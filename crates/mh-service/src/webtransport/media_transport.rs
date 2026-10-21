@@ -9,11 +9,13 @@
 //!
 //! # Scope: plumbing, not a forward loop
 //!
-//! Four operations and nothing else: send a datagram, receive a datagram, open
-//! a unidirectional stream, write and finish it. No ingress loop, no egress
-//! loop, no queue, no routing, no framing. The forward path (story task 16)
-//! runs *against* the trait, with this type in production and
-//! `mh_test_utils::transport_shim::LossDelayTransport` in tests.
+//! Per-connection I/O and nothing else: send and receive datagrams; open a
+//! unidirectional stream, write, finish, reset and prioritise it; accept a
+//! peer's unidirectional stream, read chunks from it and stop it. No ingress
+//! loop, no egress loop, no queue, no routing, no framing. The forward paths
+//! (story task 16, story 3 MH-A2) run *against* the trait, with this type in
+//! production and `mh_test_utils::transport_shim::LossDelayTransport` in
+//! tests.
 //!
 //! # No emission originates here
 //!
@@ -45,7 +47,11 @@
 use bytes::Bytes;
 use std::sync::Arc;
 
-use crate::transport::{DatagramSendError, MediaSendStream, MediaTransport, TransportError};
+use crate::transport::{
+    DatagramSendError, MediaRecvStream, MediaSendStream, MediaTransport, StreamReadError,
+    TransportCause, TransportError, GROUP_ABANDONED,
+};
+use wtransport::VarInt;
 
 /// Per-connection media I/O over a live `wtransport` WebTransport session.
 ///
@@ -112,6 +118,44 @@ pub struct WtSendStream {
     /// unidirectional stream over the real transport, so this divergence would
     /// have shipped underneath a forward path that trusts the double.
     finished: bool,
+    /// Whether [`MediaSendStream::reset`] has run. With `finished`, decides
+    /// what `Drop` does: a stream that is neither is RESET, never left to
+    /// quinn's finishing `Drop` (see the seam's "Abandonment is a RESET"
+    /// contract).
+    reset: bool,
+}
+
+/// RESET, never FIN, on drop: the seam's abandonment contract.
+///
+/// quinn's `Drop for SendStream` finishes a stream that was neither finished
+/// nor reset, and wtransport adds no override, so without this impl every
+/// early return, cancelled writer task or aborted `JoinSet` would deliver a
+/// clean FIN on a possibly half-written frame. `tests/transport_real_impl.rs`
+/// proves on a real QUIC pair that the peer observes `RESET_STREAM`.
+impl Drop for WtSendStream {
+    fn drop(&mut self) {
+        if !self.finished && !self.reset {
+            // Already-closed is the only error, and it means there is nothing
+            // left to abandon.
+            let _ = self.stream.reset(VarInt::from_u32(GROUP_ABANDONED));
+        }
+    }
+}
+
+/// The receive half of a peer-opened unidirectional stream over `wtransport`.
+pub struct WtRecvStream {
+    stream: wtransport::RecvStream,
+}
+
+/// Map quinn's read failure onto the seam's vocabulary, keeping the cause.
+fn map_read_error(error: quinn::ReadError) -> StreamReadError {
+    match error {
+        quinn::ReadError::Reset(code) => StreamReadError::Reset(code.into_inner()),
+        quinn::ReadError::ConnectionLost(lost) => {
+            StreamReadError::ConnectionClosed(TransportCause::new(lost))
+        }
+        other => StreamReadError::Failed(TransportCause::new(other)),
+    }
 }
 
 /// Map a `wtransport` datagram-send failure onto the seam's vocabulary.
@@ -162,17 +206,22 @@ fn map_send_datagram_error(error: &wtransport::error::SendDatagramError) -> Data
 /// The one case where that reading is wrong — a write after a successful
 /// `finish` — is disambiguated **before** reaching here, by
 /// [`WtSendStream::finished`], because MH holds the fact `wtransport` discarded.
-const fn map_stream_write_error(error: &wtransport::error::StreamWriteError) -> TransportError {
+fn map_stream_write_error(error: wtransport::error::StreamWriteError) -> TransportError {
     match error {
         wtransport::error::StreamWriteError::Closed
-        | wtransport::error::StreamWriteError::Stopped(_) => TransportError::StreamClosed,
+        | wtransport::error::StreamWriteError::Stopped(_) => {
+            TransportError::StreamClosed(TransportCause::new(error))
+        }
         wtransport::error::StreamWriteError::NotConnected
-        | wtransport::error::StreamWriteError::QuicProto => TransportError::ConnectionClosed,
+        | wtransport::error::StreamWriteError::QuicProto => {
+            TransportError::ConnectionClosed(TransportCause::new(error))
+        }
     }
 }
 
 impl MediaTransport for WtMediaTransport {
     type SendStream = WtSendStream;
+    type RecvStream = WtRecvStream;
 
     fn send_datagram(&self, payload: Bytes) -> Result<(), DatagramSendError> {
         // `wtransport::Connection::send_datagram` is a plain `fn`, not `async` —
@@ -194,7 +243,7 @@ impl MediaTransport for WtMediaTransport {
             .connection
             .receive_datagram()
             .await
-            .map_err(|_| TransportError::ConnectionClosed)?;
+            .map_err(|e| TransportError::ConnectionClosed(TransportCause::new(e)))?;
 
         // Zero-copy: `Datagram::payload()` returns a `Bytes` slice of a buffer
         // the transport already owns. Callers check `.len()` against
@@ -212,16 +261,51 @@ impl MediaTransport for WtMediaTransport {
             .connection
             .open_uni()
             .await
-            .map_err(|_| TransportError::ConnectionClosed)?;
+            .map_err(|e| TransportError::ConnectionClosed(TransportCause::new(e)))?;
 
         let stream = opening
             .await
-            .map_err(|_| TransportError::ConnectionClosed)?;
+            .map_err(|e| TransportError::ConnectionClosed(TransportCause::new(e)))?;
 
         Ok(WtSendStream {
             stream,
             finished: false,
+            reset: false,
         })
+    }
+
+    async fn accept_uni(&self) -> Result<Self::RecvStream, TransportError> {
+        // Every `ConnectionError` is terminal for this connection; it is the
+        // stream accept loop's termination signal.
+        let stream = self
+            .connection
+            .accept_uni()
+            .await
+            .map_err(|e| TransportError::ConnectionClosed(TransportCause::new(e)))?;
+        Ok(WtRecvStream { stream })
+    }
+}
+
+impl MediaRecvStream for WtRecvStream {
+    async fn read_chunk(&mut self, max_len: usize) -> Result<Option<Bytes>, StreamReadError> {
+        // quinn's `read_chunk` hands out a `Bytes` slice of its own receive
+        // buffer: zero copy. That slice PINS its parent allocation for as long
+        // as it is held; `crate::media::downlink` copies any chunk it must
+        // retain in a backlog for exactly that reason.
+        self.stream
+            .quic_stream_mut()
+            .read_chunk(max_len, true)
+            .await
+            .map(|chunk| chunk.map(|chunk| chunk.bytes))
+            .map_err(map_read_error)
+    }
+
+    fn stop(&mut self, code: u32) {
+        // Already-stopped is the only error and means there is nothing to do.
+        let _ = self
+            .stream
+            .quic_stream_mut()
+            .stop(quinn::VarInt::from_u32(code));
     }
 }
 
@@ -231,40 +315,58 @@ impl MediaSendStream for WtSendStream {
         // can no longer tell us whether the stream or the connection died. See
         // the field docs on `WtSendStream::finished` for why the information is
         // unrecoverable below this line.
-        if self.finished {
-            return Err(TransportError::StreamClosed);
+        if self.finished || self.reset {
+            return Err(TransportError::StreamClosed(TransportCause::local(
+                "write after finish or reset",
+            )));
         }
 
         self.stream
             .write_all(buf)
             .await
-            .map_err(|e| map_stream_write_error(&e))
+            .map_err(map_stream_write_error)
     }
 
-    async fn finish(&mut self) -> Result<(), TransportError> {
-        // The seam states as a contract that a `write_all` after a successful
-        // `finish` must return `StreamClosed`. quinn already behaves this way
-        // (`send_stream.rs` returns `ClosedStream` once the stream is closed),
-        // so honouring it costs nothing here — but it is *asserted* against this
-        // real implementation rather than assumed, because a double and the real
-        // transport diverging on it would be invisible exactly where the forward
-        // path trusts the double.
-        let result = self
-            .stream
-            .finish()
-            .await
-            .map_err(|e| map_stream_write_error(&e));
-
-        // Latched only on success, matching the contract's wording ("once
-        // `finish` has returned `Ok`"). A failed finish leaves the stream in
-        // whatever state the transport reports, and a subsequent write is then
-        // answered by the transport rather than by this flag — so the flag can
-        // never manufacture a `StreamClosed` for a stream that was never
-        // successfully finished.
+    fn finish(&mut self) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
+        // quinn's SYNCHRONOUS finish, not wtransport's `finish().await`, which
+        // additionally waits for the peer to acknowledge every byte. The seam
+        // defines `finish` as "the group ended at a frame boundary": the data
+        // is committed the moment quinn accepts the FIN, and a writer that was
+        // cancelled while awaiting an acknowledgement would otherwise reach
+        // `Drop` with `finished == false` and RESET a stream that had in fact
+        // been finished — discarding the tail of a complete group. Hence a
+        // ready future rather than an `async fn` with nothing to await.
+        //
+        // The seam's contract that a `write_all` after a successful `finish`
+        // fails is honoured by the `finished` latch above (asserted against
+        // this implementation in `tests/transport_real_impl.rs`).
+        let result = if self.finished || self.reset {
+            Err(TransportError::StreamClosed(TransportCause::local(
+                "finish after finish or reset",
+            )))
+        } else {
+            self.stream
+                .quic_stream_mut()
+                .finish()
+                .map_err(|e| TransportError::StreamClosed(TransportCause::new(e)))
+        };
         if result.is_ok() {
             self.finished = true;
         }
-        result
+        std::future::ready(result)
+    }
+
+    fn reset(&mut self, code: u32) -> Result<(), TransportError> {
+        // Latched whatever the outcome: an already-closed stream has nothing
+        // left to abandon, and `Drop` must not try again.
+        self.reset = true;
+        self.stream
+            .reset(VarInt::from_u32(code))
+            .map_err(|e| TransportError::StreamClosed(TransportCause::new(e)))
+    }
+
+    fn set_priority(&mut self, priority: i32) {
+        self.stream.set_priority(priority);
     }
 }
 
@@ -281,7 +383,7 @@ mod tests {
     //! checked against one body rather than two.
 
     use super::{map_send_datagram_error, map_stream_write_error};
-    use crate::transport::{DatagramSendError, TransportError};
+    use crate::transport::{DatagramSendError, TransportCause, TransportError};
     use wtransport::error::{SendDatagramError, StreamWriteError};
     use wtransport::VarInt;
 
@@ -317,24 +419,34 @@ mod tests {
         // `ConnectionClosed` would make the forward path tear down a healthy
         // connection because one subscriber's stream went away.
         assert_eq!(
-            map_stream_write_error(&StreamWriteError::Closed),
-            TransportError::StreamClosed
+            map_stream_write_error(StreamWriteError::Closed),
+            TransportError::StreamClosed(TransportCause::local("x"))
         );
         assert_eq!(
-            map_stream_write_error(&StreamWriteError::Stopped(VarInt::from_u32(7))),
-            TransportError::StreamClosed
+            map_stream_write_error(StreamWriteError::Stopped(VarInt::from_u32(7))),
+            TransportError::StreamClosed(TransportCause::local("x"))
         );
     }
 
     #[test]
     fn connection_scoped_write_errors_report_a_dead_connection() {
         assert_eq!(
-            map_stream_write_error(&StreamWriteError::NotConnected),
-            TransportError::ConnectionClosed
+            map_stream_write_error(StreamWriteError::NotConnected),
+            TransportError::ConnectionClosed(TransportCause::local("x"))
         );
         assert_eq!(
-            map_stream_write_error(&StreamWriteError::QuicProto),
-            TransportError::ConnectionClosed
+            map_stream_write_error(StreamWriteError::QuicProto),
+            TransportError::ConnectionClosed(TransportCause::local("x"))
+        );
+    }
+
+    #[test]
+    fn a_write_error_keeps_its_cause_as_the_source() {
+        use std::error::Error as _;
+        let error = map_stream_write_error(StreamWriteError::Stopped(VarInt::from_u32(7)));
+        assert!(
+            error.source().is_some(),
+            "the wtransport error must survive"
         );
     }
 }

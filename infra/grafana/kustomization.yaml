@@ -58,9 +58,14 @@ configMapGenerator:
   - name: grafana-dashboards-mh
     files:
       - mh-logs.json=dashboards/mh-logs.json
-      - mh-media.json=dashboards/mh-media.json
       - mh-overview.json=dashboards/mh-overview.json
       - mh-slos.json=dashboards/mh-slos.json
+  # MH's ADR-0036 media path, split out of the MH group at story 3 MH-A2 when
+  # the stream-per-group panels took that group past the guard's 80% headroom
+  # on the 262144-byte annotation cap — the same split MC's media board got.
+  - name: grafana-dashboards-mh-media
+    files:
+      - mh-media.json=dashboards/mh-media.json
   # GROUPING IS SIZE-BOUNDED, NOT PREFIX-BOUND. Dashboards are grouped by
   # service prefix (`<prefix>-*.json`) only while the group fits: client-side
   # apply stores each generated ConfigMap, JSON-escaped, in a

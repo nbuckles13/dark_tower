@@ -1,6 +1,6 @@
 //! Stream-admission fixtures for `mh-service`'s `tests/` binaries.
 //!
-//! `SessionManagerHandle::new` requires a [`StreamAdmission`] — a session
+//! `SessionManagerHandle::new_for_tests` requires a [`StreamAdmission`] — a session
 //! manager with no stream ceiling is not representable (story 2 R-19). Tests
 //! that are not ABOUT admission use [`never_binding`]; tests that are build
 //! their own ceiling at the call site so the number under test is visible
@@ -58,5 +58,30 @@ pub fn fixture_policy_limits() -> mh_service::config::PolicyLimits {
         policy_apply_timeout_ms: 1_000,
         max_registered_meetings: 8_192,
         max_source_streams_per_meeting: 1_024,
+    }
+}
+
+/// The stream-path limits at their deployed values
+/// (`infra/services/mh-service/config.env`), for rigs that build a `Config` or
+/// a `MediaSetup` by hand. Tests ABOUT the stream path set their own.
+#[must_use]
+pub fn fixture_stream_path_limits() -> mh_service::config::StreamPathLimits {
+    mh_service::config::StreamPathLimits {
+        opens_per_connection_per_sec: 10,
+        egress_stream_backlog_bytes: 262_144,
+        mid_frame_stall: std::time::Duration::from_millis(1000),
+    }
+}
+
+/// The ADR-0036 §1 QUIC transport parameters at their deployed values
+/// (`infra/services/mh-service/config.env`), for rigs that build a `Config`
+/// or bind an endpoint by hand, and for bounds a test derives from them.
+#[must_use]
+pub fn fixture_quic_transport() -> mh_service::config::QuicTransportParams {
+    mh_service::config::QuicTransportParams {
+        max_concurrent_uni_streams: 64,
+        datagram_send_buffer_audio_frames: 32,
+        datagram_send_buffer_bytes: 32 * mh_service::config::NOMINAL_AUDIO_FRAME_BYTES,
+        keepalive_interval_ms: 10_000,
     }
 }

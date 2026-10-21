@@ -66,9 +66,8 @@ async fn cluster() -> ClusterConnection {
     cluster
 }
 
-/// Margin over MC's published connect-settle window before a view must have
-/// converged. Same role as `27_mc_slot_placement.rs`'s margin.
-const VIEW_MARGIN: Duration = Duration::from_secs(10);
+/// Margin over MC's settle window (one shared home).
+use env_tests::fixtures::participant::VIEW_MARGIN;
 
 /// Rig bound on one send-until-observed phase (unreliable datagrams).
 const PHASE_DEADLINE: Duration = Duration::from_secs(45);

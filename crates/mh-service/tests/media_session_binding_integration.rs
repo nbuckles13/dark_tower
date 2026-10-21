@@ -165,7 +165,8 @@ impl BindingSuite {
         >,
     ) -> Self {
         let jwks = JwksRig::start(46, "mh-binding-integ-01").await;
-        let session_manager = SessionManagerHandle::new(mh_test_utils::admission::never_binding());
+        let session_manager =
+            SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding());
         let jwt_validator = Arc::new(MhJwtValidator::new(jwks.jwks_client(), 300));
         let mc_client = Arc::new(McClient::new(test_token_receiver()));
 

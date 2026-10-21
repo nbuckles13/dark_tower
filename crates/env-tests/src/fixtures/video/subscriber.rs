@@ -4,7 +4,7 @@
 //! and stream ends through one ordered channel.
 
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use super::reader::{ReadError, ReceivedFrame, ReceivedStream, StreamFrameReader};
 use super::transport::{DownlinkRead, DownlinkStream};
@@ -67,6 +67,8 @@ pub struct VideoSubscriber {
     events: mpsc::UnboundedReceiver<SubscriberEvent>,
     accept: tokio::task::JoinHandle<()>,
     closed: bool,
+    /// Set by [`Self::spawn_held`]: releases the held readers.
+    release: Option<watch::Sender<bool>>,
 }
 
 impl VideoSubscriber {
@@ -74,12 +76,47 @@ impl VideoSubscriber {
     /// are shared handles).
     #[must_use]
     pub fn spawn(conn: wtransport::Connection) -> Self {
+        Self::spawn_gated(conn, None)
+    }
+
+    /// [`Self::spawn`], but every per-stream reader is HELD — streams are
+    /// accepted, nothing is read — until [`Self::release`] (story 3 MH-A2's
+    /// slow-subscriber row). While held, MH's writes block on this client's
+    /// per-stream flow-control credit, so MH's per-destination backlog fills
+    /// and MH abandons the group with a stream RESET; on release each held
+    /// stream reports how it ended (`StreamEnd::Reset` for an abandoned one).
+    /// Opt-in: [`Self::spawn`] is unchanged.
+    #[must_use]
+    pub fn spawn_held(conn: wtransport::Connection) -> Self {
+        let (release, gate) = watch::channel(false);
+        let mut subscriber = Self::spawn_gated(conn, Some(gate));
+        subscriber.release = Some(release);
+        subscriber
+    }
+
+    /// Let a [`Self::spawn_held`] subscriber's readers read. A no-op for one
+    /// built with [`Self::spawn`].
+    pub fn release(&self) {
+        if let Some(release) = &self.release {
+            let _ = release.send(true);
+        }
+    }
+
+    fn spawn_gated(conn: wtransport::Connection, gate: Option<watch::Receiver<bool>>) -> Self {
         let (tx, events) = mpsc::unbounded_channel();
         let accept = tokio::spawn(async move {
             let mut readers = tokio::task::JoinSet::new();
             let mut index = 0;
             while let Ok(recv) = conn.accept_uni().await {
-                readers.spawn(read_stream(recv, index, tx.clone()));
+                let tx = tx.clone();
+                let gate = gate.clone();
+                readers.spawn(async move {
+                    if let Some(mut gate) = gate {
+                        // A closed sender means the subscriber is gone.
+                        let _ = gate.wait_for(|released| *released).await;
+                    }
+                    read_stream(recv, index, tx).await;
+                });
                 index += 1;
             }
             let _ = tx.send(SubscriberEvent::ConnectionClosed);
@@ -91,6 +128,7 @@ impl VideoSubscriber {
             events,
             accept,
             closed: false,
+            release: None,
         }
     }
 
@@ -295,6 +333,7 @@ mod tests {
             events,
             accept: tokio::spawn(async {}),
             closed: false,
+            release: None,
         };
         assert_eq!(sub.next(Duration::from_millis(1)).await, Next::Quiet);
         tx.send(SubscriberEvent::ConnectionClosed).unwrap();

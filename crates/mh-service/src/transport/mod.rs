@@ -35,23 +35,46 @@
 //!   materialise a Guarded Shared Area glob that currently matches nothing and
 //!   convert a single-consumer trait into an owner-co-sign surface for no gain.
 //!
-//! # Scope: four operations, no lifecycle
+//! # Scope: per-connection I/O, no lifecycle
 //!
-//! There is deliberately no `ready`, no `closed` and no `close(info)`. Those
-//! are connection lifecycle, which §11 keeps as a *sibling* of the hot path
-//! rather than inside it; they stay in [`crate::webtransport::connection`].
-//! Loop termination comes from [`MediaTransport::recv_datagram`] returning
+//! Datagrams (send, receive) and unidirectional streams in both directions:
+//! open a send stream, write, finish, reset, prioritise; accept a receive
+//! stream, read chunks, stop. Nothing else. There is deliberately no `ready`,
+//! no `closed` and no `close(info)`. Those are connection lifecycle, which §11
+//! keeps as a *sibling* of the hot path rather than inside it; they stay in
+//! [`crate::webtransport::connection`]. Loop termination comes from
+//! [`MediaTransport::recv_datagram`] / [`MediaTransport::accept_uni`] returning
 //! [`TransportError::ConnectionClosed`], plus the existing `CancellationToken`.
 //!
 //! The shape mirrors the client SDK's `IWebTransport`
 //! (`packages/sdk-core/src/transport/IWebTransport.ts`) **conceptually, not
 //! member for member**. That interface is `ready` / `closed` / `datagrams
 //! {readable, writable}` / `createBidirectionalStream()` / `close()` — Web
-//! Streams and *bidirectional* streams. This one is send-datagram /
-//! recv-datagram / open-*uni* / write / finish. Same idea — per-connection I/O
-//! behind an interface with a deterministic double — in two idioms. Stated
-//! explicitly so nobody builds a cross-language parity test against a parity
-//! that was never claimed.
+//! Streams and *bidirectional* streams. This one is datagrams plus *uni*
+//! streams. Same idea — per-connection I/O behind an interface with a
+//! deterministic double — in two idioms. Stated explicitly so nobody builds a
+//! cross-language parity test against a parity that was never claimed.
+//!
+//! # Abandonment is a RESET, and dropping a send stream is an abandonment
+//!
+//! quinn's own `Drop for SendStream` FINISHES a stream that was neither
+//! finished nor reset (`quinn-0.11.12/src/send_stream.rs`), and wtransport adds
+//! no override. A stream dropped mid-frame — an early return, a cancelled task,
+//! an aborted `JoinSet`, a panic unwind — would therefore deliver a clean FIN
+//! on a half-written frame, which is exactly what story 3 R-12 forbids ("a
+//! half-written frame is never left looking complete"). So this seam's
+//! contract is the opposite of quinn's default, and it is a contract, not a
+//! convention: **a [`MediaSendStream`] dropped without [`MediaSendStream::finish`]
+//! or [`MediaSendStream::reset`] having run RESETS with [`GROUP_ABANDONED`].**
+//! The production implementation enforces it in its own `Drop`; the test double
+//! models the same contract, and `tests/transport_real_impl.rs` proves the
+//! production `Drop` on a real QUIC pair so the double never certifies a
+//! property production lacks.
+//!
+//! [`MediaSendStream::finish`] means "the group ended at a frame boundary" and
+//! completes immediately; it never waits for the peer's acknowledgement, so a
+//! writer that is cancelled after finishing never turns a finished stream into
+//! a reset.
 //!
 //! # No emission originates here
 //!
@@ -163,49 +186,181 @@
 //! next reader to re-derive why the obvious field is the wrong one, and the
 //! re-derivation fails the same way.
 //!
-//! # Future receive-stream methods must expose length before allocation
+//! # Receive streams expose chunks, never frames
 //!
-//! The stream side is **send-only** here. When a receive-stream method is
-//! added, it must expose the frame length *before* any per-frame allocation —
-//! a `read_frame() -> Vec<u8>` shape would allocate from an attacker-controlled
-//! length prefix before any cap could apply, silently foreclosing §11's ingress
-//! denial-of-service cap ("maximum frame payload before any allocation"). The
-//! `media-protocol` codec is already built for this: `parse_header_prefix` and
-//! the chunk-fed `media_protocol::reader::HeaderReader` reject a declared length
-//! over `MAX_PAYLOAD_BYTES` from the bounded fixed prefix, before anything is
-//! reserved, and report the frame length only once the header is valid. Any
-//! future method here must preserve that ordering.
+//! [`MediaRecvStream::read_chunk`] returns whatever the transport delivered, as
+//! [`Bytes`] — in production a zero-copy slice of quinn's receive buffer. It
+//! never returns a frame: a `read_frame() -> Vec<u8>` shape would allocate from
+//! an attacker-controlled length before any cap could apply, silently
+//! foreclosing §11's ingress denial-of-service cap ("maximum frame payload
+//! before any allocation"). Framing happens above the seam, in
+//! `crate::media::stream_ingress`, through `media_protocol::reader::HeaderReader`,
+//! which rejects a declared length over `MAX_PAYLOAD_BYTES` from the bounded
+//! fixed prefix before anything is sized from it.
+//!
+//! A chunk is a slice of a larger receive allocation, so RETAINING it pins that
+//! parent. The forward path therefore copies any chunk it must hold in a
+//! destination's backlog (`crate::media::downlink`); see there for the bound.
 //!
 //! On the datagram path the ordering is already safe: `recv_datagram` yields a
 //! [`Bytes`] that is a slice of a buffer the transport already owns, so the
 //! caller reads `.len()` and rejects oversize frames with no copy having
 //! occurred and nothing having been allocated on our behalf.
+//!
+//! # Stream reset and stop codes
+//!
+//! Two application codes, one home (this module), wire-visible but carrying no
+//! reason: [`GROUP_ABANDONED`] on every downlink `RESET_STREAM` MH sends,
+//! whatever the cause, and [`INGRESS_REFUSED`] on every `STOP_SENDING` MH
+//! sends to a publisher stream. The receiver semantics are anchored once in
+//! ADR-0036 §2, *Stream reset and stop codes carry no reason*. A peer MUST NOT
+//! branch on the value: wtransport 0.7.2 hands the varint straight to quinn
+//! without the WebTransport-over-HTTP/3 application-code mapping (the
+//! `0x52e4a40fa8db` range), so a browser may surface these resets with a null
+//! or unmapped `streamErrorCode`. Neither code is 0. The reason a stream was
+//! abandoned is MH-local telemetry (`mh_media_group_resets_total{reason}`) and
+//! never crosses the wire, so a
+//! subscriber gets no oracle into MH policy.
 
 use bytes::Bytes;
 use std::future::Future;
 use thiserror::Error;
 
+/// The `RESET_STREAM` application code on every downlink group MH abandons.
+/// See the module docs: one reasonless code; peers must not branch on it.
+pub const GROUP_ABANDONED: u32 = 0x4741;
+
+/// The `STOP_SENDING` application code on every publisher stream MH refuses
+/// (rate limit, attribution failure, codec reject, stall). See the module docs.
+pub const INGRESS_REFUSED: u32 = 0x4952;
+
+const _: () = assert!(
+    GROUP_ABANDONED != 0 && INGRESS_REFUSED != 0 && GROUP_ABANDONED != INGRESS_REFUSED,
+    "the two MH stream codes are non-zero and distinct"
+);
+
+/// The underlying cause of a transport failure, kept for diagnosis.
+///
+/// Cheap to clone (one `Arc`), and constructed only on an error path — never
+/// per frame — so carrying it costs the hot path nothing. Exposed as the
+/// `#[source]` of [`TransportError`] and [`StreamReadError`] so a sibling that
+/// logs the error at teardown keeps the quinn/wtransport reason (application
+/// close, idle timeout, transport error) instead of a bare "closed".
+#[derive(Clone)]
+pub struct TransportCause(std::sync::Arc<dyn std::error::Error + Send + Sync + 'static>);
+
+impl TransportCause {
+    /// Wrap the transport's own error.
+    #[must_use]
+    pub fn new(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(error))
+    }
+
+    /// A cause with no underlying error object — for test doubles and for
+    /// conditions the seam detects itself (e.g. a write after `finish`).
+    #[must_use]
+    pub fn local(reason: &'static str) -> Self {
+        Self(std::sync::Arc::new(LocalCause(reason)))
+    }
+}
+
+impl std::fmt::Debug for TransportCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl std::fmt::Display for TransportCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, f)
+    }
+}
+
+impl std::error::Error for TransportCause {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
+    }
+}
+
+#[derive(Debug)]
+struct LocalCause(&'static str);
+
+impl std::fmt::Display for LocalCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for LocalCause {}
+
 /// Failure modes of the asynchronous per-connection operations.
 ///
-/// Deliberately small and allocation-free: no variant carries a `String`, so
-/// no error path on the hot path allocates, and no variant tempts a caller into
-/// formatting one. Mapping from `wtransport`'s error types happens in the real
-/// implementation, so this seam names no transport crate.
+/// Each variant carries its [`TransportCause`]; callers match on the variant
+/// for control flow and never need the cause to decide anything. Equality is
+/// **variant-only**: two `ConnectionClosed` errors are equal whatever their
+/// causes, which is what a control-flow assertion means.
 ///
 /// These variants carry no metric label vocabulary. `docs/observability/metrics/mh-service.md`
 /// is the single source of truth for drop reasons and directions; the forward
 /// path maps an error to a label at the emission site, so that vocabulary has
 /// exactly one home.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum TransportError {
     /// The connection is gone. Tear the per-connection tasks down.
     #[error("connection closed")]
-    ConnectionClosed,
+    ConnectionClosed(#[source] TransportCause),
 
-    /// The stream is gone, but the connection may still be usable.
+    /// The stream is gone (finished, reset, or stopped by the peer), but the
+    /// connection may still be usable.
     #[error("stream closed")]
-    StreamClosed,
+    StreamClosed(#[source] TransportCause),
 }
+
+impl PartialEq for TransportError {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::ConnectionClosed(_), Self::ConnectionClosed(_))
+                | (Self::StreamClosed(_), Self::StreamClosed(_))
+        )
+    }
+}
+
+impl Eq for TransportError {}
+
+/// Failure modes of [`MediaRecvStream::read_chunk`].
+///
+/// A clean end of stream is `Ok(None)`, never an error. Equality is
+/// variant-only (and code-sensitive for `Reset`).
+#[derive(Debug, Clone, Error)]
+pub enum StreamReadError {
+    /// The peer reset the stream (`RESET_STREAM`) with this application code.
+    /// The code is the peer's and carries no meaning MH acts on.
+    #[error("stream reset by peer")]
+    Reset(u64),
+
+    /// The connection is gone.
+    #[error("connection closed")]
+    ConnectionClosed(#[source] TransportCause),
+
+    /// The stream is unusable for another reason (already stopped locally,
+    /// an illegal read). Should not occur on MH's read path.
+    #[error("stream read failed")]
+    Failed(#[source] TransportCause),
+}
+
+impl PartialEq for StreamReadError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Reset(a), Self::Reset(b)) => a == b,
+            (Self::ConnectionClosed(_), Self::ConnectionClosed(_))
+            | (Self::Failed(_), Self::Failed(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for StreamReadError {}
 
 /// Failure modes of [`MediaTransport::send_datagram`].
 ///
@@ -355,6 +510,44 @@ pub trait MediaSendStream: Send {
     /// [`TransportError::StreamClosed`] if the stream is gone,
     /// [`TransportError::ConnectionClosed`] if the connection is.
     fn finish(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send;
+
+    /// Resets the stream immediately with application code `code`, discarding
+    /// anything buffered. The abandonment primitive (story 3 R-12): the peer
+    /// sees `RESET_STREAM`, never a FIN, so a half-written frame cannot look
+    /// complete. Synchronous, as in quinn.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::StreamClosed`] if the stream was already finished or
+    /// reset. A caller abandoning a stream treats that as done.
+    fn reset(&mut self, code: u32) -> Result<(), TransportError>;
+
+    /// Sets the stream's send priority. quinn's convention: a HIGHER value is
+    /// transmitted first. Callers map MC's `priority_group` (lower is higher)
+    /// through `crate::media::downlink::quic_priority`.
+    fn set_priority(&mut self, priority: i32);
+}
+
+/// The receive half of a unidirectional stream a peer opened.
+pub trait MediaRecvStream: Send {
+    /// Reads the next chunk the transport delivered, at most `max_len` bytes.
+    /// `Ok(None)` is the peer's FIN.
+    ///
+    /// Returns a chunk, never a frame (see the module docs): nothing on this
+    /// path is sized from wire content.
+    ///
+    /// # Errors
+    ///
+    /// [`StreamReadError::Reset`] when the peer reset the stream,
+    /// [`StreamReadError::ConnectionClosed`] when the connection is gone.
+    fn read_chunk(
+        &mut self,
+        max_len: usize,
+    ) -> impl Future<Output = Result<Option<Bytes>, StreamReadError>> + Send;
+
+    /// Stops reading: the peer receives `STOP_SENDING` with `code` and unread
+    /// data is discarded. Idempotent.
+    fn stop(&mut self, code: u32);
 }
 
 /// Per-connection hot-path I/O.
@@ -380,6 +573,9 @@ pub trait MediaSendStream: Send {
 pub trait MediaTransport: Send + Sync + 'static {
     /// The unidirectional send stream this transport produces.
     type SendStream: MediaSendStream;
+
+    /// The unidirectional receive stream a peer opens.
+    type RecvStream: MediaRecvStream;
 
     /// Sends one datagram, without blocking.
     ///
@@ -424,6 +620,18 @@ pub trait MediaTransport: Send + Sync + 'static {
     ///
     /// [`TransportError::ConnectionClosed`] when the connection is gone.
     fn open_uni(&self) -> impl Future<Output = Result<Self::SendStream, TransportError>> + Send;
+
+    /// Accepts the next unidirectional stream the peer opened.
+    ///
+    /// Concurrency is bounded below this call by the declared QUIC transport
+    /// parameter `MH_MAX_CONCURRENT_UNI_STREAMS`; the per-connection creation
+    /// RATE is enforced by the caller, before any byte is read.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::ConnectionClosed`] when the connection is gone — the
+    /// stream accept loop's termination signal.
+    fn accept_uni(&self) -> impl Future<Output = Result<Self::RecvStream, TransportError>> + Send;
 }
 
 #[cfg(test)]
@@ -434,7 +642,7 @@ mod tests {
     //! `tests/transport_seam_reachability.rs` against the deterministic double
     //! in `mh-test-utils`; these tests cover only what lives in this file.
 
-    use super::{DatagramSendError, TransportError};
+    use super::{DatagramSendError, StreamReadError, TransportCause, TransportError};
     use bytes::Bytes;
 
     #[test]
@@ -486,9 +694,34 @@ mod tests {
     #[test]
     fn transport_error_display_is_stable() {
         assert_eq!(
-            TransportError::ConnectionClosed.to_string(),
+            TransportError::ConnectionClosed(TransportCause::local("x")).to_string(),
             "connection closed"
         );
-        assert_eq!(TransportError::StreamClosed.to_string(), "stream closed");
+        assert_eq!(
+            TransportError::StreamClosed(TransportCause::local("x")).to_string(),
+            "stream closed"
+        );
+    }
+
+    #[test]
+    fn the_cause_survives_as_the_error_source() {
+        use std::error::Error as _;
+        let error = TransportError::ConnectionClosed(TransportCause::local("idle timeout"));
+        let source = error.source().expect("the cause is the source");
+        assert_eq!(source.to_string(), "idle timeout");
+    }
+
+    #[test]
+    fn equality_is_variant_only_and_reset_is_code_sensitive() {
+        assert_eq!(
+            TransportError::ConnectionClosed(TransportCause::local("a")),
+            TransportError::ConnectionClosed(TransportCause::local("b"))
+        );
+        assert_ne!(
+            TransportError::ConnectionClosed(TransportCause::local("a")),
+            TransportError::StreamClosed(TransportCause::local("a"))
+        );
+        assert_eq!(StreamReadError::Reset(7), StreamReadError::Reset(7));
+        assert_ne!(StreamReadError::Reset(7), StreamReadError::Reset(8));
     }
 }

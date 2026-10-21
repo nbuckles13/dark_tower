@@ -45,6 +45,8 @@ use tokio_util::sync::CancellationToken;
 
 pub mod admission;
 
+use crate::media::downlink::DownlinkSender;
+use crate::media::edge_runtime::EdgeContext;
 use crate::media::forward::EgressQueue;
 use crate::observability::metrics::{
     resolve_session_handles, MeetingTeardownOutcome, SessionMetricHandles, StreamAdmissionOutcome,
@@ -351,7 +353,7 @@ struct SessionState {
 
 /// Actor that owns session state and processes messages sequentially.
 ///
-/// Spawned by [`SessionManagerHandle::new`]. Runs until all senders are dropped
+/// Spawned by [`SessionManagerHandle::new_for_tests`] and [`SessionManagerHandle::with_edge_context`]. Runs until all senders are dropped
 /// (channel closed), which happens naturally during shutdown.
 pub struct SessionManagerActor {
     receiver: mpsc::Receiver<SessionMessage>,
@@ -383,6 +385,7 @@ impl SessionManagerActor {
         // healthy, because MH registers eagerly" rests on this.
         metrics.publish_rejection_ratio(0.0);
         metrics.publish_egress_edges(routing.load().total_edges());
+        metrics.publish_stream_sources_declared(routing.stream_sources_declared());
         // The state is empty at construction; published anyway so the series
         // is present-at-0 from boot rather than appearing on first register.
         metrics.publish_registered_meetings(0);
@@ -638,6 +641,8 @@ impl SessionManagerActor {
             self.routing.install(&policy);
             self.metrics
                 .publish_egress_edges(self.routing.load().total_edges());
+            self.metrics
+                .publish_stream_sources_declared(self.routing.stream_sources_declared());
             tracing::info!(
                 target: "mh.session.policy",
                 key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
@@ -1092,6 +1097,8 @@ impl SessionManagerActor {
         let snapshot = self.routing.load();
         self.metrics.publish_egress_edges(snapshot.total_edges());
         self.metrics
+            .publish_stream_sources_declared(self.routing.stream_sources_declared());
+        self.metrics
             .publish_registered_meetings(self.state.registered_meetings.len());
         self.metrics
             .record_teardown(MeetingTeardownOutcome::Released);
@@ -1257,6 +1264,10 @@ pub struct LocalSubscriberSnapshot {
 struct SubscriberEntry {
     connection_id: String,
     queue: Arc<EgressQueue>,
+    /// Where new downlink group streams for this subscriber are handed to its
+    /// stream egress task (story 3 MH-A2). `None` for a connection with no
+    /// stream egress task (test rigs exercising only datagrams).
+    streams: Option<DownlinkSender>,
 }
 
 impl LocalSubscriberSnapshot {
@@ -1279,6 +1290,16 @@ impl LocalSubscriberSnapshot {
         self.connections
             .get(&SubscriberKey::new(meeting.clone(), sender))
             .map(|entry| &entry.queue)
+    }
+
+    /// The downlink channel for one meeting-scoped subscriber's stream egress
+    /// task, if it is connected to this handler with one. `None` counts
+    /// `no_local_subscriber` exactly like [`Self::egress_queue`].
+    #[must_use]
+    pub fn stream_egress(&self, meeting: &MeetingKey, sender: SenderId) -> Option<&DownlinkSender> {
+        self.connections
+            .get(&SubscriberKey::new(meeting.clone(), sender))
+            .and_then(|entry| entry.streams.as_ref())
     }
 
     /// How many subscriber connections this handler holds.
@@ -1354,10 +1375,24 @@ impl LocalSubscribers {
         connection_id: &str,
         queue: &Arc<EgressQueue>,
     ) {
+        self.register_with_streams(meeting, sender, connection_id, queue, None);
+    }
+
+    /// [`Self::register`], plus the subscriber's stream egress channel (story 3
+    /// MH-A2). Setup, not hot path; same `rcu` reasoning.
+    pub fn register_with_streams(
+        &self,
+        meeting: MeetingKey,
+        sender: SenderId,
+        connection_id: &str,
+        queue: &Arc<EgressQueue>,
+        streams: Option<DownlinkSender>,
+    ) {
         let key = SubscriberKey::new(meeting, sender);
         let entry = SubscriberEntry {
             connection_id: connection_id.to_string(),
             queue: Arc::clone(queue),
+            streams,
         };
         self.snapshot.rcu(|current| {
             let mut connections = current.connections.clone();
@@ -1625,13 +1660,29 @@ pub struct SessionManagerHandle {
 }
 
 impl SessionManagerHandle {
-    /// Create a new `SessionManagerActor` and return a handle to it.
+    /// FOR TESTS ONLY: create a `SessionManagerActor` whose routing table's
+    /// stream edges use a never-binding backlog cap (see
+    /// `RoutingTable::unbounded_for_tests`), and return a handle to it.
+    /// Production uses [`Self::with_edge_context`].
     ///
     /// Spawns the actor task immediately. The actor runs until all handles
     /// are dropped (channels close).
     #[must_use]
-    pub fn new(admission: StreamAdmission) -> Self {
-        let (handle, actor) = Self::new_with_parts(admission);
+    pub fn new_for_tests(admission: StreamAdmission) -> Self {
+        let (handle, actor) = Self::new_with_parts_for_tests(admission);
+        tokio::spawn(actor.run());
+        handle
+    }
+
+    /// [`Self::new_for_tests`] with the PRODUCTION routing table's stream-edge context (story 3
+    /// MH-A2): the per-destination backlog cap and the handles downlinks count
+    /// through. Production's constructor.
+    #[must_use]
+    pub fn with_edge_context(admission: StreamAdmission, edge_context: EdgeContext) -> Self {
+        let (handle, actor) = Self::new_with_parts_and_table(
+            admission,
+            RoutingTable::with_edge_context(edge_context),
+        );
         tokio::spawn(actor.run());
         handle
     }
@@ -1639,8 +1690,9 @@ impl SessionManagerHandle {
     /// Build a handle and its actor **without spawning**, leaving the caller to
     /// decide when — or whether — the actor runs.
     ///
-    /// This is the ordinary two-part actor constructor, not a test seam:
-    /// [`Self::new`] is written in terms of it. It matters because the two
+    /// The two-part actor constructor ([`Self::new_for_tests`] is written in
+    /// terms of it), named for tests because it installs the never-binding
+    /// stream-edge context. It matters because the two
     /// config-apply failure paths (mailbox full, apply timeout) are otherwise
     /// only reachable by racing a live actor, and a gate that depends on
     /// winning a race is a flake rather than a gate. With the actor built and
@@ -1648,10 +1700,17 @@ impl SessionManagerHandle {
     /// mailbox stays full because nothing exists that could drain it, and a
     /// reply never arrives because no task holds the sending half.
     #[must_use]
-    pub fn new_with_parts(admission: StreamAdmission) -> (Self, SessionManagerActor) {
+    pub fn new_with_parts_for_tests(admission: StreamAdmission) -> (Self, SessionManagerActor) {
+        Self::new_with_parts_and_table(admission, RoutingTable::unbounded_for_tests())
+    }
+
+    fn new_with_parts_and_table(
+        admission: StreamAdmission,
+        routing: RoutingTable,
+    ) -> (Self, SessionManagerActor) {
         let (sender, receiver) = mpsc::channel(SESSION_CHANNEL_BUFFER);
         let (config_sender, config_receiver) = mpsc::channel(CONFIG_APPLY_CHANNEL_BUFFER);
-        let routing = Arc::new(RoutingTable::new());
+        let routing = Arc::new(routing);
         let actor =
             SessionManagerActor::new(receiver, config_receiver, Arc::clone(&routing), admission);
         (
@@ -2056,7 +2115,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_register_meeting() {
-        let handle = SessionManagerHandle::new(test_admission());
+        let handle = SessionManagerHandle::new_for_tests(test_admission());
         assert!(!handle.is_meeting_registered("meeting-1").await);
 
         let pending = handle
@@ -2078,7 +2137,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_and_remove_connection() {
-        let handle = SessionManagerHandle::new(test_admission());
+        let handle = SessionManagerHandle::new_for_tests(test_admission());
         handle
             .register_meeting(
                 "meeting-1".to_string(),
@@ -2106,7 +2165,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pending_connection_promoted_on_register() {
-        let handle = SessionManagerHandle::new(test_admission());
+        let handle = SessionManagerHandle::new_for_tests(test_admission());
 
         // Add pending connection before RegisterMeeting
         let _notify = handle
@@ -2136,7 +2195,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pending_connection_for_different_meeting_not_promoted() {
-        let handle = SessionManagerHandle::new(test_admission());
+        let handle = SessionManagerHandle::new_for_tests(test_admission());
 
         // Add pending for meeting-1
         let _notify = handle
@@ -2159,7 +2218,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_pending_connection() {
-        let handle = SessionManagerHandle::new(test_admission());
+        let handle = SessionManagerHandle::new_for_tests(test_admission());
 
         let _notify = handle
             .add_pending_connection(make_pending("conn-1", "meeting-1", "user-1"))
@@ -2180,7 +2239,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_notify_wakes_pending_on_register() {
-        let handle = SessionManagerHandle::new(test_admission());
+        let handle = SessionManagerHandle::new_for_tests(test_admission());
 
         let notify = handle
             .add_pending_connection(make_pending("conn-1", "meeting-1", "user-1"))
@@ -2212,7 +2271,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registered_connection_not_affected_by_timeout() {
-        let handle = SessionManagerHandle::new(test_admission());
+        let handle = SessionManagerHandle::new_for_tests(test_admission());
 
         // Register meeting first
         handle
@@ -2242,13 +2301,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_mc_endpoint_unregistered() {
-        let handle = SessionManagerHandle::new(test_admission());
+        let handle = SessionManagerHandle::new_for_tests(test_admission());
         assert!(handle.get_mc_endpoint("nonexistent").await.is_none());
     }
 
     #[tokio::test]
     async fn a_fresh_handle_is_empty() {
-        let handle = SessionManagerHandle::new(test_admission());
+        let handle = SessionManagerHandle::new_for_tests(test_admission());
         assert!(!handle.is_meeting_registered("any").await);
         assert_eq!(handle.active_connection_count().await, 0);
     }
@@ -2515,7 +2574,7 @@ mod tests {
     // =======================================================================
 
     fn unspawned_actor() -> SessionManagerActor {
-        SessionManagerHandle::new_with_parts(test_admission()).1
+        SessionManagerHandle::new_with_parts_for_tests(test_admission()).1
     }
 
     #[test]

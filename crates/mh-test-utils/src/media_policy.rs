@@ -174,3 +174,27 @@ pub fn register_request_declared(
     request.source_streams = sources;
     request
 }
+
+/// One STREAM-transport (video-shaped) egress: `subscriber_sender`'s `slot`
+/// fed by `candidate_sender`'s `stream`, at MC's video priority group (2) and
+/// superseding on an independently-decodable frame. The transport derives
+/// from the candidate's declared `SourceStream`.
+#[must_use]
+pub fn stream_egress(
+    egress_stream_id: u32,
+    subscriber_sender: u32,
+    slot: u32,
+    candidate_sender: u32,
+    stream: u32,
+) -> EgressStream {
+    let mut e = egress_from(
+        egress_stream_id,
+        subscriber_sender,
+        slot,
+        candidate_sender,
+        stream,
+    );
+    e.priority_group = 2;
+    e.supersede_on_independent_frame = true;
+    e
+}

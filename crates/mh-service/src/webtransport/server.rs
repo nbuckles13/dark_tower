@@ -11,8 +11,8 @@
 
 use crate::auth::MhJwtValidator;
 use crate::config::{
-    QuicTransportParams, CONNECTION_RECEIVE_WINDOW_BYTES, DATAGRAM_RECEIVE_BUFFER_BYTES,
-    MAX_IDLE_TIMEOUT_SECONDS, STREAM_RECEIVE_WINDOW_BYTES,
+    QuicTransportParams, CONNECTION_RECEIVE_WINDOW_BYTES, CONNECTION_SEND_WINDOW_BYTES,
+    DATAGRAM_RECEIVE_BUFFER_BYTES, MAX_IDLE_TIMEOUT_SECONDS, STREAM_RECEIVE_WINDOW_BYTES,
 };
 use crate::grpc::McClient;
 use crate::media::MediaSetup;
@@ -290,11 +290,17 @@ fn build_transport_config(params: &QuicTransportParams) -> quinn::TransportConfi
     ));
 
     // Receive-side flow control. Without these, quinn leaves `receive_window`
-    // at `VarInt::MAX`, and since MH has no `accept_uni` loop the windows fill
-    // and stay filled — making `max_connections` an admission bound in name
-    // only. See `config::CONNECTION_RECEIVE_WINDOW_BYTES` for the arithmetic.
+    // at `VarInt::MAX`, so a peer could buffer without bound before MH's
+    // stream accept loop (story 3 MH-A2) reads — making `max_connections` an
+    // admission bound in name only. See `config::CONNECTION_RECEIVE_WINDOW_BYTES` for the arithmetic.
     transport.receive_window(CONNECTION_RECEIVE_WINDOW_BYTES.into());
     transport.stream_receive_window(STREAM_RECEIVE_WINDOW_BYTES.into());
+
+    // Send-side bound (story 3 MH-A2). quinn's default is 10 MB per
+    // connection, which would sit UNDER each subscriber's backlog cap so the
+    // cap never tripped; see `config::CONNECTION_SEND_WINDOW_BYTES`. It is a
+    // term of the boot memory check.
+    transport.send_window(u64::from(CONNECTION_SEND_WINDOW_BYTES));
 
     transport
 }
@@ -371,6 +377,11 @@ mod tests {
         assert!(
             rendered.contains("stream_receive_window: 65536"),
             "stream receive window not declared: {rendered}"
+        );
+        assert!(
+            rendered.contains("send_window: 524288"),
+            "connection send window not declared (quinn's 10 MB default would sit under the \
+             egress backlog cap): {rendered}"
         );
         assert!(
             // quinn renders the idle timeout in milliseconds, not as a Duration.

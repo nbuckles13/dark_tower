@@ -138,7 +138,7 @@ const MUTED_REASON: ForwardOutcome = ForwardOutcome {
 async fn a_muted_sender_with_live_edges_is_dropped_and_still_hears_its_peer() {
     let snapshot = MetricAssertion::snapshot();
 
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     let registry = LocalSubscribers::new();
     // A <-> B, both directions live; A muted.
     install(
@@ -185,7 +185,7 @@ async fn a_muted_sender_with_live_edges_is_dropped_and_still_hears_its_peer() {
 /// are never parsed, so it cannot steer which counter moves.
 #[tokio::test]
 async fn a_muted_senders_malformed_frame_is_server_muted_not_a_codec_reject() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     let registry = LocalSubscribers::new();
     install(&table, 1, vec![edge(B, 0, B_SLOT_0, A)], &[A]);
     let _b = connect(&registry, B, "h");
@@ -219,7 +219,7 @@ async fn a_muted_senders_malformed_frame_is_server_muted_not_a_codec_reject() {
 ///    consumed a hop number (a consumed hop would read as loss downstream).
 #[tokio::test]
 async fn a_mute_survives_reassert_and_an_unmute_takes_effect_in_one_generation() {
-    let sm = SessionManagerHandle::new(with_ceiling(64));
+    let sm = SessionManagerHandle::new_for_tests(with_ceiling(64));
     let limits = fixture_policy_limits();
     let apply = |generation: u64, muted: &'static [u32]| {
         let request = register_request_muted(
@@ -306,7 +306,7 @@ struct Handler {
 
 impl Handler {
     fn new(name: &'static str, streams: Vec<EgressStream>, muted: &[u32]) -> Self {
-        let table = RoutingTable::new();
+        let table = RoutingTable::unbounded_for_tests();
         install(&table, 1, streams, muted);
         Self {
             name,
@@ -486,7 +486,7 @@ async fn s10c_a_sender_muted_on_both_handlers_is_dropped_by_each_independently()
 /// handler, where the same ordinal is a different participant.
 #[tokio::test]
 async fn a_sender_muted_in_one_meeting_forwards_normally_in_another_on_the_same_handler() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     let limits = fixture_policy_limits();
     table.install(
         &MeetingPolicy::from_request(

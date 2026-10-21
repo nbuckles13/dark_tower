@@ -323,7 +323,7 @@ fn traces_payload_pii_span() -> Vec<u8> {
 /// still being scraped would otherwise satisfy a later "rose" check with
 /// nothing from this test (a false pass). A failure-only ceiling.
 #[cfg(feature = "observability")]
-const BASELINE_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(90);
+use env_tests::fixtures::metrics::BASELINE_SETTLE_BOUND;
 
 #[cfg(feature = "observability")]
 fn pii_dropped_promql(kind: &str) -> String {

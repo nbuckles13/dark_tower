@@ -228,6 +228,20 @@ impl Declarations {
         }
     }
 
+    /// How many declared streams use `transport` (the transitional reading
+    /// declares DATAGRAM only). Counts only.
+    #[must_use]
+    pub fn count_transport(&self, transport: TransportMode) -> usize {
+        match self {
+            Self::Declared { streams, .. } => {
+                streams.iter().filter(|d| d.transport == transport).count()
+            }
+            Self::Transitional(_) => {
+                usize::from(transport == TransportMode::Datagram) * self.declared_count()
+            }
+        }
+    }
+
     /// How many streams are declared (the transitional reading declares one
     /// per NAMED sender). Counts only — for the divergence WARN.
     #[must_use]

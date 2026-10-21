@@ -68,7 +68,7 @@ impl LoopbackRig {
             &mh_test_utils::admission::fixture_policy_limits(),
         )
         .expect("fixture policy must validate");
-        let routing = RoutingTable::new();
+        let routing = RoutingTable::unbounded_for_tests();
         routing.install(&policy);
 
         let forwarder = ConnectionForwarder::new(

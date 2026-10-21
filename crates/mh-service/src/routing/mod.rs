@@ -81,6 +81,7 @@ use proto_gen::dark_tower::internal::v1::{RegisterMeetingRequest, SourceStreamEc
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 
 use crate::config::PolicyLimits;
+use crate::media::edge_runtime::{self, EdgeContext, EdgeRuntime, SourceStatus};
 use crate::observability::metrics::PolicyApplyOutcome;
 
 mod sources;
@@ -739,6 +740,12 @@ pub struct MeetingRoutes {
     declarations: Declarations,
     /// `(sender, stream)` -> position in the declarations, derived from them.
     declared_index: HashMap<(SenderId, StreamNumber), usize>,
+    /// One runtime cell per edge, aligned with `edges` — the state that must
+    /// SURVIVE a re-push (hop sequence; a stream edge's switch machine,
+    /// downlinks and backlog budget). Held here by `Arc` and carried into the
+    /// successor routes by `egress_stream_id` (`crate::media::edge_runtime`),
+    /// so the snapshot stays immutable while the cells it points at are not.
+    cells: EdgeCells,
     /// Senders every frame of which drops `server_muted` (the shortcut),
     /// derived from the declarations; non-vacuous (see
     /// `Declarations::all_muted`). Keyed by the scoped [`SenderId`] inside this
@@ -749,7 +756,39 @@ pub struct MeetingRoutes {
 }
 
 impl MeetingRoutes {
-    fn build(policy: &MeetingPolicy) -> Self {
+    /// Build the routes for `policy`, reconciling the runtime cells of the
+    /// installed `previous` routes (if any). Reconcile's side effects —
+    /// resetting removed edges' downlinks, assigning switch targets — happen
+    /// HERE, before the successor snapshot is published.
+    fn build(policy: &MeetingPolicy, previous: Option<&Self>, context: &EdgeContext) -> Self {
+        let declared_index = policy.declarations.build_index();
+        let all_muted = policy.declarations.all_muted();
+        // The same kernel, in the same order, as `attribute()`: a wholly
+        // muted sender's source reads Muted even if this stream is undeclared.
+        let status = |candidate: CandidateRef| -> SourceStatus {
+            match classify(
+                &policy.declarations,
+                &declared_index,
+                &all_muted,
+                candidate.sender,
+                candidate.stream,
+            ) {
+                Classified::SenderMuted => SourceStatus::Muted,
+                Classified::Undeclared => SourceStatus::Undeclared,
+                Classified::Declared(decl) => match decl.disposition {
+                    Disposition::Forward => SourceStatus::Forward,
+                    Disposition::Paused => SourceStatus::Paused,
+                    Disposition::DropAtIngress => SourceStatus::Muted,
+                },
+            }
+        };
+        let reconciled = edge_runtime::reconcile(
+            previous.map(|routes| (routes.edges.as_slice(), routes.cells.0.as_slice())),
+            &policy.edges,
+            status,
+            context,
+        );
+
         let mut by_source: HashMap<(SenderId, StreamNumber), Vec<usize>> = HashMap::new();
         for (index, edge) in policy.edges.iter().enumerate() {
             for candidate in &edge.candidates {
@@ -759,14 +798,37 @@ impl MeetingRoutes {
                     .push(index);
             }
         }
+        // A stream edge mid-switch still receives the source it forwards
+        // until the target's group start (ADR-0036 §7); its edge machine
+        // skips that source's frames once the switch lands.
+        for (source, index) in reconciled.still_forwarding {
+            let indices = by_source.entry((source.sender, source.stream)).or_default();
+            if !indices.contains(&index) {
+                indices.push(index);
+            }
+        }
         Self {
             generation: policy.generation,
             edges: policy.edges.clone(),
             by_source,
-            declared_index: policy.declarations.build_index(),
-            all_muted: policy.declarations.all_muted(),
+            declared_index,
+            all_muted,
             declarations: policy.declarations.clone(),
+            cells: EdgeCells(reconciled.cells),
         }
+    }
+
+    /// Every runtime cell of this meeting, aligned with [`Self::edges`].
+    #[must_use]
+    pub fn cells(&self) -> &[Arc<EdgeRuntime>] {
+        &self.cells.0
+    }
+
+    /// `STREAM_PER_GROUP` source streams this policy declares. Counts only.
+    #[must_use]
+    pub fn stream_sources_declared(&self) -> usize {
+        self.declarations
+            .count_transport(TransportMode::StreamPerGroup)
     }
 
     /// The generation this meeting's live forward path reflects.
@@ -820,6 +882,25 @@ impl MeetingRoutes {
     }
 }
 
+/// The runtime cells of one meeting's edges. Compared by identity of the
+/// edges they serve (`egress_stream_id`), never by their mutable contents, so
+/// `MeetingRoutes` equality still means "the same installed policy".
+#[derive(Debug, Clone)]
+struct EdgeCells(Vec<Arc<EdgeRuntime>>);
+
+impl PartialEq for EdgeCells {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(&other.0)
+                .all(|(a, b)| a.egress_stream_id() == b.egress_stream_id())
+    }
+}
+
+impl Eq for EdgeCells {}
+
 /// Which declared source stream an ingress frame belongs to, and what to do
 /// with it — the result of [`RoutingSnapshot::attribute`].
 ///
@@ -842,6 +923,9 @@ pub enum Attribution<'a> {
     /// Forward along this source stream's edges (possibly none:
     /// `no_subscriber`).
     Route {
+        /// The declared stream the label resolved to — narrowed from the
+        /// 16-bit label ONCE, here, so no caller re-narrows it.
+        stream: StreamNumber,
         /// The stream is PAUSED (client mute): forwarded normally, counted on
         /// the paused-arrivals overlay.
         paused: bool,
@@ -850,12 +934,56 @@ pub enum Attribution<'a> {
     },
 }
 
+/// How one `(sender, stream)` reads against a meeting's declarations — the
+/// ONE kernel behind both [`RoutingSnapshot::attribute`] (per frame) and the
+/// edge-runtime reconcile's view of a candidate (per apply), so the two can
+/// never order the checks differently.
+///
+/// **Order, stated once:** the sender-level server-mute shortcut FIRST (a
+/// wholly muted sender is muted whatever stream it names, declared or not),
+/// then the declaration lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Classified {
+    /// Every declared stream of the sender is `DROP_AT_INGRESS`, or it is
+    /// union-muted.
+    SenderMuted,
+    /// No declared stream of this sender carries this number.
+    Undeclared,
+    /// Declared.
+    Declared(SourceDecl),
+}
+
+fn classify(
+    declarations: &Declarations,
+    declared_index: &HashMap<(SenderId, StreamNumber), usize>,
+    all_muted: &HashSet<SenderId>,
+    sender: SenderId,
+    stream: StreamNumber,
+) -> Classified {
+    if all_muted.contains(&sender) {
+        return Classified::SenderMuted;
+    }
+    declarations
+        .resolve(declared_index, sender, stream)
+        .map_or(Classified::Undeclared, Classified::Declared)
+}
+
 /// The egress edges one source stream feeds, within one meeting. Borrowing and
 /// non-allocating — the per-frame path walks it on every frame.
 #[derive(Debug, Clone)]
 pub struct SourceEdges<'a> {
     edges: &'a [EgressEdge],
+    cells: &'a [Arc<EdgeRuntime>],
     indices: std::slice::Iter<'a, usize>,
+}
+
+/// One edge a source stream feeds, with its runtime cell.
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeRef<'a> {
+    /// The installed instruction.
+    pub edge: &'a EgressEdge,
+    /// Its runtime cell (hop, and a stream edge's switch state).
+    pub runtime: &'a Arc<EdgeRuntime>,
 }
 
 impl SourceEdges<'_> {
@@ -869,16 +997,16 @@ impl SourceEdges<'_> {
 }
 
 impl<'a> Iterator for SourceEdges<'a> {
-    type Item = &'a EgressEdge;
+    type Item = EdgeRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Resolve through the MEETING-LOCAL slice. `indexing_slicing = "deny"`
+        // Resolve through the MEETING-LOCAL slices. `indexing_slicing = "deny"`
         // forces `.get`, which is also what keeps a stale index from reading a
         // neighbouring meeting's edge if the invariant on `by_source` is ever
         // broken.
         for &i in self.indices.by_ref() {
-            if let Some(edge) = self.edges.get(i) {
-                return Some(edge);
+            if let (Some(edge), Some(runtime)) = (self.edges.get(i), self.cells.get(i)) {
+                return Some(EdgeRef { edge, runtime });
             }
         }
         None
@@ -946,11 +1074,16 @@ impl RoutingSnapshot {
         let Ok(stream) = StreamNumber::try_from(uplink_id) else {
             return Attribution::Unmatched;
         };
-        let Some(declared) = routes
-            .declarations
-            .resolve(&routes.declared_index, sender, stream)
-        else {
-            return Attribution::Unmatched;
+        let declared = match classify(
+            &routes.declarations,
+            &routes.declared_index,
+            &routes.all_muted,
+            sender,
+            stream,
+        ) {
+            Classified::SenderMuted => return Attribution::ServerMuted,
+            Classified::Undeclared => return Attribution::Unmatched,
+            Classified::Declared(declared) => declared,
         };
         if declared.transport != arrival {
             return Attribution::TransportMismatch;
@@ -965,9 +1098,11 @@ impl RoutingSnapshot {
             .get(&(sender, stream))
             .map_or(SourceEdges::EMPTY, Vec::as_slice);
         Attribution::Route {
+            stream,
             paused,
             edges: SourceEdges {
                 edges: &routes.edges,
+                cells: &routes.cells.0,
                 indices: indices.iter(),
             },
         }
@@ -1048,7 +1183,7 @@ impl RoutingSnapshot {
     /// Every other meeting's routes carry over by `Arc` clone. The result is
     /// complete before it is published: apply is all-edges-or-none, so a
     /// partial install is not a representable state.
-    fn with_policy(&self, policy: &MeetingPolicy) -> Self {
+    fn with_policy(&self, policy: &MeetingPolicy, context: &EdgeContext) -> Self {
         // Deliberately the SAME accounting the aggregate bound is tested
         // against, not a second copy of the same subtract-then-add. Two copies
         // would let the accounting and the check drift, and the direction that
@@ -1058,10 +1193,9 @@ impl RoutingSnapshot {
         // [`Self::edges_after_displacing`].
         let total_edges = self.projected_total_edges(policy);
         let mut meetings = self.meetings.clone();
-        meetings.insert(
-            policy.meeting.clone(),
-            Arc::new(MeetingRoutes::build(policy)),
-        );
+        let previous = self.meetings.get(&policy.meeting).map(Arc::as_ref);
+        let routes = MeetingRoutes::build(policy, previous, context);
+        meetings.insert(policy.meeting.clone(), Arc::new(routes));
         Self {
             meetings,
             total_edges,
@@ -1146,20 +1280,29 @@ impl RoutingSnapshot {
 #[derive(Debug)]
 pub struct RoutingTable {
     snapshot: ArcSwap<RoutingSnapshot>,
-}
-
-impl Default for RoutingTable {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// What edge-runtime reconcile needs beyond the policy.
+    edge_context: EdgeContext,
 }
 
 impl RoutingTable {
-    /// A table with no policy installed for any meeting.
+    /// FOR TESTS ONLY: a table whose stream edges get a never-binding backlog
+    /// cap and freshly resolved handles — for tests that are not about the
+    /// stream path. The name says so, so no production call site can reach for
+    /// it by accident; production uses [`Self::with_edge_context`].
     #[must_use]
-    pub fn new() -> Self {
+    pub fn unbounded_for_tests() -> Self {
+        Self::with_edge_context(EdgeContext {
+            backlog_cap: crate::config::MAX_EGRESS_STREAM_BACKLOG_BYTES,
+            handles: Arc::new(crate::observability::metrics::resolve_media_handles()),
+        })
+    }
+
+    /// A table whose stream edges use `edge_context`.
+    #[must_use]
+    pub fn with_edge_context(edge_context: EdgeContext) -> Self {
         Self {
             snapshot: ArcSwap::from_pointee(RoutingSnapshot::default()),
+            edge_context,
         }
     }
 
@@ -1174,7 +1317,7 @@ impl RoutingTable {
     /// One swap of a fully-built successor: readers observe either the prior
     /// generation or the new one, never a partial install.
     pub fn install(&self, policy: &MeetingPolicy) {
-        let next = self.snapshot.load().with_policy(policy);
+        let next = self.snapshot.load().with_policy(policy, &self.edge_context);
         self.snapshot.store(Arc::new(next));
     }
 
@@ -1185,13 +1328,46 @@ impl RoutingTable {
     /// Same single-writer contract as `install` (the session actor), which is
     /// why a plain load-modify-store is safe here.
     pub fn remove(&self, meeting: &MeetingKey) -> bool {
-        match self.snapshot.load().without_meeting(meeting) {
+        let current = self.snapshot.load_full();
+        match current.without_meeting(meeting) {
             Some(next) => {
                 self.snapshot.store(Arc::new(next));
+                // After the swap: the released meeting's stream groups end
+                // (`edge_removed`). A frame already holding the old snapshot
+                // finds its downlinks gone.
+                if let Some(routes) = current.meetings.get(meeting) {
+                    for cell in routes.cells() {
+                        cell.release();
+                    }
+                }
                 true
             }
             None => false,
         }
+    }
+
+    /// The publisher `sender` of `meeting` disconnected: every edge it fed or
+    /// was switching to learns its sources ended (`source_ended`; a pending
+    /// switch to it is abandoned and the current source kept). Called by the
+    /// connection teardown, a sibling of the hot path.
+    pub fn sender_ended(&self, meeting: &MeetingKey, sender: SenderId) {
+        if let Some(routes) = self.snapshot.load().meetings.get(meeting) {
+            for cell in routes.cells() {
+                cell.on_sender_ended(sender);
+            }
+        }
+    }
+
+    /// `STREAM_PER_GROUP` source streams declared across every installed
+    /// policy — `mh_media_stream_sources_declared`.
+    #[must_use]
+    pub fn stream_sources_declared(&self) -> usize {
+        self.snapshot
+            .load()
+            .meetings
+            .values()
+            .map(|routes| routes.stream_sources_declared())
+            .sum()
     }
 }
 

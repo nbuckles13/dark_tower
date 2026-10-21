@@ -30,6 +30,10 @@ use proto_gen::dark_tower::signaling::v1::{
 /// triager on the operator lane is a stable literal they can grep for —
 /// the same discipline as `32_media_metric_hygiene.rs`'s `TRIAGE_SCRAPE`.
 /// Catalogued in `docs/runbooks/devloop-validation.md` §8 (pointer to §6.7).
+/// Margin over MC's settle window for a participant view to converge (a
+/// failure bound, never a pass condition).
+pub const VIEW_MARGIN: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub const TRIAGE_HANDLER_SET: &str = "Triage MH handler-set health";
 
 /// Greppable triage literal for a mock client that could not open a media

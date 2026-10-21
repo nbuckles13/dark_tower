@@ -142,7 +142,7 @@ mod counting_boundary {
 
     fn service() -> MhMediaService {
         MhMediaService::new(
-            SessionManagerHandle::new(mh_test_utils::admission::never_binding()),
+            SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding()),
             "mh-boundary-test".to_string(),
             1_700_000_000_000,
             mh_test_utils::admission::fixture_policy_limits(),

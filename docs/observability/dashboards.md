@@ -260,6 +260,7 @@ authoritative — do not restate a threshold here.
 ### MH Media Path
 
 **File**: `infra/grafana/dashboards/mh-media.json` | **UID**: `mh-media`
+**ConfigMap**: `grafana-dashboards-mh-media` (its own since story 3 MH-A2: the stream-path panels took the shared MH group past `dt-guard kustomize`'s 80% annotation headroom, the same split `mc-media.json` got)
 
 The media-path **triage** board: where an operator goes to answer *why*, after
 `mh-overview.json` has told them *whether*.
@@ -282,6 +283,10 @@ The media-path **triage** board: where an operator goes to answer *why*, after
 | Registration Policy Bounds | What per-registration pre-allocation bounds the running process loaded (config reflection; a step means a pod started on different config) |
 | Policy Apply Timeout | What config-apply reply timeout the running process loaded, in seconds (config reflection; a step means a pod started on different config) |
 | Per-Stream Egress Costs (bytes/s) | What enforced per-stream audio and video costs the running process loaded, in bytes (config reflection; a step means a pod started on different config) |
+| Stream-Path Group Starts by Direction (stream-per-group) | Stream-per-group churn (story 3 MH-A2): attributed publisher groups in, downlink groups opened out. MH is type-blind; MC's assignment is what makes stream-transport traffic video |
+| Stream-Path Group Resets by Reason (per destination) | Which downlink groups MH abandoned for one destination, and why (`subscriber_backlog`, `publisher_reset`, `publisher_stall`, `source_ended`, `edge_removed`). `increase()`; one per group abandoned for a destination, whether or not its stream opened |
+| Live Stream-Path Ingress Groups and Declared Stream Sources | Publisher group streams being read now (process-wide) and `STREAM_PER_GROUP` sources declared across installed policies |
+| Uni Streams per Connection Limit / Egress Backlog Cap per Destination / Mid-Frame Stall Bound (config) | The per-connection uni-stream limit (count), the per-destination backlog cap (bytes) and the mid-frame stall bound (seconds) the running process enforces — one panel each, in its own unit (config reflection) |
 
 Two conventions this board depends on, both easy to break by well-meaning edit:
 

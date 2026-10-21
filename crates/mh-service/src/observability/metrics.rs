@@ -612,6 +612,7 @@ pub struct SessionMetricHandles {
     decisions: [Counter; 2],
     rejection_ratio: Gauge,
     egress_edges: Gauge,
+    stream_sources_declared: Gauge,
     registered_meetings: Gauge,
     /// Indexed by [`MeetingTeardownOutcome::ALL`] order.
     teardowns: [Counter; 3],
@@ -696,6 +697,17 @@ impl SessionMetricHandles {
         self.egress_edges.set(edges as f64);
     }
 
+    /// Publish `STREAM_PER_GROUP` source streams declared across every
+    /// installed policy on this handler — ALWAYS recomputed from the installed
+    /// snapshot at each apply/release, never delta-maintained.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "declared source streams are bounded by MH_MAX_SOURCE_STREAMS_PER_MEETING x meetings (<= 2^30)"
+    )]
+    pub fn publish_stream_sources_declared(&self, count: usize) {
+        self.stream_sources_declared.set(count as f64);
+    }
+
     /// Publish how many meetings this handler holds registered.
     ///
     /// ALWAYS the map's current length, set at every mutation site — never
@@ -729,6 +741,10 @@ pub fn resolve_session_handles() -> SessionMetricHandles {
         ),
         egress_edges: gauge!(
             "mh_media_egress_edges",
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        ),
+        stream_sources_declared: gauge!(
+            "mh_media_stream_sources_declared",
             KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
         ),
         registered_meetings: gauge!(
@@ -1311,20 +1327,18 @@ pub enum MediaDropReason {
     /// spelling. This one is a pre-parse whole-datagram cap. Same constant, two
     /// checks, two tokens, both implemented.
     OversizeDatagram,
-    /// A connection exceeded its per-connection stream **creation-rate** cap.
+    /// A publisher connection exceeded its per-connection unidirectional
+    /// stream **creation-rate** cap (`MH_STREAM_OPENS_PER_CONNECTION_PER_SEC`).
     ///
-    /// **UNREACHABLE UNTIL UNI-STREAM/VIDEO**, in the same sense as
-    /// [`Self::PartialFrameDiscard`] and for the same reason: MH opens no
-    /// unidirectional-stream accept loop, and audio is one frame per datagram
-    /// (ADR-0036 §1), so there is no stream-creation event to rate-limit. A
-    /// fixed-window limiter was built for this token at story task 16 and
-    /// **removed at review** — it was unreachable enforcement machinery behind a
-    /// catalog entry that described it as a live detector, which is a control
-    /// that reads as present and cannot fire.
+    /// Enforced at accept, before a single byte of the stream is read, by
+    /// `crate::media::caps::TokenBucket` in `crate::media::stream_ingress`; the
+    /// refused stream is `STOP_SENDING`'d with
+    /// [`crate::transport::INGRESS_REFUSED`].
     ///
-    /// The token is kept so the author of the accept path inherits the spelling
-    /// rather than inventing a second one, and inherits no bound they did not
-    /// choose. Owner: whichever task lands the uni-stream accept path (video).
+    /// **One increment per refused STREAM, on a frames counter.** A refused
+    /// stream is a whole group whose frames MH never reads, so this is a LOWER
+    /// BOUND on frames lost, not a frame count. Ingress direction: it happens
+    /// before attribution.
     StreamRateLimited,
     /// No forwarding policy is installed for this meeting. The remedy is the
     /// control plane (ADR-0036 §8), not this handler.
@@ -1342,15 +1356,20 @@ pub enum MediaDropReason {
     /// to resolve, resolved structurally (a distinct token) rather than with an
     /// `entry_point` label. **Should read zero forever.**
     RelayRewriteFailed,
-    /// A partially-read stream frame was discarded.
+    /// A publisher's group stream ended — FIN, `RESET_STREAM`, a mid-frame
+    /// stall, or the publisher's connection closing — while a frame HEADER was
+    /// partly buffered.
     ///
-    /// **UNREACHABLE UNTIL VIDEO.** Audio is one frame per datagram (ADR-0036
-    /// §1), so the only producer is the stream-carried path's `Ok(None)`
-    /// caller obligation documented at `media_protocol::codec`'s
-    /// `decode_stream_frame`. It is defined now because that obligation names
-    /// MH as one of its two owners and a counted give-up is the whole point of
-    /// it; leaving the token out would make the video path's first author
-    /// invent a spelling.
+    /// INGRESS direction (re-classified from egress at story 3 MH-A2): that
+    /// frame never reached `forwarded{direction="ingress"}` (counted at header
+    /// completion), so this term is what keeps the stream path's ingress
+    /// identity whole. A stream that ends mid-PAYLOAD does NOT count here — the
+    /// frame was already counted forwarded — and its downstream streams are
+    /// reset, counted on `mh_media_group_resets_total`. It counts on EVERY
+    /// non-clean end, MH's own abort (connection teardown, shutdown) included:
+    /// a publisher disconnect reaches the group task either as a read error or
+    /// as an abort, decided by scheduling, and one event must not have two
+    /// counts. At most one per live group per teardown.
     PartialFrameDiscard,
     /// The QUIC connection received a DATAGRAM frame that MH's ingress loop
     /// never read.
@@ -1555,14 +1574,70 @@ impl MediaDropReason {
             | Self::NoMediaSession
             | Self::ServerMuted
             | Self::UnmatchedStream
-            | Self::TransportMismatch => MediaDirection::Ingress,
+            | Self::TransportMismatch
+            | Self::PartialFrameDiscard => MediaDirection::Ingress,
             Self::EgressQueueOverflow
             | Self::TransportSendRefused
             | Self::ConnectionClosed
             | Self::NoSubscriber
             | Self::NoLocalSubscriber
-            | Self::RelayRewriteFailed
-            | Self::PartialFrameDiscard => MediaDirection::Egress,
+            | Self::RelayRewriteFailed => MediaDirection::Egress,
+        }
+    }
+}
+
+/// Why MH abandoned one subscriber's downlink group stream —
+/// `mh_media_group_resets_total{reason}` (story 3 R-12, R-21).
+///
+/// **One increment per downlink group abandoned for a destination, whether or
+/// not its uni stream was opened**, counted in exactly one place,
+/// `crate::media::downlink::Downlink::abandon`, which is idempotent. One
+/// full-channel or backlog event on an edge with N live downlinks therefore
+/// counts 1 + N. Not a subset of `group_starts{egress}`. Every abandonment is a `RESET_STREAM` with the single reasonless
+/// code [`crate::transport::GROUP_ABANDONED`]; the reason is MH-local. A reset
+/// made by the seam's DROP contract because the subscriber's connection is
+/// already gone is deliberately NOT counted (the destination no longer
+/// exists). Counts GROUPS, never frames: frames lost in an abandoned group are
+/// not counted again on `mh_media_frames_dropped_total`. No `direction` label:
+/// every reason is egress-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupResetReason {
+    /// The destination's capped backlog (`MH_EGRESS_STREAM_BACKLOG_BYTES`)
+    /// overflowed, or its writer fell two groups behind.
+    SubscriberBacklog,
+    /// The publisher's group ended mid-group for a PUBLISHER-SIDE reason:
+    /// `RESET_STREAM`, a FIN that truncates the frame in flight, or MH refusing
+    /// the rest of the group for a sender fault (that fault is counted on
+    /// `mh_media_frames_dropped_total` by its own token).
+    PublisherReset,
+    /// The publisher stalled mid-frame past `MH_STREAM_MID_FRAME_STALL_MS`.
+    PublisherStall,
+    /// The source ended: its publisher's connection closed, or MC stopped
+    /// declaring the stream.
+    SourceEnded,
+    /// MC removed the edge, or `EndMeeting` released the meeting.
+    EdgeRemoved,
+}
+
+impl GroupResetReason {
+    /// Every value, in catalog order.
+    pub const ALL: [Self; 5] = [
+        Self::SubscriberBacklog,
+        Self::PublisherReset,
+        Self::PublisherStall,
+        Self::SourceEnded,
+        Self::EdgeRemoved,
+    ];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SubscriberBacklog => "subscriber_backlog",
+            Self::PublisherReset => "publisher_reset",
+            Self::PublisherStall => "publisher_stall",
+            Self::SourceEnded => "source_ended",
+            Self::EdgeRemoved => "edge_removed",
         }
     }
 }
@@ -1640,6 +1715,13 @@ pub struct MediaMetricHandles {
     /// MH's own application egress queue depth. **Not** quinn's send buffer,
     /// which `wtransport` exposes no accessor for.
     egress_queue_depth: Gauge,
+    /// `mh_media_group_starts_total`, indexed by [`MediaDirection::ALL`].
+    group_starts: [Counter; 2],
+    /// `mh_media_group_resets_total`, indexed by [`GroupResetReason::ALL`].
+    group_resets: [Counter; 5],
+    /// `mh_media_stream_ingress_groups`: publisher group streams being read
+    /// right now, process-wide (moved by an RAII guard, never last-writer-wins).
+    stream_ingress_groups: Gauge,
 }
 
 impl MediaMetricHandles {
@@ -1728,6 +1810,38 @@ impl MediaMetricHandles {
     #[must_use]
     pub const fn egress_queue_depth(&self) -> &Gauge {
         &self.egress_queue_depth
+    }
+
+    /// `mh_media_group_starts_total{direction}`: ingress = one per accepted,
+    /// attributed publisher group stream; egress = one per downlink stream
+    /// actually opened.
+    #[must_use]
+    pub fn group_starts(&self, direction: MediaDirection) -> &Counter {
+        let [ingress, egress] = &self.group_starts;
+        match direction {
+            MediaDirection::Ingress => ingress,
+            MediaDirection::Egress => egress,
+        }
+    }
+
+    /// `mh_media_group_resets_total{reason}`.
+    #[must_use]
+    pub fn group_resets(&self, reason: GroupResetReason) -> &Counter {
+        let [backlog, publisher_reset, stall, source_ended, edge_removed] = &self.group_resets;
+        match reason {
+            GroupResetReason::SubscriberBacklog => backlog,
+            GroupResetReason::PublisherReset => publisher_reset,
+            GroupResetReason::PublisherStall => stall,
+            GroupResetReason::SourceEnded => source_ended,
+            GroupResetReason::EdgeRemoved => edge_removed,
+        }
+    }
+
+    /// The live publisher group streams gauge, moved only by
+    /// `crate::media::stream_ingress`'s RAII guard.
+    #[must_use]
+    pub const fn stream_ingress_groups(&self) -> &Gauge {
+        &self.stream_ingress_groups
     }
 
     /// Publish the sampling ratio the sampler was built with.
@@ -1820,6 +1934,27 @@ pub fn resolve_media_handles() -> MediaMetricHandles {
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     );
 
+    // Group-level stream-path series (story 3 R-30). Counters resolved here
+    // are present at zero from boot; no kind, no identity.
+    let group_starts = MediaDirection::ALL.map(|direction| {
+        counter!(
+            "mh_media_group_starts_total",
+            "direction" => direction.as_str(),
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        )
+    });
+    let group_resets = GroupResetReason::ALL.map(|reason| {
+        counter!(
+            "mh_media_group_resets_total",
+            "reason" => reason.as_str(),
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        )
+    });
+    let stream_ingress_groups = gauge!(
+        "mh_media_stream_ingress_groups",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    );
+
     MediaMetricHandles {
         forwarded,
         dropped,
@@ -1828,7 +1963,46 @@ pub fn resolve_media_handles() -> MediaMetricHandles {
         latency,
         sample_ratio,
         egress_queue_depth,
+        group_starts,
+        group_resets,
+        stream_ingress_groups,
     }
+}
+
+/// The stream-path bounds MH ENFORCES, published once at setup from the same
+/// config fields enforcement reads (ADR-0036 §11 "derive rather than guard"):
+///
+/// - `mh_media_uni_streams_per_connection_limit` — the declared QUIC
+///   `max_concurrent_uni_streams` handed to quinn, PER CONNECTION. It is NOT
+///   the limit of the process-wide `mh_media_stream_ingress_groups`.
+/// - `mh_media_egress_stream_backlog_limit_bytes` — the per-DESTINATION
+///   backlog cap (`MH_EGRESS_STREAM_BACKLOG_BYTES`).
+/// - `mh_media_stream_mid_frame_stall_seconds` — `MH_STREAM_MID_FRAME_STALL_MS`
+///   in seconds.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "every value is a bounded config integer far below 2^52"
+)]
+pub fn publish_stream_limits(
+    uni_streams_per_connection: u32,
+    backlog_limit_bytes: usize,
+    stall: Duration,
+) {
+    gauge!(
+        "mh_media_uni_streams_per_connection_limit",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(f64::from(uni_streams_per_connection));
+    gauge!(
+        "mh_media_egress_stream_backlog_limit_bytes",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(backlog_limit_bytes as f64);
+    gauge!(
+        "mh_media_stream_mid_frame_stall_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(stall.as_secs_f64());
 }
 
 // ============================================================================
@@ -2651,5 +2825,48 @@ mod tests {
         snap.counter("mh_token_refresh_failures_total")
             .with_labels(&[("error_type", category)])
             .assert_delta(1);
+    }
+
+    /// The stream-path bounds are published from the values enforcement reads
+    /// (story 3 MH-A2), in their catalog units.
+    #[test]
+    fn stream_limits_and_declared_sources_are_published_in_catalog_units() {
+        use common::observability::testing::MetricAssertion;
+        let snapshot = MetricAssertion::snapshot();
+        publish_stream_limits(64, 262_144, Duration::from_millis(1500));
+        snapshot
+            .gauge("mh_media_uni_streams_per_connection_limit")
+            .assert_value(64.0);
+        snapshot
+            .gauge("mh_media_egress_stream_backlog_limit_bytes")
+            .assert_value(262_144.0);
+        snapshot
+            .gauge("mh_media_stream_mid_frame_stall_seconds")
+            .assert_value(1.5);
+        resolve_session_handles().publish_stream_sources_declared(3);
+        snapshot
+            .gauge("mh_media_stream_sources_declared")
+            .assert_value(3.0);
+    }
+
+    #[test]
+    fn group_reset_reasons_are_distinct_and_complete() {
+        let tokens: std::collections::HashSet<&str> =
+            GroupResetReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(tokens.len(), GroupResetReason::ALL.len());
+        for token in [
+            "subscriber_backlog",
+            "publisher_reset",
+            "publisher_stall",
+            "source_ended",
+            "edge_removed",
+        ] {
+            assert!(tokens.contains(token), "{token}");
+        }
+        assert_eq!(
+            MediaDropReason::PartialFrameDiscard.direction(),
+            MediaDirection::Ingress,
+            "re-classified at story 3 MH-A2: it counts frames that never reached forwarded{{ingress}}"
+        );
     }
 }

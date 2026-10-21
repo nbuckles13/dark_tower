@@ -146,7 +146,7 @@ pub async fn run_ingress<T: MediaTransport>(
             () = cancel.cancelled() => return (LoopExit::Cancelled, FramesRead(frames_read)),
             received = transport.recv_datagram() => match received {
                 Ok(payload) => payload,
-                Err(TransportError::ConnectionClosed | TransportError::StreamClosed) => {
+                Err(TransportError::ConnectionClosed(_) | TransportError::StreamClosed(_)) => {
                     return (LoopExit::ConnectionClosed, FramesRead(frames_read))
                 }
             },

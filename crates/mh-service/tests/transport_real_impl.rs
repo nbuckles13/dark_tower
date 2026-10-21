@@ -47,7 +47,7 @@
 mod common;
 
 use bytes::Bytes;
-use mh_service::transport::{MediaSendStream, MediaTransport, TransportError};
+use mh_service::transport::{MediaSendStream, MediaTransport, TransportCause, TransportError};
 use mh_service::webtransport::WtMediaTransport;
 use mh_test_utils::transport_shim::LossDelayTransport;
 use std::sync::Arc;
@@ -150,7 +150,9 @@ async fn assert_write_after_finish_is_stream_closed<S: MediaSendStream>(mut stre
 
     assert_eq!(
         after,
-        Err(TransportError::StreamClosed),
+        Err(TransportError::StreamClosed(TransportCause::local(
+            "expected"
+        ))),
         "write after finish must report StreamClosed: the forward path relies on this to \
          distinguish a dead STREAM from a dead CONNECTION, and a double diverging from the real \
          transport here would be invisible exactly where task 16 trusts it"
@@ -207,7 +209,9 @@ async fn real_transport_reports_connection_closed_when_the_peer_goes_away() {
 
     assert_eq!(
         result,
-        Err(TransportError::ConnectionClosed),
+        Err(TransportError::ConnectionClosed(TransportCause::local(
+            "expected"
+        ))),
         "a closed connection must surface as ConnectionClosed"
     );
 }
@@ -318,4 +322,150 @@ async fn measure_whether_a_received_datagram_payload_is_uniquely_owned() {
          now fails, correctness is unaffected (the arena path is taken) but the zero-copy \
          claim in main.md's §Devloop Verification Steps must be re-measured, not deleted."
     );
+}
+
+/// Read a client-side uni stream to its end, reporting how it ended.
+async fn read_to_end(
+    mut received: wtransport::RecvStream,
+) -> (Vec<u8>, Result<(), wtransport::error::StreamReadError>) {
+    let mut buf = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        match tokio::time::timeout(RIG_TIMEOUT, received.read(&mut chunk))
+            .await
+            .expect("reads must make progress")
+        {
+            Ok(Some(n)) => buf.extend_from_slice(chunk.get(..n).unwrap_or(&[])),
+            Ok(None) => return (buf, Ok(())),
+            Err(e) => return (buf, Err(e)),
+        }
+    }
+}
+
+/// The seam's ABANDONMENT contract on the PRODUCTION implementation (story 3
+/// MH-A2): a send stream dropped without `finish`/`reset` RESETS — the peer
+/// sees `RESET_STREAM`, never a clean FIN on a possibly half-written frame.
+/// quinn's own `Drop` would FINISH; this is what makes the shim's
+/// drop-equals-reset model faithful rather than a property production lacks.
+///
+/// The peer first accepts the stream and reads its first bytes: a reset that
+/// overtakes the WebTransport stream header leaves the peer unable to
+/// attribute the stream to the session at all, so it would never surface.
+#[tokio::test]
+async fn a_dropped_real_send_stream_resets_rather_than_finishing() {
+    let pair = RealTransportPair::establish().await;
+    let mut stream = tokio::time::timeout(RIG_TIMEOUT, pair.server.open_uni())
+        .await
+        .expect("open_uni must not hang")
+        .expect("open_uni must succeed");
+    stream.write_all(b"half a frame").await.expect("write");
+    let mut received = tokio::time::timeout(RIG_TIMEOUT, pair.client.accept_uni())
+        .await
+        .expect("the client must observe the stream")
+        .expect("accept_uni");
+    let mut first = [0_u8; 4];
+    received.read_exact(&mut first).await.expect("first bytes");
+    drop(stream);
+    let (_, end) = read_to_end(received).await;
+    assert_reset_with_group_abandoned(end, "a dropped stream must arrive RESET, not finished");
+}
+
+/// Fail CLOSED: only a stream RESET carrying MH's `GROUP_ABANDONED` code
+/// passes — a connection loss, a stop or a rig race does not.
+fn assert_reset_with_group_abandoned(
+    end: Result<(), wtransport::error::StreamReadError>,
+    what: &str,
+) {
+    let code = match end {
+        Err(wtransport::error::StreamReadError::Reset(code)) => Some(code.into_inner()),
+        _ => None,
+    };
+    assert_eq!(
+        code,
+        Some(u64::from(mh_service::transport::GROUP_ABANDONED)),
+        "{what}: expected RESET_STREAM(GROUP_ABANDONED), got {end:?}"
+    );
+}
+
+/// An explicit reset reaches the peer as a reset; a finish as a clean end.
+#[tokio::test]
+async fn real_reset_and_finish_reach_the_peer_as_such() {
+    let pair = RealTransportPair::establish().await;
+    let mut reset = pair.server.open_uni().await.expect("open");
+    reset.write_all(b"xxxx").await.expect("write");
+    let mut received = pair.client.accept_uni().await.expect("accept");
+    let mut first = [0_u8; 4];
+    received.read_exact(&mut first).await.expect("first bytes");
+    reset
+        .reset(mh_service::transport::GROUP_ABANDONED)
+        .expect("reset a live stream");
+    assert_reset_with_group_abandoned(read_to_end(received).await.1, "an explicit reset");
+
+    let mut finished = pair.server.open_uni().await.expect("open");
+    finished.set_priority(mh_service::media::downlink::quic_priority(2));
+    finished.write_all(b"whole group").await.expect("write");
+    finished.finish().await.expect("finish");
+    drop(finished); // finished: the drop contract must NOT reset it
+    let received = pair.client.accept_uni().await.expect("accept");
+    let (bytes, end) = read_to_end(received).await;
+    assert!(end.is_ok(), "a finished stream ends cleanly: {end:?}");
+    assert_eq!(bytes, b"whole group");
+}
+
+/// The receive side over real QUIC: `accept_uni` + `read_chunk` deliver the
+/// bytes and the FIN, and a peer reset surfaces as `StreamReadError::Reset`.
+#[tokio::test]
+async fn real_accept_uni_reads_chunks_fin_and_reset() {
+    use mh_service::transport::{MediaRecvStream, StreamReadError};
+    let pair = RealTransportPair::establish().await;
+
+    let mut sent = pair
+        .client
+        .open_uni()
+        .await
+        .expect("open")
+        .await
+        .expect("opened");
+    sent.write_all(b"group bytes").await.expect("write");
+    sent.finish().await.expect("finish");
+    let mut stream = tokio::time::timeout(RIG_TIMEOUT, pair.server.accept_uni())
+        .await
+        .expect("accept must not hang")
+        .expect("accept_uni");
+    let mut got = Vec::new();
+    while let Some(chunk) = tokio::time::timeout(RIG_TIMEOUT, stream.read_chunk(1024))
+        .await
+        .expect("progress")
+        .expect("read")
+    {
+        got.extend_from_slice(&chunk);
+    }
+    assert_eq!(got, b"group bytes");
+
+    let mut abandoned = pair
+        .client
+        .open_uni()
+        .await
+        .expect("open")
+        .await
+        .expect("opened");
+    abandoned.write_all(b"partial").await.expect("write");
+    let mut stream = tokio::time::timeout(RIG_TIMEOUT, pair.server.accept_uni())
+        .await
+        .expect("accept must not hang")
+        .expect("accept_uni");
+    let first = stream.read_chunk(1024).await.expect("read").expect("bytes");
+    assert!(!first.is_empty());
+    abandoned.reset(0x5254_u32.into()).expect("reset");
+    let outcome = loop {
+        match tokio::time::timeout(RIG_TIMEOUT, stream.read_chunk(1024))
+            .await
+            .expect("progress")
+        {
+            Ok(Some(_)) => {}
+            other => break other,
+        }
+    };
+    assert_eq!(outcome, Err(StreamReadError::Reset(0x5254)));
+    stream.stop(mh_service::transport::INGRESS_REFUSED);
 }

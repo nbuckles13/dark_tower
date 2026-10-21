@@ -11,6 +11,7 @@ use std::time::Duration;
 use crate::fixtures::metrics::{
     format_instance_map, gauge_by_instance_present, instance_for_pod_ip,
 };
+pub use crate::fixtures::metrics::{BASELINE_SETTLE_BOUND, PINNED_METRIC_BOUND};
 use crate::fixtures::mh_grpc::{self, Handler, ReleaseOnDrop};
 use crate::fixtures::participant::Participant;
 use crate::fixtures::PrometheusClient;
@@ -382,4 +383,124 @@ pub async fn injectable_handlers(prom: &PrometheusClient, settle_bound: Duration
         );
     }
     handlers
+}
+
+/// One declared-reading egress (story 3): `source`'s `stream` into
+/// `subscriber`'s `slot`, the superseded per-egress transport UNSPECIFIED as
+/// MC-A writes it (the edge's transport derives from `source_streams`).
+#[must_use]
+pub fn declared_edge(
+    id: u32,
+    subscriber: u32,
+    slot: u32,
+    source: u32,
+    stream: u16,
+) -> EgressStream {
+    edge(
+        id,
+        subscriber,
+        slot,
+        source,
+        u32::from(stream),
+        TransportMode::Unspecified,
+    )
+}
+
+/// [`source_stream`] taking the 16-bit send-id shape the media fixtures use.
+#[must_use]
+pub fn declared_source(
+    sender_id: u32,
+    stream: u16,
+    mode: TransportMode,
+    disposition: SourceDisposition,
+) -> SourceStream {
+    source_stream(sender_id, u32::from(stream), mode, disposition)
+}
+
+/// Settled per-pod baselines for `promql` (shared by the MH attribution and
+/// video-forwarding suites), bounded by [`BASELINE_SETTLE_BOUND`].
+pub async fn baselines(
+    prom: &PrometheusClient,
+    promql: &str,
+) -> crate::fixtures::metrics::InstanceCounters {
+    crate::fixtures::metrics::settled_baseline(
+        prom,
+        promql,
+        BASELINE_SETTLE_BOUND,
+        "the assertion under test",
+    )
+    .await
+}
+
+/// Each pinned pod's counter rises by at least `at_least` past its baseline,
+/// within [`PINNED_METRIC_BOUND`]. A lower bound, so one stray event cannot
+/// satisfy it.
+pub async fn assert_rise(
+    prom: &PrometheusClient,
+    handlers: &[Handler],
+    promql: &str,
+    base: &crate::fixtures::metrics::InstanceCounters,
+    at_least: u32,
+    phase: &str,
+) {
+    for h in handlers {
+        let b = instance_for_pod_ip(base, &h.pod_ip).map_or(0.0, |(_, v)| v);
+        let target = b + f64::from(at_least);
+        crate::fixtures::metrics::poll_until_pinned_instance(
+            prom,
+            promql,
+            &h.pod_ip,
+            PINNED_METRIC_BOUND,
+            Duration::from_secs(2),
+            phase,
+            &format!(
+                ">= {target} (baseline {b} + the {at_least} test events sent to this pod). \
+                 If short, rule out TRANSPORT-OVERFLOW first: receive-buffer loss before \
+                 attribution is counted as transport_receive_dropped only at connection \
+                 TEARDOWN (it is forensic, not live), so read that series on this pod after \
+                 the run; a rise there is input-side loss, not an attribution fault, and is \
+                 never fixed by relaxing this gate"
+            ),
+            |v| v >= target,
+        )
+        .await;
+    }
+}
+
+/// Install `edges` + `declared` at `step` on every pod; require the apply and
+/// a per-stream echo of exactly the declared set (PAUSED and DROP_AT_INGRESS
+/// included — the echo carries no disposition).
+pub async fn install_all(
+    injections: &mut [Injection<'_>],
+    step: u64,
+    edges: Vec<EgressStream>,
+    declared: Vec<SourceStream>,
+) {
+    use std::collections::BTreeSet;
+    let want: BTreeSet<(u32, u32, i32)> = declared
+        .iter()
+        .map(|s| (s.sender_id, s.stream_number, s.transport_mode))
+        .collect();
+    for injection in injections.iter_mut() {
+        let g = injection.generation(step);
+        let resp = injection
+            .register_full(g, edges.clone(), &[], declared.clone())
+            .await;
+        assert_eq!(
+            resp.applied_generation, g,
+            "INJECT APPLY on {}: the mixed-transport registration must apply",
+            injection.handler.name
+        );
+        let echoed: BTreeSet<(u32, u32, i32)> = resp
+            .applied_source_streams
+            .iter()
+            .map(|e| (e.sender_id, e.stream_number, e.transport_mode))
+            .collect();
+        assert_eq!(
+            echoed, want,
+            "INJECT ECHO on {}: the per-stream echo must list every declared source stream \
+             with its transport",
+            injection.handler.name
+        );
+    }
 }

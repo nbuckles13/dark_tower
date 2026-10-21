@@ -493,7 +493,7 @@ async fn a_frame_for_a_meeting_with_no_policy_is_dropped_as_no_policy() {
     // this file's central distinction (whose problem is it: the control plane's,
     // or MC's assignment?), so the fixture has to be able to express both.
     let handles = Arc::new(resolve_media_handles());
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     let registry = LocalSubscribers::new();
     let mut forwarder = ConnectionForwarder::new(
         MeetingKey::new(MEETING),
@@ -579,7 +579,7 @@ async fn a_sender_valid_in_one_meeting_forwards_nothing_in_another() {
     // separate tables cannot demonstrate non-resolution across them — the test
     // would pass for an implementation that leaks.
     let handles = Arc::new(resolve_media_handles());
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     for (meeting, publisher) in [("meeting-a", 5_u32), ("meeting-b", 6_u32)] {
         let request = register_request(meeting, 1, vec![loopback_egress(1, publisher, 0)]);
         let policy = MeetingPolicy::from_request(

@@ -59,7 +59,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // through yet — it propagates as a non-zero exit via the default Debug-to-
     // stderr dump, same as AC's exemplar; nothing is lost because no spans/logs
     // have been emitted yet.
-    let config = Config::from_env()?;
+    //
+    // One structured ERROR line first, in the same JSON shape the subscriber
+    // would have produced, so a refusal is legible in the log pipeline as well
+    // as on stderr. This matters most for the boot memory check (story 3
+    // R-21): a pod that refuses to boot shows only as CrashLoopBackOff, and
+    // this line — target `mh.config`, message beginning "Pod memory check
+    // failed: refusing to start" — names every term, its key and the levers.
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            // serde_json, never `{:?}`: Debug escaping is not JSON, and the
+            // message can carry operator-supplied values.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "level": "ERROR",
+                    "target": "mh.config",
+                    "fields": { "message": error.to_string() },
+                })
+            );
+            return Err(error.into());
+        }
+    };
 
     // R-55: initialize the OpenTelemetry SDK only when explicitly enabled
     // (OTEL_ENABLED=true). `init_otel` is async, eagerly probes the collector,
@@ -215,6 +237,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Configuration loaded successfully"
     );
 
+    // Stream-path limits and the boot memory check (story 3 R-21, R-23). All
+    // REQUIRED reads, so provenance is `env`. The memory figures are the ones
+    // `config::check_pod_memory` certified; OPS-B's runbook anchors on target
+    // `mh.config.memory`.
+    info!(
+        target: "mh.config.memory",
+        stream_opens_per_connection_per_sec = config.stream_path.opens_per_connection_per_sec,
+        egress_stream_backlog_bytes = config.stream_path.egress_stream_backlog_bytes,
+        stream_mid_frame_stall_ms =
+            u64::try_from(config.stream_path.mid_frame_stall.as_millis()).unwrap_or(u64::MAX),
+        pod_memory_limit_bytes = config.memory_budget.limit_bytes,
+        memory_check_allowed_bytes = config.memory_budget.allowed_bytes,
+        memory_check_backlog_term_bytes = config.memory_budget.backlog_term_bytes,
+        memory_check_per_connection_bytes = config.memory_budget.per_connection_bytes,
+        memory_check_connection_term_bytes = config.memory_budget.connection_term_bytes,
+        memory_check_required_bytes = config.memory_budget.required_bytes,
+        memory_check_headroom_bytes = config.memory_budget.headroom_bytes(),
+        connection_send_window_bytes = mh_service::config::CONNECTION_SEND_WINDOW_BYTES,
+        connection_receive_window_bytes = mh_service::config::CONNECTION_RECEIVE_WINDOW_BYTES,
+        memory_check_backlog_allocation_factor = mh_service::config::BACKLOG_ALLOCATION_FACTOR,
+        "Pod memory check passed: bounded media buffers fit the allowed share of the pod \
+         memory limit (terms as computed by config::check_pod_memory)"
+    );
+
     // Retired keys still present in the environment (two-deploy retirement,
     // step 1: present ON PURPOSE, so INFO, not WARN). Names only — never a
     // value — so nobody tunes a key believing it still applies.
@@ -354,8 +400,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The actor enforces the derived stream ceiling from the ONE
     // `EgressAdmission` computed at config load (story 2 R-19). Built AFTER the
     // metrics recorder, so the admission handles it resolves are live.
-    let session_manager =
-        SessionManagerHandle::new(StreamAdmission::from(&config.egress_admission));
+    // Media forward-path setup (ADR-0036 §11): every metric handle the hot
+    // path uses is resolved ONCE, here, before any connection exists — so no
+    // registry lookup can occur per frame. This is the sibling half of the
+    // layout constraint; `crate::media` never resolves a handle. Resolved
+    // before the session manager so its routing table's stream edges count
+    // through these same handles.
+    let media_setup = mh_service::media::MediaSetup {
+        handles: Arc::new(mh_service::observability::metrics::resolve_media_handles()),
+        latency_sample_ratio: config.media_latency_sample_ratio,
+        stream_path: config.stream_path,
+        downlink_channel_capacity: mh_service::media::downlink_channel_capacity(
+            config.egress_admission.stream_ceiling,
+        ),
+    };
+    let session_manager = SessionManagerHandle::with_edge_context(
+        StreamAdmission::from(&config.egress_admission),
+        mh_service::media::edge_runtime::EdgeContext {
+            backlog_cap: config.stream_path.egress_stream_backlog_bytes,
+            handles: Arc::clone(&media_setup.handles),
+        },
+    );
     // GC's `current_streams` reads the same live table admission counts
     // against (see `GcClient::current_streams`).
     let routing_table_for_gc = session_manager.routing_table();
@@ -472,14 +537,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     info!(addr = %grpc_addr, "gRPC server started");
 
-    // Media forward-path setup (ADR-0036 §11): every metric handle the hot
-    // path uses is resolved ONCE, here, before any connection exists — so no
-    // registry lookup can occur per frame. This is the sibling half of the
-    // layout constraint; `crate::media` never resolves a handle.
-    let media_setup = mh_service::media::MediaSetup {
-        handles: Arc::new(mh_service::observability::metrics::resolve_media_handles()),
-        latency_sample_ratio: config.media_latency_sample_ratio,
-    };
+    // The media setup (resolved before the session manager, above):
     // Published ONCE, unconditionally, at process start — not per media session.
     //
     // The handle is resolved above, so the series exists from startup either
@@ -508,6 +566,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     media_setup
         .handles
         .publish_sample_ratio(media_setup.latency_sample_ratio);
+    // The stream-path bounds MH enforces, from the same fields enforcement
+    // reads (ADR-0036 §11 "derive rather than guard").
+    mh_service::observability::metrics::publish_stream_limits(
+        config.quic_transport.max_concurrent_uni_streams,
+        config.stream_path.egress_stream_backlog_bytes,
+        config.stream_path.mid_frame_stall,
+    );
 
     // Start WebTransport server BEFORE GC registration (ADR-0010 ordering)
     // This ensures MH can accept client connections before GC starts routing traffic here

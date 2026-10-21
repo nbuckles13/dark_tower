@@ -463,6 +463,16 @@ receiver validates against its own declared slots. The uplink `hop_sequence` is 
 validated by MH. Do not conflate the 16-bit relay field with the key id's 8-bit `stream` field:
 on the uplink they carry the same value in two fields of different width and different trust.
 
+**Stream reset and stop codes carry no reason** (story 3 MH-A2). MH abandons a downlink group
+with `RESET_STREAM`, never a FIN, using a single application code that carries no reason; a
+receiver treats any reset as "group abandoned" — it discards the partial frame and waits for the
+next group start — and MUST NOT branch on the code's value. MH `STOP_SENDING`s a refused publisher
+stream with a single code; the publisher treats it as "this group is not wanted". Why the value is
+unusable anyway: wtransport 0.7.2 hands the varint straight to quinn without the
+WebTransport-over-HTTP/3 application-code mapping, so a browser may surface these with a null or
+unmapped `streamErrorCode`. The codes' one home is `crates/mh-service/src/transport/mod.rs`
+(`GROUP_ABANDONED`, `INGRESS_REFUSED`); the abandonment reason is MH-local telemetry only.
+
 **Version.** v3 is the only version. A frame of any other version rejects `unknown_version`; a
 join not declaring 3 is refused (§2 above). v2 is an intentional wire break with no dual decode,
 cut over atomically with the TypeScript and Rust codecs (P2, 2026-10-21). The governing vectors file

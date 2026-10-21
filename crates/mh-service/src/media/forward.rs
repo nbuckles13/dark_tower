@@ -46,11 +46,12 @@
 //! price of the derived-offset guarantee, and that guarantee is not optional —
 //! see [`rewrite`] below.
 
+use crate::media::edge_runtime::EdgeRuntime;
 use crate::media::forwarder::{ConnectionForwarder, ForwardParts};
 use crate::media::queue::{depth_as_gauge, SharedQueue};
 use crate::observability::metrics::{MediaDirection, MediaDropReason, MediaLatencyPhase};
 use crate::observability::per_frame_trace;
-use crate::routing::{Attribution, EgressEdge, RoutingSnapshot, SourceEdges};
+use crate::routing::{Attribution, EdgeRef, RoutingSnapshot, SourceEdges};
 use crate::session::LocalSubscriberSnapshot;
 use bytes::{Bytes, BytesMut};
 use core::fmt;
@@ -284,40 +285,39 @@ pub fn forward_one(
     // ATTRIBUTION (story 3 R-20): (bound sender, uplink id, arrival transport)
     // against the meeting's declared source streams. The match is exhaustive:
     // every non-`Route` arm records exactly one Ingress drop.
-    let reason = match snapshot.attribute(
+    let attribution = snapshot.attribute(
         forwarder.meeting(),
         forwarder.sender(),
         uplink_id,
         TransportMode::Datagram,
-    ) {
-        Attribution::Route { paused, edges } => {
-            let outcome = fan_out(
-                forwarder,
-                subscribers,
-                edges,
-                paused,
-                frame.payload,
-                popped_at,
-                sampled,
-            );
-            // Processing latency is observed for frames that reached at least
-            // one edge decision — never for a frame delivered nowhere
-            // (`no_subscriber`), exactly as before attribution existed.
-            if sampled && outcome.rejected.is_none() {
-                observe(
-                    forwarder,
-                    MediaLatencyPhase::Processing,
-                    Instant::now().saturating_duration_since(popped_at),
-                );
-            }
-            return outcome;
-        }
-        Attribution::NoPolicy => MediaDropReason::NoPolicy,
-        Attribution::ServerMuted => MediaDropReason::ServerMuted,
-        Attribution::Unmatched => MediaDropReason::UnmatchedStream,
-        Attribution::TransportMismatch => MediaDropReason::TransportMismatch,
+    );
+    let Attribution::Route { paused, edges, .. } = attribution else {
+        // Exhaustive by construction: every non-`Route` outcome has exactly
+        // one Ingress drop token, mapped in ONE place.
+        let reason = crate::media::attribution_drop_reason(&attribution)
+            .unwrap_or(MediaDropReason::NoPolicy);
+        return drop_traced(forwarder, reason, frame.payload.len());
     };
-    drop_traced(forwarder, reason, frame.payload.len())
+    let outcome = fan_out(
+        forwarder,
+        subscribers,
+        edges,
+        paused,
+        frame.payload,
+        popped_at,
+        sampled,
+    );
+    // Processing latency is observed for frames that reached at least
+    // one edge decision — never for a frame delivered nowhere
+    // (`no_subscriber`), exactly as before attribution existed.
+    if sampled && outcome.rejected.is_none() {
+        observe(
+            forwarder,
+            MediaLatencyPhase::Processing,
+            Instant::now().saturating_duration_since(popped_at),
+        );
+    }
+    outcome
 }
 
 /// Count one Ingress-direction drop for a frame that reached no edge.
@@ -420,19 +420,20 @@ fn fan_out(
     }
 }
 
-/// The fields of an [`EgressEdge`] the fan-out needs, copied out so the closure
-/// does not hold a borrow of the snapshot across the delivery.
+/// The parts of an edge the fan-out needs: who receives it, and the edge's
+/// runtime cell, whose hop counter is per (SUBSCRIBER connection, media stream)
+/// and survives source changes (see `crate::media::forwarder::HopSequence`).
 #[derive(Debug, Clone, Copy)]
-struct PendingEdge {
-    egress_stream_id: u32,
+struct PendingEdge<'a> {
     subscriber: crate::routing::SubscriberRef,
+    runtime: &'a EdgeRuntime,
 }
 
-impl From<&EgressEdge> for PendingEdge {
-    fn from(edge: &EgressEdge) -> Self {
+impl<'a> From<EdgeRef<'a>> for PendingEdge<'a> {
+    fn from(edge: EdgeRef<'a>) -> Self {
         Self {
-            egress_stream_id: edge.egress_stream_id,
-            subscriber: edge.subscriber,
+            subscriber: edge.edge.subscriber,
+            runtime: edge.runtime,
         }
     }
 }
@@ -455,7 +456,7 @@ enum Delivery {
 fn deliver(
     parts: &mut ForwardParts<'_>,
     subscribers: &LocalSubscriberSnapshot,
-    edge: PendingEdge,
+    edge: PendingEdge<'_>,
     source: FrameSource<'_>,
     popped_at: Instant,
     sampled: bool,
@@ -472,7 +473,7 @@ fn deliver(
         return Delivery::Dropped;
     };
 
-    let hop = parts.take_hop_for(edge.egress_stream_id);
+    let hop = edge.runtime.take_hop();
     let slot = edge.subscriber.slot.get();
 
     let mut buffer = match source {

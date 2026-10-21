@@ -18,12 +18,14 @@ use crate::config::{
 };
 use crate::errors::MhError;
 use crate::grpc::McClient;
+use crate::media::downlink::run_stream_egress;
 use crate::media::forward::EgressQueue;
 use crate::media::forwarder::ConnectionForwarder;
 use crate::media::ingress::{
     run_egress, run_forward, run_ingress, FramesRead, IngressQueue, LoopExit,
 };
 use crate::media::queue::SharedQueue;
+use crate::media::stream_ingress::{run_stream_ingress, StreamIngressContext};
 use crate::media::{MediaSetup, MediaTaskContext};
 use crate::observability::metrics;
 use crate::routing::{IdError, MeetingKey, SenderId};
@@ -654,6 +656,7 @@ pub async fn handle_connection(
     for (name, task) in [
         ("forward", media_session.forward),
         ("egress", media_session.egress),
+        ("stream_ingress", media_session.stream_ingress),
     ] {
         match task.await {
             Ok(LoopExit::ConnectionClosed) => debug!(
@@ -677,6 +680,22 @@ pub async fn handle_connection(
             ),
         }
     }
+
+    if let Err(e) = media_session.stream_egress.await {
+        warn!(
+            target: "mh.webtransport.connection",
+            connection_id = %connection_id,
+            loop_name = "stream_egress",
+            error = %e,
+            "Media loop task failed"
+        );
+    }
+    // This publisher's group tasks are gone (each reset what it fed,
+    // `source_ended`). Edges that were switching TO it abandon the switch and
+    // keep their current source (ADR-0036 §7).
+    session_manager
+        .routing_table()
+        .sender_ended(&meeting_key, media_session.sender);
 
     // Step 7: Cleanup — remove connection from session manager and notify MC
     session_manager
@@ -813,6 +832,10 @@ struct MediaSession {
     ingress: tokio::task::JoinHandle<(LoopExit, FramesRead)>,
     forward: tokio::task::JoinHandle<LoopExit>,
     egress: tokio::task::JoinHandle<LoopExit>,
+    /// Stream-per-group ingress (story 3 MH-A2): this connection as PUBLISHER.
+    stream_ingress: tokio::task::JoinHandle<LoopExit>,
+    /// Stream-per-group egress writers: this connection as SUBSCRIBER.
+    stream_egress: tokio::task::JoinHandle<()>,
 }
 
 /// Start this connection's media forward path.
@@ -851,12 +874,22 @@ fn start_media_session(
     let ingress_queue: Arc<IngressQueue> = Arc::new(SharedQueue::new(INGRESS_QUEUE_FRAMES));
     let egress_queue: Arc<EgressQueue> = Arc::new(SharedQueue::new(EGRESS_QUEUE_FRAMES));
 
+    // This connection's downlink channel, as a SUBSCRIBER of stream-per-group
+    // video: bounded (see `media::downlink_channel_capacity`) and fed only by
+    // `try_send`, so no publisher ever awaits it.
+    let (downlink_sender, downlink_receiver) =
+        tokio::sync::mpsc::channel(media.downlink_channel_capacity);
+
     // Registered BEFORE the loops start: a frame arriving from another
     // participant between spawn and registration would otherwise count as
     // `no_local_subscriber` against a subscriber that is in fact connected.
-    session_manager
-        .subscribers()
-        .register(meeting.clone(), sender, connection_id, &egress_queue);
+    session_manager.subscribers().register_with_streams(
+        meeting.clone(),
+        sender,
+        connection_id,
+        &egress_queue,
+        Some(downlink_sender),
+    );
 
     let forwarder = ConnectionForwarder::new(
         meeting.clone(),
@@ -878,13 +911,42 @@ fn start_media_session(
         Arc::clone(&context),
         cancel.clone(),
     ));
-    let egress = tokio::spawn(run_egress(transport, egress_queue, context, cancel.clone()));
+    let egress = tokio::spawn(run_egress(
+        Arc::clone(&transport),
+        egress_queue,
+        Arc::clone(&context),
+        cancel.clone(),
+    ));
+
+    // Stream-per-group video (story 3 MH-A2): the accept loop for this
+    // connection's publisher groups, and the writer set for its downlinks.
+    let stream_context = Arc::new(StreamIngressContext {
+        meeting: meeting.clone(),
+        sender,
+        routing: Arc::clone(&context.routing),
+        subscribers: Arc::clone(&context.subscribers),
+        handles: Arc::clone(&media.handles),
+        limits: media.stream_path,
+        sample_ratio: media.latency_sample_ratio,
+    });
+    let stream_ingress = tokio::spawn(run_stream_ingress(
+        Arc::clone(&transport),
+        stream_context,
+        cancel.clone(),
+    ));
+    let stream_egress = tokio::spawn(run_stream_egress(
+        transport,
+        downlink_receiver,
+        cancel.clone(),
+    ));
 
     MediaSession {
         sender,
         ingress,
         forward,
         egress,
+        stream_ingress,
+        stream_egress,
     }
 }
 
@@ -1369,7 +1431,7 @@ mod tests {
         let snap = MetricAssertion::snapshot();
 
         let session_manager =
-            SessionManagerHandle::new(crate::session::admission::test_admission());
+            SessionManagerHandle::new_for_tests(crate::session::admission::test_admission());
         let meeting_id = "meeting-1";
         let connection_id = "conn-1";
         let notify = setup_pending(&session_manager, meeting_id, connection_id).await;
@@ -1400,7 +1462,7 @@ mod tests {
         let snap = MetricAssertion::snapshot();
 
         let session_manager =
-            SessionManagerHandle::new(crate::session::admission::test_admission());
+            SessionManagerHandle::new_for_tests(crate::session::admission::test_admission());
         let meeting_id = "meeting-2";
         let connection_id = "conn-2";
         let notify = setup_pending(&session_manager, meeting_id, connection_id).await;
@@ -1432,7 +1494,7 @@ mod tests {
         let snap = MetricAssertion::snapshot();
 
         let session_manager =
-            SessionManagerHandle::new(crate::session::admission::test_admission());
+            SessionManagerHandle::new_for_tests(crate::session::admission::test_admission());
         let meeting_id = "meeting-3";
         let connection_id = "conn-3";
         let notify = setup_pending(&session_manager, meeting_id, connection_id).await;

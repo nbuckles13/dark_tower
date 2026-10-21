@@ -1,4 +1,7 @@
-//! The MH audio datagram forward path (ADR-0036 §2 / §7 / §11).
+//! The MH media forward paths (ADR-0036 §1 / §2 / §7 / §11): datagram audio
+//! (`ingress`, `forward`, `forwarder`, `queue`) and, since story 3 MH-A2,
+//! stream-per-group cut-through video (`stream_ingress`, `edge`,
+//! `edge_runtime`, `downlink`).
 //!
 //! # THIS DIRECTORY IS THE HOT PATH, AND THE DIRECTORY BOUNDARY IS THE POINT
 //!
@@ -50,8 +53,10 @@
 //! it *is*. Nothing under `media/` branches on media kind, and the only
 //! datagram-specific code is the transport call itself. The structure is built
 //! around `EgressEdge`, so the video/uni-stream path is an addition rather than
-//! a redesign — it shares the routing read, the relay rewrite, the queues, the
-//! caps and every metric.
+//! a redesign — it shares the routing read and the single attribution lookup,
+//! the codec's relay rewrite, the caps, the per-edge hop counter and every
+//! metric. The group-start gate (`edge`) is a behaviour, not a media type: a
+//! source whose every frame is independently decodable never waits.
 //!
 //! # There is no client-SDK parity here to mirror
 //!
@@ -65,17 +70,22 @@
 //! validation. **No cross-language parity test follows from this**, per the
 //! standing warning at `crate::transport`.
 
-use crate::observability::metrics::MediaMetricHandles;
+use crate::config::StreamPathLimits;
+use crate::observability::metrics::{MediaDropReason, MediaMetricHandles};
 use crate::routing::RoutingTable;
 use crate::session::LocalSubscribers;
 use std::sync::Arc;
 
 pub mod caps;
+pub mod downlink;
+pub mod edge;
+pub mod edge_runtime;
 pub mod forward;
 pub mod forwarder;
 pub mod ingress;
 pub mod queue;
 pub mod sampler;
+pub mod stream_ingress;
 
 /// What a connection needs to start its media tasks, assembled once at
 /// process setup.
@@ -91,6 +101,43 @@ pub struct MediaSetup {
     /// The fraction of forwarded frames whose latency is observed. One field,
     /// two readers: the sampler draws against it and the gauge publishes it.
     pub latency_sample_ratio: f64,
+    /// Stream-path limits (story 3 MH-A2).
+    pub stream_path: StreamPathLimits,
+    /// Capacity of each subscriber connection's downlink channel; see
+    /// [`downlink_channel_capacity`].
+    pub downlink_channel_capacity: usize,
+}
+
+/// The ONE mapping from a non-routing attribution outcome to its ingress drop
+/// token, shared by the datagram and stream paths. `None` for
+/// [`Attribution::Route`], which is not a drop. Lives here, not in `routing`,
+/// because routing must not depend on metrics.
+#[must_use]
+pub const fn attribution_drop_reason(
+    attribution: &crate::routing::Attribution<'_>,
+) -> Option<MediaDropReason> {
+    use crate::routing::Attribution;
+    match attribution {
+        Attribution::Route { .. } => None,
+        Attribution::NoPolicy => Some(MediaDropReason::NoPolicy),
+        Attribution::ServerMuted => Some(MediaDropReason::ServerMuted),
+        Attribution::Unmatched => Some(MediaDropReason::UnmatchedStream),
+        Attribution::TransportMismatch => Some(MediaDropReason::TransportMismatch),
+    }
+}
+
+/// Each subscriber connection's downlink channel capacity: 2 x the derived
+/// egress stream ceiling. A downlink exists only while charged to one of the
+/// subscriber's edges, an edge keeps at most
+/// [`edge_runtime::MAX_LIVE_DOWNLINKS_PER_EDGE`] live, and a subscriber's edges
+/// are a subset of the admitted ceiling — so a full channel means the writer
+/// task is not draining (see `downlink::DownlinkSender`).
+#[must_use]
+pub fn downlink_channel_capacity(stream_ceiling: u32) -> usize {
+    usize::try_from(stream_ceiling)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(edge_runtime::MAX_LIVE_DOWNLINKS_PER_EDGE)
+        .max(1)
 }
 
 /// The per-process state every media task reads.

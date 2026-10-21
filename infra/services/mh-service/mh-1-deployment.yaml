@@ -218,9 +218,10 @@ spec:
               name: mh-service-config
               key: MH_MAX_SOURCE_STREAMS_PER_MEETING
         # Video stream path and keyframe recovery (story 3 R-10..R-13, R-21).
-        # HARD refs: required reads once MH-A2 (stream opens, backlog, stall)
-        # and MH-B (retry, aggregation, recovery rate) land; the current image
-        # ignores them. Rationale and bounds: config.env.
+        # HARD refs. MH-A2's three (stream opens, backlog, stall) are REQUIRED
+        # reads in the current image: absent or out of bounds, MH refuses to
+        # start. MH-B's three (retry, aggregation, recovery rate) are still
+        # ignored until MH-B lands. Rationale and bounds: config.env.
         - name: MH_KEYFRAME_REQUEST_RETRY_MS
           valueFrom:
             configMapKeyRef:
@@ -292,8 +293,11 @@ spec:
         # `resources.limits.memory` below. MH's boot-time memory check (from
         # MH-A2: egress backlog cap x derived stream ceiling plus the
         # receive-side bound x MH_MAX_CONNECTIONS within a fixed fraction of
-        # this) is therefore derived, never restated; MH-A2 logs the effective
-        # limit it read at startup. The current image ignores this variable.
+        # this) is therefore derived, never restated. The current image READS
+        # it as a required value: absent, empty, unparseable or 0 refuses to
+        # boot, and a failing check refuses with one ERROR line (target
+        # `mh.config`); a passing boot logs the effective limit and figures on
+        # target `mh.config.memory`.
         #
         # The limit MUST stay declared. If `resources.limits.memory` were
         # absent, Kubernetes would silently resolve this variable to the

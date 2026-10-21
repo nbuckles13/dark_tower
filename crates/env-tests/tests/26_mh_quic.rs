@@ -265,10 +265,7 @@ fn notification_promql(event_type: &str) -> String {
     )
 }
 
-/// Bound on a baseline read settling (two reads a scrape apart agreeing). Under
-/// cluster load the MC/MH notification and push chains converge in several
-/// non-equal rounds of the settle; this is a failure-only ceiling.
-const BASELINE_SETTLE_BOUND: Duration = Duration::from_secs(90);
+use env_tests::fixtures::metrics::BASELINE_SETTLE_BOUND;
 
 /// Wait for the PER-INSTANCE `mc_mh_notifications_received_total{event_type=...}`
 /// snapshot to stabilize: two consecutive reads (a Prometheus scrape interval
@@ -1153,17 +1150,14 @@ const MARK_A: u8 = 0xA4;
 const MARK_B: u8 = 0xB4;
 const MARK_C: u8 = 0xC4;
 
-/// Margin over MC's published connect-settle window before a view must have
-/// converged (MH's connect notification, the push, the flush). Same role as
-/// `27_mc_slot_placement.rs`'s margin.
-const VIEW_MARGIN: Duration = Duration::from_secs(10);
+/// Margin over MC's settle window (one shared home).
+use env_tests::fixtures::participant::VIEW_MARGIN;
 
 /// Rig bound on one send-until-observed phase. A precondition for unreliable
 /// QUIC datagrams, never a performance assertion.
 const PHASE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Bound on a pinned-pod counter becoming visible in Prometheus.
-const PINNED_METRIC_BOUND: Duration = Duration::from_secs(90);
+use env_tests::fixtures::metrics::PINNED_METRIC_BOUND;
 
 /// Sequence-number floors separating frames by phase, so a frame still queued
 /// from an earlier phase can never be read as evidence about a later one.

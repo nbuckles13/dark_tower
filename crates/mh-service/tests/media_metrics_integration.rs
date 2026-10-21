@@ -156,7 +156,7 @@ async fn the_egress_loop_observes_the_transmit_buffer_and_total_phases() {
         let transport = Arc::new(mh_test_utils::transport_shim::LossDelayTransport::new());
         let queue: Arc<EgressQueue> = Arc::new(SharedQueue::new(EGRESS_QUEUE_FRAMES));
         let context = Arc::new(mh_service::media::MediaTaskContext {
-            routing: Arc::new(RoutingTable::new()),
+            routing: Arc::new(RoutingTable::unbounded_for_tests()),
             subscribers: Arc::new(LocalSubscribers::new()),
             handles,
         });
