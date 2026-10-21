@@ -1442,7 +1442,7 @@ tasks:
   slug: 2026-10-21-mh-a2-stream-forwarding
   tag: story-2026-10-07-see-each-other-task-9
 - id: 10
-  status: pending
+  status: completed
   specialist: media-handler
   deps:
   - 1
@@ -1529,6 +1529,7 @@ tasks:
     - Deadline logic runs on an injected clock.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-21-mh-b-on-demand-keyframes
   tag: story-2026-10-07-see-each-other-task-10
 - id: 11
   status: pending
