@@ -20,9 +20,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { InMemoryMetricsSink } from '@darktower/test-utils';
 
-import { HEADER_VERSION_V3 } from '../../frame/frameCodec.js';
 import { ReplayWindow, TransmitKeyCache } from '../../frame/receivePath.js';
-import { HEADER_VERSION } from '../../frame/wireConstants.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { gateFor, kekHolderWith } from '../../__tests__/helpers.js';
 import { MEDIA_KIND_LABELS, MediaKindMetrics } from '../../setup/mediaMetrics.js';
@@ -439,36 +437,5 @@ describe('non-dropping wrap outcomes are counted separately from drops', () => {
       h.hopMonitor,
     );
     expect(h.dropReasons()).toEqual(['no_transmit_key']);
-  });
-});
-
-describe('transitional dual decode through ONE ingress (v2 — deleted by P2)', () => {
-  it('accepts a v2 frame and a v3 frame from the same sender, counted, with zero drops', async () => {
-    const h = makeHarness();
-    const alice = await makeIdentity(0x41);
-    await h.roster.upsert({ senderId: SENDER_A, identityPublicKey: alice.publicKey });
-
-    const common = { keyIdSenderId: SENDER_A, kek: KEK, signer: alice, streamId: SLOT_ID };
-    const v2 = await buildTestFrame({
-      ...common,
-      plaintext: PLAINTEXT,
-      streamSequence: 0,
-      headerVersion: HEADER_VERSION,
-    });
-    const v3 = await buildTestFrame({
-      ...common,
-      plaintext: PLAINTEXT,
-      streamSequence: 1,
-      hopSequence: 1,
-      headerVersion: HEADER_VERSION_V3,
-      gopCounter: 1,
-    });
-    await h.ingress.accept(v2, h.hopMonitor);
-    await h.ingress.accept(v3, h.hopMonitor);
-
-    expect(h.accepted.map((f) => f.senderId)).toEqual([SENDER_A, SENDER_A]);
-    expect(h.count('dt_client_media_frames_received_total')).toBe(2);
-    expect(h.count('dt_client_media_frames_accepted_total')).toBe(2);
-    expect(h.dropReasons()).toEqual([]);
   });
 });

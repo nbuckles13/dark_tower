@@ -1,7 +1,7 @@
 // File: packages/sdk-core/scripts/gen-wire-constants.mjs
 //
 // Renders `src/media/frame/wireConstants.ts` from the cross-language SSoT,
-// `proto/test-vectors/frame-v2.vectors.json`.
+// `proto/test-vectors/frame-v3.vectors.json`.
 //
 // ---------------------------------------------------------------------------
 // WHY A RENDERER RATHER THAN A HAND-WRITTEN CONSTANT WITH A DRIFT ASSERTION
@@ -25,7 +25,7 @@
 // WHY THIS SCRIPT LIVES OUTSIDE `src/`
 // ---------------------------------------------------------------------------
 //
-// It reads `proto/test-vectors/frame-v2.vectors.json` with `node:fs`. That file
+// It reads `proto/test-vectors/frame-v3.vectors.json` with `node:fs`. That file
 // is 94 KB, carries a `_non_production` banner, and every one of its rows holds
 // `kek_hex`, `transmit_key_hex` and `identity_private_seed_hex`. Nothing under
 // `src/` may reach it: `vite.config.ts` externalises only `/^@opentelemetry\//`,
@@ -46,7 +46,7 @@ import { fileURLToPath } from 'node:url';
 import * as prettier from 'prettier';
 
 /** Path of the SSoT, relative to the repository root. */
-export const VECTORS_PATH = 'proto/test-vectors/frame-v2.vectors.json';
+export const VECTORS_PATH = 'proto/test-vectors/frame-v3.vectors.json';
 /** Path of the rendered module, relative to the repository root. */
 export const OUTPUT_PATH = 'packages/sdk-core/src/media/frame/wireConstants.ts';
 /** The command a reader must run to regenerate. Quoted verbatim in the output. */
@@ -94,11 +94,13 @@ const SCALAR_KEYS = [
   'key_id_bytes',
   'relay_region_bytes',
   'publisher_fixed_prefix_bytes',
+  'gop_counter_field_bytes',
   'wrapped_transmit_key_bytes',
   'kek_generation_field_bytes',
   'wrapped_transmit_key_material_bytes',
   'ext_length_field_bytes',
   'max_ext_bytes',
+  'max_header_bytes',
 ];
 
 const KEY_ID_LAYOUT_KEYS = ['sender_id_bits', 'stream_bits', 'generation_bits'];

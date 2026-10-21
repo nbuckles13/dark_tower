@@ -2,7 +2,7 @@
 
 ## Architecture & Design (ADRs)
 
-- Media flow (frame-v2, signaling/internal contracts, §4 security floor, §8 control plane, §10 transport seam, §11 telemetry/layout) → ADR-0036; approved crypto (SFrame, AES-256-GCM, EdDSA) → ADR-0027
+- Media flow (frame-v3, signaling/internal contracts, §4 security floor, §8 control plane, §10 transport seam, §11 telemetry/layout) → ADR-0036; approved crypto (SFrame, AES-256-GCM, EdDSA) → ADR-0027
 - Actor handle/task separation → ADR-0001; Error handling + service-layer wrapping → ADR-0003; Cross-service duplication → ADR-0019
 - No-panic policy, `#[expect]` over `#[allow]` → ADR-0002; workspace clippy deny list → `Cargo.toml`
 - Observability naming + SLOs → ADR-0011 (targets now authoritative in `docs/observability/slos.md`); Dashboards → ADR-0029; Alert conventions → ADR-0031; Metric testability → ADR-0032
@@ -13,7 +13,7 @@
 
 ## Media Path (stories: hear-yourself, hear-each-other)
 
-- Frame-v2 codec (one `parse_layout()`, four entry points, TLV) → `crates/media-protocol/src/codec.rs`, `crates/media-protocol/src/frame.rs`, `crates/media-protocol/src/extensions.rs`; frozen cross-language vectors + generator → `proto/test-vectors/frame-v2.vectors.json`, `crates/media-vector-gen/`
+- Frame-v3 codec (one `parse_layout()`, several entry points, TLV) → `crates/media-protocol/src/codec.rs`, `crates/media-protocol/src/frame.rs`, `crates/media-protocol/src/extensions.rs`; frozen cross-language vectors + generator → `proto/test-vectors/frame-v3.vectors.json`, `crates/media-vector-gen/`
 - Wire contract (media vocabulary, `sender_id`, `meeting_kek`, server mute) → `proto/dark_tower/signaling/v1/signaling.proto`; MC→MH control plane + `EndMeeting` → `proto/dark_tower/internal/v1/internal.proto`; no-key-material guard → `scripts/guards/simple/validate-internal-proto-no-key-material.sh`; redacting `Debug` → `crates/proto-gen/src/lib.rs`; Rule R → `docs/protocol/CONVENTIONS.md`
 - MC admission (KEK, identity key, sender-id, binding outcome) → `crates/mc-service/src/media_admission/`; client signaling + per-connection dispatch (mute, KEK) → `crates/mc-service/src/media_signaling/`, `crates/mc-service/src/webtransport/connection.rs`; per-meeting media state (slots, mute, KEK lifecycle) → `crates/mc-service/src/actors/meeting_media.rs:MeetingMedia`
 - MC §9 shared-handler edge model: join-order slots → `crates/mc-service/src/media_routing/slots.rs:SlotTable`; placement → `crates/mc-service/src/media_routing/placement.rs:MeetingHandlers`; edge colocation → `crates/mc-service/src/media_routing/edges.rs:colocate()`; MH-observed connectivity → `crates/mc-service/src/media_routing/connectivity.rs`

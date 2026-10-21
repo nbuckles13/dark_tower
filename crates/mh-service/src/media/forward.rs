@@ -196,7 +196,7 @@ pub fn forward_one(
     //
     // SENDER-SCOPED, on `forwarder.sender()`: the publisher bound at spawn,
     // after the JWT gate, from MC's `NotifyParticipantConnectedResponse`.
-    // Nothing read from the frame participates — frame header v2 carries no
+    // Nothing read from the frame participates — the frame header carries no
     // sender id, and this path never parses the SFrame key id. So a PATCHED
     // CLIENT changes nothing observable: there is no client-reachable input
     // to this decision. Exact under the transitional union reading

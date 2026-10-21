@@ -12,6 +12,7 @@ import { emptyKekHolder } from '../../media/__tests__/helpers.js';
 import type { MeetingKekHolder } from '../../media/setup/kekSource.js';
 import { RosterIdentityKeys } from '../../media/setup/rosterKeys.js';
 import { generateIdentityKeyPair } from '../../media/frame/ed25519.js';
+import { HEADER_VERSION } from '../../media/frame/wireConstants.js';
 import { SignalingClient } from '../SignalingClient.js';
 import type {
   ParticipantMuteEvent,
@@ -176,7 +177,7 @@ describe('send directive', () => {
     );
     await waitFor(() => seen.length > 0);
     expect(seen[0]).toEqual({
-      headerVersion: 2,
+      headerVersion: HEADER_VERSION,
       streams: [
         { streamNumber: 3, mediaKind: 'audio', maxBitrateBps: 40_000, targets: ['https://mh'] },
       ],

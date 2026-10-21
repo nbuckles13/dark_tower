@@ -123,8 +123,12 @@ describe('structural codec rejects reach the drop counter individually', () => {
     // Named explicitly rather than left to the loop above, because this is the
     // one whose collapse has a consequence no dashboard would reveal: a
     // version-skewed rollback presenting as an undifferentiated decode failure.
+    // Two rows since v3: an unassigned version (4) and the one a skewed v2
+    // peer would actually send — the rollback hazard itself.
     const rows = decodeRejectRows.filter((row) => row.reject_reason === 'unknown_version');
-    expect(rows).toHaveLength(1);
+    expect(rows.map((row) => row.name).sort()).toEqual(
+      ['decode_reject_unknown_version', 'decode_reject_v2_labelled'].sort(),
+    );
     const others = new Set(
       decodeRejectRows.map((row) => row.reject_reason).filter((r) => r !== 'unknown_version'),
     );

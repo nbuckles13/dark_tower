@@ -166,7 +166,7 @@ export class IngressPipeline {
    *
    * Safe to expose and to project, and **the TYPE is what makes that true** —
    * not this comment. `RejectReason` is the closed union whose SSoT is
-   * `proto/test-vectors/frame-v2.vectors.json`, so the field is bounded by
+   * `proto/test-vectors/frame-v3.vectors.json`, so the field is bounded by
    * construction and carries no participant, key or payload information.
    *
    * Typed as the union rather than `string` deliberately: a bounded telemetry

@@ -1,6 +1,6 @@
 // File: packages/sdk-core/src/media/frame/hex.ts
 //
-// Hex codec and byte primitives for the v2 media frame stack: lowercase,
+// Hex codec and byte primitives for the media frame stack: lowercase,
 // unprefixed, even-length hex — the convention `proto/test-vectors/` uses for
 // every byte-string field — plus the concat / big-endian-encode / XOR helpers
 // the SFrame key schedule and the frame codec are built on.

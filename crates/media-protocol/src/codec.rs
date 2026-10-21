@@ -1,6 +1,6 @@
-//! Encoding and decoding of version-2 media frames.
+//! Encoding and decoding of version-3 media frames (ADR-0036 §2).
 //!
-//! # One parser, four entry points
+//! # One parser, several entry points
 //!
 //! Everything here is built on a single private layout parser. There is
 //! deliberately no second parse of these bytes: two parsers agree on every
@@ -14,13 +14,16 @@
 //! |---|---|---|
 //! | [`decode_datagram`] | exact | one frame per datagram (§1); a trailing byte is a rejection |
 //! | [`decode_stream_frame`] | prefix | frames share a group's stream (§1); `Ok(None)` means "need more bytes" |
-//! | [`peek_frame_len`] | prefix | reader-side pre-allocation bound |
-//! | [`rewrite_relay_region`] | in place | the relay's per-subscriber rewrite |
+//! | [`parse_header_prefix`] | prefix | cut-through: the header alone, before the payload arrives; reader-side pre-allocation bound |
+//! | [`crate::reader::HeaderReader::feed`] | chunked | cut-through: the same parse, fed arbitrary chunk splits |
+//! | [`rewrite_relay_region`] | in place | the relay's per-subscriber rewrite of a complete frame |
+//! | [`rewrite_relay_region_header`] | in place | the same rewrite given only the header bytes, so the tail streams through untouched |
 //!
 //! # Incomplete is not a rejection
 //!
-//! [`decode_stream_frame`] returns `Ok(None)` when the buffer is a strict
-//! prefix of a possibly-valid frame. That outcome carries **no reject reason**
+//! [`decode_stream_frame`] returns `Ok(None)`, and [`parse_header_prefix`]
+//! returns [`HeaderPrefix::Incomplete`], when the buffer is a strict prefix of a
+//! possibly-valid frame (or header). That outcome carries **no reject reason**
 //! and must not be counted on a drop counter: on a stream it is the ordinary
 //! consequence of a frame spanning a read boundary. `Err` means *no extension
 //! of this buffer can decode*.
@@ -30,14 +33,25 @@
 //! * **Any shortfall** of available bytes against a required region length —
 //!   fixed or declared — is **incomplete** on the stream path.
 //! * **Any violation of a limit or of the grammar** is **terminal** on both
-//!   paths: unknown version, an undefined flag bit, a payload length over
+//!   paths: unknown version, an undefined flag bit, key-bearing together with
+//!   discardable, a payload length over
 //!   [`MAX_PAYLOAD_BYTES`], an extension length over
 //!   [`crate::frame::MAX_EXT_BYTES`], or a malformed TLV region that is fully
 //!   present.
 //!
 //! Consequently `truncated`, `payload_length_exceeds_available` and
-//! `trailing_bytes` **can never occur on the stream path**. Each
-//! [`RejectReason`] records this as [`RejectReason::producible_by`].
+//! `trailing_bytes` **can never occur on the prefix-tolerant entry points**.
+//! Each [`RejectReason`] records which entry points can emit it as
+//! [`RejectReason::producible_by`].
+//!
+//! # Decode order is ADR-0036 §2's, normatively
+//!
+//! The checks run in the §2 "Decode order" table's order and the first failure
+//! is the reported reason. In particular every check decidable from the
+//! 14-byte fixed prefix — version, undefined flag bits, key-bearing with
+//! discardable, `payload_length <= MAX_PAYLOAD_BYTES` — is terminal **before**
+//! any later region is asked for, so a reader never requests (let alone sizes
+//! a buffer from) bytes of a frame that can never be legal.
 //!
 //! **`Ok(None)` obligates the caller.** See the obligation stated in
 //! [`crate::frame`]: bound both buffered bytes per stream and
@@ -65,11 +79,12 @@
 
 use crate::extensions::{encode_into, Extension, ExtensionError, Extensions};
 use crate::frame::{
-    FrameFlags, Layout, MediaFrameView, WrappedTransmitKey, AEAD_TAG_BYTES, EXT_LENGTH_FIELD_SIZE,
-    FLAGS_OFFSET, KEK_GENERATION_FIELD_BYTES, MAX_EXT_BYTES, MAX_PAYLOAD_BYTES,
-    PAYLOAD_LENGTH_OFFSET, PROTOCOL_VERSION, PUBLISHER_FIXED_PREFIX_SIZE, RELAY_REGION_SIZE,
-    SIGNATURE_SIZE, STREAM_ID_FIELD_BYTES, STREAM_SEQUENCE_OFFSET, VERSION_OFFSET,
-    WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES, WRAPPED_TRANSMIT_KEY_SIZE,
+    read_u16_be, read_u32_be, FrameFlags, FrameHeader, Layout, MediaFrameView, WrappedTransmitKey,
+    AEAD_TAG_BYTES, EXT_LENGTH_FIELD_SIZE, FLAGS_OFFSET, GOP_COUNTER_OFFSET,
+    KEK_GENERATION_FIELD_BYTES, MAX_EXT_BYTES, MAX_PAYLOAD_BYTES, PAYLOAD_LENGTH_OFFSET,
+    PROTOCOL_VERSION, PUBLISHER_FIXED_PREFIX_SIZE, RELAY_REGION_SIZE, SIGNATURE_SIZE,
+    STREAM_SEQUENCE_OFFSET, VERSION_OFFSET, WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES,
+    WRAPPED_TRANSMIT_KEY_SIZE,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use core::fmt;
@@ -84,7 +99,7 @@ use core::fmt;
 /// earlier version of this type said "audio is carried in datagrams and video
 /// in streams, so this is also which media a reason can be observed on". That
 /// was false and failed in the mis-triage direction: [`rewrite_relay_region`]
-/// is a fourth fallible entry point, and a media handler calls it on
+/// is a fallible entry point too, and a media handler calls it on
 /// **stream-carried video** while re-framing. It converts a shortfall through
 /// the same path [`decode_datagram`] uses, so it emits `truncated` and
 /// `payload_length_exceeds_available` on the video path — which the old
@@ -95,12 +110,24 @@ use core::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProducibleBy {
     /// Every entry point: [`decode_datagram`], [`decode_stream_frame`],
-    /// [`peek_frame_len`] and [`rewrite_relay_region`]. These are the terminal
-    /// limit and grammar violations, which no additional bytes can rescue.
+    /// [`parse_header_prefix`], [`crate::reader::HeaderReader::feed`],
+    /// [`rewrite_relay_region`] and [`rewrite_relay_region_header`]. These are
+    /// the terminal limit and grammar violations, which no additional bytes can
+    /// rescue.
     AllEntryPoints,
-    /// The two entry points that require a **complete** frame:
-    /// [`decode_datagram`] and [`rewrite_relay_region`]. The prefix-tolerant
-    /// entry points report the same condition as the non-reject `Ok(None)`.
+    /// The entry points that require at least a **complete header**:
+    /// [`decode_datagram`], [`rewrite_relay_region`] and
+    /// [`rewrite_relay_region_header`]. The prefix-tolerant entry points report
+    /// the same condition as the non-reject incomplete outcome.
+    ///
+    /// One defensive exception, stated so the table is not contradicted by the
+    /// code: [`crate::reader::HeaderReader::feed`] fails closed with
+    /// `truncated` if its fixed buffer could not hold what the parser asked
+    /// for. That is reachable **only on a parser defect** (the parser decides
+    /// within `MAX_HEADER_BYTES`), never from any input.
+    CompleteHeaderRequired,
+    /// The entry points that require a **complete frame** (payload and
+    /// signature too): [`decode_datagram`] and [`rewrite_relay_region`].
     CompleteFrameRequired,
     /// [`decode_datagram`] alone.
     DecodeDatagramOnly,
@@ -112,7 +139,11 @@ impl ProducibleBy {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AllEntryPoints => {
-                "decode_datagram, decode_stream_frame, peek_frame_len, rewrite_relay_region"
+                "decode_datagram, decode_stream_frame, parse_header_prefix, HeaderReader::feed, \
+                 rewrite_relay_region, rewrite_relay_region_header"
+            }
+            Self::CompleteHeaderRequired => {
+                "decode_datagram, rewrite_relay_region, rewrite_relay_region_header"
             }
             Self::CompleteFrameRequired => "decode_datagram, rewrite_relay_region",
             Self::DecodeDatagramOnly => "decode_datagram",
@@ -123,13 +154,15 @@ impl ProducibleBy {
     /// (video) frames.
     ///
     /// True unless the reason is reachable only from [`decode_datagram`],
-    /// because [`rewrite_relay_region`] runs on video frames during re-framing.
+    /// because the relay rewrites run on video frames during re-framing.
     /// This is the accessor an alert selector or a runbook should consult; do
     /// not infer media from an entry-point name.
     #[must_use]
     pub const fn reachable_on_stream_carried_frames(self) -> bool {
         match self {
-            Self::AllEntryPoints | Self::CompleteFrameRequired => true,
+            Self::AllEntryPoints | Self::CompleteHeaderRequired | Self::CompleteFrameRequired => {
+                true
+            }
             Self::DecodeDatagramOnly => false,
         }
     }
@@ -155,8 +188,8 @@ macro_rules! reject_reasons {
         /// may reuse one of these tokens with a different meaning.**
         ///
         /// ANCHOR (DRY): the cross-language single source of truth is
-        /// `proto/test-vectors/frame-v2.vectors.json` (story task 8); both
-        /// codecs assert against it rather than each hardcoding the strings.
+        /// `proto/test-vectors/frame-v3.vectors.json`; both codecs assert
+        /// against it rather than each hardcoding the strings.
         ///
         /// Vector precedence: vectors beat prose, but a vector contradicting a
         /// recorded ruling is a defect to escalate rather than conform to — see
@@ -194,6 +227,9 @@ reject_reasons! {
     UnknownVersion => "unknown_version",
     /// The flag byte sets a bit this version does not define.
     ReservedFlagBitSet => "reserved_flag_bit_set",
+    /// The flag byte sets key-bearing **and** discardable (header v3,
+    /// ADR-0036 §2 decode step 5).
+    KeyBearingDiscardable => "key_bearing_discardable",
     /// The declared payload length exceeds [`MAX_PAYLOAD_BYTES`].
     PayloadLengthExceedsMax => "payload_length_exceeds_max",
     /// The declared payload length exceeds the bytes actually present.
@@ -215,15 +251,15 @@ impl RejectReason {
         match self {
             Self::UnknownVersion
             | Self::ReservedFlagBitSet
+            | Self::KeyBearingDiscardable
             | Self::PayloadLengthExceedsMax
             | Self::ExtensionsTooLarge
             | Self::ExtensionsMalformed => ProducibleBy::AllEntryPoints,
-            // Not `DatagramOnly`: `rewrite_relay_region` maps a shortfall
-            // through the same path, and a media handler calls it on
-            // stream-carried video.
-            Self::PayloadLengthExceedsAvailable | Self::Truncated => {
-                ProducibleBy::CompleteFrameRequired
-            }
+            // Not `DatagramOnly`: the relay rewrites map a shortfall through
+            // the same path, and a media handler calls them on stream-carried
+            // video.
+            Self::Truncated => ProducibleBy::CompleteHeaderRequired,
+            Self::PayloadLengthExceedsAvailable => ProducibleBy::CompleteFrameRequired,
             Self::TrailingBytes => ProducibleBy::DecodeDatagramOnly,
         }
     }
@@ -242,6 +278,12 @@ impl RejectReason {
                 "A sender set a flag bit this version does not define. A sender build \
                  emitting new flags without a version bump, or corrupt input."
             }
+            Self::KeyBearingDiscardable => {
+                "A sender marked a key-bearing frame discardable. A frame carrying a new \
+                 transmit key must never be droppable, or a receiver that dropped it could not \
+                 open what follows (§2, §4). A sender encoder defect — every conforming encoder \
+                 refuses this combination — or corrupt input; investigate the sender's build."
+            }
             Self::PayloadLengthExceedsMax => {
                 "A frame declared a payload larger than the wire format permits. This is \
                  a fixed wire-format constant, not a capacity limit: investigate the \
@@ -258,10 +300,11 @@ impl RejectReason {
             Self::Truncated => {
                 "Two distinct causes, opposite teams. From `decode_datagram`: a datagram \
                  ended before a required fixed-size region — suspect truncation on the send \
-                 path or a sender emitting short frames. From `rewrite_relay_region`: the \
-                 relay was handed an incomplete frame to rewrite — a caller-side re-framing \
-                 defect in the handler's stream reader, not a sender fault. Fork on which \
-                 entry point emitted it before triaging."
+                 path or a sender emitting short frames. From `rewrite_relay_region` or \
+                 `rewrite_relay_region_header`: the relay was handed an incomplete frame or \
+                 header to rewrite — a caller-side re-framing defect in the handler's stream \
+                 reader, not a sender fault. Fork on which entry point emitted it before \
+                 triaging."
             }
             Self::ExtensionsTooLarge => {
                 "The declared extension region is larger than the registry could ever \
@@ -360,6 +403,12 @@ pub enum DecodeError {
         /// Just the undefined bits.
         undefined: u8,
     },
+    /// The flag byte sets key-bearing and discardable together.
+    #[error("flag byte 0x{flags:02x} sets key-bearing and discardable together")]
+    KeyBearingDiscardable {
+        /// The whole flag byte (a scalar; no other header byte is carried).
+        flags: u8,
+    },
     /// The declared payload length exceeds the wire-format maximum.
     #[error("declared payload length {declared} exceeds the wire-format maximum {max}")]
     PayloadLengthExceedsMax {
@@ -413,6 +462,7 @@ impl DecodeError {
         match self {
             Self::UnknownVersion { .. } => RejectReason::UnknownVersion,
             Self::ReservedFlagBitSet { .. } => RejectReason::ReservedFlagBitSet,
+            Self::KeyBearingDiscardable { .. } => RejectReason::KeyBearingDiscardable,
             Self::PayloadLengthExceedsMax { .. } => RejectReason::PayloadLengthExceedsMax,
             Self::PayloadLengthExceedsAvailable { .. } => {
                 RejectReason::PayloadLengthExceedsAvailable
@@ -437,6 +487,10 @@ pub enum EncodeError {
         /// Whether the field was supplied.
         field_present: bool,
     },
+    /// Key-bearing and discardable together: the decoder rejects this
+    /// (`key_bearing_discardable`), so the encoder refuses to produce it.
+    #[error("a key-bearing frame must not be marked discardable")]
+    KeyBearingDiscardable,
     /// The payload exceeds the wire-format maximum.
     #[error("payload of {len} bytes exceeds the wire-format maximum {max}")]
     PayloadTooLarge {
@@ -467,6 +521,17 @@ impl Shortfall {
     ///
     /// A payload shortfall gets its own reason; every other region reports
     /// `truncated`.
+    /// Map a **header** shortfall (never a payload one: `parse_layout` stops at
+    /// the relay region) onto `truncated`, for the entry points that require a
+    /// complete header.
+    const fn into_truncated(self) -> DecodeError {
+        DecodeError::Truncated {
+            region: self.region,
+            needed: self.needed,
+            available: self.available,
+        }
+    }
+
     const fn into_datagram_error(self, declared_payload: usize) -> DecodeError {
         match self.region {
             Region::Payload => DecodeError::PayloadLengthExceedsAvailable {
@@ -487,18 +552,6 @@ enum HeaderOutcome {
     Incomplete(Shortfall),
 }
 
-fn read_u16_be(data: &[u8], offset: usize) -> Option<u16> {
-    let end = offset.checked_add(2)?;
-    let bytes: [u8; 2] = data.get(offset..end)?.try_into().ok()?;
-    Some(u16::from_be_bytes(bytes))
-}
-
-fn read_u32_be(data: &[u8], offset: usize) -> Option<u32> {
-    let end = offset.checked_add(4)?;
-    let bytes: [u8; 4] = data.get(offset..end)?.try_into().ok()?;
-    Some(u32::from_be_bytes(bytes))
-}
-
 /// Require `needed` bytes to be available from `offset`, or report a shortfall.
 fn require(data: &[u8], offset: usize, needed: usize, region: Region) -> Result<usize, Shortfall> {
     let end = offset.checked_add(needed).ok_or(Shortfall {
@@ -517,7 +570,8 @@ fn require(data: &[u8], offset: usize, needed: usize, region: Region) -> Result<
 }
 
 /// Parse the header through the relay region. **This is the crate's only
-/// parser**, and all four public entry points are built on it.
+/// parser**, and every public entry point is built on it. Its steps are
+/// ADR-0036 §2's "Decode order" table, in that order.
 ///
 /// # Keep it one function
 ///
@@ -605,7 +659,15 @@ fn parse_layout(data: &[u8]) -> Result<HeaderOutcome, DecodeError> {
         });
     };
 
-    // 5. Payload length, bounded before anything is sized from it.
+    // 5. Key-bearing AND discardable is terminal: a grammar check on the flag
+    //    byte alone, after step 4 so an undefined bit reports the broader
+    //    reason, and before every length check so no cursor work happens for a
+    //    frame that can never be legal (ADR-0036 §2, "Why step 5 sits there").
+    if flags.is_key_bearing_discardable() {
+        return Err(DecodeError::KeyBearingDiscardable { flags: flag_bits });
+    }
+
+    // 6. Payload length, bounded before anything is sized from it.
     let Some(declared_payload) = read_u32_be(data, PAYLOAD_LENGTH_OFFSET) else {
         return Ok(HeaderOutcome::Incomplete(short_prefix));
     };
@@ -621,8 +683,15 @@ fn parse_layout(data: &[u8]) -> Result<HeaderOutcome, DecodeError> {
         });
     }
 
-    // 6. Stream sequence: the AEAD nonce input, readable before decryption.
+    // 7. Stream sequence: the AEAD nonce input, readable before decryption.
+    //    Every value is accepted.
     let Some(stream_sequence) = read_u32_be(data, STREAM_SEQUENCE_OFFSET) else {
+        return Ok(HeaderOutcome::Incomplete(short_prefix));
+    };
+
+    // 8. GoP counter: every u32 is accepted, 0 and u32::MAX included. Its
+    //    rules (increment per group, never wrap) bind the sender, not the wire.
+    let Some(gop_counter) = read_u32_be(data, GOP_COUNTER_OFFSET) else {
         return Ok(HeaderOutcome::Incomplete(short_prefix));
     };
 
@@ -631,7 +700,7 @@ fn parse_layout(data: &[u8]) -> Result<HeaderOutcome, DecodeError> {
     // "where does the next field start".
     let mut cursor = PUBLISHER_FIXED_PREFIX_SIZE;
 
-    // 7. Wrapped transmit key, present iff the key-bearing flag is set. Its
+    // 9. Wrapped transmit key, present iff the key-bearing flag is set. Its
     //    offset is *recorded from the cursor*, never recomputed downstream.
     let mut wrapped_key_offset = None;
     if flags.key_bearing {
@@ -647,7 +716,7 @@ fn parse_layout(data: &[u8]) -> Result<HeaderOutcome, DecodeError> {
         };
     }
 
-    // 8. Extension length.
+    // 10. Extension length.
     let ext_len_offset = cursor;
     cursor = match require(data, cursor, EXT_LENGTH_FIELD_SIZE, Region::ExtensionLength) {
         Ok(end) => end,
@@ -662,8 +731,8 @@ fn parse_layout(data: &[u8]) -> Result<HeaderOutcome, DecodeError> {
     };
     let ext_len = usize::from(ext_len_u16);
 
-    // 9. Limit before availability: an over-large declaration is terminal even
-    //    on a short buffer, because no extension of the buffer can rescue it.
+    //     Limit before availability: an over-large declaration is terminal even
+    //     on a short buffer, because no extension of the buffer can rescue it.
     if ext_len > MAX_EXT_BYTES {
         return Err(DecodeError::ExtensionsTooLarge {
             declared: ext_len,
@@ -671,7 +740,7 @@ fn parse_layout(data: &[u8]) -> Result<HeaderOutcome, DecodeError> {
         });
     }
 
-    // 10. The extension region, then the grammar walk over a fully-present one.
+    // 11. The extension region, then the grammar walk over a fully-present one.
     //     A region shorter than the declared length is a *shortfall*, not a
     //     grammar violation — so on the stream path it is `Ok(None)`, never a
     //     rejection. Conflating the two would kill any video frame whose read
@@ -688,7 +757,8 @@ fn parse_layout(data: &[u8]) -> Result<HeaderOutcome, DecodeError> {
     })?;
     Extensions::validate(ext_bytes)?;
 
-    // 11. The relay region.
+    // 12. The relay region. (Step 13, the body, is `require_body`; step 14,
+    //     trailing bytes, is `decode_datagram`'s.)
     match require(data, cursor, RELAY_REGION_SIZE, Region::RelayRegion) {
         Ok(_) => {}
         Err(shortfall) => return Ok(HeaderOutcome::Incomplete(shortfall)),
@@ -698,6 +768,7 @@ fn parse_layout(data: &[u8]) -> Result<HeaderOutcome, DecodeError> {
         flags,
         payload_length,
         stream_sequence,
+        gop_counter,
         wrapped_key_offset,
         ext_start,
         ext_len,
@@ -815,17 +886,11 @@ fn build_view(data: &[u8], layout: Layout) -> Result<MediaFrameView<'_>, DecodeE
     // region is at most `MAX_EXT_BYTES` (3) bytes.
     let extensions = Extensions::validate(ext_bytes)?;
 
-    let relay = layout.relay_region_offset();
-    let short_relay = DecodeError::Truncated {
-        region: Region::RelayRegion,
-        needed: RELAY_REGION_SIZE,
-        available: frame.len().saturating_sub(relay),
-    };
-    let stream_id = read_u16_be(frame, relay).ok_or(short_relay)?;
-    let hop_offset = relay
-        .checked_add(STREAM_ID_FIELD_BYTES)
-        .ok_or(short_relay)?;
-    let hop_sequence = read_u32_be(frame, hop_offset).ok_or(short_relay)?;
+    // The relay fields come from `FrameHeader::from_layout`, the crate's one
+    // reader of the relay region, at `Layout::relay_region_offset()`.
+    let header = header_from_layout(frame, layout)?;
+    let stream_id = header.stream_id();
+    let hop_sequence = header.hop_sequence();
 
     let payload = frame
         .get(layout.payload_start()..layout.signature_start())
@@ -874,7 +939,7 @@ pub fn decode_datagram(data: &[u8]) -> Result<MediaFrameView<'_>, DecodeError> {
     let layout = match parse_layout(data)? {
         HeaderOutcome::Complete(layout) => layout,
         HeaderOutcome::Incomplete(shortfall) => {
-            return Err(shortfall.into_datagram_error(0));
+            return Err(shortfall.into_truncated());
         }
     };
     if let Err(shortfall) = require_body(data, layout) {
@@ -909,26 +974,108 @@ pub fn decode_stream_frame(data: &[u8]) -> Result<Option<MediaFrameView<'_>>, De
     build_view(data, layout).map(Some)
 }
 
-/// Total on-wire length of the frame starting at `data`, once knowable.
+/// Outcome of [`parse_header_prefix`].
 ///
-/// This is the **reader-side pre-allocation boundary**. Call it before
-/// reserving buffer space: it enforces [`MAX_PAYLOAD_BYTES`] on the declared
-/// length, which is the trust boundary ADR-0036 §2 describes as passing a fuzz
-/// test of the decode function while being wrong in the reader that calls it.
-/// Decode itself is zero-copy and never allocates, so this is where the bound
-/// earns its keep.
+/// Carries **no bytes**: `Incomplete` is a count, `Complete` is the scalar
+/// [`FrameHeader`]. Neither variant can reach the wrapped transmit key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderPrefix {
+    /// The buffer is a strict prefix of a possibly-valid header. **Not a
+    /// rejection** (see the module docs and the caller obligation in
+    /// [`crate::frame`]).
+    Incomplete {
+        /// At least this many more bytes are needed before the parse can
+        /// advance — always `>= 1` and `<= MAX_HEADER_BYTES`.
+        ///
+        /// **Region-relative, not "the header ends after N".** It is the
+        /// shortfall of the region currently being read (the fixed prefix, the
+        /// wrapped key, `ext_length`, the extensions or the relay region), from
+        /// the parser's own `require`/shortfall machinery. Supplying exactly
+        /// this many advances the parse to the next region or to a terminal
+        /// outcome; supplying fewer leaves it `Incomplete`. It is **never**
+        /// derived from `payload_length`: the payload is not part of the
+        /// header, and the tail count exists only in
+        /// [`FrameHeader::tail_len`].
+        needed: usize,
+    },
+    /// The header is present and fully valid through the relay region.
+    Complete(FrameHeader),
+}
+
+/// Build the scalar header view, mapping an (unreachable) short relay region
+/// onto the same error every other relay-region shortfall reports.
+fn header_from_layout(data: &[u8], layout: Layout) -> Result<FrameHeader, DecodeError> {
+    FrameHeader::from_layout(data, layout).ok_or(DecodeError::Truncated {
+        region: Region::RelayRegion,
+        needed: RELAY_REGION_SIZE,
+        available: data.len().saturating_sub(layout.relay_region_offset()),
+    })
+}
+
+/// Parse a frame's **header** from the first bytes of a stream-carried frame,
+/// without needing its payload or signature (cut-through, R-21).
 ///
-/// Returns `Ok(None)` while more header bytes are needed; at most
-/// [`crate::frame::MAX_HEADER_BYTES`] are ever required to answer.
+/// This is the **reader-side pre-allocation boundary**. It runs the crate's
+/// single parser, so it enforces [`MAX_PAYLOAD_BYTES`] against the declared
+/// length as soon as the 14-byte fixed prefix is present — before anything is
+/// requested beyond the header and before any caller could size a buffer from
+/// that length. That is the trust boundary ADR-0036 §2 says passes fuzzing of
+/// a whole-frame decode while being wrong in the reader that calls it. It
+/// validates every header byte to decode's standard: version, flag bits,
+/// key-bearing with discardable, wrapped-key presence, the extension grammar.
+///
+/// `data` may extend past the header (into the payload, or into later
+/// frames); only the header is examined. Never allocates.
 ///
 /// # Errors
 ///
-/// Returns [`DecodeError`] for a terminal violation.
-pub fn peek_frame_len(data: &[u8]) -> Result<Option<usize>, DecodeError> {
+/// Returns [`DecodeError`] for a terminal violation — one that no further
+/// bytes can rescue. A shortfall is [`HeaderPrefix::Incomplete`], never `Err`.
+pub fn parse_header_prefix(data: &[u8]) -> Result<HeaderPrefix, DecodeError> {
     match parse_layout(data)? {
-        HeaderOutcome::Complete(layout) => Ok(Some(layout.frame_len())),
-        HeaderOutcome::Incomplete(_) => Ok(None),
+        HeaderOutcome::Complete(layout) => {
+            header_from_layout(data, layout).map(HeaderPrefix::Complete)
+        }
+        HeaderOutcome::Incomplete(shortfall) => Ok(HeaderPrefix::Incomplete {
+            // Region-relative and at least one: a shortfall is only reported
+            // when `available < needed`.
+            needed: shortfall.needed.saturating_sub(shortfall.available).max(1),
+        }),
     }
+}
+
+/// The single relay-region **writer**, shared by both rewrite entry points.
+///
+/// The offset is [`Layout::relay_region_offset`] — the same method
+/// [`FrameHeader::from_layout`] reads at — so there is one answer to "where
+/// are the relay bytes" for readers and writers alike. Exactly
+/// `RELAY_REGION_SIZE` bytes are written; nothing in the publisher region or
+/// after the relay region is touched.
+fn write_relay(
+    buf: &mut [u8],
+    layout: Layout,
+    stream_id: u16,
+    hop_sequence: u32,
+) -> Result<(), DecodeError> {
+    let offset = layout.relay_region_offset();
+    let available = buf.len().saturating_sub(offset);
+    let short = DecodeError::Truncated {
+        region: Region::RelayRegion,
+        needed: RELAY_REGION_SIZE,
+        available,
+    };
+    let end = offset.checked_add(RELAY_REGION_SIZE).ok_or(short)?;
+    let region: &mut [u8; RELAY_REGION_SIZE] = buf
+        .get_mut(offset..end)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(short)?;
+
+    // Destructured rather than indexed: no panicking path, and the widths are
+    // the field widths by construction (invariant 3).
+    let [slot_hi, slot_lo] = stream_id.to_be_bytes();
+    let [hop_a, hop_b, hop_c, hop_d] = hop_sequence.to_be_bytes();
+    *region = [slot_hi, slot_lo, hop_a, hop_b, hop_c, hop_d];
+    Ok(())
 }
 
 /// Rewrite the relay region of `frame` in place.
@@ -942,10 +1089,11 @@ pub fn peek_frame_len(data: &[u8]) -> Result<Option<usize>, DecodeError> {
 /// to overwrite three bytes of another participant's *signed* publisher region,
 /// failing verification at every receiver.
 ///
-/// The full header is validated to the same standard as decode before any byte
+/// The full frame is validated to the same standard as decode before any byte
 /// is written: a relay must not write into a frame it has not validated.
 /// Neither the publisher region nor the signature is touched, because the relay
-/// region is excluded from both.
+/// region is excluded from both. For a frame whose tail has not arrived, use
+/// [`rewrite_relay_region_header`].
 ///
 /// `frame` may be longer than one frame; only this frame's relay region is
 /// written.
@@ -953,7 +1101,7 @@ pub fn peek_frame_len(data: &[u8]) -> Result<Option<usize>, DecodeError> {
 /// # Errors
 ///
 /// Returns [`DecodeError`] if `frame` does not hold one complete, well-formed
-/// frame.
+/// frame. Nothing is written on error.
 pub fn rewrite_relay_region(
     frame: &mut [u8],
     stream_id: u16,
@@ -961,31 +1109,43 @@ pub fn rewrite_relay_region(
 ) -> Result<(), DecodeError> {
     let layout = match parse_layout(frame)? {
         HeaderOutcome::Complete(layout) => layout,
-        HeaderOutcome::Incomplete(shortfall) => return Err(shortfall.into_datagram_error(0)),
+        HeaderOutcome::Incomplete(shortfall) => return Err(shortfall.into_truncated()),
     };
     if let Err(shortfall) = require_body(frame, layout) {
         return Err(shortfall.into_datagram_error(layout.payload_length));
     }
+    write_relay(frame, layout, stream_id, hop_sequence)
+}
 
-    let offset = layout.relay_region_offset();
-    let available = frame.len().saturating_sub(offset);
-    let short = DecodeError::Truncated {
-        region: Region::RelayRegion,
-        needed: RELAY_REGION_SIZE,
-        available,
+/// Rewrite the relay region given **only the header bytes** (cut-through,
+/// R-21), so the payload-plus-signature tail can stream through untouched.
+///
+/// `header` must hold at least the whole header (through the relay region);
+/// bytes after it are neither required nor touched. The header is re-validated
+/// by the crate's single parser — to decode's standard — **before** any byte
+/// is written, so a relay never writes into a header it has not validated, and
+/// exactly the six relay bytes are written. Returns the validated header as it
+/// reads after the rewrite. Never allocates.
+///
+/// A media handler fanning one frame out to several subscribers copies the
+/// header once per subscriber (at most `MAX_HEADER_BYTES`) and calls this on
+/// each copy.
+///
+/// # Errors
+///
+/// Returns [`DecodeError`] if the header is malformed, or `truncated` if it is
+/// incomplete. Nothing is written on error.
+pub fn rewrite_relay_region_header(
+    header: &mut [u8],
+    stream_id: u16,
+    hop_sequence: u32,
+) -> Result<FrameHeader, DecodeError> {
+    let layout = match parse_layout(header)? {
+        HeaderOutcome::Complete(layout) => layout,
+        HeaderOutcome::Incomplete(shortfall) => return Err(shortfall.into_truncated()),
     };
-    let end = offset.checked_add(RELAY_REGION_SIZE).ok_or(short)?;
-    let region: &mut [u8; RELAY_REGION_SIZE] = frame
-        .get_mut(offset..end)
-        .and_then(|slice| slice.try_into().ok())
-        .ok_or(short)?;
-
-    // Destructured rather than indexed: no panicking path, and the widths are
-    // the field widths by construction (invariant 3).
-    let [slot_hi, slot_lo] = stream_id.to_be_bytes();
-    let [hop_a, hop_b, hop_c, hop_d] = hop_sequence.to_be_bytes();
-    *region = [slot_hi, slot_lo, hop_a, hop_b, hop_c, hop_d];
-    Ok(())
+    write_relay(header, layout, stream_id, hop_sequence)?;
+    header_from_layout(header, layout)
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,6 +1166,10 @@ pub struct MediaFrameParts<'a> {
     pub flags: FrameFlags,
     /// The AEAD nonce input; see [`MediaFrameView::stream_sequence`].
     pub stream_sequence: u32,
+    /// The `GoP` counter; see [`MediaFrameView::gop_counter`]. The encoder
+    /// writes what it is given: the increment and never-wrap rules bind the
+    /// caller (the sender), ADR-0036 §2.
+    pub gop_counter: u32,
     /// The wrapped transmit key, present iff `flags.key_bearing`.
     pub wrapped_transmit_key: Option<WrappedTransmitKey<'a>>,
     /// Extensions, in any order: they are emitted canonically.
@@ -1026,11 +1190,12 @@ impl fmt::Debug for MediaFrameParts<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MediaFrameParts")
             .field("flags", &self.flags)
-            .field("stream_sequence", &self.stream_sequence)
+            .field("stream_sequence", &format_args!("<redacted>"))
+            .field("gop_counter", &format_args!("<redacted>"))
             .field("wrapped_transmit_key", &self.wrapped_transmit_key)
             .field("extensions", &self.extensions)
-            .field("stream_id", &self.stream_id)
-            .field("hop_sequence", &self.hop_sequence)
+            .field("stream_id", &format_args!("<redacted>"))
+            .field("hop_sequence", &format_args!("<redacted>"))
             .field(
                 "payload",
                 &format_args!("<redacted {} B>", self.payload.len()),
@@ -1062,9 +1227,14 @@ impl fmt::Debug for MediaFrameParts<'_> {
 ///
 /// # Errors
 ///
-/// Returns [`EncodeError`] if the flag and field disagree, the payload is over
-/// [`MAX_PAYLOAD_BYTES`], or the extensions violate the grammar.
+/// Returns [`EncodeError`] if the flags are key-bearing and discardable, the
+/// key-bearing flag and field disagree, the payload is over
+/// [`MAX_PAYLOAD_BYTES`], or the extensions violate the grammar — every frame
+/// the decoder would reject (ADR-0036 §2 "Encode side").
 pub fn encode_frame(parts: &MediaFrameParts<'_>) -> Result<Bytes, EncodeError> {
+    if parts.flags.is_key_bearing_discardable() {
+        return Err(EncodeError::KeyBearingDiscardable);
+    }
     let field_present = parts.wrapped_transmit_key.is_some();
     if parts.flags.key_bearing != field_present {
         return Err(EncodeError::KeyBearingFlagMismatch {
@@ -1111,6 +1281,7 @@ pub fn encode_frame(parts: &MediaFrameParts<'_>) -> Result<Bytes, EncodeError> {
     buf.put_u8(parts.flags.to_u8());
     buf.put_u32(payload_length);
     buf.put_u32(parts.stream_sequence);
+    buf.put_u32(parts.gop_counter);
     if let Some(wrapped) = parts.wrapped_transmit_key {
         buf.put_u16(wrapped.kek_generation());
         buf.put_slice(wrapped.expose_wrapped_key());

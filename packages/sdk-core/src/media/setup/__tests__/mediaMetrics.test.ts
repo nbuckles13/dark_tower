@@ -23,7 +23,7 @@ import { describe, expect, it } from 'vitest';
 import { InMemoryMetricsSink } from '@darktower/test-utils';
 
 import { ALL_REJECT_REASONS, NON_DROPPING_REASON } from '../../frame/rejectReason.js';
-import { loadFrameVectors, PENDING_P2_REJECT_TOKENS } from '../../frame/__tests__/frameVectors.js';
+import { loadFrameVectors } from '../../frame/__tests__/frameVectors.js';
 import {
   MEDIA_KEK_INSTALL_REFUSALS,
   MEDIA_KIND_LABELS,
@@ -297,15 +297,10 @@ describe('every media emission carries nothing forbidden', () => {
 describe('the drop counter carries the frozen reject vocabulary', () => {
   it('accepts every DROPPING token and no others', () => {
     // The tokens come from `rejectReason.ts`, which is set-equality pinned in
-    // both directions against `proto/test-vectors/frame-v2.vectors.json`. There
+    // both directions against `proto/test-vectors/frame-v3.vectors.json`. There
     // is deliberately no second hand-written list here, in the test either.
     const file = loadFrameVectors();
-    // Plus the tokens P2's vectors will add (all dropping); see
-    // `PENDING_P2_REJECT_TOKENS` for why that list retires itself.
-    const dropping = [
-      ...file.reject_reasons.filter((r) => r.drops_frame).map((r) => r.token),
-      ...PENDING_P2_REJECT_TOKENS,
-    ];
+    const dropping = file.reject_reasons.filter((r) => r.drops_frame).map((r) => r.token);
     const sink = new InMemoryMetricsSink();
     const metrics = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Audio, sink);
     for (const token of dropping) {
@@ -343,6 +338,7 @@ describe('the send-drop vocabulary', () => {
       'oversize_datagram',
       'connection_closed',
       'not_connected',
+      'gop_counter_exhausted',
     ]);
   });
 

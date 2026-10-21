@@ -404,8 +404,8 @@ const _: () = assert!(
 ///
 /// | sized at | traffic at 32 kbps | traffic at 48 kbps |
 /// |---|---|---|
-/// | 32 kbps (236 B) | 32 frames, 640 ms | 27 frames, 540 ms |
-/// | 48 kbps (276 B) | **37 frames, 740 ms** | 32 frames, 640 ms |
+/// | 32 kbps (240 B) | 32 frames, 640 ms | 27 frames, 540 ms |
+/// | 48 kbps (280 B) | **37 frames, 740 ms** | 32 frames, 640 ms |
 ///
 /// So: if the SDK's bitrate **floor** ever drops below this value, this
 /// constant must drop with it. A rise in the SDK's *ceiling* does not affect
@@ -443,7 +443,7 @@ const SUPPORTED_AUDIO_BITRATE_CEILING_BPS: usize = 48_000;
 /// This exists because sizing it at the *ceiling* is the mistake that was
 /// actually made — proposed, ruled for, and reversed — during this change's
 /// review, by three readers who had each read ADR-0036 §1's row. A byte-level
-/// assertion cannot catch it: 32 × 236 = 7,552 and 32 × 276 = 8,832 both look
+/// assertion cannot catch it: 32 × 240 = 7,680 and 32 × 280 = 8,960 both look
 /// like plausible buffer sizes. What separates them is *held frames at the
 /// smallest real frame* — 32 versus 37 — i.e. whether the latency ceiling holds.
 ///
@@ -467,12 +467,12 @@ pub const AUDIO_FRAME_DURATION_MS: usize = 20;
 pub const NOMINAL_OPUS_PAYLOAD_BYTES: usize =
     NOMINAL_AUDIO_BITRATE_BPS * AUDIO_FRAME_DURATION_MS / (8 * 1000);
 
-/// Non-payload bytes on a nominal v2 audio frame: the whole header **except**
+/// Non-payload bytes on a nominal v3 audio frame: the whole header **except**
 /// the extension region, which a nominal audio frame does not carry.
 ///
 /// Every term is imported from `media-protocol`; the only thing enumerated here
 /// is *which regions are present*, and the compile-time pin below it
-/// pins that enumeration against the crate's own composition so a frame-v2
+/// pins that enumeration against the crate's own composition so a frame-header
 /// layout change breaks the build instead of silently resizing a live buffer.
 ///
 /// The extension region is excluded because the TLV registry's salience entry
@@ -487,22 +487,22 @@ const NOMINAL_HEADER_BYTES: usize = media_protocol::frame::PUBLISHER_FIXED_PREFI
 /// Compile-time pin: [`NOMINAL_HEADER_BYTES`] must equal `media-protocol`'s own
 /// maximum header composition minus the extension region.
 ///
-/// The duplicated knowledge is **the set of regions a v2 header is made of**,
+/// The duplicated knowledge is **the set of regions a v3 header is made of**,
 /// not their widths — the widths are imported above and track automatically. A
-/// sixth region added to frame v2 would update `MAX_HEADER_BYTES` and silently
+/// sixth region added to the frame header would update `MAX_HEADER_BYTES` and silently
 /// miss the local enumeration, which would under-size the datagram buffer *and*
 /// feed a stale premise into the egress-queue-binds-first startup validation.
 /// Same idiom as the `media_protocol` width pins in [`crate::routing`].
 const _: () = assert!(
     NOMINAL_HEADER_BYTES
         == media_protocol::frame::MAX_HEADER_BYTES - media_protocol::frame::MAX_EXT_BYTES,
-    "frame v2 gained or lost a header region: NOMINAL_HEADER_BYTES must track MAX_HEADER_BYTES"
+    "the frame header gained or lost a region: NOMINAL_HEADER_BYTES must track MAX_HEADER_BYTES"
 );
 
-/// Full on-wire size of one nominal v2 audio frame, in bytes.
+/// Full on-wire size of one nominal v3 audio frame, in bytes.
 ///
-/// Nominal Opus payload + the `SFrame` object's own overhead + the v2 header
-/// (publisher prefix, wrapped transmit key, extension-length field, relay
+/// Nominal Opus payload + the `SFrame` object's own overhead + the v3 header
+/// (14-byte publisher prefix, wrapped transmit key, extension-length field, relay
 /// region) + the trailing Ed25519 signature. Every term but the payload comes
 /// from `media-protocol`.
 ///
@@ -539,11 +539,12 @@ const _: () = assert!(
 /// # Relationship to ADR-0036 §1's "~225-byte on-wire audio frame"
 ///
 /// §1 quotes ~225 B and computes quinn's 1 MiB default as ≈93 s of queued
-/// audio. This constant sums the tree's own size components and lands at 236 B
-/// (so the same default is ≈88.9 s). The ADR's figure is written with a `~` and
+/// audio. This constant sums the tree's own size components and lands at 240 B
+/// (so the same default is ≈87.4 s; header v3's 4-byte `gop_counter` is part
+/// of that sum). The ADR's figure is written with a `~` and
 /// is an approximation of this same derivation, not a competing number — the
 /// chain is one chain (§3's "80-byte Opus frame (32 kbps, 20 ms)" is the
-/// payload term here). Recorded so the 11-byte delta reads as rounding rather
+/// payload term here). Recorded so the 15-byte delta reads as rounding rather
 /// than as a defect in either place.
 pub const NOMINAL_AUDIO_FRAME_BYTES: usize = NOMINAL_OPUS_PAYLOAD_BYTES
     + media_protocol::frame::SFRAME_OBJECT_OVERHEAD_BYTES
@@ -775,7 +776,7 @@ pub const MIN_KEEPALIVE_TO_IDLE_RATIO: u64 = 3;
 ///
 /// **Third term, and the only OPERATOR-TUNABLE one: the datagram SEND buffer.**
 /// `MH_DATAGRAM_BUFFER_AUDIO_FRAMES x NOMINAL_AUDIO_FRAME_BYTES` is also a
-/// per-connection allocation ceiling — at the deployed 32 frames, 7,552 B, which
+/// per-connection allocation ceiling — at the deployed 32 frames, 7,680 B, which
 /// is ~3% of the ~264 KB above and does not move the ~13% conclusion. It is
 /// listed anyway, and listed last, precisely because it is the term an operator
 /// can change: a ledger that omits the only tunable term cannot show whoever
@@ -785,7 +786,7 @@ pub const MIN_KEEPALIVE_TO_IDLE_RATIO: u64 = 3;
 /// omitting it here while correcting it there would be the narrower version of
 /// the same mistake. Bounded above by
 /// [`MAX_DATAGRAM_BUFFER_AUDIO_FRAMES_CEILING`], so its worst case is
-/// `150 x 236 B` = ~35 KB per connection, ~17 MB across 500.
+/// `150 x 240 B` = ~36 KB per connection, ~18 MB across 500.
 ///
 /// Changing `resources.limits.memory` in `mh-{0,1}-deployment.yaml` invalidates
 /// this arithmetic and requires revisiting `MH_MAX_CONNECTIONS`.
@@ -2469,7 +2470,7 @@ mod tests {
     #[test]
     fn nominal_audio_frame_bytes_is_the_component_sum_not_a_literal() {
         // Deliberately re-derived from `media-protocol`'s exported components
-        // rather than compared against 236. A frame-v2 layout change must break
+        // rather than compared against 240. A frame-header layout change must break
         // THIS test (and the compile-time header-region pin), not silently
         // resize a live buffer.
         let expected = NOMINAL_OPUS_PAYLOAD_BYTES
@@ -2517,8 +2518,8 @@ mod tests {
         // made in review: sizing the constant at the bitrate range's CEILING
         // rather than its floor.
         //
-        // Byte-level checks are blind to it — 32 x 236 = 7,552 and 32 x 276 =
-        // 8,832 are both plausible buffer sizes. What separates them is HELD
+        // Byte-level checks are blind to it — 32 x 240 = 7,680 and 32 x 280 =
+        // 8,960 are both plausible buffer sizes. What separates them is HELD
         // FRAMES at the smallest real frame, because `datagram_send_buffer_size`
         // is a latency ceiling, not a capacity guarantee (ADR-0036 §1: "prefer
         // loss to unbounded latency"). Held frames = buffer / actual frame, so

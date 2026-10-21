@@ -229,7 +229,7 @@ message ParticipantCapabilities {
   // replaces both, and the `docs/TODO.md` entry that tracked them is closed.)
   //
   // ANCHOR (DRY): the cross-language single source of truth for the header
-  // version is `proto/test-vectors/frame-v2.vectors.json` (story task 8);
+  // version is `proto/test-vectors/frame-v3.vectors.json`;
   // `crates/media-protocol/src/frame.rs::PROTOCOL_VERSION` is the Rust-side
   // derivation. Precedence: vectors beat prose, but a vector contradicting a
   // recorded ruling is a defect to escalate rather than conform to — see
@@ -1162,8 +1162,7 @@ message SendDirective {
   // former "MUST NOT emit a version below the configured floor" language is
   // deleted with the floor.)
   // ANCHOR (DRY): cross-language source of truth is the frame vectors file
-  // (`proto/test-vectors/frame-v2.vectors.json` today; P2 regenerates it for
-  // v3); see `docs/TODO.md` §Media Path Obligations for the precedence rule
+  // (`proto/test-vectors/frame-v3.vectors.json`, `header_version: 3`); see `docs/TODO.md` §Media Path Obligations for the precedence rule
   // between the two anchors.
   uint32 header_version = 2;
 }

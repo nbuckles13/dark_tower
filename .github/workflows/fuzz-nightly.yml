@@ -28,6 +28,10 @@ jobs:
             target: codec_decode
           - crate: media-protocol
             target: codec_roundtrip
+          - crate: media-protocol
+            target: header_prefix
+          - crate: media-protocol
+            target: header_reader_split
           - crate: ac-service
             target: jwt_validation
           - crate: ac-service

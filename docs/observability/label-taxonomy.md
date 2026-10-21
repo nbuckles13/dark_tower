@@ -84,7 +84,7 @@ case future drift emerges from new services or metric additions.
 | `region` | Geographic/deployment region | Bounded by cloud region set |
 | `pod` | Kubernetes pod identifier | Per-pod — cardinality bounded by fleet size |
 | `key_custody` | Who holds media key material | **`operator` — single permitted value.** See §Key custody below. |
-| `reason` | Why a **frame** was dropped on the media path | **ONE label space, TWO families, each with exactly one home.** (a) The *codec* family is bounded by `proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`; (b) the *relay transport-and-routing* family is bounded by `mh_service::observability::metrics::MediaDropReason`. **Points, never restates** — restating either set here would give each token two homes and they would drift. Distinct from `error_type` / `error_category`, which classify why a **service operation** failed: `reason` is per-frame and lives entirely on the media path. See §Frame reject reason and §Media-path transport refusals below. |
+| `reason` | Why a **frame** was dropped on the media path | **ONE label space, TWO families, each with exactly one home.** (a) The *codec* family is bounded by `proto/test-vectors/frame-v3.vectors.json` → `reject_reasons`; (b) the *relay transport-and-routing* family is bounded by `mh_service::observability::metrics::MediaDropReason`. **Points, never restates** — restating either set here would give each token two homes and they would drift. Distinct from `error_type` / `error_category`, which classify why a **service operation** failed: `reason` is per-frame and lives entirely on the media path. See §Frame reject reason and §Media-path transport refusals below. |
 | `mode` | Capture source of the LOCAL send path — what feeds this client's encoder | `microphone` (also covers an embedder-injected capture factory), `test_tone` (only the define-gated built-in tone) — a closed enum declared as the type `MediaCaptureSourceMode` in `packages/sdk-core/src/media/setup/mediaMetrics.ts`, carried only by `dt_client_media_capture_source`. **Datapoint-only** (GC `MEDIA_DATAPOINT_EXTRA`, collector `keep_keys`; never on spans or exemplars). **Identity-free**: the value is a build-time property of the bundle (`__DT_TEST_TONE__`), not per user, participant or meeting. The token `test_tone` exists in a bundle only inside the define's gate. |
 
 **`status` vs `outcome`.** Use `status` when the values are the coarse, shared
@@ -249,7 +249,7 @@ mechanics* — name, permitted values, which surfaces carry it — this file win
 
 ## Frame reject reason `[reviewer-only]`
 
-**All eighteen `reason` values are emitted individually as `reason` values, without exception
+**Every `reason` value in `reject_reasons` is emitted individually as a `reason` value, without exception
 (R-25, R-31). Nothing below bears on that.** This section is where someone will come looking for
 permission to coarsen the vocabulary, and everything after this sentence is about a different axis.
 R-25 already settled the per-token question on 2026-08-31: *"'bucket' names a FAMILY of `reason`
@@ -258,9 +258,9 @@ values, not one collapsed `decode_reject` label"* — collapsing would destroy R
 would break `sum by(reason)` comparability between MH and the client.
 
 **"Without exception" above is about granularity, not about membership of the drop counter. Those are
-different questions and only one of them has the answer "all eighteen".** Which values belong on
+different questions and only one of them has the answer "all of them".** Which values belong on
 `dt_client_media_frames_dropped_total{reason}` is carried by **`drops_frame`** in
-`proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. Seventeen are `true`.
+`proto/test-vectors/frame-v3.vectors.json` → `reject_reasons`. Every token is `true` but one.
 **`wrap_key_id_mismatch` is `false`, and is the only one**: it describes a correctly self-signed frame
 whose unusable wrapped key the receiver ignores (ADR-0036 §4), so the frame is otherwise processed
 and **played**. (The token *name* says mis-bound; the receiver cannot actually tell a mis-bound wrap
@@ -282,19 +282,17 @@ so only the state-dependent ones tell them anything new.
 **The discriminator is byte-determined versus receiver-state-dependent — *not* codec-versus-crypto,
 and not `has_vector`.** Those are all *nearly* the same distinction and none of them is it:
 
-- The eight structural rejects are **byte-determined**.
-- `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry`, `no_transmit_key`,
-  `signature_invalid`, `decrypt_failed`, `unwrap_failed`, `replay_detected`,
-  `wrap_key_id_mismatch` and `sender_not_assigned` are **receiver-state-dependent**.
-- **Pending a nineteenth (header v3, task C-v3):** `key_bearing_discardable` — a v3 frame with both
-  the key-bearing and the discardable flag set (ADR-0036 §2 decode step 5) — is **byte-determined**,
-  so it joins the structural family, and it is `drops_frame: true`. The SDK emits it on v3 decode
-  only. It is not yet in `reject_reasons` (the v2 vectors predate it), so the counts in this section
-  remain statements about the SSoT; P2 adds it to the v3 vectors and folds it into the counts here.
-  The client's `rejectReason.test.ts` holds it in a self-retiring pending set until then.
-- **Eight and ten is all eighteen: the two families PARTITION the vocabulary.** (Sixteen until story 2
-  task 7 added `kek_generation_stale` and `sender_not_assigned`, both receiver-state-dependent.)
-  Stated because an earlier revision of this list classified fourteen and left `replay_detected` and
+- **Byte- or transport-determined:** the structural codec rejects — every
+  `media_protocol::codec::RejectReason` token, `key_bearing_discardable` (header v3, ADR-0036 §2
+  decode step 5) included — and `stream_partial_reset`, which is transport-event-determined: the
+  party who caused the reset already knows it happened.
+- **Receiver-state-dependent:** `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry`,
+  `no_transmit_key`, `signature_invalid`, `decrypt_failed`, `unwrap_failed`, `replay_detected`,
+  `wrap_key_id_mismatch`, `sender_not_assigned`, and story 3's `self_sender`,
+  `sender_server_muted`, `decode_over_bound` and `stream_slot_mismatch`.
+- **The two families PARTITION the vocabulary.** No count is restated here: the vocabulary is the
+  `reject_reasons` array, and a restated count is a second home that drifts. Stated because an
+  earlier revision of this list classified fourteen and left `replay_detected` and
   `wrap_key_id_mismatch` in neither — and an unclassified token is not read as unclassified, it is
   read as byte-determined and therefore safe to slice, which is the permissive answer arrived at by
   omission. If a token is added to `reject_reasons`, it lands in one of these two families here or
@@ -320,6 +318,16 @@ and not `has_vector`.** Those are all *nearly* the same distinction and none of 
   frame from sender X reads as *"does this receiver hold sender X in its assignment set?"* It is the
   clearest member of this family: the frame parsed, verified **and** decrypted before the gate ran,
   so nothing about the bytes selects it.
+- `self_sender` and `sender_server_muted` are decided against the receiver's own identity and its
+  held server-mute set: an injected frame reads as *"is X this receiver?"* / *"does this receiver
+  hold X as server-muted?"*.
+- `decode_over_bound` compares decoded output against the **receiving slot's configured bounds**,
+  which are receiver state, so it tells an injector something about the receiver's slot
+  configuration.
+- `stream_slot_mismatch` has two halves, both receiver-dependent in what they reveal: a relay
+  `stream_id` that is not one of the receiver's **declared slots** (decided against the declared
+  set), or one that differs between frames on one stream (a multi-frame property, which is also why
+  no single vector row determines it — `has_vector: false`).
 - `wrap_key_id_mismatch` is the subtlest of the set, and the one whose **name points away from its
   firing condition**. The receiver cannot detect a mis-bound wrap. The wrap's bound key id is nowhere
   on the wire — the key-bearing block is `kek_generation`, 32 wrapped bytes and a 16-byte tag, and
@@ -388,7 +396,7 @@ threaded from `MeetingSession.join` into **every** emission site including the m
 `reason × meeting_id_hash` — the oracle — is the **default**. It arrives by doing nothing. A task-19
 implementer must act to prevent it; the violation ships unless they do.
 
-**Following the pointer:** `frame-v2.vectors.json` is a **test-vector fixture**. Its `crypto` blocks
+**Following the pointer:** `frame-v3.vectors.json` is a **test-vector fixture**. Its `crypto` blocks
 carry synthetic, test-only key material (including a field named `identity_private_seed_hex`) whose
 values are structured low-entropy patterns, not CSPRNG output, and nothing in it derives from any real
 environment or secret. Read the `reject_reasons` array; do not file an incident on the rest.
@@ -404,7 +412,7 @@ tokens a **relay** adds to the same label space: the conditions under which MH
 did not forward a frame that had nothing wrong with its bytes.
 
 `media-protocol`'s `reject_reasons!` macro is the governing text and already
-says this — its eight tokens are *"the structural / parse subset of a **shared**
+says this — its tokens are *"the structural / parse subset of a **shared**
 `reason` label space"* — and `RejectReason::producible_by()` names
 `rewrite_relay_region` as a producing entry point, which is a relay call.
 Recorded here because an earlier draft of this file described the two families

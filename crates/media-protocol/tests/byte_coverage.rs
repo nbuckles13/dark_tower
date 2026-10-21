@@ -1,4 +1,4 @@
-//! Executable proof that the v2 header has no skipped bytes and no skipped
+//! Executable proof that the v3 header has no skipped bytes and no skipped
 //! bits.
 //!
 //! ADR-0036 §2 requires that *"every byte and every bit is either decoded into
@@ -29,19 +29,22 @@
 
 mod common;
 
-use common::{build, flip_bit, set_byte, Shape, ALL_SHAPES, SENTINEL_PAYLOAD};
+use common::{build, flip_bit, set_byte, Shape, ALL_SHAPES, SENTINEL_PAYLOAD, TEST_GOP_COUNTER};
 use media_protocol::codec::decode_datagram;
-use media_protocol::frame::{MediaFrameView, FLAGS_OFFSET, LEGAL_FLAG_MASK};
+use media_protocol::frame::{
+    MediaFrameView, FLAGS_OFFSET, GOP_COUNTER_FIELD_BYTES, GOP_COUNTER_OFFSET, LEGAL_FLAG_MASK,
+};
 
 /// Everything a receiver can observe about a decoded frame, as one comparable
 /// value. If a mutation changes no element of this tuple and does not reject,
 /// the mutated byte is unobservable.
 fn observable(view: &MediaFrameView<'_>) -> String {
     format!(
-        "{:?}|{}|{}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}",
+        "{:?}|{}|{}|{}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}",
         view.flags(),
         view.payload_length(),
         view.stream_sequence(),
+        view.gop_counter(),
         view.wrapped_transmit_key().map(|w| (
             w.kek_generation(),
             *w.expose_wrapped_key(),
@@ -167,5 +170,61 @@ fn no_byte_of_the_frame_is_outside_a_named_region() {
             frame.len(),
             "frame does not end at the signature"
         );
+    }
+}
+
+/// The v3 field: every one of the 32 `gop_counter` bits is decoded into
+/// `gop_counter()` (no other value moves), and the field lies inside the
+/// publisher region — so it is covered by the AEAD associated data and is the
+/// first half of the signed input, i.e. a relay cannot alter it unnoticed.
+#[test]
+fn every_gop_counter_bit_is_decoded_and_inside_the_signed_region() {
+    for shape in ALL_SHAPES {
+        let frame = build(shape, &SENTINEL_PAYLOAD);
+        let view = decode_datagram(&frame).expect("fixture must decode");
+        assert_eq!(view.gop_counter(), TEST_GOP_COUNTER);
+        let field = GOP_COUNTER_OFFSET..GOP_COUNTER_OFFSET + GOP_COUNTER_FIELD_BYTES;
+        assert!(
+            view.publisher_region_range().start <= field.start
+                && field.end <= view.publisher_region_range().end,
+            "gop_counter must be inside the publisher (signed + AAD) region"
+        );
+        for offset in field {
+            for bit in 0..8u32 {
+                let mutated = flip_bit(&frame, offset, bit);
+                let m = decode_datagram(&mutated).expect("every gop_counter value decodes");
+                let shift = 8 * (GOP_COUNTER_OFFSET + GOP_COUNTER_FIELD_BYTES - 1 - offset);
+                let flipped = 1u32 << (u32::try_from(shift).unwrap() + bit);
+                assert_eq!(m.gop_counter(), TEST_GOP_COUNTER ^ flipped);
+                assert_eq!(m.stream_sequence(), view.stream_sequence());
+                assert_eq!(m.payload_length(), view.payload_length());
+                assert_ne!(
+                    m.publisher_region(),
+                    view.publisher_region(),
+                    "the mutated gop byte must change the signed publisher region"
+                );
+            }
+        }
+    }
+}
+
+/// The relay region is outside both signed ranges: rewriting it changes
+/// neither half of the signed input nor the associated data.
+#[test]
+fn relay_region_is_outside_the_signed_input() {
+    for shape in ALL_SHAPES {
+        let frame = build(shape, &SENTINEL_PAYLOAD);
+        let view = decode_datagram(&frame).expect("fixture must decode");
+        let relay = view.relay_region_range();
+        for offset in relay {
+            let mutated = set_byte(&frame, offset, frame[offset] ^ 0xFF);
+            let m = decode_datagram(&mutated).expect("relay bytes never reject");
+            assert_eq!(m.signed_ranges(), view.signed_ranges());
+            assert_eq!(m.publisher_region(), view.publisher_region());
+            assert_ne!(
+                (m.stream_id(), m.hop_sequence()),
+                (view.stream_id(), view.hop_sequence())
+            );
+        }
     }
 }

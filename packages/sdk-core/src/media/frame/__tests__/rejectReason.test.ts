@@ -19,30 +19,17 @@ import { describe, expect, it } from 'vitest';
 
 import { ALL_REJECT_REASONS, NON_DROPPING_REASON, FrameRejectedError } from '../rejectReason.js';
 import { RECEIVE_PATH_REASONS } from '../receivePath.js';
-import { loadFrameVectors, PENDING_P2_REJECT_TOKENS } from './frameVectors.js';
+import { loadFrameVectors } from './frameVectors.js';
 
 const file = loadFrameVectors();
-
-const PENDING_P2 = PENDING_P2_REJECT_TOKENS;
 
 describe('the token set matches the SSoT exactly', () => {
   it('has no token the SSoT lacks, and lacks none the SSoT has', () => {
     const ours = [...ALL_REJECT_REASONS].sort();
-    const theirs = [...file.reject_reasons.map((r) => r.token), ...PENDING_P2].sort();
+    const theirs = file.reject_reasons.map((r) => r.token).sort();
     // Equality, not subset, in both directions. A subset assertion stays green
     // when a token is DELETED from one side.
     expect(ours).toEqual(theirs);
-  });
-
-  it('holds no pending token the SSoT already carries (the pending set retires itself)', () => {
-    const ssot = new Set(file.reject_reasons.map((r) => r.token));
-    for (const token of PENDING_P2) {
-      expect(
-        ssot.has(token),
-        `${token} is now in the vectors: P2 landed it, so remove it from PENDING_P2`,
-      ).toBe(false);
-      expect(ALL_REJECT_REASONS as readonly string[]).toContain(token);
-    }
   });
 
   it('declares no duplicates', () => {
@@ -62,6 +49,11 @@ describe('the token set matches the SSoT exactly', () => {
         'no_transmit_key',
         'kek_generation_stale',
         'sender_not_assigned',
+        'self_sender',
+        'sender_server_muted',
+        'decode_over_bound',
+        'stream_partial_reset',
+        'stream_slot_mismatch',
       ].sort(),
     );
     for (const token of unvectored) {

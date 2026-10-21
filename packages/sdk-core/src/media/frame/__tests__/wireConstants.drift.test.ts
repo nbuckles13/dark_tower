@@ -5,7 +5,7 @@
 //   crates/media-protocol/src/frame.rs        <- origin
 //        |  guard g2 / g3 / g4
 //        v
-//   proto/test-vectors/frame-v2.vectors.json
+//   proto/test-vectors/frame-v3.vectors.json
 //        |  THIS TEST (re-render + byte-compare)
 //        v
 //   src/media/frame/wireConstants.ts
@@ -32,7 +32,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { repoRoot } from './repoRoot.js';
-import { loadFrameVectors } from './frameVectors.js';
+import { loadFrameVectors, VECTORS_PATH } from './frameVectors.js';
 import {
   WIRE_CONSTANTS,
   HEADER_VERSION,
@@ -49,7 +49,16 @@ const generator = (await import(
   loadVectors: () => unknown;
   OUTPUT_PATH: string;
   REGEN_COMMAND: string;
+  VECTORS_PATH: string;
 };
+
+describe('the SSoT path has one value on both sides of the render', () => {
+  it('the renderer and the test-tier loader read the same vectors file', () => {
+    // Two homes by necessity (the renderer runs under bare `node`, the loader
+    // is TypeScript); this equality is the guard that keeps them one value.
+    expect(generator.VECTORS_PATH).toBe(VECTORS_PATH);
+  });
+});
 
 describe('wireConstants.ts is a faithful render of the SSoT', () => {
   it('matches a fresh render, byte for byte', async () => {
@@ -62,7 +71,7 @@ describe('wireConstants.ts is a faithful render of the SSoT', () => {
       const at = [...committed].findIndex((c, i) => c !== rendered[i]);
       throw new Error(
         `${generator.OUTPUT_PATH} is not a faithful render of ` +
-          `proto/test-vectors/frame-v2.vectors.json (first difference at byte ${at}).\n\n` +
+          `${generator.VECTORS_PATH} (first difference at byte ${at}).\n\n` +
           `Regenerate with:\n    ${generator.REGEN_COMMAND}\n\n` +
           `If you edited ${generator.OUTPUT_PATH} by hand: DO NOT re-render to make this pass — ` +
           `that discards your edit silently. The value's origin is ` +

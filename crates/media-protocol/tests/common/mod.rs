@@ -1,9 +1,9 @@
 //! Shared frame construction for the `media-protocol` integration tests.
 //!
 //! Both `byte_coverage.rs` and `corpus_seeds.rs` need the same two
-//! capabilities — build a canonical valid v2 frame, and mutate one at a named
+//! capabilities — build a canonical valid v3 frame, and mutate one at a named
 //! constant offset — so they live here rather than as two private builders
-//! that would have to agree about the v2 layout and would diverge on the first
+//! that would have to agree about the v3 layout and would diverge on the first
 //! header change.
 //!
 //! **Every frame here is produced by the encoder**, and every invalid frame is
@@ -20,6 +20,8 @@
     clippy::unwrap_used,
     clippy::indexing_slicing
 )]
+
+pub mod seeds;
 
 use media_protocol::codec::{encode_frame, MediaFrameParts};
 use media_protocol::extensions::{Extension, EXT_TYPE_SALIENCE};
@@ -43,6 +45,9 @@ pub static SENTINEL_PAYLOAD: [u8; 24] = [0xD4; 24];
 pub const TEST_KEK_GENERATION: u16 = 0x0107;
 /// The stream sequence carried by every built frame.
 pub const TEST_STREAM_SEQUENCE: u32 = 0x1234_5678;
+/// The GoP counter carried by every built frame. Distinct from every other
+/// field's pattern so a byte-coverage or redaction test can tell them apart.
+pub const TEST_GOP_COUNTER: u32 = 0x9ABC_DEF1;
 /// The relay slot carried by every built frame.
 pub const TEST_STREAM_ID: u16 = 0x2A2B;
 /// The hop sequence carried by every built frame.
@@ -110,6 +115,27 @@ pub fn try_build_with_salience(
     payload: &[u8],
     salience: u8,
 ) -> Result<Vec<u8>, media_protocol::codec::EncodeError> {
+    try_build(shape, payload, salience, TEST_GOP_COUNTER)
+}
+
+/// Build a valid frame carrying a specific GoP counter. Every u32 is legal on
+/// the wire, `0` and `u32::MAX` included.
+#[must_use]
+pub fn build_with_gop(shape: Shape, payload: &[u8], gop_counter: u32) -> Vec<u8> {
+    try_build(shape, payload, TEST_SALIENCE, gop_counter).expect("valid frame must encode")
+}
+
+/// Build a frame from every variable input, surfacing encoder rejections.
+///
+/// # Errors
+///
+/// Propagates the encoder's error.
+pub fn try_build(
+    shape: Shape,
+    payload: &[u8],
+    salience: u8,
+    gop_counter: u32,
+) -> Result<Vec<u8>, media_protocol::codec::EncodeError> {
     let salience_value = [salience];
     let extensions: Vec<Extension<'_>> = if shape.extensions {
         vec![Extension {
@@ -135,6 +161,7 @@ pub fn try_build_with_salience(
             key_bearing: shape.key_bearing,
         },
         stream_sequence: TEST_STREAM_SEQUENCE,
+        gop_counter,
         wrapped_transmit_key: wrapped,
         extensions: &extensions,
         stream_id: TEST_STREAM_ID,
@@ -250,7 +277,7 @@ pub fn ext_region_offset(frame: &[u8]) -> usize {
 ///
 /// # Provenance rule
 ///
-/// These are **generated through the v2 encoder**, never hand-written byte
+/// These are **generated through the v3 encoder**, never hand-written byte
 /// arrays. A hand-written array is a second implementation of the layout, and
 /// a wrong one would make the prefix-invariant test assert `Ok(None)` over
 /// bytes that are not a valid frame at all — passing while proving nothing.

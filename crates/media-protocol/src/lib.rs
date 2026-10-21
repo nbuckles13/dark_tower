@@ -1,4 +1,5 @@
-//! Dark Tower media frame wire format, version 2 (ADR-0036 §2 and Appendix).
+//! Dark Tower media frame wire format, version 3 (ADR-0036 §2 "Header v3 — the
+//! normative layout"), the only version.
 //!
 //! A binary codec for the frames carried between clients and media handlers.
 //! The header splits into a **publisher region**, authenticated end-to-end, and
@@ -7,7 +8,8 @@
 //!
 //! * [`frame`] — field sizes, offsets, flags, and the zero-copy decoded view.
 //! * [`extensions`] — the publisher-set TLV region and its registry.
-//! * [`codec`] — the parser, the four entry points, and the reject vocabulary.
+//! * [`codec`] — the parser, its entry points, and the reject vocabulary.
+//! * [`reader`] — the chunk-fed header reader for cut-through stream forwarding.
 //!
 //! # What this crate does not do
 //!
@@ -35,3 +37,4 @@
 pub mod codec;
 pub mod extensions;
 pub mod frame;
+pub mod reader;

@@ -29,9 +29,18 @@ pub fn sample_identity_public_key() -> Vec<u8> {
 /// precondition for unreliable QUIC datagrams, not a performance assertion.
 pub const BINDING_DEADLINE: Duration = Duration::from_secs(30);
 
-/// A frame-v2 audio datagram through the production codec, with publisher-side
-/// relay values a correct relay must rewrite and a payload marker naming the
-/// sender (MH is keyless: payload and signature must survive byte-identically).
+/// The uplink relay `stream_id` a publisher stamps on its audio frames: MC's
+/// send id for the audio stream (`signaling.proto::SendStream.stream_number`;
+/// MC's `MAIN_AUDIO_STREAM_NUMBER`, 0 today). Hop-local (ADR-0036 §2): it is
+/// MH's publisher-set, unauthenticated attribution label on the uplink, and MH
+/// rewrites it to the receiver's slot id on the downlink. Named in prose rather
+/// than imported, because env-tests links no service crate (ADR-0028).
+pub const AUDIO_SEND_ID: u16 = 0;
+
+/// A frame-v3 audio datagram through the production codec, with the real uplink
+/// relay stream id ([`AUDIO_SEND_ID`]), a hop-sequence sentinel a correct relay
+/// must rewrite, and a payload marker naming the sender (MH is keyless: payload
+/// and signature must survive byte-identically).
 ///
 /// Hoisted from `tests/27_mc_slot_placement.rs` at story 2 task 10, when
 /// `26_mh_quic.rs` became its second consumer.
@@ -60,9 +69,15 @@ pub fn audio_datagram(stream_sequence: u32, marker: u8) -> bytes::Bytes {
             key_bearing: false,
         },
         stream_sequence,
+        // Audio is independently decodable on every frame, so its GoP counter
+        // advances with every frame exactly as the stream sequence does
+        // (ADR-0036 §2). Same rule as the mh-service twin.
+        gop_counter: stream_sequence,
         wrapped_transmit_key: None,
         extensions: &[],
-        stream_id: 0xFFFF,
+        stream_id: AUDIO_SEND_ID,
+        // A sentinel MH never writes: `assert_relayed_on_slot` proves the
+        // relay rewrite through it (see there).
         hop_sequence: 0xDEAD_BEEF,
         payload: &payload,
         signature: &signature,
@@ -193,6 +208,10 @@ pub fn assert_relayed_on_slot(
         "{phase}: {who}'s frames must arrive on the slot the receiver's own StreamAssignments \
          named for {who}"
     );
+    // THIS is the rewrite proof. The uplink `stream_id` is the real audio send
+    // id (`AUDIO_SEND_ID`, 0), so for a receiver whose slot is also 0 the
+    // equality above cannot distinguish a rewritten id from an un-rewritten
+    // one; the hop-sequence sentinel can, on every slot.
     assert_ne!(
         view.hop_sequence(),
         0xDEAD_BEEF,

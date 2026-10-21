@@ -1,4 +1,4 @@
-//! Structural properties of the v2 codec: zero-copy, canonical encoding,
+//! Structural properties of the v3 codec: zero-copy, canonical encoding,
 //! derived constants, the relay rewrite, and redaction.
 
 // Test code: a panic on a bad index IS the failure signal here, and these
@@ -14,12 +14,12 @@ mod common;
 
 use common::{
     audio_frame, build, canonical_frame, Shape, ALL_SHAPES, SENTINEL_PAYLOAD, SENTINEL_SIGNATURE,
-    SENTINEL_WRAPPED_KEY, SENTINEL_WRAP_TAG, TEST_HOP_SEQUENCE, TEST_KEK_GENERATION,
-    TEST_STREAM_ID, TEST_STREAM_SEQUENCE,
+    SENTINEL_WRAPPED_KEY, SENTINEL_WRAP_TAG, TEST_GOP_COUNTER, TEST_HOP_SEQUENCE,
+    TEST_KEK_GENERATION, TEST_STREAM_ID, TEST_STREAM_SEQUENCE,
 };
 use media_protocol::codec::{
-    decode_datagram, decode_stream_frame, encode_frame, peek_frame_len, rewrite_relay_region,
-    DecodeError, EncodeError, MediaFrameParts,
+    decode_datagram, decode_stream_frame, encode_frame, parse_header_prefix, rewrite_relay_region,
+    DecodeError, EncodeError, HeaderPrefix, MediaFrameParts,
 };
 use media_protocol::extensions::{Extension, EXT_ENTRY_HEADER_BYTES, EXT_TYPE_SALIENCE};
 use media_protocol::frame::{
@@ -154,6 +154,7 @@ fn decode_then_encode_is_byte_identical() {
             let parts = MediaFrameParts {
                 flags: view.flags(),
                 stream_sequence: view.stream_sequence(),
+                gop_counter: view.gop_counter(),
                 wrapped_transmit_key: view.wrapped_transmit_key(),
                 extensions: &extensions,
                 stream_id: view.stream_id(),
@@ -183,6 +184,7 @@ fn decoded_fields_match_what_was_encoded() {
     let view = decode_datagram(&frame).expect("fixture must decode");
     assert_eq!(view.version(), media_protocol::frame::PROTOCOL_VERSION);
     assert_eq!(view.stream_sequence(), TEST_STREAM_SEQUENCE);
+    assert_eq!(view.gop_counter(), TEST_GOP_COUNTER);
     assert_eq!(view.stream_id(), TEST_STREAM_ID);
     assert_eq!(view.hop_sequence(), TEST_HOP_SEQUENCE);
     assert_eq!(view.payload(), SENTINEL_PAYLOAD.as_slice());
@@ -206,6 +208,7 @@ fn encoder_rejects_a_flag_field_mismatch() {
             key_bearing: true,
         },
         stream_sequence: 1,
+        gop_counter: 0,
         wrapped_transmit_key: None,
         extensions: &[],
         stream_id: 0,
@@ -236,6 +239,7 @@ fn encoder_emits_extensions_in_ascending_order_regardless_of_input_order() {
             key_bearing: false,
         },
         stream_sequence: 1,
+        gop_counter: 0,
         wrapped_transmit_key: None,
         extensions: &[
             Extension {
@@ -327,7 +331,7 @@ fn max_ext_bytes_is_the_full_registry() {
 /// number; the definitions are the derived `const` expressions.
 #[test]
 fn derived_constants_have_their_expected_values() {
-    assert_eq!(PUBLISHER_FIXED_PREFIX_SIZE, 10);
+    assert_eq!(PUBLISHER_FIXED_PREFIX_SIZE, 14);
     assert_eq!(EXT_LENGTH_FIELD_SIZE, 2);
     assert_eq!(RELAY_REGION_SIZE, 6);
     assert_eq!(SIGNATURE_SIZE, 64);
@@ -337,8 +341,8 @@ fn derived_constants_have_their_expected_values() {
     assert_eq!(KEY_ID_BYTES, 8);
     // `MAX_PAYLOAD_BYTES` is deliberately NOT pinned to a literal here.
     //
-    // It became a cross-language value with story task 8: the single source of
-    // truth is `proto/test-vectors/frame-v2.vectors.json` -> `max_payload_bytes`,
+    // It is a cross-language value: the single source of truth is
+    // `proto/test-vectors/frame-v3.vectors.json` -> `max_payload_bytes`,
     // and `scripts/guards/simple/validate-frame-vectors.sh` check g2 asserts the
     // Rust constant equals it, with a `rust-const-not-found` bail so a renamed
     // declaration reds instead of comparing nothing. A literal here would be a
@@ -346,7 +350,7 @@ fn derived_constants_have_their_expected_values() {
     // isolation, since it sits next to seven other literals that are genuinely
     // Rust-only. The derived constants below still pin it transitively.
     assert_eq!(MAX_EXT_BYTES, 3);
-    assert_eq!(MAX_HEADER_BYTES, 71);
+    assert_eq!(MAX_HEADER_BYTES, 75);
     assert_eq!(
         MAX_FRAME_BYTES,
         MAX_HEADER_BYTES + MAX_PAYLOAD_BYTES + SIGNATURE_SIZE
@@ -357,24 +361,28 @@ fn derived_constants_have_their_expected_values() {
 // The reader-side pre-allocation boundary
 // ---------------------------------------------------------------------------
 
+fn frame_len_of(data: &[u8]) -> Option<usize> {
+    match parse_header_prefix(data).expect("a prefix is never a rejection") {
+        HeaderPrefix::Complete(header) => Some(header.frame_len()),
+        HeaderPrefix::Incomplete { .. } => None,
+    }
+}
+
 #[test]
-fn peek_answers_once_the_header_is_present_and_never_before() {
+fn header_prefix_answers_once_the_header_is_present_and_never_before() {
     let frame = canonical_frame();
     let view = decode_datagram(&frame).expect("fixture must decode");
     let header_end = view.payload_range().start;
 
     for len in 0..header_end {
         assert_eq!(
-            peek_frame_len(&frame[..len]).expect("a prefix is never a rejection"),
+            frame_len_of(&frame[..len]),
             None,
-            "peek answered at {len}, before the header was complete"
+            "the header parse answered at {len}, before the header was complete"
         );
     }
-    assert_eq!(
-        peek_frame_len(&frame[..header_end]).unwrap(),
-        Some(frame.len())
-    );
-    assert_eq!(peek_frame_len(&frame).unwrap(), Some(frame.len()));
+    assert_eq!(frame_len_of(&frame[..header_end]), Some(frame.len()));
+    assert_eq!(frame_len_of(&frame), Some(frame.len()));
     assert!(
         header_end <= MAX_HEADER_BYTES,
         "a header exceeded MAX_HEADER_BYTES"
@@ -382,16 +390,17 @@ fn peek_answers_once_the_header_is_present_and_never_before() {
 }
 
 #[test]
-fn peek_enforces_the_maximum_before_a_caller_could_reserve() {
+fn header_prefix_enforces_the_maximum_before_a_caller_could_reserve() {
     let frame = canonical_frame();
     let over = u32::try_from(MAX_PAYLOAD_BYTES + 1).unwrap();
     let mut bytes = frame.clone();
     bytes[media_protocol::frame::PAYLOAD_LENGTH_OFFSET
         ..media_protocol::frame::PAYLOAD_LENGTH_OFFSET + 4]
         .copy_from_slice(&over.to_be_bytes());
-    // Only the header is offered — a reader has not yet buffered a payload.
-    let header_only = &bytes[..MAX_HEADER_BYTES];
-    let err = peek_frame_len(header_only).expect_err("must reject before any reservation");
+    // Only the 14-byte fixed prefix is offered — a reader has buffered nothing
+    // past it, and must not be asked for more.
+    let prefix_only = &bytes[..PUBLISHER_FIXED_PREFIX_SIZE];
+    let err = parse_header_prefix(prefix_only).expect_err("must reject before any reservation");
     assert_eq!(
         err.reason(),
         media_protocol::codec::RejectReason::PayloadLengthExceedsMax
@@ -414,7 +423,7 @@ fn payload_length_at_u32_max_rejects_rather_than_wrapping() {
         media_protocol::codec::RejectReason::PayloadLengthExceedsMax
     );
     assert!(matches!(
-        peek_frame_len(&bytes),
+        parse_header_prefix(&bytes),
         Err(DecodeError::PayloadLengthExceedsMax { .. })
     ));
 }
@@ -556,6 +565,7 @@ fn rendered_output_never_contains_key_signature_or_payload_bytes() {
     let parts = MediaFrameParts {
         flags: view.flags(),
         stream_sequence: view.stream_sequence(),
+        gop_counter: view.gop_counter(),
         wrapped_transmit_key: view.wrapped_transmit_key(),
         extensions: &extensions,
         stream_id: view.stream_id(),
@@ -564,7 +574,38 @@ fn rendered_output_never_contains_key_signature_or_payload_bytes() {
         signature: view.signature(),
     };
 
-    let rendered = format!("{view:?} {wrapped:?} {:?} {parts:?}", view.extensions());
+    let header = match parse_header_prefix(&frame).expect("fixture parses") {
+        HeaderPrefix::Complete(header) => header,
+        HeaderPrefix::Incomplete { .. } => panic!("complete frame"),
+    };
+    let mut reader = media_protocol::reader::HeaderReader::new();
+    reader.feed(&frame).expect("fixture parses");
+    let rendered = format!(
+        "{view:?} {wrapped:?} {:?} {parts:?} {header:?} {reader:?}",
+        view.extensions()
+    );
+
+    // Per-stream identity is never rendered (ADR-0036 §2/§11, R-30): neither
+    // the GoP counter nor the stream sequence, in decimal or hex, in any of the
+    // view, the encode-side parts, the header-only view or the reader.
+    for (name, value) in [
+        ("gop_counter", TEST_GOP_COUNTER),
+        ("stream_sequence", TEST_STREAM_SEQUENCE),
+    ] {
+        assert!(
+            !rendered.contains(&value.to_string()),
+            "{name} rendered in decimal: {rendered}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains(&format!("{value:x}")),
+            "{name} rendered in hex"
+        );
+    }
+    // Every type redacts the relay values too (stream identity, R-30), so one
+    // frame formats the same whichever type a call site holds.
+    let header_rendered = format!("{header:?} {view:?} {parts:?}");
+    assert!(!header_rendered.contains(&TEST_STREAM_ID.to_string()));
+    assert!(!header_rendered.contains(&TEST_HOP_SEQUENCE.to_string()));
 
     for (name, sentinel) in [
         ("wrapped key", SENTINEL_WRAPPED_KEY.as_slice()),

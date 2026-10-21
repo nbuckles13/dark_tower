@@ -170,8 +170,8 @@ export interface SignalingCapabilities {
    * one meeting-wide version, and a join not declaring the current one is
    * refused (`ParticipantCapabilities.supported_header_versions`).
    *
-   * Omit it to declare the SDK's own sendable set (`SENDABLE_HEADER_VERSIONS`
-   * in `media/frame/frameCodec.ts`); a value given here replaces that default.
+   * Omit it to declare the SDK's own set (`SUPPORTED_HEADER_VERSIONS` in
+   * `media/frame/frameCodec.ts`); a value given here replaces that default.
    */
   readonly supportedHeaderVersions?: readonly number[];
 }

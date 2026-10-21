@@ -1,6 +1,6 @@
 //! The Rust leg of the cross-language drift gate.
 //!
-//! Reads `proto/test-vectors/frame-v2.vectors.json` as **data** — never through
+//! Reads `proto/test-vectors/frame-v3.vectors.json` as **data** — never through
 //! the generator's structs — and drives every row through `media-protocol`.
 //! Reading it as data matters: consuming the generator's own types would test
 //! that a struct round-trips through serde, not that the committed bytes decode.
@@ -23,7 +23,8 @@
 
 use media_protocol::codec::{decode_datagram, ALL_REJECT_REASONS};
 use media_protocol::frame::{
-    AEAD_TAG_BYTES, KEY_ID_BYTES, LEGAL_FLAG_MASK, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION,
+    AEAD_TAG_BYTES, GOP_COUNTER_FIELD_BYTES, KEY_ID_BYTES, LEGAL_FLAG_MASK, MAX_HEADER_BYTES,
+    MAX_PAYLOAD_BYTES, PROTOCOL_VERSION, PUBLISHER_FIXED_PREFIX_SIZE,
 };
 use media_vector_gen::{crypto, schedule, CIPHER_SUITE_ID};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
@@ -31,10 +32,13 @@ use ring::signature;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-const VECTORS: &str = "../../proto/test-vectors/frame-v2.vectors.json";
-
 fn doc() -> Value {
-    let text = std::fs::read_to_string(VECTORS).expect("vector file must exist");
+    // The generator's exported path, not a second copy of the literal. Only
+    // the path constant is imported: the file is still read as DATA.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(media_vector_gen::VECTOR_FILE_PATH);
+    let text = std::fs::read_to_string(path).expect("vector file must exist");
     serde_json::from_str(&text).expect("vector file must be valid JSON")
 }
 
@@ -65,6 +69,19 @@ fn wire_constants_match_the_rust_codec() {
     assert_eq!(
         d["cipher_suite_id"].as_u64(),
         Some(u64::from(CIPHER_SUITE_ID))
+    );
+    let wc = &d["wire_constants"];
+    assert_eq!(
+        wc["publisher_fixed_prefix_bytes"].as_u64(),
+        Some(PUBLISHER_FIXED_PREFIX_SIZE as u64)
+    );
+    assert_eq!(
+        wc["gop_counter_field_bytes"].as_u64(),
+        Some(GOP_COUNTER_FIELD_BYTES as u64)
+    );
+    assert_eq!(
+        wc["max_header_bytes"].as_u64(),
+        Some(MAX_HEADER_BYTES as u64)
     );
 }
 
@@ -168,7 +185,9 @@ fn every_row_is_consumed_and_every_kind_is_handled() {
         // falling through green.
         match kind {
             "roundtrip" | "decode_ok" | "full_frame" | "wrap_binding" | "verify_reject"
-            | "decrypt_reject" | "replay_reject" => check_decodes(row, &frame, name),
+            | "decrypt_reject" | "replay_reject" | "relay_rewrite" => {
+                check_decodes(row, &frame, name);
+            }
             "decode_reject" => check_rejects(row, &frame, name),
             other => panic!(
                 "row `{name}` has unrecognised kind `{other}`; add an arm rather than a \
@@ -230,6 +249,11 @@ fn check_decodes(row: &Value, frame: &[u8], name: &str) {
     assert_eq!(
         u64::from(view.stream_sequence()),
         dec["stream_sequence"].as_u64().unwrap()
+    );
+    assert_eq!(
+        u64::from(view.gop_counter()),
+        dec["gop_counter"].as_u64().unwrap(),
+        "row `{name}`: gop_counter"
     );
     assert_eq!(
         u64::from(view.stream_id()),
@@ -328,7 +352,11 @@ fn check_decodes(row: &Value, frame: &[u8], name: &str) {
     );
 
     // Only well-formed rows carry a reproducible crypto path.
-    if row["kind"] == "roundtrip" || row["kind"] == "full_frame" || row["kind"] == "wrap_binding" {
+    if row["kind"] == "roundtrip"
+        || row["kind"] == "full_frame"
+        || row["kind"] == "wrap_binding"
+        || row["kind"] == "relay_rewrite"
+    {
         verify_and_open(row, &view, name);
     }
 }
@@ -401,4 +429,92 @@ fn verify_and_open(row: &Value, view: &media_protocol::frame::MediaFrameView<'_>
         hex::encode(pt),
         row["crypto"]["plaintext_hex"].as_str().unwrap()
     );
+}
+
+/// Every `signature_invalid` row fails Ed25519 verification against the key
+/// it claims — the row's own identity, or `expected.verify_against_public_hex`
+/// for the insider forgery. Covers the v3 `tamper_gop_counter` row: every u32
+/// decodes, so only the signature catches a rewritten GoP counter.
+#[test]
+fn signature_invalid_rows_fail_verification() {
+    let d = doc();
+    let mut checked = 0usize;
+    for row in d["vectors"].as_array().unwrap() {
+        if row["reject_reason"] != "signature_invalid" {
+            continue;
+        }
+        let name = row["name"].as_str().unwrap();
+        let frame = hexf(row, "frame_hex");
+        let view = decode_datagram(&frame)
+            .unwrap_or_else(|e| panic!("row `{name}` must decode to reach the signature: {e:?}"));
+        let key_hex = row["expected"]["verify_against_public_hex"]
+            .as_str()
+            .or_else(|| row["crypto"]["identity_public_hex"].as_str())
+            .unwrap();
+        let public =
+            signature::UnparsedPublicKey::new(&signature::ED25519, hex::decode(key_hex).unwrap());
+        let [p, pay] = view.signed_ranges();
+        let mut signed = p.to_vec();
+        signed.extend_from_slice(pay);
+        assert!(
+            public.verify(&signed, view.signature()).is_err(),
+            "row `{name}` claims signature_invalid but verifies"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 4,
+        "expected the tamper, gop-tamper, signature and forgery rows"
+    );
+}
+
+/// The relay-rewrite row's signed input and AAD equal its base row's while its
+/// relay bytes differ: the relay region is outside both (§2).
+#[test]
+fn relay_rewrite_rows_keep_their_base_spans() {
+    let d = doc();
+    let rows = d["vectors"].as_array().unwrap();
+    let mut checked = 0usize;
+    for row in rows.iter().filter(|r| r["kind"] == "relay_rewrite") {
+        let base_name = row["expected"]["rewritten_from"].as_str().unwrap();
+        let base = rows
+            .iter()
+            .find(|r| r["name"] == base_name)
+            .unwrap_or_else(|| panic!("rewritten_from `{base_name}` names no row"));
+        assert_eq!(
+            row["derived"]["signed_input_hex"],
+            base["derived"]["signed_input_hex"]
+        );
+        assert_eq!(
+            row["derived"]["aead_aad_hex"],
+            base["derived"]["aead_aad_hex"]
+        );
+        assert_eq!(
+            row["derived"]["signature_hex"],
+            base["derived"]["signature_hex"]
+        );
+        assert_ne!(row["decoded"]["stream_id"], base["decoded"]["stream_id"]);
+        assert_ne!(row["frame_hex"], base["frame_hex"]);
+        checked += 1;
+    }
+    assert!(checked >= 1, "no relay_rewrite row");
+}
+
+/// Publisher (uplink) rows carry relay `stream_id` = the key id's `stream`
+/// (MC's send id; ADR-0036 §2 hop-local relay ids). Rewritten rows carry a
+/// downlink slot id instead and are excluded.
+#[test]
+fn uplink_rows_stamp_the_send_id_in_the_relay_stream_id() {
+    let d = doc();
+    for row in d["vectors"].as_array().unwrap() {
+        if row["kind"] == "relay_rewrite" {
+            continue;
+        }
+        assert_eq!(
+            row["decoded"]["stream_id"].as_u64(),
+            row["decoded"]["key_id_decomposed"]["stream"].as_u64(),
+            "row `{}`: uplink relay stream_id must equal the key-id stream",
+            row["name"]
+        );
+    }
 }

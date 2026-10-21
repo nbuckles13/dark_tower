@@ -1,4 +1,4 @@
-//! Generates `proto/test-vectors/frame-v2.vectors.json`.
+//! Generates `proto/test-vectors/frame-v3.vectors.json`.
 //!
 //! **NON-PRODUCTION.** See the crate docs in `lib.rs` for why deliberately
 //! dead-looking Rust crypto exists here and must not be deleted.

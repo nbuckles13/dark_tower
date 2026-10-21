@@ -45,7 +45,7 @@ const MH_METRICS: &str = "crates/mh-service/src/observability/metrics.rs";
 const ALERTS_DIR: &str = "infra/docker/prometheus/rules";
 const MC_ALERTS: &str = "infra/docker/prometheus/rules/mc-alerts.yaml";
 const CLIENT_ALERTS: &str = "infra/docker/prometheus/rules/client-alerts.yaml";
-const VECTORS: &str = "proto/test-vectors/frame-v2.vectors.json";
+const VECTORS: &str = "proto/test-vectors/frame-v3.vectors.json";
 const TAXONOMY: &str = "docs/observability/label-taxonomy.md";
 
 const EXPORTED: &[&str] = &[
@@ -66,6 +66,7 @@ const NOT_EXPORTED: &[&str] = &[
 const REJECT_TOKENS: &[(&str, &str, bool)] = &[
     ("unknown_version", "codec", true),
     ("reserved_flag_bit_set", "codec", true),
+    ("key_bearing_discardable", "codec", true),
     ("payload_length_exceeds_max", "codec", true),
     ("payload_length_exceeds_available", "codec", true),
     ("truncated", "codec", true),
@@ -82,6 +83,11 @@ const REJECT_TOKENS: &[(&str, &str, bool)] = &[
     ("no_roster_entry", "key", true),
     ("kek_generation_stale", "key", true),
     ("sender_not_assigned", "assignment", true),
+    ("self_sender", "assignment", true),
+    ("sender_server_muted", "assignment", true),
+    ("decode_over_bound", "codec", true),
+    ("stream_partial_reset", "codec", true),
+    ("stream_slot_mismatch", "codec", true),
 ];
 
 const POLICY_BLOCK: &str = "\

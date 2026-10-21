@@ -2,7 +2,7 @@
 //!
 //! This crate is a **deliberately non-production** reference implementation of
 //! the ADR-0036 media-frame cryptography, used **only** to generate
-//! `proto/test-vectors/frame-v2.vectors.json`. Nothing in any service links it,
+//! `proto/test-vectors/frame-v3.vectors.json`. Nothing in any service links it,
 //! and nothing ever should.
 //!
 //! ## Why dead-looking Rust crypto exists here on purpose
@@ -103,7 +103,7 @@ pub const CIPHER_SUITE_NAME: &str = "AES_256_GCM_SHA512_128";
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Where the generated file lives, relative to the workspace root.
-pub const VECTOR_FILE_PATH: &str = "proto/test-vectors/frame-v2.vectors.json";
+pub const VECTOR_FILE_PATH: &str = "proto/test-vectors/frame-v3.vectors.json";
 
 /// Assemble the complete vector file.
 ///

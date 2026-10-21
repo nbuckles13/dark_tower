@@ -878,18 +878,18 @@ stated here.
   - `reason`: one layered label space with two families, below
   - `direction`: `ingress` or `egress`; each reason has exactly one
   - `key_custody`: `operator` (single value)
-- **Cardinality**: Low — bounded at the type level by the compile-checked `MediaDropReason::ALL` plus `media_protocol`’s `ALL_REJECT_REASONS`, × one `key_custody` value. **Deliberately no restated integer**: the two vocabularies below are the operator-facing artifact, and a second encoding of their combined length only rots — `mc-service.md` §`mc_media_sender_binding_responses_total` records one drifting four times inside a single devloop. The codec half is not merely tedious to restate but **unrestatable in principle**: `resolve_media_handles` builds it by iterating `ALL_REJECT_REASONS`, so a ninth codec token added upstream gets an MH series with no MH edit. (The written-out lengths in `MediaDropReason::ALL` and in the handle array stay: those are compile-checked, and they are the guard.)
+- **Cardinality**: Low — bounded at the type level by the compile-checked `MediaDropReason::ALL` plus `media_protocol`’s `ALL_REJECT_REASONS`, × one `key_custody` value. **Deliberately no restated integer**: the two vocabularies below are the operator-facing artifact, and a second encoding of their combined length only rots — `mc-service.md` §`mc_media_sender_binding_responses_total` records one drifting four times inside a single devloop. The codec half is not merely tedious to restate but **unrestatable in principle**: `resolve_media_handles` builds it by iterating `ALL_REJECT_REASONS`, so a new codec token added upstream gets an MH series with no MH edit. (The written-out lengths in `MediaDropReason::ALL` and in the handle array stay: those are compile-checked, and they are the guard.)
 - **Usage**: The primary "why is there no audio" signal. Read it with the forwarded counter, never alone.
 - **Fan-out units**: see the N-way fan-out accounting identity under `mh_media_frames_forwarded_total` — egress drops are per edge (except `no_subscriber`, per frame), so they are comparable only with egress forwards.
 - **A SOLO PARTICIPANT PUTS NO FRAMES ON THIS COUNTER AT ALL, AND THAT IS HEALTHY** (story 2 task 16, verified against code; this corrects the task text's premise that a solo participant produces a climbing `no_subscriber` series). Story 1's loopback (the sender forwarded back to itself) is removed. A publisher nobody holds is sent an EMPTY target set by MC (`DirectiveOutcome::EmittedEmptyTargets`, `crates/mc-service/src/media_signaling/directive.rs`: "empty. That means send nothing."), and the SDK builds and sends nothing on an empty set (`packages/sdk-core/src/media/pipeline/egress.ts`, `submit()`). So a one-person meeting reads flat on ingress AND on every drop reason. `no_subscriber` is healthy only as a short in-flight tail: frames already sent when the last holder leaves, before the empty directive lands. **A SUSTAINED `no_subscriber` is a fault**: a client is sending while MH has no edge naming it. Either MC's send directive and MH's installed policy disagree (MC's assignment and push path, Scenario 15's divergence family), or MC and MH agree and the client is ignoring its directive (a stale SDK bundle, or a misbehaving or hostile participant — the sender is an untrusted client). Divergence checks coming back clean is what separates the two. Not a quiet meeting either way.
 
 **`reason` is ONE layered label space, not two vocabularies.**
-`media-protocol`'s `reject_reasons!` macro documents its eight tokens as "the
+`media-protocol`'s `reject_reasons!` macro documents its tokens as "the
 structural / parse subset of a **shared** `reason` label space", and **MH is a
 first-class member of the codec layer** — `RejectReason::producible_by()` names
 `rewrite_relay_region` as a producing entry point. MH emits the codec tokens
 **verbatim** via `RejectReason::as_str()`, iterating the codec's own generated
-list so a ninth token upstream gets an MH series automatically. It never
+list so a new codec token upstream gets an MH series automatically. It never
 re-spells one, and it never invents an MH spelling for a condition the codec
 already names.
 
@@ -1036,7 +1036,7 @@ MH re-spelling it would merge drops from two different layers under one
 `sum by(reason)` token. The bar is executable:
 `crates/mh-service/tests/media_metrics_integration.rs` asserts MH's own
 vocabulary is disjoint from every token in
-`proto/test-vectors/frame-v2.vectors.json`.
+`proto/test-vectors/frame-v3.vectors.json`.
 
 > **Blind spot 1 — relay-side corruption has NO MH-side signal, by
 > construction.**

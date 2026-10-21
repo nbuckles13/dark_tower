@@ -30,9 +30,9 @@
 //     RFC 9605's is `config || KID || CTR`. Different layouts entirely.
 //   * Our AEAD associated data. Upstream's AAD is `sframe_header || metadata`
 //     (asserted below so the difference is pinned, not assumed); ours is the
-//     publisher region of the v2 frame. These must never be read across.
+//     publisher region of the v3 frame. These must never be read across.
 //   * Our Ed25519 signed range, our detached-tag split, our KEK unwrap, and
-//     the entire v2 frame header.
+//     the entire v3 frame header.
 //
 // Those five are gated ONLY by the Rust reference generator against an
 // independent TypeScript derivation. The external anchor reduces that surface
@@ -182,7 +182,7 @@ describe.each(manifest.cipher_suites)('ciphersuite 0x%s', (suite) => {
         const ct = hexToBytes(row.ct, 'ct');
 
         // Upstream's AAD is its own SFrame header followed by the metadata.
-        // Asserted rather than assumed, so the difference from OUR AAD (the v2
+        // Asserted rather than assumed, so the difference from OUR AAD (the v3
         // publisher region) is pinned by a test and cannot be quietly conflated.
         const header = aad.subarray(0, aad.length - metadata.length);
         expect(bytesToHex(aad)).toBe(bytesToHex(concatBytes(header, metadata)));

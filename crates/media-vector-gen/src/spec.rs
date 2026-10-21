@@ -48,7 +48,31 @@ use crate::error::GenError;
 use media_protocol::codec::MediaFrameParts;
 use media_protocol::frame::{
     FrameFlags, MediaFrameView, AEAD_TAG_BYTES, EXT_LENGTH_FIELD_SIZE, KEY_ID_BYTES,
-    PUBLISHER_FIXED_PREFIX_SIZE, SIGNATURE_SIZE, WRAPPED_TRANSMIT_KEY_SIZE,
+    PROTOCOL_VERSION, PUBLISHER_FIXED_PREFIX_SIZE, SIGNATURE_SIZE, WRAPPED_TRANSMIT_KEY_SIZE,
+};
+
+/// The header version, **as ADR-0036 §2's "Header v3" table states it**
+/// (offset 0, `= 3`). Declared here from the specification text rather than
+/// imported, then asserted equal to the codec's constant, so a codec that moved
+/// its version without the spec reds at compile time here.
+pub const SPEC_HEADER_VERSION: u8 = 3;
+
+/// The fixed prefix, **as ADR-0036 §2's "Header v3" table states it**:
+/// `version (1) | flags (1) | payload_length (4) | stream_sequence (4) |
+/// gop_counter (4)` = 14 bytes, absolute offsets 0/1/2/6/10. Written from the
+/// table, not imported, and asserted against the codec: this crate's span
+/// arithmetic must not inherit a wrong prefix from the codec it checks.
+pub const SPEC_FIXED_PREFIX_BYTES: usize = 1 + 1 + 4 + 4 + 4;
+
+const _: () = {
+    assert!(
+        SPEC_HEADER_VERSION == PROTOCOL_VERSION,
+        "ADR-0036 §2 says the header version is 3; media-protocol disagrees"
+    );
+    assert!(
+        SPEC_FIXED_PREFIX_BYTES == PUBLISHER_FIXED_PREFIX_SIZE,
+        "ADR-0036 §2's fixed prefix is 14 bytes; media-protocol disagrees"
+    );
 };
 
 /// **Computation 3: the detached-tag split.**
@@ -133,6 +157,7 @@ pub const fn sframe_object_len(plaintext_len: usize) -> usize {
 pub struct PublisherRegionDraft {
     flags: FrameFlags,
     stream_sequence: u32,
+    gop_counter: u32,
     wrapped: Option<Vec<u8>>,
     extensions: Vec<u8>,
 }
@@ -145,12 +170,14 @@ impl PublisherRegionDraft {
     pub fn new(
         flags: FrameFlags,
         stream_sequence: u32,
+        gop_counter: u32,
         wrapped: Option<Vec<u8>>,
         extensions: Vec<u8>,
     ) -> Self {
         Self {
             flags,
             stream_sequence,
+            gop_counter,
             wrapped,
             extensions,
         }
@@ -166,6 +193,7 @@ impl PublisherRegionDraft {
     ///
     /// ```text
     /// version(1) + flags(1) + payload_length(4) + stream_sequence(4)
+    ///   + gop_counter(4)             new in v3, offset 10
     ///   + wrapped_transmit_key(50)   iff key-bearing
     ///   + ext_length(2)
     ///   + extensions(ext_length)
@@ -183,7 +211,7 @@ impl PublisherRegionDraft {
     #[must_use]
     pub fn finalize(self, payload_len: usize) -> PublisherRegion {
         let mut bytes = Vec::new();
-        bytes.push(media_protocol::frame::PROTOCOL_VERSION);
+        bytes.push(SPEC_HEADER_VERSION);
         bytes.push(self.flags.to_u8());
         // Truncation is structurally impossible here: callers derive
         // `payload_len` from `sframe_object_len`, and `encode_frame` enforces
@@ -193,6 +221,9 @@ impl PublisherRegionDraft {
         let declared = u32::try_from(payload_len).unwrap_or(u32::MAX);
         bytes.extend_from_slice(&declared.to_be_bytes());
         bytes.extend_from_slice(&self.stream_sequence.to_be_bytes());
+        // §2: `gop_counter` immediately follows `stream_sequence`, inside the
+        // fixed prefix and therefore inside the AAD and the signed input.
+        bytes.extend_from_slice(&self.gop_counter.to_be_bytes());
         if let Some(w) = &self.wrapped {
             bytes.extend_from_slice(w);
         }
@@ -212,7 +243,7 @@ impl PublisherRegionDraft {
     /// clothes.
     #[must_use]
     pub fn spec_span_len(&self) -> usize {
-        PUBLISHER_FIXED_PREFIX_SIZE
+        SPEC_FIXED_PREFIX_BYTES
             + if self.flags.key_bearing {
                 WRAPPED_TRANSMIT_KEY_SIZE
             } else {

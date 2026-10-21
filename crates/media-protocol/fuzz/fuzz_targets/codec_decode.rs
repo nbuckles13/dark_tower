@@ -1,20 +1,21 @@
 #![no_main]
 
-//! Malformed-input fuzzing for the version-2 frame codec.
+//! Malformed-input fuzzing for the version-3 frame codec.
 //!
-//! Drives **all four** entry points, because they differ in exactly the places
-//! a bug hides: `decode_datagram` adds an exactness condition,
+//! Drives the whole-frame entry points, because they differ in exactly the
+//! places a bug hides: `decode_datagram` adds an exactness condition,
 //! `decode_stream_frame` must return `Ok(None)` rather than an error for a
-//! prefix, `peek_frame_len` is the reader-side pre-allocation bound that
+//! prefix, `parse_header_prefix` is the reader-side pre-allocation bound that
 //! ADR-0036 §2 says a fuzz test of the decode function alone structurally
-//! misses, and `rewrite_relay_region` is the only one that writes.
+//! misses, and `rewrite_relay_region` writes. The cut-through header API has
+//! its own targets: `header_prefix` and `header_reader_split`.
 //!
 //! No header size and no maximum is hardcoded here; everything comes from the
 //! crate's exported constants.
 
 use libfuzzer_sys::fuzz_target;
 use media_protocol::codec::{
-    decode_datagram, decode_stream_frame, peek_frame_len, rewrite_relay_region,
+    decode_datagram, decode_stream_frame, parse_header_prefix, rewrite_relay_region, HeaderPrefix,
 };
 use media_protocol::frame::{MAX_FRAME_BYTES, MAX_HEADER_BYTES};
 
@@ -34,21 +35,26 @@ fuzz_target!(|data: &[u8]| {
     match decode_stream_frame(data) {
         Ok(Some(view)) => {
             assert!(view.encoded_len() <= data.len());
-            // The stream path agrees with peek about how long the frame is.
-            assert_eq!(peek_frame_len(data), Ok(Some(view.encoded_len())));
+            // The stream path agrees with the header parse about the length.
+            match parse_header_prefix(data) {
+                Ok(HeaderPrefix::Complete(h)) => assert_eq!(h.frame_len(), view.encoded_len()),
+                other => panic!("stream decoded but header parse said {other:?}"),
+            }
         }
         Ok(None) => {
-            // Incomplete: peek never rejects what the stream path holds open.
-            // It is silent while the header is short, and once the header is
-            // complete it names a length the buffer does not yet reach — that
-            // is its whole job as the pre-allocation bound.
-            match peek_frame_len(data) {
-                Ok(None) => {}
-                Ok(Some(frame_len)) => {
-                    assert!(frame_len > data.len());
-                    assert!(frame_len <= MAX_FRAME_BYTES);
+            // Incomplete: the header parse never rejects what the stream path
+            // holds open. It is incomplete while the header is short, and once
+            // the header is complete it names a length the buffer does not yet
+            // reach — its whole job as the pre-allocation bound.
+            match parse_header_prefix(data) {
+                Ok(HeaderPrefix::Incomplete { needed }) => {
+                    assert!(data.len() + needed <= MAX_HEADER_BYTES);
                 }
-                Err(err) => panic!("incomplete on stream, terminal on peek: {err:?}"),
+                Ok(HeaderPrefix::Complete(h)) => {
+                    assert!(h.frame_len() > data.len());
+                    assert!(h.frame_len() <= MAX_FRAME_BYTES);
+                }
+                Err(err) => panic!("incomplete on stream, terminal on header parse: {err:?}"),
             }
             assert!(data.len() < MAX_FRAME_BYTES);
         }
@@ -61,11 +67,10 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // peek must decide within a header's worth of bytes.
-    if data.len() >= MAX_FRAME_BYTES {
-        assert!(!matches!(peek_frame_len(data), Ok(None)));
+    // The header parse must decide within a header's worth of bytes.
+    if data.len() >= MAX_HEADER_BYTES {
+        assert!(!matches!(parse_header_prefix(data), Ok(HeaderPrefix::Incomplete { .. })));
     }
-    let _ = MAX_HEADER_BYTES;
 
     // The write path, on a copy: it must validate to the decoder's standard
     // before touching a byte.

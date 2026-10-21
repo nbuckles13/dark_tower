@@ -130,7 +130,7 @@ impl StreamForwarder {
 /// [`Self::sender`] is fixed when this value is constructed, **after** the JWT
 /// gate in `crate::webtransport::connection` has returned. Nothing
 /// datagram-carried influences which slots a frame can address: MH never reads
-/// a sender id off the wire, and frame header v2 deliberately carries none. A
+/// a sender id off the wire, and the frame header deliberately carries none. A
 /// publisher-asserted sender id would be a cross-participant injection
 /// primitive — a patched client claims another participant's ordinal and its
 /// frames are forwarded onto that participant's edges.

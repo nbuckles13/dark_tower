@@ -1,7 +1,7 @@
 # Semantic Guard Navigation
 
 ## Architecture & Design
-- Media path / key custody / frame-v2 → ADR-0036 | Guard methodology → ADR-0015 | Agent Teams pipeline → ADR-0024
+- Media path / key custody / frame-v3 → ADR-0036 | Guard methodology → ADR-0015 | Agent Teams pipeline → ADR-0024
 - Polyglot layers → ADR-0033 | Story runner → ADR-0035 | Cluster helper (+ cannot-self-validate) → ADR-0030
 - Semantic check definitions → `scripts/guards/semantic/checks.md` | Shell utils → `scripts/guards/common.sh`
 - Reviewer-panel slot (Gate 2 unicast loop, Step 7 dedup) → `.claude/skills/devloop/SKILL.md`
@@ -11,7 +11,7 @@
 - KEK emission sites (named in checks.md §Credential Leak) → `media_admission/kek.rs:MeetingKeyState::rotate()`, `epoch.rs:AdmissionEpoch::admit()`
 - KEK push path (typed `KekPush`, never `SignalingPayload::Raw`) → `actors/messages.rs:ParticipantMessage::KekUpdate` → `actors/participant.rs:handle_kek_update()`
 - Rotation lifecycle log (`mc.kek.lifecycle`) → `media_admission/rotation.rs:collect_push_outcomes()`, `actors/meeting.rs:rotation_failed()`
-- Frame-v2 + wrapped-key redacting Debug → `crates/media-protocol/src/frame.rs`
+- Frame-v3 + wrapped-key redacting Debug → `crates/media-protocol/src/frame.rs`
 - Redaction control (`skip_debug` set + `RedactedLen` hand-Debug) → `crates/proto-gen/build.rs`, `crates/proto-gen/src/lib.rs`
 - Signaling contract (`JoinResponse.meeting_kek`, `MeetingKekUpdate`, `unreachable_sender_ids`) → `proto/dark_tower/signaling/v1/signaling.proto`
 - MC→MH internal contract (RegisterMeeting + EndMeeting; no-key-material header rule) → `proto/dark_tower/internal/v1/internal.proto`

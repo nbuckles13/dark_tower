@@ -136,10 +136,10 @@ pub struct ExtensionSpec {
     pub accepted: AcceptedValues,
 }
 
-/// The version-2 extension registry.
+/// The extension registry (header v3).
 ///
 /// ANCHOR (DRY): pinned cross-language in
-/// `proto/test-vectors/frame-v2.vectors.json` (story task 8) — the type byte,
+/// `proto/test-vectors/frame-v3.vectors.json` (story task 8) — the type byte,
 /// the value length **and** the accepted range travel together, and both
 /// codecs derive [`crate::frame::MAX_EXT_BYTES`] from the pinned registry
 /// rather than hardcoding a bound. The pin must include the rejection

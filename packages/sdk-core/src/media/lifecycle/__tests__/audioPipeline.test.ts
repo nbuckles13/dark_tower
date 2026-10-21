@@ -33,7 +33,7 @@ import {
 import { DEFAULT_CLIENT_CONFIG, type MediaConfig } from '../../../config/clientConfig.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { HEADER_VERSION } from '../../frame/wireConstants.js';
-import { HEADER_VERSION_V3, decodeFrame } from '../../frame/frameCodec.js';
+import { decodeFrame } from '../../frame/frameCodec.js';
 import { MeetingIdentity } from '../../setup/identity.js';
 import { assignmentsOn, kekHolderWith } from '../../__tests__/helpers.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
@@ -477,7 +477,7 @@ describe('the directed header version (ADR-0036 §2: meeting-wide, MC-directed)'
     await settle();
     expect(rig.transport.getOutboundDatagrams()).toHaveLength(1);
 
-    // Episode 1. Never a fallback to v2: nothing leaves the device.
+    // Episode 1. Never a fallback to another version: nothing leaves the device.
     rig.pipeline.setSendDirective(directive(4));
     rig.emit(2);
     await settle();
@@ -515,18 +515,18 @@ describe('the directed header version (ADR-0036 §2: meeting-wide, MC-directed)'
     expect(rig.count('dt_client_media_frames_dropped_total')).toBe(0);
   });
 
-  it('refuses a directed 3 until P2 lands the GoP counter owner (the codec can already build v3)', async () => {
+  it('refuses a directed 2: v2 is gone, and a v2 directive sends nothing', async () => {
     const rig = await makeRig();
     const faults: string[] = [];
     rig.pipeline.on('fault', (f) => faults.push(f.stage));
-    rig.pipeline.setSendDirective(directive(HEADER_VERSION_V3));
+    rig.pipeline.setSendDirective(directive(2));
     rig.emit(1);
     await settle();
     expect(rig.transport.getOutboundDatagrams()).toHaveLength(0);
     expect(faults).toEqual(['config']);
   });
 
-  it('a directive-2 frame is a v2 frame', async () => {
+  it('a directive-3 frame is a v3 frame', async () => {
     const rig = await makeRig();
     rig.emit(1);
     await settle();
@@ -534,7 +534,7 @@ describe('the directed header version (ADR-0036 §2: meeting-wide, MC-directed)'
     expect(decodeFrame(sent!).version).toBe(HEADER_VERSION);
   });
 
-  it('egress refuses an unsendable version as a backstop, but an empty plan is always accepted', () => {
+  it('egress refuses an unsupported version as a backstop, but an empty plan is always accepted', () => {
     const egress = new EgressPipeline({
       metrics: new MediaMetrics({ clientVersion: '0.0.0-test', orgId: 'demo' }, undefined).audio,
       transmitKeys: new TransmitKeyManager(SENDER_ID),
@@ -546,9 +546,7 @@ describe('the directed header version (ADR-0036 §2: meeting-wide, MC-directed)'
       senderFor: () => undefined,
       onTargetNotConnected: () => {},
     });
-    expect(() =>
-      egress.setTargets({ targets: [MH_URL], headerVersion: HEADER_VERSION_V3 }),
-    ).toThrow(RangeError);
+    expect(() => egress.setTargets({ targets: [MH_URL], headerVersion: 2 })).toThrow(RangeError);
     expect(() => egress.setTargets({ targets: [], headerVersion: 4 })).not.toThrow();
   });
 });

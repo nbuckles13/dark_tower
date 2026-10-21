@@ -27,3 +27,15 @@ name = "codec_roundtrip"
 path = "fuzz_targets/codec_roundtrip.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "header_prefix"
+path = "fuzz_targets/header_prefix.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "header_reader_split"
+path = "fuzz_targets/header_reader_split.rs"
+test = false
+doc = false

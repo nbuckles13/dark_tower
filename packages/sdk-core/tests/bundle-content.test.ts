@@ -29,6 +29,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { TONE_RUNTIME_TOKENS } from './toneMarkers.js';
+// Test tier to test tier: the loader's path constant, never a second literal.
+import { VECTORS_PATH } from '../src/media/frame/__tests__/frameVectors.js';
 
 const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const REPO_ROOT = join(PKG_ROOT, '..', '..');
@@ -53,7 +55,7 @@ const DIST = join(PKG_ROOT, 'dist');
 // list:
 //
 //   * Assert on the thing, never on a name for the thing. An earlier version
-//     banned `frame-v2.vectors` (the path) and `identity_private_seed_hex` (a
+//     banned `frame-v3.vectors` (the path) and `identity_private_seed_hex` (a
 //     field name), both of which `vite-plugin-dts` carries into `.d.ts` via
 //     JSDoc — and g12 positively REQUIRES the path string in `frameCodec.ts` /
 //     `sframe.ts`, so a path-token ban put two correct controls in unsatisfiable
@@ -65,7 +67,7 @@ const DIST = join(PKG_ROOT, 'dist');
 //     ever changed. Deriving from `key_material_fields` across every row is
 //     exhaustive BY CONSTRUCTION and cannot drift from the SSoT.
 function forbiddenFixtureValues(): string[] {
-  const vectorsPath = join(REPO_ROOT, 'proto/test-vectors/frame-v2.vectors.json');
+  const vectorsPath = join(REPO_ROOT, VECTORS_PATH);
   const ssot = JSON.parse(readFileSync(vectorsPath, 'utf8')) as {
     key_material_fields: string[];
     vectors: { crypto: Record<string, string> }[];

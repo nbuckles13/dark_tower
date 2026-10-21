@@ -1,15 +1,16 @@
-//! Media frame v2 wire format: field sizes, offsets, flags, and the zero-copy
-//! decoded view.
+//! Media frame v3 wire format: field sizes, offsets, flags, the zero-copy
+//! decoded view, and the header-only [`FrameHeader`].
 //!
-//! # Layout (ADR-0036 §2 and its Appendix), big-endian throughout
+//! # Layout (ADR-0036 §2 "Header v3 — the normative layout"), big-endian throughout
 //!
 //! ```text
 //! off  size  field                       region
-//!   0     1  version (= 2)               publisher  |
-//!   1     1  flags                       publisher  | PUBLISHER_FIXED_PREFIX_SIZE
-//!   2     4  payload_length : u32        publisher  |
+//!   0     1  version (= 3)               publisher  |
+//!   1     1  flags                       publisher  |
+//!   2     4  payload_length : u32        publisher  | PUBLISHER_FIXED_PREFIX_SIZE (14)
 //!   6     4  stream_sequence : u32       publisher  |
-//!  10    50  wrapped transmit key        publisher    present IFF flags bit2
+//!  10     4  gop_counter : u32           publisher  |
+//!  14    50  wrapped transmit key        publisher    present IFF flags bit2
 //!              kek_generation : u16
 //!              wrapped_key    : 32 B
 //!              wrap_tag       : 16 B
@@ -29,11 +30,16 @@
 //!
 //! **Relay ids are hop-local** (ADR-0036 §2, amendment 2026-10-13). On the
 //! UPLINK the publisher stamps `stream_id` with MC's send id
-//! (`signaling.proto::SendStream.stream_number`), and MH attributes the frame
-//! by (connection-bound sender, that id) — a publisher-set, unauthenticated
-//! label, never cross-checked against the key id. On the DOWNLINK MH rewrites
-//! it to the receiving subscriber's `ReceiveSlot.slot_id`. MH never
-//! distinguishes audio from video.
+//! (`signaling.proto::SendStream.stream_number`; audio 0, video 1 today), and
+//! MH attributes the frame by (connection-bound sender, that id) — a
+//! publisher-set, unauthenticated attribution label, never cross-checked
+//! against the key id. On the DOWNLINK MH rewrites it to the receiving
+//! subscriber's `ReceiveSlot.slot_id`. MH never distinguishes audio from video.
+//!
+//! **Version 3 is the only version** (R-22). There is no v2 decode path, no
+//! allowlist and no floor: a frame of any other version rejects
+//! `unknown_version`. v3 added exactly one field, `gop_counter`, and one
+//! reject, `key_bearing_discardable`.
 //!
 //! # This crate holds no keys and performs no cryptography
 //!
@@ -43,7 +49,7 @@
 //!
 //! # Obligations this crate cannot enforce
 //!
-//! Two properties the format depends on live in callers, named here so the
+//! Properties the format depends on live in callers, named here so the
 //! constraint travels with the format rather than only in a task description:
 //!
 //! 1. **The relay region is unauthenticated by design.** `stream_id` and
@@ -56,13 +62,29 @@
 //!    uplink value is the publisher's own label, so on that hop the field is
 //!    publisher-controlled rather than relay-controlled; per-kind server mute
 //!    still holds, stated in slot terms at `internal.proto::MutedSource`.)
-//! 2. **`Ok(None)` from [`crate::codec::decode_stream_frame`] obligates the
-//!    caller.** A peer that opens a stream and stalls mid-frame produces
-//!    `Ok(None)` forever: no reject reason, no counter, no timeout. A caller
-//!    must pair the incomplete outcome with a bound on **both** buffered bytes
-//!    per stream (see [`MAX_FRAME_BYTES`]) and time-to-completion, and must
-//!    **count the give-up**. This crate sees one buffer and has no notion of
-//!    time or stream count, so it cannot enforce this.
+//! 2. **Incomplete obligates the caller.** `Ok(None)` from
+//!    [`crate::codec::decode_stream_frame`], [`crate::codec::HeaderPrefix::Incomplete`]
+//!    and [`crate::reader::Feed::NeedMore`] all mean "need more bytes". A peer
+//!    that opens a stream and stalls mid-frame produces that outcome forever:
+//!    no reject reason, no counter, no timeout. A caller must pair it with a
+//!    bound on **both** buffered bytes per stream (see [`MAX_FRAME_BYTES`]) and
+//!    time-to-completion, and must **count the give-up**. This crate sees one
+//!    buffer and has no notion of time or stream count, so it cannot enforce
+//!    this.
+//! 3. **The uplink `stream_id` is the publisher's own, unauthenticated
+//!    label.** Nothing in this crate, at MH, or at a receiver authenticates it;
+//!    MH uses it only to look up (connection-bound sender, label) in MC's
+//!    `source_streams`. A publisher can mislabel its own streams; what it
+//!    cannot do is reach a kind that has no live route (R-16 in slot terms,
+//!    `internal.proto::SourceStream`).
+//! 4. **`gop_counter` rules bind the sender, not the decoder.** Every u32 is
+//!    accepted on the wire, `0` and `u32::MAX` included. The sender increments
+//!    it on every independently-decodable frame (every audio frame), carries
+//!    the group-starting frame's value on every frame of a group, never resets
+//!    it while the sender id lives, and never wraps it: after `u32::MAX` it
+//!    stops that stream, counts the stop, and resumes only under a fresh
+//!    stream number or sender id (ADR-0036 §2). It is stream identity: never a
+//!    log field, metric label, span attribute or test-bus value (§11, R-30).
 //!
 //! # Accepted cleartext channel: the relay region
 //!
@@ -125,7 +147,7 @@ pub const KEY_ID_BYTES: usize = 8;
 /// Width of the `sender_id` component of the key id.
 ///
 /// ANCHOR (DRY): pinned cross-language in
-/// `proto/test-vectors/frame-v2.vectors.json` under `wire_constants.key_id_layout`.
+/// `proto/test-vectors/frame-v3.vectors.json` under `wire_constants.key_id_layout`.
 ///
 /// Promoted from prose to a named constant because **three** separate contracts
 /// bound themselves to the old comment and nothing failed if the layout moved:
@@ -194,6 +216,8 @@ pub const FLAGS_FIELD_BYTES: usize = 1;
 pub const PAYLOAD_LENGTH_FIELD_BYTES: usize = 4;
 /// Width of the stream-sequence field.
 pub const STREAM_SEQUENCE_FIELD_BYTES: usize = 4;
+/// Width of the `gop_counter` field (new in header v3, ADR-0036 §2).
+pub const GOP_COUNTER_FIELD_BYTES: usize = 4;
 /// Width of the KEK-generation field inside the wrapped-transmit-key field.
 pub const KEK_GENERATION_FIELD_BYTES: usize = 2;
 /// Length of the wrapped transmit key itself (AES-256).
@@ -214,11 +238,13 @@ pub const SIGNATURE_SIZE: usize = 64;
 // ---------------------------------------------------------------------------
 
 /// Bytes of publisher region that are present on every frame regardless of
-/// flags: version, flags, payload length, stream sequence.
+/// flags: version, flags, payload length, stream sequence, `GoP` counter — 14
+/// in header v3.
 pub const PUBLISHER_FIXED_PREFIX_SIZE: usize = VERSION_FIELD_BYTES
     + FLAGS_FIELD_BYTES
     + PAYLOAD_LENGTH_FIELD_BYTES
-    + STREAM_SEQUENCE_FIELD_BYTES;
+    + STREAM_SEQUENCE_FIELD_BYTES
+    + GOP_COUNTER_FIELD_BYTES;
 
 /// Size of the wrapped-transmit-key field, present iff the key-bearing flag is
 /// set. Fixed size is what lets presence be signalled by a flag rather than a
@@ -242,31 +268,31 @@ pub const MAX_EXT_BYTES: usize = EXT_REGISTRY_TOTAL_BYTES;
 /// Maximum payload size accepted by this wire format.
 ///
 /// **A wire-format constant, not an operational knob.** It is enforced before
-/// any allocation, and exposed through [`crate::codec::peek_frame_len`] so a
+/// any allocation, and enforced by [`crate::codec::parse_header_prefix`] and
+/// [`crate::reader::HeaderReader`] as soon as the length field is readable, so a
 /// stream reader can bound its buffer *before* reserving — which is the
 /// parsing trust boundary ADR-0036 §2 describes as passing fuzzing of the
 /// decode function while being wrong in the reader that calls it. The tunable
 /// levers for load are §11's ingress admission controls, not this value.
 ///
 /// ANCHOR (DRY): the cross-language single source of truth is
-/// `proto/test-vectors/frame-v2.vectors.json`, key `max_payload_bytes`, landed
-/// by story task 8; its drift guard asserts this constant equals that value.
-/// (The anchor deliberately names a file created by a later task that depends
-/// on this one.)
+/// `proto/test-vectors/frame-v3.vectors.json`, key `max_payload_bytes`; its
+/// drift guard asserts this constant equals that value.
 ///
 /// Vector precedence: vectors beat prose, but a vector contradicting a recorded
 /// ruling is a defect to escalate rather than conform to — see the note at
 /// [`crate::extensions::EXT_REGISTRY`].
 pub const MAX_PAYLOAD_BYTES: usize = 1_048_576;
 
-/// Bytes a reader must buffer before [`crate::codec::peek_frame_len`] can
-/// possibly determine a frame's total length.
+/// Bytes a reader must buffer before [`crate::codec::parse_header_prefix`] can
+/// possibly determine a frame's total length — 75 in header v3.
 ///
 /// This is the whole header including the relay region, because the parser
 /// validates through the relay region before reporting a length: every
-/// conditional region at its maximum. A reader that has buffered this many
-/// bytes and still gets `Ok(None)` has been handed something that is not a
-/// frame.
+/// conditional region at its maximum. The property: given this many bytes, the
+/// parser always reaches `Complete` or `Err` — never `Incomplete`.
+///
+/// ANCHOR (DRY): pinned cross-language as `wire_constants.max_header_bytes`.
 pub const MAX_HEADER_BYTES: usize = PUBLISHER_FIXED_PREFIX_SIZE
     + WRAPPED_TRANSMIT_KEY_SIZE
     + EXT_LENGTH_FIELD_SIZE
@@ -291,28 +317,37 @@ pub const FLAGS_OFFSET: usize = VERSION_OFFSET + VERSION_FIELD_BYTES;
 pub const PAYLOAD_LENGTH_OFFSET: usize = FLAGS_OFFSET + FLAGS_FIELD_BYTES;
 /// Offset of the stream sequence.
 pub const STREAM_SEQUENCE_OFFSET: usize = PAYLOAD_LENGTH_OFFSET + PAYLOAD_LENGTH_FIELD_BYTES;
+/// Offset of the `GoP` counter (10 in header v3).
+pub const GOP_COUNTER_OFFSET: usize = STREAM_SEQUENCE_OFFSET + STREAM_SEQUENCE_FIELD_BYTES;
+
+const _: () = assert!(
+    GOP_COUNTER_OFFSET + GOP_COUNTER_FIELD_BYTES == PUBLISHER_FIXED_PREFIX_SIZE,
+    "the fixed prefix must end exactly where the GoP counter ends"
+);
 
 // ---------------------------------------------------------------------------
 // Version and flags
 // ---------------------------------------------------------------------------
 
-/// The frame header version this codec implements.
+/// The frame header version this codec implements: **3, the only version**
+/// (ADR-0036 §2, R-22).
 ///
-/// **There is deliberately no version-1 decode path and no version
-/// negotiation.** v1 is deleted rather than retained: at the commit that
-/// introduced v2, `media-protocol` had no consumer in any service and nothing
-/// deployed spoke v1, so a live v1 branch would have been a downgrade surface
-/// with no legitimate caller. Per §2 the version is meeting-wide and
-/// MC-directed, so a mixed-version meeting cannot arise and a relay can never
-/// translate between versions (the field is signed).
+/// **There is deliberately no older decode path and no version negotiation.**
+/// v1 and v2 were each deleted atomically when their successor landed, rather
+/// than retained: a live older branch would be a downgrade surface with no
+/// legitimate caller (no production clients exist). A frame of any other
+/// version rejects `unknown_version`, and MC refuses a join that does not
+/// declare 3. The version is meeting-wide and MC-directed, so a relay can never
+/// translate between versions (the field is signed). MC's directed
+/// `SendDirective.header_version` derives from this constant.
 ///
 /// ANCHOR (DRY): now cross-language. Pinned in
-/// `proto/test-vectors/frame-v2.vectors.json` as `header_version`, and guard
+/// `proto/test-vectors/frame-v3.vectors.json` as `header_version`, and guard
 /// check g3 asserts the two are equal. It carried no anchor line until
 /// `signaling.proto` gained `ParticipantCapabilities.supported_header_versions`,
 /// which is what made the header version a value TypeScript must also hold —
 /// before that, nothing outside Rust consumed it.
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 
 /// Flag bit 0: this frame can be decoded without its predecessors.
 ///
@@ -326,7 +361,11 @@ pub const FLAG_INDEPENDENTLY_DECODABLE: u8 = 0b0000_0001;
 /// others. Publisher-declared and therefore untrusted (§2, §7).
 pub const FLAG_DISCARDABLE: u8 = 0b0000_0010;
 
-/// Flag bit 2: a fixed-size wrapped transmit key follows the stream sequence.
+/// Flag bit 2: a fixed-size wrapped transmit key follows the fixed prefix.
+///
+/// Never together with [`FLAG_DISCARDABLE`]: that combination rejects
+/// `key_bearing_discardable`, because a receiver that dropped a key-carrying
+/// frame could not open what follows (ADR-0036 §2, §4).
 pub const FLAG_KEY_BEARING: u8 = 0b0000_0100;
 
 /// The only flag bits this version defines. Any other bit set is a decode
@@ -335,7 +374,7 @@ pub const FLAG_KEY_BEARING: u8 = 0b0000_0100;
 /// no ignored bits anywhere in this format.
 ///
 /// ANCHOR (DRY): pinned cross-language in
-/// `proto/test-vectors/frame-v2.vectors.json` (story task 8); the TypeScript
+/// `proto/test-vectors/frame-v3.vectors.json` (story task 8); the TypeScript
 /// codec derives its mask from that file rather than hardcoding one.
 ///
 /// Vector precedence: vectors beat prose, but a vector contradicting a recorded
@@ -350,7 +389,7 @@ pub struct FrameFlags {
     pub independently_decodable: bool,
     /// Droppable without affecting other frames. Untrusted.
     pub discardable: bool,
-    /// A wrapped transmit key follows the stream sequence.
+    /// A wrapped transmit key follows the fixed prefix.
     pub key_bearing: bool,
 }
 
@@ -386,6 +425,13 @@ impl FrameFlags {
             discardable: bits & FLAG_DISCARDABLE != 0,
             key_bearing: bits & FLAG_KEY_BEARING != 0,
         })
+    }
+
+    /// Whether this flag set is key-bearing **and** discardable, the v3
+    /// combination that rejects `key_bearing_discardable`.
+    #[must_use]
+    pub const fn is_key_bearing_discardable(self) -> bool {
+        self.key_bearing && self.discardable
     }
 
     /// The undefined bits set in `bits`, for error reporting.
@@ -492,11 +538,14 @@ impl fmt::Debug for WrappedTransmitKey<'_> {
 /// relay-region write path would mean a media handler writing six bytes at an
 /// offset the receiver does not read them from — malformed only from the
 /// receiver's point of view, and invisible to every counter the handler owns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No `Debug`: it holds `gop_counter` and `stream_sequence`, which are never
+// formatted (R-30); every public type that wraps it redacts them by hand.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Layout {
     pub(crate) flags: FrameFlags,
     pub(crate) payload_length: usize,
     pub(crate) stream_sequence: u32,
+    pub(crate) gop_counter: u32,
     /// Offset of the wrapped-transmit-key field, present iff key-bearing.
     ///
     /// **Recorded from the cursor during the walk, never recomputed.** It
@@ -531,6 +580,159 @@ impl Layout {
 
     pub(crate) const fn frame_len(self) -> usize {
         self.signature_start() + SIGNATURE_SIZE
+    }
+}
+
+/// Read a big-endian `u16` at `offset`, or `None` if out of range.
+pub(crate) fn read_u16_be(data: &[u8], offset: usize) -> Option<u16> {
+    let end = offset.checked_add(2)?;
+    let bytes: [u8; 2] = data.get(offset..end)?.try_into().ok()?;
+    Some(u16::from_be_bytes(bytes))
+}
+
+/// Read a big-endian `u32` at `offset`, or `None` if out of range.
+pub(crate) fn read_u32_be(data: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let bytes: [u8; 4] = data.get(offset..end)?.try_into().ok()?;
+    Some(u32::from_be_bytes(bytes))
+}
+
+// ---------------------------------------------------------------------------
+// Header-only view (cut-through, R-21)
+// ---------------------------------------------------------------------------
+
+/// A fully validated frame **header** — everything up to and including the
+/// relay region — without the payload or signature.
+///
+/// Produced by [`crate::codec::parse_header_prefix`],
+/// [`crate::codec::rewrite_relay_region_header`] and
+/// [`crate::reader::HeaderReader`], all of which run the crate's single layout
+/// parser. It is what a cut-through stream reader needs to forward a frame
+/// whose payload has not arrived yet: the header length, the declared payload
+/// length (already bounded by [`MAX_PAYLOAD_BYTES`]), the total frame length,
+/// the flags, the `GoP` counter and the relay region.
+///
+/// **Holds no bytes.** Scalars only — never a slice of the header, so the
+/// wrapped transmit key cannot reach it.
+///
+/// **Its values are not telemetry (ADR-0036 §2/§11, R-30).** `gop_counter`,
+/// `stream_sequence`, `stream_id` and `hop_sequence` are per-stream identity:
+/// never a log field, metric label, span attribute or test-bus value. `Debug`
+/// is hand-rolled and redacts all four, so a `?header` in a tracing call
+/// prints only flags and lengths.
+///
+/// The uplink `stream_id` is the publisher-set, unauthenticated attribution
+/// label; nothing here authenticates it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FrameHeader {
+    flags: FrameFlags,
+    payload_length: usize,
+    stream_sequence: u32,
+    gop_counter: u32,
+    stream_id: u16,
+    hop_sequence: u32,
+    header_len: usize,
+    frame_len: usize,
+}
+
+impl FrameHeader {
+    /// Build from a parsed layout over `data`, which holds at least the bytes
+    /// through the relay region.
+    ///
+    /// **The only reader of the relay region in this crate.** The offset comes
+    /// from [`Layout::relay_region_offset`], the same method every relay
+    /// writer uses; it is never recomputed here.
+    pub(crate) fn from_layout(data: &[u8], layout: Layout) -> Option<Self> {
+        let relay = layout.relay_region_offset();
+        let stream_id = read_u16_be(data, relay)?;
+        let hop_sequence = read_u32_be(data, relay.checked_add(STREAM_ID_FIELD_BYTES)?)?;
+        Some(Self {
+            flags: layout.flags,
+            payload_length: layout.payload_length,
+            stream_sequence: layout.stream_sequence,
+            gop_counter: layout.gop_counter,
+            stream_id,
+            hop_sequence,
+            header_len: layout.payload_start(),
+            frame_len: layout.frame_len(),
+        })
+    }
+
+    /// The three defined flags. MH gates group start on
+    /// `independently_decodable`.
+    #[must_use]
+    pub const fn flags(&self) -> FrameFlags {
+        self.flags
+    }
+
+    /// The declared payload length, already checked against
+    /// [`MAX_PAYLOAD_BYTES`].
+    #[must_use]
+    pub const fn payload_length(&self) -> usize {
+        self.payload_length
+    }
+
+    /// The end-to-end stream sequence (the AEAD nonce input). Not telemetry.
+    #[must_use]
+    pub const fn stream_sequence(&self) -> u32 {
+        self.stream_sequence
+    }
+
+    /// The `GoP` counter (ADR-0036 §2). Not telemetry.
+    #[must_use]
+    pub const fn gop_counter(&self) -> u32 {
+        self.gop_counter
+    }
+
+    /// The hop-local relay stream id. Uplink: the publisher-set,
+    /// unauthenticated attribution label (MC's send id). Downlink: the
+    /// subscriber's slot id.
+    #[must_use]
+    pub const fn stream_id(&self) -> u16 {
+        self.stream_id
+    }
+
+    /// The relay hop sequence, as the transmitter of this hop wrote it.
+    #[must_use]
+    pub const fn hop_sequence(&self) -> u32 {
+        self.hop_sequence
+    }
+
+    /// Bytes of header: the publisher region plus the relay region. The
+    /// payload starts at this offset.
+    #[must_use]
+    pub const fn header_len(&self) -> usize {
+        self.header_len
+    }
+
+    /// Total on-wire frame length: header, payload and signature.
+    #[must_use]
+    pub const fn frame_len(&self) -> usize {
+        self.frame_len
+    }
+
+    /// Bytes that follow the header: payload plus signature. A cut-through
+    /// reader streams exactly this many bytes through after the header.
+    #[must_use]
+    pub const fn tail_len(&self) -> usize {
+        // The spec's own definition of the tail (§2 "Frame extent"), not a
+        // subtraction: no arithmetic here can underflow.
+        self.payload_length + SIGNATURE_SIZE
+    }
+}
+
+impl fmt::Debug for FrameHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FrameHeader")
+            .field("flags", &self.flags)
+            .field("payload_length", &self.payload_length)
+            .field("header_len", &self.header_len)
+            .field("frame_len", &self.frame_len)
+            .field("stream_sequence", &format_args!("<redacted>"))
+            .field("gop_counter", &format_args!("<redacted>"))
+            .field("stream_id", &format_args!("<redacted>"))
+            .field("hop_sequence", &format_args!("<redacted>"))
+            .finish()
     }
 }
 
@@ -647,6 +849,19 @@ impl<'a> MediaFrameView<'a> {
     #[must_use]
     pub const fn stream_sequence(&self) -> u32 {
         self.layout.stream_sequence
+    }
+
+    /// The `GoP` counter (header v3, ADR-0036 §2): per (sender, media stream),
+    /// incremented on every independently-decodable frame and carried
+    /// unchanged by every frame of the group. Every u32 decodes; the
+    /// never-wrap rule binds the sender. Covered by the signature and the AEAD
+    /// associated data, so a relay cannot alter it.
+    ///
+    /// Stream identity: never a log field, metric label, span attribute or
+    /// test-bus value (§11, R-30).
+    #[must_use]
+    pub const fn gop_counter(&self) -> u32 {
+        self.layout.gop_counter
     }
 
     /// The wrapped transmit key, present iff the key-bearing flag is set.
@@ -829,11 +1044,14 @@ impl fmt::Debug for MediaFrameView<'_> {
             .field("version", &PROTOCOL_VERSION)
             .field("flags", &self.layout.flags)
             .field("payload_length", &self.layout.payload_length)
-            .field("stream_sequence", &self.layout.stream_sequence)
+            // Per-stream identity (R-30): redacted, consistent with
+            // `FrameHeader`'s Debug — sequence, GoP counter and relay values.
+            .field("stream_sequence", &format_args!("<redacted>"))
+            .field("gop_counter", &format_args!("<redacted>"))
             .field("wrapped_transmit_key", &self.wrapped)
             .field("extensions", &self.extensions)
-            .field("stream_id", &self.stream_id)
-            .field("hop_sequence", &self.hop_sequence)
+            .field("stream_id", &format_args!("<redacted>"))
+            .field("hop_sequence", &format_args!("<redacted>"))
             .field(
                 "payload",
                 &format_args!("<redacted {} B>", self.payload.len()),

@@ -4,8 +4,8 @@
 // boundary conditions either side of each reject, and the encode-side rule that
 // the publisher region is complete before either authenticated range is taken.
 //
-// v2 — deleted by P2: this suite exercises the v2 codec. The v3 codec's own
-// suite is `frameCodec.v3.test.ts`.
+// Version-generic: it builds whatever `HEADER_VERSION` the SSoT says (3). The
+// table-literal suite is `frameCodec.v3.test.ts`.
 
 import { describe, expect, it } from 'vitest';
 
@@ -13,7 +13,6 @@ import { bytesToHex, concatBytes } from '../hex.js';
 import {
   FLAG_INDEPENDENTLY_DECODABLE,
   FLAG_KEY_BEARING,
-  HEADER_VERSION_V3,
   buildUnsignedFrame,
   decodeFrame,
   finishFrame,
@@ -26,7 +25,6 @@ const SIG = new Uint8Array(WIRE_CONSTANTS.signature_bytes).fill(0xab);
 
 function baseInput(over: Partial<EncodeFrameInput> = {}): EncodeFrameInput {
   return {
-    // v2 — deleted by P2: this whole suite is the v2 codec's.
     headerVersion: HEADER_VERSION,
     flags: { independentlyDecodable: true, discardable: false, keyBearing: false },
     streamSequence: 7,
@@ -47,7 +45,8 @@ function encode(over: Partial<EncodeFrameInput> = {}) {
 describe('round trip', () => {
   it('preserves every field with no wrapped key and no extensions', () => {
     const decoded = decodeFrame(encode());
-    expect(decoded.version).toBe(2);
+    expect(decoded.version).toBe(HEADER_VERSION);
+    expect(decoded.gopCounter).toBe(0);
     expect(decoded.flags).toEqual({
       independentlyDecodable: true,
       discardable: false,
@@ -66,7 +65,8 @@ describe('round trip', () => {
     ).fill(0x33);
     const decoded = decodeFrame(
       encode({
-        flags: { independentlyDecodable: true, discardable: true, keyBearing: true },
+        // Not discardable: key-bearing + discardable is a v3 reject (§2 step 5).
+        flags: { independentlyDecodable: true, discardable: false, keyBearing: true },
         wrappedTransmitKey: { kekGeneration: 9, wrappedKeyWithTag: wrap },
         extensions: [{ extType: 1, value: Uint8Array.of(42) }],
       }),
@@ -155,9 +155,8 @@ describe('reject boundaries', () => {
     return 'accepted';
   }
 
-  it('rejects an unknown version (neither v2 nor the transitional v3)', () => {
-    // v2 — deleted by P2. 3 is no longer unknown: it routes to the v3 decoder.
-    for (const version of [0, 1, HEADER_VERSION_V3 + 1, 0xff]) {
+  it('rejects every version but the one it speaks', () => {
+    for (const version of [0, 1, HEADER_VERSION - 1, HEADER_VERSION + 1, 0xff]) {
       const f = encode();
       f[0] = version;
       expect(rejectOf(f), `version ${version}`).toBe('unknown_version');

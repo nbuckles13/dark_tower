@@ -75,11 +75,10 @@ export interface TestFrameSpec {
   /** Omit the wrap and clear the key-bearing flag. */
   readonly keyBearing?: boolean;
   /**
-   * Header version to build. Defaults to `HEADER_VERSION` (the current one —
-   * v2 until P2). A v3 frame lets a receive-path test prove dual decode.
+   * Header version to build. Defaults to `HEADER_VERSION`; anything else is
+   * refused by the codec, which is what a version test wants.
    */
   readonly headerVersion?: number;
-  /** v3 only; the codec ignores it on v2. */
   readonly gopCounter?: number;
 }
 

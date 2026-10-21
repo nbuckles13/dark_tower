@@ -1220,7 +1220,7 @@ impl MediaLatencyPhase {
 /// # One label space, two families — not two vocabularies
 ///
 /// `reason` is a **shared, layered** label space. `media_protocol`'s
-/// `reject_reasons!` macro documents its eight tokens as "the structural /
+/// `reject_reasons!` macro documents its tokens as "the structural /
 /// parse subset of a **shared** `reason` label space", and **MH is a
 /// first-class member of the codec layer** —
 /// `RejectReason::producible_by()` names `rewrite_relay_region` as a producing
@@ -1248,7 +1248,7 @@ impl MediaLatencyPhase {
 ///
 /// The collision test in
 /// `crates/mh-service/tests/media_metrics_integration.rs` pins both bars
-/// against every token in `proto/test-vectors/frame-v2.vectors.json`.
+/// against every token in `proto/test-vectors/frame-v3.vectors.json`.
 ///
 /// ANCHOR (DRY): the operator-facing meaning of each token, and the split
 /// between the should-read-zero invariant-violation group and the

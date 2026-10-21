@@ -1,8 +1,7 @@
 // File: packages/sdk-core/src/media/frame/rejectReason.ts
 //
-// The bounded reject-reason taxonomy for the media frame receive path (v3, plus
-// the transitional v2 path), and
-// the typed errors that carry it.
+// The bounded reject-reason taxonomy for the media frame receive path (header
+// v3), and the typed errors that carry it.
 //
 // ---------------------------------------------------------------------------
 // THE TOKENS ARE HAND-WRITTEN HERE, AND THAT IS THE POINT
@@ -19,7 +18,7 @@
 //   1. Per-arm equality against the vectors' `reject_reason`, in the conformance
 //      harness. Catches a token mapped to the WRONG condition.
 //   2. Set equality against the SSoT's `reject_reasons[].token`, both directions,
-//      over every token in `proto/test-vectors/frame-v2.vectors.json`
+//      over every token in `proto/test-vectors/frame-v3.vectors.json`
 //      (`__tests__/rejectReason.test.ts`). This is the ONLY cover for the
 //      `has_vector: false` tokens — the receiver-state-dependent ones no byte
 //      string determines, so no row exercises them and a typo would otherwise
@@ -75,10 +74,9 @@
  * Every reject reason the receive path can produce, plus the one non-dropping
  * outcome.
  *
- * Mirrors `reject_reasons[].token` in `proto/test-vectors/frame-v2.vectors.json`,
+ * Mirrors `reject_reasons[].token` in `proto/test-vectors/frame-v3.vectors.json`,
  * asserted for set equality in both directions by
- * `__tests__/rejectReason.test.ts` — modulo the explicit pending-P2 set there
- * (`key_bearing_discardable`, which P2's v3 vectors add).
+ * `__tests__/rejectReason.test.ts`. There is no second client-side union.
  */
 export type RejectReason =
   // --- codec layer: the frame did not parse -------------------------------
@@ -88,11 +86,6 @@ export type RejectReason =
    * A v3 frame with BOTH the key-bearing and the discardable flag set (ADR-0036
    * §2 decode step 5; §4: a frame carrying a new key must never be droppable).
    * Byte-determined, structural family.
-   *
-   * PENDING P2: the v2 vectors file does not carry this token; P2 adds it to the
-   * v3 vectors it generates. Until then `__tests__/rejectReason.test.ts` holds it
-   * in an explicit, self-retiring pending set rather than loosening the
-   * set-equality check. Emitted on v3 decode only.
    */
   | 'key_bearing_discardable'
   | 'payload_length_exceeds_max'
@@ -102,6 +95,26 @@ export type RejectReason =
   | 'extensions_malformed'
   | 'trailing_bytes'
   | 'no_transmit_key'
+  // --- codec layer, receiver/stream-dependent (`has_vector: false`) -------
+  //
+  // Emitted by the VIDEO receive path (C-B), not by `decodeFrame`: no single
+  // byte string determines them, so no conformance row can. Declared here now
+  // because the vectors file is the vocabulary SSoT and set equality is
+  // both-directions. Every one DROPS the frame.
+  /** Decoded output exceeded the slot's configured receive bounds. */
+  | 'decode_over_bound'
+  /**
+   * A stream reset mid-frame; the partial frame is discarded. Counted ONCE per
+   * aborted frame against the stream path's `received` counting point (C-B), so
+   * `received = accepted + sum(drops)` holds.
+   */
+  | 'stream_partial_reset'
+  /**
+   * Frames on one stream carried differing relay `stream_id`s; the stream is
+   * aborted. A two-frame property, hence no vector. Same counting-point rule as
+   * `stream_partial_reset`.
+   */
+  | 'stream_slot_mismatch'
   // --- crypto layer: the frame parsed but did not open --------------------
   | 'signature_invalid'
   | 'decrypt_failed'
@@ -135,7 +148,15 @@ export type RejectReason =
    * Defence in depth against a misrouting or compromised handler; in the honest
    * data plane MH never forwards it.
    */
-  | 'sender_not_assigned';
+  | 'sender_not_assigned'
+  /** The frame's verified key-id sender is this receiver itself (C-B). Never rendered. */
+  | 'self_sender'
+  /**
+   * The verified sender is server-muted for this media kind per the latest
+   * `ParticipantMuteUpdate` (C-B). The receiver-side signal that MH's ingress
+   * mute enforcement failed; corroborating, not proof.
+   */
+  | 'sender_server_muted';
 
 /**
  * The tokens, as data, for the set-equality assertion.
@@ -153,6 +174,9 @@ export const ALL_REJECT_REASONS: readonly RejectReason[] = [
   'extensions_malformed',
   'trailing_bytes',
   'no_transmit_key',
+  'decode_over_bound',
+  'stream_partial_reset',
+  'stream_slot_mismatch',
   'signature_invalid',
   'decrypt_failed',
   'unwrap_failed',
@@ -162,6 +186,8 @@ export const ALL_REJECT_REASONS: readonly RejectReason[] = [
   'no_roster_entry',
   'kek_generation_stale',
   'sender_not_assigned',
+  'self_sender',
+  'sender_server_muted',
 ] as const;
 
 /**

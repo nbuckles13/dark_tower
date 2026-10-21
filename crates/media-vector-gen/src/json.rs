@@ -1,4 +1,4 @@
-//! Serde shapes for `proto/test-vectors/frame-v2.vectors.json`.
+//! Serde shapes for `proto/test-vectors/frame-v3.vectors.json`.
 //!
 //! NON-PRODUCTION crate — see crate docs.
 //!
@@ -105,6 +105,12 @@ pub struct WireConstants {
     pub ext_length_field_bytes: u32,
     /// Registry-derived maximum extension-region size.
     pub max_ext_bytes: u32,
+    /// Width of the v3 `gop_counter` field (offset 10, inside the fixed prefix).
+    pub gop_counter_field_bytes: u32,
+    /// The largest header a reader ever buffers before knowing the frame
+    /// length: fixed prefix + wrapped key + `ext_length` + `max_ext_bytes` +
+    /// relay region (ADR-0036 §2 "Frame extent").
+    pub max_header_bytes: u32,
     /// Key-id field widths.
     pub key_id_layout: KeyIdLayout,
 }
@@ -250,10 +256,13 @@ pub struct Decoded {
     pub payload_length: u32,
     /// The AEAD nonce input.
     pub stream_sequence: u32,
+    /// The v3 `GoP` counter (ADR-0036 §2). Every u32 decodes.
+    pub gop_counter: u32,
     /// Present iff key-bearing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kek_generation: Option<u16>,
-    /// Relay: subscriber slot.
+    /// Relay `stream_id`, hop-local: the publisher's send id on an uplink row,
+    /// a subscriber slot id on a rewritten (downlink) row.
     pub stream_id: u16,
     /// Relay: transmit count.
     pub hop_sequence: u32,
