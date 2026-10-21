@@ -75,6 +75,7 @@ import { closesConnection, mapErrorCode, staticMessageFor } from './errorCodeMap
 import { MAX_RELAYED_PARTICIPANT_ID_LENGTH, mapLeaveReason } from './events.js';
 import { takeMeetingKek, type MeetingKekSink } from './kekIntake.js';
 import { MEDIA_KEK_SOURCES } from '../media/setup/mediaMetrics.js';
+import { SENDABLE_HEADER_VERSIONS } from '../media/frame/frameCodec.js';
 import { RosterKeyFeed } from './rosterKeyFeed.js';
 import type {
   ParticipantMuteEvent,
@@ -408,9 +409,16 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       supportedCodecs: (caps?.supportedCodecs ?? [])
         .map(toWireCodec)
         .filter((c): c is Codec => c !== undefined),
+      // Default: what this SDK's publish path will SEND, derived from the codec's
+      // one set — never a literal. `[2]` today; `[3]` once P2 regenerates the
+      // version AND removes the set's explicit v3 exclusion alongside the GoP
+      // owner (until both, `[]`, which MC refuses loudly). No edit is needed
+      // here. Not the codec's DECODE set: declaring a
+      // version the egress path refuses would invite MC to direct it. An
+      // explicit caller list still wins.
       supportedHeaderVersions: caps?.supportedHeaderVersions
         ? [...caps.supportedHeaderVersions]
-        : [],
+        : [...SENDABLE_HEADER_VERSIONS],
     });
     const joinRequest = create(JoinRequestSchema, {
       meetingId: params.meetingId,

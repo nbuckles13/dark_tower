@@ -14,6 +14,7 @@
 //
 // No wall-clock assertion appears here, and none may (ADR-0036 §10).
 
+import { HEADER_VERSION } from '../../frame/wireConstants.js';
 import { describe, expect, it } from 'vitest';
 import {
   FakeAudioCodecs,
@@ -122,7 +123,12 @@ async function makeRig(options: { readonly startDeviceId?: string } = {}): Promi
   await pipeline.start(
     options.startDeviceId !== undefined ? { deviceId: options.startDeviceId } : {},
   );
-  pipeline.setSendDirective({ streamNumber: 1, bitrateBps: 32_000, targets: [MH_URL] });
+  pipeline.setSendDirective({
+    streamNumber: 1,
+    bitrateBps: 32_000,
+    targets: [MH_URL],
+    headerVersion: HEADER_VERSION,
+  });
   // Receiving comes from the slot assignments, not from the send directive.
   pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
 

@@ -23,6 +23,18 @@ import { repoRoot } from './repoRoot.js';
 /** Path of the SSoT relative to the repository root. */
 export const VECTORS_PATH = 'proto/test-vectors/frame-v2.vectors.json';
 
+/**
+ * Reject tokens the codec already emits but the SSoT does not carry YET.
+ *
+ * `key_bearing_discardable` is the v3 decode-step-5 reject (ADR-0036 §2), a
+ * DROPPING, byte-determined token. The v2 vectors file predates it; P2
+ * generates the v3 vectors that add it. Hand-written and EXPLICIT rather than a
+ * loosened comparison, and self-retiring: `rejectReason.test.ts` asserts every
+ * entry is ABSENT from the SSoT, so the day P2's vectors add it that test goes
+ * red until this list is emptied. Deletion owner: P2.
+ */
+export const PENDING_P2_REJECT_TOKENS: readonly string[] = ['key_bearing_discardable'];
+
 /** Decoded flag bits, as the vectors spell them. */
 export interface VectorFlags {
   readonly independently_decodable: boolean;

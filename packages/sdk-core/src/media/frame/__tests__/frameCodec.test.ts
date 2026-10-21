@@ -3,6 +3,9 @@
 // Codec behaviour the vectors do not pin: encode/decode round trips, the
 // boundary conditions either side of each reject, and the encode-side rule that
 // the publisher region is complete before either authenticated range is taken.
+//
+// v2 — deleted by P2: this suite exercises the v2 codec. The v3 codec's own
+// suite is `frameCodec.v3.test.ts`.
 
 import { describe, expect, it } from 'vitest';
 
@@ -10,20 +13,24 @@ import { bytesToHex, concatBytes } from '../hex.js';
 import {
   FLAG_INDEPENDENTLY_DECODABLE,
   FLAG_KEY_BEARING,
+  HEADER_VERSION_V3,
   buildUnsignedFrame,
   decodeFrame,
   finishFrame,
   type EncodeFrameInput,
 } from '../frameCodec.js';
 import { FrameRejectedError } from '../rejectReason.js';
-import { WIRE_CONSTANTS } from '../wireConstants.js';
+import { HEADER_VERSION, WIRE_CONSTANTS } from '../wireConstants.js';
 
 const SIG = new Uint8Array(WIRE_CONSTANTS.signature_bytes).fill(0xab);
 
 function baseInput(over: Partial<EncodeFrameInput> = {}): EncodeFrameInput {
   return {
+    // v2 — deleted by P2: this whole suite is the v2 codec's.
+    headerVersion: HEADER_VERSION,
     flags: { independentlyDecodable: true, discardable: false, keyBearing: false },
     streamSequence: 7,
+    gopCounter: 0,
     wrappedTransmitKey: null,
     extensions: [],
     streamId: 2,
@@ -148,10 +155,13 @@ describe('reject boundaries', () => {
     return 'accepted';
   }
 
-  it('rejects an unknown version', () => {
-    const f = encode();
-    f[0] = 3;
-    expect(rejectOf(f)).toBe('unknown_version');
+  it('rejects an unknown version (neither v2 nor the transitional v3)', () => {
+    // v2 — deleted by P2. 3 is no longer unknown: it routes to the v3 decoder.
+    for (const version of [0, 1, HEADER_VERSION_V3 + 1, 0xff]) {
+      const f = encode();
+      f[0] = version;
+      expect(rejectOf(f), `version ${version}`).toBe('unknown_version');
+    }
   });
 
   it('rejects every reserved flag bit, one at a time', () => {

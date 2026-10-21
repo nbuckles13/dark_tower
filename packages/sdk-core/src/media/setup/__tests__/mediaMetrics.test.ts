@@ -23,7 +23,7 @@ import { describe, expect, it } from 'vitest';
 import { InMemoryMetricsSink } from '@darktower/test-utils';
 
 import { ALL_REJECT_REASONS, NON_DROPPING_REASON } from '../../frame/rejectReason.js';
-import { loadFrameVectors } from '../../frame/__tests__/frameVectors.js';
+import { loadFrameVectors, PENDING_P2_REJECT_TOKENS } from '../../frame/__tests__/frameVectors.js';
 import {
   MEDIA_KEK_INSTALL_REFUSALS,
   MEDIA_KIND_LABELS,
@@ -300,7 +300,12 @@ describe('the drop counter carries the frozen reject vocabulary', () => {
     // both directions against `proto/test-vectors/frame-v2.vectors.json`. There
     // is deliberately no second hand-written list here, in the test either.
     const file = loadFrameVectors();
-    const dropping = file.reject_reasons.filter((r) => r.drops_frame).map((r) => r.token);
+    // Plus the tokens P2's vectors will add (all dropping); see
+    // `PENDING_P2_REJECT_TOKENS` for why that list retires itself.
+    const dropping = [
+      ...file.reject_reasons.filter((r) => r.drops_frame).map((r) => r.token),
+      ...PENDING_P2_REJECT_TOKENS,
+    ];
     const sink = new InMemoryMetricsSink();
     const metrics = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Audio, sink);
     for (const token of dropping) {

@@ -20,7 +20,7 @@
 - Client config SSoT → `config/clientConfig.ts` (`parseReceiveSlots()`, `deriveKekRetention()`); export interval → `telemetry/telemetryConfig.ts:getMetricExportIntervalMs()`
 
 ## SDK Core: Media Pipeline (`packages/sdk-core/src/media/`)
-- Frame codec + signing → `frame/{frameCodec,ed25519,wireConstants}.ts`; hot-path layout rule → `__tests__/hotPathLayout.test.ts`
+- Frame codec + signing → `frame/{frameCodec,ed25519,wireConstants}.ts`; header v3 + sendable/supported versions → `frameCodec.ts:HEADER_VERSION_V3`, `__tests__/frameCodec.v3.test.ts`; hot-path layout rule → `__tests__/hotPathLayout.test.ts`
 - Egress (seal once, per-target fan-out) → `pipeline/{egress,egressQueue}.ts`; proof → `pipeline/__tests__/egress.multiTarget.test.ts`
 - Ingress + slot-edge gate + per-sender receive lanes → `pipeline/{ingress,receiveLanes,playbackSink}.ts`; proof → `lifecycle/__tests__/audioPipeline.multiSender.test.ts`
 - Receive verification recorder (test-injected); hop monitor → `pipeline/{receiveVerification,hopSequenceMonitor}.ts`

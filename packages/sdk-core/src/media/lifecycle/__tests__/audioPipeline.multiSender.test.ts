@@ -17,6 +17,7 @@
 // processing is awaited with a bounded drain (`waitFor`) on the receive-path
 // identity itself, never on a duration.
 
+import { HEADER_VERSION } from '../../frame/wireConstants.js';
 import { describe, expect, it } from 'vitest';
 import {
   FakeAudioCodecs,
@@ -743,7 +744,12 @@ async function makeSender(senderId: number) {
     clearInterval: () => {},
   });
   await pipeline.start();
-  pipeline.setSendDirective({ streamNumber: 1, bitrateBps: 32_000, targets: [HANDLER_A] });
+  pipeline.setSendDirective({
+    streamNumber: 1,
+    bitrateBps: 32_000,
+    targets: [HANDLER_A],
+    headerVersion: HEADER_VERSION,
+  });
   return {
     senderId,
     holder,

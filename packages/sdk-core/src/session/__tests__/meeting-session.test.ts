@@ -1225,6 +1225,22 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     rig.session.disconnect();
   });
 
+  it("passes MC's header version through to the pipeline verbatim, never defaulting it", async () => {
+    const rig = await joinedWithMedia();
+    const pipeline = await rig.session.startMedia();
+    const applied = vi.spyOn(pipeline, 'setSendDirective');
+    const mc = rig.mocks.get(MC_ENDPOINT)!;
+    // 4 is unsendable: the listener must hand it over as-is, so the pipeline's
+    // fail-closed refusal (not a silent coercion here) decides.
+    mc.simulateServerMessage(
+      0,
+      framedSendDirective({ targets: [MEDIA_SERVERS[0]!], headerVersion: 4 }),
+    );
+    await waitFor(() => applied.mock.calls.length === 1);
+    expect(applied.mock.calls[0]![0].headerVersion).toBe(4);
+    rig.session.disconnect();
+  });
+
   it('a first directive with NO audio stream withdraws nothing and invents nothing', async () => {
     // A solo participant's first directive: there is no earlier instruction to
     // withdraw, so nothing is applied — no placeholder stream number or bitrate.

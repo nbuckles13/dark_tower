@@ -114,6 +114,9 @@ export function sendDirectiveListener(
       // Never a local ceiling applied on top — see `clientConfig.ts`.
       bitrateBps: audio.maxBitrateBps ?? defaultBitrateBps,
       targets: audio.targets,
+      // MC's meeting-wide version, passed through verbatim. The pipeline refuses
+      // one it cannot send; nothing here defaults or coerces it.
+      headerVersion: directive.headerVersion,
     };
     pipeline.setSendDirective(lastAudio);
   };
