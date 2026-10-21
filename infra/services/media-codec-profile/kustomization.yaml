@@ -1,0 +1,38 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Shared media codec profile (story 3 R-23/R-24; ADR-0036 §11 "Derive rather
+# than guard"). A GENERATOR-ONLY base: one content-addressed ConfigMap and
+# nothing else — no workload, Service or NetworkPolicy. Its consumers are the
+# mc-{0,1} and mh-{0,1} Deployments in the sibling mc-service and mh-service
+# bases, whose `configMapKeyRef: {name: media-codec-profile}` entries kustomize
+# rewrites to this generator's hash-suffixed name in the ONE environment-root
+# render (infra/kubernetes/overlays/kind, applied by
+# infra/kind/scripts/deploy.sh:apply_env_root). A value change here therefore
+# changes the pod template of all four and ROLLS MC AND MH TOGETHER — see the
+# header of profile.env for what that costs.
+#
+# Rendering this base or the mc/mh bases ALONE leaves the cross-base reference
+# unhashed; only the environment root resolves it. `dt-guard kustomize` R-21
+# knows this shape (a non-root target defers a reference to a generator-only
+# base's generator to the root, and only when the root rendered in the same
+# run), and `dt-guard env-config` resolves the reference cross-base. Both are
+# keyed on this base being generator-only (configMapGenerator, no resources:),
+# so do not add resources here.
+#
+# Content-addressed configuration (ADR-0038 §2). `namespace:` is load-bearing
+# -- see infra/kubernetes/observability/kustomization.yaml. Env-file format:
+# KEY=VALUE taken literally, so values are never quoted.
+configMapGenerator:
+  - name: media-codec-profile
+    namespace: dark-tower
+    envs:
+      - profile.env
+    options:
+      labels:
+        component: media-codec-profile
+
+labels:
+  - pairs:
+      managed-by: dark-tower
+    includeSelectors: false

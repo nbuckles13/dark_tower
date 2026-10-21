@@ -21,6 +21,16 @@
 //! * **R-21** (build-dependent, FAIL-closed) — every pod-consumed ConfigMap is
 //!   content-addressed (ADR-0038 §2); see `kustomize_content_addressing`.
 //!
+//! Plus the **downward-API resource rule** (build-dependent; story 3, policy
+//! content operations): every `resourceFieldRef` names a resource its target
+//! container declares — see [`crate::kustomize_resource_field_refs`]. It runs
+//! over the rendered bases and the environment root.
+//!
+//! Service bases are DERIVED (`common::services::infra_service_bases`, every
+//! directory under `infra/services/`), never listed here, so a new base —
+//! including a generator-only one such as `media-codec-profile/` — is built and
+//! orphan-checked with no special case.
+//!
 //! Plus one local check over generated ConfigMaps, in
 //! [`crate::kustomize_configmaps`] (added at story 2 task 12; no story
 //! R-number): **`configmap_annotation_size`** (every generator under `infra/`
@@ -39,10 +49,12 @@
 
 use crate::common::explain::{print_finding, Finding};
 use crate::common::kustomize_generators::parse_config_map_generators;
+use crate::common::kustomize_generators::shared_generator_index;
 use crate::common::scan::warn_skip;
+use crate::common::services::{infra_service_bases, INFRA_SERVICES_DIR};
 use crate::common::status::emit_ok;
 use crate::kustomize_content_addressing::{
-    check_rendered, declared_generator_names, NOT_CONTENT_ADDRESSED_RULE_ID,
+    check_rendered, declared_generator_names, RenderContext, NOT_CONTENT_ADDRESSED_RULE_ID,
     UNREFERENCED_CONFIGMAP_RULE_ID, UNRESOLVED_REFERENCE_RULE_ID, UNVERIFIABLE_RULE_ID,
     VACUOUS_RULE_ID,
 };
@@ -60,18 +72,13 @@ pub const EMPTY_SECRET_RULE_ID: &str = "empty_secret_value";
 pub const ORPHAN_MANIFEST_RULE_ID: &str = "orphan_manifest";
 pub const DASHBOARD_ORPHAN_RULE_ID: &str = "dashboard_orphan";
 
-const SERVICE_BASES: &[&str] = &[
-    "ac-service",
-    "gc-service",
-    "mc-service",
-    "mh-service",
-    // The migration Job's base (ADR-0038 §2): applied ahead of the root, not
-    // part of it, so it is built, orphan-checked and schema-checked here.
-    "db-migrate",
-    "otel-collector",
-    "postgres",
-    "redis",
-];
+// Service bases are NOT listed here: R-15/R-16 enumerate every base under
+// `infra/services/` through `common::services::infra_service_bases`, the ONE
+// enumeration (a hand list here once had to be remembered for every new base —
+// e.g. the generator-only `media-codec-profile/` — and missed silently). That
+// includes the migration Job's base, `db-migrate/` (ADR-0038 §2): applied ahead
+// of the root, not part of it, so it is built, orphan-checked and
+// schema-checked here.
 
 const ORPHAN_EXCLUSIONS: &[&str] = &["kustomization.yaml", "service-monitor.yaml"];
 
@@ -149,9 +156,9 @@ struct Hit {
 /// source.
 fn check_orphan_manifests(repo_root: &Path) -> Result<Vec<Hit>> {
     let mut hits: Vec<Hit> = Vec::new();
-    let services_dir = repo_root.join("infra/services");
-    for svc in SERVICE_BASES {
-        let svc_dir = services_dir.join(svc);
+    let services_dir = repo_root.join(INFRA_SERVICES_DIR);
+    for svc in infra_service_bases(repo_root)? {
+        let svc_dir = services_dir.join(&svc);
         let kustomization = svc_dir.join("kustomization.yaml");
         if !kustomization.is_file() {
             // Bash today flags this as a violation; preserve.
@@ -165,8 +172,12 @@ fn check_orphan_manifests(repo_root: &Path) -> Result<Vec<Hit>> {
             });
             continue;
         }
-        let kust_content = std::fs::read_to_string(&kustomization)
-            .with_context(|| format!("reading {}", kustomization.display()))?;
+        // Containment-gated read (THE one base-kustomization reader).
+        let Some(kust_content) =
+            crate::common::kustomize_generators::read_base_kustomization(repo_root, &svc)?
+        else {
+            anyhow::bail!("infra/services/{svc}/kustomization.yaml vanished while being read");
+        };
         let mut declared = extract_declared_resources(&kust_content);
         // Generator sources (ADR-0038 §2: `collector.yaml`, `*.env`, …) are
         // declared too — read through the ONE structured generator parser.
@@ -354,18 +365,18 @@ fn check_dashboard_coverage(repo_root: &Path) -> Result<Vec<Hit>> {
 /// `infra/services/<svc>/`, the observability base, per-service overlays
 /// under `infra/kubernetes/overlays/kind/services/<svc>/`, and the
 /// observability overlay.
-fn build_targets(repo_root: &Path) -> Vec<(PathBuf, String)> {
+fn build_targets(repo_root: &Path) -> Result<Vec<(PathBuf, String)>> {
     let mut out: Vec<(PathBuf, String)> = Vec::new();
-    let services_dir = repo_root.join("infra/services");
+    let services_dir = repo_root.join(INFRA_SERVICES_DIR);
     let overlays_dir = repo_root.join("infra/kubernetes/overlays/kind");
     let obs_base = repo_root.join("infra/kubernetes/observability");
     let obs_overlay = overlays_dir.join("observability");
-    for svc in SERVICE_BASES {
-        let base = services_dir.join(svc);
+    for svc in infra_service_bases(repo_root)? {
+        let base = services_dir.join(&svc);
         if base.is_dir() {
             out.push((base, format!("base: infra/services/{svc}")));
         }
-        let overlay = overlays_dir.join("services").join(svc);
+        let overlay = overlays_dir.join("services").join(&svc);
         if overlay.is_dir() {
             out.push((overlay, format!("overlay: overlays/kind/services/{svc}")));
         }
@@ -383,7 +394,7 @@ fn build_targets(repo_root: &Path) -> Vec<(PathBuf, String)> {
     if overlays_dir.is_dir() {
         out.push((overlays_dir, ENV_ROOT_LABEL.to_string()));
     }
-    out
+    Ok(out)
 }
 
 /// Label of the Kind environment-root build target; R-21's vacuity check and
@@ -417,8 +428,9 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
 
     // R-15/R-17/R-18/R-19/R-21 — build-dependent. Gate on `tool`.
     let mut consumed_configmaps = 0;
+    let mut root_resource_field_refs = 0;
     if let Some(tool) = tool {
-        consumed_configmaps =
+        (consumed_configmaps, root_resource_field_refs) =
             run_build_dependent_checks(repo_root, tool, has_kubeconform, &mut all_hits)?;
     } else {
         warn_skip(
@@ -429,11 +441,7 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
             ),
         );
         // R-21 does NOT degrade: see the module doc.
-        all_hits.push(Hit {
-            rule_id: UNVERIFIABLE_RULE_ID,
-            detail: "neither `kustomize` nor `kubectl kustomize` is available, so the environment root cannot be rendered and pod-consumed ConfigMaps cannot be verified content-addressed (R-21 fails closed)".to_string(),
-            file: PathBuf::from("infra"),
-        });
+        all_hits.push(no_tool_hit());
     }
     if tool.is_some() && !has_kubeconform {
         warn_skip(
@@ -447,11 +455,11 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
         // `tool` is necessarily Some here: its absence is an R-21 hit.
         if has_kubeconform {
             emit_ok(format!(
-                "kustomize-clean-{consumed_configmaps}-consumed-configmaps"
+                "kustomize-clean-{consumed_configmaps}-consumed-configmaps-{root_resource_field_refs}-resource-field-refs"
             ));
         } else {
             emit_ok(format!(
-                "kustomize-clean-kubeconform-skipped-{consumed_configmaps}-consumed-configmaps"
+                "kustomize-clean-kubeconform-skipped-{consumed_configmaps}-consumed-configmaps-{root_resource_field_refs}-resource-field-refs"
             ));
         }
         return Ok(());
@@ -494,6 +502,37 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
     anyhow::bail!("{}", fail_token(&all_hits))
 }
 
+/// The hit a run without any kustomize tool always carries. FATAL (it is a
+/// "could not check" class in [`fail_token`]), and that fatality is what keeps
+/// EVERY build-dependent rule from passing silently on a tool-less host —
+/// R-21 and the downward-API resource rule
+/// (`kustomize_resource_field_refs`, whose SOUNDNESS note depends on it).
+fn no_tool_hit() -> Hit {
+    Hit {
+        rule_id: UNVERIFIABLE_RULE_ID,
+        detail: "neither `kustomize` nor `kubectl kustomize` is available, so the environment root cannot be rendered: pod-consumed ConfigMaps cannot be verified content-addressed (R-21) and downward-API resource refs cannot be checked — both fail closed".to_string(),
+        file: PathBuf::from("infra"),
+    }
+}
+
+/// R-21 cross-base deferrals that nothing verified: when the environment root
+/// did not render in this run, every deferred reference is a finding.
+fn unverified_deferral_hits(root_rendered: bool, deferred: Vec<(PathBuf, String)>) -> Vec<Hit> {
+    if root_rendered {
+        return Vec::new();
+    }
+    deferred
+        .into_iter()
+        .map(|(file, d)| Hit {
+            rule_id: UNRESOLVED_REFERENCE_RULE_ID,
+            detail: format!(
+                "{d} — deferred to the environment root, which did not render in this run, so the cross-base reference was never verified"
+            ),
+            file,
+        })
+        .collect()
+}
+
 /// Select the single REASON token for a failing R-15..R-21 run from the
 /// accumulated hits. Extracted pure so the fail-closed precedence and the exact
 /// emitted strings — which runbooks and the OK/skip enum consumers key on — are
@@ -508,7 +547,8 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
 /// names the run whenever present. Otherwise the largest content-failure class
 /// wins, in the deterministic order R-15 build > R-17 schema > R-18
 /// securityContext > R-19 empty-secret > R-16 orphan > R-20 dashboard > R-21
-/// content-addressing > the generated-ConfigMap size check.
+/// content-addressing > the generated-ConfigMap size check > the downward-API
+/// resource rule.
 ///
 /// # Ties go to the FIRST class listed, which needs saying in code
 ///
@@ -567,6 +607,13 @@ fn fail_token(all_hits: &[Hit]) -> String {
             "kustomize-configmap-annotation-size",
             by_kind(crate::kustomize_configmaps::CONFIGMAP_ANNOTATION_SIZE_RULE_ID),
         ),
+        (
+            "kustomize-resource-field-ref",
+            crate::kustomize_resource_field_refs::RULE_IDS
+                .iter()
+                .map(|id| by_kind(id))
+                .sum(),
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -579,15 +626,17 @@ fn fail_token(all_hits: &[Hit]) -> String {
 /// failures are recorded but do NOT short-circuit subsequent targets;
 /// downstream checks (R-17/R-18/R-19) silently skip the affected target
 /// (their input is the missing rendered stdout). Bash today: same shape.
-/// Returns the number of distinct ConfigMaps pod templates consume in the
-/// environment-root render (R-21's status-line count).
+/// Returns, for the environment-root render, the number of distinct ConfigMaps
+/// pod templates consume (R-21's status-line count) and the number of
+/// downward-API `resourceFieldRef`s the resource rule examined (its positive
+/// control: a blind walk shows as 0 on the OK line).
 fn run_build_dependent_checks(
     repo_root: &Path,
     tool: KustomizeTool,
     has_kubeconform: bool,
     all_hits: &mut Vec<Hit>,
-) -> Result<usize> {
-    let targets = build_targets(repo_root);
+) -> Result<(usize, usize)> {
+    let targets = build_targets(repo_root)?;
     if targets.is_empty() {
         all_hits.push(Hit {
             rule_id: VACUOUS_RULE_ID,
@@ -598,7 +647,12 @@ fn run_build_dependent_checks(
         });
     }
     let declared_generators = declared_generator_names(repo_root)?;
+    let shared = shared_generator_index(repo_root)?;
     let mut root_consumed: Option<usize> = None;
+    let mut root_resource_field_refs = 0;
+    // R-21 cross-base deferrals from non-root targets. Sound ONLY if the
+    // environment root rendered in THIS run (checked after the loop).
+    let mut deferred: Vec<(PathBuf, String)> = Vec::new();
     for (dir, label) in targets {
         // R-15: kustomize build.
         let build = run_kustomize_build(tool, &dir)?;
@@ -621,7 +675,17 @@ fn run_build_dependent_checks(
         // R-21: content-addressed ConfigMaps — every target, bases and
         // overlays alike (a base with a plain ConfigMap is the defect, and an
         // overlay can introduce a namespace mismatch).
-        let r21 = check_rendered(rendered, &label, &declared_generators);
+        let is_env_root = label == ENV_ROOT_LABEL;
+        let r21 = check_rendered(
+            rendered,
+            &label,
+            &RenderContext {
+                declared_generators: &declared_generators,
+                shared: &shared,
+                is_env_root,
+            },
+        );
+        deferred.extend(r21.deferred.into_iter().map(|d| (rel.clone(), d)));
         for f in r21.findings {
             all_hits.push(Hit {
                 rule_id: f.rule_id,
@@ -668,6 +732,25 @@ fn run_build_dependent_checks(
         // checking the overlay-rendered output would double-flag every
         // base finding without surfacing new ones.
         let is_base = !label.starts_with("overlay:");
+
+        // Downward-API resource rule — bases (attribution) and the
+        // environment root (catches an overlay stripping a limit). See
+        // `kustomize_resource_field_refs` for the SOUNDNESS dependency on
+        // R-21's fail-closed unverifiable branch.
+        if is_base || is_env_root {
+            let rf = crate::kustomize_resource_field_refs::check_rendered(rendered, &label);
+            if is_env_root {
+                root_resource_field_refs = rf.checked;
+            }
+            for f in rf.findings {
+                all_hits.push(Hit {
+                    rule_id: f.rule_id,
+                    detail: f.detail,
+                    file: rel.clone(),
+                });
+            }
+        }
+
         if is_base {
             for f in check_security_context(rendered, &label) {
                 all_hits.push(Hit {
@@ -688,9 +771,13 @@ fn run_build_dependent_checks(
             }
         }
     }
+    // A deferral is only a promise that the root checks the reference. If the
+    // root did not render in this run (absent target, or a build failure),
+    // nothing kept that promise: every deferred reference fails.
+    all_hits.extend(unverified_deferral_hits(root_consumed.is_some(), deferred));
     // The root target is always built when infra/ exists; if it did not render
     // (R-15 hit) the count is 0 and the run is already red.
-    Ok(root_consumed.unwrap_or(0))
+    Ok((root_consumed.unwrap_or(0), root_resource_field_refs))
 }
 
 #[cfg(test)]
@@ -735,6 +822,202 @@ mod tests {
             "kustomize-content-addressing-unverifiable-1",
             "the unverifiable precedence must not be defeated by a larger content class"
         );
+    }
+
+    /// SOUNDNESS pin for the build-dependent rules that have no fail-closed
+    /// branch of their own (the downward-API resource rule): a tool-less run
+    /// carries the unverifiable hit, and it names the run over any content
+    /// class. Make R-21's unverifiable branch non-fatal and this fails.
+    #[test]
+    fn no_tool_run_is_red_so_build_dependent_rules_cannot_pass_silently() {
+        let h = no_tool_hit();
+        assert_eq!(h.rule_id, UNVERIFIABLE_RULE_ID);
+        assert!(h.detail.contains("downward-API"), "{}", h.detail);
+        let hits = [
+            no_tool_hit(),
+            hit(crate::kustomize_resource_field_refs::RESOURCE_FIELD_REF_UNDECLARED_RULE_ID),
+            hit(crate::kustomize_resource_field_refs::RESOURCE_FIELD_REF_UNDECLARED_RULE_ID),
+        ];
+        assert_eq!(
+            fail_token(&hits),
+            "kustomize-content-addressing-unverifiable-1"
+        );
+    }
+
+    #[test]
+    fn resource_field_findings_have_their_own_token_class() {
+        let hits = [
+            hit(crate::kustomize_resource_field_refs::RESOURCE_FIELD_REF_UNDECLARED_RULE_ID),
+            hit(crate::kustomize_resource_field_refs::RESOURCE_FIELD_REF_UNKNOWN_CONTAINER_RULE_ID),
+        ];
+        assert_eq!(fail_token(&hits), "kustomize-resource-field-ref-2");
+    }
+
+    /// Security S2: a deferral that the root never verified is a finding.
+    #[test]
+    fn deferred_refs_fail_unless_the_root_rendered() {
+        let deferred = vec![(
+            PathBuf::from("infra/services/mc-service"),
+            "mc-0 ref".to_string(),
+        )];
+        assert!(unverified_deferral_hits(true, deferred.clone()).is_empty());
+        let hits = unverified_deferral_hits(false, deferred);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].rule_id, UNRESOLVED_REFERENCE_RULE_ID);
+        assert!(hits[0].detail.contains("never verified"));
+    }
+
+    /// 6c: a generator-only base is orphan-clean when its sources are
+    /// declared, and still orphan-checked (a stray manifest fails).
+    #[test]
+    fn generator_only_base_is_orphan_checked_without_special_cases() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let dir = td.path().join("infra/services/profile");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("kustomization.yaml"),
+            "configMapGenerator:\n  - name: profile\n    envs: [profile.env]\n",
+        )
+        .expect("write");
+        std::fs::write(dir.join("profile.env"), "K=v\n").expect("write");
+        assert!(check_orphan_manifests(td.path()).expect("walk").is_empty());
+        std::fs::write(dir.join("stray.yaml"), "kind: ConfigMap\n").expect("write");
+        let hits = check_orphan_manifests(td.path()).expect("walk");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].detail.contains("stray.yaml"));
+    }
+
+    /// The real tree: every directory under infra/services/ is a base build
+    /// target — including the generator-only media-codec-profile — with no
+    /// hand list to forget it from.
+    #[test]
+    fn every_real_service_base_is_a_build_target() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let bases = infra_service_bases(&root).expect("bases");
+        assert!(
+            bases.contains(&"media-codec-profile".to_string()),
+            "{bases:?}"
+        );
+        let targets = build_targets(&root).expect("targets");
+        for b in &bases {
+            let label = format!("base: infra/services/{b}");
+            assert!(targets.iter().any(|(_, l)| *l == label), "{label} missing");
+        }
+        let orphans = check_orphan_manifests(&root).expect("orphan walk");
+        assert!(orphans.is_empty(), "{orphans:#?}");
+    }
+
+    /// R-21 on the REAL tree's cross-base shape: the mc-service base render
+    /// DEFERS its media-codec-profile refs (no finding), and the environment
+    /// root resolves every one to the hashed generator. Skips VISIBLY without
+    /// a kustomize tool, as R-15 does.
+    #[test]
+    fn real_cross_base_profile_refs_defer_in_base_and_resolve_at_root() {
+        let Some(tool) = crate::kustomize_tools::detect_kustomize_tool() else {
+            eprintln!("SKIP: real_cross_base_profile_refs_defer_in_base_and_resolve_at_root — no kustomize tool");
+            return;
+        };
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let declared = declared_generator_names(&root).expect("declared");
+        let shared = shared_generator_index(&root).expect("index");
+        assert!(shared.generators.contains_key("media-codec-profile"));
+        let ctx = |is_env_root| RenderContext {
+            declared_generators: &declared,
+            shared: &shared,
+            is_env_root,
+        };
+        let mc = crate::kustomize_tools::run_kustomize_build(
+            tool,
+            &root.join("infra/services/mc-service"),
+        )
+        .expect("build mc");
+        assert!(mc.success, "{}", mc.stderr_head);
+        let r = check_rendered(&mc.stdout, "mc base", &ctx(false));
+        assert!(r.findings.is_empty(), "{:?}", r.findings);
+        assert!(
+            !r.deferred.is_empty(),
+            "positive control: the profile refs were deferred"
+        );
+        // The same render judged AS the root never defers: it must fail.
+        let as_root = check_rendered(&mc.stdout, "mc as root", &ctx(true));
+        assert!(as_root.deferred.is_empty());
+        assert!(
+            !as_root.findings.is_empty(),
+            "a root without the profile must fail"
+        );
+        let env_root = crate::kustomize_tools::run_kustomize_build(
+            tool,
+            &root.join("infra/kubernetes/overlays/kind"),
+        )
+        .expect("build root");
+        assert!(env_root.success, "{}", env_root.stderr_head);
+        let r = check_rendered(&env_root.stdout, ENV_ROOT_LABEL, &ctx(true));
+        assert!(r.findings.is_empty(), "{:?}", r.findings);
+        assert!(env_root.stdout.contains("name: media-codec-profile-"));
+    }
+
+    /// Positive control for the downward-API rule on the REAL tree: the mh
+    /// base render yields the MH_POD_MEMORY_LIMIT_BYTES ref on BOTH mh-0 and
+    /// mh-1 and is clean; stripping the declared memory limit from the render
+    /// yields exactly one `resource_field_ref_undeclared` per workload. Skips
+    /// VISIBLY without a kustomize tool, as R-15 does.
+    #[test]
+    fn real_mh_memory_limit_refs_are_seen_and_guarded() {
+        use crate::common::pod_spec::{
+            meta_str, parse_docs, pod_resource_field_refs, pod_spec, ResourceFieldOrigin,
+        };
+        use crate::kustomize_resource_field_refs::{
+            check_rendered as check_rf, RESOURCE_FIELD_REF_UNDECLARED_RULE_ID,
+        };
+        let Some(tool) = crate::kustomize_tools::detect_kustomize_tool() else {
+            eprintln!("SKIP: real_mh_memory_limit_refs_are_seen_and_guarded — no kustomize tool");
+            return;
+        };
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mh = crate::kustomize_tools::run_kustomize_build(
+            tool,
+            &root.join("infra/services/mh-service"),
+        )
+        .expect("build mh");
+        assert!(mh.success, "{}", mh.stderr_head);
+        let docs = parse_docs(&mh.stdout).expect("parse");
+        for name in ["mh-0", "mh-1"] {
+            let doc = docs
+                .iter()
+                .find(|d| {
+                    d.get("kind").and_then(serde_norway::Value::as_str) == Some("Deployment")
+                        && meta_str(d, "name") == Some(name)
+                })
+                .expect("mh Deployment rendered");
+            let refs = pod_resource_field_refs(pod_spec(doc).expect("pod"));
+            assert!(
+                refs.iter().any(|r| r.origin
+                    == ResourceFieldOrigin::Env(Some("MH_POD_MEMORY_LIMIT_BYTES"))
+                    && r.resource == Some("limits.memory")),
+                "{name}: walker did not see MH_POD_MEMORY_LIMIT_BYTES"
+            );
+        }
+        let clean = check_rf(&mh.stdout, "mh base");
+        assert!(clean.findings.is_empty(), "{:?}", clean.findings);
+        assert!(clean.checked >= 2, "checked {}", clean.checked);
+        let stripped = mh.stdout.replace(
+            "          limits:\n            cpu: 1000m\n            memory: 1Gi\n",
+            "          limits:\n            cpu: 1000m\n",
+        );
+        assert_ne!(
+            stripped, mh.stdout,
+            "the render's limits shape changed; update this control"
+        );
+        let broken = check_rf(&stripped, "mh base");
+        assert_eq!(broken.findings.len(), 2, "{:?}", broken.findings);
+        for (f, name) in broken
+            .findings
+            .iter()
+            .zip(["Deployment/mh-0", "Deployment/mh-1"])
+        {
+            assert_eq!(f.rule_id, RESOURCE_FIELD_REF_UNDECLARED_RULE_ID);
+            assert!(f.detail.contains(name), "{}", f.detail);
+        }
     }
 
     #[test]
@@ -939,10 +1222,13 @@ resources:
     /// orphan-checked (R-16) like every other base.
     #[test]
     fn service_bases_include_db_migrate() {
-        assert!(SERVICE_BASES.contains(&"db-migrate"));
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert!(infra_service_bases(&root)
+            .expect("bases")
+            .contains(&"db-migrate".to_string()));
         assert!(
             build_targets(&root)
+                .expect("targets")
                 .iter()
                 .any(|(_, label)| label == "base: infra/services/db-migrate"),
             "db-migrate must be a build target"

@@ -38,6 +38,7 @@ pub mod knowledge_index;
 pub mod kustomize;
 pub mod kustomize_configmaps;
 pub mod kustomize_content_addressing;
+pub mod kustomize_resource_field_refs;
 pub mod kustomize_tools;
 pub mod media_telemetry_deny;
 pub mod metric_coverage;

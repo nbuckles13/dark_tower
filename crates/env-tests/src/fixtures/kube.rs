@@ -107,8 +107,14 @@ pub fn agree_on_generation(
     Ok(names.into_iter().next().expect("non-empty, checked above"))
 }
 
-/// `kubectl get pods -l instance=<instance> -o json`, parsed.
-fn live_pods_json(instance: &str) -> Value {
+/// `kubectl get pods -n dark-tower -l instance=<instance> -o json`, parsed.
+/// THE one pod-list call (also behind
+/// `deployment_config::fetch_live_pod`).
+///
+/// # Panics
+/// `kubectl` cannot run, fails, or prints unparseable output.
+#[must_use]
+pub fn live_pods_json(instance: &str) -> Value {
     let selector = format!("instance={instance}");
     let output = Command::new("kubectl")
         .args([

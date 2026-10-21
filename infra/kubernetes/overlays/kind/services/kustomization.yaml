@@ -6,6 +6,7 @@ resources:
   - gc-service/
   - mc-service/
   - mh-service/
+  - media-codec-profile/
   - otel-collector/
   - postgres/
   - redis/

@@ -290,6 +290,167 @@ pub fn generator_keys(
         .collect())
 }
 
+/// Is this kustomization a GENERATOR-ONLY base — at least one
+/// `configMapGenerator` entry and no `resources`? Such a base (e.g.
+/// `infra/services/media-codec-profile/`) owns a ConfigMap that workloads in
+/// OTHER bases consume; `env-config` resolves references to it cross-base and
+/// R-21 defers its per-base references to the environment root.
+///
+/// `resources:` absent, `resources:` (null) and `resources: []` all mean "no
+/// resources" — the spelling of an empty list must not move a base in or out of
+/// the shared index. Any other `resources` value (a non-empty list, or a
+/// non-list) means the base carries resources of its own.
+pub fn is_generator_only(doc: &Value) -> Result<bool> {
+    let has_resources = match doc.get("resources") {
+        None | Some(Value::Null) => false,
+        Some(Value::Sequence(seq)) => !seq.is_empty(),
+        Some(_) => true,
+    };
+    Ok(!has_resources && !config_map_generators(doc)?.is_empty())
+}
+
+/// One generator owned by a generator-only base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedGenerator {
+    /// The base directory name under `infra/services/`.
+    pub base: String,
+    /// Repo-relative path of the generator's first source file (its
+    /// kustomization when it has none) — where findings point.
+    pub source: PathBuf,
+    /// The data keys it generates, through [`generator_keys`].
+    pub keys: BTreeSet<String>,
+}
+
+/// A shared generator name declared by more than one base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousGenerator {
+    pub name: String,
+    /// Every base declaring the name, sorted.
+    pub bases: Vec<String>,
+}
+
+/// Generators owned by generator-only bases, by name — THE one answer to
+/// "which ConfigMap names may a workload reference across bases". Consumed by
+/// `env-config` (cross-base resolution, orphan detection) and `kustomize` R-21
+/// (per-base deferral to the environment root), so the two can never disagree
+/// about membership or about an ambiguous name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SharedGeneratorIndex {
+    /// Unambiguous shared generators only. An ambiguous name is NEVER here —
+    /// no consumer may resolve it (no last-wins, no union).
+    pub generators: BTreeMap<String, SharedGenerator>,
+    /// Shared names declared by two or more bases (two generator-only bases,
+    /// or a generator-only base and any other base). A hard error for
+    /// `env-config`; R-21 refuses to defer them.
+    pub ambiguous: Vec<AmbiguousGenerator>,
+    /// Every generator-only base, by directory name — recorded separately
+    /// because a base whose only generator name is ambiguous drops out of
+    /// `generators` but is still generator-only.
+    pub generator_only_bases: BTreeSet<String>,
+}
+
+/// The contents of `infra/services/<base>/kustomization.yaml`, read through
+/// the containment gate — `None` when the base has no kustomization (R-16
+/// reports that). THE one reader of a base's kustomization file.
+///
+/// # Errors
+/// The file resolves outside the repository, or cannot be read.
+pub fn read_base_kustomization(repo_root: &Path, base: &str) -> Result<Option<String>> {
+    let rel = format!(
+        "{}/{base}/kustomization.yaml",
+        crate::common::services::INFRA_SERVICES_DIR
+    );
+    if !repo_root.join(&rel).exists() {
+        return Ok(None);
+    }
+    let Some(path) = resolve_cited_path(repo_root, &rel) else {
+        bail!("{rel} resolves outside the repository; refusing to read it");
+    };
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {rel}"))
+        .map(Some)
+}
+
+/// Build the [`SharedGeneratorIndex`] over every base
+/// [`crate::common::services::infra_service_bases`] yields. Every kustomization
+/// is read through the containment gate; an unreadable or escaping one, an
+/// unparseable generator, or a generator-only base whose generator does not
+/// CREATE (merge/replace belong in overlays) is a hard error.
+pub fn shared_generator_index(repo_root: &Path) -> Result<SharedGeneratorIndex> {
+    use crate::common::services::{infra_service_bases, INFRA_SERVICES_DIR};
+    // name -> every base declaring it (any base), and the shared entries.
+    let mut declared_by: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut shared: BTreeMap<String, SharedGenerator> = BTreeMap::new();
+    let mut generator_only_bases: BTreeSet<String> = BTreeSet::new();
+    for base in infra_service_bases(repo_root)? {
+        let rel = format!("{INFRA_SERVICES_DIR}/{base}/kustomization.yaml");
+        let Some(content) = read_base_kustomization(repo_root, &base)? else {
+            continue; // R-16 reports a base without a kustomization.
+        };
+        let doc: Value =
+            serde_norway::from_str(&content).with_context(|| format!("parsing {rel}"))?;
+        let entries = config_map_generators(&doc).with_context(|| format!("reading {rel}"))?;
+        let generator_only = is_generator_only(&doc)?;
+        if generator_only {
+            generator_only_bases.insert(base.clone());
+        }
+        let kust_dir = repo_root.join(INFRA_SERVICES_DIR).join(&base);
+        for entry in entries {
+            declared_by
+                .entry(entry.name.clone())
+                .or_default()
+                .insert(base.clone());
+            if !generator_only {
+                continue;
+            }
+            if entry.behavior.as_deref().is_some_and(|b| b != "create") {
+                bail!(
+                    "{rel}: configMapGenerator {:?} uses behavior {:?}; a generator-only base must CREATE its ConfigMap",
+                    entry.name,
+                    entry.behavior
+                );
+            }
+            let keys = generator_keys(repo_root, &kust_dir, &entry)?;
+            let source = entry.source_paths().next().map_or_else(
+                || PathBuf::from(&rel),
+                |p| PathBuf::from(format!("{INFRA_SERVICES_DIR}/{base}/{p}")),
+            );
+            let dup = shared.insert(
+                entry.name.clone(),
+                SharedGenerator {
+                    base: base.clone(),
+                    source,
+                    keys,
+                },
+            );
+            if dup.is_some_and(|prev| prev.base == base) {
+                // Same name twice in ONE generator-only base: kustomize itself
+                // rejects that build; record it so the index stays honest.
+                declared_by
+                    .entry(entry.name.clone())
+                    .or_default()
+                    .insert(format!("{base} (declared twice)"));
+            }
+        }
+    }
+    let mut index = SharedGeneratorIndex {
+        generator_only_bases,
+        ..SharedGeneratorIndex::default()
+    };
+    for (name, generator) in shared {
+        let bases = declared_by.remove(&name).unwrap_or_default();
+        if bases.len() > 1 {
+            index.ambiguous.push(AmbiguousGenerator {
+                name,
+                bases: bases.into_iter().collect(),
+            });
+        } else {
+            index.generators.insert(name, generator);
+        }
+    }
+    Ok(index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +671,129 @@ configMapGenerator:
             ..e
         };
         assert!(generator_keys(td.path(), td.path(), &missing_file).is_err());
+    }
+
+    fn doc(y: &str) -> Value {
+        serde_norway::from_str(y).expect("yaml")
+    }
+
+    const GEN: &str = "configMapGenerator:\n  - name: shared\n    envs: [p.env]\n";
+
+    #[test]
+    fn generator_only_accepts_every_spelling_of_no_resources() {
+        assert!(is_generator_only(&doc(GEN)).expect("absent"));
+        assert!(is_generator_only(&doc(&format!("resources:\n{GEN}"))).expect("null"));
+        assert!(is_generator_only(&doc(&format!("resources: []\n{GEN}"))).expect("empty"));
+        assert!(!is_generator_only(&doc(&format!("resources:\n  - d.yaml\n{GEN}"))).expect("list"));
+        assert!(!is_generator_only(&doc(&format!("resources: d.yaml\n{GEN}"))).expect("scalar"));
+        assert!(!is_generator_only(&doc("resources: []\n")).expect("no generator"));
+    }
+
+    /// `(base, kustomization, &[(file, body)])` under a temp repo's infra/services.
+    type BaseSpec<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+    fn index_fixture(bases: &[BaseSpec<'_>]) -> tempfile::TempDir {
+        let td = tempfile::tempdir().expect("tempdir");
+        for (base, kust, files) in bases {
+            let dir = td.path().join("infra/services").join(base);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("kustomization.yaml"), kust).expect("write");
+            for (f, body) in *files {
+                std::fs::write(dir.join(f), body).expect("write");
+            }
+        }
+        td
+    }
+
+    #[test]
+    fn shared_index_holds_generator_only_bases_only() {
+        let td = index_fixture(&[
+            ("profile", GEN, &[("p.env", "K=v\n")]),
+            (
+                "svc",
+                "resources:\n  - d.yaml\nconfigMapGenerator:\n  - name: svc-config\n    envs: [c.env]\n",
+                &[("c.env", "A=1\n")],
+            ),
+        ]);
+        let idx = shared_generator_index(td.path()).expect("index");
+        assert!(idx.ambiguous.is_empty(), "{idx:?}");
+        assert_eq!(idx.generators.keys().collect::<Vec<_>>(), vec!["shared"]);
+        let g = &idx.generators["shared"];
+        assert_eq!(g.base, "profile");
+        assert_eq!(g.source, PathBuf::from("infra/services/profile/p.env"));
+        assert_eq!(g.keys.iter().collect::<Vec<_>>(), vec!["K"]);
+        assert_eq!(
+            idx.generator_only_bases.iter().collect::<Vec<_>>(),
+            vec!["profile"]
+        );
+    }
+
+    #[test]
+    fn shared_name_in_two_bases_is_ambiguous_never_last_wins() {
+        let td = index_fixture(&[
+            ("a-profile", GEN, &[("p.env", "K=v\n")]),
+            ("b-profile", GEN, &[("p.env", "J=v\n")]),
+        ]);
+        let idx = shared_generator_index(td.path()).expect("index");
+        assert!(
+            idx.generators.is_empty(),
+            "ambiguous name must not resolve: {idx:?}"
+        );
+        assert_eq!(
+            idx.generator_only_bases.len(),
+            2,
+            "still generator-only: {idx:?}"
+        );
+        assert_eq!(
+            idx.ambiguous,
+            vec![AmbiguousGenerator {
+                name: "shared".into(),
+                bases: vec!["a-profile".into(), "b-profile".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn shared_name_also_declared_by_a_workload_base_is_ambiguous() {
+        let td = index_fixture(&[
+            ("profile", GEN, &[("p.env", "K=v\n")]),
+            (
+                "svc",
+                "resources:\n  - d.yaml\nconfigMapGenerator:\n  - name: shared\n    envs: [c.env]\n",
+                &[("c.env", "A=1\n")],
+            ),
+        ]);
+        let idx = shared_generator_index(td.path()).expect("index");
+        assert!(idx.generators.is_empty());
+        assert_eq!(idx.ambiguous[0].bases, vec!["profile", "svc"]);
+    }
+
+    #[test]
+    fn shared_source_escaping_the_repo_is_an_error() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        let repo = outer.path().join("repo");
+        let dir = repo.join("infra/services/profile");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(outer.path().join("outside.env"), "K=v\n").expect("write");
+        std::fs::write(
+            dir.join("kustomization.yaml"),
+            "configMapGenerator:\n  - name: shared\n    envs: [../../../../outside.env]\n",
+        )
+        .expect("write");
+        let err = shared_generator_index(&repo).expect_err("escape");
+        assert!(
+            format!("{err:#}").contains("outside the repository"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn generator_only_base_must_create() {
+        let td = index_fixture(&[(
+            "profile",
+            "configMapGenerator:\n  - name: shared\n    behavior: merge\n    envs: [p.env]\n",
+            &[("p.env", "K=v\n")],
+        )]);
+        assert!(shared_generator_index(td.path()).is_err());
     }
 }

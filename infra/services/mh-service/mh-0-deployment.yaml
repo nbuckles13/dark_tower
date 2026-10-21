@@ -84,22 +84,24 @@ spec:
               key: MH_WEBTRANSPORT_BIND_ADDRESS
         # RETIRED — PENDING REMOVAL, and this reference is deliberately KEPT.
         # Since story 2 task 8's image, nothing reads MH_MAX_STREAMS.
-        # This ref stays anyway, as a cheap ordering discipline: the read goes
-        # one deploy before the key. Undo itself is safe either way while the
+        # The ref stays as a cheap ordering discipline: the read goes one
+        # deploy before the key. Undo itself is safe either way while the
         # previous hash-suffixed ConfigMap generation exists (ADR-0038 §2):
         # that generation holds every key its revision references. The
         # ordering protects a partial revert/apply, and a future move to a
         # stable ConfigMap name. It is NOT a defence against pruning; see
         # docs/runbooks/mh-deployment.md §Config-failure triage. The removal
-        # is itself two deploys (first flip this ref to `optional: true`, then
-        # delete key and refs together) — see
-        # docs/TODO.md §Media Path Obligations. Keep this identical in
-        # mh-0-deployment.yaml and mh-1-deployment.yaml.
+        # is two deploys. STEP 1 IS DONE (story 3): this ref is now
+        # `optional: true`. Step 2 deletes key and refs together, scheduled in
+        # docs/TODO.md §Media Path Obligations, "Delete the story-3 retired
+        # config keys". Keep this identical in mh-0-deployment.yaml and
+        # mh-1-deployment.yaml.
         - name: MH_MAX_STREAMS
           valueFrom:
             configMapKeyRef:
               name: mh-service-config
               key: MH_MAX_STREAMS
+              optional: true
         # QUIC transport parameters (ADR-0036 §1). Shared across both MH
         # instances, so they live in the shared ConfigMap; see the rationale
         # comments there. Both instances MUST reference all four: dt-guard
@@ -126,36 +128,46 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_MAX_CONNECTIONS
-        # Story-2 egress-budget chain (R-19, R-23). Rationale for every value
+        # Egress-budget chain (story 2 R-19, R-23). Rationale for every value
         # is in config.env, which is its single home. HARD references, NOT
-        # `optional:` — all six are required reads (four since story 2 task 8,
-        # the other two when tasks 10/11 land), so a key
+        # `optional:`, for every key an image reads or will read — a key
         # missing here must be a loud CreateContainerConfigError, never a pod
-        # that starts with a value nobody chose. `MH_MEDIA_LATENCY_SAMPLE_RATIO`
-        # below is the ONLY optional ref in this file, deliberately; do not
-        # copy that pattern here.
+        # that starts with a value nobody chose. The ONLY optional refs in this
+        # file are MH_MEDIA_LATENCY_SAMPLE_RATIO and the RETIRED keys (see the
+        # rule at MH_MEDIA_LATENCY_SAMPLE_RATIO below); do not copy that
+        # pattern for a live key.
         #
         # PER WORKLOAD, NEVER UNION: mh-0-deployment.yaml and
         # mh-1-deployment.yaml must carry the identical set. `dt-guard
-        # env-config` rule 1 checks per workload once the reads are required;
-        # until then the env-test in
-        # crates/env-tests/tests/01_mh_deployment_config.rs is what enforces
-        # both instances carry every key.
+        # env-config` rule 1 checks per workload; the env-test in
+        # crates/env-tests/tests/01_mh_deployment_config.rs checks the live
+        # pods.
         - name: MH_EGRESS_BUDGET_BPS
           valueFrom:
             configMapKeyRef:
               name: mh-service-config
               key: MH_EGRESS_BUDGET_BPS
+        # RETIRED — PENDING REMOVAL: MH_STREAM_COST_AUDIO_BPS,
+        # MH_STREAM_COST_VIDEO_BPS (superseded by the costs MH derives from
+        # media-codec-profile) and MH_MAX_MUTED_SOURCES_PER_MEETING (superseded
+        # by MH_MAX_SOURCE_STREAMS_PER_MEETING). Step 1 of the two-deploy
+        # retirement: `optional: true`, keys kept in mh-service-config. The
+        # current image still READS all three as required, so the flag
+        # loosens nothing until MH-A1 removes the reads; then a later deploy
+        # deletes keys and refs together (docs/TODO.md §Media Path
+        # Obligations, "Delete the story-3 retired config keys").
         - name: MH_STREAM_COST_AUDIO_BPS
           valueFrom:
             configMapKeyRef:
               name: mh-service-config
               key: MH_STREAM_COST_AUDIO_BPS
+              optional: true
         - name: MH_STREAM_COST_VIDEO_BPS
           valueFrom:
             configMapKeyRef:
               name: mh-service-config
               key: MH_STREAM_COST_VIDEO_BPS
+              optional: true
         - name: MH_EGRESS_REJECTION_RATIO_THRESHOLD
           valueFrom:
             configMapKeyRef:
@@ -171,6 +183,7 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_MAX_MUTED_SOURCES_PER_MEETING
+              optional: true
         # ADR-0036 §8 policy bounds (R-22): resource-exhaustion guards, never
         # capacity. REQUIRED reads since story 2 task 8 (no code default;
         # values equal the former defaults, so behaviour did not change at
@@ -195,8 +208,106 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_POLICY_APPLY_TIMEOUT_MS
-        # OPTIONAL AT THE MANIFEST LAYER TOO, deliberately — the only key in
-        # this file that is.
+        # Source-stream bound (story 3), replacing the retired muted bound.
+        # HARD ref: required read once MH-A1 lands; the current image ignores
+        # it. Same per-workload rule as above.
+        - name: MH_MAX_SOURCE_STREAMS_PER_MEETING
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MAX_SOURCE_STREAMS_PER_MEETING
+        # Video stream path and keyframe recovery (story 3 R-10..R-13, R-21).
+        # HARD refs: required reads once MH-A2 (stream opens, backlog, stall)
+        # and MH-B (retry, aggregation, recovery rate) land; the current image
+        # ignores them. Rationale and bounds: config.env.
+        - name: MH_KEYFRAME_REQUEST_RETRY_MS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_KEYFRAME_REQUEST_RETRY_MS
+        - name: MH_KEYFRAME_REQUEST_AGGREGATION_MS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_KEYFRAME_REQUEST_AGGREGATION_MS
+        - name: MH_RECOVERY_REQUESTS_PER_CONNECTION_PER_SEC
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_RECOVERY_REQUESTS_PER_CONNECTION_PER_SEC
+        - name: MH_STREAM_OPENS_PER_CONNECTION_PER_SEC
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_STREAM_OPENS_PER_CONNECTION_PER_SEC
+        - name: MH_EGRESS_STREAM_BACKLOG_BYTES
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_EGRESS_STREAM_BACKLOG_BYTES
+        - name: MH_STREAM_MID_FRAME_STALL_MS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_STREAM_MID_FRAME_STALL_MS
+        # Shared media codec profile (story 3 R-23, R-24): the five values MH
+        # reads from the SHARED `media-codec-profile` generator in the sibling
+        # base infra/services/media-codec-profile/ — their single home, also
+        # read by MC. MH derives both per-stream egress costs from the four
+        # bitrate/frame-rate keys (MH-A1) and validates
+        # MH_KEYFRAME_REQUEST_RETRY_MS against the minimum keyframe interval
+        # (MH-B). Kustomize rewrites this name to the generator's hashed name in
+        # the environment-root render, so a profile edit rolls mc-0, mc-1,
+        # mh-0 and mh-1 together — and an MH roll sheds every media session on
+        # the pod. HARD refs; the current image ignores them.
+        - name: MEDIA_VIDEO_MAX_BITRATE_BPS
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_VIDEO_MAX_BITRATE_BPS
+        - name: MEDIA_VIDEO_FRAME_RATE_HZ
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_VIDEO_FRAME_RATE_HZ
+        - name: MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS
+        - name: MEDIA_AUDIO_MAX_BITRATE_BPS
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_AUDIO_MAX_BITRATE_BPS
+        - name: MEDIA_AUDIO_FRAME_RATE_HZ
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_AUDIO_FRAME_RATE_HZ
+        # Pod memory limit, in bytes, via the DOWNWARD API — deliberately NOT
+        # a ConfigMap key, so the limit has exactly ONE home: this container's
+        # `resources.limits.memory` below. MH's boot-time memory check (from
+        # MH-A2: egress backlog cap x derived stream ceiling plus the
+        # receive-side bound x MH_MAX_CONNECTIONS within a fixed fraction of
+        # this) is therefore derived, never restated; MH-A2 logs the effective
+        # limit it read at startup. The current image ignores this variable.
+        #
+        # The limit MUST stay declared. If `resources.limits.memory` were
+        # absent, Kubernetes would silently resolve this variable to the
+        # NODE's allocatable memory and the check would pass vacuously —
+        # fail-open with no signal. `dt-guard kustomize` fails any
+        # resourceFieldRef whose container does not declare the referenced
+        # resource. `divisor: "1"` yields integer bytes.
+        - name: MH_POD_MEMORY_LIMIT_BYTES
+          valueFrom:
+            resourceFieldRef:
+              containerName: mh-service
+              resource: limits.memory
+              divisor: "1"
+        # OPTIONAL AT THE MANIFEST LAYER TOO, deliberately — the only LIVE key
+        # in this file that is (the retired keys are the other case; see the
+        # end of this comment).
         #
         # THE RULE, and it is NOT "required by config.rs": a hard
         # configMapKeyRef is correct when a missing key must be a LOUD STARTUP
@@ -210,13 +321,26 @@ spec:
         #
         # `optional: true` is correct only when the code default IS the intended
         # production behaviour AND decoupling the manifest rollback from the
-        # image rollback matters. Today that is this key alone: mh-service falls
+        # image rollback matters. Among LIVE keys that is this key alone:
+        # mh-service falls
         # back to DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO, which is the value we
         # want, and a hard reference would make the kubelet refuse to start the
         # container when the key is absent (CreateContainerConfigError), forcing
         # the deployment and the ConfigMap to roll back together — the
         # deploy-time coupling optional-with-default was chosen to avoid,
         # reintroduced one layer down.
+        #
+        # THE RETIRED KEYS ARE ALSO `optional: true` (MH_MAX_STREAMS,
+        # MH_STREAM_COST_*_BPS, MH_MAX_MUTED_SOURCES_PER_MEETING here, and
+        # MC_MAX_RECEIVE_SLOTS + MC_AUDIO_* in the MC Deployments), and that
+        # does NOT contradict "DO NOT flip them": the warning covers keys whose
+        # absence must be LOUD, and a key nothing reads (after its code task
+        # removes the read) cannot be loud. Until then the current images
+        # still read every one of them as REQUIRED (MissingEnvVar) — except
+        # MH_MAX_STREAMS, which is already unread — and the key stays present,
+        # so the flag loosens no bound: a key that vanished early would still
+        # fail the old image's startup loudly. It is step 1
+        # of the two-deploy retirement in docs/TODO.md.
         - name: MH_MEDIA_LATENCY_SAMPLE_RATIO
           valueFrom:
             configMapKeyRef:

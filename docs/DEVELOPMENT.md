@@ -490,9 +490,11 @@ See guard script comments and `docs/specialist-knowledge/security/` for the stan
      so correcting one block cannot silently falsify a total. NOTHING CHECKS
      ANY OF THESE; the status is as true as the date on it. Tracked in
      docs/TODO.md § Cross-Service Duplication (DRY).
-       - MH: CORRECTED 2026-09-23 — complete against its required set.
-       - MC: NON-FUNCTIONAL as written (measured 2026-08-28) — exits at
-         startup on its first MissingEnvVar.
+       - MH: CORRECTED 2026-09-23, extended 2026-10-20 (story 3) — complete
+         against its required set, plus the story-3 keys MH-A1/MH-A2/MH-B
+         make required (harmless to set before then).
+       - MC: CORRECTED 2026-10-20 (story 3) — complete against its required
+         set as of that date, plus the story-3 keys MC-A makes required.
        - GC: INCOMPLETE (measured 2026-08-28) — lacks GC_CLIENT_ID and
          GC_CLIENT_SECRET.
        - AC: complete (measured 2026-08-28).
@@ -613,14 +615,59 @@ export OTEL_COLLECTOR_ENDPOINT="http://localhost:4318"
 
 ### Meeting Controller
 
+<!-- ANCHOR (DRY): this block is COMPLETE against MC's required set as of
+     2026-10-20 — every ConfigError::MissingEnvVar in
+     crates/mc-service/src/config.rs::Config::from_vars() — plus the story-3
+     keys MC-A makes required (harmless to set before then). VALUES mirror
+     infra/services/mc-service/config.env (MC-only knobs) and
+     infra/services/media-codec-profile/profile.env (the nine shared MEDIA_*
+     encoding keys, also read by MH); those files are the single homes — if
+     they disagree, they win. The four RETIRED keys (MC_MAX_RECEIVE_SLOTS,
+     MC_AUDIO_*) are still REQUIRED by the current image and are kept until
+     MC-A removes the reads. -->
+
 ```bash
 export REDIS_URL="redis://:dev_password_change_in_production@localhost:6379"
-export RUST_LOG="info,meeting_controller=debug"
+# The log target is the crate name, mc_service (not "meeting_controller").
+export RUST_LOG="info,mc_service=debug"
 # MC reads MC_WEBTRANSPORT_BIND_ADDRESS, not the unprefixed BIND_ADDRESS (which it ignores).
 export MC_WEBTRANSPORT_BIND_ADDRESS="0.0.0.0:4433"
-export AC_CLIENT_ID="<from-service-registration>"
-export AC_CLIENT_SECRET="<from-service-registration>"
-export AC_URL="http://localhost:8082"
+# Advertised addresses (required). gRPC is what GC dials; WebTransport is what clients dial.
+export MC_GRPC_ADVERTISE_ADDRESS="http://localhost:50052"
+export MC_WEBTRANSPORT_ADVERTISE_ADDRESS="https://localhost:4433"
+# TLS for WebTransport (required). Generate with ./scripts/generate-dev-certs.sh.
+export MC_TLS_CERT_PATH="infra/docker/certs/mc-webtransport.crt"
+export MC_TLS_KEY_PATH="infra/docker/certs/mc-webtransport.key"
+# OAuth client credentials (required). MC reads MC_-prefixed names, NOT AC_CLIENT_ID/AC_CLIENT_SECRET.
+export MC_CLIENT_ID="meeting-controller"
+export MC_CLIENT_SECRET="<from-service-registration>"
+# Session binding token secret (required; base64).
+export MC_BINDING_TOKEN_SECRET="<generate: openssl rand -base64 32>"
+# AC endpoints (required). MC reads AC_ENDPOINT, NOT AC_URL.
+export AC_ENDPOINT="http://localhost:8082"
+export AC_JWKS_URL="http://localhost:8082/.well-known/jwks.json"
+# Client-facing media signalling (required).
+export MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS="64"
+export MC_KEK_ROTATION_DEBOUNCE_SECONDS="60"
+export MC_MEDIA_CONNECT_SETTLE_MS="1500"
+# Story 3 per-kind receive-slot caps (required once MC-A lands). Video 0 is the video-off lever.
+export MC_MAX_AUDIO_RECEIVE_SLOTS="8"
+export MC_MAX_VIDEO_RECEIVE_SLOTS="4"
+# Story 3 shared media codec profile (required once MC-A lands). Home: infra/services/media-codec-profile/profile.env.
+export MEDIA_VIDEO_CODEC="vp8"
+export MEDIA_VIDEO_WIDTH="640"
+export MEDIA_VIDEO_HEIGHT="360"
+export MEDIA_VIDEO_FRAME_RATE_HZ="30"
+export MEDIA_VIDEO_MAX_BITRATE_BPS="800000"
+export MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS="500"
+export MEDIA_AUDIO_CODEC="opus"
+export MEDIA_AUDIO_MAX_BITRATE_BPS="48000"
+export MEDIA_AUDIO_FRAME_RATE_HZ="50"
+# RETIRED — still required by the current image; removed with MC-A. Superseded by the caps and MEDIA_AUDIO_* above.
+export MC_MAX_RECEIVE_SLOTS="8"
+export MC_AUDIO_CODEC="opus"
+export MC_AUDIO_MAX_BITRATE_BPS="48000"
+export MC_AUDIO_FRAME_RATE_HZ="50"
 export OTLP_ENDPOINT="http://localhost:4317"
 export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean OTEL_ENABLED, NOT on OTLP_ENDPOINT being set;
 # leaving this "false" means OTLP_ENDPOINT above has no effect. Enabling needs a reachable collector
@@ -634,12 +681,17 @@ export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean
      crates/mh-service/src/config.rs::Config::from_vars() (which since story 2
      task 8 includes the four egress-budget keys and the four ADR-0036 §8
      bounds), plus MH_MAX_REGISTERED_MEETINGS and
-     MH_MAX_MUTED_SOURCES_PER_MEETING, which story 2 tasks 11 and 10 make
-     required (harmless to set before then). VALUES mirror
-     infra/services/mh-service/config.env (the budget mirrors the Kind
-     overlay's, so a local run is not starved); that file is the single home —
-     if they disagree, it wins. MH_MAX_STREAMS is deliberately absent: it is
-     retired and no longer read. -->
+     MH_MAX_MUTED_SOURCES_PER_MEETING (both now required), plus the story-3
+     keys MH-A1/MH-A2/MH-B make required (harmless to set before then). VALUES
+     mirror infra/services/mh-service/config.env (the budget mirrors the Kind
+     overlay's, so a local run is not starved) and, for the five MEDIA_* keys,
+     infra/services/media-codec-profile/profile.env; those files are the
+     single homes — if they disagree, they win. MH_POD_MEMORY_LIMIT_BYTES is
+     injected in-cluster by the downward API from resources.limits.memory (no
+     ConfigMap key); set it by hand for a local run. MH_MAX_STREAMS is
+     deliberately absent: it is retired and no longer read. The RETIRED
+     MH_STREAM_COST_* and MH_MAX_MUTED_SOURCES_PER_MEETING are still required by
+     the current image and are kept until MH-A1 removes the reads. -->
 
 ```bash
 # The log target is the crate name, mh_service (not "media_handler").
@@ -665,18 +717,38 @@ export MH_KEEPALIVE_INTERVAL_MS="10000"
 export MH_MAX_CONNECTIONS="500"
 # Drain window (required). In-cluster this is derived from the pod's grace period; locally, set it.
 export MH_TERMINATION_GRACE_SECONDS="35"
-# Story 2 egress-budget chain (required once the MH egress-budget code task lands).
+# Egress-budget chain (required).
 export MH_EGRESS_BUDGET_BPS="100000000"
-export MH_STREAM_COST_AUDIO_BPS="90000"
-export MH_STREAM_COST_VIDEO_BPS="2500000"
 export MH_EGRESS_REJECTION_RATIO_THRESHOLD="0.05"
 export MH_MAX_REGISTERED_MEETINGS="8192"
-export MH_MAX_MUTED_SOURCES_PER_MEETING="512"
-# ADR-0036 §8 policy bounds (required once the same code task lands).
+# ADR-0036 §8 policy bounds (required).
 export MH_MAX_EGRESS_STREAMS_PER_MEETING="512"
 export MH_MAX_CANDIDATE_SOURCES_PER_EGRESS="16"
 export MH_MAX_TOTAL_EGRESS_EDGES="65536"
 export MH_POLICY_APPLY_TIMEOUT_MS="1000"
+# Story 3 stream and keyframe keys (required once MH-A1 / MH-A2 / MH-B land).
+export MH_MAX_SOURCE_STREAMS_PER_MEETING="1024"
+export MH_KEYFRAME_REQUEST_RETRY_MS="500"
+export MH_KEYFRAME_REQUEST_AGGREGATION_MS="100"
+export MH_RECOVERY_REQUESTS_PER_CONNECTION_PER_SEC="20"
+export MH_STREAM_OPENS_PER_CONNECTION_PER_SEC="10"
+export MH_EGRESS_STREAM_BACKLOG_BYTES="262144"
+export MH_STREAM_MID_FRAME_STALL_MS="1000"
+# Pod memory limit in bytes (required once MH-A2 lands). In-cluster: downward API from
+# resources.limits.memory, never a ConfigMap key. Locally: the memory you allow the process.
+export MH_POD_MEMORY_LIMIT_BYTES="1073741824"
+# Story 3 shared media codec profile, the five keys MH reads (required once MH-A1 / MH-B land).
+# Home: infra/services/media-codec-profile/profile.env.
+export MEDIA_VIDEO_MAX_BITRATE_BPS="800000"
+export MEDIA_VIDEO_FRAME_RATE_HZ="30"
+export MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS="500"
+export MEDIA_AUDIO_MAX_BITRATE_BPS="48000"
+export MEDIA_AUDIO_FRAME_RATE_HZ="50"
+# RETIRED — still required by the current image; removed with MH-A1 (superseded by the derived costs
+# and MH_MAX_SOURCE_STREAMS_PER_MEETING).
+export MH_STREAM_COST_AUDIO_BPS="90000"
+export MH_STREAM_COST_VIDEO_BPS="2500000"
+export MH_MAX_MUTED_SOURCES_PER_MEETING="512"
 export OTLP_ENDPOINT="http://localhost:4317"
 export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean OTEL_ENABLED, NOT on OTLP_ENDPOINT being set;
 # leaving this "false" means OTLP_ENDPOINT above has no effect. Enabling needs a reachable collector

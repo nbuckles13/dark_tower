@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The shared media codec profile in the Kind environment. No patch today: Kind
+# runs the production profile. The Kind test profile (story 3 R-28) lands here
+# as ONE patch on `media-codec-profile`; removing that patch and redeploying is
+# how a demo gets production quality.
+resources:
+  - ../../../../../services/media-codec-profile
+
+labels:
+  - pairs:
+      environment: kind
+    includeSelectors: false
