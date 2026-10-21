@@ -186,9 +186,10 @@ Each layer collects every child `STATUS=` line that came across stdout via `_com
 
 ```
 STATUS=OK REASON=cargo-build-passed         (rust)
+STATUS=OK REASON=pnpm-peers-passed          (ts)
 STATUS=OK REASON=nx-typecheck-passed        (ts)
 STATUS=FAIL REASON=buf-build-failed         (proto, stage 1)
-→ aggregate_worst_status OK OK FAIL = FAIL
+→ aggregate_worst_status OK OK OK FAIL = FAIL
 → Layer 1 final STATUS=FAIL REASON=layer1-summary
 → exit code 1 (status_to_exit_code FAIL)
 ```
@@ -410,6 +411,7 @@ Both stages route through the dispatcher (`scripts/build.sh` → `_dispatch.sh::
 | `cargo-build-dt-guard-failed` | `lang/rust/compile.sh` | The `target/release/dt-guard` binary did not build. **Layer 3's guard wrappers consume it**, so this is the upstream cause of §8's "a missing guard binary reaches the implementer lane" caveat — fix here, not there. |
 | `cargo-build-dt-story-failed` | `lang/rust/compile.sh` | The `target/release/dt-story` binary did not build. Same consumer relationship as `dt-guard` above. |
 | `release-feature-gate-failed` | `scripts/release-feature-gate.test.sh` | The ADR-0036 §11 release-build gate self-test failed. **Five distinguishable causes and they do NOT share a fix — read the assertion label before triaging**, see the sub-table below. |
+| `pnpm-peers-failed` | `lang/ts/compile.sh` | `pnpm peers check` found an unmet peer in the installed graph — typically a partial bump of a family that cross-peers at exact versions (vitest + `@vitest/*`, PR #78). Runs before typecheck and ends the wrapper, so no `nx-typecheck-*` line follows. `strictPeerDependencies` (`pnpm-workspace.yaml`) only fires when pnpm resolves; a `--frozen-lockfile` install of a committed skewed lockfile reaches this check instead. Fix: bump every member of the family to the same version, `pnpm install`, then `pnpm peers check` locally (offline). |
 | `nx-typecheck-failed` | `lang/ts/compile.sh` | `tsc --noEmit` error reported via `nx run-many -t typecheck --all`. Run `pnpm exec nx run-many -t typecheck --all` locally. **The `nx affected` form is retired** (2026-08-20 always-run change) — an `--base=…` repro reproduces something the pipeline no longer runs. |
 | `nx: command not found` | `lang/ts/compile.sh` (also Layer 2 / 4 / 5 TS wrappers) | Local-only failure mode — CI has `corepack` / `pnpm install` in setup. Fix: `pnpm install` from repo root (nx is a project-local dev dep, not a global tool). |
 
@@ -441,6 +443,7 @@ expected and dominated by the workspace build, not by the release-feature gate.
 ```
 STATUS=FAIL REASON=buf-build-failed             (proto, stage 1; per-child stdout)
 STATUS=OK REASON=cargo-build-passed             (stage 2, rust — always-runs)
+STATUS=OK REASON=pnpm-peers-passed              (stage 2, ts — always-runs)
 STATUS=OK REASON=nx-typecheck-passed            (stage 2, ts — always-runs)
 STATUS=FAIL REASON=layer1-summary               (aggregated stdout summary line)
 LAYER=1 ... RESULT=FAIL REASON=buf-build-failed (stderr anchor; worst-child cause)

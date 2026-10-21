@@ -33,6 +33,27 @@ allowBuilds:
   msw: false
   nx: false
 
+# strictPeerDependencies: `pnpm install` FAILS (ERR_PNPM_PEER_DEP_ISSUES) on an unmet peer, instead of the
+# default's one-line warning. What it stops: a partial bump of a package family that cross-peers at EXACT
+# versions — PR #78 moved `vitest` to 5 and left `@vitest/browser`, `-browser-playwright` and `-coverage-v8`
+# on 4, which installed green with a warning and broke at test time. vitest and those three peer each other at
+# their exact version, so any skew in that family is an unmet peer here. Stated explicitly so the policy does
+# not depend on a default. LIMIT: it only fires when pnpm RESOLVES; `--frozen-lockfile` (CI) skips resolution,
+# so a committed skewed lockfile still installs. `pnpm peers check` in scripts/lang/ts/compile.sh covers that.
+strictPeerDependencies: true
+
+# catalog: a dependency that holds a PROCESS-GLOBAL singleton, so it must resolve to ONE copy across every
+# importer, where strictPeerDependencies cannot enforce that (its dependents peer it as a range). Membership is
+# that criterion, not "shared versions live here": typescript, vite, @types/node etc. are declared in several
+# manifests but hold no global, so they stay plain pins. Importers write `"<name>": "catalog:"`.
+#   @opentelemetry/api — the OTel API registry (Symbol.for('opentelemetry.js.api.1')); @opentelemetry/core peers
+#                        it as >=1.0.0 <1.10.0. sdk-svelte and web-app re-declare it ONLY because their test
+#                        bundles compile sdk-core SOURCE and @vitest/browser 5 excludes it from optimizeDeps, so it
+#                        must resolve from their own node_modules.
+# The vitest family is NOT here: it cross-peers at exact versions, so strictPeerDependencies enforces lockstep.
+catalog:
+  '@opentelemetry/api': 1.9.1
+
 # verifyDepsBeforeRun: `pnpm run` / `pnpm exec` REFUSE to run against a node_modules that
 # no longer matches the lockfile (ERR_PNPM_VERIFY_DEPS_BEFORE_RUN), instead of pnpm >= 11's
 # default of silently re-installing. Remedy: `pnpm install --frozen-lockfile`. The pipeline

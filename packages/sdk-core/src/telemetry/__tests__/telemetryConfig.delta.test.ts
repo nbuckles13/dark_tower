@@ -13,7 +13,11 @@
 // pass through exactly the renumbering regression that matters, so we build the
 // real exporter and ask it what it selects.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+// This file asserts the REAL exporter, so it opts out of the tier-wide no-op mock
+// (`otlpExporterSetup.ts`). It never configures telemetry or exports.
+vi.unmock('@opentelemetry/exporter-metrics-otlp-proto');
 import { AggregationTemporality, InstrumentType } from '@opentelemetry/sdk-metrics';
 
 import { createMetricExporter } from '../telemetryConfig.js';

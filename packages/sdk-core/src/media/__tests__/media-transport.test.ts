@@ -5,7 +5,7 @@
 // frames are decoded by stripping the reused 4-byte BE prefix.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { context, propagation, trace } from '@opentelemetry/api';
+import { context, trace } from '@opentelemetry/api';
 import { InMemoryMetricsSink, type MockWebTransport } from '@darktower/test-utils';
 
 import { MediaTransport } from '../MediaTransport.js';
@@ -15,9 +15,11 @@ import {
 } from '../../errors/MediaConnectionError.js';
 import {
   configureTelemetry,
+  getMeter,
   getTracer,
   resetTelemetryForTest,
 } from '../../telemetry/telemetryConfig.js';
+import { exportCalls } from '../../telemetry/__tests__/otlpExporterMock.js';
 import { decodeMhClientMessages, makeConnect, waitFor } from './helpers.js';
 
 const URL_A = 'https://mh-a.example:4433';
@@ -25,10 +27,8 @@ const URL_B = 'https://mh-b.example:4433';
 const URL_C = 'https://mh-c.example:4433';
 const JWT = 'meeting-jwt-value';
 
-afterEach(() => {
-  resetTelemetryForTest();
-  context.disable();
-  propagation.disable();
+afterEach(async () => {
+  await resetTelemetryForTest();
   vi.restoreAllMocks();
 });
 
@@ -458,5 +458,18 @@ describe('MediaTransport — datagram I/O (ADR-0036 §1, §11)', () => {
       [],
     );
     mt.disconnect();
+  });
+});
+
+describe('the unit tier never reaches a real OTLP exporter', () => {
+  // Positive control for the tier-wide mock (`setupFiles` -> otlpExporterSetup.ts):
+  // a dropped setup entry or a wrong module path would otherwise look exactly like
+  // "no egress, no error". This file has no mock of its own, so it proves the wiring.
+  it("resetTelemetryForTest's shutdown export lands on the shared mock", async () => {
+    configureTelemetry({ telemetryEndpoint: 'https://gc.example/api/v1/telemetry', env: 'test' });
+    getMeter()!.createCounter('reset_probe').add(1);
+    const before = exportCalls.length;
+    await resetTelemetryForTest();
+    expect(exportCalls.length).toBe(before + 1);
   });
 });

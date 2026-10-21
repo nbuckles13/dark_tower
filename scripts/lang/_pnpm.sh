@@ -18,6 +18,14 @@ pnpm_exec_unverified() {
   pnpm --config.verify-deps-before-run=false exec "$@"
 }
 
+# The nx output style every pipeline wrapper passes to `nx run-many` (lang/ts/{compile,lint,test,fmt}.sh).
+# nx >= 23.3 resolves its DEFAULT style to `summary` under an AI agent (isAiAgent()), which prints
+# "Re-run with --output-style=static to inline logs" in place of a failing task's output, so the
+# pipeline log loses the failure detail in agent shells only (CI is not an agent). One value, here,
+# so the wrappers cannot drift. fmt.sh APPLY pins its own style (it parses prettier's list).
+# shellcheck disable=SC2034  # consumed by the wrappers that source this file
+NX_PIPELINE_OUTPUT_STYLE='--output-style=static'
+
 # Is node_modules in step with the lockfile? Runs a no-op through `pnpm exec` with the
 # verify step ON. The decision is the exit status alone (pnpm's message is shown to the
 # operator, never matched on). A missing pnpm is checked first and named as such

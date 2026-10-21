@@ -134,6 +134,6 @@ The demo exposes a stable surface the test-owned Playwright specs consume:
 |--------|------|
 | `pnpm dev` | Vite dev server |
 | `pnpm build` | Production SPA build |
-| `pnpm test:component` | Vitest 4 Browser Mode (Chromium) component tests |
+| `pnpm test:component` | Vitest Browser Mode (Chromium) component tests |
 | `pnpm test:unit` | Node-tier prod bundle-content assertion (R-14) |
 | `pnpm lint` | svelte-check + eslint + prettier |

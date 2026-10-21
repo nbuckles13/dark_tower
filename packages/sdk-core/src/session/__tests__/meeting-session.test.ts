@@ -7,7 +7,6 @@
 // driven through a url→mock `connect` factory; AC/GC are a fake `fetch`.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { context, propagation } from '@opentelemetry/api';
 import {
   FakeAudioCodecs,
   FakeCaptureSource,
@@ -200,10 +199,8 @@ async function driveJoin(
   });
 }
 
-afterEach(() => {
-  resetTelemetryForTest();
-  context.disable();
-  propagation.disable();
+afterEach(async () => {
+  await resetTelemetryForTest();
   vi.restoreAllMocks();
 });
 

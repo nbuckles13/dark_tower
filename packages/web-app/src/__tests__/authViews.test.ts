@@ -106,5 +106,5 @@ test('sign-up surfaces AC 409 duplicate-email message verbatim', async () => {
 
   await expect
     .element(screen.getByTestId('last-error'))
-    .toHaveTextContent(/^AUTH: An account with this email already exists$/);
+    .toMatchTextContent(/^AUTH: An account with this email already exists$/);
 });

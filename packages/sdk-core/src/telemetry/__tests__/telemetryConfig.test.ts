@@ -1,26 +1,16 @@
 // File: packages/sdk-core/src/telemetry/__tests__/telemetryConfig.test.ts
 //
 // R-19/R-24: the single global providers + name-guard mode resolution. The
-// OTLP-proto exporter is MOCKED (OTel is externalized; the unit tier must not
-// open a real network exporter) so the provider-wiring lines execute and clear
-// the ≥90% branch gate (per @test's Gate-2 note that v8 branch coverage dips on
-// provider construction).
+// OTLP-proto exporter is MOCKED tier-wide (`otlpExporterSetup.ts`; the unit tier
+// must not open a real network exporter) so the provider-wiring lines execute and
+// clear the ≥90% branch gate (per @test's Gate-2 note that v8 branch coverage dips
+// on provider construction). The mock's `exporterCtor` captures constructor options.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AggregationTemporality } from '@opentelemetry/sdk-metrics';
+import { diag, DiagLogLevel, propagation } from '@opentelemetry/api';
 
-// Mock the OTLP exporter so no real exporter / network is constructed. Capture
-// the constructor options to assert the `/v1/metrics` endpoint suffix.
-const exporterCtor = vi.fn();
-vi.mock('@opentelemetry/exporter-metrics-otlp-proto', () => ({
-  OTLPMetricExporter: class {
-    constructor(opts: unknown) {
-      exporterCtor(opts);
-    }
-  },
-}));
-
-import { metrics, propagation, trace } from '@opentelemetry/api';
+import { exporterCtor, OTLPMetricExporter } from './otlpExporterMock.js';
 
 import {
   configureTelemetry,
@@ -35,10 +25,8 @@ describe('configureTelemetry', () => {
     exporterCtor.mockClear();
   });
 
-  afterEach(() => {
-    resetTelemetryForTest();
-    metrics.disable();
-    trace.disable();
+  afterEach(async () => {
+    await resetTelemetryForTest();
     vi.restoreAllMocks();
   });
 
@@ -118,5 +106,98 @@ describe('configureTelemetry', () => {
     expect(() =>
       sink.counter('dt_client_join_attempts_total', { status: 'success' }),
     ).not.toThrow();
+  });
+});
+
+// The 16 duplicate-registration lines this guards against (pre-existing until
+// 2026-10-21) are printed by vitest's `default` reporter only; the agent reporter
+// hides a passing test's console. So the guard is this assertion, not a log grep.
+describe('resetTelemetryForTest', () => {
+  afterEach(async () => {
+    await resetTelemetryForTest();
+  });
+
+  it('lets configureTelemetry run again with no duplicate global registration', async () => {
+    const error = vi.fn();
+    const logger = { error, warn: vi.fn(), info: vi.fn(), debug: vi.fn(), verbose: vi.fn() };
+    const endpoint = 'https://gc.example/api/v1/telemetry';
+    // `production` keeps configureTelemetry from replacing this logger with a console one.
+    diag.setLogger(logger, DiagLogLevel.ERROR);
+    configureTelemetry({ telemetryEndpoint: endpoint, env: 'production' });
+    await resetTelemetryForTest();
+    diag.setLogger(logger, DiagLogLevel.ERROR);
+    configureTelemetry({ telemetryEndpoint: endpoint, env: 'production' });
+
+    const messages = error.mock.calls.map((call) => String(call[0]));
+    expect(messages.filter((m) => m.includes('duplicate registration'))).toEqual([]);
+    expect(getTracer()).toBeDefined();
+  });
+
+  // Shutdown runs BEFORE any global is disabled, `diag` last, so a teardown failure
+  // stays visible. The two failure kinds surface differently (sdk-metrics 2.12): a
+  // rejecting exporter shutdown rejects the reset; a failed final export is reported
+  // through the global error handler, i.e. `diag`, which must still be live.
+  function errorLogger() {
+    const error = vi.fn();
+    diag.setLogger(
+      { error, warn: vi.fn(), info: vi.fn(), debug: vi.fn(), verbose: vi.fn() },
+      DiagLogLevel.ERROR,
+    );
+    return error;
+  }
+
+  it('a rejecting exporter shutdown rejects the reset AND still clears every global', async () => {
+    const endpoint = 'https://gc.example/api/v1/telemetry';
+    configureTelemetry({ telemetryEndpoint: endpoint, env: 'production' });
+    vi.spyOn(OTLPMetricExporter.prototype, 'shutdown').mockRejectedValueOnce(
+      new Error('shutdown boom'),
+    );
+    await expect(resetTelemetryForTest()).rejects.toThrow('shutdown boom');
+
+    // A failed teardown must not leave the globals registered: the next configure
+    // would otherwise reproduce the duplicate-registration cascade in every later test.
+    const error = errorLogger();
+    configureTelemetry({ telemetryEndpoint: endpoint, env: 'production' });
+    const messages = error.mock.calls.map((call) => String(call[0]));
+    expect(messages.filter((m) => m.includes('duplicate registration'))).toEqual([]);
+  });
+
+  // Non-production configure installs a DiagConsoleLogger; a reset that left it
+  // installed would print every later test's OTel diagnostics. DiagConsoleLogger
+  // binds the console at module load (a console spy cannot see it), so observe the
+  // registry instead: setting a logger over a still-registered one warns to the new
+  // logger. The control below proves that signal exists, so (a) cannot go vacuous.
+  function warnSpyLogger() {
+    const warn = vi.fn();
+    diag.setLogger(
+      { error: vi.fn(), warn, info: vi.fn(), debug: vi.fn(), verbose: vi.fn() },
+      DiagLogLevel.WARN,
+    );
+    return warn;
+  }
+
+  it("removes configureTelemetry's console diag logger", async () => {
+    configureTelemetry({ telemetryEndpoint: 'https://gc.example/api/v1/telemetry', env: 'test' });
+    await resetTelemetryForTest();
+    expect(warnSpyLogger()).not.toHaveBeenCalled();
+  });
+
+  it('control: without a reset, a new logger IS warned about the registered one', () => {
+    configureTelemetry({ telemetryEndpoint: 'https://gc.example/api/v1/telemetry', env: 'test' });
+    expect(warnSpyLogger()).toHaveBeenCalled();
+  });
+
+  it('a failed final export during the reset reaches diag', async () => {
+    configureTelemetry({
+      telemetryEndpoint: 'https://gc.example/api/v1/telemetry',
+      env: 'production',
+    });
+    const error = errorLogger();
+    getMeter()!.createCounter('reset_probe').add(1);
+    vi.spyOn(OTLPMetricExporter.prototype, 'export').mockImplementationOnce((_metrics, done) =>
+      done({ code: 1, error: new Error('export boom') } as never),
+    );
+    await resetTelemetryForTest();
+    expect(error.mock.calls.map((call) => String(call[0])).join('\n')).toContain('export boom');
   });
 });
