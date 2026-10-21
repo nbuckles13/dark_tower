@@ -491,8 +491,8 @@ See guard script comments and `docs/specialist-knowledge/security/` for the stan
      ANY OF THESE; the status is as true as the date on it. Tracked in
      docs/TODO.md § Cross-Service Duplication (DRY).
        - MH: CORRECTED 2026-09-23, extended 2026-10-20 (story 3) — complete
-         against its required set, plus the story-3 keys MH-A1/MH-A2/MH-B
-         make required (harmless to set before then).
+         against its required set, plus the story-3 keys MH-A1/MH-A2 make
+         required (MH-B adds none).
        - MC: CORRECTED 2026-10-20 (story 3) — complete against its required
          set as of that date, plus the story-3 keys MC-A makes required.
        - GC: INCOMPLETE (measured 2026-08-28) — lacks GC_CLIENT_ID and
@@ -682,9 +682,10 @@ export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean
      task 8 includes the four egress-budget keys and the four ADR-0036 §8
      bounds), plus MH_MAX_REGISTERED_MEETINGS and
      MH_MAX_SOURCE_STREAMS_PER_MEETING (both required), plus the story-3
-     keys MH-A1/MH-A2/MH-B make required (harmless to set before then). VALUES
+     stream keys MH-A1/MH-A2 make required (MH-B adds none: keyframe and
+     recovery requests have no keys). VALUES
      mirror infra/services/mh-service/config.env (the budget mirrors the Kind
-     overlay's, so a local run is not starved) and, for the five MEDIA_* keys,
+     overlay's, so a local run is not starved) and, for the four MEDIA_* keys,
      infra/services/media-codec-profile/profile.env; those files are the
      single homes — if they disagree, they win. MH_POD_MEMORY_LIMIT_BYTES is
      injected in-cluster by the downward API from resources.limits.memory (no
@@ -726,22 +727,18 @@ export MH_MAX_EGRESS_STREAMS_PER_MEETING="512"
 export MH_MAX_CANDIDATE_SOURCES_PER_EGRESS="16"
 export MH_MAX_TOTAL_EGRESS_EDGES="65536"
 export MH_POLICY_APPLY_TIMEOUT_MS="1000"
-# Story 3 stream and keyframe keys (required once MH-A1 / MH-A2 / MH-B land).
+# Story 3 stream keys (required since MH-A1 / MH-A2).
 export MH_MAX_SOURCE_STREAMS_PER_MEETING="1024"
-export MH_KEYFRAME_REQUEST_RETRY_MS="500"
-export MH_KEYFRAME_REQUEST_AGGREGATION_MS="100"
-export MH_RECOVERY_REQUESTS_PER_CONNECTION_PER_SEC="20"
 export MH_STREAM_OPENS_PER_CONNECTION_PER_SEC="10"
 export MH_EGRESS_STREAM_BACKLOG_BYTES="262144"
 export MH_STREAM_MID_FRAME_STALL_MS="1000"
 # Pod memory limit in bytes (required once MH-A2 lands). In-cluster: downward API from
 # resources.limits.memory, never a ConfigMap key. Locally: the memory you allow the process.
 export MH_POD_MEMORY_LIMIT_BYTES="1073741824"
-# Story 3 shared media codec profile, the five keys MH reads (required once MH-A1 / MH-B land).
+# Story 3 shared media codec profile, the four keys MH reads (required since MH-A1).
 # Home: infra/services/media-codec-profile/profile.env.
 export MEDIA_VIDEO_MAX_BITRATE_BPS="800000"
 export MEDIA_VIDEO_FRAME_RATE_HZ="30"
-export MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS="500"
 export MEDIA_AUDIO_MAX_BITRATE_BPS="48000"
 export MEDIA_AUDIO_FRAME_RATE_HZ="50"
 export OTLP_ENDPOINT="http://localhost:4317"

@@ -343,10 +343,11 @@ message EncodingParameters {
   uint32 height = 4;
   uint32 frame_rate = 5;
 
-  // The minimum interval between REQUEST-DRIVEN keyframes the publisher may
-  // produce on this stream, in milliseconds (story 3 R-11, R-23). There is no
-  // keyframe interval: keyframes are produced on demand (`KeyframeRequest`),
-  // and this is the bound on how often a request can be honoured.
+  // The minimum interval between keyframes the publisher may produce on this
+  // stream, in milliseconds (story 3 R-11, R-12, R-23). There is no keyframe
+  // interval: keyframes are produced on demand -- for a `KeyframeRequest`, or
+  // because a target has no group in progress (amendment 4) -- and this bounds
+  // both.
   //
   // VIDEO ONLY, AND REQUIRED ON VIDEO: a client REFUSES a video stream
   // directed without it. The client enforces max(directed value, its compiled
@@ -356,13 +357,12 @@ message EncodingParameters {
   //
   // THE SINGLE NORMATIVE HOME for its source: the shared `media-codec-profile`
   // key `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS` (range 100..=10000, default
-  // 500), read by MC AND MH -- not an MC-only key. MC directs it here and
-  // publishes the same parsed value as the gauge
-  // `mc_media_video_keyframe_min_interval_seconds`; MH reads it to validate
-  // `MH_KEYFRAME_REQUEST_RETRY_MS` (see `MhServerMessage`). It is
-  // server-configured, never client-reported: a client-reported value would let
-  // a patched client suppress the keyframe-storm alert. Other sites name the
-  // key and point here.
+  // 500), read by MC; MH does not read it (story 3 amendment 4). MC directs it
+  // here and publishes the same parsed value as the gauge
+  // `mc_media_video_keyframe_min_interval_seconds`. It is server-configured,
+  // never client-reported: a client-reported value would let a patched client
+  // suppress the keyframe-storm alert. Other sites name the key and point
+  // here.
   //
   // NOT IDENTITY OR KEY MATERIAL: a configuration value, safe to log.
   optional uint32 min_keyframe_interval_ms = 6;
@@ -1586,43 +1586,61 @@ message MhConnectRequest {
 // slots (story 3 R-13): the same counter-based request as `KeyframeRequest`,
 // client to MH instead of MH to client.
 //
-// Sent when a slot loses decodability (failed verify or decrypt, decoder
-// error, local drop, abandoned group). NOT a token-refresh or reconnect
-// variant: it carries no credential, and the read-once rule at
+// EVENT-DRIVEN (story 3 amendment 4). A receiver sends ONE request per loss
+// event: the first failure on a slot (failed verify or decrypt, decoder error,
+// local drop, abandoned group) at a given (`sender_id`, `gop_counter`).
+// Further failures at that same pair send nothing, so a decoder-error loop
+// cannot flood; there is no pacing timer and no retry. A stream reset before
+// any header is parsed has no failing frame and sends nothing: that slot,
+// like one receiving nothing from a new source, is MH's to recover (R-10,
+// R-12). The receiver keeps at most one queued, unsent request per slot; a
+// newer one replaces it.
+//
+// NOT a token-refresh or reconnect variant: it carries no credential, and the
+// read-once rule at
 // `dark_tower.internal.v1.NotifyParticipantConnectedRequest.participant_id` is
 // untouched by it.
 //
-// MH RULES (MH-B). Per-connection rate bound
-// `MH_RECOVERY_REQUESTS_PER_CONNECTION_PER_SEC`, applied before any parse or
-// work. MH resolves `slot_id` only within THIS subscriber connection's own
-// edges, then:
+// MH RULES (MH-B). Per message MH does a fixed-size parse and one lookup,
+// nothing else; volume is bounded by QUIC flow control. Undecodable, or a
+// post-connect body larger than MH's fixed parse buffer (sized for the
+// largest conforming envelope) -> `malformed`. MH resolves `slot_id` only
+// within THIS subscriber connection's own edges (unknown slot, or no
+// forwarding stream-per-group source -> `unmapped_slot`), then:
 //   - `sender_id` not the slot's current source sender -> `source_mismatch`;
-//   - `gop_counter` EQUAL to MH's newest counter for that source stream ->
-//     forwarded; LOWER -> `stale` (a newer group is already in flight);
-//     HIGHER -> `counter_ahead` (refused: MH never saw that group). No
+//   - `gop_counter` LOWER than MH's newest counter for that source stream ->
+//     `stale` (a newer group is already in flight); HIGHER, or MH has no
+//     counter for that source yet -> `counter_ahead` (refused: MH never saw
+//     that group); EQUAL and already
+//     requested for that (source stream, counter), by any receiver or by
+//     MH's own request -> `duplicate`; otherwise EQUAL -> forwarded. No
 //     clamping in either direction.
 // MH NEVER forwards this message verbatim: it re-sends upstream as its own
 // `KeyframeRequest`, with the source's `stream_number` and MH's newest
-// counter (fields are REMAPPED), aggregated to at most one per source stream
-// per `MH_KEYFRAME_REQUEST_AGGREGATION_MS` (default 100 ms). That 100 ms is a
-// different value from the client's compiled 100 ms keyframe floor
-// (`EncodingParameters.min_keyframe_interval_ms`); the two are unrelated and
-// MUST NOT share a constant.
+// counter (fields are REMAPPED). MH keeps ONE dedupe record per source
+// stream, shared with its own requests, so each (source stream, counter)
+// yields at most one upstream request; forwarded requests are therefore
+// bounded by groups produced, which the publisher's minimum interval bounds.
+// Dedupe is by counter, not by time: there is no aggregation window.
 message RecoveryRequest {
   // The receiver's DOWNLINK relay id: its own `ReceiveSlot.slot_id`, as MH
   // writes it into the relay region on this hop. Never a publisher stream
   // number.
   uint32 slot_id = 1;
 
-  // The sender the receiver believes holds that slot: the slot's
-  // signature-verified key-id sender. A STALENESS GUARD ONLY
-  // (`source_mismatch`): it narrows matching and is NEVER authority -- never
-  // used to choose a source or publisher, and never forwarded upstream. Zero
-  // never matches a source (`JoinResponse.sender_id`).
+  // The sender of the FAILING frame: the key-id sender from that frame's own
+  // header, never the last verified frame's (after a switch, that names the
+  // previous source). It MAY be unverified (e.g. the failure was a verify
+  // failure); that is bounded because MH forwards only on an exact counter
+  // match for the slot's current source, and `source_mismatch` catches the
+  // rest. A STALENESS GUARD ONLY (`source_mismatch`): it narrows matching and
+  // is NEVER authority -- never used to choose a source or publisher, and
+  // never forwarded upstream. Zero never matches a source
+  // (`JoinResponse.sender_id`).
   uint32 sender_id = 2;
 
-  // The newest GoP counter the receiver has seen on that slot. 0 is legal
-  // (a sender's first group).
+  // The `gop_counter` from the failing frame's own header (the same frame as
+  // `sender_id`). 0 is legal (a sender's first group).
   uint32 gop_counter = 3;
 }
 
@@ -1664,13 +1682,31 @@ message MhClientMessage {
 // requests are counted by reason. A compromised MH can therefore at most drive
 // a publisher's keyframes at that bound.
 //
-// MH RULES (MH-B). MH requests only after it has received at least one frame
-// from that source stream, carrying the newest counter it has seen, and
-// retries every `MH_KEYFRAME_REQUEST_RETRY_MS` (default 500, range 100..=10000)
-// until a group start arrives. MH refuses to boot unless that retry is at
-// least `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS` (fail closed; a faster retry is
-// wasted). Every request MH sends, its own or a remapped `RecoveryRequest`,
-// passes one per-source-stream aggregator.
+// SELF-KEYING (story 3 amendment 4, R-12). Separately from requests, the
+// publisher keys whenever a target has no group in progress: a directed
+// start, a target added to an active stream, and abandonment of that target
+// by the publisher's own per-target backlog cap. There is one encoder, so
+// that keyframe reaches every target of the stream; it is under the same
+// bound and the same single deferral, never dropped. WHOEVER DECIDES AN
+// ABANDONMENT REPAIRS IT: the publisher does NOT re-key for a stream MH
+// refused or stopped (STOP_SENDING: ingress refusal, stream-open limit); MH
+// repairs that by request when it wants the source again. Otherwise a refused
+// stream would loop at the minimum interval.
+//
+// MH RULES (MH-B). MH requests only for a source stream it has received at
+// least one frame from: it needs the counter, and an unseen source needs no
+// request, since the publisher keys every target with no group in progress.
+// The request carries MH's NEWEST counter for that stream: the HIGHEST
+// `gop_counter` read from any of its frame headers (the counter never wraps,
+// ADR-0036 §2) -- forwarded, muted, unrouted or paused frames alike, and a
+// stream MH stopped after reading its header -- not the last one read (a late
+// frame of group N can arrive after group N+1's header). MH sends AT MOST ONE
+// request per (source stream, counter) and NEVER retries: the request rides a
+// reliable stream, so repeating a counter achieves nothing, and a later loss
+// is a new event with a newer counter. MH's own requests and remapped
+// `RecoveryRequest`s share one dedupe record per source stream. MH keeps at
+// most one queued, unsent request per stream (a newer one replaces it); a
+// failed write is counted, not re-sent.
 message KeyframeRequest {
   // The publisher's UPLINK relay id for the stream to key: MC's send id,
   // `SendStream.stream_number` (the SSoT). NOT a slot id.

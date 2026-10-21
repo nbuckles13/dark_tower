@@ -269,8 +269,9 @@ async fn the_mid_frame_stall_reset_fires_at_the_bound() {
             .with_labels(&[("reason", "partial_frame_discard")])
             .assert_delta(0);
     }
-    // Mid-HEADER: partial_frame_discard (the frame never reached
-    // forwarded{ingress}).
+    // Mid-HEADER of the stream's FIRST frame: NO stall bound (story 3
+    // amendment 4 — nothing has been forwarded; the declared QUIC
+    // concurrent-stream limit bounds headerless streams).
     {
         let metrics = MetricAssertion::snapshot();
         let mut rig = StreamRig::new(&policy(1, &[6]), limits(1 << 20, STALL_MS));
@@ -279,21 +280,42 @@ async fn the_mid_frame_stall_reset_fires_at_the_bound() {
         let inbound = publisher.push_inbound_uni();
         inbound.push(big_frame(1, 0, true, 40).slice(..5));
         settle().await;
+        advance(Duration::from_millis(STALL_MS * 100)).await;
+        settle().await;
+        assert_eq!(inbound.stopped(), None, "a headerless stream never stalls");
+        assert_only_resets(&metrics, GroupResetReason::PublisherStall, 0);
+        // Positive control: the same stream, once its header completes and a
+        // tail is pending, IS stall-bounded.
+        inbound.push(big_frame(1, 0, true, 40).slice(5..60));
+        settle().await;
+        advance(Duration::from_millis(STALL_MS)).await;
+        settle().await;
+        assert_eq!(inbound.stopped(), Some(INGRESS_REFUSED));
+    }
+    // Mid-HEADER of a LATER frame (downstream open): still bounded —
+    // publisher_stall downstream and partial_frame_discard.
+    {
+        let metrics = MetricAssertion::snapshot();
+        let mut rig = StreamRig::new(&policy(1, &[6]), limits(1 << 20, STALL_MS));
+        let publisher = rig.publisher(5);
+        let subscriber = rig.subscriber(6);
+        let inbound = publisher.push_inbound_uni();
+        inbound.push(big_frame(1, 0, true, 400));
+        inbound.push(big_frame(2, 0, false, 40).slice(..5));
+        settle().await;
         advance(Duration::from_millis(STALL_MS)).await;
         settle().await;
         assert_eq!(
             inbound.stopped(),
             Some(INGRESS_REFUSED),
-            "a 5-byte slowloris is bounded"
+            "a 5-byte slowloris on frame 2 is bounded"
         );
+        assert!(subscriber.egress_uni_streams()[0].terminal().is_reset());
+        assert_only_resets(&metrics, GroupResetReason::PublisherStall, 1);
         metrics
             .counter(DROPPED)
             .with_labels(&[("reason", "partial_frame_discard")])
             .assert_delta(1);
-        metrics
-            .counter("mh_media_frames_forwarded_total")
-            .with_labels(&[("direction", "ingress")])
-            .assert_delta(0);
     }
     // Slow but progressing: a chunk every bound - 1 ms, total far past the
     // bound — never reset (the timer re-arms on progress).
@@ -496,10 +518,11 @@ async fn an_aborted_mid_header_group_counts_partial_frame_discard() {
         .assert_delta(1);
 }
 
-/// The creation-rate cap: N admitted, the N+1th refused before a byte is read
-/// (stopped, `stream_rate_limited`), admitted again after a second.
+/// The creation-rate cap: N admitted; the N+1th has ONLY its header read
+/// (its counter recorded — story 3 amendment 4), then is stopped and counted
+/// `stream_rate_limited` once; admitted again after a second.
 #[tokio::test(start_paused = true)]
-async fn the_stream_open_rate_limit_refuses_before_reading() {
+async fn the_stream_open_rate_limit_reads_the_header_then_refuses() {
     let metrics = MetricAssertion::snapshot();
     let n = 3_u32;
     let mut limits = limits(1 << 20, STALL_MS);
@@ -514,18 +537,27 @@ async fn the_stream_open_rate_limit_refuses_before_reading() {
         admitted.push(s);
     }
     let refused = publisher.push_inbound_uni();
-    refused.push(concat(&stream_group(1, 0, UPLINK_VIDEO_SEND_ID, 0)));
+    let refused_group = concat(&stream_group(9, 7, UPLINK_VIDEO_SEND_ID, 3));
+    refused.push(refused_group.clone());
     settle().await;
     assert!(admitted.iter().all(|s| s.stopped().is_none()));
     assert_eq!(refused.stopped(), Some(INGRESS_REFUSED));
-    assert_eq!(refused.bytes_read(), 0, "refused before a byte was read");
+    let read = usize::try_from(refused.bytes_read()).unwrap();
+    assert!(read > 0, "the header was read");
+    assert!(read < refused_group.len(), "the rest of the group was not");
+    let video = mh_service::routing::StreamNumber::from_wire(1).unwrap();
+    assert_eq!(
+        rig.keyframes(5).unwrap().newest(video),
+        Some(7),
+        "the refused group's counter is recorded"
+    );
     metrics
         .counter(DROPPED)
         .with_labels(&[("reason", "stream_rate_limited")])
         .assert_delta(1);
     advance(Duration::from_secs(1)).await;
     let later = publisher.push_inbound_uni();
-    later.push(concat(&stream_group(1, 0, UPLINK_VIDEO_SEND_ID, 0)));
+    later.push(concat(&stream_group(1, 8, UPLINK_VIDEO_SEND_ID, 0)));
     settle().await;
     assert_eq!(later.stopped(), None, "admitted again after a second");
     assert!(later.bytes_read() > 0);
@@ -559,10 +591,11 @@ async fn the_ingress_groups_gauge_returns_to_zero_on_every_exit() {
         let _subscriber = rig.subscriber(6);
         let frame = big_frame(1, 0, true, 400);
         let refused = matches!(exit, Exit::Refused);
-        let first = if refused {
-            concat(&stream_group(1, 0, 9, 0))
-        } else {
-            frame.slice(..5)
+        let first = match exit {
+            Exit::Refused => concat(&stream_group(1, 0, 9, 0)),
+            // The stall bound is armed only once the first header completed.
+            Exit::Stall => frame.slice(..200),
+            _ => frame.slice(..5),
         };
         let inbound = publisher.push_inbound_uni();
         inbound.push(first);

@@ -929,7 +929,7 @@ sender; none is a bug on its own.
 | `egress_queue_overflow` | egress | MH's bounded egress ring shed its oldest frame. | A slow subscriber. **This is expected load shedding**, not a fault; read the blind-spot note below before concluding anything from its level. |
 | `connection_closed` | egress | The subscriber's connection — or, on the stream path, its downlink STREAM (a peer `STOP_SENDING`, or `open_uni` failing) — closed mid-flight. On the stream path it is counted on the frame that DISCOVERS the dead downlink (that frame is not pushed, so it is never also `forwarded{egress}`); the edge then waits for the next group start. | **Routine** — a participant leaves every meeting, many times. A *spike* is real signal (a client-side crash loop, a network event); a steady trickle is normal. Deliberately split from `transport_send_refused` so that counter stays alertable. |
 | `oversize_datagram` | ingress | The received datagram's byte length exceeded the wire-format frame maximum, rejected before any parse. | A sender build defect or a hostile peer. **Not** the codec's `payload_length_exceeds_max`, which is the declared *field* exceeding the max during header validation — same constant, two checks, two tokens, and the distinction tells you whether anything was parsed at all. |
-| `stream_rate_limited` | ingress | A publisher connection exceeded `MH_STREAM_OPENS_PER_CONNECTION_PER_SEC` (a token bucket, burst = rate), enforced at accept BEFORE a byte of the stream is read; the stream is `STOP_SENDING`'d. **Live since story 3 MH-A2.** | **One increment per refused STREAM on a frames counter: a LOWER BOUND on frames lost** (a group's frames are never read). A real publisher opens one stream per keyframe; a sustained rate means a client churning group streams (a defect or a hostile peer), never load. |
+| `stream_rate_limited` | ingress | A publisher connection exceeded `MH_STREAM_OPENS_PER_CONNECTION_PER_SEC` (a token bucket, burst = rate), enforced at accept. The over-limit stream has ONLY its header prefix read — its GoP counter recorded so MH repairs that source by keyframe request (story 3 amendment 4: the publisher does not re-key for MH's refusal) — then is `STOP_SENDING`'d. A malformed header is stopped without a counter and gets no repair; still counted here once. **Live since story 3 MH-A2; header read since MH-B.** | **One increment per refused STREAM on a frames counter: a LOWER BOUND on frames lost** (a group's frames are never read). A real publisher opens one stream per keyframe; a sustained rate means a client churning group streams (a defect or a hostile peer), never load. |
 | `partial_frame_discard` | ingress | A publisher's group stream ended — FIN, `RESET_STREAM`, a mid-frame stall, or its connection closing — while a frame HEADER was partly buffered. **Live since story 3 MH-A2; re-classified from egress to INGRESS** there: that frame never reached `forwarded{ingress}` (counted at header completion), so this term keeps the stream path's ingress identity whole. A stream ending mid-PAYLOAD does not count here (the frame was already forwarded); its downstream streams reset, on `mh_media_group_resets_total`. It counts on EVERY non-clean end, MH's own abort (connection teardown, shutdown) included: a publisher disconnect reaches the group as a read error or as an abort, decided by scheduling, and one event must not have two counts — at most one per live group per teardown. | A sender fault or a lossy uplink. A steady trickle alongside `publisher_reset`/`publisher_stall` resets is a client abandoning groups mid-frame. |
 | `no_policy` | ingress | No forwarding policy is installed for this meeting. | **The remedy is the control plane, not this handler.** Read `mh_media_policy_applies_total` and MC's `mc_media_policy_pushes_total`. |
 | `no_subscriber` | egress | A policy is installed and the frame was attributed to a declared source stream, but no egress edge names THAT source stream (story 3: the index is per (sender, stream), so a watched sender's unwatched other stream lands here). | A short in-flight tail after a sender's last subscriber leaves is healthy. **Sustained** means the client is sending against an empty edge set: MC's directive and MH's policy disagree (MC's assignment and push path), or they agree and the client is ignoring its directive (stale bundle or hostile participant). A solo participant produces NONE: MC directs it to send nothing (see above). |
@@ -1226,9 +1226,9 @@ group start. Accounting rules a responder needs before reading any panel:
 
 | `reason` | Condition | What a responder does |
 |---|---|---|
-| `subscriber_backlog` | The destination's backlog (`MH_EGRESS_STREAM_BACKLOG_BYTES`, per destination) overflowed, its writer fell two groups behind, or its downlink channel was full. | A slow subscriber path. Recovery is the next hop's keyframe request; repeated resets on one path below the fixed bitrate are accepted in story 3. |
+| `subscriber_backlog` | The destination's backlog (`MH_EGRESS_STREAM_BACKLOG_BYTES`, per destination) overflowed, its writer fell two groups behind, or its downlink channel was full. | A slow subscriber path. Recovery is MH's own keyframe request, once per (source stream, counter) via the edge's Waiting state (`mh_media_keyframe_requests_sent_total{trigger="initial"}`); repeated resets on one path below the fixed bitrate are accepted in story 3. |
 | `publisher_reset` | The publisher's group ended mid-group for a **publisher-side** reason: `RESET_STREAM`, a FIN that truncates the frame in flight, or MH refusing the rest of the group for a sender fault (that fault is counted on `mh_media_frames_dropped_total` by its own token). | The publisher side, never "the client reset its stream" alone — read the drop tokens first. A refusal on a stream's FIRST frame resets nothing (nothing downstream exists yet). |
-| `publisher_stall` | The publisher sat mid-frame (mid-header or mid-payload) with no progress past `MH_STREAM_MID_FRAME_STALL_MS`; the ingress stream is also stopped. | A stalled or slowloris publisher. An inactivity bound: a trickling publisher keeps its own frame open, harming only its own media. |
+| `publisher_stall` | The publisher sat mid-frame (mid-header or mid-payload) with no progress past `MH_STREAM_MID_FRAME_STALL_MS`; the ingress stream is also stopped. Armed only once the stream's FIRST header has completed (story 3 amendment 4): a stream that has never completed a header has forwarded nothing and is bounded by the declared concurrent-stream limit instead. | A stalled or slowloris publisher. An inactivity bound: a trickling publisher keeps its own frame open, harming only its own media. |
 | `source_ended` | The forwarded source ended: its publisher's connection closed (or MH shut the group down), or MC stopped declaring the stream. | Routine on leave. |
 | `edge_removed` | MC removed the edge mid-group, or `EndMeeting` released the meeting. | Routine on reassignment. |
 
@@ -1273,6 +1273,102 @@ group start. Accounting rules a responder needs before reading any panel:
 - **Usage**: A client sending on a stream MC believes is client-muted. Expected briefly around a mute toggle (in-flight frames, a resume that beats MC's update); SUSTAINED is a client privacy defect (sending while muted) — runbook and alert owned by OPS-B / OBS-B.
 - **Recorded in**: `observability/metrics.rs::MediaMetricHandles::paused_source_frames` (resolved once at setup; incremented in `media/forward.rs`)
 - **Dashboard**: MH Media - Paused-Source Arrivals
+
+### On-demand keyframes and recovery (story 3 MH-B)
+
+Keyframes are event-driven (story 3 amendment 4; ADR-0036 §1/§7 amendments of
+2026-10-21). MH requests one from a publisher at most once per (source stream,
+GoP counter) and NEVER retries; a receiver's `RecoveryRequest` is remapped to
+the slot's source and deduped against the SAME per-source record. "Pending" —
+an edge waiting for a group start — exists only in the series below; nothing
+retries, so a stuck pending edge is a MISSING EVENT (a keyframe or request
+someone owed), never a slow retry. All series are pod-level and type-blind: no
+kind, slot, sender, stream number, counter value or request timing in any
+label, log or span.
+
+### `mh_media_keyframe_requests_sent_total`
+- **Type**: Counter
+- **Description**: `KeyframeRequest`s actually WRITTEN to a publisher's control stream, after the once-per-(source stream, counter) dedupe and the newest-only queue replacement. A queued request replaced by a newer one, or discarded (group start, edge removal, PAUSED, DROP_AT_INGRESS, unbind), is never counted.
+- **Labels**:
+  - `trigger`: `initial` — EVERY MH-originated request: an edge waiting for a group start from a source MH has seen, whether a first join, a source switch, a subscriber connecting, recovery after ANY abandonment (MH's backlog reset, a propagated publisher reset, a stall) or the repair of a group MH refused at the stream-open limit. Not "first join only". | `receiver_recovery` — a receiver's `RecoveryRequest`, remapped and forwarded.
+  - `key_custody`: `operator`
+- **Cardinality**: Low (2)
+- **Usage**: Keyframe demand MH places on publishers. Bounded per source stream by groups produced (one request per counter), which the publisher's minimum interval bounds.
+- **Recorded in**: `media/keyframe.rs::run_keyframe_writer` (handles resolved once at setup)
+- **Dashboard**: MH Media - Keyframe Requests Sent
+
+### `mh_media_keyframe_request_write_failures_total`
+- **Expected-empty**: yes on a healthy fleet
+- **Type**: Counter
+- **Description**: Keyframe requests NEVER DELIVERED to a publisher: a failed control-stream write, plus every request counted at once after that publisher's control stream failed (the writer stops; nothing queues forever). A failed request is never re-emitted.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: A publisher whose control stream is gone while its media continues — its subscribers recover only through the publisher's own self-keying. Sustained: a client defect.
+- **Recorded in**: `media/keyframe.rs` (writer and `PublisherKeyframes::request`)
+- **Dashboard**: MH Media - Keyframe Request Write Failures
+
+### `mh_media_recovery_requests_received_total`
+- **Type**: Counter
+- **Description**: Post-connect control-stream messages from subscriber connections, one outcome each (a framing break counts once; an end of stream is not a message). Per message MH does a fixed-size parse and one lookup; volume is bounded by QUIC flow control.
+- **Labels**:
+  - `outcome`: `forwarded` | `duplicate` | `stale` | `counter_ahead` | `source_mismatch` | `unmapped_slot` | `malformed`
+  - `key_custody`: `operator`
+- **Cardinality**: Low (7)
+- **Recorded in**: `media/keyframe.rs::serve_control_message`
+- **Dashboard**: MH Media - Recovery Requests by Outcome
+
+| `outcome` | Condition |
+|---|---|
+| `forwarded` | Counter EQUAL to MH's newest for the slot's source and not yet requested: ACCEPTED for forwarding (one upstream `KeyframeRequest` with MH's own fields handed to the publisher's outbox). Delivery is counted on `mh_media_keyframe_requests_sent_total{trigger="receiver_recovery"}`. A request a newer one replaced in the queue, or one counted on `mh_media_keyframe_request_write_failures_total` because the publisher's control stream had already failed, is still `forwarded` here — so `forwarded` >= `sent{receiver_recovery}`, the gap being replaced plus undeliverable requests. |
+| `duplicate` | Equal, but that (source stream, counter) was already requested — by any receiver or by MH itself. Expected when several receivers lose the same group. |
+| `stale` | Lower than MH's newest: a newer group is already in flight. |
+| `counter_ahead` | Higher than MH's newest, or MH has no counter for the source yet: MH never saw that group. Refused. |
+| `source_mismatch` | `sender_id` is not the slot's CURRENT ASSIGNED source (normal briefly around a switch). |
+| `unmapped_slot` | Not one of this connection's stream-per-group slots with a FORWARD source (unknown slot, an audio/datagram slot, a paused or muted source). |
+| `malformed` | Undecodable, not a `RecoveryRequest` (a second `connect_request` included — it never re-authenticates), oversize, or a length prefix of 0 / above the bound (control reading then stops; the connection is kept). |
+
+### `mh_media_edges_pending`
+- **Type**: Gauge (tick-sampled)
+- **Description**: Stream edges PENDING right now, pod-wide: a stream-per-group edge whose subscriber is connected to this handler, waiting for a group start (Waiting, or a pending switch) from an assigned FORWARD source whose publisher is connected to this handler — seen or not, so a never-sending source counts. Sampled every 10 s by the session actor (the single writer) from per-edge entry stamps; never per frame. Present at 0 from boot. **Blind spot:** an edge whose assigned publisher is NOT connected to this handler (never connected, or never reconnected after leaving) is not pending at all, so "0 pending" does not mean every assigned slot is fed — that case shows on the client's unfulfilled-slot series (R-30: `dt_client_media_slots_unfulfilled` / `dt_client_media_slot_unfulfilled_duration_ms`, slots MC reports live that show neither video nor an avatar).
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Recorded in**: `routing/mod.rs::RoutingTable::publish_pending`, called from the `session/mod.rs` rotation tick (handles resolved once at setup)
+- **Dashboard**: MH Media - Pending Edges
+
+### `mh_media_edge_pending_oldest_seconds`
+- **Type**: Gauge (tick-sampled)
+- **Description**: Age of the OLDEST pending edge on the pod (max), in seconds, on the injected clock; 0 when nothing is pending. Same sampler as `mh_media_edges_pending`. Present at 0 from boot. The stuck-pending alert (OBS-B) reads this; its threshold is OBS-B's, and no longer derives from a retry interval (there is none). Same blind spot as `mh_media_edges_pending`: a slot whose publisher is absent from this handler is excluded (see the client's unfulfilled-slot series).
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Recorded in**: `routing/mod.rs::RoutingTable::publish_pending`, called from the `session/mod.rs` rotation tick (handles resolved once at setup)
+- **Dashboard**: MH Media - Oldest Pending Edge
+
+### `mh_media_edge_pending_duration_seconds`
+- **Type**: Histogram
+- **Description**: How long each pending episode lasted, observed once at its exit (same instant and same exit as `mh_media_edge_pending_exits_total`). Observed AT EXIT ONLY: an edge still stuck pending appears here only once it exits — read `mh_media_edge_pending_oldest_seconds` for it.
+- **Labels**: `key_custody`: `operator`
+- **Recorded in**: `media/edge_runtime.rs::StreamEdge::end_pending`, via `settle` / `release` / reconcile (handles resolved once at setup)
+- **Buckets**: 50 ms → 300 s (`[0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300]`), past 10 × the 10 000 ms maximum keyframe interval.
+- **Cardinality**: 1 series × bucket count
+- **Dashboard**: MH Media - Pending Duration
+
+### `mh_media_edge_pending_exits_total`
+- **Type**: Counter
+- **Description**: Pending episodes ended, exactly one per exit; `sum` over outcomes equals `mh_media_edge_pending_duration_seconds_count`.
+- **Recorded in**: `media/edge_runtime.rs::StreamEdge::end_pending`, via `settle` / `release` / reconcile (handles resolved once at setup)
+- **Labels**:
+  - `outcome`: `group_start` | `abandoned_source_left` | `superseded` | `paused_forward_nothing` | `edge_removed`
+  - `key_custody`: `operator`
+- **Cardinality**: Low (5)
+- **Dashboard**: MH Media - Pending Exits by Outcome
+
+| `outcome` | Condition |
+|---|---|
+| `group_start` | The wanted source's group start was forwarded. The healthy exit. |
+| `abandoned_source_left` | The wanted source's publisher left this handler (its connection closed), or the source stopped being declared. |
+| `superseded` | MC assigned a different source or none (a change of target exits, then re-enters if the new one is wanted). |
+| `paused_forward_nothing` | The assigned source became PAUSED (client mute) **or** DROP_AT_INGRESS (server mute): the policy forwards nothing. |
+| `edge_removed` | The edge was removed or stopped being a stream edge, its meeting was released (EndMeeting), or its subscriber's connection left this handler. |
 
 ### `mh_media_forward_latency_seconds`
 - **Type**: Histogram

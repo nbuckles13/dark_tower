@@ -439,6 +439,9 @@ impl SessionManagerActor {
                 _ = rotation.tick() => {
                     self.admission_window.rotate();
                     self.publish_admission_ratio();
+                    // The pending-edge gauges (story 3 R-4): tick-sampled
+                    // here, the single writer, never per frame.
+                    self.routing.publish_pending(tokio::time::Instant::now());
                 }
             }
         }
@@ -1315,6 +1318,43 @@ impl LocalSubscriberSnapshot {
     }
 }
 
+/// A registry entry owned by ONE connection: what compare-and-remove compares.
+pub(crate) trait HeldByConnection {
+    /// The connection id that holds this entry.
+    fn holder(&self) -> &str;
+}
+
+impl HeldByConnection for SubscriberEntry {
+    fn holder(&self) -> &str {
+        &self.connection_id
+    }
+}
+
+/// **Compare-and-remove**, the ONE body behind every connection-held registry
+/// on this handler ([`LocalSubscribers`] and
+/// `crate::media::keyframe::PublisherKeyframesRegistry`): remove `key` only if
+/// `connection_id` still holds it, and say whether it did.
+///
+/// A connection superseded by a same-participant reconnect holds the same
+/// `(meeting, sender)` ordinal as its successor; without the comparison, the
+/// superseded connection's teardown would clear the LIVE successor's entry
+/// (see [`SubscriberEntry`] for the silent failure that produces). Callers run
+/// it inside `ArcSwap::rcu` (see [`LocalSubscribers::register`] for why the
+/// writers race), on a fresh clone each attempt.
+pub(crate) fn remove_if_held<K, V>(map: &mut HashMap<K, V>, key: &K, connection_id: &str) -> bool
+where
+    K: std::hash::Hash + Eq,
+    V: HeldByConnection,
+{
+    let held = map
+        .get(key)
+        .is_some_and(|entry| entry.holder() == connection_id);
+    if held {
+        map.remove(key);
+    }
+    held
+}
+
 /// Lock-free publication of [`LocalSubscriberSnapshot`] to the forward path.
 #[derive(Debug)]
 pub struct LocalSubscribers {
@@ -1410,19 +1450,18 @@ impl LocalSubscribers {
     /// [`SubscriberEntry`] for the silent-audio failure this prevents.
     ///
     /// `rcu` for the same concurrency reason as [`Self::register`].
-    pub fn unregister(&self, meeting: &MeetingKey, sender: SenderId, connection_id: &str) {
+    ///
+    /// Returns whether the caller WAS the holder (and so was removed): only
+    /// then did the subscriber leave this handler.
+    pub fn unregister(&self, meeting: &MeetingKey, sender: SenderId, connection_id: &str) -> bool {
         let key = SubscriberKey::new(meeting.clone(), sender);
+        let mut removed = false;
         self.snapshot.rcu(|current| {
-            let holder_is_caller = current
-                .connections
-                .get(&key)
-                .is_some_and(|entry| entry.connection_id == connection_id);
             let mut connections = current.connections.clone();
-            if holder_is_caller {
-                connections.remove(&key);
-            }
+            removed = remove_if_held(&mut connections, &key, connection_id);
             LocalSubscriberSnapshot { connections }
         });
+        removed
     }
 }
 
@@ -1717,8 +1756,8 @@ impl SessionManagerHandle {
             Self {
                 sender,
                 config_sender,
+                subscribers: Arc::clone(routing.subscribers()),
                 routing,
-                subscribers: Arc::new(LocalSubscribers::new()),
                 sender_bindings: Arc::new(SenderBindings::new()),
             },
             actor,

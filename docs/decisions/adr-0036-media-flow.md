@@ -152,6 +152,43 @@ guarantee is bounded head-of-line blocking. Nothing more.
 > The transport parameters table's *slow subscriber* reasoning stands unchanged: the application
 > bound must still trip well before the transport ceiling.
 
+> **Amendment (2026-10-21, story 3 amendment 4 — event-driven keyframes and recovery; R-10, R-12,
+> R-13).** Four statements in the 2026-10-13 amendment above are superseded and kept so the change
+> is visible: MH "retries at a configured interval until a group start arrives"; a receiver's
+> request "carrying the newest counter it saw on that slot"; MH "aggregates to at most one request
+> per source stream per configured interval"; and "the publisher never keys itself on abandonment".
+> The cause: a browser stream reset discards unsent bytes, so after a publisher abandons a group
+> toward a handler, that handler may never see the next group, and without self-keying its
+> subscribers could not recover. What replaces them:
+>
+> - **The publisher keys whenever a target has no group in progress** — a directed start, a target
+>   added to an active stream, and abandonment of that target. There is one encoder, so that
+>   keyframe reaches every target. It is bounded by the same max(directed minimum interval,
+>   compiled floor); one that comes too soon is held as the single deferral, never dropped.
+> - **Whoever decides an abandonment repairs it.** The publisher re-keys only after abandonments it
+>   decided (its per-target backlog cap). A stream MH refuses or stops (STOP_SENDING: ingress
+>   refusal, the stream-open rate limit) is MH's decision: the publisher does not re-key for it, and
+>   MH requests when it wants the stream again. Otherwise a refused stream would loop at the
+>   minimum interval. MH→subscriber recovery stays request-driven, because MH always knows its own
+>   abandonments: "the next hop's ordinary keyframe request" above still holds for that hop.
+> - **MH requests at most once per (source stream, counter) and never retries.** Requests ride a
+>   reliable stream, so repeating a counter achieves nothing; a later loss is a new event with a
+>   newer counter. MH still requests only for a source it has seen, because it needs the counter;
+>   an unseen source needs no request, because the publisher keys every target with no group in
+>   progress.
+> - **Recovery requests are event-driven and deduped by counter, not by time.** A receiver sends one
+>   per loss event, with no timer or retry, taking the sender and counter from the failing frame's
+>   own header. MH forwards at most one per (source stream, counter), sharing one dedupe record with
+>   its own requests; the rest are counted, not forwarded. Forwarded requests are therefore bounded
+>   by groups produced, which the minimum interval bounds.
+> - **Senders replace obsolete requests.** Each sender keeps at most one queued, unsent request per
+>   stream or slot; a newer one replaces it.
+> - **A missing event is loud, not masked.** With nothing retrying, an edge stuck waiting means a
+>   keyframe or request someone owed never happened; MH's pending gauges and the stuck-pending
+>   alert surface it.
+>
+> Message rules remain at `signaling.proto` `KeyframeRequest` / `RecoveryRequest`.
+
 ---
 
 ## 2. Frame format
@@ -1131,6 +1168,14 @@ up to one keyframe interval.
 > source completes at once as "forward nothing", cancelling the keyframe wait. "Pending" is
 > MH-internal and visible only as an MH metric; MH's completion report to MC, described in the
 > paragraphs below, is **deferred to story 5**, which needs it for dynamic selection.
+
+> **Amendment (2026-10-21, story 3 amendment 4 — event-driven keyframes and recovery; R-10, R-12,
+> R-13).** The amendment above's "retrying until a group start arrives" is superseded and kept so
+> the change is visible. MH requests a keyframe from B once per (source stream, counter), carrying
+> the newest counter it has seen, and never retries (§1 amendment, 2026-10-21). If B has no group
+> in progress toward this handler — B newly directed, or this handler newly added as B's target —
+> B keys itself, so the switch lands without a request. There is still no give-up timeout while B
+> stays assigned, and "pending" stays MH-internal, visible only as MH metrics.
 
 **MH reports completion to MC by command identifier, never by state description.** If MC switches a
 slot to B, reverts to A, then switches to B again, a report reading *"A→B complete"* is ambiguous

@@ -416,10 +416,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let session_manager = SessionManagerHandle::with_edge_context(
         StreamAdmission::from(&config.egress_admission),
-        mh_service::media::edge_runtime::EdgeContext {
-            backlog_cap: config.stream_path.egress_stream_backlog_bytes,
-            handles: Arc::clone(&media_setup.handles),
-        },
+        mh_service::media::edge_runtime::EdgeContext::new(
+            config.stream_path.egress_stream_backlog_bytes,
+            Arc::clone(&media_setup.handles),
+        ),
     );
     // GC's `current_streams` reads the same live table admission counts
     // against (see `GcClient::current_streams`).

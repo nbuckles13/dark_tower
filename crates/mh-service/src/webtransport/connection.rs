@@ -24,12 +24,17 @@ use crate::media::forwarder::ConnectionForwarder;
 use crate::media::ingress::{
     run_egress, run_forward, run_ingress, FramesRead, IngressQueue, LoopExit,
 };
+use crate::media::keyframe::{
+    run_keyframe_writer, serve_control_message, ControlStep, PublisherKeyframes,
+};
 use crate::media::queue::SharedQueue;
 use crate::media::stream_ingress::{run_stream_ingress, StreamIngressContext};
 use crate::media::{MediaSetup, MediaTaskContext};
 use crate::observability::metrics;
 use crate::routing::{IdError, MeetingKey, SenderId};
 use crate::session::{ConnectionEntry, PendingConnection, SessionManagerHandle};
+use crate::transport::framing::{FrameEnd, FramedReader, CONTROL_PARSE_BYTES};
+use crate::webtransport::media_transport::{WtRecvStream, WtSendStream};
 use crate::webtransport::WtMediaTransport;
 
 use prost::Message;
@@ -43,10 +48,6 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use wtransport::endpoint::IncomingSession;
-use wtransport::stream::RecvStream;
-
-/// Maximum size for a single framed message (64KB).
-const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
 /// Outcome of awaiting a `RegisterMeeting` notification for a provisional
 /// connection. Drives the caller's dispatch in [`handle_connection`].
@@ -216,8 +217,10 @@ pub async fn handle_connection(
     // seam) while this function keeps driving the lifecycle.
     let connection = Arc::new(connection);
 
-    // Step 2: Accept bidirectional stream
-    let (_, mut recv_stream) = connection.accept_bi().await.map_err(|e| {
+    // Step 2: Accept bidirectional stream. Both halves are kept: the receive
+    // half carries the connect envelope, then (story 3 R-13) recovery
+    // requests; the send half carries MH's keyframe requests to a publisher.
+    let (control_send, control_recv) = connection.accept_bi().await.map_err(|e| {
         warn!(
             target: "mh.webtransport.connection",
             connection_id = %connection_id,
@@ -228,7 +231,8 @@ pub async fn handle_connection(
     })?;
 
     // Step 3: Read length-prefixed `MhClientMessage` (typed connect envelope)
-    let envelope_bytes = read_framed_message(&mut recv_stream).await?;
+    let mut control = FramedReader::new(WtRecvStream::from_stream(control_recv));
+    let envelope_bytes = read_connect_message(&mut control).await?;
     let envelope = MhClientMessage::decode(envelope_bytes.as_ref()).map_err(|e| {
         warn!(
             target: "mh.webtransport.connection",
@@ -279,8 +283,8 @@ pub async fn handle_connection(
     let token = match envelope.message {
         Some(mh_client_message::Message::ConnectRequest(req)) => req.join_token,
         // A post-connect variant as the FIRST message is not a connect: the
-        // same generic invalid-connect reject. Reading `RecoveryRequest` after
-        // a connect is MH-B's.
+        // same generic invalid-connect reject. `RecoveryRequest` is read only
+        // after a connect (Step 6).
         Some(mh_client_message::Message::RecoveryRequest(_)) => {
             warn!(
                 target: "mh.webtransport.connection",
@@ -449,6 +453,7 @@ pub async fn handle_connection(
                 &session_manager,
                 &media,
                 &connection,
+                control_send,
                 &meeting_key,
                 sender,
                 &connection_id,
@@ -505,13 +510,27 @@ pub async fn handle_connection(
         }
     };
 
-    // Step 6: Hold connection open — monitor for disconnect or cancellation
-    // The connection stays open for future media frame forwarding (separate story).
-    // For now, we monitor the recv stream for closure and the cancellation token.
+    // Step 6: Hold the connection open and read its control stream until the
+    // connection ends.
+    //
+    // After connect the control stream carries ONLY recovery requests (story 3
+    // R-13). Per message: one fixed-size parse from a stack buffer and one
+    // lookup (`crate::media::keyframe::judge_control_message`), counted on
+    // `mh_media_recovery_requests_received_total{outcome}`. Nothing is logged
+    // per message and no trace context is extracted. Volume is bounded by
+    // QUIC flow control. This loop is the connection's own lifecycle, so it
+    // dies with the connection.
+    //
+    // A framing break (length prefix 0 or above the bound) cannot be
+    // resynchronised: counted `malformed` once, control reading stops, and
+    // the connection is KEPT — its end is then detected by the connection
+    // closing.
     //
     // WHY the connection ended decides whether MC is told (see `ConnectionEnd`).
     let connection_end;
-    let mut probe_buf = [0u8; 1];
+    let mut parse_buf = [0u8; CONTROL_PARSE_BYTES];
+    let mut control_open = true;
+    let routing = session_manager.routing_table();
     loop {
         tokio::select! {
             () = connection_close.cancelled() => {
@@ -540,33 +559,48 @@ pub async fn handle_connection(
                 }
                 break;
             }
-            result = recv_stream.read(&mut probe_buf) => {
-                match result {
-                    Ok(None) => {
-                        info!(
-                            target: "mh.webtransport.connection",
-                            connection_id = %connection_id,
-                            meeting_id = %meeting_id,
-                            "Client disconnected"
-                        );
-                        connection_end = ConnectionEnd::ClientClosed;
-                        break;
-                    }
-                    Err(_) => {
-                        info!(
-                            target: "mh.webtransport.connection",
-                            connection_id = %connection_id,
-                            meeting_id = %meeting_id,
-                            "Client disconnected with error"
-                        );
-                        connection_end = ConnectionEnd::Error;
-                        break;
-                    }
-                    Ok(Some(_)) => {
-                        // Client sent data — ignore for now (media forwarding is future scope)
-                    }
-                }
+            _ = connection.closed(), if !control_open => {
+                info!(
+                    target: "mh.webtransport.connection",
+                    connection_id = %connection_id,
+                    meeting_id = %meeting_id,
+                    "Client disconnected"
+                );
+                connection_end = ConnectionEnd::ClientClosed;
+                break;
             }
+            step = serve_control_message(
+                &mut control,
+                &mut parse_buf,
+                &routing,
+                &meeting_key,
+                media_session.sender,
+                &media.handles,
+            ), if control_open => match step {
+                ControlStep::Continue => {}
+                ControlStep::FramingBroken => control_open = false,
+                ControlStep::Finished => {
+                    info!(
+                        target: "mh.webtransport.connection",
+                        connection_id = %connection_id,
+                        meeting_id = %meeting_id,
+                        "Client disconnected"
+                    );
+                    connection_end = ConnectionEnd::ClientClosed;
+                    break;
+                }
+                ControlStep::Failed(error) => {
+                    info!(
+                        target: "mh.webtransport.connection",
+                        connection_id = %connection_id,
+                        meeting_id = %meeting_id,
+                        error = %error,
+                        "Client disconnected with error"
+                    );
+                    connection_end = ConnectionEnd::Error;
+                    break;
+                }
+            },
         }
     }
 
@@ -579,9 +613,27 @@ pub async fn handle_connection(
     // binding below: a connection superseded by a same-participant reconnect
     // holds the same ordinal and must not clear the live successor's egress queue
     // (SEC-2).
-    session_manager
-        .subscribers()
-        .unregister(&meeting_key, media_session.sender, &connection_id);
+    let left = session_manager.subscribers().unregister(
+        &meeting_key,
+        media_session.sender,
+        &connection_id,
+    );
+    if left {
+        // This subscriber left the handler: its stream edges stop counting
+        // as pending (`edge_removed`) and stop requesting.
+        session_manager.routing_table().subscriber_presence(
+            &meeting_key,
+            media_session.sender,
+            false,
+        );
+    }
+    // This publisher binding's per-source GoP state, compare-and-remove: a
+    // superseded connection never frees its live successor's.
+    session_manager.routing_table().keyframes().unregister(
+        &meeting_key,
+        media_session.sender,
+        &connection_id,
+    );
     // Release the ordinal for the uniqueness check. Compare-and-remove keyed on
     // this connection id: a connection superseded by a reconnect no longer holds
     // the entry and must not clear the live one's.
@@ -681,6 +733,15 @@ pub async fn handle_connection(
         }
     }
 
+    if let Err(e) = media_session.keyframe_writer.await {
+        warn!(
+            target: "mh.webtransport.connection",
+            connection_id = %connection_id,
+            loop_name = "keyframe_writer",
+            error = %e,
+            "Media loop task failed"
+        );
+    }
     if let Err(e) = media_session.stream_egress.await {
         warn!(
             target: "mh.webtransport.connection",
@@ -836,6 +897,8 @@ struct MediaSession {
     stream_ingress: tokio::task::JoinHandle<LoopExit>,
     /// Stream-per-group egress writers: this connection as SUBSCRIBER.
     stream_egress: tokio::task::JoinHandle<()>,
+    /// Keyframe requests to this connection as PUBLISHER (story 3 MH-B).
+    keyframe_writer: tokio::task::JoinHandle<()>,
 }
 
 /// Start this connection's media forward path.
@@ -855,10 +918,15 @@ struct MediaSession {
 /// the frame's `SFrame` key id, or accepting one the client asserts in its
 /// connect envelope — are cross-participant injection primitives, not
 /// shortcuts. See `crate::session::SenderBindings`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one setup step; every argument is a collaborator of this connection's media session"
+)]
 fn start_media_session(
     session_manager: &SessionManagerHandle,
     media: &MediaSetup,
     connection: &Arc<wtransport::Connection>,
+    control_send: wtransport::SendStream,
     meeting: &MeetingKey,
     sender: SenderId,
     connection_id: &str,
@@ -890,6 +958,29 @@ fn start_media_session(
         &egress_queue,
         Some(downlink_sender),
     );
+
+    // As a subscriber now connected HERE: its stream edges may wait (and
+    // request) for a group start (story 3 MH-B).
+    session_manager
+        .routing_table()
+        .subscriber_presence(meeting, sender, true);
+
+    // As a PUBLISHER: this binding's per-source GoP state, registered
+    // meeting-scoped so waiting edges and remapped recovery requests reach
+    // it, and its keyframe writer on the control stream's send half.
+    let keyframes = Arc::new(PublisherKeyframes::new(Arc::clone(&media.handles)));
+    session_manager.routing_table().keyframes().register(
+        meeting.clone(),
+        sender,
+        connection_id,
+        &keyframes,
+    );
+    session_manager.routing_table().publisher_bound(meeting);
+    let keyframe_writer = tokio::spawn(run_keyframe_writer(
+        Arc::clone(&keyframes),
+        WtSendStream::from_stream(control_send),
+        cancel.clone(),
+    ));
 
     let forwarder = ConnectionForwarder::new(
         meeting.clone(),
@@ -928,6 +1019,7 @@ fn start_media_session(
         handles: Arc::clone(&media.handles),
         limits: media.stream_path,
         sample_ratio: media.latency_sample_ratio,
+        keyframes,
     });
     let stream_ingress = tokio::spawn(run_stream_ingress(
         Arc::clone(&transport),
@@ -947,6 +1039,7 @@ fn start_media_session(
         egress,
         stream_ingress,
         stream_egress,
+        keyframe_writer,
     }
 }
 
@@ -1334,49 +1427,30 @@ fn decline_for_notify_error(error: &MhError) -> metrics::MediaSessionStartOutcom
     }
 }
 
-/// Read a length-prefixed message from a `RecvStream`.
-///
-/// Wire format: 4-byte big-endian length prefix + payload bytes.
-/// Enforces `MAX_MESSAGE_SIZE` (64KB) to prevent abuse.
-async fn read_framed_message(stream: &mut RecvStream) -> Result<bytes::Bytes, MhError> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await.map_err(|e| {
-        warn!(
-            target: "mh.webtransport.connection",
-            error = %e,
-            "Failed to read message length prefix"
-        );
-        MhError::WebTransportError("Failed to read message".to_string())
-    })?;
-
-    let msg_len = u32::from_be_bytes(len_buf) as usize;
-
-    if msg_len > MAX_MESSAGE_SIZE {
-        warn!(
-            target: "mh.webtransport.connection",
-            msg_len = msg_len,
-            max = MAX_MESSAGE_SIZE,
-            "Message exceeds maximum size"
-        );
-        return Err(MhError::WebTransportError("Message too large".to_string()));
-    }
-
-    if msg_len == 0 {
-        return Err(MhError::WebTransportError("Empty message".to_string()));
-    }
-
-    let mut buf = vec![0u8; msg_len];
-    stream.read_exact(&mut buf).await.map_err(|e| {
-        warn!(
-            target: "mh.webtransport.connection",
-            error = %e,
-            msg_len = msg_len,
-            "Failed to read message body"
-        );
-        MhError::WebTransportError("Failed to read message body".to_string())
-    })?;
-
-    Ok(bytes::Bytes::from(buf))
+/// Read the length-prefixed connect envelope through the control stream's
+/// framer (`crate::transport::framing`, the one framer for both directions),
+/// which enforces `MAX_MESSAGE_SIZE` before allocating.
+async fn read_connect_message(
+    control: &mut FramedReader<WtRecvStream>,
+) -> Result<bytes::Bytes, MhError> {
+    control.next_owned().await.map_err(|end| {
+        match &end {
+            FrameEnd::FramingBreak => warn!(
+                target: "mh.webtransport.connection",
+                "Connect message length is zero or exceeds the maximum size"
+            ),
+            FrameEnd::Finished => warn!(
+                target: "mh.webtransport.connection",
+                "Stream ended before a complete connect message"
+            ),
+            FrameEnd::Failed(e) => warn!(
+                target: "mh.webtransport.connection",
+                error = %e,
+                "Failed to read connect message"
+            ),
+        }
+        MhError::WebTransportError(format!("Failed to read message: {end:?}"))
+    })
 }
 
 #[cfg(test)]

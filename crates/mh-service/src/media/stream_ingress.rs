@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! accept loop (one per publisher connection):
-//!     accept_uni -> TokenBucket (BEFORE any read) -> spawn group task
+//!     accept_uni -> TokenBucket -> spawn group task
+//!                   (over the limit: spawn a header-then-stop task)
 //! group task (one per publisher uni stream = one group):
 //!     read_chunk -> HeaderReader -> attribute (task 8's lookup)
 //!       -> per edge: edge machine -> hop -> rewritten header -> downlink
@@ -26,6 +27,12 @@
 //! Every header runs `RoutingSnapshot::attribute` with the bound sender, the
 //! uplink relay `stream_id` and the arrival transport (`STREAM_PER_GROUP`) —
 //! task 8's single lookup; no second rule lives here. Outcomes:
+//!
+//! Before the outcome is acted on, every header that resolves to a DECLARED
+//! stream of the bound sender (`Route`, or `ServerMuted` via
+//! `RoutingSnapshot::declared_stream`) records its `gop_counter` in the
+//! publisher binding's per-source state (`crate::media::keyframe`): the
+//! counter is taken from forwarded, muted, unrouted and paused frames alike.
 //!
 //! * `Route` — `forwarded{ingress}` +1 at header completion (once per frame,
 //!   never per chunk or edge), the paused overlay if PAUSED, and fan-out.
@@ -55,16 +62,39 @@
 //! | refusal (codec, unmatched, mismatch, label change) | its token | RESET `publisher_reset` (none on a first frame) |
 //! | MH cancel / abort | `partial_frame_discard` iff mid-header | RESET `source_ended` |
 //!
-//! # The stall timer is an INACTIVITY bound
+//! # The stall timer is an INACTIVITY bound, armed from the FIRST header
 //!
-//! Armed only while a frame is incomplete — mid-HEADER (`is_mid_header`) or
-//! mid-tail — and re-armed on every chunk of progress. That satisfies
+//! Armed only once the stream's first header has completed (story 3
+//! amendment 4: before that nothing has been forwarded, so no stall bound
+//! applies; the declared QUIC concurrent-stream limit bounds headerless
+//! streams), and then only while a frame is incomplete — mid-HEADER
+//! (`is_mid_header`) of a later frame, or mid-tail — re-armed on every chunk
+//! of progress. A partial header on frame N > 1 still resets downstream
+//! `publisher_stall`: downstream group streams are open at that point. That satisfies
 //! `media_protocol::frame`'s caller obligation to bound "time-to-completion" in
 //! its inactivity form, matching the task's "stalled mid-frame": a publisher
 //! trickling a byte per bound keeps its frame open, but the damage is confined
 //! to its own media and its resources are bounded (quinn's declared concurrent
 //! uni streams × the 64 KiB stream window, two downlinks per edge, and the
 //! copy-on-backlog charge in `crate::media::downlink`).
+//!
+//! # Over the stream-open limit: read the header, record, then stop
+//!
+//! MH never stops a stream before its counter is read (story 3 amendment 4,
+//! user ruling): an over-limit stream is counted `stream_rate_limited` once,
+//! then a task in the SAME `JoinSet` (so it never blocks the accept loop, the
+//! declared `MH_MAX_CONCURRENT_UNI_STREAMS` bounds how many exist, and the
+//! loop's drop aborts them) reads ONLY its fixed header through the same
+//! `HeaderReader`, buffers nothing past it, and feeds the tail nowhere. A
+//! header resolving to a declared stream records its counter and repairs that
+//! source's edges by request (`RoutingTable::source_group_refused`) — the
+//! publisher does not re-key for MH's refusal. That edge walk is COALESCED to
+//! the first refusal since the last admitted group, so every further
+//! over-limit stream costs O(1) (`PublisherKeyframes::record_refused`). Then
+//! `STOP_SENDING`. A
+//! malformed header (or an end before the header) is stopped with no record
+//! and no repair. It touches no edge's downlink, no `group_starts`, no
+//! `forwarded` counter and no hop.
 //!
 //! # No telemetry macro here
 //!
@@ -77,6 +107,7 @@ use crate::media::downlink::Downlink;
 use crate::media::edge::GroupToken;
 use crate::media::edge_runtime::{EdgeRuntime, HeaderIn};
 use crate::media::ingress::LoopExit;
+use crate::media::keyframe::{PublisherKeyframes, Refusal};
 use crate::media::sampler::LatencySampler;
 use crate::observability::metrics::{
     GroupResetReason, MediaDirection, MediaDropReason, MediaLatencyPhase, MediaMetricHandles,
@@ -94,6 +125,10 @@ use tokio_util::sync::CancellationToken;
 /// The most bytes one `read_chunk` returns: one stream receive window. A
 /// ceiling on what the transport hands over, never a buffer MH allocates.
 pub const READ_CHUNK_MAX: usize = crate::config::STREAM_RECEIVE_WINDOW_BYTES as usize;
+
+/// The most bytes one read of an over-limit stream takes off the transport
+/// while its header is read (the 14-byte prefix, then the rest of the header).
+const REFUSED_HEADER_READ_BYTES: usize = 64;
 
 /// Process-unique ingress group tokens.
 static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
@@ -114,13 +149,16 @@ pub struct StreamIngressContext {
     pub limits: StreamPathLimits,
     /// The latency sample ratio (the same field the gauge publishes).
     pub sample_ratio: f64,
+    /// This publisher binding's per-source `GoP` state (story 3 MH-B).
+    pub keyframes: Arc<PublisherKeyframes>,
 }
 
 /// The accept loop: admit each publisher uni stream against the per-connection
-/// creation-rate cap BEFORE reading a byte, then hand it to its own group task
-/// (a loop-owned `JoinSet`, so one stalled stream never blocks the next
-/// accept, and every group task is aborted — through its `Drop` guard — when
-/// this loop returns).
+/// creation-rate cap, then hand it to its own group task (a loop-owned
+/// `JoinSet`, so one stalled stream never blocks the next accept, and every
+/// group task is aborted — through its `Drop` guard — when this loop
+/// returns). An over-limit stream is counted, then read only to its header and
+/// stopped by a task in the same set (see the module docs).
 pub async fn run_stream_ingress<T: MediaTransport>(
     transport: Arc<T>,
     context: Arc<StreamIngressContext>,
@@ -133,22 +171,98 @@ pub async fn run_stream_ingress<T: MediaTransport>(
         tokio::select! {
             () = cancel.cancelled() => return LoopExit::Cancelled,
             accepted = transport.accept_uni() => match accepted {
-                Ok(mut stream) => {
+                Ok(stream) => {
                     if bucket.admit(tokio::time::Instant::now()) {
                         groups.spawn(run_group(stream, Arc::clone(&context)));
                     } else {
-                        // One per refused STREAM: a lower bound on frames lost.
-                        stream.stop(INGRESS_REFUSED);
+                        // One per refused STREAM, on every arm below: a lower
+                        // bound on frames lost.
                         context
                             .handles
                             .dropped(MediaDropReason::StreamRateLimited)
                             .increment(1);
+                        groups.spawn(refuse_after_header(stream, Arc::clone(&context)));
                     }
                 }
                 Err(_) => return LoopExit::ConnectionClosed,
             },
             Some(_) = groups.join_next(), if !groups.is_empty() => {}
         }
+    }
+}
+
+/// An over-limit stream: read its fixed header ONLY, record the counter and
+/// repair the source by request if it is a declared stream, then stop it.
+async fn refuse_after_header<R: MediaRecvStream>(
+    mut stream: R,
+    context: Arc<StreamIngressContext>,
+) {
+    let mut reader = HeaderReader::new();
+    let header = loop {
+        // Small reads: bytes past the header are never retained (the chunk
+        // is dropped as soon as the reader has taken what it needs).
+        match stream.read_chunk(REFUSED_HEADER_READ_BYTES).await {
+            Ok(Some(chunk)) => match reader.feed(&chunk) {
+                Ok(Feed::Complete { header, .. }) => break Some(header),
+                Ok(Feed::NeedMore) => {}
+                Err(_) => break None,
+            },
+            Ok(None) | Err(_) => break None,
+        }
+    };
+    if let Some(header) = header {
+        let snapshot = context.routing.load();
+        if let Some(source) = snapshot.declared_stream(
+            &context.meeting,
+            context.sender,
+            header.stream_id(),
+            TransportMode::StreamPerGroup,
+        ) {
+            if context
+                .keyframes
+                .record_refused(source, header.gop_counter())
+                == Refusal::RepairEdges
+            {
+                context
+                    .routing
+                    .source_group_refused(&context.meeting, context.sender, source);
+            }
+        }
+    }
+    stream.stop(INGRESS_REFUSED);
+}
+
+/// Record one header's `GoP` counter, from every header of a DECLARED stream
+/// (forwarded, muted, unrouted, paused alike), before the outcome is acted on.
+/// Nothing is recorded for an unattributable label.
+fn record_counter(
+    context: &StreamIngressContext,
+    snapshot: &crate::routing::RoutingSnapshot,
+    attribution: &Attribution<'_>,
+    label: u16,
+    gop_counter: u32,
+    first_of_stream: bool,
+) {
+    match attribution {
+        // The first attributed header of an ADMITTED stream re-arms the
+        // refused-group walk (bounded by the stream-open bucket).
+        Attribution::Route { stream, .. } if first_of_stream => {
+            context
+                .keyframes
+                .record_admitted_group(*stream, gop_counter);
+        }
+        Attribution::Route { stream, .. } => context.keyframes.record(*stream, gop_counter),
+        Attribution::ServerMuted => {
+            if let Some(stream) = snapshot.declared_stream(
+                &context.meeting,
+                context.sender,
+                label,
+                TransportMode::StreamPerGroup,
+            ) {
+                context.keyframes.record(stream, gop_counter);
+            }
+        }
+        Attribution::NoPolicy | Attribution::Unmatched | Attribution::TransportMismatch => {}
     }
 }
 
@@ -276,7 +390,9 @@ impl GroupState {
     }
 
     fn stall_deadline(&self, stall: std::time::Duration) -> Option<tokio::time::Instant> {
-        self.mid_frame().then(|| self.last_progress + stall)
+        // `label` is set at the stream's FIRST complete header: the stall
+        // timer is armed only from then on.
+        (self.label.is_some() && self.mid_frame()).then(|| self.last_progress + stall)
     }
 
     /// Feed one transport chunk: header bytes into the reader, tail bytes to
@@ -335,6 +451,14 @@ impl GroupState {
             context.sender,
             label,
             TransportMode::StreamPerGroup,
+        );
+        record_counter(
+            &context,
+            &snapshot,
+            &attribution,
+            label,
+            header.gop_counter(),
+            !self.started,
         );
         let Attribution::Route {
             stream,

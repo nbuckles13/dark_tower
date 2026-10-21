@@ -4,9 +4,9 @@
 //! the same 4-byte big-endian length prefix and the same per-message bound
 //! ([`crate::fixtures::mc_session::MAX_FRAME_BYTES`]).
 //!
-//! Until MH-B (task 10) lands, MH's hold-open loop reads and DISCARDS carrier
-//! bytes: a recovery request is harmless and has no effect, and no keyframe
-//! request ever arrives.
+//! Since MH-B (task 10), MH judges every post-connect recovery request (one
+//! counted outcome each) and writes its own keyframe requests here, once per
+//! (source stream, counter), never retried.
 
 #![expect(
     async_fn_in_trait,

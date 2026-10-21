@@ -742,6 +742,62 @@ impl LossDelayTransport {
             .push(message);
     }
 
+    /// The client-opened control stream's two halves, as MH holds them: the
+    /// send half MH writes `MhServerMessage` to, and the receive half MH reads
+    /// `MhClientMessage` from (fed by [`Self::push_control_inbound`]).
+    #[must_use]
+    pub fn control_halves(&self) -> (ShimControlSend, ShimControlRecv) {
+        (
+            ShimControlSend {
+                state: Arc::clone(&self.state),
+            },
+            ShimControlRecv {
+                state: Arc::clone(&self.state),
+            },
+        )
+    }
+
+    /// Control envelope, client → MH: the client finishes its send half (FIN).
+    pub fn finish_control_inbound(&self) {
+        self.push_control_inbound(Bytes::new());
+    }
+
+    /// Make MH's control-stream writes pend until [`Self::release_control_writes`]
+    /// (a publisher not reading its control stream).
+    pub fn block_control_writes(&self) {
+        self.state
+            .streams
+            .control_write_blocked
+            .store(true, Ordering::Release);
+    }
+
+    /// Let pending and future control-stream writes complete.
+    pub fn release_control_writes(&self) {
+        self.state
+            .streams
+            .control_write_blocked
+            .store(false, Ordering::Release);
+        self.state.streams.control_write_notify.notify_waiters();
+    }
+
+    /// Make MH's control-stream writes fail (stream closed by the peer).
+    pub fn fail_control_writes(&self) {
+        self.state
+            .streams
+            .control_write_failing
+            .store(true, Ordering::Release);
+        self.state.streams.control_write_notify.notify_waiters();
+    }
+
+    /// Writes MH has started on the control stream, blocked or not.
+    #[must_use]
+    pub fn control_write_attempts(&self) -> u64 {
+        self.state
+            .streams
+            .control_write_attempts
+            .load(Ordering::Acquire)
+    }
+
     /// Control envelope, MH → client: everything MH sent, in order.
     #[must_use]
     pub fn control_outbound(&self) -> Vec<Bytes> {
@@ -1034,6 +1090,104 @@ impl MediaTransport for LossDelayTransport {
 
 fn closed() -> TransportError {
     TransportError::ConnectionClosed(TransportCause::local("shim connection closed"))
+}
+
+/// The receive half of the client-opened control stream, as MH reads it.
+/// Each pushed item is delivered as raw bytes; an EMPTY item is the client's
+/// FIN.
+#[derive(Debug)]
+pub struct ShimControlRecv {
+    state: Arc<ShimState>,
+}
+
+impl MediaRecvStream for ShimControlRecv {
+    async fn read_chunk(&mut self, max_len: usize) -> Result<Option<Bytes>, StreamReadError> {
+        let streams = &self.state.streams;
+        loop {
+            let notified = streams.control_inbound_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut queue = streams
+                    .control_inbound
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if let Some(mut chunk) = queue.pop_front() {
+                    if chunk.is_empty() {
+                        return Ok(None);
+                    }
+                    if chunk.len() > max_len {
+                        let rest = chunk.split_off(max_len);
+                        queue.push_front(rest);
+                    }
+                    return Ok(Some(chunk));
+                }
+            }
+            if self.state.closed.load(Ordering::Acquire) {
+                return Err(StreamReadError::ConnectionClosed(TransportCause::local(
+                    "shim connection closed",
+                )));
+            }
+            notified.await;
+        }
+    }
+
+    fn stop(&mut self, _code: u32) {}
+}
+
+/// The send half of the client-opened control stream, as MH writes it. One
+/// record per `write_all`; writes pend while blocked and fail while failing.
+#[derive(Debug)]
+pub struct ShimControlSend {
+    state: Arc<ShimState>,
+}
+
+impl MediaSendStream for ShimControlSend {
+    fn write_all(
+        &mut self,
+        buf: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
+        let message = Bytes::copy_from_slice(buf);
+        async move {
+            let streams = &self.state.streams;
+            streams
+                .control_write_attempts
+                .fetch_add(1, Ordering::AcqRel);
+            loop {
+                let notified = streams.control_write_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.state.closed.load(Ordering::Acquire) {
+                    return Err(closed());
+                }
+                if streams.control_write_failing.load(Ordering::Acquire) {
+                    return Err(TransportError::StreamClosed(TransportCause::local(
+                        "shim control stream failing",
+                    )));
+                }
+                if !streams.control_write_blocked.load(Ordering::Acquire) {
+                    break;
+                }
+                notified.await;
+            }
+            streams
+                .control_outbound
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(message);
+            Ok(())
+        }
+    }
+
+    async fn finish(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    fn reset(&mut self, _code: u32) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    fn set_priority(&mut self, _priority: i32) {}
 }
 
 /// A publisher stream as MH's `accept_uni` sees it; fed by an [`InboundUni`].

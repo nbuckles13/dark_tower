@@ -11,6 +11,7 @@ use mh_service::config::EGRESS_QUEUE_FRAMES;
 use mh_service::media::downlink::run_stream_egress;
 use mh_service::media::edge_runtime::{EdgeContext, EdgeRuntime};
 use mh_service::media::forward::EgressQueue;
+use mh_service::media::keyframe::{run_keyframe_writer, PublisherKeyframes};
 use mh_service::media::queue::SharedQueue;
 use mh_service::media::stream_ingress::{run_stream_ingress, StreamIngressContext};
 use mh_service::observability::metrics::{resolve_media_handles, MediaMetricHandles};
@@ -55,13 +56,14 @@ impl StreamRig {
     #[must_use]
     pub fn new(request: &RegisterMeetingRequest, limits: StreamPathLimits) -> Self {
         let handles = Arc::new(resolve_media_handles());
-        let routing = Arc::new(RoutingTable::with_edge_context(EdgeContext {
-            backlog_cap: limits.egress_stream_backlog_bytes,
-            handles: Arc::clone(&handles),
-        }));
+        let routing = Arc::new(RoutingTable::with_edge_context(EdgeContext::new(
+            limits.egress_stream_backlog_bytes,
+            Arc::clone(&handles),
+        )));
+        let subscribers = Arc::clone(routing.subscribers());
         let rig = Self {
             routing,
-            subscribers: Arc::new(LocalSubscribers::new()),
+            subscribers,
             handles,
             meeting: MeetingKey::new(MEETING),
             limits,
@@ -82,10 +84,25 @@ impl StreamRig {
         self.routing.install(&policy);
     }
 
-    /// Connect a publisher: its stream ingress accept loop runs on the shim.
+    /// Connect a publisher: its stream ingress accept loop and its keyframe
+    /// writer (on the shim's control stream) run on the shim, with its
+    /// per-source GoP state registered as connection `pub-{publisher}`.
     pub fn publisher(&mut self, publisher: u32) -> LossDelayTransport {
         let shim = LossDelayTransport::new();
         let cancel = self.cancel.child_token();
+        let keyframes = Arc::new(PublisherKeyframes::new(Arc::clone(&self.handles)));
+        self.routing.keyframes().register(
+            self.meeting.clone(),
+            sender(publisher),
+            &format!("pub-{publisher}"),
+            &keyframes,
+        );
+        self.routing.publisher_bound(&self.meeting);
+        tokio::spawn(run_keyframe_writer(
+            Arc::clone(&keyframes),
+            shim.control_halves().0,
+            cancel.clone(),
+        ));
         let context = Arc::new(StreamIngressContext {
             meeting: self.meeting.clone(),
             sender: sender(publisher),
@@ -94,6 +111,7 @@ impl StreamRig {
             handles: Arc::clone(&self.handles),
             limits: self.limits,
             sample_ratio: 1.0,
+            keyframes,
         });
         tokio::spawn(run_stream_ingress(
             Arc::new(shim.clone()),
@@ -113,7 +131,34 @@ impl StreamRig {
             }
         }
         settle().await;
+        self.routing.keyframes().unregister(
+            &self.meeting,
+            sender(publisher),
+            &format!("pub-{publisher}"),
+        );
         self.routing.sender_ended(&self.meeting, sender(publisher));
+    }
+
+    /// The publisher binding's per-source GoP state, if bound.
+    #[must_use]
+    pub fn keyframes(&self, publisher: u32) -> Option<Arc<PublisherKeyframes>> {
+        self.routing
+            .keyframes()
+            .lookup(&self.meeting, sender(publisher))
+    }
+
+    /// Disconnect a subscriber as the connection teardown does: unregister,
+    /// then tell its edges it left this handler.
+    pub fn disconnect_subscriber(&self, subscriber: u32, cancel: &CancellationToken) {
+        cancel.cancel();
+        if self.subscribers.unregister(
+            &self.meeting,
+            sender(subscriber),
+            &format!("conn-{subscriber}"),
+        ) {
+            self.routing
+                .subscriber_presence(&self.meeting, sender(subscriber), false);
+        }
     }
 
     /// Connect a subscriber: registered with a datagram queue and a downlink
@@ -139,6 +184,8 @@ impl StreamRig {
             &queue,
             Some(tx),
         );
+        self.routing
+            .subscriber_presence(&self.meeting, sender(subscriber), true);
         tokio::spawn(run_stream_egress(
             Arc::new(shim.clone()),
             rx,

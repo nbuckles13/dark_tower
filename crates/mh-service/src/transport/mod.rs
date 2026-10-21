@@ -226,6 +226,8 @@ use bytes::Bytes;
 use std::future::Future;
 use thiserror::Error;
 
+pub mod framing;
+
 /// The `RESET_STREAM` application code on every downlink group MH abandons.
 /// See the module docs: one reasonless code; peers must not branch on it.
 pub const GROUP_ABANDONED: u32 = 0x4741;
@@ -625,7 +627,9 @@ pub trait MediaTransport: Send + Sync + 'static {
     ///
     /// Concurrency is bounded below this call by the declared QUIC transport
     /// parameter `MH_MAX_CONCURRENT_UNI_STREAMS`; the per-connection creation
-    /// RATE is enforced by the caller, before any byte is read.
+    /// RATE is enforced by the caller: an over-limit stream has only its
+    /// header prefix read (its `GoP` counter recorded, story 3 amendment 4)
+    /// before it is stopped.
     ///
     /// # Errors
     ///

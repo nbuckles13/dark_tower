@@ -99,47 +99,16 @@ const C_VIDEO_SLOT: u32 = 701;
 const SEQ_A: u32 = 1_400_000;
 const _: () = assert!(SEQ_A >= env_tests::fixtures::media::AUDIO_SEQUENCE_CEILING);
 
-/// The backlog row's sizing inputs that live outside this cluster's
-/// Prometheus. env-tests cannot import mh-service (ADR-0028), so each is a
-/// literal naming its home:
-///
-/// * MH's declared connection send window — `mh_service::config::CONNECTION_SEND_WINDOW_BYTES`;
-/// * the fixture client's per-stream receive window — quinn 0.11's default
-///   `STREAM_RWND` (12 500 x 100 B), which `mc_session::try_connect_wt_with`
-///   inherits (it sets no transport config).
-// Drift-guarded: `mh-service`'s config tests read this line and fail if it
-// differs from `CONNECTION_SEND_WINDOW_BYTES`.
-const MH_CONNECTION_SEND_WINDOW_BYTES: u64 = 524_288;
-const CLIENT_STREAM_RECEIVE_WINDOW_BYTES: u64 = 1_250_000;
-/// Margin over the bytes a held destination can absorb before MH's cap trips.
-const BACKLOG_MARGIN: u64 = 2;
 /// Group cadence for the backlog row and the late-subscriber row: long groups,
 /// so "mid-group" is wide and each backlog group carries the sized byte count
 /// at a modest rate.
 const BACKLOG_GROUP_INTERVAL: Duration = Duration::from_secs(2);
 const BACKLOG_FRAMES_PER_GROUP: u64 = 100;
 
-/// Everything one subscriber reported, drained until it has been quiet for
-/// [`QUIET`] OR [`DRAIN_SLICE`] has passed, whichever comes first (both drain
-/// bounds, never pass conditions). The slice bound matters while a publisher
-/// is still sending: its events never go quiet, and an unbounded drain would
-/// starve every deadline check that calls it.
+/// Every subscriber drain in this file: the shared fixture drain at this
+/// file's bounds.
 async fn drain(sub: &mut VideoSubscriber) -> Vec<SubscriberEvent> {
-    let until = Instant::now() + DRAIN_SLICE;
-    let mut out = Vec::new();
-    while Instant::now() < until {
-        match sub.next(QUIET).await {
-            env_tests::fixtures::video::Next::Event(event) => {
-                assert!(
-                    event != SubscriberEvent::ConnectionClosed,
-                    "a video subscriber's MH connection closed mid-test"
-                );
-                out.push(event);
-            }
-            env_tests::fixtures::video::Next::Quiet => break,
-        }
-    }
-    out
+    sub.drain(QUIET, DRAIN_SLICE).await
 }
 
 fn ended(events: &[SubscriberEvent]) -> Vec<ReceivedStream> {
@@ -179,24 +148,11 @@ fn group_ticks() -> u32 {
     u32::try_from(BACKLOG_FRAMES_PER_GROUP).expect("a small frame count")
 }
 
-/// Wait for a frame on `sub` that is NOT a group start and return its GoP
-/// counter: the group the publisher is inside right now. The deadline is a
-/// FAILURE.
+/// The group the publisher is inside right now, read off `sub` (the shared
+/// fixture helper at this file's bounds).
 async fn until_mid_group_frame(phase: &str, who: &str, sub: &mut VideoSubscriber) -> u32 {
-    let deadline = Instant::now() + PHASE_DEADLINE;
-    loop {
-        assert!(
-            Instant::now() < deadline,
-            "VIDEO-NOT-OBSERVED: {phase}: {who} saw no mid-group frame within {PHASE_DEADLINE:?}"
-        );
-        if let env_tests::fixtures::video::Next::Event(SubscriberEvent::Frame { frame, .. }) =
-            sub.next(QUIET).await
-        {
-            if !frame.independently_decodable {
-                return frame.gop_counter;
-            }
-        }
-    }
+    sub.mid_group_counter(&format!("{phase}: {who}"), None, QUIET, PHASE_DEADLINE)
+        .await
 }
 
 /// Every stream a receiver got for A carries A's frames on `slot` only, opens
@@ -674,14 +630,8 @@ async fn test_stream_per_group_video_forwarding() {
     );
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let backlog = backlog as u64;
-    let absorbable = CLIENT_STREAM_RECEIVE_WINDOW_BYTES + MH_CONNECTION_SEND_WINDOW_BYTES + backlog;
-    let per_group = BACKLOG_MARGIN * absorbable;
-    let payload_len = usize::try_from(per_group / BACKLOG_FRAMES_PER_GROUP).expect("fits");
-    assert!(
-        payload_len < media_protocol::frame::MAX_PAYLOAD_BYTES,
-        "PRECONDITION: the deployed backlog cap ({backlog} B) makes a reset unreachable within \
-         one fixture group at <= MAX_PAYLOAD_BYTES per frame; resize BACKLOG_FRAMES_PER_GROUP"
-    );
+    let payload_len =
+        env_tests::fixtures::video::backlog::backlog_payload_len(backlog, BACKLOG_FRAMES_PER_GROUP);
     let reset_base = injection::baselines(&prom, &group_reset_promql("subscriber_backlog")).await;
     for sub in &mut b_subs {
         let _ = drain(sub).await;

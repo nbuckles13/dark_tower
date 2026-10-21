@@ -248,8 +248,8 @@ naming this failure mode).
 **Pipeline wiring (task #19, R-48).** `scripts/layer7.sh` runs this suite as
 its second Phase-2 step: sequentially **after** `cargo test -p env-tests
 --features all`, against the same live Kind cluster, under the same
-single-attempt Layer-7 budget (its own 600s wall clock,
-`DEVLOOP_BROWSER_E2E_TIMEOUT`). It **always runs** whenever Layer 7 runs (the
+single-attempt Layer-7 budget (its own wall clock,
+`DEVLOOP_BROWSER_E2E_TIMEOUT`, default in `scripts/layer7.sh`). It **always runs** whenever Layer 7 runs (the
 diff-trigger was retired 2026-08-20 — gate coverage is independent of
 change-detection, so there is no longer a "no diff" skip for the browser suite).
 If the Rust env-tests fail first, the browser suite is not run that attempt

@@ -887,6 +887,23 @@ assert_exit   "phase2-fail-exit1"  1 "$RC"
 assert_status "phase2-fail-status" "STATUS=FAIL REASON=env-tests-failed" "$(cat "$OUT")"
 reset_case
 
+# === Phase 2 rc 124 (the suite's own `timeout`) → SAME FAIL lane, plus a named budget line ===
+reset_case
+TIMEOUT_SUITE="${WORK}/timeout-suite.sh"
+printf '#!/usr/bin/env bash\nexit 124\n' > "$TIMEOUT_SUITE"
+chmod +x "$TIMEOUT_SUITE"
+SOCK="$PRESENT_SOCK"; export ENVCMD="$TIMEOUT_SUITE"
+run_layer7 "$OUT" "$ERR"
+assert_exit   "phase2-timeout-exit1"   1 "$RC"
+assert_status "phase2-timeout-status"  "STATUS=FAIL REASON=env-tests-failed" "$(cat "$OUT")"
+assert_status "phase2-timeout-budget-line" "hit DEVLOOP_ENV_TEST_TIMEOUT=" "$(cat "$ERR")"
+reset_case
+# ... and an ordinary non-zero does NOT claim a budget overrun.
+SOCK="$PRESENT_SOCK"; export ENVCMD="false"
+run_layer7 "$OUT" "$ERR"
+assert_absent "phase2-nontimeout-no-budget-line" "hit DEVLOOP_ENV_TEST_TIMEOUT=" "$(cat "$ERR")"
+reset_case
+
 # === LOAD-BEARING: a test FAIL whose output contains infra words STILL FAILs ===
 # (Proves the retired log-grep no longer swallows a real failure as infra — the
 #  reverse-masking bug ruling #3 closes.)
@@ -1896,5 +1913,18 @@ for f in "$PW_CONFIG" "${REPO_ROOT}"/packages/*/vitest*.config.ts "${REPO_ROOT}"
   assert_absent "no-maxfailures-${f#"${REPO_ROOT}"/}" "maxFailures" "$(code_of "$f")"
   assert_absent "no-bail-config-${f#"${REPO_ROOT}"/}" "bail:" "$(code_of "$f")"
 done
+
+# === Per-suite wall-clock defaults: ONE home, one pinned restatement ==========================
+# scripts/layer7.sh owns DEVLOOP_ENV_TEST_TIMEOUT / DEVLOOP_BROWSER_E2E_TIMEOUT defaults; the
+# devloop-validation runbook (§6.7) restates them for operators. Drift guard: the restatement
+# must name exactly the script's values (a raised budget with a stale runbook misleads triage).
+RUNBOOK_DV="${REPO_ROOT}/docs/runbooks/devloop-validation.md"
+env_test_default="$(code_of "$LAYER7" | sed -nE 's/^ENV_TEST_TIMEOUT="\$\{DEVLOOP_ENV_TEST_TIMEOUT:-([0-9]+)\}"$/\1/p')"
+browser_default="$(code_of "$LAYER7" | sed -nE 's/^BROWSER_E2E_TIMEOUT="\$\{DEVLOOP_BROWSER_E2E_TIMEOUT:-([0-9]+)\}"$/\1/p')"
+# Non-vacuous: both defaults were actually extracted.
+assert_rc "env-test-timeout-default-extracted" 1 "$([[ "$env_test_default" =~ ^[0-9]+$ ]] && echo 1 || echo 0)"
+assert_rc "browser-timeout-default-extracted" 1 "$([[ "$browser_default" =~ ^[0-9]+$ ]] && echo 1 || echo 0)"
+assert_status "runbook-env-test-timeout-default" "\`DEVLOOP_ENV_TEST_TIMEOUT\` default ${env_test_default}s" "$(cat "$RUNBOOK_DV")"
+assert_status "runbook-browser-timeout-default" "\`DEVLOOP_BROWSER_E2E_TIMEOUT\` default ${browser_default}s" "$(cat "$RUNBOOK_DV")"
 
 report_results "scripts/layer7.test.sh"

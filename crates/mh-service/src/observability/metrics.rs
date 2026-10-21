@@ -90,7 +90,14 @@ fn configured_prometheus_builder() -> Result<PrometheusBuilder, String> {
             Matcher::Prefix("mh_media_forward_latency".to_string()),
             &MEDIA_FORWARD_LATENCY_BUCKETS,
         )
-        .map_err(|e| format!("Failed to set media forward latency buckets: {e}"))
+        .map_err(|e| format!("Failed to set media forward latency buckets: {e}"))?
+        // Pending-edge durations (story 3 R-4, R-30); see
+        // [`EDGE_PENDING_DURATION_BUCKETS`].
+        .set_buckets_for_metric(
+            Matcher::Prefix("mh_media_edge_pending_duration".to_string()),
+            &EDGE_PENDING_DURATION_BUCKETS,
+        )
+        .map_err(|e| format!("Failed to set edge pending duration buckets: {e}"))
 }
 
 /// Record a GC registration attempt.
@@ -1642,6 +1649,150 @@ impl GroupResetReason {
     }
 }
 
+/// `mh_media_keyframe_requests_sent_total{trigger}` (story 3 R-10, R-13, R-30):
+/// what MH actually WROTE to a publisher's control stream, after the
+/// once-per-(source stream, counter) dedupe and the newest-only queue
+/// replacement. A replaced or discarded queued request is never counted here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyframeTrigger {
+    /// Every MH-ORIGINATED request: an edge waiting for a group start from a
+    /// source MH has seen. Covers a first join, a source switch, a subscriber
+    /// connecting, recovery after ANY abandonment (MH's own backlog reset, a
+    /// propagated publisher reset, a stall), and the repair of a group MH
+    /// refused at the stream-open limit. Not "first join only".
+    Initial,
+    /// A receiver's `RecoveryRequest`, remapped and forwarded.
+    ReceiverRecovery,
+}
+
+impl KeyframeTrigger {
+    /// Every value, in catalog order.
+    pub const ALL: [Self; 2] = [Self::Initial, Self::ReceiverRecovery];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::ReceiverRecovery => "receiver_recovery",
+        }
+    }
+}
+
+/// `mh_media_recovery_requests_received_total{outcome}` (story 3 R-13): one
+/// per post-connect control-stream message (or framing break) a subscriber
+/// connection sent. The judging is `crate::media::keyframe::classify_recovery`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    /// Equal to MH's newest counter and not yet requested: ACCEPTED for
+    /// forwarding (one upstream `KeyframeRequest` handed to the publisher's
+    /// outbox). Not "delivered": a newer request may replace it in the queue,
+    /// and a publisher whose control stream already failed counts it on
+    /// `mh_media_keyframe_request_write_failures_total` instead.
+    Forwarded,
+    /// Equal, but that (source stream, counter) was already requested — by
+    /// any receiver or by MH itself.
+    Duplicate,
+    /// Lower than MH's newest counter: a newer group is already in flight.
+    Stale,
+    /// Higher than MH's newest counter, or MH has no counter for the source
+    /// yet: MH never saw that group. Refused.
+    CounterAhead,
+    /// `sender_id` is not the slot's current (assigned) source.
+    SourceMismatch,
+    /// The slot is not one of this connection's stream-per-group edges with a
+    /// FORWARD source (unknown slot, an audio/datagram slot, a paused or muted
+    /// source).
+    UnmappedSlot,
+    /// Undecodable, not a `RecoveryRequest`, oversize, or a framing break.
+    Malformed,
+}
+
+impl RecoveryOutcome {
+    /// Every value, in catalog order.
+    pub const ALL: [Self; 7] = [
+        Self::Forwarded,
+        Self::Duplicate,
+        Self::Stale,
+        Self::CounterAhead,
+        Self::SourceMismatch,
+        Self::UnmappedSlot,
+        Self::Malformed,
+    ];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded",
+            Self::Duplicate => "duplicate",
+            Self::Stale => "stale",
+            Self::CounterAhead => "counter_ahead",
+            Self::SourceMismatch => "source_mismatch",
+            Self::UnmappedSlot => "unmapped_slot",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+/// `mh_media_edge_pending_exits_total{outcome}` (story 3 R-4, R-30): how a
+/// pending stream edge stopped being pending. Exactly one per exit, observed
+/// with `mh_media_edge_pending_duration_seconds` at the same instant.
+///
+/// "Pending" = a stream-per-group edge whose subscriber is connected to this
+/// handler, waiting for a group start (Waiting, or `SwitchPending`) from an
+/// assigned FORWARD source whose publisher is connected to this handler, seen
+/// or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingExit {
+    /// The wanted source's group start was forwarded.
+    GroupStart,
+    /// The wanted source's publisher left this handler (its connection
+    /// closed), or the source stopped being declared.
+    AbandonedSourceLeft,
+    /// MC assigned a different source, or none (a change of target exits and,
+    /// if the new target is wanted, re-enters).
+    Superseded,
+    /// The assigned source became PAUSED (client mute) or `DROP_AT_INGRESS`
+    /// (server mute): the policy forwards nothing.
+    PausedForwardNothing,
+    /// The edge was removed or stopped being a stream edge, its meeting was
+    /// released, or its subscriber's connection left this handler.
+    EdgeRemoved,
+}
+
+impl PendingExit {
+    /// Every value, in catalog order.
+    pub const ALL: [Self; 5] = [
+        Self::GroupStart,
+        Self::AbandonedSourceLeft,
+        Self::Superseded,
+        Self::PausedForwardNothing,
+        Self::EdgeRemoved,
+    ];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GroupStart => "group_start",
+            Self::AbandonedSourceLeft => "abandoned_source_left",
+            Self::Superseded => "superseded",
+            Self::PausedForwardNothing => "paused_forward_nothing",
+            Self::EdgeRemoved => "edge_removed",
+        }
+    }
+}
+
+/// Histogram bucket edges for `mh_media_edge_pending_duration_seconds`.
+///
+/// 50 ms to 300 s. The stuck-pending alert scale is 10 x the minimum keyframe
+/// interval, and that interval reaches 10 000 ms, so the edges must resolve
+/// well past 100 s; the bottom resolves a healthy join (one interval).
+pub const EDGE_PENDING_DURATION_BUCKETS: [f64; 12] = [
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+];
+
 /// Histogram bucket edges for `mh_media_forward_latency_seconds`, in seconds.
 ///
 /// 50 µs to 100 ms. The bottom of the range has to resolve a forward path whose
@@ -1722,6 +1873,20 @@ pub struct MediaMetricHandles {
     /// `mh_media_stream_ingress_groups`: publisher group streams being read
     /// right now, process-wide (moved by an RAII guard, never last-writer-wins).
     stream_ingress_groups: Gauge,
+    /// `mh_media_keyframe_requests_sent_total`, indexed by [`KeyframeTrigger::ALL`].
+    keyframe_requests_sent: [Counter; 2],
+    /// `mh_media_keyframe_request_write_failures_total`.
+    keyframe_request_write_failures: Counter,
+    /// `mh_media_recovery_requests_received_total`, indexed by [`RecoveryOutcome::ALL`].
+    recovery_requests: [Counter; 7],
+    /// `mh_media_edges_pending` (tick-sampled, pod sum).
+    edges_pending: Gauge,
+    /// `mh_media_edge_pending_oldest_seconds` (tick-sampled, pod max).
+    edge_pending_oldest: Gauge,
+    /// `mh_media_edge_pending_duration_seconds`, observed at every exit.
+    edge_pending_duration: Histogram,
+    /// `mh_media_edge_pending_exits_total`, indexed by [`PendingExit::ALL`].
+    edge_pending_exits: [Counter; 5],
 }
 
 impl MediaMetricHandles {
@@ -1844,6 +2009,73 @@ impl MediaMetricHandles {
         &self.stream_ingress_groups
     }
 
+    /// `mh_media_keyframe_requests_sent_total{trigger}`: one per request
+    /// actually written to a publisher.
+    #[must_use]
+    pub fn keyframe_requests_sent(&self, trigger: KeyframeTrigger) -> &Counter {
+        let [initial, receiver] = &self.keyframe_requests_sent;
+        match trigger {
+            KeyframeTrigger::Initial => initial,
+            KeyframeTrigger::ReceiverRecovery => receiver,
+        }
+    }
+
+    /// `mh_media_keyframe_request_write_failures_total`: requests never
+    /// delivered — a failed control-stream write, and every request counted at
+    /// once after that publisher's control stream failed.
+    #[must_use]
+    pub const fn keyframe_request_write_failures(&self) -> &Counter {
+        &self.keyframe_request_write_failures
+    }
+
+    /// `mh_media_recovery_requests_received_total{outcome}`.
+    #[must_use]
+    pub fn recovery_requests(&self, outcome: RecoveryOutcome) -> &Counter {
+        let [forwarded, duplicate, stale, ahead, mismatch, unmapped, malformed] =
+            &self.recovery_requests;
+        match outcome {
+            RecoveryOutcome::Forwarded => forwarded,
+            RecoveryOutcome::Duplicate => duplicate,
+            RecoveryOutcome::Stale => stale,
+            RecoveryOutcome::CounterAhead => ahead,
+            RecoveryOutcome::SourceMismatch => mismatch,
+            RecoveryOutcome::UnmappedSlot => unmapped,
+            RecoveryOutcome::Malformed => malformed,
+        }
+    }
+
+    /// `mh_media_edges_pending`: set by the session actor's tick only.
+    #[must_use]
+    pub const fn edges_pending(&self) -> &Gauge {
+        &self.edges_pending
+    }
+
+    /// `mh_media_edge_pending_oldest_seconds`: set by the session actor's tick
+    /// only; 0 when nothing is pending.
+    #[must_use]
+    pub const fn edge_pending_oldest(&self) -> &Gauge {
+        &self.edge_pending_oldest
+    }
+
+    /// `mh_media_edge_pending_duration_seconds`.
+    #[must_use]
+    pub const fn edge_pending_duration(&self) -> &Histogram {
+        &self.edge_pending_duration
+    }
+
+    /// `mh_media_edge_pending_exits_total{outcome}`.
+    #[must_use]
+    pub fn edge_pending_exits(&self, exit: PendingExit) -> &Counter {
+        let [group_start, left, superseded, nothing, removed] = &self.edge_pending_exits;
+        match exit {
+            PendingExit::GroupStart => group_start,
+            PendingExit::AbandonedSourceLeft => left,
+            PendingExit::Superseded => superseded,
+            PendingExit::PausedForwardNothing => nothing,
+            PendingExit::EdgeRemoved => removed,
+        }
+    }
+
     /// Publish the sampling ratio the sampler was built with.
     ///
     /// Takes the value rather than reading config itself, because the ONE
@@ -1868,6 +2100,10 @@ impl MediaMetricHandles {
 /// `dt-guard:zero-init-entrypoint`
 // dt-guard:zero-init-entrypoint
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "ONE resolution site per handle (the zero-init entrypoint); splitting it would scatter the names the guards scan"
+)]
 pub fn resolve_media_handles() -> MediaMetricHandles {
     // Names are literals; labels are loop variables. See `MediaMetricHandles`.
     let forwarded = MediaDirection::ALL.map(|direction| {
@@ -1955,6 +2191,50 @@ pub fn resolve_media_handles() -> MediaMetricHandles {
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     );
 
+    // Keyframe and recovery requests, pending edges (story 3 R-4, R-10, R-13,
+    // R-30). No kind, no identity, no counter value, no timing: pod-level only.
+    let keyframe_requests_sent = KeyframeTrigger::ALL.map(|trigger| {
+        counter!(
+            "mh_media_keyframe_requests_sent_total",
+            "trigger" => trigger.as_str(),
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        )
+    });
+    let keyframe_request_write_failures = counter!(
+        "mh_media_keyframe_request_write_failures_total",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    );
+    let recovery_requests = RecoveryOutcome::ALL.map(|outcome| {
+        counter!(
+            "mh_media_recovery_requests_received_total",
+            "outcome" => outcome.as_str(),
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        )
+    });
+    let edges_pending = gauge!(
+        "mh_media_edges_pending",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    );
+    let edge_pending_oldest = gauge!(
+        "mh_media_edge_pending_oldest_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    );
+    // Present at zero from boot (ops Q1): an absent series would silently
+    // break the stuck-pending alert.
+    edges_pending.set(0.0);
+    edge_pending_oldest.set(0.0);
+    let edge_pending_duration = histogram!(
+        "mh_media_edge_pending_duration_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    );
+    let edge_pending_exits = PendingExit::ALL.map(|exit| {
+        counter!(
+            "mh_media_edge_pending_exits_total",
+            "outcome" => exit.as_str(),
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        )
+    });
+
     MediaMetricHandles {
         forwarded,
         dropped,
@@ -1966,6 +2246,13 @@ pub fn resolve_media_handles() -> MediaMetricHandles {
         group_starts,
         group_resets,
         stream_ingress_groups,
+        keyframe_requests_sent,
+        keyframe_request_write_failures,
+        recovery_requests,
+        edges_pending,
+        edge_pending_oldest,
+        edge_pending_duration,
+        edge_pending_exits,
     }
 }
 

@@ -1462,3 +1462,68 @@ async fn an_abandoned_connected_and_its_decline_disconnect_carry_one_connection_
         );
     }
 }
+
+/// A control-stream framing break after connect (story 3 R-13) stops control
+/// reading but KEEPS the connection: the binding stays held, and when the
+/// client then closes, the connection's end is still detected — through the
+/// connection closing rather than the control stream — so MC is told and the
+/// session is not leaked.
+#[tokio::test(flavor = "current_thread")]
+async fn a_control_framing_break_keeps_the_connection_and_its_close_still_notifies_mc() {
+    // BEFORE the suite: the accept rig resolves its media handles at start,
+    // against the recorder current on this (the only) thread.
+    let snap = MetricAssertion::snapshot();
+    let replies = SenderReplies::default().with("participant-break", SENDER_FIRST_TO_CONNECT);
+    let (suite, mut disconnect_rx) =
+        BindingSuite::start_capturing_disconnects(MockBehavior::Accept, replies).await;
+    suite.register("meeting-break").await;
+    let (conn, mut send, _recv) = suite.connect("meeting-break", "participant-break").await;
+    let meeting = MeetingKey::new("meeting-break");
+    let sender = suite.allocated("participant-break");
+    assert!(
+        holder_within(
+            &suite.session_manager,
+            &meeting,
+            sender,
+            Duration::from_secs(5)
+        )
+        .await
+        .is_some(),
+        "positive control: the session bound"
+    );
+
+    // A length prefix far above the bound: unrecoverable framing.
+    send.write_all(&[0xFF, 0xFF, 0xFF, 0xFF])
+        .await
+        .expect("write the broken prefix");
+    // The absence window ends on an EVENT: the break was processed (counted
+    // `malformed` once) — never on a sleep alone.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while snap
+        .counter("mh_media_recovery_requests_received_total")
+        .with_labels(&[("outcome", "malformed")])
+        .delta()
+        < 1
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the framing break was never counted `malformed` within 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        disconnect_rx.try_recv().is_err(),
+        "a framing break does not end the connection"
+    );
+    assert!(
+        suite
+            .session_manager
+            .sender_bindings()
+            .holder_of(&meeting, sender)
+            .is_some(),
+        "still bound after the framing break"
+    );
+
+    conn.close(wtransport::VarInt::from_u32(0), b"bye");
+    expect_reject_and_close(&mut disconnect_rx, "participant-break").await;
+}

@@ -1,5 +1,5 @@
 //! The per-edge source-switch state machine (ADR-0036 §7; story 3 R-4, R-10,
-//! R-17). Pure: no I/O, no clock read, no metric — `now` is passed in.
+//! R-17). Pure: no I/O, no clock, no metric.
 //!
 //! One machine per stream-transport egress edge, held in that edge's runtime
 //! cell (`crate::media::edge_runtime`). It decides, for every frame of a
@@ -28,8 +28,12 @@
 //!   MC's update) forward from its next group start.
 //!
 //! There is NO give-up timeout anywhere while a source stays assigned (R-4;
-//! ADR §7's open item, closed 2026-10-13). "Waiting with the source seen" is
-//! exposed for MH-B's keyframe requests ([`EdgeMachine::waiting_with_source_seen`]).
+//! ADR §7's open item, closed 2026-10-13). Which source the edge is waiting
+//! for a group start from is [`EdgeMachine::awaiting_group_start`] — MH-B's
+//! keyframe-request and pending input. Whether that source has been SEEN is
+//! not the machine's business: the per-source record in
+//! `crate::media::keyframe` (seen since the publisher's bind) is the single
+//! source for it, so a source seen before an abandonment still requests.
 //!
 //! # Group tokens
 //!
@@ -43,7 +47,6 @@
 //! bounds (no egress stream-open amplification).
 
 use crate::routing::CandidateRef;
-use tokio::time::Instant;
 
 /// Identifies one ingress group (one publisher uni stream), process-unique.
 pub type GroupToken = u64;
@@ -55,8 +58,6 @@ pub enum EdgeState {
     Waiting {
         /// The assigned source, or `None` for an edge with no candidate.
         target: Option<CandidateRef>,
-        /// When a frame from `target` was first seen while waiting.
-        seen_at: Option<Instant>,
     },
     /// Forwarding `source`'s ingress group `group`.
     Forwarding {
@@ -73,8 +74,6 @@ pub enum EdgeState {
         group: GroupToken,
         /// The source the slot is switching to.
         target: CandidateRef,
-        /// When a frame from `target` was first seen.
-        seen_at: Option<Instant>,
     },
     /// Forwarding nothing for a PAUSED assigned source.
     Paused {
@@ -128,10 +127,7 @@ impl EdgeMachine {
     pub const fn new(target: Option<CandidateRef>, paused: bool) -> Self {
         let state = match target {
             Some(source) if paused => EdgeState::Paused { source },
-            _ => EdgeState::Waiting {
-                target,
-                seen_at: None,
-            },
+            _ => EdgeState::Waiting { target },
         };
         let assigned = match target {
             Some(source) => Some((source, paused)),
@@ -157,15 +153,16 @@ impl EdgeMachine {
         }
     }
 
-    /// MH-B's keyframe-request input: `Some(first seen)` while the edge waits
-    /// for a group start from a source it has already received a frame from.
-    /// `None` when paused, forwarding, or waiting for a source never seen.
+    /// The source this edge is waiting for a group start from — the assigned
+    /// target of `Waiting`, or the pending target of `SwitchPending` — or
+    /// `None` when forwarding, paused, or assigned nothing. MH-B's keyframe
+    /// request and pending accounting read this; whether the source has been
+    /// seen is the per-source record's (`crate::media::keyframe`).
     #[must_use]
-    pub const fn waiting_with_source_seen(&self) -> Option<Instant> {
+    pub const fn awaiting_group_start(&self) -> Option<CandidateRef> {
         match self.state {
-            EdgeState::Waiting { seen_at, .. } | EdgeState::SwitchPending { seen_at, .. } => {
-                seen_at
-            }
+            EdgeState::Waiting { target } => target,
+            EdgeState::SwitchPending { target, .. } => Some(target),
             EdgeState::Forwarding { .. } | EdgeState::Paused { .. } => None,
         }
     }
@@ -176,12 +173,8 @@ impl EdgeMachine {
             Some((source, true)) => EdgeState::Paused { source },
             Some((source, false)) => EdgeState::Waiting {
                 target: Some(source),
-                seen_at: None,
             },
-            None => EdgeState::Waiting {
-                target: None,
-                seen_at: None,
-            },
+            None => EdgeState::Waiting { target: None },
         }
     }
 
@@ -203,7 +196,6 @@ impl EdgeMachine {
                         current: source,
                         group,
                         target: t,
-                        seen_at: None,
                     };
                     AssignEffect::None
                 }
@@ -212,12 +204,7 @@ impl EdgeMachine {
                     AssignEffect::Detach
                 }
             },
-            EdgeState::SwitchPending {
-                current,
-                group,
-                target: pending,
-                seen_at,
-            } => match target {
+            EdgeState::SwitchPending { current, group, .. } => match target {
                 // MC reverted: the pending switch is abandoned, not queued.
                 Some(t) if t == current => {
                     self.state = EdgeState::Forwarding {
@@ -232,7 +219,6 @@ impl EdgeMachine {
                         current,
                         group,
                         target: t,
-                        seen_at: if t == pending { seen_at } else { None },
                     };
                     AssignEffect::None
                 }
@@ -243,20 +229,7 @@ impl EdgeMachine {
                     AssignEffect::Detach
                 }
             },
-            EdgeState::Waiting {
-                target: old,
-                seen_at,
-            } => {
-                self.state = match self.resting() {
-                    EdgeState::Waiting { target: new, .. } if new == old => EdgeState::Waiting {
-                        target: new,
-                        seen_at,
-                    },
-                    resting => resting,
-                };
-                AssignEffect::None
-            }
-            EdgeState::Paused { .. } => {
+            EdgeState::Waiting { .. } | EdgeState::Paused { .. } => {
                 self.state = self.resting();
                 AssignEffect::None
             }
@@ -270,21 +243,15 @@ impl EdgeMachine {
         source: CandidateRef,
         group: GroupToken,
         independently_decodable: bool,
-        now: Instant,
     ) -> FrameDecision {
         match self.state {
             EdgeState::Waiting {
                 target: Some(target),
-                seen_at,
             } if target == source => {
                 if independently_decodable {
                     self.state = EdgeState::Forwarding { source, group };
                     FrameDecision::StartGroup
                 } else {
-                    self.state = EdgeState::Waiting {
-                        target: Some(target),
-                        seen_at: seen_at.or(Some(now)),
-                    };
                     FrameDecision::Skip
                 }
             }
@@ -310,19 +277,12 @@ impl EdgeMachine {
                 current,
                 group: current_group,
                 target,
-                seen_at,
             } => {
                 if source == target {
                     if independently_decodable {
                         self.state = EdgeState::Forwarding { source, group };
                         FrameDecision::StartGroup
                     } else {
-                        self.state = EdgeState::SwitchPending {
-                            current,
-                            group: current_group,
-                            target,
-                            seen_at: seen_at.or(Some(now)),
-                        };
                         FrameDecision::Skip
                     }
                 } else if source == current {
@@ -333,7 +293,6 @@ impl EdgeMachine {
                             current,
                             group,
                             target,
-                            seen_at,
                         };
                         FrameDecision::StartGroup
                     } else {
@@ -353,9 +312,11 @@ impl EdgeMachine {
         }
     }
 
-    /// The current downlink was abandoned (or lost): wait for the next group
-    /// start of whatever is assigned. MH never self-triggers recovery; MH-B's
-    /// keyframe request rides on this Waiting state.
+    /// The current downlink was abandoned (or lost), or MH refused the next
+    /// group of the forwarded source: wait for the next group start of
+    /// whatever is assigned. MH repairs what it abandoned by its ordinary
+    /// keyframe request, which rides on this Waiting state (story 3
+    /// amendment 4: whoever decides an abandonment repairs it).
     pub fn on_abandoned(&mut self) {
         self.state = self.resting();
     }
@@ -375,39 +336,14 @@ impl EdgeMachine {
             } if current == source => {
                 self.state = EdgeState::Waiting {
                     target: Some(target),
-                    seen_at: None,
                 };
                 SourceEndedEffect::ResetCurrent
             }
             // B left before its group start: A is KEPT (the slot must not go
             // dark) and the edge stays pending on B — MC still assigns B, so
             // if B returns its next group start completes the switch (and
-            // MH-B's keyframe request can fire for it). Only `seen_at` resets:
-            // nothing of the returning B has been seen yet.
-            EdgeState::SwitchPending {
-                current,
-                group,
-                target,
-                ..
-            } if target == source => {
-                self.state = EdgeState::SwitchPending {
-                    current,
-                    group,
-                    target,
-                    seen_at: None,
-                };
-                SourceEndedEffect::None
-            }
-            EdgeState::Waiting {
-                target: Some(target),
-                ..
-            } if target == source => {
-                self.state = EdgeState::Waiting {
-                    target: Some(target),
-                    seen_at: None,
-                };
-                SourceEndedEffect::None
-            }
+            // MH-B's keyframe request can fire for it, once the returning
+            // binding has been seen). A waiting edge likewise keeps waiting.
             _ => SourceEndedEffect::None,
         }
     }
@@ -417,7 +353,6 @@ impl EdgeMachine {
 mod tests {
     use super::*;
     use crate::routing::{SenderId, StreamNumber};
-    use std::time::Duration;
 
     fn src(sender: u32) -> CandidateRef {
         CandidateRef {
@@ -426,26 +361,26 @@ mod tests {
         }
     }
 
-    fn now() -> Instant {
-        Instant::now()
-    }
-
     #[test]
     fn a_first_forwarded_frame_is_always_a_group_start() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        assert_eq!(m.on_frame(src(1), 7, false, t), FrameDecision::Skip);
-        assert_eq!(m.waiting_with_source_seen(), Some(t), "seen while waiting");
-        assert_eq!(m.on_frame(src(1), 7, false, t), FrameDecision::Skip);
-        assert_eq!(m.on_frame(src(1), 8, true, t), FrameDecision::StartGroup);
-        assert_eq!(m.on_frame(src(1), 8, false, t), FrameDecision::Continue);
-        assert_eq!(m.waiting_with_source_seen(), None);
+        assert_eq!(m.on_frame(src(1), 7, false), FrameDecision::Skip);
+        assert_eq!(m.awaiting_group_start(), Some(src(1)), "still waiting");
+        assert_eq!(m.on_frame(src(1), 7, false), FrameDecision::Skip);
+        assert_eq!(m.on_frame(src(1), 8, true), FrameDecision::StartGroup);
+        assert_eq!(m.on_frame(src(1), 8, false), FrameDecision::Continue);
+        assert_eq!(m.awaiting_group_start(), None);
     }
 
     #[test]
-    fn a_source_never_seen_does_not_read_as_seen() {
+    fn a_fresh_edge_awaits_its_assigned_source_and_an_empty_one_awaits_nothing() {
         let m = EdgeMachine::new(Some(src(1)), false);
-        assert_eq!(m.waiting_with_source_seen(), None);
+        assert_eq!(m.awaiting_group_start(), Some(src(1)));
+        assert_eq!(EdgeMachine::new(None, false).awaiting_group_start(), None);
+        assert_eq!(
+            EdgeMachine::new(Some(src(1)), true).awaiting_group_start(),
+            None
+        );
     }
 
     /// ADR §10 Tier 1a: ONE parameterised test, instant switching for a
@@ -456,11 +391,10 @@ mod tests {
     fn swap_only_at_an_independently_decodable_frame_for_both_shapes() {
         for every_frame_decodable in [true, false] {
             let mut m = EdgeMachine::new(Some(src(1)), false);
-            let t = now();
-            assert_eq!(m.on_frame(src(1), 1, true, t), FrameDecision::StartGroup);
+            assert_eq!(m.on_frame(src(1), 1, true), FrameDecision::StartGroup);
             m.assign(Some(src(2)), false);
             // B's first frame: a group start for the audio shape, a delta for video.
-            let first_b = m.on_frame(src(2), 2, every_frame_decodable, t);
+            let first_b = m.on_frame(src(2), 2, every_frame_decodable);
             if every_frame_decodable {
                 assert_eq!(first_b, FrameDecision::StartGroup, "audio never waits");
             } else {
@@ -470,11 +404,11 @@ mod tests {
                     "video waits for B's group start"
                 );
                 assert_eq!(
-                    m.on_frame(src(1), 1, false, t),
+                    m.on_frame(src(1), 1, false),
                     FrameDecision::Continue,
                     "A keeps forwarding while the switch is pending"
                 );
-                assert_eq!(m.on_frame(src(2), 3, true, t), FrameDecision::StartGroup);
+                assert_eq!(m.on_frame(src(2), 3, true), FrameDecision::StartGroup);
             }
             assert_eq!(
                 m.state(),
@@ -484,7 +418,7 @@ mod tests {
                 }
             );
             assert_eq!(
-                m.on_frame(src(1), 1, false, t),
+                m.on_frame(src(1), 1, false),
                 FrameDecision::Skip,
                 "A is done"
             );
@@ -494,10 +428,9 @@ mod tests {
     #[test]
     fn a_switch_is_abandoned_and_a_kept_when_b_leaves_first() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        m.on_frame(src(1), 1, true, t);
+        m.on_frame(src(1), 1, true);
         m.assign(Some(src(2)), false);
-        m.on_frame(src(2), 2, false, t);
+        m.on_frame(src(2), 2, false);
         assert_eq!(m.on_source_ended(src(2)), SourceEndedEffect::None);
         assert_eq!(
             m.forwarding_source(),
@@ -505,14 +438,14 @@ mod tests {
             "A kept: the slot never goes dark"
         );
         assert_eq!(
-            m.waiting_with_source_seen(),
-            None,
-            "the departed B is no longer seen"
+            m.awaiting_group_start(),
+            Some(src(2)),
+            "still pending on the departed B: MC still assigns it"
         );
         // B returns with MC's assignment unchanged: its group start switches.
         let mut returned = m.clone();
         assert_eq!(
-            returned.on_frame(src(2), 3, true, t),
+            returned.on_frame(src(2), 3, true),
             FrameDecision::StartGroup
         );
         assert_eq!(
@@ -522,14 +455,13 @@ mod tests {
                 group: 3
             }
         );
-        assert_eq!(m.on_frame(src(1), 1, false, t), FrameDecision::Continue);
+        assert_eq!(m.on_frame(src(1), 1, false), FrameDecision::Continue);
     }
 
     #[test]
     fn mc_reverting_abandons_the_pending_switch() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        m.on_frame(src(1), 1, true, t);
+        m.on_frame(src(1), 1, true);
         m.assign(Some(src(2)), false);
         assert_eq!(m.assign(Some(src(1)), false), AssignEffect::None);
         assert_eq!(
@@ -540,7 +472,7 @@ mod tests {
             }
         );
         assert_eq!(
-            m.on_frame(src(2), 2, true, t),
+            m.on_frame(src(2), 2, true),
             FrameDecision::Skip,
             "B no longer wanted"
         );
@@ -549,107 +481,98 @@ mod tests {
     #[test]
     fn a_second_switch_supersedes_the_pending_one() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        m.on_frame(src(1), 1, true, t);
+        m.on_frame(src(1), 1, true);
         m.assign(Some(src(2)), false);
-        m.on_frame(src(2), 2, false, t);
+        m.on_frame(src(2), 2, false);
         m.assign(Some(src(3)), false);
-        assert_eq!(m.waiting_with_source_seen(), None, "C has not been seen");
-        assert_eq!(m.on_frame(src(2), 4, true, t), FrameDecision::Skip);
-        assert_eq!(m.on_frame(src(3), 5, true, t), FrameDecision::StartGroup);
+        assert_eq!(m.awaiting_group_start(), Some(src(3)), "now awaiting C");
+        assert_eq!(m.on_frame(src(2), 4, true), FrameDecision::Skip);
+        assert_eq!(m.on_frame(src(3), 5, true), FrameDecision::StartGroup);
     }
 
     #[test]
     fn a_switch_to_a_paused_source_completes_at_once_and_cancels_the_wait() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        m.on_frame(src(1), 1, true, t);
+        m.on_frame(src(1), 1, true);
         m.assign(Some(src(2)), false);
-        m.on_frame(src(2), 2, false, t);
-        assert!(m.waiting_with_source_seen().is_some());
+        m.on_frame(src(2), 2, false);
+        assert_eq!(m.awaiting_group_start(), Some(src(2)));
         assert_eq!(m.assign(Some(src(2)), true), AssignEffect::Detach);
         assert_eq!(m.state(), EdgeState::Paused { source: src(2) });
         assert_eq!(
-            m.waiting_with_source_seen(),
+            m.awaiting_group_start(),
             None,
             "no keyframe wait while paused"
         );
         assert_eq!(
-            m.on_frame(src(1), 1, false, t),
+            m.on_frame(src(1), 1, false),
             FrameDecision::Skip,
             "A stopped"
         );
         // A resume that beat MC's update forwards from the next group start.
-        assert_eq!(m.on_frame(src(2), 3, false, t), FrameDecision::Skip);
-        assert_eq!(m.on_frame(src(2), 3, true, t), FrameDecision::StartGroup);
+        assert_eq!(m.on_frame(src(2), 3, false), FrameDecision::Skip);
+        assert_eq!(m.on_frame(src(2), 3, true), FrameDecision::StartGroup);
     }
 
     #[test]
     fn pausing_the_forwarded_source_changes_nothing() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        m.on_frame(src(1), 1, true, t);
+        m.on_frame(src(1), 1, true);
         assert_eq!(m.assign(Some(src(1)), true), AssignEffect::None);
-        assert_eq!(m.on_frame(src(1), 1, false, t), FrameDecision::Continue);
+        assert_eq!(m.on_frame(src(1), 1, false), FrameDecision::Continue);
     }
 
     #[test]
     fn an_identical_reassignment_is_a_true_no_op() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        m.on_frame(src(1), 1, false, t);
+        m.on_frame(src(1), 1, false);
         let before = m.clone();
         assert_eq!(m.assign(Some(src(1)), false), AssignEffect::None);
-        assert_eq!(m, before, "seen_at and state preserved");
+        assert_eq!(m, before, "state preserved");
     }
 
     #[test]
     fn abandonment_returns_to_waiting_for_the_assigned_source() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        m.on_frame(src(1), 1, true, t);
+        m.on_frame(src(1), 1, true);
         m.on_abandoned();
         assert_eq!(
             m.state(),
             EdgeState::Waiting {
                 target: Some(src(1)),
-                seen_at: None
             }
         );
         assert_eq!(
-            m.on_frame(src(1), 1, false, t),
+            m.on_frame(src(1), 1, false),
             FrameDecision::Skip,
             "never mid-group"
         );
-        assert_eq!(m.on_frame(src(1), 2, true, t), FrameDecision::StartGroup);
+        assert_eq!(m.on_frame(src(1), 2, true), FrameDecision::StartGroup);
     }
 
     #[test]
     fn abandoning_during_a_switch_waits_for_the_target() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        m.on_frame(src(1), 1, true, t);
+        m.on_frame(src(1), 1, true);
         m.assign(Some(src(2)), false);
         m.on_abandoned();
-        assert_eq!(m.on_frame(src(1), 1, true, t), FrameDecision::Skip);
-        assert_eq!(m.on_frame(src(2), 2, true, t), FrameDecision::StartGroup);
+        assert_eq!(m.on_frame(src(1), 1, true), FrameDecision::Skip);
+        assert_eq!(m.on_frame(src(2), 2, true), FrameDecision::StartGroup);
     }
 
     #[test]
     fn the_forwarded_source_ending_resets_and_waits() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        m.on_frame(src(1), 1, true, t);
+        m.on_frame(src(1), 1, true);
         assert_eq!(m.on_source_ended(src(1)), SourceEndedEffect::ResetCurrent);
         assert_eq!(m.forwarding_source(), None);
-        m.on_frame(src(1), 1, true, t);
+        m.on_frame(src(1), 1, true);
         m.assign(Some(src(2)), false);
         assert_eq!(m.on_source_ended(src(1)), SourceEndedEffect::ResetCurrent);
         assert_eq!(
             m.state(),
             EdgeState::Waiting {
                 target: Some(src(2)),
-                seen_at: None
             }
         );
     }
@@ -657,31 +580,29 @@ mod tests {
     #[test]
     fn a_stale_group_of_the_same_source_never_continues_a_newer_downlink() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        m.on_frame(src(1), 1, true, t);
-        m.on_frame(src(1), 2, true, t);
-        assert_eq!(m.on_frame(src(1), 1, false, t), FrameDecision::Skip);
-        assert_eq!(m.on_frame(src(1), 2, false, t), FrameDecision::Continue);
+        m.on_frame(src(1), 1, true);
+        m.on_frame(src(1), 2, true);
+        assert_eq!(m.on_frame(src(1), 1, false), FrameDecision::Skip);
+        assert_eq!(m.on_frame(src(1), 2, false), FrameDecision::Continue);
     }
 
     #[test]
     fn an_independently_decodable_frame_inside_the_same_group_continues_it() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        assert_eq!(m.on_frame(src(1), 1, true, t), FrameDecision::StartGroup);
+        assert_eq!(m.on_frame(src(1), 1, true), FrameDecision::StartGroup);
         assert_eq!(
-            m.on_frame(src(1), 1, true, t),
+            m.on_frame(src(1), 1, true),
             FrameDecision::Continue,
             "no new downlink"
         );
         m.assign(Some(src(2)), false);
         assert_eq!(
-            m.on_frame(src(1), 1, true, t),
+            m.on_frame(src(1), 1, true),
             FrameDecision::Continue,
             "pending: same group"
         );
         assert_eq!(
-            m.on_frame(src(1), 0, true, t),
+            m.on_frame(src(1), 0, true),
             FrameDecision::Skip,
             "an older group never reopens"
         );
@@ -690,10 +611,9 @@ mod tests {
     #[test]
     fn an_edge_with_no_candidate_forwards_nothing() {
         let mut m = EdgeMachine::new(None, false);
-        let t = now();
-        assert_eq!(m.on_frame(src(1), 1, true, t), FrameDecision::Skip);
+        assert_eq!(m.on_frame(src(1), 1, true), FrameDecision::Skip);
         m.assign(Some(src(1)), false);
-        assert_eq!(m.on_frame(src(1), 1, true, t), FrameDecision::StartGroup);
+        assert_eq!(m.on_frame(src(1), 1, true), FrameDecision::StartGroup);
         assert_eq!(m.assign(None, false), AssignEffect::Detach);
         assert_eq!(m.forwarding_source(), None);
     }
@@ -701,21 +621,12 @@ mod tests {
     #[test]
     fn there_is_no_give_up_timeout() {
         let mut m = EdgeMachine::new(Some(src(1)), false);
-        let t = now();
-        m.on_frame(src(1), 1, false, t);
-        let much_later = t + Duration::from_hours(24);
-        assert_eq!(
-            m.on_frame(src(1), 1, false, much_later),
-            FrameDecision::Skip
-        );
-        assert_eq!(
-            m.waiting_with_source_seen(),
-            Some(t),
-            "first-seen kept, still waiting"
-        );
-        assert_eq!(
-            m.on_frame(src(1), 2, true, much_later),
-            FrameDecision::StartGroup
-        );
+        // The machine holds no clock at all: however many deltas arrive, it
+        // keeps waiting, and the next group start still lands.
+        for _ in 0..10_000 {
+            assert_eq!(m.on_frame(src(1), 1, false), FrameDecision::Skip);
+        }
+        assert_eq!(m.awaiting_group_start(), Some(src(1)), "still waiting");
+        assert_eq!(m.on_frame(src(1), 2, true), FrameDecision::StartGroup);
     }
 }

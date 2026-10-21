@@ -157,6 +157,65 @@ impl VideoSubscriber {
     }
 }
 
+impl VideoSubscriber {
+    /// Everything this subscriber reported, drained until it has been quiet
+    /// for `quiet` OR `slice` has passed, whichever comes first — both DRAIN
+    /// bounds, never pass conditions. The slice bound matters while a
+    /// publisher is still sending: its events never go quiet, and an
+    /// unbounded drain would starve every deadline check that calls it.
+    ///
+    /// # Panics
+    ///
+    /// If the MH connection closes mid-drain.
+    pub async fn drain(&mut self, quiet: Duration, slice: Duration) -> Vec<SubscriberEvent> {
+        let until = std::time::Instant::now() + slice;
+        let mut out = Vec::new();
+        while std::time::Instant::now() < until {
+            match self.next(quiet).await {
+                Next::Event(event) => {
+                    assert!(
+                        event != SubscriberEvent::ConnectionClosed,
+                        "a video subscriber's MH connection closed mid-test"
+                    );
+                    out.push(event);
+                }
+                Next::Quiet => break,
+            }
+        }
+        out
+    }
+
+    /// Wait for a frame that is NOT a group start (on `slot`, if given) and
+    /// return its `GoP` counter: the group the publisher is inside right now.
+    ///
+    /// # Panics
+    ///
+    /// When none arrives within `deadline` — a FAILURE bound; `context` names
+    /// the phase and receiver in the message.
+    pub async fn mid_group_counter(
+        &mut self,
+        context: &str,
+        slot: Option<u32>,
+        quiet: Duration,
+        deadline: Duration,
+    ) -> u32 {
+        let until = std::time::Instant::now() + deadline;
+        loop {
+            assert!(
+                std::time::Instant::now() < until,
+                "VIDEO-NOT-OBSERVED: {context}: no mid-group frame within {deadline:?}"
+            );
+            if let Next::Event(SubscriberEvent::Frame { frame, .. }) = self.next(quiet).await {
+                if !frame.independently_decodable
+                    && slot.is_none_or(|slot| u32::from(frame.slot_id) == slot)
+                {
+                    return frame.gop_counter;
+                }
+            }
+        }
+    }
+}
+
 impl Drop for VideoSubscriber {
     fn drop(&mut self) {
         self.accept.abort();
