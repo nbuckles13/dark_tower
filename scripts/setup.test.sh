@@ -80,9 +80,13 @@ src_run() {
 RUN_GUARD='check_build_disk_space "${ARGS[0]}"'
 
 # === (1) forced TRIP: min-disk floor absurdly high → comparison trips on the real fs ========
-# Real df on the real graphroot (or its PROJECT_ROOT fallback — always df-able, so avail_gb
-# is always populated and the huge floor always trips, even on a host without podman).
-trip_out="$(DEVLOOP_MIN_DISK_GB=999999999 src_run "$DEPLOY" "$RUN_GUARD" podman 2>&1)"
+# Real df on the guard's fallback graphroot (ending at PROJECT_ROOT — always df-able, so
+# avail_gb is always populated and the huge floor always trips). The runtime is a name that
+# does not exist, so `info` fails at once: a real podman that is slow to answer (cold rootless
+# podman on a CI runner) would hit ENV_PROBE_TIMEOUT and take the runtime-unreachable exit 2
+# instead, which this case would misread. The hung-runtime path has its own stubbed case below.
+NO_RUNTIME="dt-no-such-container-runtime"
+trip_out="$(DEVLOOP_MIN_DISK_GB=999999999 src_run "$DEPLOY" "$RUN_GUARD" "$NO_RUNTIME" 2>&1)"
 trip_rc=$?
 assert_rc "trip-exit2" 2 "$trip_rc"
 # The operator contract: line-anchored, greppable by the §4 one-pass scan.
@@ -93,7 +97,7 @@ assert_status "trip-remediation-hint" "podman image prune -f" "$trip_out"
 # === (2) PASS path: a 0 GB floor cannot trip (avail_gb >= 0) → exit 0, no banner ============
 # Guards against a regression where the guard trips unconditionally (which would still pass
 # case 1). Proves the comparison is real, not always-fail.
-pass_out="$(DEVLOOP_MIN_DISK_GB=0 src_run "$DEPLOY" "$RUN_GUARD" podman 2>&1)"
+pass_out="$(DEVLOOP_MIN_DISK_GB=0 src_run "$DEPLOY" "$RUN_GUARD" "$NO_RUNTIME" 2>&1)"
 pass_rc=$?
 assert_rc "pass-exit0" 0 "$pass_rc"
 grep -Eq 'PRECONDITION_FAILURE' <<<"$pass_out"
