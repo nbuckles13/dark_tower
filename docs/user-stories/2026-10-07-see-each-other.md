@@ -815,7 +815,7 @@ tasks:
   tier: light
   tier_reason: docs-only runbook edits; no code, contract or security surface
 - id: 5
-  status: pending
+  status: completed
   specialist: client
   deps:
   - 1
@@ -883,6 +883,7 @@ tasks:
     - Dual-encode is transitional only and is removed by task 6 (P2). There is no runtime path to choose v2 except MC's directive during the transition.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-21-c-v3-ts-frame-codec
   tag: story-2026-10-07-see-each-other-task-5
 - id: 6
   status: pending
