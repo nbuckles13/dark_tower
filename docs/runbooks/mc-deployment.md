@@ -153,6 +153,17 @@ Complete ALL items before deploying to production:
 
 ### Coordination
 
+- [ ] **Story 3 ("see each other") is ONE coordinated cutover: config → MH → MC → browser SDK,
+  and rolling back across it is all components together** (R-25, confirmed 2026-10-08). The
+  authority, with the skew-detection table and the three-layer rollback, is
+  [`mh-deployment.md` §Story 3 cutover](mh-deployment.md#story-3-cutover-see-each-other-order-skew-detection-rollback).
+  The MC view is [§Story 3 cutover](#story-3-cutover-see-each-other-the-mc-view) below. **For that
+  cutover it supersedes every ordering bullet that follows in this list.** Those bullets were written
+  for story-2 releases. Within the v3 era they impose no order (R-25: one component, one version
+  back, holds), and across the cutover nothing rolls alone. The bullets most likely to mislead are
+  "the browser SDK must roll BEFORE this MC image" and the `sender_id` rule's "forward MC first",
+  because story 3 puts MH before MC and the SDK last. *(Added 2026-10-21, story 3 OPS-A.)*
+
 - [ ] **MC and the browser SDK ship together** (wire-lockstep)
   - The ADR-0036 signalling reshape is a breaking wire change: `ClientMessage`
     tag 8 changed message type, and stream assignments moved from tag 5 to 12.
@@ -170,6 +181,10 @@ Complete ALL items before deploying to production:
     The field is additive: an older SDK ignores it; a newer SDK against an older
     MC sees it absent, treats the cap as unknown and declares, and MC's
     whole-declaration rejection (`slot_count_over_cap`) stays the enforcer.
+    *(Pre-story-3 history, corrected 2026-10-21: from MC-A each kind is
+    truncated to its own cap and the excess slots show `unavailable`. An
+    over-cap declaration is never rejected, and the first bullet of this list
+    governs the story-3 roll.)*
   - **Story 2 task 20 (shared-handler edge model) adds a VERSION-SKEW WINDOW,
     not just an ordering rule** — see Deployment Steps §0. MC now offers every
     handler and may direct a sender at SEVERAL handlers and a subscriber's slots
@@ -290,7 +305,42 @@ Complete ALL items before deploying to production:
 
 ## Deployment Steps
 
+### Story 3 cutover (see each other): the MC view
+
+The order, the skew table and the rollback have **one home**:
+[`mh-deployment.md` §Story 3 cutover](mh-deployment.md#story-3-cutover-see-each-other-order-skew-detection-rollback).
+What MC operators need from it:
+
+- **Order: config → MH → MC → browser SDK.** MC goes third. Do not roll MC until both MH pods show
+  `mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}` **present** (MH-A1's
+  per-stream transport check is live). A story-3 MC in front of a story-2 MH has every
+  registration that carries a video egress rejected **whole**, audio included
+  ([Mixed-Transport Rollback Hazard](mh-deployment.md#mixed-transport-rollback-hazard)). The
+  config step (a) already rolled both MC pods once, because the shared `media-codec-profile`
+  changed their pod templates. That roll changes no behaviour on the old image.
+- **On Kind it is one converge.** `infra/kind/scripts/deploy.sh` applies MC, MH and the config in
+  one `kubectl apply -k` and cannot sequence MH before MC. Run it with no live meetings. The
+  browser bundle is a separate step that `deploy.sh` does not perform.
+- **What MC counts during the window.** An old SDK joining a story-3 MC is refused at join
+  (`supported_header_versions` lacks 3) on
+  `mc_session_join_failures_total{error_type="header_version_unsupported"}`, which is shipped by
+  MC-A. That is the stale-bundle tail. Users clear it by reloading.
+- **Rollback.** Within the v3 era, `kubectl rollout undo` of mc-0 AND mc-1 holds (one version
+  back, R-25). **Across the cutover, never roll MC back alone.** A pre-story MC directs
+  `header_version` 2, which a v3 SDK refuses and a v3 MH drops. Roll back everything together:
+  on Kind, `deploy.sh` from the last pre-story-3 commit, then the bundle.
+- **For a video-only incident, use the [video-off lever](#video-off-lever) BEFORE any rollback.**
+
 ### 0. Roll the browser SDK first (story 2 task 20 and later)
+
+> **Scope (corrected 2026-10-21, story 3 OPS-A, R-25): this step does NOT apply to the story-3
+> cutover, and within the v3 era it imposes no order.** Story 3's cutover puts the SDK **last**
+> (config → MH → MC → SDK; [§Story 3 cutover](#story-3-cutover-see-each-other-the-mc-view)).
+> A reader who trusted "SDK first" for story 3 would ship a v3 SDK in front of a pre-story MC,
+> and once C-A1 lands that SDK refuses the old MC's `header_version` 2 directive and sends no
+> audio at all. The rule below still describes story 2 task 20's skew between pre-story-3
+> builds. Every story-3 build has multi-target send and multi-transport receive, so the skew it
+> guards against cannot occur within the v3 era.
 
 The SDK tolerates an old MC (one handler offered, one target), but an old SDK
 does NOT tolerate the new MC under partial connectivity (see §Coordination: it
@@ -504,7 +554,17 @@ kubectl logs deployment/mc-1 -n dark-tower | grep "Configuration loaded successf
 
 - [ ] `max_receive_slots`, `max_receive_capability_declarations`, `audio_codec`,
       `audio_max_bitrate_bps`, `audio_frame_rate_hz` are present on the line and
-      match `infra/services/mc-service/config.env`
+      match `infra/services/mc-service/config.env`. **That holds until MC-A lands.**
+- [ ] **From MC-A (story 3):** the line carries the per-kind caps and the directive
+      parameters MC read. Check the caps against `MC_MAX_AUDIO_RECEIVE_SLOTS` /
+      `MC_MAX_VIDEO_RECEIVE_SLOTS` in `infra/services/mc-service/config.env`, and the
+      audio and video directive values (including the minimum keyframe interval)
+      against `infra/services/media-codec-profile/profile.env`, **not** against the
+      retired `MC_MAX_RECEIVE_SLOTS` / `MC_AUDIO_*`. MC-A names the fields. Verify them
+      against the line itself, and do not assume the story-2 spellings carried over.
+      A video cap of 0 here means the [video-off lever](#video-off-lever) is pulled.
+      The same values are readable at runtime on `mc_media_receive_slot_cap{media_kind}`
+      and `mc_media_video_keyframe_min_interval_seconds`.
 - [ ] **mc-0 and mc-1 report identical values.** They read one shared ConfigMap,
       so a difference means one Deployment's `configMapKeyRef` block is stale —
       the guard-green split-brain the ConfigMap banner warns about.
@@ -543,7 +603,10 @@ kubectl logs deployment/mc-1 -n dark-tower | grep "Configuration loaded successf
       decides whether a shutdown release happens at all.
 
 > **That WARN will not appear in the error grep above.** §Logs review greps
-> `error|panic|fatal`; this one is a `WARN`. `mc-service` emits it whenever
+> `error|panic|fatal`; this one is a `WARN`. *(From MC-A the value is the profile's
+> `MEDIA_AUDIO_FRAME_RATE_HZ`, and from MH-A1 a value other than MH's single supported rate makes
+> MH refuse to boot rather than understate. See the header of
+> `infra/services/media-codec-profile/profile.env`.)* `mc-service` emits it whenever
 > `MC_AUDIO_FRAME_RATE_HZ` is not 50 Hz, because `mh-service` sizes its datagram
 > send buffer in bytes against 20 ms frames and will then **understate** its
 > reported held latency. A non-50 value is legal (ADR-0036 §3's 40 ms
@@ -650,6 +713,14 @@ kill %1
 - Critical changes: 24 hours with on-call monitoring
 
 ### How to Rollback
+
+> **Story 3 cutover first (R-25).** If the build you are leaving contains story 3 and the build you
+> are returning to does not, **this procedure's MC-only steps do not apply.** MH, MC, the SDK
+> bundle and the config roll back together:
+> [`mh-deployment.md` §Story 3 cutover](mh-deployment.md#story-3-cutover-see-each-other-order-skew-detection-rollback),
+> layer 3. An MC-only undo across it directs `header_version` 2 into a v3 fleet, which silences
+> audio. Within the v3 era, the steps below hold, one version back. For a video-only problem, use
+> the [video-off lever](#video-off-lever) before any rollback.
 
 > **Cross-service order for the story-2 task-12 release: roll back MH → MC →
 > GC** (MC before GC, or ended meeting ids become unjoinable). The full
@@ -795,13 +866,16 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 | `MC_TLS_KEY_PATH` | **Yes** | PEM private key for the WebTransport server. Existence checked at startup, with the same caveat as `MC_TLS_CERT_PATH` above. | None | `/etc/mc-tls/tls.key` |
 | `MC_GRPC_ADVERTISE_ADDRESS` | **Yes** | Address GC uses to reach this pod's gRPC. Built from the downward-API `POD_IP`. | None | `http://$(POD_IP):50052` |
 | `MC_WEBTRANSPORT_ADVERTISE_ADDRESS` | **Yes** | Address GC hands clients for this pod. **Per-instance** — from `mc-0-config` / `mc-1-config`, not the shared ConfigMap. | None | `https://127.0.0.1:4433` |
-| `MC_MAX_RECEIVE_SLOTS` | **Yes** | Max receive slots one client may declare in a `ReceiveCapability` (ADR-0036 §6). Over-cap rejects the **whole declaration**. The value itself is validated `1..=64` at load — a cap whose own value is unbounded is not a cap. | `8` (in ConfigMap) | `8` |
+| `MC_MAX_RECEIVE_SLOTS` *(RETIRED by story 3)* | **Yes, until MC-A** | Superseded by the per-kind caps below. In story 2 it is a **TOTAL** across kinds. Until MC-A lands the current image still reads it, rejects an over-cap declaration **whole** (`slot_count_over_cap`), validates the value itself at load (`MIN_RECEIVE_SLOTS`/`MAX_RECEIVE_SLOTS`, `crates/mc-service/src/config.rs`), and publishes it as `mc_media_receive_slot_cap{media_kind="audio"}`. MC-A removes the read. The ref is `optional: true` (step 1 of the two-deploy retirement), and deletion is scheduled in `docs/TODO.md` §Media Path Obligations, "Delete the story-3 retired config keys". Do not tune it. | `8` (in ConfigMap) | `8` |
+| `MC_MAX_AUDIO_RECEIVE_SLOTS` *(story 3)* | **Hard ref** (read from MC-A) | Max AUDIO receive slots per client (R-1). Each kind is **truncated** to its own cap: excess slots report `SLOT_STATE_UNAVAILABLE`, which is visible, **never a join failure** (this supersedes story 2's whole-declaration reject). Bounds: `crates/mc-service/src/config.rs`, added by MC-A. The floor is not 0, because an audio cap of 0 would be a silent total outage that reads as valid config. Absent key: `CreateContainerConfigError` today, and an MC-A boot refusal after. Published as `mc_media_receive_slot_cap{media_kind="audio"}` (from MC-A; until then that series echoes the retired key). | `8` (in ConfigMap) | `8` |
+| `MC_MAX_VIDEO_RECEIVE_SLOTS` *(story 3)* | **Hard ref** (read from MC-A) | Max VIDEO receive slots per client (R-1), truncated like audio. Bounds: `crates/mc-service/src/config.rs`, added by MC-A. **0 is legal: it is the [video-off lever](#video-off-lever)** (R-26). It lives in this ConfigMap only, never in `media-codec-profile`, so changing it rolls MC and never MH. Absent key: as audio. Published as `mc_media_receive_slot_cap{media_kind="video"}` (MC-A); 0 confirms the lever. | `4` (in ConfigMap) | `0` = video off |
 | `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS` | **Yes** | Per-connection budget on *accepted* capability declarations. Bounds client-driven O(N) meeting-actor work; over-budget declarations are rejected and counted. | `64` (in ConfigMap) | `64` |
-| `MC_AUDIO_CODEC` | **Yes** | Codec MC directs clients to produce for main audio. Parsed to the `Codec` proto enum; unrecognised values, `unspecified`, and video codecs all fail at startup. | `opus` (in ConfigMap) | `opus` |
-| `MC_AUDIO_MAX_BITRATE_BPS` | **Yes** | Max audio bitrate MC directs. Top of the 32–48 kbps band `mh-service` sizes its datagram buffer against; validated against that band at load. | `48000` (in ConfigMap) | `48000` |
+| `MC_AUDIO_CODEC`, `MC_AUDIO_MAX_BITRATE_BPS`, `MC_AUDIO_FRAME_RATE_HZ` *(RETIRED by story 3)* | **Yes, until MC-A** | Superseded by `MEDIA_AUDIO_CODEC`, `MEDIA_AUDIO_MAX_BITRATE_BPS` and `MEDIA_AUDIO_FRAME_RATE_HZ` in the shared profile (rows below). **Until MC-A lands the current image still reads, validates and DIRECTS these three**, and the directive clients receive carries these values, not the profile's. Change them only together with the profile keys. MC-A removes the reads. The refs are `optional: true`, and deletion is scheduled with `MC_MAX_RECEIVE_SLOTS`. | `opus` / `48000` / `50` (in ConfigMap) | — |
+| `MEDIA_VIDEO_CODEC`, `MEDIA_VIDEO_WIDTH`, `MEDIA_VIDEO_HEIGHT`, `MEDIA_VIDEO_FRAME_RATE_HZ`, `MEDIA_VIDEO_MAX_BITRATE_BPS` *(story 3)* | **Hard ref** to ConfigMap **`media-codec-profile`** (read from MC-A) | The VP8 send directive MC gives video publishers (R-8). MC reads all nine profile keys. Bounds: `crates/mc-service/src/media_signaling/directive.rs`, added by MC-A. An unknown codec or an out-of-bounds value refuses boot and never falls back. MH also derives its video cost from the frame rate and bitrate, so **editing any profile key rolls mc-0, mc-1, mh-0 and mh-1 together**, and the MH roll sheds every session on each pod. | `profile.env` | — |
+| `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS` *(story 3)* | **Hard ref** to `media-codec-profile` (read from MC-A) | The minimum interval between request-driven keyframes. It is a **profile** key, not an MC key, and there is no keyframe interval (R-9). MC carries it on the video directive as `min_keyframe_interval_ms` and publishes it as `mc_media_video_keyframe_min_interval_seconds` (MC-A). It is server-configured and never client-reported; the client honours max(directed, its compiled floor). Bounds: `MIN_KEYFRAME_INTERVAL_MS_FLOOR`/`_CEILING` in `directive.rs` (MC-A). MH-B refuses to boot unless `MH_KEYFRAME_REQUEST_RETRY_MS` ≥ this. | `profile.env` | — |
+| `MEDIA_AUDIO_CODEC`, `MEDIA_AUDIO_MAX_BITRATE_BPS`, `MEDIA_AUDIO_FRAME_RATE_HZ` *(story 3)* | **Hard ref** to `media-codec-profile` (read from MC-A) | The audio send directive. MC keeps its existing `AUDIO_*` bounds (`directive.rs`). MH-A1 also reads the bitrate and frame rate and **refuses to boot** on a bitrate outside its supported band or a frame rate other than the one its frame duration implies, so the deployable value is the intersection (header of `profile.env`). | `profile.env` | — |
 | `MC_MEDIA_CONNECT_SETTLE_MS` | **Yes** | Connect settle window (ADR-0036 §9, story 2 task 20): how long after a participant's FIRST MH-reported connection MC waits before routing on whatever it observed. Ends early once the participant reaches every handler of its meeting. **Not a debounce** — without it an all-connected meeting loses co-location permanently. Validated `100..=10000` at load. Published as `mc_media_connect_settle_window_seconds`. | `1500` (in ConfigMap) | `1500` |
 | `MC_KEK_ROTATION_DEBOUNCE_SECONDS` | **Yes** | W, the meeting KEK rotation debounce window (ADR-0036 §4 Rotation, story 2 task 9). Every roster removal schedules a KEK rotation, debounced to at most once per W measured from the OLDEST un-rotated removal. **W is the exposure bound on a departed participant**, so the value is a security setting, not a tuning one. Carried to clients as `kek_rotation_debounce_seconds`; they derive their previous-KEK retention from it, so changing W moves client key hygiene too. Validated both sides at load; the bounds and their derivation live in `crates/mc-service/src/config.rs` (`MIN_`/`MAX_KEK_ROTATION_DEBOUNCE_SECONDS`). Published as `mc_meeting_kek_rotation_window_seconds`. | `60` (in ConfigMap) | `60` |
-| `MC_AUDIO_FRAME_RATE_HZ` | **Yes** | Audio frames per second MC directs (50 Hz = 20 ms frames). Same physical quantity as `mh-service`'s `AUDIO_FRAME_DURATION_MS = 20` in the reciprocal unit; changing it moves MH's "32 frames = 640 ms" latency budget. | `50` (in ConfigMap) | `50` |
 | `MC_REGION` | No | Geographic region for this MC. | `us-east-1` | `local` |
 | `GC_GRPC_URL` | No | Global Controller gRPC endpoint. | `http://localhost:50051` | `http://gc-service.dark-tower:50051` |
 | `MC_WEBTRANSPORT_BIND_ADDRESS` | No | WebTransport (QUIC/UDP) bind address. | `0.0.0.0:4433` | `0.0.0.0:4433` |
@@ -839,9 +913,13 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 > `mc_media_end_meeting_total{outcome="superseded_by_successor"}`, which is
 > expected during a roll — see `mc-incident-response.md` Scenario 20.
 
-**The seventeen Required rows are the CrashLoop list.** Each is loaded via
+**The rows whose Required column reads Yes are the CrashLoop list.** (They are not counted
+here: a restated count is what goes stale.) Each is loaded via
 `ConfigError::MissingEnvVar` in `crates/mc-service/src/config.rs`, so absence
-fails config load before the server binds: the pod enters `CrashLoopBackOff`
+fails config load before the server binds. The **Hard ref** rows (story 3) are not read by the
+current image. An absent key there is a `CreateContainerConfigError` (kubelet, empty logs, no
+container ever ran), and they join the CrashLoop list when MC-A adds the reads. The retired rows
+leave it at the same moment. For Yes rows: the pod enters `CrashLoopBackOff`
 and the reason is the first line of the container log. `MC_TLS_CERT_PATH` and
 `MC_TLS_KEY_PATH` additionally fail when the *file* is absent — but **that check
 is only reachable once the container starts**, so it is the signal for a Secret
@@ -860,11 +938,35 @@ kubelet cannot complete the mount and the pod stays Pending in
 > catches drift here automatically. Re-verify against `config.rs` whenever a
 > key is added or removed.
 
-> **`MC_AUDIO_*` has no observable effect until the client honours the send
-> directive** (story task 19). MC emits the directive today and the SDK still
+> **(Pre-story-3 history.) `MC_AUDIO_*` has no observable effect until the client honours the send
+> directive** (story task 19). Since story 3 these keys are retired in favour of the profile's
+> `MEDIA_AUDIO_*` (rows above). MC emits the directive today and the SDK still
 > uses its own encoder settings, so tuning these three changes the wire message
 > and nothing an operator can measure. Stated here because a live-looking knob
 > that does nothing generates support questions for a whole story.
+
+### Video-off lever
+
+**`MC_MAX_VIDEO_RECEIVE_SLOTS=0` turns video off and leaves audio untouched** (story 3 R-26, once
+MC-A lands). What it does, its cost (it rolls both MC pods and never MH), its blast radius, its
+place **before any rollback**, and how it is verified have one home:
+[`mh-deployment.md` §Operator levers](mh-deployment.md#operator-levers-for-media-video-off-and-nothing-else).
+This subsection carries only the MC procedure.
+
+- **Procedure.** Make the edit **on the commit that is currently deployed, with nothing else
+  changed**. Set `MC_MAX_VIDEO_RECEIVE_SLOTS=0` in `infra/services/mc-service/config.env` and
+  apply the environment root (Kind: `dev-cluster deploy` / `infra/kind/scripts/deploy.sh`).
+  `deploy.sh` converges **every** workload to the checked-out tree, so any other difference rolls
+  too, and an MH difference sheds MH sessions. With only this edit, content addressing rolls mc-0
+  and mc-1 and nothing else. Do not `kubectl edit` the live ConfigMap
+  ([§Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)).
+- **Confirm.** `mc_media_receive_slot_cap{media_kind="video"}` reads **0 on both mc-0 and mc-1**,
+  and `mc_media_slot_states_total{media_kind="video",slot_state="unavailable"}` rises while every
+  other video slot state stays flat.
+- **Undo.** Make the reverse edit the same way. It costs another MC roll, and restores directives.
+- **A host's server unmute can resume a participant's camera or microphone** (R-18), at any time
+  and independent of this lever, unless the participant has client-muted that kind. The
+  participant is shown a non-suppressible notice at that moment and can client-mute at once.
 
 ### Config-failure triage: three signals, and `kubectl logs` is wrong for all three
 
@@ -1050,16 +1152,27 @@ data:
   # statement of the intended value. THIS BLOCK IS A COPY — do not edit it to
   # change a value; edit config.env and apply the root (see the ordering banner there).
   # Same convention as the mc-alerts.yaml pointer further down this file.
-  MC_MAX_RECEIVE_SLOTS: "8"                    # validated 1..=64 at load
+  MC_MAX_AUDIO_RECEIVE_SLOTS: "8"              # story 3; bounds in config.rs (MC-A)
+  MC_MAX_VIDEO_RECEIVE_SLOTS: "4"              # story 3; 0 = video-off lever (R-26)
+  MC_MAX_RECEIVE_SLOTS: "8"                    # RETIRED (story 3); read until MC-A
   MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS: "64"
-  MC_AUDIO_CODEC: "opus"
-  MC_AUDIO_MAX_BITRATE_BPS: "48000"            # top of mh-service's 32-48 kbps band
-  MC_AUDIO_FRAME_RATE_HZ: "50"                 # 50 Hz = 20 ms frames
+  MC_AUDIO_CODEC: "opus"                       # RETIRED (story 3); read until MC-A
+  MC_AUDIO_MAX_BITRATE_BPS: "48000"            # RETIRED (story 3); read until MC-A
+  MC_AUDIO_FRAME_RATE_HZ: "50"                 # RETIRED (story 3); read until MC-A
   # ---- ADR-0036 §9 connect settle window (REQUIRED; absent = CrashLoop) ----
   MC_MEDIA_CONNECT_SETTLE_MS: "1500"           # validated 100..=10000 at load; see config.env
   # ---- ADR-0036 §4 KEK rotation (REQUIRED; absent = CrashLoop) ----
   MC_KEK_ROTATION_DEBOUNCE_SECONDS: "60"       # W; bounds in config.rs; see config.env
 ```
+
+**Shared with MH: `media-codec-profile`** (story 3), generated from
+`infra/services/media-codec-profile/profile.env`, a generator-only base. It holds the nine `MEDIA_*`
+encoding keys MC directs and MH costs against. Its content is not copied here. Read
+`profile.env`, whose header carries the membership rule (only values both services must agree on;
+a header rule, not a guard) and the roll cost: **any edit rolls mc-0, mc-1, mh-0 and mh-1
+together.** Kind runs the production profile until INF-C adds the Kind test-profile patch in
+`infra/kubernetes/overlays/kind/services/media-codec-profile/`. There is no `dev-web.sh` override
+for the profile: to change it, edit (or, once it exists, remove) that patch and redeploy.
 
 **Per-instance ConfigMaps: `mc-0-config`, `mc-1-config`** — carry only
 `MC_WEBTRANSPORT_ADVERTISE_ADDRESS`, which necessarily differs per pod. Both
@@ -1639,7 +1752,7 @@ sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
 > **MC-restart floor adoptions do NOT appear in the "No unconfirmed pushes" gate, by design.** A rolled MC pod's first push to a live handler is answered with the pre-restart generation; MC records that on `mc_media_policy_generation_adoptions_total` INSTEAD of `generation_mismatch`, so the gate stays green on a healthy rollout. Expect `increase(mc_media_policy_generation_adoptions_total{outcome="adopted"}[30m])` to be non-zero after an MC roll with live meetings — **at most one per live (meeting, handler)**, which is the value with that bound. The sibling `{outcome="superseded"}` counts restart-floor replies discarded for a newer render (routine churn) and has NO such bound, so do not read the unlabelled total as a meeting count. A FAILED adoption is recorded as `generation_mismatch` and fails the gate, correctly. See the metrics catalog entry for why this is a sibling counter and not a sixth `outcome` value.
 - [ ] Cross-check the MH-side checklist (link above) for the full set of MH-side checks (handshake, JWT, timeout, MH→MC delivery success rate, active connections)
 
-**Rollback (MC half)**: same as the join-flow rollback above — `kubectl rollout undo deployment/mc-0 -n dark-tower` and `kubectl rollout undo deployment/mc-1 -n dark-tower` (MC ships as two per-ordinal Deployments; there is no Deployment named `mc-service` — that string is a Service, a PDB and a container name. Form per `docs/runbooks/mh-deployment.md`). **Carve-out — do NOT roll MC back for sustained `no_applied_generation`.** If `mc_media_policy_pushes_total{outcome="no_applied_generation"}` is climbing with retries exhausted after a deploy, MH is below the ADR-0036 §8 contract and **the remedy is to roll MH forward, not MC back**: rolling MC back returns it to `policy_generation: 0` registrations, which MH installs nothing for — the pre-change media blackhole, not a fix. If the issue is on the MH side (handshake, JWT, RegisterMeeting timeouts), follow the rollback criteria + `mh-service` rollback documented in `docs/runbooks/mh-deployment.md` §"Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination" → "Rollback criteria".
+**Rollback (MC half)** *(within the v3 era only; across the story-3 cutover nothing rolls back alone — [§Story 3 cutover](#story-3-cutover-see-each-other-the-mc-view))*: same as the join-flow rollback above — `kubectl rollout undo deployment/mc-0 -n dark-tower` and `kubectl rollout undo deployment/mc-1 -n dark-tower` (MC ships as two per-ordinal Deployments; there is no Deployment named `mc-service` — that string is a Service, a PDB and a container name. Form per `docs/runbooks/mh-deployment.md`). **Carve-out — do NOT roll MC back for sustained `no_applied_generation` (and, from story 3, for `transport_mode_mismatch`: [Mixed-Transport Rollback Hazard](mh-deployment.md#mixed-transport-rollback-hazard)).** If `mc_media_policy_pushes_total{outcome="no_applied_generation"}` is climbing with retries exhausted after a deploy, MH is below the ADR-0036 §8 contract and **the remedy is to roll MH forward, not MC back**: rolling MC back returns it to `policy_generation: 0` registrations, which MH installs nothing for — the pre-change media blackhole, not a fix. If the issue is on the MH side (handshake, JWT, RegisterMeeting timeouts), follow the rollback criteria + `mh-service` rollback documented in `docs/runbooks/mh-deployment.md` §"Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination" → "Rollback criteria".
 
 **Carve-out #2 — do NOT roll MC back on a media-session decline spike.** Since
 `NotifyParticipantConnectedResponse` gained `sender_id`, MC and MH are a two-sided
@@ -1718,6 +1831,8 @@ handler.
 - **Source Code:** `crates/mc-service/`
 - **Kubernetes Manifests (base):** `infra/services/mc-service/`
 - **Kubernetes Manifests (Kind overlay):** `infra/kubernetes/overlays/kind/services/mc-service/`
+- **Shared media codec profile:** `infra/services/media-codec-profile/` (story 3)
+- **Story 3 cutover:** `docs/user-stories/2026-10-07-see-each-other.md` (R-23, R-25, R-26); deploy-order authority `docs/runbooks/mh-deployment.md` §Story 3 cutover
 
 ---
 

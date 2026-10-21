@@ -1496,7 +1496,7 @@ fire), `MHCallerTypeRejected` (Scenario 7 — the Step 4 escalation route).
 > `infra/docker/prometheus/rules/mh-alerts.yaml` cite their anchors. Renumbering would have broken
 > four guard-resolved links.
 
-**What this is.** Audio is carried one frame per **QUIC datagram** (ADR-0036 §1). Datagrams are
+**What this is.** Audio is carried one frame per **QUIC datagram** (ADR-0036 §1). *(Scope, corrected 2026-10-21, story 3 OPS-A: the media path is no longer datagram-only. From MH-A2, video rides one QUIC unidirectional stream per group beside datagram audio in the same meeting. This scenario covers the datagram path. Stream-path drops and resets are MH-A2's and MH-B's reasons, and their scenarios (slow video subscriber, keyframe storm, stuck pending) are OPS-B's.)* Datagrams are
 lossy by design and by transport: there is no retransmission and no ordering guarantee. Drops occur
 at **both ends of the hop**, the two ends have different owners, and only one of them is visible to
 MH.
@@ -1892,7 +1892,27 @@ advances `policy_generation`. MH drops that sender's frames at **ingress**, keye
 not read the stream component: it sits in the SFrame key id inside the payload, which MH forwards
 without parsing (ADR-0036 §7, type-blind). Each drop is counted as
 `mh_media_frames_dropped_total{direction="ingress",reason="server_muted"}`, present at zero from
-process start. MH logs nothing about mutes (ADR-0036 §11 deny scope). The MC half of this triage,
+process start. MH logs nothing about mutes (ADR-0036 §11 deny scope).
+
+> **Corrected 2026-10-21 (story 3 OPS-A): the paragraph above is the story-2 mechanism, and it
+> holds only until MH-A1 and MC-A.** Story 2's mute is **sender-scoped**: every stream of a muted
+> sender is dropped. It was exact only because media was audio-only. From story 3 it is **per
+> declared stream**. MC lists every published stream in the registration's `source_streams`
+> (sender, stream number, transport, disposition), and a server-muted stream is
+> `DROP_AT_INGRESS`. MH attributes each ingress frame by (connection-bound sender, uplink
+> relay-region `stream_id`), looked up in `source_streams`, without parsing the payload. The uplink
+> `stream_id` is the publisher-stamped MC send id (`SendStream.stream_number`, which is 0 for audio
+> and 1 for video today). It is **hop-local, unauthenticated and publisher-set**. There is no
+> signed stream number in the header. **R-16 still holds, in slot terms**: a muted stream is
+> dropped at ingress, so a frame relabelled onto the other stream id can reach only slots of the
+> other kind, and receivers take the decoder from the slot kind (wire-freeze Amendment 3). A
+> reader who kept the sender-scoped model would expect a video server mute to silence audio too,
+> and would read audio still flowing as a failed mute. The per-kind arms of this scenario
+> (including "camera light still on after server mute") are OPS-B's extension. Server mute stays
+> reachable by any holder of the service credential the registration contract accepts (Arm 2),
+> now per kind.
+
+The MC half of this triage,
 covering which host asked, what MC recorded, and whether the push was confirmed, is
 [MC Scenario 21](mc-incident-response.md#scenario-21-server-mute-not-enforced). Start there for
 Steps 1-2, then use the arms below, **in cost order**.
@@ -1974,9 +1994,17 @@ generation MC confirmed and the flat drop rate.
 shows `generation_mismatch` or `no_applied_generation`, or the RegisterMeeting failed outright. The
 mute rides the same snapshot as every other policy change, so a push that is failing fails for the mute
 too. One mute-specific cause: a muted set larger than `MH_MAX_MUTED_SOURCES_PER_MEETING`
-(`mh_media_muted_sources_per_meeting_limit`) makes MH refuse the **whole** registration as
+(`mh_media_muted_sources_per_meeting_limit`; *retired by story 3: from MH-A1 the bound is
+`MH_MAX_SOURCE_STREAMS_PER_MEETING` on `source_streams`, every published stream and not only muted
+ones, so an undersized value refuses registrations whether or not anyone is muted; corrected
+2026-10-21*) makes MH refuse the **whole** registration as
 `mh_media_policy_applies_total{outcome="rejected_invalid"}`. The previous policy, without the mute,
-stays live. Work [MC Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence).
+stays live. *(Corrected 2026-10-21, story 3 OPS-A: a whole-registration reject is answered with a
+gRPC `invalid_argument`, so MC records no push outcome and MC Scenario 15 shows nothing for it. MC's
+reading is `mc_register_meeting_total{status="error"}` and the WARN "RegisterMeeting RPC failed"
+(target `mc.grpc.mh_client`): work [MC Scenario 12](mc-incident-response.md#scenario-12-registermeeting-coordination-failures).
+A push that was answered but not applied, `generation_mismatch` or `no_applied_generation`, is
+[MC Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence).)*
 
 **Escalation**: `client` for Arm 1's optimistic rendering; `security` + `meeting-controller` for Arm 2;
 `media-handler` for Arm 3; `meeting-controller` for Arm 4.
