@@ -6,11 +6,15 @@
 //!    `MH_TERMINATION_GRACE_SECONDS` equals the pod spec's
 //!    `terminationGracePeriodSeconds`. (Sections below through "Why
 //!    `-n dark-tower`".)
-//! 2. Story 2 configuration surface (R-19, R-22, R-23, R-24): MH's egress-budget
-//!    chain and §8 policy keys are wired into BOTH instances, carry parseable
-//!    values, are what the running process actually loaded, and — on Kind —
-//!    size a stream ceiling that meets the demo requirement. (Section "Story 2
-//!    configuration surface".)
+//! 2. Story 2/3 configuration surface (story 2 R-19, R-22, R-23, R-24; story 3
+//!    R-21, R-23): MH's egress-budget chain, §8 policy keys, story-3 stream and
+//!    keyframe keys and shared media-codec-profile keys are wired into BOTH
+//!    instances, carry parseable values that satisfy the relationships MH
+//!    boot-checks, are what the running process actually loaded (where MH
+//!    publishes them), and — on Kind — size a stream ceiling that meets the demo
+//!    requirement. Retiring keys are optional refs to keys still present.
+//!    (Section "Story 2 configuration surface".) The MC twin is
+//!    `02_mc_deployment_config.rs`.
 //!
 //! # What this asserts, and why it is not a tautology
 //!
@@ -63,9 +67,15 @@
 //! any rewrite: they look similar and neither covers the other.
 //!
 //! - **(a) Wiring proves the REFERENCE.** For both `mh-0` and `mh-1`, every key
-//!   in [`STORY2_KEYS`] is present on the live pod as a `configMapKeyRef` to
-//!   the ONE [`SHARED_CONFIGMAP`] generation that pod is wired to, whose `key`
-//!   equals the env var's own name. This is
+//!   in [`WIRED_KEYS`] is present on the live pod as a HARD `configMapKeyRef` to
+//!   the ONE generation of ITS base (`mh-service-config` or, for the story-3
+//!   profile keys, `media-codec-profile`) that pod is wired to, whose `key`
+//!   equals the env var's own name; every key in [`RETIRING_KEYS`] is present
+//!   as an `optional: true` ref AND still present and parseable in the live
+//!   generation (the current image still reads it); and
+//!   `MH_POD_MEMORY_LIMIT_BYTES` is a downward-API `resourceFieldRef` to the
+//!   container's DECLARED `limits.memory`. The checks are the pure cores in
+//!   `env_tests::fixtures::deployment_config` (unit-tested at Layer 4). This is
 //!   the per-workload coverage `dt-guard env-config` cannot give yet: its rule
 //!   1 only engages once the MH code task makes these reads required, and its
 //!   rule 3 is satisfied if EITHER workload references a key — so "present in
@@ -105,6 +115,16 @@
 //!
 //! ## What this does NOT prove — read before citing it
 //!
+//! `MH_POD_MEMORY_LIMIT_BYTES` is asserted STRUCTURALLY only (the
+//! `resourceFieldRef` shape, divisor 1, and the target container declaring
+//! `limits.memory`). Kubernetes then resolves exactly that limit, and
+//! `dt-guard kustomize`'s `resource_field_ref_undeclared` closes the
+//! fail-open case in the manifests. The value the running PROCESS read is not
+//! observable here: the image is distroless (no exec), and the current image
+//! neither reads nor publishes it. The gauge that would close that gap is
+//! tracked in `docs/TODO.md` §Observability Debt ("MH_POD_MEMORY_LIMIT_BYTES is
+//! not published"; owner media-handler, lands with MH-A2).
+//!
 //! (c) shows the process LOADED each value; it does not show every code path
 //! reads the field the gauge reflects. That is pinned on the MH side:
 //! `crates/mh-service/tests/stream_admission_integration.rs` asserts each gauge
@@ -141,120 +161,21 @@
 
 #![cfg(feature = "smoke")]
 
+use env_tests::fixtures::deployment_config::{
+    check_key_ref, check_resource_field_ref, check_shape, cm_value, fetch_configmap,
+    fetch_live_pod, parse_positive, pod_name_of, RefKind, ValueShape,
+};
 use env_tests::fixtures::kube::{configmap_name_for, configmap_name_for_all, REDEPLOY_HINT};
 use env_tests::fixtures::mh_config::{gauge_verdict, Conversion, GaugeVerdict};
 use env_tests::{repo_root, NAMESPACE};
 use serde_json::Value;
-use std::process::Command;
 
 const CONTAINER: &str = "mh-service";
 const GRACE_ENV: &str = "MH_TERMINATION_GRACE_SECONDS";
 
-/// Fetches the single pod matching `instance=<instance>` as parsed JSON.
-///
-/// Never skips. Missing `kubectl`, a failed call, or an empty pod set are all
-/// hard failures with distinct messages — a probe that can return "nothing" and
-/// be read as "equal" is what this test exists to rule out.
-fn fetch_pod(instance: &str) -> Value {
-    let selector = format!("instance={instance}");
-    let args = [
-        "get",
-        "pods",
-        "-n",
-        NAMESPACE,
-        "-l",
-        selector.as_str(),
-        "-o",
-        "json",
-    ];
-
-    let output = Command::new("kubectl")
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| {
-            panic!(
-                "kubectl not available - cannot verify the deployed drain window \
-                 for {instance}. env-tests require kubectl installed and \
-                 configured: {e}"
-            )
-        });
-
-    assert!(
-        output.status.success(),
-        "`kubectl {}` failed for {instance} (exit status {}): {}",
-        args.join(" "),
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
-        panic!("could not parse `kubectl get pods -o json` output for {instance}: {e}")
-    });
-
-    let items = parsed
-        .get("items")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("kubectl output for {instance} has no `items` array"));
-
-    assert!(
-        !items.is_empty(),
-        "no pods matched -n {NAMESPACE} -l instance={instance}. The drain-window \
-         assertion would have nothing to compare and would pass vacuously. \
-         Either MH is not deployed or the label selector has drifted - fix the \
-         selector, do not delete this assertion."
-    );
-
-    // Ignore pods that are already terminating. During a rolling update both the
-    // old and the new ReplicaSet's pods match the `instance=` selector, and the
-    // OLD pod predates this manifest change - it carries no MH_TERMINATION_GRACE_SECONDS
-    // at all. Taking items[0] unfiltered would fail against a pod that is on its
-    // way out, which is a false negative on the Layer-7 retry path rather than a
-    // real defect. Filtering on deletionTimestamp (not on phase) is the precise
-    // test: it means "the API server has accepted this pod's deletion".
-    let live: Vec<&Value> = items
-        .iter()
-        .filter(|p| p.pointer("/metadata/deletionTimestamp").is_none())
-        .collect();
-
-    assert!(
-        !live.is_empty(),
-        "every pod matching -n {NAMESPACE} -l instance={instance} is terminating \
-         ({} total). Nothing is serving this instance - the assertion is not \
-         meaningful and must not pass vacuously.",
-        items.len()
-    );
-
-    // Pick the NEWEST live pod, not an arbitrary one.
-    //
-    // `deletionTimestamp` alone is not sufficient. These are 1-replica
-    // Deployments with the default RollingUpdate strategy, which resolves to
-    // maxSurge=1 / maxUnavailable=0 — so the replacement pod is created and must
-    // become Ready BEFORE the outgoing pod is marked for deletion. That leaves a
-    // window where two pods match `instance=mh-N` and NEITHER has a
-    // `deletionTimestamp`: the old one (which predates this manifest change and
-    // carries no MH_TERMINATION_GRACE_SECONDS at all) and the new one. Taking an
-    // arbitrary element would panic against a pod on its way out — a false
-    // negative on the Layer-7 retry path, not a real defect.
-    //
-    // The surged pod is always the newer, and it is the one carrying the value
-    // under test. RFC 3339 timestamps sort lexicographically, so a string
-    // comparison is the correct ordering here.
-    let newest = live
-        .iter()
-        .max_by_key(|p| {
-            p.pointer("/metadata/creationTimestamp")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        })
-        .expect("live is non-empty, asserted above");
-
-    (*newest).clone()
-}
-
 /// Asserts one instance's deployed env value equals its own pod spec's grace.
 fn assert_grace_matches_pod_spec(instance: &str) {
-    let pod = fetch_pod(instance);
+    let pod = fetch_live_pod(instance);
 
     // Extract every scalar BEFORE formatting anything, so no `Value` and no env
     // array can reach a panic message. See the PII policy in the module doc.
@@ -382,48 +303,137 @@ fn shared_configmap() -> String {
     configmap_name_for_all(MH_INSTANCES, SHARED_CONFIGMAP)
 }
 
-/// How a resolved value must parse. Mirrors what the MH code task's required
-/// reads will accept, so a value that fails here would refuse to boot there.
-#[derive(Clone, Copy, Debug)]
-enum ValueShape {
-    /// A count, bit rate or duration: an unsigned integer strictly above zero.
-    PositiveInteger,
-    /// A ratio in `0.0..=1.0`.
-    UnitRatio,
-}
+/// The GENERATOR BASE NAME of the shared media codec profile (story 3). Its
+/// live name is `media-codec-profile-<hash>`, resolved from the pod spec.
+const PROFILE_CONFIGMAP: &str = "media-codec-profile";
 
-/// Every key this story wires into BOTH MH workloads. ONE list, iterated for
-/// every instance — never a second copy per instance or per test.
-///
-/// `MH_MAX_STREAMS` is RETIRED but deliberately listed: its two refs must
-/// survive one deploy so `kubectl rollout undo` does not produce
-/// `CreateContainerConfigError`, and once the code read is gone nothing else in
-/// the tree asserts those refs still exist.
-const STORY2_KEYS: &[(&str, ValueShape)] = &[
-    // Egress-budget chain (R-19, R-23).
-    ("MH_EGRESS_BUDGET_BPS", ValueShape::PositiveInteger),
-    ("MH_STREAM_COST_AUDIO_BPS", ValueShape::PositiveInteger),
-    ("MH_STREAM_COST_VIDEO_BPS", ValueShape::PositiveInteger),
-    ("MH_EGRESS_REJECTION_RATIO_THRESHOLD", ValueShape::UnitRatio),
-    ("MH_MAX_REGISTERED_MEETINGS", ValueShape::PositiveInteger),
+/// Every key wired into BOTH MH workloads as a HARD ref: `(key, generator
+/// base, shape)`. ONE table, iterated for every instance — never a second copy
+/// per instance or per test. The base column is needed because the profile
+/// keys come from a DIFFERENT ConfigMap (resolved per instance and base).
+const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
+    // Egress-budget chain (story 2 R-19, R-23).
     (
-        "MH_MAX_MUTED_SOURCES_PER_MEETING",
+        "MH_EGRESS_BUDGET_BPS",
+        SHARED_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
-    // ADR-0036 §8 policy bounds (R-22).
+    (
+        "MH_EGRESS_REJECTION_RATIO_THRESHOLD",
+        SHARED_CONFIGMAP,
+        ValueShape::UnitRatio,
+    ),
+    (
+        "MH_MAX_REGISTERED_MEETINGS",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    // ADR-0036 §8 policy bounds (story 2 R-22).
     (
         "MH_MAX_EGRESS_STREAMS_PER_MEETING",
+        SHARED_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
     (
         "MH_MAX_CANDIDATE_SOURCES_PER_EGRESS",
+        SHARED_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
-    ("MH_MAX_TOTAL_EGRESS_EDGES", ValueShape::PositiveInteger),
-    ("MH_POLICY_APPLY_TIMEOUT_MS", ValueShape::PositiveInteger),
-    // Retired, refs retained for rollback safety (R-24).
+    (
+        "MH_MAX_TOTAL_EGRESS_EDGES",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MH_POLICY_APPLY_TIMEOUT_MS",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    // Story 3 MH keys (required reads from MH-A1 / MH-A2 / MH-B).
+    (
+        "MH_MAX_SOURCE_STREAMS_PER_MEETING",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MH_KEYFRAME_REQUEST_RETRY_MS",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MH_KEYFRAME_REQUEST_AGGREGATION_MS",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MH_RECOVERY_REQUESTS_PER_CONNECTION_PER_SEC",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MH_STREAM_OPENS_PER_CONNECTION_PER_SEC",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MH_EGRESS_STREAM_BACKLOG_BYTES",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MH_STREAM_MID_FRAME_STALL_MS",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    // Story 3 shared media codec profile: the five keys MH reads.
+    (
+        "MEDIA_VIDEO_MAX_BITRATE_BPS",
+        PROFILE_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MEDIA_VIDEO_FRAME_RATE_HZ",
+        PROFILE_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
+        PROFILE_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MEDIA_AUDIO_MAX_BITRATE_BPS",
+        PROFILE_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MEDIA_AUDIO_FRAME_RATE_HZ",
+        PROFILE_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+];
+
+/// RETIRING MH keys (two-deploy retirement, step 1 — docs/TODO.md §Media Path
+/// Obligations, "Delete the story-3 retired config keys"). Each ref must be
+/// present on BOTH instances and `optional: true`, AND the key must STILL be
+/// present and parseable in the live generation: the current image reads all
+/// but `MH_MAX_STREAMS` as REQUIRED, and under an optional ref an absent key is
+/// a silently unset variable that image refuses to boot on — the optional flag
+/// would hide exactly the failure the retirement must not cause.
+const RETIRING_KEYS: &[(&str, ValueShape)] = &[
+    ("MH_STREAM_COST_AUDIO_BPS", ValueShape::PositiveInteger),
+    ("MH_STREAM_COST_VIDEO_BPS", ValueShape::PositiveInteger),
+    (
+        "MH_MAX_MUTED_SOURCES_PER_MEETING",
+        ValueShape::PositiveInteger,
+    ),
     ("MH_MAX_STREAMS", ValueShape::PositiveInteger),
 ];
+
+/// The downward-API memory limit (story 3 R-21): env name, target container,
+/// resource.
+const MEMORY_LIMIT_ENV: (&str, &str, &str) =
+    ("MH_POD_MEMORY_LIMIT_BYTES", CONTAINER, "limits.memory");
 
 /// How long a MH gauge series may take to appear for a pod (its first scrape
 /// after process start). ONE bound for every presence poll in this file.
@@ -496,211 +506,114 @@ const fn required_edges(n: u64) -> u64 {
     (n + 1) * n
 }
 
-/// Fetches the named ConfigMap from the live cluster as parsed JSON.
-///
-/// Never skips; same discipline as [`fetch_pod`]. Reading the cluster's copy —
-/// not a kustomize render — is the point: a render cannot tell you whether the
-/// overlay was applied, or whether someone edited the live object by hand.
-fn fetch_configmap(name: &str) -> Value {
-    // `name` is the LIVE (hash-suffixed) name, resolved from the pod spec.
-    let args = ["get", "configmap", name, "-n", NAMESPACE, "-o", "json"];
-    let output = Command::new("kubectl")
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| {
-            panic!(
-                "kubectl not available - cannot read ConfigMap {name}. env-tests \
-                 require kubectl installed and configured: {e}"
-            )
-        });
-    assert!(
-        output.status.success(),
-        "`kubectl {}` failed (exit status {}): {}",
-        args.join(" "),
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
-        panic!("could not parse `kubectl get configmap {name} -o json` output: {e}")
-    })
+/// A strictly-positive deployed integer, or a panic naming the key and base.
+fn positive(cm: &Value, base: &str, key: &str) -> u64 {
+    parse_positive(key, &cm_value(cm, base, key), base).unwrap_or_else(|e| panic!("{e}"))
 }
 
-/// The pod's `metadata.name`, extracted before anything is formatted.
-fn pod_name_of(pod: &Value, instance: &str) -> String {
-    pod.pointer("/metadata/name")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("pod matched by instance={instance} has no metadata.name"))
-        .to_string()
-}
-
-/// The `mh-service` container of `pod`.
-fn mh_container<'a>(pod: &'a Value, pod_name: &str) -> &'a Value {
-    pod.pointer("/spec/containers")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("pod {pod_name} has no .spec.containers array"))
-        .iter()
-        .find(|c| c.get("name").and_then(Value::as_str) == Some(CONTAINER))
-        .unwrap_or_else(|| panic!("pod {pod_name} has no container named {CONTAINER:?}"))
-}
-
-/// `data[key]` of a fetched ConfigMap. An absent key is its own failure: it is
-/// the `CreateContainerConfigError` case, not a wrong value.
-fn configmap_value(cm: &Value, key: &str) -> String {
-    cm.pointer("/data")
-        .and_then(|d| d.get(key))
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            panic!(
-                "live ConfigMap {SHARED_CONFIGMAP} (-n {NAMESPACE}) has no key {key}. \
-                 Any pod holding a hard configMapKeyRef to it cannot start \
-                 (CreateContainerConfigError, empty logs). Either the manifests \
-                 were not applied, or the key was removed ahead of its refs — \
-                 which is the rollback trap the two-deploy retirement exists to avoid."
-            )
-        })
-        .to_string()
-}
-
-/// Parses `raw` as a strictly-positive integer, failing with the key's name.
-fn parse_positive(key: &str, raw: &str) -> u64 {
-    let v: u64 = raw.parse().unwrap_or_else(|e| {
-        panic!(
-            "{key}={raw:?} in {SHARED_CONFIGMAP} is not an unsigned integer ({e}). \
-             The MH code task reads it as REQUIRED and would refuse to start."
-        )
-    });
-    assert!(
-        v > 0,
-        "{key}=0 in {SHARED_CONFIGMAP}: must be strictly positive. The MH code task \
-         would refuse to start (and a zero cost would divide by zero in the ceiling)."
-    );
-    v
-}
-
-/// Asserts `raw` parses as `shape` would under the MH code task's required read.
-fn assert_parses(key: &str, raw: &str, shape: ValueShape) {
-    match shape {
-        ValueShape::PositiveInteger => {
-            parse_positive(key, raw);
-        }
-        ValueShape::UnitRatio => {
-            let v: f64 = raw.parse().unwrap_or_else(|e| {
-                panic!("{key}={raw:?} in {SHARED_CONFIGMAP} is not a number ({e}).")
-            });
-            assert!(
-                v.is_finite() && (0.0..=1.0).contains(&v),
-                "{key}={raw:?} in {SHARED_CONFIGMAP} must lie in 0.0..=1.0. The MH \
-                 code task reads it as REQUIRED and would refuse to start."
-            );
-        }
-    }
-}
-
-/// (a) wiring + (b) parse, for one instance.
+/// (a) wiring + (b) parse, for one instance, plus the relationships between
+/// deployed values that a reading image refuses to boot on.
 fn assert_story2_keys_wired(instance: &str) {
-    // The generation THIS instance's pod references — so the values checked
-    // below are the config in effect for this pod, not a superseded one.
-    let live_cm = shared_configmap_for(instance);
-    let cm = fetch_configmap(&live_cm);
-    let pod = fetch_pod(instance);
-    let pod_name = pod_name_of(&pod, instance);
-    let env = mh_container(&pod, &pod_name)
-        .get("env")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("container {CONTAINER} in pod {pod_name} has no `env` array"));
+    // The generation THIS instance's pod references, per base — so the values
+    // checked below are the config in effect for this pod.
+    let mh_cm_name = shared_configmap_for(instance);
+    let profile_cm_name = configmap_name_for(instance, PROFILE_CONFIGMAP);
+    let mh_cm = fetch_configmap(&mh_cm_name);
+    let profile_cm = fetch_configmap(&profile_cm_name);
+    let live = |base: &str| -> (&str, &Value) {
+        if base == PROFILE_CONFIGMAP {
+            (profile_cm_name.as_str(), &profile_cm)
+        } else {
+            (mh_cm_name.as_str(), &mh_cm)
+        }
+    };
+    let pod = fetch_live_pod(instance);
 
-    for &(key, shape) in STORY2_KEYS {
-        let Some(entry) = env
-            .iter()
-            .find(|e| e.get("name").and_then(Value::as_str) == Some(key))
-        else {
-            panic!(
-                "pod {pod_name} (-n {NAMESPACE}) has no env entry {key}. Every \
-                 story-2 key must be referenced from BOTH mh-0-deployment.yaml and \
-                 mh-1-deployment.yaml — per workload, never union. Once the MH \
-                 code task makes this read required, this pod CrashLoops alone \
-                 while its sibling stays healthy."
-            );
-        };
-
-        let cm_ref = entry
-            .pointer("/valueFrom/configMapKeyRef")
-            .unwrap_or_else(|| {
-                panic!(
-                    "pod {pod_name}: env {key} is not a configMapKeyRef (a literal \
-                     value or another source). {SHARED_CONFIGMAP} is the single \
-                     home for its number; a literal here is a second encoding."
-                )
-            });
-        let ref_name = cm_ref.get("name").and_then(Value::as_str);
-        let ref_key = cm_ref.get("key").and_then(Value::as_str);
-
-        assert_eq!(
-            ref_name,
-            Some(live_cm.as_str()),
-            "pod {pod_name}: env {key} references ConfigMap {ref_name:?}, expected \
-             {live_cm:?} (the one {SHARED_CONFIGMAP} generation this pod is wired to)."
+    // Positive control that CAN fail: the table wires every base this file
+    // covers (a table that quietly lost the profile rows would otherwise pass
+    // on what remains), and the retiring list is not empty.
+    for base in [SHARED_CONFIGMAP, PROFILE_CONFIGMAP] {
+        assert!(
+            WIRED_KEYS.iter().any(|(_, b, _)| *b == base),
+            "WIRED_KEYS has no row for base {base}"
         );
-        assert_eq!(
-            ref_key,
-            Some(key),
-            "pod {pod_name}: env {key} reads key {ref_key:?} — a CROSSED reference. \
-             The pod starts and passes readiness while running another variable's \
-             value. The key must equal the env var name. (dt-guard env-config's \
-             configmap_key_name_mismatch catches this in the manifests; reaching \
-             this assertion means the live cluster does not match them.)"
-        );
-        assert_ne!(
-            cm_ref.get("optional").and_then(Value::as_bool),
-            Some(true),
-            "pod {pod_name}: env {key} is `optional: true`. It must be a HARD \
-             reference: a missing key must be a loud CreateContainerConfigError, \
-             never a pod that starts on a value nobody chose."
-        );
-
-        let raw = configmap_value(&cm, key);
-        assert_parses(key, &raw, shape);
+    }
+    assert!(!RETIRING_KEYS.is_empty());
+    for &(key, base, shape) in WIRED_KEYS {
+        let (cm_name, cm) = live(base);
+        check_key_ref(&pod, CONTAINER, key, cm_name, RefKind::Hard)
+            .unwrap_or_else(|e| panic!("{e}"));
+        check_shape(key, &cm_value(cm, base, key), shape, base).unwrap_or_else(|e| panic!("{e}"));
+    }
+    for &(key, shape) in RETIRING_KEYS {
+        check_key_ref(&pod, CONTAINER, key, &mh_cm_name, RefKind::Optional)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // STILL present and parseable: the current image still reads it.
+        check_shape(
+            key,
+            &cm_value(&mh_cm, SHARED_CONFIGMAP, key),
+            shape,
+            SHARED_CONFIGMAP,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
     }
 
-    // The muted-source bound's safety claim is a RELATIONSHIP between two
-    // deployed values, so it is asserted here rather than left to the comment
-    // that states it.
-    //
-    // `MH_MAX_MUTED_SOURCES_PER_MEETING` is documented as a bound that can
-    // never falsely reject a legitimate snapshot. That holds only while it is
-    // at least `MH_MAX_EGRESS_STREAMS_PER_MEETING`: MC sends a handler only the
-    // muted senders that SOURCE at least one of its egress streams, so a
-    // legitimate snapshot names at most as many muted senders as it has
-    // streams (derivation: `infra/services/mh-service/config.env`).
-    //
-    // Since story 2 task 10 MH also REFUSES TO BOOT on the inversion
-    // (`ConfigError::MutedSourceBoundBelowEgressBound`), so a violation here
-    // would additionally show as a crash-looping pod; this assertion names the
-    // cause in seconds.
-    //
-    // DIRECTION: raising the egress bound above the muted bound breaks the
-    // claim; lowering it does not. Without this assertion a one-character edit
-    // to either key silently turns server mute off for large meetings — the
-    // registration is rejected whole, which is not a mute-shaped symptom.
-    let muted = parse_positive(
-        "MH_MAX_MUTED_SOURCES_PER_MEETING",
-        &configmap_value(&cm, "MH_MAX_MUTED_SOURCES_PER_MEETING"),
+    let (env, target, resource) = MEMORY_LIMIT_ENV;
+    check_resource_field_ref(&pod, CONTAINER, env, target, resource)
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    assert_deployed_relationships(&mh_cm, &profile_cm);
+}
+
+/// Relationships between DEPLOYED values that a reading image refuses to boot
+/// on — asserted here so the cause is named in seconds, before that image
+/// ships (the point of landing manifests first). Each message names both keys
+/// and their homes.
+fn assert_deployed_relationships(mh_cm: &Value, profile_cm: &Value) {
+    let mh = |k| positive(mh_cm, SHARED_CONFIGMAP, k);
+    let retry = mh("MH_KEYFRAME_REQUEST_RETRY_MS");
+    let aggregation = mh("MH_KEYFRAME_REQUEST_AGGREGATION_MS");
+    let min_interval = positive(
+        profile_cm,
+        PROFILE_CONFIGMAP,
+        "MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
     );
-    let egress = parse_positive(
-        "MH_MAX_EGRESS_STREAMS_PER_MEETING",
-        &configmap_value(&cm, "MH_MAX_EGRESS_STREAMS_PER_MEETING"),
+    assert!(
+        retry >= min_interval,
+        "MH_KEYFRAME_REQUEST_RETRY_MS={retry} ({SHARED_CONFIGMAP}) is BELOW \
+         MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS={min_interval} ({PROFILE_CONFIGMAP}). MH (from \
+         MH-B) refuses to boot on this: a retry faster than the publisher's minimum interval is \
+         wasted. Change both in the same deploy (infra/services/mh-service/config.env and \
+         infra/services/media-codec-profile/profile.env)."
     );
+    assert!(
+        aggregation <= retry,
+        "MH_KEYFRAME_REQUEST_AGGREGATION_MS={aggregation} exceeds \
+         MH_KEYFRAME_REQUEST_RETRY_MS={retry} (both {SHARED_CONFIGMAP}). MH (from MH-B) refuses \
+         to boot on this."
+    );
+
+    let egress = mh("MH_MAX_EGRESS_STREAMS_PER_MEETING");
+    let sources = mh("MH_MAX_SOURCE_STREAMS_PER_MEETING");
+    assert!(
+        sources >= egress,
+        "MH_MAX_SOURCE_STREAMS_PER_MEETING={sources} is BELOW \
+         MH_MAX_EGRESS_STREAMS_PER_MEETING={egress} (both {SHARED_CONFIGMAP}). MH refuses to boot \
+         on this (from MH-A1; the floor rule lives in crates/mh-service/src/config.rs). Note \
+         this floor is MH's boot rule, NOT a guarantee that a legitimate registration fits — \
+         the source-stream bound is sized against publishers (see its config.env comment)."
+    );
+    // Kept until the retired muted bound's read is removed (MH-A1): the
+    // CURRENT image still refuses to boot on this inversion
+    // (`ConfigError::MutedSourceBoundBelowEgressBound`).
+    let muted = mh("MH_MAX_MUTED_SOURCES_PER_MEETING");
     assert!(
         muted >= egress,
         "MH_MAX_MUTED_SOURCES_PER_MEETING={muted} is BELOW \
-         MH_MAX_EGRESS_STREAMS_PER_MEETING={egress} in {SHARED_CONFIGMAP}. The \
-         muted bound is documented as never able to falsely reject a legitimate \
-         snapshot, and that derivation requires muted >= egress. As deployed, a \
-         legitimate registration naming more muted senders than the muted bound \
-         admits is rejected WHOLE — server mute stops working for large meetings, \
-         and the symptom is a rejected registration rather than anything \
-         mute-shaped. Fix: raise MH_MAX_MUTED_SOURCES_PER_MEETING to at least \
-         MH_MAX_EGRESS_STREAMS_PER_MEETING, or lower the egress bound."
+         MH_MAX_EGRESS_STREAMS_PER_MEETING={egress} (both {SHARED_CONFIGMAP}). The CURRENT MH \
+         image refuses to boot on this inversion (until MH-A1 removes the muted read). Fix: \
+         raise MH_MAX_MUTED_SOURCES_PER_MEETING to at least the egress bound, or lower the \
+         egress bound."
     );
 }
 
@@ -735,7 +648,7 @@ async fn test_policy_bounds_reported_by_running_mh_match_configmap() {
     let pods: Vec<(&str, String, String, Value)> = MH_INSTANCES
         .iter()
         .map(|&instance| {
-            let pod = fetch_pod(instance);
+            let pod = fetch_live_pod(instance);
             let pod_name = pod_name_of(&pod, instance);
             let pod_ip = pod
                 .pointer("/status/podIP")
@@ -749,7 +662,7 @@ async fn test_policy_bounds_reported_by_running_mh_match_configmap() {
 
     for &(key, gauge, conversion) in CONFIG_GAUGES {
         for (instance, pod_name, pod_ip, cm) in &pods {
-            let deployed = parse_positive(key, &configmap_value(cm, key));
+            let deployed = positive(cm, SHARED_CONFIGMAP, key);
             // Branch: no data for THIS pod. Polled PER POD, pinned to its IP: right after
             // a deploy rolls MH, the terminating predecessor is still a scrape target for
             // its drain window, so "enough instances have the series" can be satisfied
@@ -806,7 +719,8 @@ fn tree_budget(rel_path: &str) -> u64 {
             .lines()
             .find_map(|l| l.strip_prefix("MH_EGRESS_BUDGET_BPS="))
             .unwrap_or_else(|| panic!("{} has no MH_EGRESS_BUDGET_BPS= line", path.display()));
-        return parse_positive("MH_EGRESS_BUDGET_BPS", raw);
+        return parse_positive("MH_EGRESS_BUDGET_BPS", raw, rel_path)
+            .unwrap_or_else(|e| panic!("{e}"));
     }
     let doc: serde_norway::Value = serde_norway::from_str(&text)
         .unwrap_or_else(|e| panic!("{} is not valid YAML: {e}", path.display()));
@@ -815,7 +729,7 @@ fn tree_budget(rel_path: &str) -> u64 {
         .and_then(|d| d.get("MH_EGRESS_BUDGET_BPS"))
         .and_then(serde_norway::Value::as_str)
         .unwrap_or_else(|| panic!("{} has no string data.MH_EGRESS_BUDGET_BPS", path.display()));
-    parse_positive("MH_EGRESS_BUDGET_BPS", raw)
+    parse_positive("MH_EGRESS_BUDGET_BPS", raw, rel_path).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// (e) The deployed Kind stream ceiling meets the demo requirement.
@@ -841,10 +755,7 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
          meaningful against another cluster - this is not a sizing failure."
     );
 
-    let deployed = parse_positive(
-        "MH_EGRESS_BUDGET_BPS",
-        &configmap_value(&cm, "MH_EGRESS_BUDGET_BPS"),
-    );
+    let deployed = positive(&cm, SHARED_CONFIGMAP, "MH_EGRESS_BUDGET_BPS");
     let patch_value = tree_budget(PATCH);
     let base_value = tree_budget(BASE);
 
@@ -889,14 +800,8 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
     // today's values in a comment, compute both orders and hold the requirement
     // against the SMALLER — so the check is true whichever order MH uses, and
     // imposes no multiple-of-8 rule MH itself does not impose.
-    let audio = parse_positive(
-        "MH_STREAM_COST_AUDIO_BPS",
-        &configmap_value(&cm, "MH_STREAM_COST_AUDIO_BPS"),
-    );
-    let video = parse_positive(
-        "MH_STREAM_COST_VIDEO_BPS",
-        &configmap_value(&cm, "MH_STREAM_COST_VIDEO_BPS"),
-    );
+    let audio = positive(&cm, SHARED_CONFIGMAP, "MH_STREAM_COST_AUDIO_BPS");
+    let video = positive(&cm, SHARED_CONFIGMAP, "MH_STREAM_COST_VIDEO_BPS");
     let bits_ceiling = deployed / audio.max(video);
     let byte_cost = (audio / 8).max(video / 8);
     assert!(
@@ -972,18 +877,9 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
     use env_tests::fixtures::PrometheusClient;
 
     let cm = fetch_configmap(&shared_configmap());
-    let budget = parse_positive(
-        "MH_EGRESS_BUDGET_BPS",
-        &configmap_value(&cm, "MH_EGRESS_BUDGET_BPS"),
-    );
-    let audio = parse_positive(
-        "MH_STREAM_COST_AUDIO_BPS",
-        &configmap_value(&cm, "MH_STREAM_COST_AUDIO_BPS"),
-    );
-    let video = parse_positive(
-        "MH_STREAM_COST_VIDEO_BPS",
-        &configmap_value(&cm, "MH_STREAM_COST_VIDEO_BPS"),
-    );
+    let budget = positive(&cm, SHARED_CONFIGMAP, "MH_EGRESS_BUDGET_BPS");
+    let audio = positive(&cm, SHARED_CONFIGMAP, "MH_STREAM_COST_AUDIO_BPS");
+    let video = positive(&cm, SHARED_CONFIGMAP, "MH_STREAM_COST_VIDEO_BPS");
     let expected = mh_documented_ceiling(budget, audio, video);
 
     let cluster = ClusterConnection::new()

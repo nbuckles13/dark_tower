@@ -1,0 +1,737 @@
+//! Live-cluster DEPLOYMENT-CONFIG assertions shared by the per-service
+//! deployment-config env-tests (`tests/01_mh_deployment_config.rs`,
+//! `tests/02_mc_deployment_config.rs`).
+//!
+//! Hoisted from `01_mh_deployment_config.rs` at its second consumer (story 3):
+//! the pod/ConfigMap fetches, the value shapes, and the wiring check move HERE
+//! and are deleted there — never a parallel copy.
+//!
+//! The checks are PURE cores over parsed `kubectl -o json` documents
+//! ([`check_key_ref`], [`check_resource_field_ref`], [`check_shape`],
+//! [`quantity_to_bytes`]), returning `Err(message)` so every branch is unit
+//! tested at Layer 4 rather than only triaged at Layer 7. The thin fetchers
+//! panic as PRECONDITION failures, never skip.
+//!
+//! # Diagnostic output policy (PII)
+//!
+//! Messages carry only pod names, namespace, env var / key / ConfigMap NAMES,
+//! the scalar values of named configuration keys (none is a credential), and
+//! resource quantities. Never a parsed `Value`, an env array, a ConfigMap's
+//! `data` map, or raw `kubectl` output. Extract scalars first, then format.
+
+use std::process::Command;
+
+use serde_json::Value;
+
+use crate::NAMESPACE;
+
+/// How a deployed value must parse — mirrors what the reading image's required
+/// read accepts (SHAPE only: bounds stay with their readers, and no test holds
+/// a second copy of a deployed number).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueShape {
+    /// A count, rate or duration: an unsigned integer strictly above zero.
+    PositiveInteger,
+    /// An unsigned integer where zero is legal (e.g. the R-26 video-off lever,
+    /// `MC_MAX_VIDEO_RECEIVE_SLOTS=0`).
+    NonNegativeInteger,
+    /// A non-empty token: no whitespace, no quotes (e.g. a codec name). The set
+    /// of legal tokens is the reader's, deliberately not restated here.
+    Token,
+    /// A ratio in `0.0..=1.0`.
+    UnitRatio,
+}
+
+/// Whether a `configMapKeyRef` must be hard or `optional: true`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefKind {
+    /// A missing key must be a loud `CreateContainerConfigError`.
+    Hard,
+    /// A retiring key (two-deploy retirement, step 1).
+    Optional,
+}
+
+/// Parse `raw` as an unsigned integer. `home` names where the value lives.
+///
+/// # Errors
+/// Not an unsigned integer.
+pub fn parse_u64(key: &str, raw: &str, home: &str) -> Result<u64, String> {
+    raw.parse().map_err(|e| {
+        format!(
+            "{key}={raw:?} in {home} is not an unsigned integer ({e}). Its reader takes it as a \
+             REQUIRED read and would refuse to start."
+        )
+    })
+}
+
+/// Parse `raw` as a strictly-positive integer.
+///
+/// # Errors
+/// Not an unsigned integer, or zero.
+pub fn parse_positive(key: &str, raw: &str, home: &str) -> Result<u64, String> {
+    let v = parse_u64(key, raw, home)?;
+    if v == 0 {
+        return Err(format!(
+            "{key}=0 in {home}: must be strictly positive. Its reader would refuse to start."
+        ));
+    }
+    Ok(v)
+}
+
+/// Check `raw` against `shape`.
+///
+/// # Errors
+/// The value does not have the shape, with the key and its home named.
+pub fn check_shape(key: &str, raw: &str, shape: ValueShape, home: &str) -> Result<(), String> {
+    match shape {
+        ValueShape::PositiveInteger => parse_positive(key, raw, home).map(|_| ()),
+        ValueShape::NonNegativeInteger => parse_u64(key, raw, home).map(|_| ()),
+        ValueShape::Token => {
+            let ok = !raw.is_empty()
+                && !raw
+                    .chars()
+                    .any(|c| c.is_whitespace() || c == '"' || c == '\'');
+            if ok {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{key}={raw:?} in {home} is not a non-empty token (no whitespace or quotes)."
+                ))
+            }
+        }
+        ValueShape::UnitRatio => {
+            let v: f64 = raw
+                .parse()
+                .map_err(|e| format!("{key}={raw:?} in {home} is not a number ({e})."))?;
+            if v.is_finite() && (0.0..=1.0).contains(&v) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{key}={raw:?} in {home} must lie in 0.0..=1.0. Its reader would refuse to start."
+                ))
+            }
+        }
+    }
+}
+
+/// The pod's `metadata.name`.
+///
+/// # Panics
+/// The pod has no name.
+#[must_use]
+pub fn pod_name_of(pod: &Value, instance: &str) -> String {
+    pod.pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("pod matched by instance={instance} has no metadata.name"))
+        .to_string()
+}
+
+/// The container named `name` in a pod (containers, then initContainers).
+///
+/// # Errors
+/// No such container.
+pub fn container<'a>(pod: &'a Value, pod_name: &str, name: &str) -> Result<&'a Value, String> {
+    ["/spec/containers", "/spec/initContainers"]
+        .iter()
+        .filter_map(|p| pod.pointer(p).and_then(Value::as_array))
+        .flatten()
+        .find(|c| c.get("name").and_then(Value::as_str) == Some(name))
+        .ok_or_else(|| format!("pod {pod_name} has no container named {name:?}"))
+}
+
+/// The env entry `env_name` of `container_name`.
+fn env_entry<'a>(
+    pod: &'a Value,
+    pod_name: &str,
+    container_name: &str,
+    env_name: &str,
+) -> Result<&'a Value, String> {
+    container(pod, pod_name, container_name)?
+        .get("env")
+        .and_then(Value::as_array)
+        .and_then(|env| {
+            env.iter()
+                .find(|e| e.get("name").and_then(Value::as_str) == Some(env_name))
+        })
+        .ok_or_else(|| {
+            format!(
+                "pod {pod_name} (-n {NAMESPACE}): container {container_name} has no env entry \
+                 {env_name}. Every key must be referenced from EVERY instance's Deployment — per \
+                 workload, never union; a missing ref crash-loops that pod alone once its \
+                 reader requires it."
+            )
+        })
+}
+
+/// PURE wiring check: env `key` of `container_name` is a `configMapKeyRef`
+/// to the live ConfigMap generation `expected_cm`, its `key` equals the env
+/// name, and its optionality is `kind`.
+///
+/// # Errors
+/// Absent entry, not a `configMapKeyRef`, wrong ConfigMap, crossed key, or
+/// optionality mismatch — each with its own message naming the key.
+pub fn check_key_ref(
+    pod: &Value,
+    container_name: &str,
+    key: &str,
+    expected_cm: &str,
+    kind: RefKind,
+) -> Result<(), String> {
+    let pod_name = pod
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed pod>");
+    let entry = env_entry(pod, pod_name, container_name, key)?;
+    let cm_ref = entry.pointer("/valueFrom/configMapKeyRef").ok_or_else(|| {
+        format!(
+            "pod {pod_name}: env {key} is not a configMapKeyRef (a literal value or another \
+             source). Its ConfigMap is the single home for the value; a literal here is a second \
+             encoding."
+        )
+    })?;
+    let ref_name = cm_ref.get("name").and_then(Value::as_str);
+    if ref_name != Some(expected_cm) {
+        return Err(format!(
+            "pod {pod_name}: env {key} references ConfigMap {ref_name:?}, expected {expected_cm:?} \
+             (the generation this pod is wired to for that key's base)."
+        ));
+    }
+    let ref_key = cm_ref.get("key").and_then(Value::as_str);
+    if ref_key != Some(key) {
+        return Err(format!(
+            "pod {pod_name}: env {key} reads key {ref_key:?} — a CROSSED reference. The pod starts \
+             and passes readiness while running another variable's value. The key must equal the \
+             env var name (dt-guard env-config's configmap_key_name_mismatch catches this in the \
+             manifests; reaching here means the live cluster does not match them)."
+        ));
+    }
+    let optional = cm_ref.get("optional").and_then(Value::as_bool) == Some(true);
+    match (kind, optional) {
+        (RefKind::Hard, true) => Err(format!(
+            "pod {pod_name}: env {key} is `optional: true`. It must be a HARD reference: a missing \
+             key must be a loud CreateContainerConfigError, never a pod that starts on a value \
+             nobody chose."
+        )),
+        (RefKind::Optional, false) => Err(format!(
+            "pod {pod_name}: env {key} is a HARD reference, but it is a RETIRING key: step 1 of \
+             its two-deploy retirement makes every ref `optional: true` so the later key deletion \
+             cannot meet a hard ref in any revision `kubectl rollout undo` can reach."
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// `data[key]` of a fetched ConfigMap; `base` names it in the message.
+///
+/// # Errors
+/// The key is absent — the `CreateContainerConfigError` case (for a hard ref)
+/// or, for an optional ref, an env var silently unset while the current image
+/// still requires it.
+pub fn configmap_value(cm: &Value, base: &str, key: &str) -> Result<String, String> {
+    cm.pointer("/data")
+        .and_then(|d| d.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            format!(
+                "live ConfigMap {base} (-n {NAMESPACE}) has no key {key}. A pod holding a hard \
+                 configMapKeyRef to it cannot start (CreateContainerConfigError, empty logs); \
+                 under an OPTIONAL ref the variable is silently unset, which an image that still \
+                 requires it refuses to boot on. Either the manifests were not applied, or the key \
+                 was removed ahead of its refs — the rollback trap the two-deploy retirement \
+                 exists to avoid."
+            )
+        })
+}
+
+/// [`configmap_value`] or a PRECONDITION panic naming the key.
+///
+/// # Panics
+/// The key is absent.
+#[must_use]
+pub fn cm_value(cm: &Value, base: &str, key: &str) -> String {
+    configmap_value(cm, base, key).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// PURE downward-API check: env `env_name` of `container_name` is a
+/// `resourceFieldRef` to `expected_resource` (e.g. `limits.memory`) of
+/// `expected_container`, with divisor `1` (or absent, which Kubernetes treats
+/// as 1), and the target container DECLARES that resource.
+///
+/// # Errors
+/// Each branch named; the undeclared-resource branch says why it matters.
+pub fn check_resource_field_ref(
+    pod: &Value,
+    container_name: &str,
+    env_name: &str,
+    expected_container: &str,
+    expected_resource: &str,
+) -> Result<(), String> {
+    let pod_name = pod
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed pod>");
+    let entry = env_entry(pod, pod_name, container_name, env_name)?;
+    let rf = entry
+        .pointer("/valueFrom/resourceFieldRef")
+        .ok_or_else(|| {
+            format!(
+                "pod {pod_name}: env {env_name} is not a downward-API resourceFieldRef; the limit \
+                 must have one home (resources) and be injected, never restated."
+            )
+        })?;
+    let resource = rf.get("resource").and_then(Value::as_str);
+    if resource != Some(expected_resource) {
+        return Err(format!(
+            "pod {pod_name}: env {env_name} reads resource {resource:?}, expected \
+             {expected_resource:?}."
+        ));
+    }
+    let target = rf
+        .get("containerName")
+        .and_then(Value::as_str)
+        .unwrap_or(container_name);
+    if target != expected_container {
+        return Err(format!(
+            "pod {pod_name}: env {env_name} reads {expected_resource} of container {target:?}, \
+             expected {expected_container:?}."
+        ));
+    }
+    // Kubernetes serialises the divisor as a quantity string; absent means 1.
+    let divisor = rf.get("divisor").map(|d| {
+        d.as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| d.to_string())
+    });
+    if let Some(d) = divisor {
+        if quantity_to_bytes(&d) != Ok(1) {
+            return Err(format!(
+                "pod {pod_name}: env {env_name} has divisor {d:?}; it must be 1 so the value is \
+                 integer bytes (a larger divisor shrinks the limit the reader checks against)."
+            ));
+        }
+    }
+    let (section, res) = expected_resource.split_once('.').ok_or_else(|| {
+        format!("expected resource {expected_resource:?} is not <section>.<name>")
+    })?;
+    let declared = container(pod, pod_name, target)?
+        .get("resources")
+        .and_then(|r| r.get(section))
+        .and_then(|s| s.get(res))
+        .and_then(Value::as_str);
+    match declared {
+        Some(q) => quantity_to_bytes(q).map(|_| ()).map_err(|e| {
+            format!("pod {pod_name}: container {target} resources.{section}.{res}: {e}")
+        }),
+        None => Err(format!(
+            "pod {pod_name}: container {target} does NOT declare resources.{section}.{res}, yet env \
+             {env_name} reads it. Without the declared limit Kubernetes silently resolves the \
+             variable to the NODE's allocatable value, so the reader's check passes vacuously \
+             (fail-open). dt-guard kustomize's resource_field_ref_undeclared catches this in the \
+             manifests; reaching here means the live cluster does not match them."
+        )),
+    }
+}
+
+/// A Kubernetes resource quantity in bytes: a plain integer, a binary suffix
+/// (`Ki`, `Mi`, `Gi`, `Ti`) or a decimal one (`k`, `M`, `G`, `T`). Anything
+/// else (fractions, `m`, exponents, other suffixes) is an error — never a
+/// guess.
+///
+/// # Errors
+/// An unsupported or malformed quantity, or overflow.
+pub fn quantity_to_bytes(q: &str) -> Result<u64, String> {
+    const SUFFIXES: &[(&str, u64)] = &[
+        ("Ki", 1 << 10),
+        ("Mi", 1 << 20),
+        ("Gi", 1 << 30),
+        ("Ti", 1 << 40),
+        ("k", 1_000),
+        ("M", 1_000_000),
+        ("G", 1_000_000_000),
+        ("T", 1_000_000_000_000),
+    ];
+    let (digits, mult) = SUFFIXES
+        .iter()
+        .find_map(|(s, m)| q.strip_suffix(s).map(|d| (d, *m)))
+        .unwrap_or((q, 1));
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "quantity {q:?} is not an integer with an optional Ki/Mi/Gi/Ti/k/M/G/T suffix"
+        ));
+    }
+    let n: u64 = digits.parse().map_err(|e| format!("quantity {q:?}: {e}"))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("quantity {q:?} overflows u64 bytes"))
+}
+
+/// The newest live pod matching `instance=<instance>`, from
+/// [`crate::fixtures::kube::live_pods_json`] (the one pod-list call).
+///
+/// Never skips: an empty pod set or an all-terminating one is a hard failure
+/// with its own message. Terminating pods are ignored, and of the rest the
+/// NEWEST is taken: these are 1-replica Deployments with
+/// maxSurge=1 / maxUnavailable=0, so mid-rollout two pods can match with
+/// neither terminating, and the surged (newer) one carries the config under
+/// test. RFC 3339 timestamps sort lexicographically.
+///
+/// # Panics
+/// As above, or when `kubectl` fails.
+#[must_use]
+pub fn fetch_live_pod(instance: &str) -> Value {
+    let parsed = crate::fixtures::kube::live_pods_json(instance);
+    newest_live_pod(&parsed, instance).unwrap_or_else(|e| panic!("PRECONDITION: {e}"))
+}
+
+/// PURE core of [`fetch_live_pod`].
+///
+/// # Errors
+/// No `items`, no pods, or every pod terminating.
+pub fn newest_live_pod(pods: &Value, instance: &str) -> Result<Value, String> {
+    let items = pods
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("kubectl output for {instance} has no `items` array"))?;
+    if items.is_empty() {
+        return Err(format!(
+            "no pods matched -n {NAMESPACE} -l instance={instance}: the assertion would have \
+             nothing to compare and would pass vacuously. Either the service is not deployed or \
+             the label selector has drifted - fix the selector, do not delete the assertion."
+        ));
+    }
+    items
+        .iter()
+        .filter(|p| p.pointer("/metadata/deletionTimestamp").is_none())
+        .max_by_key(|p| {
+            p.pointer("/metadata/creationTimestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "every pod matching -n {NAMESPACE} -l instance={instance} is terminating ({} \
+                 total). Nothing is serving this instance - the assertion must not pass vacuously.",
+                items.len()
+            )
+        })
+}
+
+/// Fetches the named (LIVE, hash-suffixed) ConfigMap as parsed JSON. Reading
+/// the cluster's copy — not a render — is the point.
+///
+/// # Panics
+/// `kubectl` missing or failing, or unparseable output.
+#[must_use]
+pub fn fetch_configmap(name: &str) -> Value {
+    let args = ["get", "configmap", name, "-n", NAMESPACE, "-o", "json"];
+    let output = Command::new("kubectl")
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "kubectl not available - cannot read ConfigMap {name}. env-tests require kubectl \
+             installed and configured: {e}"
+            )
+        });
+    assert!(
+        output.status.success(),
+        "`kubectl {}` failed (exit status {}): {}",
+        args.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!("could not parse `kubectl get configmap {name} -o json` output: {e}")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn pod(env: Value, resources: Value) -> Value {
+        json!({
+            "metadata": {"name": "mh-0-abc"},
+            "spec": {"containers": [
+                {"name": "mh-service", "env": env, "resources": resources},
+                {"name": "sidecar"}
+            ]}
+        })
+    }
+
+    fn keyref(key: &str, cm: &str, ref_key: &str, optional: Option<bool>) -> Value {
+        let mut r = json!({"name": cm, "key": ref_key});
+        if let Some(o) = optional {
+            r["optional"] = json!(o);
+        }
+        json!({"name": key, "valueFrom": {"configMapKeyRef": r}})
+    }
+
+    fn err(r: Result<(), String>) -> String {
+        r.expect_err("expected an error")
+    }
+
+    #[test]
+    fn key_ref_passes_hard_and_optional() {
+        let p = pod(json!([keyref("K", "cm-abc", "K", None)]), json!({}));
+        assert_eq!(
+            check_key_ref(&p, "mh-service", "K", "cm-abc", RefKind::Hard),
+            Ok(())
+        );
+        let p = pod(json!([keyref("K", "cm-abc", "K", Some(true))]), json!({}));
+        assert_eq!(
+            check_key_ref(&p, "mh-service", "K", "cm-abc", RefKind::Optional),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn key_ref_absent_entry_names_the_key_and_the_per_workload_rule() {
+        let p = pod(json!([]), json!({}));
+        let e = err(check_key_ref(
+            &p,
+            "mh-service",
+            "K",
+            "cm-abc",
+            RefKind::Hard,
+        ));
+        assert!(
+            e.contains("no env entry K") && e.contains("per workload"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn key_ref_not_a_configmap_ref() {
+        let p = pod(json!([{"name": "K", "value": "1"}]), json!({}));
+        let e = err(check_key_ref(
+            &p,
+            "mh-service",
+            "K",
+            "cm-abc",
+            RefKind::Hard,
+        ));
+        assert!(e.contains("env K is not a configMapKeyRef"), "{e}");
+    }
+
+    #[test]
+    fn key_ref_wrong_configmap() {
+        let p = pod(json!([keyref("K", "other-abc", "K", None)]), json!({}));
+        let e = err(check_key_ref(
+            &p,
+            "mh-service",
+            "K",
+            "cm-abc",
+            RefKind::Hard,
+        ));
+        assert!(
+            e.contains("\"other-abc\"") && e.contains("\"cm-abc\""),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn key_ref_crossed_key() {
+        let p = pod(json!([keyref("K", "cm-abc", "J", None)]), json!({}));
+        let e = err(check_key_ref(
+            &p,
+            "mh-service",
+            "K",
+            "cm-abc",
+            RefKind::Hard,
+        ));
+        assert!(e.contains("CROSSED") && e.contains("env K"), "{e}");
+    }
+
+    #[test]
+    fn key_ref_optionality_mismatch_in_both_directions() {
+        let p = pod(json!([keyref("K", "cm-abc", "K", Some(true))]), json!({}));
+        let e = err(check_key_ref(
+            &p,
+            "mh-service",
+            "K",
+            "cm-abc",
+            RefKind::Hard,
+        ));
+        assert!(
+            e.contains("env K is `optional: true`") && e.contains("HARD"),
+            "{e}"
+        );
+        let p = pod(json!([keyref("K", "cm-abc", "K", Some(false))]), json!({}));
+        let e = err(check_key_ref(
+            &p,
+            "mh-service",
+            "K",
+            "cm-abc",
+            RefKind::Optional,
+        ));
+        assert!(e.contains("RETIRING key") && e.contains("env K"), "{e}");
+    }
+
+    #[test]
+    fn shapes() {
+        assert!(check_shape("K", "1", ValueShape::PositiveInteger, "h").is_ok());
+        assert!(check_shape("K", "0", ValueShape::PositiveInteger, "h").is_err());
+        assert!(check_shape("K", "0", ValueShape::NonNegativeInteger, "h").is_ok());
+        assert!(check_shape("K", "-1", ValueShape::NonNegativeInteger, "h").is_err());
+        assert!(check_shape("K", "vp8", ValueShape::Token, "h").is_ok());
+        for bad in ["", "v p8", "\"vp8\""] {
+            assert!(
+                check_shape("K", bad, ValueShape::Token, "h").is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(check_shape("K", "0.5", ValueShape::UnitRatio, "h").is_ok());
+        assert!(check_shape("K", "1.5", ValueShape::UnitRatio, "h").is_err());
+        let e = check_shape("MY_KEY", "x", ValueShape::PositiveInteger, "my-cm").expect_err("bad");
+        assert!(e.contains("MY_KEY") && e.contains("my-cm"), "{e}");
+    }
+
+    #[test]
+    fn configmap_value_absent_key_explains_optional_too() {
+        let cm = json!({"data": {"A": "1"}});
+        assert_eq!(configmap_value(&cm, "base", "A"), Ok("1".to_string()));
+        let e = configmap_value(&cm, "base", "B").expect_err("absent");
+        assert!(e.contains("no key B") && e.contains("OPTIONAL"), "{e}");
+    }
+
+    fn mem_ref(rf: Value) -> Value {
+        json!([{"name": "MH_POD_MEMORY_LIMIT_BYTES", "valueFrom": {"resourceFieldRef": rf}}])
+    }
+
+    const MEM: &str = "MH_POD_MEMORY_LIMIT_BYTES";
+
+    #[test]
+    fn resource_field_ref_passes_with_divisor_one_or_absent() {
+        let lim = json!({"limits": {"memory": "1Gi"}});
+        for rf in [
+            json!({"containerName": "mh-service", "resource": "limits.memory", "divisor": "1"}),
+            json!({"containerName": "mh-service", "resource": "limits.memory"}),
+            json!({"resource": "limits.memory"}),
+        ] {
+            let p = pod(mem_ref(rf), lim.clone());
+            assert_eq!(
+                check_resource_field_ref(&p, "mh-service", MEM, "mh-service", "limits.memory"),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn resource_field_ref_wrong_divisor_fails() {
+        let p = pod(
+            mem_ref(
+                json!({"containerName": "mh-service", "resource": "limits.memory", "divisor": "1Mi"}),
+            ),
+            json!({"limits": {"memory": "1Gi"}}),
+        );
+        let e = err(check_resource_field_ref(
+            &p,
+            "mh-service",
+            MEM,
+            "mh-service",
+            "limits.memory",
+        ));
+        assert!(e.contains("divisor \"1Mi\""), "{e}");
+    }
+
+    #[test]
+    fn resource_field_ref_undeclared_limit_explains_fail_open() {
+        let p = pod(
+            mem_ref(json!({"containerName": "mh-service", "resource": "limits.memory"})),
+            json!({"requests": {"memory": "512Mi"}}),
+        );
+        let e = err(check_resource_field_ref(
+            &p,
+            "mh-service",
+            MEM,
+            "mh-service",
+            "limits.memory",
+        ));
+        assert!(
+            e.contains("does NOT declare resources.limits.memory") && e.contains("NODE"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn resource_field_ref_wrong_resource_or_container() {
+        let lim = json!({"limits": {"memory": "1Gi"}});
+        let p = pod(mem_ref(json!({"resource": "requests.memory"})), lim.clone());
+        assert!(err(check_resource_field_ref(
+            &p,
+            "mh-service",
+            MEM,
+            "mh-service",
+            "limits.memory"
+        ))
+        .contains("requests.memory"));
+        let p = pod(
+            mem_ref(json!({"containerName": "sidecar", "resource": "limits.memory"})),
+            lim,
+        );
+        assert!(err(check_resource_field_ref(
+            &p,
+            "mh-service",
+            MEM,
+            "mh-service",
+            "limits.memory"
+        ))
+        .contains("\"sidecar\""));
+        let p = pod(json!([{"name": MEM, "value": "1073741824"}]), json!({}));
+        assert!(err(check_resource_field_ref(
+            &p,
+            "mh-service",
+            MEM,
+            "mh-service",
+            "limits.memory"
+        ))
+        .contains("not a downward-API resourceFieldRef"));
+    }
+
+    #[test]
+    fn newest_live_pod_skips_terminating_and_takes_newest() {
+        let pods = json!({"items": [
+            {"metadata": {"name": "old", "creationTimestamp": "2026-10-01T00:00:00Z"}},
+            {"metadata": {"name": "new", "creationTimestamp": "2026-10-02T00:00:00Z"}},
+            {"metadata": {"name": "dying", "creationTimestamp": "2026-10-03T00:00:00Z",
+                          "deletionTimestamp": "2026-10-03T00:01:00Z"}}
+        ]});
+        let p = newest_live_pod(&pods, "mh-0").expect("live");
+        assert_eq!(
+            p.pointer("/metadata/name").and_then(Value::as_str),
+            Some("new")
+        );
+        assert!(newest_live_pod(&json!({"items": []}), "mh-0")
+            .expect_err("empty")
+            .contains("vacuously"));
+        let dying = json!({"items": [{"metadata": {"name": "d", "deletionTimestamp": "x"}}]});
+        assert!(newest_live_pod(&dying, "mh-0")
+            .expect_err("dying")
+            .contains("terminating"));
+        assert!(newest_live_pod(&json!({}), "mh-0").is_err());
+    }
+
+    #[test]
+    fn quantities() {
+        assert_eq!(quantity_to_bytes("1Gi"), Ok(1 << 30));
+        assert_eq!(quantity_to_bytes("512Mi"), Ok(512 << 20));
+        assert_eq!(quantity_to_bytes("4Ki"), Ok(4096));
+        assert_eq!(quantity_to_bytes("2Ti"), Ok(2 << 40));
+        assert_eq!(quantity_to_bytes("1k"), Ok(1000));
+        assert_eq!(quantity_to_bytes("3M"), Ok(3_000_000));
+        assert_eq!(quantity_to_bytes("1G"), Ok(1_000_000_000));
+        assert_eq!(quantity_to_bytes("1073741824"), Ok(1_073_741_824));
+        assert_eq!(quantity_to_bytes("1"), Ok(1));
+        for bad in ["", "Gi", "1.5Gi", "100m", "1e3", "1Pi", "-1", " 1"] {
+            assert!(
+                quantity_to_bytes(bad).is_err(),
+                "{bad:?} must not be guessed"
+            );
+        }
+        assert!(quantity_to_bytes("99999999999999Ti").is_err(), "overflow");
+    }
+}

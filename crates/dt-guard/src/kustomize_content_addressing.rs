@@ -26,14 +26,25 @@
 //!   ConfigMap in the render is referenced by some pod template. No exemption:
 //!   Grafana dashboards are mounted through a projected volume, so a dashboard
 //!   group generated but never added to that volume fails here. If the
-//!   reference walker went blind, this fails too.
+//!   reference walker went blind, this fails too. One exemption, in non-root
+//!   targets only: a SHARED generator's ConfigMap (a generator-only base,
+//!   whose consumers live in other bases) — it is held to the control at the
+//!   environment root, which renders every consumer.
+//!
+//! **Cross-base references** (a workload referencing a shared generator owned
+//! by a generator-only base, e.g. `media-codec-profile`) resolve only at the
+//! environment root, so a non-root target DEFERS them to the root — exact
+//! name from the ONE `SharedGeneratorIndex`, never an ambiguous name, never at
+//! the root itself, and only if the root rendered in the same run. See
+//! [`RenderContext`].
 
-use crate::common::kustomize_generators::parse_config_map_generators;
-use crate::common::pod_spec::{pod_configmap_refs, pod_spec, ConfigMapRefKind};
+use crate::common::kustomize_generators::{parse_config_map_generators, SharedGeneratorIndex};
+use crate::common::pod_spec::{
+    meta_str, parse_docs, pod_configmap_refs, pod_spec, ConfigMapRefKind,
+};
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde::Deserialize as _;
 use serde_norway::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -77,6 +88,33 @@ pub struct TargetReport {
     pub findings: Vec<ContentAddressingFinding>,
     /// Distinct `(namespace, name)` ConfigMaps referenced by pod templates.
     pub consumed: usize,
+    /// References this (non-root) target DEFERRED to the environment root —
+    /// see [`RenderContext`]. Each is a human-readable description. The caller
+    /// MUST turn every one into a finding unless the environment root rendered
+    /// successfully in the same run.
+    pub deferred: Vec<String>,
+}
+
+/// What [`check_rendered`] needs to know beyond the render itself.
+///
+/// # Cross-base references (generator-only bases)
+///
+/// A workload in one base may reference a SHARED generator owned by a
+/// generator-only base (`infra/services/media-codec-profile/`). Only the
+/// environment root includes both, so only the root rewrites that reference to
+/// the hashed name; a per-service base or overlay render leaves it bare and
+/// absent. In a NON-root target such a reference is therefore DEFERRED, not a
+/// finding — on three exact conditions: the name carries no hash suffix, it is
+/// EXACTLY a name in the [`SharedGeneratorIndex`] (unambiguous; an ambiguous
+/// name is never deferred), and no ConfigMap of that name is in this render.
+/// The environment root NEVER defers, so a shared generator missing from the
+/// root still fails there; and the deferral is conditional on the root having
+/// rendered in the same run (`TargetReport::deferred`, enforced by the caller).
+pub struct RenderContext<'a> {
+    pub declared_generators: &'a BTreeSet<String>,
+    pub shared: &'a SharedGeneratorIndex,
+    /// This render is the environment root (deploy.sh's one apply).
+    pub is_env_root: bool,
 }
 
 /// Every `configMapGenerator` name declared by a kustomization under `infra/`.
@@ -99,10 +137,6 @@ pub fn declared_generator_names(repo_root: &Path) -> Result<BTreeSet<String>> {
     Ok(names)
 }
 
-fn meta_str<'a>(doc: &'a Value, field: &str) -> Option<&'a str> {
-    doc.get("metadata")?.get(field)?.as_str()
-}
-
 fn ref_kind_label(k: ConfigMapRefKind) -> &'static str {
     match k {
         ConfigMapRefKind::KeyRef => "configMapKeyRef",
@@ -113,33 +147,27 @@ fn ref_kind_label(k: ConfigMapRefKind) -> &'static str {
 }
 
 /// Check one rendered multi-document YAML stream.
-pub fn check_rendered(
-    rendered: &str,
-    label: &str,
-    declared_generators: &BTreeSet<String>,
-) -> TargetReport {
+pub fn check_rendered(rendered: &str, label: &str, ctx: &RenderContext<'_>) -> TargetReport {
     let mut report = TargetReport::default();
+    let mut findings: Vec<ContentAddressingFinding> = Vec::new();
     let mut push = |rule_id, detail: String| {
-        report.findings.push(ContentAddressingFinding {
+        findings.push(ContentAddressingFinding {
             rule_id,
             detail: format!("{label} — {detail}"),
         });
     };
 
-    let mut docs: Vec<Value> = Vec::new();
-    for de in serde_norway::Deserializer::from_str(rendered) {
-        match Value::deserialize(de) {
-            Ok(v) if !v.is_null() => docs.push(v),
-            Ok(_) => {}
-            Err(e) => {
-                push(
-                    UNRESOLVED_REFERENCE_RULE_ID,
-                    format!("rendered output is not parseable YAML ({e}); nothing can be checked"),
-                );
-                return report;
-            }
+    let docs = match parse_docs(rendered) {
+        Ok(d) => d,
+        Err(e) => {
+            push(
+                UNRESOLVED_REFERENCE_RULE_ID,
+                format!("rendered output is not parseable YAML ({e}); nothing can be checked"),
+            );
+            report.findings = findings;
+            return report;
         }
-    }
+    };
 
     // Every ConfigMap in the render, by (namespace, name).
     let mut configmaps: BTreeSet<(String, String)> = BTreeSet::new();
@@ -151,6 +179,13 @@ pub fn check_rendered(
         let name = meta_str(doc, "name").unwrap_or("").to_string();
         configmaps.insert((ns, name));
     }
+    let rendered_names: BTreeSet<&str> = configmaps.iter().map(|(_, n)| n.as_str()).collect();
+    let ambiguous: BTreeSet<&str> = ctx
+        .shared
+        .ambiguous
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect();
 
     let mut referenced: BTreeSet<(String, String)> = BTreeSet::new();
     for doc in &docs {
@@ -169,15 +204,35 @@ pub fn check_rendered(
                 );
                 continue;
             };
+            let hashed = HASH_SUFFIX_RE.captures(name).and_then(|c| c.get(1));
+            // Cross-base deferral (see RenderContext). Exact name, unambiguous,
+            // bare, absent from this render, and never at the root.
+            if !ctx.is_env_root && hashed.is_none() && !rendered_names.contains(name) {
+                if let Some(shared_gen) = ctx.shared.generators.get(name) {
+                    report.deferred.push(format!(
+                        "{label} — {kind}/{wname}: {how} ConfigMap {name:?} (shared generator in base {})",
+                        shared_gen.base
+                    ));
+                    continue;
+                }
+            }
+            if ambiguous.contains(name) {
+                push(
+                    UNRESOLVED_REFERENCE_RULE_ID,
+                    format!(
+                        "{kind}/{wname}: {how} ConfigMap {name:?} is declared by more than one base under infra/services/ (env-config configmap_name_ambiguous_across_bases); it is never resolved or deferred"
+                    ),
+                );
+            }
             referenced.insert((ns.to_string(), name.to_string()));
-            match HASH_SUFFIX_RE.captures(name).and_then(|c| c.get(1)) {
+            match hashed {
                 None => push(
                     NOT_CONTENT_ADDRESSED_RULE_ID,
                     format!(
                         "{kind}/{wname}: {how} ConfigMap {name:?} has no content hash — make it a configMapGenerator entry (a plain ConfigMap change rolls nothing; ADR-0038 §2)"
                     ),
                 ),
-                Some(base) if !declared_generators.contains(base.as_str()) => push(
+                Some(base) if !ctx.declared_generators.contains(base.as_str()) => push(
                     NOT_CONTENT_ADDRESSED_RULE_ID,
                     format!(
                         "{kind}/{wname}: {how} ConfigMap {name:?} looks hash-suffixed but no configMapGenerator under infra/ declares {:?}",
@@ -197,17 +252,33 @@ pub fn check_rendered(
         }
     }
 
+    // Positive control: every rendered ConfigMap is consumed — always run.
+    // One exemption, in NON-root targets only: a SHARED generator's ConfigMap
+    // (hash-stripped name in the shared index) is consumed by workloads in
+    // OTHER bases, which only the environment root renders; it is held to this
+    // control there. Any other unreferenced ConfigMap fails, including in a
+    // render with no pod template at all (so a walk that went blind still
+    // fails here rather than passing a pod-template-free render).
     for (ns, name) in &configmaps {
-        if !referenced.contains(&(ns.clone(), name.clone())) {
-            push(
-                UNREFERENCED_CONFIGMAP_RULE_ID,
-                format!(
-                    "ConfigMap {ns}/{name} is referenced by no pod template in this render (dead config, or a reference shape this check cannot see)"
-                ),
-            );
+        if referenced.contains(&(ns.clone(), name.clone())) {
+            continue;
         }
+        let generator_name = HASH_SUFFIX_RE
+            .captures(name)
+            .and_then(|c| c.get(1))
+            .map_or(name.as_str(), |m| m.as_str());
+        if !ctx.is_env_root && ctx.shared.generators.contains_key(generator_name) {
+            continue;
+        }
+        push(
+            UNREFERENCED_CONFIGMAP_RULE_ID,
+            format!(
+                "ConfigMap {ns}/{name} is referenced by no pod template in this render (dead config, or a reference shape this check cannot see)"
+            ),
+        );
     }
 
+    report.findings = findings;
     report.consumed = referenced.len();
     report
 }
@@ -218,6 +289,19 @@ mod tests {
 
     fn declared() -> BTreeSet<String> {
         ["app-config".to_string()].into_iter().collect()
+    }
+
+    fn check(render: &str, declared: &BTreeSet<String>) -> TargetReport {
+        let shared = SharedGeneratorIndex::default();
+        check_rendered(
+            render,
+            "t",
+            &RenderContext {
+                declared_generators: declared,
+                shared: &shared,
+                is_env_root: false,
+            },
+        )
     }
 
     fn cm(name: &str) -> String {
@@ -233,7 +317,7 @@ mod tests {
     const HASHED: &str = "app-config-2b4c5d6f7g";
 
     fn run(docs: &[String]) -> TargetReport {
-        check_rendered(&docs.join("---\n"), "t", &declared())
+        check(&docs.join("---\n"), &declared())
     }
 
     fn rules(r: &TargetReport) -> Vec<&'static str> {
@@ -312,6 +396,142 @@ mod tests {
     fn unreferenced_configmap_is_the_positive_control() {
         let r = run(&[cm(HASHED)]);
         assert_eq!(rules(&r), vec![UNREFERENCED_CONFIGMAP_RULE_ID]);
+        // With a pod template that consumes nothing, too.
+        let r = run(&[
+            cm(HASHED),
+            deployment("      containers:\n      - name: c\n"),
+        ]);
+        assert_eq!(rules(&r), vec![UNREFERENCED_CONFIGMAP_RULE_ID]);
+    }
+
+    /// A generator-only base renders its SHARED ConfigMap and no consumer;
+    /// in a non-root target that ConfigMap is exempt (it is held to the
+    /// control at the root). FAILS against the pre-story-3 rule.
+    #[test]
+    fn shared_generator_configmap_is_exempt_only_outside_the_root() {
+        let shared = shared_index("app-config");
+        let r = check_with(&cm(HASHED), &shared, false);
+        assert!(r.findings.is_empty(), "{:?}", r.findings);
+        let r = check_with(&cm(HASHED), &shared, true);
+        assert_eq!(
+            rules(&r),
+            vec![UNREFERENCED_CONFIGMAP_RULE_ID],
+            "the root holds it to the control"
+        );
+    }
+
+    /// The exemption is by shared NAME, not by "no pod template": a
+    /// pod-template-free render with a non-shared ConfigMap still fails.
+    #[test]
+    fn pod_template_free_render_with_a_non_shared_configmap_still_fails() {
+        let shared = shared_index("media-codec-profile");
+        let r = check_with(&cm(HASHED), &shared, false);
+        assert_eq!(rules(&r), vec![UNREFERENCED_CONFIGMAP_RULE_ID]);
+    }
+
+    // ---- Cross-base deferral (generator-only bases) -----------------------
+
+    fn shared_index(name: &str) -> SharedGeneratorIndex {
+        let mut idx = SharedGeneratorIndex::default();
+        idx.generators.insert(
+            name.to_string(),
+            crate::common::kustomize_generators::SharedGenerator {
+                base: "media-codec-profile".into(),
+                source: "infra/services/media-codec-profile/profile.env".into(),
+                keys: BTreeSet::new(),
+            },
+        );
+        idx
+    }
+
+    fn keyref_to(name: &str) -> String {
+        deployment(&format!(
+            "      containers:\n      - name: c\n        env:\n        - name: K\n          valueFrom:\n            configMapKeyRef: {{name: {name}, key: K}}\n"
+        ))
+    }
+
+    fn check_with(render: &str, shared: &SharedGeneratorIndex, is_env_root: bool) -> TargetReport {
+        check_rendered(
+            render,
+            "t",
+            &RenderContext {
+                declared_generators: &declared(),
+                shared,
+                is_env_root,
+            },
+        )
+    }
+
+    /// FAILS against the pre-story-3 rule: a non-root base render's bare ref
+    /// to a shared generator was `not_content_addressed` + `unresolved`.
+    #[test]
+    fn non_root_bare_ref_to_a_shared_generator_is_deferred() {
+        let shared = shared_index("media-codec-profile");
+        let r = check_with(&keyref_to("media-codec-profile"), &shared, false);
+        assert!(r.findings.is_empty(), "{:?}", r.findings);
+        assert_eq!(r.deferred.len(), 1);
+        assert!(r.deferred[0].contains("media-codec-profile"));
+    }
+
+    #[test]
+    fn the_environment_root_never_defers() {
+        // The profile excluded from the root: the root must go red.
+        let shared = shared_index("media-codec-profile");
+        let r = check_with(&keyref_to("media-codec-profile"), &shared, true);
+        assert!(r.deferred.is_empty());
+        assert_eq!(
+            rules(&r),
+            vec![NOT_CONTENT_ADDRESSED_RULE_ID, UNRESOLVED_REFERENCE_RULE_ID]
+        );
+    }
+
+    #[test]
+    fn deferral_is_exact_name_only() {
+        let shared = shared_index("media-codec-profile");
+        for near in [
+            "media-codec",
+            "media-codec-profile-extra",
+            "x-media-codec-profile",
+        ] {
+            let r = check_with(&keyref_to(near), &shared, false);
+            assert!(r.deferred.is_empty(), "{near} must not defer");
+            assert!(!r.findings.is_empty(), "{near} must fail");
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_shared_name_is_never_deferred() {
+        let mut shared = SharedGeneratorIndex::default();
+        shared
+            .ambiguous
+            .push(crate::common::kustomize_generators::AmbiguousGenerator {
+                name: "media-codec-profile".into(),
+                bases: vec!["a".into(), "b".into()],
+            });
+        let r = check_with(&keyref_to("media-codec-profile"), &shared, false);
+        assert!(r.deferred.is_empty());
+        assert!(
+            r.findings
+                .iter()
+                .any(|f| f.detail.contains("more than one base")),
+            "{:?}",
+            r.findings
+        );
+    }
+
+    #[test]
+    fn a_shared_generator_present_in_the_render_is_not_deferred() {
+        // If the render includes the generator (bare name = a plain ConfigMap
+        // of that name), the ordinary rule applies — no deferral escape hatch.
+        let shared = shared_index("media-codec-profile");
+        let plain = cm("media-codec-profile");
+        let r = check_with(
+            &[plain, keyref_to("media-codec-profile")].join("---\n"),
+            &shared,
+            false,
+        );
+        assert!(r.deferred.is_empty());
+        assert_eq!(rules(&r), vec![NOT_CONTENT_ADDRESSED_RULE_ID]);
     }
 
     #[test]
@@ -333,7 +553,7 @@ mod tests {
             "      containers:\n      - name: grafana\n      volumes:\n      - name: dashboards\n        projected:\n          sources:\n          - configMap: {{name: {mounted}}}\n"
         ));
         let render = [dashboard_cm(mounted), dashboard_cm(forgotten), grafana].join("---\n");
-        let r = check_rendered(&render, "t", &declared);
+        let r = check(&render, &declared);
         assert_eq!(
             rules(&r),
             vec![UNREFERENCED_CONFIGMAP_RULE_ID],

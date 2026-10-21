@@ -8,14 +8,18 @@
 //!    union: a var present in `mc-0` but missing from `mc-1` is a real
 //!    production defect (that pod CrashLoops) even though its sibling is fine.
 //! 2. Every `configMapKeyRef` resolves — the named ConfigMap exists in the
-//!    service directory **and** declares the named key. Resolution is
-//!    name-scoped: the `(configMapKeyRef.name, key)` pair is looked up against
-//!    that specific ConfigMap's `data:` block, never against a directory-wide
-//!    union of every key in sight.
+//!    service directory, or is a SHARED generator in a generator-only sibling
+//!    base (see "Cross-base resolution" below), **and** declares the named key.
+//!    Resolution is name-scoped: the `(configMapKeyRef.name, key)` pair is
+//!    looked up against that specific ConfigMap's `data:` block, never against
+//!    a directory-wide union of every key in sight.
 //! 3. Every ConfigMap `data:` key is referenced by at least one workload
 //!    **naming that ConfigMap**. A key in `mh-0-config` referenced only by
 //!    `mh-0-deployment.yaml` is correct; the same key referenced only by
-//!    `mh-1-deployment.yaml` (which names `mh-1-config`) is an orphan.
+//!    `mh-1-deployment.yaml` (which names `mh-1-config`) is an orphan. For a
+//!    shared generator the referencing workload may live in ANY base: a
+//!    profile key referenced by nobody is an orphan; one referenced only by
+//!    MC (not MH) is not.
 //! 4. Every `configMapKeyRef.key` equals the name of the env var it feeds. A
 //!    crossed reference — env `MH_STREAM_COST_VIDEO_BPS` pointing at key
 //!    `MH_STREAM_COST_AUDIO_BPS` — passes checks 1-3 (the var is declared, the
@@ -45,9 +49,37 @@
 //! the ConfigMap count, so a guard that stopped seeing generators cannot report
 //! a vacuous check 3 as clean.
 //!
+//! # Cross-base resolution (shared generators)
+//!
+//! A **generator-only base** under `infra/services/` — a kustomization with a
+//! `configMapGenerator` and no `resources` (e.g. `media-codec-profile/`) — owns
+//! a ConfigMap that workloads in OTHER bases consume. Membership comes from the
+//! ONE [`shared_generator_index`] (also consumed by `kustomize` R-21), never a
+//! list here. Rules:
+//!
+//! - A canonical workload's ref resolves LOCAL-FIRST, then against the shared
+//!   index. A ref to a generator in a sibling base that is NOT generator-only
+//!   (another service's own config, `redis.conf`, …) stays
+//!   `configmap_not_found`: one service never silently binds to another's
+//!   private config.
+//! - A shared name declared by two bases (two generator-only bases, or a
+//!   generator-only base and any other base) is a hard
+//!   [`CONFIGMAP_NAME_AMBIGUOUS_ACROSS_BASES_RULE_ID`] error and is never
+//!   resolved — no last-wins, mirroring [`DUPLICATE_CONFIGMAP_NAME_RULE_ID`].
+//! - Orphan detection for a shared generator runs AFTER every service, over
+//!   `configMapKeyRef`s from every canonical workload plus every workload in
+//!   the non-canonical bases. A non-canonical workload consuming a shared
+//!   generator by `envFrom` or volume is `unsupported_env_source` (its
+//!   key-consumption is unknowable). SOUNDNESS: shared orphan checks are
+//!   suppressed exactly when some service's are (an unreadable import, or an
+//!   envFrom/malformed ref naming the shared map) — and every such case
+//!   carries a FATAL hit, so the suppressed orphans never hide behind a green
+//!   run (same argument as `suppress_all_orphans` below).
+//!
 //! # Scope boundary — read this before trusting the status line
 //!
-//! This guard covers `infra/services/<svc>/` **only**. It does NOT cover
+//! This guard covers `infra/services/<svc>/` for the canonical services, plus
+//! the generator-only bases they consume, **only**. It does NOT cover
 //! `infra/kubernetes/overlays/**`. Kind overlays carry live `data:` keys
 //! (`overlays/kind/services/{ac,gc,mc}-service/configmap-otel-patch.yaml`,
 //! `overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml`) that
@@ -61,16 +93,19 @@
 //! Coverage that is stated can be audited; coverage that is assumed cannot.
 
 use crate::common::explain::{print_finding, Finding};
-use crate::common::kustomize_generators::{config_map_generators, generator_keys};
+use crate::common::kustomize_generators::{
+    config_map_generators, generator_keys, shared_generator_index, SharedGeneratorIndex,
+};
 use crate::common::path_safety::resolve_cited_path;
 use crate::common::pod_spec::{
-    container_configmap_refs, containers, env_from_is_list, pod_spec, ConfigMapRefKind,
+    container_configmap_refs, containers, env_from_is_list, meta_str, parse_docs,
+    pod_configmap_refs, pod_spec, ConfigMapRefKind,
 };
+use crate::common::services::{infra_service_bases, INFRA_SERVICES_DIR};
 use crate::common::status::emit_ok;
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde::Deserialize as _;
 use serde_norway::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -114,6 +149,13 @@ pub const MALFORMED_ENV_REFERENCE_RULE_ID: &str = "malformed_env_reference";
 /// a name-scoped resolver whose entire premise is that `metadata.name`
 /// identifies the document — a silent last-wins collapse would hide both.
 pub const DUPLICATE_CONFIGMAP_NAME_RULE_ID: &str = "duplicate_configmap_name";
+/// A shared (generator-only base) ConfigMap name is declared by more than one
+/// base under `infra/services/`. The cross-base twin of
+/// [`DUPLICATE_CONFIGMAP_NAME_RULE_ID`]: a name-scoped resolver that picked one
+/// would silently bind workloads to whichever base it saw last. The name is
+/// never resolved (see [`SharedGeneratorIndex::ambiguous`]).
+pub const CONFIGMAP_NAME_AMBIGUOUS_ACROSS_BASES_RULE_ID: &str =
+    "configmap_name_ambiguous_across_bases";
 /// A `configMapKeyRef`'s `key` differs from the name of the env var it feeds.
 ///
 /// **The failure it catches is silent at runtime.** A crossed reference
@@ -168,6 +210,10 @@ const RULE_PRECEDENCE: &[(&str, &str)] = &[
         "unclassified-manifest-kind",
     ),
     (DUPLICATE_CONFIGMAP_NAME_RULE_ID, "duplicate-configmap-name"),
+    (
+        CONFIGMAP_NAME_AMBIGUOUS_ACROSS_BASES_RULE_ID,
+        "configmap-name-ambiguous-across-bases",
+    ),
     (
         WORKLOAD_MISSING_POD_SPEC_RULE_ID,
         "workload-missing-pod-spec",
@@ -364,7 +410,7 @@ fn extract_required_env_vars(content: &str) -> Vec<String> {
 
 /// Read `metadata.name`, if present.
 fn metadata_name(doc: &Value) -> Option<&str> {
-    doc.get("metadata")?.get("name")?.as_str()
+    meta_str(doc, "name")
 }
 
 /// Extract env names and `configMapKeyRef` pairs from one workload document.
@@ -556,125 +602,82 @@ fn configmap_keys(doc: &Value) -> BTreeSet<String> {
 fn discover_manifests(repo_root: &Path, infra_dir: &Path, dir: &str) -> Result<Discovered> {
     let mut out = Discovered::default();
 
-    // Collect and sort so findings are ordered by path rather than by inode.
-    let mut paths: Vec<PathBuf> = Vec::new();
-    let entries = std::fs::read_dir(infra_dir)
-        .with_context(|| format!("reading directory {}", infra_dir.display()))?;
-    for entry in entries {
-        let entry = entry.with_context(|| format!("reading entry in {}", infra_dir.display()))?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let is_yaml = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e == "yaml" || e == "yml");
-        if !is_yaml {
-            continue;
-        }
-        paths.push(path);
-    }
-    paths.sort();
-
-    for path in paths {
-        // ADR-0034 §5: containment through the single SoT, never a re-implementation.
-        let rel_for_resolve = path.strip_prefix(repo_root).unwrap_or(&path);
-        let rel_str = rel_for_resolve.to_string_lossy().into_owned();
-        if resolve_cited_path(repo_root, &rel_str).is_none() {
-            anyhow::bail!(
-                "manifest path escapes the repository root or cannot be resolved: {rel_str}"
-            );
-        }
-        let rel = rel_for_resolve.to_path_buf();
-
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-
-        for de in serde_norway::Deserializer::from_str(&raw) {
-            let doc = Value::deserialize(de)
-                .with_context(|| format!("parsing YAML in {}", rel.display()))?;
-
-            // A trailing `---` yields a null document. That is not a manifest.
-            // A document with *content* but no `kind` is a different case and
-            // must not fall through into silence — see below.
-            if doc.is_null() {
-                continue;
-            }
-
-            let Some(kind) = doc.get("kind").and_then(Value::as_str) else {
-                out.hits.push(Hit {
+    // One manifest reader per base (`base_documents`: sorted, containment-gated,
+    // every document parsed; null documents dropped). A document with content but
+    // no `kind` must not fall through into silence — see below.
+    for (rel, doc) in base_documents(repo_root, dir)? {
+        let Some(kind) = doc.get("kind").and_then(Value::as_str) else {
+            out.hits.push(Hit {
                     rule_id: UNCLASSIFIED_MANIFEST_KIND_RULE_ID,
                     detail: format!(
                         "{dir}: manifest document has no `kind` field; cannot classify it as workload, ConfigMap, or neither"
                     ),
                     file: rel.clone(),
                 });
-                continue;
-            };
+            continue;
+        };
 
-            if WORKLOAD_KINDS_WITH_POD_SPEC.contains(&kind) {
-                let (workload, hits) = parse_workload(&doc, &rel, dir);
-                out.hits.extend(hits);
-                if let Some(w) = workload {
-                    out.workloads.push(w);
-                }
-            } else if kind == CONFIGMAP_KIND {
-                let Some(name) = metadata_name(&doc) else {
-                    out.hits.push(Hit {
+        if WORKLOAD_KINDS_WITH_POD_SPEC.contains(&kind) {
+            let (workload, hits) = parse_workload(&doc, &rel, dir);
+            out.hits.extend(hits);
+            if let Some(w) = workload {
+                out.workloads.push(w);
+            }
+        } else if kind == CONFIGMAP_KIND {
+            let Some(name) = metadata_name(&doc) else {
+                out.hits.push(Hit {
                         rule_id: UNCLASSIFIED_MANIFEST_KIND_RULE_ID,
                         detail: format!(
                             "{dir}: ConfigMap has no metadata.name; its keys cannot be resolved against any configMapKeyRef"
                         ),
                         file: rel.clone(),
                     });
-                    continue;
-                };
-                out.configmaps.push(ConfigMapDoc {
-                    path: rel.clone(),
-                    name: name.to_string(),
-                    keys: configmap_keys(&doc),
-                });
-            } else if kind == KUSTOMIZATION_KIND {
-                // ADR-0038 §2: service ConfigMaps are `configMapGenerator`
-                // entries, not `kind: ConfigMap` documents. They enter the SAME
-                // name-scoped model, keyed by the generator name (the pre-hash
-                // name every base `configMapKeyRef` uses); findings point at
-                // the source file. The shared parser makes an unreadable
-                // generator or source a hard error — a generator this guard
-                // cannot read would otherwise be a ConfigMap it silently
-                // cannot see, turning check 3 vacuous.
-                let entries = config_map_generators(&doc)
-                    .with_context(|| format!("reading configMapGenerator in {}", rel.display()))?;
-                for entry in entries {
-                    if entry.behavior.as_deref().is_some_and(|b| b != "create") {
-                        anyhow::bail!(
+                continue;
+            };
+            out.configmaps.push(ConfigMapDoc {
+                path: rel.clone(),
+                name: name.to_string(),
+                keys: configmap_keys(&doc),
+            });
+        } else if kind == KUSTOMIZATION_KIND {
+            // ADR-0038 §2: service ConfigMaps are `configMapGenerator`
+            // entries, not `kind: ConfigMap` documents. They enter the SAME
+            // name-scoped model, keyed by the generator name (the pre-hash
+            // name every base `configMapKeyRef` uses); findings point at
+            // the source file. The shared parser makes an unreadable
+            // generator or source a hard error — a generator this guard
+            // cannot read would otherwise be a ConfigMap it silently
+            // cannot see, turning check 3 vacuous.
+            let entries = config_map_generators(&doc)
+                .with_context(|| format!("reading configMapGenerator in {}", rel.display()))?;
+            for entry in entries {
+                if entry.behavior.as_deref().is_some_and(|b| b != "create") {
+                    anyhow::bail!(
                             "{}: configMapGenerator {:?} uses behavior {:?}; a service base must CREATE its ConfigMaps (merge/replace belong in overlays, which this guard does not cover)",
                             rel.display(),
                             entry.name,
                             entry.behavior
                         );
-                    }
-                    let keys = generator_keys(repo_root, infra_dir, &entry)?;
-                    let src = entry
-                        .source_paths()
-                        .next()
-                        .map_or_else(|| rel.clone(), |p| rel.with_file_name(p));
-                    out.configmaps.push(ConfigMapDoc {
-                        path: src,
-                        name: entry.name,
-                        keys,
-                    });
                 }
-            } else if !NO_POD_SPEC_KINDS.contains(&kind) {
-                out.hits.push(Hit {
+                let keys = generator_keys(repo_root, infra_dir, &entry)?;
+                let src = entry
+                    .source_paths()
+                    .next()
+                    .map_or_else(|| rel.clone(), |p| rel.with_file_name(p));
+                out.configmaps.push(ConfigMapDoc {
+                    path: src,
+                    name: entry.name,
+                    keys,
+                });
+            }
+        } else if !NO_POD_SPEC_KINDS.contains(&kind) {
+            out.hits.push(Hit {
                     rule_id: UNCLASSIFIED_MANIFEST_KIND_RULE_ID,
                     detail: format!(
                         "{dir}: manifest kind {kind:?} is classified neither as a workload nor as pod-spec-free; if it carries a pod template add it to WORKLOAD_KINDS_WITH_POD_SPEC, otherwise to NO_POD_SPEC_KINDS"
                     ),
                     file: rel.clone(),
                 });
-            }
         }
     }
 
@@ -685,160 +688,267 @@ fn discover_manifests(repo_root: &Path, infra_dir: &Path, dir: &str) -> Result<D
 // Analysis.
 // -----------------------------------------------------------------------------
 
+/// What the per-service passes learn about SHARED generators, carried to the
+/// cross-base orphan pass that runs after every service.
+#[derive(Debug, Default)]
+struct SharedUse {
+    /// `(shared ConfigMap name, key)` referenced by any workload in any base.
+    refs: BTreeSet<(String, String)>,
+    /// Shared names whose key-consumption some workload made unknowable.
+    ambiguous: BTreeSet<String>,
+    /// Some service imported a ConfigMap it could not identify.
+    suppress_all: bool,
+}
+
+/// The detail line both duplicate-name rules share: `name` is declared at
+/// every `location`, so a name-scoped resolver cannot tell them apart.
+fn duplicate_name_detail(scope: &str, name: &str, locations: &[String]) -> String {
+    format!(
+        "{scope}: ConfigMap name {name:?} is declared more than once ({}); name-scoped resolution cannot tell them apart",
+        locations.join(", ")
+    )
+}
+
+/// Cross-base ambiguity hits — one per shared name declared by two bases.
+fn ambiguity_hits(shared: &SharedGeneratorIndex) -> Vec<Hit> {
+    shared
+        .ambiguous
+        .iter()
+        .map(|a| Hit {
+            rule_id: CONFIGMAP_NAME_AMBIGUOUS_ACROSS_BASES_RULE_ID,
+            detail: duplicate_name_detail(
+                INFRA_SERVICES_DIR,
+                &a.name,
+                &a.bases
+                    .iter()
+                    .map(|b| format!("base {b}"))
+                    .collect::<Vec<_>>(),
+            ),
+            file: PathBuf::from(INFRA_SERVICES_DIR),
+        })
+        .collect()
+}
+
 pub(crate) fn analyze(repo_root: &Path) -> Result<Report> {
     let mut report = Report::default();
+    let shared = shared_generator_index(repo_root)?;
+    report.hits.extend(ambiguity_hits(&shared));
+    let mut shared_use = SharedUse::default();
 
     for (_, dir) in crate::common::services::CANONICAL_SERVICES {
-        let config_rs = repo_root.join("crates").join(dir).join("src/config.rs");
-        let infra_dir = repo_root.join("infra/services").join(dir);
+        analyze_service(repo_root, dir, &shared, &mut shared_use, &mut report)?;
+    }
+    collect_non_canonical_refs(repo_root, &shared, &mut shared_use, &mut report)?;
+    report.hits.extend(shared_orphan_hits(&shared, &shared_use));
+    report.checked_configmaps += shared.generators.len();
+    Ok(report)
+}
 
-        // Formerly a silent `continue`. A canonical service losing its config
-        // or its manifests would have vanished from the run with no trace at
-        // all — not even the WARN the missing-workload path emitted.
-        if !config_rs.is_file() || !infra_dir.is_dir() {
+/// Checks 1-4 for one canonical service. Refs to shared generators resolve
+/// against `shared` (local-first) and are recorded in `shared_use` for the
+/// cross-base orphan pass instead of this service's.
+fn analyze_service(
+    repo_root: &Path,
+    dir: &str,
+    shared: &SharedGeneratorIndex,
+    shared_use: &mut SharedUse,
+    report: &mut Report,
+) -> Result<()> {
+    let config_rs = repo_root.join("crates").join(dir).join("src/config.rs");
+    let infra_dir = repo_root.join(INFRA_SERVICES_DIR).join(dir);
+
+    // Formerly a silent `continue`. A canonical service losing its config
+    // or its manifests would have vanished from the run with no trace at
+    // all — not even the WARN the missing-workload path emitted.
+    if !config_rs.is_file() || !infra_dir.is_dir() {
+        report.hits.push(Hit {
+            rule_id: SERVICE_INPUTS_MISSING_RULE_ID,
+            detail: format!(
+                "{dir}: expected both crates/{dir}/src/config.rs and infra/services/{dir}/ (config.rs present: {c}, infra dir present: {i})",
+                c = config_rs.is_file(),
+                i = infra_dir.is_dir(),
+            ),
+            file: PathBuf::from(format!("infra/services/{dir}")),
+        });
+        return Ok(());
+    }
+
+    let discovered = discover_manifests(repo_root, &infra_dir, dir)?;
+    report.hits.extend(discovered.hits);
+
+    if discovered.workloads.is_empty() {
+        report.hits.push(Hit {
+            rule_id: NO_WORKLOAD_MANIFEST_RULE_ID,
+            detail: format!(
+                "{dir}: no workload manifest discovered in infra/services/{dir}/ (looked for kinds {kinds:?} in every *.yaml); this service is deployed but unchecked",
+                kinds = WORKLOAD_KINDS_WITH_POD_SPEC,
+            ),
+            file: PathBuf::from(format!("infra/services/{dir}")),
+        });
+        return Ok(());
+    }
+
+    report.checked_services += 1;
+    report.checked_workloads += discovered.workloads.len();
+    report.checked_configmaps += discovered.configmaps.len();
+
+    let config_content = std::fs::read_to_string(&config_rs)
+        .with_context(|| format!("reading {}", config_rs.display()))?;
+    let required = extract_required_env_vars(&config_content);
+
+    // ConfigMap name -> its declared keys. A name collision is fatal to a
+    // name-scoped resolver — `.collect()` would silently keep the last and
+    // hide both — so detect it explicitly rather than dedup by accident.
+    let mut by_name: BTreeMap<&str, &ConfigMapDoc> = BTreeMap::new();
+    for cm in &discovered.configmaps {
+        if let Some(prev) = by_name.insert(cm.name.as_str(), cm) {
             report.hits.push(Hit {
-                rule_id: SERVICE_INPUTS_MISSING_RULE_ID,
-                detail: format!(
-                    "{dir}: expected both crates/{dir}/src/config.rs and infra/services/{dir}/ (config.rs present: {c}, infra dir present: {i})",
-                    c = config_rs.is_file(),
-                    i = infra_dir.is_dir(),
+                rule_id: DUPLICATE_CONFIGMAP_NAME_RULE_ID,
+                detail: duplicate_name_detail(
+                    dir,
+                    &cm.name,
+                    &[
+                        prev.path.display().to_string(),
+                        cm.path.display().to_string(),
+                    ],
                 ),
-                file: PathBuf::from(format!("infra/services/{dir}")),
+                file: cm.path.clone(),
             });
-            continue;
         }
-
-        let discovered = discover_manifests(repo_root, &infra_dir, dir)?;
-        report.hits.extend(discovered.hits);
-
-        if discovered.workloads.is_empty() {
+    }
+    // A local ConfigMap with the name of a shared generator would SHADOW it
+    // (local-first) — silently binding this service's refs to the local copy.
+    // A local GENERATOR of that name is already an ambiguity (the index drops
+    // the name from `generators`, so this cannot double-fire); a local
+    // `kind: ConfigMap` document is not seen by the index, so catch it here.
+    for cm in &discovered.configmaps {
+        if let Some(g) = shared.generators.get(cm.name.as_str()) {
             report.hits.push(Hit {
-                rule_id: NO_WORKLOAD_MANIFEST_RULE_ID,
-                detail: format!(
-                    "{dir}: no workload manifest discovered in infra/services/{dir}/ (looked for kinds {kinds:?} in every *.yaml); this service is deployed but unchecked",
-                    kinds = WORKLOAD_KINDS_WITH_POD_SPEC,
+                rule_id: CONFIGMAP_NAME_AMBIGUOUS_ACROSS_BASES_RULE_ID,
+                detail: duplicate_name_detail(
+                    dir,
+                    &cm.name,
+                    &[
+                        cm.path.display().to_string(),
+                        g.source.display().to_string(),
+                    ],
                 ),
-                file: PathBuf::from(format!("infra/services/{dir}")),
+                file: cm.path.clone(),
             });
-            continue;
         }
+    }
+    // A name is SHARED for this service only when no local ConfigMap claims it
+    // (local-first; any local+shared clash is an ambiguity hit, above or in
+    // the index).
+    let is_shared =
+        |name: &str| !by_name.contains_key(name) && shared.generators.contains_key(name);
 
-        report.checked_services += 1;
-        report.checked_workloads += discovered.workloads.len();
-        report.checked_configmaps += discovered.configmaps.len();
-
-        let config_content = std::fs::read_to_string(&config_rs)
-            .with_context(|| format!("reading {}", config_rs.display()))?;
-        let required = extract_required_env_vars(&config_content);
-
-        // ConfigMap name -> its declared keys. A name collision is fatal to a
-        // name-scoped resolver — `.collect()` would silently keep the last and
-        // hide both — so detect it explicitly rather than dedup by accident.
-        let mut by_name: BTreeMap<&str, &ConfigMapDoc> = BTreeMap::new();
-        for cm in &discovered.configmaps {
-            if let Some(prev) = by_name.insert(cm.name.as_str(), cm) {
-                report.hits.push(Hit {
-                    rule_id: DUPLICATE_CONFIGMAP_NAME_RULE_ID,
-                    detail: format!(
-                        "{dir}: two ConfigMaps share metadata.name {name:?} ({a}, {b}); name-scoped resolution cannot tell them apart",
-                        name = cm.name,
-                        a = prev.path.display(),
-                        b = cm.path.display(),
-                    ),
-                    file: cm.path.clone(),
-                });
-            }
+    // Every (configmap name, key) pair referenced by any workload here.
+    let referenced: BTreeSet<(&str, &str)> = discovered
+        .workloads
+        .iter()
+        .flat_map(|w| w.key_refs.iter().map(|(n, k)| (n.as_str(), k.as_str())))
+        .collect();
+    for (n, k) in &referenced {
+        if is_shared(n) {
+            shared_use.refs.insert(((*n).to_string(), (*k).to_string()));
         }
+    }
 
-        // Every (configmap name, key) pair referenced by any workload here.
-        let referenced: BTreeSet<(&str, &str)> = discovered
-            .workloads
-            .iter()
-            .flat_map(|w| w.key_refs.iter().map(|(n, k)| (n.as_str(), k.as_str())))
-            .collect();
+    // Check 1 is suppressed PER WORKLOAD for any workload using envFrom (a
+    // required var might be bulk-injected, so "not declared" is unprovable).
+    // Check 3 is suppressed PER CONFIGMAP for maps named by an envFrom
+    // import or a malformed ref (their key-consumption is unknowable) — NOT
+    // service-wide: an orphan in a ConfigMap that no unseeable reference
+    // names is still a real orphan. The `unsupported_env_source` /
+    // `malformed_env_reference` hits fail the run regardless.
+    let ambiguous_cms: BTreeSet<&str> = discovered
+        .workloads
+        .iter()
+        .flat_map(|w| w.ambiguous_cm_names.iter().map(String::as_str))
+        .collect();
+    for n in &ambiguous_cms {
+        if is_shared(n) {
+            shared_use.ambiguous.insert((*n).to_string());
+        }
+    }
+    // Loop-invariant, hoisted so it reads as "check 3 is entirely off" not
+    // "filtered per ConfigMap": true only when a workload imports a
+    // ConfigMap we could not identify (unreadable `name`, or an `envFrom`
+    // that is not a list), so no map can be excluded precisely.
+    //
+    // SOUNDNESS: this blanket suppression is safe ONLY because
+    // `unsupported_env_source` is emitted UNCONDITIONALLY for any `envFrom`
+    // and is a hard FAIL — so a run reaching this line is always red, and
+    // the suppressed orphans cannot hide behind a green verdict. The
+    // guarantor is that unconditional fatality, NOT the accompanying
+    // `malformed_env_reference` hit. Anyone adding an `envFrom` allowlist,
+    // or otherwise making `unsupported_env_source` non-fatal, MUST revisit
+    // this line first: without it this becomes a silent service-wide orphan
+    // blind spot on a green run. The invariant "suppression implies a fatal
+    // hit" is encoded in `env_from_suppresses_missing_in_manifest`
+    // (asserts the unsupported_env_source hit) and every suppression test's
+    // `run(..).is_err()` assertion — weaken the fatality and those fail.
+    // The same flag also suppresses the SHARED generators' orphan pass (the
+    // unidentified import could be one of them) — same soundness argument.
+    let suppress_all_orphans = discovered
+        .workloads
+        .iter()
+        .any(|w| w.imports_unnamed_configmap);
+    shared_use.suppress_all |= suppress_all_orphans;
 
-        // Check 1 is suppressed PER WORKLOAD for any workload using envFrom (a
-        // required var might be bulk-injected, so "not declared" is unprovable).
-        // Check 3 is suppressed PER CONFIGMAP for maps named by an envFrom
-        // import or a malformed ref (their key-consumption is unknowable) — NOT
-        // service-wide: an orphan in a ConfigMap that no unseeable reference
-        // names is still a real orphan. The `unsupported_env_source` /
-        // `malformed_env_reference` hits fail the run regardless.
-        let ambiguous_cms: BTreeSet<&str> = discovered
-            .workloads
-            .iter()
-            .flat_map(|w| w.ambiguous_cm_names.iter().map(String::as_str))
-            .collect();
-        // Loop-invariant, hoisted so it reads as "check 3 is entirely off" not
-        // "filtered per ConfigMap": true only when a workload imports a
-        // ConfigMap we could not identify (unreadable `name`, or an `envFrom`
-        // that is not a list), so no map can be excluded precisely.
-        //
-        // SOUNDNESS: this blanket suppression is safe ONLY because
-        // `unsupported_env_source` is emitted UNCONDITIONALLY for any `envFrom`
-        // and is a hard FAIL — so a run reaching this line is always red, and
-        // the suppressed orphans cannot hide behind a green verdict. The
-        // guarantor is that unconditional fatality, NOT the accompanying
-        // `malformed_env_reference` hit. Anyone adding an `envFrom` allowlist,
-        // or otherwise making `unsupported_env_source` non-fatal, MUST revisit
-        // this line first: without it this becomes a silent service-wide orphan
-        // blind spot on a green run. The invariant "suppression implies a fatal
-        // hit" is encoded in `env_from_suppresses_missing_in_manifest`
-        // (asserts the unsupported_env_source hit) and every suppression test's
-        // `run(..).is_err()` assertion — weaken the fatality and those fail.
-        let suppress_all_orphans = discovered
-            .workloads
-            .iter()
-            .any(|w| w.imports_unnamed_configmap);
-
+    for workload in &discovered.workloads {
         // Check 1 — per workload, not union.
-        for workload in &discovered.workloads {
-            if !workload.uses_env_from {
-                for var in &required {
-                    if !workload.env_names.contains(var) {
-                        report.hits.push(Hit {
-                            rule_id: MISSING_IN_MANIFEST_RULE_ID,
-                            detail: format!(
-                                "{dir}: config.rs requires {var}, not declared by this workload"
-                            ),
-                            file: workload.path.clone(),
-                        });
-                    }
-                }
-            }
-
-            // Check 2 — name-scoped resolution. Runs regardless of envFrom:
-            // an explicit configMapKeyRef either resolves or it does not.
-            for (cm_name, key) in &workload.key_refs {
-                match by_name.get(cm_name.as_str()) {
-                    None => report.hits.push(Hit {
-                        rule_id: CONFIGMAP_NOT_FOUND_RULE_ID,
+        if !workload.uses_env_from {
+            for var in &required {
+                if !workload.env_names.contains(var) {
+                    report.hits.push(Hit {
+                        rule_id: MISSING_IN_MANIFEST_RULE_ID,
                         detail: format!(
-                            "{dir}: configMapKeyRef names ConfigMap {cm_name:?} (key {key:?}) but no ConfigMap with that metadata.name exists in infra/services/{dir}/"
+                            "{dir}: config.rs requires {var}, not declared by this workload"
                         ),
                         file: workload.path.clone(),
-                    }),
-                    Some(cm) if !cm.keys.contains(key) => report.hits.push(Hit {
-                        rule_id: KEY_NOT_IN_CONFIGMAP_RULE_ID,
-                        detail: format!(
-                            "{dir}: configMapKeyRef requests key {key:?} from ConfigMap {cm_name:?}, which does not declare it"
-                        ),
-                        file: workload.path.clone(),
-                    }),
-                    Some(_) => {}
+                    });
                 }
             }
         }
 
-        // Check 3 — orphan keys, scoped to the ConfigMap that declares them.
-        // A key is an orphan iff no workload references (this ConfigMap's name,
-        // this key). Suppressed per-ConfigMap for maps a bulk import or a
-        // malformed ref names (their key-consumption is unknowable), and only
-        // service-wide in the unreadable-import fallback above.
-        for cm in &discovered.configmaps {
-            if suppress_all_orphans {
-                break;
+        // Check 2 — name-scoped resolution, local-first then shared. Runs
+        // regardless of envFrom: an explicit configMapKeyRef either resolves
+        // or it does not.
+        for (cm_name, key) in &workload.key_refs {
+            let keys = by_name
+                .get(cm_name.as_str())
+                .map(|cm| &cm.keys)
+                .or_else(|| shared.generators.get(cm_name.as_str()).map(|g| &g.keys));
+            match keys {
+                None => report.hits.push(Hit {
+                    rule_id: CONFIGMAP_NOT_FOUND_RULE_ID,
+                    detail: format!(
+                        "{dir}: configMapKeyRef names ConfigMap {cm_name:?} (key {key:?}) but no ConfigMap with that name exists in infra/services/{dir}/ or as a shared generator in a generator-only base under infra/services/ (a generator in another service's base is never resolved across bases)"
+                    ),
+                    file: workload.path.clone(),
+                }),
+                Some(keys) if !keys.contains(key) => report.hits.push(Hit {
+                    rule_id: KEY_NOT_IN_CONFIGMAP_RULE_ID,
+                    detail: format!(
+                        "{dir}: configMapKeyRef requests key {key:?} from ConfigMap {cm_name:?}, which does not declare it"
+                    ),
+                    file: workload.path.clone(),
+                }),
+                Some(_) => {}
             }
+        }
+    }
+
+    // Check 3 — orphan keys, scoped to the ConfigMap that declares them.
+    // A key is an orphan iff no workload references (this ConfigMap's name,
+    // this key). Suppressed per-ConfigMap for maps a bulk import or a
+    // malformed ref names (their key-consumption is unknowable), and only
+    // service-wide in the unreadable-import fallback above. Shared generators
+    // are checked once, across every base, by `shared_orphan_hits`.
+    if !suppress_all_orphans {
+        for cm in &discovered.configmaps {
             if ambiguous_cms.contains(cm.name.as_str()) {
                 continue;
             }
@@ -856,8 +966,130 @@ pub(crate) fn analyze(repo_root: &Path) -> Result<Report> {
             }
         }
     }
+    Ok(())
+}
 
-    Ok(report)
+/// Record references to SHARED generators made by workloads in the
+/// non-canonical bases (otel-collector, redis, …), which this guard otherwise
+/// does not check. Only refs naming a shared generator matter here; anything
+/// else in those bases is out of scope. A bulk (`envFrom`) or volume
+/// consumption of a shared generator makes its key-consumption unknowable, so
+/// it is an `unsupported_env_source` hit (fatal) and suppresses that map's
+/// orphan check.
+fn collect_non_canonical_refs(
+    repo_root: &Path,
+    shared: &SharedGeneratorIndex,
+    shared_use: &mut SharedUse,
+    report: &mut Report,
+) -> Result<()> {
+    if shared.generators.is_empty() {
+        return Ok(());
+    }
+    let canonical: BTreeSet<&str> = crate::common::services::CANONICAL_SERVICES
+        .iter()
+        .map(|(_, d)| *d)
+        .collect();
+    for base in infra_service_bases(repo_root)? {
+        if canonical.contains(base.as_str()) || shared.generator_only_bases.contains(&base) {
+            continue;
+        }
+        for (rel, doc) in base_documents(repo_root, &base)? {
+            let Some(pod) = pod_spec(&doc) else {
+                continue;
+            };
+            for r in pod_configmap_refs(pod) {
+                let Some(name) = r.name.filter(|n| shared.generators.contains_key(*n)) else {
+                    continue;
+                };
+                match (r.kind, r.key) {
+                    (ConfigMapRefKind::KeyRef, Some(key)) => {
+                        shared_use.refs.insert((name.to_string(), key.to_string()));
+                    }
+                    _ => {
+                        shared_use.ambiguous.insert(name.to_string());
+                        report.hits.push(Hit {
+                            rule_id: UNSUPPORTED_ENV_SOURCE_RULE_ID,
+                            detail: format!(
+                                "{base}: a workload consumes shared ConfigMap {name:?} other than by a configMapKeyRef with a key (envFrom, volume, or a keyless ref); this guard cannot see which keys it consumes and will not claim orphan coverage for that map"
+                            ),
+                            file: rel.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every non-null YAML document of every `*.yaml`/`*.yml` directly under a
+/// base, with its repo-relative path, ordered by path (not inode). THE one
+/// manifest reader per base (canonical discovery and the non-canonical shared
+/// scan both use it). Containment-gated through the single SoT (ADR-0034 §5);
+/// an unreadable entry or unparseable YAML is an error, never a skip.
+fn base_documents(repo_root: &Path, base: &str) -> Result<Vec<(PathBuf, Value)>> {
+    let dir = repo_root.join(INFRA_SERVICES_DIR).join(base);
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in
+        std::fs::read_dir(&dir).with_context(|| format!("reading directory {}", dir.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("reading entry in {}", dir.display()))?
+            .path();
+        let is_yaml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "yaml" || e == "yml");
+        if path.is_file() && is_yaml {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    let mut out = Vec::new();
+    for path in paths {
+        let rel = path.strip_prefix(repo_root).unwrap_or(&path).to_path_buf();
+        let rel_str = rel.to_string_lossy().into_owned();
+        if resolve_cited_path(repo_root, &rel_str).is_none() {
+            anyhow::bail!(
+                "manifest path escapes the repository root or cannot be resolved: {rel_str}"
+            );
+        }
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let docs =
+            parse_docs(&raw).map_err(|e| anyhow::anyhow!("parsing YAML in {rel_str}: {e}"))?;
+        out.extend(docs.into_iter().map(|d| (rel.clone(), d)));
+    }
+    Ok(out)
+}
+
+/// Check 3 for SHARED generators: a key no workload in ANY base references is
+/// an orphan. Suppressed wholesale when some service imported an unidentified
+/// ConfigMap, and per map when its consumption is unknowable — both cases
+/// carry a fatal hit (module doc, "Cross-base resolution").
+fn shared_orphan_hits(shared: &SharedGeneratorIndex, used: &SharedUse) -> Vec<Hit> {
+    if used.suppress_all {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for (name, generator) in &shared.generators {
+        if used.ambiguous.contains(name) {
+            continue;
+        }
+        for key in &generator.keys {
+            if !used.refs.contains(&(name.clone(), key.clone())) {
+                hits.push(Hit {
+                    rule_id: ORPHAN_CONFIGMAP_KEY_RULE_ID,
+                    detail: format!(
+                        "{base}: shared ConfigMap {name:?} declares {key:?}, referenced by no workload in any base",
+                        base = generator.base,
+                    ),
+                    file: generator.source.clone(),
+                });
+            }
+        }
+    }
+    hits
 }
 
 // -----------------------------------------------------------------------------
@@ -1747,6 +1979,7 @@ spec:
             UNSUPPORTED_ENV_SOURCE_RULE_ID,
             MALFORMED_ENV_REFERENCE_RULE_ID,
             DUPLICATE_CONFIGMAP_NAME_RULE_ID,
+            CONFIGMAP_NAME_AMBIGUOUS_ACROSS_BASES_RULE_ID,
             CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID,
         ] {
             assert!(
@@ -2373,5 +2606,271 @@ data:
         assert!(keys.contains("LOG_LEVEL"));
         assert!(keys.contains("METRICS_PORT"));
         assert_eq!(keys.len(), 2, "metadata.name must not leak into data keys");
+    }
+
+    // -------------------------------------------------------------------------
+    // Cross-base resolution — shared generators in generator-only bases.
+    // -------------------------------------------------------------------------
+
+    const PROFILE_KUST: &str = "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nconfigMapGenerator:\n  - name: media-codec-profile\n    envs: [profile.env]\n";
+
+    /// Add a base `infra/services/<base>/` with `files` to a fixture root.
+    fn add_base(root: &std::path::Path, base: &str, files: &[(&str, &str)]) {
+        let dir = root.join("infra/services").join(base);
+        std::fs::create_dir_all(&dir).expect("mkdir base");
+        for (name, body) in files {
+            std::fs::write(dir.join(name), body).expect("write base file");
+        }
+    }
+
+    fn add_profile(root: &std::path::Path, env: &str) {
+        add_base(
+            root,
+            "media-codec-profile",
+            &[("kustomization.yaml", PROFILE_KUST), ("profile.env", env)],
+        );
+    }
+
+    #[test]
+    fn shared_generator_ref_resolves_and_is_counted() {
+        let td = fixture(&[(
+            "mc-service",
+            "",
+            &[(
+                "mc-0-deployment.yaml",
+                &deployment_ref("mc-0", "media-codec-profile", "MEDIA_X"),
+            )],
+        )]);
+        add_profile(td.path(), "MEDIA_X=1\n");
+        let report = analyze(td.path()).expect("analyze");
+        assert!(report.hits.is_empty(), "unexpected hits: {:?}", report.hits);
+        assert_eq!(report.checked_configmaps, 1, "the shared map is counted");
+        // A generator-only base is not a canonical service: it never trips
+        // no_workload_manifest and does not change the service count.
+        assert_eq!(report.checked_services, 4);
+    }
+
+    #[test]
+    fn shared_key_referenced_by_nobody_is_an_orphan() {
+        let td = fixture(&[(
+            "mc-service",
+            "",
+            &[(
+                "mc-0-deployment.yaml",
+                &deployment_ref("mc-0", "media-codec-profile", "MEDIA_X"),
+            )],
+        )]);
+        add_profile(td.path(), "MEDIA_X=1\nMEDIA_UNUSED=2\n");
+        let report = analyze(td.path()).expect("analyze");
+        let orphans = hits_for(&report, ORPHAN_CONFIGMAP_KEY_RULE_ID);
+        assert_eq!(orphans.len(), 1, "hits: {:?}", report.hits);
+        assert!(orphans[0].detail.contains("MEDIA_UNUSED"));
+        assert!(orphans[0].detail.contains("media-codec-profile"));
+        assert_eq!(
+            orphans[0].file,
+            PathBuf::from("infra/services/media-codec-profile/profile.env")
+        );
+    }
+
+    #[test]
+    fn shared_key_referenced_only_from_another_base_is_not_an_orphan() {
+        // MC references MEDIA_A, MH references MEDIA_B: each key is referenced
+        // by SOME base, so neither is an orphan — the per-service orphan scope
+        // would have called both orphans from one side.
+        let td = fixture(&[
+            (
+                "mc-service",
+                "",
+                &[(
+                    "mc-0-deployment.yaml",
+                    &deployment_ref("mc-0", "media-codec-profile", "MEDIA_A"),
+                )],
+            ),
+            (
+                "mh-service",
+                "",
+                &[(
+                    "mh-0-deployment.yaml",
+                    &deployment_ref("mh-0", "media-codec-profile", "MEDIA_B"),
+                )],
+            ),
+        ]);
+        add_profile(td.path(), "MEDIA_A=1\nMEDIA_B=2\n");
+        let report = analyze(td.path()).expect("analyze");
+        assert!(report.hits.is_empty(), "unexpected hits: {:?}", report.hits);
+    }
+
+    #[test]
+    fn shared_key_absent_from_the_shared_generator_is_flagged() {
+        let td = fixture(&[(
+            "mc-service",
+            "",
+            &[(
+                "mc-0-deployment.yaml",
+                &deployment_ref("mc-0", "media-codec-profile", "MEDIA_MISSING"),
+            )],
+        )]);
+        add_profile(td.path(), "MEDIA_X=1\n");
+        let report = analyze(td.path()).expect("analyze");
+        assert_eq!(
+            hits_for(&report, KEY_NOT_IN_CONFIGMAP_RULE_ID).len(),
+            1,
+            "hits: {:?}",
+            report.hits
+        );
+    }
+
+    #[test]
+    fn shared_name_in_two_bases_is_a_named_error_never_resolved() {
+        let td = fixture(&[(
+            "mc-service",
+            "",
+            &[(
+                "mc-0-deployment.yaml",
+                &deployment_ref("mc-0", "media-codec-profile", "MEDIA_X"),
+            )],
+        )]);
+        add_profile(td.path(), "MEDIA_X=1\n");
+        add_base(
+            td.path(),
+            "second-profile",
+            &[
+                ("kustomization.yaml", PROFILE_KUST),
+                ("profile.env", "MEDIA_X=2\n"),
+            ],
+        );
+        let report = analyze(td.path()).expect("analyze");
+        let amb = hits_for(&report, CONFIGMAP_NAME_AMBIGUOUS_ACROSS_BASES_RULE_ID);
+        assert_eq!(amb.len(), 1, "hits: {:?}", report.hits);
+        assert!(amb[0].detail.contains("media-codec-profile"));
+        assert!(amb[0].detail.contains("second-profile"));
+        // Never resolved: the ref is configmap_not_found, not silently bound
+        // to whichever base was read last.
+        assert_eq!(
+            hits_for(&report, CONFIGMAP_NOT_FOUND_RULE_ID).len(),
+            1,
+            "hits: {:?}",
+            report.hits
+        );
+        assert!(fail_token(&report.hits)
+            .starts_with("env-config-configmap-name-ambiguous-across-bases-1-of-"));
+    }
+
+    #[test]
+    fn local_configmap_document_shadowing_a_shared_generator_is_ambiguous() {
+        let td = fixture(&[(
+            "mc-service",
+            "",
+            &[
+                (
+                    "mc-0-deployment.yaml",
+                    &deployment_ref("mc-0", "media-codec-profile", "MEDIA_X"),
+                ),
+                ("shadow.yaml", &configmap("media-codec-profile", "MEDIA_X")),
+            ],
+        )]);
+        add_profile(td.path(), "MEDIA_X=1\n");
+        let report = analyze(td.path()).expect("analyze");
+        let amb = hits_for(&report, CONFIGMAP_NAME_AMBIGUOUS_ACROSS_BASES_RULE_ID);
+        assert_eq!(amb.len(), 1, "hits: {:?}", report.hits);
+        assert!(amb[0].detail.contains("shadow.yaml"), "{}", amb[0].detail);
+    }
+
+    #[test]
+    fn ref_to_another_services_own_generator_is_not_resolved_across_bases() {
+        // Isolation: mc's workload names mh-service-config, which exists — in
+        // mh-service's base, which is NOT generator-only. One service must not
+        // silently bind to another's private config.
+        let mh_kust =
+            generator_kustomization("  - name: mh-service-config\n    envs: [config.env]\n");
+        let td = fixture(&[
+            (
+                "mc-service",
+                "",
+                &[(
+                    "mc-0-deployment.yaml",
+                    &deployment_ref("mc-0", "mh-service-config", "K"),
+                )],
+            ),
+            (
+                "mh-service",
+                "",
+                &[
+                    ("kustomization.yaml", &mh_kust),
+                    (
+                        "deployment.yaml",
+                        &deployment_ref("mh-0", "mh-service-config", "K"),
+                    ),
+                    ("config.env", "K=v\n"),
+                ],
+            ),
+        ]);
+        let report = analyze(td.path()).expect("analyze");
+        let nf = hits_for(&report, CONFIGMAP_NOT_FOUND_RULE_ID);
+        assert_eq!(nf.len(), 1, "hits: {:?}", report.hits);
+        assert!(nf[0].file.to_string_lossy().contains("mc-service"));
+    }
+
+    #[test]
+    fn non_canonical_workload_ref_counts_and_bulk_consumption_is_loud() {
+        let keyref = deployment_ref("collector", "media-codec-profile", "MEDIA_B");
+        let td = fixture(&[(
+            "mc-service",
+            "",
+            &[(
+                "mc-0-deployment.yaml",
+                &deployment_ref("mc-0", "media-codec-profile", "MEDIA_A"),
+            )],
+        )]);
+        add_profile(td.path(), "MEDIA_A=1\nMEDIA_B=2\n");
+        add_base(
+            td.path(),
+            "otel-collector",
+            &[
+                ("kustomization.yaml", "resources:\n  - deployment.yaml\n"),
+                ("deployment.yaml", &keyref),
+            ],
+        );
+        let report = analyze(td.path()).expect("analyze");
+        assert!(
+            report.hits.is_empty(),
+            "a non-canonical keyref counts: {:?}",
+            report.hits
+        );
+
+        let envfrom = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: collector\nspec:\n  template:\n    spec:\n      containers:\n      - name: c\n        envFrom:\n        - configMapRef: {name: media-codec-profile}\n";
+        add_base(td.path(), "otel-collector", &[("deployment.yaml", envfrom)]);
+        let report = analyze(td.path()).expect("analyze");
+        assert_eq!(
+            hits_for(&report, UNSUPPORTED_ENV_SOURCE_RULE_ID).len(),
+            1,
+            "hits: {:?}",
+            report.hits
+        );
+        // Its key-consumption is unknowable, so MEDIA_B is not called an
+        // orphan — but the run is red regardless.
+        assert!(
+            hits_for(&report, ORPHAN_CONFIGMAP_KEY_RULE_ID).is_empty(),
+            "hits: {:?}",
+            report.hits
+        );
+    }
+
+    #[test]
+    fn canonical_env_from_on_shared_map_suppresses_its_orphans_and_is_fatal() {
+        let envfrom = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: mc-0\nspec:\n  template:\n    spec:\n      containers:\n      - name: c\n        envFrom:\n        - configMapRef: {name: media-codec-profile}\n";
+        let td = fixture(&[("mc-service", "", &[("mc-0-deployment.yaml", envfrom)])]);
+        add_profile(td.path(), "MEDIA_A=1\n");
+        let report = analyze(td.path()).expect("analyze");
+        assert!(
+            hits_for(&report, ORPHAN_CONFIGMAP_KEY_RULE_ID).is_empty(),
+            "hits: {:?}",
+            report.hits
+        );
+        assert_eq!(hits_for(&report, UNSUPPORTED_ENV_SOURCE_RULE_ID).len(), 1);
+        assert!(
+            run(td.path(), false).is_err(),
+            "suppression implies a fatal hit"
+        );
     }
 }

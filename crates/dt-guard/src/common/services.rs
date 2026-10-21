@@ -12,8 +12,56 @@
 //! code-generation from Rust or a JSON/TOML intermediary, and is tracked
 //! as Wave 2+ work in `docs/TODO.md` §Cross-Service Duplication (DRY).
 
+use crate::common::path_safety::resolve_cited_path;
+use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::path::Path;
+
+/// Repo-relative directory holding every Kustomize service base.
+pub const INFRA_SERVICES_DIR: &str = "infra/services";
+
+/// Every Kustomize base under `infra/services/` — the directory names, sorted.
+///
+/// THE ONE enumeration of service bases. `kustomize` R-15/R-16 build and
+/// orphan-check every base it returns, and `env-config` discovers generator-only
+/// bases (shared ConfigMaps such as `media-codec-profile`) from it. It replaced
+/// a hand-written list in `kustomize.rs` that a new base could silently miss —
+/// the listing IS the source of truth.
+///
+/// Every subdirectory is yielded, with or without a `kustomization.yaml`:
+/// R-16 reports a base missing one, so dropping it here would turn that loud
+/// finding into an invisible omission.
+///
+/// Containment: each base directory is resolved through
+/// [`resolve_cited_path`]; a base that is (or resolves through) a symlink out
+/// of the repository is a hard error, never a skip — a guard must not parse a
+/// kustomization from outside the tree it vouches for. A missing
+/// `infra/services/` yields no bases (the callers' own vacuity checks fire).
+pub fn infra_service_bases(repo_root: &Path) -> Result<Vec<String>> {
+    let dir = repo_root.join(INFRA_SERVICES_DIR);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("reading entry in {}", dir.display()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            anyhow::bail!("{INFRA_SERVICES_DIR}: a base directory name is not UTF-8");
+        };
+        let rel = format!("{INFRA_SERVICES_DIR}/{name}");
+        let Some(resolved) = resolve_cited_path(repo_root, &rel) else {
+            anyhow::bail!(
+                "{rel} resolves outside the repository (a symlink?) or cannot be resolved; refusing to read a service base from outside the tree"
+            );
+        };
+        if resolved.is_dir() {
+            out.push(name);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
 
 /// `(metric_prefix, directory_name)` for each service that emits metrics.
 /// Adding a new service requires updating only this one site — the
@@ -82,6 +130,43 @@ mod tests {
             .filter_map(|c| c.get(1).map(|m| m.as_str()))
             .collect();
         assert_eq!(captured.len(), CANONICAL_SERVICES.len());
+    }
+
+    #[test]
+    fn infra_service_bases_lists_every_dir_sorted_and_skips_files() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let svc = td.path().join(INFRA_SERVICES_DIR);
+        for d in ["zeta", "alpha", "no-kustomization"] {
+            std::fs::create_dir_all(svc.join(d)).expect("mkdir");
+        }
+        std::fs::write(svc.join("alpha/kustomization.yaml"), "").expect("write");
+        std::fs::write(svc.join("README.md"), "").expect("write");
+        let bases = infra_service_bases(td.path()).expect("bases");
+        assert_eq!(bases, vec!["alpha", "no-kustomization", "zeta"]);
+    }
+
+    #[test]
+    fn infra_service_bases_missing_dir_is_empty() {
+        let td = tempfile::tempdir().expect("tempdir");
+        assert!(infra_service_bases(td.path()).expect("bases").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn infra_service_bases_symlink_escaping_repo_is_an_error() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        let repo = outer.path().join("repo");
+        let outside = outer.path().join("outside-base");
+        std::fs::create_dir_all(repo.join(INFRA_SERVICES_DIR)).expect("mkdir");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        std::fs::write(outside.join("kustomization.yaml"), "resources: []\n").expect("write");
+        std::os::unix::fs::symlink(&outside, repo.join(INFRA_SERVICES_DIR).join("evil"))
+            .expect("symlink");
+        let err = infra_service_bases(&repo).expect_err("escape must fail");
+        assert!(
+            format!("{err:#}").contains("infra/services/evil"),
+            "error names the base: {err:#}"
+        );
     }
 
     #[test]

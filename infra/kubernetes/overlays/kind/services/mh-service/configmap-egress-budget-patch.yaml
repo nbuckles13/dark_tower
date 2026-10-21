@@ -18,8 +18,12 @@
 #       ceiling = MH_EGRESS_BUDGET_BPS / max(MH_STREAM_COST_AUDIO_BPS,
 #                                            MH_STREAM_COST_VIDEO_BPS)
 #   rounded down. It divides by the VIDEO cost even though story 2 sends only
-#   audio: the larger cost is used so MH stays type-blind. So this value must
-#   satisfy, against the DEPLOYED costs, a TWO-SIDED window:
+#   audio: the larger cost is used so MH stays type-blind.
+#   (Story 3: once MH-A1 lands, the two costs are DERIVED by MH from the shared
+#   media-codec-profile instead of the two retired keys; the formula keeps this
+#   shape, and INF-C re-sizes this value against MH's published derived
+#   ceiling.)
+#   So this value must satisfy, against the DEPLOYED costs, a TWO-SIDED window:
 #     lower:  ceiling >= (N+1) x N  with N = 5            (the demo requirement)
 #     upper:  2 x ceiling < MAX_S9_PARTICIPANTS x slot_cap (the S9 exhaustion
 #             test, 28_mh_egress_admission.rs, must still be able to drive a

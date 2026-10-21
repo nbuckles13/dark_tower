@@ -158,44 +158,134 @@ spec:
               name: mc-service-config
               key: DEPLOYMENT_ENVIRONMENT
         # ---- Client-facing media signalling (ADR-0036 §5, §6) ----
-        # All five REQUIRED: mc-service reads them via ConfigError::MissingEnvVar
-        # with no Rust default, so a missing key CrashLoopBackOffs the pod rather
-        # than silently reverting to a value nobody chose.
+        # Every key here that an image reads is REQUIRED: mc-service reads it
+        # via ConfigError::MissingEnvVar with no Rust default, so a missing key
+        # CrashLoopBackOffs the pod rather than silently reverting to a value
+        # nobody chose.
         #
         # THE COUPLED SET IS THREE ARTIFACTS: the ConfigMap, BOTH Deployments,
         # and the image. THIS file is where the configMapKeyRef lives, so THIS
         # file is what declares that the pod consumes a key — the ConfigMap only
-        # supplies the value. Applying the ConfigMap alone does not roll the pods
-        # (resources:, not configMapGenerator:, so no content hash) AND does not
-        # fix a CrashLoop caused by a missing ref here: same pods, same crash,
-        # same key in the message, which reads as "my apply did not take".
-        # Apply all three with-or-before each other; never revert any
-        # independently. See docs/runbooks/mc-deployment.md §Config-failure triage.
-        - name: MC_MAX_RECEIVE_SLOTS
+        # supplies the value. Every MC ConfigMap is content-addressed
+        # (ADR-0038 §2), so a value edit rolls this pod; a missing ref here is
+        # NOT fixed by re-applying the ConfigMap (same pod, same crash, same key
+        # in the message). Apply all three with-or-before each other; never
+        # revert any independently. See docs/runbooks/mc-deployment.md
+        # §Config-failure triage.
+        #
+        # PER WORKLOAD, NEVER UNION: mc-0-deployment.yaml and
+        # mc-1-deployment.yaml carry the identical set (`dt-guard env-config`
+        # rule 1 checks per workload; a key on mc-0 missing from mc-1
+        # crash-loops that pod alone).
+        #
+        # Shared media codec profile (story 3 R-23): the encoding contract MC
+        # directs, read from the SHARED `media-codec-profile` generator in the
+        # sibling base infra/services/media-codec-profile/ — its single home,
+        # also read by MH. Kustomize rewrites this name to the generator's
+        # hashed name in the environment-root render, so a profile edit rolls
+        # mc-0, mc-1, mh-0 and mh-1 together. HARD refs: required reads once
+        # MC-A lands; the current image ignores them.
+        - name: MEDIA_VIDEO_CODEC
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_VIDEO_CODEC
+        - name: MEDIA_VIDEO_WIDTH
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_VIDEO_WIDTH
+        - name: MEDIA_VIDEO_HEIGHT
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_VIDEO_HEIGHT
+        - name: MEDIA_VIDEO_FRAME_RATE_HZ
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_VIDEO_FRAME_RATE_HZ
+        - name: MEDIA_VIDEO_MAX_BITRATE_BPS
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_VIDEO_MAX_BITRATE_BPS
+        - name: MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS
+        - name: MEDIA_AUDIO_CODEC
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_AUDIO_CODEC
+        - name: MEDIA_AUDIO_MAX_BITRATE_BPS
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_AUDIO_MAX_BITRATE_BPS
+        - name: MEDIA_AUDIO_FRAME_RATE_HZ
+          valueFrom:
+            configMapKeyRef:
+              name: media-codec-profile
+              key: MEDIA_AUDIO_FRAME_RATE_HZ
+        # Per-kind receive-slot caps (story 3 R-1, R-26). MC-only, so they live
+        # in mc-service-config — NOT the profile — and the R-26 video-off lever
+        # (MC_MAX_VIDEO_RECEIVE_SLOTS=0) rolls MC only. HARD refs: required
+        # reads once MC-A lands; the current image ignores them.
+        - name: MC_MAX_AUDIO_RECEIVE_SLOTS
           valueFrom:
             configMapKeyRef:
               name: mc-service-config
-              key: MC_MAX_RECEIVE_SLOTS
+              key: MC_MAX_AUDIO_RECEIVE_SLOTS
+        - name: MC_MAX_VIDEO_RECEIVE_SLOTS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_MAX_VIDEO_RECEIVE_SLOTS
         - name: MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS
           valueFrom:
             configMapKeyRef:
               name: mc-service-config
               key: MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS
+        # RETIRED — PENDING REMOVAL: MC_MAX_RECEIVE_SLOTS (superseded by the
+        # per-kind caps) and the three MC_AUDIO_* keys (superseded by
+        # MEDIA_AUDIO_* in the profile). Step 1 of the two-deploy retirement:
+        # these refs are `optional: true` and the keys stay present in
+        # mc-service-config. The current image still READS all four as
+        # required (MissingEnvVar), so the optional flag loosens nothing: a key
+        # that vanished early would still fail this image's startup loudly.
+        # Reads removed by MC-A; then nothing reads them, and a later deploy
+        # deletes keys and refs together (docs/TODO.md §Media Path
+        # Obligations, "Delete the story-3 retired config keys"). Why
+        # `optional: true` here does not contradict the "DO NOT flip them" rule
+        # is stated once, in infra/services/mh-service/mh-0-deployment.yaml at
+        # MH_MEDIA_LATENCY_SAMPLE_RATIO.
+        - name: MC_MAX_RECEIVE_SLOTS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_MAX_RECEIVE_SLOTS
+              optional: true
         - name: MC_AUDIO_CODEC
           valueFrom:
             configMapKeyRef:
               name: mc-service-config
               key: MC_AUDIO_CODEC
+              optional: true
         - name: MC_AUDIO_MAX_BITRATE_BPS
           valueFrom:
             configMapKeyRef:
               name: mc-service-config
               key: MC_AUDIO_MAX_BITRATE_BPS
+              optional: true
         - name: MC_AUDIO_FRAME_RATE_HZ
           valueFrom:
             configMapKeyRef:
               name: mc-service-config
               key: MC_AUDIO_FRAME_RATE_HZ
+              optional: true
         # ---- Meeting KEK lifecycle (ADR-0036 §4; story 2 R-12) ----
         # W, the KEK rotation debounce window. Required by MC (from task 9) with
         # no Rust default, and deliberately NOT `optional:` here: R-12's leaver
