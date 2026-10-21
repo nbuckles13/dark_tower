@@ -155,7 +155,7 @@ The verdict is **RESOLVED-DEFERRED** if *any* finding remains in the diff after 
 [Which finding, why the deferral/spin-out justification is insufficient]
 
 ### Accepted Deferrals
-[Pointers to `docs/TODO.md` entries appended for any accepted deferrals, spin-outs, or DRY extraction opportunities — one bullet per entry, citing the section heading the entry was added under so the reader can locate it. If this section is non-empty, your verdict above is RESOLVED-DEFERRED.]
+[Pointers to `docs/TODO.md` entries appended for any accepted deferrals or spin-outs — one bullet per entry, citing the section heading the entry was added under so the reader can locate it. If this section is non-empty, your verdict above is RESOLVED-DEFERRED. DRY extraction opportunities do not go here: they never entered the fix-or-defer flow (§DRY Reviewer Exception), so list them under a separate `### Extraction opportunities` heading; they do not change the verdict.]
 ```
 
 ### Classification Monotonicity (Ownership Lens)

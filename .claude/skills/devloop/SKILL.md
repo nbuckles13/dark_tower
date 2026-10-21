@@ -601,10 +601,13 @@ Update main.md:
 - Duration
 - Final summary
 
-Append any accepted deferrals, DRY extraction opportunities, and
-spun-out findings to `docs/TODO.md` under the appropriate section
-(Cross-Service Duplication, Observability Debt, Code Quality, etc.),
+Append any accepted deferrals and spun-out findings to `docs/TODO.md`
+under the appropriate section (Observability Debt, Code Quality, etc.),
 then add a one-line pointer to each under main.md's §Accepted Deferrals.
+DRY extraction opportunities also go to `docs/TODO.md` (Cross-Service
+Duplication), but their pointer goes under main.md's DRY Reviewer
+§Extraction opportunities, not §Accepted Deferrals: they never entered
+the fix-or-defer flow, so they do not force RESOLVED-DEFERRED.
 The pointer surfaces the cost shift at the devloop level; the body lives
 in `docs/TODO.md` as the durable, decay-tracked home for forward-looking
 work. Scope decisions that are devloop-local context (e.g., "we did not
