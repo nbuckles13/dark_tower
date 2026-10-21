@@ -34,14 +34,25 @@ import type { InstanceCounters } from './instanceCounters.js';
 import type { JoinedMember } from './cohortContexts.js';
 import { laneCarriesTone, type BusSlotAssignment, type CohortTone } from './toneDetector.js';
 import { sampleWindow, unpairedObservers } from './windowSampling.js';
+import type { SlotExpectation } from './slotOracle.js';
+import {
+  parseSendTracks,
+  parseVideoCaptureSource,
+  parseReceiveLayers,
+  parseVideoSlots,
+  type VideoSlotsEvent,
+} from './videoBusShape.js';
+import {
+  assertVideoSlots,
+  judgePatternAnnouncement,
+  judgeSendTracks,
+  judgeVideoSlot,
+  type SendSideExpectation,
+  type LayerRow,
+} from './videoEvidence.js';
 
-/** One (observed slot, sender) row of layers 1 and 2, as the bus projects it. */
-export interface LayerRow {
-  readonly slot: number | 'undeclared' | 'unparsed';
-  readonly senderId: string;
-  readonly keyed: number;
-  readonly verified: number;
-}
+/** One (observed slot, sender) row of layers 1 and 2 (one home: `./videoEvidence`). */
+export type { LayerRow };
 
 /** Liveness bound for layers 1/2 to appear once a slot is active. Not a latency gate. */
 const LAYERS_TIMEOUT_MS = 30_000;
@@ -49,8 +60,9 @@ const LAYERS_TIMEOUT_MS = 30_000;
 /** The receiver's latest cumulative layer rows (empty before media starts). */
 export async function latestLayers(receiver: JoinedMember): Promise<readonly LayerRow[]> {
   const { receiveLayers } = await latestBusEventsOf(receiver.page, ['receiveLayers']);
-  const layers = receiveLayers?.['layers'];
-  return Array.isArray(layers) ? (layers as LayerRow[]) : [];
+  // No event yet (before media starts) is "no rows"; a PRESENT event is held to
+  // the exact-key contract (`parseReceiveLayers`).
+  return receiveLayers === undefined ? [] : parseReceiveLayers(receiveLayers['layers']);
 }
 
 /** Frames from `sender` that verified and decrypted at this receiver, on any slot. */
@@ -317,4 +329,113 @@ export async function expectToneAbsent(
       },
     )
     .toBe('absent');
+}
+
+// ----------------------------------------------------------------------------
+// Story 3 R-32: video slots, three layers + state + rendered (judges: ./videoEvidence)
+// ----------------------------------------------------------------------------
+
+/** One receiver video slot and what the oracle expects there. */
+export interface VideoSlotExpectation {
+  readonly slotId: number;
+  readonly expectation: SlotExpectation;
+  /** The expected occupant, for its JOIN-BOUND sender id (never its own announcement). */
+  readonly occupant?: JoinedMember;
+}
+
+/**
+ * `member`'s meeting-scoped sender id from its OWN `joined` bus event — the join
+ * binding, never a self-announcement and never its audio tone (a video-only
+ * publisher has no tone). Absent is a HARNESS error, never a default.
+ */
+export function joinBoundSenderId(member: JoinedMember): string {
+  const senderId = member.joined.senderId;
+  if (senderId === undefined || senderId === '') {
+    throw new Error(
+      `HARNESS: ${member.label}'s joined bus event carries no senderId — the video ` +
+        'evidence helpers cannot name its join-bound sender',
+    );
+  }
+  return senderId;
+}
+
+/**
+ * Sample the receiver's `videoSlots` and `receiveLayers` together over ONE
+ * window on the shared stop rule (`./windowSampling`; samples counted by order,
+ * no bus timestamp), then judge every listed slot and throw once, naming each
+ * failing slot.
+ */
+export async function expectVideoSlots(
+  receiver: JoinedMember,
+  slots: readonly VideoSlotExpectation[],
+  why: string,
+  { observeMs = FLAT_WINDOW_OBSERVE_MS } = {},
+): Promise<void> {
+  const rounds = await sampleWindow({
+    sample: async (): Promise<[VideoSlotsEvent, readonly LayerRow[]]> => {
+      const { videoSlots, receiveLayers } = await latestBusEventsOf(receiver.page, [
+        'videoSlots',
+        'receiveLayers',
+      ]);
+      if (videoSlots === undefined) {
+        throw new Error(`${receiver.label}: no videoSlots sample on the bus (${why})`);
+      }
+      return [
+        parseVideoSlots(videoSlots),
+        receiveLayers === undefined ? [] : parseReceiveLayers(receiveLayers['layers']),
+      ];
+    },
+    windowMs: observeMs,
+    minSamples: MIN_FLAT_WINDOW_SAMPLES,
+    maxMs: FLAT_WINDOW_MAX_OBSERVE_FACTOR * observeMs,
+    intervalMs: E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS,
+    why,
+  });
+  const window = { slots: rounds.map((r) => r[0]), layers: rounds.map((r) => r[1]) };
+  assertVideoSlots(
+    `${receiver.label} (${why})`,
+    slots.map((s) =>
+      judgeVideoSlot(
+        {
+          slotId: s.slotId,
+          expectation: s.expectation,
+          ...(s.occupant !== undefined ? { expectedSenderId: joinBoundSenderId(s.occupant) } : {}),
+        },
+        window,
+      ),
+    ),
+  );
+}
+
+/** Assert `member`'s send tracks against the scenario's directive/mute/health facts. */
+export async function expectSendTracks(
+  member: JoinedMember,
+  want: SendSideExpectation,
+  timeoutMs = 20_000,
+): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        const { sendTracks } = await latestBusEventsOf(member.page, ['sendTracks']);
+        if (sendTracks === undefined) return ['no sendTracks sample on the bus'];
+        return judgeSendTracks(want, parseSendTracks(sendTracks));
+      },
+      { message: `${member.label}: send tracks`, timeout: timeoutMs },
+    )
+    .toEqual([]);
+}
+
+/** Assert `member`'s announced test pattern names its own join-bound sender id. */
+export async function expectPatternAnnounced(member: JoinedMember): Promise<void> {
+  const { videoCaptureSource } = await latestBusEventsOf(member.page, ['videoCaptureSource']);
+  if (videoCaptureSource === undefined) {
+    throw new Error(`${member.label}: no videoCaptureSource on the bus (capture never started?)`);
+  }
+  expect(
+    judgePatternAnnouncement(
+      parseVideoCaptureSource(videoCaptureSource),
+      joinBoundSenderId(member),
+    ),
+    `${member.label}: announced pattern source`,
+  ).toEqual([]);
 }

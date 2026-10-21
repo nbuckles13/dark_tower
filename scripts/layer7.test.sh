@@ -172,6 +172,30 @@ cat > "$FAKE_KUBECTL" <<'EOF'
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
+  # Story 3 R-28: the deployed media-codec-profile resolution (Phase 1g). The mc-service pods
+  # reference FAKE_PROFILE_GENERATIONS generations (default 1; `bare` = the unhashed name). A
+  # TERMINATING pod referencing an OLD generation is always listed too: it must be skipped.
+  *" get pods -l app=mc-service "*)
+    [[ "${FAKE_PROFILE_PODS_RC:-0}" == "0" ]] || { echo 'error: You must be logged in to the server (Unauthorized)' >&2; exit 1; }
+    [[ "${FAKE_PROFILE_PODS_GARBAGE:-0}" == "0" ]] || { echo 'this is not JSON'; exit 0; }
+    old='{"metadata":{"name":"mc-0-old","deletionTimestamp":"2026-10-21T00:00:00Z"},"spec":{"containers":[{"env":[{"valueFrom":{"configMapKeyRef":{"name":"media-codec-profile-z0y9x8w7v6"}}}]}]}}'
+    live() { printf '{"metadata":{"name":"mc-%s"},"spec":{"containers":[{"env":[{"name":"X","value":"y"},{"valueFrom":{"configMapKeyRef":{"name":"%s"}}}],"envFrom":[{"configMapRef":{"name":"mc-service-config-abc"}}]}]}}' "$1" "$2"; }
+    case "${FAKE_PROFILE_GENERATIONS:-1}" in
+      0)    items="${old},$(live 0 mc-service-config-abc)" ;;
+      2)    items="${old},$(live 0 media-codec-profile-k7m2p9x4qa),$(live 1 media-codec-profile-b3c8d1f6gh)" ;;
+      bare) items="${old},$(live 0 media-codec-profile)" ;;
+      # Kube.rs parity: a generation referenced ONLY through a projected volume resolves;
+      # a wrong-length hash is not a generation (so: zero generations).
+      projected) items="${old},$(printf '{"metadata":{"name":"mc-0"},"spec":{"containers":[{"env":[{"name":"X","value":"y"}]}],"volumes":[{"projected":{"sources":[{"configMap":{"name":"media-codec-profile-k7m2p9x4qa"}}]}}]}}')" ;;
+      badlen) items="${old},$(live 0 media-codec-profile-abc123)" ;;
+      *)    items="${old},$(live 0 media-codec-profile-k7m2p9x4qa),$(live 1 media-codec-profile-k7m2p9x4qa)" ;;
+    esac
+    printf '{"items":[%s]}\n' "$items"
+    ;;
+  *" get configmap media-codec-profile-"*)
+    [[ "${FAKE_PROFILE_CM_RC:-0}" == "0" ]] || { echo 'Error from server (NotFound)' >&2; exit 1; }
+    printf '{"data":{"MEDIA_VIDEO_CODEC":"vp8","MEDIA_VIDEO_WIDTH":"320","MEDIA_VIDEO_HEIGHT":"180","MEDIA_AUDIO_CODEC":"opus"}}\n'
+    ;;
   *" get pods "*)
     n="${args##*instance=mh-}"; n="${n%% *}"
     # A rollout's terminating predecessor, listed FIRST (three fields: it carries a
@@ -393,6 +417,10 @@ run_layer7() {
       FAKE_FORWARD_EXIT="${FAKE_FORWARD_EXIT:-0}" \
       FAKE_PORT_OCCUPIED="${FAKE_PORT_OCCUPIED:-0}" \
       FAKE_MH_TERMINATING="${FAKE_MH_TERMINATING:-0}" \
+      FAKE_PROFILE_GENERATIONS="${FAKE_PROFILE_GENERATIONS:-1}" \
+      FAKE_PROFILE_CM_RC="${FAKE_PROFILE_CM_RC:-0}" \
+      FAKE_PROFILE_PODS_RC="${FAKE_PROFILE_PODS_RC:-0}" \
+      FAKE_PROFILE_PODS_GARBAGE="${FAKE_PROFILE_PODS_GARBAGE:-0}" \
       bash "$LAYER7" ) >"$out_f" 2>"$err_f"
   RC=$?
 }
@@ -413,7 +441,8 @@ reset_case() {
         FAKE_STATUS_SLEEP FAKE_APISERVER_REACHABLE FAKE_PODS_FLIP_AFTER FAKE_RECREATE_OUTCOME \
         FAKE_RECREATE_NO_FLIP FAKE_RECREATE_RC FAKE_RECREATE_EVIDENCE FAKE_RECREATE_ATTEMPT \
         FAKE_RESTORE_OUTCOME FAKE_RESTORE_RC FAKE_RESTORE_ATTEMPT STATUS_TIMEOUT \
-        FAKE_MH_PODS FAKE_FORWARD_EXIT MH_FORWARD_BUDGET FAKE_PORT_OCCUPIED FAKE_MH_TERMINATING
+        FAKE_MH_PODS FAKE_FORWARD_EXIT MH_FORWARD_BUDGET FAKE_PORT_OCCUPIED FAKE_MH_TERMINATING \
+        FAKE_PROFILE_GENERATIONS FAKE_PROFILE_CM_RC FAKE_PROFILE_PODS_RC FAKE_PROFILE_PODS_GARBAGE
   # Markers are per-case evidence; a stale one from the previous case would make
   # assert_no_marker report a stub that never ran (and assert_marker pass vacuously).
   rm -rf "$MARKERS"; mkdir -p "$MARKERS"
@@ -940,6 +969,157 @@ assert_status "env-red-env-fail"       "STATUS=FAIL REASON=env-tests-failed" "$(
 assert_status "env-red-not-run-note"   "browser-e2e-not-run:" "$(cat "$ERR")"
 if ! grep -q 'REASON=browser-e2e' "$OUT"; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[env-red-no-browser-status] browser STATUS line emitted despite env-tests FAIL"); fi
+reset_case
+
+# === Story 3 R-28: the VP8 substrate probe's routing (verdict file) + deployed profile ===
+# global-setup (inside the browser suite) writes the verdict file ONLY on an unsupported verdict;
+# layer7.sh routes it, fail-closed, from the FILE — never from output, never from exit status
+# alone. The stubs below stand in for the browser suite: each writes (or does not write) the file
+# layer7.sh exported, then exits as named.
+VP8_TMP="${WORK}/devloop-tmp"
+VP8_FILE="${VP8_TMP}/layer-7-vp8-verdict"
+mk_browser_stub() {  # $1 = path  $2 = file body ("" = write nothing)  $3 = exit code
+  printf '#!/usr/bin/env bash\nprintf "%%s" "$E2E_MEDIA_CODEC_PROFILE_ENV" > "%s/browser.profile-path"\ncp "$E2E_MEDIA_CODEC_PROFILE_ENV" "%s/browser.profile" 2>/dev/null\nprintf "%%s" "$E2E_VP8_VERDICT_FILE" > "%s/browser.verdict-path"\n%s\nexit %s\n' \
+    "$MARKERS" "$MARKERS" "$MARKERS" \
+    "$([[ -n "$2" ]] && printf 'printf %q > "$E2E_VP8_VERDICT_FILE"' "$2")" "$3" > "$1"
+  chmod +x "$1"
+}
+VP8_UNSUP="${WORK}/browser-vp8-unsupported.sh";   mk_browser_stub "$VP8_UNSUP"   $'browser-vp8-unsupported\nencode_timeout\n' 1
+VP8_NOFILE="${WORK}/browser-fail-nofile.sh";      mk_browser_stub "$VP8_NOFILE"  "" 1
+VP8_GARBAGE="${WORK}/browser-garbage-token.sh";   mk_browser_stub "$VP8_GARBAGE" $'browser-vp8-unsupported-ish\nencode_failed\n' 1
+VP8_PROFTOK="${WORK}/browser-profile-token.sh";   mk_browser_stub "$VP8_PROFTOK" $'media-codec-profile-unresolved\nencode_failed\n' 1
+VP8_EMPTY="${WORK}/browser-empty-file.sh";        mk_browser_stub "$VP8_EMPTY"   $'\n' 1
+VP8_BADSUB="${WORK}/browser-bad-subcheck.sh";     mk_browser_stub "$VP8_BADSUB"  $'browser-vp8-unsupported\n$(rm -rf /) encode_failed\n' 1
+VP8_GREEN="${WORK}/browser-green-with-file.sh";   mk_browser_stub "$VP8_GREEN"   $'browser-vp8-unsupported\nencode_failed\n' 0
+VP8_PASS="${WORK}/browser-green.sh";              mk_browser_stub "$VP8_PASS"    "" 0
+
+# (V1) an unsupported verdict (token + valid sub-check) and a failed suite → the OPERATOR lane:
+#      PRECONDITION_FAILURE browser-vp8-unsupported, exit 2, the sub-check named in the banner.
+reset_case
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="$VP8_UNSUP"
+run_layer7 "$OUT" "$ERR"
+assert_exit   "vp8-unsupported-exit2"     2 "$RC"
+assert_status "vp8-unsupported-status"    "STATUS=PRECONDITION_FAILURE REASON=browser-vp8-unsupported" "$(cat "$OUT")"
+assert_status "vp8-unsupported-subcheck"  "failed sub-check: encode_timeout" "$(cat "$ERR")"
+assert_status "vp8-unsupported-fix-diff"  "infra/services/media-codec-profile/" "$(cat "$ERR")"
+assert_absent "vp8-unsupported-not-fail"  "REASON=browser-e2e-failed" "$(cat "$OUT")"
+assert_marker "vp8-unsupported-suite-ran" "$MARKERS" "browser.verdict-path"
+assert_status "vp8-verdict-path-exported" "$VP8_FILE" "$(cat "${MARKERS}/browser.verdict-path" 2>/dev/null)"
+reset_case
+
+# (V2) NEGATIVE CONTROL: the suite fails and writes nothing → today's FAIL (implementer lane).
+reset_case
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="$VP8_NOFILE"
+run_layer7 "$OUT" "$ERR"
+assert_exit   "vp8-nofile-exit1"     1 "$RC"
+assert_status "vp8-nofile-fail"      "STATUS=FAIL REASON=browser-e2e-failed" "$(cat "$OUT")"
+assert_absent "vp8-nofile-no-precon" "REASON=browser-vp8-unsupported" "$(cat "$OUT")"
+reset_case
+
+# (V3) STALE: a verdict file left by an earlier run, and this run's suite fails WITHOUT writing
+#      → FAIL. Proves Phase 1g removes the file before the suite can run.
+reset_case
+mkdir -p "$VP8_TMP"; printf 'browser-vp8-unsupported\nencode_failed\n' > "$VP8_FILE"
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="$VP8_NOFILE"
+run_layer7 "$OUT" "$ERR"
+assert_exit   "vp8-stale-exit1"     1 "$RC"
+assert_status "vp8-stale-fail"      "STATUS=FAIL REASON=browser-e2e-failed" "$(cat "$OUT")"
+assert_absent "vp8-stale-no-precon" "REASON=browser-vp8-unsupported" "$(cat "$OUT")"
+reset_case
+
+# (V4) line 1 not EXACTLY the one routable token — a near-miss, the Phase-1g-only profile token,
+#      or an empty file → FAIL, never PRECONDITION. The list is exactly one token.
+for stub in "$VP8_GARBAGE" "$VP8_PROFTOK" "$VP8_EMPTY"; do
+  reset_case
+  SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="$stub"
+  run_layer7 "$OUT" "$ERR"
+  assert_exit   "vp8-badtoken-exit1-${stub##*/}"     1 "$RC"
+  assert_status "vp8-badtoken-fail-${stub##*/}"      "STATUS=FAIL REASON=browser-e2e-failed" "$(cat "$OUT")"
+  assert_absent "vp8-badtoken-no-precon-${stub##*/}" "STATUS=PRECONDITION_FAILURE" "$(cat "$OUT")"
+  assert_status "vp8-badtoken-note-${stub##*/}"      "line 1 is not a routable token" "$(cat "$ERR")"
+done
+reset_case
+
+# (V5) the token with a sub-check NOT in the fixed list → FAIL with a fixed cause; the file's
+#      line 2 is never echoed into the output (security P2).
+reset_case
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="$VP8_BADSUB"
+run_layer7 "$OUT" "$ERR"
+assert_exit   "vp8-badsub-exit1"     1 "$RC"
+assert_status "vp8-badsub-fail"      "STATUS=FAIL REASON=browser-e2e-failed" "$(cat "$OUT")"
+assert_status "vp8-badsub-note"      "line 2 is not a known probe sub-check" "$(cat "$ERR")"
+assert_absent "vp8-badsub-not-echoed" 'rm -rf' "$(cat "$OUT" "$ERR")"
+reset_case
+
+# (V6) a valid verdict file but a GREEN suite → contradictory evidence is a LOUD FAIL, never a
+#      silent green.
+reset_case
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="$VP8_GREEN"
+run_layer7 "$OUT" "$ERR"
+assert_exit   "vp8-green-with-file-exit1" 1 "$RC"
+assert_status "vp8-green-with-file-fail"  "STATUS=FAIL REASON=browser-e2e-failed" "$(cat "$OUT")"
+assert_absent "vp8-green-with-file-no-ok" "REASON=browser-e2e-passed" "$(cat "$OUT")"
+assert_status "vp8-green-with-file-note"  "contradictory" "$(cat "$ERR")"
+reset_case
+
+# (V7) the DEPLOYED profile reaches the suite: the resolved generation's data, every key, as
+#      KEY=value at the exported path (the terminating pod's old generation skipped); a probe pass
+#      writes nothing and the suite proceeds green.
+reset_case
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="$VP8_PASS"
+run_layer7 "$OUT" "$ERR"
+assert_exit   "vp8-profile-exit0"       0 "$RC"
+assert_status "vp8-profile-browser-ok"  "STATUS=OK REASON=browser-e2e-passed" "$(cat "$OUT")"
+assert_status "vp8-profile-path"        "${VP8_TMP}/layer-7-media-codec-profile.env" "$(cat "${MARKERS}/browser.profile-path" 2>/dev/null)"
+assert_status "vp8-profile-codec"       "MEDIA_VIDEO_CODEC=vp8" "$(cat "${MARKERS}/browser.profile" 2>/dev/null)"
+assert_status "vp8-profile-width"       "MEDIA_VIDEO_WIDTH=320" "$(cat "${MARKERS}/browser.profile" 2>/dev/null)"
+assert_status "vp8-profile-all-keys"    "MEDIA_AUDIO_CODEC=opus" "$(cat "${MARKERS}/browser.profile" 2>/dev/null)"
+reset_case
+
+# (V8) the deployed profile cannot be resolved — two generations (rollout in flight), none,
+#      the BARE name, or an unreadable ConfigMap → PRECONDITION_FAILURE
+#      media-codec-profile-unresolved, exit 2, decided in Phase 1g: NEITHER suite runs.
+for variant in gens2 gens0 bare badlen cm-unreadable pods-unlistable pods-garbage; do
+  reset_case
+  case "$variant" in
+    gens2) export FAKE_PROFILE_GENERATIONS=2 ;;
+    gens0) export FAKE_PROFILE_GENERATIONS=0 ;;
+    bare)  export FAKE_PROFILE_GENERATIONS=bare ;;
+    badlen) export FAKE_PROFILE_GENERATIONS=badlen ;;
+    cm-unreadable) export FAKE_PROFILE_CM_RC=1 ;;
+    pods-unlistable) export FAKE_PROFILE_PODS_RC=1 ;;
+    pods-garbage) export FAKE_PROFILE_PODS_GARBAGE=1 ;;
+  esac
+  SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="$VP8_PASS"
+  run_layer7 "$OUT" "$ERR"
+  assert_exit      "profile-unresolved-exit2-${variant}"   2 "$RC"
+  assert_status    "profile-unresolved-status-${variant}"  "STATUS=PRECONDITION_FAILURE REASON=media-codec-profile-unresolved" "$(cat "$OUT")"
+  assert_absent    "profile-unresolved-no-suite-${variant}" "REASON=env-tests" "$(cat "$OUT")"
+  assert_no_marker "profile-unresolved-no-browser-${variant}" "$MARKERS" "browser.profile-path"
+done
+reset_case
+# The two pod-list failures name THEIR cause — never "0 generation(s) ... not wired".
+reset_case
+export FAKE_PROFILE_PODS_RC=1
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="$VP8_PASS"
+run_layer7 "$OUT" "$ERR"
+assert_status "profile-pods-unlistable-cause" "could not list the mc-service pods" "$(cat "$ERR")"
+reset_case
+export FAKE_PROFILE_PODS_GARBAGE=1
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="$VP8_PASS"
+run_layer7 "$OUT" "$ERR"
+assert_status "profile-pods-garbage-cause" "could not parse the mc-service pod list" "$(cat "$ERR")"
+assert_absent "profile-pods-garbage-not-wiring" "generation(s) of the media-codec-profile" "$(cat "$ERR")"
+reset_case
+
+# (V9) kube.rs parity, POSITIVE: a generation referenced only through a projected volume
+#      resolves (the suite runs and sees the dumped profile).
+reset_case
+export FAKE_PROFILE_GENERATIONS=projected
+SOCK="$PRESENT_SOCK"; export ENVCMD="true" BROWSER_CMD="$VP8_PASS"
+run_layer7 "$OUT" "$ERR"
+assert_exit   "profile-projected-exit0"   0 "$RC"
+assert_status "profile-projected-dumped"  "MEDIA_VIDEO_CODEC=vp8" "$(cat "${MARKERS}/browser.profile" 2>/dev/null)"
 reset_case
 
 # === busy-tolerant cluster writes (@operations condition 4) ===========================

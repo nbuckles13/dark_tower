@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod mh_config;
 pub mod mh_grpc;
 pub mod participant;
+pub mod video;
 
 pub use auth_client::AuthClient;
 pub use gc_client::GcClient;

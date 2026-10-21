@@ -1665,6 +1665,8 @@ tasks:
     - Fill order for each empty slot of kind K:
       - (1) the earliest joiner (lowest `JoinRank`) holding a slot of the OTHER kind with S but none of kind K, which completes a pair;
       - (2) otherwise, the earliest eligible joiner holding no slot of kind K with S.
+      - KIND ORDER (amended 2026-10-21, lead ruling at T-A planning): when S has empty slots of BOTH kinds at one event (its own join, a redeclaration, a refill after a leave or connectivity change), fill AUDIO first, then VIDEO, ONE slot at a time, repeating until no empty slot can be filled (a fixed point). The order changes the outcome (receive-only A earliest, B publishes both, N=M=1: audio-first gives audio=B, video=B; video-first would give video=A, audio=B), and rule (1) exists to complete pairs, which audio-first does. The independent test oracle pins the same order (`packages/web-app/e2e/slotOracle.ts:KIND_FILL_ORDER`).
+      - NO-VIDEO PRECEDENCE (amended 2026-10-21, lead ruling at T-A Gate 3): a VIDEO slot whose occupant publishes no video is AVATAR_NO_VIDEO regardless of either mute, client or server; the mute avatars apply only to an occupant that declared video. The test oracle (`packages/web-app/e2e/slotOracle.ts`) pins the same.
     - STABILITY BEATS PAIRING. None of these ever change an occupied slot:
       - a join or a leave;
       - a mute of either kind or either cause;

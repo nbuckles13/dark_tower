@@ -1178,6 +1178,9 @@ const INJECTION_MARGIN: u64 = 16;
 /// from an earlier phase can never be read as evidence about a later one.
 const SEQ_PRE: u32 = 1;
 const SEQ_MUTED: u32 = 1_000_000;
+// The shared binding sequence (`next_audio_sequence`) must stay below every
+// hand-rolled phase floor, or a sender's GoP counter could regress.
+const _: () = assert!(SEQ_MUTED >= env_tests::fixtures::media::AUDIO_SEQUENCE_CEILING);
 const SEQ_REASSERTED: u32 = 2_000_000;
 const SEQ_UNMUTED: u32 = 3_000_000;
 const SEQ_CHURN_ADD: u32 = 4_000_000;
