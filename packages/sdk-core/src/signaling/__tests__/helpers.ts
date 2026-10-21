@@ -9,6 +9,7 @@
 import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
 
 import { FrameDecoder, encodeFrame } from '../../framing/length-prefix.js';
+import { HEADER_VERSION } from '../../media/frame/wireConstants.js';
 import {
   ClientMessageSchema,
   ErrorCode,
@@ -210,7 +211,8 @@ export function buildSendDirective(init: {
   mediaKind?: MediaKind;
 }) {
   return create(SendDirectiveSchema, {
-    headerVersion: init.headerVersion ?? 2,
+    // MC derives it from the current version; so does this fixture.
+    headerVersion: init.headerVersion ?? HEADER_VERSION,
     streams: [
       create(SendStreamSchema, {
         streamNumber: init.streamNumber ?? 1,
@@ -233,7 +235,7 @@ export function buildSendDirective(init: {
 export function framedSendDirectiveWithoutStreams(): Uint8Array {
   return frameServerMessage({
     case: 'sendDirective',
-    value: create(SendDirectiveSchema, { headerVersion: 2, streams: [] }),
+    value: create(SendDirectiveSchema, { headerVersion: HEADER_VERSION, streams: [] }),
   });
 }
 

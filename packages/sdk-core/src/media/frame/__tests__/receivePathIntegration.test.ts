@@ -7,9 +7,10 @@
 import { describe, expect, it } from 'vitest';
 
 import { bytesToHex, hexToBytes } from '../hex.js';
-import { buildUnsignedFrame, decodeFrame, finishFrame } from '../frameCodec.js';
+import { HEADER_VERSION_V3, buildUnsignedFrame, decodeFrame, finishFrame } from '../frameCodec.js';
 import { exportPublicKey, importSigningKeyFromSeed, signFrame } from '../ed25519.js';
 import { packKeyId, unpackKeyId } from '../keyId.js';
+import { HEADER_VERSION } from '../wireConstants.js';
 import {
   SFRAME_CIPHER_SUITE_ID,
   aesGcmSeal,
@@ -45,6 +46,8 @@ async function makeFrame(
     plaintext?: string;
     /** KEK generation announced on the wrap. Defaults to `KEK_GENERATION`. */
     kekGeneration?: number;
+    headerVersion?: number;
+    gopCounter?: number;
     /** KEK the transmit key is wrapped under. Defaults to `KEK`. */
     kek?: Uint8Array;
     /** Ed25519 signing seed: the sender's IDENTITY. Defaults to `SEED`. */
@@ -59,6 +62,8 @@ async function makeFrame(
   });
   const transmitKey = over.transmitKey ?? TRANSMIT;
   const streamSequence = over.streamSequence ?? 7;
+  const headerVersion = over.headerVersion ?? HEADER_VERSION;
+  const gopCounter = over.gopCounter ?? 0;
   const keyBearing = over.keyBearing ?? true;
 
   const derived = await deriveSframeKeys({
@@ -93,8 +98,10 @@ async function makeFrame(
   // length-preserving, so the AAD from the first pass is the AAD of the second.
   const plaintext = new TextEncoder().encode(over.plaintext ?? 'dark-tower');
   const skeleton = buildUnsignedFrame({
+    headerVersion,
     flags: { independentlyDecodable: true, discardable: false, keyBearing },
     streamSequence,
+    gopCounter,
     wrappedTransmitKey,
     extensions: [],
     streamId: 2,
@@ -111,8 +118,10 @@ async function makeFrame(
   });
 
   const unsigned = buildUnsignedFrame({
+    headerVersion,
     flags: { independentlyDecodable: true, discardable: false, keyBearing },
     streamSequence,
+    gopCounter,
     wrappedTransmitKey,
     extensions: [],
     streamId: 2,
@@ -148,6 +157,22 @@ describe('the happy path', () => {
     expect(opened.wrapOutcome).toBe('cached');
     expect(bytesToHex(opened.plaintext)).toBe(bytesToHex(f.plaintext));
     expect(opened.senderId).toBe(258n);
+  });
+
+  it('a v3 frame (transitional dual path) decodes, verifies, unwraps and decrypts end to end', async () => {
+    // Self-consistency only, NOT correctness evidence for v3: one author built
+    // and opened this frame. P2's independent v3 vectors are the gate. What it
+    // does prove is that the four-byte-longer publisher region flows through
+    // seal, sign, verify and open with the AAD the receive path slices.
+    const f = await makeFrame({ headerVersion: HEADER_VERSION_V3, gopCounter: 0xffff_ffff });
+    const decoded = decodeFrame(f.bytes);
+    expect([decoded.version, decoded.gopCounter]).toEqual([HEADER_VERSION_V3, 0xffff_ffff]);
+    const opened = await openVerifiedFrame(
+      await verifyFrame(decoded, f.publicKey),
+      new TransmitKeyCache(),
+      keysWithKek,
+    );
+    expect(bytesToHex(opened.plaintext)).toBe(bytesToHex(f.plaintext));
   });
 
   it('does no per-frame unwrap once the key is held', async () => {

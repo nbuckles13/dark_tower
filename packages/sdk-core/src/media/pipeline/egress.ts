@@ -43,6 +43,8 @@ import {
   buildPublisherRegion,
   buildUnsignedFrame,
   finishFrame,
+  HEADER_VERSION_V2,
+  isSendableHeaderVersion,
   writeHopSequence,
 } from '../frame/frameCodec.js';
 import { signFrame } from '../frame/ed25519.js';
@@ -142,6 +144,44 @@ export interface DatagramSender {
   readonly maxDatagramSize: number | undefined;
   /** False once the transport has closed. */
   readonly isOpen: boolean;
+}
+
+/**
+ * The `gop_counter` input this path passes, per header version.
+ *
+ * On v2 the codec ignores it (v2 has no such field), so 0 is inert. For ANY
+ * other version it THROWS: no per-(sender, stream) GoP counter owner exists yet,
+ * and a constant on a v3 wire would break ADR-0036 §2's increment rule — well-
+ * formed, so nothing downstream would notice. The throw lands in
+ * `AudioPipeline`'s `submit().catch` as a typed fault, so a v3 enablement that
+ * forgot this site is a loud outage, not a silent rule break.
+ *
+ * Keyed on the v2 version byte INDEPENDENTLY of the generated `HEADER_VERSION`:
+ * after P2's regeneration `HEADER_VERSION` is 3, and a check against it would
+ * release itself. P2 enables (task 6): replace this with the counter owner on
+ * `TransmitKeyManager`, allocated once per frame here above the fan-out, in the
+ * same edit that removes the v3 exclusion from `SENDABLE_HEADER_VERSIONS`.
+ */
+/** @internal Test seam; not in `index.ts`. */
+export function gopCounterFor(headerVersion: number): number {
+  if (headerVersion === HEADER_VERSION_V2) return 0;
+  throw new Error('EgressPipeline: no GoP counter owner for this header version until P2');
+}
+
+/**
+ * What MC directs this stream to do, as ONE value: where to send, and in which
+ * header version. One object rather than two arguments so the targets and the
+ * version they were directed with cannot come apart.
+ */
+export interface EgressSendPlan {
+  /** Media-handler URLs. EMPTY MEANS SEND NOTHING (ADR-0036 §5). */
+  readonly targets: readonly string[];
+  /**
+   * `SendDirective.header_version` — the only runtime source of the version
+   * (ADR-0036 §2). Must satisfy `isSendableHeaderVersion`; the lifecycle layer
+   * refuses anything else before it gets here.
+   */
+  readonly headerVersion: number;
 }
 
 /** Construction options for {@link EgressPipeline}. */
@@ -258,6 +298,8 @@ export class EgressPipeline {
    */
   #datagramsSent = 0;
   #stopped = false;
+  /** From the latest {@link EgressSendPlan}. Unset until the first plan. */
+  #headerVersion: number | undefined;
 
   constructor(options: EgressPipelineOptions) {
     this.#metrics = options.metrics;
@@ -298,10 +340,25 @@ export class EgressPipeline {
    * An empty set means SEND NOTHING (§5). Lanes not named go inactive and their
    * queues are discarded; a lane named again later resumes on its retained hop
    * counter.
+   *
+   * @throws {RangeError} if a plan with targets names a header version that is
+   *   not sendable. The
+   *   lifecycle layer refuses such a directive first (typed fault, send
+   *   nothing); this is the backstop, so a bypass fails loudly rather than
+   *   building a frame with no legitimate GoP counter.
    */
-  setTargets(mediaHandlerUrls: readonly string[]): void {
+  setTargets(plan: EgressSendPlan): void {
     if (this.#stopped) return;
-    const wanted = new Set(mediaHandlerUrls.filter((url) => url !== ''));
+    const wanted = new Set(plan.targets.filter((url) => url !== ''));
+    if (wanted.size > 0) {
+      // Only a plan that can SEND is held to the version. An empty plan sends
+      // nothing in any version, and the lifecycle layer's fail-closed refusal
+      // arrives here as exactly that.
+      if (!isSendableHeaderVersion(plan.headerVersion)) {
+        throw new RangeError('EgressPipeline: the directed frame header version is not sendable');
+      }
+      this.#headerVersion = plan.headerVersion;
+    }
     for (const [url, lane] of this.#lanes) {
       if (wanted.has(url)) continue;
       lane.active = false;
@@ -383,6 +440,14 @@ export class EgressPipeline {
     // sequence is consumed and no drop is counted — "count the frames we did not
     // send" is the tempting wrong turn, exactly as on the mute path.
     if (!this.#hasActiveTarget()) return;
+    // An active target is only ever created by `setTargets`, which sets the
+    // version first. Reaching here without one is a broken invariant: fail
+    // loudly (typed fault via `submit().catch`), never drop silently.
+    const headerVersion = this.#headerVersion;
+    if (headerVersion === undefined) {
+      throw new Error('EgressPipeline: an active target without a send plan');
+    }
+    const gopCounter = gopCounterFor(headerVersion);
 
     const material = await this.#transmitKeys.materialFor(this.#streamNumber, this.#kek);
     const streamSequence = this.#transmitKeys.nextStreamSequence(this.#streamNumber);
@@ -406,8 +471,10 @@ export class EgressPipeline {
     const sealedLength = sframeObjectLength(frame.data.length);
     const publisherRegion = buildPublisherRegion(
       {
+        headerVersion,
         flags,
         streamSequence,
+        gopCounter,
         wrappedTransmitKey: material.wrapped,
         extensions: [],
       },
@@ -437,8 +504,10 @@ export class EgressPipeline {
     const payload = serializeSframe(sframe);
 
     const unsigned = buildUnsignedFrame({
+      headerVersion,
       flags,
       streamSequence,
+      gopCounter,
       wrappedTransmitKey: material.wrapped,
       extensions: [],
       streamId: this.#streamId,

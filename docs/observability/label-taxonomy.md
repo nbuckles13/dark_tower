@@ -286,6 +286,12 @@ and not `has_vector`.** Those are all *nearly* the same distinction and none of 
 - `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry`, `no_transmit_key`,
   `signature_invalid`, `decrypt_failed`, `unwrap_failed`, `replay_detected`,
   `wrap_key_id_mismatch` and `sender_not_assigned` are **receiver-state-dependent**.
+- **Pending a nineteenth (header v3, task C-v3):** `key_bearing_discardable` — a v3 frame with both
+  the key-bearing and the discardable flag set (ADR-0036 §2 decode step 5) — is **byte-determined**,
+  so it joins the structural family, and it is `drops_frame: true`. The SDK emits it on v3 decode
+  only. It is not yet in `reject_reasons` (the v2 vectors predate it), so the counts in this section
+  remain statements about the SSoT; P2 adds it to the v3 vectors and folds it into the counts here.
+  The client's `rejectReason.test.ts` holds it in a self-retiring pending set until then.
 - **Eight and ten is all eighteen: the two families PARTITION the vocabulary.** (Sixteen until story 2
   task 7 added `kek_generation_stale` and `sender_not_assigned`, both receiver-state-dependent.)
   Stated because an earlier revision of this list classified fourteen and left `replay_detected` and

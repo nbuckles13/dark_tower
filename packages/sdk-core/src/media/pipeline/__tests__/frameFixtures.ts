@@ -11,6 +11,7 @@
 // insider-forgery shape the attribution test asserts against and which a
 // production encoder cannot produce.
 
+import { HEADER_VERSION } from '../../frame/wireConstants.js';
 import { buildPublisherRegion, buildUnsignedFrame, finishFrame } from '../../frame/frameCodec.js';
 import { importSigningKeyFromSeed, signFrame } from '../../frame/ed25519.js';
 import { packKeyId } from '../../frame/keyId.js';
@@ -73,11 +74,20 @@ export interface TestFrameSpec {
   readonly hopSequence?: number;
   /** Omit the wrap and clear the key-bearing flag. */
   readonly keyBearing?: boolean;
+  /**
+   * Header version to build. Defaults to `HEADER_VERSION` (the current one —
+   * v2 until P2). A v3 frame lets a receive-path test prove dual decode.
+   */
+  readonly headerVersion?: number;
+  /** v3 only; the codec ignores it on v2. */
+  readonly gopCounter?: number;
 }
 
-/** Build one complete v2 frame with real crypto. */
+/** Build one complete frame (default: the current header version) with real crypto. */
 export async function buildTestFrame(spec: TestFrameSpec): Promise<Bytes> {
   const streamSequence = spec.streamSequence ?? 0;
+  const headerVersion = spec.headerVersion ?? HEADER_VERSION;
+  const gopCounter = spec.gopCounter ?? 0;
   const keyId = packKeyId({
     senderId: BigInt(spec.keyIdSenderId),
     stream: BigInt(spec.stream ?? 1),
@@ -100,7 +110,14 @@ export async function buildTestFrame(spec: TestFrameSpec): Promise<Bytes> {
 
   const flags = { independentlyDecodable: true, discardable: false, keyBearing } as const;
   const region = buildPublisherRegion(
-    { flags, streamSequence, wrappedTransmitKey: wrapped, extensions: [] },
+    {
+      headerVersion,
+      flags,
+      streamSequence,
+      gopCounter,
+      wrappedTransmitKey: wrapped,
+      extensions: [],
+    },
     sframeObjectLength(spec.plaintext.length),
   );
 
@@ -121,8 +138,10 @@ export async function buildTestFrame(spec: TestFrameSpec): Promise<Bytes> {
   });
 
   const unsigned = buildUnsignedFrame({
+    headerVersion,
     flags,
     streamSequence,
+    gopCounter,
     wrappedTransmitKey: wrapped,
     extensions: [],
     streamId: spec.streamId ?? 0,

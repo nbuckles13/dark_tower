@@ -6,6 +6,7 @@
 // is STILL hop-observed, so it is counted once (as a reject) rather than twice
 // (as a reject and as a relay gap).
 
+import { HEADER_VERSION } from '../../frame/wireConstants.js';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { InMemoryMetricsSink } from '@darktower/test-utils';
 import { buildUnsignedFrame, finishFrame } from '../../frame/frameCodec.js';
@@ -79,8 +80,10 @@ function makeHarness(): Harness {
 /** A frame that DECODES (relay region readable) but whose SFrame header does not parse. */
 function frameWithUnreadableKeyId(hopSequence: number): Uint8Array {
   const unsigned = buildUnsignedFrame({
+    headerVersion: HEADER_VERSION,
     flags: { independentlyDecodable: true, discardable: false, keyBearing: false },
     streamSequence: 0,
+    gopCounter: 0,
     wrappedTransmitKey: null,
     extensions: [],
     streamId: SLOT_ID,

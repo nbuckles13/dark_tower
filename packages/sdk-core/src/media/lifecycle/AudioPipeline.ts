@@ -43,6 +43,7 @@ import { ReplayWindow, TransmitKeyCache } from '../frame/receivePath.js';
 import type { MediaConfig } from '../../config/clientConfig.js';
 import { ClientConfigError, validateMediaConfig } from '../../config/clientConfig.js';
 import { EgressPipeline, type DatagramSender } from '../pipeline/egress.js';
+import { isSendableHeaderVersion } from '../frame/frameCodec.js';
 import { IngressPipeline, type AcceptedFrame } from '../pipeline/ingress.js';
 import { ReceiveLanes, type SlotAssignment } from '../pipeline/receiveLanes.js';
 import { FirstMediaObserver } from '../setup/measurement.js';
@@ -175,7 +176,21 @@ export interface AudioSendDirective {
    * empty rotates the transmit key.
    */
   readonly targets: readonly string[];
+  /**
+   * MC's meeting-wide `SendDirective.header_version` (ADR-0036 §2). The ONLY
+   * runtime input that selects a header version; required, with no default. A
+   * value this client cannot send is refused fail-closed — see
+   * {@link AudioPipeline.setSendDirective}.
+   */
+  readonly headerVersion: number;
 }
+
+/**
+ * The fault for a directed header version this client cannot send. A fixed
+ * literal (it is part of the event-once dedupe key). C-A1 counts it.
+ */
+const UNSENDABLE_HEADER_VERSION_FAULT =
+  'the controller directed a frame header version this client cannot send';
 
 /** Construction options. */
 export interface AudioPipelineOptions {
@@ -612,7 +627,26 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    *
    * Resuming from an EMPTY target set rotates the transmit key (ADR-0036 §4).
    */
-  setSendDirective(directive: AudioSendDirective): void {
+  setSendDirective(requested: AudioSendDirective): void {
+    let directive = requested;
+    if (isSendableHeaderVersion(requested.headerVersion)) {
+      // A valid directive ends a refusal EPISODE: re-arm the fault so a later
+      // bad directive is reported again rather than latched once per session.
+      this.#rearmFault(MediaFaultStage.Config, UNSENDABLE_HEADER_VERSION_FAULT);
+    } else {
+      // FAIL-CLOSED. Never a fallback to v2 or to `HEADER_VERSION`: the version
+      // is signed and MC-directed, and guessing one is how a downgrade goes
+      // unnoticed. Applied as SEND NOTHING (§5), through the same path as any
+      // withdrawal, so a later valid directive resumes on the empty→non-empty
+      // edge and rotates the transmit key exactly as it does today.
+      //
+      // This also refuses a directed 3 until P2 (task 6) lands the GoP counter
+      // owner. P2 enables v3 by removing the explicit v3 exclusion from
+      // `SENDABLE_HEADER_VERSIONS` in the same edit that wires that owner; no
+      // edit is needed here.
+      this.#fault(MediaFaultStage.Config, UNSENDABLE_HEADER_VERSION_FAULT, false);
+      directive = { ...requested, targets: [] };
+    }
     const wasEmpty = (this.#directive?.targets.length ?? 0) === 0;
     const isEmpty = directive.targets.length === 0;
     this.#directive = directive;
@@ -875,7 +909,10 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       });
       this.#teardown.register('egress', () => this.#egress?.stop());
     }
-    this.#egress.setTargets(directive.targets);
+    this.#egress.setTargets({
+      targets: directive.targets,
+      headerVersion: directive.headerVersion,
+    });
   }
 
   /**
@@ -897,10 +934,24 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    * string or any per-frame value — that would make a repeating fault unbounded.
    */
   #fault(stage: MediaFaultStage, message: string, fatal: boolean): void {
-    const key = `${stage}\u0000${message}`;
+    const key = faultKey(stage, message);
     if (this.#reportedFaults.has(key)) return;
     this.#reportedFaults.add(key);
     this.emit('fault', { stage, message, fatal });
     if (fatal) void this.stop();
   }
+
+  /**
+   * End a fault's episode: the next occurrence is reported again. For a fault
+   * whose condition is RECOVERABLE by a later input, so "event-once" means once
+   * per episode rather than once per session.
+   */
+  #rearmFault(stage: MediaFaultStage, message: string): void {
+    this.#reportedFaults.delete(faultKey(stage, message));
+  }
+}
+
+/** The event-once dedupe key: (stage, message). */
+function faultKey(stage: MediaFaultStage, message: string): string {
+  return `${stage}\u0000${message}`;
 }

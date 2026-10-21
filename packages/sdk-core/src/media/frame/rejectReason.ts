@@ -1,6 +1,7 @@
 // File: packages/sdk-core/src/media/frame/rejectReason.ts
 //
-// The bounded reject-reason taxonomy for the v2 media frame receive path, and
+// The bounded reject-reason taxonomy for the media frame receive path (v3, plus
+// the transitional v2 path), and
 // the typed errors that carry it.
 //
 // ---------------------------------------------------------------------------
@@ -76,12 +77,24 @@
  *
  * Mirrors `reject_reasons[].token` in `proto/test-vectors/frame-v2.vectors.json`,
  * asserted for set equality in both directions by
- * `__tests__/rejectReason.test.ts`.
+ * `__tests__/rejectReason.test.ts` — modulo the explicit pending-P2 set there
+ * (`key_bearing_discardable`, which P2's v3 vectors add).
  */
 export type RejectReason =
   // --- codec layer: the frame did not parse -------------------------------
   | 'unknown_version'
   | 'reserved_flag_bit_set'
+  /**
+   * A v3 frame with BOTH the key-bearing and the discardable flag set (ADR-0036
+   * §2 decode step 5; §4: a frame carrying a new key must never be droppable).
+   * Byte-determined, structural family.
+   *
+   * PENDING P2: the v2 vectors file does not carry this token; P2 adds it to the
+   * v3 vectors it generates. Until then `__tests__/rejectReason.test.ts` holds it
+   * in an explicit, self-retiring pending set rather than loosening the
+   * set-equality check. Emitted on v3 decode only.
+   */
+  | 'key_bearing_discardable'
   | 'payload_length_exceeds_max'
   | 'payload_length_exceeds_available'
   | 'truncated'
@@ -132,6 +145,7 @@ export type RejectReason =
 export const ALL_REJECT_REASONS: readonly RejectReason[] = [
   'unknown_version',
   'reserved_flag_bit_set',
+  'key_bearing_discardable',
   'payload_length_exceeds_max',
   'payload_length_exceeds_available',
   'truncated',

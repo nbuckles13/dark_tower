@@ -17,6 +17,8 @@ import { TraceState } from '@opentelemetry/core';
 import { MockWebTransport } from '@darktower/test-utils';
 
 import { SignalingClient } from '../SignalingClient.js';
+import { HEADER_VERSION_V3, SENDABLE_HEADER_VERSIONS } from '../../media/frame/frameCodec.js';
+import { HEADER_VERSION } from '../../media/frame/wireConstants.js';
 import type { SignalingClientOptions } from '../SignalingClient.js';
 import type { SignalingJoinParams } from '../events.js';
 import { ParticipantLeaveReason, SignalingCodec } from '../events.js';
@@ -126,6 +128,27 @@ describe('SignalingClient — connect + JoinRequest (R-16)', () => {
       expect(caps?.supportedCodecs).toEqual([Codec.VP9, Codec.AV1, Codec.OPUS]);
       expect(caps?.supportedHeaderVersions).toEqual([2]);
     }
+
+    client.close();
+    await expect(joinPromise).rejects.toBeInstanceOf(SignalingError);
+  });
+
+  it('declares the SDK SENDABLE header versions by default, never the decode set', async () => {
+    const wt = new MockWebTransport();
+    const { client, joinPromise } = startJoin(wt);
+    wt.simulateReady();
+    await waitFor(() => wt.getOutboundBidiWrites(0).length > 0);
+
+    const cm = decodeOutboundClientMessages(wt.getOutboundBidiWrites(0))[0]!;
+    if (cm.message.case !== 'joinRequest') throw new Error('expected a joinRequest');
+    const declared = cm.message.value.capabilities?.supportedHeaderVersions;
+    // Derived from the codec's one predicate: `[2]` today, `[3]` after P2's
+    // flip with no edit to the join path.
+    expect(declared).toEqual([...SENDABLE_HEADER_VERSIONS]);
+    expect(declared).toEqual([HEADER_VERSION]);
+    // v3 is decodable but not yet sendable (no GoP counter owner until P2), so
+    // it is not declared: declaring it would invite MC to direct it.
+    expect(declared).not.toContain(HEADER_VERSION_V3);
 
     client.close();
     await expect(joinPromise).rejects.toBeInstanceOf(SignalingError);

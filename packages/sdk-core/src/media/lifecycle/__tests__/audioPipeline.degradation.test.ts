@@ -6,6 +6,7 @@
 // failures silently is the every-signal-green-no-audio case this story exists to
 // localise.
 
+import { HEADER_VERSION } from '../../frame/wireConstants.js';
 import { describe, expect, it } from 'vitest';
 import {
   FakeAudioCodecs,
@@ -108,6 +109,7 @@ async function makePipeline(opts: Options = {}): Promise<{
     streamNumber: 1,
     bitrateBps: 32_000,
     targets: opts.targets ?? [MH_URL],
+    headerVersion: HEADER_VERSION,
   });
   // By default, assignments name the handler only when the rig supplies a stream
   // for it: naming a handler with no connected transport is itself a fault.
@@ -225,7 +227,12 @@ describe('send-side degradation', () => {
     expect(sent).toHaveLength(0);
 
     const before = rig.pipeline.transmitGeneration;
-    rig.pipeline.setSendDirective({ streamNumber: 1, bitrateBps: 32_000, targets: [MH_URL] });
+    rig.pipeline.setSendDirective({
+      streamNumber: 1,
+      bitrateBps: 32_000,
+      targets: [MH_URL],
+      headerVersion: HEADER_VERSION,
+    });
     expect(rig.pipeline.transmitGeneration).toBe(before + 1n);
     rig.emit();
     await settle();
@@ -269,7 +276,12 @@ describe('receive-side degradation', () => {
     rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
     rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL, ''], SENDER_ID));
     // Directives no longer touch the read loop at all.
-    rig.pipeline.setSendDirective({ streamNumber: 1, bitrateBps: 32_000, targets: [MH_URL] });
+    rig.pipeline.setSendDirective({
+      streamNumber: 1,
+      bitrateBps: 32_000,
+      targets: [MH_URL],
+      headerVersion: HEADER_VERSION,
+    });
     await settle();
     expect(rig.faults).toEqual([]);
     // And the one loop still works.
@@ -502,6 +514,7 @@ describe('receive-side degradation', () => {
       streamNumber: 1,
       bitrateBps: 32_000,
       targets: ['https://mh-unconnected.example:4433'],
+      headerVersion: HEADER_VERSION,
     });
     rig.emit();
     // The same conditions again: bounded, so NOT reported twice.

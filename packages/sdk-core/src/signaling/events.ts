@@ -166,10 +166,12 @@ export interface SignalingCapabilities {
   readonly supportedCodecs?: readonly SignalingCodec[];
 
   /**
-   * Frame header versions this client can produce and consume (ADR-0036 §2).
-   * An upper bound on what the client can do — never a lower bound on what the
-   * meeting accepts: MC selects from a server-side allowlist with a minimum
-   * floor and rejects a client that declares nothing at or above it.
+   * Frame header versions this client can produce (ADR-0036 §2). MC directs
+   * one meeting-wide version, and a join not declaring the current one is
+   * refused (`ParticipantCapabilities.supported_header_versions`).
+   *
+   * Omit it to declare the SDK's own sendable set (`SENDABLE_HEADER_VERSIONS`
+   * in `media/frame/frameCodec.ts`); a value given here replaces that default.
    */
   readonly supportedHeaderVersions?: readonly number[];
 }

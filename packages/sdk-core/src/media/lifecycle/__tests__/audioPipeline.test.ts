@@ -32,6 +32,8 @@ import {
 
 import { DEFAULT_CLIENT_CONFIG, type MediaConfig } from '../../../config/clientConfig.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
+import { HEADER_VERSION } from '../../frame/wireConstants.js';
+import { HEADER_VERSION_V3, decodeFrame } from '../../frame/frameCodec.js';
 import { MeetingIdentity } from '../../setup/identity.js';
 import { assignmentsOn, kekHolderWith } from '../../__tests__/helpers.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
@@ -132,7 +134,12 @@ async function makeRig(overrides: Partial<MediaConfig> = {}): Promise<Rig> {
   };
   const pipeline = new AudioPipeline(options);
   await pipeline.start();
-  pipeline.setSendDirective({ streamNumber: 1, bitrateBps: 32_000, targets: [MH_URL] });
+  pipeline.setSendDirective({
+    streamNumber: 1,
+    bitrateBps: 32_000,
+    targets: [MH_URL],
+    headerVersion: HEADER_VERSION,
+  });
   // Receiving comes from the slot assignments, not from the send directive.
   pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
 
@@ -149,7 +156,7 @@ async function makeRig(overrides: Partial<MediaConfig> = {}): Promise<Rig> {
   });
   // A raw-submit rig still needs a directed target: `submit()` builds nothing
   // when MC has directed none, which is §5's "send nothing".
-  egress.setTargets([MH_URL]);
+  egress.setTargets({ targets: [MH_URL], headerVersion: HEADER_VERSION });
 
   const rig: Rig = {
     pipeline,
@@ -448,5 +455,100 @@ describe('degradation is loud', () => {
     // be fatal when a single decoder served every sender.
     expect(faults).toEqual([{ stage: 'decoder', fatal: false }]);
     expect(rig.capture.stopCount).toBe(0);
+  });
+});
+
+describe('the directed header version (ADR-0036 §2: meeting-wide, MC-directed)', () => {
+  const directive = (headerVersion: number, targets: readonly string[] = [MH_URL]) => ({
+    streamNumber: 1,
+    bitrateBps: 32_000,
+    targets,
+    headerVersion,
+  });
+
+  it('an unsendable version sends NOTHING and faults; a valid one resumes; a second episode faults again', async () => {
+    const rig = await makeRig();
+    const faults: { stage: string; message: string; fatal: boolean }[] = [];
+    rig.pipeline.on('fault', (f) =>
+      faults.push({ stage: f.stage, message: f.message, fatal: f.fatal }),
+    );
+
+    rig.emit(1);
+    await settle();
+    expect(rig.transport.getOutboundDatagrams()).toHaveLength(1);
+
+    // Episode 1. Never a fallback to v2: nothing leaves the device.
+    rig.pipeline.setSendDirective(directive(4));
+    rig.emit(2);
+    await settle();
+    expect(rig.transport.getOutboundDatagrams()).toHaveLength(1);
+    expect(faults).toEqual([
+      {
+        stage: 'config',
+        message: 'the controller directed a frame header version this client cannot send',
+        fatal: false,
+      },
+    ]);
+    // A refused directive is SEND NOTHING, not a send drop: counting frames we
+    // chose not to send is the wrong turn `egress.ts` warns about. And no
+    // receive-side counter moves for a send-side refusal.
+    expect(rig.count('dt_client_media_send_dropped_total')).toBe(0);
+    expect(rig.count('dt_client_media_frames_received_total')).toBe(0);
+    expect(rig.count('dt_client_media_frames_accepted_total')).toBe(0);
+    expect(rig.count('dt_client_media_frames_dropped_total')).toBe(0);
+    // Repeating the same bad directive inside one episode stays event-once.
+    rig.pipeline.setSendDirective(directive(0));
+    expect(faults).toHaveLength(1);
+
+    // Recovery: a valid directive resumes egress on the next frame.
+    rig.pipeline.setSendDirective(directive(HEADER_VERSION));
+    rig.emit(3);
+    await settle();
+    expect(rig.transport.getOutboundDatagrams()).toHaveLength(2);
+
+    // Episode 2 is reported again — latched per episode, not per session.
+    rig.pipeline.setSendDirective(directive(1));
+    expect(faults).toHaveLength(2);
+
+    // A refused SEND is not a receive-side event: the drop counter, whose
+    // identity is received = accepted + sum(drops), never sees it.
+    expect(rig.count('dt_client_media_frames_dropped_total')).toBe(0);
+  });
+
+  it('refuses a directed 3 until P2 lands the GoP counter owner (the codec can already build v3)', async () => {
+    const rig = await makeRig();
+    const faults: string[] = [];
+    rig.pipeline.on('fault', (f) => faults.push(f.stage));
+    rig.pipeline.setSendDirective(directive(HEADER_VERSION_V3));
+    rig.emit(1);
+    await settle();
+    expect(rig.transport.getOutboundDatagrams()).toHaveLength(0);
+    expect(faults).toEqual(['config']);
+  });
+
+  it('a directive-2 frame is a v2 frame', async () => {
+    const rig = await makeRig();
+    rig.emit(1);
+    await settle();
+    const [sent] = rig.transport.getOutboundDatagrams();
+    expect(decodeFrame(sent!).version).toBe(HEADER_VERSION);
+  });
+
+  it('egress refuses an unsendable version as a backstop, but an empty plan is always accepted', () => {
+    const egress = new EgressPipeline({
+      metrics: new MediaMetrics({ clientVersion: '0.0.0-test', orgId: 'demo' }, undefined).audio,
+      transmitKeys: new TransmitKeyManager(SENDER_ID),
+      kek: kekHolderWith(KEK, 0),
+      identity: undefined as never,
+      maxQueueFrames: 4,
+      streamNumber: 1,
+      streamId: 0,
+      senderFor: () => undefined,
+      onTargetNotConnected: () => {},
+    });
+    expect(() =>
+      egress.setTargets({ targets: [MH_URL], headerVersion: HEADER_VERSION_V3 }),
+    ).toThrow(RangeError);
+    expect(() => egress.setTargets({ targets: [], headerVersion: 4 })).not.toThrow();
   });
 });

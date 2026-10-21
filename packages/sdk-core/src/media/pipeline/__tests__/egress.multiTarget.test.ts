@@ -24,6 +24,7 @@
 // own terms, so it survives someone "fixing" the byte-equality assertion when a
 // legitimately per-target field starts differing. The redundancy is the point.
 
+import { HEADER_VERSION } from '../../frame/wireConstants.js';
 import { describe, expect, it } from 'vitest';
 import { InMemoryMetricsSink } from '@darktower/test-utils';
 
@@ -142,7 +143,7 @@ function keyIdOf(frame: Uint8Array): string {
 describe('multi-target send', () => {
   it('delivers EVERY frame to EVERY target', async () => {
     const rig = await makeRig([FIRST, SECOND]);
-    rig.egress.setTargets([FIRST, SECOND]);
+    rig.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
 
     await rig.submit(1);
     await rig.submit(2);
@@ -160,7 +161,7 @@ describe('multi-target send', () => {
     // above the fan-out. Only the relay region's hop sequence — unauthenticated,
     // per (connection, stream) — is stamped per lane.
     const rig = await makeRig([FIRST, SECOND]);
-    rig.egress.setTargets([FIRST, SECOND]);
+    rig.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
 
     await rig.submit(7);
     await settle();
@@ -189,11 +190,11 @@ describe('multi-target send', () => {
 
     // FIRST alone carries two frames, so its counter reaches 2 while SECOND's is
     // still at 0. Then both carry the SAME captured frame.
-    rig.egress.setTargets([FIRST]);
+    rig.egress.setTargets({ targets: [FIRST], headerVersion: HEADER_VERSION });
     await rig.submit(1);
     await rig.submit(2);
     await settle();
-    rig.egress.setTargets([FIRST, SECOND]);
+    rig.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
     await rig.submit(3);
     await settle();
 
@@ -228,7 +229,7 @@ describe('multi-target send', () => {
     // catastrophic form (ADR-0036 §2: a nonce repeat under one key leaks the
     // authentication subkey and permits forgery). Both show up here.
     const three = await makeRig([FIRST, SECOND, THIRD]);
-    three.egress.setTargets([FIRST, SECOND, THIRD]);
+    three.egress.setTargets({ targets: [FIRST, SECOND, THIRD], headerVersion: HEADER_VERSION });
     await three.submit(1);
     await three.submit(2);
     await three.submit(3);
@@ -237,7 +238,7 @@ describe('multi-target send', () => {
     expect(three.transmitKeys.nextStreamSequence(1)).toBe(3);
 
     const one = await makeRig([FIRST]);
-    one.egress.setTargets([FIRST]);
+    one.egress.setTargets({ targets: [FIRST], headerVersion: HEADER_VERSION });
     await one.submit(1);
     await one.submit(2);
     await one.submit(3);
@@ -251,7 +252,7 @@ describe('multi-target send', () => {
     // take this property with it. A duplicate pair here means two plaintexts were
     // sealed under one (key, nonce).
     const rig = await makeRig([FIRST, SECOND]);
-    rig.egress.setTargets([FIRST, SECOND]);
+    rig.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
     for (let byte = 1; byte <= 5; byte += 1) await rig.submit(byte);
     await settle();
 
@@ -283,7 +284,7 @@ describe('multi-target send', () => {
     // shared counter would make each handler see every other number missing and
     // read ~50% uplink loss.
     const rig = await makeRig([FIRST, SECOND]);
-    rig.egress.setTargets([FIRST, SECOND]);
+    rig.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
     for (let byte = 1; byte <= 3; byte += 1) await rig.submit(byte);
     await settle();
 
@@ -296,7 +297,7 @@ describe('multi-target send', () => {
     // hears me". Lanes drain independently, so a hung transport cannot block one
     // that is fine.
     const rig = await makeRig([FIRST, SECOND]);
-    rig.egress.setTargets([FIRST, SECOND]);
+    rig.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
     rig.senders.get(SECOND)!.stall();
 
     for (let byte = 1; byte <= 4; byte += 1) await rig.submit(byte);
@@ -309,7 +310,7 @@ describe('multi-target send', () => {
 
   it('counts connection_closed on the closed lane only, and keeps the other sending', async () => {
     const rig = await makeRig([FIRST, SECOND]);
-    rig.egress.setTargets([FIRST, SECOND]);
+    rig.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
     rig.senders.get(SECOND)!.isOpen = false;
 
     await rig.submit(1);
@@ -324,15 +325,15 @@ describe('multi-target send', () => {
     // restart from 0 on the same transport reads as a publisher restart to
     // anything tracking that hop.
     const rig = await makeRig([FIRST, SECOND]);
-    rig.egress.setTargets([FIRST, SECOND]);
+    rig.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
     await rig.submit(1);
     await settle();
 
     // SECOND's edge moves away, then comes back.
-    rig.egress.setTargets([FIRST]);
+    rig.egress.setTargets({ targets: [FIRST], headerVersion: HEADER_VERSION });
     await rig.submit(2);
     await settle();
-    rig.egress.setTargets([FIRST, SECOND]);
+    rig.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
     await rig.submit(3);
     await settle();
 
@@ -343,12 +344,12 @@ describe('multi-target send', () => {
 
   it('builds NOTHING when the target set is empty (§5 send nothing)', async () => {
     const rig = await makeRig([FIRST]);
-    rig.egress.setTargets([FIRST]);
+    rig.egress.setTargets({ targets: [FIRST], headerVersion: HEADER_VERSION });
     await rig.submit(1);
     await settle();
     expect(rig.egress.framesSent).toBe(1);
 
-    rig.egress.setTargets([]);
+    rig.egress.setTargets({ targets: [], headerVersion: HEADER_VERSION });
     await rig.submit(2);
     await rig.submit(3);
     await settle();
@@ -366,7 +367,7 @@ describe('multi-target send', () => {
     // nothing. Under §9 that is a server-side condition, and it must be loud
     // rather than queued-and-aged as `egress_queue_overflow`.
     const rig = await makeRig([FIRST]);
-    rig.egress.setTargets([FIRST, SECOND]);
+    rig.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
 
     await rig.submit(1);
     await rig.submit(2);
@@ -384,12 +385,12 @@ describe('multi-target send', () => {
     // a test, not the client. The same two targets in the opposite order must
     // produce the same delivery.
     const forward = await makeRig([FIRST, SECOND]);
-    forward.egress.setTargets([FIRST, SECOND]);
+    forward.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
     await forward.submit(9);
     await settle();
 
     const reverse = await makeRig([FIRST, SECOND]);
-    reverse.egress.setTargets([SECOND, FIRST]);
+    reverse.egress.setTargets({ targets: [SECOND, FIRST], headerVersion: HEADER_VERSION });
     await reverse.submit(9);
     await settle();
 

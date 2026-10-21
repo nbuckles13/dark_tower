@@ -641,7 +641,9 @@ the comment's reader.
 - **All eight structural codec tokens are emitted INDIVIDUALLY** — `unknown_version`,
   `reserved_flag_bit_set`, `payload_length_exceeds_max`,
   `payload_length_exceeds_available`, `truncated`, `extensions_too_large`,
-  `extensions_malformed`, `trailing_bytes` — never collapsed into a
+  `extensions_malformed`, `trailing_bytes` (plus, pending P2's v3 vectors,
+  `key_bearing_discardable`: structural, dropping, emitted on v3 decode only;
+  the counts on this page are about the SSoT and P2 folds it in) — never collapsed into a
   `decode_reject` bucket. Collapsing destroys R-31's only lever
   (`unknown_version` staying individually visible is how a version-skewed
   rollback is detected — rollback for this feature is redeploy-only with no
