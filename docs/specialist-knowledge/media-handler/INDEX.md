@@ -2,7 +2,7 @@
 
 ## Architecture & Design
 - SFU architecture, MH registration/load reports → ADR-0010 (Section 4a); MH assignment/selection → ADR-0023 (Section 5)
-- Media flow: frame v2 (§2), forward path (§7), control plane (§8), multi-handler edges (§9), transport seam (§10), sender binding (§11) → ADR-0036
+- Media flow: frame v3 (§2), forward path (§7), control plane (§8), multi-handler edges (§9), transport seam (§10), sender binding (§11) → ADR-0036
 - Actor pattern → ADR-0001; service auth + gRPC scopes → ADR-0003; fuzzing → ADR-0006; deploy parity / config-key ordering → ADR-0038
 - Observability: metrics facade → ADR-0011; dashboards → ADR-0029; service-owned dashboards/alerts → ADR-0031; metric testability → ADR-0032
 - User stories: QUIC connection → `docs/user-stories/2026-04-12-mh-quic-connection.md`; hear-each-other (story 2) → `docs/user-stories/2026-09-21-hear-each-other.md`
@@ -34,7 +34,7 @@
 - Drop-oldest ring → `media/queue.rs`; pre-alloc caps + stream rate limiter → `media/caps.rs`; per-connection loops + `FramesRead` → `media/ingress.rs`; random sampler → `media/sampler.rs`
 
 ## Media Protocol (ADR-0036 §2)
-- Frame v2 layout + size constants → `crates/media-protocol/src/frame.rs`; parser + entry points + `ALL_REJECT_REASONS` → `crates/media-protocol/src/codec.rs`
+- Frame v3 layout + size constants → `crates/media-protocol/src/frame.rs`; parser + entry points + `ALL_REJECT_REASONS` → `crates/media-protocol/src/codec.rs`
 - Relay-region rewrite → `codec.rs:rewrite_relay_region()`; extension TLVs → `crates/media-protocol/src/extensions.rs`; fuzz → `crates/media-protocol/fuzz/fuzz_targets/`
 
 ## Proto Definitions

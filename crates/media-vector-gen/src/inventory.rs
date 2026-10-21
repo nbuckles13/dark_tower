@@ -14,16 +14,16 @@ use crate::json::{
     WireConstants,
 };
 use crate::kid::KeyIdParts;
-use crate::rows::{build_frame, FrameSpec};
+use crate::rows::{build_frame, FrameSpec, VIDEO_SEND_ID};
 use crate::{CIPHER_SUITE_ID, CIPHER_SUITE_NAME, NON_PRODUCTION_BANNER, SCHEMA_VERSION};
 use media_protocol::codec::ALL_REJECT_REASONS;
 use media_protocol::extensions::{AcceptedValues, EXT_REGISTRY};
 use media_protocol::frame::{
-    AEAD_TAG_BYTES, EXT_LENGTH_FIELD_SIZE, KEK_GENERATION_FIELD_BYTES, KEY_ID_BYTES,
-    KEY_ID_GENERATION_BITS, KEY_ID_SENDER_ID_BITS, KEY_ID_STREAM_BITS, LEGAL_FLAG_MASK,
-    MAX_EXT_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION, PUBLISHER_FIXED_PREFIX_SIZE,
-    RELAY_REGION_SIZE, SIGNATURE_SIZE, WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES,
-    WRAPPED_TRANSMIT_KEY_SIZE,
+    AEAD_TAG_BYTES, EXT_LENGTH_FIELD_SIZE, GOP_COUNTER_FIELD_BYTES, KEK_GENERATION_FIELD_BYTES,
+    KEY_ID_BYTES, KEY_ID_GENERATION_BITS, KEY_ID_SENDER_ID_BITS, KEY_ID_STREAM_BITS,
+    LEGAL_FLAG_MASK, MAX_EXT_BYTES, MAX_HEADER_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION,
+    PUBLISHER_FIXED_PREFIX_SIZE, RELAY_REGION_SIZE, SIGNATURE_SIZE,
+    WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES, WRAPPED_TRANSMIT_KEY_SIZE,
 };
 
 /// Story-file path carrying the verbatim `wrap_key_id_mismatch` spelling.
@@ -166,6 +166,50 @@ fn reject_reasons() -> Vec<RejectReasonEntry> {
         None,
     ));
 
+    // Story 3 receiver drop reasons (ADR-0036 §6/§7, client stages). All drop
+    // the frame and none is determined by one row's bytes, hence
+    // `has_vector: false`. They are NOT `media-protocol` codec variants: MH
+    // never emits them, so they must not join `ALL_REJECT_REASONS` (MH would
+    // initialise drop series it can never produce). An over-maximum length on
+    // the stream reader is NOT a new token: it reuses
+    // `payload_length_exceeds_max`.
+    //
+    // Layer `assignment`: decided against receiver-held assignment state.
+    // `self_sender` — the receiver's own echoed frame; `sender_server_muted` —
+    // a frame from a sender it holds as server-muted.
+    out.push(entry("self_sender", "assignment", true, false, None, None));
+    out.push(entry(
+        "sender_server_muted",
+        "assignment",
+        true,
+        false,
+        None,
+        None,
+    ));
+    // Layer `codec`: the receiver's stream-reader/decoder stage.
+    // `decode_over_bound` — decoded output over the receiving slot's configured
+    // bounds; `stream_partial_reset` — a group stream reset mid-frame;
+    // `stream_slot_mismatch` — a relay slot id that is not one of the
+    // receiver's declared slots, or that differs between frames on one stream
+    // (a multi-frame property: no single row determines it).
+    out.push(entry("decode_over_bound", "codec", true, false, None, None));
+    out.push(entry(
+        "stream_partial_reset",
+        "codec",
+        true,
+        false,
+        None,
+        None,
+    ));
+    out.push(entry(
+        "stream_slot_mismatch",
+        "codec",
+        true,
+        false,
+        None,
+        None,
+    ));
+
     out
 }
 
@@ -182,6 +226,8 @@ fn wire_constants() -> WireConstants {
         wrapped_transmit_key_material_bytes: u32_of(WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES),
         ext_length_field_bytes: u32_of(EXT_LENGTH_FIELD_SIZE),
         max_ext_bytes: u32_of(MAX_EXT_BYTES),
+        gop_counter_field_bytes: u32_of(GOP_COUNTER_FIELD_BYTES),
+        max_header_bytes: u32_of(MAX_HEADER_BYTES),
         key_id_layout: KeyIdLayout {
             sender_id_bits: u32_of(KEY_ID_SENDER_ID_BITS),
             stream_bits: u32_of(KEY_ID_STREAM_BITS),
@@ -252,6 +298,15 @@ fn aad_span_rows() -> Result<Vec<Row>, GenError> {
         );
         spec.key_bearing = key_bearing;
         spec.salience = salience;
+        if !key_bearing {
+            // Audio is key-bearing on every frame (§4), so a frame with no
+            // wrapped key is video-shaped: stream 1, a mid-group delta frame
+            // carrying its group's GoP counter. Relay `stream_id` = the send id.
+            spec.key.stream = u64::from(VIDEO_SEND_ID);
+            spec.stream_id = u16::from(VIDEO_SEND_ID);
+            spec.independently_decodable = false;
+            spec.gop_counter = 5;
+        }
         out.push(build_frame(&spec)?.row);
     }
     Ok(out)
@@ -282,6 +337,70 @@ fn wrap_determinism_rows() -> Result<Vec<Row>, GenError> {
     Ok(out)
 }
 
+/// The v3 GoP-counter rows (ADR-0036 §2): both ends of u32, and a key change
+/// that is NOT the first frame of its group.
+///
+/// # Errors
+///
+/// Propagates [`GenError`] from row construction.
+fn gop_counter_rows() -> Result<Vec<Row>, GenError> {
+    let mut out = Vec::new();
+
+    let mut zero = FrameSpec::base(
+        "gop_counter_zero_keyframe",
+        "The first frame a sender ever sends on a stream: independently decodable, gop_counter 0, \
+         stream_sequence 0. Zero is a legal gop_counter (§2 decode step 8: every u32 is \
+         accepted); a decoder that treated 0 as 'absent' or 'unset' fails here.",
+        "roundtrip",
+    );
+    zero.gop_counter = 0;
+    zero.stream_sequence = 0;
+    out.push(build_frame(&zero)?.row);
+
+    let mut max = FrameSpec::base(
+        "gop_counter_u32_max",
+        "gop_counter at u32::MAX (0xFFFFFFFF) DECODES: every u32 is accepted on the wire (§2 \
+         decode step 8). The never-wrap rule binds the SENDER, not the decoder: this is the last \
+         legal value on its stream, after which the sender emits nothing more on that stream, \
+         counts the stop, and resumes only under a fresh stream number or sender id. A decoder \
+         must not reject it, and a sender must never follow it with 0.",
+        "roundtrip",
+    );
+    max.gop_counter = u32::MAX;
+    max.stream_sequence = 8;
+    out.push(build_frame(&max)?.row);
+
+    // A key-bearing frame that is NOT the first of its group: video, a delta
+    // frame carrying its group's GoP counter and a wrapped key, as in the
+    // "first N frames after any key change" rule (§4) — the key changed
+    // mid-group, so key-bearing does not imply group start.
+    let mut mid = FrameSpec::base(
+        "key_bearing_mid_group",
+        "A key-bearing video frame that is NOT independently decodable (flags 0x04): a key change \
+         mid-group, so the wrapped key rides the first frames after the change rather than the \
+         group's keyframe (§4). Its gop_counter (5) is its GROUP's value — every frame of a group \
+         carries the group-starting frame's counter (§2). Key-bearing and group start are \
+         independent flags; a receiver or MH that inferred one from the other fails here. Relay \
+         stream_id = key-id stream = 1, video's send id.",
+        "full_frame",
+    );
+    mid.key.stream = u64::from(VIDEO_SEND_ID);
+    mid.stream_id = u16::from(VIDEO_SEND_ID);
+    mid.independently_decodable = false;
+    mid.gop_counter = 5;
+    mid.stream_sequence = 41;
+    let mut row = build_frame(&mid)?.row;
+    row.expected = Some(serde_json::json!({
+        "decodes": true,
+        "signature_valid": true,
+        "unwraps": true,
+        "decrypts": true,
+        "plaintext_matches_crypto_block": true
+    }));
+    out.push(row);
+    Ok(out)
+}
+
 /// The two adversarial rows: wrap-binding and insider forgery.
 ///
 /// Grouped because they are the pair that proves the *key-binding* and
@@ -307,13 +426,15 @@ fn adversarial_rows() -> Result<Vec<Row>, GenError> {
          here is testing the wrong control.",
         "wrap_binding",
     );
-    wrap_spec.wrap_for_key_id = Some(KeyIdParts {
-        sender_id: 0x0102,
-        stream: 0x03,
+    let own_kid = hex::encode(wrap_spec.key.pack()?);
+    let other = KeyIdParts {
         // Same sender and stream, next generation: the closest possible
         // mis-binding, so the row cannot pass by a coarse comparison.
-        generation: 0x04_0506_0709,
-    });
+        generation: wrap_spec.key.generation + 1,
+        ..wrap_spec.key
+    };
+    let other_kid = hex::encode(other.pack()?);
+    wrap_spec.wrap_for_key_id = Some(other);
     wrap_spec.reject_reason = Some("wrap_key_id_mismatch");
     wrap_spec.expected = Some(serde_json::json!({
         "outcome": "wrap_key_id_mismatch",
@@ -321,30 +442,30 @@ fn adversarial_rows() -> Result<Vec<Row>, GenError> {
         "frame_dropped": false,
         "wrap_cached": false,
         "decrypts": true,
-        "_assert": "Observe the receiver's key cache: key id 0x0102030405060709 must be ABSENT \
-                    after processing. Do not assert a dropped frame or a reject reason.",
+        "_assert": format!("Observe the receiver's key cache: key id 0x{other_kid} must be \
+                    ABSENT after processing. Do not assert a dropped frame or a reject reason."),
         // Declared in the SSoT rather than left to harness convention, mirroring
         // `replay_of`, so a codec in a third language cannot get this wrong by
         // omission. `decrypts: true` is only satisfiable if the receiver already
-        // holds a usable transmit key for the frame's OWN key id 0x0102030405060708
-        // — this frame's wrap is bound to 0x0102030405060709 and is ignored, so it
+        // holds a usable transmit key for the frame's OWN key id — this frame's
+        // wrap is bound to the next generation's key id and is ignored, so it
         // cannot supply that key.
         "receiver_precondition": {
-            "cached_transmit_key_for_key_id": "0102030405060708",
+            "cached_transmit_key_for_key_id": own_kid,
             "primed_by": "full_frame_compose",
             "prime_via": "unwrap_only",
             "replay_window_advanced": false,
-            "_assert": "Before processing this row, prime the receiver's transmit-key cache for key \
-                        id 0x0102030405060708 by unwrapping full_frame_compose's wrapped-key block \
-                        under its KEK — the UNWRAP PATH ONLY. Do NOT run full_frame_compose through \
-                        the replay-checked receive path: it shares (key_id, stream_sequence) = \
-                        (0x0102030405060708, 7) with this row, so processing it advances the replay \
-                        window to seq 7 and this row is then rejected as replay_detected. Unwrap-only \
-                        priming keeps the cached key originating from a genuine valid wrap (so \
-                        decrypts:true stays self-protecting) while leaving the replay window \
-                        unadvanced. The harness MUST fail loudly if this precondition is not \
-                        established — a wrap-binding row that silently no-ops when unprimed is \
-                        indistinguishable from a pass."
+            "_assert": format!("Before processing this row, prime the receiver's transmit-key \
+                        cache for key id 0x{own_kid} by unwrapping full_frame_compose's wrapped-key \
+                        block under its KEK — the UNWRAP PATH ONLY. Do NOT run full_frame_compose \
+                        through the replay-checked receive path: it shares (key_id, \
+                        stream_sequence) = (0x{own_kid}, 7) with this row, so processing it \
+                        advances the replay window to seq 7 and this row is then rejected as \
+                        replay_detected. Unwrap-only priming keeps the cached key originating from \
+                        a genuine valid wrap (so decrypts:true stays self-protecting) while leaving \
+                        the replay window unadvanced. The harness MUST fail loudly if this \
+                        precondition is not established — a wrap-binding row that silently no-ops \
+                        when unprimed is indistinguishable from a pass.")
         }
     }));
     out.push(build_frame(&wrap_spec)?.row);
@@ -450,7 +571,12 @@ pub fn build() -> Result<VectorFile, GenError> {
         stream: 0xFF,
         generation: (1u64 << KEY_ID_GENERATION_BITS) - 1,
     };
+    // Uplink: the relay stream_id carries the same value as the key id's
+    // stream — in two fields of different width and trust (§2).
+    max_spec.stream_id = 0xFF;
     vectors.push(build_frame(&max_spec)?.row);
+
+    vectors.extend(gop_counter_rows()?);
 
     vectors.extend(wrap_determinism_rows()?);
 
@@ -506,6 +632,25 @@ pub fn build() -> Result<VectorFile, GenError> {
     // Crypto-layer rejects: wrong transmit key, and wrong KEK. Two AES-GCM
     // failures on one receive path that route to OPPOSITE teams.
     vectors.extend(crate::mutate::crypto_reject_rows(&full.frame, &full.row)?);
+
+    // Relay rewrite: an uplink base row and its downlink rewrite, proving the
+    // relay region is outside the signature and the AAD.
+    let mut relay_base_spec = FrameSpec::base(
+        "relay_rewrite_base_uplink",
+        "An uplink audio frame as the publisher sends it: relay stream_id = the publisher's send \
+         id (0, audio; MC's SendStream.stream_number), equal to the key id's stream. The base of \
+         relay_rewrite_still_verifies. Its own (key id, stream_sequence) so that neither row \
+         collides with full_frame_compose in a replay window.",
+        "roundtrip",
+    );
+    relay_base_spec.stream_sequence = 21;
+    relay_base_spec.gop_counter = 21;
+    let relay_base = build_frame(&relay_base_spec)?;
+    vectors.push(relay_base.row.clone());
+    vectors.push(crate::mutate::relay_rewrite_row(
+        &relay_base.frame,
+        &relay_base.row,
+    )?);
 
     // Replay: byte-identical to a frame already accepted. It carries a VALID
     // signature and a VALID tag — it was legitimately produced — so only the

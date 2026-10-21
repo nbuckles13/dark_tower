@@ -17,7 +17,7 @@ import { TraceState } from '@opentelemetry/core';
 import { MockWebTransport } from '@darktower/test-utils';
 
 import { SignalingClient } from '../SignalingClient.js';
-import { HEADER_VERSION_V3, SENDABLE_HEADER_VERSIONS } from '../../media/frame/frameCodec.js';
+import { SUPPORTED_HEADER_VERSIONS } from '../../media/frame/frameCodec.js';
 import { HEADER_VERSION } from '../../media/frame/wireConstants.js';
 import type { SignalingClientOptions } from '../SignalingClient.js';
 import type { SignalingJoinParams } from '../events.js';
@@ -133,7 +133,7 @@ describe('SignalingClient — connect + JoinRequest (R-16)', () => {
     await expect(joinPromise).rejects.toBeInstanceOf(SignalingError);
   });
 
-  it('declares the SDK SENDABLE header versions by default, never the decode set', async () => {
+  it('declares the SDK header version set by default: exactly v3', async () => {
     const wt = new MockWebTransport();
     const { client, joinPromise } = startJoin(wt);
     wt.simulateReady();
@@ -142,13 +142,10 @@ describe('SignalingClient — connect + JoinRequest (R-16)', () => {
     const cm = decodeOutboundClientMessages(wt.getOutboundBidiWrites(0))[0]!;
     if (cm.message.case !== 'joinRequest') throw new Error('expected a joinRequest');
     const declared = cm.message.value.capabilities?.supportedHeaderVersions;
-    // Derived from the codec's one predicate: `[2]` today, `[3]` after P2's
-    // flip with no edit to the join path.
-    expect(declared).toEqual([...SENDABLE_HEADER_VERSIONS]);
+    // Derived from the codec's one set, never a literal in the join path.
+    expect(declared).toEqual([...SUPPORTED_HEADER_VERSIONS]);
     expect(declared).toEqual([HEADER_VERSION]);
-    // v3 is decodable but not yet sendable (no GoP counter owner until P2), so
-    // it is not declared: declaring it would invite MC to direct it.
-    expect(declared).not.toContain(HEADER_VERSION_V3);
+    expect(declared).toEqual([3]);
 
     client.close();
     await expect(joinPromise).rejects.toBeInstanceOf(SignalingError);

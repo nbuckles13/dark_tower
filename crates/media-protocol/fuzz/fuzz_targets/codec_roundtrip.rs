@@ -1,6 +1,6 @@
 #![no_main]
 
-//! Round-trip correctness for the version-2 frame codec.
+//! Round-trip correctness for the version-3 frame codec.
 //!
 //! Asserts **byte identity**, not field equality. Encoding is canonical — one
 //! fixed field order, extensions emitted in ascending type order — so
@@ -36,6 +36,7 @@ fuzz_target!(|data: &[u8]| {
     let parts = MediaFrameParts {
         flags: view.flags(),
         stream_sequence: view.stream_sequence(),
+        gop_counter: view.gop_counter(),
         wrapped_transmit_key: view.wrapped_transmit_key(),
         extensions: &extensions,
         stream_id: view.stream_id(),

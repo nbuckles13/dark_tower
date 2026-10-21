@@ -11,12 +11,12 @@
 - Signaling (client↔MC) → `proto/dark_tower/signaling/v1/signaling.proto`; internal (service↔service) → `proto/dark_tower/internal/v1/internal.proto`
 - Codegen build script + skip_debug → `crates/proto-gen/build.rs`; re-exports, module wiring, redacting Debug → `crates/proto-gen/src/lib.rs`
 
-## Media Protocol Crate (frame header v2, ADR-0036 §2 + Appendix)
+## Media Protocol Crate (frame header v3, ADR-0036 §2 + Appendix)
 - Crate root; no-crypto/no-telemetry scope, lint denies → `crates/media-protocol/src/lib.rs`
 - Wire layout, size constants, flags, zero-copy view, publisher/relay split, key-id layout → `frame.rs`; TLV grammar + registry → `extensions.rs`
-- Single parser, four entry points, encode, reject reasons; relay rewrite (`rewrite_relay_region()`), reader bound (`peek_frame_len()`) → `crates/media-protocol/src/codec.rs`
-- Tests (no-skipped-byte proof, reject-reason precedence, zero-copy/roundtrip/redaction, fuzz corpus) → `crates/media-protocol/tests/`; fuzzers → `fuzz/fuzz_targets/`
-- Cross-language v2 frame SSoT (Rust+TS codecs conform) → `proto/test-vectors/frame-v2.vectors.json`; external sframe-wg vectors → `proto/test-vectors/external/sframe-wg/`; non-prod reference generator → `crates/media-vector-gen/`; SDK conforming codec → `packages/sdk-core/src/media/frame/`; drift guard wired via ADR-0033
+- Single parser, several entry points, encode, reject reasons (`key_bearing_discardable` = §2 step 5); relay rewrite (`rewrite_relay_region()`); cut-through header parse + reader bound (`parse_header_prefix()`, `HeaderPrefix`), header-only rewrite (`rewrite_relay_region_header()`) → `crates/media-protocol/src/codec.rs`; scalar header view (`FrameHeader`, redacting Debug) → `frame.rs`; chunk-fed header reader (`HeaderReader`, sticky outcomes) → `reader.rs`
+- Tests (no-skipped-byte proof, reject-reason precedence, zero-copy/roundtrip/redaction, fuzz corpus; split-invariance `header_prefix.rs`; counting-allocator `no_alloc.rs`; fuzz-matrix drift `fuzz_wiring.rs`) → `crates/media-protocol/tests/`; fuzzers (incl. `header_prefix`, `header_reader_split`) → `fuzz/fuzz_targets/`
+- Cross-language v3 frame SSoT (Rust+TS codecs conform) → `proto/test-vectors/frame-v3.vectors.json`; external sframe-wg vectors → `proto/test-vectors/external/sframe-wg/`; non-prod reference generator → `crates/media-vector-gen/`; SDK conforming codec → `packages/sdk-core/src/media/frame/`; drift guard wired via ADR-0033
 
 ## gRPC Services (all in `proto/dark_tower/internal/v1/internal.proto`)
 - MediaHandlerService (MC→MH): RegisterMeeting + EndMeeting — forwarding policy gains fields, not sibling RPCs (ADR-0036 §8); teardown is its own RPC (story 2 R-20; mc_id-mismatch → FAILED_PRECONDITION, not an authz control). `Register`, `RouteMedia`, `StreamTelemetry` retired 2026-09-01; tombstone block in the proto

@@ -514,7 +514,8 @@ exactly one of `dt_client_media_frames_accepted_total` or
 
 **It is an ACCOUNTING identity, not a playback guarantee.** Its job is to prove
 that no drop path fails to count itself. It says nothing about audibility: all
-seventeen `drops_frame: true` reasons fire at or before decoder handoff, so the
+`drops_frame: true` reasons fire on a received frame before it is rendered (every one at
+or before decoder handoff except `decode_over_bound`, which fires on the decoder's output), so the
 identity is exact **by construction** at the crypto/parse boundary, and at the
 playback boundary it would be FALSE — a frame lost between handoff and audible
 decrements nothing on the right-hand side.
@@ -571,12 +572,14 @@ the comment's reader.
   | `oversize_datagram` | **shared** | The frame exceeded the transport maximum and was never offered. Separate from the row above precisely so a configuration condition cannot poison an invariant counter. |
   | `connection_closed` | **shared** | The connection closed underneath a send. **Routine** — a participant leaves every meeting, many times. Not alertable. |
   | `not_connected` | **client-only** | The lane's directed target has no connected transport. **Reads zero forever; alertable at `> 0`** — but since story 2 task 20 it has TWO arms with opposite owners, and the alert must not presume the first. (1) **Client lifecycle ordering** — a send attempted before any transport was up. (2) **Server-side, and this is the new one**: MC directed this sender at a handler the client has no session with. MC derives a sender's targets from the handlers owning its edges, and an edge exists only where *both* parties are connected to that handler (ADR-0036 §9), so a directed target outside this client's own connected set means **MC's connectivity view is stale** — not a client bug. Fork on whether the client holds any transport at all: none means arm (1), some-but-not-this-one means arm (2). Arm (2) is the only signal available today for stale MC connectivity after a lost `NotifyParticipantDisconnected`, so it is a **partial mitigation** for the MH-observed-vs-client-reported divergence counter deferred in `docs/TODO.md` — partial because it fires only for a *sender* holding an edge on the stale handler. |
+  | `gop_counter_exhausted` | **client-only** | The stream's `gop_counter` is exhausted: `u32::MAX` was its last legal value, so ADR-0036 §2 stops the stream (it never wraps) until a fresh stream number or sender id. Every later captured frame is refused **before it is built** (no nonce, no seal) and counted **once per active lane** — the send attempts it would have made — so `frames_sent + send_dropped` stays a per-lane attempt total and the send-drop ratio still means loss. **An exhausted stream reads 100% send loss on every lane.** Unreachable in practice (audio at 50 fps needs ~2.7 years of continuous sending on one stream); **zero forever, deliberately not alerted** (`docs/observability/alerts.md` §Deliberate absence (client send path)). Owner: `TransmitKeyManager.nextGopCounter` (`packages/sdk-core/src/media/lifecycle/transmitKeys.ts`). The counter value itself is stream identity and never a label. |
 
 - **Cross-end comparison**: the four shared spellings match
   `MediaDropReason` in `crates/mh-service/src/observability/metrics.rs`, so
   `sum by(reason)` compares across the two ends of one hop. **`not_connected`
-  has no counterpart** — MH never initiates — so a cross-end sum is meaningful
-  only for the shared four. Nothing mechanically guards that the two lists agree.
+  and `gop_counter_exhausted` have no counterpart** — MH never initiates or
+  originates a stream — so a cross-end sum is meaningful only for the shared
+  four. Nothing mechanically guards that the two lists agree.
 - **Why this counter exists at all**: ADR-0036 §11 calls the client-side send
   drop the one that matters most, because it happens in the sender and **MH
   structurally cannot observe it**. WebTransport exposes no send-side drop event,
@@ -627,8 +630,8 @@ the comment's reader.
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Labels**: per-kind base (incl. `media_kind`) + `reason` — the frozen frame-reject vocabulary, whose SSoT is
-  `proto/test-vectors/frame-v2.vectors.json` → `reject_reasons`. Membership of
-  THIS counter is carried by `drops_frame`: seventeen of the eighteen tokens.
+  `proto/test-vectors/frame-v3.vectors.json` → `reject_reasons`. Membership of
+  THIS counter is carried by `drops_frame`: every token but one.
   `wrap_key_id_mismatch` is the only `false` and **must never appear here**: the
   frame it describes is *accepted*, and is already counted on
   `dt_client_media_frames_accepted_total`. Counting it here as well would put one
@@ -638,12 +641,10 @@ the comment's reader.
   of reach: it arrives on the receive path's success channel as a `WrapOutcome`,
   never as a thrown reject, so "catch it into the drop counter" is not a path that
   exists.
-- **All eight structural codec tokens are emitted INDIVIDUALLY** — `unknown_version`,
-  `reserved_flag_bit_set`, `payload_length_exceeds_max`,
+- **Every structural codec token is emitted INDIVIDUALLY** — `unknown_version`,
+  `reserved_flag_bit_set`, `key_bearing_discardable`, `payload_length_exceeds_max`,
   `payload_length_exceeds_available`, `truncated`, `extensions_too_large`,
-  `extensions_malformed`, `trailing_bytes` (plus, pending P2's v3 vectors,
-  `key_bearing_discardable`: structural, dropping, emitted on v3 decode only;
-  the counts on this page are about the SSoT and P2 folds it in) — never collapsed into a
+  `extensions_malformed`, `trailing_bytes` — never collapsed into a
   `decode_reject` bucket. Collapsing destroys R-31's only lever
   (`unknown_version` staying individually visible is how a version-skewed
   rollback is detected — rollback for this feature is redeploy-only with no
@@ -658,7 +659,7 @@ the comment's reader.
   reasons below plus `unwrap_failed` (next bullets). `unwrap_failed` joined the
   selector at story 2 task 16; before that it was in no alert and no panel.
   Membership is held by a PARTITION check, not by this list: every
-  `drops_frame: true` token in `proto/test-vectors/frame-v2.vectors.json` must sit in
+  `drops_frame: true` token in `proto/test-vectors/frame-v3.vectors.json` must sit in
   exactly one of that alternation or the `NOT_KEY_DELIVERY` const in
   `crates/dt-guard/src/client_metrics_export.rs` (which carries each exclusion's
   reason), so a new token fails the build until classified.
@@ -754,7 +755,7 @@ the comment's reader.
     reads-zero-forever contract: the format permits the behaviour, and this SDK
     does not control every sender.
   - `wrap_key_id_mismatch` — the SSoT spelling, carried verbatim from
-    `frame-v2.vectors.json` → `vectors[].expected.outcome`. **A rename toward the
+    `frame-v3.vectors.json` → `vectors[].expected.outcome`. **A rename toward the
     observable is pending under `docs/TODO.md`** (proposed target spelling:
     `unwrap_failed_key_held`); the rename is protocol-owned because the token is
     pinned in a Guarded Shared Area, and it must move both `reject_reason` and

@@ -34,13 +34,16 @@ use common::{
     SENTINEL_PAYLOAD,
 };
 use media_protocol::codec::{
-    decode_datagram, decode_stream_frame, peek_frame_len, rewrite_relay_region, DecodeError,
-    ProducibleBy, RejectReason, ALL_REJECT_REASONS,
+    decode_datagram, decode_stream_frame, encode_frame, parse_header_prefix, rewrite_relay_region,
+    rewrite_relay_region_header, DecodeError, EncodeError, MediaFrameParts, ProducibleBy,
+    RejectReason, ALL_REJECT_REASONS,
 };
+use media_protocol::frame::{FrameFlags, WrappedTransmitKey, FLAG_DISCARDABLE};
 use media_protocol::frame::{
     MAX_EXT_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION, PUBLISHER_FIXED_PREFIX_SIZE,
     SIGNATURE_SIZE, VERSION_OFFSET,
 };
+use media_protocol::reader::HeaderReader;
 
 const MAXIMAL: Shape = Shape {
     key_bearing: true,
@@ -70,6 +73,11 @@ fn datagram_case(reason: RejectReason) -> Vec<u8> {
         RejectReason::ReservedFlagBitSet => {
             flip_bit(&frame, media_protocol::frame::FLAGS_OFFSET, 3)
         }
+        RejectReason::KeyBearingDiscardable => {
+            // The canonical frame is key-bearing; add discardable.
+            let flags = frame[media_protocol::frame::FLAGS_OFFSET] | FLAG_DISCARDABLE;
+            set_byte(&frame, media_protocol::frame::FLAGS_OFFSET, flags)
+        }
         RejectReason::PayloadLengthExceedsMax => {
             let over = u32::try_from(MAX_PAYLOAD_BYTES + 1).unwrap();
             overwrite(
@@ -79,8 +87,8 @@ fn datagram_case(reason: RejectReason) -> Vec<u8> {
             )
         }
         RejectReason::PayloadLengthExceedsAvailable => {
-            // Within the wire-format maximum, so step 5 passes; larger than the
-            // bytes present, so step 11 fires.
+            // Within the wire-format maximum, so step 6 passes; larger than the
+            // bytes present, so step 13 fires.
             let declared = u32::try_from(MAX_PAYLOAD_BYTES).unwrap();
             overwrite(
                 &frame,
@@ -125,6 +133,7 @@ fn reason_tokens_are_the_frozen_spellings() {
         vec![
             "unknown_version",
             "reserved_flag_bit_set",
+            "key_bearing_discardable",
             "payload_length_exceeds_max",
             "payload_length_exceeds_available",
             "truncated",
@@ -151,12 +160,13 @@ fn all_reject_reasons_is_complete() {
         match reason {
             RejectReason::UnknownVersion => 0,
             RejectReason::ReservedFlagBitSet => 1,
-            RejectReason::PayloadLengthExceedsMax => 2,
-            RejectReason::PayloadLengthExceedsAvailable => 3,
-            RejectReason::Truncated => 4,
-            RejectReason::ExtensionsTooLarge => 5,
-            RejectReason::ExtensionsMalformed => 6,
-            RejectReason::TrailingBytes => 7,
+            RejectReason::KeyBearingDiscardable => 2,
+            RejectReason::PayloadLengthExceedsMax => 3,
+            RejectReason::PayloadLengthExceedsAvailable => 4,
+            RejectReason::Truncated => 5,
+            RejectReason::ExtensionsTooLarge => 6,
+            RejectReason::ExtensionsMalformed => 7,
+            RejectReason::TrailingBytes => 8,
         }
     }
 
@@ -203,6 +213,104 @@ fn version_precedes_truncation() {
         reason_of(&truncated_to(&bytes, 1)),
         RejectReason::UnknownVersion
     );
+}
+
+fn key_bearing_discardable(frame: &[u8]) -> Vec<u8> {
+    let flags = frame[media_protocol::frame::FLAGS_OFFSET] | FLAG_DISCARDABLE;
+    set_byte(frame, media_protocol::frame::FLAGS_OFFSET, flags)
+}
+
+/// ADR-0036 §2 step 2 before step 5.
+#[test]
+fn version_precedes_key_bearing_discardable() {
+    let both = set_byte(
+        &key_bearing_discardable(&canonical_frame()),
+        VERSION_OFFSET,
+        2,
+    );
+    assert_eq!(reason_of(&both), RejectReason::UnknownVersion);
+}
+
+/// Step 4 before step 5: an undefined bit reports the broader reason.
+#[test]
+fn reserved_flag_bit_precedes_key_bearing_discardable() {
+    let both = flip_bit(
+        &key_bearing_discardable(&canonical_frame()),
+        media_protocol::frame::FLAGS_OFFSET,
+        3,
+    );
+    assert_eq!(reason_of(&both), RejectReason::ReservedFlagBitSet);
+}
+
+/// Step 5 before step 6: no length is examined for a frame that can never be
+/// legal.
+#[test]
+fn key_bearing_discardable_precedes_payload_length() {
+    let over = u32::try_from(MAX_PAYLOAD_BYTES + 1).unwrap();
+    let both = overwrite(
+        &key_bearing_discardable(&canonical_frame()),
+        media_protocol::frame::PAYLOAD_LENGTH_OFFSET,
+        &over.to_be_bytes(),
+    );
+    assert_eq!(reason_of(&both), RejectReason::KeyBearingDiscardable);
+}
+
+/// Every entry point rejects key-bearing + discardable, including from just
+/// the 14-byte fixed prefix (it is decidable, and terminal, there).
+#[test]
+fn key_bearing_discardable_is_rejected_by_every_entry_point() {
+    let bytes = key_bearing_discardable(&canonical_frame());
+    let want = Some(RejectReason::KeyBearingDiscardable);
+    assert_eq!(decode_datagram(&bytes).err().map(|e| e.reason()), want);
+    assert_eq!(decode_stream_frame(&bytes).err().map(|e| e.reason()), want);
+    assert_eq!(parse_header_prefix(&bytes).err().map(|e| e.reason()), want);
+    let prefix = truncated_to(&bytes, PUBLISHER_FIXED_PREFIX_SIZE);
+    assert_eq!(parse_header_prefix(&prefix).err().map(|e| e.reason()), want);
+    assert_eq!(decode_stream_frame(&prefix).err().map(|e| e.reason()), want);
+    let mut reader = HeaderReader::new();
+    assert_eq!(reader.feed(&prefix).err().map(|e| e.reason()), want);
+    let mut writable = bytes.clone();
+    assert_eq!(
+        rewrite_relay_region(&mut writable, 1, 2)
+            .err()
+            .map(|e| e.reason()),
+        want
+    );
+    assert_eq!(writable, bytes, "nothing written on reject");
+    assert_eq!(
+        rewrite_relay_region_header(&mut writable, 1, 2)
+            .err()
+            .map(|e| e.reason()),
+        want
+    );
+    assert_eq!(writable, bytes, "nothing written on reject");
+}
+
+/// The encoder refuses every frame the decoder would reject (§2 "Encode
+/// side"), this one included.
+#[test]
+fn encoder_refuses_key_bearing_discardable() {
+    let key = [0x11u8; 32];
+    let tag = [0x22u8; 16];
+    let parts = MediaFrameParts {
+        flags: FrameFlags {
+            independently_decodable: true,
+            discardable: true,
+            key_bearing: true,
+        },
+        stream_sequence: 1,
+        gop_counter: 0,
+        wrapped_transmit_key: Some(WrappedTransmitKey::new(1, &key, &tag)),
+        extensions: &[],
+        stream_id: 0,
+        hop_sequence: 0,
+        payload: &[],
+        signature: &[0u8; SIGNATURE_SIZE],
+    };
+    assert!(matches!(
+        encode_frame(&parts),
+        Err(EncodeError::KeyBearingDiscardable)
+    ));
 }
 
 #[test]
@@ -356,53 +464,82 @@ fn declared_producibility_matches_behaviour() {
             "datagram case mismatch for {reason}"
         );
 
-        // `rewrite_relay_region` is the fourth fallible entry point, and a
-        // media handler calls it on stream-carried video. Checking only the
-        // two decode paths would assert two thirds of the claim — which is how
-        // `Truncated` and `PayloadLengthExceedsAvailable` came to be labelled
+        // The relay rewrites are fallible entry points too, and a media
+        // handler calls them on stream-carried video. Checking only the decode
+        // paths would assert part of the claim — which is how `Truncated` and
+        // `PayloadLengthExceedsAvailable` once came to be labelled
         // datagram-only while being reachable on the video path.
         let mut writable = bytes.clone();
         let rewrite = rewrite_relay_region(&mut writable, 1, 2);
+        let mut header_writable = bytes.clone();
+        let header_rewrite = rewrite_relay_region_header(&mut header_writable, 1, 2);
         let stream = decode_stream_frame(&bytes);
-        let peek = peek_frame_len(&bytes);
+        let prefix = parse_header_prefix(&bytes);
+        let mut reader = HeaderReader::new();
+        let fed = reader.feed(&bytes);
 
-        match reason.producible_by() {
-            ProducibleBy::AllEntryPoints => {
-                for (name, produced) in [
-                    ("decode_stream_frame", stream.err().map(|e| e.reason())),
-                    ("peek_frame_len", peek.err().map(|e| e.reason())),
-                    ("rewrite_relay_region", rewrite.err().map(|e| e.reason())),
-                ] {
-                    assert_eq!(
-                        produced,
-                        Some(reason),
-                        "{reason} is declared AllEntryPoints but {name} did not produce it"
-                    );
-                }
+        let reason_of_entry = |name: &'static str| -> Option<RejectReason> {
+            match name {
+                "decode_stream_frame" => stream.err().map(|e| e.reason()),
+                "parse_header_prefix" => prefix.err().map(|e| e.reason()),
+                "HeaderReader::feed" => fed.err().map(|e| e.reason()),
+                "rewrite_relay_region" => rewrite.err().map(|e| e.reason()),
+                "rewrite_relay_region_header" => header_rewrite.err().map(|e| e.reason()),
+                _ => unreachable!(),
             }
-            ProducibleBy::CompleteFrameRequired => {
-                // The prefix-tolerant entry points must NOT reject.
-                assert!(
-                    stream.is_ok(),
-                    "{reason} is declared CompleteFrameRequired but decode_stream_frame rejected"
-                );
-                assert!(
-                    peek.is_ok(),
-                    "{reason} is declared CompleteFrameRequired but peek_frame_len rejected"
-                );
-                // The relay rewrite must, and this is the half the old
-                // `DatagramOnly` label denied.
+        };
+        let required: &[&str] = match reason.producible_by() {
+            ProducibleBy::AllEntryPoints => &[
+                "decode_stream_frame",
+                "parse_header_prefix",
+                "HeaderReader::feed",
+                "rewrite_relay_region",
+                "rewrite_relay_region_header",
+            ],
+            ProducibleBy::CompleteHeaderRequired => {
+                &["rewrite_relay_region", "rewrite_relay_region_header"]
+            }
+            ProducibleBy::CompleteFrameRequired => &["rewrite_relay_region"],
+            ProducibleBy::DecodeDatagramOnly => &[],
+        };
+        for name in [
+            "decode_stream_frame",
+            "parse_header_prefix",
+            "HeaderReader::feed",
+            "rewrite_relay_region",
+            "rewrite_relay_region_header",
+        ] {
+            let produced = reason_of_entry(name);
+            if required.contains(&name) {
                 assert_eq!(
-                    rewrite.err().map(|e| e.reason()),
+                    produced,
                     Some(reason),
-                    "{reason} is declared CompleteFrameRequired but rewrite_relay_region did not \
-                     produce it — this is the claim that must hold for MH's video path"
+                    "{reason} is declared {:?} but {name} did not produce it",
+                    reason.producible_by()
+                );
+                assert!(
+                    reason
+                        .producible_by()
+                        .as_str()
+                        .contains(name.trim_start_matches("HeaderReader::")),
+                    "{name} missing from ProducibleBy::as_str for {reason}"
+                );
+            } else {
+                assert_eq!(
+                    produced,
+                    None,
+                    "{reason} is declared {:?} but {name} rejected",
+                    reason.producible_by()
                 );
             }
+        }
+        match reason.producible_by() {
+            ProducibleBy::AllEntryPoints
+            | ProducibleBy::CompleteHeaderRequired
+            | ProducibleBy::CompleteFrameRequired => {}
             ProducibleBy::DecodeDatagramOnly => {
                 for (name, outcome_is_err) in [
                     ("decode_stream_frame", stream.is_err()),
-                    ("peek_frame_len", peek.is_err()),
                     ("rewrite_relay_region", rewrite.is_err()),
                 ] {
                     assert!(
@@ -440,7 +577,7 @@ fn a_violation_visible_in_a_short_prefix_is_terminal_on_the_stream_path() {
     let frame = canonical_frame();
 
     // Over-max payload length, truncated to just the publisher prefix: the
-    // limit check at step 5 fires before any body-availability check.
+    // limit check at step 6 fires before any body-availability check.
     let over = u32::try_from(MAX_PAYLOAD_BYTES + 1).unwrap();
     let short_over_max = truncated_to(
         &overwrite(
@@ -515,11 +652,15 @@ fn no_prefix_of_a_valid_frame_ever_errs() {
                 "prefix of length {len} produced {outcome:?}; a prefix of a valid frame must be \
                  incomplete, never a rejection"
             );
-            // peek must never reject a prefix either, and must stay silent
-            // until the length is genuinely knowable.
+            // The header parse and the chunk-fed reader must never reject a
+            // prefix either.
             assert!(
-                peek_frame_len(&prefix).is_ok(),
-                "peek rejected a valid prefix at {len}"
+                parse_header_prefix(&prefix).is_ok(),
+                "parse_header_prefix rejected a valid prefix at {len}"
+            );
+            assert!(
+                HeaderReader::new().feed(&prefix).is_ok(),
+                "HeaderReader rejected a valid prefix at {len}"
             );
         }
         // The whole frame decodes, so the prefixes above really were prefixes
@@ -561,4 +702,27 @@ fn decode_error_display_leaks_no_buffer_bytes() {
         assert!(!rendered.contains("A1A1"), "wrapped key material rendered");
         assert!(!rendered.contains("C3C3"), "signature material rendered");
     }
+}
+
+/// v3 is the only version (R-22): a v2-labelled frame — every other byte a
+/// valid v3 frame — is refused loudly as `unknown_version`, with no allowlist
+/// and no floor, on every entry point.
+#[test]
+fn a_v2_labelled_frame_is_unknown_version_everywhere() {
+    let bytes = set_byte(&canonical_frame(), VERSION_OFFSET, 2);
+    let want = Some(RejectReason::UnknownVersion);
+    assert_eq!(decode_datagram(&bytes).err().map(|e| e.reason()), want);
+    assert_eq!(decode_stream_frame(&bytes).err().map(|e| e.reason()), want);
+    assert_eq!(
+        parse_header_prefix(&bytes[..1]).err().map(|e| e.reason()),
+        want,
+        "terminal on a one-byte buffer"
+    );
+    assert_eq!(
+        HeaderReader::new()
+            .feed(&bytes[..1])
+            .err()
+            .map(|e| e.reason()),
+        want
+    );
 }

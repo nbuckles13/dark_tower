@@ -599,7 +599,7 @@ groups:
       # stage, not the remedy owner: unwrap_failed is layer=crypto and still
       # belongs here. The partition is MECHANICAL: dt-guard
       # client-metrics-export (G7) requires every `drops_frame: true` token in
-      # proto/test-vectors/frame-v2.vectors.json to sit in EXACTLY ONE of this
+      # proto/test-vectors/frame-v3.vectors.json to sit in EXACTLY ONE of this
       # alternation or its `NOT_KEY_DELIVERY` list
       # (crates/dt-guard/src/client_metrics_export.rs, which carries the
       # per-token reason, including sender_not_assigned = misrouting). A new

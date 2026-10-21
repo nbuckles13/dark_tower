@@ -177,7 +177,7 @@ export type {
   TokenCredentials,
 } from './session/events.js';
 
-// --- ADR-0036 §2/§3/§4 media frame v2 + SFrame stack (story task 15) ---
+// --- ADR-0036 §2/§3/§4 media frame (header v3) + SFrame stack ---
 //
 // Three separable modules, so the vendored external sframe-wg vectors reach the
 // exact code they validate: the RFC 9605 key schedule, the AEAD/SFrame object,

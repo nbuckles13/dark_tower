@@ -74,6 +74,49 @@ describe('generation is monotonic per sender and is never reset', () => {
   });
 });
 
+describe('gop_counter is per (sender, stream), monotonic, and never reset (ADR-0036 §2)', () => {
+  it('is monotonic per stream, starting at 0', () => {
+    const mgr = new TransmitKeyManager(258);
+    expect([0, 1, 2, 3].map(() => mgr.nextGopCounter(0))).toEqual([0, 1, 2, 3]);
+  });
+
+  it('counts each stream independently', () => {
+    const mgr = new TransmitKeyManager(258);
+    expect(mgr.nextGopCounter(0)).toBe(0);
+    expect(mgr.nextGopCounter(1)).toBe(0);
+    expect(mgr.nextGopCounter(0)).toBe(1);
+    expect(mgr.nextGopCounter(1)).toBe(1);
+  });
+
+  it('is independent of the stream sequence on the same stream', () => {
+    // Two counters, not one: video advances the GoP only on keyframes (C-A2).
+    const mgr = new TransmitKeyManager(258);
+    mgr.nextStreamSequence(0);
+    mgr.nextStreamSequence(0);
+    expect(mgr.nextGopCounter(0)).toBe(0);
+    expect(mgr.nextStreamSequence(0)).toBe(2);
+  });
+
+  it('survives key rotation and teardown: it never resets while the sender id lives', () => {
+    const mgr = new TransmitKeyManager(258);
+    expect(mgr.nextGopCounter(0)).toBe(0);
+    mgr.rotate();
+    expect(mgr.nextGopCounter(0)).toBe(1);
+    mgr.rotate();
+    mgr.rotate();
+    expect(mgr.nextGopCounter(0)).toBe(2);
+    // `clear()` is teardown, not a reset — the same rule as the sequence.
+    mgr.clear();
+    expect(mgr.nextGopCounter(0)).toBe(3);
+  });
+
+  it('exposes no getter, setter or reset for it (stream identity, R-30)', () => {
+    const mgr = new TransmitKeyManager(258);
+    const surface = Object.getOwnPropertyNames(Object.getPrototypeOf(mgr));
+    expect(surface.filter((n) => /gop/i.test(n))).toEqual(['nextGopCounter']);
+  });
+});
+
 describe('key material', () => {
   it('packs the generation into the key id and mints a new key on rotation', async () => {
     const mgr = new TransmitKeyManager(258);

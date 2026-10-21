@@ -60,7 +60,7 @@ const PUBLISHER: u32 = 7;
 /// workspace-relative spelling lives at `media-vector-gen`'s own
 /// `VECTOR_FILE_PATH`; it is a different form of the same path, named here so a
 /// reader who greps finds no home this comment failed to mention.)
-const VECTORS: &str = "../../proto/test-vectors/frame-v2.vectors.json";
+const VECTORS: &str = "../../proto/test-vectors/frame-v3.vectors.json";
 
 /// Forward one frame through a loopback policy, returning the queue it landed
 /// in so a test can assert on what was delivered.
@@ -327,7 +327,7 @@ fn repo_relative(relative: &str) -> PathBuf {
 /// `ALL_REJECT_REASONS` is blind precisely where the risk is. The crypto and
 /// key tokens have **no Rust home at all** — they exist only in this file and
 /// in `packages/sdk-core/src/media/frame/rejectReason.ts` — so a test against
-/// the Rust eight would let an MH-local enum define `replay_detected` and pass
+/// the Rust codec tokens alone would let an MH-local enum define `replay_detected` and pass
 /// cleanly. `no_transmit_key` is the sharpest trap: tagged `layer: "codec"`,
 /// not a `RejectReason` variant, and it *reads* like a plain routing failure.
 /// `no_roster_entry` reads like a sibling of `no_subscriber` and is not.
@@ -357,14 +357,15 @@ fn no_mh_local_drop_reason_collides_with_a_cross_language_reject_token() {
     // follow-up, so that is live rather than hypothetical. Without this, a file
     // move or a renamed field yields an empty barred set and a vacuously green
     // assertion.
-    // The eight CODEC tokens are DERIVED from `ALL_REJECT_REASONS`; the
-    // non-codec tokens (crypto, key, and the assignment token
-    // `sender_not_assigned`) are literals because they have no
+    // The CODEC tokens are DERIVED from `ALL_REJECT_REASONS`; the receiver-only
+    // tokens (crypto, key, assignment, and the codec-layer receiver tokens
+    // `no_transmit_key`, `decode_over_bound`, `stream_partial_reset`,
+    // `stream_slot_mismatch`) are literals because they have no
     // `ALL_REJECT_REASONS` home — they have no Rust home at all, and exist
     // only in the vector file and in the SDK's
     // `rejectReason.ts`, which is the entire reason this test reads the fixture
     // rather than the Rust enum. Deriving the half that can be derived removes
-    // eight hand-typed spellings without weakening the pin: a Rust-side rename
+    // the codec spellings from hand-typing without weakening the pin: a Rust-side rename
     // still moves both the derived list and MH's emission together, and the
     // count floor below is what catches a fixture that lost entries.
     let required: Vec<&str> = ALL_REJECT_REASONS
@@ -381,6 +382,14 @@ fn no_mh_local_drop_reason_collides_with_a_cross_language_reject_token() {
             "kek_generation_stale",
             "no_roster_entry",
             "sender_not_assigned",
+            // Story 3 receiver drop reasons. MH's own story-3 drop tokens sit
+            // right next to these (`server_muted`, `partial_frame_discard`),
+            // which is exactly the collision this pin exists to catch.
+            "self_sender",
+            "sender_server_muted",
+            "decode_over_bound",
+            "stream_partial_reset",
+            "stream_slot_mismatch",
         ])
         .collect();
     assert!(

@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { bytesToHex, hexToBytes } from '../hex.js';
-import { HEADER_VERSION_V3, buildUnsignedFrame, decodeFrame, finishFrame } from '../frameCodec.js';
+import { buildUnsignedFrame, decodeFrame, finishFrame } from '../frameCodec.js';
 import { exportPublicKey, importSigningKeyFromSeed, signFrame } from '../ed25519.js';
 import { packKeyId, unpackKeyId } from '../keyId.js';
 import { HEADER_VERSION } from '../wireConstants.js';
@@ -159,14 +159,12 @@ describe('the happy path', () => {
     expect(opened.senderId).toBe(258n);
   });
 
-  it('a v3 frame (transitional dual path) decodes, verifies, unwraps and decrypts end to end', async () => {
-    // Self-consistency only, NOT correctness evidence for v3: one author built
-    // and opened this frame. P2's independent v3 vectors are the gate. What it
-    // does prove is that the four-byte-longer publisher region flows through
-    // seal, sign, verify and open with the AAD the receive path slices.
-    const f = await makeFrame({ headerVersion: HEADER_VERSION_V3, gopCounter: 0xffff_ffff });
+  it('carries gop_counter at u32::MAX through seal, sign, verify and open', async () => {
+    // Self-consistency only: one author built and opened this frame. The
+    // independent v3 vectors are the correctness gate.
+    const f = await makeFrame({ gopCounter: 0xffff_ffff });
     const decoded = decodeFrame(f.bytes);
-    expect([decoded.version, decoded.gopCounter]).toEqual([HEADER_VERSION_V3, 0xffff_ffff]);
+    expect([decoded.version, decoded.gopCounter]).toEqual([HEADER_VERSION, 0xffff_ffff]);
     const opened = await openVerifiedFrame(
       await verifyFrame(decoded, f.publicKey),
       new TransmitKeyCache(),

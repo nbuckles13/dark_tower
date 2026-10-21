@@ -85,7 +85,10 @@ interface Rig {
   reasons(): string[];
 }
 
-async function makeRig(urls: readonly string[]): Promise<Rig> {
+async function makeRig(
+  urls: readonly string[],
+  transmitKeys: TransmitKeyManager = new TransmitKeyManager(SENDER_ID),
+): Promise<Rig> {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaKindMetrics(
     { clientVersion: 'v', orgId: 'o' },
@@ -100,7 +103,6 @@ async function makeRig(urls: readonly string[]): Promise<Rig> {
 
   // ONE manager, as production has: its identity IS the nonce-uniqueness
   // boundary (see `transmitKeys.ts::nextStreamSequence`).
-  const transmitKeys = new TransmitKeyManager(SENDER_ID);
   const egress = new EgressPipeline({
     metrics,
     transmitKeys,
@@ -399,5 +401,71 @@ describe('multi-target send', () => {
       expect(reverse.senders.get(url)!.sent).toHaveLength(1);
       expect(hopSequenceOf(reverse.senders.get(url)!.sent[0]!)).toBe(0);
     }
+  });
+});
+
+describe('gop_counter: one value per frame, above the fan-out (ADR-0036 §2)', () => {
+  it('stamps IDENTICAL gop_counter on every target and advances it once per audio frame', async () => {
+    const rig = await makeRig([FIRST, SECOND, THIRD]);
+    rig.egress.setTargets({ targets: [FIRST, SECOND, THIRD], headerVersion: HEADER_VERSION });
+    for (let byte = 1; byte <= 3; byte += 1) await rig.submit(byte);
+    await settle();
+
+    for (const url of [FIRST, SECOND, THIRD]) {
+      const gops = rig.senders.get(url)!.sent.map((f) => decodeFrame(f).gopCounter);
+      // Every Opus frame is independently decodable, so every frame starts a
+      // group: 0, 1, 2 on EVERY lane — never 0..8 across three lanes.
+      expect(gops, url).toEqual([0, 1, 2]);
+      for (const f of rig.senders.get(url)!.sent) {
+        expect(decodeFrame(f).flags.independentlyDecodable).toBe(true);
+      }
+    }
+    // Exactly three consumed on the ONE owner, whatever the target count.
+    expect(rig.transmitKeys.nextGopCounter(1)).toBe(3);
+  });
+
+  it('an exhausted stream sends nothing, consumes no sequence, and counts once per ACTIVE lane', async () => {
+    // The u32::MAX boundary itself is pinned on the owner
+    // (`transmitKeys.gopExhaustion.test.ts`); here the owner reports exhaustion
+    // and the egress path's reaction is what is under test.
+    class ExhaustedKeys extends TransmitKeyManager {
+      override nextGopCounter(): number | null {
+        return null;
+      }
+    }
+    const keys = new ExhaustedKeys(SENDER_ID);
+    // THIRD is known to the rig but NOT directed, so it must not be counted.
+    const rig = await makeRig([FIRST, SECOND, THIRD], keys);
+    rig.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
+
+    await rig.submit(1);
+    await rig.submit(2);
+    await settle();
+
+    for (const sender of rig.senders.values()) expect(sender.sent).toEqual([]);
+    expect(rig.egress.framesSent).toBe(0);
+    // Two frames x two active lanes: the attempts that would have been made, so
+    // `frames_sent + send_dropped` stays a per-lane attempt total.
+    expect(rig.reasons()).toEqual([
+      'gop_counter_exhausted',
+      'gop_counter_exhausted',
+      'gop_counter_exhausted',
+      'gop_counter_exhausted',
+    ]);
+    // Refused BEFORE the nonce is allocated: no stream sequence was consumed.
+    expect(keys.nextStreamSequence(1)).toBe(0);
+  });
+
+  it('an exhausted stream with no directed target counts nothing (send nothing is not a drop)', async () => {
+    class ExhaustedKeys extends TransmitKeyManager {
+      override nextGopCounter(): number | null {
+        return null;
+      }
+    }
+    const rig = await makeRig([FIRST], new ExhaustedKeys(SENDER_ID));
+    rig.egress.setTargets({ targets: [], headerVersion: HEADER_VERSION });
+    await rig.submit(1);
+    await settle();
+    expect(rig.reasons()).toEqual([]);
   });
 });

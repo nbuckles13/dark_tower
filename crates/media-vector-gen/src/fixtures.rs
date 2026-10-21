@@ -98,7 +98,7 @@ pub const KEK_GENERATION: u16 = 1;
 
 /// Legible ASCII plaintext, so a reader can tell fixture from ciphertext on
 /// sight without decoding anything.
-pub const PLAINTEXT: &[u8] = b"dark-tower frame v2 vector plaintext";
+pub const PLAINTEXT: &[u8] = b"dark-tower frame v3 vector plaintext";
 
 #[cfg(test)]
 mod tests {

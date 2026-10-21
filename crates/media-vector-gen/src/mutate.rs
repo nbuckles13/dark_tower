@@ -18,7 +18,10 @@ use crate::error::GenError;
 use crate::json::Offsets;
 use crate::json::Row;
 use media_protocol::codec::decode_datagram;
-use media_protocol::frame::{FLAGS_OFFSET, PAYLOAD_LENGTH_OFFSET, VERSION_OFFSET};
+use media_protocol::frame::{
+    FLAGS_OFFSET, FLAG_DISCARDABLE, GOP_COUNTER_OFFSET, PAYLOAD_LENGTH_OFFSET, PROTOCOL_VERSION,
+    VERSION_OFFSET,
+};
 
 /// Apply a mutation to a built row, re-deriving the offsets that remain
 /// meaningful and recording the reject reason.
@@ -53,6 +56,20 @@ fn mutated(
     reason: &'static str,
     expected: serde_json::Value,
 ) -> Row {
+    mutated_with(base, frame, name, description, kind, Some(reason), expected)
+}
+
+/// [`mutated`], for a row that may carry no reject reason (the relay-rewrite
+/// row, which is accepted).
+fn mutated_with(
+    base: &Row,
+    frame: &[u8],
+    name: &'static str,
+    description: &'static str,
+    kind: &'static str,
+    reason: Option<&'static str>,
+    expected: serde_json::Value,
+) -> Row {
     let mut offsets = base.offsets.clone();
     let mut decoded = base.decoded.clone();
     let mut derived = base.derived.clone();
@@ -67,6 +84,7 @@ fn mutated(
         };
         decoded.payload_length = narrow(view.payload_length());
         decoded.stream_sequence = view.stream_sequence();
+        decoded.gop_counter = view.gop_counter();
         decoded.stream_id = view.stream_id();
         decoded.hop_sequence = view.hop_sequence();
 
@@ -147,7 +165,7 @@ fn mutated(
         decoded,
         derived,
         crypto: base.crypto.clone(),
-        reject_reason: Some(reason.to_string()),
+        reject_reason: reason.map(ToString::to_string),
         expected: Some(expected),
     }
 }
@@ -295,17 +313,34 @@ pub fn decode_reject_rows(base_frame: &[u8], base: &Row) -> Result<Vec<Row>, Gen
 
     // Version byte at a named offset, not a literal position.
     let mut f = base_frame.to_vec();
-    set_byte(&mut f, VERSION_OFFSET, 1)?;
+    set_byte(&mut f, VERSION_OFFSET, PROTOCOL_VERSION.saturating_add(1))?;
     push_reject(
         base,
         &mut out,
         "decode_reject_unknown_version",
-        "Version byte set to 1. There is deliberately no v1 decode path: at the commit that \
-         introduced v2 nothing deployed spoke v1, so a live v1 branch would have been a \
-         downgrade surface with no legitimate caller.",
+        "Version byte set to 4, one past the only version (3). There is no forward \
+         compatibility: an unknown version is terminal even on a one-byte buffer (§2 decode \
+         step 2), and the version field is the extension path.",
         "unknown_version",
         &f,
-        "frame[VERSION_OFFSET] = 1",
+        "frame[VERSION_OFFSET] = 4",
+    )?;
+
+    // v2-labelled: every other byte a valid v3 frame. R-22: v3 is the only
+    // version, with no allowlist, no floor and no dual decode.
+    let mut f = base_frame.to_vec();
+    set_byte(&mut f, VERSION_OFFSET, 2)?;
+    push_reject(
+        base,
+        &mut out,
+        "decode_reject_v2_labelled",
+        "Version byte set to 2, every other byte a valid v3 frame. Header v3 is the ONLY version \
+         (ADR-0036 §2, R-22): there is no allowlist, no floor and no dual decode, so a v2 peer \
+         is refused loudly as unknown_version — never decoded under the v2 layout, which lacks \
+         the 4-byte gop_counter and would misread every later field.",
+        "unknown_version",
+        &f,
+        "frame[VERSION_OFFSET] = 2",
     )?;
 
     // Undefined flag bit. This is the covert-channel closure: v1 masked unknown
@@ -324,6 +359,8 @@ pub fn decode_reject_rows(base_frame: &[u8], base: &Row) -> Result<Vec<Row>, Gen
         &f,
         "frame[FLAGS_OFFSET] |= 0x80",
     )?;
+
+    flag_byte_rejects(base_frame, base, &mut out)?;
 
     // Declared payload length over MAX_PAYLOAD_BYTES: the parsing trust
     // boundary. Enforced BEFORE any allocation.
@@ -388,6 +425,54 @@ pub fn decode_reject_rows(base_frame: &[u8], base: &Row) -> Result<Vec<Row>, Gen
     extension_and_framing_rejects(base_frame, base, ext_len_range, &mut out)?;
 
     Ok(out)
+}
+
+/// The two flag-byte rejects beyond bit 7: the lowest undefined bit, and the
+/// v3 key-bearing-with-discardable combination (§2 decode step 5).
+///
+/// Split out of [`decode_reject_rows`] rather than suppressing
+/// `too_many_lines`; both mutate only the flag byte.
+///
+/// # Errors
+///
+/// [`GenError::Encode`] if either mutation fails to produce its intended reject
+/// reason.
+fn flag_byte_rejects(base_frame: &[u8], base: &Row, out: &mut Vec<Row>) -> Result<(), GenError> {
+    // The LOWEST undefined bit, so both ends of the 0xF8 undefined mask are
+    // pinned: a decoder whose mask were 0x0F would pass the bit-7 row.
+    let mut f = base_frame.to_vec();
+    xor_byte(&mut f, FLAGS_OFFSET, 0b0000_1000)?;
+    push_reject(
+        base,
+        out,
+        "decode_reject_reserved_flag_bit_3",
+        "Flag bit 3 set — the lowest undefined bit, so the 0xF8 undefined mask is pinned at both \
+         ends (bit 7 above, bit 3 here). A decoder whose legal mask were 0x0F instead of 0x07 \
+         passes the bit-7 row and fails this one.",
+        "reserved_flag_bit_set",
+        &f,
+        "frame[FLAGS_OFFSET] |= 0x08",
+    )?;
+
+    // Key-bearing AND discardable (v3, §2 decode step 5). The base is
+    // key-bearing; set discardable. No encoder can produce this frame — every
+    // conforming encoder refuses it — so it exists only as a mutation.
+    let mut f = base_frame.to_vec();
+    xor_byte(&mut f, FLAGS_OFFSET, FLAG_DISCARDABLE)?;
+    push_reject(
+        base,
+        out,
+        "decode_reject_key_bearing_discardable",
+        "A key-bearing frame with the discardable flag set (flags 0x07). New in header v3 (§2 \
+         decode step 5): a frame carrying a new transmit key must never be droppable, or a \
+         receiver that dropped it could not open what follows (§4). Decidable from the flag \
+         byte alone, after the reserved-bit check and before any length check.",
+        "key_bearing_discardable",
+        &f,
+        "frame[FLAGS_OFFSET] |= 0x02 (base is key-bearing)",
+    )?;
+
+    Ok(())
 }
 
 /// The two rejects that are not single-field header mutations.
@@ -523,16 +608,41 @@ pub fn tamper_rows(base_frame: &[u8], base: &Row) -> Result<Vec<Row>, GenError> 
 
     // Flip a bit in the signature itself.
     let sig = view.signature_range();
+    // Flip a bit in the v3 GoP counter: inside the fixed prefix, so it is
+    // signed AND associated data. Every u32 is a legal gop_counter, so the
+    // mutated frame still DECODES; only verification can catch it.
     let mut frame = base_frame.to_vec();
-    xor_byte(&mut frame, sig.start, 0x01)?;
+    xor_byte(&mut frame, GOP_COUNTER_OFFSET, 0x01)?;
     if decode_datagram(&frame).is_err() {
         return Err(GenError::Encode {
-            detail: "tampered signature must still DECODE".to_string(),
+            detail: "tampered gop_counter must still DECODE: every u32 is a legal value"
+                .to_string(),
         });
     }
     out.push(mutated(
         base,
         frame.as_slice(),
+        "tamper_gop_counter",
+        "One bit flipped in the v3 gop_counter (offset 10). Every u32 is a legal value, so the \
+         frame still DECODES and no parse check can catch this — only the signature can. The \
+         field is in the publisher region, so it is signed AND associated data: a relay that \
+         rewrote it (to fake a group start for MH's switching, say) fails verification at \
+         every receiver.",
+        "verify_reject",
+        "signature_invalid",
+        serde_json::json!({
+            "mutation": "frame[GOP_COUNTER_OFFSET] ^= 0x01",
+            "decodes": true,
+            "signature_valid": false,
+            "would_decrypt_if_verification_skipped": false,
+            "_assert": "Must still decode, and verification must fail. Decryption would ALSO \
+                        fail (gop_counter is in the AAD), but the signature is checked first."
+        }),
+    ));
+
+    out.push(mutated(
+        base,
+        frame_sig(base_frame, sig.start)?.as_slice(),
         "tamper_signature",
         "One bit flipped in the trailing signature. The publisher region and payload are \
          untouched, so this frame DECRYPTS correctly and only verification fails — the mirror \
@@ -548,6 +658,76 @@ pub fn tamper_rows(base_frame: &[u8], base: &Row) -> Result<Vec<Row>, GenError> 
         }),
     ));
     Ok(out)
+}
+
+/// The base frame with one bit of its signature flipped.
+fn frame_sig(base_frame: &[u8], at: usize) -> Result<Vec<u8>, GenError> {
+    let mut frame = base_frame.to_vec();
+    xor_byte(&mut frame, at, 0x01)?;
+    if decode_datagram(&frame).is_err() {
+        return Err(GenError::Encode {
+            detail: "tampered signature must still DECODE".to_string(),
+        });
+    }
+    Ok(frame)
+}
+
+/// The relay-rewrite row: the base (uplink) frame with its relay region
+/// rewritten to a downlink value, which still verifies and decrypts.
+///
+/// The rewrite goes through `media_protocol::codec::rewrite_relay_region`, the
+/// relay's own entry point. What the row pins is not the rewrite mechanics but
+/// the **span claim**: the relay region is outside both the signature and the
+/// AEAD associated data, so a changed `stream_id`/`hop_sequence` leaves the
+/// signed input and the AAD byte-identical to the base row's.
+///
+/// # Errors
+///
+/// [`GenError::Encode`] if the rewrite fails or the spans moved.
+pub fn relay_rewrite_row(base_frame: &[u8], base: &Row) -> Result<Row, GenError> {
+    let mut frame = base_frame.to_vec();
+    // A downlink slot id that is neither audio's nor video's send id, so it
+    // cannot be mistaken for the uplink value.
+    let slot_id: u16 = 0x0007;
+    let hop: u32 = 0x0000_002A;
+    media_protocol::codec::rewrite_relay_region(&mut frame, slot_id, hop).map_err(|e| {
+        GenError::Encode {
+            detail: format!("relay rewrite failed: {e:?}"),
+        }
+    })?;
+    let row = mutated_with(
+        base,
+        &frame,
+        "relay_rewrite_still_verifies",
+        "relay_rewrite_base_uplink with its relay region rewritten as MH does on the DOWNLINK: \
+         stream_id from the publisher's send id (0, audio) to a subscriber slot id (7), and a \
+         new hop_sequence. The signature, the AEAD associated data and the signed input are \
+         byte-identical to the base row's, so the frame still verifies and decrypts: the relay \
+         region is outside both (§2, §3, §4). This is what lets MH rewrite per subscriber — and \
+         why the uplink stream_id is a publisher-set, unauthenticated attribution label.",
+        "relay_rewrite",
+        None,
+        serde_json::json!({
+            "rewritten_from": base.name,
+            "mutation": "relay stream_id := 0x0007, hop_sequence := 0x0000002A",
+            "decodes": true,
+            "signature_valid": true,
+            "decrypts": true,
+            "_assert": "Verify against the base row's identity key and decrypt with its transmit \
+                        key; assert derived.signed_input_hex and derived.aead_aad_hex EQUAL the \
+                        base row's while the relay bytes differ."
+        }),
+    );
+    if row.derived.signed_input_hex != base.derived.signed_input_hex
+        || row.derived.aead_aad_hex != base.derived.aead_aad_hex
+    {
+        return Err(GenError::SpanDisagreement {
+            span: "relay rewrite moved the signed input or the AAD",
+            spec_derived: base.derived.signed_input_hex.len(),
+            codec_derived: row.derived.signed_input_hex.len(),
+        });
+    }
+    Ok(row)
 }
 
 /// Wrong transmit key and wrong KEK: two AES-GCM failures, opposite teams.

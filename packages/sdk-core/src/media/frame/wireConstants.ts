@@ -3,7 +3,7 @@
 // GENERATED — DO NOT EDIT.
 //
 //   Renderer: packages/sdk-core/scripts/gen-wire-constants.mjs
-//   Source:   proto/test-vectors/frame-v2.vectors.json
+//   Source:   proto/test-vectors/frame-v3.vectors.json
 //   Regenerate: node packages/sdk-core/scripts/gen-wire-constants.mjs --write
 //
 // ---------------------------------------------------------------------------
@@ -14,7 +14,7 @@
 //   crates/media-protocol/src/frame.rs        <- the origin; the constants are declared here
 //        |  guard g2 / g3 / g4 (scripts/guards/simple/validate-frame-vectors.sh)
 //        v
-//   proto/test-vectors/frame-v2.vectors.json
+//   proto/test-vectors/frame-v3.vectors.json
 //        |  __tests__/wireConstants.drift.test.ts  (re-render + byte-compare)
 //        v
 //   this file
@@ -35,7 +35,7 @@
 // `sframe.ts`). Renaming these to TypeScript casing would break that link.
 
 /** Frame header version. ADR-0036 §2; mirrors `frame.rs::PROTOCOL_VERSION`. */
-export const HEADER_VERSION = 2;
+export const HEADER_VERSION = 3;
 
 /**
  * Maximum payload length, enforced BEFORE the payload slice is taken.
@@ -60,12 +60,14 @@ export const WIRE_CONSTANTS = {
   aead_tag_bytes: 16,
   key_id_bytes: 8,
   relay_region_bytes: 6,
-  publisher_fixed_prefix_bytes: 10,
+  publisher_fixed_prefix_bytes: 14,
+  gop_counter_field_bytes: 4,
   wrapped_transmit_key_bytes: 50,
   kek_generation_field_bytes: 2,
   wrapped_transmit_key_material_bytes: 32,
   ext_length_field_bytes: 2,
   max_ext_bytes: 3,
+  max_header_bytes: 75,
   max_payload_bytes: 1048576,
   cipher_suite_id: 5,
   key_id_layout: {

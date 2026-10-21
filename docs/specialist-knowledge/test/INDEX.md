@@ -32,8 +32,8 @@
 - Release-build-profile + env-config guards + e2e → `crates/dt-guard/src/release_build_profile.rs`, `env_config.rs`, `tests/release_build_profile_e2e.rs`; internal-proto no-key-material self-test → `scripts/guards/validate-internal-proto-no-key-material.test.sh`
 
 ## Media Path Tests (ADR-0036)
-- Cross-language frame-v2 vector generator (non-production reference crypto; only independent check on TS) + suites → `crates/media-vector-gen/src/lib.rs`, `crates/media-vector-gen/tests/`
-- Committed vectors + pinned external SFrame-WG anchor + row manifest; freshness guard (g11) → `proto/test-vectors/frame-v2.vectors.json`, `proto/test-vectors/external/sframe-wg/`, `scripts/guards/simple/validate-frame-vectors.sh`
+- Cross-language frame-v3 vector generator (non-production reference crypto; only independent check on TS) + suites → `crates/media-vector-gen/src/lib.rs`, `crates/media-vector-gen/tests/`
+- Committed vectors + pinned external SFrame-WG anchor + row manifest; freshness guard (g11) → `proto/test-vectors/frame-v3.vectors.json`, `proto/test-vectors/external/sframe-wg/`, `scripts/guards/simple/validate-frame-vectors.sh`
 - SDK frame/receive-path, multi-sender pipeline, KEK retention/source, test tone, hot-path layout → `packages/sdk-core/src/media/{frame,lifecycle,pipeline,setup}/__tests__/`, `src/config/__tests__/kekRetention.test.ts`, `src/media/__tests__/hotPathLayout.test.ts`
 - SDK source-scan suites (join-label spread, server-message sinks) + bundle tone-marker check → `packages/sdk-core/src/__tests__/joinLabelSpread.test.ts`, `serverMessageSinkScan.test.ts`, `packages/sdk-core/tests/bundle-content.test.ts`
 - MC slot placement, admission, KEK rotation, server mute, teardown, coordination + rig → `crates/mc-service/tests/slot_placement_integration.rs`, `media_*_integration.rs`, `kek_rotation_integration.rs`, `server_mute_integration.rs`, `meeting_teardown_integration.rs`, `tests/common/media_session.rs`

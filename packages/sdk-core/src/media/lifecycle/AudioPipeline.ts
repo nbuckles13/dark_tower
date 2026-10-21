@@ -21,7 +21,7 @@
 // over the wrong range. Every one of those produces a working demo.
 //
 // The only evidence of crypto correctness is the codec task's externally
-// anchored vectors — `proto/test-vectors/frame-v2.vectors.json`, the vendored
+// anchored vectors — `proto/test-vectors/frame-v3.vectors.json`, the vendored
 // sframe-wg key-schedule vectors, and the conformance suite that runs both. This
 // module does not weaken, regenerate, or route around them. If a vector row ever
 // appears to need changing to accommodate this pipeline, that is a finding to
@@ -43,7 +43,7 @@ import { ReplayWindow, TransmitKeyCache } from '../frame/receivePath.js';
 import type { MediaConfig } from '../../config/clientConfig.js';
 import { ClientConfigError, validateMediaConfig } from '../../config/clientConfig.js';
 import { EgressPipeline, type DatagramSender } from '../pipeline/egress.js';
-import { isSendableHeaderVersion } from '../frame/frameCodec.js';
+import { isSupportedHeaderVersion } from '../frame/frameCodec.js';
 import { IngressPipeline, type AcceptedFrame } from '../pipeline/ingress.js';
 import { ReceiveLanes, type SlotAssignment } from '../pipeline/receiveLanes.js';
 import { FirstMediaObserver } from '../setup/measurement.js';
@@ -115,7 +115,7 @@ export interface MediaFrameCounts {
    * The most recent reject token, or `undefined` before the first drop.
    *
    * Bounded by TYPE, not by convention: `RejectReason` is the closed union of
-   * every token in `proto/test-vectors/frame-v2.vectors.json`,
+   * every token in `proto/test-vectors/frame-v3.vectors.json`,
    * so no participant, key or payload string can reach this field and compile.
    */
   readonly lastDropReason: RejectReason | undefined;
@@ -629,21 +629,16 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    */
   setSendDirective(requested: AudioSendDirective): void {
     let directive = requested;
-    if (isSendableHeaderVersion(requested.headerVersion)) {
+    if (isSupportedHeaderVersion(requested.headerVersion)) {
       // A valid directive ends a refusal EPISODE: re-arm the fault so a later
       // bad directive is reported again rather than latched once per session.
       this.#rearmFault(MediaFaultStage.Config, UNSENDABLE_HEADER_VERSION_FAULT);
     } else {
-      // FAIL-CLOSED. Never a fallback to v2 or to `HEADER_VERSION`: the version
-      // is signed and MC-directed, and guessing one is how a downgrade goes
-      // unnoticed. Applied as SEND NOTHING (§5), through the same path as any
-      // withdrawal, so a later valid directive resumes on the empty→non-empty
-      // edge and rotates the transmit key exactly as it does today.
-      //
-      // This also refuses a directed 3 until P2 (task 6) lands the GoP counter
-      // owner. P2 enables v3 by removing the explicit v3 exclusion from
-      // `SENDABLE_HEADER_VERSIONS` in the same edit that wires that owner; no
-      // edit is needed here.
+      // FAIL-CLOSED. Never a fallback to `HEADER_VERSION`: the version is
+      // MC-directed, and guessing one is how a mismatch goes unnoticed. Applied
+      // as SEND NOTHING (§5), through the same path as any withdrawal, so a
+      // later valid directive resumes on the empty→non-empty edge and rotates
+      // the transmit key exactly as it does today.
       this.#fault(MediaFaultStage.Config, UNSENDABLE_HEADER_VERSION_FAULT, false);
       directive = { ...requested, targets: [] };
     }

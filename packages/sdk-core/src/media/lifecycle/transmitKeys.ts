@@ -19,10 +19,11 @@
 //
 // So:
 //
-//   * `#generation` and `#streamSequences` are fields on THIS object, which is
-//     session-scoped and is not rebuilt on mute/unmute, on a directive change,
-//     or on resume-from-empty.
-//   * **There is no reset method.** No code path returns a sequence to zero.
+//   * `#generation`, `#streamSequences` and `#gopCounters` are fields on THIS
+//     object, which is session-scoped and is not rebuilt on mute/unmute, on a
+//     directive change, or on resume-from-empty.
+//   * **There is no reset method.** No code path returns a sequence or a GoP
+//     counter to zero.
 //   * `rotate()` increments the generation UNCONDITIONALLY. There is no branch
 //     under which a rotation fails to advance it — a conditional bump is exactly
 //     the shape that produces the hazard above.
@@ -65,6 +66,11 @@
 //     check and no ceiling vector — and an author who adds one is adding dead
 //     code, while an author who reads the omission as an oversight might instead
 //     conclude the sequence may be reset, which is the actual hazard.
+//     The `gop_counter` (same width, same rate for audio) is the exception
+//     because ADR-0036 §2 REQUIRES its stop: `nextGopCounter` returns `null`
+//     after `u32::MAX`, and `egress.ts::submit` takes it before the sequence,
+//     so for audio the GoP stop also halts the stream before its sequence
+//     could wrap. That is a consequence, not a sequence ceiling.
 //   * **Reconnect** — UNREACHABLE THIS STORY. `MediaTransport` performs no
 //     reconnect, `MeetingSession` is single-use per join, and no path restarts
 //     the pipeline against a new transport while this object survives. It
@@ -142,9 +148,16 @@
 
 import { aesGcmSeal, AES_256_KEY_BYTES, wrapNonce } from '../frame/sframe.js';
 import { packKeyId } from '../frame/keyId.js';
+import { WIRE_CONSTANTS } from '../frame/wireConstants.js';
 import type { WrappedTransmitKey } from '../frame/frameCodec.js';
 import type { Bytes } from '../frame/hex.js';
 import type { KekWrapSource } from '../setup/kekSource.js';
+
+/**
+ * The last legal `gop_counter` value: `u32::MAX`, derived from the SSoT field
+ * width rather than written as a literal.
+ */
+const GOP_COUNTER_MAX = 2 ** (8 * WIRE_CONSTANTS.gop_counter_field_bytes) - 1;
 
 /** Everything the egress path needs to seal and announce one frame. */
 export interface TransmitKeyMaterial {
@@ -191,6 +204,15 @@ export class TransmitKeyManager {
    * required.
    */
   readonly #streamSequences = new Map<number, number>();
+
+  /**
+   * Per-stream NEXT `gop_counter` value (ADR-0036 §2). NEVER RESET — not on
+   * rotation, mute, a directive change, or `clear()` — and never wrapped: a
+   * stream whose last issued value was `u32::MAX` holds `GOP_COUNTER_MAX + 1`
+   * here forever, which is the exhausted state. Stream identity: never logged,
+   * labelled, traced or put on the test bus (R-30), so no getter exposes it.
+   */
+  readonly #gopCounters = new Map<number, number>();
 
   /** The current key per stream number, invalidated wholesale by `rotate()`. */
   #current = new Map<number, TransmitKeyMaterial>();
@@ -437,12 +459,37 @@ export class TransmitKeyManager {
   }
 
   /**
+   * Take the `gop_counter` for the next GROUP on `streamNumber`, or `null` once
+   * the stream is exhausted.
+   *
+   * ADR-0036 §2: per (sender, stream), increments on every independently
+   * decodable frame, every frame of a group carries its group-starting frame's
+   * value, never resets while the sender id lives, and NEVER WRAPS — at
+   * `u32::MAX` "the sender stops that stream, counts it, and resumes only under
+   * a fresh stream number or sender id". So the values issued are exactly
+   * `0..=u32::MAX`, then `null` on every later call for the life of this
+   * manager. Counting the stop is the caller's (`egress.ts::submit`, per lane).
+   *
+   * Call it ONCE PER GROUP START, never per target. For audio every frame starts
+   * a group, so `egress.ts::submit` calls it once per frame above the fan-out —
+   * the same ownership discipline, and the same one-manager-per-sender rule, as
+   * {@link nextStreamSequence}: identical sealed bytes on every target. Video
+   * (C-A2) calls it on keyframes and adds no second counter.
+   */
+  nextGopCounter(streamNumber: number): number | null {
+    const next = this.#gopCounters.get(streamNumber) ?? 0;
+    if (next > GOP_COUNTER_MAX) return null;
+    this.#gopCounters.set(streamNumber, next + 1);
+    return next;
+  }
+
+  /**
    * Drop every key, overwriting the buffers first.
    *
    * ADR-0028 §5's explicit cleanup. Note this deliberately does NOT reset the
-   * generation or the sequences: teardown ends the session, and a manager that
-   * survived teardown with reset counters would be the hazard this module's
-   * header describes.
+   * generation, the sequences or the GoP counters: teardown ends the session,
+   * and a manager that survived teardown with reset counters would be the
+   * hazard this module's header describes.
    *
    * ---------------------------------------------------------------------------
    * OVERWRITING HAPPENS HERE AND **NOT** IN `rotate()`, DELIBERATELY

@@ -1,8 +1,8 @@
-//! Frame-v2 fixtures for the media forward-path suites.
+//! Frame-v3 fixtures for the media forward-path suites.
 //!
 //! # One home, and why it is here rather than in `mh-test-utils`
 //!
-//! Three integration binaries build frame-v2 datagrams
+//! Three integration binaries build frame-v3 datagrams
 //! (`media_forward_integration`, `media_backpressure_integration`,
 //! `media_metrics_integration`), and a copy in each would be three places to
 //! find when the header moves. This directory is already the shared home for
@@ -114,6 +114,10 @@ pub fn audio_datagram_shaped(stream_sequence: u32, marker: u8, shape: FrameShape
             key_bearing: matches!(shape, FrameShape::KeyBearing),
         },
         stream_sequence,
+        // Audio is independently decodable on every frame, so its GoP counter
+        // advances with every frame exactly as the stream sequence does
+        // (ADR-0036 §2). Same rule as the env-tests twin.
+        gop_counter: stream_sequence,
         wrapped_transmit_key: match shape {
             FrameShape::KeyBearing => Some(wrapped),
             FrameShape::Minimal | FrameShape::WithExtensions => None,
@@ -122,6 +126,10 @@ pub fn audio_datagram_shaped(stream_sequence: u32, marker: u8, shape: FrameShape
             FrameShape::WithExtensions => &extensions,
             FrameShape::Minimal | FrameShape::KeyBearing => &[],
         },
+        // Deliberately NOT the real audio send id (0), unlike the env-tests
+        // twin's `AUDIO_SEND_ID`: the forward-integration suite asserts the
+        // rewrite to `MAIN_AUDIO_SLOT` (0), which an uplink 0 would make
+        // vacuous. MH-A1 reworks this fixture together with attribution.
         stream_id: 0xFFFF,
         hop_sequence: 0xDEAD_BEEF,
         payload: &payload,

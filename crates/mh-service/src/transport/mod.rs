@@ -170,10 +170,11 @@
 //! a `read_frame() -> Vec<u8>` shape would allocate from an attacker-controlled
 //! length prefix before any cap could apply, silently foreclosing §11's ingress
 //! denial-of-service cap ("maximum frame payload before any allocation"). The
-//! `media-protocol` codec is already built for this: `peek_frame_len` reports a
-//! length from a bounded prefix so a reader can check it against
-//! `MAX_PAYLOAD_BYTES` before reserving. Any future method here must preserve
-//! that ordering.
+//! `media-protocol` codec is already built for this: `parse_header_prefix` and
+//! the chunk-fed `media_protocol::reader::HeaderReader` reject a declared length
+//! over `MAX_PAYLOAD_BYTES` from the bounded fixed prefix, before anything is
+//! reserved, and report the frame length only once the header is valid. Any
+//! future method here must preserve that ordering.
 //!
 //! On the datagram path the ordering is already safe: `recv_datagram` yields a
 //! [`Bytes`] that is a slice of a buffer the transport already owns, so the

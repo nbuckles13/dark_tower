@@ -4,7 +4,7 @@
 // SFrame object, and the KEK unwrap.
 //
 // ANCHOR (DRY): every wire constant here comes from `./wireConstants.js`, which
-// is RENDERED from `proto/test-vectors/frame-v2.vectors.json` — the cross-language
+// is RENDERED from `proto/test-vectors/frame-v3.vectors.json` — the cross-language
 // SSoT. Sites below read `WIRE_CONSTANTS.cipher_suite_id` and
 // `WIRE_CONSTANTS.aead_tag_bytes` by their SSoT spellings. Never hardcode a second
 // copy of any of them: the number's origin is `crates/media-protocol/src/frame.rs`,

@@ -20,6 +20,10 @@ IFS=$'\n\t'
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${HERE}/../.." && pwd)"
 GUARD="${HERE}/simple/validate-frame-vectors.sh"
+# The vectors file, relative to a tree root: ONE home, so the next header
+# version bump is a one-line edit. Exported because the mutators run under
+# `bash -c '...'`, which expands it in the child.
+export VEC="proto/test-vectors/frame-v3.vectors.json"
 
 PASS=0
 FAIL=0
@@ -35,7 +39,7 @@ new_tree() {
            "$d/crates/media-protocol/src" \
            "$d/crates/media-vector-gen/tests" \
            "$d/docs"
-  cp "$REPO/proto/test-vectors/frame-v2.vectors.json" "$d/proto/test-vectors/"
+  cp "$REPO/$VEC" "$d/proto/test-vectors/"
   cp "$REPO"/proto/test-vectors/external/sframe-wg/* "$d/proto/test-vectors/external/sframe-wg/"
   cp "$REPO/crates/media-protocol/src/frame.rs" "$d/crates/media-protocol/src/"
   cp "$REPO/crates/media-protocol/src/codec.rs" "$d/crates/media-protocol/src/"
@@ -114,8 +118,8 @@ ungate_typescript() {
   # reachable, which is the exact failure this suite exists to prevent
   # (@infrastructure R1, demonstrated by mutation).
   jq ".gated_by.typescript = false | .cross_language_property_established = ${established}" \
-    "$tree/proto/test-vectors/frame-v2.vectors.json" > "$tree/ug" \
-    && mv "$tree/ug" "$tree/proto/test-vectors/frame-v2.vectors.json" \
+    "$tree/$VEC" > "$tree/ug" \
+    && mv "$tree/ug" "$tree/$VEC" \
     || return 1
   # The EXACT literal, inside a TODO-entry-shaped line. Load-bearing for the
   # `-MOVED` case, whose whole point is that `<!-- frame-vectors-ts-leg-MOVED -->`
@@ -151,9 +155,9 @@ expect() {
 echo "validate-frame-vectors self-test"
 
 # --- vacuity bails: every missing input must be LOUD, never a skip -----------
-expect "vectors-missing"      1 'PRECONDITION \[vectors-missing\]'      rm proto/test-vectors/frame-v2.vectors.json
-expect "vectors-unparseable"  1 'PRECONDITION \[vectors-unparseable\]'  bash -c 'echo "{" > proto/test-vectors/frame-v2.vectors.json'
-expect "banner-missing"       1 'PRECONDITION \[banner-missing\]'       bash -c 'jq "del(._non_production)" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
+expect "vectors-missing"      1 'PRECONDITION \[vectors-missing\]'      rm $VEC
+expect "vectors-unparseable"  1 'PRECONDITION \[vectors-unparseable\]'  bash -c 'echo "{" > $VEC'
+expect "banner-missing"       1 'PRECONDITION \[banner-missing\]'       bash -c 'jq "del(._non_production)" $VEC > t && mv t $VEC'
 expect "rust-const-not-found" 1 'PRECONDITION \[rust-const-not-found\]' bash -c 'sed -i "s/^pub const MAX_PAYLOAD_BYTES/pub const RENAMED_MAX_PAYLOAD/" crates/media-protocol/src/frame.rs'
 expect "flag-consts-not-found" 1 'PRECONDITION \[rust-flag-consts-not-found\]' bash -c 'sed -i "s/^pub const FLAG_DISCARDABLE/pub const RENAMED_FLAG/" crates/media-protocol/src/frame.rs'
 expect "reject-macro-not-found" 1 'PRECONDITION \[reject-macro-not-found\]' bash -c 'sed -i "s/ => \"/ =X \"/g" crates/media-protocol/src/codec.rs'
@@ -163,7 +167,7 @@ expect "provenance-digest-not-found" 1 'PRECONDITION \[provenance-digest-not-fou
 expect "suite-list-empty"     1 'PRECONDITION \[suite-list-empty\]'     bash -c 'jq ".cipher_suites = []" proto/test-vectors/external/sframe-wg/manifest.json > t && mv t proto/test-vectors/external/sframe-wg/manifest.json'
 expect "generator-crate-missing (file)"   1 'PRECONDITION \[generator-crate-missing\]' rm crates/media-vector-gen/Cargo.toml
 expect "generator-crate-missing (member)" 1 'PRECONDITION \[generator-crate-missing\]' bash -c 'sed -i "s|\"crates/media-vector-gen\",||" Cargo.toml'
-expect "crypto-field-unclassified" 1 'PRECONDITION \[crypto-field-unclassified\]' bash -c 'jq "(.vectors[0].crypto.new_secret_hex) = \"aabb\"" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
+expect "crypto-field-unclassified" 1 'PRECONDITION \[crypto-field-unclassified\]' bash -c 'jq "(.vectors[0].crypto.new_secret_hex) = \"aabb\"" $VEC > t && mv t $VEC'
 
 # g15 anti-vacuity, PER SUITE. The aggregate form ("at least one row overall")
 # would pass this case, because 0x0004 survives — which is exactly the
@@ -179,31 +183,31 @@ expect "todo-tracking-entry-missing" 1 'PRECONDITION \[todo-tracking-entry-missi
   bash -c 'ungate_typescript . && sed -i "s/frame-vectors-ts-leg/frame-vectors-ts-leg-MOVED/" docs/TODO.md'
 
 # --- violations: wrong values, not missing inputs ----------------------------
-expect "g2 max_payload drift"  1 'VIOLATION.*g2 max_payload_bytes'  bash -c 'jq ".max_payload_bytes = 999" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
-expect "g3 header_version drift" 1 'VIOLATION.*g3 header_version'   bash -c 'jq ".header_version = 9" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
-expect "g4 flag mask drift"    1 'VIOLATION.*g4 legal_flag_mask'    bash -c 'jq ".wire_constants.legal_flag_mask = 15" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
+expect "g2 max_payload drift"  1 'VIOLATION.*g2 max_payload_bytes'  bash -c 'jq ".max_payload_bytes = 999" $VEC > t && mv t $VEC'
+expect "g3 header_version drift" 1 'VIOLATION.*g3 header_version'   bash -c 'jq ".header_version = 9" $VEC > t && mv t $VEC'
+expect "g4 flag mask drift"    1 'VIOLATION.*g4 legal_flag_mask'    bash -c 'jq ".wire_constants.legal_flag_mask = 15" $VEC > t && mv t $VEC'
 # g5 EQUALITY, not subset: deleting a token from the file must red. Subset would pass.
-expect "g5 deleted codec token" 1 'VIOLATION.*g5 codec reject tokens' bash -c 'jq "(.reject_reasons) |= map(select(.token != \"truncated\"))" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
-expect "g5b has_vector false with a row" 1 'VIOLATION.*g5b' bash -c 'jq "(.reject_reasons[] | select(.token==\"replay_detected\") | .has_vector) = false" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
-expect "g6 malformed token"    1 'VIOLATION.*g6 token'             bash -c 'jq "(.reject_reasons[0].token) = \"Bad-Token\"" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
-expect "g7 aad not a subset"   1 'VIOLATION.*g7'                   bash -c 'jq "(.vectors[0].derived.aead_aad_hex) = (.vectors[0].derived.signed_input_hex)" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
-expect "g9 vacuous near-miss"  1 'VIOLATION.*g9'                   bash -c 'jq "(.vectors[0].derived.naive_contiguous_signed_input_hex) = (.vectors[0].derived.signed_input_hex)" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
+expect "g5 deleted codec token" 1 'VIOLATION.*g5 codec reject tokens' bash -c 'jq "(.reject_reasons) |= map(select(.token != \"truncated\"))" $VEC > t && mv t $VEC'
+expect "g5b has_vector false with a row" 1 'VIOLATION.*g5b' bash -c 'jq "(.reject_reasons[] | select(.token==\"replay_detected\") | .has_vector) = false" $VEC > t && mv t $VEC'
+expect "g6 malformed token"    1 'VIOLATION.*g6 token'             bash -c 'jq "(.reject_reasons[0].token) = \"Bad-Token\"" $VEC > t && mv t $VEC'
+expect "g7 aad not a subset"   1 'VIOLATION.*g7'                   bash -c 'jq "(.vectors[0].derived.aead_aad_hex) = (.vectors[0].derived.signed_input_hex)" $VEC > t && mv t $VEC'
+expect "g9 vacuous near-miss"  1 'VIOLATION.*g9'                   bash -c 'jq "(.vectors[0].derived.naive_contiguous_signed_input_hex) = (.vectors[0].derived.signed_input_hex)" $VEC > t && mv t $VEC'
 expect "g10 digest mismatch"   1 'VIOLATION.*g10'                  bash -c 'printf "\n" >> proto/test-vectors/external/sframe-wg/test-vectors.json'
-expect "g13 reclassified secret" 1 'VIOLATION.*g13'                bash -c 'jq ".key_material_fields -= [\"kek_hex\"] | .derived_public_fields += [\"kek_hex\"]" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
-expect "g13 real-looking key material" 1 'VIOLATION.*g13'          bash -c 'jq "(.vectors[0].crypto.kek_hex) = \"9f3c1a77b20e45d8e1c9042fa6b7381d5c0e29b4a87f6612d3049ee1bb70c5a2\"" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
-expect "g16 crypto token typo"  1 'VIOLATION.*g16'                 bash -c 'jq "(.reject_reasons[] | select(.token==\"signature_invalid\") | .token) = \"signature_invald\"" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
+expect "g13 reclassified secret" 1 'VIOLATION.*g13'                bash -c 'jq ".key_material_fields -= [\"kek_hex\"] | .derived_public_fields += [\"kek_hex\"]" $VEC > t && mv t $VEC'
+expect "g13 real-looking key material" 1 'VIOLATION.*g13'          bash -c 'jq "(.vectors[0].crypto.kek_hex) = \"9f3c1a77b20e45d8e1c9042fa6b7381d5c0e29b4a87f6612d3049ee1bb70c5a2\"" $VEC > t && mv t $VEC'
+expect "g16 crypto token typo"  1 'VIOLATION.*g16'                 bash -c 'jq "(.reject_reasons[] | select(.token==\"signature_invalid\") | .token) = \"signature_invald\"" $VEC > t && mv t $VEC'
 
 # --- g7b: derived-vs-frame_hex correspondence, declared per row --------------
 # Mutating a byte inside the publisher region of a NON-mutated row makes its
 # derived block stop describing its own frame. Undeclared, that must red.
 expect "g7b undeclared derived/frame_hex divergence" 1 'VIOLATION.*g7b' \
-  bash -c 'jq "(.vectors[0].frame_hex) = (\"03\" + .vectors[0].frame_hex[2:])" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
+  bash -c 'jq "(.vectors[0].frame_hex) = (\"04\" + .vectors[0].frame_hex[2:])" $VEC > t && mv t $VEC'
 # A stale declaration on a row whose spans DO match is also wrong: it would tell
 # a consumer to skip a comparison that is in fact meaningful.
 expect "g7b stale derived_describes on a matching row" 1 'VIOLATION.*g7b' \
-  bash -c 'jq "(.vectors[0].expected) = {\"derived_describes\": \"base_frame_before_mutation\"}" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
+  bash -c 'jq "(.vectors[0].expected) = {\"derived_describes\": \"base_frame_before_mutation\"}" $VEC > t && mv t $VEC'
 expect "derived-note-missing" 1 'PRECONDITION \[derived-note-missing\]' \
-  bash -c 'jq "del(._comment_derived_on_reject_rows)" proto/test-vectors/frame-v2.vectors.json > t && mv t proto/test-vectors/frame-v2.vectors.json'
+  bash -c 'jq "del(._comment_derived_on_reject_rows)" $VEC > t && mv t $VEC'
 
 # --- g12: inert BY DECLARATION, and it really starts running when flipped -----
 # The point @dry-reviewer pressed at Gate 1: inert-by-declaration and

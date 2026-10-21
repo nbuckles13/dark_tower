@@ -18,7 +18,13 @@
     reason = "Test code: a panic is the failure report."
 )]
 
-const COMMITTED: &str = "../../proto/test-vectors/frame-v2.vectors.json";
+/// The committed file, located through the generator's own exported path
+/// rather than a second copy of the literal.
+fn committed() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(media_vector_gen::VECTOR_FILE_PATH)
+}
 
 fn regenerate() -> String {
     let file = media_vector_gen::build_vector_file().expect("generator must succeed");
@@ -29,8 +35,8 @@ fn regenerate() -> String {
 
 #[test]
 fn committed_file_matches_a_fresh_generation() {
-    let on_disk = std::fs::read_to_string(COMMITTED)
-        .expect("proto/test-vectors/frame-v2.vectors.json must exist");
+    let on_disk = std::fs::read_to_string(committed())
+        .unwrap_or_else(|e| panic!("{} must exist: {e}", media_vector_gen::VECTOR_FILE_PATH));
     let fresh = regenerate();
     if on_disk != fresh {
         let at = on_disk

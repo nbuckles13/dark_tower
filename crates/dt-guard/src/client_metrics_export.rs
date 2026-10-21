@@ -95,7 +95,7 @@ const MEETING_SESSION_TS: &str = "packages/sdk-core/src/session/MeetingSession.t
 const MH_METRICS_RS: &str = "crates/mh-service/src/observability/metrics.rs";
 const SDK_SRC: &str = "packages/sdk-core/src";
 const ALERTS_SUBDIR: &str = "infra/docker/prometheus/rules";
-const VECTORS_JSON: &str = "proto/test-vectors/frame-v2.vectors.json";
+const VECTORS_JSON: &str = "proto/test-vectors/frame-v3.vectors.json";
 const LABEL_TAXONOMY: &str = "docs/observability/label-taxonomy.md";
 
 /// The value the collector rewrites a shape-failing label value to.
@@ -210,6 +210,7 @@ const COUNTER_DIFF_FUNCS: &[&str] = &["increase", "rate", "irate", "delta", "ide
 pub const NOT_KEY_DELIVERY: &[(&str, &str)] = &[
     ("unknown_version", CODEC_SHAPE),
     ("reserved_flag_bit_set", CODEC_SHAPE),
+    ("key_bearing_discardable", CODEC_SHAPE),
     ("payload_length_exceeds_max", CODEC_SHAPE),
     ("payload_length_exceeds_available", CODEC_SHAPE),
     ("truncated", CODEC_SHAPE),
@@ -240,6 +241,30 @@ pub const NOT_KEY_DELIVERY: &[(&str, &str)] = &[
         "sender_not_assigned",
         "misrouting: a verified frame from a sender outside the client's MC slot assignment; \
          remedy is MC placement / MH forwarding (docs/observability/metrics/client.md)",
+    ),
+    (
+        "self_sender",
+        "receiver dropped its own echoed frame (assignment stage); a routing/assignment defect, \
+         not key delivery",
+    ),
+    (
+        "sender_server_muted",
+        "receiver dropped a frame from a sender it holds as server-muted; mute enforcement, not \
+         key delivery",
+    ),
+    (
+        "decode_over_bound",
+        "decoded output exceeds the receiving slot's configured bounds (post-decrypt, render \
+         stage); a sender/encoder conformance fault, not key delivery",
+    ),
+    (
+        "stream_partial_reset",
+        "stream reset mid-frame; transport/stream framing, not key delivery",
+    ),
+    (
+        "stream_slot_mismatch",
+        "relay stream_id is not one of the receiver's declared slots, or differs between frames \
+         on one stream; relay/stream structure, not key delivery",
     ),
 ];
 
@@ -1559,7 +1584,7 @@ fn enclosing_functions(s: &str, pos: usize) -> Vec<String> {
 // Vectors (G7).
 // -----------------------------------------------------------------------------
 
-/// The typed slice of `frame-v2.vectors.json` G7 reads. Unknown fields are
+/// The typed slice of `frame-v3.vectors.json` G7 reads. Unknown fields are
 /// allowed; the three named fields are REQUIRED, so a rename fails the parse
 /// (and the run) instead of defaulting.
 #[derive(Debug, Deserialize)]

@@ -14,10 +14,10 @@
 // here. It cannot catch a MISREADING of the table: a misread offset would be
 // misread identically in both places, and every test here would stay green.
 //
-// The gate that catches a misreading is P2's cross-language v3 vectors, produced
-// by the Rust generator written independently from the same table (R-22). This
-// task exists to make that gate meaningful by keeping the two derivations
-// separate. Do not "fix" a red conformance row by editing this file to agree
+// The gate that catches a misreading is the cross-language v3 vectors
+// (`vectors.conformance.test.ts`), produced by the Rust generator written
+// independently from the same table (R-22). Keeping the two derivations
+// separate is what makes that gate meaningful. Do not "fix" a red conformance row by editing this file to agree
 // with the codec; fix whichever side misreads the ADR.
 //
 // The ADR literals (offsets 0/1/2/6/10/14, block sizes 50/2/6/64) are written
@@ -27,19 +27,14 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { bytesToHex, concatBytes, hexToBytes } from '../hex.js';
+import { bytesToHex, concatBytes } from '../hex.js';
 import {
-  GOP_COUNTER_FIELD_BYTES,
-  HEADER_VERSION_V2,
-  HEADER_VERSION_V3,
-  SENDABLE_HEADER_VERSIONS,
+  PROTOCOL_VERSION,
   SUPPORTED_HEADER_VERSIONS,
   buildPublisherRegion,
   buildUnsignedFrame,
   decodeFrame,
-  decodeFrameV3,
   finishFrame,
-  isSendableHeaderVersion,
   isSupportedHeaderVersion,
   writeHopSequence,
   type EncodeFrameInput,
@@ -52,12 +47,11 @@ import {
   verifyFrameSignature,
 } from '../ed25519.js';
 import { FrameRejectedError, type RejectReason } from '../rejectReason.js';
-import { HEADER_VERSION, MAX_PAYLOAD_BYTES } from '../wireConstants.js';
-import { gopCounterFor } from '../../pipeline/egress.js';
-import { loadFrameVectors } from './frameVectors.js';
+import { HEADER_VERSION, MAX_PAYLOAD_BYTES, WIRE_CONSTANTS } from '../wireConstants.js';
 
 // --- the ADR-0036 §2 v3 table, as literals ----------------------------------
 
+const V3 = 3;
 const OFF_VERSION = 0;
 const OFF_FLAGS = 1;
 const OFF_PAYLOAD_LENGTH = 2;
@@ -114,7 +108,7 @@ function assembleV3(spec: V3Spec): Uint8Array {
     SIGNATURE;
   const out = new Uint8Array(total);
   const dv = new DataView(out.buffer);
-  out[OFF_VERSION] = 3;
+  out[OFF_VERSION] = V3;
   out[OFF_FLAGS] = spec.flags;
   dv.setUint32(OFF_PAYLOAD_LENGTH, spec.payloadLength ?? spec.payload.length, false);
   dv.setUint32(OFF_STREAM_SEQUENCE, spec.streamSequence, false);
@@ -168,7 +162,7 @@ function extensionsOf(ext: Uint8Array | undefined): FrameExtension[] {
 /** The codec input for the same spec. */
 function inputOf(spec: V3Spec): EncodeFrameInput {
   return {
-    headerVersion: HEADER_VERSION_V3,
+    headerVersion: V3,
     flags: flagsOf(spec.flags),
     streamSequence: spec.streamSequence,
     gopCounter: spec.gopCounter,
@@ -238,38 +232,30 @@ async function verifies(frame: Uint8Array, publicKey: Uint8Array): Promise<boole
 
 // ---------------------------------------------------------------------------
 
-describe('transitional block: pinned to the ADR table, and retired by P2', () => {
-  it('pins the v3 constants to the table literally', () => {
-    expect(HEADER_VERSION_V3).toBe(3);
-    expect(GOP_COUNTER_FIELD_BYTES).toBe(4);
+describe('v3 is the only version: the SSoT and the table agree', () => {
+  it('pins the generated constants to the table literally', () => {
+    expect(HEADER_VERSION).toBe(V3);
+    expect(PROTOCOL_VERSION).toBe(V3);
+    expect(WIRE_CONSTANTS.gop_counter_field_bytes).toBe(4);
+    expect(WIRE_CONSTANTS.publisher_fixed_prefix_bytes).toBe(FIXED_PREFIX);
+    // MAX_HEADER_BYTES = 14 + 50 + 2 + MAX_EXT_BYTES + 6 (ADR-0036 §2 frame extent).
+    expect(WIRE_CONSTANTS.max_header_bytes).toBe(
+      FIXED_PREFIX +
+        WRAPPED_KEY_BLOCK +
+        EXT_LENGTH_FIELD +
+        WIRE_CONSTANTS.max_ext_bytes +
+        RELAY_REGION,
+    );
     // The 14-byte prefix: a plain frame's publisher region is prefix + ext_length.
     const spec = baseSpec({ flags: F_INDEP, ext: new Uint8Array(0) });
     expect(decodeFrame(assembleV3(spec)).offsets.publisherRegionLen).toBe(14 + 2);
   });
 
-  it('TRIPWIRE: the generated vectors are still v2 (P2 deletes the v2 path and this block)', () => {
-    expect(
-      HEADER_VERSION,
-      'P2 flipped the vectors to v3: delete every "v2 — deleted by P2" branch and the ' +
-        'transitional v3 block in frameCodec.ts; replace egress.ts gopCounterFor with the ' +
-        'TransmitKeyManager GoP counter owner and, in the SAME edit, remove the v3 exclusion ' +
-        'from SENDABLE_HEADER_VERSIONS; then delete this test',
-    ).toBe(2);
-    expect(HEADER_VERSION_V2).toBe(HEADER_VERSION);
-  });
-
-  it('decodes v2 and v3 but SENDS only the current version until P2 lands the GoP owner', () => {
-    expect([...SUPPORTED_HEADER_VERSIONS].sort()).toEqual(
-      [HEADER_VERSION, HEADER_VERSION_V3].sort(),
-    );
-    expect(isSupportedHeaderVersion(HEADER_VERSION_V3)).toBe(true);
-    expect(SENDABLE_HEADER_VERSIONS).toEqual([HEADER_VERSION]);
-    // The gap, pinned: the codec builds v3, the publish path will not send it.
-    expect(isSendableHeaderVersion(HEADER_VERSION_V3)).toBe(false);
-    expect(() => buildUnsignedFrame(inputOf(baseSpec()))).not.toThrow();
-    for (const v of [0, 1, 4, 0xff]) {
-      expect(isSupportedHeaderVersion(v)).toBe(false);
-      expect(isSendableHeaderVersion(v)).toBe(false);
+  it('speaks exactly one version, for encode, decode, send and the join declaration', () => {
+    expect(SUPPORTED_HEADER_VERSIONS).toEqual([V3]);
+    expect(isSupportedHeaderVersion(V3)).toBe(true);
+    for (const v of [0, 1, 2, 4, 0xff]) {
+      expect(isSupportedHeaderVersion(v), `version ${v}`).toBe(false);
     }
   });
 });
@@ -367,25 +353,24 @@ describe('flags (ADR-0036 §2 flags table, decode steps 4-5)', () => {
 });
 
 describe('version (decode steps 1-3)', () => {
-  it('the v3 routine: empty and [3] are truncated, any other one byte is terminal', () => {
-    expect(rejectAt(() => decodeFrameV3(new Uint8Array(0)))).toEqual({
+  it('empty and [3] are truncated, any other one byte is terminal (v2 included)', () => {
+    expect(rejectAt(() => decodeFrame(new Uint8Array(0)))).toEqual({
       reason: 'truncated',
       at: 0,
     });
-    expect(verdict(() => decodeFrameV3(Uint8Array.of(3)))).toBe('truncated');
+    expect(verdict(() => decodeFrame(Uint8Array.of(V3)))).toBe('truncated');
     for (const v of [0, 1, 2, 4, 7, 0xff]) {
       expect(
-        verdict(() => decodeFrameV3(Uint8Array.of(v))),
+        verdict(() => decodeFrame(Uint8Array.of(v))),
         `version ${v}`,
       ).toBe('unknown_version');
     }
   });
 
-  it('decodeFrame keeps v2 order for non-3 bytes until P2 (v2 — deleted by P2)', () => {
-    // A one-byte non-3 buffer is `truncated` through v2's prefix-first order
-    // today; at P2 it becomes `unknown_version` end to end.
-    expect(verdict(() => decodeFrame(Uint8Array.of(7)))).toBe('truncated');
-    expect(verdict(() => decodeFrame(new Uint8Array(0)))).toBe('truncated');
+  it('a whole, well-formed frame relabelled as v2 is refused, not read as v2', () => {
+    const frame = assembleV3(baseSpec());
+    frame[OFF_VERSION] = 2;
+    expect(rejectAt(() => decodeFrame(frame))).toEqual({ reason: 'unknown_version', at: 0 });
   });
 });
 
@@ -471,14 +456,9 @@ describe('payload_length (step 6), before anything is sized from it', () => {
   });
 
   it('the v3 encoder refuses MAX+1 before building anything', () => {
-    expect(
-      verdict(() =>
-        buildPublisherRegion(
-          { ...inputOf(baseSpec()), headerVersion: HEADER_VERSION_V3 },
-          MAX_PAYLOAD_BYTES + 1,
-        ),
-      ),
-    ).toBe('payload_length_exceeds_max');
+    expect(verdict(() => buildPublisherRegion(inputOf(baseSpec()), MAX_PAYLOAD_BYTES + 1))).toBe(
+      'payload_length_exceeds_max',
+    );
   });
 });
 
@@ -542,7 +522,7 @@ describe('encoder input ranges (v3): refused, never silently wrapped', () => {
   });
 
   it('refuses a header version it does not speak', () => {
-    for (const v of [0, 1, 4]) {
+    for (const v of [0, 1, 2, 4]) {
       expect(verdict(() => buildUnsignedFrame({ ...inputOf(baseSpec()), headerVersion: v }))).toBe(
         'unknown_version',
       );
@@ -622,8 +602,7 @@ describe('authenticated ranges: slices of the received buffer, relay region excl
     // from the table for this spec (xor 0x01 on each), never read off a run, so
     // a decoder change that turned most flips into structural rejects (and so
     // checked almost no signatures) goes red here:
-    //   0       version 3 -> 2: the v2 parse reads ext_length out of the wrap
-    //           material (bytes 60-61) and rejects it as too large
+    //   0       version 3 -> 2: unknown_version (no other version decodes)
     //   2-5     payload_length 24 -> over the maximum / over what is available
     //   64-65   ext_length 3 -> 259 (too large) / 2 (TLV cut short: malformed)
     //   66-67   TLV type 1 -> 0 (unknown) / value_len 1 -> 0 (registry mismatch)
@@ -677,79 +656,6 @@ describe('authenticated ranges: slices of the received buffer, relay region excl
   });
 });
 
-describe('the v2 path is unchanged (v2 — deleted by P2)', () => {
-  function v2Input(gopCounter: number): EncodeFrameInput {
-    return { ...inputOf(baseSpec()), headerVersion: HEADER_VERSION, gopCounter };
-  }
-
-  it('v2 ignores gop_counter: identical bytes for 0 and u32::MAX', () => {
-    const a = finishFrame(buildUnsignedFrame(v2Input(0)), FAKE_SIG);
-    const b = finishFrame(buildUnsignedFrame(v2Input(U32_MAX)), FAKE_SIG);
-    expect(bytesToHex(a)).toBe(bytesToHex(b));
-    expect(decodeFrame(a).gopCounter).toBeNull();
-    expect(decodeFrame(a).version).toBe(HEADER_VERSION);
-  });
-
-  it('v2 encode reproduces the COMMITTED v2 vector bytes for every round-trip row', () => {
-    // The reference is the committed vectors file, never a re-run of the builder.
-    const file = loadFrameVectors();
-    const rows = file.vectors.filter((r) => r.name.startsWith('aad_span_'));
-    expect(rows.length).toBe(4);
-    for (const row of rows) {
-      const bytes = hexToBytes(row.frame_hex);
-      const dec = row.decoded;
-      const keyBearing = dec.flags.key_bearing;
-      // v2 table: the wrapped key block starts at 10, its material at 12.
-      const input: EncodeFrameInput = {
-        headerVersion: HEADER_VERSION,
-        flags: {
-          independentlyDecodable: dec.flags.independently_decodable,
-          discardable: dec.flags.discardable,
-          keyBearing,
-        },
-        streamSequence: dec.stream_sequence,
-        gopCounter: 0,
-        wrappedTransmitKey: keyBearing
-          ? { kekGeneration: dec.kek_generation!, wrappedKeyWithTag: bytes.subarray(12, 60) }
-          : null,
-        extensions: dec.extensions.map((e) => ({
-          extType: e.ext_type,
-          value: hexToBytes(e.value_hex),
-        })),
-        streamId: dec.stream_id,
-        hopSequence: dec.hop_sequence,
-        payload: bytes.subarray(row.offsets.payload_offset, row.offsets.signature_offset),
-      };
-      const encoded = finishFrame(
-        buildUnsignedFrame(input),
-        bytes.subarray(row.offsets.signature_offset),
-      );
-      expect(bytesToHex(encoded), row.name).toBe(row.frame_hex);
-    }
-  });
-
-  it('v2 still accepts key-bearing + discardable (v3-only reject; no SDK/MH asymmetry)', () => {
-    const frame = finishFrame(
-      buildUnsignedFrame({
-        ...v2Input(0),
-        flags: { independentlyDecodable: true, discardable: true, keyBearing: true },
-      }),
-      FAKE_SIG,
-    );
-    expect(decodeFrame(frame).flags.discardable).toBe(true);
-  });
-
-  it('one decoder reads both versions by their own version byte', () => {
-    const v2 = decodeFrame(finishFrame(buildUnsignedFrame(v2Input(0)), FAKE_SIG));
-    const v3 = decodeFrame(assembleV3(baseSpec()));
-    expect([v2.version, v2.gopCounter]).toEqual([HEADER_VERSION, null]);
-    expect([v3.version, v3.gopCounter]).toEqual([3, baseSpec().gopCounter]);
-    // Same payload either way; the v3 publisher region is four bytes longer.
-    expect(bytesToHex(v2.payload)).toBe(bytesToHex(v3.payload));
-    expect(v3.offsets.publisherRegionLen - v2.offsets.publisherRegionLen).toBe(4);
-  });
-});
-
 describe('extension region on the v3 DECODE side (steps 10-11), hand-assembled', () => {
   function withExtLength(spec: V3Spec, extLength: number, at: number): Uint8Array {
     // Cut right after ext_length: the region it declares is NOT present, so a
@@ -776,18 +682,5 @@ describe('extension region on the v3 DECODE side (steps 10-11), hand-assembled',
     expect(
       verdict(() => decodeFrame(assembleV3(baseSpec({ ext: Uint8Array.of(0x01, 0x01, 101) })))),
     ).toBe('extensions_malformed');
-  });
-});
-
-describe('the egress GoP placeholder cannot reach a non-v2 frame', () => {
-  it('returns the inert 0 only for v2 and throws for any other version', () => {
-    expect(gopCounterFor(HEADER_VERSION_V2)).toBe(0);
-    for (const v of [HEADER_VERSION_V3, 0, 1, 4]) {
-      expect(() => gopCounterFor(v), `version ${v}`).toThrow();
-    }
-  });
-
-  it('v3 is never sendable while the placeholder exists (explicit exclusion, not self-releasing)', () => {
-    expect(SENDABLE_HEADER_VERSIONS).not.toContain(HEADER_VERSION_V3);
   });
 });

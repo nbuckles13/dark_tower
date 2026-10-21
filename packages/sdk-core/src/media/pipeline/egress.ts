@@ -3,7 +3,7 @@
 // HOT PATH. Per-frame code only: no logging, no metric names, no label
 // construction. Metric handles arrive pre-bound from `../setup/mediaMetrics.ts`.
 //
-// One encoded Opus frame -> one signed, encrypted v2 frame -> one QUIC datagram.
+// One encoded Opus frame -> one signed, encrypted v3 frame -> one QUIC datagram.
 //
 // ---------------------------------------------------------------------------
 // THE ORDER IS FIXED BY ADR-0036 §4 AND IS NOT NEGOTIABLE
@@ -43,8 +43,7 @@ import {
   buildPublisherRegion,
   buildUnsignedFrame,
   finishFrame,
-  HEADER_VERSION_V2,
-  isSendableHeaderVersion,
+  isSupportedHeaderVersion,
   writeHopSequence,
 } from '../frame/frameCodec.js';
 import { signFrame } from '../frame/ed25519.js';
@@ -147,28 +146,6 @@ export interface DatagramSender {
 }
 
 /**
- * The `gop_counter` input this path passes, per header version.
- *
- * On v2 the codec ignores it (v2 has no such field), so 0 is inert. For ANY
- * other version it THROWS: no per-(sender, stream) GoP counter owner exists yet,
- * and a constant on a v3 wire would break ADR-0036 §2's increment rule — well-
- * formed, so nothing downstream would notice. The throw lands in
- * `AudioPipeline`'s `submit().catch` as a typed fault, so a v3 enablement that
- * forgot this site is a loud outage, not a silent rule break.
- *
- * Keyed on the v2 version byte INDEPENDENTLY of the generated `HEADER_VERSION`:
- * after P2's regeneration `HEADER_VERSION` is 3, and a check against it would
- * release itself. P2 enables (task 6): replace this with the counter owner on
- * `TransmitKeyManager`, allocated once per frame here above the fan-out, in the
- * same edit that removes the v3 exclusion from `SENDABLE_HEADER_VERSIONS`.
- */
-/** @internal Test seam; not in `index.ts`. */
-export function gopCounterFor(headerVersion: number): number {
-  if (headerVersion === HEADER_VERSION_V2) return 0;
-  throw new Error('EgressPipeline: no GoP counter owner for this header version until P2');
-}
-
-/**
  * What MC directs this stream to do, as ONE value: where to send, and in which
  * header version. One object rather than two arguments so the targets and the
  * version they were directed with cannot come apart.
@@ -178,7 +155,7 @@ export interface EgressSendPlan {
   readonly targets: readonly string[];
   /**
    * `SendDirective.header_version` — the only runtime source of the version
-   * (ADR-0036 §2). Must satisfy `isSendableHeaderVersion`; the lifecycle layer
+   * (ADR-0036 §2). Must satisfy `isSupportedHeaderVersion`; the lifecycle layer
    * refuses anything else before it gets here.
    */
   readonly headerVersion: number;
@@ -341,11 +318,10 @@ export class EgressPipeline {
    * queues are discarded; a lane named again later resumes on its retained hop
    * counter.
    *
-   * @throws {RangeError} if a plan with targets names a header version that is
-   *   not sendable. The
-   *   lifecycle layer refuses such a directive first (typed fault, send
-   *   nothing); this is the backstop, so a bypass fails loudly rather than
-   *   building a frame with no legitimate GoP counter.
+   * @throws {RangeError} if a plan with targets names a header version this
+   *   codec does not speak. The lifecycle layer refuses such a directive first
+   *   (typed fault, send nothing); this is the backstop, so a bypass fails
+   *   loudly rather than at frame build.
    */
   setTargets(plan: EgressSendPlan): void {
     if (this.#stopped) return;
@@ -354,7 +330,7 @@ export class EgressPipeline {
       // Only a plan that can SEND is held to the version. An empty plan sends
       // nothing in any version, and the lifecycle layer's fail-closed refusal
       // arrives here as exactly that.
-      if (!isSendableHeaderVersion(plan.headerVersion)) {
+      if (!isSupportedHeaderVersion(plan.headerVersion)) {
         throw new RangeError('EgressPipeline: the directed frame header version is not sendable');
       }
       this.#headerVersion = plan.headerVersion;
@@ -407,8 +383,8 @@ export class EgressPipeline {
    * frame." Read it there; it is not restated here, because a second wording of
    * a crypto invariant is a second thing to drift.
    *
-   * What that means for this method: ONE `materialFor`, ONE
-   * `nextStreamSequence`, ONE `sealSframe`, ONE `signFrame`, ONE `finishFrame` —
+   * What that means for this method: ONE `materialFor`, ONE `nextGopCounter`,
+   * ONE `nextStreamSequence`, ONE `sealSframe`, ONE `signFrame`, ONE `finishFrame` —
    * all of it above `#fanOut`. Per-lane state is the queue and the hop sequence
    * ONLY. NO PER-LANE COUNTER MAY EVER REACH `sframeNonce`.
    *
@@ -447,9 +423,23 @@ export class EgressPipeline {
     if (headerVersion === undefined) {
       throw new Error('EgressPipeline: an active target without a send plan');
     }
-    const gopCounter = gopCounterFor(headerVersion);
-
     const material = await this.#transmitKeys.materialFor(this.#streamNumber, this.#kek);
+    // ONE GoP value per frame, above the fan-out, from the same non-resettable
+    // owner as the stream sequence. Every Opus frame is independently decodable,
+    // so audio advances it on EVERY frame (ADR-0036 §2, no per-kind branch).
+    // Taken BEFORE the sequence, so an exhausted stream consumes no nonce.
+    const gopCounter = this.#transmitKeys.nextGopCounter(this.#streamNumber);
+    if (gopCounter === null) {
+      // u32::MAX was the last legal value: this stream sends nothing more, ever,
+      // and never wraps (§2). COUNTED, once per active lane — the N send attempts
+      // this frame would have made — so `frames_sent + send_dropped` stays a
+      // per-lane attempt total and an exhausted stream reads 100% send loss on
+      // every lane. Never the value: stream identity (R-30).
+      for (const lane of this.#lanes.values()) {
+        if (lane.active) this.#metrics.sendDropped(MEDIA_SEND_DROP_REASONS.GopCounterExhausted);
+      }
+      return;
+    }
     const streamSequence = this.#transmitKeys.nextStreamSequence(this.#streamNumber);
 
     const flags = {

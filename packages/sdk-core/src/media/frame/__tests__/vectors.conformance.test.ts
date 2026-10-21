@@ -45,7 +45,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { bytesToHex, concatBytes, hexToBytes } from '../hex.js';
-import { decodeFrame } from '../frameCodec.js';
+import { PROTOCOL_VERSION, decodeFrame } from '../frameCodec.js';
 import {
   exportPublicKey,
   importSigningKeyFromSeed,
@@ -106,10 +106,12 @@ function keysHolding(kekHex: string, generation: number): ReceiverKeys {
   };
 }
 
-describe('frame-v2 vectors — the file itself', () => {
+describe('frame-v3 vectors — the file itself', () => {
   it('is non-empty and carries the non-production banner', () => {
     expect(rows.length).toBeGreaterThan(0);
     expect(file.schema_version).toBe(1);
+    // v3 is the only version, and the file says so (guard g3 pins it to Rust).
+    expect(file.header_version).toBe(PROTOCOL_VERSION);
     expect(file.reject_reasons.length).toBeGreaterThan(0);
   });
 });
@@ -153,6 +155,9 @@ describe.each(rows.map((r) => [r.name, r] as const))('row %s', (_name, row) => {
     expect(decoded.flags.keyBearing).toBe(row.decoded.flags.key_bearing);
     expect(decoded.payloadLength).toBe(row.decoded.payload_length);
     expect(decoded.streamSequence).toBe(row.decoded.stream_sequence);
+    // v3's one new field, on EVERY decodable row — read from the signed prefix.
+    expect(typeof row.decoded.gop_counter).toBe('number');
+    expect(decoded.gopCounter).toBe(row.decoded.gop_counter);
     expect(decoded.streamId).toBe(row.decoded.stream_id);
     expect(decoded.hopSequence).toBe(row.decoded.hop_sequence);
     expect(decoded.offsets.publisherRegionLen).toBe(row.offsets.publisher_region_len);
@@ -428,7 +433,7 @@ describe('wrap_for_different_key_id — the wrap is IGNORED, the frame is played
     // This is a FILE-INTERNAL CONSISTENCY check, not a new contract.
     expect(
       row.reject_reason,
-      'frame-v2.vectors.json pins this condition twice, as `reject_reason` and as ' +
+      'frame-v3.vectors.json pins this condition twice, as `reject_reason` and as ' +
         '`expected.outcome`; a rename must move BOTH',
     ).toBe(row.expected?.outcome);
     expect(bytesToHex(opened.plaintext)).toBe(row.crypto.plaintext_hex);
@@ -447,7 +452,7 @@ describe('wrap_for_different_key_id — the wrap is IGNORED, the frame is played
 });
 
 describe('tamper and decrypt rejects', () => {
-  for (const name of ['tamper_publisher_region', 'tamper_signature']) {
+  for (const name of ['tamper_publisher_region', 'tamper_signature', 'tamper_gop_counter']) {
     it(`${name} still decodes and fails verification`, async () => {
       const row = visit(rowByName(file, name));
       const decoded = decodeFrame(hexToBytes(row.frame_hex));
@@ -547,6 +552,101 @@ describe('wrap determinism', () => {
     // differs, the nonce has picked up a per-frame input and nonce uniqueness
     // under the KEK no longer reduces to key-id uniqueness.
     expect(wrapOf(lo)).toBe(wrapOf(hi));
+  });
+});
+
+describe('gop_counter rows (ADR-0036 §2: every u32 accepted, rules bind the sender)', () => {
+  it('gop_counter_zero_keyframe decodes a group start at 0', () => {
+    const row = visit(rowByName(file, 'gop_counter_zero_keyframe'));
+    const d = decodeFrame(hexToBytes(row.frame_hex));
+    expect(d.gopCounter).toBe(0);
+    expect(d.flags.independentlyDecodable).toBe(true);
+  });
+
+  it('gop_counter_u32_max decodes — the stop is a SENDER rule, not a decode reject', () => {
+    const row = visit(rowByName(file, 'gop_counter_u32_max'));
+    expect(decodeFrame(hexToBytes(row.frame_hex)).gopCounter).toBe(0xffff_ffff);
+  });
+
+  it('key_bearing_mid_group carries the key on a frame that does NOT start a group', async () => {
+    const row = visit(rowByName(file, 'key_bearing_mid_group'));
+    const d = decodeFrame(hexToBytes(row.frame_hex));
+    expect(d.flags).toEqual({
+      independentlyDecodable: false,
+      discardable: false,
+      keyBearing: true,
+    });
+    const verified = await verifyFrame(d, hexToBytes(row.crypto.identity_public_hex));
+    const opened = await openVerifiedFrame(
+      verified,
+      new TransmitKeyCache(),
+      keysHolding(row.crypto.kek_hex, row.decoded.kek_generation!),
+    );
+    expect(bytesToHex(opened.plaintext)).toBe(row.crypto.plaintext_hex);
+  });
+
+  it('tamper_gop_counter differs from a verifying frame ONLY in the gop_counter bytes', () => {
+    // The tamper row's own check is in 'tamper and decrypt rejects'. This pins
+    // WHERE the mutation is, from the codec's offsets, so a row whose mutation
+    // landed elsewhere cannot pass as a GoP tamper.
+    const row = visit(rowByName(file, 'tamper_gop_counter'));
+    const tampered = hexToBytes(row.frame_hex);
+    const d = decodeFrame(tampered);
+    const base = file.vectors.find(
+      (r) =>
+        r.name !== row.name &&
+        r.frame_hex.length === row.frame_hex.length &&
+        r.derived.signature_hex === bytesToHex(d.signature),
+    );
+    expect(base, 'the row the tamper was derived from (same signature)').toBeDefined();
+    const original = hexToBytes(base!.frame_hex);
+    const differing: number[] = [];
+    for (let i = 0; i < tampered.length; i += 1) if (tampered[i] !== original[i]) differing.push(i);
+    expect(differing.length).toBeGreaterThan(0);
+    // ADR-0036 §2: gop_counter is the u32 at offset 10.
+    for (const at of differing) expect(at >= 10 && at < 14, `byte ${at}`).toBe(true);
+  });
+});
+
+describe('relay_rewrite_still_verifies — the relay region is outside both ranges', () => {
+  const row = rowByName(file, 'relay_rewrite_still_verifies');
+
+  it('verifies, with the same AAD and signed range as its base, and a different relay region', async () => {
+    visit(row);
+    expect(row.kind).toBe('relay_rewrite');
+    expect(row.expected?.signature_valid).toBe(true);
+    const base = rowByName(file, row.expected!.rewritten_from!);
+    const rewritten = decodeFrame(hexToBytes(row.frame_hex));
+    const original = decodeFrame(hexToBytes(base.frame_hex));
+
+    // POSITIVE CONTROL: the relay region really changed.
+    expect([rewritten.streamId, rewritten.hopSequence]).not.toEqual([
+      original.streamId,
+      original.hopSequence,
+    ]);
+    expect(bytesToHex(rewritten.aeadAad)).toBe(bytesToHex(original.aeadAad));
+    expect(bytesToHex(rewritten.signedRange)).toBe(bytesToHex(original.signedRange));
+    // Verified against the BASE row's publisher key: the rewrite did not need it.
+    await expect(
+      verifyFrame(rewritten, hexToBytes(base.crypto.identity_public_hex)),
+    ).resolves.toBeDefined();
+  });
+});
+
+describe('publisher rows stamp the uplink relay stream_id = the send id = the key-id stream', () => {
+  it('holds on every decodable publisher-shaped row', () => {
+    // ADR-0036 §2: on the uplink the publisher stamps MC's send id (audio 0,
+    // video 1 today), which on the uplink is the same value as the key id's
+    // 8-bit stream field. relay_rewrite rows carry a DOWNLINK value instead.
+    const publisherRows = rows.filter(
+      (r) =>
+        r.kind !== 'decode_reject' && r.kind !== 'relay_rewrite' && derivedDescribesOwnFrame(r),
+    );
+    expect(publisherRows.length).toBeGreaterThan(0);
+    const mismatched = publisherRows
+      .filter((r) => r.decoded.stream_id !== r.decoded.key_id_decomposed.stream)
+      .map((r) => r.name);
+    expect(mismatched).toEqual([]);
   });
 });
 

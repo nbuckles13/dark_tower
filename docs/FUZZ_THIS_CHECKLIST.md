@@ -407,11 +407,19 @@ Before implementing a new feature, answer these questions:
 **Priority**: 🔴 CRITICAL
 
 **Fuzz Targets**:
-- `media_protocol/fuzz/fuzz_targets/codec_decode.rs` - Malformed input; drives all four entry
-  points (`decode_datagram`, `decode_stream_frame`, `peek_frame_len`, `rewrite_relay_region`),
-  because they differ exactly where a bug hides. `peek_frame_len` is the only one that covers the
-  reader-side pre-allocation bound, which ADR-0036 §2 notes a fuzz test of the decode function
-  alone structurally misses.
+- `media_protocol/fuzz/fuzz_targets/codec_decode.rs` - Malformed input; drives the whole-frame
+  entry points (`decode_datagram`, `decode_stream_frame`, `parse_header_prefix`,
+  `rewrite_relay_region`), because they differ exactly where a bug hides.
+- `media_protocol/fuzz/fuzz_targets/header_prefix.rs` - The cut-through header parse on its own:
+  `Incomplete` never asks past `MAX_HEADER_BYTES`, a `Complete` header is within
+  `MAX_PAYLOAD_BYTES` and agrees with `decode_stream_frame`, and the header-only relay rewrite
+  accepts exactly what the parse accepts and writes only relay bytes. This is the reader-side
+  pre-allocation bound ADR-0036 §2 notes a fuzz test of the decode function alone structurally
+  misses.
+- `media_protocol/fuzz/fuzz_targets/header_reader_split.rs` - The chunk-fed `HeaderReader` under
+  arbitrary chunk splits (byte-at-a-time, fuzzer-chosen, one chunk): the split never changes the
+  outcome (header, consumed bytes, leftover tail, or reject reason). Covers the READER, not only
+  decode. Deterministic counterpart: `crates/media-protocol/tests/header_prefix.rs`.
 - `media_protocol/fuzz/fuzz_targets/codec_roundtrip.rs` - Correctness. Asserts **byte identity**,
   not field equality: encoding is canonical, so `encode(decode(x)) == x` means decode is injective
   over the accepted language, which is the no-covert-channel property. Weakening this to a field

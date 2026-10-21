@@ -1,8 +1,8 @@
 // File: packages/sdk-core/src/media/frame/frameCodec.ts
 //
 // MODULE THREE of the SFrame stack: the ADR-0036 §2 binary frame codec — header
-// v3, plus the transitional v2 path — and the two authenticated byte ranges the
-// rest of the stack consumes.
+// v3, the only version — and the two authenticated byte ranges the rest of the
+// stack consumes.
 //
 // ---------------------------------------------------------------------------
 // PROVENANCE OF THE v3 CODEC (R-22). READ BEFORE "SIMPLIFYING" IT.
@@ -21,18 +21,20 @@
 // table (and get the table fixed if it is the table), never by copying the
 // other language.
 //
-// ANCHOR (DRY): every wire constant v3 shares with v2 comes from
-// `./wireConstants.js`, which is RENDERED from
-// `proto/test-vectors/frame-v2.vectors.json` — the cross-language SSoT. Sites
-// below read `WIRE_CONSTANTS.max_payload_bytes` and
+// ANCHOR (DRY): every wire constant comes from `./wireConstants.js`, which is
+// RENDERED from `proto/test-vectors/frame-v3.vectors.json` — the cross-language
+// SSoT. Sites below read `WIRE_CONSTANTS.max_payload_bytes` and
 // `WIRE_CONSTANTS.legal_flag_mask` by their SSoT spellings. Never hardcode a
 // second copy: the origin is `crates/media-protocol/src/frame.rs`, the vectors
 // file mirrors it under guards g2/g3/g4, and
 // `__tests__/wireConstants.drift.test.ts` byte-compares the render. `legal_flag_mask`
 // matters most here — it is 7, so no banned-literal check could ever catch a
-// hardcode of it, and the derivation is the only enforcement there is. The
-// values v3 ADDS have no SSoT until P2 regenerates the vectors, so they live in
-// ONE transitional block below (`HEADER_VERSION_V3`), cited to the ADR table.
+// hardcode of it, and the derivation is the only enforcement there is.
+//
+// What the SSoT pins is the WIDTHS; the OFFSETS are this file's reading of the
+// ADR table (`GOP_COUNTER_OFFSET` = `stream_sequence`'s end), checked against the
+// SSoT's prefix width at module load and against the vectors' pinned offsets by
+// the conformance harness.
 //
 // ---------------------------------------------------------------------------
 // LAYOUT (ADR-0036 §2 Header v3 table), BIG-ENDIAN THROUGHOUT
@@ -52,8 +54,8 @@
 //     .     m  payload (SFrame object)               <- signed, NOT in the AAD
 //     .    64  Ed25519 signature
 //
-// v2 — deleted by P2: identical except that it has no `gop_counter`, so its
-// fixed prefix is 10 bytes and the wrapped key starts at offset 10.
+// v3 is the only version (R-22): v2 was an intentional wire break with no dual
+// decode, and any other version byte rejects `unknown_version`.
 //
 // The relay `stream_id` is HOP-LOCAL (ADR-0036 §2): on the uplink the publisher
 // stamps MC's send id there, on the downlink MH rewrites it to the receiver's
@@ -80,11 +82,9 @@
 //     and the conformance harness asserts it DIFFERS from the real signed range on
 //     every row.
 //
-// BOTH DEVIATIONS APPLY UNCHANGED TO v3. `gop_counter` sits inside the fixed
-// publisher prefix, so it is covered by the AAD and by the signature exactly as
-// `stream_sequence` is; the relay region is still the one excluded run. The only
-// v3 consequence is arithmetic: the publisher region starts its cursor at 14,
-// not 10, and every block after the prefix moves by four bytes.
+// `gop_counter` sits inside the fixed publisher prefix, so it is covered by the
+// AAD and by the signature exactly as `stream_sequence` is; the relay region is
+// the one excluded run.
 //
 // BOTH RANGES ARE SLICES OF THE RECEIVED BUFFER AND ARE NEVER RE-SERIALIZED.
 // Re-serializing would verify the decoder against itself: a field the decoder
@@ -108,6 +108,7 @@ const {
   signature_bytes: SIGNATURE_BYTES,
   relay_region_bytes: RELAY_REGION_BYTES,
   publisher_fixed_prefix_bytes: PUBLISHER_FIXED_PREFIX_BYTES,
+  gop_counter_field_bytes: GOP_COUNTER_FIELD_BYTES,
   wrapped_transmit_key_bytes: WRAPPED_TRANSMIT_KEY_BYTES,
   kek_generation_field_bytes: KEK_GENERATION_FIELD_BYTES,
   wrapped_transmit_key_material_bytes: WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES,
@@ -142,15 +143,12 @@ const HOP_SEQUENCE_FIELD_BYTES = 4;
 
 /**
  * Protocol version, from the SSoT (`header_version`, guard g3 pins it against
- * `frame.rs::PROTOCOL_VERSION`). There is deliberately no v1 decode path — see
- * `decodeFrame`.
+ * `frame.rs::PROTOCOL_VERSION`). The ONLY version this codec encodes or decodes,
+ * and therefore the only one a join declares and the publish path sends.
  */
 export const PROTOCOL_VERSION = HEADER_VERSION;
 
-/**
- * Field positions shared by every version's fixed prefix (ADR-0036 §2): v3
- * keeps v2's first ten bytes exactly and appends `gop_counter`.
- */
+/** Field positions in the fixed prefix (ADR-0036 §2 table). */
 const VERSION_OFFSET = 0;
 const FLAGS_OFFSET = 1;
 const PAYLOAD_LENGTH_OFFSET = 2;
@@ -158,83 +156,32 @@ const STREAM_SEQUENCE_OFFSET = 6;
 /** u32, like `payload_length` and `hop_sequence`. */
 const STREAM_SEQUENCE_FIELD_BYTES = 4;
 
-// ===========================================================================
-// TRANSITIONAL HEADER v3 BLOCK — v2 — deleted by P2
-// ===========================================================================
-//
-// Source: ADR-0036 §2 "Header v3 — the normative layout", authored by C-v3.
-// These are the ONLY values v3 adds; everything it shares with v2 is read from
-// `WIRE_CONSTANTS` above. P2 regenerates `wireConstants.ts` from the v3 vectors,
-// at which point `HEADER_VERSION` is 3, the prefix constant is 14, and this
-// whole block (and every `v2 — deleted by P2` branch) is deleted in favour of
-// the regenerated constants. `__tests__/frameCodec.v3.test.ts` carries a
-// tripwire (`HEADER_VERSION === 2`) that goes red at that regeneration, so the
-// block cannot outlive the flip.
-
-/** The v3 `version` byte. The ONLY literal 3 in production code (R-22, DRY N2). */
-export const HEADER_VERSION_V3 = 3;
-
 /**
- * The v2 `version` byte, pinned so it does NOT move when P2 regenerates
- * `HEADER_VERSION` to 3. Only for sites that must stay keyed to v2 itself across
- * that regeneration (`egress.ts:gopCounterFor`); everything meaning "the
- * current version" reads `HEADER_VERSION`. Equal to it while the vectors are
- * v2, asserted by the tripwire test. v2 — deleted by P2.
- */
-export const HEADER_VERSION_V2 = 2;
-
-/** `gop_counter`: u32, new in v3, immediately after `stream_sequence`. */
-export const GOP_COUNTER_FIELD_BYTES = 4;
-
-/**
- * Where `gop_counter` sits: offset 10, immediately after `stream_sequence` — the
- * table's own relation, so it stays right whatever the generated v2 constants
- * say. `frameCodec.v3.test.ts` pins 10 and 14 literally.
+ * Where `gop_counter` sits: immediately after `stream_sequence` — the table's
+ * own relation, offset 10. `frameCodec.v3.test.ts` pins 10 and 14 literally.
  */
 const GOP_COUNTER_OFFSET = STREAM_SEQUENCE_OFFSET + STREAM_SEQUENCE_FIELD_BYTES;
 
-/** The v3 fixed publisher prefix: 14 bytes. */
-const V3_PUBLISHER_FIXED_PREFIX_BYTES = GOP_COUNTER_OFFSET + GOP_COUNTER_FIELD_BYTES;
+// The prefix is `gop_counter`'s end. Checked against the SSoT's declared width
+// once, at load, so a vectors file and this layout cannot disagree silently.
+if (GOP_COUNTER_OFFSET + GOP_COUNTER_FIELD_BYTES !== PUBLISHER_FIXED_PREFIX_BYTES) {
+  throw new Error(
+    'frameCodec: the ADR-0036 §2 prefix layout disagrees with wire_constants.publisher_fixed_prefix_bytes',
+  );
+}
 
 /**
- * Header versions this codec can ENCODE AND DECODE. v2 — deleted by P2: after
- * the flip only `HEADER_VERSION` (then 3) remains.
+ * The header versions this SDK encodes, decodes, SENDS and therefore declares at
+ * join (`ParticipantCapabilities.supported_header_versions`): exactly
+ * {@link PROTOCOL_VERSION}. One set for all four, because with one version
+ * there is nothing to distinguish them — no allowlist, no floor (R-22).
  */
-export const SUPPORTED_HEADER_VERSIONS: readonly number[] = [HEADER_VERSION, HEADER_VERSION_V3];
+export const SUPPORTED_HEADER_VERSIONS: readonly number[] = [PROTOCOL_VERSION];
 
 /** The one membership predicate for {@link SUPPORTED_HEADER_VERSIONS}. */
 export function isSupportedHeaderVersion(version: number): boolean {
   return SUPPORTED_HEADER_VERSIONS.includes(version);
 }
-
-/**
- * Header versions the PUBLISH PATH will send, and therefore what a join declares
- * (`ParticipantCapabilities.supported_header_versions`).
- *
- * A DIFFERENT PREDICATE FROM {@link isSupportedHeaderVersion}, deliberately. The
- * codec can build v3, but a v3 frame must carry a `gop_counter` obeying ADR-0036
- * §2's sender rules (per sender and stream, increments on every
- * independently-decodable frame, never resets, never wraps), and that counter's
- * OWNER lands with P2 on `TransmitKeyManager`. Until then no legitimate value
- * exists to stamp, so v3 is not sendable and a directed 3 is refused fail-closed
- * (`AudioPipeline.setSendDirective`).
- *
- * THE v3 EXCLUSION IS EXPLICIT AND DOES NOT RELEASE ITSELF. P2's regeneration
- * makes `HEADER_VERSION` 3; this filter then leaves the set EMPTY — the join
- * declares nothing and MC refuses it loudly — rather than silently enabling v3
- * with no GoP owner. P2 enables (task 6): remove the filter in the SAME edit that
- * replaces `egress.ts`'s `gopCounterFor` with the `TransmitKeyManager` owner.
- */
-export const SENDABLE_HEADER_VERSIONS: readonly number[] = [HEADER_VERSION].filter(
-  (version) => version !== HEADER_VERSION_V3,
-);
-
-/** The one membership predicate for {@link SENDABLE_HEADER_VERSIONS}. */
-export function isSendableHeaderVersion(version: number): boolean {
-  return SENDABLE_HEADER_VERSIONS.includes(version);
-}
-
-// =========================== end transitional block ========================
 
 /**
  * Refuse an encoder input that `DataView` would silently wrap.
@@ -244,8 +191,6 @@ export function isSendableHeaderVersion(version: number): boolean {
  * repeat. The ADR's encode-side rule is that an encoder MUST refuse what the
  * decoder would reject; a value that cannot be represented is the limiting case.
  * The bound is derived from the field width, never written as a literal.
- *
- * v3 path only (v2 — deleted by P2 — stays byte- and behaviour-identical).
  */
 function assertUintField(name: string, value: number, widthBytes: number): void {
   const max = 2 ** (8 * widthBytes) - 1;
@@ -300,11 +245,8 @@ export interface DecodedFrame {
    * Every u32 is accepted on the wire; its rules bind the sender. It is stream
    * identity: never a log field, metric label, span attribute or test-bus value
    * (§11).
-   *
-   * `null` on a v2 frame, which has no such field. v2 — deleted by P2: P2
-   * narrows this to `number`.
    */
-  readonly gopCounter: number | null;
+  readonly gopCounter: number;
   readonly wrappedTransmitKey: WrappedTransmitKey | null;
   readonly extensions: readonly FrameExtension[];
   /**
@@ -464,13 +406,13 @@ interface ParsedPrefix {
   readonly flags: FrameFlags;
   readonly payloadLength: number;
   readonly streamSequence: number;
-  readonly gopCounter: number | null;
+  readonly gopCounter: number;
   /** Where the cursor stands once the fixed prefix is consumed. */
   readonly prefixLen: number;
 }
 
 /**
- * Decode the flag byte. Shared by both versions: the legal mask is the same.
+ * Decode the flag byte.
  *
  * Every bit is decoded into a field the receiver inspects, or rejected if set.
  * There is deliberately no masking variant of this parser: masking-and-continuing
@@ -509,47 +451,23 @@ function parsePayloadLength(view: DataView): number {
 }
 
 /**
- * The v2 fixed prefix, in v2's historical check order (prefix present, THEN
- * version). v2 — deleted by P2.
- */
-function parsePrefixV2(data: Uint8Array, view: DataView): ParsedPrefix {
-  need(data.length, PUBLISHER_FIXED_PREFIX_BYTES, 'the fixed publisher prefix', 0);
-  const version = data[VERSION_OFFSET] as number;
-  if (version !== HEADER_VERSION) {
-    // No v1 decode path exists, deliberately. At the commit that introduced v2
-    // nothing deployed spoke v1, so a live v1 branch would have been a downgrade
-    // surface with no legitimate caller.
-    throw codecReject('unknown_version', `unsupported frame version ${version}`, {
-      at: VERSION_OFFSET,
-    });
-  }
-  const flags = parseFlags(data[FLAGS_OFFSET] as number);
-  const payloadLength = parsePayloadLength(view);
-  return {
-    version,
-    flags,
-    payloadLength,
-    streamSequence: view.getUint32(STREAM_SEQUENCE_OFFSET, false),
-    gopCounter: null,
-    prefixLen: PUBLISHER_FIXED_PREFIX_BYTES,
-  };
-}
-
-/**
  * The v3 fixed prefix, ADR-0036 §2 decode-order steps 1–8, in that order.
  */
-function parsePrefixV3(data: Uint8Array, view: DataView): ParsedPrefix {
+function parsePrefix(data: Uint8Array, view: DataView): ParsedPrefix {
   // Step 1: the version byte is present.
   need(data.length, VERSION_OFFSET + 1, 'the version byte', VERSION_OFFSET);
   // Step 2: version == 3, terminal even on a one-byte buffer.
   const version = data[VERSION_OFFSET] as number;
-  if (version !== HEADER_VERSION_V3) {
+  if (version !== PROTOCOL_VERSION) {
+    // No other version has a decode path, deliberately (R-22): v3 is the only
+    // version, a v2 frame is refused here like any other, and a live branch for
+    // an older version would be a downgrade surface with no legitimate caller.
     throw codecReject('unknown_version', `unsupported frame version ${version}`, {
       at: VERSION_OFFSET,
     });
   }
   // Step 3: the 14-byte fixed prefix is present.
-  need(data.length, V3_PUBLISHER_FIXED_PREFIX_BYTES, 'the fixed publisher prefix', 0);
+  need(data.length, PUBLISHER_FIXED_PREFIX_BYTES, 'the fixed publisher prefix', 0);
   // Step 4: no flag bit outside the legal mask.
   const flags = parseFlags(data[FLAGS_OFFSET] as number);
   // Step 5: never key-bearing AND discardable (ADR-0036 §4: a frame carrying a
@@ -573,14 +491,13 @@ function parsePrefixV3(data: Uint8Array, view: DataView): ParsedPrefix {
     // Step 8: every u32 accepted, 0 and u32::MAX included. No check, because no
     // value is illegal on the wire; the rules bind the sender.
     gopCounter: view.getUint32(GOP_COUNTER_OFFSET, false),
-    prefixLen: V3_PUBLISHER_FIXED_PREFIX_BYTES,
+    prefixLen: PUBLISHER_FIXED_PREFIX_BYTES,
   };
 }
 
 /**
- * Everything after the fixed prefix — ADR-0036 §2 decode-order steps 9–14 — for
- * either version. VERSION-BLIND: it works only from the prefix's cursor and
- * flags, so the two versions cannot drift apart in the blocks they share.
+ * Everything after the fixed prefix — ADR-0036 §2 decode-order steps 9–14 —
+ * working only from the prefix's cursor and flags.
  *
  * Check ORDER is load-bearing and is pinned by the vectors:
  *   * `ext_length` is bounded BEFORE the region's availability is checked.
@@ -702,44 +619,14 @@ function viewOf(data: Uint8Array): DataView {
 }
 
 /**
- * Decode a frame from a received buffer, by its own `version` byte. Slices,
- * never copies.
- *
- * TRANSITIONAL DUAL DECODE. Until P2 flips the cluster, MC directs v2 and the
- * SDK must still read it; a byte of 3 takes the v3 path, and every other byte
- * keeps v2's historical check order (so an empty buffer, or any short buffer
- * whose first byte is not 3, still reports `truncated` exactly as before).
- * v2 — deleted by P2: after the flip this is `decodeFrameV3` and nothing else.
- *
- * The receiver does NOT bind an accepted version to the meeting's directed one;
- * with v3 the only version after P2 that binding is moot, and P2 lands in the
- * same story.
+ * Decode a frame from a received buffer: ADR-0036 §2 steps 1–14 for ANY input.
+ * Slices, never copies.
  *
  * @throws {FrameRejectedError} with a bounded `rejectReason`.
  */
 export function decodeFrame(data: Uint8Array): DecodedFrame {
-  if (isV3(data[VERSION_OFFSET])) {
-    return decodeFrameV3(data);
-  }
-  // v2 — deleted by P2.
   const view = viewOf(data);
-  return decodeAfterPrefix(data, view, parsePrefixV2(data, view));
-}
-
-/**
- * The v3 decoder alone, ADR-0036 §2 steps 1–14 for ANY input.
- *
- * Test seam: exported so the ADR's "step 2 is terminal on a one-byte buffer"
- * is checkable while `decodeFrame` still routes non-3 bytes to v2. Not part of
- * the SDK's public surface (absent from `index.ts`); P2 folds it into
- * `decodeFrame`.
- *
- * @internal
- * @throws {FrameRejectedError} with a bounded `rejectReason`.
- */
-export function decodeFrameV3(data: Uint8Array): DecodedFrame {
-  const view = viewOf(data);
-  return decodeAfterPrefix(data, view, parsePrefixV3(data, view));
+  return decodeAfterPrefix(data, view, parsePrefix(data, view));
 }
 
 /** Fields an encoder needs to build a frame. */
@@ -788,9 +675,8 @@ export interface PublisherRegionInput {
   /**
    * The v3 GoP counter. An opaque input: its semantics (ADR-0036 §2 — per sender
    * and stream, increments on every independently-decodable frame, never resets
-   * or wraps) belong to the sender, not the codec.
-   *
-   * IGNORED on v2, which has no such field. v2 — deleted by P2.
+   * or wraps) belong to the sender — `TransmitKeyManager.nextGopCounter` —
+   * not the codec.
    */
   readonly gopCounter: number;
   readonly wrappedTransmitKey: WrappedTransmitKey | null;
@@ -825,10 +711,10 @@ export interface PublisherRegionInput {
  * authenticates zeros, and the resulting frame verifies against nothing.
  *
  * @throws {FrameRejectedError} `unknown_version` (unsupported `headerVersion`),
- *   `payload_length_exceeds_max`, `extensions_too_large`; on v3 also
+ *   `payload_length_exceeds_max`, `extensions_too_large`,
  *   `key_bearing_discardable` and `extensions_malformed`.
  * @throws {RangeError} if the key-bearing flag and the wrapped key disagree, or
- *   (v3) if a field value does not fit its width.
+ *   if a field value does not fit its width.
  */
 export function buildPublisherRegion(input: PublisherRegionInput, payloadLength: number): Bytes {
   const { headerVersion, flags, wrappedTransmitKey, extensions } = input;
@@ -859,9 +745,9 @@ export function buildPublisherRegion(input: PublisherRegionInput, payloadLength:
       { declared: extBytes.length, limit: MAX_EXT_BYTES },
     );
   }
-  if (isV3(headerVersion)) assertV3EncodeInput(input, extBytes);
+  assertEncodeInput(input, extBytes);
 
-  const prefixLen = fixedPrefixBytes(headerVersion);
+  const prefixLen = PUBLISHER_FIXED_PREFIX_BYTES;
   const regionLen =
     prefixLen +
     (wrappedTransmitKey ? WRAPPED_TRANSMIT_KEY_BYTES : 0) +
@@ -887,26 +773,12 @@ export function buildPublisherRegion(input: PublisherRegionInput, payloadLength:
   return region as Bytes;
 }
 
-/** True for the v3 version byte. One spelling of the comparison, everywhere. */
-function isV3(version: number | undefined): boolean {
-  return version === HEADER_VERSION_V3;
-}
-
-/** The fixed publisher prefix length for a supported version. */
-function fixedPrefixBytes(version: number): number {
-  // v2 — deleted by P2: the 10-byte arm.
-  return isV3(version) ? V3_PUBLISHER_FIXED_PREFIX_BYTES : PUBLISHER_FIXED_PREFIX_BYTES;
-}
-
 /**
- * The v3 encode-side refusals beyond what both versions share (ADR-0036 §2
- * "Encode side": refuse every frame the v3 decoder rejects). Called once.
- *
- * v2 — deleted by P2 — keeps its historical behaviour: it accepts key-bearing +
- * discardable (so a live v2 cluster sees no SDK/MH asymmetry) and lets DataView
- * apply its usual conversion.
+ * The encode-side refusals (ADR-0036 §2 "Encode side": refuse every frame the
+ * decoder rejects) beyond the version, flag/wrap pairing and size bounds
+ * checked by the caller. Called once.
  */
-function assertV3EncodeInput(input: PublisherRegionInput, extBytes: Uint8Array): void {
+function assertEncodeInput(input: PublisherRegionInput, extBytes: Uint8Array): void {
   if (input.flags.keyBearing && input.flags.discardable) {
     throw codecReject('key_bearing_discardable', 'a key-bearing frame must not be discardable');
   }
@@ -940,8 +812,7 @@ function writeFixedPrefix(
     (flags.keyBearing ? FLAG_KEY_BEARING : 0);
   view.setUint32(PAYLOAD_LENGTH_OFFSET, payloadLength, false);
   view.setUint32(STREAM_SEQUENCE_OFFSET, input.streamSequence, false);
-  // v2 — deleted by P2: v2 has no gop_counter and stops here.
-  if (isV3(input.headerVersion)) view.setUint32(GOP_COUNTER_OFFSET, input.gopCounter, false);
+  view.setUint32(GOP_COUNTER_OFFSET, input.gopCounter, false);
 }
 
 /**
@@ -986,10 +857,7 @@ export function writeHopSequence(
   relayRegionOffset: number,
   hopSequence: number,
 ): void {
-  if (isV3(frame[VERSION_OFFSET])) {
-    // v3 only; v2 — deleted by P2 — keeps DataView's historical behaviour.
-    assertUintField('hop_sequence', hopSequence, HOP_SEQUENCE_FIELD_BYTES);
-  }
+  assertUintField('hop_sequence', hopSequence, HOP_SEQUENCE_FIELD_BYTES);
   const hopOffset = relayRegionOffset + STREAM_ID_FIELD_BYTES;
   if (hopOffset + HOP_SEQUENCE_FIELD_BYTES > frame.length) {
     throw new RangeError(
@@ -1026,12 +894,9 @@ export function buildUnsignedFrame(input: EncodeFrameInput): UnsignedFrame {
   // so a sender that pre-computed the AAD gets a byte-identical region here by
   // construction rather than by comparison.
   const publisherRegionBytes = buildPublisherRegion(input, payload.length);
-  if (isV3(input.headerVersion)) {
-    // The relay ids are opaque but must still be representable. v3 only; v2 —
-    // deleted by P2 — is unchanged.
-    assertUintField('stream_id', input.streamId, STREAM_ID_FIELD_BYTES);
-    assertUintField('hop_sequence', input.hopSequence, HOP_SEQUENCE_FIELD_BYTES);
-  }
+  // The relay ids are opaque but must still be representable.
+  assertUintField('stream_id', input.streamId, STREAM_ID_FIELD_BYTES);
+  assertUintField('hop_sequence', input.hopSequence, HOP_SEQUENCE_FIELD_BYTES);
   const publisherRegionLen = publisherRegionBytes.length;
   const total = publisherRegionLen + RELAY_REGION_BYTES + payload.length;
 

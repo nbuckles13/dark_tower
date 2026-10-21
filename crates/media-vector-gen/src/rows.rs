@@ -55,7 +55,10 @@ pub struct FrameSpec {
     pub salience: Option<u8>,
     /// AEAD nonce input.
     pub stream_sequence: u32,
-    /// Relay: subscriber slot.
+    /// The v3 `GoP` counter (ADR-0036 §2).
+    pub gop_counter: u32,
+    /// Relay `stream_id`. Hop-local: on these publisher (uplink) rows it is the
+    /// stream's send id, equal to the key id's `stream` (audio 0, video 1).
     pub stream_id: u16,
     /// Relay: transmit count.
     pub hop_sequence: u32,
@@ -76,7 +79,12 @@ pub struct FrameSpec {
 }
 
 impl FrameSpec {
-    /// A well-formed audio-shaped default: key-bearing, no extensions.
+    /// A well-formed audio-shaped default: key-bearing, no extensions, stream
+    /// 0 (audio's send id), relay `stream_id` 0 — the uplink value.
+    ///
+    /// Audio is independently decodable on every frame, so its `GoP` counter
+    /// advances with every frame exactly as its stream sequence does (§2).
+    /// Both are 7 here: the eighth frame of the stream.
     #[must_use]
     pub fn base(name: &'static str, description: &'static str, kind: &'static str) -> Self {
         Self {
@@ -85,7 +93,7 @@ impl FrameSpec {
             kind,
             key: KeyIdParts {
                 sender_id: 0x0102,
-                stream: 0x03,
+                stream: u64::from(AUDIO_SEND_ID),
                 generation: 0x04_0506_0708,
             },
             key_bearing: true,
@@ -93,7 +101,8 @@ impl FrameSpec {
             discardable: false,
             salience: None,
             stream_sequence: 7,
-            stream_id: 2,
+            gop_counter: 7,
+            stream_id: u16::from(AUDIO_SEND_ID),
             hop_sequence: 11,
             transmit_key: fixtures::ALICE_TRANSMIT_KEY,
             kek: fixtures::MEETING_KEK,
@@ -104,6 +113,11 @@ impl FrameSpec {
         }
     }
 }
+
+/// MC's send id for the audio stream today (`SendStream.stream_number`).
+pub const AUDIO_SEND_ID: u8 = 0;
+/// MC's send id for the video stream today.
+pub const VIDEO_SEND_ID: u8 = 1;
 
 /// The assembled artifacts of one frame, before JSON shaping.
 pub struct BuiltFrame {
@@ -187,6 +201,7 @@ pub fn build_frame(spec_in: &FrameSpec) -> Result<BuiltFrame, GenError> {
     let draft = PublisherRegionDraft::new(
         flags,
         spec_in.stream_sequence,
+        spec_in.gop_counter,
         wrapped_field_bytes.clone(),
         ext_bytes.clone(),
     );
@@ -227,6 +242,7 @@ pub fn build_frame(spec_in: &FrameSpec) -> Result<BuiltFrame, GenError> {
     let parts = MediaFrameParts {
         flags,
         stream_sequence: spec_in.stream_sequence,
+        gop_counter: spec_in.gop_counter,
         wrapped_transmit_key: wrapped_view,
         extensions: &ext_entries,
         stream_id: spec_in.stream_id,
@@ -281,6 +297,7 @@ pub fn build_frame(spec_in: &FrameSpec) -> Result<BuiltFrame, GenError> {
             },
             payload_length: as_u32(view.payload_length()),
             stream_sequence: view.stream_sequence(),
+            gop_counter: view.gop_counter(),
             kek_generation: wrapped.as_ref().map(|_| fixtures::KEK_GENERATION),
             stream_id: view.stream_id(),
             hop_sequence: view.hop_sequence(),

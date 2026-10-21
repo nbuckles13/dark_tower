@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Frame-v2 cross-language vector drift guard (ADR-0036 §2, story task 8).
+# Frame-v3 cross-language vector drift guard (ADR-0036 §2, story task 8).
 #
-# Pins `proto/test-vectors/frame-v2.vectors.json` against the Rust codec's
+# Pins `proto/test-vectors/frame-v3.vectors.json` against the Rust codec's
 # declarations and against the vendored external anchor. Pure jq + sed: it never
 # invokes cargo or pnpm, because Layer 3 gives each guard 30s with a hard
 # --kill-after and Layer 3 + Layer 6 share a 90s p95. All codec conformance is
@@ -51,7 +51,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # synthetic trees without touching the repository.
 ROOT="${FRAME_VECTORS_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
 
-VECTORS="${ROOT}/proto/test-vectors/frame-v2.vectors.json"
+VECTORS="${ROOT}/proto/test-vectors/frame-v3.vectors.json"
 EXTERNAL_DIR="${ROOT}/proto/test-vectors/external/sframe-wg"
 FRAME_RS="${ROOT}/crates/media-protocol/src/frame.rs"
 CODEC_RS="${ROOT}/crates/media-protocol/src/codec.rs"
@@ -423,7 +423,7 @@ ENUMERATED, not globbed: a renamed file must red here rather than silently drop 
       grep -qF -- "$lit" "${ROOT}/${site}" && fail \
         "g12 ${site} hardcodes '${lit}'; it must read the value from ${VECTORS#"${ROOT}/"}"
     done
-    grep -qE 'frame-v2\.vectors|legal_flag_mask|max_payload_bytes|cipher_suite_id' \
+    grep -qE 'frame-v3\.vectors|legal_flag_mask|max_payload_bytes|cipher_suite_id' \
       "${ROOT}/${site}" || fail \
       "g12 ${site} never references the vectors. The flag mask is 7 and cannot be checked as a \
 banned literal, so the enforcement for it is that the site demonstrably reads the SSoT."
@@ -462,7 +462,7 @@ if [[ "$VIOLATIONS" -gt 0 ]]; then
   echo ""
   echo "${VIOLATIONS} frame-vector violation(s). Regenerate with:"
   echo "    cargo run -p media-vector-gen --bin generate-frame-vectors"
-  echo "Do NOT hand-edit proto/test-vectors/frame-v2.vectors.json: a vector that contradicts a"
+  echo "Do NOT hand-edit proto/test-vectors/frame-v3.vectors.json: a vector that contradicts a"
   echo "recorded ruling is a defect to escalate, not to conform to (proto/test-vectors/README.md)."
   exit 1
 fi

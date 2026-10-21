@@ -424,6 +424,19 @@ processors:
   #   - honest ONCE VIDEO EMITS:        37 x 2 + 14 = 88  -> ~5.7 runs
   #   - ADVERSARIAL (audio, video and the `invalid` rewrite from a patched
   #     client):                        37 x 3 + 14 = 125 -> ~4.0 runs
+  # STORY 3 P2 — two per-kind `reason` additions:
+  #   - `dt_client_media_send_dropped_total` gains `gop_counter_exhausted`
+  #     (client-only; unreachable in practice, so it costs a stream only if
+  #     it ever fires): +1 per kind;
+  #   - `dt_client_media_frames_dropped_total` gains the six new
+  #     `drops_frame: true` tokens in `proto/test-vectors/frame-v3.vectors.json`
+  #     (`key_bearing_discardable`, `self_sender`, `sender_server_muted`,
+  #     `decode_over_bound`, `stream_partial_reset`, `stream_slot_mismatch`):
+  #     +6 per kind.
+  # Per-kind series 37 + 7 = 44: honest today 44 x 1 + 14 = 58 (~8.6 runs),
+  # honest once video 44 x 2 + 14 = 102 (~4.9 runs), adversarial
+  # 44 x 3 + 14 = 146 (~3.4 runs). Still above the 3-run trigger below; no
+  # cap change.
   # Kept at 500 (operations ruling, story 3 task 2): this is a fail-closed
   # tripwire, not a capacity estimate, and per-run orgs overlap only within
   # `max_stale`. Because of the multiplier, every PER-KIND name a later task

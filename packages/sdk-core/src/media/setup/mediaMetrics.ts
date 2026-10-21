@@ -91,7 +91,7 @@ const KEY_CUSTODY = 'operator';
  *
  * **The reject-reason mirror three files away is protected and this one is
  * not.** `rejectReason.ts` earns its hand-written token list with a JSON SSoT
- * (`proto/test-vectors/frame-v2.vectors.json`) and a both-directions
+ * (`proto/test-vectors/frame-v3.vectors.json`) and a both-directions
  * set-equality test. THIS list has a comment and nothing else: no shared home is
  * reachable (the natural candidate, the vectors file, is a Guarded Shared Area
  * carrying frame REJECT reasons, not send-drop reasons, so widening it is a
@@ -170,6 +170,17 @@ export const MEDIA_SEND_DROP_REASONS = {
    * A LIFECYCLE ORDERING BUG. Should read zero forever; alertable at `> 0`.
    */
   NotConnected: 'not_connected',
+  /**
+   * The stream's `gop_counter` is exhausted: `u32::MAX` was its last legal
+   * value, so ADR-0036 §2 stops the stream rather than wrap. Every later frame
+   * is refused BEFORE it is built, and counted once per ACTIVE lane — the send
+   * attempts it would have made — so `frames_sent + send_dropped` stays a
+   * per-lane attempt total; an exhausted stream reads 100% send loss on every
+   * lane. CLIENT-ONLY (MH never originates a stream). Unreachable in practice
+   * (audio at 50 fps needs ~2.7 years on one stream): zero forever, and
+   * deliberately not alerted (`docs/observability/alerts.md`).
+   */
+  GopCounterExhausted: 'gop_counter_exhausted',
 } as const;
 
 /** One of {@link MEDIA_SEND_DROP_REASONS}. Derived, never retyped at a call site. */
@@ -471,7 +482,7 @@ export class MediaKindMetrics {
    *
    * The parameter's type is `RejectReason`, whose token list is set-equality
    * pinned in both directions against
-   * `proto/test-vectors/frame-v2.vectors.json` — so the spellings are derived,
+   * `proto/test-vectors/frame-v3.vectors.json` — so the spellings are derived,
    * never retyped here.
    */
   frameDropped(reason: RejectReason): void {

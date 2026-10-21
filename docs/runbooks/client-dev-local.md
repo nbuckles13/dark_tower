@@ -801,9 +801,10 @@ tokens are emitted **individually** rather than collapsed. Grouped by what they 
 |---|---|---|
 | **Key material** | `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry` | Expected transiently at join and after a KEK rotation. **Sustained is the signal.** For why a KEK was refused or retained as it was, read `dt_client_media_kek_install_refusals_total{outcome}` and `dt_client_media_kek_retention_anomalies_total{outcome}`. → F15 |
 | **Crypto** | `unwrap_failed`, `decrypt_failed`, `signature_invalid` | `unwrap_failed` is the KEK unwrap (key **distribution**); `decrypt_failed` is the SFrame payload (key schedule or sender). Two AES-GCM failures on one path routing to opposite owners. |
-| **Structural / codec** | `unknown_version`, `reserved_flag_bit_set`, `payload_length_exceeds_max`, `payload_length_exceeds_available`, `truncated`, `extensions_too_large`, `extensions_malformed`, `trailing_bytes` | A wire-format disagreement. `unknown_version` specifically is the version-skew tell — see `mh-deployment.md` §Rollout With Media Flowing. |
+| **Structural / codec** | `unknown_version`, `reserved_flag_bit_set`, `key_bearing_discardable`, `payload_length_exceeds_max`, `payload_length_exceeds_available`, `truncated`, `extensions_too_large`, `extensions_malformed`, `trailing_bytes` | A wire-format disagreement. `unknown_version` specifically is the version-skew tell — see `mh-deployment.md` §Rollout With Media Flowing. |
 | **Protocol violation** | `no_transmit_key` | Neither a cached key nor a usable wrap. Not a third key reason. |
 | **Replay** | `replay_detected` | The replay window rejected it. |
+| **Slot / stream (story 3)** | `self_sender`, `sender_server_muted`, `decode_over_bound`, `stream_partial_reset`, `stream_slot_mismatch` | Receive-side slot and stream checks: its own echoed frame, a sender it holds as server-muted, decoded output over the slot's configured bounds, a group stream reset mid-frame, a relay slot id that is undeclared or changes within one stream. An oversized stream payload is `payload_length_exceeds_max`, not a new token. |
 
 #### Rung 6 — server-side, and which service to open
 
