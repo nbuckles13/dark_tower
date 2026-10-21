@@ -6,6 +6,7 @@ pub mod collector;
 pub mod deployment_config;
 pub mod egress_admission;
 pub mod gc_client;
+pub mod injection;
 pub mod kube;
 pub mod mc_session;
 pub mod media;

@@ -139,8 +139,12 @@ protocol change, not a call-site decision. Screen share is `media_kind="video"` 
 
 **MH is type-blind and NEVER carries `media_kind`** (ADR-0036 §7: "Any proposal that
 switches on media type inside MH is a design error to be rewritten as a behaviour").
-MH labels by the behaviour it was told — transport `datagram`/`stream`, a disposition, a
-reason — never by kind. The live hygiene kernel enforces it on the stored series
+MH labels by behaviour only — a drop or outcome `reason`, a pipeline `direction` —
+never by kind. No `mh_*` series carries the stream's transport or disposition as a label
+either: MH's attribution outcomes are reasons (`unmatched_stream`, `transport_mismatch`,
+`server_muted`), paused-source arrivals are their own series carrying only `key_custody`
+(`mh_media_paused_source_frames_total`), and MH never learns which kind a declared stream
+is — only how it is transported and what to do with it (story 3 R-20, R-29). The live hygiene kernel enforces it on the stored series
 (`crates/env-tests/src/fixtures/metric_hygiene.rs`, `Rule::MediaKindOnMh`, applied by
 `32_media_metric_hygiene.rs`); there is no source-level check yet (`docs/TODO.md`
 §Guard Coverage Gaps).
@@ -699,7 +703,7 @@ published advisory value takes a descriptive suffix instead. The canonical case 
 reason: a `_threshold` spelling tells a responder that something automatic is watching, and an
 advisory value spelled that way reads as coverage that does not exist.
 
-**Story-2 label values** (bounded vocabularies; each is defined in code and catalogued in the
+**Story-2 and story-3 label values** (bounded vocabularies; each is defined in code and catalogued in the
 service catalog):
 
 | Series | Label | Values (source) |
@@ -708,6 +712,8 @@ service catalog):
 | `mc_meeting_kek_pushes_total` | `outcome` | per recipient (`crates/mc-service/src/observability/metrics.rs`) |
 | `mc_participant_outbound_messages_dropped_total` | `payload_kind` | including the KEK-update kind |
 | `mh_media_frames_dropped_total` | `reason` | gains `server_muted` (`MediaDropReason`) |
+| `mh_media_frames_dropped_total` | `reason` | story 3 gains `unmatched_stream`, `transport_mismatch` (`MediaDropReason`) |
+| `mh_media_policy_applies_total` | `outcome` | story 3 gains `rejected_transport_inconsistent` (`PolicyApplyOutcome`) |
 | `mh_media_stream_admission_total` | `outcome` | admission outcomes |
 | `dt_client_media_kek_updates_total` | `source` | `MEDIA_KEK_SOURCES`, including `kek_update` (two values, deliberately; see `docs/observability/metrics/client.md`) |
 | `dt_client_media_capture_source` | `mode` | the `MediaCaptureSourceMode` type (a type, not a const, so `test_tone` never reaches a production bundle; `packages/sdk-core/src/media/setup/mediaMetrics.ts`) |

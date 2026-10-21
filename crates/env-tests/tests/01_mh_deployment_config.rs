@@ -165,7 +165,9 @@ use env_tests::fixtures::deployment_config::{
     check_key_ref, check_resource_field_ref, check_shape, cm_value, fetch_configmap,
     fetch_live_pod, parse_positive, pod_name_of, RefKind, ValueShape,
 };
-use env_tests::fixtures::kube::{configmap_name_for, configmap_name_for_all, REDEPLOY_HINT};
+use env_tests::fixtures::kube::{
+    configmap_name_for, configmap_name_for_all, PROFILE_CONFIGMAP, REDEPLOY_HINT,
+};
 use env_tests::fixtures::mh_config::{gauge_verdict, Conversion, GaugeVerdict};
 use env_tests::{repo_root, NAMESPACE};
 use serde_json::Value;
@@ -303,10 +305,6 @@ fn shared_configmap() -> String {
     configmap_name_for_all(MH_INSTANCES, SHARED_CONFIGMAP)
 }
 
-/// The GENERATOR BASE NAME of the shared media codec profile (story 3). Its
-/// live name is `media-codec-profile-<hash>`, resolved from the pod spec.
-const PROFILE_CONFIGMAP: &str = "media-codec-profile";
-
 /// Every key wired into BOTH MH workloads as a HARD ref: `(key, generator
 /// base, shape)`. ONE table, iterated for every instance — never a second copy
 /// per instance or per test. The base column is needed because the profile
@@ -416,7 +414,8 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
 /// RETIRING MH keys (two-deploy retirement, step 1 — docs/TODO.md §Media Path
 /// Obligations, "Delete the story-3 retired config keys"). Each ref must be
 /// present on BOTH instances and `optional: true`, AND the key must STILL be
-/// present and parseable in the live generation: the current image reads all
+/// present and parseable in the live generation: the current image reads none
+/// of them, but the PREVIOUS image (the rollback target until step 2) reads all
 /// but `MH_MAX_STREAMS` as REQUIRED, and under an optional ref an absent key is
 /// a silently unset variable that image refuses to boot on — the optional flag
 /// would hide exactly the failure the retirement must not cause.
@@ -473,8 +472,8 @@ const CONFIG_GAUGES: &[(&str, &str, Conversion)] = &[
         Conversion::Identity,
     ),
     (
-        "MH_MAX_MUTED_SOURCES_PER_MEETING",
-        "mh_media_muted_sources_per_meeting_limit",
+        "MH_MAX_SOURCE_STREAMS_PER_MEETING",
+        "mh_media_source_streams_per_meeting_limit",
         Conversion::Identity,
     ),
     (
@@ -482,28 +481,78 @@ const CONFIG_GAUGES: &[(&str, &str, Conversion)] = &[
         "mh_media_egress_budget_bytes_per_second",
         Conversion::BitsToBytesFloor,
     ),
-    (
-        "MH_STREAM_COST_AUDIO_BPS",
-        "mh_media_stream_cost_audio_bytes_per_second",
-        Conversion::BitsToBytesCeil,
-    ),
-    (
-        "MH_STREAM_COST_VIDEO_BPS",
-        "mh_media_stream_cost_video_bytes_per_second",
-        Conversion::BitsToBytesCeil,
-    ),
 ];
 
-/// The demo requirement the Kind budget is sized against: N+1 participants
-/// all hearing each other on one handler. This is the REQUIREMENT being
-/// asserted, stated once here; the Kind patch comment states it in prose and
-/// points at this test.
+/// The demo requirement the Kind budget is sized against: P participants each
+/// filling N audio plus M video receive slots on one handler (story 3: P = 6,
+/// N = 5, M = 4). This is the REQUIREMENT being asserted, stated once here; the
+/// Kind patch comment states it in prose and points at this test.
+const DEMO_P: u64 = 6;
 const DEMO_N: u64 = 5;
+const DEMO_M: u64 = 4;
 
-/// Egress streams for N+1 participants all hearing each other: every one of
-/// the N+1 subscribers receives each of the other N senders.
-const fn required_edges(n: u64) -> u64 {
-    (n + 1) * n
+/// Egress streams for P participants each filling N audio + M video slots:
+/// `P x (N + M)`.
+///
+/// ANCHOR (DRY): the same formula, same parameter meaning, is `demo_streams`
+/// in `crates/mh-service/src/config.rs` (env-tests links no service crate);
+/// `test_running_mh_publishes_the_deployed_stream_ceiling` checks the two agree
+/// through the published recommended minimum.
+const fn required_edges(p: u64, n: u64, m: u64) -> u64 {
+    p * (n + m)
+}
+
+// -----------------------------------------------------------------------------
+// The independent per-stream cost oracle (story 3 R-24)
+// -----------------------------------------------------------------------------
+//
+// MH derives each egress cost as MAX_BITRATE_BPS + per-frame overhead bits x
+// FRAME_RATE_HZ from the shared media-codec-profile. This suite cannot link
+// mh-service, so it derives the same costs INDEPENDENTLY from `media-protocol`
+// size constants and the LIVE profile, and compares MH's published gauges
+// against them.
+//
+// ANCHOR (DRY): the region set below mirrors
+// `crates/mh-service/src/config.rs::AUDIO_FRAME_OVERHEAD_BYTES` (and its
+// `NOMINAL_HEADER_BYTES`). Both sides carry the SAME pin — the header sum
+// equals `MAX_HEADER_BYTES - MAX_EXT_BYTES` — so a header region added to the
+// layout fails to compile in both places instead of letting one drift.
+
+/// Non-extension header bytes of an audio frame: publisher prefix, wrapped
+/// transmit key, extension-length field, relay region.
+const ORACLE_AUDIO_HEADER_BYTES: usize = media_protocol::frame::PUBLISHER_FIXED_PREFIX_SIZE
+    + media_protocol::frame::WRAPPED_TRANSMIT_KEY_SIZE
+    + media_protocol::frame::EXT_LENGTH_FIELD_SIZE
+    + media_protocol::frame::RELAY_REGION_SIZE;
+
+const _: () = assert!(
+    ORACLE_AUDIO_HEADER_BYTES
+        == media_protocol::frame::MAX_HEADER_BYTES - media_protocol::frame::MAX_EXT_BYTES,
+    "the frame header gained or lost a region: the cost oracle must track MAX_HEADER_BYTES"
+);
+
+/// Non-payload bytes per audio frame (the wrapped key on every frame).
+const ORACLE_AUDIO_OVERHEAD_BYTES: u64 = (ORACLE_AUDIO_HEADER_BYTES
+    + media_protocol::frame::SFRAME_OBJECT_OVERHEAD_BYTES
+    + media_protocol::frame::SIGNATURE_SIZE) as u64;
+
+/// Non-payload bytes per video frame: the wrapped key amortises to zero.
+const ORACLE_VIDEO_OVERHEAD_BYTES: u64 =
+    ORACLE_AUDIO_OVERHEAD_BYTES - media_protocol::frame::WRAPPED_TRANSMIT_KEY_SIZE as u64;
+
+/// `(audio_bps, video_bps)` derived from the live profile ConfigMap.
+fn oracle_costs_bps(profile_cm: &Value) -> (u64, u64) {
+    let p = |k| positive(profile_cm, PROFILE_CONFIGMAP, k);
+    let audio = p("MEDIA_AUDIO_MAX_BITRATE_BPS")
+        + ORACLE_AUDIO_OVERHEAD_BYTES * 8 * p("MEDIA_AUDIO_FRAME_RATE_HZ");
+    let video = p("MEDIA_VIDEO_MAX_BITRATE_BPS")
+        + ORACLE_VIDEO_OVERHEAD_BYTES * 8 * p("MEDIA_VIDEO_FRAME_RATE_HZ");
+    (audio, video)
+}
+
+/// The live profile generation BOTH MH instances reference.
+fn profile_configmap() -> String {
+    configmap_name_for_all(MH_INSTANCES, PROFILE_CONFIGMAP)
 }
 
 /// A strictly-positive deployed integer, or a panic naming the key and base.
@@ -599,21 +648,22 @@ fn assert_deployed_relationships(mh_cm: &Value, profile_cm: &Value) {
         sources >= egress,
         "MH_MAX_SOURCE_STREAMS_PER_MEETING={sources} is BELOW \
          MH_MAX_EGRESS_STREAMS_PER_MEETING={egress} (both {SHARED_CONFIGMAP}). MH refuses to boot \
-         on this (from MH-A1; the floor rule lives in crates/mh-service/src/config.rs). Note \
+         on this (the floor rule lives in crates/mh-service/src/config.rs). Note \
          this floor is MH's boot rule, NOT a guarantee that a legitimate registration fits — \
          the source-stream bound is sized against publishers (see its config.env comment)."
     );
-    // Kept until the retired muted bound's read is removed (MH-A1): the
-    // CURRENT image still refuses to boot on this inversion
-    // (`ConfigError::MutedSourceBoundBelowEgressBound`).
+    // Kept until the retirement's step 2: the current image no longer reads
+    // the muted bound, but the PREVIOUS image (the rollback target) still
+    // refuses to boot on this inversion.
     let muted = mh("MH_MAX_MUTED_SOURCES_PER_MEETING");
     assert!(
         muted >= egress,
         "MH_MAX_MUTED_SOURCES_PER_MEETING={muted} is BELOW \
-         MH_MAX_EGRESS_STREAMS_PER_MEETING={egress} (both {SHARED_CONFIGMAP}). The CURRENT MH \
-         image refuses to boot on this inversion (until MH-A1 removes the muted read). Fix: \
-         raise MH_MAX_MUTED_SOURCES_PER_MEETING to at least the egress bound, or lower the \
-         egress bound."
+         MH_MAX_EGRESS_STREAMS_PER_MEETING={egress} (both {SHARED_CONFIGMAP}). The current MH \
+         image ignores the retired key, but the PREVIOUS image (the rollback target until the \
+         retirement's step 2) refuses to boot on this inversion. Fix: raise \
+         MH_MAX_MUTED_SOURCES_PER_MEETING to at least the egress bound, or lower the egress \
+         bound."
     );
 }
 
@@ -785,7 +835,9 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
     );
 
     // Branch 2: the patch applied; is the value it set big enough? Computed
-    // from DEPLOYED values, never a literal.
+    // from DEPLOYED values, never a literal — the budget from mh-service-config
+    // and both costs DERIVED by this file's independent oracle from the live
+    // media-codec-profile (MH stopped reading the retired cost keys).
     //
     // A second encoding of MH's derivation (budget / max(cost_audio,
     // cost_video), floored), and now a CHECKED one:
@@ -800,20 +852,18 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
     // today's values in a comment, compute both orders and hold the requirement
     // against the SMALLER — so the check is true whichever order MH uses, and
     // imposes no multiple-of-8 rule MH itself does not impose.
-    let audio = positive(&cm, SHARED_CONFIGMAP, "MH_STREAM_COST_AUDIO_BPS");
-    let video = positive(&cm, SHARED_CONFIGMAP, "MH_STREAM_COST_VIDEO_BPS");
+    let (audio, video) = oracle_costs_bps(&fetch_configmap(&profile_configmap()));
     let bits_ceiling = deployed / audio.max(video);
     let byte_cost = (audio / 8).max(video / 8);
     assert!(
         byte_cost > 0,
-        "both stream costs (MH_STREAM_COST_AUDIO_BPS={audio}, \
-         MH_STREAM_COST_VIDEO_BPS={video}) are below 8 bits/s, so each converts to \
-         0 bytes/s and the byte-order ceiling divides by zero. MH would refuse or \
-         misbehave on these values; they are not real stream costs."
+        "both derived stream costs (audio {audio}, video {video} bits/s) are below 8 \
+         bits/s, so each converts to 0 bytes/s and the byte-order ceiling divides by zero. \
+         The live media-codec-profile is not a real profile."
     );
     let bytes_ceiling = (deployed / 8) / byte_cost;
     let ceiling = bits_ceiling.min(bytes_ceiling);
-    let required = required_edges(DEMO_N);
+    let required = required_edges(DEMO_P, DEMO_N, DEMO_M);
 
     // Upper side (story 2 task 10): the S9 exhaustion test must still be able
     // to drive a registration PAST this ceiling within its economic
@@ -841,12 +891,12 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
         ceiling >= required,
         "Kind stream ceiling {ceiling} (the smaller of {bits_ceiling} dividing in \
          bits and {bytes_ceiling} dividing in bytes) is BELOW the demo requirement \
-         of {required} egress streams (N={DEMO_N}: (N+1) x N). Derived from the deployed \
-         MH_EGRESS_BUDGET_BPS={deployed} / max(MH_STREAM_COST_AUDIO_BPS={audio}, \
-         MH_STREAM_COST_VIDEO_BPS={video}). Under-sizing makes admission reject \
-         partway through the largest scenario, which looks exactly like a routing \
-         bug. Fix: RAISE the budget in {PATCH}. Do not lower the costs and do not \
-         lower N."
+         of {required} egress streams (P={DEMO_P}, N={DEMO_N}, M={DEMO_M}: P x (N + M)). \
+         Derived from the deployed MH_EGRESS_BUDGET_BPS={deployed} / max(derived audio \
+         cost {audio}, derived video cost {video}) from the live media-codec-profile. \
+         Under-sizing makes admission reject partway through the largest scenario, which \
+         looks exactly like a routing bug. Fix: RAISE the budget in {PATCH}. Do not lower \
+         the profile and do not lower the demo size."
     );
 }
 
@@ -868,7 +918,7 @@ fn mh_documented_ceiling(budget_bps: u64, audio_bps: u64, video_bps: u64) -> u64
 ///
 /// Three encodings of one requirement meet here and are CHECKED rather than
 /// anchored: MH's `EGRESS_STREAM_CEILING_RECOMMENDED_MIN` (published as a
-/// gauge), this file's `required_edges(DEMO_N)`, and the Kind budget patch
+/// gauge), this file's `required_edges(DEMO_P, DEMO_N, DEMO_M)`, and the Kind budget patch
 /// sized against it.
 #[tokio::test]
 async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
@@ -878,8 +928,7 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
 
     let cm = fetch_configmap(&shared_configmap());
     let budget = positive(&cm, SHARED_CONFIGMAP, "MH_EGRESS_BUDGET_BPS");
-    let audio = positive(&cm, SHARED_CONFIGMAP, "MH_STREAM_COST_AUDIO_BPS");
-    let video = positive(&cm, SHARED_CONFIGMAP, "MH_STREAM_COST_VIDEO_BPS");
+    let (audio, video) = oracle_costs_bps(&fetch_configmap(&profile_configmap()));
     let expected = mh_documented_ceiling(budget, audio, video);
 
     let cluster = ClusterConnection::new()
@@ -899,8 +948,8 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
         assert_eq!(
             *value, expected as f64,
             "MH instance {instance} publishes mh_media_egress_stream_ceiling={value}, but \
-             the deployed ConfigMap (MH_EGRESS_BUDGET_BPS={budget}, \
-             MH_STREAM_COST_AUDIO_BPS={audio}, MH_STREAM_COST_VIDEO_BPS={video}) derives \
+             the deployed ConfigMaps (MH_EGRESS_BUDGET_BPS={budget}; derived costs audio \
+             {audio}, video {video} bits/s from the live media-codec-profile) derive \
              {expected} under MH's documented rule. Either the pod predates the config \
              ({REDEPLOY_HINT}) or MH's derivation diverged from its documentation."
         );
@@ -913,14 +962,50 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
         GAUGE_PRESENT_BOUND,
     )
     .await;
-    let required = required_edges(DEMO_N);
+    let required = required_edges(DEMO_P, DEMO_N, DEMO_M);
     for (instance, value) in &mins {
         assert_eq!(
             *value, required as f64,
             "MH instance {instance} publishes \
              mh_media_egress_stream_ceiling_recommended_min={value}, but this suite's demo \
-             requirement is required_edges(DEMO_N={DEMO_N})={required}. The two encode ONE \
-             requirement (one full all-hear-all meeting at N={DEMO_N}); change both together."
+             requirement is required_edges(P={DEMO_P}, N={DEMO_N}, M={DEMO_M})={required}. The \
+             two encode ONE requirement (one full see-and-hear meeting at the demo size); \
+             change both together."
         );
+    }
+}
+
+/// The running MH processes publish the per-stream costs this file's
+/// INDEPENDENT oracle derives from the live `media-codec-profile` (story 3
+/// R-24), in bytes (`div_ceil(8)`, as MH converts). Replaces the retired
+/// `MH_STREAM_COST_*` rows of [`CONFIG_GAUGES`]: MH no longer reads those keys.
+#[tokio::test]
+async fn test_running_mh_publishes_the_derived_stream_costs() {
+    use env_tests::cluster::ClusterConnection;
+    use env_tests::fixtures::metrics::gauge_by_instance_present;
+    use env_tests::fixtures::PrometheusClient;
+
+    let (audio, video) = oracle_costs_bps(&fetch_configmap(&profile_configmap()));
+    let cluster = ClusterConnection::new()
+        .await
+        .expect("Failed to connect to cluster - ensure port-forwards are running");
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    for (gauge, bits) in [
+        ("mh_media_stream_cost_audio_bytes_per_second", audio),
+        ("mh_media_stream_cost_video_bytes_per_second", video),
+    ] {
+        let expected = bits.div_ceil(8);
+        let values =
+            gauge_by_instance_present(&prom, gauge, MH_INSTANCES.len(), GAUGE_PRESENT_BOUND).await;
+        for (instance, value) in &values {
+            assert_eq!(
+                *value, expected as f64,
+                "MH instance {instance} publishes {gauge}={value}, but the live \
+                 media-codec-profile derives {bits} bits/s = {expected} bytes/s under \
+                 MAX_BITRATE + per-frame overhead x FRAME_RATE (this file's oracle). Either \
+                 the pod predates the profile ({REDEPLOY_HINT}) or MH's overhead derivation \
+                 diverged from the frame layout."
+            );
+        }
     }
 }

@@ -681,7 +681,7 @@ export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean
      crates/mh-service/src/config.rs::Config::from_vars() (which since story 2
      task 8 includes the four egress-budget keys and the four ADR-0036 §8
      bounds), plus MH_MAX_REGISTERED_MEETINGS and
-     MH_MAX_MUTED_SOURCES_PER_MEETING (both now required), plus the story-3
+     MH_MAX_SOURCE_STREAMS_PER_MEETING (both required), plus the story-3
      keys MH-A1/MH-A2/MH-B make required (harmless to set before then). VALUES
      mirror infra/services/mh-service/config.env (the budget mirrors the Kind
      overlay's, so a local run is not starved) and, for the five MEDIA_* keys,
@@ -689,9 +689,9 @@ export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean
      single homes — if they disagree, they win. MH_POD_MEMORY_LIMIT_BYTES is
      injected in-cluster by the downward API from resources.limits.memory (no
      ConfigMap key); set it by hand for a local run. MH_MAX_STREAMS is
-     deliberately absent: it is retired and no longer read. The RETIRED
-     MH_STREAM_COST_* and MH_MAX_MUTED_SOURCES_PER_MEETING are still required by
-     the current image and are kept until MH-A1 removes the reads. -->
+     deliberately absent: it is retired and no longer read, as are
+     MH_STREAM_COST_* and MH_MAX_MUTED_SOURCES_PER_MEETING (both stream costs are
+     derived from the MEDIA_* profile keys above). -->
 
 ```bash
 # The log target is the crate name, mh_service (not "media_handler").
@@ -718,7 +718,7 @@ export MH_MAX_CONNECTIONS="500"
 # Drain window (required). In-cluster this is derived from the pod's grace period; locally, set it.
 export MH_TERMINATION_GRACE_SECONDS="35"
 # Egress-budget chain (required).
-export MH_EGRESS_BUDGET_BPS="100000000"
+export MH_EGRESS_BUDGET_BPS="82640000"
 export MH_EGRESS_REJECTION_RATIO_THRESHOLD="0.05"
 export MH_MAX_REGISTERED_MEETINGS="8192"
 # ADR-0036 §8 policy bounds (required).
@@ -744,11 +744,6 @@ export MEDIA_VIDEO_FRAME_RATE_HZ="30"
 export MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS="500"
 export MEDIA_AUDIO_MAX_BITRATE_BPS="48000"
 export MEDIA_AUDIO_FRAME_RATE_HZ="50"
-# RETIRED — still required by the current image; removed with MH-A1 (superseded by the derived costs
-# and MH_MAX_SOURCE_STREAMS_PER_MEETING).
-export MH_STREAM_COST_AUDIO_BPS="90000"
-export MH_STREAM_COST_VIDEO_BPS="2500000"
-export MH_MAX_MUTED_SOURCES_PER_MEETING="512"
 export OTLP_ENDPOINT="http://localhost:4317"
 export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean OTEL_ENABLED, NOT on OTLP_ENDPOINT being set;
 # leaving this "false" means OTLP_ENDPOINT above has no effect. Enabling needs a reachable collector

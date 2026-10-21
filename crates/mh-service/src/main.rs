@@ -173,11 +173,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy_apply_timeout_ms = config.policy_limits.policy_apply_timeout_ms,
         // Registered-meeting cap (story 2 R-21), a resource guard.
         max_registered_meetings = config.policy_limits.max_registered_meetings,
-        // Muted-source bound (story 2 R-9), a pre-allocation guard.
-        max_muted_sources_per_meeting = config.policy_limits.max_muted_sources_per_meeting,
+        // Source-stream bound (story 3), a pre-allocation guard; also bounds
+        // the superseded `server_muted_sources`.
+        max_source_streams_per_meeting = config.policy_limits.max_source_streams_per_meeting,
+        // The shared media-codec-profile values both derived costs come from.
+        media_audio_max_bitrate_bps = config.media_codec_profile.audio_max_bitrate_bps,
+        media_audio_frame_rate_hz = config.media_codec_profile.audio_frame_rate_hz,
+        media_video_max_bitrate_bps = config.media_codec_profile.video_max_bitrate_bps,
+        media_video_frame_rate_hz = config.media_codec_profile.video_frame_rate_hz,
         // Egress-budget admission chain (story 2 R-19, R-23). BOTH ends of the
         // single bits->bytes conversion are logged, so it is checkable from
-        // this line: the `_bps` fields are the ConfigMap values verbatim (BITS),
+        // this line: the budget `_bps` is the ConfigMap value verbatim and the
+        // cost `_bps` are DERIVED from the profile values above (BITS),
         // the `_bytes_per_second` fields are what enforcement and the gauges
         // read. `egress_stream_ceiling` is the value enforced at admission AND
         // advertised to GC as `max_streams` — the same field.
@@ -207,6 +214,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // long-lived pod.
         "Configuration loaded successfully"
     );
+
+    // Retired keys still present in the environment (two-deploy retirement,
+    // step 1: present ON PURPOSE, so INFO, not WARN). Names only — never a
+    // value — so nobody tunes a key believing it still applies.
+    if !config.retired_keys_present.is_empty() {
+        info!(
+            retired_keys = ?config.retired_keys_present,
+            "Retired configuration keys are set and IGNORED by this image (kept only so a \
+             rollback to the previous image still boots); see docs/TODO.md 'Delete the story-3 \
+             retired config keys'"
+        );
+    }
 
     // The derived STREAM ceiling, loudly, on its own line (never "subscriber
     // ceiling": a subscriber holds N slots).

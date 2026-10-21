@@ -45,7 +45,8 @@ mod tests {
 
     #[test]
     fn kind_sizing_matches_the_recorded_figures() {
-        // Kind: ceiling 100 (250M / 2.5M), MC_MAX_RECEIVE_SLOTS 8.
+        // Kind: ceiling 100 (the budget over the derived video cost at the
+        // production profile it runs today), MC_MAX_RECEIVE_SLOTS 8.
         assert_eq!(size_s9_meeting(100, 8), Some((26, 8)));
         // The pre-story-2-task-10 budget, for the record.
         assert_eq!(size_s9_meeting(40, 8), Some((11, 8)));

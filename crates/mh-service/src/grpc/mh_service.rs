@@ -119,7 +119,9 @@ impl MhMediaService {
 
     /// Build the response from MH's own live state.
     ///
-    /// The only place `applied_generation` and `transport_mode` come from.
+    /// The only place `applied_generation`, `transport_mode` and
+    /// `applied_source_streams` come from — all three from ONE snapshot load,
+    /// so they describe the same installed generation and cannot tear.
     fn respond(&self, meeting: &crate::routing::MeetingKey) -> RegisterMeetingResponse {
         let snapshot = self.session_manager.routing_snapshot();
         RegisterMeetingResponse {
@@ -130,12 +132,13 @@ impl MhMediaService {
             applied_generation: snapshot.generation_for(meeting),
             handler_id: self.handler_id.clone(),
             process_start_epoch_ms: self.process_start_epoch_ms,
-            transport_mode: snapshot
-                .transport_mode_for(meeting)
-                .unwrap_or(TransportMode::Unspecified) as i32,
-            // Story 3 per-stream echo: MH-A1 builds it from the applied
-            // snapshot. Empty until then.
-            applied_source_streams: vec![],
+            // Superseded single-mode echo (field 5; deleted by MC-B): story
+            // 2's value on the transitional reading, `Unspecified` once
+            // `source_streams` is declared (see `Declarations`).
+            transport_mode: snapshot.legacy_transport_echo_for(meeting) as i32,
+            // The per-stream echo, from the APPLIED snapshot, never the
+            // received request.
+            applied_source_streams: snapshot.applied_source_streams_for(meeting),
         }
     }
 }
@@ -198,13 +201,15 @@ impl MediaHandlerService for MhMediaService {
         let policy = match MeetingPolicy::from_request(&req, &self.policy_limits) {
             Ok(policy) => policy,
             Err(rejection) => {
-                metrics::record_media_policy_apply(PolicyApplyOutcome::RejectedInvalid);
+                metrics::record_media_policy_apply(rejection.outcome());
                 metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "error");
                 tracing::warn!(
                     target: "mh.grpc.service",
                     key_custody = KEY_CUSTODY_OPERATOR,
                     reason = rejection.reason(),
+                    policy_apply_outcome = rejection.outcome().as_label(),
                     egress_stream_count = req.egress_streams.len(),
+                    source_stream_count = req.source_streams.len(),
                     "Rejecting whole registration; live policy unchanged"
                 );
                 return Err(Status::invalid_argument(rejection.reason()));
@@ -251,7 +256,13 @@ impl MediaHandlerService for MhMediaService {
             }
         };
 
-        let declared_mode = policy.transport_mode;
+        // What MC declared, captured before `policy` moves into the apply, for
+        // the two-ends check below. Identity-bearing values; only COUNTS ever
+        // leave this function.
+        let declared_streams = echo_set(&policy.declarations.echo());
+        let declared_mode = policy
+            .declarations
+            .legacy_transport_echo(policy.edges.len());
         let received_generation = policy.generation;
         let meeting = policy.meeting.clone();
 
@@ -311,40 +322,49 @@ impl MediaHandlerService for MhMediaService {
         //
         // Gated on `Applied`, and that gate is load-bearing rather than
         // tidiness. On every other outcome MH deliberately installed nothing,
-        // so `applied_mode` is the PRIOR generation's mode (or `UNSPECIFIED`
-        // when nothing was ever installed) and a "disagrees" line would be
-        // comparing two different generations' modes and reporting the
-        // difference as a contract fault. That fires on exactly the paths an
-        // operator is already reading logs on — mailbox-full, apply-timeout,
-        // stale re-assert, and the whole task-11→13 gen-0 window — naming a
-        // transport-mode disagreement as the cause of an incident whose real
-        // cause is one WARN above it, with a completely different remedy. Each
-        // of those outcomes reports itself; this line exists for the one case
-        // nothing else can see.
+        // so the echo is the PRIOR generation's (or empty when nothing was ever
+        // installed) and a "disagrees" line would be comparing two different
+        // generations and reporting the difference as a contract fault. That
+        // fires on exactly the paths an operator is already reading logs on —
+        // mailbox-full, apply-timeout, stale re-assert, the gen-0 window —
+        // naming a declaration disagreement as the cause of an incident whose
+        // real cause is one WARN above it, with a completely different remedy.
+        // Each of those outcomes reports itself; this line exists for the one
+        // case nothing else can see.
         //
         // What survives the gate is the case worth the noise: an idempotent
-        // re-assert at an ALREADY-INSTALLED generation whose content changed
-        // transport mode. MH honours the generation and does not swap
-        // (ADR-0036 §8), so it reports `applied` while running a different mode
-        // from the one MC just declared — a genuine two-ends divergence that no
-        // outcome label distinguishes. A fresh install cannot reach here: it
-        // installs the mode it just parsed.
-        let applied_mode =
-            TransportMode::try_from(response.transport_mode).unwrap_or(TransportMode::Unspecified);
+        // re-assert at an ALREADY-INSTALLED generation whose declared streams
+        // changed. MH honours the generation and does not swap (ADR-0036 §8),
+        // so it reports `applied` while running streams other than the ones MC
+        // just declared — a genuine two-ends divergence that no outcome label
+        // distinguishes. A fresh install cannot reach here: it installs exactly
+        // what it just parsed.
+        //
+        // PER STREAM (story 3): the declared source streams against the
+        // applied echo, as SETS of (sender, stream, transport) — never
+        // per-mode counts, which read green on a swap. On the transitional
+        // reading the superseded single-mode echo (field 5) is compared too.
+        // COUNTS ONLY in the log: which sender or stream differs is the
+        // per-stream identity ADR-0036 §11 bars.
         if outcome == PolicyApplyOutcome::Applied {
-            if let Some(declared) = declared_mode {
-                if declared != applied_mode {
-                    tracing::warn!(
-                        target: "mh.grpc.service",
-                        key_custody = KEY_CUSTODY_OPERATOR,
-                        declared_transport_mode = declared.as_str_name(),
-                        applied_transport_mode = applied_mode.as_str_name(),
-                        received_generation,
-                        applied_generation = response.applied_generation,
-                        "MC declared a transport mode that disagrees with the one MH \
-                         has installed at this generation"
-                    );
-                }
+            let applied_streams = echo_set(&response.applied_source_streams);
+            let applied_mode = TransportMode::try_from(response.transport_mode)
+                .unwrap_or(TransportMode::Unspecified);
+            if applied_streams != declared_streams || applied_mode != declared_mode {
+                tracing::warn!(
+                    target: "mh.grpc.service",
+                    key_custody = KEY_CUSTODY_OPERATOR,
+                    declared_source_stream_count = declared_streams.len(),
+                    applied_source_stream_count = applied_streams.len(),
+                    differing_source_stream_count =
+                        applied_streams.symmetric_difference(&declared_streams).count(),
+                    declared_transport_mode = declared_mode.as_str_name(),
+                    applied_transport_mode = applied_mode.as_str_name(),
+                    received_generation,
+                    applied_generation = response.applied_generation,
+                    "MC declared source streams that disagree with the ones MH has installed \
+                     at this generation"
+                );
             }
         }
 
@@ -443,6 +463,15 @@ impl MediaHandlerService for MhMediaService {
             }
         }
     }
+}
+
+/// A per-stream echo as a comparable SET of `(sender, stream, transport)`.
+fn echo_set(
+    echo: &[proto_gen::dark_tower::internal::v1::SourceStreamEcho],
+) -> std::collections::HashSet<(u32, u32, i32)> {
+    echo.iter()
+        .map(|e| (e.sender_id, e.stream_number, e.transport_mode))
+        .collect()
 }
 
 /// The caller-identity id checks, shared by BOTH `MediaHandlerService` RPCs so the
@@ -1294,46 +1323,40 @@ mod tests {
     }
 
     /// The same case one field over: an equal-generation re-assert that
-    /// changes `transport_mode`.
+    /// changes a declared source stream (story 3).
     ///
     /// This is the one path on which the §8 two-ends-must-agree WARN can fire,
-    /// and it is the reason that WARN is gated on `Applied` rather than
-    /// emitted whenever the request's mode differs from the echo. The
-    /// machine-checkable half is the echo: `transport_mode` must report what
-    /// MH has INSTALLED, never what the request declared. Echoing the request
-    /// would make MC's comparison agree with itself and the divergence
-    /// undetectable at both ends simultaneously.
+    /// and it is the reason that WARN is gated on `Applied`. The
+    /// machine-checkable half is the echo: `applied_source_streams` must
+    /// report what MH has INSTALLED, never what the request declared. Echoing
+    /// the request would make MC's comparison agree with itself and the
+    /// divergence undetectable at both ends simultaneously.
     #[tokio::test]
-    async fn reassert_at_an_equal_generation_echoes_the_installed_transport_mode() {
+    async fn reassert_at_an_equal_generation_echoes_the_installed_source_streams() {
         let (svc, sm) = make_service();
-
-        svc.register_meeting(make_policy_request("m-1", 3, vec![egress(1, 5, 0, 5)]))
+        svc.register_meeting(Request::new(mixed_request("m-1", 3)))
             .await
             .unwrap();
         let snapshot_before = sm.routing_snapshot();
 
-        let mut changed = egress(1, 5, 0, 5);
-        changed.transport_mode = TransportMode::StreamPerGroup as i32;
+        let mut changed = mixed_request("m-1", 3);
+        changed.source_streams[1].transport_mode = TransportMode::Datagram as i32;
+        changed.egress_streams.truncate(1);
         let resp = svc
-            .register_meeting(make_policy_request("m-1", 3, vec![changed]))
+            .register_meeting(Request::new(changed))
             .await
             .unwrap()
             .into_inner();
 
         assert_eq!(
-            resp.transport_mode,
-            TransportMode::Datagram as i32,
-            "the echo must report the INSTALLED mode, never the requested one"
+            echo_set(&resp.applied_source_streams),
+            echo_set(&mixed_request_echo()),
+            "the echo must report the INSTALLED streams, never the requested ones"
         );
         assert_eq!(resp.applied_generation, 3);
         assert!(
             Arc::ptr_eq(&snapshot_before, &sm.routing_snapshot()),
-            "a transport-mode change at an unchanged generation must not swap"
-        );
-        assert_eq!(
-            sm.routing_snapshot()
-                .transport_mode_for(&MeetingKey::new("m-1")),
-            Some(TransportMode::Datagram)
+            "a declaration change at an unchanged generation must not swap"
         );
     }
 
@@ -1668,9 +1691,215 @@ mod tests {
     }
 
     // =======================================================================
-    // Transport mode
+    // Transport mode and the per-stream echo (story 3 R-20)
     // =======================================================================
 
+    /// Publisher 5 declares audio (0, DATAGRAM) and video (1,
+    /// `STREAM_PER_GROUP`); subscriber 6 watches both.
+    fn mixed_request(meeting: &str, generation: u64) -> RegisterMeetingRequest {
+        use mh_test_utils::media_policy::{egress_from, register_request_declared, source_stream};
+        use proto_gen::dark_tower::internal::v1::SourceDisposition;
+        register_request_declared(
+            meeting,
+            generation,
+            vec![egress_from(1, 6, 0, 5, 0), egress_from(2, 6, 4, 5, 1)],
+            vec![
+                source_stream(5, 0, TransportMode::Datagram, SourceDisposition::Forward),
+                source_stream(
+                    5,
+                    1,
+                    TransportMode::StreamPerGroup,
+                    SourceDisposition::Paused,
+                ),
+            ],
+        )
+    }
+
+    fn mixed_request_echo() -> Vec<proto_gen::dark_tower::internal::v1::SourceStreamEcho> {
+        use proto_gen::dark_tower::internal::v1::SourceStreamEcho;
+        vec![
+            SourceStreamEcho {
+                sender_id: 5,
+                stream_number: 0,
+                transport_mode: TransportMode::Datagram as i32,
+            },
+            SourceStreamEcho {
+                sender_id: 5,
+                stream_number: 1,
+                transport_mode: TransportMode::StreamPerGroup as i32,
+            },
+        ]
+    }
+
+    /// A mixed-mode registration applies, echoes every applied source stream,
+    /// and echoes the superseded field 5 as UNSPECIFIED.
+    #[tokio::test]
+    async fn a_mixed_mode_registration_applies_and_echoes_every_source_stream() {
+        let (svc, _sm) = make_service();
+        let resp = svc
+            .register_meeting(Request::new(mixed_request("m", 1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.applied_generation, 1);
+        assert_eq!(resp.applied_source_streams, mixed_request_echo());
+        assert_eq!(resp.transport_mode, TransportMode::Unspecified as i32);
+    }
+
+    /// The echo is the APPLIED snapshot's: a rejected or generation-0 re-push
+    /// after a good apply leaves the echo at the PRIOR set (the
+    /// applied-not-received pin for the new field).
+    #[tokio::test]
+    async fn the_echo_stays_the_prior_applied_set_across_a_rejected_or_gen0_push() {
+        let (svc, _sm) = make_service();
+        svc.register_meeting(Request::new(mixed_request("m", 1)))
+            .await
+            .unwrap();
+
+        let mut bad = mixed_request("m", 2);
+        bad.source_streams.remove(1); // video candidate now undeclared
+        let err = svc.register_meeting(Request::new(bad)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let mut gen0 = mixed_request("m", 0);
+        gen0.source_streams.truncate(1);
+        gen0.egress_streams.truncate(1);
+        let resp = svc
+            .register_meeting(Request::new(gen0))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.applied_generation, 1);
+        assert_eq!(resp.applied_source_streams, mixed_request_echo());
+    }
+
+    /// Each apply-time reject counts its own outcome token once, every other
+    /// outcome zero, and leaves the prior policy live.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table of every reject, deliberately in one place"
+    )]
+    async fn each_reject_counts_its_token_and_leaves_the_prior_policy_live() {
+        use common::observability::testing::MetricAssertion;
+        use mh_test_utils::media_policy::source_stream;
+        use proto_gen::dark_tower::internal::v1::SourceDisposition;
+
+        let (svc, sm) = make_service_with_limits(PolicyLimits {
+            max_source_streams_per_meeting: 3,
+            ..PolicyLimits::for_tests()
+        });
+        svc.register_meeting(Request::new(mixed_request("m", 1)))
+            .await
+            .unwrap();
+
+        let cases: Vec<(&str, RegisterMeetingRequest, PolicyApplyOutcome)> = vec![
+            (
+                "duplicate (sender, stream)",
+                {
+                    let mut r = mixed_request("m", 2);
+                    r.source_streams.push(source_stream(
+                        5,
+                        0,
+                        TransportMode::Datagram,
+                        SourceDisposition::Paused,
+                    ));
+                    r
+                },
+                PolicyApplyOutcome::RejectedInvalid,
+            ),
+            (
+                "UNSPECIFIED disposition",
+                {
+                    let mut r = mixed_request("m", 2);
+                    r.source_streams[0].disposition = SourceDisposition::Unspecified as i32;
+                    r
+                },
+                PolicyApplyOutcome::RejectedInvalid,
+            ),
+            (
+                "UNSPECIFIED transport",
+                {
+                    let mut r = mixed_request("m", 2);
+                    r.source_streams[0].transport_mode = TransportMode::Unspecified as i32;
+                    r
+                },
+                PolicyApplyOutcome::RejectedInvalid,
+            ),
+            (
+                "over MH_MAX_SOURCE_STREAMS_PER_MEETING",
+                {
+                    let mut r = mixed_request("m", 2);
+                    for stream in 2..=3 {
+                        r.source_streams.push(source_stream(
+                            7,
+                            stream,
+                            TransportMode::Datagram,
+                            SourceDisposition::Forward,
+                        ));
+                    }
+                    r
+                },
+                PolicyApplyOutcome::RejectedInvalid,
+            ),
+            (
+                "undeclared candidate",
+                {
+                    let mut r = mixed_request("m", 2);
+                    r.source_streams.remove(1);
+                    r
+                },
+                PolicyApplyOutcome::RejectedTransportInconsistent,
+            ),
+            (
+                "mixed-transport candidates on one egress",
+                {
+                    let mut r = mixed_request("m", 2);
+                    r.egress_streams[0].candidate_sources.push(CandidateSource {
+                        sender_id: 5,
+                        stream_number: 1,
+                    });
+                    r
+                },
+                PolicyApplyOutcome::RejectedTransportInconsistent,
+            ),
+            (
+                "transitional egress not DATAGRAM",
+                {
+                    let mut stream = egress(1, 6, 0, 5);
+                    stream.transport_mode = TransportMode::StreamPerGroup as i32;
+                    register_request("m", 2, vec![stream])
+                },
+                PolicyApplyOutcome::RejectedTransportInconsistent,
+            ),
+        ];
+
+        for (name, request, token) in cases {
+            let snap = MetricAssertion::snapshot();
+            let err = svc
+                .register_meeting(Request::new(request))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{name}");
+            for outcome in PolicyApplyOutcome::ALL {
+                snap.counter("mh_media_policy_applies_total")
+                    .with_labels(&[("outcome", outcome.as_label()), ("key_custody", "operator")])
+                    .assert_delta(u64::from(outcome == token));
+            }
+            // The prior policy is still live: generation 1 and its echo.
+            let live = sm.routing_snapshot();
+            let meeting = MeetingKey::new("m");
+            assert_eq!(live.generation_for(&meeting), 1, "{name}");
+            assert_eq!(
+                live.applied_source_streams_for(&meeting),
+                mixed_request_echo(),
+                "{name}"
+            );
+        }
+    }
+
+    /// The transitional reading keeps story 2's reject of an egress naming no
+    /// transport mode, and never defaults it to datagram.
     #[tokio::test]
     async fn unspecified_transport_mode_rejects_and_never_defaults_to_datagram() {
         let (svc, sm) = make_service();
@@ -1683,40 +1912,30 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert_eq!(
-            sm.routing_snapshot()
-                .transport_mode_for(&MeetingKey::new("m")),
-            None,
-            "MH must not fall back to datagram for a stream that names no mode"
+            sm.routing_snapshot().generation_for(&MeetingKey::new("m")),
+            0,
+            "nothing installed for a stream that names no mode"
         );
     }
 
+    /// Story 2's field-5 echo on the transitional reading: DATAGRAM when an
+    /// egress was applied — the story-2 MC compares it unconditionally — plus
+    /// the synthesized per-stream entries.
     #[tokio::test]
-    async fn heterogeneous_transport_modes_reject_rather_than_echoing_one_of_n() {
+    async fn the_transitional_reading_echoes_field_5_as_story_2_did() {
         let (svc, _sm) = make_service();
-        let mut second = egress(2, 6, 0, 6);
-        second.transport_mode = TransportMode::StreamPerGroup as i32;
-        let err = svc
-            .register_meeting(make_policy_request(
-                "m",
-                1,
-                vec![egress(1, 5, 0, 5), second],
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[tokio::test]
-    async fn applied_transport_mode_is_echoed() {
-        let (svc, _sm) = make_service();
-        let mut stream = egress(1, 5, 0, 5);
-        stream.transport_mode = TransportMode::StreamPerGroup as i32;
         let resp = svc
-            .register_meeting(make_policy_request("m", 1, vec![stream]))
+            .register_meeting(make_policy_request("m", 1, vec![egress(1, 6, 0, 5)]))
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(resp.transport_mode, TransportMode::StreamPerGroup as i32);
+        assert_eq!(resp.transport_mode, TransportMode::Datagram as i32);
+        assert_eq!(
+            echo_set(&resp.applied_source_streams),
+            [(5, 0, TransportMode::Datagram as i32)]
+                .into_iter()
+                .collect()
+        );
     }
 
     // =======================================================================

@@ -1475,7 +1475,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "The ENFORCED per-stream costs in BYTES per second (MH_STREAM_COST_AUDIO_BPS / MH_STREAM_COST_VIDEO_BPS are bits, converted once at load with div_ceil(8)): mh_media_stream_cost_audio_bytes_per_second and mh_media_stream_cost_video_bytes_per_second. The heavier one divides the budget into mh_media_egress_stream_ceiling. Deliberately NOT on the Egress Budget panel. A CONFIG REFLECTION, not a signal: static for the process lifetime (published once at startup from the one field enforcement reads), so a step here means a pod started on different configuration. No alert selects on it. env-test 01 compares it with the deployed ConfigMap. key_custody=operator.",
+      "description": "The ENFORCED per-stream costs in BYTES per second, DERIVED at load from the shared media-codec-profile (MEDIA_*_MAX_BITRATE_BPS plus per-frame overhead x MEDIA_*_FRAME_RATE_HZ, in bits, converted once with div_ceil(8); the retired MH_STREAM_COST_* keys are no longer read): mh_media_stream_cost_audio_bytes_per_second and mh_media_stream_cost_video_bytes_per_second. The heavier one divides the budget into mh_media_egress_stream_ceiling. Deliberately NOT on the Egress Budget panel. A CONFIG REFLECTION, not a signal: static for the process lifetime (published once at startup from the one field enforcement reads), so a step here means a pod started on different configuration. No alert selects on it. env-test 01 compares it with an independent derivation from the live media-codec-profile. key_custody=operator.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1579,7 +1579,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "The ADR-0036 section 8 pre-allocation bounds on ONE registration: MH_MAX_EGRESS_STREAMS_PER_MEETING (mh_media_egress_streams_per_meeting_limit), MH_MAX_CANDIDATE_SOURCES_PER_EGRESS (mh_media_candidate_sources_per_egress_limit) and MH_MAX_MUTED_SOURCES_PER_MEETING (mh_media_muted_sources_per_meeting_limit). A registration exceeding one is refused whole (mh_media_policy_applies_total{outcome=\"rejected_invalid\"}). A CONFIG REFLECTION, not a signal: static for the process lifetime (published once at startup from the one field enforcement reads), so a step here means a pod started on different configuration. No alert selects on it. env-test 01 compares it with the deployed ConfigMap. key_custody=operator.",
+      "description": "The ADR-0036 section 8 pre-allocation bounds on ONE registration: MH_MAX_EGRESS_STREAMS_PER_MEETING (mh_media_egress_streams_per_meeting_limit), MH_MAX_CANDIDATE_SOURCES_PER_EGRESS (mh_media_candidate_sources_per_egress_limit) and MH_MAX_SOURCE_STREAMS_PER_MEETING (mh_media_source_streams_per_meeting_limit; story 3, bounds source_streams and the superseded server_muted_sources, replacing the retired muted-source bound). A registration exceeding one is refused whole (mh_media_policy_applies_total{outcome=\"rejected_invalid\"}). A CONFIG REFLECTION, not a signal: static for the process lifetime (published once at startup from the one field enforcement reads), so a step here means a pod started on different configuration. No alert selects on it. env-test 01 compares it with the deployed ConfigMap. key_custody=operator.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1680,8 +1680,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "max by (instance) (mh_media_muted_sources_per_meeting_limit)",
-          "legendFormat": "muted/meeting {{instance}}",
+          "expr": "max by (instance) (mh_media_source_streams_per_meeting_limit)",
+          "legendFormat": "source streams/meeting {{instance}}",
           "range": true,
           "refId": "C"
         }
@@ -1780,6 +1780,104 @@
         }
       ],
       "title": "Policy Apply Timeout",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Per-stream ingress attribution drops (story 3 R-20). unmatched_stream: the uplink relay id names no stream MC declared for the bound sender (declaration drift, or a sender labelling outside its declaration; on the transitional no-source_streams reading, any label but 0). transport_mismatch: a declared stream on another transport (a sender or contract fault). Zero is healthy: both are zero-initialised, so a flat 0 is calm and an ABSENT series is a fault. Saturation-or-input tokens, deliberately not on the Zero-Forever panel. Ingress drops, inside the ingress accounting identity. Rates (ADR-0029); pod-level, no identity. Layout and alerts: OBS-B. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Frames/s"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 64
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(mh_media_frames_dropped_total{direction=\"ingress\",reason=~\"unmatched_stream|transport_mismatch\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Attribution Drops (unmatched_stream / transport_mismatch)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_paused_source_frames_total: frames on a PAUSED (client-muted) source stream (story 3 R-17). An ARRIVAL OVERLAY, NOT A DROP: PAUSED forwards, so these frames are already in mh_media_frames_forwarded_total{direction=\"ingress\"}; never add this to the received total. Brief arrivals around a mute toggle are expected; SUSTAINED is a client sending while client-muted (runbook and alert: OPS-B / OBS-B). Rates (ADR-0029). key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Frames/s"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 64
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (instance) (rate(mh_media_paused_source_frames_total[$__rate_interval]))",
+          "legendFormat": "paused arrivals {{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Paused-Source Arrivals",
       "type": "timeseries"
     }
   ],

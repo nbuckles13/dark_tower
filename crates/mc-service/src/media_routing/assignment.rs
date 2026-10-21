@@ -181,7 +181,8 @@ pub struct HandlerAssignment {
     /// multi-candidate render (story 3 selection) voids this bound, which must
     /// then be re-derived. `egress_streams` is bounded by
     /// `MH_MAX_EGRESS_STREAMS_PER_MEETING`, which MH's boot refuses to exceed
-    /// `MH_MAX_MUTED_SOURCES_PER_MEETING` (`crates/mh-service/src/config.rs`).
+    /// `MH_MAX_SOURCE_STREAMS_PER_MEETING` — the bound MH applies to this set
+    /// (`crates/mh-service/src/config.rs`).
     /// So a host muting every participant cannot make MC emit a registration
     /// MH rejects WHOLE — which would freeze the meeting's forwarding at its
     /// previous policy.

@@ -153,7 +153,7 @@ fn static_admission_gauges_publish_the_fields_enforcement_reads() {
         max_total_egress_edges: 4_321,
         policy_apply_timeout_ms: 2_500,
         max_registered_meetings: 1_234,
-        max_muted_sources_per_meeting: 909,
+        max_source_streams_per_meeting: 909,
     };
     let snap = MetricAssertion::snapshot();
     publish_egress_admission(&admission, &limits);
@@ -187,9 +187,9 @@ fn static_admission_gauges_publish_the_fields_enforcement_reads() {
     snap.gauge("mh_media_candidate_sources_per_egress_limit")
         .with_labels(&[KEY_CUSTODY])
         .assert_value(limits.max_candidate_sources_per_egress as f64);
-    snap.gauge("mh_media_muted_sources_per_meeting_limit")
+    snap.gauge("mh_media_source_streams_per_meeting_limit")
         .with_labels(&[KEY_CUSTODY])
-        .assert_value(limits.max_muted_sources_per_meeting as f64);
+        .assert_value(limits.max_source_streams_per_meeting as f64);
     // SECONDS: the field is ms; 2_500 ms publishes 2.5.
     snap.gauge("mh_media_policy_apply_timeout_seconds")
         .with_labels(&[KEY_CUSTODY])

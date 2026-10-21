@@ -130,7 +130,10 @@ use env_tests::fixtures::mh_grpc::{
 };
 use env_tests::fixtures::PrometheusClient;
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
-use proto_gen::dark_tower::internal::v1::{EndMeetingRequest, RegisterMeetingRequest};
+use proto_gen::dark_tower::internal::v1::{
+    EndMeetingRequest, RegisterMeetingRequest, SourceDisposition, SourceStream,
+};
+use proto_gen::dark_tower::signaling::v1::TransportMode;
 use tonic::transport::Channel;
 use tonic::Code;
 
@@ -202,8 +205,14 @@ async fn a_long_running_mh_pod_releases_an_ended_meeting_and_admits_like_a_fresh
         }
     }
 
+    // Both readings of the registration (story 3): the transitional one (no
+    // `source_streams`, as the story-2 MC sends) and the declared one. The
+    // declared probe declares ONE source stream and still carries no edge, so
+    // it moves no shared capacity either.
     for handler in &handlers {
-        exercise_one_handler(&prom, &cleanup, &token, handler).await;
+        for declared in [false, true] {
+            exercise_one_handler(&prom, &cleanup, &token, handler, declared).await;
+        }
     }
 }
 
@@ -215,6 +224,7 @@ async fn exercise_one_handler(
     cleanup: &ReleaseOnDrop,
     token: &str,
     handler: &Handler,
+    declared: bool,
 ) {
     let run = uuid::Uuid::new_v4().simple().to_string();
     let meeting_id = format!("env-test-teardown-{run}");
@@ -282,11 +292,12 @@ async fn exercise_one_handler(
     //    test registers NO edges"). The auth positive control: an error status
     //    here is the token or the forward, never teardown logic.
     cleanup.record(&handler.grpc_url, &meeting_id, &owner_mc);
+    let mut first = register(&meeting_id, &owner_mc, HELD_GENERATION);
+    if declared {
+        first.source_streams = vec![PROBE_SOURCE_STREAM];
+    }
     let registered = client
-        .register_meeting(authed(
-            token,
-            register(&meeting_id, &owner_mc, HELD_GENERATION),
-        ))
+        .register_meeting(authed(token, first))
         .await
         .unwrap_or_else(|s| {
             // RESOURCE_EXHAUSTED is SHARED CAPACITY, not a teardown fault: with
@@ -307,6 +318,24 @@ async fn exercise_one_handler(
             )
         })
         .into_inner();
+    if declared {
+        // The per-stream echo comes from the APPLIED snapshot: exactly the
+        // one declared stream, with the transport MH installed.
+        let echoed: Vec<(u32, u32, i32)> = registered
+            .applied_source_streams
+            .iter()
+            .map(|e| (e.sender_id, e.stream_number, e.transport_mode))
+            .collect();
+        assert_eq!(
+            echoed,
+            vec![(
+                PROBE_SOURCE_STREAM.sender_id,
+                PROBE_SOURCE_STREAM.stream_number,
+                PROBE_SOURCE_STREAM.transport_mode
+            )],
+            "ECHO on {name}: a declared registration must echo its applied source streams"
+        );
+    }
     assert_eq!(
         registered.applied_generation, HELD_GENERATION,
         "PRECONDITION: {name} echoed applied_generation {} for a ZERO-EDGE generation-\
@@ -505,6 +534,16 @@ async fn assert_stale(
         "STALE-PROBE on {name} ({when}): generation 1 must be refused as stale while the meeting is held at generation {HELD_GENERATION}; any other echo means MH does not hold this meeting's state"
     );
 }
+
+/// The one source stream the declared-reading probe declares (story 3). A
+/// sender id no real participant holds in this fresh meeting id; no edge
+/// names it, so nothing forwards.
+const PROBE_SOURCE_STREAM: SourceStream = env_tests::fixtures::injection::source_stream(
+    1,
+    0,
+    TransportMode::Datagram,
+    SourceDisposition::Forward,
+);
 
 /// Test 29's probe: the shared fixture (see `probe_registration` for the
 /// empty-edges and never-generation-0 decisions this test documents).
