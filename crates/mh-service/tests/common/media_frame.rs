@@ -108,55 +108,18 @@ pub fn labelled_datagram(stream_sequence: u32, uplink_id: u16, payload: &[u8]) -
 }
 
 fn datagram_with(stream_sequence: u32, uplink_id: u16, payload: &[u8], shape: FrameShape) -> Bytes {
-    let signature = fixture_signature();
-
-    // Synthetic, not key material: fixed patterns, never CSPRNG output, and
-    // never used to decrypt anything. MH cannot read them and does not try.
-    let wrapped_key = [0x11_u8; WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES];
-    let wrap_tag = [0x22_u8; AEAD_TAG_BYTES];
-    let wrapped = WrappedTransmitKey::new(7, &wrapped_key, &wrap_tag);
-
-    // The one registered extension type, at a value inside its declared
-    // accepted range — the encoder enforces the whole grammar, so a value
-    // outside it would fail to encode rather than produce a bad fixture.
-    let salience = [42_u8];
-    let extensions = [Extension {
-        ext_type: EXT_TYPE_SALIENCE,
-        value: &salience,
-    }];
-
-    let parts = MediaFrameParts {
-        flags: FrameFlags {
-            independently_decodable: true,
-            discardable: false,
-            key_bearing: matches!(shape, FrameShape::KeyBearing),
-        },
+    // Audio is independently decodable on every frame, so its GoP counter
+    // advances with every frame exactly as the stream sequence does
+    // (ADR-0036 §2). Same rule as the env-tests twin. One frame builder for
+    // both paths: `stream_frame`.
+    stream_frame(
         stream_sequence,
-        // Audio is independently decodable on every frame, so its GoP counter
-        // advances with every frame exactly as the stream sequence does
-        // (ADR-0036 §2). Same rule as the env-tests twin.
-        gop_counter: stream_sequence,
-        wrapped_transmit_key: match shape {
-            FrameShape::KeyBearing => Some(wrapped),
-            FrameShape::Minimal | FrameShape::WithExtensions => None,
-        },
-        extensions: match shape {
-            FrameShape::WithExtensions => &extensions,
-            FrameShape::Minimal | FrameShape::KeyBearing => &[],
-        },
-        // The UPLINK relay id is the publisher's audio send id (MC's
-        // `stream_number`, 0), exactly as the SDK and the env-tests twin's
-        // `AUDIO_SEND_ID` stamp it: MH attributes ingress by (bound sender,
-        // this id) against the declared source streams (story 3 R-20), so any
-        // other value is `unmatched_stream`. A suite asserting the DOWNLINK
-        // rewrite uses a non-zero subscriber slot so the rewrite stays
-        // observable ([`UPLINK_AUDIO_SEND_ID`]).
-        stream_id: uplink_id,
-        hop_sequence: 0xDEAD_BEEF,
+        stream_sequence,
+        uplink_id,
+        true,
         payload,
-        signature: &signature,
-    };
-    encode_frame(&parts).expect("fixture frame must encode")
+        shape,
+    )
 }
 
 /// The relay-region offset a frame's own header determines.
@@ -179,4 +142,115 @@ pub fn relay_region_offset(frame: &[u8]) -> usize {
 pub fn marker_of(frame: &[u8]) -> u8 {
     let view = media_protocol::codec::decode_datagram(frame).expect("frame must decode");
     view.payload().first().copied().unwrap_or(0)
+}
+
+/// The uplink relay id of the video stream in story 3 fixtures: MC's video
+/// send id (`SendStream.stream_number`).
+pub const UPLINK_VIDEO_SEND_ID: u16 = 1;
+
+/// One stream-carried (video-shaped) frame: `uplink_id` in the relay region,
+/// `group_start` as the independently-decodable flag, `gop` as the `GoP`
+/// counter, and `payload` verbatim. Built through the production codec.
+#[must_use]
+pub fn stream_frame(
+    stream_sequence: u32,
+    gop: u32,
+    uplink_id: u16,
+    group_start: bool,
+    payload: &[u8],
+    shape: FrameShape,
+) -> Bytes {
+    let signature = fixture_signature();
+    let wrapped_key = [0x11_u8; WRAPPED_TRANSMIT_KEY_MATERIAL_BYTES];
+    let wrap_tag = [0x22_u8; AEAD_TAG_BYTES];
+    let wrapped = WrappedTransmitKey::new(7, &wrapped_key, &wrap_tag);
+    let salience = [42_u8];
+    let extensions = [Extension {
+        ext_type: EXT_TYPE_SALIENCE,
+        value: &salience,
+    }];
+    let parts = MediaFrameParts {
+        flags: FrameFlags {
+            independently_decodable: group_start,
+            discardable: false,
+            key_bearing: matches!(shape, FrameShape::KeyBearing),
+        },
+        stream_sequence,
+        gop_counter: gop,
+        wrapped_transmit_key: match shape {
+            FrameShape::KeyBearing => Some(wrapped),
+            FrameShape::Minimal | FrameShape::WithExtensions => None,
+        },
+        extensions: match shape {
+            FrameShape::WithExtensions => &extensions,
+            FrameShape::Minimal | FrameShape::KeyBearing => &[],
+        },
+        stream_id: uplink_id,
+        hop_sequence: 0xDEAD_BEEF,
+        payload,
+        signature: &signature,
+    };
+    encode_frame(&parts).expect("fixture frame must encode")
+}
+
+/// One group: a group start followed by `deltas` delta frames, every frame's
+/// payload a distinct marker, all sharing `gop`.
+#[must_use]
+pub fn stream_group(first_sequence: u32, gop: u32, uplink_id: u16, deltas: u32) -> Vec<Bytes> {
+    (0..=deltas)
+        .map(|i| {
+            let marker = u8::try_from((first_sequence + i) % 251).unwrap_or(0);
+            stream_frame(
+                first_sequence + i,
+                gop,
+                uplink_id,
+                i == 0,
+                &[marker; 40],
+                FrameShape::ALL
+                    .get(usize::try_from(i).unwrap_or(0) % FrameShape::ALL.len())
+                    .copied()
+                    .unwrap_or(FrameShape::Minimal),
+            )
+        })
+        .collect()
+}
+
+/// A downlink stream's bytes parsed back into frames (header fields and the
+/// payload), through the production codec. Panics on a malformed stream.
+#[must_use]
+pub fn parse_stream(bytes: &[u8]) -> Vec<ParsedFrame> {
+    let mut frames = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let view = media_protocol::codec::decode_stream_frame(rest)
+            .expect("downlink stream must be well-formed")
+            .expect("downlink stream must hold whole frames");
+        frames.push(ParsedFrame {
+            stream_id: view.stream_id(),
+            hop: view.hop_sequence(),
+            stream_sequence: view.stream_sequence(),
+            gop: view.gop_counter(),
+            group_start: view.flags().independently_decodable,
+            payload: view.payload().to_vec(),
+        });
+        rest = rest.get(view.encoded_len()..).unwrap_or(&[]);
+    }
+    frames
+}
+
+/// One frame read back off a downlink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedFrame {
+    /// Downlink relay id (the subscriber's slot).
+    pub stream_id: u16,
+    /// MH's downlink hop number.
+    pub hop: u32,
+    /// The publisher's end-to-end sequence.
+    pub stream_sequence: u32,
+    /// The `GoP` counter.
+    pub gop: u32,
+    /// Independently decodable.
+    pub group_start: bool,
+    /// The payload bytes.
+    pub payload: Vec<u8>,
 }

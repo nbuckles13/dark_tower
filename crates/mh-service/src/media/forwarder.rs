@@ -1,9 +1,13 @@
-//! Per-connection and per-egress-stream forward state.
+//! Per-publisher-connection forward state, and the hop-sequence counter type.
 //!
-//! Holds the hop sequence, the fan-out arena, the pre-resolved metric handles
-//! and the latency sampler. No setup and no teardown live here: constructing
-//! one of these is the caller's job (`crate::webtransport::connection`), and
-//! ADR-0036 §11 keeps lifecycle a **sibling** of the media directory.
+//! Holds the fan-out arena, the pre-resolved metric handles and the latency
+//! sampler. The hop COUNTERS live per egress edge in
+//! `crate::media::edge_runtime::EdgeRuntime` (story 3 MH-A2), not here: the
+//! hop is per (SUBSCRIBER connection, media stream), and a publisher-owned
+//! counter restarts whenever the edge's source changes. No setup and no
+//! teardown live here: constructing one of these is the caller's job
+//! (`crate::webtransport::connection`), and ADR-0036 §11 keeps lifecycle a
+//! **sibling** of the media directory.
 
 use crate::config::EGRESS_QUEUE_FRAMES;
 use crate::media::sampler::LatencySampler;
@@ -11,16 +15,17 @@ use crate::observability::metrics::MediaMetricHandles;
 use crate::routing::{MeetingKey, SenderId};
 use bytes::BytesMut;
 use media_protocol::frame::HOP_SEQUENCE_FIELD_BYTES;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-/// The relay's per-(connection, media stream) downlink send count.
+/// The relay's per-(subscriber connection, media stream) downlink send count.
 ///
 /// # MH runtime state, not wire format
 ///
 /// This type lands here rather than in `media-protocol` deliberately: the hop
 /// counter is **MH-generated and never publisher-set**, and the wire contract is
 /// already complete without it — `frame::HOP_SEQUENCE_FIELD_BYTES` gives the
-/// width and `codec::rewrite_relay_region` takes the value as a `u32`
+/// width and the codec's rewrite entry points take the value as a `u32`
 /// parameter. There is no cross-language reason to widen the codec's surface
 /// for a counter only a relay owns.
 ///
@@ -34,25 +39,40 @@ use std::sync::Arc;
 /// so the two are separate types with separate homes and this one has no reset
 /// at all.
 ///
-/// # Scope: per (connection, MEDIA stream), never per QUIC stream
+/// # Scope: per (subscriber connection, MEDIA stream), never per QUIC stream
 ///
-/// Keyed by `egress_stream_id`, MC's policy-plane identity, which is stable
-/// across slot renumbering. A video QUIC stream lasts one group of pictures
-/// (§1), so a counter scoped to it would reset at every keyframe and detect
-/// nothing.
+/// One lives in each egress edge's runtime cell, keyed by `egress_stream_id`
+/// (MC's policy-plane identity, stable across slot renumbering AND across a
+/// slot refill — `mc-service`'s `assignment::egress_stream_id`). It therefore
+/// continues across group streams (a video QUIC stream lasts one group, ADR §1,
+/// so a counter scoped to it would reset at every keyframe and detect nothing)
+/// and across a source switch or refill, for both transports. Before story 3
+/// MH-A2 it lived in the PUBLISHER's forwarder, so an audio slot refilled A→C
+/// restarted from C's counter.
 ///
 /// # The number is consumed at REWRITE time, not at send time
 ///
 /// It must be assigned before the first lossy step, because a counter
 /// incremented only on success can never reveal loss — every number that exists
 /// would have been delivered, which defeats the field's purpose. So a frame
-/// shed by egress-queue overflow *after* its hop number was assigned leaves a
-/// gap, and the subscriber reads that gap as loss, which it **is**. An
-/// intentionally unforwarded frame — one whose routing lookup never reached the
-/// rewrite — consumes no number, which is §2's rule that gaps must reflect
+/// shed by egress-queue overflow, or a stream frame whose downlink is reset
+/// mid-payload, *after* its hop number was assigned leaves a gap, and the
+/// subscriber reads that gap as loss, which it **is**. An intentionally
+/// unforwarded frame — one gated, server-muted, unattributed or with no local
+/// subscriber — consumes no number, which is §2's rule that gaps must reflect
 /// genuine transport loss and never selection policy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct HopSequence(u32);
+///
+/// # Unique, not ordered, across concurrent takers
+///
+/// Atomic with `Relaxed` ordering: the only property needed is that every
+/// number is handed out once. During a datagram slot refill or a video switch,
+/// two publishers' tasks can briefly take numbers for one edge concurrently, so
+/// numbers are unique and monotonic per edge but sends may interleave out of
+/// numbering order across the two sources (and on two live video streams).
+/// ADR §2 asks the receiver to detect GAPS; reordering across a switch is not
+/// loss.
+#[derive(Debug, Default)]
+pub struct HopSequence(AtomicU32);
 
 /// The width is derived from the wire format, never restated. If the field ever
 /// widens, this fails to compile rather than silently truncating on the wire.
@@ -65,61 +85,29 @@ impl HopSequence {
     /// A counter that has sent nothing.
     #[must_use]
     pub const fn new() -> Self {
-        Self(0)
+        Self(AtomicU32::new(0))
     }
 
     /// The number to write into this frame's relay region, advancing the
     /// counter.
     ///
-    /// Wrapping, not saturating: a saturating counter pins at `u32::MAX` and
-    /// every subsequent frame looks like a duplicate to the receiver, which is
-    /// worse than a single wrap the receiver reads as one large gap.
-    pub fn take(&mut self) -> u32 {
-        let value = self.0;
-        self.0 = self.0.wrapping_add(1);
-        value
+    /// Wrapping, not saturating (`fetch_add` wraps): a saturating counter pins
+    /// at `u32::MAX` and every subsequent frame looks like a duplicate to the
+    /// receiver, which is worse than a single wrap the receiver reads as one
+    /// large gap.
+    pub fn take(&self) -> u32 {
+        self.0.fetch_add(1, Ordering::Relaxed)
     }
 
     /// The next number this counter would hand out. Test-facing.
     #[must_use]
-    pub const fn peek(self) -> u32 {
-        self.0
-    }
-}
-
-/// Per-egress-stream state: the identity MC assigned, and its hop counter.
-#[derive(Debug)]
-pub struct StreamForwarder {
-    /// MC-allocated policy-plane identity for this egress stream.
-    egress_stream_id: u32,
-    hop: HopSequence,
-}
-
-impl StreamForwarder {
-    /// A forwarder for one egress stream, having sent nothing.
-    #[must_use]
-    pub const fn new(egress_stream_id: u32) -> Self {
-        Self {
-            egress_stream_id,
-            hop: HopSequence::new(),
-        }
+    pub fn peek(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
     }
 
-    /// The egress stream this forwarder counts for.
-    #[must_use]
-    pub const fn egress_stream_id(&self) -> u32 {
-        self.egress_stream_id
-    }
-
-    /// The hop number for the frame being rewritten now.
-    pub fn take_hop(&mut self) -> u32 {
-        self.hop.take()
-    }
-
-    /// The next hop number, without consuming it. Test-facing.
-    #[must_use]
-    pub const fn peek_hop(&self) -> u32 {
-        self.hop.peek()
+    #[cfg(test)]
+    const fn starting_at(value: u32) -> Self {
+        Self(AtomicU32::new(value))
     }
 }
 
@@ -137,13 +125,6 @@ impl StreamForwarder {
 pub struct ConnectionForwarder {
     meeting: MeetingKey,
     sender: SenderId,
-    /// One entry per egress stream this sender feeds.
-    ///
-    /// A `Vec` with a linear scan rather than a `HashMap`: a sender feeds a
-    /// handful of edges, the scan is over `u32`s in one cache line's worth of
-    /// memory, and it allocates only when a new egress stream is first seen
-    /// (amortized, never per frame).
-    streams: Vec<StreamForwarder>,
     /// Fan-out scratch space for edges 2..N.
     ///
     /// Edge 1 takes the zero-copy path (the ingress buffer is rewritten in
@@ -179,7 +160,6 @@ impl ConnectionForwarder {
         Self {
             meeting,
             sender,
-            streams: Vec::new(),
             arena: BytesMut::with_capacity(EGRESS_QUEUE_FRAMES * arena_frame_bytes),
             handles,
             sampler: LatencySampler::new(sample_ratio),
@@ -216,11 +196,10 @@ impl ConnectionForwarder {
     }
 
     /// The forward path's mutable working set, split so the fan-out closure can
-    /// borrow the arena and the stream counters disjointly from the handles.
+    /// borrow the arena disjointly from the handles.
     pub(crate) fn parts(&mut self) -> ForwardParts<'_> {
         ForwardParts {
             meeting: &self.meeting,
-            streams: &mut self.streams,
             arena: &mut self.arena,
             handles: &self.handles,
         }
@@ -230,43 +209,8 @@ impl ConnectionForwarder {
 /// The disjoint borrows [`crate::media::forward::forward_one`] needs.
 pub(crate) struct ForwardParts<'a> {
     pub(crate) meeting: &'a MeetingKey,
-    pub(crate) streams: &'a mut Vec<StreamForwarder>,
     pub(crate) arena: &'a mut BytesMut,
     pub(crate) handles: &'a MediaMetricHandles,
-}
-
-impl ForwardParts<'_> {
-    /// The hop number to write for `egress_stream_id`, creating the counter on
-    /// first sight and advancing it.
-    ///
-    /// Returns the number rather than a `&mut StreamForwarder` so there is no
-    /// find-then-insert double borrow to route around, and so the only way to
-    /// obtain a hop number is to consume one — a caller cannot peek at the next
-    /// value and then decide not to send, which is how a counter silently
-    /// stops meaning "what the transmitter sent".
-    pub(crate) fn take_hop_for(&mut self, egress_stream_id: u32) -> u32 {
-        if let Some(stream) = self
-            .streams
-            .iter_mut()
-            .find(|stream| stream.egress_stream_id() == egress_stream_id)
-        {
-            return stream.take_hop();
-        }
-        let mut fresh = StreamForwarder::new(egress_stream_id);
-        let hop = fresh.take_hop();
-        self.streams.push(fresh);
-        hop
-    }
-
-    /// The next hop number for `egress_stream_id` without consuming it.
-    /// Test-facing.
-    #[cfg(test)]
-    pub(crate) fn peek_hop_for(&self, egress_stream_id: u32) -> Option<u32> {
-        self.streams
-            .iter()
-            .find(|stream| stream.egress_stream_id() == egress_stream_id)
-            .map(StreamForwarder::peek_hop)
-    }
 }
 
 #[cfg(test)]
@@ -275,12 +219,12 @@ mod tests {
 
     #[test]
     fn hop_sequence_advances_by_one_and_wraps_rather_than_pinning() {
-        let mut hop = HopSequence::new();
+        let hop = HopSequence::new();
         assert_eq!(hop.take(), 0);
         assert_eq!(hop.take(), 1);
         assert_eq!(hop.peek(), 2);
 
-        let mut near_max = HopSequence(u32::MAX);
+        let near_max = HopSequence::starting_at(u32::MAX);
         assert_eq!(near_max.take(), u32::MAX);
         assert_eq!(
             near_max.peek(),
@@ -288,27 +232,5 @@ mod tests {
             "wrapping, not saturating: a pinned counter makes every later frame look like a \
              duplicate"
         );
-    }
-
-    #[test]
-    fn each_egress_stream_gets_its_own_counter() {
-        let mut forwarder = ConnectionForwarder::new(
-            MeetingKey::new("m"),
-            SenderId::from_wire(1).unwrap(),
-            Arc::new(crate::observability::metrics::resolve_media_handles()),
-            1.0,
-            256,
-        );
-        let mut parts = forwarder.parts();
-        assert_eq!(parts.take_hop_for(10), 0);
-        assert_eq!(parts.take_hop_for(10), 1);
-        assert_eq!(
-            parts.take_hop_for(20),
-            0,
-            "a second egress stream counts independently — per MEDIA stream, not per connection"
-        );
-        assert_eq!(parts.take_hop_for(10), 2);
-        assert_eq!(parts.peek_hop_for(10), Some(3));
-        assert_eq!(parts.peek_hop_for(999), None);
     }
 }

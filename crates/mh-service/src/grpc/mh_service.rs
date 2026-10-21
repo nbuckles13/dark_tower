@@ -548,7 +548,7 @@ mod tests {
     }
 
     fn make_service_with_limits(limits: PolicyLimits) -> (MhMediaService, SessionManagerHandle) {
-        let sm = SessionManagerHandle::new(crate::session::admission::test_admission());
+        let sm = SessionManagerHandle::new_for_tests(crate::session::admission::test_admission());
         let svc = MhMediaService::new(
             sm.clone(),
             TEST_HANDLER_ID.to_string(),
@@ -567,8 +567,9 @@ mod tests {
     fn make_service_with_unspawned_actor(
         limits: PolicyLimits,
     ) -> (MhMediaService, SessionManagerHandle, SessionManagerActor) {
-        let (sm, actor) =
-            SessionManagerHandle::new_with_parts(crate::session::admission::test_admission());
+        let (sm, actor) = SessionManagerHandle::new_with_parts_for_tests(
+            crate::session::admission::test_admission(),
+        );
         let svc = MhMediaService::new(
             sm.clone(),
             TEST_HANDLER_ID.to_string(),
@@ -1398,7 +1399,7 @@ mod tests {
     }
 
     fn make_service_with_ceiling(stream_ceiling: usize) -> (MhMediaService, SessionManagerHandle) {
-        let sm = SessionManagerHandle::new(crate::session::StreamAdmission {
+        let sm = SessionManagerHandle::new_for_tests(crate::session::StreamAdmission {
             stream_ceiling,
             rejection_ratio_threshold: 0.05,
         });

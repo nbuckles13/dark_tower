@@ -64,7 +64,8 @@ struct WtSuite {
 impl WtSuite {
     async fn start() -> Self {
         let jwks = JwksRig::start(44, "mh-otel-wt-integ-01").await;
-        let session_manager = SessionManagerHandle::new(mh_test_utils::admission::never_binding());
+        let session_manager =
+            SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding());
         let jwt_validator = Arc::new(MhJwtValidator::new(jwks.jwks_client(), 300));
         let mc_client = Arc::new(McClient::new(test_token_receiver()));
 

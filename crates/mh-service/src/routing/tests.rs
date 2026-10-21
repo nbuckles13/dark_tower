@@ -49,8 +49,8 @@ fn attribute(
         Attribution::ServerMuted => Seen::ServerMuted,
         Attribution::Unmatched => Seen::Unmatched,
         Attribution::TransportMismatch => Seen::TransportMismatch,
-        Attribution::Route { paused, edges } => {
-            Seen::Route(paused, edges.map(|e| e.egress_stream_id).collect())
+        Attribution::Route { paused, edges, .. } => {
+            Seen::Route(paused, edges.map(|e| e.edge.egress_stream_id).collect())
         }
     }
 }
@@ -87,7 +87,7 @@ fn mixed(audio: SourceDisposition, video: SourceDisposition) -> RegisterMeetingR
 }
 
 fn install(req: &RegisterMeetingRequest) -> RoutingTable {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     table.install(&parse(req).unwrap());
     table
 }
@@ -153,7 +153,7 @@ fn stream_number_is_eight_bit_and_rejects_never_truncates() {
 /// implementations.
 #[test]
 fn sender_id_valid_in_one_meeting_does_not_resolve_in_another() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     table.install(&policy("meeting-a", 1, vec![egress(1, 5, 0, 5)]));
     table.install(&policy("meeting-b", 1, vec![egress(1, 7, 0, 7)]));
     let snapshot = table.load();
@@ -186,7 +186,7 @@ fn sender_id_valid_in_one_meeting_does_not_resolve_in_another() {
 /// resolve in meeting B, where the same ordinal declares nothing.
 #[test]
 fn a_declared_source_stream_in_one_meeting_does_not_resolve_in_another() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     table.install(&parse(&mixed(FWD, FWD)).unwrap());
     // The realistic collision: sender ids are meeting-local ordinals, so
     // meeting B has its OWN sender 5 — declaring only its video stream.
@@ -351,7 +351,7 @@ fn union_muted_sender_drops_server_muted_whatever_source_streams_says() {
 /// every other label unmatched, muted senders via the shortcut.
 #[test]
 fn transitional_reading_reproduces_story_2() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     let req = register_request_muted("m", 1, vec![egress(1, 6, 0, 5), egress(2, 5, 0, 6)], &[6]);
     table.install(&parse(&req).unwrap());
     let snapshot = table.load();
@@ -393,7 +393,7 @@ fn transitional_reading_reproduces_story_2() {
 
 #[test]
 fn transitional_reading_with_no_egress_echoes_unspecified() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     table.install(&policy("m", 1, vec![]));
     assert_eq!(
         table
@@ -443,7 +443,7 @@ fn a_mixed_mode_registration_applies_and_echoes_every_declared_stream() {
     assert_eq!(parsed.edges[0].transport, Some(DGRAM));
     assert_eq!(parsed.edges[1].transport, Some(SPG));
 
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     table.install(&parsed);
     let snapshot = table.load();
     let meeting = MeetingKey::new("m");
@@ -795,7 +795,7 @@ fn reject_reasons_are_static_and_carry_no_request_data() {
 
 #[test]
 fn install_publishes_generation_and_the_echo() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     let meeting = MeetingKey::new("m");
     assert_eq!(table.load().generation_for(&meeting), 0);
     assert_eq!(
@@ -811,7 +811,7 @@ fn install_publishes_generation_and_the_echo() {
 
 #[test]
 fn installing_one_meeting_leaves_another_meetings_routes_untouched() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     table.install(&policy("a", 1, vec![egress(1, 5, 0, 5)]));
     let a_before = Arc::clone(table.load().routes_for(&MeetingKey::new("a")).unwrap());
 
@@ -826,7 +826,7 @@ fn installing_one_meeting_leaves_another_meetings_routes_untouched() {
 
 #[test]
 fn projected_total_subtracts_the_meetings_own_current_edges() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     let three = vec![egress(1, 5, 0, 5), egress(2, 6, 0, 6), egress(3, 7, 0, 7)];
     table.install(&policy("m", 1, three.clone()));
     assert_eq!(table.load().total_edges(), 3);
@@ -845,7 +845,7 @@ fn projected_total_subtracts_the_meetings_own_current_edges() {
 
 #[test]
 fn total_edges_tracks_replacement_not_accumulation() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     table.install(&policy(
         "m",
         1,
@@ -865,7 +865,7 @@ fn total_edges_tracks_replacement_not_accumulation() {
 /// untouched BY POINTER, and forgets the released meeting's generation.
 #[test]
 fn remove_returns_edges_forgets_generation_and_spares_other_meetings() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     table.install(&policy(
         "a",
         9,
@@ -920,7 +920,7 @@ fn per_source_state_is_freed_when_the_meetings_routes_are_removed() {
 /// kernel stays consistent across install -> remove -> re-install.
 #[test]
 fn remove_of_an_absent_meeting_does_not_swap_and_reinstall_is_fresh() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     table.install(&policy("a", 4, vec![egress(1, 5, 0, 5)]));
     let before = table.load();
     assert!(!table.remove(&MeetingKey::new("never")));
@@ -990,7 +990,7 @@ fn malformed_muted_sender_id_rejects_through_the_same_width_rule() {
 fn muted_sender_with_no_edge_here_is_held_not_rejected() {
     // Sender 9 sources nothing on this handler and may not be connected:
     // `internal.proto` says HOLD (it stays muted when it attaches).
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     let req = register_request_muted("m", 1, vec![egress(1, 5, 0, 6)], &[9]);
     table.install(&parse(&req).unwrap());
     assert!(table
@@ -1003,7 +1003,7 @@ fn muted_sender_with_no_edge_here_is_held_not_rejected() {
 /// silences an innocent sender in meeting B.
 #[test]
 fn sender_muted_in_one_meeting_is_not_muted_in_another() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     table.install(
         &parse(&register_request_muted(
             "meeting-a",
@@ -1032,7 +1032,7 @@ fn sender_muted_in_one_meeting_is_not_muted_in_another() {
 fn an_absent_meeting_reads_not_muted() {
     // The documented fail-open arm: safe only because `attribute` then fails
     // closed (`NoPolicy`).
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     assert!(!table
         .load()
         .is_server_muted(&MeetingKey::new("nowhere"), sender(1)));
@@ -1044,7 +1044,7 @@ fn an_absent_meeting_reads_not_muted() {
 
 #[test]
 fn unmute_is_the_next_generation_without_the_sender() {
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     let meeting = MeetingKey::new("m");
     table.install(
         &parse(&register_request_muted(
@@ -1084,7 +1084,7 @@ fn multiple_candidates_all_index_the_same_edge() {
         sender_id: 6,
         stream_number: 0,
     });
-    let table = RoutingTable::new();
+    let table = RoutingTable::unbounded_for_tests();
     table.install(&policy("m", 1, vec![stream]));
     let snapshot = table.load();
     assert_eq!(

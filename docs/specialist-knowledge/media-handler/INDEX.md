@@ -12,6 +12,7 @@
 - Entry point (process epoch sampled once, advisory WARNs) → `crates/mh-service/src/main.rs`; module roots + `per-frame-trace` gate → `src/lib.rs`
 - Config: required env vars, transport constants, drain window, `NOMINAL_AUDIO_FRAME_BYTES` → `crates/mh-service/src/config.rs`
 - Policy bounds + ceilings (incl. registered-meeting cap, source-stream bound) → `config.rs:PolicyLimits`, `config.rs:MAX_REGISTERED_MEETINGS_CEILING`, `config.rs:MAX_SOURCE_STREAMS_PER_MEETING_CEILING`
+- Stream-path limits (opens/s, backlog, stall) → `config.rs:StreamPathLimits`; pod memory boot check + per-connection ledger → `config.rs:check_pod_memory`, `config.rs:per_connection_memory_bound_bytes`, `config.rs:MEMORY_CHECK_FRACTION`; declared send window → `config.rs:CONNECTION_SEND_WINDOW_BYTES`
 - Egress-budget admission config (budget, costs DERIVED from `media-codec-profile`, derived stream ceiling) → `config.rs:EgressAdmission`, `config.rs:derived_stream_cost_bps`, `config.rs:AUDIO_FRAME_OVERHEAD_BYTES`; profile reads + audio-envelope refusals → `config.rs:parse_media_codec_profile`; demo sizing → `config.rs:demo_streams`; retired keys → `config.rs:RETIRED_KEYS`; boot refusals → `config.rs:ConfigError`
 - Process-incarnation epoch → `crates/mh-service/src/process.rs`; errors → `src/errors.rs`
 
@@ -19,7 +20,7 @@
 - `RegisterMeeting` (validate → upsert → apply → echo applied generation) + `EndMeeting` → `crates/mh-service/src/grpc/mh_service.rs:end_meeting`
 - Session actor: lifecycle + config-apply mailboxes → `crates/mh-service/src/session/mod.rs`; registration + cap → `session/mod.rs:handle_register_meeting`; teardown → `session/mod.rs:handle_end_meeting`; `mc_id` ownership → `session/mod.rs:Ownership`
 - Stream admission (budget enforcement, rejection-ratio window) → `crates/mh-service/src/session/admission.rs`, `session/mod.rs:handle_config_apply`
-- Forwarding policy + ArcSwap routing snapshot; edge accounting kernel → `crates/mh-service/src/routing/mod.rs:edges_after_displacing`
+- Forwarding policy + ArcSwap routing snapshot; edge accounting kernel → `crates/mh-service/src/routing/mod.rs:edges_after_displacing`; per-edge runtime cells carried across re-push → `routing/mod.rs:MeetingRoutes::build`, `RoutingTable::sender_ended`
 - Per-stream attribution (THE lookup, datagram + stream path) → `routing/mod.rs:RoutingSnapshot::attribute` / `Attribution`; sender-level mute shortcut → `routing/mod.rs:is_server_muted`; apply-time rejects + outcome mapping → `routing/mod.rs:PolicyRejection::outcome`
 - Declared `source_streams`, dispositions, per-stream echo, transitional story-2 reading (deleted by MC-B) → `crates/mh-service/src/routing/sources.rs:transitional_story2_reading`
 - Subscriber registry + `SenderBindings` → `crates/mh-service/src/session/mod.rs`
@@ -29,10 +30,11 @@
 ## Data Plane (Client ↔ MH)
 - WebTransport server + `quinn::TransportConfig` → `crates/mh-service/src/webtransport/server.rs:build_transport_config`
 - Connection handler, sender-binding gate, media session start, per-connection `close` token → `webtransport/connection.rs:resolve_sender_binding()`, `connection.rs:start_media_session`
-- Transport seam trait (ADR-0036 §10) → `crates/mh-service/src/transport/mod.rs`; real impl → `webtransport/media_transport.rs`
+- Transport seam trait (ADR-0036 §10; uni streams both ways, drop-resets contract, reset/stop codes) → `crates/mh-service/src/transport/mod.rs`; real impl → `webtransport/media_transport.rs`; declared send window → `webtransport/server.rs:build_transport_config`
 - Hot-path boundary (no telemetry macros under it) → `crates/mh-service/src/media/mod.rs`
 - `forward_one` (sender shortcut first, decode, attribute, drop or fan-out over the source stream's edges) → `media/forward.rs`; `HopSequence` + `ConnectionForwarder` → `media/forwarder.rs`
-- Drop-oldest ring → `media/queue.rs`; pre-alloc caps + stream rate limiter → `media/caps.rs`; per-connection loops + `FramesRead` → `media/ingress.rs`; random sampler → `media/sampler.rs`
+- Drop-oldest ring → `media/queue.rs`; pre-alloc caps + `TokenBucket` (stream-open rate) → `media/caps.rs`; per-connection loops + `FramesRead` → `media/ingress.rs`; random sampler → `media/sampler.rs`
+- Stream-per-group video (story 3 MH-A2): accept loop + group task + exit table → `media/stream_ingress.rs:run_stream_ingress`, `GroupState::terminate`; switch state machine (Waiting/Forwarding/SwitchPending/Paused, `waiting_with_source_seen` for MH-B) → `media/edge.rs:EdgeMachine`; per-edge cell (hop for BOTH transports, downlinks, reconcile) → `media/edge_runtime.rs:EdgeRuntime`, `reconcile`; per-destination backlog, copy-on-backlog, writer → `media/downlink.rs:Downlink`, `run_writer`, `run_stream_egress`; hop counter type → `media/forwarder.rs:HopSequence`
 
 ## Media Protocol (ADR-0036 §2)
 - Frame v3 layout + size constants → `crates/media-protocol/src/frame.rs`; parser + entry points + `ALL_REJECT_REASONS` → `crates/media-protocol/src/codec.rs`
@@ -44,6 +46,7 @@
 - MC-side edge placement that drives MH policy (ADR-0036 §9) → `crates/mc-service/src/media_routing/`
 
 ## Observability
+- Stream-path metrics (group starts/resets, ingress groups, stream bounds) → `metrics.rs:GroupResetReason`, `MediaMetricHandles::group_resets`, `metrics.rs:publish_stream_limits`
 - Metrics: policy-apply (incl. `rejected_transport_inconsistent`) → `src/observability/metrics.rs:PolicyApplyOutcome`; paused-source arrivals → `metrics.rs:MediaMetricHandles::paused_source_frames`; admission → `metrics.rs:publish_egress_admission`, `StreamAdmissionOutcome`; teardown → `metrics.rs:MeetingTeardownOutcome`; `GrpcMethod`; session handles → `metrics.rs:resolve_session_handles`; hot-path handles + `MediaDropReason` → `metrics.rs:resolve_media_handles`
 - Health/readiness → `src/observability/health.rs`; shared `key_custody` label → `crates/common/src/observability/labels.rs`
 - Catalog → `docs/observability/metrics/mh-service.md`; alert inventory → `docs/observability/alerts.md`; media-path label rules → `docs/observability/label-taxonomy.md`
@@ -53,9 +56,10 @@
 ## Testing
 - Rigs (JWKS/MC mocks, gRPC + WT rigs, token minters) → `crates/mh-service/tests/common/`; fixtures (policy builders, admission limits, transport shim) → `crates/mh-test-utils/src/`
 - Control plane: `register_meeting_integration.rs`, `policy_apply_integration.rs`, `end_meeting_integration.rs`, `stream_admission_integration.rs`, `gc_integration.rs`, `mc_client_integration.rs`, `auth_layer_integration.rs` → `crates/mh-service/tests/`
+- Stream path: `media_stream_forward_integration.rs` (every chunk split, zero-copy + copy-on-backlog, group-start gating, switch/paused, hop continuity incl. audio refill, re-push, stream attribution rows, no I/O driver), `media_stream_abandonment_integration.rs` (backlog, stall, publisher reset, source ended, edge removed, drop contract, rate limit, gauge on every exit); stream rig → `tests/common/stream_rig.rs`; shim streams → `crates/mh-test-utils/src/stream_shim.rs`
 - Data plane: `media_attribution_integration.rs` (attribution outcome table, re-push hop continuity), `media_forward_integration.rs`, `media_backpressure_integration.rs`, `media_metrics_integration.rs`, `media_session_binding_integration.rs`, `media_server_mute_integration.rs`, `transport_real_impl.rs`, `transport_seam_reachability.rs`, `webtransport_*integration.rs` → `crates/mh-service/tests/`
 - Trace propagation → `tests/otel_grpc_integration.rs`, `tests/otel_webtransport_integration.rs`
-- Env-tests: config surface → `crates/env-tests/tests/01_mh_deployment_config.rs`; QUIC flow + server mute → `26_mh_quic.rs`; multi-handler forwarding → `27_mc_slot_placement.rs`; egress admission + alert joins → `28_mh_egress_admission.rs`; teardown → `29_mh_meeting_teardown.rs`; media metric hygiene → `32_media_metric_hygiene.rs`; per-stream attribution on the datagram path → `37_mh_stream_attribution.rs`
+- Env-tests: config surface → `crates/env-tests/tests/01_mh_deployment_config.rs`; QUIC flow + server mute → `26_mh_quic.rs`; multi-handler forwarding → `27_mc_slot_placement.rs`; egress admission + alert joins → `28_mh_egress_admission.rs`; teardown → `29_mh_meeting_teardown.rs`; media metric hygiene → `32_media_metric_hygiene.rs`; per-stream attribution on the datagram path → `37_mh_stream_attribution.rs`; video stream-per-group forwarding (mixed, late subscriber, mute, mismatch, paused, backlog) → `38_mh_video_forwarding.rs`
 - Env-test fixtures: MH gRPC as MC → `crates/env-tests/src/fixtures/mh_grpc.rs`; injected policy on a real MC's meeting → `fixtures/injection.rs`; S9 sizing → `fixtures/egress_admission.rs`; frames → `fixtures/media.rs`; scrape settle → `fixtures/metrics.rs:service_job_scrape_settle`
 
 ## Infrastructure & Operations

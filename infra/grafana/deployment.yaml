@@ -72,6 +72,8 @@ spec:
               - configMap:
                   name: grafana-dashboards-mh
               - configMap:
+                  name: grafana-dashboards-mh-media
+              - configMap:
                   name: grafana-dashboards-client
               - configMap:
                   name: grafana-dashboards-errors

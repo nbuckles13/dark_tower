@@ -2,38 +2,97 @@
 //!
 //! ADR-0036 §11 names three: "maximum frame payload before any allocation;
 //! per-connection concurrent-stream and creation-rate limits enforced before
-//! per-frame work". Their status on the datagram path, stated because two of
-//! the three are not this module's to enforce and a reader will otherwise
-//! assume they are:
+//! per-frame work". Where each lives:
 //!
 //! | Cap | Where |
 //! |---|---|
-//! | Maximum frame payload before any allocation | **Here**, [`check_datagram_size`], wired in `crate::media::ingress::run_ingress` before anything is allocated on our behalf |
-//! | Per-connection **concurrent** stream limit | A declared QUIC transport parameter, `MH_MAX_CONCURRENT_UNI_STREAMS` (`crate::config`) — enforced by quinn, not by MH code |
-//! | Per-connection stream **creation-rate** limit | **NOT ENFORCED, AND NOT ENFORCEABLE TODAY.** See below. |
+//! | Maximum frame payload before any allocation | Datagrams: **here**, [`check_datagram_size`], wired in `crate::media::ingress::run_ingress`. Streams: `media_protocol::reader::HeaderReader` rejects a declared `payload_length` over `MAX_PAYLOAD_BYTES` from the 14-byte prefix, before anything is sized from it (`crate::media::stream_ingress`) |
+//! | Per-connection **concurrent** stream limit | A declared QUIC transport parameter, `MH_MAX_CONCURRENT_UNI_STREAMS` (`crate::config`) — enforced by quinn. MH has no event to count; it publishes the declared limit and the live groups as gauges |
+//! | Per-connection stream **creation-rate** limit | **Here**, [`TokenBucket`], admitted at accept in `crate::media::stream_ingress::run_stream_ingress` BEFORE a byte of the stream is read; a refused stream is `STOP_SENDING`'d and counted `stream_rate_limited` |
 //!
-//! # The creation-rate cap has no enforcement point in a datagram-only path
+//! > **Corrected (story 3 MH-A2).** This module used to say the creation-rate
+//! > cap was "not enforced, and not enforceable today" because MH had no
+//! > unidirectional-stream accept loop. MH-A2 added that loop, so the cap now
+//! > has its enforcement point and its counter a firing path.
 //!
-//! MH opens no unidirectional-stream accept loop — `crate::config` and
-//! `crate::webtransport::server` both record that, and audio is one frame per
-//! datagram (ADR-0036 §1). There is therefore **no stream-creation event to
-//! rate-limit**, and a limiter here would be a mechanism with no read and no
-//! write on either side.
-//!
-//! A fixed-window limiter was built and then **removed at review**: it shipped
-//! as unreachable enforcement machinery while the metrics catalog described its
-//! drop token as a live detector, which is a control that reads as present and
-//! cannot fire. Only the vocabulary is kept — see
-//! `MediaDropReason::StreamRateLimited`, marked unreachable in the same style
-//! as `PartialFrameDiscard` — so the author of the uni-stream accept path
-//! inherits the token rather than inventing a second spelling for it, and
-//! inherits no bound they did not choose.
-//!
-//! The one check that remains is a pure predicate returning a bounded
-//! [`MediaDropReason`]; nothing here emits, and nothing here allocates.
+//! Nothing here emits and nothing here allocates; each check returns a value
+//! the caller counts through a pre-resolved handle.
 
 use crate::observability::metrics::MediaDropReason;
 use media_protocol::frame::MAX_FRAME_BYTES;
+use tokio::time::{Duration, Instant};
+
+/// A token bucket: `rate` tokens per second, holding at most `burst`.
+///
+/// Generic on purpose — the stream-open cap is its first user and MH-B's
+/// per-connection recovery-request cap its second; there is one bucket type,
+/// not one per limit.
+///
+/// # Why not `governor`
+///
+/// `governor` (a workspace dependency, used by gc-service) needs a clock whose
+/// instant implements its `Reference` trait. MH's deadlines run on tokio time
+/// so tests drive them with `start_paused` + `advance` (ADR-0036 §10: "all
+/// deadline logic takes an injected clock"), and tokio's `Instant` is foreign
+/// to both crates: using governor would mean a newtype adapter whose
+/// nanosecond arithmetic needs its own tests — more code than this bucket.
+///
+/// Owned state, `now` passed in, no interior mutability: the caller (one
+/// accept loop per connection) owns it.
+#[derive(Debug, Clone)]
+pub struct TokenBucket {
+    /// Whole tokens available.
+    tokens: u32,
+    burst: u32,
+    /// Time to accrue one token.
+    period: Duration,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    /// A full bucket of `burst` tokens refilling at `rate` per second.
+    /// `rate` and `burst` are clamped to at least 1 (config forbids 0).
+    #[must_use]
+    pub fn new(rate: u32, burst: u32, now: Instant) -> Self {
+        let rate = rate.max(1);
+        Self {
+            tokens: burst.max(1),
+            burst: burst.max(1),
+            period: Duration::from_secs(1) / rate,
+            last_refill: now,
+        }
+    }
+
+    /// Take one token if available.
+    pub fn admit(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+
+    fn refill(&mut self, now: Instant) {
+        if self.tokens >= self.burst {
+            self.last_refill = now;
+            return;
+        }
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        let earned = elapsed.as_nanos() / self.period.as_nanos().max(1);
+        if earned == 0 {
+            return;
+        }
+        let earned = u32::try_from(earned).unwrap_or(u32::MAX);
+        self.tokens = self.tokens.saturating_add(earned).min(self.burst);
+        // Advance by whole periods only, keeping the remainder.
+        let advanced = self.period.saturating_mul(earned);
+        self.last_refill += advanced;
+        if self.tokens >= self.burst {
+            self.last_refill = now;
+        }
+    }
+}
 
 /// Reject a datagram whose **byte length** exceeds the wire-format frame
 /// maximum, before any parse and before anything is allocated on our behalf.
@@ -75,5 +134,32 @@ mod tests {
             Err(MediaDropReason::OversizeDatagram)
         );
         assert!(check_datagram_size(0).is_ok());
+    }
+
+    #[test]
+    fn the_bucket_admits_its_burst_then_refills_at_its_rate() {
+        let start = Instant::now();
+        let mut bucket = TokenBucket::new(10, 10, start);
+        for _ in 0..10 {
+            assert!(bucket.admit(start));
+        }
+        assert!(
+            !bucket.admit(start),
+            "the eleventh in the same instant is refused"
+        );
+        assert!(
+            !bucket.admit(start + Duration::from_millis(99)),
+            "one token takes 100 ms at 10/s"
+        );
+        assert!(bucket.admit(start + Duration::from_millis(100)));
+        assert!(!bucket.admit(start + Duration::from_millis(100)));
+        let later = start + Duration::from_secs(5);
+        for _ in 0..10 {
+            assert!(
+                bucket.admit(later),
+                "never more than the burst after a long idle"
+            );
+        }
+        assert!(!bucket.admit(later));
     }
 }

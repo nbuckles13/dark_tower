@@ -76,16 +76,14 @@ use env_tests::fixtures::participant::{
 use env_tests::fixtures::AuthClient;
 use proto_gen::dark_tower::signaling::v1::SlotState;
 use std::collections::{BTreeSet, HashMap};
-use std::time::Duration;
 
 // The participant vocabulary (`Participant`, `meeting_of`, `reach`, the two
 // triage literals `TRIAGE_HANDLER_SET` / `TRIAGE_MH_REACH`) lives in
 // `env_tests::fixtures::participant` since story 2 task 10, shared with
 // `26_mh_quic.rs`.
 
-/// Margin added to MC's published settle window before a view must have
-/// converged: covers MH's connect notification, the push and the flush.
-const VIEW_MARGIN: Duration = Duration::from_secs(10);
+/// Margin over MC's settle window (one shared home).
+use env_tests::fixtures::participant::VIEW_MARGIN;
 
 async fn cluster() -> ClusterConnection {
     let cluster = ClusterConnection::new()

@@ -36,7 +36,9 @@
 //! Both ship so neither mechanism is mistaken for the other.
 
 use bytes::Bytes;
-use mh_service::transport::{DatagramSendError, MediaSendStream, MediaTransport, TransportError};
+use mh_service::transport::{
+    DatagramSendError, MediaSendStream, MediaTransport, TransportCause, TransportError,
+};
 use mh_test_utils::transport_shim::{DatagramLoss, LossDelayTransport, ShimConfig};
 use std::time::Duration;
 
@@ -485,8 +487,8 @@ async fn every_transport_error_variant_is_shim_reachable() {
     }
     fn classify_transport(e: &TransportError) -> &'static str {
         match e {
-            TransportError::ConnectionClosed => "connection_closed",
-            TransportError::StreamClosed => "stream_closed",
+            TransportError::ConnectionClosed(_) => "connection_closed",
+            TransportError::StreamClosed(_) => "stream_closed",
         }
     }
 
@@ -573,7 +575,12 @@ async fn closing_wakes_a_parked_receiver() {
 
     shim.set_closed();
     let result = handle.await.expect("receive task must not panic");
-    assert_eq!(result, Err(TransportError::ConnectionClosed));
+    assert_eq!(
+        result,
+        Err(TransportError::ConnectionClosed(TransportCause::local(
+            "expected"
+        )))
+    );
 }
 
 // =====================================================================
@@ -666,4 +673,124 @@ async fn full_ingress_queue_hands_the_payload_back() {
         0,
         "queue saturation is not in-flight loss and must not move that counter"
     );
+}
+
+// =====================================================================
+// Unidirectional streams (story 3 MH-A2): the shim's stream knobs are
+// reachable through the seam, generically.
+// =====================================================================
+
+/// Inbound streams are delivered in exactly the chunks the caller chose, a
+/// FIN and a reset are observable, and a stop is recorded with its code.
+#[tokio::test(start_paused = true)]
+async fn inbound_uni_streams_deliver_caller_chosen_chunks_fin_and_reset() {
+    use mh_service::transport::{MediaRecvStream, StreamReadError};
+    let shim = LossDelayTransport::new();
+    let inbound = shim.push_inbound_uni();
+    inbound.push(Bytes::from_static(b"he"));
+    inbound.push(Bytes::from_static(b"ader"));
+    inbound.finish();
+    let mut stream = shim.accept_uni().await.expect("accept");
+    assert_eq!(
+        stream.read_chunk(64).await,
+        Ok(Some(Bytes::from_static(b"he")))
+    );
+    assert_eq!(
+        stream.read_chunk(2).await,
+        Ok(Some(Bytes::from_static(b"ad"))),
+        "max honoured"
+    );
+    assert_eq!(
+        stream.read_chunk(64).await,
+        Ok(Some(Bytes::from_static(b"er")))
+    );
+    assert_eq!(stream.read_chunk(64).await, Ok(None));
+
+    let reset = shim.push_inbound_uni();
+    reset.reset(7);
+    let mut stream = shim.accept_uni().await.expect("accept");
+    assert_eq!(stream.read_chunk(64).await, Err(StreamReadError::Reset(7)));
+    stream.stop(9);
+    assert_eq!(reset.stopped(), Some(9));
+    assert_eq!(
+        (shim.inbound_uni_offered(), shim.inbound_uni_accepted()),
+        (2, 2)
+    );
+    assert_eq!(shim.inbound_uni_stopped(), 1);
+}
+
+/// Write credit makes `write_all` pend (the slow subscriber) until granted;
+/// open credit does the same for `open_uni`; terminal states and concurrency
+/// are recorded; a drop records the seam's reset contract.
+#[tokio::test(start_paused = true)]
+async fn send_streams_have_controllable_credit_and_a_recorded_terminal_state() {
+    use mh_test_utils::stream_shim::EgressTerminal;
+    let shim = LossDelayTransport::new();
+    shim.set_stream_credit(3);
+    let mut stream = shim.open_uni().await.expect("open");
+    let write = tokio::spawn(async move {
+        stream.write_all(b"abcdef").await.expect("write");
+        stream
+    });
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!write.is_finished(), "pends past the credit");
+    shim.grant_stream_credit(3);
+    let mut stream = write.await.expect("join");
+    stream.finish().await.expect("finish");
+    let dropped = shim.open_uni().await.expect("open");
+    let mut second = shim.open_uni().await.expect("open");
+    assert_eq!(
+        (shim.egress_uni_open_now(), shim.egress_uni_max_concurrent()),
+        (2, 2),
+        "a peak of two, held at once"
+    );
+    drop(dropped);
+    second.reset(1).expect("reset a live stream");
+    let records = shim.egress_uni_streams();
+    assert_eq!(records[0].terminal(), EgressTerminal::Finished);
+    assert_eq!(records[0].bytes(), b"abcdef");
+    assert_eq!(
+        records[1].terminal(),
+        EgressTerminal::Reset {
+            code: mh_service::transport::GROUP_ABANDONED,
+            by_drop: true
+        }
+    );
+    assert_eq!(
+        (shim.egress_uni_open_now(), shim.egress_uni_max_concurrent()),
+        (0, 2),
+        "the peak survives, the count returns to zero"
+    );
+
+    shim.set_open_credit(0);
+    let opener = tokio::spawn({
+        let shim = shim.clone();
+        async move { shim.open_uni().await.map(|_| ()) }
+    });
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!opener.is_finished(), "MAX_STREAMS withheld");
+    shim.grant_open_credit(1);
+    opener.await.expect("join").expect("opened once granted");
+}
+
+/// The MH<->client control envelope, both ways (plumbing for MH-B).
+#[tokio::test(start_paused = true)]
+async fn the_control_envelope_is_carried_both_ways() {
+    let shim = LossDelayTransport::new();
+    shim.push_control_inbound(Bytes::from_static(b"recovery"));
+    assert_eq!(
+        shim.recv_control_inbound().await,
+        Some(Bytes::from_static(b"recovery"))
+    );
+    shim.send_control_outbound(Bytes::from_static(b"keyframe"));
+    assert_eq!(
+        shim.control_outbound(),
+        vec![Bytes::from_static(b"keyframe")]
+    );
+    shim.set_closed();
+    assert_eq!(shim.recv_control_inbound().await, None);
 }

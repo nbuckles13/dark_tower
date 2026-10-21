@@ -70,7 +70,7 @@ fn rig() -> Rig {
     let context = Arc::new(MediaTaskContext {
         // The egress loop reads neither of these — it drains a queue and sends
         // — so empty registries are the honest shape rather than a shortcut.
-        routing: Arc::new(RoutingTable::new()),
+        routing: Arc::new(RoutingTable::unbounded_for_tests()),
         subscribers: Arc::new(LocalSubscribers::new()),
         handles: Arc::clone(&inner.handles),
     });

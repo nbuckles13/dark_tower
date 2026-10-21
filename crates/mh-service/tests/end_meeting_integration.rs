@@ -76,7 +76,8 @@ impl Rig {
     /// the module docs.
     async fn start(limits: PolicyLimits) -> Self {
         let jwks = JwksRig::start(42, "mh-end-meeting-integ-01").await;
-        let session_manager = SessionManagerHandle::new(mh_test_utils::admission::never_binding());
+        let session_manager =
+            SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding());
         let grpc =
             GrpcRig::start_with_limits(jwks.jwks_client(), session_manager.clone(), limits).await;
         let channel = Endpoint::from_shared(grpc.url())

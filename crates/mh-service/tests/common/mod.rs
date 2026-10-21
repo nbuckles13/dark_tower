@@ -5,6 +5,8 @@
 //! - [`TestKeypair`] / [`mount_jwks_mock`] — Ed25519 keypair + wiremock JWKS
 //! - [`media_frame`] — frame-v3 datagram fixtures, built through the codec
 //! - [`media_rig`] — the loopback forward-path rig the three media binaries share
+//! - [`stream_rig`] — the stream-per-group (video) forward-path rig over the
+//!   transport shim (story 3 MH-A2)
 //! - [`mock_mc`] — MC gRPC mock (MediaCoordinationService) with channel capture
 //! - [`grpc_rig`] — Real `MhAuthLayer` + `MhMediaService` on `127.0.0.1:0`
 //! - [`accept_loop_rig`] — Real `WebTransportServer::bind() → accept_loop()`
@@ -47,6 +49,7 @@ pub mod media_frame;
 pub mod media_rig;
 pub mod mock_mc;
 pub mod otel_capture;
+pub mod stream_rig;
 pub mod tokens;
 pub mod wt_client;
 

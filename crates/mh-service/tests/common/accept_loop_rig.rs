@@ -119,6 +119,8 @@ impl AcceptLoopRig {
                     mh_service::observability::metrics::resolve_media_handles(),
                 ),
                 latency_sample_ratio: mh_service::config::DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO,
+                stream_path: mh_test_utils::admission::fixture_stream_path_limits(),
+                downlink_channel_capacity: mh_service::media::downlink_channel_capacity(12),
             },
             cancel_token.clone(),
         );

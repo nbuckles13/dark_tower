@@ -216,6 +216,18 @@ fn test_config(gc_url: &str) -> Config {
             datagram_send_buffer_bytes: 32 * mh_service::config::NOMINAL_AUDIO_FRAME_BYTES,
             keepalive_interval_ms: 10_000,
         },
+        stream_path: mh_test_utils::admission::fixture_stream_path_limits(),
+        // Through the production check against a 1 GiB limit, never assembled.
+        memory_budget: mh_service::config::check_pod_memory(
+            262_144,
+            40,
+            mh_service::config::per_connection_memory_bound_bytes(
+                &mh_test_utils::admission::fixture_quic_transport(),
+            ),
+            500,
+            1 << 30,
+        )
+        .expect("fixture fits"),
         termination_grace_seconds: 35,
         drain_window: std::time::Duration::from_secs(
             mh_service::config::SHUTDOWN_SETTLE_TARGET_SECONDS,
@@ -251,7 +263,7 @@ fn test_config(gc_url: &str) -> Config {
 
 /// A routing table with nothing installed: `current_streams` reports 0.
 fn empty_routing() -> std::sync::Arc<mh_service::routing::RoutingTable> {
-    std::sync::Arc::new(mh_service::routing::RoutingTable::new())
+    std::sync::Arc::new(mh_service::routing::RoutingTable::unbounded_for_tests())
 }
 
 /// Create a mock `TokenReceiver` for testing.
@@ -446,7 +458,7 @@ async fn test_gc_client_load_report_carries_installed_streams_equal_to_the_gauge
     // Snapshot FIRST: the actor resolves its handles at construction, on this
     // (current-thread) runtime's thread.
     let snap = MetricAssertion::snapshot();
-    let session_manager = SessionManagerHandle::new(never_binding());
+    let session_manager = SessionManagerHandle::new_for_tests(never_binding());
     snap.gauge("mh_media_egress_edges")
         .with_labels(&[("key_custody", "operator")])
         .assert_value(0.0);

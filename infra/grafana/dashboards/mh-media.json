@@ -546,7 +546,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "sum(rate(mh_media_frames_forwarded_total{direction=\"egress\"})) / sum(rate(mh_media_frames_forwarded_total{direction=\"ingress\"})): EXPECTED VALUE IS THE MEAN SUBSCRIBER COUNT PER ACCEPTED INGRESS FRAME. It exists because egress forwards are NOT comparable to ingress forwards (the R-28 frame accounting identity, docs/observability/metrics/mh-service.md §Media Forward Path): one accepted ingress frame becomes E egress attempts, one per subscriber edge, so this quotient is a fan-out, never a delivery ratio - delivery is the egress-internal Egress Delivery Ratio beside it. Reading it: in a meeting of M participants where everyone holds everyone else in a slot, each sender fans out to M-1 edges, so expect roughly the fleet's mean holder count per sender; a fall with no change in meeting sizes means egress attempts are being dropped (read Egress Drops by Reason) or edges were withdrawn. It is a MEAN over every ingress frame, including frames that reached no edge (no_subscriber counts on forwarded{direction=\"ingress\"} too), and its numerator counts only egress the transport ACCEPTED, so egress drops pull it down. It is a fleet-wide mean, never a per-meeting value: no meeting identity exists on these series by design (ADR-0036 §11). Guarded: the 'and ... > 0' on the ingress denominator makes a window with no ingress forwards read as no data rather than NaN or +Inf; empty is healthy when no media is flowing (a solo participant is directed to send nothing). key_custody=operator.",
+      "description": "sum(rate(mh_media_frames_forwarded_total{direction=\"egress\"})) / sum(rate(mh_media_frames_forwarded_total{direction=\"ingress\"})): EXPECTED VALUE IS THE MEAN SUBSCRIBER COUNT PER ACCEPTED INGRESS FRAME. It exists because egress forwards are NOT comparable to ingress forwards (the R-28 frame accounting identity, docs/observability/metrics/mh-service.md §Media Forward Path): one accepted ingress frame becomes E egress attempts, one per subscriber edge, so this quotient is a fan-out, never a delivery ratio - delivery is the egress-internal Egress Delivery Ratio beside it. Reading it: in a meeting of M participants where everyone holds everyone else in a slot, each sender fans out to M-1 edges, so expect roughly the fleet's mean holder count per sender; a fall with no change in meeting sizes means egress attempts are being dropped (read Egress Drops by Reason) or edges were withdrawn. It is a MEAN over every ingress frame, including frames that reached no edge (no_subscriber counts on forwarded{direction=\"ingress\"} too), and its numerator counts only egress the transport ACCEPTED, so egress drops pull it down. It is a fleet-wide mean, never a per-meeting value: no meeting identity exists on these series by design (ADR-0036 §11). Guarded: the 'and ... > 0' on the ingress denominator makes a window with no ingress forwards read as no data rather than NaN or +Inf; empty is healthy when no media is flowing (a solo participant is directed to send nothing). key_custody=operator. On stream-per-group traffic, frames withheld by the group-start gate are uncounted, so this mean reads BELOW the subscriber count while healthy (docs/observability/metrics/mh-service.md, Stream-per-group path).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1878,6 +1878,303 @@
         }
       ],
       "title": "Paused-Source Arrivals",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_group_starts_total (story 3 MH-A2). ingress: accepted publisher group streams whose first frame was attributed (refused or attribution-failed streams never count); egress: downlink group streams actually opened to subscribers. Egress over ingress is the mean destinations a group reaches. Rates (ADR-0029); pod-level, no kind, no identity. Layout and alerts: OBS-B. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Groups/s"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 72
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (direction) (rate(mh_media_group_starts_total[$__rate_interval]))",
+          "legendFormat": "{{direction}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Stream-Path Group Starts by Direction (stream-per-group)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_group_resets_total (story 3 R-12): downlink group streams MH RESET for ONE destination (never finished: a half-written frame never looks complete). One per downlink group abandoned for a destination, whether or not its uni stream was opened (a full channel or backlog overflow on an edge with N live downlinks counts 1+N); not a subset of group starts. subscriber_backlog = a slow destination past MH_EGRESS_STREAM_BACKLOG_BYTES; publisher_reset / publisher_stall = the publisher side ended the group mid-frame; source_ended / edge_removed = routine leave / reassignment. Drop-contract resets of an already-gone subscriber are deliberately uncounted. Counts groups, not frames. Zero-initialised: flat 0 is calm, ABSENT is a pipeline fault. increase() per interval (ADR-0029 Category A). Layout and alerts (A2): OBS-B. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Resets"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 72
+      },
+      "id": 23,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (increase(mh_media_group_resets_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Stream-Path Group Resets by Reason (per destination)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_stream_ingress_groups: publisher group streams being read now, process-wide (RAII-moved, a true count). mh_media_stream_sources_declared: STREAM_PER_GROUP source streams declared across installed policies (recomputed at each apply/release). Gauges, bare (ADR-0029). The per-CONNECTION uni-stream limit is in the bounds panel and is NOT the limit of the process-wide groups gauge. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 80
+      },
+      "id": 24,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(mh_media_stream_ingress_groups)",
+          "legendFormat": "ingress groups",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(mh_media_stream_sources_declared)",
+          "legendFormat": "declared stream sources",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Live Stream-Path Ingress Groups and Declared Stream Sources",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_uni_streams_per_connection_limit: the declared QUIC max_concurrent_uni_streams handed to quinn, PER CONNECTION (not the limit of the process-wide groups gauge). Gauge, bare; flat by design, a step is a config roll. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 12,
+        "y": 80
+      },
+      "id": 25,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mh_media_uni_streams_per_connection_limit)",
+          "legendFormat": "uni streams / connection",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Uni Streams per Connection Limit (config)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_egress_stream_backlog_limit_bytes: MH_EGRESS_STREAM_BACKLOG_BYTES, the per-DESTINATION backlog cap past which MH abandons that destination's group (subscriber_backlog). Gauge, bare; config reflection. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 16,
+        "y": 80
+      },
+      "id": 26,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mh_media_egress_stream_backlog_limit_bytes)",
+          "legendFormat": "backlog cap / destination",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Egress Backlog Cap per Destination (config)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_stream_mid_frame_stall_seconds: MH_STREAM_MID_FRAME_STALL_MS in seconds, the inactivity bound past which a publisher stalled mid-frame is reset downstream (publisher_stall). Gauge, bare; config reflection. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 20,
+        "y": 80
+      },
+      "id": 27,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mh_media_stream_mid_frame_stall_seconds)",
+          "legendFormat": "stall bound",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Mid-Frame Stall Bound (config)",
       "type": "timeseries"
     }
   ],

@@ -93,7 +93,7 @@ struct Rig {
 
 impl Rig {
     fn new(request: &RegisterMeetingRequest) -> Self {
-        let table = RoutingTable::new();
+        let table = RoutingTable::unbounded_for_tests();
         install(&table, request);
         let registry = LocalSubscribers::new();
         let queue: Arc<EgressQueue> = Arc::new(SharedQueue::new(EGRESS_QUEUE_FRAMES));

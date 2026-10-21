@@ -41,8 +41,8 @@ use env_tests::fixtures::participant::{
 };
 use env_tests::fixtures::AuthClient;
 
-/// Margin added to MC's published settle window before a view must converge.
-const VIEW_MARGIN: Duration = Duration::from_secs(10);
+/// Margin over MC's settle window (one shared home).
+use env_tests::fixtures::participant::VIEW_MARGIN;
 /// Failure-only ceiling for a counter rise (scrape + ingestion).
 const COUNTER_BUDGET: Duration = Duration::from_secs(120);
 

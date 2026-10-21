@@ -1002,6 +1002,34 @@ pub async fn poll_until_pinned_instance(
     }
 }
 
+/// Failure bound for a settled per-pod baseline ([`settled_baseline`]): two
+/// reads a scrape apart agreeing. A PRECONDITION bound, never a pass
+/// condition; under cluster load the notification and push chains converge in
+/// several non-equal rounds of the settle. One home for every suite.
+pub const BASELINE_SETTLE_BOUND: Duration = Duration::from_secs(90);
+
+/// Failure bound for a pinned-pod counter becoming visible
+/// ([`poll_until_pinned_instance`]). Never a pass condition. One home.
+pub const PINNED_METRIC_BOUND: Duration = Duration::from_secs(90);
+
+/// Per-pod sum of MH's frame-drop counter for one `reason` token.
+#[must_use]
+pub fn reason_promql(reason: &str) -> String {
+    format!(r#"sum by (instance) (mh_media_frames_dropped_total{{reason="{reason}"}})"#)
+}
+
+/// Per-pod sum of MH's paused-source arrivals overlay.
+#[must_use]
+pub fn paused_promql() -> String {
+    "sum by (instance) (mh_media_paused_source_frames_total)".to_string()
+}
+
+/// Per-pod sum of MH's downlink group resets for one `reason` (story 3).
+#[must_use]
+pub fn group_reset_promql(reason: &str) -> String {
+    format!(r#"sum by (instance) (mh_media_group_resets_total{{reason="{reason}"}})"#)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

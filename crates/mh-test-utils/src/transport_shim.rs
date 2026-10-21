@@ -6,6 +6,10 @@
 //! counter to observe can be *made to fire on demand*, rather than being
 //! believed to be reachable.
 //!
+//! The unidirectional-stream half — inbound streams in caller-chosen chunks,
+//! send streams with controllable credit and a recorded terminal state, the
+//! control envelope — lives in [`crate::stream_shim`] (story 3 MH-A2).
+//!
 //! # Zero syscalls
 //!
 //! Nothing here opens a socket, a file or a timer fd. Ingress is a bounded
@@ -129,8 +133,14 @@
     clippy::indexing_slicing
 )]
 
+use crate::stream_shim::{
+    EgressTerminal, EgressUni, InboundItem, InboundShared, InboundUni, StreamState,
+};
 use bytes::Bytes;
-use mh_service::transport::{DatagramSendError, MediaSendStream, MediaTransport, TransportError};
+use mh_service::transport::{
+    DatagramSendError, MediaRecvStream, MediaSendStream, MediaTransport, StreamReadError,
+    TransportCause, TransportError, GROUP_ABANDONED,
+};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -311,6 +321,9 @@ struct ShimState {
     inbound_tx: mpsc::Sender<Inbound>,
     inbound_rx: AsyncMutex<mpsc::Receiver<Inbound>>,
     closed_notify: Notify,
+
+    // ---- uni streams, both directions; see `crate::stream_shim` ------
+    streams: StreamState,
 }
 
 impl ShimState {
@@ -383,6 +396,7 @@ impl LossDelayTransport {
                 inbound_tx,
                 inbound_rx: AsyncMutex::new(inbound_rx),
                 closed_notify: Notify::new(),
+                streams: StreamState::default(),
             }),
         }
     }
@@ -521,7 +535,9 @@ impl LossDelayTransport {
     /// [`MediaTransport::recv_datagram`] rather than hanging it.
     pub fn set_closed(&self) {
         self.state.closed.store(true, Ordering::Release);
+        self.state.streams.closed.store(true, Ordering::Release);
         self.state.closed_notify.notify_waiters();
+        self.state.streams.wake_all();
     }
 
     /// Make the peer refuse datagram support, so
@@ -560,6 +576,181 @@ impl LossDelayTransport {
             .map_err(|e| match e {
                 TrySendError::Full(item) | TrySendError::Closed(item) => item.payload,
             })
+    }
+
+    // ================================================================
+    // Unidirectional streams (story 3, MH-A2) — see `crate::stream_shim`
+    // ================================================================
+
+    /// Inject a publisher stream for MH's `accept_uni` and return the handle
+    /// that feeds it chunk by chunk.
+    #[must_use]
+    pub fn push_inbound_uni(&self) -> InboundUni {
+        let shared = Arc::new(InboundShared::default());
+        let streams = &self.state.streams;
+        streams.inbound_offered.fetch_add(1, Ordering::AcqRel);
+        streams
+            .inbound_all
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::clone(&shared));
+        streams
+            .inbound_queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(Arc::clone(&shared));
+        streams.inbound_notify.notify_one();
+        InboundUni { shared }
+    }
+
+    /// Publisher streams injected so far.
+    #[must_use]
+    pub fn inbound_uni_offered(&self) -> u64 {
+        self.state.streams.inbound_offered.load(Ordering::Acquire)
+    }
+
+    /// Publisher streams MH's `accept_uni` has taken.
+    #[must_use]
+    pub fn inbound_uni_accepted(&self) -> u64 {
+        self.state.streams.inbound_accepted.load(Ordering::Acquire)
+    }
+
+    /// Publisher streams MH stopped (STOP_SENDING).
+    #[must_use]
+    pub fn inbound_uni_stopped(&self) -> usize {
+        self.state
+            .streams
+            .inbound_all
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|inbound| {
+                inbound
+                    .stopped
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_some()
+            })
+            .count()
+    }
+
+    /// Limit stream WRITE credit to `bytes` more bytes, connection-wide (the
+    /// slow subscriber): a `write_all` beyond it pends until [`Self::grant_stream_credit`].
+    pub fn set_stream_credit(&self, bytes: u64) {
+        self.state.streams.write_credit.store(
+            bytes.min(crate::stream_shim::UNLIMITED - 1),
+            Ordering::Release,
+        );
+        self.state.streams.credit_notify.notify_waiters();
+    }
+
+    /// Grant `bytes` more write credit.
+    pub fn grant_stream_credit(&self, bytes: u64) {
+        let streams = &self.state.streams;
+        streams.grant(&streams.write_credit, bytes);
+    }
+
+    /// Remove the write-credit limit.
+    pub fn clear_stream_credit(&self) {
+        let streams = &self.state.streams;
+        streams
+            .write_credit
+            .store(crate::stream_shim::UNLIMITED, Ordering::Release);
+        streams.credit_notify.notify_waiters();
+    }
+
+    /// Limit stream OPENS (QUIC `MAX_STREAMS`) to `n` more: `open_uni` beyond
+    /// it pends until [`Self::grant_open_credit`].
+    pub fn set_open_credit(&self, n: u64) {
+        self.state
+            .streams
+            .open_credit
+            .store(n.min(crate::stream_shim::UNLIMITED - 1), Ordering::Release);
+        self.state.streams.credit_notify.notify_waiters();
+    }
+
+    /// Grant `n` more stream opens.
+    pub fn grant_open_credit(&self, n: u64) {
+        let streams = &self.state.streams;
+        streams.grant(&streams.open_credit, n);
+    }
+
+    /// Every stream MH opened on this connection, in open order, whatever its
+    /// terminal state.
+    #[must_use]
+    pub fn egress_uni_streams(&self) -> Vec<Arc<EgressUni>> {
+        self.state
+            .streams
+            .egress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Streams MH has opened and not yet finished or reset.
+    #[must_use]
+    pub fn egress_uni_open_now(&self) -> usize {
+        self.state.streams.current_open.load(Ordering::Acquire)
+    }
+
+    /// The most streams MH ever held open at once on this connection.
+    #[must_use]
+    pub fn egress_uni_max_concurrent(&self) -> usize {
+        self.state.streams.max_open.load(Ordering::Acquire)
+    }
+
+    /// Control envelope, client → MH: queue one message for MH.
+    pub fn push_control_inbound(&self, message: Bytes) {
+        self.state
+            .streams
+            .control_inbound
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(message);
+        self.state.streams.control_inbound_notify.notify_one();
+    }
+
+    /// Control envelope, client → MH: MH's read side. `None` once closed.
+    pub async fn recv_control_inbound(&self) -> Option<Bytes> {
+        let streams = &self.state.streams;
+        loop {
+            let notified = streams.control_inbound_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(message) = streams
+                .control_inbound
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+            {
+                return Some(message);
+            }
+            if streams.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            notified.await;
+        }
+    }
+
+    /// Control envelope, MH → client: MH's write side.
+    pub fn send_control_outbound(&self, message: Bytes) {
+        self.state
+            .streams
+            .control_outbound
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(message);
+    }
+
+    /// Control envelope, MH → client: everything MH sent, in order.
+    #[must_use]
+    pub fn control_outbound(&self) -> Vec<Bytes> {
+        self.state
+            .streams
+            .control_outbound
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     // ================================================================
@@ -689,6 +880,7 @@ impl LossDelayTransport {
 
 impl MediaTransport for LossDelayTransport {
     type SendStream = ShimSendStream;
+    type RecvStream = ShimRecvStream;
 
     /// Order of checks is the contract, because it is what keeps the two
     /// back-pressure and loss knobs mapped onto two structurally distinct
@@ -752,13 +944,13 @@ impl MediaTransport for LossDelayTransport {
 
     async fn recv_datagram(&self) -> Result<Bytes, TransportError> {
         if self.state.closed.load(Ordering::Acquire) {
-            return Err(TransportError::ConnectionClosed);
+            return Err(closed());
         }
-        let closed = self.state.closed_notify.notified();
-        tokio::pin!(closed);
+        let closed_signal = self.state.closed_notify.notified();
+        tokio::pin!(closed_signal);
 
         let item = tokio::select! {
-            () = &mut closed => return Err(TransportError::ConnectionClosed),
+            () = &mut closed_signal => return Err(closed()),
             item = async {
                 let mut rx = self.state.inbound_rx.lock().await;
                 rx.recv().await
@@ -774,47 +966,173 @@ impl MediaTransport for LossDelayTransport {
                 tokio::time::sleep_until(inbound.ready_at).await;
                 Ok(inbound.payload)
             }
-            None => Err(TransportError::ConnectionClosed),
+            None => Err(closed()),
         }
     }
 
     async fn open_uni(&self) -> Result<Self::SendStream, TransportError> {
-        if self.state.closed.load(Ordering::Acquire) {
-            return Err(TransportError::ConnectionClosed);
+        let streams = &self.state.streams;
+        // Stream-open credit (QUIC MAX_STREAMS): pend until granted.
+        loop {
+            let notified = streams.credit_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.closed.load(Ordering::Acquire) {
+                return Err(closed());
+            }
+            if StreamState::take_credit(&streams.open_credit, 1) == 1 {
+                break;
+            }
+            notified.await;
         }
         let open_ordinal = self.state.next_open_ordinal.fetch_add(1, Ordering::AcqRel);
         let open = self.state.open_uni_streams.fetch_add(1, Ordering::AcqRel) + 1;
         self.state
             .max_concurrent_open_uni
             .fetch_max(open, Ordering::AcqRel);
+        streams.opened();
+        let record = Arc::new(EgressUni::new(open_ordinal));
+        streams
+            .egress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::clone(&record));
         Ok(ShimSendStream {
             state: Arc::clone(&self.state),
             open_ordinal,
             chunks: Vec::new(),
             finished: false,
+            record,
         })
+    }
+
+    async fn accept_uni(&self) -> Result<Self::RecvStream, TransportError> {
+        let streams = &self.state.streams;
+        loop {
+            let notified = streams.inbound_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.closed.load(Ordering::Acquire) {
+                return Err(closed());
+            }
+            let next = streams
+                .inbound_queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front();
+            if let Some(shared) = next {
+                streams.inbound_accepted.fetch_add(1, Ordering::AcqRel);
+                return Ok(ShimRecvStream {
+                    state: Arc::clone(&self.state),
+                    shared,
+                });
+            }
+            notified.await;
+        }
     }
 }
 
-/// A unidirectional send stream produced by [`LossDelayTransport::open_uni`].
-///
-/// Chunks are COPIED into the capture (`write_all` takes `&[u8]`), so this
-/// path carries no zero-copy claim — see the module's fidelity-boundary
-/// section.
+fn closed() -> TransportError {
+    TransportError::ConnectionClosed(TransportCause::local("shim connection closed"))
+}
+
+/// A publisher stream as MH's `accept_uni` sees it; fed by an [`InboundUni`].
+#[derive(Debug)]
+pub struct ShimRecvStream {
+    state: Arc<ShimState>,
+    shared: Arc<InboundShared>,
+}
+
+impl MediaRecvStream for ShimRecvStream {
+    async fn read_chunk(&mut self, max_len: usize) -> Result<Option<Bytes>, StreamReadError> {
+        loop {
+            let notified = self.shared.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut items = self
+                    .shared
+                    .items
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                match items.pop_front() {
+                    Some(InboundItem::Chunk(mut chunk)) => {
+                        if chunk.len() > max_len {
+                            let rest = chunk.split_off(max_len);
+                            items.push_front(InboundItem::Chunk(rest));
+                        }
+                        let read = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                        self.shared.bytes_read.fetch_add(read, Ordering::AcqRel);
+                        return Ok(Some(chunk));
+                    }
+                    Some(InboundItem::Fin) => return Ok(None),
+                    Some(InboundItem::Reset(code)) => return Err(StreamReadError::Reset(code)),
+                    None => {}
+                }
+            }
+            if self.state.closed.load(Ordering::Acquire) {
+                return Err(StreamReadError::ConnectionClosed(TransportCause::local(
+                    "shim connection closed",
+                )));
+            }
+            notified.await;
+        }
+    }
+
+    fn stop(&mut self, code: u32) {
+        let mut stopped = self
+            .shared
+            .stopped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if stopped.is_none() {
+            *stopped = Some(code);
+        }
+        drop(stopped);
+        self.shared
+            .items
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+}
+
 #[derive(Debug)]
 pub struct ShimSendStream {
     state: Arc<ShimState>,
     open_ordinal: u64,
     chunks: Vec<Vec<u8>>,
     finished: bool,
+    record: Arc<EgressUni>,
 }
 
 impl ShimSendStream {
-    /// This stream's monotonic open-ordinal, assigned at open. See
-    /// [`FinishedUniStream::open_ordinal`] for why this is not `stream_id`.
     #[must_use]
     pub fn open_ordinal(&self) -> u64 {
         self.open_ordinal
+    }
+
+    fn is_open(&self) -> bool {
+        self.record.terminal() == EgressTerminal::Open
+    }
+
+    /// Record the terminal state once and release the concurrency slot.
+    fn terminate(&self, terminal: EgressTerminal) {
+        let mut slot = self
+            .record
+            .terminal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *slot == EgressTerminal::Open {
+            *slot = terminal;
+            drop(slot);
+            self.state.open_uni_streams.fetch_sub(1, Ordering::AcqRel);
+            self.state.streams.closed_one();
+        }
+    }
+
+    fn stream_closed() -> TransportError {
+        TransportError::StreamClosed(TransportCause::local("shim stream already closed"))
     }
 }
 
@@ -823,44 +1141,66 @@ impl MediaSendStream for ShimSendStream {
         &mut self,
         buf: &[u8],
     ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
-        // Copy before the async block so the returned future borrows only
-        // `self`, not `buf` — which is what lets a caller write from a
-        // temporary slice.
         let chunk = buf.to_vec();
         async move {
-            if self.finished {
-                return Err(TransportError::StreamClosed);
+            if !self.is_open() {
+                return Err(Self::stream_closed());
             }
             if self.state.closed.load(Ordering::Acquire) {
-                return Err(TransportError::ConnectionClosed);
+                return Err(closed());
             }
-            // Per-call delay: this is the slow-subscriber mechanism.
             self.state.sleep_added_delay().await;
+            // Connection-wide write credit: take what is available, pend for
+            // the rest. Bytes are recorded only once credited, so a write
+            // cancelled mid-way records exactly the credited prefix.
+            let wanted = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            let mut written = 0_u64;
+            let streams = &self.state.streams;
+            while written < wanted {
+                let notified = streams.credit_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.state.closed.load(Ordering::Acquire) {
+                    return Err(closed());
+                }
+                if !self.is_open() {
+                    return Err(Self::stream_closed());
+                }
+                let taken = StreamState::take_credit(&streams.write_credit, wanted - written);
+                if taken > 0 {
+                    let from = usize::try_from(written).unwrap_or(usize::MAX);
+                    let to = usize::try_from(written + taken).unwrap_or(usize::MAX);
+                    if let Some(part) = chunk.get(from..to) {
+                        self.record
+                            .chunks
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(Bytes::copy_from_slice(part));
+                    }
+                    written += taken;
+                    continue;
+                }
+                notified.await;
+            }
             self.chunks.push(chunk);
             Ok(())
         }
     }
 
     async fn finish(&mut self) -> Result<(), TransportError> {
-        if self.finished {
-            return Err(TransportError::StreamClosed);
+        if self.finished || !self.is_open() {
+            return Err(Self::stream_closed());
         }
         if self.state.closed.load(Ordering::Acquire) {
-            return Err(TransportError::ConnectionClosed);
+            return Err(closed());
         }
         self.state.sleep_added_delay().await;
         self.finished = true;
-        self.state.open_uni_streams.fetch_sub(1, Ordering::AcqRel);
+        self.terminate(EgressTerminal::Finished);
         let finished = FinishedUniStream {
             open_ordinal: self.open_ordinal,
             chunks: std::mem::take(&mut self.chunks),
         };
-        // Same shape as `capture_delivered`: keep counting, stop retaining,
-        // make the truncation loud. Bounded because each entry owns every byte
-        // written to its stream — under ADR-0036 §1 a video stream carries a
-        // whole group of pictures, so an unbounded history would leak
-        // monotonically across a Tier-2 benchmark run and pollute the very
-        // deltas that benchmark exists to compare.
         let mut history = self
             .state
             .finished_uni_streams
@@ -876,17 +1216,30 @@ impl MediaSendStream for ShimSendStream {
         drop(history);
         Ok(())
     }
+
+    fn reset(&mut self, code: u32) -> Result<(), TransportError> {
+        if !self.is_open() {
+            return Err(Self::stream_closed());
+        }
+        self.terminate(EgressTerminal::Reset {
+            code,
+            by_drop: false,
+        });
+        Ok(())
+    }
+
+    fn set_priority(&mut self, priority: i32) {
+        self.record.priority.store(priority, Ordering::Release);
+    }
 }
 
+/// The seam's abandonment contract: dropped without `finish`/`reset` RESETS
+/// with `GROUP_ABANDONED` — exactly what the production `Drop` does.
 impl Drop for ShimSendStream {
-    /// A stream dropped without `finish()` models an abandoned group of
-    /// pictures (ADR-0036 §1's reset case). It leaves the open count correct
-    /// so the concurrency high-water mark stays meaningful, and it is NOT
-    /// recorded as finished — an abandoned group must not read as a delivered
-    /// one.
     fn drop(&mut self) {
-        if !self.finished {
-            self.state.open_uni_streams.fetch_sub(1, Ordering::AcqRel);
-        }
+        self.terminate(EgressTerminal::Reset {
+            code: GROUP_ABANDONED,
+            by_drop: true,
+        });
     }
 }

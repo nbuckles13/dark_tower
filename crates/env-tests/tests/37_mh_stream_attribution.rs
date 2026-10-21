@@ -66,20 +66,18 @@
 
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::injection::{
-    self, assert_mc_programmed_a_carrying_pod, injectable_handlers, Injection,
+    self, assert_mc_programmed_a_carrying_pod, injectable_handlers, install_all, Injection,
 };
 use env_tests::fixtures::media::{audio_datagram, AUDIO_SEND_ID, VIDEO_SEND_ID};
-use env_tests::fixtures::metrics::{
-    instance_for_pod_ip, poll_until_pinned_instance, settled_baseline, InstanceCounters,
-};
-use env_tests::fixtures::mh_grpc::{self, Handler, ReleaseOnDrop};
+use env_tests::fixtures::metrics::{paused_promql, reason_promql};
+use env_tests::fixtures::mh_grpc::{self, ReleaseOnDrop};
 use env_tests::fixtures::participant::{self, open_sessions};
 use env_tests::fixtures::video::{
     key_id_sender, NoRequests, PublisherMode, UplinkLabel, VideoPublisher, VideoPublisherConfig,
     VideoTransport,
 };
 use env_tests::fixtures::{AuthClient, GcClient, PrometheusClient};
-use proto_gen::dark_tower::internal::v1::{EgressStream, SourceDisposition, SourceStream};
+use proto_gen::dark_tower::internal::v1::SourceDisposition;
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -112,9 +110,6 @@ const TEST_FRAMES: u32 = 20;
 const FRAME_INTERVAL: Duration = Duration::from_millis(20);
 /// Failure bounds only — never pass conditions.
 const PHASE_DEADLINE: Duration = Duration::from_secs(30);
-const PINNED_METRIC_BOUND: Duration = Duration::from_secs(90);
-const BASELINE_SETTLE_BOUND: Duration = Duration::from_secs(90);
-const VIEW_MARGIN: Duration = Duration::from_secs(10);
 
 /// The injected VIDEO slot ids B and C hold for A — disjoint from every audio
 /// slot id below and from every sender id.
@@ -127,32 +122,6 @@ const SEQ_C: u32 = 1_200_000;
 const SEQ_D: u32 = 1_250_000;
 const SEQ_E: u32 = 1_300_000;
 const _: () = assert!(SEQ_B >= env_tests::fixtures::media::AUDIO_SEQUENCE_CEILING);
-
-fn reason_promql(reason: &str) -> String {
-    format!(r#"sum by (instance) (mh_media_frames_dropped_total{{reason="{reason}"}})"#)
-}
-
-fn paused_promql() -> String {
-    "sum by (instance) (mh_media_paused_source_frames_total)".to_string()
-}
-
-/// One egress stream through the shared fixture. The superseded per-egress
-/// transport is UNSPECIFIED, as MC-A writes it: with `source_streams` declared,
-/// the edge's transport derives from them.
-fn edge(id: u32, subscriber: u32, slot: u32, source: u32, stream: u16) -> EgressStream {
-    injection::edge(
-        id,
-        subscriber,
-        slot,
-        source,
-        u32::from(stream),
-        TransportMode::Unspecified,
-    )
-}
-
-fn source(sender_id: u32, stream: u16, mode: TransportMode, d: SourceDisposition) -> SourceStream {
-    injection::source_stream(sender_id, u32::from(stream), mode, d)
-}
 
 /// What one received datagram is, for this file's classification.
 enum Rx {
@@ -290,87 +259,6 @@ async fn observe_phase(
     observed
 }
 
-/// Baselines for `promql` on each pinned pod.
-async fn baselines(prom: &PrometheusClient, promql: &str) -> InstanceCounters {
-    settled_baseline(
-        prom,
-        promql,
-        BASELINE_SETTLE_BOUND,
-        "the assertion under test",
-    )
-    .await
-}
-
-/// Each pinned pod's counter rises by at least `at_least` past its baseline.
-async fn assert_rise(
-    prom: &PrometheusClient,
-    handlers: &[Handler],
-    promql: &str,
-    base: &InstanceCounters,
-    at_least: u32,
-    phase: &str,
-) {
-    for h in handlers {
-        let b = instance_for_pod_ip(base, &h.pod_ip).map_or(0.0, |(_, v)| v);
-        let target = b + f64::from(at_least);
-        poll_until_pinned_instance(
-            prom,
-            promql,
-            &h.pod_ip,
-            PINNED_METRIC_BOUND,
-            Duration::from_secs(2),
-            phase,
-            &format!(
-                ">= {target} (baseline {b} + the {at_least} test frames sent to this pod). \
-                 If short, rule out TRANSPORT-OVERFLOW first: receive-buffer loss before \
-                 attribution is counted as transport_receive_dropped only at connection \
-                 TEARDOWN (it is forensic, not live), so read that series on this pod after \
-                 the run; a rise there is input-side loss, not an attribution fault, and is \
-                 never fixed by relaxing this gate"
-            ),
-            |v| v >= target,
-        )
-        .await;
-    }
-}
-
-/// Install `edges` + `declared` at `step` on every pod; require the apply and
-/// a per-stream echo of exactly the declared set (PAUSED and DROP_AT_INGRESS
-/// included — the echo carries no disposition).
-async fn install_all(
-    injections: &mut [Injection<'_>],
-    step: u64,
-    edges: Vec<EgressStream>,
-    declared: Vec<SourceStream>,
-) {
-    let want: BTreeSet<(u32, u32, i32)> = declared
-        .iter()
-        .map(|s| (s.sender_id, s.stream_number, s.transport_mode))
-        .collect();
-    for injection in injections.iter_mut() {
-        let g = injection.generation(step);
-        let resp = injection
-            .register_full(g, edges.clone(), &[], declared.clone())
-            .await;
-        assert_eq!(
-            resp.applied_generation, g,
-            "ATTR APPLY on {}: the mixed-transport registration must apply",
-            injection.handler.name
-        );
-        let echoed: BTreeSet<(u32, u32, i32)> = resp
-            .applied_source_streams
-            .iter()
-            .map(|e| (e.sender_id, e.stream_number, e.transport_mode))
-            .collect();
-        assert_eq!(
-            echoed, want,
-            "ATTR ECHO on {}: the per-stream echo must list every declared source stream with \
-             its transport",
-            injection.handler.name
-        );
-    }
-}
-
 #[tokio::test]
 #[serial_test::serial(mh_notifications)]
 async fn test_per_stream_attribution_on_the_datagram_path() {
@@ -391,7 +279,7 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
     ps[0].declare(&[11, 12]).await;
     ps[1].declare(&[21, 22]).await;
     ps[2].declare(&[31, 32]).await;
-    let bound = window + VIEW_MARGIN;
+    let bound = window + participant::VIEW_MARGIN;
     for (i, others) in [(0, [b, c]), (1, [a, c]), (2, [a, b])] {
         let want: BTreeSet<u32> = others.into_iter().collect();
         ps[i]
@@ -408,7 +296,8 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
     let slot = |i: usize, from: u32| ps[i].slot_for(from);
 
     // (a) INJECT the mixed registration on both pods.
-    let handlers = injectable_handlers(&prom, BASELINE_SETTLE_BOUND).await;
+    let handlers =
+        injectable_handlers(&prom, env_tests::fixtures::metrics::BASELINE_SETTLE_BOUND).await;
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;
     let cleanup = ReleaseOnDrop::new(token.clone());
     let mut injections = Vec::new();
@@ -426,7 +315,7 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
                 .enumerate()
             {
                 let ordinal = u32::try_from(ordinal).expect("two sources");
-                e.push(edge(
+                e.push(injection::declared_edge(
                     (subscriber << 8) | ordinal,
                     subscriber,
                     slot(i, from),
@@ -435,21 +324,33 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
                 ));
             }
         }
-        e.push(edge((b << 8) | 9, b, B_VIDEO_SLOT, a, VIDEO_SEND_ID));
-        e.push(edge((c << 8) | 9, c, C_VIDEO_SLOT, a, VIDEO_SEND_ID));
+        e.push(injection::declared_edge(
+            (b << 8) | 9,
+            b,
+            B_VIDEO_SLOT,
+            a,
+            VIDEO_SEND_ID,
+        ));
+        e.push(injection::declared_edge(
+            (c << 8) | 9,
+            c,
+            C_VIDEO_SLOT,
+            a,
+            VIDEO_SEND_ID,
+        ));
         e
     };
     let sources = |audio: SourceDisposition, video: SourceDisposition| {
         vec![
-            source(a, AUDIO_SEND_ID, TransportMode::Datagram, audio),
-            source(a, VIDEO_SEND_ID, TransportMode::StreamPerGroup, video),
-            source(
+            injection::declared_source(a, AUDIO_SEND_ID, TransportMode::Datagram, audio),
+            injection::declared_source(a, VIDEO_SEND_ID, TransportMode::StreamPerGroup, video),
+            injection::declared_source(
                 b,
                 AUDIO_SEND_ID,
                 TransportMode::Datagram,
                 SourceDisposition::Forward,
             ),
-            source(
+            injection::declared_source(
                 c,
                 AUDIO_SEND_ID,
                 TransportMode::Datagram,
@@ -542,7 +443,7 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
     };
 
     // (b) PER-KIND SERVER MUTE: A's audio DROP_AT_INGRESS, still declared.
-    let muted_base = baselines(&prom, &reason_promql("server_muted")).await;
+    let muted_base = injection::baselines(&prom, &reason_promql("server_muted")).await;
     install_all(
         &mut injections,
         1,
@@ -555,7 +456,7 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
     // control: the ORDERING evidence is the pinned counter, FIRST — once each
     // pod has counted every test frame as `server_muted`, every test frame was
     // ingested and dropped, so the drain after it is ordered.
-    assert_rise(
+    injection::assert_rise(
         &prom,
         &handlers,
         &reason_promql("server_muted"),
@@ -592,9 +493,9 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
     )
     .await;
     // Labelled as video, on the wrong transport: transport_mismatch.
-    let mismatch_base = baselines(&prom, &reason_promql("transport_mismatch")).await;
+    let mismatch_base = injection::baselines(&prom, &reason_promql("transport_mismatch")).await;
     send_a_video(UplinkLabel::Directed).await;
-    assert_rise(
+    injection::assert_rise(
         &prom,
         &handlers,
         &reason_promql("transport_mismatch"),
@@ -637,7 +538,7 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
     // (d) UNMATCHED: an undeclared label. Per entity: the frames are delivered
     // NOWHERE — A's own audio, sent after them on the same connections, is
     // the ordering control, and no A video frame lands on any slot.
-    let unmatched_base = baselines(&prom, &reason_promql("unmatched_stream")).await;
+    let unmatched_base = injection::baselines(&prom, &reason_promql("unmatched_stream")).await;
     send_a_video(UplinkLabel::Override(7)).await;
     let seen = observe_phase(
         "ATTR (d) UNMATCHED",
@@ -658,7 +559,7 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
             o.a_video_slots
         );
     }
-    assert_rise(
+    injection::assert_rise(
         &prom,
         &handlers,
         &reason_promql("unmatched_stream"),
@@ -669,7 +570,7 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
     .await;
 
     // (e) CLIENT MUTE: A's audio PAUSED still forwards, counted as arrivals.
-    let paused_base = baselines(&prom, &paused_promql()).await;
+    let paused_base = injection::baselines(&prom, &paused_promql()).await;
     install_all(
         &mut injections,
         3,
@@ -696,7 +597,7 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
             r.name
         );
     }
-    assert_rise(
+    injection::assert_rise(
         &prom,
         &handlers,
         &paused_promql(),

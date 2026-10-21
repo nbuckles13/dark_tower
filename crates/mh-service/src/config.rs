@@ -15,6 +15,7 @@ use common::secret::SecretString;
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Default gRPC bind address for MC→MH communication.
@@ -877,9 +878,196 @@ pub const MIN_KEEPALIVE_TO_IDLE_RATIO: u64 = 3;
 /// [`MAX_DATAGRAM_BUFFER_AUDIO_FRAMES_CEILING`], so its worst case is
 /// `150 x 240 B` = ~36 KB per connection, ~18 MB across 500.
 ///
-/// Changing `resources.limits.memory` in `mh-{0,1}-deployment.yaml` invalidates
-/// this arithmetic and requires revisiting `MH_MAX_CONNECTIONS`.
+/// **Superseded as the memory statement (story 3 MH-A2).** The per-connection
+/// terms are now summed ONCE, executably, by [`per_connection_memory_bound_bytes`]
+/// — which adds the declared [`CONNECTION_SEND_WINDOW_BYTES`] (512 KiB, the
+/// dominant term) to the receive window, datagram receive buffer and datagram
+/// send buffer above — and the whole pod is checked at boot by
+/// [`check_pod_memory`] against `MH_POD_MEMORY_LIMIT_BYTES`. The ledger above
+/// is kept for its reasoning; the "~13%" conclusion no longer holds. With the
+/// send term, `MH_MAX_CONNECTIONS = 500` uses ~400 MB of the 537 MB the check
+/// allows at a 1 GiB limit, so `MH_MAX_CONNECTIONS` has roughly 1.3x headroom
+/// before MH refuses to boot — that, not the old 13%, is now the binding
+/// constraint on raising it.
 pub const CONNECTION_RECEIVE_WINDOW_BYTES: u32 = 256 * 1024;
+
+/// Connection-level SEND window, in bytes: the most stream data quinn holds
+/// written-but-unacknowledged per connection (`TransportConfig::send_window`).
+///
+/// # Declared, because undeclared it sat UNDER the backlog cap
+///
+/// quinn defaults it to `8 x STREAM_RWND` = 10 MB per connection. With
+/// stream-per-group video egress (story 3 MH-A2) that is where a slow
+/// subscriber's data would pile up: MH's own per-destination backlog
+/// (`MH_EGRESS_STREAM_BACKLOG_BYTES`) only fills once `write_all` stops
+/// accepting, so with 10 MB beneath it the cap would never trip and the boot
+/// memory check would certify nothing (~5 GB across 500 connections against a
+/// 1 GiB pod). ADR-0036 §1: "a bound has to be declared to be assertable".
+///
+/// # Its throughput consequence
+///
+/// It caps unacknowledged egress per connection at 512 KiB per RTT — about
+/// 21 Mbit/s at 200 ms, ~42 Mbit/s at 100 ms. The worst-case per-subscriber
+/// downlink is `video slots x MEDIA_VIDEO_MAX_BITRATE_BPS + audio`: at story 3's
+/// defaults (4 video slots x 800 kbit/s + 8 x 48 kbit/s audio) ~3.6 Mbit/s,
+/// comfortably inside. Whoever raises the video bitrate or the slot cap must
+/// check this line: it is in the path, and datagram audio does not draw on it.
+pub const CONNECTION_SEND_WINDOW_BYTES: u32 = 512 * 1024;
+
+/// The fraction of `MH_POD_MEMORY_LIMIT_BYTES` the bounded media buffers may
+/// claim at boot, as `(numerator, denominator)`: one half.
+///
+/// The other half is deliberate slack for everything the check does not
+/// enumerate: the process itself (tokio, TLS, gRPC, the routing snapshot),
+/// allocator fragmentation, quinn's per-connection state and inherited 16 KiB
+/// crypto buffer, MH's bounded datagram queues, and the receive-buffer
+/// RETENTION overhang. That last one, stated as a figure: a payload chunk held
+/// uncopied pins its quinn receive batch (up to ~64 GRO segments x ~1.5 KB =
+/// ~96 KB), and `crate::media::downlink` holds at most one such chunk per
+/// downlink, two downlinks per edge — so 2 x stream ceiling x ~96 KB: ~19 MB at
+/// Kind's ceiling of ~99, ~2.3 MB at the base ceiling of 12. The ingress
+/// "chunk in flight" is bounded the same way: 64 streams x one chunk x one
+/// batch per connection is a TRANSIENT (the chunk is forwarded or copied
+/// before the next read). Both sit well inside the half.
+pub const MEMORY_CHECK_FRACTION: (u64, u64) = (1, 2);
+
+/// Bounds for `MH_STREAM_OPENS_PER_CONNECTION_PER_SEC` (story 3 R-23).
+pub const STREAM_OPENS_PER_SEC_RANGE: (u64, u64) = (1, 100);
+/// Bounds for `MH_EGRESS_STREAM_BACKLOG_BYTES` (story 3 R-23).
+pub const EGRESS_STREAM_BACKLOG_BYTES_RANGE: (u64, u64) = (16_384, 4_194_304);
+/// The largest per-destination backlog any configuration can hold — the
+/// never-binding value for tests that are not about the stream path. Derived
+/// from the range: one source of truth.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "4 MiB fits usize on every supported (>= 32-bit) target"
+)]
+pub const MAX_EGRESS_STREAM_BACKLOG_BYTES: usize = EGRESS_STREAM_BACKLOG_BYTES_RANGE.1 as usize;
+
+/// How much real memory one byte of charged backlog can occupy: 2.
+///
+/// `crate::media::downlink` charges the bytes it queues. Headers are exact
+/// allocations and uncopied chunks are bounded separately (one per downlink,
+/// see [`MEMORY_CHECK_FRACTION`]); the coalescing buffer a backlogged
+/// destination copies into is a `BytesMut`, whose growth doubles capacity, so
+/// it can hold at most 2x the bytes charged against it before the writer takes
+/// it whole. The boot memory check multiplies the backlog term by this factor
+/// so it asserts the real worst case, not the charge.
+pub const BACKLOG_ALLOCATION_FACTOR: u64 = 2;
+/// Bounds for `MH_STREAM_MID_FRAME_STALL_MS` (story 3 R-23).
+pub const STREAM_MID_FRAME_STALL_MS_RANGE: (u64, u64) = (100, 10_000);
+
+/// The stream-path limits MH enforces (story 3 R-21, R-23), all REQUIRED reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamPathLimits {
+    /// `MH_STREAM_OPENS_PER_CONNECTION_PER_SEC`: the per-publisher-connection
+    /// token bucket's rate and burst, enforced at accept.
+    pub opens_per_connection_per_sec: u32,
+    /// `MH_EGRESS_STREAM_BACKLOG_BYTES`: each destination's backlog cap.
+    pub egress_stream_backlog_bytes: usize,
+    /// `MH_STREAM_MID_FRAME_STALL_MS`: how long a publisher may sit mid-frame
+    /// with no progress before MH resets downstream.
+    pub mid_frame_stall: Duration,
+}
+
+/// The per-connection memory MH's declared buffers can claim, in bytes — the
+/// ONE executable home of that ledger: connection receive window + datagram
+/// receive buffer + connection SEND window + the operator-tunable datagram send
+/// buffer.
+#[must_use]
+pub fn per_connection_memory_bound_bytes(quic: &QuicTransportParams) -> u64 {
+    u64::from(CONNECTION_RECEIVE_WINDOW_BYTES)
+        .saturating_add(DATAGRAM_RECEIVE_BUFFER_BYTES as u64)
+        .saturating_add(u64::from(CONNECTION_SEND_WINDOW_BYTES))
+        .saturating_add(quic.datagram_send_buffer_bytes as u64)
+}
+
+/// The boot memory check's figures, logged at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudget {
+    /// `MH_POD_MEMORY_LIMIT_BYTES` as read (downward API).
+    pub limit_bytes: u64,
+    /// `limit x MEMORY_CHECK_FRACTION`.
+    pub allowed_bytes: u64,
+    /// `backlog x BACKLOG_ALLOCATION_FACTOR x stream ceiling`.
+    pub backlog_term_bytes: u64,
+    /// `per-connection bound x MH_MAX_CONNECTIONS`.
+    pub connection_term_bytes: u64,
+    /// The per-connection bound.
+    pub per_connection_bytes: u64,
+    /// The two terms summed.
+    pub required_bytes: u64,
+}
+
+impl MemoryBudget {
+    /// What is left of the allowed share.
+    #[must_use]
+    pub const fn headroom_bytes(&self) -> u64 {
+        self.allowed_bytes.saturating_sub(self.required_bytes)
+    }
+}
+
+/// The boot memory check (story 3 R-21): MH refuses to start when
+/// `backlog x BACKLOG_ALLOCATION_FACTOR x derived stream ceiling +
+/// per-connection bound x MH_MAX_CONNECTIONS` exceeds [`MEMORY_CHECK_FRACTION`]
+/// of the pod memory limit, so backlog exhaustion is a counted reset, never an
+/// out-of-memory kill.
+///
+/// The multiplier is the DERIVED stream ceiling because that is what admission
+/// enforces (`session::SessionManagerActor`: `projected_total_edges >
+/// stream_ceiling` refuses the apply), and because the backlog is per
+/// DESTINATION — shared by an edge's at most two live downlinks — so an edge
+/// can never hold more than one cap. All arithmetic is checked; an overflow
+/// refuses to boot.
+///
+/// # Errors
+///
+/// [`ConfigError::PodMemoryCheckFailed`] naming every figure and lever.
+pub fn check_pod_memory(
+    backlog_bytes: usize,
+    stream_ceiling: u32,
+    per_connection_bytes: u64,
+    max_connections: usize,
+    limit_bytes: u64,
+) -> Result<MemoryBudget, ConfigError> {
+    let (numerator, denominator) = MEMORY_CHECK_FRACTION;
+    let backlog_term = (backlog_bytes as u64)
+        .checked_mul(BACKLOG_ALLOCATION_FACTOR)
+        .and_then(|b| b.checked_mul(u64::from(stream_ceiling)));
+    let connection_term = per_connection_bytes.checked_mul(max_connections as u64);
+    let required = backlog_term
+        .zip(connection_term)
+        .and_then(|(a, b)| a.checked_add(b));
+    let allowed = limit_bytes
+        .checked_mul(numerator)
+        .map(|scaled| scaled / denominator);
+    let fail = || ConfigError::PodMemoryCheckFailed {
+        limit_bytes,
+        fraction_numerator: numerator,
+        fraction_denominator: denominator,
+        allowed_bytes: allowed.unwrap_or(0),
+        backlog_bytes: backlog_bytes as u64,
+        stream_ceiling: u64::from(stream_ceiling),
+        per_connection_bytes,
+        max_connections: max_connections as u64,
+        required: required.map_or_else(|| "overflows u64".to_string(), |r| r.to_string()),
+    };
+    match (backlog_term, connection_term, required, allowed) {
+        (Some(backlog_term), Some(connection_term), Some(required), Some(allowed))
+            if required <= allowed =>
+        {
+            Ok(MemoryBudget {
+                limit_bytes,
+                allowed_bytes: allowed,
+                backlog_term_bytes: backlog_term,
+                connection_term_bytes: connection_term,
+                per_connection_bytes,
+                required_bytes: required,
+            })
+        }
+        _ => Err(fail()),
+    }
+}
 
 /// Per-stream receive window, in bytes.
 ///
@@ -1422,6 +1610,35 @@ fn reject_above(key: &str, value: u64, ceiling: u64, consequence: &str) -> Resul
     Ok(())
 }
 
+/// Reject a required numeric bound below its code-level FLOOR, naming the
+/// floor and what a smaller value would silently cost. The third member of the
+/// [`reject_zero`] / [`reject_above`] message family.
+fn reject_below(key: &str, value: u64, floor: u64, consequence: &str) -> Result<(), ConfigError> {
+    if value < floor {
+        return Err(ConfigError::InvalidValue(format!(
+            "{key} must be at least {floor}, got {value} — {consequence}. Remediation: raise \
+             {key} in infra/services/mh-service/config.env to {floor} or more"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse a required integer in `floor..=ceiling` through the shared message
+/// family. Presence stays at the call site (the guard-load-bearing
+/// `MissingEnvVar` literal).
+fn parse_in_range(
+    key: &str,
+    raw: &str,
+    (floor, ceiling): (u64, u64),
+    below_consequence: &str,
+    above_consequence: &str,
+) -> Result<u64, ConfigError> {
+    let parsed: u64 = parse_required_number(key, raw)?;
+    reject_below(key, parsed, floor, below_consequence)?;
+    reject_above(key, parsed, ceiling, above_consequence)?;
+    Ok(parsed)
+}
+
 /// Where an optional configuration value came from, for the startup log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueSource {
@@ -1527,6 +1744,14 @@ pub struct Config {
 
     /// Explicit QUIC transport parameters (ADR-0036 §1). All REQUIRED.
     pub quic_transport: QuicTransportParams,
+
+    /// Stream-path limits (story 3 R-21, R-23). All REQUIRED.
+    pub stream_path: StreamPathLimits,
+
+    /// The boot memory check's figures (story 3 R-21), computed from
+    /// `MH_POD_MEMORY_LIMIT_BYTES` (REQUIRED, downward API, no default and no
+    /// cgroup fallback). Construction fails when the check fails.
+    pub memory_budget: MemoryBudget,
 
     /// Pod termination grace period in seconds (env
     /// `MH_TERMINATION_GRACE_SECONDS`, REQUIRED).
@@ -1643,6 +1868,8 @@ impl fmt::Debug for Config {
             )
             .field("max_connections", &self.max_connections)
             .field("quic_transport", &self.quic_transport)
+            .field("stream_path", &self.stream_path)
+            .field("memory_budget", &self.memory_budget)
             .field("termination_grace_seconds", &self.termination_grace_seconds)
             .field("drain_window", &self.drain_window)
             .field("drain_window_source", &self.drain_window_source)
@@ -1768,6 +1995,41 @@ pub enum ConfigError {
         ceiling: u64,
         /// The configured `MH_MAX_TOTAL_EGRESS_EDGES`.
         max_total_egress_edges: u64,
+    },
+
+    /// The boot memory check failed (story 3 R-21; [`check_pod_memory`]).
+    #[error(
+        "Pod memory check failed: refusing to start. Bounded media buffers need {required} B \
+         but only {allowed_bytes} B are allowed ({fraction_numerator}/{fraction_denominator} of \
+         MH_POD_MEMORY_LIMIT_BYTES={limit_bytes}). Terms: egress backlog \
+         MH_EGRESS_STREAM_BACKLOG_BYTES={backlog_bytes} x allocation factor 2 x derived egress \
+         stream ceiling \
+         {stream_ceiling} (from MH_EGRESS_BUDGET_BPS and the media-codec-profile costs); plus \
+         per-connection buffers {per_connection_bytes} B (receive window + datagram receive \
+         buffer + send window + datagram send buffer from MH_DATAGRAM_BUFFER_AUDIO_FRAMES) x \
+         MH_MAX_CONNECTIONS={max_connections}. Levers: raise resources.limits.memory in the MH \
+         deployment, or lower MH_EGRESS_BUDGET_BPS, MH_EGRESS_STREAM_BACKLOG_BYTES or \
+         MH_MAX_CONNECTIONS in infra/services/mh-service/config.env"
+    )]
+    PodMemoryCheckFailed {
+        /// `MH_POD_MEMORY_LIMIT_BYTES`.
+        limit_bytes: u64,
+        /// Fraction numerator.
+        fraction_numerator: u64,
+        /// Fraction denominator.
+        fraction_denominator: u64,
+        /// `limit x fraction` (0 if that overflowed).
+        allowed_bytes: u64,
+        /// `MH_EGRESS_STREAM_BACKLOG_BYTES`.
+        backlog_bytes: u64,
+        /// The derived egress stream ceiling.
+        stream_ceiling: u64,
+        /// [`per_connection_memory_bound_bytes`].
+        per_connection_bytes: u64,
+        /// `MH_MAX_CONNECTIONS`.
+        max_connections: u64,
+        /// The requirement, or "overflows u64".
+        required: String,
     },
 
     /// The source-stream bound is below the egress-stream bound (story 3;
@@ -2373,6 +2635,74 @@ impl Config {
             policy_limits.max_total_egress_edges,
         )?;
 
+        // ---------------------------------------------------------------------
+        // Story 3 R-21/R-23 stream-path limits and the boot memory check. ALL
+        // REQUIRED (the story-2 R-23 precedent: a required read is what
+        // `dt-guard env-config` check 1 sees; the shipped values live in the
+        // ConfigMap INF-A landed). Out of range refuses, never clamps.
+        // ---------------------------------------------------------------------
+        let stream_opens = parse_in_range(
+            "MH_STREAM_OPENS_PER_CONNECTION_PER_SEC",
+            vars.get("MH_STREAM_OPENS_PER_CONNECTION_PER_SEC")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MH_STREAM_OPENS_PER_CONNECTION_PER_SEC".to_string())
+                })?,
+            STREAM_OPENS_PER_SEC_RANGE,
+            "a publisher could never open a video group stream",
+            "a connection could churn group streams faster than any keyframe cadence needs, \
+             which is the stream-open flood this cap exists to bound (ADR-0036 §11)",
+        )?;
+        let backlog_bytes = parse_in_range(
+            "MH_EGRESS_STREAM_BACKLOG_BYTES",
+            vars.get("MH_EGRESS_STREAM_BACKLOG_BYTES").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MH_EGRESS_STREAM_BACKLOG_BYTES".to_string())
+            })?,
+            EGRESS_STREAM_BACKLOG_BYTES_RANGE,
+            "a single keyframe would overflow it and every subscriber would be reset at every \
+             group start",
+            "each destination could pin that much memory, multiplied by the stream ceiling",
+        )?;
+        let stall_ms = parse_in_range(
+            "MH_STREAM_MID_FRAME_STALL_MS",
+            vars.get("MH_STREAM_MID_FRAME_STALL_MS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MH_STREAM_MID_FRAME_STALL_MS".to_string())
+            })?,
+            STREAM_MID_FRAME_STALL_MS_RANGE,
+            "ordinary network jitter would reset healthy publishers mid-frame",
+            "a stalled publisher would hold every subscriber's group open that long",
+        )?;
+        let stream_path = StreamPathLimits {
+            opens_per_connection_per_sec: u32::try_from(stream_opens).map_err(|e| {
+                ConfigError::InvalidValue(format!(
+                    "MH_STREAM_OPENS_PER_CONNECTION_PER_SEC={stream_opens}: {e}"
+                ))
+            })?,
+            egress_stream_backlog_bytes: bound_to_usize(
+                "MH_EGRESS_STREAM_BACKLOG_BYTES",
+                backlog_bytes,
+            )?,
+            mid_frame_stall: Duration::from_millis(stall_ms),
+        };
+        let pod_memory_limit_bytes: u64 = parse_required_number(
+            "MH_POD_MEMORY_LIMIT_BYTES",
+            vars.get("MH_POD_MEMORY_LIMIT_BYTES").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MH_POD_MEMORY_LIMIT_BYTES".to_string())
+            })?,
+        )?;
+        reject_zero(
+            "MH_POD_MEMORY_LIMIT_BYTES",
+            pod_memory_limit_bytes,
+            "the downward-API limit is missing or the container declares no \
+             resources.limits.memory, so the memory check would certify nothing",
+        )?;
+        let memory_budget = check_pod_memory(
+            stream_path.egress_stream_backlog_bytes,
+            egress_admission.stream_ceiling,
+            per_connection_memory_bound_bytes(&quic_transport),
+            max_connections,
+            pod_memory_limit_bytes,
+        )?;
+
         // ADR-0036 §11 media latency sampling. Optional-with-default (a
         // reasoned carve-out; see the field doc) plus a hard range check: above
         // 1 silently means "observe everything" (a per-frame histogram write on
@@ -2468,6 +2798,8 @@ impl Config {
             register_meeting_timeout_seconds,
             max_connections,
             quic_transport,
+            stream_path,
+            memory_budget,
             media_codec_profile,
             retired_keys_present: RETIRED_KEYS
                 .iter()
@@ -2601,6 +2933,24 @@ mod tests {
             (
                 "MH_EGRESS_REJECTION_RATIO_THRESHOLD".to_string(),
                 "0.05".to_string(),
+            ),
+            // Story 3 MH-A2 stream-path keys, deployed values, plus the pod
+            // memory limit the deployments declare (1Gi, via the downward API).
+            (
+                "MH_STREAM_OPENS_PER_CONNECTION_PER_SEC".to_string(),
+                "10".to_string(),
+            ),
+            (
+                "MH_EGRESS_STREAM_BACKLOG_BYTES".to_string(),
+                "262144".to_string(),
+            ),
+            (
+                "MH_STREAM_MID_FRAME_STALL_MS".to_string(),
+                "1000".to_string(),
+            ),
+            (
+                "MH_POD_MEMORY_LIMIT_BYTES".to_string(),
+                (1_u64 << 30).to_string(),
             ),
         ])
     }
@@ -4045,6 +4395,11 @@ mod tests {
     fn test_max_connections_custom_value() {
         let mut vars = base_vars();
         vars.insert("MH_MAX_CONNECTIONS".to_string(), "5000".to_string());
+        // 5000 connections need a pod sized for them (the boot memory check).
+        vars.insert(
+            "MH_POD_MEMORY_LIMIT_BYTES".to_string(),
+            (16_u64 << 30).to_string(),
+        );
 
         let config = Config::from_vars(&vars).expect("Config should load successfully");
         assert_eq!(config.max_connections, 5000);
@@ -4234,5 +4589,243 @@ mod tests {
             cited += 1;
         }
         assert!(cited > 0, "expected at least one cited infra path");
+    }
+
+    // =========================================================================
+    // Story 3 MH-A2: stream-path keys and the boot memory check.
+    // =========================================================================
+
+    const STREAM_KEYS: [(&str, (u64, u64)); 3] = [
+        (
+            "MH_STREAM_OPENS_PER_CONNECTION_PER_SEC",
+            STREAM_OPENS_PER_SEC_RANGE,
+        ),
+        (
+            "MH_EGRESS_STREAM_BACKLOG_BYTES",
+            EGRESS_STREAM_BACKLOG_BYTES_RANGE,
+        ),
+        (
+            "MH_STREAM_MID_FRAME_STALL_MS",
+            STREAM_MID_FRAME_STALL_MS_RANGE,
+        ),
+    ];
+
+    #[test]
+    fn the_stream_path_keys_and_the_memory_limit_are_required() {
+        for key in STREAM_KEYS
+            .iter()
+            .map(|(key, _)| *key)
+            .chain(["MH_POD_MEMORY_LIMIT_BYTES"])
+        {
+            assert_required(key);
+        }
+    }
+
+    #[test]
+    fn the_stream_path_bounds_refuse_naming_the_key_and_never_clamp() {
+        // The task's bounds, written out (a test against the same constant
+        // would pass whatever it became).
+        assert_eq!(STREAM_OPENS_PER_SEC_RANGE, (1, 100));
+        assert_eq!(EGRESS_STREAM_BACKLOG_BYTES_RANGE, (16_384, 4_194_304));
+        assert_eq!(STREAM_MID_FRAME_STALL_MS_RANGE, (100, 10_000));
+        for (key, (floor, ceiling)) in STREAM_KEYS {
+            for (value, ok) in [
+                (floor - 1, false),
+                (floor, true),
+                (ceiling, true),
+                (ceiling + 1, false),
+            ] {
+                let mut vars = base_vars();
+                vars.insert(key.to_string(), value.to_string());
+                match Config::from_vars(&vars) {
+                    Ok(_) => assert!(ok, "{key}={value} must refuse"),
+                    Err(e) => {
+                        assert!(!ok, "{key}={value} must boot: {e}");
+                        assert!(e.to_string().contains(key), "{e}");
+                    }
+                }
+            }
+        }
+        let config = Config::from_vars(&base_vars()).expect("deployed values boot");
+        assert_eq!(
+            config.stream_path,
+            StreamPathLimits {
+                opens_per_connection_per_sec: 10,
+                egress_stream_backlog_bytes: 262_144,
+                mid_frame_stall: Duration::from_millis(1000),
+            }
+        );
+    }
+
+    #[test]
+    fn a_zero_empty_or_malformed_memory_limit_refuses_with_no_fallback() {
+        for value in ["0", "", "1Gi", "-1"] {
+            let mut vars = base_vars();
+            vars.insert("MH_POD_MEMORY_LIMIT_BYTES".to_string(), value.to_string());
+            let error = Config::from_vars(&vars).expect_err("must refuse");
+            assert!(
+                error.to_string().contains("MH_POD_MEMORY_LIMIT_BYTES"),
+                "{value}: {error}"
+            );
+        }
+    }
+
+    /// Just under, exactly at, and just over the allowed share; overflow.
+    #[test]
+    fn the_memory_check_refuses_exactly_past_the_fraction() {
+        let per_connection: u64 = 1_000;
+        let connections: usize = 10;
+        let backlog: usize = 100;
+        let ceiling: u32 = 10;
+        let required =
+            u64::try_from(backlog).unwrap() * BACKLOG_ALLOCATION_FACTOR * u64::from(ceiling)
+                + per_connection * u64::try_from(connections).unwrap();
+        let (n, d) = MEMORY_CHECK_FRACTION;
+        let at = required * d / n;
+        let budget = check_pod_memory(backlog, ceiling, per_connection, connections, at)
+            .expect("exactly at the fraction boots");
+        assert_eq!(budget.required_bytes, required);
+        assert_eq!(budget.headroom_bytes(), 0);
+        assert!(check_pod_memory(backlog, ceiling, per_connection, connections, at + d).is_ok());
+        let error = check_pod_memory(backlog, ceiling, per_connection, connections, at - 1)
+            .expect_err("one byte under refuses");
+        let text = error.to_string();
+        for needle in [
+            "refusing to start",
+            "MH_POD_MEMORY_LIMIT_BYTES",
+            "MH_EGRESS_STREAM_BACKLOG_BYTES",
+            "MH_MAX_CONNECTIONS",
+            "MH_EGRESS_BUDGET_BPS",
+            "resources.limits.memory",
+            &required.to_string(),
+        ] {
+            assert!(text.contains(needle), "missing {needle}: {text}");
+        }
+        assert!(matches!(
+            check_pod_memory(usize::MAX, u32::MAX, u64::MAX, usize::MAX, u64::MAX),
+            Err(ConfigError::PodMemoryCheckFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn an_oversize_configuration_refuses_to_boot() {
+        let mut vars = base_vars();
+        // 512 MiB pod: the ~400 MB requirement exceeds its half.
+        vars.insert(
+            "MH_POD_MEMORY_LIMIT_BYTES".to_string(),
+            (512_u64 << 20).to_string(),
+        );
+        assert!(matches!(
+            Config::from_vars(&vars),
+            Err(ConfigError::PodMemoryCheckFailed { .. })
+        ));
+    }
+
+    /// Read `KEY=VALUE` lines.
+    fn env_file(text: &str) -> HashMap<String, String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect()
+    }
+
+    /// `limits: ... memory: <n>Gi|Mi` from a deployment, in bytes.
+    fn deployment_memory_limit(yaml: &str) -> u64 {
+        let after = yaml.split("limits:").nth(1).expect("limits block");
+        let value = after
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("memory:"))
+            .expect("limits.memory")
+            .trim();
+        if let Some(gi) = value.strip_suffix("Gi") {
+            gi.parse::<u64>().unwrap() << 30
+        } else if let Some(mi) = value.strip_suffix("Mi") {
+            mi.parse::<u64>().unwrap() << 20
+        } else {
+            panic!("unparsed memory limit {value}")
+        }
+    }
+
+    /// The SHIPPED base config, codec profile and deployment limit pass the
+    /// boot memory check, and so does the Kind overlay's budget — so raising a
+    /// budget or a connection count fails HERE (Layer 3), not as a `CrashLoop`
+    /// in a cluster.
+    #[test]
+    fn the_shipped_base_and_kind_configurations_pass_the_memory_check() {
+        let config_env = include_str!("../../../infra/services/mh-service/config.env");
+        let profile = include_str!("../../../infra/services/media-codec-profile/profile.env");
+        let kind_patch = include_str!(
+            "../../../infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml"
+        );
+        for deployment in [
+            include_str!("../../../infra/services/mh-service/mh-0-deployment.yaml"),
+            include_str!("../../../infra/services/mh-service/mh-1-deployment.yaml"),
+        ] {
+            let limit = deployment_memory_limit(deployment);
+            let mut vars = base_vars();
+            // Every shipped value except the in-cluster TLS file paths, which
+            // this test cannot provide.
+            vars.extend(
+                env_file(config_env)
+                    .into_iter()
+                    .filter(|(key, _)| !key.starts_with("MH_TLS_")),
+            );
+            vars.extend(env_file(profile));
+            vars.insert("MH_POD_MEMORY_LIMIT_BYTES".to_string(), limit.to_string());
+            let base = Config::from_vars(&vars).expect("the shipped base config must boot");
+            assert!(base.memory_budget.headroom_bytes() > 0);
+
+            let kind_budget = kind_patch
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("MH_EGRESS_BUDGET_BPS:"))
+                .expect("Kind budget patch")
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            vars.insert("MH_EGRESS_BUDGET_BPS".to_string(), kind_budget);
+            let kind = Config::from_vars(&vars).expect("the Kind overlay must boot");
+            assert!(kind.memory_budget.required_bytes > base.memory_budget.required_bytes);
+        }
+    }
+
+    #[test]
+    fn the_per_connection_bound_sums_every_declared_term() {
+        let quic = QuicTransportParams {
+            max_concurrent_uni_streams: 64,
+            datagram_send_buffer_audio_frames: 32,
+            datagram_send_buffer_bytes: 7_680,
+            keepalive_interval_ms: 10_000,
+        };
+        assert_eq!(
+            per_connection_memory_bound_bytes(&quic),
+            262_144 + 2_048 + 524_288 + 7_680
+        );
+    }
+
+    /// Drift guard (single source of truth): env-test 38 cannot import this
+    /// crate (ADR-0028), so it restates `CONNECTION_SEND_WINDOW_BYTES` as a
+    /// literal to size its backlog row. Fail here if the two ever differ.
+    #[test]
+    fn env_test_38_restates_the_send_window_exactly() {
+        let source = include_str!("../../env-tests/tests/38_mh_video_forwarding.rs");
+        let line = source
+            .lines()
+            .find(|l| {
+                l.trim_start()
+                    .starts_with("const MH_CONNECTION_SEND_WINDOW_BYTES: u64 =")
+            })
+            .expect("env-test 38 declares MH_CONNECTION_SEND_WINDOW_BYTES");
+        let value: u64 = line
+            .split('=')
+            .nth(1)
+            .expect("an initialiser")
+            .trim()
+            .trim_end_matches(';')
+            .replace('_', "")
+            .parse()
+            .expect("a plain integer literal");
+        assert_eq!(value, u64::from(CONNECTION_SEND_WINDOW_BYTES));
     }
 }

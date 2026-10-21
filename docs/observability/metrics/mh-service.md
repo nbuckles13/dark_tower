@@ -613,7 +613,9 @@ only one carrying `direction`.
 
 ## Media Forward Path
 
-The ADR-0036 §2/§7 audio datagram forward path and its §11 telemetry. Placed
+The ADR-0036 §2/§7 forward paths — datagram audio and, since story 3 MH-A2,
+stream-per-group cut-through video (§"Stream-per-group path" below) — and their
+§11 telemetry. Placed
 immediately after the control plane above because a responder triaging "no
 audio" reads them together: the control plane says *whether MH was told what to
 forward*, and these say *what it did with the frames*.
@@ -812,7 +814,7 @@ decisions reached, and a cancelled await is not a decision.
 
 ### `mh_media_frames_forwarded_total`
 - **Type**: Counter
-- **Description**: Frames MH accepted into the forward path (`direction=ingress`) and frames the transport accepted for a subscriber (`direction=egress`).
+- **Description**: Frames MH accepted into the forward path (`direction=ingress`) and frames forwarded to a subscriber (`direction=egress`). **The egress meaning differs by path**: on the DATAGRAM path it is "the transport accepted the datagram"; on the STREAM path (story 3 MH-A2) it is "the rewritten header was pushed to the edge's downlink (MH-side)" — the instant the hop number is consumed — because a cut-through frame's tail is still in flight at that point. On the stream path `direction=ingress` is counted once per frame at HEADER completion, never per chunk or per edge.
 - **Labels**:
   - `direction`: `ingress` (publisher→relay) or `egress` (relay→subscriber)
   - `key_custody`: `operator` (single value)
@@ -862,7 +864,7 @@ ratio is therefore built within ONE direction:
 **EVERY egress series is counted per EDGE except one.** `forwarded{direction="egress"}`
 and every `direction=egress` drop reason — `egress_queue_overflow`,
 `connection_closed`, `transport_send_refused`, `no_local_subscriber`,
-`relay_rewrite_failed`, `partial_frame_discard` — count once per
+`relay_rewrite_failed` — count once per
 (frame × subscriber), because that is the unit at which each outcome happens.
 **`no_subscriber` is the exception and counts once per FRAME**, because the frame
 reached *zero* edges and there is no per-edge event to count. Two consequences a reader of the drop-rate expression needs: under
@@ -917,7 +919,6 @@ violation can never be alerted on.
 |---|---|---|---|
 | `transport_send_refused` | egress | The seam refused a datagram it should have accepted (`TooLarge`, `DatagramsUnsupported`, or the test double's `WouldBlock`). | The `EgressQueueDoesNotBindFirst` ordering premise broke, or MH built an oversize datagram. Check `MH_DATAGRAM_BUFFER_AUDIO_FRAMES` against the application bound. |
 | `relay_rewrite_failed` | egress | `rewrite_relay_region` failed on a frame that had already decoded cleanly. | **An MH bug.** Not a sender fault: the frame passed full header validation moments earlier. |
-| `partial_frame_discard` | egress | A partially-read stream frame was given up on. | **Unreachable until video.** Audio is one frame per datagram, so this has no producer today; it exists because the `decode_stream_frame` `Ok(None)` caller obligation names MH as an owner and a counted give-up is the whole point of it. |
 
 *Saturation-or-input tokens.* Expected under load or under a misbehaving
 sender; none is a bug on its own.
@@ -926,9 +927,10 @@ sender; none is a bug on its own.
 |---|---|---|---|
 | `ingress_queue_overflow` | ingress | MH's bounded ingress ring shed its oldest frame. | MH ingest is saturated — the forward loop is not keeping up with the receive loop. Look at CPU and at handler load, not at the sender. |
 | `egress_queue_overflow` | egress | MH's bounded egress ring shed its oldest frame. | A slow subscriber. **This is expected load shedding**, not a fault; read the blind-spot note below before concluding anything from its level. |
-| `connection_closed` | egress | The subscriber's connection closed mid-flight. | **Routine** — a participant leaves every meeting, many times. A *spike* is real signal (a client-side crash loop, a network event); a steady trickle is normal. Deliberately split from `transport_send_refused` so that counter stays alertable. |
+| `connection_closed` | egress | The subscriber's connection — or, on the stream path, its downlink STREAM (a peer `STOP_SENDING`, or `open_uni` failing) — closed mid-flight. On the stream path it is counted on the frame that DISCOVERS the dead downlink (that frame is not pushed, so it is never also `forwarded{egress}`); the edge then waits for the next group start. | **Routine** — a participant leaves every meeting, many times. A *spike* is real signal (a client-side crash loop, a network event); a steady trickle is normal. Deliberately split from `transport_send_refused` so that counter stays alertable. |
 | `oversize_datagram` | ingress | The received datagram's byte length exceeded the wire-format frame maximum, rejected before any parse. | A sender build defect or a hostile peer. **Not** the codec's `payload_length_exceeds_max`, which is the declared *field* exceeding the max during header validation — same constant, two checks, two tokens, and the distinction tells you whether anything was parsed at all. |
-| `stream_rate_limited` | ingress | A connection exceeded its per-connection stream creation-rate cap. | **UNREACHABLE UNTIL UNI-STREAM/VIDEO — this token cannot fire today and is not a live detector.** MH opens no unidirectional-stream accept loop and audio is one frame per datagram, so there is no stream-creation event to limit. The token is defined now so the author of the accept path inherits the spelling rather than inventing a second one; a fixed-window limiter was built for it at task 16 and **removed at review** as unreachable enforcement machinery. Same posture as `partial_frame_discard`. |
+| `stream_rate_limited` | ingress | A publisher connection exceeded `MH_STREAM_OPENS_PER_CONNECTION_PER_SEC` (a token bucket, burst = rate), enforced at accept BEFORE a byte of the stream is read; the stream is `STOP_SENDING`'d. **Live since story 3 MH-A2.** | **One increment per refused STREAM on a frames counter: a LOWER BOUND on frames lost** (a group's frames are never read). A real publisher opens one stream per keyframe; a sustained rate means a client churning group streams (a defect or a hostile peer), never load. |
+| `partial_frame_discard` | ingress | A publisher's group stream ended — FIN, `RESET_STREAM`, a mid-frame stall, or its connection closing — while a frame HEADER was partly buffered. **Live since story 3 MH-A2; re-classified from egress to INGRESS** there: that frame never reached `forwarded{ingress}` (counted at header completion), so this term keeps the stream path's ingress identity whole. A stream ending mid-PAYLOAD does not count here (the frame was already forwarded); its downstream streams reset, on `mh_media_group_resets_total`. It counts on EVERY non-clean end, MH's own abort (connection teardown, shutdown) included: a publisher disconnect reaches the group as a read error or as an abort, decided by scheduling, and one event must not have two counts — at most one per live group per teardown. | A sender fault or a lossy uplink. A steady trickle alongside `publisher_reset`/`publisher_stall` resets is a client abandoning groups mid-frame. |
 | `no_policy` | ingress | No forwarding policy is installed for this meeting. | **The remedy is the control plane, not this handler.** Read `mh_media_policy_applies_total` and MC's `mc_media_policy_pushes_total`. |
 | `no_subscriber` | egress | A policy is installed and the frame was attributed to a declared source stream, but no egress edge names THAT source stream (story 3: the index is per (sender, stream), so a watched sender's unwatched other stream lands here). | A short in-flight tail after a sender's last subscriber leaves is healthy. **Sustained** means the client is sending against an empty edge set: MC's directive and MH's policy disagree (MC's assignment and push path), or they agree and the client is ignoring its directive (stale bundle or hostile participant). A solo participant produces NONE: MC directs it to send nothing (see above). |
 | `no_local_subscriber` | egress | An edge names a subscriber with no connection on this handler. | Ordinary under multi-handler assignment (§9), where a meeting's participants are spread across handlers. Sustained and unexpected means a stale assignment. |
@@ -1108,9 +1110,9 @@ never "nobody is muted".
 
 1. **Enforcement is live at MH as of story 2 task 10.** The drop path and this
    counter are real and tested end to end (env-test S4 in
-   `crates/env-tests/tests/26_mh_quic.rs`). This is NOT a
-   `stream_rate_limited`- or `partial_frame_discard`-style token with no
-   enforcement behind it.
+   `crates/env-tests/tests/26_mh_quic.rs`). It never was a token with no
+   enforcement behind it (as `stream_rate_limited` and `partial_frame_discard`
+   were until story 3 MH-A2 gave them their stream-path producers).
 2. **MC programs the muted set as of story 2 task 12**: a host's server mute
    puts the muted participant's sender id into `server_muted_sources` on every
    registration snapshot MC pushes to a handler carrying that sender's edges
@@ -1179,6 +1181,89 @@ ingress attempt, so `server_muted` enters that rule's ingress denominator
 its `transport_receive_dropped` ratio — the fail-quiet direction; the rule's
 description says so.
 
+### Stream-per-group path (story 3 MH-A2)
+
+Video forwards **cut-through** on one unidirectional stream per group: MH reads
+each frame's header (the maximum payload enforced against the length field
+before anything is accepted), writes a per-subscriber rewritten header, and
+passes payload chunks to each subscriber as they arrive. Each subscriber
+destination (egress edge) has a capped backlog; past it MH **RESETS** that
+destination's group stream (never finishes it) and the edge waits for the next
+group start. Accounting rules a responder needs before reading any panel:
+
+- **Frames WITHHELD by the group-start gate are uncounted.** A subscriber's
+  first forwarded frame from any source is a group start, and a pending switch
+  keeps the old source until the new one's group start — frames gated that way
+  increment no drop token (they are policy, not loss, and consume no hop
+  number). On video the MH Media "Mean Fan-out" panel therefore reads BELOW the
+  subscriber count while healthy.
+- **Frames lost in an abandoned group are NOT re-counted as frame drops.**
+  Frames whose header was pushed stay `forwarded{egress}`; the frame whose
+  header push overflows the backlog, and the rest of that group for that
+  destination (gated until the next group start), are uncounted. The
+  group-level signal is `mh_media_group_resets_total`.
+- `stream_rate_limited`, `unmatched_stream` and `transport_mismatch` on the
+  stream path count ONCE per refused stream (the stream is stopped) — lower
+  bounds on frames lost. `server_muted` and `no_policy` count per frame: the
+  stream keeps being read so a lifted mute resumes at the next group start.
+
+### `mh_media_group_starts_total`
+- **Type**: Counter
+- **Description**: Groups (uni streams) started. `direction=ingress`: one per accepted publisher group stream whose first frame was ATTRIBUTED (a refused or attribution-failed stream never counts). `direction=egress`: one per downlink stream actually opened to a subscriber (when `open_uni` returns).
+- **Labels**: `direction` (`ingress` | `egress`), `key_custody`
+- **Cardinality**: Low (2)
+- **Usage**: Stream churn. Egress over ingress is the mean number of destinations a group reaches.
+
+### `mh_media_group_resets_total`
+- **Expected-empty**: no — `subscriber_backlog` and `publisher_*` have a legitimate tail on real networks
+- **Type**: Counter
+- **Description**: Downlink groups MH abandoned for ONE destination (RESET, never finished). **One per downlink group abandoned for a destination, whether or not its uni stream was opened** — a full downlink channel or a backlog overflow on an edge with N live downlinks counts 1 + N — counted in exactly one place (`Downlink::abandon`), whether or not the transport reset then succeeds. **Not a subset of `mh_media_group_starts_total{direction="egress"}`** (a group can be abandoned before its stream opens), so never build resets/starts as a "share of groups abandoned" without that caveat. Every reset carries the single reasonless application code `GROUP_ABANDONED`; the reason is MH-local. A stream reset by the transport seam's DROP contract because the subscriber's connection is already gone is **deliberately uncounted** (the destination no longer exists).
+- **Labels**:
+  - `reason`: `subscriber_backlog` | `publisher_reset` | `publisher_stall` | `source_ended` | `edge_removed`
+  - `key_custody`: `operator`
+- **Cardinality**: Low (5). No `direction`: every reason is egress-side.
+- **Usage**: Group-level abandonment. Counts GROUPS, kept out of the frame identity.
+
+| `reason` | Condition | What a responder does |
+|---|---|---|
+| `subscriber_backlog` | The destination's backlog (`MH_EGRESS_STREAM_BACKLOG_BYTES`, per destination) overflowed, its writer fell two groups behind, or its downlink channel was full. | A slow subscriber path. Recovery is the next hop's keyframe request; repeated resets on one path below the fixed bitrate are accepted in story 3. |
+| `publisher_reset` | The publisher's group ended mid-group for a **publisher-side** reason: `RESET_STREAM`, a FIN that truncates the frame in flight, or MH refusing the rest of the group for a sender fault (that fault is counted on `mh_media_frames_dropped_total` by its own token). | The publisher side, never "the client reset its stream" alone — read the drop tokens first. A refusal on a stream's FIRST frame resets nothing (nothing downstream exists yet). |
+| `publisher_stall` | The publisher sat mid-frame (mid-header or mid-payload) with no progress past `MH_STREAM_MID_FRAME_STALL_MS`; the ingress stream is also stopped. | A stalled or slowloris publisher. An inactivity bound: a trickling publisher keeps its own frame open, harming only its own media. |
+| `source_ended` | The forwarded source ended: its publisher's connection closed (or MH shut the group down), or MC stopped declaring the stream. | Routine on leave. |
+| `edge_removed` | MC removed the edge mid-group, or `EndMeeting` released the meeting. | Routine on reassignment. |
+
+### `mh_media_stream_ingress_groups`
+- **Type**: Gauge
+- **Description**: Publisher group streams being read right now, process-wide. Moved by an RAII guard on every exit (abort and panic included) — a true count, not a last-writer-wins sample.
+- **Labels**: `key_custody`
+- **Cardinality**: 1
+- **Usage**: Live ingress group load. Its per-connection limit is `mh_media_uni_streams_per_connection_limit` — **per connection**, so it is NOT the limit of this process-wide gauge.
+
+### `mh_media_uni_streams_per_connection_limit`
+- **Type**: Gauge (published once at setup)
+- **Description**: The declared QUIC `max_concurrent_uni_streams` (`MH_MAX_CONCURRENT_UNI_STREAMS`), the same field handed to quinn — PER CONNECTION. quinn enforces it; MH has no event to count.
+- **Labels**: `key_custody`
+- **Cardinality**: 1
+
+### `mh_media_egress_stream_backlog_limit_bytes`
+- **Type**: Gauge (published once at setup)
+- **Description**: `MH_EGRESS_STREAM_BACKLOG_BYTES`, the per-DESTINATION backlog cap the downlinks enforce (shared by an edge's at most two live downlinks). A backlogged chunk is COPIED before it is retained, so the cap measures real memory.
+- **Labels**: `key_custody`
+- **Cardinality**: 1
+
+### `mh_media_stream_mid_frame_stall_seconds`
+- **Type**: Gauge (published once at setup)
+- **Description**: `MH_STREAM_MID_FRAME_STALL_MS`, in seconds — the inactivity bound past which a publisher stalled mid-frame is reset downstream.
+- **Labels**: `key_custody`
+- **Cardinality**: 1
+
+### `mh_media_stream_sources_declared`
+- **Type**: Gauge
+- **Description**: `STREAM_PER_GROUP` source streams declared across every installed policy on this handler — recomputed from the installed snapshot at every apply and release, never delta-maintained.
+- **Labels**: `key_custody`
+- **Cardinality**: 1
+- **Usage**: Whether this handler is programmed to carry video at all; read beside `mh_media_group_starts_total{direction="ingress"}`.
+
 ### `mh_media_paused_source_frames_total`
 - **Type**: Counter
 - **Description**: Frames attributed to a PAUSED (client-muted) source stream (story 3 R-17; `internal.proto` `SourceDisposition.PAUSED`). An ARRIVAL OVERLAY, not a drop: PAUSED is never dropped at ingress — a resume frame that beats MC's policy update must still reach subscribers — so these frames forward normally.
@@ -1202,9 +1287,16 @@ description says so.
 | `phase` | Spans | A rise means |
 |---|---|---|
 | `receive_buffer` | datagram received → popped off the ingress ring | The forward loop is not keeping up with the receive loop. Pairs with `ingress_queue_overflow`. |
-| `processing` | ingress pop → pushed onto a subscriber's egress ring | Routing, the relay rewrite and fan-out. A rise here is MH's own work getting slower — an unusually wide fan-out, or CPU starvation. |
-| `transmit_buffer` | egress push → the transport send call returned | A slow subscriber. Pairs with `egress_queue_overflow`. |
-| `total` | received → send returned | The headline. Always read with the three components. |
+| `processing` | Datagram: ingress pop → pushed onto a subscriber's egress ring. Stream: frame HEADER complete → last rewritten header pushed to the downlinks | Routing, the relay rewrite and fan-out. A rise here is MH's own work getting slower — an unusually wide fan-out, or CPU starvation. |
+| `transmit_buffer` | Datagram: egress push → the transport send call returned. Stream: rewritten header pushed → its `write_all` returned | A slow subscriber. Pairs with `egress_queue_overflow`. On the stream path it INCLUDES subscriber stream-credit waits, up to the stall or backlog abandon. |
+| `total` | Datagram: received → send returned. Stream: header complete → rewritten header written | The headline. Always read with the components. |
+
+**Two populations share these series since story 3 MH-A2.** The stream path
+feeds `processing`, `transmit_buffer` and `total` but never `receive_buffer`
+(there is no ingress ring on it), observes header frames only (payload chunk
+timing is never observed), and its `transmit_buffer` includes stream-credit
+waits. **Do not sum the phases, and do not compare stream totals with datagram
+totals** — the mix is by sample, not by kind, and MH carries no kind label.
 
 **Sampled, and the sampling is deliberate.** Timestamps are taken on **every**
 frame (a monotonic clock read is a ~25 ns vDSO call and the ingress timestamp is

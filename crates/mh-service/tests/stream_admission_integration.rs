@@ -55,7 +55,7 @@ async fn apply(sm: &SessionManagerHandle, policy: MeetingPolicy) -> ApplyOutcome
 #[tokio::test]
 async fn gauges_exist_at_zero_from_construction() {
     let snap = MetricAssertion::snapshot();
-    let _sm = SessionManagerHandle::new(with_ceiling(4));
+    let _sm = SessionManagerHandle::new_for_tests(with_ceiling(4));
     snap.gauge("mh_media_stream_admission_rejection_ratio")
         .with_labels(&[KEY_CUSTODY])
         .assert_value(0.0);
@@ -67,7 +67,7 @@ async fn gauges_exist_at_zero_from_construction() {
 #[tokio::test]
 async fn admission_is_counted_by_outcome_and_the_ratio_follows() {
     let snap = MetricAssertion::snapshot();
-    let sm = SessionManagerHandle::new(with_ceiling(4));
+    let sm = SessionManagerHandle::new_for_tests(with_ceiling(4));
 
     // Positive control: two admissions (3 streams, then +1 = 4, AT the ceiling).
     assert_eq!(apply(&sm, policy("m-a", 1, 3)).await, ApplyOutcome::Applied);
@@ -102,7 +102,7 @@ async fn admission_is_counted_by_outcome_and_the_ratio_follows() {
 #[tokio::test]
 async fn stale_and_equal_generation_applies_are_not_admission_decisions() {
     let snap = MetricAssertion::snapshot();
-    let sm = SessionManagerHandle::new(with_ceiling(2));
+    let sm = SessionManagerHandle::new_for_tests(with_ceiling(2));
     assert_eq!(apply(&sm, policy("m-a", 5, 2)).await, ApplyOutcome::Applied);
 
     // Full handler. An equal-generation re-assert is a no-op and can never
@@ -124,7 +124,7 @@ async fn stale_and_equal_generation_applies_are_not_admission_decisions() {
 #[tokio::test]
 async fn a_shrinking_policy_releases_streams_and_the_gauge_falls() {
     let snap = MetricAssertion::snapshot();
-    let sm = SessionManagerHandle::new(with_ceiling(3));
+    let sm = SessionManagerHandle::new_for_tests(with_ceiling(3));
     assert_eq!(apply(&sm, policy("m-a", 1, 3)).await, ApplyOutcome::Applied);
     // Ordinary departure: MC re-pushes a smaller policy at a higher generation.
     assert_eq!(apply(&sm, policy("m-a", 2, 0)).await, ApplyOutcome::Applied);
@@ -210,4 +210,47 @@ fn static_admission_gauges_publish_the_fields_enforcement_reads() {
     snap.gauge("mh_media_stream_cost_video_bytes_per_second")
         .with_labels(&[KEY_CUSTODY])
         .assert_value(admission.stream_cost_video_bytes_per_second as f64);
+}
+
+/// `mh_media_stream_sources_declared` (story 3 MH-A2) is recomputed from the
+/// installed snapshot at every apply and release — published by the session
+/// actor beside `mh_media_egress_edges`, never delta-maintained.
+#[tokio::test]
+async fn declared_stream_sources_follow_apply_and_release() {
+    use mh_test_utils::media_policy::{register_request_declared, source_stream, stream_egress};
+    use proto_gen::dark_tower::internal::v1::SourceDisposition;
+    use proto_gen::dark_tower::signaling::v1::TransportMode;
+    let snap = MetricAssertion::snapshot();
+    let sm = SessionManagerHandle::new_for_tests(with_ceiling(8));
+    tokio::task::yield_now().await;
+    snap.gauge("mh_media_stream_sources_declared")
+        .assert_value(0.0);
+    let request = register_request_declared(
+        "m-video",
+        1,
+        vec![stream_egress(11, 6, 4, 5, 1)],
+        vec![
+            source_stream(5, 0, TransportMode::Datagram, SourceDisposition::Forward),
+            source_stream(
+                5,
+                1,
+                TransportMode::StreamPerGroup,
+                SourceDisposition::Forward,
+            ),
+            source_stream(
+                6,
+                1,
+                TransportMode::StreamPerGroup,
+                SourceDisposition::Paused,
+            ),
+        ],
+    );
+    let policy = mh_service::routing::MeetingPolicy::from_request(
+        &request,
+        &mh_test_utils::admission::fixture_policy_limits(),
+    )
+    .expect("valid");
+    let _ = mh_test_utils::session::apply_registered(&sm, policy).await;
+    snap.gauge("mh_media_stream_sources_declared")
+        .assert_value(2.0);
 }
