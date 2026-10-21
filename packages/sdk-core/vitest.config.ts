@@ -35,6 +35,9 @@ export default defineConfig({
     environment: 'node',
     globals: false,
     include: ['src/**/__tests__/**/*.test.ts'],
+    // The OTLP exporter is a no-op mock tier-wide (resetTelemetryForTest's shutdown would otherwise
+    // export to the configured endpoint). See the setup file for the opt-out.
+    setupFiles: ['src/telemetry/__tests__/otlpExporterSetup.ts'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],

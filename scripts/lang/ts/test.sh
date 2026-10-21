@@ -9,4 +9,4 @@ install_wrapper_exit_trap  # task #50: a set -e abort before run_and_emit must s
 pnpm_deps_fresh || exit 1  # stale node_modules is its own token, not an nx-* failure
 
 
-run_and_emit "nx-test" pnpm exec nx run-many -t test:unit test:component --all "$@"
+run_and_emit "nx-test" pnpm exec nx run-many -t test:unit test:component --all "$NX_PIPELINE_OUTPUT_STYLE" "$@"  # _pnpm.sh

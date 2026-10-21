@@ -63,8 +63,8 @@ test('surfaces an error via last-error without leaking a non-allowlisted field',
   (err as { token?: string }).token = 'SECRET_TOKEN_123';
   session.fire('error', err);
 
-  await expect.element(screen.getByTestId('last-error')).toHaveTextContent('SIGNALING');
-  await expect.element(screen.getByTestId('last-error')).not.toHaveTextContent('SECRET_TOKEN_123');
+  await expect.element(screen.getByTestId('last-error')).toMatchTextContent('SIGNALING');
+  await expect.element(screen.getByTestId('last-error')).not.toMatchTextContent('SECRET_TOKEN_123');
 });
 
 // ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ test('server mute and client mute are DISTINCT tokens; client mute is unknown wi
   // c: server-muted -> the slot's source_muted says nothing about their own mic.
   await expect.element(c).toHaveAttribute('data-server-muted', 'true');
   await expect.element(c).toHaveAttribute('data-client-muted', 'unknown');
-  await expect.element(screen.getByTestId('participant-server-muted-c')).toHaveTextContent('Hal');
+  await expect.element(screen.getByTestId('participant-server-muted-c')).toMatchTextContent('Hal');
   // h: in no slot of ours -> no wire fact either way.
   await expect.element(h).toHaveAttribute('data-client-muted', 'unknown');
 });
@@ -173,7 +173,7 @@ test('the host affordance sends target + action, and its label follows the WIRE,
     serverMutedBy: 'self',
   });
   await expect.element(button).toHaveAttribute('aria-pressed', 'true');
-  await expect.element(screen.getByTestId('participant-server-muted-b')).toHaveTextContent('you');
+  await expect.element(screen.getByTestId('participant-server-muted-b')).toMatchTextContent('you');
 
   // A relayed unmute request is shown to the host; it lifts nothing.
   session.fire('unmuteRequested', { participantId: 'b' });

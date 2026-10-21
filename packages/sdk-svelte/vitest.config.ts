@@ -3,7 +3,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { resolve } from 'node:path';
 import { playwright } from '@vitest/browser-playwright';
 
-// R-43: REAL Vitest 4 Browser Mode (Chromium via the Playwright provider) — the
+// R-43: REAL Vitest Browser Mode (Chromium via the Playwright provider) — the
 // new component test tier (sdk-core's `test:component` is a node-env bundle
 // test, NOT this). `retries: 0` per ADR-0028 flaky policy. Runs `.svelte.ts` +
 // `.svelte` through the svelte plugin so `$state` runes evaluate in the browser.

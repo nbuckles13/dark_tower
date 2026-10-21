@@ -7,7 +7,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   context,
-  propagation,
   ROOT_CONTEXT,
   SpanStatusCode,
   trace,
@@ -73,12 +72,10 @@ async function reachJoined(wt: MockWebTransport, joinResp: JoinResponseInit = {}
   wt.simulateServerMessage(0, framedJoinResponse(joinResp));
 }
 
-afterEach(() => {
-  // Clear any telemetry config a test installed (also disables the propagator +
-  // global context manager) so non-telemetry tests see `getTracer() === undefined`.
-  resetTelemetryForTest();
-  context.disable();
-  propagation.disable();
+afterEach(async () => {
+  // Clear any telemetry config a test installed (every global it registered) so
+  // non-telemetry tests see `getTracer() === undefined`.
+  await resetTelemetryForTest();
 });
 
 describe('SignalingClient — connect + JoinRequest (R-16)', () => {

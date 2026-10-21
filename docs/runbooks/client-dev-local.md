@@ -1718,7 +1718,7 @@ The web-app's own tests, both through Nx so proto codegen runs first (F5):
 
 ```bash
 # --- WSL2 ---
-pnpm nx run web-app:test:component   # Vitest 4 browser mode (Chromium) component tests
+pnpm nx run web-app:test:component   # Vitest browser mode (Chromium) component tests
 pnpm nx run web-app:test:unit        # Node-tier prod-bundle-content assertion (R-14)
 ```
 

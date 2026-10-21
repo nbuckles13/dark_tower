@@ -3,7 +3,7 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { playwright } from '@vitest/browser-playwright';
 import { sdkSourceAliases } from './vite/sourceAliases.js';
 
-// R-43: REAL Vitest 4 Browser Mode (Chromium) component tests for the demo
+// R-43: REAL Vitest Browser Mode (Chromium) component tests for the demo
 // views + the E2E bus. Mocks `MeetingSession`; no real WebTransport/WebCodecs.
 // `retries: 0` per ADR-0028 flaky policy. All build-time defines are mirrored
 // here (@observability/@test REQ-2) so telemetry-touching imports resolve.

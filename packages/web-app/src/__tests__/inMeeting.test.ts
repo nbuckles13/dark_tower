@@ -333,7 +333,7 @@ test('a media fault renders as a fault rather than presenting as silence', async
 
   await expect
     .element(screen.getByTestId('media-fault'))
-    .toHaveTextContent('the audio decoder failed');
+    .toMatchTextContent('the audio decoder failed');
 });
 
 // ---------------------------------------------------------------------------
@@ -358,7 +358,7 @@ test('each filled slot names the roster participant MC placed there; an unfilled
     ],
   });
   await expect.element(screen.getByTestId('slot-0')).toHaveAttribute('data-sender-id', '258');
-  await expect.element(screen.getByTestId('slot-0')).toHaveTextContent('Bea');
+  await expect.element(screen.getByTestId('slot-0')).toMatchTextContent('Bea');
   await expect.element(screen.getByTestId('slot-1')).not.toHaveAttribute('data-sender-id');
   await expect
     .element(screen.getByTestId('slot-1'))
@@ -371,7 +371,7 @@ test('a slot whose sender the roster does not know reads as unknown, never the r
     unreachableSenderIds: [],
     assignments: [slot({ slotId: 0, senderId: 999, slotState: 'active' })],
   });
-  await expect.element(screen.getByTestId('slot-0')).toHaveTextContent('unknown participant');
+  await expect.element(screen.getByTestId('slot-0')).toMatchTextContent('unknown participant');
   expect(screen.getByTestId('slot-0').element().textContent).not.toContain('999');
 });
 
@@ -425,7 +425,7 @@ test('the "asked" label belongs to ONE server-mute episode: a re-mute starts wit
   session.fire('participantMuteChanged', { participantId: 'self', audioServerMuted: true });
   await screen.getByTestId('request-unmute').click();
   await vi.waitFor(() => expect(session.unmuteRequestCalls).toBe(1));
-  await expect.element(screen.getByTestId('request-unmute')).toHaveTextContent('Asked the host');
+  await expect.element(screen.getByTestId('request-unmute')).toMatchTextContent('Asked the host');
 
   session.fire('participantMuteChanged', { participantId: 'self', audioServerMuted: false });
   await expect.element(screen.getByTestId('request-unmute')).not.toBeInTheDocument();

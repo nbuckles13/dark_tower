@@ -39,11 +39,13 @@
 // darktower, deployment.environment=<env>.
 
 import {
+  context,
   diag,
   DiagConsoleLogger,
   DiagLogLevel,
   metrics,
   propagation,
+  trace,
   type Meter,
   type Tracer,
 } from '@opentelemetry/api';
@@ -353,13 +355,36 @@ export async function flushMetrics(): Promise<void> {
 /**
  * Reset global telemetry state. TEST-ONLY seam — lets a unit test re-run
  * `configureTelemetry` cleanly. Not part of the production join flow.
+ *
+ * Undoes EVERY global `configureTelemetry` registers: the meter provider, the
+ * tracer provider + the context manager and propagator `register()` installs, and
+ * the console `diag` logger. A partial reset makes the next configure log
+ * `Attempted duplicate registration of API: <name>` through `diag` and keep the
+ * OLD provider (OTel's global registration is first-wins). That error is only
+ * visible under vitest's `default` reporter, not the agent one, so the guard is
+ * the reset regression test in `telemetryConfig.test.ts`, not a log grep.
+ *
+ * Async: the previous providers are shut down (stopping the periodic reader's
+ * timer), which forces a final export, so every caller must `await` it. The unit
+ * tier mocks the exporter for every file (`__tests__/otlpExporterSetup.ts`), so
+ * that export never leaves the process. Both shutdowns run FIRST, while `diag` is
+ * still live, so a failed final export is reported there. The globals are then
+ * disabled EVEN IF a shutdown rejected, and the first rejection is rethrown: a
+ * failed teardown stays loud without leaving stale registrations behind for the
+ * next configure.
  */
-export function resetTelemetryForTest(): void {
-  // `configureTelemetry` registers a GLOBAL console `diag` logger outside
-  // production; without this, one test that configured telemetry leaves it
-  // registered for every later test in the worker, breaking this seam's
-  // "re-run cleanly" contract.
-  diag.disable();
+export async function resetTelemetryForTest(): Promise<void> {
+  const previous = configured;
   configured = undefined;
+  const results = await Promise.allSettled([
+    previous?.meterProvider.shutdown(),
+    previous?.tracerProvider.shutdown(),
+  ]);
+  metrics.disable();
+  trace.disable();
+  context.disable();
   propagation.disable();
+  diag.disable();
+  const failed = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+  if (failed) throw failed.reason;
 }

@@ -48,5 +48,5 @@ Svelte 5 adapter for `@darktower/sdk-core`: rune stores that mirror a
 | Script | What |
 |--------|------|
 | `pnpm build` | Vite library build (ESM + CJS + `.d.ts`) |
-| `pnpm test:component` | Vitest 4 Browser Mode (Chromium) component tests |
+| `pnpm test:component` | Vitest Browser Mode (Chromium) component tests |
 | `pnpm lint` | svelte-check + eslint + prettier |

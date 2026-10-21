@@ -65,7 +65,9 @@ case "$__mode" in
     __assert_format_targets
     # Plain --check: prettier lists offending files as `[warn] <repo-relative path>` and exits non-zero,
     # which nx propagates. run_and_emit maps that to nx-format-passed / nx-format-failed.
-    run_and_emit "nx-format" pnpm exec nx run-many -t format --all -- --check
+    # Output style from _pnpm.sh (NX_PIPELINE_OUTPUT_STYLE): an agent-default `summary` would drop
+    # prettier's offender list. APPLY pins its own style below.
+    run_and_emit "nx-format" pnpm exec nx run-many -t format --all "$NX_PIPELINE_OUTPUT_STYLE" -- --check
     ;;
   APPLY)
     __assert_format_targets

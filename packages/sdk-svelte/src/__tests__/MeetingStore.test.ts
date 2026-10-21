@@ -1,4 +1,4 @@
-// R-43: MeetingStore mutator/getter reactivity (Vitest 4 Browser Mode, Chromium).
+// R-43: MeetingStore mutator/getter reactivity (Vitest Browser Mode, Chromium).
 // Drives the store's typed mutators and reads the reactive getters. Does NOT
 // re-test any sdk-core logic — only the adapter's reactive container.
 
