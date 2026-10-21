@@ -652,7 +652,7 @@ tasks:
   slug: 2026-10-20-media-kind-label-split
   tag: story-2026-10-07-see-each-other-task-2
 - id: 3
-  status: pending
+  status: completed
   specialist: infrastructure
   prompt: |-
     Land the media configuration surface for story 3, "See Each Other" (docs/user-stories/2026-10-07-see-each-other.md; covers R-23, R-24 (the derivation half), R-25 (the manifest half), R-26 (the cap's home); ADR-0036 §11 "Derive rather than guard", ADR-0038 §2 content-addressed ConfigMaps). This is task 3 (INF-A). It has NO dependencies and MUST land before the code tasks that read these keys: task 8 (MH-A1, media-handler: per-stream attribution, derived costs, MH config reads, memory startup check) and task 12 (MC-A, meeting-controller: video slots, send directives, per-kind caps) both require every key below as a required read with no code fallback. Behaviour on the cluster must be unchanged when this task deploys alone: today's images ignore every new key, and every key they still read stays present.
@@ -733,6 +733,7 @@ tasks:
     - No secret or credential is added to ConfigMaps. The env-config drift guard covers every new key on every workload.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-20-media-codec-profile-config
   tag: story-2026-10-07-see-each-other-task-3
 - id: 4
   status: pending
