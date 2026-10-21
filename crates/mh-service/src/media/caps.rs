@@ -8,7 +8,7 @@
 //! |---|---|
 //! | Maximum frame payload before any allocation | Datagrams: **here**, [`check_datagram_size`], wired in `crate::media::ingress::run_ingress`. Streams: `media_protocol::reader::HeaderReader` rejects a declared `payload_length` over `MAX_PAYLOAD_BYTES` from the 14-byte prefix, before anything is sized from it (`crate::media::stream_ingress`) |
 //! | Per-connection **concurrent** stream limit | A declared QUIC transport parameter, `MH_MAX_CONCURRENT_UNI_STREAMS` (`crate::config`) — enforced by quinn. MH has no event to count; it publishes the declared limit and the live groups as gauges |
-//! | Per-connection stream **creation-rate** limit | **Here**, [`TokenBucket`], admitted at accept in `crate::media::stream_ingress::run_stream_ingress` BEFORE a byte of the stream is read; a refused stream is `STOP_SENDING`'d and counted `stream_rate_limited` |
+//! | Per-connection stream **creation-rate** limit | **Here**, [`TokenBucket`], admitted at accept in `crate::media::stream_ingress::run_stream_ingress`. A refused stream has ONLY its fixed header prefix read, through the same `HeaderReader` (its GoP counter recorded so MH can repair it by request, story 3 amendment 4), then is `STOP_SENDING`'d and counted `stream_rate_limited`; a malformed header is stopped with no counter and no repair |
 //!
 //! > **Corrected (story 3 MH-A2).** This module used to say the creation-rate
 //! > cap was "not enforced, and not enforceable today" because MH had no
@@ -24,9 +24,10 @@ use tokio::time::{Duration, Instant};
 
 /// A token bucket: `rate` tokens per second, holding at most `burst`.
 ///
-/// Generic on purpose — the stream-open cap is its first user and MH-B's
-/// per-connection recovery-request cap its second; there is one bucket type,
-/// not one per limit.
+/// Generic on purpose — one bucket type, not one per limit. The stream-open
+/// cap is its only user: story 3 amendment 4 removed the per-connection
+/// recovery-request rate limit (recovery requests are bounded by QUIC flow
+/// control, a fixed-size parse and one lookup, and deduped by counter).
 ///
 /// # Why not `governor`
 ///

@@ -2176,6 +2176,356 @@
       ],
       "title": "Mid-Frame Stall Bound (config)",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_keyframe_requests_sent_total: KeyframeRequests actually WRITTEN to publishers, once per (source stream, GoP counter), never retried. initial = every MH-originated request (join, switch, subscriber connect, recovery after any abandonment, repair of a group refused at the stream-open limit), not first-join only; receiver_recovery = a remapped receiver RecoveryRequest. Rates (ADR-0029). Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Requests/s"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 88
+      },
+      "id": 28,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (trigger) (rate(mh_media_keyframe_requests_sent_total[$__rate_interval]))",
+          "legendFormat": "{{trigger}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Keyframe Requests Sent",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_recovery_requests_received_total: receiver RecoveryRequests by outcome (forwarded, duplicate, stale, counter_ahead, source_mismatch, unmapped_slot, malformed). Deduped by counter against the same per-source record as MH's own requests. forwarded = accepted for forwarding, not delivered (delivery: keyframe_requests_sent{trigger=receiver_recovery}). Rates (ADR-0029). Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Requests/s"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 88
+      },
+      "id": 29,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mh_media_recovery_requests_received_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Recovery Requests by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_edges_pending: stream edges waiting for a group start from an assigned FORWARD source (subscriber and publisher both on this handler), tick-sampled every 10 s. Summed across pods. Nothing retries: a stuck pending edge is a missing event. Blind spot: an edge whose publisher is not connected to this handler is excluded; that case shows on the client's unfulfilled-slot series (dt_client_media_slots_unfulfilled). Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Edges"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 96
+      },
+      "id": 30,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(mh_media_edges_pending)",
+          "legendFormat": "pending edges",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Pending Edges",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_edge_pending_oldest_seconds: age of the oldest pending edge per pod (max), tick-sampled; 0 when none. Max across pods. Excludes edges whose publisher is not connected to this handler (see the client's unfulfilled-slot series). Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 96
+      },
+      "id": 31,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mh_media_edge_pending_oldest_seconds)",
+          "legendFormat": "oldest pending",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Oldest Pending Edge",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_keyframe_request_write_failures_total: keyframe requests never delivered (a failed control-stream write, and every request counted at once after that publisher's control stream failed). Expected-empty: zero is healthy — zero-initialised, so a healthy reading is a flat 0 and an ABSENT series is a fault, not calm. Rate (ADR-0029). Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Requests/s"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 96
+      },
+      "id": 32,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mh_media_keyframe_request_write_failures_total[$__rate_interval]))",
+          "legendFormat": "undelivered",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Keyframe Request Write Failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_edge_pending_duration_seconds: how long pending episodes lasted, observed at EXIT only (buckets to 300 s): a still-stuck edge shows only on Oldest Pending Edge. p50/p99 from _bucket. Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 104
+      },
+      "id": 33,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(mh_media_edge_pending_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(mh_media_edge_pending_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Pending Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_edge_pending_exits_total: one per pending exit (group_start, abandoned_source_left, superseded, paused_forward_nothing = PAUSED or DROP_AT_INGRESS, edge_removed incl. the subscriber leaving the handler). Rates (ADR-0029). Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Exits/s"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 104
+      },
+      "id": 34,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mh_media_edge_pending_exits_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Pending Exits by Outcome",
+      "type": "timeseries"
     }
   ],
   "refresh": "1m",

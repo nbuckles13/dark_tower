@@ -345,8 +345,14 @@ async fn a_subscribers_first_forwarded_frame_is_a_group_start() {
         "never mid-group"
     );
     assert!(
-        rig.cell(11).waiting_with_source_seen().is_some(),
-        "seen, still waiting"
+        rig.cell(11).awaiting_group_start().is_some(),
+        "still waiting"
+    );
+    let video = mh_service::routing::StreamNumber::from_wire(u32::from(UPLINK_VIDEO_SEND_ID))
+        .expect("video send id");
+    assert!(
+        rig.keyframes(5).and_then(|k| k.newest(video)).is_some(),
+        "the source has been seen"
     );
 
     let group = stream_group(3, 1, UPLINK_VIDEO_SEND_ID, 2);
@@ -536,7 +542,7 @@ async fn a_switch_to_a_paused_source_completes_immediately() {
         Some(EdgeState::Paused { .. })
     ));
     assert_eq!(
-        rig.cell(11).waiting_with_source_seen(),
+        rig.cell(11).awaiting_group_start(),
         None,
         "no keyframe wait"
     );

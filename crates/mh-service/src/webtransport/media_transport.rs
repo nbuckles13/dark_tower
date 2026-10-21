@@ -125,6 +125,20 @@ pub struct WtSendStream {
     reset: bool,
 }
 
+impl WtSendStream {
+    /// Wrap the send half of the client-opened MH control stream (story 3
+    /// MH-B: `MhServerMessage` is written here), with the same write and
+    /// drop contract as a media stream.
+    #[must_use]
+    pub const fn from_stream(stream: wtransport::SendStream) -> Self {
+        Self {
+            stream,
+            finished: false,
+            reset: false,
+        }
+    }
+}
+
 /// RESET, never FIN, on drop: the seam's abandonment contract.
 ///
 /// quinn's `Drop for SendStream` finishes a stream that was neither finished
@@ -145,6 +159,16 @@ impl Drop for WtSendStream {
 /// The receive half of a peer-opened unidirectional stream over `wtransport`.
 pub struct WtRecvStream {
     stream: wtransport::RecvStream,
+}
+
+impl WtRecvStream {
+    /// Wrap the receive half of the client-opened MH control stream, so the
+    /// connect read and the post-connect loop share the seam's framer
+    /// (`crate::transport::framing`).
+    #[must_use]
+    pub const fn from_stream(stream: wtransport::RecvStream) -> Self {
+        Self { stream }
+    }
 }
 
 /// Map quinn's read failure onto the seam's vocabulary, keeping the cause.

@@ -23,8 +23,12 @@
 //!   exhausted, `write_all` / `open_uni` pend until a test grants more.
 //! * **Counts** of streams offered, accepted and stopped (inbound) and opened,
 //!   current and maximum concurrent (outbound).
-//! * **The MH↔client control envelope, both ways** — plumbing for MH-B
-//!   (keyframe and recovery requests); nothing in MH-A2 consumes it.
+//! * **The MH↔client control envelope, both ways** (story 3 MH-B: keyframe
+//!   and recovery requests), as seam stream halves MH's own framer reads and
+//!   writes (`LossDelayTransport::control_halves`). Inbound items are RAW
+//!   bytes (a test pushes framed messages, or deliberately broken framing);
+//!   each outbound record is one `write_all`, i.e. one framed message. Writes
+//!   can be BLOCKED (a publisher that never reads) or made to FAIL.
 //!
 //! The codes come from `mh_service::transport` and are never restated.
 
@@ -201,6 +205,14 @@ pub(crate) struct StreamState {
     pub(crate) control_inbound: Mutex<VecDeque<Bytes>>,
     pub(crate) control_inbound_notify: Notify,
     pub(crate) control_outbound: Mutex<Vec<Bytes>>,
+    /// MH's control-stream writes pend while set (a publisher that is not
+    /// reading, or never will).
+    pub(crate) control_write_blocked: AtomicBool,
+    /// MH's control-stream writes fail while set.
+    pub(crate) control_write_failing: AtomicBool,
+    pub(crate) control_write_notify: Notify,
+    /// Writes MH has STARTED on the control stream (blocked or not).
+    pub(crate) control_write_attempts: AtomicU64,
     pub(crate) closed: AtomicBool,
 }
 
@@ -221,6 +233,10 @@ impl Default for StreamState {
             control_inbound: Mutex::new(VecDeque::new()),
             control_inbound_notify: Notify::new(),
             control_outbound: Mutex::new(Vec::new()),
+            control_write_blocked: AtomicBool::new(false),
+            control_write_failing: AtomicBool::new(false),
+            control_write_notify: Notify::new(),
+            control_write_attempts: AtomicU64::new(0),
             closed: AtomicBool::new(false),
         }
     }
@@ -267,6 +283,7 @@ impl StreamState {
         self.inbound_notify.notify_waiters();
         self.credit_notify.notify_waiters();
         self.control_inbound_notify.notify_waiters();
+        self.control_write_notify.notify_waiters();
         for inbound in self
             .inbound_all
             .lock()

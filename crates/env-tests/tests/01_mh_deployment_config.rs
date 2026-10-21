@@ -7,8 +7,8 @@
 //!    `terminationGracePeriodSeconds`. (Sections below through "Why
 //!    `-n dark-tower`".)
 //! 2. Story 2/3 configuration surface (story 2 R-19, R-22, R-23, R-24; story 3
-//!    R-21, R-23): MH's egress-budget chain, §8 policy keys, story-3 stream and
-//!    keyframe keys and shared media-codec-profile keys are wired into BOTH
+//!    R-21, R-23): MH's egress-budget chain, §8 policy keys, story-3 stream
+//!    keys and shared media-codec-profile keys are wired into BOTH
 //!    instances, carry parseable values that satisfy the relationships MH
 //!    boot-checks, are what the running process actually loaded (where MH
 //!    publishes them), and — on Kind — size a stream ceiling that meets the demo
@@ -162,7 +162,7 @@
 #![cfg(feature = "smoke")]
 
 use env_tests::fixtures::deployment_config::{
-    check_key_ref, check_resource_field_ref, check_shape, cm_value, fetch_configmap,
+    check_key_ref, check_resource_field_ref, check_shape, cm_value, container, fetch_configmap,
     fetch_live_pod, parse_positive, pod_name_of, RefKind, ValueShape,
 };
 use env_tests::fixtures::kube::{
@@ -347,24 +347,9 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
         SHARED_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
-    // Story 3 MH keys (required reads from MH-A1 / MH-A2 / MH-B).
+    // Story 3 MH keys (required reads from MH-A1 / MH-A2).
     (
         "MH_MAX_SOURCE_STREAMS_PER_MEETING",
-        SHARED_CONFIGMAP,
-        ValueShape::PositiveInteger,
-    ),
-    (
-        "MH_KEYFRAME_REQUEST_RETRY_MS",
-        SHARED_CONFIGMAP,
-        ValueShape::PositiveInteger,
-    ),
-    (
-        "MH_KEYFRAME_REQUEST_AGGREGATION_MS",
-        SHARED_CONFIGMAP,
-        ValueShape::PositiveInteger,
-    ),
-    (
-        "MH_RECOVERY_REQUESTS_PER_CONNECTION_PER_SEC",
         SHARED_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
@@ -383,7 +368,7 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
         SHARED_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
-    // Story 3 shared media codec profile: the five keys MH reads.
+    // Story 3 shared media codec profile: the four keys MH reads.
     (
         "MEDIA_VIDEO_MAX_BITRATE_BPS",
         PROFILE_CONFIGMAP,
@@ -391,11 +376,6 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
     ),
     (
         "MEDIA_VIDEO_FRAME_RATE_HZ",
-        PROFILE_CONFIGMAP,
-        ValueShape::PositiveInteger,
-    ),
-    (
-        "MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
         PROFILE_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
@@ -611,37 +591,78 @@ fn assert_story2_keys_wired(instance: &str) {
     check_resource_field_ref(&pod, CONTAINER, env, target, resource)
         .unwrap_or_else(|e| panic!("{e}"));
 
-    assert_deployed_relationships(&mh_cm, &profile_cm);
+    assert_removed_keys_absent(&pod, &mh_cm);
+    assert_deployed_relationships(&mh_cm);
+}
+
+/// Keys story 3 amendment 4 removed from MH (R-23): MH's three keyframe /
+/// recovery keys (keyframe and recovery requests are event-driven, with no
+/// retry, aggregation window or rate limit), and MH's ref to the minimum
+/// keyframe interval (MC-only config; MH has no use for it). No image ever
+/// read the three, so they are deleted outright, not retired.
+///
+/// Asserted ABSENT because `dt-guard env-config` cannot catch a
+/// reintroduction: it checks that every key the Rust code reads is declared,
+/// not that every declared key is read — re-adding a key to config.env plus
+/// both refs passes it cleanly. This also catches a cluster still running the
+/// pre-amendment manifests.
+const REMOVED_KEYS: &[&str] = &[
+    "MH_KEYFRAME_REQUEST_RETRY_MS",
+    "MH_KEYFRAME_REQUEST_AGGREGATION_MS",
+    "MH_RECOVERY_REQUESTS_PER_CONNECTION_PER_SEC",
+    "MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
+];
+
+/// None of [`REMOVED_KEYS`] is an env entry of THIS pod's MH container, and
+/// the three MH keys are absent from its live `mh-service-config` generation.
+/// The minimum interval is deliberately not checked against the profile
+/// ConfigMap, which still holds it for MC.
+///
+/// Reads the SAME parsed pod and ConfigMap the positive wiring checks above
+/// just used, so the absence cannot be vacuous: an empty or unread env list is
+/// its own loud failure here.
+fn assert_removed_keys_absent(pod: &Value, mh_cm: &Value) {
+    let pod_name = pod_name_of(pod, CONTAINER);
+    let env: Vec<&str> = container(pod, &pod_name, CONTAINER)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .get("env")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.get("name").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Positive control: the list read is the one the wiring checks passed on.
+    assert!(
+        WIRED_KEYS.iter().all(|(key, _, _)| env.contains(key)),
+        "pod {pod_name}: the env list read for the absence check does not hold every wired key \
+         — the absence check below would be vacuous"
+    );
+    for key in REMOVED_KEYS {
+        assert!(
+            !env.contains(key),
+            "pod {pod_name}: env {key} is present, but story 3 amendment 4 removed it from MH \
+             (R-23). Remove the ref from infra/services/mh-service/mh-0-deployment.yaml and \
+             mh-1-deployment.yaml (and the key from config.env, if it is an MH key)."
+        );
+    }
+    for key in REMOVED_KEYS.iter().filter(|key| key.starts_with("MH_")) {
+        assert!(
+            mh_cm.pointer("/data").and_then(|d| d.get(*key)).is_none(),
+            "live ConfigMap {SHARED_CONFIGMAP} still holds {key}, removed by story 3 amendment 4 \
+             (R-23). Remove it from infra/services/mh-service/config.env."
+        );
+    }
 }
 
 /// Relationships between DEPLOYED values that a reading image refuses to boot
 /// on — asserted here so the cause is named in seconds, before that image
 /// ships (the point of landing manifests first). Each message names both keys
 /// and their homes.
-fn assert_deployed_relationships(mh_cm: &Value, profile_cm: &Value) {
+fn assert_deployed_relationships(mh_cm: &Value) {
     let mh = |k| positive(mh_cm, SHARED_CONFIGMAP, k);
-    let retry = mh("MH_KEYFRAME_REQUEST_RETRY_MS");
-    let aggregation = mh("MH_KEYFRAME_REQUEST_AGGREGATION_MS");
-    let min_interval = positive(
-        profile_cm,
-        PROFILE_CONFIGMAP,
-        "MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
-    );
-    assert!(
-        retry >= min_interval,
-        "MH_KEYFRAME_REQUEST_RETRY_MS={retry} ({SHARED_CONFIGMAP}) is BELOW \
-         MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS={min_interval} ({PROFILE_CONFIGMAP}). MH (from \
-         MH-B) refuses to boot on this: a retry faster than the publisher's minimum interval is \
-         wasted. Change both in the same deploy (infra/services/mh-service/config.env and \
-         infra/services/media-codec-profile/profile.env)."
-    );
-    assert!(
-        aggregation <= retry,
-        "MH_KEYFRAME_REQUEST_AGGREGATION_MS={aggregation} exceeds \
-         MH_KEYFRAME_REQUEST_RETRY_MS={retry} (both {SHARED_CONFIGMAP}). MH (from MH-B) refuses \
-         to boot on this."
-    );
-
     let egress = mh("MH_MAX_EGRESS_STREAMS_PER_MEETING");
     let sources = mh("MH_MAX_SOURCE_STREAMS_PER_MEETING");
     assert!(

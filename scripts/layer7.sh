@@ -161,9 +161,14 @@ readonly VP8_PROBE_SUBCHECKS=(webcodecs_unavailable encoder_config_unsupported d
 
 # Wall-clock budgets, one PER SUITE (the browser suite must never eat the Rust suite's
 # budget, or vice versa); Phase-1 bring-up is unbounded here (the helper enforces its own
-# setup timeout). 600s matches the `all` feature envelope; the browser default covers the
-# Vite dev-server start (60s webServer ceiling) + the specs' own 120s/test ceilings.
-ENV_TEST_TIMEOUT="${DEVLOOP_ENV_TEST_TIMEOUT:-600}"
+# setup timeout). The env-test default carries real headroom over the measured Rust
+# suite envelope: ~605s on 2026-10-21 (story 3 task 10: ~525s through env-test 38, compile
+# included, + ~80s for 39), which broke the former 600s, and later story tasks add more
+# env-tests. Re-measure from layer-7-env-test.log's per-binary "finished in" lines before
+# changing it. The browser default covers the Vite dev-server start (60s webServer
+# ceiling) + the specs' own 120s/test ceilings. Both defaults are restated in
+# docs/runbooks/devloop-validation.md §6.7, pinned by scripts/layer7.test.sh.
+ENV_TEST_TIMEOUT="${DEVLOOP_ENV_TEST_TIMEOUT:-900}"
 BROWSER_E2E_TIMEOUT="${DEVLOOP_BROWSER_E2E_TIMEOUT:-600}"
 
 # -----------------------------------------------------------------------------
@@ -1547,6 +1552,11 @@ __layer7_main() {
     # No grep: a non-zero suite on a confirmed-healthy cluster is the diff's problem.
     # (timeout's 124 included — a hang on a healthy cluster is a test problem.)
     printf 'Layer7: env-test suite exited %s (full output: %s).\n' "$rc" "$ENV_TEST_LOG" >&2
+    if [[ "$rc" -eq 124 ]]; then
+      # Same FAIL lane (no reclassification) — but a budget overrun must not read like any
+      # other test failure, or it is diagnosed by hand (story 3 task 10's Gate 2).
+      printf 'Layer7: env-test suite hit DEVLOOP_ENV_TEST_TIMEOUT=%ss (rc 124) — if no test hung, the suite outgrew the budget: re-measure from the per-binary "finished in" lines (devloop-validation.md §6.7).\n' "$ENV_TEST_TIMEOUT" >&2
+    fi
     emit_status FAIL env-tests-failed | tee_collect_statuses
   fi
 
@@ -1613,6 +1623,9 @@ __layer7_main() {
       # them, flagged so nobody promotes them off the workstation.
       printf 'Layer7: browser E2E suite exited %s (full output: %s; Playwright traces/screenshots: packages/web-app/test-results/ — retained on failure, may contain live tokens, local-only).\n' \
         "$browser_rc" "$BROWSER_E2E_LOG" >&2
+      if [[ "$browser_rc" -eq 124 ]]; then
+        printf 'Layer7: browser E2E suite hit DEVLOOP_BROWSER_E2E_TIMEOUT=%ss (rc 124) — if no spec hung, the suite outgrew the budget: re-measure it (devloop-validation.md §6.7).\n' "$BROWSER_E2E_TIMEOUT" >&2
+      fi
       emit_status FAIL browser-e2e-failed | tee_collect_statuses
     fi
   fi

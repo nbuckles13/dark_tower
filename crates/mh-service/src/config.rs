@@ -425,7 +425,8 @@ pub const REQUIRED_AUDIO_FRAME_RATE_HZ: u64 = 1000 / AUDIO_FRAME_DURATION_MS as 
 /// The shared `media-codec-profile` values MH reads (story 3 R-23, R-24).
 ///
 /// Required reads, startup-validated. `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS`
-/// is not read here (MH-B reads it).
+/// is NOT read by MH at all: it is MC-only config (story 3 amendment 4), and
+/// MH's keyframe requests are event-driven with no MH-side interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaCodecProfile {
     /// `MEDIA_AUDIO_MAX_BITRATE_BPS`, inside the compiled envelope
@@ -4804,19 +4805,20 @@ mod tests {
         );
     }
 
-    /// Drift guard (single source of truth): env-test 38 cannot import this
-    /// crate (ADR-0028), so it restates `CONNECTION_SEND_WINDOW_BYTES` as a
-    /// literal to size its backlog row. Fail here if the two ever differ.
+    /// Drift guard (single source of truth): the env-tests' backlog sizing
+    /// fixture cannot import this crate (ADR-0028), so it restates
+    /// `CONNECTION_SEND_WINDOW_BYTES` as a literal. Fail here if the two ever
+    /// differ.
     #[test]
-    fn env_test_38_restates_the_send_window_exactly() {
-        let source = include_str!("../../env-tests/tests/38_mh_video_forwarding.rs");
+    fn env_test_backlog_sizing_restates_the_send_window_exactly() {
+        let source = include_str!("../../env-tests/src/fixtures/video/backlog.rs");
         let line = source
             .lines()
             .find(|l| {
                 l.trim_start()
-                    .starts_with("const MH_CONNECTION_SEND_WINDOW_BYTES: u64 =")
+                    .starts_with("pub const MH_CONNECTION_SEND_WINDOW_BYTES: u64 =")
             })
-            .expect("env-test 38 declares MH_CONNECTION_SEND_WINDOW_BYTES");
+            .expect("the backlog sizing fixture declares MH_CONNECTION_SEND_WINDOW_BYTES");
         let value: u64 = line
             .split('=')
             .nth(1)

@@ -12,8 +12,9 @@ use super::schedule::{Decision, GroupScheduler, GroupStartSource, PublisherEvent
 use super::transport::{UplinkError, UplinkStream, UplinkTransport};
 use crate::fixtures::media::VIDEO_SEND_ID;
 
-/// The code [`Fault::ResetMidGroup`] resets with. ADR-0036 does not specify
-/// one and MH does not interpret it; any reset is abandonment.
+/// The code [`Fault::ResetMidGroup`] and [`Fault::AbandonMidGroup`] reset
+/// with. ADR-0036 does not specify one and MH does not interpret it; any reset
+/// is abandonment.
 pub const RESET_MID_GROUP_CODE: u32 = 0x5254;
 
 /// The uplink relay `stream_id` knob. `Debug` omits the overriding id.
@@ -69,9 +70,23 @@ pub enum Fault {
         after_frames: u32,
     },
     /// After `after_frames` complete frames, reset the group's stream with
-    /// [`RESET_MID_GROUP_CODE`] — R-12 abandonment. The publisher then stops.
+    /// [`RESET_MID_GROUP_CODE`], and the publisher then ENDS (sends nothing
+    /// more). The pre-amendment-4 behaviour, kept for tests that need a
+    /// publisher that resets and goes away.
     ResetMidGroup {
         /// Complete frames sent before the reset.
+        after_frames: u32,
+    },
+    /// After `after_frames` complete frames, ONCE: reset the group's stream
+    /// with [`RESET_MID_GROUP_CODE`] (the publisher's own per-target
+    /// abandonment, R-12) and KEEP RUNNING — then self-key the next group
+    /// (story 3 amendment 4: a publisher keys whenever a target has no group
+    /// in progress), at once or, inside `min_interval`, through the single
+    /// deferral, logged as
+    /// [`GroupStartCause::TargetAbandoned`](super::schedule::GroupStartCause::TargetAbandoned).
+    /// Frames are withheld until that group starts.
+    AbandonMidGroup {
+        /// Complete frames sent before the abandonment.
         after_frames: u32,
     },
 }
@@ -159,8 +174,11 @@ pub enum FrameOutcome {
     NotDirected,
     /// The stall fault fired on this tick; the stream is parked.
     Stalled,
-    /// The reset fault fired on this tick.
+    /// The reset fault fired on this tick (the publisher then ends).
     Reset,
+    /// The abandonment fault fired on this tick: the group was reset and the
+    /// publisher keeps running, self-keying the next group.
+    Abandoned,
     /// The publisher has stopped (a fault fired earlier, or the counter is
     /// exhausted).
     Stopped,
@@ -191,6 +209,8 @@ pub struct VideoPublisher<T: UplinkTransport> {
     /// A compliant publisher was withdrawn after starting: its next frame
     /// starts a new group (a resume).
     resume_pending: bool,
+    /// [`Fault::AbandonMidGroup`] is one-shot.
+    abandon_fired: bool,
 }
 
 impl<T: UplinkTransport> VideoPublisher<T> {
@@ -214,6 +234,7 @@ impl<T: UplinkTransport> VideoPublisher<T> {
             stopped: false,
             awaiting_group: false,
             resume_pending: false,
+            abandon_fired: false,
         }
     }
 
@@ -403,6 +424,22 @@ impl<T: UplinkTransport> VideoPublisher<T> {
                 self.stream = None;
                 self.stopped = true;
                 return FrameOutcome::Reset;
+            }
+            Fault::AbandonMidGroup { after_frames }
+                if !self.abandon_fired && self.frames_sent == after_frames =>
+            {
+                stream
+                    .reset(RESET_MID_GROUP_CODE)
+                    .unwrap_or_else(|e| panic!("video publisher: reset failed: {e}"));
+                self.stream = None;
+                self.abandon_fired = true;
+                // The publisher DECIDED this abandonment, so it self-keys the
+                // target (MH-decided STOP_SENDING never reaches here). Frames
+                // are withheld until the decided group start.
+                self.awaiting_group = true;
+                let d = self.sched.on_target_abandoned(Instant::now());
+                self.apply(d);
+                return FrameOutcome::Abandoned;
             }
             _ => {}
         }
@@ -733,6 +770,145 @@ mod tests {
         assert!(!w.contains(&Wire::Finished(1)) && !w.contains(&Wire::Dropped(1)));
         assert_eq!(parse(x.transport(), 1).frames.len(), 3);
         assert_eq!(x.send_frame().await, FrameOutcome::Stopped);
+    }
+
+    fn group_starts(p: &VideoPublisher<MemoryTransport>) -> Vec<GroupStartCause> {
+        p.events()
+            .iter()
+            .filter_map(|e| match e {
+                PublisherEvent::GroupStart { cause, .. } => Some(*cause),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandon_mid_group_resets_keeps_running_and_self_keys() {
+        let mut p = publisher(VideoPublisherConfig {
+            fault: Fault::AbandonMidGroup { after_frames: 3 },
+            ..VideoPublisherConfig::new(1)
+        });
+        p.run(&mut NoRequests, 8).await;
+        assert!(!p.is_stopped(), "the publisher keeps running");
+        let t = p.transport().clone();
+        let w = t.wire();
+        assert!(w.contains(&Wire::Reset(1, RESET_MID_GROUP_CODE)));
+        assert!(!w.contains(&Wire::Finished(1)) && !w.contains(&Wire::Dropped(1)));
+        assert_eq!(parse(&t, 1).frames.len(), 3, "the abandoned group's frames");
+        assert_eq!(
+            opened(&t),
+            vec![1, 2],
+            "a fresh stream for the self-keyed group"
+        );
+        let next = parse(&t, 2);
+        assert_eq!(next.first_frame_group_start, Some(true));
+        assert!(
+            next.frames.iter().all(|f| f.gop_counter == 1),
+            "counter + 1"
+        );
+        assert_eq!(
+            group_starts(&p),
+            vec![
+                GroupStartCause::StreamStart,
+                GroupStartCause::TargetAbandoned
+            ]
+        );
+        assert_eq!(
+            next.frames.len(),
+            4,
+            "one-shot: the second group runs on (8 ticks - 3 sent - 1 abandon tick)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_in_interval_abandonment_withholds_frames_until_the_deferred_self_key() {
+        let mut p = publisher(VideoPublisherConfig {
+            group_start: GroupStartSource::OnKeyframeRequest {
+                min_interval: Duration::from_millis(500),
+            },
+            fault: Fault::AbandonMidGroup { after_frames: 2 },
+            frame_interval: Duration::from_millis(20),
+            ..VideoPublisherConfig::new(1)
+        });
+        // 2 frames, the abandon tick, then ticks inside the interval withheld.
+        let mut withheld = 0;
+        for _ in 0..3 {
+            p.send_frame().await;
+        }
+        for _ in 0..5 {
+            if p.send_frame().await == FrameOutcome::AwaitingGroupStart {
+                withheld += 1;
+            }
+        }
+        assert_eq!(withheld, 5, "withheld while the self-key is deferred");
+        assert_eq!(opened(p.transport()), vec![1]);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        p.poll();
+        assert_eq!(
+            p.send_frame().await,
+            FrameOutcome::Sent { group_start: true }
+        );
+        assert_eq!(
+            group_starts(&p),
+            vec![
+                GroupStartCause::StreamStart,
+                GroupStartCause::TargetAbandoned
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_with_the_old_counter_after_a_self_key_is_ignored() {
+        let mut p = publisher(VideoPublisherConfig {
+            group_start: GroupStartSource::OnKeyframeRequest {
+                min_interval: Duration::ZERO,
+            },
+            fault: Fault::AbandonMidGroup { after_frames: 1 },
+            ..VideoPublisherConfig::new(1)
+        });
+        p.send_frame().await;
+        assert_eq!(p.send_frame().await, FrameOutcome::Abandoned);
+        // MH's Waiting-path request carries the abandoned group's counter (0).
+        p.on_request(1, 0);
+        assert_eq!(
+            group_starts(&p),
+            vec![
+                GroupStartCause::StreamStart,
+                GroupStartCause::TargetAbandoned
+            ],
+            "no extra group"
+        );
+        assert!(p.events().contains(&PublisherEvent::KeyframeRequest {
+            stream_number: 1,
+            gop_counter: 0,
+            outcome: RequestOutcome::IgnoredLower,
+        }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_by_mh_never_self_keys() {
+        // Positive control first: an abandonment the publisher decided does.
+        let mut keyed = publisher(VideoPublisherConfig {
+            fault: Fault::AbandonMidGroup { after_frames: 1 },
+            ..VideoPublisherConfig::new(1)
+        });
+        keyed.send_frame().await;
+        keyed.send_frame().await;
+        assert!(group_starts(&keyed).contains(&GroupStartCause::TargetAbandoned));
+
+        let mut t = MemoryTransport::new(None);
+        t.stop.on_write = Some((1, 2));
+        let mut p = VideoPublisher::new(t, VideoPublisherConfig::new(4));
+        p.send_frame().await;
+        assert_eq!(p.send_frame().await, FrameOutcome::StoppedByPeer);
+        for _ in 0..5 {
+            assert_eq!(p.send_frame().await, FrameOutcome::AwaitingGroupStart);
+        }
+        assert_eq!(
+            group_starts(&p),
+            vec![GroupStartCause::StreamStart],
+            "MH's stop is MH's to repair by request"
+        );
     }
 
     #[test]

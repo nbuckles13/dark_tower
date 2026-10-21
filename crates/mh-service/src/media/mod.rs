@@ -1,7 +1,8 @@
 //! The MH media forward paths (ADR-0036 §1 / §2 / §7 / §11): datagram audio
 //! (`ingress`, `forward`, `forwarder`, `queue`) and, since story 3 MH-A2,
 //! stream-per-group cut-through video (`stream_ingress`, `edge`,
-//! `edge_runtime`, `downlink`).
+//! `edge_runtime`, `downlink`) and, since MH-B, on-demand keyframes and
+//! receiver recovery (`keyframe`).
 //!
 //! # THIS DIRECTORY IS THE HOT PATH, AND THE DIRECTORY BOUNDARY IS THE POINT
 //!
@@ -83,6 +84,7 @@ pub mod edge_runtime;
 pub mod forward;
 pub mod forwarder;
 pub mod ingress;
+pub mod keyframe;
 pub mod queue;
 pub mod sampler;
 pub mod stream_ingress;

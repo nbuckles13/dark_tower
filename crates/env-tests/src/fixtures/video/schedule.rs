@@ -38,6 +38,21 @@ pub enum GroupStartCause {
     /// a new group (story 3: the counter increments on every keyframe,
     /// including the one that starts a resume).
     Resume,
+    /// The publisher self-keyed after abandoning (resetting) its own group
+    /// toward this handler — story 3 amendment 4: a publisher keys whenever a
+    /// target has no group in progress. The client's keyframes-produced cause
+    /// for it is `abandonment`.
+    TargetAbandoned,
+}
+
+/// The ONE deferred slot per stream: a held in-interval keyframe request (its
+/// counter, re-checked when it fires) or a held self-key (fires with no
+/// counter re-check). A self-key dominates: a request coalescing into a held
+/// self-key leaves it a self-key (the self-keyed group answers the request).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Deferred {
+    Request(u32),
+    SelfKey,
 }
 
 /// What became of one keyframe request.
@@ -140,8 +155,8 @@ pub struct GroupScheduler {
     directed_send_id: u16,
     current: Option<u32>,
     last_start: Option<Instant>,
-    /// The deferred request's counter, if one is held.
-    deferred: Option<u32>,
+    /// The one deferred slot, if held.
+    deferred: Option<Deferred>,
     next_periodic: Option<Instant>,
     exhausted: bool,
     /// Whether the publisher is sending (a request never makes an undirected
@@ -285,13 +300,54 @@ impl GroupScheduler {
             return (RequestOutcome::IgnoredLower, None);
         }
         if now < last_start + min_interval {
-            // One deferred slot; a later in-interval request coalesces into it.
-            self.deferred = Some(self.deferred.map_or(gop_counter, |d| d.max(gop_counter)));
+            // One deferred slot; a later in-interval request coalesces into it
+            // (into a held self-key, which then answers it).
+            self.deferred = Some(match self.deferred {
+                Some(Deferred::SelfKey) => Deferred::SelfKey,
+                Some(Deferred::Request(d)) => Deferred::Request(d.max(gop_counter)),
+                None => Deferred::Request(gop_counter),
+            });
             return (RequestOutcome::Deferred, None);
         }
         // Answering now also answers anything deferred.
         self.deferred = None;
         (RequestOutcome::Answered, Some(GroupStartCause::Request))
+    }
+
+    /// The publisher's minimum interval between group starts: the
+    /// request-driven source's `min_interval`; zero for the other sources
+    /// (self-keying after an abandonment is client behaviour under every
+    /// source, so a `None`-source abandonment still recovers).
+    fn min_interval(&self) -> Duration {
+        match self.source {
+            GroupStartSource::OnKeyframeRequest { min_interval } => min_interval,
+            GroupStartSource::None | GroupStartSource::Periodic(_) => Duration::ZERO,
+        }
+    }
+
+    /// The publisher abandoned (reset) its own group toward this handler:
+    /// story 3 amendment 4 — it keys whenever a target has no group in
+    /// progress, under the same bound and the same single deferral. Out of
+    /// interval the self-keyed group begins now
+    /// ([`GroupStartCause::TargetAbandoned`]); in interval it is held in the
+    /// deferred slot (never dropped) and fires at `last + min_interval` with no
+    /// counter re-check. A held request is subsumed (the self-keyed group's
+    /// counter is above it). `None` before the first group, once exhausted, or
+    /// while withdrawn (re-direction starts a `Resume` group instead).
+    ///
+    /// Only for abandonments the publisher DECIDED: a stream MH stopped
+    /// (STOP_SENDING) is MH's to repair by request, never self-keyed.
+    pub fn on_target_abandoned(&mut self, now: Instant) -> Option<Decision> {
+        let last_start = self.last_start?;
+        if self.current.is_none() || self.exhausted || !self.sending {
+            return None;
+        }
+        if now < last_start + self.min_interval() {
+            self.deferred = Some(Deferred::SelfKey);
+            return None;
+        }
+        self.deferred = None;
+        Some(self.begin_group(GroupStartCause::TargetAbandoned, now))
     }
 
     /// The next instant [`Self::poll`] may decide something, if any.
@@ -300,10 +356,8 @@ impl GroupScheduler {
         if self.exhausted {
             return None;
         }
-        let deferred_at = match (self.deferred, self.source, self.last_start) {
-            (Some(_), GroupStartSource::OnKeyframeRequest { min_interval }, Some(last)) => {
-                Some(last + min_interval)
-            }
+        let deferred_at = match (self.deferred, self.last_start) {
+            (Some(_), Some(last)) => Some(last + self.min_interval()),
             _ => None,
         };
         match (deferred_at, self.next_periodic) {
@@ -312,19 +366,25 @@ impl GroupScheduler {
         }
     }
 
-    /// Fire whatever is due at `now`: a deferred request (re-checked against
-    /// the current counter) or the periodic cadence.
+    /// Fire whatever is due at `now`: the deferred slot — a request
+    /// (re-checked against the current counter) or a self-key (no re-check) —
+    /// or the periodic cadence.
     pub fn poll(&mut self, now: Instant) -> Option<Decision> {
         if self.exhausted {
             return None;
         }
-        if let (Some(requested), GroupStartSource::OnKeyframeRequest { min_interval }, Some(last)) =
-            (self.deferred, self.source, self.last_start)
-        {
-            if now >= last + min_interval {
+        if let (Some(deferred), Some(last)) = (self.deferred, self.last_start) {
+            if now >= last + self.min_interval() {
                 self.deferred = None;
-                if self.current.is_some_and(|c| requested >= c) {
-                    return Some(self.begin_group(GroupStartCause::DeferredRequest, now));
+                match deferred {
+                    Deferred::SelfKey => {
+                        return Some(self.begin_group(GroupStartCause::TargetAbandoned, now));
+                    }
+                    Deferred::Request(requested) => {
+                        if self.current.is_some_and(|c| requested >= c) {
+                            return Some(self.begin_group(GroupStartCause::DeferredRequest, now));
+                        }
+                    }
                 }
             }
         }
@@ -607,6 +667,161 @@ mod tests {
         }
         assert_eq!(s.on_request(1, 0, Instant::now()), None);
         assert_eq!(starts(s.events()), vec![(0, GroupStartCause::StreamStart)]);
+    }
+
+    fn on_request_source(min_interval: Duration) -> GroupStartSource {
+        GroupStartSource::OnKeyframeRequest { min_interval }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_out_of_interval_abandonment_self_keys_at_once() {
+        let mut s = GroupScheduler::new(on_request_source(Duration::from_millis(500)), VIDEO);
+        let t0 = Instant::now();
+        // Positive control for the "before the first group" arm below.
+        assert_eq!(s.on_target_abandoned(t0), None, "no group yet: nothing");
+        assert!(s.events().is_empty(), "and nothing logged");
+        s.start(t0);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert_eq!(
+            s.on_target_abandoned(Instant::now()),
+            Some(Decision::GroupStart {
+                gop_counter: 1,
+                cause: GroupStartCause::TargetAbandoned
+            })
+        );
+        assert_eq!(s.next_deadline(), None, "nothing held");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_in_interval_abandonment_is_deferred_and_fires_once() {
+        let floor = Duration::from_millis(500);
+        let mut s = GroupScheduler::new(on_request_source(floor), VIDEO);
+        let t0 = Instant::now();
+        s.start(t0);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(s.on_target_abandoned(Instant::now()), None, "deferred");
+        assert_eq!(s.next_deadline(), Some(t0 + floor));
+        tokio::time::advance(Duration::from_millis(399)).await;
+        assert_eq!(s.poll(Instant::now()), None, "not before the floor");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(
+            s.poll(Instant::now()),
+            Some(Decision::GroupStart {
+                gop_counter: 1,
+                cause: GroupStartCause::TargetAbandoned
+            })
+        );
+        assert_eq!(s.poll(Instant::now()), None, "fires once");
+        assert_eq!(s.next_deadline(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_coalesced_into_a_held_self_key_yields_one_self_keyed_group() {
+        for request_counter in [0, 1] {
+            let floor = Duration::from_millis(500);
+            let mut s = GroupScheduler::new(on_request_source(floor), VIDEO);
+            let t0 = Instant::now();
+            s.start(t0);
+            assert_eq!(s.on_target_abandoned(t0), None);
+            // The request carries the OLD counter (0, == current) or a newer
+            // one: either way it coalesces, and the self-key dominates.
+            assert_eq!(s.on_request(1, request_counter, t0), None);
+            assert_eq!(outcomes(s.events()), vec![RequestOutcome::Deferred]);
+            tokio::time::advance(floor).await;
+            assert_eq!(
+                s.poll(Instant::now()),
+                Some(Decision::GroupStart {
+                    gop_counter: 1,
+                    cause: GroupStartCause::TargetAbandoned
+                })
+            );
+            assert_eq!(s.poll(Instant::now()), None);
+            assert_eq!(starts(s.events()).len(), 2, "exactly one more group");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_request_then_an_abandonment_fires_as_a_self_key() {
+        let floor = Duration::from_millis(500);
+        let mut s = GroupScheduler::new(on_request_source(floor), VIDEO);
+        let t0 = Instant::now();
+        s.start(t0);
+        assert_eq!(s.on_request(1, 0, t0), None, "held request");
+        assert_eq!(
+            s.on_target_abandoned(t0),
+            None,
+            "the self-key takes the slot"
+        );
+        tokio::time::advance(floor).await;
+        assert_eq!(
+            s.poll(Instant::now()),
+            Some(Decision::GroupStart {
+                gop_counter: 1,
+                cause: GroupStartCause::TargetAbandoned
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_withdrawal_drops_a_held_self_key() {
+        let floor = Duration::from_millis(500);
+        let mut s = GroupScheduler::new(on_request_source(floor), VIDEO);
+        let t0 = Instant::now();
+        s.start(t0);
+        assert_eq!(s.on_target_abandoned(t0), None);
+        assert!(s.next_deadline().is_some(), "positive control: held");
+        s.set_sending(false);
+        assert_eq!(s.next_deadline(), None);
+        tokio::time::advance(floor).await;
+        assert_eq!(s.poll(Instant::now()), None, "dropped, never fired");
+        assert_eq!(
+            s.on_target_abandoned(Instant::now()),
+            None,
+            "a withdrawn publisher does not self-key"
+        );
+        assert_eq!(starts(s.events()).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_self_key_at_the_counter_ceiling_exhausts() {
+        let now = Instant::now();
+        let mut s =
+            GroupScheduler::started_at(on_request_source(Duration::ZERO), VIDEO, u32::MAX, now);
+        assert_eq!(s.on_target_abandoned(now), Some(Decision::Exhausted));
+        assert!(s.is_exhausted());
+        assert_eq!(s.on_target_abandoned(now), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_source_self_keys_after_an_abandonment() {
+        for source in [
+            GroupStartSource::None,
+            GroupStartSource::Periodic(Duration::from_secs(60)),
+        ] {
+            let mut s = GroupScheduler::new(source, VIDEO);
+            let t0 = Instant::now();
+            s.start(t0);
+            assert_eq!(
+                s.on_target_abandoned(t0),
+                Some(Decision::GroupStart {
+                    gop_counter: 1,
+                    cause: GroupStartCause::TargetAbandoned
+                }),
+                "no minimum interval outside the request-driven source"
+            );
+        }
+    }
+
+    #[test]
+    fn the_self_key_debug_prints_no_counter() {
+        let d = Decision::GroupStart {
+            gop_counter: 0x0007_7777,
+            cause: GroupStartCause::TargetAbandoned,
+        };
+        let text = format!("{d:?}");
+        assert!(text.contains("TargetAbandoned"));
+        assert!(!text.contains(&0x0007_7777_u32.to_string()), "{text}");
+        assert!(!text.to_lowercase().contains("777777"), "{text}");
     }
 
     #[tokio::test(start_paused = true)]

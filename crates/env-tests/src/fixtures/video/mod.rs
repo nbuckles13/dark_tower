@@ -31,8 +31,9 @@
 //! * [`GroupStartSource`] — ONE knob, default `None`:
 //!   * `None`: a group starts only at stream start. This is ALSO the
 //!     withhold-keyframes / never-keying source for MH-B's pending gauge (a late
-//!     subscriber waits while MH retries keyframe requests that are never
-//!     answered). A publisher that is bound but never started is the different
+//!     subscriber's edge waits pending, and MH sends ONE request per (stream,
+//!     counter) that is never answered — MH does not retry). A publisher that
+//!     is bound but never started is the different
 //!     "never-sending, zero requests answerable" source.
 //!   * `OnKeyframeRequest { min_interval }` (MH-B, task 10): answers
 //!     `MhServerMessage.keyframe_request { stream_number, gop_counter }` read
@@ -70,8 +71,14 @@
 //! * [`Fault`] — `StallMidFrame` writes a header and part of a payload, then
 //!   PARKS the stream handle until [`VideoPublisher::release_stall`] (dropping
 //!   it would FINISH it — R-21's stall bound); `ResetMidGroup` calls
-//!   `reset(`[`RESET_MID_GROUP_CODE`]`)` explicitly (R-12 abandonment). A group
-//!   rollover calls `finish()` explicitly.
+//!   `reset(`[`RESET_MID_GROUP_CODE`]`)` explicitly and the publisher then ENDS;
+//!   `AbandonMidGroup` resets the same way ONCE and keeps running, self-keying
+//!   the next group (story 3 amendment 4: a publisher keys whenever a target
+//!   has no group in progress — under every [`GroupStartSource`], inside
+//!   `min_interval` through the single deferral), logged as
+//!   `GroupStartCause::TargetAbandoned`. A stream MH stopped never self-keys:
+//!   that abandonment is MH's to repair by request. A group rollover calls
+//!   `finish()` explicitly.
 //!
 //! There is no key-id-stream knob (ruled out at story design).
 //!
@@ -152,6 +159,7 @@
 //! A file that would exceed it serialises its fns or raises the budget in the
 //! same change.
 
+pub mod backlog;
 pub mod control;
 pub mod encode;
 pub mod publisher;

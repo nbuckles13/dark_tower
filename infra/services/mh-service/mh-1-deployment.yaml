@@ -217,26 +217,10 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_MAX_SOURCE_STREAMS_PER_MEETING
-        # Video stream path and keyframe recovery (story 3 R-10..R-13, R-21).
-        # HARD refs. MH-A2's three (stream opens, backlog, stall) are REQUIRED
-        # reads in the current image: absent or out of bounds, MH refuses to
-        # start. MH-B's three (retry, aggregation, recovery rate) are still
-        # ignored until MH-B lands. Rationale and bounds: config.env.
-        - name: MH_KEYFRAME_REQUEST_RETRY_MS
-          valueFrom:
-            configMapKeyRef:
-              name: mh-service-config
-              key: MH_KEYFRAME_REQUEST_RETRY_MS
-        - name: MH_KEYFRAME_REQUEST_AGGREGATION_MS
-          valueFrom:
-            configMapKeyRef:
-              name: mh-service-config
-              key: MH_KEYFRAME_REQUEST_AGGREGATION_MS
-        - name: MH_RECOVERY_REQUESTS_PER_CONNECTION_PER_SEC
-          valueFrom:
-            configMapKeyRef:
-              name: mh-service-config
-              key: MH_RECOVERY_REQUESTS_PER_CONNECTION_PER_SEC
+        # Video stream path (story 3 R-12, R-21). HARD refs: all three
+        # (stream opens, backlog, stall) are REQUIRED reads — absent or out of
+        # bounds, MH refuses to start. Keyframe and recovery requests have no
+        # keys (story 3 amendment 4). Rationale and bounds: config.env.
         - name: MH_STREAM_OPENS_PER_CONNECTION_PER_SEC
           valueFrom:
             configMapKeyRef:
@@ -252,17 +236,15 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_STREAM_MID_FRAME_STALL_MS
-        # Shared media codec profile (story 3 R-23, R-24): the five values MH
+        # Shared media codec profile (story 3 R-23, R-24): the four values MH
         # reads from the SHARED `media-codec-profile` generator in the sibling
         # base infra/services/media-codec-profile/ — their single home, also
-        # read by MC. MH derives both per-stream egress costs from the four
-        # bitrate/frame-rate keys (required reads) and validates
-        # MH_KEYFRAME_REQUEST_RETRY_MS against the minimum keyframe interval
-        # (MH-B). Kustomize rewrites this name to the generator's hashed name in
-        # the environment-root render, so a profile edit rolls mc-0, mc-1,
-        # mh-0 and mh-1 together — and an MH roll sheds every media session on
-        # the pod. HARD refs; the current image reads the four cost inputs
-        # (MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS from MH-B).
+        # read by MC. MH derives both per-stream egress costs from them
+        # (required reads). MH does not read the minimum keyframe interval
+        # (MC-only, story 3 amendment 4). Kustomize rewrites this name to the
+        # generator's hashed name in the environment-root render, so a profile
+        # edit rolls mc-0, mc-1, mh-0 and mh-1 together — and an MH roll sheds
+        # every media session on the pod. HARD refs.
         - name: MEDIA_VIDEO_MAX_BITRATE_BPS
           valueFrom:
             configMapKeyRef:
@@ -273,11 +255,6 @@ spec:
             configMapKeyRef:
               name: media-codec-profile
               key: MEDIA_VIDEO_FRAME_RATE_HZ
-        - name: MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS
-          valueFrom:
-            configMapKeyRef:
-              name: media-codec-profile
-              key: MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS
         - name: MEDIA_AUDIO_MAX_BITRATE_BPS
           valueFrom:
             configMapKeyRef:

@@ -82,7 +82,9 @@ use proto_gen::dark_tower::signaling::v1::TransportMode;
 
 use crate::config::PolicyLimits;
 use crate::media::edge_runtime::{self, EdgeContext, EdgeRuntime, SourceStatus};
+use crate::media::keyframe::PublisherKeyframesRegistry;
 use crate::observability::metrics::PolicyApplyOutcome;
+use crate::session::LocalSubscribers;
 
 mod sources;
 pub use sources::{Declarations, Disposition, SourceDecl};
@@ -746,6 +748,11 @@ pub struct MeetingRoutes {
     /// successor routes by `egress_stream_id` (`crate::media::edge_runtime`),
     /// so the snapshot stays immutable while the cells it points at are not.
     cells: EdgeCells,
+    /// `(subscriber, slot)` -> index into `edges`: a receiver's
+    /// `RecoveryRequest` resolves its `slot_id` ONLY through its own
+    /// connection's bound sender here (story 3 R-13), meeting-local like
+    /// `by_source`.
+    by_slot: HashMap<(SenderId, SlotId), usize>,
     /// Senders every frame of which drops `server_muted` (the shortcut),
     /// derived from the declarations; non-vacuous (see
     /// `Declarations::all_muted`). Keyed by the scoped [`SenderId`] inside this
@@ -783,10 +790,46 @@ impl MeetingRoutes {
             }
         };
         let reconciled = edge_runtime::reconcile(
+            &policy.meeting,
             previous.map(|routes| (routes.edges.as_slice(), routes.cells.0.as_slice())),
             &policy.edges,
             status,
             context,
+        );
+
+        // Per-source keyframe state of every publisher bound in this meeting
+        // (story 3 MH-B): records of streams MC no longer declares are FREED
+        // (unassign), and a queued request for a source no stream edge assigns
+        // with a FORWARD declaration any more (edge removed, PAUSED,
+        // DROP_AT_INGRESS) is discarded.
+        for (sender, keyframes) in context.keyframes.in_meeting(&policy.meeting) {
+            keyframes.reconcile(
+                |stream| {
+                    policy
+                        .declarations
+                        .resolve(&declared_index, sender, stream)
+                        .is_some()
+                },
+                |stream| {
+                    reconciled
+                        .wanted_sources
+                        .contains(&CandidateRef { sender, stream })
+                },
+            );
+        }
+
+        // (subscriber, slot) is unique: validation rejects a repeat
+        // (`DuplicateSubscriberSlot`).
+        let by_slot: HashMap<(SenderId, SlotId), usize> = policy
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(index, edge)| ((edge.subscriber.sender, edge.subscriber.slot), index))
+            .collect();
+        debug_assert_eq!(
+            by_slot.len(),
+            policy.edges.len(),
+            "a validated policy holds one edge per (subscriber, slot)"
         );
 
         let mut by_source: HashMap<(SenderId, StreamNumber), Vec<usize>> = HashMap::new();
@@ -811,6 +854,7 @@ impl MeetingRoutes {
             generation: policy.generation,
             edges: policy.edges.clone(),
             by_source,
+            by_slot,
             declared_index,
             all_muted,
             declarations: policy.declarations.clone(),
@@ -1108,6 +1152,66 @@ impl RoutingSnapshot {
         }
     }
 
+    /// The declared stream an uplink label resolves to for `sender` on
+    /// `arrival`, whatever its disposition — the per-source keyframe record's
+    /// key for a frame [`Self::attribute`] dropped `server_muted` (story 3
+    /// MH-B: the counter is taken from muted frames too). The SAME
+    /// declaration lookup as `attribute`, so a label `attribute` would call
+    /// unmatched or mismatched never yields a key here: records exist only
+    /// for declared streams.
+    #[must_use]
+    pub fn declared_stream(
+        &self,
+        meeting: &MeetingKey,
+        sender: SenderId,
+        uplink_id: u16,
+        arrival: TransportMode,
+    ) -> Option<StreamNumber> {
+        let routes = self.meetings.get(meeting)?;
+        let stream = StreamNumber::try_from(uplink_id).ok()?;
+        routes
+            .declarations
+            .resolve(&routes.declared_index, sender, stream)
+            .filter(|declared| declared.transport == arrival)
+            .map(|declared| declared.stream)
+    }
+
+    /// The source a receiver's `RecoveryRequest` names by `slot_id` (story 3
+    /// R-13): resolved ONLY among `own`'s edges in `meeting` (the requesting
+    /// connection's bound sender), and only to a stream-per-group edge whose
+    /// MC-ASSIGNED source (B during a pending A→B switch) is declared
+    /// `FORWARD`. `None` is `unmapped_slot`.
+    #[must_use]
+    pub fn slot_source(
+        &self,
+        meeting: &MeetingKey,
+        own: SenderId,
+        slot_id: u32,
+    ) -> Option<CandidateRef> {
+        let routes = self.meetings.get(meeting)?;
+        let slot = SlotId::from_wire(slot_id).ok()?;
+        let edge = routes.edges.get(*routes.by_slot.get(&(own, slot))?)?;
+        if edge.transport != Some(TransportMode::StreamPerGroup) {
+            return None;
+        }
+        let source = *edge.candidates.first()?;
+        match classify(
+            &routes.declarations,
+            &routes.declared_index,
+            &routes.all_muted,
+            source.sender,
+            source.stream,
+        ) {
+            Classified::Declared(declared)
+                if declared.disposition == Disposition::Forward
+                    && declared.transport == TransportMode::StreamPerGroup =>
+            {
+                Some(source)
+            }
+            _ => None,
+        }
+    }
+
     /// The sender-level server-mute shortcut **within `meeting`** — true when
     /// every declared stream of `sender` is `DROP_AT_INGRESS` (at least one
     /// declared) or the sender is union-muted.
@@ -1291,10 +1395,10 @@ impl RoutingTable {
     /// it by accident; production uses [`Self::with_edge_context`].
     #[must_use]
     pub fn unbounded_for_tests() -> Self {
-        Self::with_edge_context(EdgeContext {
-            backlog_cap: crate::config::MAX_EGRESS_STREAM_BACKLOG_BYTES,
-            handles: Arc::new(crate::observability::metrics::resolve_media_handles()),
-        })
+        Self::with_edge_context(EdgeContext::new(
+            crate::config::MAX_EGRESS_STREAM_BACKLOG_BYTES,
+            Arc::new(crate::observability::metrics::resolve_media_handles()),
+        ))
     }
 
     /// A table whose stream edges use `edge_context`.
@@ -1340,6 +1444,9 @@ impl RoutingTable {
                         cell.release();
                     }
                 }
+                for (_, keyframes) in self.edge_context.keyframes.in_meeting(meeting) {
+                    keyframes.clear();
+                }
                 true
             }
             None => false,
@@ -1356,6 +1463,93 @@ impl RoutingTable {
                 cell.on_sender_ended(sender);
             }
         }
+    }
+
+    /// The subscriber registry stream edges judge presence against (one per
+    /// table; the session handle and the media tasks share it).
+    #[must_use]
+    pub fn subscribers(&self) -> &Arc<LocalSubscribers> {
+        &self.edge_context.subscribers
+    }
+
+    /// The publisher keyframe registry (one per table).
+    #[must_use]
+    pub fn keyframes(&self) -> &Arc<PublisherKeyframesRegistry> {
+        &self.edge_context.keyframes
+    }
+
+    /// MH refused a new group of `sender`'s `stream` at the stream-open limit,
+    /// after recording its counter: every edge of that source repairs by
+    /// request (`EdgeRuntime::on_source_group_refused`).
+    pub fn source_group_refused(
+        &self,
+        meeting: &MeetingKey,
+        sender: SenderId,
+        stream: StreamNumber,
+    ) {
+        let snapshot = self.snapshot.load();
+        let Some(routes) = snapshot.meetings.get(meeting) else {
+            return;
+        };
+        let source = CandidateRef { sender, stream };
+        for &index in routes
+            .by_source
+            .get(&(sender, stream))
+            .into_iter()
+            .flatten()
+        {
+            if let Some(cell) = routes.cells.0.get(index) {
+                cell.on_source_group_refused(source);
+            }
+        }
+    }
+
+    /// `sender`'s subscriber connection registered (`true`) or was removed
+    /// (`false`) on this handler: its stream edges in `meeting` enter or
+    /// leave pending (and request) accordingly. Called by the connection
+    /// lifecycle AFTER the registry write.
+    pub fn subscriber_presence(&self, meeting: &MeetingKey, sender: SenderId, present: bool) {
+        let snapshot = self.snapshot.load();
+        let Some(routes) = snapshot.meetings.get(meeting) else {
+            return;
+        };
+        for (edge, cell) in routes.edges.iter().zip(&routes.cells.0) {
+            if edge.subscriber.sender == sender {
+                cell.set_subscriber_present(present);
+            }
+        }
+    }
+
+    /// A publisher binding registered in `meeting`: edges waiting for one of
+    /// its sources become pending (and request once its source is seen).
+    pub fn publisher_bound(&self, meeting: &MeetingKey) {
+        if let Some(routes) = self.snapshot.load().meetings.get(meeting) {
+            for cell in routes.cells() {
+                cell.resettle();
+            }
+        }
+    }
+
+    /// Sample every installed edge's pending stamp and publish the pod-wide
+    /// `mh_media_edges_pending` (count) and `mh_media_edge_pending_oldest_seconds`
+    /// (max age; 0 when nothing is pending). Called from the session actor's
+    /// tick — the single writer — never per frame.
+    #[expect(clippy::cast_precision_loss, reason = "an edge count far below 2^52")]
+    pub fn publish_pending(&self, now: tokio::time::Instant) {
+        let snapshot = self.snapshot.load();
+        let mut count = 0usize;
+        let mut oldest = std::time::Duration::ZERO;
+        for routes in snapshot.meetings.values() {
+            for cell in routes.cells() {
+                if let Some(since) = cell.pending_since() {
+                    count += 1;
+                    oldest = oldest.max(now.saturating_duration_since(since));
+                }
+            }
+        }
+        let handles = &self.edge_context.handles;
+        handles.edges_pending().set(count as f64);
+        handles.edge_pending_oldest().set(oldest.as_secs_f64());
     }
 
     /// `STREAM_PER_GROUP` source streams declared across every installed
