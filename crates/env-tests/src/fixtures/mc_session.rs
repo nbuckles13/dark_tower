@@ -31,9 +31,10 @@ use std::time::Duration;
 
 use super::media::sample_identity_public_key;
 
-/// Upper bound on a single framed MC/MH message, in bytes. Frames larger than
-/// this are a wire defect, not a payload.
-const MAX_FRAME_BYTES: usize = 65_536;
+/// Upper bound on a single framed MC/MH message, in bytes (MC's and MH's
+/// per-message size bound). Frames larger than this are a wire defect, not a
+/// payload, and are refused BEFORE the body is allocated.
+pub const MAX_FRAME_BYTES: usize = 65_536;
 
 /// How long [`mc_join`] waits for the `JoinResponse` before giving up.
 const JOIN_RESPONSE_BOUND: Duration = Duration::from_secs(10);
@@ -92,6 +93,60 @@ pub fn frame(encoded: &[u8]) -> Vec<u8> {
     f.to_vec()
 }
 
+/// The body length a 4-byte big-endian prefix declares, held to
+/// `1..=`[`MAX_FRAME_BYTES`] BEFORE anything is allocated for the body — the
+/// ONE bound rule for every carrier/signalling reader in env-tests
+/// ([`read_framed`] and the cancel-safe carrier reader in `fixtures::video`).
+///
+/// # Panics
+///
+/// On a length outside the bound; the text names `what` only.
+pub(crate) fn checked_frame_len(prefix: [u8; 4], what: &str) -> usize {
+    let n = usize::try_from(u32::from_be_bytes(prefix)).unwrap_or(usize::MAX);
+    assert!(
+        n > 0 && n <= MAX_FRAME_BYTES,
+        "{what}: length prefix out of range (must be 1..={MAX_FRAME_BYTES})"
+    );
+    n
+}
+
+/// Read the next 4-byte-length-prefixed message body from `recv`, or `None` if
+/// no length prefix arrives within `bound` — THE bounded framed read for both
+/// MC's signalling stream and MH's carrier stream.
+///
+/// `bound` covers BOTH halves of the frame (see [`McSession::try_read`]). A
+/// length outside `1..=`[`MAX_FRAME_BYTES`] is refused before the body is
+/// allocated, and a half-written frame panics rather than reading as quiet.
+/// Panic text names `what` and the reason only — never body content.
+///
+/// # Panics
+///
+/// On a read error, an out-of-range length, or a body that does not follow
+/// its length prefix within `bound`.
+pub async fn read_framed(
+    recv: &mut wtransport::RecvStream,
+    bound: Duration,
+    what: &str,
+) -> Option<Vec<u8>> {
+    let mut len = [0u8; 4];
+    tokio::time::timeout(bound, recv.read_exact(&mut len))
+        .await
+        .ok()?
+        .unwrap_or_else(|e| panic!("{what}: read length prefix failed: {e}"));
+    let n = checked_frame_len(len, what);
+    let mut buf = vec![0u8; n];
+    tokio::time::timeout(bound, recv.read_exact(&mut buf))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{what}: body did not arrive within {bound:?} after its length prefix — a \
+                 half-written frame, not quiet"
+            )
+        })
+        .unwrap_or_else(|e| panic!("{what}: read body failed: {e}"));
+    Some(buf)
+}
+
 /// One live MC signalling session: the WebTransport connection and its bidi
 /// stream, kept open so post-join signalling (ADR-0036 §6 `ReceiveCapability`
 /// in, §5 `SendDirective` + `StreamAssignments` out) can be driven over it.
@@ -145,26 +200,7 @@ impl McSession {
     /// as their stop condition, and a partial frame read as quiet would turn a
     /// wire fault into a green settle.
     pub async fn try_read(&mut self, bound: Duration) -> Option<ServerMessage> {
-        let mut len = [0u8; 4];
-        tokio::time::timeout(bound, self.recv.read_exact(&mut len))
-            .await
-            .ok()?
-            .expect("read MC frame length");
-        let n = u32::from_be_bytes(len) as usize;
-        assert!(
-            n > 0 && n <= MAX_FRAME_BYTES,
-            "MC frame length out of range: {n}"
-        );
-        let mut buf = vec![0u8; n];
-        tokio::time::timeout(bound, self.recv.read_exact(&mut buf))
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "MC frame body ({n} bytes) did not arrive within {bound:?} after its length \
-                     prefix — a half-written frame, not quiet"
-                )
-            })
-            .expect("read MC frame body");
+        let buf = read_framed(&mut self.recv, bound, "MC frame").await?;
         Some(ServerMessage::decode(buf.as_slice()).expect("decode ServerMessage"))
     }
 }
@@ -336,9 +372,11 @@ pub async fn try_mh_open_connect(
 /// exactly as long as this value; drop it to disconnect.
 pub struct MhSession {
     conn: wtransport::Connection,
-    // Held, never read: their only job is to keep the carrier stream open.
-    _send: wtransport::SendStream,
-    _recv: wtransport::RecvStream,
+    // Held for the session's lifetime: their first job is to keep the carrier
+    // stream open. Lent out (never moved) by [`MhSession::control`] for the
+    // story-3 control messages.
+    send: wtransport::SendStream,
+    recv: wtransport::RecvStream,
 }
 
 impl MhSession {
@@ -346,6 +384,17 @@ impl MhSession {
     #[must_use]
     pub fn connection(&self) -> &wtransport::Connection {
         &self.conn
+    }
+
+    /// The carrier stream's halves, BORROWED: the send half carries
+    /// `MhClientMessage.recovery_request`, the receive half
+    /// `MhServerMessage.keyframe_request` (story 3; both length-framed exactly as
+    /// the connect request). Borrow-only on purpose — the session must keep
+    /// owning both halves, because finishing or dropping the send half is MH's
+    /// "client disconnected" and tears the media session down. Never call
+    /// `finish()` or `reset()` on the lent send half.
+    pub fn control(&mut self) -> (&mut wtransport::SendStream, &mut wtransport::RecvStream) {
+        (&mut self.send, &mut self.recv)
     }
 }
 
@@ -382,9 +431,5 @@ pub async fn try_mh_connect_with(
     let (send, recv) = try_mh_open_connect(&conn, jwt)
         .await
         .map_err(|e| format!("{e} (MH at {url})"))?;
-    Ok(MhSession {
-        conn,
-        _send: send,
-        _recv: recv,
-    })
+    Ok(MhSession { conn, send, recv })
 }

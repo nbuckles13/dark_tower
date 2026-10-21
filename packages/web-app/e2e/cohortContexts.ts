@@ -39,13 +39,22 @@ import {
   type JoinedBusEvent,
 } from './fixtures.js';
 import type { CohortTone } from './toneDetector.js';
-import { SUITE_RECEIVE_SLOTS } from './cohort.js';
+import { SUITE_RECEIVE_SLOTS, type PublishSet } from './cohort.js';
 
 /** The per-context levers, as the app's `parseTestLevers` accepts them. */
 export interface ContextLevers {
   readonly blockHandlers?: readonly string[];
+  /** audio N; renamed to audioReceiveSlots with VITE_DT_AUDIO_RECEIVE_SLOTS in C-A1 (task 11) */
   readonly receiveSlots?: string;
   readonly forceHostControls?: boolean;
+  /**
+   * Story 3: the member's publish set and video M (`cohort.ts:leversForPlan`).
+   * TYPE ONLY until the client's publish-path task teaches the app's strict
+   * lever parser these keys. No spec passes them before then, so the parser's
+   * unknown-key throw is never reached.
+   */
+  readonly publish?: PublishSet;
+  readonly videoReceiveSlots?: string;
 }
 
 /** One cohort member's browsing context. */

@@ -453,3 +453,158 @@ metric export to `/api/v1/telemetry/v1/metrics` sends the user bearer in its
 life of each session — so a retained trace holds many copies of the token in
 headers, not one per join in bodies, which is why the policy above applies with
 more force, not less.
+
+## Video test infrastructure (story 3, R-32 / R-3 / R-30)
+
+Helpers only. The video specs that use them land with C-C1 (task 17). Every helper below is pure and has a node-tier self-test under `tests/`.
+
+### Video test pattern (THE spec)
+
+This prose is the pattern's single home. The client's generator restates it in its file header. The detector (`patternDetector.ts`) is written from this text and shares **no code** with the generator: it never imports it, and its self-test builds its inputs from its own transcription of this section. This mirrors `testTone.ts` / `toneDetector.ts`.
+
+- **Input:** only the meeting-scoped `sender_id`, an integer in 1..65535. It is a visual watermark, never a durable identity: no user id, email, display name or token. The generator throws on 0 or out of range.
+- **Geometry:** the whole encoded picture (directed width W, height H) is a 6-column × 4-row grid of 24 equal blocks. Block (c, r) spans x ∈ [⌊c·W/6⌋, ⌊(c+1)·W/6⌋) and y ∈ [⌊r·H/4⌋, ⌊(r+1)·H/4⌋). Its row-major index is i = r·6 + c.
+- **Colours:** every block is one flat colour, pure black rgb(0,0,0) or pure white rgb(255,255,255). There are no gradients, text or borders, so nothing is smearable by VP8 at the Kind test profile. White = 1.
+- **Assignment** (row-major):
+
+  | row | c0  | c1  | c2  | c3  | c4  | c5  |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 0   | G0  | I15 | I14 | I13 | I12 | G1  |
+  | 1   | I11 | I10 | I9  | I8  | I7  | I6  |
+  | 2   | I5  | I4  | I3  | I2  | I1  | I0  |
+  | 3   | G2  | C3  | C2  | C1  | C0  | G3  |
+  - **I15..I0:** the 16 bits of `sender_id`, MSB first (index 1 = bit 15 … index 17 = bit 0). That is the full 16-bit space, so ids never collide.
+  - **Guards:** the corners in a fixed checkerboard, G0 (top-left) = white, G1 (top-right) = black, G2 (bottom-left) = black, G3 (bottom-right) = white. They catch blank (all equal), inverted, mirrored and flipped frames.
+  - **C3..C0:** the Gray code g = n ^ (n >> 1) of n = capturedFrameIndex mod 16, MSB first. It advances on every CAPTURED frame, so frames the encoder drops or a hop abandons simply skip values.
+- **Gating (security, binding on the client tasks):** the test-pattern generator, and any browser patched-client harness (C-C1's server-mute evasion case), is reachable ONLY behind an opt-in build define resolved by `vite/testDefines.ts:resolveOptInTestDefine` — never default-on, never runtime, and a production build THROWS. Their synthesis and lever tokens join the FORBIDDEN list of `tests/bundle-content.test.ts`, each with a positive control, so the bundle test proves their absence.
+
+### Render-surface luma projection (what the detector reads)
+
+- **Where sampled:** the slot's **render** canvas (behind the SDK's `VideoSink` seam), over the rectangle the picture was drawn into (letterbox excluded). Never at the decoder output, so a frame painted into the wrong slot reads as the wrong id.
+- **Per block:** the mean of Y = 0.299R + 0.587G + 0.114B over the block's central half in each dimension (x ∈ [bx + bw/4, bx + 3bw/4), and likewise for y). That keeps edge ringing and the floor() seams out. The value is rounded to an integer 0..255. There are exactly 24 values, row-major.
+- **When present:** only while the slot is rendering video and at least one frame has been painted. **Absent, never zero-filled,** on avatar or empty slots. An all-zero array would read as "blank, guard fail", which is the wrong diagnosis.
+
+### Detector rules (`patternDetector.ts`)
+
+- **Thresholds:** a block is black at luma ≤ `BLACK_MAX` (80), white at ≥ `WHITE_MIN` (175), and **undecided** in between. The generator paints 0 / 255, and a canvas readback of VP8 flat blocks typically lands within ~0–20 / ~235–255. Each threshold therefore keeps ~60 of margin beyond observed codec drift. A sample with any undecided block is "not a pattern frame". It is never coerced to a bit.
+- **One sample:** `decodePattern(lumas)` returns `{ decided, guardPass, id, counter }`. The id and counter are read only when the guard passes.
+- **A window:** `judgeSlotPattern(samples, expectedId)` returns `{ idMatch, guardPass, liveness, decodedIds }`.
+  - `guardPass` holds only if every sample passed.
+  - Liveness counts only decided, guard-passing samples. It is `live` when there are at least 2 such samples and the counter differs across any pair. It never requires "+1" (R-12 abandonment skips frames). With fewer than 2 valid samples it is `insufficient`, reported apart from `frozen`.
+  - At a 250 ms bus tick and 15 fps (~3.75 frames per tick; the counter cycles every 16 frames), a live stream reads equal on consecutive samples only on an exact 16k-frame alias.
+- **Malformed input** (not 24 entries, NaN, null, a non-integer, outside 0..255) THROWS `PatternInputError`. A harness error is never a verdict.
+- **Known non-catches:**
+  - A 180° rotation preserves the corner checkerboard. It still misreads the id, so layer 3's expected-id check catches it.
+  - A shifted or cropped frame is caught deterministically only where a corner lands on opposite content. Within a live window the bottom-right corner eventually lands on the moving counter column and fails, and the expected-id check backs it up.
+
+### Slot oracle (`slotOracle.ts`): the rule source
+
+MC never names the source of a live video slot (video ACTIVE carries no `sender_id`, R-5), so layer 1 needs the test's OWN expectation.
+
+- **Rule source:** R-3's text and the MC-A SLOT TABLE bullets in `docs/user-stories/2026-10-07-see-each-other.md`, including the 2026-10-21 **KIND ORDER** amendment (lead ruling at T-A planning). It is never MC's code: the oracle imports nothing from `crates/mc-service`, and `tests/slotOracle.test.ts` enforces that.
+- **Fill:** per subscriber S and kind K, (1) the earliest joiner already holding a slot of the other kind with S but none of K, else (2) the earliest eligible joiner holding no slot of K.
+- **Eligibility:**
+  - never S itself;
+  - shares a connected handler with S (otherwise the pair is unreachable and consumes no slot);
+  - audio slots take audio publishers only;
+  - video slots take any participant, so receive-only and audio-only participants show as `avatar_no_video`.
+- **Stability:** no join, leave, mute or other-kind redeclaration moves an occupied slot. Over-cap slots are `unavailable`. The server mute avatar wins over the client one.
+- **Kind order:** `KIND_FILL_ORDER` = audio, then video, one slot at a time, to a fixed point. MC-A implements the same order.
+
+### Video bus contract (`videoBusShape.ts`)
+
+The client projects these under `__E2E_HOOKS__`, sampled on the existing tick and never per frame.
+
+- **The events:**
+  - `slotAssignments` entries gain `kind: 'audio' | 'video'`.
+  - **`videoSlots`** is `{ slots: [{ slotId, mcState, rendered: 'video'|'avatar'|'empty', renderedSenderId?, framesDecoded, framesRendered, lumas? }] }`, with **no** timestamp; the bus replay order is the order.
+  - Layer 2 reuses the existing `receiveLayers` `{ slot, senderId, keyed, verified }` rows.
+  - `sendTracks` is `{ cameraTrackLive, micTrackOpen }`.
+  - `videoCaptureSource` is `{ mode: 'camera'|'test_pattern', patternId? }`.
+- **Exact-key parsers:** every parser rejects an unknown field, so a GoP value, a frame size, a key id or a timestamp cannot slip onto the bus unnoticed.
+- **Identity carve-out (R-30 vs R-32):** `renderedSenderId`, `receiveLayers.senderId` and `patternId` carry the meeting-scoped `sender_id`, stringified, on the test-build bus only. This follows the story-2 `receiveLayers` precedent. There is never a stream number, relay id, GoP value, size, key id, timing or durable identity. The decoded pattern id is computed test-side and never written back to the bus.
+- **Lumas exception** (security's conditions, binding on C-B / C-C1):
+  - emitted only inside `__E2E_HOOKS__`;
+  - **the `videoSlots` event type goes into the FORBIDDEN list of `tests/bundle-content.test.ts`**, with its positive control;
+  - never sent off-page or logged;
+  - no per-sample timestamp, frame index, GoP, key id or size;
+  - absent on avatar and unavailable slots.
+  - why it is acceptable: with a real camera this is a 6x4 greyscale thumbnail; no added exposure because same-page scripts can already read the canvas.
+- **Test-pattern camera:** the synthetic capture track must stop and restart on exactly the withdrawal, mute and failure edges a real camera does. Otherwise every camera-light assertion is vacuous.
+
+### Video evidence (`videoEvidence.ts` judges; Playwright side in `receiveEvidence.ts`)
+
+The checks run per receiver, per ACTIVE video slot, against the oracle's expected occupant and that occupant's sender id **from the harness's own join binding**, never from the occupant's own announcement:
+
+- **Layer 1:** the key-id sender of the rendered frames (`renderedSenderId`) is the expected sender. A frame from anyone else fails layer 1, and its lumas are never pooled into layer 3.
+- **Layer 2:** the verified-and-decrypted count for (slot, expected sender) advances across the window.
+- **Layer 3:** the detector reads the expected id, the guard passes, and the slot is live.
+  - Only samples with `rendered === 'video'`, lumas present and the expected sender count. Leading avatar samples (avatar → active) are outside the window.
+  - An `insufficient` window is a HARNESS error.
+
+Separately, for every slot, the window's last sample must show the MC state token and the matching rendered kind (`active` → video, `avatar_*` → avatar, `fewer_sources` / `unavailable` → empty). Unreachable senders come from `unreachableSenderIds`.
+
+The send side:
+
+- `cameraTrackLive` is exactly (directed AND NOT client-muted AND camera healthy), so an unwatched publisher's camera is off and a server-muted one's track has ended.
+- The mic stays open through client and server audio mute.
+- `videoCaptureSource.patternId` must equal the member's join-bound sender id, so a generator that drifts from `sender_id` fails loudly.
+
+Windows reuse `windowSampling.ts`'s stop rule and count samples by order.
+
+### Cohort plans (`cohort.ts`)
+
+- **Plans:** a scenario gives each member a `PublishSet` (`audio` / `video` / `both` / `none` = receive-only) plus its own audio N and video M.
+- **Registration:** the cohort is still registered once per run (global setup, AC's auth-rate limit read from AC config). `assertPlanFitsCohort` refuses a plan larger than the registered cohort rather than registering more.
+- **Levers:** `leversForPlan` maps a member to the per-context levers `publish`, `receiveSlots` (audio N; renamed to `audioReceiveSlots` with `VITE_DT_AUDIO_RECEIVE_SLOTS` in C-A1) and `videoReceiveSlots`. The app's lever parser learns the new keys in the client's publish-path task.
+
+## VP8 substrate probe (story 3 R-28)
+
+The browser test substrate must be shown to ENCODE and DECODE VP8 at the profile the cluster directs. If it cannot, the browser layer fails loudly. The probe **never skips** and **never degrades the suite to audio-only**.
+
+One module, `vp8Probe.ts`. It deliberately does not import the SDK or its VP8 support check: it is an independent check of the substrate, and the SDK's own fail-loud is tested in the client's task. Its in-page body (`runVp8ProbeInPage`) does the following:
+- checks for a secure context and the WebCodecs constructors;
+- calls `VideoEncoder.isConfigSupported` and `VideoDecoder.isConfigSupported` at the profile;
+- then performs a REAL round trip, because isConfigSupported alone can lie. One synthetic `OffscreenCanvas` frame is encoded as a keyframe and decoded with the encoder's emitted decoder config, and the decoded display size is compared with the profile.
+
+There is no getUserMedia, no camera and no browser flag. Each WebCodecs step is raced against `PROBE_STEP_BOUND_MS`, a liveness bound and never a latency gate. The observation carries booleans, numbers and enums only.
+
+**Verdicts.** The result is `pass` or exactly one sub-check:
+
+| Sub-check | Meaning |
+|-----------|---------|
+| `webcodecs_unavailable` | Not a secure context, or no WebCodecs constructors |
+| `encoder_config_unsupported` | The encoder config query said no |
+| `decoder_config_unsupported` | The decoder config query said no |
+| `encode_failed` | Encoding errored, or produced nothing |
+| `encode_timeout` | An encoder-side step HUNG |
+| `decode_failed` | Decoding errored, or produced nothing |
+| `decode_timeout` | A decoder-side step HUNG |
+| `dimension_mismatch` | The decoded size differs from the profile |
+
+`tests/vp8Probe.test.ts` runs the real body against fake WebCodecs on `globalThis`, under fake timers.
+
+**Two callers, two profile sources, one reader** (`configEnv.ts:readVideoProfile`, which holds the five `MEDIA_VIDEO_*` keys once):
+
+1. **Layer 7.** `global-setup.ts` runs the probe FIRST, before the cert check and before cohort registration.
+   - **Profile source:** the DEPLOYED `media-codec-profile` ConfigMap. `scripts/layer7.sh` (Phase 1g) resolves its one live generation from the `mc-service` pods and dumps every key to `${DEVLOOP_TMP}/layer-7-media-codec-profile.env`, exported as `E2E_MEDIA_CODEC_PROFILE_ENV`. INF-C's Kind test-profile patch is therefore probed by construction.
+   - **Missing source:** if the variable is unset, global-setup throws. There is deliberately no fallback to the repo file, which would probe the base profile instead of the Kind patch.
+   - **Manual runs:** dump the live ConfigMap yourself and point the variable at the dump:
+     `kubectl -n dark-tower get cm <media-codec-profile-HASH> -o json | jq -r '.data|to_entries[]|"\(.key)=\(.value)"' > /tmp/profile.env`
+2. **CI.** `src/__tests__/vp8Probe.test.ts` runs in vitest browser mode under the existing `pnpm test:component` step of `ci-client.yml`'s Chromium job.
+   - **Profile source:** the repo's BASE `infra/services/media-codec-profile/profile.env`, injected by `vitest.config.ts` as the `__E2E_VP8_PROBE_PROFILE__` define through `configEnv.ts:vp8ProbeProfileDefine`. The values are never restated, and the define is test-runner-only (absent from `vite.config.ts`).
+   - **Strictness:** the test asserts `pass` exactly, and a missing define throws.
+
+**Layer-7 routing (REASON tokens).**
+
+| Token | When | Lane |
+|-------|------|------|
+| `media-codec-profile-unresolved` | Phase 1g cannot resolve exactly one deployed generation, or cannot read it. Decided pre-suite, so neither suite runs. | PRECONDITION_FAILURE, exit 2 |
+| `browser-vp8-unsupported` | An UNSUPPORTED verdict, and only that. | PRECONDITION_FAILURE, exit 2 |
+
+How an unsupported verdict is routed:
+- Global-setup writes the verdict to `E2E_VP8_VERDICT_FILE` (`${DEVLOOP_TMP}/layer-7-vp8-verdict`, removed in Phase 1g before the suite can run). Line 1 is the token. Line 2 is the sub-check, validated by `layer7.sh` against its mirror of the list above. Then global-setup throws with remediation.
+- Every harness error writes nothing and stays `FAIL` / `browser-e2e-failed`. That covers an unset variable, a malformed deployed profile, and a page crash.
+- Routing is fail-closed. No file, any other line 1, or a line 2 outside the list stays `FAIL`. A verdict file next to a green suite is a loud `FAIL`.
+- The token and the sub-check list are declared once in `vp8Probe.ts`. `tests/vp8Probe.test.ts` fails if `layer7.sh`'s mirror drifts.
+- Remediation and the accepted residual (the probe runs after the Rust env-tests) are in `docs/runbooks/devloop-validation.md` §6.7.

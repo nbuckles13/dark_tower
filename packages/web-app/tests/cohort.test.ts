@@ -10,13 +10,17 @@ import {
   AC_REGISTRATION_RATE_LIMIT_MAX_KEY,
   AC_REGISTRATION_RATE_LIMIT_WINDOW_KEY,
   assertCohortFitsAuthWindow,
+  assertPlanFitsCohort,
   COHORT_ENV_VAR,
   cohortSize,
   cohortWindowSpend,
   decodeCohort,
   encodeCohort,
+  leversForPlan,
   parseAcAuthRateLimit,
   SUITE_RECEIVE_SLOTS,
+  type CohortMemberPlan,
+  type PublishSet,
 } from '../e2e/cohort.js';
 
 const AC_CONFIG_ENV = fileURLToPath(
@@ -173,5 +177,52 @@ describe('the base AC config IS the value the Kind cluster runs', () => {
 
   test('positive control: the same scan hits the base config.env', () => {
     expect(readFileSync(AC_CONFIG_ENV, 'utf8').includes(NEEDLE)).toBe(true);
+  });
+});
+
+describe('story 3: scenario plans over the once-registered cohort', () => {
+  const plan = (publish: PublishSet, a = 1, v = 1): CohortMemberPlan => ({
+    publish,
+    audioReceiveSlots: a,
+    videoReceiveSlots: v,
+  });
+
+  test('a plan within the registered cohort fits', () => {
+    expect(() =>
+      assertPlanFitsCohort([plan('both'), plan('audio'), plan('video'), plan('none')], 4),
+    ).not.toThrow();
+  });
+
+  test('a plan larger than the registered cohort THROWS, never registers more', () => {
+    expect(() => assertPlanFitsCohort(new Array(5).fill(plan('both')), 4)).toThrow(
+      /registered 4 .*never register per scenario/,
+    );
+  });
+
+  test.each([
+    ['an empty plan', [] as CohortMemberPlan[]],
+    ['an unknown publish set', [{ ...plan('both'), publish: 'screen' as PublishSet }]],
+    ['a negative N', [plan('both', -1, 1)]],
+    ['a fractional M', [plan('both', 1, 1.5)]],
+    ['a member that neither publishes nor receives', [plan('none', 0, 0)]],
+  ])('rejects %s', (_l, p) => {
+    expect(() => assertPlanFitsCohort(p, 4)).toThrow();
+  });
+
+  test('a receive-only member with only video slots is fine (it holds video slots)', () => {
+    expect(() => assertPlanFitsCohort([plan('none', 0, 2)], 4)).not.toThrow();
+  });
+
+  test('leversForPlan emits exactly the agreed lever names and strings', () => {
+    expect(leversForPlan(plan('video', 3, 2))).toEqual({
+      publish: 'video',
+      receiveSlots: '3',
+      videoReceiveSlots: '2',
+    });
+    expect(Object.keys(leversForPlan(plan('none', 0, 1))).sort()).toEqual([
+      'publish',
+      'receiveSlots',
+      'videoReceiveSlots',
+    ]);
   });
 });

@@ -21,7 +21,8 @@
 #
 # FOUR terminal lanes, each a STATUS line through the lifecycle (the browser suite adds
 # REASON tokens — browser-e2e-passed / browser-e2e-failed / dev-certs-missing /
-# playwright-browser-missing — but NO new lanes):
+# playwright-browser-missing / media-codec-profile-unresolved / browser-vp8-unsupported —
+# but NO new lanes):
 #   SKIPPED-NO-CLUSTER (exit 0) — socket ABSENT + `GITHUB_ACTIONS` set (CI, no cluster, not
 #                                 provisionable). The ONLY clean-skip case; below OK. A
 #                                 PRESENT socket runs even in CI (forward-compatible).
@@ -144,6 +145,20 @@ PLAYWRIGHT_BROWSERS_DIR="${PLAYWRIGHT_BROWSERS_PATH:-/opt/ms-playwright}"
 ENV_TEST_LOG="${DEVLOOP_TMP}/layer-7-env-test.log"
 BROWSER_E2E_LOG="${DEVLOOP_TMP}/layer-7-browser-e2e.log"
 
+# Story 3 R-28 — the VP8 substrate probe's two Layer-7 files (both REMOVED in Phase 1g before
+# anything can write them, so a stale one from an earlier run can never route this one):
+#   * the DEPLOYED media-codec-profile, dumped verbatim (every key, `KEY=value`; bash names no
+#     key — the key list and its validation live once, in packages/web-app/e2e/configEnv.ts);
+#   * the probe's VERDICT FILE, written by packages/web-app/e2e/global-setup.ts ONLY on an
+#     unsupported verdict: line 1 a token from VP8_VERDICT_TOKEN_LIST, line 2 a sub-check from
+#     VP8_PROBE_SUBCHECKS. Both lists MIRROR packages/web-app/e2e/vp8Probe.ts and are
+#     drift-tested by packages/web-app/tests/vp8Probe.test.ts (keep each on ONE line). Nothing
+#     else from the file is ever echoed: it is suite-written, so it is validated, not trusted.
+MEDIA_CODEC_PROFILE_DUMP="${DEVLOOP_TMP}/layer-7-media-codec-profile.env"
+VP8_VERDICT_FILE="${DEVLOOP_TMP}/layer-7-vp8-verdict"
+readonly VP8_VERDICT_TOKEN_LIST=(browser-vp8-unsupported)
+readonly VP8_PROBE_SUBCHECKS=(webcodecs_unavailable encoder_config_unsupported decoder_config_unsupported encode_failed encode_timeout decode_failed decode_timeout dimension_mismatch)
+
 # Wall-clock budgets, one PER SUITE (the browser suite must never eat the Rust suite's
 # budget, or vice versa); Phase-1 bring-up is unbounded here (the helper enforces its own
 # setup timeout). 600s matches the `all` feature envelope; the browser default covers the
@@ -262,6 +277,99 @@ __devloop_cluster_name() {
 }
 __kind_context() {  # $1 = cluster name
   printf 'kind-%s' "$1"
+}
+
+# Story 3 R-28: resolve the DEPLOYED media-codec-profile and dump it for the browser suite's VP8
+# substrate probe. The ConfigMap is content-addressed (hash-suffixed, ADR-0038 §2), so its name
+# is read off the LIVE mc-service pods — MC is the service that directs the codec to browsers —
+# the same rule as crates/env-tests/src/fixtures/kube.rs:resolve_generation: skip terminating
+# pods, collect every configMapKeyRef / configMapRef / volume / projected-volume ConfigMap name,
+# refuse a BARE (unhashed) name, and require EXACTLY ONE `media-codec-profile-<hash>` generation,
+# <hash> being kustomize's 10 lowercase-alphanumeric characters (zero = not wired; more = a
+# rollout in flight).
+# ANCHOR (DRY): a deliberate bash TWIN of kube.rs's resolve_generation / referenced_configmaps /
+# is_generation_of (bash cannot call the Rust). Held to the same cases by scripts/layer7.test.sh
+# (projected volume, wrong-length hash, bare name, 0/2 generations); change both together. Then the ConfigMap's data, every key, verbatim. Reads only
+# pods and that one ConfigMap — never a Secret. Every failure is decided on exit status /
+# counts, pre-suite, and is the OPERATOR lane: media-codec-profile-unresolved.
+# Args: $1=kube context  $2=output file
+__dump_media_codec_profile() {
+  local context="$1" out="$2" pods_json names gen
+  local err="${DEVLOOP_TMP}/layer-7-media-codec-profile.stderr.log"
+  local fix="kubectl --context ${context} -n dark-tower get pods -l app=mc-service -o yaml | grep media-codec-profile; wait for an in-flight rollout to settle, or redeploy (dev-cluster deploy), then re-run Layer 7"
+  pods_json="$("$KUBECTL_BIN" --context "$context" -n dark-tower get pods -l app=mc-service -o json 2>"$err")" \
+    || precondition_fail media-codec-profile-unresolved \
+      "could not list the mc-service pods in context ${context} to resolve the deployed media-codec-profile: $(tail -n 3 "$err" | tr '\n' ' ')" \
+      "$fix"
+  # A jq failure is its OWN cause (an unparseable pod list), never folded into the
+  # "0 generations = not wired" branch below — same device as the kubectl call above.
+  names="$(jq -r '
+      [ .items[] | select(.metadata.deletionTimestamp == null) | .spec as $s
+        | ( ([$s.containers[]?, $s.initContainers[]?]
+              | map((.env[]?.valueFrom.configMapKeyRef.name // empty),
+                    (.envFrom[]?.configMapRef.name // empty))[]),
+            ($s.volumes[]?.configMap.name // empty),
+            ($s.volumes[]?.projected.sources[]?.configMap.name // empty) ) ]
+      | map(select(startswith("media-codec-profile"))) | unique | .[]' <<<"$pods_json" 2>>"$err")" \
+    || precondition_fail media-codec-profile-unresolved \
+      "could not parse the mc-service pod list: $(tail -n 3 "$err" | tr '\n' ' ')" \
+      "$fix"
+  if grep -qx 'media-codec-profile' <<<"$names"; then
+    precondition_fail media-codec-profile-unresolved \
+      "a live mc-service pod references the BARE ConfigMap name media-codec-profile: it is not content-addressed (ADR-0038 §2), so the deployed profile cannot be identified" \
+      "$fix"
+  fi
+  names="$(grep -xE 'media-codec-profile-[a-z0-9]{10}' <<<"$names" || true)"
+  if [[ -z "$names" || "$(printf '%s\n' "$names" | wc -l)" -ne 1 ]]; then
+    precondition_fail media-codec-profile-unresolved \
+      "the live mc-service pods reference $( [[ -z "$names" ]] && echo 0 || printf '%s\n' "$names" | wc -l) generation(s) of the media-codec-profile ConfigMap (need exactly one: zero = not wired, more = a rollout in flight)" \
+      "$fix"
+  fi
+  gen="$names"
+  # A multi-line value cannot be one `KEY=value` line: refused (jq error → non-zero), never
+  # truncated into a silently different profile.
+  "$KUBECTL_BIN" --context "$context" -n dark-tower get configmap "$gen" -o json 2>>"$err" \
+    | jq -r '.data // {} | to_entries[]
+        | if (.value | test("\n")) then error("multi-line value") else "\(.key)=\(.value)" end' \
+    >"$out" 2>>"$err" \
+    || precondition_fail media-codec-profile-unresolved \
+      "could not read the deployed ConfigMap ${gen} (or a value spans lines): $(tail -n 3 "$err" | tr '\n' ' ')" \
+      "kubectl --context ${context} -n dark-tower get configmap ${gen} -o yaml"
+  if [[ ! -s "$out" ]]; then
+    precondition_fail media-codec-profile-unresolved \
+      "the deployed ConfigMap ${gen} has no data" \
+      "kubectl --context ${context} -n dark-tower get configmap ${gen} -o yaml; redeploy (dev-cluster deploy)"
+  fi
+}
+
+# Story 3 R-28: route a FAILED browser suite by the VP8 verdict file, fail-closed. Calls
+# precondition_fail (does not return) ONLY when line 1 is exactly a VP8_VERDICT_TOKEN_LIST token
+# AND line 2 is exactly a VP8_PROBE_SUBCHECKS member; returns 1 otherwise (the caller keeps
+# today's FAIL). No file, an empty file, a garbage token, or a bad sub-check all stay FAIL — a
+# forged file can at most turn a FAIL into a loud halt, never into green. Only validated values
+# reach the status output; the file is never echoed.
+__route_vp8_verdict() {
+  [[ -f "$VP8_VERDICT_FILE" ]] || return 1
+  local line1 line2 token="" sub="" t
+  line1="$(sed -n 1p "$VP8_VERDICT_FILE")"
+  line2="$(sed -n 2p "$VP8_VERDICT_FILE")"
+  for t in "${VP8_VERDICT_TOKEN_LIST[@]}"; do
+    if [[ "$line1" == "$t" ]]; then token="$t"; fi
+  done
+  if [[ -z "$token" ]]; then
+    printf 'Layer7: a VP8 verdict file exists but line 1 is not a routable token — NOT routed; the browser failure stays FAIL (implementer lane).\n' >&2
+    return 1
+  fi
+  for t in "${VP8_PROBE_SUBCHECKS[@]}"; do
+    if [[ "$line2" == "$t" ]]; then sub="$t"; fi
+  done
+  if [[ -z "$sub" ]]; then
+    printf 'Layer7: the VP8 verdict file names %s but line 2 is not a known probe sub-check — NOT routed; the browser failure stays FAIL (implementer lane).\n' "$token" >&2
+    return 1
+  fi
+  precondition_fail "$token" \
+    "the browser test substrate cannot encode/decode VP8 at the DEPLOYED media-codec-profile (R-28) — failed sub-check: ${sub} (*_timeout = a WebCodecs step hung, *_failed = it errored or produced nothing). Probed profile: ${MEDIA_CODEC_PROFILE_DUMP}; the probe's own error in ${BROWSER_E2E_LOG} prints its values" \
+    "FIRST check whether this change touched infra/services/media-codec-profile/ or the Kind profile patch (infra/kubernetes/overlays/kind/services/media-codec-profile/) — a profile Chromium cannot encode lands here, not as a test FAIL. Otherwise check the Playwright Chromium pin/bake (infra/devloop). Never edit the probe to pass; docs/runbooks/devloop-validation.md §6.7"
 }
 
 # Wait (bounded) for the cluster to become healthy. `dev-cluster deploy` itself waits for
@@ -1360,6 +1468,18 @@ __layer7_main() {
       "no Playwright Chromium installation under ${PLAYWRIGHT_BROWSERS_DIR} — the browser E2E suite cannot launch a browser" \
       "run 'pnpm exec playwright install chromium' (the devloop image is expected to bake it; see infra/devloop/Dockerfile)"
   fi
+  # Story 3 R-28, the VP8 substrate probe's inputs. The verdict file is REMOVED first, so only
+  # this run's global-setup can write it (a stale one could otherwise route this run). Then the
+  # DEPLOYED profile is resolved and dumped — the probe runs at the profile the cluster directs,
+  # so INF-C's Kind test-profile patch is probed by construction. The probe itself runs in the
+  # browser suite's global-setup (Phase 2), FIRST: a pre-suite run here is impossible without a
+  # TS runner outside Playwright, and a Playwright run would trigger global-setup's cohort
+  # registration (AC budget). Residual, accepted: a substrate defect surfaces only after the
+  # Rust suite, and not at all on an attempt whose Rust suite fails.
+  rm -f "$VP8_VERDICT_FILE" "$MEDIA_CODEC_PROFILE_DUMP"
+  export E2E_VP8_VERDICT_FILE="$VP8_VERDICT_FILE"
+  __dump_media_codec_profile "$(__kind_context "$cluster_name")" "$MEDIA_CODEC_PROFILE_DUMP"
+  export E2E_MEDIA_CODEC_PROFILE_ENV="$MEDIA_CODEC_PROFILE_DUMP"
   emit_step_duration browser-e2e-preconditions "$t_step"
 
   # (i) MH gRPC port-forwards for the env-test suite (story 2 task 11). The MH teardown
@@ -1476,9 +1596,18 @@ __layer7_main() {
     set -e
     emit_step_duration browser-e2e "$t_step"
 
-    if [[ "$browser_rc" -eq 0 ]]; then
+    if [[ "$browser_rc" -eq 0 && -e "$VP8_VERDICT_FILE" ]]; then
+      # A green suite cannot have written an unsupported verdict (global-setup throws right
+      # after writing it). Contradictory evidence is LOUD, never a silent green.
+      printf 'Layer7: the browser suite exited 0 but the VP8 verdict file %s exists — contradictory (global-setup writes it only on an unsupported verdict and then throws). Treated as FAIL; inspect %s.\n' \
+        "$VP8_VERDICT_FILE" "$BROWSER_E2E_LOG" >&2
+      emit_status FAIL browser-e2e-failed | tee_collect_statuses
+    elif [[ "$browser_rc" -eq 0 ]]; then
       emit_status OK browser-e2e-passed | tee_collect_statuses
     else
+      # Story 3 R-28: an UNSUPPORTED VP8 verdict (validated) is the OPERATOR lane; every other
+      # non-zero stays the implementer lane below. No output grep — the verdict file only.
+      __route_vp8_verdict || true
       # No grep (same rule as the Rust suite). Playwright's retained failure artifacts
       # live OUTSIDE DEVLOOP_TMP and can contain live tokens — named here so triage finds
       # them, flagged so nobody promotes them off the workstation.

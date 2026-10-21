@@ -363,6 +363,12 @@ export interface JoinedBusEvent {
   readonly userId: string;
   readonly participants: ReadonlyArray<{ participantId: string; name: string }>;
   readonly mediaServers: readonly string[];
+  /**
+   * The meeting-scoped sender id (`JoinResponse.sender_id`), STRINGIFIED, as the
+   * bus emits it. Optional in the type only: the video evidence helpers
+   * (`receiveEvidence.ts:joinBoundSenderId`) throw when it is absent.
+   */
+  readonly senderId?: string;
 }
 
 /** Open the join view and fill the meeting code (shared by both join drivers). */

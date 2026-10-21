@@ -5,6 +5,17 @@
 // warn-and-continue (a masked precondition becomes a cryptic mid-spec timeout).
 //
 // Order:
+//   0. Story 3 R-28: the VP8 SUBSTRATE PROBE (`./vp8Probe`), FIRST — before any
+//      other check and before cohort registration, so a browser that cannot
+//      encode/decode VP8 at the DEPLOYED profile fails in seconds and spends no
+//      AC budget. The profile is the deployed `media-codec-profile` ConfigMap,
+//      dumped by `scripts/layer7.sh` (Phase 1g) to `E2E_MEDIA_CODEC_PROFILE_ENV`;
+//      there is NO fallback to the repo file (that would probe the base profile,
+//      not the Kind patch). On an UNSUPPORTED verdict — and only then — the
+//      verdict is written to `E2E_VP8_VERDICT_FILE` (token + sub-check) for
+//      layer7.sh to route to PRECONDITION_FAILURE; every harness error (unset
+//      variable, unreadable or malformed profile, page crash) writes NOTHING and
+//      stays the FAIL lane, because by then Phase 1g has proven the environment.
 //   1. Dev WebTransport cert fingerprints exist (MC + MH) — without them the
 //      browser refuses the MC/MH handshakes and assertion (b) can only time out.
 //   2. Host-side Kind cluster reachable: AC + GC health, Prometheus healthy
@@ -16,7 +27,7 @@
 //      worker after a failing test (see ./cohort's header). Playwright starts
 //      the `webServer` plugin BEFORE global setup, so the UI is up.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright/test';
 // Reuse the ONE fingerprints parser (writer: scripts/generate-dev-certs.sh, which
@@ -32,9 +43,73 @@ import {
   parseAcAuthRateLimit,
   SUITE_RECEIVE_SLOTS,
 } from './cohort.js';
-import { serviceConfigEnvPath } from './configEnv.js';
+import { readVideoProfile, serviceConfigEnvPath, type VideoCodecProfile } from './configEnv.js';
 import { describeEnv, e2eEnv } from './env.js';
 import { registerCohort } from './fixtures.js';
+import {
+  runVp8ProbeInBrowser,
+  vp8VerdictFileBody,
+  VP8_UNSUPPORTED_REASON,
+  type Vp8ProbeVerdict,
+} from './vp8Probe.js';
+
+/** The deployed profile file layer7.sh dumps (Phase 1g). Required — no fallback. */
+const MEDIA_CODEC_PROFILE_ENV_VAR = 'E2E_MEDIA_CODEC_PROFILE_ENV';
+/** Where an UNSUPPORTED verdict is written for layer7.sh to route (unset outside Layer 7). */
+const VP8_VERDICT_FILE_VAR = 'E2E_VP8_VERDICT_FILE';
+
+/**
+ * Step 0: the VP8 substrate probe at the DEPLOYED profile (R-28). Throws on an
+ * unsupported verdict (after writing it for layer7.sh) and on every harness
+ * error (writing nothing).
+ */
+async function probeVp8Substrate(): Promise<void> {
+  const profileFile = process.env[MEDIA_CODEC_PROFILE_ENV_VAR];
+  if (profileFile === undefined || profileFile === '') {
+    throw new Error(
+      `[e2e] ${MEDIA_CODEC_PROFILE_ENV_VAR} is not set: the VP8 substrate probe (R-28) needs the ` +
+        `DEPLOYED media-codec-profile. scripts/layer7.sh exports it (Phase 1g); for a manual run, ` +
+        `dump the live ConfigMap to a KEY=value file and point ${MEDIA_CODEC_PROFILE_ENV_VAR} at it ` +
+        `(see e2e/README.md "VP8 substrate probe"). There is deliberately no fallback to the repo file.`,
+    );
+  }
+  // A malformed deployed profile THROWS here (harness error, FAIL lane): Phase 1g
+  // already proved the ConfigMap was readable, so a parse failure is the tree's
+  // own config or this reader. `tests/configEnv.test.ts` (reader over the REAL
+  // profile.env) is the MANDATORY Layer-1–6 control that keeps a TS-side key
+  // rename from first surfacing here.
+  const profile: VideoCodecProfile = readVideoProfile(
+    readFileSync(profileFile, 'utf8'),
+    profileFile,
+  );
+  // No launch args at all: the probe synthesises an OffscreenCanvas frame (no
+  // getUserMedia, no camera), so it needs no flag — not even the fake-media pair.
+  const browser = await chromium.launch();
+  let verdict: Vp8ProbeVerdict;
+  try {
+    ({ verdict } = await runVp8ProbeInBrowser(browser, profile));
+  } finally {
+    await browser.close();
+  }
+  const probed =
+    `codec=${profile.codec} ${profile.width}x${profile.height} ` +
+    `${profile.frameRateHz}fps ${profile.maxBitrateBps}bps`;
+  if (verdict === 'pass') {
+    console.log(`[e2e] VP8 substrate probe OK (encode + decode at ${probed})`);
+    return;
+  }
+  const verdictFile = process.env[VP8_VERDICT_FILE_VAR];
+  if (verdictFile !== undefined && verdictFile !== '') {
+    writeFileSync(verdictFile, vp8VerdictFileBody(verdict));
+  }
+  throw new Error(
+    `[e2e] ${VP8_UNSUPPORTED_REASON}: this Chromium cannot round-trip VP8 at the deployed profile ` +
+      `(${probed}); failed sub-check: ${verdict}. The browser layer fails loudly — it never skips ` +
+      `and never degrades to audio-only (R-28). Fix: first check whether this change touched ` +
+      `infra/services/media-codec-profile/ or the Kind profile patch; otherwise check the ` +
+      `Playwright Chromium pin/bake (infra/devloop). Do not edit the probe to pass.`,
+  );
+}
 
 // ESM-safe repo-relative path (this file runs under Playwright's ESM loader —
 // no __dirname).
@@ -65,6 +140,9 @@ export default async function globalSetup(): Promise<void> {
   for (const line of describeEnv()) {
     console.log(`[e2e]   ${line}`);
   }
+
+  // --- 0. VP8 substrate probe (story 3 R-28) — FIRST ---
+  await probeVp8Substrate();
 
   // --- 1. Cert fingerprints (R-36) ---
   const hashes = loadCertFingerprints(FINGERPRINTS_JSON);

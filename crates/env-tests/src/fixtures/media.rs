@@ -37,6 +37,68 @@ pub const BINDING_DEADLINE: Duration = Duration::from_secs(30);
 /// than imported, because env-tests links no service crate (ADR-0028).
 pub const AUDIO_SEND_ID: u16 = 0;
 
+/// The uplink relay `stream_id` a publisher stamps on its VIDEO frames: MC's
+/// send id for the video stream (`signaling.proto::SendStream.stream_number`;
+/// MC's `MAIN_VIDEO_STREAM_NUMBER`, 1). Same hop-local, publisher-set,
+/// unauthenticated label as [`AUDIO_SEND_ID`], and named in prose for the same
+/// reason. The ONE home both media fixtures use (`fixtures/video` stamps it).
+pub const VIDEO_SEND_ID: u16 = 1;
+
+/// The relay hop-sequence sentinel every publisher fixture writes and MH never
+/// does: a received frame still carrying it was handed an un-rewritten relay
+/// region. The ONE home for the audio and video fixtures. It is the rewrite
+/// proof where the uplink label can equal the downlink slot id (audio 0 / slot
+/// 0, video 1 / slot 1), which slot equality alone cannot distinguish.
+pub const HOP_SENTINEL: u32 = 0xDEAD_BEEF;
+
+/// The fixed 64-byte signature placeholder every publisher fixture stamps.
+/// Not a signature (the fixtures are keyless); MH relays it byte-identically.
+#[must_use]
+pub fn fixture_signature() -> [u8; media_protocol::frame::SIGNATURE_SIZE] {
+    let mut signature = [0_u8; media_protocol::frame::SIGNATURE_SIZE];
+    for (i, b) in signature.iter_mut().enumerate() {
+        *b = u8::try_from(i % 251).unwrap_or(0);
+    }
+    signature
+}
+
+/// Exclusive ceiling on [`next_audio_sequence`].
+///
+/// `tests/26_mh_quic.rs` and `tests/35_mc_server_mute_teardown.rs` drive some
+/// phases with hand-rolled `audio_datagram(seq)` calls from phase FLOORS
+/// (`SEQ_MUTED = 1_000_000` and up). A sender's GoP counter must never regress
+/// while its sender id lives (ADR-0036 §2), and audio's counter IS its
+/// sequence, so the shared counter must stay BELOW the lowest floor, and on any
+/// one connection the bind phases (which draw from it) precede the floor
+/// phases. This ceiling makes the first half a checked invariant rather than a
+/// coincidence; the second is the order those suites already run in.
+pub const AUDIO_SEQUENCE_CEILING: u32 = 1_000_000;
+
+static NEXT_AUDIO_SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// The next audio stream sequence (and so GoP counter) for a send-until-received
+/// round.
+///
+/// Process-wide and strictly increasing, so a sender driven through several
+/// binding phases on one connection never sends a regressing counter (each call
+/// of [`bind_until_received_each`] used to restart at 1). Monotonic per sender
+/// because it is monotonic globally: threading a per-sender counter would change
+/// every binding call site, and the hand-rolled floor phases would still own
+/// their own sequences (see [`AUDIO_SEQUENCE_CEILING`]).
+///
+/// # Panics
+///
+/// Panics once the counter reaches [`AUDIO_SEQUENCE_CEILING`].
+pub fn next_audio_sequence() -> u32 {
+    let seq = NEXT_AUDIO_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        seq < AUDIO_SEQUENCE_CEILING,
+        "the shared audio sequence reached AUDIO_SEQUENCE_CEILING; it would collide with the \
+         hand-rolled phase floors in tests 26/35 and regress a sender's GoP counter"
+    );
+    seq
+}
+
 /// A frame-v3 audio datagram through the production codec, with the real uplink
 /// relay stream id ([`AUDIO_SEND_ID`]), a hop-sequence sentinel a correct relay
 /// must rewrite, and a payload marker naming the sender (MH is keyless: payload
@@ -44,6 +106,14 @@ pub const AUDIO_SEND_ID: u16 = 0;
 ///
 /// Hoisted from `tests/27_mc_slot_placement.rs` at story 2 task 10, when
 /// `26_mh_quic.rs` became its second consumer.
+///
+/// The GoP counter is CALLER-DRIVEN (it equals `stream_sequence`): the caller
+/// owns monotonicity per sender — [`bind_until_received_each`] draws from
+/// [`next_audio_sequence`], and the floor-phase suites from their own floors.
+/// MH relies on nothing about audio counters (audio never waits for a group
+/// start, and a recovery request on a datagram slot is `unmapped_slot`). The
+/// payload is MARKER-ONLY (no key id), unlike `fixtures/video`'s frames, which
+/// lead with an 8-byte key id because a 16-bit sender id does not fit a marker.
 ///
 /// ANCHOR (DRY): this is a deliberate TWIN of
 /// `crates/mh-service/tests/common/media_frame.rs` (the mh-service forward-path
@@ -56,12 +126,9 @@ pub const AUDIO_SEND_ID: u16 = 0;
 /// layout; two homes is the accepted cost, kept equal in shape, not by import.
 pub fn audio_datagram(stream_sequence: u32, marker: u8) -> bytes::Bytes {
     use media_protocol::codec::{encode_frame, MediaFrameParts};
-    use media_protocol::frame::{FrameFlags, SIGNATURE_SIZE};
+    use media_protocol::frame::FrameFlags;
     let payload = vec![marker; 160];
-    let mut signature = [0_u8; SIGNATURE_SIZE];
-    for (i, b) in signature.iter_mut().enumerate() {
-        *b = u8::try_from(i % 251).unwrap_or(0);
-    }
+    let signature = fixture_signature();
     encode_frame(&MediaFrameParts {
         flags: FrameFlags {
             independently_decodable: true,
@@ -78,7 +145,7 @@ pub fn audio_datagram(stream_sequence: u32, marker: u8) -> bytes::Bytes {
         stream_id: AUDIO_SEND_ID,
         // A sentinel MH never writes: `assert_relayed_on_slot` proves the
         // relay rewrite through it (see there).
-        hop_sequence: 0xDEAD_BEEF,
+        hop_sequence: HOP_SENTINEL,
         payload: &payload,
         signature: &signature,
     })
@@ -126,7 +193,6 @@ pub async fn bind_until_received_each(
     let mut seen: HashMap<u8, bytes::Bytes> = HashMap::new();
     let mut counts: HashMap<u8, usize> = HashMap::new();
     let deadline = Instant::now() + BINDING_DEADLINE;
-    let mut seq = 0u32;
     while senders
         .iter()
         .any(|(_, m)| counts.get(m).copied().unwrap_or(0) < per_sender)
@@ -141,7 +207,7 @@ pub async fn bind_until_received_each(
             per_sender,
             senders.len(),
         );
-        seq += 1;
+        let seq = next_audio_sequence();
         for (conn, marker) in senders {
             // The send error is NOT discarded. A dropped `Err` here makes the
             // deadline message above ambiguous between "MH forwarded nothing"
@@ -214,7 +280,7 @@ pub fn assert_relayed_on_slot(
     // one; the hop-sequence sentinel can, on every slot.
     assert_ne!(
         view.hop_sequence(),
-        0xDEAD_BEEF,
+        HOP_SENTINEL,
         "{phase}: MH writes its own hop sequence"
     );
     // Re-encode exactly what was sent for this sequence number.
@@ -266,5 +332,44 @@ pub async fn drain(conn: &wtransport::Connection, mut each: impl FnMut(u8, u32, 
     {
         let (marker, seq, slot) = read_frame(&d.payload());
         each(marker, seq, slot);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_datagram_stamps_the_audio_send_id_and_a_gop_equal_to_its_sequence() {
+        for seq in [1_u32, 2, 77, 999_999] {
+            let raw = audio_datagram(seq, 0xA5);
+            let view = media_protocol::codec::decode_datagram(&raw).expect("decodes");
+            assert_eq!(view.stream_id(), AUDIO_SEND_ID);
+            assert_eq!(
+                view.stream_id(),
+                0,
+                "audio's send id is 0 (MC's MAIN_AUDIO_STREAM_NUMBER)"
+            );
+            assert_eq!(view.stream_sequence(), seq);
+            assert_eq!(view.gop_counter(), seq, "every audio frame starts a group");
+            assert!(view.flags().independently_decodable);
+            assert!(!view.flags().discardable && !view.flags().key_bearing);
+        }
+    }
+
+    #[test]
+    fn send_ids_are_the_contract_values() {
+        assert_eq!((AUDIO_SEND_ID, VIDEO_SEND_ID), (0, 1));
+    }
+
+    #[test]
+    fn next_audio_sequence_is_strictly_increasing_and_below_the_ceiling() {
+        let mut last = next_audio_sequence();
+        for _ in 0..1000 {
+            let next = next_audio_sequence();
+            assert!(next > last, "the shared audio sequence must never regress");
+            assert!(next < AUDIO_SEQUENCE_CEILING);
+            last = next;
+        }
     }
 }

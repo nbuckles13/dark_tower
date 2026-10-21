@@ -189,3 +189,93 @@ export function assertCohortFitsAuthWindow(receiveSlots: number, limit: AcAuthRa
     );
   }
 }
+
+// ---------------------------------------------------------------------------
+// STORY 3: per-participant publish sets and per-kind N / M
+// ---------------------------------------------------------------------------
+//
+// A video scenario gives each cohort member a publish set and its own audio N
+// and video M. The cohort is still REGISTERED ONCE per run (global setup, the
+// size above). A scenario plan only selects and configures members of that one
+// cohort, so a video scenario spends no extra AC registration budget. The limit
+// is still read from AC's config by `parseAcAuthRateLimit`.
+//
+// The per-member settings reach the app per BROWSING CONTEXT, through the test
+// levers (`src/lib/testLevers.ts`, the client's). One dev server serves every
+// context, so a build-time variable cannot vary them. `leversForPlan` produces
+// exactly the agreed lever names. The app's strict lever parser learns
+// `publish` and `videoReceiveSlots` in the client's publish-path task. Until
+// then no spec passes them.
+
+/**
+ * What a participant publishes (`none` is receive-only). The four values are
+ * listed once; {@link PublishSet} is derived from them.
+ */
+export const PUBLISH_SETS = ['audio', 'video', 'both', 'none'] as const;
+export type PublishSet = (typeof PUBLISH_SETS)[number];
+
+/** One cohort member's role in a scenario. */
+export interface CohortMemberPlan {
+  readonly publish: PublishSet;
+  /** Audio receive slots N declared by this member. */
+  readonly audioReceiveSlots: number;
+  /** Video receive slots M declared by this member. */
+  readonly videoReceiveSlots: number;
+}
+
+/**
+ * Fail at plan time when a scenario plan does not fit the cohort registered
+ * once for this run (`registeredSize` members), or declares something the
+ * levers cannot carry. Never registers more accounts to make it fit; raising
+ * the registered cohort is a budget decision (README §Budgets).
+ */
+export function assertPlanFitsCohort(
+  plan: readonly CohortMemberPlan[],
+  registeredSize: number,
+): void {
+  if (plan.length < 1) throw new RangeError('a cohort plan needs at least one member');
+  if (plan.length > registeredSize) {
+    throw new Error(
+      `the scenario plan has ${plan.length} members but the run registered ${registeredSize} ` +
+        `(once, in global setup, within AC's auth-rate window). Use fewer members or raise the ` +
+        `registered cohort as a budget decision (e2e/README.md §Budgets); never register per scenario.`,
+    );
+  }
+  plan.forEach((m, i) => {
+    if (!(PUBLISH_SETS as readonly string[]).includes(m.publish)) {
+      throw new RangeError(`plan member ${i}: unknown publish set '${String(m.publish)}'`);
+    }
+    for (const [key, n] of [
+      ['audioReceiveSlots', m.audioReceiveSlots],
+      ['videoReceiveSlots', m.videoReceiveSlots],
+    ] as const) {
+      if (!Number.isInteger(n) || n < 0) {
+        throw new RangeError(`plan member ${i}: ${key} must be an integer >= 0 (got ${n})`);
+      }
+    }
+    if (m.publish === 'none' && m.audioReceiveSlots === 0 && m.videoReceiveSlots === 0) {
+      // MC refuses a participant that would neither publish nor receive.
+      throw new RangeError(`plan member ${i}: neither publishes nor receives (MC refuses it)`);
+    }
+  });
+}
+
+/** The per-context lever values for one plan member (agreed names). */
+export interface PlanLevers {
+  readonly publish: PublishSet;
+  /** audio N; renamed to audioReceiveSlots with VITE_DT_AUDIO_RECEIVE_SLOTS in C-A1 (task 11) */
+  readonly receiveSlots: string;
+  readonly videoReceiveSlots: string;
+}
+
+/**
+ * The levers for one member. The slot counts are strings because the SDK's
+ * `parseReceiveSlots` parses them strictly, as for the existing `receiveSlots`.
+ */
+export function leversForPlan(member: CohortMemberPlan): PlanLevers {
+  return {
+    publish: member.publish,
+    receiveSlots: String(member.audioReceiveSlots),
+    videoReceiveSlots: String(member.videoReceiveSlots),
+  };
+}

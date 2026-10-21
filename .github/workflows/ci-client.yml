@@ -10,8 +10,13 @@ name: CI Client
 #               Requires dt-guard binary → Rust stable build in this job.
 #   unit      — vitest run --coverage; sdk-core ≥90% gate enforced by vitest
 #               thresholds (R-41); Codecov upload.
-#   component — Chromium provisioned forward-compat (R-43 browser-mode tests
-#               arrive with task #15); today's test:component is node-based.
+#   component — Chromium; `test:component` is vitest BROWSER mode (R-43
+#               component tests), and includes the story-3 R-28 VP8 SUBSTRATE
+#               PROBE (packages/web-app/src/__tests__/vp8Probe.test.ts), which
+#               encodes + decodes one VP8 frame at the repo's base
+#               media-codec-profile. A substrate that cannot do VP8 FAILS this
+#               job; it never skips. That probe reads
+#               infra/services/media-codec-profile/, hence the paths entry.
 #
 # Base-ref for TS guards (T2): dt-guard ts-no-test-removal calls
 # scripts/lang/_get_base_ref.sh which in PR mode resolves to
@@ -35,6 +40,9 @@ on:
       - 'proto/buf.gen.yaml'
       - '.github/workflows/ci-client.yml'
       - '.nvmrc'
+      # The VP8 substrate probe's profile (story 3 R-28): a profile-only change
+      # must re-run the component-tier probe.
+      - 'infra/services/media-codec-profile/**'
   # Manual run on any branch (e.g. a branch whose PR targets neither main nor develop).
   workflow_dispatch:
 

@@ -113,6 +113,30 @@ Suites run in parallel against shared pods, so:
 
 `tests/29_mh_meeting_teardown.rs` is the worked example.
 
+### Media fixtures (ADR-0036; story 3)
+
+Keyless, black-box clients for the media path. They build and parse frames only through the production `media-protocol` codec, hold no key material, and log nothing: GoP counters, stream and slot ids, key-id senders and lengths are returned values only (R-30).
+
+- **Audio** — `src/fixtures/media.rs`. One frame-v3 datagram per frame, marker-only payload, uplink relay `stream_id` = `AUDIO_SEND_ID` (0). `gop_counter` equals `stream_sequence`, because every audio frame starts a group. The send-until-received loop draws its sequences from one process-wide, strictly increasing `next_audio_sequence()`, which is capped below `AUDIO_SEQUENCE_CEILING`, the lowest hand-rolled phase floor in tests 26 and 35. So a sender's counter never regresses across phases.
+- **Video** — `src/fixtures/video/` (module docs carry the full contract). The video tests depend on MH-A1 (task 8), MH-A2 (task 9) and MH-B (task 10).
+  - **`VideoPublisher`** sends one uni stream per group of pictures, written through `encode_frame`.
+    - **Group start, `GroupStartSource`**: one knob, default `None`. It is also the never-keying source for MH-B's pending gauge.
+      - `OnKeyframeRequest { min_interval }` answers `MhServerMessage.keyframe_request` read from the MH carrier stream. It acts only on the directed stream with a counter ≥ the current one, and defers one in-interval request rather than refusing it.
+      - `Periodic(interval)` starts a group on tokio time. **It is fixture-only and never a production keyframe interval**: ADR-0036 as amended has none, and keyframes are on demand only.
+    - **Independent knobs**: the uplink label (default: the directed send id `VIDEO_SEND_ID` = 1; override to relabel or to use an undeclared id) and the transport (uni-stream-per-group or one ≤MTU datagram per frame).
+    - **Modes**: `KeepSendingWhileMuted` is the R-16 patched client, `StallMidFrame` the R-21 stall, and `ResetMidGroup` the R-12 abandonment.
+    - Every request and group start goes into one ordered event log.
+    - A compliant publisher finishes its group stream on withdrawal and starts a NEW group (`Resume`, next counter) when re-directed. MH's STOP_SENDING on a stream (a stream-path attribution drop) is an observable `StoppedByPeer` outcome, never a fixture panic.
+  - **`VideoSubscriber`** reads every incoming uni stream with the chunk-fed `HeaderReader`, enforcing the maximum payload before any allocation. Per frame it reports the key-id sender, relay slot id, hop sequence, `gop_counter` and whether the frame is independently decodable. Per stream it reports first-frame-is-a-group-start, slot change within the stream, and finish / reset / partial. `next()` reports `Quiet` only while the connection is live, so an absence assertion cannot pass on a dead subscriber.
+  - **`send_recovery_request`** writes `recovery_request { slot_id, sender_id, gop_counter }` with every field explicit.
+  - MH's expected outcome table (`unmatched_stream`, `transport_mismatch`, `server_muted`, PAUSED forwarding, the recovery outcomes) is pinned in `src/fixtures/video/mod.rs` as what the consuming env-tests assert. The fixtures' own hermetic tests assert no MH behaviour.
+
+### Per-file edge-sum header rule
+
+Every env-test file that opens media sessions states in its header the sum, over its **concurrently running** test fns, of **P × (N+M)**: participants, times the audio plus video receive slots each declares. `cargo test` runs one file's test fns in parallel and the files one after another, so that per-file sum is the load the Kind cluster carries at once.
+
+INF-C (story 3 task 16) sizes the Kind ceiling at about 120 against the largest per-file sum, 72 (`27_mc_slot_placement`). A change that pushes a file past the ceiling must, in the same change, either serialise that file's fns or re-size the budget.
+
 ## Future Work
 
 - Resilience tests: pod restart recovery, network partition, DB connection loss (see TODO.md)

@@ -1,10 +1,15 @@
 import { defineConfig } from 'vitest/config';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { playwright } from '@vitest/browser-playwright';
+import { readFileSync } from 'node:fs';
 import { sdkSourceAliases } from './vite/sourceAliases.js';
+import { vp8ProbeProfileDefine } from './e2e/configEnv.js';
 
 // R-43: REAL Vitest Browser Mode (Chromium) component tests for the demo
-// views + the E2E bus. Mocks `MeetingSession`; no real WebTransport/WebCodecs.
+// views + the E2E bus. Mocks `MeetingSession`; no real WebTransport.
+// EXCEPTION, story 3 R-28: `src/__tests__/vp8Probe.test.ts` runs the VP8
+// substrate probe on REAL WebCodecs in this Chromium, at the base
+// media-codec-profile injected below via `vp8ProbeProfileDefine`.
 // `retries: 0` per ADR-0028 flaky policy. All build-time defines are mirrored
 // here (@observability/@test REQ-2) so telemetry-touching imports resolve.
 export default defineConfig({
@@ -21,6 +26,12 @@ export default defineConfig({
     // Enabled so the `window.__darktower_test__` bus is exercisable at this tier.
     __E2E_HOOKS__: JSON.stringify(true),
     __DEV_CERT_SHA256_HASHES__: JSON.stringify([]),
+    // Story 3 R-28: the VP8 substrate probe's profile for the component-tier
+    // caller (`src/__tests__/vp8Probe.test.ts`) — the repo's BASE
+    // media-codec-profile, read through THE one reader (`e2e/configEnv.ts`),
+    // never restated. Test runner only: deliberately absent from vite.config.ts,
+    // so it can never reach an app build.
+    ...vp8ProbeProfileDefine((path) => readFileSync(path, 'utf8')),
   },
   resolve: {
     alias: sdkSourceAliases,

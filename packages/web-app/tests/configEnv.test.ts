@@ -6,6 +6,10 @@ import { describe, expect, it } from 'vitest';
 import {
   MC_KEK_ROTATION_DEBOUNCE_KEY,
   mcConfigRsPath,
+  mediaCodecProfilePath,
+  readVideoProfile,
+  VP8_PROBE_PROFILE_DEFINE,
+  vp8ProbeProfileDefine,
   parseConfigEnv,
   parseMcDefaultGraceSeconds,
   readMcRotationTimings,
@@ -66,5 +70,108 @@ describe('MC rotation timings', () => {
     const t = readMcRotationTimings(readFileSync(env, 'utf8'), env, readFileSync(rs, 'utf8'), rs);
     expect(t.debounceSeconds).toBeGreaterThanOrEqual(1);
     expect(t.graceSeconds).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Story 3 R-28: the media codec profile reader (the VP8 probe's ONE profile source)
+// ---------------------------------------------------------------------------
+//
+// MANDATORY POSITIVE CONTROL — do not skip, weaken or delete. The Layer-7 probe
+// reads the DEPLOYED profile through `readVideoProfile`; a key renamed on the TS
+// side would otherwise first surface there, after the whole Rust suite. Reading
+// the REAL `profile.env` here makes that a Layer-1–6 FAIL.
+
+/** The file's own `KEY=value` for `key`, read with a regex independent of the reader. */
+function fileValue(text: string, key: string): string {
+  const m = new RegExp(`^${key}=(\\S+)\\s*$`, 'm').exec(text);
+  if (m?.[1] === undefined) throw new Error(`test setup: profile.env has no ${key} line`);
+  return m[1];
+}
+
+describe('readVideoProfile', () => {
+  const path = mediaCodecProfilePath();
+  const text = readFileSync(path, 'utf8');
+
+  it('reads the REAL base profile.env, value for value', () => {
+    expect(readVideoProfile(text, path)).toEqual({
+      codec: fileValue(text, 'MEDIA_VIDEO_CODEC'),
+      width: Number(fileValue(text, 'MEDIA_VIDEO_WIDTH')),
+      height: Number(fileValue(text, 'MEDIA_VIDEO_HEIGHT')),
+      frameRateHz: Number(fileValue(text, 'MEDIA_VIDEO_FRAME_RATE_HZ')),
+      maxBitrateBps: Number(fileValue(text, 'MEDIA_VIDEO_MAX_BITRATE_BPS')),
+    });
+  });
+
+  const valid = [
+    'MEDIA_VIDEO_CODEC=vp8',
+    'MEDIA_VIDEO_WIDTH=320',
+    'MEDIA_VIDEO_HEIGHT=180',
+    'MEDIA_VIDEO_FRAME_RATE_HZ=15',
+    'MEDIA_VIDEO_MAX_BITRATE_BPS=250000',
+  ];
+
+  it('reads a deployed-style dump (every key, any order, unrelated keys ignored)', () => {
+    const dump = ['MEDIA_AUDIO_CODEC=opus', ...valid.slice().reverse()].join('\n');
+    expect(readVideoProfile(dump, 'dump.env')).toEqual({
+      codec: 'vp8',
+      width: 320,
+      height: 180,
+      frameRateHz: 15,
+      maxBitrateBps: 250_000,
+    });
+  });
+
+  it.each(valid.map((line) => line.split('=')[0]!))('a missing %s throws, naming it', (key) => {
+    const without = valid.filter((l) => !l.startsWith(`${key}=`)).join('\n');
+    expect(() => readVideoProfile(without, 'dump.env')).toThrow(`dump.env declares no ${key}`);
+  });
+
+  it.each(['h264', '', 'VP8'])('an unsupported codec (%j) throws', (codec) => {
+    const text2 = valid.map((l) =>
+      l.startsWith('MEDIA_VIDEO_CODEC=') ? `MEDIA_VIDEO_CODEC=${codec}` : l,
+    );
+    expect(() => readVideoProfile(text2.join('\n'), 'dump.env')).toThrow(
+      /not a codec the probe checks/,
+    );
+  });
+
+  it('a non-integer dimension throws', () => {
+    const text2 = valid.map((l) =>
+      l.startsWith('MEDIA_VIDEO_WIDTH=') ? 'MEDIA_VIDEO_WIDTH=320.5' : l,
+    );
+    expect(() => readVideoProfile(text2.join('\n'), 'dump.env')).toThrow(/not a positive integer/);
+  });
+});
+
+describe('vp8ProbeProfileDefine: what vitest.config.ts injects is DERIVED, never restated', () => {
+  it('equals readVideoProfile over the real base profile.env', () => {
+    const path = mediaCodecProfilePath();
+    const define = vp8ProbeProfileDefine((p) => readFileSync(p, 'utf8'));
+    expect(Object.keys(define)).toEqual([VP8_PROBE_PROFILE_DEFINE]);
+    expect(JSON.parse(define[VP8_PROBE_PROFILE_DEFINE]!)).toEqual(
+      readVideoProfile(readFileSync(path, 'utf8'), path),
+    );
+  });
+
+  it('reads the file it is pointed at (a changed profile changes the define)', () => {
+    const define = vp8ProbeProfileDefine(
+      () =>
+        'MEDIA_VIDEO_CODEC=vp8\nMEDIA_VIDEO_WIDTH=2\nMEDIA_VIDEO_HEIGHT=4\nMEDIA_VIDEO_FRAME_RATE_HZ=6\nMEDIA_VIDEO_MAX_BITRATE_BPS=8\n',
+      'other.env',
+    );
+    expect(JSON.parse(define[VP8_PROBE_PROFILE_DEFINE]!)).toEqual({
+      codec: 'vp8',
+      width: 2,
+      height: 4,
+      frameRateHz: 6,
+      maxBitrateBps: 8,
+    });
+  });
+
+  it('vitest.config.ts injects it through the helper (one call, no literal)', () => {
+    const config = readFileSync(new URL('../vitest.config.ts', import.meta.url), 'utf8');
+    expect(config).toContain('...vp8ProbeProfileDefine(');
+    expect(config).not.toContain(VP8_PROBE_PROFILE_DEFINE);
   });
 });

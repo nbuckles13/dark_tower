@@ -87,6 +87,10 @@ media-protocol = { path = "../media-protocol" }
 tonic = { workspace = true }
 
 [dev-dependencies]
+# Paused tokio time for the hermetic video-fixture self-tests (`src/fixtures/video`):
+# no wall-clock sleeps anywhere (ADR-0036 §10). Same feature the service crates use.
+tokio = { workspace = true, features = ["test-util"] }
+
 # JWT validation
 jsonwebtoken = { workspace = true }
 

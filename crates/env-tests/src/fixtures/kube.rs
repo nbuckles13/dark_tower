@@ -144,6 +144,9 @@ pub fn live_pods_json(instance: &str) -> Value {
 ///   retired staleness test, depend on being impossible);
 /// - zero generations of `base` (the pod is not wired to it) or more than one
 ///   (a rollout in flight).
+// ANCHOR (DRY): `scripts/layer7.sh:__dump_media_codec_profile` is a bash TWIN of this rule
+// (with `referenced_configmaps` and `is_generation_of`) for the deployed media-codec-profile;
+// bash cannot call this. Change both together; `scripts/layer7.test.sh` mirrors these cases.
 pub fn resolve_generation(pods: &Value, instance: &str, base: &str) -> Result<String, String> {
     let items = pods
         .get("items")
