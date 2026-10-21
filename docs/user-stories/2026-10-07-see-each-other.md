@@ -951,7 +951,7 @@ tasks:
   slug: 2026-10-21-frame-header-v3-cutover
   tag: story-2026-10-07-see-each-other-task-6
 - id: 7
-  status: pending
+  status: completed
   specialist: test
   deps:
   - 1
@@ -1120,6 +1120,7 @@ tasks:
     - Test-bus projections carry no frame sizes, GoP values, key ids or per-stream timings.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-21-story3-video-test-infra
   tag: story-2026-10-07-see-each-other-task-7
 - id: 8
   status: pending
