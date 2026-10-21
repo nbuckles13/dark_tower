@@ -736,7 +736,7 @@ tasks:
   slug: 2026-10-20-media-codec-profile-config
   tag: story-2026-10-07-see-each-other-task-3
 - id: 4
-  status: pending
+  status: completed
   specialist: operations
   prompt: |-
     Video deploy order, v3 cutover and rollback, the video-off lever, send-directive wiring, and the premise sweep (docs/user-stories/2026-10-07-see-each-other.md, R-23 runbook rows, R-25, R-26 runbook half, R-31 directive-wiring and premise items; ADR-0036 §8 "two-ends-must-agree … loud mismatch", §11 eight required media scenarios, "A control's coverage must be demonstrated, not asserted" applied to prose). Task 4 (OPS-A), specialist operations. Dependencies: none. R-25 requires the deploy order to be written in the MH and MC deployment runbooks BEFORE the code lands, so this task runs on the first front, in parallel with task 1 (P1: protocol contract and the ADR-0036 R-36 amendment bundle) and task 3 (INF-A: the media config surface, the shared `media-codec-profile` ConfigMap, MC and MH keys, retirements, and the downward-API memory-limit guard). In anything you write into the repo, refer to other tasks by CODE only (for example "deleted by MC-B"), never by task number. Key names below are the confirmed final names from INF-A's design. If INF-A has landed when you start, cite the live keys in `infra/services/*/config.env` and the new `media-codec-profile` ConfigMap; if it has not, write the same names. Either way, at Gate 1 diff every key name you cite against INF-A's prompt or the tree, and reconcile any difference rather than writing a guess. This task is documentation only, with no code, manifest or alert-rule edits. It still carries R-25, so review it as load-bearing: pair with infrastructure (deploy tooling and key ordering), protocol (the skew paths) and observability (anchor and alert cross-references).
@@ -810,6 +810,7 @@ tasks:
     - Rollback across the v3 cutover is all components together (R-25). No runbook step proposes mixing v2 and v3 components.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-21-story3-ops-a-video-cutover-runbooks
   tag: story-2026-10-07-see-each-other-task-4
   tier: light
   tier_reason: docs-only runbook edits; no code, contract or security surface
