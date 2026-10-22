@@ -2,6 +2,7 @@
   "name": "@darktower/web-app",
   "version": "0.0.0",
   "private": true,
+  "license": "MIT OR Apache-2.0",
   "description": "Dark Tower minimal browser demo: sign-up / sign-in / create-meeting / meeting-join, wired to the SDK.",
   "type": "module",
   "scripts": {

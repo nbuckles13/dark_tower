@@ -2,6 +2,7 @@
   "name": "@darktower/sdk-core",
   "version": "0.0.0",
   "private": true,
+  "license": "MIT OR Apache-2.0",
   "description": "Dark Tower browser SDK core: WebTransport transport abstraction and length-prefix wire framing.",
   "type": "module",
   "exports": {
