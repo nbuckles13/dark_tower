@@ -1711,6 +1711,87 @@ mod tests {
         assert_eq!(occupants(&t, 1, VI), vec![Some(3)]);
     }
 
+    /// Reachable again, both kinds (depth 4+, past the exhaustive check): P
+    /// moving off S's handler frees both its slots and video refills to R; P
+    /// coming back (from another handler, then from no handler at all) is no
+    /// longer unreachable and refills only the FREE audio slot — R keeps
+    /// video.
+    #[test]
+    fn a_sender_reachable_again_refills_only_free_slots_in_both_kinds() {
+        let mut t = SlotTable::new();
+        t.admit(sender(1), kinds_of("AV")).unwrap(); // S
+        t.set_demand(sender(1), [vec![0], vec![1]]);
+        t.admit(sender(2), kinds_of("AV")).unwrap(); // P
+        t.admit(sender(3), kinds_of("")).unwrap(); // R
+        for s in 1..=3 {
+            t.set_connectivity(sender(s), on(&["mh-0"]));
+        }
+        assert_eq!(occupants(&t, 1, AU), vec![Some(2)]);
+        assert_eq!(occupants(&t, 1, VI), vec![Some(2)]);
+
+        t.set_connectivity(sender(2), on(&["mh-1"]));
+        assert_eq!(unreachable(&t, 1), vec![2]);
+        assert_eq!(occupants(&t, 1, AU), vec![None], "R publishes no audio");
+        assert_eq!(occupants(&t, 1, VI), vec![Some(3)]);
+
+        t.set_connectivity(sender(2), on(&["mh-0"]));
+        assert!(unreachable(&t, 1).is_empty());
+        assert_eq!(occupants(&t, 1, AU), vec![Some(2)]);
+        assert_eq!(
+            occupants(&t, 1, VI),
+            vec![Some(3)],
+            "an occupied slot never moves"
+        );
+
+        t.set_connectivity(sender(2), Some(ConnectedHandlers::new()));
+        assert!(
+            unreachable(&t, 1).is_empty(),
+            "not connected is not unreachable"
+        );
+        assert_eq!(occupants(&t, 1, AU), vec![None]);
+        t.set_connectivity(sender(2), all());
+        assert_eq!(occupants(&t, 1, AU), vec![Some(2)]);
+        assert_eq!(occupants(&t, 1, VI), vec![Some(3)]);
+        assert_properties(&t);
+    }
+
+    /// A video vector that grows (depth 4+, past the exhaustive check) refills
+    /// by rule (1): A holds S's audio slot and no video, so it takes the new
+    /// video slot over the earlier joiner R — as AVATAR_NO_VIDEO, rendering no
+    /// video edge.
+    #[test]
+    fn a_grown_video_slot_refills_by_rule_one_to_a_non_video_publisher() {
+        let mut t = SlotTable::new();
+        t.admit(sender(1), kinds_of("AV")).unwrap(); // S
+        t.set_demand(sender(1), [vec![0], vec![1]]);
+        t.admit(sender(2), kinds_of("")).unwrap(); // R
+        t.admit(sender(3), kinds_of("A")).unwrap(); // A
+        connect_all(&mut t, &[1, 2, 3]);
+        assert_eq!(occupants(&t, 1, AU), vec![Some(3)]);
+        assert_eq!(occupants(&t, 1, VI), vec![Some(2)], "rule (2): earliest");
+
+        t.set_demand(sender(1), [vec![0], vec![]]);
+        assert_eq!(occupants(&t, 1, VI), vec![]);
+        t.set_demand(sender(1), [vec![0], vec![1]]);
+        assert_eq!(occupants(&t, 1, AU), vec![Some(3)], "audio untouched");
+        assert_eq!(
+            occupants(&t, 1, VI),
+            vec![Some(3)],
+            "rule (1) completes the pair"
+        );
+
+        let render = t.render(handler_set().ids(), &t.quiet_mute()).unwrap();
+        assert!(
+            render
+                .per_handler
+                .values()
+                .flat_map(|p| &p.egress_streams)
+                .all(|p| !(p.subscriber == sender(1) && p.stream_number == 1)),
+            "a non-video occupant renders no video edge"
+        );
+        assert_properties(&t);
+    }
+
     /// No self in a video slot, even though video eligibility is "any
     /// participant": self-exclusion is explicit.
     #[test]
@@ -2614,12 +2695,11 @@ mod tests {
             people: BTreeMap::new(),
             next_sender: 1,
         };
+        // Dedupe on push, not pop: a visited state is never cloned into the
+        // queue, so memory tracks distinct states, not edges.
+        let mut visited: HashSet<Vec<u8>> = HashSet::from([canonical(&start)]);
         let mut queue = VecDeque::from([(start, 0usize)]);
-        let mut visited: HashSet<Vec<u8>> = HashSet::new();
         while let Some((world, d)) = queue.pop_front() {
-            if !visited.insert(canonical(&world)) {
-                continue;
-            }
             check_world(&world, controls);
             let world_views = views(&world);
             if d == depth {
@@ -2657,60 +2737,87 @@ mod tests {
                 {
                     controls.mute_flip_changed_a_view += 1;
                 }
-                queue.push_back((next, d + 1));
+                if visited.insert(canonical(&next)) {
+                    assert!(
+                        visited.len() <= MAX_MODEL_STATES,
+                        "model check exceeded MAX_MODEL_STATES ({MAX_MODEL_STATES}) at \
+                         {people} people, depth {depth}: shrink the scope (unit-test budget is \
+                         sub-second) or move the deeper case to a named test"
+                    );
+                    queue.push_back((next, d + 1));
+                }
             }
         }
         visited.len()
     }
 
+    /// The scope of the exhaustive check: the fewest people that exercise
+    /// every fill rule (rule (1) vs (2), earliest joiner, stability beats
+    /// pairing and kind order each need two candidates competing for one
+    /// subscriber's slot) with CAPS of one slot per kind.
+    const MODEL_PEOPLE: u8 = 3;
+    const MODEL_DEPTH: usize = 3;
+    /// ~2x the states the scope above reaches (~11.5k per chooser). A scope
+    /// change that blows past it fails with the count instead of eating the
+    /// machine: depth 4 is ~150k states and ~15 s in debug.
+    const MAX_MODEL_STATES: usize = 25_000;
+
     /// The test that proves R-3/R-4 for both kinds: breadth-first over
-    /// canonical states — up to 3 people x 2 handlers x connectivity {none,
-    /// h0, h1, both} x publish sets {A, V, AV, none} x per-kind declared counts
-    /// {0, 1, 2 (over cap)} x per-kind client and server mute flips — to depth
-    /// 4 (~150k canonical states per chooser), under the production chooser
-    /// AND an adversarial one. Depth 5 is ~10x slower in debug and was cut
-    /// (never sampled instead); 4 people run to depth 3. A join carries a one-slot-per-kind declaration and its
-    /// connectivity (as a real join carries its declaration), so the
-    /// interesting fills are reachable within the depth; the cap keeps the
-    /// enumeration fast in debug. Deeper cases are the named tests above. After EVERY step: the state and render invariants, the
+    /// canonical states — MODEL_PEOPLE people x 2 handlers x connectivity
+    /// {none, h0, h1, both} x publish sets {A, V, AV, none} x per-kind declared
+    /// counts {0, 1, 2 (over cap)} x per-kind client and server mute flips — to
+    /// MODEL_DEPTH. A join carries a one-slot-per-kind declaration and its
+    /// connectivity (as a real join carries its declaration), so a depth of 3
+    /// reaches a full three-person table, or two joins plus a leave,
+    /// redeclaration, reconnect or mute. Never sampled; the depth is cut for
+    /// the sub-second unit-test budget, and every longer ordering a rule needs
+    /// is a named test above (leave refills, rejoin rank, reachable-again,
+    /// video regrow). After EVERY step: the state and render invariants, the
     /// transition rule, and exact occupant + wire-state equality with the
-    /// independent oracle. Never sampled.
+    /// independent oracle. Run once per chooser, as two tests, so they run in
+    /// parallel.
+    fn exhaustive_model_check(chooser: EdgeChooser) {
+        let started = std::time::Instant::now();
+        let mut controls = Controls::default();
+        let states = run_model_check(chooser, MODEL_PEOPLE, MODEL_DEPTH, &mut controls);
+        println!(
+            "two-kind slot model check ({MODEL_PEOPLE} people, depth {MODEL_DEPTH}): {states} \
+             states, {controls:?}, {:?}",
+            started.elapsed()
+        );
+        // Positive controls: a generator that explores nothing, or an
+        // op set that never exercises a rule, cannot pass.
+        assert!(states > 10_000, "explored only {states} states");
+        assert!(
+            controls.rule_one_differs > 0,
+            "rule (1) never differed from rule (2)"
+        );
+        assert!(controls.order_mattered > 0, "kind order never mattered");
+        assert!(controls.unavailable_seen > 0, "no over-cap slot was seen");
+        assert!(
+            controls.non_video_in_video_slot > 0,
+            "no AVATAR_NO_VIDEO occupant"
+        );
+        assert!(
+            controls.mute_flip_changed_a_view > 0,
+            "mute flips were vacuous"
+        );
+        assert!(
+            controls.per_op.iter().all(|n| *n > 0),
+            "an op never ran: {:?}",
+            controls.per_op
+        );
+    }
+
     #[test]
-    fn exhaustive_small_scope_model_check() {
-        for (people, depth) in [(3u8, 4usize), (4, 3)] {
-            for chooser in [colocate as EdgeChooser, last] {
-                let started = std::time::Instant::now();
-                let mut controls = Controls::default();
-                let states = run_model_check(chooser, people, depth, &mut controls);
-                println!(
-                    "two-kind slot model check ({people} people, depth {depth}): {states} states, \
-                     {controls:?}, {:?}",
-                    started.elapsed()
-                );
-                // Positive controls: a generator that explores nothing, or an
-                // op set that never exercises a rule, cannot pass.
-                assert!(states > 10_000, "explored only {states} states");
-                assert!(
-                    controls.rule_one_differs > 0,
-                    "rule (1) never differed from rule (2)"
-                );
-                assert!(controls.order_mattered > 0, "kind order never mattered");
-                assert!(controls.unavailable_seen > 0, "no over-cap slot was seen");
-                assert!(
-                    controls.non_video_in_video_slot > 0,
-                    "no AVATAR_NO_VIDEO occupant"
-                );
-                assert!(
-                    controls.mute_flip_changed_a_view > 0,
-                    "mute flips were vacuous"
-                );
-                assert!(
-                    controls.per_op.iter().all(|n| *n > 0),
-                    "an op never ran: {:?}",
-                    controls.per_op
-                );
-            }
-        }
+    fn exhaustive_model_check_production_chooser() {
+        exhaustive_model_check(colocate);
+    }
+
+    /// Nothing may depend on WHICH shared handler carries an edge.
+    #[test]
+    fn exhaustive_model_check_adversarial_chooser() {
+        exhaustive_model_check(last);
     }
 
     /// R-26, named: with a video cap of 0 every video slot is UNAVAILABLE, no
