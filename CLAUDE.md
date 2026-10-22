@@ -12,12 +12,12 @@ Rust video conferencing platform using WebTransport/HTTP/3, PostgreSQL, and Prot
 | Media Handler | `crates/mh-service/` |
 | Shared | `crates/common/` |
 
-Architecture: `docs/ARCHITECTURE.md` | Status: `docs/PROJECT_STATUS.md`
+Architecture: `docs/ARCHITECTURE.md` | Status: `docs/user-stories/`
 
 ## Layout
 
-- `crates/` — Rust services + shared `common/` (Cargo workspace); see table above
-- `packages/` — TypeScript/Svelte client monorepo: `sdk-core`, `sdk-svelte`, `web-app`, `test-utils` (pnpm + Nx)
+- `crates/` — Rust services + shared `common/` (Cargo workspace); see table above. Also `media-protocol` (frame wire format), `proto-gen`, per-service `*-test-utils`, `env-tests` (Layer 7), and tooling: `dt-guard` (guards), `dt-story` (story manifests), `devloop-helper` (cluster helper), `media-vector-gen`
+- `packages/` — TypeScript/Svelte client monorepo: `sdk-core`, `sdk-svelte`, `web-app`, `test-utils`, `proto-gen` (pnpm + Nx)
 - `proto/` — Protocol Buffers contracts (source of truth for wire types)
 - `migrations/` — PostgreSQL migrations
 - `infra/` — devloop container tooling (`infra/devloop/`), Kind cluster setup (`infra/kind/`)
@@ -53,7 +53,7 @@ Apply to every agent here — host orchestrator, devloop teammates, and speciali
 | `observability` | Metrics, logging, tracing, SLOs (MANDATORY cross-cutting) |
 | `operations` | Deployment safety, runbooks, cost (MANDATORY cross-cutting) |
 
-**Guard-crate ownership (interim).** `crates/dt-guard/**` splits by *what the edit changes*, not by path. It is **not** a Guarded Shared Area today — no module under it meets an ADR-0024 §6.4 criterion, it has no key in `scripts/guards/simple/cross-boundary-ownership.yaml`, and must not be given one (that file is a GSA mirror; `dt-guard gsa-sync` rejects stray keys). **This is a statement about the tree as it stands, not a standing exemption**: per ADR-0024 §6.4, modules matching a criterion are Guarded whether or not they appear in the enumerated list, so the criterion still applies per-module to anything added here. Guard **policy content** — what a vocabulary term, allow- or deny-list entry, threshold, or required-shape rule *means* — belongs to the specialist owning that policy (e.g. `observability` + `security` for `common/pii_vocabulary.rs`). Guard **machinery** — crate/module layout, clap dispatch, matcher implementations, and the shape of the constructs policy is expressed in — is `infrastructure`. For any list construct, **membership is content; evaluation order and construct shape are machinery.** An edit that *changes* a machinery construct is both; one that merely *satisfies* an existing construct (classifying a new term into an existing partition bucket) is content — **the test is what the edit changes, not what the author had to read to get it right.** Interim pending a general non-GSA path→specialist map — see `docs/TODO.md` §Media Path Obligations.
+**Guard-crate ownership (interim).** `crates/dt-guard/**` splits by *what the edit changes*, not by path. It is **not** a Guarded Shared Area today — no module under it meets an ADR-0024 §6.4 criterion, it has no key in `scripts/guards/simple/cross-boundary-ownership.yaml`, and must not be given one (that file is a GSA mirror; `dt-guard gsa-sync` rejects stray keys). **This is a statement about the tree as it stands, not a standing exemption**: per ADR-0024 §6.4, modules matching a criterion are Guarded whether or not they appear in the enumerated list, so the criterion still applies per-module to anything added here. Guard **policy content** — what a vocabulary term, allow- or deny-list entry, threshold, or required-shape rule *means* — belongs to the specialist owning that policy (e.g. `observability` + `security` for `crates/dt-guard/src/common/pii_vocabulary.rs`). Guard **machinery** — crate/module layout, clap dispatch, matcher implementations, and the shape of the constructs policy is expressed in — is `infrastructure`. For any list construct, **membership is content; evaluation order and construct shape are machinery.** An edit that *changes* a machinery construct is both; one that merely *satisfies* an existing construct (classifying a new term into an existing partition bucket) is content — **the test is what the edit changes, not what the author had to read to get it right.** Interim pending a general non-GSA path→specialist map — see `docs/TODO.md` §Media Path Obligations.
 
 Definitions: `.claude/agents/*.md`
 
@@ -69,3 +69,6 @@ Definitions: `.claude/agents/*.md`
 - `/devloop "task"` - Implementation via Agent Teams (`.claude/skills/devloop/SKILL.md`)
 - `/debate "question"` - Cross-cutting design decisions (`.claude/skills/debate/SKILL.md`)
 - `/user-story "story"` - Story decomposition (`.claude/skills/user-story/SKILL.md`)
+- `scripts/workflow/run-story.sh` - Unattended story runner: one headless devloop per manifest task (ADR-0035)
+- `/close-story` - Story completion: completeness check, story-scope reflection, PR
+- `infra/devloop/devloop.sh <slug>` - Containerized devloop (ADR-0025); `/absorb-devloop <slug>` brings its commits back; `/devloop-status` lists loops

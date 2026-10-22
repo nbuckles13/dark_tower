@@ -24,15 +24,15 @@ This isn't a flaw to work around - it's a fundamental constraint to design for. 
 
 ## The Core Idea: Autonomous AI Specialist Teams
 
-Instead of one AI doing everything, we use **specialist agent teams** - each agent with deep expertise in a specific domain, communicating directly with each other while a Lead coordinates at key gates.
+Instead of one AI doing everything, we use **specialist agent teams**. Each agent has deep expertise in one domain, and agents talk to each other directly while a Lead enforces gates.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    HUMAN ORCHESTRATOR                        │
-│              (Invokes skills, approves gates)                │
+│     Plans stories, approves designs, runs the manual demo    │
 └────────────────────────────┬────────────────────────────────┘
                              │
-                  Invokes: /devloop or /debate
+        /user-story, /debate, /devloop, or run-story.sh
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -41,34 +41,32 @@ Instead of one AI doing everything, we use **specialist agent teams** - each age
 └────────────────────────────┬────────────────────────────────┘
                              │
         Spawns teammates with composed prompts
-        (specialist identity + dynamic knowledge)
+        (specialist identity + navigation INDEX + task)
                              │
      ┌───────────────────────┼───────────────────────┐
-     │                       │                       │
      ▼                       ▼                       ▼
-┌──────────┐  ┌───────────────────┐  ┌─────────────────────┐
-│IMPLEMENTER│  │  DOMAIN REVIEWERS │  │ CROSS-CUTTING       │
-│           │  │                   │  │ REVIEWERS           │
-│ One of:   │  │ code-reviewer     │  │ security (mandatory)│
-│ auth-ctrl │  │ dry-reviewer      │  │ test (mandatory)    │
-│ global-ctrl│ │                   │  │ operations          │
-│ meeting-ctrl│└─────────┬─────────┘  └──────────┬──────────┘
-│ media-hndlr│           │                       │
-│ database  │            └───────────┬───────────┘
-│ protocol  │                        │
-│ infra     │          Direct peer-to-peer
-│ observ.   │            messaging between
-└─────┬─────┘              all teammates
-      │                        │
+┌────────────┐  ┌───────────────────┐  ┌──────────────────────┐
+│IMPLEMENTER │  │  DOMAIN REVIEWERS │  │ CROSS-CUTTING        │
+│ One of:    │  │ code-reviewer     │  │ REVIEWERS (mandatory)│
+│ auth-ctrl  │  │ dry-reviewer      │  │ security             │
+│ global-ctrl│  │ semantic-guard    │  │ test                 │
+│ meeting-ctl│  │   (conditional)   │  │ observability        │
+│ media-hndlr│  └─────────┬─────────┘  │ operations           │
+│ client     │            │            └──────────┬───────────┘
+│ database   │            └───────────┬───────────┘
+│ protocol   │                        │
+│ infra      │          Direct peer-to-peer
+│ observ.    │            messaging between
+└─────┬──────┘              all teammates
       └────────────────────────┘
 ```
 
 **Why this structure?**
-- **Autonomous teammates**: Specialists drive their own work and communicate directly with each other - the Lead doesn't shuttle messages
+- **Autonomous teammates**: Specialists drive their own work and talk to each other directly; the Lead doesn't relay messages
 - **Independent context**: Each teammate has its own context window, so one specialist's work doesn't crowd out another's
-- **Lead stays minimal**: The Lead only spawns the team and intervenes at gates (plan approval, validation, final approval) - minimal context accumulation
-- **Focused prompts**: Each specialist gets only their domain knowledge, relevant principles, and the specific task
-- **Cross-cutting review**: Security, Test, Observability, and Operations specialists catch what domain experts miss
+- **Lead stays minimal**: The Lead spawns the team and acts only at gates (plan confirmation, review verdicts, full validation)
+- **Focused prompts**: Each specialist gets its identity, a short navigation index for its domain, and the task, nothing else
+- **Cross-cutting review**: Security, Test, Observability, and Operations review every change and catch what domain experts miss
 
 ---
 
@@ -99,169 +97,162 @@ The specialists debated directly - Security raising concerns about key lifecycle
 
 ---
 
-## Dynamic Knowledge: AI That Learns
+## Specialist Knowledge: Navigation, Not Memory
 
-We can't inject every best practice into every prompt — that would overwhelm the AI and dilute focus. Instead, each specialist accumulates **dynamic knowledge files** that they read as their first step on every task:
+Each specialist has one file, `docs/specialist-knowledge/{specialist}/INDEX.md`. It is a short map of where things live in its domain: which ADR governs a topic, which file and function implement it, which guard enforces it.
 
 ```
-docs/specialist-knowledge/{specialist}/
-├── patterns.md          # What works well (standard)
-├── gotchas.md           # Pitfalls to avoid (standard)
-├── integration.md       # How to work with other components (standard)
-└── {domain-specific}.md # Specialist-created files for their domain
+docs/specialist-knowledge/security/INDEX.md
+- Service auth (OAuth 2.0 Client Credentials) → ADR-0003 | Key rotation → ADR-0008 | ...
+- sender_id allocation, never reused → crates/mc-service/src/media_admission/sender_id.rs:SenderIdAllocator::allocate()
+- No key material on the MC→MH contract → scripts/guards/simple/validate-internal-proto-no-key-material.sh
 ```
-
-The three standard files are common across all specialists, but specialists can create additional domain-specific files during reflection. For example, the Security specialist tracks `approved-crypto.md` for reviewed cryptographic algorithms, while the DRY Reviewer maintains `common-patterns.md` for known shared code in `crates/common/`.
 
 **How it works**:
-1. Each specialist's [agent definition](.claude/agents/) includes "FIRST STEP: Read ALL `.md` files from your knowledge directory"
-2. After each implementation, a **reflection step** captures learnings into knowledge files
-3. The specialist gets smarter with each task — and can organize knowledge however makes sense for their domain
+1. The Lead injects the specialist's INDEX into every spawn prompt as its `## Navigation` section. Injection is deterministic, so no step depends on an agent remembering to read its notes.
+2. The INDEX points; it does not restate. Facts live in code and ADRs only, and rules that can be enforced are enforced by tooling (clippy, guards, CI), not by instructions.
+3. A guard (`validate-knowledge-index.sh`) checks every INDEX on every validation run, so a pointer to a moved or deleted file fails the pipeline.
+4. When a user story closes, `/close-story` runs one reflection pass: specialists update their INDEX for the architecture the story changed, with the whole story's context in hand.
 
-**Reflection quality gates**: Not every observation warrants a knowledge entry. Entries must be **surprising or corrective** (not expected behavior), **project-specific** (not generic Rust/async knowledge), and **within the specialist's ownership lane** (Security doesn't write about Rust idioms, Code Quality doesn't write about crypto). This prevents knowledge bloat from parallel reflection where multiple specialists record the same insight.
-
-**Example from `security/gotchas.md`**:
-```markdown
-## SecretBox requires owned data
-- `SecretBox::new()` takes `Box<T>`, not `&T`
-- Clone the data before wrapping: `SecretBox::new(Box::new(data.clone()))`
-- This is intentional - prevents accidental exposure of borrowed references
-```
-
-This knowledge persists across sessions. A specialist that encountered this issue once won't make the same mistake again. And because specialists can create new files freely, knowledge organization evolves naturally.
-
-> **Historical note**: An earlier approach used static `docs/principles/` files (crypto.md, jwt.md, etc.) with keyword-based injection. This was superseded by specialist knowledge files which are more targeted and evolve organically. See ADR-0017 for the knowledge architecture.
+**Why not accumulate lessons?** That was the first design ([ADR-0017](docs/decisions/adr-0017-specialist-knowledge.md)): each specialist kept growing `patterns.md`, `gotchas.md` and `integration.md` files and read them first on every task. Over time those files cached facts that went stale, and a stale "fact" in a knowledge file overrode the ADR it had been copied from. [ADR-0026](docs/decisions/adr-0026-knowledge-restructure.md) replaced them with navigation-only indexes: an agent that is told *where* to look reads the current truth instead of a remembered one.
 
 ---
 
-## Guard Pipeline: Trust but Verify
+## Validation Pipeline: Trust but Verify
 
-Even with focused specialists and targeted principles, AI will sometimes forget things. A specialist deep in implementation logic might overlook a logging statement that contains sensitive data. This isn't failure - it's expected.
+Even with focused specialists, AI will sometimes forget things. A specialist deep in implementation logic might overlook a log statement that contains sensitive data. This isn't failure; it's expected.
 
 **Guards exist because we know AI is fallible.** They're the safety net that catches what slips through.
 
-Before any code is committed, it passes through a **polyglot validation pipeline** (`scripts/layer-all.sh` → `layer1..7.sh`; see ADR-0033 for the full specification). Each layer runs the relevant per-language checks (Rust and TypeScript):
+Every change passes through a **polyglot validation pipeline** (`scripts/layer-all.sh` → `layer1..7.sh`; see [ADR-0033](docs/decisions/adr-0033-polyglot-validation-pipeline.md)). Each layer runs the relevant checks for Rust, TypeScript and protobuf, and the same scripts run locally, in devloops, and in CI:
 
 | Layer | Check | Purpose |
 |-------|-------|---------|
-| 1 | Compile | `cargo check` + TS typecheck/build |
-| 2 | Format | `cargo fmt` + prettier |
-| 3 | Guards | Pattern + policy checks (`dt-guard`, ADR-0034) + semantic-guard self-tests |
+| 1 | Compile | `cargo check` + TS typecheck/build + pnpm peer check |
+| 2 | Format | `cargo fmt` + prettier + `buf format` |
+| 3 | Guards | Pattern and policy checks (`dt-guard`, ADR-0034) + pipeline self-tests |
 | 4 | Test | Rust unit/integration + TS unit/component (Nx) |
-| 5 | Lint | `cargo clippy` + eslint/svelte-check |
-| 6 | Audit | `cargo audit` + `pnpm audit` + buf-breaking |
-| 7 | Env-tests | Integration tests against the live Kind cluster |
+| 5 | Lint | `cargo clippy` + eslint/svelte-check + `buf lint` |
+| 6 | Audit | `cargo audit` + `pnpm audit` + `buf breaking` |
+| 7 | Env-tests | Integration and browser E2E tests against a live Kind cluster |
 
-> Semantic guards are **not** a numbered layer — they run as a reviewer agent during the review phase (see below), not in the shell pipeline.
+Two rules keep the pipeline honest. **No layer may report success without running**: a skipped, stubbed or unrecognized step is a failure, never a quiet pass. And **no retries** (ADR-0028): a flaky test is fixed, not re-run until green.
 
-### Simple Guards (Pattern Matching)
+### Pattern Guards
 
-Fast, deterministic checks that catch common issues. Examples:
+Fast, deterministic checks, about fifty of them, most implemented in one Rust binary, `dt-guard` ([ADR-0034](docs/decisions/adr-0034-guard-pipeline-as-rust-binary.md)). Examples:
 
 | Guard | What it catches |
 |-------|-----------------|
 | `no-hardcoded-secrets` | API keys, passwords in source code |
-| `no-secrets-in-logs` | Sensitive data in log statements |
-| `no-pii-in-logs` | Email, IP addresses in logs |
+| `no-secrets-in-logs` / `no-pii-in-logs` | Sensitive data or PII in log statements |
 | `instrument-skip-all` | `#[instrument]` using denylist `skip()` instead of allowlist `skip_all` |
-| `test-registration` | Test files not registered in entry point (silently never run) |
+| `test-registration` | Test files not registered in an entry point (silently never run) |
+| `ts-no-retained-credentials` | Client code that keeps a credential alive past its use |
+| `validate-dashboard-panels` | Panels that misuse a metric's type (a raw counter outside `rate()`) or hard-code a datasource |
+| `validate-alert-rules` | Alerts whose `runbook_url` is missing or points to no file under `docs/runbooks/` |
 
 See [`scripts/guards/simple/`](scripts/guards/simple/) for the full set.
 
 ### Semantic Guards (AI-Powered)
 
-For issues that patterns can't catch, a dedicated **semantic-guard agent** analyzes the diff during devloop validation. The agent reads check definitions from [`scripts/guards/semantic/checks.md`](scripts/guards/semantic/checks.md), examines the current diff, and can read full source files for context when needed.
+For issues that patterns can't catch, a **semantic-guard agent** reviews the diff during the devloop. It reads its checks from [`scripts/guards/semantic/checks.md`](scripts/guards/semantic/checks.md), the authoritative list (today: credential leaks, client credential lifetime, actor blocking, error context preservation, metrics path completeness). It can read full source files for context, and it reports SAFE or UNSAFE with file, line and explanation.
 
-Current checks: credential leaks, actor blocking, error context preservation, metrics path completeness.
-
-The agent reports SAFE or UNSAFE with specific findings (file, line number, explanation). This catches subtle issues like "this function logs a struct that contains a field that could contain sensitive data."
-
-Unlike the simple guards (which run as shell scripts), semantic guards run as a teammate agent — this avoids the Claude-in-Claude problems of shell-based LLM invocation and gives the agent access to the full codebase for context.
+It is spawned only when a diff touches one of those check surfaces ([ADR-0037](docs/decisions/adr-0037-devloop-process-tuning.md) D4). Running it as a teammate rather than a shell step gives it the whole codebase for context and avoids invoking Claude from inside a shell script.
 
 ---
 
 ## The Development Loop
 
-Putting it all together, here's how a feature gets implemented. The key insight: **autonomous teammates drive the work; the Lead only enforces gates**.
+Putting it together, here's how one task gets implemented. The key idea: **autonomous teammates drive the work; the Lead only enforces gates**. The authoritative procedure is [`.claude/skills/devloop/SKILL.md`](.claude/skills/devloop/SKILL.md).
 
-> **Evolution Note**: The devloop went through several iterations before arriving at the current design. See [Evolution of the Devloop](#evolution-of-the-devloop) below for why earlier approaches failed.
+> **Evolution Note**: The devloop went through several iterations before arriving at this design. See [Evolution of the Devloop](#evolution-of-the-devloop) below for why earlier approaches failed.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  SETUP (Lead)                                               │
-│     Human: /devloop "implement feature X"               │
-│     Lead: Spawns 8 teammates (1 implementer + 7 reviewers)  │
-│     Lead: Composes prompts with specialist identity +        │
-│           dynamic knowledge + task context                   │
-│     Lead: Records git state, goes idle - teammates drive     │
+│     /devloop "implement feature X"                          │
+│     Lead: spawns implementer + reviewers, each with its     │
+│           identity, navigation INDEX and the task           │
+│     Lead: records git state, goes idle - teammates drive    │
 └────────────────────────────┬────────────────────────────────┘
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  PLANNING (Teammates collaborate directly)                   │
-│     Implementer: Drafts approach, messages reviewers         │
-│     Reviewers: Provide input, raise concerns                 │
-│     Implementer: Revises plan based on feedback              │
-│     All reviewers confirm → proceed                          │
-│     ► GATE 1: Lead checks all reviewers confirmed            │
+│  PLANNING (teammates collaborate directly)                  │
+│     Implementer drafts the approach; reviewers raise        │
+│     concerns; the plan is revised until all confirm         │
+│     ► GATE 1: every reviewer has confirmed the plan         │
 └────────────────────────────┬────────────────────────────────┘
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  IMPLEMENTATION (Implementer drives)                         │
-│     Implementer: Does the work, messages reviewers if needed │
-│     Implementer: Signals "Ready for validation"              │
-│     ► GATE 2: Lead runs validation pipeline                   │
-│       Pass → proceed to review                               │
-│       Fail → feedback to implementer, loop back (max 3)      │
+│  IMPLEMENTATION (implementer drives)                        │
+│     Does the work, asks reviewers as needed                 │
+│     Runs layer-fast.sh (layers 1-6) before asking for review│
 └────────────────────────────┬────────────────────────────────┘
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  REVIEW (Reviewers + Implementer collaborate)                │
-│     Reviewers: Examine code, discuss with each other         │
-│     Implementer: Responds to feedback, fixes issues          │
-│     Each reviewer: Sends verdict (APPROVED or BLOCKED)       │
-│     ► GATE 3: Lead checks all verdicts                       │
-│       All approved → proceed                                 │
-│       Any blocked → implementer fixes, loop back (max 3)     │
+│  REVIEW (reviewers + implementer)                           │
+│     Every finding defaults to "fix it now"                  │
+│     ► GATE 3: every reviewer's verdict is in                │
+│       CLEAR / RESOLVED-FIXED / RESOLVED-DEFERRED / ESCALATED│
 └────────────────────────────┬────────────────────────────────┘
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  REFLECTION (All teammates)                                  │
-│     Each teammate: Documents learnings to knowledge files    │
-│     Lead: Writes summary to output file                      │
-│     Team disbanded                                           │
+│  FULL VALIDATION                                            │
+│     ► GATE 2: layer-all.sh, all 7 layers                    │
+│       Fail → back to implementation                         │
+│       (3 attempts for layers 1-6, 2 for layer 7)            │
 └────────────────────────────┬────────────────────────────────┘
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  COMMIT                                                      │
-│     With full audit trail in docs/devloop-outputs/          │
+│  COMMIT                                                     │
+│     Pre-commit hook checks the Gate-2 verdict; full record  │
+│     in docs/devloop-outputs/<date>-<slug>/main.md           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Team composition** (every devloop):
+Gate numbers are names, not order. Review runs before the full pipeline ([ADR-0037](docs/decisions/adr-0037-devloop-process-tuning.md) D10): review almost always changes the tree, so running the full pipeline first meant running it, and bringing up the Layer-7 cluster, twice. Now it runs once, on the reviewed tree. Any failure after implementation returns to implementation and repeats the cycle from there.
+
+**Team composition** (full mode):
 
 | Teammate | Role |
 |----------|------|
 | Implementing Specialist | Domain expert who does the work |
-| Security Reviewer | Vulnerabilities, crypto, zero-trust |
-| Test Reviewer | Coverage, edge cases, quality gates |
+| Security Reviewer | Vulnerabilities, crypto, auth |
+| Test Reviewer | Coverage, test quality, regressions |
 | Observability Reviewer | Metrics, logging, tracing, PII, SLOs |
 | Code Quality Reviewer | Rust idioms, ADR compliance |
 | DRY Reviewer | Cross-service duplication |
-| Operations Reviewer | Deployment safety, runbooks |
-| Semantic Guard Reviewer | Diff-level anti-patterns pattern guards can't catch |
+| Operations Reviewer | Deployment safety, rollback, runbooks |
+| Semantic Guard Reviewer | Only when the diff touches a semantic check surface |
 
-(Plus a conditional Database or Protocol reviewer when the change touches schema/migrations or API contracts and the implementer isn't that specialist.)
+**Variants**:
+- `--light`: small, contained changes get a 3-teammate panel (implementer, security, one context reviewer) and skip Gate 1.
+- `--tier=light`: set by the story runner for tasks with no plan surface (no wire contract, new seam or multi-service span); skips only the Gate-1 planning round and keeps the full review panel.
+- `--paired-with=<specialist>`: a second specialist collaborates during implementation and reviews at Gate 3.
+- `--continue=<slug>`: reopens a completed devloop to address human review feedback.
+
+**Review model**: every finding defaults to "fix it." A reviewer can accept a deferral only by showing that fixing later is genuinely cheaper; an accepted deferral is tracked in `docs/TODO.md` and makes that reviewer's verdict RESOLVED-DEFERRED rather than RESOLVED-FIXED. The DRY reviewer's suggestions to extract shared code are different: they go to `docs/TODO.md` as opportunities and never count as deferrals ([ADR-0019](docs/decisions/adr-0019-dry-reviewer.md)).
+
+**Cross-boundary edits**: an implementer may edit any file, but an edit in another specialist's domain pulls that specialist into planning and review. Guarded Shared Areas, such as the wire protocol and auth policy, also pull in security ([ADR-0024](docs/decisions/adr-0024-agent-teams-workflow.md) §6).
 
 **Why autonomous teammates?**
-- **Teammates preserve full context**: They stay alive throughout the entire loop with their complete history
-- **Minimal Lead context**: Lead is idle during planning, implementation, and review - only wakes at gates
-- **Natural collaboration**: Reviewers discuss findings with the implementer directly, not through a coordinator
-- **Self-organizing**: Implementer drives pace, gets reviewer buy-in directly, asks questions as needed
-- **Graceful recovery**: Checkpoint files in `docs/devloop-outputs/` enable restart if session dies
+- **Teammates preserve full context**: they stay alive for the whole loop with their complete history
+- **Minimal Lead context**: the Lead is idle during planning, implementation and review, and only wakes at gates
+- **Natural collaboration**: reviewers discuss findings with the implementer directly, not through a coordinator
+- **Graceful recovery**: checkpoint files in `docs/devloop-outputs/` let a loop resume after a session dies
 
-**Code review blocking behavior**:
-- Security, Test, Code Quality, Operations: ALL findings must be fixed
-- DRY Reviewer: Only BLOCKER-level blocks; non-BLOCKERs documented as tech debt (see ADR-0019)
+---
+
+## From Goal to Demo: User Stories
+
+A devloop implements one task. A **user story** is how a user-facing goal, such as "participants can see each other", becomes a sequence of devloops.
+
+1. **Plan** (`/user-story`): specialists decompose the goal into tasks, each cut so it delivers something demonstrable and never ships half of an invariant ([ADR-0037](docs/decisions/adr-0037-devloop-process-tuning.md) D3, D9). Requirements are stated as observable behaviour, and every story carries a manual test plan a human runs in a real browser. The plan is a story document in [`docs/user-stories/`](docs/user-stories/) plus a task manifest managed by `dt-story`.
+2. **Run** (`scripts/workflow/run-story.sh`, [ADR-0035](docs/decisions/adr-0035-story-runner.md)): a deterministic bash runner, with no LLM in its control flow, walks the manifest in dependency order and starts one headless `/devloop` per task inside a devloop container. **Pass/fail is the runner's own `layer-all.sh` run, never the devloop's self-report**: a gate that says PASS while its work never happened has failed before, so the runner re-executes instead of trusting. An escalation stops the run and waits for a human decision.
+3. **Close**: a human runs the story's manual test plan, then `/close-story` checks every task is done, runs the story-scope reflection that updates specialist INDEX files, and opens the story's PR.
+
+This moves human involvement from every task boundary to the story boundary: plan a story, then come back to a finished story or to a short queue of genuine decisions.
 
 ---
 
@@ -399,73 +390,81 @@ User: /devloop-validate
 
 ### Version 4: Agent Teams Devloop (Feb 2026 - Current)
 
-**Approach**: Replaced subagent-based orchestration with Claude Code Agent Teams. Specialists are spawned as autonomous teammates that communicate directly with each other. The Lead only intervenes at gates.
+**Approach**: Replaced subagent-based orchestration with Claude Code Agent Teams. Specialists are spawned as autonomous teammates that communicate directly with each other. The Lead only acts at gates.
 
 ```
 User: /devloop "implement feature X" --specialist=meeting-controller
     ↓
-Lead: Spawns 8 teammates (1 implementer + 7 reviewers)
-Lead: Records git state, goes idle
+Lead: Spawns implementer + reviewers, records git state, goes idle
     ↓
 Teammates drive autonomously:
-    Planning → Implementation → Review → Reflection
-    (Lead wakes only at gates to run validation and check verdicts)
+    Planning → Implementation → Review → Full validation → Commit
+    (Lead wakes only at gates)
 ```
 
 **What changed from Version 3**:
-- **Subagent invocations → Teammate spawning**: Specialists stay alive with full context throughout the entire loop instead of reporting back and being discarded
+- **Subagent invocations → Teammate spawning**: Specialists stay alive with full context for the whole loop instead of reporting back and being discarded
 - **One-way reporting → Peer-to-peer messaging**: Reviewers discuss findings directly with the implementer, and with each other
 - **Coordinator-driven → Teammate-driven**: Implementer drives pace, gets reviewer buy-in directly, asks questions as needed
 - **Multi-step skills → Single command**: One `/devloop` invocation handles the entire workflow
-- **Lead context accumulation → Lead mostly idle**: Lead only wakes at 3 brief gate checks, avoiding the context rot that plagued earlier versions
+- **Lead context accumulation → Lead mostly idle**: Lead only wakes at gate checks, avoiding the context rot that plagued earlier versions
 
-**Why this works**:
-- **Teammates preserve context**: Each specialist keeps their full history for the entire loop
-- **Natural collaboration**: Reviewers and implementer have real discussions, not coordinator-mediated exchanges
-- **Minimal Lead overhead**: ~4 brief gate checks vs continuous orchestration
-- **Graceful recovery**: Checkpoint files enable restart via `/devloop-restore` if session dies
+Since February the loop has been tuned rather than redesigned ([ADR-0037](docs/decisions/adr-0037-devloop-process-tuning.md)): review moved ahead of the full pipeline, semantic-guard became conditional, the Gate-1 planning round became risk-tiered, and reflection moved from every devloop to once per story.
 
-**Current files**: [.claude/skills/devloop/SKILL.md](.claude/skills/devloop/SKILL.md)
-
-**Version 3 skills have been retired.** The Agent Teams workflow (`/devloop`) is the current and only implementation.
+**Version 3 skills have been retired.** `/devloop` is the current and only implementation; `/devloop --continue` resumes a completed loop.
 
 #### Containerized Execution (Preferred)
 
-For maximum autonomy, devloops run inside isolated **podman containers** where Claude Code operates with `--dangerously-skip-permissions` (all permission prompts disabled). The container boundary limits blast radius to the current task's clone.
+For maximum autonomy, devloops run inside isolated **podman containers** where Claude Code operates with `--dangerously-skip-permissions` (no permission prompts). The container boundary limits the blast radius to the current task's clone.
 
 ```
-Host (WSL2)                              Containers (podman)
+Host (WSL2)                              Containers (podman, per devloop)
 ┌──────────────────────┐                 ┌──────────────────────────┐
 │ GitHub credentials   │                 │ Claude Code (autonomous) │
-│ SSH keys             │  bind mount     │ Rust toolchain + tools   │
+│ SSH keys             │  bind mount     │ Rust + Node toolchains   │
 │ Git clone ───────────┼────────────────►│ /work (clone only)       │
 │ devloop.sh wrapper   │                 │ PostgreSQL (shared net)  │
-│                      │                 │                          │
-│ Push + PR creation ◄─┼── .devloop-pr  │ No GitHub credentials    │
-│ (host credentials)   │    .json        │ No SSH keys              │
-└──────────────────────┘                 └──────────────────────────┘
+│ Cluster helper ◄─────┼── socket ───────┤ No GitHub credentials    │
+│  └─ per-devloop Kind │                 │ No SSH keys              │
+│     cluster          │                 └──────────────────────────┘
+│ Push + PR creation   │
+└──────────────────────┘
 ```
 
 **Why containerize?**
-- `--dangerously-skip-permissions` enables fully autonomous Claude Code execution — no approval prompts interrupting the devloop
-- Container isolation means Claude can only access the mounted clone, not SSH keys, GitHub credentials, or other projects
-- OAuth credentials are mounted read-only for Claude API access; no API keys needed
-- PRs are created from the host side using commit history from the devloop
+- `--dangerously-skip-permissions` enables fully autonomous execution: no approval prompts interrupting the devloop
+- The container can only reach the mounted clone, not SSH keys, GitHub credentials or other projects
+- Claude's own credentials are mounted read-only; no API keys are needed
+- Layer 7 needs a Kubernetes cluster, which the container cannot run itself. A **host-side helper** gives each devloop its own Kind cluster and exposes a narrow set of cluster verbs to the container ([ADR-0030](docs/decisions/adr-0030-host-side-cluster-helper.md))
 
 **Workflow**:
 ```bash
 # One command: creates clone, starts containers, drops into Claude
-./infra/devloop/devloop.sh td-42-rate-limiting
+./infra/devloop/devloop.sh td-42-rate-limiting main
 
 # Inside container:
 claude> /devloop "implement rate limiting on GC endpoints"
-# ... autonomous implementation, review, commit ...
+# ... autonomous implementation, review, validation, commit ...
 claude> /exit
 
-# Back on host — commits are in the local clone, ready to cherry-pick or push
+# Back on host: devloop.sh offers to push and open a PR,
+# or bring the commits into your branch with /absorb-devloop td-42-rate-limiting
 ```
 
 **See**: [ADR-0025](docs/decisions/adr-0025-containerized-devloop.md) for the full design and security model.
+
+---
+
+### Version 5: Unattended Story Runner (Aug 2026 - Current)
+
+**Approach**: Version 4 still needed a human at every task boundary: start each devloop, watch for derailment, merge the result, start the next. `run-story.sh` takes that job ([ADR-0035](docs/decisions/adr-0035-story-runner.md)). It is a program, not a prompt: a bash runner and the `dt-story` manifest tool decide everything from exit codes and manifest fields, and run one headless devloop per task.
+
+**What it solved**:
+- **Human time moves to the story boundary**: plan the story, run it, review the result and the escalation queue
+- **Independent pass/fail**: the runner re-runs the full pipeline itself instead of trusting the devloop's verdict, because self-reported success has been wrong before
+- **Faithful record**: with no model in the control flow, the runner's event log and cost ledger record what actually happened
+
+**Deliberately not solved**: the runner is serial, one task at a time on one branch. Usage quota, not compute, limits throughput, and parallel branches would need parallel Kind clusters and would let reviewers review against diverging bases.
 
 ---
 
@@ -479,52 +478,50 @@ When Claude orchestrates:
 3. **Interpretation varies** - Same documentation, different behavior across sessions
 4. **Complex beats simple** - When faced with a choice, Claude picks the "smarter" approach even when the simple one is correct
 
-Version 3 (skill-based) fixed the interpretation and skipping problems by giving the human explicit control of flow. Version 4 (Agent Teams) fixed the remaining context accumulation problem by making the Lead mostly idle - teammates drive themselves, and the Lead's context stays small.
+Version 3 (skill-based) fixed the interpretation and skipping problems by giving the human explicit control of flow. Version 4 (Agent Teams) fixed the remaining context accumulation problem by making the Lead mostly idle. Version 5 finished the arc: the orchestration between tasks stopped being instructions a model follows and became a program.
 
 ---
 
 ## Why This Works
 
 ### 1. Respects the Constraint
-Every design decision works within AI's context limitations rather than fighting them. Each teammate has its own independent context window - one specialist's deep dive doesn't crowd out another's focus.
+Every design decision works within AI's context limitations rather than fighting them. Each teammate has its own context window; one specialist's deep dive doesn't crowd out another's focus.
 
 ### 2. Specialists Stay Focused
-Each specialist only sees what they need: their domain knowledge, relevant principles, and the specific task. No cognitive overload.
+Each specialist sees only its identity, a short navigation index for its domain, and the task. No cognitive overload.
 
-### 3. Knowledge Compounds Without Bloating
-Dynamic knowledge files grow over time, but each specialist only loads their own domain knowledge. The system learns without any single prompt getting larger.
+### 3. Knowledge Points, It Doesn't Remember
+Specialist indexes point to code and ADRs instead of copying facts out of them, so they cannot drift into contradicting the source, and a guard fails the pipeline when a pointer goes stale.
 
 ### 4. Guards Assume Failure
-We don't trust any single AI interaction to be perfect. Seven verification layers catch inevitable oversights before they reach production.
+We don't trust any single AI interaction to be perfect. Seven validation layers, about fifty pattern guards, and a semantic reviewer catch inevitable oversights before they are committed.
 
-### 5. Explicit Over Implicit
-Principles aren't generic best practices the AI "should know" - they're our specific standards, documented and injected. The AI follows *your* rules, not its training defaults.
+### 5. Enforce, Don't Instruct
+A rule that tooling can enforce (no panics, no secrets in logs, no unregistered tests) is enforced by tooling, not written into a prompt and hoped for. Instructions are kept for judgment that tooling cannot make.
 
 ### 6. Audit Trail
-Every implementation produces an output file documenting what was done, what was verified, and what was learned. When things go wrong, we can trace why.
+Every devloop produces an output file recording the plan, each reviewer's findings and verdict, and the validation results. When things go wrong, we can trace why.
 
 ### 7. Natural Collaboration
-Agent Teams enables the kind of back-and-forth discussion that produces better outcomes - a Security reviewer can raise a concern, the implementer can propose a fix, and the Test reviewer can suggest how to verify it, all without a coordinator bottleneck.
+Agent Teams enables the back-and-forth that produces better outcomes: a Security reviewer raises a concern, the implementer proposes a fix, and the Test reviewer suggests how to verify it, all without a coordinator bottleneck.
 
 ---
 
 ## Results So Far
 
-Using this methodology, Dark Tower has achieved:
+Using this methodology, Dark Tower has:
 
-- **Authentication Controller**: Production-ready OAuth 2.0 implementation
-- **Global Controller**: HTTP/3 API gateway with meeting management and MC/MH registration
-- **Meeting Controller**: WebTransport signaling with actor-based session management, Prometheus metrics
-- **Media Handler**: Media forwarding with per-instance addressing and MC/MH coordination
-- **Browser client**: TypeScript SDK (`sdk-core`/`sdk-svelte`) + Svelte web-app driving the full join flow
-- **Distributed tracing**: OpenTelemetry with W3C trace-context propagation browser → MC → MH, verified by env-tests
-- **80% test coverage** (per Codecov; targeting 95%) with 65+ security tests
-- **Zero known security vulnerabilities** in implemented components
-- **Consistent code quality** across ~130,000 lines of Rust + ~12,000 lines of TypeScript/Svelte
-- **Clear architectural decisions** documented in 34+ ADRs
-- **15 specialist knowledge bases** with accumulated patterns and gotchas
+- **Authentication Controller**: OAuth 2.0 client credentials, user auth, JWT/JWKS, key rotation
+- **Global Controller**: HTTP/3 API with meeting management and MC/MH registration
+- **Meeting Controller**: WebTransport signaling with actor-based sessions, media routing and key distribution
+- **Media Handler**: a keyless SFU that forwards end-to-end encrypted media it cannot read
+- **Browser client**: TypeScript SDK (`sdk-core`/`sdk-svelte`) and Svelte web app; participants can join and hear each other, and video is in progress
+- **Distributed tracing**: OpenTelemetry with W3C trace context from browser to MC to MH, verified by env-tests
+- **90% test coverage** ([Codecov](https://app.codecov.io/gh/nbuckles13/dark_tower)), with dependencies audited on every lockfile change and weekly
+- **~250,000 lines of Rust and ~53,000 lines of TypeScript/Svelte**, including tests
+- **38 ADRs** and **15 specialists**, each with its own navigation index
 
-The codebase handles authentication, JWT issuance, key rotation, rate limiting, encryption, meeting lifecycle, session binding, media forwarding, the browser join flow, and end-to-end observability - all generated by AI following this structured methodology.
+All of it was written by AI following this structured methodology.
 
 ---
 
@@ -534,16 +531,19 @@ The codebase handles authentication, JWT issuance, key rotation, rate limiting, 
 |-------|----------|
 | Project overview | [README.md](README.md) |
 | Full architecture | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
-| Devloop overview | [.claude/skills/devloop/SKILL.md](.claude/skills/devloop/SKILL.md) |
-| Containerized devloop | [infra/devloop/](infra/devloop/) and [ADR-0025](docs/decisions/adr-0025-containerized-devloop.md) |
+| Devloop procedure | [.claude/skills/devloop/SKILL.md](.claude/skills/devloop/SKILL.md) |
+| Process tuning | [ADR-0037](docs/decisions/adr-0037-devloop-process-tuning.md) |
+| User stories | [.claude/skills/user-story/SKILL.md](.claude/skills/user-story/SKILL.md), [docs/user-stories/](docs/user-stories/) |
+| Story runner | [ADR-0035](docs/decisions/adr-0035-story-runner.md), `scripts/workflow/run-story.sh` |
+| Validation pipeline | [ADR-0033](docs/decisions/adr-0033-polyglot-validation-pipeline.md), [docs/runbooks/devloop-validation.md](docs/runbooks/devloop-validation.md) |
+| Containerized devloop | [infra/devloop/](infra/devloop/), [ADR-0025](docs/decisions/adr-0025-containerized-devloop.md), [ADR-0030](docs/decisions/adr-0030-host-side-cluster-helper.md) |
 | Debate workflow | [.claude/skills/debate/SKILL.md](.claude/skills/debate/SKILL.md) |
 | Specialist definitions | [.claude/agents/](.claude/agents/) |
-| Specialist knowledge | [docs/specialist-knowledge/](docs/specialist-knowledge/) |
+| Specialist knowledge | [docs/specialist-knowledge/](docs/specialist-knowledge/), [ADR-0026](docs/decisions/adr-0026-knowledge-restructure.md) |
 | Architecture decisions | [docs/decisions/](docs/decisions/) |
 | Debate records | [docs/debates/](docs/debates/) |
 | Devloop outputs | [docs/devloop-outputs/](docs/devloop-outputs/) |
-| Current progress | [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) |
 
 ---
 
-*Dark Tower is an experiment in whether AI can build complex, secure, production-quality systems - not by pretending AI has unlimited capacity, but by designing processes that work within its constraints. Four iterations of development methodology have converged on a model where autonomous specialist teams collaborate directly, accumulate knowledge over time, and verify each other's work through structured review - turning AI's limitations into a manageable engineering problem.*
+*Dark Tower is an experiment in whether AI can build complex, secure, production-quality systems, not by pretending AI has unlimited capacity, but by designing processes that work within its constraints. Five iterations of development methodology have converged on a model where autonomous specialist teams collaborate directly, navigate the codebase from short indexes instead of accumulated memory, verify each other's work through structured review, and are driven task by task by a deterministic runner. That turns AI's limitations into a manageable engineering problem.*
