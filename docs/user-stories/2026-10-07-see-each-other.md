@@ -1532,7 +1532,7 @@ tasks:
   slug: 2026-10-21-mh-b-on-demand-keyframes
   tag: story-2026-10-07-see-each-other-task-10
 - id: 11
-  status: pending
+  status: completed
   specialist: client
   deps:
   - 2
@@ -1666,6 +1666,7 @@ tasks:
     - Transitional shims are clearly marked and deleted by C-A2: the post-join ReceiveCapability redeclaration, and the mapping of legacy SOURCE_MUTED to avatar tokens via ParticipantMuteUpdate (server-muted wins). No shim adds a path that accepts v2 beyond MC's directive, and no shim maps an unknown or legacy state to ACTIVE.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-21-c-a1-sdk-contract-migration
   tag: story-2026-10-07-see-each-other-task-11
 - id: 12
   status: pending
