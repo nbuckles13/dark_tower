@@ -39,15 +39,23 @@ import type {
   CaptureSourceFactory,
   PlaybackSinkFactory,
   VideoCaptureSourceFactory,
+  VideoDecoderFactory,
   VideoEncoderFactory,
 } from '../media/setup/seams.js';
+import { VideoReceiver, type VideoReceiveView } from '../media/lifecycle/VideoReceiver.js';
+import { createVideoDecoder } from '../media/setup/vp8Decoder.js';
 import { VideoCodecUnsupportedError, type Vp8Profile } from '../media/setup/vp8.js';
 import { createVideoEncoder } from '../media/setup/vp8Encoder.js';
 import { createAudioDecoder, createAudioEncoder } from '../media/setup/opus.js';
 import { createAudioContextPlaybackSink } from '../media/setup/audioPlayback.js';
 import type { PublishKind, ReceiveSlotDeclaration } from '../signaling/events.js';
 import { getMetricExportIntervalMs } from '../telemetry/telemetryConfig.js';
-import type { CaptureSourceInfo, MeetingSessionOptions, VideoCaptureSourceInfo } from './events.js';
+import type {
+  CaptureSourceInfo,
+  MeetingSessionOptions,
+  VideoCaptureSourceInfo,
+  VideoSlotRenderChangedEvent,
+} from './events.js';
 import {
   declaredSlotIds,
   selectCaptureSource,
@@ -64,6 +72,7 @@ export interface SessionMediaSeams {
   readonly playbackFactory: PlaybackSinkFactory;
   readonly videoCaptureFactory: VideoCaptureSourceFactory | undefined;
   readonly videoEncoderFactory: VideoEncoderFactory;
+  readonly videoDecoderFactory: VideoDecoderFactory;
   readonly timers: Pick<
     MeetingSessionOptions,
     'setTimeout' | 'clearTimeout' | 'setInterval' | 'clearInterval'
@@ -79,6 +88,7 @@ export function sessionMediaSeams(options: MeetingSessionOptions): SessionMediaS
     playbackFactory: options.playbackFactory ?? createAudioContextPlaybackSink,
     videoCaptureFactory: options.videoCaptureFactory,
     videoEncoderFactory: options.videoEncoderFactory ?? createVideoEncoder,
+    videoDecoderFactory: options.videoDecoderFactory ?? createVideoDecoder,
     timers: {
       ...(options.setTimeout ? { setTimeout: options.setTimeout } : {}),
       ...(options.clearTimeout ? { clearTimeout: options.clearTimeout } : {}),
@@ -110,15 +120,23 @@ export interface SessionMediaDeps {
     readonly muteChanged: (state: MuteSnapshot) => void;
     readonly firstMediaFrame: (elapsedMs: number) => void;
     readonly mediaFault: (fault: MediaFault) => void;
+    readonly videoSlotRenderChanged: (event: VideoSlotRenderChangedEvent) => void;
   };
   /** The signalling-derived media state the pipelines attach to (E3 replay). */
-  readonly mediaState: Pick<SignalingMediaState, 'attach' | 'effectiveTargets'>;
+  readonly mediaState: Pick<
+    SignalingMediaState,
+    'attach' | 'effectiveTargets' | 'videoMuteState' | 'onVideoServerMuteLifted'
+  >;
 }
 
 /** What {@link buildSessionMedia} built. */
 export interface SessionMedia {
   readonly pipeline: AudioPipeline;
   readonly video: VideoPublisher | undefined;
+  /** The video receive path, when this client declared video slots (story 3 C-B). Internal. */
+  readonly videoReceiver: VideoReceiver | undefined;
+  /** The narrow embedder view of it (security F4) — what the session hands out. */
+  readonly videoView: VideoReceiveView | undefined;
   readonly captureInfo: CaptureSourceInfo;
   readonly videoCaptureInfo: VideoCaptureSourceInfo | undefined;
   /**
@@ -132,6 +150,11 @@ export interface SessionMedia {
    * in-flight seal). Idempotent; never rejects. Runs on EVERY exit.
    */
   release(): Promise<void>;
+  /**
+   * Story 2 R-18, EVERY kind: drop `senderId`'s cached transmit keys in the
+   * audio pipeline AND the video receiver. Replay state is kept in both.
+   */
+  purgeTransmitKeys(senderId: number): void;
 }
 
 /** Build the session's media (not started). See the module header. */
@@ -194,12 +217,44 @@ export function buildSessionMedia(deps: SessionMediaDeps): SessionMedia {
     });
   }
 
+  // The video RECEIVE path (story 3 C-B): only when video slots were declared.
+  const videoSlotIds = declaredSlotIds(deps.declaration, 'video');
+  let videoReceiver: VideoReceiver | undefined;
+  if (videoSlotIds.length > 0) {
+    videoReceiver = new VideoReceiver({
+      config: deps.config,
+      configSource: deps.configSource,
+      metrics: deps.metrics.video,
+      kekSource: deps.kekSource,
+      roster: deps.roster,
+      selfSenderId: deps.senderId,
+      videoMuteState: (senderId) => deps.mediaState.videoMuteState(senderId),
+      declaredSlotIds: videoSlotIds,
+      incomingStreamsFor: (url) => media?.incomingUniStreamsFor(url),
+      sendRecoveryRequest: (url, request) =>
+        media ? media.sendRecoveryRequest(url, request) : Promise.reject(new Error('no media')),
+      decoderFactory: seams.videoDecoderFactory,
+      metricExportIntervalMs: getMetricExportIntervalMs(),
+      fault: deps.emit.mediaFault,
+      onRenderChanged: (slotId, state) => deps.emit.videoSlotRenderChanged({ slotId, state }),
+      ...(deps.verification ? { verification: deps.verification } : {}),
+      clock: deps.clock,
+      ...(seams.timers.setInterval ? { setInterval: seams.timers.setInterval } : {}),
+      ...(seams.timers.clearInterval ? { clearInterval: seams.timers.clearInterval } : {}),
+    });
+    const receiver = videoReceiver;
+    deps.mediaState.onVideoServerMuteLifted((senderId) => receiver.videoServerMuteLifted(senderId));
+  }
+
   let released: Promise<void> | undefined;
   const release = (): Promise<void> => {
     released ??= (async () => {
       const videoDrained = video?.stop();
+      deps.mediaState.onVideoServerMuteLifted(undefined);
+      const receiverStopped = videoReceiver?.stop();
       try {
         await pipeline.stop();
+        await receiverStopped;
         // Video's in-flight seals too (its submit chain never rejects).
         await videoDrained;
       } catch {
@@ -229,6 +284,7 @@ export function buildSessionMedia(deps: SessionMediaDeps): SessionMedia {
       publish: deps.publish,
       pipeline,
       ...(video ? { video } : {}),
+      ...(videoReceiver ? { videoReceiver } : {}),
       defaultBitrateBps: deps.config.audio.defaultBitrateBps,
       metrics: deps.metrics,
       fault: deps.emit.mediaFault,
@@ -240,6 +296,7 @@ export function buildSessionMedia(deps: SessionMediaDeps): SessionMedia {
     try {
       await pipeline.start(startOptions);
       video?.start();
+      videoReceiver?.start();
     } catch (err) {
       await release();
       throw err;
@@ -252,7 +309,22 @@ export function buildSessionMedia(deps: SessionMediaDeps): SessionMedia {
   // still before `start()`, so before any capture can mint.
   unsubscribe = rotateOnKekChange(deps.kekSource, transmitKeys);
 
-  return { pipeline, video, captureInfo: capture.info, videoCaptureInfo, start, release };
+  const purgeTransmitKeys = (senderId: number): void => {
+    pipeline.purgeTransmitKeys(senderId);
+    videoReceiver?.purgeTransmitKeys(senderId);
+  };
+
+  return {
+    pipeline,
+    video,
+    videoReceiver,
+    videoView: videoReceiver?.view(),
+    captureInfo: capture.info,
+    videoCaptureInfo,
+    start,
+    release,
+    purgeTransmitKeys,
+  };
 }
 
 /** The join-time VP8 probe result: `undefined` when video is not in use. */

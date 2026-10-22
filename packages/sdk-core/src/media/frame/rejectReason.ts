@@ -191,6 +191,25 @@ export const ALL_REJECT_REASONS: readonly RejectReason[] = [
 ] as const;
 
 /**
+ * The reject reasons that judge DECODER OUTPUT (or the decrypted bitstream the
+ * decoder is about to see) rather than the frame on the wire — the ONE
+ * exception to the parse-boundary accounting identity (story 3 C-B):
+ *
+ *     received = accepted + sum(drops{reason not in this set})
+ *
+ * A video frame is ACCEPTED once it verified, decrypted and reached its slot
+ * pipeline; only then can its decoded geometry or rate be judged, so a
+ * `decode_over_bound` frame is counted on BOTH sides and is subtracted here.
+ * The token cannot move to a post-accept counter: it is a member of the vectors
+ * file's closed vocabulary and the task names it a frame drop.
+ *
+ * A subset of {@link RejectReason}, not a second union.
+ */
+export const VIDEO_POST_DECODE_REJECT_REASONS = [
+  'decode_over_bound',
+] as const satisfies readonly RejectReason[];
+
+/**
  * The ONE reason that does not drop the frame.
  *
  * ADR-0036 §4: the receiver ignores a wrap bound to another key id and otherwise

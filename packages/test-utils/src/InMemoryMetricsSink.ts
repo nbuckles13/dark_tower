@@ -23,6 +23,8 @@ export interface RecordedMetric {
   readonly value: number;
   /** `Date.now()` at the time of recording, for ordering / debugging. */
   readonly recordedAt: number;
+  /** Histogram only: the explicit bucket boundaries the caller declared, if any. */
+  readonly boundaries?: readonly number[];
 }
 
 /**
@@ -76,13 +78,19 @@ export class InMemoryMetricsSink implements MetricsSink {
   }
 
   /** Record a histogram observation of `value`. */
-  histogram(name: string, labels: MetricLabels, value: number): void {
+  histogram(
+    name: string,
+    labels: MetricLabels,
+    value: number,
+    boundaries?: readonly number[],
+  ): void {
     this.#recorded.push({
       kind: 'histogram',
       name,
       labels: freezeLabels(labels),
       value,
       recordedAt: Date.now(),
+      ...(boundaries ? { boundaries: Object.freeze([...boundaries]) } : {}),
     });
   }
 

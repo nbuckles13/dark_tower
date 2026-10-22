@@ -70,9 +70,71 @@ export function buildVp8EncoderConfig(profile: Vp8Profile): VideoEncoderConfig {
   };
 }
 
-/** The VP8 decoder configuration for a profile. */
-export function buildVp8DecoderConfig(profile: Vp8Profile): VideoDecoderConfig {
-  return { codec: 'vp8', codedWidth: profile.width, codedHeight: profile.height };
+/**
+ * The VP8 decoder configuration for a profile — the probe's AND every receive
+ * slot's (story 3 C-B, built from the slot's configured bounds, never the
+ * bitstream). `optimizeForLatency`: a call, not a playback buffer.
+ *
+ * `codedWidth`/`codedHeight` are HINTS to WebCodecs, not enforcement: the
+ * receive slot judges every decoded frame against its bounds itself.
+ */
+export function buildVp8DecoderConfig(
+  profile: Pick<Vp8Profile, 'width' | 'height'>,
+): VideoDecoderConfig {
+  return {
+    codec: 'vp8',
+    codedWidth: profile.width,
+    codedHeight: profile.height,
+    optimizeForLatency: true,
+  };
+}
+
+/**
+ * The bytes of a VP8 key frame's uncompressed header (RFC 6386 §9.1): the
+ * 3-byte frame tag, the 3-byte start code, then 2 bytes each of width and
+ * height (14-bit dimension, 2-bit scale).
+ */
+const VP8_KEYFRAME_HEADER_BYTES = 10;
+const VP8_START_CODE = [0x9d, 0x01, 0x2a] as const;
+const VP8_DIMENSION_MASK = 0x3fff;
+
+/** What a VP8 key frame's header declares, or why it could not be read. */
+export type Vp8KeyframeDimensions =
+  { readonly ok: true; readonly width: number; readonly height: number } | { readonly ok: false };
+
+/**
+ * Whether a VP8 frame's bitstream says it is a KEY frame (RFC 6386 §9.1: frame
+ * tag bit 0 is `!key_frame`). Bounds-checked: an empty buffer is not one. Used
+ * to refuse a frame whose SIGNED header flag and bitstream disagree.
+ */
+export function vp8IsKeyFrame(plaintext: Uint8Array): boolean {
+  return plaintext.length > 0 && ((plaintext[0] as number) & 0x01) === 0;
+}
+
+/**
+ * Read the coded dimensions a VP8 KEY frame declares (RFC 6386 §9.1), from
+ * DECRYPTED plaintext, before the native decoder sees it — so an over-bound
+ * key frame never reaches the platform decoder (story 3 C-B, security).
+ *
+ * Bounds-checked: a buffer shorter than the header, a frame whose tag says it
+ * is NOT a key frame, or a wrong start code is `{ok: false}` — a typed result,
+ * never an exception and never a read past the end. Call on key frames only.
+ * PURE; VP8 bitstream knowledge lives in this module and nowhere else.
+ */
+export function vp8KeyframeDimensions(plaintext: Uint8Array): Vp8KeyframeDimensions {
+  if (plaintext.length < VP8_KEYFRAME_HEADER_BYTES) return { ok: false };
+  // Frame tag bit 0 is `!key_frame` (0 = key frame).
+  if (((plaintext[0] as number) & 0x01) !== 0) return { ok: false };
+  if (
+    plaintext[3] !== VP8_START_CODE[0] ||
+    plaintext[4] !== VP8_START_CODE[1] ||
+    plaintext[5] !== VP8_START_CODE[2]
+  ) {
+    return { ok: false };
+  }
+  const width = ((plaintext[6] as number) | ((plaintext[7] as number) << 8)) & VP8_DIMENSION_MASK;
+  const height = ((plaintext[8] as number) | ((plaintext[9] as number) << 8)) & VP8_DIMENSION_MASK;
+  return { ok: true, width, height };
 }
 
 /** The probe profile of a directed encoding. */

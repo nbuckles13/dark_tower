@@ -13,6 +13,7 @@ import {
   makeAudioData,
   InMemoryMetricsSink,
   RecordingPlaybackSink,
+  FakeVideoDecoders,
   type MockWebTransport,
 } from '@darktower/test-utils';
 
@@ -67,7 +68,12 @@ import {
   framedParticipantMuteUpdate,
   framedUnmuteRequestRelay,
   framedMeetingKekUpdate,
+  framedParticipantLeft,
 } from '../../signaling/__tests__/helpers.js';
+import { VideoReceiver } from '../../media/lifecycle/VideoReceiver.js';
+import { AudioPipeline } from '../../media/lifecycle/AudioPipeline.js';
+import type { VideoSlotRenderChangedEvent } from '../events.js';
+import { LeaveReason } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import {
   decodeClientMessages,
   decodeMhClientMessages,
@@ -2590,6 +2596,144 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
       expect(Object.keys(m.labels)).not.toContain('stream_number');
       expect(Object.keys(m.labels)).not.toContain('gop_counter');
     }
+    rig.session.disconnect();
+  });
+});
+
+describe('MeetingSession — video receive wiring (story 3 C-B)', () => {
+  const KEK = new Uint8Array(32).fill(0x11);
+  const PEER = {
+    participantId: 'p-video',
+    name: 'V',
+    senderId: 300,
+    identityPublicKey: new Uint8Array(32).fill(3),
+  };
+
+  async function videoRig(metricsSink: InMemoryMetricsSink = new InMemoryMetricsSink()) {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const mocks = new Map<string, MockWebTransport>();
+    const codecs = new FakeAudioCodecs();
+    const decoders = new FakeVideoDecoders();
+    const session = makeSession(mocks, {
+      metricsSink,
+      captureFactory: async () => new FakeCaptureSource() as never,
+      encoderFactory: codecs.encoderFactory as never,
+      decoderFactory: codecs.decoderFactory as never,
+      playbackFactory: new RecordingPlaybackSink().factory as never,
+      videoDecoderFactory: decoders.factory as never,
+      audioReceiveSlots: { count: 1, source: 'configured' },
+      videoReceiveSlots: { count: 2, source: 'configured' },
+    });
+    const joining = session.join({
+      meetingCode: MEETING_CODE,
+      orgSubdomain: 'acme',
+      credentials: LOGIN,
+    });
+    await driveJoin(mocks, 'all', { senderId: 258, meetingKek: KEK, participants: [PEER] });
+    await joining;
+    await session.startMedia();
+    return { session, mocks, decoders, mc: mocks.get(MC_ENDPOINT)! };
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('startMedia builds the receiver with exactly M decoders; video assignments reach it; renders are bridged', async () => {
+    const rig = await videoRig();
+    expect(Object.keys(rig.session.videoReceive ?? {}).sort()).toEqual([
+      'evidence',
+      'setVideoSink',
+      'unfulfilledSnapshot',
+    ]);
+    expect(Object.isFrozen(rig.session.videoReceive)).toBe(true);
+    expect(rig.decoders.constructions).toBe(2);
+    const renders: VideoSlotRenderChangedEvent[] = [];
+    rig.session.on('videoSlotRenderChanged', (e) => renders.push(e));
+    // Video slots are ids 1 and 2 (audio 0).
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({
+        slotId: 1,
+        senderId: 300,
+        mediaHandlerUrl: MEDIA_SERVERS[0]!,
+        slotState: SlotState.AVATAR_NO_VIDEO,
+        mediaKind: MediaKind.VIDEO_CAMERA,
+      }),
+    );
+    await waitFor(() => renders.length > 0);
+    expect(renders).toEqual([
+      { slotId: 1, state: { kind: 'avatar', participantSenderId: 300, reason: 'avatar_no_video' } },
+    ]);
+    expect(rig.session.videoReceive?.evidence().find((e) => e.slotId === 1)?.mcState).toBe(
+      'avatar_no_video',
+    );
+    // The pairing view reads assignments AND live senders.
+    expect(rig.session.slotPairing.get(300)).toEqual({ videoSlotId: 1 });
+    rig.session.videoReceive?.setVideoSink(1, { drawFrame: () => {} });
+    rig.session.disconnect();
+  });
+
+  it('disconnect records every unfulfilled exit and the gauge 0 SYNCHRONOUSLY, before the final flush', async () => {
+    const sink = new InMemoryMetricsSink();
+    const rig = await videoRig(sink);
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({
+        slotId: 1,
+        mediaHandlerUrl: MEDIA_SERVERS[0]!,
+        slotState: SlotState.ACTIVE,
+        mediaKind: MediaKind.VIDEO_CAMERA,
+      }),
+    );
+    await waitFor(() => rig.session.videoReceive?.evidence()[0]?.unfulfilled === true);
+    rig.session.disconnect();
+    // No await: what the disconnect's flush can see.
+    const named = (n: string) => sink.getRecordedMetrics().filter((m) => m.name === n);
+    expect(named('dt_client_media_slot_unfulfilled_duration_ms')).toHaveLength(1);
+    expect(named('dt_client_media_slots_unfulfilled').at(-1)?.value).toBe(0);
+  });
+
+  it('the video server-mute -> unmute EDGE reaches the receiver with the roster sender id', async () => {
+    const rig = await videoRig();
+    const lifted = vi.spyOn(VideoReceiver.prototype, 'videoServerMuteLifted');
+    rig.mc.simulateServerMessage(
+      0,
+      framedParticipantMuteUpdate({
+        participantId: 'p-video',
+        audioServerMuted: false,
+        videoServerMuted: true,
+      }),
+    );
+    rig.mc.simulateServerMessage(
+      0,
+      framedParticipantMuteUpdate({
+        participantId: 'p-video',
+        audioServerMuted: true,
+        videoServerMuted: true,
+      }),
+    );
+    rig.mc.simulateServerMessage(
+      0,
+      framedParticipantMuteUpdate({
+        participantId: 'p-video',
+        audioServerMuted: true,
+        videoServerMuted: false,
+      }),
+    );
+    await waitFor(() => lifted.mock.calls.length > 0);
+    expect(lifted.mock.calls).toEqual([[300]]);
+    rig.session.disconnect();
+  });
+
+  it('a roster forget purges transmit keys in BOTH the audio pipeline and the video receiver', async () => {
+    const rig = await videoRig();
+    const video = vi.spyOn(VideoReceiver.prototype, 'purgeTransmitKeys');
+    const audio = vi.spyOn(AudioPipeline.prototype, 'purgeTransmitKeys');
+    rig.mc.simulateServerMessage(0, framedParticipantLeft('p-video', LeaveReason.VOLUNTARY));
+    await waitFor(() => video.mock.calls.length > 0);
+    expect(video.mock.calls).toEqual([[300]]);
+    expect(audio.mock.calls).toEqual([[300]]);
     rig.session.disconnect();
   });
 });

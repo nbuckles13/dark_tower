@@ -67,7 +67,7 @@ import type {
   PlaybackSinkFactory,
 } from '../setup/seams.js';
 import type { RejectReason } from '../frame/rejectReason.js';
-import { TeardownRegistry } from '../teardown/teardown.js';
+import { TeardownRegistry, teardownFailureMessage } from '../teardown/teardown.js';
 import { MuteState, type MuteSnapshot } from './muteState.js';
 import { uplinkRelayStreamId } from '../pipeline/sendId.js';
 import { MediaCaptureError, classifyCaptureError } from '../setup/captureFailure.js';
@@ -75,6 +75,7 @@ import { MEDIA_CAPTURE_FAILURE_OUTCOMES } from '../setup/mediaMetrics.js';
 import type { TransmitKeyManager } from './transmitKeys.js';
 import { FaultOnce } from './faultOnce.js';
 import { ReceiveTransports } from './receiveTransports.js';
+import { bindReceiverState } from './receiverState.js';
 
 /** Why the pipeline reported a fault. Bounded; never a raw platform message. */
 export const MediaFaultStage = {
@@ -603,38 +604,19 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       frameFault: (message) => this.#fault(MediaFaultStage.Crypto, message, false),
     });
 
-    // Receive-side state is cleared at teardown: ADR-0028 §5's explicit cleanup,
-    // whose wiring the codec task deliberately left to this task.
-    this.#teardown.register('receiver-state', () => {
-      this.#cache.clear();
-      this.#replay.clear();
+    // Receive-side key state: cleared at teardown and discarded per KEK
+    // generation by the ONE binding both kinds use (`receiverState.ts`, C-3).
+    // Bound before any datagram can reach the ingress.
+    bindReceiverState(
+      { cache: this.#cache, replay: this.#replay },
+      this.#options.kekSource,
+      (name, dispose) => this.#teardown.register(name, dispose),
+      '',
+    );
+    this.#teardown.register('receive-bookkeeping', () => {
       this.#transports?.clear();
       this.#firstMedia.clear();
     });
-    // The transmit keys are the SESSION's: cleared by it after every path stops.
-
-    // C-3 (story 2 R-16): a KEK generation leaving retention takes its replay
-    // scope and its transmit keys with it, TOGETHER, in this one synchronous
-    // listener. Both are DERIVED from the holder, which is authoritative for
-    // which generations are live; they have no lifetime of their own, so the two
-    // cannot disagree with it or with each other. There is no other timer — the
-    // holder's retention timer, its lazy backstop, a demotion and its
-    // `RetentionGuard` fail-safe all arrive here. Subscribed before any datagram
-    // can reach the ingress, so no scope can be created that this does not see.
-    // NOT RE-ENTRANT, STRUCTURALLY (@security). The body is two synchronous map
-    // deletions and nothing else: no await, no emit, no metric, no call back into
-    // the ingress — so although this fires from INSIDE frame processing (the
-    // holder's lazy expiry runs on the receive path's own KEK lookup), it cannot
-    // re-enter `openVerifiedFrame`. Registered exactly ONCE here, so "one
-    // synchronous listener" is a property of this call site rather than of
-    // whatever happens to be subscribed. Keep it that way: anything async or
-    // anything that emits would make the discard interleave with the frame whose
-    // lookup triggered it.
-    const unsubscribeDropped = this.#options.kekSource.onGenerationDropped((generation) => {
-      this.#replay.discardGeneration(generation);
-      this.#cache.discardGeneration(generation);
-    });
-    this.#teardown.register('kek-generation-dropped-listener', unsubscribeDropped);
 
     // Sampled FROM THE START, before any datagram can arrive, so the measurement
     // exists for every session rather than only for lucky ones.
@@ -875,11 +857,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       // Surfaced, not swallowed. The NAME is a static string chosen at
       // registration; the error itself is deliberately not interpolated,
       // because a platform message on this path could carry anything.
-      this.#fault(
-        MediaFaultStage.Transport,
-        `media teardown step '${failure.name}' failed; the resource may not have been released`,
-        false,
-      );
+      this.#fault(MediaFaultStage.Transport, teardownFailureMessage(failure.name), false);
     }
   }
 

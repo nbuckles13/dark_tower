@@ -64,3 +64,16 @@ describe('RosterKeyFeed', () => {
     expect(upserts).toEqual([]);
   });
 });
+
+describe('RosterKeyFeed.participantIdOf — the reverse query over the ONE index (story 3 C-B)', () => {
+  it('maps a sender to its participant, following rebind and leave', () => {
+    const feed = new RosterKeyFeed(recordingSink().sink);
+    feed.joined([{ participantId: 'p1', senderId: 11, identityPublicKey: key }]);
+    expect(feed.participantIdOf(11)).toBe('p1');
+    feed.joined([{ participantId: 'p1', senderId: 12, identityPublicKey: key }]);
+    expect(feed.participantIdOf(11)).toBeUndefined();
+    expect(feed.participantIdOf(12)).toBe('p1');
+    feed.left('p1');
+    expect(feed.participantIdOf(12)).toBeUndefined();
+  });
+});

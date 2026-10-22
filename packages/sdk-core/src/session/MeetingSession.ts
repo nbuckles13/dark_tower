@@ -44,6 +44,7 @@ import {
   mhControlSink,
   rosterInvalidationListener,
   zeroInitDirectiveSeries,
+  bestEffortMuteReport,
 } from './mediaWiring.js';
 import { readIsHost } from './meetingRole.js';
 import { MediaMetrics } from '../media/setup/mediaMetrics.js';
@@ -51,6 +52,7 @@ import type { MuteSnapshot } from '../media/lifecycle/muteState.js';
 import { RosterIdentityKeys } from '../media/setup/rosterKeys.js';
 import type { ReceiveVerificationRecorder } from '../media/pipeline/receiveVerification.js';
 import type { VideoPublisher } from '../media/lifecycle/VideoPublisher.js';
+import type { VideoReceiveView } from '../media/lifecycle/VideoReceiver.js';
 import { probeVp8Support, type Vp8Profile } from '../media/setup/vp8.js';
 import { TypedEventEmitter } from '../events/TypedEventEmitter.js';
 import {
@@ -599,14 +601,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       declaration: this.#slots.declaration,
       media: this.#media,
       mute: this.#mediaState.mute,
-      reportMute: (state) => {
-        // Informational and deliberately best-effort: ADR-0036 §5 requires
-        // client mute to hold WITHOUT the server honouring it, so a failed
-        // report must not undo the local suppression. Both kinds, explicit.
-        void signaling.sendMuteRequest(state).catch(() => {
-          // Nothing actionable, and nothing safe to log about a mute report.
-        });
-      },
+      reportMute: bestEffortMuteReport(signaling),
       seams: this.#seams,
       verification: this.#receiveVerification,
       clock: this.#clock,
@@ -614,6 +609,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         muteChanged: (snapshot) => this.emit('muteChanged', snapshot),
         firstMediaFrame: (elapsedMs) => this.emit('firstMediaFrame', elapsedMs),
         mediaFault: (fault) => this.emit('mediaFault', fault),
+        videoSlotRenderChanged: (e) => this.emit('videoSlotRenderChanged', e),
       },
       mediaState: this.#mediaState,
     });
@@ -672,11 +668,16 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   /**
    * The participant pairing view (story 3 R-3): sender id -> the audio and video
    * slots naming that sender, from MC's LATEST assignments. Pairing is by
-   * publisher, never by slot index. Live video slots name no sender, so they
-   * do not appear (story 3 C-B adds live-video pairing from verified frames).
+   * publisher, never by slot index. A live video slot pairs by the VERIFIED
+   * sender of its last rendered frame (story 3 C-B).
    */
   get slotPairing(): ReadonlyMap<number, SlotPair> {
-    return this.#mediaState.slotPairing;
+    return this.#mediaState.slotPairing(this.#sessionMedia?.videoReceiver?.liveSenders());
+  }
+
+  /** Video receive (story 3 C-B): attach slot sinks, read evidence. Narrow by design. */
+  get videoReceive(): VideoReceiveView | undefined {
+    return this.#sessionMedia?.videoView;
   }
 
   /**
@@ -939,7 +940,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     this.#rosterKeys.setTransmitKeyInvalidationListener(
       rosterInvalidationListener(
         () => this.#mediaMetrics?.session,
-        () => this.#pipeline,
+        () => this.#sessionMedia, // every kind's key cache (`mediaStart.ts`)
       ),
     );
     const opts: SignalingClientOptions = {

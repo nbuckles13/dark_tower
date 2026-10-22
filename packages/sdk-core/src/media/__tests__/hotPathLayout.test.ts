@@ -95,7 +95,18 @@ describe('media hot-path layout (ADR-0036 §11)', () => {
     // Story 3 C-A2: the video egress and the shared seal sequence are per-frame
     // code and must sit INSIDE the scanned scope, by name.
     const files = sourceFiles(HOT_PATH_DIR, SCAN_SCOPE);
-    for (const name of ['egress.ts', 'videoEgress.ts', 'frameSeal.ts']) {
+    for (const name of [
+      'egress.ts',
+      'videoEgress.ts',
+      'frameSeal.ts',
+      // Story 3 C-B: the video receive hot path.
+      'streamReader.ts',
+      'receivePolicy.ts',
+      'frameAccounting.ts',
+      'videoIngress.ts',
+      'videoSlotPipeline.ts',
+      'renderDecision.ts',
+    ]) {
       expect(
         files.some((f) => f.endsWith(`/pipeline/${name}`)),
         `${name} is not in the hot-path scan`,

@@ -62,8 +62,21 @@ export interface MetricsSink {
   /**
    * Record an observation of `value` against a histogram identified by
    * `(name, labels)`.
+   *
+   * `boundaries` (optional) are the explicit bucket upper bounds for this
+   * histogram, as declared ONCE by the metric's owner beside its emission (story
+   * 3 C-B; e.g. `mediaMetrics.ts:SLOT_UNFULFILLED_BUCKETS_MS`). Instruments are
+   * keyed by NAME, so boundaries bind at the FIRST observation of a name; a later
+   * call with different boundaries is a drifted call site (production sinks throw
+   * in `'throw'` mode, warn and keep the first in `'warn'` mode). Omitted: the
+   * sink's default buckets.
    */
-  histogram(name: string, labels: MetricLabels, value: number): void;
+  histogram(
+    name: string,
+    labels: MetricLabels,
+    value: number,
+    boundaries?: readonly number[],
+  ): void;
 
   /**
    * Set a gauge to `value` for `(name, labels)`. Most-recent-write-wins

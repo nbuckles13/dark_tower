@@ -44,6 +44,7 @@
 //     which are per sender and owned elsewhere.
 
 import type { MediaKindMetrics } from '../setup/mediaMetrics.js';
+import { DecoderRestartGate } from './decoderRestartGate.js';
 import type {
   AudioDecoderFactory,
   AudioDecoderSeam,
@@ -199,7 +200,7 @@ class Lane implements DecodeLane {
    * a decoder this lane has already discarded cannot act on the current one.
    */
   #instance = 0;
-  #lastFaultAtMs: number | undefined;
+  readonly #restart: DecoderRestartGate;
   readonly #pending: EncodedAudioFrame[] = [];
   #closed = false;
   /** Decoder OUTPUTS on this lane (post-decode). One increment per output. */
@@ -209,6 +210,7 @@ class Lane implements DecodeLane {
   constructor(options: ReceiveLanesOptions, senderId: number, epoch: number) {
     this.#options = options;
     this.epoch = epoch;
+    this.#restart = new DecoderRestartGate(options.restartBackoffMs, options.clock);
     this.#playback = options.playback.openLane(senderId);
     // Created EAGERLY at assignment, so it is usually ready before MH forwards
     // the sender's first frame.
@@ -257,13 +259,7 @@ class Lane implements DecodeLane {
    */
   #ensureDecoder(): void {
     if (this.#closed || this.#decoder || this.#creating) return;
-    const lastFault = this.#lastFaultAtMs;
-    if (
-      lastFault !== undefined &&
-      this.#options.clock() - lastFault < this.#options.restartBackoffMs
-    ) {
-      return;
-    }
+    if (!this.#restart.mayRestart()) return;
     this.#creating = true;
     const instance = (this.#instance += 1);
     this.#options
@@ -307,7 +303,7 @@ class Lane implements DecodeLane {
     this.#options.metrics.decoderError();
     this.#decoder?.close();
     this.#decoder = undefined;
-    this.#lastFaultAtMs = this.#options.clock();
+    this.#restart.fault();
     this.#options.onDecoderFault();
   }
 }

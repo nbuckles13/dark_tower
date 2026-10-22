@@ -168,3 +168,47 @@ describe('OtelMetricsSink', () => {
     expect(counters.get('dt_client_signaling_connection_total')?.calls[0]?.value).toBe(1);
   });
 });
+
+describe('OtelMetricsSink — explicit histogram bucket boundaries (story 3 C-B)', () => {
+  const NAME = 'dt_client_media_slot_unfulfilled_duration_ms';
+
+  it('passes declared boundaries as OTel advice at FIRST creation; none when omitted', () => {
+    const { meter, createHistogram } = makeFakeMeter();
+    const sink = new OtelMetricsSink(meter, 'throw');
+    sink.histogram(NAME, {}, 1, [10, 100_000, 300_000]);
+    sink.histogram(NAME, {}, 2, [10, 100_000, 300_000]);
+    expect(createHistogram).toHaveBeenCalledTimes(1);
+    expect(createHistogram.mock.calls[0]).toEqual([
+      NAME,
+      { advice: { explicitBucketBoundaries: [10, 100_000, 300_000] } },
+    ]);
+    sink.histogram('dt_client_time_to_signaling_ready_ms', {}, 1);
+    expect(createHistogram.mock.calls[1]).toEqual([
+      'dt_client_time_to_signaling_ready_ms',
+      undefined,
+    ]);
+  });
+
+  it("a later call with DIFFERENT boundaries throws in 'throw' mode (a drifted call site)", () => {
+    const { meter } = makeFakeMeter();
+    const sink = new OtelMetricsSink(meter, 'throw');
+    sink.histogram(NAME, {}, 1, [10, 20]);
+    expect(() => sink.histogram(NAME, {}, 1, [10, 30])).toThrow(/bucket boundaries/);
+    expect(() => sink.histogram(NAME, {}, 1)).toThrow(/bucket boundaries/);
+  });
+
+  it("warns and keeps the first boundaries in 'warn' mode, still recording", () => {
+    const { meter, histograms } = makeFakeMeter();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const sink = new OtelMetricsSink(meter, 'warn');
+    sink.histogram(NAME, {}, 1, [10, 20]);
+    sink.histogram(NAME, {}, 2, [10, 30]);
+    sink.histogram(NAME, {}, 3, [10, 30]);
+    expect(warn).toHaveBeenCalledTimes(1); // once per name, not per observation
+    expect(histograms.get(NAME)?.calls.map((c) => c.value)).toEqual([1, 2, 3]);
+    // An equal-valued but distinct array is the SAME boundaries.
+    sink.histogram(NAME, {}, 4, [10, 20]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+});

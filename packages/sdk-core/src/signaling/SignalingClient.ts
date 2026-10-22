@@ -344,6 +344,16 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     return this.#publishKinds;
   }
 
+  /** The roster's sender id for `participantId` (`rosterKeyFeed.ts`, the one index). */
+  senderIdOf(participantId: string): number | undefined {
+    return this.#rosterKeys.senderIdOf(participantId);
+  }
+
+  /** The roster's participant for `senderId` — the REVERSE query over the same one index. */
+  participantIdOf(senderId: number): string | undefined {
+    return this.#rosterKeys.participantIdOf(senderId);
+  }
+
   /**
    * Connect to MC, send the `JoinRequest`, and resolve with the typed
    * {@link JoinedEvent} when `JoinResponse` arrives. Rejects with a

@@ -19,9 +19,14 @@
 // right. It is a RECEIVE-PATH ACCOUNTING IDENTITY whose job is to prove that no
 // drop path fails to count itself; it says nothing about audibility.
 //
-// NOTE FOR THE VIDEO STORY: this counting point must move from the transport
-// boundary to the PARSE boundary once several frames share one stream, and the
-// identity must be re-established there.
+// THE COUNTING POINT IS THE PARSE BOUNDARY, PER KIND (story 3 C-B resolved the
+// video story's note here). For audio one datagram IS one frame, so the parse
+// boundary and the wire coincide and nothing about this path changed. Video
+// frames share a group stream, so `videoIngress.ts` counts each frame at its
+// first byte, and the identity is re-established there with one stated
+// exception: `received = accepted + sum(drops{reason not in
+// VIDEO_POST_DECODE_REJECT_REASONS})`. Both kinds keep the counters in ONE
+// helper, `frameAccounting.ts`, and run ONE policy, `receivePolicy.ts`.
 //
 // ---------------------------------------------------------------------------
 // THERE IS NO SELF-TRUST BRANCH
@@ -35,16 +40,26 @@
 // The identity key is resolved from `key_id.sender_id` AND NOTHING ELSE — never
 // from the slot assignment, never from the relay `stream_id`, never from a
 // "current speaker" cache. `RosterIdentityKeys` has no method that takes any of
-// those, so the wrong lookup is not expressible.
+// those, so the wrong lookup is not expressible. The resolve/verify/gate/open
+// sequence itself is `receivePolicy.ts:receiveByKind`, shared with video.
 //
 // ---------------------------------------------------------------------------
 // THE RELAY REGION IS UNAUTHENTICATED AND IS QUARANTINED TO ONE CONSUMER
 // ---------------------------------------------------------------------------
 //
-// `stream_id` and `hop_sequence` are written by MH and signed by nobody. They
-// reach exactly one place — the hop-sequence monitor, which creates no state for
-// an undeclared `stream_id` — and they never reach key selection, roster lookup,
-// attribution, the replay window, or any drop-or-play decision.
+// `stream_id` and `hop_sequence` are written by MH and signed by nobody. On
+// this DATAGRAM path they reach exactly one place — the hop-sequence monitor,
+// which creates no state for an undeclared `stream_id` — and they never reach
+// key selection, roster lookup, attribution, the replay window, or any
+// drop-or-play decision.
+//
+// VIDEO DIFFERS, BY DESIGN (story 3 C-B; security accepted at Gate 1): on a
+// group stream the relay `stream_id` SELECTS the slot pipeline, because MH owns
+// the per-subscriber slot mapping and the media kind comes from transport and
+// slot. It still never reaches attribution: the render tag, the pairing view
+// and every evidence hook use only the VERIFIED key-id sender. A stream naming
+// an undeclared or non-video slot, or changing slot mid-stream, is aborted and
+// counted `stream_slot_mismatch` (lead ruling E2). See `videoIngress.ts`.
 //
 // ---------------------------------------------------------------------------
 // THE SLOT-EDGE GATE: VERIFY, THEN GATE, THEN OPEN
@@ -66,28 +81,19 @@
 // authority is MC's stated assignment and never observed traffic.
 
 import { decodeFrame } from '../frame/frameCodec.js';
-import { parseSframe } from '../frame/sframe.js';
-import { unpackKeyId } from '../frame/keyId.js';
-import {
-  openVerifiedFrame,
-  verifyFrame,
-  type ReceiverKeys,
-  type ReplayWindow,
-  type TransmitKeyCache,
-} from '../frame/receivePath.js';
-import { FrameRejectedError, assignmentReject } from '../frame/rejectReason.js';
+import { keyIdSenderOf } from '../frame/sframe.js';
+import type { ReceiverKeys, ReplayWindow, TransmitKeyCache } from '../frame/receivePath.js';
+import { FrameRejectedError } from '../frame/rejectReason.js';
 import type { RejectReason } from '../frame/rejectReason.js';
 import type { MediaKindMetrics } from '../setup/mediaMetrics.js';
 import type { DecodeLane } from './receiveLanes.js';
 import type { FirstMediaObserver } from '../setup/measurement.js';
 import type { HopSequenceMonitor } from './hopSequenceMonitor.js';
 import type { ObservedSlot, ReceiveVerificationRecorder } from './receiveVerification.js';
+import { FrameAccounting } from './frameAccounting.js';
+import { receiveByKind, type IdentityKeyResolver, type ReceiveGate } from './receivePolicy.js';
 
-/** Resolves a verification key from a frame's own `key_id.sender_id`. */
-export interface IdentityKeyResolver {
-  /** `undefined` when this client holds no usable key for `senderId`. */
-  identityKeyFor(senderId: number): CryptoKey | undefined;
-}
+export type { IdentityKeyResolver } from './receivePolicy.js';
 
 /** A frame that completed the receive path. Attribution comes from the key id. */
 export interface AcceptedFrame {
@@ -133,7 +139,7 @@ export interface IngressPipelineOptions {
 export class IngressPipeline {
   readonly #metrics: MediaKindMetrics;
   readonly #roster: IdentityKeyResolver;
-  readonly #lanes: SenderGate;
+  readonly #gate: Extract<ReceiveGate, { kind: 'audio' }>;
   readonly #keys: ReceiverKeys;
   readonly #cache: TransmitKeyCache;
   readonly #replay: ReplayWindow;
@@ -142,46 +148,20 @@ export class IngressPipeline {
   readonly #verify: ReceiveVerificationRecorder | undefined;
 
   /**
-   * Frames that completed the receive path, since construction. Monotone.
-   *
-   * A plain field read, sampled by an embedder — never a per-frame emission.
-   * Bumped at the single site beside `MediaKindMetrics.frameAccepted()`.
+   * `received = accepted + sum(drops by reason)`, kept by the ONE accounting
+   * helper both kinds use (`frameAccounting.ts`). Without the received side a
+   * reader cannot tell "nothing is arriving" from "arriving and being rejected"
+   * — two states with opposite remediations that look identical when only
+   * `accepted` is visible; that ambiguity cost a live misdiagnosis in story 2.
    */
-  #framesAccepted = 0;
-  /**
-   * Datagrams that arrived, since construction. Monotone.
-   *
-   * The LEFT-HAND side of `received = accepted + sum(drops by reason)`. Without
-   * it a reader cannot tell "nothing is arriving" from "arriving and being
-   * rejected" — two states with opposite remediations (a server forwarding
-   * failure vs a client key-attribution bug) that look identical when only
-   * `accepted` is visible. That ambiguity cost a live misdiagnosis at this
-   * task's Gate 2.
-   */
-  #framesReceived = 0;
-  /** Frames rejected for any wire reason. The `sum(drops)` term. Monotone. */
-  #framesDropped = 0;
-  /**
-   * The most recent reject token, or `undefined` if nothing has been dropped.
-   *
-   * Safe to expose and to project, and **the TYPE is what makes that true** —
-   * not this comment. `RejectReason` is the closed union whose SSoT is
-   * `proto/test-vectors/frame-v3.vectors.json`, so the field is bounded by
-   * construction and carries no participant, key or payload information.
-   *
-   * Typed as the union rather than `string` deliberately: a bounded telemetry
-   * token is always one refactor away from becoming a metric label or a log
-   * field, and `string` is the annotation that lets a `DOMException.message` or
-   * an interpolated identifier land here and compile. That is the journey
-   * ADR-0036 §11 and `label-taxonomy.md` R2 exist to block. Same discipline as
-   * `MediaKindMetrics.frameDropped(reason: RejectReason)` beside the call sites.
-   */
-  #lastDropReason: RejectReason | undefined;
+  readonly #accounting: FrameAccounting;
 
   constructor(options: IngressPipelineOptions) {
     this.#metrics = options.metrics;
     this.#roster = options.roster;
-    this.#lanes = options.lanes;
+    const lanes = options.lanes;
+    this.#gate = { kind: 'audio', laneFor: (senderId) => lanes.laneFor(senderId) };
+    this.#accounting = new FrameAccounting(options.metrics, options.verification);
     this.#keys = options.keys;
     this.#cache = options.cache;
     this.#replay = options.replay;
@@ -200,22 +180,22 @@ export class IngressPipeline {
    * that verified, decrypted and reached the decoder.
    */
   get framesAccepted(): number {
-    return this.#framesAccepted;
+    return this.#accounting.framesAccepted;
   }
 
   /** Datagrams that arrived at the wire (monotone). The identity's left side. */
   get framesReceived(): number {
-    return this.#framesReceived;
+    return this.#accounting.framesReceived;
   }
 
   /** Frames rejected for a wire reason (monotone). The `sum(drops)` term. */
   get framesDropped(): number {
-    return this.#framesDropped;
+    return this.#accounting.framesDropped;
   }
 
   /** The most recent reject token; `undefined` before the first drop. Bounded by type. */
   get lastDropReason(): RejectReason | undefined {
-    return this.#lastDropReason;
+    return this.#accounting.lastDropReason;
   }
 
   /**
@@ -251,12 +231,9 @@ export class IngressPipeline {
    * it once as a typed media error, and continues; see the caller.
    */
   async accept(datagram: Uint8Array, hopMonitor: HopSequenceMonitor): Promise<void> {
-    // AT THE WIRE. First statement, before any parse.
-    // ONE INCREMENT, TWO READERS — same rule as the accepted and dropped pairs
-    // below. Kept adjacent so the getter and
-    // `dt_client_media_frames_received_total` cannot drift apart.
-    this.#metrics.frameReceived();
-    this.#framesReceived += 1;
+    // AT THE WIRE — which, for a datagram, is the parse boundary. First
+    // statement, before any parse.
+    this.#accounting.received();
     this.#firstMedia.onFrameReceived();
 
     // Test-only verification keys (R-30): where this frame was OBSERVED, and
@@ -269,8 +246,7 @@ export class IngressPipeline {
       // `decodeFrame` bounds `payload_length` against the wire maximum BEFORE
       // slicing and returns slices rather than copies, so a reject costs no more
       // than a parse and no allocation is sized from an attacker-controlled
-      // field. That is why there is no separate pre-parse byte cap here: adding
-      // one would need a reject token outside the vectors file's closed set.
+      // field.
       const decoded = decodeFrame(datagram);
 
       // The key id lives in the SFrame clear header, so it is readable before
@@ -280,20 +256,17 @@ export class IngressPipeline {
       // sender to tell a slot refill from a reorder. A parse failure is HELD, not
       // thrown yet: the frame still arrived on the downlink, so it must still be
       // hop-observed (with no sender) or it would read as a relay gap on top of
-      // being counted as a reject. It is rethrown below with its own token.
-      // The sender is converted ONCE, here, and that one value feeds both the
-      // hop monitor and the roster lookup below.
+      // being counted as a reject. The sender is converted ONCE, here, and that
+      // one value feeds both the hop monitor and the policy.
       let keyed: { readonly senderId: number } | { readonly error: unknown };
       try {
-        keyed = { senderId: Number(unpackKeyId(parseSframe(decoded.payload).keyId).senderId) };
+        keyed = { senderId: keyIdSenderOf(decoded.payload) };
       } catch (error) {
         keyed = { error };
       }
 
       // The relay region, quarantined: read once, used only for hop-gap
-      // bookkeeping, and never allowed to influence what follows. The key-id
-      // sender passed in is unverified here; it only selects whether the slot's
-      // hop baseline resets, and creates no state (see `hopSequenceMonitor.ts`).
+      // bookkeeping, and never allowed to influence what follows.
       const hop = hopMonitor.observe(
         decoded.streamId,
         decoded.hopSequence,
@@ -310,101 +283,30 @@ export class IngressPipeline {
       // Layer 1: the key id names this sender on this slot. Pre-verify.
       this.#verify?.keyed(observedSlot, senderId);
 
-      const identityKey = this.#roster.identityKeyFor(senderId);
-      if (!identityKey) {
-        // FAIL CLOSED. `undefined` covers unknown participant, participant with
-        // an EMPTY published key, and participant with an unusable key — all
-        // three mean this frame cannot be verified. It is never "no key, so skip
-        // verification": that reading fails open and is the natural one, which
-        // is exactly why it is refused here in one place rather than guarded at
-        // each call site.
-        // ONE INCREMENT, TWO READERS. Both drop sites must record, or the
-        // identity `received = accepted + sum(drops)` silently stops holding for
-        // a reader of these getters — and a half-instrumented reason field is
-        // worse than none, because it reads as "no drops of that kind".
-        this.#metrics.frameDropped('no_roster_entry');
-        this.#framesDropped += 1;
-        this.#lastDropReason = 'no_roster_entry';
-        this.#verify?.dropped(observedSlot, senderId, 'no_roster_entry');
-        return;
-      }
+      // THE ONE RECEIVE POLICY (`receivePolicy.ts`), audio branch: resolve,
+      // verify, slot-edge gate BEFORE open, open.
+      const { opened, lane } = await receiveByKind({ decoded, senderId }, this.#gate, {
+        roster: this.#roster,
+        keys: this.#keys,
+        cache: this.#cache,
+        replay: this.#replay,
+      });
 
-      // VERIFY BEFORE DECRYPT, structurally: `openVerifiedFrame` below is
-      // unreachable without the brand `verifyFrame` applies.
-      const verified = await verifyFrame(decoded, identityKey);
-
-      // THE SLOT-EDGE GATE — after verify, before open. See the module header.
-      const lane = this.#lanes.laneFor(senderId);
-      if (!lane) {
-        throw assignmentReject(
-          'sender_not_assigned',
-          "the frame's sender is not assigned to any of this client's receive slots",
-        );
-      }
-
-      const opened = await openVerifiedFrame(verified, this.#cache, this.#keys, this.#replay);
-
-      // ---------------------------------------------------------------------
-      // REPORTED BY EXCLUSION. DO NOT "SIMPLIFY" THIS BACK TO NAMING THE TWO
-      // VALUES — it reads like the same thing and is not.
-      // ---------------------------------------------------------------------
-      //
-      // What is spelled here are the three UNINTERESTING outcomes; the two that
-      // are counted are whatever remains of the `WrapOutcome` union, and
-      // TypeScript narrows `outcome` to exactly those.
-      //
-      // The property this buys is not "no hardcoded string" — it is that
-      // **`wrap_key_id_mismatch`'s pending rename will not have to find this
-      // call site at all.** That token names a cause the receiver cannot
-      // substantiate (the wrap's bound key id is nowhere on the wire, so a
-      // mis-bound wrap and a wrong KEK are one indistinguishable GCM tag
-      // mismatch), and a protocol-owned rename across the vectors, the
-      // generator and both language sides is tracked in `docs/TODO.md`. A
-      // consumer that named the value would be one more site for that change to
-      // locate and move; by exclusion there is no site. That is the difference
-      // between a constraint satisfied and a constraint made unnecessary, and it
-      // is lost the moment someone rewrites this as an equality check on the two
-      // names — silently, with the suite still green.
-      //
-      // Both reported outcomes are NON-DROPPING: the frame was accepted and
-      // plays. Counting either as a drop would break
-      // `received = accepted + sum(drops by reason)` for a frame that was not
-      // dropped.
-      const outcome = opened.wrapOutcome;
-      if (outcome !== 'absent' && outcome !== 'cached' && outcome !== 'already_held') {
-        this.#metrics.wrapOutcome(outcome);
-      }
-
-      // ONE INCREMENT, TWO READERS. `#framesAccepted` and the counter are two
-      // statements encoding one fact, and they are kept adjacent deliberately: a
-      // `++` placed anywhere else in this function would agree today and drift
-      // the first time a drop path lands between the two sites, at which point
-      // the getter and `dt_client_media_frames_accepted_total` disagree and
-      // nothing fails. Do not separate them.
-      //
       // The count is safe to expose where a per-frame SIZE would not be
       // (ADR-0036 §11's voice-activity trace) ONLY because the encoder runs with
-      // DTX off — see `lifecycle/muteState.ts`, "with DTX, absence of frames
-      // becomes a signal". Enabling DTX makes the frame RATE speech-dependent
-      // and turns both this getter and the production counter into that trace.
-      this.#metrics.frameAccepted();
-      this.#framesAccepted += 1;
-      // Layer 2: verified under this sender's roster key AND decrypted.
-      this.#verify?.verified(observedSlot, senderId);
+      // DTX off — see `lifecycle/muteState.ts`.
+      // Layer 2 (verified under this sender's roster key AND decrypted) and the
+      // wrap outcome ride the ONE accept tail (`frameAccounting.ts`).
+      this.#accounting.accepted(opened.wrapOutcome, observedSlot, senderId);
       this.#onAccepted?.({ senderId: Number(opened.senderId), plaintext: opened.plaintext });
       lane.decode({ data: opened.plaintext, timestampUs: 0 });
     } catch (err) {
       if (err instanceof FrameRejectedError) {
         // The token, verbatim. No mapping table, no bucket, no `other`: the
-        // eight structural codec tokens stay individually visible, which is what
-        // keeps `unknown_version` able to reveal a version-skewed rollback and
-        // keeps `sum by(reason)` comparable with the media handler.
-        this.#metrics.frameDropped(err.rejectReason);
-        this.#framesDropped += 1;
-        // The verbatim token, from the vectors file's closed set. No mapping
-        // table here either — see the comment above this catch.
-        this.#lastDropReason = err.rejectReason;
-        this.#verify?.dropped(observedSlot, observedSender, err.rejectReason);
+        // structural codec tokens stay individually visible, which is what keeps
+        // `unknown_version` able to reveal a version-skewed rollback and keeps
+        // `sum by(reason)` comparable with the media handler.
+        this.#accounting.dropped(err.rejectReason, observedSlot, observedSender);
         return;
       }
       // Anything else is a defect rather than a wire condition, and it must not

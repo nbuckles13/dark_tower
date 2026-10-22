@@ -533,18 +533,8 @@ function decodeAfterPrefix(data: Uint8Array, view: DataView, prefix: ParsedPrefi
 
   // Step 10: present, then the limit, then (step 11) availability and grammar.
   need(data.length - cursor, EXT_LENGTH_FIELD_BYTES, 'the extension length field', cursor);
-  const extLength = view.getUint16(cursor, false);
+  const extLength = parseExtLength(view, cursor);
   cursor += EXT_LENGTH_FIELD_BYTES;
-  if (extLength > MAX_EXT_BYTES) {
-    // The bound is DERIVED from the registry, not chosen: a grammatically valid
-    // region is a subset of the registry with each type at most once, so the
-    // maximum is the registry's own total size.
-    throw codecReject(
-      'extensions_too_large',
-      `declared extension region ${extLength} exceeds the registry-derived maximum ${MAX_EXT_BYTES}`,
-      { at: cursor - EXT_LENGTH_FIELD_BYTES, declared: extLength, limit: MAX_EXT_BYTES },
-    );
-  }
   need(data.length - cursor, extLength, 'the extension region', cursor);
   const extensions = parseExtensions(data.subarray(cursor, cursor + extLength), cursor);
   cursor += extLength;
@@ -553,7 +543,7 @@ function decodeAfterPrefix(data: Uint8Array, view: DataView, prefix: ParsedPrefi
 
   // Step 12.
   need(data.length - cursor, RELAY_REGION_BYTES, 'the relay region', cursor);
-  const streamId = view.getUint16(cursor, false);
+  const streamId = relayStreamIdAt(view, cursor);
   const hopSequence = view.getUint32(cursor + STREAM_ID_FIELD_BYTES, false);
   cursor += RELAY_REGION_BYTES;
 
@@ -614,6 +604,46 @@ function decodeAfterPrefix(data: Uint8Array, view: DataView, prefix: ParsedPrefi
   };
 }
 
+/**
+ * Step 10's bound: read `ext_length` at `at` and refuse it above the
+ * registry-derived maximum. ONE implementation for `decodeFrame` and
+ * `peekFrameExtent`.
+ */
+function parseExtLength(view: DataView, at: number): number {
+  const extLength = view.getUint16(at, false);
+  if (extLength > MAX_EXT_BYTES) {
+    // The bound is DERIVED from the registry, not chosen: a grammatically valid
+    // region is a subset of the registry with each type at most once, so the
+    // maximum is the registry's own total size.
+    throw codecReject(
+      'extensions_too_large',
+      `declared extension region ${extLength} exceeds the registry-derived maximum ${MAX_EXT_BYTES}`,
+      { at, declared: extLength, limit: MAX_EXT_BYTES },
+    );
+  }
+  return extLength;
+}
+
+/** Where `ext_length` sits: after the fixed prefix and, iff key-bearing, the wrapped key. */
+function extLengthOffset(prefix: ParsedPrefix): number {
+  return prefix.prefixLen + (prefix.flags.keyBearing ? WRAPPED_TRANSMIT_KEY_BYTES : 0);
+}
+
+/** The relay `stream_id` at the start of the relay region. */
+function relayStreamIdAt(view: DataView, relayRegionOffset: number): number {
+  return view.getUint16(relayRegionOffset, false);
+}
+
+/**
+ * The relay `stream_id` of a frame whose relay region starts at
+ * `relayRegionOffset` (from {@link peekFrameExtent}) — for a stream reader that
+ * must bind a stream to a slot before the whole frame is buffered. The same
+ * read `decodeFrame` makes; UNAUTHENTICATED (see {@link DecodedFrame.streamId}).
+ */
+export function readRelayStreamId(data: Uint8Array, relayRegionOffset: number): number {
+  return relayStreamIdAt(viewOf(data), relayRegionOffset);
+}
+
 function viewOf(data: Uint8Array): DataView {
   return new DataView(data.buffer, data.byteOffset, data.byteLength);
 }
@@ -627,6 +657,80 @@ function viewOf(data: Uint8Array): DataView {
 export function decodeFrame(data: Uint8Array): DecodedFrame {
   const view = viewOf(data);
   return decodeAfterPrefix(data, view, parsePrefix(data, view));
+}
+
+/**
+ * The largest frame the wire can carry: the registry-derived maximum header
+ * (`max_header_bytes`: fixed prefix, wrapped key, ext length, maximal extension
+ * region, relay region), the maximum payload, and the signature. Every term is an
+ * SSoT constant; nothing is restated. A stream reader's per-stream memory bound.
+ */
+export const MAX_FRAME_BYTES =
+  WIRE_CONSTANTS.max_header_bytes + MAX_PAYLOAD_BYTES + SIGNATURE_BYTES;
+
+/**
+ * Bytes a stream reader must hold before {@link peekFrameExtent} can always
+ * answer: the fixed prefix, the wrapped-key block and the extension length
+ * field. A reader needs at most this many buffered bytes per frame before it
+ * knows the frame's total length.
+ */
+export const FRAME_EXTENT_PEEK_BYTES =
+  PUBLISHER_FIXED_PREFIX_BYTES + WRAPPED_TRANSMIT_KEY_BYTES + EXT_LENGTH_FIELD_BYTES;
+
+/** What {@link peekFrameExtent} learned from a frame's leading bytes. */
+export type FrameExtent =
+  /** Not enough bytes yet: hold at least `need` before asking again. */
+  | { readonly complete: false; readonly need: number }
+  /** The frame's exact total length on the wire, known before its payload arrives. */
+  | {
+      readonly complete: true;
+      readonly totalLength: number;
+      /** The signed `gop_counter` from the parsed prefix. Stream identity (§11). */
+      readonly gopCounter: number;
+      /** Where the relay region starts (for {@link readRelayStreamId}). */
+      readonly relayRegionOffset: number;
+      /** Where the SFrame payload (and so its key id) starts within the frame. */
+      readonly payloadOffset: number;
+      /** The bounded `payload_length`. */
+      readonly payloadLength: number;
+    };
+
+/**
+ * A STREAM reader's view of ADR-0036 §2 decode steps 1–11: from a frame's
+ * LEADING bytes only, either "need more" or the frame's exact total length.
+ *
+ * The same prefix parser `decodeFrame` uses — version, flags, the
+ * key-bearing/discardable grammar and, LOAD-BEARING, the `payload_length` bound
+ * — runs here BEFORE the reader allocates anything for the frame, so an
+ * attacker-chosen length is refused from the header alone
+ * (`payload_length_exceeds_max`). The extension length is bounded here too.
+ * The whole frame, once buffered, still goes through {@link decodeFrame}: this
+ * function only measures, it validates nothing past step 11.
+ *
+ * @throws {FrameRejectedError} for a malformed prefix. Never `truncated`: a
+ * short buffer is `complete: false`.
+ */
+export function peekFrameExtent(data: Uint8Array): FrameExtent {
+  if (data.length < PUBLISHER_FIXED_PREFIX_BYTES) {
+    return { complete: false, need: PUBLISHER_FIXED_PREFIX_BYTES };
+  }
+  const view = viewOf(data);
+  const prefix = parsePrefix(data, view);
+  const extLengthAt = extLengthOffset(prefix);
+  if (data.length < extLengthAt + EXT_LENGTH_FIELD_BYTES) {
+    return { complete: false, need: extLengthAt + EXT_LENGTH_FIELD_BYTES };
+  }
+  const extLength = parseExtLength(view, extLengthAt);
+  const relayRegionOffset = extLengthAt + EXT_LENGTH_FIELD_BYTES + extLength;
+  const payloadOffset = relayRegionOffset + RELAY_REGION_BYTES;
+  return {
+    complete: true,
+    totalLength: payloadOffset + prefix.payloadLength + SIGNATURE_BYTES,
+    gopCounter: prefix.gopCounter,
+    relayRegionOffset,
+    payloadOffset,
+    payloadLength: prefix.payloadLength,
+  };
 }
 
 /** Fields an encoder needs to build a frame. */

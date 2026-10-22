@@ -46,6 +46,10 @@ export class SignalingMediaState {
   #latestDirective: SendDirectiveEvent | undefined;
   #latestAssignments: StreamAssignmentsEvent | undefined;
   #listeners: MediaStateListeners | undefined;
+  /** The roster's participant <-> sender index lives on the signaling client (one index). */
+  #signaling: Pick<SignalingClient, 'senderIdOf' | 'participantIdOf'> | undefined;
+  /** Story 3 C-B: a sender's VIDEO server mute was lifted (the unmute-edge repair). */
+  #onVideoServerMuteLifted: ((senderId: number) => void) | undefined;
 
   /** `onResume(kind)` is the session's `captureResumedAfterServerMute` emitter. */
   constructor(onResume: (kind: PublishKind) => void) {
@@ -57,6 +61,7 @@ export class SignalingMediaState {
    * own event bridges, so the pipeline sees an update no later than an embedder.
    */
   observe(signaling: SignalingClient): void {
+    this.#signaling = signaling;
     // `joined` is emitted before `join()` resolves, so the SELF mute replay that
     // follows the join response is recognised.
     signaling.on('joined', (e) => {
@@ -72,6 +77,7 @@ export class SignalingMediaState {
       this.#listeners?.onDirective(d);
     });
     signaling.on('participantMuteChanged', (e) => {
+      const wasVideoMuted = this.#serverMute.get(e.participantId)?.video ?? false;
       this.#serverMute.set(e.participantId, {
         audio: e.audioServerMuted,
         video: e.videoServerMuted,
@@ -81,6 +87,12 @@ export class SignalingMediaState {
       if (e.participantId === this.#selfParticipantId) {
         this.#resume.apply({ type: 'selfServerMute', kind: 'audio', muted: e.audioServerMuted });
         this.#resume.apply({ type: 'selfServerMute', kind: 'video', muted: e.videoServerMuted });
+      }
+      // The video server-mute -> unmute EDGE (story 3 C-B, observability O2):
+      // the video receiver re-requests a frame it dropped as muted at arrival.
+      if (wasVideoMuted && !e.videoServerMuted) {
+        const senderId = signaling.senderIdOf(e.participantId);
+        if (senderId !== undefined) this.#onVideoServerMuteLifted?.(senderId);
       }
     });
   }
@@ -112,9 +124,31 @@ export class SignalingMediaState {
     return this.#latestDirective;
   }
 
-  /** Sender id -> the audio and video slots naming that sender (story 3 R-3). */
-  get slotPairing(): ReadonlyMap<number, SlotPair> {
-    return pairSlotsBySender(this.#latestAssignments?.assignments ?? []);
+  /**
+   * Sender id -> the audio and video slots showing that sender (story 3 R-3):
+   * MC's latest assignments plus `liveVideo` (video slot -> the VERIFIED sender
+   * its live slot last rendered, story 3 C-B).
+   */
+  slotPairing(liveVideo?: ReadonlyMap<number, number>): ReadonlyMap<number, SlotPair> {
+    return pairSlotsBySender(this.#latestAssignments?.assignments ?? [], liveVideo);
+  }
+
+  /**
+   * A VERIFIED video sender's server-mute state per the latest
+   * `ParticipantMuteUpdate`, through the roster's ONE participant <-> sender
+   * index. `unmapped` when no roster participant maps to the sender — never
+   * rendered (security S2). Absent update = unmuted (MC replays every muted
+   * participant right after the join response).
+   */
+  videoMuteState(senderId: number): 'muted' | 'unmuted' | 'unmapped' {
+    const participantId = this.#signaling?.participantIdOf(senderId);
+    if (participantId === undefined) return 'unmapped';
+    return this.#serverMute.get(participantId)?.video === true ? 'muted' : 'unmuted';
+  }
+
+  /** Subscribe the video receiver to video server-mute -> unmute edges. */
+  onVideoServerMuteLifted(listener: ((senderId: number) => void) | undefined): void {
+    this.#onVideoServerMuteLifted = listener;
   }
 
   /**

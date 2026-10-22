@@ -42,6 +42,10 @@ export class OtelMetricsSink implements MetricsSink {
   readonly #counters = new Map<string, Counter>();
   readonly #histograms = new Map<string, Histogram>();
   readonly #gauges = new Map<string, Gauge>();
+  /** The bucket boundaries each histogram was CREATED with, for drift detection. */
+  readonly #boundaries = new Map<string, readonly number[] | undefined>();
+  /** Names whose drift was already warned (`warn` mode warns once per name). */
+  readonly #warnedDrift = new Set<string>();
 
   /**
    * @param meter an OTel `Meter` obtained from the global `MeterProvider`
@@ -64,13 +68,31 @@ export class OtelMetricsSink implements MetricsSink {
     instrument.add(value, labels);
   }
 
-  histogram(name: string, labels: MetricLabels, value: number): void {
+  histogram(
+    name: string,
+    labels: MetricLabels,
+    value: number,
+    boundaries?: readonly number[],
+  ): void {
     if (!assertClientMetricName(name, this.#mode)) return;
     let instrument = this.#histograms.get(name);
     if (instrument === undefined) {
       // dt-metric-name-dynamic: name is runtime-validated by assertClientMetricName(name, mode) above (R-24 sink boundary); this is the canonical generic MetricsSink, the sole legitimate dynamic createX caller
-      instrument = this.#meter.createHistogram(name);
+      instrument = this.#meter.createHistogram(
+        name,
+        boundaries ? { advice: { explicitBucketBoundaries: [...boundaries] } } : undefined,
+      );
       this.#histograms.set(name, instrument);
+      this.#boundaries.set(name, boundaries);
+    } else if (!sameBoundaries(this.#boundaries.get(name), boundaries)) {
+      // Boundaries bind at FIRST creation; a later call with others is a drifted
+      // call site that would silently get the first call's buckets.
+      const message = `histogram ${name} observed with bucket boundaries that differ from its first observation`;
+      if (this.#mode === 'throw') throw new Error(message);
+      if (!this.#warnedDrift.has(name)) {
+        this.#warnedDrift.add(name);
+        console.warn('[dt-metric]', message); // pii-safe: bounded dt_client_* metric name (name-guarded above), no labels or values
+      }
     }
     instrument.record(value, labels);
   }
@@ -85,4 +107,15 @@ export class OtelMetricsSink implements MetricsSink {
     }
     instrument.record(value, labels);
   }
+}
+
+/** Same boundaries: by reference first (the common case: one SSoT const), then element-wise. No allocation. */
+function sameBoundaries(
+  a: readonly number[] | undefined,
+  b: readonly number[] | undefined,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+  return true;
 }

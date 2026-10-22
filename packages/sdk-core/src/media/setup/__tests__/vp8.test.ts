@@ -63,3 +63,54 @@ describe('probeVp8Support', () => {
     });
   });
 });
+
+describe('buildVp8DecoderConfig (story 3 C-B: every receive slot is configured from its bounds)', () => {
+  it('is VP8 at the given coded size, latency-optimised, and carries nothing from a bitstream', async () => {
+    const { buildVp8DecoderConfig } = await import('../vp8.js');
+    expect(buildVp8DecoderConfig({ width: 1280, height: 720 })).toEqual({
+      codec: 'vp8',
+      codedWidth: 1280,
+      codedHeight: 720,
+      optimizeForLatency: true,
+    });
+  });
+});
+
+describe('vp8KeyframeDimensions (RFC 6386 §9.1, bounds-checked)', () => {
+  const key = (w: number, h: number) =>
+    Uint8Array.of(
+      0x00,
+      0,
+      0,
+      0x9d,
+      0x01,
+      0x2a,
+      w & 0xff,
+      (w >> 8) & 0x3f,
+      h & 0xff,
+      (h >> 8) & 0x3f,
+      1,
+      2,
+    );
+
+  it('reads the declared width and height of a key frame (scale bits ignored)', async () => {
+    const { vp8KeyframeDimensions } = await import('../vp8.js');
+    expect(vp8KeyframeDimensions(key(640, 360))).toEqual({ ok: true, width: 640, height: 360 });
+    const scaled = key(1280, 720);
+    scaled[7] = (scaled[7] as number) | 0xc0;
+    expect(vp8KeyframeDimensions(scaled)).toEqual({ ok: true, width: 1280, height: 720 });
+  });
+
+  it('is a typed {ok: false} — never a throw or an out-of-bounds read — for short, delta or bad-start-code input', async () => {
+    const { vp8KeyframeDimensions } = await import('../vp8.js');
+    const full = key(640, 360);
+    for (let n = 0; n < 10; n += 1)
+      expect(vp8KeyframeDimensions(full.subarray(0, n))).toEqual({ ok: false });
+    const delta = Uint8Array.from(full);
+    delta[0] = 0x01;
+    expect(vp8KeyframeDimensions(delta)).toEqual({ ok: false });
+    const badStart = Uint8Array.from(full);
+    badStart[4] = 0x00;
+    expect(vp8KeyframeDimensions(badStart)).toEqual({ ok: false });
+  });
+});

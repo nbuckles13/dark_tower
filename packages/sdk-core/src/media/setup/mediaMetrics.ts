@@ -445,6 +445,74 @@ export type MediaKeyframeSource =
   (typeof MEDIA_KEYFRAME_SOURCES)[keyof typeof MEDIA_KEYFRAME_SOURCES];
 
 /**
+ * Bounded `source` vocabulary for `dt_client_media_recovery_requests_sent_total`
+ * (story 3 R-13, C-B): the CAUSE — why a receiver's video slot lost
+ * decodability and sent its handler ONE recovery request for that loss event.
+ *
+ * `source`, NOT `reason` (label-taxonomy owner ruling at C-B, superseding the
+ * task text's `reason=`): `reason` is the frame-drop label space whose contract
+ * is `sum by(reason)` across hops, and `decrypt_failed` here is a SUPERSET of
+ * the codec token of that name (it also covers unwrap, missing transmit key and
+ * missing KEK). `source` is the client's "what caused this event" key, as on
+ * `dt_client_media_keyframes_produced_total`.
+ *
+ *   * `verify_failed` — a frame on the slot could not be verified: bad
+ *     signature, no roster key for its key-id sender (roster lag on a new
+ *     source), or a whole-frame codec reject with a readable key id.
+ *   * `decrypt_failed` — verified but could not be opened: decrypt or unwrap
+ *     failure, no transmit key (a missed key-bearing frame), no KEK for its
+ *     generation (KEK lag).
+ *   * `decoder_error` — the slot's decoder raised its error callback.
+ *   * `local_drop` — the slot's jitter buffer overflowed or held a frame past
+ *     its maximum hold time (local resource pressure).
+ *   * `group_abandoned` — MH reset the group's stream after a frame header was
+ *     parsed on it (R-12).
+ *   * `server_mute_lifted` — a frame dropped `sender_server_muted` at arrival
+ *     (typically the publisher's resume keyframe beating the
+ *     `ParticipantMuteUpdate`) is re-requested once the unmute arrives; a
+ *     sustained rate means unmute ordering races are common, not a fault. An
+ *     observability extension of the task's five (C-B Gate 1, ruling O2).
+ *
+ * Zero-initialised when the video receiver starts. Never a sender, slot or GoP
+ * value. A per-metric vocabulary: never summed by `source` with
+ * `keyframes_produced_total` or `kek_updates_total`.
+ */
+export const MEDIA_RECOVERY_SOURCES = {
+  VerifyFailed: 'verify_failed',
+  DecryptFailed: 'decrypt_failed',
+  DecoderError: 'decoder_error',
+  LocalDrop: 'local_drop',
+  GroupAbandoned: 'group_abandoned',
+  ServerMuteLifted: 'server_mute_lifted',
+} as const satisfies Record<string, string>;
+
+/** One of {@link MEDIA_RECOVERY_SOURCES}. */
+export type MediaRecoverySource =
+  (typeof MEDIA_RECOVERY_SOURCES)[keyof typeof MEDIA_RECOVERY_SOURCES];
+
+/**
+ * Bucket upper bounds (ms) for `dt_client_media_slot_unfulfilled_duration_ms`
+ * — THE SSoT; the catalog row cites this name. Extends past 100 s (10x the
+ * 10 000 ms maximum keyframe interval) so a slot stuck for a whole interval
+ * cycle is not folded into `+Inf`. Changing a boundary splits the `le` series
+ * across client versions.
+ */
+export const SLOT_UNFULFILLED_BUCKETS_MS: readonly number[] = [
+  100, 250, 500, 1_000, 2_500, 5_000, 10_000, 20_000, 30_000, 60_000, 120_000, 300_000,
+];
+
+/**
+ * Bucket upper bounds (ms) for the two first-render latency histograms
+ * (`dt_client_media_time_to_first_render_ms`,
+ * `dt_client_media_slot_active_to_first_render_ms`) — THE SSoT. Extends past
+ * the 10 000 ms maximum keyframe interval to 30 s. Changing a boundary splits
+ * the `le` series across client versions.
+ */
+export const FIRST_RENDER_BUCKETS_MS: readonly number[] = [
+  50, 100, 250, 500, 1_000, 2_000, 3_000, 5_000, 7_500, 10_000, 15_000, 20_000, 30_000,
+];
+
+/**
  * Bounded `outcome` vocabulary for
  * `dt_client_media_mh_control_channel_ended_total`: how a handler's control
  * stream ended while this client was not tearing down. A per-metric vocabulary.
@@ -622,12 +690,12 @@ export class MediaKindMetrics {
   // --------------------------------------------------------------- ingress ---
 
   /**
-   * A datagram arrived. Counted AT THE WIRE, before any parse or verification,
-   * so `received = accepted + sum(drops by reason)` holds.
-   *
-   * NOTE FOR THE VIDEO STORY: this counting point must move from the transport
-   * boundary to the PARSE boundary once several frames share one stream, and the
-   * identity must be re-established there.
+   * A frame arrived, counted at the PARSE boundary before any verification, so
+   * `received = accepted + sum(drops by reason)` holds per kind. Audio: one per
+   * datagram (a datagram is one frame). Video (story 3 C-B): one per frame at
+   * its FIRST BYTE on a group stream, so a partial frame cut by a reset or FIN
+   * is received and then dropped `stream_partial_reset`. The video identity
+   * excludes `VIDEO_POST_DECODE_REJECT_REASONS` (`frame/rejectReason.ts`).
    */
   frameReceived(): void {
     this.#sink?.counter('dt_client_media_frames_received_total', this.#base);
@@ -713,6 +781,12 @@ export class MediaKindMetrics {
   /**
    * A frame arrived on a relay `stream_id` this client never declared.
    *
+   * VIDEO (story 3 C-B, lead ruling E2) differs: there the relay id SELECTS the
+   * slot pipeline, so a group stream naming an undeclared or non-video slot is
+   * aborted and its frame counted `stream_slot_mismatch`; this diagnostic is
+   * bumped beside it so the cause stays distinguishable. The audio text below
+   * describes the datagram path.
+   *
    * The relay region is UNAUTHENTICATED — a media handler writes `stream_id`
    * freely and nobody signs it — so it is validated against the declared slot
    * set before ANY receiver state is created for it. The frame itself is still
@@ -767,6 +841,13 @@ export class MediaKindMetrics {
    * `received = accepted + sum(drops by reason)`, breaking it silently and only
    * in aggregate. That is exactly the failure `wrap_key_id_mismatch`'s
    * `drops_frame: false` exists to prevent. One increment per evicted frame.
+   *
+   * VIDEO (story 3 C-B) counts every POST-ACCEPT loss before render here, one
+   * per frame: jitter-buffer overflow or max-hold discards, frames discarded
+   * while a slot awaits a keyframe, superseded-source trailing frames after a
+   * switch, unmatched decoder output, and held frames the never-render guard
+   * rejects. `decode_over_bound` is the one post-accept loss that is a frame
+   * drop reason instead (see `VIDEO_POST_DECODE_REJECT_REASONS`).
    */
   decodeQueueDropped(): void {
     this.#sink?.counter('dt_client_media_decode_queue_dropped_total', this.#base);
@@ -895,6 +976,92 @@ export class MediaKindMetrics {
    */
   sendDirectiveKindMissing(count: 0 | 1 = 1): void {
     this.#sink?.counter('dt_client_media_send_directive_kind_missing_total', this.#base, count);
+  }
+
+  // -------------------------------------------------------- video receive ---
+
+  /**
+   * A video slot sent its handler ONE recovery request for a loss event
+   * (story 3 R-13), by cause ({@link MEDIA_RECOVERY_SOURCES}, label `source`). Counted on a SUCCESSFUL
+   * control-stream write: a request replaced while queued, or a failed write,
+   * is not counted (a failed write raises an event-once transport `mediaFault`).
+   * `count` 0 is the zero-initialisation at receiver start.
+   */
+  recoveryRequestSent(source: MediaRecoverySource, count: 0 | 1 = 1): void {
+    this.#sink?.counter(
+      'dt_client_media_recovery_requests_sent_total',
+      { ...this.#base, source },
+      count,
+    );
+  }
+
+  /**
+   * An incoming group stream was refused at the concurrency cap
+   * (`media.videoReceive.maxIncomingStreams`) — cancelled unread, never queued.
+   * Unit: streams; OUTSIDE the frame accounting identity (no frame was parsed).
+   * `count` 0 is the zero-initialisation at receiver start.
+   */
+  incomingStreamRefused(count: 0 | 1 = 1): void {
+    this.#sink?.counter('dt_client_media_incoming_streams_refused_total', this.#base, count);
+  }
+
+  /**
+   * One EXIT from the unfulfilled state (story 3 R-30): how long a slot MC
+   * reports ACTIVE showed neither decodable video nor an avatar. Observed on
+   * EVERY exit, teardown included. Buckets: {@link SLOT_UNFULFILLED_BUCKETS_MS}.
+   */
+  slotUnfulfilledDurationMs(ms: number): void {
+    this.#sink?.histogram(
+      'dt_client_media_slot_unfulfilled_duration_ms',
+      this.#base,
+      ms,
+      SLOT_UNFULFILLED_BUCKETS_MS,
+    );
+  }
+
+  /**
+   * How many of this client's slots are CURRENTLY unfulfilled — the absolute
+   * count, set on every transition, re-set on the export tick, 0 at teardown.
+   * Last-writer-wins across browsers: panel only, never a fleet count.
+   */
+  slotsUnfulfilled(count: number): void {
+    this.#sink?.gauge('dt_client_media_slots_unfulfilled', this.#base, count);
+  }
+
+  /**
+   * Distinct verified senders with at least one DECODED output in the last
+   * export interval (unit: source-intervals). Fed from decode activity, never
+   * slot state. `0` is a legal call — the zero-initialisation at receiver start.
+   */
+  activeSourceIntervals(count: number): void {
+    this.#sink?.counter('dt_client_media_active_source_intervals_total', this.#base, count);
+  }
+
+  /**
+   * Media start to the first RENDERED frame of this kind, once per session.
+   * Open objective, observed never gated. Buckets: {@link FIRST_RENDER_BUCKETS_MS}.
+   */
+  timeToFirstRenderMs(ms: number): void {
+    this.#sink?.histogram(
+      'dt_client_media_time_to_first_render_ms',
+      this.#base,
+      ms,
+      FIRST_RENDER_BUCKETS_MS,
+    );
+  }
+
+  /**
+   * A slot's ACTIVE entry to its first rendered frame. An entry that exits
+   * unrendered is NOT observed (survivorship; read with the unfulfilled
+   * histogram). Open objective, observed never gated.
+   */
+  slotActiveToFirstRenderMs(ms: number): void {
+    this.#sink?.histogram(
+      'dt_client_media_slot_active_to_first_render_ms',
+      this.#base,
+      ms,
+      FIRST_RENDER_BUCKETS_MS,
+    );
   }
 
   /**
