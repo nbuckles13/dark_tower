@@ -1669,7 +1669,7 @@ tasks:
   slug: 2026-10-21-c-a1-sdk-contract-migration
   tag: story-2026-10-07-see-each-other-task-11
 - id: 12
-  status: pending
+  status: completed
   specialist: meeting-controller
   deps:
   - 1
@@ -1897,6 +1897,7 @@ tasks:
     - No GoP value or stream timing appears in MC logs or labels.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-22-mc-a-video-slots
   tag: story-2026-10-07-see-each-other-task-12
 - id: 13
   status: pending
