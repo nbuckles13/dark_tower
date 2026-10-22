@@ -1310,9 +1310,8 @@ mod tests {
                 stream_number: 0,
                 priority_group: 1,
                 supersede_on_independent_frame: false,
-                transport_mode: proto_gen::dark_tower::signaling::v1::TransportMode::Datagram,
             }],
-            server_muted_sources: std::collections::BTreeSet::new(),
+            ..crate::media_routing::HandlerAssignment::default()
         }
     }
 

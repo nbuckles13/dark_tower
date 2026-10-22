@@ -263,7 +263,6 @@ mod tests {
     use crate::media_routing::assignment::{
         EgressStreamPlan, AUDIO_PRIORITY_GROUP, MAIN_AUDIO_STREAM_NUMBER,
     };
-    use proto_gen::dark_tower::signaling::v1::TransportMode;
     use std::num::NonZeroU16;
 
     fn assignment(subscriber: u16) -> HandlerAssignment {
@@ -279,9 +278,8 @@ mod tests {
                 stream_number: MAIN_AUDIO_STREAM_NUMBER,
                 priority_group: AUDIO_PRIORITY_GROUP,
                 supersede_on_independent_frame: false,
-                transport_mode: TransportMode::Datagram,
             }],
-            server_muted_sources: std::collections::BTreeSet::new(),
+            ..HandlerAssignment::default()
         }
     }
 

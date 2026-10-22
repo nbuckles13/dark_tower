@@ -21,12 +21,6 @@
 // participant: their slot reads `avatar_server_muted` (server wins), which says
 // nothing about their own microphone.
 //
-// ORDERING WINDOW (until MC-A): the controller in service before MC-A still sends
-// the legacy `source_muted`, which the SDK resolves to `avatar_client_muted` until
-// the `ParticipantMuteUpdate` for a server mute lands (SDK shim b). A server mute
-// can therefore briefly read as a client mute. That is transient and
-// self-correcting; the browser suite polls to the settled state.
-//
 // Identities are resolved against the roster and rendered as TEXT only. An id the
 // roster does not know renders as a bounded placeholder, never as the raw wire
 // string (@security M4).

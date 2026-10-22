@@ -32,14 +32,13 @@
 
 use super::outcome::{DirectiveOutcome, MediaKindLabel};
 use crate::media_admission::SenderId;
-use crate::media_routing::{
-    HandlerId, MeetingAssignment, MeetingHandlers, MAIN_AUDIO_STREAM_NUMBER,
-};
+use crate::media_kind::PublishSet;
+use crate::media_routing::assignment::{stream_number_of, transport_of};
+use crate::media_routing::{HandlerId, MeetingAssignment, MeetingHandlers};
 use media_protocol::frame::PROTOCOL_VERSION;
 use proto_gen::dark_tower::signaling::v1::{
-    Codec, EncodingParameters, MediaKind, SendDirective, SendStream, SendTarget, TransportMode,
+    Codec, EncodingParameters, SendDirective, SendStream, SendTarget, TransportMode,
 };
-use std::collections::BTreeMap;
 
 /// A publisher's stream index, carried in the signed SFrame key id.
 ///
@@ -88,12 +87,55 @@ impl StreamNumber {
 }
 
 /// A configured value could not be turned into a usable audio encoding.
+/// A configured codec NAME could not be parsed ([`parse_codec`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecParseError {
+    /// The name matched nothing in the closed set.
+    UnknownCodec,
+    /// The name was `unspecified`, which is never valid in a directive.
+    CodecUnspecified,
+}
+
+impl std::fmt::Display for CodecParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UnknownCodec => "not a recognised codec",
+            Self::CodecUnspecified => {
+                "'unspecified' is never valid in a send directive; name a codec"
+            }
+        })
+    }
+}
+
+impl std::error::Error for CodecParseError {}
+
+/// Parse a configured codec name into the closed proto enum — the ONE
+/// codec-name parser for both kinds; each encoding's constructor then checks
+/// the codec is of its kind ([`AudioEncoding::new`], [`VideoEncoding::new`]).
+///
+/// Trimmed and case-folded, then matched exactly. An unrecognised value is an
+/// **error**, never a fall-back to a default: silently coercing `"oppus"` to
+/// Opus would leave an operator believing they had configured something they
+/// had not.
+///
+/// # Errors
+///
+/// [`CodecParseError`].
+pub fn parse_codec(raw: &str) -> Result<Codec, CodecParseError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "opus" => Ok(Codec::Opus),
+        "vp8" => Ok(Codec::Vp8),
+        "vp9" => Ok(Codec::Vp9),
+        "av1" => Ok(Codec::Av1),
+        "h264" => Ok(Codec::H264),
+        "unspecified" => Err(CodecParseError::CodecUnspecified),
+        _ => Err(CodecParseError::UnknownCodec),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioEncodingError {
-    /// The codec string named nothing in the closed set.
-    UnknownCodec,
-    /// The codec string named `unspecified`, which is never valid in a
-    /// directive.
+    /// `CODEC_UNSPECIFIED`, which is never valid in a directive.
     CodecUnspecified,
     /// The codec string named a video codec for an audio-only knob.
     CodecNotAudio,
@@ -107,7 +149,6 @@ pub enum AudioEncodingError {
 impl std::fmt::Display for AudioEncodingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
-            Self::UnknownCodec => "not a recognised codec",
             Self::CodecUnspecified => {
                 "'unspecified' is never valid in a send directive; name a codec"
             }
@@ -251,28 +292,6 @@ impl AudioEncoding {
         })
     }
 
-    /// Parse a configured codec name into the closed proto enum.
-    ///
-    /// Trimmed and case-folded, then matched exactly. An unrecognised value is
-    /// an **error**, never a fall-back to a default: silently coercing
-    /// `"oppus"` to Opus would leave an operator believing they had configured
-    /// something they had not.
-    ///
-    /// # Errors
-    ///
-    /// [`AudioEncodingError::UnknownCodec`] or
-    /// [`AudioEncodingError::CodecUnspecified`].
-    pub fn parse_codec(raw: &str) -> Result<Codec, AudioEncodingError> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "opus" => Ok(Codec::Opus),
-            "vp9" => Ok(Codec::Vp9),
-            "av1" => Ok(Codec::Av1),
-            "h264" => Ok(Codec::H264),
-            "unspecified" => Err(AudioEncodingError::CodecUnspecified),
-            _ => Err(AudioEncodingError::UnknownCodec),
-        }
-    }
-
     /// The wire form.
     #[must_use]
     pub fn to_proto(self) -> EncodingParameters {
@@ -309,11 +328,199 @@ impl AudioEncoding {
     }
 }
 
+/// A configured value could not be turned into a usable video encoding.
+///
+/// Every variant is a BOOT REFUSAL (`config.rs` names the key, the value and
+/// the bound in the returned error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoEncodingError {
+    /// Not VP8, the one video codec this story directs (story 3 R-8).
+    CodecNotVp8,
+    /// Width or height outside [`VIDEO_DIMENSION_MIN_PX`]`..=`[`VIDEO_DIMENSION_MAX_PX`].
+    DimensionOutOfBand,
+    /// Frame rate outside [`VIDEO_FRAME_RATE_MIN_HZ`]`..=`[`VIDEO_FRAME_RATE_MAX_HZ`].
+    FrameRateOutOfBand,
+    /// Bitrate outside [`VIDEO_BITRATE_MIN_BPS`]`..=`[`VIDEO_BITRATE_MAX_BPS`].
+    BitrateOutOfBand,
+    /// Minimum keyframe interval outside
+    /// [`MIN_KEYFRAME_INTERVAL_MS_FLOOR`]`..=`[`MIN_KEYFRAME_INTERVAL_MS_CEILING`].
+    MinKeyframeIntervalOutOfBand,
+}
+
+impl std::fmt::Display for VideoEncodingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The bands are read from the constants below, never restated, so a
+        // band change cannot leave the boot message wrong.
+        match self {
+            Self::CodecNotVp8 => f.write_str("not vp8, the only video codec MC directs"),
+            Self::DimensionOutOfBand => write!(
+                f,
+                "outside the video dimension band {VIDEO_DIMENSION_MIN_PX}..={VIDEO_DIMENSION_MAX_PX} px"
+            ),
+            Self::FrameRateOutOfBand => write!(
+                f,
+                "outside the video frame-rate band {VIDEO_FRAME_RATE_MIN_HZ}..={VIDEO_FRAME_RATE_MAX_HZ} Hz"
+            ),
+            Self::BitrateOutOfBand => write!(
+                f,
+                "outside the video bitrate band {VIDEO_BITRATE_MIN_BPS}..={VIDEO_BITRATE_MAX_BPS} bps"
+            ),
+            Self::MinKeyframeIntervalOutOfBand => write!(
+                f,
+                "outside the minimum keyframe interval band \
+                 {MIN_KEYFRAME_INTERVAL_MS_FLOOR}..={MIN_KEYFRAME_INTERVAL_MS_CEILING} ms"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VideoEncodingError {}
+
+/// Smallest video width or height MC directs, in pixels.
+pub const VIDEO_DIMENSION_MIN_PX: u32 = 16;
+/// Largest video width or height MC directs, in pixels.
+pub const VIDEO_DIMENSION_MAX_PX: u32 = 1920;
+/// Lowest video frame rate MC directs, in frames per second.
+pub const VIDEO_FRAME_RATE_MIN_HZ: u32 = 1;
+/// Highest video frame rate MC directs, in frames per second.
+pub const VIDEO_FRAME_RATE_MAX_HZ: u32 = 60;
+/// Lowest video bitrate MC directs, in bits per second.
+///
+/// MH derives its per-stream video cost from the SAME `media-codec-profile`
+/// value (`MEDIA_VIDEO_MAX_BITRATE_BPS`), so there is no MC-side guard against
+/// MH's sizing: the profile is the single source (story 3 R-24). MH's own
+/// non-zero check lives in `crates/mh-service/src/config.rs`
+/// (`MediaCodecProfile`); this band is the stricter boot gate.
+pub const VIDEO_BITRATE_MIN_BPS: u32 = 100_000;
+/// Highest video bitrate MC directs, in bits per second. See
+/// [`VIDEO_BITRATE_MIN_BPS`].
+pub const VIDEO_BITRATE_MAX_BPS: u32 = 4_000_000;
+
+/// The lowest minimum keyframe interval MC will direct, in milliseconds.
+///
+/// DRIFT SIGNAL: the client compiles its own floor (the SDK keyframe floor in
+/// `clientConfig.ts`, added by the client publish-path task, story 3 C-A2) and
+/// enforces max(directed, compiled floor). That task's keyframe-floor sync
+/// guard, `scripts/guards/simple/validate-keyframe-floor-sync.sh`, greps THIS
+/// literal and compares it with the SDK's; a directed value the client had to
+/// raise is counted client-side as `keyframe_min_interval_clamped`. Keep this
+/// a single literal so the guard can read it.
+pub const MIN_KEYFRAME_INTERVAL_MS_FLOOR: u32 = 100;
+
+/// The highest minimum keyframe interval MC will direct, in milliseconds.
+pub const MIN_KEYFRAME_INTERVAL_MS_CEILING: u32 = 10_000;
+
+/// The encoding parameters MC directs for main (camera) video.
+///
+/// Constructible only through [`VideoEncoding::new`], which enforces every
+/// band above; the fields are private, so an unchecked value is
+/// unrepresentable at the emit site. Every field is ALWAYS set on the wire:
+/// the client refuses a video stream missing any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoEncoding {
+    codec: Codec,
+    width: u32,
+    height: u32,
+    frame_rate_hz: u32,
+    max_bitrate_bps: u32,
+    min_keyframe_interval_ms: u32,
+}
+
+impl VideoEncoding {
+    /// Validate configured values into an encoding MC can direct.
+    ///
+    /// # Errors
+    ///
+    /// [`VideoEncodingError`] for the first value outside its band.
+    pub fn new(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        frame_rate_hz: u32,
+        max_bitrate_bps: u32,
+        min_keyframe_interval_ms: u32,
+    ) -> Result<Self, VideoEncodingError> {
+        if codec != Codec::Vp8 {
+            return Err(VideoEncodingError::CodecNotVp8);
+        }
+        let dims = VIDEO_DIMENSION_MIN_PX..=VIDEO_DIMENSION_MAX_PX;
+        if !dims.contains(&width) || !dims.contains(&height) {
+            return Err(VideoEncodingError::DimensionOutOfBand);
+        }
+        if !(VIDEO_FRAME_RATE_MIN_HZ..=VIDEO_FRAME_RATE_MAX_HZ).contains(&frame_rate_hz) {
+            return Err(VideoEncodingError::FrameRateOutOfBand);
+        }
+        if !(VIDEO_BITRATE_MIN_BPS..=VIDEO_BITRATE_MAX_BPS).contains(&max_bitrate_bps) {
+            return Err(VideoEncodingError::BitrateOutOfBand);
+        }
+        if !(MIN_KEYFRAME_INTERVAL_MS_FLOOR..=MIN_KEYFRAME_INTERVAL_MS_CEILING)
+            .contains(&min_keyframe_interval_ms)
+        {
+            return Err(VideoEncodingError::MinKeyframeIntervalOutOfBand);
+        }
+        Ok(Self {
+            codec,
+            width,
+            height,
+            frame_rate_hz,
+            max_bitrate_bps,
+            min_keyframe_interval_ms,
+        })
+    }
+
+    /// The wire form: every field set, including `min_keyframe_interval_ms`.
+    #[must_use]
+    pub fn to_proto(self) -> EncodingParameters {
+        EncodingParameters {
+            codec: self.codec as i32,
+            max_bitrate_bps: self.max_bitrate_bps,
+            width: self.width,
+            height: self.height,
+            frame_rate: self.frame_rate_hz,
+            min_keyframe_interval_ms: Some(self.min_keyframe_interval_ms),
+        }
+    }
+
+    /// The configured codec.
+    #[must_use]
+    pub fn codec(self) -> Codec {
+        self.codec
+    }
+    /// The configured width, in pixels.
+    #[must_use]
+    pub fn width(self) -> u32 {
+        self.width
+    }
+    /// The configured height, in pixels.
+    #[must_use]
+    pub fn height(self) -> u32 {
+        self.height
+    }
+    /// The configured frame rate, in frames per second.
+    #[must_use]
+    pub fn frame_rate_hz(self) -> u32 {
+        self.frame_rate_hz
+    }
+    /// The configured maximum bitrate, in bits per second.
+    #[must_use]
+    pub fn max_bitrate_bps(self) -> u32 {
+        self.max_bitrate_bps
+    }
+    /// The directed minimum keyframe interval, in milliseconds — the ONE value
+    /// both the directive and `mc_media_video_keyframe_min_interval_seconds`
+    /// read.
+    #[must_use]
+    pub fn min_keyframe_interval_ms(self) -> u32 {
+        self.min_keyframe_interval_ms
+    }
+}
+
 /// What each stream number a publisher may be asked to produce actually is.
 ///
 /// MH is type-blind by design (§7), so the forwarding assignment carries no
 /// media kind — it names behaviours. MC, which is not type-blind, holds the
-/// mapping here. One entry today.
+/// mapping here: stream `MAIN_AUDIO_STREAM_NUMBER` (0) is audio, stream
+/// `MAIN_VIDEO_STREAM_NUMBER` (1) is camera video (`media_routing::assignment`).
 ///
 /// A plan naming a stream number absent from this table is an **MC defect** and
 /// fails loudly: there is no "assume audio" fallback, because guessing the kind
@@ -322,24 +529,43 @@ impl AudioEncoding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaStreamPolicy {
     audio: AudioEncoding,
+    video: VideoEncoding,
 }
 
 impl MediaStreamPolicy {
-    /// Build the table from the configured audio encoding.
+    /// Build the table from the configured encodings.
     #[must_use]
-    pub fn new(audio: AudioEncoding) -> Self {
-        Self { audio }
+    pub fn new(audio: AudioEncoding, video: VideoEncoding) -> Self {
+        Self { audio, video }
     }
 
-    /// The kind and encoding for a stream number, or `None` if MC has no policy
-    /// for it.
+    /// The configured video encoding.
     #[must_use]
-    pub fn lookup(&self, stream: StreamNumber) -> Option<(MediaKind, AudioEncoding)> {
-        if stream.get() == MAIN_AUDIO_STREAM_NUMBER {
-            Some((MediaKind::Audio, self.audio))
-        } else {
-            None
-        }
+    pub fn video(&self) -> VideoEncoding {
+        self.video
+    }
+
+    /// The configured audio encoding.
+    #[must_use]
+    pub fn audio(&self) -> AudioEncoding {
+        self.audio
+    }
+
+    /// The kind for a stream number, or `None` if MC has no policy for it.
+    #[must_use]
+    pub fn kind_of(&self, stream: StreamNumber) -> Option<MediaKindLabel> {
+        MediaKindLabel::ALL
+            .into_iter()
+            .find(|k| stream_number_of(*k) == stream.get())
+    }
+
+    /// The wire stream (number, kind, encoding, transport) for a kind.
+    fn stream_for(&self, kind: MediaKindLabel) -> (u8, EncodingParameters, TransportMode) {
+        (
+            stream_number_of(kind),
+            kind.pick(self.audio.to_proto(), self.video.to_proto()),
+            transport_of(kind),
+        )
     }
 }
 
@@ -353,14 +579,10 @@ impl MediaStreamPolicy {
 ///
 /// # What this is NOT
 ///
-/// This is a derivation, **not** the version floor or allowlist. ADR-0036 §2 and
-/// `signaling.proto` require MC to select from a server-side allowlist with a
-/// configured minimum floor and to reject at join a client declaring nothing at
-/// or above it. **No story task owns that yet** — `signaling.proto` says so
-/// explicitly and `docs/TODO.md` §Media Path Obligations tracks it. Do not read
-/// this function as that control: it is latent only because `PROTOCOL_VERSION`
-/// is 2 with no v1 downgrade path, and MC adds no code path here that could
-/// express a lower version.
+/// v3 is the ONLY header version (story 3 R-22): there is no allowlist and no
+/// floor. The join-time refusal of a client whose `supported_header_versions`
+/// lacks it lives in `webtransport::connection::validate_join_media`, against
+/// the same `PROTOCOL_VERSION`.
 #[must_use]
 fn header_version() -> u32 {
     u32::from(PROTOCOL_VERSION)
@@ -368,89 +590,70 @@ fn header_version() -> u32 {
 
 /// Compose the send directive for one publisher from the forwarding assignment.
 ///
-/// The target set is **derived from the same [`MeetingAssignment`]** the MC→MH
-/// control plane is programmed from — the handlers carrying an egress stream
-/// whose candidate sources include this publisher, i.e. **every handler that
-/// owns at least one of its edges** (ADR-0036 §9 multi-handler send). Under the
-/// shared-handler edge model that is one handler when MC could co-locate the
-/// publisher's edges, several when its subscribers share different handlers
-/// with it, and none for a publisher nobody holds — including a solo
-/// participant, or one not yet connected — which gets the empty set, "send
-/// nothing" (§5). One target per handler, never per edge: the client encrypts
-/// each frame once and transmits it to every target.
+/// # Every published kind, always; an unpublished kind, never
 ///
-/// Target urls come from the meeting's frozen [`MeetingHandlers`], the same
-/// value `JoinResponse.media_servers` and `StreamAssignment.media_handler_url`
-/// are read from, so the three are byte-identical strings.
+/// The directive lists ONE stream per kind in the publisher's fixed publish
+/// set (story 3 R-2, R-8), audio first, and no stream for a kind it does not
+/// publish. A stream's targets are the handlers carrying at least one rendered
+/// out-edge OF THAT STREAM — derived from the same [`MeetingAssignment`] the
+/// MC→MH control plane is programmed from (ADR-0036 §9 multi-handler send). An
+/// UNWATCHED stream (no out-edges: a solo participant, one not yet connected,
+/// or a camera nobody holds in a video slot) is listed with EMPTY targets:
+/// "send nothing" (§5), a specified success. Withdrawal is empty targets,
+/// never removal, so the last watcher's leave withdraws and a new watcher
+/// restores within the same structural change.
 ///
-/// An empty target set is a **specified success** (§5: "A target set may be
-/// empty. That means send nothing."), reported as
-/// [`DirectiveOutcome::EmittedEmptyTargets`] rather than as a failure.
+/// One target per handler, never per edge: the client encrypts each frame
+/// once and transmits it to every target. Target urls come from the meeting's
+/// frozen [`MeetingHandlers`], the same value `JoinResponse.media_servers` and
+/// `StreamAssignment.media_handler_url` are read from. Each target's transport
+/// is its stream's kind's ([`transport_of`]): datagrams for audio,
+/// stream-per-group for video.
 ///
 /// The third element is each stream's `media_kind` metric label, PARALLEL to
-/// `SendDirective.streams` (same length, same order): the typed kind is
-/// projected HERE, once, from the policy's `MediaKind`, so the recorder never
-/// re-derives it from the wire `i32` (the same shape as
-/// `SlotComposition.slot_states`).
+/// `SendDirective.streams` (same length, same order).
 ///
 /// # Errors
 ///
-/// A [`DirectiveOutcome`] failure variant. Every one fails closed: an unknown
-/// stream number is not assumed to be audio, and an unspecified transport mode
-/// is not defaulted to datagram. A policy kind with no `media_kind` label
-/// (`UNSPECIFIED`) is an MC defect reported as
-/// [`DirectiveOutcome::UnknownStreamNumber`] — counted on
-/// `mc_media_send_directives_total`, never skipped.
+/// A [`DirectiveOutcome`] failure variant. Every one fails closed: a plan
+/// naming an unknown stream number is not assumed to be audio, and a target
+/// handler with no url is never emitted as an empty url.
 pub fn build_send_directive(
     publisher: SenderId,
+    publish_set: PublishSet,
     assignment: &MeetingAssignment,
     meeting_handlers: &MeetingHandlers,
     policy: &MediaStreamPolicy,
 ) -> Result<(SendDirective, DirectiveOutcome, Vec<MediaKindLabel>), DirectiveOutcome> {
-    // stream number -> targets, ordered so an unchanged meeting produces an
-    // unchanged directive. `BTreeMap` over the handler id keeps target order
-    // deterministic for the same reason the assignment sorts its streams:
-    // byte-identical output for unchanged input is what lets a test assert the
-    // directive did not move across a mute cycle.
-    let mut by_stream: BTreeMap<StreamNumber, BTreeMap<HandlerId, TransportMode>> = BTreeMap::new();
-
+    // kind -> owning handlers, ordered so an unchanged meeting produces an
+    // unchanged directive (byte-identical output for unchanged input).
+    let mut owners: [std::collections::BTreeSet<HandlerId>; 2] = Default::default();
     for (handler, handler_assignment) in &assignment.per_handler {
         for plan in &handler_assignment.egress_streams {
             if !plan.candidate_sources.contains(&publisher) {
                 continue;
             }
-            if plan.transport_mode == TransportMode::Unspecified {
-                return Err(DirectiveOutcome::TransportModeUnspecified);
-            }
-            let stream = StreamNumber::from_u8(plan.stream_number);
-            if policy.lookup(stream).is_none() {
+            let Some(kind) = policy.kind_of(StreamNumber::from_u8(plan.stream_number)) else {
                 return Err(DirectiveOutcome::UnknownStreamNumber);
-            }
-            by_stream
-                .entry(stream)
-                .or_default()
-                .insert(handler.clone(), plan.transport_mode);
+            };
+            kind.of_mut(&mut owners).insert(handler.clone());
         }
     }
 
-    let mut streams = Vec::with_capacity(by_stream.len());
-    let mut stream_kinds = Vec::with_capacity(by_stream.len());
+    let mut streams = Vec::with_capacity(2);
+    let mut stream_kinds = Vec::with_capacity(2);
     let mut any_target = false;
 
-    for (stream, handlers) in by_stream {
-        let Some((media_kind, encoding)) = policy.lookup(stream) else {
-            return Err(DirectiveOutcome::UnknownStreamNumber);
-        };
-        let Some(kind_label) = MediaKindLabel::from_proto(media_kind) else {
-            return Err(DirectiveOutcome::UnknownStreamNumber);
-        };
-
+    for kind in publish_set.kinds() {
+        let (stream_number, encoding, transport_mode) = policy.stream_for(kind);
+        if transport_mode == TransportMode::Unspecified {
+            return Err(DirectiveOutcome::TransportModeUnspecified);
+        }
+        let handlers = kind.of_ref(&owners);
         let mut targets = Vec::with_capacity(handlers.len());
-        for (handler, transport_mode) in handlers {
-            let Some(url) = meeting_handlers.url_of(&handler) else {
-                // Fail loud rather than emit a target with an empty url: a
-                // client cannot connect to "" and would report a media
-                // connection failure MC could not explain.
+        for handler in handlers {
+            let Some(url) = meeting_handlers.url_of(handler) else {
+                // Fail loud rather than emit a target with an empty url.
                 return Err(DirectiveOutcome::HandlerUrlUnresolved);
             };
             targets.push(SendTarget {
@@ -458,18 +661,25 @@ pub fn build_send_directive(
                 transport_mode: transport_mode as i32,
             });
         }
-
         any_target |= !targets.is_empty();
         streams.push(SendStream {
-            // 8-bit domain widened into the proto's uint32. `u32::from`, never
-            // `as` — the narrowing direction is the fallible one and lives in
-            // `StreamNumber::from_wire`.
-            stream_number: u32::from(stream.get()),
-            media_kind: media_kind as i32,
-            encoding: Some(encoding.to_proto()),
+            // `u32::from`, never `as`: the narrowing direction is the fallible
+            // one and lives in `StreamNumber::from_wire`.
+            stream_number: u32::from(stream_number),
+            media_kind: kind.to_proto() as i32,
+            encoding: Some(encoding),
             targets,
         });
-        stream_kinds.push(kind_label);
+        stream_kinds.push(kind);
+    }
+
+    // A plan naming this publisher on a kind it does not publish is an MC
+    // defect (the render only edges published streams): fail closed rather
+    // than direct a stream the publish set does not contain.
+    for kind in MediaKindLabel::ALL {
+        if !publish_set.publishes(kind) && !kind.of_ref(&owners).is_empty() {
+            return Err(DirectiveOutcome::UnknownStreamNumber);
+        }
     }
 
     let outcome = if any_target {
@@ -492,15 +702,30 @@ pub fn build_send_directive(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::media_routing::{HandlerEndpoint, SlotTable};
+    use crate::media_routing::{
+        HandlerEndpoint, SlotTable, MAIN_AUDIO_STREAM_NUMBER, MAIN_VIDEO_STREAM_NUMBER,
+    };
+    use proto_gen::dark_tower::signaling::v1::MediaKind;
+    use std::collections::BTreeMap;
     use std::num::NonZeroU16;
+
+    const AU: MediaKindLabel = MediaKindLabel::Audio;
+    const VI: MediaKindLabel = MediaKindLabel::Video;
 
     fn sender(n: u16) -> SenderId {
         SenderId::from_nonzero(NonZeroU16::new(n).unwrap())
     }
 
-    fn encoding() -> AudioEncoding {
+    fn audio() -> AudioEncoding {
         AudioEncoding::new(Codec::Opus, 48_000, 50).unwrap()
+    }
+
+    fn video() -> VideoEncoding {
+        VideoEncoding::new(Codec::Vp8, 640, 360, 30, 800_000, 500).unwrap()
+    }
+
+    fn policy() -> MediaStreamPolicy {
+        MediaStreamPolicy::new(audio(), video())
     }
 
     fn handler_set(handlers: &[&str]) -> MeetingHandlers {
@@ -512,60 +737,48 @@ mod tests {
         .unwrap()
     }
 
-    /// Senders 1 and 2 connected only to `mh-0`, each declaring one audio slot, in a
-    /// meeting assigned `handlers` (in the given, arbitrary, order).
+    fn av() -> PublishSet {
+        PublishSet::of(&[AU, VI])
+    }
+
+    fn a() -> PublishSet {
+        PublishSet::of(&[AU])
+    }
+
+    /// Senders 1 and 2 (audio-only) on `mh-0`, each declaring one audio slot.
     fn two_party(handlers: &[&str]) -> (MeetingAssignment, MeetingHandlers) {
         let set = handler_set(handlers);
         let mut table = SlotTable::new();
         for s in [1, 2] {
             table.admit_on(sender(s), &set, &["mh-0"]);
-            table.set_demand(sender(s), vec![0]);
+            table.set_audio_demand(sender(s), vec![0]);
         }
-        (
-            table
-                .render(set.ids(), &std::collections::BTreeSet::new())
-                .unwrap(),
-            set,
-        )
+        (table.render(set.ids(), &table.quiet_mute()).unwrap(), set)
     }
 
     #[test]
     fn header_version_is_derived_not_a_literal() {
-        // Compared to the anchor, never to `2`: if `PROTOCOL_VERSION` moves and
-        // MC does not, this fails.
         assert_eq!(header_version(), u32::from(PROTOCOL_VERSION));
     }
 
     #[test]
     fn a_held_publisher_is_directed_to_one_audio_stream_on_one_datagram_target() {
         let (assignment, urls) = two_party(&["mh-0"]);
-        let (directive, outcome, stream_kinds) = build_send_directive(
-            sender(1),
-            &assignment,
-            &urls,
-            &MediaStreamPolicy::new(encoding()),
-        )
-        .unwrap();
-
+        let (directive, outcome, stream_kinds) =
+            build_send_directive(sender(1), a(), &assignment, &urls, &policy()).unwrap();
         assert_eq!(outcome, DirectiveOutcome::Emitted);
         assert_eq!(directive.header_version, u32::from(PROTOCOL_VERSION));
         assert_eq!(directive.streams.len(), 1);
-        // The per-stream labels are PARALLEL to the streams.
-        assert_eq!(stream_kinds, vec![MediaKindLabel::Audio]);
-
+        assert_eq!(stream_kinds, vec![AU]);
         let stream = &directive.streams[0];
         assert_eq!(stream.stream_number, u32::from(MAIN_AUDIO_STREAM_NUMBER));
         assert_eq!(stream.media_kind, MediaKind::Audio as i32);
-
         let params = stream.encoding.as_ref().unwrap();
         assert_eq!(params.codec, Codec::Opus as i32);
-        assert_ne!(params.codec, Codec::Unspecified as i32);
         assert_eq!(params.max_bitrate_bps, 48_000);
         assert_eq!(params.frame_rate, 50);
-        // Audio carries no geometry: zero is the absence of a constraint.
-        assert_eq!(params.width, 0);
-        assert_eq!(params.height, 0);
-
+        assert_eq!((params.width, params.height), (0, 0));
+        assert_eq!(params.min_keyframe_interval_ms, None, "absent on audio");
         assert_eq!(stream.targets.len(), 1);
         assert_eq!(
             stream.targets[0].media_handler_url,
@@ -577,68 +790,134 @@ mod tests {
         );
     }
 
+    /// R-8 / story-2 contract: an unwatched publisher is LISTED with EMPTY
+    /// targets — a specified success, never an omitted stream.
     #[test]
-    fn a_publisher_nobody_watches_gets_an_empty_target_set() {
-        // ADR-0036 §5: an empty target set is a SPECIFIED SUCCESS ("that means
-        // send nothing"), not a failure — so the outcome must sit in the success
-        // set, or an `outcome != "emitted"` alert would page on a legal state.
+    fn an_unwatched_publisher_lists_its_stream_with_empty_targets() {
         let (assignment, urls) = two_party(&["mh-0"]);
-        let (directive, outcome, _) = build_send_directive(
-            sender(9),
-            &assignment,
-            &urls,
-            &MediaStreamPolicy::new(encoding()),
-        )
-        .unwrap();
+        let (directive, outcome, kinds) =
+            build_send_directive(sender(9), a(), &assignment, &urls, &policy()).unwrap();
         assert_eq!(outcome, DirectiveOutcome::EmittedEmptyTargets);
         assert!(outcome.is_success());
-        assert!(directive.streams.is_empty());
+        assert_eq!(directive.streams.len(), 1);
+        assert!(directive.streams[0].targets.is_empty());
+        assert_eq!(kinds, vec![AU]);
+    }
+
+    /// Every published kind is ALWAYS listed (audio first), and an unpublished
+    /// kind never is; a receive-only participant gets no streams.
+    #[test]
+    fn the_directive_lists_exactly_the_publish_set() {
+        let (assignment, urls) = two_party(&["mh-0"]);
+        for (set, expected) in [
+            (PublishSet::NONE, vec![]),
+            (a(), vec![(0u32, MediaKind::Audio as i32)]),
+            (
+                PublishSet::of(&[VI]),
+                vec![(1, MediaKind::VideoCamera as i32)],
+            ),
+            (
+                av(),
+                vec![
+                    (0, MediaKind::Audio as i32),
+                    (1, MediaKind::VideoCamera as i32),
+                ],
+            ),
+        ] {
+            let (directive, _, kinds) =
+                build_send_directive(sender(9), set, &assignment, &urls, &policy()).unwrap();
+            let got: Vec<(u32, i32)> = directive
+                .streams
+                .iter()
+                .map(|s| (s.stream_number, s.media_kind))
+                .collect();
+            assert_eq!(got, expected);
+            assert_eq!(kinds.len(), directive.streams.len());
+        }
+    }
+
+    /// The video stream: stream 1, VIDEO_CAMERA, ALL six encoding fields set,
+    /// STREAM_PER_GROUP targets — exactly the handlers owning its video
+    /// out-edges.
+    #[test]
+    fn a_watched_video_publisher_is_directed_on_stream_one_with_every_field() {
+        let set = handler_set(&["mh-0"]);
+        let mut table = SlotTable::new();
+        table.admit_on_publishing(sender(1), av(), &set, &["mh-0"]);
+        table.admit_on_publishing(sender(2), av(), &set, &["mh-0"]);
+        table.set_demand(sender(2), [vec![0], vec![1]]);
+        let assignment = table.render(set.ids(), &table.quiet_mute()).unwrap();
+        let (directive, outcome, kinds) =
+            build_send_directive(sender(1), av(), &assignment, &set, &policy()).unwrap();
+        assert_eq!(outcome, DirectiveOutcome::Emitted);
+        assert_eq!(kinds, vec![AU, VI]);
+        let v = &directive.streams[1];
+        assert_eq!(v.stream_number, u32::from(MAIN_VIDEO_STREAM_NUMBER));
+        assert_eq!(v.stream_number, 1, "pinned: video send id is 1");
+        assert_eq!(
+            directive.streams[0].stream_number, 0,
+            "pinned: audio send id is 0"
+        );
+        assert_eq!(v.media_kind, MediaKind::VideoCamera as i32);
+        let e = v.encoding.as_ref().unwrap();
+        assert_eq!(e.codec, Codec::Vp8 as i32);
+        assert_eq!(
+            (e.width, e.height, e.frame_rate, e.max_bitrate_bps),
+            (640, 360, 30, 800_000)
+        );
+        assert_eq!(e.min_keyframe_interval_ms, Some(500));
+        assert_eq!(v.targets.len(), 1);
+        assert_eq!(
+            v.targets[0].transport_mode,
+            TransportMode::StreamPerGroup as i32
+        );
+    }
+
+    /// A video publisher held only in a placeholder sense (nobody declares
+    /// video) has its video stream listed with EMPTY targets: unwatched.
+    #[test]
+    fn an_unwatched_video_stream_is_listed_with_empty_targets() {
+        let set = handler_set(&["mh-0"]);
+        let mut table = SlotTable::new();
+        table.admit_on_publishing(sender(1), av(), &set, &["mh-0"]);
+        table.admit_on_publishing(sender(2), av(), &set, &["mh-0"]);
+        table.set_demand(sender(2), [vec![0], vec![]]);
+        let assignment = table.render(set.ids(), &table.quiet_mute()).unwrap();
+        let (directive, _, _) =
+            build_send_directive(sender(1), av(), &assignment, &set, &policy()).unwrap();
+        assert!(!directive.streams[0].targets.is_empty(), "audio watched");
+        assert!(
+            directive.streams[1].targets.is_empty(),
+            "video unwatched, still listed"
+        );
     }
 
     #[test]
     fn an_unresolvable_handler_url_fails_loud_rather_than_emitting_an_empty_url() {
         let (assignment, _) = two_party(&["mh-0"]);
-        // A handler set that does not contain the handler the plan names: an
-        // MC defect by construction, and it must fail closed.
         let outcome = build_send_directive(
             sender(1),
+            a(),
             &assignment,
             &handler_set(&["mh-9"]),
-            &MediaStreamPolicy::new(encoding()),
+            &policy(),
         );
         assert_eq!(outcome, Err(DirectiveOutcome::HandlerUrlUnresolved));
     }
 
     #[test]
     fn the_directive_carries_no_priority_group() {
-        // Structural, not observed: no priority-group field exists on
-        // SendDirective/SendStream/SendTarget. A client able to name its own
-        // group could promote itself past the salience bound §7 relies on.
-        // This test documents the property; the proto enforces it.
         let (assignment, urls) = two_party(&["mh-0"]);
-        let (directive, _, _) = build_send_directive(
-            sender(1),
-            &assignment,
-            &urls,
-            &MediaStreamPolicy::new(encoding()),
-        )
-        .unwrap();
-        let encoded = format!("{directive:?}");
-        assert!(!encoded.contains("priority"));
+        let (directive, _, _) =
+            build_send_directive(sender(1), a(), &assignment, &urls, &policy()).unwrap();
+        assert!(!format!("{directive:?}").contains("priority"));
     }
 
     #[test]
     fn stream_number_from_wire_fails_closed_and_never_wraps() {
-        // The one seam a wider value can enter through. 256 must be an ERROR,
-        // not 0 — truncation would alias two of one sender's streams inside the
-        // signed key id, which is a nonce-reuse hazard, not a routing nuisance.
         assert_eq!(StreamNumber::from_wire(255).unwrap().get(), 255);
         assert_eq!(
             StreamNumber::from_wire(256),
-            Err(DirectiveOutcome::UnknownStreamNumber)
-        );
-        assert_eq!(
-            StreamNumber::from_wire(65_536),
             Err(DirectiveOutcome::UnknownStreamNumber)
         );
         assert_eq!(
@@ -647,47 +926,22 @@ mod tests {
         );
     }
 
-    /// Every kind the policy can name projects to a label, so the composition's
-    /// `UnknownStreamNumber` fallback for an unlabelled kind is never reached by
-    /// a configured stream. Pinned over the whole 8-bit stream-number domain so
-    /// a new policy entry with an unlabelled kind reds.
     #[test]
-    fn every_policy_kind_projects_to_a_label() {
-        let policy = MediaStreamPolicy::new(encoding());
-        let mut seen = 0;
+    fn the_policy_names_exactly_streams_zero_and_one() {
+        let p = policy();
         for n in 0..=u8::MAX {
-            if let Some((kind, _)) = policy.lookup(StreamNumber::from_u8(n)) {
-                seen += 1;
-                assert!(
-                    MediaKindLabel::from_proto(kind).is_some(),
-                    "policy stream {n} names kind {kind:?}, which has no media_kind label"
-                );
+            let kind = p.kind_of(StreamNumber::from_u8(n));
+            match n {
+                0 => assert_eq!(kind, Some(AU)),
+                1 => assert_eq!(kind, Some(VI)),
+                _ => assert_eq!(kind, None, "stream {n} is never assumed to be anything"),
             }
         }
-        assert!(
-            seen > 0,
-            "positive control: the policy names at least one stream"
-        );
     }
 
+    /// A plan naming an unknown stream number emits nothing.
     #[test]
-    fn an_unknown_stream_number_is_never_assumed_to_be_audio() {
-        let policy = MediaStreamPolicy::new(encoding());
-        assert!(policy
-            .lookup(StreamNumber::from_u8(MAIN_AUDIO_STREAM_NUMBER))
-            .is_some());
-        assert!(policy.lookup(StreamNumber::from_u8(1)).is_none());
-        assert!(policy.lookup(StreamNumber::from_u8(255)).is_none());
-    }
-
-    /// Build a one-plan assignment with fields the caller chooses, so the two
-    /// fail-closed guards INSIDE `build_send_directive` can be driven.
-    ///
-    /// The neighbouring tests exercise `policy.lookup` and
-    /// `StreamNumber::from_wire` directly; neither reaches the guards in the
-    /// build path, which are the ones that decide whether a defaulted-datagram
-    /// or assumed-audio directive can ever be EMITTED.
-    fn assignment_with(stream_number: u8, transport_mode: TransportMode) -> MeetingAssignment {
+    fn a_plan_naming_an_unknown_stream_number_emits_nothing() {
         use crate::media_routing::HandlerAssignment;
         let mut per_handler = BTreeMap::new();
         per_handler.insert(
@@ -698,107 +952,59 @@ mod tests {
                     subscriber: sender(2),
                     slot_id: 0,
                     candidate_sources: vec![sender(1)],
-                    stream_number,
-                    priority_group: 0,
+                    stream_number: 7,
+                    priority_group: 1,
                     supersede_on_independent_frame: false,
-                    transport_mode,
                 }],
-                server_muted_sources: std::collections::BTreeSet::new(),
+                ..HandlerAssignment::default()
             },
         );
-        MeetingAssignment { per_handler }
-    }
-
-    fn urls_for_mh0() -> MeetingHandlers {
-        handler_set(&["mh-0"])
-    }
-
-    #[test]
-    fn an_unspecified_transport_mode_is_never_defaulted_to_datagram() {
-        // The proto zero is a rejection, not a convenience. Emitting a
-        // datagram-defaulted directive would have MC silently choose a
-        // transport the assignment never named.
-        let assignment = assignment_with(MAIN_AUDIO_STREAM_NUMBER, TransportMode::Unspecified);
+        let assignment = MeetingAssignment { per_handler };
         assert_eq!(
             build_send_directive(
                 sender(1),
+                av(),
                 &assignment,
-                &urls_for_mh0(),
-                &MediaStreamPolicy::new(encoding()),
-            ),
-            Err(DirectiveOutcome::TransportModeUnspecified)
-        );
-    }
-
-    #[test]
-    fn a_plan_naming_an_unknown_stream_number_emits_nothing() {
-        // Stream number 1 is absent from the policy table. There is no "assume
-        // audio" fallback: guessing a stream's kind is how a client ends up
-        // encrypting video parameters into an audio key stream.
-        let assignment = assignment_with(1, TransportMode::Datagram);
-        assert_eq!(
-            build_send_directive(
-                sender(1),
-                &assignment,
-                &urls_for_mh0(),
-                &MediaStreamPolicy::new(encoding()),
+                &handler_set(&["mh-0"]),
+                &policy()
             ),
             Err(DirectiveOutcome::UnknownStreamNumber)
         );
     }
 
     #[test]
-    fn the_same_assignment_shape_succeeds_when_both_fields_are_well_formed() {
-        // The control test for the two above: without it, a build_send_directive
-        // that rejected EVERY hand-built assignment would pass both and prove
-        // nothing about the two specific guards.
-        let assignment = assignment_with(MAIN_AUDIO_STREAM_NUMBER, TransportMode::Datagram);
-        let (directive, outcome, _) = build_send_directive(
-            sender(1),
-            &assignment,
-            &urls_for_mh0(),
-            &MediaStreamPolicy::new(encoding()),
-        )
-        .unwrap();
-        assert_eq!(outcome, DirectiveOutcome::Emitted);
-        assert_eq!(directive.streams.len(), 1);
+    fn codec_parsing_fails_loud_and_never_falls_back() {
+        assert_eq!(parse_codec("  OPUS ").unwrap(), Codec::Opus);
+        assert_eq!(parse_codec("vp8").unwrap(), Codec::Vp8);
+        assert_eq!(parse_codec("oppus"), Err(CodecParseError::UnknownCodec));
+        assert_eq!(parse_codec(""), Err(CodecParseError::UnknownCodec));
+        assert_eq!(
+            parse_codec("unspecified"),
+            Err(CodecParseError::CodecUnspecified)
+        );
     }
 
     #[test]
-    fn codec_parsing_fails_loud_and_never_falls_back() {
-        assert_eq!(AudioEncoding::parse_codec("opus").unwrap(), Codec::Opus);
-        assert_eq!(AudioEncoding::parse_codec("  OPUS ").unwrap(), Codec::Opus);
-        assert_eq!(AudioEncoding::parse_codec("Opus").unwrap(), Codec::Opus);
-        // A near-miss must NOT silently become Opus.
-        assert_eq!(
-            AudioEncoding::parse_codec("oppus"),
-            Err(AudioEncodingError::UnknownCodec)
-        );
-        assert_eq!(
-            AudioEncoding::parse_codec(""),
-            Err(AudioEncodingError::UnknownCodec)
-        );
-        assert_eq!(
-            AudioEncoding::parse_codec("unspecified"),
-            Err(AudioEncodingError::CodecUnspecified)
-        );
+    fn the_video_encoding_error_names_the_bands_from_the_constants() {
+        let text = VideoEncodingError::MinKeyframeIntervalOutOfBand.to_string();
+        assert!(text.contains(&format!(
+            "{MIN_KEYFRAME_INTERVAL_MS_FLOOR}..={MIN_KEYFRAME_INTERVAL_MS_CEILING}"
+        )));
+        assert!(VideoEncodingError::DimensionOutOfBand
+            .to_string()
+            .contains(&format!(
+                "{VIDEO_DIMENSION_MIN_PX}..={VIDEO_DIMENSION_MAX_PX}"
+            )));
     }
 
     #[test]
     fn codec_unspecified_is_rejected_at_construction_not_at_emit() {
-        // This is what makes CODEC_UNSPECIFIED structurally unrepresentable in a
-        // send directive: there is no `AudioEncoding` holding it, so no emit
-        // site can produce one.
         assert_eq!(
             AudioEncoding::new(Codec::Unspecified, 48_000, 50),
             Err(AudioEncodingError::CodecUnspecified)
         );
         assert_eq!(
-            AudioEncoding::new(Codec::Vp9, 48_000, 50),
-            Err(AudioEncodingError::CodecNotAudio)
-        );
-        assert_eq!(
-            AudioEncoding::new(Codec::H264, 48_000, 50),
+            AudioEncoding::new(Codec::Vp8, 48_000, 50),
             Err(AudioEncodingError::CodecNotAudio)
         );
     }
@@ -812,115 +1018,90 @@ mod tests {
             Err(AudioEncodingError::BitrateOutOfBand)
         );
         assert_eq!(
-            AudioEncoding::new(Codec::Opus, 0, 50),
-            Err(AudioEncodingError::BitrateOutOfBand)
-        );
-        assert_eq!(
             AudioEncoding::new(Codec::Opus, AUDIO_BITRATE_MAX_BPS + 1, 50),
             Err(AudioEncodingError::BitrateOutOfBand)
         );
-        assert!(AudioEncoding::new(Codec::Opus, 48_000, AUDIO_FRAME_RATE_MIN_HZ).is_ok());
-        assert!(AudioEncoding::new(Codec::Opus, 48_000, AUDIO_FRAME_RATE_MAX_HZ).is_ok());
         assert_eq!(
             AudioEncoding::new(Codec::Opus, 48_000, AUDIO_FRAME_RATE_MAX_HZ + 1),
             Err(AudioEncodingError::FrameRateOutOfBand)
         );
-        assert_eq!(
-            AudioEncoding::new(Codec::Opus, 48_000, 0),
-            Err(AudioEncodingError::FrameRateOutOfBand)
+    }
+
+    /// Every `VideoEncoding` bound, both ends, and the codec.
+    #[test]
+    fn video_encoding_bounds_refuse_every_out_of_band_value() {
+        let ok = |w, h, f, b, k| VideoEncoding::new(Codec::Vp8, w, h, f, b, k);
+        assert!(
+            ok(16, 16, 1, 100_000, 100).is_ok(),
+            "every floor is inclusive"
         );
+        assert!(
+            ok(1920, 1920, 60, 4_000_000, 10_000).is_ok(),
+            "every ceiling is inclusive"
+        );
+        assert!(
+            ok(320, 180, 15, 250_000, 500).is_ok(),
+            "the planned Kind test profile"
+        );
+        use VideoEncodingError::*;
+        for (w, h, f, b, k, e) in [
+            (15, 360, 30, 800_000, 500, DimensionOutOfBand),
+            (1921, 360, 30, 800_000, 500, DimensionOutOfBand),
+            (640, 15, 30, 800_000, 500, DimensionOutOfBand),
+            (640, 1921, 30, 800_000, 500, DimensionOutOfBand),
+            (640, 360, 0, 800_000, 500, FrameRateOutOfBand),
+            (640, 360, 61, 800_000, 500, FrameRateOutOfBand),
+            (640, 360, 30, 99_999, 500, BitrateOutOfBand),
+            (640, 360, 30, 4_000_001, 500, BitrateOutOfBand),
+            (640, 360, 30, 800_000, 99, MinKeyframeIntervalOutOfBand),
+            (640, 360, 30, 800_000, 10_001, MinKeyframeIntervalOutOfBand),
+        ] {
+            assert_eq!(ok(w, h, f, b, k), Err(e), "{w}x{h}@{f} {b} {k}");
+        }
+        for codec in [
+            Codec::Unspecified,
+            Codec::Opus,
+            Codec::Vp9,
+            Codec::Av1,
+            Codec::H264,
+        ] {
+            assert_eq!(
+                VideoEncoding::new(codec, 640, 360, 30, 800_000, 500),
+                Err(CodecNotVp8)
+            );
+        }
+        assert_eq!(MIN_KEYFRAME_INTERVAL_MS_FLOOR, 100);
+        assert_eq!(MIN_KEYFRAME_INTERVAL_MS_CEILING, 10_000);
     }
 
     #[test]
     fn the_directive_is_byte_identical_for_unchanged_input() {
-        // What makes "the directive did not move across a mute cycle" assertable
-        // as bytes rather than as a field-by-field comparison.
         use prost::Message;
         let (assignment, urls) = two_party(&["mh-1", "mh-0", "mh-2"]);
-        let policy = MediaStreamPolicy::new(encoding());
-        let (a, _, _) = build_send_directive(sender(1), &assignment, &urls, &policy).unwrap();
-        let (b, _, _) = build_send_directive(sender(1), &assignment, &urls, &policy).unwrap();
-        assert_eq!(a.encode_to_vec(), b.encode_to_vec());
+        let (x, _, _) =
+            build_send_directive(sender(1), av(), &assignment, &urls, &policy()).unwrap();
+        let (y, _, _) =
+            build_send_directive(sender(1), av(), &assignment, &urls, &policy()).unwrap();
+        assert_eq!(x.encode_to_vec(), y.encode_to_vec());
     }
 
-    /// R-3: a solo participant is held by nobody, so it is told to send
-    /// nothing — a specified success, never a self-edge.
-    #[test]
-    fn a_solo_participant_is_directed_to_send_nothing() {
-        let set = handler_set(&["mh-0"]);
-        let mut table = SlotTable::new();
-        table.admit_on(sender(1), &set, &["mh-0"]);
-        table.set_demand(sender(1), vec![0]);
-        let (directive, outcome, _) = build_send_directive(
-            sender(1),
-            &table
-                .render(set.ids(), &std::collections::BTreeSet::new())
-                .unwrap(),
-            &set,
-            &MediaStreamPolicy::new(encoding()),
-        )
-        .unwrap();
-        assert_eq!(outcome, DirectiveOutcome::EmittedEmptyTargets);
-        assert!(directive.streams.is_empty());
-    }
-
-    /// The directive's targets ARE the handlers carrying this publisher's edges
-    /// — a property, asserted without naming which handler that is.
-    ///
-    /// # What this rejects, by name
-    ///
-    /// Both participants reach only **mh-0**, so mh-1 holds a correct-by-design
-    /// EMPTY edge set. The nameable wrong answer is `https://mh-1.example:4434`
-    /// — what list-order selection produced on the live cluster in story 1
-    /// (three of four media connections on mh-1 while every edge sat on mh-0).
-    /// The `assert_ne!` below is that injected adverse condition, and it is
-    /// forced by connectivity (mh-0 is the ONLY shared handler), not by which
-    /// handler a chooser happens to prefer.
-    ///
-    /// The urls are WRITTEN LITERALS, deliberately not sourced from any helper
-    /// the production path also calls.
+    /// The targets ARE the handlers carrying this publisher's edges; mh-1 holds
+    /// a correct-by-design EMPTY edge set (written literals).
     #[test]
     fn the_directive_targets_exactly_the_handlers_carrying_this_publishers_edges() {
         let (assignment, urls) = two_party(&["mh-0", "mh-1"]);
-        let carrying: Vec<String> = assignment
-            .per_handler
-            .iter()
-            .filter(|(_, h)| {
-                h.egress_streams
-                    .iter()
-                    .any(|p| p.candidate_sources.contains(&sender(1)))
-            })
-            .map(|(id, _)| urls.url_of(id).unwrap().to_string())
-            .collect();
-
-        let (directive, outcome, _) = build_send_directive(
-            sender(1),
-            &assignment,
-            &urls,
-            &MediaStreamPolicy::new(encoding()),
-        )
-        .unwrap();
+        let (directive, outcome, _) =
+            build_send_directive(sender(1), a(), &assignment, &urls, &policy()).unwrap();
         assert_eq!(outcome, DirectiveOutcome::Emitted);
-        let targets: Vec<String> = directive.streams[0]
+        let targets: Vec<&str> = directive.streams[0]
             .targets
             .iter()
-            .map(|t| t.media_handler_url.clone())
+            .map(|t| t.media_handler_url.as_str())
             .collect();
-        assert_eq!(
-            targets, carrying,
-            "targets == owners of the publisher's edges"
-        );
-        assert_eq!(targets, vec!["https://mh-0.example:4434".to_string()]);
-        assert_ne!(
-            targets[0], "https://mh-1.example:4434",
-            "mh-1 holds a correct-by-design EMPTY edge set; steering a client there is the defect \
-             story 1 task 25 fixed"
-        );
+        assert_eq!(targets, vec!["https://mh-0.example:4434"]);
     }
 
-    /// ADR-0036 §9 multi-handler send: A shares mh-0 with B and mh-1 with C, so
-    /// A's edges genuinely span both handlers and its ONE stream carries BOTH
-    /// targets — one per handler, each a registered url verbatim.
+    /// ADR-0036 §9 multi-handler send: one stream, both owners as targets.
     #[test]
     fn a_publisher_whose_edges_span_handlers_is_directed_to_every_owner() {
         let set = handler_set(&["mh-0", "mh-1"]);
@@ -929,23 +1110,17 @@ mod tests {
         table.admit_on(sender(2), &set, &["mh-0"]);
         table.admit_on(sender(3), &set, &["mh-1"]);
         for s in [1, 2, 3] {
-            table.set_demand(sender(s), vec![0, 1]);
+            table.set_audio_demand(sender(s), vec![0, 1]);
         }
-        let (directive, outcome, _) = build_send_directive(
+        let (directive, _, _) = build_send_directive(
             sender(1),
-            &table
-                .render(set.ids(), &std::collections::BTreeSet::new())
-                .unwrap(),
+            a(),
+            &table.render(set.ids(), &table.quiet_mute()).unwrap(),
             &set,
-            &MediaStreamPolicy::new(encoding()),
+            &policy(),
         )
         .unwrap();
-        assert_eq!(outcome, DirectiveOutcome::Emitted);
-        assert_eq!(
-            directive.streams.len(),
-            1,
-            "one stream, many targets — never two streams"
-        );
+        assert_eq!(directive.streams.len(), 1);
         let mut targets: Vec<&str> = directive.streams[0]
             .targets
             .iter()
@@ -956,36 +1131,5 @@ mod tests {
             targets,
             vec!["https://mh-0.example:4434", "https://mh-1.example:4434"]
         );
-    }
-
-    /// Registration order cannot change where the client is steered.
-    ///
-    /// A unit-tier pin only: `MeetingHandlers` sorts at construction, so the
-    /// property is a type guarantee here (review-protocol §Assertion Vacuity
-    /// mechanism 4). The seam whose order genuinely varies — the Redis
-    /// `MhAssignmentData.handlers` list reaching MC through a real join — is
-    /// proven by `crates/mc-service/tests/media_client_signaling_integration.rs`'s
-    /// `every_client_is_offered_the_full_set_and_steered_only_to_owning_handlers`.
-    #[test]
-    fn handler_list_order_does_not_move_the_directive_at_this_tier() {
-        use prost::Message;
-        let policy = MediaStreamPolicy::new(encoding());
-        let (ascending, urls_a) = two_party(&["mh-0", "mh-1"]);
-        let (inverted, urls_b) = two_party(&["mh-1", "mh-0"]);
-
-        let (a, _, _) = build_send_directive(sender(1), &ascending, &urls_a, &policy).unwrap();
-        let (b, _, _) = build_send_directive(sender(1), &inverted, &urls_b, &policy).unwrap();
-
-        // Byte-identical AND non-empty naming mh-0: equality alone is green when
-        // both sides are empty, so the literal is what gives this teeth.
-        assert_eq!(a.encode_to_vec(), b.encode_to_vec());
-        for directive in [&a, &b] {
-            assert_eq!(directive.streams.len(), 1);
-            assert_eq!(directive.streams[0].targets.len(), 1);
-            assert_eq!(
-                directive.streams[0].targets[0].media_handler_url,
-                "https://mh-0.example:4434"
-            );
-        }
     }
 }

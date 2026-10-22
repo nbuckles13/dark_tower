@@ -130,7 +130,7 @@ exclusively through `serverCertificateHashes` pinning.
 |---|---|---|
 | s1 | `joined.mediaServers` is non-empty and every entry connects | R-33: every participant is offered the meeting's whole handler set and dials all of it. No handler COUNT is asserted — `env.ts` keeps topology out of this tier. |
 | s2 | Slot 0 polls to exactly **`fewer_sources_than_slots`** | **The positive control.** A specific, non-default wire token proves MC's assignment arrived and says "nobody to hear" — not merely "not awaiting-assignment", which is vacuous under R-3. `active` here would mean MC routed the client to itself. |
-| s3 | `framesSent` and `framesAccepted` are both **flat** over a window after s2 | Egress is flat because MC directs no audio stream to a publisher nobody holds (a `SendDirective` with no streams, §5), so no send instruction is ever applied — not because of mute. Ingress is flat because MC pushed no edge into this client. |
+| s3 | `framesSent` and `framesAccepted` are both **flat** over a window after s2 | Egress is flat because MC directs no audio stream to a publisher nobody holds (a `SendDirective` listing audio with empty targets, §5), so no send instruction is ever applied — not because of mute. Ingress is flat because MC pushed no edge into this client. |
 | s4 | The window contains **≥ 4 samples**, asserted separately (shared `expectCountersFlatOverWindow`) | Flatness over zero samples is vacuously true, so a stalled sampler must be reported as a harness failure. |
 
 Browser-tier proof of client STRUCTURAL mute (egress flat while muted, then
@@ -312,10 +312,11 @@ Building blocks for the N+1 specs; each module header carries the detail.
   audio specs run with no video slots, story 3 R-33), and `readOwnTone` asserts
   the build's declared N and M at runtime (`expectDeclaredReceiveSlots`) because
   a reused server keeps whatever values it was started with. The retired
-  `VITE_DT_RECEIVE_SLOTS` fails the web app's config load if set. Until MC-A
-  the controller sends no per-kind caps; the fixture then records a
-  `transitional` annotation and a gate-log warning instead of comparing N to the
-  cap; MC-A (task 12) deletes that branch and restores `unknown` as a failure.
+  `VITE_DT_RECEIVE_SLOTS` fails the web app's config load if set. The same
+  fixture asserts MC advertised BOTH per-kind caps (`JoinResponse`
+  `max_audio_receive_slots` / `max_video_receive_slots`) and that each admits
+  its count (audio cap >= N, video cap >= M); an `unknown` cap of either kind is
+  a failure, and a video cap of 0 reads `known`.
 - **Layer 3 tone detector** (`toneDetector.ts`, `fixtures.ts` `readOwnTone` /
   `expectHearsSender`): reads the bus's per-lane dB spectrum; two-sided (the
   sender's announced tone is dominant in its lane AND no other cohort tone — the

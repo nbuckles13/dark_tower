@@ -111,7 +111,7 @@ is safe only **within the v3 era**: between two builds that both contain story 3
 |---|---|---|
 | (a) **Config** | The shared `media-codec-profile` ConfigMap (generator-only base `infra/services/media-codec-profile/`, required on mc-0, mc-1, mh-0 and mh-1), the new required MC and MH keys, and the retiring keys flipped to `optional: true` with RETIRED banners. All of it landed with INF-A, ahead of the code. Current images ignore every new key, so applying it alone changes no behaviour. **It does still roll all four pods**, because the pod templates change, and an MH roll sheds that pod's sessions ([Rollout With Media Flowing](#rollout-with-media-flowing)). | Both MC and MH pods Ready. No `CreateContainerConfigError` ([Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)). |
 | (b) **MH** | The story-3 MH image. | MH's per-stream apply-time transport check is live. It ships with MH-A1: `mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}` is **present** on both pods. **Presence is the gate, not zero.** The series **rises** while the old MC is still up, because the shipped MH refuses each of the old MC's egress-bearing registrations (the skew table's old-MC row). That is expected until step (c). If the series is absent, that MH predates MH-A1, so do not roll MC. |
-| (c) **MC** | The story-3 MC image. | `mc_session_join_failures_total{error_type="header_version_unsupported"}` is present on both pods (shipped by MC-A), and `mc_media_policy_pushes_total{outcome="transport_mode_mismatch"}` is flat. |
+| (c) **MC** | The story-3 MC image. | `mc_session_join_failures_total{error_type="header_version_unsupported"}` is present on both pods (shipped by MC-A; zero-initialised, so presence is the gate), and `mc_media_policy_pushes_total{outcome="transport_mode_mismatch"}` is flat. |
 | (d) **Browser SDK / web-app bundle** | A **separately named step**. Kind's `infra/kind/scripts/deploy.sh` does NOT deploy it. The bundle is served by the Vite dev server (`scripts/dev-web.sh`, restarted from the new tree) or by a built bundle, and browsers holding the old bundle must reload. | Old-bundle joins (the first row of the skew table below) fall to zero as users reload. |
 
 **Why MH goes before MC inside the cutover.** MH's apply-time per-stream transport check and its
@@ -157,7 +157,7 @@ console.
 | **Old SDK → new MC** | The join is refused before admission, because `ParticipantCapabilities.supported_header_versions` (signaling.proto) lacks 3 (an empty list included). The refusal uses the generic join-refusal shape and echoes no version. | `mc_session_join_failures_total{error_type="header_version_unsupported"}` | MC-A |
 | **v3 frames → old MH**, and **v2 frames → new MH** | Every frame is dropped at MH ingress. Audio is **totally** silent on that handler. | `mh_media_frames_dropped_total{direction="ingress",reason="unknown_version"}` | live today (codec token, `crates/media-protocol/src/codec.rs`) |
 | **Old MC directs `header_version` 2 → v3 SDK** | The SDK refuses the directive and sends nothing for that kind. | The exported client directive-fault series, under its header-version-refused reason. Its series and token names are fixed by C-A1 in `docs/observability/metrics/client.md`; this runbook does not pre-empt them. | C-A1 |
-| **New MC → story-2 MH** (video egress) | The whole registration is rejected, so the meeting's audio goes dark too. A story-2 MH that ACCEPTS a registration (an audio-only meeting, one transport) echoes no `applied_source_streams`; from MC-A that reads `transport_mode_mismatch`, arm `absent_from_echo`. | MH: `mh_media_policy_applies_total{outcome="rejected_invalid"}`. MC: the RPC fails, so nothing lands on `mc_media_policy_pushes_total`. Read `mc_register_meeting_total{status="error"}` and the WARN "RegisterMeeting RPC failed" (target `mc.grpc.mh_client`). | live today; see [Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard) |
+| **New MC → story-2 MH** (video egress) | The whole registration is rejected, so the meeting's audio goes dark too. A story-2 MH that ACCEPTS a registration (an audio-only meeting, one transport) echoes no `applied_source_streams`; that reads `transport_mode_mismatch`, `echo_arm=absent_from_echo`. | MH: `mh_media_policy_applies_total{outcome="rejected_invalid"}`. MC: the RPC fails, so nothing lands on `mc_media_policy_pushes_total`. Read `mc_register_meeting_total{status="error"}` and the WARN "RegisterMeeting RPC failed" (target `mc.grpc.mh_client`). | live today; see [Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard) |
 | **Old MC → new MH** (registration) | The old MC sends no `source_streams`, so the shipped MH refuses every egress-bearing registration **whole** (audio dark). It clears when the new MC re-registers. Both the forward order (between steps b and c) and the reversed by-hand rollback pass through this. | MH: `mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}`. This is also A8's selector, so A8 can fire if the window is held past its `for: 15m`. MC: the old MC's RegisterMeeting fails, read as above. | MH-A1 + MC-B |
 
 The receiver-side `dt_client_media_frames_dropped_total{reason="unknown_version"}` also moves on
@@ -1014,20 +1014,21 @@ Deploy order: [Story 3 cutover](#story-3-cutover-see-each-other-order-skew-detec
 **MC side: it pages.** `mc_media_policy_pushes_total{outcome="transport_mode_mismatch"}` fires
 `MCMediaGenerationDivergence`, triaged in
 [`mc-incident-response.md` Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence),
-whose `transport_mode_mismatch` row links back here. Once MC-A lands, the token's meaning **widens
-to any per-stream echo disagreement**. MC compares each declared `SourceStream` against MH's
-`RegisterMeetingResponse.applied_source_streams`, and three arms map to this one token, with no new
-outcome value. **Fork on MC's confirm-failure log line**, which carries the arm and the
-`stream_number` as log fields, never as labels:
+whose `transport_mode_mismatch` row links back here. Since story 3 MC-A the token means **any
+per-stream echo disagreement**. MC compares each declared `SourceStream` against MH's
+`RegisterMeetingResponse.applied_source_streams`, unconditionally, and three arms map to this one
+token, with no new outcome value. **Fork on MC's confirm-failure ERROR line** ("MH did not confirm
+the forwarding policy", target `mc.grpc.mh_client`), which carries the arm and the stream as log
+fields `echo_arm` and `echo_stream_number`, never as labels (and no sender id):
 
-| Arm (log field, from MC-A) | Means | Do |
+| `echo_arm` | Means | Do |
 |---|---|---|
 | `absent_from_echo` | The MH that answered never echoed that stream. It is an older or mis-ordered MH build that predates the per-stream echo. | **Roll MH FORWARD.** Do NOT roll MC back. Across the story-3 cutover that is a partial rollback (above), and within the v3 era it does not remove the old MH. |
 | `echoed_unspecified` | MH echoed the stream with no transport. This is a contract fault. | Escalate to `media-handler` and `meeting-controller` together. |
 | `mode_differs` | MH applied a different transport than MC declared. This is configuration or contract drift between the two builds, not a version skew. | Compare MC's declared transport for that `stream_number` with MH's applied one. Escalate to both specialists. A rejoin re-sends the same declaration and will not clear it. |
 
-Before MC-A, MC compares the single superseded `RegisterMeetingResponse.transport_mode`, and the
-token keeps its story-2 meaning (MC Scenario 15's row).
+*(History: before MC-A, MC compared the single superseded `RegisterMeetingResponse.transport_mode`,
+and the token had its story-2 meaning.)*
 
 **MH side: warning A8 (`for: 15m`), written by OBS-B.**
 `mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}` (MH-A1) means MH refused
@@ -1104,8 +1105,9 @@ touches MH ([Operator levers](#operator-levers-for-media-video-off-and-nothing-e
 
 - **`MC_MAX_VIDEO_RECEIVE_SLOTS=0` disables video (R-26).** Every declared video slot is
   truncated to `SLOT_STATE_UNAVAILABLE` (R-1). No publisher is watched, so no camera is directed
-  to send. **Audio is unaffected.** It applies to declarations made after the new MC pods are up.
-  This takes effect once MC-A lands; the current MC image ignores the key. Confirm it on
+  to send. **Audio is unaffected.** MC reads the cap once at startup and never re-truncates a live
+  slot vector, so it applies to declarations made after the new MC pods are up (the restart
+  reconnects everyone). Confirm it on
   `mc_media_receive_slot_cap{media_kind="video"}` reading 0 on both MC pods.
   - **Its cost.** The key lives in `infra/services/mc-service/config.env` **only**, never in
     `media-codec-profile`, so pulling it **never rolls MH** and never sheds an MH session. The MC
@@ -1122,12 +1124,19 @@ touches MH ([Operator levers](#operator-levers-for-media-video-off-and-nothing-e
     wire break. A rollback across the story-3 cutover takes MH, MC and the SDK back together and
     silences audio for its window
     ([Story 3 cutover](#story-3-cutover-see-each-other-order-skew-detection-rollback)).
-  - **Verification of the lever itself** is MC's and test's. Neither artifact is in the tree yet,
-    and both are planned in `docs/user-stories/2026-10-07-see-each-other.md`:
-    - MC-A adds an integration test under `crates/mc-service/tests/` (in the story's MC-A test
-      list, R-26). With the cap at 0, every video slot is UNAVAILABLE, no video targets exist, and
-      audio is identical to a run without video.
-    - T-B's manual test plan, step (8) "Video cap 0".
+  - **Verification of the lever itself** is MC's and test's:
+    - MC (shipped with MC-A, R-26): the integration test
+      `the_video_cap_zero_lever_turns_video_off_and_leaves_audio_identical` in
+      `crates/mc-service/tests/video_slots_integration.rs` — with the cap at 0, a video-only
+      receive-only client is still admitted, every video slot is UNAVAILABLE, no camera is
+      directed to send, and the audio slots and audio directive are identical to a run without
+      video — backed by the unit tests
+      `a_video_cap_of_zero_leaves_audio_identical_and_renders_no_video`
+      (`crates/mc-service/src/media_routing/slots.rs`) and
+      `neither_publish_nor_receive_is_judged_before_truncation`
+      (`crates/mc-service/src/webtransport/connection.rs`).
+    - T-B's manual test plan, step (8) "Video cap 0" (planned in
+      `docs/user-stories/2026-10-07-see-each-other.md`).
     It is deliberately not an env-test, because it needs MC restarted mid-suite.
 - **Beside it, the cost of a `media-codec-profile` change.** It is a coordinated MC+MH roll: the
   profile is referenced by mc-0, mc-1, mh-0 and mh-1, so any edit rolls all four, and **MH sheds

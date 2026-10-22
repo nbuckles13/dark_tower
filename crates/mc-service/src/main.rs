@@ -141,11 +141,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // silent, and this line is the only record of it. Same discipline as
         // mh-service, which logs every effective transport value and its derived
         // drain window in one structured startup line.
-        max_receive_slots = config.max_receive_slots,
+        // Per-kind caps, read ONCE here (live vectors are never re-truncated).
+        max_audio_receive_slots = mc_service::media_kind::MediaKindLabel::Audio.of(config.max_receive_slots),
+        max_video_receive_slots = mc_service::media_kind::MediaKindLabel::Video.of(config.max_receive_slots),
         max_receive_capability_declarations = config.max_receive_capability_declarations,
         audio_codec = ?config.audio_encoding.codec(),
         audio_max_bitrate_bps = config.audio_encoding.max_bitrate_bps(),
         audio_frame_rate_hz = config.audio_encoding.frame_rate_hz(),
+        video_codec = ?config.video_encoding.codec(),
+        video_width = config.video_encoding.width(),
+        video_height = config.video_encoding.height(),
+        video_frame_rate_hz = config.video_encoding.frame_rate_hz(),
+        video_max_bitrate_bps = config.video_encoding.max_bitrate_bps(),
+        video_min_keyframe_interval_ms = config.video_encoding.min_keyframe_interval_ms(),
         // DERIVED teardown bounds (story 2 task 12), logged so the runbook names
         // a field instead of restating arithmetic over four constants in two
         // files. Named for what each bounds, not for its formula.

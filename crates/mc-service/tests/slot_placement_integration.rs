@@ -771,7 +771,7 @@ async fn rapid_distinct_redeclarations_are_bounded_and_do_not_starve_peers() {
     b.write(mute_frame(true, false)).await;
     a.assignments_until("B shown muted in A's view", |x| {
         x.assignments.iter().any(|s| {
-            s.sender_id == Some(b.sender_id) && s.slot_state == SlotState::SourceMuted as i32
+            s.sender_id == Some(b.sender_id) && s.slot_state == SlotState::AvatarClientMuted as i32
         })
     })
     .await;
@@ -821,10 +821,10 @@ async fn grace_expiry_drives_the_same_re_push_as_a_clean_leave() {
             &proto_gen::dark_tower::signaling::v1::ReceiveCapability {
                 slots: audio_slots(1),
             },
-            8,
             true,
         )
-        .unwrap();
+        .unwrap()
+        .truncate(client_media_config().max_receive_slots);
         meeting
             .register_receive_capability(format!("part-{p}"), decl)
             .await
@@ -884,10 +884,10 @@ async fn a_reconnect_in_grace_keeps_slots_and_re_sends_only_the_reconnectors_vie
             &proto_gen::dark_tower::signaling::v1::ReceiveCapability {
                 slots: audio_slots(1),
             },
-            8,
             true,
         )
         .unwrap()
+        .truncate(client_media_config().max_receive_slots)
     };
 
     let mut joins = Vec::new();
@@ -976,6 +976,10 @@ async fn a_reconnect_in_grace_keeps_slots_and_re_sends_only_the_reconnectors_vie
             "conn-b2".to_string(),
             joins[1].correlation_id.clone(),
             joins[1].binding_token.clone(),
+            mc_service::media_signaling::PublishSet::of(&[
+                mc_service::media_signaling::MediaKindLabel::Audio,
+            ]),
+            None,
         )
         .await
         .unwrap();
@@ -1145,16 +1149,13 @@ async fn an_applied_echo_mismatch_on_a_re_push_is_loud() {
 async fn the_published_slot_cap_is_the_enforced_cap() {
     let snap = MetricAssertion::snapshot();
     let (_stack, _rig) = start_stack("slot-cap-gauge").await;
-    let expected = f64::from(client_media_config().max_receive_slots);
-    snap.gauge("mc_media_receive_slot_cap")
-        .with_labels(&[("media_kind", "audio"), ("key_custody", "operator")])
-        .assert_value(expected);
-    // No video cap is published until MC-A adds the per-kind cap: a video `0`
-    // will mean "the R-26 video-off lever applied", so publishing it early would
-    // be a false reading.
-    snap.gauge("mc_media_receive_slot_cap")
-        .with_labels(&[("media_kind", "video")])
-        .assert_unobserved();
+    let caps = client_media_config().max_receive_slots;
+    // BOTH kinds are published (story 3 MC-A), each from the configured cap.
+    for kind in mc_service::media_signaling::MediaKindLabel::ALL {
+        snap.gauge("mc_media_receive_slot_cap")
+            .with_labels(&[("media_kind", kind.label()), ("key_custody", "operator")])
+            .assert_value(f64::from(kind.of(caps)));
+    }
 }
 
 // ============================================================================
@@ -1204,10 +1205,10 @@ async fn actor_meeting(
             &proto_gen::dark_tower::signaling::v1::ReceiveCapability {
                 slots: audio_slots(3),
             },
-            8,
             true,
         )
-        .unwrap();
+        .unwrap()
+        .truncate(client_media_config().max_receive_slots);
         meeting
             .register_receive_capability(format!("part-{user}"), decl)
             .await

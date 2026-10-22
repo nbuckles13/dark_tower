@@ -48,9 +48,7 @@ export const SUITE_AUDIO_RECEIVE_SLOTS = 3;
 
 /**
  * The suite's VIDEO receive-slot count M. 0: the story-2 audio specs run with
- * M=0 (story 3 R-33), and the controller in service before MC-A counts video
- * slots against its retired TOTAL cap. Story 3 C-C1 (task 17) raises it with the
- * video specs.
+ * M=0 (story 3 R-33). Story 3 C-C1 (task 17) raises it with the video specs.
  */
 export const SUITE_VIDEO_RECEIVE_SLOTS = 0;
 

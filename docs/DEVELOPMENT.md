@@ -493,8 +493,9 @@ See guard script comments and `docs/specialist-knowledge/security/` for the stan
        - MH: CORRECTED 2026-09-23, extended 2026-10-20 (story 3) — complete
          against its required set, plus the story-3 keys MH-A1/MH-A2 make
          required (MH-B adds none).
-       - MC: CORRECTED 2026-10-20 (story 3) — complete against its required
-         set as of that date, plus the story-3 keys MC-A makes required.
+       - MC: CORRECTED 2026-10-22 (story 3 MC-A) — complete against its
+         required set as of that date; the retired MC_MAX_RECEIVE_SLOTS and
+         MC_AUDIO_* keys removed (no longer read).
        - GC: INCOMPLETE (measured 2026-08-28) — lacks GC_CLIENT_ID and
          GC_CLIENT_SECRET.
        - AC: complete (measured 2026-08-28).
@@ -616,15 +617,16 @@ export OTEL_COLLECTOR_ENDPOINT="http://localhost:4318"
 ### Meeting Controller
 
 <!-- ANCHOR (DRY): this block is COMPLETE against MC's required set as of
-     2026-10-20 — every ConfigError::MissingEnvVar in
-     crates/mc-service/src/config.rs::Config::from_vars() — plus the story-3
-     keys MC-A makes required (harmless to set before then). VALUES mirror
-     infra/services/mc-service/config.env (MC-only knobs) and
-     infra/services/media-codec-profile/profile.env (the nine shared MEDIA_*
+     2026-10-22 (story 3 MC-A) — every ConfigError::MissingEnvVar in
+     crates/mc-service/src/config.rs::Config::from_vars(). VALUES mirror
+     infra/services/mc-service/config.env (MC-only knobs, including the
+     minimum keyframe interval) and
+     infra/services/media-codec-profile/profile.env (the eight shared MEDIA_*
      encoding keys, also read by MH); those files are the single homes — if
      they disagree, they win. The four RETIRED keys (MC_MAX_RECEIVE_SLOTS,
-     MC_AUDIO_*) are still REQUIRED by the current image and are kept until
-     MC-A removes the reads. -->
+     MC_AUDIO_*) are no longer read and are deliberately absent here. MC logs
+     the effective values at startup (max_audio_receive_slots,
+     max_video_receive_slots, audio_*, video_* fields). -->
 
 ```bash
 export REDIS_URL="redis://:dev_password_change_in_production@localhost:6379"
@@ -650,24 +652,20 @@ export AC_JWKS_URL="http://localhost:8082/.well-known/jwks.json"
 export MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS="64"
 export MC_KEK_ROTATION_DEBOUNCE_SECONDS="60"
 export MC_MEDIA_CONNECT_SETTLE_MS="1500"
-# Story 3 per-kind receive-slot caps (required once MC-A lands). Video 0 is the video-off lever.
+# Story 3 per-kind receive-slot caps (required). Video 0 is the video-off lever.
 export MC_MAX_AUDIO_RECEIVE_SLOTS="8"
 export MC_MAX_VIDEO_RECEIVE_SLOTS="4"
-# Story 3 shared media codec profile (required once MC-A lands). Home: infra/services/media-codec-profile/profile.env.
+# Story 3 minimum keyframe interval MC directs (required; MC-only, not a profile key).
+export MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS="500"
+# Story 3 shared media codec profile (required). Home: infra/services/media-codec-profile/profile.env.
 export MEDIA_VIDEO_CODEC="vp8"
 export MEDIA_VIDEO_WIDTH="640"
 export MEDIA_VIDEO_HEIGHT="360"
 export MEDIA_VIDEO_FRAME_RATE_HZ="30"
 export MEDIA_VIDEO_MAX_BITRATE_BPS="800000"
-export MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS="500"
 export MEDIA_AUDIO_CODEC="opus"
 export MEDIA_AUDIO_MAX_BITRATE_BPS="48000"
 export MEDIA_AUDIO_FRAME_RATE_HZ="50"
-# RETIRED — still required by the current image; removed with MC-A. Superseded by the caps and MEDIA_AUDIO_* above.
-export MC_MAX_RECEIVE_SLOTS="8"
-export MC_AUDIO_CODEC="opus"
-export MC_AUDIO_MAX_BITRATE_BPS="48000"
-export MC_AUDIO_FRAME_RATE_HZ="50"
 export OTLP_ENDPOINT="http://localhost:4317"
 export OTEL_ENABLED="false"  # OTel span export is gated on the explicit boolean OTEL_ENABLED, NOT on OTLP_ENDPOINT being set;
 # leaving this "false" means OTLP_ENDPOINT above has no effect. Enabling needs a reachable collector

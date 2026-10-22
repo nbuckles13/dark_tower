@@ -678,10 +678,9 @@ done
 # 0 is the video-off lever (story 3 R-26): every video slot is unavailable. This
 # script does not clamp either value.
 #
-# TRANSITION (until MC-A, story 3 task 12): the controller in service before MC-A
-# still enforces the retired TOTAL `MC_MAX_RECEIVE_SLOTS` and rejects N+M over it
-# WHOLE (a silent participant). This script deliberately no longer reads that
-# key; the authority note below names the counter that shows it.
+# The retired TOTAL `MC_MAX_RECEIVE_SLOTS` is never read here: since story 3
+# MC-A nothing enforces it (the key stays in the file only for the two-deploy
+# retirement).
 #
 # TWO READERS, NOT ONE HELPER (@dry-reviewer D-2): check_wt_endpoint reads a
 # URL from a PER-INSTANCE ConfigMap with a deliberately UNANCHORED key match;
@@ -748,9 +747,7 @@ participants_for_n() {
 cap_authority_note() {
     echo "      Those caps are an ON-DISK pre-flight read. In the cluster, MC truncates and reports"
     echo "      each excess slot on mc_media_slot_states_total{slot_state=\"unavailable\"}"
-    echo "      (docs/observability/metrics/mc-service.md). Until MC-A lands, the controller in service"
-    echo "      still caps N+M at the retired TOTAL MC_MAX_RECEIVE_SLOTS and rejects a declaration over it"
-    echo "      WHOLE: mc_media_receive_capability_declarations_total{outcome=\"slot_count_over_cap\"}."
+    echo "      (docs/observability/metrics/mc-service.md)."
     echo "      Live audio cap: $(cap_live_value_cmd MC_MAX_AUDIO_RECEIVE_SLOTS)"
     echo "      Live video cap: $(cap_live_value_cmd MC_MAX_VIDEO_RECEIVE_SLOTS)"
 }

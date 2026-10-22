@@ -31,6 +31,13 @@
 //! arriving, a connection closing, a counter rising); the bounds are rig
 //! bounds for unreliable datagrams and scrape latency, never performance
 //! assertions.
+//!
+//! # Edge sum (README per-file edge-sum header rule)
+//!
+//! S3 3 x 2 = 6; the non-host refusal declares nothing; TEARDOWN 2 + 1 + 1 =
+//! 4. Audio only.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 10
 
 #![cfg(feature = "flows")]
 
@@ -66,6 +73,7 @@ async fn cluster() -> ClusterConnection {
     cluster
 }
 
+use env_tests::fixtures::participant::AUDIO;
 /// Margin over MC's settle window (one shared home).
 use env_tests::fixtures::participant::VIEW_MARGIN;
 
@@ -163,15 +171,15 @@ async fn test_host_server_mute_is_enforced_at_mh_ingress_and_unmute_restores_it(
     let (h, a, b) = (ps[0].sender_id(), ps[1].sender_id(), ps[2].sender_id());
 
     let sessions = open_sessions("S3", &ps, &[&x, &y]).await;
-    ps[0].declare(&[1, 2]).await;
-    ps[1].declare(&[1, 2]).await;
-    ps[2].declare(&[1, 2]).await;
+    ps[0].declare(&[1, 2], &[]).await;
+    ps[1].declare(&[1, 2], &[]).await;
+    ps[2].declare(&[1, 2], &[]).await;
     let bound = window + VIEW_MARGIN;
     for (i, want) in [(0, [a, b]), (1, [h, b]), (2, [h, a])] {
         ps[i]
             .converge("S3", bound, |v, d| {
                 v.is_some_and(|v| {
-                    let mut f = filled_senders(v);
+                    let mut f = filled_senders(v, AUDIO);
                     f.sort_unstable();
                     let mut w = want.to_vec();
                     w.sort_unstable();
@@ -182,7 +190,7 @@ async fn test_host_server_mute_is_enforced_at_mh_ingress_and_unmute_restores_it(
     }
 
     // PRE: B hears A on B's own slot for A.
-    let b_edge_url = ps[2].slot_url(a);
+    let b_edge_url = ps[2].slot_url(a, AUDIO);
     let pre = bind_until_received(
         "S3 PRE",
         sessions[2][&b_edge_url].connection(),
@@ -190,7 +198,13 @@ async fn test_host_server_mute_is_enforced_at_mh_ingress_and_unmute_restores_it(
         &[MARK_H],
     )
     .await;
-    assert_relayed_on_slot("S3 PRE", &pre[&MARK_A], ps[2].slot_for(a), MARK_A, "A");
+    assert_relayed_on_slot(
+        "S3 PRE",
+        &pre[&MARK_A],
+        ps[2].slot_for(a, AUDIO),
+        MARK_A,
+        "A",
+    );
 
     // MUTE through MC's public API, by the host.
     let drops_before = settled_baseline(
@@ -202,16 +216,26 @@ async fn test_host_server_mute_is_enforced_at_mh_ingress_and_unmute_restores_it(
     .await;
     let a_id = ps[1].join.participant_id.clone();
     ps[0].session.write(&server_mute(&a_id, true)).await;
-    // MC applied it: B's own view marks A's slot SOURCE_MUTED.
+    // MC applied it: B's own view shows A's audio slot as the server-muted
+    // avatar (story 3 flat vocabulary; SOURCE_MUTED is no longer emitted), still
+    // naming A and still on the edge's handler (lead ruling 2026-10-22: a mute
+    // avatar keeps its edge, so the url does not move).
     ps[2]
         .converge("S3 MUTE-VISIBLE", bound, |v, _| {
             v.is_some_and(|v| {
                 v.assignments.iter().any(|s| {
-                    s.sender_id == Some(a) && s.slot_state == SlotState::SourceMuted as i32
+                    s.media_kind == AUDIO as i32
+                        && s.sender_id == Some(a)
+                        && s.slot_state == SlotState::AvatarServerMuted as i32
                 })
             })
         })
         .await;
+    assert_eq!(
+        ps[2].slot_url(a, AUDIO),
+        b_edge_url,
+        "S3 MUTE-VISIBLE: the server-muted avatar keeps the edge's handler url"
+    );
 
     // MUTED: A transmits on every session every round. B and H go FLAT for A;
     // A still hears B; B still hears H.
@@ -231,7 +255,7 @@ async fn test_host_server_mute_is_enforced_at_mh_ingress_and_unmute_restores_it(
             "S3 MUTED: within {PHASE_DEADLINE:?} A's frames did not go flat at every other \
              receiver (flat rounds {flat}/{FLAT_ROUNDS}), or a liveness control never held (A \
              heard B: {a_heard_b}, B heard H: {b_heard_h}). A frames still reaching B/H after \
-             MC showed SOURCE_MUTED means MH is not enforcing the mute: check \
+             MC showed AVATAR_SERVER_MUTED means MH is not enforcing the mute: check \
              mh_media_frames_dropped_total{{reason=\"server_muted\"}} and \
              mc_media_policy_pushes_total{{outcome}}"
         );
@@ -316,7 +340,7 @@ async fn test_host_server_mute_is_enforced_at_mh_ingress_and_unmute_restores_it(
     }
     assert_eq!(
         resumed,
-        Some(ps[2].slot_for(a)),
+        Some(ps[2].slot_for(a, AUDIO)),
         "S3 UNMUTED: A's frames land on B's own slot for A"
     );
     drop(sessions);
@@ -329,7 +353,7 @@ fn slot_state_of_view(
 ) -> Option<i32> {
     v?.assignments
         .iter()
-        .find(|a| a.sender_id == Some(sender))
+        .find(|a| a.media_kind == AUDIO as i32 && a.sender_id == Some(sender))
         .map(|a| a.slot_state)
 }
 
@@ -467,14 +491,14 @@ async fn test_meeting_end_releases_every_handler_even_with_a_straggler() {
     let s_y = reach_kept_alive("TEARDOWN", &y, &ps[0].token).await;
     let b_x = participant::reach("TEARDOWN", "B", &x, &ps[1].token).await;
     let c_y = participant::reach("TEARDOWN", "C", &y, &ps[2].token).await;
-    ps[0].declare(&[4, 5]).await;
-    ps[1].declare(&[6]).await;
-    ps[2].declare(&[7]).await;
+    ps[0].declare(&[4, 5], &[]).await;
+    ps[1].declare(&[6], &[]).await;
+    ps[2].declare(&[7], &[]).await;
     let bound = window + VIEW_MARGIN;
     ps[0]
         .converge("TEARDOWN", bound, |v, _| {
             v.is_some_and(|v| {
-                let mut f = filled_senders(v);
+                let mut f = filled_senders(v, AUDIO);
                 f.sort_unstable();
                 let mut w = vec![b, c];
                 w.sort_unstable();
@@ -484,8 +508,8 @@ async fn test_meeting_end_releases_every_handler_even_with_a_straggler() {
         .await;
     // Structural changes CONFIRMED on both handlers: S's own view places its
     // edge from B on x and its edge from C on y.
-    assert_eq!(ps[0].slot_url(b), x, "TEARDOWN: S<->B sits on x");
-    assert_eq!(ps[0].slot_url(c), y, "TEARDOWN: S<->C sits on y");
+    assert_eq!(ps[0].slot_url(b, AUDIO), x, "TEARDOWN: S<->B sits on x");
+    assert_eq!(ps[0].slot_url(c, AUDIO), y, "TEARDOWN: S<->C sits on y");
 
     // POSITIVE CONTROL that the straggler's sessions are ALIVE right before the
     // teardown: frames reach S on both.

@@ -49,13 +49,17 @@ pub mod teardown;
 
 pub use assignment::{
     AssignmentError, EgressStreamPlan, HandlerAssignment, HandlerId, MeetingAssignment,
-    AUDIO_PRIORITY_GROUP, MAIN_AUDIO_STREAM_NUMBER,
+    SourceDispositionPlan, SourceStreamPlan, AUDIO_PRIORITY_GROUP, MAIN_AUDIO_STREAM_NUMBER,
+    MAIN_VIDEO_STREAM_NUMBER, VIDEO_PRIORITY_GROUP,
 };
 pub use confirm::{
-    divergence_magnitude, evaluate, PolicyPushOutcome, PushDisposition, PushExpectation,
+    divergence_magnitude, evaluate, evaluate_with_echo, first_echo_mismatch, EchoArm,
+    PolicyPushOutcome, PushDisposition, PushExpectation,
 };
 pub use connectivity::{ConnectionKey, ParticipantConnectivity, Phase, SettleOutcome, Unapplied};
 pub use generation::{GenerationSpaceExhausted, PolicyGenerations};
 pub use placement::{ConnectedHandlers, HandlerEndpoint, HandlerSetError, MeetingHandlers};
 pub use pusher::{FloorAdoption, HandlerPusher, PushJob, PushTarget};
-pub use slots::{Edge, JoinRank, SlotTable, SlotTableError};
+pub use slots::{
+    Edge, JoinRank, SlotTable, SlotTableError, SourceMute, SourceMuteView, KIND_FILL_ORDER,
+};

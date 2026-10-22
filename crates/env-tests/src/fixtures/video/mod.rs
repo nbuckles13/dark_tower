@@ -155,13 +155,15 @@
 //! plus video slots each declares. `cargo test` runs one file's fns in
 //! parallel and the files sequentially, so the per-file sum is the load the
 //! Kind cluster carries at once. INF-C (task 16) sizes the Kind ceiling at
-//! about 120 against the largest per-file sum, 72 (`27_mc_slot_placement`).
-//! A file that would exceed it serialises its fns or raises the budget in the
+//! about 120 against the PLANNED largest per-file sum, 72
+//! (`27_mc_slot_placement`); each file's ACTUAL sum is the `Edge-sum` line in
+//! its own header. A file that would exceed it serialises its fns or raises the budget in the
 //! same change.
 
 pub mod backlog;
 pub mod control;
 pub mod encode;
+pub mod probe;
 pub mod publisher;
 pub mod reader;
 pub mod schedule;
@@ -173,6 +175,7 @@ pub use control::{
     KeyframeRequestSource, NoRequests,
 };
 pub use encode::{encode_video_frame, key_id_sender, pack_key_id, VideoFrameSpec};
+pub use probe::{until_video_on_slot, BackgroundPublisher};
 pub use publisher::{
     Fault, FrameOutcome, PublisherMode, UplinkLabel, VideoPublisher, VideoPublisherConfig,
     VideoTransport, RESET_MID_GROUP_CODE,

@@ -316,6 +316,7 @@ fn test_config(gc_url: &str) -> Config {
         kek_rotation_debounce_seconds: 60,
         max_receive_capability_declarations: media.max_receive_capability_declarations,
         audio_encoding: media.audio_encoding,
+        video_encoding: media.video_encoding,
     }
 }
 

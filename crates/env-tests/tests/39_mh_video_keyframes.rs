@@ -72,7 +72,7 @@ use env_tests::fixtures::metrics::{
     gauge_by_instance_present, group_reset_promql, poll_until_pinned_instance,
 };
 use env_tests::fixtures::mh_grpc::{self, ReleaseOnDrop};
-use env_tests::fixtures::participant::{self, open_sessions};
+use env_tests::fixtures::participant::{self, open_sessions, AUDIO};
 use env_tests::fixtures::video::backlog::backlog_payload_len;
 use env_tests::fixtures::video::{
     recovery_request_frame, CarrierRequests, Fault, GroupStartCause, GroupStartSource,
@@ -287,10 +287,10 @@ async fn test_on_demand_keyframes_and_recovery() {
     );
     let mut sessions = open_sessions("KEYFRAMES", &ps, &[&x, &y]).await;
 
-    ps[0].declare(&[11, 12, 13]).await;
-    ps[1].declare(&[21, 22, 23]).await;
-    ps[2].declare(&[31, 32, 33]).await;
-    ps[3].declare(&[41, 42, 43]).await;
+    ps[0].declare(&[11, 12, 13], &[]).await;
+    ps[1].declare(&[21, 22, 23], &[]).await;
+    ps[2].declare(&[31, 32, 33], &[]).await;
+    ps[3].declare(&[41, 42, 43], &[]).await;
     let all = [a, b, c, e];
     let bound = window + participant::VIEW_MARGIN;
     for (i, me) in all.iter().enumerate() {
@@ -298,7 +298,7 @@ async fn test_on_demand_keyframes_and_recovery() {
         ps[i]
             .converge("KEYFRAMES", bound, |v, d| {
                 v.is_some_and(|v| {
-                    participant::filled_senders(v)
+                    participant::filled_senders(v, AUDIO)
                         .into_iter()
                         .collect::<BTreeSet<_>>()
                         == want

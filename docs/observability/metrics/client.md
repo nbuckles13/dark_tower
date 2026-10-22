@@ -1213,9 +1213,10 @@ the comment's reader.
   the first deficit.
 - **Blind spot**: a declaration MC rejects whole produces ZERO active
   assignments, so this reads 0. Since story 3 MC truncates an over-cap
-  declaration instead (excess slots `unavailable`, never active), so the only
-  remaining whole rejection is the pre-MC-A controller's retired TOTAL cap —
-  read it on `mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}`.
+  declaration instead (excess slots `unavailable`, never active); a whole
+  rejection is now only a malformed declaration — read it on
+  `mc_media_receive_capability_declarations_total{outcome}` (story 2's
+  `slot_count_over_cap` is retired since MC-A).
 - **Panel**: `infra/grafana/dashboards/client-media.json`. Triage:
   `docs/runbooks/client-dev-local.md` (receive-source deficit).
 
@@ -1312,12 +1313,12 @@ the comment's reader.
   every published kind is always listed; withdrawal is an empty target set, never
   removal). The kind FAILS CLOSED (sends nothing) and a typed `mediaFault` is
   raised once per episode.
-- **Reads zero forever against a conforming MC, and that holds at the story 3
-  C-A1 gate ONLY BECAUSE of TRANSITIONAL shim (c)** (`session/mediaWiring.ts`,
-  deleted by C-A2, task 13): the controller in service before MC-A spells "nobody
-  watches you" as a directive with NO streams, which shim (c) reads as a
-  withdrawal of every published kind, uncounted. Alertable at `> 0` once that
-  shim is gone.
+- **Reads zero forever against a conforming MC.** Since MC-A every published kind
+  is always listed (unwatched = empty targets), so a conforming MC never sends an
+  empty `streams`. TRANSITIONAL shim (c) (`session/mediaWiring.ts`, deleted by
+  C-A2, task 13) still reads a directive with NO streams as a withdrawal of every
+  published kind, uncounted — the legacy spelling of "nobody watches you" by the
+  pre-MC-A controller. Alertable at `> 0` once that shim is gone.
 - **Zero-initialised at join** for each published kind (audio only until C-A2).
 - **Alert**: none yet (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
 

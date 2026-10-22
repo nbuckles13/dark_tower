@@ -64,8 +64,6 @@ pub enum CapabilityOutcome {
     AcceptedUnchanged,
     /// Two slots claimed the same id. Client defect.
     DuplicateSlotId,
-    /// More slots than the configured server-side cap. Client defect.
-    SlotCountOverCap,
     /// A slot id did not fit the 16-bit relay-region field. Client defect.
     SlotIdOutOfRange,
     /// A pin named sender id 0, which is reserved-invalid. Client defect.
@@ -78,21 +76,32 @@ pub enum CapabilityOutcome {
     /// zero is what a pre-ADR-0036 peer's `AUDIO = 0` decodes to — not a client
     /// that forgot a field. Read a rising rate as client-fleet skew first.
     MediaKindUnspecified,
+    /// A slot named a real kind this story does not serve
+    /// (`MEDIA_KIND_VIDEO_SCREEN`). Rejected, never accepted-and-ignored
+    /// (story 3 R-2). Client defect.
+    MediaKindUnsupported,
+    /// A redeclaration that would leave the participant neither publishing
+    /// nor receiving (story 3 R-2). REFUSED; the previous declaration stays in
+    /// force, byte-identical. Judged on the declaration AS SENT. Client defect
+    /// (a refusal, not a success). The join-time equivalent is the join
+    /// failure `publishes_and_receives_nothing`.
+    WouldPublishAndReceiveNothing,
     /// The connection exhausted its budget of accepted declarations.
     DeclarationBudgetExhausted,
 }
 
 impl CapabilityOutcome {
     /// Every variant, for exhaustive metric-vocabulary tests.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Accepted,
         Self::AcceptedUnchanged,
         Self::DuplicateSlotId,
-        Self::SlotCountOverCap,
         Self::SlotIdOutOfRange,
         Self::PinnedSenderIdZero,
         Self::PinnedSenderIdOutOfRange,
         Self::MediaKindUnspecified,
+        Self::MediaKindUnsupported,
+        Self::WouldPublishAndReceiveNothing,
         Self::DeclarationBudgetExhausted,
     ];
 
@@ -103,11 +112,12 @@ impl CapabilityOutcome {
             Self::Accepted => "accepted",
             Self::AcceptedUnchanged => "accepted_unchanged",
             Self::DuplicateSlotId => "duplicate_slot_id",
-            Self::SlotCountOverCap => "slot_count_over_cap",
             Self::SlotIdOutOfRange => "slot_id_out_of_range",
             Self::PinnedSenderIdZero => "pinned_sender_id_zero",
             Self::PinnedSenderIdOutOfRange => "pinned_sender_id_out_of_range",
             Self::MediaKindUnspecified => "media_kind_unspecified",
+            Self::MediaKindUnsupported => "media_kind_unsupported",
+            Self::WouldPublishAndReceiveNothing => "would_publish_and_receive_nothing",
             Self::DeclarationBudgetExhausted => "declaration_budget_exhausted",
         }
     }
@@ -123,12 +133,15 @@ impl CapabilityOutcome {
         match self {
             Self::Accepted | Self::AcceptedUnchanged => "receive capability accepted",
             Self::DuplicateSlotId => "receive capability rejected: duplicate slot id",
-            Self::SlotCountOverCap => "receive capability rejected: too many slots",
             Self::SlotIdOutOfRange => "receive capability rejected: slot id out of range",
             Self::PinnedSenderIdZero | Self::PinnedSenderIdOutOfRange => {
                 "receive capability rejected: invalid pinned sender id"
             }
             Self::MediaKindUnspecified => "receive capability rejected: slot media kind unset",
+            Self::MediaKindUnsupported => "receive capability rejected: unsupported media kind",
+            Self::WouldPublishAndReceiveNothing => {
+                "receive capability rejected: participant would neither publish nor receive"
+            }
             Self::DeclarationBudgetExhausted => {
                 "receive capability rejected: too many declarations on this connection"
             }
@@ -222,19 +235,18 @@ pub enum DirectiveOutcome {
 /// That is a worse failure than the amplification it would prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuteOutcome {
-    /// The audio flag moved on a declared connection and was reported to the
-    /// meeting actor, which re-emits the changed slot view to the subscribers
-    /// holding this source. A failed re-emit is counted by the actor itself
+    /// THIS KIND's flag moved and was reported to the meeting actor, which
+    /// re-renders (the stream's disposition) and re-emits the changed slot view
+    /// to the subscribers holding this source (story 3: either kind). A failed re-emit is counted by the actor itself
     /// (`mc_media_send_directives_total` and
     /// `mc_media_slot_view_emissions_total{outcome="composition_failed"}`).
     Applied,
     /// Reported to the meeting actor, with nothing to re-convey.
     ///
-    /// Either this connection has not declared a receive capability yet, or
-    /// only `video_muted` changed — and the slot view reads only audio mute, so
-    /// no subscriber's view changes.
-    ///
-    /// A healthy, routine value: it is what a camera button produces.
+    /// UNREACHABLE since story 3 MC-A: every connection is declared from its
+    /// join, and a moved flag of either kind recomposes (`applied`). Kept in
+    /// the vocabulary (and zero-initialised) until MC-B reshapes per-kind mute,
+    /// so a dashboard reading it sees a real zero, not an absent series.
     AppliedNoRecompose,
     /// THIS KIND's state did not move. Two sources (story 3, per kind):
     /// - the whole-request identical repeat — the tuple short-circuit, before
@@ -289,101 +301,9 @@ impl MuteOutcome {
     }
 }
 
-/// The media kind a series' subject has (`media_kind` label; story 3 OBS-A).
-///
-/// ANCHOR (DRY): the `media_kind` row of `docs/observability/label-taxonomy.md`
-/// is the single source of truth for this value set; the test
-/// `media_kind_label_matches_the_taxonomy_row` reads that row, so the two cannot
-/// drift silently. The key constant is `common::observability::labels::MEDIA_KIND_LABEL`.
-///
-/// A TELEMETRY projection, deliberately distinct from the wire
-/// `proto_gen::dark_tower::signaling::v1::MediaKind`, which has four values
-/// (`UNSPECIFIED`, `AUDIO`, `VIDEO_CAMERA`, `VIDEO_SCREEN`) against this label's
-/// two. [`Self::from_proto`] is the ONE mapping; no call site maps a wire kind
-/// to a label string on its own.
-///
-/// MC and the client SDK carry this label; MH never does (ADR-0036 §7: MH is
-/// type-blind).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MediaKindLabel {
-    /// `audio`.
-    Audio,
-    /// `video` (camera AND screen share; see [`Self::from_proto`]).
-    Video,
-}
-
-impl MediaKindLabel {
-    /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
-    pub const ALL: [Self; 2] = [Self::Audio, Self::Video];
-
-    /// Bounded metric-label form.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Audio => "audio",
-            Self::Video => "video",
-        }
-    }
-
-    /// This kind's position in [`Self::ALL`], for per-kind `[T; 2]` tallies
-    /// (read back with [`Self::of`]). Exhaustive, so the positional layout is
-    /// defined HERE and nowhere else.
-    #[must_use]
-    pub const fn index(self) -> usize {
-        match self {
-            Self::Audio => 0,
-            Self::Video => 1,
-        }
-    }
-
-    /// Select this kind's value from a per-kind pair of named fields
-    /// (`kind.pick(p.audio_server_muted, p.video_server_muted)`). The ONE
-    /// kind -> field mapping, so call sites never write their own `match`.
-    #[must_use]
-    pub fn pick<T>(self, audio: T, video: T) -> T {
-        match self {
-            Self::Audio => audio,
-            Self::Video => video,
-        }
-    }
-
-    /// This kind's entry of a per-kind `[T; 2]` laid out by [`Self::index`]
-    /// (as built by [`Self::per_kind`]). Infallible: destructures, never
-    /// indexes.
-    #[must_use]
-    pub fn of<T>(self, per_kind: [T; 2]) -> T {
-        let [audio, video] = per_kind;
-        self.pick(audio, video)
-    }
-
-    /// A per-kind `[T; 2]` built from `f`, laid out by [`Self::index`].
-    #[must_use]
-    pub fn per_kind<T>(mut f: impl FnMut(Self) -> T) -> [T; 2] {
-        Self::ALL.map(&mut f)
-    }
-
-    /// The label for a wire media kind, or `None` for `UNSPECIFIED`.
-    ///
-    /// Exhaustive with no wildcard arm, so a new wire variant is a compile error
-    /// here rather than a silent mislabel.
-    #[must_use]
-    pub const fn from_proto(kind: proto_gen::dark_tower::signaling::v1::MediaKind) -> Option<Self> {
-        use proto_gen::dark_tower::signaling::v1::MediaKind;
-        match kind {
-            MediaKind::Audio => Some(Self::Audio),
-            MediaKind::VideoCamera => Some(Self::Video),
-            // DELIBERATE: screen share is `media_kind="video"` plus
-            // `content_kind="slides"` in the taxonomy. `content_kind` is
-            // declared but not carried (content share is out of story 3's
-            // scope), so a screen slot is labelled `video` and the split is
-            // left to that label when it is carried.
-            MediaKind::VideoScreen => Some(Self::Video),
-            // Rejected at every parse boundary that admits a kind; it has no
-            // honest label.
-            MediaKind::Unspecified => None,
-        }
-    }
-}
+/// Re-exported from its leaf home, [`crate::media_kind`], so the OBS-A call
+/// sites that import it from here keep compiling.
+pub use crate::media_kind::MediaKindLabel;
 
 /// The verb a server-mute request asked for (`mc_media_server_mute_requests_total{action}`).
 ///
@@ -699,6 +619,41 @@ impl DirectiveOutcome {
     #[must_use]
     pub fn is_success(self) -> bool {
         matches!(self, Self::Emitted | Self::EmittedEmptyTargets)
+    }
+}
+
+/// Why one stream's send directive was WITHDRAWN — its targets went from
+/// non-empty to empty (`mc_media_send_directive_withdrawals_total{reason}`;
+/// story 3 R-8).
+///
+/// Withdrawal is EMPTY TARGETS, never removal: the stream stays listed. Counted
+/// per (stream kind, transition), only on a DELIVERED directive change whose
+/// previous directive had targets on that stream — never on a re-render that
+/// re-sends empty targets, and never on a reconnect's fresh view. Delivery is
+/// the counting point, unlike `mc_media_send_directives_total` (counted at
+/// composition): a withdrawal whose delivery failed is not counted here and
+/// shows up on `mc_media_slot_view_emissions_total{outcome="delivery_failed"}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawalReason {
+    /// The stream's last watcher left, redeclared it away or became
+    /// unreachable: nobody holds it in a slot. Routine.
+    Unwatched,
+    /// The kind was server-muted (emitted by story 3 MC-B; zero-initialised
+    /// now so that task adds no series).
+    ServerMuted,
+}
+
+impl WithdrawalReason {
+    /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
+    pub const ALL: [Self; 2] = [Self::Unwatched, Self::ServerMuted];
+
+    /// Bounded metric-label form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unwatched => "unwatched",
+            Self::ServerMuted => "server_muted",
+        }
     }
 }
 

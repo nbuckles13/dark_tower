@@ -104,24 +104,30 @@ pub const MIN_KEK_ROTATION_DEBOUNCE_SECONDS: u32 = 30;
 /// into "within a day". Five minutes. Security's Gate-1 input.
 pub const MAX_KEK_ROTATION_DEBOUNCE_SECONDS: u32 = 300;
 
-/// Smallest legal `MC_MAX_RECEIVE_SLOTS`.
+/// Smallest legal `MC_MAX_AUDIO_RECEIVE_SLOTS`.
 ///
-/// Zero would mean no client can ever receive media — a silent total outage
-/// that reads as a valid configuration.
+/// Zero would mean no client can ever hear anyone — a silent total audio
+/// outage that reads as a valid configuration. (Video, by contrast, has a
+/// floor of 0: that is the R-26 video-off lever.)
 ///
 /// `u8` end to end (config, `ClientMediaConfig`, the gauge and the
-/// `JoinResponse.max_receive_slots` wire value): the bound fits, so every
-/// widening is a total `From`, never a fallible or truncating conversion.
-const MIN_RECEIVE_SLOTS: u8 = 1;
+/// `JoinResponse` per-kind cap fields): every widening is a total `From`.
+pub const MIN_AUDIO_RECEIVE_SLOTS: u8 = 1;
 
-/// Largest legal `MC_MAX_RECEIVE_SLOTS`.
+/// Largest legal `MC_MAX_AUDIO_RECEIVE_SLOTS`.
 ///
-/// ADR-0036 §6 leans on this cap for *"resource-amplification-by-request
-/// becomes structurally impossible rather than rate-limited"*. A cap set to
-/// 100000 quietly retires that property while still looking like a cap, so the
-/// cap's own value is bounded. 64 is generous against the two media kinds §11
-/// ships and a realistic grid of ≤5 video plus audio.
-const MAX_RECEIVE_SLOTS: u8 = 64;
+/// A cap set to 100000 quietly retires the per-subscriber work bound while
+/// still looking like a cap, so the cap's own value is bounded. It also keeps
+/// every kept ordinal inside `egress_stream_id`'s 8-bit field.
+pub const MAX_AUDIO_RECEIVE_SLOTS: u8 = 64;
+
+/// Smallest legal `MC_MAX_VIDEO_RECEIVE_SLOTS`: 0 is LEGAL and is the R-26
+/// video-off lever (every video slot truncated to `UNAVAILABLE`, no camera
+/// directed to send, audio untouched).
+pub const MIN_VIDEO_RECEIVE_SLOTS: u8 = 0;
+
+/// Largest legal `MC_MAX_VIDEO_RECEIVE_SLOTS`. As [`MAX_AUDIO_RECEIVE_SLOTS`].
+pub const MAX_VIDEO_RECEIVE_SLOTS: u8 = 64;
 
 /// Smallest legal `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`.
 const MIN_RECEIVE_CAPABILITY_DECLARATIONS: u32 = 1;
@@ -299,7 +305,7 @@ pub struct Config {
     // ========================================================================
     // Client-facing media signalling (ADR-0036 §5, §6)
     //
-    // All five are REQUIRED — `ConfigError::MissingEnvVar`, no Rust default.
+    // All of them are REQUIRED — `ConfigError::MissingEnvVar`, no Rust default.
     // A Rust-defaulted key wired into `mc-0` and forgotten on `mc-1` passes
     // `dt-guard env-config` green (its `orphan_configmap_key` check fires only
     // when NO workload references a key; per-workload enforcement exists only
@@ -320,14 +326,15 @@ pub struct Config {
     // surviving only in a fixture reads as retired while remaining a live second
     // encoding of the value.
     // ========================================================================
-    /// Maximum receive slots one client may declare (`MC_MAX_RECEIVE_SLOTS`).
+    /// Per-kind receive-slot caps (`MC_MAX_AUDIO_RECEIVE_SLOTS`,
+    /// `MC_MAX_VIDEO_RECEIVE_SLOTS`), laid out by `MediaKindLabel::index`.
     ///
-    /// ADR-0036 §6 caps slot count server-side by configuration; MC rejects a
-    /// whole declaration exceeding it. The cap is what makes
-    /// resource-amplification-by-request structurally impossible rather than
-    /// rate-limited, so the value itself is validated (`1..=64`) — a cap whose
-    /// own value is unbounded is not a cap.
-    pub max_receive_slots: u8,
+    /// Story 3 R-1: MC TRUNCATES each kind of a declaration to its cap (the
+    /// excess slots are `UNAVAILABLE`), never refuses it. Read once at startup;
+    /// live vectors are never re-truncated. Bounded at load: audio
+    /// [`MIN_AUDIO_RECEIVE_SLOTS`]`..=`[`MAX_AUDIO_RECEIVE_SLOTS`], video
+    /// [`MIN_VIDEO_RECEIVE_SLOTS`]`..=`[`MAX_VIDEO_RECEIVE_SLOTS`] (0 = video off).
+    pub max_receive_slots: [u8; 2],
 
     /// Connect settle window in milliseconds (`MC_MEDIA_CONNECT_SETTLE_MS`).
     ///
@@ -359,16 +366,20 @@ pub struct Config {
     /// `1..=4096` for the same reason the slot cap is.
     pub max_receive_capability_declarations: u32,
 
-    /// The audio encoding MC directs clients to produce (`MC_AUDIO_CODEC`,
-    /// `MC_AUDIO_MAX_BITRATE_BPS`, `MC_AUDIO_FRAME_RATE_HZ`).
+    /// The audio encoding MC directs clients to produce, from the shared
+    /// `media-codec-profile` (`MEDIA_AUDIO_CODEC`, `MEDIA_AUDIO_MAX_BITRATE_BPS`,
+    /// `MEDIA_AUDIO_FRAME_RATE_HZ`; story 3 R-24 — MH derives its costs from
+    /// the same keys).
     ///
     /// A parsed, validated value rather than three loose scalars:
     /// `CODEC_UNSPECIFIED` is rejected at load, which is what makes it
     /// structurally unrepresentable at the send-directive emit site.
-    ///
-    /// **No observable effect until the client honours the send directive**
-    /// (story task 19). An operator tuning these before then changes nothing.
     pub audio_encoding: crate::media_signaling::AudioEncoding,
+
+    /// The video encoding MC directs (story 3 R-8): the five `MEDIA_VIDEO_*`
+    /// profile keys plus MC's own `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`. Every
+    /// bound refuses to boot (`directive.rs`).
+    pub video_encoding: crate::media_signaling::VideoEncoding,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -425,6 +436,7 @@ impl fmt::Debug for Config {
                 &self.max_receive_capability_declarations,
             )
             .field("audio_encoding", &self.audio_encoding)
+            .field("video_encoding", &self.video_encoding)
             .finish()
     }
 }
@@ -656,17 +668,25 @@ impl Config {
             .cloned()
             .unwrap_or_else(|| DEFAULT_ENVIRONMENT.to_string());
 
-        // ADR-0036 §6: the server-side receive-slot cap. Required, fail-loud,
-        // and bounded on BOTH sides — rejecting only 0 would stop the
-        // silent-total-outage direction while leaving the amplification bound
-        // an operator could retire with a typo.
-        let max_receive_slots = bounded(
-            "MC_MAX_RECEIVE_SLOTS",
-            vars.get("MC_MAX_RECEIVE_SLOTS")
-                .ok_or_else(|| ConfigError::MissingEnvVar("MC_MAX_RECEIVE_SLOTS".to_string()))?,
-            MIN_RECEIVE_SLOTS,
-            MAX_RECEIVE_SLOTS,
+        // Story 3 R-1/R-26: the per-kind receive-slot caps. Required,
+        // fail-loud, bounded on both sides. Video's floor is 0 (the off lever).
+        let max_audio_receive_slots = bounded(
+            "MC_MAX_AUDIO_RECEIVE_SLOTS",
+            vars.get("MC_MAX_AUDIO_RECEIVE_SLOTS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MC_MAX_AUDIO_RECEIVE_SLOTS".to_string())
+            })?,
+            MIN_AUDIO_RECEIVE_SLOTS,
+            MAX_AUDIO_RECEIVE_SLOTS,
         )?;
+        let max_video_receive_slots = bounded(
+            "MC_MAX_VIDEO_RECEIVE_SLOTS",
+            vars.get("MC_MAX_VIDEO_RECEIVE_SLOTS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MC_MAX_VIDEO_RECEIVE_SLOTS".to_string())
+            })?,
+            MIN_VIDEO_RECEIVE_SLOTS,
+            MAX_VIDEO_RECEIVE_SLOTS,
+        )?;
+        let max_receive_slots = [max_audio_receive_slots, max_video_receive_slots];
 
         // ADR-0036 §9 connect settle window. Required and bounded on both
         // sides: too short stops it working, too long silently delays audio.
@@ -726,56 +746,124 @@ impl Config {
             MAX_RECEIVE_CAPABILITY_DECLARATIONS,
         )?;
 
-        // The audio encoding MC directs. Parsed and validated here so that
-        // `CODEC_UNSPECIFIED` and out-of-band values cannot reach the emit site
-        // at all — an unrecognised codec is an error, NEVER a fall-back to Opus,
-        // which would leave an operator believing they configured something they
-        // did not.
-        let audio_codec = crate::media_signaling::AudioEncoding::parse_codec(
-            vars.get("MC_AUDIO_CODEC")
-                .ok_or_else(|| ConfigError::MissingEnvVar("MC_AUDIO_CODEC".to_string()))?,
-        )
-        .map_err(|e| ConfigError::InvalidValue(format!("MC_AUDIO_CODEC is invalid: {e}")))?;
+        // The audio encoding MC directs, from the shared media-codec-profile.
+        // Parsed and validated here so that `CODEC_UNSPECIFIED` and
+        // out-of-band values cannot reach the emit site at all — an
+        // unrecognised codec is an error, NEVER a fall-back to Opus.
+        let audio_codec_raw = vars
+            .get("MEDIA_AUDIO_CODEC")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MEDIA_AUDIO_CODEC".to_string()))?;
+        let audio_codec = crate::media_signaling::parse_codec(audio_codec_raw).map_err(|e| {
+            ConfigError::InvalidValue(format!(
+                "MEDIA_AUDIO_CODEC is invalid: {e} (got {audio_codec_raw:?})"
+            ))
+        })?;
 
         let audio_max_bitrate_bps = bounded(
-            "MC_AUDIO_MAX_BITRATE_BPS",
-            vars.get("MC_AUDIO_MAX_BITRATE_BPS").ok_or_else(|| {
-                ConfigError::MissingEnvVar("MC_AUDIO_MAX_BITRATE_BPS".to_string())
+            "MEDIA_AUDIO_MAX_BITRATE_BPS",
+            vars.get("MEDIA_AUDIO_MAX_BITRATE_BPS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MEDIA_AUDIO_MAX_BITRATE_BPS".to_string())
             })?,
             crate::media_signaling::AUDIO_BITRATE_MIN_BPS,
             crate::media_signaling::AUDIO_BITRATE_MAX_BPS,
         )?;
 
         let audio_frame_rate_hz = bounded(
-            "MC_AUDIO_FRAME_RATE_HZ",
-            vars.get("MC_AUDIO_FRAME_RATE_HZ")
-                .ok_or_else(|| ConfigError::MissingEnvVar("MC_AUDIO_FRAME_RATE_HZ".to_string()))?,
+            "MEDIA_AUDIO_FRAME_RATE_HZ",
+            vars.get("MEDIA_AUDIO_FRAME_RATE_HZ").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MEDIA_AUDIO_FRAME_RATE_HZ".to_string())
+            })?,
             crate::media_signaling::AUDIO_FRAME_RATE_MIN_HZ,
             crate::media_signaling::AUDIO_FRAME_RATE_MAX_HZ,
         )?;
 
-        // Codec, bitrate and frame rate become ONE validated value here. After
-        // this line an unspecified codec is unrepresentable, which is what makes
-        // the send-directive emit site structurally unable to violate
-        // `signaling.proto`'s "zero is not a silent Opus" rule.
+        // Codec, bitrate and frame rate become ONE validated value here.
         let audio_encoding = crate::media_signaling::AudioEncoding::new(
             audio_codec,
             audio_max_bitrate_bps,
             audio_frame_rate_hz,
         )
         .map_err(|e| {
-            // Name all THREE inputs, not just `MC_AUDIO_CODEC`. Today
-            // `CodecNotAudio` is the only reachable variant here — the bitrate
-            // and frame-rate bands are already enforced by `bounded` above,
-            // so `BitrateOutOfBand`/`FrameRateOutOfBand` cannot arrive — but
-            // hardcoding one key name would silently mislead the moment those
-            // bounds diverge. An operator reading this in a CrashLoop gets the
-            // effective value of every key that feeds the failure.
+            // Name all THREE inputs: an operator reading this in a CrashLoop
+            // gets the effective value of every key that feeds the failure.
             ConfigError::InvalidValue(format!(
                 "audio encoding configuration is invalid: {e} \
-                 (MC_AUDIO_CODEC={audio_codec:?}, \
-                  MC_AUDIO_MAX_BITRATE_BPS={audio_max_bitrate_bps}, \
-                  MC_AUDIO_FRAME_RATE_HZ={audio_frame_rate_hz})"
+                 (MEDIA_AUDIO_CODEC={audio_codec:?}, \
+                  MEDIA_AUDIO_MAX_BITRATE_BPS={audio_max_bitrate_bps}, \
+                  MEDIA_AUDIO_FRAME_RATE_HZ={audio_frame_rate_hz})"
+            ))
+        })?;
+
+        // The video encoding MC directs (story 3 R-8): the five MEDIA_VIDEO_*
+        // profile keys and MC's own minimum keyframe interval. Each numeric
+        // key is bounded here by the directive.rs band, so the returned error
+        // names the key, the value and the bound; `VideoEncoding::new` then
+        // refuses any codec other than VP8.
+        let video_codec_raw = vars
+            .get("MEDIA_VIDEO_CODEC")
+            .ok_or_else(|| ConfigError::MissingEnvVar("MEDIA_VIDEO_CODEC".to_string()))?;
+        let video_codec = crate::media_signaling::parse_codec(video_codec_raw).map_err(|e| {
+            ConfigError::InvalidValue(format!(
+                "MEDIA_VIDEO_CODEC is invalid: {e} (got {video_codec_raw:?}; only vp8 is \
+                     directed)"
+            ))
+        })?;
+        let video_width = bounded(
+            "MEDIA_VIDEO_WIDTH",
+            vars.get("MEDIA_VIDEO_WIDTH")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MEDIA_VIDEO_WIDTH".to_string()))?,
+            crate::media_signaling::directive::VIDEO_DIMENSION_MIN_PX,
+            crate::media_signaling::directive::VIDEO_DIMENSION_MAX_PX,
+        )?;
+        let video_height = bounded(
+            "MEDIA_VIDEO_HEIGHT",
+            vars.get("MEDIA_VIDEO_HEIGHT")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MEDIA_VIDEO_HEIGHT".to_string()))?,
+            crate::media_signaling::directive::VIDEO_DIMENSION_MIN_PX,
+            crate::media_signaling::directive::VIDEO_DIMENSION_MAX_PX,
+        )?;
+        let video_frame_rate_hz = bounded(
+            "MEDIA_VIDEO_FRAME_RATE_HZ",
+            vars.get("MEDIA_VIDEO_FRAME_RATE_HZ").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MEDIA_VIDEO_FRAME_RATE_HZ".to_string())
+            })?,
+            crate::media_signaling::directive::VIDEO_FRAME_RATE_MIN_HZ,
+            crate::media_signaling::directive::VIDEO_FRAME_RATE_MAX_HZ,
+        )?;
+        let video_max_bitrate_bps = bounded(
+            "MEDIA_VIDEO_MAX_BITRATE_BPS",
+            vars.get("MEDIA_VIDEO_MAX_BITRATE_BPS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MEDIA_VIDEO_MAX_BITRATE_BPS".to_string())
+            })?,
+            crate::media_signaling::directive::VIDEO_BITRATE_MIN_BPS,
+            crate::media_signaling::directive::VIDEO_BITRATE_MAX_BPS,
+        )?;
+        // MC-only config since story 3 amendment 4 (MH does not read it).
+        let video_min_keyframe_interval_ms = bounded(
+            "MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
+            vars.get("MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS".to_string())
+                })?,
+            crate::media_signaling::MIN_KEYFRAME_INTERVAL_MS_FLOOR,
+            crate::media_signaling::MIN_KEYFRAME_INTERVAL_MS_CEILING,
+        )?;
+        let video_encoding = crate::media_signaling::VideoEncoding::new(
+            video_codec,
+            video_width,
+            video_height,
+            video_frame_rate_hz,
+            video_max_bitrate_bps,
+            video_min_keyframe_interval_ms,
+        )
+        .map_err(|e| {
+            ConfigError::InvalidValue(format!(
+                "video encoding configuration is invalid: {e} \
+                 (MEDIA_VIDEO_CODEC={video_codec:?}, MEDIA_VIDEO_WIDTH={video_width}, \
+                  MEDIA_VIDEO_HEIGHT={video_height}, \
+                  MEDIA_VIDEO_FRAME_RATE_HZ={video_frame_rate_hz}, \
+                  MEDIA_VIDEO_MAX_BITRATE_BPS={video_max_bitrate_bps}, \
+                  MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS={video_min_keyframe_interval_ms})"
             ))
         })?;
 
@@ -820,6 +908,7 @@ impl Config {
             kek_rotation_debounce_seconds,
             max_receive_capability_declarations,
             audio_encoding,
+            video_encoding,
         })
     }
 
@@ -834,6 +923,7 @@ impl Config {
             max_receive_slots: self.max_receive_slots,
             max_receive_capability_declarations: self.max_receive_capability_declarations,
             audio_encoding: self.audio_encoding,
+            video_encoding: self.video_encoding,
             connect_settle_window: std::time::Duration::from_millis(self.media_connect_settle_ms),
         }
     }
@@ -912,14 +1002,30 @@ mod tests {
             // discipline as `mh-service`, which deleted
             // `DEFAULT_MAX_CONNECTIONS`, its `unwrap_or`, AND the fixture
             // assertion against it.
-            ("MC_MAX_RECEIVE_SLOTS".to_string(), "8".to_string()),
+            ("MC_MAX_AUDIO_RECEIVE_SLOTS".to_string(), "8".to_string()),
+            ("MC_MAX_VIDEO_RECEIVE_SLOTS".to_string(), "4".to_string()),
             (
                 "MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS".to_string(),
                 "64".to_string(),
             ),
-            ("MC_AUDIO_CODEC".to_string(), "opus".to_string()),
-            ("MC_AUDIO_MAX_BITRATE_BPS".to_string(), "48000".to_string()),
-            ("MC_AUDIO_FRAME_RATE_HZ".to_string(), "50".to_string()),
+            ("MEDIA_AUDIO_CODEC".to_string(), "opus".to_string()),
+            (
+                "MEDIA_AUDIO_MAX_BITRATE_BPS".to_string(),
+                "48000".to_string(),
+            ),
+            ("MEDIA_AUDIO_FRAME_RATE_HZ".to_string(), "50".to_string()),
+            ("MEDIA_VIDEO_CODEC".to_string(), "vp8".to_string()),
+            ("MEDIA_VIDEO_WIDTH".to_string(), "640".to_string()),
+            ("MEDIA_VIDEO_HEIGHT".to_string(), "360".to_string()),
+            ("MEDIA_VIDEO_FRAME_RATE_HZ".to_string(), "30".to_string()),
+            (
+                "MEDIA_VIDEO_MAX_BITRATE_BPS".to_string(),
+                "800000".to_string(),
+            ),
+            (
+                "MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS".to_string(),
+                "500".to_string(),
+            ),
             // ADR-0036 §9 connect settle window.
             ("MC_MEDIA_CONNECT_SETTLE_MS".to_string(), "1500".to_string()),
             // ADR-0036 §4 KEK rotation debounce (W).
@@ -941,11 +1047,18 @@ mod tests {
     #[test]
     fn test_from_vars_missing_each_media_signalling_key_fails() {
         for key in [
-            "MC_MAX_RECEIVE_SLOTS",
+            "MC_MAX_AUDIO_RECEIVE_SLOTS",
+            "MC_MAX_VIDEO_RECEIVE_SLOTS",
             "MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS",
-            "MC_AUDIO_CODEC",
-            "MC_AUDIO_MAX_BITRATE_BPS",
-            "MC_AUDIO_FRAME_RATE_HZ",
+            "MEDIA_AUDIO_CODEC",
+            "MEDIA_AUDIO_MAX_BITRATE_BPS",
+            "MEDIA_AUDIO_FRAME_RATE_HZ",
+            "MEDIA_VIDEO_CODEC",
+            "MEDIA_VIDEO_WIDTH",
+            "MEDIA_VIDEO_HEIGHT",
+            "MEDIA_VIDEO_FRAME_RATE_HZ",
+            "MEDIA_VIDEO_MAX_BITRATE_BPS",
+            "MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
             "MC_MEDIA_CONNECT_SETTLE_MS",
             "MC_KEK_ROTATION_DEBOUNCE_SECONDS",
         ] {
@@ -968,10 +1081,16 @@ mod tests {
     fn test_from_vars_media_signalling_bounds_reject_both_ends() {
         // (key, below-range, above-range)
         for (key, low, high) in [
-            ("MC_MAX_RECEIVE_SLOTS", "0", "65"),
+            ("MC_MAX_AUDIO_RECEIVE_SLOTS", "0", "65"),
+            ("MC_MAX_VIDEO_RECEIVE_SLOTS", "-1", "65"),
             ("MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS", "0", "4097"),
-            ("MC_AUDIO_MAX_BITRATE_BPS", "31999", "48001"),
-            ("MC_AUDIO_FRAME_RATE_HZ", "24", "51"),
+            ("MEDIA_AUDIO_MAX_BITRATE_BPS", "31999", "48001"),
+            ("MEDIA_AUDIO_FRAME_RATE_HZ", "24", "51"),
+            ("MEDIA_VIDEO_WIDTH", "15", "1921"),
+            ("MEDIA_VIDEO_HEIGHT", "15", "1921"),
+            ("MEDIA_VIDEO_FRAME_RATE_HZ", "0", "61"),
+            ("MEDIA_VIDEO_MAX_BITRATE_BPS", "99999", "4000001"),
+            ("MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS", "99", "10001"),
             ("MC_MEDIA_CONNECT_SETTLE_MS", "99", "10001"),
             ("MC_KEK_ROTATION_DEBOUNCE_SECONDS", "29", "301"),
         ] {
@@ -980,10 +1099,15 @@ mod tests {
                 vars.insert(key.to_string(), value.to_string());
                 let err =
                     Config::from_vars(&vars).expect_err(&format!("{key}={value} must be rejected"));
-                assert!(
-                    matches!(err, ConfigError::InvalidValue(_)),
-                    "{key}={value}: expected InvalidValue, got {err:?}"
-                );
+                // The returned error names the key, the value and the bound —
+                // not only a log line.
+                match err {
+                    ConfigError::InvalidValue(msg) => assert!(
+                        msg.contains(key) && msg.contains("..=") && msg.contains(value),
+                        "{key}={value}: error must name key, value and bound: {msg}"
+                    ),
+                    other => panic!("{key}={value}: expected InvalidValue, got {other:?}"),
+                }
             }
         }
     }
@@ -1007,17 +1131,17 @@ mod tests {
     }
 
     /// A value too large for the knob's TYPE (not just its range) still names the
-    /// legal range. `MC_MAX_RECEIVE_SLOTS` is a `u8`, so 256 fails in the parse,
+    /// legal range. `MC_MAX_AUDIO_RECEIVE_SLOTS` is a `u8`, so 256 fails in the parse,
     /// before the range check — and "must be a non-negative integer" would send an
     /// operator the wrong way, since 256 is one.
     #[test]
     fn test_type_overflow_error_names_the_legal_range() {
         let mut vars = base_vars();
-        vars.insert("MC_MAX_RECEIVE_SLOTS".to_string(), "256".to_string());
+        vars.insert("MC_MAX_AUDIO_RECEIVE_SLOTS".to_string(), "256".to_string());
         let err = Config::from_vars(&vars).expect_err("256 must be rejected");
         match err {
             ConfigError::InvalidValue(msg) => assert!(
-                msg.contains("1..=64") && msg.contains("MC_MAX_RECEIVE_SLOTS"),
+                msg.contains("1..=64") && msg.contains("MC_MAX_AUDIO_RECEIVE_SLOTS"),
                 "the type-overflow message must state the legal range: {msg}"
             ),
             other => panic!("expected InvalidValue, got {other:?}"),
@@ -1028,10 +1152,16 @@ mod tests {
     #[test]
     fn test_from_vars_media_signalling_non_numeric_fails_loud() {
         for key in [
-            "MC_MAX_RECEIVE_SLOTS",
+            "MC_MAX_AUDIO_RECEIVE_SLOTS",
+            "MC_MAX_VIDEO_RECEIVE_SLOTS",
             "MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS",
-            "MC_AUDIO_MAX_BITRATE_BPS",
-            "MC_AUDIO_FRAME_RATE_HZ",
+            "MEDIA_AUDIO_MAX_BITRATE_BPS",
+            "MEDIA_AUDIO_FRAME_RATE_HZ",
+            "MEDIA_VIDEO_WIDTH",
+            "MEDIA_VIDEO_HEIGHT",
+            "MEDIA_VIDEO_FRAME_RATE_HZ",
+            "MEDIA_VIDEO_MAX_BITRATE_BPS",
+            "MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
             "MC_KEK_ROTATION_DEBOUNCE_SECONDS",
         ] {
             let mut vars = base_vars();
@@ -1064,47 +1194,51 @@ mod tests {
         // Path 1: rejected in `parse_codec` — not a codec name at all.
         for value in ["oppus", "", "unspecified"] {
             let mut vars = base_vars();
-            vars.insert("MC_AUDIO_CODEC".to_string(), value.to_string());
+            vars.insert("MEDIA_AUDIO_CODEC".to_string(), value.to_string());
             let err = Config::from_vars(&vars)
                 .expect_err("an unrecognised codec must be rejected, never coerced to Opus");
             match err {
                 ConfigError::InvalidValue(msg) => assert!(
-                    msg.contains("MC_AUDIO_CODEC"),
-                    "MC_AUDIO_CODEC='{value}': message must name the key, got: {msg}"
+                    msg.contains("MEDIA_AUDIO_CODEC"),
+                    "MEDIA_AUDIO_CODEC='{value}': message must name the key, got: {msg}"
                 ),
-                other => panic!("MC_AUDIO_CODEC='{value}': expected InvalidValue, got {other:?}"),
+                other => {
+                    panic!("MEDIA_AUDIO_CODEC='{value}': expected InvalidValue, got {other:?}")
+                }
             }
         }
 
         // Path 2: a REAL codec that is not an audio codec. `parse_codec`
         // accepts it and `AudioEncoding::new` rejects it, so this takes the
-        // message that names all three `MC_AUDIO_*` inputs.
-        for value in ["vp9", "h264", "av1"] {
+        // message that names all three `MEDIA_AUDIO_*` inputs.
+        for value in ["vp8", "vp9", "h264", "av1"] {
             let mut vars = base_vars();
-            vars.insert("MC_AUDIO_CODEC".to_string(), value.to_string());
+            vars.insert("MEDIA_AUDIO_CODEC".to_string(), value.to_string());
             let err = Config::from_vars(&vars)
                 .expect_err("a video codec must be rejected for an audio-only knob");
             match err {
                 ConfigError::InvalidValue(msg) => {
                     assert!(
                         msg.contains("not an audio codec"),
-                        "MC_AUDIO_CODEC='{value}': expected the audio-kind reason, got: {msg}"
+                        "MEDIA_AUDIO_CODEC='{value}': expected the audio-kind reason, got: {msg}"
                     );
                     // All three, not just the one that happened to be wrong:
                     // the message must stay useful if the bounds ever diverge
                     // and another variant becomes reachable here.
                     for key in [
-                        "MC_AUDIO_CODEC",
-                        "MC_AUDIO_MAX_BITRATE_BPS",
-                        "MC_AUDIO_FRAME_RATE_HZ",
+                        "MEDIA_AUDIO_CODEC",
+                        "MEDIA_AUDIO_MAX_BITRATE_BPS",
+                        "MEDIA_AUDIO_FRAME_RATE_HZ",
                     ] {
                         assert!(
                             msg.contains(key),
-                            "MC_AUDIO_CODEC='{value}': message must name {key}, got: {msg}"
+                            "MEDIA_AUDIO_CODEC='{value}': message must name {key}, got: {msg}"
                         );
                     }
                 }
-                other => panic!("MC_AUDIO_CODEC='{value}': expected InvalidValue, got {other:?}"),
+                other => {
+                    panic!("MEDIA_AUDIO_CODEC='{value}': expected InvalidValue, got {other:?}")
+                }
             }
         }
     }
@@ -1115,9 +1249,9 @@ mod tests {
     fn test_from_vars_audio_codec_accepts_trimmed_and_case_folded() {
         for value in ["opus", "  opus  ", "OPUS", "Opus"] {
             let mut vars = base_vars();
-            vars.insert("MC_AUDIO_CODEC".to_string(), value.to_string());
+            vars.insert("MEDIA_AUDIO_CODEC".to_string(), value.to_string());
             let config = Config::from_vars(&vars)
-                .unwrap_or_else(|e| panic!("MC_AUDIO_CODEC='{value}' should load: {e:?}"));
+                .unwrap_or_else(|e| panic!("MEDIA_AUDIO_CODEC='{value}' should load: {e:?}"));
             assert_eq!(
                 config.audio_encoding.codec(),
                 proto_gen::dark_tower::signaling::v1::Codec::Opus
@@ -1130,24 +1264,91 @@ mod tests {
     #[test]
     fn test_from_vars_media_signalling_values_are_effective() {
         let mut vars = base_vars();
-        vars.insert("MC_MAX_RECEIVE_SLOTS".to_string(), "3".to_string());
+        vars.insert("MC_MAX_AUDIO_RECEIVE_SLOTS".to_string(), "3".to_string());
+        // 0 is LEGAL for video: the R-26 off lever.
+        vars.insert("MC_MAX_VIDEO_RECEIVE_SLOTS".to_string(), "0".to_string());
         vars.insert(
             "MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS".to_string(),
             "7".to_string(),
         );
-        vars.insert("MC_AUDIO_MAX_BITRATE_BPS".to_string(), "32000".to_string());
-        vars.insert("MC_AUDIO_FRAME_RATE_HZ".to_string(), "25".to_string());
+        vars.insert(
+            "MEDIA_AUDIO_MAX_BITRATE_BPS".to_string(),
+            "32000".to_string(),
+        );
+        vars.insert("MEDIA_AUDIO_FRAME_RATE_HZ".to_string(), "25".to_string());
+        vars.insert("MEDIA_VIDEO_WIDTH".to_string(), "320".to_string());
+        vars.insert("MEDIA_VIDEO_HEIGHT".to_string(), "180".to_string());
+        vars.insert("MEDIA_VIDEO_FRAME_RATE_HZ".to_string(), "15".to_string());
+        vars.insert(
+            "MEDIA_VIDEO_MAX_BITRATE_BPS".to_string(),
+            "250000".to_string(),
+        );
+        vars.insert(
+            "MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS".to_string(),
+            "750".to_string(),
+        );
 
         let config = Config::from_vars(&vars).expect("in-range values load");
-        assert_eq!(config.max_receive_slots, 3);
+        assert_eq!(config.max_receive_slots, [3, 0]);
         assert_eq!(config.max_receive_capability_declarations, 7);
         assert_eq!(config.audio_encoding.max_bitrate_bps(), 32_000);
         assert_eq!(config.audio_encoding.frame_rate_hz(), 25);
+        let v = config.video_encoding;
+        assert_eq!(
+            (
+                v.width(),
+                v.height(),
+                v.frame_rate_hz(),
+                v.max_bitrate_bps()
+            ),
+            (320, 180, 15, 250_000)
+        );
+        assert_eq!(v.min_keyframe_interval_ms(), 750);
+        assert_eq!(v.codec(), proto_gen::dark_tower::signaling::v1::Codec::Vp8);
 
         let projected = config.client_media_config();
-        assert_eq!(projected.max_receive_slots, 3);
+        assert_eq!(projected.max_receive_slots, [3, 0]);
         assert_eq!(projected.max_receive_capability_declarations, 7);
         assert_eq!(projected.audio_encoding, config.audio_encoding);
+        assert_eq!(projected.video_encoding, config.video_encoding);
+    }
+
+    /// The video codec is VP8 only: any other codec, real or not, refuses to
+    /// boot with an error naming the key.
+    #[test]
+    fn test_from_vars_video_codec_is_vp8_only() {
+        for value in ["opus", "vp9", "h264", "av1", "vp88", "", "unspecified"] {
+            let mut vars = base_vars();
+            vars.insert("MEDIA_VIDEO_CODEC".to_string(), value.to_string());
+            match Config::from_vars(&vars) {
+                Err(ConfigError::InvalidValue(msg)) => {
+                    assert!(msg.contains("MEDIA_VIDEO_CODEC"), "'{value}': {msg}");
+                }
+                other => {
+                    panic!("MEDIA_VIDEO_CODEC='{value}': expected InvalidValue, got {other:?}")
+                }
+            }
+        }
+        let mut vars = base_vars();
+        vars.insert("MEDIA_VIDEO_CODEC".to_string(), " VP8 ".to_string());
+        assert!(Config::from_vars(&vars).is_ok());
+    }
+
+    /// The retired keys are NOT read: their absence changes nothing, and a
+    /// garbage value in one is ignored (MC-A removes the reads; INF-A
+    /// schedules the key deletion).
+    #[test]
+    fn test_retired_keys_are_not_read() {
+        let mut vars = base_vars();
+        for key in [
+            "MC_MAX_RECEIVE_SLOTS",
+            "MC_AUDIO_CODEC",
+            "MC_AUDIO_MAX_BITRATE_BPS",
+            "MC_AUDIO_FRAME_RATE_HZ",
+        ] {
+            vars.insert(key.to_string(), "garbage".to_string());
+        }
+        assert!(Config::from_vars(&vars).is_ok());
     }
 
     #[test]

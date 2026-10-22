@@ -32,11 +32,13 @@ use super::messages::{
 use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 use super::participant::{ParticipantActor, ParticipantActorHandle};
 use super::session::{SessionBindingManager, StoredBinding};
+use crate::media_kind::PublishSet;
+use crate::media_routing::SourceMute;
 use crate::media_routing::{ConnectionKey, Unapplied};
-use crate::media_signaling::{MediaKindLabel, ReceiveCapabilityDeclaration};
+use crate::media_signaling::{MediaKindLabel, SlotDemand, SourceMuteView};
 
 use common::secret::SecretBox;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -139,12 +141,16 @@ impl MeetingActorHandle {
             .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
     }
 
-    /// Attempt to reconnect with binding token.
+    /// Attempt to reconnect with binding token, presenting the client's
+    /// publish set (compared as a set; a mismatch is refused, story 3 R-2) and
+    /// optionally a receive declaration (treated as a redeclaration).
     pub async fn connection_reconnect(
         &self,
         connection_id: String,
         correlation_id: String,
         binding_token: String,
+        publishes: PublishSet,
+        demand: Option<SlotDemand>,
     ) -> Result<ReconnectResult, McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
@@ -152,6 +158,8 @@ impl MeetingActorHandle {
                 connection_id,
                 correlation_id,
                 binding_token,
+                publishes,
+                demand,
                 respond_to: tx,
             })
             .await
@@ -298,7 +306,7 @@ impl MeetingActorHandle {
     pub async fn register_receive_capability(
         &self,
         participant_id: String,
-        declaration: ReceiveCapabilityDeclaration,
+        declaration: SlotDemand,
     ) -> Result<(), McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
@@ -451,6 +459,9 @@ struct Participant {
     audio_server_muted: bool,
     /// Video server-mute (enforced, ADR-0036 §5).
     video_server_muted: bool,
+    /// What this participant publishes, FIXED for its membership (story 3
+    /// R-2): set once at join, never adopted from a reconnect.
+    publishes: PublishSet,
     /// Who applied the server mute (a participant id), while either kind is
     /// server-muted. Written ONLY by `handle_server_mute`, beside the two flags
     /// it qualifies, and cleared in lockstep with them — so the requester and
@@ -479,6 +490,19 @@ struct Participant {
 }
 
 impl Participant {
+    /// This participant's per-kind mute flags, explicitly projected (never the
+    /// roster entry itself, which also carries identity material).
+    fn source_mute(&self) -> SourceMute {
+        SourceMute {
+            server: MediaKindLabel::per_kind(|k| {
+                k.pick(self.audio_server_muted, self.video_server_muted)
+            }),
+            client: MediaKindLabel::per_kind(|k| {
+                k.pick(self.audio_self_muted, self.video_self_muted)
+            }),
+        }
+    }
+
     fn to_info(&self) -> ParticipantInfo {
         ParticipantInfo {
             participant_id: self.participant_id.clone(),
@@ -1034,10 +1058,18 @@ impl MeetingActor {
                 connection_id,
                 correlation_id,
                 binding_token,
+                publishes,
+                demand,
                 respond_to,
             } => {
                 let result = self
-                    .handle_reconnect(connection_id, correlation_id, binding_token)
+                    .handle_reconnect(
+                        connection_id,
+                        correlation_id,
+                        binding_token,
+                        publishes,
+                        demand,
+                    )
                     .await;
                 let _ = respond_to.send(result);
             }
@@ -1278,8 +1310,14 @@ impl MeetingActor {
         // joiner is bound to no handler: it is offered the whole set, and
         // becomes routable only when the handlers report its connections
         // (ADR-0036 §9).
+        let publishes = media.publishes;
+        let demand = media.demand.clone();
         self.media.install(media);
-        self.media.admit(&participant_id, sender_id)?;
+        self.media.admit(&participant_id, sender_id, publishes)?;
+        // The join carries the initial declaration (story 3 R-2): registered
+        // in THIS turn, before the reconcile below, so the joiner's first
+        // directive and assignments are queued behind its JoinResponse.
+        self.media.declare(&participant_id, demand)?;
         let media_handlers =
             self.media.frozen_handlers().cloned().ok_or_else(|| {
                 McError::MhAssignmentMissing("no handler set installed".to_string())
@@ -1380,6 +1418,7 @@ impl MeetingActor {
             // it. No side table is needed for either (R-10).
             audio_server_muted: false,
             video_server_muted: false,
+            publishes,
             server_muted_by: None,
             is_host,
             sender_id,
@@ -1419,8 +1458,8 @@ impl MeetingActor {
 
         // Structural change: re-render, re-push every handler (the first join
         // registers every handler, possibly with an empty snapshot), and
-        // re-emit changed views to existing declared subscribers. The joiner
-        // itself has not declared, so it is sent nothing yet.
+        // re-emit changed views to every declared participant — the joiner
+        // included, whose join carried its declaration.
         self.reconcile_media(Affected::All).await;
         self.flush_views().await;
 
@@ -1745,6 +1784,8 @@ impl MeetingActor {
         connection_id: String,
         correlation_id: String,
         binding_token: String,
+        publishes: PublishSet,
+        demand: Option<SlotDemand>,
     ) -> Result<ReconnectResult, McError> {
         // Find stored binding by correlation ID
         let stored_binding =
@@ -1797,6 +1838,29 @@ impl MeetingActor {
                 .ok_or(McError::SessionBinding(
                     crate::errors::SessionBindingError::SessionNotFound,
                 ))?;
+
+        // Story 3 R-2: the publish set is FIXED for the membership. A
+        // reconnect presenting a different SET is refused — generically,
+        // counted, BEFORE any binding rotation or broadcast — and never
+        // adopted: otherwise a participant could slip out from under a mute by
+        // reconnecting with a different set. The roster entry is untouched.
+        //
+        // REACHABILITY: this actor-level reconnect is not yet wired to the
+        // WebTransport accept path (see the note on
+        // `sender_id_continuity_across_actor_level_reconnect`); a browser
+        // "reconnect" is a fresh join. The control is proven at this seam.
+        if participant.publishes != publishes {
+            // Failure side only; see `record_join_refusal` for the double-count
+            // hazard once reconnect is wired to the accept path.
+            crate::observability::metrics::record_join_refusal(
+                McError::ReconnectPublishSetMismatch.error_type_label(),
+            );
+            warn!(
+                target: "mc.actor.meeting",
+                "Refusing reconnect: presented publish set differs from the membership's"
+            );
+            return Err(McError::ReconnectPublishSetMismatch);
+        }
 
         debug!(
             target: "mc.actor.meeting",
@@ -1874,8 +1938,42 @@ impl MeetingActor {
         );
 
         // A reconnect keeps rank and slots (the participant never left the
-        // roster). The new connection has received nothing, so its full current
-        // view is re-sent. No re-push: nothing structural changed.
+        // roster). Its receive declaration is a REDECLARATION: a different one
+        // is applied (structural change, re-push), an identical or absent one
+        // keeps the declaration in force. A declaration that would leave the
+        // participant neither publishing nor receiving is not applied — the
+        // previous one stays (R-2). The new connection has received nothing, so
+        // its full current view is re-sent.
+        let redeclared = match demand {
+            // Absent, or identical to the declaration in force: an uncounted
+            // no-op, as on the post-join path.
+            None => false,
+            Some(demand) if self.media.declaration_of(&participant_id) == Some(&demand) => false,
+            // R-2: would leave the participant neither publishing nor
+            // receiving. Refused and COUNTED, exactly as the post-join path
+            // counts it; the previous declaration stays in force.
+            Some(demand)
+                if crate::media_signaling::publishes_and_receives_nothing(
+                    publishes,
+                    demand.declaration(),
+                ) =>
+            {
+                crate::observability::metrics::record_receive_capability(
+                    crate::media_signaling::CapabilityOutcome::WouldPublishAndReceiveNothing,
+                );
+                false
+            }
+            // A view missing for a roster participant is an MC invariant
+            // violation: fail the reconnect loudly rather than silently not
+            // applying the redeclaration.
+            Some(demand) => {
+                self.media.declare(&participant_id, demand)?;
+                true
+            }
+        };
+        if redeclared {
+            self.reconcile_media(Affected::All).await;
+        }
         self.media.reset_view(&participant_id);
         self.flush_views().await;
 
@@ -1999,18 +2097,22 @@ impl MeetingActor {
     /// is a JUDGMENT, not a consequence of the encoder. `encode_participant_update`
     /// now has a real `MuteChanged` arm, so a roster broadcast here WOULD reach
     /// clients — security's S-2 concluded that nothing needs it: the
-    /// subscriber-visible signal is `SLOT_STATE_SOURCE_MUTED`, and a self-mute is
+    /// subscriber-visible signal is the slot state (`SLOT_STATE_AVATAR_CLIENT_MUTED`
+    /// since story 3; formerly `SOURCE_MUTED`), and a self-mute is
     /// the participant's own state, which its own client already knows. Server
     /// mute is different and does fan out, because who-muted-whom has no other
     /// carrier (`ParticipantMuteUpdate.server_muted_by`).
     ///
-    /// The subscriber-visible mute signal is `SLOT_STATE_SOURCE_MUTED`, and since
-    /// story 2 the ACTOR composes it: an audio-flag change marks dirty only the
-    /// subscribers HOLDING this source in a slot, and the per-turn flush bound
-    /// applies — a per-MEETING bound, which is the kind the self-mute lesson
-    /// asked for (a per-connection rate limit cannot bound N connections each
-    /// within their own limit). Each subscriber's message goes only if its view
-    /// actually changed. A video-only change dirties nothing.
+    /// The subscriber-visible mute signal is the per-kind slot state
+    /// (`SLOT_STATE_AVATAR_CLIENT_MUTED`), and the ACTOR composes it: a change of
+    /// EITHER kind re-renders (the stream's PAUSED disposition rides
+    /// `source_streams`) and marks dirty only the subscribers HOLDING this source
+    /// in a slot of either kind; the per-turn flush bound applies — a
+    /// per-MEETING bound, which is the kind the self-mute lesson asked for (a
+    /// per-connection rate limit cannot bound N connections each within their
+    /// own limit). Each subscriber's message goes only if its view actually
+    /// changed: a video toggle by a participant that publishes no video changes
+    /// no view and no disposition.
     async fn handle_self_mute(
         &mut self,
         participant_id: &str,
@@ -2029,15 +2131,17 @@ impl MeetingActor {
             return;
         }
 
-        let audio_changed = participant.audio_self_muted != audio_muted;
         participant.audio_self_muted = audio_muted;
         participant.video_self_muted = video_muted;
         let sender = participant.sender_id;
 
-        if audio_changed {
-            self.reconcile_media(Affected::HoldersOf(sender)).await;
-            self.flush_views().await;
-        }
+        // EITHER kind (story 3): the change re-renders (the source's PAUSED
+        // disposition rides `source_streams`; the generation advances only if
+        // the output changed — a video toggle by a non-video publisher changes
+        // nothing) and re-emits to every holder of this source whose view
+        // changed, under the per-meeting flush bound.
+        self.reconcile_media(Affected::HoldersOf(sender)).await;
+        self.flush_views().await;
     }
 
     /// Register a validated receive-capability declaration: slot demand is now
@@ -2046,7 +2150,7 @@ impl MeetingActor {
     async fn handle_receive_capability(
         &mut self,
         participant_id: &str,
-        declaration: ReceiveCapabilityDeclaration,
+        declaration: SlotDemand,
     ) -> Result<(), McError> {
         if !self.participants.contains_key(participant_id) {
             return Err(McError::ParticipantNotFound(
@@ -2178,8 +2282,8 @@ impl MeetingActor {
                     RosterEntry {
                         sender: p.sender_id,
                         connection: p.connection.as_ref(),
-                        // One wire state (`SOURCE_MUTED`) covers both causes.
-                        audio_muted: p.audio_self_muted || p.audio_server_muted,
+                        publishes: p.publishes,
+                        mute: p.source_mute(),
                     },
                 )
             })
@@ -2215,11 +2319,12 @@ impl MeetingActor {
     /// so the two compose: clearing one never clears the other.
     ///
     /// Broadcast to EVERY participant — the target included, so the muted
-    /// participant learns it cannot clear the mute itself (R-10, R-11). An
-    /// audio change is a structural change: re-render (the muted set rides each
-    /// handler's snapshot, so the generation advances where it changed),
+    /// participant learns it cannot clear the mute itself (R-10, R-11). A
+    /// change of either kind is a structural change: re-render (that kind's
+    /// stream turns DROP_AT_INGRESS in every handler's `source_streams`, so the
+    /// generation advances where the snapshot changed),
     /// re-push, confirm the echo, and re-emit `StreamAssignments` to the
-    /// holders of this source (`SOURCE_MUTED`).
+    /// holders of this source (`AVATAR_SERVER_MUTED`).
     ///
     /// # Fan-out cost, and what the argument rests on
     ///
@@ -2264,7 +2369,6 @@ impl MeetingActor {
             return Ok(decision);
         }
 
-        let audio_changed = decision.changed(MediaKindLabel::Audio);
         participant.audio_server_muted = audio_muted;
         participant.video_server_muted = video_muted;
         // Cleared in lockstep with the flags it qualifies.
@@ -2279,17 +2383,13 @@ impl MeetingActor {
             }
         }
 
-        // Story 2 is audio-only, and MH mute is SENDER-scoped (it drops every
-        // stream of the sender), so only the audio flag feeds MH. Per-kind mute
-        // arrives as `SourceStream` DROP_AT_INGRESS dispositions (MC-A;
-        // reasoning at `internal.proto` `MutedSource`, corrected 2026-10-13);
-        // until then a video-only server mute is recorded and broadcast but
-        // changes nothing MH enforces.
-        if audio_changed {
-            self.publish_mute_census();
-            self.reconcile_media(Affected::HoldersOf(sender)).await;
-            self.flush_views().await;
-        }
+        // Per kind (story 3 MC-A): each kind's server mute reaches MH as that
+        // stream's DROP_AT_INGRESS disposition in `source_streams`, and the
+        // holders of this source see the AVATAR_SERVER_MUTED state for that
+        // kind. (Directive withdrawal on server mute is MC-B's.)
+        self.publish_mute_census();
+        self.reconcile_media(Affected::HoldersOf(sender)).await;
+        self.flush_views().await;
         Ok(decision)
     }
 
@@ -2427,18 +2527,18 @@ impl MeetingActor {
         Ok(())
     }
 
-    /// Re-render and re-publish with the CURRENT server-muted set — the one
-    /// place it is computed, from the roster (the one home for mute state).
+    /// Re-render and re-publish with the CURRENT per-kind mute projection —
+    /// the one place it is computed, from the roster (the one home for mute).
     /// Every reconcile goes through here; `MeetingMedia::reconcile` takes the
     /// set as a required argument so no path can render without it.
     async fn reconcile_media(&mut self, affected: Affected) {
-        let server_muted: BTreeSet<SenderId> = self
-            .participants
-            .values()
-            .filter(|p| p.audio_server_muted)
-            .map(|p| p.sender_id)
-            .collect();
-        self.media.reconcile(affected, &server_muted).await;
+        let mute = SourceMuteView::from_map(
+            self.participants
+                .values()
+                .map(|p| (p.sender_id, p.source_mute()))
+                .collect(),
+        );
+        self.media.reconcile(affected, &mute).await;
     }
 
     /// Write this meeting's ABSOLUTE per-kind server-muted counts into the pod
@@ -2447,10 +2547,9 @@ impl MeetingActor {
     ///
     /// Each kind counts its OWN flag: `audio_server_muted` for audio,
     /// `video_server_muted` for video. A participant muted on both kinds is one
-    /// source on each. MH is told only the audio-server-muted senders
-    /// (`reconcile_media`), so `{media_kind="audio"}` is TODAY's reading
-    /// comparable with MH's `server_muted` drops; it becomes the sum across
-    /// kinds when MC-A adds per-stream DROP_AT_INGRESS dispositions for video.
+    /// source on each. Each kind's server mute reaches MH as that kind's
+    /// stream DROP_AT_INGRESS (`source_streams`), so the sum across kinds is
+    /// the reading comparable with MH's `server_muted` drops.
     fn publish_mute_census(&self) {
         if let Some(wiring) = &self.wiring {
             let counts = MediaKindLabel::per_kind(|kind| {
@@ -3090,6 +3189,8 @@ mod tests {
                 "conn-2".to_string(),
                 join.correlation_id.clone(),
                 join.binding_token.clone(),
+                PublishSet::of(&[MediaKindLabel::Audio]),
+                None,
             )
             .await
             .expect("reconnect within grace succeeds");
@@ -3153,6 +3254,8 @@ mod tests {
                 "conn-2".to_string(),
                 join_result.correlation_id.clone(),
                 join_result.binding_token.clone(),
+                PublishSet::of(&[MediaKindLabel::Audio]),
+                None,
             )
             .await;
 
@@ -3212,6 +3315,8 @@ mod tests {
                 "conn-2".to_string(),
                 join_result.correlation_id.clone(),
                 "invalid-token".to_string(),
+                PublishSet::of(&[MediaKindLabel::Audio]),
+                None,
             )
             .await;
 
@@ -3252,7 +3357,7 @@ mod tests {
     /// transition is confirmed to have LANDED, via `get_state()` observing
     /// `audio_self_muted`, on the same read path
     /// `actors::meeting_media` uses (via the roster) to derive
-    /// `SLOT_STATE_SOURCE_MUTED`. That is the mechanism that replaced the
+    /// `SLOT_STATE_AVATAR_CLIENT_MUTED` (formerly `SOURCE_MUTED`). That is the mechanism that replaced the
     /// broadcast, so the control exercises the actual delivery route.
     ///
     /// The connection-side `last_reported_mute` cache short-circuits BEFORE the
@@ -3325,7 +3430,7 @@ mod tests {
              `MuteChanged` IS wire-serialized as of task 12, so this is no longer a \
              zero-byte fan-out — it is one S-2 deliberately does not perform: a self-mute \
              is the participant's own state and the subscriber-visible signal is \
-             SLOT_STATE_SOURCE_MUTED, so a roster broadcast would cost one awaited send \
+             SLOT_STATE_AVATAR_CLIENT_MUTED, so a roster broadcast would cost one awaited send \
              per participant on the shared actor task and tell no one anything new. If \
              this goes red, the question is whether S-2's judgment changed, not whether \
              the encoder did"
@@ -3334,7 +3439,7 @@ mod tests {
         // POSITIVE CONTROL — the transition actually landed. Without this the
         // assertions above would pass just as well if the actor had ignored
         // both messages. This is also the path that REPLACED the broadcast:
-        // each subscriber derives `SLOT_STATE_SOURCE_MUTED` from its own
+        // each subscriber derives `SLOT_STATE_AVATAR_CLIENT_MUTED` from its own
         // `get_state()` read, so the control exercises the real delivery route.
         let state = handle.get_state().await.expect("state read succeeds");
         let part_a = state
@@ -3785,6 +3890,8 @@ mod tests {
                 "conn-3b".to_string(),
                 joined.correlation_id.clone(),
                 joined.binding_token.clone(),
+                PublishSet::of(&[MediaKindLabel::Audio]),
+                None,
             )
             .await
             .unwrap();
@@ -4019,6 +4126,8 @@ mod tests {
                 "conn-2".to_string(),
                 join_result.correlation_id.clone(),
                 join_result.binding_token.clone(),
+                PublishSet::of(&[MediaKindLabel::Audio]),
+                None,
             )
             .await;
 
@@ -4159,6 +4268,8 @@ mod tests {
                 "conn-2".to_string(),
                 join_result.correlation_id.clone(),
                 join_result.binding_token.clone(),
+                PublishSet::of(&[MediaKindLabel::Audio]),
+                None,
             )
             .await;
         assert!(reconnect_result.is_ok());

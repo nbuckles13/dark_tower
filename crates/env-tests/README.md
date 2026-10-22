@@ -135,7 +135,7 @@ Keyless, black-box clients for the media path. They build and parse frames only 
 
 Every env-test file that opens media sessions states in its header the sum, over its **concurrently running** test fns, of **P × (N+M)**: participants, times the audio plus video receive slots each declares. `cargo test` runs one file's test fns in parallel and the files one after another, so that per-file sum is the load the Kind cluster carries at once.
 
-INF-C (story 3 task 16) sizes the Kind ceiling at about 120 against the largest per-file sum, 72 (`27_mc_slot_placement`). A change that pushes a file past the ceiling must, in the same change, either serialise that file's fns or re-size the budget.
+INF-C (story 3 task 16) sizes the Kind ceiling at about 120 against the PLANNED largest per-file sum, 72 (`27_mc_slot_placement`); each file's ACTUAL sum is the `Edge-sum` line in its own header, the one home for that number. A change that pushes a file past the ceiling must, in the same change, either serialise that file's fns or re-size the budget.
 
 ## Future Work
 

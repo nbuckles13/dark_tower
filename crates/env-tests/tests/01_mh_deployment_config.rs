@@ -615,8 +615,10 @@ const REMOVED_KEYS: &[&str] = &[
 
 /// None of [`REMOVED_KEYS`] is an env entry of THIS pod's MH container, and
 /// the three MH keys are absent from its live `mh-service-config` generation.
-/// The minimum interval is deliberately not checked against the profile
-/// ConfigMap, which still holds it for MC.
+/// The minimum interval's absence from the shared profile generation (it
+/// moved to MC's own ConfigMap as `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`, story 3
+/// MC-A) has ONE home: `02_mc_deployment_config.rs`, beside that key's new
+/// wiring, so the move and its absence are asserted together.
 ///
 /// Reads the SAME parsed pod and ConfigMap the positive wiring checks above
 /// just used, so the absence cannot be vacuous: an empty or unread env list is
@@ -891,9 +893,11 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
     // participant limit. Checked here, from the live ConfigMaps, in seconds —
     // rather than discovered as a PRECONDITION panic deep in the Layer-7 flows
     // run. The limit and the pigeonhole rule have ONE home, shared with test 28.
+    // S9 drives AUDIO slots only, so the per-kind AUDIO cap bounds it (story 3
+    // MC-A retired the kind-blind `MC_MAX_RECEIVE_SLOTS`).
     let slot_cap = env_tests::fixtures::kube::configmap_u64(
         &configmap_name_for_all(&["mc-0", "mc-1"], "mc-service-config"),
-        "MC_MAX_RECEIVE_SLOTS",
+        "MC_MAX_AUDIO_RECEIVE_SLOTS",
     );
     let feasible = env_tests::fixtures::egress_admission::max_s9_feasible_ceiling(slot_cap);
     let s9_ceiling = bits_ceiling.max(bytes_ceiling);
@@ -901,7 +905,7 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
         s9_ceiling <= feasible,
         "Kind stream ceiling {s9_ceiling} is ABOVE the largest ceiling the S9 exhaustion test \
          (28_mh_egress_admission.rs) can exceed: {feasible}, i.e. P x S > 2 x ceiling with at \
-         most {} participants and MC_MAX_RECEIVE_SLOTS={slot_cap}. Both bounds on the Kind \
+         most {} participants and MC_MAX_AUDIO_RECEIVE_SLOTS={slot_cap}. Both bounds on the Kind \
          budget: ceiling >= {required} (demo) and ceiling <= {feasible} (S9). Fix: LOWER \
          MH_EGRESS_BUDGET_BPS in {PATCH}; raising MAX_S9_PARTICIPANTS instead is a decision \
          about test cost, not a sizing fix.",

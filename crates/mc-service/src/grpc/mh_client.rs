@@ -43,6 +43,7 @@ use crate::errors::McError;
 use crate::media_routing::teardown::{EndMeetingCall, EndMeetingFailure, EndMeetingFailureKind};
 use crate::media_routing::{
     self, EgressStreamPlan, HandlerAssignment, PolicyPushOutcome, PushDisposition, PushExpectation,
+    SourceDispositionPlan,
 };
 use crate::observability::metrics::{record_media_policy_push, record_register_meeting};
 use common::observability::labels::KEY_CUSTODY_OPERATOR;
@@ -51,7 +52,7 @@ use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
 use proto_gen::dark_tower::internal::v1::{
     CandidateSource, EgressStream, EndMeetingRequest, MutedSource, RegisterMeetingRequest,
-    RegisterMeetingResponse, SubscriberSlot,
+    RegisterMeetingResponse, SourceDisposition, SourceStream, SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use std::num::NonZeroU64;
@@ -205,7 +206,6 @@ fn build_egress_streams(assignment: &HandlerAssignment) -> Vec<EgressStream> {
                 stream_number,
                 priority_group,
                 supersede_on_independent_frame,
-                transport_mode,
             } = plan;
             EgressStream {
                 egress_stream_id: *egress_stream_id,
@@ -222,29 +222,34 @@ fn build_egress_streams(assignment: &HandlerAssignment) -> Vec<EgressStream> {
                     .collect(),
                 priority_group: *priority_group,
                 supersede_on_independent_frame: *supersede_on_independent_frame,
-                transport_mode: *transport_mode as i32,
+                // No longer written (story 3): an edge's transport derives from
+                // its candidate's `SourceStream`. Left at the proto default
+                // until MC-B deletes the field.
+                transport_mode: TransportMode::Unspecified as i32,
             }
         })
         .collect()
 }
 
-/// The transport mode MC declares for this push.
-///
-/// `internal.proto` echoes ONE transport mode for the whole registration, which
-/// is unambiguous only while a meeting's egress streams are homogeneous — true
-/// this story (audio, datagram) and false when video lands. MC's assignment
-/// produces homogeneous modes by construction, so the declared mode is the
-/// first stream's.
-///
-/// An **empty** policy names no mode. `Unspecified` is correct there and is not
-/// a fail-open: an empty policy also means MH installs no egress stream, so the
-/// echo has nothing to disagree with, and a handler that installed the empty
-/// policy echoes `Unspecified` back.
-fn declared_transport_mode(assignment: &HandlerAssignment) -> TransportMode {
+/// The wire form of one handler's `source_streams` (story 3 R-16, R-17,
+/// R-20). Already a canonically ordered, duplicate-free set upstream
+/// (`SlotTable::render`); this is a pure projection of its four fields — no
+/// roster or identity material reaches it.
+fn build_source_streams(assignment: &HandlerAssignment) -> Vec<SourceStream> {
     assignment
-        .egress_streams
-        .first()
-        .map_or(TransportMode::Unspecified, |s| s.transport_mode)
+        .source_streams
+        .iter()
+        .map(|s| SourceStream {
+            sender_id: u32::from(s.sender.get().get()),
+            stream_number: u32::from(s.stream_number),
+            transport_mode: s.transport_mode.mode() as i32,
+            disposition: match s.disposition {
+                SourceDispositionPlan::Forward => SourceDisposition::Forward,
+                SourceDispositionPlan::Paused => SourceDisposition::Paused,
+                SourceDispositionPlan::DropAtIngress => SourceDisposition::DropAtIngress,
+            } as i32,
+        })
+        .collect()
 }
 
 /// MH client for RegisterMeeting RPCs.
@@ -304,7 +309,6 @@ impl MhClient {
             common::observability::otel_grpc::client_interceptor(),
         );
 
-        let declared_mode = declared_transport_mode(programming.assignment);
         let request = RegisterMeetingRequest {
             meeting_id: meeting_id.to_string(),
             mc_id: programming.mc_id.to_string(),
@@ -323,10 +327,11 @@ impl MhClient {
             // ordered; a change to it changed the assignment, so the generation
             // above already advanced for it.
             server_muted_sources: build_muted_sources(programming.assignment),
-            // Story 3 per-stream declarations: MC-A emits them. Empty selects
-            // MH's transitional story-2 reading (internal.proto
-            // `server_muted_sources`).
-            source_streams: vec![],
+            // Story 3: every published (sender, stream) with its transport and
+            // disposition. Always present (MC never selects MH's legacy
+            // no-`source_streams` reading); a disposition change is an
+            // assignment change, so the generation above advanced for it.
+            source_streams: build_source_streams(programming.assignment),
         };
 
         let grpc_request = self.add_auth(request)?;
@@ -336,7 +341,7 @@ impl MhClient {
             Ok(response) => {
                 let duration = start.elapsed();
                 let inner = response.into_inner();
-                self.confirm(programming, &inner, declared_mode, duration)
+                self.confirm(programming, &inner, duration)
             }
             Err(e) => {
                 let duration = start.elapsed();
@@ -366,15 +371,14 @@ impl MhClient {
         &self,
         programming: &MeetingProgramming<'_>,
         response: &RegisterMeetingResponse,
-        declared_mode: TransportMode,
         duration: Duration,
     ) -> Result<(), McError> {
         let expectation = PushExpectation {
             handler_id: programming.expected_handler_id,
             policy_generation: programming.policy_generation,
-            transport_mode: declared_mode,
+            source_streams: &programming.assignment.source_streams,
         };
-        let outcome = media_routing::evaluate(&expectation, response);
+        let (outcome, echo) = media_routing::evaluate_with_echo(&expectation, response);
         let restart_floor = programming.is_restart_floor(outcome, response.applied_generation);
 
         // The MC-restart floor is NOT recorded here: the pusher records exactly
@@ -447,6 +451,8 @@ impl MhClient {
             });
         }
 
+        // The per-stream echo arm and its stream number are LOG FIELDS, never
+        // labels; no sender id is logged.
         let interim_marker = if outcome == PolicyPushOutcome::HandlerIdMismatch {
             // Read this as the expected stable-id-not-yet-deployed case at a
             // glance; see `media_routing::confirm::evaluate`'s precedence note
@@ -465,10 +471,9 @@ impl MhClient {
             sent_generation = programming.policy_generation.get(),
             applied_generation = response.applied_generation,
             generation_matched = response.applied_generation == programming.policy_generation.get(),
-            sent_transport_mode = declared_mode.as_str_name(),
-            echoed_transport_mode = TransportMode::try_from(response.transport_mode)
-                .unwrap_or(TransportMode::Unspecified)
-                .as_str_name(),
+            echo_arm = echo.map_or("none", |(arm, _)| arm.label()),
+            echo_stream_number = echo.map_or(-1, |(_, n)| i32::from(n)),
+            declared_source_streams = programming.assignment.source_streams.len(),
             process_start_epoch_ms = response.process_start_epoch_ms,
             accepted = response.accepted,
             "MH did not confirm the forwarding policy{}",
@@ -653,10 +658,11 @@ mod tests {
         for n in [7, 8] {
             let sender = SenderId::from_nonzero(NonZeroU16::new(n).unwrap());
             table.admit_on(sender, &set, &["mh-0"]);
-            table.set_demand(sender, vec![0]);
+            table.set_audio_demand(sender, vec![0]);
         }
+        let mute = table.quiet_mute();
         table
-            .render([&handler], &std::collections::BTreeSet::new())
+            .render([&handler], &mute)
             .unwrap()
             .for_handler(&handler)
             .cloned()
@@ -709,15 +715,32 @@ mod tests {
             );
         }
 
-        // A specified, homogeneous transport mode.
-        assert_ne!(
-            s.transport_mode,
-            TransportMode::Unspecified as i32,
-            "UNSPECIFIED is a rejection, not a default"
-        );
-        let modes: std::collections::HashSet<i32> =
-            streams.iter().map(|s| s.transport_mode).collect();
-        assert_eq!(modes.len(), 1, "heterogeneous modes are rejected whole");
+        // `EgressStream.transport_mode` is no longer written (derived at MH
+        // from the candidate's `SourceStream`).
+        assert!(streams
+            .iter()
+            .all(|s| s.transport_mode == TransportMode::Unspecified as i32));
+
+        // Every candidate is declared in `source_streams`, with a specified
+        // transport and disposition, one entry per (sender, stream).
+        let sources = build_source_streams(&assignment);
+        let keys: std::collections::HashSet<(u32, u32)> = sources
+            .iter()
+            .map(|s| (s.sender_id, s.stream_number))
+            .collect();
+        assert_eq!(keys.len(), sources.len(), "one entry per (sender, stream)");
+        for s in &streams {
+            for c in &s.candidate_sources {
+                assert!(
+                    keys.contains(&(c.sender_id, c.stream_number)),
+                    "candidate listed"
+                );
+            }
+        }
+        for s in &sources {
+            assert_ne!(s.transport_mode, TransportMode::Unspecified as i32);
+            assert_ne!(s.disposition, SourceDisposition::Unspecified as i32);
+        }
 
         // The two uniqueness obligations.
         let ids: std::collections::HashSet<u32> =
@@ -731,21 +754,91 @@ mod tests {
         assert_eq!(slots.len(), streams.len());
     }
 
+    /// The WIRE pins (story 3): audio is stream 0 on DATAGRAM, video stream 1
+    /// on STREAM_PER_GROUP, and every disposition maps to its proto value —
+    /// read off the encoded `SourceStream`s, not the plan.
     #[test]
-    fn declared_transport_mode_is_datagram_for_an_audio_policy() {
-        assert_eq!(
-            declared_transport_mode(&two_party_assignment()),
-            TransportMode::Datagram
-        );
-    }
+    fn source_streams_pin_stream_numbers_transports_and_dispositions_on_the_wire() {
+        use crate::media_kind::{MediaKindLabel, PublishSet};
+        use crate::media_routing::{SourceMute, SourceMuteView};
+        let sources = build_source_streams(&two_party_assignment());
+        assert_eq!(sources.len(), 2, "two audio publishers");
+        assert!(sources
+            .iter()
+            .all(|s| s.stream_number == 0 && s.transport_mode == TransportMode::Datagram as i32));
 
-    /// An empty policy declares no mode — MH installs no egress stream, so
-    /// there is nothing for the echo to disagree with.
-    #[test]
-    fn declared_transport_mode_is_unspecified_for_an_empty_policy() {
+        let handler = HandlerId::new("mh-0");
+        let set =
+            crate::media_routing::MeetingHandlers::new([crate::media_routing::HandlerEndpoint {
+                id: handler.clone(),
+                webtransport_url: "https://mh-0.example:4434".to_string(),
+                grpc_endpoint: "http://mh-0.example:50053".to_string(),
+            }])
+            .unwrap();
+        let mut table = SlotTable::new();
+        let av = PublishSet::of(&[MediaKindLabel::Audio, MediaKindLabel::Video]);
+        let (a, b) = (
+            SenderId::from_nonzero(NonZeroU16::new(1).unwrap()),
+            SenderId::from_nonzero(NonZeroU16::new(2).unwrap()),
+        );
+        table.admit_on_publishing(a, av, &set, &["mh-0"]);
+        table.admit_on_publishing(b, av, &set, &["mh-0"]);
+        // A: audio client-muted (PAUSED), video server-muted (DROP_AT_INGRESS).
+        let mute = SourceMuteView::from_map(std::collections::HashMap::from([
+            (
+                a,
+                SourceMute {
+                    server: [false, true],
+                    client: [true, false],
+                },
+            ),
+            (b, SourceMute::default()),
+        ]));
+        let policy = table
+            .render([&handler], &mute)
+            .unwrap()
+            .for_handler(&handler)
+            .cloned()
+            .unwrap();
+        let got: Vec<(u32, u32, i32, i32)> = build_source_streams(&policy)
+            .iter()
+            .map(|s| {
+                (
+                    s.sender_id,
+                    s.stream_number,
+                    s.transport_mode,
+                    s.disposition,
+                )
+            })
+            .collect();
         assert_eq!(
-            declared_transport_mode(&HandlerAssignment::default()),
-            TransportMode::Unspecified
+            got,
+            vec![
+                (
+                    1,
+                    0,
+                    TransportMode::Datagram as i32,
+                    SourceDisposition::Paused as i32
+                ),
+                (
+                    1,
+                    1,
+                    TransportMode::StreamPerGroup as i32,
+                    SourceDisposition::DropAtIngress as i32
+                ),
+                (
+                    2,
+                    0,
+                    TransportMode::Datagram as i32,
+                    SourceDisposition::Forward as i32
+                ),
+                (
+                    2,
+                    1,
+                    TransportMode::StreamPerGroup as i32,
+                    SourceDisposition::Forward as i32
+                ),
+            ]
         );
     }
 

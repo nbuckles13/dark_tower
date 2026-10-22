@@ -458,7 +458,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Client receive-capability declarations by disposition (ADR-0036 \u00a76). This metric PARTITIONS declarations: every one lands in exactly one bucket. THE SUCCESS SET IS {accepted, accepted_unchanged}, so the complete rejection count is outcome!~\"accepted|accepted_unchanged\". DO NOT USE outcome!=\"accepted\": that counts a success as a rejection, and the success it counts is the one value a client can inflate for free. USE accepted ALONE AS ANY RATIO DENOMINATOR - accepted_unchanged is an identical re-declaration that MC does no work for, so it is client-inflatable at near-zero server cost and a ratio computed over it is an evadable alert. Rejection is always WHOLE-DECLARATION - MC never accepts a prefix, never applies last-write-wins to a duplicate, never clamps an out-of-range id. COLOUR, and read it carefully: GREEN is accepted; DARK GREEN is accepted_unchanged (also a success, but NOT the denominator); RED is the five CLIENT DEFECTS (duplicate_slot_id, slot_count_over_cap, slot_id_out_of_range, pinned_sender_id_zero, pinned_sender_id_out_of_range). YELLOW is media_kind_unspecified, whose likeliest producer is a VERSION-SKEWED client whose AUDIO=0 decodes as unspecified - correlate with a client rollout, not with a forgotten field. ORANGE is declaration_budget_exhausted - a client re-declaring past MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS on one connection; any occurrence is a client bug or an attack (since story 2 an accepted distinct declaration is a meeting-wide structural change, which is why the budget exists). slot_count_over_cap is R-1's loud over-cap rejection: read it beside the Receive Slot Cap stat - a cap below the clients' configured N is a configuration mismatch, not a client bug. (slot_id_not_planned is retired in story 2: declared slots are now the assignment's input.) No meeting identifier, participant id, slot id or sender id appears as a label.",
+      "description": "Client receive-capability declarations by disposition (ADR-0036 \u00a76). This metric PARTITIONS declarations: every one lands in exactly one bucket. THE SUCCESS SET IS {accepted, accepted_unchanged}, so the complete rejection count is outcome!~\"accepted|accepted_unchanged\". DO NOT USE outcome!=\"accepted\": that counts a success as a rejection, and the success it counts is the one value a client can inflate for free. USE accepted ALONE AS ANY RATIO DENOMINATOR - accepted_unchanged is an identical re-declaration that MC does no work for, so it is client-inflatable at near-zero server cost and a ratio computed over it is an evadable alert. Rejection is always WHOLE-DECLARATION - MC never accepts a prefix, never applies last-write-wins to a duplicate, never clamps an out-of-range id. COLOUR, and read it carefully: GREEN is accepted; DARK GREEN is accepted_unchanged (also a success, but NOT the denominator); RED is the six CLIENT DEFECTS (duplicate_slot_id, slot_id_out_of_range, pinned_sender_id_zero, pinned_sender_id_out_of_range, media_kind_unsupported - a VIDEO_SCREEN slot, and would_publish_and_receive_nothing - a redeclaration that would leave a receive-only participant receiving nothing: REFUSED, previous declaration kept, a refusal not a success). YELLOW is media_kind_unspecified, whose likeliest producer is a VERSION-SKEWED client whose AUDIO=0 decodes as unspecified - correlate with a client rollout, not with a forgotten field. ORANGE is declaration_budget_exhausted - a client re-declaring past MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS on one connection; any occurrence is a client bug or an attack (since story 2 an accepted distinct declaration is a meeting-wide structural change, which is why the budget exists). Over-cap is NOT here: since story 3 MC-A each kind is truncated to its own cap and the excess slots read unavailable on Slot States (slot_count_over_cap is retired; there is no truncation counter). A join-carried declaration that fails the parser is ALSO counted on MC Overview's join failures as receive_capability_invalid - two views of one event; alert on the join series only. (slot_id_not_planned is retired in story 2: declared slots are now the assignment's input.) No meeting identifier, participant id, slot id or sender id appears as a label.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -540,7 +540,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "/^(duplicate_slot_id|slot_count_over_cap|slot_id_out_of_range|pinned_sender_id_zero|pinned_sender_id_out_of_range)$/"
+              "options": "/^(duplicate_slot_id|slot_id_out_of_range|pinned_sender_id_zero|pinned_sender_id_out_of_range|media_kind_unsupported|would_publish_and_receive_nothing)$/"
             },
             "properties": [
               {
@@ -766,7 +766,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Slot states MC conveys to subscribers (ADR-0036 \u00a76), one increment per declared slot per StreamAssignments the actor actually SENDS. The bucketed slot-state signal \u00a711 mandates, joined to NO identity: it answers how many and how bad; MC's own assignment state answers WHO. There is no per-slot series and must not be one. The label domain mirrors the wire enum EXHAUSTIVELY (every named SlotState variant, not only the ones reachable today) so it stays comparable with the client's distribution and so an UNSPECIFIED on the wire is visible rather than absent. EMISSIONS ARE CLIENT- AND SERVER-DRIVEN since story 2: the actor re-emits on a PEER's join, leave, declaration or audio-mute change, so the distribution is weighted by meeting churn as well as by any one client - normalise before building a ratio. fewer_sources_than_slots is every declared-but-unfilled slot - a solo participant (loopback removed, R-3), any meeting smaller than N, and every slot of a participant not yet connected to a handler; it is the healthy steady state of a small meeting. source_muted covers client AND server mute (one wire state). source_unreachable stays UNEMITTED under the story-2 edge model: a participant the subscriber shares NO connected handler with is named in unreachable_sender_ids instead (the state is reserved for a PINNED source with no shared handler, which static fill cannot produce) (see Unreachable Senders Named); a non-zero red line here is therefore an MC defect, as is unspecified. zero_requested is gone: the proto reserved it 2026-10-13 as unemittable. The story-3 values avatar_no_video, unavailable, avatar_client_muted and avatar_server_muted are in the domain and arrive with MC-A. withheld_by_congestion arrives with the MH slot-state notification and switch_pending with \u00a77 switching.",
+      "description": "Slot states MC conveys to subscribers (ADR-0036 \u00a76), one increment per declared slot per StreamAssignments the actor actually SENDS. The bucketed slot-state signal \u00a711 mandates, joined to NO identity: it answers how many and how bad; MC's own assignment state answers WHO. There is no per-slot series and must not be one. The label domain mirrors the wire enum EXHAUSTIVELY (every named SlotState variant, not only the ones reachable today) so it stays comparable with the client's distribution and so an UNSPECIFIED on the wire is visible rather than absent. EMISSIONS ARE CLIENT- AND SERVER-DRIVEN since story 2: the actor re-emits on a PEER's join, leave, declaration or mute change (either kind since story 3), so the distribution is weighted by meeting churn as well as by any one client - normalise before building a ratio. fewer_sources_than_slots is every declared-but-unfilled slot - a solo participant (loopback removed, R-3), any meeting smaller than N, and every slot of a participant not yet connected to a handler; it is the healthy steady state of a small meeting. Emitted since story 3 MC-A: active (audio names the sender; live video names none), avatar_no_video (a video slot whose occupant publishes no video - precedence over any mute), avatar_client_muted, avatar_server_muted (server wins), fewer_sources_than_slots, and unavailable (truncated by that kind's cap - the over-cap signal; every video slot when MC_MAX_VIDEO_RECEIVE_SLOTS=0). NOTHING emits source_muted any more (it stays in the domain until MC-B deletes the wire value); a non-zero source_muted is an MC defect or a pre-MC-A image. source_unreachable stays UNEMITTED under the story-2 edge model: a participant the subscriber shares NO connected handler with is named in unreachable_sender_ids instead (the state is reserved for a PINNED source with no shared handler, which static fill cannot produce) (see Unreachable Senders Named); a non-zero red line here is therefore an MC defect, as is unspecified. zero_requested is gone: the proto reserved it 2026-10-13 as unemittable. withheld_by_congestion arrives with the MH slot-state notification and switch_pending with \u00a77 switching.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -832,8 +832,8 @@
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "source_muted"
+              "id": "byRegexp",
+              "options": "/^(source_muted|avatar_no_video|avatar_client_muted|avatar_server_muted)$/"
             },
             "properties": [
               {
@@ -848,7 +848,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "/^fewer_sources_than_slots$/"
+              "options": "/^(fewer_sources_than_slots|unavailable)$/"
             },
             "properties": [
               {
@@ -950,7 +950,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "NO SLOT-OCCUPANCY GAUGE EXISTS, SO THIS IS NOT 'slots used / cap' AND MUST NOT BE READ AS ONE. MC publishes no count of filled receive slots: mc_media_slot_states_total counts slot states CONVEYED (one per declared slot per StreamAssignments sent) and mc_media_receive_slot_cap is a config echo. What this panel shows instead - the honest substitute, not the requested ratio: LEFT AXIS, the share of conveyed slot states that carried a source (active or source_muted) out of all conveyed. Emission-weighted, so a meeting with churn weighs more than a quiet one (see Slot States). A low share is the healthy steady state of meetings with fewer other participants than the declared N (fewer_sources_than_slots - every solo participant included, since loopback is removed, R-3); it is not a fault. RIGHT AXIS, the published cap (mc_media_receive_slot_cap, publishing MC_MAX_RECEIVE_SLOTS from the ClientMediaConfig field every capability parse enforces): the bound every client's declared N is checked against. A cap below the clients' N shows as slot_count_over_cap on Receive Capability Declarations, never here. The pair says whether declared slots are being filled and against which configured bound clients declare; it CANNOT say how close any meeting is to the cap. That reading needs an occupancy gauge that does not exist today. Guarded: the '> 0' on the conveyed total makes a window with no emissions read as no data rather than NaN; empty is healthy when no StreamAssignments were sent. key_custody=operator. No meeting, participant, slot or sender identity is on either series. Per media_kind (story 3): audio today; MC-A adds video, where a reading of 0 confirms the R-26 video-off lever applied - max() without by(media_kind) would hide it.",
+      "description": "NO SLOT-OCCUPANCY GAUGE EXISTS, SO THIS IS NOT 'slots used / cap' AND MUST NOT BE READ AS ONE. MC publishes no count of filled receive slots: mc_media_slot_states_total counts slot states CONVEYED (one per declared slot per StreamAssignments sent) and mc_media_receive_slot_cap is a config echo. What this panel shows instead - the honest substitute, not the requested ratio: LEFT AXIS, the share of conveyed slot states that carried a source (active, avatar_no_video, avatar_client_muted or avatar_server_muted; source_muted stays in the match until MC-B deletes it, though nothing emits it) out of all conveyed. unavailable and fewer_sources_than_slots are NOT filled. Emission-weighted, so a meeting with churn weighs more than a quiet one (see Slot States). A low share is the healthy steady state of meetings with fewer other participants than the declared N (fewer_sources_than_slots - every solo participant included, since loopback is removed, R-3); it is not a fault. RIGHT AXIS, the published per-kind caps (mc_media_receive_slot_cap, publishing MC_MAX_AUDIO_RECEIVE_SLOTS / MC_MAX_VIDEO_RECEIVE_SLOTS from the ClientMediaConfig field every declaration is truncated against): the bound each kind's declared N is truncated to. A cap below the clients' N shows as unavailable on Slot States (excess slots are truncated, never rejected), and lowers the filled share here. The pair says whether declared slots are being filled and against which configured bound clients declare; it CANNOT say how close any meeting is to the cap. That reading needs an occupancy gauge that does not exist today. Guarded: the '> 0' on the conveyed total makes a window with no emissions read as no data rather than NaN; empty is healthy when no StreamAssignments were sent. key_custody=operator. No meeting, participant, slot or sender identity is on either series. Caps per media_kind (story 3): both kinds are published; a video reading of 0 confirms the R-26 video-off lever applied - max() without by(media_kind) would hide it.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1050,7 +1050,7 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum(rate(mc_media_slot_states_total{slot_state=~\"active|source_muted\"}[$__rate_interval]))\n/\nsum(rate(mc_media_slot_states_total[$__rate_interval]))\nand\nsum(rate(mc_media_slot_states_total[$__rate_interval])) > 0",
+          "expr": "sum(rate(mc_media_slot_states_total{slot_state=~\"active|avatar_no_video|avatar_client_muted|avatar_server_muted|source_muted\"}[$__rate_interval]))\n/\nsum(rate(mc_media_slot_states_total[$__rate_interval]))\nand\nsum(rate(mc_media_slot_states_total[$__rate_interval])) > 0",
           "legendFormat": "filled share of conveyed slots",
           "range": true,
           "refId": "A"
@@ -1062,7 +1062,7 @@
           },
           "editorMode": "code",
           "expr": "max by (media_kind) (mc_media_receive_slot_cap)",
-          "legendFormat": "slot cap (MC_MAX_RECEIVE_SLOTS) {{media_kind}}",
+          "legendFormat": "slot cap {{media_kind}}",
           "range": true,
           "refId": "B"
         }
@@ -1075,7 +1075,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Client MuteRequest dispositions (ADR-0036 §5). COUNTING UNIT (story 3): one increment per (request, named kind) - in the interim before MC-B every request names BOTH kinds (P1 shim), so rates roughly doubled at that change; a counting-unit change, not traffic. It PARTITIONS (report, kind) pairs. A camera button lands on media_kind=\"video\" applied_no_recompose; applied never occurs for video. Summed over media_kind here. THE SUCCESS SET IS {applied, applied_no_recompose} - the failure predicate is outcome=~\"rate_limited|actor_unavailable\", NOT outcome!=\"applied\", which would count two routine states as failures. GREEN applied: the audio flag moved on a declared connection and the meeting actor re-emits the changed slot view to the subscribers HOLDING this source; a failed re-emit is counted by the actor on Send Directives and on Slot View Emissions outcome=composition_failed. DARK GREEN applied_no_recompose: reported, with nothing to re-convey - either no receive capability has been declared yet, or ONLY video_muted changed, and the slot view reads only audio mute, so no subscriber's view changes. Expect applied_no_recompose to be the largest bucket once clients wire camera buttons; it is what an ordinary camera toggle produces. BLUE unchanged: THIS KIND's state did not move - either the whole-request identical repeat (no actor hop) or the unmoved kind of an applied request (a camera toggle is unchanged on audio) - not a failure. USE applied + applied_no_recompose AS ANY RATIO DENOMINATOR, NOT unchanged: the no-op short-circuit runs before any actor hop, roster read or recomposition, so unchanged is client-inflatable at line rate for a tuple compare, and a fraction-applied ratio computed over it is a number one participant can drive to zero. unchanged is exempt from the limiter on purpose - reversing that ordering would let a client spamming a steady state drain its own bucket on no-ops and suppress its next genuine toggle. ORANGE rate_limited is the visible edge of the mute-work token bucket (per connection; burst MUTE_WORK_BURST, one token refilled per MUTE_WORK_REFILL_INTERVAL_MS - both in crates/mc-service/src/webtransport/connection.rs, cited rather than restated). Client mute is the only repeatable client-driven path that puts work on the SHARED meeting actor's mailbox - one actor hop plus a re-emit to the source's holders, which the actor bounds per meeting per turn (Slot View Emissions outcome=deferred). This is NOT a meeting-wide contention signal; do not route a meeting-wide latency investigation to this panel. A HUMAN NEVER REACHES THIS LIMITER, so a sustained non-zero rate means one connection is toggling far above human rates - a client-side repeat loop first, an abusive peer second - and it is bounded to that connection either way. It is a rate limit and NOT a budget on purpose: a budget would permanently freeze that participant's audio_self_muted once spent, leaving every other client rendering a live speaker as muted for the rest of the session. Dropping a report is safe because §5 enforces client mute at CAPTURE on the client, so the audio genuinely stops and only the indicator is stale. RED actor_unavailable is environmental and terminal. No meeting identifier, participant id, slot id or sender id appears as a label.",
+      "description": "Client MuteRequest dispositions (ADR-0036 §5). COUNTING UNIT (story 3): one increment per (request, named kind) - in the interim before MC-B every request names BOTH kinds (P1 shim), so rates roughly doubled at that change; a counting-unit change, not traffic. It PARTITIONS (report, kind) pairs. Since story 3 MC-A a moved flag of EITHER kind is applied (the actor re-renders the stream's PAUSED disposition and re-emits), so a camera button lands on media_kind=\"video\" applied; applied_no_recompose is unreachable (kept, zero-initialised, until MC-B) - a non-zero value is an MC defect or a pre-MC-A image. Summed over media_kind here. THE SUCCESS SET IS {applied, applied_no_recompose} - the failure predicate is outcome=~\"rate_limited|actor_unavailable\", NOT outcome!=\"applied\", which would count two routine states as failures. GREEN applied: this kind's flag moved and the meeting actor re-emits the changed slot view to the subscribers HOLDING this source; a failed re-emit is counted by the actor on Send Directives and on Slot View Emissions outcome=composition_failed. DARK GREEN applied_no_recompose: unreachable since MC-A (it meant reported with nothing to re-convey - a flag moved before any declaration, or any video toggle before MC-A). BLUE unchanged: THIS KIND's state did not move - either the whole-request identical repeat (no actor hop) or the unmoved kind of an applied request (a camera toggle is unchanged on audio) - not a failure. USE applied + applied_no_recompose AS ANY RATIO DENOMINATOR, NOT unchanged: the no-op short-circuit runs before any actor hop, roster read or recomposition, so unchanged is client-inflatable at line rate for a tuple compare, and a fraction-applied ratio computed over it is a number one participant can drive to zero. unchanged is exempt from the limiter on purpose - reversing that ordering would let a client spamming a steady state drain its own bucket on no-ops and suppress its next genuine toggle. ORANGE rate_limited is the visible edge of the mute-work token bucket (per connection; burst MUTE_WORK_BURST, one token refilled per MUTE_WORK_REFILL_INTERVAL_MS - both in crates/mc-service/src/webtransport/connection.rs, cited rather than restated). Client mute is the only repeatable client-driven path that puts work on the SHARED meeting actor's mailbox - one actor hop plus a re-emit to the source's holders, which the actor bounds per meeting per turn (Slot View Emissions outcome=deferred). This is NOT a meeting-wide contention signal; do not route a meeting-wide latency investigation to this panel. A HUMAN NEVER REACHES THIS LIMITER, so a sustained non-zero rate means one connection is toggling far above human rates - a client-side repeat loop first, an abusive peer second - and it is bounded to that connection either way. It is a rate limit and NOT a budget on purpose: a budget would permanently freeze that participant's audio_self_muted once spent, leaving every other client rendering a live speaker as muted for the rest of the session. Dropping a report is safe because §5 enforces client mute at CAPTURE on the client, so the audio genuinely stops and only the indicator is stale. RED actor_unavailable is environmental and terminal. No meeting identifier, participant id, slot id or sender id appears as a label.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1430,7 +1430,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "How many (participant, kind) sources MC believes are SERVER-muted right now, per media_kind, summed across each MC instance's meetings (one series per instance and kind; a participant muted on both kinds is 1 on each). Today ONLY media_kind=\"audio\" is comparable with MH's server_muted drops (MC tells MH only audio-muted senders; a video-only server mute drops nothing at MH); it becomes the sum across kinds when MC-A adds per-stream DROP_AT_INGRESS for video - a STATE level, not an event rate: a mute applied yesterday is still here while Server Mute Requests stays flat. Present at zero from process start. Recomputed from live state on the controller's health walk, so it cannot drift after an actor dies. Read it against MH's server_muted drops at FLEET level only (sum across MC pods vs sum of mh_media_frames_dropped_total{reason=\"server_muted\"} rate across MH pods) and DIRECTIONALLY - never divided, never per instance (MC and MH meeting sets do not nest). Gauge > 0 with a flat fleet drop rate is only a candidate disagreement: a muted participant who is silent, disconnected or in grace drops nothing. It does not answer whether ONE meeting has a mute in force.",
+      "description": "How many (participant, kind) sources MC believes are SERVER-muted right now, per media_kind, summed across each MC instance's meetings (one series per instance and kind; a participant muted on both kinds is 1 on each). Since story 3 MC-A each kind's server mute reaches MH as that stream's DROP_AT_INGRESS disposition, so the SUM ACROSS KINDS is comparable with MH's server_muted drops - a STATE level, not an event rate: a mute applied yesterday is still here while Server Mute Requests stays flat. Present at zero from process start. Recomputed from live state on the controller's health walk, so it cannot drift after an actor dies. Read it against MH's server_muted drops at FLEET level only (sum across MC pods vs sum of mh_media_frames_dropped_total{reason=\"server_muted\"} rate across MH pods) and DIRECTIONALLY - never divided, never per instance (MC and MH meeting sets do not nest). Gauge > 0 with a flat fleet drop rate is only a candidate disagreement: a muted participant who is silent, disconnected, in grace, or does not publish the muted kind drops nothing. It does not answer whether ONE meeting has a mute in force.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2050,7 +2050,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "The configured MC_MAX_RECEIVE_SLOTS, published from the SAME ClientMediaConfig field every connection's capability parse enforces. A CONFIG ECHO, NOT A UTILISATION GAUGE - there is no numerator; do not build a 'slots used / cap' ratio. Receive Slot Fill vs Cap reads the nearest honest substitute beside it. Read beside Receive Capability Declarations: a rising slot_count_over_cap with a cap below the clients' configured N is a configuration mismatch (R-1), not a client bug. Per media_kind (story 3): audio today; MC-A adds video, where a reading of 0 confirms the R-26 video-off lever applied - max() without by(media_kind) would hide it.",
+      "description": "The configured per-kind caps MC_MAX_AUDIO_RECEIVE_SLOTS (audio) and MC_MAX_VIDEO_RECEIVE_SLOTS (video), published at boot from the SAME ClientMediaConfig field every declaration is truncated against and JoinResponse tags 13/14 carry. Read once at startup: a change applies after the MC restart, and live slot vectors are never re-truncated. A CONFIG ECHO, NOT A UTILISATION GAUGE - there is no numerator; do not build a 'slots used / cap' ratio. Receive Slot Fill vs Cap reads the nearest honest substitute beside it. Read beside Slot States: a rising unavailable with a cap below the clients' configured N is a configuration mismatch (R-1: excess slots truncated, never rejected), not a client bug. Per media_kind: a video reading of 0 confirms the R-26 video-off lever applied - max() without by(media_kind) would hide it.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2109,12 +2109,168 @@
       "type": "stat"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Stream WITHDRAWALS (story 3 R-8): a DELIVERED SendDirective whose stream of this kind went from non-empty to EMPTY targets, by media_kind and reason. reason=unwatched (nobody holds the stream in a slot any more; emitted since MC-A) and reason=server_muted (zero-initialised; emitted from MC-B). Counted per TRANSITION, never per re-render, and not on a reconnect's fresh view. Counted on DELIVERY, unlike Send Directives (composition): a withdrawal whose delivery failed is visible only on Slot View Emissions outcome=delivery_failed. A WITHDRAWAL IS NOT MEDIA FAILURE - nobody watching a camera is routine; read it beside Send Directives outcome=emitted_empty_targets. key_custody=operator. No meeting, participant, sender, slot or stream identity appears as a label. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero \u2014 it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 74
+      },
+      "id": 188,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (media_kind, reason) (rate(mc_media_send_directive_withdrawals_total[$__rate_interval]))",
+          "legendFormat": "{{media_kind}} {{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Send Directive Withdrawals by Kind and Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The minimum keyframe interval MC directs on every video stream: MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS / 1000 (story 3 R-23; MC's own ConfigMap mc-service-config, bounds 100..=10000 ms, default 500). A CONFIG ECHO set once at boot from the SAME validated value the video directive carries as min_keyframe_interval_ms, so published and directed values cannot drift. Configuration, NOT GoP or frame timing - the keyframe-storm alert reads it as a server-side bound, never a client-reported value. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      },
+      "id": 189,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_media_video_keyframe_min_interval_seconds)",
+          "instant": true,
+          "legendFormat": "min keyframe interval",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Directed Video Minimum Keyframe Interval",
+      "type": "stat"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 74
+        "y": 82
       },
       "id": 163,
       "panels": [],
@@ -2241,7 +2397,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 75
+        "y": 83
       },
       "id": 164,
       "options": {
@@ -2365,7 +2521,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 75
+        "y": 83
       },
       "id": 165,
       "options": {
@@ -2458,7 +2614,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 83
+        "y": 91
       },
       "id": 166,
       "options": {
@@ -2551,7 +2707,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 83
+        "y": 91
       },
       "id": 167,
       "options": {
@@ -2675,7 +2831,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 91
+        "y": 99
       },
       "id": 168,
       "options": {
@@ -2768,7 +2924,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 91
+        "y": 99
       },
       "id": 169,
       "options": {
@@ -2831,7 +2987,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 99
+        "y": 107
       },
       "id": 170,
       "options": {
@@ -2871,7 +3027,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 103
+        "y": 111
       },
       "id": 171,
       "panels": [],
@@ -2937,7 +3093,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 104
+        "y": 112
       },
       "id": 172,
       "options": {
@@ -3052,7 +3208,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 104
+        "y": 112
       },
       "id": 173,
       "options": {
@@ -3145,7 +3301,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 112
+        "y": 120
       },
       "id": 174,
       "options": {
@@ -3260,7 +3416,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 112
+        "y": 120
       },
       "id": 175,
       "options": {
@@ -3364,7 +3520,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 120
+        "y": 128
       },
       "id": 176,
       "options": {
@@ -3427,7 +3583,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 120
+        "y": 128
       },
       "id": 177,
       "options": {

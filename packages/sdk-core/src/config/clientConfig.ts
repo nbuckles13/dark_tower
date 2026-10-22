@@ -282,11 +282,6 @@ export interface ReceiverStateConfig {
  * forbids it). Story 2's whole-declaration rejection and its client counter
  * are retired.
  *
- * TRANSITION (until MC-A, story 3 task 12): the controller in service before
- * MC-A still caps the TOTAL N+M at the retired `MC_MAX_RECEIVE_SLOTS` and
- * rejects an over-cap declaration whole
- * (`mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}`).
- *
  * THE DEFAULTS ARE THE SDK's FALLBACK for an embedder that configures nothing,
  * NOT the demo topology: `scripts/dev-web.sh` always exports
  * `VITE_DT_AUDIO_RECEIVE_SLOTS` / `VITE_DT_VIDEO_RECEIVE_SLOTS`, which the web app

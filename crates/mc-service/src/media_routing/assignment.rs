@@ -13,6 +13,7 @@
 //! meeting and a split meeting run the same fill and the same render.
 
 use crate::media_admission::SenderId;
+use crate::media_kind::MediaKindLabel;
 use media_protocol::frame::KEY_ID_STREAM_BITS;
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,6 +73,58 @@ pub const AUDIO_PRIORITY_GROUP: u32 = 1;
 /// the id-packing ordinal width are two different 8s that must not be collapsed.
 pub const MAIN_AUDIO_STREAM_NUMBER: u8 = 0;
 
+/// The publisher-side stream number for a participant's main (camera) video.
+///
+/// A CONTRACT constant, not config, exactly as [`MAIN_AUDIO_STREAM_NUMBER`]:
+/// MC's send id IS the uplink relay `stream_id` the publisher stamps, and MH
+/// attributes every ingress frame by (connection-bound sender, that id)
+/// against `source_streams` (story 3 R-20). The pre-story SDK stamps 0 in
+/// practice, which is why audio must stay 0 and video takes 1. Pinned in the
+/// directive AND `source_streams` tests.
+pub const MAIN_VIDEO_STREAM_NUMBER: u8 = 1;
+
+/// MC-assigned forwarding priority for the main video egress stream
+/// (ADR-0036 §7; story 3 R-20). A LOWER number is a HIGHER priority, so video
+/// ranks below audio ([`AUDIO_PRIORITY_GROUP`]) and MH stays type-blind: it
+/// learns the order, never the kind. A compile-time constant for the same
+/// reason as [`AUDIO_PRIORITY_GROUP`].
+pub const VIDEO_PRIORITY_GROUP: u32 = 2;
+
+// Video ranks BELOW audio: a lower number is a higher priority. A build
+// failure, not a test, if the two are ever reordered.
+const _: () = assert!(AUDIO_PRIORITY_GROUP < VIDEO_PRIORITY_GROUP);
+
+/// The stream number MC directs and declares for a kind. The ONE kind ->
+/// stream mapping; an edge's stream derives from its SLOT's kind through here,
+/// never from a candidate's publish set.
+#[must_use]
+pub const fn stream_number_of(kind: MediaKindLabel) -> u8 {
+    match kind {
+        MediaKindLabel::Audio => MAIN_AUDIO_STREAM_NUMBER,
+        MediaKindLabel::Video => MAIN_VIDEO_STREAM_NUMBER,
+    }
+}
+
+/// The transport a kind's stream travels on (ADR-0036 §1): audio on
+/// datagrams, video stream-per-group. The ONE kind -> transport mapping, read
+/// by both the `source_streams` declaration and the send directive's targets.
+#[must_use]
+pub const fn transport_of(kind: MediaKindLabel) -> TransportMode {
+    match kind {
+        MediaKindLabel::Audio => TransportMode::Datagram,
+        MediaKindLabel::Video => TransportMode::StreamPerGroup,
+    }
+}
+
+/// The forwarding priority group for a kind's stream.
+#[must_use]
+pub const fn priority_group_of(kind: MediaKindLabel) -> u32 {
+    match kind {
+        MediaKindLabel::Audio => AUDIO_PRIORITY_GROUP,
+        MediaKindLabel::Video => VIDEO_PRIORITY_GROUP,
+    }
+}
+
 /// A media handler's identity, as MC knows it from the Redis assignment
 /// snapshot (`MhEndpointInfo::mh_id`).
 ///
@@ -127,18 +180,83 @@ pub struct EgressStreamPlan {
     /// repeated and story 5's MH-side §7 selection returns multi-candidate
     /// streams; a scalar here would have to be widened back then.
     pub candidate_sources: Vec<SenderId>,
-    /// Which of each candidate's streams. Always [`MAIN_AUDIO_STREAM_NUMBER`]
-    /// in this story.
+    /// Which of each candidate's streams: [`stream_number_of`] the SLOT's
+    /// kind.
     pub stream_number: u8,
-    /// MC-assigned forwarding priority ([`AUDIO_PRIORITY_GROUP`]).
+    /// MC-assigned forwarding priority ([`priority_group_of`] the slot's kind).
     pub priority_group: u32,
     /// Whether a superseding frame permits discarding queued frames.
     ///
-    /// **False for audio.** "Every audio frame forwards" is a consequence of
-    /// this flag; MH never learns the stream is audio.
+    /// **False for audio** ("every audio frame forwards"), **true for video**
+    /// (a new group supersedes a stale one). MH never learns which is which.
     pub supersede_on_independent_frame: bool,
-    /// How MH carries this stream to its subscriber.
-    pub transport_mode: TransportMode,
+}
+
+/// One stream a publisher may send to a handler, as MC declares it
+/// (`internal.v1.SourceStream`; story 3 R-16, R-17, R-20).
+///
+/// Ordered by (sender, stream) so a handler's set is canonical and structural
+/// equality — what the policy generation derives from — is well-defined. A
+/// set, so a duplicate (sender, stream), which MH hard-rejects, is
+/// unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourceStreamPlan {
+    /// The publisher.
+    pub sender: SenderId,
+    /// Its stream: MC's send id and the uplink relay id.
+    pub stream_number: u8,
+    /// The transport the stream arrives on and its edges leave on
+    /// ([`transport_of`] its kind).
+    pub transport_mode: TransportModeOrd,
+    /// What MH does with it.
+    pub disposition: SourceDispositionPlan,
+}
+
+/// [`TransportMode`] with an ordering, so [`SourceStreamPlan`] can live in a
+/// `BTreeSet`. The proto enum derives no `Ord`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TransportModeOrd(i32);
+
+impl TransportModeOrd {
+    /// Wrap a proto transport mode.
+    #[must_use]
+    pub fn new(mode: TransportMode) -> Self {
+        Self(mode as i32)
+    }
+
+    /// The proto value (an unknown i32 reads as `Unspecified`).
+    #[must_use]
+    pub fn mode(self) -> TransportMode {
+        TransportMode::try_from(self.0).unwrap_or(TransportMode::Unspecified)
+    }
+}
+
+/// What MH does with one declared source stream (`internal.v1.SourceDisposition`).
+///
+/// Behaviour names: MH learns neither the kind nor the moderation fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SourceDispositionPlan {
+    /// Forward along the stream's edges.
+    Forward,
+    /// Client-muted: forward nothing new, never drop at ingress (R-17).
+    Paused,
+    /// Server-muted: drop at ingress (R-16). Wins over client mute.
+    DropAtIngress,
+}
+
+impl SourceDispositionPlan {
+    /// The disposition for a stream whose kind is server- and/or client-muted.
+    /// Server wins: a server-muted stream is dropped whatever the client says.
+    #[must_use]
+    pub fn from_mute(server_muted: bool, client_muted: bool) -> Self {
+        if server_muted {
+            Self::DropAtIngress
+        } else if client_muted {
+            Self::Paused
+        } else {
+            Self::Forward
+        }
+    }
 }
 
 /// One handler's complete forwarding policy for one meeting.
@@ -193,12 +311,21 @@ pub struct HandlerAssignment {
     ///
     /// # Server mute ONLY — never self-mute
     ///
-    /// Deliberately NOT built from `SourceMuteView` / `RosterEntry.audio_muted`,
-    /// which answer `self || server` for the one wire `SOURCE_MUTED` slot
-    /// state. A self-muted participant in MH's ingress-drop set would be muted
-    /// by the server in a way they could never lift by unmuting — and their
-    /// capture is already stopped on the client anyway (ADR-0036 §5).
+    /// Deliberately NEVER built from client-mute flags. A self-muted
+    /// participant in MH's ingress-drop set would be muted by the server in a
+    /// way they could never lift by unmuting — and their capture is already
+    /// stopped on the client anyway (ADR-0036 §5). Client mute reaches MH only
+    /// as a PAUSED disposition in [`Self::source_streams`]. SUPERSEDED by
+    /// `source_streams`; MC-B deletes this field.
     pub server_muted_sources: BTreeSet<SenderId>,
+    /// Every (sender, stream) in EVERY member's publish set, with its
+    /// transport and disposition (`RegisterMeetingRequest.source_streams`;
+    /// story 3). A superset of every directed stream, so nothing MC directs is
+    /// ever unmatched at MH; and a participant that did not declare video has
+    /// NO stream-1 entry, so its stream-1 frames are `unmatched_stream` at MH —
+    /// what makes the publish set "fixed for the membership" a real control.
+    /// See [`super::slots::SlotTable::render`], the one place it is built.
+    pub source_streams: BTreeSet<SourceStreamPlan>,
 }
 
 /// The meeting's forwarding assignment, split per handler.
@@ -223,9 +350,10 @@ impl MeetingAssignment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignmentError {
     /// A subscriber's egress ordinal exceeded the 8 bits [`egress_stream_id`]
-    /// allots it. Unreachable from real input while `MC_MAX_RECEIVE_SLOTS` is
-    /// bounded at 64 (config load rejects more), but the ordinal is
-    /// client-sized, so it rejects rather than truncates.
+    /// allots it. Unreachable from real input while each per-kind cap
+    /// (`MC_MAX_AUDIO_RECEIVE_SLOTS`, `MC_MAX_VIDEO_RECEIVE_SLOTS`) is bounded at
+    /// 64 (config load rejects more) and truncation keeps at most the cap, but
+    /// it rejects rather than truncates.
     EgressOrdinalOverflow,
 }
 
@@ -251,45 +379,61 @@ impl AssignmentError {
     }
 }
 
-/// Pack a subscriber's egress ordinal into a policy-plane stream identity.
+/// Bit position of the slot KIND in [`egress_stream_id`] (story 3).
+const EGRESS_KIND_SHIFT: u32 = 24;
+/// Bit position of the subscriber's sender id in [`egress_stream_id`].
+const EGRESS_SENDER_SHIFT: u32 = 8;
+
+/// Pack a subscriber's (kind, egress ordinal) into a policy-plane stream
+/// identity.
 ///
-/// Unique **by construction**:
-/// `sender_id` is unique per participant within a meeting and is never
-/// recycled (R-35), and the ordinal is the slot's index in that subscriber's
-/// slot vector (never an enumeration over FILLED slots), so the pair is unique
-/// per meeting and stable across a middle leave or a refill. It is also stable across a client slot renumber, which
-/// is precisely why `internal.proto` keeps `egress_stream_id` distinct from
-/// `subscriber.slot_id`.
+/// # Layout
+///
+/// | bits | field |
+/// |---|---|
+/// | 0-7 | the slot's ordinal in the subscriber's slot vector OF THAT KIND |
+/// | 8-23 | the subscriber's `sender_id` (16 bits) |
+/// | 24 | the slot kind: 0 audio, 1 video |
+///
+/// Audio ids are byte-identical to story 2's (kind bit 0), so a meeting with
+/// no video renders exactly as before. Unique **by construction** — injective
+/// over (subscriber, kind, ordinal): `sender_id` is unique per participant and
+/// never recycled (R-35), the ordinal is the slot's index in that subscriber's
+/// per-kind vector (never an enumeration over FILLED slots), and the kind bit
+/// keeps one subscriber's audio and video edges apart. Stable across a middle
+/// leave, a refill, an edge moving between handlers, and a client slot
+/// renumber — which is why `internal.proto` keeps `egress_stream_id` distinct
+/// from `subscriber.slot_id`.
 ///
 /// # The two adjacent 8s, named so they are not collapsed
 ///
-/// This function's ordinal width is **8 bits, and it is an independent
-/// policy-plane choice.** It merely *coincides* with
-/// `media_protocol::frame::KEY_ID_STREAM_BITS`, and is deliberately NOT derived
-/// from it: deriving would couple MC's policy-plane id packing to the SFrame
-/// wire layout, so a future key-id reallocation would silently renumber every
-/// egress stream identity.
-///
-/// The **other** 8 in this module — the bound on
-/// [`MAIN_AUDIO_STREAM_NUMBER`] — genuinely IS
-/// `KEY_ID_STREAM_BITS`: `stream_number` rides in the signed key id's stream
-/// field, and a value above it would alias two of one sender's streams. That
-/// one is anchored; this one is not. Same number, different reasons, opposite
-/// drift obligations.
+/// The ordinal width is **8 bits, an independent policy-plane choice.** It
+/// merely *coincides* with `media_protocol::frame::KEY_ID_STREAM_BITS` and is
+/// deliberately NOT derived from it. The **other** 8 in this module — the bound
+/// on [`MAIN_AUDIO_STREAM_NUMBER`] — genuinely IS `KEY_ID_STREAM_BITS`. Same
+/// number, different reasons, opposite drift obligations.
 pub(crate) fn egress_stream_id(
     subscriber: SenderId,
+    kind: MediaKindLabel,
     ordinal: usize,
 ) -> Result<u32, AssignmentError> {
     let ordinal = u8::try_from(ordinal).map_err(|_| AssignmentError::EgressOrdinalOverflow)?;
-    Ok((u32::from(subscriber.get().get()) << 8) | u32::from(ordinal))
+    let kind_bit = u32::from(kind == MediaKindLabel::Video);
+    Ok((kind_bit << EGRESS_KIND_SHIFT)
+        | (u32::from(subscriber.get().get()) << EGRESS_SENDER_SHIFT)
+        | u32::from(ordinal))
 }
 
-/// The inverse of [`egress_stream_id`]'s ordinal half. Kept beside the packer
-/// so pack and unpack are read and changed together; only the slot-table
-/// model check unpacks today.
+/// The inverse of [`egress_stream_id`]'s (kind, ordinal) half. Kept beside the
+/// packer so pack and unpack are read and changed together.
 #[cfg(test)]
-pub(crate) fn egress_ordinal(egress_stream_id: u32) -> usize {
-    usize::from(egress_stream_id.to_le_bytes()[0])
+pub(crate) fn egress_kind_and_ordinal(egress_stream_id: u32) -> (MediaKindLabel, usize) {
+    let kind = if (egress_stream_id >> EGRESS_KIND_SHIFT) & 1 == 1 {
+        MediaKindLabel::Video
+    } else {
+        MediaKindLabel::Audio
+    };
+    (kind, usize::from(egress_stream_id.to_le_bytes()[0]))
 }
 
 #[cfg(test)]
@@ -302,19 +446,62 @@ mod tests {
         SenderId::from_nonzero(NonZeroU16::new(n).unwrap())
     }
 
+    const A: MediaKindLabel = MediaKindLabel::Audio;
+    const V: MediaKindLabel = MediaKindLabel::Video;
+
     #[test]
-    fn egress_stream_id_packs_sender_and_ordinal_without_collision() {
-        assert_eq!(egress_stream_id(sender(1), 0).unwrap(), 0x0000_0100);
-        assert_eq!(egress_stream_id(sender(1), 1).unwrap(), 0x0000_0101);
-        assert_eq!(egress_stream_id(sender(2), 0).unwrap(), 0x0000_0200);
+    fn egress_stream_id_packs_sender_kind_and_ordinal_without_collision() {
+        // Audio is byte-identical to story 2's layout.
+        assert_eq!(egress_stream_id(sender(1), A, 0).unwrap(), 0x0000_0100);
+        assert_eq!(egress_stream_id(sender(1), A, 1).unwrap(), 0x0000_0101);
+        assert_eq!(egress_stream_id(sender(2), A, 0).unwrap(), 0x0000_0200);
+        assert_eq!(egress_stream_id(sender(1), V, 0).unwrap(), 0x0100_0100);
         assert_eq!(
-            egress_stream_id(sender(u16::MAX), 255).unwrap(),
-            0x00FF_FFFF
+            egress_stream_id(sender(u16::MAX), V, 255).unwrap(),
+            0x01FF_FFFF
         );
-        for ordinal in [0usize, 1, 255] {
-            let id = egress_stream_id(sender(7), ordinal).unwrap();
-            assert_eq!(egress_ordinal(id), ordinal);
+        for kind in MediaKindLabel::ALL {
+            for ordinal in [0usize, 1, 255] {
+                let id = egress_stream_id(sender(7), kind, ordinal).unwrap();
+                assert_eq!(egress_kind_and_ordinal(id), (kind, ordinal));
+            }
         }
+    }
+
+    /// Injective over (subscriber, kind, ordinal): one subscriber's audio and
+    /// video edges never collide, nor two subscribers'.
+    #[test]
+    fn egress_stream_id_is_free_of_cross_kind_and_cross_subscriber_collisions() {
+        let mut seen = std::collections::HashSet::new();
+        for s in [1u16, 2, 255, 256, 257, u16::MAX] {
+            for kind in MediaKindLabel::ALL {
+                for ordinal in 0..=64usize {
+                    assert!(
+                        seen.insert(egress_stream_id(sender(s), kind, ordinal).unwrap()),
+                        "collision at ({s}, {kind:?}, {ordinal})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stream_numbers_are_pinned_audio_zero_video_one() {
+        assert_eq!(MAIN_AUDIO_STREAM_NUMBER, 0);
+        assert_eq!(MAIN_VIDEO_STREAM_NUMBER, 1);
+        assert_eq!(stream_number_of(A), 0);
+        assert_eq!(stream_number_of(V), 1);
+        assert_eq!(transport_of(A), TransportMode::Datagram);
+        assert_eq!(transport_of(V), TransportMode::StreamPerGroup);
+    }
+
+    #[test]
+    fn server_mute_wins_over_client_mute_in_the_disposition() {
+        use SourceDispositionPlan::*;
+        assert_eq!(SourceDispositionPlan::from_mute(false, false), Forward);
+        assert_eq!(SourceDispositionPlan::from_mute(false, true), Paused);
+        assert_eq!(SourceDispositionPlan::from_mute(true, false), DropAtIngress);
+        assert_eq!(SourceDispositionPlan::from_mute(true, true), DropAtIngress);
     }
 
     /// The 256-ordinal boundary. Unreachable from a real declaration (the
@@ -323,7 +510,7 @@ mod tests {
     #[test]
     fn egress_ordinal_above_eight_bits_rejects_rather_than_truncating() {
         assert_eq!(
-            egress_stream_id(sender(1), 256),
+            egress_stream_id(sender(1), A, 256),
             Err(AssignmentError::EgressOrdinalOverflow),
         );
     }

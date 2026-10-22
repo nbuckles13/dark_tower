@@ -23,6 +23,12 @@
 //! checks run over the SAME fetch in which the audio rise is re-proven, so a
 //! wrong selector cannot hand them an empty set. They report under their own
 //! token, distinct from the did-not-rise failure.
+//!
+//! # Edge sum (README per-file edge-sum header rule)
+//!
+//! One fn: 2 participants x 1 audio slot.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 2
 
 #![cfg(all(feature = "flows", feature = "observability"))]
 
@@ -41,6 +47,7 @@ use env_tests::fixtures::participant::{
 };
 use env_tests::fixtures::AuthClient;
 
+use env_tests::fixtures::participant::AUDIO;
 /// Margin over MC's settle window (one shared home).
 use env_tests::fixtures::participant::VIEW_MARGIN;
 /// Failure-only ceiling for a counter rise (scrape + ingestion).
@@ -95,13 +102,13 @@ async fn test_mc_slot_states_and_send_targets_carry_media_kind_audio_after_a_joi
     let ids: Vec<u32> = ps.iter().map(participant::Participant::sender_id).collect();
     let _sessions = open_sessions("MEDIA-KIND", &ps, &[&x, &y]).await;
     for p in &mut ps {
-        p.declare(&[1]).await;
+        p.declare(&[1], &[]).await;
     }
     let bound = window + VIEW_MARGIN;
     for (i, p) in ps.iter_mut().enumerate() {
         let other = ids[1 - i];
         p.converge("MEDIA-KIND", bound, move |v, d| {
-            v.is_some_and(|v| filled_senders(v) == vec![other])
+            v.is_some_and(|v| filled_senders(v, AUDIO) == vec![other])
                 && d.is_some_and(|d| !targets_of(d).is_empty())
         })
         .await;

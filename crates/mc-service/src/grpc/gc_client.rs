@@ -832,7 +832,7 @@ mod tests {
             otel_endpoint: String::new(),
             otel_sample_rate: 1.0,
             environment: "development".to_string(),
-            max_receive_slots: 8,
+            max_receive_slots: [8, 4],
             media_connect_settle_ms: 1500,
             kek_rotation_debounce_seconds: 60,
             max_receive_capability_declarations: 64,
@@ -842,6 +842,15 @@ mod tests {
                 50,
             )
             .expect("fixture audio encoding is in band"),
+            video_encoding: crate::media_signaling::VideoEncoding::new(
+                proto_gen::dark_tower::signaling::v1::Codec::Vp8,
+                640,
+                360,
+                30,
+                800_000,
+                500,
+            )
+            .expect("fixture video encoding is in band"),
         };
 
         let token_rx = mc_test_utils::test_token_receiver();
@@ -891,7 +900,7 @@ mod tests {
             otel_endpoint: String::new(),
             otel_sample_rate: 1.0,
             environment: "development".to_string(),
-            max_receive_slots: 8,
+            max_receive_slots: [8, 4],
             media_connect_settle_ms: 1500,
             kek_rotation_debounce_seconds: 60,
             max_receive_capability_declarations: 64,
@@ -901,6 +910,15 @@ mod tests {
                 50,
             )
             .expect("fixture audio encoding is in band"),
+            video_encoding: crate::media_signaling::VideoEncoding::new(
+                proto_gen::dark_tower::signaling::v1::Codec::Vp8,
+                640,
+                360,
+                30,
+                800_000,
+                500,
+            )
+            .expect("fixture video encoding is in band"),
         };
 
         let token_rx = mc_test_utils::test_token_receiver();

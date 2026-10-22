@@ -31,6 +31,7 @@ use proto_gen::dark_tower::internal::v1::media_handler_service_server::{
 };
 use proto_gen::dark_tower::internal::v1::{
     EndMeetingRequest, EndMeetingResponse, RegisterMeetingRequest, RegisterMeetingResponse,
+    SourceStreamEcho,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use std::collections::HashMap;
@@ -133,6 +134,10 @@ pub struct MediaHandlerStub {
     /// Per meeting, the transport mode of the LAST snapshot the stub applied —
     /// what a real MH echoes, since it reads the mode off its live snapshot.
     live_modes: Mutex<HashMap<String, TransportMode>>,
+    /// Per meeting, the per-stream echo of the last APPLIED snapshot
+    /// (`applied_source_streams` is built from the applied snapshot, never the
+    /// received one).
+    live_echoes: Mutex<HashMap<String, Vec<SourceStreamEcho>>>,
 }
 
 impl MediaHandlerStub {
@@ -261,6 +266,13 @@ impl MediaHandlerStubBuilder {
     }
 
     /// Set the transport mode the stub echoes.
+    ///
+    /// Per stream (story 3): with a SPECIFIED mode here, the stub echoes every
+    /// APPLIED `source_streams` entry with its own declared mode — a faithful
+    /// MH. With `TRANSPORT_MODE_UNSPECIFIED` it echoes every applied entry as
+    /// UNSPECIFIED: the pre-reshape peer MC must read as a mismatch. The
+    /// legacy single `transport_mode` echo follows the old rule and is no
+    /// longer compared by MC.
     #[must_use]
     pub fn transport_mode(mut self, transport_mode: TransportMode) -> Self {
         self.transport_mode = transport_mode;
@@ -325,6 +337,7 @@ impl MediaHandlerStubBuilder {
             register_delay: self.register_delay,
             end_meeting_status: self.end_meeting_status,
             live_modes: Mutex::new(HashMap::new()),
+            live_echoes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -359,6 +372,7 @@ impl MediaHandlerStubBuilder {
             register_delay: self.register_delay,
             end_meeting_status: self.end_meeting_status,
             live_modes: Mutex::new(HashMap::new()),
+            live_echoes: Mutex::new(HashMap::new()),
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -396,6 +410,19 @@ impl MediaHandlerService for MediaHandlerStub {
     ) -> Result<Response<RegisterMeetingResponse>, Status> {
         let req = request.into_inner();
         let sent = req.policy_generation;
+        let request_echo: Vec<SourceStreamEcho> = req
+            .source_streams
+            .iter()
+            .map(|s| SourceStreamEcho {
+                sender_id: s.sender_id,
+                stream_number: s.stream_number,
+                transport_mode: if self.transport_mode == TransportMode::Unspecified {
+                    TransportMode::Unspecified as i32
+                } else {
+                    s.transport_mode
+                },
+            })
+            .collect();
         let req_is_empty = req.egress_streams.is_empty();
         let meeting_id = req.meeting_id.clone();
         self.events
@@ -459,6 +486,17 @@ impl MediaHandlerService for MediaHandlerStub {
             }
         };
 
+        let applied_source_streams = {
+            let mut live = self
+                .live_echoes
+                .lock()
+                .expect("MediaHandlerStub mutex poisoned");
+            if applied_now {
+                live.insert(meeting_id_for_log.clone(), request_echo);
+            }
+            live.get(&meeting_id_for_log).cloned().unwrap_or_default()
+        };
+
         self.events
             .lock()
             .expect("MediaHandlerStub mutex poisoned")
@@ -472,8 +510,8 @@ impl MediaHandlerService for MediaHandlerStub {
             handler_id: self.handler_id.clone(),
             process_start_epoch_ms: self.process_start_epoch_ms,
             transport_mode: transport_mode as i32,
-            // Story 3 per-stream echo: not stubbed until MC-A compares it.
-            applied_source_streams: Vec::new(),
+            // Story 3 per-stream echo, from the APPLIED snapshot.
+            applied_source_streams,
         }))
     }
 

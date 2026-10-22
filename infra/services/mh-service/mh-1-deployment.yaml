@@ -318,12 +318,11 @@ spec:
         # MC_MAX_RECEIVE_SLOTS + MC_AUDIO_* in the MC Deployments), and that
         # does NOT contradict "DO NOT flip them": the warning covers keys whose
         # absence must be LOUD, and a key nothing reads (after its code task
-        # removes the read) cannot be loud. Until then the current images
-        # still read every one of them as REQUIRED (MissingEnvVar) — except
-        # MH_MAX_STREAMS, which is already unread — and the key stays present,
-        # so the flag loosens no bound: a key that vanished early would still
-        # fail the old image's startup loudly. It is step 1
-        # of the two-deploy retirement in docs/TODO.md.
+        # removes the read) cannot be loud. Every one of them is now unread
+        # (MH's code tasks and story 3 MC-A removed the reads), and each key
+        # stays present for one more deploy, so the flag loosens no bound: a
+        # rollback to an image that still reads one as REQUIRED finds it.
+        # It is step 1 of the two-deploy retirement in docs/TODO.md.
         - name: MH_MEDIA_LATENCY_SAMPLE_RATIO
           valueFrom:
             configMapKeyRef:

@@ -143,6 +143,13 @@ pub enum MeetingMessage {
         connection_id: String,
         correlation_id: String,
         binding_token: String,
+        /// The publish set the reconnecting client PRESENTS. Compared as a SET
+        /// against the roster entry's fixed set before any state changes; a
+        /// mismatch is refused and counted (story 3 R-2), never adopted.
+        publishes: crate::media_kind::PublishSet,
+        /// The reconnect's receive declaration, treated as a redeclaration
+        /// (`None` keeps the declaration in force).
+        demand: Option<crate::media_signaling::SlotDemand>,
         /// Response channel for reconnect result.
         respond_to: oneshot::Sender<Result<ReconnectResult, McError>>,
     },
@@ -229,7 +236,8 @@ pub enum MeetingMessage {
     /// resizes the participant's slots, re-renders, re-pushes and re-emits.
     RegisterReceiveCapability {
         participant_id: String,
-        declaration: crate::media_signaling::ReceiveCapabilityDeclaration,
+        /// Validated and truncated at the connection.
+        declaration: crate::media_signaling::SlotDemand,
         /// `Ok` once the declaration is registered (and a first flush ran).
         respond_to: oneshot::Sender<Result<(), McError>>,
     },
@@ -740,7 +748,7 @@ pub enum ParticipantStateUpdate {
     ///
     /// Wire-visible as `ParticipantMuteUpdate` (story 2 R-11). Emitted only for
     /// SERVER mute: self-mute does not fan out to the roster (security S-2's
-    /// judgment — the subscriber-visible signal is `SLOT_STATE_SOURCE_MUTED`).
+    /// judgment — the subscriber-visible signal is the slot state, `SLOT_STATE_AVATAR_CLIENT_MUTED`).
     /// So the two self-mute booleans ride along as INFORMATIONAL snapshots and
     /// are not a self-mute source for any client.
     MuteChanged {

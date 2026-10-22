@@ -1,0 +1,319 @@
+//! The media-kind vocabulary MC shares across its media modules (story 3).
+//!
+//! A LEAF module on purpose (Gate 1, code-quality CQ1): `media_signaling`
+//! depends on `media_routing`, never the reverse, and both need the kind and
+//! the publish set. Homing them here keeps that dependency one-way;
+//! `media_signaling` re-exports [`MediaKindLabel`] so its existing call sites
+//! are unchanged.
+//!
+//! No key material, no identity: kinds and booleans only.
+
+use proto_gen::dark_tower::signaling::v1::MediaKind;
+
+/// The media kind a series' subject has (`media_kind` label; story 3 OBS-A).
+///
+/// ANCHOR (DRY): the `media_kind` row of `docs/observability/label-taxonomy.md`
+/// is the single source of truth for this value set; the test
+/// `media_kind_label_matches_the_taxonomy_row` reads that row, so the two cannot
+/// drift silently. The key constant is `common::observability::labels::MEDIA_KIND_LABEL`.
+///
+/// A TELEMETRY projection, deliberately distinct from the wire
+/// `proto_gen::dark_tower::signaling::v1::MediaKind`, which has four values
+/// (`UNSPECIFIED`, `AUDIO`, `VIDEO_CAMERA`, `VIDEO_SCREEN`) against this label's
+/// two.
+///
+/// # Two wire mappings, deliberately NOT collapsed
+///
+/// - [`Self::from_proto`] is the LABEL projection: every labellable wire kind
+///   maps to a label (screen share is `video`), so a recorder is never handed
+///   an unlabelled kind.
+/// - [`served_kind`] is ADMISSION: the closed set of kinds this story SERVES.
+///   It refuses `VIDEO_SCREEN` (`media_kind_unsupported`), so merging the two
+///   would fail open on screen share. The `served_kind_agrees_with_the_label_projection`
+///   test pins that wherever admission yields a kind, the label projection
+///   yields the same one.
+///
+/// Since story 3 MC-A this is ALSO the slot table's kind (per-kind slot
+/// vectors, edges, egress ids), so there is no third kind enum.
+///
+/// MC and the client SDK carry this label; MH never does (ADR-0036 §7: MH is
+/// type-blind).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaKindLabel {
+    /// `audio`.
+    Audio,
+    /// `video`. As a served kind: the camera only ([`served_kind`] refuses
+    /// screen share). As a label projection ([`Self::from_proto`]) a screen
+    /// kind also labels `video`.
+    Video,
+}
+
+impl MediaKindLabel {
+    /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
+    pub const ALL: [Self; 2] = [Self::Audio, Self::Video];
+
+    /// Bounded metric-label form.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+
+    /// This kind's position in [`Self::ALL`], for per-kind `[T; 2]` tallies
+    /// (read back with [`Self::of`]). Exhaustive, so the positional layout is
+    /// defined HERE and nowhere else.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Audio => 0,
+            Self::Video => 1,
+        }
+    }
+
+    /// Select this kind's value from a per-kind pair of named fields
+    /// (`kind.pick(p.audio_server_muted, p.video_server_muted)`). The ONE
+    /// kind -> field mapping, so call sites never write their own `match`.
+    #[must_use]
+    pub fn pick<T>(self, audio: T, video: T) -> T {
+        match self {
+            Self::Audio => audio,
+            Self::Video => video,
+        }
+    }
+
+    /// This kind's entry of a per-kind `[T; 2]` laid out by [`Self::index`]
+    /// (as built by [`Self::per_kind`]). Infallible: destructures, never
+    /// indexes.
+    #[must_use]
+    pub fn of<T>(self, per_kind: [T; 2]) -> T {
+        let [audio, video] = per_kind;
+        self.pick(audio, video)
+    }
+
+    /// This kind's entry of a per-kind `[T; 2]`, by reference. Infallible:
+    /// destructures, never indexes (`clippy::indexing_slicing`).
+    #[must_use]
+    pub fn of_ref<T>(self, per_kind: &[T; 2]) -> &T {
+        let [audio, video] = per_kind;
+        self.pick(audio, video)
+    }
+
+    /// This kind's entry of a per-kind `[T; 2]`, mutably. Infallible.
+    pub fn of_mut<T>(self, per_kind: &mut [T; 2]) -> &mut T {
+        let [audio, video] = per_kind;
+        self.pick(audio, video)
+    }
+
+    /// The other kind.
+    #[must_use]
+    pub const fn other(self) -> Self {
+        match self {
+            Self::Audio => Self::Video,
+            Self::Video => Self::Audio,
+        }
+    }
+
+    /// The wire kind MC serves for this kind (camera for video).
+    #[must_use]
+    pub const fn to_proto(self) -> MediaKind {
+        match self {
+            Self::Audio => MediaKind::Audio,
+            Self::Video => MediaKind::VideoCamera,
+        }
+    }
+
+    /// A per-kind `[T; 2]` built from `f`, laid out by [`Self::index`].
+    #[must_use]
+    pub fn per_kind<T>(mut f: impl FnMut(Self) -> T) -> [T; 2] {
+        Self::ALL.map(&mut f)
+    }
+
+    /// The label for a wire media kind, or `None` for `UNSPECIFIED`.
+    ///
+    /// Exhaustive with no wildcard arm, so a new wire variant is a compile error
+    /// here rather than a silent mislabel.
+    #[must_use]
+    pub const fn from_proto(kind: MediaKind) -> Option<Self> {
+        match kind {
+            MediaKind::Audio => Some(Self::Audio),
+            MediaKind::VideoCamera => Some(Self::Video),
+            // DELIBERATE: screen share is `media_kind="video"` plus
+            // `content_kind="slides"` in the taxonomy. `content_kind` is
+            // declared but not carried (content share is out of story 3's
+            // scope), so a screen slot is labelled `video` and the split is
+            // left to that label when it is carried.
+            MediaKind::VideoScreen => Some(Self::Video),
+            // Rejected at every parse boundary that admits a kind; it has no
+            // honest label.
+            MediaKind::Unspecified => None,
+        }
+    }
+}
+
+/// Why a wire kind is not a kind MC serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindRefusal {
+    /// A real kind this story does not serve (`VIDEO_SCREEN`).
+    Unsupported,
+    /// `MEDIA_KIND_UNSPECIFIED`, or an i32 outside the enum (the enum is open
+    /// on the wire, so an unknown number decodes as an integer).
+    Unspecified,
+}
+
+/// ADMISSION: the closed set of kinds MC serves, from a raw wire value.
+///
+/// Exhaustive with no wildcard arm over the decoded enum, so a new wire
+/// variant is a compile error here. See [`MediaKindLabel`] for why this and
+/// [`MediaKindLabel::from_proto`] are two mappings.
+///
+/// # Errors
+///
+/// [`KindRefusal`] for every value outside {`AUDIO`, `VIDEO_CAMERA`}.
+pub fn served_kind(raw: i32) -> Result<MediaKindLabel, KindRefusal> {
+    match MediaKind::try_from(raw) {
+        Ok(MediaKind::Audio) => Ok(MediaKindLabel::Audio),
+        Ok(MediaKind::VideoCamera) => Ok(MediaKindLabel::Video),
+        Ok(MediaKind::VideoScreen) => Err(KindRefusal::Unsupported),
+        Ok(MediaKind::Unspecified) | Err(_) => Err(KindRefusal::Unspecified),
+    }
+}
+
+/// What a participant publishes, fixed for its membership (story 3 R-2).
+///
+/// Constructible only through [`Self::parse`] (or [`Self::of`] for tests and
+/// MC-internal construction from already-typed kinds), so a set holding an
+/// unserved kind or a duplicate is unrepresentable. Equality is SET equality:
+/// order on the wire is irrelevant, which is what the reconnect comparison
+/// needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PublishSet([bool; 2]);
+
+/// A `publish_kinds` list MC refuses (join token `publish_kind_invalid`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishKindInvalid;
+
+impl PublishSet {
+    /// Receive-only: publishes nothing.
+    pub const NONE: Self = Self([false; 2]);
+
+    /// Parse the wire `publish_kinds`.
+    ///
+    /// Fails on the FIRST unserved or duplicate value, so a long hostile list
+    /// costs at most three iterations and allocates nothing (Gate 1 security):
+    /// a third valid entry is necessarily a duplicate.
+    ///
+    /// # Errors
+    ///
+    /// [`PublishKindInvalid`] for `UNSPECIFIED`, `VIDEO_SCREEN`, an unknown
+    /// value or a duplicate — rejected, never ignored or deduplicated.
+    pub fn parse(raw: &[i32]) -> Result<Self, PublishKindInvalid> {
+        let mut set = [false; 2];
+        for value in raw {
+            let kind = served_kind(*value).map_err(|_| PublishKindInvalid)?;
+            let slot = kind.of_mut(&mut set);
+            if *slot {
+                return Err(PublishKindInvalid);
+            }
+            *slot = true;
+        }
+        Ok(Self(set))
+    }
+
+    /// A set publishing exactly `kinds` (duplicates collapse; MC-internal use).
+    #[must_use]
+    pub fn of(kinds: &[MediaKindLabel]) -> Self {
+        let mut set = [false; 2];
+        for kind in kinds {
+            *kind.of_mut(&mut set) = true;
+        }
+        Self(set)
+    }
+
+    /// Does this participant publish `kind`?
+    #[must_use]
+    pub fn publishes(self, kind: MediaKindLabel) -> bool {
+        *kind.of_ref(&self.0)
+    }
+
+    /// Does this participant publish nothing?
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self == Self::NONE
+    }
+
+    /// The published kinds, in [`MediaKindLabel::ALL`] order (audio first).
+    pub fn kinds(self) -> impl Iterator<Item = MediaKindLabel> {
+        MediaKindLabel::ALL
+            .into_iter()
+            .filter(move |k| self.publishes(*k))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    const A: i32 = MediaKind::Audio as i32;
+    const V: i32 = MediaKind::VideoCamera as i32;
+    const S: i32 = MediaKind::VideoScreen as i32;
+    const U: i32 = MediaKind::Unspecified as i32;
+
+    #[test]
+    fn publish_set_accepts_the_closed_set_in_any_order() {
+        assert_eq!(PublishSet::parse(&[]).unwrap(), PublishSet::NONE);
+        assert!(PublishSet::parse(&[]).unwrap().is_empty());
+        let av = PublishSet::parse(&[A, V]).unwrap();
+        assert_eq!(av, PublishSet::parse(&[V, A]).unwrap(), "set equality");
+        assert!(av.publishes(MediaKindLabel::Audio) && av.publishes(MediaKindLabel::Video));
+        let a = PublishSet::parse(&[A]).unwrap();
+        assert!(a.publishes(MediaKindLabel::Audio) && !a.publishes(MediaKindLabel::Video));
+        assert_eq!(av.kinds().collect::<Vec<_>>(), MediaKindLabel::ALL.to_vec());
+    }
+
+    #[test]
+    fn publish_set_rejects_screen_unspecified_unknown_and_duplicates() {
+        for bad in [&[S][..], &[U], &[4242], &[A, A], &[V, V], &[A, V, A], &[-1]] {
+            assert_eq!(PublishSet::parse(bad), Err(PublishKindInvalid), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn served_kind_refuses_screen_as_unsupported_and_the_rest_as_unspecified() {
+        assert_eq!(served_kind(A), Ok(MediaKindLabel::Audio));
+        assert_eq!(served_kind(V), Ok(MediaKindLabel::Video));
+        assert_eq!(served_kind(S), Err(KindRefusal::Unsupported));
+        assert_eq!(served_kind(U), Err(KindRefusal::Unspecified));
+        assert_eq!(served_kind(99), Err(KindRefusal::Unspecified));
+    }
+
+    /// DRY Gate 1: the two mappings agree wherever admission yields a kind.
+    #[test]
+    fn served_kind_agrees_with_the_label_projection() {
+        for kind in [
+            MediaKind::Unspecified,
+            MediaKind::Audio,
+            MediaKind::VideoCamera,
+            MediaKind::VideoScreen,
+        ] {
+            if let Ok(served) = served_kind(kind as i32) {
+                assert_eq!(MediaKindLabel::from_proto(kind), Some(served), "{kind:?}");
+                assert_eq!(served.to_proto(), kind);
+            }
+        }
+    }
+
+    #[test]
+    fn per_kind_accessors_are_consistent_with_index() {
+        let mut pair = [10, 20];
+        for k in MediaKindLabel::ALL {
+            assert_eq!(*k.of_ref(&pair), k.of(pair));
+            *k.of_mut(&mut pair) += 1;
+            assert_eq!(k.other().other(), k);
+            assert_ne!(k.other(), k);
+        }
+        assert_eq!(pair, [11, 21]);
+    }
+}

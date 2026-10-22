@@ -13,13 +13,21 @@ use std::time::{Duration, Instant};
 use crate::cluster::ClusterConnection;
 use crate::fixtures::auth_client::UserRegistrationRequest;
 use crate::fixtures::gc_client::{CreateMeetingRequest, JoinMeetingResponse};
-use crate::fixtures::mc_session::{self, McSession};
+use crate::fixtures::mc_session::{self, JoinDeclaration, McSession};
 use crate::fixtures::metrics::{gauge_by_instance_present, PrometheusClient};
 use crate::fixtures::{AuthClient, GcClient};
 use proto_gen::dark_tower::signaling::v1::{
-    client_message, server_message, ClientMessage, JoinResponse, MediaKind, ReceiveCapability,
-    ReceiveSlot, SendDirective, StreamAssignments,
+    client_message, server_message, ClientMessage, JoinResponse, MediaKind, SendDirective,
+    StreamAssignment, StreamAssignments,
 };
+
+/// The audio slot kind, for the kind-taking helpers below. Every helper that
+/// reads a view takes a kind: a video slot showing an avatar NAMES its
+/// participant, so a kind-blind "which slot holds sender X" would answer with
+/// the video avatar (empty url) as readily as the audio edge.
+pub const AUDIO: MediaKind = MediaKind::Audio;
+/// The camera-video slot kind (see [`AUDIO`]).
+pub const VIDEO: MediaKind = MediaKind::VideoCamera;
 
 /// Greppable triage literal for the ONE failure in this suite that is an
 /// environment fact rather than a diff defect: fewer than two distinct handlers
@@ -79,20 +87,14 @@ impl Participant {
         urls
     }
 
-    pub async fn declare(&mut self, audio_slot_ids: &[u32]) {
+    /// Redeclare this participant's receive slots (post-join
+    /// `ReceiveCapability`): audio ids, then video ids, in declaration order.
+    /// Built by the one builder, `mc_session::receive_capability`.
+    pub async fn declare(&mut self, audio_slot_ids: &[u32], video_slot_ids: &[u32]) {
         self.session
             .write(&ClientMessage {
                 message: Some(client_message::Message::ReceiveCapability(
-                    ReceiveCapability {
-                        slots: audio_slot_ids
-                            .iter()
-                            .map(|id| ReceiveSlot {
-                                slot_id: *id,
-                                media_kind: MediaKind::Audio as i32,
-                                pinned_sender_id: None,
-                            })
-                            .collect(),
-                    },
+                    mc_session::receive_capability(audio_slot_ids, video_slot_ids),
                 )),
                 trace_parent: String::new(),
                 trace_state: String::new(),
@@ -124,9 +126,11 @@ impl Participant {
                  mh_media_egress_edges against mh_media_egress_stream_ceiling on both MH pods \
                  ({TRIAGE_HANDLER_SET}).",
                 self.label,
-                self.view
-                    .as_ref()
-                    .map(|v| (filled_senders(v), &v.unreachable_sender_ids)),
+                self.view.as_ref().map(|v| (
+                    filled_senders(v, AUDIO),
+                    filled_senders(v, VIDEO),
+                    &v.unreachable_sender_ids
+                )),
                 self.directive.as_ref().map(targets_of)
             );
             match self
@@ -153,26 +157,44 @@ impl Participant {
         self.view.as_ref().expect("converged view")
     }
 
-    /// The handler url owning this participant's edge from `sender`.
-    pub fn slot_url(&self, sender: u32) -> String {
-        self.view()
-            .assignments
-            .iter()
-            .find(|a| a.sender_id == Some(sender))
-            .unwrap_or_else(|| panic!("{} does not hold sender {sender}", self.label))
-            .media_handler_url
-            .clone()
+    /// This participant's slots of `kind`, in declaration order.
+    pub fn slots(&self, kind: MediaKind) -> Vec<&StreamAssignment> {
+        slots_of(self.view(), kind)
     }
 
-    /// The slot id this participant declared for its edge from `sender`.
-    pub fn slot_for(&self, sender: u32) -> u32 {
+    /// The `kind` slot naming `sender`. Panics if none does.
+    fn slot_naming(&self, sender: u32, kind: MediaKind) -> &StreamAssignment {
         self.view()
             .assignments
             .iter()
-            .find(|a| a.sender_id == Some(sender))
-            .unwrap_or_else(|| panic!("{} does not hold sender {sender}", self.label))
-            .slot_id
+            .find(|a| a.media_kind == kind as i32 && a.sender_id == Some(sender))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} has no {} slot naming sender {sender}",
+                    self.label,
+                    kind.as_str_name()
+                )
+            })
     }
+
+    /// The handler url on this participant's `kind` slot naming `sender`.
+    pub fn slot_url(&self, sender: u32, kind: MediaKind) -> String {
+        self.slot_naming(sender, kind).media_handler_url.clone()
+    }
+
+    /// The slot id this participant declared for its `kind` slot naming
+    /// `sender`.
+    pub fn slot_for(&self, sender: u32, kind: MediaKind) -> u32 {
+        self.slot_naming(sender, kind).slot_id
+    }
+}
+
+/// `view`'s slots of `kind`, in declaration order.
+pub fn slots_of(view: &StreamAssignments, kind: MediaKind) -> Vec<&StreamAssignment> {
+    view.assignments
+        .iter()
+        .filter(|a| a.media_kind == kind as i32)
+        .collect()
 }
 
 pub fn targets_of(d: &SendDirective) -> BTreeSet<String> {
@@ -240,17 +262,24 @@ pub async fn mc_join(
     gc: &JoinMeetingResponse,
     display_name: &str,
 ) -> Participant {
-    let mc_url = gc
-        .mc_assignment
-        .webtransport_endpoint
-        .clone()
-        .expect("MC assignment must include webtransport_endpoint");
-    let mut session = McSession::connect(&mc_url).await;
-    let join = mc_session::mc_join(
+    mc_join_with(label, gc, display_name, &JoinDeclaration::default()).await
+}
+
+/// [`mc_join`] with an explicit join declaration (publish set, initial receive
+/// slots, header versions).
+pub async fn mc_join_with(
+    label: &'static str,
+    gc: &JoinMeetingResponse,
+    display_name: &str,
+    declaration: &JoinDeclaration,
+) -> Participant {
+    let mut session = McSession::connect(&mc_url(gc)).await;
+    let join = mc_session::mc_join_with(
         &mut session,
         &gc.meeting_id.to_string(),
         &gc.token,
         display_name,
+        declaration,
         label,
     )
     .await;
@@ -265,42 +294,100 @@ pub async fn mc_join(
     }
 }
 
-pub fn filled_senders(view: &StreamAssignments) -> Vec<u32> {
-    view.assignments
-        .iter()
+/// MC's WebTransport endpoint from GC's join answer.
+pub fn mc_url(gc: &JoinMeetingResponse) -> String {
+    gc.mc_assignment
+        .webtransport_endpoint
+        .clone()
+        .expect("MC assignment must include webtransport_endpoint")
+}
+
+pub fn filled_senders(view: &StreamAssignments, kind: MediaKind) -> Vec<u32> {
+    slots_of(view, kind)
+        .into_iter()
         .filter_map(|a| a.sender_id)
         .collect()
 }
 
+/// A meeting created as its first user, with `users.len()` registered users
+/// who have NOT joined yet: for scenarios that must sequence each join (and
+/// converge on an observed view) before the next, because MC fills slots when
+/// a pair becomes routable, so the fill depends on event ORDER.
+pub struct Invited<'a> {
+    gc: &'a GcClient,
+    meeting_code: String,
+    /// `(user access token, display name)` per invited user, in label order.
+    users: Vec<(String, String)>,
+}
+
+impl Invited<'_> {
+    /// Register `count` users and create a meeting as the first.
+    pub async fn new<'a>(
+        auth: &AuthClient,
+        gc: &'a GcClient,
+        title: &str,
+        count: usize,
+    ) -> Invited<'a> {
+        let mut users = Vec::new();
+        for i in 0..count {
+            let request = UserRegistrationRequest::unique(format!("{title} {i}"));
+            let display = request.display_name.clone();
+            let registered = auth
+                .register_user(&request)
+                .await
+                .expect("AC should register a test user");
+            users.push((registered.access_token, display));
+        }
+        let created = gc
+            .create_meeting(&users[0].0, &CreateMeetingRequest::new(title))
+            .await
+            .expect("GC should create the meeting");
+        Invited {
+            gc,
+            meeting_code: created.meeting_code,
+            users,
+        }
+    }
+
+    /// A fresh GC meeting token for user `i` (each MC join presents its own).
+    pub async fn gc_join(&self, i: usize) -> JoinMeetingResponse {
+        self.gc
+            .join_meeting(&self.meeting_code, &self.users[i].0)
+            .await
+            .expect("GC should issue a meeting token")
+    }
+
+    /// User `i`'s display name.
+    pub fn display(&self, i: usize) -> &str {
+        &self.users[i].1
+    }
+
+    /// Join user `i` through GC -> MC with `declaration`, awaiting the
+    /// `JoinResponse` (see [`mc_join_with`]).
+    pub async fn join(
+        &self,
+        i: usize,
+        label: &'static str,
+        declaration: &JoinDeclaration,
+    ) -> Participant {
+        let gc_join = self.gc_join(i).await;
+        mc_join_with(label, &gc_join, self.display(i), declaration).await
+    }
+}
+
 /// Register `labels.len()` users, create a meeting as the first, and join all
-/// sequentially (each JoinResponse awaited, so join order is label order).
+/// sequentially (each JoinResponse awaited, so join order is label order),
+/// each with the default declaration (audio publisher, no receive slots).
 pub async fn meeting_of(
     auth: &AuthClient,
     gc: &GcClient,
     title: &str,
     labels: &[&'static str],
 ) -> Vec<Participant> {
-    let mut users = Vec::new();
-    for label in labels {
-        let request = UserRegistrationRequest::unique(format!("{title} {label}"));
-        let display = request.display_name.clone();
-        let registered = auth
-            .register_user(&request)
-            .await
-            .expect("AC should register a test user");
-        users.push((registered.access_token, display));
-    }
-    let created = gc
-        .create_meeting(&users[0].0, &CreateMeetingRequest::new(title))
-        .await
-        .expect("GC should create the meeting");
+    let invited = Invited::new(auth, gc, title, labels.len()).await;
     let mut ps = Vec::new();
     for (i, label) in labels.iter().enumerate() {
-        let gc_join = gc
-            .join_meeting(&created.meeting_code, &users[i].0)
-            .await
-            .expect("GC should issue a meeting token");
-        ps.push(mc_join(label, &gc_join, &users[i].1).await);
+        ps.push(invited.join(i, label, &JoinDeclaration::default()).await);
     }
     ps
 }

@@ -464,6 +464,7 @@ fn join_media_with(
             mc_grpc_endpoint: "http://mc-test:50052".to_string(),
             stream_policy: mc_service::media_signaling::MediaStreamPolicy::new(
                 client_media_config().audio_encoding,
+                client_media_config().video_encoding,
             ),
             connect_settle_window: client_media_config().connect_settle_window,
         }),
@@ -473,6 +474,13 @@ fn join_media_with(
             grpc_endpoint: h.grpc_endpoint.clone(),
         }))
         .expect("fixture handler set is non-empty and duplicate-free"),
+        // The actor-driven suite joins as an audio publisher with no
+        // join-carried declaration (it declares post-join), story 2's shape.
+        publishes: mc_service::media_signaling::PublishSet::of(&[
+            mc_service::media_signaling::MediaKindLabel::Audio,
+        ]),
+        demand: mc_service::media_signaling::ReceiveCapabilityDeclaration::empty()
+            .truncate(client_media_config().max_receive_slots),
     }
 }
 
@@ -503,7 +511,8 @@ pub fn sample_identity_public_key() -> Vec<u8> {
 /// parameters is asserting the shipped configuration, not a test-only one.
 pub fn client_media_config() -> mc_service::media_signaling::ClientMediaConfig {
     mc_service::media_signaling::ClientMediaConfig {
-        max_receive_slots: 8,
+        // `MC_MAX_AUDIO_RECEIVE_SLOTS` / `MC_MAX_VIDEO_RECEIVE_SLOTS`.
+        max_receive_slots: [8, 4],
         max_receive_capability_declarations: 64,
         audio_encoding: mc_service::media_signaling::AudioEncoding::new(
             proto_gen::dark_tower::signaling::v1::Codec::Opus,
@@ -511,6 +520,17 @@ pub fn client_media_config() -> mc_service::media_signaling::ClientMediaConfig {
             50,
         )
         .expect("suite audio encoding is in band"),
+        // The `media-codec-profile` production video values and
+        // `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`.
+        video_encoding: mc_service::media_signaling::VideoEncoding::new(
+            proto_gen::dark_tower::signaling::v1::Codec::Vp8,
+            640,
+            360,
+            30,
+            800_000,
+            500,
+        )
+        .expect("suite video encoding is in band"),
         // `MC_MEDIA_CONNECT_SETTLE_MS` as the ConfigMap ships it.
         connect_settle_window: std::time::Duration::from_millis(1500),
     }

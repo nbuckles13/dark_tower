@@ -90,7 +90,7 @@ test.describe('solo participant: loopback removed (ADR-0036 story 2 R-3)', () =>
       fromMs: assignedAtMs,
       fields: ['framesSent', 'framesAccepted'],
       whyFlat:
-        'a solo participant is held by nobody (a SendDirective with no streams, §5) and holds nobody ' +
+        'a solo participant is held by nobody (its SendDirective lists audio with no targets, §5) and holds nobody ' +
         '(no edge into it) — a moving counter means a self-edge survived (R-3).',
     });
   });
