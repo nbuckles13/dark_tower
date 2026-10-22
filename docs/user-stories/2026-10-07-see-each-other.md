@@ -1900,7 +1900,7 @@ tasks:
   slug: 2026-10-22-mc-a-video-slots
   tag: story-2026-10-07-see-each-other-task-12
 - id: 13
-  status: pending
+  status: completed
   specialist: client
   deps:
   - 11
@@ -2077,6 +2077,7 @@ tasks:
     - Every C-A1 transitional shim is deleted; none survives the task.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-22-c-a2-sdk-video-publish
   tag: story-2026-10-07-see-each-other-task-13
 - id: 14
   status: pending
