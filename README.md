@@ -1,189 +1,106 @@
 # Dark Tower
 
-A modern, high-performance video conferencing platform built with Rust and WebTransport.
+A video conferencing platform built with Rust and WebTransport.
 
 ## Overview
 
-Dark Tower is an ambitious open-source video conferencing platform designed for scalability, performance, and user flexibility. Built entirely with AI-generated code, it leverages cutting-edge web technologies including WebTransport, WebCodec, and QUIC to deliver low-latency, high-quality video conferencing experiences.
+Dark Tower is an open-source video conferencing platform designed for scalability, performance, and user flexibility. It uses WebTransport over QUIC/HTTP/3 for media and signaling, WebCodecs in the browser, and SFrame end-to-end encryption, so the media handlers forward frames they cannot read. The code is written by AI agents.
 
-> **Curious how we build with AI?** See [AI_DEVELOPMENT.md](AI_DEVELOPMENT.md) for an overview of our specialist agents, guard pipeline, and development methodology.
+> **Curious how we build with AI?** See [AI_DEVELOPMENT.md](AI_DEVELOPMENT.md) for our specialist agent teams, validation pipeline, and story-driven workflow.
 
 ## Architecture
 
-The platform consists of five main components:
+| Component | Crate / package | Role |
+|-----------|-----------------|------|
+| Auth Controller (AC) | `crates/ac-service` | OAuth 2.0 client credentials, user auth, JWT issuance, JWKS, key rotation |
+| Global Controller (GC) | `crates/gc-service` | HTTP/3 API entry point, meeting management, MC/MH registration and assignment |
+| Meeting Controller (MC) | `crates/mc-service` | WebTransport signaling, sessions, participant roster, media routing decisions, key distribution |
+| Media Handler (MH) | `crates/mh-service` | Keyless SFU: forwards encrypted media frames over WebTransport |
+| Browser client | `packages/sdk-core`, `sdk-svelte`, `web-app` | TypeScript SDK and Svelte web app: join flow, WebCodecs, SFrame |
 
-1. **Authentication Controller** ✅ - Service-to-service authentication via OAuth 2.0, JWT tokens, JWKS federation
-2. **Global Controller** 🚧 - Global API entry point with DNS-based geographic routing
-3. **Meeting Controller** 🚧 - Manages individual meetings, signaling, and participant coordination
-4. **Media Handler** 🚧 - Handles media routing, transcoding, and mixing (SFU architecture)
-5. **Client** 📋 - Web-based user interface built with Svelte and WebCodec
+AC and GC are stateless and load-balanced; MC and MH are stateful and individually addressable. Services talk to each other over gRPC with contracts in `proto/`.
+
+**Where it stands:** participants can join a meeting from the browser and hear each other, with end-to-end encrypted audio forwarded by the media handler. Multi-participant video is in progress ([see-each-other story](docs/user-stories/2026-10-07-see-each-other.md)). Every story, finished or planned, is in [docs/user-stories/](docs/user-stories/).
+
+Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · Decisions: [docs/decisions/](docs/decisions/)
 
 ## Project Structure
 
 ```
 dark_tower/
-├── crates/                    # Rust workspace
-│   ├── ac-service/            # Authentication Controller (IMPLEMENTED)
-│   ├── ac-test-utils/         # Auth testing utilities (IMPLEMENTED)
-│   ├── global-controller/     # Global Controller service
-│   ├── meeting-controller/    # Meeting Controller service
-│   ├── media-handler/         # Media Handler service
-│   ├── common/                # Shared utilities and types
-│   ├── proto-gen/             # Generated Protocol Buffer code
-│   └── media-protocol/        # Proprietary media protocol implementation
-├── client/                    # Svelte web client (planned)
-├── proto/                     # Protocol Buffer definitions
-├── migrations/                # Database migrations (AC schema implemented)
-├── infra/                     # Infrastructure as Code
-│   ├── terraform/             # Terraform configurations (planned)
-│   ├── kubernetes/            # Kubernetes manifests (planned)
-│   └── docker/                # Docker configurations
-├── .claude/                   # Claude Code orchestration
-│   ├── agents/                # Specialist agent definitions
-│   └── workflows/             # Debate and code review workflows
-├── tests/                     # Integration and E2E tests
-└── docs/                      # Comprehensive documentation
-    ├── debates/               # Multi-agent design debates
-    └── decisions/             # Architecture Decision Records
-
+├── crates/                 # Rust workspace
+│   ├── ac-service/ gc-service/ mc-service/ mh-service/   # the four services
+│   ├── common/             # shared Rust code
+│   ├── media-protocol/     # media frame wire format
+│   ├── proto-gen/          # generated protobuf code
+│   ├── *-test-utils/       # per-service test helpers
+│   ├── env-tests/          # tests against a live Kind cluster
+│   ├── dt-guard/           # validation guards (ADR-0034)
+│   ├── dt-story/           # story manifest tool (ADR-0035)
+│   └── devloop-helper/     # host-side cluster helper for devloops
+├── packages/               # TypeScript monorepo (pnpm + Nx): sdk-core, sdk-svelte, web-app, test-utils, proto-gen
+├── proto/                  # Protocol Buffers contracts
+├── migrations/             # PostgreSQL migrations
+├── infra/
+│   ├── kind/               # local Kind cluster setup and deploy
+│   ├── kubernetes/ services/ grafana/   # manifests, service config, dashboards
+│   └── devloop/            # containerized devloop tooling
+├── scripts/                # validation pipeline (layer-all.sh → layer1..7.sh) and guards
+├── .claude/                # agent definitions and skills
+└── docs/                   # architecture, ADRs, runbooks, user stories, specialist knowledge
 ```
-
-## Technology Stack
-
-- **Backend**: Rust with Tokio async runtime
-- **Frontend**: Svelte with TypeScript
-- **Transport**: WebTransport (QUIC), HTTP/3
-- **Media**: WebCodec API, custom media protocol
-- **Databases**: PostgreSQL (persistent), Redis (ephemeral)
-- **Orchestration**: Kubernetes
-- **Observability**: OpenTelemetry, Prometheus, Grafana
-
-See [TECHNICAL_STACK.md](docs/TECHNICAL_STACK.md) for complete details.
-
-## Key Features
-
-- **Service Authentication** ✅ - OAuth 2.0 Client Credentials, JWT tokens, JWKS federation
-- **Security** ✅ - EdDSA signatures, AES-256-GCM encryption, bcrypt hashing, rate limiting
-- **Testing** ✅ - 83% code coverage, P0/P1 security tests, fuzzing infrastructure
-- End-to-end encrypted media streams (planned)
-- Sub-250ms join-to-media latency (planned)
-- Support for multiple simultaneous content shares (planned)
-- Multiple cameras per participant (planned)
-- Highly scalable architecture (10,000+ concurrent participants per region)
-- Power user controls and customization (planned)
-- Open APIs for extensibility (planned)
 
 ## Development
 
 ### Prerequisites
 
-- **Rust** 1.75+ (install via [rustup](https://rustup.rs/))
-- **C Compiler** and build tools (gcc/clang/MSVC)
-- **Protocol Buffer Compiler** (`protoc` 3.0+)
-- **Node.js** 20+
-- **Docker** and Docker Compose
-- **PostgreSQL** 15+
-- **Redis** 7+
+- **Rust** via [rustup](https://rustup.rs/). The toolchain is pinned in `rust-toolchain.toml` and installs automatically.
+- **C toolchain**, `pkg-config`, `protoc` and the protobuf well-known types (`libprotobuf-dev` on Debian/Ubuntu). See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#system-build-tools).
+- **Node.js** at the version in `.nvmrc` (nvm recommended), and **pnpm** at the version pinned by `packageManager` in `package.json` (via corepack).
+- **Podman** (or Docker), **kind** and **kubectl** for the local cluster.
 
-**⚠️ Important**: Dark Tower requires a C compiler for native dependencies (`ring`, `rustls`, `bcrypt`). See [DEVELOPMENT.md](docs/DEVELOPMENT.md#system-build-tools) for platform-specific setup.
-
-#### Quick Setup (Ubuntu/WSL2)
+On Ubuntu/WSL2:
 
 ```bash
-# Install build dependencies
-sudo apt update && sudo apt install -y build-essential pkg-config protobuf-compiler
-
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Verify installation
-rustc --version && gcc --version && protoc --version
-```
-
-#### Quick Setup (macOS)
-
-```bash
-# Install Xcode Command Line Tools
-xcode-select --install
-
-# Install protobuf
-brew install protobuf pkg-config
-
-# Install Rust
+sudo apt update && sudo apt install -y build-essential pkg-config protobuf-compiler libprotobuf-dev podman
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
-
-See [DEVELOPMENT.md](docs/DEVELOPMENT.md) for detailed setup instructions for other platforms.
 
 ### Getting Started
 
 ```bash
-# Clone the repository
 git clone https://github.com/nbuckles13/dark_tower.git
 cd dark_tower
+./.githooks/install.sh            # pre-commit: fmt + clippy
 
-# Install git hooks (automatically runs cargo fmt and clippy before commits)
-./.githooks/install.sh
+cargo build                       # Rust workspace
+pnpm install --frozen-lockfile    # TypeScript workspace
 
-# Build all components
-cargo build
-
-# Run tests
-cargo test
-
-# Start local development environment
-docker-compose up -d
-
-# Run the client
-cd client
-npm install
-npm run dev
+./infra/kind/scripts/setup.sh     # local Kind cluster with all services, Postgres, Redis, observability
+./scripts/dev-web.sh              # preflight checks, then the web-app dev server
 ```
 
-## Testing
+Cluster details, observability, and troubleshooting: [docs/LOCAL_DEVELOPMENT.md](docs/LOCAL_DEVELOPMENT.md). Running the browser demo: [docs/runbooks/client-dev-local.md](docs/runbooks/client-dev-local.md).
 
-We maintain ambitious test coverage goals:
+### Validation
 
-- **P0 Security Tests**: 48 tests - Critical security paths (all passing) ✅
-- **P1 Security Tests**: 17 tests - Important security functionality (all passing) ✅
-- **Unit Tests**: 83% code coverage (targeting 95%)
-- **Integration Tests**: All critical paths ✅
-- **Fuzzing**: cargo-fuzz infrastructure for parsers and protocols ✅
-- **CI/CD**: GitHub Actions with automated testing and code coverage ✅
-- **Performance Tests**: Baseline and regression testing (planned)
+Every change passes the same 7-layer pipeline locally and in CI ([ADR-0033](docs/decisions/adr-0033-polyglot-validation-pipeline.md)):
 
-## Code Quality
+```bash
+./scripts/layer-fast.sh   # layers 1-6: compile, format, guards, tests, lint, audit
+./scripts/layer-all.sh    # adds layer 7: env-tests and browser E2E against the Kind cluster
+```
 
-All code must:
-- Pass `clippy` with pedantic warnings enabled
-- Be formatted with `rustfmt`
-- Have zero compile errors and zero warnings
-- Pass AI-powered code review
-- Follow security best practices
+Production Rust code may not panic: `unwrap`, `expect`, `panic!` and unchecked indexing are denied at compile time ([ADR-0002](docs/decisions/adr-0002-no-panic-policy.md)). Dependencies are audited on every lockfile change and weekly.
+
+Coverage: [Codecov](https://app.codecov.io/gh/nbuckles13/dark_tower).
 
 ## Contributing
 
-This project is built entirely with AI-generated code. All contributions should follow the established patterns and quality standards.
+All code is written by AI agents through the [devloop](.claude/skills/devloop/SKILL.md) and [user-story](.claude/skills/user-story/SKILL.md) workflows. Contributions should follow the same patterns and pass the same pipeline.
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
 
-## Project Status
-
-🔄 **Phase 4: Security Hardening & Guard Infrastructure** - In Progress
-
-**Recent Achievements (January 2026)**:
-- ✅ SecretBox/SecretString refactor for sensitive data protection
-- ✅ Guard pipeline Phase 1 (credential leak detection, 6 simple guards)
-- ✅ Development loop workflow with specialist-owned verification
-- ✅ Specialist knowledge architecture for compounding learnings
-
-**Previous Achievements**:
-- ✅ Authentication Controller fully implemented (OAuth 2.0, JWT, JWKS)
-- ✅ Comprehensive security test suite (65+ tests passing)
-- ✅ Key rotation implementation with advisory locking
-- ✅ Fuzzing infrastructure operational
-- ✅ CI/CD pipeline with code coverage tracking
-
-See [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) for detailed roadmap and progress.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

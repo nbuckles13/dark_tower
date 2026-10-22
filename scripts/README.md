@@ -130,8 +130,8 @@ Planned script categories (to be added as needed):
 
 ## Related Documentation
 
-- **Development Workflow**: `../.claude/DEVELOPMENT_WORKFLOW.md`
-- **Project Status**: `../docs/PROJECT_STATUS.md`
+- **Development Workflow**: `../.claude/skills/devloop/SKILL.md`
+- **Project Status**: `../docs/user-stories/`
 - **Architecture**: `../docs/ARCHITECTURE.md`
 - **Docker Setup**: `../docker-compose.test.yml`
 
