@@ -91,6 +91,18 @@ describe('media hot-path layout (ADR-0036 §11)', () => {
     ).toBeGreaterThan(0);
   });
 
+  it('covers the named per-frame files — positive control, not just "non-empty"', () => {
+    // Story 3 C-A2: the video egress and the shared seal sequence are per-frame
+    // code and must sit INSIDE the scanned scope, by name.
+    const files = sourceFiles(HOT_PATH_DIR, SCAN_SCOPE);
+    for (const name of ['egress.ts', 'videoEgress.ts', 'frameSeal.ts']) {
+      expect(
+        files.some((f) => f.endsWith(`/pipeline/${name}`)),
+        `${name} is not in the hot-path scan`,
+      ).toBe(true);
+    }
+  });
+
   it('has lifecycle, setup and teardown as SIBLINGS of the hot path, not children', () => {
     // The layout constraint itself. If a sibling were moved under `pipeline/`,
     // the directory boundary and the hot-path boundary would stop coinciding and

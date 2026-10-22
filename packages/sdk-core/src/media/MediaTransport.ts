@@ -288,6 +288,21 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
   }
 
   /**
+   * Open one OUTGOING unidirectional stream to the CONNECTED handler at `url`
+   * (story 3: one stream per video group per handler), or `undefined` when no
+   * transport to `url` is connected.
+   *
+   * A SELECTOR, NEVER A DIALER — the same rule as `getDatagramChannel`: it
+   * looks up transports `connectAll` already opened and can never create one,
+   * so a directed target can pick among those transports only.
+   */
+  openUniStream(url: string): Promise<WritableStream<Uint8Array>> | undefined {
+    const transport = this.#connectedTransports.get(url);
+    if (!transport || this.#terminated) return undefined;
+    return transport.createUnidirectionalStream();
+  }
+
+  /**
    * Send a receiver's recovery request for one of its slots to the handler at
    * `url` (story 3 R-13), as `MhClientMessage.recovery_request` on that
    * handler's control stream. Framed by the same pipeline as the connect

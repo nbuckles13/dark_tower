@@ -12,6 +12,7 @@ import { FrameDecoder, encodeFrame } from '../../framing/length-prefix.js';
 import { HEADER_VERSION } from '../../media/frame/wireConstants.js';
 import {
   ClientMessageSchema,
+  Codec,
   ErrorCode,
   ErrorMessageSchema,
   JoinResponseSchema,
@@ -215,6 +216,14 @@ export interface SendStreamInit {
   maxBitrateBps?: number;
   targets?: string[];
   mediaKind?: MediaKind;
+  /** Video encoding fields (story 3 C-A2); absent = unset on the wire. */
+  video?: {
+    codec?: Codec;
+    width?: number;
+    height?: number;
+    frameRate?: number;
+    minKeyframeIntervalMs?: number;
+  };
 }
 
 function buildSendStream(init: SendStreamInit) {
@@ -223,6 +232,17 @@ function buildSendStream(init: SendStreamInit) {
     mediaKind: init.mediaKind ?? MediaKind.AUDIO,
     encoding: create(EncodingParametersSchema, {
       maxBitrateBps: init.maxBitrateBps ?? 0,
+      ...(init.video
+        ? {
+            codec: init.video.codec ?? Codec.UNSPECIFIED,
+            width: init.video.width ?? 0,
+            height: init.video.height ?? 0,
+            frameRate: init.video.frameRate ?? 0,
+            ...(init.video.minKeyframeIntervalMs !== undefined
+              ? { minKeyframeIntervalMs: init.video.minKeyframeIntervalMs }
+              : {}),
+          }
+        : {}),
     }),
     targets: (init.targets ?? []).map((url) => create(SendTargetSchema, { mediaHandlerUrl: url })),
   });

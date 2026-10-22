@@ -72,7 +72,8 @@ import { MuteState, type MuteSnapshot } from './muteState.js';
 import { uplinkRelayStreamId } from '../pipeline/sendId.js';
 import { MediaCaptureError, classifyCaptureError } from '../setup/captureFailure.js';
 import { MEDIA_CAPTURE_FAILURE_OUTCOMES } from '../setup/mediaMetrics.js';
-import { TransmitKeyManager } from './transmitKeys.js';
+import type { TransmitKeyManager } from './transmitKeys.js';
+import { FaultOnce } from './faultOnce.js';
 import { ReceiveTransports } from './receiveTransports.js';
 
 /** Why the pipeline reported a fault. Bounded; never a raw platform message. */
@@ -216,6 +217,15 @@ export interface AudioPipelineOptions {
   /** MC's per-meeting sender id for this client, from the join response. */
   readonly senderId: number;
   /**
+   * The SESSION's single transmit-key manager (one per sender — the nonce
+   * boundary, `transmitKeys.ts`), shared with the video publisher. Owned,
+   * KEK-rotated (`transmitKeys.ts:rotateOnKekChange`) and cleared by the
+   * session; this pipeline adds only the audio-specific rotation triggers (its
+   * T, resume-from-empty, unmute). REQUIRED: there is no pipeline-private
+   * manager and no second KEK subscription.
+   */
+  readonly transmitKeys: TransmitKeyManager;
+  /**
    * The meeting identity holder.
    *
    * Passed as the holder, never as a bare `CryptoKey` — see
@@ -248,6 +258,14 @@ export interface AudioPipelineOptions {
    */
   readonly reportMute: (state: MuteSnapshot) => void;
   readonly captureFactory: CaptureSourceFactory;
+  /**
+   * Whether this participant PUBLISHES audio (story 3 R-2: the frozen publish
+   * set). `false` — a video-only or receive-only participant — and the
+   * microphone is NEVER acquired: no capture, no encoder, no audio rotation
+   * timer; the pipeline still receives. REQUIRED (security F5): no constructor
+   * site may open the microphone by omission.
+   */
+  readonly publishesAudio: boolean;
   readonly encoderFactory: AudioEncoderFactory;
   readonly decoderFactory: AudioDecoderFactory;
   readonly playbackFactory: PlaybackSinkFactory;
@@ -317,18 +335,8 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   #directive: AudioSendDirective | undefined;
   #started = false;
   #stopped = false;
-  /**
-   * Event-once flags: a repeating fault must not become per-frame telemetry.
-   *
-   * Keyed on (stage, message), NOT stage alone. Several faults share a stage
-   * with genuinely different remedies — on `transport`, "not connected to this
-   * handler" and "assignments moved to a different handler mid-session" (an MC
-   * placement defect) — and a stage-only key let whichever fired first silence
-   * the rest for the session. Still bounded by construction: every message is
-   * a string literal at its call site, except teardown's, which interpolates
-   * only a `TeardownRegistry` name — itself a literal from a fixed set.
-   */
-  readonly #reportedFaults = new Set<string>();
+  /** Event-once fault dedupe — the rule and its bound live in `./faultOnce.ts`. */
+  readonly #faults = new FaultOnce();
 
   /**
    * The live capture, held as a FIELD rather than captured by the teardown
@@ -362,7 +370,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     this.#clock = options.clock ?? Date.now;
     this.#setInterval = options.setInterval ?? ((fn, ms) => setInterval(fn, ms));
     this.#clearInterval = options.clearInterval ?? ((h) => clearInterval(h));
-    this.#transmitKeys = new TransmitKeyManager(options.senderId);
+    this.#transmitKeys = options.transmitKeys;
     this.#cache = new TransmitKeyCache(options.config.receiverState.maxTransmitKeysPerSender);
     this.#replay = new ReplayWindow(
       options.config.receiverState.maxReplayContextsPerSender,
@@ -441,6 +449,11 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     };
   }
 
+  /** Whether the microphone capture is open (the test bus's `micTrackOpen`). Sampled. */
+  get captureOpen(): boolean {
+    return this.#capture !== undefined && !this.#stopped;
+  }
+
   /** The microphone currently requested, or `undefined` for the platform default. */
   get captureDeviceId(): string | undefined {
     return this.#deviceId;
@@ -464,24 +477,28 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
 
     const audio = this.#config.audio;
     if (options.deviceId !== undefined) this.#deviceId = options.deviceId;
-    let capture: CaptureSource;
-    try {
-      capture = await this.#options.captureFactory({
-        sampleRateHz: audio.sampleRateHz,
-        channels: audio.channels,
-        deviceId: this.#deviceId,
-      });
-    } catch (err) {
-      this.#countCaptureFailure(err);
-      throw err;
+    // Not publishing audio: the microphone is never touched (privacy, R-2).
+    const publishes = this.#options.publishesAudio;
+    let capture: CaptureSource | undefined;
+    if (publishes) {
+      try {
+        capture = await this.#options.captureFactory({
+          sampleRateHz: audio.sampleRateHz,
+          channels: audio.channels,
+          deviceId: this.#deviceId,
+        });
+      } catch (err) {
+        this.#countCaptureFailure(err);
+        throw err;
+      }
+      this.#capture = capture;
+      // REGISTERED BEFORE THE NEXT AWAIT: a leaked capture keeps the microphone
+      // hot and the browser's recording indicator lit.
+      //
+      // The disposer reads the FIELD, not this local, so `setCaptureDevice` can
+      // replace the capture without a second registration — see `#capture`.
+      this.#teardown.register('capture', () => this.#capture?.stop());
     }
-    this.#capture = capture;
-    // REGISTERED BEFORE THE NEXT AWAIT: a leaked capture keeps the microphone
-    // hot and the browser's recording indicator lit.
-    //
-    // The disposer reads the FIELD, not this local, so `setCaptureDevice` can
-    // replace the capture without a second registration — see `#capture`.
-    this.#teardown.register('capture', () => this.#capture?.stop());
 
     const playback = await this.#options.playbackFactory({
       sampleRateHz: audio.sampleRateHz,
@@ -517,32 +534,51 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     this.#lanes = lanes;
     this.#teardown.register('receive-lanes', () => lanes.close());
 
-    const encoder = await this.#options.encoderFactory({
-      sampleRateHz: audio.sampleRateHz,
-      channels: audio.channels,
-      // MC's directed bitrate when it supplied one; the configured DEFAULT
-      // otherwise. Never a local ceiling applied on top: the directive's
-      // `max_bitrate_bps` is the wire SSoT, and MC validates it at config load
-      // against a code-owned band it refuses to start without satisfying.
-      bitrateBps: this.#directive?.bitrateBps ?? audio.defaultBitrateBps,
-      frameDurationMs: audio.frameDurationMs,
-      complexity: audio.opusComplexity,
-      application: audio.opusApplication,
-      signal: audio.opusSignal,
-      useDtx: audio.opusUseDtx,
-      useInbandFec: audio.opusUseInbandFec,
-      packetLossPerc: audio.opusPacketLossPerc,
-      onOutput: (frame) => {
-        void this.#egress?.submit(frame).catch(() => {
-          this.#fault(MediaFaultStage.Crypto, 'a media frame could not be built or signed', false);
+    if (publishes) {
+      let encoder: AudioEncoderSeam;
+      try {
+        encoder = await this.#options.encoderFactory({
+          sampleRateHz: audio.sampleRateHz,
+          channels: audio.channels,
+          // MC's directed bitrate when it supplied one; the configured DEFAULT
+          // otherwise. Never a local ceiling applied on top: the directive's
+          // `max_bitrate_bps` is the wire SSoT, and MC validates it at config load
+          // against a code-owned band it refuses to start without satisfying.
+          bitrateBps: this.#directive?.bitrateBps ?? audio.defaultBitrateBps,
+          frameDurationMs: audio.frameDurationMs,
+          complexity: audio.opusComplexity,
+          application: audio.opusApplication,
+          signal: audio.opusSignal,
+          useDtx: audio.opusUseDtx,
+          useInbandFec: audio.opusUseInbandFec,
+          packetLossPerc: audio.opusPacketLossPerc,
+          onOutput: (frame) => {
+            void this.#egress?.submit(frame).catch(() => {
+              this.#fault(
+                MediaFaultStage.Crypto,
+                'a media frame could not be built or signed',
+                false,
+              );
+            });
+          },
+          onError: () => {
+            // Event-once per encoder instance: the fatal fault stops the pipeline.
+            this.#metrics.audio.encoderError();
+            this.#fault(
+              MediaFaultStage.Encoder,
+              'the audio encoder failed; capture has stopped',
+              true,
+            );
+          },
         });
-      },
-      onError: () => {
-        this.#fault(MediaFaultStage.Encoder, 'the audio encoder failed; capture has stopped', true);
-      },
-    });
-    this.#encoder = encoder;
-    this.#teardown.register('encoder', () => encoder.close());
+      } catch (err) {
+        // An encoder that cannot be BUILT is counted like its error callback (both kinds).
+        this.#metrics.audio.encoderError();
+        throw err;
+      }
+      this.#encoder = encoder;
+      this.#teardown.register('encoder', () => encoder.close());
+    }
 
     this.#ingress = new IngressPipeline({
       metrics: this.#metrics.audio,
@@ -575,7 +611,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       this.#transports?.clear();
       this.#firstMedia.clear();
     });
-    this.#teardown.register('transmit-keys', () => this.#transmitKeys.clear());
+    // The transmit keys are the SESSION's: cleared by it after every path stops.
 
     // C-3 (story 2 R-16): a KEK generation leaving retention takes its replay
     // scope and its transmit keys with it, TOGETHER, in this one synchronous
@@ -604,39 +640,29 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     // exists for every session rather than only for lucky ones.
     this.#firstMedia.start();
 
-    // R-13: every sender rotates its transmit keys on receipt of a new KEK, or a
-    // departed member keeps decrypting from the unwrapped keys it cached before
-    // the rotation. The holder fires this only AFTER the new KEK is current, so
-    // the next mint wraps under it — and never on a redelivery of the same
-    // generation, which would make a reconnect a rotation lever.
-    //
-    // SUBSCRIBED BEFORE `capture.start`, not after. The capture callback is
-    // registered inside that call and can mint before it resolves, so a KEK
-    // demotion landing in that window would otherwise never rotate — leaving the
-    // sender on a transmit key a leaver holds until the next timer or unmute
-    // rotation. A rotate() with nothing minted yet is harmless.
-    const unsubscribe = this.#options.kekSource.onCurrentGenerationChanged(() => {
-      this.#transmitKeys.rotate();
-    });
-    this.#teardown.register('kek-rotation-listener', unsubscribe);
+    // R-13 (KEK receipt rotates the transmit keys) is the SESSION's single
+    // subscription, beside the manager it rotates (`transmitKeys.ts:
+    // rotateOnKekChange`, bound in `session/mediaStart.ts` before this starts).
 
-    try {
-      await capture.start(
-        (data) => this.#onCapturedFrame(data),
-        () => this.#onCaptureEnded(),
-      );
-    } catch (err) {
-      this.#countCaptureFailure(err);
-      throw err;
+    if (capture) {
+      try {
+        await capture.start(
+          (data) => this.#onCapturedFrame(data),
+          () => this.#onCaptureEnded(),
+        );
+      } catch (err) {
+        this.#countCaptureFailure(err);
+        throw err;
+      }
+
+      this.#rotationTimer = this.#setInterval(() => {
+        // §4: senders rotate every T for audio, because rotation is O(1),
+        // involves nobody else, and needs no signalling.
+        this.#transmitKeys.rotate();
+      }, this.#config.keys.audioRotationPeriodMs);
+      const timer = this.#rotationTimer;
+      this.#teardown.register('rotation-timer', () => this.#clearInterval(timer));
     }
-
-    this.#rotationTimer = this.#setInterval(() => {
-      // §4: senders rotate every T for audio, because rotation is O(1),
-      // involves nobody else, and needs no signalling.
-      this.#transmitKeys.rotate();
-    }, this.#config.keys.audioRotationPeriodMs);
-    const timer = this.#rotationTimer;
-    this.#teardown.register('rotation-timer', () => this.#clearInterval(timer));
 
     // Capture-source gauge + deficit on one export-cadence timer (`intervalSignals.ts`).
     this.#teardown.register(
@@ -793,7 +819,8 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   async setCaptureDevice(deviceId: string | undefined): Promise<void> {
     if (this.#deviceId === deviceId) return;
     this.#deviceId = deviceId;
-    if (!this.#started || this.#stopped) return;
+    // Not publishing audio: record the choice, never open a microphone.
+    if (!this.#started || this.#stopped || !this.#options.publishesAudio) return;
 
     const audio = this.#config.audio;
     // Stop FIRST. Two live captures means two lit microphone indicators and two
@@ -989,9 +1016,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    * string or any per-frame value — that would make a repeating fault unbounded.
    */
   #fault(stage: MediaFaultStage, message: string, fatal: boolean): void {
-    const key = faultKey(stage, message);
-    if (this.#reportedFaults.has(key)) return;
-    this.#reportedFaults.add(key);
+    if (!this.#faults.report(stage, message)) return;
     this.emit('fault', { stage, message, fatal });
     if (fatal) void this.stop();
   }
@@ -1002,11 +1027,6 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    * per episode rather than once per session.
    */
   #rearmFault(stage: MediaFaultStage, message: string): void {
-    this.#reportedFaults.delete(faultKey(stage, message));
+    this.#faults.rearm(stage, message);
   }
-}
-
-/** The event-once dedupe key: (stage, message). */
-function faultKey(stage: MediaFaultStage, message: string): string {
-  return `${stage}\u0000${message}`;
 }

@@ -35,7 +35,7 @@ import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { HEADER_VERSION } from '../../frame/wireConstants.js';
 import { decodeFrame } from '../../frame/frameCodec.js';
 import { MeetingIdentity } from '../../setup/identity.js';
-import { assignmentsOn, kekHolderWith } from '../../__tests__/helpers.js';
+import { assignmentsOn, kekHolderWith, sessionTransmitKeys } from '../../__tests__/helpers.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import {
@@ -123,6 +123,8 @@ async function makeRig(
     kekSource,
     roster,
     senderId: SENDER_ID,
+    transmitKeys: sessionTransmitKeys(SENDER_ID, kekSource),
+    publishesAudio: true,
     identity,
     declaredSlotIds: shape.declaredSlotIds ?? [0],
     captureSource: 'microphone',
@@ -378,6 +380,8 @@ describe('teardown', () => {
       kekSource,
       roster: new RosterIdentityKeys(4),
       senderId: SENDER_ID,
+      transmitKeys: sessionTransmitKeys(SENDER_ID, kekSource),
+      publishesAudio: true,
       identity,
       declaredSlotIds: [0],
       captureSource: 'microphone',

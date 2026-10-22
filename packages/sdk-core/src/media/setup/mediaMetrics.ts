@@ -394,6 +394,57 @@ export type MediaKeyframePerKindOutcome = Exclude<
 >;
 
 /**
+ * Bounded `source` vocabulary for `dt_client_media_keyframes_produced_total`
+ * (story 3 R-30, amendment 4): WHY the publisher keyed a video stream.
+ *
+ *   * `directive_start` — a directed start or resume, or a target added to an
+ *     active stream (a target with no group in progress).
+ *   * `request` — an accepted MH `KeyframeRequest`.
+ *   * `abandonment` — the publisher re-keying after an abandonment IT decided
+ *     (its per-target backlog cap). Never folded into `directive_start`: the
+ *     split keeps a lossy-uplink keying loop distinguishable from a request
+ *     storm. An MH STOP_SENDING / refusal is MH's decision and never lands here.
+ *
+ * A keyframe is counted ONCE; a merged deferral counts under the cause that
+ * created it. A per-metric vocabulary: `source` also means `join_response |
+ * kek_update` on `dt_client_media_kek_updates_total`, and the two are never
+ * summed by `source` across series.
+ */
+export const MEDIA_KEYFRAME_SOURCES = {
+  DirectiveStart: 'directive_start',
+  Request: 'request',
+  Abandonment: 'abandonment',
+} as const satisfies Record<string, string>;
+
+/**
+ * Bounded `outcome` vocabulary for `dt_client_media_send_groups_stopped_total`
+ * (story 3 C-A2): why a target went dark for the PEER's reasons — the lane went
+ * `mh_stopped` and gets no publisher re-key (whoever decides an abandonment
+ * repairs it).
+ *
+ *   * `peer_stopped` — MH sent STOP_SENDING, or a write failed in any way.
+ *   * `open_failed` — the group stream open was rejected.
+ *   * `open_stalled` — the backlog cap tripped while the open was still pending
+ *     (stream credit never arrived: MAX_STREAMS starvation). The ONLY signal for
+ *     it anywhere: quinn enforces the limit and MH has no event to count.
+ *
+ * A per-metric vocabulary: never summed by `outcome` across series.
+ */
+export const MEDIA_SEND_GROUP_STOP_OUTCOMES = {
+  PeerStopped: 'peer_stopped',
+  OpenFailed: 'open_failed',
+  OpenStalled: 'open_stalled',
+} as const satisfies Record<string, string>;
+
+/** One of {@link MEDIA_SEND_GROUP_STOP_OUTCOMES}. */
+export type MediaSendGroupStopOutcome =
+  (typeof MEDIA_SEND_GROUP_STOP_OUTCOMES)[keyof typeof MEDIA_SEND_GROUP_STOP_OUTCOMES];
+
+/** One of {@link MEDIA_KEYFRAME_SOURCES}. */
+export type MediaKeyframeSource =
+  (typeof MEDIA_KEYFRAME_SOURCES)[keyof typeof MEDIA_KEYFRAME_SOURCES];
+
+/**
  * Bounded `outcome` vocabulary for
  * `dt_client_media_mh_control_channel_ended_total`: how a handler's control
  * stream ended while this client was not tearing down. A per-metric vocabulary.
@@ -754,6 +805,87 @@ export class MediaKindMetrics {
     });
   }
 
+  // ---------------------------------------------------------- video send ---
+
+  /**
+   * The publisher produced a keyframe on a stream of THIS kind, by cause
+   * ({@link MEDIA_KEYFRAME_SOURCES}). Counted ONCE per keyframe at the gate's
+   * decision; a merged deferral counts under its creating cause. `count` 0 is
+   * the zero-initialisation when the stream is first directed. Never the GoP
+   * value, stream number or timing.
+   */
+  keyframeProduced(source: MediaKeyframeSource, count: 0 | 1 = 1): void {
+    this.#sink?.counter(
+      'dt_client_media_keyframes_produced_total',
+      { ...this.#base, source },
+      count,
+    );
+  }
+
+  /**
+   * The publisher RESET one target's current group stream because that target's
+   * backlog crossed its cap (story 3 R-12) — a PUBLISHER-DECIDED abandonment.
+   * NOT counted here: a peer stop / refused open / stalled open — those are on
+   * {@link sendGroupStopped}. `count` 0 is the
+   * zero-initialisation when the stream is first directed. No depth or size.
+   */
+  sendGroupAbandoned(count: 0 | 1 = 1): void {
+    this.#sink?.counter('dt_client_media_send_groups_abandoned_total', this.#base, count);
+  }
+
+  /**
+   * A target went dark for the PEER's reasons (`mh_stopped`), once per
+   * transition into that state, by {@link MEDIA_SEND_GROUP_STOP_OUTCOMES}. No
+   * target or handler dimension. `count` 0 is the zero-initialisation at first
+   * direction.
+   */
+  sendGroupStopped(outcome: MediaSendGroupStopOutcome, count: 0 | 1 = 1): void {
+    this.#sink?.counter(
+      'dt_client_media_send_groups_stopped_total',
+      { ...this.#base, outcome },
+      count,
+    );
+  }
+
+  /**
+   * A CAPTURED frame was dropped BEFORE encode because the encoder's queue was
+   * over `media.egress.videoMaxEncodeQueue` (pre-encode, per captured frame, not
+   * per lane; never part of the send-drop ratio). Audio has no pre-encode bound
+   * and never emits it. `count` 0 is the zero-initialisation at first direction.
+   */
+  encodeQueueDropped(count: 0 | 1 = 1): void {
+    this.#sink?.counter('dt_client_media_encode_queue_dropped_total', this.#base, count);
+  }
+
+  /**
+   * A directive's `min_keyframe_interval_ms` was below the compiled floor and
+   * was clamped up to it — once per directive RECEIPT that clamps. A correct MC
+   * never directs below its own floor, so a non-zero value is a drift or
+   * hostile-controller signal. Lazily created; panel only, no alert.
+   */
+  keyframeMinIntervalClamped(): void {
+    this.#sink?.counter('dt_client_media_keyframe_min_interval_clamped_total', this.#base);
+  }
+
+  /**
+   * An encoder for THIS kind raised its error callback, or could not be built
+   * for the directed configuration. Event-once per encoder instance; no
+   * `reason` label (WebCodecs gives no bounded one). Lazily created.
+   */
+  encoderError(): void {
+    this.#sink?.counter('dt_client_media_encoder_errors_total', this.#base);
+  }
+
+  /**
+   * MC directed a stream of THIS kind with a required encoding field missing or
+   * invalid (video: codec, width, height, frame rate, bitrate,
+   * `min_keyframe_interval_ms`). The stream is refused and fails closed. No
+   * field label: the WARN names the field. Lazily created.
+   */
+  sendDirectiveEncodingRefused(): void {
+    this.#sink?.counter('dt_client_media_send_directive_encoding_refused_total', this.#base);
+  }
+
   /**
    * MC's send directive omitted THIS published kind from a non-empty `streams`
    * list — a protocol fault (story 3 wire freeze: every published kind is
@@ -936,18 +1068,24 @@ export class MediaSessionMetrics {
  * The handles one media session uses: the kind-free session set and one
  * per-kind set per kind the session runs.
  *
- * AUDIO ONLY IN THIS TASK. No video handle is constructed: a constructed handle
- * zero-initialises its series (e.g. `sendDirectiveKindMissing(0)`), and a
- * `media_kind="video"` series appearing before video flows would let the video
- * read-back (story 3 C-B) pass vacuously. The tasks that add video emitters
- * (C-A2, C-B) add the `video` member.
+ * Constructing a handle emits NOTHING (zero-initialisation is an explicit call
+ * at join or at first direction), so the video handle exists from join while no
+ * `media_kind="video"` series appears before video is directed.
  */
 export class MediaMetrics {
   readonly session: MediaSessionMetrics;
   readonly audio: MediaKindMetrics;
+  /**
+   * The VIDEO handle (story 3 C-A2). Constructing it emits nothing: every video
+   * series is either lazy or zero-initialised only when a video stream is first
+   * DIRECTED (`lifecycle/VideoPublisher.ts`), so no `media_kind="video"` series
+   * exists before video flows and C-B's read-back cannot pass vacuously.
+   */
+  readonly video: MediaKindMetrics;
 
   constructor(identity: MediaMetricIdentity, sink: MetricsSink | undefined) {
     this.session = new MediaSessionMetrics(identity, sink);
     this.audio = new MediaKindMetrics(identity, MEDIA_KIND_LABELS.Audio, sink);
+    this.video = new MediaKindMetrics(identity, MEDIA_KIND_LABELS.Video, sink);
   }
 }

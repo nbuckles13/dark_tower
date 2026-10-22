@@ -4,18 +4,15 @@
 // `StreamAssignment` onto the public tokens (story 3 R-4, wire freeze). Same
 // shape and reasoning as `codecMap.ts`:
 //
-//   * KEYED ON THE WIRE ENUM. `Record<SlotState, …>` must list every member, so
-//     a value added to the proto is a COMPILE ERROR here rather than a slot that
-//     silently renders as something it is not.
+//   * KEYED ON THE WIRE ENUM (a `Partial` table until MC-B; see below).
 //   * OPEN-ENUM FAIL-CLOSED. protobuf-es decodes a number the schema does not
 //     name as that number; it is not in the table and maps to `unspecified`.
 //     NOTHING but the wire's `ACTIVE` maps to `active` — the security property
 //     (an unknown or legacy state never renders media).
 //
-// `SOURCE_MUTED` is the one wire value with no direct token: the flat
-// vocabulary removed it (story 3 wire freeze). Until MC-A stops emitting it,
-// `legacySourceMutedShim.ts` resolves it to an avatar token. Here it maps to
-// `null`, which callers must hand to that shim — never default.
+// A wire value the table does not name — including any superseded member the
+// proto still carries until MC-B (story 3 task 15) deletes it — maps to
+// `unspecified`, never `active`.
 
 import { MediaKind, SlotState } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 
@@ -23,15 +20,18 @@ import type { SlotStateToken } from './events.js';
 import type { MediaKindToken, OpenMediaKindToken } from '../media/mediaKind.js';
 
 /**
- * Exhaustive wire -> token table. `null` = "no direct token": the legacy
- * `SOURCE_MUTED`, resolved by the transitional shim.
+ * Wire -> token table.
+ *
+ * `Partial` rather than the exhaustive `Record<SlotState, …>` ONLY while the
+ * proto still carries the superseded legacy member that no SDK code may name
+ * (story 3 C-A2: zero references, so MC-B can delete it). MC-B (story 3 task 15)
+ * restores `Record<SlotState, SlotStateToken>` once the member is gone, bringing
+ * back the compile error for an unmapped new member. Until then
+ * `__tests__/slotStateMap.test.ts` pins "every member but one is mapped".
  */
-// TRANSITIONAL (C-A1 shim b) — deleted by C-A2: the `| null` arm of this type.
-const SLOT_STATE_TOKENS: Record<SlotState, SlotStateToken | null> = {
+const SLOT_STATE_TOKENS: Partial<Record<SlotState, SlotStateToken>> = {
   [SlotState.UNSPECIFIED]: 'unspecified',
   [SlotState.ACTIVE]: 'active',
-  // TRANSITIONAL (C-A1 shim b) — deleted by C-A2: legacy SOURCE_MUTED has no token.
-  [SlotState.SOURCE_MUTED]: null,
   [SlotState.WITHHELD_BY_CONGESTION]: 'withheld_by_congestion',
   [SlotState.FEWER_SOURCES_THAN_SLOTS]: 'fewer_sources_than_slots',
   [SlotState.SOURCE_UNREACHABLE]: 'source_unreachable',
@@ -43,14 +43,11 @@ const SLOT_STATE_TOKENS: Record<SlotState, SlotStateToken | null> = {
 };
 
 /**
- * Map a wire slot state onto its token. Returns `null` ONLY for the legacy
- * `SOURCE_MUTED` (hand it to the transitional shim); any number the table does
- * not name is `unspecified`, never `active`.
+ * Map a wire slot state onto its token. Any number the table does not name is
+ * `unspecified`, never `active` (fail closed).
  */
-export function slotStateToken(state: SlotState): SlotStateToken | null {
-  return Object.prototype.hasOwnProperty.call(SLOT_STATE_TOKENS, state)
-    ? SLOT_STATE_TOKENS[state]
-    : 'unspecified';
+export function slotStateToken(state: SlotState): SlotStateToken {
+  return SLOT_STATE_TOKENS[state] ?? 'unspecified';
 }
 
 /**

@@ -19,7 +19,10 @@ import type {
   AudioEncoderFactory,
   CaptureSourceFactory,
   PlaybackSinkFactory,
+  VideoCaptureSourceFactory,
+  VideoEncoderFactory,
 } from '../media/setup/seams.js';
+import type { Vp8Profile } from '../media/setup/vp8.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
 import type { MediaFault } from '../media/lifecycle/AudioPipeline.js';
 import type { MuteSnapshot } from '../media/lifecycle/muteState.js';
@@ -265,6 +268,16 @@ export interface CaptureSourceInfo {
   readonly toneHz?: number;
 }
 
+/**
+ * What feeds the VIDEO send path (story 3 R-27). `patternId` only in a
+ * test-pattern build: the meeting-scoped sender id the pattern encodes (the
+ * test bus's `videoCaptureSource.patternId`). Never a metric label.
+ */
+export interface VideoCaptureSourceInfo {
+  readonly mode: 'camera' | 'test_pattern';
+  readonly patternId?: number;
+}
+
 export interface MeetingSessionOptions {
   /** AC origin template containing `{subdomain}` (e.g. `https://{subdomain}.localhost:8443`). */
   readonly acOriginTemplate: string;
@@ -301,12 +314,26 @@ export interface MeetingSessionOptions {
   readonly playbackFactory?: PlaybackSinkFactory;
   /**
    * What this participant publishes (story 3 R-2). Default `['audio']`. FIXED
-   * FOR THE MEMBERSHIP: copied and frozen at construction. Audio only in this
-   * SDK build: a `video` entry throws a typed `PublishKindNotSupported` (story
-   * 3 C-A2 enables it); publishing nothing with 0 + 0 slots throws
-   * `NothingToPublishOrReceive`.
+   * FOR THE MEMBERSHIP: copied and frozen at construction. `audio`, `video`,
+   * both, or neither; a duplicate throws `PublishKindNotSupported`, and
+   * publishing nothing with 0 + 0 slots throws `NothingToPublishOrReceive`.
    */
   readonly publish?: readonly PublishKind[];
+  /** Camera capture factory. Defaults to `getUserMedia({video})`; injected for tests. */
+  readonly videoCaptureFactory?: VideoCaptureSourceFactory;
+  /** VP8 encoder factory. Defaults to WebCodecs; injected for tests. */
+  readonly videoEncoderFactory?: VideoEncoderFactory;
+  /**
+   * The VP8 capability probe run at join when video is published or received
+   * (story 3 R-8). Defaults to `media/setup/vp8.ts:probeVp8Support`; injected
+   * for tests. Rejecting means "not supported".
+   */
+  readonly vp8Probe?: (profile: Vp8Profile) => Promise<void>;
+  /** Timer seams for the video keyframe gate and rotation (tests). */
+  readonly setTimeout?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  readonly clearTimeout?: (handle: ReturnType<typeof setTimeout>) => void;
+  readonly setInterval?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
+  readonly clearInterval?: (handle: ReturnType<typeof setInterval>) => void;
   /**
    * N, as parsed by `parseReceiveSlots(…, 'audio')` (e.g. from
    * `VITE_DT_AUDIO_RECEIVE_SLOTS`), with its source. When present it sets

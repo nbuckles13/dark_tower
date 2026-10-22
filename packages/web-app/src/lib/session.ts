@@ -41,7 +41,8 @@ export function buildMeetingClient(config: DemoConfig): MeetingApiClient {
  *
  * N and M come from `VITE_DT_AUDIO_RECEIVE_SLOTS` / `VITE_DT_VIDEO_RECEIVE_SLOTS`
  * (see `config.ts`), unless a test-levers build overrides them for this context.
- * The publish set is the SDK default (audio) until the video publish path ships. `e2e` is
+ * The publish set is the SDK default (audio); the publish-set chooser is story 3
+ * C-C1's. A test-levers build may set it per context (`publish` lever). `e2e` is
  * the test build's receive-side instrumentation (`e2eAnalysis.ts`); it is
  * `undefined` in production, so neither the verification recorder nor the
  * analysing playback wrapper is ever injected there.
@@ -64,6 +65,7 @@ export function buildMeetingSession(
       (__DT_TEST_LEVERS__ ? active?.audioReceiveSlots : undefined) ?? config.audioReceiveSlots,
     videoReceiveSlots:
       (__DT_TEST_LEVERS__ ? active?.videoReceiveSlots : undefined) ?? config.videoReceiveSlots,
+    ...(__DT_TEST_LEVERS__ && active?.publish ? { publish: active.publish } : {}),
     ...(e2e ? { receiveVerification: e2e.recorder, playbackFactory: e2e.playbackFactory } : {}),
   });
 }

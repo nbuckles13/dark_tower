@@ -9,6 +9,7 @@ import { MockWebTransport } from '@darktower/test-utils';
 
 import { FrameDecoder } from '../../framing/length-prefix.js';
 import { DEFAULT_CLIENT_CONFIG, transmitRewrapLatencyMs } from '../../config/clientConfig.js';
+import { TransmitKeyManager, rotateOnKekChange } from '../lifecycle/transmitKeys.js';
 import { MeetingKekHolder, type MeetingKekHolderOptions } from '../setup/kekSource.js';
 import type { SenderGate } from '../pipeline/ingress.js';
 import type { DecodeLane } from '../pipeline/receiveLanes.js';
@@ -96,6 +97,19 @@ export function emptyKekHolder(
     rewrapLatencyMs: transmitRewrapLatencyMs(DEFAULT_CLIENT_CONFIG.media),
     ...options,
   });
+}
+
+/**
+ * The session-owned transmit keys a pipeline is built with: one manager,
+ * KEK-rotated through the ONE production binding (`rotateOnKekChange`).
+ */
+export function sessionTransmitKeys(
+  senderId: number,
+  kek: { onCurrentGenerationChanged(listener: () => void): () => void },
+): TransmitKeyManager {
+  const keys = new TransmitKeyManager(senderId);
+  rotateOnKekChange(kek, keys);
+  return keys;
 }
 
 /** A holder with `kek` installed as the current generation, as a join response would. */

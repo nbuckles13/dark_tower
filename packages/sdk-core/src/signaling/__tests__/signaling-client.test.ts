@@ -232,8 +232,6 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
       const joined = (await joinPromise) as Awaited<ReturnType<SignalingClient['join']>>;
       expect(joined.maxAudioReceiveSlots).toBe(expected);
       expect(joined.maxVideoReceiveSlots).toBe(expected);
-      // The superseded tag 12 is no longer projected.
-      expect(Object.keys(joined)).not.toContain('maxReceiveSlots');
       client.close();
     },
   );

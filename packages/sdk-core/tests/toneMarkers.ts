@@ -16,3 +16,19 @@ export const TONE_RUNTIME_TOKENS = [
   'createMediaStreamDestination',
   'test_tone',
 ] as const;
+
+/**
+ * THE test-PATTERN bundle markers (story 3 R-27) — same contract as
+ * {@link TONE_RUNTIME_TOKENS}: forbidden in sdk-core's runtime artifacts, and
+ * the web app's FORBIDDEN list must be a superset whose positive-control build
+ * proves each one real. Generator-unique literals only: `dt-test-pattern` is
+ * the generator's marker (`media/setup/testPattern.ts:TEST_PATTERN_MARKER`, on
+ * a live gated path), `test_pattern` the mode token. A platform API name such
+ * as `OffscreenCanvas` is deliberately NOT a marker: a later legitimate render
+ * path could use it.
+ */
+export const PATTERN_RUNTIME_TOKENS = [
+  '__DT_TEST_PATTERN__',
+  'test_pattern',
+  'dt-test-pattern',
+] as const;

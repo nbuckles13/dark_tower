@@ -34,7 +34,7 @@ import {
   transmitRewrapLatencyMs,
 } from '../../../config/clientConfig.js';
 import { kekObserver, rosterInvalidationListener } from '../../../session/mediaWiring.js';
-import { NOMINAL_DEBOUNCE_SECONDS, waitFor } from '../../__tests__/helpers.js';
+import { NOMINAL_DEBOUNCE_SECONDS, sessionTransmitKeys, waitFor } from '../../__tests__/helpers.js';
 import { decodeFrame } from '../../frame/frameCodec.js';
 import { unpackKeyId } from '../../frame/keyId.js';
 import { MEETING_KEK_BYTES, parseSframe } from '../../frame/sframe.js';
@@ -138,6 +138,8 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
     kekSource: holder,
     roster,
     senderId: RECEIVER_SENDER_ID,
+    transmitKeys: sessionTransmitKeys(RECEIVER_SENDER_ID, holder),
+    publishesAudio: true,
     identity,
     declaredSlotIds: opts.declared ?? [0, 1, 2],
     captureSource: 'microphone',
@@ -728,6 +730,8 @@ async function makeSender(senderId: number) {
     kekSource: holder,
     roster: new RosterIdentityKeys(8),
     senderId,
+    transmitKeys: sessionTransmitKeys(senderId, holder),
+    publishesAudio: true,
     identity,
     declaredSlotIds: [0],
     captureSource: 'microphone',
@@ -1074,6 +1078,8 @@ describe('R-13 holds from the first captured frame, not from when start() resolv
       kekSource: holder,
       roster: new RosterIdentityKeys(8),
       senderId: 79,
+      transmitKeys: sessionTransmitKeys(79, holder),
+      publishesAudio: true,
       identity: await MeetingIdentity.create(),
       declaredSlotIds: [0],
       captureSource: 'microphone',

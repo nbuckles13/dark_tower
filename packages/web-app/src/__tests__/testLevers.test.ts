@@ -41,6 +41,7 @@ describe('parseTestLevers', () => {
       audioReceiveSlots: undefined,
       videoReceiveSlots: undefined,
       forceHostControls: false,
+      publish: undefined,
     });
   });
 
@@ -116,3 +117,19 @@ describe('checkLeversApplied — the S10a non-vacuity guard', () => {
     expect(checkLeversApplied(parseTestLevers({})!, [U0])).toBeUndefined();
   });
 });
+
+it('the publish lever maps the cohort contract onto the SDK publish set (story 3 C-A2)', () => {
+  expect(parseTestLevers({ publish: 'audio' })?.publish).toEqual(['audio']);
+  expect(parseTestLevers({ publish: 'video' })?.publish).toEqual(['video']);
+  expect(parseTestLevers({ publish: 'both' })?.publish).toEqual(['audio', 'video']);
+  expect(parseTestLevers({ publish: 'none' })?.publish).toEqual([]);
+  expect(parseTestLevers({})?.publish).toBeUndefined();
+  expect(Object.isFrozen(parseTestLevers({ publish: 'both' })?.publish)).toBe(true);
+});
+
+it.each(['camera', 'AUDIO', 'toString', 'constructor', '__proto__', 7, ['audio']])(
+  'the publish lever REFUSES %j, never guessing',
+  (bad) => {
+    expect(() => parseTestLevers({ publish: bad })).toThrow(/publish must be one of/);
+  },
+);

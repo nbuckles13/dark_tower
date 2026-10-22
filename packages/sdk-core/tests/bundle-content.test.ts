@@ -28,7 +28,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { TONE_RUNTIME_TOKENS } from './toneMarkers.js';
+import { PATTERN_RUNTIME_TOKENS, TONE_RUNTIME_TOKENS } from './toneMarkers.js';
 // Test tier to test tier: the loader's path constant, never a second literal.
 import { VECTORS_PATH } from '../src/media/frame/__tests__/frameVectors.js';
 
@@ -158,6 +158,16 @@ describe('R-14: production bundle excludes the dev-trust path', () => {
       'SCAN VACUOUS: no .mjs and .cjs runtime artifact was scanned for the tone markers',
     ).toBe(true);
     expect(scanForTokens(scanned, TONE_RUNTIME_TOKENS)).toEqual([]);
+  });
+
+  it('carries no test-PATTERN generator, gate or mode token outside type declarations (story 3 R-27)', () => {
+    const isDeclaration = (f: string): boolean => /\.d\.[cm]?ts(\.map)?$/.test(f);
+    const scanned = listFiles(DIST).filter((f) => !isDeclaration(f));
+    expect(
+      scanned.some((f) => f.endsWith('.mjs')) && scanned.some((f) => f.endsWith('.cjs')),
+      'SCAN VACUOUS: no .mjs and .cjs runtime artifact was scanned for the pattern markers',
+    ).toBe(true);
+    expect(scanForTokens(scanned, PATTERN_RUNTIME_TOKENS)).toEqual([]);
   });
 
   it('contains none of the dev-trust tokens in ANY dist artifact (matches dt-guard dist scan)', () => {

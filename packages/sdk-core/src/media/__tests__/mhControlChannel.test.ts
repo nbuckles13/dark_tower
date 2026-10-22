@@ -27,16 +27,21 @@ const JWT = 'meeting-jwt-value';
 
 interface Recorded {
   readonly requests: MhKeyframeRequest[];
+  /** The handler URL each request was bound to (the connection it was READ on). */
+  readonly urls: string[];
   malformed: number;
   readonly ended: MhControlChannelEnding[];
 }
 
 function recordingSink(): { sink: MhControlSink; seen: Recorded } {
-  const seen: Recorded = { requests: [], malformed: 0, ended: [] };
+  const seen: Recorded = { requests: [], urls: [], malformed: 0, ended: [] };
   return {
     seen,
     sink: {
-      keyframeRequest: (_url, request) => seen.requests.push(request),
+      keyframeRequest: (url, request) => {
+        seen.urls.push(url);
+        seen.requests.push(request);
+      },
       malformed: () => {
         seen.malformed += 1;
       },
@@ -92,6 +97,8 @@ describe('MhServerMessage read loop', () => {
     mh.simulateServerMessage(0, encodeFrame(keyframeRequest(1, 7)));
     await waitFor(() => seen.requests.length === 1);
     expect(seen.requests).toEqual([{ streamNumber: 1, gopCounter: 7 }]);
+    // H is the connection the request was read on (security S6), never payload.
+    expect(seen.urls).toEqual([URL_A]);
     expect(seen.malformed).toBe(0);
   });
 

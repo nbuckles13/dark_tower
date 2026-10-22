@@ -76,7 +76,6 @@ import { MEDIA_KEK_SOURCES } from '../media/setup/mediaMetrics.js';
 import { SUPPORTED_HEADER_VERSIONS } from '../media/frame/frameCodec.js';
 import { RosterKeyFeed } from './rosterKeyFeed.js';
 import { mediaKindToken, slotStateToken, wireMediaKind } from './slotStateMap.js';
-import { LegacySourceMutedShim, type LegacyAssignmentInput } from './legacySourceMutedShim.js';
 import { explicitMuteFields, type PerKindMuteState } from './muteRequest.js';
 import type {
   ParticipantMuteEvent,
@@ -86,11 +85,12 @@ import type {
   RosterKeySink,
   SendDirectiveEvent,
   SendStreamDirective,
+  SlotMediaKind,
   StreamAssignmentEvent,
   StreamAssignmentsEvent,
 } from './events.js';
-import { toWireCodec } from './codecMap.js';
-import type { Codec } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
+import { fromWireCodec, toWireCodec } from './codecMap.js';
+import type { Codec, SlotState } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type {
   JoinedEvent,
   MhConnectionStatusReport,
@@ -218,7 +218,10 @@ function defer<T>(): Deferred<T> {
 }
 
 /** A decoded `StreamAssignment`, copied out of the protobuf graph. */
-interface WireAssignment extends LegacyAssignmentInput {
+interface WireAssignment {
+  readonly slotState: SlotState;
+  readonly senderId: number | undefined;
+  readonly mediaKind: SlotMediaKind;
   readonly slotId: number;
   readonly mediaHandlerUrl: string;
 }
@@ -290,8 +293,6 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   #publishKinds: readonly PublishKind[] | undefined;
   /** Tail of the serialised write chain on the signalling stream. */
   #sendTail: Promise<void> = Promise.resolve();
-  /** TRANSITIONAL (C-A1 shim b) — deleted by C-A2. See `legacySourceMutedShim.ts`. */
-  readonly #legacyShim = new LegacySourceMutedShim();
   /** TRANSITIONAL (C-A1 shim b): the latest WIRE assignments, for re-derivation. */
   #lastWireAssignments: readonly WireAssignment[] = [];
   #lastUnreachable: readonly number[] = [];
@@ -606,8 +607,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           // through, never coerced to 0 (ADR-0036 §2: 0 is reserved-invalid).
           senderId: jr.senderId,
           // `optional uint32`: absent stays absent (caps unknown), a present 0
-          // stays 0 (legal; video 0 is the video-off lever). Tag 12
-          // (`max_receive_slots`) is superseded and no longer read.
+          // stays 0 (legal; video 0 is the video-off lever).
           maxAudioReceiveSlots: jr.maxAudioReceiveSlots,
           maxVideoReceiveSlots: jr.maxVideoReceiveSlots,
           existingParticipants: jr.existingParticipants.map((p) => ({
@@ -639,8 +639,6 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       }
       case 'participantLeft': {
         const pl = message.value;
-        // TRANSITIONAL (C-A1 shim b): forget the leaver's mute flags.
-        this.#legacyShim.forget(this.#rosterKeys.senderIdOf(pl.participantId));
         // Forgets the leaver's roster key — a second cutoff beside the slot gate.
         this.#rosterKeys.left(pl.participantId);
         this.emit('participantLeft', {
@@ -660,6 +658,16 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           // "MC said nothing" stays distinguishable from "MC said 0".
           maxBitrateBps:
             s.encoding && s.encoding.maxBitrateBps > 0 ? s.encoding.maxBitrateBps : undefined,
+          encoding: s.encoding
+            ? {
+                codec: fromWireCodec(s.encoding.codec),
+                width: s.encoding.width,
+                height: s.encoding.height,
+                frameRate: s.encoding.frameRate,
+                maxBitrateBps: s.encoding.maxBitrateBps,
+                minKeyframeIntervalMs: s.encoding.minKeyframeIntervalMs,
+              }
+            : undefined,
           targets: s.targets.map((target) => target.mediaHandlerUrl),
         }));
         this.emit('sendDirective', { streams, headerVersion: directive.headerVersion });
@@ -714,20 +722,6 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           videoServerMuted: update.videoServerMuted,
           ...(serverMutedBy !== undefined ? { serverMutedBy } : {}),
         });
-        // TRANSITIONAL (C-A1 shim b) — deleted by C-A2: a late update re-derives
-        // the legacy SOURCE_MUTED slots this sender holds.
-        const senderId = this.#rosterKeys.senderIdOf(participantId);
-        if (
-          this.#legacyShim.recordMuteUpdate(
-            senderId,
-            update.audioServerMuted,
-            update.videoServerMuted,
-          ) &&
-          senderId !== undefined &&
-          LegacySourceMutedShim.holdsLegacySlot(this.#lastWireAssignments, senderId)
-        ) {
-          this.#emitAssignments();
-        }
         return;
       }
       case 'unmuteRequest': {
@@ -857,8 +851,8 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
 
   /**
    * Map the latest wire assignments onto the public event and emit it. The
-   * flat tokens come from `slotStateMap.ts`; the legacy `SOURCE_MUTED` goes
-   * through TRANSITIONAL shim b (deleted by C-A2), never to `active`.
+   * flat tokens come from `slotStateMap.ts`; any wire value it does not name
+   * maps to `unspecified`, never to `active`.
    */
   #emitAssignments(): void {
     const assignments: StreamAssignmentEvent[] = this.#lastWireAssignments.map((a) => ({
@@ -866,8 +860,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       mediaKind: a.mediaKind,
       senderId: a.senderId,
       mediaHandlerUrl: a.mediaHandlerUrl,
-      // `null` only for the legacy SOURCE_MUTED: TRANSITIONAL (C-A1 shim b).
-      slotState: slotStateToken(a.slotState) ?? this.#legacyShim.resolve(a),
+      slotState: slotStateToken(a.slotState),
     }));
     const event: StreamAssignmentsEvent = {
       assignments,

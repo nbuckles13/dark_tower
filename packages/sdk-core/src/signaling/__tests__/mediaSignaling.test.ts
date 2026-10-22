@@ -183,7 +183,20 @@ describe('send directive', () => {
     expect(seen[0]).toEqual({
       headerVersion: HEADER_VERSION,
       streams: [
-        { streamNumber: 3, mediaKind: 'audio', maxBitrateBps: 40_000, targets: ['https://mh'] },
+        {
+          streamNumber: 3,
+          mediaKind: 'audio',
+          maxBitrateBps: 40_000,
+          encoding: {
+            codec: null,
+            width: 0,
+            height: 0,
+            frameRate: 0,
+            maxBitrateBps: 40_000,
+            minKeyframeIntervalMs: undefined,
+          },
+          targets: ['https://mh'],
+        },
       ],
     });
   });

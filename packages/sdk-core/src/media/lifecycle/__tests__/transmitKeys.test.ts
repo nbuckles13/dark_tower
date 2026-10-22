@@ -110,10 +110,29 @@ describe('gop_counter is per (sender, stream), monotonic, and never reset (ADR-0
     expect(mgr.nextGopCounter(0)).toBe(3);
   });
 
-  it('exposes no getter, setter or reset for it (stream identity, R-30)', () => {
+  it('exposes no setter or reset for it — only the next value and the current one (R-30)', () => {
     const mgr = new TransmitKeyManager(258);
     const surface = Object.getOwnPropertyNames(Object.getPrototypeOf(mgr));
-    expect(surface.filter((n) => /gop/i.test(n))).toEqual(['nextGopCounter']);
+    // `currentGopCounter` is the keyframe gate's read-only comparison input
+    // (story 3 C-A2); there is still no way to set or reset the counter.
+    expect(surface.filter((n) => /gop/i.test(n)).sort()).toEqual([
+      'currentGopCounter',
+      'nextGopCounter',
+    ]);
+  });
+
+  it('currentGopCounter reads the latest group value and never advances it', () => {
+    const mgr = new TransmitKeyManager(258);
+    expect(mgr.currentGopCounter(1)).toBeUndefined();
+    expect(mgr.nextGopCounter(1)).toBe(0);
+    expect(mgr.currentGopCounter(1)).toBe(0);
+    expect(mgr.currentGopCounter(1)).toBe(0);
+    expect(mgr.nextGopCounter(1)).toBe(1);
+    expect(mgr.currentGopCounter(1)).toBe(1);
+    mgr.rotate();
+    mgr.clear();
+    expect(mgr.currentGopCounter(1)).toBe(1);
+    expect(mgr.currentGopCounter(0)).toBeUndefined();
   });
 });
 

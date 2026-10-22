@@ -169,3 +169,85 @@ export type CaptureSourceFactory = (options: {
   /** `MediaDeviceInfo.deviceId` of the chosen microphone, or `undefined` for the default. */
   readonly deviceId: string | undefined;
 }) => Promise<CaptureSource>;
+
+// ---------------------------------------------------------------------------
+// VIDEO (story 3 C-A2)
+// ---------------------------------------------------------------------------
+
+/**
+ * MC's DIRECTED video encoding for one stream, validated
+ * (`session/mediaWiring.ts:validateVideoEncoding`). Every field is required:
+ * the SDK has no client default for any video encoding value.
+ */
+export interface DirectedVideoEncoding {
+  /** The one video codec this story directs. */
+  readonly codec: 'vp8';
+  readonly width: number;
+  readonly height: number;
+  readonly frameRateHz: number;
+  readonly maxBitrateBps: number;
+  /** As directed. The publisher enforces max(this, the compiled floor). */
+  readonly minKeyframeIntervalMs: number;
+}
+
+/** One encoded video frame leaving the encoder. */
+export interface EncodedVideoFrame {
+  /** Raw VP8 frame bytes. */
+  readonly data: Uint8Array;
+  /** Presentation timestamp, in microseconds. */
+  readonly timestampUs: number;
+  /** `true` for a key (independently decodable) chunk, solicited or not. */
+  readonly key: boolean;
+}
+
+/** A video encoder, as the video egress path uses one. NO keyframe interval. */
+export interface VideoEncoderSeam {
+  /**
+   * Submit a captured frame; `keyFrame: true` asks for a key chunk. The
+   * encoder does NOT take ownership — the caller closes the frame.
+   */
+  encode(frame: VideoFrame, keyFrame: boolean): void;
+  /** Frames handed to `encode` and not yet output (`VideoEncoder.encodeQueueSize`). */
+  readonly encodeQueueSize: number;
+  /** Release the encoder. Idempotent. */
+  close(): void;
+}
+
+/** Construction options for a video encoder. */
+export interface VideoEncoderSeamOptions {
+  readonly encoding: DirectedVideoEncoding;
+  /** Called for each encoded frame. */
+  readonly onOutput: (frame: EncodedVideoFrame) => void;
+  /** Called on the codec's error callback. Bounded/event-once, never per frame. */
+  readonly onError: (err: unknown) => void;
+}
+
+/** Builds a video encoder (re-probing the directed config). Injected so unit tests never touch WebCodecs. */
+export type VideoEncoderFactory = (options: VideoEncoderSeamOptions) => Promise<VideoEncoderSeam>;
+
+/** Camera (or test-pattern) capture, behind the same seam shape as audio's. */
+export interface VideoCaptureSource {
+  /**
+   * Start capturing. `onFrame` receives each captured `VideoFrame` and takes
+   * ownership of it. `onEnded` fires if the track ends on its own (unplugged,
+   * revoked). Rejects with a typed `MediaCaptureError` on acquisition failure.
+   */
+  start(onFrame: (frame: VideoFrame) => void, onEnded: () => void): Promise<void>;
+  /** Stop capturing and release the device (camera light off). Idempotent. */
+  stop(): void;
+  /**
+   * The device actually granted, once `start` resolved (`getSettings().deviceId`),
+   * so a re-acquire reuses it rather than re-picking. `undefined` for a
+   * synthetic source.
+   */
+  readonly grantedDeviceId: string | undefined;
+}
+
+/** Builds a video capture source at the DIRECTED geometry. */
+export type VideoCaptureSourceFactory = (options: {
+  readonly width: number;
+  readonly height: number;
+  readonly frameRateHz: number;
+  /** The previously granted camera, or `undefined` for the platform default. */
+  readonly deviceId: string | undefined;
+}) => Promise<VideoCaptureSource>;

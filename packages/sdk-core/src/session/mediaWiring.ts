@@ -13,7 +13,16 @@ import {
   type MediaFault,
 } from '../media/lifecycle/AudioPipeline.js';
 import { isSupportedHeaderVersion } from '../media/frame/frameCodec.js';
-import type { PublishKind, SendDirectiveEvent, SendStreamDirective } from '../signaling/events.js';
+import type {
+  PublishKind,
+  SendDirectiveEvent,
+  SendStreamDirective,
+  SendStreamEncoding,
+} from '../signaling/events.js';
+import { SignalingCodec } from '../signaling/codecMap.js';
+import { KEYFRAME_MIN_INTERVAL_CEILING_MS } from '../config/clientConfig.js';
+import type { DirectedVideoEncoding } from '../media/setup/seams.js';
+import type { VideoSendDirective } from '../media/lifecycle/VideoPublisher.js';
 import type { MhControlSink } from '../media/events.js';
 import type { MediaStateListeners } from './signalingMediaState.js';
 import {
@@ -21,6 +30,7 @@ import {
   MEDIA_KEYFRAME_UNATTRIBUTED_OUTCOMES,
   MEDIA_MH_CONTROL_CHANNEL_ENDINGS,
   MEDIA_ROSTER_KEY_CHANGES,
+  type MediaKeyframePerKindOutcome,
   type MediaKindMetrics,
   type MediaMetrics,
   type MediaSessionMetrics,
@@ -83,11 +93,81 @@ export const DIRECTIVE_KIND_MISSING_FAULT =
   "the controller's send directive omitted a media kind this client publishes; " +
   'nothing of that kind is sent until a directive lists it again';
 
+/** The fault text for a refused video encoding. A fixed literal (event-once dedupe key). */
+export const VIDEO_ENCODING_REFUSED_FAULT =
+  "the controller's video send directive has a missing or invalid required encoding field; " +
+  'no video is sent until a complete directive arrives';
+
+/** The required video encoding fields, by their wire names (the WARN names one). */
+export const VIDEO_ENCODING_FIELDS = [
+  'codec',
+  'width',
+  'height',
+  'frame_rate',
+  'max_bitrate_bps',
+  'min_keyframe_interval_ms',
+] as const;
+
+/** One of {@link VIDEO_ENCODING_FIELDS}. */
+export type VideoEncodingField = (typeof VIDEO_ENCODING_FIELDS)[number];
+
+/** The result of {@link validateVideoEncoding}. */
+export type VideoEncodingValidation =
+  | { readonly ok: true; readonly encoding: DirectedVideoEncoding }
+  | { readonly ok: false; readonly field: VideoEncodingField };
+
+/**
+ * Validate a VIDEO stream's directed encoding (story 3 R-8, R-11, R-23). PURE.
+ *
+ * EVERY field is required, `min_keyframe_interval_ms` included, and there is no
+ * client default for any of them: an absent or 0 plain scalar, a codec other
+ * than VP8, or an absent `min_keyframe_interval_ms` refuses the stream (MC's
+ * `VideoEncoding` always sets all six). A PRESENT `min_keyframe_interval_ms`
+ * of 0 is refused too; a present value below the compiled floor is not refused
+ * here — the keyframe gate clamps and counts it. Video-only: audio leaves
+ * these unset.
+ */
+export function validateVideoEncoding(
+  encoding: SendStreamEncoding | undefined,
+): VideoEncodingValidation {
+  if (!encoding || encoding.codec !== SignalingCodec.Vp8) return { ok: false, field: 'codec' };
+  const positive = (n: number | undefined): n is number =>
+    n !== undefined && Number.isInteger(n) && n > 0;
+  if (!positive(encoding.width)) return { ok: false, field: 'width' };
+  if (!positive(encoding.height)) return { ok: false, field: 'height' };
+  if (!positive(encoding.frameRate)) return { ok: false, field: 'frame_rate' };
+  if (!positive(encoding.maxBitrateBps)) return { ok: false, field: 'max_bitrate_bps' };
+  const minInterval = encoding.minKeyframeIntervalMs;
+  if (!positive(minInterval) || minInterval > KEYFRAME_MIN_INTERVAL_CEILING_MS) {
+    return { ok: false, field: 'min_keyframe_interval_ms' };
+  }
+  return {
+    ok: true,
+    encoding: {
+      codec: 'vp8',
+      width: encoding.width,
+      height: encoding.height,
+      frameRateHz: encoding.frameRate,
+      maxBitrateBps: encoding.maxBitrateBps,
+      minKeyframeIntervalMs: minInterval,
+    },
+  };
+}
+
+/** The video publisher operation a directive drives. */
+export interface VideoDirectiveTarget {
+  setDirective(directive: VideoSendDirective | undefined): void;
+}
+
 /** Construction options for {@link sendDirectiveListener}. */
 export interface SendDirectiveWiring {
   /** The frozen publish set. Every published kind must be listed by MC. */
   readonly publish: readonly PublishKind[];
   readonly pipeline: DirectiveTarget;
+  /** The video publisher, when video is published and media started. */
+  readonly video?: VideoDirectiveTarget;
+  /** Lifecycle WARN sink for a refused video encoding (names the field only). */
+  readonly warn?: (message: string) => void;
   /** The configured audio bitrate, applied only when MC directs none. */
   readonly defaultBitrateBps: number;
   readonly metrics: MediaMetrics;
@@ -95,8 +175,8 @@ export interface SendDirectiveWiring {
   readonly fault: (fault: MediaFault) => void;
   /**
    * The R-18 feed: whether `kind` is EFFECTIVELY being sent after validation
-   * (`serverMuteResume.ts`). A refused header version, a missing kind and shim
-   * (c) all report `false`.
+   * (`serverMuteResume.ts`). A refused header version, a missing kind and a
+   * refused video encoding all report `false`.
    */
   readonly effectiveTargets: (kind: PublishKind, nonEmpty: boolean) => void;
 }
@@ -113,8 +193,12 @@ export interface SendDirectiveWiring {
  *     counted per kind, a typed `mediaFault`, and that kind FAILS CLOSED (empty
  *     targets) — never read as a quiet withdrawal, and never left on its stale
  *     target set (forward secrecy; see {@link applyAudio}).
- *   * An EMPTY `streams` list is the pre-MC-A withdrawal spelling — TRANSITIONAL
- *     shim (c), see {@link legacyEmptyStreamsWithdrawal}.
+ *     MC lists EVERY published kind on every directive (withdrawal is EMPTY
+ *     TARGETS, never removal), so an empty `streams` list from MC is the same
+ *     fault for each published kind — and no fault at all for a receive-only
+ *     participant, which publishes nothing.
+ *   * A VIDEO stream missing any encoding field is refused (counted, a typed
+ *     fault, a WARN naming the field) and video fails closed.
  *   * Client mute never changes the directive (ADR-0036 §5); audio withdrawal
  *     keeps the mic OPEN and sends nothing (no silence, no DTX).
  */
@@ -123,6 +207,52 @@ export function sendDirectiveListener(
 ): (directive: SendDirectiveEvent) => void {
   let lastAudio: AudioSendDirective | undefined;
   let missingFaultRaised = false;
+  let encodingFaultRaised = false;
+  const warn = wiring.warn ?? ((message: string) => console.warn('[dt-media-video]', message));
+
+  /**
+   * Apply video's instruction, or withdraw it. Fail closed on a refused header
+   * version or a refused encoding: the publisher sees a withdrawal (camera off).
+   * Returns whether video is EFFECTIVELY being sent (the R-18 feed).
+   */
+  const applyVideo = (
+    stream: SendStreamDirective | undefined,
+    headerOk: boolean,
+    headerVersion: number,
+  ): boolean => {
+    if (!stream || !headerOk) {
+      wiring.video?.setDirective(undefined);
+      return false;
+    }
+    const valid = validateVideoEncoding(stream.encoding);
+    if (!valid.ok) {
+      // Counted per directive receipt; the fault is event-once per episode.
+      // Counted per directive receipt; the WARN and the fault once per episode
+      // (MC re-sends directives on every composition change).
+      wiring.metrics.video.sendDirectiveEncodingRefused();
+      if (!encodingFaultRaised) {
+        encodingFaultRaised = true;
+        warn(
+          `refused a video send directive: required encoding field ${valid.field} is missing or invalid`,
+        );
+        wiring.fault({
+          stage: MediaFaultStage.Config,
+          message: VIDEO_ENCODING_REFUSED_FAULT,
+          fatal: false,
+        });
+      }
+      wiring.video?.setDirective(undefined);
+      return false;
+    }
+    encodingFaultRaised = false;
+    wiring.video?.setDirective({
+      streamNumber: stream.streamNumber,
+      encoding: valid.encoding,
+      targets: stream.targets,
+      headerVersion,
+    });
+    return stream.targets.length > 0;
+  };
 
   /**
    * Apply audio's instruction, or its WITHDRAWAL (`undefined`).
@@ -165,22 +295,17 @@ export function sendDirectiveListener(
     headerOk: boolean,
     headerVersion: number,
   ): void => {
-    // Video has no send path until story 3 C-A2, and `validatePublishSet`
-    // refuses to publish it, so only audio reaches a pipeline.
-    if (kind === 'audio') applyAudio(stream, headerVersion);
+    if (kind === 'video') {
+      wiring.effectiveTargets(kind, applyVideo(stream, headerOk, headerVersion));
+      return;
+    }
+    applyAudio(stream, headerVersion);
     wiring.effectiveTargets(kind, headerOk && stream !== undefined && stream.targets.length > 0);
   };
 
   return (directive) => {
     const headerOk = isSupportedHeaderVersion(directive.headerVersion);
     if (!headerOk) wiring.metrics.session.sendDirectiveHeaderVersionRefused();
-
-    if (directive.streams.length === 0) {
-      legacyEmptyStreamsWithdrawal(wiring.publish, (kind) =>
-        apply(kind, undefined, headerOk, directive.headerVersion),
-      );
-      return;
-    }
 
     let anyMissing = false;
     for (const kind of wiring.publish) {
@@ -206,36 +331,16 @@ export function sendDirectiveListener(
 }
 
 /**
- * TRANSITIONAL (C-A1 shim c) — deleted by C-A2 (story 3 task 13).
- *
- * The controller in service before MC-A (task 12) spells "nobody watches you"
- * as a directive with NO streams at all (`build_send_directive` omits unwatched
- * streams; a solo participant gets exactly this). MC-A lists every published
- * kind and withdraws with EMPTY TARGETS instead. Until then an EMPTY `streams`
- * list is read as a withdrawal of EVERY published kind — no fault, no counter —
- * while a NON-empty list missing a published kind stays a counted fault. Either
- * way the kind fails closed (sends nothing).
- */
-export function legacyEmptyStreamsWithdrawal(
-  publish: readonly PublishKind[],
-  withdraw: (kind: PublishKind) => void,
-): void {
-  for (const kind of publish) withdraw(kind);
-}
-
-/**
  * The per-kind handle for a PUBLISHED kind. Exhaustive: a published kind with
  * no handle is an internal invariant violation and THROWS, never a silently
- * uncounted fault. `validatePublishSet` refuses video until story 3 C-A2 (task
- * 13), which adds `MediaMetrics.video` and this arm's handle.
+ * uncounted fault.
  */
 export function kindMetrics(metrics: MediaMetrics, kind: PublishKind): MediaKindMetrics {
   switch (kind) {
     case 'audio':
       return metrics.audio;
     case 'video':
-      // C-A2 (task 13): add MediaMetrics.video and return it here.
-      throw new Error('internal invariant: video is published but has no metric handle');
+      return metrics.video;
     default: {
       const exhaustive: never = kind;
       return exhaustive;
@@ -249,22 +354,33 @@ export interface MhControlWiring {
   readonly publish: readonly PublishKind[];
   /** MC's latest send directive (the session's cache), read at request time. */
   readonly latestDirective: () => SendDirectiveEvent | undefined;
+  /** The video publisher once media started (`undefined` before, or not publishing video). */
+  readonly video: () => VideoKeyframeTarget | undefined;
+}
+
+/** The video publisher operation a keyframe request drives. */
+export interface VideoKeyframeTarget {
+  /** Classify, count (the gate counts) and key if honoured. */
+  keyframeRequest(url: string, gopCounter: number): MediaKeyframePerKindOutcome;
 }
 
 /**
  * The session's MH control-channel sink (story 3 R-11).
  *
- * A `KeyframeRequest` is UNTRUSTED input. Until story 3 C-A2 adds a video
- * stream there is nothing this client can key, so EVERY request is refused
- * `not_sending` — none is honoured, and none reaches capture or an encoder.
- * Attribution: a request naming the directed `stream_number` of a PUBLISHED
- * kind counts on that kind's handle; any other stream number has no kind and
- * counts kind-free, as does malformed input. Neither the stream number nor the
- * GoP counter reaches a label, log or event.
+ * A `KeyframeRequest` is UNTRUSTED input. Only a request naming the directed
+ * `stream_number` of the PUBLISHED video stream reaches the keyframe gate
+ * (`lifecycle/keyframePolicy.ts`), with `url` = the handler connection the
+ * request was READ on (bound by `MediaTransport`'s per-connection read loop,
+ * never taken from the payload); the gate classifies and counts it. Every
+ * other request is refused BEFORE any gate state is touched: one naming the
+ * AUDIO stream (audio has no keyframes) counts `not_sending` on the audio
+ * handle; one naming no directed stream counts kind-free, as does malformed
+ * input. Neither the stream number nor the GoP counter reaches a label, log or
+ * event.
  */
 export function mhControlSink(wiring: MhControlWiring): MhControlSink {
   return {
-    keyframeRequest: (_url, request) => {
+    keyframeRequest: (url, request) => {
       const stream = wiring
         .latestDirective()
         ?.streams.find((s) => s.streamNumber === request.streamNumber);
@@ -276,7 +392,9 @@ export function mhControlSink(wiring: MhControlWiring): MhControlSink {
         kind !== undefined && wiring.publish.includes(kind)
           ? kindMetrics(wiring.metrics, kind)
           : undefined;
-      if (handle) handle.keyframeRequestReceived(MEDIA_KEYFRAME_REQUEST_OUTCOMES.NotSending);
+      const video = kind === 'video' && handle ? wiring.video() : undefined;
+      if (video) video.keyframeRequest(url, request.gopCounter);
+      else if (handle) handle.keyframeRequestReceived(MEDIA_KEYFRAME_REQUEST_OUTCOMES.NotSending);
       else
         wiring.metrics.session.keyframeRequestUnattributed(
           MEDIA_KEYFRAME_REQUEST_OUTCOMES.NotSending,
@@ -294,7 +412,8 @@ export function mhControlSink(wiring: MhControlWiring): MhControlSink {
 /**
  * Zero-initialise, at join, the directive and keyframe series that should read
  * zero forever, so an alert later has a series to read (`client.md`). Per-kind
- * series for PUBLISHED kinds only — no video series before video flows.
+ * series for PUBLISHED kinds only (video's `kind_missing` when video is
+ * published; video's keyframe and abandonment series wait for first direction).
  */
 export function zeroInitDirectiveSeries(
   metrics: MediaMetrics,

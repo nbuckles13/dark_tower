@@ -12,10 +12,9 @@ const ALL_SLOT_STATES = Object.values(SlotState).filter(
   (v): v is SlotState => typeof v === 'number',
 );
 
-const EXPECTED: Record<number, string | null> = {
+const EXPECTED: Record<number, string> = {
   [SlotState.UNSPECIFIED]: 'unspecified',
   [SlotState.ACTIVE]: 'active',
-  [SlotState.SOURCE_MUTED]: null,
   [SlotState.WITHHELD_BY_CONGESTION]: 'withheld_by_congestion',
   [SlotState.FEWER_SOURCES_THAN_SLOTS]: 'fewer_sources_than_slots',
   [SlotState.SOURCE_UNREACHABLE]: 'source_unreachable',
@@ -27,13 +26,26 @@ const EXPECTED: Record<number, string | null> = {
 };
 
 describe('slotStateToken', () => {
-  it('the table covers every generated SlotState value (positive control)', () => {
+  // Story 3 C-A2: the proto still carries ONE superseded member until MC-B
+  // (task 15) deletes it, and no SDK code may name it. So this pins "every
+  // generated member but exactly one is mapped", and that one fails closed.
+  const UNMAPPED = ALL_SLOT_STATES.filter((st) => !(st in EXPECTED));
+
+  it('the table covers every generated SlotState value but the ONE superseded member (positive control)', () => {
     expect(ALL_SLOT_STATES.length).toBeGreaterThanOrEqual(11);
-    expect(new Set(ALL_SLOT_STATES)).toEqual(new Set(Object.keys(EXPECTED).map(Number)));
+    expect(UNMAPPED).toHaveLength(1);
+    for (const key of Object.keys(EXPECTED).map(Number)) expect(ALL_SLOT_STATES).toContain(key);
   });
 
-  it.each(ALL_SLOT_STATES)('maps wire value %i to its MC slot_state_label token', (state) => {
-    expect(slotStateToken(state)).toBe(EXPECTED[state]);
+  it.each(Object.keys(EXPECTED).map(Number))(
+    'maps wire value %i to its MC slot_state_label token',
+    (state) => {
+      expect(slotStateToken(state as SlotState)).toBe(EXPECTED[state]);
+    },
+  );
+
+  it('the superseded member maps to unspecified — never active, never an avatar it cannot justify', () => {
+    expect(UNMAPPED.map((st) => slotStateToken(st))).toEqual(['unspecified']);
   });
 
   it.each([5, 12, 99, -1])('maps the unnamed number %i to unspecified — fail closed', (n) => {
@@ -45,12 +57,6 @@ describe('slotStateToken', () => {
       if (state === SlotState.ACTIVE) continue;
       expect(slotStateToken(state)).not.toBe('active');
     }
-  });
-
-  it('only the legacy SOURCE_MUTED maps to null (handed to the transitional shim)', () => {
-    expect(ALL_SLOT_STATES.filter((st) => slotStateToken(st) === null)).toEqual([
-      SlotState.SOURCE_MUTED,
-    ]);
   });
 });
 

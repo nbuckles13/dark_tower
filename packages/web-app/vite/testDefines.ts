@@ -5,6 +5,9 @@
 //
 //   * `__DT_TEST_TONE__`   (`DT_TEST_TONE=1`)   — story 2 R-7: the capture source
 //     is a per-participant tone instead of the microphone.
+//   * `__DT_TEST_PATTERN__` (`DT_TEST_PATTERN=1`) — story 3 R-27: the video
+//     capture source is a per-participant synthetic test pattern instead of
+//     the camera.
 //   * `__DT_TEST_LEVERS__` (`DT_TEST_LEVERS=1`) — story 2 task 15: per-browsing-
 //     context test levers (handler blocking for S10a, per-context N for S2,
 //     forced host controls for the non-host refusal) read from ONE init-script
@@ -26,6 +29,9 @@
 
 /** The environment variable that opts a dev build into the test tone. */
 export const TEST_TONE_ENV = 'DT_TEST_TONE';
+
+/** The environment variable that opts a dev build into the synthetic test-pattern camera (story 3 R-27). */
+export const TEST_PATTERN_ENV = 'DT_TEST_PATTERN';
 
 /** The environment variable that opts a dev build into the per-context test levers. */
 export const TEST_LEVERS_ENV = 'DT_TEST_LEVERS';

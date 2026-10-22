@@ -39,6 +39,8 @@
 // published on the E2E bus, so a harness treats a cohort collision as a
 // precondition failure rather than as misrouting.
 
+import { assertMeetingSenderId } from './meetingSenderId.js';
+
 /** Lowest tone in the band, Hz. */
 export const TEST_TONE_BAND_START_HZ = 600;
 /** Spacing between adjacent tones, Hz. */
@@ -49,9 +51,6 @@ export const TEST_TONE_BUCKETS = 24;
 export const TEST_TONE_BAND_END_HZ =
   TEST_TONE_BAND_START_HZ + (TEST_TONE_BUCKETS - 1) * TEST_TONE_STEP_HZ;
 
-/** Largest legal sender id: the key id allots it 16 bits (`JoinResponse.sender_id`). */
-const MAX_SENDER_ID = 0xffff;
-
 /**
  * The tone frequency for a participant, from its meeting-scoped sender id ONLY.
  *
@@ -59,10 +58,6 @@ const MAX_SENDER_ID = 0xffff;
  * 0, the reserved-invalid sender id. Never a fallback frequency.
  */
 export function testToneFrequencyHz(senderId: number): number {
-  if (!Number.isInteger(senderId) || senderId < 1 || senderId > MAX_SENDER_ID) {
-    throw new RangeError(
-      'a test tone is derived from an assigned sender id (1..65535); refusing to play a default',
-    );
-  }
+  assertMeetingSenderId(senderId, 'test tone');
   return TEST_TONE_BAND_START_HZ + ((senderId - 1) % TEST_TONE_BUCKETS) * TEST_TONE_STEP_HZ;
 }

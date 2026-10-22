@@ -289,6 +289,47 @@ test('captureSource is announced ONCE when media starts, so the harness asserts 
   }
 });
 
+test('videoCaptureSource is announced ONCE; patternId never rides it outside a __DT_TEST_PATTERN__ build', async () => {
+  vi.useFakeTimers();
+  try {
+    expect(__DT_TEST_PATTERN__).toBe(false);
+    const session = new MockMeetingSession();
+    install(session);
+    await session.startMedia();
+    session.videoCaptureSource = { mode: 'test_pattern', patternId: 258 };
+    await vi.advanceTimersByTimeAsync(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS * 3);
+    const announced = events().filter((e) => e['type'] === 'videoCaptureSource');
+    // The define is false under every test runner: the id is withheld.
+    expect(announced).toEqual([{ type: 'videoCaptureSource', mode: 'test_pattern' }]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('sendTracks samples the camera light and the open microphone as booleans only', async () => {
+  vi.useFakeTimers();
+  try {
+    const session = new MockMeetingSession();
+    install(session);
+    await vi.advanceTimersByTimeAsync(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS * 2);
+    expect(events().filter((e) => e['type'] === 'sendTracks')).toEqual([]);
+    await session.startMedia();
+    session.cameraTrackLive = true;
+    await vi.advanceTimersByTimeAsync(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS);
+    expect(
+      events()
+        .filter((e) => e['type'] === 'sendTracks')
+        .at(-1),
+    ).toEqual({
+      type: 'sendTracks',
+      cameraTrackLive: true,
+      micTrackOpen: true,
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test('receive layers and analysis are SAMPLED from the injected instrumentation, whitelist-only', async () => {
   vi.useFakeTimers();
   try {

@@ -3,7 +3,12 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { loadCertFingerprints } from './vite/fingerprints.js';
-import { TEST_LEVERS_ENV, TEST_TONE_ENV, resolveOptInTestDefine } from './vite/testDefines.js';
+import {
+  TEST_LEVERS_ENV,
+  TEST_TONE_ENV,
+  TEST_PATTERN_ENV,
+  resolveOptInTestDefine,
+} from './vite/testDefines.js';
 
 // R-30: web-app dev/build config.
 //
@@ -39,6 +44,12 @@ export default defineConfig(({ mode }) => ({
     // all three (`vite/testDefines.ts`).
     __DT_TEST_TONE__: JSON.stringify(
       resolveOptInTestDefine(TEST_TONE_ENV, mode, process.env[TEST_TONE_ENV]),
+    ),
+    // Story 3 R-27: the test-PATTERN camera define. Same predicate, same rules:
+    // opt-in `DT_TEST_PATTERN=1`, THROW in production. Read at one site,
+    // the SDK's `session/mediaSelection.ts:selectVideoCaptureSource`.
+    __DT_TEST_PATTERN__: JSON.stringify(
+      resolveOptInTestDefine(TEST_PATTERN_ENV, mode, process.env[TEST_PATTERN_ENV]),
     ),
     // Story 2 task 15: the per-browsing-context test levers (S10a handler
     // blocking, S2 per-context N, forced host controls). Same predicate, same

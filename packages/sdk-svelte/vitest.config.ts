@@ -13,6 +13,9 @@ export default defineConfig({
     // so the default suite runs the microphone path and an accidentally
     // default-on tone cannot hide in it (@security A3).
     __DT_TEST_TONE__: JSON.stringify(false),
+    // Story 3 R-27: the test-pattern define is FALSE under every test runner
+    // too, so the default suite runs the camera path.
+    __DT_TEST_PATTERN__: JSON.stringify(false),
     // sdk-core source (aliased below) references these build-time literals; a
     // fixed `__SDK_VERSION__` keeps assertions stable across version bumps.
     __SDK_VERSION__: JSON.stringify('0.0.0-test'),

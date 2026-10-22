@@ -7,33 +7,41 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { TEST_LEVERS_ENV, TEST_TONE_ENV, resolveOptInTestDefine } from '../vite/testDefines.js';
+import {
+  TEST_LEVERS_ENV,
+  TEST_PATTERN_ENV,
+  TEST_TONE_ENV,
+  resolveOptInTestDefine,
+} from '../vite/testDefines.js';
 
-describe.each([TEST_TONE_ENV, TEST_LEVERS_ENV])('resolveOptInTestDefine(%s)', (envName) => {
-  it.each([
-    ['development', undefined],
-    ['development', ''],
-    ['production', undefined],
-    ['production', ''],
-  ])('%s with the variable=%j is OFF — never default-on', (mode, raw) => {
-    expect(resolveOptInTestDefine(envName, mode, raw)).toBe(false);
-  });
+describe.each([TEST_TONE_ENV, TEST_LEVERS_ENV, TEST_PATTERN_ENV])(
+  'resolveOptInTestDefine(%s)',
+  (envName) => {
+    it.each([
+      ['development', undefined],
+      ['development', ''],
+      ['production', undefined],
+      ['production', ''],
+    ])('%s with the variable=%j is OFF — never default-on', (mode, raw) => {
+      expect(resolveOptInTestDefine(envName, mode, raw)).toBe(false);
+    });
 
-  it('development with =1 is ON', () => {
-    expect(resolveOptInTestDefine(envName, 'development', '1')).toBe(true);
-  });
+    it('development with =1 is ON', () => {
+      expect(resolveOptInTestDefine(envName, 'development', '1')).toBe(true);
+    });
 
-  it('production with =1 THROWS rather than coercing to off', () => {
-    expect(() => resolveOptInTestDefine(envName, 'production', '1')).toThrow(
-      `${envName}=1 in a production build`,
+    it('production with =1 THROWS rather than coercing to off', () => {
+      expect(() => resolveOptInTestDefine(envName, 'production', '1')).toThrow(
+        `${envName}=1 in a production build`,
+      );
+    });
+
+    it.each([['true'], ['yes'], ['0'], ['1 '], ['TRUE']])(
+      'any other spelling (%j) THROWS in every mode',
+      (raw) => {
+        expect(() => resolveOptInTestDefine(envName, 'development', raw)).toThrow(/exactly "1"/);
+        expect(() => resolveOptInTestDefine(envName, 'production', raw)).toThrow(/exactly "1"/);
+      },
     );
-  });
-
-  it.each([['true'], ['yes'], ['0'], ['1 '], ['TRUE']])(
-    'any other spelling (%j) THROWS in every mode',
-    (raw) => {
-      expect(() => resolveOptInTestDefine(envName, 'development', raw)).toThrow(/exactly "1"/);
-      expect(() => resolveOptInTestDefine(envName, 'production', raw)).toThrow(/exactly "1"/);
-    },
-  );
-});
+  },
+);

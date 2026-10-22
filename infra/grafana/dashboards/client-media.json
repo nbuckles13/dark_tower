@@ -1219,7 +1219,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "dt_client_media_send_directive_kind_missing_total{media_kind}: a SendDirective whose NON-EMPTY streams list omitted a kind this client publishes (a protocol fault; the kind fails closed and sends nothing). dt_client_media_send_directive_header_version_refused_total: a directive whose header_version this client cannot send (v3 is the only version), refused whole. Both are zero-initialised at join and read zero forever against a conforming MC. At the story 3 C-A1 gate kind_missing reads zero only because the pre-MC-A controller's empty-streams withdrawal is read as a withdrawal (transitional shim c, deleted by C-A2). Over-cap receive slots are no longer refused by the client: MC truncates and reports the excess on mc_media_slot_states_total{slot_state=\"unavailable\"}. Catalog: docs/observability/metrics/client.md.",
+      "description": "dt_client_media_send_directive_kind_missing_total{media_kind}: a SendDirective whose NON-EMPTY streams list omitted a kind this client publishes (a protocol fault; the kind fails closed and sends nothing). dt_client_media_send_directive_header_version_refused_total: a directive whose header_version this client cannot send (v3 is the only version), refused whole. Both are zero-initialised at join and read zero forever against a conforming MC. Over-cap receive slots are no longer refused by the client: MC truncates and reports the excess on mc_media_slot_states_total{slot_state=\"unavailable\"}. Catalog: docs/observability/metrics/client.md.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1996,7 +1996,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "dt_client_media_capture_failures_total{media_kind, outcome}: capture that could not be acquired (permission_denied, no_device, device_unavailable, unsupported, platform_unsupported, unknown) or a track that ended on its own mid-call (ended). Lazily created - an empty panel means no failures yet, hence the or vector(0). Audio emits today; video (camera) arrives with story 3 C-A2. No device, sender or slot dimension. Catalog: docs/observability/metrics/client.md.",
+      "description": "dt_client_media_capture_failures_total{media_kind, outcome}: capture that could not be acquired (permission_denied, no_device, device_unavailable, unsupported, platform_unsupported, unknown) or a track that ended on its own mid-call (ended). Lazily created - an empty panel means no failures yet, hence the or vector(0). Audio and video (camera or test pattern, story 3 C-A2) both emit; a video failure presents the participant as video-muted with no automatic retry (R-19). No device, sender or slot dimension. Catalog: docs/observability/metrics/client.md.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2089,7 +2089,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "dt_client_media_keyframe_requests_received_total{media_kind, outcome}: MH KeyframeRequests for a published kind's directed stream, by what the publisher did (honoured, honoured_counter_ahead, stale_counter, min_interval, not_sending; malformed requests name no kind and are counted on the unattributed panel). Until story 3 C-A2 adds a video stream every request is refused not_sending and none is honoured. Not zero-initialised (no video series before video flows), hence the or vector(0). Never summed by outcome with the unattributed series. Catalog: docs/observability/metrics/client.md.",
+      "description": "dt_client_media_keyframe_requests_received_total{media_kind, outcome}: MH KeyframeRequests for a published kind's directed stream, by what the publisher did (honoured, honoured_counter_ahead, stale_counter, min_interval, not_sending; malformed requests name no kind and are counted on the unattributed panel). Since story 3 C-A2 a video request is classified by the keyframe gate: honoured only for a directed, unmuted stream whose targets include the carrying handler; min_interval is held as the single deferral (the keyframe it may produce is counted on the keyframes-produced panel). Audio requests are always not_sending. Not zero-initialised (no video series before video flows), hence the or vector(0). Never summed by outcome with the unattributed series. Catalog: docs/observability/metrics/client.md.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2361,6 +2361,657 @@
         }
       ],
       "title": "MH Control Channel Ended (reset / finished)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_keyframes_produced_total{media_kind, source}: keyframes the publisher produced, by cause - directive_start (start, resume, target added), request (an accepted MH KeyframeRequest), abandonment (re-keying after an abandonment the publisher decided: its per-target backlog cap). Each bounded by max(directed min_keyframe_interval_ms, compiled 100 ms floor); a merged deferral counts once under its creating cause. abandonment rising with requests flat is a lossy-uplink keying loop; request rising is a request storm. Zero-initialised for video when video is first directed. Never summed by source with dt_client_media_kek_updates_total. Catalog: docs/observability/metrics/client.md.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Keyframes",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 105
+      },
+      "id": 26,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(media_kind, source) (increase(dt_client_media_keyframes_produced_total[$__rate_interval]))",
+          "legendFormat": "{{media_kind}} {{source}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Video Keyframes Produced by Cause",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_send_groups_abandoned_total{media_kind}: group streams the publisher RESET because one target's backlog crossed its cap (frames or bytes). Publisher-decided only: a peer STOP_SENDING, a rejected open and a stream open that never completed (MAX_STREAMS starvation) are on the Send Groups Stopped panel; MH's own ingress refusals are on mh_media_frames_dropped_total (stream_rate_limited and the other ingress tokens). A flat line here does not mean the peer refused nothing. Zero-initialised for video when video is first directed. Catalog: docs/observability/metrics/client.md.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Groups",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 105
+      },
+      "id": 27,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(media_kind) (increase(dt_client_media_send_groups_abandoned_total[$__rate_interval]))",
+          "legendFormat": "{{media_kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Video Send Groups Abandoned (publisher-decided)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_keyframe_min_interval_clamped_total{media_kind}: video send directives whose min_keyframe_interval_ms was below the client's compiled 100 ms floor and was raised to it (once per directive receipt). A correct MC never directs below its own floor (MIN_KEYFRAME_INTERVAL_MS_FLOOR, pinned equal by validate-keyframe-floor-sync.sh), so non-zero is a drift or hostile-controller signal. Panel only, no alert. Lazily created, hence the or vector(0). Catalog: docs/observability/metrics/client.md.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Directives",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 113
+      },
+      "id": 28,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(media_kind) (increase(dt_client_media_keyframe_min_interval_clamped_total[$__rate_interval])) or vector(0)",
+          "legendFormat": "{{media_kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Keyframe Min-Interval Clamped (panel only)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_encoder_errors_total{media_kind}: an encoder error callback, or an encoder that could not be built (audio: the Opus factory rejected; video: the directed configuration). Event-once per encoder instance; fatal for that kind's send path. Both kinds emit. Lazily created, hence the or vector(0). Catalog: docs/observability/metrics/client.md.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Errors",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 113
+      },
+      "id": 29,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(media_kind) (increase(dt_client_media_encoder_errors_total[$__rate_interval])) or vector(0)",
+          "legendFormat": "{{media_kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Encoder Errors by Kind",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_send_directive_encoding_refused_total{media_kind}: send directives whose video stream lacked a required encoding field (codec VP8, width, height, frame_rate, max_bitrate_bps, min_keyframe_interval_ms); the stream is refused and video fails closed. No field label: the client WARN names the field. Reads zero against a conforming MC. Lazily created, hence the or vector(0). Catalog: docs/observability/metrics/client.md.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Directives",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 121
+      },
+      "id": 30,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(media_kind) (increase(dt_client_media_send_directive_encoding_refused_total[$__rate_interval])) or vector(0)",
+          "legendFormat": "{{media_kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Video Directives Refused for a Missing Encoding Field",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_send_groups_stopped_total{media_kind, outcome}: targets that went dark for the PEER's reasons - peer_stopped (MH STOP_SENDING or a failed write), open_failed (open rejected), open_stalled (backlog cap tripped while the open was pending: stream credit never arrived). Counted once per transition, never per frame; no publisher re-key (MH requests when it wants the stream). open_stalled is the ONLY signal for MAX_STREAMS starvation anywhere (MH has no event to count). Zero-initialised for video when video is first directed. Catalog: docs/observability/metrics/client.md.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Groups",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 129
+      },
+      "id": 31,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(media_kind, outcome) (increase(dt_client_media_send_groups_stopped_total[$__rate_interval]))",
+          "legendFormat": "{{media_kind}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Video Send Groups Stopped (peer-decided) by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_encode_queue_dropped_total{media_kind}: captured video frames dropped BEFORE encode because the encoder already held more than media.egress.videoMaxEncodeQueue frames (a CPU-starved or throttled tab). Per captured frame, not per lane; never part of the send-drop ratio; a pending keyframe rides the next encoded frame. Audio never emits it. Zero-initialised for video when video is first directed. Catalog: docs/observability/metrics/client.md.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Frames",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 129
+      },
+      "id": 32,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(media_kind) (increase(dt_client_media_encode_queue_dropped_total[$__rate_interval]))",
+          "legendFormat": "{{media_kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Video Frames Dropped Before Encode (encoder queue full)",
       "type": "timeseries"
     }
   ],
