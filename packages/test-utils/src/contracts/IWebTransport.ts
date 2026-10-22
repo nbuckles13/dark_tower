@@ -70,6 +70,16 @@ export interface WebTransportDatagrams {
 }
 
 /**
+ * Platform stream-error shape. Mirror of `WebTransportStreamError` in
+ * `packages/sdk-core/src/transport/IWebTransport.ts` (rationale there).
+ */
+export interface WebTransportStreamError extends Error {
+  readonly name: 'WebTransportError';
+  readonly source: 'stream';
+  readonly streamErrorCode: number | null;
+}
+
+/**
  * Minimal contract for a WebTransport-shaped client. `MockWebTransport`
  * implements this; production code in sdk-core will declare an equivalent
  * interface and consume either the real `WebTransport` or this mock.
@@ -86,6 +96,15 @@ export interface IWebTransport {
 
   /** Open a new bidirectional stream. */
   createBidirectionalStream(): Promise<WebTransportBidirectionalStream>;
+
+  /**
+   * Open a new outgoing unidirectional stream. REQUIRED — rationale at the
+   * canonical declaration in `packages/sdk-core/src/transport/IWebTransport.ts`.
+   */
+  createUnidirectionalStream(): Promise<WritableStream<Uint8Array>>;
+
+  /** Peer-opened unidirectional streams. See the sdk-core canonical declaration. */
+  readonly incomingUnidirectionalStreams: ReadableStream<ReadableStream<Uint8Array>>;
 
   /** Close the transport with optional close-info. */
   close(info?: WebTransportCloseInfo): void;

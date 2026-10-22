@@ -61,6 +61,8 @@ async function joinedRig(joinResponse: Uint8Array, identityPublicKey?: Uint8Arra
     meetingId: 'm',
     joinToken: 'jwt',
     participantName: 'self',
+    publishKinds: ['audio'],
+    receiveSlots: [{ slotId: 0, mediaKind: 'audio' }],
     ...(identityPublicKey ? { identityPublicKey } : {}),
   });
   transport.simulateReady();
@@ -119,6 +121,8 @@ describe('the meeting KEK never survives the decode boundary', () => {
       meetingId: 'm',
       joinToken: 'jwt',
       participantName: 'self',
+      publishKinds: ['audio'],
+      receiveSlots: [],
     });
     transport.simulateReady();
     await waitFor(() => transport.getOpenedBidiStreams().length > 0);
@@ -228,7 +232,7 @@ describe('stream assignments', () => {
       }),
     );
     await waitFor(() => seen.length > 0);
-    expect(seen[0]?.assignments[0]?.slotState).toBe('withheld_congestion');
+    expect(seen[0]?.assignments[0]?.slotState).toBe('withheld_by_congestion');
   });
 
   it('carries unreachable_sender_ids through, and an EMPTY set as empty', async () => {
@@ -292,7 +296,7 @@ describe('stream assignments', () => {
     rig.deliver(framedStreamAssignments({ slotState: SlotState.FEWER_SOURCES_THAN_SLOTS }));
     await waitFor(() => seen.length > 0);
     expect(seen[0]?.assignments[0]?.senderId).toBeUndefined();
-    expect(seen[0]?.assignments[0]?.slotState).toBe('fewer_sources');
+    expect(seen[0]?.assignments[0]?.slotState).toBe('fewer_sources_than_slots');
   });
 
   it('maps an UNSPECIFIED state to unspecified rather than guessing active', async () => {
@@ -304,22 +308,46 @@ describe('stream assignments', () => {
     expect(seen[0]?.assignments[0]?.slotState).toBe('unspecified');
   });
 
-  // Durable: the reserved former ZERO_REQUESTED number fails closed.
-  // Interim (C-A1 WILL CHANGE these four rows): the story-3 values 8..11 fall
-  // to the fail-closed default until C-A1 maps them.
+  // The reserved former ZERO_REQUESTED number, and any number the SDK does not
+  // name, fail closed.
   it.each([
     ['reserved 5 (former ZERO_REQUESTED)', 5 as SlotState],
-    ['AVATAR_NO_VIDEO (C-A1 will map)', SlotState.AVATAR_NO_VIDEO],
-    ['UNAVAILABLE (C-A1 will map)', SlotState.UNAVAILABLE],
-    ['AVATAR_CLIENT_MUTED (C-A1 will map)', SlotState.AVATAR_CLIENT_MUTED],
-    ['AVATAR_SERVER_MUTED (C-A1 will map)', SlotState.AVATAR_SERVER_MUTED],
-  ])('maps %s to unspecified', async (_label, state) => {
+    ['an unknown future value', 99 as SlotState],
+  ])('maps %s to unspecified, never active', async (_label, state) => {
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     const seen: StreamAssignmentsEvent[] = [];
     rig.client.on('streamAssignments', (e) => seen.push(e));
     rig.deliver(framedStreamAssignments({ slotState: state }));
     await waitFor(() => seen.length > 0);
     expect(seen[0]?.assignments[0]?.slotState).toBe('unspecified');
+  });
+
+  it('carries the slot kind; a live VIDEO slot names no sender', async () => {
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    const seen: StreamAssignmentsEvent[] = [];
+    rig.client.on('streamAssignments', (e) => seen.push(e));
+    rig.deliver(
+      framedStreamAssignments({
+        slotId: 0,
+        senderId: 259,
+        mediaHandlerUrl: 'https://mh',
+        extraSlots: [
+          { slotId: 1, mediaHandlerUrl: 'https://mh', mediaKind: MediaKind.VIDEO_CAMERA },
+          {
+            slotId: 2,
+            mediaHandlerUrl: '',
+            mediaKind: MediaKind.VIDEO_SCREEN,
+            slotState: SlotState.ACTIVE,
+          },
+        ],
+      }),
+    );
+    await waitFor(() => seen.length > 0);
+    expect(seen[0]?.assignments.map((a) => [a.mediaKind, a.senderId, a.slotState])).toEqual([
+      ['audio', 259, 'active'],
+      ['video', undefined, 'active'],
+      ['unknown', undefined, 'active'],
+    ]);
   });
 });
 
@@ -348,17 +376,23 @@ describe('client sends', () => {
 
   it('reports client mute informationally', async () => {
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
-    await rig.client.sendMuteRequest(true);
+    await rig.client.sendMuteRequest({ audioMuted: true, videoMuted: false });
     const mute = rig.outbound().find((m) => m.message.case === 'muteRequest');
-    expect((mute?.message.value as { audioMuted: boolean }).audioMuted).toBe(true);
+    expect(mute?.message.value).toMatchObject({ audioMuted: true, videoMuted: false });
   });
 
   it('a server-mute request carries TARGET AND ACTION ONLY — no requester, no reason', async () => {
     // Story 2 R-8 / @security M1: MC identifies the requester from the
     // authenticated connection; the message has no field for it and none is sent.
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
-    await rig.client.sendServerMuteRequest('participant-b', true);
-    await rig.client.sendServerMuteRequest('participant-b', false);
+    await rig.client.sendServerMuteRequest('participant-b', {
+      audioMuted: true,
+      videoMuted: false,
+    });
+    await rig.client.sendServerMuteRequest('participant-b', {
+      audioMuted: false,
+      videoMuted: false,
+    });
     const sent = rig
       .outbound()
       .filter((m) => m.message.case === 'serverMuteRequest')
@@ -387,8 +421,10 @@ describe('client sends', () => {
   it('refuses every send before a settled join', async () => {
     const client = new SignalingClient({ connect: () => new MockWebTransport() });
     await expect(client.sendReceiveCapability([])).rejects.toThrow();
-    await expect(client.sendMuteRequest(true)).rejects.toThrow();
-    await expect(client.sendServerMuteRequest('p', true)).rejects.toThrow();
+    await expect(client.sendMuteRequest({ audioMuted: true, videoMuted: false })).rejects.toThrow();
+    await expect(
+      client.sendServerMuteRequest('p', { audioMuted: true, videoMuted: false }),
+    ).rejects.toThrow();
     await expect(client.sendUnmuteRequest()).rejects.toThrow();
   });
 });
@@ -456,9 +492,18 @@ describe('server mute state from the wire (story 2 R-10/R-11)', () => {
     );
     rig.deliver(framedParticipantMuteUpdate({ participantId: 'b', audioServerMuted: false }));
     await waitFor(() => seen.length > 1);
-    expect(seen[0]).toEqual({ participantId: 'b', audioServerMuted: true, serverMutedBy: 'host' });
+    expect(seen[0]).toEqual({
+      participantId: 'b',
+      audioServerMuted: true,
+      videoServerMuted: false,
+      serverMutedBy: 'host',
+    });
     // Unmuted: no `serverMutedBy`, even if MC were to send a stale one.
-    expect(seen[1]).toEqual({ participantId: 'b', audioServerMuted: false });
+    expect(seen[1]).toEqual({
+      participantId: 'b',
+      audioServerMuted: false,
+      videoServerMuted: false,
+    });
   });
 
   it('bounds MC-relayed ids to 256 before they leave the decode boundary', async () => {
@@ -495,5 +540,81 @@ describe('server mute state from the wire (story 2 R-10/R-11)', () => {
     rig.deliver(framedUnmuteRequestRelay('b'));
     await waitFor(() => seen.length > 0);
     expect(seen).toEqual([{ participantId: 'b' }]);
+  });
+});
+
+describe('story 3 C-A1: join contract and per-kind mute requests', () => {
+  it('the JoinRequest carries publish_kinds and the full receive_capability, closed kinds, id order', async () => {
+    const transport = new MockWebTransport();
+    const client = new SignalingClient({ connect: () => transport });
+    const publish: ('audio' | 'video')[] = ['audio'];
+    const joining = client.join({
+      webtransportEndpoint: ENDPOINT,
+      meetingId: 'm',
+      joinToken: 'jwt',
+      participantName: 'self',
+      publishKinds: publish,
+      receiveSlots: [
+        { slotId: 0, mediaKind: 'audio' },
+        { slotId: 1, mediaKind: 'video' },
+      ],
+    });
+    transport.simulateReady();
+    await waitFor(() => transport.getOpenedBidiStreams().length > 0);
+    transport.simulateServerMessage(0, framedJoinResponse({ senderId: 258 }));
+    await joining;
+    const join = decodeOutboundClientMessages(transport.getOutboundBidiWrites(0))[0];
+    expect(join?.message.case).toBe('joinRequest');
+    const request = join?.message.value as {
+      publishKinds: MediaKind[];
+      receiveCapability?: { slots: { slotId: number; mediaKind: MediaKind }[] };
+    };
+    expect(request.publishKinds).toEqual([MediaKind.AUDIO]);
+    expect(request.receiveCapability?.slots.map((s) => [s.slotId, s.mediaKind])).toEqual([
+      [0, MediaKind.AUDIO],
+      [1, MediaKind.VIDEO_CAMERA],
+    ]);
+    // Stored frozen beside correlation/binding for a future reconnect; the
+    // caller's array cannot change it.
+    publish.push('video');
+    expect(client.publishKinds).toEqual(['audio']);
+    expect(Object.isFrozen(client.publishKinds)).toBe(true);
+  });
+
+  it.each([
+    ['audio muted, video unchanged at false', { audioMuted: true, videoMuted: false }],
+    ['video muted, audio unchanged at true', { audioMuted: true, videoMuted: true }],
+    ['both unmuted', { audioMuted: false, videoMuted: false }],
+  ])(
+    'a MuteRequest sets BOTH kinds explicitly (%s) — never absent until MC-B',
+    async (_l, state) => {
+      const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+      await rig.client.sendMuteRequest(state);
+      const mute = rig.outbound().find((m) => m.message.case === 'muteRequest');
+      const value = mute?.message.value as { audioMuted?: boolean; videoMuted?: boolean };
+      // PRESENCE on the wire (`optional bool`): an explicit false is sent, not omitted.
+      expect(value.audioMuted).toBe(state.audioMuted);
+      expect(value.videoMuted).toBe(state.videoMuted);
+    },
+  );
+
+  it('a ServerMuteRequest sets BOTH kinds explicitly, including an explicit false', async () => {
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    await rig.client.sendServerMuteRequest('b', { audioMuted: false, videoMuted: true });
+    const sent = rig.outbound().find((m) => m.message.case === 'serverMuteRequest');
+    const value = sent?.message.value as { audioMuted?: boolean; videoMuted?: boolean };
+    expect(value.audioMuted).toBe(false);
+    expect(value.videoMuted).toBe(true);
+  });
+
+  it('a directive stream for screen share is `unknown` — never sent', async () => {
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    const seen: SendDirectiveEvent[] = [];
+    rig.client.on('sendDirective', (e) => seen.push(e));
+    rig.deliver(
+      framedSendDirective({ mediaKind: MediaKind.VIDEO_SCREEN, targets: ['https://mh'] }),
+    );
+    await waitFor(() => seen.length > 0);
+    expect(seen[0]?.streams[0]?.mediaKind).toBe('unknown');
   });
 });

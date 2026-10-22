@@ -10,7 +10,7 @@
 // same version as the Vitest browser provider, zero extra dependencies.
 
 import { defineConfig } from 'playwright/test';
-import { SUITE_RECEIVE_SLOTS } from './e2e/cohort.js';
+import { SUITE_AUDIO_RECEIVE_SLOTS, SUITE_VIDEO_RECEIVE_SLOTS } from './e2e/cohort.js';
 import { e2eEnv } from './e2e/env.js';
 
 export default defineConfig({
@@ -73,14 +73,17 @@ export default defineConfig({
     // bus) and the dev cert-fingerprint define are compile-time gates that only
     // exist in dev builds. Never point this at `pnpm preview`/a prod build.
     command: 'pnpm dev',
-    // Story 2 R-30: the suite's N, written once in e2e/cohort.ts and derived
-    // here. Only reaches a server Playwright STARTS; a reused one keeps the N it
-    // was started with, so every multi-party participant asserts the declared N
-    // at runtime (`expectDeclaredReceiveSlots` in e2e/fixtures.ts). N=3 leaves
-    // the solo and two-party specs' assertions unchanged (a solo client's slots
-    // are all `fewer_sources`; slot-0 is still asserted).
+    // Story 2 R-30 / story 3 R-1: the suite's N and M, written once in
+    // e2e/cohort.ts and derived here. Only reaches a server Playwright STARTS; a
+    // reused one keeps the values it was started with, so every multi-party
+    // participant asserts the declared N and M at runtime
+    // (`expectDeclaredReceiveSlots` in e2e/fixtures.ts). N=3 leaves the solo and
+    // two-party specs' assertions unchanged (a solo client's slots are all
+    // `fewer_sources_than_slots`; slot-0 is still asserted). M=0: the story-2
+    // audio specs run with no video slots (story 3 R-33); story 3 C-C1 raises it.
     env: {
-      VITE_DT_RECEIVE_SLOTS: String(SUITE_RECEIVE_SLOTS),
+      VITE_DT_AUDIO_RECEIVE_SLOTS: String(SUITE_AUDIO_RECEIVE_SLOTS),
+      VITE_DT_VIDEO_RECEIVE_SLOTS: String(SUITE_VIDEO_RECEIVE_SLOTS),
       // Story 2 R-7: the test tone is OPT-IN (`DT_TEST_TONE=1` reaches
       // `vite.config.ts` -> `vite/testDefines.ts`). The multi-party scenarios
       // hear by CONTENT, so every participant sends its own tone.

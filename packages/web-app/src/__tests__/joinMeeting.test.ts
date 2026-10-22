@@ -29,7 +29,8 @@ const config: DemoConfig = {
   gcBaseUrl: '',
   env: 'test',
   devCertHashes: [],
-  receiveSlots: { count: 1, source: 'default' },
+  audioReceiveSlots: { count: 1, source: 'default' },
+  videoReceiveSlots: { count: 0, source: 'default' },
 };
 
 const auth: AuthSession = {
@@ -96,8 +97,13 @@ async function joinedRig(opts: { isHost?: boolean } = {}) {
   return { session, screen };
 }
 
-const assignment = (senderId: number, slotState: 'active' | 'source_muted', slotId: number) => ({
+const assignment = (
+  senderId: number,
+  slotState: 'active' | 'avatar_client_muted' | 'avatar_server_muted',
+  slotId: number,
+) => ({
   slotId,
+  mediaKind: 'audio' as const,
   senderId,
   mediaHandlerUrl: 'https://mh-0:4433',
   slotState,
@@ -128,21 +134,25 @@ test('an unreachable participant is ON the roster, marked with the wire token â€
 test('server mute and client mute are DISTINCT tokens; client mute is unknown with no slot evidence', async () => {
   const { session, screen } = await joinedRig();
   session.fire('streamAssignments', {
-    assignments: [assignment(258, 'source_muted', 0), assignment(259, 'source_muted', 1)],
+    assignments: [
+      assignment(258, 'avatar_client_muted', 0),
+      assignment(259, 'avatar_server_muted', 1),
+    ],
     unreachableSenderIds: [],
   });
   session.fire('participantMuteChanged', {
     participantId: 'c',
     audioServerMuted: true,
+    videoServerMuted: false,
     serverMutedBy: 'h',
   });
   const b = screen.getByTestId('participant-b');
   const c = screen.getByTestId('participant-c');
   const h = screen.getByTestId('participant-h');
-  // b: slot source_muted, no server mute -> client-muted.
+  // b: slot avatar_client_muted, no server mute -> client-muted.
   await expect.element(b).toHaveAttribute('data-client-muted', 'true');
   await expect.element(b).toHaveAttribute('data-server-muted', 'false');
-  // c: server-muted -> the slot's source_muted says nothing about their own mic.
+  // c: server-muted -> the slot's avatar state says nothing about their own mic.
   await expect.element(c).toHaveAttribute('data-server-muted', 'true');
   await expect.element(c).toHaveAttribute('data-client-muted', 'unknown');
   await expect.element(screen.getByTestId('participant-server-muted-c')).toMatchTextContent('Hal');
@@ -162,7 +172,7 @@ test('the host affordance sends target + action, and its label follows the WIRE,
   await expect.element(button).toHaveAttribute('aria-pressed', 'false');
   await button.click();
   await vi.waitFor(() =>
-    expect(session.serverMuteCalls).toEqual([{ participantId: 'b', muted: true }]),
+    expect(session.serverMuteCalls).toEqual([{ participantId: 'b', kind: 'audio', muted: true }]),
   );
   // No wire update yet: still unpressed.
   await expect.element(button).toHaveAttribute('aria-pressed', 'false');
@@ -170,6 +180,7 @@ test('the host affordance sends target + action, and its label follows the WIRE,
   session.fire('participantMuteChanged', {
     participantId: 'b',
     audioServerMuted: true,
+    videoServerMuted: false,
     serverMutedBy: 'self',
   });
   await expect.element(button).toHaveAttribute('aria-pressed', 'true');
@@ -184,9 +195,13 @@ test('the host affordance sends target + action, and its label follows the WIRE,
 
   await button.click();
   await vi.waitFor(() =>
-    expect(session.serverMuteCalls[1]).toEqual({ participantId: 'b', muted: false }),
+    expect(session.serverMuteCalls[1]).toEqual({ participantId: 'b', kind: 'audio', muted: false }),
   );
-  session.fire('participantMuteChanged', { participantId: 'b', audioServerMuted: false });
+  session.fire('participantMuteChanged', {
+    participantId: 'b',
+    audioServerMuted: false,
+    videoServerMuted: false,
+  });
   await expect.element(button).toHaveAttribute('aria-pressed', 'false');
   await expect.element(screen.getByTestId('unmute-requested-b')).not.toBeInTheDocument();
   expect(screen.container.textContent?.toLowerCase()).not.toMatch(/\bban/);

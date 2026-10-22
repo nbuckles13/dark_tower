@@ -1621,7 +1621,7 @@ tasks:
     - With no video stream yet, every `keyframe_request` is refused and counted as `not_sending`. Malformed input is counted as `malformed` and never throws untyped. That makes the channel testable now; C-A2 adds acceptance.
 
     TELEMETRY (on OBS-A's per-kind handles, each with its row in `docs/observability/metrics/client.md` in this task):
-    - `dt_client_media_capture_failures_total{media_kind, reason}`, with reasons from the existing `CaptureFailure` vocabulary (`media/setup/captureFailure.ts`), generalised beyond microphone wording and extended with `ended`: `permission_denied`, `no_device`, `device_unavailable`, `ended`. Audio emits on it now (today audio failures surface only as events); C-A2 adds video.
+    - `dt_client_media_capture_failures_total{media_kind, outcome}` (label `outcome`, not `reason`: taxonomy ruling at C-A1 Gate 1), with outcomes from the existing `CaptureFailure` vocabulary (`media/setup/captureFailure.ts`), generalised beyond microphone wording and extended with `ended`: `permission_denied`, `no_device`, `device_unavailable`, `ended`. Audio emits on it now (today audio failures surface only as events); C-A2 adds video.
     - `dt_client_media_keyframe_requests_received_total{media_kind, outcome}`, with all outcome values declared now (`honoured`, `honoured_counter_ahead`, `stale_counter`, `min_interval`, `not_sending`, `malformed`) and zero-initialised; C-A2 emits the honour paths.
     - Directive faults: published kind missing; header version refused.
     - No GoP values, sizes, timings, or sender, slot or stream identity in any label, log, span or test-bus field.
@@ -1662,7 +1662,7 @@ tasks:
       - unknown slot-state and enum values received from MC are treated as fail-safe (avatar or no media), never as ACTIVE.
     - MhServerMessage read loop: the message is parsed with a size bound. Until C-A2, every KeyframeRequest is refused and counted as `not_sending` or `malformed`; none is ever honoured, and none starts capture.
     - R-18 resume event: whenever capture resumes for a kind last recorded as server-muted, the event fires independent of message order. It is tested for both orders plus "update never arrives". A named test records the residual case (never recorded as muted → no event) as by design. The non-suppressible UI notice is task 17 (C-C1).
-    - The `capture_failures{reason}` series exists, emitted by audio, with no identity labels.
+    - The `capture_failures{outcome}` series exists, emitted by audio, with no identity labels.
     - Transitional shims are clearly marked and deleted by C-A2: the post-join ReceiveCapability redeclaration, and the mapping of legacy SOURCE_MUTED to avatar tokens via ParticipantMuteUpdate (server-muted wins). No shim adds a path that accepts v2 beyond MC's directive, and no shim maps an unknown or legacy state to ACTIVE.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
@@ -1701,6 +1701,7 @@ tasks:
       MC must not emit video egress before this is deployed. Until MC-B, MH treats a registration with no `source_streams` as legacy (stream 0 DATAGRAM per sender). This task's registrations always carry `source_streams`, so that path is not exercised.
     - task 9 (MH-A2): stream-per-group forwarding. This task's env-test 34 needs video frames actually flowing through MH.
     - task 11 (C-A1): the SDK and web app already send `publish_kinds` and the initial `receive_capability` on the JoinRequest and render the flat slot-state values (avatar states instead of `SOURCE_MUTED`, and UNAVAILABLE). It lands first so the story-2 browser hear specs stay green when this task starts refusing joins without a publish set or receive declaration and stops emitting `SOURCE_MUTED`. If a story-2 browser spec fails here on either change, that is a C-A1 gap to report, not something to work around in MC.
+      - C-A1 left ONE transitional tolerance that THIS task deletes (C-A1 Gate 3, test ruling): `packages/web-app/e2e/fixtures.ts:expectDeclaredReceiveSlots` accepts an UNKNOWN audio cap with a `transitional` annotation, because the controller before this task sends no `max_audio_receive_slots`/`max_video_receive_slots`. This task is the first to send them, so it restores the strict `serverCapState === 'known'` and cap >= N assertion and deletes the annotation branch (a client-file edit, paired with client).
 
     JOIN (R-2, R-22)
     - Where: the connection's join path in `crates/mc-service/src/webtransport/connection.rs`, before the actor admits.
@@ -1946,7 +1947,7 @@ tasks:
     - DEVICES: the camera track STOPS on ANY video withdrawal (empty targets: unwatched or server-muted) and on client video mute. It is re-acquired on restore with the existing device and permission, and never re-prompts in a loop. Camera light on ⟺ directed with non-empty targets AND not client-muted AND camera healthy.
     - R-19: a track that ends or is revoked mid-call, or a failed re-acquire:
       - presents the participant as video client-muted (`MuteRequest{video_muted: true}`, with `audio_muted` set to its current state until MC-B);
-      - is counted on `capture_failures_total{media_kind="video", reason}` (`permission_denied`, `no_device`, `device_unavailable`, `ended`);
+      - is counted on `capture_failures_total{media_kind="video", outcome}` (`permission_denied`, `no_device`, `device_unavailable`, `ended`);
       - has NO automatic retry; only the next directive restore or a user unmute tries again.
 
     (3) Codec.
@@ -2061,7 +2062,7 @@ tasks:
       - under client mute nothing of that kind leaves the device;
       - the camera stops on any video withdrawal or mute;
       - re-acquire reuses the granted device and permission with no prompt loop;
-      - a re-acquire failure presents as video client-muted, counted in `capture_failures{reason}`, with no automatic retry (R-19).
+      - a re-acquire failure presents as video client-muted, counted in `capture_failures{outcome}`, with no automatic retry (R-19).
     - KeyframeRequest:
       - honoured only when the stream is directed, its target set includes the carrying handler, and it is not muted;
       - at most one keyframe per max(directed `min_keyframe_interval_ms`, compiled 100 ms floor), with the floor sync guard;

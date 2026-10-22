@@ -24,10 +24,10 @@
 // test asserts on the protocol's vocabulary rather than on display copy that a
 // copy edit can change.
 
-import type { StreamAssignmentEvent } from '@darktower/sdk-core';
+import type { SlotStateToken as SdkSlotStateToken } from '@darktower/sdk-core';
 
-/** The eight wire tokens, as the SDK maps them from `SlotState`. */
-export type SlotStateToken = StreamAssignmentEvent['slotState'];
+/** The wire tokens, as the SDK maps them from `SlotState` (flat vocabulary, story 3). */
+export type SlotStateToken = SdkSlotStateToken;
 
 /**
  * The state of a slot the client declared but for which MC has sent no
@@ -55,19 +55,23 @@ export type SlotStateAttr = SlotStateToken | typeof AWAITING_ASSIGNMENT;
  * not.
  */
 export const SLOT_STATE_TEXT: Record<SlotStateToken, string> = {
-  // MC set no state. A protocol-level surprise, so it says so rather than
-  // pretending to be a normal empty slot.
+  // MC set no state, or one this build does not know. A protocol-level surprise,
+  // so it says so rather than pretending to be a normal empty slot.
   unspecified: 'no state reported for this slot',
-  active: 'receiving audio',
-  // §5: a muted sender sends NOTHING. This text is rendered from the wire, never
-  // from having noticed that frames stopped.
-  source_muted: 'the sender is muted',
-  // The only genuinely handler-observed state, and transient.
-  withheld_congestion: 'held back by the handler (congestion)',
-  fewer_sources: 'no one to fill this slot yet',
-  zero_requested: 'no audio requested',
-  // Structurally persistent, unlike the transient states above — this one does
-  // not resolve by waiting, which is why it must not render as a spinner.
+  active: 'receiving',
+  // Avatars for a NAMED participant, by reason (story 3 R-4). Minimal copy;
+  // story 3 C-C1 writes the final text. §5: a muted sender sends NOTHING, and
+  // this text is rendered from the wire, never from having noticed frames stop.
+  avatar_no_video: 'the participant publishes no video',
+  avatar_client_muted: 'the participant is muted',
+  avatar_server_muted: 'the participant is muted by the host',
+  fewer_sources_than_slots: 'no one to fill this slot yet',
+  // Over MC's per-kind cap: truncated, and permanent for the declaration.
+  unavailable: 'slot unavailable (over the meeting limit)',
+  // Retained on the wire but never emitted: rendered fail-closed, no media.
+  withheld_by_congestion: 'held back by the handler (congestion)',
+  // Structurally persistent — this one does not resolve by waiting, which is
+  // why it must not render as a spinner.
   source_unreachable: 'the sender cannot be reached',
   switch_pending: 'switching sources',
 };
@@ -93,7 +97,8 @@ export function slotStateText(state: SlotStateAttr): string {
 }
 
 /**
- * Whether this state means audio should be flowing.
+ * Whether this state means media should be flowing (live). Every other state,
+ * including the retained-never-emitted ones, renders no media (fail closed).
  *
  * Used ONLY to decide presentation emphasis. It is deliberately not used to
  * decide anything about mute: the local mute indicator comes from the SDK's

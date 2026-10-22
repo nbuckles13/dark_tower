@@ -41,7 +41,7 @@ import {
   COHORT_ENV_VAR,
   encodeCohort,
   parseAcAuthRateLimit,
-  SUITE_RECEIVE_SLOTS,
+  SUITE_AUDIO_RECEIVE_SLOTS,
 } from './cohort.js';
 import { readVideoProfile, serviceConfigEnvPath, type VideoCodecProfile } from './configEnv.js';
 import { describeEnv, e2eEnv } from './env.js';
@@ -181,14 +181,14 @@ export default async function globalSetup(): Promise<void> {
 
   // --- 3. N+1 cohort (story 2 R-30) ---
   const limit = parseAcAuthRateLimit(readFileSync(AC_CONFIG_ENV, 'utf8'), AC_CONFIG_ENV);
-  assertCohortFitsAuthWindow(SUITE_RECEIVE_SLOTS, limit);
+  assertCohortFitsAuthWindow(SUITE_AUDIO_RECEIVE_SLOTS, limit);
   const browser = await chromium.launch();
   try {
-    const cohort = await registerCohort(browser, SUITE_RECEIVE_SLOTS);
+    const cohort = await registerCohort(browser, SUITE_AUDIO_RECEIVE_SLOTS);
     // Playwright's globalSetup -> worker channel: workers inherit this env.
     process.env[COHORT_ENV_VAR] = encodeCohort(cohort);
     console.log(
-      `[e2e] registered the N+1 cohort once for this run (N=${SUITE_RECEIVE_SLOTS}, ` +
+      `[e2e] registered the N+1 cohort once for this run (N=${SUITE_AUDIO_RECEIVE_SLOTS}, ` +
         `${cohort.length} accounts)`,
     );
   } finally {

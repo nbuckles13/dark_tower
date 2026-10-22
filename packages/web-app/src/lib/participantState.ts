@@ -9,22 +9,23 @@
 //
 //   * reachability  <- `StreamAssignments.unreachable_sender_ids` (per subscriber);
 //   * server mute   <- `ParticipantMuteUpdate` (who, and who muted them);
-//   * client mute   <- the slot carrying that participant reading `source_muted`
-//                      while MC reports no server mute.
+//   * client mute   <- the AUDIO slot carrying that participant reading
+//                      `avatar_client_muted` while MC reports no server mute.
 //
 // CLIENT MUTE IS TRI-STATE, deliberately. Self-mute does not fan out on the
 // roster (MC's rule; `ParticipantMuteUpdate`'s self-mute booleans are stale
-// snapshots), so the ONLY wire signal is a slot's `source_muted`. A participant
+// snapshots), so the ONLY wire signal is a slot's `avatar_client_muted`. A participant
 // no slot of ours carries (over-subscription, unreachable) has no wire fact either
 // way, and `false` there would assert "not muted" from absence — the collapse
 // `slotState.ts` exists to prevent. That case is `unknown`. So is a server-muted
-// participant: their slot reads `source_muted` because of the server mute, which
-// says nothing about their own microphone.
+// participant: their slot reads `avatar_server_muted` (server wins), which says
+// nothing about their own microphone.
 //
-// ORDERING WINDOW: MC may push the slot's `source_muted` a moment before the
-// `ParticipantMuteUpdate` for the same server mute lands, so a server mute can
-// briefly read as a client mute. That is transient and self-correcting; the
-// browser suite polls to the settled state rather than reading once.
+// ORDERING WINDOW (until MC-A): the controller in service before MC-A still sends
+// the legacy `source_muted`, which the SDK resolves to `avatar_client_muted` until
+// the `ParticipantMuteUpdate` for a server mute lands (SDK shim b). A server mute
+// can therefore briefly read as a client mute. That is transient and
+// self-correcting; the browser suite polls to the settled state.
 //
 // Identities are resolved against the roster and rendered as TEXT only. An id the
 // roster does not know renders as a bounded placeholder, never as the raw wire
@@ -110,11 +111,14 @@ export function participantIndicators(
       : 'reachable';
   const serverMute = media.serverMutes.get(participant.participantId);
   const serverMuted = serverMute !== undefined;
+  // The participant's AUDIO slot: audio mute is what this row reports.
   const slot =
-    senderId === undefined ? undefined : media.slots.find((s) => s.senderId === senderId);
+    senderId === undefined
+      ? undefined
+      : media.slots.find((s) => s.senderId === senderId && s.mediaKind === 'audio');
   let clientMuted: ClientMuteToken = 'unknown';
   if (slot !== undefined && !serverMuted) {
-    if (slot.slotState === 'source_muted') clientMuted = 'true';
+    if (slot.slotState === 'avatar_client_muted') clientMuted = 'true';
     else if (slot.slotState === 'active') clientMuted = 'false';
   }
   return {

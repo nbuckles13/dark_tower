@@ -237,6 +237,14 @@ describe('AudioPipeline.setCaptureDevice', () => {
     // the rejection still sees the fault, and a caller that awaits gets an
     // error rather than silently believing a dead pipeline is live.
     expect(rig.faults).toContain('capture');
+    // Counted by its bounded, CLASSIFIED outcome: the raw platform error here
+    // has no recognised name, so it is `unknown` — never its message.
+    const failures = rig.sink
+      .getRecordedMetrics()
+      .filter((m) => m.name === 'dt_client_media_capture_failures_total');
+    expect(failures.map((m) => [m.labels['media_kind'], m.labels['outcome']])).toEqual([
+      ['audio', 'unknown'],
+    ]);
     await rig.pipeline.stop();
   });
 

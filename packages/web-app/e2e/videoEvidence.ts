@@ -67,7 +67,7 @@ export class VideoEvidenceHarnessError extends Error {
 /** What a slot in each MC state must render. */
 export function renderedFor(state: ExpectedSlotState): RenderedKind {
   if (state === 'active') return 'video';
-  if (state === 'fewer_sources' || state === 'unavailable') return 'empty';
+  if (state === 'fewer_sources_than_slots' || state === 'unavailable') return 'empty';
   return 'avatar';
 }
 

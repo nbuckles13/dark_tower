@@ -24,7 +24,12 @@ import { InMemoryMetricsSink } from '@darktower/test-utils';
 
 import { ALL_REJECT_REASONS, NON_DROPPING_REASON } from '../../frame/rejectReason.js';
 import { loadFrameVectors } from '../../frame/__tests__/frameVectors.js';
+import { CaptureFailure } from '../captureFailure.js';
 import {
+  MEDIA_CAPTURE_FAILURE_OUTCOMES,
+  MEDIA_KEYFRAME_REQUEST_OUTCOMES,
+  MEDIA_KEYFRAME_UNATTRIBUTED_OUTCOMES,
+  MEDIA_MH_CONTROL_CHANNEL_ENDINGS,
   MEDIA_KEK_INSTALL_REFUSALS,
   MEDIA_KIND_LABELS,
   MEDIA_ROSTER_KEY_CHANGES,
@@ -72,7 +77,17 @@ const PER_KIND_EMITTERS: [string, (m: MediaKindMetrics) => void, string | null][
   ],
   ['dt_client_media_decode_queue_dropped_total', (m) => m.decodeQueueDropped(), null],
   ['dt_client_media_receive_source_deficit_total', (m) => m.receiveSourceDeficit(2), null],
-  ['dt_client_media_receive_slots_rejected_total', (m) => m.receiveSlotsRejected(), null],
+  [
+    'dt_client_media_capture_failures_total',
+    (m) => m.captureFailure(MEDIA_CAPTURE_FAILURE_OUTCOMES.Ended),
+    'outcome',
+  ],
+  [
+    'dt_client_media_keyframe_requests_received_total',
+    (m) => m.keyframeRequestReceived(MEDIA_KEYFRAME_REQUEST_OUTCOMES.NotSending),
+    'outcome',
+  ],
+  ['dt_client_media_send_directive_kind_missing_total', (m) => m.sendDirectiveKindMissing(), null],
   ['dt_client_time_to_first_media_frame_ms', (m) => m.timeToFirstMediaFrameMs(42), null],
 ];
 
@@ -101,6 +116,21 @@ const SESSION_EMITTERS: [string, (m: MediaSessionMetrics) => void, string | null
     'outcome',
   ],
   ['dt_client_media_capture_source', (m) => m.captureSource('microphone'), 'mode'],
+  [
+    'dt_client_media_send_directive_header_version_refused_total',
+    (m) => m.sendDirectiveHeaderVersionRefused(),
+    null,
+  ],
+  [
+    'dt_client_media_mh_control_channel_ended_total',
+    (m) => m.mhControlChannelEnded(MEDIA_MH_CONTROL_CHANNEL_ENDINGS.Reset),
+    'outcome',
+  ],
+  [
+    'dt_client_media_keyframe_requests_unattributed_total',
+    (m) => m.keyframeRequestUnattributed(MEDIA_KEYFRAME_REQUEST_OUTCOMES.Malformed),
+    'outcome',
+  ],
 ];
 
 function emitEverything(metrics: MediaMetrics): void {
@@ -427,5 +457,51 @@ describe('story 2 task 13 media metrics', () => {
     m.receiveSourceDeficit(0);
     m.receiveSourceDeficit(3);
     expect(sink.getRecordedMetrics().map((r) => r.value)).toEqual([0, 3]);
+  });
+});
+
+describe('story 3 C-A1 vocabularies', () => {
+  it('capture-failure outcomes are exactly the CaptureFailure vocabulary plus `ended`', () => {
+    expect(new Set(Object.values(MEDIA_CAPTURE_FAILURE_OUTCOMES))).toEqual(
+      new Set([...Object.values(CaptureFailure), 'ended']),
+    );
+  });
+
+  it('keyframe-request outcomes are the six declared values', () => {
+    expect(Object.values(MEDIA_KEYFRAME_REQUEST_OUTCOMES).sort()).toEqual(
+      [
+        'honoured',
+        'honoured_counter_ahead',
+        'malformed',
+        'min_interval',
+        'not_sending',
+        'stale_counter',
+      ].sort(),
+    );
+  });
+
+  it('the unattributed outcomes are a subset of the keyframe outcomes', () => {
+    for (const o of MEDIA_KEYFRAME_UNATTRIBUTED_OUTCOMES) {
+      expect(Object.values(MEDIA_KEYFRAME_REQUEST_OUTCOMES)).toContain(o);
+    }
+  });
+
+  it('no new vocabulary spells the collector sentinel `invalid`', () => {
+    for (const v of [
+      ...Object.values(MEDIA_CAPTURE_FAILURE_OUTCOMES),
+      ...Object.values(MEDIA_KEYFRAME_REQUEST_OUTCOMES),
+    ]) {
+      expect(v).not.toBe('invalid');
+    }
+  });
+
+  it('a zero-initialisation emits a 0-valued series with the kind-free label set', () => {
+    const sink = new InMemoryMetricsSink();
+    const metrics = new MediaMetrics(IDENTITY, sink);
+    metrics.session.sendDirectiveHeaderVersionRefused(0);
+    metrics.session.keyframeRequestUnattributed(MEDIA_KEYFRAME_REQUEST_OUTCOMES.NotSending, 0);
+    const recorded = sink.getRecordedMetrics();
+    expect(recorded.map((r) => r.value)).toEqual([0, 0]);
+    expect(Object.keys(recorded[0]!.labels).sort()).toEqual(SESSION_KEYS);
   });
 });

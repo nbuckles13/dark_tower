@@ -9,11 +9,11 @@
 ## SDK Core: Session & Signaling (`packages/sdk-core/src/`)
 - Signaling client / meeting session (single-use per join) → `signaling/SignalingClient.ts`, `session/MeetingSession.ts`
 - Session event surface (mute / first-media / slot / fault) → `session/events.ts:MeetingSessionEventMap`; `StreamAssignments` + unreachable senders → `signaling/events.ts:StreamAssignmentsEvent`
-- Session↔media wiring (rebind purge, KEK observer, send directives) → `session/mediaWiring.ts:sendDirectiveListener`
-- Capture-source + receive-slot selection → `session/mediaSelection.ts:selectCaptureSource`
-- Host role hint → `session/meetingRole.ts`; base64url (one decoder) → `encoding/base64url.ts`
-- Error codes, connection-closing vs request-refusal → `signaling/errorCodeMap.ts:closesConnection()`; SDK error taxonomy → `errors/`
-- WebTransport length-prefix framing → `framing/{length-prefix,sendFramed}.ts`; connection mgmt + datagrams → `transport/`, `media/MediaTransport.ts`
+- Session↔media wiring (rebind purge, KEK observer, per-kind send directives + shim c, MH control sink) → `session/mediaWiring.ts:sendDirectiveListener`
+- Signalling media state (E3 cache, mute) + R-18 tracker (S1); publish set + slot plan + declaration + capture source → `session/{signalingMediaState,serverMuteResume,slotPlan,mediaSelection}.ts`
+- Flat slot-state map + legacy SOURCE_MUTED shim b + pairing view + both-kinds mute builder → `signaling/{slotStateMap,legacySourceMutedShim,pairing,muteRequest}.ts`
+- Host role hint → `session/meetingRole.ts`; base64url → `encoding/base64url.ts`; error codes (closing vs refusal) → `signaling/errorCodeMap.ts:closesConnection()`, `errors/`
+- WebTransport length-prefix framing → `framing/{length-prefix,sendFramed}.ts`; connection mgmt, datagrams, uni streams, MH control channel → `transport/`, `media/MediaTransport.ts:sendRecoveryRequest`
 - HTTP/3 meeting API; generated protobuf-es types (gitignored); wire→public codec oracle; validation SSoT → `http/`, `proto/dark_tower/`, `signaling/codecMap.ts`, `validation/limits.ts`
 
 ## SDK Core: Config
@@ -21,7 +21,7 @@
 
 ## SDK Core: Media Pipeline (`packages/sdk-core/src/media/`)
 - Frame codec + signing → `frame/{frameCodec,ed25519,wireConstants}.ts`; header v3 + sendable/supported versions → `frameCodec.ts:HEADER_VERSION_V3`, `__tests__/frameCodec.v3.test.ts`; hot-path layout rule → `__tests__/hotPathLayout.test.ts`
-- Egress (seal once, per-target fan-out) → `pipeline/{egress,egressQueue}.ts`; proof → `pipeline/__tests__/egress.multiTarget.test.ts`
+- Egress (seal once, per-target fan-out) + uplink stamp = MC send id → `pipeline/{egress,egressQueue,sendId}.ts`; proof → `pipeline/__tests__/egress.multiTarget.test.ts`
 - Ingress + slot-edge gate + per-sender receive lanes → `pipeline/{ingress,receiveLanes,playbackSink}.ts`; proof → `lifecycle/__tests__/audioPipeline.multiSender.test.ts`
 - Receive verification recorder (test-injected); hop monitor → `pipeline/{receiveVerification,hopSequenceMonitor}.ts`
 - Pipeline lifecycle (per-transport receive, transmit keys, mute) → `lifecycle/{AudioPipeline,receiveTransports,transmitKeys,muteState}.ts`
@@ -60,7 +60,7 @@
 - Subdomain-pattern drift guard → `scripts/guards/simple/validate-subdomain-regex-sync.sh`
 
 ## Client Test Utilities (`packages/test-utils/src/`)
-- Mock transport; audio seam doubles; tokens, metrics sink contract + mocks, ids → `MockWebTransport.ts`, `media/index.ts`, `TestTokenBuilder.ts`, `token-claims.ts`, `contracts/MetricsSink.ts`, `InMemoryMetricsSink.ts`, `MockOTLPExporter.ts`, `deterministic-ids.ts`
+- Mock transport (uni streams, STOP_SENDING/reset, write gates → `mockUniStreams.ts`); audio seam doubles; tokens, metrics sink contract + mocks, ids → `MockWebTransport.ts`, `media/index.ts`, `TestTokenBuilder.ts`, `token-claims.ts`, `contracts/MetricsSink.ts`, `InMemoryMetricsSink.ts`, `MockOTLPExporter.ts`, `deterministic-ids.ts`
 
 ## Protocol Integration
 - Signaling proto (incl. `max_receive_slots`, `kek_rotation_debounce_seconds`) → `proto/dark_tower/signaling/v1/signaling.proto`

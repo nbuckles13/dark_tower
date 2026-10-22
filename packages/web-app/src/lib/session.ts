@@ -39,8 +39,9 @@ export function buildMeetingClient(config: DemoConfig): MeetingApiClient {
 /**
  * Construct a fresh single-use {@link MeetingSession} (meeting-join view).
  *
- * `receiveSlots` is N from `VITE_DT_RECEIVE_SLOTS` (see `config.ts`), unless a
- * test-levers build overrides it for this context. `e2e` is
+ * N and M come from `VITE_DT_AUDIO_RECEIVE_SLOTS` / `VITE_DT_VIDEO_RECEIVE_SLOTS`
+ * (see `config.ts`), unless a test-levers build overrides them for this context.
+ * The publish set is the SDK default (audio) until the video publish path ships. `e2e` is
  * the test build's receive-side instrumentation (`e2eAnalysis.ts`); it is
  * `undefined` in production, so neither the verification recorder nor the
  * analysing playback wrapper is ever injected there.
@@ -59,7 +60,10 @@ export function buildMeetingSession(
     acOriginTemplate: config.acOriginTemplate,
     gcBaseUrl: config.gcBaseUrl,
     connect: __DT_TEST_LEVERS__ && active ? blockingConnect(connect, active) : connect,
-    receiveSlots: (__DT_TEST_LEVERS__ ? active?.receiveSlots : undefined) ?? config.receiveSlots,
+    audioReceiveSlots:
+      (__DT_TEST_LEVERS__ ? active?.audioReceiveSlots : undefined) ?? config.audioReceiveSlots,
+    videoReceiveSlots:
+      (__DT_TEST_LEVERS__ ? active?.videoReceiveSlots : undefined) ?? config.videoReceiveSlots,
     ...(e2e ? { receiveVerification: e2e.recorder, playbackFactory: e2e.playbackFactory } : {}),
   });
 }

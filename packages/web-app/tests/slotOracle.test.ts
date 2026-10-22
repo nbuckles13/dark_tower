@@ -98,7 +98,7 @@ describe('R-3 fill', () => {
     o.join('S', both(1, 1));
     o.join('R', receiveOnly(1, 1));
     expect(o.expected('S')).toEqual({
-      audio: [{ state: 'fewer_sources' }],
+      audio: [{ state: 'fewer_sources_than_slots' }],
       video: [{ state: 'avatar_no_video', occupant: 'R' }],
       unreachable: [],
     });
@@ -221,8 +221,8 @@ describe('R-3 fill', () => {
     o.join('X', both(1, 1, ['mh-1']));
     o.join('Y', both(1, 1, ['mh-0', 'mh-1']));
     expect(o.expected('S')).toEqual({
-      audio: [{ state: 'active', occupant: 'Y' }, { state: 'fewer_sources' }],
-      video: [{ state: 'active', occupant: 'Y' }, { state: 'fewer_sources' }],
+      audio: [{ state: 'active', occupant: 'Y' }, { state: 'fewer_sources_than_slots' }],
+      video: [{ state: 'active', occupant: 'Y' }, { state: 'fewer_sources_than_slots' }],
       unreachable: ['X'],
     });
     // X connects to mh-0 too: now reachable, fills the free slots; Y never moves.
@@ -241,8 +241,8 @@ describe('R-3 fill', () => {
     // Y drops mh-0: S and Y become unreachable; only Y's slots are freed.
     o.setHandlers('Y', ['mh-1']);
     expect(o.expected('S')).toEqual({
-      audio: [{ state: 'fewer_sources' }, { state: 'active', occupant: 'X' }],
-      video: [{ state: 'fewer_sources' }, { state: 'active', occupant: 'X' }],
+      audio: [{ state: 'fewer_sources_than_slots' }, { state: 'active', occupant: 'X' }],
+      video: [{ state: 'fewer_sources_than_slots' }, { state: 'active', occupant: 'X' }],
       unreachable: ['Y'],
     });
   });

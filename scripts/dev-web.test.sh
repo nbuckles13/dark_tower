@@ -69,13 +69,16 @@ unset __path_dirs __d __f __n
 
 # Build a temp root. $1 = "with-fingerprints" | "without-fingerprints".
 # $2 = advertise address to write into every per-instance config.env ("" = omit the key).
-# $3 = the shared MC config.env's MC_MAX_RECEIVE_SLOTS value (default "8");
-#      "__omit_key__" writes the file without the key, "__no_file__" writes no
-#      file at all. Every root carries a COMMENT decoy naming the key with a
-#      different value, so a reader that is not anchored on the KEY= line reads
-#      the decoy and the cap assertions below go red.
+# $3 = the shared MC config.env's MC_MAX_AUDIO_RECEIVE_SLOTS value (default "8");
+#      "__omit_key__" writes the file without that key, "__no_file__" writes no
+#      file at all.
+# $4 = its MC_MAX_VIDEO_RECEIVE_SLOTS value (default "4"); "__omit_key__" omits it.
+#      Every root carries COMMENT decoys naming both keys with a different value,
+#      so a reader that is not anchored on the KEY= line reads the decoy and the
+#      cap assertions below go red. It also carries the RETIRED total key with a
+#      distinct value, which must never be read.
 make_root() {
-  local fingerprints="$1" advertise="${2-}" cap="${3-8}"
+  local fingerprints="$1" advertise="${2-}" cap="${3-8}" vcap="${4-4}"
   local root; root="$(mktemp -d "$WORK/root.XXXXXX")"
 
   mkdir -p "$root/scripts" "$root/packages/web-app" "$root/infra/docker/certs"
@@ -109,10 +112,16 @@ JSON
   done
   if [[ "$cap" != "__no_file__" ]]; then
     {
-      printf '# Prose decoy — MC_MAX_RECEIVE_SLOTS=99 must never be read from a comment.\n'
+      printf '# Prose decoy — MC_MAX_AUDIO_RECEIVE_SLOTS=99 must never be read from a comment.\n'
+      printf '# Prose decoy — MC_MAX_VIDEO_RECEIVE_SLOTS=98 must never be read from a comment.\n'
       if [[ "$cap" != "__omit_key__" ]]; then
-        printf 'MC_MAX_RECEIVE_SLOTS=%s\n' "$cap"
+        printf 'MC_MAX_AUDIO_RECEIVE_SLOTS=%s\n' "$cap"
       fi
+      if [[ "$vcap" != "__omit_key__" ]]; then
+        printf 'MC_MAX_VIDEO_RECEIVE_SLOTS=%s\n' "$vcap"
+      fi
+      # The RETIRED total: present on disk (two-deploy retirement), never read.
+      printf 'MC_MAX_RECEIVE_SLOTS=77\n'
       printf 'MC_AUDIO_CODEC=opus\n'
     } >"$root/infra/services/mc-service/config.env"
   fi
@@ -159,12 +168,17 @@ SH
 # Run `dev-web.sh --check` hermetically. Sets RUN_OUT.
 # PATH is stubs + TOOLBOX only — never the outer PATH — so `ss` exists exactly
 # when the stub dir provides it.
-# $3 (optional) = VITE_DT_RECEIVE_SLOTS for the run. When omitted the variable
-# is UNSET (`env -u`), so the developer's own shell can never leak an N in.
+# $3 (optional) = VITE_DT_AUDIO_RECEIVE_SLOTS (N) for the run, $4 (optional) =
+# VITE_DT_VIDEO_RECEIVE_SLOTS (M). When omitted each variable is UNSET (`env -u`),
+# so the developer's own shell can never leak a value in. The RETIRED
+# VITE_DT_RECEIVE_SLOTS is always unset unless RUN_CHECK_RETIRED is non-empty.
 run_check() {
   local root="$1" stubs="$2"
-  local -a n_env=(-u VITE_DT_RECEIVE_SLOTS)
-  if [[ $# -ge 3 ]]; then n_env=("VITE_DT_RECEIVE_SLOTS=$3"); fi
+  local -a unset_env=(-u VITE_DT_RECEIVE_SLOTS -u VITE_DT_AUDIO_RECEIVE_SLOTS -u VITE_DT_VIDEO_RECEIVE_SLOTS)
+  local -a n_env=()
+  if [[ $# -ge 3 ]]; then n_env+=("VITE_DT_AUDIO_RECEIVE_SLOTS=$3"); fi
+  if [[ $# -ge 4 ]]; then n_env+=("VITE_DT_VIDEO_RECEIVE_SLOTS=$4"); fi
+  if [[ -n "${RUN_CHECK_RETIRED:-}" ]]; then n_env+=("VITE_DT_RECEIVE_SLOTS=${RUN_CHECK_RETIRED}"); fi
   # The test-tone opt-in is hermetic too: unset unless a case sets RUN_CHECK_TONE.
   # `-u` options must precede any NAME=VALUE for env(1), so this comes first.
   local -a tone_env=(-u DT_TEST_TONE)
@@ -176,7 +190,7 @@ run_check() {
   if [[ -n "${RUN_CHECK_LEVERS:-}" ]]; then levers_env=(); fi
   local -a levers_set=()
   if [[ -n "${RUN_CHECK_LEVERS:-}" ]]; then levers_set=("DT_TEST_LEVERS=${RUN_CHECK_LEVERS}"); fi
-  RUN_OUT="$(cd "$root" && env "${tone_env[@]}" "${levers_env[@]}" "${n_env[@]}" "${tone_set[@]}" "${levers_set[@]}" PATH="${stubs}:${TOOLBOX}" AC_PORT=1 GC_PORT=2 \
+  RUN_OUT="$(cd "$root" && env "${unset_env[@]}" "${tone_env[@]}" "${levers_env[@]}" "${tone_set[@]}" "${levers_set[@]}" "${n_env[@]}" PATH="${stubs}:${TOOLBOX}" AC_PORT=1 GC_PORT=2 \
     bash "$root/scripts/dev-web.sh" --check 2>&1 || true)"
 }
 
@@ -662,42 +676,44 @@ else
 fi
 
 # ===========================================================================
-# (10) Receive slots: client N vs the MC server cap (story 2, R-1/R-23/R-25).
-#
-#      N above the cap has MC reject the WHOLE declaration — one silent
-#      participant per browser — so every failure here must be a HARD FAIL
-#      (`✗` present, `!` absent). Expected numbers are DERIVED from the fixture
-#      variables, never typed from memory.
+# (10) Receive slots: client N and M vs the MC per-kind caps (story 3 R-1, R-23,
+#      R-26; story 2 R-25). Every expected value is derived from the fixture or
+#      from the script's own constants, never typed from memory.
 # ===========================================================================
 stubs="$(make_stubs ss-present 'udp   UNCONN  0  0   127.0.0.1:4434   0.0.0.0:*')"
-OVER_CAP_TEXT="exceeds the server cap"
+NOTICE_TEXT="excess slots will show unavailable"
+VIDEO_OFF_TEXT="video disabled"
 
-# (10a) POSITIVE CONTROL — default N, fixture cap 8. N unset in the run, so the
-#       launcher default applies and says so.
+# Extract a demo-default constant: EXTRACTION vs CONTENT, as two assertions with
+# two reason tokens (review-protocol §Assertion Vacuity mechanism 1): an empty
+# extraction must red here, never turn every later comparison into contains("").
+extract_default() {
+  local name="$1" value
+  value="$(grep -E "^${name}=[0-9]+\$" "$DEV_WEB" | head -1 | cut -d= -f2 || true)"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[slots-default-constant-found-${name}] could not extract ${name} from ${DEV_WEB} (got '${value}') — the constant moved or changed shape; this is an EXTRACTION failure, NOT a wrong default.")
+  fi
+  printf '%s' "$value"
+}
+default_n="$(extract_default DEMO_AUDIO_RECEIVE_SLOTS)"
+default_m="$(extract_default DEMO_VIDEO_RECEIVE_SLOTS)"
+
+# (10a) POSITIVE CONTROL — defaults, fixture caps 8 / 4. N and M unset in the run,
+#       so the launcher defaults apply and say so.
 fixture_cap=8
-root="$(make_root with-fingerprints 'https://127.0.0.1:4434' "$fixture_cap")"
+fixture_vcap=4
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434' "$fixture_cap" "$fixture_vcap")"
 run_check "$root" "$stubs"
 out="$(plain "$RUN_OUT")"
-# EXTRACTION vs CONTENT, as two assertions with two reason tokens — the (10g)
-# shape. The earlier form here was `assert_status "…found" "default=" "default=${default_n:+…}"`,
-# which is `contains("")` wearing a prefix: an empty `default_n` made needle and
-# haystack both the literal `default=`, so the assertion whose whole job is "the
-# constant was found" went GREEN exactly when it was not, and the `[[ -n ]]`
-# guard then SKIPPED the only assertion comparing the echoed N against the
-# script's own constant. Quoting or indenting `DEMO_RECEIVE_SLOTS=3` would have
-# disarmed both, silently. (@dry-reviewer F-DRY-1; review-protocol §Assertion
-# Vacuity mechanism 1.)
-default_n="$(grep -E '^DEMO_RECEIVE_SLOTS=[0-9]+$' "$DEV_WEB" | head -1 | cut -d= -f2 || true)"
-if [[ "$default_n" =~ ^[1-9][0-9]*$ ]]; then
-  PASS=$((PASS + 1))
-else
-  FAIL=$((FAIL + 1))
-  FAILURES+=("[slots-default-n-constant-found] could not extract DEMO_RECEIVE_SLOTS from ${DEV_WEB} (got '${default_n}') — the constant moved or changed shape; this is an EXTRACTION failure, NOT a wrong default. Every assertion below comparing the echo against it is meaningless until this is fixed.")
-fi
-# Unconditional: a skipped assertion is not a passing one.
-assert_status "slots-default-echoes-n-and-cap" \
-  "effective N=${default_n} (launcher demo default) <= server cap MC_MAX_RECEIVE_SLOTS=${fixture_cap}" "$out"
+assert_status "slots-default-echoes-n-m-and-caps" \
+  "effective N=${default_n} audio (launcher demo default), M=${default_m} video (launcher demo default); server caps MC_MAX_AUDIO_RECEIVE_SLOTS=${fixture_cap}, MC_MAX_VIDEO_RECEIVE_SLOTS=${fixture_vcap}" "$out"
 assert_status "slots-default-is-pass-line" "✓ receive slots: effective N=" "$out"
+# The participant COUNT the operator acts on is a number, derived from N.
+assert_status "slots-default-prints-participant-count" \
+  "with N=${default_n}, $((default_n + 1))" "$out"
 # The test-tone state is printed beside N (@operations OPS-2): OFF when unset...
 assert_status "tone-state-off-when-unset" "test tone: OFF (DT_TEST_TONE unset)" "$out"
 assert_absent "tone-state-not-on-when-unset" "test tone: ON" "$out"
@@ -714,94 +730,122 @@ RUN_CHECK_LEVERS=1 run_check "$root" "$stubs"
 out_levers="$(plain "$RUN_OUT")"
 assert_status "levers-state-on-when-set" "test levers: ON requested (DT_TEST_LEVERS=1;" "$out_levers"
 assert_absent "levers-state-not-off-when-set" "test levers: OFF" "$out_levers"
-assert_absent "slots-default-not-over-cap" "$OVER_CAP_TEXT" "$out"
+assert_absent "slots-default-no-notice" "$NOTICE_TEXT" "$out"
 assert_absent "slots-default-no-cannot-verify" "receive slots: CANNOT VERIFY" "$out"
-# The comment decoy's value must never surface as the cap.
-assert_absent "slots-decoy-not-read" "MC_MAX_RECEIVE_SLOTS=99" "$out"
-# The live name is hash-suffixed (ADR-0038 §2), so the command resolves it via mc-0's ref.
-assert_status "slots-echo-prints-live-cmd" \
-  "kubectl get cm -n dark-tower -o jsonpath='{.data.MC_MAX_RECEIVE_SLOTS}'" "$out"
+assert_absent "slots-default-not-video-off" "$VIDEO_OFF_TEXT" "$out"
+# The comment decoys' values must never surface as a cap, and the RETIRED total
+# key is never read.
+assert_absent "slots-audio-decoy-not-read" "MC_MAX_AUDIO_RECEIVE_SLOTS=99" "$out"
+assert_absent "slots-video-decoy-not-read" "MC_MAX_VIDEO_RECEIVE_SLOTS=98" "$out"
+assert_absent "slots-retired-total-not-read" "MC_MAX_RECEIVE_SLOTS=77" "$out"
+# The live names are hash-suffixed (ADR-0038 §2): commands resolve them via mc-0's ref.
+assert_status "slots-echo-prints-live-audio-cmd" \
+  "kubectl get cm -n dark-tower -o jsonpath='{.data.MC_MAX_AUDIO_RECEIVE_SLOTS}'" "$out"
+assert_status "slots-echo-prints-live-video-cmd" \
+  "kubectl get cm -n dark-tower -o jsonpath='{.data.MC_MAX_VIDEO_RECEIVE_SLOTS}'" "$out"
+assert_absent "slots-echo-not-retired-live-cmd" "jsonpath='{.data.MC_MAX_RECEIVE_SLOTS}'" "$out"
 assert_status "slots-echo-live-cmd-resolves-hashed-name" \
   "kubectl get deployment/mc-0 -n dark-tower" "$out"
-# THE AUTHORITY FRAMING ON THE **PASS** BRANCH. The demo-breaking case is an
-# on-disk cap of 8 against a live cap of 2: the operator stands on a GREEN line
-# holding a number the cluster does not enforce, so "this is an on-disk read,
-# here is what enforces it" is most load-bearing exactly where nothing looked
-# wrong (@observability F2). Pinned on both branches so the shared helper cannot
-# be inlined back into one of them.
-assert_status "slots-pass-names-authority-counter" \
-  'outcome="slot_count_over_cap"' "$out"
+# THE AUTHORITY FRAMING ON THE **PASS** BRANCH (@observability F2): truncation's
+# in-cluster signal, and — until MC-A — the retired total's whole-declaration
+# rejection, so the transition window is not misreported.
+assert_status "slots-pass-names-truncation-counter" \
+  'mc_media_slot_states_total{slot_state="unavailable"}' "$out"
+assert_status "slots-pass-names-transition-counter" 'outcome="slot_count_over_cap"' "$out"
 assert_status "slots-pass-says-on-disk" "ON-DISK pre-flight read" "$out"
 
-# (10b) The cap is READ from the file, not hardcoded: a non-default cap of 5
-#       with N=5 passes and echoes 5 — and the over-cap text is ABSENT.
+# (10b) The caps are READ from the file, not hardcoded: non-default caps with
+#       N and M exactly at them pass, echo them, and carry no notice.
 fixture_cap=5
-root="$(make_root with-fingerprints 'https://127.0.0.1:4434' "$fixture_cap")"
-run_check "$root" "$stubs" "$fixture_cap"
+fixture_vcap=2
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434' "$fixture_cap" "$fixture_vcap")"
+run_check "$root" "$stubs" "$fixture_cap" "$fixture_vcap"
 out="$(plain "$RUN_OUT")"
-assert_status "slots-cap-read-from-file" \
-  "effective N=${fixture_cap} (set by you) <= server cap MC_MAX_RECEIVE_SLOTS=${fixture_cap}" "$out"
-assert_absent "slots-at-cap-not-over-cap" "$OVER_CAP_TEXT" "$out"
+assert_status "slots-caps-read-from-file" \
+  "effective N=${fixture_cap} audio (set by you), M=${fixture_vcap} video (set by you); server caps MC_MAX_AUDIO_RECEIVE_SLOTS=${fixture_cap}, MC_MAX_VIDEO_RECEIVE_SLOTS=${fixture_vcap}" "$out"
+assert_absent "slots-at-cap-no-notice" "$NOTICE_TEXT" "$out"
 
-# (10c) N one above the cap: HARD FAIL, says why in the operator's terms, points
-#       at the in-cluster authority, and does NOT pass.
-run_check "$root" "$stubs" "$((fixture_cap + 1))"
+# (10c) OVER-CAP IS A NOTICE, NOT A HARD FAIL (story 3 R-1: MC truncates). One
+#       above each cap: a `!` notice per kind, the pass line still prints, and no
+#       receive-slot ✗ appears.
+run_check "$root" "$stubs" "$((fixture_cap + 1))" "$((fixture_vcap + 1))"
 out="$(plain "$RUN_OUT")"
-assert_hard_fail_branch "slots-over-cap" "$OVER_CAP_TEXT" "$out"
-assert_status "slots-over-cap-silent-participant" "one silent participant" "$out"
-assert_status "slots-over-cap-names-authority" 'outcome="slot_count_over_cap"' "$out"
-assert_status "slots-over-cap-remedy" "VITE_DT_RECEIVE_SLOTS=${fixture_cap} scripts/dev-web.sh" "$out"
-assert_absent "slots-over-cap-does-not-pass" "✓ receive slots" "$out"
+audio_notice="$(printf '%s\n' "$out" | grep -F -- "N=$((fixture_cap + 1)) audio" | grep -F -- "$NOTICE_TEXT" | head -1 || true)"
+video_notice="$(printf '%s\n' "$out" | grep -F -- "M=$((fixture_vcap + 1)) video" | grep -F -- "$NOTICE_TEXT" | head -1 || true)"
+assert_status "slots-over-audio-cap-is-notice" '!' "$audio_notice"
+assert_absent "slots-over-audio-cap-not-hard-fail" '✗' "$audio_notice"
+assert_status "slots-over-video-cap-is-notice" '!' "$video_notice"
+assert_absent "slots-over-video-cap-not-hard-fail" '✗' "$video_notice"
+assert_status "slots-over-cap-still-passes" "✓ receive slots: effective N=" "$out"
+assert_absent "slots-over-cap-no-receive-slot-fail" "✗ receive slots" "$out"
 
-# (10d) An absurdly long N must not overflow bash arithmetic into a pass.
-run_check "$root" "$stubs" "99999999999999999999999"
+# (10d) An absurdly long N must not overflow bash arithmetic into "under the cap".
+run_check "$root" "$stubs" "99999999999999999999999" 0
 out="$(plain "$RUN_OUT")"
-assert_hard_fail_branch "slots-huge-n-over-cap" "$OVER_CAP_TEXT" "$out"
+assert_status "slots-huge-n-is-over-cap-notice" "$NOTICE_TEXT" "$out"
 
-# (10e) N not an integer >= 1: HARD FAIL.
-for bad_n in 0 abc "" -1; do
-  run_check "$root" "$stubs" "$bad_n"
+# (10e) N or M not an integer >= 0: HARD FAIL, naming the offending variable.
+for bad in abc "" -1 03 1.5; do
+  run_check "$root" "$stubs" "$bad" 0
   out="$(plain "$RUN_OUT")"
-  assert_hard_fail_branch "slots-invalid-n-[${bad_n}]" "is not an integer >= 1" "$out"
+  assert_hard_fail_branch "slots-invalid-n-[${bad}]" "VITE_DT_AUDIO_RECEIVE_SLOTS='${bad}'" "$out"
+  run_check "$root" "$stubs" 0 "$bad"
+  out="$(plain "$RUN_OUT")"
+  assert_hard_fail_branch "slots-invalid-m-[${bad}]" "VITE_DT_VIDEO_RECEIVE_SLOTS='${bad}'" "$out"
 done
+# 0 of either kind is LEGAL (story 3 R-1).
+run_check "$root" "$stubs" 0 0
+out="$(plain "$RUN_OUT")"
+assert_status "slots-zero-is-legal" "✓ receive slots: effective N=0 audio (set by you), M=0 video" "$out"
 
-# (10f) Cap unreadable — REPO/CONFIG DRIFT lane, for each cause the header names.
-#       FILE-ABSENT IS ASSERTED SEPARATELY, below: naming a path in a message
-#       implies that path exists, and "the shared ConfigMap both MC pods mount is
-#       gone" is a deployment problem while "the key was renamed" is a repo one.
-#       Asserting one shared needle across all three would PIN that collapse.
-#       Each cause asserts its OWN wording AND the absence of the other two
+# (10e-bis) A video cap of 0 is the video-off lever (R-26): reported as
+#           "video disabled", never as a failure or an over-cap notice.
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434' 8 0)"
+run_check "$root" "$stubs" 3 3
+out="$(plain "$RUN_OUT")"
+assert_status "slots-video-cap-zero-says-disabled" "$VIDEO_OFF_TEXT" "$out"
+assert_absent "slots-video-cap-zero-no-video-notice" "M=3 video (set by you) is over the cap" "$out"
+assert_absent "slots-video-cap-zero-no-fail" "✗ receive slots" "$out"
+
+# (10f) The RETIRED VITE_DT_RECEIVE_SLOTS fails loudly, first, naming BOTH new
+#       variables — and never as an alias (the run stops before any probe).
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+RUN_CHECK_RETIRED=3 run_check "$root" "$stubs"
+out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "slots-retired-var" "VITE_DT_RECEIVE_SLOTS is RETIRED" "$out"
+assert_status "slots-retired-names-audio-var" "VITE_DT_AUDIO_RECEIVE_SLOTS" "$out"
+assert_status "slots-retired-names-video-var" "VITE_DT_VIDEO_RECEIVE_SLOTS" "$out"
+assert_absent "slots-retired-stops-before-probes" "receive slots: effective" "$out"
+
+# (10g) Cap unreadable — REPO/CONFIG DRIFT lane, for each cause, for EACH key.
+#       Each cause asserts its OWN wording AND the absence of the other
 #       diagnoses, so a future collapse into one shared message reds here.
-for cap_case in __omit_key__ eight; do
-  root="$(make_root with-fingerprints 'https://127.0.0.1:4434' "$cap_case")"
+for case_ in "audio-omit:__omit_key__:4:MC_MAX_AUDIO_RECEIVE_SLOTS" \
+             "video-omit:8:__omit_key__:MC_MAX_VIDEO_RECEIVE_SLOTS"; do
+  IFS=':' read -r label acap vcap key <<<"$case_"
+  root="$(make_root with-fingerprints 'https://127.0.0.1:4434' "$acap" "$vcap")"
   run_check "$root" "$stubs"
   out="$(plain "$RUN_OUT")"
-  assert_hard_fail_branch "slots-cap-unreadable-[${cap_case}]" "receive slots: CANNOT VERIFY" "$out"
-  assert_status "slots-cap-unreadable-lane-[${cap_case}]" "REPO/CONFIG DRIFT" "$out"
-  assert_absent "slots-cap-unreadable-no-pass-[${cap_case}]" "✓ receive slots" "$out"
-  assert_status "slots-cap-unreadable-live-cmd-[${cap_case}]" \
-    "kubectl get deployment/mc-0 -n dark-tower" "$out"
-  # ...and must NOT claim the file is missing when it is present.
-  assert_absent "slots-cap-unreadable-not-file-absent-[${cap_case}]" "DOES NOT EXIST" "$out"
+  assert_hard_fail_branch "slots-cap-key-absent-[${label}]" "declares no ${key} data key" "$out"
+  assert_status "slots-cap-key-absent-lane-[${label}]" "REPO/CONFIG DRIFT" "$out"
+  assert_absent "slots-cap-key-absent-no-pass-[${label}]" "✓ receive slots" "$out"
+  assert_absent "slots-cap-key-absent-not-file-absent-[${label}]" "DOES NOT EXIST" "$out"
+  assert_absent "slots-cap-key-absent-not-malformed-[${label}]" "is not an integer >= 0 (got" "$out"
+  assert_status "slots-cap-key-absent-live-cmd-[${label}]" "jsonpath='{.data.${key}}'" "$out"
+done
+for case_ in "audio-malformed:eight:4:MC_MAX_AUDIO_RECEIVE_SLOTS:eight" \
+             "video-malformed:8:-1:MC_MAX_VIDEO_RECEIVE_SLOTS:-1"; do
+  IFS=':' read -r label acap vcap key bad <<<"$case_"
+  root="$(make_root with-fingerprints 'https://127.0.0.1:4434' "$acap" "$vcap")"
+  run_check "$root" "$stubs"
+  out="$(plain "$RUN_OUT")"
+  assert_hard_fail_branch "slots-cap-malformed-[${label}]" "${key} in" "$out"
+  assert_status "slots-cap-malformed-says-so-[${label}]" "is not an integer >= 0 (got '${bad}')" "$out"
+  assert_status "slots-cap-malformed-key-present-[${label}]" "KEY IS PRESENT" "$out"
+  assert_absent "slots-cap-malformed-not-key-absent-[${label}]" "declares no ${key} data key" "$out"
 done
 
-# Cause 2 — key absent from a file that exists.
-root="$(make_root with-fingerprints 'https://127.0.0.1:4434' __omit_key__)"
-run_check "$root" "$stubs"
-out="$(plain "$RUN_OUT")"
-assert_status "slots-cap-key-absent-says-so"  "declares no MC_MAX_RECEIVE_SLOTS data key" "$out"
-assert_absent "slots-cap-key-absent-not-malformed" "is not an integer >= 1 (got" "$out"
-
-# Cause 3 — key present, value malformed. The `(got '…')` token must carry the
-# offending value, and the message must say the key IS present.
-root="$(make_root with-fingerprints 'https://127.0.0.1:4434' eight)"
-run_check "$root" "$stubs"
-out="$(plain "$RUN_OUT")"
-assert_status "slots-cap-malformed-says-so"     "is not an integer >= 1 (got 'eight')" "$out"
-assert_status "slots-cap-malformed-key-present" "KEY IS PRESENT" "$out"
-assert_absent "slots-cap-malformed-not-key-absent" "declares no MC_MAX_RECEIVE_SLOTS data key" "$out"
-
-# (10f-bis) The file itself absent: a DISTINCT diagnosis, not "the key is missing
+# (10g-bis) The file itself absent: a DISTINCT diagnosis, not "the key is missing
 # from <path>". Same lane, same hard fail, different first move.
 root="$(make_root with-fingerprints 'https://127.0.0.1:4434' __no_file__)"
 run_check "$root" "$stubs"
@@ -811,24 +855,28 @@ assert_status "slots-cap-file-absent-says-so"      "DOES NOT EXIST" "$out"
 assert_status "slots-cap-file-absent-not-key"      "NOT a missing key inside it" "$out"
 assert_status "slots-cap-file-absent-lane"         "REPO/CONFIG DRIFT" "$out"
 assert_status "slots-cap-file-absent-live-cmd"     "kubectl get deployment/mc-0 -n dark-tower" "$out"
+assert_status "slots-cap-file-absent-live-audio"   "jsonpath='{.data.MC_MAX_AUDIO_RECEIVE_SLOTS}'" "$out"
+assert_status "slots-cap-file-absent-live-video"   "jsonpath='{.data.MC_MAX_VIDEO_RECEIVE_SLOTS}'" "$out"
 assert_absent "slots-cap-file-absent-no-pass"      "✓ receive slots" "$out"
 
-# (10g) REAL-FILE control (@operations condition 2). The fixture shape is ours;
-#       the committed ConfigMap's shape is not. Run the extraction against the
-#       real infra/services/mc-service/config.env and assert it produced a
-#       non-empty integer >= 1 — no literal value, so raising the cap never reds
-#       this for the wrong reason.
+# (10g-ter) REAL-FILE control (@operations condition 2). The fixture shape is
+#       ours; the committed ConfigMap's shape is not. Run the extraction against
+#       the real infra/services/mc-service/config.env and assert it produced
+#       integers >= 0 — no literal values, so moving a cap never reds this for
+#       the wrong reason.
 root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
 cp "$REPO_ROOT/infra/services/mc-service/config.env" "$root/infra/services/mc-service/config.env"
-run_check "$root" "$stubs" 1
+run_check "$root" "$stubs" 1 0
 out="$(plain "$RUN_OUT")"
-real_cap="$(printf '%s\n' "$out" | grep -oE 'server cap MC_MAX_RECEIVE_SLOTS=[0-9]+' | head -1 | cut -d= -f2 || true)"
-if [[ "$real_cap" =~ ^[1-9][0-9]*$ ]]; then
-  PASS=$((PASS + 1))
-else
-  FAIL=$((FAIL + 1))
-  FAILURES+=("[slots-real-configmap-cap-extracted] the cap extraction produced '${real_cap}' from the REAL infra/services/mc-service/config.env — the reader no longer matches the committed file's shape (not a cap-value problem)")
-fi
+for key in MC_MAX_AUDIO_RECEIVE_SLOTS MC_MAX_VIDEO_RECEIVE_SLOTS; do
+  real_cap="$(printf '%s\n' "$out" | grep -oE "${key}=[0-9]+" | head -1 | cut -d= -f2 || true)"
+  if [[ "$real_cap" =~ ^[0-9]+$ ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[slots-real-configmap-cap-extracted-${key}] the cap extraction produced '${real_cap}' from the REAL infra/services/mc-service/config.env — the reader no longer matches the committed file's shape (not a cap-value problem)")
+  fi
+done
 assert_absent "slots-real-configmap-no-cannot-verify" "receive slots: CANNOT VERIFY" "$out"
 
 # (10h) Hard-fail exit carries the counter-message (docs/TODO.md "dev-web.sh's
@@ -844,7 +892,8 @@ assert_status "help-n-plus-1-distinct-accounts" "N+1 DISTINCT REGISTERED ACCOUNT
 assert_status "help-auth-not-shared-cited"      "packages/web-app/src/App.svelte" "$help_out"
 assert_status "help-tabs-question-unverified"   "UNVERIFIED" "$help_out"
 assert_status "help-names-test-tone-define"     "__DT_TEST_TONE__" "$help_out"
-assert_status "help-names-receive-slots-var"    "VITE_DT_RECEIVE_SLOTS" "$help_out"
+assert_status "help-names-audio-slots-var"      "VITE_DT_AUDIO_RECEIVE_SLOTS" "$help_out"
+assert_status "help-names-video-slots-var"      "VITE_DT_VIDEO_RECEIVE_SLOTS" "$help_out"
 assert_status "help-one-n-per-dev-server"       "ONE value per dev server" "$help_out"
 assert_status "help-second-machine-block"       "WHY NOT A SECOND MACHINE" "$help_out"
 # Pins the LOOPBACK claim, which is what the second-machine argument rests on —

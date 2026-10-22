@@ -13,7 +13,8 @@ const config: DemoConfig = {
   gcBaseUrl: '',
   env: 'test',
   devCertHashes: [],
-  receiveSlots: { count: 1, source: 'default' },
+  audioReceiveSlots: { count: 1, source: 'default' },
+  videoReceiveSlots: { count: 0, source: 'default' },
 };
 
 const auth: AuthSession = {

@@ -76,8 +76,10 @@ export interface JoinResponseInit {
   // Present so a test can construct the leak scenario: the meeting KEK is on the
   // wire but must never be projected into `JoinedEvent` (events.ts guarantee).
   meetingKek?: Uint8Array;
-  /** `JoinResponse.max_receive_slots`; omitted = absent on the wire. */
-  maxReceiveSlots?: number;
+  /** `JoinResponse.max_audio_receive_slots`; omitted = absent on the wire. */
+  maxAudioReceiveSlots?: number;
+  /** `JoinResponse.max_video_receive_slots`; omitted = absent on the wire. */
+  maxVideoReceiveSlots?: number;
 }
 
 export function buildJoinResponse(init: JoinResponseInit = {}) {
@@ -99,7 +101,12 @@ export function buildJoinResponse(init: JoinResponseInit = {}) {
     correlationId: init.correlationId ?? '',
     bindingToken: init.bindingToken ?? '',
     meetingKek: init.meetingKek ?? new Uint8Array(),
-    ...(init.maxReceiveSlots !== undefined ? { maxReceiveSlots: init.maxReceiveSlots } : {}),
+    ...(init.maxAudioReceiveSlots !== undefined
+      ? { maxAudioReceiveSlots: init.maxAudioReceiveSlots }
+      : {}),
+    ...(init.maxVideoReceiveSlots !== undefined
+      ? { maxVideoReceiveSlots: init.maxVideoReceiveSlots }
+      : {}),
   });
 }
 
@@ -202,29 +209,36 @@ export async function waitFor(predicate: () => boolean, tries = 100): Promise<vo
 
 // --- ADR-0036 §4/§5/§6 media signaling (story task 19) ---
 
-/** Build a `SendDirective` naming one audio stream and its targets. */
-export function buildSendDirective(init: {
+/** One stream of a fixture `SendDirective`. */
+export interface SendStreamInit {
   streamNumber?: number;
   maxBitrateBps?: number;
   targets?: string[];
-  headerVersion?: number;
   mediaKind?: MediaKind;
-}) {
+}
+
+function buildSendStream(init: SendStreamInit) {
+  return create(SendStreamSchema, {
+    streamNumber: init.streamNumber ?? 1,
+    mediaKind: init.mediaKind ?? MediaKind.AUDIO,
+    encoding: create(EncodingParametersSchema, {
+      maxBitrateBps: init.maxBitrateBps ?? 0,
+    }),
+    targets: (init.targets ?? []).map((url) => create(SendTargetSchema, { mediaHandlerUrl: url })),
+  });
+}
+
+/**
+ * Build a `SendDirective` naming one stream (default audio) and its targets, or
+ * the explicit `streams` list when given.
+ */
+export function buildSendDirective(
+  init: SendStreamInit & { headerVersion?: number; streams?: SendStreamInit[] },
+) {
   return create(SendDirectiveSchema, {
     // MC derives it from the current version; so does this fixture.
     headerVersion: init.headerVersion ?? HEADER_VERSION,
-    streams: [
-      create(SendStreamSchema, {
-        streamNumber: init.streamNumber ?? 1,
-        mediaKind: init.mediaKind ?? MediaKind.AUDIO,
-        encoding: create(EncodingParametersSchema, {
-          maxBitrateBps: init.maxBitrateBps ?? 0,
-        }),
-        targets: (init.targets ?? []).map((url) =>
-          create(SendTargetSchema, { mediaHandlerUrl: url }),
-        ),
-      }),
-    ],
+    streams: (init.streams ?? [init]).map(buildSendStream),
   });
 }
 
@@ -245,8 +259,16 @@ export function buildStreamAssignments(init: {
   senderId?: number;
   mediaHandlerUrl?: string;
   slotState?: SlotState;
+  /** The slot's kind; default audio. */
+  mediaKind?: MediaKind;
   /** Extra slots, for the multi-handler cases (ADR-0036 §9). */
-  extraSlots?: { slotId: number; senderId?: number; mediaHandlerUrl: string }[];
+  extraSlots?: {
+    slotId: number;
+    senderId?: number;
+    mediaHandlerUrl: string;
+    mediaKind?: MediaKind;
+    slotState?: SlotState;
+  }[];
   /** Roster participants this subscriber shares no connected handler with. */
   unreachableSenderIds?: number[];
 }) {
@@ -255,7 +277,7 @@ export function buildStreamAssignments(init: {
       create(StreamAssignmentSchema, {
         slotId: init.slotId ?? 0,
         ...(init.senderId !== undefined ? { senderId: init.senderId } : {}),
-        mediaKind: MediaKind.AUDIO,
+        mediaKind: init.mediaKind ?? MediaKind.AUDIO,
         mediaHandlerUrl: init.mediaHandlerUrl ?? '',
         slotState: init.slotState ?? SlotState.ACTIVE,
       }),
@@ -263,9 +285,9 @@ export function buildStreamAssignments(init: {
         create(StreamAssignmentSchema, {
           slotId: slot.slotId,
           ...(slot.senderId !== undefined ? { senderId: slot.senderId } : {}),
-          mediaKind: MediaKind.AUDIO,
+          mediaKind: slot.mediaKind ?? MediaKind.AUDIO,
           mediaHandlerUrl: slot.mediaHandlerUrl,
-          slotState: SlotState.ACTIVE,
+          slotState: slot.slotState ?? SlotState.ACTIVE,
         }),
       ),
     ],
@@ -303,12 +325,14 @@ export function buildParticipantMuteUpdate(init: {
   participantId: string;
   audioSelfMuted?: boolean;
   audioServerMuted: boolean;
+  videoServerMuted?: boolean;
   serverMutedBy?: string;
 }) {
   return create(ParticipantMuteUpdateSchema, {
     participantId: init.participantId,
     audioSelfMuted: init.audioSelfMuted ?? false,
     audioServerMuted: init.audioServerMuted,
+    videoServerMuted: init.videoServerMuted ?? false,
     serverMutedBy: init.serverMutedBy ?? '',
   });
 }

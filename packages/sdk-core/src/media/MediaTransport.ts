@@ -6,8 +6,24 @@
 // each: open the first bidi stream, write a single length-prefixed
 // `MhClientMessage{connectRequest{joinToken}}` envelope (trace-injected via the SAME
 // shared `sendFramedMessage` path as the MC send), and treat the MH as CONNECTED iff
-// `ready` resolved AND that envelope wrote without error. No frame I/O beyond the
-// connect envelope, no SFrame, no WebCodecs, no datagrams.
+// `ready` resolved AND that envelope wrote without error. This layer does no
+// SFrame and no WebCodecs; datagrams and the control channel (below) are
+// exposed to the layers above.
+//
+// STORY 3 ADDS THE MH CONTROL CHANNEL (C-A1). The connect bidi stream is no
+// longer write-once: after the connect envelope it carries, in BOTH directions,
+// the same 4-byte big-endian length prefix and size bound as `MhClientMessage`:
+//   * MH -> client: `MhServerMessage` (a `keyframe_request`), read by a per-handler
+//     loop (`#runControlReadLoop`) through the shared `FrameDecoder`, which
+//     refuses an oversized length from the PREFIX ALONE, before the body is
+//     buffered. Malformed input is COUNTED (via the injected `controlSink`) and
+//     never throws: a decode failure skips the message, a framing failure stops
+//     that handler's loop (the stream is desynchronised; media is unaffected).
+//   * client -> MH: `MhClientMessage.recovery_request`, via `sendRecoveryRequest`
+//     (story 3 task 14, C-B, is its first caller), framed by the same
+//     `sendFramedMessage` as the connect envelope and serialised per handler.
+// The loop and the control send hold the STREAM only — never the meeting JWT or
+// the connect envelope that carried it.
 //
 // R-21 resolver: `connectAll` resolves (with the per-MH reports) when ≥1 MH connects
 // and rejects with `MediaConnectionError(ALL_FAILED)` only when EVERY MH fails. Each
@@ -33,19 +49,22 @@
 // `#connectOne`; it is never stored on the instance. `failureReason`/`failureCode`
 // are SDK-authored bounded classifications (never a raw transport-error message).
 
-import { create } from '@bufbuild/protobuf';
+import { create, fromBinary } from '@bufbuild/protobuf';
 
 import { TypedEventEmitter } from '../events/TypedEventEmitter.js';
-import { sendFramedMessage } from '../framing/sendFramed.js';
+import { encodeFramedMessage, sendFramedMessage, writeFrame } from '../framing/sendFramed.js';
+import { FrameDecoder } from '../framing/length-prefix.js';
 import { MediaConnectionError, MediaConnectionErrorCode } from '../errors/MediaConnectionError.js';
 import { getMetricsSink } from '../telemetry/telemetryConfig.js';
 import type { MetricLabels, MetricsSink } from '../telemetry/MetricsSink.js';
 import { connect as defaultConnect } from '../transport/BrowserWebTransport.js';
-import type { IWebTransport } from '../transport/IWebTransport.js';
+import type { IWebTransport, WebTransportBidirectionalStream } from '../transport/IWebTransport.js';
 import { capMhUrl } from '../validation/limits.js';
 import {
   MhClientMessageSchema,
   MhConnectRequestSchema,
+  MhServerMessageSchema,
+  RecoveryRequestSchema,
 } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
 import type { MhConnectionStatusReport } from '../signaling/events.js';
@@ -57,12 +76,15 @@ import {
   type MediaDatagramChannel,
   type MediaTransportEventMap,
   type MediaTransportOptions,
+  type MhControlSink,
+  type MhRecoveryRequest,
   type RunInContext,
 } from './events.js';
 
 /** Static, bounded failure reasons (never a raw cause string — R-23/security). */
 const REASON_TRANSPORT = 'media handler connection failed';
 const REASON_TIMEOUT = 'media handler connect deadline exceeded';
+const REASON_NO_CONTROL_CHANNEL = 'no control channel is open to that media handler';
 
 /** Bucket a raw MH index into the bounded `mh_index_bucket` label set (`0|1|2+`). */
 function mhIndexBucket(index: number): string {
@@ -101,6 +123,16 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
   /** Connected transports by URL, so a datagram channel can find its transport. */
   readonly #connectedTransports = new Map<string, IWebTransport>();
   readonly #datagramQueue: DatagramQueueSettings | undefined;
+  readonly #controlSink: MhControlSink | undefined;
+  /**
+   * Per-URL control stream (the connect bidi stream after its envelope) and the
+   * tail of its serialised send chain. Holds the STREAM only — never the JWT.
+   */
+  readonly #controlChannels = new Map<
+    string,
+    { readonly stream: WebTransportBidirectionalStream; tail: Promise<void> }
+  >();
+  readonly #controlReaders = new Set<ReadableStreamDefaultReader<Uint8Array>>();
 
   #terminated = false;
 
@@ -113,6 +145,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     this.#metricLabels = options.metricLabels ?? {};
     this.#runInContext = options.runInContext ?? identityRunInContext;
     this.#datagramQueue = options.datagramQueue;
+    this.#controlSink = options.controlSink;
   }
 
   /**
@@ -191,6 +224,13 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     }
     this.#datagramWriters.clear();
     this.#datagramChannels.clear();
+    for (const reader of this.#controlReaders) {
+      void reader.cancel().catch(() => {
+        // Already released or errored — the transport close below ends it.
+      });
+    }
+    this.#controlReaders.clear();
+    this.#controlChannels.clear();
     this.#connectedTransports.clear();
     for (const transport of this.#transports) {
       this.#safeClose(transport);
@@ -247,6 +287,158 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     return channel;
   }
 
+  /**
+   * Send a receiver's recovery request for one of its slots to the handler at
+   * `url` (story 3 R-13), as `MhClientMessage.recovery_request` on that
+   * handler's control stream. Framed by the same pipeline as the connect
+   * envelope; sends to one handler are serialised (one writer at a time).
+   *
+   * @throws {MediaConnectionError} `Transport` when no control channel is open
+   * to `url`, or the write fails. Bounded messages only.
+   */
+  async sendRecoveryRequest(url: string, request: MhRecoveryRequest): Promise<void> {
+    const channel = this.#controlChannels.get(url);
+    if (!channel || this.#terminated) {
+      throw new MediaConnectionError(
+        MediaConnectionErrorCode.Transport,
+        REASON_NO_CONTROL_CHANNEL,
+        {
+          mhUrl: capMhUrl(url),
+        },
+      );
+    }
+    const message = create(MhClientMessageSchema, {
+      message: {
+        case: 'recoveryRequest',
+        value: create(RecoveryRequestSchema, {
+          slotId: request.slotId,
+          senderId: request.senderId,
+          gopCounter: request.gopCounter,
+        }),
+      },
+    });
+    // Encoded (and trace-injected) NOW, under the caller's context; only the
+    // write is queued behind any earlier one.
+    const frame = this.#runInContext(() => encodeFramedMessage(MhClientMessageSchema, message));
+    const send = channel.tail.then(() => writeFrame(channel.stream, frame));
+    // The chain continues past a failed send; the failure is the caller's.
+    channel.tail = send.catch(() => undefined);
+    try {
+      await send;
+    } catch {
+      // Never the platform error: it is not ours to forward (R-23).
+      throw new MediaConnectionError(MediaConnectionErrorCode.Transport, REASON_TRANSPORT, {
+        mhUrl: capMhUrl(url),
+      });
+    }
+  }
+
+  /**
+   * Open the MH control channel on `stream` — the connect bidi stream AFTER its
+   * envelope. Takes the URL, the transport and the stream ONLY: nothing that
+   * carried the meeting JWT is captured by the loop or the control send.
+   */
+  #startControlChannel(
+    url: string,
+    transport: IWebTransport,
+    stream: WebTransportBidirectionalStream,
+  ): void {
+    this.#controlChannels.set(url, { stream, tail: Promise.resolve() });
+    // The transport ending ends the channel, whatever the read loop is doing:
+    // a later send then reports "no control channel", not a write failure.
+    const drop = (): void => this.#dropControlChannel(url, stream);
+    void transport.closed.then(drop, drop);
+    void this.#runControlReadLoop(url, stream);
+  }
+
+  /** Forget `url`'s control channel if it is still this stream. */
+  #dropControlChannel(url: string, stream: WebTransportBidirectionalStream): void {
+    if (this.#controlChannels.get(url)?.stream === stream) this.#controlChannels.delete(url);
+  }
+
+  /**
+   * Read `MhServerMessage`s off a handler's control stream until it ends.
+   * NEVER throws: every failure is bounded, counted through the control sink,
+   * and ends or continues the loop.
+   */
+  async #runControlReadLoop(url: string, stream: WebTransportBidirectionalStream): Promise<void> {
+    let reader: ReadableStreamDefaultReader<Uint8Array>;
+    try {
+      reader = stream.readable.getReader();
+    } catch {
+      return;
+    }
+    this.#controlReaders.add(reader);
+    // The SAME decoder as MC signalling: the 64 KiB per-message bound is checked
+    // on the length prefix, before the body is buffered.
+    const decoder = new FrameDecoder();
+    let desynchronised = false;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (this.#terminated) return;
+        if (done) {
+          // MH finished its send half: no keyframe request can arrive again.
+          this.#controlSink?.ended(url, 'finished');
+          return;
+        }
+        let frames: Uint8Array[];
+        try {
+          frames = decoder.push(value);
+        } catch {
+          // Oversized or empty length: the INBOUND half is desynchronised and no
+          // later boundary can be trusted. Count it and stop reading; its
+          // datagrams are unaffected. The channel entry is KEPT deliberately: the
+          // OUTBOUND half is independent of an inbound desync, so recovery
+          // requests can still be sent on it.
+          this.#controlSink?.malformed(url);
+          desynchronised = true;
+          return;
+        }
+        for (const frame of frames) this.#dispatchControl(url, frame);
+      }
+    } catch {
+      // The stream was reset or the transport ended. Teardown is ours and is not
+      // counted; anything else silently ends this handler's keyframe requests,
+      // so it is made visible.
+      if (!this.#terminated) this.#controlSink?.ended(url, 'reset');
+    } finally {
+      this.#controlReaders.delete(reader);
+      // The stream ENDED (MH finished or reset it, or the transport went): the
+      // channel is gone, so a later send reports "no control channel" — not a
+      // generic write failure an operator cannot tell from a transient.
+      if (!desynchronised) this.#dropControlChannel(url, stream);
+      try {
+        reader.releaseLock();
+      } catch {
+        // Already released during teardown.
+      }
+    }
+  }
+
+  /** Decode one control message and hand it to the sink. Never throws. */
+  #dispatchControl(url: string, frame: Uint8Array): void {
+    let message;
+    try {
+      message = fromBinary(MhServerMessageSchema, frame);
+    } catch {
+      this.#controlSink?.malformed(url);
+      return;
+    }
+    switch (message.message.case) {
+      case 'keyframeRequest':
+        this.#controlSink?.keyframeRequest(url, {
+          streamNumber: message.message.value.streamNumber,
+          gopCounter: message.message.value.gopCounter,
+        });
+        return;
+      default:
+        // An unset or unknown variant carries nothing this client can act on.
+        this.#controlSink?.malformed(url);
+        return;
+    }
+  }
+
   #applyDatagramQueueSettings(transport: IWebTransport): void {
     const settings = this.#datagramQueue;
     if (!settings) return;
@@ -276,10 +468,11 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     // Register for teardown IMMEDIATELY — BEFORE awaiting ready — so disconnect()
     // can always reach an in-flight / never-ready transport (no leak).
     this.#transports.push(transport);
-    // This connect-only handshake never observes `closed` (no media-plane I/O, no
-    // reconnect this story). Attach a no-op catch so a transport that rejects
-    // `closed` (e.g. a connect failure) doesn't surface as an unhandled rejection;
-    // the connect outcome is driven entirely off `ready` + the write below.
+    // The handshake never observes `closed` (the datagram channel and the
+    // control channel each observe their own end; no reconnect this story).
+    // Attach a no-op catch so a transport that rejects `closed` (e.g. a connect
+    // failure) doesn't surface as an unhandled rejection; the connect outcome is
+    // driven entirely off `ready` + the write below.
     void transport.closed.catch(() => {});
 
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -354,6 +547,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
       // throw into the catch (whose #terminated guard handles it); no intermediate
       // checks needed here.
       this.#succeedOne(url, index, transport);
+      this.#startControlChannel(url, transport, stream);
     } catch (err) {
       clearDeadline();
       if (this.#terminated) return;

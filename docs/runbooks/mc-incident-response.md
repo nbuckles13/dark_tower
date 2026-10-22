@@ -1986,18 +1986,19 @@ sum by (outcome) (rate(mc_media_receive_capability_declarations_total{outcome!~"
 Every rejection token names a **client** defect, so a rise is a client
 fleet problem and points at a client release, not an MC deploy:
 `duplicate_slot_id`, `slot_count_over_cap` (the client asked for more slots than
-`MC_MAX_RECEIVE_SLOTS` — compare its configured N with the `mc_media_receive_slot_cap{media_kind="audio"}`
-gauge; a cap below legitimate clients' N is a configuration mismatch. A current SDK refuses an
-over-cap N LOCALLY — it reads the cap off `JoinResponse.max_receive_slots` — and counts it on
-`dt_client_media_receive_slots_rejected_total`, so an MC-side `slot_count_over_cap` means an SDK
-predating that field or a client ignoring it; for "hears nobody" with this rate flat, read the
-client counter and `docs/runbooks/client-dev-local.md` F18. **(Corrected 2026-10-21, story 3 OPS-A,
-R-1: all of this holds only until MC-A and C-A1.** From MC-A, each kind is **truncated** to its own
-cap (`MC_MAX_AUDIO_RECEIVE_SLOTS`, `MC_MAX_VIDEO_RECEIVE_SLOTS`). The excess slots report
-`unavailable` on `mc_media_slot_states_total`, so an over-cap declaration is never rejected and never
-a join failure. C-A1 retires the client's local refusal and its counter. A reader who trusted
-"over-cap is refused" after MC-A would look for a rejection that cannot happen, and would miss the
-`unavailable` slots that are the real reading.) `slot_id_out_of_range`, `pinned_sender_id_zero`,
+the retired TOTAL `MC_MAX_RECEIVE_SLOTS` — compare the client's configured N+M with the
+`mc_media_receive_slot_cap{media_kind="audio"}` gauge; a cap below legitimate clients' N+M is a
+configuration mismatch. **Since story 3 C-A1 the SDK no longer refuses an over-cap declaration
+locally** and no longer counts one (`dt_client_media_receive_slots_rejected_total` is retired): it
+declares N audio plus M video slots and MC is the only authority. So **until MC-A lands**, an
+MC-side `slot_count_over_cap` is THE signal for a client whose N+M exceeds the retired total — the
+participant hears nobody, and the client's deficit counter reads 0 — see
+`docs/runbooks/client-dev-local.md` F18. **From MC-A** each kind is **truncated** to its own cap
+(`MC_MAX_AUDIO_RECEIVE_SLOTS`, `MC_MAX_VIDEO_RECEIVE_SLOTS`): the excess slots report `unavailable`
+on `mc_media_slot_states_total{slot_state="unavailable"}`, so an over-cap declaration is never
+rejected and never a join failure, and `slot_count_over_cap` then reads zero. A reader who trusted
+"over-cap is refused" after MC-A would look for a rejection that cannot happen and miss the
+`unavailable` slots that are the real reading. `slot_id_out_of_range`, `pinned_sender_id_zero`,
 `pinned_sender_id_out_of_range`, `declaration_budget_exhausted` (the client blew
 `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS` on one connection — a re-declaration
 loop). `media_kind_unspecified` most often means a **version-skewed** client, not
@@ -3188,17 +3189,14 @@ shows the reporter and the silent peer with **disjoint** connected sets, or one 
 **(b) Over-subscription — EXPECTED.** Reporter and silent peer share a connected handler, but the
 reporter's slots are all full with earlier joiners: the N+2th sender gets no slot, is NOT in the
 unreachable set ("no slot" is not "unreachable"), and the reporter's slots show `ACTIVE` for the
-earliest joiners. **Remedy: raise the client's N** (`VITE_DT_RECEIVE_SLOTS`), within
-`MC_MAX_RECEIVE_SLOTS` (published as `mc_media_receive_slot_cap{media_kind="audio"}`). A declaration above the cap is
-rejected whole and counted as `slot_count_over_cap` — see the client media signalling section. A
-current SDK refuses such an N itself (the cap is advertised on `JoinResponse.max_receive_slots`) and
-counts it on `dt_client_media_receive_slots_rejected_total` instead, so a flat MC over-cap rate does
-not rule this arm out. *(Corrected 2026-10-21, story 3 OPS-A, R-1: the cap and rejection text
-holds only until MC-A and C-A1. From MC-A the cap is per kind (`MC_MAX_AUDIO_RECEIVE_SLOTS` for
-this audio arm), and an over-cap declaration is truncated: the excess slots show `unavailable`,
-never a rejection. C-A1 retires the client's local refusal and its counter, and renames
-`VITE_DT_RECEIVE_SLOTS` to the per-kind `VITE_DT_AUDIO_RECEIVE_SLOTS` / `VITE_DT_VIDEO_RECEIVE_SLOTS`.
-The remedy, raising N within the audio cap, is unchanged.)*
+earliest joiners. **Remedy: raise the client's audio N** (`VITE_DT_AUDIO_RECEIVE_SLOTS`; story 3
+C-A1 retired the single `VITE_DT_RECEIVE_SLOTS`), within the audio cap. **Until MC-A lands** the
+controller still caps N+M at the retired TOTAL `MC_MAX_RECEIVE_SLOTS` (published as
+`mc_media_receive_slot_cap{media_kind="audio"}`) and rejects a declaration above it whole, counted
+as `slot_count_over_cap` — see the client media signalling section; the SDK no longer refuses or
+counts this itself. **From MC-A** the cap is per kind (`MC_MAX_AUDIO_RECEIVE_SLOTS` for this audio
+arm) and an over-cap declaration is truncated: the excess slots show `unavailable`
+(`mc_media_slot_states_total{slot_state="unavailable"}`), never a rejection.
 
 **(c) MH refused the WHOLE snapshot on a policy bound — a REAL fault.** MC co-locates edges: in an
 all-connected meeting **every** edge lands on ONE handler while the other carries none, and MC does

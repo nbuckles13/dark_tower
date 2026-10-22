@@ -20,11 +20,16 @@
 #     Enumerative, not illustrative — the
 #     runbook cites this block as the severity SSoT, so it must not
 #     under-list. See the contract below.
-#   - client N (VITE_DT_RECEIVE_SLOTS) is an integer >= 1     [HARD FAIL]
-#     and <= the MC server cap MC_MAX_RECEIVE_SLOTS, read
-#     from infra/services/mc-service/config.env. N above
-#     the cap is one silent participant per browser.
-#   - ...including when the cap CANNOT BE READ. All THREE causes  [HARD FAIL]
+#   - the RETIRED VITE_DT_RECEIVE_SLOTS is not set            [HARD FAIL, first]
+#     (story 3: replaced by the two per-kind variables below; no alias).
+#   - client N (VITE_DT_AUDIO_RECEIVE_SLOTS) and M             [HARD FAIL]
+#     (VITE_DT_VIDEO_RECEIVE_SLOTS) are integers >= 0.
+#   - N and M against the per-kind MC caps                     [NOTICE]
+#     MC_MAX_AUDIO_RECEIVE_SLOTS / MC_MAX_VIDEO_RECEIVE_SLOTS, read
+#     from infra/services/mc-service/config.env. Over a cap, MC
+#     truncates and the excess slots show unavailable; a video
+#     cap of 0 is reported as "video disabled".
+#   - ...including when a cap CANNOT BE READ. All THREE causes    [HARD FAIL]
 #     are hard fails and are diagnosed separately: cap file absent,
 #     key absent, value not an integer (all REPO/CONFIG DRIFT).
 #   - demo.localhost resolves (/etc/hosts)                    [WARN — browser only]
@@ -127,10 +132,13 @@
 #   participant's tone is derived from its per-meeting sender id. Headphones
 #   are for the separate one-microphone human-audibility pass, not the answer
 #   to N-way feedback.
-#   N: VITE_DT_RECEIVE_SLOTS, the client's audio receive-slot count — each
-#   participant hears at most N others. Exported by this script (default 3) and
-#   echoed in the preflight beside the MC cap. ONE value per dev server: every
-#   tab and profile it serves gets the same N; re-run the script to change it.
+#   N and M: VITE_DT_AUDIO_RECEIVE_SLOTS and VITE_DT_VIDEO_RECEIVE_SLOTS, the
+#   client's audio and video receive-slot counts — each participant hears at
+#   most N others and sees at most M. Exported by this script (demo defaults in
+#   DEMO_AUDIO_RECEIVE_SLOTS / DEMO_VIDEO_RECEIVE_SLOTS) and echoed in the
+#   preflight beside the MC caps. ONE value per dev server: every tab and profile
+#   it serves gets the same N and M; re-run the script to change them. The
+#   retired single-N VITE_DT_RECEIVE_SLOTS fails the preflight if set.
 #
 # Usage:
 #   scripts/dev-web.sh              # preflight + install (if needed) + dev server
@@ -187,6 +195,23 @@ HARD_FAIL=0
 pass() { echo "  ${GRN}✓${NC} $*"; }
 warn() { echo "  ${YEL}!${NC} $*"; }
 fail() { echo "  ${RED}✗${NC} $*"; HARD_FAIL=1; }
+
+# The launcher's demo topology for N and M (four participants each hearing and
+# seeing the other three). Defined here, before the retired-variable check that
+# names them; the receive-slot preflight below documents and applies them.
+DEMO_AUDIO_RECEIVE_SLOTS=3
+DEMO_VIDEO_RECEIVE_SLOTS=3
+
+# ─── Retired receive-slot variable (HARD FAIL, before any probe) ───
+# Story 3 replaced the single audio N with per-kind N and M. The old name is
+# NEVER an alias — one number cannot say how many of each kind was meant — and
+# it fails here, first, so no cluster probe output buries the reason. The web
+# app refuses it the same way (packages/web-app/src/lib/config.ts).
+if [[ -n "${VITE_DT_RECEIVE_SLOTS+x}" ]]; then
+    fail "receive slots: VITE_DT_RECEIVE_SLOTS is RETIRED and no longer read. Set VITE_DT_AUDIO_RECEIVE_SLOTS (audio receive slots N) and VITE_DT_VIDEO_RECEIVE_SLOTS (video receive slots M) instead; each is an integer >= 0. Not starting the dev server." >&2
+    echo "      Fix: unset VITE_DT_RECEIVE_SLOTS, e.g. VITE_DT_AUDIO_RECEIVE_SLOTS=${DEMO_AUDIO_RECEIVE_SLOTS} VITE_DT_VIDEO_RECEIVE_SLOTS=${DEMO_VIDEO_RECEIVE_SLOTS} scripts/dev-web.sh" >&2
+    exit 1
+fi
 
 # node_in_engines <version> <range> — 0 if the version satisfies an engines range
 # made of space-separated >=, >, <=, < or exact terms; 1 if not; 2 if the range is
@@ -625,49 +650,73 @@ for cm in "${WT_CONFIGMAPS[@]}"; do
     check_wt_endpoint "$cm" "$label"
 done
 
-# ─── Receive slots: client N vs the MC server cap (HARD FAIL) ───
-# "Why can't I hear the sixth person?" is answered by N — each participant
-# declares N audio receive slots and hears at most N others — so the preflight
-# prints the effective N beside the server cap it must fit under.
+# ─── Receive slots: client N and M vs the MC per-kind caps ───
+# "Why can't I hear / see the sixth person?" is answered by N and M — each
+# participant declares N audio and M video receive slots and hears at most N
+# others and sees at most M — so the preflight prints both beside the per-kind
+# caps they are bounded by (story 3 R-1, R-23).
 #
-# N is VITE_DT_RECEIVE_SLOTS (client N; read by
+# N is VITE_DT_AUDIO_RECEIVE_SLOTS and M is VITE_DT_VIDEO_RECEIVE_SLOTS (read by
 # packages/sdk-core/src/config/clientConfig.ts via packages/web-app/src/lib/config.ts).
-# This launcher ALWAYS exports it — the operator's value, or DEMO_RECEIVE_SLOTS —
-# so the N echoed here is by construction the N every client of this dev server
-# declares. DEMO_RECEIVE_SLOTS is the launcher's demo topology (N=3: four
-# participants each hear the other three), NOT the SDK's default: the SDK's own
-# default is its home for non-dev builds and is never consulted in a dev-web
-# session. Same shape as VITE_TELEMETRY_ENDPOINT below.
+# This launcher ALWAYS exports both — the operator's values, or the demo
+# defaults DEMO_AUDIO_RECEIVE_SLOTS / DEMO_VIDEO_RECEIVE_SLOTS — so the values
+# echoed here are by construction what every client of this dev server
+# declares. The demo defaults are the launcher's demo topology (four
+# participants each hearing and seeing the other three), NOT the SDK's own
+# defaults, which are its home for non-dev builds and are never consulted in a
+# dev-web session. Either may be 0. The retired VITE_DT_RECEIVE_SLOTS is refused
+# at the top of this script, before any probe.
 #
-# ONE VALUE PER DEV SERVER, not per tab or profile: one Vite process serves every
-# browsing context on one origin, and import.meta.env is fixed when the server
-# starts. Changing N means re-running this script.
+# ONE VALUE EACH PER DEV SERVER, not per tab or profile: one Vite process serves
+# every browsing context on one origin, and import.meta.env is fixed when the
+# server starts. Changing N or M means re-running this script.
 #
-# The cap is MC_MAX_RECEIVE_SLOTS, READ from the shared MC ConfigMap (its SSoT),
-# never copied here. MC rejects an over-cap declaration WHOLE — never clamps,
-# never accepts a prefix (see the key's comment there) — so N > cap is a
-# participant that joins and hears nobody: a HARD FAIL by the contract above.
-# This script does not clamp N either.
+# The caps are MC_MAX_AUDIO_RECEIVE_SLOTS and MC_MAX_VIDEO_RECEIVE_SLOTS, READ
+# from the shared MC ConfigMap (their SSoT), never copied here. MC TRUNCATES a
+# declaration over a kind's cap: the excess slots render UNAVAILABLE — visible,
+# never a join failure — so over-cap is a NOTICE, not a hard fail. A video cap of
+# 0 is the video-off lever (story 3 R-26): every video slot is unavailable. This
+# script does not clamp either value.
+#
+# TRANSITION (until MC-A, story 3 task 12): the controller in service before MC-A
+# still enforces the retired TOTAL `MC_MAX_RECEIVE_SLOTS` and rejects N+M over it
+# WHOLE (a silent participant). This script deliberately no longer reads that
+# key; the authority note below names the counter that shows it.
 #
 # TWO READERS, NOT ONE HELPER (@dry-reviewer D-2): check_wt_endpoint reads a
 # URL from a PER-INSTANCE ConfigMap with a deliberately UNANCHORED key match;
-# this reads an integer from the SHARED ConfigMap anchored on the indented data
-# line, so prose that ever names the key in a comment can never match. A shared
-# helper would have to branch on both the anchoring and the value shape.
+# this reads integers from the SHARED ConfigMap anchored on the data line, so
+# prose that ever names a key in a comment can never match.
 #
 # Same stale-on-disk caveat as the WebTransport block (docs/TODO.md,
 # "dev-web.sh's WebTransport preflight reads the on-disk ConfigMap"): on a
-# devloop cluster the live value can differ, so every cap message prints the
-# live command, and the in-cluster AUTHORITY is MC's own counter.
+# devloop cluster the live values can differ, so every cap message prints the
+# live command, and the in-cluster AUTHORITY is MC's own counters.
 MC_SHARED_CONFIGMAP="infra/services/mc-service/config.env"
-DEMO_RECEIVE_SLOTS=3
-if [[ -n "${VITE_DT_RECEIVE_SLOTS+x}" ]]; then
+if [[ -n "${VITE_DT_AUDIO_RECEIVE_SLOTS+x}" ]]; then
     N_SOURCE="set by you"
 else
-    VITE_DT_RECEIVE_SLOTS="$DEMO_RECEIVE_SLOTS"
+    VITE_DT_AUDIO_RECEIVE_SLOTS="$DEMO_AUDIO_RECEIVE_SLOTS"
     N_SOURCE="launcher demo default"
 fi
-export VITE_DT_RECEIVE_SLOTS
+if [[ -n "${VITE_DT_VIDEO_RECEIVE_SLOTS+x}" ]]; then
+    M_SOURCE="set by you"
+else
+    VITE_DT_VIDEO_RECEIVE_SLOTS="$DEMO_VIDEO_RECEIVE_SLOTS"
+    M_SOURCE="launcher demo default"
+fi
+export VITE_DT_AUDIO_RECEIVE_SLOTS VITE_DT_VIDEO_RECEIVE_SLOTS
+
+# The one accepted spelling of a slot count or cap: an integer >= 0, no sign, no
+# leading zero (other than 0 itself) — the same class the SDK's parseReceiveSlots
+# accepts, so a value that passes here is read the same way in the browser.
+SLOT_COUNT_RE='^(0|[1-9][0-9]*)$'
+
+# int_gt A B — A > B for slot-count spellings, by digit count first, so an
+# absurdly long value cannot overflow bash arithmetic into a small one.
+int_gt() {
+    (( ${#1} > ${#2} )) || { (( ${#1} == ${#2} )) && [[ "$1" > "$2" ]]; }
+}
 
 cap_live_value_cmd() {
     # SHARED ConfigMap (consumed by mc-0 AND mc-1), namespace spelled out: without
@@ -676,84 +725,124 @@ cap_live_value_cmd() {
     # `mc-service-config-<hash>`), so it is resolved through the name mc-0's
     # Deployment actually references — the same move as wt_live_value_cmd, which
     # this deliberately does not reuse because that derives PER-INSTANCE names.
-    printf "kubectl get cm -n dark-tower -o jsonpath='{.data.MC_MAX_RECEIVE_SLOTS}' \"\$(kubectl get deployment/mc-0 -n dark-tower -o jsonpath='{.spec.template.spec.containers[?(@.name==\"mc-service\")].env[?(@.name==\"MC_MAX_RECEIVE_SLOTS\")].valueFrom.configMapKeyRef.name}')\""
+    local key="$1"
+    printf "kubectl get cm -n dark-tower -o jsonpath='{.data.%s}' \"\$(kubectl get deployment/mc-0 -n dark-tower -o jsonpath='{.spec.template.spec.containers[?(@.name==\"mc-service\")].env[?(@.name==\"%s\")].valueFrom.configMapKeyRef.name}')\"" "$key" "$key"
+}
+
+# N+1 as a number — the count a demo operator acts on. N has passed
+# SLOT_COUNT_RE by the time this runs; an absurdly long N (beyond 4 digits) is
+# printed symbolically rather than risking bash arithmetic overflow.
+participants_for_n() {
+    if (( ${#VITE_DT_AUDIO_RECEIVE_SLOTS} <= 4 )); then
+        printf '%s' "$((VITE_DT_AUDIO_RECEIVE_SLOTS + 1))"
+    else
+        printf 'N+1'
+    fi
 }
 
 # The authority framing, printed on EVERY branch that names a cap — including
 # the PASS branch. The failure that actually reaches a demo is the on-disk cap
-# reading 8 while the live ConfigMap has been patched to 2: the operator is
-# standing on a GREEN line holding a number the cluster does not enforce, so
-# "the file may be lying, here is what does enforce it" is most load-bearing
-# exactly where everything looked fine. One home so the two cannot drift.
+# reading one value while the live ConfigMap has been patched to another: the
+# operator is standing on a GREEN line holding a number the cluster does not
+# enforce. One home so the branches cannot drift.
 cap_authority_note() {
-    echo "      That cap is an ON-DISK pre-flight read; the in-cluster authority is"
-    echo "      mc_media_receive_capability_declarations_total{outcome=\"slot_count_over_cap\"}"
-    echo "      (docs/observability/metrics/mc-service.md). Live cap: $(cap_live_value_cmd)"
+    echo "      Those caps are an ON-DISK pre-flight read. In the cluster, MC truncates and reports"
+    echo "      each excess slot on mc_media_slot_states_total{slot_state=\"unavailable\"}"
+    echo "      (docs/observability/metrics/mc-service.md). Until MC-A lands, the controller in service"
+    echo "      still caps N+M at the retired TOTAL MC_MAX_RECEIVE_SLOTS and rejects a declaration over it"
+    echo "      WHOLE: mc_media_receive_capability_declarations_total{outcome=\"slot_count_over_cap\"}."
+    echo "      Live audio cap: $(cap_live_value_cmd MC_MAX_AUDIO_RECEIVE_SLOTS)"
+    echo "      Live video cap: $(cap_live_value_cmd MC_MAX_VIDEO_RECEIVE_SLOTS)"
 }
 
-check_receive_slots() {
-    local cap_line cap
-    # FILE-ABSENT IS ITS OWN DIAGNOSIS, not folded into "the key is missing". A
-    # message naming a path implies that path exists, and "the shared ConfigMap
-    # both MC pods mount is GONE" is a deployment problem while "the key was
-    # renamed" is a repo one — different first moves. Same wrong-and-confident
-    # class the `ss`-failed branch and `wt_live_value_cmd` were written about.
-    if [[ ! -f "$MC_SHARED_CONFIGMAP" ]]; then
-        fail "receive slots: CANNOT VERIFY — ${MC_SHARED_CONFIGMAP} DOES NOT EXIST, so client N=${VITE_DT_RECEIVE_SLOTS} cannot be checked against the server cap. (The file is absent — this is NOT a missing key inside it.)"
-        echo "      This is REPO/CONFIG DRIFT (the shared MC ConfigMap both mc-0 and mc-1 mount),"
-        echo "      not your environment. Nothing to fix locally: report it. A check that did not"
-        echo "      run must never read as one that passed."
-        echo "      The live value discriminates the cause — set there but not on disk means the"
-        echo "      file drifted; absent in both is larger: $(cap_live_value_cmd)"
-        return
-    fi
+# read_slot_cap KEY — set SLOT_CAP_VALUE to the cap's value and return 0, or
+# HARD FAIL with the cause and return 1. Runs in THIS shell (never a command
+# substitution), so `fail` reaches HARD_FAIL. Two causes, two branches, each with
+# a different first move: the key is gone or this script's anchored match
+# drifted (repo), or the value is malformed (repo, one line). The file-absent
+# cause is checked by the caller, once, before any key.
+read_slot_cap() {
+    local key="$1" cap_line
+    SLOT_CAP_VALUE=""
     # `|| true`: grep's no-match exit must reach the CANNOT VERIFY branch below,
     # not kill the preflight via pipefail + set -e (see check_wt_endpoint).
-    cap_line="$(grep -E '^MC_MAX_RECEIVE_SLOTS=' "$MC_SHARED_CONFIGMAP" 2>/dev/null | head -1 || true)"
-    # THREE CAUSES, THREE BRANCHES — deliberately not one message with the value
-    # interpolated. Each has a different first move: the file is gone (deploy),
-    # the key is gone or this script's anchored match drifted (repo), the value
-    # is malformed (repo, one line). Collapsing them makes the message
-    # wrong-and-confident for two of the three.
+    cap_line="$(grep -E "^${key}=" "$MC_SHARED_CONFIGMAP" 2>/dev/null | head -1 || true)"
     if [[ -z "$cap_line" ]]; then
-        fail "receive slots: CANNOT VERIFY — ${MC_SHARED_CONFIGMAP} exists but declares no MC_MAX_RECEIVE_SLOTS data key, so client N=${VITE_DT_RECEIVE_SLOTS} cannot be checked against the server cap."
+        fail "receive slots: CANNOT VERIFY — ${MC_SHARED_CONFIGMAP} exists but declares no ${key} data key, so the client's slot count cannot be checked against it."
         echo "      This is REPO/CONFIG DRIFT — the key was removed or renamed, or this script's"
         echo "      anchored match drifted from the file's shape. NOT your environment, and note"
         echo "      the match is anchored on a line-start KEY= entry, so a comment mentioning the"
         echo "      key never satisfies it. Nothing to fix locally: report it."
         echo "      The live value discriminates: present live but not on disk means the file"
         echo "      drifted; absent in both means the key really is gone:"
-        echo "        $(cap_live_value_cmd)"
-        return
+        echo "        $(cap_live_value_cmd "$key")"
+        return 1
     fi
-    cap="${cap_line#MC_MAX_RECEIVE_SLOTS=}"
-    if [[ ! "$cap" =~ ^[1-9][0-9]*$ ]]; then
-        fail "receive slots: CANNOT VERIFY — MC_MAX_RECEIVE_SLOTS in ${MC_SHARED_CONFIGMAP} is not an integer >= 1 (got '${cap}'), so client N=${VITE_DT_RECEIVE_SLOTS} cannot be checked against the server cap."
+    SLOT_CAP_VALUE="${cap_line#"${key}"=}"
+    if [[ ! "$SLOT_CAP_VALUE" =~ $SLOT_COUNT_RE ]]; then
+        fail "receive slots: CANNOT VERIFY — ${key} in ${MC_SHARED_CONFIGMAP} is not an integer >= 0 (got '${SLOT_CAP_VALUE}'), so the client's slot count cannot be checked against it."
         echo "      This is REPO/CONFIG DRIFT — the KEY IS PRESENT and its VALUE is malformed (MC"
         echo "      refuses to start outside its own configured bound, so this would not deploy"
         echo "      either). The bound's figures live in crates/mc-service/src/config.rs and are"
-        echo "      deliberately not restated here — same rule this diff applies to W."
+        echo "      deliberately not restated here."
         echo "      Not your environment. Nothing to fix locally: report it."
-        echo "      Live value for comparison: $(cap_live_value_cmd)"
+        echo "      Live value for comparison: $(cap_live_value_cmd "$key")"
+        SLOT_CAP_VALUE=""
+        return 1
+    fi
+}
+
+# check_slot_count VAR SOURCE DEMO — HARD FAIL (return 1) unless VAR's value is
+# an integer >= 0. One helper for N and M, so the two can never drift.
+check_slot_count() {
+    local var="$1" source="$2" demo="$3" value="${!1}"
+    if [[ ! "$value" =~ $SLOT_COUNT_RE ]]; then
+        fail "receive slots: ${var}='${value}' (${source}) is not an integer >= 0 — the web app refuses to load with it. Not starting the dev server."
+        echo "      Fix: unset ${var} (demo default ${demo}), or set an integer >= 0."
+        return 1
+    fi
+}
+
+check_receive_slots() {
+    local ok=true
+    # The client's own values first: they need no file to be judged.
+    check_slot_count VITE_DT_AUDIO_RECEIVE_SLOTS "$N_SOURCE" "$DEMO_AUDIO_RECEIVE_SLOTS" || ok=false
+    check_slot_count VITE_DT_VIDEO_RECEIVE_SLOTS "$M_SOURCE" "$DEMO_VIDEO_RECEIVE_SLOTS" || ok=false
+    # FILE-ABSENT IS ITS OWN DIAGNOSIS, not folded into "the key is missing". A
+    # message naming a path implies that path exists, and "the shared ConfigMap
+    # both MC pods mount is GONE" is a deployment problem while "the key was
+    # renamed" is a repo one — different first moves.
+    if [[ ! -f "$MC_SHARED_CONFIGMAP" ]]; then
+        fail "receive slots: CANNOT VERIFY — ${MC_SHARED_CONFIGMAP} DOES NOT EXIST, so client N=${VITE_DT_AUDIO_RECEIVE_SLOTS} audio / M=${VITE_DT_VIDEO_RECEIVE_SLOTS} video cannot be checked against the per-kind caps. (The file is absent — this is NOT a missing key inside it.)"
+        echo "      This is REPO/CONFIG DRIFT (the shared MC ConfigMap both mc-0 and mc-1 mount),"
+        echo "      not your environment. Nothing to fix locally: report it. A check that did not"
+        echo "      run must never read as one that passed."
+        echo "      The live values discriminate the cause — set there but not on disk means the"
+        echo "      file drifted; absent in both is larger:"
+        echo "        $(cap_live_value_cmd MC_MAX_AUDIO_RECEIVE_SLOTS)"
+        echo "        $(cap_live_value_cmd MC_MAX_VIDEO_RECEIVE_SLOTS)"
         return
     fi
-    if [[ ! "$VITE_DT_RECEIVE_SLOTS" =~ ^[1-9][0-9]*$ ]]; then
-        fail "receive slots: VITE_DT_RECEIVE_SLOTS='${VITE_DT_RECEIVE_SLOTS}' (${N_SOURCE}) is not an integer >= 1 — clients would declare no valid receive capability and hear nobody. Not starting the dev server."
-        echo "      Fix: unset VITE_DT_RECEIVE_SLOTS (demo default ${DEMO_RECEIVE_SLOTS}), or set an integer 1..${cap}."
-        return
+    # Each key is read on its own: an unreadable audio cap must not hide an
+    # unreadable video cap (or the reverse).
+    local audio_cap_value="" video_cap_value=""
+    if read_slot_cap MC_MAX_AUDIO_RECEIVE_SLOTS; then audio_cap_value="$SLOT_CAP_VALUE"; else ok=false; fi
+    if read_slot_cap MC_MAX_VIDEO_RECEIVE_SLOTS; then video_cap_value="$SLOT_CAP_VALUE"; else ok=false; fi
+    $ok || return
+
+    if [[ "$video_cap_value" == "0" ]]; then
+        warn "receive slots: video disabled — MC_MAX_VIDEO_RECEIVE_SLOTS=0 (${MC_SHARED_CONFIGMAP}). Every video slot will show unavailable and no camera is directed to send; audio is unaffected (the story 3 R-26 lever)."
     fi
-    # Compare by digit count first, so an absurdly long N cannot overflow bash
-    # arithmetic into a small or negative number and pass.
-    if (( ${#VITE_DT_RECEIVE_SLOTS} > ${#cap} )) || { (( ${#VITE_DT_RECEIVE_SLOTS} == ${#cap} )) && [[ "$VITE_DT_RECEIVE_SLOTS" > "$cap" ]]; }; then
-        fail "receive slots: client N=${VITE_DT_RECEIVE_SLOTS} (${N_SOURCE}) exceeds the server cap MC_MAX_RECEIVE_SLOTS=${cap} (${MC_SHARED_CONFIGMAP}). MC rejects the WHOLE declaration, so every participant would present as one silent participant. Not starting the dev server."
-        echo "      Fix: VITE_DT_RECEIVE_SLOTS=${cap} scripts/dev-web.sh   (or any value 1..${cap}; never clamped for you)"
-        cap_authority_note
-        return
+    if int_gt "$VITE_DT_AUDIO_RECEIVE_SLOTS" "$audio_cap_value"; then
+        warn "receive slots: NOTICE — client N=${VITE_DT_AUDIO_RECEIVE_SLOTS} audio (${N_SOURCE}) is over the cap MC_MAX_AUDIO_RECEIVE_SLOTS=${audio_cap_value}: excess slots will show unavailable (MC truncates; never a join failure)."
     fi
-    pass "receive slots: effective N=${VITE_DT_RECEIVE_SLOTS} (${N_SOURCE}) <= server cap MC_MAX_RECEIVE_SLOTS=${cap} (${MC_SHARED_CONFIGMAP})"
-    echo "      Each participant hears at most N others: with N=${VITE_DT_RECEIVE_SLOTS}, $((VITE_DT_RECEIVE_SLOTS + 1)) participants"
-    echo "      each hear the other ${VITE_DT_RECEIVE_SLOTS}; one more finds some receivers' slots already full —"
-    echo "      that participant is the fewer-sources case, not a bug. One N per dev server: re-run to change it."
+    if [[ "$video_cap_value" != "0" ]] && int_gt "$VITE_DT_VIDEO_RECEIVE_SLOTS" "$video_cap_value"; then
+        warn "receive slots: NOTICE — client M=${VITE_DT_VIDEO_RECEIVE_SLOTS} video (${M_SOURCE}) is over the cap MC_MAX_VIDEO_RECEIVE_SLOTS=${video_cap_value}: excess slots will show unavailable (MC truncates; never a join failure)."
+    fi
+    pass "receive slots: effective N=${VITE_DT_AUDIO_RECEIVE_SLOTS} audio (${N_SOURCE}), M=${VITE_DT_VIDEO_RECEIVE_SLOTS} video (${M_SOURCE}); server caps MC_MAX_AUDIO_RECEIVE_SLOTS=${audio_cap_value}, MC_MAX_VIDEO_RECEIVE_SLOTS=${video_cap_value} (${MC_SHARED_CONFIGMAP})"
+    echo "      Each participant hears at most N others and sees at most M: with N=${VITE_DT_AUDIO_RECEIVE_SLOTS}, $(participants_for_n)"
+    echo "      participants each hear the other ${VITE_DT_AUDIO_RECEIVE_SLOTS}; one more finds some receivers' slots already full —"
+    echo "      that participant is the fewer-sources case, not a bug. One N and M per dev server: re-run to change them."
     cap_authority_note
 }
 check_receive_slots
@@ -830,7 +919,7 @@ export VITE_TELEMETRY_ENDPOINT="${VITE_TELEMETRY_ENDPOINT:-/api/v1/telemetry}"
 
 echo; echo "== Starting web-app dev server =="
 echo "   Open Chrome at: http://${DEMO_HOST}:5173"
-echo "   N+1 participants (N=${VITE_DT_RECEIVE_SLOTS}, ${N_SOURCE}): open $((VITE_DT_RECEIVE_SLOTS + 1)) browsing contexts on"
+echo "   N+1 participants (N=${VITE_DT_AUDIO_RECEIVE_SLOTS} audio, ${N_SOURCE}; M=${VITE_DT_VIDEO_RECEIVE_SLOTS} video, ${M_SOURCE}): open $(participants_for_n) browsing contexts on"
 echo "   THIS machine — demo Chrome profiles recommended, one per participant — each signed"
 echo "   in as a DISTINCT registered account, all joining the same meeting code."
 echo "   Audio for N-way: the test-tone build (DT_TEST_TONE=1 -> __DT_TEST_TONE__, see --help), not one shared mic."

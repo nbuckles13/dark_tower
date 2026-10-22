@@ -129,7 +129,7 @@ exclusively through `serverCertificateHashes` pinning.
 | # | Assertion | Why it is shaped this way |
 |---|---|---|
 | s1 | `joined.mediaServers` is non-empty and every entry connects | R-33: every participant is offered the meeting's whole handler set and dials all of it. No handler COUNT is asserted — `env.ts` keeps topology out of this tier. |
-| s2 | Slot 0 polls to exactly **`fewer_sources`** | **The positive control.** A specific, non-default wire token proves MC's assignment arrived and says "nobody to hear" — not merely "not awaiting-assignment", which is vacuous under R-3. `active` here would mean MC routed the client to itself. |
+| s2 | Slot 0 polls to exactly **`fewer_sources_than_slots`** | **The positive control.** A specific, non-default wire token proves MC's assignment arrived and says "nobody to hear" — not merely "not awaiting-assignment", which is vacuous under R-3. `active` here would mean MC routed the client to itself. |
 | s3 | `framesSent` and `framesAccepted` are both **flat** over a window after s2 | Egress is flat because MC directs no audio stream to a publisher nobody holds (a `SendDirective` with no streams, §5), so no send instruction is ever applied — not because of mute. Ingress is flat because MC pushed no edge into this client. |
 | s4 | The window contains **≥ 4 samples**, asserted separately (shared `expectCountersFlatOverWindow`) | Flatness over zero samples is vacuously true, so a stalled sampler must be reported as a harness failure. |
 
@@ -163,9 +163,9 @@ rejection / misrouting / unobservable) automatically.
 | Spec | Scenario | What is asserted |
 |---|---|---|
 | `multi-party-hear.spec.ts` | **S1** hear by content, N=3, 4 participants | All 12 ordered pairs at all three layers at the slot MC assigned, and no frame keyed to a sender on any other slot. First-media time per receiver is recorded as an annotation — observed, never gated. **R-27 part 1**: the send counter rises in Prometheus under its exact `_total` name (a solo client sends nothing under R-3, so this runs here). **R-27 part 2**: the LOADED `MCMediaMissingKeyMaterial` rule selects exactly the names in `clientMetricNames.ts`, and the received counter rises under that exact name. |
-| `over-subscription.spec.ts` | **S2** under-fill and over-subscription | A receiver declaring N=2 (per-context `receiveSlots` lever): with one sender, slot 1 reads `fewer_sources` as an empty cell in a 2-cell grid; with three senders joined one at a time, its slots hold the two earliest, and the third has zero layer-1/2 at it WHILE the third's send counter and a full-N receiver's accepted-from-third advance. (The task text's "fewer-sources on the third" has no third slot at N=2; both R-2 clauses are covered instead.) |
-| `server-mute.spec.ts` | **S3** server mute | The host clicks the real affordance; every receiver's slot for B reads `source_muted` and its roster row `data-server-muted=true` (`data-client-muted=unknown`); accepted-from-B is flat at every receiver WHILE B's send counter and the other pairs advance; B's tone is absent; B's own client-mute indicator is unchanged. B's unmute request reaches the host and lifts nothing. The host's unmute restores B at all three layers. |
-| `server-mute.spec.ts` | **Client STRUCTURAL mute** (restores the proof task 6 removed) | C mutes itself: `expectEgressFlatWhileMuted(C)` holds WHILE the other pairs advance; receivers see `source_muted` with `data-client-muted=true`. Unmute resumes. Compose: B client-mutes, is server-muted, client-unmutes — B's egress resumes, receivers stay flat. |
+| `over-subscription.spec.ts` | **S2** under-fill and over-subscription | A receiver declaring N=2 (per-context `audioReceiveSlots` lever): with one sender, slot 1 reads `fewer_sources_than_slots` as an empty cell in a 2-cell grid; with three senders joined one at a time, its slots hold the two earliest, and the third has zero layer-1/2 at it WHILE the third's send counter and a full-N receiver's accepted-from-third advance. (The task text's "fewer-sources on the third" has no third slot at N=2; both R-2 clauses are covered instead.) |
+| `server-mute.spec.ts` | **S3** server mute | The host clicks the real affordance; every receiver's slot for B reads `avatar_server_muted` and its roster row `data-server-muted=true` (`data-client-muted=unknown`); accepted-from-B is flat at every receiver WHILE B's send counter and the other pairs advance; B's tone is absent; B's own client-mute indicator is unchanged. B's unmute request reaches the host and lifts nothing. The host's unmute restores B at all three layers. |
+| `server-mute.spec.ts` | **Client STRUCTURAL mute** (restores the proof task 6 removed) | C mutes itself: `expectEgressFlatWhileMuted(C)` holds WHILE the other pairs advance; receivers see `avatar_client_muted` with `data-client-muted=true`. Unmute resumes. Compose: B client-mutes, is server-muted, client-unmutes — B's egress resumes, receivers stay flat. |
 | `server-mute.spec.ts` | **Non-host refusal** (@security M2) | The `forceHostControls` lever renders the affordance for a non-host; MC answers `FORBIDDEN`; the refused client stays joined (post-join `FORBIDDEN` no longer closes the connection) and B keeps being heard. |
 | `partial-connectivity.spec.ts` | **S10a** partial connectivity | A on every handler; B and C each block one (the `blockHandlers` lever, by exact match against A's offered list). Connected sets proven first; A hears B and C, B and C each hear A (all layers); B and C see each other with `data-reachability=source_unreachable` from `unreachable_sender_ids`, in no slot, not muted; C's accepted count at B stays zero WHILE A's advances (and vice versa). |
 | `kek-rotation.spec.ts` | **S6** joiner half | A leave; both remaining clients' bus `kekGeneration` advance to the same generation; `dt_client_media_kek_updates_total{source="kek_update"}` and `dt_client_media_kek_generations_retained_total` each rise by ≥ the remaining-client count (a baseline→delta, not `increase()`, which cannot see a series born in the window); a joiner after the rotation holds that generation and opens every remaining sender's frames at all three layers. Budget from MC's config: grace + W. |
@@ -181,8 +181,9 @@ are counted per surface, so "ran over it" is observable.
 `__DT_TEST_LEVERS__` (`DT_TEST_LEVERS=1`; THROWS in production; absent from the
 production bundle — `tests/bundle-content.test.ts`), gating one init-script
 global `window.__dt_test_levers__` read once per session: `blockHandlers`
-(refuses dials to exact-match offered handlers — it can only narrow), `receiveSlots`
-(a per-context N through the SDK's strict parser) and `forceHostControls`.
+(refuses dials to exact-match offered handlers — it can only narrow),
+`audioReceiveSlots` / `videoReceiveSlots` (a per-context N / M through the SDK's
+strict parser) and `forceHostControls`.
 
 **Traces and HARs** from these multi-context runs contain several live meeting
 and user tokens at once: they stay gitignored, local-only and are never promoted
@@ -304,11 +305,17 @@ counterpart). MC/MH endpoints come exclusively from the join response's
 Building blocks for the N+1 specs; each module header carries the detail.
 
 - **Cohort** (`cohort.ts`, `fixtures.ts` `authAsCohortMember`): N+1 distinct
-  accounts at the suite's one N (`SUITE_RECEIVE_SLOTS`), registered once per run
-  by `global-setup.ts` — see §Budgets. `playwright.config.ts` derives the dev
-  server's `VITE_DT_RECEIVE_SLOTS` from it, and `readOwnTone` asserts the build's
-  declared N at runtime (`expectDeclaredReceiveSlots`) because a reused server
-  keeps whatever N it was started with.
+  accounts at the suite's one audio N (`SUITE_AUDIO_RECEIVE_SLOTS`), registered
+  once per run by `global-setup.ts` — see §Budgets. `playwright.config.ts`
+  derives the dev server's `VITE_DT_AUDIO_RECEIVE_SLOTS` from it and
+  `VITE_DT_VIDEO_RECEIVE_SLOTS` from `SUITE_VIDEO_RECEIVE_SLOTS` (0: the story-2
+  audio specs run with no video slots, story 3 R-33), and `readOwnTone` asserts
+  the build's declared N and M at runtime (`expectDeclaredReceiveSlots`) because
+  a reused server keeps whatever values it was started with. The retired
+  `VITE_DT_RECEIVE_SLOTS` fails the web app's config load if set. Until MC-A
+  the controller sends no per-kind caps; the fixture then records a
+  `transitional` annotation and a gate-log warning instead of comparing N to the
+  cap; MC-A (task 12) deletes that branch and restores `unknown` as a failure.
 - **Layer 3 tone detector** (`toneDetector.ts`, `fixtures.ts` `readOwnTone` /
   `expectHearsSender`): reads the bus's per-lane dB spectrum; two-sided (the
   sender's announced tone is dominant in its lane AND no other cohort tone — the
@@ -354,7 +361,7 @@ Building blocks for the N+1 specs; each module header carries the detail.
     test** (Playwright restarts the worker after a failure, re-creating the
     memo). `userB`, the distinct second party of the two-party test, and the
     throwaway account auth-rejection signs up to obtain a real retained token:
-    one each. The **N+1 cohort**: `cohortSize(SUITE_RECEIVE_SLOTS)` = **4 at the
+    one each. The **N+1 cohort**: `cohortSize(SUITE_AUDIO_RECEIVE_SLOTS)` = **4 at the
     suite's locked N=3**, registered **once per run in `global-setup.ts`**,
     whatever fails later.
   - **Failed registrations.** Any `/register` that reaches AC and is refused for
@@ -409,9 +416,9 @@ Building blocks for the N+1 specs; each module header carries the detail.
 - **Cohort registration wall clock**: `global-setup.ts` runs N+1 full sign-up
   UI flows (a fresh context and page load each) before any spec — measured at
   **≈ 4 s at N=3** (2026-09-30). It comes out of the same `BROWSER_E2E_TIMEOUT`
-  and scales with `SUITE_RECEIVE_SLOTS`, so raising N is a wall-clock decision as
+  and scales with `SUITE_AUDIO_RECEIVE_SLOTS`, so raising N is a wall-clock decision as
   well as an auth-budget one.
-- **Peak concurrency**: at most `cohortSize(SUITE_RECEIVE_SLOTS)` = 4 browsing
+- **Peak concurrency**: at most `cohortSize(SUITE_AUDIO_RECEIVE_SLOTS)` = 4 browsing
   contexts at once (S1, S2, S3), each left gracefully and closed in a `finally`
   before the next test opens its own (`e2e/cohortContexts.ts`) — so peaks never
   stack, and a leaver's MH connections (so its edges) drop at once. RESIDUAL:
@@ -542,7 +549,7 @@ The checks run per receiver, per ACTIVE video slot, against the oracle's expecte
   - Only samples with `rendered === 'video'`, lumas present and the expected sender count. Leading avatar samples (avatar → active) are outside the window.
   - An `insufficient` window is a HARNESS error.
 
-Separately, for every slot, the window's last sample must show the MC state token and the matching rendered kind (`active` → video, `avatar_*` → avatar, `fewer_sources` / `unavailable` → empty). Unreachable senders come from `unreachableSenderIds`.
+Separately, for every slot, the window's last sample must show the MC state token and the matching rendered kind (`active` → video, `avatar_*` → avatar, `fewer_sources_than_slots` / `unavailable` → empty). Unreachable senders come from `unreachableSenderIds`.
 
 The send side:
 
@@ -556,7 +563,7 @@ Windows reuse `windowSampling.ts`'s stop rule and count samples by order.
 
 - **Plans:** a scenario gives each member a `PublishSet` (`audio` / `video` / `both` / `none` = receive-only) plus its own audio N and video M.
 - **Registration:** the cohort is still registered once per run (global setup, AC's auth-rate limit read from AC config). `assertPlanFitsCohort` refuses a plan larger than the registered cohort rather than registering more.
-- **Levers:** `leversForPlan` maps a member to the per-context levers `publish`, `receiveSlots` (audio N; renamed to `audioReceiveSlots` with `VITE_DT_AUDIO_RECEIVE_SLOTS` in C-A1) and `videoReceiveSlots`. The app's lever parser learns the new keys in the client's publish-path task.
+- **Levers:** `leversForPlan` maps a member to the per-context levers `publish`, `audioReceiveSlots` (audio N, the `VITE_DT_AUDIO_RECEIVE_SLOTS` form) and `videoReceiveSlots` (parsed by the app since C-A1). The app's lever parser learns the new keys in the client's publish-path task.
 
 ## VP8 substrate probe (story 3 R-28)
 

@@ -9,6 +9,16 @@ interface ImportMetaEnv {
    * N — the audio receive-slot count this client declares (story 2 R-1). Parsed
    * strictly by the SDK's `parseReceiveSlots`; see `src/lib/config.ts`.
    */
+  readonly VITE_DT_AUDIO_RECEIVE_SLOTS?: string;
+  /**
+   * M — the video receive-slot count (story 3 R-1). Parsed strictly by the SDK's
+   * `parseReceiveSlots`; see `src/lib/config.ts`.
+   */
+  readonly VITE_DT_VIDEO_RECEIVE_SLOTS?: string;
+  /**
+   * RETIRED (story 3). Declared ONLY so `src/lib/config.ts` can refuse it loudly
+   * when set; never read as a value.
+   */
   readonly VITE_DT_RECEIVE_SLOTS?: string;
 }
 

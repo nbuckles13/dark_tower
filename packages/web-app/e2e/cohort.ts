@@ -38,13 +38,21 @@ import { parseConfigEnv, requirePositiveInt } from './configEnv.js';
 import type { TestCredentials } from './fixtures.js';
 
 /**
- * The suite's receive-slot count N — THE one place the multi-party suite's N is
- * written. Locked at 3 (four participants, 12 egress edges; the Kind MH egress
- * budget is sized for N=5 — see the Kind overlay patch
+ * The suite's AUDIO receive-slot count N — THE one place the multi-party suite's
+ * N is written. Locked at 3 (four participants, 12 egress edges; the Kind MH
+ * egress budget is sized for N=5 — see the Kind overlay patch
  * `infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml`).
  * Raising it is a budget decision (e2e/README.md §Budgets), not a knob.
  */
-export const SUITE_RECEIVE_SLOTS = 3;
+export const SUITE_AUDIO_RECEIVE_SLOTS = 3;
+
+/**
+ * The suite's VIDEO receive-slot count M. 0: the story-2 audio specs run with
+ * M=0 (story 3 R-33), and the controller in service before MC-A counts video
+ * slots against its retired TOTAL cap. Story 3 C-C1 (task 17) raises it with the
+ * video specs.
+ */
+export const SUITE_VIDEO_RECEIVE_SLOTS = 0;
 
 /**
  * Environment variable carrying the cohort from global setup to the workers.
@@ -263,19 +271,19 @@ export function assertPlanFitsCohort(
 /** The per-context lever values for one plan member (agreed names). */
 export interface PlanLevers {
   readonly publish: PublishSet;
-  /** audio N; renamed to audioReceiveSlots with VITE_DT_AUDIO_RECEIVE_SLOTS in C-A1 (task 11) */
-  readonly receiveSlots: string;
+  /** audio N, the `VITE_DT_AUDIO_RECEIVE_SLOTS` form */
+  readonly audioReceiveSlots: string;
   readonly videoReceiveSlots: string;
 }
 
 /**
  * The levers for one member. The slot counts are strings because the SDK's
- * `parseReceiveSlots` parses them strictly, as for the existing `receiveSlots`.
+ * `parseReceiveSlots` parses them strictly.
  */
 export function leversForPlan(member: CohortMemberPlan): PlanLevers {
   return {
     publish: member.publish,
-    receiveSlots: String(member.audioReceiveSlots),
+    audioReceiveSlots: String(member.audioReceiveSlots),
     videoReceiveSlots: String(member.videoReceiveSlots),
   };
 }

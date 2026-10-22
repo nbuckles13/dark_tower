@@ -69,6 +69,9 @@ import type {
 import type { RejectReason } from '../frame/rejectReason.js';
 import { TeardownRegistry } from '../teardown/teardown.js';
 import { MuteState, type MuteSnapshot } from './muteState.js';
+import { uplinkRelayStreamId } from '../pipeline/sendId.js';
+import { MediaCaptureError, classifyCaptureError } from '../setup/captureFailure.js';
+import { MEDIA_CAPTURE_FAILURE_OUTCOMES } from '../setup/mediaMetrics.js';
 import { TransmitKeyManager } from './transmitKeys.js';
 import { ReceiveTransports } from './receiveTransports.js';
 
@@ -192,6 +195,13 @@ export interface AudioSendDirective {
 const UNSENDABLE_HEADER_VERSION_FAULT =
   'the controller directed a frame header version this client cannot send';
 
+/**
+ * The fault for a directed stream number outside the key-id stream domain, so
+ * no uplink relay id can be stamped. A fixed literal (event-once dedupe key).
+ */
+const UNSTAMPABLE_STREAM_FAULT =
+  'the controller directed a stream number this client cannot stamp; nothing is sent';
+
 /** Construction options. */
 export interface AudioPipelineOptions {
   readonly config: MediaConfig;
@@ -213,7 +223,11 @@ export interface AudioPipelineOptions {
    * `MeetingIdentity.clear()` and teardown then fails to revoke it.
    */
   readonly identity: MeetingIdentity;
-  /** Slot ids this client declared in its `ReceiveCapability`. */
+  /**
+   * The AUDIO slot ids this client declared in its `ReceiveCapability`
+   * (`session/mediaSelection.ts:declaredSlotIds`). Receive-side only — never
+   * the uplink stamp (see `pipeline/sendId.ts`).
+   */
   readonly declaredSlotIds: readonly number[];
   /** Resolves a datagram channel for a media-handler URL, or `undefined`. */
   readonly senderFor: (mediaHandlerUrl: string) => DatagramSender | undefined;
@@ -223,8 +237,16 @@ export interface AudioPipelineOptions {
    * A selector, never a dialer: see {@link AudioPipeline.setReceiveAssignments}.
    */
   readonly readableFor: (mediaHandlerUrl: string) => ReadableStream<Uint8Array> | undefined;
-  /** Reports client mute to MC. Informational; the local state changes first. */
-  readonly reportMute: (audioMuted: boolean) => void;
+  /**
+   * The session's client-mute state, shared with every pipeline and the mute
+   * report (both kinds, `muteState.ts`). Omitted: a pipeline-private one.
+   */
+  readonly mute?: MuteState;
+  /**
+   * Reports client mute to MC — BOTH kinds' current state (`signaling/muteRequest.ts`).
+   * Informational; the local state changes first.
+   */
+  readonly reportMute: (state: MuteSnapshot) => void;
   readonly captureFactory: CaptureSourceFactory;
   readonly encoderFactory: AudioEncoderFactory;
   readonly decoderFactory: AudioDecoderFactory;
@@ -259,7 +281,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   readonly #options: AudioPipelineOptions;
   readonly #config: MediaConfig;
   readonly #metrics: MediaMetrics;
-  readonly #mute = new MuteState();
+  readonly #mute: MuteState;
   readonly #teardown = new TeardownRegistry();
   readonly #transmitKeys: TransmitKeyManager;
   readonly #cache: TransmitKeyCache;
@@ -334,6 +356,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       );
     }
     this.#options = options;
+    this.#mute = options.mute ?? new MuteState();
     this.#config = options.config;
     this.#metrics = options.metrics;
     this.#clock = options.clock ?? Date.now;
@@ -441,11 +464,17 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
 
     const audio = this.#config.audio;
     if (options.deviceId !== undefined) this.#deviceId = options.deviceId;
-    const capture = await this.#options.captureFactory({
-      sampleRateHz: audio.sampleRateHz,
-      channels: audio.channels,
-      deviceId: this.#deviceId,
-    });
+    let capture: CaptureSource;
+    try {
+      capture = await this.#options.captureFactory({
+        sampleRateHz: audio.sampleRateHz,
+        channels: audio.channels,
+        deviceId: this.#deviceId,
+      });
+    } catch (err) {
+      this.#countCaptureFailure(err);
+      throw err;
+    }
     this.#capture = capture;
     // REGISTERED BEFORE THE NEXT AWAIT: a leaked capture keeps the microphone
     // hot and the browser's recording indicator lit.
@@ -591,10 +620,15 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     });
     this.#teardown.register('kek-rotation-listener', unsubscribe);
 
-    await capture.start(
-      (data) => this.#onCapturedFrame(data),
-      () => this.#onCaptureEnded(),
-    );
+    try {
+      await capture.start(
+        (data) => this.#onCapturedFrame(data),
+        () => this.#onCaptureEnded(),
+      );
+    } catch (err) {
+      this.#countCaptureFailure(err);
+      throw err;
+    }
 
     this.#rotationTimer = this.#setInterval(() => {
       // §4: senders rotate every T for audio, because rotation is O(1),
@@ -726,11 +760,13 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     // Resuming from silence is a resume-from-empty for this stream: bump the
     // generation, which bounds a leaked transmit key across the muted window.
     if (!muted) this.#transmitKeys.rotate();
-    this.emit('muteChanged', this.#mute.snapshot());
+    const snapshot = this.#mute.snapshot();
+    this.emit('muteChanged', snapshot);
     // Informational, and deliberately last. A failure to report must not undo
     // the local suppression: ADR-0036 §5 requires client mute to hold without
-    // the server honouring it.
-    this.#options.reportMute(muted);
+    // the server honouring it. BOTH kinds: video's current state rides along
+    // unchanged (story 3 R-15; `signaling/muteRequest.ts`).
+    this.#options.reportMute(snapshot);
   }
 
   /**
@@ -772,6 +808,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
         deviceId,
       });
     } catch (err) {
+      this.#countCaptureFailure(err);
       this.#fault(
         MediaFaultStage.Capture,
         'the selected microphone could not be opened; capture has stopped',
@@ -788,10 +825,15 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       this.#capture = undefined;
       return;
     }
-    await capture.start(
-      (data) => this.#onCapturedFrame(data),
-      () => this.#onCaptureEnded(),
-    );
+    try {
+      await capture.start(
+        (data) => this.#onCapturedFrame(data),
+        () => this.#onCaptureEnded(),
+      );
+    } catch (err) {
+      this.#countCaptureFailure(err);
+      throw err;
+    }
   }
 
   /** Stop everything. Idempotent, and safe to call during `start()`. */
@@ -817,6 +859,33 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
   // ------------------------------------------------------------------------
 
   /**
+   * Count a failed capture acquisition by its bounded reason
+   * (`dt_client_media_capture_failures_total{media_kind="audio"}`). A typed
+   * `MediaCaptureError` carries its classified reason; anything else is
+   * classified from the platform error's NAME only, never its message.
+   */
+  #countCaptureFailure(err: unknown): void {
+    this.#metrics.audio.captureFailure(
+      err instanceof MediaCaptureError ? err.reason : classifyCaptureError(err),
+    );
+  }
+
+  /**
+   * The capture track ended on its own. Shared by `start()` and
+   * `setCaptureDevice()` so a device acquired by the swap reports an unplug
+   * exactly as the original does — a second, subtly different handler is how a
+   * swapped device ends up failing silently.
+   */
+  #onCaptureEnded(): void {
+    this.#metrics.audio.captureFailure(MEDIA_CAPTURE_FAILURE_OUTCOMES.Ended);
+    this.#fault(
+      MediaFaultStage.Capture,
+      'the microphone stopped; the device may have been unplugged or access revoked',
+      true,
+    );
+  }
+
+  /**
    * CLIENT MUTE IS ENFORCED HERE, AT CAPTURE.
    *
    * While muted the frame is released and never reaches the encoder, so no
@@ -825,20 +894,6 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    * check happens before the encoder sees the sample. Unmute resumes on the very
    * next captured frame with no round trip.
    */
-  /**
-   * The capture track ended on its own. Shared by `start()` and
-   * `setCaptureDevice()` so a device acquired by the swap reports an unplug
-   * exactly as the original does — a second, subtly different handler is how a
-   * swapped device ends up failing silently.
-   */
-  #onCaptureEnded(): void {
-    this.#fault(
-      MediaFaultStage.Capture,
-      'the microphone stopped; the device may have been unplugged or access revoked',
-      true,
-    );
-  }
-
   #onCapturedFrame(data: AudioData): void {
     if (this.#mute.audioMuted || this.#stopped) {
       // `AudioData` holds a platform-side buffer; a suppressed frame must still
@@ -878,6 +933,14 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       // Nothing to withdraw from: egress has never run, and constructing it just
       // to tell it to send nothing would invent a stream number and a bitrate.
       if (directive.targets.length === 0) return;
+      // The uplink relay `stream_id` is MC's SEND ID for this stream — the ONE
+      // stamping function, never a declared slot id (story 3 R-20).
+      const streamId = uplinkRelayStreamId(directive);
+      if (streamId === undefined) {
+        // Fail loud, send nothing: no substituted id ever reaches the wire.
+        this.#fault(MediaFaultStage.Config, UNSTAMPABLE_STREAM_FAULT, false);
+        return;
+      }
       this.#egress = new EgressPipeline({
         metrics: this.#metrics.audio,
         transmitKeys: this.#transmitKeys,
@@ -885,10 +948,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
         identity: this.#options.identity,
         maxQueueFrames: this.#config.egress.maxQueueFrames,
         streamNumber: directive.streamNumber,
-        // The relay `stream_id` this client stamps on its uplink. The declared
-        // slot id, so the value space matches what MH routes on. Slot 0 by
-        // construction (ids are `0..N-1`, `session/mediaSelection.ts`).
-        streamId: this.#options.declaredSlotIds[0] ?? 0,
+        streamId,
         senderFor: (url) => this.#options.senderFor(url),
         onTargetNotConnected: () => {
           // Event-once by (stage, message) — see `#fault`. Under §9 MC only

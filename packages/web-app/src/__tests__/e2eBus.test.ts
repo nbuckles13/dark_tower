@@ -110,8 +110,8 @@ test('first-media and mute-state project exactly their whitelisted scalars', () 
   install(session);
 
   session.fire('firstMediaFrame', 87);
-  session.fire('muteChanged', { audioMuted: true });
-  session.fire('muteChanged', { audioMuted: false });
+  session.fire('muteChanged', { audioMuted: true, videoMuted: false });
+  session.fire('muteChanged', { audioMuted: false, videoMuted: false });
 
   const firstMedia = events().find((e) => e['type'] === 'firstMediaFrame');
   // Exact key set, not just "contains elapsedMs": a whitelist that is only
@@ -216,12 +216,12 @@ test('the disposer stops the sampler', async () => {
 // Story 2 R-1 / R-7 / R-23 / R-30
 // ---------------------------------------------------------------------------
 
-test('receiveSlots: effective N, its source and the cap are projected on join, numbers only', () => {
+test('receiveSlots: publish set, N, M, sources and per-kind caps are projected on join, numbers only', () => {
   const session = new MockMeetingSession();
   session.receiveSlots = {
-    declared: 3,
-    source: 'configured',
-    serverCap: { state: 'known', value: 8 },
+    publish: ['audio'],
+    audio: { declared: 3, source: 'configured', serverCap: { state: 'known', value: 8 } },
+    video: { declared: 0, source: 'default', serverCap: { state: 'unknown' } },
   };
   install(session);
   session.fire('joined', {
@@ -235,10 +235,10 @@ test('receiveSlots: effective N, its source and the cap are projected on join, n
   const event = events().find((e) => e['type'] === 'receiveSlots');
   expect(event).toEqual({
     type: 'receiveSlots',
-    declared: 3,
-    source: 'configured',
-    serverCapState: 'known',
-    serverCap: 8,
+    publish: ['audio'],
+    audio: { declared: 3, source: 'configured', serverCapState: 'known', serverCap: 8 },
+    // An unknown cap is never coerced to a number (0 would read "video disabled").
+    video: { declared: 0, source: 'default', serverCapState: 'unknown' },
   });
 });
 
@@ -247,16 +247,28 @@ test('slotAssignments: the EXPECTED sender per slot, stringified, whitelist-only
   install(session);
   session.fire('streamAssignments', {
     assignments: [
-      { slotId: 0, senderId: 7, mediaHandlerUrl: 'https://mh:1', slotState: 'active' },
-      { slotId: 1, senderId: undefined, mediaHandlerUrl: '', slotState: 'fewer_sources' },
+      {
+        slotId: 0,
+        mediaKind: 'audio',
+        senderId: 7,
+        mediaHandlerUrl: 'https://mh:1',
+        slotState: 'active',
+      },
+      {
+        slotId: 1,
+        mediaKind: 'audio',
+        senderId: undefined,
+        mediaHandlerUrl: '',
+        slotState: 'fewer_sources_than_slots',
+      },
     ],
     unreachableSenderIds: [9],
   });
   expect(events().find((e) => e['type'] === 'slotAssignments')).toEqual({
     type: 'slotAssignments',
     assignments: [
-      { slotId: 0, senderId: '7', slotState: 'active' },
-      { slotId: 1, slotState: 'fewer_sources' },
+      { slotId: 0, kind: 'audio', senderId: '7', slotState: 'active' },
+      { slotId: 1, kind: 'audio', slotState: 'fewer_sources_than_slots' },
     ],
     unreachableSenderIds: ['9'],
   });
@@ -366,14 +378,30 @@ test('participantMute / unmuteRequested are whitelist projections of the wire', 
   session.fire('participantMuteChanged', {
     participantId: 'b',
     audioServerMuted: true,
+    videoServerMuted: false,
     serverMutedBy: 'h',
     ...({ rogue: 'SECRET' } as object),
   });
-  session.fire('participantMuteChanged', { participantId: 'b', audioServerMuted: false });
+  session.fire('participantMuteChanged', {
+    participantId: 'b',
+    audioServerMuted: false,
+    videoServerMuted: false,
+  });
   session.fire('unmuteRequested', { participantId: 'b' });
   expect(events().filter((e) => e['type'] === 'participantMute')).toEqual([
-    { type: 'participantMute', participantId: 'b', audioServerMuted: true, serverMutedBy: 'h' },
-    { type: 'participantMute', participantId: 'b', audioServerMuted: false },
+    {
+      type: 'participantMute',
+      participantId: 'b',
+      audioServerMuted: true,
+      videoServerMuted: false,
+      serverMutedBy: 'h',
+    },
+    {
+      type: 'participantMute',
+      participantId: 'b',
+      audioServerMuted: false,
+      videoServerMuted: false,
+    },
   ]);
   expect(events().find((e) => e['type'] === 'unmuteRequested')).toEqual({
     type: 'unmuteRequested',

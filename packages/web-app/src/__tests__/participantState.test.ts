@@ -21,7 +21,7 @@ function slot(
   senderId: number,
   slotState: StreamAssignmentEvent['slotState'],
 ): StreamAssignmentEvent {
-  return { slotId: 0, senderId, mediaHandlerUrl: 'https://mh', slotState };
+  return { slotId: 0, mediaKind: 'audio', senderId, mediaHandlerUrl: 'https://mh', slotState };
 }
 
 function facts(over: Partial<MediaFacts> = {}): MediaFacts {
@@ -52,16 +52,22 @@ test('reachability is the wire token when the sender id is in the unreachable se
 test.each([
   ['active slot -> not muted', [slot(258, 'active')], new Map(), 'false'],
   [
-    'source_muted slot, no server mute -> client-muted',
-    [slot(258, 'source_muted')],
+    'avatar_client_muted slot, no server mute -> client-muted',
+    [slot(258, 'avatar_client_muted')],
     new Map(),
     'true',
   ],
   ['no slot carries them -> unknown', [], new Map(), 'unknown'],
-  ['withheld slot -> unknown', [slot(258, 'withheld_congestion')], new Map(), 'unknown'],
+  [
+    'only a VIDEO slot carries them -> unknown (audio mute is what this reports)',
+    [{ ...slot(258, 'avatar_client_muted'), mediaKind: 'video' as const }],
+    new Map(),
+    'unknown',
+  ],
+  ['withheld slot -> unknown', [slot(258, 'withheld_by_congestion')], new Map(), 'unknown'],
   [
     'server-muted -> unknown (the slot state says nothing about their mic)',
-    [slot(258, 'source_muted')],
+    [slot(258, 'avatar_server_muted')],
     new Map([['b', { serverMutedBy: 'c' }]]),
     'unknown',
   ],

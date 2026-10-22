@@ -66,10 +66,25 @@
 // whole design exists to provide with a resumption path that can fail. Nothing
 // in the mute path may call `stop()` on the capture.
 
+// ---------------------------------------------------------------------------
+// PER KIND, INDEPENDENT (story 3 R-15, R-17)
+// ---------------------------------------------------------------------------
+//
+// Audio and video client mute are two independent fields: a request about one
+// kind never changes the other. ONE instance per session, shared by every
+// pipeline and by the mute report to MC, so the report always carries both
+// kinds' CURRENT state (`signaling/muteRequest.ts`). Video client mute stops
+// the camera track (story 3 R-17) — there is no video capture until C-A2, so
+// today the video field is state and report only.
+
+import type { MediaKindToken } from '../mediaKind.js';
+
 /** Immutable snapshot of the local mute state. */
 export interface MuteSnapshot {
-  /** The participant muted themselves. Enforced here, at capture. */
+  /** The participant muted their audio. Enforced at capture. */
   readonly audioMuted: boolean;
+  /** The participant muted their video. Enforced at capture (camera stops; C-A2). */
+  readonly videoMuted: boolean;
 }
 
 /**
@@ -81,15 +96,26 @@ export interface MuteSnapshot {
  */
 export class MuteState {
   #audioMuted = false;
+  #videoMuted = false;
 
-  /** Whether capture output is currently suppressed. Read once per frame. */
+  /** Whether audio capture output is currently suppressed. Read once per frame. */
   get audioMuted(): boolean {
     return this.#audioMuted;
   }
 
-  /** A snapshot for an event payload. */
+  /** Whether video is client-muted. */
+  get videoMuted(): boolean {
+    return this.#videoMuted;
+  }
+
+  /** A snapshot for an event payload, and the both-kinds mute report. */
   snapshot(): MuteSnapshot {
-    return { audioMuted: this.#audioMuted };
+    return { audioMuted: this.#audioMuted, videoMuted: this.#videoMuted };
+  }
+
+  /** Whether `kind` is client-muted. */
+  isMuted(kind: MediaKindToken): boolean {
+    return kind === 'audio' ? this.#audioMuted : this.#videoMuted;
   }
 
   /**
@@ -103,6 +129,13 @@ export class MuteState {
   setAudioMuted(muted: boolean): boolean {
     if (this.#audioMuted === muted) return false;
     this.#audioMuted = muted;
+    return true;
+  }
+
+  /** Set the local VIDEO mute state. Never touches audio. Same return contract. */
+  setVideoMuted(muted: boolean): boolean {
+    if (this.#videoMuted === muted) return false;
+    this.#videoMuted = muted;
     return true;
   }
 }

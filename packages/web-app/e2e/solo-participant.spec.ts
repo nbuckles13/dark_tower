@@ -23,7 +23,7 @@
 //
 // "Nothing moved" is trivially true of a client that never started. So the
 // PRIMARY assertion is a specific, non-default wire token: slot 0 polls to
-// exactly `fewer_sources`, which proves MC's assignment ARRIVED. Only after
+// exactly `fewer_sources_than_slots`, which proves MC's assignment ARRIVED. Only after
 // that are the flat counters meaningful, and the flat-window helper carries its
 // own sample-count vacuity check.
 //
@@ -77,7 +77,7 @@ test.describe('solo participant: loopback removed (ADR-0036 story 2 R-3)', () =>
           'the participant to itself — the loopback this story removes.',
         timeout: 20_000,
       })
-      .toBe('fewer_sources');
+      .toBe('fewer_sources_than_slots');
     const assignedAtMs = Date.now();
 
     // SECONDARY — both counters flat. Egress is flat because MC directs no
@@ -98,7 +98,7 @@ test.describe('solo participant: loopback removed (ADR-0036 story 2 R-3)', () =>
   test('slot state is rendered from the wire, not inferred from silence', async ({ page }) => {
     // ADR-0036 §6: "Slot state is explicit on the wire. Absence of frames is not
     // a signal." For a solo participant the wire says, specifically,
-    // `fewer_sources` — asserting merely "not awaiting-assignment" would be
+    // `fewer_sources_than_slots` — asserting merely "not awaiting-assignment" would be
     // vacuous under R-3.
     await page.goto('/');
     const token = await authAsSharedUser(page);
@@ -121,6 +121,6 @@ test.describe('solo participant: loopback removed (ADR-0036 story 2 R-3)', () =>
         message: "a solo participant's slot must reach exactly the fewer-sources state",
         timeout: 20_000,
       })
-      .toBe('fewer_sources');
+      .toBe('fewer_sources_than_slots');
   });
 });

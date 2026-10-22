@@ -90,7 +90,12 @@ processors:
           - dt_client_media_decode_queue_dropped_total
           - dt_client_media_capture_source
           - dt_client_media_receive_source_deficit_total
-          - dt_client_media_receive_slots_rejected_total
+          - dt_client_media_capture_failures_total
+          - dt_client_media_keyframe_requests_received_total
+          - dt_client_media_keyframe_requests_unattributed_total
+          - dt_client_media_send_directive_kind_missing_total
+          - dt_client_media_send_directive_header_version_refused_total
+          - dt_client_media_mh_control_channel_ended_total
           - dt_client_time_to_first_media_frame_ms
 
   # ---------------------------------------------------------------------
@@ -437,6 +442,29 @@ processors:
   # honest once video 44 x 2 + 14 = 102 (~4.9 runs), adversarial
   # 44 x 3 + 14 = 146 (~3.4 runs). Still above the 3-run trigger below; no
   # cap change.
+  # STORY 3 C-A1 (task 11) — the allowlist is now 28 names. Per-kind:
+  #   - RETIRED `dt_client_media_receive_slots_rejected_total`: -1 (MC truncates
+  #     over-cap declarations now; the SDK refusal and its counter are gone);
+  #   - `dt_client_media_capture_failures_total` x 7 `outcome` values
+  #     (`captureFailure.ts` vocabulary + `ended`): +7;
+  #   - `dt_client_media_keyframe_requests_received_total` x 5 per-kind
+  #     `outcome` values (`malformed` lives only on the kind-free series): +5
+  #     (declared, not zero-initialised; at this gate only an audio
+  #     `not_sending` can ever be emitted);
+  #   - `dt_client_media_send_directive_kind_missing_total`: +1.
+  #   Per-kind 44 - 1 + 7 + 5 + 1 = 56.
+  # Session-level (kind-free): `..._send_directive_header_version_refused_total`
+  #   1 + `..._keyframe_requests_unattributed_total` x 2 `outcome` +
+  #   `..._mh_control_channel_ended_total` x 2 `outcome` = +5, so 14 + 5 = 19.
+  # Per per-run `org_id`:
+  #   - honest AT THIS GATE (audio only; no video handle exists):
+  #       56 x 1 + 19 = 75  -> ~6.7 runs of headroom
+  #   - honest once video emits:  56 x 2 + 19 = 131 -> ~3.8 runs
+  #   - adversarial:              56 x 3 + 19 = 187 -> ~2.7 runs
+  # The honest-once-video figure (3.8) is still above the 3-run trigger: no cap
+  # change. NEXT: story 3 C-A2 (task 13: video send-path series), C-B (task 14:
+  # video receive and recovery series) and C-C1 (task 17) add per-kind names;
+  # the task whose additions take honest-once-video below 3 runs raises the cap.
   # Kept at 500 (operations ruling, story 3 task 2): this is a fail-closed
   # tripwire, not a capacity estimate, and per-run orgs overlap only within
   # `max_stale`. Because of the multiplier, every PER-KIND name a later task

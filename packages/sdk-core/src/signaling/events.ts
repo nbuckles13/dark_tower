@@ -13,6 +13,7 @@
 import { LeaveReason } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 
 import type { SignalingCodec } from './codecMap.js';
+import type { MediaKindToken, OpenMediaKindToken } from '../media/mediaKind.js';
 
 export { SignalingCodec } from './codecMap.js';
 
@@ -40,18 +41,21 @@ export const MAX_RELAYED_PARTICIPANT_ID_LENGTH = 256;
 /**
  * Payload of `participantMuteChanged` (proto `ParticipantMuteUpdate`).
  *
- * SERVER mute only (ADR-0036 §5, story 2 R-11): MC emits this when a participant's
- * server mute changes, and replays it to a joiner for every currently server-muted
- * participant. The proto's self-mute booleans are deliberately NOT projected: MC
- * sends them as informational snapshots taken at the server-mute change, so they
- * go stale on the next self-mute and are not a self-mute source (MC's own rule —
- * self-mute does not fan out; the subscriber-visible signal is the slot's
- * `source_muted`).
+ * SERVER mute only (ADR-0036 §5, story 2 R-11), PER KIND (story 3 R-15): MC emits
+ * this when a participant's server mute changes, and replays it right after the
+ * join response for every participant server-muted in EITHER kind, carrying both
+ * kinds' flags. So a participant with no update is server-unmuted in both kinds
+ * (known, not unknown). The proto's self-mute booleans are deliberately NOT
+ * projected: MC sends them as informational snapshots taken at the server-mute
+ * change, so they go stale on the next self-mute and are not a self-mute source
+ * (the subscriber-visible signal is the slot's `avatar_client_muted`).
  */
 export interface ParticipantMuteEvent {
   readonly participantId: string;
   /** Whether this participant's audio is server-muted (enforced at MH ingress). */
   readonly audioServerMuted: boolean;
+  /** Whether this participant's video is server-muted (enforced at MH ingress). */
+  readonly videoServerMuted: boolean;
   /**
    * Participant id of whoever applied the server mute, when muted and MC said.
    * MC's own value, bounded to {@link MAX_RELAYED_PARTICIPANT_ID_LENGTH}. Resolve it
@@ -94,11 +98,15 @@ export interface JoinedEvent {
   readonly participantId: string;
   readonly senderId?: number | undefined;
   /**
-   * MC's receive-slot cap (`JoinResponse.max_receive_slots`), passed through
-   * verbatim: `undefined` when absent (older MC), and a present `0` kept as `0`
-   * so the session can surface it as a contract violation. Never coerced.
+   * MC's per-kind receive-slot caps (`JoinResponse.max_audio_receive_slots` /
+   * `max_video_receive_slots`, story 3 R-1), passed through verbatim:
+   * `undefined` when absent (an MC that does not send them — the caps are then
+   * UNKNOWN), and a present `0` kept as `0` (legal: a video cap of 0 is the
+   * video-off lever, R-26). Never coerced. Informational only: MC truncates, so
+   * a client never shrinks its declaration from these.
    */
-  readonly maxReceiveSlots?: number | undefined;
+  readonly maxAudioReceiveSlots?: number | undefined;
+  readonly maxVideoReceiveSlots?: number | undefined;
   readonly existingParticipants: readonly RosterParticipant[];
   readonly mediaServers: readonly string[];
   readonly correlationId: string;
@@ -205,6 +213,13 @@ export interface RosterKeySink {
   remove(senderId: number): void;
 }
 
+/**
+ * What a participant publishes (story 3 R-2): a closed vocabulary mapped onto
+ * `MEDIA_KIND_AUDIO` / `MEDIA_KIND_VIDEO_CAMERA` at the wire boundary. Screen
+ * share is not a kind this story serves and is unrepresentable here.
+ */
+export type PublishKind = MediaKindToken;
+
 /** One receive slot this client declares it can render (ADR-0036 §6). */
 export interface ReceiveSlotDeclaration {
   /**
@@ -215,16 +230,16 @@ export interface ReceiveSlotDeclaration {
    * a receiver validate an arriving `stream_id` against its own declared slots.
    */
   readonly slotId: number;
-  /** What this slot can decode. Audio only this story. */
-  readonly mediaKind: 'audio';
+  /** What this slot can decode. */
+  readonly mediaKind: MediaKindToken;
 }
 
 /** One stream MC directs this client to produce (ADR-0036 §5). */
 export interface SendStreamDirective {
   /** The publisher's stream index. 8-bit semantics: it is the key id's stream field. */
   readonly streamNumber: number;
-  /** Media kind. Audio only this story; a video stream is ignored by this client. */
-  readonly mediaKind: 'audio' | 'video' | 'other';
+  /** Media kind. `unknown` is a kind this client never publishes (fail closed: never sent). */
+  readonly mediaKind: OpenMediaKindToken;
   /**
    * Directed bitrate ceiling, or `undefined` when MC did not set it.
    *
@@ -251,11 +266,53 @@ export interface SendDirectiveEvent {
   readonly headerVersion: number;
 }
 
+/**
+ * A slot's state, in tokens IDENTICAL to MC's `slot_state_label()`
+ * (`crates/mc-service/src/media_signaling/assignments.rs`) and the
+ * observability labels, so the client's and MC's distributions compare
+ * directly. A FLAT vocabulary (story 3 wire freeze, ADR-0036 §6): one value per
+ * thing a receiver renders.
+ *
+ *   * `active` — live. Audio names the sender; VIDEO DOES NOT (the verified
+ *     key-id sender names it, R-5).
+ *   * `avatar_no_video` / `avatar_client_muted` / `avatar_server_muted` — an
+ *     avatar for the named participant, with the reason (server wins over
+ *     client).
+ *   * `fewer_sources_than_slots`, `unavailable` (over MC's per-kind cap,
+ *     truncated) — sourceless.
+ *   * `switch_pending`, `withheld_by_congestion`, `source_unreachable` —
+ *     retained on the wire but NEVER EMITTED; a consumer renders them FAIL
+ *     CLOSED (no media from the slot).
+ *   * `unspecified` — the wire's zero value or ANY number this SDK does not
+ *     name (the enum is open). Fail closed, never guessed.
+ *
+ * The one mapping site is `signaling/slotStateMap.ts`. Nothing but the wire's
+ * `ACTIVE` ever maps to `active`.
+ */
+export type SlotStateToken =
+  | 'unspecified'
+  | 'active'
+  | 'avatar_no_video'
+  | 'avatar_client_muted'
+  | 'avatar_server_muted'
+  | 'fewer_sources_than_slots'
+  | 'unavailable'
+  | 'switch_pending'
+  | 'withheld_by_congestion'
+  | 'source_unreachable';
+
+/** A slot's media kind, from the DECLARED slot (never a frame). `unknown` renders no media. */
+export type SlotMediaKind = OpenMediaKindToken;
+
 /** What MC has placed in one of this client's declared slots (ADR-0036 §6). */
 export interface StreamAssignmentEvent {
   readonly slotId: number;
+  /** The slot's media kind as MC echoed it (`StreamAssignment.media_kind`). */
+  readonly mediaKind: SlotMediaKind;
   /**
-   * The source participant, or `undefined` when no source is assigned.
+   * The participant the slot shows, or `undefined` when MC names none: every
+   * sourceless state, and a LIVE VIDEO slot (MC never names the live video
+   * source — story 3 R-5; the frame's verified key-id sender does).
    *
    * ATTRIBUTION DOES NOT COME FROM HERE. A receiver attributes an arriving frame
    * from that frame's own `key_id.sender_id` and the signature verifying against
@@ -266,22 +323,11 @@ export interface StreamAssignmentEvent {
   /** Which handler to receive this slot's media from. Empty when unassigned. */
   readonly mediaHandlerUrl: string;
   /**
-   * Why the slot looks the way it does.
+   * Why the slot looks the way it does — see {@link SlotStateToken}.
    *
-   * EXPLICIT ON THE WIRE because absence of frames is not a signal (ADR-0036 §6):
-   * "withheld by congestion", "fewer sources than slots" and "source unreachable"
-   * are indistinguishable to a client — all present as no media — and render
-   * completely differently.
+   * EXPLICIT ON THE WIRE because absence of frames is not a signal (ADR-0036 §6).
    */
-  readonly slotState:
-    | 'unspecified'
-    | 'active'
-    | 'source_muted'
-    | 'withheld_congestion'
-    | 'fewer_sources'
-    | 'zero_requested'
-    | 'source_unreachable'
-    | 'switch_pending';
+  readonly slotState: SlotStateToken;
 }
 
 /** The subscriber's current slot assignments. */
@@ -347,6 +393,17 @@ export interface SignalingJoinParams {
   readonly participantName: string;
   /** Optional advertised capabilities. */
   readonly capabilities?: SignalingCapabilities;
+  /**
+   * What this participant publishes (`JoinRequest.publish_kinds`, story 3 R-2).
+   * FIXED FOR THE MEMBERSHIP: MC refuses a reconnect presenting a different
+   * set. Copied and frozen by the client; never re-read from the caller.
+   */
+  readonly publishKinds: readonly PublishKind[];
+  /**
+   * The INITIAL receive declaration (`JoinRequest.receive_capability`), in slot
+   * id order (`session/mediaSelection.ts:receiveDeclaration`).
+   */
+  readonly receiveSlots: readonly ReceiveSlotDeclaration[];
 }
 
 /**

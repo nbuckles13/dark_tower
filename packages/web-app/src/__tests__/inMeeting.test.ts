@@ -28,6 +28,7 @@ import { MockMeetingSession } from './helpers/MockMeetingSession.js';
 function slot(overrides: Partial<StreamAssignmentEvent> = {}): StreamAssignmentEvent {
   return {
     slotId: 0,
+    mediaKind: 'audio',
     senderId: 258,
     mediaHandlerUrl: 'https://mh-0:4433',
     slotState: 'active',
@@ -169,7 +170,7 @@ test('the indicator follows an SDK-originated mute the UI never requested', asyn
   const { session, screen } = await mount();
   await screen.getByTestId('start-audio').click();
 
-  session.fire('muteChanged', { audioMuted: true });
+  session.fire('muteChanged', { audioMuted: true, videoMuted: false });
 
   await expect.element(screen.getByTestId('mute-state')).toHaveTextContent('muted');
   await expect.element(screen.getByTestId('mute-state')).toHaveAttribute('data-muted', 'true');
@@ -212,9 +213,9 @@ test('each wire slot state renders distinctly, including the far-end-muted case'
   session.fire('streamAssignments', {
     unreachableSenderIds: [],
     assignments: [
-      slot({ slotId: 0, slotState: 'source_muted' }),
-      slot({ slotId: 1, slotState: 'withheld_congestion' }),
-      slot({ slotId: 2, slotState: 'fewer_sources' }),
+      slot({ slotId: 0, slotState: 'avatar_client_muted' }),
+      slot({ slotId: 1, slotState: 'withheld_by_congestion' }),
+      slot({ slotId: 2, slotState: 'fewer_sources_than_slots' }),
       slot({ slotId: 3, slotState: 'source_unreachable' }),
     ],
   });
@@ -223,13 +224,13 @@ test('each wire slot state renders distinctly, including the far-end-muted case'
   // vocabulary rather than on display copy a copy edit can change.
   await expect
     .element(screen.getByTestId('slot-0'))
-    .toHaveAttribute('data-slot-state', 'source_muted');
+    .toHaveAttribute('data-slot-state', 'avatar_client_muted');
   await expect
     .element(screen.getByTestId('slot-1'))
-    .toHaveAttribute('data-slot-state', 'withheld_congestion');
+    .toHaveAttribute('data-slot-state', 'withheld_by_congestion');
   await expect
     .element(screen.getByTestId('slot-2'))
-    .toHaveAttribute('data-slot-state', 'fewer_sources');
+    .toHaveAttribute('data-slot-state', 'fewer_sources_than_slots');
   await expect
     .element(screen.getByTestId('slot-3'))
     .toHaveAttribute('data-slot-state', 'source_unreachable');
@@ -252,12 +253,12 @@ test('far-end muted is rendered from the wire, not from that slot being silent',
 
   session.fire('streamAssignments', {
     unreachableSenderIds: [],
-    assignments: [slot({ slotState: 'source_muted' })],
+    assignments: [slot({ slotState: 'avatar_client_muted' })],
   });
 
   await expect
     .element(screen.getByTestId('slot-0'))
-    .toHaveAttribute('data-slot-state', 'source_muted');
+    .toHaveAttribute('data-slot-state', 'avatar_client_muted');
   await expect.element(screen.getByTestId('slot-0')).toHaveAttribute('data-slot-active', 'false');
 });
 
@@ -354,7 +355,7 @@ test('each filled slot names the roster participant MC placed there; an unfilled
     unreachableSenderIds: [],
     assignments: [
       slot({ slotId: 0, senderId: 258, slotState: 'active' }),
-      slot({ slotId: 1, senderId: undefined, slotState: 'fewer_sources' }),
+      slot({ slotId: 1, senderId: undefined, slotState: 'fewer_sources_than_slots' }),
     ],
   });
   await expect.element(screen.getByTestId('slot-0')).toHaveAttribute('data-sender-id', '258');
@@ -362,7 +363,7 @@ test('each filled slot names the roster participant MC placed there; an unfilled
   await expect.element(screen.getByTestId('slot-1')).not.toHaveAttribute('data-sender-id');
   await expect
     .element(screen.getByTestId('slot-1'))
-    .toHaveAttribute('data-slot-state', 'fewer_sources');
+    .toHaveAttribute('data-slot-state', 'fewer_sources_than_slots');
 });
 
 test('a slot whose sender the roster does not know reads as unknown, never the raw id', async () => {
@@ -386,6 +387,7 @@ test('own SERVER mute is a separate indicator, driven only by the wire; asking t
   session.fire('participantMuteChanged', {
     participantId: 'self',
     audioServerMuted: true,
+    videoServerMuted: false,
     serverMutedBy: 'nobody-we-know',
   });
   await expect
@@ -405,7 +407,11 @@ test('own SERVER mute is a separate indicator, driven only by the wire; asking t
     .element(screen.getByTestId('server-mute-state'))
     .toHaveAttribute('data-server-muted', 'true');
 
-  session.fire('participantMuteChanged', { participantId: 'self', audioServerMuted: false });
+  session.fire('participantMuteChanged', {
+    participantId: 'self',
+    audioServerMuted: false,
+    videoServerMuted: false,
+  });
   await expect
     .element(screen.getByTestId('server-mute-state'))
     .toHaveAttribute('data-server-muted', 'false');
@@ -413,7 +419,11 @@ test('own SERVER mute is a separate indicator, driven only by the wire; asking t
 
 test('nothing in the view calls a server mute a ban', async () => {
   const { session, screen } = await mount();
-  session.fire('participantMuteChanged', { participantId: 'self', audioServerMuted: true });
+  session.fire('participantMuteChanged', {
+    participantId: 'self',
+    audioServerMuted: true,
+    videoServerMuted: false,
+  });
   await expect
     .element(screen.getByTestId('server-mute-state'))
     .toHaveAttribute('data-server-muted', 'true');
@@ -422,14 +432,26 @@ test('nothing in the view calls a server mute a ban', async () => {
 
 test('the "asked" label belongs to ONE server-mute episode: a re-mute starts with nothing asked', async () => {
   const { session, screen } = await mount();
-  session.fire('participantMuteChanged', { participantId: 'self', audioServerMuted: true });
+  session.fire('participantMuteChanged', {
+    participantId: 'self',
+    audioServerMuted: true,
+    videoServerMuted: false,
+  });
   await screen.getByTestId('request-unmute').click();
   await vi.waitFor(() => expect(session.unmuteRequestCalls).toBe(1));
   await expect.element(screen.getByTestId('request-unmute')).toMatchTextContent('Asked the host');
 
-  session.fire('participantMuteChanged', { participantId: 'self', audioServerMuted: false });
+  session.fire('participantMuteChanged', {
+    participantId: 'self',
+    audioServerMuted: false,
+    videoServerMuted: false,
+  });
   await expect.element(screen.getByTestId('request-unmute')).not.toBeInTheDocument();
-  session.fire('participantMuteChanged', { participantId: 'self', audioServerMuted: true });
+  session.fire('participantMuteChanged', {
+    participantId: 'self',
+    audioServerMuted: true,
+    videoServerMuted: false,
+  });
   await expect
     .element(screen.getByTestId('request-unmute'))
     .toHaveTextContent('Ask the host to unmute you');

@@ -62,6 +62,55 @@ export interface MediaTransportOptions {
    * pipeline starts); supplied by the media pipeline from `clientConfig.ts`.
    */
   readonly datagramQueue?: DatagramQueueSettings;
+  /**
+   * Where the MH control channel's inbound messages go (story 3): each
+   * handler's `MhServerMessage` read loop hands decoded keyframe requests and
+   * malformed-message events here. Omitted: they are read and discarded
+   * (still bounded, never thrown).
+   */
+  readonly controlSink?: MhControlSink;
+}
+
+/**
+ * A decoded MH `KeyframeRequest`. INTERNAL: `streamNumber` and `gopCounter` are
+ * stream identity (ADR-0036 §11) — never a metric label, log field, span
+ * attribute, event payload or test-bus value.
+ */
+export interface MhKeyframeRequest {
+  readonly streamNumber: number;
+  readonly gopCounter: number;
+}
+
+/** Receiver of a handler's MH control-channel input. Per handler URL. */
+export interface MhControlSink {
+  /** A well-formed `keyframe_request` arrived from the handler at `url`. */
+  keyframeRequest(url: string, request: MhKeyframeRequest): void;
+  /**
+   * An undecodable, oversized, empty or unknown-variant message arrived. After a
+   * FRAMING failure the stream is desynchronised and that handler's loop stops
+   * (media is unaffected); after a decode failure it continues.
+   */
+  malformed(url: string): void;
+  /**
+   * The handler's control stream ENDED while the transport was not being torn
+   * down: MH reset it (or the connection was lost) — `reset` — or MH finished
+   * its send half — `finished`. After either, this handler's keyframe requests
+   * are never received again. Not called on this client's own teardown.
+   */
+  ended(url: string, cause: MhControlChannelEnding): void;
+}
+
+/** Why a handler's control stream ended (see {@link MhControlSink.ended}). */
+export type MhControlChannelEnding = 'reset' | 'finished';
+
+/** A receiver's recovery request for one of its slots (story 3 R-13). */
+export interface MhRecoveryRequest {
+  /** The receiver's own DOWNLINK slot id. Never a publisher stream number. */
+  readonly slotId: number;
+  /** The failing frame's key-id sender. A staleness guard only. */
+  readonly senderId: number;
+  /** The failing frame's GoP counter. */
+  readonly gopCounter: number;
 }
 
 /**

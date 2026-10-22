@@ -1371,8 +1371,8 @@ client-side reading:
 
 | `dt_client_media_receive_source_deficit_total` | slot rows' `data-slot-state` | Meaning |
 |---|---|---|
-| flat | only `source_muted` or `fewer_sources`, **and the roster agrees** — those peers really are muted, or there really are fewer unmuted peers than slots (declaring zero slots of a kind yields no slot rows of that kind at all; MC never sends a zero-requested state, which the proto reserved 2026-10-13) | **Correct behaviour.** Silence is what the wire says. Stop. |
-| flat | `fewer_sources` **while the roster shows unmuted peers you should hear** | Those peers are unreachable from you: you share no CONNECTED handler, so MC names them in `unreachable_sender_ids` instead of a slot. A connectivity fault — [`mc-incident-response.md` Scenario 18](mc-incident-response.md#scenario-18-a-participant-hears-only-part-of-the-roster). |
+| flat | only `source_muted` or `fewer_sources_than_slots`, **and the roster agrees** — those peers really are muted, or there really are fewer unmuted peers than slots (declaring zero slots of a kind yields no slot rows of that kind at all; MC never sends a zero-requested state, which the proto reserved 2026-10-13) | **Correct behaviour.** Silence is what the wire says. Stop. |
+| flat | `fewer_sources_than_slots` **while the roster shows unmuted peers you should hear** | Those peers are unreachable from you: you share no CONNECTED handler, so MC names them in `unreachable_sender_ids` instead of a slot. A connectivity fault — [`mc-incident-response.md` Scenario 18](mc-incident-response.md#scenario-18-a-participant-hears-only-part-of-the-roster). |
 | flat | `awaiting-assignment` on every slot, or a media error naming the slot cap | MC never assigned your slots — F18 (receive-slot cap), or MC signalling (§4.1). |
 | flat | `unspecified`, or any token MC does not emit today | An MC defect — [`mc-incident-response.md` §Client media signalling](mc-incident-response.md#client-media-signalling--where-to-look-no-scenario-number-yet) lists which slot states are reachable. File against `meeting-controller`. |
 | flat | `active` | Inside the deficit counter's grace interval (a fresh or just-remapped assignment is not counted yet). Re-read after one export interval; still flat with nothing heard → F14. |
@@ -1552,67 +1552,69 @@ in again. MC never re-sends a KEK push that was dropped.
 **Symptom.** In a meeting with more participants than your receive-slot count, you hear the people
 who joined first and not the ones who joined later. Nothing errors, and no drop counter moves.
 
-**Why.** This is **static fill** (story 2 R-2): your client declares N receive slots
-(`VITE_DT_RECEIVE_SLOTS`, capped by MC's `MC_MAX_RECEIVE_SLOTS`), and MC fills them **in join order**
+**Why.** This is **static fill** (story 2 R-2): your client declares N audio receive slots
+(`VITE_DT_AUDIO_RECEIVE_SLOTS`, capped by MC's `MC_MAX_AUDIO_RECEIVE_SLOTS`), and MC fills them **in join order**
 from the senders you share a connected handler with, and never reselects. A slot changes only when its
 occupant leaves. It is then refilled by the earliest-joined sender not yet assigned. **A late joiner
 is inaudible to you until someone you can hear leaves.** That is the designed behaviour, not a fault.
 
 **Discriminator.**
-- **Effective N**: count the cells in the in-meeting slot grid (`data-testid="slot-list"`, one cell
-  per declared slot, each naming its sender). The E2E bus `receiveSlots.declared` and the console
-  line `[dt-media-slots] declaring N=...` show the same number. The server cap is
-  `mc_media_receive_slot_cap{media_kind="audio"}`, also on the bus as `receiveSlots.serverCap`.
+- **Effective N**: count the audio cells in the in-meeting slot grid (`data-testid="slot-list"`, one
+  cell per declared slot, each naming its sender). The E2E bus `receiveSlots.audio.declared` and the
+  console line `[dt-media-slots] publishing [...]; declared N=... audio` show the same number. The
+  server cap is `mc_media_receive_slot_cap{media_kind="audio"}`, also on the bus as
+  `receiveSlots.audio.serverCap` (absent on a controller that predates the per-kind caps).
 - If every cell is filled and the unheard participants are the latest joiners, it is static fill.
 - If a cell says fewer sources, or an unheard participant is marked unreachable on the roster, it is
   not static fill. Unreachable (no shared handler) is
   [`mc-incident-response.md` Scenario 18](mc-incident-response.md#scenario-18-a-participant-hears-only-part-of-the-roster).
-  An over-cap N that hears nobody at all is F18.
+  An over-cap N shows `unavailable` cells (or, before MC-A, hears nobody at all): F18.
 
-**Fix.** Raise N, up to the cap (`VITE_DT_RECEIVE_SLOTS=<n> scripts/dev-web.sh`), or accept it.
+**Fix.** Raise N, up to the cap (`VITE_DT_AUDIO_RECEIVE_SLOTS=<n> scripts/dev-web.sh`), or accept it.
 **There is no debugger for slot selection** beyond the slot grid. Speaker-based selection (story 5)
 replaces static fill.
 
-### F18 — "I hear nobody", and the media error names the receive-slot cap
+### F18 — Slots read `unavailable`, or (before MC-A) the participant hears nobody
 
-> **Corrected 2026-10-21 (story 3 OPS-A, R-1): this entry describes builds before MC-A and C-A1.**
-> Story 3 supersedes "an over-cap receive declaration fails loudly". Each kind (audio and video)
-> has its own server-side cap (`MC_MAX_AUDIO_RECEIVE_SLOTS`, `MC_MAX_VIDEO_RECEIVE_SLOTS`). From
-> MC-A an over-cap declaration is **truncated** to the cap, and each excess slot shows the
-> permanent `unavailable` state. It is visible, never a silent participant and **never a join or
-> media-start failure**. C-A1 deletes the SDK's local refusal and its counter, and rewrites this
-> entry together with the slot env-var rename. A reader who trusted the text below on a story-3
-> build would wait for a media error that never comes, and would miss the `unavailable` slot rows
-> that are the actual reading. On a story-3 build, an over-cap N hears up to the cap.
+> **Rewritten 2026-10-21 (story 3 C-A1, R-1).** Story 3 superseded "an over-cap receive declaration
+> fails loudly". The client no longer refuses an over-cap declaration and no longer counts one
+> (`dt_client_media_receive_slots_rejected_total` is retired); `VITE_DT_RECEIVE_SLOTS` is retired in
+> favour of `VITE_DT_AUDIO_RECEIVE_SLOTS` (N) and `VITE_DT_VIDEO_RECEIVE_SLOTS` (M), and setting the
+> old name fails both `scripts/dev-web.sh` and the web app's config load, naming the two new ones.
 
-**Symptom.** Start audio fails and the in-meeting view shows a `media-error` like
-`SIGNALING: this client is configured to receive 5 audio slots, but the meeting controller allows
-at most 4 ... Lower VITE_DT_RECEIVE_SLOTS ... or raise MC_MAX_RECEIVE_SLOTS`. The participant hears
-nobody; others may still hear them.
+**Symptom.** Story-3 controller (MC-A and later): some cells in the slot grid read
+`unavailable` (`data-slot-state="unavailable"`) and never fill. Controller in service BEFORE MC-A:
+start audio succeeds but the participant hears nobody, and the session shows a server `error`.
 
-**Why it is loud.** N (`VITE_DT_RECEIVE_SLOTS`, the client's declared receive-slot count) is a
-REQUEST bounded by MC's `MC_MAX_RECEIVE_SLOTS`, which MC advertises on
-`JoinResponse.max_receive_slots`. MC rejects an over-cap declaration **whole** — never clamps it — so
-the SDK refuses it before sending rather than presenting as one silent participant, and counts it on
-`dt_client_media_receive_slots_rejected_total`. `dt_client_media_receive_source_deficit_total` reads
-**0** for this failure (there are no active assignments to be silent) — do not read that as health.
+**Why.** N and M are REQUESTS. Each kind has its own server cap (`MC_MAX_AUDIO_RECEIVE_SLOTS`,
+`MC_MAX_VIDEO_RECEIVE_SLOTS`, advertised on `JoinResponse.max_audio_receive_slots` /
+`max_video_receive_slots`). From MC-A, MC **truncates** an over-cap declaration: it keeps the
+lowest ids up to the cap and reports every excess slot `unavailable`, permanently for that
+declaration — visible, never a join failure. A video cap of 0 is the video-off lever (story 3
+R-26): every video slot reads `unavailable`. **Until MC-A lands**, the controller in service still
+caps N+M at the retired TOTAL `MC_MAX_RECEIVE_SLOTS` and rejects a declaration over it **whole**
+(one silent participant); the SDK no longer pre-checks this.
+`dt_client_media_receive_source_deficit_total` reads **0** for a whole rejection (there are no
+active assignments to be silent) — do not read that as health.
 
 **Discriminator.**
-- The effective N and the cap are on the E2E bus (`receiveSlots`: `declared`, `source`,
-  `serverCapState`, `serverCap`) and in the browser console line `[dt-media-slots] declaring N=...
-  receive slots (...); server cap ...`. `source: default` means `VITE_DT_RECEIVE_SLOTS` was not set
-  and the SDK default applied.
-- `serverCapState: unknown` means the MC predates the advertised cap: the SDK declares anyway and MC
-  rejects, which surfaces as a session `error` and counts on MC's
+- The effective values and the caps are on the E2E bus (`receiveSlots`: `publish`, and per kind
+  `audio` / `video` with `declared`, `source`, `serverCapState`, `serverCap`) and in the console
+  line `[dt-media-slots] publishing [...]; declared N=... audio (...), M=... video (...); server
+  caps audio ..., video ...`. `source: default` means the variable was not set and the SDK default
+  applied. `serverCapState: unknown` means the controller sends no per-kind caps — the pre-MC-A
+  controller.
+- In the cluster: truncation shows on `mc_media_slot_states_total{slot_state="unavailable"}`; a
+  pre-MC-A whole rejection shows on
   `mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}` — see the
   receive-capability rejection section of [`mc-incident-response.md`](mc-incident-response.md).
-- `serverCapState: invalid` (a present 0) is an MC contract violation; the console WARNs with the
-  value. Report it against MC.
+- `scripts/dev-web.sh --check` prints both values beside both on-disk caps and a NOTICE when one
+  is over its cap ("excess slots will show unavailable"), or "video disabled" for a video cap of 0.
 
-**Fix.** Make them agree — never by clamping: `VITE_DT_RECEIVE_SLOTS=<n> scripts/dev-web.sh` with
-`n` at or below the cap (the preflight prints both and refuses a mismatch), or raise
-`MC_MAX_RECEIVE_SLOTS` in the MC ConfigMap. The browser knob is **not** covered by `dt-guard
-env-config`; the runtime value on the bus is the check.
+**Fix.** Accept the truncation, lower N or M, or raise the per-kind cap in the MC ConfigMap
+(`VITE_DT_AUDIO_RECEIVE_SLOTS=<n> VITE_DT_VIDEO_RECEIVE_SLOTS=<m> scripts/dev-web.sh`). Before
+MC-A, keep N+M at or below `MC_MAX_RECEIVE_SLOTS`. The browser knobs are **not** covered by
+`dt-guard env-config`; the runtime values on the bus are the check.
 
 ### F19 — Receive-source deficit rising: MC says a source is active and nothing decodes
 

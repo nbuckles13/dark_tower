@@ -35,6 +35,7 @@ import {
   DEFAULT_HOP_RESTART_BACKWARD_JUMP_FRAMES,
   HOP_HALF_SPACE,
 } from '../media/pipeline/hopSequenceMonitor.js';
+import type { MediaKindToken } from '../media/mediaKind.js';
 
 /** Opus `application` mode. Mirrors the WebCodecs Opus registration. */
 export type OpusApplication = 'voip' | 'audio' | 'lowdelay';
@@ -265,79 +266,131 @@ export interface ReceiverStateConfig {
 }
 
 /**
- * What this client asks to RECEIVE (ADR-0036 §6; story 2 R-1, R-23).
+ * What this client asks to RECEIVE (ADR-0036 §6; story 2 R-1, R-23; story 3
+ * R-1, R-23).
+ *
+ * N audio and M video receive slots, configured INDEPENDENTLY; either may be 0
+ * (story 3 R-1). Declared at join as audio slot ids `0..N-1` then video ids
+ * `N..N+M-1` (`session/mediaSelection.ts:receiveDeclaration`, the one producer
+ * of slot ids).
+ *
+ * N AND M ARE REQUESTS. MC caps each kind (`MC_MAX_AUDIO_RECEIVE_SLOTS`,
+ * `MC_MAX_VIDEO_RECEIVE_SLOTS`, advertised on `JoinResponse.max_audio_receive_slots`
+ * / `max_video_receive_slots`) and TRUNCATES an over-cap declaration: the excess
+ * slots report `unavailable` on the wire, visibly, never a join failure. So the
+ * SDK has no over-cap pre-check and never shrinks a declaration (the proto
+ * forbids it). Story 2's whole-declaration rejection and its client counter
+ * are retired.
+ *
+ * TRANSITION (until MC-A, story 3 task 12): the controller in service before
+ * MC-A still caps the TOTAL N+M at the retired `MC_MAX_RECEIVE_SLOTS` and
+ * rejects an over-cap declaration whole
+ * (`mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}`).
+ *
+ * THE DEFAULTS ARE THE SDK's FALLBACK for an embedder that configures nothing,
+ * NOT the demo topology: `scripts/dev-web.sh` always exports
+ * `VITE_DT_AUDIO_RECEIVE_SLOTS` / `VITE_DT_VIDEO_RECEIVE_SLOTS`, which the web app
+ * reads through {@link parseReceiveSlots}.
+ *
+ * NOT COVERED BY `dt-guard env-config`, which reads `infra/services/**` only:
+ * the two variables are browser-side build knobs. The browser suite asserts the
+ * effective values at runtime (`MeetingSession.receiveSlots`) instead.
  */
 export interface ReceiveConfig {
   /**
-   * N — the number of audio receive slots this client DECLARES in its
-   * `ReceiveCapability` (slot ids `0..N-1`). Each participant hears at most N
-   * others.
-   *
-   * N IS A REQUEST, BOUNDED BY THE SERVER. MC caps the TOTAL slot count of one
-   * declaration at `MC_MAX_RECEIVE_SLOTS`, advertised to this client on
-   * `JoinResponse.max_receive_slots`. A declaration above that cap is REJECTED
-   * WHOLE by MC — never clamped, never accepted as a prefix — so the SDK refuses
-   * an over-cap N locally and loudly before declaring (typed error,
-   * `dt_client_media_receive_slots_rejected_total`), and never shrinks N to fit.
-   * Two quantities, not a duplicate — the `MC_AUDIO_MAX_BITRATE_BPS` /
-   * {@link AudioConfig.defaultBitrateBps} precedent. No copy of the server cap
-   * exists on this side.
-   *
+   * N — audio receive slots. Each participant hears at most N others.
    * CLIENT CEILING: at most `ingress.maxDecodeLanes` (one decode lane per
    * assigned sender), checked by {@link validateMediaConfig}.
-   *
-   * THE DEFAULT (1) IS THE SDK's FALLBACK for an embedder that configures
-   * nothing, NOT the demo topology: `scripts/dev-web.sh`'s `DEMO_RECEIVE_SLOTS`
-   * (the four-participant demo, N=3) always exports `VITE_DT_RECEIVE_SLOTS`, which
-   * the web app reads through {@link parseReceiveSlots}. Two quantities.
-   *
-   * NOT COVERED BY `dt-guard env-config`, which reads `infra/services/**` only:
-   * `VITE_DT_RECEIVE_SLOTS` is a browser-side build knob. The browser suite
-   * asserts the effective N at runtime (`MeetingSession.receiveSlots`) instead.
    */
   readonly audioSlots: number;
+  /** M — video receive slots. Each participant sees at most M others. */
+  readonly videoSlots: number;
 }
 
 /** The SDK's fallback N when an embedder configures none. See {@link ReceiveConfig}. */
 export const DEFAULT_RECEIVE_AUDIO_SLOTS = 1;
 
-/** Whether N came from the embedder's configuration or the SDK default. */
+/**
+ * The SDK's fallback M when an embedder configures none: 0. This SDK has no
+ * video receive path yet (story 3 task 14, C-B, adds it), so a default that
+ * declared video slots would ask MC to direct publishers' video to a client
+ * that cannot read it. Story 3 E6 ruling (lead, 2026-10-21).
+ */
+export const DEFAULT_RECEIVE_VIDEO_SLOTS = 0;
+
+/**
+ * Upper bound on N + M: slot ids are 16-bit (`ReceiveSlot.slot_id`, the same
+ * value space as the relay-region `stream_id`), and ids run `0..N+M-1`.
+ */
+const SLOT_ID_SPACE = 0x1_0000;
+
+/** A receive-slot kind. */
+export type ReceiveSlotKind = MediaKindToken;
+
+/** Whether a slot count came from the embedder's configuration or the SDK default. */
 export type ReceiveSlotsSource = 'configured' | 'default';
 
-/** A parsed N, with where it came from (R-23: absent vs defaulted is visible). */
+/** A parsed slot count, with where it came from (R-23: absent vs defaulted is visible). */
 export interface ParsedReceiveSlots {
   readonly count: number;
   readonly source: ReceiveSlotsSource;
 }
 
 /**
- * The ONE accepted spelling of N: a decimal integer >= 1 with no sign, no
- * leading zero, no whitespace and no fraction. Identical to the class
- * `scripts/dev-web.sh` accepts, so a value that passes the launcher's preflight
- * is read the same way in the browser.
+ * The RETIRED story-2 variable. Setting it is a loud failure, never an alias:
+ * one N cannot say how many of each kind the operator meant.
  */
-const RECEIVE_SLOTS_PATTERN = /^[1-9][0-9]*$/;
+export const RETIRED_RECEIVE_SLOTS_VARIABLE = 'VITE_DT_RECEIVE_SLOTS';
+
+/** The per-kind variables that replace {@link RETIRED_RECEIVE_SLOTS_VARIABLE}. */
+export const RECEIVE_SLOTS_VARIABLES: Readonly<Record<ReceiveSlotKind, string>> = {
+  audio: 'VITE_DT_AUDIO_RECEIVE_SLOTS',
+  video: 'VITE_DT_VIDEO_RECEIVE_SLOTS',
+};
 
 /**
- * Parse a configured N (e.g. `VITE_DT_RECEIVE_SLOTS`). THROWS; never falls back.
- *
- * `undefined` — the knob is ABSENT — yields the SDK default with
- * `source: 'default'`. Anything present must match `^[1-9][0-9]*$`: `0`, `03`,
- * `3.0`, ` 3`, `-1`, the empty string and non-numeric values all throw a
- * {@link ClientConfigError}, because a silently substituted N is a participant
- * who hears fewer people than the operator configured with nothing saying so.
- * The upper bound (`ingress.maxDecodeLanes`) is checked by
- * {@link validateMediaConfig} against the config the value lands in.
+ * THE message for a set retired variable — one home, read by the web app's
+ * config loader and asserted by its test. It names both replacements.
  */
-export function parseReceiveSlots(raw: string | undefined): ParsedReceiveSlots {
+export const RETIRED_RECEIVE_SLOTS_MESSAGE =
+  `${RETIRED_RECEIVE_SLOTS_VARIABLE} is retired and is no longer read: set ` +
+  `${RECEIVE_SLOTS_VARIABLES.audio} (audio receive slots N) and ` +
+  `${RECEIVE_SLOTS_VARIABLES.video} (video receive slots M) instead; each is an integer >= 0`;
+
+/**
+ * The ONE accepted spelling of a slot count: a decimal integer >= 0 with no
+ * sign, no leading zero (other than `0` itself), no whitespace and no fraction.
+ * Identical to the class `scripts/dev-web.sh` accepts, so a value that passes
+ * the launcher's preflight is read the same way in the browser.
+ */
+const RECEIVE_SLOTS_PATTERN = /^(0|[1-9][0-9]*)$/;
+
+/**
+ * Parse a configured slot count for `kind` (e.g. `VITE_DT_AUDIO_RECEIVE_SLOTS`).
+ * THROWS; never falls back.
+ *
+ * `undefined` — the knob is ABSENT — yields that kind's SDK default with
+ * `source: 'default'`. Anything present must match `^(0|[1-9][0-9]*)$`: `03`,
+ * `3.0`, ` 3`, `-1`, the empty string and non-numeric values all throw a
+ * {@link ClientConfigError}, because a silently substituted count is a
+ * participant who hears or sees fewer people than the operator configured with
+ * nothing saying so. Upper bounds are checked by {@link validateMediaConfig}.
+ */
+export function parseReceiveSlots(
+  raw: string | undefined,
+  kind: ReceiveSlotKind,
+): ParsedReceiveSlots {
   if (raw === undefined) {
-    return { count: DEFAULT_RECEIVE_AUDIO_SLOTS, source: 'default' };
+    return {
+      count: kind === 'audio' ? DEFAULT_RECEIVE_AUDIO_SLOTS : DEFAULT_RECEIVE_VIDEO_SLOTS,
+      source: 'default',
+    };
   }
   if (!RECEIVE_SLOTS_PATTERN.test(raw) || !Number.isSafeInteger(Number(raw))) {
     throw new ClientConfigError(
-      'media.receive.audioSlots',
-      `the receive-slot count must be an integer >= 1 written without sign, leading zero, ` +
-        `whitespace or fraction; got ${JSON.stringify(raw.slice(0, 32))}`,
+      `media.receive.${kind}Slots`,
+      `the ${kind} receive-slot count must be an integer >= 0 written without sign, leading ` +
+        `zero, whitespace or fraction; got ${JSON.stringify(raw.slice(0, 32))}`,
     );
   }
   return { count: Number(raw), source: 'configured' };
@@ -580,6 +633,7 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
     },
     receive: {
       audioSlots: DEFAULT_RECEIVE_AUDIO_SLOTS,
+      videoSlots: DEFAULT_RECEIVE_VIDEO_SLOTS,
     },
   },
   telemetry: {
@@ -596,6 +650,12 @@ export class ClientConfigError extends Error {
     super(message);
     this.name = 'ClientConfigError';
     this.configKey = configKey;
+  }
+}
+
+function nonNegativeInteger(value: number, key: string): void {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+    throw new ClientConfigError(key, `${key} must be an integer >= 0, got ${String(value)}`);
   }
 }
 
@@ -656,7 +716,15 @@ export function validateMediaConfig(media: MediaConfig): void {
   positiveInteger(ingress.maxDecodeLanes, 'media.ingress.maxDecodeLanes');
   positiveInteger(ingress.decoderRestartBackoffMs, 'media.ingress.decoderRestartBackoffMs');
   positiveInteger(ingress.decoderPendingFrames, 'media.ingress.decoderPendingFrames');
-  positiveInteger(receive.audioSlots, 'media.receive.audioSlots');
+  nonNegativeInteger(receive.audioSlots, 'media.receive.audioSlots');
+  nonNegativeInteger(receive.videoSlots, 'media.receive.videoSlots');
+  if (receive.audioSlots + receive.videoSlots > SLOT_ID_SPACE) {
+    throw new ClientConfigError(
+      'media.receive.videoSlots',
+      `media.receive.audioSlots + media.receive.videoSlots must not exceed ${SLOT_ID_SPACE}, ` +
+        'the 16-bit slot id space',
+    );
+  }
   // The client-side ceiling on N: every declared slot can be filled by a
   // distinct sender, and each assigned sender needs its own decode lane.
   if (receive.audioSlots > ingress.maxDecodeLanes) {

@@ -11,6 +11,10 @@ import {
   DEFAULT_CLIENT_CONFIG,
   DEFAULT_METRIC_EXPORT_INTERVAL_MS,
   DEFAULT_RECEIVE_AUDIO_SLOTS,
+  DEFAULT_RECEIVE_VIDEO_SLOTS,
+  RECEIVE_SLOTS_VARIABLES,
+  RETIRED_RECEIVE_SLOTS_MESSAGE,
+  RETIRED_RECEIVE_SLOTS_VARIABLE,
   MIN_AUDIO_ROTATION_PERIOD_MS,
   parseReceiveSlots,
   validateMediaConfig,
@@ -197,28 +201,38 @@ describe('the downlink hop-restart bound', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Story 2 R-1 / R-23: the receive-slot count N
+// Story 2 R-1 / R-23, story 3 R-1 / R-23: the per-kind receive-slot counts N, M
 // ---------------------------------------------------------------------------
 
 describe('parseReceiveSlots', () => {
-  it('ABSENT yields the SDK default, marked as the default', () => {
-    expect(parseReceiveSlots(undefined)).toEqual({
+  it("ABSENT yields each kind's SDK default, marked as the default", () => {
+    expect(parseReceiveSlots(undefined, 'audio')).toEqual({
       count: DEFAULT_RECEIVE_AUDIO_SLOTS,
+      source: 'default',
+    });
+    expect(parseReceiveSlots(undefined, 'video')).toEqual({
+      count: DEFAULT_RECEIVE_VIDEO_SLOTS,
       source: 'default',
     });
   });
 
+  it('the video default is 0 until a video receive path exists (story 3 E6)', () => {
+    expect(DEFAULT_RECEIVE_VIDEO_SLOTS).toBe(0);
+  });
+
   it.each([
+    ['0', 0],
     ['1', 1],
     ['3', 3],
     ['32', 32],
-  ])('accepts %j', (raw, count) => {
-    expect(parseReceiveSlots(raw)).toEqual({ count, source: 'configured' });
+  ])('accepts %j for both kinds (0 is legal)', (raw, count) => {
+    expect(parseReceiveSlots(raw, 'audio')).toEqual({ count, source: 'configured' });
+    expect(parseReceiveSlots(raw, 'video')).toEqual({ count, source: 'configured' });
   });
 
   it.each([
     [''],
-    ['0'],
+    ['00'],
     ['03'],
     ['-1'],
     ['+3'],
@@ -231,39 +245,69 @@ describe('parseReceiveSlots', () => {
     ['0x3'],
     ['99999999999999999999'],
   ])('REJECTS %j loudly — never falls back to a default', (raw) => {
-    expect(() => parseReceiveSlots(raw)).toThrow(ClientConfigError);
+    expect(() => parseReceiveSlots(raw, 'audio')).toThrow(ClientConfigError);
+    expect(() => parseReceiveSlots(raw, 'video')).toThrow(ClientConfigError);
+  });
+
+  it('names the kind in the offending key', () => {
+    try {
+      parseReceiveSlots('x', 'video');
+      expect.unreachable();
+    } catch (err) {
+      expect((err as ClientConfigError).configKey).toBe('media.receive.videoSlots');
+    }
+  });
+});
+
+describe('the retired VITE_DT_RECEIVE_SLOTS message', () => {
+  it('names the retired variable and BOTH replacements', () => {
+    expect(RETIRED_RECEIVE_SLOTS_MESSAGE).toContain(RETIRED_RECEIVE_SLOTS_VARIABLE);
+    expect(RETIRED_RECEIVE_SLOTS_MESSAGE).toContain('VITE_DT_AUDIO_RECEIVE_SLOTS');
+    expect(RETIRED_RECEIVE_SLOTS_MESSAGE).toContain('VITE_DT_VIDEO_RECEIVE_SLOTS');
+    expect(RECEIVE_SLOTS_VARIABLES).toEqual({
+      audio: 'VITE_DT_AUDIO_RECEIVE_SLOTS',
+      video: 'VITE_DT_VIDEO_RECEIVE_SLOTS',
+    });
   });
 });
 
 describe('validateMediaConfig — receive slots', () => {
   const media = DEFAULT_CLIENT_CONFIG.media;
+  const withReceive = (audioSlots: number, videoSlots: number): typeof media => ({
+    ...media,
+    receive: { audioSlots, videoSlots },
+  });
 
   it('accepts N up to maxDecodeLanes', () => {
-    expect(() =>
-      validateMediaConfig({
-        ...media,
-        receive: { audioSlots: media.ingress.maxDecodeLanes },
-      }),
-    ).not.toThrow();
+    expect(() => validateMediaConfig(withReceive(media.ingress.maxDecodeLanes, 0))).not.toThrow();
   });
 
   it('rejects N above maxDecodeLanes (the client-side ceiling)', () => {
-    expect(() =>
-      validateMediaConfig({
-        ...media,
-        receive: { audioSlots: media.ingress.maxDecodeLanes + 1 },
-      }),
-    ).toThrow(ClientConfigError);
-  });
-
-  it('rejects a non-positive N', () => {
-    expect(() => validateMediaConfig({ ...media, receive: { audioSlots: 0 } })).toThrow(
+    expect(() => validateMediaConfig(withReceive(media.ingress.maxDecodeLanes + 1, 0))).toThrow(
       ClientConfigError,
     );
   });
 
+  it('accepts 0 of either kind (story 3 R-1)', () => {
+    expect(() => validateMediaConfig(withReceive(0, 0))).not.toThrow();
+    expect(() => validateMediaConfig(withReceive(0, 4))).not.toThrow();
+  });
+
+  it.each([
+    [-1, 0],
+    [0, -1],
+    [1.5, 0],
+    [0, Number.NaN],
+  ])('rejects a negative or non-integer count (%j, %j)', (audio, video) => {
+    expect(() => validateMediaConfig(withReceive(audio, video))).toThrow(ClientConfigError);
+  });
+
+  it('rejects N + M beyond the 16-bit slot id space', () => {
+    expect(() => validateMediaConfig(withReceive(1, 0x1_0000))).toThrow(ClientConfigError);
+  });
+
   it('the default maxDecodeLanes covers the demo topology N', () => {
-    // `scripts/dev-web.sh` DEMO_RECEIVE_SLOTS=3.
+    // `scripts/dev-web.sh` DEMO_AUDIO_RECEIVE_SLOTS=3.
     expect(media.ingress.maxDecodeLanes).toBeGreaterThanOrEqual(3);
   });
 });

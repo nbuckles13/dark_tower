@@ -63,6 +63,8 @@ function startJoin(
     meetingId: 'meet-1',
     joinToken: 'secret-jwt',
     participantName: 'Ada',
+    publishKinds: ['audio'],
+    receiveSlots: [],
     ...overrides,
   });
   return { client, joinPromise };
@@ -208,10 +210,10 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
 
   it.each([
     ['present', 8, 8],
-    ['absent (older MC)', undefined, undefined],
-    ['a present 0 (contract violation), kept as 0', 0, 0],
+    ['absent (caps unknown)', undefined, undefined],
+    ['a present 0 (legal: video off), kept as 0', 0, 0],
   ] as const)(
-    'passes JoinResponse.max_receive_slots through verbatim when %s',
+    'passes JoinResponse.max_{audio,video}_receive_slots through verbatim when %s',
     async (_label, onWire, expected) => {
       const wt = new MockWebTransport();
       const { client, joinPromise } = startJoin(wt);
@@ -222,11 +224,16 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
         framedJoinResponse({
           participantId: 'p-self',
           senderId: 1,
-          ...(onWire !== undefined ? { maxReceiveSlots: onWire } : {}),
+          ...(onWire !== undefined
+            ? { maxAudioReceiveSlots: onWire, maxVideoReceiveSlots: onWire }
+            : {}),
         }),
       );
       const joined = (await joinPromise) as Awaited<ReturnType<SignalingClient['join']>>;
-      expect(joined.maxReceiveSlots).toBe(expected);
+      expect(joined.maxAudioReceiveSlots).toBe(expected);
+      expect(joined.maxVideoReceiveSlots).toBe(expected);
+      // The superseded tag 12 is no longer projected.
+      expect(Object.keys(joined)).not.toContain('maxReceiveSlots');
       client.close();
     },
   );
@@ -449,7 +456,7 @@ describe('SignalingClient — post-join ErrorMessage close rule (story 2 R-8)', 
     expect(errors[0]?.signalingCode).toBe(SignalingErrorCode.Forbidden);
     expect(await closedSoon(wt)).toBe(false);
     // Still usable: a later send goes out.
-    await client.sendMuteRequest(true);
+    await client.sendMuteRequest({ audioMuted: true, videoMuted: false });
   });
 
   it('a post-join UNAUTHORIZED still closes with the typed auth reason', async () => {
@@ -502,6 +509,8 @@ describe('SignalingClient — trace injection (R-19)', () => {
         meetingId: 'm',
         joinToken: 'secret-jwt',
         participantName: 'Ada',
+        publishKinds: ['audio'],
+        receiveSlots: [],
       }),
     );
     wt.simulateReady();
@@ -669,6 +678,8 @@ describe('SignalingClient — lifecycle & teardown', () => {
         meetingId: 'm',
         joinToken: 't',
         participantName: 'n',
+        publishKinds: ['audio'],
+        receiveSlots: [],
       }),
     ).rejects.toBeInstanceOf(SignalingError);
     client.close();
@@ -768,6 +779,10 @@ describe('SignalingClient — lifecycle & teardown', () => {
           }),
         });
       },
+      createUnidirectionalStream(): Promise<WritableStream<Uint8Array>> {
+        return Promise.resolve(new WritableStream<Uint8Array>());
+      },
+      incomingUnidirectionalStreams: new ReadableStream<ReadableStream<Uint8Array>>(),
       close() {},
     };
     const { joinPromise } = startJoin(failingTransport);

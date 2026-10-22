@@ -13,6 +13,26 @@ import type {
   WebTransportCloseInfo,
   WebTransportDatagrams,
 } from './contracts/IWebTransport.js';
+import {
+  MockUniStreams,
+  streamError,
+  type InboundUniStreamHandle,
+  type InboundUniStreamInfo,
+  type OutboundUniStreamInfo,
+} from './mockUniStreams.js';
+
+/**
+ * Width of the length prefix on MC/MH bidi control streams (4-byte big-endian).
+ *
+ * A DELIBERATE, INDEPENDENT COPY of the framing contract whose canonical home is
+ * `packages/sdk-core/src/framing/length-prefix.ts`: test-utils takes no sdk-core
+ * dependency (and must not gain one), and a splitter written separately is a
+ * better oracle than reusing the decoder under test. Drift is caught by
+ * `packages/sdk-core/src/media/__tests__/mhControlChannel.test.ts`, which frames
+ * with sdk-core's `encodeFrame`/`sendFramedMessage` and splits with
+ * {@link MockWebTransport.getOutboundBidiFrames}.
+ */
+const LENGTH_PREFIX_BYTES = 4;
 
 interface CapturedBidiStream {
   readonly index: number;
@@ -78,6 +98,9 @@ export class MockWebTransport implements IWebTransport {
   readonly #datagrams: WebTransportDatagrams;
 
   readonly #bidiStreams: CapturedBidiStream[] = [];
+
+  /** Uni streams, both directions. See `mockUniStreams.ts` for the model. */
+  readonly #uni = new MockUniStreams();
 
   #closed: boolean = false;
 
@@ -180,10 +203,27 @@ export class MockWebTransport implements IWebTransport {
     return stream;
   }
 
+  /**
+   * Open an outgoing uni stream. Indexed in its OWN ordinal space (0 = first
+   * SDK-opened uni stream), separate from bidi and from inbound uni.
+   */
+  async createUnidirectionalStream(): Promise<WritableStream<Uint8Array>> {
+    if (this.#closed) {
+      throw new Error('MockWebTransport: cannot open uni stream on closed transport');
+    }
+    return this.#uni.create();
+  }
+
+  /** Peer-opened uni streams; buffered until the SDK reads them. */
+  get incomingUnidirectionalStreams(): ReadableStream<ReadableStream<Uint8Array>> {
+    return this.#uni.incoming;
+  }
+
   /** Close the transport, resolving the `closed` promise. */
   close(info?: WebTransportCloseInfo): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#uni.end();
     this.#closedResolvers.resolve(info ?? {});
   }
 
@@ -198,6 +238,7 @@ export class MockWebTransport implements IWebTransport {
   simulateClose(code?: number, reason?: string): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#uni.end();
     const info: WebTransportCloseInfo = {
       ...(code !== undefined ? { closeCode: code } : {}),
       ...(reason !== undefined ? { reason } : {}),
@@ -210,6 +251,7 @@ export class MockWebTransport implements IWebTransport {
     this.#readyResolvers.reject(err);
     if (!this.#closed) {
       this.#closed = true;
+      this.#uni.end(err);
       this.#closedResolvers.reject(err);
     }
   }
@@ -308,6 +350,30 @@ export class MockWebTransport implements IWebTransport {
   }
 
   /**
+   * The PEER finishes its send half of bidi stream `streamIndex` (FIN): the
+   * SDK's reader then reads `done`.
+   */
+  simulateBidiStreamEnd(streamIndex: number): void {
+    this.#requireBidi(streamIndex).readableController.close();
+  }
+
+  /**
+   * The PEER resets its send half of bidi stream `streamIndex`: the SDK's next
+   * read rejects with the platform stream-error shape carrying `code`.
+   */
+  simulateBidiStreamReset(streamIndex: number, code: number | null): void {
+    this.#requireBidi(streamIndex).readableController.error(streamError(code));
+  }
+
+  #requireBidi(streamIndex: number): CapturedBidiStream {
+    const stream = this.#bidiStreams[streamIndex];
+    if (stream === undefined) {
+      throw new Error(`MockWebTransport: no bidi stream at index ${streamIndex}`);
+    }
+    return stream;
+  }
+
+  /**
    * Convenience alias for `simulateBidiStream` framed for tests that think
    * in terms of "server message" rather than "raw bytes". Tests responsible
    * for producing the framed envelope (4-byte BE length prefix + protobuf)
@@ -317,7 +383,94 @@ export class MockWebTransport implements IWebTransport {
     this.simulateBidiStream(streamIndex, framedBytes);
   }
 
+  // ---------------- Uni-stream control points ----------------
+
+  /**
+   * Open a peer-initiated (inbound) uni stream and return its handle. Inbound
+   * streams have their OWN ordinal space (0 = first simulated). Buffered on
+   * `incomingUnidirectionalStreams` until the SDK reads it, never dropped.
+   */
+  simulateIncomingUniStream(): InboundUniStreamHandle {
+    return this.#uni.simulateIncoming();
+  }
+
+  /**
+   * Peer STOP_SENDING on outbound uni stream `index`. The SDK's next write
+   * (including one stalled on a pause gate) rejects with the platform
+   * stream-error shape carrying `code`. Recorded as `stopSendingCode`, never as
+   * the SDK's own `ending`.
+   */
+  simulateOutboundUniStopSending(index: number, code: number | null): void {
+    this.#uni.stopSending(index, code);
+  }
+
+  /**
+   * Slow-reader knob for outbound uni stream `index` (PER STREAM): writes stall
+   * until `resumeUniStreamWrites(index)`, so the SDK sees backpressure
+   * (`writer.ready` pending). A stalled write is NOT in the inspector until it
+   * is released. No timers.
+   */
+  pauseUniStreamWrites(index: number): void {
+    this.#uni.pause(index);
+  }
+
+  /** Release `pauseUniStreamWrites(index)`. Idempotent. */
+  resumeUniStreamWrites(index: number): void {
+    this.#uni.resume(index);
+  }
+
   // ---------------- Inspectors ----------------
+
+  /** Every SDK-opened uni stream: accepted chunks, the SDK's ending, any injected stop. */
+  getOutboundUniStreams(): readonly OutboundUniStreamInfo[] {
+    return this.#uni.outboundInfo();
+  }
+
+  /** Every simulated inbound uni stream: the injected peer ending and whether the SDK cancelled. */
+  getInboundUniStreams(): readonly InboundUniStreamInfo[] {
+    return this.#uni.inboundInfo();
+  }
+
+  /**
+   * The length-prefixed messages the SDK wrote on bidi stream `streamIndex`,
+   * as payloads (prefix stripped), split from the concatenated writes.
+   *
+   * THROWS on a truncated trailing frame or a leftover partial prefix, rather
+   * than dropping it: a framing bug must read as a framing bug, never as "N-1
+   * messages were sent". Raw bytes only — test-utils has no protobuf; tests
+   * decode the payloads with sdk-core's generated schemas.
+   */
+  getOutboundBidiFrames(streamIndex: number = 0): readonly Uint8Array[] {
+    const chunks = this.getOutboundBidiWrites(streamIndex);
+    const total = chunks.reduce((n, c) => n + c.byteLength, 0);
+    const buf = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) {
+      buf.set(c, offset);
+      offset += c.byteLength;
+    }
+    const frames: Uint8Array[] = [];
+    let pos = 0;
+    while (pos < buf.byteLength) {
+      if (buf.byteLength - pos < LENGTH_PREFIX_BYTES) {
+        throw new Error(
+          `MockWebTransport: bidi stream ${streamIndex} ends with a partial length prefix ` +
+            `(${buf.byteLength - pos} byte(s))`,
+        );
+      }
+      const len = new DataView(buf.buffer, pos, LENGTH_PREFIX_BYTES).getUint32(0, false);
+      const end = pos + LENGTH_PREFIX_BYTES + len;
+      if (end > buf.byteLength) {
+        throw new Error(
+          `MockWebTransport: bidi stream ${streamIndex} ends with a truncated frame ` +
+            `(declared ${len} byte(s), ${buf.byteLength - pos - LENGTH_PREFIX_BYTES} present)`,
+        );
+      }
+      frames.push(buf.slice(pos + LENGTH_PREFIX_BYTES, end));
+      pos = end;
+    }
+    return frames;
+  }
 
   /** All datagrams written via `datagrams.writable` AND NOT DROPPED, in order. */
   getOutboundDatagrams(): readonly Uint8Array[] {
@@ -395,6 +548,7 @@ export class MockWebTransport implements IWebTransport {
     for (const s of this.#bidiStreams) {
       s.outboundChunks.length = 0;
     }
+    this.#uni.clearCaptures();
   }
 }
 

@@ -325,11 +325,11 @@ describe('lane and assignment states', () => {
   test('a sender with no slot, or a non-active slot, is not_assigned even if a stale lane is ok', () => {
     expect(verdictFor(A, B, bLane, assignedTo(C, D)).kind).toBe('not_assigned');
     const muted: BusSlotAssignment[] = [
-      { slotId: 1, senderId: B.senderId, slotState: 'source_muted' },
+      { slotId: 1, senderId: B.senderId, slotState: 'avatar_client_muted' },
     ];
     const v = verdictFor(A, B, bLane, muted);
     expect(v.kind).toBe('not_assigned');
-    expect(v.detail).toContain("'source_muted'");
+    expect(v.detail).toContain("'avatar_client_muted'");
   });
 
   test('a sender placed in two slots is duplicate_assignment, even with a clean lane', () => {

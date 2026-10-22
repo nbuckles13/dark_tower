@@ -44,16 +44,34 @@ export async function sendFramedMessage<T extends Message & TraceCarrier>(
   schema: GenMessage<T>,
   message: T,
 ): Promise<void> {
-  // R-58: single injection call site (no hand-rolled propagation.inject). Runs
-  // synchronously under whatever context the caller has made active.
+  await writeFrame(stream, encodeFramedMessage(schema, message));
+}
+
+/**
+ * The SYNCHRONOUS half of {@link sendFramedMessage}: trace-inject (under the
+ * caller's active context), serialize and length-prefix. Split out so a caller
+ * that serialises its writes (one writer at a time on a shared stream) can encode
+ * — and capture trace context — at CALL time and queue only the write.
+ *
+ * @throws {FramingError} if the encoded payload is empty or exceeds the cap.
+ */
+export function encodeFramedMessage<T extends Message & TraceCarrier>(
+  schema: GenMessage<T>,
+  message: T,
+): Uint8Array {
   injectIntoClientMessage(message);
-  const bytes = toBinary(schema, message);
-  const frame = encodeFrame(bytes);
+  return encodeFrame(toBinary(schema, message));
+}
+
+/** The write half: acquire the writer, write one framed message, release the lock. */
+export async function writeFrame(
+  stream: WebTransportBidirectionalStream,
+  frame: Uint8Array,
+): Promise<void> {
   const writer = stream.writable.getWriter();
   try {
     await writer.write(frame);
   } finally {
-    // Release immediately — the long-lived connection holds no writable lock.
     writer.releaseLock();
   }
 }

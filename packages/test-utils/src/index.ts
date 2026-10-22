@@ -17,6 +17,7 @@ export type {
   WebTransportBidirectionalStream,
   WebTransportCloseInfo,
   WebTransportDatagrams,
+  WebTransportStreamError,
 } from './contracts/IWebTransport.js';
 
 export type { MetricLabels, MetricsSink } from './contracts/MetricsSink.js';
@@ -38,6 +39,13 @@ export {
 } from './MockOTLPExporter.js';
 
 export { MockWebTransport } from './MockWebTransport.js';
+export {
+  streamError,
+  type InboundUniStreamHandle,
+  type InboundUniStreamInfo,
+  type OutboundUniEnding,
+  type OutboundUniStreamInfo,
+} from './mockUniStreams.js';
 
 export {
   TestTokenBuilder,

@@ -6,12 +6,13 @@
 // stream so the codec and transport are validated together.
 
 import { afterEach, describe, expect, it } from 'vitest';
-import { MockWebTransport } from '@darktower/test-utils';
+import { MockWebTransport, streamError } from '@darktower/test-utils';
 import type {
   IWebTransport,
   WebTransportBidirectionalStream,
   WebTransportCloseInfo,
 } from '../IWebTransport.js';
+import { isWebTransportStreamError } from '../IWebTransport.js';
 import { BrowserWebTransport, connect } from '../BrowserWebTransport.js';
 import { TransportError, TransportErrorCode } from '../errors.js';
 import { encodeFrame, FrameDecoder } from '../../framing/length-prefix.js';
@@ -225,5 +226,23 @@ describe('connect() + BrowserWebTransport runtime behavior', () => {
     // close forwards the optional close-info.
     transport.close({ closeCode: 7, reason: 'done' });
     expect(fake.closeCalls).toEqual([{ closeCode: 7, reason: 'done' }]);
+  });
+});
+
+describe('the platform stream-error shape (one declaration, mock and browser alike)', () => {
+  it('isWebTransportStreamError accepts the shape the test double produces', async () => {
+    expect(isWebTransportStreamError(streamError(7))).toBe(true);
+    const wt = new MockWebTransport();
+    const s = await wt.createUnidirectionalStream();
+    const w = s.getWriter();
+    wt.simulateOutboundUniStopSending(0, 4);
+    const err = await w.write(new Uint8Array([1])).catch((e: unknown) => e);
+    expect(isWebTransportStreamError(err)).toBe(true);
+  });
+
+  it('rejects a session-level or plain error', () => {
+    expect(isWebTransportStreamError(new Error('x'))).toBe(false);
+    expect(isWebTransportStreamError({ name: 'WebTransportError', source: 'session' })).toBe(false);
+    expect(isWebTransportStreamError(undefined)).toBe(false);
   });
 });

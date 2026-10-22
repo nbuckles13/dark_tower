@@ -22,13 +22,11 @@
 // metric/log label. `meeting_id_hash` is a SHA-256 digest of the meeting id (R-32:
 // `crypto.subtle.digest`, never `Math.random`).
 
-import {
-  DEFAULT_CLIENT_CONFIG,
-  transmitRewrapLatencyMs,
-  validateMediaConfig,
-  type MediaConfig,
-  type ReceiveSlotsSource,
-} from '../config/clientConfig.js';
+import { transmitRewrapLatencyMs, type MediaConfig } from '../config/clientConfig.js';
+import { SignalingMediaState } from './signalingMediaState.js';
+import { SlotPlan } from './slotPlan.js';
+import type { SlotPair } from '../signaling/pairing.js';
+import type { PublishKind } from '../signaling/events.js';
 import { AuthApiClient } from '../http/AuthApiClient.js';
 import { bytesToHex } from '../media/frame/hex.js';
 import { MeetingApiClient } from '../http/MeetingApiClient.js';
@@ -40,10 +38,17 @@ import type { MediaTransportOptions } from '../media/events.js';
 import { MeetingIdentity } from '../media/setup/identity.js';
 import { AudioPipeline, type AudioPipelineOptions } from '../media/lifecycle/AudioPipeline.js';
 import { MeetingKekHolder } from '../media/setup/kekSource.js';
-import { kekObserver, rosterInvalidationListener, sendDirectiveListener } from './mediaWiring.js';
-import { classifySlotCap, receiveSlotIdsToDeclare, selectCaptureSource } from './mediaSelection.js';
+import {
+  kekObserver,
+  mhControlSink,
+  rosterInvalidationListener,
+  pipelineListeners,
+  zeroInitDirectiveSeries,
+} from './mediaWiring.js';
+import { declaredSlotIds, selectCaptureSource } from './mediaSelection.js';
 import { readIsHost } from './meetingRole.js';
 import { MediaMetrics } from '../media/setup/mediaMetrics.js';
+import type { MuteSnapshot } from '../media/lifecycle/muteState.js';
 import { RosterIdentityKeys } from '../media/setup/rosterKeys.js';
 import type { ReceiveVerificationRecorder } from '../media/pipeline/receiveVerification.js';
 import { createAudioDecoder, createAudioEncoder } from '../media/setup/opus.js';
@@ -304,14 +309,18 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   #orgId = '';
   /** The embedder's capture factory, if it injected one. See {@link #selectCaptureSource}. */
   readonly #injectedCaptureFactory: CaptureSourceFactory | undefined;
-  readonly #receiveSlotsSource: ReceiveSlotsSource;
   readonly #receiveVerification: ReceiveVerificationRecorder | undefined;
   /**
-   * `JoinResponse.max_receive_slots` from THIS session's join, verbatim
-   * (`undefined` = absent). Per session by construction: a `MeetingSession` is
-   * single-use per join, so nothing is carried across joins.
+   * What this session publishes and declares, and the caps its join reported —
+   * resolved and frozen at construction (story 3 R-1, R-2). See `slotPlan.ts`.
    */
-  #advertisedSlotCap: number | undefined;
+  readonly #slots: SlotPlan;
+  /**
+   * Signalling-derived media state: the E3 directive/assignments cache, server
+   * mute per participant, the R-18 tracker and client mute. See
+   * `signalingMediaState.ts`.
+   */
+  readonly #mediaState: SignalingMediaState;
   #captureSource: CaptureSourceInfo | undefined;
   /**
    * Whether the meeting token names this participant host — a UI HINT for the
@@ -338,14 +347,12 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     this.#connectTimeoutMs = options.connectTimeoutMs;
     this.#joinTimeoutMs = options.joinTimeoutMs;
     this.#metricsSink = options.metricsSink ?? getMetricsSink();
-    const baseMedia = options.mediaConfig ?? DEFAULT_CLIENT_CONFIG.media;
-    this.#mediaConfig = options.receiveSlots
-      ? { ...baseMedia, receive: { ...baseMedia.receive, audioSlots: options.receiveSlots.count } }
-      : baseMedia;
-    // At the boundary, BEFORE N is used: an out-of-ceiling N throws typed, here.
-    validateMediaConfig(this.#mediaConfig);
-    this.#receiveSlotsSource =
-      options.receiveSlots?.source ?? (options.mediaConfig ? 'configured' : 'default');
+    // At the boundary, BEFORE N and M are used: every refusal throws typed, here.
+    this.#slots = new SlotPlan(options);
+    this.#mediaConfig = this.#slots.mediaConfig;
+    this.#mediaState = new SignalingMediaState((kind) =>
+      this.emit('captureResumedAfterServerMute', { kind }),
+    );
     this.#receiveVerification = options.receiveVerification;
     this.#kekSource = new MeetingKekHolder({
       rewrapLatencyMs: transmitRewrapLatencyMs(this.#mediaConfig),
@@ -385,6 +392,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     const mediaMetrics = this.#buildMediaMetrics();
     this.#mediaMetrics = mediaMetrics;
     this.#kekSource.setObserver(kekObserver(mediaMetrics.session));
+    zeroInitDirectiveSeries(mediaMetrics, this.#slots.publish);
     let stage: FailureStage = FailureStage.Internal;
     try {
       // --- fetching-token: auth + GC meeting token ---
@@ -449,7 +457,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       // --- joining: active/active MH handshake + MediaConnectionUpdate ---
       this.#setState(MeetingSessionState.Joining);
       stage = FailureStage.MhConnect;
-      const media = this.#createMedia(signaling);
+      const media = this.#createMedia(signaling, mediaMetrics);
       this.#media = media;
       let firstMh = true;
       media.on('connected', (url) => {
@@ -473,7 +481,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
 
       // --- joined ---
       this.#senderId = joined.senderId;
-      this.#advertisedSlotCap = joined.maxReceiveSlots;
+      this.#slots.joined(joined.maxAudioReceiveSlots, joined.maxVideoReceiveSlots);
       // OUR OWN key goes into the roster resolver, and this is NOT a self-trust
       // branch.
       //
@@ -558,15 +566,6 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     // — the dimension ADR-0036 §11 bars from every media emission.
     const metrics = this.#mediaMetrics ?? this.#buildMediaMetrics();
 
-    // Zero-initialised, so `rate()` has a series before the first refusal.
-    // Audio only: no video handle exists yet (see `MediaMetrics`).
-    metrics.audio.receiveSlotsRejected(0);
-    const slotIds = receiveSlotIdsToDeclare({
-      count: this.#mediaConfig.receive.audioSlots,
-      source: this.#receiveSlotsSource,
-      cap: classifySlotCap(this.#advertisedSlotCap),
-      metrics: metrics.audio,
-    });
     const capture = selectCaptureSource(this.#injectedCaptureFactory, senderId);
     const media = this.#media;
     const pipelineOptions: AudioPipelineOptions = {
@@ -577,14 +576,16 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         this.#rosterKeys ?? new RosterIdentityKeys(this.#mediaConfig.ingress.maxCachedIdentityKeys),
       senderId,
       identity,
-      declaredSlotIds: slotIds,
+      // Receive side only: the audio ids of the ONE declaration.
+      declaredSlotIds: declaredSlotIds(this.#slots.declaration, 'audio'),
       senderFor: (url) => media?.getDatagramChannel(url),
       readableFor: (url) => media?.getDatagramChannel(url)?.readable,
-      reportMute: (audioMuted) => {
+      mute: this.#mediaState.mute,
+      reportMute: (state) => {
         // Informational and deliberately best-effort: ADR-0036 §5 requires
         // client mute to hold WITHOUT the server honouring it, so a failed
-        // report must not undo the local suppression.
-        void signaling.sendMuteRequest(audioMuted).catch(() => {
+        // report must not undo the local suppression. Both kinds, explicit.
+        void signaling.sendMuteRequest(state).catch(() => {
           // Nothing actionable, and nothing safe to log about a mute report.
         });
       },
@@ -614,32 +615,27 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     pipeline.on('firstMediaFrame', (elapsedMs) => this.emit('firstMediaFrame', elapsedMs));
     pipeline.on('fault', (fault) => this.emit('mediaFault', fault));
 
-    // What MC directs this client to SEND. The listener carries the load-bearing
-    // empty-directive rule (forward secrecy) — see `mediaWiring.ts`.
-    signaling.on(
-      'sendDirective',
-      sendDirectiveListener(pipeline, this.#mediaConfig.audio.defaultBitrateBps),
+    // What MC directs this client to SEND (per published kind) and which slots
+    // it RECEIVES, wired by `mediaWiring.ts:pipelineListeners`; E3: what MC
+    // already sent is replayed ONCE as they attach, later updates go through.
+    this.#mediaState.attach(
+      pipelineListeners({
+        publish: this.#slots.publish,
+        pipeline,
+        defaultBitrateBps: this.#mediaConfig.audio.defaultBitrateBps,
+        metrics,
+        fault: (fault) => this.emit('mediaFault', fault),
+        effectiveTargets: (kind, nonEmpty) => this.#mediaState.effectiveTargets(kind, nonEmpty),
+      }),
     );
-    // RECEIVING comes from the slot assignments, independently of the send
-    // directive: a participant nobody holds gets an empty target set and must
-    // still hear the slots it holds. Subscribed before the declaration below,
-    // because MC's first `StreamAssignments` answers that declaration.
-    signaling.on('streamAssignments', (event) => {
-      // Slot, sender and handler travel together: the handler URLs pick the
-      // receive transports and the slot -> sender pairs are the slot-edge gate.
-      pipeline.setReceiveAssignments(
-        event.assignments.map((a) => ({
-          slotId: a.slotId,
-          senderId: a.senderId,
-          mediaHandlerUrl: a.mediaHandlerUrl,
-          active: a.slotState === 'active',
-        })),
-      );
-    });
 
-    await signaling.sendReceiveCapability(
-      slotIds.map((slotId) => ({ slotId, mediaKind: 'audio' as const })),
-    );
+    // TRANSITIONAL (C-A1 shim a) — deleted by C-A2 (story 3 task 13). The
+    // controller in service before MC-A ignores the join-carried declaration and
+    // emits the directive and assignments only when a post-join
+    // `ReceiveCapability` arrives, so send one, IDENTICAL to the join-carried
+    // declaration (the same frozen value). After MC-A it is a legal no-op
+    // redeclaration (`accepted_unchanged`).
+    await signaling.sendReceiveCapability(this.#slots.declaration);
     await pipeline.start(options.deviceId !== undefined ? { deviceId: options.deviceId } : {});
     return pipeline;
   }
@@ -683,11 +679,48 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
    * readable at runtime. Numbers and a bounded source token only.
    */
   get receiveSlots(): ReceiveSlotsDiagnostics {
-    return {
-      declared: this.#mediaConfig.receive.audioSlots,
-      source: this.#receiveSlotsSource,
-      serverCap: classifySlotCap(this.#advertisedSlotCap),
-    };
+    return this.#slots.diagnostics();
+  }
+
+  /**
+   * The participant pairing view (story 3 R-3): sender id -> the audio and video
+   * slots naming that sender, from MC's LATEST assignments. Pairing is by
+   * publisher, never by slot index. Live video slots name no sender, so they
+   * do not appear (story 3 C-B adds live-video pairing from verified frames).
+   */
+  get slotPairing(): ReadonlyMap<number, SlotPair> {
+    return this.#mediaState.slotPairing;
+  }
+
+  /**
+   * AUDIO client mute (ADR-0036 §5); never touches video. Through the running
+   * pipeline when there is one (capture-side enforcement).
+   */
+  setAudioMuted(muted: boolean): void {
+    if (this.#pipeline) this.#pipeline.setAudioMuted(muted);
+    else this.#clientMuteChanged(this.#mediaState.setClientMute('audio', muted));
+  }
+
+  /**
+   * VIDEO client mute (story 3 R-15, R-17); never touches audio. No video
+   * capture until story 3 C-A2: state, `muteChanged` and the both-kinds report.
+   */
+  setVideoMuted(muted: boolean): void {
+    this.#clientMuteChanged(this.#mediaState.setClientMute('video', muted));
+  }
+
+  /** The current client-mute state, both kinds. */
+  get muteState(): MuteSnapshot {
+    return this.#mediaState.mute.snapshot();
+  }
+
+  #clientMuteChanged(snapshot: MuteSnapshot | undefined): void {
+    if (!snapshot) return;
+    this.emit('muteChanged', snapshot);
+    // Informational, best-effort, both kinds explicit (see `startMedia`).
+    if (this.#state === MeetingSessionState.Joined) {
+      void this.#signaling?.sendMuteRequest(snapshot).catch(() => undefined);
+    }
   }
 
   /**
@@ -722,14 +755,24 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
 
   /**
    * Ask MC to server-mute (`muted = true`) or lift a server mute on another
-   * participant (ADR-0036 §5, story 2 R-8). Carries target and action only; MC
-   * identifies the requester from the connection and refuses a non-host with a
-   * post-join `FORBIDDEN` session `error` (the connection stays up).
+   * participant's `kind` (ADR-0036 §5, story 2 R-8, story 3 R-15). Carries
+   * target and action only; MC identifies the requester from the connection and
+   * refuses a non-host with a post-join `FORBIDDEN` session `error` (the
+   * connection stays up).
+   *
+   * BOTH KINDS ARE SENT (until MC-B): the other kind carries the target's
+   * CURRENT server-mute state from its latest `ParticipantMuteUpdate` — known
+   * after join, since MC replays every server-muted participant's flags — so a
+   * request about one kind never changes the other (`signaling/muteRequest.ts`).
    *
    * @throws {SignalingError} `Transport` if called before a settled join.
    */
-  async setServerMute(participantId: string, muted: boolean): Promise<void> {
-    await this.#requireJoinedSignaling('setServerMute').sendServerMuteRequest(participantId, muted);
+  async setServerMute(participantId: string, kind: PublishKind, muted: boolean): Promise<void> {
+    const signaling = this.#requireJoinedSignaling('setServerMute');
+    await signaling.sendServerMuteRequest(
+      participantId,
+      this.#mediaState.serverMuteRequest(participantId, kind, muted),
+    );
   }
 
   /**
@@ -906,6 +949,9 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       rosterKeys: this.#rosterKeys,
     };
     const signaling = new SignalingClient(opts);
+    // Signalling-derived media state first, so the pipeline sees an update no
+    // later than an embedder (`signalingMediaState.ts`).
+    this.#mediaState.observe(signaling);
     signaling.on('participantJoined', (e) => this.emit('participantJoined', e));
     signaling.on('participantLeft', (e) => this.emit('participantLeft', e));
     signaling.on('error', (e) => this.emit('error', e));
@@ -934,6 +980,9 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         joinToken: joinResp.token,
         participantName,
         ...(this.#identity?.publicKey ? { identityPublicKey: this.#identity.publicKey } : {}),
+        // The frozen fields, never the options object (story 3 R-2).
+        publishKinds: this.#slots.publish,
+        receiveSlots: this.#slots.declaration,
       });
       this.#emitSignalingConnection('success', CloseReason.Normal);
       this.#histogram('dt_client_time_to_signaling_ready_ms');
@@ -944,7 +993,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     }
   }
 
-  #createMedia(signaling: SignalingClient): MediaTransport {
+  #createMedia(signaling: SignalingClient, metrics: MediaMetrics): MediaTransport {
     const egress = this.#mediaConfig.egress;
     const opts: MediaTransportOptions = {
       clock: this.#clock,
@@ -959,6 +1008,13 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         incomingHighWaterMark: this.#mediaConfig.ingress.transportIncomingHighWaterMarkFrames,
       },
       runInContext: (fn) => signaling.runInJoinContext(fn),
+      // The MH control channel's input (story 3): every keyframe request is
+      // refused `not_sending` until C-A2; malformed input is counted.
+      controlSink: mhControlSink({
+        metrics,
+        publish: this.#slots.publish,
+        latestDirective: () => this.#mediaState.latestDirective,
+      }),
       ...(this.#connectFn ? { connect: this.#connectFn } : {}),
       ...(this.#connectTimeoutMs !== undefined ? { connectTimeoutMs: this.#connectTimeoutMs } : {}),
       ...(this.#metricsSink ? { metricsSink: this.#metricsSink } : {}),

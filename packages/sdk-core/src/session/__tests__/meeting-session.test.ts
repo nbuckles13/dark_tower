@@ -16,17 +16,20 @@ import {
   type MockWebTransport,
 } from '@darktower/test-utils';
 
+import { create, toBinary } from '@bufbuild/protobuf';
+
 import { MeetingSession } from '../MeetingSession.js';
+import { encodeFrame } from '../../framing/length-prefix.js';
 import { RosterIdentityKeys } from '../../media/setup/rosterKeys.js';
 import { MeetingSessionState } from '../events.js';
 import type { JoinCredentials, MeetingSessionOptions } from '../events.js';
 import { MediaConnectionError } from '../../errors/MediaConnectionError.js';
 import { SignalingError, SignalingErrorCode } from '../../errors/SignalingError.js';
-import type { SdkError } from '../../errors/SdkError.js';
 import {
   ClientConfigError,
   DEFAULT_CLIENT_CONFIG,
   DEFAULT_RECEIVE_AUDIO_SLOTS,
+  DEFAULT_RECEIVE_VIDEO_SLOTS,
 } from '../../config/clientConfig.js';
 import { selectCaptureSource } from '../mediaSelection.js';
 import { createMicrophoneCapture } from '../../media/setup/capture.js';
@@ -36,7 +39,13 @@ import {
   readGrandfatheredRoster,
 } from '../../__tests__/joinLabelRoster.js';
 import { MeetingUnauthorizedError } from '../../errors/MeetingError.js';
-import { ConnectionState, SlotState } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
+import {
+  ConnectionState,
+  KeyframeRequestSchema,
+  MediaKind,
+  MhServerMessageSchema,
+  SlotState,
+} from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type { FetchLike } from '../../http/types.js';
 import {
   configureTelemetry,
@@ -424,7 +433,10 @@ describe('MeetingSession — join metrics (R-24/R-25 M2)', () => {
     sink.assertCounterAtLeast('dt_client_mh_connection_total', { status: 'success' }, 2);
 
     // Label set: client_version + org_id + 16-hex meeting_id_hash; no PII.
-    const sample = sink.getRecordedMetrics()[0]!;
+    // The join-flow sample (media zero-initialisations carry the media set, not this one).
+    const sample = sink
+      .getRecordedMetrics()
+      .find((m) => m.name === 'dt_client_join_attempts_total')!;
     expect(sample.labels['org_id']).toBe('demo');
     expect(sample.labels['client_version']).toBe('0.0.0-test');
     expect(sample.labels['meeting_id_hash']).toMatch(/^[0-9a-f]{16}$/);
@@ -1447,8 +1459,9 @@ describe('MeetingSession — media absence-signals (ADR-0036 §5/§6/§10)', () 
 
     await waitFor(() => seen.length === 3);
     expect(seen).toEqual([
-      { slotId: 0, slotState: 'source_muted' },
-      { slotId: 1, slotState: 'withheld_congestion' },
+      // Legacy SOURCE_MUTED with no mute update: shim (b)'s fail-closed default.
+      { slotId: 0, slotState: 'avatar_client_muted' },
+      { slotId: 1, slotState: 'withheld_by_congestion' },
       { slotId: 2, slotState: 'source_unreachable' },
     ]);
 
@@ -1587,91 +1600,221 @@ describe('MeetingSession — media absence-signals (ADR-0036 §5/§6/§10)', () 
 // capture-source selection (R-1, R-7, R-23)
 // ---------------------------------------------------------------------------
 
-describe('MeetingSession — receive slots N and the server cap (story 2 R-1, R-23)', () => {
+describe('MeetingSession — publish set, per-kind receive slots and caps (story 3 R-1, R-2, R-23)', () => {
   const KEK = new Uint8Array(32).fill(0x11);
 
   async function joinedWith(opts: {
-    readonly receiveSlots?: { count: number; source: 'configured' | 'default' };
-    readonly maxReceiveSlots?: number;
-    readonly injectCapture?: boolean;
+    readonly audio?: { count: number; source: 'configured' | 'default' };
+    readonly video?: { count: number; source: 'configured' | 'default' };
+    readonly publish?: readonly ('audio' | 'video')[];
+    readonly maxAudioReceiveSlots?: number;
+    readonly maxVideoReceiveSlots?: number;
   }): Promise<{
     session: MeetingSession;
     mocks: Map<string, MockWebTransport>;
     sink: InMemoryMetricsSink;
   }> {
     const mocks = new Map<string, MockWebTransport>();
-    const capture = new FakeCaptureSource();
     const codecs = new FakeAudioCodecs();
-    const playback = new RecordingPlaybackSink();
     const sink = new InMemoryMetricsSink();
     const session = makeSession(mocks, {
       metricsSink: sink,
-      ...(opts.injectCapture === false ? {} : { captureFactory: async () => capture as never }),
+      captureFactory: async () => new FakeCaptureSource() as never,
       encoderFactory: codecs.encoderFactory as never,
       decoderFactory: codecs.decoderFactory as never,
-      playbackFactory: playback.factory as never,
-      ...(opts.receiveSlots ? { receiveSlots: opts.receiveSlots } : {}),
+      playbackFactory: new RecordingPlaybackSink().factory as never,
+      ...(opts.audio ? { audioReceiveSlots: opts.audio } : {}),
+      ...(opts.video ? { videoReceiveSlots: opts.video } : {}),
+      ...(opts.publish ? { publish: opts.publish } : {}),
     });
     const joining = session.join({
       meetingCode: MEETING_CODE,
       orgSubdomain: 'acme',
       credentials: LOGIN,
     });
-    await waitFor(() => mocks.has(MC_ENDPOINT));
-    const mc = mocks.get(MC_ENDPOINT)!;
-    mc.simulateReady();
-    await waitFor(() => mc.getOpenedBidiStreams().length > 0);
-    mc.simulateServerMessage(
-      0,
-      framedJoinResponse({
-        mediaServers: MEDIA_SERVERS,
-        senderId: 258,
-        meetingKek: KEK,
-        kekGeneration: 0,
-        ...(opts.maxReceiveSlots !== undefined ? { maxReceiveSlots: opts.maxReceiveSlots } : {}),
-      }),
-    );
-    await waitFor(() => MEDIA_SERVERS.every((u) => mocks.has(u)));
-    for (const url of MEDIA_SERVERS) mocks.get(url)!.simulateReady();
+    await driveJoin(mocks, 'all', {
+      senderId: 258,
+      meetingKek: KEK,
+      ...(opts.maxAudioReceiveSlots !== undefined
+        ? { maxAudioReceiveSlots: opts.maxAudioReceiveSlots }
+        : {}),
+      ...(opts.maxVideoReceiveSlots !== undefined
+        ? { maxVideoReceiveSlots: opts.maxVideoReceiveSlots }
+        : {}),
+    });
     await joining;
     return { session, mocks, sink };
   }
 
-  function declaredSlots(mocks: Map<string, MockWebTransport>): number[] | undefined {
-    const capability = decodeOutboundClientMessages(
-      mocks.get(MC_ENDPOINT)!.getOutboundBidiWrites(0),
-    ).find((m) => m.message.case === 'receiveCapability');
-    if (capability?.message.case !== 'receiveCapability') return undefined;
-    return capability.message.value.slots.map((s) => s.slotId);
+  function outbound(mocks: Map<string, MockWebTransport>) {
+    return decodeOutboundClientMessages(mocks.get(MC_ENDPOINT)!.getOutboundBidiWrites(0));
   }
 
-  function rejectedCount(sink: InMemoryMetricsSink): number {
-    return sink
-      .getRecordedMetrics()
-      .filter((m) => m.name === 'dt_client_media_receive_slots_rejected_total')
-      .reduce((sum, m) => sum + m.value, 0);
+  function joinRequest(mocks: Map<string, MockWebTransport>) {
+    const join = outbound(mocks).find((m) => m.message.case === 'joinRequest');
+    if (join?.message.case !== 'joinRequest') throw new Error('no JoinRequest was sent');
+    return join.message.value;
   }
 
-  it('declares slots 0..N-1 for the configured N, within the advertised cap', async () => {
+  /** (slot id, wire kind) pairs of a `ReceiveCapability`, in wire order. */
+  function slotsOf(capability: { slots: { slotId: number; mediaKind: MediaKind }[] } | undefined) {
+    return capability?.slots.map((s) => [s.slotId, s.mediaKind]);
+  }
+
+  it('the JOIN carries the publish set and the declaration: audio 0..N-1 then video N..N+M-1, in id order', async () => {
     vi.spyOn(console, 'info').mockImplementation(() => {});
     const rig = await joinedWith({
-      receiveSlots: { count: 3, source: 'configured' },
-      maxReceiveSlots: 8,
+      audio: { count: 2, source: 'configured' },
+      video: { count: 3, source: 'configured' },
+    });
+    const join = joinRequest(rig.mocks);
+    expect(join.publishKinds).toEqual([MediaKind.AUDIO]);
+    expect(slotsOf(join.receiveCapability)).toEqual([
+      [0, MediaKind.AUDIO],
+      [1, MediaKind.AUDIO],
+      [2, MediaKind.VIDEO_CAMERA],
+      [3, MediaKind.VIDEO_CAMERA],
+      [4, MediaKind.VIDEO_CAMERA],
+    ]);
+    rig.session.disconnect();
+  });
+
+  it.each([
+    [
+      'N = 0',
+      0,
+      2,
+      [
+        [0, MediaKind.VIDEO_CAMERA],
+        [1, MediaKind.VIDEO_CAMERA],
+      ],
+    ],
+    [
+      'M = 0',
+      2,
+      0,
+      [
+        [0, MediaKind.AUDIO],
+        [1, MediaKind.AUDIO],
+      ],
+    ],
+  ] as const)('a kind may declare 0 slots (%s)', async (_label, n, m, expected) => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({
+      audio: { count: n, source: 'configured' },
+      video: { count: m, source: 'configured' },
+    });
+    expect(slotsOf(joinRequest(rig.mocks).receiveCapability)).toEqual(expected);
+    rig.session.disconnect();
+  });
+
+  it('TRANSITIONAL shim (a): the post-join ReceiveCapability is IDENTICAL to the join-carried one', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({
+      audio: { count: 2, source: 'configured' },
+      video: { count: 1, source: 'configured' },
     });
     await rig.session.startMedia();
-    expect(declaredSlots(rig.mocks)).toEqual([0, 1, 2]);
-    expect(rig.session.receiveSlots).toEqual({
-      declared: 3,
-      source: 'configured',
-      serverCap: { state: 'known', value: 8 },
+    const redeclared = outbound(rig.mocks).find((m) => m.message.case === 'receiveCapability');
+    expect(redeclared?.message.case).toBe('receiveCapability');
+    expect(slotsOf(redeclared?.message.value as never)).toEqual(
+      slotsOf(joinRequest(rig.mocks).receiveCapability),
+    );
+    rig.session.disconnect();
+  });
+
+  it('the publish set is COPIED and FROZEN: mutating the caller array changes nothing', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const publish: ('audio' | 'video')[] = ['audio'];
+    const rig = await joinedWith({ publish });
+    publish.length = 0;
+    expect(rig.session.receiveSlots.publish).toEqual(['audio']);
+    expect(Object.isFrozen(rig.session.receiveSlots.publish)).toBe(true);
+    expect(joinRequest(rig.mocks).publishKinds).toEqual([MediaKind.AUDIO]);
+    rig.session.disconnect();
+  });
+
+  it('refuses a VIDEO publish at construction with a typed "not yet supported" error', () => {
+    const mocks = new Map<string, MockWebTransport>();
+    let err: unknown;
+    try {
+      makeSession(mocks, { publish: ['audio', 'video'] });
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(SignalingError);
+    expect((err as SignalingError).signalingCode).toBe(SignalingErrorCode.PublishKindNotSupported);
+    expect(mocks.size).toBe(0);
+  });
+
+  it('refuses a duplicate publish kind, typed', () => {
+    expect(() => makeSession(new Map(), { publish: ['audio', 'audio'] })).toThrow(SignalingError);
+  });
+
+  it('refuses "publishes nothing and declares 0 + 0" LOCALLY, typed, before any dial', () => {
+    const mocks = new Map<string, MockWebTransport>();
+    let err: unknown;
+    try {
+      makeSession(mocks, {
+        publish: [],
+        audioReceiveSlots: { count: 0, source: 'configured' },
+        videoReceiveSlots: { count: 0, source: 'configured' },
+      });
+    } catch (e) {
+      err = e;
+    }
+    expect((err as SignalingError).signalingCode).toBe(
+      SignalingErrorCode.NothingToPublishOrReceive,
+    );
+    expect(mocks.size).toBe(0);
+  });
+
+  it('a receive-only participant (publishes nothing, declares slots) is NOT refused', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({ publish: [], audio: { count: 1, source: 'configured' } });
+    expect(joinRequest(rig.mocks).publishKinds).toEqual([]);
+    rig.session.disconnect();
+  });
+
+  it('per-kind caps are readable, alongside effective N, M and the publish set', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({
+      audio: { count: 3, source: 'configured' },
+      video: { count: 2, source: 'configured' },
+      maxAudioReceiveSlots: 8,
+      maxVideoReceiveSlots: 0,
     });
-    // Zero-initialised, never incremented.
-    expect(rejectedCount(rig.sink)).toBe(0);
+    expect(rig.session.receiveSlots).toEqual({
+      publish: ['audio'],
+      audio: { declared: 3, source: 'configured', serverCap: { state: 'known', value: 8 } },
+      // 0 is LEGAL (video off) and stays known-0, never folded into unknown.
+      video: { declared: 2, source: 'configured', serverCap: { state: 'known', value: 0 } },
+    });
+    rig.session.disconnect();
+  });
+
+  it('ABSENT caps (an MC that does not send them) read as unknown, never coerced to 0', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({});
+    expect(rig.session.receiveSlots.audio.serverCap).toEqual({ state: 'unknown' });
+    expect(rig.session.receiveSlots.video.serverCap).toEqual({ state: 'unknown' });
+    rig.session.disconnect();
+  });
+
+  it('OVER-CAP IS NOT REFUSED LOCALLY: the whole declaration is sent and the retired counter never emits', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({
+      audio: { count: 5, source: 'configured' },
+      maxAudioReceiveSlots: 4,
+    });
+    await rig.session.startMedia();
+    expect(slotsOf(joinRequest(rig.mocks).receiveCapability)).toHaveLength(5);
+    expect(rig.session.media).toBeDefined();
     expect(
       rig.sink
         .getRecordedMetrics()
         .some((m) => m.name === 'dt_client_media_receive_slots_rejected_total'),
-    ).toBe(true);
+    ).toBe(false);
     rig.session.disconnect();
   });
 
@@ -1679,109 +1822,62 @@ describe('MeetingSession — receive slots N and the server cap (story 2 R-1, R-
     const mocks = new Map<string, MockWebTransport>();
     const ceiling = DEFAULT_CLIENT_CONFIG.media.ingress.maxDecodeLanes;
     expect(() =>
-      makeSession(mocks, { receiveSlots: { count: ceiling + 1, source: 'configured' } }),
+      makeSession(mocks, { audioReceiveSlots: { count: ceiling + 1, source: 'configured' } }),
     ).toThrow(ClientConfigError);
-    // Nothing was dialled, so nothing could have been declared.
     expect(mocks.size).toBe(0);
   });
 
-  it('accepts N exactly at the cap', async () => {
+  it('reports the SDK defaults with source "default" when nothing is configured', async () => {
     vi.spyOn(console, 'info').mockImplementation(() => {});
-    const rig = await joinedWith({
-      receiveSlots: { count: 4, source: 'configured' },
-      maxReceiveSlots: 4,
+    const rig = await joinedWith({});
+    expect(rig.session.receiveSlots.audio).toMatchObject({
+      declared: DEFAULT_RECEIVE_AUDIO_SLOTS,
+      source: 'default',
     });
-    await rig.session.startMedia();
-    expect(declaredSlots(rig.mocks)).toEqual([0, 1, 2, 3]);
-    rig.session.disconnect();
-  });
-
-  it('refuses N above the cap LOUDLY — typed, counted, nothing declared, never shrunk', async () => {
-    vi.spyOn(console, 'info').mockImplementation(() => {});
-    const rig = await joinedWith({
-      receiveSlots: { count: 5, source: 'configured' },
-      maxReceiveSlots: 4,
+    expect(rig.session.receiveSlots.video).toMatchObject({
+      declared: DEFAULT_RECEIVE_VIDEO_SLOTS,
+      source: 'default',
     });
-    const err = await rig.session.startMedia().then(
-      () => undefined,
-      (e: unknown) => e,
-    );
-    expect(err).toBeInstanceOf(SignalingError);
-    expect((err as SignalingError).signalingCode).toBe(SignalingErrorCode.ReceiveSlotsOverCap);
-    // Both quantities in the message, numbers only.
-    expect((err as SignalingError).message).toContain('5');
-    expect((err as SignalingError).message).toContain('4');
-    // The redaction allowlist carries no cause and no payload.
-    expect(Object.keys((err as SignalingError).toJSON()).sort()).not.toContain('cause');
-    expect(rejectedCount(rig.sink)).toBe(1);
-    // NO declaration at all — never a prefix, never one silent slot.
-    expect(declaredSlots(rig.mocks)).toBeUndefined();
-    expect(rig.session.media).toBeUndefined();
     rig.session.disconnect();
   });
 
-  it('declares when the cap is ABSENT (older MC): cap unknown, MC is the backstop', async () => {
-    vi.spyOn(console, 'info').mockImplementation(() => {});
-    const rig = await joinedWith({ receiveSlots: { count: 5, source: 'configured' } });
-    await rig.session.startMedia();
-    expect(declaredSlots(rig.mocks)).toEqual([0, 1, 2, 3, 4]);
-    expect(rig.session.receiveSlots.serverCap).toEqual({ state: 'unknown' });
-    expect(rejectedCount(rig.sink)).toBe(0);
-
-    // THE BACKSTOP IS LOUD TOO (R-1): MC rejects the whole declaration with an
-    // ErrorMessage, which surfaces as a session `error` carrying the server code
-    // — never parsed for its text, never a silent single slot.
-    const errors: SdkError[] = [];
-    rig.session.on('error', (e) => errors.push(e));
-    rig.mocks
-      .get(MC_ENDPOINT)!
-      .simulateServerMessage(
-        0,
-        framedError(ErrorCode.INVALID_REQUEST, 'receive capability rejected: too many slots'),
-      );
-    await waitFor(() => errors.length === 1);
-    expect(errors[0]?.toJSON().serverCode).toBe('INVALID_REQUEST');
-    expect(rig.session.media?.assignedSenders).toEqual([]);
-    rig.session.disconnect();
-  });
-
-  it('surfaces a PRESENT 0 cap loudly and distinctly, then proceeds as unknown', async () => {
-    vi.spyOn(console, 'info').mockImplementation(() => {});
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const rig = await joinedWith({
-      receiveSlots: { count: 2, source: 'configured' },
-      maxReceiveSlots: 0,
-    });
-    expect(rig.session.receiveSlots.serverCap).toEqual({ state: 'invalid', value: 0 });
-    await rig.session.startMedia();
-    // Not "refuse everything": the declaration goes out.
-    expect(declaredSlots(rig.mocks)).toEqual([0, 1]);
-    const warned = warn.mock.calls.map((c) => c.join(' '));
-    expect(warned.some((line) => line.includes('[dt-media-slots]') && line.includes('0'))).toBe(
-      true,
-    );
-    rig.session.disconnect();
-  });
-
-  it('reports the SDK default N with source "default" when nothing is configured', async () => {
-    vi.spyOn(console, 'info').mockImplementation(() => {});
-    const rig = await joinedWith({ maxReceiveSlots: 8 });
-    await rig.session.startMedia();
-    expect(rig.session.receiveSlots.declared).toBe(DEFAULT_RECEIVE_AUDIO_SLOTS);
-    expect(rig.session.receiveSlots.source).toBe('default');
-    expect(declaredSlots(rig.mocks)).toEqual([0]);
-    rig.session.disconnect();
-  });
-
-  it('logs N with its source and the cap as numbers only', async () => {
+  it('logs the publish set, N, M and both caps as numbers and fixed tokens only', async () => {
     const info = vi.spyOn(console, 'info').mockImplementation(() => {});
     const rig = await joinedWith({
-      receiveSlots: { count: 2, source: 'configured' },
-      maxReceiveSlots: 8,
+      audio: { count: 2, source: 'configured' },
+      video: { count: 1, source: 'configured' },
+      maxAudioReceiveSlots: 8,
+      maxVideoReceiveSlots: 0,
     });
-    await rig.session.startMedia();
     const line = info.mock.calls.map((c) => c.join(' ')).find((l) => l.includes('dt-media-slots'));
-    expect(line).toBe('[dt-media-slots] declaring N=2 receive slots (configured); server cap 8');
+    expect(line).toBe(
+      '[dt-media-slots] publishing [audio]; declared N=2 audio (configured), M=1 video ' +
+        '(configured); server caps audio 8, video 0 (video disabled)',
+    );
+    rig.session.disconnect();
+  });
+
+  it('zero-initialises the directive-fault and unattributed keyframe series at join, and no video series', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({});
+    const zeroed = rig.sink
+      .getRecordedMetrics()
+      .filter((m) => m.value === 0 && m.name.startsWith('dt_client_media_'))
+      .map((m) => `${m.name}|${m.labels['outcome'] ?? ''}|${m.labels['media_kind'] ?? ''}`)
+      .sort();
+    expect(zeroed).toEqual(
+      [
+        'dt_client_media_keyframe_requests_unattributed_total|malformed|',
+        'dt_client_media_mh_control_channel_ended_total|finished|',
+        'dt_client_media_mh_control_channel_ended_total|reset|',
+        'dt_client_media_keyframe_requests_unattributed_total|not_sending|',
+        'dt_client_media_send_directive_header_version_refused_total||',
+        'dt_client_media_send_directive_kind_missing_total||audio',
+      ].sort(),
+    );
+    expect(rig.sink.getRecordedMetrics().some((m) => m.labels['media_kind'] === 'video')).toBe(
+      false,
+    );
     rig.session.disconnect();
   });
 });
@@ -1868,7 +1964,7 @@ describe('join label bag — PRIMARY, behavioural (ADR-0036 §11; story 2 task 1
       encoderFactory: codecs.encoderFactory as never,
       decoderFactory: codecs.decoderFactory as never,
       playbackFactory: new RecordingPlaybackSink().factory as never,
-      receiveSlots: { count: 2, source: 'configured' },
+      audioReceiveSlots: { count: 2, source: 'configured' },
     });
     const joining = session.join({
       meetingCode: MEETING_CODE,
@@ -1878,7 +1974,7 @@ describe('join label bag — PRIMARY, behavioural (ADR-0036 §11; story 2 task 1
     await driveJoin(mocks, 'partial', {
       senderId: 258,
       meetingKek: new Uint8Array(32).fill(1),
-      maxReceiveSlots: 8,
+      maxAudioReceiveSlots: 8,
     });
     await joining;
     await session.startMedia();
@@ -1969,17 +2065,21 @@ describe('MeetingSession — host hint and server mute (story 2 R-8/R-10/R-11)',
 
   it('setServerMute sends target + action; requestUnmute sends an unmute request', async () => {
     const { session, mc } = await joined(meetingJwt({ role: 'host' }));
-    await session.setServerMute('participant-b', true);
+    await session.setServerMute('participant-b', 'audio', true);
     await session.requestUnmute();
     const messages = decodeOutboundClientMessages(mc.getOutboundBidiWrites(0));
     const mute = messages.find((m) => m.message.case === 'serverMuteRequest');
-    expect(mute?.message.value).toMatchObject({ participantId: 'participant-b', audioMuted: true });
+    expect(mute?.message.value).toMatchObject({
+      participantId: 'participant-b',
+      audioMuted: true,
+      videoMuted: false,
+    });
     expect(messages.some((m) => m.message.case === 'unmuteRequest')).toBe(true);
   });
 
   it('refuses both before a settled join', async () => {
     const session = makeSession(new Map());
-    await expect(session.setServerMute('b', true)).rejects.toBeInstanceOf(SignalingError);
+    await expect(session.setServerMute('b', 'audio', true)).rejects.toBeInstanceOf(SignalingError);
     await expect(session.requestUnmute()).rejects.toBeInstanceOf(SignalingError);
   });
 
@@ -2006,7 +2106,298 @@ describe('MeetingSession — host hint and server mute (story 2 R-8/R-10/R-11)',
     );
     mc.simulateServerMessage(0, framedUnmuteRequestRelay('b'));
     await waitFor(() => mutes.length > 0 && requests.length > 0);
-    expect(mutes[0]).toEqual({ participantId: 'b', audioServerMuted: true, serverMutedBy: 'h' });
+    expect(mutes[0]).toEqual({
+      participantId: 'b',
+      audioServerMuted: true,
+      videoServerMuted: false,
+      serverMutedBy: 'h',
+    });
     expect(requests[0]).toEqual({ participantId: 'b' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Story 3 C-A1: cached directive/assignments (E3), per-kind mute, R-18 through
+// the session, and the MH control sink
+// ---------------------------------------------------------------------------
+
+describe('MeetingSession — story 3 C-A1 session wiring', () => {
+  const KEK = new Uint8Array(32).fill(0x22);
+  const SELF = 'participant-self';
+  const MH = MEDIA_SERVERS[0]!;
+
+  async function joinedRig(): Promise<{
+    session: MeetingSession;
+    mocks: Map<string, MockWebTransport>;
+    mc: MockWebTransport;
+    capture: FakeCaptureSource;
+    sink: InMemoryMetricsSink;
+    resumed: string[];
+    sentCount: (name: string, labels?: Record<string, string>) => number;
+    outbound: () => ReturnType<typeof decodeOutboundClientMessages>;
+  }> {
+    const mocks = new Map<string, MockWebTransport>();
+    const capture = new FakeCaptureSource();
+    const codecs = new FakeAudioCodecs();
+    const sink = new InMemoryMetricsSink();
+    const session = makeSession(mocks, {
+      metricsSink: sink,
+      captureFactory: async () => capture as never,
+      encoderFactory: codecs.encoderFactory as never,
+      decoderFactory: codecs.decoderFactory as never,
+      playbackFactory: new RecordingPlaybackSink().factory as never,
+    });
+    const resumed: string[] = [];
+    session.on('captureResumedAfterServerMute', (e) => resumed.push(e.kind));
+    const joining = session.join({
+      meetingCode: MEETING_CODE,
+      orgSubdomain: 'acme',
+      credentials: LOGIN,
+    });
+    await driveJoin(mocks, 'all', { participantId: SELF, senderId: 258, meetingKek: KEK });
+    await joining;
+    const mc = mocks.get(MC_ENDPOINT)!;
+    return {
+      session,
+      mocks,
+      mc,
+      capture,
+      sink,
+      resumed,
+      sentCount: (name, labels = {}) =>
+        sink
+          .getRecordedMetrics()
+          .filter(
+            (m) => m.name === name && Object.entries(labels).every(([k, v]) => m.labels[k] === v),
+          )
+          .reduce((n, m) => n + m.value, 0),
+      outbound: () => decodeOutboundClientMessages(mc.getOutboundBidiWrites(0)),
+    };
+  }
+
+  /** Let the read loops and listeners run: bounded zero-delay task turns, never a timed sleep. */
+  async function settle(turns = 25): Promise<void> {
+    for (let i = 0; i < turns; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  it('E3: a directive and assignments that arrive BEFORE startMedia are applied when the pipeline is built', async () => {
+    const rig = await joinedRig();
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, senderId: 259, mediaHandlerUrl: MH }),
+    );
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    await settle();
+    const pipeline = await rig.session.startMedia();
+    expect(pipeline.assignedSenders).toEqual([259]);
+    rig.capture.emit(makeAudioData({ samples: Float32Array.of(1, 1, 1) }));
+    await settle();
+    expect(rig.mocks.get(MH)!.getOutboundDatagrams().length).toBeGreaterThan(0);
+
+    // A LIVE update after the replay goes straight through (no double-apply race).
+    rig.mc.simulateServerMessage(
+      0,
+      framedStreamAssignments({ slotId: 0, senderId: 260, mediaHandlerUrl: MH }),
+    );
+    await waitFor(() => pipeline.assignedSenders[0] === 260);
+    expect(pipeline.assignedSenders).toEqual([260]);
+    rig.session.disconnect();
+  });
+
+  it('per-kind client mute: each kind changes alone, and BOTH kinds are reported explicitly', async () => {
+    const rig = await joinedRig();
+    await rig.session.startMedia();
+    rig.session.setVideoMuted(true);
+    rig.session.setAudioMuted(true);
+    rig.session.setVideoMuted(false);
+    await settle();
+    expect(rig.session.muteState).toEqual({ audioMuted: true, videoMuted: false });
+    const reports = rig
+      .outbound()
+      .filter((m) => m.message.case === 'muteRequest')
+      .map((m) => m.message.value as { audioMuted?: boolean; videoMuted?: boolean })
+      .map((v) => [v.audioMuted, v.videoMuted]);
+    expect(reports).toEqual([
+      [false, true],
+      [true, true],
+      [true, false],
+    ]);
+    rig.session.disconnect();
+  });
+
+  it("a host's per-kind server mute carries the target's CURRENT state for the other kind", async () => {
+    const rig = await joinedRig();
+    rig.mc.simulateServerMessage(
+      0,
+      framedParticipantMuteUpdate({
+        participantId: 'b',
+        audioServerMuted: false,
+        videoServerMuted: true,
+      }),
+    );
+    await settle();
+    await rig.session.setServerMute('b', 'audio', true);
+    const sent = rig
+      .outbound()
+      .filter((m) => m.message.case === 'serverMuteRequest')
+      .map((m) => m.message.value);
+    expect(sent).toEqual([
+      expect.objectContaining({ participantId: 'b', audioMuted: true, videoMuted: true }),
+    ]);
+    rig.session.disconnect();
+  });
+
+  async function startedSending(): Promise<Awaited<ReturnType<typeof joinedRig>>> {
+    const rig = await joinedRig();
+    await rig.session.startMedia();
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    await settle();
+    return rig;
+  }
+
+  const muteSelf = (muted: boolean) =>
+    framedParticipantMuteUpdate({ participantId: SELF, audioServerMuted: muted });
+
+  it('R-18: unmute update BEFORE the resumed directive fires exactly one event', async () => {
+    const rig = await startedSending();
+    rig.mc.simulateServerMessage(0, muteSelf(true));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
+    rig.mc.simulateServerMessage(0, muteSelf(false));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    await settle();
+    expect(rig.resumed).toEqual(['audio']);
+    rig.session.disconnect();
+  });
+
+  it('R-18: the resumed directive BEFORE the unmute update fires exactly one event; the later update adds none', async () => {
+    const rig = await startedSending();
+    rig.mc.simulateServerMessage(0, muteSelf(true));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    rig.mc.simulateServerMessage(0, muteSelf(false));
+    await settle();
+    expect(rig.resumed).toEqual(['audio']);
+    rig.session.disconnect();
+  });
+
+  it('R-18: the unmute update LOST still fires exactly one event', async () => {
+    const rig = await startedSending();
+    rig.mc.simulateServerMessage(0, muteSelf(true));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    await settle();
+    expect(rig.resumed).toEqual(['audio']);
+    rig.session.disconnect();
+  });
+
+  it('R-18 S2: a server mute and directives that arrive BEFORE startMedia still fire exactly one event at startMedia', async () => {
+    // The tracker is subscribed from signalling creation, not from startMedia():
+    // a refactor moving it would lose this pre-media mute silently.
+    const rig = await joinedRig();
+    rig.mc.simulateServerMessage(0, muteSelf(true));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    await settle();
+    // Positive control: nothing is sent before media starts, so no event yet.
+    expect(rig.resumed).toEqual([]);
+    await rig.session.startMedia();
+    await settle();
+    expect(rig.resumed).toEqual(['audio']);
+    rig.session.disconnect();
+  });
+
+  it('R-18 S2, false-positive side: with no mute recorded, a pre-media directive raises nothing at startMedia', async () => {
+    const rig = await joinedRig();
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    await settle();
+    await rig.session.startMedia();
+    await settle();
+    expect(rig.resumed).toEqual([]);
+    rig.session.disconnect();
+  });
+
+  it('R-18: client-muted means no event', async () => {
+    const rig = await startedSending();
+    rig.session.setAudioMuted(true);
+    rig.mc.simulateServerMessage(0, muteSelf(true));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    await settle();
+    expect(rig.resumed).toEqual([]);
+    rig.session.disconnect();
+  });
+
+  it("R-18: ANOTHER participant's server-mute update never touches the self latch", async () => {
+    const rig = await startedSending();
+    rig.mc.simulateServerMessage(
+      0,
+      framedParticipantMuteUpdate({ participantId: 'someone-else', audioServerMuted: true }),
+    );
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    await settle();
+    expect(rig.resumed).toEqual([]);
+    rig.session.disconnect();
+  });
+
+  it('S1: a self unmute while still sending changes no egress state and emits nothing', async () => {
+    const rig = await startedSending();
+    rig.mc.simulateServerMessage(0, muteSelf(true));
+    rig.mc.simulateServerMessage(0, muteSelf(false));
+    await settle();
+    rig.capture.emit(makeAudioData({ samples: Float32Array.of(2, 2, 2) }));
+    await settle();
+    // Still sending throughout: the mute update itself never stopped capture.
+    expect(rig.mocks.get(MH)!.getOutboundDatagrams().length).toBeGreaterThan(0);
+    expect(rig.resumed).toEqual([]);
+    rig.session.disconnect();
+  });
+
+  function framedKeyframeRequest(streamNumber: number): Uint8Array {
+    return encodeFrame(
+      toBinary(
+        MhServerMessageSchema,
+        create(MhServerMessageSchema, {
+          message: {
+            case: 'keyframeRequest',
+            value: create(KeyframeRequestSchema, { streamNumber, gopCounter: 3 }),
+          },
+        }),
+      ),
+    );
+  }
+
+  it('every keyframe request is refused not_sending, attributed only to a directed published kind', async () => {
+    const rig = await startedSending();
+    const mh = rig.mocks.get(MH)!;
+    mh.simulateServerMessage(0, framedKeyframeRequest(0)); // audio's directed stream
+    mh.simulateServerMessage(0, framedKeyframeRequest(9)); // no published kind
+    mh.simulateServerMessage(0, encodeFrame(new Uint8Array([0xff, 0xff])));
+    await settle();
+    expect(
+      rig.sentCount('dt_client_media_keyframe_requests_received_total', {
+        media_kind: 'audio',
+        outcome: 'not_sending',
+      }),
+    ).toBe(1);
+    expect(
+      rig.sentCount('dt_client_media_keyframe_requests_unattributed_total', {
+        outcome: 'not_sending',
+      }),
+    ).toBe(1);
+    expect(
+      rig.sentCount('dt_client_media_keyframe_requests_unattributed_total', {
+        outcome: 'malformed',
+      }),
+    ).toBe(1);
+    // None was honoured, and nothing about a request reaches a label.
+    expect(
+      rig.sentCount('dt_client_media_keyframe_requests_received_total', { outcome: 'honoured' }),
+    ).toBe(0);
+    for (const m of rig.sink.getRecordedMetrics()) {
+      expect(Object.keys(m.labels)).not.toContain('stream_number');
+      expect(Object.keys(m.labels)).not.toContain('gop_counter');
+    }
+    rig.session.disconnect();
   });
 });

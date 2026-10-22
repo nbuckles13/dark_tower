@@ -393,8 +393,8 @@ lives here:
 
 | Class | Label set | Series |
 |---|---|---|
-| **Per-kind** | `client_version`, `org_id`, `key_custody=operator`, **`media_kind`** (+ own discriminator) | `frames_sent`, `send_dropped`, `send_queue_depth`, `frames_received`, `frames_accepted`, `frames_dropped`, `key_wrap_outcomes`, `downlink_gap_frames`, `downlink_reorder`, `undeclared_stream_id`, `decoder_errors`, `mute_transitions`, `decode_queue_dropped`, `receive_source_deficit`, `receive_slots_rejected` (all `dt_client_media_*`), and `dt_client_time_to_first_media_frame_ms` |
-| **Kind-free (session-level)** | `client_version`, `org_id`, `key_custody=operator` (+ own discriminator), **no `media_kind` key at all** | `dt_client_media_kek_updates_total`, `_kek_retention_violations_total`, `_kek_retention_anomalies_total`, `_kek_install_refusals_total`, `_kek_generations_retained_total`, `_roster_key_rebinds_total`, `dt_client_media_capture_source` |
+| **Per-kind** | `client_version`, `org_id`, `key_custody=operator`, **`media_kind`** (+ own discriminator) | `frames_sent`, `send_dropped`, `send_queue_depth`, `frames_received`, `frames_accepted`, `frames_dropped`, `key_wrap_outcomes`, `downlink_gap_frames`, `downlink_reorder`, `undeclared_stream_id`, `decoder_errors`, `mute_transitions`, `decode_queue_dropped`, `receive_source_deficit`, `capture_failures`, `keyframe_requests_received`, `send_directive_kind_missing` (all `dt_client_media_*`), and `dt_client_time_to_first_media_frame_ms` |
+| **Kind-free (session-level)** | `client_version`, `org_id`, `key_custody=operator` (+ own discriminator), **no `media_kind` key at all** | `dt_client_media_kek_updates_total`, `_kek_retention_violations_total`, `_kek_retention_anomalies_total`, `_kek_install_refusals_total`, `_kek_generations_retained_total`, `_roster_key_rebinds_total`, `dt_client_media_capture_source`, `_send_directive_header_version_refused_total`, `_keyframe_requests_unattributed_total`, `_mh_control_channel_ended_total` |
 
 **Why the session-level series are kind-free.** A KEK arrival, a retention anomaly, an
 install refusal, a retained generation and a roster rebind each happen ONCE per session
@@ -1212,32 +1212,127 @@ the comment's reader.
   Initialised with `add(0)` at pipeline start, so `rate()` has a series before
   the first deficit.
 - **Blind spot**: a declaration MC rejects whole produces ZERO active
-  assignments, so this reads 0 — see
-  `dt_client_media_receive_slots_rejected_total` for that case.
+  assignments, so this reads 0. Since story 3 MC truncates an over-cap
+  declaration instead (excess slots `unavailable`, never active), so the only
+  remaining whole rejection is the pre-MC-A controller's retired TOTAL cap —
+  read it on `mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}`.
 - **Panel**: `infra/grafana/dashboards/client-media.json`. Triage:
   `docs/runbooks/client-dev-local.md` (receive-source deficit).
 
-### `dt_client_media_receive_slots_rejected_total`
+### `dt_client_media_capture_failures_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Description**: `startMedia()` calls refused because the client's declared
-  receive-slot count N exceeds the cap MC advertised on
-  `JoinResponse.max_receive_slots` (`MC_MAX_RECEIVE_SLOTS`). MC rejects such a
-  declaration WHOLE, so the SDK refuses it locally, loudly, before sending —
-  never shrinking N to fit. One increment per refusal. With an MC that predates
-  the field (cap unknown) the SDK declares anyway and MC's
-  `mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}`
-  counts it instead.
-- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
-- **Reads zero on a correctly configured deployment**: N is
-  `VITE_DT_RECEIVE_SLOTS` (a build-time client knob outside `dt-guard
-  env-config`'s reach), and the fix for a non-zero reading is to lower it or
-  raise `MC_MAX_RECEIVE_SLOTS`. Initialised with `add(0)` at session start.
-- **The ONLY signal for this failure**: the participant hears nobody, and
-  `dt_client_media_receive_source_deficit_total` stays at 0 because there are no
-  active assignments to be silent.
-- **Panel**: `infra/grafana/dashboards/client-media.json` (its own panel, next
-  to the deficit). Triage: `docs/runbooks/client-dev-local.md`.
+- **Labels**: per-kind base (`client_version`, `org_id`, `key_custody`, `media_kind`)
+  + `outcome`. **`outcome`, not `reason`** (story 3 C-A1, taxonomy owner's ruling):
+  `reason` is reserved for the two per-FRAME drop families
+  (`docs/observability/label-taxonomy.md`), and a capture failure is not a frame
+  drop. A per-metric vocabulary — each value names a distinct remedy.
+- **Permitted values** (`MEDIA_CAPTURE_FAILURE_OUTCOMES` in `mediaMetrics.ts`, tied
+  in both directions to `media/setup/captureFailure.ts:CaptureFailure`):
+  `permission_denied`, `no_device`, `device_unavailable`, `unsupported`,
+  `platform_unsupported`, `unknown` (a failed acquisition, classified from the
+  platform error's NAME only) and `ended` (a track that stopped on its own
+  mid-call: unplugged, revoked).
+- **Counting point**: audio emits on a failed capture start or device swap, and on
+  a track ending; story 3 C-A2 adds video (camera). One increment per failure.
+- **Lazily created — no zero-initialisation**: an ABSENT series means no failures
+  yet, not a broken pipeline. Panels MUST tolerate absence (`or vector(0)`) rather
+  than render "No data".
+- **No device, sender, slot or stream dimension** — ever.
+- **Alert**: none yet (story 3 OBS-B, task 20, owns the alert inventory). **Panel**:
+  `infra/grafana/dashboards/client-media.json`.
+
+### `dt_client_media_keyframe_requests_received_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Counter
+- **Labels**: per-kind base + `outcome` — a per-metric vocabulary, declared IN FULL
+  now (`MEDIA_KEYFRAME_REQUEST_OUTCOMES`). The five per-kind values are
+  `honoured`, `honoured_counter_ahead`, `stale_counter`, `min_interval`,
+  `not_sending` (typed `MediaKeyframePerKindOutcome`). `malformed` belongs to the
+  same vocabulary but lives ONLY on `..._keyframe_requests_unattributed_total`: a
+  malformed request names no kind.
+- **Counting point**: one increment per MH `KeyframeRequest` (the
+  `MhServerMessage` read on the MH control stream, `media/MediaTransport.ts`)
+  whose `stream_number` is the directed stream of a PUBLISHED kind; the kind is
+  that stream's. Requests with no attributable kind count on
+  `dt_client_media_keyframe_requests_unattributed_total` instead.
+- **Story 3 C-A1**: there is no video stream yet, so EVERY request is refused
+  `not_sending` — none is honoured, and none reaches capture or an encoder. C-A2
+  emits the honour paths.
+- **NOT zero-initialised** (story 3 E4 ruling): a `media_kind="video"` series before
+  video flows would let the video read-back pass vacuously, and audio has no
+  keyframes. At this gate only an audio `not_sending` can be emitted (an MH
+  requesting audio's stream).
+- **Never summed by `outcome`** with `..._keyframe_requests_unattributed_total`:
+  `outcome` is a per-metric vocabulary (`label-taxonomy.md`, the `outcome` row).
+- **No GoP counter, stream number, slot or sender in any label** (ADR-0036 §11).
+- **Alert**: none yet (story 3 OBS-B; A1 keyframe storm is MH-side). **Panel**:
+  `infra/grafana/dashboards/client-media.json`.
+
+### `dt_client_media_keyframe_requests_unattributed_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Counter
+- **Labels**: session base (kind-free; see §`media_kind`) + `outcome`, exactly
+  `not_sending` (a well-formed request naming a stream number that is no
+  published kind's directed stream) and `malformed` (undecodable, oversized,
+  empty or an unknown variant on the MH control stream — a framing failure also
+  stops that handler's control loop).
+- **Kind-free because the subject has no kind**: an unattributable request names
+  no published stream.
+- **Zero-initialised at join** for both outcomes; reads zero on a conforming MH.
+  Non-zero `malformed` is a handler (or path) defect.
+- **Never summed by `outcome`** with `..._keyframe_requests_received_total`
+  (per-metric `outcome`, `label-taxonomy.md`).
+- **Alert**: none yet (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
+
+### `dt_client_media_mh_control_channel_ended_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Counter
+- **Labels**: session base (kind-free) + `outcome`, exactly `reset` (MH reset the
+  control stream, or the connection was lost) and `finished` (MH finished its
+  send half) — `MEDIA_MH_CONTROL_CHANNEL_ENDINGS`.
+- **Counting point**: a handler's MH control stream (the connect bidi stream after
+  `MhConnectRequest`) ended while this client was NOT tearing down
+  (`media/MediaTransport.ts`). From then on that handler's keyframe requests are
+  never received — and since story 3 amendment 4 makes keyframes event-driven
+  with no retry, a dead control channel means video that never recovers.
+  This client's own teardown is never counted.
+- **A connection loss increments it too** (`reset`): read it AGAINST the
+  connection-loss signals; outside a connection loss it reads zero.
+  Zero-initialised at join for both outcomes.
+- **Alert**: none yet (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
+
+### `dt_client_media_send_directive_kind_missing_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Counter
+- **Labels**: per-kind base only — `media_kind` is the PUBLISHED kind the directive
+  omitted.
+- **Counting point**: one increment per `SendDirective` whose NON-EMPTY `streams`
+  omits a kind this client publishes — a protocol fault (story 3 wire freeze:
+  every published kind is always listed; withdrawal is an empty target set, never
+  removal). The kind FAILS CLOSED (sends nothing) and a typed `mediaFault` is
+  raised once per episode.
+- **Reads zero forever against a conforming MC, and that holds at the story 3
+  C-A1 gate ONLY BECAUSE of TRANSITIONAL shim (c)** (`session/mediaWiring.ts`,
+  deleted by C-A2, task 13): the controller in service before MC-A spells "nobody
+  watches you" as a directive with NO streams, which shim (c) reads as a
+  withdrawal of every published kind, uncounted. Alertable at `> 0` once that
+  shim is gone.
+- **Zero-initialised at join** for each published kind (audio only until C-A2).
+- **Alert**: none yet (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
+
+### `dt_client_media_send_directive_header_version_refused_total`
+- **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
+- **Type**: Counter
+- **Labels**: session base only (kind-free: one refusal refuses the WHOLE
+  directive, so it is counted once, never once per kind).
+- **Counting point**: one increment per `SendDirective` whose `header_version` this
+  client cannot send (`frameCodec.ts:isSupportedHeaderVersion`; v3 is the only
+  version). The directive is refused fail-closed (nothing sent) and the pipeline
+  raises its existing `config` fault.
+- **Reads zero forever** against a conforming MC; **alertable at `> 0`**.
+  Zero-initialised at join.
+- **Alert**: none yet (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_time_to_first_media_frame_ms`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
