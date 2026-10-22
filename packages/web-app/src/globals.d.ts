@@ -14,6 +14,14 @@ declare const __E2E_HOOKS__: boolean;
  * `vite/testDefines.ts`. Read only by the SDK's capture-source selection.
  */
 declare const __DT_TEST_TONE__: boolean;
+
+// Story 3 R-27: the TEST-PATTERN camera define. Same rules as `__DT_TEST_TONE__`:
+// `false` in the SDK library build and every vitest config, opt-in
+// (`DT_TEST_PATTERN=1`) in web-app dev, a hard `false` with a build-time THROW on
+// the opt-in in production. Read at exactly one site:
+// `session/mediaSelection.ts:selectVideoCaptureSource`.
+declare const __DT_TEST_PATTERN__: boolean;
+
 /**
  * Story 2 task 15: the per-browsing-context TEST LEVERS define — opt-in
  * (`DT_TEST_LEVERS=1`) in dev, a hard `false` in production (the opt-in THROWS

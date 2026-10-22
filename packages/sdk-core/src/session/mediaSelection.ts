@@ -11,29 +11,30 @@
 //   * WHAT FEEDS THE SEND PATH — the one capture-source substitution point.
 
 import { createMicrophoneCapture, createTestToneCapture } from '../media/setup/capture.js';
+import { createCameraCapture, createTestPatternCapture } from '../media/setup/videoCapture.js';
+import { TestPatternSource } from '../media/setup/testPattern.js';
 import { testToneFrequencyHz } from '../media/setup/testTone.js';
-import type { CaptureSourceFactory } from '../media/setup/seams.js';
+import type { CaptureSourceFactory, VideoCaptureSourceFactory } from '../media/setup/seams.js';
 import { SignalingError, SignalingErrorCode } from '../errors/SignalingError.js';
 import type { PublishKind, ReceiveSlotDeclaration } from '../signaling/events.js';
-import type { CaptureSourceInfo, ReceiveSlotCap } from './events.js';
+import type { CaptureSourceInfo, ReceiveSlotCap, VideoCaptureSourceInfo } from './events.js';
 import type { MediaKindToken } from '../media/mediaKind.js';
 
 /** The default capture source. The ONE `microphone` literal on the emitting path. */
 const MICROPHONE_SOURCE: CaptureSourceInfo = { mode: 'microphone' };
 
 /**
- * The kinds this SDK build can PUBLISH. Video joins in story 3 C-A2 (task 13),
- * with its capture and encoder; until then a video request is refused typed,
- * never silently dropped from the set.
+ * The kinds this SDK build can PUBLISH: audio and (story 3 C-A2) camera video.
+ * Anything else is refused typed, never silently dropped from the set.
  */
-const PUBLISHABLE_KINDS: ReadonlySet<PublishKind> = new Set<PublishKind>(['audio']);
+const PUBLISHABLE_KINDS: ReadonlySet<PublishKind> = new Set<PublishKind>(['audio', 'video']);
 
 /**
  * Validate and FREEZE a publish set (story 3 R-2). THROWS typed:
  *
- *   * `PublishKindNotSupported` — a kind this build cannot publish yet (video),
- *     a duplicate, or a value outside the closed vocabulary (possible only if a
- *     caller defeats the type system). MC rejects all three as well.
+ *   * `PublishKindNotSupported` — a duplicate, or a value outside the closed
+ *     vocabulary (possible only if a caller defeats the type system). MC
+ *     rejects both as well.
  *   * `NothingToPublishOrReceive` — nothing published and `audioSlots +
  *     videoSlots` is 0. A user-experience pre-check only: MC is the authority
  *     and refuses such a join itself.
@@ -51,11 +52,9 @@ export function validatePublishSet(
     if (!PUBLISHABLE_KINDS.has(kind) || seen.has(kind)) {
       throw new SignalingError(
         SignalingErrorCode.PublishKindNotSupported,
-        kind === 'video'
-          ? 'publishing video is not yet supported by this client'
-          : seen.has(kind)
-            ? `the publish set names ${kind} more than once`
-            : 'the publish set names a media kind this client cannot publish',
+        seen.has(kind)
+          ? `the publish set names ${kind} more than once`
+          : 'the publish set names a media kind this client cannot publish',
       );
     }
     seen.add(kind);
@@ -145,4 +144,39 @@ export function selectCaptureSource(
     };
   }
   return { factory: createMicrophoneCapture, info: MICROPHONE_SOURCE };
+}
+
+/** The default video capture source. The ONE `camera` literal on the emitting path. */
+const CAMERA_SOURCE: VideoCaptureSourceInfo = { mode: 'camera' };
+
+/**
+ * THE ONE VIDEO capture-source substitution point (story 3 R-27), beside
+ * {@link selectCaptureSource} and built the same way.
+ *
+ * An embedder-injected factory is always respected and reported as the camera.
+ * Otherwise the default is the camera — unless this is a TEST-PATTERN BUILD:
+ * `__DT_TEST_PATTERN__` is a Vite build-time define, `false` in every
+ * production build and in the SDK's own library build, opt-in
+ * (`DT_TEST_PATTERN=1`) in dev. In a production bundle the branch is
+ * statically dead, so the generator and the `test_pattern` token are
+ * tree-shaken (proved by the bundle-content tests). It is never a runtime
+ * option, and the generator itself THROWS if reached without the define.
+ *
+ * The pattern derives from the meeting-scoped `senderId` ONLY (throws on 0 or
+ * out of range), never a durable identity. One pattern source per session, so
+ * its captured-frame counter continues across camera-edge restarts.
+ */
+export function selectVideoCaptureSource(
+  injected: VideoCaptureSourceFactory | undefined,
+  senderId: number,
+): { readonly factory: VideoCaptureSourceFactory; readonly info: VideoCaptureSourceInfo } {
+  if (injected) return { factory: injected, info: CAMERA_SOURCE };
+  if (__DT_TEST_PATTERN__) {
+    const source = new TestPatternSource(senderId);
+    return {
+      factory: createTestPatternCapture(source),
+      info: { mode: 'test_pattern', patternId: source.patternId },
+    };
+  }
+  return { factory: createCameraCapture, info: CAMERA_SOURCE };
 }

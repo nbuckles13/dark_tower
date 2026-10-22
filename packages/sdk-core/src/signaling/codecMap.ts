@@ -25,6 +25,7 @@ import { Codec } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
  */
 export const SignalingCodec = {
   Opus: 'opus',
+  Vp8: 'vp8',
   Vp9: 'vp9',
   Av1: 'av1',
   H264: 'h264',
@@ -46,10 +47,9 @@ const CODEC_TO_SIGNALING: Record<Codec, SignalingCodec | null> = {
   [Codec.VP9]: SignalingCodec.Vp9,
   [Codec.AV1]: SignalingCodec.Av1,
   [Codec.H264]: SignalingCodec.H264,
-  // No public member until C-A2's VP8 probe gate: the SDK must not declare a
-  // codec it has not proven it can encode and decode (signaling.proto
-  // `CODEC_VP8`). `null` keeps a received VP8 unrepresentable, as before.
-  [Codec.VP8]: null,
+  // Story 3 C-A2: the SDK DECLARES `vp8` only after `media/setup/vp8.ts:
+  // probeVp8Support` proved both encode and decode (signaling.proto `CODEC_VP8`).
+  [Codec.VP8]: SignalingCodec.Vp8,
 };
 
 /**

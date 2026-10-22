@@ -352,6 +352,7 @@ accounting identity `received = accepted + sum(drops by reason)`.
   - the other two install-refusal arms;
   - `decode_queue_dropped_total` (post-accept, never part of the accounting identity);
   - **KEK Rotations vs Generations Retained**, which reads `kek_generations_retained_total` AGAINST `kek_updates_total{source="kek_update"}`. Rotations rising while retentions stay flat is the signal, and neither series alone says anything.
+  - story 3 C-A2's video send-path series, panel only until story 3 OBS-B: `keyframes_produced_total{source}`, `send_groups_abandoned_total`, `send_groups_stopped_total{outcome}`, `encode_queue_dropped_total`, `encoder_errors_total`, `send_directive_encoding_refused_total`, and `keyframe_min_interval_clamped_total` (panel only BY DECISION, task text).
 
 The capture-source panel's value is not a browser count: the only signal is the presence of `mode="test_tone"`. The panel list itself is in the JSON.
 

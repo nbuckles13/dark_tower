@@ -27,6 +27,9 @@ export default defineConfig(({ mode }) => ({
     // sdk-core must never carry the synthesis. `tests/bundle-content.test.ts`
     // asserts it does not.
     __DT_TEST_TONE__: JSON.stringify(false),
+    // Story 3 R-27: the test-PATTERN define, same rule — a HARD `false` in the
+    // library build; the web app supplies its own (`vite/testDefines.ts`).
+    __DT_TEST_PATTERN__: JSON.stringify(false),
   },
   build: {
     lib: {

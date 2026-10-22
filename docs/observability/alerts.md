@@ -1209,6 +1209,22 @@ sum(dt_client_media_kek_retention_violations_total) > 0
 
 ---
 
+### Deliberate absences (client video send path, story 3 C-A2)
+
+None of the video send-path series below is alerted yet. Each lands with catalog and panel entries (`docs/observability/metrics/client.md`, `infra/grafana/dashboards/client-media.json`); the alert inventory for video is story 3 OBS-B's (A1–A9).
+
+| Series | Alert | Reason |
+|---|---|---|
+| `dt_client_media_keyframes_produced_total{source}` | none yet — story 3 OBS-B | A1 (keyframe storm) is MH-side; the client `source` split is its triage input |
+| `dt_client_media_send_groups_abandoned_total` | none yet — story 3 OBS-B | A2 (fleet backlog resets) is MH-side; read against `keyframes_produced{source="abandonment"}` |
+| `dt_client_media_send_groups_stopped_total{outcome}` | none yet — story 3 OBS-B | no baseline yet; `open_stalled` is the only MAX_STREAMS-starvation signal anywhere |
+| `dt_client_media_encode_queue_dropped_total` | none yet — story 3 OBS-B | device-pressure signal; no baseline yet |
+| `dt_client_media_encoder_errors_total` | none yet — story 3 OBS-B | fatal per encoder instance; no baseline yet |
+| `dt_client_media_send_directive_encoding_refused_total` | none yet — story 3 OBS-B | reads zero against a conforming MC |
+| `dt_client_media_keyframe_min_interval_clamped_total` | panel only, BY DECISION (task text) | reads zero against a correct MC; a drift / hostile-controller signal |
+
+---
+
 ## Telemetry Pipeline Alerts (OTel collector) — SPECIFIED, NOT LOADED
 
 > ## NONE OF THE THREE BELOW EXISTS AS A RULE. NOTHING FIRES ON ANY OF THESE CONDITIONS TODAY.

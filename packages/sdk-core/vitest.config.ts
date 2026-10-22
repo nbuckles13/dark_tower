@@ -12,6 +12,9 @@ export default defineConfig({
     // so the default suite runs the microphone path and an accidentally
     // default-on tone cannot hide in it (@security A3).
     __DT_TEST_TONE__: JSON.stringify(false),
+    // Story 3 R-27: the test-pattern define is FALSE under every test runner
+    // too, so the default suite runs the camera path.
+    __DT_TEST_PATTERN__: JSON.stringify(false),
     // Unit tests exercise the dev branch; mirror the non-prod Vite define so
     // `__DEV_TRUST_FINGERPRINT__` resolves under Vitest's transform.
     __DEV_TRUST_FINGERPRINT__: JSON.stringify(true),
@@ -73,6 +76,12 @@ export default defineConfig({
         'src/media/setup/capture.ts',
         'src/media/setup/opus.ts',
         'src/media/setup/audioPlayback.ts',
+        // Story 3 C-A2: the video counterparts, same rule — `getUserMedia({video})`,
+        // `OffscreenCanvas`/`VideoFrame` and `VideoEncoder` construction only;
+        // the probe, the pattern adapter and every branch are scored in
+        // `vp8.ts`, `videoCapture.ts` and `testPattern.ts`.
+        'src/media/setup/videoCaptureBrowser.ts',
+        'src/media/setup/vp8Encoder.ts',
       ],
       // ≥90% gate (R-41 / R-47). Enforced here so `vitest run --coverage`
       // exits non-zero if any metric drops below threshold — CI does not

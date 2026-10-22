@@ -19,6 +19,7 @@ import { kekHolderWith } from '../../__tests__/helpers.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import { AudioPipeline, type ReceiveAssignment } from '../AudioPipeline.js';
+import { TransmitKeyManager } from '../transmitKeys.js';
 
 const INTERVAL_MS = 7_000;
 const MH_URL = 'https://mh.example:4433';
@@ -34,6 +35,8 @@ async function rig(opts: { declaredSlotIds?: number[] } = {}) {
     kekSource: kekHolderWith(new Uint8Array(AES_256_KEY_BYTES).fill(1), 0),
     roster: new RosterIdentityKeys(8),
     senderId: 1,
+    transmitKeys: new TransmitKeyManager(1),
+    publishesAudio: true,
     identity: await MeetingIdentity.create(),
     declaredSlotIds: opts.declaredSlotIds ?? [0, 1],
     captureSource: 'microphone',

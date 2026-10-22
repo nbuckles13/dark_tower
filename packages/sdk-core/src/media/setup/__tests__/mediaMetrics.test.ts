@@ -28,6 +28,8 @@ import { CaptureFailure } from '../captureFailure.js';
 import {
   MEDIA_CAPTURE_FAILURE_OUTCOMES,
   MEDIA_KEYFRAME_REQUEST_OUTCOMES,
+  MEDIA_KEYFRAME_SOURCES,
+  MEDIA_SEND_GROUP_STOP_OUTCOMES,
   MEDIA_KEYFRAME_UNATTRIBUTED_OUTCOMES,
   MEDIA_MH_CONTROL_CHANNEL_ENDINGS,
   MEDIA_KEK_INSTALL_REFUSALS,
@@ -88,6 +90,29 @@ const PER_KIND_EMITTERS: [string, (m: MediaKindMetrics) => void, string | null][
     'outcome',
   ],
   ['dt_client_media_send_directive_kind_missing_total', (m) => m.sendDirectiveKindMissing(), null],
+  [
+    'dt_client_media_keyframes_produced_total',
+    (m) => m.keyframeProduced(MEDIA_KEYFRAME_SOURCES.Abandonment),
+    'source',
+  ],
+  ['dt_client_media_send_groups_abandoned_total', (m) => m.sendGroupAbandoned(), null],
+  [
+    'dt_client_media_send_groups_stopped_total',
+    (m) => m.sendGroupStopped(MEDIA_SEND_GROUP_STOP_OUTCOMES.OpenStalled),
+    'outcome',
+  ],
+  ['dt_client_media_encode_queue_dropped_total', (m) => m.encodeQueueDropped(), null],
+  [
+    'dt_client_media_keyframe_min_interval_clamped_total',
+    (m) => m.keyframeMinIntervalClamped(),
+    null,
+  ],
+  ['dt_client_media_encoder_errors_total', (m) => m.encoderError(), null],
+  [
+    'dt_client_media_send_directive_encoding_refused_total',
+    (m) => m.sendDirectiveEncodingRefused(),
+    null,
+  ],
   ['dt_client_time_to_first_media_frame_ms', (m) => m.timeToFirstMediaFrameMs(42), null],
 ];
 
@@ -261,25 +286,21 @@ describe('every SESSION-LEVEL emission is kind-free', () => {
 });
 
 describe('the session container', () => {
-  it('holds a kind-free session handle and an AUDIO handle only (no video yet)', () => {
-    const metrics = new MediaMetrics(IDENTITY, undefined);
+  it('holds a kind-free session handle, an AUDIO and a VIDEO handle — and constructing emits NOTHING', () => {
+    // Story 3 C-A2 adds the video handle. Construction must not zero-init any
+    // series: a media_kind="video" series before video is DIRECTED would let
+    // C-B's read-back pass vacuously.
+    const recorded: unknown[] = [];
+    const sink = {
+      counter: (...a: unknown[]) => recorded.push(a),
+      gauge: (...a: unknown[]) => recorded.push(a),
+      histogram: (...a: unknown[]) => recorded.push(a),
+    } as unknown as ConstructorParameters<typeof MediaMetrics>[1];
+    const metrics = new MediaMetrics(IDENTITY, sink);
     expect(metrics.audio.kind).toBe('audio');
+    expect(metrics.video.kind).toBe('video');
     expect(Object.keys(metrics.session.labels)).not.toContain('media_kind');
-    // `in` sees accessors and inherited members, not only own enumerable keys,
-    // so a `get video()` would fail here too.
-    expect('video' in metrics).toBe(false);
-    // Behavioural form: every per-kind handle reachable from the container
-    // (own fields AND prototype getters) is the audio one. A video handle here
-    // would zero-init a media_kind="video" series and pre-empt C-B's read-back.
-    const reachable = [
-      ...Object.getOwnPropertyNames(metrics),
-      ...Object.getOwnPropertyNames(Object.getPrototypeOf(metrics)),
-    ]
-      .filter((k) => k !== 'constructor')
-      .map((k) => (metrics as unknown as Record<string, unknown>)[k])
-      .filter((v): v is MediaKindMetrics => v instanceof MediaKindMetrics);
-    expect(reachable.length, 'no per-kind handle reachable: positive control').toBeGreaterThan(0);
-    expect(reachable.map((h) => h.kind)).toEqual(reachable.map(() => 'audio'));
+    expect(recorded, 'constructing the handles emitted a series').toEqual([]);
   });
 });
 

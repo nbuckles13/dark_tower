@@ -16,6 +16,10 @@ import {
   RETIRED_RECEIVE_SLOTS_MESSAGE,
   RETIRED_RECEIVE_SLOTS_VARIABLE,
   MIN_AUDIO_ROTATION_PERIOD_MS,
+  KEYFRAME_MIN_INTERVAL_FLOOR_MS as FLOOR,
+  MAX_VIDEO_KEY_BEARING_FRAMES as MAX_N,
+  MIN_VIDEO_ROTATION_PERIOD_MS as MIN_T,
+  videoConfigLogLine,
   parseReceiveSlots,
   validateMediaConfig,
   type MediaConfig,
@@ -121,7 +125,10 @@ describe('validation throws rather than clamping', () => {
     // caller-controlled — see `TransmitKeyManager.rotate`.
     const below = {
       ...DEFAULT_CLIENT_CONFIG.media,
-      keys: { audioRotationPeriodMs: MIN_AUDIO_ROTATION_PERIOD_MS - 1 },
+      keys: {
+        ...DEFAULT_CLIENT_CONFIG.media.keys,
+        audioRotationPeriodMs: MIN_AUDIO_ROTATION_PERIOD_MS - 1,
+      },
     };
     expect(() => validateMediaConfig(below)).toThrow(ClientConfigError);
     try {
@@ -133,7 +140,10 @@ describe('validation throws rather than clamping', () => {
 
     const at = {
       ...DEFAULT_CLIENT_CONFIG.media,
-      keys: { audioRotationPeriodMs: MIN_AUDIO_ROTATION_PERIOD_MS },
+      keys: {
+        ...DEFAULT_CLIENT_CONFIG.media.keys,
+        audioRotationPeriodMs: MIN_AUDIO_ROTATION_PERIOD_MS,
+      },
     };
     expect(() => validateMediaConfig(at)).not.toThrow();
   });
@@ -309,5 +319,73 @@ describe('validateMediaConfig — receive slots', () => {
   it('the default maxDecodeLanes covers the demo topology N', () => {
     // `scripts/dev-web.sh` DEMO_AUDIO_RECEIVE_SLOTS=3.
     expect(media.ingress.maxDecodeLanes).toBeGreaterThanOrEqual(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Story 3 C-A2 (R-23): the video publish knobs — code-config, validated,
+// floored, logged once with configured-vs-default distinguished.
+// ---------------------------------------------------------------------------
+
+describe('video publish knobs (story 3 R-23)', () => {
+  const base = DEFAULT_CLIENT_CONFIG.media;
+  const keyOf = (fn: () => void): string | undefined => {
+    try {
+      fn();
+      return undefined;
+    } catch (err) {
+      expect(err).toBeInstanceOf(ClientConfigError);
+      return (err as ClientConfigError).configKey;
+    }
+  };
+
+  it('defaults validate and the compiled floor is 100 ms', () => {
+    expect(() => validateMediaConfig(base)).not.toThrow();
+    expect(FLOOR).toBe(100);
+  });
+
+  it.each([
+    [
+      'media.keys.videoRotationPeriodMs',
+      { keys: { ...base.keys, videoRotationPeriodMs: MIN_T - 1 } },
+    ],
+    ['media.keys.videoRotationPeriodMs', { keys: { ...base.keys, videoRotationPeriodMs: 0 } }],
+    ['media.keys.videoKeyBearingFrames', { keys: { ...base.keys, videoKeyBearingFrames: 0 } }],
+    [
+      'media.keys.videoKeyBearingFrames',
+      { keys: { ...base.keys, videoKeyBearingFrames: MAX_N + 1 } },
+    ],
+    [
+      'media.egress.videoMaxBacklogFrames',
+      { egress: { ...base.egress, videoMaxBacklogFrames: 0 } },
+    ],
+    [
+      'media.egress.videoMaxBacklogBytes',
+      { egress: { ...base.egress, videoMaxBacklogBytes: 1.5 } },
+    ],
+  ] as const)(
+    'refuses an out-of-range %s with a typed ClientConfigError (never clamped)',
+    (key, patch) => {
+      expect(keyOf(() => validateMediaConfig({ ...base, ...patch }))).toBe(key);
+    },
+  );
+
+  it('accepts the boundary values', () => {
+    expect(() =>
+      validateMediaConfig({
+        ...base,
+        keys: { ...base.keys, videoRotationPeriodMs: MIN_T, videoKeyBearingFrames: MAX_N },
+      }),
+    ).not.toThrow();
+  });
+
+  it('logs every knob once with the config PROVENANCE (never inferred from a value), floor and ceiling compiled', () => {
+    expect(videoConfigLogLine(base, 'default')).toBe(
+      'media config (default): videoRotationPeriodMs=60000; videoKeyBearingFrames=3; ' +
+        'videoMaxBacklogFrames=30; videoMaxBacklogBytes=131072; videoMaxEncodeQueue=2; ' +
+        'keyframeMinIntervalFloorMs=100 (compiled); keyframeMinIntervalCeilingMs=10000 (compiled)',
+    );
+    // An embedder that SUPPLIED the default values is still `configured`.
+    expect(videoConfigLogLine(base, 'configured')).toMatch(/^media config \(configured\): /);
   });
 });

@@ -136,6 +136,25 @@ export interface KeyRotationConfig {
    * `media/lifecycle/transmitKeys.ts` and not the event-driven half.
    */
   readonly audioRotationPeriodMs: number;
+  /**
+   * `T` for VIDEO (story 3 R-14): the video stream rotates the session-wide
+   * transmit-key generation every T, measured from video publisher start, in
+   * addition to every group start and every KEK receipt. Separate from
+   * {@link audioRotationPeriodMs} so the two kinds' periods are tuned
+   * independently, with its own floor {@link MIN_VIDEO_ROTATION_PERIOD_MS}.
+   * Neither T forces a keyframe: the new key rides the next
+   * {@link videoKeyBearingFrames} frames instead.
+   */
+  readonly videoRotationPeriodMs: number;
+  /**
+   * N (story 3 R-14): how many consecutive video frames after ANY key change
+   * (T, group start, KEK receipt — whatever the trigger) carry the wrapped
+   * transmit key. Key-bearing frames are never discardable. Bounded
+   * `1..`{@link MAX_VIDEO_KEY_BEARING_FRAMES}: 0 would make a mid-group rotation
+   * undecryptable for a receiver that missed the group start, and a large N is
+   * pure overhead on every frame.
+   */
+  readonly videoKeyBearingFrames: number;
 }
 
 /** Bounded egress queue + the transport knobs beneath it (ADR-0036 §1, §11). */
@@ -186,6 +205,45 @@ export interface EgressConfig {
    * stale MH policy.
    */
   readonly transportOutgoingMaxAgeMs: number;
+  /**
+   * Per-TARGET video backlog cap, in FRAMES (story 3 R-12). A target whose
+   * unsent backlog for its current group would exceed this has that group
+   * stream RESET (never finished) and receives nothing until the next group —
+   * the publisher-decided abandonment. Bounds memory per target together with
+   * {@link videoMaxBacklogBytes}; whichever trips first wins.
+   */
+  readonly videoMaxBacklogFrames: number;
+  /** Per-TARGET video backlog cap, in BYTES of sealed frames. See {@link videoMaxBacklogFrames}. */
+  readonly videoMaxBacklogBytes: number;
+  /**
+   * Pre-encode bound (story 3 C-A2, ops F3): a captured video frame is DROPPED
+   * (closed, counted on `dt_client_media_encode_queue_dropped_total`) when the
+   * encoder already holds more than this many frames, so a CPU-starved or
+   * throttled tab sheds frames instead of growing memory and latency without
+   * bound. A pending keyframe carries to the next encoded frame.
+   */
+  readonly videoMaxEncodeQueue: number;
+}
+
+/**
+ * Video capability probe (story 3 R-8). NOT an encoding default — the SDK has
+ * no client default for any video encoding value, and every encoder is
+ * configured from (and re-probed at) MC's DIRECTED `EncodingParameters`. This
+ * shape exists only to decide, BEFORE the join, whether `CODEC_VP8` may be
+ * declared in `supported_codecs`, since the join precedes any directive. Its
+ * values are the production `media-codec-profile` (VP8 640x360, 30 fps,
+ * 800 kbps).
+ */
+export interface VideoCapabilityProbeConfig {
+  readonly width: number;
+  readonly height: number;
+  readonly frameRateHz: number;
+  readonly bitrateBps: number;
+}
+
+/** Video-path configuration (story 3). */
+export interface VideoConfig {
+  readonly capabilityProbe: VideoCapabilityProbeConfig;
 }
 
 /** Receive-path bounds. */
@@ -322,8 +380,15 @@ const SLOT_ID_SPACE = 0x1_0000;
 /** A receive-slot kind. */
 export type ReceiveSlotKind = MediaKindToken;
 
+/**
+ * THE provenance vocabulary for a client knob (R-23: absent vs defaulted is
+ * visible): `configured` when the embedder SUPPLIED it, `default` when it was
+ * absent and the SDK default applied — provenance, never a value comparison.
+ */
+export type ConfigValueSource = 'configured' | 'default';
+
 /** Whether a slot count came from the embedder's configuration or the SDK default. */
-export type ReceiveSlotsSource = 'configured' | 'default';
+export type ReceiveSlotsSource = ConfigValueSource;
 
 /** A parsed slot count, with where it came from (R-23: absent vs defaulted is visible). */
 export interface ParsedReceiveSlots {
@@ -418,6 +483,7 @@ export interface TelemetryCadenceConfig {
 /** Media-path configuration. */
 export interface MediaConfig {
   readonly audio: AudioConfig;
+  readonly video: VideoConfig;
   readonly keys: KeyRotationConfig;
   readonly egress: EgressConfig;
   readonly ingress: IngressConfig;
@@ -454,6 +520,45 @@ export interface ClientConfig {
  * validated and which is not.
  */
 export const MIN_AUDIO_ROTATION_PERIOD_MS = 1_000;
+
+/**
+ * Floor on {@link KeyRotationConfig.videoRotationPeriodMs}. Same derivation as
+ * {@link MIN_AUDIO_ROTATION_PERIOD_MS} (the retirement deferral's periodic half
+ * must exceed one HKDF-extract), kept as its own constant so the two kinds'
+ * floors can move independently.
+ */
+export const MIN_VIDEO_ROTATION_PERIOD_MS = 1_000;
+
+/** Upper bound on {@link KeyRotationConfig.videoKeyBearingFrames}. */
+export const MAX_VIDEO_KEY_BEARING_FRAMES = 30;
+
+/**
+ * ANCHOR (DRY): the COMPILED keyframe floor, in milliseconds (story 3 R-11,
+ * R-23). The publisher enforces max(directed `min_keyframe_interval_ms`, this)
+ * between ANY two keyframes on a stream (requested or self-keyed), so neither
+ * an absent nor a tiny directed value can raise its keyframe rate. A directed
+ * value below it is clamped and counted on
+ * `dt_client_media_keyframe_min_interval_clamped_total`.
+ *
+ * MUST EQUAL MC's `MIN_KEYFRAME_INTERVAL_MS_FLOOR` in
+ * `crates/mc-service/src/media_signaling/directive.rs` (the lowest value MC will
+ * direct from `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`). Pinned by
+ * `scripts/guards/simple/validate-keyframe-floor-sync.sh`, which reads this
+ * exact declaration line — keep it a single literal.
+ */
+export const KEYFRAME_MIN_INTERVAL_FLOOR_MS = 100;
+
+/**
+ * ANCHOR (DRY): the COMPILED keyframe-interval CEILING, in milliseconds. A
+ * directed `min_keyframe_interval_ms` above it is REFUSED as an invalid encoding
+ * field (`session/mediaWiring.ts:validateVideoEncoding`) — the wire field is a
+ * `uint32`, and a value past a timer's range would otherwise turn a bounded wait
+ * into a re-arm spin. MUST EQUAL MC's `MIN_KEYFRAME_INTERVAL_MS_CEILING` in
+ * `crates/mc-service/src/media_signaling/directive.rs` (the top of
+ * `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`'s range); pinned by the same
+ * `scripts/guards/simple/validate-keyframe-floor-sync.sh`.
+ */
+export const KEYFRAME_MIN_INTERVAL_CEILING_MS = 10_000;
 
 // ---------------------------------------------------------------------------
 // KEK PREVIOUS-GENERATION RETENTION (ADR-0036 §4, story 2 R-14)
@@ -605,13 +710,23 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
       opusUseInbandFec: false,
       opusPacketLossPerc: 0,
     },
+    video: {
+      capabilityProbe: { width: 640, height: 360, frameRateHz: 30, bitrateBps: 800_000 },
+    },
     keys: {
       audioRotationPeriodMs: 60_000,
+      videoRotationPeriodMs: 60_000,
+      videoKeyBearingFrames: 3,
     },
     egress: {
       maxQueueFrames: 10,
       transportOutgoingHighWaterMarkFrames: 2,
       transportOutgoingMaxAgeMs: 500,
+      // ~1 s of the production 800 kbps profile at 30 fps; a target that holds
+      // more than this is not keeping up and is better reset than queued.
+      videoMaxBacklogFrames: 30,
+      videoMaxBacklogBytes: 131_072,
+      videoMaxEncodeQueue: 2,
     },
     ingress: {
       transportIncomingHighWaterMarkFrames: 32,
@@ -693,6 +808,30 @@ export function validateMediaConfig(media: MediaConfig): void {
         `schedule rather than at this setting`,
     );
   }
+  positiveInteger(keys.videoRotationPeriodMs, 'media.keys.videoRotationPeriodMs');
+  if (keys.videoRotationPeriodMs < MIN_VIDEO_ROTATION_PERIOD_MS) {
+    throw new ClientConfigError(
+      'media.keys.videoRotationPeriodMs',
+      `media.keys.videoRotationPeriodMs (${keys.videoRotationPeriodMs}) must be at least ` +
+        `${MIN_VIDEO_ROTATION_PERIOD_MS}ms, for the same retirement-window reason as the audio period`,
+    );
+  }
+  positiveInteger(keys.videoKeyBearingFrames, 'media.keys.videoKeyBearingFrames');
+  if (keys.videoKeyBearingFrames > MAX_VIDEO_KEY_BEARING_FRAMES) {
+    throw new ClientConfigError(
+      'media.keys.videoKeyBearingFrames',
+      `media.keys.videoKeyBearingFrames must be 1..${MAX_VIDEO_KEY_BEARING_FRAMES}, ` +
+        `got ${keys.videoKeyBearingFrames}`,
+    );
+  }
+  positiveInteger(egress.videoMaxBacklogFrames, 'media.egress.videoMaxBacklogFrames');
+  positiveInteger(egress.videoMaxBacklogBytes, 'media.egress.videoMaxBacklogBytes');
+  positiveInteger(egress.videoMaxEncodeQueue, 'media.egress.videoMaxEncodeQueue');
+  const probe = media.video.capabilityProbe;
+  positiveInteger(probe.width, 'media.video.capabilityProbe.width');
+  positiveInteger(probe.height, 'media.video.capabilityProbe.height');
+  positiveInteger(probe.frameRateHz, 'media.video.capabilityProbe.frameRateHz');
+  positiveInteger(probe.bitrateBps, 'media.video.capabilityProbe.bitrateBps');
   positiveInteger(egress.maxQueueFrames, 'media.egress.maxQueueFrames');
   positiveInteger(
     egress.transportOutgoingHighWaterMarkFrames,
@@ -802,4 +941,31 @@ export function validateMediaConfig(media: MediaConfig): void {
         `floor drops frames from senders that have not yet re-wrapped under a rotated KEK`,
     );
   }
+}
+
+/**
+ * The video publish path's client knobs, as ONE log line (story 3 R-23), emitted
+ * once at video publisher start. `source` is the PROVENANCE of the media
+ * configuration (`configured` when the embedder supplied `mediaConfig`,
+ * `default` when it was absent — the same rule as the slot counts,
+ * `session/slotPlan.ts`); it is never inferred from a value. The keyframe floor
+ * and ceiling are `compiled` (constants, not settings). Numbers and fixed
+ * tokens only.
+ *
+ * TUNING / ROLLBACK: these are code-config — bundle constants, outside every
+ * ConfigMap and the env-config guard. Changing one means rebuilding and
+ * redeploying the web app (or the embedder's bundle); there is no runtime lever.
+ */
+export function videoConfigLogLine(media: MediaConfig, source: ConfigValueSource): string {
+  const { keys, egress } = media;
+  return (
+    `media config (${source}): ` +
+    `videoRotationPeriodMs=${keys.videoRotationPeriodMs}; ` +
+    `videoKeyBearingFrames=${keys.videoKeyBearingFrames}; ` +
+    `videoMaxBacklogFrames=${egress.videoMaxBacklogFrames}; ` +
+    `videoMaxBacklogBytes=${egress.videoMaxBacklogBytes}; ` +
+    `videoMaxEncodeQueue=${egress.videoMaxEncodeQueue}; ` +
+    `keyframeMinIntervalFloorMs=${KEYFRAME_MIN_INTERVAL_FLOOR_MS} (compiled); ` +
+    `keyframeMinIntervalCeilingMs=${KEYFRAME_MIN_INTERVAL_CEILING_MS} (compiled)`
+  );
 }

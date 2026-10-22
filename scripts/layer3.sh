@@ -66,6 +66,12 @@ layer_lifecycle_begin 3
   # nothing and report success. Deliberately NOT under guards/simple/ for the same
   # find -name '*.sh' reason. No cluster.
   run_and_emit "slug-class-sync-guard-selftest" "${__here}/guards/validate-slug-class-sync.test.sh" || true
+  # Keyframe-floor sync self-test (story 3 C-A2): validate-keyframe-floor-sync.sh pins the
+  # SDK's compiled keyframe floor to MC's MIN_KEYFRAME_INTERVAL_MS_FLOOR; in-tree it always
+  # passes, so its drift and literal-not-found branches are exercised here against edited
+  # COPIES of the real files via the KEYFRAME_FLOOR_SYNC_*_SRC seams. Same find -name '*.sh'
+  # reason for living outside guards/simple/. No cluster.
+  run_and_emit "keyframe-floor-sync-guard-selftest" "${__here}/guards/validate-keyframe-floor-sync.test.sh" || true
   # Counter-zero-init self-test (ADR-0036 story-1 counter-visibility fix): the guard PASSES on
   # every real run (all four services are zero-init'd), so its failure branches — the positive
   # control (a planted lazy counter MUST fire), the exempt/malformed/mutual-exclusion paths, the

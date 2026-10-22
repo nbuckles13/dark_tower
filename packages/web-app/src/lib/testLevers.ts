@@ -32,7 +32,7 @@
 // mistyped lever can never pass S10a vacuously as "connected to everything".
 
 import { parseReceiveSlots } from '@darktower/sdk-core';
-import type { ParsedReceiveSlots, WebTransportConnectFn } from '@darktower/sdk-core';
+import type { ParsedReceiveSlots, PublishKind, WebTransportConnectFn } from '@darktower/sdk-core';
 
 /** The validated, frozen levers for this browsing context. */
 export interface TestLevers {
@@ -40,7 +40,21 @@ export interface TestLevers {
   readonly audioReceiveSlots: ParsedReceiveSlots | undefined;
   readonly videoReceiveSlots: ParsedReceiveSlots | undefined;
   readonly forceHostControls: boolean;
+  /**
+   * Story 3 C-A2: this context's publish set, from the e2e cohort contract's
+   * `audio | video | both | none` (`e2e/cohort.ts`). `undefined`: the app
+   * default (audio). Frozen at session build like every lever.
+   */
+  readonly publish: readonly PublishKind[] | undefined;
 }
+
+/** The cohort contract's publish-set spellings -> the SDK's publish set. */
+const PUBLISH_SETS: Readonly<Record<string, readonly PublishKind[]>> = {
+  audio: ['audio'],
+  video: ['video'],
+  both: ['audio', 'video'],
+  none: [],
+};
 
 /** The only keys the init-script global may carry. */
 const LEVER_KEYS: readonly string[] = [
@@ -48,6 +62,7 @@ const LEVER_KEYS: readonly string[] = [
   'audioReceiveSlots',
   'videoReceiveSlots',
   'forceHostControls',
+  'publish',
 ];
 
 /** Prefix on every lever error, so a failure names its cause. */
@@ -89,8 +104,16 @@ export function parseTestLevers(raw: unknown): TestLevers | undefined {
   if (typeof force !== 'boolean') {
     throw new Error(`${LEVER_ERROR} forceHostControls must be a boolean`);
   }
+  const publish = record['publish'];
+  if (
+    publish !== undefined &&
+    (typeof publish !== 'string' || !Object.hasOwn(PUBLISH_SETS, publish))
+  ) {
+    throw new Error(`${LEVER_ERROR} publish must be one of audio, video, both, none`);
+  }
   return Object.freeze({
     blockHandlers: Object.freeze([...(block as string[])]),
+    publish: publish === undefined ? undefined : Object.freeze([...PUBLISH_SETS[publish]!]),
     audioReceiveSlots:
       audioSlots === undefined ? undefined : parseReceiveSlots(audioSlots, 'audio'),
     videoReceiveSlots:

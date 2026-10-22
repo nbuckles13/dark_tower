@@ -10,6 +10,7 @@ import {
   DEFAULT_CLIENT_CONFIG,
   validateMediaConfig,
   type MediaConfig,
+  type ConfigValueSource,
   type ReceiveSlotsSource,
 } from '../config/clientConfig.js';
 import type { PublishKind, ReceiveSlotDeclaration } from '../signaling/events.js';
@@ -24,6 +25,8 @@ export class SlotPlan {
   readonly publish: readonly PublishKind[];
   /** Audio ids `0..N-1`, then video `N..N+M-1`; the one producer is `receiveDeclaration`. */
   readonly declaration: readonly ReceiveSlotDeclaration[];
+  /** Provenance of the media configuration as a whole (R-23). */
+  readonly mediaConfigSource: ConfigValueSource;
   readonly #audioSource: ReceiveSlotsSource;
   readonly #videoSource: ReceiveSlotsSource;
   /** `JoinResponse.max_{audio,video}_receive_slots`, verbatim (`undefined` = absent). */
@@ -46,7 +49,8 @@ export class SlotPlan {
       },
     };
     validateMediaConfig(this.mediaConfig);
-    const fallbackSource: ReceiveSlotsSource = options.mediaConfig ? 'configured' : 'default';
+    const fallbackSource: ConfigValueSource = options.mediaConfig ? 'configured' : 'default';
+    this.mediaConfigSource = fallbackSource;
     this.#audioSource = options.audioReceiveSlots?.source ?? fallbackSource;
     this.#videoSource = options.videoReceiveSlots?.source ?? fallbackSource;
     const { audioSlots, videoSlots } = this.mediaConfig.receive;

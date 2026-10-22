@@ -42,10 +42,13 @@ export { CAPTURE_MESSAGE, CaptureFailure, MediaCaptureError, classifyCaptureErro
  * Typed narrowly and looked up off `globalThis` so its absence is a loud, typed
  * `platform_unsupported` rather than a `ReferenceError` from somewhere deeper.
  */
-interface TrackProcessorLike {
-  readonly readable: ReadableStream<AudioData>;
+interface TrackProcessorLike<F> {
+  readonly readable: ReadableStream<F>;
 }
-type TrackProcessorCtor = new (init: { track: MediaStreamTrack }) => TrackProcessorLike;
+/** The processor constructor, parameterised by the frame type it yields. */
+export type TrackProcessorCtor<F = AudioData> = new (init: {
+  track: MediaStreamTrack;
+}) => TrackProcessorLike<F>;
 
 /**
  * Enumerate available microphones.
@@ -208,13 +211,14 @@ export function createTestToneCapture(options: {
 }
 
 /** Chrome's `MediaStreamTrackProcessor`, looked up so its absence is typed. */
-function trackProcessor(): TrackProcessorCtor | undefined {
-  return (globalThis as { MediaStreamTrackProcessor?: TrackProcessorCtor })
+export function trackProcessor<F = AudioData>(): TrackProcessorCtor<F> | undefined {
+  return (globalThis as { MediaStreamTrackProcessor?: TrackProcessorCtor<F> })
     .MediaStreamTrackProcessor;
 }
 
 /**
- * THE ONE track -> frames lifecycle, shared by every capture source, so the
+ * THE ONE track -> frames lifecycle, shared by every capture source (microphone,
+ * test tone, camera and test pattern — `./videoCapture.ts`), so the
  * teardown ORDER and the registration rule live in one place and a tone frame
  * leaves through exactly the path a microphone frame does.
  *
@@ -222,12 +226,14 @@ function trackProcessor(): TrackProcessorCtor | undefined {
  * reaches it and the microphone indicator goes out; if `stop()` already ran
  * during the caller's acquisition it stops the track immediately.
  */
-function trackCapture(Processor: TrackProcessorCtor): {
-  attach(track: MediaStreamTrack, onFrame: (data: AudioData) => void, onEnded: () => void): void;
+export function trackCapture<F = AudioData>(
+  Processor: TrackProcessorCtor<F>,
+): {
+  attach(track: MediaStreamTrack, onFrame: (data: F) => void, onEnded: () => void): void;
   stop(): void;
 } {
   let track: MediaStreamTrack | undefined;
-  let reader: ReadableStreamDefaultReader<AudioData> | undefined;
+  let reader: ReadableStreamDefaultReader<F> | undefined;
   let stopped = false;
 
   const stop = (): void => {
@@ -248,7 +254,7 @@ function trackCapture(Processor: TrackProcessorCtor): {
 
   const attach = (
     acquired: MediaStreamTrack,
-    onFrame: (data: AudioData) => void,
+    onFrame: (data: F) => void,
     onEnded: () => void,
   ): void => {
     // REGISTERED BEFORE ANYTHING ELSE. If anything below throws, `stop()` still
@@ -276,9 +282,9 @@ function trackCapture(Processor: TrackProcessorCtor): {
  * so awaiting it would never return. The loop exits when the reader is cancelled
  * by `stop()`.
  */
-async function pump(
-  reader: ReadableStreamDefaultReader<AudioData>,
-  onFrame: (data: AudioData) => void,
+async function pump<F>(
+  reader: ReadableStreamDefaultReader<F>,
+  onFrame: (data: F) => void,
 ): Promise<void> {
   try {
     for (;;) {

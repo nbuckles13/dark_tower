@@ -173,11 +173,13 @@ overrides:
   brace-expansion: '>=5.0.11'
   devalue: '>=5.9.3 <6'
   fast-uri: '>=3.1.6 <4'
+  follow-redirects: '>=1.16.1 <2'
   nanoid: '>=3.3.17 <4'
   postcss: '>=8.5.18'
   smol-toml: '>=1.7.1'
   source-map-js: '>=1.2.2 <2'
   undici: '>=7.29.1 <8'
+  vite: '>=8.2.4 <9'
 
 importers:
 
@@ -275,7 +277,7 @@ importers:
         specifier: 6.0.3
         version: 6.0.3
       vite:
-        specifier: ^8.3.4
+        specifier: '>=8.2.4 <9'
         version: 8.3.4(@types/node@22.20.1)(yaml@2.9.0)
       vite-plugin-dts:
         specifier: ^5.1.2
@@ -318,7 +320,7 @@ importers:
         specifier: 6.0.3
         version: 6.0.3
       vite:
-        specifier: ^8.3.4
+        specifier: '>=8.2.4 <9'
         version: 8.3.4(@types/node@22.20.1)(yaml@2.9.0)
       vite-plugin-dts:
         specifier: ^5.1.2
@@ -342,7 +344,7 @@ importers:
         specifier: 6.0.3
         version: 6.0.3
       vite:
-        specifier: ^8.3.4
+        specifier: '>=8.2.4 <9'
         version: 8.3.4(@types/node@22.20.1)(yaml@2.9.0)
       vite-plugin-dts:
         specifier: ^5.1.2
@@ -388,7 +390,7 @@ importers:
         specifier: 6.0.3
         version: 6.0.3
       vite:
-        specifier: ^8.3.4
+        specifier: '>=8.2.4 <9'
         version: 8.3.4(@types/node@22.20.1)(yaml@2.9.0)
       vitest:
         specifier: ^5.0.5
@@ -1213,7 +1215,7 @@ packages:
     engines: {node: ^20.19 || ^22.12 || >=24}
     peerDependencies:
       svelte: ^5.46.4
-      vite: ^8.0.0-beta.7 || ^8.0.0
+      vite: '>=8.2.4 <9'
 
   '@testing-library/svelte-core@1.1.3':
     resolution: {integrity: sha512-KkMAvXeWorxN2Yn0kdC1lfoAItxpoj4uOWzxK5leDrNxonLvS5nwBFvztrroyTszQ0Wf/EU6iLT8JhY5qcn22g==}
@@ -1357,7 +1359,7 @@ packages:
     resolution: {integrity: sha512-xLL3lkDegJZw+MGoGaCCsFayDZthGgpAtr3Vziyfc4p7xH89K7KRPcRBBh/kEYm0Aqkt5DtTmkYpBtRV/FrHZg==}
     peerDependencies:
       msw: ^2.4.9 || ^3.0.0
-      vite: ^6.0.0 || ^7.0.0 || ^8.0.0
+      vite: '>=8.2.4 <9'
     peerDependenciesMeta:
       msw:
         optional: true
@@ -2556,7 +2558,7 @@ packages:
       rolldown: '*'
       rollup: '>=3'
       typescript: '>=4'
-      vite: '>=3'
+      vite: '>=8.2.4 <9'
       webpack: ^4 || ^5
     peerDependenciesMeta:
       '@microsoft/api-extractor':
@@ -2594,7 +2596,7 @@ packages:
     peerDependencies:
       '@microsoft/api-extractor': '>=7'
       rollup: '>=3'
-      vite: '>=3'
+      vite: '>=8.2.4 <9'
     peerDependenciesMeta:
       '@microsoft/api-extractor':
         optional: true
@@ -2649,7 +2651,7 @@ packages:
   vitefu@1.1.3:
     resolution: {integrity: sha512-ub4okH7Z5KLjb6hDyjqrGXqWtWvoYdU3IGm/NorpgHncKoLTCfRIbvlhBm7r0YstIaQRYlp4yEbFqDcKSzXSSg==}
     peerDependencies:
-      vite: ^3.0.0 || ^4.0.0 || ^5.0.0 || ^6.0.0 || ^7.0.0 || ^8.0.0
+      vite: '>=8.2.4 <9'
     peerDependenciesMeta:
       vite:
         optional: true
@@ -2676,7 +2678,7 @@ packages:
       '@vitest/ui': 5.0.5
       happy-dom: '*'
       jsdom: '*'
-      vite: ^6.4.0 || ^7.0.0 || ^8.0.0
+      vite: '>=8.2.4 <9'
     peerDependenciesMeta:
       '@edge-runtime/vm':
         optional: true

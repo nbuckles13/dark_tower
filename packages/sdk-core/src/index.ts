@@ -288,6 +288,7 @@ export type {
   ReceiveConfig,
   ReceiveSlotKind,
   ReceiveSlotsSource,
+  ConfigValueSource,
   ReceiverStateConfig,
   TelemetryCadenceConfig,
 } from './config/clientConfig.js';
@@ -303,6 +304,11 @@ export type {
   PipelineKekSource,
   ReceiveAssignment,
 } from './media/lifecycle/AudioPipeline.js';
+export { VideoPublisher } from './media/lifecycle/VideoPublisher.js';
+export type {
+  VideoPublisherOptions,
+  VideoSendDirective,
+} from './media/lifecycle/VideoPublisher.js';
 export { MuteState } from './media/lifecycle/muteState.js';
 export type { MuteSnapshot } from './media/lifecycle/muteState.js';
 
@@ -310,6 +316,7 @@ export {
   MEDIA_KEK_INSTALL_REFUSALS,
   MEDIA_KEK_RETENTION_ANOMALIES,
   MEDIA_KEK_SOURCES,
+  MEDIA_KEYFRAME_SOURCES,
   MEDIA_MUTE_ACTIONS,
   MEDIA_KIND_LABELS,
   MEDIA_SEND_DROP_REASONS,
@@ -352,6 +359,8 @@ export type {
 } from './media/setup/rosterKeys.js';
 export { CaptureFailure, MediaCaptureError, listMicrophones } from './media/setup/capture.js';
 export { AudioCodecUnsupportedError } from './media/setup/opus.js';
+export { VideoCodecUnsupportedError, probeVp8Support } from './media/setup/vp8.js';
+export type { Vp8Profile, Vp8ProbeApi } from './media/setup/vp8.js';
 export {
   MediaPlaybackError,
   PlaybackFailure,
@@ -371,6 +380,12 @@ export type {
   PlaybackLane,
   PlaybackSink,
   PlaybackSinkFactory,
+  DirectedVideoEncoding,
+  EncodedVideoFrame,
+  VideoCaptureSource,
+  VideoCaptureSourceFactory,
+  VideoEncoderFactory,
+  VideoEncoderSeam,
 } from './media/setup/seams.js';
 
 // `generateIdentityKeyPair` and `IdentityKeyPair` are deliberately NOT exported.
@@ -390,6 +405,7 @@ export type { PublisherRegionInput } from './media/frame/frameCodec.js';
 export type {
   CaptureResumedAfterServerMuteEvent,
   CaptureSourceInfo,
+  VideoCaptureSourceInfo,
   KindSlotsDiagnostics,
   ReceiveSlotCap,
   ReceiveSlotsDiagnostics,
@@ -418,6 +434,7 @@ export type {
   ReceiveSlotDeclaration,
   SendDirectiveEvent,
   SendStreamDirective,
+  SendStreamEncoding,
   SlotMediaKind,
   SlotStateToken,
   StreamAssignmentEvent,

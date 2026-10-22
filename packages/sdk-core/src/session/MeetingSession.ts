@@ -31,45 +31,42 @@ import { AuthApiClient } from '../http/AuthApiClient.js';
 import { bytesToHex } from '../media/frame/hex.js';
 import { MeetingApiClient } from '../http/MeetingApiClient.js';
 import { SignalingClient } from '../signaling/SignalingClient.js';
+import { SignalingCodec } from '../signaling/codecMap.js';
 import type { SignalingClientOptions } from '../signaling/SignalingClient.js';
 import type { JoinedEvent } from '../signaling/events.js';
 import { MediaTransport } from '../media/MediaTransport.js';
 import type { MediaTransportOptions } from '../media/events.js';
 import { MeetingIdentity } from '../media/setup/identity.js';
-import { AudioPipeline, type AudioPipelineOptions } from '../media/lifecycle/AudioPipeline.js';
+import type { AudioPipeline } from '../media/lifecycle/AudioPipeline.js';
 import { MeetingKekHolder } from '../media/setup/kekSource.js';
 import {
   kekObserver,
   mhControlSink,
   rosterInvalidationListener,
-  pipelineListeners,
   zeroInitDirectiveSeries,
 } from './mediaWiring.js';
-import { declaredSlotIds, selectCaptureSource } from './mediaSelection.js';
 import { readIsHost } from './meetingRole.js';
 import { MediaMetrics } from '../media/setup/mediaMetrics.js';
 import type { MuteSnapshot } from '../media/lifecycle/muteState.js';
 import { RosterIdentityKeys } from '../media/setup/rosterKeys.js';
 import type { ReceiveVerificationRecorder } from '../media/pipeline/receiveVerification.js';
-import { createAudioDecoder, createAudioEncoder } from '../media/setup/opus.js';
-import { createAudioContextPlaybackSink } from '../media/setup/audioPlayback.js';
-import type {
-  AudioDecoderFactory,
-  AudioEncoderFactory,
-  CaptureSourceFactory,
-  PlaybackSinkFactory,
-} from '../media/setup/seams.js';
+import type { VideoPublisher } from '../media/lifecycle/VideoPublisher.js';
+import { probeVp8Support, type Vp8Profile } from '../media/setup/vp8.js';
 import { TypedEventEmitter } from '../events/TypedEventEmitter.js';
+import {
+  buildSessionMedia,
+  probeVideoCodec,
+  sessionMediaSeams,
+  vp8StartFault,
+  type SessionMedia,
+  type SessionMediaSeams,
+  type Vp8ProbeResult,
+} from './mediaStart.js';
 import { validateUserToken } from '../validation/limits.js';
 import { SignalingError, SignalingErrorCode } from '../errors/SignalingError.js';
 import { MeetingUnauthorizedError } from '../errors/MeetingError.js';
 import { CloseReason, normalizeCloseReason } from '../telemetry/closeReason.js';
-import {
-  configureTelemetry,
-  flushMetrics,
-  getMetricExportIntervalMs,
-  getMetricsSink,
-} from '../telemetry/telemetryConfig.js';
+import { configureTelemetry, flushMetrics, getMetricsSink } from '../telemetry/telemetryConfig.js';
 import type { TelemetryConfig } from '../telemetry/telemetryConfig.js';
 import type { MetricLabels, MetricsSink } from '../telemetry/MetricsSink.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
@@ -77,6 +74,7 @@ import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
 import {
   MeetingSessionState,
   type CaptureSourceInfo,
+  type VideoCaptureSourceInfo,
   type JoinCredentials,
   type JoinOptions,
   type MeetingSessionEventMap,
@@ -307,8 +305,6 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   #pipeline: AudioPipeline | undefined;
   #senderId: number | undefined;
   #orgId = '';
-  /** The embedder's capture factory, if it injected one. See {@link #selectCaptureSource}. */
-  readonly #injectedCaptureFactory: CaptureSourceFactory | undefined;
   readonly #receiveVerification: ReceiveVerificationRecorder | undefined;
   /**
    * What this session publishes and declares, and the caps its join reported —
@@ -322,15 +318,18 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
    */
   readonly #mediaState: SignalingMediaState;
   #captureSource: CaptureSourceInfo | undefined;
+  /** What `startMedia()` built (keys, audio, video) and its one release. */
+  #sessionMedia: SessionMedia | undefined;
+  /** The join-time VP8 probe (story 3 R-8); `undefined` when video is not in use. */
+  #vp8: Vp8ProbeResult | undefined;
+  readonly #seams: SessionMediaSeams;
+  readonly #vp8Probe: (profile: Vp8Profile) => Promise<void>;
   /**
    * Whether the meeting token names this participant host — a UI HINT for the
    * server-mute affordance, never an authority (MC authorises every request).
    * Only this boolean survives `join()`; see `meetingRole.ts`.
    */
   #isHost = false;
-  readonly #encoderFactory: AudioEncoderFactory;
-  readonly #decoderFactory: AudioDecoderFactory;
-  readonly #playbackFactory: PlaybackSinkFactory;
 
   constructor(options: MeetingSessionOptions) {
     super();
@@ -358,10 +357,8 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       rewrapLatencyMs: transmitRewrapLatencyMs(this.#mediaConfig),
       clock: this.#clock,
     });
-    this.#injectedCaptureFactory = options.captureFactory;
-    this.#encoderFactory = options.encoderFactory ?? createAudioEncoder;
-    this.#decoderFactory = options.decoderFactory ?? createAudioDecoder;
-    this.#playbackFactory = options.playbackFactory ?? createAudioContextPlaybackSink;
+    this.#seams = sessionMediaSeams(options);
+    this.#vp8Probe = options.vp8Probe ?? ((profile) => probeVp8Support(profile));
   }
 
   /**
@@ -438,6 +435,16 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       // join request, so its public half can travel on it. Per meeting, never
       // persisted, private half non-extractable.
       this.#identity = await MeetingIdentity.create();
+
+      // Story 3 R-8: when video is published or received, prove VP8 encode AND
+      // decode BEFORE the join, so `CODEC_VP8` is declared only when both pass.
+      // A failure does not fail the join: it is held and fails `startMedia()`
+      // loudly (never an audio-only degradation).
+      this.#vp8 = await probeVideoCodec(
+        this.#slots.publish.includes('video') || this.#mediaConfig.receive.videoSlots > 0,
+        this.#mediaConfig.video.capabilityProbe,
+        this.#vp8Probe,
+      );
 
       // --- connecting-mc: MC signaling join ---
       this.#setState(MeetingSessionState.ConnectingMc);
@@ -532,15 +539,20 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
    * healthy. Degraded audio beats a dropped meeting.
    *
    * ---------------------------------------------------------------------------
-   * THE ORDER IS FIXED: DECLARE CAPABILITY, THEN EXPECT A DIRECTIVE
+   * THE DECLARATION RODE THE JOIN
    * ---------------------------------------------------------------------------
    *
-   * MC emits the send directive when the client declares its receive capability,
-   * NOT at join. A client that joins and never declares is never told to send,
-   * and the connection stays healthy in every other respect — which is exactly
-   * what makes the omission hard to notice from the client side.
+   * The join carried the publish set and the receive declaration (story 3 R-2),
+   * so MC directs from the join; the directive and assignments already received
+   * are replayed into the pipeline as it attaches. No post-join declaration is
+   * sent here (a redeclaration stays available).
+   *
+   * VIDEO (story 3 C-A2): when video is published or received and the join-time
+   * VP8 probe failed, this THROWS `VideoCodecUnsupportedError` and emits a fatal
+   * `mediaFault` — never an audio-only degradation (R-8).
    *
    * @throws {SignalingError} if called before a settled join.
+   * @throws {VideoCodecUnsupportedError} if VP8 is unsupported and video is in use.
    */
   async startMedia(options: StartMediaOptions = {}): Promise<AudioPipeline> {
     const signaling = this.#signaling;
@@ -566,20 +578,26 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     // — the dimension ADR-0036 §11 bars from every media emission.
     const metrics = this.#mediaMetrics ?? this.#buildMediaMetrics();
 
-    const capture = selectCaptureSource(this.#injectedCaptureFactory, senderId);
-    const media = this.#media;
-    const pipelineOptions: AudioPipelineOptions = {
+    // R-8: video in use and VP8 unproven -> fail media start LOUDLY, typed.
+    if (this.#vp8?.ok === false) {
+      this.emit('mediaFault', vp8StartFault(this.#vp8.error));
+      throw this.#vp8.error;
+    }
+
+    // The session's ONE transmit-key manager + KEK subscription, the audio
+    // pipeline and (when published) the video publisher — `mediaStart.ts`.
+    const built = buildSessionMedia({
       config: this.#mediaConfig,
+      configSource: this.#slots.mediaConfigSource,
       metrics,
       kekSource: this.#kekSource,
       roster:
         this.#rosterKeys ?? new RosterIdentityKeys(this.#mediaConfig.ingress.maxCachedIdentityKeys),
       senderId,
       identity,
-      // Receive side only: the audio ids of the ONE declaration.
-      declaredSlotIds: declaredSlotIds(this.#slots.declaration, 'audio'),
-      senderFor: (url) => media?.getDatagramChannel(url),
-      readableFor: (url) => media?.getDatagramChannel(url)?.readable,
+      publish: this.#slots.publish,
+      declaration: this.#slots.declaration,
+      media: this.#media,
       mute: this.#mediaState.mute,
       reportMute: (state) => {
         // Informational and deliberately best-effort: ADR-0036 §5 requires
@@ -589,54 +607,23 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
           // Nothing actionable, and nothing safe to log about a mute report.
         });
       },
-      captureFactory: capture.factory,
-      captureSource: capture.info.mode,
-      metricExportIntervalMs: getMetricExportIntervalMs(),
-      encoderFactory: this.#encoderFactory,
-      decoderFactory: this.#decoderFactory,
-      playbackFactory: this.#playbackFactory,
-      ...(this.#receiveVerification ? { verification: this.#receiveVerification } : {}),
+      seams: this.#seams,
+      verification: this.#receiveVerification,
       clock: this.#clock,
-    };
-    const pipeline = new AudioPipeline(pipelineOptions);
+      emit: {
+        muteChanged: (snapshot) => this.emit('muteChanged', snapshot),
+        firstMediaFrame: (elapsedMs) => this.emit('firstMediaFrame', elapsedMs),
+        mediaFault: (fault) => this.emit('mediaFault', fault),
+      },
+      mediaState: this.#mediaState,
+    });
+    this.#sessionMedia = built;
+    const { pipeline } = built;
     this.#pipeline = pipeline;
-    this.#captureSource = capture.info;
+    this.#captureSource = built.captureInfo;
 
-    // The remaining three absence-signals (§5/§10), forwarded verbatim — see
-    // `session/events.ts`. Subscribed immediately after construction and before
-    // `start()`, so nothing the pipeline can emit is missed: `firstMediaFrame`
-    // in particular is armed inside `start()` and could otherwise fire into no
-    // listener on a fast loopback.
-    //
-    // Nothing is recomputed here. `muteChanged` is the ONLY mute source a UI may
-    // render from, and re-deriving it (from frame counts, a timer, or the click
-    // that requested it) is what §5's out-of-band rule exists to prevent.
-    pipeline.on('muteChanged', (snapshot) => this.emit('muteChanged', snapshot));
-    pipeline.on('firstMediaFrame', (elapsedMs) => this.emit('firstMediaFrame', elapsedMs));
-    pipeline.on('fault', (fault) => this.emit('mediaFault', fault));
-
-    // What MC directs this client to SEND (per published kind) and which slots
-    // it RECEIVES, wired by `mediaWiring.ts:pipelineListeners`; E3: what MC
-    // already sent is replayed ONCE as they attach, later updates go through.
-    this.#mediaState.attach(
-      pipelineListeners({
-        publish: this.#slots.publish,
-        pipeline,
-        defaultBitrateBps: this.#mediaConfig.audio.defaultBitrateBps,
-        metrics,
-        fault: (fault) => this.emit('mediaFault', fault),
-        effectiveTargets: (kind, nonEmpty) => this.#mediaState.effectiveTargets(kind, nonEmpty),
-      }),
-    );
-
-    // TRANSITIONAL (C-A1 shim a) — deleted by C-A2 (story 3 task 13). The
-    // controller in service before MC-A ignores the join-carried declaration and
-    // emits the directive and assignments only when a post-join
-    // `ReceiveCapability` arrives, so send one, IDENTICAL to the join-carried
-    // declaration (the same frozen value). After MC-A it is a legal no-op
-    // redeclaration (`accepted_unchanged`).
-    await signaling.sendReceiveCapability(this.#slots.declaration);
-    await pipeline.start(options.deviceId !== undefined ? { deviceId: options.deviceId } : {});
+    // Audio then video; a failure releases everything (keys cleared) first.
+    await built.start(options.deviceId !== undefined ? { deviceId: options.deviceId } : {});
     return pipeline;
   }
 
@@ -702,11 +689,29 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   }
 
   /**
-   * VIDEO client mute (story 3 R-15, R-17); never touches audio. No video
-   * capture until story 3 C-A2: state, `muteChanged` and the both-kinds report.
+   * VIDEO client mute (story 3 R-15, R-17); never touches audio. Via the video
+   * publisher when running: the camera STOPS; unmute re-acquires it (also the
+   * R-19 retry edge).
    */
   setVideoMuted(muted: boolean): void {
-    this.#clientMuteChanged(this.#mediaState.setClientMute('video', muted));
+    const video = this.video;
+    if (video) video.setMuted(muted);
+    else this.#clientMuteChanged(this.#mediaState.setClientMute('video', muted));
+  }
+
+  /** The video publisher, once media started with video published. */
+  get video(): VideoPublisher | undefined {
+    return this.#sessionMedia?.video;
+  }
+
+  /** Camera light: directed with targets AND not client-muted AND healthy. Sampled. */
+  get cameraTrackLive(): boolean {
+    return this.video?.cameraTrackLive ?? false;
+  }
+
+  /** What feeds the VIDEO send path, once media started with video published. */
+  get videoCaptureSource(): VideoCaptureSourceInfo | undefined {
+    return this.#sessionMedia?.videoCaptureInfo;
   }
 
   /** The current client-mute state, both kinds. */
@@ -836,10 +841,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         // only. An unhandled rejection here would surface in the embedder's
         // error reporting attributed to the SDK, on disconnect, exactly when
         // something else has already gone wrong.
-        void this.#pipeline?.stop().catch(() => {
-          // Teardown is already complete by the time a fault can be raised —
-          // `dispose()` has run — so resources are released either way.
-        });
+        void this.#sessionMedia?.release();
       } catch {
         // ignore — best-effort teardown
       }
@@ -983,6 +985,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         // The frozen fields, never the options object (story 3 R-2).
         publishKinds: this.#slots.publish,
         receiveSlots: this.#slots.declaration,
+        capabilities: { supportedCodecs: this.#vp8?.ok === true ? [SignalingCodec.Vp8] : [] },
       });
       this.#emitSignalingConnection('success', CloseReason.Normal);
       this.#histogram('dt_client_time_to_signaling_ready_ms');
@@ -1008,12 +1011,14 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         incomingHighWaterMark: this.#mediaConfig.ingress.transportIncomingHighWaterMarkFrames,
       },
       runInContext: (fn) => signaling.runInJoinContext(fn),
-      // The MH control channel's input (story 3): every keyframe request is
-      // refused `not_sending` until C-A2; malformed input is counted.
+      // The MH control channel's input (story 3): a keyframe request for the
+      // directed video stream reaches the video publisher's gate; everything
+      // else is refused and counted before any gate state is touched.
       controlSink: mhControlSink({
         metrics,
         publish: this.#slots.publish,
         latestDirective: () => this.#mediaState.latestDirective,
+        video: () => this.video,
       }),
       ...(this.#connectFn ? { connect: this.#connectFn } : {}),
       ...(this.#connectTimeoutMs !== undefined ? { connectTimeoutMs: this.#connectTimeoutMs } : {}),

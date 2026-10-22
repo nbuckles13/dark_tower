@@ -14,6 +14,7 @@
 import { MeetingSessionState, TypedEventEmitter } from '@darktower/sdk-core';
 import type {
   CaptureSourceInfo,
+  VideoCaptureSourceInfo,
   JoinedEvent,
   MediaFrameCounts,
   ReceiveSlotsDiagnostics,
@@ -41,6 +42,8 @@ export class FakeAudioPipeline {
     framesDropped: 0,
     lastDropReason: undefined,
   };
+  /** Sampled by the E2E bus's `sendTracks` (story 3). */
+  captureOpen = true;
   /** Make the next `setCaptureDevice` reject, as an unavailable device would. */
   failNextDeviceChange = false;
 
@@ -121,6 +124,10 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
   };
   /** Set by `startMedia()` to the microphone, as the real facade's default. */
   captureSource: CaptureSourceInfo | undefined;
+  /** The video capture source (story 3), `undefined` unless a test sets it. */
+  videoCaptureSource: VideoCaptureSourceInfo | undefined;
+  /** The camera light (story 3). */
+  cameraTrackLive = false;
 
   /** The running pipeline, or `undefined` before `startMedia()` — as the real facade. */
   media: FakeAudioPipeline | undefined;

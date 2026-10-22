@@ -234,6 +234,18 @@ export interface ReceiveSlotDeclaration {
   readonly mediaKind: MediaKindToken;
 }
 
+/** `EncodingParameters` as received on a send directive (story 3). */
+export interface SendStreamEncoding {
+  /** The public codec, or `null` for `CODEC_UNSPECIFIED` / an unknown value. */
+  readonly codec: SignalingCodec | null;
+  readonly width: number;
+  readonly height: number;
+  readonly frameRate: number;
+  readonly maxBitrateBps: number;
+  /** `optional` on the wire: `undefined` when absent, a present 0 stays 0. */
+  readonly minKeyframeIntervalMs: number | undefined;
+}
+
 /** One stream MC directs this client to produce (ADR-0036 §5). */
 export interface SendStreamDirective {
   /** The publisher's stream index. 8-bit semantics: it is the key id's stream field. */
@@ -250,6 +262,14 @@ export interface SendStreamDirective {
    * fielded clients the first time an operator legitimately moved the ceiling.
    */
   readonly maxBitrateBps: number | undefined;
+  /**
+   * The directed `EncodingParameters` as received, or `undefined` when MC sent
+   * none. Carried RAW (0 = absent for the plain scalars): the video send path
+   * validates it (`session/mediaWiring.ts:validateVideoEncoding`) and refuses a
+   * video stream missing any field — there is no client default for any video
+   * encoding value. Audio reads only `maxBitrateBps` above.
+   */
+  readonly encoding: SendStreamEncoding | undefined;
   /**
    * Media-handler URLs to send to.
    *

@@ -32,6 +32,9 @@ import {
   DEFAULT_RECEIVE_VIDEO_SLOTS,
 } from '../../config/clientConfig.js';
 import { selectCaptureSource } from '../mediaSelection.js';
+import { TransmitKeyManager } from '../../media/lifecycle/transmitKeys.js';
+import { VideoCodecUnsupportedError } from '../../media/setup/vp8.js';
+import { Codec } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { createMicrophoneCapture } from '../../media/setup/capture.js';
 import {
   JOIN_BAG_MARKER,
@@ -175,6 +178,9 @@ function makeSession(
     connect: makeConnect(mocks),
     clock: () => 1_000,
     connectTimeoutMs: 5_000,
+    // The node tier has no WebCodecs: a passing VP8 probe by default (the probe
+    // itself and its failure path are tested on their own).
+    vp8Probe: () => Promise.resolve(),
     ...extra,
   });
 }
@@ -1102,15 +1108,14 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     return { session, mocks, capture, codecs, playback, sink };
   }
 
-  it('declares a receive capability BEFORE any directive is expected', async () => {
-    // MC composes the directive and the slot assignments from one meeting-state
-    // snapshot when the capability arrives, not at join.
+  it('sends NO post-join receive capability: the join carried the declaration (story 3 R-2)', async () => {
     const rig = await joinedWithMedia();
     await rig.session.startMedia();
     const messages = decodeOutboundClientMessages(
       rig.mocks.get(MC_ENDPOINT)!.getOutboundBidiWrites(0),
     );
-    expect(messages.some((m) => m.message.case === 'receiveCapability')).toBe(true);
+    expect(messages.some((m) => m.message.case === 'joinRequest')).toBe(true);
+    expect(messages.some((m) => m.message.case === 'receiveCapability')).toBe(false);
     rig.session.disconnect();
   });
 
@@ -1446,7 +1451,7 @@ describe('MeetingSession — media absence-signals (ADR-0036 §5/§6/§10)', () 
     // one-spinner-for-three-causes client §6 complains about.
     mc.simulateServerMessage(
       0,
-      framedStreamAssignments({ slotId: 0, slotState: SlotState.SOURCE_MUTED }),
+      framedStreamAssignments({ slotId: 0, slotState: SlotState.AVATAR_CLIENT_MUTED }),
     );
     mc.simulateServerMessage(
       0,
@@ -1459,7 +1464,6 @@ describe('MeetingSession — media absence-signals (ADR-0036 §5/§6/§10)', () 
 
     await waitFor(() => seen.length === 3);
     expect(seen).toEqual([
-      // Legacy SOURCE_MUTED with no mute update: shim (b)'s fail-closed default.
       { slotId: 0, slotState: 'avatar_client_muted' },
       { slotId: 1, slotState: 'withheld_by_congestion' },
       { slotId: 2, slotState: 'source_unreachable' },
@@ -1609,6 +1613,7 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
     readonly publish?: readonly ('audio' | 'video')[];
     readonly maxAudioReceiveSlots?: number;
     readonly maxVideoReceiveSlots?: number;
+    readonly extra?: Partial<MeetingSessionOptions>;
   }): Promise<{
     session: MeetingSession;
     mocks: Map<string, MockWebTransport>;
@@ -1626,6 +1631,7 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
       ...(opts.audio ? { audioReceiveSlots: opts.audio } : {}),
       ...(opts.video ? { videoReceiveSlots: opts.video } : {}),
       ...(opts.publish ? { publish: opts.publish } : {}),
+      ...opts.extra,
     });
     const joining = session.join({
       meetingCode: MEETING_CODE,
@@ -1708,18 +1714,209 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
     rig.session.disconnect();
   });
 
-  it('TRANSITIONAL shim (a): the post-join ReceiveCapability is IDENTICAL to the join-carried one', async () => {
+  it('the join-carried declaration is the ONLY initial one: startMedia sends no post-join ReceiveCapability (shim a deleted)', async () => {
     vi.spyOn(console, 'info').mockImplementation(() => {});
     const rig = await joinedWith({
       audio: { count: 2, source: 'configured' },
       video: { count: 1, source: 'configured' },
     });
     await rig.session.startMedia();
-    const redeclared = outbound(rig.mocks).find((m) => m.message.case === 'receiveCapability');
-    expect(redeclared?.message.case).toBe('receiveCapability');
-    expect(slotsOf(redeclared?.message.value as never)).toEqual(
-      slotsOf(joinRequest(rig.mocks).receiveCapability),
-    );
+    expect(slotsOf(joinRequest(rig.mocks).receiveCapability)).toHaveLength(3);
+    expect(outbound(rig.mocks).filter((m) => m.message.case === 'receiveCapability')).toEqual([]);
+    rig.session.disconnect();
+  });
+
+  // --- Story 3 C-A2: the VP8 gate, the session-owned keys, video mute -------
+
+  it('declares CODEC_VP8 in supported_codecs only when the probe passed (video in use)', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const ok = await joinedWith({ publish: ['audio', 'video'] });
+    expect(joinRequest(ok.mocks).capabilities?.supportedCodecs).toEqual([Codec.VP8]);
+    ok.session.disconnect();
+    const failing = await joinedWith({
+      publish: ['audio', 'video'],
+      extra: { vp8Probe: () => Promise.reject(new VideoCodecUnsupportedError('decoder', 'no')) },
+    });
+    expect(joinRequest(failing.mocks).capabilities?.supportedCodecs).toEqual([]);
+    failing.session.disconnect();
+  });
+
+  it('runs NO probe and declares nothing when video is neither published nor received', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    let probed = 0;
+    const rig = await joinedWith({
+      extra: {
+        vp8Probe: () => {
+          probed += 1;
+          return Promise.resolve();
+        },
+      },
+    });
+    expect(probed).toBe(0);
+    expect(joinRequest(rig.mocks).capabilities?.supportedCodecs).toEqual([]);
+    rig.session.disconnect();
+  });
+
+  it.each([
+    ['published', { publish: ['audio', 'video'] as const }],
+    ['received (M > 0)', { video: { count: 1, source: 'configured' as const } }],
+  ])(
+    'a failed VP8 probe with video %s fails startMedia LOUDLY, typed, with a fatal fault — never audio-only',
+    async (_n, opts) => {
+      vi.spyOn(console, 'info').mockImplementation(() => {});
+      const rig = await joinedWith({
+        ...opts,
+        extra: { vp8Probe: () => Promise.reject(new VideoCodecUnsupportedError('encoder', 'no')) },
+      });
+      const faults: { stage: string; fatal: boolean }[] = [];
+      rig.session.on('mediaFault', (f) => faults.push(f));
+      await expect(rig.session.startMedia()).rejects.toBeInstanceOf(VideoCodecUnsupportedError);
+      expect(faults).toEqual([expect.objectContaining({ stage: 'encoder', fatal: true })]);
+      expect(rig.session.media).toBeUndefined();
+      rig.session.disconnect();
+    },
+  );
+
+  it('clears the session transmit keys on a startMedia FAILURE after the manager exists', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const clear = vi.spyOn(TransmitKeyManager.prototype, 'clear');
+    const rig = await joinedWith({
+      extra: {
+        captureFactory: () => Promise.reject(new Error('no microphone')),
+      },
+    });
+    await expect(rig.session.startMedia()).rejects.toThrow();
+    await waitFor(() => clear.mock.calls.length > 0);
+    expect(clear).toHaveBeenCalledTimes(1);
+    clear.mockRestore();
+    rig.session.disconnect();
+  });
+
+  it('a VIDEO-ONLY session rotates its transmit keys on a KEK receipt (ONE session-level subscription)', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({
+      publish: ['video'],
+      audio: { count: 0, source: 'configured' },
+      extra: {
+        videoEncoderFactory: async () => ({
+          encode: () => undefined,
+          encodeQueueSize: 0,
+          close: () => undefined,
+        }),
+        videoCaptureFactory: async () => ({
+          start: async () => undefined,
+          stop: () => undefined,
+          grantedDeviceId: undefined,
+        }),
+      },
+    });
+    const pipeline = await rig.session.startMedia();
+    const before = pipeline.transmitGeneration;
+    rig.mocks
+      .get(MC_ENDPOINT)!
+      .simulateServerMessage(0, framedMeetingKekUpdate(new Uint8Array(32).fill(9), 1));
+    await waitFor(() => pipeline.transmitGeneration === before + 1n);
+    // Exactly one rotation per receipt: no second subscription anywhere.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(pipeline.transmitGeneration).toBe(before + 1n);
+    rig.session.disconnect();
+  });
+
+  it.each([
+    ['video-only', ['video'] as const],
+    ['receive-only', [] as const],
+  ])(
+    'a %s participant NEVER acquires the microphone: zero audio capture calls (privacy, R-2)',
+    async (_n, publish) => {
+      vi.spyOn(console, 'info').mockImplementation(() => {});
+      let micCalls = 0;
+      const rig = await joinedWith({
+        publish,
+        extra: {
+          captureFactory: async () => {
+            micCalls += 1;
+            return new FakeCaptureSource() as never;
+          },
+          videoEncoderFactory: async () => ({
+            encode: () => undefined,
+            encodeQueueSize: 0,
+            close: () => undefined,
+          }),
+          videoCaptureFactory: async () => ({
+            start: async () => undefined,
+            stop: () => undefined,
+            grantedDeviceId: undefined,
+          }),
+        },
+      });
+      const pipeline = await rig.session.startMedia();
+      await pipeline.setCaptureDevice('another-mic');
+      rig.session.setAudioMuted(false);
+      expect(micCalls).toBe(0);
+      expect(pipeline.captureOpen).toBe(false);
+      // Receiving still works: the pipeline started.
+      expect(rig.session.media).toBe(pipeline);
+      rig.session.disconnect();
+    },
+  );
+
+  it('an AUDIO encoder that cannot be built is counted on encoder_errors{audio} (both kinds count a build failure)', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({
+      extra: { encoderFactory: () => Promise.reject(new Error('unsupported')) },
+    });
+    await expect(rig.session.startMedia()).rejects.toThrow();
+    const errors = rig.sink
+      .getRecordedMetrics()
+      .filter(
+        (m) => m.name === 'dt_client_media_encoder_errors_total' && m.labels.media_kind === 'audio',
+      )
+      .reduce((n, m) => n + m.value, 0);
+    expect(errors).toBe(1);
+    rig.session.disconnect();
+  });
+
+  it('an audio publisher DOES acquire the microphone (positive control)', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    let micCalls = 0;
+    const rig = await joinedWith({
+      extra: {
+        captureFactory: async () => {
+          micCalls += 1;
+          return new FakeCaptureSource() as never;
+        },
+      },
+    });
+    const pipeline = await rig.session.startMedia();
+    expect(micCalls).toBe(1);
+    expect(pipeline.captureOpen).toBe(true);
+    rig.session.disconnect();
+  });
+
+  it('setVideoMuted goes through the video publisher and never touches the microphone', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({
+      publish: ['audio', 'video'],
+      extra: {
+        videoEncoderFactory: async () => ({
+          encode: () => undefined,
+          encodeQueueSize: 0,
+          close: () => undefined,
+        }),
+        videoCaptureFactory: async () => ({
+          start: async () => undefined,
+          stop: () => undefined,
+          grantedDeviceId: undefined,
+        }),
+      },
+    });
+    const pipeline = await rig.session.startMedia();
+    expect(rig.session.video).toBeDefined();
+    expect(rig.session.videoCaptureSource).toEqual({ mode: 'camera' });
+    rig.session.setVideoMuted(true);
+    expect(rig.session.muteState).toEqual({ audioMuted: false, videoMuted: true });
+    expect(pipeline.captureOpen).toBe(true);
+    expect(rig.session.cameraTrackLive).toBe(false);
     rig.session.disconnect();
   });
 
@@ -1734,17 +1931,12 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
     rig.session.disconnect();
   });
 
-  it('refuses a VIDEO publish at construction with a typed "not yet supported" error', () => {
-    const mocks = new Map<string, MockWebTransport>();
-    let err: unknown;
-    try {
-      makeSession(mocks, { publish: ['audio', 'video'] });
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(SignalingError);
-    expect((err as SignalingError).signalingCode).toBe(SignalingErrorCode.PublishKindNotSupported);
-    expect(mocks.size).toBe(0);
+  it('ACCEPTS a video publish set (story 3 C-A2 enables it) and carries it on the join', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({ publish: ['audio', 'video'] });
+    expect(rig.session.receiveSlots.publish).toEqual(['audio', 'video']);
+    expect(joinRequest(rig.mocks).publishKinds).toEqual([MediaKind.AUDIO, MediaKind.VIDEO_CAMERA]);
+    rig.session.disconnect();
   });
 
   it('refuses a duplicate publish kind, typed', () => {

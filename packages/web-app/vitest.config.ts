@@ -18,6 +18,9 @@ export default defineConfig({
     // so the default suite runs the microphone path and an accidentally
     // default-on tone cannot hide in it (@security A3).
     __DT_TEST_TONE__: JSON.stringify(false),
+    // Story 3 R-27: the test-pattern define is FALSE under every test runner
+    // too, so the default suite runs the camera path.
+    __DT_TEST_PATTERN__: JSON.stringify(false),
     // Story 2 task 15: the test levers are FALSE under the test runner too; the
     // lever parser is unit-tested directly (`src/__tests__/testLevers.test.ts`).
     __DT_TEST_LEVERS__: JSON.stringify(false),

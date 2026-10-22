@@ -19,6 +19,7 @@
 import { flushMetrics, getMetricsSink } from '@darktower/sdk-core';
 import type {
   CaptureSourceInfo,
+  VideoCaptureSourceInfo,
   KindSlotsDiagnostics,
   MediaFrameCounts,
   MeetingSessionEventMap,
@@ -49,11 +50,16 @@ export interface SessionEvents {
  * which only a test build injects.
  */
 export interface SessionMediaCounters {
-  readonly media: { readonly frameCounts: MediaFrameCounts } | undefined;
+  readonly media:
+    { readonly frameCounts: MediaFrameCounts; readonly captureOpen: boolean } | undefined;
   /** Effective publish set, N, M, their sources and the per-kind caps (story 3 R-23). Plain values. */
   readonly receiveSlots: ReceiveSlotsDiagnostics;
   /** What feeds the send path, once media has started (story 2 R-7). */
   readonly captureSource: CaptureSourceInfo | undefined;
+  /** What feeds the VIDEO send path, once media has started with video (story 3 R-27). */
+  readonly videoCaptureSource: VideoCaptureSourceInfo | undefined;
+  /** Camera light: directed with targets AND not client-muted AND healthy (story 3). */
+  readonly cameraTrackLive: boolean;
   /** The current meeting-KEK generation (public: it is in every key id). Story 2 S6. */
   readonly currentKekGeneration: number | undefined;
 }
@@ -299,6 +305,7 @@ export function installE2EHooks(
     // ASSERTS tone mode from it rather than assuming the dev server was started
     // with `DT_TEST_TONE=1` (Playwright may reuse an existing server).
     let captureAnnounced = false;
+    let videoAnnounced = false;
     // Story 2 S6: the KEK generation, emitted on CHANGE (not every tick) — the
     // per-participant evidence that this client installed a rotation.
     let lastKekGeneration: number | undefined;
@@ -315,6 +322,30 @@ export function installE2EHooks(
           type: 'captureSource',
           mode: source.mode,
           ...(source.toneHz !== undefined ? { toneHz: source.toneHz } : {}),
+        });
+      }
+      // Story 3 C-A2: the VIDEO capture source, announced once like the audio
+      // one. `patternId` is the meeting-scoped sender id the synthetic pattern
+      // encodes — an R-27/R-32 test-bus carve-out (security ruling, C-A2
+      // Gate 1): emitted ONLY in a `__DT_TEST_PATTERN__` build, never the frame
+      // counter, Gray index, GoP value or any per-frame datum.
+      const videoSource = session.videoCaptureSource;
+      if (!videoAnnounced && videoSource !== undefined) {
+        videoAnnounced = true;
+        bus.emit({
+          type: 'videoCaptureSource',
+          mode: videoSource.mode,
+          ...(__DT_TEST_PATTERN__ && videoSource.patternId !== undefined
+            ? { patternId: String(videoSource.patternId) }
+            : {}),
+        });
+      }
+      // The camera light and the open microphone, sampled: booleans only.
+      if (session.media !== undefined) {
+        bus.emit({
+          type: 'sendTracks',
+          cameraTrackLive: session.cameraTrackLive,
+          micTrackOpen: session.media.captureOpen,
         });
       }
       // Receive layers 1/2 (+ drops) and layer 3, SAMPLED on the same tick.

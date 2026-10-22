@@ -39,8 +39,8 @@ test('the wire vocabulary is the ten flat states (story 3 wire freeze; MC slot_s
   // was written from belief rather than derived from the artifact.
   expect(WIRE_TOKENS).toHaveLength(10);
   expect(new Set(WIRE_TOKENS).size).toBe(10);
-  // The retired story-2 tokens are gone from the vocabulary.
-  expect(WIRE_TOKENS).not.toContain('source_muted' as never);
+  // The reserved token is not in the vocabulary (the superseded legacy one is
+  // pinned unrepresentable by sdk-core's `slotStateMap` tests).
   expect(WIRE_TOKENS).not.toContain('zero_requested' as never);
 });
 

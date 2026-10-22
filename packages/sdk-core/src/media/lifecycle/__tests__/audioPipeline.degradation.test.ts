@@ -20,7 +20,12 @@ import {
 import { DEFAULT_CLIENT_CONFIG, type MediaConfig } from '../../../config/clientConfig.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { MeetingIdentity } from '../../setup/identity.js';
-import { assignmentsOn, emptyKekHolder, kekHolderWith } from '../../__tests__/helpers.js';
+import {
+  assignmentsOn,
+  emptyKekHolder,
+  kekHolderWith,
+  sessionTransmitKeys,
+} from '../../__tests__/helpers.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import type { DatagramSender } from '../../pipeline/egress.js';
@@ -84,6 +89,8 @@ async function makePipeline(opts: Options = {}): Promise<{
     kekSource,
     roster,
     senderId: SENDER_ID,
+    transmitKeys: sessionTransmitKeys(SENDER_ID, kekSource),
+    publishesAudio: true,
     identity,
     declaredSlotIds: [0],
     captureSource: 'microphone',

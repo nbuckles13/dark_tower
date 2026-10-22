@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterAll, beforeAll, expect, test } from 'vitest';
-import { TONE_RUNTIME_TOKENS } from '../../sdk-core/tests/toneMarkers.js';
+import { PATTERN_RUNTIME_TOKENS, TONE_RUNTIME_TOKENS } from '../../sdk-core/tests/toneMarkers.js';
 
 const PKG_ROOT = resolve(__dirname, '..');
 const DIST = resolve(PKG_ROOT, 'dist');
@@ -67,6 +67,15 @@ const DIST = resolve(PKG_ROOT, 'dist');
 //     refusal, only inside `if (__E2E_HOOKS__)` in `lib/e2eBus.ts`.
 //   NOT `participantMute` (a substring of the SDK's `participantMuteChanged`
 //   event) or `kekGeneration` (a protobuf field name): both FAIL the rule.
+//
+// Story 3 C-A2 additions (R-27, the `__DT_TEST_PATTERN__` synthetic camera):
+//   * `test_pattern`, `dt-test-pattern` — the pattern mode token and the
+//     generator-unique marker (`PATTERN_RUNTIME_TOKENS`, sdk-core's
+//     `tests/toneMarkers.ts`), reachable only inside `if (__DT_TEST_PATTERN__)`.
+//     NOT `OffscreenCanvas`: a platform API a later render path may use
+//     legitimately, so it would FAIL the rule.
+//   * `sendTracks` — a bus event type, only inside `if (__E2E_HOOKS__)`. NOT
+//     `videoCaptureSource` (also an SDK getter name): it FAILS the rule.
 const FORBIDDEN = [
   '__darktower_test__',
   'mediaFrameCounts',
@@ -87,6 +96,10 @@ const FORBIDDEN = [
   'forceHostControls',
   'buildKnobs',
   'telemetry_not_configured',
+  '__DT_TEST_PATTERN__',
+  'test_pattern',
+  'dt-test-pattern',
+  'sendTracks',
 ] as const;
 
 /**
@@ -100,6 +113,7 @@ const GATE_IDENTIFIERS = new Set<string>([
   '__DEV_TRUST_FINGERPRINT__',
   '__DT_TEST_TONE__',
   '__DT_TEST_LEVERS__',
+  '__DT_TEST_PATTERN__',
 ]);
 
 /** The positive-control build: dev mode with the test tone AND the test levers opted in. */
@@ -120,6 +134,7 @@ function envWithoutTone(): NodeJS.ProcessEnv {
   const env = { ...process.env };
   delete env['DT_TEST_TONE'];
   delete env['DT_TEST_LEVERS'];
+  delete env['DT_TEST_PATTERN'];
   return env;
 }
 
@@ -137,7 +152,7 @@ beforeAll(() => {
     {
       cwd: PKG_ROOT,
       stdio: 'inherit',
-      env: { ...envWithoutTone(), DT_TEST_TONE: '1', DT_TEST_LEVERS: '1' },
+      env: { ...envWithoutTone(), DT_TEST_TONE: '1', DT_TEST_LEVERS: '1', DT_TEST_PATTERN: '1' },
     },
   );
 }, 360_000);
@@ -152,6 +167,10 @@ test('FORBIDDEN carries every sdk-core tone marker, so this control proves each 
   for (const token of TONE_RUNTIME_TOKENS) expect(FORBIDDEN).toContain(token);
 });
 
+test('FORBIDDEN carries every sdk-core test-PATTERN marker, so this control proves each one', () => {
+  for (const token of PATTERN_RUNTIME_TOKENS) expect(FORBIDDEN).toContain(token);
+});
+
 test('production dist emits at least one JS chunk', () => {
   const files = walk(DIST);
   expect(files.some((f) => f.endsWith('.js'))).toBe(true);
@@ -164,7 +183,7 @@ test.each(FORBIDDEN)('production bundle excludes forbidden token %s', (token) =>
 });
 
 test.each(FORBIDDEN.filter((t) => !GATE_IDENTIFIERS.has(t)))(
-  'POSITIVE CONTROL: the gated build (dev + DT_TEST_TONE=1 + DT_TEST_LEVERS=1) CONTAINS %s',
+  'POSITIVE CONTROL: the gated build (dev + DT_TEST_TONE=1 + DT_TEST_LEVERS=1 + DT_TEST_PATTERN=1) CONTAINS %s',
   (token) => {
     const files = walk(CONTROL_DIST).filter((f) => f.endsWith('.js'));
     expect(files.length).toBeGreaterThan(0);
@@ -217,4 +236,26 @@ test('a PRODUCTION build asked for the test levers FAILS at the gate, never coer
   expect(failure, 'the production build with DT_TEST_LEVERS=1 must not succeed').toBeDefined();
   const output = String((failure as { stderr?: unknown }).stderr ?? '');
   expect(output).toContain('DT_TEST_LEVERS=1 in a production build');
+}, 180_000);
+
+test('a PRODUCTION build asked for the test pattern FAILS at the gate, never coerces it off', () => {
+  let failure: unknown;
+  try {
+    execFileSync(
+      'pnpm',
+      ['exec', 'vite', 'build', '--mode', 'production', '--outDir', `${CONTROL_DIST}-prod-pattern`],
+      {
+        cwd: PKG_ROOT,
+        stdio: 'pipe',
+        env: { ...envWithoutTone(), DT_TEST_PATTERN: '1' },
+      },
+    );
+  } catch (err) {
+    failure = err;
+  } finally {
+    rmSync(`${CONTROL_DIST}-prod-pattern`, { recursive: true, force: true });
+  }
+  expect(failure, 'the production build with DT_TEST_PATTERN=1 must not succeed').toBeDefined();
+  const output = String((failure as { stderr?: unknown }).stderr ?? '');
+  expect(output).toContain('DT_TEST_PATTERN=1 in a production build');
 }, 180_000);

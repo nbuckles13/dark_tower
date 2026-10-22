@@ -718,6 +718,8 @@ service catalog):
 | `dt_client_media_kek_updates_total` | `source` | `MEDIA_KEK_SOURCES`, including `kek_update` (two values, deliberately; see `docs/observability/metrics/client.md`) |
 | `dt_client_media_capture_source` | `mode` | the `MediaCaptureSourceMode` type (a type, not a const, so `test_tone` never reaches a production bundle; `packages/sdk-core/src/media/setup/mediaMetrics.ts`) |
 | `dt_client_media_frames_dropped_total` | `reason` | the split key-generation reasons `no_kek_for_generation` and `kek_generation_stale` |
+| `dt_client_media_send_groups_stopped_total` | `outcome` | `MEDIA_SEND_GROUP_STOP_OUTCOMES` (`peer_stopped`, `open_failed`, `open_stalled`; story 3 C-A2) — a per-metric vocabulary |
+| `dt_client_media_keyframes_produced_total` | `source` | `MEDIA_KEYFRAME_SOURCES` (`directive_start`, `request`, `abandonment`; story 3 C-A2) — a per-metric vocabulary, never summed by `source` with `dt_client_media_kek_updates_total` |
 
 The authoritative value lists are the code enums named in each catalog entry. This table says which
 label each series gained; it is not a second copy of the values.

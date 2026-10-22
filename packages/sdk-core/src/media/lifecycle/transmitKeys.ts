@@ -39,23 +39,36 @@
 // ROTATION TRIGGERS: WHICH ARE IMPLEMENTED, AND WHICH ARE UNREACHABLE
 // ---------------------------------------------------------------------------
 //
-// ADR-0036 §4's table has seven. This story reaches four; the other three are
+// ADR-0036 §4's table has seven. Story 3 (C-A2) reaches these; the rest are
 // named here so their absence reads as a decision rather than an oversight.
+// The GENERATION IS SESSION-WIDE: one manager per sender, so every trigger
+// below rotates every stream (audio and video) at once — which is harmless
+// (audio carries the key on every frame; video re-arms its wrap for the next N
+// frames after ANY key change) and keeps one generation counter.
 //
-//   * **Every T for audio** — implemented, `T` from config, measured from
-//     pipeline start (per-client phase, deliberately not wall-clock aligned).
-//   * **Sender resumes from empty** — implemented: a send directive's target set
-//     going empty -> non-empty.
-//   * **Unmute after mute** — implemented. Not literally in §4's table; a mute is
+//   * **Every T for audio** — `audioRotationPeriodMs`, AudioPipeline's timer,
+//     measured from pipeline start (per-client phase, not wall-clock aligned).
+//   * **Every T for video** — `videoRotationPeriodMs`, VideoPublisher's timer,
+//     its own config and floor (story 3 R-14). Forces no keyframe.
+//   * **Every video group start** — `videoEgress.ts`, on every key chunk
+//     (requested, a resume, keyed for a target with no group in progress, or
+//     unsolicited), before that keyframe takes its key.
+//   * **Sender resumes from empty** — audio: a send directive's target set
+//     going empty -> non-empty. Video's resume is a group start (above).
+//   * **Unmute after mute** — audio. Not literally in §4's table; a mute is
 //     a resume-from-empty for the stream, it costs one generation bump, and it
-//     bounds a leaked transmit key across the silent window.
-//   * **Meeting KEK rotated** — implemented (story 2, R-13): `AudioPipeline`
-//     rotates on `MeetingKekHolder.onCurrentGenerationChanged`, which fires only
+//     bounds a leaked transmit key across the silent window. Video's unmute is
+//     a resume, hence a group start.
+//   * **Meeting KEK rotated** — implemented (story 2, R-13): ONE session-level
+//     subscription (`session/mediaStart.ts:buildSessionMedia`, beside the manager it rotates,
+//     so a video-only session rotates too) on
+//     `MeetingKekHolder.onCurrentGenerationChanged`, which fires only
 //     AFTER the new KEK is current, so the next mint wraps under it. Without this
 //     the leave bound ADR-0036 §4 states is false: a departed member keeps
 //     decrypting from the unwrapped transmit keys it cached before the rotation,
 //     and re-wrapping under the new KEK cannot revoke a key it already holds in
-//     plaintext — the sender has to move to a key the leaver never held.
+//     plaintext — the sender has to move to a key the leaver never held. Forces
+//     no keyframe (video re-arms its wrap instead).
 //   * **Participant leaves / joins** — not a transmit-key trigger in itself; MC
 //     rotates the KEK for those, and the KEK row above is what follows.
 //   * **Counter exhaustion** — UNREACHABLE RATHER THAN UNCHECKED, and stated in
@@ -158,6 +171,19 @@ import type { KekWrapSource } from '../setup/kekSource.js';
  * width rather than written as a literal.
  */
 const GOP_COUNTER_MAX = 2 ** (8 * WIRE_CONSTANTS.gop_counter_field_bytes) - 1;
+
+/**
+ * THE KEK-rotation binding (R-13): rotate `keys` whenever a NEWER meeting KEK
+ * becomes current. One call per manager — the session makes it beside the
+ * manager it owns (`session/mediaStart.ts`), so it rotates exactly once per
+ * receipt whatever the participant publishes. Returns the unsubscribe.
+ */
+export function rotateOnKekChange(
+  kek: { onCurrentGenerationChanged(listener: () => void): () => void },
+  keys: TransmitKeyManager,
+): () => void {
+  return kek.onCurrentGenerationChanged(() => keys.rotate());
+}
 
 /** Everything the egress path needs to seal and announce one frame. */
 export interface TransmitKeyMaterial {
@@ -284,11 +310,15 @@ export class TransmitKeyManager {
     // So retirement is deferred by one rotation. **The bound is the interval
     // between two CONSECUTIVE ROTATIONS FROM ANY TRIGGER — not the configured
     // rotation period**, and the distinction is the whole of it: `rotate()` has
-    // four call sites in `AudioPipeline`, and only one of them is the timer.
+    // several call sites, and only two of them are timers.
     //
-    //   * the rotation interval        (`audioRotationPeriodMs`)
+    //   * the audio rotation interval  (`audioRotationPeriodMs`)
+    //   * the video rotation interval  (`videoRotationPeriodMs`)
     //   * resume-from-empty            (a send directive going empty -> non-empty)
     //   * unmute                       (`setAudioMuted(false)`)
+    //   * every video group start      (`videoEgress.ts`; at most one per
+    //                                   effective keyframe interval >= 100 ms,
+    //                                   except an unsolicited platform key chunk)
     //   * a meeting KEK rotation       (`onCurrentGenerationChanged`, R-13; paced
     //                                   by MC's leave debounce W, so seconds apart)
     //
@@ -312,6 +342,14 @@ export class TransmitKeyManager {
     // orders of magnitude of headroom" from the 60 s default, which is false for
     // the mute path and would have led a reader who checked it to discard the
     // paragraph including the part that matters.
+    //
+    // STORY 3 C-A2: the shared manager adds rotation sources that land on BOTH
+    // kinds' in-flight seals (every video group start — unsolicited key chunks
+    // included — and the video T), so the caller-controlled interval is no
+    // longer only "a mute toggled twice". The read window itself is now closed
+    // at the reader: `pipeline/frameSeal.ts:sealAndSignFrame` copies the key
+    // SYNCHRONOUSLY at entry (before any await) and refuses an all-zero key, so
+    // an overwrite here can no longer reach a frame being sealed.
     //
     // `clear()` catches whatever is still held at teardown, where there is no
     // in-flight reader to race.
@@ -474,13 +512,26 @@ export class TransmitKeyManager {
    * a group, so `egress.ts::submit` calls it once per frame above the fan-out —
    * the same ownership discipline, and the same one-manager-per-sender rule, as
    * {@link nextStreamSequence}: identical sealed bytes on every target. Video
-   * (C-A2) calls it on keyframes and adds no second counter.
+   * (`videoEgress.ts`) calls it on every key chunk — including the one starting
+   * a resume — and adds no second counter.
    */
   nextGopCounter(streamNumber: number): number | null {
     const next = this.#gopCounters.get(streamNumber) ?? 0;
     if (next > GOP_COUNTER_MAX) return null;
     this.#gopCounters.set(streamNumber, next + 1);
     return next;
+  }
+
+  /**
+   * The `gop_counter` the LATEST group on `streamNumber` carries, or
+   * `undefined` before its first group. For the keyframe gate's request
+   * comparison only (`gop_counter >= current`); internal to the SDK (not
+   * exported from the package) and never logged, labelled, traced or put on
+   * the test bus (R-30).
+   */
+  currentGopCounter(streamNumber: number): number | undefined {
+    const next = this.#gopCounters.get(streamNumber);
+    return next === undefined ? undefined : next - 1;
   }
 
   /**

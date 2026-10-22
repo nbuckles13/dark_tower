@@ -39,17 +39,7 @@
 // "Count the frames we did not send" is the tempting wrong turn and it would
 // spike the send-drop rate on every mute.
 
-import {
-  buildPublisherRegion,
-  buildUnsignedFrame,
-  finishFrame,
-  isSupportedHeaderVersion,
-  writeHopSequence,
-} from '../frame/frameCodec.js';
-import { signFrame } from '../frame/ed25519.js';
-import { sealSframe, serializeSframe, sframeObjectLength } from '../frame/sframe.js';
-import { deriveSframeKeys, sframeNonce } from '../frame/sframeKeySchedule.js';
-import { AES_256_KEY_BYTES, SFRAME_CIPHER_SUITE_ID, SFRAME_SALT_BYTES } from '../frame/sframe.js';
+import { isSupportedHeaderVersion, writeHopSequence } from '../frame/frameCodec.js';
 import type { Bytes } from '../frame/hex.js';
 import type { TransmitKeyManager } from '../lifecycle/transmitKeys.js';
 import type { KekWrapSource } from '../setup/kekSource.js';
@@ -57,21 +47,10 @@ import type { MeetingIdentity } from '../setup/identity.js';
 import { MEDIA_SEND_DROP_REASONS, type MediaKindMetrics } from '../setup/mediaMetrics.js';
 import type { EncodedAudioFrame } from '../setup/seams.js';
 import { BoundedDropOldestQueue } from './egressQueue.js';
+import { EgressIdentityReleasedError, sealAndSignFrame } from './frameSeal.js';
 
-/**
- * Thrown when a frame reaches the signing step after the meeting identity has
- * been released.
- *
- * Its own type rather than a bare `Error` so the lifecycle layer can tell a
- * teardown race from a genuine crypto fault: the first is expected at the tail
- * of a session, the second is not.
- */
-export class EgressIdentityReleasedError extends Error {
-  constructor() {
-    super('the meeting identity was released before this frame could be signed');
-    this.name = 'EgressIdentityReleasedError';
-  }
-}
+// Re-exported from its one home: the shared seal sequence throws it.
+export { EgressIdentityReleasedError };
 
 /** A frame built and signed, waiting for its turn on the wire. */
 interface PendingFrame {
@@ -442,83 +421,24 @@ export class EgressPipeline {
     }
     const streamSequence = this.#transmitKeys.nextStreamSequence(this.#streamNumber);
 
-    const flags = {
-      // Every Opus frame stands alone.
-      independentlyDecodable: true,
-      // Audio is never discardable: there is no dependent frame to protect by
-      // dropping this one, so the flag would only invite a relay to shed audio.
-      discardable: false,
-      // EVERY audio frame carries the key (§4's cadence). Not a policy choice
-      // made here: `buildPublisherRegion` throws if the flag and the wrap
-      // disagree, so the two cannot drift apart.
-      keyBearing: true,
-    } as const;
-
-    // GCM is length-preserving, so the sealed object's length is known now.
-    // Computed by the SFrame module from the same constants its serializer uses,
-    // never by arithmetic here — a second derivation of this length is a second
-    // wire format that agrees only by review.
-    const sealedLength = sframeObjectLength(frame.data.length);
-    const publisherRegion = buildPublisherRegion(
-      {
-        headerVersion,
-        flags,
-        streamSequence,
-        gopCounter,
-        wrappedTransmitKey: material.wrapped,
-        extensions: [],
-      },
-      sealedLength,
-    );
-
-    const derived = await deriveSframeKeys({
-      hash: 'SHA-512',
-      baseKey: material.key,
-      // The packed key id AS IT WILL APPEAR ON THE WIRE, never a value re-packed
-      // from decomposed fields — a re-pack always succeeds and is merely wrong.
-      kid: material.keyId,
-      cipherSuiteId: SFRAME_CIPHER_SUITE_ID,
-      keyBytes: AES_256_KEY_BYTES,
-      saltBytes: SFRAME_SALT_BYTES,
-    });
-
-    const sframe = await sealSframe({
-      key: derived.key,
-      nonce: sframeNonce(derived.salt, BigInt(streamSequence)),
-      // THE PUBLISHER REGION, and only the publisher region. The relay region is
-      // excluded because MH rewrites it.
-      aad: publisherRegion,
-      plaintext: frame.data,
-      keyId: material.keyId,
-    });
-    const payload = serializeSframe(sframe);
-
-    const unsigned = buildUnsignedFrame({
+    // Seal and sign ONCE, above the fan-out, through the one shared sequence
+    // (`./frameSeal.ts`). Every Opus frame stands alone; audio is never
+    // discardable (there is no dependent frame to protect, so the flag would
+    // only invite a relay to shed audio); and EVERY audio frame carries the key
+    // (§4's cadence — `buildPublisherRegion` throws if flag and wrap disagree).
+    const { bytes, relayRegionOffset } = await sealAndSignFrame({
       headerVersion,
-      flags,
+      flags: { independentlyDecodable: true, discardable: false, keyBearing: true },
       streamSequence,
       gopCounter,
-      wrappedTransmitKey: material.wrapped,
-      extensions: [],
+      material,
       streamId: this.#streamId,
-      // Placeholder: overwritten at dequeue so the hop sequence counts only
-      // frames actually sent.
-      hopSequence: 0,
-      payload,
+      plaintext: frame.data,
+      identity: this.#identity,
     });
-    // Read at the point of use, so a released identity cannot be signed with.
-    const signer = this.#identity.signer;
-    if (!signer) {
-      // Fail loudly rather than emitting anything. Reaching here means a frame
-      // was still being built when the session tore down; there is no
-      // degradation available, because this SDK does not send unsigned frames.
-      throw new EgressIdentityReleasedError();
-    }
-    const signature = await signFrame(signer, unsigned.signedRange);
-    const bytes = finishFrame(unsigned, signature);
 
     if (this.#stopped) return;
-    this.#fanOut(bytes, unsigned.relayRegionOffset);
+    this.#fanOut(bytes, relayRegionOffset);
   }
 
   /** True when at least one lane is still named by the latest directive. */

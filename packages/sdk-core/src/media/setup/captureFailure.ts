@@ -101,3 +101,25 @@ export function classifyCaptureError(err: unknown): CaptureFailure {
 export function captureError(reason: CaptureFailure): MediaCaptureError {
   return new MediaCaptureError(reason, CAPTURE_MESSAGE[reason]);
 }
+
+/**
+ * Camera counterparts of {@link CAPTURE_MESSAGE} (story 3 R-19): the SAME
+ * bounded vocabulary and classifier, kind-specific human text only. Static
+ * strings; never a platform message.
+ */
+export const CAMERA_CAPTURE_MESSAGE: Record<CaptureFailure, string> = {
+  [CaptureFailure.PermissionDenied]:
+    'camera access was denied; the participant must grant it before video can be sent',
+  [CaptureFailure.NoDevice]: 'no camera is available on this device',
+  [CaptureFailure.DeviceUnavailable]: 'the camera is in use or could not be read',
+  [CaptureFailure.Unsupported]: 'the directed camera constraints cannot be satisfied',
+  [CaptureFailure.PlatformUnsupported]:
+    'this platform does not expose camera capture; the video path requires a secure context ' +
+    'with getUserMedia and MediaStreamTrackProcessor',
+  [CaptureFailure.Unknown]: 'camera capture failed',
+};
+
+/** Build the typed CAMERA error for a classified failure. */
+export function cameraCaptureError(reason: CaptureFailure): MediaCaptureError {
+  return new MediaCaptureError(reason, CAMERA_CAPTURE_MESSAGE[reason]);
+}

@@ -408,6 +408,12 @@ pub const VIDEO_BITRATE_MAX_BPS: u32 = 4_000_000;
 pub const MIN_KEYFRAME_INTERVAL_MS_FLOOR: u32 = 100;
 
 /// The highest minimum keyframe interval MC will direct, in milliseconds.
+///
+/// DRIFT SIGNAL: mirrored by the SDK's `KEYFRAME_MIN_INTERVAL_CEILING_MS`
+/// (`packages/sdk-core/src/config/clientConfig.ts`), which REFUSES a directed
+/// value above it; pinned by
+/// `scripts/guards/simple/validate-keyframe-floor-sync.sh` (see
+/// [`MIN_KEYFRAME_INTERVAL_MS_FLOOR`]). Keep this a single literal.
 pub const MIN_KEYFRAME_INTERVAL_MS_CEILING: u32 = 10_000;
 
 /// The encoding parameters MC directs for main (camera) video.
