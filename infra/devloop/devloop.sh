@@ -173,6 +173,22 @@ DESTROY=false
 DEVLOOP_LEAD_MODEL="${DEVLOOP_LEAD_MODEL:-}"
 LEAD_MODEL_ARGS=()
 [[ -n "$DEVLOOP_LEAD_MODEL" ]] && LEAD_MODEL_ARGS=(--model "$DEVLOOP_LEAD_MODEL")
+# Hard memory cap on the dev container (2026-10-22). Without one, a single
+# runaway test (story 3 task 12: an exhaustive model check at 12 GB) took the
+# whole WSL VM into swap, and the Kind node, Prometheus and the shell froze with
+# it. Capped and with swap equal to the limit (no container swap), the runaway is
+# OOM-killed inside the container and fails its layer loudly instead.
+# Default is derived from the host, not hardcoded: 70% of MemTotal, leaving the
+# rest for the Kind node, the observability stack and the OS. Override with
+# DEVLOOP_CONTAINER_MEMORY (a podman size, e.g. 12g). Like every `podman run`
+# flag it takes effect only on container (re)create (--recreate).
+DEVLOOP_CONTAINER_MEMORY="${DEVLOOP_CONTAINER_MEMORY:-}"
+if [[ -z "$DEVLOOP_CONTAINER_MEMORY" ]]; then
+    __mem_total_kib="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)"
+    [[ "$__mem_total_kib" =~ ^[0-9]+$ ]] || { echo "ERROR: cannot read MemTotal from /proc/meminfo to size the dev-container memory cap; set DEVLOOP_CONTAINER_MEMORY (e.g. 10g)." >&2; exit 1; }
+    DEVLOOP_CONTAINER_MEMORY="$(( __mem_total_kib * 70 / 100 / 1024 ))m"
+fi
+[[ "$DEVLOOP_CONTAINER_MEMORY" =~ ^[1-9][0-9]*[kmg]$ ]] || { echo "ERROR: DEVLOOP_CONTAINER_MEMORY='${DEVLOOP_CONTAINER_MEMORY}' is not a podman size like 10g or 9500m." >&2; exit 1; }
 while [[ "${1:-}" == --* ]]; do
     case "$1" in
         --rebuild) REBUILD_IMAGE=true; shift ;;
@@ -819,6 +835,8 @@ if ! is_container_running "$DEV_CONTAINER"; then
     podman run -d --name "$DEV_CONTAINER" \
         --init \
         --pids-limit 8192 \
+        --memory "$DEVLOOP_CONTAINER_MEMORY" \
+        --memory-swap "$DEVLOOP_CONTAINER_MEMORY" \
         --userns=keep-id \
         --network "$NETWORK_NAME" \
         --add-host "${DB_CONTAINER}:${DB_IP}" \

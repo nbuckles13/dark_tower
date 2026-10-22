@@ -572,6 +572,28 @@ reset_marks
 dl_acc_out="$(cd "$WORK" && PATH="${STUB_BIN}:${PATH}" bash "$DEVLOOP" "$SLUG41" 2>&1)"
 assert_absent "namelen-devloop-accept-no-token" "CLUSTER_NAME_TOO_LONG" "$dl_acc_out"
 
+# --- devloop.sh dev-container memory cap: a bad DEVLOOP_CONTAINER_MEMORY exits BEFORE any
+#     container creation (same non-git $WORK + podman marker as the slug cap above).
+reset_marks
+dl_mem_rej_out="$(cd "$WORK" && DEVLOOP_CONTAINER_MEMORY=lots PATH="${STUB_BIN}:${PATH}" bash "$DEVLOOP" "$SLUG41" 2>&1)"; dl_mem_rej_rc=$?
+assert_rc        "devloop-memory-reject-exit1"           1 "$dl_mem_rej_rc"
+assert_status    "devloop-memory-reject-message"         "ERROR: DEVLOOP_CONTAINER_MEMORY='lots' is not a podman size" "$dl_mem_rej_out"
+assert_no_marker "devloop-memory-reject-before-creation" "$MARK" "ran.podman"
+
+# accept: an explicit size, and the default derived from the real /proc/meminfo, both pass the
+# check (each then fails later at the git step — WITHOUT the error, which is the boundary proof).
+reset_marks
+dl_mem_acc_out="$(cd "$WORK" && DEVLOOP_CONTAINER_MEMORY=10g PATH="${STUB_BIN}:${PATH}" bash "$DEVLOOP" "$SLUG41" 2>&1)"
+assert_absent "devloop-memory-accept-override" "DEVLOOP_CONTAINER_MEMORY" "$dl_mem_acc_out"
+reset_marks
+dl_mem_def_out="$(cd "$WORK" && env -u DEVLOOP_CONTAINER_MEMORY PATH="${STUB_BIN}:${PATH}" bash "$DEVLOOP" "$SLUG41" 2>&1)"
+assert_absent "devloop-memory-accept-derived-default" "DEVLOOP_CONTAINER_MEMORY" "$dl_mem_def_out"
+
+# The cap is only a cap if swap is capped to the SAME value: --memory alone lets the container
+# swap (podman's default memory-swap is 2x memory), which is the freeze this exists to stop.
+dl_mem_flags="$(grep -cE -- '--memory(-swap)? "\$DEVLOOP_CONTAINER_MEMORY"' "$DEVLOOP")"
+assert_rc "devloop-memory-and-swap-same-cap" 0 "$([[ "$(grep -c -- '--memory "$DEVLOOP_CONTAINER_MEMORY"' "$DEVLOOP")" -eq 1 && "$(grep -c -- '--memory-swap "$DEVLOOP_CONTAINER_MEMORY"' "$DEVLOOP")" -eq 1 ]] && echo 0 || echo "1 (memory/memory-swap flag lines=${dl_mem_flags}, want one of each)")"
+
 # --- devloop.sh detect_orphan_clusters: a FAILED listing is "unknown", never "no orphans" ------
 # devloop.sh has no source guard (sourcing it runs the launcher), so the REAL function body is
 # extracted from the file and run against PATH stubs — never a re-typed copy.
