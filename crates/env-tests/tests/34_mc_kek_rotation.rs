@@ -28,7 +28,20 @@
 //! delta. The frame at the right generation is what attributes the rotation to
 //! THIS meeting; the counters prove it was recorded.
 //!
-//! Registration cost: two AC registrations per run.
+//! # Story 3 MC-A: rotation with video flowing
+//!
+//! A second fn (three AV participants) proves a leave while video is directed
+//! and flowing rotates the KEK for exactly the post-removal members and leaves
+//! every video directive alone; see its doc.
+//!
+//! # Edge sum (README per-file edge-sum header rule)
+//!
+//! The two fns run concurrently. The story-2 fn opens no media session (0);
+//! the video fn: 3 participants x (2 audio + 2 video) = 12.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 12
+//!
+//! Registration cost: 2 + 3 = five AC registrations per run.
 
 #![cfg(feature = "flows")]
 
@@ -265,4 +278,301 @@ async fn a_departure_rotates_the_meeting_kek_for_the_remaining_member() {
 
     a.connection()
         .close(wtransport::VarInt::from_u32(0), b"leave");
+}
+
+/// Story 3 MC-A (R-14, R-33 "rotation on leave with video flowing"): a leave
+/// while video is DIRECTED AND FLOWING rotates the KEK for exactly the
+/// post-removal members, and does NOT re-issue, withdraw or restart any video
+/// directive.
+///
+/// A, B, C each publish both kinds and declare 2 audio + 2 video slots, all on
+/// both handlers (co-located: one target per stream). Joined and converged one
+/// at a time, so each holds the earlier joiners first (R-3). B's first video
+/// slot holds A; A's video frames reaching it is the FLOWING positive control.
+///
+/// C leaves. A and B each receive a `MeetingKekUpdate` at the next generation
+/// carrying the SAME new key. A's video is still watched by B on the same
+/// handler, so its directive has nothing to change: no `SendDirective` may
+/// reach A between C's departure and a FENCE taken after the rotation — A
+/// redeclares its audio slot count and reads until the resulting
+/// `StreamAssignments` (a PRE-fence the same way, before the leave, drains
+/// everything A was sent earlier). MC writes one participant's outbound stream in
+/// meeting-actor turn order (the leave's flush, the rotation push and the
+/// redeclaration's flush all enqueue on A's one mailbox), so anything the leave
+/// or the rotation emitted for A is ordered BEFORE the fence: the absence is
+/// bounded by an event, never by a timeout. Finally A's video still reaches B.
+///
+/// The browser half (decoding continues, no rotation keyframe) is C-C1's.
+///
+/// Edge sum and registration cost: see the file header.
+#[tokio::test]
+async fn a_leave_with_video_flowing_rotates_the_kek_without_touching_video_directives() {
+    use env_tests::fixtures::mc_session::JoinDeclaration;
+    use env_tests::fixtures::participant::{
+        reach, settle_window, slots_of, Invited, Participant, AUDIO, VIDEO, VIEW_MARGIN,
+    };
+    use env_tests::fixtures::video::{until_video_on_slot, BackgroundPublisher, VideoSubscriber};
+    use proto_gen::dark_tower::signaling::v1::{SlotState, StreamAssignments};
+    use std::collections::HashMap;
+
+    const PHASE: &str = "KEK+VIDEO";
+    /// Failure bound for a directed video frame (rig bound, never a pass).
+    const FRAME_DEADLINE: Duration = Duration::from_secs(30);
+
+    let cluster = cluster().await;
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    let w = rotation_window(&prom).await;
+    let bound = settle_window(&cluster).await + VIEW_MARGIN;
+    let auth = AuthClient::new(&cluster.ac_base_url);
+    let gc = GcClient::new(&cluster.gc_base_url);
+    let invited = Invited::new(&auth, &gc, "KEK rotation with video", 3).await;
+    let both = [AUDIO, VIDEO];
+
+    // A view where `kind`'s slots are `n` occupied (state != FEWER) then
+    // FEWER, the occupied ones ACTIVE.
+    let filled = |v: &StreamAssignments, kind, n: usize| {
+        let s = slots_of(v, kind);
+        s.len() == 2
+            && s.iter().enumerate().all(|(i, a)| {
+                let want = if i < n {
+                    SlotState::Active
+                } else {
+                    SlotState::FewerSourcesThanSlots
+                };
+                a.slot_state == want as i32
+            })
+    };
+
+    let labels = ["A", "B", "C"];
+    let mut ps: Vec<Participant> = Vec::new();
+    let mut mh: Vec<HashMap<String, env_tests::fixtures::mc_session::MhSession>> = Vec::new();
+    for (i, label) in labels.iter().enumerate() {
+        let base = 10 * u32::try_from(i).unwrap();
+        let p = invited
+            .join(
+                i,
+                label,
+                &JoinDeclaration::default()
+                    .publishing(&both)
+                    .receiving(&[base + 1, base + 2], &[base + 3, base + 4]),
+            )
+            .await;
+        let mut sessions = HashMap::new();
+        for url in p.offered() {
+            sessions.insert(url.clone(), reach(PHASE, label, &url, &p.token).await);
+        }
+        ps.push(p);
+        mh.push(sessions);
+        // Converge EVERY member on holding every earlier/later peer before the
+        // next join, so slot order is the join order (R-3).
+        let peers = ps.len() - 1;
+        for p in &mut ps {
+            p.converge(PHASE, bound, |v, _| {
+                v.is_some_and(|v| filled(v, AUDIO, peers) && filled(v, VIDEO, peers))
+            })
+            .await;
+        }
+    }
+    for p in &mut ps {
+        // One co-located target per published kind.
+        p.converge(PHASE, bound, |_, d| {
+            d.is_some_and(|d| {
+                d.streams.len() == 2 && d.streams.iter().all(|s| s.targets.len() == 1)
+            })
+        })
+        .await;
+    }
+    let a_id = ps[0].sender_id();
+    let a_join = ps[0].join.clone();
+    let b_join = ps[1].join.clone();
+    assert_eq!(
+        a_join.kek_generation, b_join.kek_generation,
+        "PRECONDITION: one meeting KEK generation"
+    );
+    let base_generation = a_join.kek_generation.max(b_join.kek_generation);
+
+    // FLOWING: A's video on B's first video slot (it holds A: the earliest).
+    let a_target = ps[0]
+        .directive
+        .as_ref()
+        .unwrap()
+        .streams
+        .iter()
+        .find(|s| s.media_kind == VIDEO as i32)
+        .unwrap()
+        .targets[0]
+        .media_handler_url
+        .clone();
+    let b_video_slot = slots_of(ps[1].view(), VIDEO)[0].clone();
+    assert_eq!(
+        b_video_slot.media_handler_url, a_target,
+        "PRECONDITION: B's edge from A is on A's one video target"
+    );
+    let publisher = BackgroundPublisher::start(mh[0][&a_target].connection().clone(), a_id);
+    let mut b_sub = VideoSubscriber::spawn(mh[1][&a_target].connection().clone());
+    until_video_on_slot(
+        "KEK+VIDEO before",
+        "B",
+        &mut b_sub,
+        b_video_slot.slot_id,
+        a_id,
+        FRAME_DEADLINE,
+    )
+    .await;
+
+    // PRE-FENCE: everything A was sent before the leave is read off its stream
+    // first, so nothing emitted earlier can be counted against the leave. A
+    // adds a third audio slot and reads to the view carrying it.
+    fence(PHASE, &mut ps[0], &[1, 2, 5], 3, bound).await;
+
+    // C leaves (clean close: immediate removal, debounced rotation). C's MC
+    // session closes FIRST, and its media sessions are dropped only once A's
+    // view shows C removed. Dropping them first would make the handlers report
+    // C's connections closing ONE AT A TIME while C is still on the roster: a
+    // genuine partial-connectivity change that legitimately moves C's edges
+    // from A to C's remaining handler (A's targets widen, then narrow) — real
+    // routing, but not what this phase measures. Once C is off the roster the
+    // handlers' disconnect reports are for an unknown participant and change
+    // nothing.
+    let c = ps.pop().unwrap();
+    let c_id = c.sender_id();
+    c.session
+        .connection()
+        .close(wtransport::VarInt::from_u32(0), b"leave");
+    let deadline = Instant::now() + w + ROTATION_MARGIN;
+    let mut a_directives_since_leave = 0usize;
+    let mut early_update = None;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "{PHASE}: A's view never dropped C after C's clean close"
+        );
+        match ps[0]
+            .session
+            .try_read(READ_BOUND)
+            .await
+            .and_then(|m| m.message)
+        {
+            Some(server_message::Message::StreamAssignments(v)) => {
+                let gone = !v.assignments.iter().any(|a| a.sender_id == Some(c_id));
+                ps[0].view = Some(v);
+                if gone {
+                    break;
+                }
+            }
+            Some(server_message::Message::SendDirective(d)) => {
+                a_directives_since_leave += 1;
+                ps[0].directive = Some(d);
+            }
+            Some(server_message::Message::MeetingKekUpdate(u)) => early_update = Some(u),
+            _ => {}
+        }
+    }
+    drop((c, mh.pop()));
+
+    // Read A and B until each has its rotation; count A's SendDirectives.
+    let mut updates = Vec::new();
+    for (i, p) in ps.iter_mut().enumerate() {
+        if i == 0 {
+            if let Some(u) = early_update.take() {
+                updates.push(u);
+                continue;
+            }
+        }
+        let update = loop {
+            assert!(
+                Instant::now() < deadline,
+                "{PHASE}: {} received NO MeetingKekUpdate within W ({w:?}) + {ROTATION_MARGIN:?} \
+                 of C's departure while video was flowing (mc-incident-response.md Scenario 19)",
+                p.label
+            );
+            match p.session.try_read(READ_BOUND).await.and_then(|m| m.message) {
+                Some(server_message::Message::MeetingKekUpdate(u)) => break u,
+                Some(server_message::Message::SendDirective(d)) => {
+                    if i == 0 {
+                        a_directives_since_leave += 1;
+                    }
+                    p.directive = Some(d);
+                }
+                Some(server_message::Message::StreamAssignments(v)) => p.view = Some(v),
+                _ => {}
+            }
+        };
+        updates.push(update);
+    }
+    for (p, u) in ps.iter().zip(&updates) {
+        assert_eq!(
+            u.kek_generation,
+            base_generation + 1,
+            "{PHASE}: {} — a departure advances the generation by exactly one",
+            p.label
+        );
+        assert_eq!(u.meeting_kek.len(), 32, "{PHASE}: AES-256");
+    }
+    assert_eq!(
+        updates[0].meeting_kek, updates[1].meeting_kek,
+        "{PHASE}: every post-removal member receives the SAME rotated key"
+    );
+    assert_ne!(
+        updates[0].meeting_kek, a_join.meeting_kek,
+        "{PHASE}: a new key"
+    );
+
+    // FENCE: A drops back to two audio slots; read to the view carrying it.
+    a_directives_since_leave += fence(PHASE, &mut ps[0], &[1, 2], 2, bound).await;
+    assert_eq!(
+        a_directives_since_leave, 0,
+        "{PHASE}: C's leave and the KEK rotation re-issued A's send directive — A's video is \
+         still watched by B on the same handler, so nothing about it changed"
+    );
+
+    // Still flowing after the rotation, on the same slot.
+    until_video_on_slot(
+        "KEK+VIDEO after",
+        "B",
+        &mut b_sub,
+        b_video_slot.slot_id,
+        a_id,
+        FRAME_DEADLINE,
+    )
+    .await;
+    publisher.stop().await;
+}
+
+/// Redeclare `p`'s audio slots to `audio` (video kept at its two join ids) and
+/// read until a view with `audio_len` audio slots arrives. Returns how many
+/// `SendDirective`s arrived on the way. A redeclaration of a participant's OWN
+/// slots changes what it receives, never what it is directed to send.
+async fn fence(
+    phase: &str,
+    p: &mut env_tests::fixtures::participant::Participant,
+    audio: &[u32],
+    audio_len: usize,
+    bound: Duration,
+) -> usize {
+    use env_tests::fixtures::participant::{slots_of, AUDIO};
+    p.declare(audio, &[3, 4]).await;
+    let deadline = Instant::now() + bound;
+    let mut directives = 0;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "{phase}: {}'s fence redeclaration produced no StreamAssignments within {bound:?}",
+            p.label
+        );
+        match p.session.try_read(READ_BOUND).await.and_then(|m| m.message) {
+            Some(server_message::Message::StreamAssignments(v)) => {
+                let done = slots_of(&v, AUDIO).len() == audio_len;
+                p.view = Some(v);
+                if done {
+                    return directives;
+                }
+            }
+            Some(server_message::Message::SendDirective(d)) => {
+                directives += 1;
+                p.directive = Some(d);
+            }
+            _ => {}
+        }
+    }
 }

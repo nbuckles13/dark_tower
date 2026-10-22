@@ -92,7 +92,7 @@ test.describe('story 2 S1: N+1 participants hear each other by content', () => {
       await Promise.all(members.map((m) => flushTelemetry(m.page)));
 
       await test.step('R-27 part 1: send-counter pipe liveness and _total survival', async () => {
-        // A SOLO client sends nothing (R-3: its send directive has no streams), so
+        // A SOLO client sends nothing (R-3: its audio stream has no targets), so
         // this runs here, where every client is held by the others. The query is
         // by the exact exported `_total` name: a rise proves both the pipe and
         // the suffix; a lost suffix returns empty and fails loudly.

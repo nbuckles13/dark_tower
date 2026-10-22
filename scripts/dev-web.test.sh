@@ -747,11 +747,12 @@ assert_absent "slots-echo-not-retired-live-cmd" "jsonpath='{.data.MC_MAX_RECEIVE
 assert_status "slots-echo-live-cmd-resolves-hashed-name" \
   "kubectl get deployment/mc-0 -n dark-tower" "$out"
 # THE AUTHORITY FRAMING ON THE **PASS** BRANCH (@observability F2): truncation's
-# in-cluster signal, and — until MC-A — the retired total's whole-declaration
-# rejection, so the transition window is not misreported.
+# in-cluster signal. The retired total's whole-declaration rejection
+# (`slot_count_over_cap`) was removed by story 3 MC-A, so the note must no
+# longer name it — an operator would hunt a token MC no longer emits.
 assert_status "slots-pass-names-truncation-counter" \
   'mc_media_slot_states_total{slot_state="unavailable"}' "$out"
-assert_status "slots-pass-names-transition-counter" 'outcome="slot_count_over_cap"' "$out"
+assert_absent "slots-pass-no-retired-transition-counter" 'slot_count_over_cap' "$out"
 assert_status "slots-pass-says-on-disk" "ON-DISK pre-flight read" "$out"
 
 # (10b) The caps are READ from the file, not hardcoded: non-default caps with

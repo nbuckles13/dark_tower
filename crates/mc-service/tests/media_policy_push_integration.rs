@@ -427,7 +427,18 @@ async fn pushed_request_carries_the_two_party_policy_and_a_non_zero_generation()
             !stream.supersede_on_independent_frame,
             "every audio frame forwards; MH is told the behaviour, never the media type"
         );
-        assert_eq!(stream.transport_mode, TransportMode::Datagram as i32);
+        // No longer written (story 3): derived at MH from the candidate's
+        // `SourceStream`, which carries DATAGRAM for stream 0.
+        assert_eq!(stream.transport_mode, TransportMode::Unspecified as i32);
+        let declared = request
+            .source_streams
+            .iter()
+            .find(|s| {
+                s.sender_id == stream.candidate_sources[0].sender_id
+                    && s.stream_number == stream.candidate_sources[0].stream_number
+            })
+            .expect("every candidate is declared in source_streams");
+        assert_eq!(declared.transport_mode, TransportMode::Datagram as i32);
         assert_ne!(
             stream.priority_group, 0,
             "MC assigns the priority group; 0 is the never-set default"

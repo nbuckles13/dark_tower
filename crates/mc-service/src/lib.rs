@@ -148,6 +148,7 @@ pub mod config;
 pub mod errors;
 pub mod grpc;
 pub mod media_admission;
+pub mod media_kind;
 pub mod media_routing;
 pub mod media_signaling;
 pub mod observability;

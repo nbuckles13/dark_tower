@@ -130,8 +130,17 @@ pub struct Session {
     pub sender_id: u32,
     /// `JoinResponse.media_servers`, as MC sent it.
     pub media_servers: Vec<String>,
-    /// `JoinResponse.max_receive_slots`, as MC advertised it (absent = `None`).
+    /// `JoinResponse.max_receive_slots` (superseded tag 12; MC-A no longer
+    /// writes it, so `None`).
     pub max_receive_slots: Option<u32>,
+    /// `JoinResponse.max_audio_receive_slots` / `max_video_receive_slots`.
+    pub max_kind_receive_slots: (Option<u32>, Option<u32>),
+    /// The `SendDirective` MC emitted in the join turn.
+    pub join_directive: Option<SendDirective>,
+    /// The `StreamAssignments` MC emitted in the join turn.
+    pub join_assignments: Option<StreamAssignments>,
+    /// Non-media messages read while taking the join view, replayed first.
+    pending: std::collections::VecDeque<ServerMessage>,
     /// The token `sub` this session joined as (what MH reports).
     pub user: String,
     /// MC's participant id for this session, read off the `JoinResponse`.
@@ -190,9 +199,39 @@ impl Session {
     }
 
     async fn next_raw(&mut self) -> Option<ServerMessage> {
+        if let Some(m) = self.pending.pop_front() {
+            return Some(m);
+        }
         tokio::time::timeout(QUIET, read_server_message(&mut self.recv))
             .await
             .ok()
+    }
+
+    /// Consume the joiner's JOIN-TURN view (story 3: every join carries its
+    /// declaration, so MC emits the joiner's `SendDirective` then
+    /// `StreamAssignments` in the join turn). Non-media messages read on the
+    /// way (the server-mute replay, roster broadcasts) are kept, in order, for
+    /// the test to read next — so a session starts from the same clean slate
+    /// the story-2 suite assumed, with the join view recorded.
+    async fn take_join_view(&mut self) {
+        let mut kept = std::collections::VecDeque::new();
+        loop {
+            let Ok(m) = tokio::time::timeout(QUIET, read_server_message(&mut self.recv)).await
+            else {
+                panic!("{}: the join-turn view never arrived", self.user);
+            };
+            match &m.message {
+                Some(server_message::Message::SendDirective(d)) => {
+                    self.join_directive = Some(d.clone());
+                }
+                Some(server_message::Message::StreamAssignments(a)) => {
+                    self.join_assignments = Some(a.clone());
+                    break;
+                }
+                _ => kept.push_back(m),
+            }
+        }
+        self.pending = kept;
     }
 
     /// The next server message of ANY kind (roster traffic included), or
@@ -490,6 +529,59 @@ pub async fn try_join_as(
     try_join_with_role(rig, stack, meeting_id, user, false).await
 }
 
+/// What a join presents for media (story 3 R-2, R-22). The suite default is
+/// story 2's shape: publish audio, header v3, no join-carried declaration.
+#[derive(Debug, Clone)]
+pub struct JoinShape {
+    /// `JoinRequest.publish_kinds`, raw.
+    pub publish_kinds: Vec<i32>,
+    /// `ParticipantCapabilities.supported_header_versions`.
+    pub header_versions: Vec<u32>,
+    /// `JoinRequest.receive_capability` (`None` = absent).
+    pub receive: Option<Vec<ReceiveSlot>>,
+}
+
+impl Default for JoinShape {
+    fn default() -> Self {
+        Self {
+            publish_kinds: vec![MediaKind::Audio as i32],
+            header_versions: vec![u32::from(media_protocol::frame::PROTOCOL_VERSION)],
+            receive: None,
+        }
+    }
+}
+
+impl JoinShape {
+    /// Publish exactly `kinds`.
+    #[must_use]
+    pub fn publishing(kinds: &[MediaKind]) -> Self {
+        Self {
+            publish_kinds: kinds.iter().map(|k| *k as i32).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Carry `slots` as the join's receive declaration.
+    #[must_use]
+    pub fn receiving(mut self, slots: Vec<ReceiveSlot>) -> Self {
+        self.receive = Some(slots);
+        self
+    }
+}
+
+/// Join with an explicit [`JoinShape`]; a refusal returns MC's error text.
+/// On success the join-turn view is taken as for [`join_as`]. No media
+/// connection is reported.
+pub async fn try_join_shaped(
+    rig: &AcceptLoopRig,
+    stack: &TestStackHandles,
+    meeting_id: &str,
+    user: &str,
+    shape: JoinShape,
+) -> Result<Session, String> {
+    try_join_full(rig, stack, meeting_id, user, false, shape).await
+}
+
 /// The one join path behind [`try_join_as`] and [`join_as_host`].
 async fn try_join_with_role(
     rig: &AcceptLoopRig,
@@ -497,6 +589,17 @@ async fn try_join_with_role(
     meeting_id: &str,
     user: &str,
     host: bool,
+) -> Result<Session, String> {
+    try_join_full(rig, stack, meeting_id, user, host, JoinShape::default()).await
+}
+
+async fn try_join_full(
+    rig: &AcceptLoopRig,
+    stack: &TestStackHandles,
+    meeting_id: &str,
+    user: &str,
+    host: bool,
+    shape: JoinShape,
 ) -> Result<Session, String> {
     let mut claims = make_meeting_claims(meeting_id);
     claims.sub = user.to_string();
@@ -515,12 +618,19 @@ async fn try_join_with_role(
             meeting_id: meeting_id.to_string(),
             join_token: token,
             participant_name: user.to_string(),
-            capabilities: None,
+            capabilities: Some(
+                proto_gen::dark_tower::signaling::v1::ParticipantCapabilities {
+                    supported_codecs: Vec::new(),
+                    supported_header_versions: shape.header_versions,
+                },
+            ),
             correlation_id: String::new(),
             binding_token: String::new(),
             identity_public_key: sample_identity_public_key(),
-            publish_kinds: Vec::new(),
-            receive_capability: None,
+            publish_kinds: shape.publish_kinds,
+            receive_capability: shape
+                .receive
+                .map(|slots| proto_gen::dark_tower::signaling::v1::ReceiveCapability { slots }),
         })),
     }))
     .await
@@ -529,30 +639,38 @@ async fn try_join_with_role(
     let resp = tokio::time::timeout(Duration::from_secs(5), read_server_message(&mut recv))
         .await
         .expect("join response timeout");
-    let (participant_id, sender_id, media_servers, max_receive_slots) = match resp.message {
-        Some(server_message::Message::JoinResponse(r)) => (
-            r.participant_id.clone(),
-            r.sender_id.expect("MC allocates a sender id at join"),
-            r.media_servers
-                .into_iter()
-                .map(|m| m.media_handler_url)
-                .collect::<Vec<String>>(),
-            r.max_receive_slots,
-        ),
-        other => return Err(format!("{other:?}")),
-    };
+    let (participant_id, sender_id, media_servers, max_receive_slots, max_kind_receive_slots) =
+        match resp.message {
+            Some(server_message::Message::JoinResponse(r)) => (
+                r.participant_id.clone(),
+                r.sender_id.expect("MC allocates a sender id at join"),
+                r.media_servers
+                    .into_iter()
+                    .map(|m| m.media_handler_url)
+                    .collect::<Vec<String>>(),
+                r.max_receive_slots,
+                (r.max_audio_receive_slots, r.max_video_receive_slots),
+            ),
+            other => return Err(format!("{other:?}")),
+        };
 
-    Ok(Session {
+    let mut session = Session {
         conn,
         send,
         recv,
         sender_id,
         media_servers,
         max_receive_slots,
+        max_kind_receive_slots,
+        join_directive: None,
+        join_assignments: None,
+        pending: std::collections::VecDeque::new(),
         user: user.to_string(),
         participant_id,
         meeting_id: meeting_id.to_string(),
-    })
+    };
+    session.take_join_view().await;
+    Ok(session)
 }
 
 /// A framed `ServerMuteRequest` naming `target`.

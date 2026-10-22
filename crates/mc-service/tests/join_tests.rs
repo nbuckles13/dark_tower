@@ -193,7 +193,15 @@ async fn join_and_read_response(
             meeting_id: meeting_id.to_string(),
             join_token: join_token.to_string(),
             participant_name: participant_name.to_string(),
-            capabilities: None,
+            capabilities: Some(
+                proto_gen::dark_tower::signaling::v1::ParticipantCapabilities {
+                    supported_codecs: Vec::new(),
+                    // v3 is the only header version (story 3 R-22).
+                    supported_header_versions: vec![u32::from(
+                        media_protocol::frame::PROTOCOL_VERSION,
+                    )],
+                },
+            ),
             correlation_id: String::new(),
             binding_token: String::new(),
             // ADR-0036 §4: raw Ed25519 identity signing public key, exactly 32
@@ -202,7 +210,8 @@ async fn join_and_read_response(
             // `cnf` check, so acceptance means trust-on-first-use and nothing
             // about identity.
             identity_public_key: sample_identity_public_key(),
-            publish_kinds: Vec::new(),
+            // Story 3 R-2: the suite publishes audio (story-2 shape).
+            publish_kinds: vec![proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32],
             receive_capability: None,
         })),
     };
@@ -251,7 +260,15 @@ async fn join_keep_open(
             meeting_id: meeting_id.to_string(),
             join_token: join_token.to_string(),
             participant_name: participant_name.to_string(),
-            capabilities: None,
+            capabilities: Some(
+                proto_gen::dark_tower::signaling::v1::ParticipantCapabilities {
+                    supported_codecs: Vec::new(),
+                    // v3 is the only header version (story 3 R-22).
+                    supported_header_versions: vec![u32::from(
+                        media_protocol::frame::PROTOCOL_VERSION,
+                    )],
+                },
+            ),
             correlation_id: String::new(),
             binding_token: String::new(),
             // ADR-0036 §4: raw Ed25519 identity signing public key, exactly 32
@@ -260,7 +277,8 @@ async fn join_keep_open(
             // `cnf` check, so acceptance means trust-on-first-use and nothing
             // about identity.
             identity_public_key: sample_identity_public_key(),
-            publish_kinds: Vec::new(),
+            // Story 3 R-2: the suite publishes audio (story-2 shape).
+            publish_kinds: vec![proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32],
             receive_capability: None,
         })),
     };
@@ -861,7 +879,15 @@ async fn test_participant_joined_notification_via_bridge() {
             meeting_id: "meeting-bridge".to_string(),
             join_token: token1,
             participant_name: "Alice".to_string(),
-            capabilities: None,
+            capabilities: Some(
+                proto_gen::dark_tower::signaling::v1::ParticipantCapabilities {
+                    supported_codecs: Vec::new(),
+                    // v3 is the only header version (story 3 R-22).
+                    supported_header_versions: vec![u32::from(
+                        media_protocol::frame::PROTOCOL_VERSION,
+                    )],
+                },
+            ),
             correlation_id: String::new(),
             binding_token: String::new(),
             // ADR-0036 §4: raw Ed25519 identity signing public key, exactly 32
@@ -870,7 +896,8 @@ async fn test_participant_joined_notification_via_bridge() {
             // `cnf` check, so acceptance means trust-on-first-use and nothing
             // about identity.
             identity_public_key: sample_identity_public_key(),
-            publish_kinds: Vec::new(),
+            // Story 3 R-2: the suite publishes audio (story-2 shape).
+            publish_kinds: vec![proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32],
             receive_capability: None,
         })),
     };
@@ -917,7 +944,15 @@ async fn test_participant_joined_notification_via_bridge() {
             meeting_id: "meeting-bridge".to_string(),
             join_token: token2,
             participant_name: "Bob".to_string(),
-            capabilities: None,
+            capabilities: Some(
+                proto_gen::dark_tower::signaling::v1::ParticipantCapabilities {
+                    supported_codecs: Vec::new(),
+                    // v3 is the only header version (story 3 R-22).
+                    supported_header_versions: vec![u32::from(
+                        media_protocol::frame::PROTOCOL_VERSION,
+                    )],
+                },
+            ),
             correlation_id: String::new(),
             binding_token: String::new(),
             // ADR-0036 §4: raw Ed25519 identity signing public key, exactly 32
@@ -926,7 +961,8 @@ async fn test_participant_joined_notification_via_bridge() {
             // `cnf` check, so acceptance means trust-on-first-use and nothing
             // about identity.
             identity_public_key: sample_identity_public_key(),
-            publish_kinds: Vec::new(),
+            // Story 3 R-2: the suite publishes audio (story-2 shape).
+            publish_kinds: vec![proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32],
             receive_capability: None,
         })),
     };
@@ -947,11 +983,19 @@ async fn test_participant_joined_notification_via_bridge() {
         "Expected JoinResponse for second client"
     );
 
-    // First client should receive a ParticipantJoined notification via bridge
-    let notification =
-        tokio::time::timeout(Duration::from_secs(5), read_server_message(&mut recv1))
+    // First client should receive a ParticipantJoined notification via bridge.
+    // Since story 3 every join carries its declaration, so the first client's
+    // own SendDirective / StreamAssignments may precede it: skip those.
+    let notification = loop {
+        let m = tokio::time::timeout(Duration::from_secs(5), read_server_message(&mut recv1))
             .await
             .expect("Timeout: ParticipantJoined notification not received via bridge");
+        match &m.message {
+            Some(server_message::Message::SendDirective(_))
+            | Some(server_message::Message::StreamAssignments(_)) => continue,
+            _ => break m,
+        }
+    };
 
     match &notification.message {
         Some(server_message::Message::ParticipantJoined(joined)) => {
@@ -1110,23 +1154,23 @@ async fn test_first_participant_triggers_register_meeting() {
 }
 
 // ============================================================================
-// T13: A join that changes no handler's snapshot is not re-pushed
+// T13: every join changes the snapshot — it declares the joiner's streams
 // ============================================================================
 //
-// Neither participant has declared a receive capability, so both hold zero
-// slots and the handler's snapshot is empty before and after Bob joins: the
-// generation does not advance and the push worker sends nothing. (A join that
-// DOES change a snapshot re-pushes — see `slot_placement_integration.rs`.)
+// Story 3: each handler's snapshot declares `source_streams` for EVERY
+// participant's publish set, so a second join changes the snapshot even when
+// nobody holds anybody (no edges) and MUST be re-pushed — otherwise MH would
+// drop the joiner's first frames as `unmatched_stream`. (The converse, "an
+// identical re-render does not advance the generation", is pinned in
+// `slot_placement_integration.rs`.)
 
 #[tokio::test]
-async fn test_second_participant_does_not_trigger_register_meeting() {
+async fn test_second_participant_join_re_pushes_its_declared_streams() {
     let server = TestServer::start().await;
     server.create_meeting("meeting-noreg").await;
 
-    // First participant joins and STAYS connected — otherwise a clean close would
-    // (post-task-#64) remove Alice immediately, and Bob below would look like the
-    // first participant and re-trigger RegisterMeeting. Holding the connection is
-    // what "a meeting that already has a participant" actually means.
+    // First participant joins and STAYS connected, so Bob below is genuinely
+    // the second.
     let claims1 = make_meeting_claims("meeting-noreg");
     let token1 = server.sign_token(&claims1);
     let (_conn1, _send1, _recv1, response1) =
@@ -1139,20 +1183,21 @@ async fn test_second_participant_does_not_trigger_register_meeting() {
         "Expected JoinResponse for first client"
     );
 
-    // Give spawned task time to execute
     tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let calls_after_first = server.stack.mh_reg_client.calls().len();
+    let calls = server.stack.mh_reg_client.calls();
     assert_eq!(
-        calls_after_first, 1,
+        calls.len(),
+        1,
         "First participant should trigger RegisterMeeting"
     );
+    assert_eq!(calls[0].assignment.source_streams.len(), 1, "Alice's audio");
+    assert_eq!(calls[0].egress_stream_count, 0, "nobody holds anybody");
 
-    // Second participant joins (Alice still connected → Bob is genuinely second)
     let mut claims2 = make_meeting_claims("meeting-noreg");
     claims2.sub = "user-002".to_string();
     let token2 = server.sign_token(&claims2);
-    let response2 = join_and_read_response(&server.url(), "meeting-noreg", &token2, "Bob").await;
+    let (_conn2, _send2, _recv2, response2) =
+        join_keep_open(&server.url(), "meeting-noreg", &token2, "Bob").await;
     assert!(
         matches!(
             &response2.message,
@@ -1161,14 +1206,20 @@ async fn test_second_participant_does_not_trigger_register_meeting() {
         "Expected JoinResponse for second client"
     );
 
-    // Give time for any potential (unwanted) spawned task
     tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let calls_after_second = server.stack.mh_reg_client.calls().len();
+    let calls = server.stack.mh_reg_client.calls();
     assert_eq!(
-        calls_after_second, 1,
-        "a join that leaves every snapshot unchanged must not re-push"
+        calls.len(),
+        2,
+        "Bob's join declares his stream: one re-push"
     );
+    assert_eq!(
+        calls[1].assignment.source_streams.len(),
+        2,
+        "Alice's and Bob's audio"
+    );
+    assert!(calls[1].policy_generation > calls[0].policy_generation);
+    assert_eq!(calls[1].egress_stream_count, 0, "still no edges");
 }
 
 // ============================================================================

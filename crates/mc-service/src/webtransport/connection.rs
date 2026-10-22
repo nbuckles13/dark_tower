@@ -17,8 +17,8 @@ use crate::errors::McError;
 use crate::media_routing::{HandlerEndpoint, HandlerId, MeetingHandlers};
 use crate::media_signaling::{
     CapabilityOutcome, ClientMediaConfig, DirectiveOutcome, MediaKindLabel, MuteOutcome,
-    ReceiveCapabilityDeclaration, RefusalReplySurface, ServerMuteAction, ServerMuteOutcome,
-    UnmuteRequestOutcome,
+    PublishSet, ReceiveCapabilityDeclaration, RefusalReplySurface, ServerMuteAction,
+    ServerMuteOutcome, SlotDemand, UnmuteRequestOutcome,
 };
 use crate::observability::metrics;
 use crate::redis::{MhAssignmentData, MhAssignmentStore};
@@ -44,7 +44,7 @@ use wtransport::stream::{RecvStream, SendStream};
 use wtransport::Connection;
 
 /// Maximum size for a single framed message (64KB).
-const MAX_MESSAGE_SIZE: usize = 64 * 1024;
+pub(crate) const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
 /// Maximum bytes for a client-controlled string before it is stored or logged
 /// (R-60 security). Applied to `mh_url` / `failure_reason` / `failure_code`.
@@ -471,6 +471,41 @@ pub async fn handle_connection(
         "absent"
     });
 
+    // Step 6d0 (story 3 R-2, R-22): the media declaration — header version,
+    // publish set, receive declaration, neither-publish-nor-receive — AFTER
+    // authentication (no unauthenticated validation oracle; a bad token still
+    // reports `jwt_validation`) and BEFORE `join_connection` (nothing is
+    // allocated: no sender id, roster entry or binding). One pure function, so
+    // the refusal ORDER is unit-tested (`validate_join_media`).
+    let join_media = match validate_join_media(&join_request, &client_media_config) {
+        Ok(media) => media,
+        Err(err) => {
+            if let McError::ReceiveCapabilityInvalid(outcome) = &err {
+                // The specific cause on the capability series; the join series
+                // counts the class below. Two views of one event.
+                metrics::record_receive_capability(*outcome);
+            }
+            // The token only — never the request (it carries the join JWT),
+            // never the raw publish kinds or slots.
+            warn!(
+                target: "mc.webtransport.connection",
+                connection_id = %connection_id,
+                meeting_id = %meeting_id,
+                error_type = err.error_type_label(),
+                "Rejecting join: media declaration refused"
+            );
+            // Counted BEFORE the reply, so the count is never behind what the
+            // client already observed.
+            metrics::record_session_join(
+                "failure",
+                Some(err.error_type_label()),
+                join_start.elapsed(),
+            );
+            let _ = send_error(&mut send_stream, err.error_code(), &err.client_message()).await;
+            return Err(err);
+        }
+    };
+
     // Step 6c: resolve the live meeting BEFORE reading its handler assignment,
     // so a join into a meeting this MC does not host reports NOT_FOUND rather
     // than a missing assignment. The handle is kept for post-join signalling.
@@ -551,6 +586,8 @@ pub async fn handle_connection(
             JoinMedia {
                 deps: Arc::clone(&media_deps),
                 handlers,
+                publishes: join_media.publishes,
+                demand: join_media.demand,
             },
         )
         .await
@@ -686,8 +723,14 @@ pub async fn handle_connection(
     // validates, bounds and forwards what its client says.
     // `is_host` is threaded from the ONE derivation above (`claims.role`), never
     // re-derived from a message or a roster lookup at this layer.
-    let mut media_context =
-        media_signaling_context(meeting_handle, &join_result, client_media_config, is_host);
+    let mut media_context = media_signaling_context(
+        meeting_handle,
+        &join_result,
+        client_media_config,
+        is_host,
+        join_media.publishes,
+        join_media.declaration,
+    );
 
     // Step 10: Run bridge loop — forward ParticipantActor updates to client
     // outbound_tx was passed through the join flow and is now owned by ParticipantActor.
@@ -1209,8 +1252,12 @@ struct MediaSignalingContext {
     meeting_handle: MeetingActorHandle,
     /// This connection's participant id.
     participant_id: String,
-    /// Configured cap on declared slots per declaration.
-    max_receive_slots: u8,
+    /// Configured per-kind caps every declaration is truncated to.
+    max_receive_slots: [u8; 2],
+    /// This participant's publish set, fixed for the membership: the input to
+    /// the redeclaration neither-publish-nor-receive refusal (connection-local,
+    /// no actor hop).
+    publishes: PublishSet,
     /// Remaining budget of ACCEPTED declarations on this connection.
     declaration_budget: u32,
     /// The last declaration the meeting actor ACCEPTED, if any.
@@ -1313,21 +1360,35 @@ async fn handle_receive_capability(
 ) {
     reparent_current_span(trace_parent, trace_state);
 
-    // The slot cap is checked HERE, against `media.max_receive_slots` — the
-    // same `ClientMediaConfig::max_receive_slots` field `main.rs` publishes as
-    // `mc_media_receive_slot_cap`. Over the cap is rejected whole and counted
-    // as `slot_count_over_cap` (R-1: loud, never one silent participant).
-    let declaration = match ReceiveCapabilityDeclaration::parse(
-        capability,
-        media.max_receive_slots,
-        media.budget_remaining(),
-    ) {
-        Ok(declaration) => declaration,
-        Err(outcome) => {
-            reject_capability(outcome, connection_id, participant_handle, media).await;
-            return;
-        }
-    };
+    // Validated whole (every slot, kept or later truncated), then judged AS
+    // SENT for the neither-publish-nor-receive refusal, then truncated to the
+    // per-kind caps (`media.max_receive_slots`, the SAME values the JoinResponse
+    // advertises and `mc_media_receive_slot_cap` publishes). Over-cap is never
+    // a refusal (R-1). The work bound is the 64 KiB frame this arrived in
+    // (`MAX_MESSAGE_SIZE`).
+    let declaration =
+        match ReceiveCapabilityDeclaration::parse(capability, media.budget_remaining()) {
+            Ok(declaration) => declaration,
+            Err(outcome) => {
+                reject_capability(outcome, connection_id, participant_handle, media).await;
+                return;
+            }
+        };
+
+    // R-2: a redeclaration that would leave this participant neither
+    // publishing nor receiving is REFUSED and the previous declaration stays in
+    // force. Connection-local (the publish set is fixed for the membership), so
+    // no actor hop.
+    if crate::media_signaling::publishes_and_receives_nothing(media.publishes, &declaration) {
+        reject_capability(
+            CapabilityOutcome::WouldPublishAndReceiveNothing,
+            connection_id,
+            participant_handle,
+            media,
+        )
+        .await;
+        return;
+    }
 
     // Identical re-declaration: MC does NO work and sends NOTHING — no actor
     // hop, no budget charge. Recorded under its own outcome rather than as
@@ -1351,7 +1412,10 @@ async fn handle_receive_capability(
     // the same declaration — would be answered `accepted_unchanged` forever.
     match media
         .meeting_handle
-        .register_receive_capability(media.participant_id.clone(), declaration.clone())
+        .register_receive_capability(
+            media.participant_id.clone(),
+            declaration.clone().truncate(media.max_receive_slots),
+        )
         .await
     {
         Ok(()) => media.declaration = Some(declaration),
@@ -1474,7 +1538,7 @@ fn record_mute_for_each(named: &[(MediaKindLabel, bool)], outcome: MuteOutcome) 
 /// Handle a post-join `MuteRequest` (ADR-0036 §5 client mute).
 ///
 /// Records the reported state on the meeting actor (the single home for mute),
-/// which re-emits the changed slot view — `SLOT_STATE_SOURCE_MUTED` — to the
+/// which re-emits the changed slot view — `SLOT_STATE_AVATAR_CLIENT_MUTED` — to the
 /// subscribers holding this source.
 ///
 /// # Three guards, in this order, and the order is the security property
@@ -1485,8 +1549,9 @@ fn record_mute_for_each(named: &[(MediaKindLabel, bool)], outcome: MuteOutcome) 
 ///    done. This bounds the repeatable client-driven path into the SHARED
 ///    meeting actor per connection; the actor's resulting fan-out to holders is
 ///    bounded per MEETING by its per-turn flush bound.
-/// 3. **Audio-only re-emit** — a video-only change is recorded by the actor but
-///    re-emits nothing, because the slot view reads only audio mute.
+/// 3. **Changed-view re-emit** — a change of either kind is recorded by the
+///    actor, which re-emits only to holders whose view actually changed (a
+///    video toggle by a participant publishing no video changes nothing).
 ///
 /// # The send directive is not touched, and cannot be
 ///
@@ -1586,18 +1651,18 @@ async fn handle_mute_request(
     // ordering it correctly free.
     media.last_reported_mute = Some(reported);
 
-    // PER KIND. Audio: `applied` means the audio flag moved on a declared
-    // connection, so the actor re-emits to the holders of this source; an audio
-    // move before any declaration is `applied_no_recompose`. Video: a moved
-    // flag is recorded by the actor and re-emits nothing (the slot view reads
-    // only audio mute), so it is `applied_no_recompose` — a camera button
-    // produces it, routinely. A kind whose flag did not move is `unchanged`.
+    // PER KIND (story 3 MC-A). A moved flag of EITHER kind is `applied`: the
+    // actor re-renders (the stream's PAUSED disposition rides
+    // `source_streams`) and re-emits to the holders of this source whose view
+    // changed. Since every connection is declared from its join, there is no
+    // longer a "moved before any declaration" case, so `applied_no_recompose`
+    // is unreachable here. A kind whose flag did not move is `unchanged`.
     for (kind, muted) in named {
         let moved = kind.pick(previous.0, previous.1) != muted;
-        let outcome = match (kind, moved) {
-            (_, false) => MuteOutcome::Unchanged,
-            (MediaKindLabel::Audio, true) if media.declaration.is_some() => MuteOutcome::Applied,
-            (_, true) => MuteOutcome::AppliedNoRecompose,
+        let outcome = if moved {
+            MuteOutcome::Applied
+        } else {
+            MuteOutcome::Unchanged
         };
         metrics::record_mute_request(kind, outcome);
     }
@@ -1918,17 +1983,25 @@ async fn send_signaling(
 
 /// Build the per-connection media-signalling context from the live meeting
 /// handle resolved before the join.
+///
+/// The join-carried declaration seeds the identical-redeclaration
+/// short-circuit, so a client re-sending it post-join is `accepted_unchanged`
+/// (no actor hop, no reshuffle).
 fn media_signaling_context(
     meeting_handle: MeetingActorHandle,
     join_result: &JoinResult,
     config: ClientMediaConfig,
     is_host: bool,
+    publishes: PublishSet,
+    declaration: ReceiveCapabilityDeclaration,
 ) -> MediaSignalingContext {
     MediaSignalingContext::new(
         meeting_handle,
         join_result.participant_id.clone(),
         &config,
         is_host,
+        publishes,
+        Some(declaration),
     )
 }
 
@@ -1940,6 +2013,8 @@ impl MediaSignalingContext {
         participant_id: String,
         config: &ClientMediaConfig,
         is_host: bool,
+        publishes: PublishSet,
+        declaration: Option<ReceiveCapabilityDeclaration>,
     ) -> Self {
         // One clock reading for every bucket: they start together at join, so a
         // skew between them would be meaningless state.
@@ -1949,8 +2024,9 @@ impl MediaSignalingContext {
             meeting_handle,
             participant_id,
             max_receive_slots: config.max_receive_slots,
+            publishes,
             declaration_budget: config.max_receive_capability_declarations,
-            declaration: None,
+            declaration,
             last_reported_mute: None,
             mute_limiter: ClientWorkLimiter::new(
                 limiter_start,
@@ -2103,6 +2179,75 @@ async fn read_meeting_handlers(
     .map_err(|e| McError::MhAssignmentMissing(format!("{meeting_id}: {e}")))
 }
 
+/// A join's validated media declaration (story 3 R-2).
+#[derive(Debug)]
+struct ValidatedJoinMedia {
+    /// What the participant publishes, fixed for the membership.
+    publishes: PublishSet,
+    /// The receive declaration AS SENT (seeds the redeclaration short-circuit).
+    declaration: ReceiveCapabilityDeclaration,
+    /// The same declaration truncated to this MC's per-kind caps.
+    demand: SlotDemand,
+}
+
+/// Validate a join's media declaration, in the ORDER the runbook relies on.
+///
+/// 1. **Header version.** `supported_header_versions` must contain
+///    `PROTOCOL_VERSION` (v3 is the only version, R-22; no allowlist, no
+///    floor; absent capabilities = an empty list = refused). FIRST, so a
+///    pre-story (v2) SDK — which also sends no `publish_kinds` — is counted
+///    `header_version_unsupported`, the operator's "old SDK meets new MC"
+///    signal (`docs/runbooks/mc-deployment.md` §Story 3 cutover), never
+///    `publish_kind_invalid`. A linear `contains`, no allocation.
+/// 2. **Publish set** — closed {AUDIO, VIDEO_CAMERA}; first invalid or
+///    duplicate fails.
+/// 3. **Receive declaration** — the SAME parser as the post-join path (absent =
+///    zero slots).
+/// 4. **Neither publish nor receive** — judged on the declaration AS SENT,
+///    before truncation: truncation is never a refusal (R-1), so a receive-only
+///    client whose video slots a video cap of 0 truncates is admitted.
+///
+/// Pure: reads only the request and the configured caps.
+///
+/// # Errors
+///
+/// The refusal's [`McError`]; each has one generic client message.
+fn validate_join_media(
+    request: &v1::JoinRequest,
+    media: &ClientMediaConfig,
+) -> Result<ValidatedJoinMedia, McError> {
+    let current = u32::from(media_protocol::frame::PROTOCOL_VERSION);
+    let supports_current = request
+        .capabilities
+        .as_ref()
+        .is_some_and(|c| c.supported_header_versions.contains(&current));
+    if !supports_current {
+        return Err(McError::HeaderVersionUnsupported);
+    }
+
+    let publishes =
+        PublishSet::parse(&request.publish_kinds).map_err(|_| McError::PublishKindInvalid)?;
+
+    let declaration = match &request.receive_capability {
+        None => ReceiveCapabilityDeclaration::empty(),
+        // The join-carried declaration is the connection's first; the budget
+        // is charged only on post-join redeclarations.
+        Some(capability) => ReceiveCapabilityDeclaration::parse(capability, true)
+            .map_err(McError::ReceiveCapabilityInvalid)?,
+    };
+
+    if crate::media_signaling::publishes_and_receives_nothing(publishes, &declaration) {
+        return Err(McError::PublishesAndReceivesNothing);
+    }
+
+    let demand = declaration.clone().truncate(media.max_receive_slots);
+    Ok(ValidatedJoinMedia {
+        publishes,
+        declaration,
+        demand,
+    })
+}
+
 /// Build a protobuf `JoinResponse` from the actor's `JoinResult` and the
 /// client media configuration this connection enforces.
 fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinResponse {
@@ -2197,17 +2342,17 @@ fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinRe
         kek_rotation_debounce_seconds: result.kek_rotation_debounce_seconds,
         correlation_id: result.correlation_id.clone(),
         binding_token: result.binding_token.clone(),
-        // The receive-slot cap, from the SAME `ClientMediaConfig` value
-        // `handle_receive_capability` enforces and `WebTransportServer::new`
-        // publishes as `mc_media_receive_slot_cap` — one value, three readers.
-        // INFORMATIONAL: MC stays the enforcer and rejects an over-cap
-        // declaration whole. Always set, so absence on the wire means an older
-        // MC. `u8` widened by `u32::from`: total, never `as`.
-        max_receive_slots: Some(u32::from(media.max_receive_slots)),
-        // Story 3 per-kind caps: not sent until MC-A introduces them (absent =
-        // unknown, which the proto defines as harmless).
-        max_audio_receive_slots: None,
-        max_video_receive_slots: None,
+        // SUPERSEDED total cap (tag 12): no longer written — its source key
+        // `MC_MAX_RECEIVE_SLOTS` is retired, and the proto defines absence as
+        // "cap unknown" (protocol ruling, MC-A Gate 1). MC-B deletes the field.
+        max_receive_slots: None,
+        // The per-kind caps, from the SAME `ClientMediaConfig` values every
+        // declaration on this connection is truncated to and
+        // `WebTransportServer::new` publishes as `mc_media_receive_slot_cap` —
+        // one value, three readers. INFORMATIONAL: MC truncates, the client
+        // needs no pre-check. `u8` widened by `u32::from`: total, never `as`.
+        max_audio_receive_slots: Some(u32::from(MediaKindLabel::Audio.of(media.max_receive_slots))),
+        max_video_receive_slots: Some(u32::from(MediaKindLabel::Video.of(media.max_receive_slots))),
     }
 }
 
@@ -2422,17 +2567,249 @@ mod tests {
             crate::media_admission::fixtures::kek_lifecycle(),
         )
         .expect("system CSPRNG must be available in tests");
-        let config = ClientMediaConfig {
-            max_receive_slots: 8,
+        let config = test_client_media_config();
+        (
+            MediaSignalingContext::new(
+                meeting,
+                "test-part".to_string(),
+                &config,
+                is_host,
+                PublishSet::of(&[MediaKindLabel::Audio]),
+                None,
+            ),
+            task,
+        )
+    }
+
+    fn test_client_media_config() -> ClientMediaConfig {
+        ClientMediaConfig {
+            max_receive_slots: [8, 4],
             max_receive_capability_declarations: 4,
             audio_encoding: crate::media_signaling::AudioEncoding::new(v1::Codec::Opus, 48_000, 50)
                 .expect("in band"),
+            video_encoding: crate::media_signaling::VideoEncoding::new(
+                v1::Codec::Vp8,
+                640,
+                360,
+                30,
+                800_000,
+                500,
+            )
+            .expect("in band"),
             connect_settle_window: std::time::Duration::from_millis(1500),
-        };
-        (
-            MediaSignalingContext::new(meeting, "test-part".to_string(), &config, is_host),
-            task,
+        }
+    }
+
+    // ---- join media validation (story 3 R-2, R-22) ------------------------
+
+    fn join_request(
+        versions: Option<Vec<u32>>,
+        publish: Vec<v1::MediaKind>,
+        slots: Option<Vec<(u32, v1::MediaKind)>>,
+    ) -> v1::JoinRequest {
+        v1::JoinRequest {
+            capabilities: versions.map(|supported_header_versions| v1::ParticipantCapabilities {
+                supported_codecs: Vec::new(),
+                supported_header_versions,
+            }),
+            publish_kinds: publish.into_iter().map(|k| k as i32).collect(),
+            receive_capability: slots.map(|slots| v1::ReceiveCapability {
+                slots: slots
+                    .into_iter()
+                    .map(|(slot_id, kind)| v1::ReceiveSlot {
+                        slot_id,
+                        media_kind: kind as i32,
+                        pinned_sender_id: None,
+                    })
+                    .collect(),
+            }),
+            ..v1::JoinRequest::default()
+        }
+    }
+
+    fn v3() -> Option<Vec<u32>> {
+        Some(vec![u32::from(media_protocol::frame::PROTOCOL_VERSION)])
+    }
+
+    fn refusal(r: &v1::JoinRequest) -> Option<&'static str> {
+        validate_join_media(r, &test_client_media_config())
+            .err()
+            .map(|e| e.error_type_label())
+    }
+
+    /// The ORDER the runbook relies on: a pre-story SDK (v2 only, no publish
+    /// kinds, nothing declared) counts `header_version_unsupported` — never
+    /// `publish_kind_invalid` or `publishes_and_receives_nothing`.
+    #[test]
+    fn a_v2_only_join_with_no_publish_kinds_counts_header_version_unsupported() {
+        let old_sdk = join_request(Some(vec![2]), Vec::new(), None);
+        assert_eq!(refusal(&old_sdk), Some("header_version_unsupported"));
+        // Even with a bogus publish set the header check wins.
+        let bogus = join_request(Some(vec![2]), vec![v1::MediaKind::VideoScreen], None);
+        assert_eq!(refusal(&bogus), Some("header_version_unsupported"));
+        // Absent capabilities, or an empty list: refused (fail closed).
+        assert_eq!(
+            refusal(&join_request(None, vec![v1::MediaKind::Audio], None)),
+            Some("header_version_unsupported")
+        );
+        assert_eq!(
+            refusal(&join_request(
+                Some(vec![]),
+                vec![v1::MediaKind::Audio],
+                None
+            )),
+            Some("header_version_unsupported")
+        );
+        // Positive twin differing in ONE field: v3 is admitted.
+        assert_eq!(
+            refusal(&join_request(v3(), vec![v1::MediaKind::Audio], None)),
+            None
+        );
+        assert_eq!(
+            refusal(&join_request(
+                Some(vec![2, 3]),
+                vec![v1::MediaKind::Audio],
+                None
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn publish_kinds_are_a_closed_set_and_rejects_come_before_the_declaration() {
+        for bad in [
+            vec![v1::MediaKind::VideoScreen],
+            vec![v1::MediaKind::Unspecified],
+            vec![v1::MediaKind::Audio, v1::MediaKind::Audio],
+        ] {
+            assert_eq!(
+                refusal(&join_request(
+                    v3(),
+                    bad,
+                    Some(vec![(0, v1::MediaKind::Audio)])
+                )),
+                Some("publish_kind_invalid")
+            );
+        }
+        let mut unknown = join_request(v3(), Vec::new(), None);
+        unknown.publish_kinds = vec![99];
+        assert_eq!(refusal(&unknown), Some("publish_kind_invalid"));
+    }
+
+    #[test]
+    fn a_malformed_join_declaration_is_refused_with_its_specific_cause() {
+        let r = join_request(
+            v3(),
+            vec![v1::MediaKind::Audio],
+            Some(vec![(0, v1::MediaKind::VideoScreen)]),
+        );
+        let outcome = validate_join_media(&r, &test_client_media_config());
+        assert!(
+            matches!(
+                outcome,
+                Err(McError::ReceiveCapabilityInvalid(
+                    CapabilityOutcome::MediaKindUnsupported
+                ))
+            ),
+            "expected ReceiveCapabilityInvalid(media_kind_unsupported), got {outcome:?}"
+        );
+        assert_eq!(refusal(&r), Some("receive_capability_invalid"));
+    }
+
+    /// R-2: neither publish nor receive is refused, judged AS SENT — a
+    /// receive-only client whose video slots a cap of 0 would truncate is
+    /// ADMITTED (R-26).
+    #[test]
+    fn neither_publish_nor_receive_is_judged_before_truncation() {
+        assert_eq!(
+            refusal(&join_request(v3(), Vec::new(), None)),
+            Some("publishes_and_receives_nothing")
+        );
+        assert_eq!(
+            refusal(&join_request(v3(), Vec::new(), Some(vec![]))),
+            Some("publishes_and_receives_nothing")
+        );
+        // Positive twin: the same join plus one receive slot is admitted.
+        assert_eq!(
+            refusal(&join_request(
+                v3(),
+                Vec::new(),
+                Some(vec![(0, v1::MediaKind::Audio)])
+            )),
+            None
+        );
+        let mut cap_zero = test_client_media_config();
+        cap_zero.max_receive_slots = [8, 0];
+        let video_only = join_request(
+            v3(),
+            Vec::new(),
+            Some(vec![(5, v1::MediaKind::VideoCamera)]),
+        );
+        let validated = validate_join_media(&video_only, &cap_zero).expect("admitted");
+        assert!(validated
+            .demand
+            .kept_slot_ids(MediaKindLabel::Video)
+            .is_empty());
+        assert!(validated.publishes.is_empty());
+    }
+
+    /// Over-cap is a truncation at join, never a refusal (R-1).
+    #[test]
+    fn an_over_cap_join_declaration_is_truncated_not_refused() {
+        let slots: Vec<(u32, v1::MediaKind)> =
+            (0..10).map(|i| (i, v1::MediaKind::VideoCamera)).collect();
+        let validated = validate_join_media(
+            &join_request(v3(), vec![v1::MediaKind::Audio], Some(slots)),
+            &test_client_media_config(),
         )
+        .expect("admitted");
+        assert_eq!(
+            validated.demand.kept_slot_ids(MediaKindLabel::Video),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    /// Protocol ruling: tag 12 is no longer written; both per-kind caps are,
+    /// from the same config values the gauge reads.
+    #[tokio::test]
+    async fn the_join_response_carries_both_per_kind_caps_and_no_total() {
+        let config = ClientMediaConfig {
+            max_receive_slots: [8, 0],
+            ..test_client_media_config()
+        };
+        let (handle, _task) = test_participant_handle();
+        let result = JoinResult {
+            participant_id: "p".to_string(),
+            correlation_id: String::new(),
+            binding_token: String::new(),
+            participants: Vec::new(),
+            fencing_generation: 0,
+            sender_id: crate::media_admission::SenderId::from_nonzero(
+                std::num::NonZeroU16::new(1).unwrap(),
+            ),
+            meeting_kek: std::sync::Arc::new(
+                crate::media_admission::MeetingKek::generate(&ring::rand::SystemRandom::new())
+                    .unwrap(),
+            ),
+            kek_generation: 0,
+            kek_rotation_debounce_seconds: 60,
+            participant_handle: handle,
+            server_mute_replay: Vec::new(),
+            media_handlers: MeetingHandlers::new([HandlerEndpoint {
+                id: HandlerId::new("mh-0"),
+                webtransport_url: "https://mh-0.test:4434".to_string(),
+                grpc_endpoint: "http://mh-0.test:50053".to_string(),
+            }])
+            .unwrap(),
+        };
+        let response = build_join_response(&result, &config);
+        assert_eq!(response.max_receive_slots, None);
+        assert_eq!(response.max_audio_receive_slots, Some(8));
+        assert_eq!(
+            response.max_video_receive_slots,
+            Some(0),
+            "a present 0: video off"
+        );
     }
 
     #[tokio::test]

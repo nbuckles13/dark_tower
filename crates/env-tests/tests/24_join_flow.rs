@@ -692,10 +692,23 @@ async fn test_second_participant_receives_join_notification() {
         response2.message
     );
 
-    // Step 6: User 1 should receive ParticipantJoined notification via bridge
-    let notification = session1.try_read(MC_REPLY_BOUND).await.expect(
-        "Timeout: User 1 did not receive ParticipantJoined notification after User 2 joined",
-    );
+    // Step 6: User 1 should receive ParticipantJoined notification via bridge.
+    //
+    // Story 3: every join carries its declaration, so each joiner is sent its
+    // own SendDirective and StreamAssignments in its JOIN TURN — after its
+    // JoinResponse (and any server-mute replay), and before any later roster
+    // broadcast. That is the contract; skip that media traffic here (user 1's
+    // join-turn view, and any re-emit caused by user 2's join).
+    let notification = loop {
+        let m = session1.try_read(MC_REPLY_BOUND).await.expect(
+            "Timeout: User 1 did not receive ParticipantJoined notification after User 2 joined",
+        );
+        match &m.message {
+            Some(server_message::Message::SendDirective(_))
+            | Some(server_message::Message::StreamAssignments(_)) => continue,
+            _ => break m,
+        }
+    };
 
     match &notification.message {
         Some(server_message::Message::ParticipantJoined(joined)) => {

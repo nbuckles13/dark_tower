@@ -101,7 +101,14 @@ pub fn meeting_assignment_for(
                 .allocate()
                 .expect("fixture sender-id allocation")
                 .sender_id;
-            table.admit(sender).expect("fixture admission");
+            table
+                .admit(
+                    sender,
+                    mc_service::media_kind::PublishSet::of(&[
+                        mc_service::media_kind::MediaKindLabel::Audio,
+                    ]),
+                )
+                .expect("fixture admission");
             sender
         })
         .collect();
@@ -109,14 +116,22 @@ pub fn meeting_assignment_for(
         .map(|i| u16::try_from(i).expect("fixture slot id"))
         .collect();
     for sender in &senders {
-        table.set_demand(*sender, slots.clone());
+        table.set_demand(*sender, [slots.clone(), Vec::new()]);
     }
-    for sender in senders {
-        table.set_connectivity(sender, Some(connected.clone()));
+    for sender in &senders {
+        table.set_connectivity(*sender, Some(connected.clone()));
     }
 
+    // Nobody muted: every declared stream FORWARD.
+    let mute: std::collections::HashMap<_, _> = senders
+        .iter()
+        .map(|s| (*s, mc_service::media_routing::SourceMute::default()))
+        .collect();
     table
-        .render([&handler], &std::collections::BTreeSet::new())
+        .render(
+            [&handler],
+            &mc_service::media_routing::SourceMuteView::from_map(mute),
+        )
         .expect("fixture assignment must render")
         .for_handler(&handler)
         .cloned()

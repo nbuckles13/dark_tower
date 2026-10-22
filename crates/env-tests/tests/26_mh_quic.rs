@@ -75,6 +75,14 @@
 //! 4-byte big-endian length prefix + encoded bytes. Mirrors MC's
 //! `ClientMessage{JoinRequest{...}}` discipline. Source of truth:
 //! `crates/mh-service/src/webtransport/connection.rs` Step 3 region.
+//!
+//! # Edge sum (README per-file edge-sum header rule)
+//!
+//! Only the `#[serial(mh_notifications)]` fns declare slots, and that group
+//! runs one at a time, so the concurrent sum is its largest member: S5
+//! 2 + 1 + 1 = 4 (S4 1 + 1 = 2; CHURN 1 + 2 + 1 = 4). Audio only.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 4
 
 #![cfg(feature = "flows")]
 
@@ -1150,6 +1158,7 @@ const MARK_A: u8 = 0xA4;
 const MARK_B: u8 = 0xB4;
 const MARK_C: u8 = 0xC4;
 
+use env_tests::fixtures::participant::AUDIO;
 /// Margin over MC's settle window (one shared home).
 use env_tests::fixtures::participant::VIEW_MARGIN;
 
@@ -1297,22 +1306,22 @@ async fn server_mute_s4(reading: Reading) {
     let (a_slot, b_slot) = (7_u32, 513_u32);
 
     let sessions = open_sessions("S4", &ps, &[&x, &y]).await;
-    ps[0].declare(&[a_slot]).await;
-    ps[1].declare(&[b_slot]).await;
+    ps[0].declare(&[a_slot], &[]).await;
+    ps[1].declare(&[b_slot], &[]).await;
     let bound = window + VIEW_MARGIN;
     ps[0]
         .converge("S4", bound, |v, d| {
-            v.is_some_and(|v| participant::filled_senders(v) == vec![b]) && d.is_some()
+            v.is_some_and(|v| participant::filled_senders(v, AUDIO) == vec![b]) && d.is_some()
         })
         .await;
     ps[1]
         .converge("S4", bound, |v, d| {
-            v.is_some_and(|v| participant::filled_senders(v) == vec![a]) && d.is_some()
+            v.is_some_and(|v| participant::filled_senders(v, AUDIO) == vec![a]) && d.is_some()
         })
         .await;
 
     // PRE-INJECTION positive control: MC's own policy forwards A -> B.
-    let b_edge_url = ps[1].slot_url(a);
+    let b_edge_url = ps[1].slot_url(a, AUDIO);
     let pre = bind_until_received(
         "S4 PRE",
         sessions[1][&b_edge_url].connection(),
@@ -1505,10 +1514,15 @@ async fn server_mute_s4(reading: Reading) {
 /// ONE handler, so both of R's edges live on one transport and a mix-up would
 /// be observable on it.
 ///
-/// TRANSITIONAL READING ONLY until MC-A: driven by MC's real policy, which
-/// carries no `source_streams` before MC-A, so there is no explicit variant
-/// here (MC-A's registrations always declare them; this spec then exercises
-/// the declared reading with no edit).
+/// Driven by MC's REAL policy (no injection). What this proves is the
+/// receiver-side property only: no frame is ever relayed onto the other
+/// sender's slot. It does NOT prove which registration reading MH applied —
+/// every participant here publishes audio alone, and stream 0 DATAGRAM is
+/// declared identically on both readings, so nothing observable here differs.
+/// The per-entity proof that MC's registrations carry `source_streams` (story
+/// 3 MC-A) is `27_mc_slot_placement.rs`'s MC-driven VIDEO delivery: stream 1
+/// exists only in a declared registration, so a video frame landing on a
+/// receiver's video slot is impossible on the transitional reading.
 #[tokio::test]
 #[serial_test::serial(mh_notifications)]
 async fn test_two_concurrent_senders_into_one_receiver_are_never_misattributed() {
@@ -1522,14 +1536,14 @@ async fn test_two_concurrent_senders_into_one_receiver_are_never_misattributed()
 
     let sessions = open_sessions("S5", &ps, &[&x]).await;
     // Non-ordinal declared ids, one > 255 (u8-truncation would collide).
-    ps[0].declare(&[513, 7]).await;
-    ps[1].declare(&[300]).await;
-    ps[2].declare(&[260]).await;
+    ps[0].declare(&[513, 7], &[]).await;
+    ps[1].declare(&[300], &[]).await;
+    ps[2].declare(&[260], &[]).await;
     let bound = window + VIEW_MARGIN;
     ps[0]
         .converge("S5", bound, |v, _| {
             v.is_some_and(|v| {
-                let mut f = participant::filled_senders(v);
+                let mut f = participant::filled_senders(v, AUDIO);
                 f.sort_unstable();
                 let mut want = vec![a, c];
                 want.sort_unstable();
@@ -1537,10 +1551,10 @@ async fn test_two_concurrent_senders_into_one_receiver_are_never_misattributed()
             })
         })
         .await;
-    let (slot_a, slot_c) = (ps[0].slot_for(a), ps[0].slot_for(c));
+    let (slot_a, slot_c) = (ps[0].slot_for(a, AUDIO), ps[0].slot_for(c, AUDIO));
     assert_ne!(slot_a, slot_c, "S5 PRECONDITION: distinct slots");
-    assert_eq!(ps[0].slot_url(a), x);
-    assert_eq!(ps[0].slot_url(c), x);
+    assert_eq!(ps[0].slot_url(a, AUDIO), x);
+    assert_eq!(ps[0].slot_url(c, AUDIO), x);
 
     let expected = |marker: u8| if marker == MARK_A { slot_a } else { slot_c };
     let first = bind_until_received_each(
@@ -1605,13 +1619,13 @@ async fn edge_churn(reading: Reading) {
     let (b_slot_0, b_slot_1) = (513_u32, 3_u32);
 
     let sessions = open_sessions("CHURN", &ps, &[&x]).await;
-    ps[0].declare(&[7]).await;
-    ps[1].declare(&[b_slot_0, b_slot_1]).await;
-    ps[2].declare(&[260]).await;
+    ps[0].declare(&[7], &[]).await;
+    ps[1].declare(&[b_slot_0, b_slot_1], &[]).await;
+    ps[2].declare(&[260], &[]).await;
     let bound = window + VIEW_MARGIN;
     ps[1]
         .converge("CHURN", bound, |v, _| {
-            v.is_some_and(|v| participant::filled_senders(v).len() == 2)
+            v.is_some_and(|v| participant::filled_senders(v, AUDIO).len() == 2)
         })
         .await;
 

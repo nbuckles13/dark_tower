@@ -117,6 +117,13 @@
 //! What stays SYNCHRONOUS, read off the gRPC response and never re-expressed as
 //! a lagged metric: the reject's status code, the acknowledgements, and every
 //! `applied_generation` (STALE-PROBE / RELEASE-NOT-PROVEN / FRESH-INSTALL).
+//!
+//! # Edge sum (README per-file edge-sum header rule)
+//!
+//! No participant declares a receive slot and every registration carries an
+//! empty `egress_streams` (see above): no edge is ever installed.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "flows")]
 

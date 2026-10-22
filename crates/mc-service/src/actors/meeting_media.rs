@@ -88,13 +88,15 @@ use super::participant::ParticipantActorHandle;
 use crate::errors::McError;
 use crate::grpc::MhRegistrationClient;
 use crate::media_admission::SenderId;
+use crate::media_kind::PublishSet;
 use crate::media_routing::{
     ConnectionKey, HandlerId, HandlerPusher, MeetingAssignment, MeetingHandlers,
-    ParticipantConnectivity, PolicyGenerations, PushJob, PushTarget, SlotTable, Unapplied,
+    ParticipantConnectivity, PolicyGenerations, PushJob, PushTarget, SlotTable, SourceMute,
+    Unapplied,
 };
 use crate::media_signaling::{
     build_send_directive, build_stream_assignments, DirectiveOutcome, MediaKindLabel,
-    MediaStreamPolicy, ReceiveCapabilityDeclaration, SlotViewEmission, SourceMuteView,
+    MediaStreamPolicy, SlotDemand, SlotViewEmission, SourceMuteView, WithdrawalReason,
 };
 use crate::observability::metrics;
 use proto_gen::dark_tower::signaling::v1::{
@@ -226,15 +228,21 @@ impl MutedSourceCensus {
     }
 }
 
-/// What a join carries for media routing: the server-level dependencies and
-/// the meeting's handler set as the registration (Redis) describes it at this
-/// join. The actor freezes the set at the first join.
+/// What a join carries for media: the server-level dependencies, the
+/// meeting's handler set as the registration (Redis) describes it at this
+/// join, and the joiner's validated media declaration. The actor freezes the
+/// handler set at the first join.
 #[derive(Debug, Clone)]
 pub struct JoinMedia {
     /// Server-level dependencies.
     pub deps: Arc<MediaRoutingDeps>,
     /// The meeting's handler set, as read for this join.
     pub handlers: MeetingHandlers,
+    /// What the joiner publishes, fixed for its membership (story 3 R-2).
+    pub publishes: PublishSet,
+    /// The joiner's initial receive declaration, validated and truncated at
+    /// the connection (`JoinRequest.receive_capability`; absent = zero slots).
+    pub demand: SlotDemand,
 }
 
 /// Test-only construction overrides for a meeting actor. **Test builds only.**
@@ -269,7 +277,7 @@ pub struct MeetingSeams {
 pub(crate) fn test_join_media() -> JoinMedia {
     use crate::grpc::{MeetingProgramming, MhRegistrationClient};
     use crate::media_routing::{HandlerEndpoint, MeetingHandlers, PolicyGenerations};
-    use crate::media_signaling::{AudioEncoding, MediaStreamPolicy};
+    use crate::media_signaling::{AudioEncoding, MediaStreamPolicy, VideoEncoding};
     use proto_gen::dark_tower::signaling::v1::Codec;
 
     struct ConfirmingMh;
@@ -305,6 +313,7 @@ pub(crate) fn test_join_media() -> JoinMedia {
             mc_grpc_endpoint: "http://mc-test:50052".to_string(),
             stream_policy: MediaStreamPolicy::new(
                 AudioEncoding::new(Codec::Opus, 48_000, 50).unwrap(),
+                VideoEncoding::new(Codec::Vp8, 640, 360, 30, 800_000, 500).unwrap(),
             ),
             connect_settle_window: std::time::Duration::from_millis(1500),
         }),
@@ -314,6 +323,8 @@ pub(crate) fn test_join_media() -> JoinMedia {
             grpc_endpoint: "http://mh-0.test:50053".to_string(),
         }])
         .unwrap(),
+        publishes: PublishSet::of(&[MediaKindLabel::Audio]),
+        demand: crate::media_signaling::ReceiveCapabilityDeclaration::empty().truncate([8, 4]),
     }
 }
 
@@ -321,7 +332,8 @@ pub(crate) fn test_join_media() -> JoinMedia {
 pub(super) enum Affected {
     /// Every declared participant (join, leave, declaration, reconnect).
     All,
-    /// The subscribers holding this source (its mute changed).
+    /// The subscribers holding this source in a slot of EITHER kind (its mute
+    /// changed, of either kind and either cause).
     HoldersOf(SenderId),
 }
 
@@ -331,15 +343,19 @@ pub(super) struct RosterEntry<'a> {
     pub sender: SenderId,
     /// Its live connection, if connected.
     pub connection: Option<&'a ParticipantActorHandle>,
-    /// Audio-muted for ANY reason (self or server): one wire state covers both.
-    pub audio_muted: bool,
+    /// Its fixed publish set (the directive lists exactly these kinds).
+    pub publishes: PublishSet,
+    /// Its per-kind mute flags, client and server kept apart.
+    pub mute: SourceMute,
 }
 
 /// One participant's declaration, observed connectivity and last-emitted view.
 struct View {
     sender: SenderId,
     connectivity: ParticipantConnectivity,
-    declaration: Option<ReceiveCapabilityDeclaration>,
+    /// The truncated declaration in force. Set at join (a join always carries
+    /// one; absent on the wire = zero slots).
+    declaration: Option<SlotDemand>,
     last_directive: Option<SendDirective>,
     last_assignments: Option<StreamAssignments>,
 }
@@ -429,14 +445,19 @@ impl MeetingMedia {
     ///
     /// [`McError::MhAssignmentMissing`] if no handler set is installed;
     /// [`McError::Internal`] if the slot table refuses the admission.
-    pub(super) fn admit(&mut self, participant_id: &str, sender: SenderId) -> Result<(), McError> {
+    pub(super) fn admit(
+        &mut self,
+        participant_id: &str,
+        sender: SenderId,
+        publishes: PublishSet,
+    ) -> Result<(), McError> {
         if self.handlers.is_none() {
             return Err(McError::MhAssignmentMissing(
                 "no handler set installed for this meeting".to_string(),
             ));
         }
         self.slots
-            .admit(sender)
+            .admit(sender, publishes)
             .map_err(|e| McError::Internal(format!("slot admission failed: {e}")))?;
         self.views.insert(
             participant_id.to_string(),
@@ -616,7 +637,8 @@ impl MeetingMedia {
         self.dirty.remove(participant_id);
     }
 
-    /// Register a validated receive-capability declaration.
+    /// Register a validated, TRUNCATED declaration: both kinds' kept slot ids
+    /// land in the slot table before one refill.
     ///
     /// # Errors
     ///
@@ -624,17 +646,29 @@ impl MeetingMedia {
     pub(super) fn declare(
         &mut self,
         participant_id: &str,
-        declaration: ReceiveCapabilityDeclaration,
+        demand: SlotDemand,
     ) -> Result<(), McError> {
         let Some(view) = self.views.get_mut(participant_id) else {
             return Err(McError::ParticipantNotFound(
                 "Participant not found".to_string(),
             ));
         };
-        self.slots
-            .set_demand(view.sender, declaration.audio_slot_ids());
-        view.declaration = Some(declaration);
+        self.slots.set_demand(
+            view.sender,
+            [
+                demand.kept_slot_ids(MediaKindLabel::Audio),
+                demand.kept_slot_ids(MediaKindLabel::Video),
+            ],
+        );
+        view.declaration = Some(demand);
         Ok(())
+    }
+
+    /// The truncated declaration in force for a participant, if any.
+    pub(super) fn declaration_of(&self, participant_id: &str) -> Option<&SlotDemand> {
+        self.views
+            .get(participant_id)
+            .and_then(|v| v.declaration.as_ref())
     }
 
     /// A reconnect: the new connection has received nothing, so forget what
@@ -684,18 +718,13 @@ impl MeetingMedia {
 
     /// Re-render, re-publish to every handler, and mark `affected` dirty.
     ///
-    /// `server_muted` is REQUIRED, never defaulted: the meeting's roster is the
-    /// one home for mute state, so every reconcile must be handed the current
-    /// server-muted set. A call site that could omit it would push an EMPTY set,
-    /// which MH reads as "nobody is server-muted" — an unmute nobody asked for,
-    /// failing open. Making it a parameter lets the compiler enumerate every
-    /// call site instead of a convention doing it.
-    pub(super) async fn reconcile(
-        &mut self,
-        affected: Affected,
-        server_muted: &BTreeSet<SenderId>,
-    ) {
-        self.render_and_publish(server_muted).await;
+    /// `mute` is REQUIRED, never defaulted: the meeting's roster is the one
+    /// home for mute state, so every reconcile must be handed the current
+    /// per-kind projection. A call site that could omit it would declare every
+    /// stream FORWARD — an unmute nobody asked for, failing open. Making it a
+    /// parameter lets the compiler enumerate every call site.
+    pub(super) async fn reconcile(&mut self, affected: Affected, mute: &SourceMuteView) {
+        self.render_and_publish(mute).await;
         match affected {
             Affected::All => {
                 for (participant_id, view) in &self.views {
@@ -717,15 +746,15 @@ impl MeetingMedia {
 
     /// Render the slot table and publish each handler's snapshot.
     ///
-    /// Each snapshot carries that handler's `server_muted_sources`, filtered by
-    /// EDGE OWNERSHIP inside [`SlotTable::render`] — see
-    /// `HandlerAssignment::server_muted_sources` for the rule and the bound it
-    /// guarantees.
-    async fn render_and_publish(&mut self, server_muted: &BTreeSet<SenderId>) {
+    /// Each snapshot carries the meeting's per-stream `source_streams` (with
+    /// dispositions from `mute`) and the legacy `server_muted_sources` —
+    /// see [`SlotTable::render`]. Synchronous in the actor; the push itself is
+    /// the handler's push worker's.
+    async fn render_and_publish(&mut self, mute: &SourceMuteView) {
         let (Some(deps), Some(handlers)) = (&self.deps, &self.handlers) else {
             return;
         };
-        let assignment = match self.slots.render(handlers.ids(), server_muted) {
+        let assignment = match self.slots.render(handlers.ids(), mute) {
             Ok(assignment) => assignment,
             Err(e) => {
                 // Fail loud: no push is better than pushing a policy MH will
@@ -886,7 +915,7 @@ impl MeetingMedia {
 
     /// Flush up to the per-turn bound of dirty participants; defer the rest.
     pub(super) async fn flush(&mut self, roster: &HashMap<String, RosterEntry<'_>>) {
-        let mute = SourceMuteView::from_pairs(roster.values().map(|e| (e.sender, e.audio_muted)));
+        let mute = SourceMuteView::from_map(roster.values().map(|e| (e.sender, e.mute)).collect());
         let mut taken = 0usize;
         while taken < self.flush_batch {
             let Some(participant_id) = self.dirty.pop_first() else {
@@ -951,20 +980,24 @@ impl MeetingMedia {
 
         let composed = match &self.assignment {
             None => Err(DirectiveOutcome::AssignmentFailed),
-            Some(assignment) => {
-                build_send_directive(view.sender, assignment, handlers, &deps.stream_policy)
-                    .and_then(|(directive, outcome, stream_kinds)| {
-                        build_stream_assignments(
-                            view.sender,
-                            declaration,
-                            assignment,
-                            handlers,
-                            mute,
-                            &self.slots.unreachable_for(view.sender),
-                        )
-                        .map(|composition| (directive, outcome, stream_kinds, composition))
-                    })
-            }
+            Some(assignment) => build_send_directive(
+                view.sender,
+                entry.publishes,
+                assignment,
+                handlers,
+                &deps.stream_policy,
+            )
+            .and_then(|(directive, outcome, stream_kinds)| {
+                build_stream_assignments(
+                    view.sender,
+                    declaration,
+                    &self.slots,
+                    handlers,
+                    mute,
+                    &self.slots.unreachable_for(view.sender),
+                )
+                .map(|composition| (directive, outcome, stream_kinds, composition))
+            }),
         };
 
         let (directive, directive_outcome, stream_kinds, composition) = match composed {
@@ -985,11 +1018,44 @@ impl MeetingMedia {
             }
         };
 
+        // A view the signalling frame cannot carry is refused HERE, loudly and
+        // counted, rather than written as a frame the client's reader must
+        // reject (the client enforces the same 64 KiB bound). Reachable only
+        // through a client's own near-frame-sized declaration of slots MC
+        // truncates (`capability::SlotDemand`): it affects that client alone.
+        // Measured on the EXACT `ServerMessage` that would be written (oneof
+        // tag, length varint and trace context included), and that same value
+        // is the one sent below: no envelope margin to drift.
+        let assignments_message = envelope(server_message::Message::StreamAssignments(
+            composition.assignments.clone(),
+        ));
+        if !fits_signalling_frame(&assignments_message) {
+            metrics::record_slot_view_emission(SlotViewEmission::CompositionFailed);
+            error!(
+                target: "mc.actor.meeting",
+                meeting_id = %self.meeting_id,
+                participant_id = %participant_id,
+                reason = "view_exceeds_message_limit",
+                declared_slots = composition.assignments.assignments.len(),
+                "Slot view exceeds the signalling frame limit; this participant's view was not \
+                 sent. Only a client declaring a near-frame-sized slot list reaches this."
+            );
+            return;
+        }
+
         let directive_changed = view.last_directive.as_ref() != Some(&directive);
         let assignments_changed = view.last_assignments.as_ref() != Some(&composition.assignments);
         if !directive_changed && !assignments_changed {
             return;
         }
+        // Streams that go from non-empty to EMPTY targets in this change,
+        // counted only once the directive is DELIVERED (below).
+        let withdrawn: Vec<MediaKindLabel> = match &view.last_directive {
+            Some(previous) if directive_changed => {
+                withdrawn_kinds(previous, &directive, &stream_kinds)
+            }
+            _ => Vec::new(),
+        };
 
         let mut delivered = true;
         if directive_changed {
@@ -1007,16 +1073,17 @@ impl MeetingMedia {
                 server_message::Message::SendDirective(directive.clone()),
             )
             .await;
+            if delivered {
+                for kind in &withdrawn {
+                    metrics::record_send_directive_withdrawal(*kind, WithdrawalReason::Unwatched);
+                }
+            }
         }
         if assignments_changed && delivered {
             for (kind, state) in &composition.slot_states {
                 metrics::record_slot_state(*kind, *state);
             }
-            delivered &= send(
-                connection,
-                server_message::Message::StreamAssignments(composition.assignments.clone()),
-            )
-            .await;
+            delivered &= send_message(connection, &assignments_message).await;
         }
 
         if !delivered {
@@ -1050,20 +1117,109 @@ impl MeetingMedia {
     }
 }
 
+/// The kinds whose stream had targets in `previous` and has NONE in `next`
+/// (a withdrawal: empty targets, never removal). `next_kinds` is parallel to
+/// `next.streams`.
+fn withdrawn_kinds(
+    previous: &SendDirective,
+    next: &SendDirective,
+    next_kinds: &[MediaKindLabel],
+) -> Vec<MediaKindLabel> {
+    next.streams
+        .iter()
+        .zip(next_kinds)
+        .filter(|(stream, _)| stream.targets.is_empty())
+        .filter(|(stream, _)| {
+            previous
+                .streams
+                .iter()
+                .any(|p| p.stream_number == stream.stream_number && !p.targets.is_empty())
+        })
+        .map(|(_, kind)| *kind)
+        .collect()
+}
+
 /// Hand one `ServerMessage` to the participant actor. `false` means the
 /// participant actor is gone (mailbox closed).
 async fn send(connection: &ParticipantActorHandle, message: server_message::Message) -> bool {
-    // R-57: carry the current server-side trace context (bounded W3C ids only).
+    send_message(connection, &envelope(message)).await
+}
+
+/// Wrap a message in the `ServerMessage` envelope as it goes on the wire.
+/// R-57: carries the current server-side trace context (bounded W3C ids only).
+fn envelope(message: server_message::Message) -> ServerMessage {
     let (trace_parent, trace_state) = crate::webtransport::trace::inject_current_context();
-    let message = ServerMessage {
+    ServerMessage {
         message: Some(message),
         trace_parent,
         trace_state,
-    };
+    }
+}
+
+/// Does this `ServerMessage` fit the 64 KiB signalling frame the client's
+/// reader enforces (`webtransport::connection::MAX_MESSAGE_SIZE`)? Measured
+/// on the whole envelope, never on the payload alone.
+fn fits_signalling_frame(message: &ServerMessage) -> bool {
+    prost::Message::encoded_len(message) <= crate::webtransport::connection::MAX_MESSAGE_SIZE
+}
+
+/// Hand an already-built `ServerMessage` to the participant actor.
+async fn send_message(connection: &ParticipantActorHandle, message: &ServerMessage) -> bool {
     connection
-        .send(SignalingPayload::server_message(&message))
+        .send(SignalingPayload::server_message(message))
         .await
         .is_ok()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod frame_bound_tests {
+    use super::*;
+    use proto_gen::dark_tower::signaling::v1::{StreamAssignment, StreamAssignments};
+
+    fn assignments(n: usize) -> StreamAssignments {
+        StreamAssignments {
+            assignments: (0..n)
+                .map(|i| StreamAssignment {
+                    slot_id: u32::try_from(i).unwrap(),
+                    sender_id: None,
+                    media_kind: 2,
+                    media_handler_url: String::new(),
+                    slot_state: 9,
+                    switch_command_id: None,
+                })
+                .collect(),
+            unreachable_sender_ids: Vec::new(),
+        }
+    }
+
+    /// The boundary: a payload that fits the frame ON ITS OWN but not inside
+    /// the `ServerMessage` envelope is refused — the bound is the envelope.
+    #[test]
+    fn the_frame_bound_is_measured_on_the_envelope_not_the_payload() {
+        let limit = crate::webtransport::connection::MAX_MESSAGE_SIZE;
+        let mut n = 0;
+        while prost::Message::encoded_len(&assignments(n + 1)) <= limit {
+            n += 1;
+        }
+        let payload = assignments(n);
+        assert!(
+            prost::Message::encoded_len(&payload) <= limit,
+            "the payload alone fits"
+        );
+        let wrapped = ServerMessage {
+            message: Some(server_message::Message::StreamAssignments(payload)),
+            trace_parent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01".to_string(),
+            trace_state: String::new(),
+        };
+        assert!(!fits_signalling_frame(&wrapped), "the envelope does not");
+        let small = ServerMessage {
+            message: Some(server_message::Message::StreamAssignments(assignments(4))),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        };
+        assert!(fits_signalling_frame(&small));
+    }
 }
 
 #[cfg(test)]

@@ -1,89 +1,60 @@
-//! What MC tells a subscriber about its **slots** (ADR-0036 §6).
+//! What MC tells a subscriber about its **slots** (ADR-0036 §6; story 3 R-1,
+//! R-3, R-4, R-5).
 //!
-//! # A join of the slot table's render and the subscriber's declaration
+//! # Composed from the slot table and the truncated declaration
 //!
-//! MC composes a subscriber's view from two inputs:
+//! MC composes a subscriber's view from three inputs:
 //!
-//! 1. the **forwarding assignment** rendered from the meeting's join-order slot
-//!    state — the same value the MC→MH control plane is programmed from — which
-//!    fixes who fills each declared audio slot and what `stream_id` MH stamps;
-//!    and
-//! 2. the subscriber's **capability declaration**, which fixes which slots it
-//!    will accept.
+//! 1. the meeting's **slot table** — who occupies each kept slot of each kind,
+//!    and which handler carries the pair (the same state the MC→MH snapshot is
+//!    rendered from);
+//! 2. the subscriber's **truncated declaration** ([`SlotDemand`]), which fixes
+//!    the declared slots in declaration order and which of them truncation
+//!    made `UNAVAILABLE`; and
+//! 3. a **per-kind mute projection** ([`SourceMuteView`]) of the roster.
 //!
-//! Since story 2 the declaration is the assignment's INPUT (declared audio slots
-//! size the subscriber's slot vector), so every declared audio slot is either
-//! filled — `ACTIVE`, or `SOURCE_MUTED` — or unfilled — `FEWER_SOURCES_THAN_SLOTS`.
-//! §6's rule is that *"absence of frames is not a signal"*, so every partial
-//! case is an explicit slot state.
+//! Every declared slot yields exactly one assignment carrying an explicit
+//! state (§6: *"absence of frames is not a signal"*).
+//!
+//! # The flat slot-state vocabulary (story 3 wire freeze)
+//!
+//! | Slot | State | `sender_id` | Url |
+//! |---|---|---|---|
+//! | video, occupant publishes video, not muted | `ACTIVE` | **absent** — MC never names a live video source (R-5) | the edge's handler |
+//! | video, occupant publishes NO video (any mute) | `AVATAR_NO_VIDEO` | named | empty (no edge) |
+//! | client-muted occupant (audio, or video publisher) | `AVATAR_CLIENT_MUTED` | named | the edge's handler |
+//! | server-muted occupant (wins over client-muted) | `AVATAR_SERVER_MUTED` | named | the edge's handler |
+//! | audio, occupant not muted | `ACTIVE` | named | the edge's handler |
+//! | kept, unfilled | `FEWER_SOURCES_THAN_SLOTS` | absent | empty |
+//! | truncated by the per-kind cap | `UNAVAILABLE` | absent | empty |
+//!
+//! NO-VIDEO PRECEDENCE (lead ruling 2026-10-21): a video slot whose occupant
+//! publishes no video is `AVATAR_NO_VIDEO` whatever its mutes. A mute avatar
+//! KEEPS its edge's url (Lead ruling 3, MC-A Gate 1): the edge still exists, so
+//! the client keeps that handler's receive transport and a resume needs no
+//! reconnect (R-5's decode-before-live). Audio never uses `AVATAR_NO_VIDEO`
+//! (an audio slot holds only audio publishers). **Nothing emits
+//! `SOURCE_MUTED`** any more (MC-B deletes the value).
 //!
 //! # What this never emits
 //!
-//! `SLOT_STATE_ZERO_REQUESTED` (reserved in the proto 2026-10-13 as
-//! unemittable: no declared slot id to echo) and
-//! `SLOT_STATE_SOURCE_UNREACHABLE` (reserved for a pinned source with which the
-//! subscriber shares no connected handler, which static fill cannot produce). A
-//! participant the subscriber shares NO connected handler with consumes no slot
-//! and is named in `unreachable_sender_ids` instead — one bit per roster entry,
-//! relative to this subscriber, carrying no topology. A participant not yet
-//! connected is in neither.
-//!
-//! # Each slot names ITS edge's handler
-//!
-//! `StreamAssignment.media_handler_url` is the handler owning that edge, so one
-//! subscriber may read different slots on different handlers (ADR-0036 §9); the
-//! client reads each slot on the transport its url names.
+//! `SLOT_STATE_ZERO_REQUESTED` (reserved) and `SLOT_STATE_SOURCE_UNREACHABLE`
+//! (a participant the subscriber shares NO connected handler with consumes no
+//! slot and is named in `unreachable_sender_ids` instead; one not yet connected
+//! is in neither).
 //!
 //! # Mute lives here and only here
 //!
 //! A source's mute changes what a **subscriber is told about it**, never what a
-//! **publisher is told to produce**. [`super::directive`] therefore has no
-//! access to mute state at all; this module is the only one that reads it.
+//! **publisher is told to produce**. [`super::directive`] has no access to mute
+//! state at all.
 
-use super::capability::{ReceiveCapabilityDeclaration, SlotId};
+use super::capability::SlotDemand;
 use super::outcome::{DirectiveOutcome, MediaKindLabel};
 use crate::media_admission::SenderId;
-use crate::media_routing::{HandlerId, MeetingAssignment, MeetingHandlers};
-use proto_gen::dark_tower::signaling::v1::{
-    MediaKind, SlotState, StreamAssignment, StreamAssignments,
-};
-use std::collections::HashMap;
-
-/// Which sources are currently audio-muted, for any reason.
-///
-/// A **read-only projection** of the meeting actor's roster, built per
-/// composition and not retained. The actor builds it from
-/// `audio_self_muted || audio_server_muted`: the wire's single
-/// `SLOT_STATE_SOURCE_MUTED` covers both causes (who muted whom rides on
-/// `ParticipantMuteUpdate`), so a subscriber's view must change when either
-/// flag does. The actor is the one home of both flags; this is a view, never a
-/// second copy.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SourceMuteView {
-    audio_muted: HashMap<SenderId, bool>,
-}
-
-impl SourceMuteView {
-    /// Build from `(sender id, audio muted for any reason)` pairs off a roster
-    /// snapshot.
-    #[must_use]
-    pub fn from_pairs(pairs: impl IntoIterator<Item = (SenderId, bool)>) -> Self {
-        Self {
-            audio_muted: pairs.into_iter().collect(),
-        }
-    }
-
-    /// Is this source audio-muted?
-    ///
-    /// An unknown source is reported **not muted**: the roster is the authority
-    /// on mute, and a source missing from the snapshot is a staleness question,
-    /// not a mute one. Answering "muted" would render a placeholder for a
-    /// participant who is in fact speaking.
-    #[must_use]
-    pub fn is_audio_muted(&self, sender: SenderId) -> bool {
-        self.audio_muted.get(&sender).copied().unwrap_or(false)
-    }
-}
+pub use crate::media_routing::SourceMuteView;
+use crate::media_routing::{MeetingHandlers, SlotTable};
+use proto_gen::dark_tower::signaling::v1::{SlotState, StreamAssignment, StreamAssignments};
 
 /// The result of composing one subscriber's slot view.
 #[derive(Debug, Clone, PartialEq)]
@@ -91,23 +62,18 @@ pub struct SlotComposition {
     /// The wire message.
     pub assignments: StreamAssignments,
     /// Per-slot `(kind, state)`, in the same order, for the bounded slot-state
-    /// counter.
-    ///
-    /// Read off the assignments themselves rather than tracked in parallel, so
-    /// the metric and the wire cannot disagree about what MC said. The kind is
-    /// the DECLARED slot's kind (never a frame's), carried as a pair so the
-    /// recorder cannot be handed a state without its kind.
+    /// counter — read off the assignments themselves, so the metric and the
+    /// wire cannot disagree.
     pub slot_states: Vec<(MediaKindLabel, SlotState)>,
 }
 
 /// Bounded metric-label form for a slot state.
 ///
-/// Exhaustive over **every** proto variant, not only the ones reachable today.
-/// A wire-vocabulary mirror is supposed to cover states it does not yet emit:
-/// a hand-picked subset needs editing every time §7 makes `switch_pending` live,
-/// and a `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be
-/// visible rather than absent. Keeping the vocabulary identical to the wire is
-/// also what makes MC's distribution comparable with the client's.
+/// Exhaustive over **every** proto variant, including the superseded
+/// `source_muted` (MC-B deletes it with the wire value) and states MC does not
+/// emit: a `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must
+/// be visible rather than absent, and identical vocabularies keep MC's
+/// distribution comparable with the client's. Labels follow the wire names.
 #[must_use]
 pub fn slot_state_label(state: SlotState) -> &'static str {
     match state {
@@ -128,86 +94,79 @@ pub fn slot_state_label(state: SlotState) -> &'static str {
 /// Compose one subscriber's slot assignments — the ONE construction site of
 /// `StreamAssignments`.
 ///
-/// Total: every declared slot yields exactly one [`StreamAssignment`] carrying
-/// an explicit state, and no slot is silently omitted. `unreachable` is the
-/// slot table's `unreachable_for(subscriber)`, carried verbatim.
-///
-/// `sender_id` is `Option` throughout and absence is **never coerced to 0** — a
-/// shared zero is not a recycled id but N concurrently-live colliding ones, and
-/// since the key id encodes `(sender, stream, generation)`, two senders at zero
-/// wrap distinct transmit keys under one KEK at one nonce.
+/// Total: every declared slot yields exactly one [`StreamAssignment`].
+/// `sender_id` is `Option` throughout and absence is **never coerced to 0**.
 ///
 /// # Errors
 ///
-/// [`DirectiveOutcome::HandlerUrlUnresolved`] if a filled slot's handler has no
-/// url in `handlers`. Unreachable by construction (one frozen handler set feeds
-/// both), and it fails CLOSED: the caller emits nothing for this subscriber
-/// rather than an `ACTIVE` slot with an empty url.
+/// [`DirectiveOutcome::HandlerUrlUnresolved`] if an edge's handler has no url
+/// in `handlers`. Unreachable by construction (one frozen handler set feeds
+/// both), and it fails CLOSED: the caller emits nothing for this subscriber.
 pub fn build_stream_assignments(
     subscriber: SenderId,
-    declaration: &ReceiveCapabilityDeclaration,
-    assignment: &MeetingAssignment,
+    demand: &SlotDemand,
+    table: &SlotTable,
     handlers: &MeetingHandlers,
     mute: &SourceMuteView,
     unreachable: &[SenderId],
 ) -> Result<SlotComposition, DirectiveOutcome> {
-    // The subscriber's own egress plans, keyed by the slot MH will stamp.
-    let mut planned: HashMap<SlotId, (&HandlerId, Option<SenderId>)> = HashMap::new();
-    for (handler, handler_assignment) in &assignment.per_handler {
-        for plan in &handler_assignment.egress_streams {
-            if plan.subscriber != subscriber {
-                continue;
-            }
-            // Exactly one pinned candidate under static fill.
-            planned.insert(
-                SlotId::from_u16(plan.slot_id),
-                (handler, plan.candidate_sources.first().copied()),
-            );
-        }
-    }
+    let entries = demand.entries();
+    let mut assignments = Vec::with_capacity(entries.len());
+    let mut slot_states = Vec::with_capacity(entries.len());
 
-    let mut assignments = Vec::with_capacity(declaration.slots().len());
-    let mut slot_states = Vec::with_capacity(declaration.slots().len());
-
-    for slot in declaration.slots() {
-        // A plan is audio in this story. Matching on kind as well as id keeps a
-        // video slot from being filled with audio when video lands.
-        let plan = if slot.media_kind == MediaKind::Audio {
-            planned.get(&slot.slot_id)
-        } else {
-            None
-        };
-
-        let (sender_id, media_handler_url, slot_state) = match plan {
-            Some((handler, Some(source))) => {
-                let url = handlers
-                    .url_of(handler)
-                    .ok_or(DirectiveOutcome::HandlerUrlUnresolved)?;
-                let state = if mute.is_audio_muted(*source) {
-                    // §5: muting signals out of band. The receiver renders a
-                    // placeholder from this state, never from a substitute
-                    // frame — and MC does not touch the source's directive.
-                    SlotState::SourceMuted
+    for (slot, ordinal) in entries {
+        let kind = slot.kind_label;
+        let edge = ordinal.and_then(|i| {
+            table
+                .slots_of(subscriber, kind)
+                .and_then(|slots| slots.get(i))
+                .cloned()
+                .flatten()
+        });
+        let (sender_id, media_handler_url, slot_state) = match (ordinal, edge) {
+            // Truncated by the per-kind cap: permanent for this declaration.
+            (None, _) => (None, String::new(), SlotState::Unavailable),
+            // Kept, but nobody eligible fills it.
+            (Some(_), None) => (None, String::new(), SlotState::FewerSourcesThanSlots),
+            (Some(_), Some(edge)) => {
+                let named = Some(u32::from(edge.source.get().get()));
+                let publishes_video = table
+                    .publishes_of(edge.source)
+                    .is_some_and(|p| p.publishes(MediaKindLabel::Video));
+                if kind == MediaKindLabel::Video && !publishes_video {
+                    // No-video precedence: no edge, so no url.
+                    (named, String::new(), SlotState::AvatarNoVideo)
                 } else {
-                    SlotState::Active
-                };
-                (Some(u32::from(source.get().get())), url.to_string(), state)
+                    let url = handlers
+                        .url_of(&edge.handler)
+                        .ok_or(DirectiveOutcome::HandlerUrlUnresolved)?
+                        .to_string();
+                    let flags = mute.flags(edge.source);
+                    let (server, client) =
+                        (*kind.of_ref(&flags.server), *kind.of_ref(&flags.client));
+                    if server {
+                        (named, url, SlotState::AvatarServerMuted)
+                    } else if client {
+                        (named, url, SlotState::AvatarClientMuted)
+                    } else if kind == MediaKindLabel::Video {
+                        // R-5: MC never names a live video source; the
+                        // verified key-id sender does.
+                        (None, url, SlotState::Active)
+                    } else {
+                        (named, url, SlotState::Active)
+                    }
+                }
             }
-            // Declared, but no sender this subscriber shares a connected handler with is left to fill
-            // it: the honest steady state of a meeting smaller than N, and of a
-            // solo participant (R-3). The url is empty BY CONTRACT here.
-            Some((_, None)) | None => (None, String::new(), SlotState::FewerSourcesThanSlots),
         };
 
-        slot_states.push((slot.kind_label, slot_state));
+        slot_states.push((kind, slot_state));
         assignments.push(StreamAssignment {
             slot_id: u32::from(slot.slot_id.get()),
             sender_id,
             media_kind: slot.media_kind as i32,
             media_handler_url,
             slot_state: slot_state as i32,
-            // §7 switching is not in this story. Present if and only if the
-            // state is `SWITCH_PENDING`, which MC never emits here.
+            // §7 switching is not in this story.
             switch_command_id: None,
         });
     }
@@ -228,9 +187,16 @@ pub fn build_stream_assignments(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::media_routing::{HandlerEndpoint, SlotTable};
-    use proto_gen::dark_tower::signaling::v1::{ReceiveCapability, ReceiveSlot};
+    use crate::media_kind::PublishSet;
+    use crate::media_routing::SourceMute;
+    use crate::media_routing::{HandlerEndpoint, HandlerId};
+    use crate::media_signaling::ReceiveCapabilityDeclaration;
+    use proto_gen::dark_tower::signaling::v1::{MediaKind, ReceiveCapability, ReceiveSlot};
+    use std::collections::HashMap;
     use std::num::NonZeroU16;
+
+    const AU: MediaKindLabel = MediaKindLabel::Audio;
+    const VI: MediaKindLabel = MediaKindLabel::Video;
 
     fn sender(n: u16) -> SenderId {
         SenderId::from_nonzero(NonZeroU16::new(n).unwrap())
@@ -245,7 +211,7 @@ mod tests {
         .unwrap()
     }
 
-    fn declare(slots: &[(u32, MediaKind)]) -> ReceiveCapabilityDeclaration {
+    fn demand(slots: &[(u32, MediaKind)], caps: [u8; 2]) -> SlotDemand {
         let message = ReceiveCapability {
             slots: slots
                 .iter()
@@ -256,133 +222,250 @@ mod tests {
                 })
                 .collect(),
         };
-        ReceiveCapabilityDeclaration::parse(&message, 64, true)
+        ReceiveCapabilityDeclaration::parse(&message, true)
             .expect("fixture declaration is valid")
+            .truncate(caps)
     }
 
-    /// A meeting on `handlers` where `others` connect only to `mh-0` after subscriber 1,
-    /// which declares `slots`. Returns (assignment, handlers, table).
-    fn meeting(
-        handlers: &[&str],
-        others: &[u16],
-        slots: &[(u32, MediaKind)],
-    ) -> (
-        MeetingAssignment,
-        MeetingHandlers,
-        SlotTable,
-        ReceiveCapabilityDeclaration,
-    ) {
-        let set = handler_set(handlers);
-        let mut table = SlotTable::new();
-        table.admit_on(sender(1), &set, &["mh-0"]);
-        for s in others {
-            table.admit_on(sender(*s), &set, &["mh-0"]);
+    fn publishing(s: &str) -> PublishSet {
+        let mut k = Vec::new();
+        if s.contains('A') {
+            k.push(AU);
         }
-        let declaration = declare(slots);
-        table.set_demand(sender(1), declaration.audio_slot_ids());
-        (
-            table
-                .render(set.ids(), &std::collections::BTreeSet::new())
-                .unwrap(),
-            set,
-            table,
-            declaration,
-        )
+        if s.contains('V') {
+            k.push(VI);
+        }
+        PublishSet::of(&k)
     }
 
-    fn compose(
-        others: &[u16],
+    /// Subscriber 1 (AV) then `others` (each with its publish set), all on
+    /// `mh-0`; subscriber 1 declares `slots` truncated to `caps`.
+    fn compose_with(
+        others: &[(u16, &str)],
         slots: &[(u32, MediaKind)],
-        mute: &SourceMuteView,
+        caps: [u8; 2],
+        overrides: &[(u16, SourceMute)],
     ) -> SlotComposition {
-        let (assignment, set, table, declaration) = meeting(&["mh-0"], others, slots);
+        let set = handler_set(&["mh-0"]);
+        let mut table = SlotTable::new();
+        table.admit_on_publishing(sender(1), publishing("AV"), &set, &["mh-0"]);
+        for (s, p) in others {
+            table.admit_on_publishing(sender(*s), publishing(p), &set, &["mh-0"]);
+        }
+        let d = demand(slots, caps);
+        table.set_demand(sender(1), [d.kept_slot_ids(AU), d.kept_slot_ids(VI)]);
+        // Everyone present and unmuted, then the overrides.
+        let mut map: HashMap<SenderId, SourceMute> = [1u16]
+            .iter()
+            .chain(others.iter().map(|(s, _)| s))
+            .map(|s| (sender(*s), SourceMute::default()))
+            .collect();
+        for (s, m) in overrides {
+            map.insert(sender(*s), *m);
+        }
         build_stream_assignments(
             sender(1),
-            &declaration,
-            &assignment,
+            &d,
+            &table,
             &set,
-            mute,
+            &SourceMuteView::from_map(map),
             &table.unreachable_for(sender(1)),
         )
         .unwrap()
     }
 
+    fn compose(
+        others: &[u16],
+        slots: &[(u32, MediaKind)],
+        overrides: &[(u16, SourceMute)],
+    ) -> SlotComposition {
+        let others: Vec<(u16, &str)> = others.iter().map(|s| (*s, "A")).collect();
+        compose_with(&others, slots, [8, 4], overrides)
+    }
+
+    fn muted(s: u16, server: [bool; 2], client: [bool; 2]) -> Vec<(u16, SourceMute)> {
+        vec![(s, SourceMute { server, client })]
+    }
+
+    fn state(a: &StreamAssignment) -> SlotState {
+        SlotState::try_from(a.slot_state).unwrap()
+    }
+
     #[test]
-    fn a_filled_slot_names_its_source_and_is_active() {
-        let composition = compose(&[2], &[(0, MediaKind::Audio)], &SourceMuteView::default());
-        assert_eq!(composition.assignments.assignments.len(), 1);
-        let a = &composition.assignments.assignments[0];
+    fn a_filled_audio_slot_names_its_source_and_is_active() {
+        let c = compose(&[2], &[(0, MediaKind::Audio)], &[]);
+        let a = &c.assignments.assignments[0];
         assert_eq!(a.slot_id, 0);
-        assert_eq!(
-            a.sender_id,
-            Some(2),
-            "the peer sharing mh-0, never the subscriber itself"
-        );
+        assert_eq!(a.sender_id, Some(2));
         assert_eq!(a.media_kind, MediaKind::Audio as i32);
         assert_eq!(a.media_handler_url, "https://mh-0.example:4434");
-        assert_eq!(a.slot_state, SlotState::Active as i32);
-        // Present iff SWITCH_PENDING, which MC never emits this story.
+        assert_eq!(state(a), SlotState::Active);
         assert!(a.switch_command_id.is_none());
     }
 
-    /// R-3: a solo participant hears nothing, and every declared slot says so
-    /// explicitly.
+    /// S8: a live VIDEO slot names no sender — and carries nothing derived
+    /// from it — while live AUDIO keeps the sender.
+    #[test]
+    fn live_video_names_no_sender_and_live_audio_does() {
+        let c = compose_with(
+            &[(2, "AV")],
+            &[(0, MediaKind::Audio), (1, MediaKind::VideoCamera)],
+            [8, 4],
+            &[],
+        );
+        let [audio, video] = [&c.assignments.assignments[0], &c.assignments.assignments[1]];
+        assert_eq!(
+            (state(audio), audio.sender_id),
+            (SlotState::Active, Some(2))
+        );
+        assert_eq!(state(video), SlotState::Active);
+        assert_eq!(video.sender_id, None);
+        assert_eq!(video.slot_id, 1, "only the subscriber's own id is echoed");
+        assert!(video.switch_command_id.is_none());
+        assert_eq!(video.media_handler_url, "https://mh-0.example:4434");
+        assert_eq!(video.media_kind, MediaKind::VideoCamera as i32);
+    }
+
+    /// The table, row by row, for both kinds — including server-wins and
+    /// no-video precedence, and which states carry a url.
+    #[test]
+    fn slot_state_mapping_for_both_kinds() {
+        let slots = [(0, MediaKind::Audio), (1, MediaKind::VideoCamera)];
+        let case = |publish: &str, server: [bool; 2], client: [bool; 2]| {
+            let c = compose_with(&[(2, publish)], &slots, [8, 4], &muted(2, server, client));
+            c.assignments
+                .assignments
+                .iter()
+                .map(|a| (state(a), a.sender_id, !a.media_handler_url.is_empty()))
+                .collect::<Vec<_>>()
+        };
+        use SlotState::*;
+        // Client mute of both kinds: named avatars, url kept.
+        assert_eq!(
+            case("AV", [false; 2], [true; 2]),
+            vec![
+                (AvatarClientMuted, Some(2), true),
+                (AvatarClientMuted, Some(2), true)
+            ]
+        );
+        // Server wins over client.
+        assert_eq!(
+            case("AV", [true; 2], [true; 2]),
+            vec![
+                (AvatarServerMuted, Some(2), true),
+                (AvatarServerMuted, Some(2), true)
+            ]
+        );
+        // Kinds are independent: video-only server mute leaves audio active.
+        assert_eq!(
+            case("AV", [false, true], [false; 2]),
+            vec![(Active, Some(2), true), (AvatarServerMuted, Some(2), true)]
+        );
+        // No-video precedence: whatever the mutes, a non-video occupant of a
+        // video slot is AVATAR_NO_VIDEO, named, with no url.
+        for (server, client) in [([false; 2], [false; 2]), ([true; 2], [true; 2])] {
+            assert_eq!(
+                case("A", server, client)[1],
+                (AvatarNoVideo, Some(2), false)
+            );
+        }
+        // A receive-only participant: no audio representation, a no-video
+        // avatar in the video slot.
+        assert_eq!(
+            case("", [false; 2], [false; 2]),
+            vec![
+                (FewerSourcesThanSlots, None, false),
+                (AvatarNoVideo, Some(2), false)
+            ]
+        );
+    }
+
+    /// R-1: an over-cap slot is UNAVAILABLE — declared id echoed, no sender,
+    /// empty url — and the kept slots fill normally.
+    #[test]
+    fn truncated_slots_are_unavailable_with_their_ids_echoed() {
+        let c = compose_with(
+            &[(2, "AV"), (3, "AV")],
+            &[
+                (5, MediaKind::VideoCamera),
+                (6, MediaKind::VideoCamera),
+                (7, MediaKind::Audio),
+            ],
+            [8, 1],
+            &[],
+        );
+        let got: Vec<(u32, SlotState, Option<u32>, bool)> = c
+            .assignments
+            .assignments
+            .iter()
+            .map(|a| {
+                (
+                    a.slot_id,
+                    state(a),
+                    a.sender_id,
+                    a.media_handler_url.is_empty(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (5, SlotState::Active, None, false),
+                (6, SlotState::Unavailable, None, true),
+                (7, SlotState::Active, Some(2), false),
+            ]
+        );
+    }
+
     #[test]
     fn a_solo_subscribers_slots_are_all_fewer_sources_than_slots() {
-        let composition = compose(
+        let c = compose(
             &[],
-            &[(0, MediaKind::Audio), (1, MediaKind::Audio)],
-            &SourceMuteView::default(),
+            &[(0, MediaKind::Audio), (1, MediaKind::VideoCamera)],
+            &[],
         );
-        for a in &composition.assignments.assignments {
-            assert_eq!(a.slot_state, SlotState::FewerSourcesThanSlots as i32);
+        for a in &c.assignments.assignments {
+            assert_eq!(state(a), SlotState::FewerSourcesThanSlots);
             assert!(a.sender_id.is_none());
             assert!(a.media_handler_url.is_empty());
         }
-        assert!(composition.assignments.unreachable_sender_ids.is_empty());
     }
 
     #[test]
-    fn a_muted_source_is_conveyed_as_source_muted_with_the_sender_still_named() {
-        let mute = SourceMuteView::from_pairs(vec![(sender(2), true)]);
-        let composition = compose(&[2], &[(0, MediaKind::Audio)], &mute);
-        let a = &composition.assignments.assignments[0];
-        assert_eq!(a.slot_state, SlotState::SourceMuted as i32);
-        assert_eq!(a.sender_id, Some(2));
-    }
-
-    #[test]
-    fn an_unfilled_slot_is_a_source_shortage_with_sender_id_absent_not_zero() {
-        let composition = compose(
-            &[2],
-            &[(0, MediaKind::Audio), (1, MediaKind::Audio)],
-            &SourceMuteView::default(),
-        );
-        assert_eq!(composition.assignments.assignments.len(), 2);
-        let extra = &composition.assignments.assignments[1];
-        assert_eq!(extra.slot_id, 1);
-        assert_eq!(extra.slot_state, SlotState::FewerSourcesThanSlots as i32);
-        // ABSENT, not 0.
-        assert!(extra.sender_id.is_none());
-        assert_ne!(extra.sender_id, Some(0));
-        assert!(extra.media_handler_url.is_empty());
+    fn nothing_emits_source_muted() {
+        for (server, client) in [([true; 2], [false; 2]), ([false; 2], [true; 2])] {
+            let c = compose_with(
+                &[(2, "AV"), (3, "A")],
+                &[
+                    (0, MediaKind::Audio),
+                    (1, MediaKind::VideoCamera),
+                    (2, MediaKind::VideoCamera),
+                ],
+                [8, 4],
+                &muted(2, server, client),
+            );
+            assert!(c
+                .slot_states
+                .iter()
+                .all(|(_, s)| *s != SlotState::SourceMuted));
+        }
     }
 
     #[test]
     fn the_subscribers_own_slot_numbering_is_echoed_not_mcs() {
-        let composition = compose(
+        let c = compose(
             &[2, 3],
             &[(9, MediaKind::Audio), (7, MediaKind::Audio)],
-            &SourceMuteView::default(),
+            &[],
         );
-        let ids: Vec<u32> = composition
+        let ids: Vec<u32> = c
             .assignments
             .assignments
             .iter()
             .map(|a| a.slot_id)
             .collect();
         assert_eq!(ids, vec![9, 7]);
-        let senders: Vec<Option<u32>> = composition
+        let senders: Vec<Option<u32>> = c
             .assignments
             .assignments
             .iter()
@@ -396,68 +479,34 @@ mod tests {
     }
 
     #[test]
-    fn a_video_slot_is_a_shortage_and_never_filled_with_audio() {
-        let composition = compose(
-            &[2],
-            &[(1, MediaKind::VideoCamera)],
-            &SourceMuteView::default(),
-        );
-        let a = &composition.assignments.assignments[0];
-        assert_eq!(a.media_kind, MediaKind::VideoCamera as i32);
-        assert_eq!(a.slot_state, SlotState::FewerSourcesThanSlots as i32);
-        assert!(a.sender_id.is_none());
-    }
-
-    #[test]
     fn a_zero_slot_declaration_yields_no_assignments() {
-        // `slot_id` echoes a slot the subscriber CHOSE, so a zero-slot
-        // declaration has no id to echo (why ZERO_REQUESTED is reserved).
-        let composition = compose(&[2], &[], &SourceMuteView::default());
-        assert!(composition.assignments.assignments.is_empty());
-        assert!(composition.slot_states.is_empty());
+        let c = compose(&[2], &[], &[]);
+        assert!(c.assignments.assignments.is_empty());
+        assert!(c.slot_states.is_empty());
     }
 
-    /// S-A: a filled slot whose handler has no url fails CLOSED — no message,
-    /// never an ACTIVE slot with an empty url.
+    /// A filled slot whose handler has no url fails CLOSED.
     #[test]
     fn an_unresolvable_handler_fails_closed_rather_than_emitting_an_empty_url() {
-        let (assignment, _, table, declaration) =
-            meeting(&["mh-0"], &[2], &[(0, MediaKind::Audio)]);
+        let set = handler_set(&["mh-0"]);
+        let mut table = SlotTable::new();
+        table.admit_on(sender(1), &set, &["mh-0"]);
+        table.admit_on(sender(2), &set, &["mh-0"]);
+        let d = demand(&[(0, MediaKind::Audio)], [8, 4]);
+        table.set_demand(sender(1), [d.kept_slot_ids(AU), d.kept_slot_ids(VI)]);
         let outcome = build_stream_assignments(
             sender(1),
-            &declaration,
-            &assignment,
+            &d,
+            &table,
             &handler_set(&["mh-9"]),
-            &SourceMuteView::default(),
-            &table.unreachable_for(sender(1)),
+            &table.quiet_mute(),
+            &[],
         );
         assert_eq!(outcome, Err(DirectiveOutcome::HandlerUrlUnresolved));
     }
 
-    /// No declared slot, of any shape, ever carries a state MC does not emit
-    /// this story. (`ZERO_REQUESTED` is reserved in the proto and so is no
-    /// longer representable.)
-    #[test]
-    fn source_unreachable_is_never_emitted() {
-        for others in [&[][..], &[2][..], &[2, 3, 4][..]] {
-            let composition = compose(
-                others,
-                &[
-                    (0, MediaKind::Audio),
-                    (1, MediaKind::Audio),
-                    (2, MediaKind::VideoCamera),
-                ],
-                &SourceMuteView::from_pairs(vec![(sender(2), true)]),
-            );
-            for (_, state) in &composition.slot_states {
-                assert_ne!(*state, SlotState::SourceUnreachable);
-            }
-        }
-    }
-
     /// R-33: a participant sharing no connected handler consumes no slot and is
-    /// named in `unreachable_sender_ids`; a participant sharing one but left over
-    /// by full slots is NOT.
+    /// named in `unreachable_sender_ids`; one left over by full slots is NOT.
     #[test]
     fn disjoint_peers_are_unreachable_and_sharing_overflow_is_not() {
         let set = handler_set(&["mh-0", "mh-1"]);
@@ -466,69 +515,73 @@ mod tests {
         table.admit_on(sender(2), &set, &["mh-1"]);
         table.admit_on(sender(3), &set, &["mh-0"]);
         table.admit_on(sender(4), &set, &["mh-0"]);
-        let declaration = declare(&[(0, MediaKind::Audio)]);
-        table.set_demand(sender(1), declaration.audio_slot_ids());
-        let composition = build_stream_assignments(
+        let d = demand(&[(0, MediaKind::Audio)], [8, 4]);
+        table.set_demand(sender(1), [d.kept_slot_ids(AU), d.kept_slot_ids(VI)]);
+        let c = build_stream_assignments(
             sender(1),
-            &declaration,
-            &table
-                .render(set.ids(), &std::collections::BTreeSet::new())
-                .unwrap(),
+            &d,
+            &table,
             &set,
-            &SourceMuteView::default(),
+            &table.quiet_mute(),
             &table.unreachable_for(sender(1)),
         )
         .unwrap();
-        assert_eq!(composition.assignments.assignments[0].sender_id, Some(3));
-        assert_eq!(
-            composition.assignments.unreachable_sender_ids,
-            vec![2],
-            "exactly the cross-handler participant; 4 is 'no slot', not unreachable"
-        );
+        assert_eq!(c.assignments.assignments[0].sender_id, Some(3));
+        assert_eq!(c.assignments.unreachable_sender_ids, vec![2]);
     }
 
     #[test]
     fn slot_states_mirror_the_wire_and_cannot_disagree_with_it() {
-        let composition = compose(
-            &[2],
-            &[(0, MediaKind::Audio), (1, MediaKind::Audio)],
-            &SourceMuteView::default(),
+        let c = compose_with(
+            &[(2, "AV")],
+            &[
+                (0, MediaKind::Audio),
+                (1, MediaKind::VideoCamera),
+                (2, MediaKind::Audio),
+            ],
+            [8, 4],
+            &[],
         );
-        let from_wire: Vec<i32> = composition
-            .assignments
-            .assignments
-            .iter()
-            .map(|a| a.slot_state)
-            .collect();
-        let from_metric: Vec<i32> = composition
-            .slot_states
-            .iter()
-            .map(|(_, s)| *s as i32)
-            .collect();
-        assert_eq!(from_wire, from_metric);
-        let kinds_from_wire: Vec<Option<MediaKindLabel>> = composition
+        let from_wire: Vec<(Option<MediaKindLabel>, i32)> = c
             .assignments
             .assignments
             .iter()
             .map(|a| {
-                MediaKind::try_from(a.media_kind)
-                    .ok()
-                    .and_then(MediaKindLabel::from_proto)
+                (
+                    MediaKind::try_from(a.media_kind)
+                        .ok()
+                        .and_then(MediaKindLabel::from_proto),
+                    a.slot_state,
+                )
             })
             .collect();
-        let kinds_from_metric: Vec<Option<MediaKindLabel>> = composition
+        let from_metric: Vec<(Option<MediaKindLabel>, i32)> = c
             .slot_states
             .iter()
-            .map(|(k, _)| Some(*k))
+            .map(|(k, s)| (Some(*k), *s as i32))
             .collect();
-        assert_eq!(kinds_from_wire, kinds_from_metric);
+        assert_eq!(from_wire, from_metric);
     }
 
+    /// One accessor, one default: a source absent from the projection fails
+    /// CLOSED (server-muted), the same answer the render gives MH.
     #[test]
-    fn an_unknown_source_is_reported_not_muted() {
-        let view = SourceMuteView::from_pairs(vec![(sender(2), true)]);
-        assert!(!view.is_audio_muted(sender(1)));
-        assert!(view.is_audio_muted(sender(2)));
+    fn an_unknown_source_fails_closed_as_server_muted() {
+        let view = SourceMuteView::from_map(HashMap::from([(
+            sender(2),
+            SourceMute {
+                server: [false; 2],
+                client: [true, false],
+            },
+        )]));
+        assert_eq!(
+            view.flags(sender(1)),
+            SourceMute {
+                server: [true; 2],
+                client: [false; 2]
+            }
+        );
+        assert_eq!(view.flags(sender(2)).client, [true, false]);
     }
 
     #[test]
@@ -549,8 +602,6 @@ mod tests {
         let labels: std::collections::HashSet<&str> =
             all.iter().map(|s| slot_state_label(*s)).collect();
         assert_eq!(labels.len(), all.len());
-        // Labels follow the WIRE names: derived from the generated artifact,
-        // not restated from memory, so a typo'd label cannot pass.
         for state in all {
             let wire = state
                 .as_str_name()
@@ -561,30 +612,20 @@ mod tests {
         }
     }
 
-    /// The slot's handler address IS the handler carrying this subscriber's
-    /// plan, in a two-handler meeting where everyone sits on mh-0.
-    ///
-    /// The url is a WRITTEN LITERAL, not sourced from any helper the production
-    /// path also calls. The nameable wrong answer — mh-1, present with a
-    /// correct-by-design empty set — is asserted against explicitly.
+    /// The slot's handler address IS the handler carrying this pair, in a
+    /// two-handler meeting where everyone sits on mh-0 (written literals).
     #[test]
-    fn the_slot_names_the_handler_carrying_this_subscribers_plan_at_n_2() {
-        let (assignment, set, table, declaration) =
-            meeting(&["mh-1", "mh-0"], &[2], &[(0, MediaKind::Audio)]);
-        assert!(assignment.per_handler[&HandlerId::new("mh-1")]
-            .egress_streams
-            .is_empty());
-        let composition = build_stream_assignments(
-            sender(1),
-            &declaration,
-            &assignment,
-            &set,
-            &SourceMuteView::default(),
-            &table.unreachable_for(sender(1)),
-        )
-        .unwrap();
-        let a = &composition.assignments.assignments[0];
-        assert_eq!(a.slot_state, SlotState::Active as i32);
+    fn the_slot_names_the_handler_carrying_this_subscribers_pair_at_n_2() {
+        let set = handler_set(&["mh-1", "mh-0"]);
+        let mut table = SlotTable::new();
+        table.admit_on(sender(1), &set, &["mh-0"]);
+        table.admit_on(sender(2), &set, &["mh-0"]);
+        let d = demand(&[(0, MediaKind::Audio)], [8, 4]);
+        table.set_demand(sender(1), [d.kept_slot_ids(AU), d.kept_slot_ids(VI)]);
+        let c = build_stream_assignments(sender(1), &d, &table, &set, &table.quiet_mute(), &[])
+            .unwrap();
+        let a = &c.assignments.assignments[0];
+        assert_eq!(state(a), SlotState::Active);
         assert_eq!(a.media_handler_url, "https://mh-0.example:4434");
         assert_ne!(a.media_handler_url, "https://mh-1.example:4434");
     }

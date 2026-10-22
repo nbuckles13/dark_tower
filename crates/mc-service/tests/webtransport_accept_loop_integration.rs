@@ -113,14 +113,23 @@ async fn open_bi_send_join(
             meeting_id: meeting_id.to_string(),
             join_token: token.to_string(),
             participant_name: "AcceptLoopTester".to_string(),
-            capabilities: None,
+            capabilities: Some(
+                proto_gen::dark_tower::signaling::v1::ParticipantCapabilities {
+                    supported_codecs: Vec::new(),
+                    // v3 is the only header version (story 3 R-22).
+                    supported_header_versions: vec![u32::from(
+                        media_protocol::frame::PROTOCOL_VERSION,
+                    )],
+                },
+            ),
             correlation_id: String::new(),
             binding_token: String::new(),
             // ADR-0036 §4: raw Ed25519 identity signing public key. Empty here —
             // this test exercises the join path, not attribution, and MC performs
             // no attestation check this story.
             identity_public_key: sample_identity_public_key(),
-            publish_kinds: Vec::new(),
+            // Story 3 R-2: the suite publishes audio (story-2 shape).
+            publish_kinds: vec![proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32],
             receive_capability: None,
         })),
     };

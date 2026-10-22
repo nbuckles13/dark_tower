@@ -32,6 +32,7 @@ mod test_common;
 use std::time::Duration;
 
 use common::observability::testing::MetricAssertion;
+use mc_service::media_signaling::MediaKindLabel;
 use prost::Message;
 use proto_gen::dark_tower::signaling::v1::{
     client_message, ClientMessage, Codec, MediaConnectionUpdate, MediaKind, MhConnectionStatus,
@@ -108,16 +109,28 @@ async fn capability_yields_send_directive_and_slot_assignment() {
     let mut b = join_as(&rig, &stack, "mcs-meeting-a", "user-b").await;
     assert_eq!(a.media_servers, vec![SEEDED_HANDLER_URL.to_string()]);
 
-    // A declares while B has not: A's slot is filled with B, but NOBODY holds
-    // A yet, so A is directed to send nothing (§5: an empty target set).
-    a.write(capability_frame(audio_slots(1))).await;
-    let directive = a.expect_directive().await;
+    // Story 3: the JOIN carries the declaration (here none: zero slots), so
+    // A was directed in its join turn — its published audio LISTED with EMPTY
+    // targets (§5: send nothing; nobody holds A).
+    let directive = a.join_directive.clone().expect("A is directed at join");
     assert_eq!(
         directive.header_version,
         u32::from(media_protocol::frame::PROTOCOL_VERSION),
         "header version must be DERIVED from the media-protocol anchor, never a literal 2"
     );
-    assert!(directive.streams.is_empty(), "held by nobody: send nothing");
+    assert_eq!(
+        directive.streams.len(),
+        1,
+        "the published audio is always listed"
+    );
+    assert!(
+        directive.streams[0].targets.is_empty(),
+        "held by nobody: send nothing"
+    );
+
+    // A declares while B has not: A's slot is filled with B. A's directive is
+    // unchanged (still unwatched), so only the view is re-sent.
+    a.write(capability_frame(audio_slots(1))).await;
     let assignments = a.expect_assignments().await;
     assert_eq!(assignments.assignments.len(), 1);
     let slot_a = &assignments.assignments[0];
@@ -138,7 +151,9 @@ async fn capability_yields_send_directive_and_slot_assignment() {
     // hear it.
     b.write(capability_frame(audio_slots(1))).await;
     let a_directive = a
-        .directive_until("A's directive once B holds A", |d| !d.streams.is_empty())
+        .directive_until("A's directive once B holds A", |d| {
+            d.streams.iter().any(|s| !s.targets.is_empty())
+        })
         .await;
     assert_eq!(
         a_directive.streams.len(),
@@ -182,12 +197,14 @@ async fn capability_yields_send_directive_and_slot_assignment() {
     snap.counter("mc_media_receive_capability_declarations_total")
         .with_labels(&[("outcome", "accepted"), ("key_custody", "operator")])
         .assert_delta(2);
+    // Two join-turn directives with empty targets (A, B); then B's (when A
+    // declared) and A's (when B declared) gain a target.
     snap.counter("mc_media_send_directives_total")
         .with_labels(&[
             ("outcome", "emitted_empty_targets"),
             ("key_custody", "operator"),
         ])
-        .assert_delta(1);
+        .assert_delta(2);
     snap.counter("mc_media_send_directives_total")
         .with_labels(&[("outcome", "emitted"), ("key_custody", "operator")])
         .assert_delta(2);
@@ -204,13 +221,16 @@ async fn capability_yields_send_directive_and_slot_assignment() {
 /// explicitly — and is directed to send nothing.
 #[tokio::test]
 async fn a_solo_participant_hears_nothing_and_is_told_to_send_nothing() {
-    let snap = MetricAssertion::snapshot();
     let (stack, rig) = start_stack("mcs-solo").await;
     let mut a = solo(&rig, &stack, "mcs-meeting-solo").await;
+    // After the join: its join-turn view is not this test's subject.
+    let snap = MetricAssertion::snapshot();
 
+    // Directed at join: the published audio listed with EMPTY targets.
+    let directive = a.join_directive.clone().expect("directed at join");
+    assert_eq!(directive.streams.len(), 1);
+    assert!(directive.streams[0].targets.is_empty());
     a.write(capability_frame(audio_slots(2))).await;
-    let directive = a.expect_directive().await;
-    assert!(directive.streams.is_empty());
     let assignments = a.expect_assignments().await;
     assert_eq!(assignments.assignments.len(), 2);
     for s in &assignments.assignments {
@@ -237,12 +257,13 @@ async fn mute_unmute_cycle_leaves_the_send_directive_untouched() {
     let (mut a, mut b) = declared_pair(&rig, &stack, "mcs-meeting-b").await;
     let snap = MetricAssertion::snapshot();
 
-    // --- A mutes: B, who holds A, sees SOURCE_MUTED; nobody gets a directive ---
+    // --- A mutes: B, who holds A, sees AVATAR_CLIENT_MUTED; nobody gets a
+    // directive ---
     a.write(mute_frame(true, false)).await;
     let muted = b.expect_assignments().await;
     assert_eq!(
         muted.assignments[0].slot_state,
-        SlotState::SourceMuted as i32,
+        SlotState::AvatarClientMuted as i32,
         "the far-end-muted slot state is conveyed explicitly, never inferred from frame absence"
     );
     assert_eq!(
@@ -264,11 +285,18 @@ async fn mute_unmute_cycle_leaves_the_send_directive_untouched() {
         .assert_delta(0);
     snap.counter("mc_media_slot_states_total")
         .with_labels(&[
-            ("slot_state", "source_muted"),
+            ("slot_state", "avatar_client_muted"),
             ("media_kind", "audio"),
             ("key_custody", "operator"),
         ])
         .assert_delta(1);
+    snap.counter("mc_media_slot_states_total")
+        .with_labels(&[
+            ("slot_state", "source_muted"),
+            ("media_kind", "audio"),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(0);
     snap.counter("mc_media_slot_states_total")
         .with_labels(&[
             ("slot_state", "active"),
@@ -318,7 +346,7 @@ async fn a_repeated_identical_mute_report_does_no_work() {
     let muted = b.expect_assignments().await;
     assert_eq!(
         muted.assignments[0].slot_state,
-        SlotState::SourceMuted as i32
+        SlotState::AvatarClientMuted as i32
     );
 
     for _ in 0..4 {
@@ -348,28 +376,33 @@ async fn a_repeated_identical_mute_report_does_no_work() {
     assert_eq!(unmuted.assignments[0].slot_state, SlotState::Active as i32);
 }
 
+/// Story 3: a video-only mute by an AUDIO-ONLY publisher changes nothing any
+/// subscriber is told (it publishes no video, so no holder's view and no
+/// disposition moves) — yet it is `applied` (the actor recomposed and found
+/// nothing changed), and an audio mute still re-emits.
 #[tokio::test]
-async fn a_video_only_mute_is_recorded_but_never_re_emitted() {
-    // The slot view reads only audio mute, so a camera toggle must reach the
-    // actor and change nothing any subscriber is told.
+async fn a_video_only_mute_by_an_audio_only_publisher_re_emits_nothing() {
     let (stack, rig) = start_stack("mcs-mute-video").await;
     let (mut a, mut b) = declared_pair(&rig, &stack, "mcs-meeting-video-mute").await;
     let snap = MetricAssertion::snapshot();
+    let pushes_before = stack.mh_reg_client.calls().len();
 
     a.write(mute_frame(false, true)).await;
     a.write(mute_frame(false, false)).await;
     b.expect_no_media().await;
+    assert_eq!(
+        stack.mh_reg_client.calls().len(),
+        pushes_before,
+        "no stream of A's changed disposition: the identical re-render is not re-pushed"
+    );
 
     a.write(mute_frame(true, false)).await;
     let muted = b.expect_assignments().await;
     assert_eq!(
         muted.assignments[0].slot_state,
-        SlotState::SourceMuted as i32
+        SlotState::AvatarClientMuted as i32
     );
 
-    // Per kind: the two camera toggles are video `applied_no_recompose`
-    // (video never recomposes) and audio `unchanged`; the audio mute is audio
-    // `applied` and video `unchanged`. Video is never `applied`.
     let mute = |outcome: &'static str, kind: &'static str| {
         snap.counter("mc_media_mute_requests_total").with_labels(&[
             ("outcome", outcome),
@@ -377,19 +410,12 @@ async fn a_video_only_mute_is_recorded_but_never_re_emitted() {
             ("key_custody", "operator"),
         ])
     };
-    mute("applied_no_recompose", "video").assert_delta(2);
+    mute("applied", "video").assert_delta(2);
     mute("unchanged", "video").assert_delta(1);
-    mute("applied", "video").assert_delta(0);
     mute("applied", "audio").assert_delta(1);
     mute("unchanged", "audio").assert_delta(2);
     mute("applied_no_recompose", "audio").assert_delta(0);
-    snap.counter("mc_media_slot_states_total")
-        .with_labels(&[
-            ("slot_state", "active"),
-            ("media_kind", "audio"),
-            ("key_custody", "operator"),
-        ])
-        .assert_delta(0);
+    mute("applied_no_recompose", "video").assert_delta(0);
 }
 
 #[tokio::test]
@@ -473,7 +499,7 @@ async fn an_extra_slot_reports_a_source_shortage_with_sender_id_absent() {
     let b = join_as(&rig, &stack, "mcs-meeting-c", "user-b").await;
 
     a.write(capability_frame(audio_slots(2))).await;
-    let _ = a.expect_directive().await;
+    // Unwatched before and after: only the view is re-sent.
     let assignments = a.expect_assignments().await;
     assert_eq!(assignments.assignments.len(), 2);
     assert_eq!(assignments.assignments[0].sender_id, Some(b.sender_id));
@@ -507,7 +533,7 @@ async fn mc_echoes_the_subscribers_own_slot_numbering() {
         slot(0, MediaKind::Audio),
     ]))
     .await;
-    let _ = a.expect_directive().await;
+    // Unwatched before and after: only the view is re-sent.
     let assignments = a.expect_assignments().await;
     let ids: Vec<u32> = assignments.assignments.iter().map(|x| x.slot_id).collect();
     assert_eq!(ids, vec![7, 0], "declaration order is echoed");
@@ -525,13 +551,14 @@ async fn mc_echoes_the_subscribers_own_slot_numbering() {
 
 #[tokio::test]
 async fn a_valid_but_unsatisfiable_video_slot_is_not_a_rejection() {
-    let snap = MetricAssertion::snapshot();
     let (stack, rig) = start_stack("mcs-video-slot").await;
     let mut a = solo(&rig, &stack, "mcs-meeting-e").await;
+    // After the join: its join-turn view is not this test's subject.
+    let snap = MetricAssertion::snapshot();
 
     a.write(capability_frame(vec![slot(1, MediaKind::VideoCamera)]))
         .await;
-    let _ = a.expect_directive().await;
+    // Unwatched before and after: only the view is re-sent.
     let assignments = a.expect_assignments().await;
     assert_eq!(assignments.assignments.len(), 1);
     assert_eq!(
@@ -550,28 +577,35 @@ async fn a_valid_but_unsatisfiable_video_slot_is_not_a_rejection() {
 #[tokio::test]
 async fn a_zero_slot_declaration_still_directs_the_client_to_send() {
     // §5 and §6 are orthogonal: a client that wants to send without receiving
-    // must still be told what to produce, once somebody holds it.
+    // must still be told what to produce, once somebody holds it. Story 3: the
+    // join itself carried A's zero-slot declaration.
     let (stack, rig) = start_stack("mcs-zero-slot").await;
     seed_meeting_with_mh(&stack, "mcs-meeting-f").await;
     let mut a = join_as(&rig, &stack, "mcs-meeting-f", "user-a").await;
+    let assignments = a.join_assignments.clone().expect("A's join-turn view");
+    assert!(
+        assignments.assignments.is_empty(),
+        "no slot was declared, so there is no slot id to echo — ZERO_REQUESTED cannot be \
+         carried without fabricating one"
+    );
     let mut b = join_as(&rig, &stack, "mcs-meeting-f", "user-b").await;
     b.write(capability_frame(audio_slots(1))).await;
     let _ = b.settle().await;
 
-    a.write(capability_frame(vec![])).await;
-    let directive = a.expect_directive().await;
+    let directive = a
+        .directive_until("A directed once B holds it", |d| {
+            d.streams.first().is_some_and(|s| !s.targets.is_empty())
+        })
+        .await;
     assert_eq!(directive.streams.len(), 1);
     assert_eq!(directive.streams[0].targets.len(), 1);
     assert_eq!(
         directive.streams[0].targets[0].media_handler_url,
         SEEDED_HANDLER_URL
     );
-    let assignments = a.expect_assignments().await;
-    assert!(
-        assignments.assignments.is_empty(),
-        "no slot was declared, so there is no slot id to echo — ZERO_REQUESTED cannot be \
-         carried without fabricating one"
-    );
+    // An identical (empty) redeclaration is a no-op.
+    a.write(capability_frame(vec![])).await;
+    a.expect_no_media().await;
 }
 
 // ============================================================================
@@ -605,9 +639,10 @@ async fn assert_rejected(
 
 #[tokio::test]
 async fn rejects_duplicate_slot_ids() {
-    let snap = MetricAssertion::snapshot();
     let (stack, rig) = start_stack("mcs-dup").await;
     let mut a = solo(&rig, &stack, "mcs-meeting-g").await;
+    // After the join: its join-turn view is not this test's subject.
+    let snap = MetricAssertion::snapshot();
     a.write(capability_frame(vec![
         slot(0, MediaKind::Audio),
         slot(0, MediaKind::Audio),
@@ -616,95 +651,101 @@ async fn rejects_duplicate_slot_ids() {
     assert_rejected(&mut a, "duplicate_slot_id", &snap).await;
 }
 
-/// R-1: over the cap is rejected whole and counted by reason; AT the cap is
-/// accepted. The cap comes from CONFIGURATION — the same field
-/// `WebTransportServer::new` (`webtransport/server.rs`) publishes as
-/// `mc_media_receive_slot_cap` — never from a literal.
-///
-/// Run with a PEER present, so an accepted declaration WOULD create an edge:
-/// "rejected whole" is then observable as no edge, no view for anyone, and no
-/// new render — deterministically, via the generation registry after the
-/// actor's turn has drained, not by waiting for a push that does not come.
+/// Story 3 R-1: over the cap is TRUNCATED, never rejected: the first `cap`
+/// audio slots fill as usual and the excess slot reads UNAVAILABLE with its
+/// declared id echoed, no sender and an empty url. The cap comes from
+/// CONFIGURATION — the same value `WebTransportServer::new` publishes as
+/// `mc_media_receive_slot_cap` and the JoinResponse advertises per kind (tag 12
+/// is no longer written).
 #[tokio::test]
-async fn the_slot_cap_rejects_one_over_and_accepts_exactly_at() {
+async fn an_over_cap_declaration_is_truncated_to_unavailable_and_counted_accepted() {
     const MEETING: &str = "mcs-meeting-h";
     let cap = client_media_config().max_receive_slots;
-    let handler = mc_service::media_routing::HandlerId::new("mh-test-1");
+    let audio_cap = u32::from(MediaKindLabel::Audio.of(cap));
 
     let (stack, rig) = start_stack("mcs-cap").await;
     let mut a = solo(&rig, &stack, MEETING).await;
     let mut b = join_as(&rig, &stack, MEETING, "user-b").await;
     let _ = a.settle().await;
     let _ = b.settle().await;
-    let meeting = stack
-        .controller_handle
-        .get_meeting_handle(MEETING.to_string())
-        .await
-        .unwrap();
-    meeting.get_state().await.unwrap(); // actor drained
-    let rendered_before = rig.policy_generations.current(MEETING, &handler).await;
-    assert!(rendered_before.is_some(), "the first join rendered");
 
-    // ADVERTISED == ENFORCED, over the real wire: the cap the client is told on
-    // `JoinResponse.max_receive_slots` is the one this test then proves MC
-    // enforces, and the boundary below is driven FROM the advertised value.
-    assert_eq!(a.max_receive_slots, Some(u32::from(cap)));
-    let cap_u32 = a.max_receive_slots.expect("MC always advertises its cap");
-
-    let snap = MetricAssertion::snapshot();
-    a.write(capability_frame(audio_slots(cap_u32 + 1))).await;
-    assert_rejected(&mut a, "slot_count_over_cap", &snap).await;
-    b.expect_no_media().await;
-    meeting.get_state().await.unwrap(); // actor drained
     assert_eq!(
-        rig.policy_generations.current(MEETING, &handler).await,
-        rendered_before,
-        "a whole-rejected declaration reaches no actor state: no edge, no render"
+        a.max_receive_slots, None,
+        "the superseded total is no longer written"
+    );
+    assert_eq!(
+        a.max_kind_receive_slots,
+        (
+            Some(audio_cap),
+            Some(u32::from(MediaKindLabel::Video.of(cap)))
+        ),
+        "advertised == configured, per kind"
     );
 
     let snap = MetricAssertion::snapshot();
-    a.write(capability_frame(audio_slots(cap_u32))).await;
-    let _ = a.expect_directive().await;
-    let assignments = a.expect_assignments().await;
+    a.write(capability_frame(audio_slots(audio_cap + 1))).await;
+    let assignments = a
+        .assignments_until("the truncated view", |x| {
+            x.assignments.len() == usize::try_from(audio_cap + 1).unwrap()
+        })
+        .await;
     assert_eq!(
         assignments.assignments.len(),
-        usize::from(cap),
-        "accepted at exactly the cap"
+        usize::try_from(audio_cap + 1).unwrap()
     );
-    assert_eq!(
-        assignments.assignments[0].sender_id,
-        Some(b.sender_id),
-        "the accepted declaration creates the edge the rejected one did not"
-    );
+    assert_eq!(assignments.assignments[0].sender_id, Some(b.sender_id));
+    let excess = assignments.assignments.last().unwrap();
+    assert_eq!(excess.slot_id, audio_cap, "the declared id is echoed");
+    assert_eq!(excess.slot_state, SlotState::Unavailable as i32);
+    assert!(excess.sender_id.is_none());
+    assert!(excess.media_handler_url.is_empty());
     snap.counter("mc_media_receive_capability_declarations_total")
         .with_labels(&[("outcome", "accepted"), ("key_custody", "operator")])
         .assert_delta(1);
-    meeting.get_state().await.unwrap();
-    assert!(
-        rig.policy_generations.current(MEETING, &handler).await > rendered_before,
-        "the accepted declaration rendered a new generation"
-    );
+    snap.counter("mc_media_slot_states_total")
+        .with_labels(&[
+            ("slot_state", "unavailable"),
+            ("media_kind", "audio"),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(1);
 }
 
+/// A lowered configured cap truncates at the LOWERED value: the wire follows
+/// configuration, not a literal.
 #[tokio::test]
-async fn rejects_a_slot_count_over_a_lowered_configured_cap() {
-    let snap = MetricAssertion::snapshot();
+async fn a_lowered_configured_cap_truncates_at_the_configured_value() {
     let mut config = client_media_config();
-    config.max_receive_slots = 2;
+    config.max_receive_slots = [2, 4];
     let (stack, rig) = start_stack_with("mcs-cap-low", config).await;
     let mut a = solo(&rig, &stack, "mcs-meeting-h2").await;
-    // Positive control for the advertisement: 2 differs from the default 8, so
-    // the wire follows CONFIGURATION, not a literal.
-    assert_eq!(a.max_receive_slots, Some(2));
+    let _ = a.settle().await;
+    assert_eq!(a.max_kind_receive_slots.0, Some(2));
     a.write(capability_frame(audio_slots(3))).await;
-    assert_rejected(&mut a, "slot_count_over_cap", &snap).await;
+    let assignments = a
+        .assignments_until("the truncated view", |x| x.assignments.len() == 3)
+        .await;
+    let states: Vec<i32> = assignments
+        .assignments
+        .iter()
+        .map(|x| x.slot_state)
+        .collect();
+    assert_eq!(
+        states,
+        vec![
+            SlotState::FewerSourcesThanSlots as i32,
+            SlotState::FewerSourcesThanSlots as i32,
+            SlotState::Unavailable as i32
+        ]
+    );
 }
 
 #[tokio::test]
 async fn rejects_a_slot_id_outside_the_16_bit_relay_field() {
-    let snap = MetricAssertion::snapshot();
     let (stack, rig) = start_stack("mcs-slot-range").await;
     let mut a = solo(&rig, &stack, "mcs-meeting-i").await;
+    // After the join: its join-turn view is not this test's subject.
+    let snap = MetricAssertion::snapshot();
     // 65536 truncates to 0 under `as`, which would silently address a
     // different slot. It must reject, never clamp.
     a.write(capability_frame(vec![slot(65_536, MediaKind::Audio)]))
@@ -714,18 +755,20 @@ async fn rejects_a_slot_id_outside_the_16_bit_relay_field() {
 
 #[tokio::test]
 async fn rejects_a_zero_pinned_sender_id() {
-    let snap = MetricAssertion::snapshot();
     let (stack, rig) = start_stack("mcs-pin-zero").await;
     let mut a = solo(&rig, &stack, "mcs-meeting-j").await;
+    // After the join: its join-turn view is not this test's subject.
+    let snap = MetricAssertion::snapshot();
     a.write(capability_frame(vec![pinned_slot(0, 0)])).await;
     assert_rejected(&mut a, "pinned_sender_id_zero", &snap).await;
 }
 
 #[tokio::test]
 async fn rejects_an_out_of_range_pinned_sender_id() {
-    let snap = MetricAssertion::snapshot();
     let (stack, rig) = start_stack("mcs-pin-range").await;
     let mut a = solo(&rig, &stack, "mcs-meeting-k").await;
+    // After the join: its join-turn view is not this test's subject.
+    let snap = MetricAssertion::snapshot();
     a.write(capability_frame(vec![pinned_slot(0, 65_536)]))
         .await;
     assert_rejected(&mut a, "pinned_sender_id_out_of_range", &snap).await;
@@ -733,9 +776,10 @@ async fn rejects_an_out_of_range_pinned_sender_id() {
 
 #[tokio::test]
 async fn rejects_an_unset_media_kind() {
-    let snap = MetricAssertion::snapshot();
     let (stack, rig) = start_stack("mcs-kind-unset").await;
     let mut a = solo(&rig, &stack, "mcs-meeting-l").await;
+    // After the join: its join-turn view is not this test's subject.
+    let snap = MetricAssertion::snapshot();
     a.write(capability_frame(vec![slot(0, MediaKind::Unspecified)]))
         .await;
     assert_rejected(&mut a, "media_kind_unspecified", &snap).await;
@@ -747,9 +791,10 @@ async fn rejects_an_unset_media_kind() {
 async fn capability_rejection_replies_are_rate_limited_but_never_uncounted() {
     const REJECTIONS: u64 = 40;
 
-    let snap = MetricAssertion::snapshot();
     let (stack, rig) = start_stack("mcs-reject-rate").await;
     let mut a = solo(&rig, &stack, "mcs-meeting-reject-rate").await;
+    // After the join: its join-turn view is not this test's subject.
+    let snap = MetricAssertion::snapshot();
 
     // Two DISTINCT out-of-range slot ids, alternating, so the
     // identical-redeclaration short-circuit never fires.
@@ -790,7 +835,6 @@ async fn rejects_declarations_past_the_per_connection_budget() {
     let mut a = solo(&rig, &stack, "mcs-meeting-n").await;
 
     a.write(capability_frame(audio_slots(1))).await;
-    let _ = a.expect_directive().await;
     let _ = a.expect_assignments().await;
 
     a.write(capability_frame(audio_slots(2))).await;
@@ -889,7 +933,7 @@ async fn client_reported_status_neither_redirects_nor_narrows_a_per_edge_url() {
     b.write(capability_frame(audio_slots(1))).await;
     let before = a
         .assignments_until("A holds B on mh-1", |x| {
-            x.assignments[0].sender_id == Some(b.sender_id)
+            x.assignments.first().and_then(|a| a.sender_id) == Some(b.sender_id)
         })
         .await;
     assert_eq!(before.assignments[0].media_handler_url, "wt://mh-1:4433");
@@ -944,18 +988,24 @@ async fn client_reported_status_neither_redirects_nor_narrows_a_per_edge_url() {
 // ============================================================================
 
 #[tokio::test]
-async fn a_client_that_never_declares_is_never_directed_and_stays_healthy() {
+async fn a_client_that_joins_without_a_declaration_is_still_directed_and_stays_healthy() {
     let (stack, rig) = start_stack("mcs-silent").await;
     seed_meeting_with_mh(&stack, "mcs-meeting-p").await;
     let mut a = join_as(&rig, &stack, "mcs-meeting-p", "user-a").await;
     let mut b = join_as(&rig, &stack, "mcs-meeting-p", "user-b").await;
     let snap = MetricAssertion::snapshot();
 
-    // B declares and is emitted to; A — undeclared — is sent nothing, even
-    // though B's declaration makes B hold A.
+    // Story 3: the join IS the declaration (absent = zero slots), so A — which
+    // never sent a ReceiveCapability — is directed once B's declaration makes
+    // B hold A.
     b.write(capability_frame(audio_slots(1))).await;
     let _ = b.settle().await;
-    a.expect_no_media().await;
+    let directive = a
+        .directive_until("A directed once B holds A", |d| {
+            d.streams.first().is_some_and(|s| !s.targets.is_empty())
+        })
+        .await;
+    assert_eq!(directive.streams.len(), 1);
 
     a.write(encode_framed(&ClientMessage {
         trace_parent: String::new(),

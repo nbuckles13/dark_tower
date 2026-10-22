@@ -355,10 +355,11 @@ message EncodingParameters {
   // keyframe rate. Audio ignores it (every audio frame is independently
   // decodable); MC leaves it absent on audio.
   //
-  // THE SINGLE NORMATIVE HOME for its source: the shared `media-codec-profile`
-  // key `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS` (range 100..=10000, default
-  // 500), read by MC; MH does not read it (story 3 amendment 4). MC directs it
-  // here and publishes the same parsed value as the gauge
+  // THE SINGLE NORMATIVE HOME for its source: MC's own ConfigMap key
+  // `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS` (`mc-service-config`; range
+  // 100..=10000, default 500), read by MC only. It is NOT in the shared
+  // `media-codec-profile`, and MH does not read it (story 3 amendment 4). MC
+  // directs it here and publishes the same parsed value as the gauge
   // `mc_media_video_keyframe_min_interval_seconds`. It is server-configured,
   // never client-reported: a client-reported value would let a patched client
   // suppress the keyframe-storm alert. Other sites name the key and point
@@ -655,8 +656,11 @@ message JoinResponse {
   // the per-kind `max_audio_receive_slots` / `max_video_receive_slots` below:
   // story 3 caps each kind separately and TRUNCATES an over-cap declaration to
   // `SLOT_STATE_UNAVAILABLE` rather than rejecting it, so the "rejected WHOLE"
-  // rule below no longer describes MC once MC-A lands. Kept, unchanged, until
-  // MC-B so nothing a consumer reads today is removed.
+  // rule below no longer describes MC. Kept, unchanged, until MC-B so nothing
+  // a consumer reads today is removed. From MC-A, MC no longer sets this field
+  // (`MC_MAX_RECEIVE_SLOTS` and its range constants are retired); every
+  // paragraph below, PRESENCE included, describes pre-story-3 MC only. MC-B
+  // removes the field and reserves tag and name.
   //
   // MC's cap on the TOTAL number of slots one `ReceiveCapability` declaration
   // may carry, across all media kinds -- `MC_MAX_RECEIVE_SLOTS`. THE canonical
@@ -1017,7 +1021,7 @@ message ReceiveCapability {
   // count; the caps are advertised on `JoinResponse.max_audio_receive_slots`
   // / `max_video_receive_slots`. (Was: "MC rejects a declaration exceeding
   // it", against the single `JoinResponse.max_receive_slots`; superseded by
-  // story 3 R-1 once MC-A lands.)
+  // story 3 R-1, which MC enforces from MC-A.)
   repeated ReceiveSlot slots = 1;
 }
 

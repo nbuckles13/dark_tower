@@ -157,11 +157,13 @@ async fn a_server_mute_rides_every_snapshot_advances_the_generation_and_mutes_th
         ])
         .assert_delta(0);
 
-    // B, who holds A, is told A's slot is SOURCE_MUTED (the R-4 third driver).
+    // B, who holds A, is told A's slot is AVATAR_SERVER_MUTED (story 3 flat
+    // vocabulary; the R-4 third driver).
     let view = b
         .assignments_until("B sees A muted", |v| {
             v.assignments.iter().any(|s| {
-                s.sender_id == Some(a.sender_id) && s.slot_state == SlotState::SourceMuted as i32
+                s.sender_id == Some(a.sender_id)
+                    && s.slot_state == SlotState::AvatarServerMuted as i32
             })
         })
         .await;
@@ -210,10 +212,11 @@ async fn a_server_mute_rides_every_snapshot_advances_the_generation_and_mutes_th
 /// is never in it, because MH drops at ingress and the participant has no way
 /// to lift a server mute (plan §1). The self mute still reaches the slot view.
 ///
-/// Discriminating without a timed silence: after A self-mutes, the host mutes B,
-/// and the push that follows must carry EXACTLY `[B]` at one generation past the
-/// baseline. If self mute leaked into the set, every later push would carry A
-/// too, so `[B]` alone would never appear.
+/// Story 3: a self mute IS a snapshot change — A's stream is declared PAUSED in
+/// `source_streams` (forward nothing, never drop at ingress), which advances
+/// the generation once. It is never DROP_AT_INGRESS and never in the legacy
+/// muted set. Discriminating without a timed silence: after A self-mutes, the
+/// host mutes B, and the push that follows must carry EXACTLY `[B]`.
 #[tokio::test]
 async fn a_self_muted_participant_is_never_in_the_mh_muted_set() {
     let (stack, rig) = start_stack("sm-self").await;
@@ -226,21 +229,48 @@ async fn a_self_muted_participant_is_never_in_the_mh_muted_set() {
     let _ = b
         .assignments_until("B sees A self-muted", |v| {
             v.assignments.iter().any(|s| {
-                s.sender_id == Some(a.sender_id) && s.slot_state == SlotState::SourceMuted as i32
+                s.sender_id == Some(a.sender_id)
+                    && s.slot_state == SlotState::AvatarClientMuted as i32
             })
         })
         .await;
+    let disposition_of = |c: &test_common::RegisterMeetingCall, sender: u32| {
+        c.assignment
+            .source_streams
+            .iter()
+            .find(|s| u32::from(s.sender.get().get()) == sender && s.stream_number == 0)
+            .map(|s| s.disposition)
+    };
+    let paused = push_until(&stack, "sm-self-m", MH, "A's PAUSED disposition", |c| {
+        disposition_of(c, a.sender_id)
+            == Some(mc_service::media_routing::SourceDispositionPlan::Paused)
+    })
+    .await;
+    assert_eq!(
+        paused.policy_generation,
+        baseline.policy_generation + 1,
+        "a disposition change advances the generation exactly once"
+    );
+    assert!(
+        muted_ids(&paused).is_empty(),
+        "PAUSED is not the ingress-drop set"
+    );
 
-    // The host server-mutes B: the set is exactly B, one generation on.
+    // The host server-mutes B: the set is exactly B, one generation on, and
+    // B's stream is DROP_AT_INGRESS while A's stays PAUSED.
     h.write(server_mute_frame(&b.participant_id, true)).await;
     let only_b = push_until(&stack, "sm-self-m", MH, "the host's mute of B", |c| {
         muted_ids(c) == vec![b.sender_id as u16]
     })
     .await;
+    assert_eq!(only_b.policy_generation, paused.policy_generation + 1);
     assert_eq!(
-        only_b.policy_generation,
-        baseline.policy_generation + 1,
-        "A's self mute consumed no generation: MH's snapshot did not change"
+        disposition_of(&only_b, b.sender_id),
+        Some(mc_service::media_routing::SourceDispositionPlan::DropAtIngress)
+    );
+    assert_eq!(
+        disposition_of(&only_b, a.sender_id),
+        Some(mc_service::media_routing::SourceDispositionPlan::Paused)
     );
     assert!(
         pushes_to(&stack, "sm-self-m", MH)

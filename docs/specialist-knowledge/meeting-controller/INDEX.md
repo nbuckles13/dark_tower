@@ -11,24 +11,26 @@
 - Service entry point (fleet-gauge samplers) → `crates/mc-service/src/main.rs`
 - Config (env loading, TLS, advertise addresses, ADR-0036 media keys, `Config::kek_lifecycle`) → `crates/mc-service/src/config.rs`
 - Error types (McError hierarchy) → `crates/mc-service/src/errors.rs`
+- Media kinds (`MediaKindLabel`, `served_kind`, `PublishSet`) → `crates/mc-service/src/media_kind.rs`
 - Auth: McJwtValidator, validate_meeting_token, validate_guest_token → `crates/mc-service/src/auth/mod.rs`
 - Actors: controller, meeting, participant, messages, session (HMAC/HKDF), metrics → `crates/mc-service/src/actors/`
 
 ## Meeting Actor (single composer + connectivity home)
-- Structural-change drivers (join, leave choke-point `remove_and_broadcast_left`, capability, mute, MH connect/disconnect, reconnect) → `crates/mc-service/src/actors/meeting.rs:handle_join()`/`handle_reconnect()`/`handle_disconnect()`/`handle_media_connected()`/`handle_media_disconnected()`
-- Media state (slot table, frozen handler set, connectivity, push workers, slot-view flush, `MutedSourceCensus`, test-only `MeetingSeams`) → `crates/mc-service/src/actors/meeting_media.rs`
+- Structural-change drivers (join, leave choke-point `remove_and_broadcast_left`, capability, mute, MH connect/disconnect, reconnect + publish-set check) → `crates/mc-service/src/actors/meeting.rs:handle_join()`/`handle_reconnect()`/`handle_disconnect()`/`handle_media_connected()`/`handle_media_disconnected()`
+- Media state (slot table, frozen handler set, connectivity, push workers, slot-view flush, `MutedSourceCensus`, test-only `MeetingSeams`) → `crates/mc-service/src/actors/meeting_media.rs`; send-directive withdrawal counting → `meeting_media.rs:flush_one()`
 - Teardown fence + generation eviction on both teardown paths → `crates/mc-service/src/actors/controller.rs`
 - `DisconnectCause`, `SenderLookup` (folded into `MeetingMessage::MediaConnected`) → `crates/mc-service/src/actors/messages.rs`; cause-cell + `handle_kek_update` → `actors/participant.rs`
 
 ## Media Routing (ADR-0036 §7/§8/§9)
-- Join-order slots, edges, `render` into `MeetingAssignment` → `crates/mc-service/src/media_routing/slots.rs`; shared-handler choice per edge → `media_routing/edges.rs`
+- Join-order per-kind slot table (`KIND_FILL_ORDER`, independent-oracle model check), edges, `render` into `MeetingAssignment` → `crates/mc-service/src/media_routing/slots.rs`; shared-handler choice per edge → `media_routing/edges.rs`
 - Observed connectivity (keyed by MH `connection_id`, settle window) → `media_routing/connectivity.rs`
-- Frozen handler set, `ConnectedHandlers` (client-facing handler urls) → `media_routing/placement.rs`; output types (`HandlerAssignment`) → `media_routing/assignment.rs`
-- `policy_generation` → `media_routing/generation.rs`; latest-wins push worker → `media_routing/pusher.rs`; `RegisterMeetingResponse` classification → `media_routing/confirm.rs`
+- Frozen handler set, `ConnectedHandlers` (client-facing handler urls) → `media_routing/placement.rs`; output types (`HandlerAssignment`, `source_streams` / `SourceStreamPlan` + dispositions) → `media_routing/assignment.rs`
+- `policy_generation` → `media_routing/generation.rs`; latest-wins push worker → `media_routing/pusher.rs`; `RegisterMeetingResponse` classification + per-stream echo → `media_routing/confirm.rs:first_echo_mismatch()`
 - Meeting end: quiesce → `EndMeeting` plan → outcome classifier → `media_routing/teardown.rs`; exit hand-off → `actors/meeting.rs:hand_off_teardown()`
 
 ## Client Media Signalling (ADR-0036 §5/§6)
-- Capability parse → `crates/mc-service/src/media_signaling/capability.rs`; send directive → `media_signaling/directive.rs`; `StreamAssignments` construction → `media_signaling/assignments.rs`; outcome vocabularies → `media_signaling/outcome.rs`
+- Join media validation (header version, publish set, initial declaration) → `crates/mc-service/src/webtransport/connection.rs:validate_join_media()`
+- Capability parse + per-kind `SlotDemand` truncation → `crates/mc-service/src/media_signaling/capability.rs`; send directive (`VideoEncoding`) → `media_signaling/directive.rs`; `StreamAssignments` construction → `media_signaling/assignments.rs`; outcome vocabularies → `media_signaling/outcome.rs`
 - Server mute: dispatch authority + limiters → `crates/mc-service/src/webtransport/connection.rs:handle_server_mute_request()`/`refuse_server_mute()`/`handle_unmute_request()`; actor side → `actors/meeting.rs:handle_server_mute()`/`handle_request_unmute()`/`server_mute_replay()`
 
 ## Media Admission (ADR-0036 §4)
@@ -56,12 +58,12 @@
 - Policy push → `crates/mc-service/tests/media_policy_push_integration.rs`; RegisterMeeting → `tests/register_meeting_integration.rs`; MH coordination → `tests/media_coordination_integration.rs`; disconnect latency → `tests/disconnect_latency_integration.rs`
 - Accept loop → `tests/webtransport_accept_loop_integration.rs`; auth layer → `tests/auth_layer_integration.rs`; actor metrics → `tests/actor_metrics_integration.rs`; Redis → `tests/redis_metrics_integration.rs`; token refresh → `tests/token_refresh_integration.rs`; GC → `tests/gc_integration.rs`; heartbeat → `tests/heartbeat_tasks.rs`; OTel → `tests/otel_grpc_inbound_continuity.rs`
 - Test utilities: mock MH gRPC stub → `crates/mc-test-utils/src/mock_mh.rs`; test W → `crates/mc-test-utils/src/kek.rs`; others → `crates/mc-test-utils/src/`
-- Env-tests: MC-GC → `crates/env-tests/tests/22_mc_gc_integration.rs`; MH QUIC + policy push → `26_mh_quic.rs`; slots/edges → `27_mc_slot_placement.rs`; KEK rotation → `34_mc_kek_rotation.rs`; server mute + teardown → `35_mc_server_mute_teardown.rs`; metric hygiene → `32_media_metric_hygiene.rs`
+- Env-tests: MC-GC → `crates/env-tests/tests/22_mc_gc_integration.rs`; MH QUIC + policy push → `26_mh_quic.rs`; slots/edges (+ MC-A two-kind scenarios) → `27_mc_slot_placement.rs`; KEK rotation (+ MC-A rotation with video) → `34_mc_kek_rotation.rs`; server mute + teardown → `35_mc_server_mute_teardown.rs`; metric hygiene → `32_media_metric_hygiene.rs`
 - Env-test fixtures: `Participant` + triage literals → `crates/env-tests/src/fixtures/participant.rs`; `McSession`/`mc_join` → `crates/env-tests/src/fixtures/mc_session.rs`
 - Browser multi-party hear-each-other → `packages/web-app/e2e/multi-party-hear.spec.ts`
 
 ## Config & Infrastructure
-- MC ConfigMap env (REQUIRED media keys, `MC_KEK_ROTATION_DEBOUNCE_SECONDS`) → `infra/services/mc-service/config.env`; cross-service audio sizing inequality → `docs/TODO.md` §Media Path Obligations
+- MC ConfigMap env (REQUIRED media keys incl. per-kind caps and `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`, `MC_KEK_ROTATION_DEBOUNCE_SECONDS`) → `infra/services/mc-service/config.env`; shared codec profile → `infra/services/media-codec-profile/profile.env`; cross-service audio sizing inequality → `docs/TODO.md` §Media Path Obligations
 - K8s deployments → `infra/services/mc-service/mc-0-deployment.yaml`, `mc-1-deployment.yaml`; network policy → `infra/services/mc-service/network-policy.yaml`
 - Dashboards → `infra/grafana/dashboards/mc-overview.json`, `infra/grafana/dashboards/mc-media.json`; alert rules → `infra/docker/prometheus/rules/mc-alerts.yaml`
 - Runbooks → `docs/runbooks/mc-incident-response.md` (Sc 12–21), `docs/runbooks/mc-deployment.md`

@@ -385,6 +385,10 @@ async fn a_grace_member_is_gone_and_reconnect_reissues_the_current_kek_without_r
             "conn-b-2".to_string(),
             b.join.correlation_id.clone(),
             b.join.binding_token.clone(),
+            mc_service::media_signaling::PublishSet::of(&[
+                mc_service::media_signaling::MediaKindLabel::Audio,
+            ]),
+            None,
         )
         .await
         .expect("reconnect inside grace");
@@ -501,6 +505,10 @@ async fn sender_id_exhaustion_resets_the_kek_epoch_and_admission_never_fails() {
             "conn-b-2".to_string(),
             b.join.correlation_id.clone(),
             b.join.binding_token.clone(),
+            mc_service::media_signaling::PublishSet::of(&[
+                mc_service::media_signaling::MediaKindLabel::Audio,
+            ]),
+            None,
         )
         .await
         .expect("reconnect inside grace");

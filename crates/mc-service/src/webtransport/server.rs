@@ -98,17 +98,21 @@ impl WebTransportServer {
         quic_max_idle_timeout: Duration,
         cancel_token: CancellationToken,
     ) -> Self {
-        // `mc_media_receive_slot_cap` is published HERE, once, from the very
-        // `ClientMediaConfig` every connection's capability parse compares a
-        // declaration against — so the published cap and the enforced cap are
-        // one value, not a config read and a parallel constant.
-        //
-        // AUDIO ONLY today: MC has one cap, and it bounds audio slots. The
-        // `media_kind="video"` series is published when MC-A introduces the
-        // per-kind cap; it is NOT zero-initialised before then, because a video
-        // reading of 0 is the operator's confirmation that the R-26 video-off
-        // lever applied.
-        metrics::set_receive_slot_cap(MediaKindLabel::Audio, client_media_config.max_receive_slots);
+        // `mc_media_receive_slot_cap` is published HERE, once, PER KIND, from
+        // the very `ClientMediaConfig` every connection truncates declarations
+        // to and advertises on the JoinResponse — so the published, enforced
+        // and advertised caps are one value. Video reading 0 is the operator's
+        // confirmation that the R-26 video-off lever applied.
+        for kind in MediaKindLabel::ALL {
+            metrics::set_receive_slot_cap(kind, kind.of(client_media_config.max_receive_slots));
+        }
+        // The directed minimum keyframe interval, from the SAME validated
+        // `VideoEncoding` the video directive carries.
+        metrics::set_video_keyframe_min_interval(
+            client_media_config
+                .video_encoding
+                .min_keyframe_interval_ms(),
+        );
         // Present at zero from process start (O-13), for EVERY kind: absent must
         // mean "not up or not scraped", never "nobody is muted". The
         // controller's health walk then keeps it recomputed from live state.
@@ -132,6 +136,7 @@ impl WebTransportServer {
                 mc_grpc_endpoint,
                 stream_policy: crate::media_signaling::MediaStreamPolicy::new(
                     client_media_config.audio_encoding,
+                    client_media_config.video_encoding,
                 ),
                 connect_settle_window: client_media_config.connect_settle_window,
             }),

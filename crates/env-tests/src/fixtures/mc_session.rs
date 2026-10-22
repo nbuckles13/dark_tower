@@ -24,8 +24,9 @@
 use bytes::{BufMut, BytesMut};
 use prost::Message;
 use proto_gen::dark_tower::signaling::v1::{
-    client_message, mh_client_message, server_message, ClientMessage, JoinRequest, JoinResponse,
-    MhClientMessage, MhConnectRequest, ServerMessage,
+    client_message, mh_client_message, server_message, ClientMessage, ErrorMessage, JoinRequest,
+    JoinResponse, MediaKind, MhClientMessage, MhConnectRequest, ParticipantCapabilities,
+    ReceiveCapability, ReceiveSlot, ServerMessage,
 };
 use std::time::Duration;
 
@@ -205,59 +206,207 @@ impl McSession {
     }
 }
 
+/// The frame header version this suite declares at join: DERIVED from the
+/// wire-format crate (`media_protocol::frame::PROTOCOL_VERSION`), never a
+/// literal, so a version bump moves every env-test join with it. MC refuses a
+/// join whose `supported_header_versions` lacks it (story 3 R-22).
+#[must_use]
+pub fn current_header_version() -> u32 {
+    u32::from(media_protocol::frame::PROTOCOL_VERSION)
+}
+
+/// One `ReceiveCapability` from per-kind slot ids: audio slots first, then
+/// video, in the order given (the client's declaration order — MC truncates
+/// each kind to its cap keeping the FIRST ids of that kind). The ONE builder
+/// for both the join-carried declaration and the post-join redeclaration
+/// (`participant::Participant::declare`).
+#[must_use]
+pub fn receive_capability(audio_slot_ids: &[u32], video_slot_ids: &[u32]) -> ReceiveCapability {
+    let slot = |kind: MediaKind| {
+        move |id: &u32| ReceiveSlot {
+            slot_id: *id,
+            media_kind: kind as i32,
+            pinned_sender_id: None,
+        }
+    };
+    ReceiveCapability {
+        slots: audio_slot_ids
+            .iter()
+            .map(slot(MediaKind::Audio))
+            .chain(video_slot_ids.iter().map(slot(MediaKind::VideoCamera)))
+            .collect(),
+    }
+}
+
+/// What a join DECLARES (story 3 R-2, R-22): the publish set, the initial
+/// receive declaration and the frame header versions.
+///
+/// [`JoinDeclaration::default`] is what every suite that does not care sends:
+/// publishes AUDIO, declares no receive slots (absent = zero of each kind, which
+/// MC admits because the participant publishes) and supports
+/// [`current_header_version`]. That is the story-2 audio participant expressed
+/// on the story-3 wire. The negative cases set raw values through the builder
+/// methods so MC observes exactly the malformed declaration under test.
+#[derive(Clone, Debug)]
+pub struct JoinDeclaration {
+    /// Raw `MediaKind` values: raw so an invalid, unknown or duplicate value
+    /// can be sent unchanged.
+    pub publish_kinds: Vec<i32>,
+    pub receive_capability: Option<ReceiveCapability>,
+    pub header_versions: Vec<u32>,
+}
+
+impl Default for JoinDeclaration {
+    fn default() -> Self {
+        Self {
+            publish_kinds: vec![MediaKind::Audio as i32],
+            receive_capability: None,
+            header_versions: vec![current_header_version()],
+        }
+    }
+}
+
+impl JoinDeclaration {
+    /// Replace the publish set (empty = receive-only).
+    #[must_use]
+    pub fn publishing(mut self, kinds: &[MediaKind]) -> Self {
+        self.publish_kinds = kinds.iter().map(|k| *k as i32).collect();
+        self
+    }
+
+    /// Replace the publish set with raw values (negative cases).
+    #[must_use]
+    pub fn publishing_raw(mut self, kinds: &[i32]) -> Self {
+        self.publish_kinds = kinds.to_vec();
+        self
+    }
+
+    /// Carry an initial receive declaration on the join (see
+    /// [`receive_capability`] for ordering).
+    #[must_use]
+    pub fn receiving(mut self, audio_slot_ids: &[u32], video_slot_ids: &[u32]) -> Self {
+        self.receive_capability = Some(receive_capability(audio_slot_ids, video_slot_ids));
+        self
+    }
+
+    /// Replace the declared header versions (negative cases).
+    #[must_use]
+    pub fn header_versions(mut self, versions: &[u32]) -> Self {
+        self.header_versions = versions.to_vec();
+        self
+    }
+}
+
 /// Build the MC `JoinRequest` — the ONE place its field list lives in env-tests.
 ///
 /// `identity_public_key` is the shared synthetic Ed25519 fixture: MC checks
 /// length only (ADR-0036 §4) and performs no attestation this story.
 #[must_use]
-pub fn join_request(meeting_id: &str, join_token: &str, participant_name: &str) -> JoinRequest {
+pub fn join_request_with(
+    meeting_id: &str,
+    join_token: &str,
+    participant_name: &str,
+    declaration: &JoinDeclaration,
+) -> JoinRequest {
     JoinRequest {
         meeting_id: meeting_id.to_string(),
         join_token: join_token.to_string(),
         participant_name: participant_name.to_string(),
-        capabilities: None,
+        capabilities: Some(ParticipantCapabilities {
+            supported_codecs: Vec::new(),
+            supported_header_versions: declaration.header_versions.clone(),
+        }),
         correlation_id: String::new(),
         binding_token: String::new(),
         identity_public_key: sample_identity_public_key(),
-        // Story 3 join declarations: absent, the pre-story-3 wire, until
-        // MC-A's env-tests set them.
-        publish_kinds: Vec::new(),
-        receive_capability: None,
+        publish_kinds: declaration.publish_kinds.clone(),
+        receive_capability: declaration.receive_capability.clone(),
     }
 }
 
-/// Wrap [`join_request`] in the `ClientMessage` envelope — what goes on the wire.
+/// [`join_request_with`] the [`JoinDeclaration::default`] declaration.
 #[must_use]
-pub fn join_message(meeting_id: &str, join_token: &str, participant_name: &str) -> ClientMessage {
+pub fn join_request(meeting_id: &str, join_token: &str, participant_name: &str) -> JoinRequest {
+    join_request_with(
+        meeting_id,
+        join_token,
+        participant_name,
+        &JoinDeclaration::default(),
+    )
+}
+
+/// Wrap a `JoinRequest` in the `ClientMessage` envelope — what goes on the wire.
+#[must_use]
+pub fn join_message_with(
+    meeting_id: &str,
+    join_token: &str,
+    participant_name: &str,
+    declaration: &JoinDeclaration,
+) -> ClientMessage {
     ClientMessage {
-        message: Some(client_message::Message::JoinRequest(join_request(
+        message: Some(client_message::Message::JoinRequest(join_request_with(
             meeting_id,
             join_token,
             participant_name,
+            declaration,
         ))),
         trace_parent: String::new(),
         trace_state: String::new(),
     }
 }
 
-/// Send a `JoinRequest` on `session` and await the `JoinResponse`. Driving a
-/// real MC join is what makes MC fire `RegisterMeeting` to every assigned MH
-/// (R-12), the precondition for MH-side coverage.
+/// [`join_message_with`] the default declaration.
+#[must_use]
+pub fn join_message(meeting_id: &str, join_token: &str, participant_name: &str) -> ClientMessage {
+    join_message_with(
+        meeting_id,
+        join_token,
+        participant_name,
+        &JoinDeclaration::default(),
+    )
+}
+
+/// Send a `JoinRequest` carrying `declaration` and read MC's ONE reply: the
+/// `JoinResponse`, or the `Error` MC refused with (`Err`). The refusal path is
+/// for the negative cases; MC's refusal text is generic, so a caller attributes
+/// a refusal only through a positive twin that differs in one field.
 ///
-/// Panics loudly (naming `label`) on an `Error` message, a non-`JoinResponse`
-/// variant, or no reply within the bound. Only the variant NAME is printed on
-/// the unexpected-variant path, never the Debug payload, to avoid echoing
-/// PII-bearing roster fields into CI logs.
+/// # Panics
 ///
-/// # Positive control (shared-fixture failure mode)
-///
-/// This helper backs BOTH `26_mh_quic.rs` and `27_mc_slot_placement.rs`. If its
-/// setup silently yielded a shape that "join did not really happen" — no
-/// `sender_id`, no assigned handler, an empty handler url — both suites could go
-/// green for one upstream reason, and two correlated greens read as stronger
-/// evidence than one. So a wholesale-empty join is made structurally impossible
-/// to mistake for a pass: it PANICS here, naming `label`, rather than being
-/// returned as a usable-looking default.
+/// On no reply within the bound or a reply that is neither variant (only the
+/// variant NAME is printed, never the Debug payload — roster fields carry PII).
+pub async fn try_mc_join(
+    session: &mut McSession,
+    meeting_id: &str,
+    join_token: &str,
+    participant_name: &str,
+    declaration: &JoinDeclaration,
+    label: &str,
+) -> Result<JoinResponse, ErrorMessage> {
+    session
+        .write(&join_message_with(
+            meeting_id,
+            join_token,
+            participant_name,
+            declaration,
+        ))
+        .await;
+    match session
+        .try_read(JOIN_RESPONSE_BOUND)
+        .await
+        .and_then(|m| m.message)
+    {
+        Some(server_message::Message::JoinResponse(j)) => Ok(j),
+        Some(server_message::Message::Error(e)) => Err(e),
+        Some(_) => {
+            panic!("expected a JoinResponse or Error for {label}, got a different variant")
+        }
+        None => panic!("expected a JoinResponse for {label}, got no reply within the bound"),
+    }
+}
+
+/// Send the default-declaration `JoinRequest` on `session` and await the
+/// `JoinResponse`. See [`mc_join_with`].
 pub async fn mc_join(
     session: &mut McSession,
     meeting_id: &str,
@@ -265,25 +414,57 @@ pub async fn mc_join(
     participant_name: &str,
     label: &str,
 ) -> JoinResponse {
-    session
-        .write(&join_message(meeting_id, join_token, participant_name))
-        .await;
+    mc_join_with(
+        session,
+        meeting_id,
+        join_token,
+        participant_name,
+        &JoinDeclaration::default(),
+        label,
+    )
+    .await
+}
 
-    let join = match session
-        .try_read(JOIN_RESPONSE_BOUND)
-        .await
-        .and_then(|m| m.message)
-    {
-        Some(server_message::Message::JoinResponse(j)) => j,
-        Some(server_message::Message::Error(e)) => panic!(
+/// Send a `JoinRequest` carrying `declaration` on `session` and await the
+/// `JoinResponse`. Driving a real MC join is what makes MC fire
+/// `RegisterMeeting` to every assigned MH (R-12), the precondition for MH-side
+/// coverage.
+///
+/// Panics loudly (naming `label`) on an `Error` message, a non-`JoinResponse`
+/// variant, or no reply within the bound.
+///
+/// # Positive control (shared-fixture failure mode)
+///
+/// This helper backs every multi-party suite. If its setup silently yielded a
+/// shape that "join did not really happen" — no `sender_id`, no assigned
+/// handler, an empty handler url — those suites could go green for one
+/// upstream reason, and correlated greens read as stronger evidence than one.
+/// So a wholesale-empty join is made structurally impossible to mistake for a
+/// pass: it PANICS here, naming `label`, rather than being returned as a
+/// usable-looking default.
+pub async fn mc_join_with(
+    session: &mut McSession,
+    meeting_id: &str,
+    join_token: &str,
+    participant_name: &str,
+    declaration: &JoinDeclaration,
+    label: &str,
+) -> JoinResponse {
+    let join = try_mc_join(
+        session,
+        meeting_id,
+        join_token,
+        participant_name,
+        declaration,
+        label,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
             "MC refused {label}'s join: code={} message={}",
             e.code, e.message
-        ),
-        Some(_) => {
-            panic!("expected a JoinResponse for {label}, got a different ServerMessage variant")
-        }
-        None => panic!("expected a JoinResponse for {label}, got no reply within the bound"),
-    };
+        )
+    });
 
     assert!(
         join.sender_id.is_some(),
@@ -432,4 +613,59 @@ pub async fn try_mh_connect_with(
         .await
         .map_err(|e| format!("{e} (MH at {url})"))?;
     Ok(MhSession { conn, send, recv })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_join_is_an_audio_publisher_on_the_current_header_version() {
+        let req = join_request("m", "t", "n");
+        assert_eq!(req.publish_kinds, vec![MediaKind::Audio as i32]);
+        assert!(
+            req.receive_capability.is_none(),
+            "absent = zero slots of each kind"
+        );
+        let caps = req.capabilities.expect("capabilities carried");
+        assert_eq!(
+            caps.supported_header_versions,
+            vec![u32::from(media_protocol::frame::PROTOCOL_VERSION)]
+        );
+        // Story 3 is v3-only; a silent change of the derivation source shows here.
+        assert_eq!(current_header_version(), 3);
+    }
+
+    #[test]
+    fn receive_capability_lists_audio_then_video_in_the_given_order() {
+        let cap = receive_capability(&[7, 300], &[513, 2, 9]);
+        let got: Vec<(u32, i32)> = cap
+            .slots
+            .iter()
+            .map(|s| (s.slot_id, s.media_kind))
+            .collect();
+        let (a, v) = (MediaKind::Audio as i32, MediaKind::VideoCamera as i32);
+        assert_eq!(got, vec![(7, a), (300, a), (513, v), (2, v), (9, v)]);
+        assert!(cap.slots.iter().all(|s| s.pinned_sender_id.is_none()));
+    }
+
+    #[test]
+    fn the_builder_carries_raw_negative_values_unchanged() {
+        let d = JoinDeclaration::default()
+            .publishing_raw(&[MediaKind::Audio as i32, MediaKind::Audio as i32, 99])
+            .receiving(&[], &[4])
+            .header_versions(&[2]);
+        let req = join_request_with("m", "t", "n", &d);
+        assert_eq!(
+            req.publish_kinds,
+            vec![MediaKind::Audio as i32, MediaKind::Audio as i32, 99]
+        );
+        assert_eq!(req.capabilities.unwrap().supported_header_versions, vec![2]);
+        assert_eq!(req.receive_capability.unwrap().slots.len(), 1);
+        let none = join_request_with("m", "t", "n", &JoinDeclaration::default().publishing(&[]));
+        assert!(
+            none.publish_kinds.is_empty(),
+            "receive-only is an EMPTY set"
+        );
+    }
 }

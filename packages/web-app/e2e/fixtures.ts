@@ -15,7 +15,7 @@
 //   - Playwright artifacts (traces) DO contain this synthetic traffic — they are
 //     gitignored and must never leave the workstation (see e2e/README.md).
 
-import { expect, test } from 'playwright/test';
+import { expect } from 'playwright/test';
 import type { Browser, BrowserContext, Page, Request, Response } from 'playwright/test';
 // Resolved to sdk-core SOURCE via this package's tsconfig `paths` (Playwright
 // honors tsconfig path mapping), keeping GC's R-53 camelCase wire mapping
@@ -1301,7 +1301,8 @@ export async function latestBusEventsOf<T extends string>(
 /**
  * Assert this participant's build declares the suite's N audio slots
  * (`SUITE_AUDIO_RECEIVE_SLOTS`) and M video slots (`SUITE_VIDEO_RECEIVE_SLOTS`),
- * and that MC's advertised audio cap admits N — the runtime check
+ * and that MC advertised BOTH per-kind caps and each admits its count (audio
+ * cap >= N, video cap >= M; `unknown` fails for either kind) — the runtime check
  * `src/lib/config.ts` defers to the suite. `playwright.config.ts` derives the
  * dev server's `VITE_DT_AUDIO_RECEIVE_SLOTS` / `VITE_DT_VIDEO_RECEIVE_SLOTS`
  * from these, but with `reuseExistingServer` a server started elsewhere (e.g.
@@ -1342,26 +1343,28 @@ export async function expectDeclaredReceiveSlots(
     `${label}: the build declares M=${String(video?.['declared'])} video slots, the scenario ` +
       `needs M=${expectedVideoSlots} (SUITE_VIDEO_RECEIVE_SLOTS). ${restart}`,
   ).toBe(expectedVideoSlots);
-  // TRANSITIONAL (C-A1) — deleted by MC-A (story 3 task 12), the first task
-  // whose gate can assert the per-kind caps (it is the first controller to send
-  // them); MC-A restores `unknown` as a failure here. The controller in service
-  // before MC-A sends no per-kind caps and the SDK no longer reads the superseded
-  // total, so the cap is UNKNOWN at C-A1's gate only. Recorded on the test AND in
-  // the gate log, never silently.
-  if (audio?.['serverCapState'] === 'unknown') {
-    const note = `${label}: MC sent no per-kind receive-slot caps (pre-MC-A controller)`;
-    console.warn(`[e2e transitional C-A1] ${note}`);
-    test.info().annotations.push({ type: 'transitional', description: note });
-    return;
+  // BOTH caps, the same rule per kind. MC always sends both
+  // (`JoinResponse.max_audio_receive_slots` / `max_video_receive_slots`), so
+  // `unknown` is a failure for either kind: an MC that stopped sending one. A
+  // video cap of 0 is LEGAL (the R-26 lever) and reads `known`, never `unknown`
+  // (`classifySlotCap`); with the suite's M=0 the video bound is trivially met,
+  // and `known` is what proves the field arrived.
+  const caps = [
+    { kind: 'audio', slots: audio, needed: expectedSlots, key: 'MC_MAX_AUDIO_RECEIVE_SLOTS' },
+    { kind: 'video', slots: video, needed: expectedVideoSlots, key: 'MC_MAX_VIDEO_RECEIVE_SLOTS' },
+  ] as const;
+  for (const { kind, slots: k, needed, key } of caps) {
+    expect(
+      k?.['serverCapState'],
+      `${label}: MC's ${kind} cap is ${String(k?.['serverCapState'])} on the bus, expected ` +
+        `known — MC sent no ${kind} receive-slot cap in its JoinResponse`,
+    ).toBe('known');
+    expect(
+      k?.['serverCap'],
+      `${label}: MC's ${kind} cap (${key}) is below the scenario's ${kind} slot count ` +
+        `${needed}; the excess slots would read unavailable`,
+    ).toBeGreaterThanOrEqual(needed);
   }
-  expect(audio?.['serverCapState'], `${label}: MC's audio cap is malformed on the bus`).toBe(
-    'known',
-  );
-  expect(
-    audio?.['serverCap'],
-    `${label}: MC's audio cap (MC_MAX_AUDIO_RECEIVE_SLOTS) is below the scenario's ` +
-      `N=${expectedSlots}; the excess slots would read unavailable`,
-  ).toBeGreaterThanOrEqual(expectedSlots);
 }
 
 /**

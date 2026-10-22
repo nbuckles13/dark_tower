@@ -32,9 +32,7 @@ export interface DemoConfig {
    *
    * REQUESTS bounded by MC's per-kind caps (`MC_MAX_AUDIO_RECEIVE_SLOTS`,
    * `MC_MAX_VIDEO_RECEIVE_SLOTS`): MC TRUNCATES an over-cap declaration and the
-   * excess slots render `unavailable` — never a refusal here. (Until MC-A, the
-   * controller in service caps the TOTAL at the retired `MC_MAX_RECEIVE_SLOTS`
-   * and rejects over it whole.)
+   * excess slots render `unavailable` — never a refusal here.
    *
    * BROWSER-SIDE BUILD KNOBS, NOT COVERED BY `dt-guard env-config` (which reads
    * `infra/services/**` only). The browser suite asserts the effective values at

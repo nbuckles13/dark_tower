@@ -117,6 +117,36 @@ pub enum McError {
     #[error("Identity key rejected")]
     IdentityKeyInvalid,
 
+    /// The join's `supported_header_versions` lacks the current
+    /// `media_protocol::frame::PROTOCOL_VERSION` (story 3 R-22: v3 is the only
+    /// version; no allowlist, no floor). The counted signal for "old SDK meets
+    /// new MC". Generic to the client: no version is echoed.
+    #[error("Header version unsupported")]
+    HeaderVersionUnsupported,
+
+    /// `JoinRequest.publish_kinds` named an unserved kind (`UNSPECIFIED`,
+    /// `VIDEO_SCREEN`, an unknown value) or a duplicate (story 3 R-2).
+    /// Rejected, never ignored.
+    #[error("Publish kinds rejected")]
+    PublishKindInvalid,
+
+    /// The join-carried `receive_capability` failed the same parse as the
+    /// post-join path. The specific cause is counted on
+    /// `mc_media_receive_capability_declarations_total` (it rides here so ONE
+    /// value feeds both counters); the join series counts the class.
+    #[error("Receive capability rejected")]
+    ReceiveCapabilityInvalid(crate::media_signaling::CapabilityOutcome),
+
+    /// The join would neither publish nor receive: no publish kinds AND zero
+    /// slots in the declaration AS SENT (before truncation; story 3 R-2).
+    #[error("Join would neither publish nor receive")]
+    PublishesAndReceivesNothing,
+
+    /// A reconnect presented a publish set different from the membership's
+    /// (story 3 R-2). Refused, never adopted; the roster entry is untouched.
+    #[error("Reconnect publish set mismatch")]
+    ReconnectPublishSetMismatch,
+
     /// A media-policy push did not confirm (ADR-0036 §8).
     ///
     /// The handler's reply did not prove that MC's forwarding policy is live:
@@ -211,7 +241,12 @@ impl McError {
             McError::MeetingNotFound(_) | McError::ParticipantNotFound(_) => 4, // NOT_FOUND
             McError::Conflict(_) => 5,                                   // CONFLICT
             McError::MeetingTeardownInProgress => 5,                     // CONFLICT (see variant)
-            McError::IdentityKeyInvalid => 1,                            // INVALID_REQUEST
+            McError::IdentityKeyInvalid
+            | McError::HeaderVersionUnsupported
+            | McError::PublishKindInvalid
+            | McError::ReceiveCapabilityInvalid(_)
+            | McError::PublishesAndReceivesNothing
+            | McError::ReconnectPublishSetMismatch => 1, // INVALID_REQUEST
             McError::MeetingCapacityExceeded(_)
             | McError::McCapacityExceeded
             | McError::Draining
@@ -261,6 +296,11 @@ impl McError {
             McError::TokenAcquisition(_) => "token_acquisition",
             McError::TokenAcquisitionTimeout => "token_acquisition_timeout",
             McError::IdentityKeyInvalid => "identity_key_invalid",
+            McError::HeaderVersionUnsupported => "header_version_unsupported",
+            McError::PublishKindInvalid => "publish_kind_invalid",
+            McError::ReceiveCapabilityInvalid(_) => "receive_capability_invalid",
+            McError::PublishesAndReceivesNothing => "publishes_and_receives_nothing",
+            McError::ReconnectPublishSetMismatch => "reconnect_publish_set_mismatch",
             McError::MediaPolicyDivergence { .. } => "media_policy_divergence",
         }
     }
@@ -293,7 +333,14 @@ impl McError {
             }
             // Generic by construction: no length, no cause, nothing the caller
             // could use to probe which validation failed.
-            McError::IdentityKeyInvalid => "Invalid join request".to_string(),
+            // Generic by construction (story 3 R-2): one message for every
+            // media-declaration refusal, naming no kind and no check.
+            McError::IdentityKeyInvalid
+            | McError::HeaderVersionUnsupported
+            | McError::PublishKindInvalid
+            | McError::ReceiveCapabilityInvalid(_)
+            | McError::PublishesAndReceivesNothing
+            | McError::ReconnectPublishSetMismatch => "Invalid join request".to_string(),
             McError::MeetingCapacityExceeded(_) => "Meeting is at capacity".to_string(),
         }
     }

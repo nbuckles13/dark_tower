@@ -6,14 +6,21 @@
 //! - **Wiring.** Every key in [`WIRED_KEYS`] is a HARD `configMapKeyRef`, with
 //!   `key` == env name, to the ONE live generation of its base that this pod
 //!   is wired to — `mc-service-config` for MC-only knobs (the per-kind slot
-//!   caps, including the R-26 video-off lever), `media-codec-profile` for the
-//!   nine shared encoding keys. Per workload, never union: a key on mc-0
-//!   missing from mc-1 crash-loops mc-1 alone once MC-A requires it.
+//!   caps, including the R-26 video-off lever, and the minimum keyframe
+//!   interval `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`, MC-only since story 3
+//!   amendment 4), `media-codec-profile` for the eight shared encoding keys.
+//!   Per workload, never union: a key on mc-0 missing from mc-1 crash-loops
+//!   mc-1 alone, because MC-A reads every one as REQUIRED.
 //! - **Retirement step 1.** Every key in [`RETIRING_KEYS`] is an
 //!   `optional: true` ref AND the key is STILL present and parseable in the
-//!   live generation — the current MC image still reads all four as REQUIRED,
-//!   and under an optional ref an absent key is a silently unset variable that
-//!   image refuses to boot on.
+//!   live generation. The current MC image (MC-A) no longer reads them; the
+//!   PREVIOUS image — the rollback target until the retirement's step 2 —
+//!   still reads all four as REQUIRED, and under an optional ref an absent key
+//!   is a silently unset variable that image refuses to boot on.
+//! - **Moved key absent.** `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS` (the
+//!   interval's pre-amendment-4 name and home) is absent from the live profile
+//!   generation and from every MC container's env: the ONE home for that
+//!   absence (`01_mh_deployment_config.rs` points here).
 //! - **Parse.** Every resolved value has the SHAPE its reader accepts (shape
 //!   only — bounds stay with the readers; no deployed number is restated here).
 //! - **One profile generation.** mc-0, mc-1, mh-0 and mh-1 all resolve the SAME
@@ -27,9 +34,14 @@
 //! # Honest limitation
 //!
 //! The pod spec as stored by the API server is the strongest reading available
-//! (the image is distroless; no exec). The current MC image ignores the new
-//! keys, so nothing here proves a process LOADED them; MC-A's published caps
-//! (`mc_media_receive_slot_cap{media_kind}`) are where that parity lands.
+//! (the image is distroless; no exec). What the running PROCESS loaded is read
+//! from the static gauges MC publishes at startup from the SAME parsed values
+//! it enforces and directs ([`CONFIG_GAUGES`]): the per-kind receive-slot caps
+//! (`mc_media_receive_slot_cap{media_kind}`, so a video cap of 0 is how an
+//! operator confirms the R-26 lever) and the minimum keyframe interval
+//! (`mc_media_video_keyframe_min_interval_seconds`). As in 01(c), a gauge
+//! cannot prove WIRING on its own (a literal `value:` equal to the ConfigMap
+//! would also match); the `configMapKeyRef` checks above are what prove that.
 //!
 //! # Diagnostic output policy (PII)
 //!
@@ -40,9 +52,13 @@
 #![cfg(feature = "smoke")]
 
 use env_tests::fixtures::deployment_config::{
-    check_key_ref, check_shape, cm_value, fetch_configmap, fetch_live_pod, RefKind, ValueShape,
+    check_key_ref, check_shape, cm_value, container, fetch_configmap, fetch_live_pod, parse_u64,
+    pod_name_of, RefKind, ValueShape,
 };
-use env_tests::fixtures::kube::{configmap_name_for, configmap_name_for_all, PROFILE_CONFIGMAP};
+use env_tests::fixtures::kube::{
+    configmap_name_for, configmap_name_for_all, PROFILE_CONFIGMAP, REDEPLOY_HINT,
+};
+use env_tests::fixtures::mh_config::{gauge_verdict, Conversion, GaugeVerdict};
 
 const CONTAINER: &str = "mc-service";
 const MC_INSTANCES: &[&str] = &["mc-0", "mc-1"];
@@ -70,7 +86,14 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
         MC_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
-    // Shared media codec profile: all nine keys MC directs from.
+    // MC-only since story 3 amendment 4 (was the profile's
+    // MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS); carried on every video directive.
+    (
+        "MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
+        MC_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    // Shared media codec profile: all eight keys MC directs from.
     ("MEDIA_VIDEO_CODEC", PROFILE_CONFIGMAP, ValueShape::Token),
     (
         "MEDIA_VIDEO_WIDTH",
@@ -89,11 +112,6 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
     ),
     (
         "MEDIA_VIDEO_MAX_BITRATE_BPS",
-        PROFILE_CONFIGMAP,
-        ValueShape::PositiveInteger,
-    ),
-    (
-        "MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
         PROFILE_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
@@ -118,6 +136,29 @@ const RETIRING_KEYS: &[(&str, ValueShape)] = &[
     ("MC_AUDIO_MAX_BITRATE_BPS", ValueShape::PositiveInteger),
     ("MC_AUDIO_FRAME_RATE_HZ", ValueShape::PositiveInteger),
 ];
+
+/// Keys that MOVED out of a base this file checks: absent from the named base's
+/// live generation AND from the MC container env. `(key, base it left)`.
+///
+/// Asserted absent because `dt-guard env-config` checks only that every key
+/// the code reads is declared, never that a declared key is read: a stale
+/// profile row plus a stale ref would pass it.
+const MOVED_KEYS: &[(&str, &str)] = &[("MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS", PROFILE_CONFIGMAP)];
+
+fn env_names<'a>(pod: &'a serde_json::Value, instance: &str) -> Vec<&'a str> {
+    let pod_name = pod_name_of(pod, instance);
+    container(pod, &pod_name, CONTAINER)
+        .unwrap_or_else(|e| panic!("{e}"))
+        .get("env")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.get("name").and_then(serde_json::Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 fn assert_mc_keys_wired(instance: &str) {
     let mc_cm_name = configmap_name_for(instance, MC_CONFIGMAP);
@@ -157,6 +198,35 @@ fn assert_mc_keys_wired(instance: &str) {
         )
         .unwrap_or_else(|e| panic!("{e}"));
     }
+
+    // MOVED keys. Positive control first: the env list read here holds every
+    // wired key, so an unread or empty list cannot make the absence vacuous.
+    let env = env_names(&pod, instance);
+    assert!(
+        WIRED_KEYS.iter().all(|(key, _, _)| env.contains(key)),
+        "{instance}: the env list read for the moved-key check does not hold every wired key \
+         — the absence check below would be vacuous"
+    );
+    assert!(!MOVED_KEYS.is_empty());
+    for &(key, left) in MOVED_KEYS {
+        assert!(
+            !env.contains(&key),
+            "{instance}: env {key} is still wired into the MC container, but story 3 \
+             amendment 4 moved the minimum keyframe interval to {MC_CONFIGMAP} as \
+             MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS. Remove the ref from \
+             infra/services/mc-service/{instance}-deployment.yaml."
+        );
+        let cm = if left == PROFILE_CONFIGMAP {
+            &profile_cm
+        } else {
+            &mc_cm
+        };
+        assert!(
+            cm.pointer("/data").and_then(|d| d.get(key)).is_none(),
+            "live ConfigMap {left} still holds {key}, moved to {MC_CONFIGMAP} by story 3 \
+             amendment 4. Remove it from infra/services/media-codec-profile/profile.env."
+        );
+    }
 }
 
 #[tokio::test]
@@ -178,4 +248,96 @@ async fn test_mc_and_mh_resolve_one_media_codec_profile_generation() {
         name.starts_with(&format!("{PROFILE_CONFIGMAP}-")),
         "resolved {name:?} is not a hash-suffixed generation of {PROFILE_CONFIGMAP}"
     );
+}
+
+/// How long a startup gauge may take to be scraped for a pod.
+const GAUGE_PRESENT_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `(mc-service-config key, published series selector, Conversion)` for every
+/// value the running MC process loaded and publishes from the SAME parsed
+/// field it enforces (caps) or directs (interval). ONE table.
+///
+/// The video cap may legitimately be 0 (the R-26 lever), so values are parsed
+/// as non-negative, never `positive`.
+const CONFIG_GAUGES: &[(&str, &str, Conversion)] = &[
+    (
+        "MC_MAX_AUDIO_RECEIVE_SLOTS",
+        "mc_media_receive_slot_cap{media_kind=\"audio\"}",
+        Conversion::Identity,
+    ),
+    (
+        "MC_MAX_VIDEO_RECEIVE_SLOTS",
+        "mc_media_receive_slot_cap{media_kind=\"video\"}",
+        Conversion::Identity,
+    ),
+    (
+        "MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
+        "mc_media_video_keyframe_min_interval_seconds",
+        Conversion::MsToSeconds,
+    ),
+];
+
+/// What the RUNNING MC process loaded equals its OWN ConfigMap generation, per
+/// instance, per [`CONFIG_GAUGES`] row. Three distinct outcomes, as in 01(c):
+/// no data (absent for this pod), shape (the publisher changed), mismatch (the
+/// process runs another value).
+#[tokio::test]
+async fn test_config_reported_by_running_mc_matches_configmap() {
+    use env_tests::cluster::ClusterConnection;
+    use env_tests::fixtures::metrics::poll_until_pinned_instance;
+    use env_tests::fixtures::PrometheusClient;
+    use std::time::Duration;
+
+    let cluster = ClusterConnection::new()
+        .await
+        .expect("Failed to connect to cluster - ensure port-forwards are running");
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+
+    assert!(!CONFIG_GAUGES.is_empty());
+    for instance in MC_INSTANCES {
+        let pod = fetch_live_pod(instance);
+        let pod_name = pod_name_of(&pod, instance);
+        // Pinned to THIS pod's IP: right after a roll, the terminating
+        // predecessor is still scraped and would otherwise satisfy the read.
+        let pod_ip = pod
+            .pointer("/status/podIP")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("pod {pod_name} has no status.podIP"))
+            .to_string();
+        let cm = fetch_configmap(&configmap_name_for(instance, MC_CONFIGMAP));
+        for &(key, series, conversion) in CONFIG_GAUGES {
+            let deployed = parse_u64(key, &cm_value(&cm, MC_CONFIGMAP, key), MC_CONFIGMAP)
+                .unwrap_or_else(|e| panic!("{e}"));
+            let promql = format!("max by (instance) ({series})");
+            let value = poll_until_pinned_instance(
+                &prom,
+                &promql,
+                &pod_ip,
+                GAUGE_PRESENT_BOUND,
+                Duration::from_secs(2),
+                &format!(
+                    "PRESENCE ({instance}, pod {pod_name}): MC publishes {series} at process \
+                     start, so absence is a scrape/startup problem — NOT a configuration \
+                     mismatch"
+                ),
+                "present",
+                |_| true,
+            )
+            .await;
+            match gauge_verdict(conversion, deployed, value) {
+                GaugeVerdict::Match => {}
+                GaugeVerdict::Shape => panic!(
+                    "{series} on {instance} (pod {pod_name}) is not a value its {conversion:?} \
+                     conversion can produce ({value}): the publisher's shape changed in \
+                     crates/mc-service/src/observability/metrics.rs — update CONFIG_GAUGES. \
+                     This is not a configuration mismatch."
+                ),
+                GaugeVerdict::Mismatch(expected) => panic!(
+                    "{instance} (pod {pod_name}) runs {series}={value}, but its {MC_CONFIGMAP} \
+                     generation carries {key}={deployed} ({conversion:?}: {expected}). The \
+                     process is not running the deployed value; {REDEPLOY_HINT}."
+                ),
+            }
+        }
+    }
 }

@@ -4,7 +4,8 @@
 //! One meeting of three real participants (A publishes, B and C receive),
 //! each joined through GC -> MC and connected to BOTH Kind MH pods. The
 //! forwarding policy is INJECTED on both pods with explicit `source_streams`
-//! (MC sends none until MC-A), through the shared
+//! (so the test controls the mixed declarations and the relabelling, and can
+//! give A a video slot MC would not place in this shape), through the shared
 //! `env_tests::fixtures::injection::Injection` helper, at a generation above
 //! MC's: A declares audio (send id 0, DATAGRAM) and video (send id 1,
 //! STREAM_PER_GROUP); B and C declare audio. B and C each hold one audio slot
@@ -71,7 +72,7 @@ use env_tests::fixtures::injection::{
 use env_tests::fixtures::media::{audio_datagram, AUDIO_SEND_ID, VIDEO_SEND_ID};
 use env_tests::fixtures::metrics::{paused_promql, reason_promql};
 use env_tests::fixtures::mh_grpc::{self, ReleaseOnDrop};
-use env_tests::fixtures::participant::{self, open_sessions};
+use env_tests::fixtures::participant::{self, open_sessions, AUDIO};
 use env_tests::fixtures::video::{
     key_id_sender, NoRequests, PublisherMode, UplinkLabel, VideoPublisher, VideoPublisherConfig,
     VideoTransport,
@@ -276,16 +277,16 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
     let sessions = open_sessions("ATTR", &ps, &[&x, &y]).await;
 
     // N = 2 audio slots each, ids disjoint from sender ids and video slots.
-    ps[0].declare(&[11, 12]).await;
-    ps[1].declare(&[21, 22]).await;
-    ps[2].declare(&[31, 32]).await;
+    ps[0].declare(&[11, 12], &[]).await;
+    ps[1].declare(&[21, 22], &[]).await;
+    ps[2].declare(&[31, 32], &[]).await;
     let bound = window + participant::VIEW_MARGIN;
     for (i, others) in [(0, [b, c]), (1, [a, c]), (2, [a, b])] {
         let want: BTreeSet<u32> = others.into_iter().collect();
         ps[i]
             .converge("ATTR", bound, |v, d| {
                 v.is_some_and(|v| {
-                    participant::filled_senders(v)
+                    participant::filled_senders(v, AUDIO)
                         .into_iter()
                         .collect::<BTreeSet<_>>()
                         == want
@@ -293,7 +294,7 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
             })
             .await;
     }
-    let slot = |i: usize, from: u32| ps[i].slot_for(from);
+    let slot = |i: usize, from: u32| ps[i].slot_for(from, AUDIO);
 
     // (a) INJECT the mixed registration on both pods.
     let handlers =

@@ -1360,20 +1360,20 @@ exactly this: silence, with no error on any path.
 that somebody holds you. Whether anybody is being sent TO you is a separate fact, and it has a
 client-side reading:
 
-> **Corrected 2026-10-21 (story 3 OPS-A): the table below holds until MC-A and C-A1.** From MC-A,
-> MC no longer emits `source_muted`. A muted peer's slot is `avatar_client_muted` or
+> **Corrected 2026-10-21 (story 3 OPS-A): read the table below with this note until C-A2 rewrites
+> it.** Since MC-A, MC no longer emits `source_muted` (a `source_muted` row on a current controller
+> is the SDK's legacy shim mapping, not a wire value). A muted peer's slot is `avatar_client_muted` or
 > `avatar_server_muted` (server wins when both), per kind. A video slot whose occupant publishes no
 > video is `avatar_no_video`, and a slot over a per-kind cap is `unavailable` (R-1). **All four are
 > correct behaviour**, the story-3 counterparts of row 1. Do NOT route them by row 4 ("any token MC
 > does not emit today") to an MC defect. Row 4 still applies to `unspecified` and to the
-> never-emitted `switch_pending`, `withheld_by_congestion` and `source_unreachable`. C-A1 rewrites
-> this table along with the client's slot-state vocabulary.
+> never-emitted `switch_pending`, `withheld_by_congestion` and `source_unreachable`.
 
 | `dt_client_media_receive_source_deficit_total` | slot rows' `data-slot-state` | Meaning |
 |---|---|---|
 | flat | only `source_muted` or `fewer_sources_than_slots`, **and the roster agrees** — those peers really are muted, or there really are fewer unmuted peers than slots (declaring zero slots of a kind yields no slot rows of that kind at all; MC never sends a zero-requested state, which the proto reserved 2026-10-13) | **Correct behaviour.** Silence is what the wire says. Stop. |
 | flat | `fewer_sources_than_slots` **while the roster shows unmuted peers you should hear** | Those peers are unreachable from you: you share no CONNECTED handler, so MC names them in `unreachable_sender_ids` instead of a slot. A connectivity fault — [`mc-incident-response.md` Scenario 18](mc-incident-response.md#scenario-18-a-participant-hears-only-part-of-the-roster). |
-| flat | `awaiting-assignment` on every slot, or a media error naming the slot cap | MC never assigned your slots — F18 (receive-slot cap), or MC signalling (§4.1). |
+| flat | `awaiting-assignment` on every slot | MC never assigned your slots — MC signalling (§4.1). (An over-cap slot is not this: it reads `unavailable`, F18.) |
 | flat | `unspecified`, or any token MC does not emit today | An MC defect — [`mc-incident-response.md` §Client media signalling](mc-incident-response.md#client-media-signalling--where-to-look-no-scenario-number-yet) lists which slot states are reachable. File against `meeting-controller`. |
 | flat | `active` | Inside the deficit counter's grace interval (a fresh or just-remapped assignment is not counted yet). Re-read after one export interval; still flat with nothing heard → F14. |
 | **rising** | `active` | **MC says a source is active and nothing is arriving.** This is the fault this entry is for; continue below. |
@@ -1563,18 +1563,18 @@ is inaudible to you until someone you can hear leaves.** That is the designed be
   cell per declared slot, each naming its sender). The E2E bus `receiveSlots.audio.declared` and the
   console line `[dt-media-slots] publishing [...]; declared N=... audio` show the same number. The
   server cap is `mc_media_receive_slot_cap{media_kind="audio"}`, also on the bus as
-  `receiveSlots.audio.serverCap` (absent on a controller that predates the per-kind caps).
+  `receiveSlots.audio.serverCap` (absent only on a controller that sends no per-kind cap — a fault, F18).
 - If every cell is filled and the unheard participants are the latest joiners, it is static fill.
 - If a cell says fewer sources, or an unheard participant is marked unreachable on the roster, it is
   not static fill. Unreachable (no shared handler) is
   [`mc-incident-response.md` Scenario 18](mc-incident-response.md#scenario-18-a-participant-hears-only-part-of-the-roster).
-  An over-cap N shows `unavailable` cells (or, before MC-A, hears nobody at all): F18.
+  An over-cap N shows `unavailable` cells: F18.
 
 **Fix.** Raise N, up to the cap (`VITE_DT_AUDIO_RECEIVE_SLOTS=<n> scripts/dev-web.sh`), or accept it.
 **There is no debugger for slot selection** beyond the slot grid. Speaker-based selection (story 5)
 replaces static fill.
 
-### F18 — Slots read `unavailable`, or (before MC-A) the participant hears nobody
+### F18 — Slots read `unavailable`
 
 > **Rewritten 2026-10-21 (story 3 C-A1, R-1).** Story 3 superseded "an over-cap receive declaration
 > fails loudly". The client no longer refuses an over-cap declaration and no longer counts one
@@ -1582,38 +1582,35 @@ replaces static fill.
 > favour of `VITE_DT_AUDIO_RECEIVE_SLOTS` (N) and `VITE_DT_VIDEO_RECEIVE_SLOTS` (M), and setting the
 > old name fails both `scripts/dev-web.sh` and the web app's config load, naming the two new ones.
 
-**Symptom.** Story-3 controller (MC-A and later): some cells in the slot grid read
-`unavailable` (`data-slot-state="unavailable"`) and never fill. Controller in service BEFORE MC-A:
-start audio succeeds but the participant hears nobody, and the session shows a server `error`.
+**Symptom.** Some cells in the slot grid read `unavailable` (`data-slot-state="unavailable"`) and
+never fill. Audio from the kept slots plays normally.
 
 **Why.** N and M are REQUESTS. Each kind has its own server cap (`MC_MAX_AUDIO_RECEIVE_SLOTS`,
 `MC_MAX_VIDEO_RECEIVE_SLOTS`, advertised on `JoinResponse.max_audio_receive_slots` /
-`max_video_receive_slots`). From MC-A, MC **truncates** an over-cap declaration: it keeps the
+`max_video_receive_slots`). MC **truncates** an over-cap declaration: it keeps the
 lowest ids up to the cap and reports every excess slot `unavailable`, permanently for that
 declaration — visible, never a join failure. A video cap of 0 is the video-off lever (story 3
-R-26): every video slot reads `unavailable`. **Until MC-A lands**, the controller in service still
-caps N+M at the retired TOTAL `MC_MAX_RECEIVE_SLOTS` and rejects a declaration over it **whole**
-(one silent participant); the SDK no longer pre-checks this.
-`dt_client_media_receive_source_deficit_total` reads **0** for a whole rejection (there are no
-active assignments to be silent) — do not read that as health.
+R-26): every video slot reads `unavailable`. The SDK no longer pre-checks the cap; MC is the only
+authority. Caps are read once at MC startup, so a cap change applies after the MC restart.
 
 **Discriminator.**
 - The effective values and the caps are on the E2E bus (`receiveSlots`: `publish`, and per kind
   `audio` / `video` with `declared`, `source`, `serverCapState`, `serverCap`) and in the console
   line `[dt-media-slots] publishing [...]; declared N=... audio (...), M=... video (...); server
   caps audio ..., video ...`. `source: default` means the variable was not set and the SDK default
-  applied. `serverCapState: unknown` means the controller sends no per-kind caps — the pre-MC-A
-  controller.
-- In the cluster: truncation shows on `mc_media_slot_states_total{slot_state="unavailable"}`; a
-  pre-MC-A whole rejection shows on
-  `mc_media_receive_capability_declarations_total{outcome="slot_count_over_cap"}` — see the
-  receive-capability rejection section of [`mc-incident-response.md`](mc-incident-response.md).
+  applied. `serverCapState` should read `known` for BOTH kinds (a video cap of 0 is legal and
+  reads `known`). **`serverCapState: unknown` is a FAULT**: MC always sends both per-kind caps, so
+  `unknown` means the controller stopped sending one (or a pre-story-3 controller is serving) —
+  check the MC image and its startup line's `max_audio_receive_slots` / `max_video_receive_slots`.
+- In the cluster: truncation shows on `mc_media_slot_states_total{slot_state="unavailable"}`
+  beside `mc_media_receive_slot_cap{media_kind}` — see the receive-capability section of
+  [`mc-incident-response.md`](mc-incident-response.md). (Story 2's whole-declaration rejection,
+  `slot_count_over_cap`, is retired.)
 - `scripts/dev-web.sh --check` prints both values beside both on-disk caps and a NOTICE when one
   is over its cap ("excess slots will show unavailable"), or "video disabled" for a video cap of 0.
 
 **Fix.** Accept the truncation, lower N or M, or raise the per-kind cap in the MC ConfigMap
-(`VITE_DT_AUDIO_RECEIVE_SLOTS=<n> VITE_DT_VIDEO_RECEIVE_SLOTS=<m> scripts/dev-web.sh`). Before
-MC-A, keep N+M at or below `MC_MAX_RECEIVE_SLOTS`. The browser knobs are **not** covered by
+(`VITE_DT_AUDIO_RECEIVE_SLOTS=<n> VITE_DT_VIDEO_RECEIVE_SLOTS=<m> scripts/dev-web.sh`). The browser knobs are **not** covered by
 `dt-guard env-config`; the runtime values on the bus are the check.
 
 ### F19 — Receive-source deficit rising: MC says a source is active and nothing decodes

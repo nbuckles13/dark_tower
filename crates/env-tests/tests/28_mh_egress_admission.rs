@@ -26,7 +26,7 @@
 //! Nothing here is a literal: the ceiling is read from each running MH's
 //! `mh_media_egress_stream_ceiling`, the per-subscriber slot cap from the
 //! deployed MC ConfigMap. Each participant declares `S = min(P - 1,
-//! MC_MAX_RECEIVE_SLOTS)` audio slots, and `P` is the smallest participant
+//! MC_MAX_AUDIO_RECEIVE_SLOTS)` audio slots, and `P` is the smallest participant
 //! count satisfying the pigeonhole condition of the shared-handler edge model
 //! (story 2 task 20, ADR-0036 §9): every participant connects to every handler
 //! it is offered, so every subscriber fills all `S` slots, the meeting totals
@@ -42,7 +42,7 @@
 //! `env_tests::fixtures::egress_admission`, their ONE home, because
 //! `01_mh_deployment_config.rs` bounds the Kind budget from ABOVE against the
 //! same limit. Illustration only, derived at run time and printed as the `S9:`
-//! line: with the Kind overlay's budget and `MC_MAX_RECEIVE_SLOTS` = 8 the
+//! line: with the Kind overlay's budget and `MC_MAX_AUDIO_RECEIVE_SLOTS` = 8 the
 //! ceiling is 100 and P = 26 (26 x 8 = 208 > 200) — 26 AC registrations and
 //! about 52 MH sessions, and the handler genuinely carries about 100 concurrent
 //! egress streams during this test.
@@ -101,6 +101,17 @@
 //! instance lacks headroom at PRECONDITION, that is this leak — an environment
 //! condition reported with the observed occupancy, not a GC bug and not a
 //! reason to rebuild the cluster.
+//!
+//! # Edge sum (README per-file edge-sum header rule)
+//!
+//! One fn: P participants x S audio slots, sized AT RUN TIME from the live
+//! ceiling and `MC_MAX_AUDIO_RECEIVE_SLOTS` (the `S9:` line prints it). At the
+//! recorded Kind figures (ceiling 100, cap 8) that is P = 26, S = 8: 208.
+//! DELIBERATELY past the per-handler ceiling — exceeding it is what S9 tests.
+//! INF-C sizes the Kind budget against this test (01's upper bound); this line
+//! records the load and changes none of that.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 208
 
 #![cfg(feature = "flows")]
 
@@ -234,7 +245,7 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
     // content-addressed generations the pods run (ADR-0038 §2).
     let mc_config = configmap_name_for_all(&["mc-0", "mc-1"], "mc-service-config");
     let mh_config = configmap_name_for_all(&["mh-0", "mh-1"], "mh-service-config");
-    let slot_cap = configmap_u64(&mc_config, "MC_MAX_RECEIVE_SLOTS");
+    let slot_cap = configmap_u64(&mc_config, "MC_MAX_AUDIO_RECEIVE_SLOTS");
     let (participants, slots) = size_meeting(ceiling, slot_cap);
 
     let per_meeting = configmap_u64(&mh_config, "MH_MAX_EGRESS_STREAMS_PER_MEETING");

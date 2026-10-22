@@ -22,7 +22,7 @@ use crate::media_routing::{
 use crate::media_signaling::{
     slot_state_label, CapabilityOutcome, DirectiveOutcome, MediaKindLabel, MuteOutcome,
     RefusalReplySurface, ServerMuteAction, ServerMuteOutcome, SlotViewEmission,
-    UnmuteRequestOutcome,
+    UnmuteRequestOutcome, WithdrawalReason,
 };
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -364,7 +364,14 @@ pub fn record_session_join(status: &str, error_type: Option<&str>, duration: Dur
         "status" => status.to_string()
     )
     .record(duration.as_secs_f64());
+    count_join(status, error_type);
+}
 
+/// `mc_session_joins_total{status}` and, for a failure,
+/// `mc_session_join_failures_total{error_type}` — the ONE place a join outcome
+/// is counted, shared by [`record_session_join`] and [`record_join_refusal`],
+/// so the failure breakdown always sums to the failure count by construction.
+fn count_join(status: &str, error_type: Option<&str>) {
     counter!("mc_session_joins_total",
         "status" => status.to_string()
     )
@@ -376,6 +383,24 @@ pub fn record_session_join(status: &str, error_type: Option<&str>, duration: Dur
         )
         .increment(1);
     }
+}
+
+/// Record a membership refusal decided INSIDE the meeting actor, where no
+/// session-accept timer exists: the actor-level reconnect's
+/// `reconnect_publish_set_mismatch` (story 3 R-2).
+///
+/// Counts through the same `count_join` as [`record_session_join`], so the
+/// failure breakdown still sums to the failure count — but records no
+/// join-duration sample, which would be a fabricated 0.
+///
+/// FAILURE SIDE ONLY: a successful actor-level reconnect increments nothing on
+/// `mc_session_joins_total`, so these refusals enter a failure ratio's
+/// numerator with no matching attempt in its denominator (unreachable today:
+/// the actor-level reconnect has no production caller). WHEN RECONNECT IS
+/// WIRED TO THE ACCEPT PATH, this call MUST be removed in favour of the
+/// connection's `record_session_join`, or every refusal is counted twice.
+pub fn record_join_refusal(error_type: &'static str) {
+    count_join("failure", Some(error_type));
 }
 
 // ============================================================================
@@ -599,7 +624,15 @@ pub fn record_sender_binding_response(outcome: SenderBindingOutcome) {
 /// Every rejection value is a client defect except
 /// `declaration_budget_exhausted`, which is a client looping. (The story-1
 /// `slot_id_not_planned` value is retired: since story 2 declared audio slots
-/// are the assignment's input, so no well-formed declaration can miss a plan.)
+/// are the assignment's input, so no well-formed declaration can miss a plan.
+/// The story-2 `slot_count_over_cap` value is retired by story 3 MC-A: an
+/// over-cap declaration is TRUNCATED, read on
+/// `mc_media_slot_states_total{slot_state="unavailable"}`.)
+///
+/// Also counts the JOIN-CARRIED declaration's rejections (its specific cause);
+/// the join itself is counted once more on
+/// `mc_session_join_failures_total{error_type="receive_capability_invalid"}`.
+/// Two views of one event: alert on the join series only.
 pub fn record_receive_capability(outcome: CapabilityOutcome) {
     counter!(
         "mc_media_receive_capability_declarations_total",
@@ -656,7 +689,7 @@ pub fn record_receive_capability(outcome: CapabilityOutcome) {
 /// `handler_url_unresolved`, `unknown_stream_number`,
 /// `transport_mode_unspecified`) occur before any stream exists, so a kind label
 /// would have no honest value. The per-kind split of directive activity lives on
-/// `mc_media_send_targets_total{media_kind}` (per stream) and, from MC-A, on
+/// `mc_media_send_targets_total{media_kind}` (per stream) and on
 /// `mc_media_send_directive_withdrawals_total{media_kind, reason}`.
 pub fn record_send_directive(outcome: DirectiveOutcome) {
     counter!(
@@ -675,8 +708,8 @@ pub fn record_send_directive(outcome: DirectiveOutcome) {
 ///
 /// `kind` is the DECLARED slot's kind (`DeclaredSlot::kind_label`, projected at
 /// parse), never a frame's: the subject of a slot state is the slot. Both kinds
-/// are zero-initialised at boot; `media_kind="video"` rises only once MC fills
-/// video slots (MC-A), so a video read-back must be a baseline-to-rise check.
+/// are zero-initialised at boot and both are emitted (story 3 MC-A); a video
+/// read-back is still a baseline-to-rise check.
 ///
 /// The bucketed slot-state signal ADR-0036 §11 mandates, joined to no identity:
 /// it answers *how many and how bad*, and MC's own assignment state answers
@@ -684,8 +717,13 @@ pub fn record_send_directive(outcome: DirectiveOutcome) {
 /// mapping.
 ///
 /// The `slot_state` label domain **mirrors the wire enum exhaustively** — every named
-/// `SlotState` variant, not only the ones reachable today (`active`,
-/// `source_muted`, `fewer_sources_than_slots`). A hand-picked subset needs
+/// `SlotState` variant, not only the ones MC emits (`active`,
+/// `avatar_no_video`, `avatar_client_muted`, `avatar_server_muted`,
+/// `fewer_sources_than_slots`, `unavailable`; the superseded `source_muted` is
+/// never emitted since MC-A and stays in the domain until MC-B deletes the wire
+/// value). Server-muted wins over client-muted; a video slot whose occupant
+/// publishes no video is `avatar_no_video` whatever its mutes. `unavailable`
+/// counts slots truncated by the per-kind cap. A hand-picked subset needs
 /// editing every time §7 makes `switch_pending` live, and a
 /// `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be
 /// visible rather than absent. Keeping the vocabulary identical to the wire's is
@@ -983,18 +1021,20 @@ pub fn record_policy_generation_adoption(outcome: FloorAdoption) {
 ///
 /// Metric: `mc_media_receive_slot_cap`
 /// Labels: `media_kind`, `key_custody`
-/// Cardinality: 2 (`MediaKindLabel::ALL`); only `audio` is published today
+/// Cardinality: 2 (`MediaKindLabel::ALL`), BOTH published at boot
 ///
-/// Today MC has ONE cap and publishes it as `media_kind="audio"`. The
-/// `media_kind="video"` series appears when MC-A introduces the per-kind cap
-/// (`MC_MAX_VIDEO_RECEIVE_SLOTS`); it is deliberately NOT zero-initialised
-/// before then, because a video reading of `0` is how an operator confirms the
-/// R-26 video-off lever applied, and publishing one early would be a lie.
+/// Story 3 MC-A: one cap per kind (`MC_MAX_AUDIO_RECEIVE_SLOTS`,
+/// `MC_MAX_VIDEO_RECEIVE_SLOTS`), each published from
+/// `ClientMediaConfig::max_receive_slots` — the SAME values MC truncates every
+/// declaration to and advertises as `JoinResponse.max_audio_receive_slots` /
+/// `max_video_receive_slots` — so the published, enforced and advertised caps
+/// cannot drift. `media_kind="video"` reading **0** is a real sample, and it is
+/// how an operator confirms the R-26 video-off lever applied
+/// (`docs/runbooks/mc-deployment.md` §Video-off lever).
 ///
-/// A CONFIG ECHO, not a utilisation gauge: set once at boot from
-/// `ClientMediaConfig::max_receive_slots`, the SAME field the capability parse
-/// compares a declaration against, so the published value cannot drift from the
-/// enforced one. There is no numerator to divide it by.
+/// A CONFIG ECHO, not a utilisation gauge: set once at boot. There is no
+/// numerator to divide it by; truncation is read off
+/// `mc_media_slot_states_total{slot_state="unavailable"}`.
 pub fn set_receive_slot_cap(kind: MediaKindLabel, cap: u8) {
     // `u8` by type, so the conversion is total and exact.
     let value = f64::from(cap);
@@ -1004,6 +1044,54 @@ pub fn set_receive_slot_cap(kind: MediaKindLabel, cap: u8) {
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .set(value);
+}
+
+/// Record one stream WITHDRAWAL: a delivered send directive whose `kind`
+/// stream went from non-empty to EMPTY targets (story 3 R-8).
+///
+/// Metric: `mc_media_send_directive_withdrawals_total`
+/// Labels: `media_kind`, `reason`, `key_custody`
+/// Cardinality: `MediaKindLabel::ALL` (2) x `WithdrawalReason::ALL` (2),
+/// zero-initialised as the full cross product
+///
+/// `unwatched` is emitted here (MC-A); `server_muted` by MC-B. Counted per
+/// TRANSITION, never per re-render: a re-sent directive whose stream already
+/// had empty targets does not count, and a reconnect's fresh view does not
+/// count. Counted on DELIVERY, unlike `mc_media_send_directives_total`
+/// (composition): a withdrawal whose delivery failed is visible only on
+/// `mc_media_slot_view_emissions_total{outcome="delivery_failed"}`. Read beside
+/// `mc_media_send_directives_total{outcome="emitted_empty_targets"}` so a
+/// withdrawal is never read as total media failure. No meeting, participant,
+/// sender, slot or stream identity.
+pub fn record_send_directive_withdrawal(kind: MediaKindLabel, reason: WithdrawalReason) {
+    counter!(
+        "mc_media_send_directive_withdrawals_total",
+        MEDIA_KIND_LABEL => kind.label(),
+        "reason" => reason.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Publish the minimum keyframe interval MC directs on every video stream, in
+/// SECONDS (story 3 R-23).
+///
+/// Metric: `mc_media_video_keyframe_min_interval_seconds`
+/// Labels: `key_custody`
+/// Cardinality: 1
+///
+/// Set once at boot from the SAME validated `VideoEncoding` value the video
+/// directive carries as `min_keyframe_interval_ms`
+/// (`MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS` / 1000), so the published and directed
+/// values cannot drift. The keyframe-storm alert reads it as a server-side
+/// bound (never a client-reported value). This is CONFIGURATION, not GoP or
+/// frame timing: no keyframe timing ever appears in MC logs or labels.
+pub fn set_video_keyframe_min_interval(min_keyframe_interval_ms: u32) {
+    gauge!(
+        "mc_media_video_keyframe_min_interval_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(f64::from(min_keyframe_interval_ms) / 1000.0);
 }
 
 /// Record the disposition of one client `MuteRequest` FOR ONE NAMED KIND.
@@ -1019,9 +1107,10 @@ pub fn set_receive_slot_cap(kind: MediaKindLabel, cap: u8) {
 /// kind. `unchanged` ALSO comes per kind from an applied request: the kind whose
 /// flag did not move (the actor was hopped for the other kind). So `unchanged`
 /// means "this kind's state did not move", not "a pure no-op repeat". The
-/// success outcomes are derived per kind (`applied` only for an audio
-/// flag that moved on a declared connection — video never recomposes the slot
-/// view, so video's success is `applied_no_recompose`). Which kinds a request
+/// success outcome is per kind: `applied` for a flag of EITHER kind that moved
+/// (story 3 MC-A: the actor recomposes for both kinds). `applied_no_recompose`
+/// is unreachable since MC-A (every connection is declared from its join) and
+/// stays zero-initialised until MC-B reshapes per-kind mute. Which kinds a request
 /// names is `named_kinds` in `webtransport/connection.rs`: INTERIM, while P1's
 /// shim reads an absent field as `false`, every request names BOTH kinds, so
 /// the per-outcome rate is about double the pre-story-3 per-request rate. That
@@ -1039,9 +1128,9 @@ pub fn set_receive_slot_cap(kind: MediaKindLabel, cap: u8) {
 /// The success set is `{applied, applied_no_recompose}`. **`unchanged` is not a
 /// failure** — this kind did not move, whether from an identical repeat (no
 /// work) or as the unmoved kind of an applied request — and it is
-/// client-inflatable via the repeat source, so never a denominator; and
-/// `applied_no_recompose` is likewise routine, being what an ordinary camera
-/// button produces. So the failure predicate is
+/// client-inflatable via the repeat source, so never a denominator. An
+/// ordinary camera button is `{media_kind="video", outcome="applied"}` plus
+/// `unchanged` on audio. So the failure predicate is
 /// `outcome=~"rate_limited|actor_unavailable"`, NOT `outcome!="applied"`.
 ///
 /// **`rate_limited` is not by itself an incident.** A human never reaches the
@@ -1164,11 +1253,10 @@ pub fn record_refusal_reply_suppressed(surface: RefusalReplySurface) {
 ///
 /// A participant server-muted on both kinds is one source per kind, so it reads
 /// `1` on each series. `sum(mc_media_server_muted_sources)` across kinds is
-/// therefore NOT "participants muted". **`{media_kind="audio"}` is TODAY's
-/// reading comparable with MH's `server_muted` drops**: `reconcile_media` tells
-/// MH only the audio-server-muted senders, so a video-only server mute raises
-/// the `video` series while MH drops nothing. It becomes the sum across kinds
-/// when MC-A adds per-stream DROP_AT_INGRESS dispositions for video.
+/// therefore NOT "participants muted". Each kind's server mute reaches MH as
+/// that kind's stream `DROP_AT_INGRESS` in `source_streams` (story 3 MC-A), so
+/// the sum across kinds is the reading comparable with MH's `server_muted`
+/// drops.
 ///
 /// A STATE level, not an event rate: a mute applied yesterday is still here.
 /// Recomputed and `set` from live state (the meeting-actor census), never
@@ -1965,6 +2053,11 @@ const JOIN_FAILURE_ERROR_TYPES: &[&str] = &[
     "conflict",
     "teardown_in_progress",
     "draining",
+    "header_version_unsupported",
+    "publish_kind_invalid",
+    "receive_capability_invalid",
+    "publishes_and_receives_nothing",
+    "reconnect_publish_set_mismatch",
 ];
 /// `mc_jwt_validations_total{result, token_type, failure_reason}` — token types.
 const JWT_TOKEN_TYPES: &[&str] = &["meeting", "guest", "service"];
@@ -2073,6 +2166,12 @@ pub fn zero_initialize_counters() {
     }
     for o in DirectiveOutcome::ALL {
         counter!("mc_media_send_directives_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    // The FULL kind x reason cross product (`server_muted` is emitted by MC-B).
+    for k in MediaKindLabel::ALL {
+        for r in WithdrawalReason::ALL {
+            counter!("mc_media_send_directive_withdrawals_total", MEDIA_KIND_LABEL => k.label(), "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+        }
     }
     for k in MediaKindLabel::ALL {
         for o in MuteOutcome::ALL {
@@ -2309,7 +2408,38 @@ mod tests {
             present_at_zero(&format!(
                 r#"mc_media_server_mute_requests_total{{action="mute",outcome="unknown_target",media_kind="{k}",key_custody="operator"}}"#
             ));
+            for r in WithdrawalReason::ALL {
+                present_at_zero(&format!(
+                    r#"mc_media_send_directive_withdrawals_total{{media_kind="{k}",reason="{}",key_custody="operator"}}"#,
+                    r.label()
+                ));
+            }
         }
+        // Story 3 MC-A join refusals and capability outcomes.
+        for e in [
+            "header_version_unsupported",
+            "publish_kind_invalid",
+            "receive_capability_invalid",
+            "publishes_and_receives_nothing",
+            "reconnect_publish_set_mismatch",
+        ] {
+            present_at_zero(&format!(
+                r#"mc_session_join_failures_total{{error_type="{e}"}}"#
+            ));
+        }
+        for o in [
+            CapabilityOutcome::MediaKindUnsupported,
+            CapabilityOutcome::WouldPublishAndReceiveNothing,
+        ] {
+            present_at_zero(&format!(
+                r#"mc_media_receive_capability_declarations_total{{outcome="{}",key_custody="operator"}}"#,
+                o.label()
+            ));
+        }
+        assert!(
+            !rendered.contains("slot_count_over_cap"),
+            "the retired slot_count_over_cap outcome must not be zero-initialised"
+        );
 
         // Series-count ceiling (security): a future enum variant can't silently
         // multiply the cross-product unnoticed. Count zero-init'd `_total` lines.
@@ -2414,6 +2544,11 @@ mod tests {
             McError::TokenAcquisition(String::new()),
             McError::TokenAcquisitionTimeout,
             McError::IdentityKeyInvalid,
+            McError::HeaderVersionUnsupported,
+            McError::PublishKindInvalid,
+            McError::ReceiveCapabilityInvalid(crate::media_signaling::CapabilityOutcome::ALL[0]),
+            McError::PublishesAndReceivesNothing,
+            McError::ReconnectPublishSetMismatch,
             McError::MediaPolicyDivergence {
                 outcome: PolicyPushOutcome::ALL[0],
                 applied_generation: 0,
@@ -2424,7 +2559,7 @@ mod tests {
         // it is classified. Do NOT add a `_ =>` arm — that reopens the drift gap.
         // When you classify a new variant here, ALSO list it in `all` above and
         // bump this count; `all` is otherwise invisible to the assertion below.
-        const MCERROR_VARIANT_COUNT: usize = 23;
+        const MCERROR_VARIANT_COUNT: usize = 28;
         assert_eq!(
             all.len(),
             MCERROR_VARIANT_COUNT,
@@ -2445,6 +2580,11 @@ mod tests {
                 | McError::McCapacityExceeded
                 | McError::MeetingCapacityExceeded(_)
                 | McError::IdentityKeyInvalid
+                | McError::HeaderVersionUnsupported
+                | McError::PublishKindInvalid
+                | McError::ReceiveCapabilityInvalid(_)
+                | McError::PublishesAndReceivesNothing
+                | McError::ReconnectPublishSetMismatch
                 | McError::SessionBinding(_)
                 | McError::Conflict(_)
                 | McError::MeetingTeardownInProgress

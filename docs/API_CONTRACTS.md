@@ -175,7 +175,17 @@ enum Codec {
 `VIDEO_SCREEN`, unknown and duplicate values are rejected and counted, never
 ignored; a join that would neither publish nor receive — judged on the
 declaration as sent, before truncation — is refused generically and counted. A
-`supported_header_versions` list lacking 3 is refused at join. The normative text
+`supported_header_versions` list lacking 3 is refused at join. The initial
+`receive_capability` is validated by the same parser as a post-join
+redeclaration (a malformed one refuses the join); over-cap slots are truncated,
+never refused. MC checks, in this order, after the JWT, meeting binding and
+identity key and before admission: header version, `publish_kinds`,
+`receive_capability`, then neither-publish-nor-receive. Every refusal is
+`ERROR_CODE_INVALID_REQUEST` with the one generic message "Invalid join request";
+the cause is only on `mc_session_join_failures_total{error_type}`
+(`header_version_unsupported`, `publish_kind_invalid`,
+`receive_capability_invalid`, `publishes_and_receives_nothing`,
+`reconnect_publish_set_mismatch`). The normative text
 is on the fields in `signaling.proto`; this paragraph summarises it and the proto
 wins on any disagreement.
 
@@ -201,9 +211,9 @@ message JoinResponse {
   bytes meeting_kek = 9;                        // AES-256, exactly 32 bytes
   uint32 kek_generation = 10;                   // u16 semantics
   uint32 kek_rotation_debounce_seconds = 11;    // W (story 2); 0/absent = older MC
-  optional uint32 max_receive_slots = 12;       // SUPERSEDED -- deleted by MC-B
-  optional uint32 max_audio_receive_slots = 13; // story 3: per-kind cap, informational
-  optional uint32 max_video_receive_slots = 14; // story 3: per-kind cap, informational; 0 = video off
+  optional uint32 max_receive_slots = 12;       // SUPERSEDED -- no longer set by MC (MC-A); deleted by MC-B
+  optional uint32 max_audio_receive_slots = 13; // story 3: per-kind cap, informational; always set
+  optional uint32 max_video_receive_slots = 14; // story 3: per-kind cap, informational; always set; 0 = video off
 }
 
 message Participant {
@@ -221,7 +231,7 @@ message MediaServerInfo {
 }
 ```
 
-**`max_receive_slots` (story 2 task 13; R-1, R-23).** MC's cap on the TOTAL slot
+**`max_receive_slots` (story 2 task 13; R-1, R-23; superseded — history).** MC's cap on the TOTAL slot
 count of one `ReceiveCapability` (`MC_MAX_RECEIVE_SLOTS`), advertised so the
 client can show it and refuse an over-cap declaration before sending. The
 `JoinResponse.max_receive_slots` comment in `signaling.proto` is normative: MC
@@ -233,9 +243,12 @@ violation the client surfaces loudly, and the value is per session.
 > whole-declaration rejection are replaced by **per-kind** caps,
 > `max_audio_receive_slots` / `max_video_receive_slots`, which are
 > informational: MC **truncates** each kind to its cap and reports every excess
-> slot `SLOT_STATE_UNAVAILABLE`, never failing the join. `max_receive_slots` stays
-> on the wire, marked superseded, until MC-B deletes it. The normative rules are
-> on the three fields in `signaling.proto`.
+> slot `SLOT_STATE_UNAVAILABLE`, never failing the join. Since MC-A, MC always
+> sets tags 13 and 14 (from `MC_MAX_AUDIO_RECEIVE_SLOTS` /
+> `MC_MAX_VIDEO_RECEIVE_SLOTS`, read once at startup) and **no longer writes**
+> `max_receive_slots` (absent on the wire); the field stays in the schema, marked
+> superseded, until MC-B deletes it. `MC_MAX_RECEIVE_SLOTS` is no longer read.
+> The normative rules are on the three fields in `signaling.proto`.
 
 **`sender_id` (ADR-0036 §2).** The joiner's per-meeting numeric sender id, and the
 first half of the attribution chain. A `uint32` on the wire carrying 16-bit

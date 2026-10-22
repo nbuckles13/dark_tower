@@ -9,19 +9,19 @@
 //!
 //! | Module | Responsibility |
 //! |---|---|
-//! | [`capability`] | **parse** a client declaration into a type that cannot hold an invalid slot |
+//! | [`capability`] | **parse** a client declaration into a type that cannot hold an invalid slot, then **truncate** it per kind |
 //! | [`directive`] | what the client must **produce** (§5) — no access to mute state |
 //! | [`assignments`] | what the client will **receive** (§6) — the only mute-aware code, and the one `StreamAssignments` construction site |
 //! | [`outcome`] | the bounded telemetry vocabularies |
 //!
 //! # The causal chain, stated because it is contractual
 //!
-//! **A client that joins and never declares a receive capability is never sent
-//! a send directive or slot assignments.** The declaration is what registers the
-//! client's slot demand with the meeting actor, and the actor emits a
-//! participant's view only once it has declared. Client-side tasks must treat
-//! the declaration as the **precondition for publishing**. Recorded in
-//! `docs/TODO.md` §Media Path Obligations.
+//! **Since story 3 the JOIN carries the initial receive declaration** (absent =
+//! zero slots of each kind) and the fixed publish set, so every admitted
+//! participant is declared from its join turn: its first `SendDirective` and
+//! `StreamAssignments` are queued in that turn, behind the `JoinResponse` and
+//! the server-mute replay. A post-join `ReceiveCapability` is a REDECLARATION;
+//! one identical to the join-carried declaration is `accepted_unchanged`.
 //!
 //! # Who composes: the meeting actor, on every structural change
 //!
@@ -73,45 +73,63 @@ pub mod capability;
 pub mod directive;
 pub mod outcome;
 
+pub use crate::media_kind::PublishSet;
 pub use assignments::{
     build_stream_assignments, slot_state_label, SlotComposition, SourceMuteView,
 };
-pub use capability::{DeclaredSlot, PinnedSenderId, ReceiveCapabilityDeclaration, SlotId};
+pub use capability::{
+    publishes_and_receives_nothing, DeclaredSlot, PinnedSenderId, ReceiveCapabilityDeclaration,
+    SlotDemand, SlotId,
+};
 pub use directive::{
-    build_send_directive, AudioEncoding, AudioEncodingError, MediaStreamPolicy, StreamNumber,
-    AUDIO_BITRATE_MAX_BPS, AUDIO_BITRATE_MIN_BPS, AUDIO_FRAME_RATE_MAX_HZ,
-    AUDIO_FRAME_RATE_MH_SIZING_HZ, AUDIO_FRAME_RATE_MIN_HZ,
+    build_send_directive, parse_codec, AudioEncoding, AudioEncodingError, CodecParseError,
+    MediaStreamPolicy, StreamNumber, VideoEncoding, VideoEncodingError, AUDIO_BITRATE_MAX_BPS,
+    AUDIO_BITRATE_MIN_BPS, AUDIO_FRAME_RATE_MAX_HZ, AUDIO_FRAME_RATE_MH_SIZING_HZ,
+    AUDIO_FRAME_RATE_MIN_HZ, MIN_KEYFRAME_INTERVAL_MS_CEILING, MIN_KEYFRAME_INTERVAL_MS_FLOOR,
 };
 pub use outcome::{
     CapabilityOutcome, DirectiveOutcome, MediaKindLabel, MuteOutcome, RefusalReplySurface,
-    ServerMuteAction, ServerMuteOutcome, SlotViewEmission, UnmuteRequestOutcome,
+    ServerMuteAction, ServerMuteOutcome, SlotViewEmission, UnmuteRequestOutcome, WithdrawalReason,
 };
 
 /// The configured inputs to client-facing media signalling, as one value.
 ///
-/// Bundled rather than threaded as four scalars through the WebTransport
-/// server and connection handler: they are read together at exactly one place
-/// (the per-connection context) and a four-scalar signature is where a caller
-/// eventually transposes two `u32`s that both look like counts.
+/// Bundled rather than threaded as scalars through the WebTransport server and
+/// connection handler: read together at exactly one place (the per-connection
+/// context), and a many-scalar signature is where a caller eventually
+/// transposes two `u8`s that both look like counts.
 ///
-/// Every field is already validated — [`AudioEncoding`] cannot hold an
-/// unspecified codec, and the two bounds are range-checked at config load — so
-/// holding one of these is proof the configuration was accepted.
+/// Every field is already validated — the encodings cannot hold an
+/// unspecified codec or an out-of-band value, and the bounds are range-checked
+/// at config load — so holding one of these is proof the configuration was
+/// accepted.
+///
+/// # Read once, at startup
+///
+/// The per-kind caps are read when MC starts and never re-read: a live
+/// participant's slot vectors are NEVER re-truncated in place. A cap change —
+/// including the R-26 video-off lever (`MC_MAX_VIDEO_RECEIVE_SLOTS=0`) —
+/// applies to declarations made after the MC restart that picks it up, and
+/// that restart reconnects everyone (`docs/runbooks/mc-deployment.md`
+/// §Video-off lever).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientMediaConfig {
-    /// Maximum slots one declaration may contain (`MC_MAX_RECEIVE_SLOTS`).
+    /// Per-kind receive-slot caps, laid out by [`MediaKindLabel::index`]:
+    /// `MC_MAX_AUDIO_RECEIVE_SLOTS` (1..=64) and `MC_MAX_VIDEO_RECEIVE_SLOTS`
+    /// (0..=64; 0 disables video).
     ///
-    /// The ONE value MC enforces (`handle_receive_capability`), publishes
-    /// (`mc_media_receive_slot_cap`) and advertises to the client
-    /// (`JoinResponse.max_receive_slots`). `u8`: see `config.rs`.
-    pub max_receive_slots: u8,
+    /// THE values MC truncates every declaration to, publishes
+    /// (`mc_media_receive_slot_cap{media_kind}`) and advertises
+    /// (`JoinResponse.max_audio_receive_slots` / `max_video_receive_slots`).
+    pub max_receive_slots: [u8; 2],
     /// Maximum ACCEPTED declarations per connection
     /// (`MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`).
     pub max_receive_capability_declarations: u32,
     /// The encoding MC directs for main audio.
     pub audio_encoding: AudioEncoding,
+    /// The encoding MC directs for main video.
+    pub video_encoding: VideoEncoding,
     /// How long a participant's handler connections may take to settle before
-    /// MC routes on what it observed (`MC_MEDIA_CONNECT_SETTLE_MS`); see
-    /// `media_routing/connectivity.rs` for why the window exists.
+    /// MC routes on what it observed (`MC_MEDIA_CONNECT_SETTLE_MS`).
     pub connect_settle_window: std::time::Duration,
 }

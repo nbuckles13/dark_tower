@@ -61,7 +61,7 @@ use env_tests::fixtures::metrics::{
     gauge_by_instance_present, group_reset_promql, paused_promql, reason_promql,
 };
 use env_tests::fixtures::mh_grpc::{self, ReleaseOnDrop};
-use env_tests::fixtures::participant::{self, open_sessions};
+use env_tests::fixtures::participant::{self, open_sessions, AUDIO};
 use env_tests::fixtures::video::{
     GroupStartSource, NoRequests, PublisherEvent, PublisherMode, ReceivedStream, StreamEnd,
     SubscriberEvent, UplinkLabel, VideoPublisher, VideoPublisherConfig, VideoSubscriber,
@@ -256,16 +256,16 @@ async fn test_stream_per_group_video_forwarding() {
     let (a, b, c) = (ps[0].sender_id(), ps[1].sender_id(), ps[2].sender_id());
     let sessions = open_sessions("VIDEO", &ps, &[&x, &y]).await;
 
-    ps[0].declare(&[11, 12]).await;
-    ps[1].declare(&[21, 22]).await;
-    ps[2].declare(&[31, 32]).await;
+    ps[0].declare(&[11, 12], &[]).await;
+    ps[1].declare(&[21, 22], &[]).await;
+    ps[2].declare(&[31, 32], &[]).await;
     let bound = window + participant::VIEW_MARGIN;
     for (i, others) in [(0, [b, c]), (1, [a, c]), (2, [a, b])] {
         let want: BTreeSet<u32> = others.into_iter().collect();
         ps[i]
             .converge("VIDEO", bound, |v, d| {
                 v.is_some_and(|v| {
-                    participant::filled_senders(v)
+                    participant::filled_senders(v, AUDIO)
                         .into_iter()
                         .collect::<BTreeSet<_>>()
                         == want
@@ -273,7 +273,7 @@ async fn test_stream_per_group_video_forwarding() {
             })
             .await;
     }
-    let slot = |i: usize, from: u32| ps[i].slot_for(from);
+    let slot = |i: usize, from: u32| ps[i].slot_for(from, AUDIO);
 
     let handlers =
         injectable_handlers(&prom, env_tests::fixtures::metrics::BASELINE_SETTLE_BOUND).await;

@@ -183,8 +183,7 @@ spec:
         # sibling base infra/services/media-codec-profile/ — its single home,
         # also read by MH. Kustomize rewrites this name to the generator's
         # hashed name in the environment-root render, so a profile edit rolls
-        # mc-0, mc-1, mh-0 and mh-1 together. HARD refs: required reads once
-        # MC-A lands; the current image ignores them.
+        # mc-0, mc-1, mh-0 and mh-1 together. HARD refs: required reads.
         - name: MEDIA_VIDEO_CODEC
           valueFrom:
             configMapKeyRef:
@@ -210,11 +209,6 @@ spec:
             configMapKeyRef:
               name: media-codec-profile
               key: MEDIA_VIDEO_MAX_BITRATE_BPS
-        - name: MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS
-          valueFrom:
-            configMapKeyRef:
-              name: media-codec-profile
-              key: MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS
         - name: MEDIA_AUDIO_CODEC
           valueFrom:
             configMapKeyRef:
@@ -230,10 +224,12 @@ spec:
             configMapKeyRef:
               name: media-codec-profile
               key: MEDIA_AUDIO_FRAME_RATE_HZ
-        # Per-kind receive-slot caps (story 3 R-1, R-26). MC-only, so they live
-        # in mc-service-config — NOT the profile — and the R-26 video-off lever
-        # (MC_MAX_VIDEO_RECEIVE_SLOTS=0) rolls MC only. HARD refs: required
-        # reads once MC-A lands; the current image ignores them.
+        # MC-only media knobs (story 3 R-1, R-26; amendment 4). They live in
+        # mc-service-config — NOT the profile — so editing any of them rolls
+        # MC only, never MH: the per-kind receive-slot caps (including the
+        # R-26 video-off lever, MC_MAX_VIDEO_RECEIVE_SLOTS=0) and the minimum
+        # keyframe interval MC directs (MH never reads it). HARD refs:
+        # required reads.
         - name: MC_MAX_AUDIO_RECEIVE_SLOTS
           valueFrom:
             configMapKeyRef:
@@ -244,6 +240,11 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: MC_MAX_VIDEO_RECEIVE_SLOTS
+        - name: MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS
         - name: MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS
           valueFrom:
             configMapKeyRef:
@@ -251,16 +252,15 @@ spec:
               key: MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS
         # RETIRED — PENDING REMOVAL: MC_MAX_RECEIVE_SLOTS (superseded by the
         # per-kind caps) and the three MC_AUDIO_* keys (superseded by
-        # MEDIA_AUDIO_* in the profile). Step 1 of the two-deploy retirement:
-        # these refs are `optional: true` and the keys stay present in
-        # mc-service-config. The current image still READS all four as
-        # required (MissingEnvVar), so the optional flag loosens nothing: a key
-        # that vanished early would still fail this image's startup loudly.
-        # Reads removed by MC-A; then nothing reads them, and a later deploy
-        # deletes keys and refs together (docs/TODO.md §Media Path
-        # Obligations, "Delete the story-3 retired config keys"). Why
-        # `optional: true` here does not contradict the "DO NOT flip them" rule
-        # is stated once, in infra/services/mh-service/mh-0-deployment.yaml at
+        # MEDIA_AUDIO_* in the profile). NOTHING READS THEM: story 3 MC-A
+        # removed the reads. Step 1 of the two-deploy retirement: these refs
+        # are `optional: true` and the keys stay present in mc-service-config
+        # for one more deploy, so a rollback to the pre-MC-A image (which
+        # reads all four as REQUIRED) still starts. A later deploy deletes
+        # keys and refs together (docs/TODO.md §Media Path Obligations,
+        # "Delete the story-3 retired config keys"). Why `optional: true`
+        # here does not contradict the "DO NOT flip them" rule is stated once,
+        # in infra/services/mh-service/mh-0-deployment.yaml at
         # MH_MEDIA_LATENCY_SAMPLE_RATIO.
         - name: MC_MAX_RECEIVE_SLOTS
           valueFrom:
