@@ -6,7 +6,7 @@
 // `media_kind="audio"` (all three hops carry the label) and nothing arrives
 // kind-less.
 //
-// Four participants (N = SUITE_RECEIVE_SLOTS = 3), every one connected to every
+// Four participants (N = SUITE_AUDIO_RECEIVE_SLOTS = 3), every one connected to every
 // handler MC offers. Each receiver, for each other sender — all 12 ordered pairs
 // — asserts all three layers at the slot MC assigned:
 //   1. the frame's key id names the expected sender at the expected slot, and no
@@ -28,7 +28,7 @@ import {
   type JoinedMember,
   type Member,
 } from './cohortContexts.js';
-import { cohortSize, SUITE_RECEIVE_SLOTS } from './cohort.js';
+import { cohortSize, SUITE_AUDIO_RECEIVE_SLOTS } from './cohort.js';
 import { bootstrapMeeting, flushTelemetry, waitForFirstMediaFrame } from './fixtures.js';
 import {
   clientCounterByInstance,
@@ -48,7 +48,7 @@ test.describe('story 2 S1: N+1 participants hear each other by content', () => {
     browser,
   }) => {
     test.setTimeout(240_000);
-    const size = cohortSize(SUITE_RECEIVE_SLOTS);
+    const size = cohortSize(SUITE_AUDIO_RECEIVE_SLOTS);
     const opened: Member[] = [];
     try {
       for (let i = 0; i < size; i += 1) opened.push(await openMember(browser, i));

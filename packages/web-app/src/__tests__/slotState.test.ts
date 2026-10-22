@@ -10,7 +10,7 @@
 //      wire state is a compile error), and this file adds the runtime half: a
 //      list of tokens that must stay in step with the union.
 //   2. DISTINCT — no two states render the same string, which is the actual
-//      requirement. Exhaustiveness alone is satisfied by mapping all eight to
+//      requirement. Exhaustiveness alone is satisfied by mapping all of them to
 //      "no audio", and that is precisely the defect.
 
 import { expect, test } from 'vitest';
@@ -24,7 +24,7 @@ import {
 
 const ALL_STATES: readonly SlotStateAttr[] = [...WIRE_TOKENS, AWAITING_ASSIGNMENT];
 
-test('the wire vocabulary is the eight states ADR-0036 §6 enumerates', () => {
+test('the wire vocabulary is the ten flat states (story 3 wire freeze; MC slot_state_label)', () => {
   // A TRIPWIRE, not the coverage mechanism. `WIRE_TOKENS` is derived from
   // `SLOT_STATE_TEXT`'s keys, and that table is `Record<SlotStateToken, string>`
   // — compiler-forced to cover the SDK union — so a ninth §6 state enters the
@@ -35,10 +35,13 @@ test('the wire vocabulary is the eight states ADR-0036 §6 enumerates', () => {
   // length check caught an unlisted addition. It did not: TypeScript does not
   // require an array to be exhaustive over a union, so a ninth token added to
   // the union and to the table but not to the list compiled clean, dropped out
-  // of every test below, and left `toHaveLength(8)` passing — the expectation
+  // of every test below, and left the length check passing — the expectation
   // was written from belief rather than derived from the artifact.
-  expect(WIRE_TOKENS).toHaveLength(8);
-  expect(new Set(WIRE_TOKENS).size).toBe(8);
+  expect(WIRE_TOKENS).toHaveLength(10);
+  expect(new Set(WIRE_TOKENS).size).toBe(10);
+  // The retired story-2 tokens are gone from the vocabulary.
+  expect(WIRE_TOKENS).not.toContain('source_muted' as never);
+  expect(WIRE_TOKENS).not.toContain('zero_requested' as never);
 });
 
 test('every state renders non-empty text', () => {
@@ -58,8 +61,8 @@ test('no two states render the same text', () => {
 test('the three indistinguishable no-media states read differently from each other', () => {
   // Named explicitly rather than left to the distinctness sweep above: these are
   // the exact three §6 calls out, and a reader of this file should see them.
-  const congestion = slotStateText('withheld_congestion');
-  const fewer = slotStateText('fewer_sources');
+  const congestion = slotStateText('withheld_by_congestion');
+  const fewer = slotStateText('fewer_sources_than_slots');
   const unreachable = slotStateText('source_unreachable');
   expect(new Set([congestion, fewer, unreachable]).size).toBe(3);
 });

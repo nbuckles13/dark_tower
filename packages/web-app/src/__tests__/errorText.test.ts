@@ -1,7 +1,8 @@
 // File: packages/web-app/src/__tests__/errorText.test.ts
 //
-// Story 2 R-1: the over-cap refusal reaches the user as a VISIBLE error naming
-// both numbers (from the SDK) and the knobs to change (this app's vocabulary).
+// Story 3 R-2: the local "neither publishes nor receives" refusal and the
+// not-yet-supported video publish reach the user as VISIBLE errors naming this
+// app's knobs. Story 2's over-cap refusal is retired (MC truncates; story 3 R-1).
 
 import { describe, expect, it } from 'vitest';
 import { SignalingError, SignalingErrorCode } from '@darktower/sdk-core';
@@ -9,17 +10,33 @@ import { SignalingError, SignalingErrorCode } from '@darktower/sdk-core';
 import { errorText } from '../lib/errorText.js';
 
 describe('errorText', () => {
-  it('names the knobs for a receive-slot declaration over the server cap', () => {
+  it('names BOTH per-kind slot variables for the nothing-to-publish-or-receive refusal', () => {
+    const text = errorText(
+      new SignalingError(SignalingErrorCode.NothingToPublishOrReceive, 'nothing to do'),
+    );
+    expect(text).toContain('SIGNALING:');
+    expect(text).toContain('VITE_DT_AUDIO_RECEIVE_SLOTS');
+    expect(text).toContain('VITE_DT_VIDEO_RECEIVE_SLOTS');
+  });
+
+  it('explains a not-yet-supported publish kind', () => {
     const text = errorText(
       new SignalingError(
-        SignalingErrorCode.ReceiveSlotsOverCap,
-        'this client is configured to receive 5 audio slots, but the meeting controller allows at most 4',
+        SignalingErrorCode.PublishKindNotSupported,
+        'publishing video is not yet supported by this client',
       ),
     );
-    expect(text).toContain('5');
-    expect(text).toContain('4');
-    expect(text).toContain('VITE_DT_RECEIVE_SLOTS');
-    expect(text).toContain('MC_MAX_RECEIVE_SLOTS');
+    expect(text).toContain('not yet supported');
+    expect(text).toContain('audio only');
+  });
+
+  it('never names the retired variable', () => {
+    for (const code of [
+      SignalingErrorCode.NothingToPublishOrReceive,
+      SignalingErrorCode.PublishKindNotSupported,
+    ]) {
+      expect(errorText(new SignalingError(code, 'x'))).not.toContain('VITE_DT_RECEIVE_SLOTS');
+    }
   });
 
   it('leaves other SDK errors in the generic form', () => {

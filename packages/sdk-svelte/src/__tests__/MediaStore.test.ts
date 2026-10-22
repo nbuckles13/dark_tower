@@ -23,6 +23,7 @@ import { MockMeetingSession } from './helpers/MockMeetingSession.js';
 function slot(overrides: Partial<StreamAssignmentEvent> = {}): StreamAssignmentEvent {
   return {
     slotId: 0,
+    mediaKind: 'audio',
     senderId: 258,
     mediaHandlerUrl: 'https://mh-0:4433',
     slotState: 'active',
@@ -47,9 +48,9 @@ test('starts unmuted with no media, no slots and no fault', () => {
 
 test('mute state mirrors the SDK snapshot in both directions', () => {
   const store = new MediaStore();
-  store.applyMuteChanged({ audioMuted: true });
+  store.applyMuteChanged({ audioMuted: true, videoMuted: false });
   expect(store.audioMuted).toBe(true);
-  store.applyMuteChanged({ audioMuted: false });
+  store.applyMuteChanged({ audioMuted: false, videoMuted: false });
   expect(store.audioMuted).toBe(false);
 });
 
@@ -156,14 +157,14 @@ test('slot state is carried through verbatim, including the muted and unreachabl
   store.applyStreamAssignments({
     unreachableSenderIds: [],
     assignments: [
-      slot({ slotId: 0, slotState: 'source_muted' }),
-      slot({ slotId: 1, slotState: 'withheld_congestion' }),
+      slot({ slotId: 0, slotState: 'avatar_client_muted' }),
+      slot({ slotId: 1, slotState: 'withheld_by_congestion' }),
       slot({ slotId: 2, slotState: 'source_unreachable' }),
     ],
   });
   expect(store.slots.map((s) => s.slotState)).toEqual([
-    'source_muted',
-    'withheld_congestion',
+    'avatar_client_muted',
+    'withheld_by_congestion',
     'source_unreachable',
   ]);
 });
@@ -184,7 +185,7 @@ test('bindMeetingSession wires all four media events into store.media', async ()
 
   await expect.element(screen.getByTestId('audio-muted')).toHaveTextContent('unmuted');
 
-  session.fire('muteChanged', { audioMuted: true });
+  session.fire('muteChanged', { audioMuted: true, videoMuted: false });
   await expect.element(screen.getByTestId('audio-muted')).toHaveTextContent('muted');
 
   session.fire('firstMediaFrame', 42);
@@ -207,13 +208,13 @@ test('unmount tears down the media subscriptions too — no leak', async () => {
   const session = new MockMeetingSession();
   const screen = await render(BoundHarness, { session });
 
-  session.fire('muteChanged', { audioMuted: true });
+  session.fire('muteChanged', { audioMuted: true, videoMuted: false });
   await expect.element(screen.getByTestId('audio-muted')).toHaveTextContent('muted');
 
   screen.unmount();
 
   expect(() => {
-    session.fire('muteChanged', { audioMuted: false });
+    session.fire('muteChanged', { audioMuted: false, videoMuted: false });
     session.fire('firstMediaFrame', 1);
     session.fire('streamAssignments', { unreachableSenderIds: [], assignments: [slot()] });
     session.fire('mediaFault', { stage: 'crypto', message: 'x', fatal: false });
@@ -236,9 +237,9 @@ test('a mute toggle does not recompute the roster projection', async () => {
   const rosterBaseline = counts.roster;
   const muteBaseline = counts.mute;
 
-  session.fire('muteChanged', { audioMuted: true });
+  session.fire('muteChanged', { audioMuted: true, videoMuted: false });
   await expect.element(screen.getByTestId('mute-text')).toHaveTextContent('muted');
-  session.fire('muteChanged', { audioMuted: false });
+  session.fire('muteChanged', { audioMuted: false, videoMuted: false });
   await expect.element(screen.getByTestId('mute-text')).toHaveTextContent('unmuted');
 
   // The property: two mute transitions, zero roster recomputations. This is
@@ -285,14 +286,27 @@ test('a roster change does not recompute the mute projection', async () => {
 test('server mutes come ONLY from participantMuteChanged, keyed by participant, replaced per change', () => {
   const store = new MediaStore();
   expect(store.serverMutes.size).toBe(0);
-  store.applyParticipantMute({ participantId: 'b', audioServerMuted: true, serverMutedBy: 'h' });
+  store.applyParticipantMute({
+    participantId: 'b',
+    audioServerMuted: true,
+    videoServerMuted: false,
+    serverMutedBy: 'h',
+  });
   const first = store.serverMutes;
   expect(first.get('b')).toEqual({ serverMutedBy: 'h' });
-  store.applyParticipantMute({ participantId: 'c', audioServerMuted: true });
+  store.applyParticipantMute({
+    participantId: 'c',
+    audioServerMuted: true,
+    videoServerMuted: false,
+  });
   // Replaced, never mutated in place: a reader holding the old map sees no change.
   expect(store.serverMutes).not.toBe(first);
   expect(first.has('c')).toBe(false);
-  store.applyParticipantMute({ participantId: 'b', audioServerMuted: false });
+  store.applyParticipantMute({
+    participantId: 'b',
+    audioServerMuted: false,
+    videoServerMuted: false,
+  });
   expect([...store.serverMutes.keys()]).toEqual(['c']);
 });
 
@@ -302,12 +316,21 @@ test('an unmute request is held only while the requester IS server-muted, and cl
   store.applyUnmuteRequested({ participantId: 'b' });
   expect(store.unmuteRequests.size).toBe(0);
 
-  store.applyParticipantMute({ participantId: 'b', audioServerMuted: true, serverMutedBy: 'h' });
+  store.applyParticipantMute({
+    participantId: 'b',
+    audioServerMuted: true,
+    videoServerMuted: false,
+    serverMutedBy: 'h',
+  });
   store.applyUnmuteRequested({ participantId: 'b' });
   expect([...store.unmuteRequests]).toEqual(['b']);
   // The request lifts NOTHING: b is still server-muted (R-10).
   expect(store.serverMutes.has('b')).toBe(true);
 
-  store.applyParticipantMute({ participantId: 'b', audioServerMuted: false });
+  store.applyParticipantMute({
+    participantId: 'b',
+    audioServerMuted: false,
+    videoServerMuted: false,
+  });
   expect(store.unmuteRequests.size).toBe(0);
 });

@@ -18,9 +18,10 @@
 //     join token is only written after a connect succeeds). A refused dial reports
 //     `failed`, exactly as an unreachable handler does — MC derives visibility
 //     from connections the handlers OBSERVE, so this is the real-world cause.
-//   * `receiveSlots` — S2's per-context N, parsed by the SDK's own strict
-//     `parseReceiveSlots`. It does not bypass MC's cap: the SDK's loud refusal
-//     above the advertised cap applies unchanged.
+//   * `audioReceiveSlots` / `videoReceiveSlots` — S2's per-context N and M (the
+//     `VITE_DT_AUDIO_RECEIVE_SLOTS` / `VITE_DT_VIDEO_RECEIVE_SLOTS` form), parsed by
+//     the SDK's own strict `parseReceiveSlots`. They do not bypass MC's caps: MC
+//     truncates an over-cap declaration exactly as for a configured one.
 //   * `forceHostControls` — renders the host server-mute affordance in a NON-host
 //     context, so the browser suite exercises MC's refusal (the authority), not a
 //     hidden button (@security M2).
@@ -36,12 +37,18 @@ import type { ParsedReceiveSlots, WebTransportConnectFn } from '@darktower/sdk-c
 /** The validated, frozen levers for this browsing context. */
 export interface TestLevers {
   readonly blockHandlers: readonly string[];
-  readonly receiveSlots: ParsedReceiveSlots | undefined;
+  readonly audioReceiveSlots: ParsedReceiveSlots | undefined;
+  readonly videoReceiveSlots: ParsedReceiveSlots | undefined;
   readonly forceHostControls: boolean;
 }
 
 /** The only keys the init-script global may carry. */
-const LEVER_KEYS: readonly string[] = ['blockHandlers', 'receiveSlots', 'forceHostControls'];
+const LEVER_KEYS: readonly string[] = [
+  'blockHandlers',
+  'audioReceiveSlots',
+  'videoReceiveSlots',
+  'forceHostControls',
+];
 
 /** Prefix on every lever error, so a failure names its cause. */
 const LEVER_ERROR = 'test lever:';
@@ -66,10 +73,16 @@ export function parseTestLevers(raw: unknown): TestLevers | undefined {
   if (!Array.isArray(block) || !block.every((u) => typeof u === 'string' && u !== '')) {
     throw new Error(`${LEVER_ERROR} blockHandlers must be an array of non-empty strings`);
   }
-  const slots = record['receiveSlots'];
-  if (slots !== undefined && typeof slots !== 'string') {
+  const audioSlots = record['audioReceiveSlots'];
+  if (audioSlots !== undefined && typeof audioSlots !== 'string') {
     throw new Error(
-      `${LEVER_ERROR} receiveSlots must be a string (the VITE_DT_RECEIVE_SLOTS form)`,
+      `${LEVER_ERROR} audioReceiveSlots must be a string (the VITE_DT_AUDIO_RECEIVE_SLOTS form)`,
+    );
+  }
+  const videoSlots = record['videoReceiveSlots'];
+  if (videoSlots !== undefined && typeof videoSlots !== 'string') {
+    throw new Error(
+      `${LEVER_ERROR} videoReceiveSlots must be a string (the VITE_DT_VIDEO_RECEIVE_SLOTS form)`,
     );
   }
   const force = record['forceHostControls'] ?? false;
@@ -78,7 +91,10 @@ export function parseTestLevers(raw: unknown): TestLevers | undefined {
   }
   return Object.freeze({
     blockHandlers: Object.freeze([...(block as string[])]),
-    receiveSlots: slots === undefined ? undefined : parseReceiveSlots(slots),
+    audioReceiveSlots:
+      audioSlots === undefined ? undefined : parseReceiveSlots(audioSlots, 'audio'),
+    videoReceiveSlots:
+      videoSlots === undefined ? undefined : parseReceiveSlots(videoSlots, 'video'),
     forceHostControls: force,
   });
 }

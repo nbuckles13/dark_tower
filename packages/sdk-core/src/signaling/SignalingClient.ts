@@ -36,7 +36,7 @@ import { context, SpanStatusCode, trace } from '@opentelemetry/api';
 import type { Span } from '@opentelemetry/api';
 
 import { FrameDecoder, FramingError } from '../framing/length-prefix.js';
-import { sendFramedMessage } from '../framing/sendFramed.js';
+import { encodeFramedMessage, writeFrame } from '../framing/sendFramed.js';
 import { TypedEventEmitter } from '../events/TypedEventEmitter.js';
 import { getTracer } from '../telemetry/telemetryConfig.js';
 import { capMhUrl } from '../validation/limits.js';
@@ -57,13 +57,11 @@ import {
   MhConnectionStatusSchema,
   ParticipantCapabilitiesSchema,
   ServerMessageSchema,
-  MediaKind,
   MuteRequestSchema,
   ServerMuteRequestSchema,
   UnmuteRequestSchema,
   ReceiveCapabilitySchema,
   ReceiveSlotSchema,
-  SlotState,
 } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type {
   ClientMessage,
@@ -77,8 +75,12 @@ import { takeMeetingKek, type MeetingKekSink } from './kekIntake.js';
 import { MEDIA_KEK_SOURCES } from '../media/setup/mediaMetrics.js';
 import { SUPPORTED_HEADER_VERSIONS } from '../media/frame/frameCodec.js';
 import { RosterKeyFeed } from './rosterKeyFeed.js';
+import { mediaKindToken, slotStateToken, wireMediaKind } from './slotStateMap.js';
+import { LegacySourceMutedShim, type LegacyAssignmentInput } from './legacySourceMutedShim.js';
+import { explicitMuteFields, type PerKindMuteState } from './muteRequest.js';
 import type {
   ParticipantMuteEvent,
+  PublishKind,
   UnmuteRequestedEvent,
   ReceiveSlotDeclaration,
   RosterKeySink,
@@ -215,32 +217,25 @@ function defer<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
+/** A decoded `StreamAssignment`, copied out of the protobuf graph. */
+interface WireAssignment extends LegacyAssignmentInput {
+  readonly slotId: number;
+  readonly mediaHandlerUrl: string;
+}
+
 /**
- * Wire `SlotState` -> the SDK's plain vocabulary.
- *
- * Every arm is explicit and the default is `unspecified` rather than a
- * best-guess: ADR-0036 §6 makes slot state explicit on the wire precisely
- * because absence of frames is not a signal, and a mapper that silently folded
- * an unknown state into `active` would reintroduce the ambiguity the field
- * exists to remove.
+ * The ONE builder of a `ReceiveCapability` message — used by the join-carried
+ * declaration and the post-join (re)declaration alike, so the two cannot
+ * differ in encoding. Closed wire kinds only.
  */
-function mapSlotState(state: SlotState): StreamAssignmentEvent['slotState'] {
-  switch (state) {
-    case SlotState.ACTIVE:
-      return 'active';
-    case SlotState.SOURCE_MUTED:
-      return 'source_muted';
-    case SlotState.WITHHELD_BY_CONGESTION:
-      return 'withheld_congestion';
-    case SlotState.FEWER_SOURCES_THAN_SLOTS:
-      return 'fewer_sources';
-    case SlotState.SOURCE_UNREACHABLE:
-      return 'source_unreachable';
-    case SlotState.SWITCH_PENDING:
-      return 'switch_pending';
-    default:
-      return 'unspecified';
-  }
+function receiveCapabilityMessage(
+  slots: readonly ReceiveSlotDeclaration[],
+): ReturnType<typeof create<typeof ReceiveCapabilitySchema>> {
+  return create(ReceiveCapabilitySchema, {
+    slots: slots.map((slot) =>
+      create(ReceiveSlotSchema, { slotId: slot.slotId, mediaKind: wireMediaKind(slot.mediaKind) }),
+    ),
+  });
 }
 
 const defaultLogger: SignalingLogger = {
@@ -286,6 +281,20 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   readonly #rosterKeys: RosterKeyFeed;
   /** The KEK generation MC issued. Never a metric label, never a span attribute. */
   #kekGeneration = 0;
+  /**
+   * The publish set this client joined with, copied and FROZEN at `join()`.
+   * Fixed for the membership (story 3 R-2): stored beside correlation/binding
+   * as the source a future reconnect re-sends — the SDK has no reconnect path
+   * yet, and none is invented here.
+   */
+  #publishKinds: readonly PublishKind[] | undefined;
+  /** Tail of the serialised write chain on the signalling stream. */
+  #sendTail: Promise<void> = Promise.resolve();
+  /** TRANSITIONAL (C-A1 shim b) — deleted by C-A2. See `legacySourceMutedShim.ts`. */
+  readonly #legacyShim = new LegacySourceMutedShim();
+  /** TRANSITIONAL (C-A1 shim b): the latest WIRE assignments, for re-derivation. */
+  #lastWireAssignments: readonly WireAssignment[] = [];
+  #lastUnreachable: readonly number[] = [];
 
   constructor(options: SignalingClientOptions = {}) {
     super();
@@ -324,6 +333,14 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
    */
   get bindingToken(): string | undefined {
     return this.#bindingToken;
+  }
+
+  /**
+   * The publish set this client joined with — frozen, fixed for the membership.
+   * `undefined` before `join()`.
+   */
+  get publishKinds(): readonly PublishKind[] | undefined {
+    return this.#publishKinds;
   }
 
   /**
@@ -415,6 +432,10 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         ? [...caps.supportedHeaderVersions]
         : [...SUPPORTED_HEADER_VERSIONS],
     });
+    // Copied and frozen: the caller's array cannot change what this
+    // membership publishes (story 3 R-2), and a future reconnect re-sends this.
+    const publishKinds = Object.freeze([...params.publishKinds]);
+    this.#publishKinds = publishKinds;
     const joinRequest = create(JoinRequestSchema, {
       meetingId: params.meetingId,
       joinToken: params.joinToken,
@@ -431,6 +452,11 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       ...(params.identityPublicKey !== undefined
         ? { identityPublicKey: params.identityPublicKey }
         : {}),
+      // Story 3 R-2: what this participant publishes and its INITIAL receive
+      // declaration ride the join, so MC's neither-publish-nor-receive check
+      // runs here. Closed wire kinds only.
+      publishKinds: publishKinds.map(wireMediaKind),
+      receiveCapability: receiveCapabilityMessage(params.receiveSlots),
     });
     const clientMessage = create(ClientMessageSchema, {
       message: { case: 'joinRequest', value: joinRequest },
@@ -460,7 +486,15 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     stream: WebTransportBidirectionalStream,
     clientMessage: ClientMessage,
   ): Promise<void> {
-    await sendFramedMessage(stream, ClientMessageSchema, clientMessage);
+    // Encoded (and trace-injected) NOW, under the caller's context; only the
+    // write is queued. Writes are SERIALISED: two sends in flight at once would
+    // otherwise race for the stream's single writer lock, and the loser — a
+    // best-effort mute report, say — would be lost silently.
+    const frame = encodeFramedMessage(ClientMessageSchema, clientMessage);
+    const write = this.#sendTail.then(() => writeFrame(stream, frame));
+    // The chain continues past a failed write; the failure is the caller's.
+    this.#sendTail = write.catch(() => undefined);
+    await write;
   }
 
   /**
@@ -571,8 +605,11 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           // `optional uint32` → `number | undefined`. Absence is passed
           // through, never coerced to 0 (ADR-0036 §2: 0 is reserved-invalid).
           senderId: jr.senderId,
-          // `optional uint32`: absent stays absent, a present 0 stays 0.
-          maxReceiveSlots: jr.maxReceiveSlots,
+          // `optional uint32`: absent stays absent (caps unknown), a present 0
+          // stays 0 (legal; video 0 is the video-off lever). Tag 12
+          // (`max_receive_slots`) is superseded and no longer read.
+          maxAudioReceiveSlots: jr.maxAudioReceiveSlots,
+          maxVideoReceiveSlots: jr.maxVideoReceiveSlots,
           existingParticipants: jr.existingParticipants.map((p) => ({
             participantId: p.participantId,
             name: p.name,
@@ -602,6 +639,8 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       }
       case 'participantLeft': {
         const pl = message.value;
+        // TRANSITIONAL (C-A1 shim b): forget the leaver's mute flags.
+        this.#legacyShim.forget(this.#rosterKeys.senderIdOf(pl.participantId));
         // Forgets the leaver's roster key — a second cutoff beside the slot gate.
         this.#rosterKeys.left(pl.participantId);
         this.emit('participantLeft', {
@@ -614,12 +653,8 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         const directive = message.value;
         const streams: SendStreamDirective[] = directive.streams.map((s) => ({
           streamNumber: s.streamNumber,
-          mediaKind:
-            s.mediaKind === MediaKind.AUDIO
-              ? 'audio'
-              : s.mediaKind === MediaKind.VIDEO_CAMERA || s.mediaKind === MediaKind.VIDEO_SCREEN
-                ? 'video'
-                : 'other',
+          // The one wire -> public kind map; `unknown` is never sent (fail closed).
+          mediaKind: mediaKindToken(s.mediaKind),
           // Absent or zero means MC did not direct one; the SDK then applies its
           // configured default. Deliberately NOT coerced to a number here, so
           // "MC said nothing" stays distinguishable from "MC said 0".
@@ -631,23 +666,21 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         return;
       }
       case 'streamAssignments': {
-        const assignments: StreamAssignmentEvent[] = message.value.assignments.map((a) => ({
+        // Copied out of the decoded message rather than aliased, so nothing
+        // downstream holds a reference into the protobuf object graph.
+        this.#lastWireAssignments = message.value.assignments.map((a) => ({
           slotId: a.slotId,
           // `optional uint32` -> `number | undefined`. Absence is passed through
           // and NEVER coerced to 0: 0 is a reserved-invalid sender id.
           senderId: a.senderId,
+          mediaKind: mediaKindToken(a.mediaKind),
           mediaHandlerUrl: a.mediaHandlerUrl,
-          slotState: mapSlotState(a.slotState),
+          slotState: a.slotState,
         }));
-        const event: StreamAssignmentsEvent = {
-          assignments,
-          // Copied out of the decoded message rather than aliased, so nothing
-          // downstream holds a reference into the protobuf object graph. The
-          // client MARKS these roster entries distinctly (`signaling.proto`) —
-          // never a spinner, never an empty slot, never inferred from silence.
-          unreachableSenderIds: [...message.value.unreachableSenderIds],
-        };
-        this.emit('streamAssignments', event);
+        // The client MARKS these roster entries distinctly (`signaling.proto`) —
+        // never a spinner, never an empty slot, never inferred from silence.
+        this.#lastUnreachable = [...message.value.unreachableSenderIds];
+        this.#emitAssignments();
         return;
       }
       case 'meetingKekUpdate': {
@@ -665,20 +698,36 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         return;
       }
       case 'participantMuteUpdate': {
-        // SERVER mute only (see `ParticipantMuteEvent`); the self-mute snapshot
-        // booleans are informational and deliberately dropped here. Ids are
-        // MC-relayed: bounded before they leave the decode boundary.
+        // SERVER mute only, per kind (see `ParticipantMuteEvent`); the self-mute
+        // snapshot booleans are informational and deliberately dropped here.
+        // Ids are MC-relayed: bounded before they leave the decode boundary.
         // One rule for both relays: an empty id carries nothing renderable and
         // is dropped (as for `unmuteRequest` below).
         const update = message.value;
         const participantId = relayedId(update.participantId);
         if (participantId === undefined) return;
-        const serverMutedBy = update.audioServerMuted ? relayedId(update.serverMutedBy) : undefined;
+        const anyServerMuted = update.audioServerMuted || update.videoServerMuted;
+        const serverMutedBy = anyServerMuted ? relayedId(update.serverMutedBy) : undefined;
         this.emit('participantMuteChanged', {
           participantId,
           audioServerMuted: update.audioServerMuted,
+          videoServerMuted: update.videoServerMuted,
           ...(serverMutedBy !== undefined ? { serverMutedBy } : {}),
         });
+        // TRANSITIONAL (C-A1 shim b) — deleted by C-A2: a late update re-derives
+        // the legacy SOURCE_MUTED slots this sender holds.
+        const senderId = this.#rosterKeys.senderIdOf(participantId);
+        if (
+          this.#legacyShim.recordMuteUpdate(
+            senderId,
+            update.audioServerMuted,
+            update.videoServerMuted,
+          ) &&
+          senderId !== undefined &&
+          LegacySourceMutedShim.holdsLegacySlot(this.#lastWireAssignments, senderId)
+        ) {
+          this.#emitAssignments();
+        }
         return;
       }
       case 'unmuteRequest': {
@@ -723,16 +772,8 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
    */
   async sendReceiveCapability(slots: readonly ReceiveSlotDeclaration[]): Promise<void> {
     const stream = this.#requireOpenStream('sendReceiveCapability');
-    const capability = create(ReceiveCapabilitySchema, {
-      slots: slots.map((slot) =>
-        create(ReceiveSlotSchema, {
-          slotId: slot.slotId,
-          mediaKind: MediaKind.AUDIO,
-        }),
-      ),
-    });
     const clientMessage = create(ClientMessageSchema, {
-      message: { case: 'receiveCapability', value: capability },
+      message: { case: 'receiveCapability', value: receiveCapabilityMessage(slots) },
     });
     await this.runInJoinContext(() => this.#sendClientMessage(stream, clientMessage));
   }
@@ -748,14 +789,18 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
    * unwatched kind withdraws it (signaling.proto `SendDirective`; ADR-0036 §5,
    * correction 2026-10-13).
    *
+   * PER KIND, BOTH KINDS EXPLICIT (story 3 R-15): `state` is this
+   * participant's CURRENT client-mute state for both kinds, so a request about
+   * one kind carries the other unchanged. See `muteRequest.ts`.
+   *
    * @throws {SignalingError} `Transport` if called before join settled or after teardown.
    */
-  async sendMuteRequest(audioMuted: boolean, videoMuted = false): Promise<void> {
+  async sendMuteRequest(state: PerKindMuteState): Promise<void> {
     const stream = this.#requireOpenStream('sendMuteRequest');
     const clientMessage = create(ClientMessageSchema, {
       message: {
         case: 'muteRequest',
-        value: create(MuteRequestSchema, { audioMuted, videoMuted }),
+        value: create(MuteRequestSchema, explicitMuteFields(state)),
       },
     });
     await this.runInJoinContext(() => this.#sendClientMessage(stream, clientMessage));
@@ -768,21 +813,22 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
    * TARGET AND ACTION ONLY. The message has no requester field, and none is
    * invented: MC identifies the requester from this authenticated connection and
    * decides authority itself. `reason` is left empty (it is client-controlled and
-   * echoed to another participant). Audio only this story, so `videoMuted` is
-   * false. A refusal arrives as a post-join `FORBIDDEN` session error, which
-   * does NOT close the connection (`errorCodeMap.closesConnection`).
+   * echoed to another participant). PER KIND, BOTH KINDS EXPLICIT (story 3
+   * R-15): `state` is the TARGET's intended server-mute state for both kinds —
+   * the changed kind's new value and the other kind's current value — built by
+   * `muteRequest.ts`. A refusal arrives as a post-join `FORBIDDEN` session
+   * error, which does NOT close the connection (`errorCodeMap.closesConnection`).
    *
    * @throws {SignalingError} `Transport` if called before join settled or after teardown.
    */
-  async sendServerMuteRequest(targetParticipantId: string, audioMuted: boolean): Promise<void> {
+  async sendServerMuteRequest(targetParticipantId: string, state: PerKindMuteState): Promise<void> {
     const stream = this.#requireOpenStream('sendServerMuteRequest');
     const clientMessage = create(ClientMessageSchema, {
       message: {
         case: 'serverMuteRequest',
         value: create(ServerMuteRequestSchema, {
           participantId: targetParticipantId,
-          audioMuted,
-          videoMuted: false,
+          ...explicitMuteFields(state),
         }),
       },
     });
@@ -807,6 +853,27 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       },
     });
     await this.runInJoinContext(() => this.#sendClientMessage(stream, clientMessage));
+  }
+
+  /**
+   * Map the latest wire assignments onto the public event and emit it. The
+   * flat tokens come from `slotStateMap.ts`; the legacy `SOURCE_MUTED` goes
+   * through TRANSITIONAL shim b (deleted by C-A2), never to `active`.
+   */
+  #emitAssignments(): void {
+    const assignments: StreamAssignmentEvent[] = this.#lastWireAssignments.map((a) => ({
+      slotId: a.slotId,
+      mediaKind: a.mediaKind,
+      senderId: a.senderId,
+      mediaHandlerUrl: a.mediaHandlerUrl,
+      // `null` only for the legacy SOURCE_MUTED: TRANSITIONAL (C-A1 shim b).
+      slotState: slotStateToken(a.slotState) ?? this.#legacyShim.resolve(a),
+    }));
+    const event: StreamAssignmentsEvent = {
+      assignments,
+      unreachableSenderIds: [...this.#lastUnreachable],
+    };
+    this.emit('streamAssignments', event);
   }
 
   #requireOpenStream(what: string): WebTransportBidirectionalStream {

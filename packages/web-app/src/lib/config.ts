@@ -6,7 +6,11 @@
 // GC is same-origin too. Telemetry is OFF unless an endpoint is configured
 // (@observability): the SDK stays on NoopMetricsSink until `configure` is called.
 
-import { parseReceiveSlots } from '@darktower/sdk-core';
+import {
+  ClientConfigError,
+  RETIRED_RECEIVE_SLOTS_MESSAGE,
+  parseReceiveSlots,
+} from '@darktower/sdk-core';
 import type { DevCertificateHash, ParsedReceiveSlots, TelemetryEnv } from '@darktower/sdk-core';
 
 /** Resolved demo configuration. */
@@ -22,22 +26,24 @@ export interface DemoConfig {
   /** Dev MC/MH cert fingerprints for WebTransport pinning (empty in prod). */
   readonly devCertHashes: readonly DevCertificateHash[];
   /**
-   * N — the audio receive slots this client declares, from
-   * `VITE_DT_RECEIVE_SLOTS`, with whether it was configured or defaulted.
+   * N and M — the audio and video receive slots this client declares, from
+   * `VITE_DT_AUDIO_RECEIVE_SLOTS` / `VITE_DT_VIDEO_RECEIVE_SLOTS`, each with
+   * whether it was configured or defaulted. Either may be 0 (story 3 R-1).
    *
-   * N IS A REQUEST bounded by MC's `MC_MAX_RECEIVE_SLOTS` (advertised on
-   * `JoinResponse.max_receive_slots`). Above the cap MC rejects the WHOLE
-   * declaration — never clamps — so the SDK refuses it loudly at `startMedia()`
-   * and the in-meeting view shows the error; nothing shrinks N to fit. Two
-   * quantities, not a duplicate: no copy of the cap exists here.
+   * REQUESTS bounded by MC's per-kind caps (`MC_MAX_AUDIO_RECEIVE_SLOTS`,
+   * `MC_MAX_VIDEO_RECEIVE_SLOTS`): MC TRUNCATES an over-cap declaration and the
+   * excess slots render `unavailable` — never a refusal here. (Until MC-A, the
+   * controller in service caps the TOTAL at the retired `MC_MAX_RECEIVE_SLOTS`
+   * and rejects over it whole.)
    *
-   * A BROWSER-SIDE BUILD KNOB, NOT COVERED BY `dt-guard env-config` (which reads
-   * `infra/services/**` only). The browser suite asserts the effective N at
+   * BROWSER-SIDE BUILD KNOBS, NOT COVERED BY `dt-guard env-config` (which reads
+   * `infra/services/**` only). The browser suite asserts the effective values at
    * runtime (the E2E bus `receiveSlots` event) instead. `scripts/dev-web.sh`
-   * always exports it (its demo topology, `DEMO_RECEIVE_SLOTS`); absent, the
-   * SDK's own default applies and is reported as `source: 'default'`.
+   * always exports both; absent, the SDK's own defaults apply and are reported as
+   * `source: 'default'`. The retired `VITE_DT_RECEIVE_SLOTS` FAILS LOUDLY if set.
    */
-  readonly receiveSlots: ParsedReceiveSlots;
+  readonly audioReceiveSlots: ParsedReceiveSlots;
+  readonly videoReceiveSlots: ParsedReceiveSlots;
 }
 
 /** Map the Vite mode string to the SDK's bounded telemetry env. */
@@ -69,11 +75,17 @@ export function loadConfig(): DemoConfig {
     value: decodeBase64(b64),
   }));
 
-  // THROWS on a present-but-malformed value (`0`, `03`, `3.0`, ` 3`, empty,
+  // The retired single-N variable FAILS LOUDLY — never an alias: one N cannot
+  // say how many of each kind the operator meant.
+  if (env.VITE_DT_RECEIVE_SLOTS !== undefined) {
+    throw new ClientConfigError('media.receive', RETIRED_RECEIVE_SLOTS_MESSAGE);
+  }
+  // THROWS on a present-but-malformed value (`03`, `3.0`, ` 3`, `-1`, empty,
   // non-numeric) — the same class `scripts/dev-web.sh` refuses — rather than
-  // falling back: a silently substituted N is a participant who hears fewer
-  // people than configured with nothing saying so.
-  const receiveSlots = parseReceiveSlots(env.VITE_DT_RECEIVE_SLOTS);
+  // falling back: a silently substituted count is a participant who hears or
+  // sees fewer people than configured with nothing saying so.
+  const audioReceiveSlots = parseReceiveSlots(env.VITE_DT_AUDIO_RECEIVE_SLOTS, 'audio');
+  const videoReceiveSlots = parseReceiveSlots(env.VITE_DT_VIDEO_RECEIVE_SLOTS, 'video');
   const telemetryEndpoint = env.VITE_TELEMETRY_ENDPOINT;
   const gcBaseUrl = env.VITE_GC_BASE_URL ?? '';
   if (telemetryEndpoint) {
@@ -84,7 +96,8 @@ export function loadConfig(): DemoConfig {
     gcBaseUrl,
     env: toTelemetryEnv(env.MODE),
     devCertHashes,
-    receiveSlots,
+    audioReceiveSlots,
+    videoReceiveSlots,
     ...(telemetryEndpoint ? { telemetryEndpoint } : {}),
   };
 }

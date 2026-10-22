@@ -1219,7 +1219,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "dt_client_media_receive_slots_rejected_total: startMedia() calls the SDK refused because the client's declared receive-slot count N (VITE_DT_RECEIVE_SLOTS) exceeds the cap MC advertised on JoinResponse.max_receive_slots (MC_MAX_RECEIVE_SLOTS). MC would reject the whole declaration, so the client refuses loudly and receives nothing. Reads zero on a correctly configured deployment. The deficit panel stays at 0 for this failure - this panel is its only signal. With an MC that predates the field, the same failure counts on MC's mc_media_receive_capability_declarations_total{outcome=\"slot_count_over_cap\"} instead. Triage: docs/runbooks/client-dev-local.md.",
+      "description": "dt_client_media_send_directive_kind_missing_total{media_kind}: a SendDirective whose NON-EMPTY streams list omitted a kind this client publishes (a protocol fault; the kind fails closed and sends nothing). dt_client_media_send_directive_header_version_refused_total: a directive whose header_version this client cannot send (v3 is the only version), refused whole. Both are zero-initialised at join and read zero forever against a conforming MC. At the story 3 C-A1 gate kind_missing reads zero only because the pre-MC-A controller's empty-streams withdrawal is read as a withdrawal (transitional shim c, deleted by C-A2). Over-cap receive slots are no longer refused by the client: MC truncates and reports the excess on mc_media_slot_states_total{slot_state=\"unavailable\"}. Catalog: docs/observability/metrics/client.md.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1228,7 +1228,7 @@
           "custom": {
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "Refusals",
+            "axisLabel": "Directives",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
@@ -1298,13 +1298,24 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum(increase(dt_client_media_receive_slots_rejected_total[$__rate_interval]))",
-          "legendFormat": "refusals",
+          "expr": "sum by(media_kind) (increase(dt_client_media_send_directive_kind_missing_total[$__rate_interval]))",
+          "legendFormat": "kind missing ({{media_kind}})",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(dt_client_media_send_directive_header_version_refused_total[$__rate_interval]))",
+          "legendFormat": "header version refused",
+          "range": true,
+          "refId": "B"
         }
       ],
-      "title": "Receive Path - Receive-Slot Refusals (N over MC cap)",
+      "title": "Send Path - Directive Faults (kind missing / header version refused)",
       "type": "timeseries"
     },
     {
@@ -1978,6 +1989,378 @@
         }
       ],
       "title": "KEK Rotations vs Generations Retained",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_capture_failures_total{media_kind, outcome}: capture that could not be acquired (permission_denied, no_device, device_unavailable, unsupported, platform_unsupported, unknown) or a track that ended on its own mid-call (ended). Lazily created - an empty panel means no failures yet, hence the or vector(0). Audio emits today; video (camera) arrives with story 3 C-A2. No device, sender or slot dimension. Catalog: docs/observability/metrics/client.md.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Failures",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 89
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(media_kind, outcome) (increase(dt_client_media_capture_failures_total[$__rate_interval])) or vector(0)",
+          "legendFormat": "{{media_kind}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Capture Failures by Kind and Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_keyframe_requests_received_total{media_kind, outcome}: MH KeyframeRequests for a published kind's directed stream, by what the publisher did (honoured, honoured_counter_ahead, stale_counter, min_interval, not_sending; malformed requests name no kind and are counted on the unattributed panel). Until story 3 C-A2 adds a video stream every request is refused not_sending and none is honoured. Not zero-initialised (no video series before video flows), hence the or vector(0). Never summed by outcome with the unattributed series. Catalog: docs/observability/metrics/client.md.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Requests",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 89
+      },
+      "id": 23,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(media_kind, outcome) (increase(dt_client_media_keyframe_requests_received_total[$__rate_interval])) or vector(0)",
+          "legendFormat": "{{media_kind}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Keyframe Requests Received by Kind and Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_keyframe_requests_unattributed_total{outcome}: MH KeyframeRequests naming no published kind's directed stream (not_sending) or undecodable on the MH control stream (malformed; a framing failure also stops that handler's control loop, media unaffected). Kind-free. Zero-initialised at join; reads zero against a conforming MH. Catalog: docs/observability/metrics/client.md.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Requests",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 97
+      },
+      "id": 24,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(outcome) (increase(dt_client_media_keyframe_requests_unattributed_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Keyframe Requests Without a Kind (unattributed / malformed)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "dt_client_media_mh_control_channel_ended_total{outcome}: a handler's MH control stream ended while the client was not tearing down - reset (MH reset it, or the connection was lost) or finished (MH finished its send half). From then on that handler's keyframe requests are never received; keyframes are event-driven with no retry, so this is the client-side evidence of video that will not recover. Read against the connection-loss signals: a connection loss also counts reset; otherwise it reads zero. Kind-free. Zero-initialised at join. Catalog: docs/observability/metrics/client.md.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Endings",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 97
+      },
+      "id": 25,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by(outcome) (increase(dt_client_media_mh_control_channel_ended_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "MH Control Channel Ended (reset / finished)",
       "type": "timeseries"
     }
   ],

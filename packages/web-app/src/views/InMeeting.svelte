@@ -297,7 +297,7 @@
   </p>
 
   <!--
-    The slot GRID: one cell per declared slot. An unfilled slot (`fewer_sources`)
+    The slot GRID: one cell per declared slot. An unfilled slot (`fewer_sources_than_slots`)
     is an EMPTY cell carrying its text — an under-filled grid, never a spinner
     (R-2). An unreachable participant takes no slot (§9); it is marked on its
     roster row instead.

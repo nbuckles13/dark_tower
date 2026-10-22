@@ -28,6 +28,7 @@ import type {
   ParticipantJoinedEvent,
   ParticipantLeftEvent,
   ParticipantMuteEvent,
+  PublishKind,
   StreamAssignmentsEvent,
   UnmuteRequestedEvent,
 } from '../signaling/events.js';
@@ -188,6 +189,21 @@ export interface MeetingSessionEventMap {
   participantMuteChanged: ParticipantMuteEvent;
   /** A server-muted participant asked the host to unmute them (host only; R-10). */
   unmuteRequested: UnmuteRequestedEvent;
+  /**
+   * A host's server UNMUTE resumed this participant's capture or send for a
+   * kind (story 3 R-18). Fires when the kind's EFFECTIVE send targets go from
+   * empty to non-empty while a server mute of that kind was recorded — in
+   * either arrival order relative to the unmute update, and even if that update
+   * is lost — and never when the participant is client-muted for that kind
+   * (nothing resumes then). A UI MUST show a non-suppressible notice for it
+   * (story 3 C-C1). Carries the kind ONLY.
+   */
+  captureResumedAfterServerMute: CaptureResumedAfterServerMuteEvent;
+}
+
+/** Payload of `captureResumedAfterServerMute`: the kind only, never an identity. */
+export interface CaptureResumedAfterServerMuteEvent {
+  readonly kind: PublishKind;
 }
 
 /** Construction options for {@link MeetingSession}. */
@@ -199,34 +215,43 @@ export interface StartMediaOptions {
 }
 
 /**
- * MC's receive-slot cap as this session learned it from `JoinResponse`
- * (`max_receive_slots`; see its proto comment, the canonical statement).
+ * MC's per-kind receive-slot cap as this session learned it from `JoinResponse`
+ * (`max_audio_receive_slots` / `max_video_receive_slots`; the proto comment is
+ * the canonical statement).
  *
- *   * `known` — MC advertised a cap. The declaration is checked against it.
- *   * `unknown` — the field was absent: an older MC (the supported rollback), or
- *     no join yet. The SDK declares and MC's whole-declaration rejection is the
- *     enforcer; nothing is inferred.
- *   * `invalid` — MC sent a PRESENT 0, a contract violation. Surfaced (here and
- *     as a console WARN) and then treated like `unknown`, never as "refuse
- *     everything".
+ *   * `known` — MC advertised a cap. 0 is LEGAL (a video cap of 0 is the
+ *     video-off lever, story 3 R-26), never folded into `unknown`.
+ *   * `unknown` — absent: an MC that does not send them, or no join yet.
+ *     Never coerced to 0, which would read as "video disabled".
+ *
+ * Informational: MC TRUNCATES an over-cap declaration (excess slots report
+ * `unavailable`), so a client never shrinks its declaration from this.
  */
 export type ReceiveSlotCap =
-  | { readonly state: 'known'; readonly value: number }
-  | { readonly state: 'unknown' }
-  | { readonly state: 'invalid'; readonly value: number };
+  { readonly state: 'known'; readonly value: number } | { readonly state: 'unknown' };
+
+/** One kind's effective receive-slot configuration. */
+export interface KindSlotsDiagnostics {
+  /** The slots of this kind this client declares. */
+  readonly declared: number;
+  /** Whether the count was configured by the embedder or is the SDK default. */
+  readonly source: ReceiveSlotsSource;
+  /** This kind's server cap, as the latest join advertised it. */
+  readonly serverCap: ReceiveSlotCap;
+}
 
 /**
- * The effective receive-slot configuration, readable at runtime (story 2 R-23):
- * "why can't I hear the sixth person" is answered by these two numbers.
- * Numbers and a bounded source token only.
+ * The effective publish set and receive-slot configuration, readable at
+ * runtime (story 2 R-23; story 3 R-23): "why can't I hear/see the sixth
+ * person" is answered by these numbers. Numbers and bounded tokens only.
  */
 export interface ReceiveSlotsDiagnostics {
-  /** N: the audio receive slots this client declares (slot ids `0..N-1`). */
-  readonly declared: number;
-  /** Whether N was configured by the embedder or is the SDK default. */
-  readonly source: ReceiveSlotsSource;
-  /** The server cap, as the latest join advertised it. */
-  readonly serverCap: ReceiveSlotCap;
+  /** What this session publishes — frozen, fixed for the membership. */
+  readonly publish: readonly PublishKind[];
+  /** N audio slots (ids `0..N-1`). */
+  readonly audio: KindSlotsDiagnostics;
+  /** M video slots (ids `N..N+M-1`). */
+  readonly video: KindSlotsDiagnostics;
 }
 
 /**
@@ -275,13 +300,22 @@ export interface MeetingSessionOptions {
   /** Playback sink factory. Defaults to `AudioContext`; injected for tests. */
   readonly playbackFactory?: PlaybackSinkFactory;
   /**
-   * N, as parsed by `parseReceiveSlots` (e.g. from `VITE_DT_RECEIVE_SLOTS`), with
-   * its source. When present it sets `mediaConfig.receive.audioSlots`; when
-   * absent N is whatever `mediaConfig` says (the SDK default unless the embedder
-   * supplied a media config). See `ReceiveConfig.audioSlots`: N is a REQUEST
-   * bounded by MC's `MC_MAX_RECEIVE_SLOTS`, rejected whole above it.
+   * What this participant publishes (story 3 R-2). Default `['audio']`. FIXED
+   * FOR THE MEMBERSHIP: copied and frozen at construction. Audio only in this
+   * SDK build: a `video` entry throws a typed `PublishKindNotSupported` (story
+   * 3 C-A2 enables it); publishing nothing with 0 + 0 slots throws
+   * `NothingToPublishOrReceive`.
    */
-  readonly receiveSlots?: ParsedReceiveSlots;
+  readonly publish?: readonly PublishKind[];
+  /**
+   * N, as parsed by `parseReceiveSlots(…, 'audio')` (e.g. from
+   * `VITE_DT_AUDIO_RECEIVE_SLOTS`), with its source. When present it sets
+   * `mediaConfig.receive.audioSlots`; when absent N is whatever `mediaConfig`
+   * says. A REQUEST: MC truncates above its per-kind cap (see `ReceiveConfig`).
+   */
+  readonly audioReceiveSlots?: ParsedReceiveSlots;
+  /** M, as parsed by `parseReceiveSlots(…, 'video')` (`VITE_DT_VIDEO_RECEIVE_SLOTS`). */
+  readonly videoReceiveSlots?: ParsedReceiveSlots;
   /**
    * TEST-ONLY receive verification (story 2 R-30). Absent in production: the web
    * app injects one only inside `if (__E2E_HOOKS__)`. See

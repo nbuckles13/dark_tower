@@ -19,6 +19,7 @@
 import { flushMetrics, getMetricsSink } from '@darktower/sdk-core';
 import type {
   CaptureSourceInfo,
+  KindSlotsDiagnostics,
   MediaFrameCounts,
   MeetingSessionEventMap,
   ReceiveSlotsDiagnostics,
@@ -49,7 +50,7 @@ export interface SessionEvents {
  */
 export interface SessionMediaCounters {
   readonly media: { readonly frameCounts: MediaFrameCounts } | undefined;
-  /** Effective N, its source and the server cap (story 2 R-23). Plain values. */
+  /** Effective publish set, N, M, their sources and the per-kind caps (story 3 R-23). Plain values. */
   readonly receiveSlots: ReceiveSlotsDiagnostics;
   /** What feeds the send path, once media has started (story 2 R-7). */
   readonly captureSource: CaptureSourceInfo | undefined;
@@ -194,12 +195,17 @@ export function installE2EHooks(
     // outside `dt-guard env-config`). Emitted once the join has told us the cap.
     session.on('joined', () => {
       const slots = session.receiveSlots;
+      const kind = (k: KindSlotsDiagnostics) => ({
+        declared: k.declared,
+        source: k.source,
+        serverCapState: k.serverCap.state,
+        ...(k.serverCap.state === 'known' ? { serverCap: k.serverCap.value } : {}),
+      });
       bus.emit({
         type: 'receiveSlots',
-        declared: slots.declared,
-        source: slots.source,
-        serverCapState: slots.serverCap.state,
-        ...(slots.serverCap.state !== 'unknown' ? { serverCap: slots.serverCap.value } : {}),
+        publish: [...slots.publish],
+        audio: kind(slots.audio),
+        video: kind(slots.video),
       });
     });
 
@@ -210,6 +216,7 @@ export function installE2EHooks(
         type: 'slotAssignments',
         assignments: event.assignments.map((a) => ({
           slotId: a.slotId,
+          kind: a.mediaKind,
           ...(a.senderId !== undefined ? { senderId: a.senderId.toString() } : {}),
           slotState: a.slotState,
         })),
@@ -225,6 +232,7 @@ export function installE2EHooks(
         type: 'participantMute',
         participantId: event.participantId,
         audioServerMuted: event.audioServerMuted,
+        videoServerMuted: event.videoServerMuted,
         ...(event.serverMutedBy !== undefined ? { serverMutedBy: event.serverMutedBy } : {}),
       }),
     );

@@ -60,11 +60,17 @@ export const SignalingErrorCode = {
   /** LOCAL: the join deadline elapsed without a `JoinResponse` (stalled/wedged MC). */
   Timeout: 'TIMEOUT',
   /**
-   * LOCAL: the declared receive-slot count N exceeds the cap MC advertised on
-   * `JoinResponse.max_receive_slots`. MC would reject the WHOLE declaration, so
-   * the SDK refuses it before sending and never shrinks N to fit.
+   * LOCAL: the publish set names a kind this SDK build cannot publish yet
+   * (video, until story 3 C-A2), or repeats a kind. Refused typed at session
+   * construction — never silently dropped from the set.
    */
-  ReceiveSlotsOverCap: 'RECEIVE_SLOTS_OVER_CAP',
+  PublishKindNotSupported: 'PUBLISH_KIND_NOT_SUPPORTED',
+  /**
+   * LOCAL: the session would neither publish nor receive (empty publish set and
+   * 0 audio + 0 video slots). A user-experience pre-check only: MC refuses such
+   * a join itself and is the authority (story 3 R-2).
+   */
+  NothingToPublishOrReceive: 'NOTHING_TO_PUBLISH_OR_RECEIVE',
 } as const;
 
 export type SignalingErrorCode = (typeof SignalingErrorCode)[keyof typeof SignalingErrorCode];

@@ -65,6 +65,7 @@ import type { MetricLabels, MetricsSink } from '../../telemetry/MetricsSink.js';
 import type { KekRetentionOutcome } from '../../config/clientConfig.js';
 import type { RejectReason } from '../frame/rejectReason.js';
 import type { WrapOutcome } from '../frame/receivePath.js';
+import type { CaptureFailure } from './captureFailure.js';
 
 /**
  * Key custody, fixed at `operator` (ADR-0036 §4). A LABEL, never a boolean.
@@ -298,6 +299,117 @@ export type MediaKekInstallRefusal =
   (typeof MEDIA_KEK_INSTALL_REFUSALS)[keyof typeof MEDIA_KEK_INSTALL_REFUSALS];
 
 /**
+ * Bounded `outcome` vocabulary for `dt_client_media_capture_failures_total`
+ * (story 3 R-19, R-30): the capture failure vocabulary
+ * (`captureFailure.ts:CaptureFailure`) plus `ended` (a track that stopped on
+ * its own mid-call: unplugged, revoked).
+ *
+ * `outcome`, NOT `reason` (observability ruling, story 3 E4): `reason` is
+ * reserved for the two per-FRAME drop families (`label-taxonomy.md`), and a
+ * capture failure is not a frame drop. A per-metric vocabulary.
+ *
+ * Spelled as literals here so G6 (which reads this file) sees them, and tied to
+ * `CaptureFailure` in BOTH directions so the two cannot drift: the `satisfies`
+ * rejects a token that is not a capture failure (or `ended`), and
+ * {@link CaptureOutcomesCoverCaptureFailure} rejects a capture failure missing
+ * here.
+ */
+export const MEDIA_CAPTURE_FAILURE_OUTCOMES = {
+  PermissionDenied: 'permission_denied',
+  NoDevice: 'no_device',
+  DeviceUnavailable: 'device_unavailable',
+  Unsupported: 'unsupported',
+  PlatformUnsupported: 'platform_unsupported',
+  Unknown: 'unknown',
+  Ended: 'ended',
+} as const satisfies Record<string, CaptureFailure | 'ended'>;
+
+/** One of {@link MEDIA_CAPTURE_FAILURE_OUTCOMES}. */
+export type MediaCaptureFailureOutcome =
+  (typeof MEDIA_CAPTURE_FAILURE_OUTCOMES)[keyof typeof MEDIA_CAPTURE_FAILURE_OUTCOMES];
+
+/** Compile-time: every `CaptureFailure` is an outcome. `never` here is a type error below. */
+type CaptureOutcomesCoverCaptureFailure =
+  Exclude<CaptureFailure, MediaCaptureFailureOutcome> extends never ? true : never;
+const CAPTURE_OUTCOMES_COVER_CAPTURE_FAILURE: CaptureOutcomesCoverCaptureFailure = true;
+void CAPTURE_OUTCOMES_COVER_CAPTURE_FAILURE;
+
+/**
+ * Bounded `outcome` vocabulary for
+ * `dt_client_media_keyframe_requests_received_total` (story 3 R-11, R-30): what
+ * the publisher did with an MH `KeyframeRequest` for one of its streams.
+ * Declared IN FULL now (story 3 C-A1); C-A2 (task 13) emits the honour paths.
+ *
+ *   * `honoured` — a keyframe was produced for this request.
+ *   * `honoured_counter_ahead` — produced, the request naming a counter ahead
+ *     of the publisher's own.
+ *   * `stale_counter` — refused: the counter is behind (a newer group exists).
+ *   * `min_interval` — deferred: within the minimum keyframe interval.
+ *   * `not_sending` — refused: not a stream this client is currently sending
+ *     to that handler. Until C-A2 every request lands here.
+ *   * `malformed` — not decodable. Counted KIND-FREE on
+ *     `dt_client_media_keyframe_requests_unattributed_total`, since a malformed
+ *     request names no kind; declared here so the vocabulary is one list.
+ *
+ * NOT ZERO-INITIALISED per kind (story 3 E4 ruling): a `media_kind="video"`
+ * series before video flows would let the video read-back pass vacuously, and
+ * audio has no keyframes. A per-metric vocabulary: never summed by `outcome`
+ * against any other series (`label-taxonomy.md`, per-metric `outcome`).
+ */
+export const MEDIA_KEYFRAME_REQUEST_OUTCOMES = {
+  Honoured: 'honoured',
+  HonouredCounterAhead: 'honoured_counter_ahead',
+  StaleCounter: 'stale_counter',
+  MinInterval: 'min_interval',
+  NotSending: 'not_sending',
+  Malformed: 'malformed',
+} as const;
+
+/** One of {@link MEDIA_KEYFRAME_REQUEST_OUTCOMES}. */
+export type MediaKeyframeRequestOutcome =
+  (typeof MEDIA_KEYFRAME_REQUEST_OUTCOMES)[keyof typeof MEDIA_KEYFRAME_REQUEST_OUTCOMES];
+
+/**
+ * The outcomes a request with NO attributable kind can have — the `outcome`
+ * values of `dt_client_media_keyframe_requests_unattributed_total`. A subset of
+ * {@link MEDIA_KEYFRAME_REQUEST_OUTCOMES}, derived from it.
+ */
+export const MEDIA_KEYFRAME_UNATTRIBUTED_OUTCOMES = [
+  MEDIA_KEYFRAME_REQUEST_OUTCOMES.NotSending,
+  MEDIA_KEYFRAME_REQUEST_OUTCOMES.Malformed,
+] as const;
+
+/** One of {@link MEDIA_KEYFRAME_UNATTRIBUTED_OUTCOMES}. */
+export type MediaKeyframeUnattributedOutcome =
+  (typeof MEDIA_KEYFRAME_UNATTRIBUTED_OUTCOMES)[number];
+
+/**
+ * The outcomes a request ATTRIBUTED to a published kind can have: every
+ * keyframe outcome except `malformed` (a malformed request names no kind and is
+ * counted kind-free).
+ */
+export type MediaKeyframePerKindOutcome = Exclude<
+  MediaKeyframeRequestOutcome,
+  typeof MEDIA_KEYFRAME_REQUEST_OUTCOMES.Malformed
+>;
+
+/**
+ * Bounded `outcome` vocabulary for
+ * `dt_client_media_mh_control_channel_ended_total`: how a handler's control
+ * stream ended while this client was not tearing down. A per-metric vocabulary.
+ */
+export const MEDIA_MH_CONTROL_CHANNEL_ENDINGS = {
+  /** MH reset the stream, or the connection was lost. */
+  Reset: 'reset',
+  /** MH finished its send half. */
+  Finished: 'finished',
+} as const;
+
+/** One of {@link MEDIA_MH_CONTROL_CHANNEL_ENDINGS}. */
+export type MediaMhControlChannelEnding =
+  (typeof MEDIA_MH_CONTROL_CHANNEL_ENDINGS)[keyof typeof MEDIA_MH_CONTROL_CHANNEL_ENDINGS];
+
+/**
  * The wrap outcomes that are REPORTED.
  *
  * Derived from `WrapOutcome` by exclusion rather than retyped, so the two
@@ -367,7 +479,7 @@ export interface MediaMetricIdentity {
  * value with an EXACT `^(audio|video)$` rewrite to `invalid`
  * (`infra/services/otel-collector/collector.yaml`). Deliberately NOT the
  * generated proto `MediaKind` (four wire values incl. unspecified and screen),
- * and NOT `events.ts`'s `'audio' | 'video' | 'other'` wire projection.
+ * and NOT the public `media/mediaKind.ts` tokens (`unknown` included).
  *
  * `invalid` is the collector's reserved rewrite sentinel and must never become a
  * value here.
@@ -620,12 +732,37 @@ export class MediaKindMetrics {
   }
 
   /**
-   * `startMedia()` refused a declaration of N receive slots above the cap MC
-   * advertised. `0` is the zero-initialisation at session start. The only signal
-   * for this failure: with no active assignments the deficit counter reads 0.
+   * Capture for THIS kind failed (story 3 R-19, R-30): a start or device swap
+   * that could not acquire the device (the classified `CaptureFailure`), or a
+   * track that ended on its own mid-call (`ended`). Lazily created — no
+   * zero-init: an absent series means no failures yet. No device, sender or
+   * slot dimension.
    */
-  receiveSlotsRejected(count: 0 | 1 = 1): void {
-    this.#sink?.counter('dt_client_media_receive_slots_rejected_total', this.#base, count);
+  captureFailure(outcome: MediaCaptureFailureOutcome): void {
+    this.#sink?.counter('dt_client_media_capture_failures_total', { ...this.#base, outcome });
+  }
+
+  /**
+   * An MH `KeyframeRequest` for a stream of THIS kind, by what the publisher did
+   * with it. Never the stream number or GoP counter. Not zero-initialised (see
+   * {@link MEDIA_KEYFRAME_REQUEST_OUTCOMES}).
+   */
+  keyframeRequestReceived(outcome: MediaKeyframePerKindOutcome): void {
+    this.#sink?.counter('dt_client_media_keyframe_requests_received_total', {
+      ...this.#base,
+      outcome,
+    });
+  }
+
+  /**
+   * MC's send directive omitted THIS published kind from a non-empty `streams`
+   * list — a protocol fault (story 3 wire freeze: every published kind is
+   * always listed; withdrawal is an empty target set, never removal). The kind
+   * fails closed (sends nothing). `0` is the zero-initialisation at join for
+   * each published kind; reads zero forever against a conforming MC.
+   */
+  sendDirectiveKindMissing(count: 0 | 1 = 1): void {
+    this.#sink?.counter('dt_client_media_send_directive_kind_missing_total', this.#base, count);
   }
 
   /**
@@ -681,8 +818,8 @@ export class MediaSessionMetrics {
   }
 
   /** The ONE counter path for session series (a `dt-guard` declared wrapper). */
-  #sessionCounter(name: string, labels: MetricLabels = {}): void {
-    this.#sink?.counter(name, { ...this.#sessionLabels, ...labels });
+  #sessionCounter(name: string, labels: MetricLabels = {}, value?: number): void {
+    this.#sink?.counter(name, { ...this.#sessionLabels, ...labels }, value);
   }
 
   /** The ONE gauge path for session series (a `dt-guard` declared wrapper). */
@@ -747,6 +884,41 @@ export class MediaSessionMetrics {
   }
 
   /**
+   * MC directed a frame header version this client cannot send, so the WHOLE
+   * directive was refused (fail-closed: nothing sent). Kind-free: one refusal
+   * per directive, never one per kind. `0` is the zero-initialisation at join;
+   * reads zero forever against a conforming MC.
+   */
+  sendDirectiveHeaderVersionRefused(count: 0 | 1 = 1): void {
+    this.#sessionCounter('dt_client_media_send_directive_header_version_refused_total', {}, count);
+  }
+
+  /**
+   * An MH `KeyframeRequest` with no attributable kind: undecodable
+   * (`malformed`), or naming a stream number that is no published kind's
+   * directed stream (`not_sending`). Never the stream number or counter.
+   * Zero-initialised at join (`0`) for both outcomes. Never summed by `outcome`
+   * with `dt_client_media_keyframe_requests_received_total`.
+   */
+  keyframeRequestUnattributed(outcome: MediaKeyframeUnattributedOutcome, count: 0 | 1 = 1): void {
+    this.#sessionCounter(
+      'dt_client_media_keyframe_requests_unattributed_total',
+      { outcome },
+      count,
+    );
+  }
+
+  /**
+   * A handler's MH control stream ended while this client was not tearing down
+   * (`reset`: MH reset it or the connection was lost; `finished`: MH finished
+   * its send half). From then on that handler's keyframe requests are never
+   * received. `0` is the zero-initialisation at join for both outcomes.
+   */
+  mhControlChannelEnded(outcome: MediaMhControlChannelEnding, count: 0 | 1 = 1): void {
+    this.#sessionCounter('dt_client_media_mh_control_channel_ended_total', { outcome }, count);
+  }
+
+  /**
    * The active capture source, as a presence gauge: value `1` for the ACTIVE
    * mode only. Never a `0`-valued series for the other mode — the signal is the
    * series' presence, and a zero series would make presence lie.
@@ -765,7 +937,7 @@ export class MediaSessionMetrics {
  * per-kind set per kind the session runs.
  *
  * AUDIO ONLY IN THIS TASK. No video handle is constructed: a constructed handle
- * zero-initialises its series (e.g. `receiveSlotsRejected(0)`), and a
+ * zero-initialises its series (e.g. `sendDirectiveKindMissing(0)`), and a
  * `media_kind="video"` series appearing before video flows would let the video
  * read-back (story 3 C-B) pass vacuously. The tasks that add video emitters
  * (C-A2, C-B) add the `video` member.

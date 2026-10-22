@@ -52,7 +52,9 @@
   async function toggleServerMute(): Promise<void> {
     controlError = '';
     try {
-      await session.setServerMute(participant.participantId, !view.serverMuted);
+      // Audio: the per-kind host controls are story 3 C-C1's. The SDK sends both
+      // kinds, video at the target's current state.
+      await session.setServerMute(participant.participantId, 'audio', !view.serverMuted);
     } catch (err) {
       controlError = errorText(err);
     }

@@ -6,27 +6,37 @@
 
 import {
   MeetingUnauthorizedError,
+  RECEIVE_SLOTS_VARIABLES,
   SdkError,
   SignalingError,
   SignalingErrorCode,
 } from '@darktower/sdk-core';
 
 /**
- * What an operator changes when the declared receive-slot count N is over MC's
- * cap (story 2 R-1). The SDK message already names both numbers; the knobs are
- * this app's deployment vocabulary, so they are named here, not in the SDK.
+ * What an operator changes when this client would neither publish nor receive
+ * (story 3 R-2). The SDK refuses it locally as a user-experience pre-check (MC
+ * is the authority and would refuse the join); the knobs are this app's
+ * deployment vocabulary, so they are named here, not in the SDK.
  */
-const RECEIVE_SLOTS_OVER_CAP_FIX =
-  'Lower VITE_DT_RECEIVE_SLOTS (this app build) or raise MC_MAX_RECEIVE_SLOTS (the meeting ' +
-  'controller); nothing is received until they agree.';
+const NOTHING_TO_PUBLISH_OR_RECEIVE_FIX =
+  `Set ${RECEIVE_SLOTS_VARIABLES.audio} or ${RECEIVE_SLOTS_VARIABLES.video} above 0 (this app ` +
+  'build), or publish audio; a participant must publish or receive something to join.';
+
+/** The fix for a publish set this build cannot serve (video, until the video publish path ships). */
+const PUBLISH_KIND_NOT_SUPPORTED_FIX =
+  'This build publishes audio only; video publishing arrives with the video publish path.';
 
 /** A safe, bounded display string for any caught error. */
 export function errorText(err: unknown): string {
-  if (
-    err instanceof SignalingError &&
-    err.signalingCode === SignalingErrorCode.ReceiveSlotsOverCap
-  ) {
-    return `${err.code}: ${err.message}. ${RECEIVE_SLOTS_OVER_CAP_FIX}`;
+  if (err instanceof SignalingError) {
+    switch (err.signalingCode) {
+      case SignalingErrorCode.NothingToPublishOrReceive:
+        return `${err.code}: ${err.message}. ${NOTHING_TO_PUBLISH_OR_RECEIVE_FIX}`;
+      case SignalingErrorCode.PublishKindNotSupported:
+        return `${err.code}: ${err.message}. ${PUBLISH_KIND_NOT_SUPPORTED_FIX}`;
+      default:
+        break;
+    }
   }
   if (err instanceof SdkError) {
     return `${err.code}: ${err.message}`;

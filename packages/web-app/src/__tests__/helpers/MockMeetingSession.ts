@@ -55,7 +55,7 @@ export class FakeAudioPipeline {
     this.muteCalls.push(muted);
     if (this.#audioMuted === muted) return;
     this.#audioMuted = muted;
-    this.#echo({ audioMuted: muted });
+    this.#echo({ audioMuted: muted, videoMuted: false });
   }
 
   async setCaptureDevice(deviceId: string | undefined): Promise<void> {
@@ -93,23 +93,31 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
   /** Current KEK generation, as the real facade reports it. Mutable. */
   currentKekGeneration: number | undefined;
   /** `setServerMute` calls, in order. */
-  readonly serverMuteCalls: Array<{ participantId: string; muted: boolean }> = [];
+  readonly serverMuteCalls: Array<{
+    participantId: string;
+    kind: 'audio' | 'video';
+    muted: boolean;
+  }> = [];
   /** `requestUnmute` calls. */
   unmuteRequestCalls = 0;
 
-  async setServerMute(participantId: string, muted: boolean): Promise<void> {
-    this.serverMuteCalls.push({ participantId, muted });
+  async setServerMute(
+    participantId: string,
+    kind: 'audio' | 'video',
+    muted: boolean,
+  ): Promise<void> {
+    this.serverMuteCalls.push({ participantId, kind, muted });
   }
 
   async requestUnmute(): Promise<void> {
     this.unmuteRequestCalls += 1;
   }
 
-  /** Effective N / source / server cap, as the real facade reports it. Mutable. */
+  /** Effective publish set, N, M and per-kind caps, as the real facade reports them. Mutable. */
   receiveSlots: ReceiveSlotsDiagnostics = {
-    declared: 1,
-    source: 'default',
-    serverCap: { state: 'unknown' },
+    publish: ['audio'],
+    audio: { declared: 1, source: 'default', serverCap: { state: 'unknown' } },
+    video: { declared: 0, source: 'default', serverCap: { state: 'unknown' } },
   };
   /** Set by `startMedia()` to the microphone, as the real facade's default. */
   captureSource: CaptureSourceInfo | undefined;

@@ -40,7 +40,6 @@ export class RosterKeyFeed {
    */
   joined(participants: readonly RosterKeyParticipant[]): void {
     const sink = this.#sink;
-    if (!sink) return;
     for (const p of participants) {
       if (p.senderId === undefined) continue;
       // A participant id reappearing under a DIFFERENT sender id (a reconnect
@@ -48,8 +47,11 @@ export class RosterKeyFeed {
       // survive until LRU eviction — defeating the leaver cutoff below, and
       // leaving this map bounded by history rather than by the roster.
       const previous = this.#senderByParticipant.get(p.participantId);
-      if (previous !== undefined && previous !== p.senderId) sink.remove(previous);
+      if (previous !== undefined && previous !== p.senderId) sink?.remove(previous);
+      // Maintained with or without a sink: it is also the roster's one
+      // participant -> sender index (`senderIdOf`).
       this.#senderByParticipant.set(p.participantId, p.senderId);
+      if (!sink) continue;
       void sink
         .upsert({ senderId: p.senderId, identityPublicKey: p.identityPublicKey })
         .catch(() => {
@@ -58,6 +60,15 @@ export class RosterKeyFeed {
           // about a participant's key material.
         });
     }
+  }
+
+  /**
+   * The sender id the roster published for `participantId`, or `undefined`.
+   * THE roster's participant -> sender index; presentation only, never
+   * attribution.
+   */
+  senderIdOf(participantId: string): number | undefined {
+    return this.#senderByParticipant.get(participantId);
   }
 
   /**

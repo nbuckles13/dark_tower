@@ -93,6 +93,28 @@ export interface WebTransportDatagrams {
 }
 
 /**
+ * The shape the platform gives a stream-level error (`WebTransportError` with
+ * `source: 'stream'`): a peer RESET_STREAM on a stream we read, or a peer
+ * STOP_SENDING on a stream we write. Declared ONCE here (and mirrored in the
+ * test-utils contract) so SDK classification code matches the platform object
+ * and the test double identically — a bespoke error class would let SDK code
+ * match the mock and miss the browser. `streamErrorCode` is `null` when the
+ * peer sent none.
+ */
+export interface WebTransportStreamError extends Error {
+  readonly name: 'WebTransportError';
+  readonly source: 'stream';
+  readonly streamErrorCode: number | null;
+}
+
+/** Whether `err` has the platform's stream-error shape. */
+export function isWebTransportStreamError(err: unknown): err is WebTransportStreamError {
+  if (typeof err !== 'object' || err === null) return false;
+  const e = err as { name?: unknown; source?: unknown };
+  return e.name === 'WebTransportError' && e.source === 'stream';
+}
+
+/**
  * Canonical contract for a WebTransport-shaped client.
  *
  * Connection establishment is modelled as a constructor/factory concern (see
@@ -120,6 +142,29 @@ export interface IWebTransport {
 
   /** Open a new bidirectional stream. */
   createBidirectionalStream(): Promise<WebTransportBidirectionalStream>;
+
+  /**
+   * Open a new OUTGOING unidirectional stream (story 3: one stream per video
+   * group per handler). Rejects on a closed transport.
+   *
+   * REQUIRED, not optional, for the same reason as the datagram knobs above:
+   * the Pattern-A drift guard (`const transport: IWebTransport = mock;`) is
+   * blind to a missing OPTIONAL member, so an optional declaration would let
+   * the test double silently drop the seam.
+   *
+   * Stream ending is the WRITER's choice and the two endings mean different
+   * things: `close()` finishes the stream (FIN), `abort()` resets it
+   * (RESET_STREAM). A group the sender abandoned is reset, never finished, so a
+   * half-written frame never looks complete downstream (story 3 R-12).
+   */
+  createUnidirectionalStream(): Promise<WritableStream<Uint8Array>>;
+
+  /**
+   * Unidirectional streams the PEER opened, in arrival order (story 3: the
+   * video receive path reads one stream per group). Each inner stream errors
+   * with a {@link WebTransportStreamError} when the peer resets it.
+   */
+  readonly incomingUnidirectionalStreams: ReadableStream<ReadableStream<Uint8Array>>;
 
   /** Close the transport with optional close-info. */
   close(info?: WebTransportCloseInfo): void;

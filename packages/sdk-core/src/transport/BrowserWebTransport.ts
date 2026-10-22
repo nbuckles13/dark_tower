@@ -78,6 +78,14 @@ export class BrowserWebTransport implements IWebTransport {
     return this.#wt.createBidirectionalStream();
   }
 
+  createUnidirectionalStream(): Promise<WritableStream<Uint8Array>> {
+    return this.#wt.createUnidirectionalStream();
+  }
+
+  get incomingUnidirectionalStreams(): ReadableStream<ReadableStream<Uint8Array>> {
+    return this.#wt.incomingUnidirectionalStreams;
+  }
+
   close(info?: WebTransportCloseInfo): void {
     this.#wt.close(info);
   }

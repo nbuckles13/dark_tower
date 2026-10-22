@@ -1,79 +1,114 @@
 // File: packages/sdk-core/src/session/mediaSelection.ts
 //
-// Two decisions `MeetingSession.startMedia` makes before it builds a pipeline,
-// kept out of the session class so each is one small, separately testable
-// function (story 2 R-1, R-7, R-23):
+// The decisions `MeetingSession` makes about what it declares and what feeds
+// its send path, kept out of the session class so each is one small,
+// separately testable function (story 2 R-7; story 3 R-1, R-2, R-23):
 //
-//   * WHICH RECEIVE SLOTS TO DECLARE — N against the cap MC advertised;
+//   * WHAT IT PUBLISHES — the publish set, validated once (`validatePublishSet`);
+//   * WHICH RECEIVE SLOTS TO DECLARE — N audio then M video (`receiveDeclaration`,
+//     THE ONE producer of slot ids);
+//   * WHAT IT LEARNED OF MC's CAPS — per kind (`classifySlotCap`);
 //   * WHAT FEEDS THE SEND PATH — the one capture-source substitution point.
 
-import type { MediaKindMetrics } from '../media/setup/mediaMetrics.js';
 import { createMicrophoneCapture, createTestToneCapture } from '../media/setup/capture.js';
 import { testToneFrequencyHz } from '../media/setup/testTone.js';
 import type { CaptureSourceFactory } from '../media/setup/seams.js';
-import type { ReceiveSlotsSource } from '../config/clientConfig.js';
 import { SignalingError, SignalingErrorCode } from '../errors/SignalingError.js';
+import type { PublishKind, ReceiveSlotDeclaration } from '../signaling/events.js';
 import type { CaptureSourceInfo, ReceiveSlotCap } from './events.js';
+import type { MediaKindToken } from '../media/mediaKind.js';
 
 /** The default capture source. The ONE `microphone` literal on the emitting path. */
 const MICROPHONE_SOURCE: CaptureSourceInfo = { mode: 'microphone' };
 
 /**
- * Classify `JoinResponse.max_receive_slots` as received (`undefined` = absent).
- * See {@link ReceiveSlotCap}; the proto comment is the canonical statement.
+ * The kinds this SDK build can PUBLISH. Video joins in story 3 C-A2 (task 13),
+ * with its capture and encoder; until then a video request is refused typed,
+ * never silently dropped from the set.
  */
-export function classifySlotCap(advertised: number | undefined): ReceiveSlotCap {
-  if (advertised === undefined) return { state: 'unknown' };
-  if (advertised === 0) return { state: 'invalid', value: 0 };
-  return { state: 'known', value: advertised };
+const PUBLISHABLE_KINDS: ReadonlySet<PublishKind> = new Set<PublishKind>(['audio']);
+
+/**
+ * Validate and FREEZE a publish set (story 3 R-2). THROWS typed:
+ *
+ *   * `PublishKindNotSupported` — a kind this build cannot publish yet (video),
+ *     a duplicate, or a value outside the closed vocabulary (possible only if a
+ *     caller defeats the type system). MC rejects all three as well.
+ *   * `NothingToPublishOrReceive` — nothing published and `audioSlots +
+ *     videoSlots` is 0. A user-experience pre-check only: MC is the authority
+ *     and refuses such a join itself.
+ *
+ * Returns a frozen COPY: the caller's array can never change what this
+ * membership publishes.
+ */
+export function validatePublishSet(
+  publish: readonly PublishKind[],
+  audioSlots: number,
+  videoSlots: number,
+): readonly PublishKind[] {
+  const seen = new Set<PublishKind>();
+  for (const kind of publish) {
+    if (!PUBLISHABLE_KINDS.has(kind) || seen.has(kind)) {
+      throw new SignalingError(
+        SignalingErrorCode.PublishKindNotSupported,
+        kind === 'video'
+          ? 'publishing video is not yet supported by this client'
+          : seen.has(kind)
+            ? `the publish set names ${kind} more than once`
+            : 'the publish set names a media kind this client cannot publish',
+      );
+    }
+    seen.add(kind);
+  }
+  if (seen.size === 0 && audioSlots + videoSlots === 0) {
+    throw new SignalingError(
+      SignalingErrorCode.NothingToPublishOrReceive,
+      'this client is configured to publish nothing and to receive 0 audio and 0 video slots, ' +
+        'so it would join a meeting it can neither hear nor be heard in',
+    );
+  }
+  return Object.freeze([...publish]);
 }
 
 /**
- * The slot ids to declare: `0..N-1`. THROWS (typed, counted) when N exceeds a
- * KNOWN cap — MC would reject the declaration WHOLE, so it is refused here,
- * before sending, and N is NEVER shrunk to fit (R-1: a participant who silently
- * hears fewer people than configured is the failure this prevents).
- *
- * A user-experience pre-check, not the authority: MC re-checks every
- * declaration. The cap bounds the TOTAL slot count of one declaration across
- * media kinds, so the comparison is on the full declared list.
- *
- * `unknown` (an older MC) and `invalid` (a present 0) do not refuse: the
- * declaration is sent and MC's rejection, which surfaces as a session `error`,
- * is the backstop. `invalid` is WARNed first. Log lines carry numbers and the
- * source token only — never the join response or the options.
+ * The receive declaration: audio slot ids `0..N-1`, then video ids
+ * `N..N+M-1`, IN ID ORDER, so MC's per-kind truncation keeps the low ids.
+ * Either count may be 0. THE ONE producer of slot ids — the join-carried
+ * declaration, the post-join redeclaration and the pipeline's declared audio ids
+ * all come from here.
  */
-export function receiveSlotIdsToDeclare(args: {
-  readonly count: number;
-  readonly source: ReceiveSlotsSource;
-  readonly cap: ReceiveSlotCap;
-  readonly metrics: MediaKindMetrics;
-}): number[] {
-  const { count, source, cap, metrics } = args;
-  const declared = Array.from({ length: count }, (_, i) => i);
-  if (cap.state === 'invalid') {
-    console.warn(
-      '[dt-media-slots]',
-      `MC advertised a receive-slot cap of ${cap.value}, which violates the JoinResponse ` +
-        `contract; treating the cap as unknown and declaring N=${count}`,
-    );
-  }
-  console.info(
-    '[dt-media-slots]',
-    `declaring N=${count} receive slots (${source}); server cap ` +
-      (cap.state === 'unknown' ? 'unknown' : String(cap.value)) +
-      (cap.state === 'invalid' ? ' (invalid)' : ''),
-  );
-  if (cap.state === 'known' && count > cap.value) {
-    metrics.receiveSlotsRejected();
-    throw new SignalingError(
-      SignalingErrorCode.ReceiveSlotsOverCap,
-      `this client is configured to receive ${count} audio slots, but the meeting controller ` +
-        `allows at most ${cap.value}; the controller would reject the whole declaration, so ` +
-        `none was sent`,
-    );
-  }
-  return declared;
+export function receiveDeclaration(
+  audioSlots: number,
+  videoSlots: number,
+): readonly ReceiveSlotDeclaration[] {
+  const audio = Array.from({ length: audioSlots }, (_, i) => ({
+    slotId: i,
+    mediaKind: 'audio' as const,
+  }));
+  const video = Array.from({ length: videoSlots }, (_, i) => ({
+    slotId: audioSlots + i,
+    mediaKind: 'video' as const,
+  }));
+  return Object.freeze([...audio, ...video]);
+}
+
+/** The slot ids of one kind in a declaration, in id order. */
+export function declaredSlotIds(
+  declaration: readonly ReceiveSlotDeclaration[],
+  kind: MediaKindToken,
+): readonly number[] {
+  return declaration.filter((s) => s.mediaKind === kind).map((s) => s.slotId);
+}
+
+/**
+ * Classify a per-kind cap from `JoinResponse.max_{audio,video}_receive_slots`
+ * as received (`undefined` = absent = unknown). 0 is LEGAL (a video cap of 0 is
+ * the video-off lever, R-26) and is `known`, never folded into unknown.
+ * Informational: MC truncates, so a client never shrinks its declaration.
+ */
+export function classifySlotCap(advertised: number | undefined): ReceiveSlotCap {
+  if (advertised === undefined) return { state: 'unknown' };
+  return { state: 'known', value: advertised };
 }
 
 /**

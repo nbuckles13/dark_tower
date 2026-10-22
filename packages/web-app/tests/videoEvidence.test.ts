@@ -216,7 +216,7 @@ describe('judgeVideoSlot: MC state and what is rendered', () => {
     ['avatar_no_video', 'avatar'],
     ['avatar_client_muted', 'avatar'],
     ['avatar_server_muted', 'avatar'],
-    ['fewer_sources', 'empty'],
+    ['fewer_sources_than_slots', 'empty'],
     ['unavailable', 'empty'],
   ] as const)('%s renders %s and passes', (state, rendered) => {
     const v = judgeVideoSlot(

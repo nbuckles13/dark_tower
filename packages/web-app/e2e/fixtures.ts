@@ -15,7 +15,7 @@
 //   - Playwright artifacts (traces) DO contain this synthetic traffic — they are
 //     gitignored and must never leave the workstation (see e2e/README.md).
 
-import { expect } from 'playwright/test';
+import { expect, test } from 'playwright/test';
 import type { Browser, BrowserContext, Page, Request, Response } from 'playwright/test';
 // Resolved to sdk-core SOURCE via this package's tsconfig `paths` (Playwright
 // honors tsconfig path mapping), keeping GC's R-53 camelCase wire mapping
@@ -35,7 +35,8 @@ import {
   COHORT_ENV_VAR,
   cohortSize,
   decodeCohort,
-  SUITE_RECEIVE_SLOTS,
+  SUITE_AUDIO_RECEIVE_SLOTS,
+  SUITE_VIDEO_RECEIVE_SLOTS,
 } from './cohort.js';
 import { E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS } from '../src/lib/e2eBus.js';
 import { scanRecordedRequests, type RecordedRequest, type ScanReport } from './credentialScan.js';
@@ -197,9 +198,9 @@ export async function registerCohort(
   return cohort;
 }
 
-/** The run's cohort (N+1 = `cohortSize(SUITE_RECEIVE_SLOTS)` distinct accounts). */
+/** The run's cohort (N+1 = `cohortSize(SUITE_AUDIO_RECEIVE_SLOTS)` distinct accounts). */
 export function suiteCohort(): TestCredentials[] {
-  return decodeCohort(process.env[COHORT_ENV_VAR], cohortSize(SUITE_RECEIVE_SLOTS));
+  return decodeCohort(process.env[COHORT_ENV_VAR], cohortSize(SUITE_AUDIO_RECEIVE_SLOTS));
 }
 
 /**
@@ -1298,18 +1299,21 @@ export async function latestBusEventsOf<T extends string>(
 }
 
 /**
- * Assert this participant's build declares the suite's N
- * (`SUITE_RECEIVE_SLOTS`) and MC's advertised cap admits it — the runtime check
+ * Assert this participant's build declares the suite's N audio slots
+ * (`SUITE_AUDIO_RECEIVE_SLOTS`) and M video slots (`SUITE_VIDEO_RECEIVE_SLOTS`),
+ * and that MC's advertised audio cap admits N — the runtime check
  * `src/lib/config.ts` defers to the suite. `playwright.config.ts` derives the
- * dev server's `VITE_DT_RECEIVE_SLOTS` from `SUITE_RECEIVE_SLOTS`, but with
- * `reuseExistingServer` a server started elsewhere (e.g. `dev-web.sh`, whose
- * demo N may differ) runs its own N; a mismatch would otherwise surface as
- * `not_assigned` / fewer-sources — the misrouting-shaped symptom S1 separates.
+ * dev server's `VITE_DT_AUDIO_RECEIVE_SLOTS` / `VITE_DT_VIDEO_RECEIVE_SLOTS`
+ * from these, but with `reuseExistingServer` a server started elsewhere (e.g.
+ * `dev-web.sh`, whose demo N and M differ) runs its own values; a mismatch would
+ * otherwise surface as `not_assigned` / fewer-sources — the misrouting-shaped
+ * symptom S1 separates.
  */
 export async function expectDeclaredReceiveSlots(
   page: Page,
   label: string,
-  expectedSlots: number = SUITE_RECEIVE_SLOTS,
+  expectedSlots: number = SUITE_AUDIO_RECEIVE_SLOTS,
+  expectedVideoSlots: number = SUITE_VIDEO_RECEIVE_SLOTS,
 ): Promise<void> {
   await expect
     .poll(
@@ -1321,18 +1325,42 @@ export async function expectDeclaredReceiveSlots(
     )
     .toBe(true);
   const { receiveSlots: slots } = await latestBusEventsOf(page, ['receiveSlots']);
+  const audio = slots?.['audio'] as Readonly<Record<string, unknown>> | undefined;
+  const video = slots?.['video'] as Readonly<Record<string, unknown>> | undefined;
+  const restart =
+    'The slot counts are fixed when the dev server starts; with reuseExistingServer a server ' +
+    'started elsewhere keeps its own — stop it and let Playwright start one.';
   expect(
-    slots?.['declared'],
-    `${label}: the build declares N=${String(slots?.['declared'])}, the scenario needs ` +
-      `N=${expectedSlots} (suite default SUITE_RECEIVE_SLOTS=${SUITE_RECEIVE_SLOTS}; a per-context ` +
-      `N comes from the receiveSlots test lever). VITE_DT_RECEIVE_SLOTS is fixed when the dev ` +
-      `server starts; with reuseExistingServer a server started elsewhere keeps its own N — ` +
-      `stop it and let Playwright start one.`,
+    audio?.['declared'],
+    `${label}: the build declares N=${String(audio?.['declared'])} audio slots, the scenario ` +
+      `needs N=${expectedSlots} (suite default SUITE_AUDIO_RECEIVE_SLOTS=` +
+      `${SUITE_AUDIO_RECEIVE_SLOTS}; a per-context N comes from the audioReceiveSlots test ` +
+      `lever). ${restart}`,
   ).toBe(expectedSlots);
-  expect(slots?.['serverCapState'], `${label}: MC advertised no receive-slot cap`).toBe('known');
   expect(
-    slots?.['serverCap'],
-    `${label}: MC's cap (MC_MAX_RECEIVE_SLOTS) is below the scenario's N=${expectedSlots}`,
+    video?.['declared'],
+    `${label}: the build declares M=${String(video?.['declared'])} video slots, the scenario ` +
+      `needs M=${expectedVideoSlots} (SUITE_VIDEO_RECEIVE_SLOTS). ${restart}`,
+  ).toBe(expectedVideoSlots);
+  // TRANSITIONAL (C-A1) — deleted by MC-A (story 3 task 12), the first task
+  // whose gate can assert the per-kind caps (it is the first controller to send
+  // them); MC-A restores `unknown` as a failure here. The controller in service
+  // before MC-A sends no per-kind caps and the SDK no longer reads the superseded
+  // total, so the cap is UNKNOWN at C-A1's gate only. Recorded on the test AND in
+  // the gate log, never silently.
+  if (audio?.['serverCapState'] === 'unknown') {
+    const note = `${label}: MC sent no per-kind receive-slot caps (pre-MC-A controller)`;
+    console.warn(`[e2e transitional C-A1] ${note}`);
+    test.info().annotations.push({ type: 'transitional', description: note });
+    return;
+  }
+  expect(audio?.['serverCapState'], `${label}: MC's audio cap is malformed on the bus`).toBe(
+    'known',
+  );
+  expect(
+    audio?.['serverCap'],
+    `${label}: MC's audio cap (MC_MAX_AUDIO_RECEIVE_SLOTS) is below the scenario's ` +
+      `N=${expectedSlots}; the excess slots would read unavailable`,
   ).toBeGreaterThanOrEqual(expectedSlots);
 }
 
@@ -1397,7 +1425,7 @@ export async function flushTelemetry(page: Page): Promise<void> {
 export async function readOwnTone(
   page: Page,
   label: string,
-  expectedSlots: number = SUITE_RECEIVE_SLOTS,
+  expectedSlots: number = SUITE_AUDIO_RECEIVE_SLOTS,
 ): Promise<CohortTone> {
   await expectBuildKnobs(page, label);
   await expectDeclaredReceiveSlots(page, label, expectedSlots);

@@ -25,7 +25,9 @@ export type {
   IWebTransport,
   WebTransportBidirectionalStream,
   WebTransportCloseInfo,
+  WebTransportStreamError,
 } from './transport/IWebTransport.js';
+export { isWebTransportStreamError } from './transport/IWebTransport.js';
 
 export type { DevCertificateHash, WebTransportConnectOptions } from './transport/types.js';
 
@@ -160,6 +162,9 @@ export type {
   MediaConnectionState,
   MediaTransportEventMap,
   MediaTransportOptions,
+  MhControlSink,
+  MhKeyframeRequest,
+  MhRecoveryRequest,
   RunInContext,
 } from './media/events.js';
 
@@ -255,6 +260,10 @@ export {
   DEFAULT_CLIENT_CONFIG,
   DEFAULT_METRIC_EXPORT_INTERVAL_MS,
   DEFAULT_RECEIVE_AUDIO_SLOTS,
+  DEFAULT_RECEIVE_VIDEO_SLOTS,
+  RECEIVE_SLOTS_VARIABLES,
+  RETIRED_RECEIVE_SLOTS_MESSAGE,
+  RETIRED_RECEIVE_SLOTS_VARIABLE,
   parseReceiveSlots,
   MIN_AUDIO_ROTATION_PERIOD_MS,
   KEK_RETENTION_CEILING_MS,
@@ -277,6 +286,7 @@ export type {
   OpusSignal,
   ParsedReceiveSlots,
   ReceiveConfig,
+  ReceiveSlotKind,
   ReceiveSlotsSource,
   ReceiverStateConfig,
   TelemetryCadenceConfig,
@@ -378,11 +388,15 @@ export { buildPublisherRegion, writeHopSequence } from './media/frame/frameCodec
 export type { PublisherRegionInput } from './media/frame/frameCodec.js';
 
 export type {
+  CaptureResumedAfterServerMuteEvent,
   CaptureSourceInfo,
+  KindSlotsDiagnostics,
   ReceiveSlotCap,
   ReceiveSlotsDiagnostics,
   StartMediaOptions,
 } from './session/events.js';
+export { pairSlotsBySender } from './signaling/pairing.js';
+export type { SlotPair } from './signaling/pairing.js';
 
 // Story 2 R-30: the TEST-ONLY receive-verification recorder. Not a door into the
 // hot path: it only RECEIVES counts from an ingress an embedder cannot build,
@@ -400,9 +414,12 @@ export type {
   ReceiveVerificationSnapshot,
 } from './media/pipeline/receiveVerification.js';
 export type {
+  PublishKind,
   ReceiveSlotDeclaration,
   SendDirectiveEvent,
   SendStreamDirective,
+  SlotMediaKind,
+  SlotStateToken,
   StreamAssignmentEvent,
   StreamAssignmentsEvent,
 } from './signaling/events.js';

@@ -53,7 +53,7 @@
 //                   (publishes no video) | avatar_client_muted |
 //                   avatar_server_muted (wins over client-muted);
 //   audio occupant: active | avatar_client_muted | avatar_server_muted (wins);
-//   no occupant:    fewer_sources; past the cap: unavailable.
+//   no occupant:    fewer_sources_than_slots; past the cap: unavailable.
 // A participant that publishes no video has nothing to mute, so
 // avatar_no_video takes precedence over the mute avatars on a video slot.
 
@@ -79,26 +79,23 @@ export const KIND_FILL_ORDER: readonly Kind[] = ['audio', 'video'];
  */
 const KINDS: readonly Kind[] = ['audio', 'video'];
 
-/** The states the SDK's union already carries, checked against it now. */
+/** The states story 2 already exercised, checked against the SDK's union. */
 export const SHARED_SLOT_STATES = [
   'active',
-  'fewer_sources',
+  'fewer_sources_than_slots',
 ] as const satisfies readonly SlotStateToken[];
 
 /**
- * PENDING SSoT. These five wire tokens are not yet in the SDK's
- * `StreamAssignmentEvent['slotState']` union (`src/lib/slotState.ts`
- * `SlotStateToken`). C-A1 (task 11) adds them there. When it does, C-C1 (task
- * 17) replaces this local list with
- * `as const satisfies readonly SlotStateToken[]`, as for
- * {@link SHARED_SLOT_STATES}, so the oracle and the app share one vocabulary.
+ * The story-3 avatar and truncation states, checked against the SDK's union
+ * (`SlotStateToken`, flat vocabulary since story 3 C-A1) so the oracle and the
+ * app share one vocabulary. Story 3 C-C1 may fold the two lists.
  */
 export const PENDING_SLOT_STATES = [
   'avatar_no_video',
   'avatar_client_muted',
   'avatar_server_muted',
   'unavailable',
-] as const;
+] as const satisfies readonly SlotStateToken[];
 
 /** Every state the oracle can expect. */
 export type ExpectedSlotState =
@@ -107,7 +104,7 @@ export type ExpectedSlotState =
 /** One slot's expectation. */
 export interface SlotExpectation {
   readonly state: ExpectedSlotState;
-  /** The participant the slot holds; absent on fewer_sources / unavailable. */
+  /** The participant the slot holds; absent on fewer_sources_than_slots / unavailable. */
   readonly occupant?: string;
 }
 
@@ -258,7 +255,7 @@ export class SlotOracle {
     const s = this.member(subscriber);
     const project = (kind: Kind): SlotExpectation[] => {
       const filled = s.slots[kind].map((occupant): SlotExpectation => {
-        if (occupant === null) return { state: 'fewer_sources' };
+        if (occupant === null) return { state: 'fewer_sources_than_slots' };
         return { state: this.occupantState(this.member(occupant), kind), occupant };
       });
       const truncated = Math.max(0, s.declared[kind] - this.caps[kind]);

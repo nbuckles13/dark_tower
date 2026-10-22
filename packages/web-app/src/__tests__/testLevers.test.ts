@@ -19,20 +19,27 @@ describe('parseTestLevers', () => {
   });
 
   it('parses every lever into a FROZEN copy that later writes cannot reach', () => {
-    const raw = { blockHandlers: [U1], receiveSlots: '2', forceHostControls: true };
+    const raw = {
+      blockHandlers: [U1],
+      audioReceiveSlots: '2',
+      videoReceiveSlots: '0',
+      forceHostControls: true,
+    };
     const levers = parseTestLevers(raw)!;
     raw.blockHandlers.push(U0);
     expect(levers.blockHandlers).toEqual([U1]);
     expect(Object.isFrozen(levers)).toBe(true);
     expect(Object.isFrozen(levers.blockHandlers)).toBe(true);
-    expect(levers.receiveSlots).toEqual({ count: 2, source: 'configured' });
+    expect(levers.audioReceiveSlots).toEqual({ count: 2, source: 'configured' });
+    expect(levers.videoReceiveSlots).toEqual({ count: 0, source: 'configured' });
     expect(levers.forceHostControls).toBe(true);
   });
 
   it('defaults absent keys to no-op values', () => {
     expect(parseTestLevers({})).toEqual({
       blockHandlers: [],
-      receiveSlots: undefined,
+      audioReceiveSlots: undefined,
+      videoReceiveSlots: undefined,
       forceHostControls: false,
     });
   });
@@ -45,8 +52,11 @@ describe('parseTestLevers', () => {
     ['a non-array block list', { blockHandlers: U1 }, /array of non-empty strings/],
     ['an empty block entry', { blockHandlers: [''] }, /array of non-empty strings/],
     ['a non-string block entry', { blockHandlers: [1] }, /array of non-empty strings/],
-    ['a numeric receiveSlots', { receiveSlots: 2 }, /receiveSlots must be a string/],
-    ['a malformed receiveSlots', { receiveSlots: '02' }, /receive-slot count/],
+    ['a numeric audioReceiveSlots', { audioReceiveSlots: 2 }, /audioReceiveSlots must be a string/],
+    ['a malformed audioReceiveSlots', { audioReceiveSlots: '02' }, /receive-slot count/],
+    ['a numeric videoReceiveSlots', { videoReceiveSlots: 2 }, /videoReceiveSlots must be a string/],
+    ['a malformed videoReceiveSlots', { videoReceiveSlots: '-1' }, /receive-slot count/],
+    ['the RETIRED receiveSlots lever', { receiveSlots: '2' }, /unknown key/],
     ['a non-boolean forceHostControls', { forceHostControls: 'yes' }, /boolean/],
   ])('THROWS on %s', (_label, raw, message) => {
     expect(() => parseTestLevers(raw)).toThrow(message);

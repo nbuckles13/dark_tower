@@ -18,7 +18,7 @@ import {
   encodeCohort,
   leversForPlan,
   parseAcAuthRateLimit,
-  SUITE_RECEIVE_SLOTS,
+  SUITE_AUDIO_RECEIVE_SLOTS,
   type CohortMemberPlan,
   type PublishSet,
 } from '../e2e/cohort.js';
@@ -42,8 +42,8 @@ describe('cohortSize', () => {
     expect(() => cohortSize(n)).toThrow(RangeError);
   });
   test('the suite is locked at N=3 (four participants)', () => {
-    expect(SUITE_RECEIVE_SLOTS).toBe(3);
-    expect(cohortSize(SUITE_RECEIVE_SLOTS)).toBe(4);
+    expect(SUITE_AUDIO_RECEIVE_SLOTS).toBe(3);
+    expect(cohortSize(SUITE_AUDIO_RECEIVE_SLOTS)).toBe(4);
   });
 });
 
@@ -129,7 +129,7 @@ describe('assertCohortFitsAuthWindow', () => {
 
   test('the suite N fits the real Kind AC config', () => {
     const limit = parseAcAuthRateLimit(readFileSync(AC_CONFIG_ENV, 'utf8'), AC_CONFIG_ENV);
-    expect(() => assertCohortFitsAuthWindow(SUITE_RECEIVE_SLOTS, limit)).not.toThrow();
+    expect(() => assertCohortFitsAuthWindow(SUITE_AUDIO_RECEIVE_SLOTS, limit)).not.toThrow();
   });
 
   test('passes at exactly the limit and fails one above it', () => {
@@ -216,12 +216,12 @@ describe('story 3: scenario plans over the once-registered cohort', () => {
   test('leversForPlan emits exactly the agreed lever names and strings', () => {
     expect(leversForPlan(plan('video', 3, 2))).toEqual({
       publish: 'video',
-      receiveSlots: '3',
+      audioReceiveSlots: '3',
       videoReceiveSlots: '2',
     });
     expect(Object.keys(leversForPlan(plan('none', 0, 1))).sort()).toEqual([
+      'audioReceiveSlots',
       'publish',
-      'receiveSlots',
       'videoReceiveSlots',
     ]);
   });

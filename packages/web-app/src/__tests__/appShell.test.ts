@@ -26,7 +26,8 @@ const config: DemoConfig = {
   gcBaseUrl: '',
   env: 'test',
   devCertHashes: [],
-  receiveSlots: { count: 1, source: 'default' },
+  audioReceiveSlots: { count: 1, source: 'default' },
+  videoReceiveSlots: { count: 0, source: 'default' },
 };
 
 function jsonResponse(body: unknown, status = 200): Response {

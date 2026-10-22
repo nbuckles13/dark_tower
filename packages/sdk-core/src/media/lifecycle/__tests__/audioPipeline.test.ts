@@ -81,7 +81,15 @@ interface Rig {
   loopback(): Promise<void>;
 }
 
-async function makeRig(overrides: Partial<MediaConfig> = {}): Promise<Rig> {
+async function makeRig(
+  overrides: Partial<MediaConfig> = {},
+  shape: {
+    readonly declaredSlotIds?: readonly number[];
+    readonly streamNumber?: number;
+    /** Collects every fault stage from construction on (before the first directive). */
+    readonly faultStages?: string[];
+  } = {},
+): Promise<Rig> {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaMetrics({ clientVersion: '0.0.0-test', orgId: 'demo' }, sink);
   const kekSource = kekHolderWith(KEK, 0);
@@ -116,12 +124,12 @@ async function makeRig(overrides: Partial<MediaConfig> = {}): Promise<Rig> {
     roster,
     senderId: SENDER_ID,
     identity,
-    declaredSlotIds: [0],
+    declaredSlotIds: shape.declaredSlotIds ?? [0],
     captureSource: 'microphone',
     metricExportIntervalMs: 10_000,
     senderFor: () => sender,
     readableFor: () => transport.datagrams.readable,
-    reportMute: (muted) => muteReports.push(muted),
+    reportMute: (state) => muteReports.push(state.audioMuted),
     captureFactory: async () => capture as never,
     encoderFactory: codecs.encoderFactory as never,
     decoderFactory: codecs.decoderFactory as never,
@@ -133,9 +141,11 @@ async function makeRig(overrides: Partial<MediaConfig> = {}): Promise<Rig> {
     clearInterval: () => {},
   };
   const pipeline = new AudioPipeline(options);
+  const faultStages = shape.faultStages;
+  if (faultStages) pipeline.on('fault', (f) => faultStages.push(f.stage));
   await pipeline.start();
   pipeline.setSendDirective({
-    streamNumber: 1,
+    streamNumber: shape.streamNumber ?? 1,
     bitrateBps: 32_000,
     targets: [MH_URL],
     headerVersion: HEADER_VERSION,
@@ -548,5 +558,59 @@ describe('the directed header version (ADR-0036 §2: meeting-wide, MC-directed)'
     });
     expect(() => egress.setTargets({ targets: [MH_URL], headerVersion: 2 })).toThrow(RangeError);
     expect(() => egress.setTargets({ targets: [], headerVersion: 4 })).not.toThrow();
+  });
+});
+
+describe('uplink send-id stamping (story 3 R-20)', () => {
+  it("stamps the relay stream_id with the DIRECTIVE's stream_number, never a declared slot id", async () => {
+    // Slots 0..2 declared and stream_number 7 directed: with any slot-id source
+    // the stamp would be 0, 1 or 2, so this cannot pass vacuously (the stale
+    // story-2 bug stamped `declaredSlotIds[0] ?? 0`).
+    const rig = await makeRig({}, { declaredSlotIds: [0, 1, 2], streamNumber: 7 });
+    rig.emit(1);
+    rig.emit(2);
+    await settle();
+    const sent = rig.transport.getOutboundDatagrams();
+    expect(sent.length).toBeGreaterThan(0);
+    for (const datagram of sent) {
+      const frame = decodeFrame(datagram);
+      expect(frame.streamId).toBe(7);
+      expect([0, 1, 2]).not.toContain(frame.streamId);
+    }
+  });
+});
+
+describe('an unstampable directed stream number (story 3 R-20)', () => {
+  it('sends NOTHING and raises one config fault — never a substituted id', async () => {
+    // 256 is outside the 8-bit key-id stream domain. Positive control: the
+    // stream-7 test above, through the same rig, does send.
+    const faults: string[] = [];
+    const rig = await makeRig(
+      {},
+      { declaredSlotIds: [0, 1, 2], streamNumber: 256, faultStages: faults },
+    );
+    rig.emit(1);
+    rig.emit(2);
+    await settle();
+    expect(rig.transport.getOutboundDatagrams()).toHaveLength(0);
+    expect(faults).toEqual(['config']);
+  });
+});
+
+describe('capture failures are counted by bounded outcome (story 3 R-19, R-30)', () => {
+  const CAPTURE_FAILURES = 'dt_client_media_capture_failures_total';
+
+  it('a track that ends mid-call counts `ended` on the audio handle, no identity labels', async () => {
+    const rig = await makeRig();
+    rig.capture.endTrack();
+    const recorded = rig.sink.getRecordedMetrics().filter((m) => m.name === CAPTURE_FAILURES);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]!.labels).toEqual({
+      client_version: '0.0.0-test',
+      org_id: 'demo',
+      key_custody: 'operator',
+      media_kind: 'audio',
+      outcome: 'ended',
+    });
   });
 });

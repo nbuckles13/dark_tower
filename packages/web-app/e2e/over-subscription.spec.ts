@@ -6,8 +6,8 @@
 // declaring 2 slots with 3 other senders sees the explicit fewer-sources state
 // on the third" has no third slot to show it (N=2). Both R-2 clauses are
 // covered instead, in two phases with one receiver R that declares N=2 through
-// the per-context `receiveSlots` test lever:
-//   1. UNDER-FILL — one sender: slot 0 `active`, slot 1 `fewer_sources` — an
+// the per-context `audioReceiveSlots` test lever:
+//   1. UNDER-FILL — one sender: slot 0 `active`, slot 1 `fewer_sources_than_slots` — an
 //      under-filled grid (an empty cell with its text), never a spinner;
 //   2. OVER-SUBSCRIPTION — two more senders join, one at a time (each joined and
 //      assigned at R before the next starts, so "earliest" is not scheduling
@@ -18,7 +18,7 @@
 
 import { expect, test } from 'playwright/test';
 import { closeMembers, joinMember, openMember, type Member } from './cohortContexts.js';
-import { cohortSize, SUITE_RECEIVE_SLOTS } from './cohort.js';
+import { cohortSize, SUITE_AUDIO_RECEIVE_SLOTS } from './cohort.js';
 import { bootstrapMeeting } from './fixtures.js';
 import { mhAdmissionRejectionsByInstance } from './mcMetrics.js';
 import {
@@ -40,12 +40,12 @@ test.describe('story 2 S2: under-fill and over-subscription', () => {
   }) => {
     test.setTimeout(180_000);
     expect(
-      cohortSize(SUITE_RECEIVE_SLOTS),
+      cohortSize(SUITE_AUDIO_RECEIVE_SLOTS),
       'S2 needs the receiver plus 3 senders',
     ).toBeGreaterThanOrEqual(4);
     const opened: Member[] = [];
     try {
-      const receiver = await openMember(browser, 0, { receiveSlots: String(R_SLOTS) });
+      const receiver = await openMember(browser, 0, { audioReceiveSlots: String(R_SLOTS) });
       opened.push(receiver);
       const meetingCode = await bootstrapMeeting(receiver.token, 'E2E S2 over-subscription');
       const admissionBaseline = await mhAdmissionRejectionsByInstance();
@@ -59,7 +59,7 @@ test.describe('story 2 S2: under-fill and over-subscription', () => {
       await waitForSenderSlotState(r, s1, 'active');
       const slot1 = r.page.getByTestId('slot-1');
       await expect(slot1, 'the unfilled slot is rendered as a cell').toBeVisible();
-      await expect(slot1).toHaveAttribute('data-slot-state', 'fewer_sources');
+      await expect(slot1).toHaveAttribute('data-slot-state', 'fewer_sources_than_slots');
       await expect(slot1, 'an unfilled cell names nobody').not.toHaveAttribute('data-sender-id');
       await expect(r.page.getByTestId('slot-list').locator('li'), 'exactly N=2 cells').toHaveCount(
         R_SLOTS,

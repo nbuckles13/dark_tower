@@ -51,15 +51,17 @@ async function clickServerMute(actor: JoinedMember, target: JoinedMember): Promi
   await actor.page.getByTestId(`server-mute-${target.joined.participantId}`).click();
 }
 
-/** A probe that reads 1 while `receiver`'s slot for `sender` reads source_muted. */
+/** A probe that reads 1 while `receiver`'s slot for `sender` reads a muted avatar state. */
 function mutedSlotProbe(receiver: JoinedMember, sender: JoinedMember): Probe {
   return {
-    label: `${receiver.label}.slot(${sender.label}).isSourceMuted`,
+    label: `${receiver.label}.slot(${sender.label}).isMutedAvatar`,
     observer: receiver.label,
     expect: 'zero',
     read: async () =>
       (await latestAssignments(receiver)).some(
-        (a) => a.senderId === sender.tone.senderId && a.slotState === 'source_muted',
+        (a) =>
+          a.senderId === sender.tone.senderId &&
+          (a.slotState === 'avatar_server_muted' || a.slotState === 'avatar_client_muted'),
       )
         ? 1
         : 0,
@@ -89,9 +91,10 @@ test.describe('story 2 S3: server mute, and client structural mute', () => {
       // end-to-end check that the token role hint and MC's authority agree).
       await clickServerMute(host, b);
       for (const r of receivers) {
-        await waitForSenderSlotState(r, b, 'source_muted');
+        // Flat vocabulary (story 3): the server cause wins on the slot.
+        await waitForSenderSlotState(r, b, 'avatar_server_muted');
         await waitForRosterToken(r, b, 'data-server-muted', 'true');
-        // Distinct from client mute: the slot's source_muted says nothing about
+        // Distinct from client mute: a server-muted slot says nothing about
         // B's own microphone while B is server-muted.
         await waitForRosterToken(r, b, 'data-client-muted', 'unknown');
       }
@@ -185,7 +188,7 @@ test.describe('story 2 S3: server mute, and client structural mute', () => {
         ),
       ]);
       for (const r of [host, b]) {
-        await waitForSenderSlotState(r, c, 'source_muted');
+        await waitForSenderSlotState(r, c, 'avatar_client_muted');
         await waitForRosterToken(r, c, 'data-client-muted', 'true');
         await waitForRosterToken(r, c, 'data-server-muted', 'false');
       }
