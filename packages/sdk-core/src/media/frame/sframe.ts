@@ -45,7 +45,7 @@
 
 import { concatBytes, type Bytes } from './hex.js';
 import { WIRE_CONSTANTS } from './wireConstants.js';
-import { KEY_ID_BYTES } from './keyId.js';
+import { KEY_ID_BYTES, unpackKeyId } from './keyId.js';
 import { codecReject } from './rejectReason.js';
 
 /**
@@ -281,6 +281,19 @@ export function parseSframe(payload: Uint8Array): SframeObject {
     tag: payload.subarray(KEY_ID_BYTES, minimum) as Bytes,
     ciphertext: payload.subarray(minimum) as Bytes,
   };
+}
+
+/**
+ * The `sender_id` a payload's SFrame key id NAMES — UNVERIFIED until the frame's
+ * signature checks against that sender's roster key. The ONE parse every
+ * receive site uses (audio and video ingress, the stream reader's header).
+ * Reads only the clear key id; the payload slice must be the frame's whole
+ * declared payload (its length is what `parseSframe` bounds).
+ *
+ * @throws {FrameRejectedError} `truncated` if the payload cannot hold the clear header.
+ */
+export function keyIdSenderOf(payload: Uint8Array): number {
+  return Number(unpackKeyId(parseSframe(payload).keyId).senderId);
 }
 
 /**

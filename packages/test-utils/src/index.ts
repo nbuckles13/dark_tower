@@ -74,3 +74,12 @@ export {
   type FakeEncodedFrame,
   type RecordingPlaybackLane,
 } from './media/index.js';
+
+// --- Video receive seam doubles (story 3 C-B): decoder + VideoFrame close counter ---
+export {
+  FakeVideoDecoders,
+  FakeVideoFrame,
+  FakeVideoFrameRegistry,
+  type FakeVideoChunk,
+  type FakeVideoDecoderRecord,
+} from './media/video.js';

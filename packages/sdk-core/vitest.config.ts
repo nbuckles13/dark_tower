@@ -82,6 +82,8 @@ export default defineConfig({
         // `vp8.ts`, `videoCapture.ts` and `testPattern.ts`.
         'src/media/setup/videoCaptureBrowser.ts',
         'src/media/setup/vp8Encoder.ts',
+        // Story 3 C-B: the VP8 decoder counterpart, same rule.
+        'src/media/setup/vp8Decoder.ts',
       ],
       // ≥90% gate (R-41 / R-47). Enforced here so `vitest run --coverage`
       // exits non-zero if any metric drops below threshold — CI does not

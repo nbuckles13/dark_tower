@@ -720,6 +720,8 @@ service catalog):
 | `dt_client_media_frames_dropped_total` | `reason` | the split key-generation reasons `no_kek_for_generation` and `kek_generation_stale` |
 | `dt_client_media_send_groups_stopped_total` | `outcome` | `MEDIA_SEND_GROUP_STOP_OUTCOMES` (`peer_stopped`, `open_failed`, `open_stalled`; story 3 C-A2) — a per-metric vocabulary |
 | `dt_client_media_keyframes_produced_total` | `source` | `MEDIA_KEYFRAME_SOURCES` (`directive_start`, `request`, `abandonment`; story 3 C-A2) — a per-metric vocabulary, never summed by `source` with `dt_client_media_kek_updates_total` |
+| `dt_client_media_recovery_requests_sent_total` | `source` | `MEDIA_RECOVERY_SOURCES` (`verify_failed`, `decrypt_failed`, `decoder_error`, `local_drop`, `group_abandoned`, `server_mute_lifted`; story 3 C-B) — a per-metric vocabulary of loss CAUSES, never summed by `source` with `dt_client_media_keyframes_produced_total` or `dt_client_media_kek_updates_total`; deliberately NOT `reason` (the frame-drop label space; `decrypt_failed` here is a superset of the codec token of that name) |
+| `dt_client_media_frames_dropped_total` | `reason` | story 3 C-B emits the video receive tokens (`self_sender`, `sender_server_muted`, `decode_over_bound`, `stream_partial_reset`, `stream_slot_mismatch`; vectors file, `has_vector: false`) on `media_kind="video"` |
 
 The authoritative value lists are the code enums named in each catalog entry. This table says which
 label each series gained; it is not a second copy of the values.

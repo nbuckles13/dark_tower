@@ -80,6 +80,13 @@ export interface TestFrameSpec {
    */
   readonly headerVersion?: number;
   readonly gopCounter?: number;
+  /**
+   * Seal the payload under THIS transmit key instead of the wrapped one — a
+   * validly signed frame that fails `decrypt_failed`.
+   */
+  readonly sealTransmitKey?: Uint8Array;
+  /** The `independentlyDecodable` flag (default true; video deltas set false). */
+  readonly independentlyDecodable?: boolean;
 }
 
 /** Build one complete frame (default: the current header version) with real crypto. */
@@ -107,7 +114,11 @@ export async function buildTestFrame(spec: TestFrameSpec): Promise<Bytes> {
       }
     : null;
 
-  const flags = { independentlyDecodable: true, discardable: false, keyBearing } as const;
+  const flags = {
+    independentlyDecodable: spec.independentlyDecodable ?? true,
+    discardable: false,
+    keyBearing,
+  } as const;
   const region = buildPublisherRegion(
     {
       headerVersion,
@@ -122,7 +133,7 @@ export async function buildTestFrame(spec: TestFrameSpec): Promise<Bytes> {
 
   const derived = await deriveSframeKeys({
     hash: 'SHA-512',
-    baseKey: transmitKey,
+    baseKey: spec.sealTransmitKey ?? transmitKey,
     kid: keyId,
     cipherSuiteId: SFRAME_CIPHER_SUITE_ID,
     keyBytes: AES_256_KEY_BYTES,

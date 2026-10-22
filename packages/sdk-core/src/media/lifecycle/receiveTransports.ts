@@ -1,9 +1,9 @@
 // File: packages/sdk-core/src/media/lifecycle/receiveTransports.ts
 //
-// The inbound read loops: ONE loop and ONE hop-sequence monitor per media-handler
-// transport. A sibling of the hot path (see `AudioPipeline.ts`), split out of the
-// pipeline because it is a separable responsibility — which transports are being
-// read — rather than orchestration.
+// The inbound read loops: ONE loop per media-handler transport (and, for audio
+// datagrams, ONE hop-sequence monitor per transport). A sibling of the hot path
+// (see `AudioPipeline.ts`), split out of the pipeline because it is a separable
+// responsibility — which transports are being read — rather than orchestration.
 //
 // ---------------------------------------------------------------------------
 // EACH LOOP STARTS AT MOST ONCE, AND IS NEVER TORN DOWN ON AN ASSIGNMENT CHANGE
@@ -36,7 +36,151 @@
 
 import { HopSequenceMonitor } from '../pipeline/hopSequenceMonitor.js';
 
-/** What the read loops need from their owner. */
+/**
+ * The bounded, literal texts one kind of loop reports with. Static strings
+ * only: they are part of the owner's event-once fault dedupe key.
+ */
+export interface ReadLoopTexts {
+  /** Registration name prefix for a loop's disposer (a static literal). */
+  readonly disposerName: string;
+  /** The readable ended while the session was still active. */
+  readonly ended: string;
+  /** The reader failed. */
+  readonly failed: string;
+  /** One item could not be processed for a non-wire reason: a defect. */
+  readonly itemDefect: string;
+}
+
+/** What one kind's per-handler read loops need from their owner. */
+export interface PerHandlerReadLoopsOptions<T, C> {
+  /**
+   * The readable for an ALREADY-CONNECTED handler, or `undefined`. A selector
+   * over transports `connectAll` opened, never a dialer.
+   */
+  readonly readableFor: (mediaHandlerUrl: string) => ReadableStream<T> | undefined;
+  /** Per-handler context, created once when that handler's loop starts. */
+  readonly contextFor: (mediaHandlerUrl: string) => C;
+  /**
+   * Process one item. Returns normally for every WIRE condition; a throw is a
+   * defect, surfaced once through `frameFault`, and the loop continues. The loop
+   * AWAITS it, so an item that must not block the loop returns at once.
+   */
+  readonly onItem: (item: T, context: C) => Promise<void> | void;
+  readonly isStopped: () => boolean;
+  /** Register a disposer with the owner's teardown. */
+  readonly register: (name: string, dispose: () => void) => void;
+  /** A transport-level condition. Non-fatal; deduplicated by the owner. */
+  readonly transportFault: (message: string) => void;
+  /** An item that could not be processed for a non-wire reason: a defect. */
+  readonly frameFault: (message: string) => void;
+  readonly texts: ReadLoopTexts;
+}
+
+/**
+ * ONE read loop per media-handler transport, each started at most once and
+ * never torn down on an assignment change — the rules in this module's header,
+ * written once for every kind (story 3 C-B, DRY P4): datagrams for audio, the
+ * incoming group-stream acceptor for video.
+ */
+export class PerHandlerReadLoops<T, C> {
+  readonly #options: PerHandlerReadLoopsOptions<T, C>;
+  /** The handlers a read loop is running on. One entry per transport. */
+  readonly #loops = new Map<string, C>();
+
+  constructor(options: PerHandlerReadLoopsOptions<T, C>) {
+    this.#options = options;
+  }
+
+  /**
+   * Start a read loop on every handler in `urls` not already looping. Loops
+   * already running are left exactly as they are, including when an edge moves
+   * off their handler.
+   */
+  open(urls: readonly string[]): void {
+    if (this.#options.isStopped()) return;
+    for (const url of urls) {
+      if (this.#loops.has(url)) continue;
+      const readable = this.#options.readableFor(url);
+      if (!readable) {
+        // A slot assigned on a transport we never opened. Structurally a server
+        // condition — MC's connectivity view names a transport we do not hold —
+        // and the last thing this client can do about it is say so loudly.
+        this.#options.transportFault(
+          'slot assignments name a media handler this client is not connected to',
+        );
+        continue;
+      }
+      if (readable.locked) {
+        // Two DISTINCT urls resolved to one readable. A `ReadableStream` takes
+        // only one reader, so `getReader()` would THROW — from inside an
+        // assignment handler. Checked rather than caught so the condition is
+        // named, and so the other handlers in this snapshot still get loops.
+        this.#options.transportFault('two media handlers resolved to the same media transport');
+        continue;
+      }
+      const context = this.#options.contextFor(url);
+      this.#loops.set(url, context);
+      this.#start(readable, context);
+    }
+  }
+
+  /** Every running loop's context. For the owner's teardown. */
+  contexts(): IterableIterator<C> {
+    return this.#loops.values();
+  }
+
+  #start(readable: ReadableStream<T>, context: C): void {
+    const reader = readable.getReader();
+    // Registered per loop. The name is a static literal plus the LOOP COUNT, not
+    // the URL: a teardown-failure fault interpolates this name, and a handler URL
+    // in a fault message would be an unbounded value on a bounded path.
+    this.#options.register(`${this.#options.texts.disposerName}-${this.#loops.size}`, () => {
+      void reader.cancel().catch(() => {
+        // Already cancelled or errored; the transport close is what matters.
+      });
+    });
+    void this.#loop(reader, context);
+  }
+
+  async #loop(reader: ReadableStreamDefaultReader<T>, context: C): Promise<void> {
+    const { texts } = this.#options;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) {
+          if (!this.#options.isStopped()) {
+            // Absence of media is not a signal (ADR-0036 §6): a readable that
+            // ends while the session continues is a real condition and is
+            // surfaced rather than read as silence.
+            this.#options.transportFault(texts.ended);
+          }
+          return;
+        }
+        if (value === undefined) continue;
+        try {
+          await this.#options.onItem(value, context);
+        } catch {
+          // `onItem` returns normally for every WIRE condition; reaching here
+          // means a defect. Surfaced ONCE — a repeating defect must not become
+          // per-frame telemetry — and the loop continues, because one bad item
+          // must not end media for the session.
+          this.#options.frameFault(texts.itemDefect);
+        }
+      }
+    } catch {
+      if (this.#options.isStopped()) return;
+      this.#options.transportFault(texts.failed);
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        // Already released during teardown.
+      }
+    }
+  }
+}
+
+/** What the DATAGRAM read loops need from their owner. */
 export interface ReceiveTransportsOptions {
   /**
    * Inbound datagrams for an ALREADY-CONNECTED handler, or `undefined`. A
@@ -56,116 +200,39 @@ export interface ReceiveTransportsOptions {
   readonly frameFault: (message: string) => void;
 }
 
-/** The read loops and their per-transport hop monitors. */
+/** The DATAGRAM (audio) read loops and their per-transport hop monitors. */
 export class ReceiveTransports {
-  readonly #options: ReceiveTransportsOptions;
-  /** The handlers a read loop is running on. One entry per transport. */
-  readonly #readLoops = new Set<string>();
-  readonly #hopMonitors = new Map<string, HopSequenceMonitor>();
+  readonly #loops: PerHandlerReadLoops<Uint8Array, HopSequenceMonitor>;
 
   constructor(options: ReceiveTransportsOptions) {
-    this.#options = options;
+    this.#loops = new PerHandlerReadLoops({
+      readableFor: options.readableFor,
+      // A hop monitor PER TRANSPORT, never shared (module header).
+      contextFor: () =>
+        new HopSequenceMonitor(options.declaredSlotIds, options.hopRestartBackwardJumpFrames),
+      // The monitor for THIS transport travels with the datagram: each handler
+      // writes its own hop numbering (see `IngressPipeline.accept`).
+      onItem: (datagram, monitor) => options.accept(datagram, monitor),
+      isStopped: options.isStopped,
+      register: options.register,
+      transportFault: options.transportFault,
+      frameFault: options.frameFault,
+      texts: {
+        disposerName: 'datagram-reader',
+        ended: 'the inbound media datagram stream ended while the session was still active',
+        failed: 'the media datagram reader failed',
+        itemDefect: 'a media frame could not be processed',
+      },
+    });
   }
 
-  /**
-   * Start a read loop on every handler in `urls` not already looping.
-   *
-   * Loops already running are left exactly as they are, including when an edge
-   * moves off their handler.
-   */
+  /** Start a read loop on every handler in `urls` not already looping. */
   open(urls: readonly string[]): void {
-    if (this.#options.isStopped()) return;
-    for (const url of urls) {
-      if (this.#readLoops.has(url)) continue;
-      const readable = this.#options.readableFor(url);
-      if (!readable) {
-        // A slot assigned on a transport we never opened. Structurally a server
-        // condition — MC's connectivity view names a transport we do not hold —
-        // and the last thing this client can do about it is say so loudly.
-        this.#options.transportFault(
-          'slot assignments name a media handler this client is not connected to',
-        );
-        continue;
-      }
-      if (readable.locked) {
-        // Two DISTINCT urls resolved to one datagram stream. A `ReadableStream`
-        // takes only one reader, so `getReader()` would THROW — from inside an
-        // assignment handler, where it would surface as "media stopped when
-        // someone joined" rather than as what it is. Checked rather than caught
-        // so the condition is named, and so the other handlers in this snapshot
-        // still get their loops.
-        this.#options.transportFault('two media handlers resolved to the same media transport');
-        continue;
-      }
-      this.#readLoops.add(url);
-      const monitor = new HopSequenceMonitor(
-        this.#options.declaredSlotIds,
-        this.#options.hopRestartBackwardJumpFrames,
-      );
-      this.#hopMonitors.set(url, monitor);
-      this.#start(readable, monitor);
-    }
+    this.#loops.open(urls);
   }
 
   /** Drop every hop monitor's state. Called from the owner's teardown. */
   clear(): void {
-    for (const monitor of this.#hopMonitors.values()) monitor.clear();
-    this.#hopMonitors.clear();
-  }
-
-  #start(readable: ReadableStream<Uint8Array>, monitor: HopSequenceMonitor): void {
-    const reader = readable.getReader();
-    // Registered per loop. The name is a static literal plus the LOOP COUNT, not
-    // the URL: a teardown-failure fault interpolates this name, and a handler URL
-    // in a fault message would be an unbounded value on a bounded path.
-    this.#options.register(`datagram-reader-${this.#readLoops.size}`, () => {
-      void reader.cancel().catch(() => {
-        // Already cancelled or errored; the transport close is what matters.
-      });
-    });
-    void this.#loop(reader, monitor);
-  }
-
-  async #loop(
-    reader: ReadableStreamDefaultReader<Uint8Array>,
-    monitor: HopSequenceMonitor,
-  ): Promise<void> {
-    try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) {
-          if (!this.#options.isStopped()) {
-            // Absence of frames is not a signal (ADR-0036 §6): a datagram stream
-            // that ends while the session continues is a real condition and is
-            // surfaced rather than read as silence.
-            this.#options.transportFault(
-              'the inbound media datagram stream ended while the session was still active',
-            );
-          }
-          return;
-        }
-        if (value === undefined) continue;
-        try {
-          // The monitor for THIS transport travels with the datagram: each
-          // handler writes its own hop numbering (see `IngressPipeline.accept`).
-          await this.#options.accept(value, monitor);
-        } catch {
-          // `accept` returns normally for every WIRE condition; reaching here
-          // means a defect. Surfaced ONCE — a repeating defect must not become
-          // per-frame telemetry — and the loop continues, because one bad frame
-          // must not end media for the session.
-          this.#options.frameFault('a media frame could not be processed');
-        }
-      }
-    } catch {
-      if (this.#options.isStopped()) return;
-      this.#options.transportFault('the media datagram reader failed');
-    } finally {
-      try {
-        reader.releaseLock();
-      } catch {
-        // Already released during teardown.
-      }
-    }
+    for (const monitor of this.#loops.contexts()) monitor.clear();
   }
 }

@@ -41,3 +41,19 @@ describe('pairSlotsBySender', () => {
     });
   });
 });
+
+describe('pairSlotsBySender — live video by VERIFIED sender (story 3 C-B)', () => {
+  it('pairs a live video slot by the verified sender of its last rendered frame, beside its audio slot', () => {
+    const pairs = pairSlotsBySender(
+      [slot(0, 'audio', 7, 'active'), slot(3, 'video', undefined, 'active')],
+      new Map([[3, 7]]),
+    );
+    expect(pairs.get(7)).toEqual({ audioSlotId: 0, videoSlotId: 3 });
+  });
+
+  it('a live sender with no audio slot still appears; slot index never pairs', () => {
+    const pairs = pairSlotsBySender([slot(1, 'audio', 8, 'active')], new Map([[1, 9]]));
+    expect(pairs.get(9)).toEqual({ videoSlotId: 1 });
+    expect(pairs.get(8)).toEqual({ audioSlotId: 1 });
+  });
+});

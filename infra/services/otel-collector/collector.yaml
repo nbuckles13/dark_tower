@@ -103,6 +103,13 @@ processors:
           - dt_client_media_send_directive_encoding_refused_total
           - dt_client_media_send_groups_stopped_total
           - dt_client_media_encode_queue_dropped_total
+          - dt_client_media_recovery_requests_sent_total
+          - dt_client_media_incoming_streams_refused_total
+          - dt_client_media_slot_unfulfilled_duration_ms
+          - dt_client_media_slots_unfulfilled
+          - dt_client_media_active_source_intervals_total
+          - dt_client_media_time_to_first_render_ms
+          - dt_client_media_slot_active_to_first_render_ms
           - dt_client_time_to_first_media_frame_ms
 
   # ---------------------------------------------------------------------
@@ -486,9 +493,29 @@ processors:
   #   - honest (audio and video emit): 67 x 2 + 19 = 153 -> ~3.3 runs of headroom
   #   - adversarial:                   67 x 3 + 19 = 220 -> ~2.3 runs
   # The honest figure (3.3) is still above the 3-run trigger: no cap change.
-  # NEXT: C-B (task 14: video receive and recovery series) and C-C1 (task 17)
-  # add per-kind names; the task whose additions take the honest figure below
-  # 3 runs raises the cap.
+  # STORY 3 C-B (task 14) — the video RECEIVE series. The allowlist is 42
+  # names. Seven names, every one emitted on `media_kind="video"` ONLY (the
+  # video receiver is the sole caller; audio never emits them), so they cost
+  # ONE stream per org honestly and are counted that way below rather than
+  # through the x2 per-kind multiplier:
+  #   - `dt_client_media_recovery_requests_sent_total` x 6 `source` values
+  #     (`MEDIA_RECOVERY_SOURCES`, zero-initialised at receiver start): +6;
+  #   - `dt_client_media_incoming_streams_refused_total`: +1;
+  #   - `dt_client_media_slot_unfulfilled_duration_ms` (histogram = 1): +1;
+  #   - `dt_client_media_slots_unfulfilled`: +1;
+  #   - `dt_client_media_active_source_intervals_total`: +1;
+  #   - `dt_client_media_time_to_first_render_ms` (histogram = 1): +1;
+  #   - `dt_client_media_slot_active_to_first_render_ms` (histogram = 1): +1.
+  #   +12 video-only streams. No new label KEY (`source` is already kept).
+  #   Existing per-kind names gain no values (the video receive drop tokens
+  #   were counted at P2).
+  # Per per-run `org_id`:
+  #   - honest (audio and video emit): 67 x 2 + 19 + 12 = 165 -> ~3.0 runs
+  #   - adversarial (a patched client emits the 12 under audio and `invalid`
+  #     too): 67 x 3 + 19 + 12 x 3 = 256 -> ~2.0 runs
+  # The honest figure (3.03) is still at/above the 3-run trigger: no cap
+  # change in C-B. C-C1 (task 17) adds the next names and, if it adds any
+  # stream, takes the honest figure below 3 runs and so RAISES THE CAP.
   # Kept at 500 (operations ruling, story 3 task 2): this is a fail-closed
   # tripwire, not a capacity estimate, and per-run orgs overlap only within
   # `max_stale`. Because of the multiplier, every PER-KIND name a later task

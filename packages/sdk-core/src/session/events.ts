@@ -20,8 +20,10 @@ import type {
   CaptureSourceFactory,
   PlaybackSinkFactory,
   VideoCaptureSourceFactory,
+  VideoDecoderFactory,
   VideoEncoderFactory,
 } from '../media/setup/seams.js';
+import type { VideoRenderState } from '../media/pipeline/renderDecision.js';
 import type { Vp8Profile } from '../media/setup/vp8.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
 import type { MediaFault } from '../media/lifecycle/AudioPipeline.js';
@@ -202,6 +204,20 @@ export interface MeetingSessionEventMap {
    * (story 3 C-C1). Carries the kind ONLY.
    */
   captureResumedAfterServerMute: CaptureResumedAfterServerMuteEvent;
+  /**
+   * What one VIDEO receive slot renders changed (story 3 R-4, R-5): live from a
+   * verified sender, an avatar for MC's named participant with MC's reason,
+   * fewer sources, unavailable, or none (fail closed). TRANSITIONS ONLY, never
+   * per frame. Frames themselves never travel on an event: they are drawn
+   * through the slot's `VideoSink` (`MeetingSession.videoReceive.setVideoSink`).
+   */
+  videoSlotRenderChanged: VideoSlotRenderChangedEvent;
+}
+
+/** Payload of `videoSlotRenderChanged`. */
+export interface VideoSlotRenderChangedEvent {
+  readonly slotId: number;
+  readonly state: VideoRenderState;
 }
 
 /** Payload of `captureResumedAfterServerMute`: the kind only, never an identity. */
@@ -323,6 +339,12 @@ export interface MeetingSessionOptions {
   readonly videoCaptureFactory?: VideoCaptureSourceFactory;
   /** VP8 encoder factory. Defaults to WebCodecs; injected for tests. */
   readonly videoEncoderFactory?: VideoEncoderFactory;
+  /**
+   * VP8 DECODER factory, one call per video receive slot (story 3 C-B).
+   * Defaults to WebCodecs; injected for tests — its call count is the R-6 test
+   * seam (exactly M; a source switch constructs none).
+   */
+  readonly videoDecoderFactory?: VideoDecoderFactory;
   /**
    * The VP8 capability probe run at join when video is published or received
    * (story 3 R-8). Defaults to `media/setup/vp8.ts:probeVp8Support`; injected

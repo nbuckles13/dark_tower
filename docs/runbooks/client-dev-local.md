@@ -1668,6 +1668,65 @@ lockfile under an existing `node_modules` — the fix for the second case is jus
 
 ---
 
+### F21 — Media start fails with a `media.videoReceive` configuration error
+
+**Symptom.** `startMedia()` rejects with a `ClientConfigError` whose `configKey` starts with
+`media.videoReceive.` (story 3 C-B), before any device opens. Nothing is published or received.
+
+**What it means.** The video receive bounds are validated at media start and the SDK REFUSES to
+start rather than run with a bound that cannot hold. Each message names the values involved:
+
+- `media.videoReceive.maxIncomingStreams (C) must be at least 2 x media.receive.videoSlots (M = m) + 2 = F`
+  — the incoming group-stream cap is below the floor for this M. Usually M was raised
+  (`VITE_DT_VIDEO_RECEIVE_SLOTS`) without the cap: the defaults admit M up to 7.
+- `... x the maximum frame size (B bytes) = P bytes exceeds media.videoReceive.readerMemoryCeilingBytes (L)`
+  — each open stream may buffer one whole frame before verify; lower the cap or raise the ceiling.
+  (The per-slot jitter buffers, M x `jitterMaxBytes`, are OUTSIDE this ceiling.)
+- `jitterMaxBytes` below one maximal frame, or decode bounds that do not admit the production
+  profile (640x360 at 30 fps).
+
+**Fix.** These are code-config (`packages/sdk-core/src/config/clientConfig.ts`, `DEFAULT_CLIENT_CONFIG`
+or the embedder's `mediaConfig`), outside every ConfigMap: change the value named in the message and
+rebuild the web app. The effective values are logged once at receiver start
+(`[dt-media-video-receive-config] media receive config (...)`).
+
+---
+
+### F22 — Video slots stay frozen or blank: `stream_slot_mismatch`, `stream_partial_reset` or refused streams
+
+**Symptom.** A video slot MC reports `active` shows a frozen frame or the previous avatar, and the
+client-media board's *Video Slot Unfulfilled* panels rise. One of these is non-zero:
+`dt_client_media_frames_dropped_total{media_kind="video", reason="stream_slot_mismatch"}`,
+`{reason="stream_partial_reset"}`, or `dt_client_media_incoming_streams_refused_total`.
+
+**What it means.**
+- `stream_slot_mismatch` — a downlink group stream named a slot this client never declared for
+  video (or an audio slot id), or changed slot mid-stream; the client aborts that stream. MH
+  guarantees one stream per slot, so a sustained rate is an MH slot-mapping defect
+  (`undeclared_stream_id_total{media_kind="video"}` rises beside it for undeclared ids).
+- `stream_partial_reset` — a frame was cut by its stream's end: MH abandoned the group (RESET,
+  R-12; the client then sends a `group_abandoned` recovery request) or the stream FINished mid-frame.
+  Bursts are normal on a slow path; sustained means repeated abandonment — see MH's backlog resets.
+- `incoming_streams_refused_total` — MH had more concurrent group streams open to this client than
+  `media.videoReceive.maxIncomingStreams` allows; extra streams are cancelled unread.
+
+**Where to look next.** `dt_client_media_recovery_requests_sent_total{source}` says whether the
+client asked for recovery and why; MH's own recovery-request outcome counters say whether MH
+forwarded it (`duplicate`, `stale`, `counter_ahead`, `source_mismatch` are not forwarded). Then
+[`mh-incident-response.md`](mh-incident-response.md) for the MH half.
+
+**A flat recovery counter is not "no losses".** A recovery-request WRITE that fails is not counted on
+`recovery_requests_sent_total`; it surfaces only once per session as the `mediaFault`
+"a video recovery request could not be sent to the media handler". Check the session's media faults
+before reading a flat line as healthy.
+
+**Mitigation without a revert.** Set `VITE_DT_VIDEO_RECEIVE_SLOTS=0` and rebuild the web app: with no
+video slots declared, no video receiver is built at all (the SDK gates it on declared video slots) and
+audio is unaffected. Server-side, MC's `MC_MAX_VIDEO_RECEIVE_SLOTS=0` lever turns video off for every
+client (R-26).
+
+---
+
 ## 6. Teardown
 
 ```bash

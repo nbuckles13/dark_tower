@@ -1223,6 +1223,20 @@ None of the video send-path series below is alerted yet. Each lands with catalog
 | `dt_client_media_send_directive_encoding_refused_total` | none yet — story 3 OBS-B | reads zero against a conforming MC |
 | `dt_client_media_keyframe_min_interval_clamped_total` | panel only, BY DECISION (task text) | reads zero against a correct MC; a drift / hostile-controller signal |
 
+### Deliberate absences (client video receive path, story 3 C-B)
+
+None of the video receive series below is alerted by C-B; the video alert inventory (A1–A9) is story 3 OBS-B's.
+
+| Series | Alert | Reason |
+|---|---|---|
+| `dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video"}` | none yet — story 3 OBS-B (A5) | MH 19 selects on it; the threshold must tolerate the per-mute burst (catalog: residual race) |
+| `dt_client_media_recovery_requests_sent_total{source}` | none yet — story 3 OBS-B | bounded per slot by groups received; MH counts forwarded vs deduped |
+| `dt_client_media_incoming_streams_refused_total` | none yet — story 3 OBS-B | an MH stream-concurrency defect signal; no baseline yet |
+| `dt_client_media_slot_unfulfilled_duration_ms` | none yet — story 3 OBS-B (A9 `ClientVideoSlotUnfulfilled`) | the fleet-meaningful unfulfilled signal; observed on exit only |
+| `dt_client_media_slots_unfulfilled` | panel only, BY DECISION | single-writer gauge: last-writer-wins across browsers, never a fleet count |
+| `dt_client_media_active_source_intervals_total` | none | a decode-activity rate, read with the unfulfilled histogram |
+| `dt_client_media_time_to_first_render_ms`, `dt_client_media_slot_active_to_first_render_ms` | none, BY DECISION | open objectives: observed, never gated (ADR-0036 §10) |
+
 ---
 
 ## Telemetry Pipeline Alerts (OTel collector) — SPECIFIED, NOT LOADED

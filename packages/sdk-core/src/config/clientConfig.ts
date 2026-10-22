@@ -36,6 +36,7 @@ import {
   HOP_HALF_SPACE,
 } from '../media/pipeline/hopSequenceMonitor.js';
 import type { MediaKindToken } from '../media/mediaKind.js';
+import { MAX_FRAME_BYTES } from '../media/frame/frameCodec.js';
 
 /** Opus `application` mode. Mirrors the WebCodecs Opus registration. */
 export type OpusApplication = 'voip' | 'audio' | 'lowdelay';
@@ -246,6 +247,55 @@ export interface VideoConfig {
   readonly capabilityProbe: VideoCapabilityProbeConfig;
 }
 
+/**
+ * The VIDEO receive path's client bounds (story 3 C-B, R-21, R-6, R-23). Code
+ * config — bundle constants, outside every ConfigMap and the env-config guard;
+ * logged once at receiver start by {@link videoReceiveConfigLogLine}.
+ */
+export interface VideoReceiveConfig {
+  /**
+   * Concurrent INCOMING group streams across every handler (one stream per
+   * forwarded group, R-21). A stream arriving at the cap is refused (cancelled,
+   * counted on `dt_client_media_incoming_streams_refused_total`), never queued.
+   * Floor `2 × M + VIDEO_STREAM_CAP_HEADROOM`: at a group boundary a slot's old
+   * stream may still drain while its new one opens.
+   */
+  readonly maxIncomingStreams: number;
+  /**
+   * The READER memory ceiling: `maxIncomingStreams × MAX_FRAME_BYTES` (each open
+   * stream buffers at most one whole frame before verify) must not exceed it,
+   * or the receive path refuses to start. NOT the total receive-memory bound:
+   * the per-slot jitter buffers (M × {@link jitterMaxBytes}) sit outside it.
+   */
+  readonly readerMemoryCeilingBytes: number;
+  /** Per-slot jitter buffer: frames held ahead of the decoder. Overflow is a `local_drop`. */
+  readonly jitterMaxFrames: number;
+  /** Per-slot jitter buffer: bytes held. At least one maximal frame. */
+  readonly jitterMaxBytes: number;
+  /**
+   * Per-slot jitter buffer: a frame held longer than this (injected clock) is
+   * discarded with its group as a `local_drop`, so nothing can stall a slot.
+   */
+  readonly jitterMaxHoldMs: number;
+  /** Frames handed to a slot's decoder and not yet output before the buffer holds back. */
+  readonly decoderQueueTarget: number;
+  /**
+   * The slot decoder's configured bounds (R-6). The decoder is configured FROM
+   * these, never from the bitstream; output above them is dropped
+   * (`decode_over_bound`). Must admit the production profile
+   * (`video.capabilityProbe`).
+   */
+  readonly decodeMaxWidth: number;
+  readonly decodeMaxHeight: number;
+  readonly decodeMaxFrameRateHz: number;
+}
+
+/**
+ * The constant `c` in the incoming-stream floor `2 × M + c` (story 3 C-B): a
+ * little room beyond one draining and one opening stream per slot.
+ */
+export const VIDEO_STREAM_CAP_HEADROOM = 2;
+
 /** Receive-path bounds. */
 export interface IngressConfig {
   /** `WebTransportDatagramDuplexStream.incomingHighWaterMark`, in datagrams. */
@@ -364,10 +414,11 @@ export interface ReceiveConfig {
 export const DEFAULT_RECEIVE_AUDIO_SLOTS = 1;
 
 /**
- * The SDK's fallback M when an embedder configures none: 0. This SDK has no
- * video receive path yet (story 3 task 14, C-B, adds it), so a default that
- * declared video slots would ask MC to direct publishers' video to a client
- * that cannot read it. Story 3 E6 ruling (lead, 2026-10-21).
+ * The SDK's fallback M when an embedder configures none: 0. The SDK has a video
+ * receive path (story 3 C-B), but until a grid renders it (C-C1) a default that
+ * declared video slots would direct publishers' cameras at a client with no UI
+ * to show them — a privacy and egress cost for nothing. Story 3 E6 / C-B E3
+ * rulings (lead); C-C1 revisits.
  */
 export const DEFAULT_RECEIVE_VIDEO_SLOTS = 0;
 
@@ -484,6 +535,7 @@ export interface TelemetryCadenceConfig {
 export interface MediaConfig {
   readonly audio: AudioConfig;
   readonly video: VideoConfig;
+  readonly videoReceive: VideoReceiveConfig;
   readonly keys: KeyRotationConfig;
   readonly egress: EgressConfig;
   readonly ingress: IngressConfig;
@@ -713,6 +765,18 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
     video: {
       capabilityProbe: { width: 640, height: 360, frameRateHz: 30, bitrateBps: 800_000 },
     },
+    videoReceive: {
+      // 2 x 7 + 2: the defaults admit up to M = 7 video slots.
+      maxIncomingStreams: 16,
+      readerMemoryCeilingBytes: 32 * 1024 * 1024,
+      jitterMaxFrames: 60,
+      jitterMaxBytes: 2 * 1024 * 1024,
+      jitterMaxHoldMs: 2_000,
+      decoderQueueTarget: 3,
+      decodeMaxWidth: 1280,
+      decodeMaxHeight: 720,
+      decodeMaxFrameRateHz: 60,
+    },
     keys: {
       audioRotationPeriodMs: 60_000,
       videoRotationPeriodMs: 60_000,
@@ -886,6 +950,8 @@ export function validateMediaConfig(media: MediaConfig): void {
     'media.receiverState.maxTransmitKeysPerSender',
   );
 
+  validateVideoReceive(media);
+
   if (audio.opusComplexity < 0 || audio.opusComplexity > 10) {
     throw new ClientConfigError(
       'media.audio.opusComplexity',
@@ -941,6 +1007,91 @@ export function validateMediaConfig(media: MediaConfig): void {
         `floor drops frames from senders that have not yet re-wrapped under a rotated KEK`,
     );
   }
+}
+
+/**
+ * The video receive bounds (story 3 C-B, R-21/R-23). Every refusal names the
+ * values involved, so the fix is obvious from the message alone.
+ */
+function validateVideoReceive(media: MediaConfig): void {
+  const v = media.videoReceive;
+  const m = media.receive.videoSlots;
+  positiveInteger(v.maxIncomingStreams, 'media.videoReceive.maxIncomingStreams');
+  positiveInteger(v.readerMemoryCeilingBytes, 'media.videoReceive.readerMemoryCeilingBytes');
+  positiveInteger(v.jitterMaxFrames, 'media.videoReceive.jitterMaxFrames');
+  positiveInteger(v.jitterMaxBytes, 'media.videoReceive.jitterMaxBytes');
+  positiveInteger(v.jitterMaxHoldMs, 'media.videoReceive.jitterMaxHoldMs');
+  positiveInteger(v.decoderQueueTarget, 'media.videoReceive.decoderQueueTarget');
+  positiveInteger(v.decodeMaxWidth, 'media.videoReceive.decodeMaxWidth');
+  positiveInteger(v.decodeMaxHeight, 'media.videoReceive.decodeMaxHeight');
+  positiveInteger(v.decodeMaxFrameRateHz, 'media.videoReceive.decodeMaxFrameRateHz');
+  const floor = 2 * m + VIDEO_STREAM_CAP_HEADROOM;
+  if (v.maxIncomingStreams < floor) {
+    throw new ClientConfigError(
+      'media.videoReceive.maxIncomingStreams',
+      `media.videoReceive.maxIncomingStreams (${v.maxIncomingStreams}) must be at least ` +
+        `2 x media.receive.videoSlots (M = ${m}) + ${VIDEO_STREAM_CAP_HEADROOM} = ${floor}: at a ` +
+        `group boundary each slot's old stream can still drain while its new one opens, so a ` +
+        `lower cap refuses legitimate group streams`,
+    );
+  }
+  const product = v.maxIncomingStreams * MAX_FRAME_BYTES;
+  if (product > v.readerMemoryCeilingBytes) {
+    throw new ClientConfigError(
+      'media.videoReceive.readerMemoryCeilingBytes',
+      `media.videoReceive.maxIncomingStreams (${v.maxIncomingStreams}) x the maximum frame size ` +
+        `(${MAX_FRAME_BYTES} bytes) = ${product} bytes exceeds ` +
+        `media.videoReceive.readerMemoryCeilingBytes (${v.readerMemoryCeilingBytes}); lower the ` +
+        `stream cap or raise the ceiling`,
+    );
+  }
+  if (v.jitterMaxBytes < MAX_FRAME_BYTES) {
+    throw new ClientConfigError(
+      'media.videoReceive.jitterMaxBytes',
+      `media.videoReceive.jitterMaxBytes (${v.jitterMaxBytes}) must be at least one maximal ` +
+        `frame (${MAX_FRAME_BYTES} bytes), or a legal frame could never be buffered`,
+    );
+  }
+  const probe = media.video.capabilityProbe;
+  for (const [key, bound, profile, what] of [
+    ['decodeMaxWidth', v.decodeMaxWidth, probe.width, 'width'],
+    ['decodeMaxHeight', v.decodeMaxHeight, probe.height, 'height'],
+    ['decodeMaxFrameRateHz', v.decodeMaxFrameRateHz, probe.frameRateHz, 'frame rate'],
+  ] as const) {
+    if (bound < profile) {
+      throw new ClientConfigError(
+        `media.videoReceive.${key}`,
+        `media.videoReceive.${key} (${bound}) must admit the production profile's ${what} ` +
+          `(${profile}, media.video.capabilityProbe), or every received frame would be dropped as ` +
+          `decode_over_bound`,
+      );
+    }
+  }
+}
+
+/**
+ * The video RECEIVE path's client knobs, as ONE log line (story 3 C-B, R-23),
+ * emitted once at video receiver start. The sibling of
+ * {@link videoConfigLogLine}, same provenance rule and same tuning/rollback
+ * note: numbers and fixed tokens only; code-config, no runtime lever.
+ */
+export function videoReceiveConfigLogLine(media: MediaConfig, source: ConfigValueSource): string {
+  const v = media.videoReceive;
+  return (
+    `media receive config (${source}): ` +
+    `videoSlots=${media.receive.videoSlots}; ` +
+    `maxIncomingStreams=${v.maxIncomingStreams}; ` +
+    `streamCapHeadroom=${VIDEO_STREAM_CAP_HEADROOM} (compiled); ` +
+    `readerMemoryCeilingBytes=${v.readerMemoryCeilingBytes}; ` +
+    `maxFrameBytes=${MAX_FRAME_BYTES} (compiled); ` +
+    `jitterMaxFrames=${v.jitterMaxFrames}; ` +
+    `jitterMaxBytes=${v.jitterMaxBytes}; ` +
+    `jitterMaxHoldMs=${v.jitterMaxHoldMs}; ` +
+    `decoderQueueTarget=${v.decoderQueueTarget}; ` +
+    `decodeMaxWidth=${v.decodeMaxWidth}; ` +
+    `decodeMaxHeight=${v.decodeMaxHeight}; ` +
+    `decodeMaxFrameRateHz=${v.decodeMaxFrameRateHz}`
+  );
 }
 
 /**

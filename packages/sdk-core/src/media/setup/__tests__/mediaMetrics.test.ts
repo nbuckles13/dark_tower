@@ -39,6 +39,9 @@ import {
   MEDIA_KEK_SOURCES,
   MEDIA_MUTE_ACTIONS,
   MEDIA_SEND_DROP_REASONS,
+  MEDIA_RECOVERY_SOURCES,
+  SLOT_UNFULFILLED_BUCKETS_MS,
+  FIRST_RENDER_BUCKETS_MS,
   MediaKindMetrics,
   MediaMetrics,
   MediaSessionMetrics,
@@ -114,6 +117,22 @@ const PER_KIND_EMITTERS: [string, (m: MediaKindMetrics) => void, string | null][
     null,
   ],
   ['dt_client_time_to_first_media_frame_ms', (m) => m.timeToFirstMediaFrameMs(42), null],
+  // Story 3 C-B: the video receive series.
+  [
+    'dt_client_media_recovery_requests_sent_total',
+    (m) => m.recoveryRequestSent(MEDIA_RECOVERY_SOURCES.GroupAbandoned),
+    'source',
+  ],
+  ['dt_client_media_incoming_streams_refused_total', (m) => m.incomingStreamRefused(), null],
+  [
+    'dt_client_media_slot_unfulfilled_duration_ms',
+    (m) => m.slotUnfulfilledDurationMs(120_000),
+    null,
+  ],
+  ['dt_client_media_slots_unfulfilled', (m) => m.slotsUnfulfilled(2), null],
+  ['dt_client_media_active_source_intervals_total', (m) => m.activeSourceIntervals(3), null],
+  ['dt_client_media_time_to_first_render_ms', (m) => m.timeToFirstRenderMs(500), null],
+  ['dt_client_media_slot_active_to_first_render_ms', (m) => m.slotActiveToFirstRenderMs(250), null],
 ];
 
 /** Every SESSION-LEVEL (kind-free) emitter. */
@@ -524,5 +543,44 @@ describe('story 3 C-A1 vocabularies', () => {
     const recorded = sink.getRecordedMetrics();
     expect(recorded.map((r) => r.value)).toEqual([0, 0]);
     expect(Object.keys(recorded[0]!.labels).sort()).toEqual(SESSION_KEYS);
+  });
+});
+
+describe('video receive series (story 3 C-B)', () => {
+  it('the unfulfilled histogram declares its boundaries from the SSoT const, with a bucket above 100 s', () => {
+    const sink = new InMemoryMetricsSink();
+    const m = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Video, sink);
+    m.slotUnfulfilledDurationMs(5);
+    const [obs] = sink.getRecordedMetrics();
+    expect(obs?.boundaries).toEqual(SLOT_UNFULFILLED_BUCKETS_MS);
+    expect(SLOT_UNFULFILLED_BUCKETS_MS.some((b) => b > 100_000)).toBe(true);
+    // Sorted strictly ascending, as OTel requires.
+    expect([...SLOT_UNFULFILLED_BUCKETS_MS].sort((a, b) => a - b)).toEqual(
+      SLOT_UNFULFILLED_BUCKETS_MS,
+    );
+    expect(new Set(SLOT_UNFULFILLED_BUCKETS_MS).size).toBe(SLOT_UNFULFILLED_BUCKETS_MS.length);
+  });
+
+  it('both first-render histograms declare the first-render boundaries, past the 10 s maximum keyframe interval', () => {
+    const sink = new InMemoryMetricsSink();
+    const m = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Video, sink);
+    m.timeToFirstRenderMs(1);
+    m.slotActiveToFirstRenderMs(1);
+    for (const obs of sink.getRecordedMetrics())
+      expect(obs.boundaries).toEqual(FIRST_RENDER_BUCKETS_MS);
+    expect(Math.max(...FIRST_RENDER_BUCKETS_MS)).toBeGreaterThan(10_000);
+  });
+
+  it('the recovery source vocabulary is closed: exactly the six reasons, no `invalid` sentinel', () => {
+    expect(Object.values(MEDIA_RECOVERY_SOURCES).sort()).toEqual(
+      [
+        'decoder_error',
+        'decrypt_failed',
+        'group_abandoned',
+        'local_drop',
+        'server_mute_lifted',
+        'verify_failed',
+      ].sort(),
+    );
   });
 });

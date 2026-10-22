@@ -272,6 +272,8 @@ export {
   deriveKekRetention,
   transmitRewrapLatencyMs,
   validateMediaConfig,
+  VIDEO_STREAM_CAP_HEADROOM,
+  videoReceiveConfigLogLine,
 } from './config/clientConfig.js';
 export type {
   AudioConfig,
@@ -291,6 +293,7 @@ export type {
   ConfigValueSource,
   ReceiverStateConfig,
   TelemetryCadenceConfig,
+  VideoReceiveConfig,
 } from './config/clientConfig.js';
 
 export { AudioPipeline, MediaFaultStage } from './media/lifecycle/AudioPipeline.js';
@@ -309,6 +312,15 @@ export type {
   VideoPublisherOptions,
   VideoSendDirective,
 } from './media/lifecycle/VideoPublisher.js';
+export { VideoReceiver } from './media/lifecycle/VideoReceiver.js';
+export type {
+  VideoReceiverOptions,
+  VideoReceiveView,
+  VideoSlotAssignment,
+  VideoSlotEvidence,
+} from './media/lifecycle/VideoReceiver.js';
+export type { UnfulfilledSlotState } from './media/lifecycle/unfulfilledSlots.js';
+export type { AvatarSlotState, VideoRenderState } from './media/pipeline/renderDecision.js';
 export { MuteState } from './media/lifecycle/muteState.js';
 export type { MuteSnapshot } from './media/lifecycle/muteState.js';
 
@@ -320,6 +332,9 @@ export {
   MEDIA_MUTE_ACTIONS,
   MEDIA_KIND_LABELS,
   MEDIA_SEND_DROP_REASONS,
+  MEDIA_RECOVERY_SOURCES,
+  SLOT_UNFULFILLED_BUCKETS_MS,
+  FIRST_RENDER_BUCKETS_MS,
   MediaKindMetrics,
   MediaMetrics,
   MediaSessionMetrics,
@@ -334,6 +349,7 @@ export type {
   MediaMetricIdentity,
   MediaMuteAction,
   MediaSendDropReason,
+  MediaRecoverySource,
   ReportableWrapOutcome,
 } from './media/setup/mediaMetrics.js';
 
@@ -360,6 +376,7 @@ export type {
 export { CaptureFailure, MediaCaptureError, listMicrophones } from './media/setup/capture.js';
 export { AudioCodecUnsupportedError } from './media/setup/opus.js';
 export { VideoCodecUnsupportedError, probeVp8Support } from './media/setup/vp8.js';
+export { createVideoDecoder } from './media/setup/vp8Decoder.js';
 export type { Vp8Profile, Vp8ProbeApi } from './media/setup/vp8.js';
 export {
   MediaPlaybackError,
@@ -386,6 +403,11 @@ export type {
   VideoCaptureSourceFactory,
   VideoEncoderFactory,
   VideoEncoderSeam,
+  EncodedVideoChunkInput,
+  VideoDecoderFactory,
+  VideoDecoderSeam,
+  VideoDecoderSeamOptions,
+  VideoSink,
 } from './media/setup/seams.js';
 
 // `generateIdentityKeyPair` and `IdentityKeyPair` are deliberately NOT exported.
@@ -410,6 +432,7 @@ export type {
   ReceiveSlotCap,
   ReceiveSlotsDiagnostics,
   StartMediaOptions,
+  VideoSlotRenderChangedEvent,
 } from './session/events.js';
 export { pairSlotsBySender } from './signaling/pairing.js';
 export type { SlotPair } from './signaling/pairing.js';

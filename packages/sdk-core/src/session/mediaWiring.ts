@@ -23,8 +23,10 @@ import { SignalingCodec } from '../signaling/codecMap.js';
 import { KEYFRAME_MIN_INTERVAL_CEILING_MS } from '../config/clientConfig.js';
 import type { DirectedVideoEncoding } from '../media/setup/seams.js';
 import type { VideoSendDirective } from '../media/lifecycle/VideoPublisher.js';
+import type { VideoReceiver } from '../media/lifecycle/VideoReceiver.js';
 import type { MhControlSink } from '../media/events.js';
 import type { MediaStateListeners } from './signalingMediaState.js';
+import type { MuteSnapshot } from '../media/lifecycle/muteState.js';
 import {
   MEDIA_KEYFRAME_REQUEST_OUTCOMES,
   MEDIA_KEYFRAME_UNATTRIBUTED_OUTCOMES,
@@ -60,7 +62,11 @@ export function kekObserver(
   };
 }
 
-/** The pipeline operation a roster invalidation drives. */
+/**
+ * The operation a roster invalidation drives. The session's media
+ * (`mediaStart.ts:SessionMedia`) implements it over EVERY kind's receive key
+ * cache — audio's and video's — so the purge covers video (story 3 C-B).
+ */
 export interface TransmitKeyPurger {
   purgeTransmitKeys(senderId: number): void;
 }
@@ -82,6 +88,20 @@ export function rosterInvalidationListener(
     if (cause === 'rebind') metrics()?.rosterKeyRebind(MEDIA_ROSTER_KEY_CHANGES.Rebind);
     if (cause === 'downgrade') metrics()?.rosterKeyRebind(MEDIA_ROSTER_KEY_CHANGES.Downgrade);
     pipeline()?.purgeTransmitKeys(senderId);
+  };
+}
+
+/**
+ * The session's client-mute report to MC — both kinds, explicit. Informational
+ * and deliberately BEST-EFFORT: ADR-0036 §5 requires client mute to hold WITHOUT
+ * the server honouring it, so a failed report must not undo the local
+ * suppression; nothing is actionable and nothing is safe to log about it.
+ */
+export function bestEffortMuteReport(signaling: {
+  sendMuteRequest(state: MuteSnapshot): Promise<unknown>;
+}): (state: MuteSnapshot) => void {
+  return (state) => {
+    void signaling.sendMuteRequest(state).catch(() => {});
   };
 }
 
@@ -430,25 +450,29 @@ export function zeroInitDirectiveSeries(
 }
 
 /**
- * The pipeline's two signalling listeners (story 3 C-A1):
+ * The pipeline's two signalling listeners (story 3 C-A1, C-B):
  *
  *   * SENDING — {@link sendDirectiveListener}, per published kind; its effective
  *     per-kind send state feeds R-18.
- *   * RECEIVING — the AUDIO slot assignments, independently of the send
- *     directive: a participant nobody holds gets an empty target set and must
- *     still hear the slots it holds. Media kind is taken from the slot, never
- *     the frame. Slot, sender and handler travel together: the handler URLs pick
- *     the receive transports and the slot -> sender pairs are the slot-edge gate.
+ *   * RECEIVING — the slot assignments, independently of the send directive: a
+ *     participant nobody holds gets an empty target set and must still receive
+ *     the slots it holds. MEDIA KIND IS TAKEN FROM THE SLOT, never the frame:
+ *     audio slots go to the audio pipeline (slot -> sender pairs are its
+ *     slot-edge gate), video slots to the video receiver (MC's flat state per
+ *     slot; a live video slot names no sender). The handler URLs pick the
+ *     receive transports for each.
  */
 export function pipelineListeners(
   wiring: SendDirectiveWiring & {
     readonly pipeline: DirectiveTarget & Pick<AudioPipeline, 'setReceiveAssignments'>;
+    /** The video receiver, when this client declared video slots. */
+    readonly videoReceiver?: Pick<VideoReceiver, 'setAssignments'>;
   },
 ): MediaStateListeners {
-  const { pipeline } = wiring;
+  const { pipeline, videoReceiver } = wiring;
   return {
     onDirective: sendDirectiveListener(wiring),
-    onAssignments: (event) =>
+    onAssignments: (event) => {
       pipeline.setReceiveAssignments(
         event.assignments
           .filter((a) => a.mediaKind === 'audio')
@@ -458,6 +482,17 @@ export function pipelineListeners(
             mediaHandlerUrl: a.mediaHandlerUrl,
             active: a.slotState === 'active',
           })),
-      ),
+      );
+      videoReceiver?.setAssignments(
+        event.assignments
+          .filter((a) => a.mediaKind === 'video')
+          .map((a) => ({
+            slotId: a.slotId,
+            slotState: a.slotState,
+            senderId: a.senderId,
+            mediaHandlerUrl: a.mediaHandlerUrl,
+          })),
+      );
+    },
   };
 }

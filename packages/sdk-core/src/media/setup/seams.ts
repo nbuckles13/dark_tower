@@ -251,3 +251,67 @@ export type VideoCaptureSourceFactory = (options: {
   /** The previously granted camera, or `undefined` for the platform default. */
   readonly deviceId: string | undefined;
 }) => Promise<VideoCaptureSource>;
+
+// ---------------------------------------------------------------------------
+// VIDEO RECEIVE (story 3 C-B)
+// ---------------------------------------------------------------------------
+
+/**
+ * One encoded video chunk entering a slot's decoder. `timestampUs` is the
+ * slot's PLAYOUT timeline (receiver arrival time, re-based on a source switch —
+ * lead ruling E1), never a sender value.
+ */
+export interface EncodedVideoChunkInput {
+  /** Decrypted VP8 frame bytes. */
+  readonly data: Uint8Array;
+  readonly timestampUs: number;
+  /** The SIGNED `independentlyDecodable` header flag. */
+  readonly isKeyframe: boolean;
+}
+
+/** A video decoder, as one receive slot uses it for the slot's whole lifetime. */
+export interface VideoDecoderSeam {
+  /** Submit a chunk. Output arrives on the factory's `onOutput`. */
+  decode(chunk: EncodedVideoChunkInput): void;
+  /** Chunks submitted and not yet output (`VideoDecoder.decodeQueueSize`). */
+  readonly decodeQueueSize: number;
+  /** Release the decoder. Idempotent. */
+  close(): void;
+}
+
+/** Construction options for a video decoder. */
+export interface VideoDecoderSeamOptions {
+  /**
+   * The decoder configuration, built from the slot's CONFIGURED receive bounds
+   * (`setup/vp8.ts:buildVp8DecoderConfig`), never from the bitstream or any
+   * extension value (R-6).
+   */
+  readonly config: VideoDecoderConfig;
+  /** Called for each decoded frame. Takes ownership of the `VideoFrame`. */
+  readonly onOutput: (frame: VideoFrame) => void;
+  /** Called on the codec's error callback. The slot closes and replaces this decoder. */
+  readonly onError: (err: unknown) => void;
+}
+
+/**
+ * Builds a slot's video decoder. SYNCHRONOUS (WebCodecs construction and
+ * `configure` are; failures arrive on `onError`). Injected so unit tests never
+ * touch WebCodecs — and so a test can COUNT constructions (R-6: a source switch
+ * constructs none; exactly M exist).
+ */
+export type VideoDecoderFactory = (options: VideoDecoderSeamOptions) => VideoDecoderSeam;
+
+/**
+ * Where one video slot's frames are drawn, supplied by the embedder per slot
+ * (`MeetingSession.videoReceive.setVideoSink`). Frame delivery NEVER passes through events
+ * or reactive stores.
+ *
+ * BORROW CONTRACT: `drawFrame` borrows the frame for the duration of the call.
+ * The SDK owns it and closes it exactly once (on replacement, avatar switch or
+ * teardown). An embedder that must keep a frame past the call MUST
+ * `frame.clone()` it and close its clone. A sink that throws does not change
+ * ownership: the SDK still closes the frame.
+ */
+export interface VideoSink {
+  drawFrame(frame: VideoFrame): void;
+}

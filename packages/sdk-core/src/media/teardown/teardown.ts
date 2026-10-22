@@ -48,6 +48,15 @@
 // the single most natural line to add to a zeroisation routine, and it is the
 // one place where naming every key at once is idiomatic.
 
+/**
+ * THE fault text for a teardown step that failed — ONE home, because the text is
+ * part of an event-once fault dedupe key in every pipeline that uses it. `name`
+ * is the static string chosen at registration, never a platform message.
+ */
+export function teardownFailureMessage(name: string): string {
+  return `media teardown step '${name}' failed; the resource may not have been released`;
+}
+
 /** A named disposer. The name is a static string, never derived from state. */
 interface Registration {
   readonly name: string;

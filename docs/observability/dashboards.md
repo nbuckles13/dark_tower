@@ -353,6 +353,7 @@ accounting identity `received = accepted + sum(drops by reason)`.
   - `decode_queue_dropped_total` (post-accept, never part of the accounting identity);
   - **KEK Rotations vs Generations Retained**, which reads `kek_generations_retained_total` AGAINST `kek_updates_total{source="kek_update"}`. Rotations rising while retentions stay flat is the signal, and neither series alone says anything.
   - story 3 C-A2's video send-path series, panel only until story 3 OBS-B: `keyframes_produced_total{source}`, `send_groups_abandoned_total`, `send_groups_stopped_total{outcome}`, `encode_queue_dropped_total`, `encoder_errors_total`, `send_directive_encoding_refused_total`, and `keyframe_min_interval_clamped_total` (panel only BY DECISION, task text).
+  - story 3 C-B's video receive series, panel only until story 3 OBS-B: `recovery_requests_sent_total{source}`, `incoming_streams_refused_total`, `slot_unfulfilled_duration_ms` (histogram; the fleet unfulfilled signal), `slots_unfulfilled` (single-writer gauge, panel only BY DECISION), `active_source_intervals_total`, `time_to_first_render_ms` and `slot_active_to_first_render_ms` (open objectives, never gated).
 
 The capture-source panel's value is not a browser count: the only signal is the presence of `mode="test_tone"`. The panel list itself is in the JSON.
 
