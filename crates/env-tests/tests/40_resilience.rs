@@ -52,9 +52,10 @@ async fn test_same_namespace_connectivity() {
         target_url
     );
 
-    // Verify cleanup succeeded
+    // A failed cleanup leaks a canary pod into the next run: fail loudly,
+    // after the primary assertion so it never hides that result.
     if let Err(e) = cleanup_result {
-        eprintln!("Warning: Canary cleanup failed: {}", e);
+        panic!("canary cleanup failed (pod leaked into dark-tower): {e}");
     }
 }
 
@@ -85,8 +86,9 @@ async fn test_network_policy_blocks_cross_namespace() {
     let target_url = "http://ac-service.dark-tower.svc.cluster.local:8082/health";
     let can_reach = canary.can_reach(target_url).await;
 
-    // Cleanup before asserting
+    // Cleanup before asserting (ensure cleanup even on failure)
     let cleanup_result = canary.cleanup().await;
+    let namespace_result = cleanup_test_namespace(test_namespace);
 
     // Assert that cross-namespace traffic is blocked
     assert!(
@@ -98,25 +100,40 @@ async fn test_network_policy_blocks_cross_namespace() {
         test_namespace, target_url
     );
 
-    // Verify cleanup succeeded
+    // A failed cleanup leaks a pod or namespace into the next run, which then
+    // fails confusingly: fail loudly, after the primary assertion so it never
+    // hides that result.
     if let Err(e) = cleanup_result {
-        eprintln!("Warning: Canary cleanup failed: {}", e);
+        panic!("canary cleanup failed (pod leaked into {test_namespace}): {e}");
     }
-
-    // Cleanup the test namespace (best effort)
-    cleanup_test_namespace(test_namespace);
+    if let Err(e) = namespace_result {
+        panic!("test namespace cleanup failed ({test_namespace} leaked): {e}");
+    }
 }
 
-/// Helper to cleanup test namespace after NetworkPolicy tests.
-fn cleanup_test_namespace(namespace: &str) {
+/// Delete a test namespace created by a NetworkPolicy test. Errors are
+/// returned, never discarded: a leaked namespace breaks the next run.
+fn cleanup_test_namespace(namespace: &str) -> Result<(), String> {
     use std::process::Command;
 
     // Only cleanup namespaces we created for testing
     if !namespace.starts_with("canary-test") {
-        return;
+        return Err(format!(
+            "refusing to delete '{namespace}': not a canary-test namespace"
+        ));
     }
 
-    let _ = Command::new("kubectl")
+    let output = Command::new("kubectl")
         .args(["delete", "namespace", namespace, "--ignore-not-found=true"])
-        .output();
+        .output()
+        .map_err(|e| format!("kubectl could not run: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "kubectl delete namespace exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
