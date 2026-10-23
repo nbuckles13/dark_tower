@@ -1,7 +1,15 @@
 //! P1 Tests: Authentication Flows
 //!
-//! Comprehensive authentication flow tests including token validation,
-//! cross-replica consistency, and expiration handling.
+//! Comprehensive authentication flow tests including token validation and
+//! cross-replica consistency.
+//!
+//! Expiry is NOT tested here: an env-test cannot mint an expired token (no
+//! signing key) and AC's lifetime is an hour. The issued `exp`/`iat` and the
+//! lifetime are checked in `25_auth_security.rs`
+//! (`test_iat_claim_is_current`, `test_token_lifetime_is_reasonable`); that
+//! services REJECT an expired token is tested where one can be minted:
+//! `gc-service/tests/auth_tests.rs::test_me_endpoint_rejects_expired_token`
+//! and `mc-service/tests/join_tests.rs::test_join_expired_token_returns_unauthorized`.
 
 #![cfg(feature = "flows")]
 
@@ -169,64 +177,6 @@ async fn test_cross_replica_token_consistency() {
         decode::<Claims>(token, &decoding_key, &validation)
             .expect("All tokens should validate against JWKS");
     }
-}
-
-#[tokio::test]
-async fn test_expired_token_rejected() {
-    let cluster = cluster().await;
-    let auth_client = AuthClient::new(&cluster.ac_base_url);
-
-    // Issue a token
-    let request =
-        TokenRequest::client_credentials(DEV_TEST_CLIENT_ID, DEV_TEST_CLIENT_SECRET, "test:all");
-
-    let token_response = auth_client
-        .issue_token(request)
-        .await
-        .expect("Token issuance should succeed");
-
-    // Fetch JWKS
-    let jwks = auth_client
-        .fetch_jwks()
-        .await
-        .expect("JWKS fetch should succeed");
-
-    let header =
-        decode_header(&token_response.access_token).expect("Token header should be decodable");
-
-    let kid = header.kid.expect("Token should have kid in header");
-
-    let jwk = jwks
-        .keys
-        .iter()
-        .find(|k| k.kid == kid)
-        .expect("JWKS should contain key with matching kid");
-
-    let x = jwk.x.as_ref().expect("JWK should have x coordinate");
-    let public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(x)
-        .expect("Public key should be valid base64");
-
-    let decoding_key = DecodingKey::from_ed_der(&public_key_bytes);
-
-    // First validation should succeed (token not expired yet)
-    let mut validation = Validation::new(Algorithm::EdDSA);
-    validation.validate_exp = true;
-    validation.set_audience(&["dark-tower-services"]);
-
-    let result = decode::<Claims>(&token_response.access_token, &decoding_key, &validation);
-    assert!(result.is_ok(), "Fresh token should validate successfully");
-
-    // Wait for token to expire (tokens have 1 hour lifetime by default)
-    // For testing purposes, we verify that validation would reject an expired token
-    // by checking that exp claim is in the future
-    let claims = result.unwrap().claims;
-    let now = chrono::Utc::now().timestamp();
-    assert!(claims.exp > now, "Token expiration should be in the future");
-
-    // Note: Actually waiting for expiration would take too long for tests
-    // The important validation is that the exp claim is properly set
-    // and that validation logic checks it (which jsonwebtoken does automatically)
 }
 
 #[tokio::test]
