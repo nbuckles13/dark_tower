@@ -2080,7 +2080,7 @@ tasks:
   slug: 2026-10-22-c-a2-sdk-video-publish
   tag: story-2026-10-07-see-each-other-task-13
 - id: 14
-  status: pending
+  status: completed
   specialist: client
   deps:
   - 11
@@ -2240,6 +2240,7 @@ tasks:
     - RecoveryRequest carries `slot_id` and the sender and GoP counter from the failing frame's own header, nothing else; at most one per slot per (sender, counter), no retry, a newer one replacing a queued one. Those header values may be unverified (for example after a verify failure); that is accepted because MH forwards only on an exact counter match for the slot's current source and `source_mismatch` catches the rest. Security confirms this at this task's Gate 1.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-22-c-b-sdk-video-receive
   tag: story-2026-10-07-see-each-other-task-14
 - id: 15
   status: pending
