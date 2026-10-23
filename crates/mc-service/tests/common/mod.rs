@@ -127,24 +127,43 @@ pub struct MockMhRegistrationClient {
     /// Notified once per `register_meeting()` call, after `calls` is updated.
     /// Lets tests await deterministic fan-out without polling sleeps.
     call_notify: Arc<Notify>,
+    /// While `Some`, every `register_meeting()` is RECORDED on arrival and
+    /// then held (not answered) until [`Self::release_pushes`]: an attempt
+    /// genuinely IN FLIGHT, so a test can count what the push worker issues
+    /// while one is outstanding (the client-mute churn bound).
+    hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl MockMhRegistrationClient {
     pub fn new() -> Self {
-        Self {
-            calls: Mutex::new(Vec::new()),
-            events: Mutex::new(Vec::new()),
-            result: Ok(()),
-            call_notify: Arc::new(Notify::new()),
-        }
+        Self::with_result(Ok(()))
     }
 
     pub fn with_error(err: McError) -> Self {
+        Self::with_result(Err(err))
+    }
+
+    fn with_result(result: Result<(), McError>) -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
-            result: Err(err),
+            result,
             call_notify: Arc::new(Notify::new()),
+            hold: Mutex::new(None),
+        }
+    }
+
+    /// Hold every `register_meeting()` from now on (recorded, not answered)
+    /// until [`Self::release_pushes`].
+    pub fn hold_pushes(&self) {
+        *self.hold.lock().expect("hold mutex poisoned") =
+            Some(Arc::new(tokio::sync::Semaphore::new(0)));
+    }
+
+    /// Answer every held push and stop holding.
+    pub fn release_pushes(&self) {
+        if let Some(gate) = self.hold.lock().expect("hold mutex poisoned").take() {
+            gate.close();
         }
     }
 
@@ -265,7 +284,15 @@ impl MhRegistrationClient for MockMhRegistrationClient {
             Ok(()) => Ok(()),
             Err(e) => Err(McError::Grpc(e.to_string())),
         };
-        Box::pin(async move { result })
+        let gate = self.hold.lock().expect("hold mutex poisoned").clone();
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                // Closed by `release_pushes`: `acquire` then fails, which is
+                // the release signal; no permit is ever granted while held.
+                let _ = gate.acquire().await;
+            }
+            result
+        })
     }
 
     fn end_meeting<'a>(
@@ -480,7 +507,7 @@ fn join_media_with(
             mc_service::media_signaling::MediaKindLabel::Audio,
         ]),
         demand: mc_service::media_signaling::ReceiveCapabilityDeclaration::empty()
-            .truncate(client_media_config().max_receive_slots),
+            .truncate(client_media_config().receive_slot_caps),
     }
 }
 
@@ -512,7 +539,7 @@ pub fn sample_identity_public_key() -> Vec<u8> {
 pub fn client_media_config() -> mc_service::media_signaling::ClientMediaConfig {
     mc_service::media_signaling::ClientMediaConfig {
         // `MC_MAX_AUDIO_RECEIVE_SLOTS` / `MC_MAX_VIDEO_RECEIVE_SLOTS`.
-        max_receive_slots: [8, 4],
+        receive_slot_caps: [8, 4],
         max_receive_capability_declarations: 64,
         audio_encoding: mc_service::media_signaling::AudioEncoding::new(
             proto_gen::dark_tower::signaling::v1::Codec::Opus,

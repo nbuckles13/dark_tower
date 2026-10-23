@@ -1186,8 +1186,9 @@ fn server_muted_promql() -> &'static str {
 
 /// One MC-shaped egress stream (story 2 task 20 edge model): `source` into
 /// `subscriber`'s declared slot at `ordinal`, with MC's id packing
-/// `(subscriber << 8) | ordinal`, one candidate at stream 0, priority group 1,
-/// datagram transport.
+/// `(subscriber << 8) | ordinal`, one candidate at stream 0, priority group 1;
+/// its transport is the candidate's declared one (DATAGRAM, via
+/// [`install_s4`]).
 fn mc_shaped_edge(subscriber: u32, ordinal: u32, slot: u32, source: u32) -> EgressStream {
     injection::edge(
         (subscriber << 8) | ordinal,
@@ -1195,12 +1196,13 @@ fn mc_shaped_edge(subscriber: u32, ordinal: u32, slot: u32, source: u32) -> Egre
         slot,
         source,
         u32::from(env_tests::fixtures::media::AUDIO_SEND_ID),
-        TransportMode::Datagram,
     )
 }
 
-/// S4 (story 2 R-9; ADR-0036 §7): a server-muted sender's datagrams are
-/// dropped at MH ingress under `server_muted`; the mute is SOURCE-only (the
+/// S4 (story 2 R-9; ADR-0036 §7; story 3 R-16): a server-muted sender's
+/// datagrams are dropped at MH ingress under `server_muted` — the mute being
+/// the sender's declared audio stream at DROP_AT_INGRESS, and the unmute that
+/// stream back at FORWARD; the mute is SOURCE-only (the
 /// muted participant still hears its peer); it survives a re-assert at the
 /// same and at a new generation; and an unmute restores forwarding within one
 /// generation.
@@ -1229,35 +1231,13 @@ fn mc_shaped_edge(subscriber: u32, ordinal: u32, slot: u32, source: u32) -> Egre
 #[tokio::test]
 #[serial_test::serial(mh_notifications)]
 async fn test_server_muted_sender_is_dropped_at_mh_ingress_and_survives_reassert() {
-    server_mute_s4(Reading::Transitional).await;
+    server_mute_s4().await;
 }
 
-/// S4 again, with the policy DECLARING its source streams (story 3 R-16; the
-/// story-2 spec green "with explicit `source_streams`"): the mute is A's audio
-/// stream at DROP_AT_INGRESS instead of A in the superseded
-/// `server_muted_sources`, and the unmute is that stream back at FORWARD. Same
-/// assertions, same evidence rule.
-#[tokio::test]
-#[serial_test::serial(mh_notifications)]
-async fn test_server_muted_source_stream_is_dropped_at_mh_ingress_and_survives_reassert() {
-    server_mute_s4(Reading::Declared).await;
-}
-
-/// Which reading of the registration an injection uses (story 3).
-#[derive(Debug, Clone, Copy)]
-enum Reading {
-    /// No `source_streams`: MH's transitional story-2 reading, mute via the
-    /// superseded `server_muted_sources`.
-    Transitional,
-    /// `source_streams` declares every stream; mute via DROP_AT_INGRESS.
-    Declared,
-}
-
-/// Install `edges` in `reading`, declaring each of `senders`' audio stream on
-/// the declared reading, with `muted` (if any) server-muted.
+/// Install `edges` declaring each of `senders`' audio stream (DATAGRAM), with
+/// `muted` (if any) at DROP_AT_INGRESS and the rest FORWARD.
 async fn install_s4(
     injection: &mut Injection<'_>,
-    reading: Reading,
     generation: u64,
     edges: Vec<EgressStream>,
     senders: impl IntoIterator<Item = u32>,
@@ -1265,35 +1245,25 @@ async fn install_s4(
 ) {
     use env_tests::fixtures::media::AUDIO_SEND_ID;
     use proto_gen::dark_tower::internal::v1::SourceDisposition;
-    match reading {
-        Reading::Transitional => {
-            let muted: Vec<u32> = muted.into_iter().collect();
-            injection.install(generation, edges, &muted).await;
-        }
-        Reading::Declared => {
-            let sources = senders
-                .into_iter()
-                .map(|sender_id| {
-                    injection::source_stream(
-                        sender_id,
-                        u32::from(AUDIO_SEND_ID),
-                        TransportMode::Datagram,
-                        if muted == Some(sender_id) {
-                            SourceDisposition::DropAtIngress
-                        } else {
-                            SourceDisposition::Forward
-                        },
-                    )
-                })
-                .collect();
-            injection
-                .install_declared(generation, edges, &[], sources)
-                .await;
-        }
-    }
+    let sources = senders
+        .into_iter()
+        .map(|sender_id| {
+            injection::source_stream(
+                sender_id,
+                u32::from(AUDIO_SEND_ID),
+                TransportMode::Datagram,
+                if muted == Some(sender_id) {
+                    SourceDisposition::DropAtIngress
+                } else {
+                    SourceDisposition::Forward
+                },
+            )
+        })
+        .collect();
+    injection.install_declared(generation, edges, sources).await;
 }
 
-async fn server_mute_s4(reading: Reading) {
+async fn server_mute_s4() {
     let cluster = cluster().await;
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
     let window = participant::settle_window(cluster).await;
@@ -1355,7 +1325,7 @@ async fn server_mute_s4(reading: Reading) {
     .await;
     for injection in &mut injections {
         let g = injection.generation(0);
-        install_s4(injection, reading, g, edges(), [a, b], Some(a)).await;
+        install_s4(injection, g, edges(), [a, b], Some(a)).await;
     }
 
     // MUTED: A sends on BOTH sessions (so both pods see muted ingress), B sends
@@ -1442,11 +1412,11 @@ async fn server_mute_s4(reading: Reading) {
     // at a NEW generation still carrying it.
     for injection in &mut injections {
         let g = injection.generation(0);
-        install_s4(injection, reading, g, edges(), [a, b], Some(a)).await;
+        install_s4(injection, g, edges(), [a, b], Some(a)).await;
     }
     for injection in &mut injections {
         let g = injection.generation(1);
-        install_s4(injection, reading, g, edges(), [a, b], Some(a)).await;
+        install_s4(injection, g, edges(), [a, b], Some(a)).await;
     }
     muted_phase(SEQ_REASSERTED, "S4 REASSERTED").await;
     for (handler, first) in handlers.iter().zip(&after_first) {
@@ -1467,7 +1437,7 @@ async fn server_mute_s4(reading: Reading) {
     // UNMUTE: the next generation without A. B hears A again, on B's slot.
     for injection in &mut injections {
         let g = injection.generation(2);
-        install_s4(injection, reading, g, edges(), [a, b], None).await;
+        install_s4(injection, g, edges(), [a, b], None).await;
     }
     let deadline = Instant::now() + PHASE_DEADLINE;
     let mut resumed = None;
@@ -1516,13 +1486,10 @@ async fn server_mute_s4(reading: Reading) {
 ///
 /// Driven by MC's REAL policy (no injection). What this proves is the
 /// receiver-side property only: no frame is ever relayed onto the other
-/// sender's slot. It does NOT prove which registration reading MH applied —
-/// every participant here publishes audio alone, and stream 0 DATAGRAM is
-/// declared identically on both readings, so nothing observable here differs.
-/// The per-entity proof that MC's registrations carry `source_streams` (story
-/// 3 MC-A) is `27_mc_slot_placement.rs`'s MC-driven VIDEO delivery: stream 1
-/// exists only in a declared registration, so a video frame landing on a
-/// receiver's video slot is impossible on the transitional reading.
+/// sender's slot. That MC's registrations carry `source_streams` at all needs
+/// no separate proof here: MH has no other reading, and a candidate-bearing
+/// registration without them is rejected (`rejected_transport_inconsistent`),
+/// so any frame relayed here was routed by a declared registration.
 #[tokio::test]
 #[serial_test::serial(mh_notifications)]
 async fn test_two_concurrent_senders_into_one_receiver_are_never_misattributed() {
@@ -1597,18 +1564,10 @@ async fn test_two_concurrent_senders_into_one_receiver_are_never_misattributed()
 #[tokio::test]
 #[serial_test::serial(mh_notifications)]
 async fn test_edge_churn_at_a_new_generation_does_not_stall_unrelated_egress() {
-    edge_churn(Reading::Transitional).await;
+    edge_churn().await;
 }
 
-/// The edge-churn spec again with every source stream DECLARED (story 3; the
-/// story-2 spec green "with explicit `source_streams`").
-#[tokio::test]
-#[serial_test::serial(mh_notifications)]
-async fn test_edge_churn_with_declared_source_streams_does_not_stall_unrelated_egress() {
-    edge_churn(Reading::Declared).await;
-}
-
-async fn edge_churn(reading: Reading) {
+async fn edge_churn() {
     let cluster = cluster().await;
     let window = participant::settle_window(cluster).await;
     let auth = AuthClient::new(&cluster.ac_base_url);
@@ -1642,7 +1601,7 @@ async fn edge_churn(reading: Reading) {
     let c_to_b = || mc_shaped_edge(b, 1, b_slot_1, c);
     for injection in &mut injections {
         let g = injection.generation(0);
-        install_s4(injection, reading, g, vec![a_to_b()], [a, b, c], None).await;
+        install_s4(injection, g, vec![a_to_b()], [a, b, c], None).await;
     }
 
     let a_conn = sessions[0][&x].connection();
@@ -1698,20 +1657,12 @@ async fn edge_churn(reading: Reading) {
     phase(SEQ_PRE, false, "CHURN BASE").await;
     for injection in &mut injections {
         let g = injection.generation(1);
-        install_s4(
-            injection,
-            reading,
-            g,
-            vec![a_to_b(), c_to_b()],
-            [a, b, c],
-            None,
-        )
-        .await;
+        install_s4(injection, g, vec![a_to_b(), c_to_b()], [a, b, c], None).await;
     }
     phase(SEQ_CHURN_ADD, true, "CHURN ADD").await;
     for injection in &mut injections {
         let g = injection.generation(2);
-        install_s4(injection, reading, g, vec![a_to_b()], [a, b, c], None).await;
+        install_s4(injection, g, vec![a_to_b()], [a, b, c], None).await;
     }
     phase(SEQ_CHURN_REMOVE, false, "CHURN REMOVE").await;
 

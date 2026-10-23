@@ -1027,7 +1027,7 @@ increase(mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}[15m]) 
 
 ### Deliberate absences (MC)
 
-- **Server mute has no alert, by decision** (story 2 task 12). A non-zero mute rate is healthy moderation, and the refusal-side values are client-inflatable. The inverse condition, "a mute was applied but the muted sender is still heard", would need a per-meeting correlation that ADR-0036 §11 bars. Coverage is the browser env-test S3 (`packages/web-app/e2e/server-mute.spec.ts`), MC runbook Scenario 21 (Server Mute Not Enforced), and MH runbook Scenario 19 (Server Mute Not Taking Effect At Ingress), and the ADR-0031 demonstration is to apply a mute and watch **MH's** `mh_media_frames_dropped_total{reason="server_muted"}` move, not only MC's counter. The decision is recorded at `mc-alerts.yaml` above `MCEndMeetingOwnershipRejected`; it is cited here, not restated.
+- **Server mute has no alert, by decision** (story 2 task 12; story 3 MC-B adds the kind-free `mc_media_mute_requests_rejected_total` under the same decision). A non-zero mute rate is healthy moderation, and the refusal-side values are client-inflatable. The inverse condition, "a mute was applied but the muted sender is still heard", would need a per-meeting correlation that ADR-0036 §11 bars. Coverage is the browser env-test S3 (`packages/web-app/e2e/server-mute.spec.ts`), MC runbook Scenario 21 (Server Mute Not Enforced), and MH runbook Scenario 19 (Server Mute Not Taking Effect At Ingress), and the ADR-0031 demonstration is to apply a mute and watch **MH's** `mh_media_frames_dropped_total{reason="server_muted"}` move, not only MC's counter. The decision is recorded at `mc-alerts.yaml` above `MCEndMeetingOwnershipRejected`; it is cited here, not restated.
 
 ---
 

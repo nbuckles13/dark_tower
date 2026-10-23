@@ -76,7 +76,8 @@ import { MEDIA_KEK_SOURCES } from '../media/setup/mediaMetrics.js';
 import { SUPPORTED_HEADER_VERSIONS } from '../media/frame/frameCodec.js';
 import { RosterKeyFeed } from './rosterKeyFeed.js';
 import { mediaKindToken, slotStateToken, wireMediaKind } from './slotStateMap.js';
-import { explicitMuteFields, type PerKindMuteState } from './muteRequest.js';
+import { singleKindMuteFields } from './muteRequest.js';
+import type { MediaKindToken } from '../media/mediaKind.js';
 import type {
   ParticipantMuteEvent,
   PublishKind,
@@ -785,26 +786,25 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   /**
    * Report client mute to MC (ADR-0036 §5).
    *
-   * INFORMATIONAL. Client mute is enforced at capture and must not depend on the
-   * server honouring it; this report is what keeps MC's view accurate and what
-   * lets other participants render the state. MC MAY leave the send directive
-   * in place under client mute, which keeps "MC has not asked you to send"
-   * distinguishable from "you have muted yourself"; a server mute or an
-   * unwatched kind withdraws it (signaling.proto `SendDirective`; ADR-0036 §5,
-   * correction 2026-10-13).
+   * Client mute is enforced at capture and must not depend on the server
+   * honouring it; this report is what keeps MC's view accurate: MC pauses the
+   * kind at MH and lets other participants render the state. The send
+   * directive NEVER depends on client mute, which keeps "MC has not asked you
+   * to send" distinguishable from "you have muted yourself"; a server mute or
+   * an unwatched kind withdraws it (signaling.proto `SendDirective`; ADR-0036
+   * §5, amendments 2026-10-13 and 2026-10-23).
    *
-   * PER KIND, BOTH KINDS EXPLICIT (story 3 R-15): `state` is this
-   * participant's CURRENT client-mute state for both kinds, so a request about
-   * one kind carries the other unchanged. See `muteRequest.ts`.
+   * ONE KIND PER REQUEST (story 3 R-15): `kind` at `muted`; the other kind's
+   * field is left ABSENT, which MC reads as "unchanged". See `muteRequest.ts`.
    *
    * @throws {SignalingError} `Transport` if called before join settled or after teardown.
    */
-  async sendMuteRequest(state: PerKindMuteState): Promise<void> {
+  async sendMuteRequest(kind: MediaKindToken, muted: boolean): Promise<void> {
     const stream = this.#requireOpenStream('sendMuteRequest');
     const clientMessage = create(ClientMessageSchema, {
       message: {
         case: 'muteRequest',
-        value: create(MuteRequestSchema, explicitMuteFields(state)),
+        value: create(MuteRequestSchema, singleKindMuteFields(kind, muted)),
       },
     });
     await this.runInJoinContext(() => this.#sendClientMessage(stream, clientMessage));
@@ -817,22 +817,26 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
    * TARGET AND ACTION ONLY. The message has no requester field, and none is
    * invented: MC identifies the requester from this authenticated connection and
    * decides authority itself. `reason` is left empty (it is client-controlled and
-   * echoed to another participant). PER KIND, BOTH KINDS EXPLICIT (story 3
-   * R-15): `state` is the TARGET's intended server-mute state for both kinds —
-   * the changed kind's new value and the other kind's current value — built by
-   * `muteRequest.ts`. A refusal arrives as a post-join `FORBIDDEN` session
-   * error, which does NOT close the connection (`errorCodeMap.closesConnection`).
+   * echoed to another participant). ONE KIND PER REQUEST (story 3 R-15): the
+   * target's `kind` at `muted`; the other kind's field is left ABSENT, so MC
+   * leaves the target's other kind exactly as it is (`muteRequest.ts`). A
+   * refusal arrives as a post-join `FORBIDDEN` session error, which does NOT
+   * close the connection (`errorCodeMap.closesConnection`).
    *
    * @throws {SignalingError} `Transport` if called before join settled or after teardown.
    */
-  async sendServerMuteRequest(targetParticipantId: string, state: PerKindMuteState): Promise<void> {
+  async sendServerMuteRequest(
+    targetParticipantId: string,
+    kind: MediaKindToken,
+    muted: boolean,
+  ): Promise<void> {
     const stream = this.#requireOpenStream('sendServerMuteRequest');
     const clientMessage = create(ClientMessageSchema, {
       message: {
         case: 'serverMuteRequest',
         value: create(ServerMuteRequestSchema, {
           participantId: targetParticipantId,
-          ...explicitMuteFields(state),
+          ...singleKindMuteFields(kind, muted),
         }),
       },
     });

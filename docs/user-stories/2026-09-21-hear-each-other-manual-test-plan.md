@@ -46,8 +46,11 @@ values *with the run*, not in the steps.
   roster lists for B. The frame's key-id sender component resolves to that roster entry, and the
   frame verifies under it. This is routing and attribution correctness **given an honest MC**. It
   is not proof of who B is (see below).
-- **Server-mute enforcement.** A host's server mute silences B at every receiver while B's client
-  keeps sending. MH drops B at ingress (`server_muted`). B cannot lift it. A non-host is refused.
+- **Server-mute enforcement.** A host's server mute silences B at every receiver. Since story 3
+  (MC-B) MC withdraws B's audio send directive, so B's send goes flat; MH's ingress drop
+  (`server_muted`) is the backstop against a patched client, proved by the Rust patched-publisher
+  env-test. B cannot lift it. A non-host is refused. (Superseded wording, kept for the record:
+  "while B's client keeps sending. MH drops B at ingress".)
 - **Rotation on leave.** A leave rotates the meeting KEK. The remaining participants keep hearing
   each other across the switch, and a joiner after the rotation opens current frames.
 

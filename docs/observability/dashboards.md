@@ -222,7 +222,8 @@ can't this participant decrypt?" — did the meeting ever get a key? — is read
 dashboard's KEK Lifecycle row.
 
 **When to Use**: "I can't hear anyone", one-way audio, a participant who cannot decrypt, server mute
-not taking effect, key rotation stalls.
+not taking effect (including "camera light still on after a server mute": Send Directive Withdrawals
+`reason="server_muted"` is MC's side of it), key rotation stalls.
 
 ---
 

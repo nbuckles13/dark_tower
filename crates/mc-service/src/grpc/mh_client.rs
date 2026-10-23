@@ -51,10 +51,9 @@ use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
 use proto_gen::dark_tower::internal::v1::{
-    CandidateSource, EgressStream, EndMeetingRequest, MutedSource, RegisterMeetingRequest,
+    CandidateSource, EgressStream, EndMeetingRequest, RegisterMeetingRequest,
     RegisterMeetingResponse, SourceDisposition, SourceStream, SubscriberSlot,
 };
-use proto_gen::dark_tower::signaling::v1::TransportMode;
 use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -222,10 +221,6 @@ fn build_egress_streams(assignment: &HandlerAssignment) -> Vec<EgressStream> {
                     .collect(),
                 priority_group: *priority_group,
                 supersede_on_independent_frame: *supersede_on_independent_frame,
-                // No longer written (story 3): an edge's transport derives from
-                // its candidate's `SourceStream`. Left at the proto default
-                // until MC-B deletes the field.
-                transport_mode: TransportMode::Unspecified as i32,
             }
         })
         .collect()
@@ -321,16 +316,12 @@ impl MhClient {
             // — so `None` is the accurate statement, not a stub left unfilled.
             selection_rules: None,
             policy_generation: programming.policy_generation.get(),
-            // This handler's server-muted senders, filtered by edge ownership in
-            // the render (`HandlerAssignment::server_muted_sources`). A set
-            // upstream, so the wire list is duplicate-free and canonically
-            // ordered; a change to it changed the assignment, so the generation
-            // above already advanced for it.
-            server_muted_sources: build_muted_sources(programming.assignment),
             // Story 3: every published (sender, stream) with its transport and
-            // disposition. Always present (MC never selects MH's legacy
-            // no-`source_streams` reading); a disposition change is an
-            // assignment change, so the generation above advanced for it.
+            // disposition -- the ONLY carrier of server mute (DROP_AT_INGRESS)
+            // and client mute (PAUSED) since MC-B deleted the sender-level
+            // muted set. Always present: with egress streams, an empty list is
+            // an MH reject. A disposition change is an assignment change, so
+            // the generation above advanced for it.
             source_streams: build_source_streams(programming.assignment),
         };
 
@@ -590,18 +581,6 @@ async fn connect_handler(mh_grpc_endpoint: &str, meeting_id: &str) -> Result<Cha
         })
 }
 
-/// The wire form of one handler's server-muted set. The set is already
-/// deduplicated and ordered upstream; this is a pure mapping.
-fn build_muted_sources(assignment: &HandlerAssignment) -> Vec<MutedSource> {
-    assignment
-        .server_muted_sources
-        .iter()
-        .map(|sender| MutedSource {
-            sender_id: u32::from(sender.get().get()),
-        })
-        .collect()
-}
-
 impl MhRegistrationClient for MhClient {
     fn register_meeting<'a>(
         &'a self,
@@ -624,6 +603,7 @@ mod tests {
     use super::*;
     use crate::media_admission::SenderId;
     use crate::media_routing::{HandlerId, SlotTable};
+    use proto_gen::dark_tower::signaling::v1::TransportMode;
     use std::num::NonZeroU16;
 
     #[test]
@@ -715,12 +695,6 @@ mod tests {
             );
         }
 
-        // `EgressStream.transport_mode` is no longer written (derived at MH
-        // from the candidate's `SourceStream`).
-        assert!(streams
-            .iter()
-            .all(|s| s.transport_mode == TransportMode::Unspecified as i32));
-
         // Every candidate is declared in `source_streams`, with a specified
         // transport and disposition, one entry per (sender, stream).
         let sources = build_source_streams(&assignment);
@@ -785,13 +759,7 @@ mod tests {
         table.admit_on_publishing(b, av, &set, &["mh-0"]);
         // A: audio client-muted (PAUSED), video server-muted (DROP_AT_INGRESS).
         let mute = SourceMuteView::from_map(std::collections::HashMap::from([
-            (
-                a,
-                SourceMute {
-                    server: [false, true],
-                    client: [true, false],
-                },
-            ),
+            (a, SourceMute::from_flags([false, true], [true, false])),
             (b, SourceMute::default()),
         ]));
         let policy = table
@@ -855,7 +823,6 @@ mod tests {
             egress_streams: build_egress_streams(p.assignment),
             selection_rules: None,
             policy_generation: p.policy_generation.get(),
-            server_muted_sources: Vec::new(),
             source_streams: Vec::new(),
         };
         // `RegisterMeetingRequest` has no bytes-typed field at all, so this is

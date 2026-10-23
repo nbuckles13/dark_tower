@@ -988,6 +988,32 @@ QUIC's connection-level keepalive** (§1), not by media flow, so a long mute doe
 > Wire homes: `signaling.proto` mute section, `SendDirective`, `SendStream.targets`,
 > `ParticipantMuteUpdate`.
 
+> **Amendment (2026-10-23, story 3 MC-B — four mute controls as implemented; R-15–R-18).** This
+> tightens the 2026-10-13 amendment above, which stays visible. Its bullet *"Client mute MAY stay
+> directed"* is superseded: **the send directive never depends on client mute.**
+>
+> - **Four independent controls that compose** — client audio, client video, server audio, server
+>   video. A request names the kinds it changes; a kind it does not name is unchanged, and a request
+>   naming no kind is refused generically and counted. A request about one kind never changes the
+>   other kind's state, directive, disposition or slot states.
+> - **Server mute of a kind withdraws that kind's directive** — the stream stays listed with an
+>   empty target set, so capture stops and, for video, the camera light goes off — **and** MH keeps
+>   dropping that stream at ingress as the **backstop** against a patched client (§7). The stream
+>   keeps its slots and edges, so the drop is counted where it happens.
+> - **Client mute keeps the directive and is enforced at capture, never by an ingress drop.** MH
+>   learns it from MC's policy as a *paused* source: nothing of that kind is forwarded while paused,
+>   and nothing is dropped, so a resume keyframe that beats MC's update still reaches subscribers.
+> - **The directive never depends on client mute.** That keeps *"MC has not asked you to send"*
+>   distinct from *"you muted yourself"*, and keeps resuming from a client mute a local decision.
+>   MC enforces it structurally: the directive's only mute input is the server half.
+> - **Plainly: a host's server unmute can resume a participant's camera or microphone, unless that
+>   participant has client-muted that kind.** A server unmute restores the directive whatever the
+>   client mute; a client-muted participant keeps capture off locally. The participant is shown a
+>   non-suppressible notice at the moment capture resumes, and MC sends the participant its own
+>   mute update before the directive change that restores capture.
+> - **Devices.** The microphone stays open on an audio mute of either cause, and only stops
+>   sending; only a video mute, client or server, stops the camera.
+
 ---
 
 ## 6. What clients receive
@@ -1231,7 +1257,8 @@ must be designed knowing that per-subscriber exclusions are where they will land
 >   stream's slots, which are of a kind not server-muted; and receivers decode by slot kind, never by frame (§6), which is a
 >   load-bearing receiver dependency. The single home of this reasoning, including the dated
 >   correction of the earlier "per-kind ingress mute is foreclosed" text, is `internal.proto`
->   `MutedSource`.
+>   `MutedSource`. *(2026-10-23: `MutedSource` was deleted by MC-B; that reasoning now lives at
+>   `internal.proto` `SourceStream`.)*
 > - **Priority.** MC assigns audio edges priority group 1 and video edges 2 (lower is higher), and
 >   video edges supersede on an independently-decodable frame — behaviours, not media types.
 

@@ -48,6 +48,7 @@ import { KeyframeGate } from './keyframePolicy.js';
 import { FaultOnce } from './faultOnce.js';
 import { MediaFaultStage, type MediaFault } from './AudioPipeline.js';
 import type { MuteSnapshot, MuteState } from './muteState.js';
+import type { MediaKindToken } from '../mediaKind.js';
 import type { TransmitKeyManager } from './transmitKeys.js';
 
 /** MC's validated instruction for this client's video stream. */
@@ -75,8 +76,8 @@ export interface VideoPublisherOptions {
   readonly identity: MeetingIdentity;
   /** The session's shared client-mute state (both kinds). */
   readonly mute: MuteState;
-  /** Report BOTH kinds' mute to MC (`signaling/muteRequest.ts`). Informational. */
-  readonly reportMute: (state: MuteSnapshot) => void;
+  /** Report ONE kind's client mute to MC (`signaling/muteRequest.ts`). Best-effort. */
+  readonly reportMute: (kind: MediaKindToken, muted: boolean) => void;
   /** The presented mute changed (drives the session's `muteChanged`). */
   readonly onMuteChanged: (state: MuteSnapshot) => void;
   /** The one capture-source selection's factory (camera or gated test pattern). */
@@ -341,7 +342,9 @@ export class VideoPublisher {
   #announceMute(): void {
     const snapshot = this.#o.mute.snapshot();
     this.#o.onMuteChanged(snapshot);
-    this.#o.reportMute(snapshot);
+    // VIDEO only: the request names the kind it changed; audio's field stays
+    // absent, so MC leaves audio exactly as it is.
+    this.#o.reportMute('video', snapshot.videoMuted);
   }
 
   #restartCapture(): void {

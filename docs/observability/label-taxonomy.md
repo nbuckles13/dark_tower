@@ -154,7 +154,8 @@ because a per-kind split would double-count one event or invent a value: the cli
 session-level KEK, roster and capture-source series; MC's `mc_media_send_directives_total`
 (composed per participant before any stream exists), `mc_media_unreachable_senders_total`
 and `mc_media_not_yet_connected_senders_total` (properties of a sender relative to a
-subscriber), and `mc_media_unmute_requests_total` (no per-kind presence on the wire). The
+subscriber), `mc_media_unmute_requests_total` (no per-kind presence on the wire), and
+`mc_media_mute_requests_rejected_total` (the rejected request names no kind). The
 per-series lists and reasons are in the catalogs.
 
 **`content_kind` is declared, not carried.** No metric emits it. Do not write a dashboard

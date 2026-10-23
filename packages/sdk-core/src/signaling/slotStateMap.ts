@@ -4,15 +4,16 @@
 // `StreamAssignment` onto the public tokens (story 3 R-4, wire freeze). Same
 // shape and reasoning as `codecMap.ts`:
 //
-//   * KEYED ON THE WIRE ENUM (a `Partial` table until MC-B; see below).
+//   * KEYED ON THE WIRE ENUM, EXHAUSTIVELY: a new wire member that is not
+//     mapped is a compile error here.
 //   * OPEN-ENUM FAIL-CLOSED. protobuf-es decodes a number the schema does not
 //     name as that number; it is not in the table and maps to `unspecified`.
 //     NOTHING but the wire's `ACTIVE` maps to `active` — the security property
 //     (an unknown or legacy state never renders media).
 //
-// A wire value the table does not name — including any superseded member the
-// proto still carries until MC-B (story 3 task 15) deletes it — maps to
-// `unspecified`, never `active`.
+// A wire value the table does not name — an unknown number from a newer or
+// older peer, e.g. a reserved number such as story 2's deleted SOURCE_MUTED —
+// maps to `unspecified`, never `active`.
 
 import { MediaKind, SlotState } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 
@@ -20,16 +21,11 @@ import type { SlotStateToken } from './events.js';
 import type { MediaKindToken, OpenMediaKindToken } from '../media/mediaKind.js';
 
 /**
- * Wire -> token table.
- *
- * `Partial` rather than the exhaustive `Record<SlotState, …>` ONLY while the
- * proto still carries the superseded legacy member that no SDK code may name
- * (story 3 C-A2: zero references, so MC-B can delete it). MC-B (story 3 task 15)
- * restores `Record<SlotState, SlotStateToken>` once the member is gone, bringing
- * back the compile error for an unmapped new member. Until then
- * `__tests__/slotStateMap.test.ts` pins "every member but one is mapped".
+ * Wire -> token table. An exhaustive `Record<SlotState, …>`: adding a wire
+ * member without mapping it fails to compile (`__tests__/slotStateMap.test.ts`
+ * also pins "every member is mapped").
  */
-const SLOT_STATE_TOKENS: Partial<Record<SlotState, SlotStateToken>> = {
+const SLOT_STATE_TOKENS: Record<SlotState, SlotStateToken> = {
   [SlotState.UNSPECIFIED]: 'unspecified',
   [SlotState.ACTIVE]: 'active',
   [SlotState.WITHHELD_BY_CONGESTION]: 'withheld_by_congestion',

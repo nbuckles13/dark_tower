@@ -29,6 +29,11 @@ use common::{roundtrip, top_level_field_numbers, UNKNOWN_ENUM_VALUE};
 /// generated code, which is what the reservation tests below prove.
 const RESERVED_SLOT_STATE_ZERO_REQUESTED: i32 = 5;
 
+/// The number `SLOT_STATE_SOURCE_MUTED` occupied before MC-B deleted it and
+/// reserved number and name (`reserved 2; reserved "SLOT_STATE_SOURCE_MUTED";`).
+/// A raw literal for the same reason as the one above.
+const RESERVED_SLOT_STATE_SOURCE_MUTED: i32 = 2;
+
 // ---------------------------------------------------------------------------
 // Receive capability (§6)
 // ---------------------------------------------------------------------------
@@ -200,7 +205,6 @@ fn every_named_slot_state_is_distinct_and_the_story_3_values_are_pinned() {
     // published value.
     let states = [
         SlotState::Active,
-        SlotState::SourceMuted,
         SlotState::WithheldByCongestion,
         SlotState::FewerSourcesThanSlots,
         SlotState::SourceUnreachable,
@@ -231,6 +235,10 @@ fn every_named_slot_state_is_distinct_and_the_story_3_values_are_pinned() {
     assert!(
         !seen.contains(&RESERVED_SLOT_STATE_ZERO_REQUESTED),
         "no named state may occupy the reserved number"
+    );
+    assert!(
+        !seen.contains(&RESERVED_SLOT_STATE_SOURCE_MUTED),
+        "no named state may occupy the number MC-B reserved for SOURCE_MUTED"
     );
 }
 
@@ -332,7 +340,6 @@ fn join_response_roundtrips_kek_generation_and_sender_id() {
         meeting_kek: kek.clone(),
         kek_generation: 65535,
         kek_rotation_debounce_seconds: 0,
-        max_receive_slots: Some(8),
         max_audio_receive_slots: None,
         max_video_receive_slots: None,
     });
@@ -340,7 +347,6 @@ fn join_response_roundtrips_kek_generation_and_sender_id() {
     assert_eq!(out.sender_id, Some(65535));
     assert_eq!(out.meeting_kek, kek);
     assert_eq!(out.kek_generation, 65535);
-    assert_eq!(out.max_receive_slots, Some(8));
     // The roster carries both halves of the attribution chain and no other key
     // material (ADR-0036 §4).
     assert_eq!(out.existing_participants[0].sender_id, Some(2));
@@ -804,70 +810,6 @@ fn debug_redaction_survives_the_enclosing_envelope() {
 }
 
 // ---------------------------------------------------------------------------
-// Story 2 task 13: MC's receive-slot cap advertised on the join (R-1, R-23)
-// ---------------------------------------------------------------------------
-
-/// The cap survives by VALUE. A value other than the default 8 so a codegen
-/// slip that wired the field to a neighbour's tag reds here.
-#[test]
-fn max_receive_slots_roundtrips_by_value() {
-    let out = roundtrip(&JoinResponse {
-        participant_id: "p-1".to_string(),
-        max_receive_slots: Some(5),
-        kek_rotation_debounce_seconds: 60,
-        ..Default::default()
-    });
-    assert_eq!(out.max_receive_slots, Some(5));
-    // The additive field does not disturb its neighbour.
-    assert_eq!(out.kek_rotation_debounce_seconds, 60);
-}
-
-/// ABSENT is the older-MC observable: "cap unknown". It must decode as absent,
-/// never as a present 0 — dropping `optional` would make the two one value.
-#[test]
-fn max_receive_slots_absent_decodes_as_absent_not_zero() {
-    let out = roundtrip(&JoinResponse {
-        participant_id: "p-1".to_string(),
-        max_receive_slots: None,
-        ..Default::default()
-    });
-    assert_eq!(out.max_receive_slots, None);
-    assert_ne!(out.max_receive_slots, Some(0));
-}
-
-/// A PRESENT 0 is a contract violation the client must surface loudly; it can
-/// only do so if the wire keeps it distinct from absence.
-#[test]
-fn max_receive_slots_zero_survives_as_a_present_zero_not_absence() {
-    let out = roundtrip(&JoinResponse {
-        max_receive_slots: Some(0),
-        ..Default::default()
-    });
-    assert_eq!(out.max_receive_slots, Some(0));
-    assert_ne!(out.max_receive_slots, None);
-}
-
-/// The cap is shown in the clear by the hand-written redacting `Debug`, whose
-/// field list has no compiler-enforced exhaustiveness.
-#[test]
-fn debug_shows_the_receive_slot_cap_in_the_clear() {
-    let join = JoinResponse {
-        meeting_kek: vec![0xC3u8; 32],
-        max_receive_slots: Some(7),
-        ..Default::default()
-    };
-    let rendered = format!("{join:?}");
-    assert!(
-        rendered.contains("max_receive_slots: Some(7)"),
-        "the cap must be visible: {rendered}"
-    );
-    assert!(
-        !rendered.contains("195, 195"),
-        "KEK bytes must not be printed"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Story 3 (see-each-other): per-kind mute presence (R-15)
 // ---------------------------------------------------------------------------
 
@@ -939,8 +881,8 @@ fn old_shape_true_decodes_as_present_true() {
 /// NOT semantics-compatible: an old encoder OMITS `false` (implicit presence),
 /// so an old sender's UNMUTE arrives as no bytes at all and decodes as
 /// "unchanged". This pins the hazard the proto comment names -- a pre-P1
-/// client's unmute reads as unchanged once MC-B honours absence -- so nobody
-/// "fixes" it by guessing.
+/// client's unmute reads as unchanged now that MC honours absence (MC-B) --
+/// so nobody "fixes" it by guessing.
 #[test]
 fn old_shape_false_is_indistinguishable_from_absent() {
     let old_false_both: [u8; 0] = [];
@@ -953,6 +895,29 @@ fn old_shape_false_is_indistinguishable_from_absent() {
 // ---------------------------------------------------------------------------
 // Story 3: slot-state vocabulary (R-4, R-5) and open enums
 // ---------------------------------------------------------------------------
+
+/// `SLOT_STATE_SOURCE_MUTED` (deleted by MC-B) is reserved by number AND name,
+/// exactly like `SLOT_STATE_ZERO_REQUESTED` below: a raw 2 from an older MC
+/// survives as the integer for a consumer to fail closed on, never as a value
+/// it could render.
+#[test]
+fn reserved_source_muted_is_not_a_named_value() {
+    assert!(SlotState::try_from(RESERVED_SLOT_STATE_SOURCE_MUTED).is_err());
+    assert_eq!(SlotState::from_str_name("SLOT_STATE_SOURCE_MUTED"), None);
+    // Positive control: the same lookups DO resolve a live value.
+    assert!(SlotState::try_from(SlotState::AvatarServerMuted as i32).is_ok());
+    assert_eq!(
+        SlotState::from_str_name("SLOT_STATE_AVATAR_SERVER_MUTED"),
+        Some(SlotState::AvatarServerMuted)
+    );
+
+    let out = roundtrip(&StreamAssignment {
+        slot_id: 1,
+        slot_state: RESERVED_SLOT_STATE_SOURCE_MUTED,
+        ..Default::default()
+    });
+    assert_eq!(out.slot_state, RESERVED_SLOT_STATE_SOURCE_MUTED);
+}
 
 /// `SLOT_STATE_ZERO_REQUESTED` is reserved by number AND name: its number no
 /// longer converts to a named value, its name no longer parses, and a raw 5 on

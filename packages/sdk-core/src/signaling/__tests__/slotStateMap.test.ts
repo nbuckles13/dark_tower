@@ -26,14 +26,9 @@ const EXPECTED: Record<number, string> = {
 };
 
 describe('slotStateToken', () => {
-  // Story 3 C-A2: the proto still carries ONE superseded member until MC-B
-  // (task 15) deletes it, and no SDK code may name it. So this pins "every
-  // generated member but exactly one is mapped", and that one fails closed.
-  const UNMAPPED = ALL_SLOT_STATES.filter((st) => !(st in EXPECTED));
-
-  it('the table covers every generated SlotState value but the ONE superseded member (positive control)', () => {
-    expect(ALL_SLOT_STATES.length).toBeGreaterThanOrEqual(11);
-    expect(UNMAPPED).toHaveLength(1);
+  it('the table covers EVERY generated SlotState value (positive control)', () => {
+    expect(ALL_SLOT_STATES.length).toBeGreaterThanOrEqual(10);
+    expect(ALL_SLOT_STATES.filter((st) => !(st in EXPECTED))).toEqual([]);
     for (const key of Object.keys(EXPECTED).map(Number)) expect(ALL_SLOT_STATES).toContain(key);
   });
 
@@ -44,16 +39,14 @@ describe('slotStateToken', () => {
     },
   );
 
-  it('the superseded member maps to unspecified — never active, never an avatar it cannot justify', () => {
-    expect(UNMAPPED.map((st) => slotStateToken(st))).toEqual(['unspecified']);
-  });
-
-  it.each([5, 12, 99, -1])('maps the unnamed number %i to unspecified — fail closed', (n) => {
+  // 2 is story 2's SOURCE_MUTED and 5 ZERO_REQUESTED, both reserved: an older
+  // peer's value fails closed like any unknown number.
+  it.each([2, 5, 12, 99, -1])('maps the unnamed number %i to unspecified — fail closed', (n) => {
     expect(slotStateToken(n as SlotState)).toBe('unspecified');
   });
 
   it('NOTHING but ACTIVE maps to active', () => {
-    for (const state of [...ALL_SLOT_STATES, 5, 12, 99] as SlotState[]) {
+    for (const state of [...ALL_SLOT_STATES, 2, 5, 12, 99] as SlotState[]) {
       if (state === SlotState.ACTIVE) continue;
       expect(slotStateToken(state)).not.toBe('active');
     }

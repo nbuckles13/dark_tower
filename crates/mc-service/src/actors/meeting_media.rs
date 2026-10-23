@@ -332,9 +332,14 @@ pub(crate) fn test_join_media() -> JoinMedia {
 pub(super) enum Affected {
     /// Every declared participant (join, leave, declaration, reconnect).
     All,
-    /// The subscribers holding this source in a slot of EITHER kind (its mute
-    /// changed, of either kind and either cause).
+    /// The subscribers holding this source in a slot of EITHER kind (its
+    /// CLIENT mute changed: the publisher's own directive never depends on
+    /// client mute, so the publisher is not dirtied).
     HoldersOf(SenderId),
+    /// The publisher itself AND the subscribers holding it (its SERVER mute
+    /// changed: the publisher's directive is withdrawn or restored for the
+    /// moved kind, and its holders' slot states change).
+    PublisherAndHoldersOf(SenderId),
 }
 
 /// One roster participant, as a flush needs it.
@@ -733,10 +738,13 @@ impl MeetingMedia {
                     }
                 }
             }
-            Affected::HoldersOf(source) => {
+            Affected::HoldersOf(source) | Affected::PublisherAndHoldersOf(source) => {
+                let with_publisher = matches!(affected, Affected::PublisherAndHoldersOf(_));
                 let holders = self.slots.holders_of(source);
                 for (participant_id, view) in &self.views {
-                    if view.declaration.is_some() && holders.contains(&view.sender) {
+                    let hit =
+                        holders.contains(&view.sender) || (with_publisher && view.sender == source);
+                    if view.declaration.is_some() && hit {
                         self.dirty.insert(participant_id.clone());
                     }
                 }
@@ -746,9 +754,9 @@ impl MeetingMedia {
 
     /// Render the slot table and publish each handler's snapshot.
     ///
-    /// Each snapshot carries the meeting's per-stream `source_streams` (with
-    /// dispositions from `mute`) and the legacy `server_muted_sources` —
-    /// see [`SlotTable::render`]. Synchronous in the actor; the push itself is
+    /// Each snapshot carries the meeting's per-stream `source_streams`, whose
+    /// dispositions (from `mute`) are the only mute carrier to MH — see
+    /// [`SlotTable::render`]. Synchronous in the actor; the push itself is
     /// the handler's push worker's.
     async fn render_and_publish(&mut self, mute: &SourceMuteView) {
         let (Some(deps), Some(handlers)) = (&self.deps, &self.handlers) else {
@@ -980,12 +988,17 @@ impl MeetingMedia {
 
         let composed = match &self.assignment {
             None => Err(DirectiveOutcome::AssignmentFailed),
+            // The SERVER half of this publisher's mute only: the directive is
+            // withdrawn for a server-muted kind and never depends on client
+            // mute (ADR-0036 §5) -- `entry.mute.client` is a different type
+            // and cannot be passed here.
             Some(assignment) => build_send_directive(
                 view.sender,
                 entry.publishes,
                 assignment,
                 handlers,
                 &deps.stream_policy,
+                entry.mute.server,
             )
             .and_then(|(directive, outcome, stream_kinds)| {
                 build_stream_assignments(
@@ -1075,7 +1088,17 @@ impl MeetingMedia {
             .await;
             if delivered {
                 for kind in &withdrawn {
-                    metrics::record_send_directive_withdrawal(*kind, WithdrawalReason::Unwatched);
+                    // Attributed to the CURRENT cause: a stream emptied while
+                    // its kind is server-muted is a `server_muted` withdrawal
+                    // (a server mute of an already-unwatched, already-empty
+                    // stream is no transition and counts nothing); otherwise
+                    // its last watcher went.
+                    let reason = if entry.mute.server.is_muted(*kind) {
+                        WithdrawalReason::ServerMuted
+                    } else {
+                        WithdrawalReason::Unwatched
+                    };
+                    metrics::record_send_directive_withdrawal(*kind, reason);
                 }
             }
         }

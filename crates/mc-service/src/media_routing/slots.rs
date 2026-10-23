@@ -110,7 +110,7 @@ use super::assignment::{
 use super::edges::{colocate, meeting_seed, EdgeChooser, EdgeContext};
 use super::placement::ConnectedHandlers;
 use crate::media_admission::SenderId;
-use crate::media_kind::{MediaKindLabel, PublishSet};
+use crate::media_kind::{ClientMutedKinds, MediaKindLabel, PublishSet, ServerMutedKinds};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// The kind order when a subscriber has empty slots of BOTH kinds at one
@@ -269,12 +269,36 @@ impl Loads {
 /// A READ-ONLY projection of the meeting actor's roster flags, built per
 /// render and never retained (the roster is the one home of mute). Explicit
 /// fields only — never a roster struct, which also holds identity material.
+///
+/// The two halves are DISTINCT TYPES ([`ServerMutedKinds`],
+/// [`ClientMutedKinds`]) so the send-directive builder, which takes only the
+/// server half, cannot be handed the client half (ADR-0036 §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SourceMute {
-    /// Server-muted, per kind (laid out by [`MediaKindLabel::index`]).
-    pub server: [bool; 2],
+    /// Server-muted, per kind.
+    pub server: ServerMutedKinds,
     /// Client-muted, per kind.
-    pub client: [bool; 2],
+    pub client: ClientMutedKinds,
+}
+
+impl SourceMute {
+    /// From the two TYPED halves. Positional `[bool; 2]` arguments would let a
+    /// swapped call feed client mute into the server half (and so into the
+    /// send directive); typed halves make that swap a compile error.
+    #[must_use]
+    pub const fn new(server: ServerMutedKinds, client: ClientMutedKinds) -> Self {
+        Self { server, client }
+    }
+
+    /// Test fixture: from raw per-kind flags (`[audio, video]`).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn from_flags(server: [bool; 2], client: [bool; 2]) -> Self {
+        Self::new(
+            ServerMutedKinds::from_server_flags(server),
+            ClientMutedKinds::from_client_flags(client),
+        )
+    }
 }
 
 /// The roster's per-kind mute flags, as every reader of mute sees them: the
@@ -307,10 +331,13 @@ impl SourceMuteView {
     /// nobody asked for.
     #[must_use]
     pub fn flags(&self, sender: SenderId) -> SourceMute {
-        self.by_sender.get(&sender).copied().unwrap_or(SourceMute {
-            server: [true; 2],
-            client: [false; 2],
-        })
+        self.by_sender
+            .get(&sender)
+            .copied()
+            .unwrap_or(SourceMute::new(
+                ServerMutedKinds::from_server_flags([true; 2]),
+                ClientMutedKinds::NONE,
+            ))
     }
 }
 
@@ -849,14 +876,6 @@ impl SlotTable {
     /// nobody asked for. A member absent from `mute` fails CLOSED
     /// ([`SourceMuteView::flags`]).
     ///
-    /// # The legacy server-muted set (MC-B deletes it)
-    ///
-    /// `server_muted_sources` is written exactly as story 2 computed it: the
-    /// AUDIO-server-muted senders that source at least one AUDIO egress stream
-    /// on this handler (edge ownership, never connectivity), bounded by
-    /// `|set| <= |audio egress_streams|` because each audio stream carries one
-    /// candidate.
-    ///
     /// # Errors
     ///
     /// [`AssignmentError::EgressOrdinalOverflow`] if an ordinal does not fit
@@ -880,8 +899,8 @@ impl SlotTable {
                     stream_number: stream_number_of(kind),
                     transport_mode: TransportModeOrd::new(transport_of(kind)),
                     disposition: SourceDispositionPlan::from_mute(
-                        *kind.of_ref(&flags.server),
-                        *kind.of_ref(&flags.client),
+                        flags.server.is_muted(kind),
+                        flags.client.is_muted(kind),
                     ),
                 });
             }
@@ -900,7 +919,8 @@ impl SlotTable {
                         egress_stream_id: egress_stream_id(member.sender, kind, ordinal)?,
                         subscriber: member.sender,
                         slot_id: *slot_id,
-                        // Exactly one candidate: the muted-set bound rests on it.
+                        // Exactly one candidate: static fill pins the source
+                        // (no selection among candidates until story 5).
                         candidate_sources: vec![edge.source],
                         stream_number: stream_number_of(kind),
                         priority_group: priority_group_of(kind),
@@ -916,18 +936,10 @@ impl SlotTable {
             }
         }
 
-        let audio_stream = stream_number_of(MediaKindLabel::Audio);
         for assignment in per_handler.values_mut() {
             assignment
                 .egress_streams
                 .sort_by_key(|s| s.egress_stream_id);
-            assignment.server_muted_sources = assignment
-                .egress_streams
-                .iter()
-                .filter(|plan| plan.stream_number == audio_stream)
-                .flat_map(|plan| plan.candidate_sources.iter().copied())
-                .filter(|source| *MediaKindLabel::Audio.of_ref(&mute.flags(*source).server))
-                .collect();
             assignment.source_streams = source_streams.clone();
         }
         Ok(MeetingAssignment { per_handler })
@@ -1011,26 +1023,6 @@ mod tests {
         for s in ids {
             t.set_connectivity(sender(*s), all());
         }
-    }
-
-    /// Every listed sender AUDIO-server-muted; everyone else absent (the
-    /// legacy muted set reads presence; these tests do not read dispositions).
-    fn audio_server_muted(t: &SlotTable, ids: &[u16]) -> SourceMuteView {
-        let mut map: HashMap<SenderId, SourceMute> = t
-            .members
-            .values()
-            .map(|m| (m.sender, SourceMute::default()))
-            .collect();
-        for s in ids {
-            map.insert(
-                sender(*s),
-                SourceMute {
-                    server: [true, false],
-                    client: [false; 2],
-                },
-            );
-        }
-        SourceMuteView::from_map(map)
     }
 
     fn admit(t: &mut SlotTable, s: u16) {
@@ -1370,86 +1362,6 @@ mod tests {
             vec![Some(1), Some(2)],
             "earliest-joined first"
         );
-    }
-
-    /// The render's per-handler server-muted set, by EDGE OWNERSHIP.
-    ///
-    /// A is on both handlers, B only on mh-0, C only on mh-1. B and C each hear
-    /// A; A hears B and C. So A sources an edge on EACH handler, B only on mh-0
-    /// (its only shared handler with A) and C only on mh-1.
-    fn split_meeting() -> (SlotTable, MeetingHandlers) {
-        let set = handler_set();
-        let mut t = SlotTable::new();
-        t.admit_on(sender(1), &set, &["mh-0", "mh-1"]);
-        t.admit_on(sender(2), &set, &["mh-0"]);
-        t.admit_on(sender(3), &set, &["mh-1"]);
-        t.set_audio_demand(sender(1), vec![0, 1]);
-        t.set_audio_demand(sender(2), vec![0]);
-        t.set_audio_demand(sender(3), vec![0]);
-        (t, set)
-    }
-
-    fn muted_on(render: &MeetingAssignment, handler: &str) -> Vec<u16> {
-        render
-            .for_handler(&h(handler))
-            .unwrap()
-            .server_muted_sources
-            .iter()
-            .map(|s| s.get().get())
-            .collect()
-    }
-
-    #[test]
-    fn a_muted_sender_whose_edges_span_both_handlers_is_in_both_sets() {
-        let (t, set) = split_meeting();
-        let render = t.render(set.ids(), &audio_server_muted(&t, &[1])).unwrap();
-        assert_eq!(muted_on(&render, "mh-0"), vec![1]);
-        assert_eq!(muted_on(&render, "mh-1"), vec![1]);
-    }
-
-    #[test]
-    fn a_muted_sender_is_only_on_the_handlers_carrying_its_edges() {
-        let (t, set) = split_meeting();
-        let render = t.render(set.ids(), &audio_server_muted(&t, &[2])).unwrap();
-        assert_eq!(
-            muted_on(&render, "mh-0"),
-            vec![2],
-            "B's one edge is on mh-0"
-        );
-        assert!(
-            muted_on(&render, "mh-1").is_empty(),
-            "B sources nothing on mh-1, and connectivity alone never puts it there"
-        );
-    }
-
-    #[test]
-    fn a_muted_sender_with_no_edge_is_in_no_set_and_nobody_muted_is_empty() {
-        let (mut t, set) = split_meeting();
-        t.admit_on(sender(4), &set, &[]); // admitted, connected to nothing
-        let render = t.render(set.ids(), &audio_server_muted(&t, &[4])).unwrap();
-        assert!(muted_on(&render, "mh-0").is_empty());
-        assert!(muted_on(&render, "mh-1").is_empty());
-
-        let unmuted = t.render(set.ids(), &t.quiet_mute()).unwrap();
-        assert!(muted_on(&unmuted, "mh-0").is_empty());
-        assert!(muted_on(&unmuted, "mh-1").is_empty());
-    }
-
-    /// The bound MH relies on: each handler's set is no larger than its egress
-    /// streams, even with EVERY participant muted.
-    #[test]
-    fn a_handlers_muted_set_never_exceeds_its_egress_streams() {
-        let (t, set) = split_meeting();
-        let render = t
-            .render(set.ids(), &audio_server_muted(&t, &[1, 2, 3]))
-            .unwrap();
-        for handler in ["mh-0", "mh-1"] {
-            let policy = render.for_handler(&h(handler)).unwrap();
-            assert!(
-                policy.server_muted_sources.len() <= policy.egress_streams.len(),
-                "{handler}: |muted| <= |egress_streams|"
-            );
-        }
     }
 
     #[test]
@@ -1855,10 +1767,7 @@ mod tests {
         let mute = HashMap::from([
             (
                 sender(1),
-                SourceMute {
-                    server: [false, true],
-                    client: [true, true],
-                },
+                SourceMute::from_flags([false, true], [true, true]),
             ),
             (sender(2), SourceMute::default()),
             (sender(3), SourceMute::default()),
@@ -1917,13 +1826,7 @@ mod tests {
         let a = t.render(set.ids(), &quiet).unwrap();
         assert_eq!(a, t.render(set.ids(), &quiet).unwrap());
         let muted = HashMap::from([
-            (
-                sender(1),
-                SourceMute {
-                    server: [false; 2],
-                    client: [false, true],
-                },
-            ),
+            (sender(1), SourceMute::from_flags([false; 2], [false, true])),
             (sender(2), SourceMute::default()),
         ]);
         assert_ne!(
@@ -2305,15 +2208,7 @@ mod tests {
     fn mute_map(people: &BTreeMap<u8, Person>) -> HashMap<SenderId, SourceMute> {
         people
             .values()
-            .map(|p| {
-                (
-                    p.sender,
-                    SourceMute {
-                        server: p.server,
-                        client: p.client,
-                    },
-                )
-            })
+            .map(|p| (p.sender, SourceMute::from_flags(p.server, p.client)))
             .collect()
     }
 
@@ -2334,11 +2229,6 @@ mod tests {
                 )
                 .unwrap();
                 for a in &composition.assignments.assignments {
-                    assert_ne!(
-                        a.slot_state,
-                        SlotState::SourceMuted as i32,
-                        "never SOURCE_MUTED"
-                    );
                     let state = SlotState::try_from(a.slot_state).unwrap();
                     match state {
                         SlotState::AvatarNoVideo

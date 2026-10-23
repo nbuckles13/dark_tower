@@ -686,7 +686,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
    */
   setAudioMuted(muted: boolean): void {
     if (this.#pipeline) this.#pipeline.setAudioMuted(muted);
-    else this.#clientMuteChanged(this.#mediaState.setClientMute('audio', muted));
+    else this.#clientMuteChanged('audio', muted, this.#mediaState.setClientMute('audio', muted));
   }
 
   /**
@@ -697,7 +697,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   setVideoMuted(muted: boolean): void {
     const video = this.video;
     if (video) video.setMuted(muted);
-    else this.#clientMuteChanged(this.#mediaState.setClientMute('video', muted));
+    else this.#clientMuteChanged('video', muted, this.#mediaState.setClientMute('video', muted));
   }
 
   /** The video publisher, once media started with video published. */
@@ -720,12 +720,13 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     return this.#mediaState.mute.snapshot();
   }
 
-  #clientMuteChanged(snapshot: MuteSnapshot | undefined): void {
+  #clientMuteChanged(kind: PublishKind, muted: boolean, snapshot: MuteSnapshot | undefined): void {
     if (!snapshot) return;
     this.emit('muteChanged', snapshot);
-    // Informational, best-effort, both kinds explicit (see `startMedia`).
+    // Best-effort, ONE kind per request: the other kind's field stays absent,
+    // so MC leaves it exactly as it is (`signaling/muteRequest.ts`).
     if (this.#state === MeetingSessionState.Joined) {
-      void this.#signaling?.sendMuteRequest(snapshot).catch(() => undefined);
+      void this.#signaling?.sendMuteRequest(kind, muted).catch(() => undefined);
     }
   }
 
@@ -766,19 +767,15 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
    * refuses a non-host with a post-join `FORBIDDEN` session `error` (the
    * connection stays up).
    *
-   * BOTH KINDS ARE SENT (until MC-B): the other kind carries the target's
-   * CURRENT server-mute state from its latest `ParticipantMuteUpdate` — known
-   * after join, since MC replays every server-muted participant's flags — so a
-   * request about one kind never changes the other (`signaling/muteRequest.ts`).
+   * ONE KIND PER REQUEST: the other kind's field is left absent, which MC
+   * reads as "unchanged", so a request about one kind never changes the other
+   * (`signaling/muteRequest.ts`).
    *
    * @throws {SignalingError} `Transport` if called before a settled join.
    */
   async setServerMute(participantId: string, kind: PublishKind, muted: boolean): Promise<void> {
     const signaling = this.#requireJoinedSignaling('setServerMute');
-    await signaling.sendServerMuteRequest(
-      participantId,
-      this.#mediaState.serverMuteRequest(participantId, kind, muted),
-    );
+    await signaling.sendServerMuteRequest(participantId, kind, muted);
   }
 
   /**

@@ -11,14 +11,19 @@ rules from the start; pre-existing deviations are draining via the R-61 chain.
 
 - `lint.use: [STANDARD]` — the full buf STANDARD ruleset, no carve-outs.
 - `breaking.use: [FILE, WIRE_JSON]` with `except: [ENUM_VALUE_NO_DELETE,
-  FIELD_SAME_CARDINALITY, FIELD_NO_DELETE]` — wire compatibility, not source
-  compatibility (2026-10-20, user decision; see the correction note below).
+  FIELD_SAME_CARDINALITY, FIELD_NO_DELETE, MESSAGE_NO_DELETE]` — wire
+  compatibility, not source compatibility (2026-10-20 and 2026-10-23, user
+  decisions; see the correction notes below).
   `FILE` stays in the set for what `WIRE_JSON` alone misses: a package rename
   via file move (the 2026-05-20 reason `FILE` was chosen, `docs/TODO.md`) and
   RPC/service deletion, which `WIRE_JSON` reports as zero findings yet breaks
   every gRPC caller. `WIRE_JSON` adds the reserve-aware and JSON-name rules.
-  The three excepted rules are source-only; each has a wire counterpart that
-  still fires.
+  The first three excepted rules are source-only; each has a wire counterpart
+  that still fires. `MESSAGE_NO_DELETE` is excepted because a message name is
+  on neither the binary nor the proto3 JSON wire (no `Any` is used); a field
+  still typed by the deleted message must change type or be deleted, and the
+  type and reserve-aware rules catch that. If `Any` (or any other type-URL
+  carrier) is ever introduced, this exception must be revisited.
 
 There is no `lint.ignore` block, and as of the ADR-0036 signalling reshape no
 `// buf:lint:ignore` annotations either — `signaling.proto` carried five, all
@@ -120,6 +125,31 @@ it escalates and a human decides.
 > human-acceptance rule now applies to *wire* breaks. A change the new set
 > passes is not a break and needs no declaration. A real wire break still turns
 > Layer 6 red, and a headless Lead still may not accept it.
+>
+> **Correction (2026-10-23, story 3 MC-B).** "Field deletion **with** number and
+> name reserved produces 0. That is the shape MC-B's superseded-field deletion
+> must use" was measured on field and enum-value deletions only. Deleting a
+> **message** still fires `MESSAGE_NO_DELETE` (a `FILE` rule, kept
+> deliberately; see `proto/buf.yaml`). MC-B's deletion of `MutedSource`
+> produced exactly that one finding (buf 1.72; positive control: an unreserved
+> field name fires). It was declared under that devloop's
+> `## Expected Layer-State` and escalated to the human; neither a tombstone
+> message nor a `breaking.except`/`ignore` entry was added by the loop. Whether
+> `MESSAGE_NO_DELETE` belongs in `except` (message names are on neither the
+> binary nor the proto3 JSON wire; no `Any` is used) is a policy question for
+> the human, not a devloop.
+>
+> **Resolution (2026-10-23, user decision on the MC-B escalation).** The human
+> chose the policy change: `MESSAGE_NO_DELETE` is added to `proto/buf.yaml`
+> `breaking.except` (see Enforcement above), and no tombstone `MutedSource` is
+> kept. The MC-B commit lands with Layer 6 green on that policy, not with an
+> accepted red. Measured (buf 1.72, scratch copies, against the pipeline's base
+> ref) under the new set: the working tree passes; with the `MESSAGE_NO_DELETE`
+> line removed it reports exactly the one `MutedSource` finding; an unreserved
+> field deletion and a tag change still fire; deleting a message and retyping the
+> fields that used it fires the type rules; deleting a message and its fields
+> unreserved fires the reserve rules (reserved: passes); deleting a message that
+> a surviving field still references fails to compile.
 
 ## Rules
 

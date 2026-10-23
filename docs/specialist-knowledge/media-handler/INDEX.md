@@ -22,7 +22,7 @@
 - Stream admission (budget enforcement, rejection-ratio window) → `crates/mh-service/src/session/admission.rs`, `session/mod.rs:handle_config_apply`
 - Forwarding policy + ArcSwap routing snapshot; edge accounting kernel → `crates/mh-service/src/routing/mod.rs:edges_after_displacing`; per-edge runtime cells carried across re-push → `routing/mod.rs:MeetingRoutes::build`, `RoutingTable::sender_ended`
 - Per-stream attribution (THE lookup, datagram + stream path) → `routing/mod.rs:RoutingSnapshot::attribute` / `Attribution`; sender-level mute shortcut → `routing/mod.rs:is_server_muted`; apply-time rejects + outcome mapping → `routing/mod.rs:PolicyRejection::outcome`
-- Declared `source_streams`, dispositions, per-stream echo, transitional story-2 reading (deleted by MC-B) → `crates/mh-service/src/routing/sources.rs:transitional_story2_reading`
+- Declared `source_streams` (the ONE reading; empty + egresses rejects `rejected_transport_inconsistent`), dispositions, per-stream echo → `crates/mh-service/src/routing/sources.rs:parse_declared`, `Declarations`
 - Subscriber registry + `SenderBindings` → `crates/mh-service/src/session/mod.rs`
 - GC client (registration, heartbeats, `max_streams`/`current_streams`) → `src/grpc/gc_client.rs`; MC client (connect/disconnect notify, returns `sender_id`) → `src/grpc/mc_client.rs`
 - gRPC auth layer → `src/grpc/auth_interceptor.rs`; trace-context span layer → `src/grpc/span_layer.rs`; JWT validator → `src/auth/mod.rs`
@@ -44,7 +44,7 @@
 - Relay-region rewrite → `codec.rs:rewrite_relay_region()`; extension TLVs → `crates/media-protocol/src/extensions.rs`; fuzz → `crates/media-protocol/fuzz/fuzz_targets/`
 
 ## Proto Definitions
-- MC↔MH (`RegisterMeeting`, `EndMeeting`, `MutedSource`), MH↔GC, MH→MC → `proto/dark_tower/internal/v1/internal.proto`; codegen → `crates/proto-gen/build.rs`
+- MC↔MH (`RegisterMeeting`, `EndMeeting`, `SourceStream` incl. the per-kind mute slot-terms property), MH↔GC, MH→MC → `proto/dark_tower/internal/v1/internal.proto`; codegen → `crates/proto-gen/build.rs`
 - Client signaling (`StreamAssignments.unreachable_sender_ids`, `SlotState`) → `proto/dark_tower/signaling/v1/signaling.proto`
 - MC-side edge placement that drives MH policy (ADR-0036 §9) → `crates/mc-service/src/media_routing/`
 

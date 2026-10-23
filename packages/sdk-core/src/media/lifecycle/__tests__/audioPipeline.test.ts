@@ -131,7 +131,11 @@ async function makeRig(
     metricExportIntervalMs: 10_000,
     senderFor: () => sender,
     readableFor: () => transport.datagrams.readable,
-    reportMute: (state) => muteReports.push(state.audioMuted),
+    reportMute: (kind, muted) => {
+      // ONE kind per report: the audio pipeline only ever names audio.
+      expect(kind).toBe('audio');
+      muteReports.push(muted);
+    },
     captureFactory: async () => capture as never,
     encoderFactory: codecs.encoderFactory as never,
     decoderFactory: codecs.decoderFactory as never,

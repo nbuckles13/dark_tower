@@ -37,7 +37,9 @@ use mh_service::observability::metrics::{resolve_media_handles, MediaDropReason}
 use mh_service::routing::{MeetingKey, MeetingPolicy, RoutingTable};
 use mh_service::session::{ApplyOutcome, LocalSubscribers, SessionManagerHandle};
 use mh_test_utils::admission::{fixture_policy_limits, with_ceiling};
-use mh_test_utils::media_policy::{egress, register_request, register_request_muted};
+use mh_test_utils::media_policy::{
+    declare_forward, egress, register_request, register_request_muted,
+};
 use mh_test_utils::session::apply_registered;
 use proto_gen::dark_tower::internal::v1::EgressStream;
 use std::collections::BTreeSet;
@@ -64,8 +66,12 @@ fn edge(subscriber: u32, ordinal: u32, slot: u32, source: u32) -> EgressStream {
     stream
 }
 
+/// MC declares every stream every participant publishes on EVERY handler
+/// (`source_streams`, watched or not), so each handler here declares all three
+/// publishers: a sender with no edge on a handler drops `no_subscriber`.
 fn install(table: &RoutingTable, generation: u64, streams: Vec<EgressStream>, muted: &[u32]) {
-    let request = register_request_muted(MEETING, generation, streams, muted);
+    let mut request = register_request_muted(MEETING, generation, streams, muted);
+    declare_forward(&mut request, &[A, B, C]);
     table.install(&MeetingPolicy::from_request(&request, &fixture_policy_limits()).unwrap());
 }
 

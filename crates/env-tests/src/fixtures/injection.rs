@@ -17,7 +17,7 @@ use crate::fixtures::participant::Participant;
 use crate::fixtures::PrometheusClient;
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
 use proto_gen::dark_tower::internal::v1::{
-    CandidateSource, EgressStream, EndMeetingRequest, MutedSource, RegisterMeetingRequest,
+    CandidateSource, EgressStream, EndMeetingRequest, RegisterMeetingRequest,
     RegisterMeetingResponse, SourceDisposition, SourceStream, SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
@@ -44,11 +44,10 @@ pub const fn source_stream(
 /// One MC-shaped egress stream: `source`'s `stream_number` into
 /// `subscriber`'s `slot`, with MC's contract priority and supersede behaviour
 /// for that send id (`internal.proto` `EgressStream`: audio 1 / no supersede,
-/// video 2 / supersede on an independent frame).
-///
-/// `transport` is the SUPERSEDED per-egress `transport_mode`: DATAGRAM on the
-/// transitional reading (it is read there), UNSPECIFIED with `source_streams`
-/// declared (MC-A stops writing it; MH ignores it).
+/// video 2 / supersede on an independent frame). The edge carries no
+/// transport of its own: MH derives it from the candidate's declared
+/// `SourceStream`, so every registration using this must declare `source`'s
+/// `stream_number`.
 #[must_use]
 pub fn edge(
     egress_stream_id: u32,
@@ -56,7 +55,6 @@ pub fn edge(
     slot: u32,
     source: u32,
     stream_number: u32,
-    transport: TransportMode,
 ) -> EgressStream {
     let video = stream_number == u32::from(crate::fixtures::media::VIDEO_SEND_ID);
     EgressStream {
@@ -71,7 +69,6 @@ pub fn edge(
         }],
         priority_group: if video { 2 } else { 1 },
         supersede_on_independent_frame: video,
-        transport_mode: transport as i32,
     }
 }
 
@@ -79,8 +76,9 @@ pub fn edge(
 /// purpose (@security, @paired-meeting-controller): it only has to stay above
 /// MC's own generation, which cannot move during the injection window because
 /// nothing structural changes in the meeting. If MC ever out-ran it, MC's
-/// next push would install its own (empty) muted set, forwarding would resume,
-/// and the mute assertions would go RED — the safe failure direction.
+/// next push would install its own declarations (no injected DROP_AT_INGRESS),
+/// forwarding would resume, and the mute assertions would go RED — the safe
+/// failure direction.
 pub const INJECTION_MARGIN: u64 = 16;
 
 /// A test-injected policy on ONE MH pod for a meeting the REAL MC also
@@ -176,7 +174,7 @@ impl<'a> Injection<'a> {
             mc_grpc_endpoint,
             mc_generation: 0,
         };
-        injection.mc_generation = injection.register(1, Vec::new(), &[], Vec::new()).await;
+        injection.mc_generation = injection.register(1, Vec::new(), Vec::new()).await;
         injection
     }
 
@@ -188,17 +186,16 @@ impl<'a> Injection<'a> {
     }
 
     /// Register at `generation` and return the echoed `applied_generation`.
-    /// `sources` empty selects MH's transitional story-2 reading
-    /// (`internal.proto` `server_muted_sources`); non-empty declares every
-    /// source stream (story 3).
+    /// `sources` declares every source stream the egresses name (story 3);
+    /// a server mute is a stream at DROP_AT_INGRESS. There is no fallback
+    /// reading: an egress whose candidate is undeclared is rejected.
     pub async fn register(
         &mut self,
         generation: u64,
         streams: Vec<EgressStream>,
-        muted: &[u32],
         sources: Vec<SourceStream>,
     ) -> u64 {
-        self.register_full(generation, streams, muted, sources)
+        self.register_full(generation, streams, sources)
             .await
             .applied_generation
     }
@@ -208,7 +205,6 @@ impl<'a> Injection<'a> {
         &mut self,
         generation: u64,
         streams: Vec<EgressStream>,
-        muted: &[u32],
         sources: Vec<SourceStream>,
     ) -> RegisterMeetingResponse {
         let request = RegisterMeetingRequest {
@@ -218,12 +214,6 @@ impl<'a> Injection<'a> {
             egress_streams: streams,
             selection_rules: None,
             policy_generation: generation,
-            server_muted_sources: muted
-                .iter()
-                .map(|sender_id| MutedSource {
-                    sender_id: *sender_id,
-                })
-                .collect(),
             source_streams: sources,
         };
         self.client
@@ -240,23 +230,15 @@ impl<'a> Injection<'a> {
             .into_inner()
     }
 
-    /// Install at `generation` on the TRANSITIONAL reading (no
-    /// `source_streams`) and require the synchronous echo to match.
-    pub async fn install(&mut self, generation: u64, streams: Vec<EgressStream>, muted: &[u32]) {
-        self.install_declared(generation, streams, muted, Vec::new())
-            .await;
-    }
-
-    /// Install at `generation` with `sources` declared (story 3; empty is the
-    /// transitional reading) and require the synchronous echo to match.
+    /// Install at `generation` with `sources` declared (story 3) and require
+    /// the synchronous echo to match.
     pub async fn install_declared(
         &mut self,
         generation: u64,
         streams: Vec<EgressStream>,
-        muted: &[u32],
         sources: Vec<SourceStream>,
     ) {
-        let applied = self.register(generation, streams, muted, sources).await;
+        let applied = self.register(generation, streams, sources).await;
         assert_eq!(
             applied, generation,
             "INJECT on {}: MH did not apply generation {generation} (echoed {applied})",
@@ -271,7 +253,7 @@ impl<'a> Injection<'a> {
     pub async fn release_and_prove(mut self, cleanup: &ReleaseOnDrop) {
         let injected = self.generation(0);
         self.end().await;
-        let echoed = self.register(1, Vec::new(), &[], Vec::new()).await;
+        let echoed = self.register(1, Vec::new(), Vec::new()).await;
         assert!(
             echoed < injected,
             "CLEANUP on {}: after EndMeeting the handler still reports generation {echoed} (>= \
@@ -385,9 +367,9 @@ pub async fn injectable_handlers(prom: &PrometheusClient, settle_bound: Duration
     handlers
 }
 
-/// One declared-reading egress (story 3): `source`'s `stream` into
-/// `subscriber`'s `slot`, the superseded per-egress transport UNSPECIFIED as
-/// MC-A writes it (the edge's transport derives from `source_streams`).
+/// [`edge`] taking the 16-bit send-id shape the media fixtures use: `source`'s
+/// `stream` into `subscriber`'s `slot` (the edge's transport derives from
+/// `source_streams`).
 #[must_use]
 pub fn declared_edge(
     id: u32,
@@ -396,14 +378,7 @@ pub fn declared_edge(
     source: u32,
     stream: u16,
 ) -> EgressStream {
-    edge(
-        id,
-        subscriber,
-        slot,
-        source,
-        u32::from(stream),
-        TransportMode::Unspecified,
-    )
+    edge(id, subscriber, slot, source, u32::from(stream))
 }
 
 /// [`source_stream`] taking the 16-bit send-id shape the media fixtures use.
@@ -484,7 +459,7 @@ pub async fn install_all(
     for injection in injections.iter_mut() {
         let g = injection.generation(step);
         let resp = injection
-            .register_full(g, edges.clone(), &[], declared.clone())
+            .register_full(g, edges.clone(), declared.clone())
             .await;
         assert_eq!(
             resp.applied_generation, g,

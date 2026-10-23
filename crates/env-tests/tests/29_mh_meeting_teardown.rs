@@ -212,10 +212,10 @@ async fn a_long_running_mh_pod_releases_an_ended_meeting_and_admits_like_a_fresh
         }
     }
 
-    // Both readings of the registration (story 3): the transitional one (no
-    // `source_streams`, as the story-2 MC sends) and the declared one. The
-    // declared probe declares ONE source stream and still carries no edge, so
-    // it moves no shared capacity either.
+    // Both shapes of an edge-free registration (story 3): an empty one (no
+    // `source_streams`, legal because there is nothing to forward) and a
+    // declared one. The declared probe declares ONE source stream and still
+    // carries no edge, so it moves no shared capacity either.
     for handler in &handlers {
         for declared in [false, true] {
             exercise_one_handler(&prom, &cleanup, &token, handler, declared).await;

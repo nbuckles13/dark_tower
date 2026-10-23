@@ -102,8 +102,7 @@ const PRE_ALLOCATION_CONSEQUENCE: &str =
 pub const MAX_EGRESS_STREAMS_PER_MEETING_CEILING: usize = 4_096;
 
 /// Hard ceiling for `MH_MAX_SOURCE_STREAMS_PER_MEETING` (per-meeting bound on
-/// `RegisterMeetingRequest.source_streams`, story 3; it also bounds the
-/// superseded `server_muted_sources` now that that field's own key is unread).
+/// `RegisterMeetingRequest.source_streams`, story 3).
 ///
 /// A fat-finger bound on the KEY, on the same footing as the §8 ceilings: a
 /// `> 0` check alone would let a copy-pasted huge value silently turn this
@@ -1212,8 +1211,8 @@ pub struct PolicyLimits {
     pub max_registered_meetings: usize,
     /// Max `source_streams` in one registration
     /// (`MH_MAX_SOURCE_STREAMS_PER_MEETING`, story 3). A PRE-ALLOCATION bound
-    /// checked before any per-element work, like the two above it. Also bounds
-    /// the superseded `server_muted_sources`. Load refuses a value below
+    /// checked before any per-element work, like the two above it. Load
+    /// refuses a value below
     /// `max_egress_streams_per_meeting`.
     pub max_source_streams_per_meeting: usize,
 }

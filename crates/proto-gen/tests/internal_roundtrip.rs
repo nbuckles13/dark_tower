@@ -24,19 +24,19 @@
 //!   primitive, and it is observationally identical to a correct index until a
 //!   SECOND CONCURRENT MEETING exists. Pinned at story task 5.
 //! - **An `UNSPECIFIED` transport-mode echo is a mismatch, not a skip**
-//!   (`RegisterMeetingResponse.transport_mode`). The fail-open form's skip
-//!   branch is unreachable against a same-version peer. Pinned at story task 6.
+//!   (`RegisterMeetingResponse.applied_source_streams`; first stated on the
+//!   single-mode field 5 that MC-B deleted). The fail-open form's skip branch
+//!   is unreachable against a same-version peer. Pinned at story task 6.
 //! - **`process_start_epoch_ms` is sampled once per process**. A per-call clock
 //!   read is indistinguishable from a correct sample until a SECOND PROCESS
 //!   INCARNATION SHARING A POD IDENTITY exists. Split: within-process stability
 //!   at story task 5, changes-on-restart at the handler-restart story.
 //!
-//! Story 2 adds four more, owned by the MH tasks that implement them and
-//! expressible only against a running handler:
+//! Story 2 adds three more, owned by the MH tasks that implement them and
+//! expressible only against a running handler (a fourth, the
+//! `server_muted_sources` duplicate and count-bound rejects, left with that
+//! field when MC-B deleted it):
 //!
-//! - **`server_muted_sources` duplicate and count-bound rejects**
-//!   (`RegisterMeetingRequest.server_muted_sources`): whether MH rejects BEFORE
-//!   building a routing table is a property of the handler, not of the wire.
 //! - **`EndMeeting` compares against the most recent validation-passing
 //!   registration's `mc_id`, not gated on its generation outcome**: needs a
 //!   handler holding registration state.
@@ -67,7 +67,7 @@
 
 use proto_gen::dark_tower::internal::v1::{
     CandidateSource, DisconnectReason, EgressStream, EndMeetingRequest, EndMeetingResponse,
-    MutedSource, NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
+    NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
     NotifyParticipantDisconnectedRequest, RegisterMeetingRequest, RegisterMeetingResponse,
     SelectionRules, SourceDisposition, SourceStream, SourceStreamEcho, SubscriberSlot,
 };
@@ -109,11 +109,9 @@ fn egress_stream_carries_edge_and_behaviours_in_one_message() {
             ],
             priority_group: 5,
             supersede_on_independent_frame: true,
-            transport_mode: TransportMode::Datagram as i32,
         }],
         selection_rules: Some(SelectionRules {}),
         policy_generation: 7,
-        server_muted_sources: vec![],
         source_streams: Vec::new(),
     };
 
@@ -129,7 +127,6 @@ fn egress_stream_carries_edge_and_behaviours_in_one_message() {
     assert_eq!(egress.candidate_sources[1].stream_number, 1);
     assert_eq!(egress.priority_group, 5);
     assert!(egress.supersede_on_independent_frame);
-    assert_eq!(egress.transport_mode, TransportMode::Datagram as i32);
     assert_eq!(decoded.policy_generation, 7);
 }
 
@@ -149,7 +146,6 @@ fn empty_egress_stream_set_is_legal_and_survives() {
         egress_streams: Vec::new(),
         selection_rules: None,
         policy_generation: 1,
-        server_muted_sources: vec![],
         source_streams: Vec::new(),
     };
 
@@ -173,7 +169,6 @@ fn selection_rules_presence_is_distinguishable_from_absence() {
         egress_streams: Vec::new(),
         selection_rules: None,
         policy_generation: 1,
-        server_muted_sources: vec![],
         source_streams: Vec::new(),
     };
 
@@ -211,7 +206,6 @@ fn applied_generation_is_independent_of_the_requested_generation() {
         egress_streams: Vec::new(),
         selection_rules: None,
         policy_generation: 7,
-        server_muted_sources: vec![],
         source_streams: Vec::new(),
     });
 
@@ -220,7 +214,6 @@ fn applied_generation_is_independent_of_the_requested_generation() {
         applied_generation: 4,
         handler_id: "mh-1".to_string(),
         process_start_epoch_ms: 1_756_684_800_000,
-        transport_mode: TransportMode::Datagram as i32,
         applied_source_streams: Vec::new(),
     });
 
@@ -239,7 +232,7 @@ fn applied_generation_is_independent_of_the_requested_generation() {
 ///
 /// This is the wire half of the reshape's zero-value contract: `accepted: true`
 /// with `applied_generation: 0`, `handler_id: ""`, `process_start_epoch_ms: 0`
-/// and `TRANSPORT_MODE_UNSPECIFIED` is exactly what MC sees from an old handler,
+/// and no `applied_source_streams` is exactly what MC sees from an old handler,
 /// and every one of those readings is documented as "not reported" rather than
 /// as a legitimate value. The rules constraining MC's *reaction* are runtime and
 /// live in `docs/TODO.md` (see the module header); what is locked here is that
@@ -251,7 +244,6 @@ fn all_zero_response_is_representable_and_distinct_from_a_populated_one() {
         applied_generation: 0,
         handler_id: String::new(),
         process_start_epoch_ms: 0,
-        transport_mode: TransportMode::Unspecified as i32,
         applied_source_streams: Vec::new(),
     });
 
@@ -259,10 +251,9 @@ fn all_zero_response_is_representable_and_distinct_from_a_populated_one() {
     assert_eq!(zeroed.applied_generation, 0, "0 = nothing applied");
     assert!(zeroed.handler_id.is_empty(), "empty = not reported");
     assert_eq!(zeroed.process_start_epoch_ms, 0, "0 = not reported");
-    assert_eq!(
-        zeroed.transport_mode,
-        TransportMode::Unspecified as i32,
-        "UNSPECIFIED = no mode applied; a MISMATCH for MC, never a skip"
+    assert!(
+        zeroed.applied_source_streams.is_empty(),
+        "no streams echoed = nothing applied; every sent stream is a MISMATCH for MC"
     );
 
     let populated = roundtrip(&RegisterMeetingResponse {
@@ -270,7 +261,6 @@ fn all_zero_response_is_representable_and_distinct_from_a_populated_one() {
         applied_generation: 1,
         handler_id: "mh-1".to_string(),
         process_start_epoch_ms: 1,
-        transport_mode: TransportMode::Datagram as i32,
         applied_source_streams: Vec::new(),
     });
     assert_ne!(zeroed, populated);
@@ -390,10 +380,11 @@ fn default_response_decodes_to_the_fail_closed_reading() {
 }
 
 // ---------------------------------------------------------------------------
-// Story 2: server mute on the snapshot (R-9) and meeting teardown (R-20)
+// Story 2: meeting teardown (R-20). (The R-9 server-muted set's tests left
+// with `server_muted_sources` when MC-B deleted it.)
 // ---------------------------------------------------------------------------
 
-fn populated_request(muted: Vec<MutedSource>) -> RegisterMeetingRequest {
+fn populated_request() -> RegisterMeetingRequest {
     RegisterMeetingRequest {
         meeting_id: "meeting-1".to_string(),
         mc_id: "mc-1".to_string(),
@@ -410,55 +401,11 @@ fn populated_request(muted: Vec<MutedSource>) -> RegisterMeetingRequest {
             }],
             priority_group: 1,
             supersede_on_independent_frame: false,
-            transport_mode: TransportMode::Datagram as i32,
         }],
         selection_rules: None,
         policy_generation: 4,
-        server_muted_sources: muted,
         source_streams: Vec::new(),
     }
-}
-
-/// The muted set survives by VALUE and ORDER, with more than one entry — a
-/// single-element case cannot catch repeated-field handling defects.
-#[test]
-fn server_muted_sources_roundtrip_by_value_and_order() {
-    let decoded = roundtrip(&populated_request(vec![
-        MutedSource { sender_id: 9 },
-        MutedSource { sender_id: 2 },
-        MutedSource { sender_id: 65535 },
-    ]));
-    let muted: Vec<u32> = decoded
-        .server_muted_sources
-        .iter()
-        .map(|m| m.sender_id)
-        .collect();
-    assert_eq!(muted, vec![9, 2, 65535]);
-    // The additive field does not disturb the policy it rides with.
-    assert_eq!(decoded.policy_generation, 4);
-    assert_eq!(decoded.egress_streams.len(), 1);
-}
-
-/// An EMPTY muted set puts NOTHING on the wire for field 7, so it is
-/// byte-identical to a pre-R-9 MC that never heard of the field — which is why
-/// the contract can say the older-MC reading is the correct one ("nobody
-/// muted"), not a degraded one. Checked structurally from the bytes, not
-/// against a golden.
-#[test]
-fn empty_muted_set_emits_no_field_7_and_a_populated_one_does() {
-    let empty = top_level_field_numbers(&populated_request(Vec::new()).encode_to_vec());
-    assert!(
-        !empty.contains(&7),
-        "empty set must emit no field 7: {empty:?}"
-    );
-    // Positive control: the walker genuinely sees the other fields, so an empty
-    // result cannot be mistaken for "saw nothing".
-    assert!(empty.contains(&1) && empty.contains(&4) && empty.contains(&6));
-
-    let populated = top_level_field_numbers(
-        &populated_request(vec![MutedSource { sender_id: 5 }]).encode_to_vec(),
-    );
-    assert!(populated.contains(&7), "a populated set must emit field 7");
 }
 
 #[test]
@@ -673,8 +620,8 @@ fn connection_id_is_opaque_and_not_required_to_be_a_uuid() {
 //
 // What these do NOT assert: MH's immediate hard rejects (duplicate
 // (sender, stream), UNSPECIFIED disposition or transport, undeclared candidate,
-// mixed candidate modes, the count bound), the transitional union with
-// `server_muted_sources`, and MC's per-stream echo comparison. Those are runtime
+// mixed candidate modes, the count bound, egress present with an empty list),
+// and MC's per-stream echo comparison. Those are runtime
 // behaviours owned by MH-A1 and MC-A. What is locked here is that every input
 // those rules read is REPRESENTABLE and survives the wire as written -- in
 // particular that the wire does not dedupe, reorder or default anything the
@@ -728,7 +675,7 @@ fn source_streams_roundtrip_every_disposition_in_order_with_duplicates() {
     ];
     let decoded = roundtrip(&RegisterMeetingRequest {
         source_streams: streams.clone(),
-        ..populated_request(Vec::new())
+        ..populated_request()
     });
     assert_eq!(decoded.source_streams, streams);
     // The additive field does not disturb the policy it rides with.
@@ -751,18 +698,19 @@ fn source_disposition_numbers_are_pinned() {
 fn unknown_source_disposition_decodes_as_an_open_integer() {
     let decoded = roundtrip(&RegisterMeetingRequest {
         source_streams: vec![source(2, 0, TransportMode::Datagram, UNKNOWN_ENUM_VALUE)],
-        ..populated_request(Vec::new())
+        ..populated_request()
     });
     assert_eq!(decoded.source_streams[0].disposition, UNKNOWN_ENUM_VALUE);
     assert!(SourceDisposition::try_from(UNKNOWN_ENUM_VALUE).is_err());
 }
 
 /// An EMPTY `source_streams` emits no field 8: byte-identical to an MC that
-/// never heard of the field, which is what the transitional reading at
-/// `server_muted_sources` keys on.
+/// never heard of the field. With egress present MH rejects that as
+/// `rejected_transport_inconsistent` (every candidate undeclared); this pins
+/// that the wire leaves the absence observable.
 #[test]
 fn empty_source_streams_emit_no_field_8_and_a_populated_list_does() {
-    let empty = top_level_field_numbers(&populated_request(Vec::new()).encode_to_vec());
+    let empty = top_level_field_numbers(&populated_request().encode_to_vec());
     assert!(
         !empty.contains(&8),
         "empty list must emit no field 8: {empty:?}"
@@ -780,7 +728,7 @@ fn empty_source_streams_emit_no_field_8_and_a_populated_list_does() {
                 TransportMode::Datagram,
                 SourceDisposition::Forward as i32,
             )],
-            ..populated_request(Vec::new())
+            ..populated_request()
         }
         .encode_to_vec(),
     );
@@ -801,7 +749,6 @@ fn response_with(echoes: Vec<SourceStreamEcho>) -> RegisterMeetingResponse {
         applied_generation: 4,
         handler_id: "mh-1".to_string(),
         process_start_epoch_ms: 1,
-        transport_mode: TransportMode::Unspecified as i32,
         applied_source_streams: echoes,
     }
 }

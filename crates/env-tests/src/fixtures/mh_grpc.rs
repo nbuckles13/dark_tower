@@ -142,7 +142,7 @@ pub async fn connect(handler: &Handler) -> MediaHandlerServiceClient<Channel> {
 pub const NEVER_DIALLED_MC_ENDPOINT: &str = "http://env-test-mc.invalid:50052";
 
 /// A PROBE registration: `meeting_id` at `generation` as `mc_id`, with NO
-/// edges and NO muted set.
+/// edges and NO declared source streams.
 ///
 /// Hoisted at its second consumer (tests 29 and 35) so both probes are the
 /// same decision under the same policy:
@@ -176,7 +176,6 @@ pub fn probe_registration(
         egress_streams: Vec::new(),
         selection_rules: None,
         policy_generation: generation,
-        server_muted_sources: Vec::new(),
         source_streams: Vec::new(),
     }
 }

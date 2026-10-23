@@ -131,9 +131,6 @@ pub struct MediaHandlerStub {
     register_delay: Duration,
     /// If set, `EndMeeting` answers this status instead of acknowledging.
     end_meeting_status: Option<tonic::Code>,
-    /// Per meeting, the transport mode of the LAST snapshot the stub applied —
-    /// what a real MH echoes, since it reads the mode off its live snapshot.
-    live_modes: Mutex<HashMap<String, TransportMode>>,
     /// Per meeting, the per-stream echo of the last APPLIED snapshot
     /// (`applied_source_streams` is built from the applied snapshot, never the
     /// received one).
@@ -270,9 +267,7 @@ impl MediaHandlerStubBuilder {
     /// Per stream (story 3): with a SPECIFIED mode here, the stub echoes every
     /// APPLIED `source_streams` entry with its own declared mode — a faithful
     /// MH. With `TRANSPORT_MODE_UNSPECIFIED` it echoes every applied entry as
-    /// UNSPECIFIED: the pre-reshape peer MC must read as a mismatch. The
-    /// legacy single `transport_mode` echo follows the old rule and is no
-    /// longer compared by MC.
+    /// UNSPECIFIED: the pre-reshape peer MC must read as a mismatch.
     #[must_use]
     pub fn transport_mode(mut self, transport_mode: TransportMode) -> Self {
         self.transport_mode = transport_mode;
@@ -336,7 +331,6 @@ impl MediaHandlerStubBuilder {
             events: Arc::new(Mutex::new(Vec::new())),
             register_delay: self.register_delay,
             end_meeting_status: self.end_meeting_status,
-            live_modes: Mutex::new(HashMap::new()),
             live_echoes: Mutex::new(HashMap::new()),
         }
     }
@@ -371,7 +365,6 @@ impl MediaHandlerStubBuilder {
             events: Arc::clone(&events),
             register_delay: self.register_delay,
             end_meeting_status: self.end_meeting_status,
-            live_modes: Mutex::new(HashMap::new()),
             live_echoes: Mutex::new(HashMap::new()),
         };
 
@@ -423,7 +416,6 @@ impl MediaHandlerService for MediaHandlerStub {
                 },
             })
             .collect();
-        let req_is_empty = req.egress_streams.is_empty();
         let meeting_id = req.meeting_id.clone();
         self.events
             .lock()
@@ -453,39 +445,15 @@ impl MediaHandlerService for MediaHandlerStub {
             AppliedGenerationBehaviour::EchoUpTo(limit) => sent.min(limit),
         };
 
-        // Real MH reads the echoed transport mode off its LIVE snapshot. So:
-        // - when the stub APPLIED what it was sent (accepted and echoing the
-        //   sent generation), the live snapshot is this request's: an empty
-        //   egress set — a solo participant, a handler nobody is placed on —
-        //   echoes UNSPECIFIED (also what MC declares for it), otherwise the
-        //   configured knob;
-        // - when it did NOT apply (Stall, EchoUpTo above the limit, rejected),
-        //   the live snapshot is the last one applied for this meeting, or —
-        //   if none was ever applied — the configured knob.
-        // Modelled so a multi-party component test is neither failed nor
-        // passed by a stub a real handler would never behave like.
-        let request_mode = if req_is_empty {
-            TransportMode::Unspecified
-        } else {
-            self.transport_mode
-        };
+        // Real MH builds the per-stream echo from its LIVE snapshot. So when
+        // the stub APPLIED what it was sent (accepted and echoing the sent
+        // generation) the live echo is this request's; when it did NOT apply
+        // (Stall, EchoUpTo above the limit, rejected) it is the last one
+        // applied for this meeting, or empty if none ever was. Modelled so a
+        // multi-party component test is neither failed nor passed by a stub a
+        // real handler would never behave like.
         let applied_now = self.accept && sent != 0 && applied_generation == sent;
-        let meeting_id_for_log = meeting_id.clone();
-        let transport_mode = {
-            let mut live = self
-                .live_modes
-                .lock()
-                .expect("MediaHandlerStub mutex poisoned");
-            if applied_now {
-                live.insert(meeting_id, request_mode);
-                request_mode
-            } else {
-                live.get(&meeting_id)
-                    .copied()
-                    .unwrap_or(self.transport_mode)
-            }
-        };
-
+        let meeting_id_for_log = meeting_id;
         let applied_source_streams = {
             let mut live = self
                 .live_echoes
@@ -509,7 +477,6 @@ impl MediaHandlerService for MediaHandlerStub {
             applied_generation,
             handler_id: self.handler_id.clone(),
             process_start_epoch_ms: self.process_start_epoch_ms,
-            transport_mode: transport_mode as i32,
             // Story 3 per-stream echo, from the APPLIED snapshot.
             applied_source_streams,
         }))

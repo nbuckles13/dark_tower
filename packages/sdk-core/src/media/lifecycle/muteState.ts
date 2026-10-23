@@ -12,15 +12,15 @@
 //     directive. Resuming is a server round trip.
 //   * **"you have muted yourself"** — client mute. Resuming is a LOCAL decision.
 //
-// They have different resumption costs, so they are separate fields here. MC
-// MAY leave the send directive in place while a client reports itself muted;
-// the client suppresses locally. A server mute or an unwatched kind withdraws
-// the directive, so a client-unmute resumes locally only while the kind is
-// still directed (signaling.proto `SendDirective`; ADR-0036 §5, correction
-// 2026-10-13).
+// They have different resumption costs, so they are separate fields here. The
+// send directive never depends on client mute: MC leaves it in place while a
+// client reports itself muted, and the client suppresses locally. A server mute
+// or an unwatched kind withdraws the directive, so a client-unmute resumes
+// locally only while the kind is still directed (signaling.proto
+// `SendDirective`; ADR-0036 §5, amendments 2026-10-13 and 2026-10-23).
 //
 // ---------------------------------------------------------------------------
-// ENFORCED AT CAPTURE, AND THE SIGNAL IS INFORMATIONAL
+// ENFORCED AT CAPTURE; THE REPORT TO MC IS BEST-EFFORT
 // ---------------------------------------------------------------------------
 //
 // §5: "Under client mute, no media leaves the device. This is enforced
@@ -28,8 +28,11 @@
 //
 // So {@link MuteState} is consulted by the capture callback, BEFORE the encoder
 // — not by the egress queue and not by the transport. `MuteRequest` is sent to
-// MC afterwards, informationally: the local state changes first and does not
-// wait for, or depend on, the report being delivered.
+// MC afterwards, best-effort: the local state changes first and enforcement
+// never waits for, or depends on, the report being delivered. The report is
+// not merely informational, though: MC turns it into the kind's PAUSED
+// disposition at MH and the AVATAR_CLIENT_MUTED slot state other participants
+// render (story 3 MC-B).
 //
 // Muting signals OUT OF BAND rather than transmitting substitute media. Audio
 // simply stops; there is no keyframe to resume from, so restart is immediate.
@@ -72,10 +75,9 @@
 //
 // Audio and video client mute are two independent fields: a request about one
 // kind never changes the other. ONE instance per session, shared by every
-// pipeline and by the mute report to MC, so the report always carries both
-// kinds' CURRENT state (`signaling/muteRequest.ts`). Video client mute stops
-// the camera track (story 3 R-17) — there is no video capture until C-A2, so
-// today the video field is state and report only.
+// pipeline; the mute report to MC names ONLY the kind that changed, the other
+// kind's field absent (= unchanged at MC; `signaling/muteRequest.ts`). Video
+// client mute stops the camera track (story 3 R-17).
 
 import type { MediaKindToken } from '../mediaKind.js';
 

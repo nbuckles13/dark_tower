@@ -61,7 +61,7 @@
 //!    and can place a frame in a slot the subscriber never assigned. (The
 //!    uplink value is the publisher's own label, so on that hop the field is
 //!    publisher-controlled rather than relay-controlled; per-kind server mute
-//!    still holds, stated in slot terms at `internal.proto::MutedSource`.)
+//!    still holds, stated in slot terms at `internal.proto::SourceStream`.)
 //! 2. **Incomplete obligates the caller.** `Ok(None)` from
 //!    [`crate::codec::decode_stream_frame`], [`crate::codec::HeaderPrefix::Incomplete`]
 //!    and [`crate::reader::Feed::NeedMore`] all mean "need more bytes". A peer

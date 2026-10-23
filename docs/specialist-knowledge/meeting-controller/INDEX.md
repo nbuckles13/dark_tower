@@ -11,7 +11,7 @@
 - Service entry point (fleet-gauge samplers) → `crates/mc-service/src/main.rs`
 - Config (env loading, TLS, advertise addresses, ADR-0036 media keys, `Config::kek_lifecycle`) → `crates/mc-service/src/config.rs`
 - Error types (McError hierarchy) → `crates/mc-service/src/errors.rs`
-- Media kinds (`MediaKindLabel`, `served_kind`, `PublishSet`) → `crates/mc-service/src/media_kind.rs`
+- Media kinds (`MediaKindLabel`, `served_kind`, `PublishSet`), the ONE per-kind mute parser + merge (`MuteChange`, `KindDecision`), and the server/client mute halves (`ServerMutedKinds` / `ClientMutedKinds`) → `crates/mc-service/src/media_kind.rs`
 - Auth: McJwtValidator, validate_meeting_token, validate_guest_token → `crates/mc-service/src/auth/mod.rs`
 - Actors: controller, meeting, participant, messages, session (HMAC/HKDF), metrics → `crates/mc-service/src/actors/`
 
@@ -30,8 +30,8 @@
 
 ## Client Media Signalling (ADR-0036 §5/§6)
 - Join media validation (header version, publish set, initial declaration) → `crates/mc-service/src/webtransport/connection.rs:validate_join_media()`
-- Capability parse + per-kind `SlotDemand` truncation → `crates/mc-service/src/media_signaling/capability.rs`; send directive (`VideoEncoding`) → `media_signaling/directive.rs`; `StreamAssignments` construction → `media_signaling/assignments.rs`; outcome vocabularies → `media_signaling/outcome.rs`
-- Server mute: dispatch authority + limiters → `crates/mc-service/src/webtransport/connection.rs:handle_server_mute_request()`/`refuse_server_mute()`/`handle_unmute_request()`; actor side → `actors/meeting.rs:handle_server_mute()`/`handle_request_unmute()`/`server_mute_replay()`
+- Capability parse + per-kind `SlotDemand` truncation → `crates/mc-service/src/media_signaling/capability.rs`; send directive (`VideoEncoding`; server-mute withdrawal via the `ServerMutedKinds` input, no client-mute input — compile_fail doctest) → `media_signaling/directive.rs`; `StreamAssignments` construction → `media_signaling/assignments.rs`; outcome vocabularies → `media_signaling/outcome.rs`
+- Mute (four controls, per kind): client mute dispatch (shape → no-op short-circuit → limiter → actor) → `crates/mc-service/src/webtransport/connection.rs:handle_mute_request()`; server mute (authority → shape → limiter → actor) → `handle_server_mute_request()`/`refuse_server_mute()`; both-absent rejection + rationed replies → `reject_no_kind_named()`/`reply_mute_refusal()`; unmute relay → `handle_unmute_request()`; actor side (roster merge, `server_muted_by`, R-18 self update before the directive) → `actors/meeting.rs:handle_self_mute()`/`handle_server_mute()`/`handle_request_unmute()`/`server_mute_replay()`; withdrawal reason (`server_muted` vs `unwatched`) → `actors/meeting_media.rs:flush_one()`
 
 ## Media Admission (ADR-0036 §4)
 - Module root → `crates/mc-service/src/media_admission/`; `IdentityPublicKey` → `identity_key.rs`; `SenderIdAllocator` → `sender_id.rs`; `AdmissionEpoch` → `epoch.rs`; `MeetingKeyState::rotate` → `kek.rs`; `SenderBindingOutcome` → `binding_response.rs`
@@ -54,11 +54,11 @@
 ## Testing
 - Shared bring-up + mock MH stores → `crates/mc-service/tests/common/mod.rs`; media session harness → `tests/common/media_session.rs`; accept-loop rig → `tests/common/accept_loop_rig.rs`
 - Join flow → `crates/mc-service/tests/join_tests.rs`; client media signalling → `tests/media_client_signaling_integration.rs`; slots/edges/connectivity → `tests/slot_placement_integration.rs`
-- Admission → `crates/mc-service/tests/media_admission_integration.rs`; KEK lifecycle → `tests/kek_rotation_integration.rs`; server mute → `tests/server_mute_integration.rs`; teardown → `tests/meeting_teardown_integration.rs`
+- Admission → `crates/mc-service/tests/media_admission_integration.rs`; KEK lifecycle → `tests/kek_rotation_integration.rs`; server + client mute (per kind, withdrawal, R-18 order, churn bound, census) → `tests/server_mute_integration.rs`; teardown → `tests/meeting_teardown_integration.rs`
 - Policy push → `crates/mc-service/tests/media_policy_push_integration.rs`; RegisterMeeting → `tests/register_meeting_integration.rs`; MH coordination → `tests/media_coordination_integration.rs`; disconnect latency → `tests/disconnect_latency_integration.rs`
 - Accept loop → `tests/webtransport_accept_loop_integration.rs`; auth layer → `tests/auth_layer_integration.rs`; actor metrics → `tests/actor_metrics_integration.rs`; Redis → `tests/redis_metrics_integration.rs`; token refresh → `tests/token_refresh_integration.rs`; GC → `tests/gc_integration.rs`; heartbeat → `tests/heartbeat_tasks.rs`; OTel → `tests/otel_grpc_inbound_continuity.rs`
 - Test utilities: mock MH gRPC stub → `crates/mc-test-utils/src/mock_mh.rs`; test W → `crates/mc-test-utils/src/kek.rs`; others → `crates/mc-test-utils/src/`
-- Env-tests: MC-GC → `crates/env-tests/tests/22_mc_gc_integration.rs`; MH QUIC + policy push → `26_mh_quic.rs`; slots/edges (+ MC-A two-kind scenarios) → `27_mc_slot_placement.rs`; KEK rotation (+ MC-A rotation with video) → `34_mc_kek_rotation.rs`; server mute + teardown → `35_mc_server_mute_teardown.rs`; metric hygiene → `32_media_metric_hygiene.rs`
+- Env-tests: MC-GC → `crates/env-tests/tests/22_mc_gc_integration.rs`; MH QUIC + policy push → `26_mh_quic.rs`; slots/edges (+ MC-A two-kind scenarios) → `27_mc_slot_placement.rs`; KEK rotation (+ MC-A rotation with video) → `34_mc_kek_rotation.rs`; server mute (audio + video, patched publisher, client video mute PAUSED) + teardown → `35_mc_server_mute_teardown.rs`; metric hygiene → `32_media_metric_hygiene.rs`
 - Env-test fixtures: `Participant` + triage literals → `crates/env-tests/src/fixtures/participant.rs`; `McSession`/`mc_join` → `crates/env-tests/src/fixtures/mc_session.rs`
 - Browser multi-party hear-each-other → `packages/web-app/e2e/multi-party-hear.spec.ts`
 

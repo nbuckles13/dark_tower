@@ -341,10 +341,10 @@ pub enum PolicyApplyOutcome {
     RejectedMeetingCap,
     /// The registration's egress set and its declared source streams disagree
     /// (story 3 R-20; `internal.proto` `SourceStream`): a candidate names a
-    /// stream absent from `source_streams`, or one egress's candidates declare
-    /// different transport modes (or, on the transitional reading, an egress's
-    /// superseded transport is not DATAGRAM). Refused whole; the prior
-    /// generation stays live.
+    /// stream absent from `source_streams` (every candidate, when
+    /// `source_streams` is absent or empty — there is no fallback reading), or
+    /// one egress's candidates declare different transport modes. Refused
+    /// whole; the prior generation stays live.
     ///
     /// Its own value, not folded into `RejectedInvalid`, because the remedy
     /// differs: every field parsed, but MC's declaration and MC's assignment
@@ -1462,8 +1462,8 @@ pub enum MediaDropReason {
     NoMediaSession,
     /// Server mute at MH ingress (ADR-0036 §7; story 2 R-9, story 3 R-16), on
     /// either of two paths: the SENDER-LEVEL shortcut — every declared stream
-    /// of the spawn-bound sender is `DROP_AT_INGRESS` (or it is union-muted via
-    /// the superseded `server_muted_sources`) — checked at the top of
+    /// of the spawn-bound sender is `DROP_AT_INGRESS` (at least one declared)
+    /// — checked at the top of
     /// `forward_one`, before decode, so even an unattributable frame counts
     /// here; or, after attribution, the frame's declared stream is
     /// `DROP_AT_INGRESS` (per-kind mute while the other kind flows). Either way
@@ -1492,9 +1492,8 @@ pub enum MediaDropReason {
     /// SATURATION-OR-INPUT group, not an invariant violation. Remedy:
     /// declaration drift (MC's `source_streams` is missing a stream the client
     /// was directed to send), or a sender labelling outside its declaration.
-    /// Under the transitional reading (no `source_streams`; deleted by MC-B)
-    /// every label other than 0 lands here — the first thing to check if a
-    /// client stamps the wrong send id. The label is publisher-set and
+    /// Also the first thing to check if a client stamps the wrong send id.
+    /// The label is publisher-set and
     /// unauthenticated: this counts a mismatch, it does not identify a stream.
     UnmatchedStream,
     /// The frame's uplink id names a declared stream, but it arrived on a

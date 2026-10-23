@@ -148,11 +148,9 @@ impl fmt::Debug for dark_tower::signaling::v1::JoinResponse {
                 "kek_rotation_debounce_seconds",
                 &self.kek_rotation_debounce_seconds,
             )
-            // MC's receive-slot cap: a bounded configuration value, not key
-            // material -- in the clear, so an operator triaging "hears nobody"
-            // can see the cap the client was told.
-            .field("max_receive_slots", &self.max_receive_slots)
-            // Story 3 per-kind caps: configuration values, in the clear.
+            // MC's per-kind receive-slot caps (story 3): bounded configuration
+            // values, not key material -- in the clear, so an operator
+            // triaging "hears nobody" can see the caps the client was told.
             .field("max_audio_receive_slots", &self.max_audio_receive_slots)
             .field("max_video_receive_slots", &self.max_video_receive_slots)
             .finish()

@@ -824,7 +824,7 @@ async fn grace_expiry_drives_the_same_re_push_as_a_clean_leave() {
             true,
         )
         .unwrap()
-        .truncate(client_media_config().max_receive_slots);
+        .truncate(client_media_config().receive_slot_caps);
         meeting
             .register_receive_capability(format!("part-{p}"), decl)
             .await
@@ -887,7 +887,7 @@ async fn a_reconnect_in_grace_keeps_slots_and_re_sends_only_the_reconnectors_vie
             true,
         )
         .unwrap()
-        .truncate(client_media_config().max_receive_slots)
+        .truncate(client_media_config().receive_slot_caps)
     };
 
     let mut joins = Vec::new();
@@ -1149,7 +1149,7 @@ async fn an_applied_echo_mismatch_on_a_re_push_is_loud() {
 async fn the_published_slot_cap_is_the_enforced_cap() {
     let snap = MetricAssertion::snapshot();
     let (_stack, _rig) = start_stack("slot-cap-gauge").await;
-    let caps = client_media_config().max_receive_slots;
+    let caps = client_media_config().receive_slot_caps;
     // BOTH kinds are published (story 3 MC-A), each from the configured cap.
     for kind in mc_service::media_signaling::MediaKindLabel::ALL {
         snap.gauge("mc_media_receive_slot_cap")
@@ -1208,7 +1208,7 @@ async fn actor_meeting(
             true,
         )
         .unwrap()
-        .truncate(client_media_config().max_receive_slots);
+        .truncate(client_media_config().receive_slot_caps);
         meeting
             .register_receive_capability(format!("part-{user}"), decl)
             .await

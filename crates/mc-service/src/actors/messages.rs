@@ -5,7 +5,7 @@
 
 use super::participant::ParticipantActorHandle;
 use crate::errors::McError;
-use crate::media_signaling::MediaKindLabel;
+use crate::media_kind::{KindDecision, MuteChange};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -242,11 +242,15 @@ pub enum MeetingMessage {
         respond_to: oneshot::Sender<Result<(), McError>>,
     },
 
-    /// Update participant mute status (self-mute, informational).
+    /// Record a participant's own CLIENT mute, per kind (ADR-0036 §5; story 3
+    /// R-17). Only the kinds the request names move ([`MuteChange`]); the
+    /// participant is the AUTHENTICATED connection's own id.
     UpdateSelfMute {
         participant_id: String,
-        audio_muted: bool,
-        video_muted: bool,
+        change: MuteChange,
+        /// The per-kind decision, or `None` if the participant is no longer on
+        /// the roster.
+        respond_to: oneshot::Sender<Option<KindDecision>>,
     },
 
     /// Apply or lift a server mute on a participant by meeting policy
@@ -261,12 +265,12 @@ pub enum MeetingMessage {
     ServerMute {
         target_participant_id: String,
         requester: String,
-        audio_muted: bool,
-        video_muted: bool,
-        /// The decision, or the refusal. Both refusals collapse to ONE wire
-        /// error at the connection; the distinction exists for the metric and
-        /// the log only.
-        respond_to: oneshot::Sender<Result<ServerMuteDecision, ServerMuteRefusal>>,
+        /// The kinds asked about; an unnamed kind is unchanged (story 3 R-15).
+        change: MuteChange,
+        /// The per-kind decision, or the refusal. Both refusals collapse to ONE
+        /// wire error at the connection; the distinction exists for the metric
+        /// and the log only.
+        respond_to: oneshot::Sender<Result<KindDecision, ServerMuteRefusal>>,
     },
 
     /// A server-muted participant asks the host(s) to lift its mute.
@@ -610,37 +614,6 @@ pub struct KekPush {
     pub kek_rotation_debounce_seconds: u32,
 }
 
-/// A server-mute request the meeting actor ACTED on, PER KIND (story 3 OBS-A).
-///
-/// Each kind reports whether ITS flag changed, so the per-kind
-/// `mc_media_server_mute_requests_total{media_kind, outcome}` cell is honest: a
-/// request that changes only audio is `applied` for audio and `unchanged` for
-/// video. The whole-request "nothing changed" case is DERIVED from the same two
-/// flags ([`Self::is_unchanged`]), never a separate comparison, so the two
-/// cannot disagree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ServerMuteDecision {
-    /// Per kind, indexed by [`MediaKindLabel::index`]: did that kind's
-    /// server-mute flag change? (Audio: broadcast, re-rendered, re-pushed.
-    /// Video: broadcast.)
-    pub changed: [bool; 2],
-}
-
-impl ServerMuteDecision {
-    /// Did `kind`'s flag change?
-    #[must_use]
-    pub fn changed(self, kind: MediaKindLabel) -> bool {
-        kind.of(self.changed)
-    }
-
-    /// Already in the requested state on both kinds: nothing broadcast,
-    /// nothing pushed.
-    #[must_use]
-    pub fn is_unchanged(self) -> bool {
-        !self.changed.contains(&true)
-    }
-}
-
 /// Why the meeting actor refused a server-mute request.
 ///
 /// Two values for the operator (the metric label and the log); ONE for the
@@ -914,11 +887,6 @@ pub struct MeetingState {
 /// Signaling message payload (wraps various message types).
 #[derive(Debug, Clone)]
 pub enum SignalingPayload {
-    /// Mute update from client.
-    MuteUpdate {
-        audio_muted: bool,
-        video_muted: bool,
-    },
     /// Layout subscription request.
     LayoutSubscribe { layout_type: String },
     /// Chat message.
@@ -1042,12 +1010,6 @@ mod tests {
 
     #[test]
     fn test_signaling_payload_variants() {
-        let mute = SignalingPayload::MuteUpdate {
-            audio_muted: true,
-            video_muted: false,
-        };
-        assert!(matches!(mute, SignalingPayload::MuteUpdate { .. }));
-
         let layout = SignalingPayload::LayoutSubscribe {
             layout_type: "grid".to_string(),
         };

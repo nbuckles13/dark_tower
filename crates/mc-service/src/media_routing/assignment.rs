@@ -261,63 +261,13 @@ impl SourceDispositionPlan {
 
 /// One handler's complete forwarding policy for one meeting.
 ///
-/// Canonically ordered (by `egress_stream_id`, and the muted set by sender id),
+/// Canonically ordered (by `egress_stream_id`, and `source_streams` as a set),
 /// which is what makes structural equality well-defined — and structural
 /// equality is what the policy generation derives from.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HandlerAssignment {
     /// The egress streams this handler forwards, in canonical order.
     pub egress_streams: Vec<EgressStreamPlan>,
-    /// The server-muted senders THIS handler must drop at ingress
-    /// (`RegisterMeetingRequest.server_muted_sources`, ADR-0036 §7; story 2 R-9).
-    ///
-    /// # A field on the snapshot, not a sibling channel
-    ///
-    /// Living here is what gives a mute every property the edges already have,
-    /// with no second mechanism: it rides EVERY full registration (so it
-    /// survives a re-assert and an MH restart), it is swapped atomically with
-    /// the edges, and a change to it is a change to this struct — so
-    /// `PolicyGenerations::next_generation` advances the generation on exactly
-    /// the handlers whose set changed, with no second "did the mute change"
-    /// decider anywhere. An unchanged set carries an unchanged generation.
-    ///
-    /// # Membership: filtered by EDGE OWNERSHIP, never by connectivity
-    ///
-    /// A sender is in H's set iff it is server-muted AND is the source of at
-    /// least one edge this render places on H — see
-    /// [`super::slots::SlotTable::render`], the one place the set is built. MH
-    /// enforces at ingress and never forwards across handlers, so a muted
-    /// sender with no edge on H forwards nothing there anyway, and gains its
-    /// mute on H in the very snapshot that gives it an edge there.
-    ///
-    /// That rule also bounds the set: `|set| <= |egress_streams|`, because
-    /// each member is the source of at least one of this handler's egress
-    /// streams AND each egress stream carries exactly ONE candidate source
-    /// (the `SlotTable::render` construction), so each stream contributes at
-    /// most one member. That second premise is load-bearing: MH accepts up to
-    /// `MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING` candidates per stream, and a
-    /// multi-candidate render (story 3 selection) voids this bound, which must
-    /// then be re-derived. `egress_streams` is bounded by
-    /// `MH_MAX_EGRESS_STREAMS_PER_MEETING`, which MH's boot refuses to exceed
-    /// `MH_MAX_SOURCE_STREAMS_PER_MEETING` — the bound MH applies to this set
-    /// (`crates/mh-service/src/config.rs`).
-    /// So a host muting every participant cannot make MC emit a registration
-    /// MH rejects WHOLE — which would freeze the meeting's forwarding at its
-    /// previous policy.
-    ///
-    /// A set, never a `Vec`: MH rejects the whole registration on a duplicate
-    /// sender id (a duplicate means MC's set construction is broken), so a
-    /// duplicate must be unrepresentable rather than merely unlikely.
-    ///
-    /// # Server mute ONLY — never self-mute
-    ///
-    /// Deliberately NEVER built from client-mute flags. A self-muted
-    /// participant in MH's ingress-drop set would be muted by the server in a
-    /// way they could never lift by unmuting — and their capture is already
-    /// stopped on the client anyway (ADR-0036 §5). Client mute reaches MH only
-    /// as a PAUSED disposition in [`Self::source_streams`]. SUPERSEDED by
-    /// `source_streams`; MC-B deletes this field.
-    pub server_muted_sources: BTreeSet<SenderId>,
     /// Every (sender, stream) in EVERY member's publish set, with its
     /// transport and disposition (`RegisterMeetingRequest.source_streams`;
     /// story 3). A superset of every directed stream, so nothing MC directs is
@@ -325,6 +275,19 @@ pub struct HandlerAssignment {
     /// NO stream-1 entry, so its stream-1 frames are `unmatched_stream` at MH —
     /// what makes the publish set "fixed for the membership" a real control.
     /// See [`super::slots::SlotTable::render`], the one place it is built.
+    ///
+    /// # Mute rides here, on the snapshot -- not a sibling channel
+    ///
+    /// The ONLY carrier of mute to MH since MC-B deleted the sender-level
+    /// muted set: a server-muted kind's stream is DROP_AT_INGRESS, a
+    /// client-muted one PAUSED (never DROP_AT_INGRESS -- client mute alone
+    /// never drops ingress). Living on this struct gives a mute every property
+    /// the edges have, with no second mechanism: it rides EVERY full
+    /// registration (so it survives a re-assert and an MH restart), it is
+    /// swapped atomically with the edges, and a disposition change is a change
+    /// to this struct -- so `PolicyGenerations::next_generation` advances the
+    /// generation exactly when it changes. A set, so a duplicate (an MH hard
+    /// reject) is unrepresentable.
     pub source_streams: BTreeSet<SourceStreamPlan>,
 }
 

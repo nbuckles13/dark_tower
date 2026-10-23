@@ -311,7 +311,7 @@ fn test_config(gc_url: &str) -> Config {
         otel_endpoint: String::new(),
         otel_sample_rate: 1.0,
         environment: "development".to_string(),
-        max_receive_slots: media.max_receive_slots,
+        receive_slot_caps: media.receive_slot_caps,
         media_connect_settle_ms: 1500,
         kek_rotation_debounce_seconds: 60,
         max_receive_capability_declarations: media.max_receive_capability_declarations,

@@ -26,13 +26,13 @@ use super::meeting_media::{Affected, JoinMedia, MeetingMedia, MutedSourceCensus,
 use super::messages::{
     DisconnectCause, JoinResult, KekPush, LeaveReason, MeetingEndCause, MeetingLifecycleEvent,
     MeetingLifecycleSink, MeetingMessage, MeetingState, ParticipantInfo, ParticipantStateUpdate,
-    ParticipantStatus, ReconnectResult, SenderLookup, ServerMuteDecision, ServerMuteRefusal,
-    SignalingPayload, UnmuteRelay,
+    ParticipantStatus, ReconnectResult, SenderLookup, ServerMuteRefusal, SignalingPayload,
+    UnmuteRelay,
 };
 use super::metrics::{ActorMetrics, ActorType, ControllerMetrics, MailboxMonitor};
 use super::participant::{ParticipantActor, ParticipantActorHandle};
 use super::session::{SessionBindingManager, StoredBinding};
-use crate::media_kind::PublishSet;
+use crate::media_kind::{ClientMutedKinds, KindDecision, MuteChange, PublishSet, ServerMutedKinds};
 use crate::media_routing::SourceMute;
 use crate::media_routing::{ConnectionKey, Unapplied};
 use crate::media_signaling::{MediaKindLabel, SlotDemand, SourceMuteView};
@@ -322,21 +322,32 @@ impl MeetingActorHandle {
             .map_err(|e| McError::Internal(format!("response receive failed: {e}")))?
     }
 
-    /// Update self-mute status.
+    /// Record a participant's own client mute, per kind (story 3 R-17): only
+    /// the kinds `change` names move. `participant_id` MUST be the
+    /// authenticated connection's own id.
+    ///
+    /// Returns the per-kind decision, or `None` if the participant is no
+    /// longer on the roster.
+    ///
+    /// # Errors
+    ///
+    /// [`McError::Internal`] if the actor could not be reached.
     pub async fn update_self_mute(
         &self,
         participant_id: String,
-        audio_muted: bool,
-        video_muted: bool,
-    ) -> Result<(), McError> {
+        change: MuteChange,
+    ) -> Result<Option<KindDecision>, McError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
             .send(MeetingMessage::UpdateSelfMute {
                 participant_id,
-                audio_muted,
-                video_muted,
+                change,
+                respond_to: tx,
             })
             .await
-            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
     }
 
     /// Apply or lift a server mute by meeting policy (enforced at MH ingress,
@@ -354,16 +365,14 @@ impl MeetingActorHandle {
         &self,
         target_participant_id: String,
         requester: String,
-        audio_muted: bool,
-        video_muted: bool,
-    ) -> Result<Result<ServerMuteDecision, ServerMuteRefusal>, McError> {
+        change: MuteChange,
+    ) -> Result<Result<KindDecision, ServerMuteRefusal>, McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
             .send(MeetingMessage::ServerMute {
                 target_participant_id,
                 requester,
-                audio_muted,
-                video_muted,
+                change,
                 respond_to: tx,
             })
             .await
@@ -462,16 +471,11 @@ struct Participant {
     /// What this participant publishes, FIXED for its membership (story 3
     /// R-2): set once at join, never adopted from a reconnect.
     publishes: PublishSet,
-    /// Who applied the server mute (a participant id), while either kind is
-    /// server-muted. Written ONLY by `handle_server_mute`, beside the two flags
-    /// it qualifies, and cleared in lockstep with them — so the requester and
-    /// the state it describes cannot come apart. No side map.
-    ///
-    /// MC PRODUCES this value (the requester's id from its authenticated
-    /// connection); it is never parsed off the wire, so nothing validates or
-    /// truncates it on the way out. Truncation-before-logging is the
-    /// receiver's obligation (`ParticipantMuteUpdate.server_muted_by`).
-    server_muted_by: Option<String>,
+    /// Who IMPOSED each kind's server mute in force (see
+    /// [`ServerMuteAttribution`]). Written ONLY by `handle_server_mute`, from
+    /// the same [`KindDecision`] that moves the two flags, so the requester
+    /// and the state it describes cannot come apart. No side map.
+    server_muted_by: ServerMuteAttribution,
     /// Whether this participant has host privileges.
     is_host: bool,
     /// Per-meeting sender id, allocated once at admission (ADR-0036 §2, §4).
@@ -489,18 +493,81 @@ struct Participant {
     identity_public_key: Option<IdentityPublicKey>,
 }
 
+/// Who IMPOSED each kind's server mute (a participant id), per kind, and the
+/// ONE projection onto the single wire `ParticipantMuteUpdate.server_muted_by`.
+///
+/// Invariant: a kind has an imposer exactly while it is server-muted -- set
+/// when that kind goes unmuted -> muted, cleared when it is unmuted, and an
+/// untouched kind keeps its own -- so an unmute of one kind never
+/// re-attributes the other kind's remaining mute (security S4).
+///
+/// MC PRODUCES these values (the requester's id from its authenticated
+/// connection); they are never parsed off the wire, so nothing validates or
+/// truncates them on the way out. Truncation-before-logging is the receiver's
+/// obligation (`ParticipantMuteUpdate.server_muted_by`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ServerMuteAttribution {
+    by_kind: [Option<String>; 2],
+    /// The kind imposed most recently: while BOTH kinds are muted, the wire
+    /// names its imposer. Explicit recency state, never array order.
+    last: Option<MediaKindLabel>,
+}
+
+impl ServerMuteAttribution {
+    /// Apply one server-mute decision made by `requester`.
+    fn apply(&mut self, decision: KindDecision, requester: &str) {
+        for kind in MediaKindLabel::ALL {
+            if !decision.changed(kind) {
+                continue;
+            }
+            let slot = kind.of_mut(&mut self.by_kind);
+            if decision.state(kind) {
+                *slot = Some(requester.to_string());
+                self.last = Some(kind);
+            } else {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Who imposed `kind`'s mute in force, if it is server-muted.
+    fn imposer(&self, kind: MediaKindLabel) -> Option<&str> {
+        kind.of_ref(&self.by_kind).as_deref()
+    }
+
+    /// The single wire value: one kind muted -> its imposer; both -> the most
+    /// recent imposer; none -> `None`.
+    fn reported(&self) -> Option<&str> {
+        match self.last {
+            Some(latest) if self.imposer(latest).is_some() => self.imposer(latest),
+            _ => MediaKindLabel::ALL
+                .into_iter()
+                .find_map(|k| self.imposer(k)),
+        }
+    }
+}
+
 impl Participant {
     /// This participant's per-kind mute flags, explicitly projected (never the
     /// roster entry itself, which also carries identity material).
     fn source_mute(&self) -> SourceMute {
-        SourceMute {
-            server: MediaKindLabel::per_kind(|k| {
-                k.pick(self.audio_server_muted, self.video_server_muted)
-            }),
-            client: MediaKindLabel::per_kind(|k| {
-                k.pick(self.audio_self_muted, self.video_self_muted)
-            }),
-        }
+        // The ONE place each half is built from its own roster fields: typed,
+        // so the two cannot be swapped into the directive's server input.
+        SourceMute::new(
+            ServerMutedKinds::from_server_flags(self.server_muted()),
+            ClientMutedKinds::from_client_flags(self.self_muted()),
+        )
+    }
+
+    /// The per-kind server-mute flags, laid out by [`MediaKindLabel::index`].
+    fn server_muted(&self) -> [bool; 2] {
+        MediaKindLabel::per_kind(|k| k.pick(self.audio_server_muted, self.video_server_muted))
+    }
+
+    /// The per-kind client (self) mute flags, laid out by
+    /// [`MediaKindLabel::index`].
+    fn self_muted(&self) -> [bool; 2] {
+        MediaKindLabel::per_kind(|k| k.pick(self.audio_self_muted, self.video_self_muted))
     }
 
     fn to_info(&self) -> ParticipantInfo {
@@ -1131,27 +1198,21 @@ impl MeetingActor {
 
             MeetingMessage::UpdateSelfMute {
                 participant_id,
-                audio_muted,
-                video_muted,
+                change,
+                respond_to,
             } => {
-                self.handle_self_mute(&participant_id, audio_muted, video_muted)
-                    .await;
+                let decision = self.handle_self_mute(&participant_id, change).await;
+                let _ = respond_to.send(decision);
             }
 
             MeetingMessage::ServerMute {
                 target_participant_id,
                 requester,
-                audio_muted,
-                video_muted,
+                change,
                 respond_to,
             } => {
                 let result = self
-                    .handle_server_mute(
-                        &target_participant_id,
-                        &requester,
-                        audio_muted,
-                        video_muted,
-                    )
+                    .handle_server_mute(&target_participant_id, &requester, change)
                     .await;
                 let _ = respond_to.send(result);
             }
@@ -1419,7 +1480,7 @@ impl MeetingActor {
             audio_server_muted: false,
             video_server_muted: false,
             publishes,
-            server_muted_by: None,
+            server_muted_by: ServerMuteAttribution::default(),
             is_host,
             sender_id,
             identity_public_key,
@@ -2052,14 +2113,11 @@ impl MeetingActor {
         );
 
         // TODO (Phase 6g): Route signaling messages appropriately
+        // There is deliberately no mute arm here: client mute has ONE entry,
+        // `MeetingMessage::UpdateSelfMute`, fed by the connection's per-kind
+        // parser and rate limit (story 3 MC-B removed a both-kinds
+        // `SignalingPayload::MuteUpdate` that bypassed both).
         match message {
-            SignalingPayload::MuteUpdate {
-                audio_muted,
-                video_muted,
-            } => {
-                self.handle_self_mute(participant_id, audio_muted, video_muted)
-                    .await;
-            }
             SignalingPayload::LayoutSubscribe { .. } => {
                 // TODO: Handle layout subscription
             }
@@ -2104,44 +2162,51 @@ impl MeetingActor {
     /// carrier (`ParticipantMuteUpdate.server_muted_by`).
     ///
     /// The subscriber-visible mute signal is the per-kind slot state
-    /// (`SLOT_STATE_AVATAR_CLIENT_MUTED`), and the ACTOR composes it: a change of
-    /// EITHER kind re-renders (the stream's PAUSED disposition rides
-    /// `source_streams`) and marks dirty only the subscribers HOLDING this source
-    /// in a slot of either kind; the per-turn flush bound applies — a
-    /// per-MEETING bound, which is the kind the self-mute lesson asked for (a
-    /// per-connection rate limit cannot bound N connections each within their
-    /// own limit). Each subscriber's message goes only if its view actually
-    /// changed: a video toggle by a participant that publishes no video changes
-    /// no view and no disposition.
+    /// (`SLOT_STATE_AVATAR_CLIENT_MUTED`, or `AVATAR_SERVER_MUTED` while the
+    /// server mute is also on), and the ACTOR composes it: a moved kind
+    /// re-renders (that stream's disposition flips FORWARD <-> PAUSED in
+    /// `source_streams` -- NEVER DROP_AT_INGRESS, so a resume keyframe that
+    /// beats this update still reaches subscribers), and marks dirty only the
+    /// subscribers HOLDING this source in a slot of either kind; the per-turn
+    /// flush bound applies — a per-MEETING bound, which is the kind the
+    /// self-mute lesson asked for (a per-connection rate limit cannot bound N
+    /// connections each within their own limit). Each subscriber's message goes
+    /// only if its view actually changed: a video toggle by a participant that
+    /// publishes no video changes no view and no disposition.
+    ///
+    /// PER KIND (story 3 R-17): only the kinds `change` names move
+    /// ([`MuteChange::apply`] against the ROSTER, never a connection cache, so a
+    /// reconnect within grace cannot coerce an unnamed kind). The SEND
+    /// DIRECTIVE is never touched: the publisher is not dirtied, and the
+    /// directive builder has no client-mute input at all (ADR-0036 §5).
+    ///
+    /// Returns the per-kind decision, or `None` if the participant is gone.
     async fn handle_self_mute(
         &mut self,
         participant_id: &str,
-        audio_muted: bool,
-        video_muted: bool,
-    ) {
-        let Some(participant) = self.participants.get_mut(participant_id) else {
-            return;
-        };
+        change: MuteChange,
+    ) -> Option<KindDecision> {
+        let participant = self.participants.get_mut(participant_id)?;
+        let decision = change.apply(participant.self_muted());
 
-        // IDEMPOTENT: a report that changes neither flag is a no-op — an
-        // unchanged pair is not a transition.
-        if participant.audio_self_muted == audio_muted
-            && participant.video_self_muted == video_muted
-        {
-            return;
+        // IDEMPOTENT: a report that moves no kind is a no-op -- no render, no
+        // generation advance, no push, no emission.
+        if decision.is_unchanged() {
+            return Some(decision);
         }
 
-        participant.audio_self_muted = audio_muted;
-        participant.video_self_muted = video_muted;
+        participant.audio_self_muted = decision.state(MediaKindLabel::Audio);
+        participant.video_self_muted = decision.state(MediaKindLabel::Video);
         let sender = participant.sender_id;
 
-        // EITHER kind (story 3): the change re-renders (the source's PAUSED
-        // disposition rides `source_streams`; the generation advances only if
-        // the output changed — a video toggle by a non-video publisher changes
-        // nothing) and re-emits to every holder of this source whose view
-        // changed, under the per-meeting flush bound.
+        // The change re-renders (the source's PAUSED disposition rides
+        // `source_streams`; the generation advances only if the output changed
+        // — a video toggle by a non-video publisher changes nothing) and
+        // re-emits to every holder of this source whose view changed, under
+        // the per-meeting flush bound.
         self.reconcile_media(Affected::HoldersOf(sender)).await;
         self.flush_views().await;
+        Some(decision)
     }
 
     /// Register a validated receive-capability declaration: slot demand is now
@@ -2318,13 +2383,37 @@ impl MeetingActor {
     /// fields are never touched here, and `handle_self_mute` never touches these,
     /// so the two compose: clearing one never clears the other.
     ///
+    /// PER KIND (story 3 R-15): only the kinds `change` names move, merged
+    /// against the roster ([`MuteChange::apply`]); a request about one kind
+    /// never changes the other kind's flag, directive, disposition, edges or
+    /// slot states.
+    ///
     /// Broadcast to EVERY participant — the target included, so the muted
     /// participant learns it cannot clear the mute itself (R-10, R-11). A
-    /// change of either kind is a structural change: re-render (that kind's
-    /// stream turns DROP_AT_INGRESS in every handler's `source_streams`, so the
-    /// generation advances where the snapshot changed),
-    /// re-push, confirm the echo, and re-emit `StreamAssignments` to the
-    /// holders of this source (`AVATAR_SERVER_MUTED`).
+    /// moved kind K is ONE structural change in THIS actor turn (R-16):
+    /// - K's stream turns DROP_AT_INGRESS in every handler's `source_streams`
+    ///   (its slots and edges are KEPT, R-3 stability, so MH counts a patched
+    ///   client's frames as `server_muted` drops), and the generation
+    ///   advances where the snapshot changed;
+    /// - the push workers re-push and confirm the echo (never awaited here);
+    /// - the TARGET's send directive lists K with EMPTY targets (withdrawal,
+    ///   counted `reason="server_muted"` on delivery), and the holders of this
+    ///   source are re-emitted `AVATAR_SERVER_MUTED` for K.
+    ///
+    /// A server UNMUTE of K restores K's targets and disposition in the same
+    /// way, REGARDLESS of client mute (ADR-0036 §5: the directive is blind to
+    /// client mute; a client-muted participant keeps capture off locally). The
+    /// disposition returns to PAUSED if K is client-muted, else FORWARD.
+    ///
+    /// # Ordering (R-18): the mute update BEFORE the directive change
+    ///
+    /// The broadcast below is enqueued BEFORE `reconcile_media`/`flush_views`,
+    /// on the same per-participant mailbox the directive and `StreamAssignments`
+    /// later ride, so every participant -- the target included -- receives
+    /// the `ParticipantMuteUpdate` before the target's directive change and the
+    /// holders' slot states. The client keys its "a host resumed your
+    /// camera/mic" notice on that pair. Do not move any emission ahead of the
+    /// broadcast.
     ///
     /// # Fan-out cost, and what the argument rests on
     ///
@@ -2342,9 +2431,8 @@ impl MeetingActor {
         &mut self,
         target_participant_id: &str,
         requester: &str,
-        audio_muted: bool,
-        video_muted: bool,
-    ) -> Result<ServerMuteDecision, ServerMuteRefusal> {
+        change: MuteChange,
+    ) -> Result<KindDecision, ServerMuteRefusal> {
         // 1. Authority, before anything about the target is read.
         let is_host = self.participants.get(requester).is_some_and(|p| p.is_host);
         if !is_host {
@@ -2355,40 +2443,35 @@ impl MeetingActor {
         let Some(participant) = self.participants.get_mut(target_participant_id) else {
             return Err(ServerMuteRefusal::UnknownTarget);
         };
-        // Per-kind, and the whole-request short-circuit is derived from the
-        // SAME two flags, so it cannot drift from the per-kind decision.
-        let decision = ServerMuteDecision {
-            changed: MediaKindLabel::per_kind(|k| {
-                k.pick(
-                    participant.audio_server_muted,
-                    participant.video_server_muted,
-                ) != k.pick(audio_muted, video_muted)
-            }),
-        };
+        // Per kind, merged against the roster; the whole-request short-circuit
+        // is derived from the SAME decision, so it cannot drift from it.
+        let decision = change.apply(participant.server_muted());
         if decision.is_unchanged() {
             return Ok(decision);
         }
 
-        participant.audio_server_muted = audio_muted;
-        participant.video_server_muted = video_muted;
-        // Cleared in lockstep with the flags it qualifies.
-        participant.server_muted_by = (audio_muted || video_muted).then(|| requester.to_string());
+        participant.audio_server_muted = decision.state(MediaKindLabel::Audio);
+        participant.video_server_muted = decision.state(MediaKindLabel::Video);
+        // Attribution follows the IMPOSITION, per kind (S4).
+        participant.server_muted_by.apply(decision, requester);
         let sender = participant.sender_id;
         let update = Self::mute_changed(participant);
 
-        // Everyone, the target included.
+        // R-18: everyone, the target included, BEFORE any directive or slot
+        // change below (same per-participant mailbox, FIFO).
         for p in self.participants.values() {
             if let Some(conn) = &p.connection {
                 let _ = conn.send_update(update.clone()).await;
             }
         }
 
-        // Per kind (story 3 MC-A): each kind's server mute reaches MH as that
-        // stream's DROP_AT_INGRESS disposition in `source_streams`, and the
-        // holders of this source see the AVATAR_SERVER_MUTED state for that
-        // kind. (Directive withdrawal on server mute is MC-B's.)
+        // The structural change: DROP_AT_INGRESS (or its lifting) in
+        // `source_streams`, the target's directive withdrawn (or restored) for
+        // the moved kind, and the holders' slot states -- the target's own view
+        // is dirtied for its directive.
         self.publish_mute_census();
-        self.reconcile_media(Affected::HoldersOf(sender)).await;
+        self.reconcile_media(Affected::PublisherAndHoldersOf(sender))
+            .await;
         self.flush_views().await;
         Ok(decision)
     }
@@ -2402,7 +2485,11 @@ impl MeetingActor {
             video_self_muted: participant.video_self_muted,
             audio_server_muted: participant.audio_server_muted,
             video_server_muted: participant.video_server_muted,
-            server_muted_by: participant.server_muted_by.clone().unwrap_or_default(),
+            server_muted_by: participant
+                .server_muted_by
+                .reported()
+                .unwrap_or_default()
+                .to_string(),
         }
     }
 
@@ -2792,6 +2879,16 @@ impl MeetingActor {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A mute request naming BOTH kinds explicitly.
+    fn both(audio: bool, video: bool) -> MuteChange {
+        MuteChange::parse(Some(audio), Some(video)).unwrap()
+    }
+
+    /// A mute request naming ONE kind; the other is absent (unchanged).
+    fn only(kind: MediaKindLabel, muted: bool) -> MuteChange {
+        MuteChange::parse(kind.pick(Some(muted), None), kind.pick(None, Some(muted))).unwrap()
+    }
 
     /// Test secret for session binding (32 bytes as required by ADR-0023).
     fn test_secret() -> SecretBox<Vec<u8>> {
@@ -3401,7 +3498,7 @@ mod tests {
         // Both flags already false at join, so this changes nothing. It must
         // reach the meeting actor and stop there.
         handle
-            .update_self_mute("part-a".to_string(), false, false)
+            .update_self_mute("part-a".to_string(), both(false, false))
             .await
             .expect("send succeeds");
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -3419,7 +3516,7 @@ mod tests {
         // cost is one awaited send per participant on the shared meeting-actor
         // task.
         handle
-            .update_self_mute("part-a".to_string(), true, false)
+            .update_self_mute("part-a".to_string(), both(true, false))
             .await
             .expect("send succeeds");
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -3490,7 +3587,7 @@ mod tests {
 
         // Update mute
         let result = handle
-            .update_self_mute("part-1".to_string(), true, false)
+            .update_self_mute("part-1".to_string(), both(true, false))
             .await;
         assert!(result.is_ok());
 
@@ -3598,21 +3695,18 @@ mod tests {
         let (handle, _task, _h, _p) = host_meeting("sm-apply").await;
 
         let result = handle
-            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .server_mute("part-2".to_string(), "host".to_string(), both(true, false))
             .await
             .unwrap();
-        assert_eq!(
-            result,
-            Ok(ServerMuteDecision {
-                changed: MediaKindLabel::per_kind(|k| k == MediaKindLabel::Audio)
-            })
-        );
+        let decision = result.unwrap();
+        assert!(decision.changed(MediaKindLabel::Audio));
+        assert!(!decision.changed(MediaKindLabel::Video));
         let p2 = state_of(&handle, "part-2").await;
         assert!(p2.audio_server_muted);
         assert!(!p2.video_server_muted);
 
         let again = handle
-            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .server_mute("part-2".to_string(), "host".to_string(), both(true, false))
             .await
             .unwrap();
         assert!(again.unwrap().is_unchanged());
@@ -3628,7 +3722,7 @@ mod tests {
         let (handle, _task, _h, _p) = host_meeting("sm-order").await;
 
         let nonexistent = handle
-            .server_mute("ghost".to_string(), "part-2".to_string(), true, false)
+            .server_mute("ghost".to_string(), "part-2".to_string(), both(true, false))
             .await
             .unwrap();
         assert_eq!(
@@ -3637,7 +3731,7 @@ mod tests {
             "a non-host naming a NON-EXISTENT participant must be NotPermitted, not UnknownTarget"
         );
         let existing = handle
-            .server_mute("host".to_string(), "part-2".to_string(), true, false)
+            .server_mute("host".to_string(), "part-2".to_string(), both(true, false))
             .await
             .unwrap();
         assert_eq!(existing, Err(ServerMuteRefusal::NotPermitted));
@@ -3652,7 +3746,11 @@ mod tests {
     async fn an_unknown_requester_is_not_permitted() {
         let (handle, _task, _h, _p) = host_meeting("sm-unknown-requester").await;
         let result = handle
-            .server_mute("part-2".to_string(), "nobody".to_string(), true, false)
+            .server_mute(
+                "part-2".to_string(),
+                "nobody".to_string(),
+                both(true, false),
+            )
             .await
             .unwrap();
         assert_eq!(result, Err(ServerMuteRefusal::NotPermitted));
@@ -3663,7 +3761,7 @@ mod tests {
     async fn a_host_naming_an_absent_participant_is_unknown_target() {
         let (handle, _task, _h, _p) = host_meeting("sm-unknown-target").await;
         let result = handle
-            .server_mute("ghost".to_string(), "host".to_string(), true, false)
+            .server_mute("ghost".to_string(), "host".to_string(), both(true, false))
             .await
             .unwrap();
         assert_eq!(result, Err(ServerMuteRefusal::UnknownTarget));
@@ -3678,16 +3776,16 @@ mod tests {
         // Direction 1: self-muted AND server-muted; lifting the server mute
         // leaves the self mute in place.
         handle
-            .update_self_mute("part-2".to_string(), true, false)
+            .update_self_mute("part-2".to_string(), both(true, false))
             .await
             .unwrap();
         handle
-            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .server_mute("part-2".to_string(), "host".to_string(), both(true, false))
             .await
             .unwrap()
             .unwrap();
         handle
-            .server_mute("part-2".to_string(), "host".to_string(), false, false)
+            .server_mute("part-2".to_string(), "host".to_string(), both(false, false))
             .await
             .unwrap()
             .unwrap();
@@ -3701,12 +3799,12 @@ mod tests {
         // Direction 2: server-muted again; the participant unmuting ITSELF
         // leaves the server mute in place.
         handle
-            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .server_mute("part-2".to_string(), "host".to_string(), both(true, false))
             .await
             .unwrap()
             .unwrap();
         handle
-            .update_self_mute("part-2".to_string(), false, false)
+            .update_self_mute("part-2".to_string(), both(false, false))
             .await
             .unwrap();
         let p2 = state_of(&handle, "part-2").await;
@@ -3715,6 +3813,218 @@ mod tests {
             p2.audio_server_muted,
             "a self-unmute did NOT clear the server mute"
         );
+    }
+
+    /// R-15: a request about ONE kind never changes the other kind's flag, for
+    /// either writer, and an identical repeat is a per-kind no-op.
+    #[tokio::test]
+    async fn a_one_kind_request_never_changes_the_other_kind_for_either_writer() {
+        let (handle, _task, _h, _p) = host_meeting("sm-one-kind").await;
+        for kind in MediaKindLabel::ALL {
+            let other = kind.other();
+            // Server mute of `kind` only.
+            let d = handle
+                .server_mute("part-2".to_string(), "host".to_string(), only(kind, true))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(d.changed(kind) && !d.changed(other));
+            let p2 = state_of(&handle, "part-2").await;
+            assert!(kind.pick(p2.audio_server_muted, p2.video_server_muted));
+            assert!(!other.pick(p2.audio_server_muted, p2.video_server_muted));
+            // Identical repeat: unchanged.
+            let again = handle
+                .server_mute("part-2".to_string(), "host".to_string(), only(kind, true))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(again.is_unchanged());
+            // Unmuting the OTHER kind (already unmuted) changes nothing.
+            let noop = handle
+                .server_mute("part-2".to_string(), "host".to_string(), only(other, false))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(noop.is_unchanged());
+            let p2 = state_of(&handle, "part-2").await;
+            assert!(kind.pick(p2.audio_server_muted, p2.video_server_muted));
+            handle
+                .server_mute("part-2".to_string(), "host".to_string(), only(kind, false))
+                .await
+                .unwrap()
+                .unwrap();
+
+            // Client mute of `kind` only.
+            let d = handle
+                .update_self_mute("part-2".to_string(), only(kind, true))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(d.changed(kind) && !d.changed(other));
+            assert!(d.state(kind) && !d.state(other));
+            let again = handle
+                .update_self_mute("part-2".to_string(), only(kind, true))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(again.is_unchanged());
+            handle
+                .update_self_mute("part-2".to_string(), only(kind, false))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// S4 invariant: a kind has an imposer EXACTLY while it is server-muted,
+    /// across mute/unmute sequences (host A / host B included), and the wire
+    /// projection follows the rule in one place.
+    #[test]
+    fn server_mute_attribution_tracks_each_kinds_imposer_exactly_while_muted() {
+        let mut flags = [false; 2];
+        let mut attr = ServerMuteAttribution::default();
+        let mut step = |kind: MediaKindLabel, muted: bool, who: &str| {
+            let d = only(kind, muted).apply(flags);
+            flags = MediaKindLabel::per_kind(|k| d.state(k));
+            attr.apply(d, who);
+            for k in MediaKindLabel::ALL {
+                assert_eq!(attr.imposer(k).is_some(), k.of(flags), "{k:?} after {who}");
+            }
+            attr.reported().map(str::to_string)
+        };
+        let (au, vi) = (MediaKindLabel::Audio, MediaKindLabel::Video);
+        assert_eq!(step(vi, true, "a").as_deref(), Some("a"));
+        assert_eq!(
+            step(au, true, "b").as_deref(),
+            Some("b"),
+            "both: most recent"
+        );
+        assert_eq!(
+            step(au, false, "a").as_deref(),
+            Some("a"),
+            "video's own imposer"
+        );
+        assert_eq!(
+            step(au, false, "b").as_deref(),
+            Some("a"),
+            "a no-op keeps it"
+        );
+        assert_eq!(step(au, true, "b").as_deref(), Some("b"));
+        assert_eq!(
+            step(vi, false, "b").as_deref(),
+            Some("b"),
+            "audio's own imposer"
+        );
+        assert_eq!(step(au, false, "a"), None, "none muted");
+    }
+
+    /// S4: `server_muted_by` names whoever IMPOSED the mute still in force:
+    /// with both kinds muted, the most recent imposer; after one kind is
+    /// unmuted, the remaining kind's own imposer; cleared when neither kind
+    /// remains muted.
+    #[tokio::test]
+    async fn server_muted_by_names_who_imposed_the_remaining_mute() {
+        let (handle, _task, _h, _p) = host_meeting("sm-muted-by").await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        handle
+            .connection_join(
+                "conn-host-b".to_string(),
+                "user-host-b".to_string(),
+                "host-b".to_string(),
+                String::new(),
+                true,
+                test_identity_key(),
+                Some(tx),
+                test_media(),
+            )
+            .await
+            .unwrap();
+        // Who the replay a fresh joiner is handed names as imposing part-2's
+        // mute (`None` = no mute in force). A new probe joiner each time.
+        let probes = std::cell::Cell::new(0u32);
+        let muted_by = |handle: MeetingActorHandle| {
+            probes.set(probes.get() + 1);
+            let n = probes.get();
+            async move {
+                let joined = handle
+                    .connection_join(
+                        format!("conn-probe-{n}"),
+                        format!("user-probe-{n}"),
+                        format!("probe-{n}"),
+                        String::new(),
+                        false,
+                        test_identity_key(),
+                        None,
+                        test_media(),
+                    )
+                    .await
+                    .unwrap();
+                joined.server_mute_replay.into_iter().find_map(|u| match u {
+                    ParticipantStateUpdate::MuteChanged {
+                        participant_id,
+                        server_muted_by,
+                        ..
+                    } if participant_id == "part-2" => Some(server_muted_by),
+                    _ => None,
+                })
+            }
+        };
+
+        // Host A mutes video.
+        handle
+            .server_mute(
+                "part-2".to_string(),
+                "host".to_string(),
+                only(MediaKindLabel::Video, true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(muted_by(handle.clone()).await.as_deref(), Some("host"));
+
+        // Host B mutes and then unmutes AUDIO: the remaining video mute is
+        // still attributed to host A after the unmute.
+        handle
+            .server_mute(
+                "part-2".to_string(),
+                "host-b".to_string(),
+                only(MediaKindLabel::Audio, true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            muted_by(handle.clone()).await.as_deref(),
+            Some("host-b"),
+            "a request that MUTES a kind names its requester"
+        );
+        handle
+            .server_mute(
+                "part-2".to_string(),
+                "host".to_string(),
+                only(MediaKindLabel::Audio, false),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            muted_by(handle.clone()).await.as_deref(),
+            Some("host"),
+            "the remaining VIDEO mute is attributed to its imposer, host A, not \
+             to host B whose audio mute is gone"
+        );
+
+        // Lifting the last kind clears it (and the replay drops the entry).
+        handle
+            .server_mute(
+                "part-2".to_string(),
+                "host".to_string(),
+                only(MediaKindLabel::Video, false),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(muted_by(handle.clone()).await, None);
     }
 
     /// R-10: `UnmuteRequest` NOTIFIES the host and NEVER clears the mute. The
@@ -3726,7 +4036,7 @@ mod tests {
         use proto_gen::dark_tower::signaling::v1::server_message::Message as M;
         let (handle, _task, mut host_rx, _p) = host_meeting("sm-unmute-request").await;
         handle
-            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .server_mute("part-2".to_string(), "host".to_string(), both(true, false))
             .await
             .unwrap()
             .unwrap();
@@ -3773,7 +4083,7 @@ mod tests {
         use proto_gen::dark_tower::signaling::v1::server_message::Message as M;
         let (handle, _task, _h, mut p2_rx) = host_meeting("sm-broadcast").await;
         handle
-            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .server_mute("part-2".to_string(), "host".to_string(), both(true, false))
             .await
             .unwrap()
             .unwrap();
@@ -3794,7 +4104,7 @@ mod tests {
     async fn a_late_joiner_is_handed_the_current_server_mutes_to_replay() {
         let (handle, _task, _h, _p) = host_meeting("sm-replay").await;
         handle
-            .server_mute("part-2".to_string(), "host".to_string(), true, false)
+            .server_mute("part-2".to_string(), "host".to_string(), both(true, false))
             .await
             .unwrap()
             .unwrap();
@@ -3827,7 +4137,7 @@ mod tests {
         assert_eq!(server_muted_by, "host");
 
         handle
-            .server_mute("part-2".to_string(), "host".to_string(), false, false)
+            .server_mute("part-2".to_string(), "host".to_string(), both(false, false))
             .await
             .unwrap()
             .unwrap();
@@ -3870,9 +4180,24 @@ mod tests {
             .await
             .unwrap();
         handle
-            .server_mute("part-3".to_string(), "host".to_string(), true, false)
+            .server_mute("part-3".to_string(), "host".to_string(), both(true, false))
             .await
             .unwrap()
+            .unwrap();
+        // Story 3: a VIDEO server mute and a video self mute ride the roster
+        // entry too.
+        handle
+            .server_mute(
+                "part-3".to_string(),
+                "host".to_string(),
+                only(MediaKindLabel::Video, true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        handle
+            .update_self_mute("part-3".to_string(), only(MediaKindLabel::Video, true))
+            .await
             .unwrap();
 
         // Reconnect within grace: the SAME roster entry, still muted.
@@ -3896,10 +4221,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reconnected.participant_id, "part-3");
+        let p3 = state_of(&handle, "part-3").await;
         assert!(
-            state_of(&handle, "part-3").await.audio_server_muted,
-            "the mute survives a reconnect within grace"
+            p3.audio_server_muted && p3.video_server_muted,
+            "both kinds' server mutes survive a reconnect within grace"
         );
+        assert!(p3.video_self_muted && !p3.audio_self_muted);
+
+        // S3: after the reconnect, a request naming ONLY audio merges against
+        // the ROSTER (the new connection knows nothing): video's self mute is
+        // untouched.
+        let decision = handle
+            .update_self_mute("part-3".to_string(), only(MediaKindLabel::Audio, true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(decision.changed(MediaKindLabel::Audio));
+        assert!(!decision.changed(MediaKindLabel::Video));
+        let p3 = state_of(&handle, "part-3").await;
+        assert!(p3.audio_self_muted && p3.video_self_muted);
 
         // A fresh join by the same user: a NEW roster entry, unmuted.
         let rejoined = handle

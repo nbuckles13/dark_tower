@@ -33,8 +33,9 @@
 //! KEEPS its edge's url (Lead ruling 3, MC-A Gate 1): the edge still exists, so
 //! the client keeps that handler's receive transport and a resume needs no
 //! reconnect (R-5's decode-before-live). Audio never uses `AVATAR_NO_VIDEO`
-//! (an audio slot holds only audio publishers). **Nothing emits
-//! `SOURCE_MUTED`** any more (MC-B deletes the value).
+//! (an audio slot holds only audio publishers). Story 2's single
+//! `SOURCE_MUTED` was deleted from the wire (and from the `slot_state` label
+//! domain) by MC-B; the cause now rides the slot.
 //!
 //! # What this never emits
 //!
@@ -43,11 +44,12 @@
 //! slot and is named in `unreachable_sender_ids` instead; one not yet connected
 //! is in neither).
 //!
-//! # Mute lives here and only here
+//! # Both mutes are told to subscribers here; only server mute reaches the directive
 //!
-//! A source's mute changes what a **subscriber is told about it**, never what a
-//! **publisher is told to produce**. [`super::directive`] has no access to mute
-//! state at all.
+//! A source's mute -- client or server -- changes what a **subscriber is told
+//! about it** here. What a **publisher is told to produce** depends on server
+//! mute and watch state, never client mute: [`super::directive`] takes only the
+//! server half (`ServerMutedKinds`) and has no client-mute input at all.
 
 use super::capability::SlotDemand;
 use super::outcome::{DirectiveOutcome, MediaKindLabel};
@@ -69,17 +71,16 @@ pub struct SlotComposition {
 
 /// Bounded metric-label form for a slot state.
 ///
-/// Exhaustive over **every** proto variant, including the superseded
-/// `source_muted` (MC-B deletes it with the wire value) and states MC does not
-/// emit: a `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must
-/// be visible rather than absent, and identical vocabularies keep MC's
+/// Exhaustive over **every** proto variant, including states MC does not
+/// emit (story 2's `source_muted` left the domain with its wire value): a
+/// `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be
+/// visible rather than absent, and identical vocabularies keep MC's
 /// distribution comparable with the client's. Labels follow the wire names.
 #[must_use]
 pub fn slot_state_label(state: SlotState) -> &'static str {
     match state {
         SlotState::Unspecified => "unspecified",
         SlotState::Active => "active",
-        SlotState::SourceMuted => "source_muted",
         SlotState::WithheldByCongestion => "withheld_by_congestion",
         SlotState::FewerSourcesThanSlots => "fewer_sources_than_slots",
         SlotState::SourceUnreachable => "source_unreachable",
@@ -143,7 +144,7 @@ pub fn build_stream_assignments(
                         .to_string();
                     let flags = mute.flags(edge.source);
                     let (server, client) =
-                        (*kind.of_ref(&flags.server), *kind.of_ref(&flags.client));
+                        (flags.server.is_muted(kind), flags.client.is_muted(kind));
                     if server {
                         (named, url, SlotState::AvatarServerMuted)
                     } else if client {
@@ -187,7 +188,7 @@ pub fn build_stream_assignments(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::media_kind::PublishSet;
+    use crate::media_kind::{ClientMutedKinds, PublishSet};
     use crate::media_routing::SourceMute;
     use crate::media_routing::{HandlerEndpoint, HandlerId};
     use crate::media_signaling::ReceiveCapabilityDeclaration;
@@ -284,7 +285,7 @@ mod tests {
     }
 
     fn muted(s: u16, server: [bool; 2], client: [bool; 2]) -> Vec<(u16, SourceMute)> {
-        vec![(s, SourceMute { server, client })]
+        vec![(s, SourceMute::from_flags(server, client))]
     }
 
     fn state(a: &StreamAssignment) -> SlotState {
@@ -432,26 +433,6 @@ mod tests {
     }
 
     #[test]
-    fn nothing_emits_source_muted() {
-        for (server, client) in [([true; 2], [false; 2]), ([false; 2], [true; 2])] {
-            let c = compose_with(
-                &[(2, "AV"), (3, "A")],
-                &[
-                    (0, MediaKind::Audio),
-                    (1, MediaKind::VideoCamera),
-                    (2, MediaKind::VideoCamera),
-                ],
-                [8, 4],
-                &muted(2, server, client),
-            );
-            assert!(c
-                .slot_states
-                .iter()
-                .all(|(_, s)| *s != SlotState::SourceMuted));
-        }
-    }
-
-    #[test]
     fn the_subscribers_own_slot_numbering_is_echoed_not_mcs() {
         let c = compose(
             &[2, 3],
@@ -569,19 +550,38 @@ mod tests {
     fn an_unknown_source_fails_closed_as_server_muted() {
         let view = SourceMuteView::from_map(HashMap::from([(
             sender(2),
-            SourceMute {
-                server: [false; 2],
-                client: [true, false],
-            },
+            SourceMute::from_flags([false; 2], [true, false]),
         )]));
         assert_eq!(
             view.flags(sender(1)),
-            SourceMute {
-                server: [true; 2],
-                client: [false; 2]
-            }
+            SourceMute::from_flags([true; 2], [false; 2])
         );
-        assert_eq!(view.flags(sender(2)).client, [true, false]);
+        assert_eq!(
+            view.flags(sender(2)).client,
+            ClientMutedKinds::from_client_flags([true, false])
+        );
+    }
+
+    /// MC-B deleted `SOURCE_MUTED` from the wire, so `source_muted` is outside
+    /// the label domain (pinned here: a metric assertion on it would read an
+    /// absent series as 0 and pass vacuously).
+    #[test]
+    fn source_muted_is_outside_the_slot_state_label_domain() {
+        for state in [
+            SlotState::Unspecified,
+            SlotState::Active,
+            SlotState::WithheldByCongestion,
+            SlotState::FewerSourcesThanSlots,
+            SlotState::SourceUnreachable,
+            SlotState::SwitchPending,
+            SlotState::AvatarNoVideo,
+            SlotState::Unavailable,
+            SlotState::AvatarClientMuted,
+            SlotState::AvatarServerMuted,
+        ] {
+            assert_ne!(slot_state_label(state), "source_muted");
+        }
+        assert!(SlotState::try_from(2).is_err(), "number 2 is reserved");
     }
 
     #[test]
@@ -589,7 +589,6 @@ mod tests {
         let all = [
             SlotState::Unspecified,
             SlotState::Active,
-            SlotState::SourceMuted,
             SlotState::WithheldByCongestion,
             SlotState::FewerSourcesThanSlots,
             SlotState::SourceUnreachable,

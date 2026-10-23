@@ -235,25 +235,20 @@ pub enum DirectiveOutcome {
 /// That is a worse failure than the amplification it would prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuteOutcome {
-    /// THIS KIND's flag moved and was reported to the meeting actor, which
-    /// re-renders (the stream's disposition) and re-emits the changed slot view
-    /// to the subscribers holding this source (story 3: either kind). A failed re-emit is counted by the actor itself
+    /// THIS KIND's flag moved (the meeting actor's per-kind decision): the
+    /// actor re-rendered (the stream's disposition flips FORWARD <-> PAUSED)
+    /// and re-emitted the changed slot view to the subscribers holding this
+    /// source. A failed re-emit is counted by the actor itself
     /// (`mc_media_send_directives_total` and
     /// `mc_media_slot_view_emissions_total{outcome="composition_failed"}`).
     Applied,
-    /// Reported to the meeting actor, with nothing to re-convey.
-    ///
-    /// UNREACHABLE since story 3 MC-A: every connection is declared from its
-    /// join, and a moved flag of either kind recomposes (`applied`). Kept in
-    /// the vocabulary (and zero-initialised) until MC-B reshapes per-kind mute,
-    /// so a dashboard reading it sees a real zero, not an absent series.
-    AppliedNoRecompose,
-    /// THIS KIND's state did not move. Two sources (story 3, per kind):
-    /// - the whole-request identical repeat — the tuple short-circuit, before
-    ///   any actor hop or recomposition (counted on every named kind);
-    /// - the UNMOVED kind of a request that was applied — the actor WAS hopped
-    ///   for the other kind (a camera toggle is `unchanged` on audio; an audio
-    ///   mute is `unchanged` on video).
+    /// THIS NAMED KIND's state did not move. Two sources (story 3 MC-B, per
+    /// named kind):
+    /// - the identical repeat — every named kind equals the connection's
+    ///   cached, actor-confirmed state — short-circuited before any actor hop
+    ///   or recomposition;
+    /// - a named kind the actor found already in that state, while another
+    ///   named kind of the same request moved.
     ///
     /// Not a failure, and client-inflatable at near-zero cost via the first
     /// source, so never a ratio denominator.
@@ -271,9 +266,8 @@ pub enum MuteOutcome {
 
 impl MuteOutcome {
     /// Every variant, for exhaustive metric-vocabulary tests.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 4] = [
         Self::Applied,
-        Self::AppliedNoRecompose,
         Self::Unchanged,
         Self::RateLimited,
         Self::ActorUnavailable,
@@ -284,7 +278,6 @@ impl MuteOutcome {
     pub fn label(self) -> &'static str {
         match self {
             Self::Applied => "applied",
-            Self::AppliedNoRecompose => "applied_no_recompose",
             Self::Unchanged => "unchanged",
             Self::RateLimited => "rate_limited",
             Self::ActorUnavailable => "actor_unavailable",
@@ -293,11 +286,12 @@ impl MuteOutcome {
 
     /// Was the reported state recorded on the meeting actor?
     ///
-    /// The success set is `{applied, applied_no_recompose}`. `unchanged` is NOT
-    /// in it: nothing was recorded because nothing needed to be.
+    /// The success set is `{applied}` (story 3 MC-B removed the unreachable
+    /// `applied_no_recompose`). `unchanged` is NOT in it: nothing was recorded
+    /// because nothing needed to be.
     #[must_use]
     pub fn is_applied(self) -> bool {
-        matches!(self, Self::Applied | Self::AppliedNoRecompose)
+        matches!(self, Self::Applied)
     }
 }
 
@@ -308,12 +302,12 @@ pub use crate::media_kind::MediaKindLabel;
 /// The verb a server-mute request asked for (`mc_media_server_mute_requests_total{action}`).
 ///
 /// The label names WHAT WAS ASKED FOR, never its result (that is `outcome`).
-/// PER KIND, not per request (story 3 OBS-A): the metric counts one increment
-/// per (request, named kind), and each kind's cell carries THAT kind's asked-for
-/// direction. A request `{audio: true, video: false}` therefore counts
-/// `action="mute", media_kind="audio"` AND `action="unmute",
-/// media_kind="video"` — stamping the request-level verb on the video cell would
-/// claim a video mute the request did not ask for.
+/// PER KIND, not per request (story 3 OBS-A, MC-B): the metric counts one
+/// increment per (request, NAMED kind), and each kind's cell carries THAT
+/// kind's asked-for direction. A request `{audio: true}` counts only
+/// `action="mute", media_kind="audio"`; `{audio: true, video: false}` also
+/// counts `action="unmute", media_kind="video"`. A request naming no kind is
+/// counted on `mc_media_mute_requests_rejected_total` instead.
 ///
 /// NOT A JOIN KEY with `dt_client_media_mute_transitions_total{action}`, whose
 /// value set is byte-identical: that series is the local user's own
@@ -387,9 +381,9 @@ impl ServerMuteAction {
 pub enum ServerMuteOutcome {
     /// THIS KIND's server-mute state changed.
     Applied,
-    /// THIS KIND was already in the requested state. When the request's other
-    /// kind was `applied`, the actor still broadcast (and, for audio,
-    /// re-rendered and re-pushed) for that other kind; only when BOTH kinds are
+    /// THIS NAMED KIND was already in the requested state. When another named
+    /// kind of the request was `applied`, the actor still broadcast,
+    /// re-rendered and re-pushed for that kind; only when every named kind is
     /// unchanged was nothing broadcast or pushed.
     Unchanged,
     /// The requester does not hold host authority.
@@ -494,22 +488,82 @@ impl UnmuteRequestOutcome {
 /// deliberately disjoint views of one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusalReplySurface {
-    /// A `ServerMuteRequest` refusal.
-    ServerMute,
+    /// A mute-request rejection reply, by request type (story 3 MC-B adds
+    /// `client_mute`). The label is [`MuteSurface::label`]'s, never restated.
+    Mute(MuteSurface),
     /// A `ReceiveCapability` rejection.
     Capability,
 }
 
 impl RefusalReplySurface {
     /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
-    pub const ALL: [Self; 2] = [Self::ServerMute, Self::Capability];
+    pub const ALL: [Self; 3] = [
+        Self::Mute(MuteSurface::ClientMute),
+        Self::Mute(MuteSurface::ServerMute),
+        Self::Capability,
+    ];
 
     /// Bounded metric-label form.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::ServerMute => "server_mute",
+            Self::Mute(surface) => surface.label(),
             Self::Capability => "capability",
+        }
+    }
+}
+
+/// Which mute request a kind-free rejection or reply belongs to
+/// (`mc_media_mute_requests_rejected_total{surface}`,
+/// `mc_media_refusal_replies_suppressed_total{surface}`). The ONE home of the
+/// `client_mute` / `server_mute` spellings: [`RefusalReplySurface`] delegates
+/// to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuteSurface {
+    /// A participant's own `MuteRequest` (client mute).
+    ClientMute,
+    /// A host's `ServerMuteRequest`.
+    ServerMute,
+}
+
+impl MuteSurface {
+    /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
+    pub const ALL: [Self; 2] = [Self::ClientMute, Self::ServerMute];
+
+    /// Bounded metric-label form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ClientMute => "client_mute",
+            Self::ServerMute => "server_mute",
+        }
+    }
+}
+
+/// Why a mute request was rejected BEFORE any kind could be counted
+/// (`mc_media_mute_requests_rejected_total{reason}`; story 3 MC-B).
+///
+/// KIND-FREE on purpose: the rejected request names no kind, so it cannot land
+/// on the per-kind mute counters without inventing one. CLIENT-INFLATABLE (a
+/// shape check before any token or actor hop): never a ratio denominator, no
+/// alert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuteRejection {
+    /// Both per-kind fields absent (`MuteChange::parse` refused it). Counted
+    /// for EVERY requester on the server-mute surface, host or not, so
+    /// `not_permitted` there undercounts non-hosts by exactly these requests.
+    NoKindNamed,
+}
+
+impl MuteRejection {
+    /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
+    pub const ALL: [Self; 1] = [Self::NoKindNamed];
+
+    /// Bounded metric-label form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoKindNamed => "no_kind_named",
         }
     }
 }
@@ -638,8 +692,10 @@ pub enum WithdrawalReason {
     /// The stream's last watcher left, redeclared it away or became
     /// unreachable: nobody holds it in a slot. Routine.
     Unwatched,
-    /// The kind was server-muted (emitted by story 3 MC-B; zero-initialised
-    /// now so that task adds no series).
+    /// The kind was server-muted: its directive is withdrawn whatever its
+    /// watchers (story 3 R-16). Routine moderation, not a failure; the MC-side
+    /// evidence that a server mute stopped capture ("camera light still on"
+    /// triage).
     ServerMuted,
 }
 
@@ -706,15 +762,12 @@ mod tests {
         }
     }
 
-    /// `unchanged` is deliberately NOT an applied state: nothing reached the
-    /// meeting actor, because nothing needed to.
+    /// `unchanged` is deliberately NOT an applied state: nothing was recorded,
+    /// because nothing needed to be.
     #[test]
-    fn only_the_two_applied_mute_outcomes_report_to_the_actor() {
+    fn only_applied_is_an_applied_mute_outcome() {
         for outcome in MuteOutcome::ALL {
-            let expected = matches!(
-                outcome,
-                MuteOutcome::Applied | MuteOutcome::AppliedNoRecompose
-            );
+            let expected = matches!(outcome, MuteOutcome::Applied);
             assert_eq!(
                 outcome.is_applied(),
                 expected,
@@ -826,6 +879,31 @@ mod tests {
             assert_eq!(k.of(MediaKindLabel::per_kind(MediaKindLabel::index)), i);
             assert_eq!(k.pick("audio", "video"), k.label());
         }
+    }
+
+    /// MC-B removed `applied_no_recompose` from the vocabulary: pinned at the
+    /// vocabulary (an absent series reads 0, so a metric assertion on the
+    /// removed value would pass vacuously).
+    #[test]
+    fn the_removed_mute_outcome_is_outside_the_vocabulary() {
+        assert!(MuteOutcome::ALL
+            .iter()
+            .all(|o| o.label() != "applied_no_recompose"));
+    }
+
+    /// DRY: the reply-suppression surface and the kind-free rejection surface
+    /// spell the two mute surfaces identically, because one delegates to the
+    /// other.
+    #[test]
+    fn the_mute_surface_spellings_have_one_home() {
+        for surface in MuteSurface::ALL {
+            assert_eq!(RefusalReplySurface::Mute(surface).label(), surface.label());
+        }
+        assert_eq!(MuteSurface::ClientMute.label(), "client_mute");
+        assert_eq!(MuteSurface::ServerMute.label(), "server_mute");
+        let labels: HashSet<&str> = RefusalReplySurface::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(labels.len(), RefusalReplySurface::ALL.len());
+        assert_eq!(MuteRejection::NoKindNamed.label(), "no_kind_named");
     }
 
     #[test]

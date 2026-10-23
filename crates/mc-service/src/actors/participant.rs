@@ -1047,9 +1047,8 @@ mod tests {
 
         // Send a message
         let result = handle
-            .send(SignalingPayload::MuteUpdate {
-                audio_muted: true,
-                video_muted: false,
+            .send(SignalingPayload::Chat {
+                content: "hello".to_string(),
             })
             .await;
         assert!(result.is_ok());

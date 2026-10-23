@@ -184,8 +184,9 @@ Complete ALL items before deploying to production:
     *(Pre-story-3 history. Since story 3 MC-A each kind is truncated to its own
     cap and the excess slots show `unavailable`; an over-cap declaration is
     never rejected, `slot_count_over_cap` is retired, and MC no longer writes
-    `max_receive_slots` (tag 12) — only the per-kind tags 13/14. The first
-    bullet of this list governs the story-3 roll.)*
+    `max_receive_slots` (tag 12) — only the per-kind tags 13/14; MC-B deleted
+    tag 12 from the wire and reserved it. The first bullet of this list governs
+    the story-3 roll.)*
   - **Story 2 task 20 (shared-handler edge model) adds a VERSION-SKEW WINDOW,
     not just an ordering rule** — see Deployment Steps §0. MC now offers every
     handler and may direct a sender at SEVERAL handlers and a subscriber's slots

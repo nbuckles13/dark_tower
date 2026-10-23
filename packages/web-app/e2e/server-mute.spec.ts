@@ -7,11 +7,17 @@
 // Two different things are called muting (`signaling.proto`, "Mute state"):
 //   * client mute — the participant about themselves, enforced at CAPTURE: no
 //     media leaves the device, so its own send counter goes FLAT;
-//   * server mute — the host about someone else, enforced at MH INGRESS: the
-//     muted client keeps SENDING (its counter keeps rising) and nobody receives.
-// The send counter is what tells them apart, so every mute window below samples
-// it beside the receivers' per-sender accepted counts, each from that
-// participant's own E2E bus (never a Prometheus aggregate).
+//   * server mute — the host about someone else. Since story 3 MC-B MC
+//     WITHDRAWS that kind's send directive (empty targets), so the muted
+//     client's send counter ALSO goes flat and nobody receives; MH's ingress
+//     drop is the backstop against a patched client, proved by the Rust
+//     patched-publisher env-test (`crates/env-tests/tests/35_mc_server_mute_teardown.rs`),
+//     which a conforming browser cannot exercise.
+// The send counter therefore no longer tells them apart; the slot state
+// (`avatar_server_muted` vs `avatar_client_muted`), the roster tokens and the
+// muted client's own `server-mute-state` do, and every window below samples the
+// counters beside a LIVE control in the same window (flat alone is vacuous),
+// each from that participant's own E2E bus (never a Prometheus aggregate).
 //
 // Wire tokens only: slot `data-slot-state`, roster `data-server-muted` /
 // `data-client-muted`, and the SDK error's `serverCode` on the bus.
@@ -69,7 +75,7 @@ function mutedSlotProbe(receiver: JoinedMember, sender: JoinedMember): Probe {
 }
 
 test.describe('story 2 S3: server mute, and client structural mute', () => {
-  test('a host server-mutes B: every receiver goes flat on B while B keeps sending; B cannot self-clear; unmute restores', async ({
+  test('a host server-mutes B: every receiver goes flat on B and B stops sending; B cannot self-clear; unmute restores', async ({
     browser,
   }) => {
     test.setTimeout(240_000);
@@ -109,8 +115,13 @@ test.describe('story 2 S3: server mute, and client structural mute', () => {
         observeWindow(
           [
             ...receivers.map((r) => acceptedProbe(r, b, 'flat')),
-            // B keeps SENDING — the difference from client mute (R-9: MH drops at ingress).
-            sentProbe(b, 'advance'),
+            // B stops SENDING: the server mute withdrew B's audio directive
+            // (story 3 R-16). MH's ingress drop is the backstop, proved in Rust.
+            sentProbe(b, 'flat'),
+            // B's OWN page mover (same-page rule): a server mute withdraws only
+            // B's SEND, so B still receives C — B's sampler is live while its
+            // send is flat.
+            acceptedProbe(b, c, 'advance'),
             // The meeting is otherwise alive, in the same window.
             acceptedProbe(host, c, 'advance'),
             acceptedProbe(c, d, 'advance'),
@@ -199,9 +210,10 @@ test.describe('story 2 S3: server mute, and client structural mute', () => {
       await expectIngressAdvances(host.page, 'the host still receiving after C unmuted');
       for (const r of [host, b]) await expectHearsAtAllLayers(r, c, cohort, admissionBaseline);
 
-      // COMPOSE: B client-mutes, the host server-mutes B, B client-UNmutes. B's
-      // egress resumes (client mute lifted) but nobody receives B (server mute
-      // holds) — the two mutes are independent (R-10).
+      // COMPOSE: B client-mutes, the host server-mutes B, B client-UNmutes.
+      // B's client mute is lifted, but B STILL does not send: the server mute
+      // keeps B's audio directive withdrawn (story 3 R-16), so lifting one mute
+      // neither lifts nor masks the other (R-10, R-15). Nobody receives B.
       await setMuteViaUi(b.page, true);
       await clickServerMute(host, b);
       await waitForRosterToken(c, b, 'data-server-muted', 'true');
@@ -212,7 +224,9 @@ test.describe('story 2 S3: server mute, and client structural mute', () => {
       );
       await observeWindow(
         [
-          sentProbe(b, 'advance'),
+          sentProbe(b, 'flat'),
+          // B's own page mover (same-page rule): B still receives C.
+          acceptedProbe(b, c, 'advance'),
           acceptedProbe(host, b, 'flat'),
           acceptedProbe(c, b, 'flat'),
           acceptedProbe(c, host, 'advance'),

@@ -789,11 +789,12 @@ groups:
       # leading indicator for registered-meeting exhaustion").
       # ------------------------------------------------------------------
       # DELIBERATELY NO ALERT on mc_media_server_mute_requests_total,
-      # mc_media_unmute_requests_total or mc_media_refusal_replies_suppressed_total
-      # (story 2 task 12). A non-zero mute rate is healthy moderation, and the
-      # refusal-side values (not_permitted, not_server_muted, suppressed replies)
-      # are CLIENT-INFLATABLE by construction - one connection can drive them at
-      # line rate. Recorded here so the absence reads as a decision, not an
+      # mc_media_unmute_requests_total, mc_media_refusal_replies_suppressed_total
+      # (story 2 task 12) or mc_media_mute_requests_rejected_total (story 3
+      # MC-B). A non-zero mute rate is healthy moderation, and the refusal-side
+      # values (not_permitted, not_server_muted, suppressed replies, no-kind
+      # rejections) are CLIENT-INFLATABLE by construction - one connection can
+      # drive them at line rate. Recorded here so the absence reads as a decision, not an
       # omission; MH's server_muted drop reason records the same decision.
       - alert: MCEndMeetingOwnershipRejected
         # Fleet-contract-reads-zero-forever: MC only ever sends its own mc_id,

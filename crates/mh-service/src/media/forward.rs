@@ -206,7 +206,7 @@ pub fn forward_one(
     // gate, from MC's `NotifyParticipantConnectedResponse`. Nothing read from
     // the frame participates, so a PATCHED CLIENT changes nothing observable
     // here: every frame of a sender whose every declared stream is
-    // DROP_AT_INGRESS (or who is union-muted) counts `server_muted`, including
+    // DROP_AT_INGRESS counts `server_muted`, including
     // frames that cannot be decoded or attributed — MH runbook scenario 19's
     // signal stays right. The non-vacuity rule (a sender with no declared
     // stream is NOT muted) lives with the set, in `routing`.
@@ -220,7 +220,8 @@ pub fn forward_one(
     // stream's declared transport and reaches only that stream's slots, where
     // receivers decode by slot kind. The full statement, and the 2026-10-13
     // correction of this paragraph's former "per-stream ingress mute is
-    // foreclosed" text, live once at `internal.proto` `MutedSource`.
+    // foreclosed" text, live once at `internal.proto` `SourceStream` (moved
+    // there by MC-B when the sender-only `MutedSource` was deleted).
     //
     // WHO CAN SET IT: `RegisterMeeting` authorizes on scope alone, so any
     // holder of `service.write.mh` can set or clear a mute — bounded as

@@ -277,8 +277,8 @@ because story task 21's media metrics need a section to extend.
 | `applied` | The live forward path reflects the generation MC sent — a fresh install, **or** an idempotent re-assert of an already-installed generation (no snapshot swap). | Nothing. This is health. |
 | `rejected_stale` | Nothing installed because MH is already ahead: (1) a generation strictly lower than the installed one was ignored; or (2, rare) an `EndMeeting` released the meeting between the apply being queued and run, while the carrying RPC was still waiting (MC's quiesce prevents this). | (1) Investigate reordering or retry on the MC→MH path. Policy is not rolled back. (2) No remedy on MH; cross-check `mc_media_push_quiesce_total{outcome="timed_out"}` on MC. |
 | `no_generation` | `policy_generation` was 0 — MC named no generation. | **See the window note below.** Today: nothing. |
-| `rejected_invalid` | The policy failed structural validation (duplicate `egress_stream_id`, duplicate subscriber slot, malformed identifier, a count bound — including `source_streams` over `MH_MAX_SOURCE_STREAMS_PER_MEETING` —, a duplicate `(sender_id, stream_number)` in `source_streams`, an UNSPECIFIED or unknown `SourceStream` transport or disposition, or — on the transitional reading only — an unspecified egress transport mode). | MC sent bad policy; the remedy is upstream in MC's assignment computation. |
-| `rejected_transport_inconsistent` | Every field parsed, but the registration's egress set contradicts its declared source streams (story 3 R-20): an egress candidate names a stream absent from `source_streams`, or one egress's candidates declare different transport modes (or, on the transitional reading, an egress's superseded transport is not DATAGRAM). Refused whole; **the prior generation stays live.** MC sees the same `invalid_argument` status as `rejected_invalid`. | Declaration drift inside MC's own computation — its declaration and its assignment disagree. Upstream in MC. Consumer: observability's MH transport-inconsistency alert (A8, OBS-B); no threshold here. |
+| `rejected_invalid` | The policy failed structural validation (duplicate `egress_stream_id`, duplicate subscriber slot, malformed identifier, a count bound — including `source_streams` over `MH_MAX_SOURCE_STREAMS_PER_MEETING` —, a duplicate `(sender_id, stream_number)` in `source_streams`, or an UNSPECIFIED or unknown `SourceStream` transport or disposition). | MC sent bad policy; the remedy is upstream in MC's assignment computation. |
+| `rejected_transport_inconsistent` | Every field parsed, but the registration's egress set contradicts its declared source streams (story 3 R-20): an egress candidate names a stream absent from `source_streams` — including every candidate of a candidate-bearing egress when `source_streams` is absent or empty (there is no fallback reading since MC-B) — or one egress's candidates declare different transport modes. Refused whole; **the prior generation stays live.** MC sees the same `invalid_argument` status as `rejected_invalid`. | Declaration drift inside MC's own computation — its declaration and its assignment disagree. Upstream in MC. Consumer: observability's MH transport-inconsistency alert (A8, OBS-B); no threshold here. |
 | `apply_failed` | MH could not install it: config-apply mailbox full, apply timed out, session actor gone, or the aggregate egress-edge bound. **The prior generation stays live.** | MH-side. Read the `reason` field on the accompanying `mh.session.policy` WARN log line to tell the causes apart — it is deliberately not a label. |
 | `rejected_stream_ceiling` | Installing would take this handler's installed egress streams above its derived egress **stream** ceiling (story 2 R-19) — a **capacity** refusal. **The prior generation stays live.** | Capacity, not an MC bug and not an MH fault: see [Egress Admission Metrics](#egress-admission-metrics). The same event is counted on `mh_media_stream_admission_total{outcome="rejected_stream_ceiling"}`. Deliberately NOT folded into `apply_failed`: under a small placeholder budget it is expected, and the deploy bake gate in `docs/runbooks/mh-deployment.md` alerts on `apply_failed`. |
 | `rejected_meeting_cap` | A NEW meeting id would take this handler past `MH_MAX_REGISTERED_MEETINGS` (story 2 R-21) — a **resource-exhaustion** refusal, never capacity. Nothing upserted, promoted or applied; the RPC answers `RESOURCE_EXHAUSTED`. A re-registration of an already-held meeting is never refused. | Which meetings are held and why they were not released: compare `mh_media_registered_meetings` with `mh_media_registered_meetings_limit`, then tell leaked registrations (an `EndMeeting` that never arrived — occupancy rising with uptime) from an empty-meeting flood or genuine load. Not `rejected_stream_ceiling` (capacity) and not `apply_failed` (MH internals). MC sees only a generic push failure, so this outcome is the discriminator. See the meeting-cap arm in `docs/runbooks/mh-incident-response.md`. |
@@ -476,7 +476,7 @@ The gauges below publish the remaining ADR-0036 §8 policy bounds and the enforc
 
 ### `mh_media_source_streams_per_meeting_limit`
 - **Type**: Gauge
-- **Description**: The configured `MH_MAX_SOURCE_STREAMS_PER_MEETING`, read from `PolicyLimits::max_source_streams_per_meeting` — the pre-allocation bound on `RegisterMeetingRequest.source_streams` (story 3), which also bounds the superseded `server_muted_sources`. Replaces `mh_media_muted_sources_per_meeting_limit`, whose key is no longer read. Unit: Streams, identity.
+- **Description**: The configured `MH_MAX_SOURCE_STREAMS_PER_MEETING`, read from `PolicyLimits::max_source_streams_per_meeting` — the pre-allocation bound on `RegisterMeetingRequest.source_streams` (story 3). Replaces `mh_media_muted_sources_per_meeting_limit`, whose key is no longer read. Unit: Streams, identity.
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
 - **Usage**: Configuration reflection (see above). Static; published once at startup.
@@ -1099,7 +1099,7 @@ read the drop against whether it was INTENDED.
 
 | `reason` | `direction` | Condition | What a responder does |
 |---|---|---|---|
-| `server_muted` | ingress | Server mute at ingress (ADR-0036 §7; story 3 R-16), on either path: the SENDER-LEVEL shortcut — every declared stream of the spawn-bound sender is DROP_AT_INGRESS (at least one declared), or the sender is in the superseded `server_muted_sources` (transitional / union reading) — checked at the top of `forward_one` before decode, so even an unattributable frame counts here; or, after attribution, the frame's declared stream is DROP_AT_INGRESS (per-kind mute while the other kind flows). Before fan-out either way, so it consumes no hop number. | **Not a fault in either direction.** Zero while no mute is active; while a mute IS active it tracks the muted sender's full frame rate, so non-zero is healthy moderation. The diagnostic value is reading it — zero or not — against whether a mute was intended. The remedy for an unwanted mute is the control plane: read the meeting's registration snapshot (MC). |
+| `server_muted` | ingress | Server mute at ingress (ADR-0036 §7; story 3 R-16), on either path: the SENDER-LEVEL shortcut — every declared stream of the spawn-bound sender is DROP_AT_INGRESS (at least one declared) — checked at the top of `forward_one` before decode, so even an unattributable frame counts here; or, after attribution, the frame's declared stream is DROP_AT_INGRESS (per-kind mute while the other kind flows). Before fan-out either way, so it consumes no hop number. | **Not a fault in either direction.** Zero while no mute is active, AND the expected steady state while one is (MC-B: a server mute also withdraws the kind's send directive, so a compliant client stops sending and this drop is the backstop); non-zero under a mute is frames sent anyway — in-flight across the withdrawal, or a client sending against a withdrawn directive. The diagnostic value is reading it — zero or not — against whether a mute was intended. The remedy for an unwanted mute is the control plane: read the meeting's registration snapshot (MC). |
 
 The series is **present at zero from process start** (pre-registered by
 `resolve_media_handles`, which walks `MediaDropReason::ALL`), so **absent is
@@ -1113,15 +1113,20 @@ never "nobody is muted".
    `crates/env-tests/tests/26_mh_quic.rs`). It never was a token with no
    enforcement behind it (as `stream_rate_limited` and `partial_frame_discard`
    were until story 3 MH-A2 gave them their stream-path producers).
-2. **MC programs the muted set as of story 2 task 12**: a host's server mute
-   puts the muted participant's sender id into `server_muted_sources` on every
-   registration snapshot MC pushes to a handler carrying that sender's edges
-   (`crates/mc-service/src/media_routing/slots.rs`). This is a DROP counter, so
-   **a zero has two causes**: no mute is in force, OR a mute is in force over a
-   source that is silent, disconnected, in grace, or not yet on this handler.
-   So a zero means no mute is being **enforced against an actively sending
-   source** — not that no mute is in force. MC's
-   `mc_media_server_muted_sources` gauge is what separates the two causes.
+2. **MC programs the mute per kind as of story 3 MC-B**: a host's server mute
+   of kind K sets the muted participant's K stream to `DROP_AT_INGRESS` in
+   `source_streams` on every registration snapshot MC pushes to a handler
+   carrying that sender's edges (`crates/mc-service/src/media_routing/slots.rs`),
+   AND withdraws K's send directive (empty targets), so a compliant client
+   stops sending K. (Story 2's sender-only `server_muted_sources` carrier was
+   deleted by MC-B.) This is a DROP counter, and the ingress drop is the
+   BACKSTOP behind the withdrawal, so **a zero is the expected steady state
+   under a mute**: no mute is in force, OR a mute is in force and the client
+   honoured the withdrawal, OR the source is silent, disconnected, in grace,
+   or not yet on this handler. A non-zero rate under a mute means frames
+   arrived anyway — in-flight frames across the withdrawal, or a client
+   sending against a withdrawn directive. So a zero never means no mute is in
+   force; MC's `mc_media_server_muted_sources` gauge is the state signal.
 3. **MC-side signals, and how to compare them with this counter.**
    `mc_media_server_mute_requests_total{action,outcome}` counts host mute
    EVENTS; `mc_media_server_muted_sources` is the STATE (participants MC holds
@@ -1131,8 +1136,11 @@ never "nobody is muted".
    `sum(rate(mh_media_frames_dropped_total{reason="server_muted"}[5m]))` across
    MH instances. Per instance it is not a signal at all, because MC and MH
    meeting sets do not nest. A level and a counter are **never divided**: a
-   gauge above zero while the fleet drop rate is flat is only a CANDIDATE
-   disagreement, and only after item 2's silent-source cause is excluded. It is
+   gauge above zero while the fleet drop rate is flat is the NORMAL shape since
+   MC-B (a compliant client honours the withdrawal and sends nothing to drop),
+   so it is a CANDIDATE disagreement only after item 2's causes are excluded —
+   above all that one (MC: `mc_media_send_directive_withdrawals_total{reason="server_muted"}`
+   rose). The comparison now detects only a sender that ignored its empty targets. It is
    the same class as `mc_media_generation_divergence` and the env-tests README
    rule against reading shared pod-level values as per-entity evidence — a
    known shape, not a quirk of this metric. The pod-level gauge answers "is any
@@ -1145,13 +1153,14 @@ attributes each frame by (that sender, the uplink relay id) against MC's
 `source_streams`; a DROP_AT_INGRESS stream drops here while the sender's other
 streams flow. The relay label is publisher-set and unauthenticated at MH: a
 relabelled frame must still match a declared stream and transport, and reaches
-only that stream's slots, where receivers decode by slot kind. On the
-transitional reading (no `source_streams`) a muted sender drops on every
-stream, as in story 2.
+only that stream's slots, where receivers decode by slot kind. A sender whose
+every declared stream is DROP_AT_INGRESS drops on every frame (the sender-level
+shortcut, before decode). There is no other reading: a registration with
+egresses and no `source_streams` is rejected (`rejected_transport_inconsistent`).
 > **Corrected 2026-10-13.** This paragraph said per-stream ingress mute was
 > foreclosed and per-kind mute would move to MC's egress edge set; that
 > conclusion is superseded. Single home of the reasoning: `internal.proto`
-> `MutedSource`.
+> `SourceStream` (moved from the deleted `MutedSource` by MC-B).
 
 **Who can set it.** A patched CLIENT changes nothing observable: the sender is
 bound at spawn after the JWT gate and the frame carries no sender id, so no

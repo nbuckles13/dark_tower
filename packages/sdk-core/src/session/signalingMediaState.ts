@@ -25,7 +25,6 @@ import type {
   SendDirectiveEvent,
   StreamAssignmentsEvent,
 } from '../signaling/events.js';
-import type { PerKindMuteState } from '../signaling/muteRequest.js';
 import { pairSlotsBySender, type SlotPair } from '../signaling/pairing.js';
 import { ServerMuteResumeTracker } from './serverMuteResume.js';
 
@@ -149,17 +148,5 @@ export class SignalingMediaState {
   /** Subscribe the video receiver to video server-mute -> unmute edges. */
   onVideoServerMuteLifted(listener: ((senderId: number) => void) | undefined): void {
     this.#onVideoServerMuteLifted = listener;
-  }
-
-  /**
-   * The both-kinds state for a host's per-kind server-mute request: `kind` at
-   * `muted`, the other kind at the target's CURRENT server-mute state.
-   */
-  serverMuteRequest(participantId: string, kind: PublishKind, muted: boolean): PerKindMuteState {
-    const current = this.#serverMute.get(participantId) ?? { audio: false, video: false };
-    return {
-      audioMuted: kind === 'audio' ? muted : current.audio,
-      videoMuted: kind === 'video' ? muted : current.video,
-    };
   }
 }

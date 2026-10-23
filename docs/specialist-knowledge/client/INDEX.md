@@ -11,7 +11,7 @@
 - Session event surface (mute / first-media / slot / fault) → `session/events.ts:MeetingSessionEventMap`; `StreamAssignments` + unreachable senders → `signaling/events.ts:StreamAssignmentsEvent`
 - Session↔media wiring (rebind purge, KEK observer, per-kind send directives, video encoding validation, MH control sink → keyframe gate) → `session/mediaWiring.ts:sendDirectiveListener`, `validateVideoEncoding`, `mhControlSink`
 - Signalling media state (E3 cache, mute) + R-18 tracker (S1); publish set + slot plan + declaration + capture source (audio + video/test pattern) → `session/{signalingMediaState,serverMuteResume,slotPlan,mediaSelection}.ts`; session-owned transmit keys + KEK subscription + VP8 join probe → `MeetingSession.ts:startMedia`
-- Flat slot-state map (Partial until MC-B) + pairing view + both-kinds mute builder → `signaling/{slotStateMap,pairing,muteRequest}.ts`
+- Flat slot-state map (exhaustive `Record<SlotState, …>`) + pairing view + single-kind mute builder (other kind absent = unchanged) → `signaling/{slotStateMap,pairing,muteRequest}.ts`
 - Host role hint → `session/meetingRole.ts`; base64url → `encoding/base64url.ts`; error codes (closing vs refusal) → `signaling/errorCodeMap.ts:closesConnection()`, `errors/`
 - WebTransport length-prefix framing → `framing/{length-prefix,sendFramed}.ts`; connection mgmt, datagrams, uni streams, MH control channel → `transport/`, `media/MediaTransport.ts:sendRecoveryRequest`
 - HTTP/3 meeting API; generated protobuf-es types (gitignored); wire→public codec oracle; validation SSoT → `http/`, `proto/dark_tower/`, `signaling/codecMap.ts`, `validation/limits.ts`
@@ -64,7 +64,7 @@
 - Mock transport (uni streams, STOP_SENDING/reset, write gates → `mockUniStreams.ts`); audio seam doubles; video decoder + VideoFrame close-registry doubles → `media/video.ts`; tokens, metrics sink contract + mocks, ids → `MockWebTransport.ts`, `media/index.ts`, `TestTokenBuilder.ts`, `token-claims.ts`, `contracts/MetricsSink.ts`, `InMemoryMetricsSink.ts`, `MockOTLPExporter.ts`, `deterministic-ids.ts`
 
 ## Protocol Integration
-- Signaling proto (incl. `max_receive_slots`, `kek_rotation_debounce_seconds`) → `proto/dark_tower/signaling/v1/signaling.proto`
+- Signaling proto (incl. per-kind `max_{audio,video}_receive_slots`, `kek_rotation_debounce_seconds`) → `proto/dark_tower/signaling/v1/signaling.proto`
 - Media frame format → `crates/media-protocol/`; vectors → `proto/test-vectors/`; meeting-token claims → `crates/common/src/jwt.rs:MeetingTokenClaims`
 
 ## Observability
