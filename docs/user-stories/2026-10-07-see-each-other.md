@@ -2243,7 +2243,7 @@ tasks:
   slug: 2026-10-22-c-b-sdk-video-receive
   tag: story-2026-10-07-see-each-other-task-14
 - id: 15
-  status: pending
+  status: completed
   specialist: meeting-controller
   deps:
   - 7
@@ -2402,6 +2402,7 @@ tasks:
     - Field deletion, paired with media-handler (`MutedSource`, `EgressStream.transport_mode`, SOURCE_MUTED): `validate-internal-proto-no-key-material.sh` still passes, and no deleted field leaves a reader that silently defaults.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-23-mc-b-per-kind-mute
   tag: story-2026-10-07-see-each-other-task-15
 - id: 16
   status: pending
