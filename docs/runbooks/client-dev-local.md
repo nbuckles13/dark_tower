@@ -1361,8 +1361,9 @@ that somebody holds you. Whether anybody is being sent TO you is a separate fact
 client-side reading:
 
 > **Corrected 2026-10-21 (story 3 OPS-A): read the table below with this note until C-A2 rewrites
-> it.** Since MC-A, MC no longer emits `source_muted` (a `source_muted` row on a current controller
-> is the SDK's legacy shim mapping, not a wire value). A muted peer's slot is `avatar_client_muted` or
+> it.** Since MC-A, MC no longer emits `source_muted`, and MC-B (2026-10-23) deleted the wire value
+> (reserved number 2): no current client or controller shows a `source_muted` row; if one appears,
+> that component predates the story-3 cutover. A muted peer's slot is `avatar_client_muted` or
 > `avatar_server_muted` (server wins when both), per kind. A video slot whose occupant publishes no
 > video is `avatar_no_video`, and a slot over a per-kind cap is `unavailable` (R-1). **All four are
 > correct behaviour**, the story-3 counterparts of row 1. Do NOT route them by row 4 ("any token MC
@@ -1371,7 +1372,7 @@ client-side reading:
 
 | `dt_client_media_receive_source_deficit_total` | slot rows' `data-slot-state` | Meaning |
 |---|---|---|
-| flat | only `source_muted` or `fewer_sources_than_slots`, **and the roster agrees** — those peers really are muted, or there really are fewer unmuted peers than slots (declaring zero slots of a kind yields no slot rows of that kind at all; MC never sends a zero-requested state, which the proto reserved 2026-10-13) | **Correct behaviour.** Silence is what the wire says. Stop. |
+| flat | only a muted avatar (`avatar_client_muted` / `avatar_server_muted`; story 2's `source_muted`, now deleted) or `fewer_sources_than_slots`, **and the roster agrees** — those peers really are muted, or there really are fewer unmuted peers than slots (declaring zero slots of a kind yields no slot rows of that kind at all; MC never sends a zero-requested state, which the proto reserved 2026-10-13) | **Correct behaviour.** Silence is what the wire says. Stop. |
 | flat | `fewer_sources_than_slots` **while the roster shows unmuted peers you should hear** | Those peers are unreachable from you: you share no CONNECTED handler, so MC names them in `unreachable_sender_ids` instead of a slot. A connectivity fault — [`mc-incident-response.md` Scenario 18](mc-incident-response.md#scenario-18-a-participant-hears-only-part-of-the-roster). |
 | flat | `awaiting-assignment` on every slot | MC never assigned your slots — MC signalling (§4.1). (An over-cap slot is not this: it reads `unavailable`, F18.) |
 | flat | `unspecified`, or any token MC does not emit today | An MC defect — [`mc-incident-response.md` §Client media signalling](mc-incident-response.md#client-media-signalling--where-to-look-no-scenario-number-yet) lists which slot states are reachable. File against `meeting-controller`. |

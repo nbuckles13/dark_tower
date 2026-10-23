@@ -454,7 +454,7 @@ describe('SignalingClient — post-join ErrorMessage close rule (story 2 R-8)', 
     expect(errors[0]?.signalingCode).toBe(SignalingErrorCode.Forbidden);
     expect(await closedSoon(wt)).toBe(false);
     // Still usable: a later send goes out.
-    await client.sendMuteRequest({ audioMuted: true, videoMuted: false });
+    await client.sendMuteRequest('audio', true);
   });
 
   it('a post-join UNAUTHORIZED still closes with the typed auth reason', async () => {

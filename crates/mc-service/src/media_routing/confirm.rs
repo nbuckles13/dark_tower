@@ -412,9 +412,6 @@ mod tests {
             applied_generation,
             handler_id: handler_id.to_string(),
             process_start_epoch_ms: 0,
-            // The legacy single echo: UNSPECIFIED once `source_streams` is
-            // declared, and never compared.
-            transport_mode: TransportMode::Unspecified as i32,
             applied_source_streams,
         }
     }
@@ -424,15 +421,6 @@ mod tests {
         let outcome = evaluate(&expectation(4), &response(4, EXPECTED_HANDLER, agreeing()));
         assert_eq!(outcome, PolicyPushOutcome::Match);
         assert_eq!(outcome.disposition(), PushDisposition::Programmed);
-    }
-
-    /// The legacy single field is not compared: an UNSPECIFIED legacy echo
-    /// with an agreeing per-stream echo is a match.
-    #[test]
-    fn the_legacy_transport_echo_is_no_longer_compared() {
-        let mut r = response(4, EXPECTED_HANDLER, agreeing());
-        r.transport_mode = TransportMode::StreamPerGroup as i32;
-        assert_eq!(evaluate(&expectation(4), &r), PolicyPushOutcome::Match);
     }
 
     #[test]

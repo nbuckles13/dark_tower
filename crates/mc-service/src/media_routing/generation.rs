@@ -329,18 +329,29 @@ mod tests {
         assert_eq!(second.get(), first.get() + 1);
     }
 
-    /// A server mute changes ONLY the muted set — the same edges — and that
-    /// alone must advance the generation. Otherwise MH sees an unchanged number,
-    /// no-ops the snapshot, and a mute (or an unmute) never takes effect while
-    /// the applied echo reads `match`.
+    /// A mute changes ONLY a stream's disposition -- the same edges -- and
+    /// that alone must advance the generation. Otherwise MH sees an unchanged
+    /// number, no-ops the snapshot, and a mute (or an unmute) never takes
+    /// effect while the applied echo reads `match`.
     #[tokio::test]
-    async fn a_change_to_the_muted_set_alone_advances_the_generation() {
+    async fn a_disposition_change_alone_advances_the_generation() {
+        use crate::media_routing::assignment::{
+            SourceDispositionPlan, SourceStreamPlan, TransportModeOrd,
+        };
+        use proto_gen::dark_tower::signaling::v1::TransportMode;
+        let with = |disposition| {
+            let mut a = assignment(1);
+            a.source_streams.insert(SourceStreamPlan {
+                sender: SenderId::from_nonzero(NonZeroU16::new(101).unwrap()),
+                stream_number: MAIN_AUDIO_STREAM_NUMBER,
+                transport_mode: TransportModeOrd::new(TransportMode::Datagram),
+                disposition,
+            });
+            a
+        };
         let registry = PolicyGenerations::new();
-        let unmuted = assignment(1);
-        let mut muted = assignment(1);
-        muted
-            .server_muted_sources
-            .insert(SenderId::from_nonzero(NonZeroU16::new(101).unwrap()));
+        let unmuted = with(SourceDispositionPlan::Forward);
+        let muted = with(SourceDispositionPlan::DropAtIngress);
         let first = registry
             .next_generation("m1", &handler("mh-0"), &unmuted)
             .await

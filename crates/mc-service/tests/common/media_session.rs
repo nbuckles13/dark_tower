@@ -98,14 +98,20 @@ pub fn capability_frame(slots: Vec<ReceiveSlot>) -> bytes::BytesMut {
     })
 }
 
-/// A framed `MuteRequest`.
+/// A framed `MuteRequest` naming BOTH kinds explicitly.
 pub fn mute_frame(audio_muted: bool, video_muted: bool) -> bytes::BytesMut {
+    mute_kinds_frame(Some(audio_muted), Some(video_muted))
+}
+
+/// A framed `MuteRequest` with each kind's presence as given (`None` = absent,
+/// i.e. "that kind unchanged"; both `None` is the rejected shape).
+pub fn mute_kinds_frame(audio_muted: Option<bool>, video_muted: Option<bool>) -> bytes::BytesMut {
     encode_framed(&ClientMessage {
         trace_parent: String::new(),
         trace_state: String::new(),
         message: Some(client_message::Message::MuteRequest(MuteRequest {
-            audio_muted: Some(audio_muted),
-            video_muted: Some(video_muted),
+            audio_muted,
+            video_muted,
         })),
     })
 }
@@ -130,9 +136,6 @@ pub struct Session {
     pub sender_id: u32,
     /// `JoinResponse.media_servers`, as MC sent it.
     pub media_servers: Vec<String>,
-    /// `JoinResponse.max_receive_slots` (superseded tag 12; MC-A no longer
-    /// writes it, so `None`).
-    pub max_receive_slots: Option<u32>,
     /// `JoinResponse.max_audio_receive_slots` / `max_video_receive_slots`.
     pub max_kind_receive_slots: (Option<u32>, Option<u32>),
     /// The `SendDirective` MC emitted in the join turn.
@@ -582,6 +585,33 @@ pub async fn try_join_shaped(
     try_join_full(rig, stack, meeting_id, user, false, shape).await
 }
 
+/// Join with an explicit [`JoinShape`] as a host or not, then report a media
+/// connection to EVERY registered handler (as [`join_as`]).
+///
+/// # Panics
+///
+/// Panics if MC answers anything but a `JoinResponse`.
+pub async fn join_shaped(
+    rig: &AcceptLoopRig,
+    stack: &TestStackHandles,
+    meeting_id: &str,
+    user: &str,
+    host: bool,
+    shape: JoinShape,
+) -> Session {
+    let session = match try_join_full(rig, stack, meeting_id, user, host, shape).await {
+        Ok(session) => session,
+        Err(e) => panic!("{user}: expected JoinResponse, got {e}"),
+    };
+    for handler in registered_handlers(stack, meeting_id).await {
+        let answered = session
+            .connect_to(stack, &handler, &connection_id_for(user, &handler))
+            .await;
+        assert_eq!(answered, session.sender_id);
+    }
+    session
+}
+
 /// The one join path behind [`try_join_as`] and [`join_as_host`].
 async fn try_join_with_role(
     rig: &AcceptLoopRig,
@@ -639,20 +669,18 @@ async fn try_join_full(
     let resp = tokio::time::timeout(Duration::from_secs(5), read_server_message(&mut recv))
         .await
         .expect("join response timeout");
-    let (participant_id, sender_id, media_servers, max_receive_slots, max_kind_receive_slots) =
-        match resp.message {
-            Some(server_message::Message::JoinResponse(r)) => (
-                r.participant_id.clone(),
-                r.sender_id.expect("MC allocates a sender id at join"),
-                r.media_servers
-                    .into_iter()
-                    .map(|m| m.media_handler_url)
-                    .collect::<Vec<String>>(),
-                r.max_receive_slots,
-                (r.max_audio_receive_slots, r.max_video_receive_slots),
-            ),
-            other => return Err(format!("{other:?}")),
-        };
+    let (participant_id, sender_id, media_servers, max_kind_receive_slots) = match resp.message {
+        Some(server_message::Message::JoinResponse(r)) => (
+            r.participant_id.clone(),
+            r.sender_id.expect("MC allocates a sender id at join"),
+            r.media_servers
+                .into_iter()
+                .map(|m| m.media_handler_url)
+                .collect::<Vec<String>>(),
+            (r.max_audio_receive_slots, r.max_video_receive_slots),
+        ),
+        other => return Err(format!("{other:?}")),
+    };
 
     let mut session = Session {
         conn,
@@ -660,7 +688,6 @@ async fn try_join_full(
         recv,
         sender_id,
         media_servers,
-        max_receive_slots,
         max_kind_receive_slots,
         join_directive: None,
         join_assignments: None,
@@ -673,16 +700,27 @@ async fn try_join_full(
     Ok(session)
 }
 
-/// A framed `ServerMuteRequest` naming `target`.
+/// A framed `ServerMuteRequest` naming `target`, about AUDIO only (video
+/// absent: unchanged).
 pub fn server_mute_frame(target: &str, audio_muted: bool) -> bytes::BytesMut {
+    server_mute_kinds_frame(target, Some(audio_muted), None)
+}
+
+/// A framed `ServerMuteRequest` naming `target`, with each kind's presence as
+/// given (`None` = absent, i.e. "that kind unchanged").
+pub fn server_mute_kinds_frame(
+    target: &str,
+    audio_muted: Option<bool>,
+    video_muted: Option<bool>,
+) -> bytes::BytesMut {
     encode_framed(&ClientMessage {
         trace_parent: String::new(),
         trace_state: String::new(),
         message: Some(client_message::Message::ServerMuteRequest(
             proto_gen::dark_tower::signaling::v1::ServerMuteRequest {
                 participant_id: target.to_string(),
-                audio_muted: Some(audio_muted),
-                video_muted: Some(false),
+                audio_muted,
+                video_muted,
                 reason: String::new(),
             },
         )),

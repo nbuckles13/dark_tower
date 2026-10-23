@@ -293,7 +293,7 @@ async fn an_identical_post_join_redeclaration_of_the_join_declaration_is_a_no_op
 #[tokio::test]
 async fn video_slots_show_no_video_avatars_senderless_live_video_and_unavailable() {
     let mut config = client_media_config();
-    config.max_receive_slots = [8, 2];
+    config.receive_slot_caps = [8, 2];
     let (stack, rig) = start_stack_with("vs-states", config).await;
     seed_meeting_with_mh(&stack, "vs-states").await;
     let a_only = joined(&rig, &stack, "vs-states", "user-a", JoinShape::default()).await;
@@ -495,7 +495,7 @@ async fn the_video_cap_zero_lever_turns_video_off_and_leaves_audio_identical() {
         Option<Vec<i32>>,
     ) {
         let mut config = client_media_config();
-        config.max_receive_slots = [8, video_cap];
+        config.receive_slot_caps = [8, video_cap];
         let (stack, rig) = start_stack_with(label, config).await;
         seed_meeting_with_mh(&stack, label).await;
         let mut p = joined(&rig, &stack, label, "user-p", av()).await;
@@ -704,7 +704,7 @@ async fn a_frame_sized_declaration_is_truncated_and_an_oversized_view_fails_clos
 async fn the_cap_and_keyframe_interval_gauges_echo_the_directed_configuration() {
     let snap = MetricAssertion::snapshot();
     let mut config = client_media_config();
-    config.max_receive_slots = [6, 0];
+    config.receive_slot_caps = [6, 0];
     let (stack, rig) = start_stack_with("vs-gauges", config).await;
     seed_meeting_with_mh(&stack, "vs-gauges").await;
     let p = joined(&rig, &stack, "vs-gauges", "user-p", av()).await;
@@ -755,7 +755,7 @@ async fn a_reconnect_redeclaring_to_nothing_is_counted_and_keeps_the_previous_de
         true,
     )
     .unwrap()
-    .truncate(client_media_config().max_receive_slots);
+    .truncate(client_media_config().receive_slot_caps);
     let (r, _rx_r) = actor_join(&stack, &meeting, "r", media).await;
     for user in ["p", "r"] {
         notify_connected(&stack, M, &format!("user-{user}"), HANDLER, user).await;
@@ -787,7 +787,7 @@ async fn a_reconnect_redeclaring_to_nothing_is_counted_and_keeps_the_previous_de
 
     let snap = MetricAssertion::snapshot();
     let empty =
-        ReceiveCapabilityDeclaration::empty().truncate(client_media_config().max_receive_slots);
+        ReceiveCapabilityDeclaration::empty().truncate(client_media_config().receive_slot_caps);
     meeting
         .connection_reconnect(
             "conn-r2".to_string(),

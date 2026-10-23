@@ -107,16 +107,12 @@ enum SlotState {
   // names the source. A live slot with no decoded frame yet keeps showing what
   // it showed before (no spinner for a steady state).
   SLOT_STATE_ACTIVE = 1;
-  // SUPERSEDED -- deleted by MC-B, then reserved by number and name. Replaced
-  // by `SLOT_STATE_AVATAR_CLIENT_MUTED` and `SLOT_STATE_AVATAR_SERVER_MUTED`.
-  //
-  // Was: "the source is present but muted", covering both mute paths in one
-  // value. Its former paragraph promising that no enum value would ever be
-  // added to distinguish client from server mute is deleted (2026-10-13):
-  // story 3 R-4 renders the two distinctly, so the cause now rides the slot.
-  // MC still emits it for both mute causes until MC-B replaces it with the two
-  // avatar states.
-  SLOT_STATE_SOURCE_MUTED = 2;
+  // Was `SLOT_STATE_SOURCE_MUTED` ("the source is present but muted", both
+  // mute causes in one value). Deleted by MC-B; replaced by
+  // `SLOT_STATE_AVATAR_CLIENT_MUTED` and `SLOT_STATE_AVATAR_SERVER_MUTED`,
+  // because story 3 R-4 renders the two causes distinctly.
+  reserved 2;
+  reserved "SLOT_STATE_SOURCE_MUTED";
   // RETAINED, NEVER EMITTED: congestion withholding is not built. Consumers
   // fail closed and count (enum header).
   SLOT_STATE_WITHHELD_BY_CONGESTION = 3;
@@ -652,53 +648,11 @@ message JoinResponse {
   // rather than a category -- the log line, not a label.
   uint32 kek_rotation_debounce_seconds = 11;
 
-  // SUPERSEDED -- deleted by MC-B, then reserved by tag and name. Replaced by
-  // the per-kind `max_audio_receive_slots` / `max_video_receive_slots` below:
-  // story 3 caps each kind separately and TRUNCATES an over-cap declaration to
-  // `SLOT_STATE_UNAVAILABLE` rather than rejecting it, so the "rejected WHOLE"
-  // rule below no longer describes MC. Kept, unchanged, until MC-B so nothing
-  // a consumer reads today is removed. From MC-A, MC no longer sets this field
-  // (`MC_MAX_RECEIVE_SLOTS` and its range constants are retired); every
-  // paragraph below, PRESENCE included, describes pre-story-3 MC only. MC-B
-  // removes the field and reserves tag and name.
-  //
-  // MC's cap on the TOTAL number of slots one `ReceiveCapability` declaration
-  // may carry, across all media kinds -- `MC_MAX_RECEIVE_SLOTS`. THE canonical
-  // statement of this field's rules. It is the same
-  // `ClientMediaConfig::max_receive_slots` value MC checks every declaration
-  // against and publishes as `mc_media_receive_slot_cap`. Its legal range is
-  // MC's configuration bound, not restated here:
-  // `crates/mc-service/src/config.rs::MIN_RECEIVE_SLOTS` / `MAX_RECEIVE_SLOTS`.
-  // Never 0 from a conforming MC.
-  //
-  // ADVISORY, NOT AUTHORITY. MC remains the enforcement point: a declaration
-  // exceeding the cap is rejected WHOLE, never clamped and never accepted as a
-  // prefix. A client's local check against this value is a user-experience
-  // pre-check that fails loudly before sending. It MUST NOT replace MC's check,
-  // and a client MUST NOT compute, clamp or shrink its declaration from it --
-  // refuse, never degrade to fewer slots.
-  //
-  // TWO QUANTITIES, NOT A DUPLICATE. The client's declared slot count N is a
-  // REQUEST; this is the bound on it. Same shape as
-  // `EncodingParameters.max_bitrate_bps` versus the client's default bitrate.
-  //
-  // PER SESSION. The value describes the MC instance that served THIS join.
-  // Instances can differ during a configuration rollout, and an ADR-0023
-  // recovery reconnect receives a fresh `JoinResponse`, so a client uses the
-  // latest value it received and never caches one across joins.
-  //
-  // PRESENCE. MC always sets this field, so ABSENT means an older MC (the
-  // supported rollback): the cap is UNKNOWN, and the client declares and relies
-  // on MC's rejection. A client MUST NOT infer a cap and MUST NOT parse the
-  // rejection's message text. A PRESENT 0 is a contract violation, not
-  // absence: a client MUST surface it loudly (log the value, mark it distinct
-  // from "unknown" on its diagnostic surface) and MAY then proceed as if the
-  // cap were unknown. It MUST NOT refuse every declaration locally on it.
-  //
-  // NOT IDENTITY OR KEY MATERIAL. A bounded configuration value: safe to log,
-  // shown in the clear by the redacting `Debug`. OBSERVABILITY: a log value,
-  // never a metric label -- MC already publishes it as a gauge.
-  optional uint32 max_receive_slots = 12;
+  // Was `max_receive_slots`: MC's single cap on the TOTAL slots one
+  // declaration may carry, a declaration over it rejected whole. Deleted by
+  // MC-B; replaced by the per-kind caps below, which TRUNCATE (story 3 R-1).
+  reserved 12;
+  reserved "max_receive_slots";
 
   // MC's per-kind receive-slot caps (story 3 R-1, R-23):
   // `MC_MAX_AUDIO_RECEIVE_SLOTS` and `MC_MAX_VIDEO_RECEIVE_SLOTS`, in MC's own
@@ -715,8 +669,11 @@ message JoinResponse {
   // 0 is LEGAL for either kind (a video cap of 0 disables video, R-26).
   // Absent means an MC that does not send them; the caps are then unknown,
   // which costs a client nothing because truncation is reported per slot.
-  // Per session, as `max_receive_slots`: use the latest received, never cache
-  // across joins.
+  //
+  // PER SESSION. The values describe the MC instance that served THIS join.
+  // Instances can differ during a configuration rollout, and an ADR-0023
+  // recovery reconnect receives a fresh `JoinResponse`, so a client uses the
+  // latest values it received and never caches them across joins.
   //
   // NOT IDENTITY OR KEY MATERIAL: bounded configuration values, safe to log.
   // OBSERVABILITY: log values, never metric labels.
@@ -764,36 +721,37 @@ enum LeaveReason {
 // "Host mute" is deliberately avoided as a term: it presumes a role model this
 // system has not defined.
 //
-// FOUR INDEPENDENT CONTROLS (story 3 R-15, ADR-0036 §5 amendment 2026-10-13):
+// FOUR INDEPENDENT CONTROLS (story 3 R-15, ADR-0036 §5 amendments 2026-10-13
+// and 2026-10-23):
 // client audio, client video, server audio, server video. They compose: a
 // request about one kind never changes the other kind's state, and client and
 // server mute of one kind are independent. Server mute of a kind WITHDRAWS
 // that kind's send directive (capture stops; for video the camera light goes
 // off) AND MH keeps dropping that stream at ingress as the backstop against a
-// patched client. Client mute MAY leave the directive in place, and nothing of
-// that kind leaves the device (no silence, no DTX, no video). Any video mute
-// stops the camera track; an audio client mute keeps the mic open and only
-// stops sending. A server unmute restores capture unless the participant is
+// patched client. The send directive NEVER depends on client mute, which keeps
+// "MC has not asked you to send" distinct from "you muted yourself"; under
+// client mute nothing of that kind leaves the device (no silence, no DTX, no
+// video), and MH learns it as a PAUSED source, never an ingress drop. Any
+// video mute stops the camera track; an audio mute of either cause keeps the
+// mic open and only stops sending. A server unmute restores the directive
+// whatever the client mute, so it resumes capture unless the participant is
 // client-muted (see `ParticipantMuteUpdate` for the notice it requires).
 //
 // PER-KIND FIELDS ARE `optional bool` on both request messages. ABSENT means
-// "that kind is unchanged"; a request with BOTH absent is rejected and
-// counted. TAG-COMPATIBLE BUT NOT SEMANTICS-COMPATIBLE with a pre-optional
-// encoder: a proto3 implicit-presence `bool` omits `false` from the wire, so an
-// old sender's `false` (an unmute) is indistinguishable from absent and reads
-// as "unchanged". Senders MUST set every kind they mean to change, including
-// an explicit `false`.
-//
-// INTERIM UNTIL MC-B (2026-10-20): MC still reads an ABSENT kind as `false` on
-// both messages (`crates/mc-service/src/webtransport/connection.rs`,
-// `handle_mute_request` / `handle_server_mute_request`), so "absent =
-// unchanged" is NOT in force yet. Until MC-B lands, senders MUST set BOTH
-// kinds on every request.
+// "that kind is unchanged"; a request with BOTH absent is refused with a
+// generic message and counted, and changes nothing. TAG-COMPATIBLE BUT NOT
+// SEMANTICS-COMPATIBLE with a pre-optional encoder: a proto3 implicit-presence
+// `bool` omits `false` from the wire, so an old sender's `false` (an unmute)
+// is indistinguishable from absent and reads as "unchanged". Senders MUST set
+// every kind they mean to change, including an explicit `false`.
 
-// Request to update client-mute status (informational, not enforced by MH).
+// Request to update client-mute status.
 //
-// The participant's own client mute, per kind. Absent = unchanged (see the
-// section header for presence rules).
+// The participant's own client mute, per kind. Enforced at capture. MC
+// reflects it to MH as `SOURCE_DISPOSITION_PAUSED` (forward nothing, never an
+// ingress drop) and to holders as `SLOT_STATE_AVATAR_CLIENT_MUTED`; it never
+// changes the send directive. Absent = unchanged; both absent is refused with
+// a generic message and counted (section header).
 message MuteRequest {
   optional bool audio_muted = 1;
   optional bool video_muted = 2;
@@ -813,10 +771,10 @@ message MuteRequest {
 // participant's camera or mic unless the participant is client-muted.
 message ParticipantMuteUpdate {
   string participant_id = 1;
-  bool audio_self_muted = 2; // Informational: participant muted themselves
-  bool video_self_muted = 3; // Informational: participant muted themselves
-  bool audio_server_muted = 4; // Enforced at MH ingress (ADR-0036 §5, §7)
-  bool video_server_muted = 5; // Enforced at MH ingress (ADR-0036 §5, §7)
+  bool audio_self_muted = 2; // Client mute: enforced at capture, PAUSED at MH
+  bool video_self_muted = 3; // Client mute: enforced at capture, PAUSED at MH
+  bool audio_server_muted = 4; // Directive withdrawn + ingress drop (ADR-0036 §5)
+  bool video_server_muted = 5; // Directive withdrawn + ingress drop (ADR-0036 §5)
 
   // Participant id of the actor who applied the server mute, if any.
   //
@@ -826,7 +784,8 @@ message ParticipantMuteUpdate {
 }
 
 // Server-mute request: mute a participant by meeting policy (ADR-0036 §5).
-// Enforced by MC and MH, unlike `MuteRequest`, which the client enforces at
+// Enforced by MC (the kind's send directive is withdrawn) and MH (ingress
+// drop, the backstop), unlike `MuteRequest`, which the client enforces at
 // capture. Renamed from the pre-ADR-0036 `HostMuteRequest`; same message, same
 // tag, no behaviour change.
 //
@@ -834,12 +793,10 @@ message ParticipantMuteUpdate {
 // counted, rate-bounded (story 2 R-8; story 3 R-15 extends it per kind).
 //
 // Per-kind fields are `optional bool` (story 3 R-15; presence rules at the
-// section header). THE DEFECT THIS FIXES: MC's
-// `crates/mc-service/src/media_signaling/outcome.rs::ServerMuteAction::from_request`
-// folds both fields into ONE Mute/Unmute action, so `{audio: true, video:
-// false}` mutes both kinds and `{false, false}` is the only unmute. MC-B
-// replaces it with per-kind actions (absent = unchanged, both absent rejected
-// and counted).
+// section header). Each kind is independent: absent = unchanged, and both
+// absent is refused with the generic message and counted. Before MC-B, MC
+// folded both fields into one mute/unmute action, so a request about one kind
+// could change the other.
 message ServerMuteRequest {
   string participant_id = 1;
   optional bool audio_muted = 2;
@@ -871,7 +828,7 @@ message UnmuteRequest {
   // the host: truncate before logging (256-byte bound, as
   // `MhConnectionStatus.mh_url`), never log unbounded (same register as
   // `ParticipantMuteUpdate.server_muted_by`). Receiving this does NOT lift a
-  // server mute; only the host's ServerMuteRequest with audio_muted=false does
+  // server mute; only the host's ServerMuteRequest with that kind set false does
   // (R-10).
   //
   // Tag 3, not 1 as `participant_id` is on most messages in this file, because
@@ -1019,9 +976,7 @@ message ReceiveCapability {
   // 2026-10-13): MC TRUNCATES each kind to its cap and reports every excess
   // slot `SLOT_STATE_UNAVAILABLE`, never rejecting the declaration for its
   // count; the caps are advertised on `JoinResponse.max_audio_receive_slots`
-  // / `max_video_receive_slots`. (Was: "MC rejects a declaration exceeding
-  // it", against the single `JoinResponse.max_receive_slots`; superseded by
-  // story 3 R-1, which MC enforces from MC-A.)
+  // / `max_video_receive_slots`.
   repeated ReceiveSlot slots = 1;
 }
 
@@ -1132,12 +1087,16 @@ message SendStream {
 
 // What MC directs this client to produce, and where (ADR-0036 §5).
 //
-// CLIENT MUTE MAY STAY DIRECTED: the directive is blind to client mute; the
+// CLIENT MUTE STAYS DIRECTED: the directive NEVER depends on client mute; the
 // client suppresses locally (nothing of that kind leaves the device) and MC
-// MAY leave the instruction in place, which keeps "MC has not asked you to
-// send" distinguishable from "you have muted yourself". SERVER MUTE WITHDRAWS:
-// a server-muted kind's stream is listed with an empty target set (capture
-// stops), with MH's ingress drop as the backstop.
+// leaves the instruction in place, which keeps "MC has not asked you to send"
+// distinguishable from "you have muted yourself". SERVER MUTE WITHDRAWS: a
+// server-muted kind's stream is listed with an empty target set (capture
+// stops), with MH's ingress drop as the backstop; a server unmute restores the
+// targets whatever the client mute.
+//
+// (Tightened 2026-10-23, MC-B: the 2026-10-13 "MAY stay directed" is now
+// "stays directed"; MC's directive builder has no input carrying client mute.)
 //
 // (Corrected 2026-10-13. Was: "MC keeps a send directive active while a
 // client reports itself client-muted ... which is what makes unmute

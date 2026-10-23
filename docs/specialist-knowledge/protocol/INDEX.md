@@ -27,13 +27,13 @@
 - DisconnectReason enum (bounded for metrics)
 
 ## ADR-0036 MC→MH Control Plane (internal.proto, 2026-09-01 reshape)
-All shapes in `internal.proto`. No-key-material rule → its header + `scripts/guards/simple/validate-internal-proto-no-key-material.sh`; server mute → `MutedSource`; teardown → `EndMeetingRequest`
+All shapes in `internal.proto`. No-key-material rule → its header + `scripts/guards/simple/validate-internal-proto-no-key-material.sh`; server mute → `SourceStream.disposition` (`MutedSource` deleted by MC-B); teardown → `EndMeetingRequest`
 - Self-contained forwarding instruction (§6; NOT parallel lists) → `EgressStream`; empty-but-named meeting-level rules → `SelectionRules`
 - `sender_id`-is-meeting-scoped MUST (no global index; malformed rejects, not-yet-connected holds) → `SubscriberSlot`; key-id-pair source ref, not `MediaStream` (§7 type-blind) → `CandidateSource`
 - Output-derived generation, three-"generation" trap list, task-5/6 ordering constraint → `RegisterMeetingRequest.policy_generation`
 - **Applied**-never-received echo, zero=nothing-applied, all-edges-or-none, canonical `outcome` label set → `RegisterMeetingResponse.applied_generation`
-- Story 3: per-stream declarations, dispositions, attribution rule → `SourceStream`/`SourceDisposition`; transitional empty-list + union mute reading → `RegisterMeetingRequest.server_muted_sources`; per-stream echo → `applied_source_streams`; per-kind mute in slot terms (single home) → `MutedSource`
-- UNSPECIFIED echo is a mismatch NOT a skip; expires at video → `.transport_mode`; restart detection, per-process → `.process_start_epoch_ms`
+- Story 3: per-stream declarations, dispositions, attribution rule, per-kind mute in slot terms (single home) → `SourceStream`/`SourceDisposition`; empty `source_streams` with egress = reject (no fallback) → `RegisterMeetingRequest.source_streams`; per-stream echo + UNSPECIFIED-is-a-mismatch rule → `applied_source_streams`; superseded fields deleted + reserved by MC-B (tags: EgressStream 6, RegisterMeetingRequest 7, RegisterMeetingResponse 5, JoinResponse 12, SlotState 2)
+- Restart detection, per-process → `.process_start_epoch_ms`
 - Wire-shape tests + "what these do NOT assert" header → `crates/proto-gen/tests/internal_roundtrip.rs` (shared byte walker `tests/common/mod.rs`); runtime MUSTs → `docs/TODO.md` §Media Path Obligations
 
 ## gRPC Endpoints (server + client per RPC)
@@ -46,7 +46,7 @@ All shapes in `internal.proto`. No-key-material rule → its header + `scripts/g
 
 ## ADR-0036 Media Contract (signaling.proto)
 All message/enum shapes → `proto/dark_tower/signaling/v1/signaling.proto`
-- Vocabulary: `MediaKind`, `Codec` (VP8 = story-3 video), `TransportMode`, `SlotState` (flat enum; ZERO_REQUESTED reserved, SOURCE_MUTED superseded, retained-never-emitted fail closed)
+- Vocabulary: `MediaKind`, `Codec` (VP8 = story-3 video), `TransportMode`, `SlotState` (flat enum; ZERO_REQUESTED and SOURCE_MUTED reserved by value and name (SOURCE_MUTED = 2, deleted by MC-B); retained-never-emitted values fail closed)
 - Receive capability, per-slot optional pin, slot-id scoping → `ReceiveCapability`/`ReceiveSlot`
 - Send directive (transport mode, NOT §7 priority group) → `SendDirective`/`SendTarget`
 - Slot assignment, attribution chain, switch-pending command id → `StreamAssignment`

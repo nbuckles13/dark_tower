@@ -334,7 +334,7 @@ pub struct Config {
     /// live vectors are never re-truncated. Bounded at load: audio
     /// [`MIN_AUDIO_RECEIVE_SLOTS`]`..=`[`MAX_AUDIO_RECEIVE_SLOTS`], video
     /// [`MIN_VIDEO_RECEIVE_SLOTS`]`..=`[`MAX_VIDEO_RECEIVE_SLOTS`] (0 = video off).
-    pub max_receive_slots: [u8; 2],
+    pub receive_slot_caps: [u8; 2],
 
     /// Connect settle window in milliseconds (`MC_MEDIA_CONNECT_SETTLE_MS`).
     ///
@@ -425,7 +425,7 @@ impl fmt::Debug for Config {
             .field("otel_endpoint", &self.otel_endpoint)
             .field("otel_sample_rate", &self.otel_sample_rate)
             .field("environment", &self.environment)
-            .field("max_receive_slots", &self.max_receive_slots)
+            .field("receive_slot_caps", &self.receive_slot_caps)
             .field("media_connect_settle_ms", &self.media_connect_settle_ms)
             .field(
                 "kek_rotation_debounce_seconds",
@@ -686,7 +686,7 @@ impl Config {
             MIN_VIDEO_RECEIVE_SLOTS,
             MAX_VIDEO_RECEIVE_SLOTS,
         )?;
-        let max_receive_slots = [max_audio_receive_slots, max_video_receive_slots];
+        let receive_slot_caps = [max_audio_receive_slots, max_video_receive_slots];
 
         // ADR-0036 §9 connect settle window. Required and bounded on both
         // sides: too short stops it working, too long silently delays audio.
@@ -903,7 +903,7 @@ impl Config {
             otel_endpoint,
             otel_sample_rate,
             environment,
-            max_receive_slots,
+            receive_slot_caps,
             media_connect_settle_ms,
             kek_rotation_debounce_seconds,
             max_receive_capability_declarations,
@@ -920,7 +920,7 @@ impl Config {
     #[must_use]
     pub fn client_media_config(&self) -> crate::media_signaling::ClientMediaConfig {
         crate::media_signaling::ClientMediaConfig {
-            max_receive_slots: self.max_receive_slots,
+            receive_slot_caps: self.receive_slot_caps,
             max_receive_capability_declarations: self.max_receive_capability_declarations,
             audio_encoding: self.audio_encoding,
             video_encoding: self.video_encoding,
@@ -1289,7 +1289,7 @@ mod tests {
         );
 
         let config = Config::from_vars(&vars).expect("in-range values load");
-        assert_eq!(config.max_receive_slots, [3, 0]);
+        assert_eq!(config.receive_slot_caps, [3, 0]);
         assert_eq!(config.max_receive_capability_declarations, 7);
         assert_eq!(config.audio_encoding.max_bitrate_bps(), 32_000);
         assert_eq!(config.audio_encoding.frame_rate_hz(), 25);
@@ -1307,7 +1307,7 @@ mod tests {
         assert_eq!(v.codec(), proto_gen::dark_tower::signaling::v1::Codec::Vp8);
 
         let projected = config.client_media_config();
-        assert_eq!(projected.max_receive_slots, [3, 0]);
+        assert_eq!(projected.receive_slot_caps, [3, 0]);
         assert_eq!(projected.max_receive_capability_declarations, 7);
         assert_eq!(projected.audio_encoding, config.audio_encoding);
         assert_eq!(projected.video_encoding, config.video_encoding);

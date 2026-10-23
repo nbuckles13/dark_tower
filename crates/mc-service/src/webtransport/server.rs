@@ -104,7 +104,7 @@ impl WebTransportServer {
         // and advertised caps are one value. Video reading 0 is the operator's
         // confirmation that the R-26 video-off lever applied.
         for kind in MediaKindLabel::ALL {
-            metrics::set_receive_slot_cap(kind, kind.of(client_media_config.max_receive_slots));
+            metrics::set_receive_slot_cap(kind, kind.of(client_media_config.receive_slot_caps));
         }
         // The directed minimum keyframe interval, from the SAME validated
         // `VideoEncoding` the video directive carries.

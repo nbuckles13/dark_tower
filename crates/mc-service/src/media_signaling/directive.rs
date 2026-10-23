@@ -1,24 +1,42 @@
 //! What MC directs a client to **produce** (ADR-0036 §5).
 //!
-//! # This module has no path to mute state, and that is the point
+//! # Server mute and watch state, never client mute
 //!
-//! ADR-0036 §5: *"MC keeps the send directive active while a client reports
-//! itself muted. The client suppresses locally; MC does not withdraw the
-//! instruction."* That is what makes unmute instantaneous, and what keeps
-//! *"MC has not asked you to send"* and *"you have muted yourself"* from
-//! collapsing into one state.
+//! The directive depends on exactly two things about a publisher's stream:
+//! whether anyone WATCHES it (its rendered out-edges) and whether its kind is
+//! SERVER-muted. Either one empties the stream's targets -- a withdrawal, never
+//! a removal (ADR-0036 §5, amendment 2026-10-23; story 3 R-8, R-16).
 //!
-//! Nothing in this module takes, holds, reads, or can reach a mute flag.
-//! [`build_send_directive`] has no mute parameter, and there is no import here
-//! through which one could arrive. A mute/unmute cycle altering the directive is
-//! therefore a **compile error**, not a test failure — the invariant is enforced
-//! by the module boundary rather than by a comment asking the next author not to
-//! do it. Mute lives entirely in [`super::assignments`], where it belongs: it
-//! changes what a *subscriber is told about a source*, never what a *publisher
-//! is told to produce*.
+//! It NEVER depends on CLIENT mute. That keeps *"MC has not asked you to send"*
+//! distinct from *"you have muted yourself"*, and makes resuming from a client
+//! mute a purely local decision with no round trip. The invariant is
+//! structural, not a comment: [`build_send_directive`]'s only mute input is a
+//! [`ServerMutedKinds`], a type DISTINCT from the roster's
+//! [`crate::media_kind::ClientMutedKinds`], with no conversion between them, and
+//! nothing here imports the roster's combined mute projection. A client
+//! mute/unmute cycle altering a directive is therefore a **compile error**:
 //!
-//! If you find yourself needing mute state here, the change you want is in
-//! `assignments`.
+//! ```compile_fail
+//! use mc_service::media_kind::ClientMutedKinds;
+//! use mc_service::media_signaling::directive::build_send_directive;
+//! fn takes_server_mute<A, B, C, D, E, R>(_f: impl Fn(A, B, C, D, E, ClientMutedKinds) -> R) {}
+//! takes_server_mute(build_send_directive);
+//! ```
+//!
+//! The positive control below is byte-identical except for that one type, so
+//! the `compile_fail` above fails for the type and nothing else:
+//!
+//! ```
+//! use mc_service::media_kind::ServerMutedKinds;
+//! use mc_service::media_signaling::directive::build_send_directive;
+//! fn takes_server_mute<A, B, C, D, E, R>(_f: impl Fn(A, B, C, D, E, ServerMutedKinds) -> R) {}
+//! takes_server_mute(build_send_directive);
+//! ```
+//!
+//! Client mute lives in [`super::assignments`] (what a *subscriber is told
+//! about a source*) and in the MH disposition (PAUSED), never in what a
+//! *publisher is told to produce*. If you find yourself needing client-mute
+//! state here, the change you want is in `assignments`.
 //!
 //! # No priority group
 //!
@@ -32,7 +50,7 @@
 
 use super::outcome::{DirectiveOutcome, MediaKindLabel};
 use crate::media_admission::SenderId;
-use crate::media_kind::PublishSet;
+use crate::media_kind::{PublishSet, ServerMutedKinds};
 use crate::media_routing::assignment::{stream_number_of, transport_of};
 use crate::media_routing::{HandlerId, MeetingAssignment, MeetingHandlers};
 use media_protocol::frame::PROTOCOL_VERSION;
@@ -616,6 +634,15 @@ fn header_version() -> u32 {
 /// is its stream's kind's ([`transport_of`]): datagrams for audio,
 /// stream-per-group for video.
 ///
+/// # A server-muted kind is withdrawn
+///
+/// A kind in `server_muted` is listed with EMPTY targets whatever its edges
+/// (which stay rendered, DROP_AT_INGRESS, so MH counts a patched client's
+/// frames as `server_muted` drops): capture stops, and for video the camera
+/// light goes off (story 3 R-16). Lifting it restores the targets in the same
+/// structural change, whatever the client mute -- there is no client-mute
+/// input (module doc).
+///
 /// The third element is each stream's `media_kind` metric label, PARALLEL to
 /// `SendDirective.streams` (same length, same order).
 ///
@@ -630,6 +657,7 @@ pub fn build_send_directive(
     assignment: &MeetingAssignment,
     meeting_handlers: &MeetingHandlers,
     policy: &MediaStreamPolicy,
+    server_muted: ServerMutedKinds,
 ) -> Result<(SendDirective, DirectiveOutcome, Vec<MediaKindLabel>), DirectiveOutcome> {
     // kind -> owning handlers, ordered so an unchanged meeting produces an
     // unchanged directive (byte-identical output for unchanged input).
@@ -655,9 +683,12 @@ pub fn build_send_directive(
         if transport_mode == TransportMode::Unspecified {
             return Err(DirectiveOutcome::TransportModeUnspecified);
         }
+        // A server-muted kind is withdrawn: its edges stay (DROP_AT_INGRESS at
+        // MH), but the publisher is told to send it nowhere.
+        let withdrawn = server_muted.is_muted(kind);
         let handlers = kind.of_ref(&owners);
         let mut targets = Vec::with_capacity(handlers.len());
-        for handler in handlers {
+        for handler in handlers.iter().filter(|_| !withdrawn) {
             let Some(url) = meeting_handlers.url_of(handler) else {
                 // Fail loud rather than emit a target with an empty url.
                 return Err(DirectiveOutcome::HandlerUrlUnresolved);
@@ -770,8 +801,15 @@ mod tests {
     #[test]
     fn a_held_publisher_is_directed_to_one_audio_stream_on_one_datagram_target() {
         let (assignment, urls) = two_party(&["mh-0"]);
-        let (directive, outcome, stream_kinds) =
-            build_send_directive(sender(1), a(), &assignment, &urls, &policy()).unwrap();
+        let (directive, outcome, stream_kinds) = build_send_directive(
+            sender(1),
+            a(),
+            &assignment,
+            &urls,
+            &policy(),
+            ServerMutedKinds::NONE,
+        )
+        .unwrap();
         assert_eq!(outcome, DirectiveOutcome::Emitted);
         assert_eq!(directive.header_version, u32::from(PROTOCOL_VERSION));
         assert_eq!(directive.streams.len(), 1);
@@ -801,8 +839,15 @@ mod tests {
     #[test]
     fn an_unwatched_publisher_lists_its_stream_with_empty_targets() {
         let (assignment, urls) = two_party(&["mh-0"]);
-        let (directive, outcome, kinds) =
-            build_send_directive(sender(9), a(), &assignment, &urls, &policy()).unwrap();
+        let (directive, outcome, kinds) = build_send_directive(
+            sender(9),
+            a(),
+            &assignment,
+            &urls,
+            &policy(),
+            ServerMutedKinds::NONE,
+        )
+        .unwrap();
         assert_eq!(outcome, DirectiveOutcome::EmittedEmptyTargets);
         assert!(outcome.is_success());
         assert_eq!(directive.streams.len(), 1);
@@ -830,8 +875,15 @@ mod tests {
                 ],
             ),
         ] {
-            let (directive, _, kinds) =
-                build_send_directive(sender(9), set, &assignment, &urls, &policy()).unwrap();
+            let (directive, _, kinds) = build_send_directive(
+                sender(9),
+                set,
+                &assignment,
+                &urls,
+                &policy(),
+                ServerMutedKinds::NONE,
+            )
+            .unwrap();
             let got: Vec<(u32, i32)> = directive
                 .streams
                 .iter()
@@ -853,8 +905,15 @@ mod tests {
         table.admit_on_publishing(sender(2), av(), &set, &["mh-0"]);
         table.set_demand(sender(2), [vec![0], vec![1]]);
         let assignment = table.render(set.ids(), &table.quiet_mute()).unwrap();
-        let (directive, outcome, kinds) =
-            build_send_directive(sender(1), av(), &assignment, &set, &policy()).unwrap();
+        let (directive, outcome, kinds) = build_send_directive(
+            sender(1),
+            av(),
+            &assignment,
+            &set,
+            &policy(),
+            ServerMutedKinds::NONE,
+        )
+        .unwrap();
         assert_eq!(outcome, DirectiveOutcome::Emitted);
         assert_eq!(kinds, vec![AU, VI]);
         let v = &directive.streams[1];
@@ -879,6 +938,136 @@ mod tests {
         );
     }
 
+    /// Two A/V publishers on one handler, each watching the other on one
+    /// audio and one video slot, rendered under `mute` for sender 1.
+    fn watched_av(
+        mute_of_1: crate::media_routing::SourceMute,
+    ) -> (MeetingAssignment, MeetingHandlers) {
+        let set = handler_set(&["mh-0"]);
+        let mut table = SlotTable::new();
+        table.admit_on_publishing(sender(1), av(), &set, &["mh-0"]);
+        table.admit_on_publishing(sender(2), av(), &set, &["mh-0"]);
+        table.set_demand(sender(1), [vec![0], vec![1]]);
+        table.set_demand(sender(2), [vec![0], vec![1]]);
+        let mute =
+            crate::media_routing::SourceMuteView::from_map(std::collections::HashMap::from([
+                (sender(1), mute_of_1),
+                (sender(2), crate::media_routing::SourceMute::default()),
+            ]));
+        (table.render(set.ids(), &mute).unwrap(), set)
+    }
+
+    /// R-16: a server-muted kind is listed with EMPTY targets (encoding and
+    /// stream number intact) while its edges stay rendered, and the OTHER
+    /// kind's stream is byte-identical to the unmuted directive -- for each
+    /// kind. Lifting the mute restores the targets.
+    #[test]
+    fn a_server_muted_kind_is_withdrawn_and_the_other_kind_is_untouched() {
+        use crate::media_routing::SourceMute;
+        for kind in [AU, VI] {
+            let muted_flags = kind.pick([true, false], [false, true]);
+            let (assignment, set) = watched_av(SourceMute::from_flags(muted_flags, [false; 2]));
+            let (unmuted, _, _) = build_send_directive(
+                sender(1),
+                av(),
+                &assignment,
+                &set,
+                &policy(),
+                ServerMutedKinds::NONE,
+            )
+            .unwrap();
+            let (muted, outcome, kinds) = build_send_directive(
+                sender(1),
+                av(),
+                &assignment,
+                &set,
+                &policy(),
+                ServerMutedKinds::from_server_flags(muted_flags),
+            )
+            .unwrap();
+            assert_eq!(kinds, vec![AU, VI]);
+            assert_eq!(
+                outcome,
+                DirectiveOutcome::Emitted,
+                "the other kind still has a target"
+            );
+            let (k, other) = (kind.index(), kind.other().index());
+            assert!(muted.streams[k].targets.is_empty(), "{kind:?} withdrawn");
+            assert!(!unmuted.streams[k].targets.is_empty(), "{kind:?} watched");
+            assert_eq!(
+                muted.streams[k].stream_number,
+                unmuted.streams[k].stream_number
+            );
+            assert_eq!(muted.streams[k].encoding, unmuted.streams[k].encoding);
+            assert_eq!(
+                muted.streams[other], unmuted.streams[other],
+                "the other kind is byte-identical"
+            );
+            // The edge is KEPT (DROP_AT_INGRESS at MH), so the withdrawal is the
+            // input's doing, not an unwatched stream's.
+            assert!(assignment
+                .for_handler(&HandlerId::new("mh-0"))
+                .unwrap()
+                .egress_streams
+                .iter()
+                .any(|p| p.candidate_sources.contains(&sender(1))
+                    && p.stream_number == stream_number_of(kind)));
+        }
+    }
+
+    /// Server-muting BOTH kinds empties every target: still a success, the
+    /// specified "send nothing".
+    #[test]
+    fn server_muting_both_kinds_emits_empty_targets_on_both_streams() {
+        let (assignment, set) = watched_av(crate::media_routing::SourceMute::from_flags(
+            [true; 2], [false; 2],
+        ));
+        let (directive, outcome, _) = build_send_directive(
+            sender(1),
+            av(),
+            &assignment,
+            &set,
+            &policy(),
+            ServerMutedKinds::from_server_flags([true; 2]),
+        )
+        .unwrap();
+        assert_eq!(outcome, DirectiveOutcome::EmittedEmptyTargets);
+        assert!(directive.streams.iter().all(|s| s.targets.is_empty()));
+    }
+
+    /// ADR-0036 §5: CLIENT mute never alters the directive. The render under
+    /// client mute differs (PAUSED dispositions), yet the directive built from
+    /// it is byte-identical to the unmuted one -- for every client-mute
+    /// combination, server mute off.
+    #[test]
+    fn a_client_mute_flip_leaves_the_directive_byte_identical() {
+        use crate::media_routing::SourceMute;
+        let (quiet, set) = watched_av(SourceMute::default());
+        let (baseline, _, _) = build_send_directive(
+            sender(1),
+            av(),
+            &quiet,
+            &set,
+            &policy(),
+            ServerMutedKinds::NONE,
+        )
+        .unwrap();
+        for client in [[true, false], [false, true], [true, true]] {
+            let (paused, _) = watched_av(SourceMute::from_flags([false; 2], client));
+            assert_ne!(paused, quiet, "the render did change (PAUSED)");
+            let (directive, _, _) = build_send_directive(
+                sender(1),
+                av(),
+                &paused,
+                &set,
+                &policy(),
+                ServerMutedKinds::NONE,
+            )
+            .unwrap();
+            assert_eq!(directive, baseline, "client mute {client:?}");
+        }
+    }
+
     /// A video publisher held only in a placeholder sense (nobody declares
     /// video) has its video stream listed with EMPTY targets: unwatched.
     #[test]
@@ -889,8 +1078,15 @@ mod tests {
         table.admit_on_publishing(sender(2), av(), &set, &["mh-0"]);
         table.set_demand(sender(2), [vec![0], vec![]]);
         let assignment = table.render(set.ids(), &table.quiet_mute()).unwrap();
-        let (directive, _, _) =
-            build_send_directive(sender(1), av(), &assignment, &set, &policy()).unwrap();
+        let (directive, _, _) = build_send_directive(
+            sender(1),
+            av(),
+            &assignment,
+            &set,
+            &policy(),
+            ServerMutedKinds::NONE,
+        )
+        .unwrap();
         assert!(!directive.streams[0].targets.is_empty(), "audio watched");
         assert!(
             directive.streams[1].targets.is_empty(),
@@ -907,6 +1103,7 @@ mod tests {
             &assignment,
             &handler_set(&["mh-9"]),
             &policy(),
+            ServerMutedKinds::NONE,
         );
         assert_eq!(outcome, Err(DirectiveOutcome::HandlerUrlUnresolved));
     }
@@ -914,8 +1111,15 @@ mod tests {
     #[test]
     fn the_directive_carries_no_priority_group() {
         let (assignment, urls) = two_party(&["mh-0"]);
-        let (directive, _, _) =
-            build_send_directive(sender(1), a(), &assignment, &urls, &policy()).unwrap();
+        let (directive, _, _) = build_send_directive(
+            sender(1),
+            a(),
+            &assignment,
+            &urls,
+            &policy(),
+            ServerMutedKinds::NONE,
+        )
+        .unwrap();
         assert!(!format!("{directive:?}").contains("priority"));
     }
 
@@ -972,7 +1176,8 @@ mod tests {
                 av(),
                 &assignment,
                 &handler_set(&["mh-0"]),
-                &policy()
+                &policy(),
+                ServerMutedKinds::NONE
             ),
             Err(DirectiveOutcome::UnknownStreamNumber)
         );
@@ -1084,10 +1289,24 @@ mod tests {
     fn the_directive_is_byte_identical_for_unchanged_input() {
         use prost::Message;
         let (assignment, urls) = two_party(&["mh-1", "mh-0", "mh-2"]);
-        let (x, _, _) =
-            build_send_directive(sender(1), av(), &assignment, &urls, &policy()).unwrap();
-        let (y, _, _) =
-            build_send_directive(sender(1), av(), &assignment, &urls, &policy()).unwrap();
+        let (x, _, _) = build_send_directive(
+            sender(1),
+            av(),
+            &assignment,
+            &urls,
+            &policy(),
+            ServerMutedKinds::NONE,
+        )
+        .unwrap();
+        let (y, _, _) = build_send_directive(
+            sender(1),
+            av(),
+            &assignment,
+            &urls,
+            &policy(),
+            ServerMutedKinds::NONE,
+        )
+        .unwrap();
         assert_eq!(x.encode_to_vec(), y.encode_to_vec());
     }
 
@@ -1096,8 +1315,15 @@ mod tests {
     #[test]
     fn the_directive_targets_exactly_the_handlers_carrying_this_publishers_edges() {
         let (assignment, urls) = two_party(&["mh-0", "mh-1"]);
-        let (directive, outcome, _) =
-            build_send_directive(sender(1), a(), &assignment, &urls, &policy()).unwrap();
+        let (directive, outcome, _) = build_send_directive(
+            sender(1),
+            a(),
+            &assignment,
+            &urls,
+            &policy(),
+            ServerMutedKinds::NONE,
+        )
+        .unwrap();
         assert_eq!(outcome, DirectiveOutcome::Emitted);
         let targets: Vec<&str> = directive.streams[0]
             .targets
@@ -1124,6 +1350,7 @@ mod tests {
             &table.render(set.ids(), &table.quiet_mute()).unwrap(),
             &set,
             &policy(),
+            ServerMutedKinds::NONE,
         )
         .unwrap();
         assert_eq!(directive.streams.len(), 1);

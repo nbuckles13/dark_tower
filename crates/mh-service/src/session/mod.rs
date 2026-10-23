@@ -1811,7 +1811,7 @@ impl SessionManagerHandle {
     /// still answerable when the actor is wedged.
     ///
     /// **This is the single source for `RegisterMeetingResponse`'s
-    /// `applied_generation` and `transport_mode`.** ADR-0036 §8: an implementer
+    /// `applied_generation` and `applied_source_streams`.** ADR-0036 §8: an implementer
     /// who writes `applied_generation: req.policy_generation` "has deleted the
     /// feature while leaving the field". Sourcing both from here means the
     /// received generation is not merely forbidden as an answer — it is not in

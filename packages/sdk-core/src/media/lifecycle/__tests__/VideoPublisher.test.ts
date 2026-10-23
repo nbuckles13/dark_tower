@@ -22,7 +22,7 @@ import type {
   VideoEncoderSeamOptions,
 } from '../../setup/seams.js';
 import type { MediaFault } from '../AudioPipeline.js';
-import { MuteState, type MuteSnapshot } from '../muteState.js';
+import { MuteState } from '../muteState.js';
 import { TransmitKeyManager } from '../transmitKeys.js';
 import { VideoPublisher, type VideoSendDirective } from '../VideoPublisher.js';
 import { uplinkRelayStreamId } from '../../pipeline/sendId.js';
@@ -124,7 +124,7 @@ async function makeRig(opts: RigOptions = {}) {
   const encodeQueue = { size: 0 };
   let encoderOptions: VideoEncoderSeamOptions | undefined;
   let encodersBuilt = 0;
-  const reports: MuteSnapshot[] = [];
+  const reports: Array<{ kind: string; muted: boolean }> = [];
   const faults: MediaFault[] = [];
   const transmitKeys = new TransmitKeyManager(258);
   const publisher = new VideoPublisher({
@@ -135,7 +135,7 @@ async function makeRig(opts: RigOptions = {}) {
     kek: kekHolderWith(new Uint8Array(AES_256_KEY_BYTES).fill(0x33), 0),
     identity: await MeetingIdentity.create(),
     mute,
-    reportMute: (s) => reports.push(s),
+    reportMute: (kind, muted) => reports.push({ kind, muted }),
     onMuteChanged: () => undefined,
     captureFactory: async (o) => {
       captureCalls.push({ deviceId: o.deviceId, width: o.width });
@@ -276,7 +276,9 @@ describe('VideoPublisher — the camera follows the directive and mute (R-16, R-
     r.publisher.start();
     r.publisher.setMuted(true);
     expect(r.mute.audioMuted).toBe(false);
-    expect(r.reports.at(-1)).toEqual({ audioMuted: false, videoMuted: true });
+    // ONE kind per report: video only; audio is never named.
+    expect(r.reports.at(-1)).toEqual({ kind: 'video', muted: true });
+    expect(r.reports.every((x) => x.kind === 'video')).toBe(true);
   });
 
   it('a re-sent directive with IDENTICAL video targets keys nothing and touches no camera (e.g. only audio changed)', async () => {
@@ -472,7 +474,8 @@ describe('VideoPublisher — R-19 camera failure', () => {
       expect(
         r.count('dt_client_media_capture_failures_total', { outcome: 'permission_denied' }),
       ).toBe(1);
-      expect(r.reports.at(-1)).toEqual({ audioMuted, videoMuted: true });
+      expect(r.reports.at(-1)).toEqual({ kind: 'video', muted: true });
+      expect(r.mute.audioMuted).toBe(audioMuted);
       expect(r.faults.map((f) => f.stage)).toEqual(['capture']);
       // Watcher churn: N restore edges, ZERO further getUserMedia calls.
       for (let i = 0; i < 5; i += 1) {
@@ -508,7 +511,7 @@ describe('VideoPublisher — R-19 camera failure', () => {
     expect(r.captureCalls).toHaveLength(2);
     // Lifted only once the track is live.
     expect(r.mute.videoMuted).toBe(false);
-    expect(r.reports.at(-1)).toEqual({ audioMuted: false, videoMuted: false });
+    expect(r.reports.at(-1)).toEqual({ kind: 'video', muted: false });
   });
 });
 

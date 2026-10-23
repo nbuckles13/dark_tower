@@ -88,7 +88,7 @@ impl std::error::Error for SenderIdSpaceExhausted {}
 /// per-frame log dimension.
 ///
 /// `Ord` exists so a set of sender ids has ONE canonical order: the per-handler
-/// server-muted set rides the forwarding snapshot, and the policy generation is
+/// `source_streams` set rides the forwarding snapshot, and the policy generation is
 /// derived from that snapshot's structural equality, so an unordered set would
 /// make two renders of the same state compare unequal. The order carries no
 /// meaning beyond that.

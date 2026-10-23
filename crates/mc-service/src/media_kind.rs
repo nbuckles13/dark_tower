@@ -251,6 +251,161 @@ impl PublishSet {
     }
 }
 
+/// A source's SERVER-mute flags, per kind (story 3 R-16). One of the two
+/// halves of `media_routing::SourceMute`, and a DISTINCT TYPE from
+/// [`ClientMutedKinds`] on purpose: `media_signaling::directive::build_send_directive`
+/// takes THIS type, so handing it the client-mute flags is a type error, not a
+/// review comment (ADR-0036 §5: the directive never depends on client mute).
+/// Converting one into the other requires an explicit, visible construction --
+/// there is no `From` between them, and there must never be one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ServerMutedKinds([bool; 2]);
+
+impl ServerMutedKinds {
+    /// Server-muted on neither kind.
+    pub const NONE: Self = Self([false; 2]);
+
+    /// From the roster's per-kind server-mute flags (`audio_server_muted`,
+    /// `video_server_muted`), laid out by [`MediaKindLabel::index`].
+    #[must_use]
+    pub const fn from_server_flags(flags: [bool; 2]) -> Self {
+        Self(flags)
+    }
+
+    /// Is `kind` server-muted?
+    #[must_use]
+    pub fn is_muted(self, kind: MediaKindLabel) -> bool {
+        kind.of(self.0)
+    }
+}
+
+/// A source's CLIENT-mute flags, per kind (story 3 R-17). See
+/// [`ServerMutedKinds`] for why the two are distinct types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClientMutedKinds([bool; 2]);
+
+impl ClientMutedKinds {
+    /// Client-muted on neither kind.
+    pub const NONE: Self = Self([false; 2]);
+
+    /// From the roster's per-kind self-mute flags (`audio_self_muted`,
+    /// `video_self_muted`), laid out by [`MediaKindLabel::index`].
+    #[must_use]
+    pub const fn from_client_flags(flags: [bool; 2]) -> Self {
+        Self(flags)
+    }
+
+    /// Is `kind` client-muted?
+    #[must_use]
+    pub fn is_muted(self, kind: MediaKindLabel) -> bool {
+        kind.of(self.0)
+    }
+}
+
+/// One mute request's per-kind ask (story 3 R-15, R-17): for each kind, `None`
+/// (ABSENT on the wire: that kind is UNCHANGED) or `Some(muted)`.
+///
+/// THE ONE PARSER for both `MuteRequest` (client mute) and `ServerMuteRequest`
+/// (server mute): both connection paths build one with [`Self::parse`] and hand
+/// it, as-is, to the meeting actor, which merges it against the ROSTER (never
+/// against a connection cache) with [`Self::apply`].
+///
+/// A request naming NO kind is unrepresentable: [`Self::parse`] is the only
+/// constructor and refuses it ([`NoKindNamed`]), so the actor can never be
+/// handed one. Bools only -- no identity, no key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MuteChange([Option<bool>; 2]);
+
+/// A mute request that names no kind: both per-kind fields absent. Refused
+/// with a generic client message and counted on the kind-free
+/// `mc_media_mute_requests_rejected_total{reason="no_kind_named"}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoKindNamed;
+
+impl std::fmt::Display for NoKindNamed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("mute request names no media kind (both per-kind fields absent)")
+    }
+}
+
+impl std::error::Error for NoKindNamed {}
+
+impl MuteChange {
+    /// Parse the wire's two `optional bool` fields.
+    ///
+    /// # Errors
+    ///
+    /// [`NoKindNamed`] when both are absent.
+    pub fn parse(audio: Option<bool>, video: Option<bool>) -> Result<Self, NoKindNamed> {
+        if audio.is_none() && video.is_none() {
+            return Err(NoKindNamed);
+        }
+        Ok(Self(MediaKindLabel::per_kind(|k| k.pick(audio, video))))
+    }
+
+    /// What this request asks of `kind`: `None` means unchanged.
+    #[must_use]
+    pub fn get(self, kind: MediaKindLabel) -> Option<bool> {
+        kind.of(self.0)
+    }
+
+    /// The kinds this request NAMES, each with its asked-for value, in
+    /// [`MediaKindLabel::ALL`] order -- the counting unit of the per-kind mute
+    /// counters (one increment per named kind). Never empty.
+    pub fn named(self) -> impl Iterator<Item = (MediaKindLabel, bool)> {
+        MediaKindLabel::ALL
+            .into_iter()
+            .filter_map(move |k| self.get(k).map(|muted| (k, muted)))
+    }
+
+    /// Merge this request into `current` (per kind, laid out by
+    /// [`MediaKindLabel::index`]): a named kind takes its asked-for value, an
+    /// unnamed kind keeps its current value. The ONE merge both mute writers
+    /// use, so "a request about one kind never changes the other" is a property
+    /// of this function.
+    #[must_use]
+    pub fn apply(self, current: [bool; 2]) -> KindDecision {
+        let state = MediaKindLabel::per_kind(|k| self.get(k).unwrap_or(k.of(current)));
+        KindDecision {
+            changed: MediaKindLabel::per_kind(|k| k.of(state) != k.of(current)),
+            state,
+        }
+    }
+}
+
+/// The outcome of merging one [`MuteChange`] into a participant's flags, PER
+/// KIND: whether each kind moved, and each kind's resulting state. The ONE
+/// decision shape for client and server mute (it feeds the per-kind
+/// `applied`/`unchanged` outcome of both mute counters).
+///
+/// Constructible only by [`MuteChange::apply`]; read through kind-keyed
+/// accessors, so no caller can mis-index audio and video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KindDecision {
+    changed: [bool; 2],
+    state: [bool; 2],
+}
+
+impl KindDecision {
+    /// Did `kind`'s flag move?
+    #[must_use]
+    pub fn changed(self, kind: MediaKindLabel) -> bool {
+        kind.of(self.changed)
+    }
+
+    /// `kind`'s flag after the merge.
+    #[must_use]
+    pub fn state(self, kind: MediaKindLabel) -> bool {
+        kind.of(self.state)
+    }
+
+    /// Neither kind moved: a no-op (nothing broadcast, rendered or pushed).
+    #[must_use]
+    pub fn is_unchanged(self) -> bool {
+        !self.changed.contains(&true)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -315,5 +470,62 @@ mod tests {
             assert_ne!(k.other(), k);
         }
         assert_eq!(pair, [11, 21]);
+    }
+
+    const AU: MediaKindLabel = MediaKindLabel::Audio;
+    const VI: MediaKindLabel = MediaKindLabel::Video;
+
+    /// R-15/R-17 parsing: an absent field is UNCHANGED, a present one (true or
+    /// false) is named, and a request naming neither kind is refused.
+    #[test]
+    fn mute_change_names_only_present_kinds_and_refuses_both_absent() {
+        assert_eq!(MuteChange::parse(None, None), Err(NoKindNamed));
+
+        let audio_only = MuteChange::parse(Some(true), None).unwrap();
+        assert_eq!(audio_only.get(AU), Some(true));
+        assert_eq!(audio_only.get(VI), None);
+        assert_eq!(audio_only.named().collect::<Vec<_>>(), vec![(AU, true)]);
+
+        // An explicit `false` is an unmute, never "unchanged".
+        let video_unmute = MuteChange::parse(None, Some(false)).unwrap();
+        assert_eq!(video_unmute.named().collect::<Vec<_>>(), vec![(VI, false)]);
+
+        let both = MuteChange::parse(Some(false), Some(true)).unwrap();
+        assert_eq!(
+            both.named().collect::<Vec<_>>(),
+            vec![(AU, false), (VI, true)]
+        );
+    }
+
+    /// A request about one kind NEVER changes the other kind, from every
+    /// starting state.
+    #[test]
+    fn applying_one_kind_leaves_the_other_untouched_from_every_state() {
+        for current in [[false, false], [true, false], [false, true], [true, true]] {
+            for asked in [true, false] {
+                for kind in MediaKindLabel::ALL {
+                    let change = MuteChange::parse(
+                        kind.pick(Some(asked), None),
+                        kind.pick(None, Some(asked)),
+                    )
+                    .unwrap();
+                    let d = change.apply(current);
+                    assert_eq!(d.state(kind), asked);
+                    assert_eq!(d.changed(kind), kind.of(current) != asked);
+                    let other = kind.other();
+                    assert_eq!(d.state(other), other.of(current), "{current:?} {kind:?}");
+                    assert!(!d.changed(other));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_repeat_is_unchanged_and_a_move_is_not() {
+        let mute_both = MuteChange::parse(Some(true), Some(true)).unwrap();
+        assert!(mute_both.apply([true, true]).is_unchanged());
+        let d = mute_both.apply([true, false]);
+        assert!(!d.is_unchanged());
+        assert!(!d.changed(AU) && d.changed(VI));
     }
 }

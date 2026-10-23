@@ -366,15 +366,16 @@ fn re_pushes_preserve_the_downlink_hop_sequence() {
     send_and_check(&mut rig, 6);
 }
 
-// -- the transitional reading ------------------------------------------------------
+// -- an audio-only (story-2-shaped) meeting, declared -----------------------------
 
-/// Story-2 behaviour through the transitional reading (no `source_streams`):
-/// label 0 forwards, any other label is unmatched, a muted sender drops
-/// server_muted.
+/// A story-2-shaped audio-only meeting, now always DECLARED (MC-B deleted the
+/// transitional reading): the publisher's declared label 0 forwards, any other
+/// label is unmatched, and a sender whose every declared stream is
+/// DROP_AT_INGRESS drops `server_muted` whatever label it stamps.
 #[test]
-fn the_transitional_reading_reproduces_story_2_and_rejects_other_labels() {
+fn an_audio_only_declared_meeting_forwards_label_0_and_rejects_other_labels() {
     use mh_test_utils::media_policy::{egress, register_request, register_request_muted};
-    let legacy = register_request(
+    let audio_only = register_request(
         MEETING,
         1,
         vec![egress(AUDIO_EDGE, SUB, u32::from(AUDIO_SLOT), PUB)],
@@ -385,7 +386,7 @@ fn the_transitional_reading_reproduces_story_2_and_rejects_other_labels() {
         (7, Some(MediaDropReason::UnmatchedStream)),
     ] {
         let snap = MetricAssertion::snapshot();
-        let mut rig = Rig::new(&legacy);
+        let mut rig = Rig::new(&audio_only);
         assert_eq!(rig.send(1, label).rejected, expected, "label {label}");
         assert_one_ingress_outcome(&snap, expected);
     }

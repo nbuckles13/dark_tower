@@ -1,6 +1,6 @@
-//! Env-test: server mute and meeting teardown driven through MC's PUBLIC APIs
-//! on the live Kind cluster (story 2 task 12; R-8, R-9, R-10, R-11, R-20;
-//! ADR-0036 §5, §7).
+//! Env-test: server mute, client mute and meeting teardown driven through MC's
+//! PUBLIC APIs on the live Kind cluster (story 2 task 12; R-8, R-9, R-10,
+//! R-11, R-20; story 3 MC-B: R-15, R-16, R-17, R-18, R-33; ADR-0036 §5, §7).
 //!
 //! Every participant joins through GC -> MC with a real meeting token (the
 //! meeting's creator carrying `MeetingRole::Host`, exactly as GC stamps it) and
@@ -32,36 +32,79 @@
 //! bounds for unreliable datagrams and scrape latency, never performance
 //! assertions.
 //!
+//! # Server-muted drops are attributable because the producers are SERIALISED
+//!
+//! `mh_media_frames_dropped_total{reason="server_muted"}` carries no sender,
+//! and test fns within one file run concurrently (files run one after
+//! another). So EVERY fn here that produces `server_muted` drops (S3 audio, and
+//! the story-3 VIDEO server mute with its patched publisher) holds the
+//! file-level [`SERVER_MUTED_PRODUCERS`] lock for its whole body. Under that
+//! lock a pinned per-pod delta of at least K — K being the label-1 uni-stream
+//! frames the patched publisher sent to THAT pod while muted — is a
+//! single-entity attribution. The other fns (client mute, the non-host refusal,
+//! teardown) produce no `server_muted` drops and run concurrently: in
+//! particular the client-mute fn's fence is an AUDIO server mute of a publisher
+//! that sends no audio, so its DROP_AT_INGRESS stream receives no frames.
+//!
+//! The client-mute fn's `mh_media_paused_source_frames_total` delta (at least
+//! K per pod) is attributable WITHOUT the lock: no other fn in this file
+//! produces paused-source arrivals — the video server-mute fn never
+//! client-mutes, and S3 is audio-only with no client mute.
+//!
+//! # What these env-tests do NOT prove (story 3 MC-B)
+//!
+//! The client-mute storm asserts per-entity CONVERGENCE (every holder ends on
+//! the final mute state, the publisher's directive never moved). The NUMERIC
+//! push bound (at most one `RegisterMeeting` in flight and one pending per
+//! handler) is MC-internal and pod-wide, so it is proven in-process by
+//! `crates/mc-service/tests/server_mute_integration.rs::a_client_mute_storm_is_bounded_by_one_push_in_flight_and_one_pending`,
+//! never read off a shared counter here.
+//!
 //! # Edge sum (README per-file edge-sum header rule)
 //!
-//! S3 3 x 2 = 6; the non-host refusal declares nothing; TEARDOWN 2 + 1 + 1 =
-//! 4. Audio only.
+//! Declared receive slots per fn: S3 3 x 2 = 6 (audio); the non-host refusal
+//! declares nothing (0); TEARDOWN 2 + 1 + 1 = 4 (audio); VIDEO SERVER MUTE: S
+//! declares 2 audio + 2 video = 4 (H, P, C declare none); CLIENT VIDEO MUTE: S1
+//! 1 + 1 and S2 1 + 1 = 4 (P declares none).
 //!
-//! Edge-sum (concurrent Σ P×(N+M)): 10
+//! S3 and VIDEO SERVER MUTE hold [`SERVER_MUTED_PRODUCERS`], so they never run
+//! together: that serialised group counts as its larger member, max(6, 4) = 6.
+//! Concurrent sum: 6 + 0 + 4 + 4 = 14, within the file budget of 46.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 14
 
 #![cfg(feature = "flows")]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::gc_client::GcClient;
+use env_tests::fixtures::mc_session::JoinDeclaration;
 use env_tests::fixtures::mc_session::{self, MhSession};
 use env_tests::fixtures::media::{
-    assert_relayed_on_slot, audio_datagram, bind_until_received, drain,
+    assert_relayed_on_slot, audio_datagram, bind_until_received, drain, AUDIO_SEND_ID,
 };
 use env_tests::fixtures::metrics::{
-    format_instance_map, gauge_by_instance_present, poll_until_any_instance_above,
-    settled_baseline, PrometheusClient,
+    format_instance_map, gauge_by_instance_present, instance_for_pod_ip, paused_promql,
+    poll_until_any_instance_above, poll_until_pinned_instance, reason_promql, settled_baseline,
+    PrometheusClient, PINNED_METRIC_BOUND,
 };
 use env_tests::fixtures::mh_grpc::{self, authed, probe_registration, ReleaseOnDrop};
 use env_tests::fixtures::participant::{
-    self, filled_senders, meeting_of, open_sessions, two_offered_handlers, TRIAGE_MH_REACH,
+    self, filled_senders, meeting_of, open_sessions, slots_of, two_offered_handlers, Invited,
+    Participant, TRIAGE_MH_REACH, VIDEO,
+};
+use env_tests::fixtures::video::{
+    key_id_sender, BackgroundPublisher, FrameOutcome, GroupStartSource, Next, PublisherEvent,
+    PublisherMode, ReceivedFrame, SubscriberEvent, UplinkLabel, VideoPublisher,
+    VideoPublisherConfig, VideoSubscriber, VideoTransport,
 };
 use env_tests::fixtures::AuthClient;
 use proto_gen::dark_tower::internal::v1::EndMeetingRequest;
 use proto_gen::dark_tower::signaling::v1::{
-    client_message, server_message, ClientMessage, ServerMuteRequest, SlotState,
+    client_message, server_message, ClientMessage, MediaKind, MuteRequest, ParticipantMuteUpdate,
+    SendDirective, SendStream, ServerMuteRequest, SlotState, StreamAssignment, StreamAssignments,
 };
 
 async fn cluster() -> ClusterConnection {
@@ -112,13 +155,23 @@ const SEQ_MUTED: u32 = 1_000_000;
 const _: () = assert!(SEQ_MUTED >= env_tests::fixtures::media::AUDIO_SEQUENCE_CEILING);
 const SEQ_UNMUTED: u32 = 2_000_000;
 
-fn server_mute(target: &str, audio_muted: bool) -> ClientMessage {
+/// Every fn producing `server_muted` drops holds this for its whole body (see
+/// the module doc): the per-pod drop delta is then attributable to one fn.
+static SERVER_MUTED_PRODUCERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A `ServerMuteRequest` about `target`, per kind: `None` = that kind absent
+/// on the wire, i.e. UNCHANGED (story 3 MC-B). Send only the kind under test.
+fn server_mute(
+    target: &str,
+    audio_muted: Option<bool>,
+    video_muted: Option<bool>,
+) -> ClientMessage {
     ClientMessage {
         message: Some(client_message::Message::ServerMuteRequest(
             ServerMuteRequest {
                 participant_id: target.to_string(),
-                audio_muted: Some(audio_muted),
-                video_muted: Some(false),
+                audio_muted,
+                video_muted,
                 reason: String::new(),
             },
         )),
@@ -156,10 +209,11 @@ const MH_RELEASED: &str =
 ///   client-side).
 /// - Positive control BEFORE the mute: B hears A on B's own slot for A.
 /// - SECONDARY: `mh_media_frames_dropped_total{reason="server_muted"}` rises past
-///   its own baseline on some MH pod. Not attributable to this test alone
-///   (env-test 26's S4 produces the same series on the same pods).
+///   its own baseline on some MH pod (within this file the producers are
+///   serialised; env-test 26's S4 produces the same series, in another file).
 #[tokio::test]
 async fn test_host_server_mute_is_enforced_at_mh_ingress_and_unmute_restores_it() {
+    let _serialised = SERVER_MUTED_PRODUCERS.lock().await;
     let cluster = cluster().await;
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
     let window = participant::settle_window(&cluster).await;
@@ -215,7 +269,10 @@ async fn test_host_server_mute_is_enforced_at_mh_ingress_and_unmute_restores_it(
     )
     .await;
     let a_id = ps[1].join.participant_id.clone();
-    ps[0].session.write(&server_mute(&a_id, true)).await;
+    ps[0]
+        .session
+        .write(&server_mute(&a_id, Some(true), None))
+        .await;
     // MC applied it: B's own view shows A's audio slot as the server-muted
     // avatar (story 3 flat vocabulary; SOURCE_MUTED is no longer emitted), still
     // naming A and still on the edge's handler (lead ruling 2026-10-22: a mute
@@ -310,7 +367,10 @@ async fn test_host_server_mute_is_enforced_at_mh_ingress_and_unmute_restores_it(
 
     // UNMUTE, by the host: B's view flips back, then A's frames land on B's
     // slot for A again — within the next generation MC pushes.
-    ps[0].session.write(&server_mute(&a_id, false)).await;
+    ps[0]
+        .session
+        .write(&server_mute(&a_id, Some(false), None))
+        .await;
     ps[2]
         .converge("S3 UNMUTE-VISIBLE", bound, |v, _| {
             v.is_some() && slot_state_of_view(v, a) == Some(SlotState::Active as i32)
@@ -377,7 +437,10 @@ async fn test_non_host_server_mute_is_refused_and_counted() {
     )
     .await;
     let h_id = ps[0].join.participant_id.clone();
-    ps[1].session.write(&server_mute(&h_id, true)).await;
+    ps[1]
+        .session
+        .write(&server_mute(&h_id, Some(true), None))
+        .await;
 
     // A's OWN connection receives the one generic refusal.
     let deadline = Instant::now() + PHASE_DEADLINE;
@@ -672,4 +735,985 @@ async fn test_meeting_end_releases_every_handler_even_with_a_straggler() {
     )
     .await;
     drop((s_x, s_y, closed));
+}
+
+// ============================================================================
+// Story 3 MC-B: per-kind server mute (R-15, R-16, R-18) and client mute (R-17)
+// ============================================================================
+
+/// Marker of P's GENUINE audio datagrams (a marker-only payload, so never
+/// confused with a video frame, whose payload leads with a key id).
+const MARK_P: u8 = 0x50;
+
+/// Rounds the patched publisher transmits in one measured mute window.
+const WINDOW_ROUNDS: u32 = 30;
+
+/// Per-read bound inside a round (a drain slice, never a pass condition).
+const READ_SLICE: Duration = Duration::from_millis(30);
+
+/// At most this many events per subscriber per round, so a drain on a
+/// continuously-fed subscriber always returns to the round's checks.
+const EVENTS_PER_ROUND: usize = 64;
+
+/// The fixture group cadence (fixture-only; never a production keyframe
+/// interval) — short, so a re-forwarded edge waits at most one group.
+const GROUP_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Rig bound on a video frame arriving on its slot (failure bound only).
+const FRAME_DEADLINE: Duration = Duration::from_secs(45);
+
+/// A participant's MC-signalling mute request, per kind (`None` = absent).
+fn mute_request(audio_muted: Option<bool>, video_muted: Option<bool>) -> ClientMessage {
+    ClientMessage {
+        message: Some(client_message::Message::MuteRequest(MuteRequest {
+            audio_muted,
+            video_muted,
+        })),
+        trace_parent: String::new(),
+        trace_state: String::new(),
+    }
+}
+
+/// `d`'s stream of `kind` (a published kind is always LISTED, R-8).
+fn stream_of(d: &SendDirective, kind: MediaKind) -> &SendStream {
+    d.streams
+        .iter()
+        .find(|s| s.media_kind == kind as i32)
+        .unwrap_or_else(|| panic!("the directive lists no {} stream", kind.as_str_name()))
+}
+
+/// The target urls of `d`'s `kind` stream.
+fn kind_targets(d: &SendDirective, kind: MediaKind) -> BTreeSet<String> {
+    stream_of(d, kind)
+        .targets
+        .iter()
+        .map(|t| t.media_handler_url.clone())
+        .collect()
+}
+
+/// `view`'s `kind` slots, owned (for byte-identity comparisons).
+fn kind_slots(view: &StreamAssignments, kind: MediaKind) -> Vec<StreamAssignment> {
+    slots_of(view, kind).into_iter().cloned().collect()
+}
+
+/// The state of `view`'s `kind` slot naming `sender`, if any.
+fn named_state(view: &StreamAssignments, kind: MediaKind, sender: u32) -> Option<i32> {
+    slots_of(view, kind)
+        .into_iter()
+        .find(|a| a.sender_id == Some(sender))
+        .map(|a| a.slot_state)
+}
+
+/// Open a media session to EVERY handler `p` was offered.
+async fn reach_both(phase: &str, p: &Participant) -> HashMap<String, MhSession> {
+    let mut out = HashMap::new();
+    for url in p.offered() {
+        out.insert(
+            url.clone(),
+            participant::reach(phase, p.label, &url, &p.token).await,
+        );
+    }
+    out
+}
+
+/// R-18 on the TARGET's own ordered signalling path: read `p`'s messages until
+/// a `SendDirective` satisfying `is_change` arrives, requiring that a
+/// `ParticipantMuteUpdate` about `p` satisfying `is_update` arrived STRICTLY
+/// before it. Keeps `p`'s latest view/directive current. Returns the directive.
+async fn update_before_directive(
+    p: &mut Participant,
+    phase: &str,
+    bound: Duration,
+    is_update: impl Fn(&ParticipantMuteUpdate) -> bool,
+    is_change: impl Fn(&SendDirective) -> bool,
+) -> SendDirective {
+    let own = p.join.participant_id.clone();
+    let deadline = Instant::now() + bound;
+    let mut update_seen = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{phase}: {}'s directive change never arrived within {bound:?}",
+            p.label
+        );
+        match p.session.try_read(remaining).await.and_then(|m| m.message) {
+            Some(server_message::Message::ParticipantMuteUpdate(u))
+                if u.participant_id == own && is_update(&u) =>
+            {
+                update_seen = true;
+            }
+            Some(server_message::Message::SendDirective(d)) => {
+                p.directive = Some(d.clone());
+                if is_change(&d) {
+                    assert!(
+                        update_seen,
+                        "{phase}: R-18 — {}'s directive change arrived BEFORE its own \
+                         ParticipantMuteUpdate on the same ordered signalling stream",
+                        p.label
+                    );
+                    return d;
+                }
+            }
+            Some(server_message::Message::StreamAssignments(a)) => p.view = Some(a),
+            Some(server_message::Message::Error(e)) => {
+                panic!("{phase}: MC sent {} an error: {}", p.label, e.message)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One patched (or compliant) video publisher per MH session.
+fn video_publishers(
+    sessions: &HashMap<String, MhSession>,
+    cfg: VideoPublisherConfig,
+) -> Vec<VideoPublisher<wtransport::Connection>> {
+    sessions
+        .values()
+        .map(|s| VideoPublisher::new(s.connection().clone(), cfg))
+        .collect()
+}
+
+/// One frame tick on every publisher; returns how many frames EACH sent
+/// (`Sent` outcomes, per publisher, in order).
+async fn pump(pubs: &mut [VideoPublisher<wtransport::Connection>]) -> Vec<u64> {
+    let mut sent = Vec::with_capacity(pubs.len());
+    for publisher in pubs.iter_mut() {
+        publisher.poll();
+        let n = u64::from(matches!(
+            publisher.send_frame().await,
+            FrameOutcome::Sent { .. }
+        ));
+        sent.push(n);
+    }
+    sent
+}
+
+/// The newest group counter any of `pubs` has started (None before the first).
+fn newest_group(pubs: &[VideoPublisher<wtransport::Connection>]) -> Option<u32> {
+    pubs.iter()
+        .flat_map(|p| p.events().iter())
+        .filter_map(|e| match e {
+            PublisherEvent::GroupStart { gop_counter, .. } => Some(*gop_counter),
+            _ => None,
+        })
+        .max()
+}
+
+/// Every video frame the subscribers report this round (bounded per round).
+async fn video_frames(subs: &mut [VideoSubscriber]) -> Vec<ReceivedFrame> {
+    let mut out = Vec::new();
+    for sub in subs.iter_mut() {
+        for _ in 0..EVENTS_PER_ROUND {
+            match sub.next(READ_SLICE).await {
+                Next::Quiet => break,
+                Next::Event(SubscriberEvent::Frame { frame, .. }) => out.push(frame),
+                Next::Event(SubscriberEvent::ConnectionClosed) => {
+                    panic!("a subscriber's MH connection closed mid-test")
+                }
+                Next::Event(_) => {}
+            }
+        }
+    }
+    out
+}
+
+/// Every datagram queued on `conn`, as `(relay slot, stream sequence, payload)`.
+async fn datagrams(conn: &wtransport::Connection) -> Vec<(u32, u32, Vec<u8>)> {
+    let mut out = Vec::new();
+    while let Ok(Ok(d)) = tokio::time::timeout(READ_SLICE, conn.receive_datagram()).await {
+        let raw = d.payload();
+        let view = media_protocol::codec::decode_datagram(&raw)
+            .unwrap_or_else(|_| panic!("received a malformed datagram"));
+        out.push((
+            u32::from(view.stream_id()),
+            view.stream_sequence(),
+            view.payload().to_vec(),
+        ));
+    }
+    out
+}
+
+/// Pump `pubs` until `sub` relays a frame from `sender` onto `slot` whose group
+/// counter is above `after` (so it was SENT after the phase began). Bounded by
+/// [`FRAME_DEADLINE`] (a failure bound).
+async fn until_fresh_video_on_slot(
+    phase: &str,
+    pubs: &mut [VideoPublisher<wtransport::Connection>],
+    subs: &mut [VideoSubscriber],
+    slot: u32,
+    sender: u32,
+    after: Option<u32>,
+) {
+    let deadline = Instant::now() + FRAME_DEADLINE;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "{phase}: no fresh video frame from the publisher reached slot {slot} within \
+             {FRAME_DEADLINE:?}"
+        );
+        let _ = pump(pubs).await;
+        if video_frames(subs).await.iter().any(|f| {
+            u32::from(f.slot_id) == slot
+                && u32::from(f.key_id_sender) == sender
+                && after.is_none_or(|g| f.gop_counter > g)
+        }) {
+            return;
+        }
+    }
+}
+
+/// R-15/R-16/R-18 (VIDEO SERVER MUTE): a host server-mutes publisher P's VIDEO
+/// only. Per-entity evidence on this test's own connections throughout.
+///
+/// Participants (join order P, C, S, H; H created the meeting, so GC stamps
+/// H's token Host): P and C publish audio and video and declare nothing; S
+/// declares two audio slots and two video slots, so by R-3 S holds P and C on
+/// both kinds (audio by name; live video proven by frames — MC names no live
+/// video source, R-5); H publishes audio only and holds nothing.
+///
+/// 1. MUTE: P's OWN directive lists video with EMPTY targets while its audio
+///    stream is byte-identical, and P's self `ParticipantMuteUpdate` arrives
+///    BEFORE it (R-18, mute direction). S's video slot for P reads
+///    `AVATAR_SERVER_MUTED`; S's audio slots are byte-identical.
+/// 2. PATCHED P keeps sending (`KeepSendingWhileMuted`), per variant, each
+///    with the pre-control (P's video reached S before the mute), a liveness
+///    control (C's video keeps reaching S in the same window) and a window
+///    bounded by TRAFFIC (rounds, then a C frame arrives after P's last):
+///    - label 1, uni stream: no P frame on any S video slot; MH counts at least
+///      K `server_muted` drops on EACH pod (P transmitted K frames to each;
+///      attributable under [`SERVER_MUTED_PRODUCERS`]);
+///    - label 1, datagram: `transport_mismatch` (the transport check runs
+///      before the disposition), never a video slot;
+///    - relabelled to 0, datagram: reaches S's AUDIO slot for P (allowed by
+///      R-16: audio is not muted) and never a video slot. P's genuine audio
+///      keeps reaching that slot too — the other kind flows.
+/// 3. UNMUTE: P's self update (video no longer server-muted) arrives BEFORE
+///    the directive whose video targets go empty -> non-empty (the pair the
+///    client keys its "a host resumed your camera" notice on), and that
+///    directive equals the pre-mute one; P's video reaches S's slot again.
+/// 4. REVERSE: an AUDIO server mute withdraws only audio (video stream
+///    byte-identical), S's audio slot for P reads `AVATAR_SERVER_MUTED`, its
+///    video slots are unchanged, and fresh P video keeps reaching S.
+#[tokio::test]
+async fn test_video_server_mute_withdraws_drops_a_patched_publisher_and_unmute_restores_it() {
+    const PHASE: &str = "VIDEO SERVER MUTE";
+    let _serialised = SERVER_MUTED_PRODUCERS.lock().await;
+    let cluster = cluster().await;
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    let bound = participant::settle_window(&cluster).await + VIEW_MARGIN;
+    let auth = AuthClient::new(&cluster.ac_base_url);
+    let gc = GcClient::new(&cluster.gc_base_url);
+    let invited = Invited::new(&auth, &gc, "Video Server Mute", 4).await;
+    let av = [AUDIO, VIDEO];
+
+    let mut p = invited
+        .join(1, "P", &JoinDeclaration::default().publishing(&av))
+        .await;
+    let p_mh = reach_both(PHASE, &p).await;
+    let c = invited
+        .join(2, "C", &JoinDeclaration::default().publishing(&av))
+        .await;
+    let c_mh = reach_both(PHASE, &c).await;
+    let (s_audio, s_video) = ([11_u32, 12], [21_u32, 22]);
+    let mut s = invited
+        .join(
+            3,
+            "S",
+            &JoinDeclaration::default()
+                .publishing(&[])
+                .receiving(&s_audio, &s_video),
+        )
+        .await;
+    let s_mh = reach_both(PHASE, &s).await;
+    let mut h = invited.join(0, "H", &JoinDeclaration::default()).await;
+    let (p_id, c_id) = (p.sender_id(), c.sender_id());
+    let p_pid = p.join.participant_id.clone();
+    let _ = two_offered_handlers(PHASE, std::slice::from_ref(&p));
+
+    // S holds P and C on both kinds.
+    let mut want = vec![p_id, c_id];
+    want.sort_unstable();
+    s.converge(&format!("{PHASE} S"), bound, |v, _| {
+        v.is_some_and(|v| {
+            let mut f = filled_senders(v, AUDIO);
+            f.sort_unstable();
+            f == want
+                && slots_of(v, VIDEO).len() == 2
+                && slots_of(v, VIDEO)
+                    .iter()
+                    .all(|a| a.slot_state == SlotState::Active as i32)
+        })
+    })
+    .await;
+    let s_before = s.view().clone();
+    let (p_vslot, c_vslot) = (s_video[0], s_video[1]);
+    let p_audio_url = s.slot_url(p_id, AUDIO);
+    let p_audio_slot = s.slot_for(p_id, AUDIO);
+    let s_video_urls: BTreeSet<String> = s
+        .slots(VIDEO)
+        .iter()
+        .map(|a| a.media_handler_url.clone())
+        .collect();
+    p.converge(&format!("{PHASE} P directed"), bound, |_, d| {
+        d.is_some_and(|d| {
+            kind_targets(d, AUDIO) == BTreeSet::from([p_audio_url.clone()])
+                && !kind_targets(d, VIDEO).is_empty()
+                && kind_targets(d, VIDEO).is_subset(&s_video_urls)
+        })
+    })
+    .await;
+    let d0 = p.directive.clone().expect("P's converged directive");
+
+    // C's compliant video (the liveness control) on every handler it is
+    // directed to, and S's subscribers on every handler.
+    let c_pubs: Vec<BackgroundPublisher> = c_mh
+        .values()
+        .map(|m| BackgroundPublisher::start(m.connection().clone(), c_id))
+        .collect();
+    let mut s_subs: Vec<VideoSubscriber> = s_mh
+        .values()
+        .map(|m| VideoSubscriber::spawn(m.connection().clone()))
+        .collect();
+    let patched = |label, transport| VideoPublisherConfig {
+        group_start: GroupStartSource::Periodic(GROUP_INTERVAL),
+        mode: PublisherMode::KeepSendingWhileMuted,
+        label,
+        transport,
+        ..VideoPublisherConfig::new(p_id)
+    };
+    let mut p_uni = video_publishers(
+        &p_mh,
+        patched(UplinkLabel::Directed, VideoTransport::StreamPerGroup),
+    );
+
+    // PRE: P's video and C's video reach S's own slots for them; P's genuine
+    // audio reaches S's audio slot for P.
+    until_fresh_video_on_slot(
+        &format!("{PHASE} PRE P"),
+        &mut p_uni,
+        &mut s_subs,
+        p_vslot,
+        p_id,
+        None,
+    )
+    .await;
+    until_fresh_video_on_slot(
+        &format!("{PHASE} PRE C"),
+        &mut [],
+        &mut s_subs,
+        c_vslot,
+        c_id,
+        None,
+    )
+    .await;
+    let pre_audio = bind_until_received(
+        &format!("{PHASE} PRE audio"),
+        s_mh[&p_audio_url].connection(),
+        &[(p_mh[&p_audio_url].connection(), MARK_P)],
+        &[],
+    )
+    .await;
+    assert_relayed_on_slot(PHASE, &pre_audio[&MARK_P], p_audio_slot, MARK_P, "P");
+
+    // ---- 1. MUTE video ------------------------------------------------------
+    let dropped_base = settled_baseline(
+        &prom,
+        &reason_promql("server_muted"),
+        COUNTER_BUDGET,
+        "the assertion under test",
+    )
+    .await;
+    let mismatch_base = settled_baseline(
+        &prom,
+        &reason_promql("transport_mismatch"),
+        COUNTER_BUDGET,
+        "the assertion under test",
+    )
+    .await;
+    h.session
+        .write(&server_mute(&p_pid, None, Some(true)))
+        .await;
+    let withdrawn = update_before_directive(
+        &mut p,
+        &format!("{PHASE} 1 MUTE"),
+        bound,
+        |u| u.video_server_muted && !u.audio_server_muted,
+        |d| kind_targets(d, VIDEO).is_empty(),
+    )
+    .await;
+    assert_eq!(
+        stream_of(&withdrawn, AUDIO),
+        stream_of(&d0, AUDIO),
+        "{PHASE} 1: the AUDIO stream of P's directive is byte-identical"
+    );
+    assert_eq!(
+        stream_of(&withdrawn, VIDEO).encoding,
+        stream_of(&d0, VIDEO).encoding,
+        "{PHASE} 1: a withdrawal empties the targets; the stream stays listed"
+    );
+    s.converge(&format!("{PHASE} 1 S"), bound, |v, _| {
+        v.is_some_and(|v| named_state(v, VIDEO, p_id) == Some(SlotState::AvatarServerMuted as i32))
+    })
+    .await;
+    assert_eq!(
+        kind_slots(s.view(), AUDIO),
+        kind_slots(&s_before, AUDIO),
+        "{PHASE} 1: S's audio slots (P's ACTIVE among them) are byte-identical"
+    );
+
+    // ---- 2a. PATCHED, label 1 on uni streams --------------------------------
+    // Settle: P transmits every round until FLAT_ROUNDS consecutive rounds bring
+    // no P video to S (frames in flight before MH installed the mute may still
+    // land; flat counts from the last one), with C's video still arriving.
+    let deadline = Instant::now() + PHASE_DEADLINE;
+    let (mut flat, mut c_alive) = (0_u32, false);
+    while flat < FLAT_ROUNDS || !c_alive {
+        assert!(
+            Instant::now() < deadline,
+            "{PHASE} 2a SETTLE: P's video did not go flat at S (flat {flat}/{FLAT_ROUNDS}, C \
+             alive {c_alive}). P frames on S's video slots after MC showed AVATAR_SERVER_MUTED \
+             mean MH is not dropping the DROP_AT_INGRESS stream: check \
+             mh_media_frames_dropped_total{{reason=\"server_muted\"}}"
+        );
+        let _ = pump(&mut p_uni).await;
+        let frames = video_frames(&mut s_subs).await;
+        c_alive |= frames
+            .iter()
+            .any(|f| u32::from(f.key_id_sender) == c_id && u32::from(f.slot_id) == c_vslot);
+        let p_reached = frames
+            .iter()
+            .any(|f| u32::from(f.key_id_sender) == p_id || u32::from(f.slot_id) == p_vslot);
+        flat = if p_reached { 0 } else { flat + 1 };
+    }
+    // The measured window: K frames per pod, NONE reaching S.
+    let mut sent = vec![0_u64; p_uni.len()];
+    let mut c_since: Option<u32> = None;
+    let no_p = |f: &ReceivedFrame, what: &str| {
+        assert!(
+            u32::from(f.key_id_sender) != p_id && u32::from(f.slot_id) != p_vslot,
+            "{PHASE} 2a {what}: a frame of the server-muted video stream reached S's video slot"
+        );
+    };
+    for _ in 0..WINDOW_ROUNDS {
+        for (total, n) in sent.iter_mut().zip(pump(&mut p_uni).await) {
+            *total += n;
+        }
+        for f in video_frames(&mut s_subs).await {
+            no_p(&f, "WINDOW");
+            if u32::from(f.key_id_sender) == c_id {
+                c_since = c_since.max(Some(f.gop_counter));
+            }
+        }
+    }
+    // Window end bounded by TRAFFIC: a C frame from a group NEWER than any C
+    // frame seen in the window (so sent after P's last frame) lands on S's
+    // slot for C; every frame drained on the way is checked too.
+    let deadline = Instant::now() + FRAME_DEADLINE;
+    'end: loop {
+        assert!(
+            Instant::now() < deadline,
+            "{PHASE} 2a END: no fresh C frame reached S within {FRAME_DEADLINE:?}"
+        );
+        for f in video_frames(&mut s_subs).await {
+            no_p(&f, "END");
+            if u32::from(f.key_id_sender) == c_id
+                && u32::from(f.slot_id) == c_vslot
+                && c_since.is_none_or(|g| f.gop_counter > g)
+            {
+                break 'end;
+            }
+        }
+    }
+    let k = sent.iter().copied().min().unwrap_or(0);
+    assert!(
+        k > 0,
+        "{PHASE} 2a: positive control — P transmitted on every pod"
+    );
+    for handler in mh_grpc::handlers() {
+        let base = instance_for_pod_ip(&dropped_base, &handler.pod_ip).map_or(0.0, |(_, v)| v);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a frame count of a few dozen; exact in f64"
+        )]
+        let want = base + k as f64;
+        poll_until_pinned_instance(
+            &prom,
+            &reason_promql("server_muted"),
+            &handler.pod_ip,
+            PINNED_METRIC_BOUND,
+            Duration::from_secs(2),
+            &format!("{PHASE} 2a DROPS ({})", handler.name),
+            ">= own baseline + K (P's label-1 frames to this pod while muted)",
+            |v| v >= want,
+        )
+        .await;
+    }
+    for publisher in &mut p_uni {
+        publisher.finish().await;
+    }
+
+    // ---- 2b. PATCHED, label 1 as datagrams: transport_mismatch -----------------
+    let mut p_dgram = video_publishers(
+        &p_mh,
+        patched(UplinkLabel::Directed, VideoTransport::Datagram),
+    );
+    // P's GENUINE audio rides every round: the liveness control (S's receive
+    // path and P's uplink are alive), and after the last video datagram it
+    // bounds the window by traffic.
+    let mut seq = SEQ_MUTED;
+    let send_audio = |seq: u32| {
+        p_mh[&p_audio_url]
+            .connection()
+            .send_datagram(audio_datagram(seq, MARK_P))
+            .unwrap_or_else(|e| panic!("{PHASE} 2b/2c: P could not send audio: {e}"));
+    };
+    // Drains S; returns whether a genuine MARK_P datagram SENT AFTER `after`
+    // (its stream sequence) landed on P's audio slot. A datagram on a video
+    // slot, or P video on a uni stream, fails.
+    let check_2b =
+        |dgrams: Vec<(u32, u32, Vec<u8>)>, frames: Vec<ReceivedFrame>, after: u32| -> bool {
+            for f in frames {
+                assert!(
+                    u32::from(f.key_id_sender) != p_id,
+                    "{PHASE} 2b: P's video reached S"
+                );
+            }
+            let mut genuine = false;
+            for (slot, sequence, payload) in dgrams {
+                assert!(
+                    !s_video.contains(&slot),
+                    "{PHASE} 2b: a datagram reached S's VIDEO slot {slot}"
+                );
+                genuine |= slot == p_audio_slot
+                    && sequence > after
+                    && payload.iter().all(|b| *b == MARK_P);
+            }
+            genuine
+        };
+    for _ in 0..WINDOW_ROUNDS {
+        let _ = pump(&mut p_dgram).await;
+        seq += 1;
+        send_audio(seq);
+        let mut dgrams = Vec::new();
+        for conn in s_mh.values() {
+            dgrams.extend(datagrams(conn.connection()).await);
+        }
+        let _ = check_2b(dgrams, video_frames(&mut s_subs).await, u32::MAX);
+    }
+    // Traffic-bounded end: genuine audio SENT AFTER the last video datagram
+    // (sequence above the window's last) arrives on P's audio slot. A window
+    // datagram drained here late cannot satisfy it.
+    let last_window_seq = seq;
+    let deadline = Instant::now() + PHASE_DEADLINE;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "{PHASE} 2b END: P's genuine audio never reached S's audio slot for P after the \
+             last video datagram — the liveness control failed"
+        );
+        seq += 1;
+        send_audio(seq);
+        let mut dgrams = Vec::new();
+        for conn in s_mh.values() {
+            dgrams.extend(datagrams(conn.connection()).await);
+        }
+        if check_2b(dgrams, video_frames(&mut s_subs).await, last_window_seq) {
+            break;
+        }
+    }
+    for handler in mh_grpc::handlers() {
+        let base = instance_for_pod_ip(&mismatch_base, &handler.pod_ip).map_or(0.0, |(_, v)| v);
+        poll_until_pinned_instance(
+            &prom,
+            &reason_promql("transport_mismatch"),
+            &handler.pod_ip,
+            PINNED_METRIC_BOUND,
+            Duration::from_secs(2),
+            &format!("{PHASE} 2b MISMATCH ({})", handler.name),
+            ">= own baseline + 1 (datagrams may be lost, so not K)",
+            |v| v > base,
+        )
+        .await;
+    }
+
+    // ---- 2c. PATCHED, relabelled to 0 as datagrams: audio slots only ---------
+    let mut p_relabel = video_publishers(
+        &p_mh,
+        patched(
+            UplinkLabel::Override(AUDIO_SEND_ID),
+            VideoTransport::Datagram,
+        ),
+    );
+    let deadline = Instant::now() + PHASE_DEADLINE;
+    let (mut relabelled_on_audio, mut genuine_audio) = (false, false);
+    while !relabelled_on_audio || !genuine_audio {
+        assert!(
+            Instant::now() < deadline,
+            "{PHASE} 2c: within {PHASE_DEADLINE:?} S's audio slot for P did not receive both a \
+             relabelled frame ({relabelled_on_audio}) and P's genuine audio ({genuine_audio}) — \
+             the other kind must keep flowing"
+        );
+        let _ = pump(&mut p_relabel).await;
+        seq += 1;
+        send_audio(seq);
+        for conn in s_mh.values() {
+            for (slot, _, payload) in datagrams(conn.connection()).await {
+                assert!(
+                    !s_video.contains(&slot),
+                    "{PHASE} 2c: a relabelled frame reached S's VIDEO slot {slot}"
+                );
+                if slot == p_audio_slot {
+                    if payload.iter().all(|b| *b == MARK_P) {
+                        genuine_audio = true;
+                    } else if key_id_sender(&payload).map(u32::from) == Some(p_id) {
+                        relabelled_on_audio = true;
+                    }
+                }
+            }
+        }
+        for f in video_frames(&mut s_subs).await {
+            assert!(
+                u32::from(f.key_id_sender) != p_id,
+                "{PHASE} 2c: P's video reached a video slot"
+            );
+        }
+    }
+    drop((p_dgram, p_relabel));
+
+    // ---- 3. UNMUTE video: R-18 pair, restored targets, frames return ----------
+    h.session
+        .write(&server_mute(&p_pid, None, Some(false)))
+        .await;
+    let restored = update_before_directive(
+        &mut p,
+        &format!("{PHASE} 3 UNMUTE"),
+        bound,
+        |u| !u.video_server_muted,
+        |d| !kind_targets(d, VIDEO).is_empty(),
+    )
+    .await;
+    assert_eq!(
+        restored, d0,
+        "{PHASE} 3: the host's unmute restores P's directive exactly"
+    );
+    s.converge(&format!("{PHASE} 3 S"), bound, |v, _| {
+        v.is_some_and(|v| *v == s_before)
+    })
+    .await;
+    let mut p_uni = video_publishers(
+        &p_mh,
+        patched(UplinkLabel::Directed, VideoTransport::StreamPerGroup),
+    );
+    until_fresh_video_on_slot(
+        &format!("{PHASE} 3 RESTORED"),
+        &mut p_uni,
+        &mut s_subs,
+        p_vslot,
+        p_id,
+        None,
+    )
+    .await;
+
+    // ---- 4. REVERSE: an AUDIO server mute leaves video flowing -------------
+    h.session
+        .write(&server_mute(&p_pid, Some(true), None))
+        .await;
+    let audio_withdrawn = update_before_directive(
+        &mut p,
+        &format!("{PHASE} 4 AUDIO MUTE"),
+        bound,
+        |u| u.audio_server_muted && !u.video_server_muted,
+        |d| kind_targets(d, AUDIO).is_empty(),
+    )
+    .await;
+    assert_eq!(
+        stream_of(&audio_withdrawn, VIDEO),
+        stream_of(&d0, VIDEO),
+        "{PHASE} 4: the VIDEO stream of P's directive is byte-identical"
+    );
+    s.converge(&format!("{PHASE} 4 S"), bound, |v, _| {
+        v.is_some_and(|v| named_state(v, AUDIO, p_id) == Some(SlotState::AvatarServerMuted as i32))
+    })
+    .await;
+    assert_eq!(
+        kind_slots(s.view(), VIDEO),
+        kind_slots(&s_before, VIDEO),
+        "{PHASE} 4: S's video slots are byte-identical"
+    );
+    let since = newest_group(&p_uni);
+    until_fresh_video_on_slot(
+        &format!("{PHASE} 4 VIDEO FLOWS"),
+        &mut p_uni,
+        &mut s_subs,
+        p_vslot,
+        p_id,
+        since,
+    )
+    .await;
+    h.session
+        .write(&server_mute(&p_pid, Some(false), None))
+        .await;
+    let back = update_before_directive(
+        &mut p,
+        &format!("{PHASE} 4 AUDIO UNMUTE"),
+        bound,
+        |u| !u.audio_server_muted,
+        |d| !kind_targets(d, AUDIO).is_empty(),
+    )
+    .await;
+    assert_eq!(
+        back, d0,
+        "{PHASE} 4: the audio unmute restores the directive"
+    );
+
+    for publisher in &mut p_uni {
+        publisher.finish().await;
+    }
+    for publisher in c_pubs {
+        publisher.stop().await;
+    }
+    drop((s_subs, s_mh, p_mh, c_mh));
+}
+
+/// R-17 (CLIENT VIDEO MUTE, with a toggle storm): publisher P client-mutes its
+/// VIDEO. S1 and S2 each hold P on one audio and one video slot.
+///
+/// - STORM then FENCE: P sends seven alternating video mute requests (audio
+///   absent: unchanged), ending muted, then an AUDIO mute (video absent). The
+///   requests ride one ordered connection into one actor, so the holder view
+///   that first shows P's audio avatar was composed after every video toggle:
+///   in THAT view, P's video slot must read `AVATAR_CLIENT_MUTED` (the final
+///   state), on its edge's url. Convergence only — the numeric push bound is
+///   proven in-process (see the module doc).
+/// - PAUSED, by its per-entity signature: P keeps sending video
+///   (`KeepSendingWhileMuted`), and FRESH frames (a group started after the
+///   holders converged) still reach both holders' video slots — a PAUSED stream
+///   is forwarded; DROP_AT_INGRESS would drop them.
+/// - The DIRECTIVE never moved: S1 (the meeting's creator, so its token is
+///   Host) then server-mutes P's AUDIO. The FIRST directive P reads after its
+///   pre-storm one must be exactly that withdrawal — the pre-storm directive
+///   with empty AUDIO targets and the VIDEO stream byte-identical. Had any
+///   client mute moved the directive, an earlier directive would arrive first
+///   (or the video stream would differ). The fence is an AUDIO server mute of a
+///   publisher sending no audio, so it produces no `server_muted` drops and
+///   this fn stays outside [`SERVER_MUTED_PRODUCERS`].
+#[tokio::test]
+async fn test_client_video_mute_pauses_without_touching_the_directive_and_a_storm_converges() {
+    const PHASE: &str = "CLIENT VIDEO MUTE";
+    /// Video toggles in the storm: odd (ends muted), and with the audio fence
+    /// well under the per-connection mute burst (8), so none is rate-limited.
+    const TOGGLES: u32 = 5;
+    let cluster = cluster().await;
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    let bound = participant::settle_window(&cluster).await + VIEW_MARGIN;
+    let auth = AuthClient::new(&cluster.ac_base_url);
+    let gc = GcClient::new(&cluster.gc_base_url);
+    let invited = Invited::new(&auth, &gc, "Client Video Mute", 3).await;
+
+    // P joins first (user 2); S1 is the creator (user 0: Host), S2 user 1.
+    let mut p = invited
+        .join(
+            2,
+            "P",
+            &JoinDeclaration::default().publishing(&[AUDIO, VIDEO]),
+        )
+        .await;
+    let p_mh = reach_both(PHASE, &p).await;
+    let p_id = p.sender_id();
+    let slots = [(1_u32, 2_u32), (3, 4)];
+    let mut holders = Vec::new();
+    for (i, (label, (a, v))) in [("S1", slots[0]), ("S2", slots[1])].into_iter().enumerate() {
+        let mut s = invited
+            .join(
+                i,
+                label,
+                &JoinDeclaration::default()
+                    .publishing(&[])
+                    .receiving(&[a], &[v]),
+            )
+            .await;
+        let mh = reach_both(PHASE, &s).await;
+        s.converge(&format!("{PHASE} {label}"), bound, |v, _| {
+            v.is_some_and(|v| {
+                filled_senders(v, AUDIO) == vec![p_id]
+                    && slots_of(v, VIDEO)
+                        .first()
+                        .is_some_and(|a| a.slot_state == SlotState::Active as i32)
+            })
+        })
+        .await;
+        holders.push((s, mh, a, v));
+    }
+    // P's directive targets exactly the handlers its holders' edges are on.
+    let want = |kind: MediaKind| -> BTreeSet<String> {
+        holders
+            .iter()
+            .map(|(s, ..)| s.slots(kind)[0].media_handler_url.clone())
+            .collect()
+    };
+    let (want_audio, want_video) = (want(AUDIO), want(VIDEO));
+    p.converge(&format!("{PHASE} P directed"), bound, |_, d| {
+        d.is_some_and(|d| {
+            kind_targets(d, AUDIO) == want_audio && kind_targets(d, VIDEO) == want_video
+        })
+    })
+    .await;
+    let d0 = p.directive.clone().expect("P's converged directive");
+    let urls_before: Vec<String> = holders
+        .iter()
+        .map(|(s, ..)| s.slots(VIDEO)[0].media_handler_url.clone())
+        .collect();
+
+    let mut p_pubs = video_publishers(
+        &p_mh,
+        VideoPublisherConfig {
+            group_start: GroupStartSource::Periodic(GROUP_INTERVAL),
+            mode: PublisherMode::KeepSendingWhileMuted,
+            ..VideoPublisherConfig::new(p_id)
+        },
+    );
+    let mut subs: Vec<Vec<VideoSubscriber>> = holders
+        .iter()
+        .map(|(_, mh, ..)| {
+            mh.values()
+                .map(|m| VideoSubscriber::spawn(m.connection().clone()))
+                .collect()
+        })
+        .collect();
+    // PRE: P's video reaches each holder's own video slot.
+    for ((s, _, _, v), sub) in holders.iter().zip(subs.iter_mut()) {
+        until_fresh_video_on_slot(
+            &format!("{PHASE} PRE {}", s.label),
+            &mut p_pubs,
+            sub,
+            *v,
+            p_id,
+            None,
+        )
+        .await;
+    }
+
+    // The paused-source baseline, per pod, before any client mute.
+    let paused_base = settled_baseline(
+        &prom,
+        &paused_promql(),
+        COUNTER_BUDGET,
+        "the assertion under test",
+    )
+    .await;
+
+    // STORM, then the audio FENCE.
+    for i in 0..TOGGLES {
+        p.session.write(&mute_request(None, Some(i % 2 == 0))).await;
+    }
+    p.session.write(&mute_request(Some(true), None)).await;
+    for ((s, ..), url) in holders.iter_mut().zip(&urls_before) {
+        s.converge(&format!("{PHASE} FENCE {}", s.label), bound, |v, _| {
+            v.is_some_and(|v| {
+                named_state(v, AUDIO, p_id) == Some(SlotState::AvatarClientMuted as i32)
+            })
+        })
+        .await;
+        let video = s.slots(VIDEO)[0].clone();
+        assert_eq!(
+            (video.slot_state, video.sender_id),
+            (SlotState::AvatarClientMuted as i32, Some(p_id)),
+            "{PHASE}: {} — in the view composed after every toggle, P's video slot shows the \
+             FINAL state (client-muted)",
+            s.label
+        );
+        assert_eq!(
+            &video.media_handler_url, url,
+            "{PHASE}: a client-mute avatar keeps its edge's url"
+        );
+    }
+
+    // PAUSED: fresh frames (a group started after the holders converged) are
+    // still forwarded to both holders, and every pod P sent to counts them as
+    // paused-source arrivals.
+    let since = newest_group(&p_pubs);
+    let mut sent = vec![0_u64; p_pubs.len()];
+    let mut fresh = vec![false; holders.len()];
+    let deadline = Instant::now() + FRAME_DEADLINE;
+    while fresh.iter().any(|f| !f) {
+        assert!(
+            Instant::now() < deadline,
+            "{PHASE} PAUSED: within {FRAME_DEADLINE:?} fresh frames did not reach every holder \
+             ({fresh:?}) — a PAUSED stream is forwarded; DROP_AT_INGRESS would drop them"
+        );
+        for (total, n) in sent.iter_mut().zip(pump(&mut p_pubs).await) {
+            *total += n;
+        }
+        for (i, ((_, _, _, v), sub)) in holders.iter().zip(subs.iter_mut()).enumerate() {
+            fresh[i] |= video_frames(sub).await.iter().any(|f| {
+                u32::from(f.slot_id) == *v
+                    && u32::from(f.key_id_sender) == p_id
+                    && since.is_none_or(|g| f.gop_counter > g)
+            });
+        }
+    }
+    let k = sent.iter().copied().min().unwrap_or(0);
+    assert!(
+        k > 0,
+        "{PHASE} PAUSED: positive control — P transmitted on every pod"
+    );
+    for handler in mh_grpc::handlers() {
+        let base = instance_for_pod_ip(&paused_base, &handler.pod_ip).map_or(0.0, |(_, v)| v);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a frame count of a few dozen; exact in f64"
+        )]
+        let want = base + k as f64;
+        poll_until_pinned_instance(
+            &prom,
+            &paused_promql(),
+            &handler.pod_ip,
+            PINNED_METRIC_BOUND,
+            Duration::from_secs(2),
+            &format!("{PHASE} PAUSED ARRIVALS ({})", handler.name),
+            ">= own baseline + K (P's frames to this pod while client-muted)",
+            |v| v >= want,
+        )
+        .await;
+    }
+
+    // The directive never moved: the first one after d0 is the host's AUDIO
+    // server-mute withdrawal (the fence), with P's video stream untouched.
+    let p_pid = p.join.participant_id.clone();
+    holders[0]
+        .0
+        .session
+        .write(&server_mute(&p_pid, Some(true), None))
+        .await;
+    let deadline = Instant::now() + bound;
+    let next = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{PHASE}: P's audio withdrawal (the fence) never arrived"
+        );
+        if let Some(server_message::Message::SendDirective(d)) =
+            p.session.try_read(remaining).await.and_then(|m| m.message)
+        {
+            break d;
+        }
+    };
+    let mut expected = d0.clone();
+    for stream in &mut expected.streams {
+        if stream.media_kind == AUDIO as i32 {
+            stream.targets.clear();
+        }
+    }
+    assert_eq!(
+        next, expected,
+        "{PHASE}: client mute changed no directive — the first one after the pre-storm \
+         directive is the fence's audio withdrawal, its video stream byte-identical"
+    );
+
+    for publisher in &mut p_pubs {
+        publisher.finish().await;
+    }
+    drop((subs, holders, p_mh));
 }

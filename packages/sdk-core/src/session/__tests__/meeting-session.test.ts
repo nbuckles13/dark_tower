@@ -2270,8 +2270,8 @@ describe('MeetingSession — host hint and server mute (story 2 R-8/R-10/R-11)',
     expect(mute?.message.value).toMatchObject({
       participantId: 'participant-b',
       audioMuted: true,
-      videoMuted: false,
     });
+    expect((mute?.message.value as { videoMuted?: boolean }).videoMuted).toBeUndefined();
     expect(messages.some((m) => m.message.case === 'unmuteRequest')).toBe(true);
   });
 
@@ -2402,7 +2402,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     rig.session.disconnect();
   });
 
-  it('per-kind client mute: each kind changes alone, and BOTH kinds are reported explicitly', async () => {
+  it('per-kind client mute: each kind changes alone, and each report names ONLY that kind', async () => {
     const rig = await joinedRig();
     await rig.session.startMedia();
     rig.session.setVideoMuted(true);
@@ -2415,15 +2415,17 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
       .filter((m) => m.message.case === 'muteRequest')
       .map((m) => m.message.value as { audioMuted?: boolean; videoMuted?: boolean })
       .map((v) => [v.audioMuted, v.videoMuted]);
+    // Decoded from the wire: the unnamed kind is ABSENT (MC: unchanged), never
+    // its current value and never an explicit false.
     expect(reports).toEqual([
-      [false, true],
-      [true, true],
-      [true, false],
+      [undefined, true],
+      [true, undefined],
+      [undefined, false],
     ]);
     rig.session.disconnect();
   });
 
-  it("a host's per-kind server mute carries the target's CURRENT state for the other kind", async () => {
+  it("a host's per-kind server mute names ONLY that kind, whatever the target's other kind", async () => {
     const rig = await joinedRig();
     rig.mc.simulateServerMessage(
       0,
@@ -2439,9 +2441,8 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
       .outbound()
       .filter((m) => m.message.case === 'serverMuteRequest')
       .map((m) => m.message.value);
-    expect(sent).toEqual([
-      expect.objectContaining({ participantId: 'b', audioMuted: true, videoMuted: true }),
-    ]);
+    expect(sent).toEqual([expect.objectContaining({ participantId: 'b', audioMuted: true })]);
+    expect((sent[0] as { videoMuted?: boolean }).videoMuted).toBeUndefined();
     rig.session.disconnect();
   });
 

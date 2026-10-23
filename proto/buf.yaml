@@ -5,13 +5,17 @@ lint:
   use:
     - STANDARD
 # Breaking-change policy: wire compatibility, not source compatibility.
-# FILE keeps package/file/service/RPC/message-deletion detection (WIRE_JSON alone
+# FILE keeps package/file/service/RPC-deletion detection (WIRE_JSON alone
 # misses RPC deletion and package-rename-via-file-move); WIRE_JSON adds the
-# reserve-aware and JSON-name rules. The three FILE rules excepted below are
-# source-only: each has a wire-safe counterpart in WIRE_JSON that still fires
-# (deletion without reserving number AND name; a wire-incompatible cardinality
-# change). Rationale and measured controls: docs/protocol/CONVENTIONS.md
-# §Enforcement (2026-10-20). Do not add `ignore:` here without the human
+# reserve-aware and JSON-name rules. The FILE rules excepted below are
+# source-only: ENUM_VALUE_NO_DELETE / FIELD_NO_DELETE / FIELD_SAME_CARDINALITY
+# each have a wire-safe counterpart in WIRE_JSON that still fires (deletion
+# without reserving number AND name; a wire-incompatible cardinality change).
+# MESSAGE_NO_DELETE (2026-10-23, user decision): a message name is on neither the
+# binary nor the proto3 JSON wire (no `Any` in these protos), and a field still
+# typed by a deleted message must change type or be deleted, which the type and
+# reserve rules catch. Rationale and measured controls: docs/protocol/CONVENTIONS.md
+# §Enforcement (2026-10-20, 2026-10-23). Do not add `ignore:` here without the human
 # acceptance described there; breaking.sh prints SUPPRESSED= if you do.
 breaking:
   use:
@@ -21,3 +25,4 @@ breaking:
     - ENUM_VALUE_NO_DELETE
     - FIELD_SAME_CARDINALITY
     - FIELD_NO_DELETE
+    - MESSAGE_NO_DELETE

@@ -46,7 +46,7 @@ run_guard() {
 # the mutation sits in real field position (not in a comment, not outside a message).
 plant_field() {
   local line="$1"
-  local anchor='  repeated MutedSource server_muted_sources = 7;'
+  local anchor='  repeated SourceStream source_streams = 8;'
   grep -qxF "$anchor" "$INTERNAL" || { echo "self-test precondition: anchor not found in internal.proto" >&2; exit 1; }
   awk -v a="$anchor" -v l="$line" '{print} $0==a {print l}' "$INTERNAL" > "${INTERNAL}.new"
   mv "${INTERNAL}.new" "$INTERNAL"

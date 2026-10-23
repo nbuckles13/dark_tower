@@ -5,11 +5,12 @@
 //! `EgressStream` and `RegisterMeetingRequest` literals were being rebuilt
 //! byte-for-byte in `mh-service`'s `routing` unit tests, its `grpc::mh_service`
 //! unit tests and its `policy_apply_integration` binary. That is three homes
-//! for one fixture, and the field that makes it more than cosmetic is
-//! [`TransportMode::Datagram`]: it is the fixture default all three
-//! independently assert against, and story 3 (video) changes what a default
-//! egress stream looks like. Three copies means three places to find, and the
-//! one that is missed keeps passing while asserting the old world.
+//! for one fixture, and the part that makes it more than cosmetic is the
+//! DECLARATION every registration must carry: MH has one reading of a
+//! registration (its `source_streams`), and an egress whose candidate is not
+//! declared there is rejected. [`register_request`] declares what MC would, so
+//! that rule lives in one place. Three copies means three places to find, and
+//! the one that is missed keeps passing while asserting the old world.
 //!
 //! This crate is the only home reachable from **all three** — it is a
 //! `[dev-dependencies]` edge of `mh-service`, so both `#[cfg(test)]` modules
@@ -27,8 +28,8 @@
 //! describes this crate as providing.
 
 use proto_gen::dark_tower::internal::v1::{
-    CandidateSource, EgressStream, MutedSource, RegisterMeetingRequest, SourceDisposition,
-    SourceStream, SubscriberSlot,
+    CandidateSource, EgressStream, RegisterMeetingRequest, SourceDisposition, SourceStream,
+    SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 
@@ -38,7 +39,9 @@ pub const TEST_MC_ID: &str = "mc-1";
 /// The MC gRPC endpoint every fixture registration claims.
 pub const TEST_MC_ENDPOINT: &str = "http://mc:50052";
 
-/// One datagram egress stream: `subscriber` receives `candidate`'s stream 0.
+/// One egress stream: `subscriber` receives `candidate`'s stream 0. Its
+/// transport is the candidate's declared one (DATAGRAM via
+/// [`register_request`]); an `EgressStream` carries none of its own.
 ///
 /// The subscriber and the candidate are named separately on purpose. Passing
 /// the same id for both is the loopback shape ("hear yourself"), and passing
@@ -64,9 +67,6 @@ pub fn egress(
         }],
         priority_group: 0,
         supersede_on_independent_frame: false,
-        // The fixture default, and the reason this builder has one home:
-        // story 3 (video) changes what a default egress stream looks like.
-        transport_mode: TransportMode::Datagram as i32,
     }
 }
 
@@ -76,7 +76,17 @@ pub fn loopback_egress(egress_stream_id: u32, sender: u32, slot: u32) -> EgressS
     egress(egress_stream_id, sender, slot, sender)
 }
 
-/// A well-formed registration carrying `streams` at `policy_generation`.
+/// A well-formed, MC-SHAPED registration carrying `streams` at
+/// `policy_generation`: `source_streams` declares every distinct candidate
+/// `(sender_id, stream_number)` the egresses name, DATAGRAM and FORWARD, in
+/// first-appearance order — what MC declares for an audio-only meeting.
+///
+/// Only NAMED candidates are declared. A sender with no edge here is
+/// undeclared, so its frames drop `unmatched_stream`; a test that needs such a
+/// sender's frames to reach `no_subscriber` declares it explicitly
+/// ([`register_request_declared`] / [`declare_forward`]). The request is built
+/// from `streams` once: a test that mutates `candidate_sources` afterwards must
+/// re-declare, or MH rejects the undeclared candidate — which is the rule.
 ///
 /// The caller-identity scalars are always valid here: every test that needs a
 /// malformed `meeting_id`, `mc_id` or `mc_grpc_endpoint` is testing the
@@ -89,6 +99,20 @@ pub fn register_request(
     policy_generation: u64,
     streams: Vec<EgressStream>,
 ) -> RegisterMeetingRequest {
+    let mut source_streams: Vec<SourceStream> = Vec::new();
+    for candidate in streams.iter().flat_map(|s| s.candidate_sources.iter()) {
+        let named = source_streams.iter().any(|d| {
+            d.sender_id == candidate.sender_id && d.stream_number == candidate.stream_number
+        });
+        if !named {
+            source_streams.push(source_stream(
+                candidate.sender_id,
+                candidate.stream_number,
+                TransportMode::Datagram,
+                SourceDisposition::Forward,
+            ));
+        }
+    }
     RegisterMeetingRequest {
         meeting_id: meeting_id.to_string(),
         mc_id: TEST_MC_ID.to_string(),
@@ -96,16 +120,35 @@ pub fn register_request(
         egress_streams: streams,
         selection_rules: None,
         policy_generation,
-        // Nobody server-muted: the pre-R-9 wire. A server-mute test mutates
-        // the returned value so the mute is visible at the assertion site.
-        server_muted_sources: Vec::new(),
-        // Story 3: empty selects MH's transitional story-2 reading
-        // (internal.proto `server_muted_sources`).
-        source_streams: Vec::new(),
+        source_streams,
     }
 }
 
-/// `register_request` with `server_muted_sources` set to `muted` (story 2 R-9).
+/// Declare `senders`' stream 0 DATAGRAM FORWARD on `request` where not
+/// already declared — for senders with no edge whose frames a test expects at
+/// `no_subscriber` rather than `unmatched_stream`.
+pub fn declare_forward(request: &mut RegisterMeetingRequest, senders: &[u32]) {
+    for &sender_id in senders {
+        if !request
+            .source_streams
+            .iter()
+            .any(|d| d.sender_id == sender_id && d.stream_number == 0)
+        {
+            request.source_streams.push(source_stream(
+                sender_id,
+                0,
+                TransportMode::Datagram,
+                SourceDisposition::Forward,
+            ));
+        }
+    }
+}
+
+/// [`register_request`] with every sender in `muted` server-muted at the
+/// SENDER level (story 2 R-9, story 3 R-16): each of its declared streams is
+/// `DROP_AT_INGRESS`, and a muted sender no edge names is declared at stream 0
+/// `DROP_AT_INGRESS` so the mute is held for it too (MH's sender-level
+/// shortcut needs at least one declared stream).
 ///
 /// A separate builder rather than a parameter on [`register_request`], so the
 /// mute is visible at every call site that sets one and the dozens of sites
@@ -118,19 +161,29 @@ pub fn register_request_muted(
     muted: &[u32],
 ) -> RegisterMeetingRequest {
     let mut request = register_request(meeting_id, policy_generation, streams);
-    request.server_muted_sources = muted
-        .iter()
-        .map(|sender_id| MutedSource {
-            sender_id: *sender_id,
-        })
-        .collect();
+    for &sender_id in muted {
+        let mut declared = false;
+        for d in &mut request.source_streams {
+            if d.sender_id == sender_id {
+                d.disposition = SourceDisposition::DropAtIngress as i32;
+                declared = true;
+            }
+        }
+        if !declared {
+            request.source_streams.push(source_stream(
+                sender_id,
+                0,
+                TransportMode::Datagram,
+                SourceDisposition::DropAtIngress,
+            ));
+        }
+    }
     request
 }
 
 /// One egress stream: `subscriber`'s `slot` receives `candidate`'s stream
-/// `stream` (story 3). Its superseded `transport_mode` (field 6) is left
-/// UNSPECIFIED, exactly as an MC that declares `source_streams` writes it: the
-/// edge's transport derives from the candidate's declared `SourceStream`.
+/// `stream` (story 3). The edge's transport derives from the candidate's
+/// declared `SourceStream`.
 #[must_use]
 pub fn egress_from(
     egress_stream_id: u32,
@@ -141,7 +194,6 @@ pub fn egress_from(
 ) -> EgressStream {
     let mut e = egress(egress_stream_id, subscriber_sender, slot, candidate_sender);
     e.candidate_sources[0].stream_number = stream;
-    e.transport_mode = TransportMode::Unspecified as i32;
     e
 }
 
@@ -161,8 +213,8 @@ pub fn source_stream(
     }
 }
 
-/// `register_request` with `source_streams` set to `sources` — the declared
-/// (non-transitional) reading.
+/// `register_request` with `source_streams` REPLACED by exactly `sources` —
+/// for tests that state every declaration themselves.
 #[must_use]
 pub fn register_request_declared(
     meeting_id: &str,

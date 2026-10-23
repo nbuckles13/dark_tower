@@ -3,24 +3,22 @@
 // THE one builder for the per-kind fields of `MuteRequest` and
 // `ServerMuteRequest` (story 3 R-15).
 //
-// UNTIL MC-B (story 3 task 15): BOTH kinds are set EXPLICITLY on every request,
-// the unchanged kind carrying its CURRENT state. The fields are `optional bool`
-// and will mean "absent = unchanged", but the controller in service reads an
-// absent kind as `false` (signaling.proto, "INTERIM UNTIL MC-B"), so sending
-// only the changed kind would UNMUTE the other one. Sending only the changed
-// kind is MC-B's switch (lead ruling at P1 review, 2026-10-20). Never both
-// absent: this builder cannot produce that.
+// ONE KIND PER REQUEST. The fields are `optional bool`, and MC reads an ABSENT
+// kind as "unchanged" (signaling.proto, mute section): a request names exactly
+// the kind it changes, and the other kind's field is left ABSENT -- never set
+// to its current value (that would re-assert, and race, a state this client
+// does not own for server mute) and never `false` (that would be an unmute).
+// A request naming no kind is refused and counted by MC; this builder cannot
+// produce one.
 
-/** One participant's mute state, both kinds. */
-export interface PerKindMuteState {
-  readonly audioMuted: boolean;
-  readonly videoMuted: boolean;
-}
+import type { MediaKindToken } from '../media/mediaKind.js';
 
-/** The wire fields for a mute request: both kinds, explicitly. */
-export function explicitMuteFields(state: PerKindMuteState): {
-  audioMuted: boolean;
-  videoMuted: boolean;
-} {
-  return { audioMuted: state.audioMuted, videoMuted: state.videoMuted };
+/** The wire fields for a mute request about ONE kind; the other kind is absent. */
+export type SingleKindMuteFields =
+  | { readonly audioMuted: boolean; readonly videoMuted?: undefined }
+  | { readonly audioMuted?: undefined; readonly videoMuted: boolean };
+
+/** The wire fields for a request setting `kind` to `muted`, the other kind absent. */
+export function singleKindMuteFields(kind: MediaKindToken, muted: boolean): SingleKindMuteFields {
+  return kind === 'audio' ? { audioMuted: muted } : { videoMuted: muted };
 }

@@ -10,8 +10,8 @@
 //! | Module | Responsibility |
 //! |---|---|
 //! | [`capability`] | **parse** a client declaration into a type that cannot hold an invalid slot, then **truncate** it per kind |
-//! | [`directive`] | what the client must **produce** (§5) — no access to mute state |
-//! | [`assignments`] | what the client will **receive** (§6) — the only mute-aware code, and the one `StreamAssignments` construction site |
+//! | [`directive`] | what the client must **produce** (§5) — server mute and watch state, never client mute |
+//! | [`assignments`] | what the client will **receive** (§6) — both mutes (client and server) as slot states, and the one `StreamAssignments` construction site |
 //! | [`outcome`] | the bounded telemetry vocabularies |
 //!
 //! # The causal chain, stated because it is contractual
@@ -88,8 +88,9 @@ pub use directive::{
     AUDIO_FRAME_RATE_MIN_HZ, MIN_KEYFRAME_INTERVAL_MS_CEILING, MIN_KEYFRAME_INTERVAL_MS_FLOOR,
 };
 pub use outcome::{
-    CapabilityOutcome, DirectiveOutcome, MediaKindLabel, MuteOutcome, RefusalReplySurface,
-    ServerMuteAction, ServerMuteOutcome, SlotViewEmission, UnmuteRequestOutcome, WithdrawalReason,
+    CapabilityOutcome, DirectiveOutcome, MediaKindLabel, MuteOutcome, MuteRejection, MuteSurface,
+    RefusalReplySurface, ServerMuteAction, ServerMuteOutcome, SlotViewEmission,
+    UnmuteRequestOutcome, WithdrawalReason,
 };
 
 /// The configured inputs to client-facing media signalling, as one value.
@@ -121,7 +122,7 @@ pub struct ClientMediaConfig {
     /// THE values MC truncates every declaration to, publishes
     /// (`mc_media_receive_slot_cap{media_kind}`) and advertises
     /// (`JoinResponse.max_audio_receive_slots` / `max_video_receive_slots`).
-    pub max_receive_slots: [u8; 2],
+    pub receive_slot_caps: [u8; 2],
     /// Maximum ACCEPTED declarations per connection
     /// (`MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`).
     pub max_receive_capability_declarations: u32,

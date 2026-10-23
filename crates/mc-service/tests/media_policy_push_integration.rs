@@ -427,9 +427,8 @@ async fn pushed_request_carries_the_two_party_policy_and_a_non_zero_generation()
             !stream.supersede_on_independent_frame,
             "every audio frame forwards; MH is told the behaviour, never the media type"
         );
-        // No longer written (story 3): derived at MH from the candidate's
+        // An edge's transport is derived at MH from the candidate's
         // `SourceStream`, which carries DATAGRAM for stream 0.
-        assert_eq!(stream.transport_mode, TransportMode::Unspecified as i32);
         let declared = request
             .source_streams
             .iter()

@@ -26,6 +26,7 @@ import type {
   PipelineKekSource,
 } from '../media/lifecycle/AudioPipeline.js';
 import type { MuteSnapshot, MuteState } from '../media/lifecycle/muteState.js';
+import type { MediaKindToken } from '../media/mediaKind.js';
 import { TransmitKeyManager, rotateOnKekChange } from '../media/lifecycle/transmitKeys.js';
 import { VideoPublisher } from '../media/lifecycle/VideoPublisher.js';
 import type { MediaTransport } from '../media/MediaTransport.js';
@@ -111,7 +112,7 @@ export interface SessionMediaDeps {
   readonly declaration: readonly ReceiveSlotDeclaration[];
   readonly media: MediaTransport | undefined;
   readonly mute: MuteState;
-  readonly reportMute: (state: MuteSnapshot) => void;
+  readonly reportMute: (kind: MediaKindToken, muted: boolean) => void;
   readonly seams: SessionMediaSeams;
   readonly verification: ReceiveVerificationRecorder | undefined;
   readonly clock: () => number;

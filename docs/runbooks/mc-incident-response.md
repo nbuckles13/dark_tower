@@ -2074,7 +2074,9 @@ sum by (outcome) (rate(mc_media_send_directives_total{outcome!~"emitted|emitted_
 
 **Withdrawals: `mc_media_send_directive_withdrawals_total{media_kind, reason}`.** This is the
 per-kind, per-cause record of a published kind being directed to send nothing. `reason="unwatched"`
-is emitted since MC-A; `reason="server_muted"` is zero-initialised and emitted from MC-B. It counts a
+is emitted since MC-A; `reason="server_muted"` since MC-B (zero-initialised, so "present and flat"
+is meaningful). The reason is the cause at delivery; a server mute of an already-unwatched stream is
+no transition and counts nothing, and an unmute never counts. It counts a
 stream whose targets went from non-empty to empty on a DELIVERED directive (not per re-render, not on
 a reconnect's fresh view); a withdrawal whose delivery failed shows only on
 `mc_media_slot_view_emissions_total{outcome="delivery_failed"}`.
@@ -2086,9 +2088,10 @@ a reconnect's fresh view); a withdrawal whose delivery failed shows only on
 | `server_muted` | **normal** (moderation) | A host server-muted that kind (R-16). Capture stops, and for video the camera light goes off. | `mc_media_server_mute_requests_total{action="mute",outcome="applied",media_kind="<same kind>"}` (Scenario 21). The `action` matcher matters: the counter counts per kind, so an applied unmute of the same kind would otherwise match. |
 
 The faults are a **missing** withdrawal and a withdrawal that did not take, never the existence of
-one. "Camera light still on after server mute" and "client sending while muted" are client-side
-and MH-side signals, triaged in Scenario 21 and MH Scenario 19 and extended to video by OPS-B.
-They are not read off this counter. **OBS-B writes the alert rule for the fault tokens above**, and
+one. A server mute of a WATCHED stream that did not move `{reason="server_muted"}` for that kind is
+MC's side of "camera light still on after server mute" (Scenario 21 Step 1b); whether the client
+then stopped capture, and "client sending while muted", are client-side and MH-side signals,
+triaged in Scenario 21 and MH Scenario 19 and extended to video by OPS-B. **OBS-B writes the alert rule for the fault tokens above**, and
 no rule is written here (`docs/TODO.md` §Media Path Obligations, "`mc_media_send_directives_total`
 has no alert rule …").
 
@@ -2121,11 +2124,12 @@ so a dashboard series for it is pre-deploy history.
 sum by (slot_state) (rate(mc_media_slot_states_total[5m]))
 ```
 
-`active` is the healthy value. **Nothing emits `source_muted`** (story 2's single mute state; MC-B
-removes it from the vocabulary): a muted occupant is `avatar_client_muted` or `avatar_server_muted`
+`active` is the healthy value. A muted occupant is `avatar_client_muted` or `avatar_server_muted`
 (server wins when both), per kind, and a video slot whose occupant publishes no video is
-`avatar_no_video` (precedence over any mute), all normal. Reading a flat `source_muted` as "nobody
-is muted" is wrong; a non-zero `source_muted` is an MC defect or a pre-MC-A image. The `slot_state`
+`avatar_no_video` (precedence over any mute), all normal. *(History: story 2's single mute state
+`source_muted` was deleted from the wire and from the `slot_state` domain by MC-B on 2026-10-23.
+The series is now ABSENT, not flat — a query or a "non-zero `source_muted`" check selects nothing;
+read the two avatar tokens instead.)* The `slot_state`
 label tokens you query come from
 `slot_state_label()` (`crates/mc-service/src/media_signaling/assignments.rs`), and their wire
 source is `SlotState` in `proto/dark_tower/signaling/v1/signaling.proto`. The tokens emitted are `active`, `fewer_sources_than_slots`, `avatar_no_video`, `unavailable`,
@@ -2146,11 +2150,15 @@ precisely because the vocabulary was not pruned to the reachable subset.
 
 **4. `mc_media_mute_requests_total{outcome, media_kind}` — is client mute landing, and is one
 connection driving meeting-wide work?** Note the failure predicate is stated
-**positively**, unlike the two above. **Counting unit (story 3): one increment per
-(request, named kind)** — until MC-B every request names both kinds, so rates are
-roughly double what they read before story 3; that is the counting unit, not traffic.
+**positively**, unlike the two above. **Counting unit: one increment per
+(request, NAMED kind)** — an absent per-kind field means "unchanged" and is not
+counted, and the SDK names only the kind it changed. **Rates roughly HALVED at MC-B
+(2026-10-23)** against the story-3 interim that counted both kinds on every request
+(which had roughly doubled them) — a counting-unit change, not a traffic drop.
 Request-level outcomes (`unchanged`, `rate_limited`, `actor_unavailable`) land once
-on each kind:
+on each named kind. A request naming NO kind is rejected and counted on
+`mc_media_mute_requests_rejected_total{surface="client_mute", reason="no_kind_named"}`
+instead (client-inflatable, expected zero; never a denominator):
 
 ```promql
 # POSITIVE form on purpose. Do NOT "harmonise" this to outcome!~"..." to match
@@ -2161,9 +2169,8 @@ sum by (outcome) (rate(mc_media_mute_requests_total{outcome=~"rate_limited|actor
 
 | Token | Meaning |
 |---|---|
-| `applied` | This kind's flag moved (either kind, since MC-A); the meeting actor re-renders (the stream's PAUSED disposition at MH) and re-emits the changed slot view to the subscribers HOLDING this source whose view changed. A camera button is `{media_kind="video", outcome="applied"}` plus `unchanged` on audio, and it is healthy. A failed re-emit is counted by the actor on counter 2 and on `mc_media_slot_view_emissions_total{outcome="composition_failed"}`. |
-| `applied_no_recompose` | **Unreachable since MC-A** (every connection is declared from its join, and a moved flag of either kind recomposes). Zero-initialised until MC-B reshapes per-kind mute; a non-zero value is an MC defect. |
-| `unchanged` | This kind's state did not move: the whole-request identical repeat (no actor hop), or the unmoved kind of an applied request (a camera toggle is `unchanged` on audio). **Not a denominator — see below.** |
+| `applied` | This named kind's flag moved; the meeting actor re-renders (the stream's PAUSED disposition at MH) and re-emits the changed slot view to the subscribers HOLDING this source whose view changed. A camera button is `{media_kind="video", outcome="applied"}` alone (audio is not named), and it is healthy. A failed re-emit is counted by the actor on counter 2 and on `mc_media_slot_view_emissions_total{outcome="composition_failed"}`. |
+| `unchanged` | This named kind's state did not move: the identical repeat (no actor hop), or a named kind the actor found already in that state. **Not a denominator — see below.** |
 | `rate_limited` | The per-connection mute-work token bucket is exhausted (burst 8, sustained 4/s — `MUTE_WORK_BURST` / `MUTE_WORK_REFILL_INTERVAL_MS` in `webtransport/connection.rs`). |
 | `actor_unavailable` | Environmental and terminal. Pairs with `meeting_state_unavailable` above — check actor health, Scenarios 1 and 2. |
 
@@ -2173,7 +2180,8 @@ fires *before* any actor hop, roster read or recomposition, so a client repeatin
 one state drives `unchanged` at line rate for the cost of a tuple compare and a
 counter increment. "What fraction of mute reports are being applied", computed
 over it, is **a number one participant can drive to zero**. The denominator is
-`applied` + `applied_no_recompose`.
+`applied`. *(History: `applied_no_recompose`, unreachable since MC-A, was removed by
+MC-B on 2026-10-23; its series is absent.)*
 
 **`unchanged` is exempt from the rate limiter on purpose — do not "fix" the
 ordering.** Reversing it would let a client spamming a steady state drain its own
@@ -3483,17 +3491,21 @@ is healthy.
 
 ### Scenario 21: Server Mute Not Enforced
 
-**The symptom**: "The host muted someone and we can still hear them", or the reverse, "I was
-unmuted by the host and nobody can hear me".
+**The symptom**: "The host muted someone and we can still hear (or see) them", "the camera light is
+still on after a server mute", or the reverse, "I was unmuted by the host and nobody can hear me".
 
-**How server mute works (story 2 task 12, R-8..R-11).** Only a HOST (the meeting creator's
-`MeetingRole::Host` claim) may server-mute. MC records the mute, broadcasts who-muted-whom to every
-participant (including the muted one, and replays it to late joiners), and programs the muted
-participant's sender id into `server_muted_sources` on the next registration snapshot to every
-handler carrying that sender's edges — a change to the muted set alone advances
-`policy_generation`. MH drops the muted sender's frames at ingress. A participant's
-`UnmuteRequest` is only RELAYED to the host; it never lifts the mute. A server mute survives a
-reconnect within grace, and does not survive a fresh join.
+**How server mute works (story 2 task 12, R-8..R-11; per kind since story 3 MC-B, R-15..R-18).**
+Only a HOST (the meeting creator's `MeetingRole::Host` claim) may server-mute, and each request
+names the kinds it changes (an unnamed kind is unchanged). For a muted kind MC, in one structural
+change: records the mute; broadcasts who-muted-whom to every participant (including the muted one,
+FIRST, and replays it to late joiners); declares that kind's stream `DROP_AT_INGRESS` in
+`source_streams` on the next registration snapshot to every handler (edges kept, so MH counts what
+it drops; the disposition change advances `policy_generation`); **withdraws that kind's send
+directive** (the stream stays listed with empty targets, so the client stops capture and, for
+video, the camera light goes off); and re-emits `avatar_server_muted` to the holders. MH's ingress
+drop is the BACKSTOP against a patched client. A participant's `UnmuteRequest` is only RELAYED to
+the host; it never lifts the mute. A server mute survives a reconnect within grace, and does not
+survive a fresh join. A server UNMUTE restores the directive whatever the client mute.
 
 **Step 1 — did the host's request land?**
 
@@ -3501,9 +3513,12 @@ reconnect within grace, and does not survive a fresh join.
 sum by (action, outcome, media_kind) (increase(mc_media_server_mute_requests_total[15m]))
 ```
 
-One increment per (request, named kind), `action` being that kind's direction — so one
-host request muting audio reads `mute/applied/audio` plus `unmute/unchanged/video` (or
-`applied`, if video had been server-muted). `applied` is the success. `unchanged` means THIS kind was already in the requested state; the request's other kind may still have been applied and pushed. `not_permitted`
+One increment per (request, NAMED kind), `action` being that kind's direction — so one
+host request muting audio reads `mute/applied/audio` and nothing on video (the SDK names only the
+kind it changes). **Rates roughly halved at MC-B (2026-10-23)** against the story-3 interim that
+counted both kinds on every request — counting unit, not traffic. A request naming NO kind is
+counted only on `mc_media_mute_requests_rejected_total{surface="server_mute", reason="no_kind_named"}`
+(any requester, so `not_permitted` undercounts non-hosts by exactly those). `applied` is the success. `unchanged` means THIS named kind was already in the requested state; another named kind may still have been applied and pushed. `not_permitted`
 means the requester was not a host — refused BEFORE the target was looked at, so a non-host learns
 nothing. `unknown_target` (host only) means the named participant is not in the meeting.
 `rate_limited` is the per-connection bound. The `mc.webtransport.connection` INFO line
@@ -3513,6 +3528,19 @@ the meeting-scoped record. A refusal reaches the requester as one generic `Forbi
 request refused" tells them apart). Refusal replies are rate-limited, and a suppressed reply is counted
 on `mc_media_refusal_replies_suppressed_total{surface="server_mute"}`, so a looping client may see no
 error at all.
+
+**Step 1b — did MC withdraw the directive?** For a server MUTE of a kind someone was watching:
+
+```promql
+sum by (media_kind) (increase(mc_media_send_directive_withdrawals_total{reason="server_muted"}[15m]))
+```
+
+It rises by one per muted, watched stream when the withdrawn directive is DELIVERED. It is
+zero-initialised, so present-and-flat after an `applied` mute of a watched kind means MC did not
+withdraw (an MC defect) or could not deliver
+(`mc_media_slot_view_emissions_total{outcome="delivery_failed"}`). If it DID rise and the camera
+light is still on, the client did not act on the empty targets — a client-side fault (C-C1 /
+`client-dev-local.md`); MH's ingress drop still holds the line meanwhile (Step 3).
 
 **Step 2 — does MC believe a mute is in force?** `mc_media_server_muted_sources{media_kind}` is the
 number of server-muted (participant, kind) SOURCES MC holds, per kind, summed across this pod's
@@ -3526,10 +3554,14 @@ across MC instances and kinds — since story 3 MC-A each kind's server mute rea
 stream's `DROP_AT_INGRESS` disposition, so a video server mute drops video at ingress like an audio
 one drops audio. Compare it against `sum(rate(mh_media_frames_dropped_total{reason="server_muted"}[5m]))` across MH
 instances. Never divide a level by a rate, and never compare per instance (MC and MH meeting sets
-do not nest). A gauge above zero with a flat drop rate is only a candidate disagreement, and only
-after excluding a muted source that is silent, disconnected, in grace, not yet on that handler or
-not publishing the muted kind —
-a drop counter reads zero for all of those.
+do not nest). **Since MC-B (2026-10-23) a gauge above zero with fleet drops near zero is the NORMAL
+shape**: a server mute withdraws the kind's send directive, so a compliant client stops sending and
+MH has nothing to drop. The comparison now detects only a sender that IGNORED its empty targets (a
+patched or faulty client). So Step 1b is the primary MC-side evidence; read this step only after it.
+A gauge above zero with a flat drop rate is not even a candidate disagreement until you have
+excluded, in order: a compliant client that honoured the withdrawal (Step 1b rose — the dominant
+cause), and a muted source that is silent, disconnected, in grace, not yet on that handler or not
+publishing the muted kind — a drop counter reads zero for all of those.
 
 **Step 4 — did the snapshot reach MH?** A mute that landed in MC but not at MH is a push problem:
 `mc_media_policy_pushes_total{outcome}` and Scenario 12 / Scenario 15. Server mute rides the same
@@ -3538,8 +3570,15 @@ snapshot as every other policy change, so a push that is failing fails for the m
 **Not a mute problem**: a participant who muted THEMSELF (client mute, enforced at capture, ADR-0036
 §5) — `mc_media_mute_requests_total`. The slot state tells them apart, per kind:
 `avatar_client_muted` versus `avatar_server_muted`, server winning when both (story 2's single
-`source_muted` covered both and is no longer emitted; MC-B removes it). The `ParticipantMuteUpdate`
-a client receives also carries who muted whom.
+`source_muted` covered both; MC-B deleted it). The `ParticipantMuteUpdate` a client receives also
+carries who muted whom.
+
+**Benign arm of "I was unmuted by the host and nobody can hear me"**: the host lifted the server
+mute, which RESTORED the participant's send directive — but the participant is still CLIENT-muted
+for that kind, so its client keeps capture off (by design: ADR-0036 §5, a host action resumes
+capture only unless the participant has client-muted). The holders' slot reads
+`avatar_client_muted` (no longer `avatar_server_muted`), and the participant's own mute control is
+on. Remedy: the participant unmutes themself. Not an MC fault.
 
 **Escalation**: the routing for "applied at MC, confirmed, MH still forwards" (MH defect) and "applied
 at MC, not confirmed" (push path) is decided in one place, MH Scenario 19 Arms 3 and 4. Route from

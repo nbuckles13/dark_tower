@@ -69,6 +69,7 @@ import type {
 import type { RejectReason } from '../frame/rejectReason.js';
 import { TeardownRegistry, teardownFailureMessage } from '../teardown/teardown.js';
 import { MuteState, type MuteSnapshot } from './muteState.js';
+import type { MediaKindToken } from '../mediaKind.js';
 import { uplinkRelayStreamId } from '../pipeline/sendId.js';
 import { MediaCaptureError, classifyCaptureError } from '../setup/captureFailure.js';
 import { MEDIA_CAPTURE_FAILURE_OUTCOMES } from '../setup/mediaMetrics.js';
@@ -254,10 +255,11 @@ export interface AudioPipelineOptions {
    */
   readonly mute?: MuteState;
   /**
-   * Reports client mute to MC — BOTH kinds' current state (`signaling/muteRequest.ts`).
-   * Informational; the local state changes first.
+   * Reports ONE kind's client mute to MC (`signaling/muteRequest.ts`; the
+   * other kind's field stays absent = unchanged). Best-effort; the local state
+   * changes first.
    */
-  readonly reportMute: (state: MuteSnapshot) => void;
+  readonly reportMute: (kind: MediaKindToken, muted: boolean) => void;
   readonly captureFactory: CaptureSourceFactory;
   /**
    * Whether this participant PUBLISHES audio (story 3 R-2: the frozen publish
@@ -757,9 +759,9 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    * Set client mute.
    *
    * Local first, always: the state changes before MC is told, and unmute resumes
-   * capture with NO server round trip while the kind is still directed. MC MAY
-   * leave the send directive in place under client mute (signaling.proto
-   * `SendDirective`; ADR-0036 §5, correction 2026-10-13), so "MC has not asked
+   * capture with NO server round trip while the kind is still directed. The
+   * send directive never depends on client mute (signaling.proto
+   * `SendDirective`; ADR-0036 §5, amendment 2026-10-23), so "MC has not asked
    * you to send" and "you have muted yourself" stay distinguishable.
    */
   setAudioMuted(muted: boolean): void {
@@ -770,11 +772,12 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     if (!muted) this.#transmitKeys.rotate();
     const snapshot = this.#mute.snapshot();
     this.emit('muteChanged', snapshot);
-    // Informational, and deliberately last. A failure to report must not undo
+    // Best-effort, and deliberately last. A failure to report must not undo
     // the local suppression: ADR-0036 §5 requires client mute to hold without
-    // the server honouring it. BOTH kinds: video's current state rides along
-    // unchanged (story 3 R-15; `signaling/muteRequest.ts`).
-    this.#options.reportMute(snapshot);
+    // the server honouring it. AUDIO only: the request names the kind it
+    // changed, so MC leaves video exactly as it is (story 3 R-15;
+    // `signaling/muteRequest.ts`).
+    this.#options.reportMute('audio', muted);
   }
 
   /**

@@ -195,8 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy_apply_timeout_ms = config.policy_limits.policy_apply_timeout_ms,
         // Registered-meeting cap (story 2 R-21), a resource guard.
         max_registered_meetings = config.policy_limits.max_registered_meetings,
-        // Source-stream bound (story 3), a pre-allocation guard; also bounds
-        // the superseded `server_muted_sources`.
+        // Source-stream bound (story 3), a pre-allocation guard.
         max_source_streams_per_meeting = config.policy_limits.max_source_streams_per_meeting,
         // The shared media-codec-profile values both derived costs come from.
         media_audio_max_bitrate_bps = config.media_codec_profile.audio_max_bitrate_bps,

@@ -163,12 +163,11 @@ fn sender_id_valid_in_one_meeting_does_not_resolve_in_another() {
         attribute(&snapshot, "meeting-a", 5, 0, DGRAM),
         Seen::Route(false, vec![1])
     );
-    // Negative arm: meeting B's routes hold no edge fed by sender 5. (Under
-    // the transitional reading stream 0 is declared for ANY sender, so the
-    // frame attributes — and reaches NOTHING, which is the property.)
+    // Negative arm: meeting B declares nothing for sender 5, so its frame is
+    // unmatched — it reaches NOTHING, which is the property.
     assert_eq!(
         attribute(&snapshot, "meeting-b", 5, 0, DGRAM),
-        Seen::Route(false, vec![])
+        Seen::Unmatched
     );
     // And B's own sender still resolves, so the negative arm is not just
     // "meeting B is empty".
@@ -178,7 +177,7 @@ fn sender_id_valid_in_one_meeting_does_not_resolve_in_another() {
     );
     assert_eq!(
         attribute(&snapshot, "meeting-a", 7, 0, DGRAM),
-        Seen::Route(false, vec![])
+        Seen::Unmatched
     );
 }
 
@@ -320,118 +319,47 @@ fn a_sender_with_no_declared_stream_is_unmatched_not_server_muted() {
     assert_eq!(attribute(&snapshot, "m", 9, 0, DGRAM), Seen::Unmatched);
 }
 
-/// UNION reading (`internal.proto` field 7, NON-EMPTY bullet): a sender FORWARD
-/// in `source_streams` but present in `server_muted_sources` drops
-/// `server_muted` on every stream, unattributable frames included; its streams
-/// are still echoed.
+// -- no fallback reading (MC-B) -------------------------------------------------
+
+/// MC-B deleted the story-2 transitional reading: an absent/empty
+/// `source_streams` declares NOTHING, so every candidate is undeclared and the
+/// registration rejects `rejected_transport_inconsistent` through the generic
+/// undeclared-candidate rule — no new token, never a stream-0 fallback.
 #[test]
-fn union_muted_sender_drops_server_muted_whatever_source_streams_says() {
-    let mut req = mixed(FWD, FWD);
-    req.server_muted_sources = register_request_muted("m", 1, vec![], &[5]).server_muted_sources;
-    let table = install(&req);
-    let snapshot = table.load();
-    assert_eq!(attribute(&snapshot, "m", 5, 0, DGRAM), Seen::ServerMuted);
-    assert_eq!(attribute(&snapshot, "m", 5, 7, DGRAM), Seen::ServerMuted);
-    assert_eq!(
-        attribute(&snapshot, "m", 6, 0, DGRAM),
-        Seen::Route(false, vec![])
-    );
-    assert_eq!(
-        snapshot
-            .applied_source_streams_for(&MeetingKey::new("m"))
-            .len(),
-        3,
-        "a union-muted sender's streams are still declared and echoed"
-    );
-}
-
-// -- the transitional (story-2) reading ---------------------------------------
-
-/// Empty `source_streams`: stream 0 DATAGRAM for ANY sender (named or not),
-/// every other label unmatched, muted senders via the shortcut.
-#[test]
-fn transitional_reading_reproduces_story_2() {
-    let table = RoutingTable::unbounded_for_tests();
-    let req = register_request_muted("m", 1, vec![egress(1, 6, 0, 5), egress(2, 5, 0, 6)], &[6]);
-    table.install(&parse(&req).unwrap());
-    let snapshot = table.load();
-
-    assert_eq!(
-        attribute(&snapshot, "m", 5, 0, DGRAM),
-        Seen::Route(false, vec![1])
-    );
-    // A sender the registration does not name is still declared stream 0:
-    // an unwatched sender is no_subscriber, never unmatched_stream.
-    assert_eq!(
-        attribute(&snapshot, "m", 9, 0, DGRAM),
-        Seen::Route(false, vec![])
-    );
-    // Any other label is unmatched (it never falls through to Route).
-    assert_eq!(attribute(&snapshot, "m", 5, 1, DGRAM), Seen::Unmatched);
-    assert_eq!(attribute(&snapshot, "m", 5, 7, DGRAM), Seen::Unmatched);
-    assert_eq!(attribute(&snapshot, "m", 5, 256, DGRAM), Seen::Unmatched);
-    // Stream 0 on the stream transport is a mismatch.
-    assert_eq!(
-        attribute(&snapshot, "m", 5, 0, SPG),
-        Seen::TransportMismatch
-    );
-    // Sender-level server mute, unattributable frames included.
-    assert_eq!(attribute(&snapshot, "m", 6, 0, DGRAM), Seen::ServerMuted);
-    assert_eq!(attribute(&snapshot, "m", 6, 7, DGRAM), Seen::ServerMuted);
-
-    // The echo: one {sender, 0, DATAGRAM} per NAMED sender, first appearance
-    // (candidates, then muted) — and field 5 as story 2 echoed it.
-    let routes = snapshot.routes_for(&MeetingKey::new("m")).unwrap();
-    let echo: Vec<(u32, u32, i32)> = routes
-        .applied_source_streams()
-        .iter()
-        .map(|e| (e.sender_id, e.stream_number, e.transport_mode))
-        .collect();
-    assert_eq!(echo, vec![(5, 0, DGRAM as i32), (6, 0, DGRAM as i32)]);
-    assert_eq!(routes.legacy_transport_echo(), DGRAM);
-}
-
-#[test]
-fn transitional_reading_with_no_egress_echoes_unspecified() {
-    let table = RoutingTable::unbounded_for_tests();
-    table.install(&policy("m", 1, vec![]));
-    assert_eq!(
-        table
-            .load()
-            .legacy_transport_echo_for(&MeetingKey::new("m")),
-        TransportMode::Unspecified
-    );
-}
-
-#[test]
-fn transitional_reading_rejects_a_non_datagram_or_unspecified_egress() {
-    let mut stream = egress(1, 5, 0, 5);
-    stream.transport_mode = SPG as i32;
-    let rejection = parse(&request("m", 1, vec![stream])).unwrap_err();
-    assert_eq!(rejection, PolicyRejection::TransitionalNonDatagramEgress);
+fn empty_source_streams_with_a_candidate_bearing_egress_rejects_transport_inconsistent() {
+    let mut req = request("m", 1, vec![egress(1, 6, 0, 5)]);
+    // Positive control on the identical input: declared, it applies — so the
+    // reject below is the missing declaration and nothing else.
+    assert!(parse(&req).is_ok(), "control: the declared request applies");
+    req.source_streams.clear();
+    let rejection = parse(&req).unwrap_err();
+    assert_eq!(rejection, PolicyRejection::UndeclaredCandidate);
     assert_eq!(
         rejection.outcome(),
         PolicyApplyOutcome::RejectedTransportInconsistent
     );
-
-    for bad in [TransportMode::Unspecified as i32, 9_999] {
-        let mut stream = egress(1, 5, 0, 5);
-        stream.transport_mode = bad;
-        let rejection = parse(&request("m", 1, vec![stream])).unwrap_err();
-        assert_eq!(rejection, PolicyRejection::UnspecifiedTransportMode);
-        assert_eq!(rejection.outcome(), PolicyApplyOutcome::RejectedInvalid);
-    }
 }
 
-/// A transitional candidate naming a stream other than 0 is undeclared.
+/// Boundary positive controls for the reject above: it is the CANDIDATE that
+/// is undeclared, not the empty list that is refused. An empty registration
+/// (the env-test probe shape) and an egress with zero candidates (a legal edge
+/// that forwards nothing) both still apply with empty `source_streams`.
 #[test]
-fn transitional_candidate_on_another_stream_is_undeclared() {
-    let mut stream = egress(1, 5, 0, 6);
-    stream.candidate_sources[0].stream_number = 1;
-    assert_eq!(
-        parse(&request("m", 1, vec![stream])),
-        Err(PolicyRejection::UndeclaredCandidate)
+fn empty_source_streams_without_candidates_still_applies() {
+    let mut req = request("m", 1, vec![]);
+    req.source_streams.clear();
+    assert!(
+        parse(&req).is_ok(),
+        "the empty (probe) registration applies"
     );
+
+    let mut stream = egress(1, 6, 0, 5);
+    stream.candidate_sources.clear();
+    let mut req = request("m", 1, vec![stream]);
+    req.source_streams.clear();
+    let parsed = parse(&req).unwrap();
+    assert_eq!(parsed.edges.len(), 1);
+    assert_eq!(parsed.edges[0].transport, None);
 }
 
 // -- declared-path apply-time rejects -----------------------------------------
@@ -461,11 +389,6 @@ fn a_mixed_mode_registration_applies_and_echoes_every_declared_stream() {
         ],
         "every declared stream, in request order, PAUSED included"
     );
-    // The declared path's superseded field-5 echo is always UNSPECIFIED.
-    assert_eq!(
-        snapshot.legacy_transport_echo_for(&meeting),
-        TransportMode::Unspecified
-    );
 }
 
 #[test]
@@ -473,16 +396,6 @@ fn heterogeneous_modes_across_egresses_are_legal() {
     // The retired story-2 reject: one meeting mixes DATAGRAM and
     // STREAM_PER_GROUP egresses.
     assert!(parse(&mixed(FWD, FWD)).is_ok());
-}
-
-#[test]
-fn the_superseded_egress_transport_field_is_ignored_on_the_declared_path() {
-    // MC-A stops writing field 6; rejecting UNSPECIFIED there would reject
-    // every MC-A registration.
-    let mut req = mixed(FWD, FWD);
-    req.egress_streams[0].transport_mode = TransportMode::Unspecified as i32;
-    req.egress_streams[1].transport_mode = 9_999;
-    assert!(parse(&req).is_ok());
 }
 
 #[test]
@@ -798,15 +711,11 @@ fn install_publishes_generation_and_the_echo() {
     let table = RoutingTable::unbounded_for_tests();
     let meeting = MeetingKey::new("m");
     assert_eq!(table.load().generation_for(&meeting), 0);
-    assert_eq!(
-        table.load().legacy_transport_echo_for(&meeting),
-        TransportMode::Unspecified
-    );
     assert_eq!(table.load().applied_source_streams_for(&meeting).len(), 0);
 
     table.install(&policy("m", 7, vec![egress(1, 5, 0, 5)]));
     assert_eq!(table.load().generation_for(&meeting), 7);
-    assert_eq!(table.load().legacy_transport_echo_for(&meeting), DGRAM);
+    assert_eq!(table.load().applied_source_streams_for(&meeting).len(), 1);
 }
 
 #[test]
@@ -933,63 +842,13 @@ fn remove_of_an_absent_meeting_does_not_swap_and_reinstall_is_fresh() {
     assert_eq!(table.load().total_edges(), 1);
 }
 
-// -- server mute (superseded set; transitional + union input) --------------------
-
-#[test]
-fn muted_count_bound_is_the_source_stream_bound_and_fires_first() {
-    let limits = PolicyLimits {
-        max_source_streams_per_meeting: 1,
-        ..PolicyLimits::for_tests()
-    };
-    // Over the bound AND duplicated AND malformed: the COUNT must be what
-    // fires, proving it ran before the dedup `HashSet` sized by the
-    // attacker-controlled field was allocated.
-    let req = register_request_muted("m", 1, vec![], &[0, 0]);
-    assert_eq!(
-        MeetingPolicy::from_request(&req, &limits),
-        Err(PolicyRejection::TooManyMutedSources)
-    );
-    // At the bound is fine.
-    let req = register_request_muted("m", 1, vec![], &[3]);
-    assert!(MeetingPolicy::from_request(&req, &limits).is_ok());
-}
-
-#[test]
-fn muted_count_bound_precedes_the_egress_shape_walk() {
-    let limits = PolicyLimits {
-        max_source_streams_per_meeting: 1,
-        ..PolicyLimits::for_tests()
-    };
-    let mut stream = egress(1, 5, 0, 5);
-    stream.subscriber = None;
-    let req = register_request_muted("m", 1, vec![stream], &[1, 2]);
-    assert_eq!(
-        MeetingPolicy::from_request(&req, &limits),
-        Err(PolicyRejection::TooManyMutedSources)
-    );
-}
-
-#[test]
-fn duplicate_muted_sender_rejects_whole_registration() {
-    let req = register_request_muted("m", 1, vec![egress(1, 5, 0, 6)], &[6, 6]);
-    assert_eq!(parse(&req), Err(PolicyRejection::DuplicateMutedSource));
-}
-
-#[test]
-fn malformed_muted_sender_id_rejects_through_the_same_width_rule() {
-    for (value, expected) in [
-        (0, IdError::SenderIdZero),
-        (65_536, IdError::SenderIdOutOfRange),
-    ] {
-        let req = register_request_muted("m", 1, vec![], &[value]);
-        assert_eq!(parse(&req), Err(PolicyRejection::Id(expected)));
-    }
-}
+// -- sender-level server mute (every declared stream DROP_AT_INGRESS) ----------
 
 #[test]
 fn muted_sender_with_no_edge_here_is_held_not_rejected() {
-    // Sender 9 sources nothing on this handler and may not be connected:
-    // `internal.proto` says HOLD (it stays muted when it attaches).
+    // Sender 9 sources nothing on this handler and may not be connected: its
+    // declared DROP_AT_INGRESS stream is HELD (it stays muted when it
+    // attaches).
     let table = RoutingTable::unbounded_for_tests();
     let req = register_request_muted("m", 1, vec![egress(1, 5, 0, 6)], &[9]);
     table.install(&parse(&req).unwrap());
@@ -998,7 +857,7 @@ fn muted_sender_with_no_edge_here_is_held_not_rejected() {
         .is_server_muted(&MeetingKey::new("m"), sender(9)));
 }
 
-/// The two-meeting pin for the muted set (@security S-2). A handler-global
+/// The two-meeting pin for server mute (@security S-2). A handler-global
 /// muted set keyed on the wire integer passes every single-meeting test and
 /// silences an innocent sender in meeting B.
 #[test]
@@ -1071,7 +930,7 @@ fn declarations_match_is_order_insensitive_set_equality() {
     assert!(routes.declarations_match(&parse(&reordered).unwrap().declarations));
     // A disposition toggle is a different declaration.
     assert!(!routes.declarations_match(&parse(&mixed(FWD, FWD)).unwrap().declarations));
-    // The transitional reading is never equal to a declared one.
+    // Declaring nothing is never equal to a declaration.
     assert!(!routes.declarations_match(&policy("m", 1, vec![]).declarations));
     assert_eq!(routes.declared_count(), 3);
     assert_eq!(routes.server_muted_count(), 0);
@@ -1095,8 +954,6 @@ fn multiple_candidates_all_index_the_same_edge() {
         attribute(&snapshot, "m", 6, 0, DGRAM),
         Seen::Route(false, vec![1])
     );
-    assert_eq!(
-        attribute(&snapshot, "m", 8, 0, DGRAM),
-        Seen::Route(false, vec![])
-    );
+    // A sender no candidate names is undeclared.
+    assert_eq!(attribute(&snapshot, "m", 8, 0, DGRAM), Seen::Unmatched);
 }

@@ -1911,6 +1911,16 @@ process start. MH logs nothing about mutes (ADR-0036 §11 deny scope).
 > (including "camera light still on after server mute") are OPS-B's extension. Server mute stays
 > reachable by any holder of the service credential the registration contract accepts (Arm 2),
 > now per kind.
+>
+> **Corrected 2026-10-23 (story 3 MC-B):** `server_muted_sources` no longer exists. MC-B deleted it
+> from the contract, together with MH's story-2 reading of a registration that declares no
+> `source_streams`: such a registration with egresses is now REJECTED
+> (`mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}`), never read
+> sender-scoped. A server mute of kind K is now K's stream at `DROP_AT_INGRESS` AND K's send
+> directive withdrawn (empty targets), so a compliant client stops sending K and MH's
+> `server_muted` drops are the backstop: **flat `server_muted` drops under an applied mute are the
+> expected healthy state**, not evidence the mute failed. "We can still hear them" is then
+> answered by whether the stream is at `DROP_AT_INGRESS` in the applied snapshot (MC Scenario 21).
 
 The MC half of this triage,
 covering which host asked, what MC recorded, and whether the push was confirmed, is
@@ -1979,7 +1989,10 @@ pusher span that carries the meeting and the handler endpoint (`crates/mc-servic
 with a `policy_generation` at or after the one the mute advanced to. **That line is DEBUG**, so at the
 default level it is absent. What remains at INFO is the negative: no divergence ERROR from the pusher
 for that meeting and handler (MC Scenario 15). Then the muted participant is
-known to be sending on that handler, yet `mh_media_frames_dropped_total{reason="server_muted"}` on that
+known to be sending on that handler — since MC-B a compliant client stops sending when its directive
+is withdrawn, so "known to be sending" now means a client that IGNORED its empty targets (evidence:
+MH ingress frames from that sender still arriving, or MC Scenario 21 Step 1b rose while the camera
+light stayed on) — yet `mh_media_frames_dropped_total{reason="server_muted"}` on that
 pod stays flat. That series is per pod, so "flat" holds only if no other mute on the handler is
 dropping. MH installed a muted set it is not enforcing. That is an MH defect.
 

@@ -21,8 +21,8 @@ use crate::media_routing::{
 };
 use crate::media_signaling::{
     slot_state_label, CapabilityOutcome, DirectiveOutcome, MediaKindLabel, MuteOutcome,
-    RefusalReplySurface, ServerMuteAction, ServerMuteOutcome, SlotViewEmission,
-    UnmuteRequestOutcome, WithdrawalReason,
+    MuteRejection, MuteSurface, RefusalReplySurface, ServerMuteAction, ServerMuteOutcome,
+    SlotViewEmission, UnmuteRequestOutcome, WithdrawalReason,
 };
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -719,10 +719,10 @@ pub fn record_send_directive(outcome: DirectiveOutcome) {
 /// The `slot_state` label domain **mirrors the wire enum exhaustively** — every named
 /// `SlotState` variant, not only the ones MC emits (`active`,
 /// `avatar_no_video`, `avatar_client_muted`, `avatar_server_muted`,
-/// `fewer_sources_than_slots`, `unavailable`; the superseded `source_muted` is
-/// never emitted since MC-A and stays in the domain until MC-B deletes the wire
-/// value). Server-muted wins over client-muted; a video slot whose occupant
-/// publishes no video is `avatar_no_video` whatever its mutes. `unavailable`
+/// `fewer_sources_than_slots`, `unavailable`; story 2's `source_muted` left
+/// the domain with its wire value). Server-muted wins over client-muted; a
+/// video slot whose occupant publishes no video is `avatar_no_video` whatever
+/// its mutes. `unavailable`
 /// counts slots truncated by the per-kind cap. A hand-picked subset needs
 /// editing every time §7 makes `switch_pending` live, and a
 /// `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be
@@ -1025,7 +1025,7 @@ pub fn record_policy_generation_adoption(outcome: FloorAdoption) {
 ///
 /// Story 3 MC-A: one cap per kind (`MC_MAX_AUDIO_RECEIVE_SLOTS`,
 /// `MC_MAX_VIDEO_RECEIVE_SLOTS`), each published from
-/// `ClientMediaConfig::max_receive_slots` — the SAME values MC truncates every
+/// `ClientMediaConfig::receive_slot_caps` — the SAME values MC truncates every
 /// declaration to and advertises as `JoinResponse.max_audio_receive_slots` /
 /// `max_video_receive_slots` — so the published, enforced and advertised caps
 /// cannot drift. `media_kind="video"` reading **0** is a real sample, and it is
@@ -1054,8 +1054,12 @@ pub fn set_receive_slot_cap(kind: MediaKindLabel, cap: u8) {
 /// Cardinality: `MediaKindLabel::ALL` (2) x `WithdrawalReason::ALL` (2),
 /// zero-initialised as the full cross product
 ///
-/// `unwatched` is emitted here (MC-A); `server_muted` by MC-B. Counted per
-/// TRANSITION, never per re-render: a re-sent directive whose stream already
+/// Reason = the CURRENT cause at delivery: `server_muted` if that kind of the
+/// publisher is server-muted (its directive is withdrawn whatever its
+/// watchers), else `unwatched`. A server mute of an already-empty (unwatched)
+/// stream is no transition and counts nothing; an unmute is never counted
+/// (restoration shows on `mc_media_send_directives_total{outcome="emitted"}`).
+/// Counted per TRANSITION, never per re-render: a re-sent directive whose stream already
 /// had empty targets does not count, and a reconnect's fresh view does not
 /// count. Counted on DELIVERY, unlike `mc_media_send_directives_total`
 /// (composition): a withdrawal whose delivery failed is visible only on
@@ -1100,22 +1104,18 @@ pub fn set_video_keyframe_min_interval(min_keyframe_interval_ms: u32) {
 /// Labels: `outcome`, `media_kind`, `key_custody`
 /// Cardinality: `MuteOutcome::ALL` x `MediaKindLabel::ALL` (2), zero-initialised
 ///
-/// # Counting unit: one increment per (request, named kind)
+/// # Counting unit: one increment per (request, NAMED kind)
 ///
-/// Not per request (story 3 OBS-A). Request-level outcomes (`unchanged` on an
-/// identical repeat, `rate_limited`, `actor_unavailable`) count once per named
-/// kind. `unchanged` ALSO comes per kind from an applied request: the kind whose
-/// flag did not move (the actor was hopped for the other kind). So `unchanged`
-/// means "this kind's state did not move", not "a pure no-op repeat". The
-/// success outcome is per kind: `applied` for a flag of EITHER kind that moved
-/// (story 3 MC-A: the actor recomposes for both kinds). `applied_no_recompose`
-/// is unreachable since MC-A (every connection is declared from its join) and
-/// stays zero-initialised until MC-B reshapes per-kind mute. Which kinds a request
-/// names is `named_kinds` in `webtransport/connection.rs`: INTERIM, while P1's
-/// shim reads an absent field as `false`, every request names BOTH kinds, so
-/// the per-outcome rate is about double the pre-story-3 per-request rate. That
-/// is a counting-unit change, not a traffic change. MC-B narrows it to present
-/// fields.
+/// Not per request (story 3 OBS-A), and only the kinds the request NAMES (story
+/// 3 MC-B: an absent per-kind field means "unchanged" and is not counted; the
+/// SDK names only the kind it changed, so rates roughly HALVED at MC-B against
+/// the interim both-kinds count -- a counting-unit change, not a traffic
+/// change). A request naming NO kind is not counted here: it is rejected and
+/// counted on `mc_media_mute_requests_rejected_total{surface="client_mute"}`.
+/// Request-level outcomes (`unchanged` on an identical repeat, `rate_limited`,
+/// `actor_unavailable`) count once per named kind; `applied`/`unchanged`
+/// otherwise come from the meeting actor's per-kind decision. The named kinds
+/// are `MuteChange::named` (`media_kind.rs`).
 ///
 /// Answers *"is client mute being applied, and when it is not, why?"*, and it is
 /// the only visibility into the mute-work rate limiter. Mute is the one
@@ -1125,9 +1125,10 @@ pub fn set_video_keyframe_min_interval(min_keyframe_interval_ms: u32) {
 /// enough to be clamped. That cost is dominated by the PER-CONNECTION
 /// composition; see the note below on why this is not a meeting-wide signal.
 ///
-/// The success set is `{applied, applied_no_recompose}`. **`unchanged` is not a
-/// failure** — this kind did not move, whether from an identical repeat (no
-/// work) or as the unmoved kind of an applied request — and it is
+/// The success set is `{applied}` (the unreachable `applied_no_recompose` was
+/// removed). **`unchanged` is not a failure** — this kind did not move,
+/// whether from an identical repeat (no work) or as the unmoved named kind of
+/// an applied request — and it is
 /// client-inflatable via the repeat source, so never a denominator. An
 /// ordinary camera button is `{media_kind="video", outcome="applied"}` plus
 /// `unchanged` on audio. So the failure predicate is
@@ -1170,13 +1171,16 @@ pub fn record_mute_request(kind: MediaKindLabel, outcome: MuteOutcome) {
 /// Request-level refusals (`not_permitted`, `unknown_target`, `rate_limited`,
 /// `actor_unavailable`) count once per named kind; `applied` / `unchanged` are
 /// per kind, from the actor's per-kind decision. `unchanged` means THIS kind
-/// was already in the requested state: if the other kind was `applied`, the
-/// actor still broadcast (and, for audio, pushed) for that kind. `action` is THAT KIND's
+/// was already in the requested state: if another named kind was `applied`,
+/// the actor still broadcast, re-rendered and pushed for it. `action` is THAT KIND's
 /// asked-for direction (`ServerMuteAction::from_muted`): a request
 /// `{audio: true, video: false}` counts `action="mute", media_kind="audio"`
-/// plus `action="unmute", media_kind="video"`. INTERIM, while P1's shim reads
-/// an absent field as `false`, every request names both kinds
-/// (`webtransport/connection.rs:named_kinds`); MC-B narrows that.
+/// plus `action="unmute", media_kind="video"`; `{audio: true}` counts only the
+/// first. Only NAMED kinds count (story 3 MC-B; rates roughly halved against
+/// the interim both-kinds count -- counting unit, not traffic). A request
+/// naming no kind -- from ANY requester, host or not -- is counted on
+/// `mc_media_mute_requests_rejected_total{surface="server_mute"}` instead, so
+/// `not_permitted` here undercounts non-hosts by exactly those requests.
 ///
 /// Counted SEPARATELY from `mc_media_mute_requests_total` — see
 /// `ServerMuteOutcome`'s type doc for the decider/enforcement/remedy split, the
@@ -1223,11 +1227,41 @@ pub fn record_unmute_request(outcome: UnmuteRequestOutcome) {
     .increment(1);
 }
 
+/// Record a mute request rejected before any kind could be counted (story 3
+/// MC-B): today only a request naming NO kind (both per-kind fields absent).
+///
+/// Metric: `mc_media_mute_requests_rejected_total`
+/// Labels: `surface` (`MuteSurface::ALL`: `client_mute`, `server_mute`),
+/// `reason` (`MuteRejection::ALL`), `key_custody`
+/// Cardinality: 2, zero-initialised
+///
+/// KIND-FREE ON PURPOSE: the request names no kind, so it cannot land on the
+/// per-kind mute counters without inventing one (`docs/observability/label-taxonomy.md`
+/// "Kind-free on purpose"). One increment per rejected request. On the
+/// server-mute surface it counts EVERY requester, host or not (authority is
+/// still checked first and a non-host gets the same generic refusal), so
+/// `mc_media_server_mute_requests_total{outcome="not_permitted"}` undercounts
+/// non-hosts by exactly these requests.
+///
+/// CLIENT-INFLATABLE: a shape check before any rate-limit token or actor hop,
+/// so one connection drives it at line rate. Never a ratio denominator; no
+/// alert. Zero is healthy; an ABSENT series is a pipeline fault.
+pub fn record_mute_request_rejected(surface: MuteSurface, reason: MuteRejection) {
+    counter!(
+        "mc_media_mute_requests_rejected_total",
+        "surface" => surface.label(),
+        "reason" => reason.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
 /// Record a refusal REPLY withheld by its path's reply limiter.
 ///
 /// Metric: `mc_media_refusal_replies_suppressed_total`
-/// Labels: `surface` (`RefusalReplySurface::ALL`), `key_custody`
-/// Cardinality: 2
+/// Labels: `surface` (`RefusalReplySurface::ALL`: `client_mute`,
+/// `server_mute`, `capability`), `key_custody`
+/// Cardinality: 3
 ///
 /// EVERY SUPPRESSED REPLY IS COUNTED HERE; ONLY THE FIRST IS LOGGED PER
 /// CONNECTION. A single WARN does not mean a single suppression — the one-shot
@@ -1254,9 +1288,12 @@ pub fn record_refusal_reply_suppressed(surface: RefusalReplySurface) {
 /// A participant server-muted on both kinds is one source per kind, so it reads
 /// `1` on each series. `sum(mc_media_server_muted_sources)` across kinds is
 /// therefore NOT "participants muted". Each kind's server mute reaches MH as
-/// that kind's stream `DROP_AT_INGRESS` in `source_streams` (story 3 MC-A), so
-/// the sum across kinds is the reading comparable with MH's `server_muted`
-/// drops.
+/// that kind's stream `DROP_AT_INGRESS` in `source_streams`, AND withdraws that
+/// kind's send directive (story 3 MC-B), so a compliant client sends nothing
+/// to drop: gauge > 0 with fleet `server_muted` drops near zero is the NORMAL
+/// shape, and a fleet-level comparison (never divided, never per instance)
+/// detects only a sender that ignored its empty targets. The MC-side evidence
+/// that a mute took is `mc_media_send_directive_withdrawals_total{reason="server_muted"}`.
 ///
 /// A STATE level, not an event rate: a mute applied yesterday is still here.
 /// Recomputed and `set` from live state (the meeting-actor census), never
@@ -1938,7 +1975,6 @@ const SLOT_STATES: &[proto_gen::dark_tower::signaling::v1::SlotState] = {
     &[
         SlotState::Unspecified,
         SlotState::Active,
-        SlotState::SourceMuted,
         SlotState::WithheldByCongestion,
         SlotState::FewerSourcesThanSlots,
         SlotState::SourceUnreachable,
@@ -1956,15 +1992,14 @@ const fn slot_slot_state(v: proto_gen::dark_tower::signaling::v1::SlotState) -> 
     match v {
         SlotState::Unspecified => 0,
         SlotState::Active => 1,
-        SlotState::SourceMuted => 2,
-        SlotState::WithheldByCongestion => 3,
-        SlotState::FewerSourcesThanSlots => 4,
-        SlotState::SourceUnreachable => 5,
-        SlotState::SwitchPending => 6,
-        SlotState::AvatarNoVideo => 7,
-        SlotState::Unavailable => 8,
-        SlotState::AvatarClientMuted => 9,
-        SlotState::AvatarServerMuted => 10,
+        SlotState::WithheldByCongestion => 2,
+        SlotState::FewerSourcesThanSlots => 3,
+        SlotState::SourceUnreachable => 4,
+        SlotState::SwitchPending => 5,
+        SlotState::AvatarNoVideo => 6,
+        SlotState::Unavailable => 7,
+        SlotState::AvatarClientMuted => 8,
+        SlotState::AvatarServerMuted => 9,
     }
 }
 
@@ -2167,7 +2202,8 @@ pub fn zero_initialize_counters() {
     for o in DirectiveOutcome::ALL {
         counter!("mc_media_send_directives_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
-    // The FULL kind x reason cross product (`server_muted` is emitted by MC-B).
+    // The FULL kind x reason cross product, so `server_muted` reads "present and
+    // flat" when no mute withdrew a directive (runbook Scenario 21).
     for k in MediaKindLabel::ALL {
         for r in WithdrawalReason::ALL {
             counter!("mc_media_send_directive_withdrawals_total", MEDIA_KIND_LABEL => k.label(), "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
@@ -2193,6 +2229,11 @@ pub fn zero_initialize_counters() {
     }
     for s in RefusalReplySurface::ALL {
         counter!("mc_media_refusal_replies_suppressed_total", "surface" => s.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for s in MuteSurface::ALL {
+        for r in MuteRejection::ALL {
+            counter!("mc_media_mute_requests_rejected_total", "surface" => s.label(), "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+        }
     }
     for o in EndMeetingOutcome::ALL {
         counter!("mc_media_end_meeting_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
@@ -3131,6 +3172,25 @@ mod tests {
                     (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
                 ])
                 .assert_delta(1);
+        }
+    }
+
+    /// `mc_media_mute_requests_rejected_total`: per (surface, reason), and
+    /// kind-free -- no `media_kind` label on the cell.
+    #[test]
+    fn record_mute_request_rejected_covers_every_surface_and_reason() {
+        for surface in MuteSurface::ALL {
+            for reason in MuteRejection::ALL {
+                let snap = MetricAssertion::snapshot();
+                record_mute_request_rejected(surface, reason);
+                snap.counter("mc_media_mute_requests_rejected_total")
+                    .with_labels(&[
+                        ("surface", surface.label()),
+                        ("reason", reason.label()),
+                        (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                    ])
+                    .assert_delta(1);
+            }
         }
     }
 

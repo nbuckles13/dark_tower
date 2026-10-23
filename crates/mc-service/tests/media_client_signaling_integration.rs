@@ -292,13 +292,6 @@ async fn mute_unmute_cycle_leaves_the_send_directive_untouched() {
         .assert_delta(1);
     snap.counter("mc_media_slot_states_total")
         .with_labels(&[
-            ("slot_state", "source_muted"),
-            ("media_kind", "audio"),
-            ("key_custody", "operator"),
-        ])
-        .assert_delta(0);
-    snap.counter("mc_media_slot_states_total")
-        .with_labels(&[
             ("slot_state", "active"),
             ("media_kind", "audio"),
             ("key_custody", "operator"),
@@ -414,8 +407,6 @@ async fn a_video_only_mute_by_an_audio_only_publisher_re_emits_nothing() {
     mute("unchanged", "video").assert_delta(1);
     mute("applied", "audio").assert_delta(1);
     mute("unchanged", "audio").assert_delta(2);
-    mute("applied_no_recompose", "audio").assert_delta(0);
-    mute("applied_no_recompose", "video").assert_delta(0);
 }
 
 #[tokio::test]
@@ -655,12 +646,12 @@ async fn rejects_duplicate_slot_ids() {
 /// audio slots fill as usual and the excess slot reads UNAVAILABLE with its
 /// declared id echoed, no sender and an empty url. The cap comes from
 /// CONFIGURATION — the same value `WebTransportServer::new` publishes as
-/// `mc_media_receive_slot_cap` and the JoinResponse advertises per kind (tag 12
-/// is no longer written).
+/// `mc_media_receive_slot_cap` and the JoinResponse advertises per kind (the
+/// single total cap, tag 12, was deleted by MC-B).
 #[tokio::test]
 async fn an_over_cap_declaration_is_truncated_to_unavailable_and_counted_accepted() {
     const MEETING: &str = "mcs-meeting-h";
-    let cap = client_media_config().max_receive_slots;
+    let cap = client_media_config().receive_slot_caps;
     let audio_cap = u32::from(MediaKindLabel::Audio.of(cap));
 
     let (stack, rig) = start_stack("mcs-cap").await;
@@ -669,10 +660,6 @@ async fn an_over_cap_declaration_is_truncated_to_unavailable_and_counted_accepte
     let _ = a.settle().await;
     let _ = b.settle().await;
 
-    assert_eq!(
-        a.max_receive_slots, None,
-        "the superseded total is no longer written"
-    );
     assert_eq!(
         a.max_kind_receive_slots,
         (
@@ -716,7 +703,7 @@ async fn an_over_cap_declaration_is_truncated_to_unavailable_and_counted_accepte
 #[tokio::test]
 async fn a_lowered_configured_cap_truncates_at_the_configured_value() {
     let mut config = client_media_config();
-    config.max_receive_slots = [2, 4];
+    config.receive_slot_caps = [2, 4];
     let (stack, rig) = start_stack_with("mcs-cap-low", config).await;
     let mut a = solo(&rig, &stack, "mcs-meeting-h2").await;
     let _ = a.settle().await;

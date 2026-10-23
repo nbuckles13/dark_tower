@@ -211,7 +211,8 @@ message JoinResponse {
   bytes meeting_kek = 9;                        // AES-256, exactly 32 bytes
   uint32 kek_generation = 10;                   // u16 semantics
   uint32 kek_rotation_debounce_seconds = 11;    // W (story 2); 0/absent = older MC
-  optional uint32 max_receive_slots = 12;       // SUPERSEDED -- no longer set by MC (MC-A); deleted by MC-B
+  reserved 12;                                  // was: max_receive_slots (deleted by MC-B)
+  reserved "max_receive_slots";
   optional uint32 max_audio_receive_slots = 13; // story 3: per-kind cap, informational; always set
   optional uint32 max_video_receive_slots = 14; // story 3: per-kind cap, informational; always set; 0 = video off
 }
@@ -246,9 +247,9 @@ violation the client surfaces loudly, and the value is per session.
 > slot `SLOT_STATE_UNAVAILABLE`, never failing the join. Since MC-A, MC always
 > sets tags 13 and 14 (from `MC_MAX_AUDIO_RECEIVE_SLOTS` /
 > `MC_MAX_VIDEO_RECEIVE_SLOTS`, read once at startup) and **no longer writes**
-> `max_receive_slots` (absent on the wire); the field stays in the schema, marked
-> superseded, until MC-B deletes it. `MC_MAX_RECEIVE_SLOTS` is no longer read.
-> The normative rules are on the three fields in `signaling.proto`.
+> `max_receive_slots` (absent on the wire). MC-B (2026-10-23) deleted it and
+> reserved tag 12 and the name. `MC_MAX_RECEIVE_SLOTS` is no longer read.
+> The normative rules are on the two per-kind fields in `signaling.proto`.
 
 **`sender_id` (ADR-0036 §2).** The joiner's per-meeting numeric sender id, and the
 first half of the attribution chain. A `uint32` on the wire carrying 16-bit
@@ -459,7 +460,8 @@ ADR-0036 §6 (2026-10-13 amendment). They are deliberately not re-listed here.
 > **Superseded 2026-10-13 (story 3, R-4/R-5).** This section previously listed
 > the seven story-1 states as a code block. Slot state is now a **flat** enum:
 > `AVATAR_NO_VIDEO`, `UNAVAILABLE`, `AVATAR_CLIENT_MUTED` and
-> `AVATAR_SERVER_MUTED` are added, `SOURCE_MUTED` is superseded (deleted by MC-B),
+> `AVATAR_SERVER_MUTED` are added, `SOURCE_MUTED` is superseded (deleted by MC-B
+> on 2026-10-23; number 2 and the name reserved),
 > `ZERO_REQUESTED` is reserved, and a live video slot names no sender. The listing
 > was replaced by the pointer above so the contract has one home.
 
@@ -568,6 +570,14 @@ client reports itself muted, which is what makes unmute instantaneous and keeps
 > only as a MAY. A server unmute can resume a participant's camera or mic unless
 > they are client-muted, with a non-suppressible notice. Normative text: the mute
 > section of `signaling.proto` and ADR-0036 §5 (2026-10-13 amendment).
+>
+> **Implemented 2026-10-23 (MC-B; ADR-0036 §5 amendment 2026-10-23).** "MAY" is now
+> "never": the send directive never depends on client mute. A request names only
+> the kinds it changes (the SDK sends exactly one); a request naming no kind is
+> refused with the generic message and counted
+> (`mc_media_mute_requests_rejected_total`). Client mute is a `PAUSED` source at MH
+> (never an ingress drop); server mute is the directive withdrawal plus
+> `DROP_AT_INGRESS`.
 
 
 #### StreamQualityUpdate (Bidirectional)
@@ -700,7 +710,15 @@ only — **not** evidence of application), the **applied** generation, `handler_
 > `server_muted_sources` and the single `transport_mode` echo are superseded and
 > deleted by MC-B; "server mute is sender-scoped because the Media Handler can
 > neither read nor authenticate a publisher's stream number" above is superseded
-> by the slot-terms property stated at `MutedSource` in `internal.proto`.
+> by the slot-terms property, now stated at `SourceStream` in `internal.proto`.
+>
+> **Deleted 2026-10-23 (MC-B).** `EgressStream.transport_mode` (tag 6),
+> `RegisterMeetingRequest.server_muted_sources` (tag 7) with the `MutedSource`
+> message, and `RegisterMeetingResponse.transport_mode` (tag 5) are gone, each
+> reserved by tag and name. Server mute and client mute reach MH ONLY as a
+> `SourceStream` disposition; a registration with egress streams and an empty
+> `source_streams` is rejected as `rejected_transport_inconsistent` (every
+> candidate is undeclared) — there is no fallback reading.
 
 > **Superseded 2026-09-01 — three RPCs retired.** This section previously
 > specified `RegisterParticipant`/`RegisterParticipantResponse{connection_token}`

@@ -26,7 +26,7 @@ import type { VideoSendDirective } from '../media/lifecycle/VideoPublisher.js';
 import type { VideoReceiver } from '../media/lifecycle/VideoReceiver.js';
 import type { MhControlSink } from '../media/events.js';
 import type { MediaStateListeners } from './signalingMediaState.js';
-import type { MuteSnapshot } from '../media/lifecycle/muteState.js';
+import type { MediaKindToken } from '../media/mediaKind.js';
 import {
   MEDIA_KEYFRAME_REQUEST_OUTCOMES,
   MEDIA_KEYFRAME_UNATTRIBUTED_OUTCOMES,
@@ -92,16 +92,17 @@ export function rosterInvalidationListener(
 }
 
 /**
- * The session's client-mute report to MC — both kinds, explicit. Informational
- * and deliberately BEST-EFFORT: ADR-0036 §5 requires client mute to hold WITHOUT
+ * The session's client-mute report to MC — ONE kind per request, the other
+ * kind's field absent (= unchanged at MC; `signaling/muteRequest.ts`).
+ * Deliberately BEST-EFFORT: ADR-0036 §5 requires client mute to hold WITHOUT
  * the server honouring it, so a failed report must not undo the local
  * suppression; nothing is actionable and nothing is safe to log about it.
  */
 export function bestEffortMuteReport(signaling: {
-  sendMuteRequest(state: MuteSnapshot): Promise<unknown>;
-}): (state: MuteSnapshot) => void {
-  return (state) => {
-    void signaling.sendMuteRequest(state).catch(() => {});
+  sendMuteRequest(kind: MediaKindToken, muted: boolean): Promise<unknown>;
+}): (kind: MediaKindToken, muted: boolean) => void {
+  return (kind, muted) => {
+    void signaling.sendMuteRequest(kind, muted).catch(() => {});
   };
 }
 

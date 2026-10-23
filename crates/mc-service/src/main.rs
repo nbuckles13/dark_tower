@@ -142,8 +142,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // mh-service, which logs every effective transport value and its derived
         // drain window in one structured startup line.
         // Per-kind caps, read ONCE here (live vectors are never re-truncated).
-        max_audio_receive_slots = mc_service::media_kind::MediaKindLabel::Audio.of(config.max_receive_slots),
-        max_video_receive_slots = mc_service::media_kind::MediaKindLabel::Video.of(config.max_receive_slots),
+        max_audio_receive_slots = mc_service::media_kind::MediaKindLabel::Audio.of(config.receive_slot_caps),
+        max_video_receive_slots = mc_service::media_kind::MediaKindLabel::Video.of(config.receive_slot_caps),
         max_receive_capability_declarations = config.max_receive_capability_declarations,
         audio_codec = ?config.audio_encoding.codec(),
         audio_max_bitrate_bps = config.audio_encoding.max_bitrate_bps(),

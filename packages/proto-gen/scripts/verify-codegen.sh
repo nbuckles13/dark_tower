@@ -133,6 +133,65 @@ assert_enum_member_absent() {
   echo "verify-codegen: OK — ${enum}.${member} absent from ${file}"
 }
 
+# Member-scoped MESSAGE-FIELD oracle (story 3 MC-B). A deleted FIELD cannot be
+# checked by `assert_not_generated` (which matches only export declarations, so
+# it passes vacuously on a field name) nor by a file-wide grep (`transportMode`
+# legitimately survives on `SourceStream`/`SourceStreamEcho`, and doc comments
+# cite deleted names). These helpers extract ONE message's generated type --
+# `export type <Msg> = Message<...> & {` ... `};` -- AND its JSON twin
+# `export type <Msg>Json = {` ... `};`, and match a field DECLARATION
+# (`  name: ...` / `  name?: ...`) inside them only. Every absence check names a
+# POSITIVE CONTROL field that must be found by the SAME extraction and matcher,
+# so a broken extraction fails loudly instead of reporting a false "absent".
+message_blocks() {
+  local path="$1"
+  local msg="$2"
+  awk -v start="^export type ${msg} = Message<" -v json="^export type ${msg}Json = [{]" '
+    $0 ~ start || $0 ~ json { inside = 1 }
+    inside { print }
+    inside && /^};/ { inside = 0 }
+  ' "${path}"
+}
+
+message_field_count() {
+  local path="$1"
+  local msg="$2"
+  local field="$3"
+  message_blocks "${path}" "${msg}" | grep -cE "^[[:space:]]+${field}[?]?: " || true
+}
+
+assert_message_field() {
+  local file="$1"
+  local msg="$2"
+  local field="$3"
+  local path="${OUT_DIR}/${file}"
+  if [[ ! -f "${path}" ]]; then
+    echo "verify-codegen: FAIL — expected file not produced: ${path}" >&2
+    exit 1
+  fi
+  # Both the message type and its JSON twin must declare it.
+  if [[ "$(message_field_count "${path}" "${msg}" "${field}")" -lt 2 ]]; then
+    echo "verify-codegen: FAIL — message ${msg} (or ${msg}Json) has no field '${field}': ${path}" >&2
+    exit 1
+  fi
+  echo "verify-codegen: OK — ${msg}.${field} in ${file}"
+}
+
+assert_message_field_absent() {
+  local file="$1"
+  local msg="$2"
+  local field="$3"
+  local control="$4"
+  local path="${OUT_DIR}/${file}"
+  # Positive control first: the same extraction must find a declared field.
+  assert_message_field "${file}" "${msg}" "${control}"
+  if [[ "$(message_field_count "${path}" "${msg}" "${field}")" -ne 0 ]]; then
+    echo "verify-codegen: FAIL — deleted field '${msg}.${field}' still generated: ${path}" >&2
+    exit 1
+  fi
+  echo "verify-codegen: OK — ${msg}.${field} absent from ${file}"
+}
+
 assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "JoinRequest"
 assert_generated "dark_tower/internal/v1/internal_pb.ts" "FastHeartbeatResponse"
 assert_generated "dark_tower/internal/v1/internal_pb.ts" "ComprehensiveHeartbeatResponse"
@@ -150,17 +209,16 @@ for symbol in \
   assert_generated "dark_tower/internal/v1/internal_pb.ts" "${symbol}"
 done
 
-# Story 2 (R-9, R-20) — the new internal shapes: the meeting-level muted set on
-# the registration snapshot, and the distinct teardown RPC with its own
-# request/response pair (buf STANDARD: distinct types per RPC). Field and method
-# names are checked in protoc-gen-es's generated casing, read from a regenerated
-# output rather than written from memory. `endMeeting: {` is the service
-# descriptor's method entry, so it cannot be satisfied by the message names.
+# Story 2 (R-20) — the distinct teardown RPC with its own request/response pair
+# (buf STANDARD: distinct types per RPC). Method names are checked in
+# protoc-gen-es's generated casing, read from a regenerated output rather than
+# written from memory. `endMeeting: {` is the service descriptor's method entry,
+# so it cannot be satisfied by the message names. (Story 2's meeting-level
+# muted set, `MutedSource` / `serverMutedSources`, was deleted by MC-B and is
+# asserted ABSENT below.)
 for symbol in \
-  MutedSource \
   EndMeetingRequest \
   EndMeetingResponse \
-  serverMutedSources \
   "endMeeting: {"; do
   assert_generated "dark_tower/internal/v1/internal_pb.ts" "${symbol}"
 done
@@ -208,11 +266,8 @@ for symbol in kekRotationDebounceSeconds unreachableSenderIds; do
   assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "${symbol}"
 done
 
-# Story 2 task 13 (R-1, R-23) — MC's receive-slot cap advertised on the join
-# response, so the SDK can expose it and refuse an over-cap declaration locally.
-for symbol in maxReceiveSlots; do
-  assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "${symbol}"
-done
+# Story 2 task 13's single receive-slot cap (`JoinResponse.max_receive_slots`)
+# was deleted by MC-B and is asserted ABSENT below (member-scoped).
 
 # ADR-0036 signalling contract — the superseded shapes must be GONE.
 # `StreamAssignment` is deliberately absent from this list: the name is reused
@@ -254,11 +309,10 @@ assert_enum_member "dark_tower/signaling/v1/signaling_pb.ts" Codec VP8
 for member in AVATAR_NO_VIDEO UNAVAILABLE AVATAR_CLIENT_MUTED AVATAR_SERVER_MUTED; do
   assert_enum_member "dark_tower/signaling/v1/signaling_pb.ts" SlotState "${member}"
 done
-# Superseded-but-present until MC-B deletes it: still a PRESENCE assert, so a
-# premature deletion fails here rather than in a consumer.
-assert_enum_member "dark_tower/signaling/v1/signaling_pb.ts" SlotState SOURCE_MUTED
-# Reserved by number and name in this story: the one member-scoped absence.
+# Reserved by number and name in this story (ZERO_REQUESTED by P1,
+# SOURCE_MUTED by MC-B): member-scoped absences, each with a positive control.
 assert_enum_member_absent "dark_tower/signaling/v1/signaling_pb.ts" SlotState ZERO_REQUESTED ACTIVE
+assert_enum_member_absent "dark_tower/signaling/v1/signaling_pb.ts" SlotState SOURCE_MUTED AVATAR_SERVER_MUTED
 
 # Story 3 — the internal per-stream source declarations and echo.
 for symbol in \
@@ -272,5 +326,19 @@ done
 for member in FORWARD PAUSED DROP_AT_INGRESS; do
   assert_enum_member "dark_tower/internal/v1/internal_pb.ts" SourceDisposition "${member}"
 done
+
+# Story 3 MC-B — the superseded fields and message are GONE (reserved by tag
+# and name in the protos). Field absences are member-scoped with a positive
+# control in the same message; `MutedSource` is a whole message, so the
+# export-declaration check is the right one for it.
+assert_not_generated "dark_tower/internal/v1/internal_pb.ts" MutedSource
+assert_message_field_absent "dark_tower/internal/v1/internal_pb.ts" EgressStream transportMode supersedeOnIndependentFrame
+assert_message_field_absent "dark_tower/internal/v1/internal_pb.ts" RegisterMeetingRequest serverMutedSources sourceStreams
+assert_message_field_absent "dark_tower/internal/v1/internal_pb.ts" RegisterMeetingResponse transportMode appliedSourceStreams
+assert_message_field_absent "dark_tower/signaling/v1/signaling_pb.ts" JoinResponse maxReceiveSlots maxAudioReceiveSlots
+# The surviving `transportMode` declarations are still matched by the same
+# helper, so the absences above cannot be a matcher that never matches.
+assert_message_field "dark_tower/internal/v1/internal_pb.ts" SourceStream transportMode
+assert_message_field "dark_tower/internal/v1/internal_pb.ts" SourceStreamEcho transportMode
 
 echo "verify-codegen: all checks passed"

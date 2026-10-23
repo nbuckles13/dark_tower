@@ -62,7 +62,11 @@ impl LoopbackRig {
         sample_ratio: f64,
     ) -> Self {
         let handles = Arc::new(resolve_media_handles());
-        let request = mh_test_utils::media_policy::register_request(meeting, 1, streams);
+        let mut request = mh_test_utils::media_policy::register_request(meeting, 1, streams);
+        // MC declares every stream every participant publishes, watched or
+        // not, so the rig's publisher is always declared (its frames reach
+        // `no_subscriber`, never `unmatched_stream`, when no edge names it).
+        mh_test_utils::media_policy::declare_forward(&mut request, &[publisher]);
         let policy = MeetingPolicy::from_request(
             &request,
             &mh_test_utils::admission::fixture_policy_limits(),

@@ -250,7 +250,6 @@ async fn test_inbound_register_meeting_reparents_handler_span_to_injected_trace(
         egress_streams: Vec::new(),
         selection_rules: None,
         policy_generation: 0,
-        server_muted_sources: Vec::new(),
         source_streams: Vec::new(),
     });
     let auth_value: MetadataValue<_> = format!("Bearer {token}")
@@ -321,7 +320,6 @@ async fn test_inbound_register_meeting_no_traceparent_gets_fresh_trace_id() {
         egress_streams: Vec::new(),
         selection_rules: None,
         policy_generation: 0,
-        server_muted_sources: Vec::new(),
         source_streams: Vec::new(),
     });
     let auth_value: MetadataValue<_> = format!("Bearer {token}")
