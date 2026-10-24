@@ -23,7 +23,10 @@ rules from the start; pre-existing deviations are draining via the R-61 chain.
   on neither the binary nor the proto3 JSON wire (no `Any` is used); a field
   still typed by the deleted message must change type or be deleted, and the
   type and reserve-aware rules catch that. If `Any` (or any other type-URL
-  carrier) is ever introduced, this exception must be revisited.
+  carrier) is ever introduced, this exception must be revisited. Accepted
+  residual: a top-level message that no other proto references but that a peer
+  decodes directly (e.g. a stream envelope) is no longer protected by buf; its
+  deletion is caught only by codegen consumers failing to compile and by tests.
 
 There is no `lint.ignore` block, and as of the ADR-0036 signalling reshape no
 `// buf:lint:ignore` annotations either — `signaling.proto` carried five, all
