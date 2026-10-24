@@ -550,6 +550,7 @@ test('videoSlots projects the allowlisted per-slot fields and round-trips the st
       setVideoSink: () => undefined,
       evidence: () => session.videoEvidence,
       unfulfilledSnapshot: () => [],
+      localStats: () => [],
     };
     session.videoEvidence = [
       // Live, painted: lumas present, the VERIFIED sender stringified.

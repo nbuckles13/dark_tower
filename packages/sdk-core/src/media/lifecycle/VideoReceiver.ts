@@ -45,6 +45,7 @@ import { FaultOnce } from './faultOnce.js';
 import { RecoveryRequestQueue } from './recoveryRequestQueue.js';
 import { PerHandlerReadLoops } from './receiveTransports.js';
 import { bindReceiverState, type GenerationDroppedSource } from './receiverState.js';
+import type { LocalReceiveSlotStats } from './localStats.js';
 import { UnfulfilledSlots, type UnfulfilledSlotState } from './unfulfilledSlots.js';
 
 /** Fixed fault texts (event-once dedupe keys; never a platform string). */
@@ -89,6 +90,8 @@ export interface VideoReceiveView {
   setVideoSink(slotId: number, sink: VideoSink | undefined): void;
   evidence(): readonly VideoSlotEvidence[];
   unfulfilledSnapshot(): readonly UnfulfilledSlotState[];
+  /** Per-slot LOCAL R-35 statistics (read-only, never exported; `localStats.ts`). */
+  localStats(): readonly LocalReceiveSlotStats[];
 }
 
 /** Construction options. */
@@ -155,7 +158,7 @@ export class VideoReceiver {
     this.#o = options;
     this.#clock = options.clock ?? Date.now;
     const { config, metrics } = options;
-    this.#accounting = new FrameAccounting(metrics, options.verification);
+    this.#accounting = new FrameAccounting(metrics, options.verification, options.declaredSlotIds);
     this.#cache = new TransmitKeyCache(config.receiverState.maxTransmitKeysPerSender);
     this.#replay = new ReplayWindow(
       config.receiverState.maxReplayContextsPerSender,
@@ -345,6 +348,7 @@ export class VideoReceiver {
         this.setVideoSink(slotId, sink),
       evidence: () => this.evidence(),
       unfulfilledSnapshot: () => this.unfulfilledSnapshot(),
+      localStats: () => this.localStats(),
     });
   }
 
@@ -363,6 +367,35 @@ export class VideoReceiver {
   /** Per-slot unfulfilled time-in-state, for the LOCAL R-35 overlay. Never exported. */
   unfulfilledSnapshot(): readonly UnfulfilledSlotState[] {
     return this.#unfulfilled.snapshot([...this.#slots.keys()]);
+  }
+
+  /**
+   * Per declared VIDEO slot, the LOCAL R-35 statistics (`localStats.ts`).
+   * Allocates a fresh snapshot; sample it on a timer, never per frame. Never
+   * exported: not evidence, not a metric, not the bus.
+   */
+  localStats(): readonly LocalReceiveSlotStats[] {
+    const unfulfilled = new Map(
+      this.unfulfilledSnapshot().map((u) => [u.slotId, u.sinceMs] as const),
+    );
+    const rows: LocalReceiveSlotStats[] = [];
+    for (const slot of this.#slots.values()) {
+      const tally = this.#accounting.slotTally(slot.slotId);
+      if (tally === undefined) continue;
+      rows.push({
+        kind: 'video',
+        slotId: slot.slotId,
+        packets: tally.packets,
+        bytes: tally.bytes,
+        framesDecoded: slot.framesDecoded,
+        queueDepth: slot.jitterDepth,
+        drops: tally.drops,
+        localDrops: slot.localDrops,
+        keyframesSeen: slot.keyframesSeen,
+        unfulfilledMs: unfulfilled.get(slot.slotId) ?? 0,
+      });
+    }
+    return rows;
   }
 
   /** Slot id -> the verified sender a LIVE slot shows (the pairing view's live half). */

@@ -82,7 +82,7 @@ export function buildTestPatternCapture(
     return Promise.resolve();
   };
 
-  return { start, stop, grantedDeviceId: undefined };
+  return { start, stop, grantedDeviceId: undefined, track: undefined };
 }
 
 /**

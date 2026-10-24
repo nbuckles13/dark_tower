@@ -253,6 +253,8 @@ export class EgressPipeline {
    * the wire since story 1.
    */
   #datagramsSent = 0;
+  /** Wire bytes of those datagrams (R-35 local overlay; a cumulative SUM only, never exported). */
+  #bytesSent = 0;
   #stopped = false;
   /** From the latest {@link EgressSendPlan}. Unset until the first plan. */
   #headerVersion: number | undefined;
@@ -287,6 +289,11 @@ export class EgressPipeline {
    */
   get framesSent(): number {
     return this.#datagramsSent;
+  }
+
+  /** Wire bytes sent, summed over targets (monotone). LOCAL R-35 overlay; never exported. */
+  get bytesSent(): number {
+    return this.#bytesSent;
   }
 
   /**
@@ -568,6 +575,7 @@ export class EgressPipeline {
         // `continue`s, so none counts an attempted-but-refused send.
         lane.hopSequence += 1;
         this.#datagramsSent += 1;
+        this.#bytesSent += pending.bytes.length;
         this.#metrics.frameSent();
       }
     } finally {

@@ -42,9 +42,9 @@
 
 ## Web Application (`packages/web-app/src/`)
 - Join + publish-set chooser → `views/JoinMeeting.svelte`; one attempt (build/bind/join, roster DOM) → `views/MeetingRoom.svelte`; in-meeting (audio rows, video grid, own controls, R-19) → `views/InMeeting.svelte`; tile / four indicators / R-18 notice / roster row + per-kind host controls → `views/{VideoSlotTile,MuteIndicators,ResumeNotice,ParticipantRow}.svelte`
+- Local-only debug panel (R-7 loopback, R-35 overlay) → `views/DebugPanel.svelte`, `lib/{selfCheck,debugStats,debugToggle}.ts`, scan `tests/debugNeverExported.test.ts`; SDK → `session/localDebugSurface.ts`, `media/lifecycle/localStats.ts`, `media/setup/localPreview.ts`
 - Slot-state copy (ONE exhaustive table) → `lib/slotState.ts`; participant copy, bounded names, self camera → `lib/participantState.ts`; auth/meeting views → `views/{SignIn,SignUp,CreateMeeting}.svelte`
-- Session wiring, config, error text → `lib/{session,config,errorText}.ts`
-- Test-only build defines (one predicate) → `vite/testDefines.ts`; test levers → `lib/testLevers.ts`
+- Session wiring, config, error text → `lib/{session,config,errorText}.ts`; test-only build defines (one predicate) → `vite/testDefines.ts`; test levers → `lib/testLevers.ts`
 - E2E bus (incl. `videoSlots`, `sendCounts`) + per-lane analysis + render-surface lumas (under `__E2E_HOOKS__`) → `lib/{e2eBus,e2eAnalysis}.ts`; contract round-trip → `__tests__/e2eBus.test.ts`
 - Vite proxy / cert fingerprints → `vite.config.ts`, `vite/fingerprints.ts`; prod-absence bundle scan → `tests/bundle-content.test.ts`
 

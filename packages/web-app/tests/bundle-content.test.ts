@@ -50,8 +50,17 @@ const DIST = resolve(PKG_ROOT, 'dist');
 //     test-tone mode token and synthesis, reachable only inside
 //     `if (__DT_TEST_TONE__)` (the mode vocabulary is a TYPE, so no const
 //     object carries the token into production).
-//   * `createAnalyser`, `getFloatFrequencyData` — the layer-3 per-lane analysis,
-//     reachable only inside `if (__E2E_HOOKS__)` in `lib/e2eAnalysis.ts`.
+//   * `getFloatFrequencyData` — the layer-3 per-lane analysis (a REMOTE lane's
+//     spectrum), reachable only inside `if (__E2E_HOOKS__)` in
+//     `lib/e2eAnalysis.ts`. Together with `receiveAnalysis` below it carries the
+//     proof that the analysis module is tree-shaken.
+//     NOT `createAnalyser` (it was listed here until story 3 C-C2): the R-7
+//     self-check's LOCAL microphone level meter (`lib/selfCheck.ts`) builds an
+//     `AnalyserNode` in production, on the user's OWN capture track only, read
+//     in the time domain as one scalar level. The security property this marker
+//     carried is "no analysis of REMOTE decoded audio ships" — not "no analyser"
+//     (paired-security ruling, C-C2) — so it now FAILS the rule. Do not re-add
+//     it; the frequency-domain reads below are the markers that matter.
 //   * `receiveLayers`, `receiveAnalysis` — bus event types that exist only in
 //     the gated block. NOT `receiveVerification` (an SDK option key, present in
 //     production as a property name), `captureSource` or `streamAssignments`
@@ -99,7 +108,6 @@ const FORBIDDEN = [
   'test_tone',
   'createOscillator',
   'createMediaStreamDestination',
-  'createAnalyser',
   'getFloatFrequencyData',
   'receiveLayers',
   'receiveAnalysis',
@@ -119,6 +127,16 @@ const FORBIDDEN = [
   'testPattern',
   'forceCameraCapture',
 ] as const;
+
+/**
+ * Tokens that must appear in NO build at all, gated or not (story 3 C-C2): a
+ * frequency-domain read the R-7 local meter must never drift into. Exempt from
+ * the positive control by construction — nothing is supposed to contain them,
+ * so absence from the control build is the expected result, not vacuity. The
+ * source-level control with positive controls is
+ * `tests/debugNeverExported.test.ts`, which denies these in the debug modules.
+ */
+const NEVER_ANYWHERE = ['getByteFrequencyData'] as const;
 
 /**
  * Gate IDENTIFIERS are replaced by the define in EVERY build, so they are absent
@@ -198,6 +216,13 @@ test.each(FORBIDDEN)('production bundle excludes forbidden token %s', (token) =>
   const files = walk(DIST);
   const offenders = files.filter((f) => readFileSync(f, 'utf8').includes(token));
   expect(offenders, `token "${token}" leaked into: ${offenders.join(', ')}`).toEqual([]);
+});
+
+test.each(NEVER_ANYWHERE)('no build at all (production or gated) contains %s', (token) => {
+  for (const dir of [DIST, CONTROL_DIST]) {
+    const offenders = walk(dir).filter((f) => readFileSync(f, 'utf8').includes(token));
+    expect(offenders, `token "${token}" appeared in: ${offenders.join(', ')}`).toEqual([]);
+  }
 });
 
 test.each(FORBIDDEN.filter((t) => !GATE_IDENTIFIERS.has(t)))(

@@ -282,6 +282,30 @@ describe('VideoEgress — per-target backlog and who repairs an abandonment', ()
     expect(r.egress.targetsAwaitingGroup()).toBe(1);
   });
 
+  it('R-35 local counters: bytesSent is the exact sum of bytes written to every target; groupsAbandoned counts the publisher abandonment', async () => {
+    const r = await makeRig({ urls: [A, B], maxBacklogFrames: 2 });
+    r.egress.setTargets({ targets: [A, B], headerVersion: HEADER_VERSION });
+    expect(r.egress.bytesSent).toBe(0);
+    expect(r.egress.groupsAbandoned).toBe(0);
+    await r.send(true);
+    await settle();
+    r.mocks.get(A)!.pauseUniStreamWrites(0);
+    for (let i = 0; i < 6; i += 1) await r.send(false);
+    await settle();
+    const written = [A, B]
+      .flatMap((url) => r.streamsOf(url))
+      .flatMap((stream) => stream.chunks)
+      .reduce((n, chunk) => n + chunk.length, 0);
+    const frames = [A, B]
+      .flatMap((url) => r.streamsOf(url))
+      .reduce((n, stream) => n + stream.chunks.length, 0);
+    expect(written).toBeGreaterThan(0);
+    expect(r.egress.bytesSent).toBe(written);
+    expect(r.egress.framesSent).toBe(frames);
+    expect(r.egress.groupsAbandoned).toBe(1);
+    expect(r.count('dt_client_media_send_groups_abandoned_total')).toBe(1);
+  });
+
   it('the byte cap trips like the frame cap', async () => {
     const r = await makeRig({ urls: [A], maxBacklogFrames: 1_000, maxBacklogBytes: 400 });
     r.egress.setTargets({ targets: [A], headerVersion: HEADER_VERSION });

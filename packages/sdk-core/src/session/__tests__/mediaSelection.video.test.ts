@@ -23,6 +23,7 @@ describe('selectVideoCaptureSource', () => {
       start: async () => undefined,
       stop: () => undefined,
       grantedDeviceId: undefined,
+      track: undefined,
     });
     const chosen = selectVideoCaptureSource(injected, 258);
     expect(chosen.factory).toBe(injected);

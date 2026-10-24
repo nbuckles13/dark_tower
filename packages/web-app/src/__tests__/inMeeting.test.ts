@@ -799,3 +799,28 @@ test('R-18: the inline action client-mutes THAT kind at once, then clears only t
   await screen.getByTestId('resume-notice-mute-audio').click();
   expect(session.sessionMuteCalls.at(-1)).toEqual({ kind: 'audio', muted: true });
 });
+
+// ---------------------------------------------------------------------------
+// Story 3 R-7 / R-35: the local debug panel's mount (one line in this view)
+// ---------------------------------------------------------------------------
+
+test('the debug toggle is present and the panel is HIDDEN by default; the overlay reads nothing while hidden', async () => {
+  localStorage.removeItem('darktower.debugPanel.v1');
+  const { screen, session } = await mount();
+  await screen.getByTestId('start-media').click();
+  await vi.waitFor(() => expect(session.media).toBeDefined());
+  const media = session.media!;
+  await expect.element(screen.getByTestId('debug-panel-toggle')).toBeInTheDocument();
+  await expect
+    .element(screen.getByTestId('debug-panel-toggle'))
+    .toHaveTextContent('Show debug options');
+  await expect.element(screen.getByTestId('debug-panel')).not.toBeInTheDocument();
+  expect(media.localStatsCalls).toBe(0);
+  // Opening it samples the session's local snapshot through the narrow closure.
+  await screen.getByTestId('debug-panel-toggle').click();
+  await expect.element(screen.getByTestId('debug-panel')).toBeInTheDocument();
+  await vi.waitFor(() => expect(media.localStatsCalls).toBeGreaterThan(0));
+  await expect.element(screen.getByTestId('debug-stats-send-audio')).toBeInTheDocument();
+  await screen.getByTestId('debug-panel-toggle').click();
+  localStorage.removeItem('darktower.debugPanel.v1');
+});

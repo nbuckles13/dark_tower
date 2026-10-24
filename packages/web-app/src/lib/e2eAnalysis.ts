@@ -10,10 +10,11 @@
 // `createE2EInstrumentation` returns `undefined` in a production build, where the
 // define is the literal `false`: the recorder class, the analyser construction
 // and every string below are dead code and tree-shaken, which
-// `tests/bundle-content.test.ts` proves (`createAnalyser`,
-// `getFloatFrequencyData`, the bus event names). The AnalyserNode exists only
-// when receive verification is on, because both are created here, together
-// (@security).
+// `tests/bundle-content.test.ts` proves (`getFloatFrequencyData` and the bus
+// event names such as `receiveAnalysis`; NOT `createAnalyser`, which the R-7
+// self-check's local microphone meter legitimately uses in production — story 3
+// C-C2). This module's REMOTE-lane AnalyserNode exists only when receive
+// verification is on, because both are created here, together (@security).
 //
 // ---------------------------------------------------------------------------
 // ANALYSED, NEVER RAW — AND NO DETECTOR

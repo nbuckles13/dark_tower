@@ -703,3 +703,32 @@ describe('teardown', () => {
     dec.emitOutput(); // late output after stop: closed, ignored
   });
 });
+
+describe('R-35 local counters (sampled, never exported)', () => {
+  it('keyframesSeen counts accepted keyframes reaching the slot; jitterDepth is the queued count; localDrops mirrors decode_queue_dropped exactly', () => {
+    const h = harness({ decoderQueueTarget: 10 });
+    const dec = h.decoders.last!;
+    expect(h.slot.keyframesSeen).toBe(0);
+    expect(h.slot.jitterDepth).toBe(0);
+    expect(h.slot.localDrops).toBe(0);
+    dec.queueSizeOverride = 99; // hold frames in the jitter buffer
+    h.slot.push(frame(A, 1, true));
+    h.slot.push(frame(A, 1, false));
+    h.slot.push(frame(A, 1, false));
+    expect(h.slot.jitterDepth).toBe(3);
+    // A new sender's delta before its keyframe: one local drop.
+    h.slot.push(frame(B, 2, false));
+    expect(h.slot.localDrops).toBe(1);
+    h.slot.push(frame(B, 2, true));
+    expect(h.slot.keyframesSeen).toBe(2);
+    expect(h.slot.jitterDepth).toBe(4);
+    dec.queueSizeOverride = undefined;
+    h.slot.push(frame(B, 2, false));
+    expect(h.slot.jitterDepth).toBe(0);
+    expect(h.slot.localDrops).toBe(
+      counterSum(h.sink, 'dt_client_media_decode_queue_dropped_total'),
+    );
+    for (let i = 0; i < dec.decoded.length; i += 1) dec.emitOutput();
+    h.stop();
+  });
+});

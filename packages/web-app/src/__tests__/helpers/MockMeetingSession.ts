@@ -14,6 +14,7 @@
 import { MeetingSessionState, TypedEventEmitter } from '@darktower/sdk-core';
 import type {
   CaptureSourceInfo,
+  LocalStatsSource,
   VideoCaptureSourceInfo,
   VideoReceiveView,
   VideoSendCounts,
@@ -47,6 +48,22 @@ export class FakeAudioPipeline {
   };
   /** Sampled by the E2E bus's `sendTracks` (story 3). */
   captureOpen = true;
+  /** Story 3 R-7: the read-only microphone track (`localCaptureTracksOf`). Mutable. */
+  captureTrack: MediaStreamTrack | undefined;
+  /**
+   * Story 3 R-35: the local statistics snapshot (`localStatsOf` reads it).
+   * `localStatsCalls` counts reads, so a test can prove the overlay samples only
+   * while open. Mutable.
+   */
+  localStatsValue: ReturnType<NonNullable<LocalStatsSource['media']>['localStats']> = {
+    receive: [],
+    send: { kind: 'audio', packets: 0, bytes: 0, keyframes: undefined, groupsAbandoned: undefined },
+  };
+  localStatsCalls = 0;
+  localStats(): ReturnType<NonNullable<LocalStatsSource['media']>['localStats']> {
+    this.localStatsCalls += 1;
+    return this.localStatsValue;
+  }
   /** Make the next `setCaptureDevice` reject, as an unavailable device would. */
   failNextDeviceChange = false;
 
@@ -83,8 +100,12 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
   joinCalls = 0;
   disconnectCalls = 0;
 
+  /** Story 3 C-C2: observe the instant `join()` runs (ordering assertions). */
+  onJoin: (() => void) | undefined;
+
   async join(): Promise<JoinedEvent> {
     this.joinCalls += 1;
+    this.onJoin?.();
     return {
       participantId: 'self',
       senderId: 1,
@@ -139,9 +160,27 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
   /** Story 3 C-C1: cumulative video send counts, `undefined` unless a test sets them. */
   videoSendCounts: VideoSendCounts | undefined;
   /** The video publisher as the bus samples it (`sendTotals`), present once counts are set. */
-  get video(): { sendTotals(): VideoSendCounts } | undefined {
+  get video():
+    | {
+        sendTotals(): VideoSendCounts;
+        localSendStats(): ReturnType<NonNullable<LocalStatsSource['video']>['localSendStats']>;
+        readonly captureTrack: MediaStreamTrack | undefined;
+      }
+    | undefined {
     const counts = this.videoSendCounts;
-    return counts === undefined ? undefined : { sendTotals: () => counts };
+    return counts === undefined
+      ? undefined
+      : {
+          sendTotals: () => counts,
+          localSendStats: () => ({
+            kind: 'video',
+            packets: counts.framesSent,
+            bytes: 0,
+            keyframes: counts.keyframes,
+            groupsAbandoned: 0,
+          }),
+          captureTrack: undefined,
+        };
   }
   /** The sinks a view attached, by slot (story 3 C-C1: the VideoTile binding). */
   readonly sinks = new Map<number, VideoSink | undefined>();
@@ -189,6 +228,7 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
         setVideoSink: (slotId, sink) => this.sinks.set(slotId, sink),
         evidence: () => this.videoEvidence,
         unfulfilledSnapshot: () => [],
+        localStats: () => [],
       };
     }
     this.captureSource ??= { mode: 'microphone' };

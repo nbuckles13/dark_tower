@@ -20,6 +20,7 @@ import {
 import { create, toBinary } from '@bufbuild/protobuf';
 
 import { MeetingSession } from '../MeetingSession.js';
+import { localCaptureTracksOf, localStatsOf } from '../localDebugSurface.js';
 import { encodeFrame } from '../../framing/length-prefix.js';
 import { RosterIdentityKeys } from '../../media/setup/rosterKeys.js';
 import { MeetingSessionState } from '../events.js';
@@ -1115,6 +1116,31 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     return { session, mocks, capture, codecs, playback, sink };
   }
 
+  it('R-35 / R-7 local surface (localStatsOf / localCaptureTracksOf over the public getters): undefined/empty before startMedia and after disconnect', async () => {
+    const rig = await joinedWithMedia();
+    expect(localStatsOf(rig.session)).toBeUndefined();
+    expect(localCaptureTracksOf(rig.session)).toEqual({});
+    await rig.session.startMedia();
+    const track = { kind: 'audio' } as unknown as MediaStreamTrack;
+    rig.capture.track = track;
+    expect(localCaptureTracksOf(rig.session)).toEqual({ audio: track });
+    const stats = localStatsOf(rig.session);
+    expect(stats).toBeDefined();
+    // One audio send stream (audio-only publish); every receive row is a declared slot.
+    expect(stats!.send.map((s) => s.kind)).toEqual(['audio']);
+    const declared = rig.session.receiveSlots;
+    expect(stats!.receive.map((r) => `${r.kind}:${r.slotId}`)).toEqual([
+      ...declared.audio.slotIds.map((id) => `audio:${id}`),
+      ...declared.video.slotIds.map((id) => `video:${id}`),
+    ]);
+    // A fresh object per read.
+    expect(localStatsOf(rig.session)).not.toBe(stats);
+    rig.session.disconnect();
+    await waitFor(() => localStatsOf(rig.session) === undefined);
+    expect(localStatsOf(rig.session)).toBeUndefined();
+    expect(localCaptureTracksOf(rig.session)).toEqual({});
+  });
+
   it('sends NO post-join receive capability: the join carried the declaration (story 3 R-2)', async () => {
     const rig = await joinedWithMedia();
     await rig.session.startMedia();
@@ -1814,6 +1840,7 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
           start: async () => undefined,
           stop: () => undefined,
           grantedDeviceId: undefined,
+          track: undefined,
         }),
       },
     });
@@ -1853,6 +1880,7 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
             start: async () => undefined,
             stop: () => undefined,
             grantedDeviceId: undefined,
+            track: undefined,
           }),
         },
       });
@@ -1914,6 +1942,7 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
           start: async () => undefined,
           stop: () => undefined,
           grantedDeviceId: undefined,
+          track: undefined,
         }),
       },
     });
@@ -2707,8 +2736,11 @@ describe('MeetingSession — video receive wiring (story 3 C-B)', () => {
 
   it('startMedia builds the receiver with exactly M decoders; video assignments reach it; renders are bridged', async () => {
     const rig = await videoRig();
+    // The narrow view (security F4). `localStats` is READ-ONLY (story 3 R-35,
+    // C-C2): a local snapshot, never exported, that changes nothing.
     expect(Object.keys(rig.session.videoReceive ?? {}).sort()).toEqual([
       'evidence',
+      'localStats',
       'setVideoSink',
       'unfulfilledSnapshot',
     ]);

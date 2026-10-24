@@ -17,9 +17,19 @@
 // per-kind handle AND the plain field a sampling embedder reads, adjacently, so
 // the getter and `dt_client_media_frames_{received,accepted,dropped}_total`
 // cannot drift apart. Do not split them.
+//
+// PER-SLOT TALLIES (story 3 R-35, the LOCAL statistics overlay). Beside the
+// kind totals, each DECLARED slot gets one tally — packets and bytes that
+// arrived naming it, and drops by reason — PRE-ALLOCATED at construction and
+// looked up by NUMERIC slot id, so the forward path does integer `++` only: no
+// insertion, no allocation, no string key. A slot id outside the declared set
+// (`'undeclared'`, `'unparsed'`, or a number never declared) is simply not
+// tallied. The tallies are read by {@link FrameAccounting.slotTally}, a sampled
+// snapshot; they never reach a metric handle, a label or the e2e bus — per-slot
+// byte counts are per-stream size series, which ADR-0036 §11 forbids exporting.
 
 import type { WrapOutcome } from '../frame/receivePath.js';
-import type { RejectReason } from '../frame/rejectReason.js';
+import { ALL_REJECT_REASONS, type RejectReason } from '../frame/rejectReason.js';
 import type { MediaKindMetrics } from '../setup/mediaMetrics.js';
 import type { ObservedSlot, ReceiveVerificationRecorder } from './receiveVerification.js';
 
@@ -30,6 +40,28 @@ export interface FrameCounts {
   readonly framesDropped: number;
   /** The most recent reject token; bounded by TYPE (the vectors file's closed set). */
   readonly lastDropReason: RejectReason | undefined;
+}
+
+/** One declared slot's local tally (R-35). Cumulative; sampled, never exported. */
+export interface SlotReceiveTally {
+  /** Frames that arrived naming this slot (its relay `stream_id`). */
+  readonly packets: number;
+  /** Their wire bytes. A cumulative SUM; no per-frame size is retained. */
+  readonly bytes: number;
+  /** Drops attributed to this slot, by reason (every reason present, zero-initialised). */
+  readonly drops: Readonly<Record<RejectReason, number>>;
+}
+
+interface MutableTally {
+  packets: number;
+  bytes: number;
+  readonly drops: Record<RejectReason, number>;
+}
+
+function newTally(): MutableTally {
+  const drops = {} as Record<RejectReason, number>;
+  for (const reason of ALL_REJECT_REASONS) drops[reason] = 0;
+  return { packets: 0, bytes: 0, drops };
 }
 
 /**
@@ -50,10 +82,39 @@ export class FrameAccounting implements FrameCounts {
    * land here and compile (ADR-0036 §11, `label-taxonomy.md` R2).
    */
   #lastDropReason: RejectReason | undefined;
+  /** Declared slot id -> its tally. Built once; never inserted into afterwards. */
+  readonly #slots: ReadonlyMap<number, MutableTally>;
 
-  constructor(metrics: MediaKindMetrics, verification?: ReceiveVerificationRecorder) {
+  constructor(
+    metrics: MediaKindMetrics,
+    verification?: ReceiveVerificationRecorder,
+    declaredSlotIds: readonly number[] = [],
+  ) {
     this.#metrics = metrics;
     this.#verify = verification;
+    this.#slots = new Map(declaredSlotIds.map((id) => [id, newTally()]));
+  }
+
+  /**
+   * A frame naming `slot` arrived with `bytes` wire bytes (R-35 local tally).
+   * Called once per frame where the slot is first known. Not a metric.
+   */
+  arrived(slot: ObservedSlot, bytes: number): void {
+    if (typeof slot !== 'number') return;
+    const tally = this.#slots.get(slot);
+    if (tally === undefined) return;
+    tally.packets += 1;
+    tally.bytes += bytes;
+  }
+
+  /**
+   * `slotId`'s local tally, COPIED (allocates — sample it, never per frame), or
+   * `undefined` for a slot this accounting was not built with.
+   */
+  slotTally(slotId: number): SlotReceiveTally | undefined {
+    const tally = this.#slots.get(slotId);
+    if (tally === undefined) return undefined;
+    return { packets: tally.packets, bytes: tally.bytes, drops: { ...tally.drops } };
   }
 
   /** A frame arrived at the parse boundary. The identity's left side. */
@@ -96,6 +157,10 @@ export class FrameAccounting implements FrameCounts {
     this.#metrics.frameDropped(reason);
     this.#dropped += 1;
     this.#lastDropReason = reason;
+    if (typeof slot === 'number') {
+      const tally = this.#slots.get(slot);
+      if (tally !== undefined) tally.drops[reason] += 1;
+    }
     this.#verify?.dropped(slot, senderId, reason);
   }
 

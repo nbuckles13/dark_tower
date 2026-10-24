@@ -327,6 +327,24 @@ export type {
   VideoSlotEvidence,
 } from './media/lifecycle/VideoReceiver.js';
 export type { UnfulfilledSlotState } from './media/lifecycle/unfulfilledSlots.js';
+// Story 3 R-35 / R-7: the LOCAL-ONLY debug surface (never exported to telemetry).
+export type {
+  LocalCaptureTracks,
+  LocalMediaStats,
+  LocalReceiveSlotStats,
+  LocalSendStreamStats,
+} from './media/lifecycle/localStats.js';
+export {
+  localCaptureTracksOf,
+  localStatsOf,
+  type LocalStatsSource,
+  type LocalTracksSource,
+} from './session/localDebugSurface.js';
+export {
+  openLocalPreview,
+  type LocalPreview,
+  type PreviewAcquire,
+} from './media/setup/localPreview.js';
 export type { AvatarSlotState, VideoRenderState } from './media/pipeline/renderDecision.js';
 export { MuteState } from './media/lifecycle/muteState.js';
 export type { MuteSnapshot } from './media/lifecycle/muteState.js';
