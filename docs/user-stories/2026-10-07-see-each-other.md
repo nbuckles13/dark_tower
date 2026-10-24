@@ -2805,7 +2805,7 @@ tasks:
   tier: light
   tier_reason: docs-only runbook scenarios; no code, contract or security surface
 - id: 20
-  status: pending
+  status: completed
   specialist: observability
   deps:
   - 2
@@ -2861,6 +2861,7 @@ tasks:
     - Alerts pass `validate-alert-rules.sh` (no URL exfiltration, annotation hygiene). A sustained `sender_server_muted` rate pages toward the server-mute runbook.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-24-story3-obs-b-video-alerts-dashboards
   tag: story-2026-10-07-see-each-other-task-20
 - id: 21
   status: pending
