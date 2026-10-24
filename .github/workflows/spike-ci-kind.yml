@@ -16,7 +16,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  KIND_VERSION: v0.20.0          # matches the local dev host
+  KIND_VERSION: v0.33.0          # run 3: v0.20 `kind load` fails on the runner Docker image store (ctr digest not found); S2 also recommends v0.33
   HOST_GATEWAY_IP: 10.255.255.254  # devloop-helper DEFAULT_HOST_GATEWAY_IP
   SLUG: ci
 
