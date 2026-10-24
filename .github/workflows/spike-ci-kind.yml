@@ -93,6 +93,15 @@ jobs:
           sudo install -m 0755 /tmp/kind /usr/local/bin/kind
           kind version
 
+      - name: Classic Docker image store (kind load compatibility)
+        # Runs 3-4: with Docker's containerd image store, `kind load` of multi-arch
+        # images fails (`ctr images import --all-platforms`: content digest not found).
+        run: |
+          docker info --format 'driver={{.Driver}} images={{.DriverStatus}}' || true
+          echo '{"features":{"containerd-snapshotter":false}}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info --format 'driver={{.Driver}}'
+
       - name: Use rootful docker, not the preinstalled podman
         # devloop-helper picks podman when it is on PATH; the spike measures the docker path.
         run: |
