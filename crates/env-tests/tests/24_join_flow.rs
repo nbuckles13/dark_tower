@@ -15,6 +15,10 @@
 //! The dev CA is at `infra/docker/certs/ca.crt`. MC tests use
 //! `with_no_cert_validation()` via the shared `fixtures::mc_session::connect_wt`
 //! because the dev CA cert is generated at Kind setup time and not committed to the repo.
+//!
+//! This file's MC joins declare no receive slots and open no MH session, so
+//! they install no egress edge (README per-file edge-sum header rule).
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "flows")]
 

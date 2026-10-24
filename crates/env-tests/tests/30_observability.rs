@@ -2,6 +2,8 @@
 //!
 //! Tests for Prometheus scraping and Loki log aggregation across all deployed services.
 //! Loki tests auto-skip if the log aggregation stack is not available.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "observability")]
 

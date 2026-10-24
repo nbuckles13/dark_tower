@@ -81,7 +81,8 @@
 //! Six concurrent fns; declared slots per fn: CANONICAL 2+2+2 = 6;
 //! ALL-CONNECTED 1+3+2 = 6; MIXES 7 (S) + 1 (R) = 8; OVER-SUBSCRIPTION cap+2
 //! = 6 at Kind's cap 4; PAIRING 2+1 = 3; TWO-HANDLER 2+2+2 = 6. Within the
-//! planned 72 (Kind is sized at about 120).
+//! planned per-file cap `fixtures::egress_admission::MAX_PER_FILE_EDGE_SUM`,
+//! which the Kind egress window is sized against.
 //!
 //! Edge-sum (concurrent Σ P×(N+M)): 35
 //!
@@ -93,7 +94,7 @@
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::gc_client::GcClient;
 use env_tests::fixtures::kube::{
-    configmap_key, configmap_name_for_all, configmap_u64, PROFILE_CONFIGMAP,
+    configmap_key, configmap_name_for_all, configmap_u64, MC_INSTANCES, PROFILE_CONFIGMAP,
 };
 use env_tests::fixtures::mc_session::{self, JoinDeclaration, McSession};
 use env_tests::fixtures::media::{
@@ -556,9 +557,8 @@ fn assert_directive_shape(phase: &str, d: &SendDirective, publishes: &[MediaKind
 /// `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS` (read from the ConfigMaps the pods run,
 /// never a literal; the client refuses a video stream missing any field).
 fn assert_video_encoding(phase: &str, s: &SendStream) {
-    let mcs = ["mc-0", "mc-1"];
-    let profile = configmap_name_for_all(&mcs, PROFILE_CONFIGMAP);
-    let mc = configmap_name_for_all(&mcs, "mc-service-config");
+    let profile = configmap_name_for_all(MC_INSTANCES, PROFILE_CONFIGMAP);
+    let mc = configmap_name_for_all(MC_INSTANCES, "mc-service-config");
     let n = |cm: &str, k: &str| u32::try_from(configmap_u64(cm, k)).expect("fits u32");
     assert_eq!(
         configmap_key(&profile, "MEDIA_VIDEO_CODEC"),
@@ -846,7 +846,7 @@ async fn test_video_over_subscription_truncates_to_unavailable() {
     // (02 proves the process loaded it) and cross-checked against S's own
     // JoinResponse below. Kind's is 4.
     let cap = usize::try_from(configmap_u64(
-        &configmap_name_for_all(&["mc-0", "mc-1"], "mc-service-config"),
+        &configmap_name_for_all(MC_INSTANCES, "mc-service-config"),
         "MC_MAX_VIDEO_RECEIVE_SLOTS",
     ))
     .unwrap();

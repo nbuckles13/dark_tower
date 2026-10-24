@@ -20,6 +20,8 @@
 //! - Kind cluster with AC and GC deployed
 //! - Port-forwards active: AC (8082), GC (8080)
 //! - Test data seeded: `devtest` organization in database
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "flows")]
 

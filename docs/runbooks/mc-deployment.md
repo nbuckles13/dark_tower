@@ -1178,9 +1178,11 @@ data:
 encoding keys MC directs and MH costs against. Its content is not copied here. Read
 `profile.env`, whose header carries the membership rule (only values both services must agree on;
 a header rule, not a guard) and the roll cost: **any edit rolls mc-0, mc-1, mh-0 and mh-1
-together.** Kind runs the production profile until INF-C adds the Kind test-profile patch in
-`infra/kubernetes/overlays/kind/services/media-codec-profile/`. There is no `dev-web.sh` override
-for the profile: to change it, edit (or, once it exists, remove) that patch and redeploy.
+together.** Kind runs a lower test profile (story 3 R-28), set only by the Kind test-profile patch
+`infra/kubernetes/overlays/kind/services/media-codec-profile/configmap-test-profile-patch.yaml`.
+There is no `dev-web.sh` override for the profile: to change it, edit or remove that patch and
+redeploy. The patch header is the one statement of the production-quality procedure, including the
+MH stream-ceiling check and the restore before Layer 7.
 
 **Per-instance ConfigMaps: `mc-0-config`, `mc-1-config`** — carry only
 `MC_WEBTRANSPORT_ADVERTISE_ADDRESS`, which necessarily differs per pod. Both

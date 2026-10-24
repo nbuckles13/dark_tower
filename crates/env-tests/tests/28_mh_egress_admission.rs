@@ -41,11 +41,11 @@
 //! economic participant limit (`MAX_S9_PARTICIPANTS`) live in
 //! `env_tests::fixtures::egress_admission`, their ONE home, because
 //! `01_mh_deployment_config.rs` bounds the Kind budget from ABOVE against the
-//! same limit. Illustration only, derived at run time and printed as the `S9:`
-//! line: with the Kind overlay's budget and `MC_MAX_AUDIO_RECEIVE_SLOTS` = 8 the
-//! ceiling is 100 and P = 26 (26 x 8 = 208 > 200) — 26 AC registrations and
-//! about 52 MH sessions, and the handler genuinely carries about 100 concurrent
-//! egress streams during this test.
+//! same limit. The figures are derived at run time and printed as the `S9:`
+//! line, never recorded here (a restated ceiling goes stale the moment the
+//! profile or MH's overhead constant moves): P AC registrations, about 2P MH
+//! sessions, and the handler genuinely carries about a ceiling's worth of
+//! concurrent egress streams during this test.
 //!
 //! Every participant opens an MH session to every handler URL it was offered.
 //! That is load-bearing, not incidental: MC routes only through connectivity MH
@@ -105,13 +105,14 @@
 //! # Edge sum (README per-file edge-sum header rule)
 //!
 //! One fn: P participants x S audio slots, sized AT RUN TIME from the live
-//! ceiling and `MC_MAX_AUDIO_RECEIVE_SLOTS` (the `S9:` line prints it). At the
-//! recorded Kind figures (ceiling 100, cap 8) that is P = 26, S = 8: 208.
+//! ceiling and `MC_MAX_AUDIO_RECEIVE_SLOTS` (the `S9:` line prints it),
 //! DELIBERATELY past the per-handler ceiling — exceeding it is what S9 tests.
-//! INF-C sizes the Kind budget against this test (01's upper bound); this line
-//! records the load and changes none of that.
+//! So this file records the exemption, not a number (a number here would be a
+//! restated derived ceiling); it is the ONE file the hermetic check
+//! (`fixtures::egress_admission::check_edge_sums`) lets carry it. The Kind
+//! budget is sized against this test (01's upper bound).
 //!
-//! Edge-sum (concurrent Σ P×(N+M)): 208
+//! Edge-sum (concurrent Σ P×(N+M)): exempt — sized from the live ceiling by fixtures::egress_admission::size_s9_meeting
 
 #![cfg(feature = "flows")]
 
@@ -125,11 +126,11 @@ use env_tests::fixtures::egress_admission::{
 };
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, GcClientError};
 use env_tests::fixtures::kube::{
-    configmap_key, configmap_name_for_all, configmap_u64, REDEPLOY_HINT,
+    configmap_key, configmap_name_for_all, configmap_u64, MC_INSTANCES, MH_INSTANCES, REDEPLOY_HINT,
 };
 use env_tests::fixtures::mc_session::{self, McSession, MhSession};
 use env_tests::fixtures::metrics::{
-    gauge_by_instance_present, instances_exceeding_baseline, poll_until_any_instance_above,
+    gauge_by_live_pod, instances_exceeding_baseline, poll_until_any_instance_above,
     settled_baseline, InstanceCounters,
 };
 use env_tests::fixtures::{AuthClient, PrometheusClient};
@@ -138,8 +139,10 @@ use proto_gen::dark_tower::signaling::v1::{
     client_message, ClientMessage, MediaKind, ReceiveCapability, ReceiveSlot,
 };
 
-/// Both Kind MH instances must publish every admission gauge.
-const MH_INSTANCE_COUNT: usize = 2;
+/// Both Kind MH instances (`kube::MH_INSTANCES`) must publish every admission
+/// gauge; every config-published one is read from EACH live pod
+/// (`gauge_by_live_pod`), never a terminated predecessor's series.
+const MH_INSTANCE_COUNT: usize = MH_INSTANCES.len();
 
 /// Scrape-convergence bound for eagerly-published gauges.
 const GAUGE_PRESENT_BOUND: Duration = Duration::from_secs(60);
@@ -218,10 +221,10 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
 
     // ---- PRECONDITION: read everything from the live system ----------------
-    let ceilings = gauge_by_instance_present(
+    let ceilings = gauge_by_live_pod(
         &prom,
         "mh_media_egress_stream_ceiling",
-        MH_INSTANCE_COUNT,
+        MH_INSTANCES,
         GAUGE_PRESENT_BOUND,
     )
     .await;
@@ -243,8 +246,8 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
         .expect("PRECONDITION: at least one ceiling");
     // Resolved ONCE per test, from EVERY instance (they must agree): the live,
     // content-addressed generations the pods run (ADR-0038 §2).
-    let mc_config = configmap_name_for_all(&["mc-0", "mc-1"], "mc-service-config");
-    let mh_config = configmap_name_for_all(&["mh-0", "mh-1"], "mh-service-config");
+    let mc_config = configmap_name_for_all(MC_INSTANCES, "mc-service-config");
+    let mh_config = configmap_name_for_all(MH_INSTANCES, "mh-service-config");
     let slot_cap = configmap_u64(&mc_config, "MC_MAX_AUDIO_RECEIVE_SLOTS");
     let (participants, slots) = size_meeting(ceiling, slot_cap);
 
@@ -274,24 +277,24 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
     // room for even one participant's slots could refuse the whole meeting
     // before any ADMITTED decision, starving the positive control. So EVERY
     // instance needs headroom >= `slots`.
-    let edges = gauge_by_instance_present(
+    let edges = gauge_by_live_pod(
         &prom,
         "mh_media_egress_edges",
-        MH_INSTANCE_COUNT,
+        MH_INSTANCES,
         GAUGE_PRESENT_BOUND,
     )
     .await;
-    let registered = gauge_by_instance_present(
+    let registered = gauge_by_live_pod(
         &prom,
         "mh_media_registered_meetings",
-        MH_INSTANCE_COUNT,
+        MH_INSTANCES,
         GAUGE_PRESENT_BOUND,
     )
     .await;
-    let registered_limit = gauge_by_instance_present(
+    let registered_limit = gauge_by_live_pod(
         &prom,
         "mh_media_registered_meetings_limit",
-        MH_INSTANCE_COUNT,
+        MH_INSTANCES,
         GAUGE_PRESENT_BOUND,
     )
     .await;
@@ -492,10 +495,10 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
     }
 
     // ---- GAUGES: ratio and threshold present on every instance -------------
-    let ratios = gauge_by_instance_present(
+    let ratios = gauge_by_live_pod(
         &prom,
         "mh_media_stream_admission_rejection_ratio",
-        MH_INSTANCE_COUNT,
+        MH_INSTANCES,
         GAUGE_PRESENT_BOUND,
     )
     .await;
@@ -511,10 +514,10 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
             panic!("PRECONDITION: MH_EGRESS_REJECTION_RATIO_THRESHOLD={raw:?} is not a number: {e}")
         })
     };
-    let thresholds = gauge_by_instance_present(
+    let thresholds = gauge_by_live_pod(
         &prom,
         "mh_media_stream_admission_rejection_ratio_threshold",
-        MH_INSTANCE_COUNT,
+        MH_INSTANCES,
         GAUGE_PRESENT_BOUND,
     )
     .await;

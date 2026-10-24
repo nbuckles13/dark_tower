@@ -154,11 +154,12 @@
 //! CONCURRENTLY running test fns, of P × (N+M) — participants times the audio
 //! plus video slots each declares. `cargo test` runs one file's fns in
 //! parallel and the files sequentially, so the per-file sum is the load the
-//! Kind cluster carries at once. INF-C (task 16) sizes the Kind ceiling at
-//! about 120 against the PLANNED largest per-file sum, 72
-//! (`27_mc_slot_placement`); each file's ACTUAL sum is the `Edge-sum` line in
-//! its own header. A file that would exceed it serialises its fns or raises the budget in the
-//! same change.
+//! Kind cluster carries at once. The Kind egress window is sized against the
+//! planned per-file cap `fixtures::egress_admission::MAX_PER_FILE_EDGE_SUM`
+//! (its lower side, with the demo and the retained-edge floor); each file's
+//! ACTUAL sum is the `Edge-sum` line in its own header, and the hermetic check
+//! there fails any file above the cap. A file that would exceed it serialises
+//! its fns or raises the cap (re-checking the Kind budget) in the same change.
 
 pub mod backlog;
 pub mod control;

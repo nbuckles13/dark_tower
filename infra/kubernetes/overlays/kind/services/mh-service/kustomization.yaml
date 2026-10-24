@@ -4,7 +4,8 @@ kind: Kustomization
 resources:
   - ../../../../../services/mh-service
 
-# Story 2 R-19: size MH's egress budget for the Kind dev cluster. The prod base
+# Story 2 R-19 (re-sized for story 3 R-24 at the Kind test codec profile): size
+# MH's egress budget for the Kind dev cluster. The prod base
 # ships MH_EGRESS_BUDGET_BPS as a deliberately-unsized placeholder; this
 # strategic-merge patch overrides that one value. The sizing requirement, the
 # formula and the env-test that enforces them are in the patch file. Mirrors

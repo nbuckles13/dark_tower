@@ -11,10 +11,10 @@
 //!    keys and shared media-codec-profile keys are wired into BOTH
 //!    instances, carry parseable values that satisfy the relationships MH
 //!    boot-checks, are what the running process actually loaded (where MH
-//!    publishes them), and — on Kind — size a stream ceiling that meets the demo
-//!    requirement. Retiring keys are optional refs to keys still present.
-//!    (Section "Story 2 configuration surface".) The MC twin is
-//!    `02_mc_deployment_config.rs`.
+//!    publishes them), and — on Kind — size a stream ceiling inside the Kind
+//!    window and run the committed Kind test codec profile. Retiring keys are
+//!    optional refs to keys still present. (Section "Story 2 configuration
+//!    surface".) The MC twin is `02_mc_deployment_config.rs`.
 //!
 //! # What this asserts, and why it is not a tautology
 //!
@@ -110,8 +110,16 @@
 //!   rollout, and Layer 7 waits for every rollout before this suite runs. The
 //!   check read `managedFields` times that no longer mean "config changed".
 //! - **(e) Kind sizing.** The deployed budget is the Kind overlay's value (not
-//!   the base placeholder), and the stream ceiling derived from DEPLOYED values
-//!   meets the demo requirement.
+//!   the base placeholder), and the stream ceiling each live MH pod PUBLISHES
+//!   (`mh_media_egress_stream_ceiling`, the value admission enforces) lies
+//!   inside the two-sided window whose constants live in
+//!   `env_tests::fixtures::egress_admission` — at least the largest load one
+//!   handler must carry plus the retained-edge floor, at most what the S9
+//!   exhaustion test can exceed.
+//! - **(f) Kind test codec profile.** The live `media-codec-profile`
+//!   generation MC and MH resolve (one generation across all four pods) holds
+//!   exactly the base keys, with every value the committed Kind test-profile
+//!   patch sets (story 3 R-28).
 //!
 //! ## What this does NOT prove — read before citing it
 //!
@@ -158,18 +166,27 @@
 //! literal-valued env var or secret-bearing ConfigMap key would turn a
 //! diagnostic dump into a credential leak in CI logs. Extract the scalars
 //! first, then format. The ConfigMap and gauge reads are in scope of this policy.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "smoke")]
 
 use env_tests::fixtures::deployment_config::{
     check_key_ref, check_resource_field_ref, check_shape, cm_value, container, fetch_configmap,
-    fetch_live_pod, parse_positive, pod_name_of, RefKind, ValueShape,
+    fetch_live_pod, kind_patch_overrides, live_pod, parse_positive, pod_name_of,
+    tree_configmap_data, PatchOverride, RefKind, ValueShape, KIND_SIZING_RESTORE,
+    KIND_TEST_PROFILE_PATCH, PROFILE_BASE_ENV,
+};
+use env_tests::fixtures::egress_admission::{
+    kind_window_lower_bound, max_s9_feasible_ceiling, required_edges, DEMO_M, DEMO_N, DEMO_P,
+    MAX_PER_FILE_EDGE_SUM, MAX_S9_PARTICIPANTS, RETAINED_EDGE_FLOOR,
 };
 use env_tests::fixtures::kube::{
-    configmap_name_for, configmap_name_for_all, PROFILE_CONFIGMAP, REDEPLOY_HINT,
+    configmap_name_for, configmap_name_for_all, MC_INSTANCES, MH_INSTANCES, PROFILE_CONFIGMAP,
+    PROFILE_READERS, REDEPLOY_HINT,
 };
 use env_tests::fixtures::mh_config::{gauge_verdict, Conversion, GaugeVerdict};
-use env_tests::{repo_root, NAMESPACE};
+use env_tests::NAMESPACE;
 use serde_json::Value;
 
 const CONTAINER: &str = "mh-service";
@@ -289,9 +306,6 @@ async fn test_mh_1_termination_grace_matches_pod_spec() {
 /// §2); resolve it from the pod spec with [`shared_configmap_for`] /
 /// [`shared_configmap`] — never use this bare name as a live object name.
 const SHARED_CONFIGMAP: &str = "mh-service-config";
-
-/// Both MH instances. Every per-instance assertion runs over this one list.
-const MH_INSTANCES: &[&str] = &["mh-0", "mh-1"];
 
 /// The live `mh-service-config` generation `instance`'s pod references.
 fn shared_configmap_for(instance: &str) -> String {
@@ -463,24 +477,9 @@ const CONFIG_GAUGES: &[(&str, &str, Conversion)] = &[
     ),
 ];
 
-/// The demo requirement the Kind budget is sized against: P participants each
-/// filling N audio plus M video receive slots on one handler (story 3: P = 6,
-/// N = 5, M = 4). This is the REQUIREMENT being asserted, stated once here; the
-/// Kind patch comment states it in prose and points at this test.
-const DEMO_P: u64 = 6;
-const DEMO_N: u64 = 5;
-const DEMO_M: u64 = 4;
-
-/// Egress streams for P participants each filling N audio + M video slots:
-/// `P x (N + M)`.
-///
-/// ANCHOR (DRY): the same formula, same parameter meaning, is `demo_streams`
-/// in `crates/mh-service/src/config.rs` (env-tests links no service crate);
-/// `test_running_mh_publishes_the_deployed_stream_ceiling` checks the two agree
-/// through the published recommended minimum.
-const fn required_edges(p: u64, n: u64, m: u64) -> u64 {
-    p * (n + m)
-}
+// The demo requirement (`DEMO_P/N/M`, `required_edges`) and every other
+// constant of the Kind window live in ONE place,
+// `env_tests::fixtures::egress_admission`, shared with 28 (the S9 side).
 
 // -----------------------------------------------------------------------------
 // The independent per-stream cost oracle (story 3 R-24)
@@ -707,56 +706,32 @@ async fn test_story2_keys_wired_into_every_mh_instance() {
 #[tokio::test]
 async fn test_policy_bounds_reported_by_running_mh_match_configmap() {
     use env_tests::cluster::ClusterConnection;
-    use env_tests::fixtures::metrics::poll_until_pinned_instance;
+    use env_tests::fixtures::metrics::gauge_on_live_pod;
     use env_tests::fixtures::PrometheusClient;
-    use std::time::Duration;
 
     let cluster = ClusterConnection::new()
         .await
         .expect("Failed to connect to cluster - ensure port-forwards are running");
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
 
-    // Per instance: its own generation and its own pod IP (the Prometheus
-    // `instance` label is pod IP:port).
-    let pods: Vec<(&str, String, String, Value)> = MH_INSTANCES
+    // Per instance: its own generation and its own live pod. Every read is
+    // pinned to that pod (`gauge_on_live_pod`): right after a deploy rolls MH,
+    // the terminating predecessor is still a scrape target for its drain
+    // window, so "enough instances have the series" can be satisfied before
+    // the NEW pod's first scrape. Its PRESENCE panic is the no-data branch.
+    let pods: Vec<_> = MH_INSTANCES
         .iter()
         .map(|&instance| {
-            let pod = fetch_live_pod(instance);
-            let pod_name = pod_name_of(&pod, instance);
-            let pod_ip = pod
-                .pointer("/status/podIP")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("pod {pod_name} has no status.podIP"))
-                .to_string();
             let cm = fetch_configmap(&shared_configmap_for(instance));
-            (instance, pod_name, pod_ip, cm)
+            (live_pod(instance), cm)
         })
         .collect();
 
     for &(key, gauge, conversion) in CONFIG_GAUGES {
-        for (instance, pod_name, pod_ip, cm) in &pods {
+        for (pod, cm) in &pods {
+            let (instance, pod_name, pod_ip) = (&pod.instance, &pod.name, &pod.ip);
             let deployed = positive(cm, SHARED_CONFIGMAP, key);
-            // Branch: no data for THIS pod. Polled PER POD, pinned to its IP: right after
-            // a deploy rolls MH, the terminating predecessor is still a scrape target for
-            // its drain window, so "enough instances have the series" can be satisfied
-            // before the NEW pod's first scrape. The poll's timeout panic is the no-data
-            // branch (its phase/expectation carry the explanation).
-            let promql = format!("max by (instance) ({gauge})");
-            let value = poll_until_pinned_instance(
-                &prom,
-                &promql,
-                pod_ip,
-                GAUGE_PRESENT_BOUND,
-                Duration::from_secs(2),
-                &format!(
-                    "PRESENCE ({instance}, pod {pod_name}): MH publishes {gauge} at process \
-                     start, so absence is a scrape/startup problem (the pod is not scraped, \
-                     or the publish ran before the recorder) — NOT a configuration mismatch"
-                ),
-                "present",
-                |_| true,
-            )
-            .await;
+            let value = gauge_on_live_pod(&prom, gauge, pod, GAUGE_PRESENT_BOUND).await;
             let series = format!("instance at {pod_ip}");
             match gauge_verdict(conversion, deployed, value) {
                 GaugeVerdict::Match => {}
@@ -778,31 +753,6 @@ async fn test_policy_bounds_reported_by_running_mh_match_configmap() {
             }
         }
     }
-}
-
-/// Reads `data.MH_EGRESS_BUDGET_BPS` from a ConfigMap manifest in the tree.
-fn tree_budget(rel_path: &str) -> u64 {
-    let path = repo_root().join(rel_path);
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    // The base is a configMapGenerator env file (ADR-0038 §2: `KEY=VALUE`, taken
-    // literally); the Kind overlay's patch is still a strategic-merge YAML patch.
-    if rel_path.ends_with(".env") {
-        let raw = text
-            .lines()
-            .find_map(|l| l.strip_prefix("MH_EGRESS_BUDGET_BPS="))
-            .unwrap_or_else(|| panic!("{} has no MH_EGRESS_BUDGET_BPS= line", path.display()));
-        return parse_positive("MH_EGRESS_BUDGET_BPS", raw, rel_path)
-            .unwrap_or_else(|e| panic!("{e}"));
-    }
-    let doc: serde_norway::Value = serde_norway::from_str(&text)
-        .unwrap_or_else(|e| panic!("{} is not valid YAML: {e}", path.display()));
-    let raw = doc
-        .get("data")
-        .and_then(|d| d.get("MH_EGRESS_BUDGET_BPS"))
-        .and_then(serde_norway::Value::as_str)
-        .unwrap_or_else(|| panic!("{} has no string data.MH_EGRESS_BUDGET_BPS", path.display()));
-    parse_positive("MH_EGRESS_BUDGET_BPS", raw, rel_path).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// (e) The deployed Kind stream ceiling meets the demo requirement.
@@ -829,22 +779,30 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
     );
 
     let deployed = positive(&cm, SHARED_CONFIGMAP, "MH_EGRESS_BUDGET_BPS");
-    let patch_value = tree_budget(PATCH);
-    let base_value = tree_budget(BASE);
-
-    assert_ne!(
-        patch_value, base_value,
-        "{PATCH} sets MH_EGRESS_BUDGET_BPS equal to the base placeholder in {BASE}: \
-         the Kind override is a no-op. Fix the tree."
-    );
+    // The ONE patch-vs-base rule (a dead key or a no-op override fails, naming
+    // the patch) — the same one the codec-profile patch is held to.
+    let overrides = kind_patch_overrides(PATCH, BASE).unwrap_or_else(|e| panic!("{e}"));
+    let budget_of = |raw: &str, home: &str| {
+        parse_positive("MH_EGRESS_BUDGET_BPS", raw, home).unwrap_or_else(|e| panic!("{e}"))
+    };
+    let (patch_value, base_value) = match overrides.as_slice() {
+        [PatchOverride { key, patch, base }] if key == "MH_EGRESS_BUDGET_BPS" => {
+            (budget_of(patch, PATCH), budget_of(base, BASE))
+        }
+        _ => panic!(
+            "{PATCH} must override exactly MH_EGRESS_BUDGET_BPS and nothing else (it overrides \
+             {:?})",
+            overrides.iter().map(|o| &o.key).collect::<Vec<_>>()
+        ),
+    };
 
     // Branch 1: the overlay did not apply. A BUILD-PATH failure, not a sizing
     // one — "ceiling too low" would send a responder to re-size a budget whose
     // override never ran.
     assert_ne!(
         deployed, base_value,
-        "deployed MH_EGRESS_BUDGET_BPS is the BASE placeholder: the Kind overlay \
-         patch ({PATCH}) did NOT apply. {REDEPLOY_HINT} (never a plain `kubectl \
+        "OVERLAY-NOT-APPLIED: deployed MH_EGRESS_BUDGET_BPS is the BASE placeholder: the Kind \
+         overlay patch ({PATCH}) did NOT apply. {REDEPLOY_HINT} (never a plain `kubectl \
          apply -k` of an overlay — the bases carry image placeholders only \
          deploy.sh renders); if the base key was renamed, the strategic merge now \
          adds a dead key and the patch must follow the rename. This is a \
@@ -857,72 +815,81 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
          by hand, or the cluster predates the current patch; {REDEPLOY_HINT}."
     );
 
-    // Branch 2: the patch applied; is the value it set big enough? Computed
-    // from DEPLOYED values, never a literal — the budget from mh-service-config
-    // and both costs DERIVED by this file's independent oracle from the live
-    // media-codec-profile (MH stopped reading the retired cost keys).
-    //
-    // A second encoding of MH's derivation (budget / max(cost_audio,
-    // cost_video), floored), and now a CHECKED one:
-    // `test_running_mh_publishes_the_deployed_stream_ceiling` compares MH's
-    // published `mh_media_egress_stream_ceiling` against the same deployed
-    // values, so this formula cannot silently disagree with the enforced one.
-    //
-    // CONSERVATIVE OVER BOTH CONVERSION ORDERS. The keys are in bits; the MH
-    // code task converts to bytes once at load. With integer division,
-    // dividing in bits and dividing in bytes can floor to different ceilings
-    // whenever a value is not a multiple of 8. Rather than assert a property of
-    // today's values in a comment, compute both orders and hold the requirement
-    // against the SMALLER — so the check is true whichever order MH uses, and
-    // imposes no multiple-of-8 rule MH itself does not impose.
-    let (audio, video) = oracle_costs_bps(&fetch_configmap(&profile_configmap()));
-    let bits_ceiling = deployed / audio.max(video);
-    let byte_cost = (audio / 8).max(video / 8);
-    assert!(
-        byte_cost > 0,
-        "both derived stream costs (audio {audio}, video {video} bits/s) are below 8 \
-         bits/s, so each converts to 0 bytes/s and the byte-order ceiling divides by zero. \
-         The live media-codec-profile is not a real profile."
-    );
-    let bytes_ceiling = (deployed / 8) / byte_cost;
-    let ceiling = bits_ceiling.min(bytes_ceiling);
-    let required = required_edges(DEMO_P, DEMO_N, DEMO_M);
+    // Branch 2: the patch applied; is the value it set inside the window? Read
+    // from the gauge MH publishes — the ceiling admission ENFORCES and GC is
+    // told — on EACH live pod, never re-derived here: that the gauge equals the
+    // documented rule over the deployed values is
+    // `test_running_mh_publishes_the_deployed_stream_ceiling`'s job.
+    use env_tests::cluster::ClusterConnection;
+    use env_tests::fixtures::metrics::gauge_by_live_pod;
+    use env_tests::fixtures::PrometheusClient;
+    let cluster = ClusterConnection::new()
+        .await
+        .expect("Failed to connect to cluster - ensure port-forwards are running");
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    let ceilings = gauge_by_live_pod(
+        &prom,
+        "mh_media_egress_stream_ceiling",
+        MH_INSTANCES,
+        GAUGE_PRESENT_BOUND,
+    )
+    .await;
 
-    // Upper side (story 2 task 10): the S9 exhaustion test must still be able
-    // to drive a registration PAST this ceiling within its economic
-    // participant limit. Checked here, from the live ConfigMaps, in seconds —
-    // rather than discovered as a PRECONDITION panic deep in the Layer-7 flows
-    // run. The limit and the pigeonhole rule have ONE home, shared with test 28.
-    // S9 drives AUDIO slots only, so the per-kind AUDIO cap bounds it (story 3
-    // MC-A retired the kind-blind `MC_MAX_RECEIVE_SLOTS`).
+    let lower = kind_window_lower_bound();
+    let demo = required_edges(DEMO_P, DEMO_N, DEMO_M);
+    // S9 drives AUDIO slots only, so the per-kind AUDIO cap bounds it.
     let slot_cap = env_tests::fixtures::kube::configmap_u64(
-        &configmap_name_for_all(&["mc-0", "mc-1"], "mc-service-config"),
+        &configmap_name_for_all(MC_INSTANCES, "mc-service-config"),
         "MC_MAX_AUDIO_RECEIVE_SLOTS",
     );
-    let feasible = env_tests::fixtures::egress_admission::max_s9_feasible_ceiling(slot_cap);
-    let s9_ceiling = bits_ceiling.max(bytes_ceiling);
-    assert!(
-        s9_ceiling <= feasible,
-        "Kind stream ceiling {s9_ceiling} is ABOVE the largest ceiling the S9 exhaustion test \
-         (28_mh_egress_admission.rs) can exceed: {feasible}, i.e. P x S > 2 x ceiling with at \
-         most {} participants and MC_MAX_AUDIO_RECEIVE_SLOTS={slot_cap}. Both bounds on the Kind \
-         budget: ceiling >= {required} (demo) and ceiling <= {feasible} (S9). Fix: LOWER \
-         MH_EGRESS_BUDGET_BPS in {PATCH}; raising MAX_S9_PARTICIPANTS instead is a decision \
-         about test cost, not a sizing fix.",
-        env_tests::fixtures::egress_admission::MAX_S9_PARTICIPANTS
+    let upper = max_s9_feasible_ceiling(slot_cap);
+    // ONE restore for both halves of the unit (profile and budget roll back
+    // together): after a production-quality demo the likelier cause is an
+    // unrestored PROFILE, which a budget re-size would only hide.
+    let restore = format!(
+        "If the Kind test profile or the budget was edited (e.g. for a production-quality \
+         demo), {KIND_SIZING_RESTORE}. If \
+         test_kind_media_codec_profile_is_the_committed_test_profile also fails, the profile is \
+         the cause — restore it, do not re-size the budget"
     );
-
-    assert!(
-        ceiling >= required,
-        "Kind stream ceiling {ceiling} (the smaller of {bits_ceiling} dividing in \
-         bits and {bytes_ceiling} dividing in bytes) is BELOW the demo requirement \
-         of {required} egress streams (P={DEMO_P}, N={DEMO_N}, M={DEMO_M}: P x (N + M)). \
-         Derived from the deployed MH_EGRESS_BUDGET_BPS={deployed} / max(derived audio \
-         cost {audio}, derived video cost {video}) from the live media-codec-profile. \
-         Under-sizing makes admission reject partway through the largest scenario, which \
-         looks exactly like a routing bug. Fix: RAISE the budget in {PATCH}. Do not lower \
-         the profile and do not lower the demo size."
+    let window = format!(
+        "window [{lower}, {upper}] per handler: lower = max(demo P x (N + M) = {demo}, \
+         MAX_PER_FILE_EDGE_SUM = {MAX_PER_FILE_EDGE_SUM}) + RETAINED_EDGE_FLOOR = \
+         {RETAINED_EDGE_FLOOR}; upper = max_s9_feasible_ceiling(MC_MAX_AUDIO_RECEIVE_SLOTS = \
+         {slot_cap}) with MAX_S9_PARTICIPANTS = {MAX_S9_PARTICIPANTS} (all in \
+         crates/env-tests/src/fixtures/egress_admission.rs)"
     );
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "window bounds are stream counts, far below 2^53"
+    )]
+    let (lower_f, upper_f) = (lower as f64, upper as f64);
+    let mut sorted: Vec<_> = ceilings.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    for (instance, &value) in sorted {
+        assert!(
+            value.is_finite() && value >= 0.0 && value.fract() == 0.0,
+            "MH instance {instance} publishes mh_media_egress_stream_ceiling={value}, which is \
+             not a stream count: the publisher's shape changed \
+             (crates/mh-service/src/observability/metrics.rs). Not a sizing failure."
+        );
+        assert!(
+            value >= lower_f,
+            "WINDOW-LOWER: MH instance {instance} publishes mh_media_egress_stream_ceiling={value}, \
+             BELOW the Kind {window}. Under-sizing makes admission reject partway through the \
+             largest scenario, which looks exactly like a routing bug (\"some receivers miss \
+             some senders\"). {restore}; otherwise RAISE MH_EGRESS_BUDGET_BPS in {PATCH}. Do not \
+             shrink the retained floor, shorten the grace period or serialise env-tests."
+        );
+        assert!(
+            value <= upper_f,
+            "WINDOW-UPPER: MH instance {instance} publishes mh_media_egress_stream_ceiling={value}, \
+             ABOVE the Kind {window}: the S9 exhaustion test (28_mh_egress_admission.rs) could not \
+             drive a registration past it. {restore}; otherwise LOWER MH_EGRESS_BUDGET_BPS in \
+             {PATCH}. Raising MAX_S9_PARTICIPANTS instead is a decision about test cost, not a \
+             sizing fix."
+        );
+    }
 }
 
 /// MH's rule for the ceiling, EXACTLY as `crates/mh-service/src/config.rs`
@@ -948,7 +915,7 @@ fn mh_documented_ceiling(budget_bps: u64, audio_bps: u64, video_bps: u64) -> u64
 #[tokio::test]
 async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
     use env_tests::cluster::ClusterConnection;
-    use env_tests::fixtures::metrics::gauge_by_instance_present;
+    use env_tests::fixtures::metrics::gauge_by_live_pod;
     use env_tests::fixtures::PrometheusClient;
 
     let cm = fetch_configmap(&shared_configmap());
@@ -960,12 +927,10 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
         .await
         .expect("Failed to connect to cluster - ensure port-forwards are running");
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
-    let instances = MH_INSTANCES.len();
-
-    let ceilings = gauge_by_instance_present(
+    let ceilings = gauge_by_live_pod(
         &prom,
         "mh_media_egress_stream_ceiling",
-        instances,
+        MH_INSTANCES,
         GAUGE_PRESENT_BOUND,
     )
     .await;
@@ -980,10 +945,10 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
         );
     }
 
-    let mins = gauge_by_instance_present(
+    let mins = gauge_by_live_pod(
         &prom,
         "mh_media_egress_stream_ceiling_recommended_min",
-        instances,
+        MH_INSTANCES,
         GAUGE_PRESENT_BOUND,
     )
     .await;
@@ -1007,7 +972,7 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
 #[tokio::test]
 async fn test_running_mh_publishes_the_derived_stream_costs() {
     use env_tests::cluster::ClusterConnection;
-    use env_tests::fixtures::metrics::gauge_by_instance_present;
+    use env_tests::fixtures::metrics::gauge_by_live_pod;
     use env_tests::fixtures::PrometheusClient;
 
     let (audio, video) = oracle_costs_bps(&fetch_configmap(&profile_configmap()));
@@ -1020,8 +985,7 @@ async fn test_running_mh_publishes_the_derived_stream_costs() {
         ("mh_media_stream_cost_video_bytes_per_second", video),
     ] {
         let expected = bits.div_ceil(8);
-        let values =
-            gauge_by_instance_present(&prom, gauge, MH_INSTANCES.len(), GAUGE_PRESENT_BOUND).await;
+        let values = gauge_by_live_pod(&prom, gauge, MH_INSTANCES, GAUGE_PRESENT_BOUND).await;
         for (instance, value) in &values {
             assert_eq!(
                 *value, expected as f64,
@@ -1032,5 +996,79 @@ async fn test_running_mh_publishes_the_derived_stream_costs() {
                  diverged from the frame layout."
             );
         }
+    }
+}
+
+/// (f) The live `media-codec-profile` IS the committed Kind test profile
+/// (story 3 R-28): MC and MH resolve ONE profile generation (they roll
+/// together), and every value the Kind patch sets is what that generation
+/// carries. Catches an overlay that did not apply (a demo edit left in place,
+/// a hand `kubectl apply`) and — with the live key set equal to the base
+/// key set — a dead patch key, which a strategic merge would ADD beside the
+/// renamed base key. The hermetic twin (no cluster) is
+/// `fixtures::deployment_config`'s
+/// `the_kind_test_profile_patch_overrides_base_keys_only`; both run the ONE
+/// patch-vs-base rule, `kind_patch_overrides`.
+///
+/// Cited by path::fn from the Kind test-profile patch header — keep the name
+/// stable.
+#[tokio::test]
+async fn test_kind_media_codec_profile_is_the_committed_test_profile() {
+    let generation = configmap_name_for_all(PROFILE_READERS, PROFILE_CONFIGMAP);
+    let live = fetch_configmap(&generation);
+    assert_eq!(
+        live.pointer("/metadata/labels/environment")
+            .and_then(Value::as_str),
+        Some("kind"),
+        "ConfigMap {generation} does not carry label environment=kind, which the Kind overlay \
+         adds. This test pins the KIND test profile and is not meaningful against another \
+         cluster - this is not a profile mismatch."
+    );
+
+    let overrides = kind_patch_overrides(KIND_TEST_PROFILE_PATCH, PROFILE_BASE_ENV)
+        .unwrap_or_else(|e| panic!("{e}; {KIND_SIZING_RESTORE}"));
+    assert!(
+        !overrides.is_empty(),
+        "{KIND_TEST_PROFILE_PATCH} overrides no key: the comparison below would be vacuous"
+    );
+
+    let live_data = live
+        .pointer("/data")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("ConfigMap {generation} has no data map"));
+    let live_keys: std::collections::BTreeSet<&str> =
+        live_data.keys().map(String::as_str).collect();
+    let base = tree_configmap_data(PROFILE_BASE_ENV).unwrap_or_else(|e| panic!("{e}"));
+    let base_keys: std::collections::BTreeSet<&str> = base.keys().map(String::as_str).collect();
+    assert_eq!(
+        live_keys, base_keys,
+        "the live profile generation {generation} does not hold exactly the keys \
+         {PROFILE_BASE_ENV} declares: a key was added by the Kind test-profile patch \
+         ({KIND_TEST_PROFILE_PATCH}) — a DEAD key after a base rename — or the cluster \
+         predates the tree; {KIND_SIZING_RESTORE}."
+    );
+
+    for PatchOverride {
+        key,
+        patch: patch_value,
+        base: base_value,
+    } in &overrides
+    {
+        let live_value = cm_value(&live, PROFILE_CONFIGMAP, key);
+        assert_ne!(
+            &live_value, base_value,
+            "OVERLAY-NOT-APPLIED: the live profile generation {generation} carries the \
+             PRODUCTION value of {key} from {PROFILE_BASE_ENV}, not the Kind test profile \
+             ({KIND_TEST_PROFILE_PATCH}). The patch is removed from the overlay or the cluster \
+             was deployed without it — a production-quality demo left in place? Layer 7 runs \
+             the TEST profile: {KIND_SIZING_RESTORE}."
+        );
+        assert_eq!(
+            &live_value, patch_value,
+            "the live profile generation {generation} carries {key}={live_value}, but the \
+             committed Kind test-profile patch ({KIND_TEST_PROFILE_PATCH}) sets {patch_value}: \
+             the patch was edited and not restored, or the cluster predates the tree; \
+             {KIND_SIZING_RESTORE}."
+        );
     }
 }

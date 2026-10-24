@@ -1,6 +1,8 @@
 //! P2 Resilience Tests
 //!
 //! NetworkPolicy enforcement tests using canary pods.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "resilience")]
 

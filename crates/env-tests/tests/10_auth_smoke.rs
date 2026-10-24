@@ -1,6 +1,8 @@
 //! P0 Smoke Tests: Authentication
 //!
 //! Basic authentication flow tests using pre-seeded credentials.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "smoke")]
 

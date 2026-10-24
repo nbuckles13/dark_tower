@@ -53,6 +53,8 @@
 //! is the failure mode this whole suite exists to demonstrate against. The
 //! asymmetry is deliberate. It is stated here and in the runbook because it
 //! reads as an oversight.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "observability")]
 

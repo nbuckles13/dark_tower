@@ -48,6 +48,8 @@
 //! As in `01_mh_deployment_config.rs`: names and the scalar values of named
 //! configuration keys only. `mc-service-config` and `media-codec-profile`
 //! hold no secrets; MC's credentials arrive via `secretKeyRef`.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "smoke")]
 
@@ -56,12 +58,12 @@ use env_tests::fixtures::deployment_config::{
     pod_name_of, RefKind, ValueShape,
 };
 use env_tests::fixtures::kube::{
-    configmap_name_for, configmap_name_for_all, PROFILE_CONFIGMAP, REDEPLOY_HINT,
+    configmap_name_for, configmap_name_for_all, MC_INSTANCES, PROFILE_CONFIGMAP, PROFILE_READERS,
+    REDEPLOY_HINT,
 };
 use env_tests::fixtures::mh_config::{gauge_verdict, Conversion, GaugeVerdict};
 
 const CONTAINER: &str = "mc-service";
-const MC_INSTANCES: &[&str] = &["mc-0", "mc-1"];
 /// Generator base names; live names are hash-suffixed (ADR-0038 §2) and
 /// resolved from each pod spec.
 const MC_CONFIGMAP: &str = "mc-service-config";
@@ -243,7 +245,7 @@ async fn test_story3_keys_wired_into_every_mc_instance() {
 /// MH does not cost against.
 #[tokio::test]
 async fn test_mc_and_mh_resolve_one_media_codec_profile_generation() {
-    let name = configmap_name_for_all(&["mc-0", "mc-1", "mh-0", "mh-1"], PROFILE_CONFIGMAP);
+    let name = configmap_name_for_all(PROFILE_READERS, PROFILE_CONFIGMAP);
     assert!(
         name.starts_with(&format!("{PROFILE_CONFIGMAP}-")),
         "resolved {name:?} is not a hash-suffixed generation of {PROFILE_CONFIGMAP}"

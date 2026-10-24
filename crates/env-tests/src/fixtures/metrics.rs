@@ -1,5 +1,6 @@
 //! Prometheus client fixture for querying metrics.
 
+use crate::fixtures::deployment_config::{live_pod, LivePod};
 use crate::fixtures::kube::REDEPLOY_HINT;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -878,6 +879,14 @@ pub async fn settled_baseline(
 /// The poll is a scrape-convergence bound (a new pod is scraped within one
 /// interval), not a wall-clock assertion about the service.
 ///
+/// # After a roll
+///
+/// Right after a deploy rolls the pods, the `>= min_instances` count can be
+/// satisfied by a TERMINATED predecessor's series, still scraped and still
+/// carrying the OLD value. So for any value compared against config or a
+/// sizing bound, use [`gauge_by_live_pod`] / [`gauge_on_live_pod`]; use this
+/// helper only for presence, or for a map that is then pinned per pod.
+///
 /// # Panics
 ///
 /// When fewer than `min_instances` instances carry the series by `timeout`.
@@ -903,6 +912,99 @@ pub async fn gauge_by_instance_present(
             current.len()
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Read an eagerly-published, CONFIG-PUBLISHED gauge from ONE live pod: the
+/// pod's own series, pinned to its IP — never another instance's.
+///
+/// # Why pinned to the live pod
+///
+/// A config change rolls the pods (content-addressed ConfigMaps, ADR-0038 §2),
+/// and for its staleness window Prometheus still returns the terminated
+/// predecessor's series under its old `pod IP:port` — carrying the OLD value.
+/// [`gauge_by_instance_present`] returns once ENOUGH instances carry the series,
+/// so right after a roll it can hand back a dead pod's value. This reads only
+/// the series of the pod that is serving now.
+///
+/// The predicate is presence only: this changes WHERE a value is read, never
+/// what is asserted about it (see [`poll_until_pinned_instance`] on occupancy
+/// gauges other suites move).
+///
+/// # Panics
+///
+/// When the pod's series is absent by `timeout` — a scrape/startup problem,
+/// never "zero" — with a `PRESENCE` phase naming the instance and pod.
+pub async fn gauge_on_live_pod(
+    prom: &PrometheusClient,
+    metric: &str,
+    pod: &LivePod,
+    timeout: Duration,
+) -> f64 {
+    poll_until_pinned_instance(
+        prom,
+        &format!("max by (instance) ({metric})"),
+        &pod.ip,
+        timeout,
+        Duration::from_secs(2),
+        &format!(
+            "PRESENCE ({}, pod {}): `{metric}` is published at process start, so absence is a \
+             scrape/startup problem (the pod is not scraped, or the publish ran before the \
+             recorder) — NOT a configuration mismatch",
+            pod.instance, pod.name
+        ),
+        "present",
+        |_| true,
+    )
+    .await
+}
+
+/// [`gauge_on_live_pod`] for EVERY instance in `instances`: one entry per live
+/// pod, keyed `"<instance> (<pod IP>)"`, and nothing from a pod that is not
+/// serving. Every instance must be present — a missing pod or series is a
+/// PRECONDITION / PRESENCE failure, never a smaller map a window check could
+/// pass on with one handler down.
+///
+/// # Panics
+///
+/// An instance has no live pod or no series ([`gauge_on_live_pod`]), or two
+/// instances resolve to one pod IP.
+pub async fn gauge_by_live_pod(
+    prom: &PrometheusClient,
+    metric: &str,
+    instances: &[&str],
+    timeout: Duration,
+) -> InstanceCounters {
+    let pods: Vec<LivePod> = instances.iter().map(|i| live_pod(i)).collect();
+    distinct_pod_ips(&pods).unwrap_or_else(|e| panic!("PRECONDITION: `{metric}`: {e}"));
+    let mut values = InstanceCounters::new();
+    for pod in &pods {
+        let value = gauge_on_live_pod(prom, metric, pod, timeout).await;
+        values.insert(format!("{} ({})", pod.instance, pod.ip), value);
+    }
+    values
+}
+
+/// PURE check behind [`gauge_by_live_pod`]: every instance resolved to its OWN
+/// pod IP. Two instances on one IP would read one handler twice and present
+/// it as both.
+///
+/// # Errors
+/// Two or more instances share a pod IP.
+pub fn distinct_pod_ips(pods: &[LivePod]) -> Result<(), String> {
+    let ips: std::collections::HashSet<&str> = pods.iter().map(|p| p.ip.as_str()).collect();
+    if ips.len() == pods.len() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} instances resolved to only {} distinct pod IP(s) ({:?}) — one handler would be \
+             read as several; {REDEPLOY_HINT}",
+            pods.len(),
+            ips.len(),
+            pods.iter()
+                .map(|p| format!("{}={}", p.instance, p.ip))
+                .collect::<Vec<_>>()
+        ))
     }
 }
 
@@ -1458,5 +1560,20 @@ mod tests {
             ("10.0.0.1:9090".to_string(), 2.0),
         ]);
         let _ = instance_for_pod_ip(&map, "10.0.0.1");
+    }
+
+    #[test]
+    fn distinct_pod_ips_rejects_a_shared_ip() {
+        let pod = |i: &str, ip: &str| LivePod {
+            instance: i.to_string(),
+            name: format!("{i}-x"),
+            ip: ip.to_string(),
+        };
+        assert!(distinct_pod_ips(&[pod("mh-0", "10.0.0.1"), pod("mh-1", "10.0.0.2")]).is_ok());
+        assert!(
+            distinct_pod_ips(&[pod("mh-0", "10.0.0.1"), pod("mh-1", "10.0.0.1")])
+                .unwrap_err()
+                .contains("only 1 distinct pod IP")
+        );
     }
 }

@@ -2,6 +2,8 @@
 //!
 //! Security-focused authentication tests including token tampering,
 //! algorithm confusion, claim validation, JWKS security, and header injection.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "flows")]
 

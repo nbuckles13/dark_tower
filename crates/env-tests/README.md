@@ -133,9 +133,9 @@ Keyless, black-box clients for the media path. They build and parse frames only 
 
 ### Per-file edge-sum header rule
 
-Every env-test file that opens media sessions states in its header the sum, over its **concurrently running** test fns, of **P × (N+M)**: participants, times the audio plus video receive slots each declares. `cargo test` runs one file's test fns in parallel and the files one after another, so that per-file sum is the load the Kind cluster carries at once.
+Every env-test file states in its header the sum, over its **concurrently running** test fns, of **P × (N+M)**: participants, times the audio plus video receive slots each declares. `cargo test` runs one file's test fns in parallel and the files one after another, so that per-file sum is the load the Kind cluster carries at once.
 
-INF-C (story 3 task 16) sizes the Kind ceiling at about 120 against the PLANNED largest per-file sum, 72 (`27_mc_slot_placement`); each file's ACTUAL sum is the `Edge-sum` line in its own header, the one home for that number. A change that pushes a file past the ceiling must, in the same change, either serialise that file's fns or re-size the budget.
+EVERY file under `tests/` carries exactly one such line — `0` when it opens no media edges — so a new file cannot slip past the rule. The S9 exhaustion test is the one exception: it sizes its meeting from the live ceiling and deliberately exceeds it, so it carries the fixed exempt token instead of a number. The Kind egress window is sized against the PLANNED per-file cap `MAX_PER_FILE_EDGE_SUM` (`src/fixtures/egress_admission.rs`, beside the window's other constants). Each file's ACTUAL sum is the `Edge-sum` line in its own header, the one home for that number. The hermetic check `every_env_test_file_records_an_edge_sum_within_the_cap` (Layer 4) fails a missing, malformed or duplicate line, any sum above the cap, and any count of exemptions other than one. A change that pushes a file past the cap must, in the same change, either serialise that file's fns or raise the cap, which moves the window's lower side, so re-check the Kind budget.
 
 ## Future Work
 

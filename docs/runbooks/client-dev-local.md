@@ -368,6 +368,8 @@ loopback is removed (story 2 R-3; a solo participant correctly hears silence, wi
 reading "no one to fill this slot yet"). To run several participants on one machine, prefer the
 test-tone build (`DT_TEST_TONE=1 scripts/dev-web.sh`), which gives each participant its own
 frequency so "I hear A and C but not B" is audible, and avoids one microphone feeding N tabs.
+For a see-and-hear (video) demo — the test-pattern camera, the Kind test codec profile, and switching
+to production quality — see `scripts/dev-web.sh --help`, §VIDEO DEMO.
 
 These are the same two flags `packages/web-app/playwright.config.ts` launches with, which is where
 the browser E2E suite gets its deterministic audio; keep the two in step. They are **not** security

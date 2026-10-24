@@ -4112,16 +4112,58 @@ mod tests {
         assert_eq!(base.egress_admission.stream_ceiling, 12);
     }
 
-    /// The KIND overlay budget (`infra/kubernetes/overlays/kind/services/
-    /// mh-service/configmap-egress-budget-patch.yaml`) at the production
-    /// profile: boots, clears the recommended minimum, stays inside S9's
-    /// feasible window (env-test 01 enforces the window on the live cluster).
+    /// The Kind environment as COMMITTED — the overlay budget
+    /// (`infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml`)
+    /// over the Kind TEST codec profile
+    /// (`.../media-codec-profile/configmap-test-profile-patch.yaml`), both read
+    /// from the patch files rather than restated, since a literal copy goes stale
+    /// on the next re-size: MH boots on it and clears the recommended minimum.
+    /// The two-sided sizing window is NOT asserted here: its constants live
+    /// with the env-tests, and env-test
+    /// `01_mh_deployment_config::test_kind_egress_stream_ceiling_meets_demo_requirement`
+    /// enforces it against the live gauge.
     #[test]
     fn the_kind_budget_boots_and_clears_the_recommended_min() {
+        // `  KEY: "value"` data lines of a committed strategic-merge patch.
+        fn patch_data(text: &str) -> Vec<(String, String)> {
+            text.lines()
+                .filter_map(|l| l.strip_prefix("  "))
+                .filter_map(|l| l.split_once(": \""))
+                .filter_map(|(k, v)| Some((k.to_string(), v.strip_suffix('"')?.to_string())))
+                .collect()
+        }
+        let budget = patch_data(include_str!(
+            "../../../infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml"
+        ));
+        let profile = patch_data(include_str!(
+            "../../../infra/kubernetes/overlays/kind/services/media-codec-profile/configmap-test-profile-patch.yaml"
+        ));
+        assert!(
+            budget.iter().any(|(k, _)| k == "MH_EGRESS_BUDGET_BPS"),
+            "the Kind budget patch carries no MH_EGRESS_BUDGET_BPS data line"
+        );
+        assert!(
+            profile
+                .iter()
+                .any(|(k, _)| k == "MEDIA_VIDEO_MAX_BITRATE_BPS"),
+            "the Kind test-profile patch carries no MEDIA_VIDEO_MAX_BITRATE_BPS data line"
+        );
         let mut vars = base_vars();
-        vars.insert("MH_EGRESS_BUDGET_BPS".to_string(), "82640000".to_string());
-        let kind = Config::from_vars(&vars).expect("Kind budget must boot");
-        assert_eq!(kind.egress_admission.stream_ceiling, 100);
+        let mut applied = 0;
+        for (key, value) in budget.into_iter().chain(profile) {
+            // Only MH's inputs: the profile's geometry keys are MC-only. A dead
+            // patch key is the env-tests' hermetic patch-vs-base check, not this.
+            if let Some(slot) = vars.get_mut(&key) {
+                *slot = value;
+                applied += 1;
+            }
+        }
+        // The budget plus the two video cost inputs, or this tests the base.
+        assert!(
+            applied >= 3,
+            "only {applied} Kind patch values are MH inputs"
+        );
+        let kind = Config::from_vars(&vars).expect("the committed Kind config must boot");
         assert!(!kind.egress_admission.below_recommended_min());
     }
 

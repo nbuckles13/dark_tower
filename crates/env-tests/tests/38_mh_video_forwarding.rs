@@ -56,9 +56,10 @@ use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::injection::{
     self, assert_mc_programmed_a_carrying_pod, injectable_handlers, install_all, Injection,
 };
+use env_tests::fixtures::kube::MH_INSTANCES;
 use env_tests::fixtures::media::{audio_datagram, AUDIO_SEND_ID, VIDEO_SEND_ID};
 use env_tests::fixtures::metrics::{
-    gauge_by_instance_present, group_reset_promql, paused_promql, reason_promql,
+    gauge_by_live_pod, group_reset_promql, paused_promql, reason_promql,
 };
 use env_tests::fixtures::mh_grpc::{self, ReleaseOnDrop};
 use env_tests::fixtures::participant::{self, open_sessions, AUDIO};
@@ -616,14 +617,27 @@ async fn test_stream_per_group_video_forwarding() {
         sources(SourceDisposition::Forward),
     )
     .await;
-    let backlog_gauge = gauge_by_instance_present(
+    // Read from EACH live MH pod, never a terminated predecessor's series
+    // (which after a roll still carries the OLD cap), and the two must agree:
+    // the cap comes from one ConfigMap, so a disagreement is a pod that
+    // predates the config — never resolved by taking the larger.
+    let backlog_gauge = gauge_by_live_pod(
         &prom,
         "mh_media_egress_stream_backlog_limit_bytes",
-        handlers.len(),
+        MH_INSTANCES,
         env_tests::fixtures::metrics::PINNED_METRIC_BOUND,
     )
     .await;
-    let backlog = backlog_gauge.values().copied().fold(0.0_f64, f64::max);
+    let mut caps: Vec<f64> = backlog_gauge.values().copied().collect();
+    caps.sort_by(f64::total_cmp);
+    caps.dedup();
+    assert!(
+        caps.len() == 1,
+        "PRECONDITION: the live MH pods publish different backlog caps {backlog_gauge:?}: one \
+         predates the config; {}",
+        env_tests::fixtures::kube::REDEPLOY_HINT
+    );
+    let backlog = caps[0];
     assert!(
         backlog > 0.0,
         "PRECONDITION: the deployed backlog cap must be published"
