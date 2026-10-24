@@ -408,3 +408,35 @@ describe('bus shape: receiveLayers rows (story-2 rows, exact-key since story 3)'
     expect(() => parseReceiveLayers({ layers: [] })).toThrow(BusShapeError);
   });
 });
+
+describe('judgeVideoSlot: a CAMERA-mode occupant (story 3 C-C1)', () => {
+  const noPattern = (): VideoWindow => {
+    const w = goodWindow();
+    // A real (fake-device) camera: no decodable pattern at all.
+    return {
+      ...w,
+      slots: w.slots.map(() => sample({ lumas: Array.from({ length: 24 }, () => 128) })),
+    };
+  };
+  test('layer 3 does NOT apply (a named branch); layers 1 and 2 still do', () => {
+    expect(
+      judgeVideoSlot(
+        { slotId: SLOT, expectation: active, expectedSenderId: B, occupantSource: 'camera' },
+        noPattern(),
+      ).failures,
+    ).toEqual([]);
+    const stalled = noPattern();
+    const layers = stalled.layers.map(() => [{ slot: SLOT, senderId: B, keyed: 10, verified: 10 }]);
+    expect(
+      judgeVideoSlot(
+        { slotId: SLOT, expectation: active, expectedSenderId: B, occupantSource: 'camera' },
+        { ...stalled, layers },
+      ).failures.some((f) => f.startsWith('layer 2')),
+    ).toBe(true);
+  });
+  test('positive control: the same window judged as a TEST-PATTERN occupant fails layer 3', () => {
+    expect(() =>
+      judgeVideoSlot({ slotId: SLOT, expectation: active, expectedSenderId: B }, noPattern()),
+    ).toThrow(VideoEvidenceHarnessError);
+  });
+});

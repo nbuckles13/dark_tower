@@ -37,6 +37,7 @@ import { TransmitKeyManager } from '../../media/lifecycle/transmitKeys.js';
 import { VideoCodecUnsupportedError } from '../../media/setup/vp8.js';
 import { Codec } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { createMicrophoneCapture } from '../../media/setup/capture.js';
+import { CaptureFailure, MediaCaptureError } from '../../media/setup/captureFailure.js';
 import {
   JOIN_BAG_MARKER,
   joinBagViolations,
@@ -1926,6 +1927,60 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
     rig.session.disconnect();
   });
 
+  it('bridges camera health (R-19) and exposes the sampled video send counts (story 3 C-C1)', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const rig = await joinedWith({
+      publish: ['audio', 'video'],
+      extra: {
+        videoEncoderFactory: async () => ({
+          encode: () => undefined,
+          encodeQueueSize: 0,
+          close: () => undefined,
+        }),
+        videoCaptureFactory: async () => {
+          throw new MediaCaptureError(CaptureFailure.PermissionDenied, 'denied');
+        },
+      },
+    });
+    const health: Array<string | undefined> = [];
+    rig.session.on('cameraHealthChanged', (e) => health.push(e.failure));
+    await rig.session.startMedia();
+    expect(rig.session.video?.cameraFailure).toBeUndefined();
+    expect(rig.session.video?.sendTotals()).toEqual({
+      framesSent: 0,
+      keyframes: { directive_start: 0, request: 0, abandonment: 0 },
+    });
+    // A directed video stream makes the publisher acquire the camera, which fails.
+    rig.mocks.get(MC_ENDPOINT)!.simulateServerMessage(
+      0,
+      framedSendDirective({
+        streams: [
+          {
+            streamNumber: 1,
+            mediaKind: MediaKind.VIDEO_CAMERA,
+            maxBitrateBps: 250_000,
+            video: {
+              codec: Codec.VP8,
+              width: 320,
+              height: 180,
+              frameRate: 15,
+              minKeyframeIntervalMs: 500,
+            },
+            targets: [MEDIA_SERVERS[0]!],
+          },
+        ],
+      }),
+    );
+    await waitFor(() => health.length > 0);
+    expect(health).toEqual(['permission_denied']);
+    expect(rig.session.video?.cameraFailure).toBe('permission_denied');
+    // A user mute clears the latch (user intent wins): healthy again.
+    rig.session.setVideoMuted(true);
+    await waitFor(() => health.length > 1);
+    expect(health).toEqual(['permission_denied', undefined]);
+    rig.session.disconnect();
+  });
+
   it('the publish set is COPIED and FROZEN: mutating the caller array changes nothing', async () => {
     vi.spyOn(console, 'info').mockImplementation(() => {});
     const publish: ('audio' | 'video')[] = ['audio'];
@@ -1984,9 +2039,19 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
     });
     expect(rig.session.receiveSlots).toEqual({
       publish: ['audio'],
-      audio: { declared: 3, source: 'configured', serverCap: { state: 'known', value: 8 } },
+      audio: {
+        declared: 3,
+        slotIds: [0, 1, 2],
+        source: 'configured',
+        serverCap: { state: 'known', value: 8 },
+      },
       // 0 is LEGAL (video off) and stays known-0, never folded into unknown.
-      video: { declared: 2, source: 'configured', serverCap: { state: 'known', value: 0 } },
+      video: {
+        declared: 2,
+        slotIds: [3, 4],
+        source: 'configured',
+        serverCap: { state: 'known', value: 0 },
+      },
     });
     rig.session.disconnect();
   });

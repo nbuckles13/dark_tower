@@ -35,7 +35,6 @@
 // times out, compare `mc_meeting_kek_rotation_window_seconds` on the running MC
 // with the value read here. A liveness bound, never a latency gate.
 
-import { readFileSync } from 'node:fs';
 import { expect, test } from 'playwright/test';
 import {
   closeMembers,
@@ -46,8 +45,8 @@ import {
   type JoinedMember,
   type Member,
 } from './cohortContexts.js';
-import { mcConfigRsPath, readMcRotationTimings, serviceConfigEnvPath } from './configEnv.js';
-import { bootstrapMeeting, flushTelemetry, latestBusEventsOf } from './fixtures.js';
+import { mcRotationBudget, ROTATION_POLL_MARGIN_MS } from './configEnv.js';
+import { bootstrapMeeting, flushTelemetry, kekGeneration } from './fixtures.js';
 import {
   clientCounterByInstance,
   mhAdmissionRejectionsByInstance,
@@ -55,24 +54,12 @@ import {
 } from './mcMetrics.js';
 import { expectHearsAtAllLayers } from './receiveEvidence.js';
 
-const MC_ENV = serviceConfigEnvPath('mc-service');
-const MC_RS = mcConfigRsPath();
-const TIMINGS = readMcRotationTimings(
-  readFileSync(MC_ENV, 'utf8'),
-  MC_ENV,
-  readFileSync(MC_RS, 'utf8'),
-  MC_RS,
-);
+const TIMINGS = mcRotationBudget();
 /** Grace + W, the worst case from the leave to the rotation push. */
-const ROTATION_BUDGET_MS = (TIMINGS.graceSeconds + TIMINGS.debounceSeconds) * 1000;
+const ROTATION_BUDGET_MS = TIMINGS.budgetMs;
 /** Margin for joins, the post-rotation joiner and the Prometheus read-back. */
 const SCENARIO_MARGIN_MS = 150_000;
-
-async function kekGeneration(member: JoinedMember): Promise<number | undefined> {
-  const { kekGeneration: event } = await latestBusEventsOf(member.page, ['kekGeneration']);
-  const generation = event?.['generation'];
-  return typeof generation === 'number' ? generation : undefined;
-}
+const memberKek = (member: JoinedMember): Promise<number | undefined> => kekGeneration(member.page);
 
 test.describe('story 2 S6 (joiner half): KEK rotation on leave', () => {
   test('a leave rotates the KEK on the remaining clients, and a later joiner opens current frames', async ({
@@ -90,7 +77,7 @@ test.describe('story 2 S6 (joiner half): KEK rotation on leave', () => {
       const remaining = [a, b];
       await expectHearsAtAllLayers(a, b, tonesOf(members), admissionBaseline);
 
-      const before = await Promise.all(remaining.map(kekGeneration));
+      const before = await Promise.all(remaining.map(memberKek));
       for (const [i, g] of before.entries()) {
         expect(g, `${remaining[i]!.label} holds a KEK generation before the leave`).toBeDefined();
       }
@@ -104,7 +91,7 @@ test.describe('story 2 S6 (joiner half): KEK rotation on leave', () => {
       await expect
         .poll(
           async () => {
-            const now = await Promise.all(remaining.map(kekGeneration));
+            const now = await Promise.all(remaining.map(memberKek));
             const advanced = now.every((g, i) => g !== undefined && g > before[i]!);
             return advanced && now[0] === now[1] ? 'rotated' : JSON.stringify(now);
           },
@@ -112,7 +99,7 @@ test.describe('story 2 S6 (joiner half): KEK rotation on leave', () => {
             message:
               `the remaining clients did not both install a newer KEK generation within grace ` +
               `(${TIMINGS.graceSeconds}s) + W (${TIMINGS.debounceSeconds}s) of the leave`,
-            timeout: ROTATION_BUDGET_MS + 30_000,
+            timeout: ROTATION_BUDGET_MS + ROTATION_POLL_MARGIN_MS,
             intervals: [1_000],
           },
         )
@@ -138,9 +125,9 @@ test.describe('story 2 S6 (joiner half): KEK rotation on leave', () => {
       const joinerMember = await openMember(browser, 3);
       opened.push(joinerMember);
       const joiner = await joinMember(joinerMember, meetingCode);
-      const rotated = await kekGeneration(a);
+      const rotated = await memberKek(a);
       await expect
-        .poll(() => kekGeneration(joiner), {
+        .poll(() => memberKek(joiner), {
           message: 'the joiner holds the rotated generation',
           timeout: 10_000,
         })

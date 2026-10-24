@@ -33,6 +33,7 @@ import {
   MEDIA_SEND_GROUP_STOP_OUTCOMES,
   type MediaCaptureFailureOutcome,
   type MediaKeyframePerKindOutcome,
+  type MediaKeyframeSource,
   type MediaKindMetrics,
 } from '../setup/mediaMetrics.js';
 import type {
@@ -63,6 +64,12 @@ export interface VideoSendDirective {
   readonly headerVersion: number;
 }
 
+/** {@link VideoPublisher.sendTotals}: cumulative counts only. */
+export interface VideoSendCounts {
+  readonly framesSent: number;
+  readonly keyframes: Readonly<Record<MediaKeyframeSource, number>>;
+}
+
 /** Construction options. */
 export interface VideoPublisherOptions {
   readonly config: MediaConfig;
@@ -87,6 +94,13 @@ export interface VideoPublisherOptions {
   readonly openStream: GroupStreamOpener;
   /** A bounded, SDK-authored fault (the session's `mediaFault`). */
   readonly fault: (fault: MediaFault) => void;
+  /**
+   * The camera gate's LATCHED failure changed (story 3 R-19): set when capture
+   * fails or the track ends, cleared by a user mute/unmute or a successful
+   * restore. A closed token (`MEDIA_CAPTURE_FAILURE_OUTCOMES`), never a platform
+   * string. Drives the session's `cameraHealthChanged`.
+   */
+  readonly onCameraHealthChanged?: (failure: MediaCaptureFailureOutcome | undefined) => void;
   readonly clock?: () => number;
   readonly setInterval?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
   readonly clearInterval?: (handle: ReturnType<typeof setInterval>) => void;
@@ -161,6 +175,23 @@ export class VideoPublisher {
   /** Camera light state: a live, acquired capture track. For the test bus and UI. */
   get cameraTrackLive(): boolean {
     return this.#cameraLive;
+  }
+
+  /** The camera gate's latched failure (R-19), or `undefined` while the camera is healthy. */
+  get cameraFailure(): MediaCaptureFailureOutcome | undefined {
+    return this.#camera.failure?.outcome;
+  }
+
+  /**
+   * Cumulative send counts for the video stream, sampled (never per frame):
+   * frames written to targets and keyframes produced by cause. Counts only — no
+   * timings, sizes or GoP values (story 3 C-C1, the test bus's `sendCounts`).
+   */
+  sendTotals(): VideoSendCounts {
+    return {
+      framesSent: this.#egress?.framesSent ?? 0,
+      keyframes: this.#gate.producedBySource(),
+    };
   }
 
   /** The egress, for sampled assertion (frame counts, lane states). */
@@ -326,8 +357,11 @@ export class VideoPublisher {
   }
 
   #stepCamera(event: CameraGateEvent): void {
+    const before = this.#camera.failure?.outcome;
     const { state, actions } = stepCameraGate(this.#camera, event);
     this.#camera = state;
+    const after = state.failure?.outcome;
+    if (after !== before) this.#o.onCameraHealthChanged?.(after);
     if (actions.stop) this.#stopCapture();
     if (actions.acquire) void this.#acquire();
     if (actions.presentMuted !== undefined && this.#o.mute.setVideoMuted(actions.presentMuted)) {

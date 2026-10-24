@@ -12,7 +12,10 @@ import type {
   ParsedReceiveSlots,
   ReceiveSlotsSource,
 } from '../config/clientConfig.js';
-import type { MediaCaptureSourceMode } from '../media/setup/mediaMetrics.js';
+import type {
+  MediaCaptureFailureOutcome,
+  MediaCaptureSourceMode,
+} from '../media/setup/mediaMetrics.js';
 import type { ReceiveVerificationRecorder } from '../media/pipeline/receiveVerification.js';
 import type {
   AudioDecoderFactory,
@@ -212,6 +215,21 @@ export interface MeetingSessionEventMap {
    * through the slot's `VideoSink` (`MeetingSession.videoReceive.setVideoSink`).
    */
   videoSlotRenderChanged: VideoSlotRenderChangedEvent;
+  /**
+   * This participant's CAMERA health changed (story 3 R-19): `failure` is the
+   * camera gate's latched failure (capture refused, no device, the track
+   * ended, ...) or `undefined` once healthy again (a user mute/unmute or a
+   * successful restore). While failed the participant is presented to others
+   * as video-muted (the `muteChanged` that accompanies it); this event is what
+   * lets a UI tell the participant WHY. A closed token, never a platform
+   * string. Fires on transitions only.
+   */
+  cameraHealthChanged: CameraHealthChangedEvent;
+}
+
+/** Payload of `cameraHealthChanged`. */
+export interface CameraHealthChangedEvent {
+  readonly failure: MediaCaptureFailureOutcome | undefined;
 }
 
 /** Payload of `videoSlotRenderChanged`. */
@@ -253,6 +271,12 @@ export type ReceiveSlotCap =
 export interface KindSlotsDiagnostics {
   /** The slots of this kind this client declares. */
   readonly declared: number;
+  /**
+   * This kind's declared slot ids, in declaration order — from the ONE producer
+   * of slot ids (`mediaSelection.ts:receiveDeclaration`), so an embedder never
+   * restates the id layout.
+   */
+  readonly slotIds: readonly number[];
   /** Whether the count was configured by the embedder or is the SDK default. */
   readonly source: ReceiveSlotsSource;
   /** This kind's server cap, as the latest join advertised it. */
@@ -329,7 +353,8 @@ export interface MeetingSessionOptions {
   /** Playback sink factory. Defaults to `AudioContext`; injected for tests. */
   readonly playbackFactory?: PlaybackSinkFactory;
   /**
-   * What this participant publishes (story 3 R-2). Default `['audio']`. FIXED
+   * What this participant publishes (story 3 R-2). Default
+   * `config/clientConfig.ts:DEFAULT_PUBLISH`. FIXED
    * FOR THE MEMBERSHIP: copied and frozen at construction. `audio`, `video`,
    * both, or neither; a duplicate throws `PublishKindNotSupported`, and
    * publishing nothing with 0 + 0 slots throws `NothingToPublishOrReceive`.

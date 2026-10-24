@@ -418,9 +418,21 @@ export const DEFAULT_RECEIVE_AUDIO_SLOTS = 1;
  * receive path (story 3 C-B), but until a grid renders it (C-C1) a default that
  * declared video slots would direct publishers' cameras at a client with no UI
  * to show them — a privacy and egress cost for nothing. Story 3 E6 / C-B E3
- * rulings (lead); C-C1 revisits.
+ * rulings (lead). Revisited in C-C1 and KEPT at 0: the SDK cannot know whether
+ * its embedder renders video, so receiving video stays an explicit choice (the
+ * demo app declares M through `VITE_DT_VIDEO_RECEIVE_SLOTS`).
  */
 export const DEFAULT_RECEIVE_VIDEO_SLOTS = 0;
+
+/**
+ * The SDK's fallback PUBLISH SET when an embedder configures none (story 3
+ * R-2): the microphone only. The one home of this default, beside the receive
+ * defaults it composes with — `session/slotPlan.ts` applies it, and an embedder
+ * UI (the demo's publish-set chooser) reads it rather than restating it. Video
+ * publishing is an explicit choice for the same privacy reason as
+ * {@link DEFAULT_RECEIVE_VIDEO_SLOTS}.
+ */
+export const DEFAULT_PUBLISH: readonly MediaKindToken[] = Object.freeze(['audio'] as const);
 
 /**
  * Upper bound on N + M: slot ids are 16-bit (`ReceiveSlot.slot_id`, the same

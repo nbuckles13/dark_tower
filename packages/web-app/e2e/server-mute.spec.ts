@@ -54,7 +54,7 @@ import {
 
 /** Click the host affordance for `target` in `actor`'s roster. */
 async function clickServerMute(actor: JoinedMember, target: JoinedMember): Promise<void> {
-  await actor.page.getByTestId(`server-mute-${target.joined.participantId}`).click();
+  await actor.page.getByTestId(`server-mute-audio-${target.joined.participantId}`).click();
 }
 
 /** A probe that reads 1 while `receiver`'s slot for `sender` reads a muted avatar state. */
@@ -184,7 +184,7 @@ test.describe('story 2 S3: server mute, and client structural mute', () => {
 
       // C mutes ITSELF.
       await expectEgressAdvances(c.page, 'C before mute');
-      const mutedAt = await setMuteViaUi(c.page, true);
+      const mutedAt = await setMuteViaUi(c.page, 'audio', true);
       await Promise.all([
         expectEgressFlatWhileMuted(c.page, mutedAt),
         observeWindow(
@@ -205,7 +205,7 @@ test.describe('story 2 S3: server mute, and client structural mute', () => {
       }
 
       // C unmutes: egress and C's arrival at the others resume.
-      await setMuteViaUi(c.page, false);
+      await setMuteViaUi(c.page, 'audio', false);
       await expectEgressAdvances(c.page, 'C after unmute');
       await expectIngressAdvances(host.page, 'the host still receiving after C unmuted');
       for (const r of [host, b]) await expectHearsAtAllLayers(r, c, cohort, admissionBaseline);
@@ -214,10 +214,10 @@ test.describe('story 2 S3: server mute, and client structural mute', () => {
       // B's client mute is lifted, but B STILL does not send: the server mute
       // keeps B's audio directive withdrawn (story 3 R-16), so lifting one mute
       // neither lifts nor masks the other (R-10, R-15). Nobody receives B.
-      await setMuteViaUi(b.page, true);
+      await setMuteViaUi(b.page, 'audio', true);
       await clickServerMute(host, b);
       await waitForRosterToken(c, b, 'data-server-muted', 'true');
-      await setMuteViaUi(b.page, false);
+      await setMuteViaUi(b.page, 'audio', false);
       await expect(b.page.getByTestId('server-mute-state')).toHaveAttribute(
         'data-server-muted',
         'true',

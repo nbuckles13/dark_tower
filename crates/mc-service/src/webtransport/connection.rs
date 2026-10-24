@@ -1726,8 +1726,8 @@ const MUTE_REJECTED_MESSAGE: &str = "Mute request refused";
 /// a forged `requester` from a real one, so this call site is the only place
 /// that binding is made.
 ///
-/// `reason` (client-controlled, echoed to another participant per the proto)
-/// is deliberately neither forwarded nor logged.
+/// `reason` (client-controlled; the proto defines no relay for it) is
+/// deliberately neither forwarded nor logged.
 async fn handle_server_mute_request(
     request: &v1::ServerMuteRequest,
     connection_id: &str,

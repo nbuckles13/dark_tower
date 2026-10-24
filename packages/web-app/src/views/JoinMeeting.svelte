@@ -1,28 +1,20 @@
 <script lang="ts">
-  // R-29 view 4: meeting-join. Drives MeetingSession.join and renders the live
-  // roster from the sdk-svelte reactive store (existing participants +
-  // ParticipantJoined/ParticipantLeft).
+  // R-29 view 4: meeting-join. The meeting code and the PUBLISH-SET CHOOSER
+  // (story 3 R-2): what this participant publishes — microphone, camera, both or
+  // neither — is fixed for the membership, so it is chosen HERE, before the
+  // session exists. Each submit mounts a fresh `MeetingRoom` (one single-use
+  // `MeetingSession` per attempt; re-submit to retry).
   //
-  // The session is built + bound at component INIT (bindMeetingSession registers
-  // `onDestroy`, which is only valid during init); `join()` runs on submit. One
-  // join per mount (MeetingSession is single-use) — re-mount to retry.
-  import { onDestroy } from 'svelte';
+  // The chooser starts from the SDK's own default (`DEFAULT_PUBLISH`, never a
+  // restated literal), or — in a test-levers build only — from this context's
+  // `publish` lever; the CHOOSER's result is what the join uses either way.
+  // A choice that would neither publish nor receive is refused by the SDK at
+  // construction and shown through `errorText` — never a silent empty meeting.
   import type { DemoConfig } from '../lib/config.js';
   import type { AuthSession } from '../lib/types.js';
-  import type { JoinCredentials } from '@darktower/sdk-core';
-  import { bindMeetingSession } from '@darktower/sdk-svelte';
-  import { MeetingSessionState } from '@darktower/sdk-core';
-  import { buildMeetingSession } from '../lib/session.js';
-  import { installE2EHooks } from '../lib/e2eBus.js';
-  import { createE2EInstrumentation } from '../lib/e2eAnalysis.js';
-  import { errorText, isSessionRejection } from '../lib/errorText.js';
-  import {
-    hostControlsForced,
-    leverViolationAfterJoin,
-    readTestLeversForSession,
-  } from '../lib/testLevers.js';
-  import InMeeting from './InMeeting.svelte';
-  import ParticipantRow from './ParticipantRow.svelte';
+  import { DEFAULT_PUBLISH, type PublishKind } from '@darktower/sdk-core';
+  import { publishSeed, readTestLeversForSession } from '../lib/testLevers.js';
+  import MeetingRoom from './MeetingRoom.svelte';
 
   let {
     config,
@@ -33,126 +25,72 @@
     auth: AuthSession;
     /**
      * Raised when GC rejects the retained token (401 — see `isSessionRejection`; a
-     * 403 is an authorization decision on a VALID token and must NOT drop it). The shell drops the dead
-     * session, which restores the sign-in affordance — without this the user is
-     * stranded holding a credential the server has already refused.
+     * 403 is an authorization decision on a VALID token and must NOT drop it). The
+     * shell drops the dead session, which restores the sign-in affordance.
      */
     onSessionInvalid: () => void;
   } = $props();
 
-  // Story 2 R-30: the receive-side instrumentation for the E2E bus — `undefined`
-  // in production, where it is eliminated with the bus. Built BEFORE the session
-  // so it can be injected into it.
-  const e2e = createE2EInstrumentation();
   // Story 2 task 15: the per-context test levers, read ONCE here into a frozen
   // copy — `undefined` in every build without `DT_TEST_LEVERS=1`, where the read
   // is statically dead. A malformed lever is a loud, visible refusal to join,
   // never a silent fallback to the production wiring.
   const { levers, error: leverError = '' } = readTestLeversForSession();
-  // svelte-ignore state_referenced_locally
-  const session = buildMeetingSession(config, e2e, levers);
-  // Returns a disposer because the bus now runs a sampling timer in test builds
-  // (a no-op function in production, where the whole bus is eliminated).
-  // svelte-ignore state_referenced_locally
-  const disposeE2EHooks = installE2EHooks(session, e2e, {
-    telemetryConfigured: config.telemetryEndpoint !== undefined,
-  });
-  const store = bindMeetingSession(session);
-  onDestroy(() => {
-    disposeE2EHooks();
-    session.disconnect();
-  });
+  const seed: readonly PublishKind[] = publishSeed(levers) ?? DEFAULT_PUBLISH;
 
   let meetingCode = $state('');
-  let joinError = $state(leverError);
-  let busy = $state(false);
-  /** This participant's own id, from the settled join (MC's roster excludes self). */
-  let selfParticipantId = $state<string | undefined>(undefined);
-  /**
-   * Whether to render host controls: the meeting-token role HINT (MC authorises
-   * every request), or — in a test-levers build only — forced on so the suite can
-   * drive a NON-host into MC's refusal.
-   */
-  let showHostControls = $state(false);
+  let publishMicrophone = $state(seed.includes('audio'));
+  let publishCamera = $state(seed.includes('video'));
+  /** The current attempt; a new id re-mounts `MeetingRoom` (a fresh single-use session). */
+  let attempt = $state<
+    | { readonly id: number; readonly code: string; readonly publish: readonly PublishKind[] }
+    | undefined
+  >(undefined);
+  let nextAttemptId = 0;
 
-  function credentials(): JoinCredentials {
-    // Join presents the token the app already holds. No re-authentication, so no
-    // password is retained or re-transmitted — and with no `mode` to carry, the
-    // register-vs-login mismatch that caused AC's 409 is structurally impossible
-    // rather than avoided by a band-aid.
-    //
-    // Conditional spread, not `displayName: auth.displayName`:
-    // `exactOptionalPropertyTypes` rejects assigning `string | undefined` to `?:`.
-    return {
-      mode: 'token',
-      userToken: auth.userToken,
-      ...(auth.displayName ? { displayName: auth.displayName } : {}),
-    };
-  }
-
-  async function submit(event: Event): Promise<void> {
+  function submit(event: Event): void {
     event.preventDefault();
     if (leverError) return;
-    joinError = '';
-    busy = true;
-    try {
-      const joined = await session.join({
-        orgSubdomain: auth.subdomain,
-        meetingCode,
-        credentials: credentials(),
-      });
-      // The S10a non-vacuity guard (test-levers builds only): a block naming a
-      // handler MC never offered, or leaving none, is a broken test setup —
-      // refused loudly, never run as "connected to everything".
-      const violation = leverViolationAfterJoin(levers, joined.mediaServers);
-      if (violation !== undefined) {
-        session.disconnect();
-        joinError = violation;
-        return;
-      }
-      selfParticipantId = joined.participantId;
-      showHostControls = session.isHost || hostControlsForced(levers);
-    } catch (err) {
-      joinError = errorText(err);
-      if (isSessionRejection(err)) onSessionInvalid();
-    } finally {
-      busy = false;
-    }
+    const publish: PublishKind[] = [];
+    if (publishMicrophone) publish.push('audio');
+    if (publishCamera) publish.push('video');
+    nextAttemptId += 1;
+    attempt = { id: nextAttemptId, code: meetingCode, publish };
   }
 </script>
 
 <form onsubmit={submit}>
   <h2>Join meeting</h2>
   <label>Meeting code<input data-testid="meeting-code" bind:value={meetingCode} /></label>
-  <button data-testid="join-button" type="submit" disabled={busy}>Join</button>
+  <fieldset data-testid="publish-chooser">
+    <legend>What you share (fixed for this meeting)</legend>
+    <label
+      ><input type="checkbox" data-testid="publish-microphone" bind:checked={publishMicrophone} />
+      Microphone</label
+    >
+    <label
+      ><input type="checkbox" data-testid="publish-camera" bind:checked={publishCamera} />
+      Camera</label
+    >
+  </fieldset>
+  <button data-testid="join-button" type="submit">Join</button>
 </form>
 
-<p data-testid="meeting-state">{store.meetingState}</p>
-<ul data-testid="participant-list">
-  {#each store.participants as participant (participant.participantId)}
-    <ParticipantRow
-      {participant}
-      {store}
-      {session}
-      {selfParticipantId}
-      hostControls={showHostControls && store.meetingState === MeetingSessionState.Joined}
+{#if attempt !== undefined}
+  {#key attempt.id}
+    <MeetingRoom
+      {config}
+      {auth}
+      meetingCode={attempt.code}
+      publish={attempt.publish}
+      {levers}
+      {onSessionInvalid}
     />
-  {/each}
-</ul>
-
-<!--
-  The in-meeting experience appears AFTER a settled join, alongside the join
-  form and roster rather than replacing them: the existing DOM contract
-  (`meeting-state`, `participant-list`, `last-error`) is what the browser suite
-  and the dev runbook's triage both read, and moving it would break both for no
-  benefit.
--->
-{#if store.meetingState === MeetingSessionState.Joined}
-  <InMeeting {session} {store} {selfParticipantId} />
-{/if}
-
-{#if store.lastError}
-  <p data-testid="last-error">{store.lastError.code}: {store.lastError.message}</p>
-{:else if joinError}
-  <p data-testid="last-error">{joinError}</p>
+  {/key}
+{:else}
+  <p data-testid="meeting-state">idle</p>
+  <ul data-testid="participant-list"></ul>
+  {#if leverError}
+    <p data-testid="last-error">{leverError}</p>
+  {/if}
 {/if}

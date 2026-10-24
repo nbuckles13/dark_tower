@@ -14,8 +14,9 @@ import {
   MeetingApiClient,
   MeetingSession,
   connect as baseConnect,
+  createCameraCapture,
 } from '@darktower/sdk-core';
-import type { WebTransportConnectFn } from '@darktower/sdk-core';
+import type { PublishKind, WebTransportConnectFn } from '@darktower/sdk-core';
 import type { DemoConfig } from './config.js';
 import type { E2EInstrumentation } from './e2eAnalysis.js';
 import { blockingConnect, type TestLevers } from './testLevers.js';
@@ -36,21 +37,37 @@ export function buildMeetingClient(config: DemoConfig): MeetingApiClient {
   return new MeetingApiClient({ gcBaseUrl: config.gcBaseUrl });
 }
 
+/** What {@link buildMeetingSession} needs beyond the config. */
+export interface MeetingSessionBuild {
+  /** The test build's receive-side instrumentation; `undefined` in production. */
+  readonly e2e?: E2EInstrumentation | undefined;
+  /** This context's test levers; only ever present in a `DT_TEST_LEVERS=1` build. */
+  readonly levers?: TestLevers | undefined;
+  /**
+   * The join's FIXED publish set (story 3 R-2), from the join view's chooser.
+   * `undefined`: the SDK default (`DEFAULT_PUBLISH`).
+   */
+  readonly publish?: readonly PublishKind[] | undefined;
+}
+
 /**
- * Construct a fresh single-use {@link MeetingSession} (meeting-join view).
+ * Construct a fresh single-use {@link MeetingSession} (one join attempt).
  *
  * N and M come from `VITE_DT_AUDIO_RECEIVE_SLOTS` / `VITE_DT_VIDEO_RECEIVE_SLOTS`
  * (see `config.ts`), unless a test-levers build overrides them for this context.
- * The publish set is the SDK default (audio); the publish-set chooser is story 3
- * C-C1's. A test-levers build may set it per context (`publish` lever). `e2e` is
- * the test build's receive-side instrumentation (`e2eAnalysis.ts`); it is
- * `undefined` in production, so neither the verification recorder nor the
- * analysing playback wrapper is ever injected there.
+ * The publish set is the chooser's (which a test-levers build may SEED from the
+ * `publish` lever — `JoinMeeting.svelte`). `e2e` is the test build's receive-side
+ * instrumentation (`e2eAnalysis.ts`); it is `undefined` in production, so
+ * neither the verification recorder nor the analysing playback wrapper is ever
+ * injected there.
+ *
+ * THROWS (typed) on a publish set and slot counts the SDK refuses at
+ * construction — nothing to publish or receive (`NothingToPublishOrReceive`), a
+ * duplicate kind — so the caller renders the refusal (`errorText.ts`).
  */
 export function buildMeetingSession(
   config: DemoConfig,
-  e2e?: E2EInstrumentation,
-  levers?: TestLevers,
+  { e2e, levers, publish }: MeetingSessionBuild = {},
 ): MeetingSession {
   // `levers` exists only in a `DT_TEST_LEVERS=1` build (`testLevers.ts`). The
   // define is tested AT EACH USE so the lever code is statically dead — and
@@ -65,7 +82,12 @@ export function buildMeetingSession(
       (__DT_TEST_LEVERS__ ? active?.audioReceiveSlots : undefined) ?? config.audioReceiveSlots,
     videoReceiveSlots:
       (__DT_TEST_LEVERS__ ? active?.videoReceiveSlots : undefined) ?? config.videoReceiveSlots,
-    ...(__DT_TEST_LEVERS__ && active?.publish ? { publish: active.publish } : {}),
+    ...(publish !== undefined ? { publish } : {}),
+    // Test-levers build only: run this context on the REAL (fake-device) camera
+    // in a test-pattern build, so a spec can assert the real track's readyState.
+    ...(__DT_TEST_LEVERS__ && active?.forceCameraCapture
+      ? { videoCaptureFactory: createCameraCapture }
+      : {}),
     ...(e2e ? { receiveVerification: e2e.recorder, playbackFactory: e2e.playbackFactory } : {}),
   });
 }

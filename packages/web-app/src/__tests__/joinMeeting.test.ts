@@ -4,15 +4,33 @@
 
 import { expect, test, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
-import { SdkError, SdkErrorCode } from '@darktower/sdk-core';
+import {
+  DEFAULT_PUBLISH,
+  SdkError,
+  SdkErrorCode,
+  SignalingError,
+  SignalingErrorCode,
+} from '@darktower/sdk-core';
 import type { DemoConfig } from '../lib/config.js';
 import type { AuthSession } from '../lib/types.js';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
 
-const holder = vi.hoisted(() => ({ session: undefined as MockMeetingSession | undefined }));
+const holder = vi.hoisted(() => ({
+  session: undefined as MockMeetingSession | undefined,
+  /** The options the view built the session with (publish set, levers, e2e). */
+  builds: [] as Array<{ publish?: readonly string[] | undefined }>,
+  /** Make the next build throw, as the SDK's construction-time refusal does. */
+  throwOnBuild: undefined as Error | undefined,
+}));
 
 vi.mock('../lib/session.js', () => ({
-  buildMeetingSession: () => holder.session,
+  buildMeetingSession: (_config: unknown, opts: { publish?: readonly string[] } = {}) => {
+    holder.builds.push(opts);
+    const refusal = holder.throwOnBuild;
+    holder.throwOnBuild = undefined;
+    if (refusal) throw refusal;
+    return holder.session;
+  },
   buildAuthClient: () => ({}),
   buildMeetingClient: () => ({}),
   // Signature is now `(config, authTokenProvider)` since telemetry gained a
@@ -38,14 +56,27 @@ const auth: AuthSession = {
   userToken: 'user-token',
 };
 
+/** Render the view and submit a join (the session is built on SUBMIT, story 3 C-C1). */
+async function submitted(session: MockMeetingSession) {
+  holder.session = session;
+  holder.builds = [];
+  const screen = await render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
+  await screen.getByTestId('meeting-code').fill('abc123ABC456');
+  await screen.getByTestId('join-button').click();
+  return screen;
+}
+
 test('renders join controls and a live roster from the store', async () => {
   const session = new MockMeetingSession();
   holder.session = session;
-  const screen = await render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
+  const pre = await render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
+  await expect.element(pre.getByTestId('meeting-code')).toBeInTheDocument();
+  await expect.element(pre.getByTestId('join-button')).toBeInTheDocument();
+  await expect.element(pre.getByTestId('meeting-state')).toHaveTextContent('idle');
+  pre.unmount();
 
-  await expect.element(screen.getByTestId('meeting-code')).toBeInTheDocument();
-  await expect.element(screen.getByTestId('join-button')).toBeInTheDocument();
-
+  const screen = await submitted(session);
+  await vi.waitFor(() => expect(session.joinCalls).toBe(1));
   session.fire('participantJoined', { participant: { participantId: 'a', name: 'Ann' } });
   await expect.element(screen.getByTestId('participant-a')).toHaveTextContent('Ann');
 
@@ -57,8 +88,8 @@ test('renders join controls and a live roster from the store', async () => {
 
 test('surfaces an error via last-error without leaking a non-allowlisted field', async () => {
   const session = new MockMeetingSession();
-  holder.session = session;
-  const screen = await render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
+  const screen = await submitted(session);
+  await vi.waitFor(() => expect(session.joinCalls).toBe(1));
 
   const err = new SdkError(SdkErrorCode.Signaling, 'join rejected', { status: 401 });
   (err as { token?: string }).token = 'SECRET_TOKEN_123';
@@ -66,6 +97,52 @@ test('surfaces an error via last-error without leaking a non-allowlisted field',
 
   await expect.element(screen.getByTestId('last-error')).toMatchTextContent('SIGNALING');
   await expect.element(screen.getByTestId('last-error')).not.toMatchTextContent('SECRET_TOKEN_123');
+});
+
+// ---------------------------------------------------------------------------
+// Story 3 R-2: the publish-set chooser
+// ---------------------------------------------------------------------------
+
+test("the chooser starts from the SDK default publish set, and its result is the join's publish set", async () => {
+  const session = new MockMeetingSession();
+  holder.session = session;
+  holder.builds = [];
+  const screen = await render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
+  // From DEFAULT_PUBLISH, never a restated literal.
+  const mic = screen.getByTestId('publish-microphone');
+  const cam = screen.getByTestId('publish-camera');
+  if (DEFAULT_PUBLISH.includes('audio')) await expect.element(mic).toBeChecked();
+  else await expect.element(mic).not.toBeChecked();
+  if (DEFAULT_PUBLISH.includes('video')) await expect.element(cam).toBeChecked();
+  else await expect.element(cam).not.toBeChecked();
+  // Nothing is built before submit: the publish set is fixed at construction.
+  expect(holder.builds).toEqual([]);
+
+  await cam.click();
+  await mic.click();
+  await screen.getByTestId('meeting-code').fill('abc123ABC456');
+  await screen.getByTestId('join-button').click();
+  await vi.waitFor(() => expect(holder.builds).toHaveLength(1));
+  const expected = [
+    ...(DEFAULT_PUBLISH.includes('audio') ? [] : ['audio']),
+    ...(DEFAULT_PUBLISH.includes('video') ? [] : ['video']),
+  ];
+  expect(holder.builds[0]?.publish).toEqual(expected);
+});
+
+test('a choice that would neither publish nor receive shows the SDK refusal — never a silent empty meeting', async () => {
+  const session = new MockMeetingSession();
+  holder.throwOnBuild = new SignalingError(
+    SignalingErrorCode.NothingToPublishOrReceive,
+    'this participant would neither publish nor receive',
+  );
+  const screen = await submitted(session);
+  const refusal = screen.getByTestId('last-error');
+  await expect.element(refusal).toHaveTextContent('neither publish nor receive');
+  await expect.element(refusal).toHaveTextContent('Choose the microphone or the camera');
+  // Nothing joined.
+  expect(session.joinCalls).toBe(0);
+  await expect.element(screen.getByTestId('in-meeting')).not.toBeInTheDocument();
 });
 
 // ---------------------------------------------------------------------------
@@ -163,12 +240,13 @@ test('server mute and client mute are DISTINCT tokens; client mute is unknown wi
 test('host controls are absent for a non-host', async () => {
   const { screen } = await joinedRig({ isHost: false });
   await expect.element(screen.getByTestId('participant-b')).toBeInTheDocument();
-  await expect.element(screen.getByTestId('server-mute-b')).not.toBeInTheDocument();
+  await expect.element(screen.getByTestId('server-mute-audio-b')).not.toBeInTheDocument();
+  await expect.element(screen.getByTestId('server-mute-video-b')).not.toBeInTheDocument();
 });
 
 test('the host affordance sends target + action, and its label follows the WIRE, not the click', async () => {
   const { session, screen } = await joinedRig({ isHost: true });
-  const button = screen.getByTestId('server-mute-b');
+  const button = screen.getByTestId('server-mute-audio-b');
   await expect.element(button).toHaveAttribute('aria-pressed', 'false');
   await button.click();
   await vi.waitFor(() =>
@@ -205,4 +283,28 @@ test('the host affordance sends target + action, and its label follows the WIRE,
   await expect.element(button).toHaveAttribute('aria-pressed', 'false');
   await expect.element(screen.getByTestId('unmute-requested-b')).not.toBeInTheDocument();
   expect(screen.container.textContent?.toLowerCase()).not.toMatch(/\bban/);
+});
+
+test('the host has a SEPARATE affordance per kind; a video request never touches audio', async () => {
+  const { session, screen } = await joinedRig({ isHost: true });
+  const video = screen.getByTestId('server-mute-video-b');
+  const audio = screen.getByTestId('server-mute-audio-b');
+  await video.click();
+  await vi.waitFor(() =>
+    expect(session.serverMuteCalls).toEqual([{ participantId: 'b', kind: 'video', muted: true }]),
+  );
+  session.fire('participantMuteChanged', {
+    participantId: 'b',
+    audioServerMuted: false,
+    videoServerMuted: true,
+    serverMutedBy: 'self',
+  });
+  await expect.element(video).toHaveAttribute('aria-pressed', 'true');
+  await expect.element(audio).toHaveAttribute('aria-pressed', 'false');
+  const row = screen.getByTestId('participant-b');
+  await expect.element(row).toHaveAttribute('data-server-muted-video', 'true');
+  await expect.element(row).toHaveAttribute('data-server-muted', 'false');
+  await expect
+    .element(row.getByTestId('mute-video-server-b'))
+    .toHaveAttribute('data-muted', 'true');
 });

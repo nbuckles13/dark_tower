@@ -817,7 +817,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
    * TARGET AND ACTION ONLY. The message has no requester field, and none is
    * invented: MC identifies the requester from this authenticated connection and
    * decides authority itself. `reason` is left empty (it is client-controlled and
-   * echoed to another participant). ONE KIND PER REQUEST (story 3 R-15): the
+   * MC does not relay it). ONE KIND PER REQUEST (story 3 R-15): the
    * target's `kind` at `muted`; the other kind's field is left ABSENT, so MC
    * leaves the target's other kind exactly as it is (`muteRequest.ts`). A
    * refusal arrives as a post-join `FORBIDDEN` session error, which does NOT

@@ -19,7 +19,7 @@ not a production app.
 | Sign-up | `AuthApiClient.register` | email / password / displayName / orgSubdomain |
 | Sign-in | `AuthApiClient.login` | email / password / orgSubdomain |
 | Create-meeting | `MeetingApiClient.createMeeting` | title (+ optional scheduled start) → shows the meeting code |
-| Meeting-join | `MeetingSession.join` | meeting code → live roster from the reactive store |
+| Meeting-join | `MeetingSession.join` | meeting code + the publish-set chooser (microphone / camera, fixed for the meeting) → one `MeetingRoom` per attempt: live roster, N audio rows paired by participant with an M-tile video grid, four mute indicators per participant, per-kind host controls, and the non-suppressible "the host turned it back on" notice (story 3 C-C1) |
 
 ## Transport & scheme (important)
 

@@ -85,6 +85,7 @@ import {
   KEK_UPDATES,
   KEK_UPDATE_SOURCE,
   MEDIA_KIND_AUDIO,
+  MEDIA_KIND_VIDEO,
   RECEIVED_COUNTER,
   SEND_COUNTER,
   clientNamesIn,
@@ -173,6 +174,11 @@ interface PromQueryResponse {
  * strictly distinct.
  */
 async function promInstantByInstance(promql: string): Promise<InstanceCounters> {
+  return resultsToInstanceMap(promql, await promInstantRows(promql));
+}
+
+/** The validated raw result rows of an instant query (fail-loud like every read here). */
+async function promInstantRows(promql: string): Promise<readonly PromResultRow[]> {
   const url = `${e2eEnv.prometheusUrl}/api/v1/query?query=${encodeURIComponent(promql)}`;
   const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
   // The trailing clause is a CROSS-LANGUAGE grep key (matches the Rust
@@ -193,7 +199,7 @@ async function promInstantByInstance(promql: string): Promise<InstanceCounters> 
       `Prometheus query returned status "${body.status ?? 'undefined'}" (${url}). ${failLoudTail}`,
     );
   }
-  return resultsToInstanceMap(promql, body.data?.result ?? []);
+  return body.data?.result ?? [];
 }
 
 /** Poll options shared by every counter-delta wait (defaults match the Rust Scenario 7 helper). */
@@ -394,6 +400,67 @@ export async function diagnoseMissingSender(
 }
 
 // ============================================================================
+// Story 3 C-C1 — VIDEO failure diagnostics (MH pending / keyframe events, MC
+// video slot states). FLEET / POD-LEVEL, DIAGNOSTICS ONLY: never a
+// per-participant assertion (that comes from the participant's own bus). Names
+// from `docs/observability/metrics/{mh,mc}-service.md`; every PromQL string of
+// the suite lives in this module (`failureDiagnostics.ts` only orchestrates).
+// ============================================================================
+
+const MH_EDGES_PENDING_PROMQL = 'max by (instance) (mh_media_edges_pending)';
+const MH_EDGE_PENDING_OLDEST_PROMQL = 'max by (instance) (mh_media_edge_pending_oldest_seconds)';
+const MH_KEYFRAME_REQUESTS_SENT_PROMQL =
+  'sum by (instance, trigger) (mh_media_keyframe_requests_sent_total)';
+const MH_KEYFRAME_WRITE_FAILURES_PROMQL =
+  'sum by (instance) (mh_media_keyframe_request_write_failures_total)';
+const MC_VIDEO_SLOT_STATES_PROMQL = `sum by (instance, slot_state) (mc_media_slot_states_total{media_kind="${MEDIA_KIND_VIDEO}"})`;
+const MC_UNREACHABLE_SENDERS_PROMQL = 'sum by (instance) (mc_media_unreachable_senders_total)';
+
+/** One labelled diagnostic read: its name and the raw rows, formatted. */
+export interface DiagnosticRead {
+  readonly label: string;
+  readonly value: string;
+}
+
+/**
+ * Read every video diagnostic at once. NEVER THROWS: a failed read is reported
+ * as its own text, so a broken Prometheus can never replace the original
+ * assertion failure this dump decorates.
+ */
+export async function videoDiagnosticReads(): Promise<readonly DiagnosticRead[]> {
+  const reads: ReadonlyArray<readonly [string, string, readonly string[]]> = [
+    ['MH pending edges (a missing keyframe event if > 0 and stuck)', MH_EDGES_PENDING_PROMQL, []],
+    ['MH oldest pending edge age, s', MH_EDGE_PENDING_OLDEST_PROMQL, []],
+    ['MH keyframe requests sent, by trigger', MH_KEYFRAME_REQUESTS_SENT_PROMQL, ['trigger']],
+    ['MH keyframe request write failures', MH_KEYFRAME_WRITE_FAILURES_PROMQL, []],
+    ['MC video slot states conveyed, by state', MC_VIDEO_SLOT_STATES_PROMQL, ['slot_state']],
+    ['MC unreachable senders named', MC_UNREACHABLE_SENDERS_PROMQL, []],
+  ];
+  return Promise.all(
+    reads.map(async ([label, query, by]) => {
+      try {
+        const rows = await promInstantRows(query);
+        const value =
+          rows.length === 0
+            ? '(empty)'
+            : rows
+                .map((r) => {
+                  const key = [
+                    r.metric?.['instance'] ?? '?',
+                    ...by.map((k) => r.metric?.[k] ?? '?'),
+                  ];
+                  return `${key.join('/')}=${r.value?.[1] ?? '?'}`;
+                })
+                .join(', ');
+        return { label, value };
+      } catch (err) {
+        return { label, value: `READ FAILED: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }),
+  );
+}
+
+// ============================================================================
 // Story 2 R-27 / S6 — CLIENT series read back out of Prometheus.
 //
 // FLEET-LEVEL EVIDENCE ONLY. Client series carry `instance` = the collector pod
@@ -423,18 +490,33 @@ const RECEIVED_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER})`;
 // matches series WITHOUT the label) must NOT rise, which proves no SDK path still
 // emits the pre-split three-key bag.
 const RECEIVED_AUDIO_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER}{media_kind="${MEDIA_KIND_AUDIO}"})`;
+// Story 3 C-C1 (R-29): the VIDEO arms — received AND sent, so both halves of
+// the video client series are proven to carry `media_kind="video"` end to end.
+// The series is born when video is first DIRECTED (lazily), so only a baseline
+// taken before the joins -> above delta can see it.
+const RECEIVED_VIDEO_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER}{media_kind="${MEDIA_KIND_VIDEO}"})`;
+const SENT_VIDEO_SUM_PROMQL = `sum by (instance) (${SEND_COUNTER}{media_kind="${MEDIA_KIND_VIDEO}"})`;
 const RECEIVED_KINDLESS_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER}{media_kind=""})`;
 const KEK_UPDATES_SUM_PROMQL = `sum by (instance) (${KEK_UPDATES}{source="${KEK_UPDATE_SOURCE}"})`;
 const KEK_RETAINED_SUM_PROMQL = `sum by (instance) (${KEK_GENERATIONS_RETAINED})`;
 
 /** Which client counter a read-back is about. */
 export type ClientCounter =
-  'sent' | 'received' | 'received_audio' | 'received_kindless' | 'kek_update' | 'kek_retained';
+  | 'sent'
+  | 'received'
+  | 'received_audio'
+  | 'received_video'
+  | 'sent_video'
+  | 'received_kindless'
+  | 'kek_update'
+  | 'kek_retained';
 
 const CLIENT_COUNTER_PROMQL: Record<ClientCounter, string> = {
   sent: SENT_SUM_PROMQL,
   received: RECEIVED_SUM_PROMQL,
   received_audio: RECEIVED_AUDIO_SUM_PROMQL,
+  received_video: RECEIVED_VIDEO_SUM_PROMQL,
+  sent_video: SENT_VIDEO_SUM_PROMQL,
   received_kindless: RECEIVED_KINDLESS_SUM_PROMQL,
   kek_update: KEK_UPDATES_SUM_PROMQL,
   kek_retained: KEK_RETAINED_SUM_PROMQL,

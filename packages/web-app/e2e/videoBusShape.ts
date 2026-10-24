@@ -16,23 +16,27 @@
 // following the story-2 `receiveLayers` precedent. There is never a stream
 // number, relay id, GoP, size, key id, timing or durable identity.
 //
-// Not imported from `src/`: the new events do not exist in the app yet, so
-// the contract lives here and the app's projection is typed against the README.
+// DIRECTION (story 3 C-C1, DRY): this module stays THE contract. The app's
+// projection (`src/lib/e2eBus.ts`) is round-tripped through these parsers by
+// `src/__tests__/e2eBus.test.ts`, so the two cannot drift; the closed
+// vocabularies (wire tokens, keyframe causes, reject reasons) are imported from
+// their one home rather than restated.
 
-import { PENDING_SLOT_STATES, SHARED_SLOT_STATES, type ExpectedSlotState } from './slotOracle.js';
+import { ALL_REJECT_REASONS, MEDIA_KEYFRAME_SOURCES } from '@darktower/sdk-core';
+import type { MediaKeyframeSource, RejectReason } from '@darktower/sdk-core';
+import { WIRE_TOKENS, type SlotStateToken } from '../src/lib/slotState.js';
 import type { LayerRow } from './videoEvidence.js';
 
 /**
- * The slot-state wire tokens the bus carries. ONE home: derived from the
- * oracle's vocabulary (`slotOracle.ts`, where the two tokens the SDK already
- * carries are checked against its union and the five pending ones wait for
- * C-A1), so the oracle's expectation and the bus value are the same type.
+ * The slot-state wire tokens the bus carries: EVERY SDK token, derived from the
+ * app's exhaustive copy table (`WIRE_TOKENS` = the keys of a `Record` over the
+ * SDK union), so a new wire state reaches the parser at compile time. Wider
+ * than the oracle's expectation on purpose (`slotOracle.ts:EXPECTED_SLOT_STATES`):
+ * a never-emitted token on the bus is a state MISMATCH the judges report, not a
+ * shape error that hides it.
  */
-export const BUS_SLOT_STATES = [
-  ...SHARED_SLOT_STATES,
-  ...PENDING_SLOT_STATES,
-] as const satisfies readonly ExpectedSlotState[];
-export type BusSlotState = ExpectedSlotState;
+export const BUS_SLOT_STATES: readonly SlotStateToken[] = WIRE_TOKENS;
+export type BusSlotState = SlotStateToken;
 
 /** What a video slot is actually showing. */
 export type RenderedKind = 'video' | 'avatar' | 'empty';
@@ -265,4 +269,84 @@ export function parseReceiveLayers(raw: unknown): LayerRow[] {
       verified: count(r, 'verified', where),
     };
   });
+}
+
+/** `{ type: 'sendCounts', video: { framesSent, keyframes: { <cause>: n } } }` (story 3 C-C1). */
+export interface SendCountsEvent {
+  readonly video: {
+    readonly framesSent: number;
+    /** Keyframes produced, by the CLOSED cause set `MEDIA_KEYFRAME_SOURCES`. */
+    readonly keyframes: Readonly<Record<MediaKeyframeSource, number>>;
+  };
+}
+
+/** The closed keyframe-cause set, from its one home (sdk-core). No periodic cause exists. */
+export const KEYFRAME_CAUSES: readonly MediaKeyframeSource[] =
+  Object.values(MEDIA_KEYFRAME_SOURCES);
+
+/**
+ * Parse one `sendCounts` bus event: keyed by KIND (never a stream number),
+ * cumulative counts only — no timestamp, timing, GoP or size. Exact keys at
+ * every level; an unknown keyframe cause is a contract error.
+ */
+export function parseSendCounts(raw: unknown): SendCountsEvent {
+  const r = record(raw, 'sendCounts');
+  exactKeys(r, 'sendCounts', ['type', 'video']);
+  if (r['type'] !== 'sendCounts') throw new BusShapeError('sendCounts: wrong type');
+  const video = record(r['video'], 'sendCounts.video');
+  exactKeys(video, 'sendCounts.video', ['framesSent', 'keyframes']);
+  const k = record(video['keyframes'], 'sendCounts.video.keyframes');
+  exactKeys(k, 'sendCounts.video.keyframes', KEYFRAME_CAUSES);
+  const keyframes = Object.fromEntries(
+    KEYFRAME_CAUSES.map((cause) => [cause, count(k, cause, 'sendCounts.video.keyframes')]),
+  ) as Record<MediaKeyframeSource, number>;
+  return {
+    video: { framesSent: count(video, 'framesSent', 'sendCounts.video'), keyframes },
+  };
+}
+
+/** One `receiveLayers.drops` row: (slot, sender|null, reason) -> count. */
+export interface DropRow {
+  readonly slot: number | 'undeclared' | 'unparsed';
+  /** `null` when the key id never parsed. */
+  readonly senderId: string | null;
+  readonly reason: RejectReason;
+  readonly count: number;
+}
+
+/**
+ * `receiveLayers.drops` — exactly `{ slot, senderId, reason, count }`, the
+ * reason from the SDK's CLOSED reject vocabulary (`ALL_REJECT_REASONS`). Used
+ * by the failure diagnostics; held to the same exact-key rule as the rest.
+ */
+export function parseReceiveDrops(raw: unknown): DropRow[] {
+  if (!Array.isArray(raw)) throw new BusShapeError('receiveLayers.drops: expected an array');
+  return raw.map((entry: unknown, i) => {
+    const where = `receiveLayers.drops[${i}]`;
+    const r = record(entry, where);
+    exactKeys(r, where, ['slot', 'senderId', 'reason', 'count']);
+    const slot = r['slot'];
+    if (!isCount(slot) && slot !== 'undeclared' && slot !== 'unparsed') {
+      throw new BusShapeError(`${where}: 'slot' must be a slot id or 'undeclared' | 'unparsed'`);
+    }
+    const sender = r['senderId'];
+    if (sender !== null && !isSenderId(sender)) {
+      throw new BusShapeError(`${where}: 'senderId' must be a stringified sender id or null`);
+    }
+    const reason = r['reason'];
+    if (typeof reason !== 'string' || !(ALL_REJECT_REASONS as readonly string[]).includes(reason)) {
+      throw new BusShapeError(`${where}: 'reason' is not in the SDK reject vocabulary`);
+    }
+    return {
+      slot,
+      senderId: sender,
+      reason: reason as RejectReason,
+      count: count(r, 'count', where),
+    };
+  });
+}
+
+/** A slot sample WITHOUT its lumas, for failure text (the 24 numbers are noise there). */
+export function withoutLumas(slot: object): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(slot).filter(([k]) => k !== 'lumas'));
 }

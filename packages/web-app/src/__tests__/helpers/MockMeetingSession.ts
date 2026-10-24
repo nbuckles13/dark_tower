@@ -15,6 +15,9 @@ import { MeetingSessionState, TypedEventEmitter } from '@darktower/sdk-core';
 import type {
   CaptureSourceInfo,
   VideoCaptureSourceInfo,
+  VideoReceiveView,
+  VideoSendCounts,
+  VideoSink,
   JoinedEvent,
   MediaFrameCounts,
   ReceiveSlotsDiagnostics,
@@ -49,6 +52,11 @@ export class FakeAudioPipeline {
 
   #audioMuted = false;
   readonly #echo: (snapshot: MuteSnapshot) => void;
+
+  /** The pipeline's current audio mute (for the session's combined echo). */
+  get audioMuted(): boolean {
+    return this.#audioMuted;
+  }
 
   constructor(echo: (snapshot: MuteSnapshot) => void) {
     this.#echo = echo;
@@ -119,8 +127,8 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
   /** Effective publish set, N, M and per-kind caps, as the real facade reports them. Mutable. */
   receiveSlots: ReceiveSlotsDiagnostics = {
     publish: ['audio'],
-    audio: { declared: 1, source: 'default', serverCap: { state: 'unknown' } },
-    video: { declared: 0, source: 'default', serverCap: { state: 'unknown' } },
+    audio: { declared: 1, slotIds: [0], source: 'default', serverCap: { state: 'unknown' } },
+    video: { declared: 0, slotIds: [], source: 'default', serverCap: { state: 'unknown' } },
   };
   /** Set by `startMedia()` to the microphone, as the real facade's default. */
   captureSource: CaptureSourceInfo | undefined;
@@ -128,6 +136,34 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
   videoCaptureSource: VideoCaptureSourceInfo | undefined;
   /** The camera light (story 3). */
   cameraTrackLive = false;
+  /** Story 3 C-C1: cumulative video send counts, `undefined` unless a test sets them. */
+  videoSendCounts: VideoSendCounts | undefined;
+  /** The video publisher as the bus samples it (`sendTotals`), present once counts are set. */
+  get video(): { sendTotals(): VideoSendCounts } | undefined {
+    const counts = this.videoSendCounts;
+    return counts === undefined ? undefined : { sendTotals: () => counts };
+  }
+  /** The sinks a view attached, by slot (story 3 C-C1: the VideoTile binding). */
+  readonly sinks = new Map<number, VideoSink | undefined>();
+  /** Per-slot evidence the bus samples; mutable by a test. */
+  videoEvidence: ReturnType<VideoReceiveView['evidence']> = [];
+  /** The video receive view; set by `startMedia()` when M > 0, as the real facade. */
+  videoReceive: VideoReceiveView | undefined;
+  /** `setAudioMuted` / `setVideoMuted` calls, in order (story 3: the session-level mute API). */
+  readonly sessionMuteCalls: Array<{ kind: 'audio' | 'video'; muted: boolean }> = [];
+  #videoMuted = false;
+
+  setAudioMuted(muted: boolean): void {
+    this.sessionMuteCalls.push({ kind: 'audio', muted });
+    this.media?.setAudioMuted(muted);
+  }
+
+  setVideoMuted(muted: boolean): void {
+    this.sessionMuteCalls.push({ kind: 'video', muted });
+    if (this.#videoMuted === muted) return;
+    this.#videoMuted = muted;
+    this.fire('muteChanged', { audioMuted: this.media?.audioMuted ?? false, videoMuted: muted });
+  }
 
   /** The running pipeline, or `undefined` before `startMedia()` — as the real facade. */
   media: FakeAudioPipeline | undefined;
@@ -144,8 +180,17 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
     this.startMediaDeviceIds.push(options.deviceId);
     const existing = this.media;
     if (existing) return existing;
-    const pipeline = new FakeAudioPipeline((snapshot) => this.fire('muteChanged', snapshot));
+    const pipeline = new FakeAudioPipeline((snapshot) =>
+      this.fire('muteChanged', { ...snapshot, videoMuted: this.#videoMuted }),
+    );
     this.media = pipeline;
+    if (this.receiveSlots.video.declared > 0) {
+      this.videoReceive = {
+        setVideoSink: (slotId, sink) => this.sinks.set(slotId, sink),
+        evidence: () => this.videoEvidence,
+        unfulfilledSnapshot: () => [],
+      };
+    }
     this.captureSource ??= { mode: 'microphone' };
     return pipeline;
   }

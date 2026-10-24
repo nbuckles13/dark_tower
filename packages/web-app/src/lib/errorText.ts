@@ -19,12 +19,13 @@ import {
  * deployment vocabulary, so they are named here, not in the SDK.
  */
 const NOTHING_TO_PUBLISH_OR_RECEIVE_FIX =
-  `Set ${RECEIVE_SLOTS_VARIABLES.audio} or ${RECEIVE_SLOTS_VARIABLES.video} above 0 (this app ` +
-  'build), or publish audio; a participant must publish or receive something to join.';
+  'Choose the microphone or the camera, or ' +
+  `set ${RECEIVE_SLOTS_VARIABLES.audio} or ${RECEIVE_SLOTS_VARIABLES.video} above 0 (this app ` +
+  'build); a participant must publish or receive something to join.';
 
-/** The fix for a publish set this build cannot serve (video, until the video publish path ships). */
+/** The fix for a publish set the SDK refuses as malformed (a duplicate or unknown kind). */
 const PUBLISH_KIND_NOT_SUPPORTED_FIX =
-  'This build publishes audio only; video publishing arrives with the video publish path.';
+  'Choose the microphone and the camera at most once each; nothing else can be published.';
 
 /** A safe, bounded display string for any caught error. */
 export function errorText(err: unknown): string {

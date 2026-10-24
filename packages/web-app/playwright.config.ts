@@ -91,6 +91,11 @@ export default defineConfig({
       // Story 2 task 15: the per-browsing-context test levers (S10a handler
       // blocking, S2 per-context N, forced host controls). Same predicate.
       DT_TEST_LEVERS: '1',
+      // Story 3 R-27 / C-C1: the synthetic per-participant TEST-PATTERN camera
+      // (`DT_TEST_PATTERN=1`, same predicate): every video publisher sends its
+      // own pattern, which layer 3 decodes at the render surface. Asserted at
+      // runtime (`expectBuildKnobs`: `buildKnobs.testPattern`).
+      DT_TEST_PATTERN: '1',
       // SDK telemetry ON — the ONE place the suite sets it (story 2 R-27
       // read-back, the credential-scan positive control). Unset, web-app's
       // `configureTelemetryIfEnabled` returns early and every `dt_client_*`

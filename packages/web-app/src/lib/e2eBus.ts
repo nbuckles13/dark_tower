@@ -26,8 +26,12 @@ import type {
   ReceiveSlotsDiagnostics,
   RosterParticipant,
   SdkError,
+  MediaKeyframeSource,
+  VideoSendCounts,
+  VideoSlotEvidence,
 } from '@darktower/sdk-core';
 import type { E2EInstrumentation } from './e2eAnalysis.js';
+import { renderedKind } from './slotState.js';
 
 /** The minimal surface installE2EHooks needs: subscribe to typed session events. */
 export interface SessionEvents {
@@ -62,6 +66,10 @@ export interface SessionMediaCounters {
   readonly cameraTrackLive: boolean;
   /** The current meeting-KEK generation (public: it is in every key id). Story 2 S6. */
   readonly currentKekGeneration: number | undefined;
+  /** Story 3 C-C1: the video receive view's per-slot evidence, once media started with M > 0. */
+  readonly videoReceive: { evidence(): readonly VideoSlotEvidence[] } | undefined;
+  /** Story 3 C-C1: the video publisher (cumulative send counts), once media started publishing video. */
+  readonly video: { sendTotals(): VideoSendCounts } | undefined;
 }
 
 /** What the bus needs to know about the app's build and config. Plain booleans. */
@@ -252,6 +260,8 @@ export function installE2EHooks(
     bus.emit({
       type: 'buildKnobs',
       testLevers: __DT_TEST_LEVERS__,
+      // Story 3 R-27: the test-pattern camera, asserted at runtime like the tone.
+      testPattern: __DT_TEST_PATTERN__,
       // Config intent AND the SDK's actual state, side by side: an endpoint that
       // was configured but never reached the SDK reads as the second being false.
       telemetryConfigured: options.telemetryConfigured,
@@ -294,7 +304,11 @@ export function installE2EHooks(
     // renders, so a test can assert the DOM and the SDK agree rather than
     // assuming it.
     session.on('muteChanged', (snapshot) =>
-      bus.emit({ type: 'muteState', audioMuted: snapshot.audioMuted }),
+      bus.emit({
+        type: 'muteState',
+        audioMuted: snapshot.audioMuted,
+        videoMuted: snapshot.videoMuted,
+      }),
     );
 
     // SAMPLED counters, never per-frame emission. The structural mute assertion
@@ -386,6 +400,62 @@ export function installE2EHooks(
             spectrumDb: [...a.spectrumDb],
           })),
           atMs: Date.now(),
+        });
+      }
+      // ------------------------------------------------------------------
+      // STORY 3 R-32 — per VIDEO slot, sampled (never per frame). Explicit
+      // allowlist projection of SDK evidence + the RENDER SURFACE (the tile's
+      // canvas, `e2eAnalysis.ts`), field by field (e2e/videoBusShape.ts is the
+      // exact-key contract):
+      //   slotId, mcState (raw wire token), rendered (video | avatar | empty),
+      //   renderedSenderId (the VERIFIED key-id sender of the last rendered
+      //   frame, stringified — the sender component only, never a key id,
+      //   generation or stream number), framesDecoded (SDK count),
+      //   framesRendered (surface paint count), lumas (24 render-surface block
+      //   means, only while rendering video and painted).
+      // A slot is OMITTED until MC has named it. No timestamp, GoP, size or
+      // timing — ever.
+      const evidence = session.videoReceive?.evidence();
+      if (evidence !== undefined && instrumentation !== undefined) {
+        const slots: Record<string, unknown>[] = [];
+        for (const e of evidence) {
+          if (e.mcState === undefined) continue;
+          const rendered = renderedKind(e.render);
+          // Lumas are read only while the slot renders video (decided here, once).
+          const surface = instrumentation.surface(e.slotId, { withLumas: rendered === 'video' });
+          const framesRendered = surface?.framesRendered ?? 0;
+          const lumas = surface?.lumas;
+          slots.push({
+            slotId: e.slotId,
+            mcState: e.mcState,
+            rendered,
+            ...(e.lastRenderedSender !== undefined
+              ? { renderedSenderId: String(e.lastRenderedSender) }
+              : {}),
+            framesDecoded: e.framesDecoded,
+            framesRendered,
+            ...(lumas !== undefined ? { lumas: [...lumas] } : {}),
+          });
+        }
+        bus.emit({ type: 'videoSlots', slots });
+      }
+      // Send side: frames written and keyframes produced BY CAUSE (the closed
+      // `MEDIA_KEYFRAME_SOURCES`), keyed by KIND — never a stream number.
+      const send = session.video?.sendTotals();
+      if (send !== undefined) {
+        // Explicit projection, typed EXHAUSTIVELY over the cause set: a new
+        // `MediaKeyframeSource` fails to compile here rather than dropping off.
+        const keyframes: Record<MediaKeyframeSource, number> = {
+          directive_start: send.keyframes.directive_start,
+          request: send.keyframes.request,
+          abandonment: send.keyframes.abandonment,
+        };
+        bus.emit({
+          type: 'sendCounts',
+          video: {
+            framesSent: send.framesSent,
+            keyframes,
+          },
         });
       }
       const counts = session.media?.frameCounts;

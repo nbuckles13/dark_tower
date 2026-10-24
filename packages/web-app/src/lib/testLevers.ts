@@ -25,6 +25,12 @@
 //   * `forceHostControls` — renders the host server-mute affordance in a NON-host
 //     context, so the browser suite exercises MC's refusal (the authority), not a
 //     hidden button (@security M2).
+//   * `publish` — SEEDS the join view's publish-set chooser (story 3 C-A2/C-C1);
+//     the chooser's result is still what the join uses.
+//   * `forceCameraCapture` — story 3 C-C1: this context captures from the REAL
+//     camera (Chromium's fake device under the suite's launch flags) instead of
+//     the build's test pattern, so a spec can assert the real track's
+//     `readyState`. It can only swap the capture source; nothing else.
 //
 // LOUD ON MISUSE (@security L3): an unknown key, a wrong type or an empty entry
 // THROWS at session build; after join, `checkLeversApplied` refuses a block list
@@ -46,6 +52,8 @@ export interface TestLevers {
    * default (audio). Frozen at session build like every lever.
    */
   readonly publish: readonly PublishKind[] | undefined;
+  /** Story 3 C-C1: capture from the real camera, not the test pattern. */
+  readonly forceCameraCapture: boolean;
 }
 
 /** The cohort contract's publish-set spellings -> the SDK's publish set. */
@@ -63,6 +71,7 @@ const LEVER_KEYS: readonly string[] = [
   'videoReceiveSlots',
   'forceHostControls',
   'publish',
+  'forceCameraCapture',
 ];
 
 /** Prefix on every lever error, so a failure names its cause. */
@@ -104,6 +113,10 @@ export function parseTestLevers(raw: unknown): TestLevers | undefined {
   if (typeof force !== 'boolean') {
     throw new Error(`${LEVER_ERROR} forceHostControls must be a boolean`);
   }
+  const forceCamera = record['forceCameraCapture'] ?? false;
+  if (typeof forceCamera !== 'boolean') {
+    throw new Error(`${LEVER_ERROR} forceCameraCapture must be a boolean`);
+  }
   const publish = record['publish'];
   if (
     publish !== undefined &&
@@ -119,6 +132,7 @@ export function parseTestLevers(raw: unknown): TestLevers | undefined {
     videoReceiveSlots:
       videoSlots === undefined ? undefined : parseReceiveSlots(videoSlots, 'video'),
     forceHostControls: force,
+    forceCameraCapture: forceCamera,
   });
 }
 
@@ -209,4 +223,9 @@ export function leverViolationAfterJoin(
 /** Whether host controls are FORCED on for this (non-host) context. */
 export function hostControlsForced(levers: TestLevers | undefined): boolean {
   return __DT_TEST_LEVERS__ && levers !== undefined && levers.forceHostControls;
+}
+
+/** The publish set this context's lever SEEDS the chooser with, if any (test-levers build only). */
+export function publishSeed(levers: TestLevers | undefined): readonly PublishKind[] | undefined {
+  return __DT_TEST_LEVERS__ ? levers?.publish : undefined;
 }

@@ -42,6 +42,7 @@ describe('parseTestLevers', () => {
       videoReceiveSlots: undefined,
       forceHostControls: false,
       publish: undefined,
+      forceCameraCapture: false,
     });
   });
 
@@ -58,6 +59,11 @@ describe('parseTestLevers', () => {
     ['a numeric videoReceiveSlots', { videoReceiveSlots: 2 }, /videoReceiveSlots must be a string/],
     ['a malformed videoReceiveSlots', { videoReceiveSlots: '-1' }, /receive-slot count/],
     ['the RETIRED receiveSlots lever', { receiveSlots: '2' }, /unknown key/],
+    [
+      'a non-boolean forceCameraCapture',
+      { forceCameraCapture: 'yes' },
+      /forceCameraCapture must be a boolean/,
+    ],
     ['a non-boolean forceHostControls', { forceHostControls: 'yes' }, /boolean/],
   ])('THROWS on %s', (_label, raw, message) => {
     expect(() => parseTestLevers(raw)).toThrow(message);
@@ -133,3 +139,7 @@ it.each(['camera', 'AUDIO', 'toString', 'constructor', '__proto__', 7, ['audio']
     expect(() => parseTestLevers({ publish: bad })).toThrow(/publish must be one of/);
   },
 );
+
+it('forceCameraCapture parses to a frozen boolean (story 3 C-C1)', () => {
+  expect(parseTestLevers({ forceCameraCapture: true })?.forceCameraCapture).toBe(true);
+});

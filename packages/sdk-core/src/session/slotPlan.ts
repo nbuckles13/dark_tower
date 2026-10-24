@@ -8,6 +8,7 @@
 
 import {
   DEFAULT_CLIENT_CONFIG,
+  DEFAULT_PUBLISH,
   validateMediaConfig,
   type MediaConfig,
   type ConfigValueSource,
@@ -15,7 +16,12 @@ import {
 } from '../config/clientConfig.js';
 import type { PublishKind, ReceiveSlotDeclaration } from '../signaling/events.js';
 import type { ReceiveSlotsDiagnostics, MeetingSessionOptions } from './events.js';
-import { classifySlotCap, receiveDeclaration, validatePublishSet } from './mediaSelection.js';
+import {
+  classifySlotCap,
+  declaredSlotIds,
+  receiveDeclaration,
+  validatePublishSet,
+} from './mediaSelection.js';
 
 /** See the module header. */
 export class SlotPlan {
@@ -54,7 +60,7 @@ export class SlotPlan {
     this.#audioSource = options.audioReceiveSlots?.source ?? fallbackSource;
     this.#videoSource = options.videoReceiveSlots?.source ?? fallbackSource;
     const { audioSlots, videoSlots } = this.mediaConfig.receive;
-    this.publish = validatePublishSet(options.publish ?? ['audio'], audioSlots, videoSlots);
+    this.publish = validatePublishSet(options.publish ?? DEFAULT_PUBLISH, audioSlots, videoSlots);
     this.declaration = receiveDeclaration(audioSlots, videoSlots);
   }
 
@@ -84,11 +90,13 @@ export class SlotPlan {
       publish: this.publish,
       audio: {
         declared: audioSlots,
+        slotIds: declaredSlotIds(this.declaration, 'audio'),
         source: this.#audioSource,
         serverCap: classifySlotCap(this.#audioCap),
       },
       video: {
         declared: videoSlots,
+        slotIds: declaredSlotIds(this.declaration, 'video'),
         source: this.#videoSource,
         serverCap: classifySlotCap(this.#videoCap),
       },

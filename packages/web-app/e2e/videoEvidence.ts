@@ -81,6 +81,14 @@ export interface VideoSlotCheck {
    * (stringified). Required when the expectation is ACTIVE.
    */
   readonly expectedSenderId?: string;
+  /**
+   * What the expected occupant captures from. `camera` (story 3 C-C1: a
+   * camera-mode context under the fake device, `forceCameraCapture`) carries no
+   * test pattern, so layer 3 does NOT APPLY to it — a NAMED branch, decided per
+   * occupant by the scenario, never a filter that could empty a window. Layers
+   * 1 and 2 and the rendered state still apply. Default: `test_pattern`.
+   */
+  readonly occupantSource?: 'test_pattern' | 'camera';
 }
 
 /** One slot's verdict. `failures` is empty on a pass. */
@@ -154,7 +162,7 @@ export function judgeVideoSlot(check: VideoSlotCheck, window: VideoWindow): Vide
       ...failures,
       ...judgeLayer1(samples, expected),
       ...judgeLayer2(window.layers, slotId, expected),
-      ...judgeLayer3(mine, slotId, expected),
+      ...(check.occupantSource === 'camera' ? [] : judgeLayer3(mine, slotId, expected)),
     ],
   };
 }

@@ -54,6 +54,12 @@ export function subscribeSession(store: MeetingStore, session: BoundMeetingSessi
     // into the same subscription and the same teardown.
     session.on('participantMuteChanged', (event) => store.media.applyParticipantMute(event)),
     session.on('unmuteRequested', (event) => store.media.applyUnmuteRequested(event)),
+    // Story 3 C-C1: per-slot video render state (transitions only — frames
+    // themselves never travel on an event or touch the store), the R-18 notice
+    // latch, and the R-19 camera health. Same subscription, same teardown.
+    session.on('videoSlotRenderChanged', (event) => store.media.applyVideoRender(event)),
+    session.on('captureResumedAfterServerMute', (event) => store.media.applyCaptureResumed(event)),
+    session.on('cameraHealthChanged', (event) => store.media.applyCameraHealth(event)),
   ];
   return () => {
     for (const unsubscribe of unsubscribes) unsubscribe();
@@ -68,10 +74,10 @@ export function subscribeSession(store: MeetingStore, session: BoundMeetingSessi
  * behavior-based unmount-leak test).
  *
  * @returns the reactive store; read `.meetingState` / `.participants` /
- *   `.mediaConnections` / `.lastError`, and `.media.audioMuted` /
- *   `.media.firstMediaFrameMs` / `.media.slots` / `.media.lastMediaFault` /
- *   `.media.serverMutes` / `.media.unmuteRequests`, in
- *   your template.
+ *   `.mediaConnections` / `.lastError`, and `.media.*` (mute, first-media,
+ *   slots, faults, and the per-slot / per-participant / pairing cells
+ *   `.media.slot(id)` / `.media.participant(id)` / `.media.pairOf(senderId)`)
+ *   in your template.
  */
 export function bindMeetingSession(session: BoundMeetingSession): MeetingStore {
   const store = new MeetingStore();

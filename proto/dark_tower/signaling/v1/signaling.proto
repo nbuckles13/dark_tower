@@ -802,11 +802,12 @@ message ServerMuteRequest {
   optional bool audio_muted = 2;
   optional bool video_muted = 3;
 
-  // Optional reason shown to the participant.
+  // Optional free-text reason. Accepted by MC but NOT relayed:
+  // `ParticipantMuteUpdate` has no reason field, so the muted participant
+  // never sees it.
   //
-  // SECURITY: client-controlled when sent by a participant with mute
-  // authority, and echoed to another participant. Consumers MUST truncate
-  // before logging (256-byte bound) and MUST NOT render it as trusted markup.
+  // SECURITY: client-controlled. Consumers MUST truncate before logging
+  // (256-byte bound) and MUST NOT render it as trusted markup.
   string reason = 4;
 }
 

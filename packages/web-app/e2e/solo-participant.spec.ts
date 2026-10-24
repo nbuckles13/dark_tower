@@ -35,7 +35,7 @@ import {
   bootstrapMeeting,
   expectCountersFlatOverWindow,
   joinAsUser,
-  startAudio,
+  startMedia,
   waitForAllMediaConnected,
   waitForJoined,
 } from './fixtures.js';
@@ -63,7 +63,7 @@ test.describe('solo participant: loopback removed (ADR-0036 story 2 R-3)', () =>
     // `crates/env-tests/tests/27_mc_slot_placement.rs`.
     expect(joined.mediaServers.length, 'media_servers must not be empty').toBeGreaterThan(0);
     await waitForAllMediaConnected(page, joined.mediaServers);
-    await startAudio(page);
+    await startMedia(page);
 
     // PRIMARY — the positive control. A specific, non-default wire token: MC's
     // assignment arrived and says "nobody to hear", not merely "not awaiting".
@@ -110,7 +110,7 @@ test.describe('solo participant: loopback removed (ADR-0036 story 2 R-3)', () =>
     // handler-count assertion at this tier.
     expect(joined.mediaServers.length, 'media_servers must not be empty').toBeGreaterThan(0);
     await waitForAllMediaConnected(page, joined.mediaServers);
-    await startAudio(page);
+    await startMedia(page);
 
     const slot = page.getByTestId('slot-0');
     await expect(slot, 'the declared slot must be rendered').toBeVisible();

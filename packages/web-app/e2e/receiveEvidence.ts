@@ -29,9 +29,17 @@ import {
   latestBusEventsOf,
   latestReceiveView,
   MIN_FLAT_WINDOW_SAMPLES,
+  pollBus,
+  VIDEO_SLOT_STATE_LIVENESS_MS,
 } from './fixtures.js';
 import type { InstanceCounters } from './instanceCounters.js';
-import type { JoinedMember } from './cohortContexts.js';
+import type { JoinedMember, Member } from './cohortContexts.js';
+import type { JoinedBusEvent } from './fixtures.js';
+
+/** What the video helpers need of a member: its label and page. */
+export type PageMember = Pick<Member, 'label' | 'page'>;
+/** What the video helpers need of an occupant: its label and its OWN join binding. */
+export type BoundMember = { readonly label: string; readonly joined: JoinedBusEvent };
 import { laneCarriesTone, type BusSlotAssignment, type CohortTone } from './toneDetector.js';
 import { sampleWindow, unpairedObservers } from './windowSampling.js';
 import type { SlotExpectation } from './slotOracle.js';
@@ -39,6 +47,7 @@ import {
   parseSendTracks,
   parseVideoCaptureSource,
   parseReceiveLayers,
+  parseSendCounts,
   parseVideoSlots,
   type VideoSlotsEvent,
 } from './videoBusShape.js';
@@ -49,6 +58,7 @@ import {
   judgeVideoSlot,
   type SendSideExpectation,
   type LayerRow,
+  type VideoWindow,
 } from './videoEvidence.js';
 
 /** One (observed slot, sender) row of layers 1 and 2 (one home: `./videoEvidence`). */
@@ -58,7 +68,7 @@ export type { LayerRow };
 const LAYERS_TIMEOUT_MS = 30_000;
 
 /** The receiver's latest cumulative layer rows (empty before media starts). */
-export async function latestLayers(receiver: JoinedMember): Promise<readonly LayerRow[]> {
+export async function latestLayers(receiver: PageMember): Promise<readonly LayerRow[]> {
   const { receiveLayers } = await latestBusEventsOf(receiver.page, ['receiveLayers']);
   // No event yet (before media starts) is "no rows"; a PRESENT event is held to
   // the exact-key contract (`parseReceiveLayers`).
@@ -72,7 +82,7 @@ export function acceptedFromRows(rows: readonly LayerRow[], senderId: string): n
 
 /** The receiver's latest slot assignments. */
 export async function latestAssignments(
-  receiver: JoinedMember,
+  receiver: PageMember,
 ): Promise<readonly BusSlotAssignment[]> {
   return (await latestReceiveView(receiver.page)).assignments;
 }
@@ -86,38 +96,57 @@ export async function latestAssignments(
  * Nothing here assumes which handler carries the pair.
  */
 export async function expectReceiveLayers(
-  receiver: JoinedMember,
-  sender: JoinedMember,
+  receiver: PageMember,
+  sender: Pick<JoinedMember, 'label' | 'tone'>,
   timeoutMs = LAYERS_TIMEOUT_MS,
 ): Promise<void> {
   const who = `${receiver.label} receiving ${sender.label} (sender ${sender.tone.senderId})`;
-  let last: string;
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const [assignments, rows] = await Promise.all([
-      latestAssignments(receiver),
-      latestLayers(receiver),
-    ]);
-    const slots = assignments.filter((a) => a.senderId === sender.tone.senderId);
-    const mine = rows.filter((r) => r.senderId === sender.tone.senderId);
-    if (slots.length === 1 && slots[0]!.slotState === 'active') {
+  // Through the one bus-cadence kernel; the misrouting `expect` fails at once.
+  const { converged, last } = await pollBus(
+    receiver.page,
+    async (): Promise<{ readonly ok: boolean; readonly detail: string }> => {
+      const [{ assignments, videoSlotIds }, rows] = await Promise.all([
+        latestReceiveView(receiver.page),
+        latestLayers(receiver),
+      ]);
+      const slots = assignments.filter((a) => a.senderId === sender.tone.senderId);
+      const mine = rows.filter((r) => r.senderId === sender.tone.senderId);
+      if (!(slots.length === 1 && slots[0]!.slotState === 'active')) {
+        return { ok: false, detail: `assignment for the sender: ${JSON.stringify(slots)}` };
+      }
       const slot = slots[0]!.slotId;
       const at = mine.find((r) => r.slot === slot);
-      const elsewhere = mine.filter((r) => r.slot !== slot && r.keyed > 0);
+      // The sender's VIDEO frames on this receiver's video slots are legitimate
+      // (story 3); every other slot carrying its frames is misrouting.
+      // RESIDUAL (story 3 C-C1, recorded): layer rows carry no kind, so an AUDIO
+      // datagram MH stamped with a VIDEO slot id would pass this check. The
+      // client cannot catch it either — on the datagram path the relay
+      // `stream_id` is quarantined (it never decides drop-or-play,
+      // `sdk-core pipeline/ingress.ts`), and the video stream path never sees a
+      // datagram. It IS caught at MH: per-stream attribution keeps audio out of
+      // video slots (R-20), proved by media-handler's Rust env-tests (MH-A1,
+      // per-stream attribution / mixed meeting).
+      const elsewhere = mine.filter(
+        (r) =>
+          r.slot !== slot &&
+          r.keyed > 0 &&
+          !(typeof r.slot === 'number' && videoSlotIds.has(r.slot)),
+      );
       expect(
         elsewhere,
         `${who}: frames keyed to the sender arrived on a slot other than its assigned slot ${slot} ` +
           `— MISROUTING (layer 1): ${JSON.stringify(elsewhere)}`,
       ).toEqual([]);
-      if (at !== undefined && at.keyed > 0 && at.verified > 0) return;
-      last = `slot ${slot} active; layer row ${JSON.stringify(at ?? null)}`;
-    } else {
-      last = `assignment for the sender: ${JSON.stringify(slots)}`;
-    }
-    if (Date.now() > deadline) break;
-    await receiver.page.waitForTimeout(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS);
-  }
-  throw new Error(`${who}: layers 1/2 not established within ${timeoutMs}ms — ${last}`);
+      return {
+        ok: at !== undefined && at.keyed > 0 && at.verified > 0,
+        detail: `slot ${slot} active; layer row ${JSON.stringify(at ?? null)}`,
+      };
+    },
+    (v) => v.ok,
+    timeoutMs,
+  );
+  if (converged) return;
+  throw new Error(`${who}: layers 1/2 not established within ${timeoutMs}ms — ${last.detail}`);
 }
 
 /**
@@ -152,8 +181,8 @@ export interface Probe {
 
 /** Frames from `sender` accepted at `receiver` (layer 2, summed over slots). */
 export function acceptedProbe(
-  receiver: JoinedMember,
-  sender: JoinedMember,
+  receiver: PageMember,
+  sender: Pick<JoinedMember, 'label' | 'tone'>,
   expectation: ProbeExpectation,
 ): Probe {
   return {
@@ -182,7 +211,7 @@ export function keyedProbe(
 }
 
 /** `member`'s own send counter (datagrams sent, all targets). */
-export function sentProbe(member: JoinedMember, expectation: ProbeExpectation): Probe {
+export function sentProbe(member: PageMember, expectation: ProbeExpectation): Probe {
   return {
     label: `${member.label}.framesSent`,
     observer: member.label,
@@ -290,8 +319,8 @@ export async function waitForSenderSlotState(
 
 /** Poll until `attribute` on the receiver's roster row for `subject` reads `value`. */
 export async function waitForRosterToken(
-  receiver: JoinedMember,
-  subject: JoinedMember,
+  receiver: PageMember,
+  subject: BoundMember,
   attribute: 'data-reachability' | 'data-server-muted' | 'data-client-muted',
   value: string,
   timeoutMs = 20_000,
@@ -340,7 +369,9 @@ export interface VideoSlotExpectation {
   readonly slotId: number;
   readonly expectation: SlotExpectation;
   /** The expected occupant, for its JOIN-BOUND sender id (never its own announcement). */
-  readonly occupant?: JoinedMember;
+  readonly occupant?: BoundMember;
+  /** The occupant captures from the real camera: layer 3 does not apply (`videoEvidence.ts`). */
+  readonly occupantSource?: 'test_pattern' | 'camera';
 }
 
 /**
@@ -348,7 +379,7 @@ export interface VideoSlotExpectation {
  * binding, never a self-announcement and never its audio tone (a video-only
  * publisher has no tone). Absent is a HARNESS error, never a default.
  */
-export function joinBoundSenderId(member: JoinedMember): string {
+export function joinBoundSenderId(member: BoundMember): string {
   const senderId = member.joined.senderId;
   if (senderId === undefined || senderId === '') {
     throw new Error(
@@ -366,11 +397,23 @@ export function joinBoundSenderId(member: JoinedMember): string {
  * failing slot.
  */
 export async function expectVideoSlots(
-  receiver: JoinedMember,
+  receiver: PageMember,
   slots: readonly VideoSlotExpectation[],
   why: string,
   { observeMs = FLAT_WINDOW_OBSERVE_MS } = {},
 ): Promise<void> {
+  assertVideoWindow(receiver, slots, await sampleVideoWindow(receiver, why, { observeMs }), why);
+}
+
+/**
+ * Sample the receiver's `videoSlots` and `receiveLayers` together over ONE
+ * window on the shared stop rule (`./windowSampling`; samples counted by order).
+ */
+export async function sampleVideoWindow(
+  receiver: PageMember,
+  why: string,
+  { observeMs = FLAT_WINDOW_OBSERVE_MS } = {},
+): Promise<VideoWindow> {
   const rounds = await sampleWindow({
     sample: async (): Promise<[VideoSlotsEvent, readonly LayerRow[]]> => {
       const { videoSlots, receiveLayers } = await latestBusEventsOf(receiver.page, [
@@ -391,7 +434,16 @@ export async function expectVideoSlots(
     intervalMs: E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS,
     why,
   });
-  const window = { slots: rounds.map((r) => r[0]), layers: rounds.map((r) => r[1]) };
+  return { slots: rounds.map((r) => r[0]), layers: rounds.map((r) => r[1]) };
+}
+
+/** Judge every listed slot over one sampled window; throw once, naming each failing slot. */
+export function assertVideoWindow(
+  receiver: PageMember,
+  slots: readonly VideoSlotExpectation[],
+  window: VideoWindow,
+  why: string,
+): void {
   assertVideoSlots(
     `${receiver.label} (${why})`,
     slots.map((s) =>
@@ -400,6 +452,7 @@ export async function expectVideoSlots(
           slotId: s.slotId,
           expectation: s.expectation,
           ...(s.occupant !== undefined ? { expectedSenderId: joinBoundSenderId(s.occupant) } : {}),
+          ...(s.occupantSource !== undefined ? { occupantSource: s.occupantSource } : {}),
         },
         window,
       ),
@@ -409,9 +462,9 @@ export async function expectVideoSlots(
 
 /** Assert `member`'s send tracks against the scenario's directive/mute/health facts. */
 export async function expectSendTracks(
-  member: JoinedMember,
+  member: PageMember,
   want: SendSideExpectation,
-  timeoutMs = 20_000,
+  timeoutMs = VIDEO_SLOT_STATE_LIVENESS_MS,
 ): Promise<void> {
   await expect
     .poll(
@@ -426,7 +479,7 @@ export async function expectSendTracks(
 }
 
 /** Assert `member`'s announced test pattern names its own join-bound sender id. */
-export async function expectPatternAnnounced(member: JoinedMember): Promise<void> {
+export async function expectPatternAnnounced(member: PageMember & BoundMember): Promise<void> {
   const { videoCaptureSource } = await latestBusEventsOf(member.page, ['videoCaptureSource']);
   if (videoCaptureSource === undefined) {
     throw new Error(`${member.label}: no videoCaptureSource on the bus (capture never started?)`);
@@ -438,4 +491,45 @@ export async function expectPatternAnnounced(member: JoinedMember): Promise<void
     ),
     `${member.label}: announced pattern source`,
   ).toEqual([]);
+}
+
+/** `member`'s VIDEO send counter (`sendCounts.video.framesSent`), the camera-light corroboration. */
+export function videoSentProbe(member: PageMember, expectation: ProbeExpectation): Probe {
+  return {
+    label: `${member.label}.videoFramesSent`,
+    observer: member.label,
+    expect: expectation,
+    read: async () => {
+      const { sendCounts } = await latestBusEventsOf(member.page, ['sendCounts']);
+      if (sendCounts === undefined)
+        throw new Error(`${member.label}: no sendCounts sample on the bus`);
+      return parseSendCounts(sendCounts).video.framesSent;
+    },
+  };
+}
+
+/** `member`'s total keyframes PRODUCED (all causes), from its own bus. */
+export async function keyframesProduced(member: PageMember): Promise<number> {
+  const { sendCounts } = await latestBusEventsOf(member.page, ['sendCounts']);
+  if (sendCounts === undefined) throw new Error(`${member.label}: no sendCounts sample on the bus`);
+  const { keyframes } = parseSendCounts(sendCounts).video;
+  return Object.values(keyframes).reduce((a, b) => a + b, 0);
+}
+
+/** Frames verified-and-decrypted at `receiver` from `senderId` on video slot `slotId` (layer 2). */
+export function videoVerifiedProbe(
+  receiver: PageMember,
+  slotId: number,
+  senderId: string,
+  expectation: ProbeExpectation,
+): Probe {
+  return {
+    label: `${receiver.label}.verified(slot ${slotId}, sender ${senderId})`,
+    observer: receiver.label,
+    expect: expectation,
+    read: async () =>
+      (await latestLayers(receiver))
+        .filter((r) => r.slot === slotId && r.senderId === senderId)
+        .reduce((sum, r) => sum + r.verified, 0),
+  };
 }

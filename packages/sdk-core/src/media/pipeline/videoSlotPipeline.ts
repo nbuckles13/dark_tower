@@ -190,6 +190,8 @@ export class VideoSlotPipeline {
   #mcState: SlotStateToken | undefined;
   #render: VideoRenderState = { kind: 'none' };
   #lastRenderedSender: number | undefined;
+  /** Frames this slot's decoder produced within bounds (cumulative; R-32 evidence, a count only). */
+  #framesDecoded = 0;
   /** When this slot last turned ACTIVE, until its first draw. */
   #activeEnteredAtMs: number | undefined;
 
@@ -229,6 +231,11 @@ export class VideoSlotPipeline {
   /** The VERIFIED sender of the last frame drawn, or `undefined` before any draw. */
   get lastRenderedSender(): number | undefined {
     return this.#lastRenderedSender;
+  }
+
+  /** Frames decoded within bounds so far (cumulative). A count only: no timing, no size. */
+  get framesDecoded(): number {
+    return this.#framesDecoded;
   }
 
   /** The verified sender this slot is live with, for the pairing view. */
@@ -575,6 +582,7 @@ export class VideoSlotPipeline {
       this.#pump();
       return;
     }
+    this.#framesDecoded += 1;
     this.#o.onDecoded(meta.senderId);
     this.#offer(frame, meta);
     this.#pump();
