@@ -166,10 +166,14 @@ readonly VP8_PROBE_SUBCHECKS=(webcodecs_unavailable encoder_config_unsupported d
 # included, + ~80s for 39), which broke the former 600s, and later story tasks add more
 # env-tests. Re-measure from layer-7-env-test.log's per-binary "finished in" lines before
 # changing it. The browser default covers the Vite dev-server start (60s webServer
-# ceiling) + the specs' own 120s/test ceilings. Both defaults are restated in
+# ceiling) + the specs' own 120s/test ceilings; the suite measured ~556s on 2026-10-24
+# (story 3 task 17 added eight video specs + a video partial-connectivity case to the
+# former ~4 min), which left the former 600s no headroom, so 1500s keeps the measured
+# suite under 40% of the budget. Re-measure from layer-7-browser-e2e.log's final
+# "N passed (Xm)" line before changing it. Both defaults are restated in
 # docs/runbooks/devloop-validation.md §6.7, pinned by scripts/layer7.test.sh.
 ENV_TEST_TIMEOUT="${DEVLOOP_ENV_TEST_TIMEOUT:-900}"
-BROWSER_E2E_TIMEOUT="${DEVLOOP_BROWSER_E2E_TIMEOUT:-600}"
+BROWSER_E2E_TIMEOUT="${DEVLOOP_BROWSER_E2E_TIMEOUT:-1500}"
 
 # -----------------------------------------------------------------------------
 # Browser-E2E: ALWAYS RUN whenever Layer 7 runs (2026-08-20)

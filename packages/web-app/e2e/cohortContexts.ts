@@ -28,18 +28,27 @@ import { expect, type Browser, type BrowserContext, type Page } from 'playwright
 import {
   assertTokenOnlyJoinTraffic,
   authAsCohortMember,
+  expectBuildKnobs,
+  expectDeclaredReceiveSlots,
   flushTelemetry,
   joinAsUser,
+  joinWithPublishViaUi,
+  latestBusEventsOf,
   readOwnTone,
   recordRequests,
-  startAudio,
+  startMedia,
   suiteCohort,
   waitForAllMediaConnected,
   waitForJoined,
   type JoinedBusEvent,
 } from './fixtures.js';
 import type { CohortTone } from './toneDetector.js';
-import { SUITE_AUDIO_RECEIVE_SLOTS, type PublishSet } from './cohort.js';
+import {
+  SUITE_AUDIO_RECEIVE_SLOTS,
+  leversForPlan,
+  type CohortMemberPlan,
+  type PublishSet,
+} from './cohort.js';
 
 /** The per-context levers, as the app's `parseTestLevers` accepts them. */
 export interface ContextLevers {
@@ -56,6 +65,8 @@ export interface ContextLevers {
   readonly publish?: PublishSet;
   /** video M, the `VITE_DT_VIDEO_RECEIVE_SLOTS` form (parsed by the app since C-A1). */
   readonly videoReceiveSlots?: string;
+  /** Story 3 C-C1: capture from the REAL (fake-device) camera instead of the test pattern. */
+  readonly forceCameraCapture?: boolean;
 }
 
 /** One cohort member's browsing context. */
@@ -87,8 +98,11 @@ export async function openMember(
   browser: Browser,
   index: number,
   levers?: ContextLevers,
+  /** Test-owned init scripts installed before any page script (e.g. `installVideoTrackRecorder`). */
+  beforeNavigate?: (context: BrowserContext) => Promise<void>,
 ): Promise<Member> {
   const context = await browser.newContext();
+  if (beforeNavigate !== undefined) await beforeNavigate(context);
   if (levers !== undefined) {
     await context.addInitScript((value) => {
       (window as { __dt_test_levers__?: unknown }).__dt_test_levers__ = value;
@@ -116,25 +130,51 @@ export async function joinMember(
     expectedSlots = SUITE_AUDIO_RECEIVE_SLOTS,
   }: { expectAllHandlers?: boolean; expectedSlots?: number } = {},
 ): Promise<JoinedMember> {
+  const { joined, result: tone } = await recordedJoin(member, {
+    join: (page) => joinAsUser(page, meetingCode),
+    expectAllHandlers,
+    inside: () => readOwnTone(member.page, member.label, expectedSlots),
+  });
+  return { ...member, joined, tone };
+}
+
+/**
+ * THE ONE recorded join window (both join helpers delegate here): the token-only
+ * credential scan's recording spans the join, the handler connections, media
+ * start, the caller's in-window checks (`inside`) and a FORCED telemetry export
+ * (the scan's positive control), and is stopped and scanned on every path.
+ */
+async function recordedJoin<T>(
+  member: Member,
+  {
+    join,
+    expectAllHandlers,
+    inside,
+  }: {
+    join: (page: Member['page']) => Promise<void>;
+    expectAllHandlers: boolean;
+    inside: (joined: JoinedBusEvent) => Promise<T>;
+  },
+): Promise<{ joined: JoinedBusEvent; result: T }> {
   const creds = suiteCohort()[member.index];
   if (creds === undefined) throw new RangeError(`no cohort member ${member.index}`);
   const recorder = recordRequests(member.context);
   let stopped = false;
   try {
-    await joinAsUser(member.page, meetingCode);
+    await join(member.page);
     const joined = await waitForJoined(member.page);
     expect(
       joined.mediaServers.length,
       `${member.label}: media_servers must not be empty`,
     ).toBeGreaterThan(0);
     if (expectAllHandlers) await waitForAllMediaConnected(member.page, joined.mediaServers);
-    await startAudio(member.page);
-    const tone = await readOwnTone(member.page, member.label, expectedSlots);
+    await startMedia(member.page);
+    const result = await inside(joined);
     // The positive control's forced export, INSIDE the window.
     await flushTelemetry(member.page);
     stopped = true;
     assertTokenOnlyJoinTraffic(recorder.stop(), creds, `${member.label}/join`);
-    return { ...member, joined, tone };
+    return { joined, result };
   } finally {
     if (!stopped) recorder.stop();
   }
@@ -202,4 +242,100 @@ export async function closeMembers(members: ReadonlyArray<Member | undefined>): 
 /** The cohort's announced tones, for the two-sided detector. */
 export function tonesOf(members: readonly JoinedMember[]): CohortTone[] {
   return members.map((m) => m.tone);
+}
+
+// ---------------------------------------------------------------------------
+// Story 3 C-C1: plan members (publish set + per-kind N / M per context)
+// ---------------------------------------------------------------------------
+
+/** A plan member after its join + media start. `tone` exists only for audio publishers. */
+export interface PlanMember extends Member {
+  readonly joined: JoinedBusEvent;
+  readonly plan: CohortMemberPlan;
+  /** The meeting-scoped sender id from the member's OWN join binding (stringified). */
+  readonly senderId: string;
+  readonly tone: CohortTone | undefined;
+}
+
+/** Whether a plan publishes `kind`. */
+export function planPublishes(plan: CohortMemberPlan, kind: 'audio' | 'video'): boolean {
+  return plan.publish === 'both' || plan.publish === kind;
+}
+
+/** The per-context levers for a plan member: N and M (the publish set is driven through the DOM chooser). */
+export function planLevers(
+  plan: CohortMemberPlan,
+  extra: Omit<ContextLevers, 'audioReceiveSlots' | 'videoReceiveSlots' | 'publish'> = {},
+): ContextLevers {
+  const { audioReceiveSlots, videoReceiveSlots } = leversForPlan(plan);
+  return { ...extra, audioReceiveSlots, videoReceiveSlots };
+}
+
+/** Open a plan member's context (its N / M levers installed). */
+export async function openPlanMember(
+  browser: Browser,
+  index: number,
+  plan: CohortMemberPlan,
+  extra: Omit<ContextLevers, 'audioReceiveSlots' | 'videoReceiveSlots' | 'publish'> = {},
+  beforeNavigate?: (context: BrowserContext) => Promise<void>,
+): Promise<Member> {
+  return openMember(browser, index, planLevers(plan, extra), beforeNavigate);
+}
+
+/**
+ * Join as a PLAN member: the publish set is chosen THROUGH THE DOM CHOOSER
+ * (`joinWithPublishViaUi`, R-2), media is started, and inside the same recorded
+ * window the member asserts its build knobs (incl. the test pattern), its
+ * EFFECTIVE N and M (`expectDeclaredReceiveSlots`, so a reused dev server or a
+ * dropped lever fails loudly), its effective publish set from the bus, and —
+ * for an audio publisher — its own tone. Joins are serialised by the caller
+ * (the oracle's input is the join order, paired-test F5).
+ */
+export async function joinPlanMember(
+  member: Member,
+  meetingCode: string,
+  plan: CohortMemberPlan,
+  {
+    expectAllHandlers = true,
+    videoCap = 'admits',
+  }: { expectAllHandlers?: boolean; videoCap?: 'admits' | 'truncates' } = {},
+): Promise<PlanMember> {
+  const publishesAudio = planPublishes(plan, 'audio');
+  const publishesVideo = planPublishes(plan, 'video');
+  const { joined, result: tone } = await recordedJoin(member, {
+    join: (page) =>
+      joinWithPublishViaUi(page, meetingCode, { audio: publishesAudio, video: publishesVideo }),
+    expectAllHandlers,
+    inside: async () => {
+      await expectBuildKnobs(member.page, member.label);
+      await expectDeclaredReceiveSlots(
+        member.page,
+        member.label,
+        plan.audioReceiveSlots,
+        plan.videoReceiveSlots,
+        videoCap,
+      );
+      const { receiveSlots } = await latestBusEventsOf(member.page, ['receiveSlots']);
+      expect(
+        receiveSlots?.['publish'],
+        `${member.label}: the session's EFFECTIVE publish set must be the plan's (chooser -> SDK)`,
+      ).toEqual([...(publishesAudio ? ['audio'] : []), ...(publishesVideo ? ['video'] : [])]);
+      return publishesAudio
+        ? readOwnTone(member.page, member.label, 'checked-by-caller')
+        : undefined;
+    },
+  });
+  const senderId = joined.senderId;
+  if (senderId === undefined || senderId === '') {
+    throw new Error(`HARNESS: ${member.label}'s joined bus event carries no senderId`);
+  }
+  return { ...member, joined, plan, senderId, tone };
+}
+
+/** Narrow a plan member to the story-2 audio member shape (it must publish audio). */
+export function asAudioMember(m: PlanMember): JoinedMember {
+  if (m.tone === undefined) {
+    throw new Error(`HARNESS: ${m.label} publishes no audio, so it has no tone`);
+  }
+  return { ...m, tone: m.tone };
 }

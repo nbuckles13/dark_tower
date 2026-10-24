@@ -610,6 +610,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         firstMediaFrame: (elapsedMs) => this.emit('firstMediaFrame', elapsedMs),
         mediaFault: (fault) => this.emit('mediaFault', fault),
         videoSlotRenderChanged: (e) => this.emit('videoSlotRenderChanged', e),
+        cameraHealthChanged: (e) => this.emit('cameraHealthChanged', e),
       },
       mediaState: this.#mediaState,
     });

@@ -51,9 +51,18 @@ test('reacts to each SDK event', () => {
     audioServerMuted: true,
     videoServerMuted: false,
   });
-  expect(store.media.serverMutes.has('b')).toBe(true);
+  expect(store.media.participant('b').audioServerMuted).toBe(true);
   session.fire('unmuteRequested', { participantId: 'b' });
-  expect(store.media.unmuteRequests.has('b')).toBe(true);
+  expect(store.media.participant('b').unmuteRequested).toBe(true);
+
+  // Story 3 C-C1: render state, the R-18 latch and camera health, same binding.
+  session.fire('videoSlotRenderChanged', { slotId: 4, state: { kind: 'active', senderId: 9 } });
+  expect(store.media.slot(4).render).toEqual({ kind: 'active', senderId: 9 });
+  expect(store.media.pairOf(9).videoSlotId).toBe(4);
+  session.fire('captureResumedAfterServerMute', { kind: 'video' });
+  expect(store.media.resumeNoticePending('video')).toBe(true);
+  session.fire('cameraHealthChanged', { failure: 'ended' });
+  expect(store.media.cameraFailure).toBe('ended');
 });
 
 test("the roster carries each participant's sender id through, never coerced", () => {
@@ -91,7 +100,13 @@ test('aggregate unsubscribe stops all further updates', () => {
     audioServerMuted: true,
     videoServerMuted: false,
   });
-  expect(store.media.serverMutes.size).toBe(0);
+  session.fire('captureResumedAfterServerMute', { kind: 'audio' });
+  session.fire('videoSlotRenderChanged', { slotId: 4, state: { kind: 'unavailable' } });
+  session.fire('cameraHealthChanged', { failure: 'ended' });
+  expect(store.media.participant('x').audioServerMuted).toBe(false);
+  expect(store.media.resumeNoticePending('audio')).toBe(false);
+  expect(store.media.slot(4).render).toBeUndefined();
+  expect(store.media.cameraFailure).toBeUndefined();
   expect(store.meetingState).toBe(MeetingSessionState.Joined);
   expect(store.participants).toEqual([]);
   expect(store.mediaConnections).toEqual([]);

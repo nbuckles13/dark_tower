@@ -284,3 +284,27 @@ describe('import rule', () => {
     expect(mcCoupling("import type { PublishSet } from './cohort.js';")).toEqual([]);
   });
 });
+
+describe('the oracle vocabulary is NARROW (story 3 C-C1 fold)', () => {
+  test('it can never expect a never-emitted state or unspecified', async () => {
+    const { EXPECTED_SLOT_STATES } = await import('../e2e/slotOracle.js');
+    for (const never of [
+      'switch_pending',
+      'withheld_by_congestion',
+      'source_unreachable',
+      'unspecified',
+    ]) {
+      expect(EXPECTED_SLOT_STATES as readonly string[]).not.toContain(never);
+    }
+    expect([...EXPECTED_SLOT_STATES].sort()).toEqual(
+      [
+        'active',
+        'avatar_client_muted',
+        'avatar_no_video',
+        'avatar_server_muted',
+        'fewer_sources_than_slots',
+        'unavailable',
+      ].sort(),
+    );
+  });
+});

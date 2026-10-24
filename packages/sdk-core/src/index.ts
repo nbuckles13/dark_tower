@@ -83,6 +83,11 @@ export { NetworkError, NetworkErrorReason } from './errors/NetworkError.js';
 
 export { ValidationError } from './errors/ValidationError.js';
 
+// The client's display-name bound (`validateDisplayName`). Exported so an
+// embedder that RENDERS MC-relayed names bounds them with the same value rather
+// than minting a second name bound (story 3 C-C1).
+export { MAX_DISPLAY_NAME_LENGTH } from './validation/limits.js';
+
 export { SignalingError, SignalingErrorCode } from './errors/SignalingError.js';
 export type { RedactedSignalingError, SignalingErrorOptions } from './errors/SignalingError.js';
 
@@ -261,6 +266,7 @@ export {
   DEFAULT_METRIC_EXPORT_INTERVAL_MS,
   DEFAULT_RECEIVE_AUDIO_SLOTS,
   DEFAULT_RECEIVE_VIDEO_SLOTS,
+  DEFAULT_PUBLISH,
   RECEIVE_SLOTS_VARIABLES,
   RETIRED_RECEIVE_SLOTS_MESSAGE,
   RETIRED_RECEIVE_SLOTS_VARIABLE,
@@ -310,6 +316,7 @@ export type {
 export { VideoPublisher } from './media/lifecycle/VideoPublisher.js';
 export type {
   VideoPublisherOptions,
+  VideoSendCounts,
   VideoSendDirective,
 } from './media/lifecycle/VideoPublisher.js';
 export { VideoReceiver } from './media/lifecycle/VideoReceiver.js';
@@ -328,6 +335,7 @@ export {
   MEDIA_KEK_INSTALL_REFUSALS,
   MEDIA_KEK_RETENTION_ANOMALIES,
   MEDIA_KEK_SOURCES,
+  MEDIA_CAPTURE_FAILURE_OUTCOMES,
   MEDIA_KEYFRAME_SOURCES,
   MEDIA_MUTE_ACTIONS,
   MEDIA_KIND_LABELS,
@@ -344,7 +352,9 @@ export type {
   MediaKekInstallRefusal,
   MediaKekRetentionAnomaly,
   MediaKekSource,
+  MediaCaptureFailureOutcome,
   MediaCaptureSourceMode,
+  MediaKeyframeSource,
   MediaKindLabel,
   MediaMetricIdentity,
   MediaMuteAction,
@@ -376,6 +386,14 @@ export type {
 export { CaptureFailure, MediaCaptureError, listMicrophones } from './media/setup/capture.js';
 export { AudioCodecUnsupportedError } from './media/setup/opus.js';
 export { VideoCodecUnsupportedError, probeVp8Support } from './media/setup/vp8.js';
+/**
+ * @internal The SDK's default camera capture factory. Exported for ONE
+ * consumer: the demo app's test-levers-build-only `forceCameraCapture` lever
+ * (`web-app/src/lib/testLevers.ts`), which injects it as
+ * `MeetingSessionOptions.videoCaptureFactory` so a test-pattern build can run
+ * one context on the real (fake-device) camera. Not an embedder API.
+ */
+export { createCameraCapture } from './media/setup/videoCapture.js';
 export { createVideoDecoder } from './media/setup/vp8Decoder.js';
 export type { Vp8Profile, Vp8ProbeApi } from './media/setup/vp8.js';
 export {
@@ -425,6 +443,7 @@ export { buildPublisherRegion, writeHopSequence } from './media/frame/frameCodec
 export type { PublisherRegionInput } from './media/frame/frameCodec.js';
 
 export type {
+  CameraHealthChangedEvent,
   CaptureResumedAfterServerMuteEvent,
   CaptureSourceInfo,
   VideoCaptureSourceInfo,

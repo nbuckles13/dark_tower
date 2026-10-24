@@ -157,6 +157,10 @@
 #   It covers VIDEO only — audio still opens the microphone unless the test
 #   tone is on — so the one-machine multi-participant launch is:
 #       DT_TEST_TONE=1 DT_TEST_PATTERN=1 scripts/dev-web.sh
+#   In each tab, tick "Camera" in the join view's publish-set chooser before
+#   Join (the chooser starts from the SDK default, microphone only; what a
+#   participant publishes is fixed for the meeting), then press "Start media".
+#   Each participant's video tiles pair with its audio rows by participant.
 #   Like N and M it is ONE setting per dev server: every tab and profile this
 #   server serves gets the pattern, or none does — there is no per-tab mix of
 #   a real camera and test patterns. A demo with participants on other
@@ -982,6 +986,7 @@ echo "   THIS machine — demo Chrome profiles recommended, one per participant 
 echo "   in as a DISTINCT registered account, all joining the same meeting code."
 echo "   Audio for N-way: the test-tone build (DT_TEST_TONE=1 -> __DT_TEST_TONE__, see --help), not one shared mic."
 echo "   Video for N-way: the test-pattern build (DT_TEST_PATTERN=1 -> __DT_TEST_PATTERN__, see --help VIDEO DEMO), not one shared camera."
+echo "   To send video: in each tab tick Camera in the join view before Join (default is microphone only), then Start media."
 echo
 # Launch through the Nx `dev` target, NOT `pnpm --filter … dev`. The web-app
 # `dev` target declares `dependsOn: proto-gen:codegen`, so Nx generates the

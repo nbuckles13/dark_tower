@@ -126,6 +126,7 @@ async function makeRig(opts: RigOptions = {}) {
   let encodersBuilt = 0;
   const reports: Array<{ kind: string; muted: boolean }> = [];
   const faults: MediaFault[] = [];
+  const healthChanges: Array<string | undefined> = [];
   const transmitKeys = new TransmitKeyManager(258);
   const publisher = new VideoPublisher({
     config: opts.config ?? DEFAULT_CLIENT_CONFIG.media,
@@ -158,6 +159,7 @@ async function makeRig(opts: RigOptions = {}) {
     },
     openStream: (url) => mocks.get(url)?.createUnidirectionalStream(),
     fault: (f) => faults.push(f),
+    onCameraHealthChanged: (failure) => healthChanges.push(failure),
     clock: time.now,
     setTimeout: time.setTimeout,
     clearTimeout: time.clearTimeout,
@@ -215,6 +217,7 @@ async function makeRig(opts: RigOptions = {}) {
     encodersBuilt: () => encodersBuilt,
     reports,
     faults,
+    healthChanges,
     transmitKeys,
     directive,
     capture,
@@ -512,6 +515,64 @@ describe('VideoPublisher — R-19 camera failure', () => {
     // Lifted only once the track is live.
     expect(r.mute.videoMuted).toBe(false);
     expect(r.reports.at(-1)).toEqual({ kind: 'video', muted: false });
+  });
+});
+
+describe('VideoPublisher — camera health and send counts (story 3 C-C1)', () => {
+  it('reports the latched failure on TRANSITIONS only, and clears it when a user unmute succeeds', async () => {
+    let fail = true;
+    const r = await makeRig({
+      captureFails: () =>
+        fail ? new MediaCaptureError(CaptureFailure.PermissionDenied, 'denied') : undefined,
+    });
+    r.publisher.start();
+    expect(r.publisher.cameraFailure).toBeUndefined();
+    r.publisher.setDirective(r.directive([A]));
+    await settle();
+    expect(r.healthChanges).toEqual(['permission_denied']);
+    expect(r.publisher.cameraFailure).toBe('permission_denied');
+    // Watcher churn is not a transition.
+    r.publisher.setDirective(r.directive([]));
+    r.publisher.setDirective(r.directive([A]));
+    await settle();
+    expect(r.healthChanges).toEqual(['permission_denied']);
+    fail = false;
+    r.publisher.setMuted(false);
+    await settle();
+    expect(r.healthChanges).toEqual(['permission_denied', undefined]);
+    expect(r.publisher.cameraFailure).toBeUndefined();
+  });
+
+  it('an ENDED track reports ended; the successful restore retry clears it', async () => {
+    const r = await makeRig();
+    r.publisher.start();
+    r.publisher.setDirective(r.directive([A]));
+    await settle();
+    r.cameras[0]!.onEnded?.();
+    expect(r.healthChanges).toEqual(['ended']);
+    r.publisher.setDirective(r.directive([]));
+    r.publisher.setDirective(r.directive([A]));
+    await settle();
+    expect(r.healthChanges).toEqual(['ended', undefined]);
+  });
+
+  it('sendTotals: frames written and keyframes by cause, counts only, zero before video flows', async () => {
+    const r = await makeRig();
+    expect(r.publisher.sendTotals()).toEqual({
+      framesSent: 0,
+      keyframes: { directive_start: 0, request: 0, abandonment: 0 },
+    });
+    r.publisher.start();
+    r.publisher.setDirective(r.directive([A]));
+    await settle();
+    r.capture();
+    r.flush();
+    await settle();
+    const counts = r.publisher.sendTotals();
+    expect(counts.keyframes.directive_start).toBe(1);
+    expect(counts.framesSent).toBe(r.publisher.egress?.framesSent);
+    expect(counts.framesSent).toBeGreaterThan(0);
+    expect(Object.keys(counts).sort()).toEqual(['framesSent', 'keyframes']);
   });
 });
 

@@ -7,6 +7,8 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { MeetingSessionState, SdkError, SdkErrorCode } from '@darktower/sdk-core';
 import type { MediaFrameCounts } from '@darktower/sdk-core';
 import { E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS, installE2EHooks } from '../lib/e2eBus.js';
+import { createE2EInstrumentation, type E2EInstrumentation } from '../lib/e2eAnalysis.js';
+import { parseSendCounts, parseVideoSlots } from '../../e2e/videoBusShape.js';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
 
 /** Build a `MediaFrameCounts` from a partial, so a test states only what it varies. */
@@ -121,7 +123,8 @@ test('first-media and mute-state project exactly their whitelisted scalars', () 
 
   const mutes = events().filter((e) => e['type'] === 'muteState');
   expect(mutes.map((e) => e['audioMuted'])).toEqual([true, false]);
-  expect(Object.keys(mutes[0] ?? {}).sort()).toEqual(['audioMuted', 'type']);
+  expect(mutes.map((e) => e['videoMuted'])).toEqual([false, false]);
+  expect(Object.keys(mutes[0] ?? {}).sort()).toEqual(['audioMuted', 'type', 'videoMuted']);
 });
 
 test('media faults are NOT projected onto the bus', () => {
@@ -220,8 +223,13 @@ test('receiveSlots: publish set, N, M, sources and per-kind caps are projected o
   const session = new MockMeetingSession();
   session.receiveSlots = {
     publish: ['audio'],
-    audio: { declared: 3, source: 'configured', serverCap: { state: 'known', value: 8 } },
-    video: { declared: 0, source: 'default', serverCap: { state: 'unknown' } },
+    audio: {
+      declared: 3,
+      slotIds: [0, 1, 2],
+      source: 'configured',
+      serverCap: { state: 'known', value: 8 },
+    },
+    video: { declared: 0, slotIds: [], source: 'default', serverCap: { state: 'unknown' } },
   };
   install(session);
   session.fire('joined', {
@@ -489,6 +497,7 @@ test('buildKnobs reports the levers define and whether telemetry is configured',
   expect(events().find((e) => e['type'] === 'buildKnobs')).toEqual({
     type: 'buildKnobs',
     testLevers: false, // the vitest define
+    testPattern: false, // the vitest define
     telemetryConfigured: true,
     // No SDK telemetry is configured under this test runner: intent alone is not state.
     telemetrySinkActive: false,
@@ -509,4 +518,170 @@ test('flushMetrics REJECTS when the config asked for telemetry but the SDK holds
   await expect(window.__darktower_test__!.flushMetrics()).rejects.toThrow(
     'telemetry_not_configured',
   );
+});
+
+// ---------------------------------------------------------------------------
+// Story 3 C-C1: videoSlots + sendCounts, round-tripped through the e2e
+// contract's strict parsers (`e2e/videoBusShape.ts` is THE contract)
+// ---------------------------------------------------------------------------
+
+function videoInstrumentation(
+  surfaces: Record<number, { framesRendered: number; lumas: number[] | undefined }>,
+): E2EInstrumentation {
+  const real = createE2EInstrumentation();
+  if (real === undefined) throw new Error('E2E instrumentation absent under __E2E_HOOKS__');
+  return {
+    ...real,
+    // Honour `withLumas` like the real sampler: no lumas unless asked.
+    surface: (slotId, { withLumas }) => {
+      const s = surfaces[slotId];
+      return s === undefined ? undefined : { ...s, lumas: withLumas ? s.lumas : undefined };
+    },
+  };
+}
+
+const LUMAS = Array.from({ length: 24 }, (_, i) => (i % 2 === 0 ? 255 : 0));
+
+test('videoSlots projects the allowlisted per-slot fields and round-trips the strict parser', async () => {
+  vi.useFakeTimers();
+  try {
+    const session = new MockMeetingSession();
+    session.videoReceive = {
+      setVideoSink: () => undefined,
+      evidence: () => session.videoEvidence,
+      unfulfilledSnapshot: () => [],
+    };
+    session.videoEvidence = [
+      // Live, painted: lumas present, the VERIFIED sender stringified.
+      {
+        slotId: 3,
+        mcState: 'active',
+        render: 'active',
+        lastRenderedSender: 258,
+        unfulfilled: false,
+        framesDecoded: 9,
+      },
+      // Avatar: no lumas even though the surface has a paint history.
+      {
+        slotId: 4,
+        mcState: 'avatar_client_muted',
+        render: 'avatar',
+        lastRenderedSender: undefined,
+        unfulfilled: false,
+        framesDecoded: 0,
+      },
+      // MC has not named it yet: OMITTED (no placeholder token).
+      {
+        slotId: 5,
+        mcState: undefined,
+        render: 'none',
+        lastRenderedSender: undefined,
+        unfulfilled: false,
+        framesDecoded: 0,
+      },
+    ];
+    disposers.push(
+      installE2EHooks(
+        session,
+        videoInstrumentation({
+          3: { framesRendered: 7, lumas: LUMAS },
+          4: { framesRendered: 2, lumas: LUMAS },
+        }),
+      ),
+    );
+    vi.advanceTimersByTime(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS);
+    const raw = events().find((e) => e['type'] === 'videoSlots');
+    const parsed = parseVideoSlots(raw);
+    expect(parsed.slots).toEqual([
+      {
+        slotId: 3,
+        mcState: 'active',
+        rendered: 'video',
+        renderedSenderId: '258',
+        framesDecoded: 9,
+        framesRendered: 7,
+        lumas: LUMAS,
+      },
+      {
+        slotId: 4,
+        mcState: 'avatar_client_muted',
+        rendered: 'avatar',
+        framesDecoded: 0,
+        framesRendered: 2,
+      },
+    ]);
+    // Never a key id, generation, stream number, GoP, size or timestamp.
+    const text = JSON.stringify(raw);
+    for (const forbidden of [
+      'keyId',
+      'generation',
+      'stream',
+      'gop',
+      'bytes',
+      'atMs',
+      'unfulfilled',
+    ]) {
+      expect(text).not.toContain(forbidden);
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('sendCounts projects frames sent and keyframes by the closed cause set, round-tripping the parser', async () => {
+  vi.useFakeTimers();
+  try {
+    const session = new MockMeetingSession();
+    session.videoSendCounts = {
+      framesSent: 40,
+      keyframes: { directive_start: 1, request: 3, abandonment: 0 },
+    };
+    disposers.push(installE2EHooks(session, videoInstrumentation({})));
+    vi.advanceTimersByTime(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS);
+    const raw = events().find((e) => e['type'] === 'sendCounts');
+    expect(parseSendCounts(raw)).toEqual({
+      video: { framesSent: 40, keyframes: { directive_start: 1, request: 3, abandonment: 0 } },
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('no videoSlots / sendCounts before the video paths exist', async () => {
+  vi.useFakeTimers();
+  try {
+    const session = new MockMeetingSession();
+    disposers.push(installE2EHooks(session, videoInstrumentation({})));
+    vi.advanceTimersByTime(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS * 2);
+    expect(events().some((e) => e['type'] === 'videoSlots')).toBe(false);
+    expect(events().some((e) => e['type'] === 'sendCounts')).toBe(false);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test('the render-surface sampler reads 24 central-half block lumas from the PAINTED canvas', async () => {
+  const inst = createE2EInstrumentation();
+  if (inst === undefined) throw new Error('E2E instrumentation absent');
+  const canvas = document.createElement('canvas');
+  canvas.width = 120;
+  canvas.height = 80;
+  const g = canvas.getContext('2d')!;
+  // Left half white, right half black.
+  g.fillStyle = '#000';
+  g.fillRect(0, 0, 120, 80);
+  g.fillStyle = '#fff';
+  g.fillRect(0, 0, 60, 80);
+  let painted = 0;
+  inst.onSurface({ slotId: 3, canvas, framesRendered: () => painted }, 3);
+  // Nothing painted yet: no lumas (absent, never zero-filled).
+  expect(inst.surface(3, { withLumas: true })).toEqual({ framesRendered: 0, lumas: undefined });
+  painted = 1;
+  // Not asked for lumas: the canvas is not read.
+  expect(inst.surface(3, { withLumas: false })).toEqual({ framesRendered: 1, lumas: undefined });
+  const sample = inst.surface(3, { withLumas: true });
+  expect(sample?.lumas).toHaveLength(24);
+  expect(sample?.lumas?.slice(0, 6)).toEqual([255, 255, 255, 0, 0, 0]);
+  inst.onSurface(undefined, 3);
+  expect(inst.surface(3, { withLumas: true })).toBeUndefined();
 });

@@ -38,11 +38,13 @@ export const KEK_UPDATES = 'dt_client_media_kek_updates_total';
 export const KEK_UPDATE_SOURCE = MEDIA_KEK_SOURCES.KekUpdate;
 
 /**
- * The `media_kind` label value the R-29 read-back selects (story 3 OBS-A) —
- * imported from the SDK's vocabulary, never retyped. Only `audio` flows today;
- * the `video` read-back is story 3 C-B's, once video emits.
+ * The `media_kind` label values the R-29 read-backs select (story 3 OBS-A) —
+ * imported from the SDK's vocabulary, never retyped. The audio read-back is
+ * `multi-party-hear.spec.ts`'s; the VIDEO read-back is `multi-party-see.spec.ts`'s
+ * (story 3 C-C1).
  */
 export const MEDIA_KIND_AUDIO = MEDIA_KIND_LABELS.Audio;
+export const MEDIA_KIND_VIDEO = MEDIA_KIND_LABELS.Video;
 
 /** Previous KEK generations demoted and retained — a COUNTER (S6 asserts a delta). */
 export const KEK_GENERATIONS_RETAINED = 'dt_client_media_kek_generations_retained_total';

@@ -183,7 +183,11 @@ production bundle — `tests/bundle-content.test.ts`), gating one init-script
 global `window.__dt_test_levers__` read once per session: `blockHandlers`
 (refuses dials to exact-match offered handlers — it can only narrow),
 `audioReceiveSlots` / `videoReceiveSlots` (a per-context N / M through the SDK's
-strict parser) and `forceHostControls`.
+strict parser), `forceHostControls`, `publish` (SEEDS the join view's chooser;
+the video specs drive the chooser through the DOM instead) and, since story 3
+C-C1, `forceCameraCapture` (this context captures from the fake-device camera
+instead of the test pattern, so a spec can assert the real track's
+`readyState`).
 
 **Traces and HARs** from these multi-context runs contain several live meeting
 and user tokens at once: they stay gitignored, local-only and are never promoted
@@ -203,6 +207,44 @@ that bound, so a hung read fails there too.
 **Registration cost (solo spec): 0.** Both tests sign in as the shared user V and
 create their meeting Node-side. The multi-party specs sign each context in from
 the pre-registered cohort; sign-ins spend no AC registration budget (§Budgets).
+
+## What the video specs assert (story 3 C-C1: see each other)
+
+Every video spec runs on the Kind **test codec profile** (320×180, 15 fps,
+250 kbps — INF-C's `media-codec-profile` patch, probed by global-setup) with the
+**test-pattern camera** (`DT_TEST_PATTERN=1`, asserted at runtime as
+`buildKnobs.testPattern`). Each member sets its own N, M (per-context levers)
+and chooses its publish set **through the join view's chooser**, then asserts
+its EFFECTIVE N, M and publish set at runtime (`cohortContexts.joinPlanMember`).
+Expectations come only from the test's own slot oracle (`slotOracle.ts`),
+driven by the spec's own join / leave / mute calls in the order it drives the
+browsers (`videoScenario.ts`); MC's assignments are never fed into it. A live
+slot's expected sender is the occupant's own join binding, never its announced
+pattern id. Convergence waits are ONE named liveness bound
+(`fixtures.VIDEO_SLOT_STATE_LIVENESS_MS`); judging windows use the shared stop
+rule. Every scenario dumps labelled diagnostics on failure
+(`failureDiagnostics.ts`: [1] MH budget rejection, [2] pending edges / keyframe
+events / MC video slot states, [3] each page's drops by reason and last
+`videoSlots`), rethrowing the original error.
+
+| Spec                                      | Requirements               | What is asserted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ----------------------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `multi-party-see.spec.ts`                 | R-1, R-5, R-32, R-33, R-29 | 4 members, all `both`, N=3/M=3: every receiver × every video slot at three layers (rendered key-id sender = oracle's occupant; verified+decrypted count advances; render-surface pattern = occupant's id, guards pass, live) plus MC state and rendered kind; every audio pair heard by tone at three layers in the same cohort; each pattern announcement names its own join binding. R-29: `dt_client_media_frames_{received,sent}_total{media_kind="video"}` rise above pre-join baselines, nothing kind-less. |
+| `publish-mixes.spec.ts`                   | R-2, R-3, R-4              | Audio-only / video-only / both / receive-only through the DOM chooser: the non-video publishers occupy video slots as `avatar_no_video`; the video-only publisher has no audio slot anywhere; audio publishers heard. A publish-nothing join at N=0/M=0 is refused with the SDK's refusal text and never emits `joined`. An N=0 receiver and an M=0 receiver each work.                                                                                                                                           |
+| `video-over-subscription.spec.ts`         | R-1, R-4                   | M = cap+1 (cap read from MC's ConfigMap source, independently of MC; MC's reported cap must equal it): the tail slot is `unavailable` / rendered empty with its copy; the join succeeds; the others render at three layers.                                                                                                                                                                                                                                                                                       |
+| `client-mute-video.spec.ts`               | R-17, R-15                 | Client video mute: `cameraTrackLive` false AND video send counter flat beside the audio mover; receivers show `avatar_client_muted`. Client audio mute: mic open, audio send flat, video flowing. Unmute resumes. A CAMERA-MODE member (`forceCameraCapture` + the fixture-owned `getUserMedia` recorder) proves the real track `ended` on mute and a NEW `live` track on unmute (layer 3 does not apply to it: a named branch).                                                                                  |
+| `server-mute-video.spec.ts`               | R-16, R-18, R-15           | The host's per-kind DOM affordance: server video mute ends B's camera (counter flat beside the audio mover), every receiver shows `avatar_server_muted`, B's audio still heard. Server unmute resumes capture and raises the R-18 `alertdialog`, which survives Escape, a click outside and a real re-render (a member leaves); its inline action client-mutes at once. Client-muted, a server mute + unmute resumes nothing and shows no notice. The patched-client ingress-drop half is MH's Rust env-tests'.   |
+| `late-joiner-video.spec.ts`               | R-10, R-33                 | A late joiner sees three flowing publishers at three layers; no keyframe interval exists in the deployed profile (non-vacuous parse first); every publisher's keyframes-produced total advances across the join.                                                                                                                                                                                                                                                                                                  |
+| `kek-rotation-video.spec.ts`              | R-14                       | A leave rotates the KEK (grace + W from MC config, a liveness bound); consecutive windows spanning the rotation each pass all three layers on the remaining pairs (no fall-back, layer 2 advancing). Leaver lockout with video: the client integration test `sdk-core/src/media/lifecycle/__tests__/videoReceiver.test.ts` ("a video LEAVER cannot open post-rotation video").                                                                                                                                    |
+| `watched-only-video.spec.ts`              | R-8                        | An unwatched camera-mode publisher has no live track, `cameraTrackLive` false and a ZERO video send counter beside its audio mover; a watcher lights it (live track); the last watcher leaving ends the track.                                                                                                                                                                                                                                                                                                    |
+| `video-codec-unavailable.spec.ts`         | R-28 (UI), R-8             | A test-owned init script makes `VideoEncoder.isConfigSupported` say no in ONE context: media start is refused as a whole (fault + error rendered, no mute controls, no `sendTracks`/`sendCounts`/`mediaFrameCounts`); a control context in the same meeting publishes video.                                                                                                                                                                                                                                      |
+| `partial-connectivity.spec.ts` (2nd test) | R-33                       | The S10a partition with M=2: unreachable peers only via `unreachable_sender_ids` (oracle-checked), video slots match the oracle, and across one window nothing from the unreachable peer arrives or renders while the slot showing A keeps verifying.                                                                                                                                                                                                                                                             |
+
+**Story-2 reruns with M=0 (R-33).** `SUITE_VIDEO_RECEIVE_SLOTS` stays **0**, so
+the six story-2 audio specs (`multi-party-hear`, `partial-connectivity`'s first
+test, `server-mute`, `kek-rotation`, `over-subscription`, `solo-participant`)
+ARE the M=0, audio-only reruns: unchanged, publishing the SDK default (audio),
+and each asserting at runtime that it declared M=0 (`expectDeclaredReceiveSlots`).
 
 ## Prerequisites (host-side)
 
@@ -397,7 +439,15 @@ Building blocks for the N+1 specs; each module header carries the detail.
   shard targets its own cluster. This suite assumes a single workstation against
   its own cluster.
 
-- **Wall-clock budget** — measured on the Layer-7 Kind cluster (story 2 task 15,
+- **Wall-clock budget (story 3 C-C1, 2026-10-24)** — the WHOLE suite with the
+  video specs measured **~556 s (9.1 min)** on the Kind cluster: the video specs
+  ≈ 15 s (`multi-party-see`, `publish-mixes` mixes), ≈ 55 s each
+  (`client-mute-video`, `server-mute-video`), **≈ 110 s `kek-rotation-video`**
+  (grace + W, like S6), ≈ 7–20 s the rest. That left the former 600 s default
+  no headroom, so `BROWSER_E2E_TIMEOUT` (`scripts/layer7.sh`) is now **1500 s**
+  (the measured suite under 40 %), restated in `devloop-validation.md` §6.7 and
+  pinned by `scripts/layer7.test.sh`. Re-measure before changing it.
+- **Wall-clock budget (story 2)** — measured on the Layer-7 Kind cluster (story 2 task 15,
   2026-09-30), per test: S1 `multi-party-hear` ≈ 13 s; S2 `over-subscription` ≈ 8 s;
   S3 `server-mute` ≈ 16 s + client structural mute ≈ 11 s + non-host refusal ≈ 6 s;
   S10a `partial-connectivity` ≈ 7 s; **S6 `kek-rotation` ≈ 100 s** (it waits out
@@ -406,7 +456,7 @@ Building blocks for the N+1 specs; each module header carries the detail.
   (dominated by the leave/rejoin test's grace path). **Whole suite ≈ 3.5–4 min**,
   including the dev-server start and global setup, against the suite-wide
   `BROWSER_E2E_TIMEOUT` (`scripts/layer7.sh`, `DEVLOOP_BROWSER_E2E_TIMEOUT`) —
-  under 40 % of it, so the default is deliberately NOT raised. **Why the numbers
+  under 40 % of it at the time (story 3 C-C1 raised it; see above). **Why the numbers
   are written down**: on budget exhaustion `layer7.sh` prints "exited 124" and
   emits `FAIL browser-e2e-failed` — the *same* terminal status as a genuine
   assertion failure, in the implementer lane — so a timeout presents as a diff
@@ -464,7 +514,7 @@ more force, not less.
 
 ## Video test infrastructure (story 3, R-32 / R-3 / R-30)
 
-Helpers only. The video specs that use them land with C-C1 (task 17). Every helper below is pure and has a node-tier self-test under `tests/`.
+The helpers the video specs (§What the video specs assert) are built on. Every helper below is pure and has a node-tier self-test under `tests/`.
 
 ### Video test pattern (THE spec)
 
@@ -529,6 +579,11 @@ The client projects these under `__E2E_HOOKS__`, sampled on the existing tick an
   - Layer 2 reuses the existing `receiveLayers` `{ slot, senderId, keyed, verified }` rows.
   - `sendTracks` is `{ cameraTrackLive, micTrackOpen }`.
   - `videoCaptureSource` is `{ mode: 'camera'|'test_pattern', patternId? }`.
+  - **`sendCounts`** (story 3 C-C1) is `{ video: { framesSent, keyframes: { directive_start, request, abandonment } } }` — keyed by KIND (never a stream number), cumulative counts, the cause set exactly `MEDIA_KEYFRAME_SOURCES` (no periodic cause exists); `parseSendCounts`.
+  - `receiveLayers.drops` rows `{ slot, senderId|null, reason, count }`, reason from the SDK's closed `ALL_REJECT_REASONS`; `parseReceiveDrops` (used by the failure diagnostics).
+  - `muteState` carries `audioMuted` and `videoMuted`; `buildKnobs` carries `testPattern`.
+  - A `videoSlots` slot is OMITTED until MC has named it (no placeholder token); `framesDecoded` is the SDK's per-slot count, `framesRendered` the render surface's paint count (`VideoTile`), `lumas` read from the tile canvas inside `__E2E_HOOKS__` only.
+- **One contract, one direction:** this module is the contract; `src/__tests__/e2eBus.test.ts` round-trips the app's projection through these parsers. The slot-state vocabulary is every SDK wire token (derived from `src/lib/slotState.ts:WIRE_TOKENS`); the ORACLE's is deliberately narrower (`slotOracle.ts:EXPECTED_SLOT_STATES`), so a never-emitted token on the bus surfaces as a state mismatch.
 - **Exact-key parsers:** every parser rejects an unknown field, so a GoP value, a frame size, a key id or a timestamp cannot slip onto the bus unnoticed.
 - **Identity carve-out (R-30 vs R-32):** `renderedSenderId`, `receiveLayers.senderId` and `patternId` carry the meeting-scoped `sender_id`, stringified, on the test-build bus only. This follows the story-2 `receiveLayers` precedent. There is never a stream number, relay id, GoP value, size, key id, timing or durable identity. The decoded pattern id is computed test-side and never written back to the bus.
 - **Lumas exception** (security's conditions, binding on C-B / C-C1):

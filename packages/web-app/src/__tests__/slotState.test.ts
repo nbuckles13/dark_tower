@@ -6,7 +6,7 @@
 // see."
 //
 //   1. EXHAUSTIVE — every wire token has text. The type system already enforces
-//      this (`Record<SlotStateToken, string>` keyed off the SDK's union, so a new
+//      this (`Record<SlotStateToken, …>` keyed off the SDK's union, so a new
 //      wire state is a compile error), and this file adds the runtime half: a
 //      list of tokens that must stay in step with the union.
 //   2. DISTINCT — no two states render the same string, which is the actual
@@ -44,27 +44,46 @@ test('the wire vocabulary is the ten flat states (story 3 wire freeze; MC slot_s
   expect(WIRE_TOKENS).not.toContain('zero_requested' as never);
 });
 
-test('every state renders non-empty text', () => {
+const CTX = { name: 'Bea', kind: 'video' } as const;
+const text = (state: SlotStateAttr, kind: 'audio' | 'video' = 'video'): string =>
+  slotStateText(state, { ...CTX, kind });
+
+test('every state renders non-empty text, for both kinds', () => {
   for (const state of ALL_STATES) {
-    expect(slotStateText(state), `no text for "${state}"`).not.toBe('');
+    for (const kind of ['audio', 'video'] as const) {
+      expect(text(state, kind), `no text for "${state}" (${kind})`).not.toBe('');
+    }
   }
 });
 
-test('no two states render the same text', () => {
-  // THE ASSERTION THAT MATTERS. Exhaustiveness is satisfied by mapping all nine
-  // to "no audio"; distinctness is what §6 actually asks for, because the three
+test('no two states render the same text (per kind)', () => {
+  // THE ASSERTION THAT MATTERS. Exhaustiveness is satisfied by mapping all of
+  // them to "no video"; distinctness is what §6 actually asks for, because the
   // no-media states have completely different remedies.
-  const texts = ALL_STATES.map(slotStateText);
-  expect(new Set(texts).size).toBe(ALL_STATES.length);
+  for (const kind of ['audio', 'video'] as const) {
+    const texts = ALL_STATES.map((s) => text(s, kind));
+    expect(new Set(texts).size).toBe(ALL_STATES.length);
+  }
 });
 
-test('the three indistinguishable no-media states read differently from each other', () => {
-  // Named explicitly rather than left to the distinctness sweep above: these are
-  // the exact three §6 calls out, and a reader of this file should see them.
-  const congestion = slotStateText('withheld_by_congestion');
-  const fewer = slotStateText('fewer_sources_than_slots');
-  const unreachable = slotStateText('source_unreachable');
-  expect(new Set([congestion, fewer, unreachable]).size).toBe(3);
+test('avatars NAME the participant and give the reason (story 3 R-4)', () => {
+  expect(text('avatar_client_muted')).toBe('Bea turned their camera off');
+  expect(text('avatar_server_muted')).toBe("Bea's camera was turned off by the host");
+  expect(text('avatar_no_video')).toBe('Bea is not sending video');
+  expect(text('avatar_client_muted', 'audio')).toBe('Bea muted their microphone');
+  expect(text('unavailable')).toBe('this meeting allows fewer video slots');
+});
+
+test('the never-emitted states AND unspecified render fail-closed "unexpected" copy', () => {
+  for (const state of [
+    'unspecified',
+    'switch_pending',
+    'withheld_by_congestion',
+    'source_unreachable',
+  ] as const) {
+    expect(text(state)).toContain('unexpected state');
+    expect(slotIsActive(state)).toBe(false);
+  }
 });
 
 test('awaiting-assignment is distinct from unspecified', () => {
@@ -72,7 +91,7 @@ test('awaiting-assignment is distinct from unspecified', () => {
   // first assignment) versus "MC sent a slot whose state it did not classify" (a
   // protocol-level surprise). Collapsing them hides a real defect inside a
   // normal startup state.
-  expect(slotStateText(AWAITING_ASSIGNMENT)).not.toBe(slotStateText('unspecified'));
+  expect(text(AWAITING_ASSIGNMENT)).not.toBe(text('unspecified'));
 });
 
 test('only the active state counts as active', () => {

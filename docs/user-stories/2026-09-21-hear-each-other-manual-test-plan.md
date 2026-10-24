@@ -166,8 +166,8 @@ This renders the host affordance in a NON-host context, so Phase 3 exercises MC'
 than a hidden button. A malformed lever is refused loudly, as `last-error` with no join; that is a
 typo, not a product failure.
 
-Every participant clicks **Start audio**. It needs a user gesture; until then `media-status` reads
-"audio not started", and the participant sends nothing.
+Every participant clicks **Start media** (the `start-media` button; named "Start audio" before story 3 C-C1). It needs a user gesture; until then `media-status` reads
+"media not started", and the participant sends nothing.
 
 Checks:
 
@@ -183,7 +183,7 @@ Checks:
   - The line's target is `mh.webtransport.connection` and it carries `participant_id`. The Loki
     form is `{app="mh-service"} |= "Connection established for registered meeting" |= "<participantId>"`.
 - [ ] Each participant's slot grid (`slot-list`) has **exactly N cells**. Every cell is `active`
-      ("receiving audio") and **names a different other participant**. No cell names self; loopback
+      ("hearing <name>") and **names a different other participant**. No cell names self; loopback
       is removed.
 - [ ] **By ear:** each participant hears the other N tones. N tones heard at once are a chord, so
       check one sender at a time. Each sender in turn clicks its own **Mute**. At every other
@@ -196,7 +196,7 @@ layers: key id at the assigned slot, verify/decrypt under the roster key, and th
 
 ## Phase 2 — One more than N+1: the extra joiner E
 
-E signs in and joins, then clicks Start audio.
+E signs in and joins, then clicks Start media.
 
 - [ ] At every earlier participant (A…), all N cells stay `active` and keep naming the same earlier
       joiners. E appears on their roster **in no slot and NOT marked unreachable**. This is **F17's
@@ -303,7 +303,7 @@ First make room, so the late joiner's N slots cover everyone. **E leaves** (Crea
 leaves N participants. This is one more leave-triggered rotation. Wait for it on *Meeting KEK
 Issuance by Trigger*.
 
-**F** joins after that rotation and clicks Start audio. F may be C's profile rejoining; a rejoin is
+**F** joins after that rotation and clicks Start media. F may be C's profile rejoining; a rejoin is
 a fresh join with a fresh participant id and sender id.
 
 - [ ] F's N cells are all `active` and name every remaining participant. F **hears all N tones**,
@@ -340,7 +340,7 @@ In a **fresh** meeting, one participant joins alone and starts audio.
 
 - [ ] Every slot cell reads `fewer_sources` ("no one to fill this slot yet"), as an under-filled
       grid with no spinner. No cell names self.
-- [ ] Silence, and `media-status` stays "no audio from other participants yet".
+- [ ] Silence, and `media-status` stays "no media from other participants yet".
 - [ ] mc-media *Send Directives by Outcome*: `emitted_empty_targets` moves. The solo sender is
       directed to send nothing, so MH's drop panels stay flat. Flat is the expected reading here,
       not evidence of anything.

@@ -43,7 +43,12 @@ import {
   parseAcAuthRateLimit,
   SUITE_AUDIO_RECEIVE_SLOTS,
 } from './cohort.js';
-import { readVideoProfile, serviceConfigEnvPath, type VideoCodecProfile } from './configEnv.js';
+import {
+  MEDIA_CODEC_PROFILE_ENV_VAR,
+  readVideoProfile,
+  serviceConfigEnvPath,
+  type VideoCodecProfile,
+} from './configEnv.js';
 import { describeEnv, e2eEnv } from './env.js';
 import { registerCohort } from './fixtures.js';
 import {
@@ -53,8 +58,6 @@ import {
   type Vp8ProbeVerdict,
 } from './vp8Probe.js';
 
-/** The deployed profile file layer7.sh dumps (Phase 1g). Required — no fallback. */
-const MEDIA_CODEC_PROFILE_ENV_VAR = 'E2E_MEDIA_CODEC_PROFILE_ENV';
 /** Where an UNSUPPORTED verdict is written for layer7.sh to route (unset outside Layer 7). */
 const VP8_VERDICT_FILE_VAR = 'E2E_VP8_VERDICT_FILE';
 

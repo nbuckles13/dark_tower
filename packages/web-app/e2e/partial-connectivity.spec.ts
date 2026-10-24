@@ -34,19 +34,26 @@ import {
   type JoinedMember,
   type Member,
 } from './cohortContexts.js';
-import { bootstrapMeeting, busEvents } from './fixtures.js';
+import type { CohortMemberPlan } from './cohort.js';
+import { bootstrapMeeting, busEvents, latestBusEventsOf } from './fixtures.js';
 import { mhAdmissionRejectionsByInstance } from './mcMetrics.js';
 import {
   acceptedProbe,
   expectHearsAtAllLayers,
   latestAssignments,
+  latestLayers,
   observeWindow,
+  videoVerifiedProbe,
   waitForRosterToken,
+  type PageMember,
   type Probe,
 } from './receiveEvidence.js';
+import { parseVideoSlots } from './videoBusShape.js';
+import { judgeUnreachable } from './videoEvidence.js';
+import { VideoScenario } from './videoScenario.js';
 
 /** The handler URLs this context's own bus reports connected. */
-async function connectedSet(member: JoinedMember): Promise<string[]> {
+async function connectedSet(member: Pick<JoinedMember, 'page'>): Promise<string[]> {
   return (await busEvents(member.page))
     .filter((e) => e['type'] === 'mediaConnected')
     .map((e) => e['mhUrl'] as string)
@@ -166,6 +173,111 @@ test.describe('story 2 S10a: partial connectivity (client handler lever)', () =>
       );
     } finally {
       await closeMembers(opened);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Story 3 R-33: the same partition, with VIDEO slots (the M=0 test above is
+// the story-2 rerun and stays exactly as it was).
+// ---------------------------------------------------------------------------
+
+/** Frames keyed to `senderId` that ARRIVED at `receiver` on ANY slot (layer 1, pre-verify). */
+function keyedFromProbe(receiver: PageMember, senderId: string): Probe {
+  return {
+    label: `${receiver.label}.keyedFrom(${senderId})`,
+    observer: receiver.label,
+    expect: 'zero',
+    read: async () =>
+      (await latestLayers(receiver))
+        .filter((r) => r.senderId === senderId)
+        .reduce((sum, r) => sum + r.keyed, 0),
+  };
+}
+
+/** 1 while ANY of `receiver`'s video slots has rendered a frame keyed to `senderId`. */
+function renderedFromProbe(receiver: PageMember, senderId: string): Probe {
+  return {
+    label: `${receiver.label}.renderedFrom(${senderId})`,
+    observer: receiver.label,
+    expect: 'zero',
+    read: async () => {
+      const { videoSlots } = await latestBusEventsOf(receiver.page, ['videoSlots']);
+      if (videoSlots === undefined) throw new Error(`${receiver.label}: no videoSlots sample`);
+      return parseVideoSlots(videoSlots).slots.some((s) => s.renderedSenderId === senderId) ? 1 : 0;
+    },
+  };
+}
+
+test.describe('story 3 R-33: partial connectivity with video slots', () => {
+  test('video from a sender sharing no handler never renders, and that peer is unreachable', async ({
+    browser,
+  }) => {
+    test.setTimeout(240_000);
+    const plan: CohortMemberPlan = { publish: 'both', audioReceiveSlots: 3, videoReceiveSlots: 2 };
+    const { scenario, host } = await VideoScenario.create(browser, 'E2E S10a video', plan);
+    try {
+      const a = await scenario.join(host, plan);
+      const offered = [...a.joined.mediaServers].sort();
+      expect(offered.length, 'the Kind environment runs two handlers').toBeGreaterThanOrEqual(2);
+      const [u0, u1] = offered as [string, string];
+      const b = await scenario.join(await scenario.open(1, plan, { blockHandlers: [u1] }), plan, {
+        expectAllHandlers: false,
+        handlers: [u0],
+      });
+      const c = await scenario.join(await scenario.open(2, plan, { blockHandlers: [u0] }), plan, {
+        expectAllHandlers: false,
+        handlers: [u1],
+      });
+      await expect.poll(() => connectedSet(b), { message: 'B connects to u0 only' }).toEqual([u0]);
+      await expect.poll(() => connectedSet(c), { message: 'C connects to u1 only' }).toEqual([u1]);
+
+      // Every video slot per the oracle: A sees B and C; B and C each see A only.
+      for (const m of [a, b, c]) await scenario.expectVideo(m.label, 'partial connectivity');
+
+      for (const [viewer, other] of [
+        [b, c],
+        [c, b],
+      ] as const) {
+        // Unreachable comes from `unreachable_sender_ids` ONLY (never a slot token).
+        const want = scenario.oracle
+          .expected(viewer.label)
+          .unreachable.map((l) => scenario.member(l).senderId);
+        expect(
+          want,
+          `non-vacuity: the oracle names ${other.label} unreachable to ${viewer.label}`,
+        ).toEqual([other.senderId]);
+        const bus = (await busEvents(viewer.page))
+          .filter((e) => e['type'] === 'slotAssignments')
+          .at(-1)?.['unreachableSenderIds'];
+        expect(judgeUnreachable(want, (bus as string[] | undefined) ?? [])).toEqual([]);
+        await waitForRosterToken(viewer, other, 'data-reachability', 'source_unreachable');
+      }
+
+      // One window per pair: nothing from the unreachable peer arrives or renders,
+      // WHILE the slot showing A keeps verifying on the same page.
+      for (const [viewer, other] of [
+        [b, c],
+        [c, b],
+      ] as const) {
+        const fromA = scenario
+          .videoExpectations(viewer.label)
+          .find((e) => e.expectation.occupant === 'A');
+        if (fromA === undefined)
+          throw new Error(`HARNESS: ${viewer.label} has no video slot for A`);
+        await scenario.diagnosed(`${viewer.label} never sees ${other.label}`, () =>
+          observeWindow(
+            [
+              keyedFromProbe(viewer, other.senderId),
+              renderedFromProbe(viewer, other.senderId),
+              videoVerifiedProbe(viewer, fromA.slotId, a.senderId, 'advance'),
+            ],
+            `${viewer.label} shares no handler with ${other.label}`,
+          ),
+        );
+      }
+    } finally {
+      await scenario.close();
     }
   });
 });

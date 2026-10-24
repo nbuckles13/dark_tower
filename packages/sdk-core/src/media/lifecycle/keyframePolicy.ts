@@ -93,6 +93,14 @@ export class KeyframeGate {
   #deferral: Deferral | undefined;
   #clampWarned = false;
   #closed = false;
+  /**
+   * Keyframes PRODUCED, by cause (cumulative). The same call site as
+   * `keyframeProduced`, so the sampled view and the metric cannot disagree.
+   * Counts only — no timing (story 3 C-C1, the test bus's `sendCounts`).
+   */
+  readonly #produced = Object.fromEntries(
+    Object.values(MEDIA_KEYFRAME_SOURCES).map((source) => [source, 0]),
+  ) as Record<MediaKeyframeSource, number>;
 
   constructor(options: KeyframeGateOptions) {
     this.#o = options;
@@ -101,6 +109,11 @@ export class KeyframeGate {
   /** max(directed, floor), as currently in force. */
   get effectiveIntervalMs(): number {
     return this.#effectiveIntervalMs;
+  }
+
+  /** Keyframes produced so far, by cause (a fresh copy; counts only). Sample it, never per frame. */
+  producedBySource(): Readonly<Record<MediaKeyframeSource, number>> {
+    return { ...this.#produced };
   }
 
   /** Whether a deferral is held (for assertion). */
@@ -216,6 +229,7 @@ export class KeyframeGate {
 
   #produce(source: MediaKeyframeSource): void {
     this.#lastKeyAt = this.#o.clock();
+    this.#produced[source] += 1;
     this.#o.metrics.keyframeProduced(source);
     this.#o.produceKeyframe();
   }

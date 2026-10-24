@@ -22,11 +22,11 @@
 ## SDK Core: Media Pipeline (`packages/sdk-core/src/media/`)
 - Frame codec + signing → `frame/{frameCodec,ed25519,wireConstants}.ts`; header v3 + sendable/supported versions → `frameCodec.ts:HEADER_VERSION_V3`, `__tests__/frameCodec.v3.test.ts`; hot-path layout rule → `__tests__/hotPathLayout.test.ts`
 - Egress (seal once, per-target fan-out) + uplink stamp = MC send id → `pipeline/{egress,egressQueue,sendId,frameSeal}.ts`; proof → `pipeline/__tests__/egress.multiTarget.test.ts`
-- Video egress (group streams, backlog reset, hop at write) → `pipeline/videoEgress.ts`; publish lifecycle (camera gate + R-19, keyframe gate) → `lifecycle/{VideoPublisher,cameraGate,keyframePolicy}.ts`; nonce property → `pipeline/__tests__/nonceUniqueness.property.test.ts`
+- Video egress (group streams, backlog reset, hop at write) → `pipeline/videoEgress.ts`; publish lifecycle (camera gate + R-19 → `cameraHealthChanged`, keyframe gate + `producedBySource`, `sendTotals`) → `lifecycle/{VideoPublisher,cameraGate,keyframePolicy}.ts`; nonce property → `pipeline/__tests__/nonceUniqueness.property.test.ts`
 - Ingress + slot-edge gate + per-sender receive lanes → `pipeline/{ingress,receiveLanes,playbackSink}.ts`; proof → `lifecycle/__tests__/audioPipeline.multiSender.test.ts`
 - Receive verification recorder (test-injected); hop monitor; ONE receive policy by kind + parse-boundary accounting (branch table `__tests__/receivePolicy.branchTable.test.ts`) → `pipeline/{receiveVerification,hopSequenceMonitor,receivePolicy,frameAccounting}.ts`
 - Video receive: uni-stream reader (extent via `frameCodec.ts:peekFrameExtent`) + ingress + M slot pipelines (jitter, decoder, group gate, re-base) + render rules → `pipeline/{streamReader,videoIngress,videoSlotPipeline,renderDecision}.ts`; recovery mapping `videoIngress.ts:RECOVERY_REASON_FOR`; reader corpus → `pipeline/__tests__/streamReader.test.ts`
-- Video receive orchestrator (sinks, evidence, pairing live senders), recovery queue, unfulfilled series, per-kind receiver-state binding, per-handler read loops → `lifecycle/{VideoReceiver,recoveryRequestQueue,unfulfilledSlots,receiverState,receiveTransports}.ts`
+- Video receive orchestrator (sinks, evidence incl. `framesDecoded`, pairing live senders), recovery queue, unfulfilled series, per-kind receiver-state binding, per-handler read loops → `lifecycle/{VideoReceiver,recoveryRequestQueue,unfulfilledSlots,receiverState,receiveTransports}.ts`
 - Pipeline lifecycle (per-transport receive, transmit keys, mute) + interval signals (capture presence, receive-source deficit) → `lifecycle/{AudioPipeline,receiveTransports,transmitKeys,muteState,intervalSignals,receiveSourceDeficit}.ts`
 - Capture (mic, tone, camera, test pattern — spec home `web-app/e2e/README.md`) / playback / Opus / VP8 (decoder config + key-frame header dims) → `setup/{capture,testTone,videoCapture,videoCaptureBrowser,testPattern,meetingSenderId,audioPlayback,opus,vp8,vp8Encoder,vp8Decoder}.ts`; VideoSink / VideoDecoder seams → `setup/seams.ts`
 - Media metric handles + allow-listed labels → `setup/mediaMetrics.ts`
@@ -37,15 +37,15 @@
 - Join-label roster guards → `__tests__/{joinLabelSpread,joinLabelRoster,stripComments}.ts`
 
 ## Svelte Adapter (`packages/sdk-svelte/src/`)
-- Roster store → `stores/MeetingStore.svelte.ts`; media/mute/slot/fault store → `stores/MediaStore.svelte.ts`
-- Session-to-store binding → `stores/bindMeetingSession.ts`; re-render granularity proof → `__tests__/MediaStore.test.ts`
+- Roster store → `stores/MeetingStore.svelte.ts`; media/mute/slot/fault store + R-18 notice latch → `stores/MediaStore.svelte.ts`; per-slot / per-participant / pairing cells (readers never construct) → `stores/mediaCells.svelte.ts:CellRegistry`
+- Session-to-store binding → `stores/bindMeetingSession.ts`; granularity proof (tile / participant / frames) → `__tests__/MediaStore.test.ts`; video render surface (canvas `VideoSink`, `onSurface`) → `components/VideoTile.svelte`
 
 ## Web Application (`packages/web-app/src/`)
-- In-meeting view + slot grid → `views/InMeeting.svelte`; roster row + copy → `views/ParticipantRow.svelte`, `lib/participantState.ts`; roster DOM → `views/JoinMeeting.svelte`
-- Slot-state user text → `lib/slotState.ts`; auth/meeting views → `views/{SignIn,SignUp,CreateMeeting}.svelte`
+- Join + publish-set chooser → `views/JoinMeeting.svelte`; one attempt (build/bind/join, roster DOM) → `views/MeetingRoom.svelte`; in-meeting (audio rows, video grid, own controls, R-19) → `views/InMeeting.svelte`; tile / four indicators / R-18 notice / roster row + per-kind host controls → `views/{VideoSlotTile,MuteIndicators,ResumeNotice,ParticipantRow}.svelte`
+- Slot-state copy (ONE exhaustive table) → `lib/slotState.ts`; participant copy, bounded names, self camera → `lib/participantState.ts`; auth/meeting views → `views/{SignIn,SignUp,CreateMeeting}.svelte`
 - Session wiring, config, error text → `lib/{session,config,errorText}.ts`
 - Test-only build defines (one predicate) → `vite/testDefines.ts`; test levers → `lib/testLevers.ts`
-- E2E bus + per-lane analysis (under `__E2E_HOOKS__`) → `lib/{e2eBus,e2eAnalysis}.ts`
+- E2E bus (incl. `videoSlots`, `sendCounts`) + per-lane analysis + render-surface lumas (under `__E2E_HOOKS__`) → `lib/{e2eBus,e2eAnalysis}.ts`; contract round-trip → `__tests__/e2eBus.test.ts`
 - Vite proxy / cert fingerprints → `vite.config.ts`, `vite/fingerprints.ts`; prod-absence bundle scan → `tests/bundle-content.test.ts`
 
 ## Client Telemetry (`packages/sdk-core/src/telemetry/`)
@@ -55,7 +55,7 @@
 - Fixtures + MC/MH metric read-backs; multi-party cohort (N+1 registered in global setup) → `fixtures.ts`, `mcMetrics.ts`, `instanceCounters.ts`, `s1Diagnostic.ts`, `cohort.ts`, `cohortContexts.ts`, `global-setup.ts`
 - Receive evidence + tone detection + window stop rule → `receiveEvidence.ts`, `toneDetector.ts`, `windowSampling.ts`
 - Credential scan, shared client metric names, config.env reader → `{credentialScan,clientMetricNames,configEnv}.ts`
-- Specs → `*.spec.ts` (multi-party-hear, partial-connectivity, server-mute, kek-rotation, over-subscription, solo-participant, ...)
+- Specs → `*.spec.ts` (story 2: multi-party-hear, partial-connectivity, server-mute, kek-rotation, over-subscription, solo-participant; story 3: multi-party-see, publish-mixes, video-over-subscription, client-mute-video, server-mute-video, late-joiner-video, kek-rotation-video, watched-only-video, video-codec-unavailable); video harness → `{videoScenario,videoPlan,videoBusShape,videoEvidence,failureDiagnostics}.ts`, `cohortContexts.ts:joinPlanMember`, `configEnv.ts:readMcReceiveCaps`
 - Env contract + catalog → `env.ts`, `README.md`; Playwright config → `packages/web-app/playwright.config.ts`; node-tier specs → `packages/web-app/tests/`
 - Layer 7 lane + per-run org provisioning → `scripts/layer7.sh`, `infra/kind/scripts/setup.sh:provision_run_org()`
 - Subdomain-pattern drift guard → `scripts/guards/simple/validate-subdomain-regex-sync.sh`

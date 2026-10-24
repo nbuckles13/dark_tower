@@ -41,7 +41,14 @@ import {
 import { E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS } from '../src/lib/e2eBus.js';
 import { scanRecordedRequests, type RecordedRequest, type ScanReport } from './credentialScan.js';
 import { windowStep } from './windowSampling.js';
+import { parseVideoSlots, withoutLumas, type VideoSlotSample } from './videoBusShape.js';
 import { e2eEnv, toLoopbackUrl } from './env.js';
+import {
+  MC_MAX_AUDIO_RECEIVE_SLOTS_KEY,
+  MC_MAX_VIDEO_RECEIVE_SLOTS_KEY,
+  ROTATION_POLL_MARGIN_MS,
+  mcRotationBudget,
+} from './configEnv.js';
 import type { InstanceCounters } from './instanceCounters.js';
 import { diagnoseMissingSender } from './mcMetrics.js';
 import {
@@ -384,6 +391,24 @@ async function fillJoinForm(page: Page, meetingCode: string): Promise<void> {
  */
 export async function joinAsUser(page: Page, meetingCode: string): Promise<void> {
   await fillJoinForm(page, meetingCode);
+  await page.getByTestId('join-button').click();
+}
+
+/**
+ * Drive the join view with the PUBLISH-SET CHOOSER set explicitly through the
+ * DOM (story 3 R-2): microphone and camera checkboxes to exactly `publish`,
+ * asserted before submit, then join.
+ */
+export async function joinWithPublishViaUi(
+  page: Page,
+  meetingCode: string,
+  publish: { readonly audio: boolean; readonly video: boolean },
+): Promise<void> {
+  await fillJoinForm(page, meetingCode);
+  await page.getByTestId('publish-microphone').setChecked(publish.audio);
+  await page.getByTestId('publish-camera').setChecked(publish.video);
+  await expect(page.getByTestId('publish-microphone')).toBeChecked({ checked: publish.audio });
+  await expect(page.getByTestId('publish-camera')).toBeChecked({ checked: publish.video });
   await page.getByTestId('join-button').click();
 }
 
@@ -1025,16 +1050,20 @@ export async function frameCountSamples(page: Page): Promise<readonly FrameCount
  * through `serverCertificateHashes` pinning, which such a flag would turn into
  * decoration while every assertion stayed green.
  */
-export async function startAudio(page: Page): Promise<void> {
+export async function startMedia(page: Page): Promise<void> {
   await expect(
     page.getByTestId('in-meeting'),
     'the in-meeting view must render after a settled join',
   ).toBeVisible();
-  await page.getByTestId('start-audio').click();
+  await page.getByTestId('start-media').click();
+  // The start control is replaced by the running controls once media started
+  // (for a receive-only participant there are no mute controls at all, so the
+  // start control's disappearance is the one signal every publish set shares).
+  // A media-start FAILURE keeps it and shows `media-error` — fail naming that.
   await expect(
-    page.getByTestId('mute-toggle'),
-    'the mute control must appear once the media pipeline is running',
-  ).toBeVisible();
+    page.getByTestId('start-media'),
+    'the media pipeline must start (a media-start failure would show media-error)',
+  ).toBeHidden();
 }
 
 /**
@@ -1071,7 +1100,7 @@ export async function waitForFirstMediaFrame(
     const samples = await frameCountSamples(page);
     throw new Error(
       `no audio returned from the media handler: no 'firstMediaFrame' bus event within ` +
-        `${timeoutMs}ms after start-audio. This is a LIVENESS failure (no media at all), not a ` +
+        `${timeoutMs}ms after start-media. This is a LIVENESS failure (no media at all), not a ` +
         `latency failure — the bound is not a budget. ` +
         `${diagnoseCounters(samples)} ${await busFailureContext(page)}`,
     );
@@ -1085,26 +1114,143 @@ export async function waitForFirstMediaFrame(
   return elapsedMs;
 }
 
-/** Click the mute control and wait for the SDK's echo to reach the DOM. */
-export async function setMuteViaUi(page: Page, muted: boolean): Promise<number> {
-  await page.getByTestId('mute-toggle').click();
+/** The client-mute control and indicator per kind (the DOM contract of `InMeeting.svelte`). */
+const MUTE_CONTROL: Record<MuteKind, { toggle: string; state: string; busKey: string }> = {
+  audio: { toggle: 'mute-toggle', state: 'mute-state', busKey: 'audioMuted' },
+  video: { toggle: 'video-mute-toggle', state: 'video-mute-state', busKey: 'videoMuted' },
+};
+
+/** A media kind a participant can mute. */
+export type MuteKind = 'audio' | 'video';
+
+/**
+ * Click `kind`'s client-mute control and wait for the SDK's echo to reach the
+ * DOM. `kind` is REQUIRED: a video spec that forgot it must not silently mute
+ * audio and still pass.
+ */
+export async function setMuteViaUi(page: Page, kind: MuteKind, muted: boolean): Promise<number> {
+  const control = MUTE_CONTROL[kind];
+  await page.getByTestId(control.toggle).click();
   // The DOM assertion is on the SDK's ECHO, not on the click: the indicator is
   // driven by `muteChanged`, so waiting here proves the SDK actually applied it.
   await expect(
-    page.getByTestId('mute-state'),
-    `the mute indicator must follow the SDK's client-mute state (requested ${String(muted)})`,
-  ).toHaveText(muted ? 'muted' : 'unmuted');
-  const busState = await page.evaluate(() => {
+    page.getByTestId(control.state),
+    `the ${kind} mute indicator must follow the SDK's client-mute state (requested ${String(muted)})`,
+  ).toHaveAttribute('data-muted', String(muted));
+  const busState = await page.evaluate((key) => {
     const events = window.__darktower_test__?.events ?? [];
     const mutes = events.filter((e) => e['type'] === 'muteState');
-    return mutes[mutes.length - 1]?.['audioMuted'];
-  });
+    return mutes[mutes.length - 1]?.[key];
+  }, control.busKey);
   expect(
     busState,
     'the DOM indicator and the SDK client-mute state must agree — a UI that can disagree with ' +
       'what gates capture is the hot-mic defect ADR-0036 §5 exists to prevent',
   ).toBe(muted);
   return Date.now();
+}
+
+/**
+ * The host clicks the per-kind server-mute affordance for `participantId`
+ * (story 3 R-15) and waits for the WIRE state to reach its own roster row (the
+ * button's label follows MC's update, never the click).
+ */
+export async function setServerMuteViaUi(
+  host: Page,
+  participantId: string,
+  kind: MuteKind,
+  muted: boolean,
+): Promise<void> {
+  const button = host.getByTestId(`server-mute-${kind}-${participantId}`);
+  await expect(button, `the host's ${kind} affordance must render`).toBeVisible();
+  await expect(button).toHaveAttribute('aria-pressed', String(!muted));
+  await button.click();
+  await expect(
+    host.getByTestId(`participant-${participantId}`),
+    `the host's roster row must show MC's ${kind} server mute = ${String(muted)}`,
+  ).toHaveAttribute(
+    kind === 'audio' ? 'data-server-muted' : 'data-server-muted-video',
+    String(muted),
+    {
+      timeout: VIDEO_SLOT_STATE_LIVENESS_MS,
+    },
+  );
+}
+
+/**
+ * THE liveness bound for every video CONVERGENCE after the event that causes
+ * it — a slot state, a roster token, a camera track ending or relighting, a
+ * send-track flip, a notice appearing — after a join, a mute or a leave. A
+ * LIVENESS bound, never a latency gate: generous, and a failure says "never
+ * converged", with the last observed state, never an elapsed time. The one
+ * bound the video specs use (no per-call literals).
+ */
+// DERIVED from MC's own config: a leave's effects can wait out MC's disconnect
+// grace (MC holds a cleanly-closed participant through it — cohortContexts.ts),
+// plus the shared poll margin. Never restated as a literal.
+export const VIDEO_SLOT_STATE_LIVENESS_MS =
+  mcRotationBudget().graceSeconds * 1000 + ROTATION_POLL_MARGIN_MS;
+
+/**
+ * THE bus-cadence poll kernel: read the page's bus on its own sampling cadence
+ * (`E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS` — reading faster only sees the same
+ * sample twice) until `done`, or until `boundMs` (a LIVENESS bound) has passed.
+ * Returns whether it converged and the LAST read, so the caller words its own
+ * failure. A plain loop, not `expect.poll`: an error thrown by `read` (a
+ * detector harness error, a misrouting assertion, a bus-shape violation) fails
+ * AT ONCE and is never retried. The waits are the inter-sample sleep only,
+ * never a deadline.
+ */
+export async function pollBus<T>(
+  page: Page,
+  read: () => Promise<T>,
+  done: (value: T) => boolean,
+  boundMs: number,
+): Promise<{ readonly converged: boolean; readonly last: T }> {
+  const deadline = Date.now() + boundMs;
+  for (;;) {
+    const last = await read();
+    if (done(last)) return { converged: true, last };
+    if (Date.now() > deadline) return { converged: false, last };
+    await page.waitForTimeout(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS);
+  }
+}
+
+/** One sampled video slot as `waitForVideoSlotState` hands it to its predicate. */
+export type ObservedVideoSlot = VideoSlotSample | undefined;
+
+/**
+ * Poll the page's `videoSlots` (on the bus cadence) until `slotId` satisfies
+ * `pred`, else throw with the last observed sample. The one convergence helper
+ * for every video spec (paired-test F2).
+ */
+export async function waitForVideoSlotState(
+  page: Page,
+  slotId: number,
+  pred: (slot: ObservedVideoSlot) => boolean,
+  why: string,
+): Promise<VideoSlotSample> {
+  const { converged, last } = await pollBus(
+    page,
+    async (): Promise<ObservedVideoSlot> => {
+      const { videoSlots } = await latestBusEventsOf(page, ['videoSlots']);
+      return videoSlots === undefined
+        ? undefined
+        : parseVideoSlots(videoSlots).slots.find((s) => s.slotId === slotId);
+    },
+    pred,
+    VIDEO_SLOT_STATE_LIVENESS_MS,
+  );
+  if (converged) {
+    if (last === undefined) {
+      throw new Error(`waitForVideoSlotState(${why}): a predicate must not accept a missing slot`);
+    }
+    return last;
+  }
+  throw new Error(
+    `LIVENESS: video slot ${slotId} never converged (${why}) within the liveness bound — ` +
+      `not a latency failure. Last observed: ${last === undefined ? '(slot absent from videoSlots)' : JSON.stringify(withoutLumas(last))}`,
+  );
 }
 
 /**
@@ -1315,6 +1461,12 @@ export async function expectDeclaredReceiveSlots(
   label: string,
   expectedSlots: number = SUITE_AUDIO_RECEIVE_SLOTS,
   expectedVideoSlots: number = SUITE_VIDEO_RECEIVE_SLOTS,
+  /**
+   * Story 3 R-1: `'truncates'` for a scenario that DELIBERATELY declares more
+   * video slots than MC's cap — the cap must then be BELOW the declaration
+   * (otherwise the over-subscription case is vacuous). Default: the cap admits it.
+   */
+  videoCap: 'admits' | 'truncates' = 'admits',
 ): Promise<void> {
   await expect
     .poll(
@@ -1350,8 +1502,13 @@ export async function expectDeclaredReceiveSlots(
   // (`classifySlotCap`); with the suite's M=0 the video bound is trivially met,
   // and `known` is what proves the field arrived.
   const caps = [
-    { kind: 'audio', slots: audio, needed: expectedSlots, key: 'MC_MAX_AUDIO_RECEIVE_SLOTS' },
-    { kind: 'video', slots: video, needed: expectedVideoSlots, key: 'MC_MAX_VIDEO_RECEIVE_SLOTS' },
+    { kind: 'audio', slots: audio, needed: expectedSlots, key: MC_MAX_AUDIO_RECEIVE_SLOTS_KEY },
+    {
+      kind: 'video',
+      slots: video,
+      needed: expectedVideoSlots,
+      key: MC_MAX_VIDEO_RECEIVE_SLOTS_KEY,
+    },
   ] as const;
   for (const { kind, slots: k, needed, key } of caps) {
     expect(
@@ -1359,6 +1516,14 @@ export async function expectDeclaredReceiveSlots(
       `${label}: MC's ${kind} cap is ${String(k?.['serverCapState'])} on the bus, expected ` +
         `known — MC sent no ${kind} receive-slot cap in its JoinResponse`,
     ).toBe('known');
+    if (kind === 'video' && videoCap === 'truncates') {
+      expect(
+        k?.['serverCap'],
+        `${label}: the over-subscription scenario declares M=${needed}, which must EXCEED MC's ` +
+          `video cap (${key}), or nothing is truncated`,
+      ).toBeLessThan(needed);
+      continue;
+    }
     expect(
       k?.['serverCap'],
       `${label}: MC's ${kind} cap (${key}) is below the scenario's ${kind} slot count ` +
@@ -1388,6 +1553,11 @@ export async function expectBuildKnobs(page: Page, label: string): Promise<void>
   expect(
     buildKnobs?.['testLevers'],
     `${label}: build-knob-missing: DT_TEST_LEVERS=1 is not set on this dev server. ${reused}`,
+  ).toBe(true);
+  expect(
+    buildKnobs?.['testPattern'],
+    `${label}: build-knob-missing: DT_TEST_PATTERN=1 is not set on this dev server, so video ` +
+      `publishers send the camera, not the per-participant test pattern layer 3 decodes. ${reused}`,
   ).toBe(true);
   expect(
     buildKnobs?.['telemetryConfigured'],
@@ -1421,17 +1591,19 @@ export async function flushTelemetry(page: Page): Promise<void> {
  * `captureSource.toneHz`), never derived: the detector shares no code with the
  * SDK's tone derivation. ASSERTS tone mode rather than assuming the dev server
  * was started with `DT_TEST_TONE=1` (`reuseExistingServer` may reuse one that
- * was not). Call after {@link startAudio}; waits for the one-shot event. Also
+ * was not). Call after {@link startMedia}; waits for the one-shot event. Also
  * asserts the build's declared N first ({@link expectDeclaredReceiveSlots}), so
  * every multi-party participant passes through both build-knob checks.
  */
 export async function readOwnTone(
   page: Page,
   label: string,
-  expectedSlots: number = SUITE_AUDIO_RECEIVE_SLOTS,
+  expectedSlots: number | 'checked-by-caller' = SUITE_AUDIO_RECEIVE_SLOTS,
 ): Promise<CohortTone> {
   await expectBuildKnobs(page, label);
-  await expectDeclaredReceiveSlots(page, label, expectedSlots);
+  if (expectedSlots !== 'checked-by-caller') {
+    await expectDeclaredReceiveSlots(page, label, expectedSlots);
+  }
   await expect
     .poll(
       async () => (await latestBusEventsOf(page, ['captureSource'])).captureSource !== undefined,
@@ -1458,16 +1630,24 @@ export async function readOwnTone(
   return { label, senderId, toneHz };
 }
 
-/** The receiver's latest `slotAssignments` view and `receiveAnalysis` lanes, one snapshot. */
+/**
+ * The receiver's latest AUDIO `slotAssignments` view, its video slot ids, and
+ * `receiveAnalysis` lanes, one snapshot. The story-2 hearing helpers reason
+ * about AUDIO slots only, so video assignments (story 3: a sender also holds a
+ * video slot) are split out here, once, rather than in every caller.
+ */
 export async function latestReceiveView(page: Page): Promise<{
   readonly assignments: readonly BusSlotAssignment[];
+  readonly videoSlotIds: ReadonlySet<number>;
   readonly lanes: readonly BusLaneAnalysis[];
 }> {
   const latest = await latestBusEventsOf(page, ['slotAssignments', 'receiveAnalysis']);
-  const assignments = latest.slotAssignments?.['assignments'];
+  const raw = latest.slotAssignments?.['assignments'];
+  const all = Array.isArray(raw) ? (raw as Array<BusSlotAssignment & { kind?: string }>) : [];
   const lanes = latest.receiveAnalysis?.['lanes'];
   return {
-    assignments: Array.isArray(assignments) ? (assignments as BusSlotAssignment[]) : [],
+    assignments: all.filter((a) => a.kind !== 'video'),
+    videoSlotIds: new Set(all.filter((a) => a.kind === 'video').map((a) => a.slotId)),
     lanes: Array.isArray(lanes) ? (lanes as BusLaneAnalysis[]) : [],
   };
 }
@@ -1508,19 +1688,18 @@ export async function expectHearsSender(
     admissionBaseline,
   }: { timeoutMs?: number; admissionBaseline?: InstanceCounters } = {},
 ): Promise<void> {
-  // A plain loop, not `expect.poll`: a ToneHarnessError / ToneCollisionError
-  // from the detector must fail AT ONCE, not be retried until the timeout.
-  const deadline = Date.now() + timeoutMs;
-  let last: ToneVerdict;
-  for (;;) {
-    const view = await latestReceiveView(page);
-    last = evaluateSenderLane({ receiver, sender, cohort, ...view });
-    if (last.kind === 'ok') return;
-    if (Date.now() > deadline) break;
-    // The bus's own sampling cadence: reading faster only sees the same
-    // `receiveAnalysis` record twice.
-    await page.waitForTimeout(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS);
-  }
+  // Through the one bus-cadence kernel: a ToneHarnessError / ToneCollisionError
+  // from the detector fails AT ONCE, never retried until the bound.
+  const { converged, last } = await pollBus(
+    page,
+    async (): Promise<ToneVerdict> => {
+      const { assignments, lanes } = await latestReceiveView(page);
+      return evaluateSenderLane({ receiver, sender, cohort, assignments, lanes });
+    },
+    (v) => v.kind === 'ok',
+    timeoutMs,
+  );
+  if (converged) return;
   let diagnosis = '';
   if (MISSING_SENDER_VERDICTS.has(last.kind)) {
     diagnosis =
@@ -1530,4 +1709,80 @@ export async function expectHearsSender(
         : ` — ${(await diagnoseMissingSender(admissionBaseline, `${receiver.label} missing ${sender.label}`)).report}`;
   }
   throw new Error(`layer 3 verdict ${last.kind} after ${timeoutMs}ms: ${last.detail}${diagnosis}`);
+}
+
+// ============================================================================
+// Story 3 C-C1: the REAL camera track's readyState (camera-mode contexts)
+// ============================================================================
+
+/**
+ * Install a TEST-OWNED `getUserMedia` wrapper (an init script, before any page
+ * script) that records every VIDEO track handed to the page, so a spec can
+ * assert the real track's `readyState` — the camera light — independently of
+ * the SDK's own `cameraTrackLive` report. Records video tracks only; never
+ * touches the app or the SDK (it lives here, in the suite, not in `src/`).
+ */
+export async function installVideoTrackRecorder(context: BrowserContext): Promise<void> {
+  await context.addInitScript(() => {
+    const md = navigator.mediaDevices;
+    if (md === undefined) return;
+    const tracks: MediaStreamTrack[] = [];
+    (window as { __e2e_video_tracks__?: MediaStreamTrack[] }).__e2e_video_tracks__ = tracks;
+    const original = md.getUserMedia.bind(md);
+    md.getUserMedia = async (constraints?: MediaStreamConstraints) => {
+      const stream = await original(constraints);
+      for (const t of stream.getVideoTracks()) tracks.push(t);
+      return stream;
+    };
+  });
+}
+
+/** The `readyState` of every video track the page has been handed, in order. */
+export async function recordedVideoTrackStates(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const tracks = (window as { __e2e_video_tracks__?: MediaStreamTrack[] }).__e2e_video_tracks__;
+    if (tracks === undefined) throw new Error('HARNESS: the video track recorder is not installed');
+    return tracks.map((t) => t.readyState);
+  });
+}
+
+/** The page's current meeting-KEK generation from its own bus (`kekGeneration`), or `undefined`. */
+export async function kekGeneration(page: Page): Promise<number | undefined> {
+  const { kekGeneration: event } = await latestBusEventsOf(page, ['kekGeneration']);
+  const generation = event?.['generation'];
+  return typeof generation === 'number' ? generation : undefined;
+}
+
+/** Wait until the page's recorded video track at `index` has ENDED (the camera light went off). */
+export async function expectCameraTrackEnded(
+  page: Page,
+  index: number,
+  why: string,
+): Promise<void> {
+  await expect
+    .poll(async () => (await recordedVideoTrackStates(page))[index] ?? 'no such track', {
+      message: `LIVENESS: camera track ${index} never ENDED (${why})`,
+      timeout: VIDEO_SLOT_STATE_LIVENESS_MS,
+    })
+    .toBe('ended');
+}
+
+/** Wait until the page has been handed a NEW video track (beyond `afterCount`) that is live. */
+export async function expectNewLiveCameraTrack(
+  page: Page,
+  afterCount: number,
+  why: string,
+): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        const states = await recordedVideoTrackStates(page);
+        return states.length > afterCount ? states.at(-1) : 'no new track';
+      },
+      {
+        message: `LIVENESS: no NEW live camera track was acquired (${why})`,
+        timeout: VIDEO_SLOT_STATE_LIVENESS_MS,
+      },
+    )
+    .toBe('live');
 }

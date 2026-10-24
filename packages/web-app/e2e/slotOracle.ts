@@ -79,18 +79,20 @@ export const KIND_FILL_ORDER: readonly Kind[] = ['audio', 'video'];
  */
 const KINDS: readonly Kind[] = ['audio', 'video'];
 
-/** The states story 2 already exercised, checked against the SDK's union. */
-export const SHARED_SLOT_STATES = [
+/**
+ * Every state the ORACLE can expect — deliberately NARROW: only the states MC
+ * emits for an occupied or truncated slot. The oracle can never expect a
+ * retained-but-never-emitted token (`switch_pending`, `withheld_by_congestion`,
+ * `source_unreachable`) or `unspecified`; if MC ever sends one, the bus (whose
+ * vocabulary is EVERY SDK token, `videoBusShape.ts`) carries it and the
+ * comparison fails as a state mismatch — never a silent pass. Checked against
+ * the SDK's union (`satisfies`), and its narrowness is pinned by
+ * `tests/slotOracle.test.ts`. (Story 3 C-C1 folded T-A's two lists into this
+ * one: the C-A1 split no longer meant anything.)
+ */
+export const EXPECTED_SLOT_STATES = [
   'active',
   'fewer_sources_than_slots',
-] as const satisfies readonly SlotStateToken[];
-
-/**
- * The story-3 avatar and truncation states, checked against the SDK's union
- * (`SlotStateToken`, flat vocabulary since story 3 C-A1) so the oracle and the
- * app share one vocabulary. Story 3 C-C1 may fold the two lists.
- */
-export const PENDING_SLOT_STATES = [
   'avatar_no_video',
   'avatar_client_muted',
   'avatar_server_muted',
@@ -98,8 +100,7 @@ export const PENDING_SLOT_STATES = [
 ] as const satisfies readonly SlotStateToken[];
 
 /** Every state the oracle can expect. */
-export type ExpectedSlotState =
-  (typeof SHARED_SLOT_STATES)[number] | (typeof PENDING_SLOT_STATES)[number];
+export type ExpectedSlotState = (typeof EXPECTED_SLOT_STATES)[number];
 
 /** One slot's expectation. */
 export interface SlotExpectation {

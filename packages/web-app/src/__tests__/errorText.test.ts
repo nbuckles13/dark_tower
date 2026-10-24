@@ -2,7 +2,7 @@
 //
 // Story 3 R-2: the local "neither publishes nor receives" refusal and the
 // not-yet-supported video publish reach the user as VISIBLE errors naming this
-// app's knobs. Story 2's over-cap refusal is retired (MC truncates; story 3 R-1).
+// app's knobs (and, since C-C1, the publish-set chooser). Story 2's over-cap refusal is retired (MC truncates; story 3 R-1).
 
 import { describe, expect, it } from 'vitest';
 import { SignalingError, SignalingErrorCode } from '@darktower/sdk-core';
@@ -19,15 +19,20 @@ describe('errorText', () => {
     expect(text).toContain('VITE_DT_VIDEO_RECEIVE_SLOTS');
   });
 
-  it('explains a not-yet-supported publish kind', () => {
+  it('explains a malformed publish set (story 3 C-C1: video publishes now; the refusal is a duplicate)', () => {
     const text = errorText(
-      new SignalingError(
-        SignalingErrorCode.PublishKindNotSupported,
-        'publishing video is not yet supported by this client',
-      ),
+      new SignalingError(SignalingErrorCode.PublishKindNotSupported, 'duplicate publish kind'),
     );
-    expect(text).toContain('not yet supported');
-    expect(text).toContain('audio only');
+    expect(text).toContain('duplicate publish kind');
+    expect(text).toContain('at most once');
+    expect(text).not.toContain('audio only');
+  });
+
+  it('the nothing-to-publish refusal names the chooser as well as the build knobs', () => {
+    const text = errorText(
+      new SignalingError(SignalingErrorCode.NothingToPublishOrReceive, 'nothing to do'),
+    );
+    expect(text).toContain('Choose the microphone or the camera');
   });
 
   it('never names the retired variable', () => {

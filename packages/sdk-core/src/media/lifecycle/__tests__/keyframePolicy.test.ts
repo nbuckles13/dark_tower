@@ -416,3 +416,38 @@ describe('KeyframeGate — Gate-3 additions', () => {
     expect(r.gate.effectiveIntervalMs).toBe(10_000);
   });
 });
+
+describe('KeyframeGate — producedBySource (story 3 C-C1, the test bus sendCounts)', () => {
+  it('counts every produced keyframe under its cause, EQUAL to the metric, and returns a copy', () => {
+    const r = rig({ awaiting: 1 });
+    expect(r.gate.producedBySource()).toEqual({ directive_start: 0, request: 0, abandonment: 0 });
+    r.gate.setDirective([A], 500);
+    r.gate.selfKey('directive_start');
+    r.emitKey();
+    r.time.advance(500);
+    r.gate.selfKey('abandonment');
+    r.emitKey();
+    r.time.advance(500);
+    r.gate.request(A, 1);
+    const snapshot = r.gate.producedBySource();
+    expect(snapshot).toEqual({ directive_start: 1, request: 1, abandonment: 1 });
+    // The same call site as the metric: the two cannot disagree.
+    for (const [source, n] of Object.entries(snapshot)) {
+      expect(r.count(PRODUCED, { source })).toBe(n);
+    }
+    // A copy: a reader holding it never sees it move.
+    r.time.advance(500);
+    r.gate.request(A, 2);
+    expect(snapshot.request).toBe(1);
+    expect(r.gate.producedBySource().request).toBe(2);
+  });
+
+  it('a request that produces nothing (stale, held, not sending) counts nothing', () => {
+    const r = rig({ awaiting: 1 });
+    r.gate.request(A, 0); // not directed: not_sending
+    r.gate.setDirective([A], 500);
+    r.setGop(5);
+    r.gate.request(A, 4); // stale
+    expect(r.gate.producedBySource()).toEqual({ directive_start: 0, request: 0, abandonment: 0 });
+  });
+});

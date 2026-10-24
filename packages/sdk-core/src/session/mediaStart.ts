@@ -56,6 +56,7 @@ import type {
   MeetingSessionOptions,
   VideoCaptureSourceInfo,
   VideoSlotRenderChangedEvent,
+  CameraHealthChangedEvent,
 } from './events.js';
 import {
   declaredSlotIds,
@@ -122,6 +123,7 @@ export interface SessionMediaDeps {
     readonly firstMediaFrame: (elapsedMs: number) => void;
     readonly mediaFault: (fault: MediaFault) => void;
     readonly videoSlotRenderChanged: (event: VideoSlotRenderChangedEvent) => void;
+    readonly cameraHealthChanged: (event: CameraHealthChangedEvent) => void;
   };
   /** The signalling-derived media state the pipelines attach to (E3 replay). */
   readonly mediaState: Pick<
@@ -213,6 +215,7 @@ export function buildSessionMedia(deps: SessionMediaDeps): SessionMedia {
       encoderFactory: seams.videoEncoderFactory,
       openStream: (url) => media?.openUniStream(url),
       fault: deps.emit.mediaFault,
+      onCameraHealthChanged: (failure) => deps.emit.cameraHealthChanged({ failure }),
       clock: deps.clock,
       ...seams.timers,
     });

@@ -84,12 +84,15 @@ export class MeetingStore {
   /** Seed the roster from the `joined` event's `existingParticipants`. */
   applyJoined(event: JoinedEvent): void {
     this.#participants = [...event.existingParticipants];
+    this.media.registerParticipant(event.participantId);
+    for (const p of event.existingParticipants) this.media.registerParticipant(p.participantId);
   }
 
   /** Append a participant (`participantJoined`); idempotent on participantId. */
   applyParticipantJoined(event: ParticipantJoinedEvent): void {
     const id = event.participant.participantId;
     if (this.#participants.some((p) => p.participantId === id)) return;
+    this.media.registerParticipant(id);
     this.#participants = [...this.#participants, event.participant];
   }
 

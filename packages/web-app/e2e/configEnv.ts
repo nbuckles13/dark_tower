@@ -13,6 +13,7 @@
 // the file and the key — defaulting would size the suite against a number the
 // cluster does not run.
 
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import { SUPPORTED_PROBE_CODECS, type ProbeCodec } from './vp8Probe.js';
@@ -39,24 +40,77 @@ export function parseConfigEnv(text: string): ReadonlyMap<string, string> {
 }
 
 /**
- * A required positive-integer key. `source` names the file; `purpose` says what
- * the suite needs it for, so a missing key reads as a cause, not a lookup miss.
+ * A required integer key of at least `min`. `source` names the file; `purpose`
+ * says what the suite needs it for, so a missing key reads as a cause, not a
+ * lookup miss. The one reader body; the two named bounds below wrap it.
  */
-export function requirePositiveInt(
+export function requireIntAtLeast(
   values: ReadonlyMap<string, string>,
   key: string,
   source: string,
   purpose: string,
+  min: 0 | 1,
 ): number {
   const raw = values.get(key);
   if (raw === undefined) {
     throw new Error(`${source} declares no ${key}; ${purpose}`);
   }
   const unquoted = unquote(raw);
-  if (!/^[0-9]+$/.test(unquoted) || Number(unquoted) < 1) {
-    throw new Error(`${source} ${key}="${raw}" is not a positive integer`);
+  if (!/^[0-9]+$/.test(unquoted) || Number(unquoted) < min) {
+    throw new Error(
+      `${source} ${key}="${raw}" is not a ${min === 1 ? 'positive' : 'non-negative'} integer`,
+    );
   }
   return Number(unquoted);
+}
+
+/** A required positive-integer key. */
+export function requirePositiveInt(
+  values: ReadonlyMap<string, string>,
+  key: string,
+  source: string,
+  purpose: string,
+): number {
+  return requireIntAtLeast(values, key, source, purpose, 1);
+}
+
+/** A required NON-NEGATIVE integer key (0 is legal: e.g. the video-off cap lever, R-26). */
+export function requireNonNegativeInt(
+  values: ReadonlyMap<string, string>,
+  key: string,
+  source: string,
+  purpose: string,
+): number {
+  return requireIntAtLeast(values, key, source, purpose, 0);
+}
+
+/** MC's per-kind receive-slot caps (story 3 R-1), the keys in MC's own ConfigMap. */
+export const MC_MAX_AUDIO_RECEIVE_SLOTS_KEY = 'MC_MAX_AUDIO_RECEIVE_SLOTS';
+export const MC_MAX_VIDEO_RECEIVE_SLOTS_KEY = 'MC_MAX_VIDEO_RECEIVE_SLOTS';
+
+/** MC's per-kind receive-slot caps. */
+export interface McReceiveCaps {
+  readonly audio: number;
+  readonly video: number;
+}
+
+/**
+ * Read MC's per-kind caps from the text of `infra/services/mc-service/config.env`
+ * — INDEPENDENTLY of MC's own report on the join (`receiveSlots.*.serverCap`),
+ * so a video-over-subscription spec is not circular (paired-test P2).
+ *
+ * FAILS CLOSED: the Kind overlay does not patch these keys (only the otel
+ * collector and the egress budget are patched for MC/MH), so the repo file IS
+ * what Kind runs. If a Kind patch ever changed a cap, the spec's equality check
+ * against MC's reported cap goes RED rather than silently green.
+ */
+export function readMcReceiveCaps(configEnvText: string, source: string): McReceiveCaps {
+  const values = parseConfigEnv(configEnvText);
+  const purpose = "cannot predict MC's per-kind slot truncation";
+  return {
+    audio: requireNonNegativeInt(values, MC_MAX_AUDIO_RECEIVE_SLOTS_KEY, source, purpose),
+    video: requireNonNegativeInt(values, MC_MAX_VIDEO_RECEIVE_SLOTS_KEY, source, purpose),
+  };
 }
 
 /** `infra/services/<service>/config.env`, as an absolute path. */
@@ -132,6 +186,13 @@ export function mcConfigRsPath(): string {
 // imports `node:url`, so the probe cannot import a runtime value from here).
 export { SUPPORTED_PROBE_CODECS, type ProbeCodec };
 
+/**
+ * The env var naming the DEPLOYED profile dump layer7.sh writes (Phase 1g).
+ * Required by its readers (global-setup's VP8 probe; the late-joiner spec's
+ * no-keyframe-interval check) — no fallback to the repo file.
+ */
+export const MEDIA_CODEC_PROFILE_ENV_VAR = 'E2E_MEDIA_CODEC_PROFILE_ENV';
+
 /** The five profile keys the VP8 probe reads, named once. */
 export const MEDIA_VIDEO_CODEC_KEY = 'MEDIA_VIDEO_CODEC';
 export const MEDIA_VIDEO_WIDTH_KEY = 'MEDIA_VIDEO_WIDTH';
@@ -202,3 +263,28 @@ export function vp8ProbeProfileDefine(
     ),
   };
 }
+
+/**
+ * MC's rotation timings read from their homes (MC's ConfigMap source and its
+ * config.rs default), and the worst-case LEAVE -> ROTATION budget grace + W in
+ * ms — the ONE home both KEK-rotation specs budget against. A liveness bound,
+ * never a latency gate.
+ */
+export function mcRotationBudget(): McRotationTimings & { readonly budgetMs: number } {
+  const env = serviceConfigEnvPath('mc-service');
+  const rs = mcConfigRsPath();
+  const timings = readMcRotationTimings(
+    readFileSync(env, 'utf8'),
+    env,
+    readFileSync(rs, 'utf8'),
+    rs,
+  );
+  return { ...timings, budgetMs: (timings.graceSeconds + timings.debounceSeconds) * 1000 };
+}
+
+/**
+ * Margin on top of {@link mcRotationBudget} for the rotation POLL: the push
+ * reaches the page and the bus samples it on its own tick, then the next poll
+ * reads it. Shared by both rotation specs so the two cannot drift.
+ */
+export const ROTATION_POLL_MARGIN_MS = 30_000;

@@ -32,6 +32,7 @@
 // analysis band below is therefore its own quantity — wide enough to contain any
 // tone the SDK documents — and deliberately not imported from the SDK.
 
+import type { TileSurface } from '@darktower/sdk-svelte';
 import {
   BoundedReceiveVerificationRecorder,
   createAudioContextPlaybackSink,
@@ -82,8 +83,42 @@ export interface LaneAnalysis {
   readonly spectrumDb: readonly number[];
 }
 
+/**
+ * The render-surface luma grid (README §Render-surface luma projection): 6 x 4.
+ *
+ * DELIBERATELY NOT IMPORTED FROM THE GENERATOR (`sdk-core media/setup/
+ * testPattern.ts` `TEST_PATTERN_COLUMNS/ROWS` / `testPatternRects()`), and its
+ * block edges are re-derived here from the README text (DRY review, recorded
+ * as a deliberate non-collapse). The sampler is the MEASURING side of layer 3:
+ * if it took the generator's rects, a generator that painted its blocks in the
+ * wrong place would be sampled in that same wrong place and still decode — a
+ * self-consistent geometry error invisible to the detector. Reading the canvas
+ * at the README's geometry is what makes a generator drift fail loudly.
+ */
+export const E2E_LUMA_GRID_COLUMNS = 6;
+export const E2E_LUMA_GRID_ROWS = 4;
+
+/** One video tile's render-surface sample. Counts and 24 integer lumas only. */
+export interface SurfaceSample {
+  readonly framesRendered: number;
+  /** Present only once at least one frame has been painted. */
+  readonly lumas: readonly number[] | undefined;
+}
+
 /** What the bus reads. */
 export interface E2EInstrumentation {
+  /**
+   * Story 3 C-C1: handed to each `VideoTile` as `onSurface`, so the bus can
+   * sample WHAT WAS PAINTED (the canvas), not the decoder output — a frame
+   * painted into the wrong slot reads as the wrong id.
+   */
+  readonly onSurface: (surface: TileSurface | undefined, slotId: number) => void;
+  /**
+   * The slot's render-surface sample, or `undefined` before its tile mounted.
+   * `withLumas`: read the canvas only when the caller will publish lumas (the
+   * slot renders video) — nothing is read to be discarded. Sample it.
+   */
+  surface(slotId: number, options: { readonly withLumas: boolean }): SurfaceSample | undefined;
   /** Injected as `MeetingSessionOptions.receiveVerification`. */
   readonly recorder: BoundedReceiveVerificationRecorder;
   /** Injected as `MeetingSessionOptions.playbackFactory`. */
@@ -107,6 +142,46 @@ interface Tap {
 }
 
 const round1 = (v: number): number => Math.round(v * 10) / 10;
+
+/**
+ * The 24 block-mean lumas of a painted canvas, row-major (README §Render-surface
+ * luma projection): Y = 0.299R + 0.587G + 0.114B over each block's CENTRAL HALF
+ * in each dimension, rounded to an integer. The tile sizes the backing store to
+ * the frame, so the drawn picture is the whole canvas (no letterbox).
+ * `undefined` when nothing has been painted.
+ */
+function sampleLumas(canvas: HTMLCanvasElement): number[] | undefined {
+  const width = canvas.width;
+  const height = canvas.height;
+  if (width === 0 || height === 0) return undefined;
+  const ctx = canvas.getContext('2d');
+  if (ctx === null) throw new Error('E2E instrumentation: the tile canvas has no 2d context');
+  const { data } = ctx.getImageData(0, 0, width, height);
+  const out: number[] = [];
+  for (let r = 0; r < E2E_LUMA_GRID_ROWS; r += 1) {
+    const by = Math.floor((r * height) / E2E_LUMA_GRID_ROWS);
+    const bh = Math.floor(((r + 1) * height) / E2E_LUMA_GRID_ROWS) - by;
+    const y0 = Math.ceil(by + bh / 4);
+    const y1 = Math.max(y0 + 1, Math.ceil(by + (3 * bh) / 4));
+    for (let c = 0; c < E2E_LUMA_GRID_COLUMNS; c += 1) {
+      const bx = Math.floor((c * width) / E2E_LUMA_GRID_COLUMNS);
+      const bw = Math.floor(((c + 1) * width) / E2E_LUMA_GRID_COLUMNS) - bx;
+      const x0 = Math.ceil(bx + bw / 4);
+      const x1 = Math.max(x0 + 1, Math.ceil(bx + (3 * bw) / 4));
+      let sum = 0;
+      let n = 0;
+      for (let y = y0; y < y1; y += 1) {
+        for (let x = x0; x < x1; x += 1) {
+          const i = (y * width + x) * 4;
+          sum += 0.299 * data[i]! + 0.587 * data[i + 1]! + 0.114 * data[i + 2]!;
+          n += 1;
+        }
+      }
+      out.push(Math.min(255, Math.max(0, Math.round(sum / n))));
+    }
+  }
+  return out;
+}
 
 /**
  * Build the instrumentation for ONE session, or `undefined` outside an E2E
@@ -231,9 +306,30 @@ export function createE2EInstrumentation(): E2EInstrumentation | undefined {
       return out;
     };
 
+    // Story 3 C-C1: the painted render surfaces, by slot.
+    const surfaces = new Map<number, TileSurface>();
+    const onSurface = (surface: TileSurface | undefined, slotId: number): void => {
+      if (surface === undefined) surfaces.delete(slotId);
+      else surfaces.set(slotId, surface);
+    };
+    const surface = (
+      slotId: number,
+      { withLumas }: { readonly withLumas: boolean },
+    ): SurfaceSample | undefined => {
+      const s = surfaces.get(slotId);
+      if (s === undefined) return undefined;
+      const framesRendered = s.framesRendered();
+      return {
+        framesRendered,
+        lumas: withLumas && framesRendered > 0 ? sampleLumas(s.canvas) : undefined,
+      };
+    };
+
     return {
       recorder,
       playbackFactory,
+      onSurface,
+      surface,
       verification: () => recorder.snapshot(),
       analysis,
     };

@@ -256,18 +256,33 @@ describe('VideoReceiver — render, sinks and evidence', () => {
     // R-32 evidence: counts, closed tokens, booleans + the two allowed ids.
     const evidence = h.receiver.evidence();
     expect(evidence).toEqual([
-      { slotId: 3, mcState: 'active', render: 'active', lastRenderedSender: A, unfulfilled: false },
+      {
+        slotId: 3,
+        mcState: 'active',
+        render: 'active',
+        lastRenderedSender: A,
+        unfulfilled: false,
+        framesDecoded: 1,
+      },
       {
         slotId: 4,
         mcState: 'avatar_no_video',
         render: 'avatar',
         lastRenderedSender: undefined,
         unfulfilled: false,
+        framesDecoded: 0,
       },
     ]);
     for (const row of evidence) {
       expect(Object.keys(row).sort()).toEqual(
-        ['lastRenderedSender', 'mcState', 'render', 'slotId', 'unfulfilled'].sort(),
+        [
+          'framesDecoded',
+          'lastRenderedSender',
+          'mcState',
+          'render',
+          'slotId',
+          'unfulfilled',
+        ].sort(),
       );
       for (const value of Object.values(row)) {
         expect(['number', 'string', 'boolean', 'undefined']).toContain(typeof value);

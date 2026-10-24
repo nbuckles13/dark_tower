@@ -76,6 +76,19 @@ const DIST = resolve(PKG_ROOT, 'dist');
 //     legitimately, so it would FAIL the rule.
 //   * `sendTracks` — a bus event type, only inside `if (__E2E_HOOKS__)`. NOT
 //     `videoCaptureSource` (also an SDK getter name): it FAILS the rule.
+//
+// Story 3 C-C1 additions (the per-slot video evidence bus and the camera lever):
+//   * `renderedSenderId` — a `videoSlots` field, only inside `if (__E2E_HOOKS__)`.
+//     It stands in for the `videoSlots` EVENT TYPE, which FAILS the rule: it is
+//     also the SDK's `ReceiveConfig.videoSlots` field (as `framesRendered` is a
+//     `VideoTile` counter).
+//   * `sendCounts` — a bus event type, only inside `if (__E2E_HOOKS__)` (the SDK
+//     method is deliberately named `sendTotals` so the marker stays unique).
+//   * `getImageData` — the render-surface luma read, only inside
+//     `if (__E2E_HOOKS__)` in `lib/e2eAnalysis.ts` (security: canvas readback is
+//     test-build only).
+//   * `testPattern` — the `buildKnobs` key for the test-pattern define.
+//   * `forceCameraCapture` — the lever key, only at `__DT_TEST_LEVERS__` sites.
 const FORBIDDEN = [
   '__darktower_test__',
   'mediaFrameCounts',
@@ -100,6 +113,11 @@ const FORBIDDEN = [
   'test_pattern',
   'dt-test-pattern',
   'sendTracks',
+  'renderedSenderId',
+  'sendCounts',
+  'getImageData',
+  'testPattern',
+  'forceCameraCapture',
 ] as const;
 
 /**

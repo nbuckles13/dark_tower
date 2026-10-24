@@ -66,6 +66,7 @@ export interface VideoSlotAssignment {
  * One video slot's R-32 evidence: counts, closed tokens and booleans, plus the
  * two identity values the security ruling allows (`slotId`, the VERIFIED
  * `lastRenderedSender`). NO durations, GoP values, stream numbers or sizes.
+ * `framesDecoded` is a cumulative count (story 3 C-C1, the bus's R-32 field).
  */
 export interface VideoSlotEvidence {
   readonly slotId: number;
@@ -75,6 +76,8 @@ export interface VideoSlotEvidence {
   readonly render: VideoRenderState['kind'];
   readonly lastRenderedSender: number | undefined;
   readonly unfulfilled: boolean;
+  /** Frames this slot's decoder produced within bounds (cumulative count). */
+  readonly framesDecoded: number;
 }
 
 /**
@@ -353,6 +356,7 @@ export class VideoReceiver {
       render: slot.renderState.kind,
       lastRenderedSender: slot.lastRenderedSender,
       unfulfilled: this.#unfulfilled.isUnfulfilled(slot.slotId),
+      framesDecoded: slot.framesDecoded,
     }));
   }
 

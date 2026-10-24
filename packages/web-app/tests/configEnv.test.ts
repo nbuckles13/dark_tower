@@ -12,6 +12,7 @@ import {
   vp8ProbeProfileDefine,
   parseConfigEnv,
   parseMcDefaultGraceSeconds,
+  readMcReceiveCaps,
   readMcRotationTimings,
   requirePositiveInt,
   serviceConfigEnvPath,
@@ -173,5 +174,26 @@ describe('vp8ProbeProfileDefine: what vitest.config.ts injects is DERIVED, never
     const config = readFileSync(new URL('../vitest.config.ts', import.meta.url), 'utf8');
     expect(config).toContain('...vp8ProbeProfileDefine(');
     expect(config).not.toContain(VP8_PROBE_PROFILE_DEFINE);
+  });
+});
+
+describe('readMcReceiveCaps (story 3 C-C1: the independent cap source)', () => {
+  it('reads both caps from the REAL MC config.env (the Kind overlay does not patch them)', () => {
+    const path = serviceConfigEnvPath('mc-service');
+    const caps = readMcReceiveCaps(readFileSync(path, 'utf8'), path);
+    expect(Number.isInteger(caps.audio) && caps.audio >= 0).toBe(true);
+    expect(Number.isInteger(caps.video) && caps.video >= 0).toBe(true);
+  });
+  it('accepts 0 (the video-off lever) and refuses a missing or malformed key', () => {
+    expect(
+      readMcReceiveCaps('MC_MAX_AUDIO_RECEIVE_SLOTS=8\nMC_MAX_VIDEO_RECEIVE_SLOTS=0', 'x'),
+    ).toEqual({
+      audio: 8,
+      video: 0,
+    });
+    expect(() => readMcReceiveCaps('MC_MAX_AUDIO_RECEIVE_SLOTS=8', 'x')).toThrow(/declares no/);
+    expect(() =>
+      readMcReceiveCaps('MC_MAX_AUDIO_RECEIVE_SLOTS=-1\nMC_MAX_VIDEO_RECEIVE_SLOTS=4', 'x'),
+    ).toThrow(/non-negative integer/);
   });
 });

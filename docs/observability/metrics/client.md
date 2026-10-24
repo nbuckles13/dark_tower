@@ -410,7 +410,7 @@ wrong side does not compile.
 handle exists from join, but constructing a handle emits nothing: video series are lazy
 or zero-initialised at first direction (`keyframes_produced`, `send_groups_abandoned`),
 and `send_directive_kind_missing` zero-inits for video at join only when video is
-published. C-B's video read-back must be baseline -> rise, not presence. **Cardinality:** each per-kind series doubles (x2) once
+published. The video read-back (`packages/web-app/e2e/multi-party-see.spec.ts`, story 3 C-C1) is baseline -> rise, not presence. **Cardinality:** each per-kind series doubles (x2) once
 video emits; a patched client can add a third value, `invalid`, via the collector's
 exact rewrite (`collector.yaml` `delta_to_cumulative` figure).
 
