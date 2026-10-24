@@ -671,3 +671,23 @@ How an unsupported verdict is routed:
 - Routing is fail-closed. No file, any other line 1, or a line 2 outside the list stays `FAIL`. A verdict file next to a green suite is a loud `FAIL`.
 - The token and the sub-check list are declared once in `vp8Probe.ts`. `tests/vp8Probe.test.ts` fails if `layer7.sh`'s mirror drifts.
 - Remediation and the accepted residual (the probe runs after the Rust env-tests) are in `docs/runbooks/devloop-validation.md` §6.7.
+
+## Capacity evidence run (story 3 R-28, opt-in, not a gate)
+
+R-28 asks for cohort size, CPU load and Kind capacity to be verified as evidence, not assumed. `capacity.evidence.ts` records that evidence for the two video cohort shapes declared in its `SHAPES` / `PARTICIPANTS`.
+
+**How it runs.**
+- Only through `playwright.capacity.config.ts` (`pnpm --filter @darktower/web-app test:capacity-evidence`). It uses the base config unchanged, with a `testMatch` for that one file.
+- The file name is outside the default `*.spec.ts` match, so `test:e2e` and Layer 7 never run it.
+- It needs the same environment as a Layer-7 browser run (`E2E_*`, `E2E_MEDIA_CODEC_PROFILE_ENV`, the org subdomain; see [Running](#running) and the VP8 probe's manual-run note above).
+- It must run on Linux, because process CPU is read from `/proc`.
+
+**What it records.** One `[capacity-evidence]` JSON line per shape, also attached under the gitignored `test-results/`:
+- process-level CPU per browsing context. `processCpu.ts` maps each context's renderer by an in-page busy-loop fingerprint taken while the page is idle, and fails loudly on ambiguity rather than guessing;
+- per-slot frames decoded and rendered, and per-publisher keyframes by cause (from the bus);
+- groups abandoned and each video slot's unfulfilled reading (from the R-35 overlay, opened only at the window's two ends);
+- the window's bounds, for the MH reads from Prometheus.
+
+**What fails it.** Liveness lost under the video detector in any round across the window, or a slot still unfulfilled at window end. Both are story-blocking findings, printed before the failure. CPU is never judged.
+
+The run's results are recorded in `docs/user-stories/2026-10-07-see-each-other-manual-test-plan.md` §Capacity evidence.

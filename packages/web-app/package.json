@@ -12,6 +12,7 @@
     "test:unit": "vitest run --config vitest.node.config.ts",
     "test:component": "vitest run --config vitest.config.ts",
     "test:e2e": "playwright test",
+    "test:capacity-evidence": "playwright test --config playwright.capacity.config.ts",
     "test:watch": "vitest --config vitest.config.ts",
     "lint": "svelte-check --tsconfig ./tsconfig.json && eslint src/ e2e/",
     "typecheck": "svelte-check --tsconfig ./tsconfig.json"
