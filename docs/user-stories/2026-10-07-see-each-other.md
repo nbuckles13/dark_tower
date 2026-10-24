@@ -2458,7 +2458,7 @@ tasks:
   slug: 2026-10-24-kind-video-test-profile
   tag: story-2026-10-07-see-each-other-task-16
 - id: 17
-  status: pending
+  status: completed
   specialist: client
   deps:
   - 7
@@ -2593,6 +2593,7 @@ tasks:
     - The env-test for the leaver lockout with video flowing is included or cross-referenced.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-24-c-c1-see-each-other-grid
   tag: story-2026-10-07-see-each-other-task-17
 - id: 18
   status: pending
