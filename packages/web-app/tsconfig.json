@@ -20,6 +20,7 @@
     "vite/**/*",
     "vite-env.d.ts",
     "playwright.config.ts",
+    "playwright.capacity.config.ts",
     "vite.config.ts",
     "vitest.config.ts",
     "vitest.node.config.ts"
