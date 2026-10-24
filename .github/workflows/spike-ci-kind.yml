@@ -19,6 +19,7 @@ env:
   KIND_VERSION: v0.33.0          # run 3: v0.20 `kind load` fails on the runner Docker image store (ctr digest not found); S2 also recommends v0.33
   HOST_GATEWAY_IP: 10.255.255.254  # devloop-helper DEFAULT_HOST_GATEWAY_IP
   SLUG: ci
+  PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright  # run 6: layer7 defaults to the image path /opt/ms-playwright
 
 jobs:
   layer7:
