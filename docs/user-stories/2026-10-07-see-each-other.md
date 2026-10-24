@@ -2650,7 +2650,7 @@ tasks:
   slug: 2026-10-24-c-c2-debug-panel
   tag: story-2026-10-07-see-each-other-task-18
 - id: 19
-  status: pending
+  status: completed
   specialist: operations
   deps:
   - 4
@@ -2800,6 +2800,7 @@ tasks:
     - No runbook step asks an operator to log, dump or export per-stream sizes, timings or GoP values. Per-participant investigation uses MC's assignment state.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-24-story3-ops-b-video-runbooks
   tag: story-2026-10-07-see-each-other-task-19
   tier: light
   tier_reason: docs-only runbook scenarios; no code, contract or security surface
