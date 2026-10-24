@@ -56,7 +56,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler socat  # socat: dev-cluster client transport
 
       - name: Install Rust toolchain
         run: |
@@ -133,6 +133,7 @@ jobs:
           ln -sfn "/tmp/devloop-${SLUG}" /tmp/devloop
           ls -la /tmp/devloop/
 
+          infra/devloop/dev-cluster status || { echo "::error::dev-cluster status failed"; exit 1; }
           echo "layer7,$(date -u +%s)" >> /tmp/spike/phases.csv
           set +e
           /usr/bin/time -v ./scripts/layer-all.sh --layers 7 2> >(tee /tmp/spike/time-v.txt >&2)
