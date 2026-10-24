@@ -111,6 +111,10 @@ layer_lifecycle_begin 3
   # STORY_REPO_ROOT/DT_STORY seams; stub claude/sleep/date, real git, real
   # dt-story. No cluster, no network, no real sessions.
   run_and_emit "run-story-selftest" "${__here}/workflow/run-story.test.sh" || true
+  # Devloop log reader self-test: a synthetic stream-json session pins each phase signal
+  # against its false-positive twin, the view filters, and the follow loop moving to the
+  # next task's log. Hermetic; no cluster.
+  run_and_emit "devloop-log-selftest" "${__here}/workflow/devloop-log.test.sh" || true
   # Dev-tool binary home (scripts/lib/tool-bins.sh): source-safety, unconditional
   # assignments, crate allow-list, pinned --target-dir, stale release-profile binary
   # removal, exec-mode missing-binary token. Hermetic — fake root + PATH-stubbed cargo.
