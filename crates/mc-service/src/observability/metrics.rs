@@ -658,16 +658,21 @@ pub fn record_receive_capability(outcome: CapabilityOutcome) {
 /// publishers nobody watches. An alerting predicate of `outcome!="emitted"` would
 /// page on a legal state.
 ///
-/// `unknown_stream_number`, `transport_mode_unspecified` and — since story 2 —
-/// `handler_url_unresolved` are **MC defects**: any non-zero value indicates a
-/// bug (every handler url now comes from one frozen handler set). The remaining
-/// **two** failure values are environmental: `meeting_state_unavailable` and
-/// `assignment_failed`. All are disjoint by construction: composition is
-/// sequential stages and the first failing stage returns its own value.
+/// The alert classes of the failure values (MC defect vs environmental) live in
+/// ONE home, `DirectiveOutcome::alert_class()` (`media_signaling/outcome.rs`,
+/// test module), pinned to the two rules in
+/// `infra/docker/prometheus/rules/mc-alerts.yaml` by a unit test; they are not
+/// restated here. In short: `assignment_failed` is an MC defect (story 3
+/// OBS-B), and `meeting_state_unavailable` is the only environmental value — a
+/// post-join capability re-declaration the meeting actor did not register. All
+/// are disjoint by construction: composition is sequential stages and the first
+/// failing stage returns its own value.
 ///
 /// **Recorded by the meeting actor on every composition**, unconditionally —
 /// including compositions triggered by a peer's join, leave, declaration or
-/// mute — plus once at join if the connection cannot obtain the meeting handle.
+/// mute — plus by the connection when a post-join re-declaration is not
+/// registered (`meeting_state_unavailable`). There is no join-time recording
+/// site.
 ///
 /// # The one caveat before concluding anything from a healthy graph
 ///

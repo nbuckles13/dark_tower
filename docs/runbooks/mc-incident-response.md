@@ -2086,10 +2086,43 @@ sum by (outcome) (rate(mc_media_send_directives_total{outcome!~"emitted|emitted_
 |---|---|---|---|
 | `emitted` | **normal** | Composed with at least one target. A participant whose video is withdrawn but whose audio is directed still reads `emitted`, because the directive spans both kinds. | — |
 | `emitted_empty_targets` | **normal** | Composed with no target on any kind: send nothing. Routine for a solo participant, a participant nobody watches, and a participant whose every published kind is withdrawn. | — |
-| `meeting_state_unavailable` | **fault** (environmental) | MC could not get the meeting actor handle. | Actor health: Scenario 1 (mailbox depth) and Scenario 2 (actor panics). |
-| `assignment_failed` | **fault** (environmental) | MC could not render the meeting's slot table into a forwarding assignment. | File against `meeting-controller`. Also read the `Forwarding assignment could not be rendered` ERROR at `mc.register_meeting.trigger`. |
-| `handler_url_unresolved` | **fault** (MC defect) | **MC-internal defect since story 2.** Every url comes from one frozen handler set, so a miss cannot happen by construction. It fails closed: nothing is sent to that participant. | File against `meeting-controller`. |
-| `unknown_stream_number`, `transport_mode_unspecified` | **fault** (MC defect) | **MC-internal defects**, fail-closed. Not operator-actionable. | File against `meeting-controller`. These are diagnostics and not pageable. |
+| `meeting_state_unavailable` | **fault** (environmental) — **warning** (`MCMediaSendDirectiveFailures`) | Its only producer is a POST-JOIN capability re-declaration the meeting actor did not register (`connection.rs`, the redeclare path): the actor is gone, usually because the meeting is ending or the participant already left. The participant is **not** darkened: its previous declaration and view stay in force. The shipped SDK never re-declares (`SignalingClient.sendReceiveCapability` has no production caller), so today this is near-unreachable; an isolated occurrence at a meeting's end is benign, and recurring occurrences in live meetings are actor health. | Actor health: Scenario 1 (mailbox depth) and Scenario 2 (actor panics). |
+| `assignment_failed` | **fault** (MC defect) — **PAGE** (`MCMediaSendDirectiveDefect`) | MC could not render the meeting's slot table into a forwarding assignment. *(Reclassified from "environmental" by OBS-B: its only producer is the render's egress-ordinal overflow, which the startup-validated per-kind slot caps make unreachable, so a hit is an MC invariant violation.)* It is **meeting-wide**: every participant of that meeting fails composition and MH is not programmed for it. | [Paged response](#send-directive-defect-page) below. Read the `Forwarding assignment could not be rendered` ERROR at `mc.register_meeting.trigger`. |
+| `handler_url_unresolved` | **fault** (MC defect) — **PAGE** (`MCMediaSendDirectiveDefect`) | **MC-internal defect since story 2.** Every url comes from one frozen handler set, so a miss cannot happen by construction. It fails closed: nothing is sent to that participant. | [Paged response](#send-directive-defect-page) below. |
+| `unknown_stream_number`, `transport_mode_unspecified` | **fault** (MC defect) — **PAGE** (`MCMediaSendDirectiveDefect`) | **MC-internal defects**, fail-closed. | [Paged response](#send-directive-defect-page) below. |
+| *any token not listed above* | **unclassified** — **warning** (`MCMediaSendDirectiveFailures`, negated selector) | A `DirectiveOutcome` variant added without classifying it. Build-time, `DirectiveOutcome::alert_class()` (no wildcard) and its rule-pinning test should have stopped this; reaching runtime means the rule file and the enum drifted. | File against `meeting-controller` + `observability`: classify the token in `alert_class()` and in both rule selectors. |
+
+<a id="send-directive-defect-page"></a>
+
+**Paged: `MCMediaSendDirectiveDefect`.** These tokens read zero on a healthy fleet (zero-initialised
+across `DirectiveOutcome::ALL`), so one increment is a real defect. Each failure is a deterministic
+function of meeting-lifetime state (the stream policy, the frozen handler set, the rendered slot
+table) and composition fails **closed with no retry**: the affected participant (for
+`assignment_failed`, the whole meeting) receives neither a `SendDirective` nor `StreamAssignments`.
+It neither sends nor receives for the rest of the meeting, while join, roster and every other signal
+read healthy, and no media alert (A3, A9) sees it because no slot ever turns active. **The alert
+resolves 15 minutes after the last failed composition; that is not recovery.** A dark meeting stays
+dark until a structural change recomposes it successfully.
+
+1. **Scope.** Count the ERROR lines and distinct `meeting_id`s:
+   `kubectl logs deployment/mc-0 -n dark-tower --since=30m | grep -E "Media signalling could not be composed|Forwarding assignment could not be rendered"`
+   (repeat for `mc-1`). One meeting is a defect to file; several meetings or both instances is a
+   regression.
+2. **Correlate with a rollout.** `kubectl rollout history deployment/mc-0 -n dark-tower` and the pod
+   ages. A first appearance after an MC deploy is the deploy.
+3. **Mitigate: roll back MC** per [`mc-deployment.md` §How to Rollback](mc-deployment.md#how-to-rollback),
+   both instances, when step 2 ties the first appearance to an MC rollout. Mind its story-3 cutover
+   note: rollback across the v2→v3 break is all components together. There is no config lever for
+   these tokens (none is config-reachable). **No rollout correlates** (a latent defect in a build
+   that has been running): there is no rollback target; escalate to `meeting-controller` on-call
+   with the ERROR lines and the affected meeting ids. For affected users: a membership change (a
+   leave or join) re-renders and may clear `assignment_failed`; the other tokens derive from
+   meeting-lifetime state and persist until the meeting itself ends (everyone leaves) and is
+   started again.
+4. **Confirm.** The rollback replaces the MC pods, so every meeting on them is re-established and
+   recomposed from scratch; affected participants recover by reconnecting, not in place. The rule
+   must stay clear for 15 minutes after the rollback completes. File against `meeting-controller`
+   with the ERROR lines either way.
 
 **Withdrawals: `mc_media_send_directive_withdrawals_total{media_kind, reason}`.** This is the
 per-kind, per-cause record of a published kind being directed to send nothing. `reason="unwatched"`
@@ -2110,9 +2143,11 @@ The faults are a **missing** withdrawal and a withdrawal that did not take, neve
 one. A server mute of a WATCHED stream that did not move `{reason="server_muted"}` for that kind is
 MC's side of "camera light still on after server mute" (Scenario 21 Step 1b); whether the client
 then stopped capture, and "client sending while muted", are client-side and MH-side signals,
-triaged in Scenario 21 and MH Scenario 19 and extended to video by OPS-B. **OBS-B writes the alert rule for the fault tokens above**, and
-no rule is written here (`docs/TODO.md` §Media Path Obligations, "`mc_media_send_directives_total`
-has no alert rule …").
+triaged in Scenario 21 and MH Scenario 19 and extended to video by OPS-B. **The fault tokens above
+alert through two rules in `infra/docker/prometheus/rules/mc-alerts.yaml`** (OBS-B; both link here):
+`MCMediaSendDirectiveDefect` (**page**, the four MC-defect tokens) and
+`MCMediaSendDirectiveFailures` (**warning**, negated selector: `meeting_state_unavailable` and any
+unclassified token). Withdrawals never feed either rule.
 
 **Where the logs are.** Since story 2 the MEETING ACTOR composes every
 participant's view, so every composition failure logs at **ERROR** on
@@ -3702,15 +3737,16 @@ recovers on the next keyframe.
 **Detection**
 
 ```promql
-sum(rate(dt_client_media_decoder_errors_total{media_kind="video"}[10m]))
-  / clamp_min(sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[10m])), 1e-9)
+# Client windows are [5m], below the collector's 10m metric_expiration (client-metrics-export G5), as the alert's are.
+sum(rate(dt_client_media_decoder_errors_total{media_kind="video"}[5m]))
+  / clamp_min(sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[5m])), 1e-9)
 
 # Split by build: a new SDK rollout shows as one client_version
-sum by (client_version) (rate(dt_client_media_decoder_errors_total{media_kind="video"}[10m]))
+sum by (client_version) (rate(dt_client_media_decoder_errors_total{media_kind="video"}[5m]))
 
 # Neighbouring video losses (each has its own fork below)
-sum by (reason) (rate(dt_client_media_frames_dropped_total{media_kind="video"}[10m]))
-sum(rate(dt_client_media_decode_queue_dropped_total{media_kind="video"}[10m]))
+sum by (reason) (rate(dt_client_media_frames_dropped_total{media_kind="video"}[5m]))
+sum(rate(dt_client_media_decode_queue_dropped_total{media_kind="video"}[5m]))
 ```
 
 **Diagnosis: forks.**
@@ -3763,7 +3799,7 @@ routing for key or identity rejects.
 
 ### Scenario 23: Client Video Slot Unfulfilled
 
-**Alert**: `ClientVideoSlotUnfulfilled` (A9, warning: p95 of `dt_client_media_slot_unfulfilled_duration_ms` above 10 × the minimum keyframe interval for 15m; rule owned by observability, OBS-B). `dt_client_media_slots_unfulfilled` is a panel only.
+**Alert**: `ClientVideoSlotUnfulfilled` (A9, warning: p95 of `dt_client_media_slot_unfulfilled_duration_ms` above 10 × the minimum keyframe interval over a `[5m]` window for 5m — exit-only observations are sparse, so `for:` stays within the window; rule owned by observability, OBS-B). `dt_client_media_slots_unfulfilled` is a panel only.
 **Severity**: Warning
 **Runbook Section**: `#scenario-23-client-video-slot-unfulfilled`
 
@@ -3780,7 +3816,7 @@ fleet count. Users see a frozen picture or the previous avatar.
 **Detection**
 
 ```promql
-histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[15m])))
+histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[5m])))
 10 * 1000 * max(mc_media_video_keyframe_min_interval_seconds)     # same unit (ms)
 max by (media_kind) (dt_client_media_slots_unfulfilled{media_kind="video"})   # ONE browser's last value, not a fleet count; never read as healthy at 0
 

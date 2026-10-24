@@ -165,6 +165,52 @@ pub const MEDIA_KIND_AUDIO: &str = "audio";
 /// a property of MH, not of its media-path subset.
 pub const MH_SERIES_PREFIX: &str = "mh_";
 
+/// Story 3 MH series registered EAGERLY at MH startup — the ONE list env-test
+/// 32 (presence) and 33 (story-3 APPLY gating) both read. Each is resolved by
+/// `resolve_media_handles` / `publish_stream_limits` / the policy-bound and
+/// cost publishers, or published when the session actor is built
+/// (`mh_media_stream_sources_declared`), in `crates/mh-service/src/`.
+///
+/// STATED RESIDUAL — lazy story-3 MH series, deliberately NOT listed (present
+/// only after their first observation, so a presence gate would red on an idle
+/// cluster): the `mh_media_edge_pending_duration_seconds` histogram (observed
+/// at pending exit; its `_bucket`/`_count` appear only after one).
+pub const STORY_3_EAGER_MH_SERIES: &[&str] = &[
+    "mh_media_group_starts_total",
+    "mh_media_group_resets_total",
+    "mh_media_stream_ingress_groups",
+    "mh_media_paused_source_frames_total",
+    "mh_media_keyframe_requests_sent_total",
+    "mh_media_keyframe_request_write_failures_total",
+    "mh_media_recovery_requests_received_total",
+    "mh_media_edges_pending",
+    "mh_media_edge_pending_oldest_seconds",
+    "mh_media_edge_pending_exits_total",
+    "mh_media_egress_stream_backlog_bytes",
+    "mh_media_egress_stream_backlog_limit_bytes",
+    "mh_media_stream_mid_frame_stall_seconds",
+    "mh_media_stream_sources_declared",
+    "mh_media_uni_streams_per_connection_limit",
+    "mh_media_source_streams_per_meeting_limit",
+    "mh_media_candidate_sources_per_egress_limit",
+    "mh_media_stream_cost_video_bytes_per_second",
+];
+
+/// Story 3 MC series present from MC boot — the ONE list 32 and 33 both read:
+/// MC's boot gauge (`webtransport/server.rs`, the directed minimum keyframe
+/// interval) and counters zero-initialised over their full label domains by
+/// `crates/mc-service/src/observability/metrics.rs::zero_initialize_counters`.
+/// Most other MC media metrics are lazy and are NOT gated.
+pub const STORY_3_EAGER_MC_SERIES: &[&str] = &[
+    "mc_media_video_keyframe_min_interval_seconds",
+    "mc_media_send_directives_total",
+    "mc_media_send_directive_withdrawals_total",
+    "mc_media_policy_pushes_total",
+    "mc_media_mute_requests_total",
+    "mc_media_server_mute_requests_total",
+    "mc_media_unmute_requests_total",
+];
+
 /// R4 identity vocabulary, CONTAINMENT half: nouns long enough to match as a
 /// substring of the lower-cased key (`senderIndex`, `x_stream_id`).
 ///

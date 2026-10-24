@@ -45,10 +45,12 @@
 //! running MH pod with no media flowing. Absence there is a genuine fault and is
 //! gated.
 //!
-//! MC's media metrics are created lazily on first emission
+//! MOST of MC's media metrics are created lazily on first emission
 //! (`init_metrics_recorder()` sets histogram buckets only), so on an idle cluster
 //! their absence is the EXPECTED state. MC is therefore in the absence selector
-//! but **not** in the presence anchor. An MC-shaped presence gate would red on
+//! but **not** in the presence anchor. The exceptions are explicit and gated by
+//! name in `STORY_3_EAGER_MC_SERIES`: MC's boot gauge and the outcome counters
+//! `zero_initialize_counters()` registers at boot. An MC-shaped presence gate would red on
 //! every idle run and be muted within weeks — which is how a control dies, and
 //! is the failure mode this whole suite exists to demonstrate against. The
 //! asymmetry is deliberate. It is stated here and in the runbook because it
@@ -61,7 +63,8 @@
 use env_tests::cluster::ClusterConnection;
 use env_tests::eventual::{assert_eventually, ConsistencyCategory};
 use env_tests::fixtures::metric_hygiene::{
-    self, check_series, scrape_reachable_client_series, service_jobs_with_metric_relabeling, Series,
+    self, check_series, scrape_reachable_client_series, service_jobs_with_metric_relabeling,
+    Series, STORY_3_EAGER_MC_SERIES, STORY_3_EAGER_MH_SERIES,
 };
 use env_tests::fixtures::PrometheusClient;
 
@@ -214,6 +217,22 @@ async fn media_metric_labels_carry_no_meeting_identifier_and_no_overclaim() {
             "{TRIAGE_SCRAPE}: `{name}` is absent from the scrape. It is published \
              eagerly at MH startup (story 2 task 8), so absence means the publish \
              path regressed to lazy or ran before the metrics recorder was installed."
+        );
+    }
+
+    // Story 3 (OBS-B): every eager story-3 series, so the identity,
+    // `key_custody` and MH-type-blind checks demonstrably inspect them rather
+    // than passing over their absence. One shared list with env-test 33.
+    for name in STORY_3_EAGER_MH_SERIES
+        .iter()
+        .chain(STORY_3_EAGER_MC_SERIES)
+    {
+        assert!(
+            series.iter().any(|s| s.name == *name),
+            "{TRIAGE_SCRAPE}: `{name}` is absent from the scrape. It is registered at \
+             service startup (MH resolve_media_handles / publish_stream_limits, MC boot gauge \
+             or zero_initialize_counters), so absence means its registration regressed to \
+             lazy, ran before the recorder, or the pod is not scraped."
         );
     }
 

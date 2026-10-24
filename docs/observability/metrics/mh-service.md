@@ -262,6 +262,7 @@ sections. The heading exists because these are not gRPC transport metrics, and
 because story task 21's media metrics need a section to extend.
 
 ### `mh_media_policy_applies_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `MHTransportInconsistent` reads `outcome="rejected_transport_inconsistent"` (one of its two arms).
 - **Type**: Counter
 - **Description**: Outcome of every ADR-0036 §8 forwarding-policy application MH considered. Incremented exactly once per `RegisterMeeting` call that reaches the **policy boundary** — the first read of a policy-bearing field (`egress_streams`, `selection_rules`, `policy_generation`) — on every terminal path from there onward.
 - **Labels**:
@@ -313,7 +314,7 @@ sum(rate(mh_media_policy_applies_total{outcome=~"rejected_stale|rejected_invalid
 
 The denominator is meaningful because the counter increments on every post-boundary path: `sum(mh_media_policy_applies_total)` is "registrations whose policy MH considered". Pre-boundary rejects (a malformed `mc_grpc_endpoint`, an over-length `mc_id`) are **not** counted here — they land on `mh_grpc_requests_total{method="register_meeting",status="error"}` alone, because "MC's assignment computation produced a policy MH will not apply" and "this caller's endpoint is malformed" have different owners and different remedies.
 
-No alert rule ships with this metric. A useful threshold depends on MC's re-assert cadence, which task 13 explicitly deferred to the handler-restart story; alerting is story task 21's scope.
+No alert rule reads this metric's apply/reject balance: a useful threshold depends on MC's re-assert cadence, deferred to the handler-restart story. The one exception is story 3's `rejected_transport_inconsistent`, which `MHTransportInconsistent` reads (story 3 OBS-B).
 
 ---
 
@@ -813,6 +814,7 @@ Cancellation during shutdown does **not** increment: this counter records
 decisions reached, and a cancelled await is not a decision.
 
 ### `mh_media_frames_forwarded_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `MHPausedSourceIngress` uses `direction="ingress"` (once per ingress frame) as its denominator and guard.
 - **Type**: Counter
 - **Description**: Frames MH accepted into the forward path (`direction=ingress`) and frames forwarded to a subscriber (`direction=egress`). **The egress meaning differs by path**: on the DATAGRAM path it is "the transport accepted the datagram"; on the STREAM path (story 3 MH-A2) it is "the rewritten header was pushed to the edge's downlink (MH-side)" — the instant the hop number is consumed — because a cut-through frame's tail is still in flight at that point. On the stream path `direction=ingress` is counted once per frame at HEADER completion, never per chunk or per edge.
 - **Labels**:
@@ -874,6 +876,7 @@ defensible and neither is inferable from the series names, which is why they are
 stated here.
 
 ### `mh_media_frames_dropped_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `MHTransportInconsistent` reads `reason="transport_mismatch"` (its second arm). Per-path stream drops are not alerted, by decision.
 - **Expected-empty**: yes — every fault reason reads zero on a healthy path; the two exceptions are named, not hidden: `no_subscriber` shows a short in-flight tail when a sender's last subscriber leaves, and `server_muted` is non-zero during healthy moderation (both below)
 - **Type**: Counter
 - **Description**: Frames MH did not forward, by reason.
@@ -1217,6 +1220,7 @@ group start. Accounting rules a responder needs before reading any panel:
   stream keeps being read so a lifted mute resumes at the next group start.
 
 ### `mh_media_group_starts_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `MHVideoKeyframeStorm` reads `direction="ingress"` (numerator, per open ingress group); `MHVideoSubscriberBacklogResets` reads `direction="egress"` (denominator and guard).
 - **Type**: Counter
 - **Description**: Groups (uni streams) started. `direction=ingress`: one per accepted publisher group stream whose first frame was ATTRIBUTED (a refused or attribution-failed stream never counts). `direction=egress`: one per downlink stream actually opened to a subscriber (when `open_uni` returns).
 - **Labels**: `direction` (`ingress` | `egress`), `key_custody`
@@ -1224,6 +1228,7 @@ group start. Accounting rules a responder needs before reading any panel:
 - **Usage**: Stream churn. Egress over ingress is the mean number of destinations a group reaches.
 
 ### `mh_media_group_resets_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `MHVideoSubscriberBacklogResets` reads `reason="subscriber_backlog"` over egress group starts, fleet-wide only (per-path recovery stays a panel, R-12). The 1+N counting is why that ratio over-reads.
 - **Expected-empty**: no — `subscriber_backlog` and `publisher_*` have a legitimate tail on real networks
 - **Type**: Counter
 - **Description**: Downlink groups MH abandoned for ONE destination (RESET, never finished). **One per downlink group abandoned for a destination, whether or not its uni stream was opened** — a full downlink channel or a backlog overflow on an edge with N live downlinks counts 1 + N — counted in exactly one place (`Downlink::abandon`), whether or not the transport reset then succeeds. **Not a subset of `mh_media_group_starts_total{direction="egress"}`** (a group can be abandoned before its stream opens), so never build resets/starts as a "share of groups abandoned" without that caveat. Every reset carries the single reasonless application code `GROUP_ABANDONED`; the reason is MH-local. A stream reset by the transport seam's DROP contract because the subscriber's connection is already gone is **deliberately uncounted** (the destination no longer exists).
@@ -1242,6 +1247,7 @@ group start. Accounting rules a responder needs before reading any panel:
 | `edge_removed` | MC removed the edge mid-group, or `EndMeeting` released the meeting. | Routine on reassignment. |
 
 ### `mh_media_stream_ingress_groups`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `MHVideoKeyframeStorm`'s denominator and guard (`avg_over_time` over the window): the live active-source measure, about one open group per sending source per handler. Media-handler ruled a separate `mh_media_stream_sources_active` gauge redundant.
 - **Type**: Gauge
 - **Description**: Publisher group streams being read right now, process-wide. Moved by an RAII guard on every exit (abort and panic included) — a true count, not a last-writer-wins sample.
 - **Labels**: `key_custody`
@@ -1260,6 +1266,16 @@ group start. Accounting rules a responder needs before reading any panel:
 - **Labels**: `key_custody`
 - **Cardinality**: 1
 
+### `mh_media_egress_stream_backlog_bytes`
+- **Type**: Gauge (tick-sampled every 10 s by the session actor from the per-destination budgets; never per chunk)
+- **Description**: Bytes charged right now across EVERY destination's stream backlog, process-wide (story 3 R-21; added at OBS-B as the MH-A2 in-use gap). SET once per 10 s rotation tick by `routing/mod.rs::RoutingTable::publish_pending` (the session actor, the single writer) to the sum of every stream edge's `BacklogBudget::used()` — one Acquire load per destination, so the media path carries NO gauge traffic (a per-chunk process-wide atomic was rejected at OBS-B Gate 3 as cross-core contention on the hot path; media-handler and operations). Present at 0 from boot (resolved in `resolve_media_handles`). **Blind spot**: a destination whose edge has already left the routing snapshot but whose writer is still draining its last bytes is not counted — a short tail, released as the writer finishes or is reset. A scrape-granular capacity reading, never a per-frame size.
+- **Pairs with** `mh_media_egress_stream_backlog_limit_bytes`, which is PER DESTINATION: never draw that cap over this process-wide sum. The process-wide bound is `mh_media_egress_stream_backlog_limit_bytes x mh_media_egress_stream_ceiling`, the backlog term R-21's boot check (`config.rs::check_pod_memory`) validates against the pod memory limit. That bound is a CHARGE bound, NOT memory: real allocation adds `BACKLOG_ALLOCATION_FACTOR` on top.
+- **Labels**: `key_custody`: `operator`. No kind, no identity.
+- **Cardinality**: 1
+- **Alert**: none, by decision (`docs/observability/alerts.md` §Deliberate absences (MH)): R-21's startup validation makes backlog OOM structurally impossible, and `MHHighMemory` covers process memory.
+- **Recorded in**: `routing/mod.rs::RoutingTable::publish_pending`, called from the `session/mod.rs` rotation tick (handle `MediaMetricHandles::egress_stream_backlog_bytes`, resolved once at setup)
+- **Dashboard**: MH Media - Stream-Path Backlog In Use vs Charge Bound
+
 ### `mh_media_stream_mid_frame_stall_seconds`
 - **Type**: Gauge (published once at setup)
 - **Description**: `MH_STREAM_MID_FRAME_STALL_MS`, in seconds — the inactivity bound past which a publisher stalled mid-frame is reset downstream.
@@ -1267,6 +1283,7 @@ group start. Accounting rules a responder needs before reading any panel:
 - **Cardinality**: 1
 
 ### `mh_media_stream_sources_declared`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): None, and NOT a denominator for `MHVideoKeyframeStorm`: it counts PAUSED, DROP_AT_INGRESS and unwatched sources, which send nothing.
 - **Type**: Gauge
 - **Description**: `STREAM_PER_GROUP` source streams declared across every installed policy on this handler — recomputed from the installed snapshot at every apply and release, never delta-maintained.
 - **Labels**: `key_custody`
@@ -1274,13 +1291,14 @@ group start. Accounting rules a responder needs before reading any panel:
 - **Usage**: Whether this handler is programmed to carry video at all; read beside `mh_media_group_starts_total{direction="ingress"}`.
 
 ### `mh_media_paused_source_frames_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `MHPausedSourceIngress` (numerator) over `mh_media_frames_forwarded_total{direction="ingress"}`, 1% for 15m.
 - **Type**: Counter
 - **Description**: Frames attributed to a PAUSED (client-muted) source stream (story 3 R-17; `internal.proto` `SourceDisposition.PAUSED`). An ARRIVAL OVERLAY, not a drop: PAUSED is never dropped at ingress — a resume frame that beats MC's policy update must still reach subscribers — so these frames forward normally.
 - **Labels**: `key_custody`: `operator` (single value). No reason, no kind, no identity.
 - **Cardinality**: 1
 - **Accounting**: incremented at exactly the point `forwarded{direction="ingress"}` is, once per frame, so `paused ⊆ forwarded{ingress}` (a paused frame whose stream feeds no edge counts `forwarded{ingress}`, `no_subscriber` and this). **NOT part of the ingress accounting identity**: never add it to the received total — it would double-count.
-- **Usage**: A client sending on a stream MC believes is client-muted. Expected briefly around a mute toggle (in-flight frames, a resume that beats MC's update); SUSTAINED is a client privacy defect (sending while muted) — runbook and alert owned by OPS-B / OBS-B.
-- **Recorded in**: `observability/metrics.rs::MediaMetricHandles::paused_source_frames` (resolved once at setup; incremented in `media/forward.rs`)
+- **Usage**: A client sending on a stream MC believes is client-muted. Expected briefly around a mute toggle (in-flight frames, a resume that beats MC's update); SUSTAINED is a client privacy defect (sending while muted) — runbook MH Scenario 23, alert `MHPausedSourceIngress`.
+- **Recorded in**: `observability/metrics.rs::MediaMetricHandles::paused_source_frames` (resolved once at setup; incremented in `media/forward.rs` (datagram path) and `media/stream_ingress.rs` (stream path))
 - **Dashboard**: MH Media - Paused-Source Arrivals
 
 ### On-demand keyframes and recovery (story 3 MH-B)
@@ -1296,6 +1314,7 @@ kind, slot, sender, stream number, counter value or request timing in any
 label, log or span.
 
 ### `mh_media_keyframe_requests_sent_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): None (diagnosis input for `MHVideoKeyframeStorm` and `MHVideoEdgeStuckPending`).
 - **Type**: Counter
 - **Description**: `KeyframeRequest`s actually WRITTEN to a publisher's control stream, after the once-per-(source stream, counter) dedupe and the newest-only queue replacement. A queued request replaced by a newer one, or discarded (group start, edge removal, PAUSED, DROP_AT_INGRESS, unbind), is never counted.
 - **Labels**:
@@ -1307,16 +1326,18 @@ label, log or span.
 - **Dashboard**: MH Media - Keyframe Requests Sent
 
 ### `mh_media_keyframe_request_write_failures_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): none of its own; its consequence fires `MHVideoEdgeStuckPending`, whose annotation names this counter as a diagnosis input.
 - **Expected-empty**: yes on a healthy fleet
 - **Type**: Counter
 - **Description**: Keyframe requests NEVER DELIVERED to a publisher: a failed control-stream write, plus every request counted at once after that publisher's control stream failed (the writer stops; nothing queues forever). A failed request is never re-emitted.
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
-- **Usage**: A publisher whose control stream is gone while its media continues — its subscribers recover only through the publisher's own self-keying. Sustained: a client defect.
+- **Usage**: A publisher whose control stream is gone while its media continues — its subscribers' edges wait indefinitely: the publisher self-keys only for its own targets' starts and its own abandonments, never for MH's resets, new subscriber edges or receiver loss (amendment 4), so the consequence surfaces as `MHVideoEdgeStuckPending`. Sustained: a client defect.
 - **Recorded in**: `media/keyframe.rs` (writer and `PublisherKeyframes::request`)
 - **Dashboard**: MH Media - Keyframe Request Write Failures
 
 ### `mh_media_recovery_requests_received_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): None, by decision: `duplicate` is the dedupe bound working; `counter_ahead` is diagnostic.
 - **Type**: Counter
 - **Description**: Post-connect control-stream messages from subscriber connections, one outcome each (a framing break counts once; an end of stream is not a message). Per message MH does a fixed-size parse and one lookup; volume is bounded by QUIC flow control.
 - **Labels**:
@@ -1337,6 +1358,7 @@ label, log or span.
 | `malformed` | Undecodable, not a `RecoveryRequest` (a second `connect_request` included — it never re-authenticates), oversize, or a length prefix of 0 / above the bound (control reading then stops; the connection is kept). |
 
 ### `mh_media_edges_pending`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): None (panel); the stuck-pending signal is `mh_media_edge_pending_oldest_seconds`.
 - **Type**: Gauge (tick-sampled)
 - **Description**: Stream edges PENDING right now, pod-wide: a stream-per-group edge whose subscriber is connected to this handler, waiting for a group start (Waiting, or a pending switch) from an assigned FORWARD source whose publisher is connected to this handler — seen or not, so a never-sending source counts. Sampled every 10 s by the session actor (the single writer) from per-edge entry stamps; never per frame. Present at 0 from boot. **Blind spot:** an edge whose assigned publisher is NOT connected to this handler (never connected, or never reconnected after leaving) is not pending at all, so "0 pending" does not mean every assigned slot is fed — that case shows on the client's unfulfilled-slot series (R-30: `dt_client_media_slots_unfulfilled` / `dt_client_media_slot_unfulfilled_duration_ms`, slots MC reports live that show neither video nor an avatar).
 - **Labels**: `key_custody`: `operator`
@@ -1345,8 +1367,9 @@ label, log or span.
 - **Dashboard**: MH Media - Pending Edges
 
 ### `mh_media_edge_pending_oldest_seconds`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `MHVideoEdgeStuckPending`: `max(...) > 10 * max(mc_media_video_keyframe_min_interval_seconds)`, `for: 5m`.
 - **Type**: Gauge (tick-sampled)
-- **Description**: Age of the OLDEST pending edge on the pod (max), in seconds, on the injected clock; 0 when nothing is pending. Same sampler as `mh_media_edges_pending`. Present at 0 from boot. The stuck-pending alert (OBS-B) reads this; its threshold is OBS-B's, and no longer derives from a retry interval (there is none). Same blind spot as `mh_media_edges_pending`: a slot whose publisher is absent from this handler is excluded (see the client's unfulfilled-slot series).
+- **Description**: Age of the OLDEST pending edge on the pod (max), in seconds, on the injected clock; 0 when nothing is pending. Same sampler as `mh_media_edges_pending`. Present at 0 from boot. `MHVideoEdgeStuckPending` reads this; its threshold derives from MC's directed minimum keyframe interval gauge, not from a retry interval (there is none). Same blind spot as `mh_media_edges_pending`: a slot whose publisher is absent from this handler is excluded (see the client's unfulfilled-slot series).
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
 - **Recorded in**: `routing/mod.rs::RoutingTable::publish_pending`, called from the `session/mod.rs` rotation tick (handles resolved once at setup)

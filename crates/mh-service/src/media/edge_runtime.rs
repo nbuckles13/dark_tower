@@ -479,6 +479,15 @@ impl EdgeRuntime {
             .and_then(|edge| edge.pending.map(|(since, _)| since))
     }
 
+    /// Bytes this edge's destination backlog holds right now
+    /// (`BacklogBudget::used`, one Acquire load); 0 for a cell with no stream
+    /// edge. The tick sampler's input for `mh_media_egress_stream_backlog_bytes`;
+    /// never read per frame or per chunk.
+    #[must_use]
+    pub fn backlog_used(&self) -> usize {
+        self.lock().as_ref().map_or(0, |edge| edge.budget.used())
+    }
+
     /// The edge machine's state. Test-facing.
     #[must_use]
     pub fn machine_state(&self) -> Option<crate::media::edge::EdgeState> {

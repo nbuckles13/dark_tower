@@ -192,6 +192,103 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
+      "description": "The exact selector of MCMediaGenerationDivergence (infra/docker/prometheus/rules/mc-alerts.yaml): every policy push outcome that is not a confirmed match and not the per-incarnation handler_id_mismatch carve-out, NEGATED so an outcome added later is drawn here. The rule pages on ANY occurrence in 15 minutes; any point above the red line at 0 is such an occurrence. Since story 3 transport_mode_mismatch is per stream (arm and first stream on MC's confirm-failure ERROR line). Split by outcome on Media Policy Pushes by Outcome; the magnitude is the stat beside it, never first. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "id": 191,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(mc_media_policy_pushes_total{outcome!~\"match|handler_id_mismatch\"}[$__rate_interval]))",
+          "legendFormat": "alerted outcomes",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Pushes Counted by MCMediaGenerationDivergence (ALERTED, page)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
       "description": "Last-observed MAGNITUDE |sent - applied| by which a handler's live forwarding policy differed from the one MC pushed - an unsigned magnitude, never a signed difference, computed from the APPLIED value in the response. Any non-zero value means the live policy is not the one MC pushed, in either direction. AN ABSENT SERIES RENDERS AS ZERO here (noValue: 0), so this panel cannot distinguish \"never pushed\" from \"recorder regressed\" - read liveness from the Media Policy Pushes panel beside it, which is also the detection signal; this one is only the magnitude. Last-write-wins per pod: a healthy push overwrites a diverged reading, and MC inherits the global scrape_interval config key, which is coarse relative to a one-shot-per-registration write, so a divergence can be overwritten before it is ever scraped. WRITTEN ONLY ON A REGISTRATION PUSH: with the ADR-0036 section 8 re-assert cadence deferred, this does NOT observe a handler restart - a handler can lose all forwarding policy while this holds its last healthy value. COLOUR: orange at >= 1, not red - any non-zero means the live policy is not the one MC pushed, but this gauge is not page-worthy on its own (the counter is the detection signal). Green covers only 0, which with noValue: 0 also covers never-pushed.",
       "fieldConfig": {
         "defaults": {
@@ -220,8 +317,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 1
+        "x": 0,
+        "y": 9
       },
       "id": 57,
       "options": {
@@ -312,7 +409,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 9
       },
       "id": 63,
@@ -405,8 +502,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 9
+        "x": 0,
+        "y": 17
       },
       "id": 162,
       "options": {
@@ -446,7 +543,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 17
+        "y": 25
       },
       "id": 157,
       "panels": [],
@@ -588,7 +685,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 18
+        "y": 26
       },
       "id": 58,
       "options": {
@@ -627,7 +724,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Send-directive compositions by disposition (ADR-0036 \u00a75), recorded by the MEETING ACTOR on every composition - including those triggered by a peer's join, leave, declaration or mute - and only when the directive CHANGED. EMITTED MEANS COMPOSED, NOT DELIVERED: two hops follow it, each on its own series - participant mailbox CLOSED is Slot View Emissions outcome=delivery_failed, stream channel FULL is Dropped Outbound Messages payload_kind=signaling_raw. THE SUCCESS SET IS {emitted, emitted_empty_targets}, NOT {emitted}. \u00a75 makes an empty target set a SPECIFIED success (\"that means send nothing\"), and it is ROUTINE: a solo participant, anyone nobody holds in a slot, anyone server-muted on every kind it publishes (story 3 MC-B: a server mute withdraws that kind's directive - per-kind withdrawals by cause are on Send Directive Withdrawals), and anyone not yet connected to a handler (or inside the connect settle window) is directed to send nothing, then re-sent a non-empty directive the moment someone holds it. 'Holds' means SHARES A CONNECTED HANDLER WITH (story 2 task 20) - not 'placed on the same handler', task 6's retired meaning. Under round-robin this was routine in every split two-person meeting; under the edge model an all-connected meeting co-locates, so the expected magnitude dropped. A directive may now carry several targets (every handler owning one of the sender's edges; Mean Send Targets per Directive). Both are GREEN and any failure predicate must read outcome!~\"emitted|emitted_empty_targets\" - PERMANENT, grounded in \u00a75, unlike the temporary carve-out on Media Policy Pushes. RED is the three MC DEFECTS (any non-zero value is a bug): unknown_stream_number, transport_mode_unspecified and handler_url_unresolved (every url comes from one frozen handler set, and an edge's owning handler is only ever a member of it; fails CLOSED - nothing is sent). ORANGE is the two ENVIRONMENTAL values: meeting_state_unavailable and assignment_failed. The failure values are disjoint by construction: composition is sequential stages and the first failing stage returns its own value.",
+      "description": "Send-directive compositions by disposition (ADR-0036 \u00a75), recorded by the MEETING ACTOR on every composition - including those triggered by a peer's join, leave, declaration or mute - and only when the directive CHANGED. EMITTED MEANS COMPOSED, NOT DELIVERED: two hops follow it, each on its own series - participant mailbox CLOSED is Slot View Emissions outcome=delivery_failed, stream channel FULL is Dropped Outbound Messages payload_kind=signaling_raw. THE SUCCESS SET IS {emitted, emitted_empty_targets}, NOT {emitted}. \u00a75 makes an empty target set a SPECIFIED success (\"that means send nothing\"), and it is ROUTINE: a solo participant, anyone nobody holds in a slot, anyone server-muted on every kind it publishes (story 3 MC-B: a server mute withdraws that kind's directive - per-kind withdrawals by cause are on Send Directive Withdrawals), and anyone not yet connected to a handler (or inside the connect settle window) is directed to send nothing, then re-sent a non-empty directive the moment someone holds it. 'Holds' means SHARES A CONNECTED HANDLER WITH (story 2 task 20) - not 'placed on the same handler', task 6's retired meaning. Under round-robin this was routine in every split two-person meeting; under the edge model an all-connected meeting co-locates, so the expected magnitude dropped. A directive may now carry several targets (every handler owning one of the sender's edges; Mean Send Targets per Directive). Both are GREEN and any failure predicate must read outcome!~\"emitted|emitted_empty_targets\" - PERMANENT, grounded in \u00a75, unlike the temporary carve-out on Media Policy Pushes. The ALERT CLASSES are not restated here: their one home is DirectiveOutcome::alert_class() (crates/mc-service/src/media_signaling/outcome.rs, test module), pinned to the two rules by a unit test. MC-defect values PAGE (MCMediaSendDirectiveDefect; any non-zero value is a bug that fails CLOSED and recurs for the meeting's life); every other non-success value, including any value added later, WARNS (MCMediaSendDirectiveFailures). Both are drawn against their selectors on Send Directive Failures (ALERTED). WITHDRAWALS ARE HEALTHY and are never read from this panel: see Send Directive Withdrawals by Kind and Reason. The failure values are disjoint by construction: composition is sequential stages and the first failing stage returns its own value. Kind-free BY DESIGN (docs/observability/metrics/mc-service.md, media_kind table): not split by media_kind - a decision, not an omission.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -727,7 +824,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 18
+        "y": 26
       },
       "id": 59,
       "options": {
@@ -766,7 +863,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Slot states MC conveys to subscribers (ADR-0036 \u00a76), one increment per declared slot per StreamAssignments the actor actually SENDS. The bucketed slot-state signal \u00a711 mandates, joined to NO identity: it answers how many and how bad; MC's own assignment state answers WHO. There is no per-slot series and must not be one. The label domain mirrors the wire enum EXHAUSTIVELY (every named SlotState variant, not only the ones reachable today) so it stays comparable with the client's distribution and so an UNSPECIFIED on the wire is visible rather than absent. EMISSIONS ARE CLIENT- AND SERVER-DRIVEN since story 2: the actor re-emits on a PEER's join, leave, declaration or mute change (either kind since story 3), so the distribution is weighted by meeting churn as well as by any one client - normalise before building a ratio. fewer_sources_than_slots is every declared-but-unfilled slot - a solo participant (loopback removed, R-3), any meeting smaller than N, and every slot of a participant not yet connected to a handler; it is the healthy steady state of a small meeting. Emitted since story 3 MC-A: active (audio names the sender; live video names none), avatar_no_video (a video slot whose occupant publishes no video - precedence over any mute), avatar_client_muted, avatar_server_muted (server wins), fewer_sources_than_slots, and unavailable (truncated by that kind's cap - the over-cap signal; every video slot when MC_MAX_VIDEO_RECEIVE_SLOTS=0). Story 2's source_muted LEFT the domain with its wire value (deleted and reserved by MC-B, 2026-10-23): it is absent, not flat, and no query selects it. source_unreachable stays UNEMITTED under the story-2 edge model: a participant the subscriber shares NO connected handler with is named in unreachable_sender_ids instead (the state is reserved for a PINNED source with no shared handler, which static fill cannot produce) (see Unreachable Senders Named); a non-zero red line here is therefore an MC defect, as is unspecified. zero_requested is gone: the proto reserved it 2026-10-13 as unemittable. withheld_by_congestion arrives with the MH slot-state notification and switch_pending with \u00a77 switching.",
+      "description": "The two send-directive rules' selectors (infra/docker/prometheus/rules/mc-alerts.yaml). 'MC defect' is MCMediaSendDirectiveDefect's positive selector (PAGE): a failure that fails CLOSED, recurs for the meeting's life and leaves the participant with no slots, so no stream-path panel can show it. 'environmental / unclassified' is MCMediaSendDirectiveFailures' negated selector (WARNING): meeting_state_unavailable, and any outcome nobody classified. Both rules fire on any occurrence in 15 minutes; any point above the red line at 0 is one. The classes' one home is DirectiveOutcome::alert_class() (outcome.rs). Withdrawals are healthy and are never read here. key_custody=operator; no identity. Kind-free BY DESIGN (docs/observability/metrics/mc-service.md, media_kind table): not split by media_kind - a decision, not an omission.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -799,7 +896,7 @@
               "mode": "none"
             },
             "thresholdsStyle": {
-              "mode": "off"
+              "mode": "line"
             }
           },
           "mappings": [],
@@ -809,111 +906,24 @@
               {
                 "color": "green",
                 "value": null
+              },
+              {
+                "color": "red",
+                "value": 0
               }
             ]
           },
-          "unit": "none"
+          "unit": "short"
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "active"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "green",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^(avatar_no_video|avatar_client_muted|avatar_server_muted)$/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "blue",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^(fewer_sources_than_slots|unavailable)$/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "yellow",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^(source_unreachable|unspecified)$/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "red",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "withheld_by_congestion"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "orange",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "switch_pending"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "purple",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
+        "overrides": []
       },
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 26
+        "y": 34
       },
-      "id": 60,
+      "id": 192,
       "options": {
         "legend": {
           "calcs": [
@@ -936,122 +946,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by (slot_state) (rate(mc_media_slot_states_total[$__rate_interval]))",
-          "legendFormat": "{{slot_state}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Slot States",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
-      "description": "NO SLOT-OCCUPANCY GAUGE EXISTS, SO THIS IS NOT 'slots used / cap' AND MUST NOT BE READ AS ONE. MC publishes no count of filled receive slots: mc_media_slot_states_total counts slot states CONVEYED (one per declared slot per StreamAssignments sent) and mc_media_receive_slot_cap is a config echo. What this panel shows instead - the honest substitute, not the requested ratio: LEFT AXIS, the share of conveyed slot states that carried a source (active, avatar_no_video, avatar_client_muted or avatar_server_muted) out of all conveyed. unavailable and fewer_sources_than_slots are NOT filled. Emission-weighted, so a meeting with churn weighs more than a quiet one (see Slot States). A low share is the healthy steady state of meetings with fewer other participants than the declared N (fewer_sources_than_slots - every solo participant included, since loopback is removed, R-3); it is not a fault. RIGHT AXIS, the published per-kind caps (mc_media_receive_slot_cap, publishing MC_MAX_AUDIO_RECEIVE_SLOTS / MC_MAX_VIDEO_RECEIVE_SLOTS from the ClientMediaConfig field every declaration is truncated against): the bound each kind's declared N is truncated to. A cap below the clients' N shows as unavailable on Slot States (excess slots are truncated, never rejected), and lowers the filled share here. The pair says whether declared slots are being filled and against which configured bound clients declare; it CANNOT say how close any meeting is to the cap. That reading needs an occupancy gauge that does not exist today. Guarded: the '> 0' on the conveyed total makes a window with no emissions read as no data rather than NaN; empty is healthy when no StreamAssignments were sent. key_custody=operator. No meeting, participant, slot or sender identity is on either series. Caps per media_kind (story 3): both kinds are published; a video reading of 0 confirms the R-26 video-off lever applied - max() without by(media_kind) would hide it.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "Filled share",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "percentunit"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byFrameRefID",
-              "options": "B"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "short"
-              },
-              {
-                "id": "custom.axisPlacement",
-                "value": "right"
-              },
-              {
-                "id": "custom.axisLabel",
-                "value": "Slots"
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 26
-      },
-      "id": 187,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "lastNotNull"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(mc_media_slot_states_total{slot_state=~\"active|avatar_no_video|avatar_client_muted|avatar_server_muted\"}[$__rate_interval]))\n/\nsum(rate(mc_media_slot_states_total[$__rate_interval]))\nand\nsum(rate(mc_media_slot_states_total[$__rate_interval])) > 0",
-          "legendFormat": "filled share of conveyed slots",
+          "expr": "sum(increase(mc_media_send_directives_total{outcome=~\"unknown_stream_number|transport_mode_unspecified|handler_url_unresolved|assignment_failed\"}[$__rate_interval]))",
+          "legendFormat": "MC defect (pages)",
           "range": true,
           "refId": "A"
         },
@@ -1061,13 +957,13 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "max by (media_kind) (mc_media_receive_slot_cap)",
-          "legendFormat": "slot cap {{media_kind}}",
+          "expr": "sum(increase(mc_media_send_directives_total{outcome!~\"emitted|emitted_empty_targets|unknown_stream_number|transport_mode_unspecified|handler_url_unresolved|assignment_failed\"}[$__rate_interval]))",
+          "legendFormat": "environmental / unclassified (warns)",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "Receive Slot Fill vs Cap",
+      "title": "Send Directive Failures (ALERTED: defect pages, rest warns)",
       "type": "timeseries"
     },
     {
@@ -1075,7 +971,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Client MuteRequest dispositions (ADR-0036 \u00a75). COUNTING UNIT: one increment per (request, NAMED kind) - a per-kind field ABSENT on the wire means unchanged and is not counted, and the SDK names only the kind it changes. TWO COUNTING-UNIT CHANGES, NEITHER A TRAFFIC CHANGE: rates roughly doubled at story 3 OBS-A (an interim that counted both kinds on every request) and roughly HALVED again at MC-B (2026-10-23) - compare against last week accordingly. A request naming NO kind is not counted here (Mute Requests Rejected). It PARTITIONS (report, named kind) pairs. A moved flag of EITHER kind is applied (the actor flips the stream's disposition FORWARD <-> PAUSED and re-emits), so a camera button lands on media_kind=\"video\" applied. Summed over media_kind here. THE SUCCESS SET IS {applied} (applied_no_recompose, unreachable since MC-A, was removed by MC-B) - the failure predicate is outcome=~\"rate_limited|actor_unavailable\", NOT outcome!=\"applied\", which would count a routine state as a failure. GREEN applied: this kind's flag moved and the meeting actor re-emits the changed slot view to the subscribers HOLDING this source; a failed re-emit is counted by the actor on Send Directives and on Slot View Emissions outcome=composition_failed. BLUE unchanged: THIS NAMED KIND's state did not move - either the identical repeat (no actor hop) or a named kind the actor found already in that state - not a failure. USE applied AS ANY RATIO DENOMINATOR, NOT unchanged: the no-op short-circuit runs before any actor hop, roster read or recomposition, so unchanged is client-inflatable at line rate, and a fraction-applied ratio computed over it is a number one participant can drive to zero. unchanged is exempt from the limiter on purpose - reversing that ordering would let a client spamming a steady state drain its own bucket on no-ops and suppress its next genuine toggle. ORANGE rate_limited is the visible edge of the mute-work token bucket (per connection; burst MUTE_WORK_BURST, one token refilled per MUTE_WORK_REFILL_INTERVAL_MS - both in crates/mc-service/src/webtransport/connection.rs, cited rather than restated). Client mute is the only repeatable client-driven path that puts work on the SHARED meeting actor's mailbox - one actor hop plus a re-emit to the source's holders, which the actor bounds per meeting per turn (Slot View Emissions outcome=deferred), and its MH re-pushes are latest-wins per handler (one in flight, one pending). This is NOT a meeting-wide contention signal; do not route a meeting-wide latency investigation to this panel. A HUMAN NEVER REACHES THIS LIMITER, so a sustained non-zero rate means one connection is toggling far above human rates - a client-side repeat loop first, an abusive peer second - and it is bounded to that connection either way. It is a rate limit and NOT a budget on purpose: a budget would permanently freeze that participant's self-mute once spent. A dropped report never lets media out (\u00a75 enforces client mute at CAPTURE), but it leaves MC's view of that kind stale (PAUSED/avatar) until the participant's next report of the SAME kind. RED actor_unavailable is environmental and terminal. No meeting identifier, participant id, slot id or sender id appears as a label.",
+      "description": "Dispositions of dirty participants in the meeting actor's server-driven slot-view flush (ADR-0036 \u00a75/\u00a76; story 2): after a join, leave, declaration or mute the actor re-emits each affected declared participant's changed SendDirective and StreamAssignments, at most SLOT_VIEW_FLUSH_BATCH per actor turn. THIS DOES NOT PARTITION EMISSIONS - a participant deferred on three turns and sent on the fourth counts four times. SUCCESS SET {sent, deferred}: GREEN sent, BLUE deferred - deferred is the ROUTINE shape of the bound under load (the view is carried, coalesced and never dropped), NOT a failure. FAILURE PREDICATE, stated positively on purpose: outcome=~\"delivery_failed|composition_failed\" - a later value defaults to not-a-failure. RED composition_failed is an MC DEFECT (any non-zero is a bug; the stage is on Send Directives, which is the alerting home - do not alert on both). ORANGE delivery_failed is environmental: the participant actor was gone. No meeting, participant, slot or sender identity is a label.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1127,7 +1023,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "applied"
+              "options": "sent"
             },
             "properties": [
               {
@@ -1142,7 +1038,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "unchanged"
+              "options": "deferred"
             },
             "properties": [
               {
@@ -1157,22 +1053,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "rate_limited"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "orange",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "actor_unavailable"
+              "options": "composition_failed"
             },
             "properties": [
               {
@@ -1183,16 +1064,31 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "delivery_failed"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
           }
         ]
       },
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 34
       },
-      "id": 62,
+      "id": 159,
       "options": {
         "legend": {
           "calcs": [
@@ -1215,13 +1111,13 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (rate(mc_media_mute_requests_total[$__rate_interval]))",
+          "expr": "sum by (outcome) (rate(mc_media_slot_view_emissions_total[$__rate_interval]))",
           "legendFormat": "{{outcome}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Mute Requests by Outcome",
+      "title": "Slot View Emissions by Outcome",
       "type": "timeseries"
     },
     {
@@ -1229,11 +1125,12 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "ServerMuteRequest dispositions by action (the verb ASKED for FOR EACH NAMED KIND: mute | unmute, never its result - {audio muted} counts only mute/audio; {audio muted, video not} counts mute/audio AND unmute/video) and outcome (story 2 task 12; ADR-0036 \u00a75, \u00a77). Counted SEPARATELY from client mute (Mute Requests by Outcome): different decider, enforcement point (directive withdrawal plus MH ingress drop, not client capture) and remedy. COUNTING UNIT: one increment per (request, NAMED kind); an absent kind is unchanged and not counted. Rates roughly doubled at story 3 OBS-A (interim: both kinds counted) and roughly HALVED at MC-B (2026-10-23) - counting unit, not traffic. A request naming NO kind - from ANY requester, host or not - is counted only on Mute Requests Rejected, so not_permitted here undercounts non-hosts by exactly those requests. Summed over media_kind here. The failure predicate is POSITIVE: outcome=~\"rate_limited|actor_unavailable\" - do not harmonise it to outcome!=\"applied\". not_permitted vs unknown_target: the metric distinguishes two refusals the CLIENT never can (one byte-identical wire error) - deliberate, do not harmonise. unknown_target is reachable ONLY for a host requester, because authority is checked before the target is looked up. not_permitted is CLIENT-INFLATABLE (the check precedes any actor hop) - NEVER use it in a ratio denominator and never alert on its raw rate. No alert on this panel by decision: non-zero mute is healthy moderation. Not a join key with the client's dt_client_media_mute_transitions_total{action} despite identical values.",
+      "description": "Joins whose Redis handler assignment differed from the meeting's handler set frozen at first join. EXPECTED EMPTY: the frozen set is the meeting's authority, so MC kept it and moved no edge - but any non-zero value is an MC-internal invariant violation (Redis and the actor disagree). Capture and escalate to meeting-controller (MC runbook Scenario 18 arm f); restarting nothing fixes it. Zero is healthy; an ABSENT series is NOT a zero - it means the metrics pipeline is broken.",
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
+            "mode": "fixed",
+            "fixedColor": "red"
           },
           "custom": {
             "axisCenteredZero": false,
@@ -1275,100 +1172,7 @@
               }
             ]
           },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 34
-      },
-      "id": 178,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "lastNotNull"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "editorMode": "code",
-          "expr": "sum by (action, outcome) (increase(mc_media_server_mute_requests_total[$__rate_interval]))",
-          "legendFormat": "{{action}}/{{outcome}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Server Mute Requests",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
-      "description": "Participant UnmuteRequest dispositions: a server-muted participant asking the host(s) to lift its mute. NOTIFIES ONLY - it never clears a mute (the single writer is the host's ServerMuteRequest). ONE increment per request, never per host relayed to; a per-host delivery failure is the later hop (Dropped Outbound Messages, signaling_raw), disjoint from this panel. Failure predicate, positive: outcome=~\"rate_limited|actor_unavailable\". not_server_muted and no_host_connected are ROUTINE (no_host_connected is normal once the host has left). not_server_muted is client-driven: keep it out of any ratio denominator.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
+          "unit": "none"
         },
         "overrides": []
       },
@@ -1378,7 +1182,7 @@
         "x": 0,
         "y": 42
       },
-      "id": 179,
+      "id": 161,
       "options": {
         "legend": {
           "calcs": [
@@ -1401,13 +1205,13 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (increase(mc_media_unmute_requests_total[$__rate_interval]))",
-          "legendFormat": "{{outcome}}",
+          "expr": "sum(increase(mc_media_handler_set_divergence_total[$__rate_interval]))",
+          "legendFormat": "divergent joins",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Unmute Requests",
+      "title": "Handler Set Divergence",
       "type": "timeseries"
     },
     {
@@ -1415,7 +1219,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "How many (participant, kind) sources MC believes are SERVER-muted right now, per media_kind, summed across each MC instance's meetings (one series per instance and kind; a participant muted on both kinds is 1 on each). Since story 3 MC-A each kind's server mute reaches MH as that stream's DROP_AT_INGRESS disposition, so the SUM ACROSS KINDS is comparable with MH's server_muted drops - a STATE level, not an event rate: a mute applied yesterday is still here while Server Mute Requests stays flat. Present at zero from process start. Recomputed from live state on the controller's health walk, so it cannot drift after an actor dies. Read it against MH's server_muted drops at FLEET level only (sum across MC pods vs sum of mh_media_frames_dropped_total{reason=\"server_muted\"} rate across MH pods) and DIRECTIONALLY - never divided, never per instance (MC and MH meeting sets do not nest). Since MC-B gauge > 0 with fleet drops near zero is the NORMAL shape (a server mute withdraws the directive, so a compliant client sends nothing to drop; Send Directive Withdrawals reason=server_muted is the primary evidence the mute took) - the comparison detects only a sender that ignored its empty targets. Beyond that, gauge > 0 with a flat fleet drop rate is only a candidate disagreement: a muted participant who is silent, disconnected, in grace, or does not publish the muted kind drops nothing. It does not answer whether ONE meeting has a mute in force.",
+      "description": "A NON-ZERO signaling_raw RATE HERE AGAINST A HEALTHY emitted RATE ON SEND DIRECTIVES IS THE SPECIFIC SHAPE OF 'MC COMPOSED A SEND DIRECTIVE THE CLIENT NEVER RECEIVED' - emitted means COMPOSED, not delivered, and this panel is the stream-channel-FULL half of what happened next. The participant-mailbox-CLOSED half is Slot View Emissions outcome=delivery_failed - an EARLIER hop, disjoint from this one. EVERY DROP IS COUNTED; ONLY THE FIRST IS LOGGED PER CONNECTION - a wedged channel drops one message per roster broadcast, so a single WARN line can stand for thousands of drops and log volume badly understates drop volume. Take the magnitude from this graph, never from a grep. mc_participant_outbound_messages_dropped_total: the client did not receive something MC decided to send, because its outbound channel was full or closed. Deliberately NOT a fourth actor_type on mc_messages_dropped_total, which is the INBOUND mailbox path - mixing them would corrupt the topk on the cross-service errors dashboard. (mc_media_unmatched_plan_slots_total, formerly the other half of this panel, is RETIRED in story 2: plans are derived from declared slots, so it was identically zero.) Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero \u2014 it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1461,7 +1265,7 @@
               }
             ]
           },
-          "unit": "short"
+          "unit": "none"
         },
         "overrides": []
       },
@@ -1471,7 +1275,7 @@
         "x": 12,
         "y": 42
       },
-      "id": 181,
+      "id": 61,
       "options": {
         "legend": {
           "calcs": [
@@ -1494,13 +1298,13 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by (instance, media_kind) (mc_media_server_muted_sources)",
-          "legendFormat": "{{instance}} {{media_kind}}",
+          "expr": "sum by (payload_kind) (rate(mc_participant_outbound_messages_dropped_total[$__rate_interval]))",
+          "legendFormat": "dropped: {{payload_kind}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Server-Muted Sources",
+      "title": "Dropped Outbound Messages",
       "type": "timeseries"
     },
     {
@@ -1655,7 +1459,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 74
+        "y": 50
       },
       "id": 190,
       "options": {
@@ -1690,104 +1494,24 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
-      "description": "A NON-ZERO signaling_raw RATE HERE AGAINST A HEALTHY emitted RATE ON SEND DIRECTIVES IS THE SPECIFIC SHAPE OF 'MC COMPOSED A SEND DIRECTIVE THE CLIENT NEVER RECEIVED' - emitted means COMPOSED, not delivered, and this panel is the stream-channel-FULL half of what happened next. The participant-mailbox-CLOSED half is Slot View Emissions outcome=delivery_failed - an EARLIER hop, disjoint from this one. EVERY DROP IS COUNTED; ONLY THE FIRST IS LOGGED PER CONNECTION - a wedged channel drops one message per roster broadcast, so a single WARN line can stand for thousands of drops and log volume badly understates drop volume. Take the magnitude from this graph, never from a grep. mc_participant_outbound_messages_dropped_total: the client did not receive something MC decided to send, because its outbound channel was full or closed. Deliberately NOT a fourth actor_type on mc_messages_dropped_total, which is the INBOUND mailbox path - mixing them would corrupt the topk on the cross-service errors dashboard. (mc_media_unmatched_plan_slots_total, formerly the other half of this panel, is RETIRED in story 2: plans are derived from declared slots, so it was identically zero.) Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero \u2014 it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "tooltip": false,
-              "viz": false,
-              "legend": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "none"
-        },
-        "overrides": []
-      },
+      "collapsed": false,
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 50
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 58
       },
-      "id": 61,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "lastNotNull"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "editorMode": "code",
-          "expr": "sum by (payload_kind) (rate(mc_participant_outbound_messages_dropped_total[$__rate_interval]))",
-          "legendFormat": "dropped: {{payload_kind}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Dropped Outbound Messages",
-      "type": "timeseries"
+      "id": 193,
+      "panels": [],
+      "title": "Slots and Mute by Kind (story 3)",
+      "type": "row"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Dispositions of dirty participants in the meeting actor's server-driven slot-view flush (ADR-0036 \u00a75/\u00a76; story 2): after a join, leave, declaration or mute the actor re-emits each affected declared participant's changed SendDirective and StreamAssignments, at most SLOT_VIEW_FLUSH_BATCH per actor turn. THIS DOES NOT PARTITION EMISSIONS - a participant deferred on three turns and sent on the fourth counts four times. SUCCESS SET {sent, deferred}: GREEN sent, BLUE deferred - deferred is the ROUTINE shape of the bound under load (the view is carried, coalesced and never dropped), NOT a failure. FAILURE PREDICATE, stated positively on purpose: outcome=~\"delivery_failed|composition_failed\" - a later value defaults to not-a-failure. RED composition_failed is an MC DEFECT (any non-zero is a bug; the stage is on Send Directives, which is the alerting home - do not alert on both). ORANGE delivery_failed is environmental: the participant actor was gone. No meeting, participant, slot or sender identity is a label.",
+      "description": "Slot states MC conveys to subscribers (ADR-0036 \u00a76), one increment per declared slot per StreamAssignments the actor actually SENDS. The bucketed slot-state signal \u00a711 mandates, joined to NO identity: it answers how many and how bad; MC's own assignment state answers WHO. There is no per-slot series and must not be one. The label domain mirrors the wire enum EXHAUSTIVELY (every named SlotState variant, not only the ones reachable today) so it stays comparable with the client's distribution and so an UNSPECIFIED on the wire is visible rather than absent. EMISSIONS ARE CLIENT- AND SERVER-DRIVEN since story 2: the actor re-emits on a PEER's join, leave, declaration or mute change (either kind since story 3), so the distribution is weighted by meeting churn as well as by any one client - normalise before building a ratio. fewer_sources_than_slots is every declared-but-unfilled slot - a solo participant (loopback removed, R-3), any meeting smaller than N, and every slot of a participant not yet connected to a handler; it is the healthy steady state of a small meeting. Emitted since story 3 MC-A: active (audio names the sender; live video names none), avatar_no_video (a video slot whose occupant publishes no video - precedence over any mute), avatar_client_muted, avatar_server_muted (server wins), fewer_sources_than_slots, and unavailable (truncated by that kind's cap - the over-cap signal; every video slot when MC_MAX_VIDEO_RECEIVE_SLOTS=0). Story 2's source_muted LEFT the domain with its wire value (deleted and reserved by MC-B, 2026-10-23): it is absent, not flat, and no query selects it. source_unreachable stays UNEMITTED under the story-2 edge model: a participant the subscriber shares NO connected handler with is named in unreachable_sender_ids instead (the state is reserved for a PINNED source with no shared handler, which static fill cannot produce) (see Unreachable Senders Named); a non-zero red line here is therefore an MC defect, as is unspecified. zero_requested is gone: the proto reserved it 2026-10-13 as unemittable. withheld_by_congestion arrives with the MH slot-state notification and switch_pending with \u00a77 switching. Split by media_kind (story 3): audio and video slots have different healthy distributions (avatar_no_video exists only on video). Unreachable senders are NOT a slot state here: read Unreachable Senders Named (mc_media_unreachable_senders_total), never this counter.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1839,7 +1563,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "sent"
+              "options": "active"
             },
             "properties": [
               {
@@ -1853,8 +1577,8 @@
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "deferred"
+              "id": "byRegexp",
+              "options": "/^(avatar_no_video|avatar_client_muted|avatar_server_muted)$/"
             },
             "properties": [
               {
@@ -1868,8 +1592,23 @@
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "composition_failed"
+              "id": "byRegexp",
+              "options": "/^(fewer_sources_than_slots|unavailable)$/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^(source_unreachable|unspecified)$/"
             },
             "properties": [
               {
@@ -1884,13 +1623,28 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "delivery_failed"
+              "options": "withheld_by_congestion"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "switch_pending"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "purple",
                   "mode": "fixed"
                 }
               }
@@ -1902,9 +1656,9 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 58
+        "y": 59
       },
-      "id": 159,
+      "id": 60,
       "options": {
         "legend": {
           "calcs": [
@@ -1927,13 +1681,13 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome) (rate(mc_media_slot_view_emissions_total[$__rate_interval]))",
-          "legendFormat": "{{outcome}}",
+          "expr": "sum by (media_kind, slot_state) (rate(mc_media_slot_states_total[$__rate_interval]))",
+          "legendFormat": "{{media_kind}} {{slot_state}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Slot View Emissions by Outcome",
+      "title": "Slot States by Kind",
       "type": "timeseries"
     },
     {
@@ -1941,17 +1695,16 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Joins whose Redis handler assignment differed from the meeting's handler set frozen at first join. EXPECTED EMPTY: the frozen set is the meeting's authority, so MC kept it and moved no edge - but any non-zero value is an MC-internal invariant violation (Redis and the actor disagree). Capture and escalate to meeting-controller (MC runbook Scenario 18 arm f); restarting nothing fixes it. Zero is healthy; an ABSENT series is NOT a zero - it means the metrics pipeline is broken.",
+      "description": "NO SLOT-OCCUPANCY GAUGE EXISTS, SO THIS IS NOT 'slots used / cap' AND MUST NOT BE READ AS ONE. MC publishes no count of filled receive slots: mc_media_slot_states_total counts slot states CONVEYED (one per declared slot per StreamAssignments sent) and mc_media_receive_slot_cap is a config echo. What this panel shows instead - the honest substitute, not the requested ratio: LEFT AXIS, the share of conveyed slot states that carried a source (active, avatar_no_video, avatar_client_muted or avatar_server_muted) out of all conveyed. unavailable and fewer_sources_than_slots are NOT filled. Emission-weighted, so a meeting with churn weighs more than a quiet one (see Slot States). A low share is the healthy steady state of meetings with fewer other participants than the declared N (fewer_sources_than_slots - every solo participant included, since loopback is removed, R-3); it is not a fault. RIGHT AXIS, the published per-kind caps (mc_media_receive_slot_cap, publishing MC_MAX_AUDIO_RECEIVE_SLOTS / MC_MAX_VIDEO_RECEIVE_SLOTS from the ClientMediaConfig field every declaration is truncated against): the bound each kind's declared N is truncated to. A cap below the clients' N shows as unavailable on Slot States (excess slots are truncated, never rejected), and lowers the filled share here. The pair says whether declared slots are being filled and against which configured bound clients declare; it CANNOT say how close any meeting is to the cap. That reading needs an occupancy gauge that does not exist today. Guarded: the '> 0' on the conveyed total makes a window with no emissions read as no data rather than NaN; empty is healthy when no StreamAssignments were sent. key_custody=operator. No meeting, participant, slot or sender identity is on either series. Caps per media_kind (story 3): both kinds are published; a video reading of 0 confirms the R-26 video-off lever applied - max() without by(media_kind) would hide it. The filled share is computed PER media_kind (story 3 OBS-B fix: it previously summed both kinds and was plotted against per-kind caps).",
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "fixed",
-            "fixedColor": "red"
+            "mode": "palette-classic"
           },
           "custom": {
             "axisCenteredZero": false,
             "axisColorMode": "text",
-            "axisLabel": "",
+            "axisLabel": "Filled share",
             "axisPlacement": "auto",
             "barAlignment": 0,
             "drawStyle": "line",
@@ -1988,17 +1741,38 @@
               }
             ]
           },
-          "unit": "none"
+          "unit": "percentunit"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Slots"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 58
+        "y": 59
       },
-      "id": 161,
+      "id": 187,
       "options": {
         "legend": {
           "calcs": [
@@ -2021,13 +1795,24 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum(increase(mc_media_handler_set_divergence_total[$__rate_interval]))",
-          "legendFormat": "divergent joins",
+          "expr": "sum by (media_kind) (rate(mc_media_slot_states_total{slot_state=~\"active|avatar_no_video|avatar_client_muted|avatar_server_muted\"}[$__rate_interval]))\n/\nsum by (media_kind) (rate(mc_media_slot_states_total[$__rate_interval]))\nand\nsum by (media_kind) (rate(mc_media_slot_states_total[$__rate_interval])) > 0",
+          "legendFormat": "filled share {{media_kind}}",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (media_kind) (mc_media_receive_slot_cap)",
+          "legendFormat": "slot cap {{media_kind}}",
+          "range": true,
+          "refId": "B"
         }
       ],
-      "title": "Handler Set Divergence",
+      "title": "Receive Slot Fill vs Cap",
       "type": "timeseries"
     },
     {
@@ -2035,7 +1820,70 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Roster participants named in StreamAssignments.unreachable_sender_ids - a routable participant whose CONNECTED handler set is disjoint from the subscriber's (ADR-0036 \u00a79, story 2 R-33, task 20), summed over emitted views. A NON-ZERO RATE IS A CONNECTIVITY-DEGRADATION SIGNAL: every client is offered every handler and an all-connected meeting co-locates, so a healthy meeting emits zero here. EMISSION-WEIGHTED, NOT A POPULATION: it does NOT count who cannot reach whom (use the connectivity INFO lines and Connect Settles window_elapsed, MC runbook Scenario 18). Mean per emitted view = this / Slot View Emissions outcome=sent. Permanently zero on a single-handler deployment, by construction - because every ROUTABLE participant is on that handler and a not-yet-connected participant is never unreachable (see Not-Yet-Connected Senders). The field is a wire contract the client must render, not optional. No sender, meeting or handler identity.",
+      "description": "The configured per-kind caps MC_MAX_AUDIO_RECEIVE_SLOTS (audio) and MC_MAX_VIDEO_RECEIVE_SLOTS (video), published at boot from the SAME ClientMediaConfig field every declaration is truncated against and JoinResponse tags 13/14 carry. Read once at startup: a change applies after the MC restart, and live slot vectors are never re-truncated. A CONFIG ECHO, NOT A UTILISATION GAUGE - there is no numerator; do not build a 'slots used / cap' ratio. Receive Slot Fill vs Cap reads the nearest honest substitute beside it. Read beside Slot States: a rising unavailable with a cap below the clients' configured N is a configuration mismatch (R-1: excess slots truncated, never rejected), not a client bug. Per media_kind: a video reading of 0 confirms the R-26 video-off lever applied - max() without by(media_kind) would hide it. Video at 0 = the R-26 video-off lever (MC_MAX_VIDEO_RECEIVE_SLOTS=0) is applied.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 67
+      },
+      "id": 158,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (media_kind) (mc_media_receive_slot_cap)",
+          "instant": true,
+          "legendFormat": "slot cap {{media_kind}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Receive Slot Cap",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Roster participants named in StreamAssignments.unreachable_sender_ids - a routable participant whose CONNECTED handler set is disjoint from the subscriber's (ADR-0036 \u00a79, story 2 R-33, task 20), summed over emitted views. A NON-ZERO RATE IS A CONNECTIVITY-DEGRADATION SIGNAL: every client is offered every handler and an all-connected meeting co-locates, so a healthy meeting emits zero here. EMISSION-WEIGHTED, NOT A POPULATION: it does NOT count who cannot reach whom (use the connectivity INFO lines and Connect Settles window_elapsed, MC runbook Scenario 18). Mean per emitted view = this / Slot View Emissions outcome=sent. Permanently zero on a single-handler deployment, by construction - because every ROUTABLE participant is on that handler and a not-yet-connected participant is never unreachable (see Not-Yet-Connected Senders). The field is a wire contract the client must render, not optional. No sender, meeting or handler identity. Kind-free BY DESIGN (mc-service.md, media_kind table): reachability is per participant, not per stream. Read beside Not-Yet-Connected Senders.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2088,8 +1936,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
-        "y": 66
+        "x": 12,
+        "y": 67
       },
       "id": 160,
       "options": {
@@ -2128,18 +1976,202 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "The configured per-kind caps MC_MAX_AUDIO_RECEIVE_SLOTS (audio) and MC_MAX_VIDEO_RECEIVE_SLOTS (video), published at boot from the SAME ClientMediaConfig field every declaration is truncated against and JoinResponse tags 13/14 carry. Read once at startup: a change applies after the MC restart, and live slot vectors are never re-truncated. A CONFIG ECHO, NOT A UTILISATION GAUGE - there is no numerator; do not build a 'slots used / cap' ratio. Receive Slot Fill vs Cap reads the nearest honest substitute beside it. Read beside Slot States: a rising unavailable with a cap below the clients' configured N is a configuration mismatch (R-1: excess slots truncated, never rejected), not a client bug. Per media_kind: a video reading of 0 confirms the R-26 video-off lever applied - max() without by(media_kind) would hide it.",
+      "description": "Client MuteRequest dispositions (ADR-0036 \u00a75). COUNTING UNIT: one increment per (request, NAMED kind) - a per-kind field ABSENT on the wire means unchanged and is not counted, and the SDK names only the kind it changes. TWO COUNTING-UNIT CHANGES, NEITHER A TRAFFIC CHANGE: rates roughly doubled at story 3 OBS-A (an interim that counted both kinds on every request) and roughly HALVED again at MC-B (2026-10-23) - compare against last week accordingly. A request naming NO kind is not counted here (Mute Requests Rejected). It PARTITIONS (report, named kind) pairs. A moved flag of EITHER kind is applied (the actor flips the stream's disposition FORWARD <-> PAUSED and re-emits), so a camera button lands on media_kind=\"video\" applied. Split by media_kind. CLIENT mute only: server mute is its own panel and must never be summed with this one (label-taxonomy.md, the action contract). THE SUCCESS SET IS {applied} (applied_no_recompose, unreachable since MC-A, was removed by MC-B) - the failure predicate is outcome=~\"rate_limited|actor_unavailable\", NOT outcome!=\"applied\", which would count a routine state as a failure. GREEN applied: this kind's flag moved and the meeting actor re-emits the changed slot view to the subscribers HOLDING this source; a failed re-emit is counted by the actor on Send Directives and on Slot View Emissions outcome=composition_failed. BLUE unchanged: THIS NAMED KIND's state did not move - either the identical repeat (no actor hop) or a named kind the actor found already in that state - not a failure. USE applied AS ANY RATIO DENOMINATOR, NOT unchanged: the no-op short-circuit runs before any actor hop, roster read or recomposition, so unchanged is client-inflatable at line rate, and a fraction-applied ratio computed over it is a number one participant can drive to zero. unchanged is exempt from the limiter on purpose - reversing that ordering would let a client spamming a steady state drain its own bucket on no-ops and suppress its next genuine toggle. ORANGE rate_limited is the visible edge of the mute-work token bucket (per connection; burst MUTE_WORK_BURST, one token refilled per MUTE_WORK_REFILL_INTERVAL_MS - both in crates/mc-service/src/webtransport/connection.rs, cited rather than restated). Client mute is the only repeatable client-driven path that puts work on the SHARED meeting actor's mailbox - one actor hop plus a re-emit to the source's holders, which the actor bounds per meeting per turn (Slot View Emissions outcome=deferred), and its MH re-pushes are latest-wins per handler (one in flight, one pending). This is NOT a meeting-wide contention signal; do not route a meeting-wide latency investigation to this panel. A HUMAN NEVER REACHES THIS LIMITER, so a sustained non-zero rate means one connection is toggling far above human rates - a client-side repeat loop first, an abusive peer second - and it is bounded to that connection either way. It is a rate limit and NOT a budget on purpose: a budget would permanently freeze that participant's self-mute once spent. A dropped report never lets media out (\u00a75 enforces client mute at CAPTURE), but it leaves MC's view of that kind stale (PAUSED/avatar) until the participant's next report of the SAME kind. RED actor_unavailable is environmental and terminal. No meeting identifier, participant id, slot id or sender id appears as a label.",
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "thresholds"
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
           },
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "blue",
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "applied"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "unchanged"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "rate_limited"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "actor_unavailable"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 75
+      },
+      "id": 62,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (media_kind, outcome) (rate(mc_media_mute_requests_total[$__rate_interval]))",
+          "legendFormat": "{{media_kind}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Client Mute Requests by Kind and Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "ServerMuteRequest dispositions by action (the verb ASKED for FOR EACH NAMED KIND: mute | unmute, never its result - {audio muted} counts only mute/audio; {audio muted, video not} counts mute/audio AND unmute/video) and outcome (story 2 task 12; ADR-0036 \u00a75, \u00a77). Counted SEPARATELY from client mute (Mute Requests by Outcome): different decider, enforcement point (directive withdrawal plus MH ingress drop, not client capture) and remedy. COUNTING UNIT: one increment per (request, NAMED kind); an absent kind is unchanged and not counted. Rates roughly doubled at story 3 OBS-A (interim: both kinds counted) and roughly HALVED at MC-B (2026-10-23) - counting unit, not traffic. A request naming NO kind - from ANY requester, host or not - is counted only on Mute Requests Rejected, so not_permitted here undercounts non-hosts by exactly those requests. Split by media_kind. SERVER mute only: never summed with client mute (label-taxonomy.md, the action contract). The failure predicate is POSITIVE: outcome=~\"rate_limited|actor_unavailable\" - do not harmonise it to outcome!=\"applied\". not_permitted vs unknown_target: the metric distinguishes two refusals the CLIENT never can (one byte-identical wire error) - deliberate, do not harmonise. unknown_target is reachable ONLY for a host requester, because authority is checked before the target is looked up. not_permitted is CLIENT-INFLATABLE (the check precedes any actor hop) - NEVER use it in a ratio denominator and never alert on its raw rate. No alert on this panel by decision: non-zero mute is healthy moderation. Not a join key with the client's dt_client_media_mute_transitions_total{action} despite identical values.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
                 "value": null
               }
             ]
@@ -2149,25 +2181,26 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
+        "h": 8,
         "w": 12,
         "x": 12,
-        "y": 66
+        "y": 75
       },
-      "id": 158,
+      "id": 178,
       "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
+        "legend": {
           "calcs": [
+            "mean",
             "lastNotNull"
           ],
-          "fields": "",
-          "values": false
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         },
-        "textMode": "auto"
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
       },
       "targets": [
         {
@@ -2176,15 +2209,213 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "max by (media_kind) (mc_media_receive_slot_cap)",
-          "instant": true,
-          "legendFormat": "slot cap {{media_kind}}",
-          "range": false,
+          "expr": "sum by (media_kind, action, outcome) (increase(mc_media_server_mute_requests_total[$__rate_interval]))",
+          "legendFormat": "{{media_kind}} {{action}} {{outcome}}",
+          "range": true,
           "refId": "A"
         }
       ],
-      "title": "Receive Slot Cap",
-      "type": "stat"
+      "title": "Server Mute Requests by Kind",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Participant UnmuteRequest dispositions: a server-muted participant asking the host(s) to lift its mute. NOTIFIES ONLY - it never clears a mute (the single writer is the host's ServerMuteRequest). ONE increment per request, never per host relayed to; a per-host delivery failure is the later hop (Dropped Outbound Messages, signaling_raw), disjoint from this panel. Failure predicate, positive: outcome=~\"rate_limited|actor_unavailable\". not_server_muted and no_host_connected are ROUTINE (no_host_connected is normal once the host has left). not_server_muted is client-driven: keep it out of any ratio denominator. Kind-free BY DESIGN (docs/observability/metrics/mc-service.md, media_kind table): not split by media_kind - a decision, not an omission.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 83
+      },
+      "id": 179,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (increase(mc_media_unmute_requests_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Unmute Requests",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "How many (participant, kind) sources MC believes are SERVER-muted right now, per media_kind, summed across each MC instance's meetings (one series per instance and kind; a participant muted on both kinds is 1 on each). Since story 3 MC-A each kind's server mute reaches MH as that stream's DROP_AT_INGRESS disposition, so the SUM ACROSS KINDS is comparable with MH's server_muted drops - a STATE level, not an event rate: a mute applied yesterday is still here while Server Mute Requests stays flat. Present at zero from process start. Recomputed from live state on the controller's health walk, so it cannot drift after an actor dies. Read it against MH's server_muted drops at FLEET level only (sum across MC pods vs sum of mh_media_frames_dropped_total{reason=\"server_muted\"} rate across MH pods) and DIRECTIONALLY - never divided, never per instance (MC and MH meeting sets do not nest). Since MC-B gauge > 0 with fleet drops near zero is the NORMAL shape (a server mute withdraws the directive, so a compliant client sends nothing to drop; Send Directive Withdrawals reason=server_muted is the primary evidence the mute took) - the comparison detects only a sender that ignored its empty targets. Beyond that, gauge > 0 with a flat fleet drop rate is only a candidate disagreement: a muted participant who is silent, disconnected, in grace, or does not publish the muted kind drops nothing. It does not answer whether ONE meeting has a mute in force.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 83
+      },
+      "id": 181,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (instance, media_kind) (mc_media_server_muted_sources)",
+          "legendFormat": "{{instance}} {{media_kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Server-Muted Sources",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 91
+      },
+      "id": 194,
+      "panels": [],
+      "title": "Video Send Directives (story 3)",
+      "type": "row"
     },
     {
       "datasource": {
@@ -2245,7 +2476,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 74
+        "y": 92
       },
       "id": 188,
       "options": {
@@ -2308,7 +2539,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 70
+        "y": 92
       },
       "id": 189,
       "options": {
@@ -2343,12 +2574,105 @@
       "type": "stat"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mc_session_join_failures_total{error_type} for the story 3 join-media values (all reach the client as one generic INVALID_REQUEST; only this label splits them): header_version_unsupported (an SDK lacking header version 3 - the old-bundle-meets-new-MC rollout signal; expected during a rollout, panel only), publish_kind_invalid, receive_capability_invalid, publishes_and_receives_nothing (neither publishes nor receives, judged on the declaration as sent) and reconnect_publish_set_mismatch (a reconnect presenting a different publish set). reconnect_publish_set_mismatch is NOT production-reachable today (actor-level reconnect is not wired to the WebTransport accept path), so a flat zero there is expected, not a broken series. Alerted only indirectly through MCHighJoinFailureRate. Zero is healthy: the counter is zero-initialised, so a flat 0 is calm and an ABSENT series is a fault (pipeline or pod), not calm.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 100
+      },
+      "id": 195,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (error_type) (increase(mc_session_join_failures_total{error_type=~\"header_version_unsupported|publish_kind_invalid|receive_capability_invalid|publishes_and_receives_nothing|reconnect_publish_set_mismatch\"}[$__rate_interval]))",
+          "legendFormat": "{{error_type}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Join Refusals - Story 3 Media Join Values",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 82
+        "y": 108
       },
       "id": 163,
       "panels": [],
@@ -2475,7 +2799,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 83
+        "y": 109
       },
       "id": 164,
       "options": {
@@ -2599,7 +2923,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 83
+        "y": 109
       },
       "id": 165,
       "options": {
@@ -2638,7 +2962,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Roster members NOT routable (not yet connected to any handler, inside their settle window, or re-establishing) counted per emitted StreamAssignments, the subscriber ITSELF INCLUDED (so a subscriber's own all-fewer_sources view, identical to a small meeting's, is not invisible). The partner of Unreachable Senders Named: that one is silence because connected sets are disjoint, this one is silence because someone is not connected yet. NOT EXPECTED-EMPTY - every join passes through it; PERSISTENCE, not rate, is the fault. Emission-weighted: normalise by Slot View Emissions outcome=sent. Mixes the subscriber's own contribution (at most 1) with its peers'.",
+      "description": "Roster members NOT routable (not yet connected to any handler, inside their settle window, or re-establishing) counted per emitted StreamAssignments, the subscriber ITSELF INCLUDED (so a subscriber's own all-fewer_sources view, identical to a small meeting's, is not invisible). The partner of Unreachable Senders Named: that one is silence because connected sets are disjoint, this one is silence because someone is not connected yet. NOT EXPECTED-EMPTY - every join passes through it; PERSISTENCE, not rate, is the fault. Emission-weighted: normalise by Slot View Emissions outcome=sent. Mixes the subscriber's own contribution (at most 1) with its peers'. Kind-free BY DESIGN (docs/observability/metrics/mc-service.md, media_kind table): not split by media_kind - a decision, not an omission.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2692,7 +3016,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 91
+        "y": 117
       },
       "id": 166,
       "options": {
@@ -2731,7 +3055,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Send targets per emitted SendDirective (story 2 task 20): a sender sends to every handler owning one of its edges, and MC's edge policy co-locates to minimise that. ~1 when participants reach every handler; above 1 only with genuinely partial connectivity. A sustained rise with healthy connectivity means co-location degraded - visible otherwise only as client uplink cost. Changed directives only (the emitted boundary). Story 3: targets are counted per stream by kind; the total is unchanged so this sum()/sum() ratio is unchanged. Directives are kind-free: a per-kind version needs ignoring(media_kind) group_left on the denominator.",
+      "description": "Send targets per emitted SendDirective (story 2 task 20): a sender sends to every handler owning one of its edges, and MC's edge policy co-locates to minimise that. ~1 when participants reach every handler; above 1 only with genuinely partial connectivity. A sustained rise with healthy connectivity means co-location degraded - visible otherwise only as client uplink cost. Changed directives only (the emitted boundary). Story 3: targets are counted per stream by kind and are split by kind here; the DENOMINATOR stays kind-free on purpose (a directive is composed per participant, before any stream exists), joined with ignoring(media_kind) group_left. The two kinds' lines sum to the old all-kind ratio.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2785,7 +3109,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 91
+        "y": 117
       },
       "id": 167,
       "options": {
@@ -2810,8 +3134,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum(rate(mc_media_send_targets_total[$__rate_interval])) / sum(rate(mc_media_send_directives_total{outcome=\"emitted\"}[$__rate_interval]))",
-          "legendFormat": "targets per directive",
+          "expr": "sum by (media_kind) (rate(mc_media_send_targets_total[$__rate_interval])) / ignoring(media_kind) group_left() sum(rate(mc_media_send_directives_total{outcome=\"emitted\"}[$__rate_interval]))",
+          "legendFormat": "targets per directive {{media_kind}}",
           "range": true,
           "refId": "A"
         }
@@ -2909,7 +3233,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 99
+        "y": 125
       },
       "id": 168,
       "options": {
@@ -3002,7 +3326,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 99
+        "y": 125
       },
       "id": 169,
       "options": {
@@ -3065,7 +3389,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 107
+        "y": 133
       },
       "id": 170,
       "options": {
@@ -3105,7 +3429,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 111
+        "y": 137
       },
       "id": 171,
       "panels": [],
@@ -3171,7 +3495,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 112
+        "y": 138
       },
       "id": 172,
       "options": {
@@ -3286,7 +3610,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 112
+        "y": 138
       },
       "id": 173,
       "options": {
@@ -3379,7 +3703,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 120
+        "y": 146
       },
       "id": 174,
       "options": {
@@ -3494,7 +3818,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 120
+        "y": 146
       },
       "id": 175,
       "options": {
@@ -3598,7 +3922,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 128
+        "y": 154
       },
       "id": 176,
       "options": {
@@ -3661,7 +3985,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 128
+        "y": 154
       },
       "id": 177,
       "options": {

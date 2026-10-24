@@ -175,9 +175,10 @@ impl CapabilityOutcome {
 /// records here unconditionally — including those triggered by a peer's action
 /// rather than this participant's own. *Every* reason a client was not told to
 /// send is a value on `mc_media_send_directives_total`, so "clients are not
-/// being directed, and why" is one query. The one pre-actor failure — the
-/// connection could not obtain the meeting handle at join — also records
-/// [`Self::MeetingStateUnavailable`].
+/// being directed, and why" is one query. The one connection-side failure — a
+/// post-join capability RE-declaration the meeting actor did not register
+/// (`webtransport/connection.rs::handle_receive_capability`) — records
+/// [`Self::MeetingStateUnavailable`]; there is no join-time recording site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectiveOutcome {
     /// Emitted with at least one target.
@@ -202,9 +203,28 @@ pub enum DirectiveOutcome {
     /// by construction. Fails closed: the participant's view is not emitted at
     /// all, never an ACTIVE slot or a send target with an empty url.
     HandlerUrlUnresolved,
-    /// Meeting state could not be read. Environmental.
+    /// A post-join capability re-declaration the meeting actor did not
+    /// register. Environmental — the only environmental token: the actor is
+    /// gone (its mailbox closed or dropped the reply, usually a meeting
+    /// ending) or `declare()` refused because the participant already left the
+    /// roster. The PREVIOUS declaration and the view MC last sent from it stay
+    /// in force, so the participant is not darkened. The shipped SDK never
+    /// re-declares (the initial declaration rides the JoinRequest), so with it
+    /// this is near-unreachable: a hit means a non-shipped or patched client,
+    /// or a test.
     MeetingStateUnavailable,
-    /// The forwarding assignment could not be computed. Environmental.
+    /// The forwarding assignment could not be computed. **MC defect**
+    /// (reclassified from "environmental" at story 3 OBS-B).
+    ///
+    /// Its only producer is the meeting actor's flush with no assignment
+    /// (`actors/meeting_media.rs::flush_one`). Because every mutation renders
+    /// before it dirties anyone, that state is reachable only after the slot
+    /// render failed (`render_and_publish` sets the assignment to `None`), and
+    /// the only render error, `AssignmentError::EgressOrdinalOverflow`, is
+    /// unreachable from valid input: every declaration is truncated to the
+    /// per-kind caps, which config load validates at <= 64. When it does
+    /// happen it is MEETING-WIDE: every participant's flush fails until the
+    /// membership changes.
     AssignmentFailed,
 }
 
@@ -753,6 +773,193 @@ mod tests {
                 outcome.label()
             );
         }
+    }
+
+    /// Alert class of each [`DirectiveOutcome`] — THE one home of the
+    /// send-directive alert partition (story 3 OBS-B). Exhaustive and
+    /// wildcard-free, so a new variant fails to compile here until someone
+    /// classifies it; `ALL` itself is a hand-written array the compiler does
+    /// not pin, which is why the classification is a `match`, not a list.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AlertClass {
+        /// A specified success: never alerted.
+        Normal,
+        /// An MC defect: pages (`MCMediaSendDirectiveDefect`).
+        Defect,
+        /// Environmental: warns (`MCMediaSendDirectiveFailures`).
+        Environmental,
+    }
+
+    impl DirectiveOutcome {
+        /// This outcome's alert class: `DirectiveOutcome::alert_class()`, the
+        /// citation the rules file, catalog and inventory use.
+        const fn alert_class(self) -> AlertClass {
+            match self {
+                Self::Emitted | Self::EmittedEmptyTargets => AlertClass::Normal,
+                Self::UnknownStreamNumber
+                | Self::TransportModeUnspecified
+                | Self::HandlerUrlUnresolved
+                | Self::AssignmentFailed => AlertClass::Defect,
+                Self::MeetingStateUnavailable => AlertClass::Environmental,
+            }
+        }
+    }
+
+    /// The committed alert rules, read from the file Prometheus loads — never
+    /// a restated copy.
+    const MC_ALERT_RULES: &str =
+        include_str!("../../../../infra/docker/prometheus/rules/mc-alerts.yaml");
+
+    /// The committed MC media dashboard, whose alert-linked panel draws the
+    /// same two selectors.
+    const MC_MEDIA_DASHBOARD: &str =
+        include_str!("../../../../infra/grafana/dashboards/mc-media.json");
+
+    /// The "Send Directive Failures (ALERTED ...)" panel's id in
+    /// `mc-media.json`.
+    const SEND_DIRECTIVE_FAILURES_PANEL_ID: u64 = 192;
+
+    #[derive(serde::Deserialize)]
+    struct RulesDoc {
+        groups: Vec<RuleGroup>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RuleGroup {
+        rules: Vec<Rule>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Rule {
+        alert: Option<String>,
+        expr: Option<String>,
+    }
+
+    /// The `expr` of `alert`, parsed structurally from the rules YAML. `None` if
+    /// the document does not parse or the rule or its expr is absent.
+    fn rule_expr(alert: &str) -> Option<String> {
+        let doc: RulesDoc = serde_norway::from_str(MC_ALERT_RULES).ok()?;
+        doc.groups
+            .into_iter()
+            .flat_map(|g| g.rules)
+            .find(|r| r.alert.as_deref() == Some(alert))?
+            .expr
+    }
+
+    /// The alternation tokens of the `outcome<op>"a|b|c"` matcher in `expr`.
+    fn outcome_alternation(expr: &str, op: &str) -> Option<HashSet<String>> {
+        let needle = format!("outcome{op}\"");
+        let rest = &expr[expr.find(&needle)? + needle.len()..];
+        let body = &rest[..rest.find('"')?];
+        Some(
+            body.split('|')
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
+    fn labels_of(class: AlertClass) -> HashSet<String> {
+        DirectiveOutcome::ALL
+            .iter()
+            .filter(|o| o.alert_class() == class)
+            .map(|o| o.label().to_string())
+            .collect()
+    }
+
+    /// Both send-directive rules in `mc-alerts.yaml` match `alert_class()`:
+    /// the PAGE rule's positive regex is exactly the defect class, and the
+    /// WARNING rule's negated regex excludes exactly normal + defect, so the
+    /// environmental class — and any token added later — warns.
+    #[test]
+    fn send_directive_alert_rules_match_the_alert_class_partition() {
+        let defect = labels_of(AlertClass::Defect);
+        let normal = labels_of(AlertClass::Normal);
+        let environmental = labels_of(AlertClass::Environmental);
+        assert!(
+            environmental.contains(DirectiveOutcome::MeetingStateUnavailable.label()),
+            "meeting_state_unavailable must be environmental (warning, not page)"
+        );
+
+        let page_expr = rule_expr("MCMediaSendDirectiveDefect")
+            .expect("MCMediaSendDirectiveDefect with an expr in mc-alerts.yaml");
+        let warn_expr = rule_expr("MCMediaSendDirectiveFailures")
+            .expect("MCMediaSendDirectiveFailures with an expr in mc-alerts.yaml");
+        assert!(page_expr.contains("mc_media_send_directives_total"));
+        assert!(warn_expr.contains("mc_media_send_directives_total"));
+
+        let page =
+            outcome_alternation(&page_expr, "=~").expect("the page rule selects outcome=~\"...\"");
+        let warn_excluded = outcome_alternation(&warn_expr, "!~")
+            .expect("the warning rule selects outcome!~\"...\"");
+
+        // Positive controls: the parse produced something, sized as the class.
+        assert!(
+            !page.is_empty() && page.len() == defect.len(),
+            "page set {page:?}"
+        );
+        let excluded_expected: HashSet<String> = normal.union(&defect).cloned().collect();
+        assert_eq!(
+            warn_excluded.len(),
+            excluded_expected.len(),
+            "{warn_excluded:?}"
+        );
+
+        assert_eq!(page, defect, "page rule != DirectiveOutcome Defect class");
+        assert_eq!(
+            warn_excluded, excluded_expected,
+            "warning rule's exclusions != Normal + Defect"
+        );
+
+        // No stale token: every token a rule names is a real outcome label.
+        let all: HashSet<String> = DirectiveOutcome::ALL
+            .iter()
+            .map(|o| o.label().to_string())
+            .collect();
+        assert!(page.is_subset(&all) && warn_excluded.is_subset(&all));
+        assert!(
+            !environmental.is_empty()
+                && environmental
+                    == all
+                        .difference(&excluded_expected)
+                        .cloned()
+                        .collect::<HashSet<_>>()
+        );
+
+        // The dashboard's alert-linked panel draws the SAME two selectors:
+        // its two target exprs must carry the page set and the warning
+        // exclusion set. Fail closed if the panel or either target is missing.
+        let board: serde_json::Value =
+            serde_json::from_str(MC_MEDIA_DASHBOARD).expect("mc-media.json parses");
+        let panel = board["panels"]
+            .as_array()
+            .expect("mc-media.json has panels")
+            .iter()
+            .find(|p| p["id"].as_u64() == Some(SEND_DIRECTIVE_FAILURES_PANEL_ID))
+            .expect("mc-media.json has the Send Directive Failures panel (id 192)");
+        assert!(
+            panel["title"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("Send Directive Failures")),
+            "panel 192 is the Send Directive Failures panel"
+        );
+        let exprs: Vec<&str> = panel["targets"]
+            .as_array()
+            .expect("panel 192 has targets")
+            .iter()
+            .filter_map(|t| t["expr"].as_str())
+            .collect();
+        let panel_page = exprs
+            .iter()
+            .find_map(|e| outcome_alternation(e, "=~"))
+            .expect("panel 192 draws the page rule's positive selector");
+        let panel_warn = exprs
+            .iter()
+            .find_map(|e| outcome_alternation(e, "!~"))
+            .expect("panel 192 draws the warning rule's negated selector");
+        assert_eq!(panel_page, page, "dashboard page selector != the rule's");
+        assert_eq!(
+            panel_warn, warn_excluded,
+            "dashboard warning selector != the rule's"
+        );
     }
 
     #[test]

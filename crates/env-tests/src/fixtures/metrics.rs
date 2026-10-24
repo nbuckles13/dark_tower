@@ -144,6 +144,24 @@ impl PrometheusClient {
         Ok(response.text().await?)
     }
 
+    /// Fetch the RAW body of `/api/v1/format_query?query=...` — Prometheus's
+    /// own pretty-printing of `query` from its parse. Parsed by
+    /// [`crate::fixtures::alert_rules_loaded::formatted_query`]. Used to compare
+    /// a committed rule expression with the one Prometheus loaded: both sides go
+    /// through this, so formatting differences cannot read as drift.
+    pub async fn format_query(&self, query: &str) -> Result<String, PrometheusError> {
+        let url = format!("{}/api/v1/format_query", self.base_url);
+        let response = self
+            .http_client
+            .get(&url)
+            .query(&[("query", query)])
+            .send()
+            .await?;
+        // A parse error is a 400 with an error envelope; return the body either
+        // way so the kernel reports it as COULD-NOT-EVALUATE.
+        Ok(response.text().await?)
+    }
+
     /// Fetch the RAW body of `/api/v1/status/config` (a JSON envelope whose
     /// `data.yaml` is the resolved config as one escaped YAML string). Parsed
     /// by pure kernels ([`max_service_job_scrape_interval`]), never at the
@@ -436,6 +454,48 @@ pub fn format_instance_map(map: &InstanceCounters) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("{{{body}}}")
+}
+
+/// `max(mc_media_video_keyframe_min_interval_seconds)`: MC's directed
+/// minimum keyframe interval in seconds, the threshold source of
+/// `MHVideoKeyframeStorm`, `MHVideoEdgeStuckPending` and
+/// `ClientVideoSlotUnfulfilled`. FIRE probes derive their adverse values from
+/// it, never from a literal.
+///
+/// # Panics
+///
+/// With a COULD-NOT-EVALUATE reason when the query fails or the gauge is
+/// absent (those rules cannot evaluate without an MC scraped).
+pub async fn mc_video_min_keyframe_interval_seconds(prom: &PrometheusClient) -> f64 {
+    prom.query_promql("max(mc_media_video_keyframe_min_interval_seconds)")
+        .await
+        .expect("COULD-NOT-EVALUATE: MC interval gauge query failed")
+        .data
+        .result
+        .first()
+        .and_then(|r| r.value.as_ref())
+        .and_then(|(_, v)| v.parse::<f64>().ok())
+        .expect(
+            "COULD-NOT-EVALUATE: mc_media_video_keyframe_min_interval_seconds is absent; the \
+             video alert thresholds derive from it and need MC scraped",
+        )
+}
+
+/// Whether `promql` returns at least one series within the
+/// [`ConsistencyCategory::MetricsScrape`](crate::eventual::ConsistencyCategory)
+/// bound — scrape lag only, never a pass condition on timing.
+pub async fn eventually_returns_series(prom: &PrometheusClient, promql: &str) -> bool {
+    crate::eventual::assert_eventually(crate::eventual::ConsistencyCategory::MetricsScrape, || {
+        let q = promql.to_string();
+        async move {
+            prom.query_promql(&q)
+                .await
+                .ok()
+                .is_some_and(|r| !r.data.result.is_empty())
+        }
+    })
+    .await
+    .is_ok()
 }
 
 /// The ONE Rust counter-delta poll loop (mirrors the TS

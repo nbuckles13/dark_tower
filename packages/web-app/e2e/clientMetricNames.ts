@@ -18,6 +18,17 @@ import { MEDIA_KEK_SOURCES, MEDIA_KIND_LABELS } from '@darktower/sdk-core';
 /** The alert whose selector the R-27 exactness read-back checks. */
 export const MISSING_KEY_MATERIAL_ALERT = 'MCMediaMissingKeyMaterial';
 
+/**
+ * The grouping label EVERY `sum` in that alert's expression carries (story 3
+ * OBS-B: the rule is per kind — numerator, denominator AND non-zero guard). An
+ * ungrouped guard under `and` would match no label set and silently kill the
+ * rule, so the drift test requires all three.
+ */
+export const MISSING_KEY_MATERIAL_GROUPING = 'media_kind';
+
+/** How many `sum` aggregations that alert's expression has (numerator, denominator, guard). */
+export const MISSING_KEY_MATERIAL_SUM_COUNT = 3;
+
 /** Every `dt_client_*` name that alert's expression selects. Set-equal to the rule. */
 export const MISSING_KEY_MATERIAL_SELECTED_NAMES = [
   'dt_client_media_frames_dropped_total',
@@ -70,4 +81,22 @@ export function clientNamesIn(expr: string): Set<string> {
 export function reasonAlternationIn(expr: string): string[] {
   const match = /reason=~"([^"]*)"/.exec(expr);
   return match?.[1] ? match[1].split('|').filter((t) => t !== '') : [];
+}
+
+/**
+ * The grouping clause of every `sum` aggregation in a PromQL expression, in
+ * order: `'media_kind'` for `sum by (media_kind) (`, `''` for a bare `sum(`.
+ * A `sum` with any other modifier shape (e.g. `sum without (...)`) is reported as
+ * the placeholder `'<unrecognised sum shape>'`, so the caller's equality check
+ * fails loudly rather than skipping it.
+ */
+export function sumGroupingsIn(expr: string): string[] {
+  const out: string[] = [];
+  const re = /\bsum\s*(by\s*\(([^)]*)\)\s*)?\(/g;
+  for (let m = re.exec(expr); m !== null; m = re.exec(expr)) {
+    out.push(m[1] === undefined ? '' : (m[2] ?? '').replace(/\s+/g, ''));
+  }
+  const total = expr.match(/\bsum\b/g)?.length ?? 0;
+  for (let i = out.length; i < total; i += 1) out.push('<unrecognised sum shape>');
+  return out;
 }

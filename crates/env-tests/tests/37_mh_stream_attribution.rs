@@ -27,7 +27,17 @@
 //!     nothing ever lands on a video slot; A's real audio is unaffected;
 //! (d) an undeclared label counts `unmatched_stream`;
 //! (e) A's audio PAUSED (client mute) still forwards, counted as paused-source
-//!     arrivals.
+//!     arrivals;
+//! (f) both producers of `rejected_transport_inconsistent` (story 3 OBS-B): a
+//!     registration whose egress candidate names an undeclared source stream,
+//!     and one whose single egress carries two DECLARED candidates of
+//!     different transport modes; MH refuses each whole.
+//!
+//! FIRE halves of `MHTransportInconsistent` (story 3 OBS-B, A8) ride on (c)
+//! and (f): after each arm's counter rise is observed, that arm of the rule's
+//! committed expression (read from `mh-alerts.yaml`, selected by its token)
+//! returns a series. The whole expression is not asserted: (c)'s drop arm is
+//! still inside its window at (f), so it could not discriminate.
 //!
 //! # Evidence (crates/env-tests/README.md evidence rule)
 //!
@@ -123,6 +133,80 @@ const SEQ_C: u32 = 1_200_000;
 const SEQ_D: u32 = 1_250_000;
 const SEQ_E: u32 = 1_300_000;
 const _: () = assert!(SEQ_B >= env_tests::fixtures::media::AUDIO_SEQUENCE_CEILING);
+
+/// MH's policy-refusal counter for the transport-inconsistent token, per pod.
+const REFUSED_PROMQL: &str = r#"sum by (instance) (mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"})"#;
+
+/// The A8 rule (MHTransportInconsistent) is `<policy arm> or <drop arm>`.
+const A8_ALERT: &str = "MHTransportInconsistent";
+
+/// One of MHTransportInconsistent's two arms, chosen by CONTENT (never by
+/// position), so a reordering of the rule's `or` cannot point a check at the
+/// wrong arm.
+#[derive(Clone, Copy)]
+enum A8Arm {
+    /// The policy arm: `mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}`.
+    Policy,
+    /// The drop arm: `mh_media_frames_dropped_total{reason="transport_mismatch"}`.
+    Drop,
+}
+
+impl A8Arm {
+    const fn token(self) -> &'static str {
+        match self {
+            Self::Policy => "rejected_transport_inconsistent",
+            Self::Drop => "transport_mismatch",
+        }
+    }
+}
+
+/// FIRE for one arm of MHTransportInconsistent, DERIVED from the rule file:
+/// the committed expr is split at its top-level `or` line and the arm whose
+/// text names the arm's token is selected — exactly one arm per token, or
+/// COULD-NOT-EVALUATE. That ARM, evaluated as an instant query, is the proof:
+/// it must return a series once the adverse condition was induced and scraped.
+/// The WHOLE expr is deliberately NOT asserted: once (c) has driven
+/// `transport_mismatch`, the drop arm stays non-empty for its `[5m]` window, so
+/// a whole-expr check at (f) would pass whether or not the policy arm fired.
+/// The rule's `for:` is never waited out — this proves the expression fires on
+/// the condition, not that the alert's timer elapsed.
+async fn assert_a8_arm_fires(phase: &str, prom: &PrometheusClient, arm: A8Arm) {
+    let expr =
+        env_tests::fixtures::alert_rules_loaded::committed_alert_expr("mh-alerts.yaml", A8_ALERT);
+    let lines: Vec<&str> = expr.lines().collect();
+    let arms: Vec<String> = lines
+        .split(|l| l.trim() == "or")
+        .map(|arm| arm.join("\n"))
+        .collect();
+    assert_eq!(
+        arms.len(),
+        2,
+        "COULD-NOT-EVALUATE: `{A8_ALERT}`'s expr is not `<arm> or <arm>` on separate lines, so \
+         its arms cannot be derived; update this probe with the rule: {expr}"
+    );
+    for other in [A8Arm::Policy, A8Arm::Drop] {
+        let n = arms.iter().filter(|a| a.contains(other.token())).count();
+        assert_eq!(
+            n,
+            1,
+            "COULD-NOT-EVALUATE: `{A8_ALERT}` has {n} arms naming `{}` (want exactly 1): {expr}",
+            other.token()
+        );
+    }
+    let q = arms
+        .iter()
+        .find(|a| a.contains(arm.token()))
+        .expect("checked above")
+        .trim()
+        .to_string();
+    let fired = env_tests::fixtures::metrics::eventually_returns_series(prom, &q).await;
+    assert!(
+        fired,
+        "FIRE-NOT-OBSERVED: {phase}: `{A8_ALERT}`'s `{}` arm, read from mh-alerts.yaml, returned \
+         no series after the condition was induced and its counter rise was observed: {q}",
+        arm.token()
+    );
+}
 
 /// What one received datagram is, for this file's classification.
 enum Rx {
@@ -505,6 +589,9 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
         "ATTR (c) TRANSPORT_MISMATCH",
     )
     .await;
+    // FIRE (story 3 OBS-B): MHTransportInconsistent's transport_mismatch ARM,
+    // read from the rule file, now returns a series.
+    assert_a8_arm_fires("ATTR (c) A8 FIRE", &prom, A8Arm::Drop).await;
     // Relabelled as A's audio: reaches AUDIO slots only (positive), never a
     // video slot (asserted on every frame by `observe_phase`); A's real audio
     // flows too.
@@ -607,6 +694,101 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
         "ATTR (e) PAUSED ARRIVALS",
     )
     .await;
+
+    // (f) TRANSPORT-INCONSISTENT REFUSALS (story 3 OBS-B; FIRE for
+    // MHTransportInconsistent's policy arm), both producers. First: an egress
+    // whose candidate names a source stream the registration does not declare. MH refuses the whole
+    // policy as `rejected_transport_inconsistent` (routing/mod.rs
+    // PolicyRejection::UndeclaredCandidate) and installs nothing, so the live
+    // snapshot from (e) is untouched. MC satisfies this by construction, so
+    // this file is the token's only producer.
+    let refused_base = injection::baselines(&prom, REFUSED_PROMQL).await;
+    for injection in &mut injections {
+        let g = injection.generation(4);
+        let status = injection
+            .register_refused(
+                g,
+                vec![injection::declared_edge(
+                    (b << 8) | 9,
+                    b,
+                    B_VIDEO_SLOT,
+                    a,
+                    VIDEO_SEND_ID,
+                )],
+                // A's VIDEO stream deliberately NOT declared.
+                vec![injection::declared_source(
+                    a,
+                    AUDIO_SEND_ID,
+                    TransportMode::Datagram,
+                    SourceDisposition::Forward,
+                )],
+            )
+            .await;
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "ATTR (f): MH must refuse an undeclared-candidate policy as invalid: {status:?}"
+        );
+    }
+    injection::assert_rise(
+        &prom,
+        &handlers,
+        REFUSED_PROMQL,
+        &refused_base,
+        1,
+        "ATTR (f) REJECTED_TRANSPORT_INCONSISTENT (undeclared candidate)",
+    )
+    .await;
+
+    // The SECOND producer (routing/mod.rs
+    // PolicyRejection::InconsistentCandidateTransports): ONE egress whose two
+    // candidates are both DECLARED but on different transports (A's audio on
+    // DATAGRAM, A's video on STREAM_PER_GROUP). Different egresses may differ;
+    // one egress's candidates may not. Refused whole, nothing installed.
+    let mixed_base = injection::baselines(&prom, REFUSED_PROMQL).await;
+    for injection in &mut injections {
+        let g = injection.generation(5);
+        let mut mixed = injection::declared_edge((b << 8) | 10, b, B_VIDEO_SLOT, a, VIDEO_SEND_ID);
+        let mut audio_candidate = mixed.candidate_sources[0];
+        audio_candidate.stream_number = u32::from(AUDIO_SEND_ID);
+        mixed.candidate_sources.push(audio_candidate);
+        let status = injection
+            .register_refused(
+                g,
+                vec![mixed],
+                vec![
+                    injection::declared_source(
+                        a,
+                        AUDIO_SEND_ID,
+                        TransportMode::Datagram,
+                        SourceDisposition::Forward,
+                    ),
+                    injection::declared_source(
+                        a,
+                        VIDEO_SEND_ID,
+                        TransportMode::StreamPerGroup,
+                        SourceDisposition::Forward,
+                    ),
+                ],
+            )
+            .await;
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "ATTR (f): MH must refuse an egress whose declared candidates mix transports: \
+             {status:?}"
+        );
+    }
+    injection::assert_rise(
+        &prom,
+        &handlers,
+        REFUSED_PROMQL,
+        &mixed_base,
+        1,
+        "ATTR (f) REJECTED_TRANSPORT_INCONSISTENT (mixed candidate transports)",
+    )
+    .await;
+    assert_a8_arm_fires("ATTR (f) A8 FIRE", &prom, A8Arm::Policy).await;
 
     // CLEANUP before any session closes, with the release PROVED.
     for injection in injections {

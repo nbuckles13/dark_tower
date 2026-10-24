@@ -645,6 +645,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   you need per-browser queue depth, it is not available from this signal at all.
 
 ### `dt_client_media_frames_received_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `MCMediaMissingKeyMaterial`'s denominator and guard, `sum by (media_kind)`.
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Frames received on the media path, counted at the PARSE
@@ -656,6 +657,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   counting-point note.
 
 ### `dt_client_media_frames_dropped_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoServerMutedSenderFrames` reads `reason="sender_server_muted", media_kind="video"`; `MCMediaMissingKeyMaterial` reads the four key-delivery reasons `sum by (media_kind)`.
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Labels**: per-kind base (incl. `media_kind`) + `reason` — the frozen frame-reject vocabulary, whose SSoT is
@@ -765,18 +767,19 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   - `sender_server_muted` — a video frame from a sender that was ALREADY
     video-server-muted (latest `ParticipantMuteUpdate`) when it ARRIVED. Dropped
     after verify, before decrypt; never rendered. The receiver-side signal that
-    MH's ingress drop failed — alert A5 and MH runbook scenario 19 select on
+    MH's ingress drop failed — `ClientVideoServerMutedSenderFrames` (A5) and MH runbook scenario 19 select on
     `{reason="sender_server_muted", media_kind="video"}`. **Residual race, by
     design:** a `ParticipantMuteUpdate` can reach this client before MH applies
     DROP_AT_INGRESS, so frames in flight during that window count here on every
     ordinary server mute — **a short burst per mute is expected and is not an MH
-    failure; a SUSTAINED rate is the MH-enforcement signal. OBS-B's A5 threshold
-    must tolerate the burst.** Never fed by decode-before-live in
+    failure; a SUSTAINED rate is the MH-enforcement signal; A5's `for: 10m`
+    tolerates the burst.** Never fed by decode-before-live in
     `avatar_client_muted` / `avatar_no_video` slots (those senders are not
     server-muted). A frame dropped here is re-requested once at the unmute edge
     (`dt_client_media_recovery_requests_sent_total{source="server_mute_lifted"}`).
 
 ### `dt_client_media_frames_accepted_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoDecodeErrorRatio`'s denominator and guard (`media_kind="video"`).
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Frames that completed the receive path — verified, replay-
@@ -929,6 +932,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   to slots this subscriber did not ask for.
 
 ### `dt_client_media_decoder_errors_total`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoDecodeErrorRatio`'s numerator (`media_kind="video"`): failure EVENTS per accepted frame.
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: A decoder's terminal error callback fired. **Audio: one
@@ -1014,7 +1018,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 - **Bound**: per slot, one request per loss pair; MH forwards only an exact
   counter match for the slot's current source and counts the rest.
 - **No GoP value, sender or slot** in any label.
-- **Alert**: none (OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
+- **Alert**: none, by decision (story 3 OBS-B: bounded per loss event; MH counts forwarded vs deduped). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_incoming_streams_refused_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
@@ -1029,6 +1033,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 - **Alert**: none. **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_slot_unfulfilled_duration_ms`
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoSlotUnfulfilled` (p95 of `_bucket{media_kind="video"}`, guard on `_count`).
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Histogram. **Unit: ms**, one observation per EXIT from the unfulfilled state.
 - **Description**: How long a video slot MC reports ACTIVE showed neither
@@ -1053,7 +1058,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   the `le` series across client versions.
 - **Labels**: per-kind base only (`media_kind="video"`). **No identity and no slot id.**
 - **The fleet-meaningful unfulfilled signal** (unlike the gauge below): A9
-  `ClientVideoSlotUnfulfilled` belongs on it (OBS-B's call). Feeds the R-35 local
+  `ClientVideoSlotUnfulfilled` reads it. Feeds the R-35 local
   overlay through a NEVER-exported snapshot getter
   (`VideoReceiver.unfulfilledSnapshot()`).
 - **Panel**: `infra/grafana/dashboards/client-media.json`.
@@ -1459,7 +1464,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   yet, not a broken pipeline. Panels MUST tolerate absence (`or vector(0)`) rather
   than render "No data".
 - **No device, sender, slot or stream dimension** — ever.
-- **Alert**: none yet (story 3 OBS-B, task 20, owns the alert inventory). **Panel**:
+- **Alert**: none, by decision (story 3 OBS-B: the user's environment). **Panel**:
   `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_keyframe_requests_received_total`
@@ -1492,7 +1497,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 - **Never summed by `outcome`** with `..._keyframe_requests_unattributed_total`:
   `outcome` is a per-metric vocabulary (`label-taxonomy.md`, the `outcome` row).
 - **No GoP counter, stream number, slot or sender in any label** (ADR-0036 §11).
-- **Alert**: none yet (story 3 OBS-B; A1 keyframe storm is MH-side). **Panel**:
+- **Alert**: none, by decision (story 3 OBS-B: `honoured_counter_ahead` is diagnostic; the storm alert `MHVideoKeyframeStorm` is MH-side). **Panel**:
   `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_keyframe_requests_unattributed_total`
@@ -1509,7 +1514,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   Non-zero `malformed` is a handler (or path) defect.
 - **Never summed by `outcome`** with `..._keyframe_requests_received_total`
   (per-metric `outcome`, `label-taxonomy.md`).
-- **Alert**: none yet (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
+- **Alert**: none, by decision (story 3 OBS-B; `docs/observability/alerts.md` §Deliberate absences). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_mh_control_channel_ended_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
@@ -1526,7 +1531,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 - **A connection loss increments it too** (`reset`): read it AGAINST the
   connection-loss signals; outside a connection loss it reads zero.
   Zero-initialised at join for both outcomes.
-- **Alert**: none yet (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
+- **Alert**: none, by decision (story 3 OBS-B; `docs/observability/alerts.md` §Deliberate absences). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_send_directive_kind_missing_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
@@ -1545,7 +1550,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   participant publishes nothing and is never counted. Alertable at `> 0`.
 - **Zero-initialised at join** for each published kind (video included when video
   is published).
-- **Alert**: none yet (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
+- **Alert**: none, by decision (story 3 OBS-B; `docs/observability/alerts.md` §Deliberate absences). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_keyframes_produced_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
@@ -1571,7 +1576,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   a video stream is FIRST DIRECTED (never at join: no video series before video
   flows). Audio never emits it.
 - **No GoP value, timing, stream number or sender** in any label.
-- **Alert**: none (story 3 OBS-B owns A1 "keyframe storm", MH-side). **Panel**:
+- **Alert**: none, by decision; the diagnosis panel for `MHVideoKeyframeStorm` (`request` vs `abandonment`). **Panel**:
   `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_send_groups_abandoned_total`
@@ -1593,7 +1598,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   value here does NOT mean the peer refused nothing.
 - **Zero-initialised** on `media_kind="video"` when a video stream is first
   directed. Read against `rate(dt_client_media_keyframes_produced_total{source="abandonment"})`.
-- **Alert**: none (story 3 OBS-B owns A2 fleet backlog resets). **Panel**:
+- **Alert**: none, by decision; the fleet signal is `MHVideoSubscriberBacklogResets`. **Panel**:
   `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_send_groups_stopped_total`
@@ -1614,7 +1619,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   the limit, and MH has no event to count (`mh_media_uni_streams_per_connection_limit`).
 - **Zero-initialised** for all three outcomes on `media_kind="video"` when a video
   stream is first directed. Never summed by `outcome` across series.
-- **Alert**: none yet (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
+- **Alert**: none, by decision (story 3 OBS-B; `docs/observability/alerts.md` §Deliberate absences). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_encode_queue_dropped_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
@@ -1628,7 +1633,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   on the other side.
 - **Audio never emits it**: audio has no pre-encode bound.
 - **Zero-initialised** on `media_kind="video"` when a video stream is first directed.
-- **Alert**: none yet (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
+- **Alert**: none, by decision (story 3 OBS-B; `docs/observability/alerts.md` §Deliberate absences). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_keyframe_min_interval_clamped_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
@@ -1653,7 +1658,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   video publishing stops). Both kinds emit it (the audio Opus encoder's `onError`
   is wired too), mirroring `dt_client_media_decoder_errors_total`.
 - **Lazily created**: panels use `or vector(0)`.
-- **Alert**: none (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
+- **Alert**: none, by decision (story 3 OBS-B; `docs/observability/alerts.md` §Deliberate absences). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_send_directive_encoding_refused_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
@@ -1668,7 +1673,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   off), and a typed `config` fault is raised once per episode.
 - **Reads zero against a conforming MC** (`VideoEncoding` always sets all six).
 - **Lazily created**: panels use `or vector(0)`.
-- **Alert**: none (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
+- **Alert**: none, by decision (story 3 OBS-B; `docs/observability/alerts.md` §Deliberate absences). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_send_directive_header_version_refused_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
@@ -1681,7 +1686,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   raises its existing `config` fault.
 - **Reads zero forever** against a conforming MC; **alertable at `> 0`**.
   Zero-initialised at join.
-- **Alert**: none yet (story 3 OBS-B). **Panel**: `infra/grafana/dashboards/client-media.json`.
+- **Alert**: none, by decision (story 3 OBS-B; `docs/observability/alerts.md` §Deliberate absences). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_time_to_first_media_frame_ms`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).

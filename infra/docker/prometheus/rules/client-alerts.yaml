@@ -8,7 +8,11 @@
 #
 # OWNERSHIP (ADR-0031 §Ownership split): the `client` specialist authors this
 # file; operations reviews severity routing and runbook linkage; observability
-# reviews thresholds, PromQL and cardinality.
+# reviews thresholds, PromQL and cardinality. EXCEPTION, by story assignment:
+# the story 3 video rules (ClientVideoServerMutedSenderFrames,
+# ClientVideoDecodeErrorRatio, ClientVideoSlotUnfulfilled) were authored by
+# observability (task OBS-B: one owner per alert), with client as
+# owner-reviewer.
 #
 # PLACEMENT RULE: a client-origin series whose remedy is the SDK lives HERE. A
 # client-origin series whose remedy is a server lives in that server's file
@@ -86,3 +90,131 @@ groups:
           description: "dt_client_media_kek_retention_violations_total is present: an SDK install path tried to make some client hold more than the current KEK generation plus one previous. The RetentionGuard fail-safe zeroized and dropped the excess in the same call, so no superseded key was kept, but the key-lifetime code that should have made the guard unnecessary is broken. The invariant is unit-tested and has no known legitimate cause. No operator or MC-side remedy exists, and changing MC_KEK_ROTATION_DEBOUNCE_SECONDS does not help. Roll back the web-app/SDK release (client_version on the series names it) and file a client bug with security. The alert clears when the collector expires the idle series (metric_expiration), not when the condition stops."
           impact: "An SDK regression in key-lifetime code. The fail-safe held, so no superseded meeting key was retained past the install, but the path that should have prevented the over-retention is broken, and a further regression could remove the fail-safe with it."
           runbook_url: "docs/runbooks/mc-incident-response.md#tripwire-kek-retention-violation"
+
+      # ==================================================================
+      # STORY 3 VIDEO (OBS-B): A5, A6, A9 — authored by observability (see
+      # OWNERSHIP above), client reviewing.
+      # WINDOWS ARE [5m] (departure from the task's [10m]/[15m], recorded):
+      # the collector's `metric_expiration` must strictly exceed every
+      # dt_client_* window and `max_stale` must cover expiration + window
+      # (alert-conventions.md §Metric expiration; client-metrics-export G5).
+      # Raising both knobs would more than double per-run org stream overlap
+      # against ~3 runs of honest headroom. Same window as
+      # MCMediaMissingKeyMaterial. No rule groups by `instance` (Rule 2) or by
+      # any identity; every matched label is in keep_keys.
+      # FIRE/APPLY for all three: env-test 31 posts the series as OTLP through
+      # the real GC proxy under a per-run client_version marker (twice, a
+      # scrape apart, so rate() sees an increase), then evaluates THIS expr,
+      # read from this file, with one marker matcher added per dt_client
+      # selector and nothing else.
+      # ==================================================================
+      #
+      # ADR-0031 block — ClientVideoServerMutedSenderFrames (A5; R-5, R-16)
+      # MEANS: receivers drop video from a sender server-muted for video; MH
+      # should have dropped it at ingress. CORROBORATING evidence of a video
+      # server-mute leak, NOT proof: the proof is MH
+      # `mh_media_frames_dropped_total{reason="server_muted"}` (MH Scenario 19,
+      # video arm). Equality matchers only, no `by`: never decode-before-live
+      # in client-muted/no-video avatar slots (legitimate, R-5), never
+      # self_sender. WARNING, NOT PAGE: the security criterion's "pages toward
+      # the server-mute runbook" means ROUTES TO it. The counter is client-
+      # reported — a patched client can inflate it (a page would let any
+      # participant wake on-call) and can suppress it (silence is not evidence
+      # the mute holds). A mute-onset transient is expected; `for: 10m` covers
+      # it and does the discriminating work (MCMediaMissingKeyMaterial shape).
+      # In Rust the "patched client" is the OTLP post (env-tests are not a
+      # browser).
+      # DEMONSTRATION (ADR-0036 §11, both halves):
+      #   | FIRE  | env-test 31: OTLP post of sender_server_muted video drops under a marker | marked expr empty before, non-empty after |
+      #   | APPLY | names: client-metrics-export rule 2; label values: web-app clientMetricNames.test.ts; live pipe: browser read-backs | every selector term binds to an emitted name/value |
+      - alert: ClientVideoServerMutedSenderFrames
+        expr: |
+          sum(rate(dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: client
+          component: media-receive
+        annotations:
+          summary: "Receivers keep dropping video from server-muted senders ({{ $value }}/s)"
+          description: "Receiving clients have dropped video frames as sender_server_muted for 10 minutes: video from senders whose video is server-muted is reaching them, which MH should have dropped at ingress. A burst at mute onset is expected; sustained is corroborating evidence that video server mute leaks at MH, not proof. The proof is MH's mh_media_frames_dropped_total{reason=server_muted} read against whether a mute was intended (MH Scenario 19, video arm). Client-reported: a patched client can inflate this and can suppress it, so silence is not evidence that server mute holds. Receivers still refuse to render these frames."
+          impact: "If MH's ingress drop is failing, a server-muted participant's video reaches other devices; receivers still refuse to render it."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-19-server-mute-not-taking-effect-at-ingress"
+
+      # ADR-0031 block — ClientVideoDecodeErrorRatio (A6; R-5, R-13)
+      # UNITS: decoder FAILURE EVENTS (one per decoder instance; the slot's
+      # decoder is replaced and waits for a keyframe) per accepted FRAME
+      # (counted before decode). At 30 fps 1% is ~one failure per 3.3 s per
+      # stream. REACHABILITY CEILING: under TOTAL failure the ratio is ~
+      # 1 / (fps x max(interval, media.ingress.decoderRestartBackoffMs)). At the
+      # deployed default (500 ms interval, 1000 ms backoff, 30 fps) that is
+      # ~3.3%, within reach. Above ~3.3 s interval at 30 fps it stays below 1%.
+      # RESIDUAL, exactly: at such intervals total video decode failure is
+      # UNALERTED while the slot is open; it surfaces at slot EXIT on the
+      # unfulfilled histogram, and ClientVideoSlotUnfulfilled fires only if
+      # such exits keep arriving fleet-wide. No per-slot keyframes-received
+      # counter exists to make it fps-free (recovery_requests_sent
+      # {source="decoder_error"} is the same event). Guard on the denominator;
+      # 1% is the rule's own policy.
+      # DEMONSTRATION (ADR-0036 §11, both halves):
+      #   | FIRE  | env-test 31: OTLP post of decoder errors and accepted frames under a marker | marked expr empty before, non-empty after |
+      #   | APPLY | names: client-metrics-export rule 2; label values: web-app clientMetricNames.test.ts; live pipe: browser read-backs | every selector term binds to an emitted name/value |
+      - alert: ClientVideoDecodeErrorRatio
+        expr: |
+          (
+            sum(rate(dt_client_media_decoder_errors_total{media_kind="video"}[5m]))
+            /
+            sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[5m]))
+          ) > 0.01
+          and
+          sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: client
+          component: media-receive
+        annotations:
+          summary: "Receivers' video decoders are failing ({{ $value | humanizePercentage }} decoder failures per accepted video frame)"
+          description: "Video decoder failure events have exceeded 1% of accepted video frames for 10 minutes. The numerator counts failure EVENTS (each replaces that slot's decoder, which waits for a keyframe), not failed frames. Frames are accepted, so key delivery works; the fault is between accept and render: a codec or browser regression, a sender encoding defect, or a profile change. Correlate with the SDK release (client_version) and media-codec-profile changes. Limit: at long directed keyframe intervals a TOTALLY failed decoder cannot reach this ratio and shows only as slot-unfulfilled exits."
+          impact: "Affected receivers see frozen or blank video tiles while audio and every server-side signal read healthy."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-22-client-video-decode-failures"
+
+      # ADR-0031 block — ClientVideoSlotUnfulfilled (A9; R-30, amendment 4)
+      # MEANS: fleet-wide, slots MC reports ACTIVE take far too long to show
+      # video — the RECEIVER's half (MH forwards, nothing renders), and
+      # MHVideoEdgeStuckPending's blind spot. PROVENANCE: an episode ends with
+      # one keyframe, produced within one directed interval, so A3's bound: 10
+      # x interval, in ms (histogram ms, gauge s: 10 * 1000 *). max(): the
+      # bound scales UP with the interval, conservative under skew. p95: capture
+      # start, not the interval, bounds the tail. BUCKETS VERIFIED:
+      # SLOT_UNFULFILLED_BUCKETS_MS (sdk-core mediaMetrics.ts) reaches 300000
+      # ms, past 100 s; the default 5000 ms threshold is a bucket boundary
+      # (exact), other intervals interpolate coarsely. EXIT-ONLY, every exit
+      # incl. teardown: a whole-session stuck slot is observed ONCE, at leave,
+      # and the tail mixes in session-length teardown exits; one stuck slot
+      # cannot fire this, a fleet pattern does. `for: 5m` with [5m]
+      # (departure from the task's 15m, recorded): observations are sparse and
+      # land at exit, so `for:` must not exceed the window. media_kind="video"
+      # on both selectors (only video emits it; keeps the rule on the
+      # runbooks' series). The gauge dt_client_media_slots_unfulfilled is
+      # PANEL-ONLY (last-writer-wins). If no MC is scraped the RHS is empty and
+      # the rule cannot evaluate (MCDown). A9's FIRE observation is derived
+      # from the live MC gauge, never a literal.
+      # DEMONSTRATION (ADR-0036 §11, both halves):
+      #   | FIRE  | env-test 31: OTLP histogram observation above the gauge-derived bound | marked expr empty before, non-empty after |
+      #   | APPLY | names: client-metrics-export rule 2; label values: web-app clientMetricNames.test.ts; live pipe: browser read-backs | every selector term binds to an emitted name/value |
+      - alert: ClientVideoSlotUnfulfilled
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[5m]))) > 10 * 1000 * max(mc_media_video_keyframe_min_interval_seconds)
+          and
+          sum(rate(dt_client_media_slot_unfulfilled_duration_ms_count{media_kind="video"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: client
+          component: media-receive
+        annotations:
+          summary: "Live video slots are taking far too long to show video (p95 {{ $value }} ms)"
+          description: "The p95 time video slots MC reports ACTIVE spend showing neither video nor an avatar has exceeded 10 x mc_media_video_keyframe_min_interval_seconds (in ms) for 5 minutes. Observed at episode exit only: a slot stuck all session appears once, when its user leaves, so one stuck slot cannot fire this; a fleet pattern does. Read the MH half first (MHVideoEdgeStuckPending, mh_media_edges_pending): pending at MH means a publisher owes a keyframe; nothing pending while slots are unfulfilled means MH forwards and the receiver does not render, or the publisher is not on that handler. An open camera permission prompt is a known residual. If no MC is scraped this rule cannot evaluate (MCDown)."
+          impact: "Participants see blank or frozen tiles for people MC says are live, while every server-side signal can read healthy."
+          runbook_url: "docs/runbooks/mc-incident-response.md#scenario-23-client-video-slot-unfulfilled"

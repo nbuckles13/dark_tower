@@ -138,6 +138,16 @@ groups:
       # responder who arrives on this page is not told their alert is not this
       # alert's problem.
       #
+      # STORY 3 (MC-A): `transport_mode_mismatch` widened to a PER-STREAM echo
+      # check (media_routing/confirm.rs::first_echo_mismatch): a sent stream
+      # absent from `applied_source_streams`, echoed UNSPECIFIED, or echoed with
+      # a different mode, all on this ONE existing outcome. The arm and the
+      # first mismatching stream are LOG FIELDS on the confirm-failure ERROR
+      # line (`echo_arm`, `echo_stream_number`), never labels. MH's own
+      # transport disagreement (`rejected_transport_inconsistent`,
+      # `transport_mismatch` drops) is MHTransportInconsistent's, a warning;
+      # this page is not duplicated there, by operations' confirmation.
+      #
       # `no_applied_generation` is covered for the same reason it matters: MH
       # echoing nothing means MC cannot verify what MH is running, which is the
       # "absent policy" half of the scenario. It also fires on a rollout skew (an
@@ -174,9 +184,130 @@ groups:
           component: media-control-plane
         annotations:
           summary: "MC and MH disagree about the applied media policy generation ({{ $value }} in 15m)"
-          description: "MC could not confirm its forwarding policy is live on MH. ADR-0036 §8 calls this shape a partial blackhole reporting healthy: MH forwards under stale or absent policy while up, readiness, the gRPC result and the channel all read green. SPLIT ON THE OUTCOME LABEL FIRST - the values have different first moves. generation_mismatch = MH applied an older generation (its apply path failed); no_applied_generation = MH echoed nothing (an MH build predating the echo, i.e. a rollout skew, or the apply never ran - confirm the image before treating it as an apply failure); transport_mode_mismatch = the separate two-ends-must-agree echo failing, a different remedy, routed from the same runbook. SINCE STORY 2, ANY STRUCTURAL CHANGE RE-PUSHES: a join, leave, capability declaration or mute re-publishes to every handler and an unconfirmed push is re-sent, so a meeting with churn often clears on the next roster event - check whether the counter stopped moving before acting, and force a structural change only if the meeting is quiescent (there is still no periodic re-assert; story 4). An MC restart against a live handler is NOT counted here: MC adopts MH's generation as a floor and re-pushes above it, and records that on mc_media_policy_generation_adoptions_total instead - deliberately under no outcome label, so read that counter (and the adoption WARN at mc.register_meeting.trigger) alongside the split. A generation_mismatch with applied > sent that DOES reach this alert is a FAILED adoption or a higher echo after a confirm (e.g. the u64::MAX ratchet wedge) - not rollout noise. The selector is negated, so an outcome added later fires here rather than falling silently outside the alert."
-          impact: "Participants in the affected meeting get no audio while the client stays connected and the UI reads healthy. Blast radius is per (meeting, handler), not fleet-wide. DO NOT RESTART MH as a remedy: it sheds every media session on the pod, recovers none of the already-dark ones, and destroys the evidence."
+          description: "MC could not confirm its forwarding policy is live on MH. ADR-0036 §8 calls this shape a partial blackhole reporting healthy: MH forwards under stale or absent policy while up, readiness, the gRPC result and the channel all read green. SPLIT ON THE OUTCOME LABEL FIRST - the values have different first moves. generation_mismatch = MH applied an older generation (its apply path failed); no_applied_generation = MH echoed nothing (an MH build predating the echo, i.e. a rollout skew, or the apply never ran - confirm the image before treating it as an apply failure); transport_mode_mismatch = the separate two-ends-must-agree echo failing, a different remedy, routed from the same runbook; since story 3 it is PER STREAM: a stream MC sent is absent from MH's applied_source_streams, echoed with no transport mode, or echoed with a different mode. The arm and the FIRST mismatching stream are on MC's ERROR line \"MH did not confirm the forwarding policy\" (target mc.grpc.mh_client) as fields echo_arm (absent_from_echo, echoed_unspecified, mode_differs) and echo_stream_number; echo_arm=none with echo_stream_number=-1 are the no-echo-mismatch sentinels, never a stream. Its usual cause is a cutover applied out of the required order (config -> MH -> MC -> SDK) or an MH build that predates per-stream echo; check which component rolled last. SINCE STORY 2, ANY STRUCTURAL CHANGE RE-PUSHES: a join, leave, capability declaration or mute re-publishes to every handler and an unconfirmed push is re-sent, so a meeting with churn often clears on the next roster event - check whether the counter stopped moving before acting, and force a structural change only if the meeting is quiescent (there is still no periodic re-assert; story 4). An MC restart against a live handler is NOT counted here: MC adopts MH's generation as a floor and re-pushes above it, and records that on mc_media_policy_generation_adoptions_total instead - deliberately under no outcome label, so read that counter (and the adoption WARN at mc.register_meeting.trigger) alongside the split. A generation_mismatch with applied > sent that DOES reach this alert is a FAILED adoption or a higher echo after a confirm (e.g. the u64::MAX ratchet wedge) - not rollout noise. The selector is negated, so an outcome added later fires here rather than falling silently outside the alert."
+          impact: "Participants in the affected meeting get no audio and/or video while the client stays connected and the UI reads healthy. Blast radius is per (meeting, handler), not fleet-wide. DO NOT RESTART MH as a remedy: it sheds every media session on the pod, recovers none of the already-dark ones, and destroys the evidence."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-15-media-generation-divergence"
+
+      # ====================================================================
+      # MCMediaSendDirectiveDefect / MCMediaSendDirectiveFailures — the send
+      # directive (story 3 OBS-B; closes the docs/TODO.md entry
+      # "`mc_media_send_directives_total` has no alert rule")
+      # ====================================================================
+      #
+      # ADR-0031 block — both rules (the WARNING half lives in mc-service-warning).
+      #
+      # WHAT IT MEANS: MC failed to compose a participant's media view. Every
+      # failure FAILS CLOSED with no retry: the participant gets neither its
+      # SendDirective nor its StreamAssignments, so it neither sends nor
+      # receives — and since the SDK honours the directive, nothing else shows
+      # it: no error, no join failure, no WebTransport rejection. Such a
+      # participant has NO SLOTS, so the stream-path detectors
+      # (MHVideoEdgeStuckPending, ClientVideoSlotUnfulfilled) cannot see it.
+      # These rules are its only detector.
+      #
+      # THE PARTITION — every `DirectiveOutcome` token
+      # (crates/mc-service/src/media_signaling/outcome.rs:DirectiveOutcome) is
+      # classified in exactly one class. The classification's ONE home is
+      # `DirectiveOutcome::alert_class()` (an exhaustive, wildcard-free match in
+      # that file's test module, so a new variant fails to compile until it is
+      # classified); a unit test there reads both selectors below out of THIS
+      # file and fails if either drifts from it. The lists are restated only in
+      # the guard-checked alerts.md inventory (byte-identical exprs) and the
+      # runbook triage table; a classification change starts at alert_class().
+      #   normal      — emitted, emitted_empty_targets (a specified success,
+      #                 ADR-0036 §5; routine once §7 withdraws unwatched kinds).
+      #   MC defect   — PAGE (MCMediaSendDirectiveDefect).
+      #   environmental, and ANY UNCLASSIFIED FUTURE TOKEN — WARNING
+      #                 (MCMediaSendDirectiveFailures, negated selector).
+      # WITHDRAWALS ARE HEALTHY and are NEVER read from this counter: they are
+      # `mc_media_send_directive_withdrawals_total{media_kind, reason}`
+      # (unwatched | server_muted). A withdrawal is a listed stream with empty
+      # targets, i.e. `emitted` or `emitted_empty_targets` here.
+      #
+      # WHY THE DEFECT CLASS PAGES (argued from the token meanings; meeting-
+      # controller argued, operations AGREED at OBS-B Gate 1, superseding its
+      # initial warning position). Each defect is a deterministic function of
+      # MEETING-LIFETIME state, so it recurs on every re-composition and
+      # silences the affected connection (often the whole meeting) for its
+      # whole life:
+      #   transport_mode_unspecified, unknown_stream_number — derive from
+      #     `deps.stream_policy`, fixed at meeting start; no structural change
+      #     clears them. Every publisher of that kind fails for the meeting's
+      #     life.
+      #   handler_url_unresolved — derives from the frozen MeetingHandlers set;
+      #     persists while any edge names that handler.
+      #   assignment_failed — reachable only after the slot render fails
+      #     (meeting_media.rs render_and_publish sets assignment = None), and
+      #     then EVERY participant's flush fails until the membership changes:
+      #     meeting-wide. It is an MC defect, not environmental (reclassified
+      #     at OBS-B; the only render error, AssignmentError::EgressOrdinalOverflow,
+      #     is unreachable from valid input).
+      # They read zero by construction when healthy, so a page costs almost no
+      # false positives, and the 3am action is an operator one: ROLL BACK MC.
+      #
+      # NOT CLIENT-REACHABLE, per token (security review, OBS-B Gate 1), so no
+      # participant can drive this page:
+      #   transport_mode_unspecified, handler_url_unresolved — derive only from
+      #     MC-built policy and the frozen MeetingHandlers; no client input.
+      #   unknown_stream_number — its plan arms derive from MC-built policy; its
+      #     publish-set arm (directive.rs build_send_directive) compares two
+      #     copies of ONE value fixed at join (actors/meeting.rs: the slot
+      #     table's admit() and the roster entry take the same
+      #     `media.publishes`); a reconnect presenting a different set is
+      #     refused before anything changes (ReconnectPublishSetMismatch), and
+      #     every structural mutation re-renders before it dirties anyone, so
+      #     any flush reads the latest render.
+      #   assignment_failed — `assignment == None` at flush happens only after
+      #     a render error, because reconcile() renders before dirtying. The
+      #     only render error is EgressOrdinalOverflow (media_routing/
+      #     assignment.rs, u8::try_from(ordinal)); every client declaration
+      #     reaches the actor only as a SlotDemand from
+      #     ReceiveCapabilityDeclaration::truncate(caps) (join and redeclare
+      #     paths), caps are validated <= 64 at config load, and the ordinal
+      #     enumerates one subscriber's kept slots of one kind: at most 63.
+      #   meeting_state_unavailable IS client-reachable (a patched client can
+      #     re-declare into an actor that is gone, usually a meeting ending; the
+      #     path is budget-charged) and is therefore on the WARNING rule, never
+      #     here.
+      #
+      # SHAPE: increase()[15m] > 0 with `for: 0m`, the MCMediaGenerationDivergence
+      # idiom. A failure is recorded only when the actor COMPOSES (a join, leave,
+      # declaration or mute, by self or peer), so a join-time defect in a quiet
+      # meeting increments ONCE and goes flat while the participant stays dark;
+      # rate()>0 with a `for:` would never fire for it. `for:` MUST stay below
+      # the window. The alert AUTO-RESOLVES 15m after the last failed
+      # composition — that is NOT recovery; a dark meeting stays dark.
+      #
+      # ZERO-INIT DEPENDENCY: the counter is pre-registered at 0 for every
+      # `DirectiveOutcome::ALL` value (crates/mc-service/src/observability/
+      # metrics.rs, the init loop), so the first failure is a visible increase
+      # from 0, not the appearance of a new series that increase() cannot see.
+      # Remove that loop and both rules miss every first occurrence.
+      #
+      # POSITIVE SELECTOR ON THE PAGE, NEGATED ON THE WARNING (operations'
+      # condition): an unclassified token added later WARNS rather than pages
+      # and rather than falling silently outside both rules.
+      #
+      # NO `by`: the counter is kind-free and identity-free (composed per
+      # participant, before any stream exists); scope by the meeting actor's
+      # ERROR lines, which carry the meeting id.
+      #
+      # DEMONSTRATION (ADR-0036 §11, both halves, both rules):
+      #   | FIRE  | not induced: each defect is unreachable from valid input (the point); outcome.rs unit test pins the partition | — |
+      #   | APPLY | env-test 33: the counter name on every MC pod (zero-initialised) | >= 1 series per MC pod |
+      - alert: MCMediaSendDirectiveDefect
+        expr: |
+          sum(increase(mc_media_send_directives_total{outcome=~"unknown_stream_number|transport_mode_unspecified|handler_url_unresolved|assignment_failed"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: page
+          service: mc-service
+          component: media-signaling
+        annotations:
+          summary: "MC failed to compose participants' media views for an MC-defect reason ({{ $value }} in 15m)"
+          description: "mc_media_send_directives_total recorded an MC-defect outcome (unknown_stream_number, transport_mode_unspecified, handler_url_unresolved or assignment_failed) in the last 15 minutes. Each fails closed with no retry: the affected participant gets no SendDirective and no StreamAssignments, so it neither sends nor receives, and the stream-path alerts cannot see it because it has no slots. Each is a deterministic function of meeting-lifetime state, so it recurs for the life of the meeting; assignment_failed darkens every participant of the meeting. Scope it by MC's ERROR lines (they carry the meeting) and correlate with the last MC rollout. The action is to ROLL BACK MC. The alert auto-resolves 15 minutes after the last failed composition; that is NOT recovery, and a dark meeting stays dark."
+          impact: "Participants in the affected meeting (for assignment_failed, all of them) are silently media-dark: no audio or video in either direction while signalling, join and the UI read healthy."
+          runbook_url: "docs/runbooks/mc-incident-response.md#send-directive-defect-page"
 
       # ------------------------------------------------------------------
       # ADR-0031 block — MCKekRotationOverdue (story 2 task 9, R-12, R-26)
@@ -641,30 +772,101 @@ groups:
       # `/ on() group_left()` broadcasting for the denominator -- machinery
       # for no triage gain. The reason fork lives in Scenario 16.
       #
+      # PER KIND (story 3 OBS-B, R-29). Numerator, denominator AND guard are
+      # `sum by (media_kind)`, so a video-only key failure is not diluted by
+      # audio's higher frame rate, and the alert fires once per affected kind.
+      # The guard MUST carry the same grouping: an ungrouped guard under `and`
+      # has no matching label set and the rule would go silently dead. The
+      # guard stays on `received` (never `accepted`; the inversion above).
+      # `media_kind` survives the client pipeline since OBS-A (keep_keys;
+      # dt-guard client-metrics-export rule 2 checks it), and every per-kind
+      # handle stamps it, so no series falls outside the grouping.
+      #
+      # THRESHOLD RE-DERIVED FOR VIDEO (story 3 R-14) — 5% and `for: 15m` stand.
+      #   - The ratio is frame-rate-free: both sides count the same kind's
+      #     frames, so video's lower frame rate changes nothing by itself.
+      #   - R-14: video transmit keys rotate every T, at every group start and
+      #     on every KEK receipt, and the new key rides the first N frames after
+      #     any key change; key-bearing frames are never discardable. A
+      #     receiver therefore always gets the key material with the frames
+      #     that need it, and a video frame lacking a transmit key is
+      #     `no_transmit_key`, which is NOT in this selector (NOT_KEY_DELIVERY).
+      #   - KEK receipt rotating video keys ties video's key-delivery duty cycle
+      #     to the same push skew per rotation as audio's: at most one rotation
+      #     per W per meeting, so the healthy video ratio is also about skew / W.
+      #   - After key material arrives, a video decoder still waits for the next
+      #     keyframe; those frames are accepted and then discarded post-accept
+      #     (`dt_client_media_decode_queue_dropped_total`), never counted here,
+      #     so the keyframe wait does not inflate this ratio.
+      # So the video re-derivation lands where the audio one did; the skew
+      # assumption above is unchanged and still unmeasured.
+      #
       # DEMONSTRATION (ADR-0036 §11, both halves): FIRE -- guard rule 2 proves
       # every name and label this expression reads survives the pipe. APPLY
       # -- a client series name read back out of Prometheus by a real browser
       # (the R-27 read-back, packages/web-app/e2e/multi-party-hear.spec.ts,
-      # names from packages/web-app/e2e/clientMetricNames.ts).
+      # names from packages/web-app/e2e/clientMetricNames.ts), and env-test
+      # 33's selector check.
       - alert: MCMediaMissingKeyMaterial
         expr: |
           (
-            sum(rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
+            sum by (media_kind) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
             /
-            sum(rate(dt_client_media_frames_received_total[5m]))
+            sum by (media_kind) (rate(dt_client_media_frames_received_total[5m]))
           ) > 0.05
           and
-          sum(rate(dt_client_media_frames_received_total[5m])) > 0
+          sum by (media_kind) (rate(dt_client_media_frames_received_total[5m])) > 0
         for: 15m
         labels:
           severity: warning
           service: mc-service
           component: media-keys
         annotations:
-          summary: "Clients sustained-dropping media frames for missing key material ({{ $value | humanizePercentage }})"
-          description: "Receiving clients cannot open frames because of key delivery, in four arms. no_kek_for_generation: the carried KEK generation is NEWER than any held, so MC's KEK push has not arrived. kek_generation_stale: the carried generation is OLDER than this client retains; retention derives from MC's rotation debounce, see Scenario 16 Arm 3 before touching MC_KEK_ROTATION_DEBOUNCE_SECONDS. no_roster_entry: there is no usable identity key for the sender. unwrap_failed: an authenticated frame whose KEK unwrap failed, i.e. a KEK-bytes split between sender and receiver, or a sender wrap bug. The first three are EXPECTED transiently at join and after a KEK rotation; unwrap_failed never is. 15 minutes sustained is the signal, and ADR-0036 §11 makes it the only signal for a join or rotation path that has silently stopped delivering keys. Split on the reason label FIRST: the arms have different remedies. This is a fleet-wide ratio and cannot see one client whose pushes fail; read mc_meeting_kek_pushes_total{outcome} for that. It fires on a client counter but lives here because the remedy is MC's KEK-and-roster delivery path."
-          impact: "Affected participants hear nothing while every server-side signal reads healthy. MH never opens a frame and structurally cannot observe any of the four conditions. The no_roster_entry arm additionally means sender signature verification cannot run, so attribution is failing and not merely decryption."
+          summary: "Clients sustained-dropping media frames for missing key material, per media kind ({{ $value | humanizePercentage }})"
+          description: "Receiving clients cannot open frames because of key delivery, in four arms. no_kek_for_generation: the carried KEK generation is NEWER than any held, so MC's KEK push has not arrived. kek_generation_stale: the carried generation is OLDER than this client retains; retention derives from MC's rotation debounce, see Scenario 16 Arm 3 before touching MC_KEK_ROTATION_DEBOUNCE_SECONDS. no_roster_entry: there is no usable identity key for the sender. unwrap_failed: an authenticated frame whose KEK unwrap failed, i.e. a KEK-bytes split between sender and receiver, or a sender wrap bug. The first three are EXPECTED transiently at join and after a KEK rotation; unwrap_failed never is. 15 minutes sustained is the signal, and ADR-0036 §11 makes it the only signal for a join or rotation path that has silently stopped delivering keys. Split on the reason label FIRST: the arms have different remedies. This is a fleet-wide ratio and cannot see one client whose pushes fail; read mc_meeting_kek_pushes_total{outcome} for that. It fires per media kind (one alert per affected kind), so a video-only key failure is not hidden by audio. It fires on a client counter but lives here because the remedy is MC's KEK-and-roster delivery path."
+          impact: "Affected participants hear or see nothing (per affected kind) while every server-side signal reads healthy. MH never opens a frame and structurally cannot observe any of the four conditions. The no_roster_entry arm additionally means sender signature verification cannot run, so attribution is failing and not merely decryption."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-16-missing-key-material"
+
+      # ------------------------------------------------------------------
+      # ADR-0031 block — MCMediaSendDirectiveFailures: the WARNING half of the
+      # send-directive pair. The full block (partition, shape, zero-init
+      # dependency, why the defect class pages) is above
+      # MCMediaSendDirectiveDefect in mc-service-page; not restated here.
+      #
+      # NEGATED SELECTOR over normal + MC-defect, so this fires on
+      # `meeting_state_unavailable` (environmental: a post-join capability
+      # RE-declaration the meeting actor did not register — the actor is gone,
+      # usually a meeting ending, or the participant already left the roster;
+      # its only producer is webtransport/connection.rs handle_receive_capability.
+      # The previous declaration and view stay in force, so nobody is
+      # darkened; the shipped SDK never re-declares, so with it this is
+      # near-unreachable) AND on any token added later that nobody classified:
+      # it warns rather than falling silently outside both rules. A firing on
+      # an unknown outcome value means `DirectiveOutcome::alert_class()` and
+      # these rules have drifted from the enum — classify it there. Warning,
+      # not page: a patched client can drive it, and it darkens nobody.
+      # HEALTHY-CLUSTER READING (alert-conventions §Threshold provenance): zero.
+      # The only producer is a post-join re-declaration, which the shipped SDK
+      # never sends, so a routine meeting-end race cannot reach it; a Rust
+      # env-test that re-declares into an ending meeting could, and that is a
+      # true firing of this warning, not noise.
+      # RESIDUAL (not closed here): alert_class() catches an UNCLASSIFIED
+      # variant, not one classified but missing from DirectiveOutcome::ALL,
+      # which would not be zero-initialised (tracked in outcome.rs's module
+      # doc and docs/TODO.md).
+      - alert: MCMediaSendDirectiveFailures
+        expr: |
+          sum(increase(mc_media_send_directives_total{outcome!~"emitted|emitted_empty_targets|unknown_stream_number|transport_mode_unspecified|handler_url_unresolved|assignment_failed"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: mc-service
+          component: media-signaling
+        annotations:
+          summary: "MC could not compose some participants' media views ({{ $value }} in 15m)"
+          description: "mc_media_send_directives_total recorded an outcome that is neither a success nor a classified MC defect in the last 15 minutes. meeting_state_unavailable means a post-join capability re-declaration the meeting actor did not register (the actor is gone, usually a meeting ending, or the participant already left); the previous declaration and view stay in force. The shipped SDK never re-declares, so with it this is near-unreachable: suspect a non-shipped or patched client, or a test. Any OTHER outcome value here is a token nobody classified: the alert rules and DirectiveOutcome::alert_class() in crates/mc-service/src/media_signaling/outcome.rs have drifted from the enum, so classify it there. Withdrawals are healthy and are read from mc_media_send_directive_withdrawals_total, never from this counter. The alert auto-resolves 15 minutes after the last occurrence."
+          impact: "For meeting_state_unavailable, none: only the new declaration was dropped and the participant keeps its previous view. For any other (unclassified) outcome, unknown until classified: treat it as a possibly media-dark participant."
+          runbook_url: "docs/runbooks/mc-incident-response.md#send-directive-wiring"
 
       # ====================================================================
       # Client key-lifecycle TRIPWIRES (story 2 task 16) -- MC-side remedy

@@ -230,6 +230,39 @@ impl<'a> Injection<'a> {
             .into_inner()
     }
 
+    /// Register at `generation` expecting MH to REFUSE the policy, and return
+    /// the refusal. A registration MH applies is a failure here (it would mean
+    /// the refusal path under test was not reached).
+    pub async fn register_refused(
+        &mut self,
+        generation: u64,
+        streams: Vec<EgressStream>,
+        sources: Vec<SourceStream>,
+    ) -> tonic::Status {
+        let request = RegisterMeetingRequest {
+            meeting_id: self.meeting_id.clone(),
+            mc_id: self.mc_id.clone(),
+            mc_grpc_endpoint: self.mc_grpc_endpoint.clone(),
+            egress_streams: streams,
+            selection_rules: None,
+            policy_generation: generation,
+            source_streams: sources,
+        };
+        match self
+            .client
+            .register_meeting(mh_grpc::authed(self.token, request))
+            .await
+        {
+            Ok(r) => panic!(
+                "INJECT on {}: RegisterMeeting at generation {generation} was ACCEPTED (applied \
+                 {}); the test expected MH to refuse it",
+                self.handler.name,
+                r.into_inner().applied_generation
+            ),
+            Err(status) => status,
+        }
+    }
+
     /// Install at `generation` with `sources` declared (story 3) and require
     /// the synchronous echo to match.
     pub async fn install_declared(
