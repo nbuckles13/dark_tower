@@ -48,7 +48,7 @@
     PublishKind,
     VideoReceiveView,
   } from '@darktower/sdk-core';
-  import { listMicrophones } from '@darktower/sdk-core';
+  import { listMicrophones, localCaptureTracksOf, localStatsOf } from '@darktower/sdk-core';
   import type { MeetingStore, TileSurface } from '@darktower/sdk-svelte';
   import { errorText } from '../lib/errorText.js';
   import {
@@ -66,6 +66,7 @@
     selfCameraState,
     serverMutedByText,
   } from '../lib/participantState.js';
+  import DebugPanel from './DebugPanel.svelte';
   import ResumeNotice from './ResumeNotice.svelte';
   import VideoSlotTile from './VideoSlotTile.svelte';
 
@@ -431,6 +432,7 @@
   {#if mediaError}
     <p data-testid="media-error">{mediaError}</p>
   {/if}
+  <DebugPanel stats={() => localStatsOf(session)} tracks={() => localCaptureTracksOf(session)} />
 </section>
 
 <style>

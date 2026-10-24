@@ -90,7 +90,7 @@ import type { DecodeLane } from './receiveLanes.js';
 import type { FirstMediaObserver } from '../setup/measurement.js';
 import type { HopSequenceMonitor } from './hopSequenceMonitor.js';
 import type { ObservedSlot, ReceiveVerificationRecorder } from './receiveVerification.js';
-import { FrameAccounting } from './frameAccounting.js';
+import { FrameAccounting, type SlotReceiveTally } from './frameAccounting.js';
 import { receiveByKind, type IdentityKeyResolver, type ReceiveGate } from './receivePolicy.js';
 
 export type { IdentityKeyResolver } from './receivePolicy.js';
@@ -126,6 +126,8 @@ export interface IngressPipelineOptions {
    * `receiveVerification.ts`.
    */
   readonly verification?: ReceiveVerificationRecorder;
+  /** The AUDIO slot ids this client declared: the per-slot local tallies (R-35). */
+  readonly declaredSlotIds?: readonly number[];
 }
 
 /**
@@ -161,7 +163,11 @@ export class IngressPipeline {
     this.#roster = options.roster;
     const lanes = options.lanes;
     this.#gate = { kind: 'audio', laneFor: (senderId) => lanes.laneFor(senderId) };
-    this.#accounting = new FrameAccounting(options.metrics, options.verification);
+    this.#accounting = new FrameAccounting(
+      options.metrics,
+      options.verification,
+      options.declaredSlotIds,
+    );
     this.#keys = options.keys;
     this.#cache = options.cache;
     this.#replay = options.replay;
@@ -196,6 +202,11 @@ export class IngressPipeline {
   /** The most recent reject token; `undefined` before the first drop. Bounded by type. */
   get lastDropReason(): RejectReason | undefined {
     return this.#accounting.lastDropReason;
+  }
+
+  /** A declared slot's LOCAL tally (R-35). Sampled; allocates. Never exported. */
+  slotTally(slotId: number): SlotReceiveTally | undefined {
+    return this.#accounting.slotTally(slotId);
   }
 
   /**
@@ -276,6 +287,7 @@ export class IngressPipeline {
       if (hop.missing > 0) this.#metrics.downlinkGapFrames(hop.missing);
       if (hop.reordered) this.#metrics.downlinkReorder();
       observedSlot = hop.undeclaredStreamId ? 'undeclared' : decoded.streamId;
+      this.#accounting.arrived(observedSlot, datagram.length);
 
       if ('error' in keyed) throw keyed.error;
       const { senderId } = keyed;

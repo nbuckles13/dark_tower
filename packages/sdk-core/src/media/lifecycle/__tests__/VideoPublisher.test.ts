@@ -56,6 +56,8 @@ class FakeCamera implements VideoCaptureSource {
   started = 0;
   stopped = 0;
   grantedDeviceId: string | undefined = 'cam-1';
+  /** The seam's read-only track reference (R-7 self-check); a test may set it. */
+  track: MediaStreamTrack | undefined = undefined;
   onFrame: ((f: VideoFrame) => void) | undefined;
   onEnded: (() => void) | undefined;
   async start(onFrame: (f: VideoFrame) => void, onEnded: () => void): Promise<void> {
@@ -983,5 +985,50 @@ describe('VideoPublisher — Gate-3 additions', () => {
     publisher.start();
     expect(lines).toEqual([expect.stringMatching(/^media config \(configured\): /)]);
     void publisher.stop();
+  });
+});
+
+describe('VideoPublisher — R-7 / R-35 local read-only surface', () => {
+  it('captureTrack is the live camera track only while the camera is lit; a video mute drops it', async () => {
+    const r = await makeRig();
+    r.publisher.start();
+    expect(r.publisher.captureTrack).toBeUndefined();
+    r.publisher.setDirective(r.directive([A]));
+    await settle();
+    const track = { kind: 'video' } as unknown as MediaStreamTrack;
+    r.cameras.at(-1)!.track = track;
+    expect(r.cameraLit()).toBe(true);
+    expect(r.publisher.captureTrack).toBe(track);
+    r.publisher.setMuted(true);
+    await settle();
+    expect(r.cameraLit()).toBe(false);
+    expect(r.publisher.captureTrack).toBeUndefined();
+    r.publisher.stop();
+  });
+
+  it('localSendStats: exact packets and bytes written, keyframes by cause, groups abandoned', async () => {
+    const r = await makeRig();
+    r.publisher.start();
+    r.publisher.setDirective(r.directive([A]));
+    await settle();
+    r.capture();
+    r.capture();
+    r.flush();
+    await settle();
+    const chunks = r.mocks
+      .get(A)!
+      .getOutboundUniStreams()
+      .flatMap((s) => s.chunks);
+    expect(chunks.length).toBeGreaterThan(0);
+    const stats = r.publisher.localSendStats();
+    expect(stats).toEqual({
+      kind: 'video',
+      packets: chunks.length,
+      bytes: chunks.reduce((n, c) => n + c.length, 0),
+      keyframes: r.publisher.sendTotals().keyframes,
+      groupsAbandoned: 0,
+    });
+    expect(stats.keyframes?.directive_start).toBe(1);
+    r.publisher.stop();
   });
 });

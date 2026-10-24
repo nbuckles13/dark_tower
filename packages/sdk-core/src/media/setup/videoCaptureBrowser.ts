@@ -75,6 +75,9 @@ export const createCameraCapture: VideoCaptureSourceFactory = (options) => {
     get grantedDeviceId(): string | undefined {
       return granted;
     },
+    get track(): MediaStreamTrack | undefined {
+      return capture.track;
+    },
   };
   return Promise.resolve(source);
 };

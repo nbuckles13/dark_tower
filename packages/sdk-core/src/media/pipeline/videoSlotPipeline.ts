@@ -192,6 +192,10 @@ export class VideoSlotPipeline {
   #lastRenderedSender: number | undefined;
   /** Frames this slot's decoder produced within bounds (cumulative; R-32 evidence, a count only). */
   #framesDecoded = 0;
+  /** Post-accept LOCAL drops (the `decodeQueueDropped` sites), for the R-35 overlay. */
+  #localDrops = 0;
+  /** Accepted keyframes that reached this slot (R-35 overlay). A count only. */
+  #keyframesSeen = 0;
   /** When this slot last turned ACTIVE, until its first draw. */
   #activeEnteredAtMs: number | undefined;
 
@@ -236,6 +240,21 @@ export class VideoSlotPipeline {
   /** Frames decoded within bounds so far (cumulative). A count only: no timing, no size. */
   get framesDecoded(): number {
     return this.#framesDecoded;
+  }
+
+  /** Post-accept local drops so far (cumulative). LOCAL R-35 overlay only. */
+  get localDrops(): number {
+    return this.#localDrops;
+  }
+
+  /** Accepted keyframes that reached this slot (cumulative). LOCAL R-35 overlay only. */
+  get keyframesSeen(): number {
+    return this.#keyframesSeen;
+  }
+
+  /** Frames held in the jitter buffer right now. LOCAL R-35 overlay only; sampled. */
+  get jitterDepth(): number {
+    return this.#queue.length;
   }
 
   /** The verified sender this slot is live with, for the pairing view. */
@@ -297,6 +316,7 @@ export class VideoSlotPipeline {
   /** Accept one verified, decrypted frame. */
   push(frame: SlotFrame): void {
     if (this.#stopped) return;
+    if (frame.isKeyframe) this.#keyframesSeen += 1;
     // Drain (and expire) what is already queued FIRST, so a loss discovered now
     // gates THIS frame, and capacity is judged on what is actually waiting.
     this.#pump();
@@ -316,7 +336,7 @@ export class VideoSlotPipeline {
       // Not the group the decoder is fed: a new sender's delta before its
       // keyframe, a trailing frame of a superseded source, or a frame after a
       // loss. Never fed onto another group's reference picture.
-      this.#o.metrics.decodeQueueDropped();
+      this.#localDrop();
       return;
     }
 
@@ -326,7 +346,7 @@ export class VideoSlotPipeline {
       this.#queuedBytes + frame.data.length > cfg.jitterMaxBytes
     ) {
       // Local overflow: this frame is lost, so its group is no longer decodable.
-      this.#o.metrics.decodeQueueDropped();
+      this.#localDrop();
       this.#awaitingKeyframe = true;
       this.loss(frame.senderId, frame.gopCounter, 'local_drop', frame.url);
       return;
@@ -409,7 +429,7 @@ export class VideoSlotPipeline {
     const group = this.#group;
     if (group && group.senderId === frame.senderId && frame.gopCounter <= group.gopCounter) {
       // An older (or repeated) group of the current sender: trailing.
-      this.#o.metrics.decodeQueueDropped();
+      this.#localDrop();
       return false;
     }
     // Pre-decode VP8 header check (security item 5): an over-bound keyframe
@@ -417,7 +437,7 @@ export class VideoSlotPipeline {
     // header is a typed discard.
     const dims = vp8KeyframeDimensions(frame.data);
     if (!dims.ok) {
-      this.#o.metrics.decodeQueueDropped();
+      this.#localDrop();
       return false;
     }
     if (
@@ -471,7 +491,7 @@ export class VideoSlotPipeline {
       if (!this.#decoder) {
         if (!head.isKeyframe) {
           this.#dequeue();
-          this.#o.metrics.decodeQueueDropped();
+          this.#localDrop();
           continue;
         }
         if (!this.#restart.mayRestart()) return;
@@ -505,6 +525,15 @@ export class VideoSlotPipeline {
     }
   }
 
+  /**
+   * ONE post-accept local drop: the production counter and the overlay's plain
+   * field, adjacent, so they cannot drift (the `frameAccounting.ts` rule).
+   */
+  #localDrop(): void {
+    this.#o.metrics.decodeQueueDropped();
+    this.#localDrops += 1;
+  }
+
   #dequeue(): Queued | undefined {
     const head = this.#queue.shift();
     if (head) this.#queuedBytes -= head.data.length;
@@ -518,7 +547,7 @@ export class VideoSlotPipeline {
       if (q.senderId === head.senderId && q.gopCounter === head.gopCounter) {
         this.#queue.splice(i, 1);
         this.#queuedBytes -= q.data.length;
-        this.#o.metrics.decodeQueueDropped();
+        this.#localDrop();
       }
     }
     this.loss(head.senderId, head.gopCounter, 'local_drop', head.url);
@@ -551,7 +580,7 @@ export class VideoSlotPipeline {
     // Queued frames before the first queued keyframe can no longer decode.
     while (this.#queue.length > 0 && !(this.#queue[0] as Queued).isKeyframe) {
       this.#dequeue();
-      this.#o.metrics.decodeQueueDropped();
+      this.#localDrop();
     }
     if (this.#queue.length === 0) this.#awaitingKeyframe = true;
     this.#o.onDecoderFault();
@@ -569,7 +598,7 @@ export class VideoSlotPipeline {
       // An output matching no input this slot submitted (or out of order): its
       // attribution is unknown, so it fails closed.
       frame.close();
-      this.#o.metrics.decodeQueueDropped();
+      this.#localDrop();
       this.#pump();
       return;
     }
@@ -620,7 +649,7 @@ export class VideoSlotPipeline {
   #offer(frame: VideoFrame, meta: InFlight): void {
     if (!this.#eligible(meta.senderId, meta.gopCounter)) {
       frame.close();
-      this.#o.metrics.decodeQueueDropped();
+      this.#localDrop();
       return;
     }
     const held: Held = { frame, senderId: meta.senderId, gopCounter: meta.gopCounter };
@@ -628,7 +657,7 @@ export class VideoSlotPipeline {
       if (!mayRender(meta.senderId, this.#o.guards)) {
         // The never-render re-check (a sender muted after its frame arrived).
         frame.close();
-        this.#o.metrics.decodeQueueDropped();
+        this.#localDrop();
         return;
       }
       this.#replaceHeld(held);
@@ -651,7 +680,7 @@ export class VideoSlotPipeline {
     this.#held = undefined;
     if (!held) return;
     held.frame.close();
-    if (count) this.#o.metrics.decodeQueueDropped();
+    if (count) this.#localDrop();
   }
 
   /**

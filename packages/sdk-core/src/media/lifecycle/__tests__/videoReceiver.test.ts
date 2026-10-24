@@ -792,3 +792,50 @@ function videoMetricsAudio() {
   );
   return { metrics, sink };
 }
+
+describe('VideoReceiver — R-35 local statistics (sampled; never exported)', () => {
+  it('per declared slot: exact packets, bytes, drops by reason, decoded, keyframes; undeclared ids are not tallied', async () => {
+    const h = await harness();
+    h.receiver.start();
+    h.assign({ 3: 'active', 4: 'active' });
+    const k = await key(A, 3, 1, 1);
+    const d = await delta(A, 3, 1, 2);
+    await h.deliver([k, d]);
+    // The SAME keyframe again: a replay, dropped and attributed to slot 3.
+    await h.deliver([k]);
+    // A stream naming an UNDECLARED slot: counted by the kind totals only.
+    await h.deliver([await key(B, 9, 1, 1)]);
+    h.drain();
+    const rows = h.receiver.localStats();
+    expect(rows.map((r) => r.slotId)).toEqual([3, 4]);
+    const three = rows[0]!;
+    expect(three).toMatchObject({
+      kind: 'video',
+      slotId: 3,
+      packets: 3,
+      bytes: k.length * 2 + d.length,
+      framesDecoded: 2,
+      queueDepth: 0,
+      localDrops: 0,
+      keyframesSeen: 1,
+      unfulfilledMs: 0,
+    });
+    expect(Object.entries(three.drops).filter(([, n]) => n > 0)).toEqual([['replay_detected', 1]]);
+    const four = rows[1]!;
+    expect(four).toMatchObject({ packets: 0, bytes: 0, framesDecoded: 0, keyframesSeen: 0 });
+    expect(Object.values(four.drops).every((n) => n === 0)).toBe(true);
+    // A FRESH object per read: mutating one snapshot cannot reach the next.
+    (three.drops as Record<string, number>)['replay_detected'] = 99;
+    expect(h.receiver.localStats()[0]!.drops.replay_detected).toBe(1);
+    await h.receiver.stop();
+  });
+
+  it('carries the unfulfilled time-in-state from the existing local snapshot', async () => {
+    const h = await harness();
+    h.receiver.start();
+    h.assign({ 3: 'active' });
+    h.clock.advance(1_250);
+    expect(h.receiver.localStats().find((r) => r.slotId === 3)?.unfulfilledMs).toBe(1_250);
+    await h.receiver.stop();
+  });
+});

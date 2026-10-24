@@ -58,9 +58,22 @@ interface Rig {
   /** Deliver an arbitrary datagram inbound, bypassing the send path. */
   inject(bytes: Uint8Array): Promise<void>;
   count(name: string): number;
+  /** Datagrams sent and not yet looped back (sizes for the R-35 byte totals). */
+  outbound(): readonly Uint8Array[];
 }
 
-async function makeRig(options: { readonly startDeviceId?: string } = {}): Promise<Rig> {
+async function makeRig(
+  options: {
+    readonly startDeviceId?: string;
+    /**
+     * Declare ONE slot with this id and assign this sender to it. A looped-back
+     * datagram carries the uplink relay id (the directed stream number), which
+     * MH would rewrite to the slot id; declaring THAT id makes the loopback land
+     * on a declared slot (the R-35 per-slot tally).
+     */
+    readonly loopbackSlot?: number;
+  } = {},
+): Promise<Rig> {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaMetrics({ clientVersion: '0.0.0-test', orgId: 'demo' }, sink);
   const kekSource = kekHolderWith(KEK, 0);
@@ -97,7 +110,7 @@ async function makeRig(options: { readonly startDeviceId?: string } = {}): Promi
     transmitKeys: sessionTransmitKeys(SENDER_ID, kekSource),
     publishesAudio: true,
     identity,
-    declaredSlotIds: [0],
+    declaredSlotIds: [options.loopbackSlot ?? 0],
     captureSource: 'microphone',
     metricExportIntervalMs: 10_000,
     senderFor: () => sender,
@@ -132,7 +145,18 @@ async function makeRig(options: { readonly startDeviceId?: string } = {}): Promi
     headerVersion: HEADER_VERSION,
   });
   // Receiving comes from the slot assignments, not from the send directive.
-  pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
+  pipeline.setReceiveAssignments(
+    options.loopbackSlot === undefined
+      ? assignmentsOn([MH_URL], SENDER_ID)
+      : [
+          {
+            slotId: options.loopbackSlot,
+            senderId: SENDER_ID,
+            mediaHandlerUrl: MH_URL,
+            active: true,
+          },
+        ],
+  );
 
   return {
     pipeline,
@@ -157,6 +181,7 @@ async function makeRig(options: { readonly startDeviceId?: string } = {}): Promi
       transport.simulateIncomingDatagram(bytes);
       await settle();
     },
+    outbound: () => [...transport.getOutboundDatagrams()],
     count: (name) =>
       sink
         .getRecordedMetrics()
@@ -382,5 +407,53 @@ describe('AudioPipeline.frameCounts', () => {
     expect(rig.count('dt_client_media_frames_dropped_total')).toBe(1);
 
     await rig.pipeline.stop();
+  });
+});
+
+describe('AudioPipeline R-35 local statistics (sampled; never exported)', () => {
+  it('exact send and per-slot receive packets and bytes; decode count from the slot sender lane', async () => {
+    // The directed stream number is 1, so a looped datagram names relay id 1.
+    const rig = await makeRig({ loopbackSlot: 1 });
+    rig.emit(1);
+    rig.emit(2);
+    await settle();
+    const sent = rig.outbound();
+    const bytes = sent.reduce((n, d) => n + d.length, 0);
+    expect(sent).toHaveLength(2);
+    await rig.loopback();
+    const stats = rig.pipeline.localStats()!;
+    expect(stats.send).toEqual({
+      kind: 'audio',
+      packets: 2,
+      bytes,
+      keyframes: undefined,
+      groupsAbandoned: undefined,
+    });
+    expect(stats.receive).toHaveLength(1);
+    const slot = stats.receive[0]!;
+    expect(slot).toMatchObject({
+      kind: 'audio',
+      slotId: 1,
+      packets: 2,
+      bytes,
+      framesDecoded: 2,
+      queueDepth: 0,
+      localDrops: undefined,
+      keyframesSeen: undefined,
+      unfulfilledMs: undefined,
+    });
+    expect(Object.values(slot.drops).every((n) => n === 0)).toBe(true);
+    await rig.pipeline.stop();
+    // Once stopped (leave / disconnect) there is no snapshot.
+    expect(rig.pipeline.localStats()).toBeUndefined();
+  });
+
+  it('captureTrack is the capture source track while running and undefined after stop', async () => {
+    const rig = await makeRig();
+    const track = { kind: 'audio' } as unknown as MediaStreamTrack;
+    rig.captures[0]!.capture.track = track;
+    expect(rig.pipeline.captureTrack).toBe(track);
+    await rig.pipeline.stop();
+    expect(rig.pipeline.captureTrack).toBeUndefined();
   });
 });

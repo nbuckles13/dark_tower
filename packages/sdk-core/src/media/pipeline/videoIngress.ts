@@ -291,6 +291,8 @@ export class VideoIngress {
     }
     const slot = state.slot as VideoSlotPipeline;
     const slotId = state.slotId;
+    // R-35 local tally: a frame naming this slot arrived (count + wire bytes).
+    this.#o.accounting.arrived(slotId, bytes.length);
 
     let senderId: number;
     try {

@@ -500,6 +500,7 @@ test('decoded frames NEVER touch the store: a paint recomputes nothing and is co
     setVideoSink: (slotId, sink) => sinks.set(slotId, sink),
     evidence: () => [],
     unfulfilledSnapshot: () => [],
+    localStats: () => [],
   };
   let surface: TileSurface | undefined;
   const screen = await render(CellGranularityHarness, {

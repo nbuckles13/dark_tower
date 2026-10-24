@@ -48,6 +48,7 @@ import { initialCameraGate, stepCameraGate, type CameraGateEvent } from './camer
 import { KeyframeGate } from './keyframePolicy.js';
 import { FaultOnce } from './faultOnce.js';
 import { MediaFaultStage, type MediaFault } from './AudioPipeline.js';
+import type { LocalSendStreamStats } from './localStats.js';
 import type { MuteSnapshot, MuteState } from './muteState.js';
 import type { MediaKindToken } from '../mediaKind.js';
 import type { TransmitKeyManager } from './transmitKeys.js';
@@ -191,6 +192,33 @@ export class VideoPublisher {
     return {
       framesSent: this.#egress?.framesSent ?? 0,
       keyframes: this.#gate.producedBySource(),
+    };
+  }
+
+  /**
+   * The live camera track while the camera is lit (acquired, current, healthy),
+   * else `undefined` — so a video mute, withdrawal or failure drops it at once.
+   * A READ-ONLY reference for the local R-7 self-check preview: the publish
+   * path owns the camera lifecycle and the camera-light rule, so a reader must
+   * never stop, clone, `applyConstraints` or toggle `enabled` on it.
+   */
+  get captureTrack(): MediaStreamTrack | undefined {
+    return this.#cameraLive ? this.#capture?.track : undefined;
+  }
+
+  /**
+   * The video send stream's LOCAL R-35 statistics (`localStats.ts`). A fresh
+   * snapshot; sampled, never per frame, never exported (it carries a byte
+   * total, which {@link sendTotals} — the bus's input — deliberately does not).
+   */
+  localSendStats(): LocalSendStreamStats {
+    const egress = this.#egress;
+    return {
+      kind: 'video',
+      packets: egress?.framesSent ?? 0,
+      bytes: egress?.bytesSent ?? 0,
+      keyframes: this.#gate.producedBySource(),
+      groupsAbandoned: egress?.groupsAbandoned ?? 0,
     };
   }
 

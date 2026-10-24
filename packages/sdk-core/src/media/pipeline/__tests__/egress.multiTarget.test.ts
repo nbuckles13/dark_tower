@@ -155,6 +155,11 @@ describe('multi-target send', () => {
     expect(rig.senders.get(SECOND)!.sent).toHaveLength(2);
     // Datagrams, not captured frames: two frames to two handlers is four sends.
     expect(rig.egress.framesSent).toBe(4);
+    // R-35 local byte total: EXACTLY the bytes handed to the transports.
+    const bytes = [FIRST, SECOND]
+      .flatMap((url) => rig.senders.get(url)!.sent)
+      .reduce((n, datagram) => n + datagram.length, 0);
+    expect(rig.egress.bytesSent).toBe(bytes);
   });
 
   it('seals ONCE: the bytes on each target differ only in the hop sequence', async () => {

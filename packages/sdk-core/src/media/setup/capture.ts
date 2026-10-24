@@ -21,6 +21,7 @@
 // failure, not a memory nit, so `stop()` must reach a partially-constructed
 // capture: the track is stored on the instance before any further await.
 
+import type { CaptureSource } from './seams.js';
 import {
   CAPTURE_MESSAGE,
   CaptureFailure,
@@ -78,10 +79,7 @@ export function createMicrophoneCapture(options: {
   readonly sampleRateHz: number;
   readonly channels: number;
   readonly deviceId: string | undefined;
-}): Promise<{
-  start(onFrame: (data: AudioData) => void, onEnded: () => void): Promise<void>;
-  stop(): void;
-}> {
+}): Promise<CaptureSource> {
   const media = globalThis.navigator?.mediaDevices;
   const Processor = trackProcessor();
   if (!media || !Processor) {
@@ -116,7 +114,13 @@ export function createMicrophoneCapture(options: {
     capture.attach(first, onFrame, onEnded);
   };
 
-  return Promise.resolve({ start, stop: capture.stop });
+  return Promise.resolve({
+    start,
+    stop: capture.stop,
+    get track(): MediaStreamTrack | undefined {
+      return capture.track;
+    },
+  });
 }
 
 /**
@@ -153,10 +157,7 @@ export function createTestToneCapture(options: {
   /** The encoder's channel count — the tone's track MUST match it. */
   readonly channels: number;
   readonly frequencyHz: number;
-}): Promise<{
-  start(onFrame: (data: AudioData) => void, onEnded: () => void): Promise<void>;
-  stop(): void;
-}> {
+}): Promise<CaptureSource> {
   const Processor = trackProcessor();
   const Context = (globalThis as { AudioContext?: typeof AudioContext }).AudioContext;
   if (!Processor || !Context) {
@@ -207,7 +208,13 @@ export function createTestToneCapture(options: {
     capture.attach(first, onFrame, onEnded);
   };
 
-  return Promise.resolve({ start, stop });
+  return Promise.resolve({
+    start,
+    stop,
+    get track(): MediaStreamTrack | undefined {
+      return capture.track;
+    },
+  });
 }
 
 /** Chrome's `MediaStreamTrackProcessor`, looked up so its absence is typed. */
@@ -231,6 +238,8 @@ export function trackCapture<F = AudioData>(
 ): {
   attach(track: MediaStreamTrack, onFrame: (data: F) => void, onEnded: () => void): void;
   stop(): void;
+  /** The attached track until `stop()`; a read-only reference (see `seams.ts`). */
+  readonly track: MediaStreamTrack | undefined;
 } {
   let track: MediaStreamTrack | undefined;
   let reader: ReadableStreamDefaultReader<F> | undefined;
@@ -272,7 +281,13 @@ export function trackCapture<F = AudioData>(
     void pump(reader, onFrame);
   };
 
-  return { attach, stop };
+  return {
+    attach,
+    stop,
+    get track(): MediaStreamTrack | undefined {
+      return stopped ? undefined : track;
+    },
+  };
 }
 
 /**

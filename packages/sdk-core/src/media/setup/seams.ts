@@ -120,6 +120,14 @@ export interface CaptureSource {
    * a user-visible privacy failure rather than a memory nit.
    */
   stop(): void;
+  /**
+   * The live microphone track while capturing, else `undefined` (before
+   * `start`, after `stop`, or a synthetic source with no track). A READ-ONLY
+   * reference for the local R-7 self-check meter: the capture source owns the
+   * track's lifecycle, so a reader must never stop, clone, `applyConstraints`
+   * or toggle `enabled` on it.
+   */
+  readonly track: MediaStreamTrack | undefined;
 }
 
 /** Construction options for an encoder. */
@@ -241,6 +249,14 @@ export interface VideoCaptureSource {
    * synthetic source.
    */
   readonly grantedDeviceId: string | undefined;
+  /**
+   * The live camera track while capturing, else `undefined` (before `start`,
+   * after `stop`, or a synthetic source such as the test pattern). A READ-ONLY
+   * reference for the local R-7 self-check preview: the publish path owns the
+   * camera lifecycle (and the camera-light rule), so a reader must never stop,
+   * clone, `applyConstraints` or toggle `enabled` on it.
+   */
+  readonly track: MediaStreamTrack | undefined;
 }
 
 /** Builds a video capture source at the DIRECTED geometry. */

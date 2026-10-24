@@ -81,6 +81,8 @@ export class FakeCaptureSource {
   stopCount = 0;
   /** Whether `start()` has run. */
   started = false;
+  /** The `CaptureSource.track` read-only reference; a test sets it to a fake track. */
+  track: MediaStreamTrack | undefined = undefined;
 
   async start(onFrame: (data: never) => void, onEnded: () => void): Promise<void> {
     this.started = true;

@@ -53,6 +53,7 @@ import {
   type MediaMetrics,
 } from '../setup/mediaMetrics.js';
 import type { ReceiveVerificationRecorder } from '../pipeline/receiveVerification.js';
+import type { LocalReceiveSlotStats, LocalSendStreamStats } from './localStats.js';
 import { activeAssignments } from './receiveSourceDeficit.js';
 import { startIntervalSignals } from './intervalSignals.js';
 import type { KekWrapSource, MeetingKekSource } from '../setup/kekSource.js';
@@ -457,6 +458,57 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     return this.#capture !== undefined && !this.#stopped;
   }
 
+  /**
+   * The live microphone track, or `undefined` when not capturing. A READ-ONLY
+   * reference for the local R-7 self-check meter: this pipeline owns the
+   * track's lifecycle, so a reader must never stop, clone, `applyConstraints`
+   * or toggle `enabled` on it.
+   */
+  get captureTrack(): MediaStreamTrack | undefined {
+    return this.#stopped ? undefined : this.#capture?.track;
+  }
+
+  /**
+   * The LOCAL R-35 statistics (`localStats.ts`): one row per declared AUDIO
+   * slot and the audio send stream. A fresh snapshot per call; sample it on a
+   * timer, never per frame. Never exported: not a metric, not the bus.
+   * `undefined` once stopped (leave / disconnect).
+   */
+  localStats(): { receive: LocalReceiveSlotStats[]; send: LocalSendStreamStats } | undefined {
+    if (this.#stopped) return undefined;
+    const ingress = this.#ingress;
+    const lanes = this.#lanes;
+    const receive: LocalReceiveSlotStats[] = [];
+    for (const slotId of this.#options.declaredSlotIds) {
+      const tally = ingress?.slotTally(slotId);
+      if (tally === undefined) continue;
+      const senderId = this.#assignments.find((a) => a.slotId === slotId)?.senderId;
+      const activity = senderId === undefined ? undefined : lanes?.activityFor(senderId);
+      receive.push({
+        kind: 'audio',
+        slotId,
+        packets: tally.packets,
+        bytes: tally.bytes,
+        framesDecoded: activity?.decoded ?? 0,
+        queueDepth: senderId === undefined ? 0 : (lanes?.pendingFor(senderId) ?? 0),
+        drops: tally.drops,
+        localDrops: undefined,
+        keyframesSeen: undefined,
+        unfulfilledMs: undefined,
+      });
+    }
+    return {
+      receive,
+      send: {
+        kind: 'audio',
+        packets: this.#egress?.framesSent ?? 0,
+        bytes: this.#egress?.bytesSent ?? 0,
+        keyframes: undefined,
+        groupsAbandoned: undefined,
+      },
+    };
+  }
+
   /** The microphone currently requested, or `undefined` for the platform default. */
   get captureDeviceId(): string | undefined {
     return this.#deviceId;
@@ -592,6 +644,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
       replay: this.#replay,
       firstMedia: this.#firstMedia,
       onAccepted: (frame) => this.emit('frameAccepted', frame),
+      declaredSlotIds: this.#options.declaredSlotIds,
       ...(this.#options.verification ? { verification: this.#options.verification } : {}),
     });
     const ingress = this.#ingress;

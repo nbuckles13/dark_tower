@@ -11,11 +11,15 @@ import {
   SignalingError,
   SignalingErrorCode,
 } from '@darktower/sdk-core';
+import type * as SdkCore from '@darktower/sdk-core';
 import type { DemoConfig } from '../lib/config.js';
 import type { AuthSession } from '../lib/types.js';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
 
 const holder = vi.hoisted(() => ({
+  /** Story 3 C-C2: the pre-join self-check's own preview, observed. */
+  previewStops: 0,
+  previewOpens: 0,
   session: undefined as MockMeetingSession | undefined,
   /** The options the view built the session with (publish set, levers, e2e). */
   builds: [] as Array<{ publish?: readonly string[] | undefined }>,
@@ -38,6 +42,26 @@ vi.mock('../lib/session.js', () => ({
   // ignores its arguments entirely.
   configureTelemetryIfEnabled: () => {},
 }));
+
+// Story 3 C-C2: the pre-join self-check's own capture, observed through the
+// SDK's ONE opener (a partial mock: everything else is the real SDK).
+vi.mock('@darktower/sdk-core', async (importOriginal) => {
+  const real = await importOriginal<typeof SdkCore>();
+  return {
+    ...real,
+    openLocalPreview: async () => {
+      holder.previewOpens += 1;
+      return {
+        stream: new MediaStream(),
+        video: undefined,
+        audio: undefined,
+        stop: () => {
+          holder.previewStops += 1;
+        },
+      };
+    },
+  };
+});
 
 // Imported after the mock is registered (vi.mock is hoisted regardless).
 import JoinMeeting from '../views/JoinMeeting.svelte';
@@ -307,4 +331,60 @@ test('the host has a SEPARATE affordance per kind; a video request never touches
   await expect
     .element(row.getByTestId('mute-video-server-b'))
     .toHaveAttribute('data-muted', 'true');
+});
+
+// ---------------------------------------------------------------------------
+// Story 3 R-7: the pre-join debug panel (one line in the idle branch)
+// ---------------------------------------------------------------------------
+
+test('the pre-join debug toggle is present, hidden by default, and the panel is GONE once Join is submitted', async () => {
+  localStorage.setItem('darktower.debugPanel.v1', '1');
+  const session = new MockMeetingSession();
+  holder.session = session;
+  const screen = await render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
+  // Persisted open: the panel shows, but the self-check is NOT started (no gesture).
+  await expect.element(screen.getByTestId('debug-panel')).toBeInTheDocument();
+  await expect.element(screen.getByTestId('self-check-status')).toHaveTextContent('idle');
+  // No statistics overlay before join (there is no session).
+  await expect.element(screen.getByTestId('debug-stats-empty')).not.toBeInTheDocument();
+  await screen.getByTestId('meeting-code').fill('abc123ABC456');
+  await screen.getByTestId('join-button').click();
+  await vi.waitFor(() => expect(session.joinCalls).toBe(1));
+  // Unmounted with the idle branch: an own preview capture would be released here.
+  await expect.element(screen.getByTestId('debug-panel-root')).not.toBeInTheDocument();
+  localStorage.removeItem('darktower.debugPanel.v1');
+  screen.unmount();
+});
+
+test('the pre-join panel is hidden by default with empty storage', async () => {
+  localStorage.removeItem('darktower.debugPanel.v1');
+  holder.session = new MockMeetingSession();
+  const screen = await render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
+  await expect.element(screen.getByTestId('debug-panel-toggle')).toBeInTheDocument();
+  await expect.element(screen.getByTestId('debug-panel')).not.toBeInTheDocument();
+  screen.unmount();
+});
+
+test('a RUNNING pre-join self-check is released BEFORE the session joins (single-webcam hosts)', async () => {
+  localStorage.setItem('darktower.debugPanel.v1', '1');
+  holder.previewOpens = 0;
+  holder.previewStops = 0;
+  const session = new MockMeetingSession();
+  let stopsWhenJoinRan: number | undefined;
+  session.onJoin = () => {
+    stopsWhenJoinRan = holder.previewStops;
+  };
+  holder.session = session;
+  const screen = await render(JoinMeeting, { config, auth, onSessionInvalid: () => {} });
+  await screen.getByTestId('self-check-start').click();
+  await expect.element(screen.getByTestId('self-check-status')).toHaveTextContent('running');
+  expect(holder.previewOpens).toBe(1);
+  expect(holder.previewStops).toBe(0);
+  await screen.getByTestId('meeting-code').fill('abc123ABC456');
+  await screen.getByTestId('join-button').click();
+  await vi.waitFor(() => expect(session.joinCalls).toBe(1));
+  // The preview was already stopped when join() ran — before any session capture.
+  expect(stopsWhenJoinRan).toBe(1);
+  localStorage.removeItem('darktower.debugPanel.v1');
+  screen.unmount();
 });

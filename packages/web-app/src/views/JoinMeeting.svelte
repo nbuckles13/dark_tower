@@ -10,10 +10,15 @@
   // `publish` lever; the CHOOSER's result is what the join uses either way.
   // A choice that would neither publish nor receive is refused by the SDK at
   // construction and shown through `errorText` — never a silent empty meeting.
+  //
+  // The local debug panel (story 3 R-7 self-check) mounts in the IDLE branch
+  // only, so submitting Join unmounts it and releases any preview capture it
+  // opened before the session acquires the camera.
   import type { DemoConfig } from '../lib/config.js';
   import type { AuthSession } from '../lib/types.js';
   import { DEFAULT_PUBLISH, type PublishKind } from '@darktower/sdk-core';
   import { publishSeed, readTestLeversForSession } from '../lib/testLevers.js';
+  import DebugPanel from './DebugPanel.svelte';
   import MeetingRoom from './MeetingRoom.svelte';
 
   let {
@@ -93,4 +98,5 @@
   {#if leverError}
     <p data-testid="last-error">{leverError}</p>
   {/if}
+  <DebugPanel />
 {/if}

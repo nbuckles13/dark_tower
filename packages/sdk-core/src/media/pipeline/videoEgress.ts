@@ -149,6 +149,10 @@ export class VideoEgress {
   #lastGeneration: bigint | undefined;
   #framesSinceKeyChange = 0;
   #framesSent = 0;
+  /** Wire bytes written, summed over targets (R-35 local overlay; a cumulative SUM only). */
+  #bytesSent = 0;
+  /** Groups the PUBLISHER abandoned (backlog cap), beside `sendGroupAbandoned()`. */
+  #groupsAbandoned = 0;
 
   constructor(options: VideoEgressOptions) {
     this.#o = options;
@@ -170,6 +174,16 @@ export class VideoEgress {
   /** Frames actually written, summed over targets (monotone). Sampled, never per frame. */
   get framesSent(): number {
     return this.#framesSent;
+  }
+
+  /** Wire bytes written, summed over targets (monotone). LOCAL R-35 overlay; never exported. */
+  get bytesSent(): number {
+    return this.#bytesSent;
+  }
+
+  /** Groups the publisher abandoned (monotone). Sampled. */
+  get groupsAbandoned(): number {
+    return this.#groupsAbandoned;
   }
 
   /** Active targets with no group in progress that the PUBLISHER owes a group (never `mh_stopped`). */
@@ -447,6 +461,7 @@ export class VideoEgress {
     if (group.writer) void group.writer.abort().catch(() => undefined);
     lane.state = 'awaiting_group';
     this.#o.metrics.sendGroupAbandoned();
+    this.#groupsAbandoned += 1;
     this.#o.onSelfAbandoned();
   }
 
@@ -526,6 +541,7 @@ export class VideoEgress {
           return;
         }
         this.#framesSent += 1;
+        this.#bytesSent += pending.bytes.length;
         this.#o.metrics.frameSent();
       }
     } finally {
