@@ -2405,7 +2405,7 @@ tasks:
   slug: 2026-10-23-mc-b-per-kind-mute
   tag: story-2026-10-07-see-each-other-task-15
 - id: 16
-  status: pending
+  status: completed
   specialist: infrastructure
   deps:
   - 3
@@ -2455,6 +2455,7 @@ tasks:
     - `dev-web.sh` demo docs use the build-gated test pattern; they never instruct disabling certificate checks.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-24-kind-video-test-profile
   tag: story-2026-10-07-see-each-other-task-16
 - id: 17
   status: pending
