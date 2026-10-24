@@ -187,8 +187,14 @@ Checks:
 - **Debug panel state persists per profile.** The panel's open/closed bit is stored in
   `localStorage` (`darktower.debugPanel.v1`). It is hidden by default only on a fresh profile or
   with that key cleared. A returning profile may show it open, which is not a Phase 9 failure.
-- Keep every window visible and unminimised. A hidden tab throttles rendering, and that is not a
-  product fault.
+- Keep every window visible, unminimised and **uncovered**. Chrome throttles a window that other
+  windows fully cover exactly as it throttles a hidden tab: timers drop to about 1/s, so a
+  test-pattern publisher there sends ~1 fps (the pattern is painted on a timer; a real camera
+  track is not) and every receiver shows that tile at ~1 fps. That is not a product fault. If five
+  windows will not fit uncovered, launch the demo Chrome with
+  `--disable-backgrounding-occluded-windows --disable-renderer-backgrounding
+  --disable-background-timer-throttling` (throttling only; no security flag). Check: the
+  `sendCounts` snippet below reads about the directed frame rate in every context.
 
 Evidence available in every context (dev builds carry the E2E bus). Open DevTools → Console:
 
