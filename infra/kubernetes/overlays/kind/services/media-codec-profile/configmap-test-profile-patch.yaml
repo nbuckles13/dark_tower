@@ -1,0 +1,89 @@
+# Kind TEST codec profile (story 3 R-28), strategic-merge patch on the shared
+# `media-codec-profile` (base: infra/services/media-codec-profile/profile.env,
+# whose header carries the membership rule and the cost model).
+#
+# WHY KIND RUNS A LOWER PROFILE. The env-tests run a config-driven lower
+# profile (R-28) so that a cohort of headless browser tabs can encode and
+# decode VP8 at once on a devloop host and a CI runner. This file changes the
+# four video geometry/rate/bitrate values and NOTHING else: every
+# MEDIA_AUDIO_* key and the video codec are inherited from the base unchanged,
+# and the minimum keyframe interval is not a profile key at all (MC-only,
+# `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS` in infra/services/mc-service/config.env).
+# Whether the substrate actually carries that cohort is verified as EVIDENCE
+# (story 3 T-B's capacity evidence), not assumed here.
+#
+# ONE PLACE, TWO READERS. MC directs publishers from these values, and MH
+# derives its per-stream video cost — hence its egress stream ceiling — from
+# the same values. Nothing else restates them: the dev-web.sh demo inherits
+# this profile, and Layer 7's VP8 probe (packages/web-app/e2e/vp8Probe.ts,
+# story 3 T-A) reads the DEPLOYED profile, so the probe tests exactly what the
+# env-tests run. Lowering the profile RAISES MH's stream ceiling: the Kind
+# egress budget (../mh-service/configmap-egress-budget-patch.yaml) is sized
+# against THIS profile.
+#
+# BOUNDS. Every value must lie inside MC's boot bounds in
+# crates/mc-service/src/media_signaling/directive.rs — `VIDEO_DIMENSION_MIN_PX`
+# ..`VIDEO_DIMENSION_MAX_PX` for width and height,
+# `VIDEO_FRAME_RATE_MIN_HZ`..`VIDEO_FRAME_RATE_MAX_HZ`, and
+# `VIDEO_BITRATE_MIN_BPS`..`VIDEO_BITRATE_MAX_BPS` — cited, not restated; MC
+# refuses to start outside them. MH requires both of its inputs non-zero.
+#
+# ROLL COST. The ConfigMap is content-addressed (ADR-0038 §2) and referenced
+# by mc-0, mc-1, mh-0 and mh-1, so ANY change to this patch — editing it,
+# removing it, or restoring it — rolls all four pods together, and the MH roll
+# drops every live meeting on each pod (participants must rejoin). The
+# consequences are in docs/runbooks/mh-deployment.md §Rollout With Media
+# Flowing; they are not restated here.
+#
+# PRODUCTION-QUALITY DEMO — the ONE authoritative procedure (dev-web.sh and
+# the env-test point here). There is no override mechanism: no deploy.sh
+# input, no dev-web.sh flag, no second render path.
+#   1. Switch: delete the `patches:` entry in the sibling kustomization.yaml
+#      (Kind then runs the production profile.env values), or edit the values
+#      below. Then deploy: infra/kind/scripts/deploy.sh (devloop container:
+#      `dev-cluster deploy`). Live meetings drop (ROLL COST).
+#   2. CHECK THE CEILING FIRST. The egress budget is sized for THIS profile;
+#      at the production profile the derived video cost is several times
+#      higher, so MH's stream ceiling falls by the same factor and can be
+#      BELOW the meeting you want to demo. Compare, per MH pod, the
+#      `mh_media_egress_stream_ceiling` gauge (Prometheus) with your meeting's
+#      P x (N + M) edges (P participants, N audio + M video receive slots each).
+#      A meeting larger than the ceiling is refused at admission — counted as
+#      mh_media_stream_admission_total{outcome="rejected_stream_ceiling"} —
+#      and presents as "some receivers miss some senders". A smaller meeting
+#      needs nothing more; a larger one ALSO needs MH_EGRESS_BUDGET_BPS raised
+#      in ../mh-service/configmap-egress-budget-patch.yaml for the demo.
+#   3. RESTORE BEFORE LAYER 7 (the window and profile env-tests fail loudly
+#      otherwise), restoring BOTH paths if you edited the budget too:
+#        git checkout -- infra/kubernetes/overlays/kind/services/media-codec-profile/ infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml && dev-cluster deploy
+#      (host: infra/kind/scripts/deploy.sh in place of `dev-cluster deploy`).
+#   PROFILE AND BUDGET ROLL BACK TOGETHER: either one reverted without the
+#   other puts MH's ceiling outside the window the budget patch states.
+#
+# ENFORCED, not asserted here:
+#   crates/env-tests/tests/01_mh_deployment_config.rs::test_kind_media_codec_profile_is_the_committed_test_profile
+# reads THIS file from the repo and the live profile generation that MC and MH
+# pods resolve (one generation across all four, or it fails), and fails —
+# naming this file and the restore command — when the live values differ from
+# these. Its hermetic twin (fixtures/deployment_config.rs, Layer 4) fails when
+# a key below is absent from profile.env or equal to its base value.
+#
+# PATCH VALUES ONLY — NEVER ADD A KEY. A strategic merge is additive by key
+# name: if a base key is ever renamed, this patch silently contributes a dead
+# key and the base (production) value wins in Kind, with nothing static to
+# notice. GUARD COVERAGE, stated honestly: `dt-guard env-config` reads
+# infra/services/** only, so the base keys are guard-covered and these patched
+# VALUES are not; the env-test above (live key set == profile.env key set, and
+# every key here present in profile.env) is what catches the dead key
+# (docs/TODO.md §Infrastructure Validation in Devloops, the env-config
+# overlay-coverage entry).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: media-codec-profile
+  namespace: dark-tower
+data:
+  MEDIA_VIDEO_WIDTH: "320"
+  MEDIA_VIDEO_HEIGHT: "180"
+  MEDIA_VIDEO_FRAME_RATE_HZ: "15"
+  MEDIA_VIDEO_MAX_BITRATE_BPS: "250000"

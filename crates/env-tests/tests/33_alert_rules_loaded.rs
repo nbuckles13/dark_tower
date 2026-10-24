@@ -47,6 +47,8 @@
 //! There is deliberately no `is_available` early return. "The rules are not
 //! loaded" is precisely the state this test exists to go red on, so a self-skip
 //! would be a check that ran where it could observe nothing and reported clean.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "observability")]
 

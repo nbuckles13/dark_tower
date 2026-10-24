@@ -10,6 +10,8 @@
 //! services REJECT an expired token is tested where one can be minted:
 //! `gc-service/tests/auth_tests.rs::test_me_endpoint_rejects_expired_token`
 //! and `mc-service/tests/join_tests.rs::test_join_expired_token_returns_unauthorized`.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "flows")]
 

@@ -19,6 +19,7 @@
 //! resource quantities. Never a parsed `Value`, an env array, a ConfigMap's
 //! `data` map, or raw `kubectl` output. Extract scalars first, then format.
 
+use std::collections::BTreeMap;
 use std::process::Command;
 
 use serde_json::Value;
@@ -383,6 +384,39 @@ pub fn fetch_live_pod(instance: &str) -> Value {
     newest_live_pod(&parsed, instance).unwrap_or_else(|e| panic!("PRECONDITION: {e}"))
 }
 
+/// The serving pod of one instance, as a metric pin needs it: the instance
+/// label value, the pod name and its `status.podIP` (the Prometheus `instance`
+/// label is `pod IP:port`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LivePod {
+    /// The `instance` label (e.g. `mh-0`).
+    pub instance: String,
+    /// The serving pod's `metadata.name`.
+    pub name: String,
+    /// The serving pod's `status.podIP`.
+    pub ip: String,
+}
+
+/// [`fetch_live_pod`] reduced to a [`LivePod`].
+///
+/// # Panics
+/// As [`fetch_live_pod`], or the pod has no `status.podIP` (not yet scheduled).
+#[must_use]
+pub fn live_pod(instance: &str) -> LivePod {
+    let pod = fetch_live_pod(instance);
+    let name = pod_name_of(&pod, instance);
+    let ip = pod
+        .pointer("/status/podIP")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("PRECONDITION: pod {name} ({instance}) has no status.podIP"))
+        .to_string();
+    LivePod {
+        instance: instance.to_string(),
+        name,
+        ip,
+    }
+}
+
 /// PURE core of [`fetch_live_pod`].
 ///
 /// # Errors
@@ -445,6 +479,175 @@ pub fn fetch_configmap(name: &str) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
         panic!("could not parse `kubectl get configmap {name} -o json` output: {e}")
     })
+}
+
+// -----------------------------------------------------------------------------
+// Tree-side ConfigMap data (the committed files a live value is compared to)
+// -----------------------------------------------------------------------------
+
+/// The Kind TEST codec profile patch (story 3 R-28) — a fixed repo-relative
+/// path, resolved under [`crate::repo_root`] (from `CARGO_MANIFEST_DIR`, never
+/// from the environment).
+pub const KIND_TEST_PROFILE_PATCH: &str =
+    "infra/kubernetes/overlays/kind/services/media-codec-profile/configmap-test-profile-patch.yaml";
+
+/// The production codec profile: the generator env file the patch overrides.
+pub const PROFILE_BASE_ENV: &str = "infra/services/media-codec-profile/profile.env";
+
+/// The ONE restore command for the Kind sizing unit — the test codec profile
+/// AND the egress budget, which roll back together. Verbatim the command in
+/// [`KIND_TEST_PROFILE_PATCH`]'s header (step 3), and a hermetic test fails if
+/// the two drift.
+macro_rules! kind_sizing_restore_cmd {
+    () => {
+        "git checkout -- infra/kubernetes/overlays/kind/services/media-codec-profile/ \
+infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml && dev-cluster deploy"
+    };
+}
+
+/// See [`kind_sizing_restore_cmd`].
+pub const KIND_SIZING_RESTORE_CMD: &str = kind_sizing_restore_cmd!();
+
+/// The ONE recovery sentence every Kind profile/budget failure prints.
+pub const KIND_SIZING_RESTORE: &str = concat!(
+    "restore BOTH committed Kind patches and converge: `",
+    kind_sizing_restore_cmd!(),
+    "` (on the host, `infra/kind/scripts/deploy.sh` in place of `dev-cluster deploy`) — the \
+     procedure and what a switch costs are in the Kind test-profile patch's header"
+);
+
+/// The `data` of a committed ConfigMap source, by file shape: a generator env
+/// file (`*.env`: `KEY=VALUE` taken literally, ADR-0038 §2) or a
+/// strategic-merge YAML patch (its `data` map, every value a string).
+///
+/// STRICT, so a malformed file can never make a comparison vacuous: in an env
+/// file a non-comment line without `=`, an empty key or value, or a duplicate
+/// key fails; in a patch a non-string value or a missing `data` map fails; and
+/// either shape yielding ZERO keys fails.
+///
+/// # Errors
+/// The file is unreadable or violates any rule above. The message names the
+/// file and the key, never a value map.
+pub fn tree_configmap_data(rel_path: &str) -> Result<BTreeMap<String, String>, String> {
+    let path = crate::repo_root().join(rel_path);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let data = if rel_path.ends_with(".env") {
+        env_file_data(&text, rel_path)?
+    } else {
+        patch_data(&text, rel_path)?
+    };
+    if data.is_empty() {
+        return Err(format!(
+            "{rel_path} yields no keys: any comparison against it would pass vacuously"
+        ));
+    }
+    Ok(data)
+}
+
+/// PURE core of [`tree_configmap_data`] for a generator env file.
+///
+/// # Errors
+/// See [`tree_configmap_data`].
+pub fn env_file_data(text: &str, home: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut data = BTreeMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("{home}:{}: not a KEY=VALUE line", n + 1))?;
+        if key.is_empty() || value.is_empty() {
+            return Err(format!("{home}:{}: empty key or value for `{key}`", n + 1));
+        }
+        if data.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(format!("{home}:{}: duplicate key {key}", n + 1));
+        }
+    }
+    Ok(data)
+}
+
+/// PURE core of [`tree_configmap_data`] for a strategic-merge ConfigMap patch.
+///
+/// # Errors
+/// See [`tree_configmap_data`].
+pub fn patch_data(text: &str, home: &str) -> Result<BTreeMap<String, String>, String> {
+    let doc: serde_norway::Value =
+        serde_norway::from_str(text).map_err(|e| format!("{home} is not valid YAML: {e}"))?;
+    let map = doc
+        .get("data")
+        .and_then(serde_norway::Value::as_mapping)
+        .ok_or_else(|| format!("{home} has no `data` map"))?;
+    map.iter()
+        .map(|(k, v)| {
+            let key = k
+                .as_str()
+                .ok_or_else(|| format!("{home}: a `data` key is not a string"))?;
+            let value = v
+                .as_str()
+                .ok_or_else(|| format!("{home}: data.{key} is not a string (quote it)"))?;
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// One key a Kind patch overrides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatchOverride {
+    /// The data key.
+    pub key: String,
+    /// The value the patch sets.
+    pub patch: String,
+    /// The value the base declares (always different from `patch`).
+    pub base: String,
+}
+
+/// The ONE patch-vs-base rule for a Kind overlay patch that must change
+/// values only: every patch key EXISTS in the base (a strategic merge is
+/// additive by key name, so a key the base renamed would be dead and the base
+/// value would win) and its value DIFFERS from the base (an unchanged value is
+/// a no-op override). Used by the hermetic Layer-4 check and the live env-test.
+///
+/// # Errors
+/// Either side unreadable/empty, a dead key, or a no-op key — each message
+/// names `patch_rel`.
+pub fn kind_patch_overrides(patch_rel: &str, base_rel: &str) -> Result<Vec<PatchOverride>, String> {
+    let patch = tree_configmap_data(patch_rel)?;
+    let base = tree_configmap_data(base_rel)?;
+    patch_overrides(&patch, &base, patch_rel, base_rel)
+}
+
+/// PURE core of [`kind_patch_overrides`].
+///
+/// # Errors
+/// See [`kind_patch_overrides`].
+pub fn patch_overrides(
+    patch: &BTreeMap<String, String>,
+    base: &BTreeMap<String, String>,
+    patch_rel: &str,
+    base_rel: &str,
+) -> Result<Vec<PatchOverride>, String> {
+    patch
+        .iter()
+        .map(|(key, value)| match base.get(key) {
+            None => Err(format!(
+                "{patch_rel} sets {key}, which {base_rel} does not declare: a DEAD patch key (the \
+                 base key was renamed or removed, so the strategic merge only ADDS this key and \
+                 the base value wins in Kind). Make the patch follow the base key."
+            )),
+            Some(b) if b == value => Err(format!(
+                "{patch_rel} sets {key} to its base value from {base_rel}: a no-op override. \
+                 Remove it from the patch, or give it the intended value."
+            )),
+            Some(b) => Ok(PatchOverride {
+                key: key.clone(),
+                patch: value.clone(),
+                base: b.clone(),
+            }),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -733,5 +936,99 @@ mod tests {
             );
         }
         assert!(quantity_to_bytes("99999999999999Ti").is_err(), "overflow");
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn env_file_data_is_strict() {
+        let ok = env_file_data("# c\n\nA=1\nB=x=y\n", "f.env").unwrap();
+        assert_eq!(ok, map(&[("A", "1"), ("B", "x=y")]));
+        assert!(env_file_data("A\n", "f.env")
+            .unwrap_err()
+            .contains("not a KEY=VALUE"));
+        assert!(env_file_data("A=\n", "f.env")
+            .unwrap_err()
+            .contains("empty key or value"));
+        assert!(env_file_data("=1\n", "f.env")
+            .unwrap_err()
+            .contains("empty key or value"));
+        assert!(env_file_data("A=1\nA=2\n", "f.env")
+            .unwrap_err()
+            .contains("duplicate key A"));
+    }
+
+    #[test]
+    fn patch_data_is_strict() {
+        let ok = patch_data("data:\n  A: \"1\"\n", "p.yaml").unwrap();
+        assert_eq!(ok, map(&[("A", "1")]));
+        assert!(patch_data("data:\n  A: 1\n", "p.yaml")
+            .unwrap_err()
+            .contains("not a string"));
+        assert!(patch_data("kind: ConfigMap\n", "p.yaml")
+            .unwrap_err()
+            .contains("no `data` map"));
+        assert!(patch_data(": : :", "p.yaml")
+            .unwrap_err()
+            .contains("not valid YAML"));
+    }
+
+    #[test]
+    fn patch_overrides_rejects_dead_and_noop_keys() {
+        let base = map(&[("A", "1"), ("B", "2")]);
+        assert_eq!(
+            patch_overrides(&map(&[("A", "9")]), &base, "p", "b").unwrap(),
+            vec![PatchOverride {
+                key: "A".to_string(),
+                patch: "9".to_string(),
+                base: "1".to_string()
+            }]
+        );
+        assert!(patch_overrides(&map(&[("C", "9")]), &base, "p", "b")
+            .unwrap_err()
+            .contains("DEAD patch key"));
+        assert!(patch_overrides(&map(&[("B", "2")]), &base, "p", "b")
+            .unwrap_err()
+            .contains("no-op override"));
+    }
+
+    /// Hermetic twin of `01::test_kind_media_codec_profile_is_the_committed_test_profile`
+    /// (story 3 R-28): the COMMITTED Kind test-profile patch overrides only keys
+    /// the base profile declares, changes every one, and leaves audio alone.
+    #[test]
+    fn the_kind_test_profile_patch_overrides_base_keys_only() {
+        let overrides = kind_patch_overrides(KIND_TEST_PROFILE_PATCH, PROFILE_BASE_ENV)
+            .unwrap_or_else(|e| panic!("{e}; {KIND_SIZING_RESTORE}"));
+        assert!(!overrides.is_empty());
+        for PatchOverride { key, .. } in &overrides {
+            assert!(
+                !key.starts_with("MEDIA_AUDIO_"),
+                "{KIND_TEST_PROFILE_PATCH} overrides {key}: the Kind test profile changes video \
+                 only (R-28) — every MEDIA_AUDIO_* key is inherited from {PROFILE_BASE_ENV}"
+            );
+        }
+    }
+
+    /// The restore command every failure prints is verbatim the one the
+    /// Kind test-profile patch header documents (two encodings, one command).
+    #[test]
+    fn the_restore_command_matches_the_patch_header() {
+        let path = crate::repo_root().join(KIND_TEST_PROFILE_PATCH);
+        let header =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(
+            header.contains("PRODUCTION-QUALITY DEMO"),
+            "wrong file read"
+        );
+        assert!(
+            header.contains(KIND_SIZING_RESTORE_CMD),
+            "{KIND_TEST_PROFILE_PATCH}'s header no longer carries `{KIND_SIZING_RESTORE_CMD}` \
+             verbatim: update KIND_SIZING_RESTORE_CMD and the header together"
+        );
     }
 }

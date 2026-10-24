@@ -190,7 +190,12 @@ run_check() {
   if [[ -n "${RUN_CHECK_LEVERS:-}" ]]; then levers_env=(); fi
   local -a levers_set=()
   if [[ -n "${RUN_CHECK_LEVERS:-}" ]]; then levers_set=("DT_TEST_LEVERS=${RUN_CHECK_LEVERS}"); fi
-  RUN_OUT="$(cd "$root" && env "${unset_env[@]}" "${tone_env[@]}" "${levers_env[@]}" "${tone_set[@]}" "${levers_set[@]}" "${n_env[@]}" PATH="${stubs}:${TOOLBOX}" AC_PORT=1 GC_PORT=2 \
+  # Same for the test-pattern opt-in (RUN_CHECK_PATTERN).
+  local -a pattern_env=(-u DT_TEST_PATTERN)
+  if [[ -n "${RUN_CHECK_PATTERN:-}" ]]; then pattern_env=(); fi
+  local -a pattern_set=()
+  if [[ -n "${RUN_CHECK_PATTERN:-}" ]]; then pattern_set=("DT_TEST_PATTERN=${RUN_CHECK_PATTERN}"); fi
+  RUN_OUT="$(cd "$root" && env "${unset_env[@]}" "${tone_env[@]}" "${levers_env[@]}" "${pattern_env[@]}" "${tone_set[@]}" "${levers_set[@]}" "${pattern_set[@]}" "${n_env[@]}" PATH="${stubs}:${TOOLBOX}" AC_PORT=1 GC_PORT=2 \
     bash "$root/scripts/dev-web.sh" --check 2>&1 || true)"
 }
 
@@ -730,6 +735,20 @@ RUN_CHECK_LEVERS=1 run_check "$root" "$stubs"
 out_levers="$(plain "$RUN_OUT")"
 assert_status "levers-state-on-when-set" "test levers: ON requested (DT_TEST_LEVERS=1;" "$out_levers"
 assert_absent "levers-state-not-off-when-set" "test levers: OFF" "$out_levers"
+# The video sibling, the test-pattern define (story 3 R-27), the same way.
+assert_status "pattern-state-off-when-unset" "test pattern: OFF (DT_TEST_PATTERN unset)" "$out"
+assert_absent "pattern-state-not-on-when-unset" "test pattern: ON" "$out"
+RUN_CHECK_PATTERN=1 run_check "$root" "$stubs"
+out_pattern="$(plain "$RUN_OUT")"
+assert_status "pattern-state-on-when-set" "test pattern: ON requested (DT_TEST_PATTERN=1;" "$out_pattern"
+assert_absent "pattern-state-not-off-when-set" "test pattern: OFF" "$out_pattern"
+# The codec-profile line NAMES the Kind test-profile patch (the profile's one
+# home) and prints — never runs — the live read, resolved through the name
+# mc-0's Deployment references (content-addressed, ADR-0038 §2).
+assert_status "profile-line-names-the-patch" \
+  "codec profile: the committed Kind overlay runs the lower TEST profile in infra/kubernetes/overlays/kind/services/media-codec-profile/configmap-test-profile-patch.yaml" "$out"
+assert_status "profile-line-prints-live-cmd" \
+  "kubectl get cm -n dark-tower -o jsonpath='{.data.MEDIA_VIDEO_WIDTH}'" "$out"
 assert_absent "slots-default-no-notice" "$NOTICE_TEXT" "$out"
 assert_absent "slots-default-no-cannot-verify" "receive slots: CANNOT VERIFY" "$out"
 assert_absent "slots-default-not-video-off" "$VIDEO_OFF_TEXT" "$out"
@@ -893,6 +912,43 @@ assert_status "help-n-plus-1-distinct-accounts" "N+1 DISTINCT REGISTERED ACCOUNT
 assert_status "help-auth-not-shared-cited"      "packages/web-app/src/App.svelte" "$help_out"
 assert_status "help-tabs-question-unverified"   "UNVERIFIED" "$help_out"
 assert_status "help-names-test-tone-define"     "__DT_TEST_TONE__" "$help_out"
+assert_status "help-names-test-pattern-define"  "__DT_TEST_PATTERN__" "$help_out"
+assert_status "help-video-demo-launch-line"     "DT_TEST_TONE=1 DT_TEST_PATTERN=1 scripts/dev-web.sh" "$help_out"
+assert_status "help-video-demo-names-patch"     "media-codec-profile/configmap-test-profile-patch.yaml" "$help_out"
+# The test profile has ONE home, the Kind patch: --help names it and never
+# restates a value from it (each of the patch's values, read from the patch).
+__pvs="$(sed -n 's/^  MEDIA_[A-Z_]*: "\([0-9]*\)"$/\1/p' "$REPO_ROOT/infra/kubernetes/overlays/kind/services/media-codec-profile/configmap-test-profile-patch.yaml")"
+# Non-vacuity: the extraction must find the patch's values, or the loop below
+# asserts nothing.
+if [[ -z "$__pvs" ]]; then
+  FAIL=$((FAIL + 1))
+  FAILURES+=("[help-profile-values-extracted] no quoted integer MEDIA_* value read from the Kind test-profile patch: the no-restatement check below would be vacuous")
+else
+  PASS=$((PASS + 1))
+fi
+while IFS= read -r __pv; do
+  assert_absent "help-no-restated-profile-value-${__pv}" "${__pv}" "$(printf '%s' "$help_out" | grep -F -e 'profile' -e 'fps' -e 'kbps' -e 'resolution' || true)"
+done <<<"$__pvs"
+unset __pv __pvs
+# ...and, with NO line filter, the DISTINCTIVE forms of a restatement anywhere
+# in --help: WxH (x or ×, with or without spaces) and the bitrate. Each value is
+# read from the patch by KEY, with its own non-vacuity check.
+__patch="$REPO_ROOT/infra/kubernetes/overlays/kind/services/media-codec-profile/configmap-test-profile-patch.yaml"
+__pkey() { sed -n "s/^  $1: \"\([0-9]*\)\"\$/\1/p" "$__patch"; }
+__w="$(__pkey MEDIA_VIDEO_WIDTH)"; __h="$(__pkey MEDIA_VIDEO_HEIGHT)"; __br="$(__pkey MEDIA_VIDEO_MAX_BITRATE_BPS)"
+for __kv in "MEDIA_VIDEO_WIDTH=$__w" "MEDIA_VIDEO_HEIGHT=$__h" "MEDIA_VIDEO_MAX_BITRATE_BPS=$__br"; do
+  if [[ -z "${__kv#*=}" ]]; then
+    FAIL=$((FAIL + 1))
+    FAILURES+=("[help-profile-key-extracted] ${__kv%%=*} not read from the Kind test-profile patch: the restatement check would be vacuous")
+  else
+    PASS=$((PASS + 1))
+  fi
+done
+for __form in "${__w}x${__h}" "${__w}×${__h}" "${__w} x ${__h}" "${__w} × ${__h}" "${__br}"; do
+  assert_absent "help-no-restated-profile-form-${__form}" "${__form}" "$help_out"
+done
+unset __patch __w __h __br __kv __form
+unset -f __pkey
 assert_status "help-names-audio-slots-var"      "VITE_DT_AUDIO_RECEIVE_SLOTS" "$help_out"
 assert_status "help-names-video-slots-var"      "VITE_DT_VIDEO_RECEIVE_SLOTS" "$help_out"
 assert_status "help-one-n-per-dev-server"       "ONE value per dev server" "$help_out"

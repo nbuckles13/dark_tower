@@ -140,6 +140,47 @@
 #   it serves gets the same N and M; re-run the script to change them. The
 #   retired single-N VITE_DT_RECEIVE_SLOTS fails the preflight if set.
 #
+# VIDEO DEMO — SEE AND HEAR (story 2026-10-07-see-each-other, R-27):
+#   Accounts and contexts: exactly as N+1 PARTICIPANTS ON ONE MACHINE above —
+#   N+1 distinct registered accounts, one per browsing context, demo Chrome
+#   profiles recommended for the reasons given there. Video adds one more:
+#   CAMERA CONTENTION. One physical webcam generally cannot be opened by
+#   several browser profiles at once (notably on a WSL2/Windows host), so a
+#   real camera serves ONE participant per physical camera.
+#   Several participants on one machine: the synthetic TEST-PATTERN camera, a
+#   Vite BUILD-TIME define __DT_TEST_PATTERN__ (owned by the client, defined in
+#   packages/web-app/vite/testDefines.ts beside __DT_TEST_TONE__; never a
+#   runtime setting, absent from production bundles — a production build that
+#   asks for it fails). Each participant's pattern is derived from its
+#   per-meeting sender id and changes every frame. It replaces the camera
+#   in-app, so no camera prompt and no browser flag of any kind is involved.
+#   It covers VIDEO only — audio still opens the microphone unless the test
+#   tone is on — so the one-machine multi-participant launch is:
+#       DT_TEST_TONE=1 DT_TEST_PATTERN=1 scripts/dev-web.sh
+#   Like N and M it is ONE setting per dev server: every tab and profile this
+#   server serves gets the pattern, or none does — there is no per-tab mix of
+#   a real camera and test patterns. A demo with participants on other
+#   machines is not available either: see WHY NOT A SECOND MACHINE above.
+#   Kind runs a lower TEST codec profile (lower resolution and frame rate than
+#   production), set ONLY in
+#   infra/kubernetes/overlays/kind/services/media-codec-profile/configmap-test-profile-patch.yaml
+#   (values there, not here). Every participant of this demo inherits it.
+#   Production quality: remove or edit that one patch and redeploy
+#   (infra/kind/scripts/deploy.sh; devloop container: `dev-cluster deploy`);
+#   restore it with `git checkout` plus a deploy BEFORE running Layer 7. Either
+#   switch rolls mc-0, mc-1, mh-0 and mh-1 and DROPS LIVE MEETINGS, and at the
+#   production profile MH's egress stream ceiling is much lower, so check it
+#   against your meeting size first. The full procedure — the ceiling check,
+#   the budget it may also need, and the one-line restore — is that patch's
+#   header; it is not restated here.
+#   Local camera/mic self-check (R-7): a client debug option, off by default,
+#   that shows or plays your own capture locally only — never through the
+#   encoder, a media handler or the network.
+#   Video off cluster-wide: MC_MAX_VIDEO_RECEIVE_SLOTS=0 in
+#   infra/services/mc-service/config.env is the video-off lever (every video
+#   slot shows unavailable, audio untouched); the receive-slots preflight
+#   below reports it as "video disabled".
+#
 # Usage:
 #   scripts/dev-web.sh              # preflight + install (if needed) + dev server
 #   scripts/dev-web.sh --check      # preflight only, do not install or launch
@@ -692,6 +733,9 @@ done
 # devloop cluster the live values can differ, so every cap message prints the
 # live command, and the in-cluster AUTHORITY is MC's own counters.
 MC_SHARED_CONFIGMAP="infra/services/mc-service/config.env"
+# The Kind TEST codec profile (story 3 R-28), named — never read — by the
+# banner below; its values and the production-quality procedure live there.
+KIND_TEST_PROFILE_PATCH="infra/kubernetes/overlays/kind/services/media-codec-profile/configmap-test-profile-patch.yaml"
 if [[ -n "${VITE_DT_AUDIO_RECEIVE_SLOTS+x}" ]]; then
     N_SOURCE="set by you"
 else
@@ -717,13 +761,16 @@ int_gt() {
     (( ${#1} > ${#2} )) || { (( ${#1} == ${#2} )) && [[ "$1" > "$2" ]]; }
 }
 
-cap_live_value_cmd() {
-    # SHARED ConfigMap (consumed by mc-0 AND mc-1), namespace spelled out: without
-    # -n the command returns NotFound in another namespace, which reads as "the
-    # cluster has no cap either". Its NAME carries a content hash (ADR-0038 §2:
-    # `mc-service-config-<hash>`), so it is resolved through the name mc-0's
-    # Deployment actually references — the same move as wt_live_value_cmd, which
-    # this deliberately does not reuse because that derives PER-INSTANCE names.
+mc0_live_value_cmd() {
+    # The live value of KEY in whichever SHARED ConfigMap mc-0's Deployment
+    # references for the env var KEY (key == env name): `mc-service-config-<hash>`
+    # for the slot caps, `media-codec-profile-<hash>` for the codec-profile line.
+    # Both are content-addressed (ADR-0038 §2), so the name is resolved through
+    # mc-0's own configMapKeyRef rather than guessed — the same move as
+    # wt_live_value_cmd, which this deliberately does not reuse because that
+    # derives PER-INSTANCE names. Namespace spelled out: without -n the command
+    # returns NotFound in another namespace, which reads as "the cluster has no
+    # value either". A static string with KEY substituted; never executed here.
     local key="$1"
     printf "kubectl get cm -n dark-tower -o jsonpath='{.data.%s}' \"\$(kubectl get deployment/mc-0 -n dark-tower -o jsonpath='{.spec.template.spec.containers[?(@.name==\"mc-service\")].env[?(@.name==\"%s\")].valueFrom.configMapKeyRef.name}')\"" "$key" "$key"
 }
@@ -748,8 +795,8 @@ cap_authority_note() {
     echo "      Those caps are an ON-DISK pre-flight read. In the cluster, MC truncates and reports"
     echo "      each excess slot on mc_media_slot_states_total{slot_state=\"unavailable\"}"
     echo "      (docs/observability/metrics/mc-service.md)."
-    echo "      Live audio cap: $(cap_live_value_cmd MC_MAX_AUDIO_RECEIVE_SLOTS)"
-    echo "      Live video cap: $(cap_live_value_cmd MC_MAX_VIDEO_RECEIVE_SLOTS)"
+    echo "      Live audio cap: $(mc0_live_value_cmd MC_MAX_AUDIO_RECEIVE_SLOTS)"
+    echo "      Live video cap: $(mc0_live_value_cmd MC_MAX_VIDEO_RECEIVE_SLOTS)"
 }
 
 # read_slot_cap KEY — set SLOT_CAP_VALUE to the cap's value and return 0, or
@@ -772,7 +819,7 @@ read_slot_cap() {
         echo "      key never satisfies it. Nothing to fix locally: report it."
         echo "      The live value discriminates: present live but not on disk means the file"
         echo "      drifted; absent in both means the key really is gone:"
-        echo "        $(cap_live_value_cmd "$key")"
+        echo "        $(mc0_live_value_cmd "$key")"
         return 1
     fi
     SLOT_CAP_VALUE="${cap_line#"${key}"=}"
@@ -783,7 +830,7 @@ read_slot_cap() {
         echo "      either). The bound's figures live in crates/mc-service/src/config.rs and are"
         echo "      deliberately not restated here."
         echo "      Not your environment. Nothing to fix locally: report it."
-        echo "      Live value for comparison: $(cap_live_value_cmd "$key")"
+        echo "      Live value for comparison: $(mc0_live_value_cmd "$key")"
         SLOT_CAP_VALUE=""
         return 1
     fi
@@ -816,8 +863,8 @@ check_receive_slots() {
         echo "      run must never read as one that passed."
         echo "      The live values discriminate the cause — set there but not on disk means the"
         echo "      file drifted; absent in both is larger:"
-        echo "        $(cap_live_value_cmd MC_MAX_AUDIO_RECEIVE_SLOTS)"
-        echo "        $(cap_live_value_cmd MC_MAX_VIDEO_RECEIVE_SLOTS)"
+        echo "        $(mc0_live_value_cmd MC_MAX_AUDIO_RECEIVE_SLOTS)"
+        echo "        $(mc0_live_value_cmd MC_MAX_VIDEO_RECEIVE_SLOTS)"
         return
     fi
     # Each key is read on its own: an unreadable audio cap must not hide an
@@ -856,6 +903,20 @@ if [[ -n "${DT_TEST_TONE:-}" ]]; then
 else
     echo "  test tone: OFF (DT_TEST_TONE unset) — every participant sends its microphone"
 fi
+# The video sibling (story 3 R-27), echoed for the same reason and under the
+# same rule: vite/testDefines.ts is the one predicate, not this script.
+if [[ -n "${DT_TEST_PATTERN:-}" ]]; then
+    echo "  test pattern: ON requested (DT_TEST_PATTERN=${DT_TEST_PATTERN}; vite.config.ts accepts only 1 and fails the launch otherwise)"
+else
+    echo "  test pattern: OFF (DT_TEST_PATTERN unset) — every participant opens its camera"
+fi
+# Which codec profile the demo runs. INFORMATIONAL and never executed: the
+# script prints the static live-read command rather than running kubectl, so no
+# cluster value is ever interpolated into shell, and it never restates the
+# profile's values (their one home is the patch).
+echo "  codec profile: the committed Kind overlay runs the lower TEST profile in ${KIND_TEST_PROFILE_PATCH}"
+echo "      (production quality: that file's header). The cluster runs whatever was last deployed — live check:"
+echo "      $(mc0_live_value_cmd MEDIA_VIDEO_WIDTH)"
 # Its sibling define, echoed for the same reason: with DT_TEST_LEVERS unset the
 # lever branch is statically dead, so `window.__dt_test_levers__` is a silent
 # no-op. Same rule — not validated here; the E2E bus `buildKnobs.testLevers` is the
@@ -920,6 +981,7 @@ echo "   N+1 participants (N=${VITE_DT_AUDIO_RECEIVE_SLOTS} audio, ${N_SOURCE}; 
 echo "   THIS machine — demo Chrome profiles recommended, one per participant — each signed"
 echo "   in as a DISTINCT registered account, all joining the same meeting code."
 echo "   Audio for N-way: the test-tone build (DT_TEST_TONE=1 -> __DT_TEST_TONE__, see --help), not one shared mic."
+echo "   Video for N-way: the test-pattern build (DT_TEST_PATTERN=1 -> __DT_TEST_PATTERN__, see --help VIDEO DEMO), not one shared camera."
 echo
 # Launch through the Nx `dev` target, NOT `pnpm --filter … dev`. The web-app
 # `dev` target declares `dependsOn: proto-gen:codegen`, so Nx generates the

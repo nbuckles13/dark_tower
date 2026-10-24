@@ -25,6 +25,8 @@
 //! - GC telemetry config = compiled defaults (the ConfigMap does NOT override
 //!   them): max payload 256 KiB, per-user rate limit 60/min (per-pod, in-memory).
 //!   See the reverse cross-ref comment in `infra/services/gc-service/config.env`.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "flows")]
 

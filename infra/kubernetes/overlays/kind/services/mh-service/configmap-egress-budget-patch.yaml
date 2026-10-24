@@ -1,4 +1,5 @@
-# Kind dev-cluster egress budget (story 2 R-19), strategic-merge patch.
+# Kind dev-cluster egress budget (story 2 R-19; re-sized for story 3 R-24),
+# strategic-merge patch.
 #
 # The prod base (infra/services/mh-service/config.env) ships
 # MH_EGRESS_BUDGET_BPS as a deliberately-unsized placeholder. That placeholder
@@ -9,67 +10,84 @@
 #
 # SIZED AGAINST A STATED REQUIREMENT — this is the only place the sizing lives.
 #
-#   Requirement: P participants each filling N audio plus M video receive
-#   slots is P x (N + M) egress edges, one egress stream per edge. The
-#   recommended minimum MH publishes (`mh_media_egress_stream_ceiling_
-#   recommended_min`) is that formula at the story-3 demo size, and this
-#   budget must clear it.
-#
 #   Formula: MH derives its stream ceiling as
 #       ceiling = MH_EGRESS_BUDGET_BPS / max(derived audio cost,
 #                                            derived video cost)
 #   rounded down, where each derived cost is MEDIA_*_MAX_BITRATE_BPS plus a
 #   per-frame overhead (derived in MH code from the frame layout) x
-#   MEDIA_*_FRAME_RATE_HZ, both read from the media-codec-profile Kind runs
+#   MEDIA_*_FRAME_RATE_HZ, both read from the media-codec-profile Kind runs —
+#   the Kind TEST profile, ../media-codec-profile/configmap-test-profile-patch.yaml
 #   (`EgressAdmission` in crates/mh-service/src/config.rs). It divides by the
 #   larger cost so MH stays type-blind. No cost or ceiling figure is restated
-#   here: read the effective ceiling from `mh_media_egress_stream_ceiling`.
+#   here: read the effective ceiling from `mh_media_egress_stream_ceiling`
+#   (and MH's startup log, which also prints both derived costs).
+#   This bitrate-derived model is INTERIM (see the profile.env header).
 #
-#   RE-SIZED when MH began deriving the costs (the derived video cost is far
-#   below the retired configured one), so that the derived ceiling stays where
-#   the S9 window below needs it; INF-C re-sizes it again when Kind moves to the
-#   lower test codec profile. BUDGET AND IMAGE ROLL BACK TOGETHER: an image
-#   that predates the derivation divides this budget by the retired
-#   `MH_STREAM_COST_VIDEO_BPS` instead, which puts its ceiling below the demo
-#   requirement — roll this patch back with such an image.
-#   So this value must satisfy, against the DEPLOYED costs, a TWO-SIDED window:
-#     lower:  ceiling >= P x (N + M) at the demo size     (the demo requirement)
-#     upper:  2 x ceiling < MAX_S9_PARTICIPANTS x slot_cap (the S9 exhaustion
-#             test, 28_mh_egress_admission.rs, must still be able to drive a
-#             registration past the ceiling at an affordable meeting size;
-#             limit and rule have one home in
-#             crates/env-tests/src/fixtures/egress_admission.rs)
+#   A TWO-SIDED window, per handler, against the DEPLOYED ceiling. Every
+#   constant has ONE home, crates/env-tests/src/fixtures/egress_admission.rs;
+#   they are named here, not restated:
+#     lower:  ceiling >= max(DEMO P x (N + M), MAX_PER_FILE_EDGE_SUM)
+#                        + RETAINED_EDGE_FLOOR        (`kind_window_lower_bound`)
+#             — the largest load that must fit on ONE handler at once: the
+#             story-3 see-and-hear demo, or the largest concurrent edge sum
+#             of any one env-test file (cargo runs test binaries one after
+#             another, so only one file's fns overlap; each file records its
+#             sum in its `Edge-sum` header line, checked hermetically against
+#             MAX_PER_FILE_EDGE_SUM), PLUS the edges disconnected participants
+#             of the PREVIOUS file still hold (below). Counting it per handler
+#             is conservative: a file's meetings may spread over both MHs.
+#     upper:  2 x ceiling < MAX_S9_PARTICIPANTS x MC_MAX_AUDIO_RECEIVE_SLOTS
+#                                                 (`max_s9_feasible_ceiling`)
+#             — the S9 exhaustion test (28_mh_egress_admission.rs) must still
+#             be able to drive a registration past the ceiling within its
+#             participant limit; S9 declares AUDIO slots only, so the audio cap
+#             bounds it. That test is the evidence admission control refuses.
+#   The value below sits mid-window. If a change ever makes the window empty,
+#   or narrower than the retained floor, that is an escalation: do NOT shrink
+#   the floor, shorten the grace period or serialise the env-tests to fit
+#   (each was considered and rejected in story 2 or story 3 planning).
 #
-# WHY THIS VALUE (story 2 task 10), and why it is DEV HEADROOM, NOT A CAPACITY
-# MODEL. It was 2.5x smaller, sized for the N = 5 demo alone. During story 2 task
-# 20's Gate 2, mh-0 reached 39 of 40 installed streams and refused a
-# registration outright. The cause was NOT real load: disconnected
-# participants hold their edges through MC's reconnect grace window
-# (MC_DISCONNECT_GRACE_PERIOD_SECONDS, 30 s default) while Layer-7 suites run
-# back to back, so edges from suites that had finished were still installed.
-# Raising the budget MASKS that edge retention — it lifts the ceiling above
-# the retained floor — and a reader of the unreclaimed-edge-floor triage arm
-# (MH incident runbook, egress-budget exhaustion scenario) must know the Kind
-# ceiling was moved for that reason.
+# THE RETAINED-EDGE FLOOR, and why this is DEV HEADROOM, NOT A CAPACITY
+# MODEL. During story 2 task 20's Gate 2, mh-0 reached 39 of 40 installed
+# streams and refused a registration outright. The cause was NOT real load:
+# disconnected participants hold their edges through MC's reconnect grace
+# window (MC_DISCONNECT_GRACE_PERIOD_SECONDS) while Layer-7 suites run back to
+# back, so edges from suites that had finished were still installed. Sizing
+# above that floor MASKS the retention — and a reader of the
+# unreclaimed-edge-floor triage arm (MH incident runbook, egress-budget
+# exhaustion scenario) must know the Kind ceiling was moved for that reason.
 #   Considered and not taken: a shorter Kind grace period. It would remove the
 #   retention at its source, but Kind would then diverge from the grace
 #   behaviour the reconnect tests exercise, trading a capacity symptom for a
 #   dev-vs-prod behavioural gap.
-#   Why not ~10x: the upper side of the window. At 10x the ceiling is far
-#   above what S9 can exceed within its participant limit (the test would fail
-#   its own precondition), and a Kind pod (1Gi) carrying hundreds of egress
-#   streams during S9 risks an OOMKill that takes every meeting on the pod
-#   down — a worse, harder-to-diagnose failure than a clean admission refusal.
-#   The value below sits mid-window: 2.5x the observed peak, S9 at 26 of its
-#   40-participant limit.
+#   Why not far higher: the upper side of the window, and memory. A Kind pod
+#   (1Gi) carrying hundreds of egress streams during S9 risks an OOMKill that
+#   takes every meeting on the pod down — a worse, harder-to-diagnose failure
+#   than a clean admission refusal. Mid-window keeps S9's load bounded by the
+#   same participant limit that bounds its cost.
 #
-# That relationship is ENFORCED, not asserted here: see
+# BUDGET AND PROFILE ROLL BACK TOGETHER. This value is sized for the Kind TEST
+# profile. Reverting either without the other puts the ceiling outside the
+# window: the production profile under this budget falls below the demo
+# requirement, and the test profile under the previous budget rises above
+# S9's reach. The same holds for a production-quality demo (procedure in the
+# profile patch header): after removing the test profile, compare
+# `mh_media_egress_stream_ceiling` with the demo meeting's P x (N + M); a
+# larger meeting also needs this value raised — and BOTH files restored
+# (`git checkout`) and redeployed before Layer 7.
+# BUDGET AND IMAGE ROLL BACK TOGETHER, too: an image that predates MH's cost
+# derivation divides this budget by the retired `MH_STREAM_COST_VIDEO_BPS`
+# instead, which puts its ceiling below the demo requirement — roll this patch
+# back with such an image.
+#
+# That window is ENFORCED, not asserted here: see
 #   crates/env-tests/tests/01_mh_deployment_config.rs::test_kind_egress_stream_ceiling_meets_demo_requirement
-# which reads the budget and the codec profile from the LIVE ConfigMaps,
-# derives the costs independently of MH's code, and fails if the derived
-# ceiling falls outside that window (either side). No ceiling literal is written
-# here on purpose — a restated result goes stale the moment either cost moves;
-# the test does not.
+# which reads `mh_media_egress_stream_ceiling` from EACH live MH pod (the value
+# admission enforces and GC is told) and fails if it falls outside the window
+# on either side, with a distinct failure when this overlay did not apply.
+# No ceiling literal is written here on purpose — a restated result goes
+# stale the moment the profile or MH's overhead constant moves; the test does
+# not.
 #
 # WHY UNDER-SIZING IS DANGEROUS HERE, SPECIFICALLY. A budget that is too small
 # makes MH reject admission partway through the largest scenario. That presents
@@ -96,4 +114,4 @@ metadata:
   name: mh-service-config
   namespace: dark-tower
 data:
-  MH_EGRESS_BUDGET_BPS: "82640000"
+  MH_EGRESS_BUDGET_BPS: "35600000"

@@ -1,12 +1,16 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# The shared media codec profile in the Kind environment. No patch today: Kind
-# runs the production profile. The Kind test profile (story 3 R-28) lands here
-# as ONE patch on `media-codec-profile`; removing that patch and redeploying is
-# how a demo gets production quality.
+# The shared media codec profile in the Kind environment. Kind runs the lower
+# TEST profile (story 3 R-28) as ONE strategic-merge patch on
+# `media-codec-profile`; why, what it changes, the production-quality demo
+# procedure (delete the `patches:` entry below and redeploy) and how to
+# restore it are all in configmap-test-profile-patch.yaml's header.
 resources:
   - ../../../../../services/media-codec-profile
+
+patches:
+  - path: configmap-test-profile-patch.yaml
 
 labels:
   - pairs:

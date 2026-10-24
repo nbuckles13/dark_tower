@@ -2,6 +2,8 @@
 //!
 //! These tests validate that the local kind cluster and port-forwards are running
 //! correctly. All other tests depend on these passing.
+//!
+//! Edge-sum (concurrent Σ P×(N+M)): 0
 
 #![cfg(feature = "smoke")]
 

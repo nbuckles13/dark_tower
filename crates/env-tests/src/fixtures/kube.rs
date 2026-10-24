@@ -69,6 +69,18 @@ pub fn configmap_name_for(instance: &str, base: &str) -> String {
 /// [`configmap_name_for_all`]. One home for the deployment-config suites.
 pub const PROFILE_CONFIGMAP: &str = "media-codec-profile";
 
+/// The Kind MH instances (the per-instance Deployments `mh-0`, `mh-1`). ONE
+/// list for every suite that reads per-instance MH state, so a caller of
+/// `gauge_by_live_pod` / [`configmap_name_for_all`] cannot pass a partial set.
+pub const MH_INSTANCES: &[&str] = &["mh-0", "mh-1"];
+
+/// The Kind MC instances (`mc-0`, `mc-1`). See [`MH_INSTANCES`].
+pub const MC_INSTANCES: &[&str] = &["mc-0", "mc-1"];
+
+/// Every reader of [`PROFILE_CONFIGMAP`]: MC and MH, which roll together on a
+/// profile change and must resolve ONE generation.
+pub const PROFILE_READERS: &[&str] = &["mc-0", "mc-1", "mh-0", "mh-1"];
+
 /// [`configmap_name_for`] over SEVERAL instances that must share one
 /// generation (e.g. both MH instances read `mh-service-config`). Resolving from
 /// one instance and checking another would blame the wrong thing mid-rollout,
@@ -502,5 +514,11 @@ mod tests {
     fn no_instances_is_an_error() {
         let err = agree_on_generation(&[], BASE, vec![]).unwrap_err();
         assert!(err.contains("no instances"), "{err}");
+    }
+
+    #[test]
+    fn profile_readers_are_exactly_mc_then_mh() {
+        let both: Vec<&str> = MC_INSTANCES.iter().chain(MH_INSTANCES).copied().collect();
+        assert_eq!(PROFILE_READERS, both.as_slice());
     }
 }
