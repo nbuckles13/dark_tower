@@ -48,6 +48,15 @@ spec:
     ports:
     - protocol: TCP
       port: 8082
+  # Allow ingress from external clients (browser sign-in / token acquisition via the
+  # NodePort in Kind, the ingress gateway in production). Mirrors gc-service's rule.
+  # Spike S6 finding: locally this passed only because rootless podman rewrites the
+  # host's source address; a rootful Docker runner delivers the real source and
+  # Calico enforces the policy.
+  - from: []
+    ports:
+    - protocol: TCP
+      port: 8082
   # Allow ingress from Prometheus for metrics scraping
   - from:
     - namespaceSelector:
