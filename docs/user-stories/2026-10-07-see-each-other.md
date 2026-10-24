@@ -2596,7 +2596,7 @@ tasks:
   slug: 2026-10-24-c-c1-see-each-other-grid
   tag: story-2026-10-07-see-each-other-task-17
 - id: 18
-  status: pending
+  status: completed
   specialist: client
   deps:
   - 13
@@ -2647,6 +2647,7 @@ tasks:
     - Loopback never passes through the encoder, packetiser or handler.
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-24-c-c2-debug-panel
   tag: story-2026-10-07-see-each-other-task-18
 - id: 19
   status: pending
