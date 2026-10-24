@@ -69,6 +69,6 @@ Definitions: `.claude/agents/*.md`
 - `/devloop "task"` - Implementation via Agent Teams (`.claude/skills/devloop/SKILL.md`)
 - `/debate "question"` - Cross-cutting design decisions (`.claude/skills/debate/SKILL.md`)
 - `/user-story "story"` - Story decomposition (`.claude/skills/user-story/SKILL.md`)
-- `scripts/workflow/run-story.sh` - Unattended story runner: one headless devloop per manifest task (ADR-0035)
+- `scripts/workflow/run-story.sh` - Unattended story runner: one headless devloop per manifest task (ADR-0035); watch it with `scripts/workflow/devloop-log.sh` (host or container)
 - `/close-story` - Story completion: completeness check, story-scope reflection, PR
 - `infra/devloop/devloop.sh <slug>` - Containerized devloop (ADR-0025); `/absorb-devloop <slug>` brings its commits back; `/devloop-status` lists loops
