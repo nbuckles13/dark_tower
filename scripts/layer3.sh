@@ -204,6 +204,12 @@ layer_lifecycle_begin 3
   # over copies of the real protos; no cluster, no network, no cargo. Deliberately NOT under
   # guards/simple/ for the same `find -name '*.sh'` reason as its neighbours.
   run_and_emit "internal-proto-no-key-material-selftest" "${__here}/guards/validate-internal-proto-no-key-material.test.sh" || true
+  # Proto no-Any SELF-TEST (the premise of buf.yaml's MESSAGE_NO_DELETE exception; rule
+  # @protocol, machinery @infrastructure). Same reason as above: the guard is green by
+  # construction in-tree, so its import/type/vacuity branches are driven here over copies of
+  # the real protos via the DEVLOOP_TEST-gated PROTO_NO_ANY_GUARD_ROOT seam, asserting rc AND
+  # token. No cluster, no network, no cargo. Not under guards/simple/ (find -name '*.sh').
+  run_and_emit "proto-no-any-selftest" "${__here}/guards/validate-proto-no-any.test.sh" || true
   # _common.sh unit tests (ADR-0037 §D7 wires this in — it was orphaned/unrun, docs/TODO.md:2006). Hosts
   # the STATUS-aggregation precedence, fail_fast_mode, AND the fmt_mode truth table (incl. the two
   # load-bearing apply-opt-in-loses-to-CI/override cells). Hermetic: pure bash, no cargo/cluster/network.
