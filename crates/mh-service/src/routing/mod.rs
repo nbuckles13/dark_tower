@@ -1463,24 +1463,35 @@ impl RoutingTable {
 
     /// Sample every installed edge's pending stamp and publish the pod-wide
     /// `mh_media_edges_pending` (count) and `mh_media_edge_pending_oldest_seconds`
-    /// (max age; 0 when nothing is pending). Called from the session actor's
-    /// tick — the single writer — never per frame.
-    #[expect(clippy::cast_precision_loss, reason = "an edge count far below 2^52")]
+    /// (max age; 0 when nothing is pending), and sum every edge's destination
+    /// backlog into `mh_media_egress_stream_backlog_bytes`. Called from the
+    /// session actor's tick — the single writer — never per frame or per chunk.
+    /// Blind spot of the backlog sum: a writer still draining after its edge
+    /// left the snapshot is not counted (a short tail).
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "an edge count and a backlog byte sum (bounded by cap x stream ceiling) far below 2^52"
+    )]
     pub fn publish_pending(&self, now: tokio::time::Instant) {
         let snapshot = self.snapshot.load();
         let mut count = 0usize;
         let mut oldest = std::time::Duration::ZERO;
+        let mut backlog = 0usize;
         for routes in snapshot.meetings.values() {
             for cell in routes.cells() {
                 if let Some(since) = cell.pending_since() {
                     count += 1;
                     oldest = oldest.max(now.saturating_duration_since(since));
                 }
+                backlog = backlog.saturating_add(cell.backlog_used());
             }
         }
         let handles = &self.edge_context.handles;
         handles.edges_pending().set(count as f64);
         handles.edge_pending_oldest().set(oldest.as_secs_f64());
+        // Story 3 R-21: the stream backlog in use, summed on this same tick
+        // from every destination budget (off the hot path; never per chunk).
+        handles.egress_stream_backlog_bytes().set(backlog as f64);
     }
 
     /// `STREAM_PER_GROUP` source streams declared across every installed

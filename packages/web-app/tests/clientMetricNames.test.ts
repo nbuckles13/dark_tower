@@ -26,13 +26,17 @@ import {
   ALL_ASSERTED_CLIENT_NAMES,
   MISSING_KEY_MATERIAL_ALERT,
   MISSING_KEY_MATERIAL_SELECTED_NAMES,
+  MISSING_KEY_MATERIAL_GROUPING,
+  MISSING_KEY_MATERIAL_SUM_COUNT,
   clientNamesIn,
+  sumGroupingsIn,
   reasonAlternationIn,
   MEDIA_KIND_AUDIO,
 } from '../e2e/clientMetricNames.js';
 
 const REPO = resolve(__dirname, '../../..');
 const RULES = resolve(REPO, 'infra/docker/prometheus/rules/mc-alerts.yaml');
+const CLIENT_RULES = resolve(REPO, 'infra/docker/prometheus/rules/client-alerts.yaml');
 const EMITTER = resolve(REPO, 'packages/sdk-core/src/media/setup/mediaMetrics.ts');
 
 /**
@@ -96,6 +100,17 @@ describe('alertExpr (the structural extractor) — self-test', () => {
   });
 });
 
+describe('sumGroupingsIn — self-test', () => {
+  it('reports grouped, bare and unrecognised sums in order', () => {
+    expect(sumGroupingsIn('sum by (media_kind) (rate(a[5m])) / sum(rate(b[5m]))')).toEqual([
+      'media_kind',
+      '',
+    ]);
+    expect(sumGroupingsIn('sum without (x) (a)')).toEqual(['<unrecognised sum shape>']);
+    expect(sumGroupingsIn('max(a)')).toEqual([]);
+  });
+});
+
 describe(`${MISSING_KEY_MATERIAL_ALERT} <-> clientMetricNames <-> emitter`, () => {
   const expr = alertExpr(readFileSync(RULES, 'utf8'), MISSING_KEY_MATERIAL_ALERT);
 
@@ -133,6 +148,18 @@ describe(`${MISSING_KEY_MATERIAL_ALERT} <-> clientMetricNames <-> emitter`, () =
     expect(unknown, 'reason-drift: the rule selects reasons the SDK never emits').toEqual([]);
   });
 
+  it('is PER KIND: numerator, denominator AND guard are all `sum by (media_kind)`', () => {
+    const groupings = sumGroupingsIn(expr ?? '');
+    expect(
+      groupings.length,
+      `grouping-count: expected ${MISSING_KEY_MATERIAL_SUM_COUNT} sum aggregations (numerator, denominator, guard)`,
+    ).toBe(MISSING_KEY_MATERIAL_SUM_COUNT);
+    expect(
+      groupings,
+      'grouping-drift: every sum must group by media_kind; an ungrouped guard under `and` silently kills the rule',
+    ).toEqual(Array(MISSING_KEY_MATERIAL_SUM_COUNT).fill(MISSING_KEY_MATERIAL_GROUPING));
+  });
+
   it('every asserted name is a quoted literal the emitter actually registers', () => {
     const emitter = readFileSync(EMITTER, 'utf8');
     const missing = ALL_ASSERTED_CLIENT_NAMES.filter((n) => !emitter.includes(`'${n}'`));
@@ -146,5 +173,97 @@ describe('the R-29 media_kind read-back value', () => {
     // retarget the read-back to a kind that does not flow yet.
     expect(Object.values(MEDIA_KIND_LABELS)).toContain(MEDIA_KIND_AUDIO);
     expect(MEDIA_KIND_AUDIO).toBe('audio');
+  });
+});
+
+/**
+ * Every `alert:` name in a rules file, in file order (the list-item shape
+ * `alertExpr` reads).
+ */
+function alertNames(yamlText: string): string[] {
+  return [...yamlText.matchAll(/^\s*- alert:\s*(\S+)\s*$/gm)].map((m) => m[1]!);
+}
+
+/** Every value a `<label>="x"` or `<label>=~"a|b"` matcher selects in `expr`. */
+function labelValuesIn(expr: string, label: string): string[] {
+  const out: string[] = [];
+  const re = new RegExp(`\\b${label}\\s*(=~|=)\\s*"([^"]*)"`, 'g');
+  for (let m = re.exec(expr); m !== null; m = re.exec(expr)) {
+    const body = m[2] ?? '';
+    out.push(...(m[1] === '=~' ? body.split('|') : [body]).filter((t) => t !== ''));
+  }
+  return out;
+}
+
+/** A histogram series name back to the instrument the SDK registers. */
+function instrumentName(series: string): string {
+  return series.replace(/_(bucket|count|sum)$/, '');
+}
+
+// Story 3 OBS-B: the client rules' APPLY for NAMES and LABEL VALUES (the live
+// pipe is the browser read-backs; label KEYS are `dt-guard client-metrics-export`
+// rule 2). A selector naming a series, or a label value, the SDK never emits
+// yields an empty result rather than an error, so it is checked here.
+describe('client-alerts.yaml selectors <-> SDK vocabulary (story 3 OBS-B)', () => {
+  const text = readFileSync(CLIENT_RULES, 'utf8');
+  const rules = alertNames(text).map((name) => ({ name, expr: alertExpr(text, name) ?? '' }));
+  const reasons = rules.flatMap((r) => labelValuesIn(r.expr, 'reason'));
+  const kinds = rules.flatMap((r) => labelValuesIn(r.expr, 'media_kind'));
+
+  it('POSITIVE CONTROL (no-client-rules): at least one rule is found, each with an expr', () => {
+    expect(rules.length, `no-client-rules: no "- alert:" item in ${CLIENT_RULES}`).toBeGreaterThan(
+      0,
+    );
+    const empty = rules.filter((r) => r.expr === '').map((r) => r.name);
+    expect(empty, 'no-expr: rules whose expr was not extracted').toEqual([]);
+  });
+
+  it('POSITIVE CONTROL (no-reason-values): at least one reason value is selected', () => {
+    expect(
+      reasons.length,
+      'no-reason-values: no reason matcher extracted from any client rule',
+    ).toBeGreaterThan(0);
+  });
+
+  it('POSITIVE CONTROL (no-media-kind-values): at least one media_kind value is selected', () => {
+    expect(
+      kinds.length,
+      'no-media-kind-values: no media_kind matcher extracted from any client rule',
+    ).toBeGreaterThan(0);
+  });
+
+  it('every selected reason is in the SDK frame-reject vocabulary (ALL_REJECT_REASONS)', () => {
+    const known: readonly string[] = ALL_REJECT_REASONS;
+    const unknown = reasons.filter((r) => !known.includes(r));
+    expect(
+      unknown,
+      'reason-value-drift: a client rule selects a reason the SDK never emits',
+    ).toEqual([]);
+    expect(known, 'sender_server_muted must be in the SDK video reject vocabulary (A5)').toContain(
+      'sender_server_muted',
+    );
+  });
+
+  it('every selected media_kind is a value of MEDIA_KIND_LABELS', () => {
+    const known: readonly string[] = Object.values(MEDIA_KIND_LABELS);
+    const unknown = kinds.filter((k) => !known.includes(k));
+    expect(
+      unknown,
+      'media-kind-value-drift: a client rule selects a media_kind the SDK never emits',
+    ).toEqual([]);
+  });
+
+  it('every dt_client_* name a client rule selects is a literal the emitter registers', () => {
+    const emitter = readFileSync(EMITTER, 'utf8');
+    const names = new Set(rules.flatMap((r) => [...clientNamesIn(r.expr)].map(instrumentName)));
+    expect(
+      names.size,
+      'no-names-extracted: no dt_client_* name in any client rule',
+    ).toBeGreaterThan(0);
+    const missing = [...names].filter((n) => !emitter.includes(`'${n}'`));
+    expect(
+      missing,
+      `emitter-drift: selected by a client rule but not registered in ${EMITTER}`,
+    ).toEqual([]);
   });
 });

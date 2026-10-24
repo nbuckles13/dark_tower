@@ -86,6 +86,9 @@ criterion = { workspace = true }
 # Fixed-seed generator for the slot table's property test (workspace dep).
 rand = { workspace = true }
 mc-test-utils = { path = "../mc-test-utils" }
+# Structural parse of the committed alert rules in the send-directive
+# partition test (media_signaling/outcome.rs), never a line scan.
+serde_norway = { workspace = true }
 # HTTP testing for health endpoint integration tests
 http-body-util = { workspace = true }
 # Need test-util feature for tokio::time::pause/advance in tests

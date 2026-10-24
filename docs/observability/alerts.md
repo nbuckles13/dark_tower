@@ -643,7 +643,7 @@ sum by (event_type) (increase(ac_audit_log_failures_total{job="ac-service"}[10m]
 
 ### Critical Alerts
 
-Existing MC `severity: page` alerts: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCMediaConnectionAllFailed`, `MCMediaGenerationDivergence`, `MCKekRotationOverdue`. That is the complete set — `mc-alerts.yaml` is the source of truth and this list is a convenience copy; verify against it rather than citing this line. (`MCHighLatency`, `MCHighMessageDropRate` and `MCGCHeartbeatFailure` appeared here and have never existed in any rules file.)
+Existing MC `severity: page` alerts: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCMediaConnectionAllFailed`, `MCMediaGenerationDivergence`, `MCMediaSendDirectiveDefect`, `MCKekRotationOverdue`. That is the complete set — `mc-alerts.yaml` is the source of truth and this list is a convenience copy; verify against it rather than citing this line. (`MCHighLatency`, `MCHighMessageDropRate` and `MCGCHeartbeatFailure` appeared here and have never existed in any rules file.)
 
 **Every MC rule is inventoried as of story 2 task 16**, except the pre-story-2 ones this section never covered: `MCDown`, `MCActorPanic`, `MCHighMailboxDepthCritical`, `MCMediaConnectionAllFailed` and the join-flow warnings not listed below. Read `mc-alerts.yaml` rather than inferring absence from this file. The ten entries task 16 owed are the two KEK warnings, the page, the sender-id info rule and the six task-12 teardown warnings, all below by name. The `inventory_expr_drift` guard holds byte-identity for every inventoried entry. It does **not** require that every rule have one, so nothing mechanical reports this file incomplete.
 
@@ -671,6 +671,23 @@ sum(increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[
 >
 > `handler_id_mismatch` is the one exclusion beyond `match`: `MH_HANDLER_ID` is per-incarnation, so an ordinary MH restart produces it by construction and a bare `outcome != "match"` would page on every rollout. That exclusion is held at three sites — this rule, `docs/observability/metrics/mc-service.md`'s catalog entry, and `mc-deployment.md`'s post-deploy checklist — as **one decision with one revert trigger**, `2026-09-02-mh-stable-handler-id`; remove it in all three places together.
 
+> **Story 3 (MC-A, refreshed at OBS-B): `transport_mode_mismatch` is per stream.** A stream MC sent that is absent from MH's `applied_source_streams`, echoed with no transport mode, or echoed with a different mode all land on this one outcome. The arm and the **first** mismatching stream are on MC's ERROR line "MH did not confirm the forwarding policy" (target `mc.grpc.mh_client`) as fields `echo_arm` (`absent_from_echo`, `echoed_unspecified`, `mode_differs`) and `echo_stream_number`; `echo_arm=none` with `echo_stream_number=-1` are the no-mismatch sentinels, never a stream. The usual cause is a cutover applied out of the required order (config -> MH -> MC -> SDK) or an MH build predating per-stream echo. MH's own transport disagreement is `MHTransportInconsistent` (a warning), deliberately not duplicated here. Impact now reads "audio and/or video". The expression is unchanged, so the three-site `handler_id_mismatch` decision is untouched.
+
+#### MCMediaSendDirectiveDefect
+
+**Severity**: Page
+**Condition**: Any composition in 15 minutes failed with an MC-defect outcome of `mc_media_send_directives_total`. The classification has ONE home, `DirectiveOutcome::alert_class()` in `crates/mc-service/src/media_signaling/outcome.rs` (an exhaustive, wildcard-free match in its test module), pinned to both directive rules by a unit test; it is deliberately not restated here.
+**Impact**: The affected participant (for `assignment_failed`, every participant of the meeting) gets no SendDirective and no StreamAssignments, so it neither sends nor receives while signalling, join and the UI read healthy. It has no slots, so the stream-path alerts cannot see it: this rule is its only detector.
+**Runbook**: [Send directive — defect page](../runbooks/mc-incident-response.md#send-directive-defect-page)
+
+**PromQL**:
+```promql
+sum(increase(mc_media_send_directives_total{outcome=~"unknown_stream_number|transport_mode_unspecified|handler_url_unresolved|assignment_failed"}[15m])) > 0
+```
+`for: 0m`
+
+**Why it pages** (meeting-controller argued, operations agreed at OBS-B Gate 1): each defect is a deterministic function of meeting-lifetime state, recurs on every re-composition and fails closed with no retry, so it silences the connection — often the meeting — for its whole life. None is client-reachable (the per-token argument, with code sites, is in the rule's ADR-0031 block). **Shape**: `increase()[15m] > 0` with `for: 0m`, because a failure is recorded only when the actor composes, so a join-time defect in a quiet meeting increments once and goes flat. It relies on the zero-initialisation over `DirectiveOutcome::ALL`. **It auto-resolves 15 minutes after the last failed composition; that is NOT recovery** — a dark meeting stays dark. The action is to roll back MC. This rule and `MCMediaSendDirectiveFailures` close the `docs/TODO.md` entry "`mc_media_send_directives_total` has no alert rule".
+
 #### MCKekRotationOverdue
 
 **Severity**: Page
@@ -691,8 +708,8 @@ mc_meeting_kek_rotation_pending_age_seconds > mc_meeting_kek_rotation_overdue_th
 #### MCMediaMissingKeyMaterial
 
 **Severity**: Warning
-**Condition**: >5% of received media frames dropped for missing key material (four reasons: `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry`, `unwrap_failed`), sustained 15 minutes
-**Impact**: Affected participants hear nothing while every server-side signal reads healthy — MH never opens a frame and structurally cannot observe any of the four conditions.
+**Condition**: >5% of received media frames **of one media kind** dropped for missing key material (four reasons: `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry`, `unwrap_failed`), sustained 15 minutes. Since story 3 (OBS-B) numerator, denominator and guard are `sum by (media_kind)`, so a video-only key failure is not diluted by audio and fires on its own; the video re-derivation (R-14 key rules, the frame-rate-free ratio, decode waits landing post-accept) leaves 5% / 15m standing and is in the rule's block.
+**Impact**: Affected participants hear or see nothing (per affected kind) while every server-side signal reads healthy — MH never opens a frame and structurally cannot observe any of the four conditions.
 **Runbook**: [Scenario 16: Missing Key Material](../runbooks/mc-incident-response.md#scenario-16-missing-key-material)
 
 > **THIS ALERT CAN NOW FIRE, AND HAS BEEN PROVEN TO MATCH.** It previously carried a notice that it was structurally incapable of matching, because `dt_client_*` metrics reached no Prometheus. That is fixed: the collector's `prometheus` exporter, the `otel-collector` scrape job and the GC telemetry-filter widening landed together, and the expression below returned `0.286` against live data driven by sdk-core's own built bundle through the GC proxy. Recorded as an event rather than deleted, because "this alert has never fired" means something different before and after that date, and a responder reading history needs to know which side of it they are on.
@@ -705,12 +722,12 @@ mc_meeting_kek_rotation_pending_age_seconds > mc_meeting_kek_rotation_overdue_th
 **PromQL**:
 ```promql
 (
-  sum(rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
+  sum by (media_kind) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
   /
-  sum(rate(dt_client_media_frames_received_total[5m]))
+  sum by (media_kind) (rate(dt_client_media_frames_received_total[5m]))
 ) > 0.05
 and
-sum(rate(dt_client_media_frames_received_total[5m])) > 0
+sum by (media_kind) (rate(dt_client_media_frames_received_total[5m])) > 0
 ```
 `for: 15m`
 
@@ -814,6 +831,23 @@ sum(rate(mc_jwt_validations_total[5m])) > 0
 5. If sudden spike -> check for recent AC key rotation or config changes
 
 ---
+
+### Warning Alerts (Media Signalling)
+
+#### MCMediaSendDirectiveFailures
+
+**Severity**: Warning
+**Condition**: Any composition in 15 minutes failed with an outcome that is neither a success nor an MC defect — a NEGATED selector, so `meeting_state_unavailable` (environmental: a post-join capability re-declaration the meeting actor did not register — actor gone, usually a meeting ending, or the participant already left; the previous declaration and view stay in force; the shipped SDK never re-declares, so with it this is near-unreachable) and any outcome added later that nobody classified fire here rather than nowhere.
+**Impact**: For `meeting_state_unavailable`, none: only the new declaration was dropped and the participant keeps its previous view. For any other (unclassified) outcome, unknown until classified.
+**Runbook**: [Send-directive wiring](../runbooks/mc-incident-response.md#send-directive-wiring)
+
+**PromQL**:
+```promql
+sum(increase(mc_media_send_directives_total{outcome!~"emitted|emitted_empty_targets|unknown_stream_number|transport_mode_unspecified|handler_url_unresolved|assignment_failed"}[15m])) > 0
+```
+`for: 0m`
+
+An outcome value here other than `meeting_state_unavailable` means `DirectiveOutcome::alert_class()` and the rules have drifted from the enum: classify it there. **Withdrawals are healthy** and are read from `mc_media_send_directive_withdrawals_total{media_kind, reason}`, never inferred from this counter.
 
 ### Warning Alerts (Media Keys)
 
@@ -1036,8 +1070,8 @@ increase(mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}[15m]) 
 **Status**: ✅ Exists — **partially inventoried here**
 **File**: `infra/docker/prometheus/rules/mh-alerts.yaml`
 
-**This section inventories `MHMediaEgressQueueOverflowRate`, `MHMediaEgressEdgeHeadroomLow` and
-`MHMediaEgressBudgetExhausted`, below. Every other alert in `mh-alerts.yaml` ships uninventoried.** Read the rules file directly, and
+**This section inventories `MHMediaEgressQueueOverflowRate`, `MHMediaEgressEdgeHeadroomLow`,
+`MHMediaEgressBudgetExhausted` and the five story-3 stream-path warnings (`MHVideoKeyframeStorm`, `MHVideoSubscriberBacklogResets`, `MHVideoEdgeStuckPending`, `MHPausedSourceIngress`, `MHTransportInconsistent`), below. Every other alert in `mh-alerts.yaml` ships uninventoried.** Read the rules file directly, and
 **do not treat the absence of an entry below as the absence of an alert** — that is the inference a
 reader naturally makes here, and it is wrong.
 
@@ -1134,6 +1168,105 @@ mh_media_stream_admission_rejection_ratio > mh_media_stream_admission_rejection_
 
 **Demonstration** (inject blast radius in the rule's ADR-0031 block: both MH pods roll on the lower and again on the revert, and the FIRE half needs sustained refused registrations for the full 10 minutes): on Kind only, lower the deployed `MH_EGRESS_BUDGET_BPS` so the derived ceiling sits below what a demo meeting installs, then keep joining participants. The ratio gauge should cross the threshold gauge. Then confirm the selector matches a real container: both gauges present per `mh` instance with identical label sets. On a live pod, lowering the budget is a new-meeting outage (`docs/runbooks/mh-deployment.md` §Operator levers).
 
+### Stream-path warnings (story 3 OBS-B)
+
+All `severity: warning` (story 3 R-12 accepts repeated per-path recovery). MH is type-blind: "Video" in these names is the stream-per-group transport, which MC's assignment makes video. Thresholds derive from MC's `mc_media_video_keyframe_min_interval_seconds` gauge (never a client value); a rule reading it cannot evaluate if no MC is scraped (`MCDown` covers that). Each rule's ADR-0031 block carries the derivation, the FIRE/APPLY halves and the recorded departures from the task text.
+
+#### MHVideoKeyframeStorm
+
+**Severity**: Warning
+**Condition**: Fleet ingress group starts per open publisher group stream (1 / mean group lifetime) above half the rate the directed minimum keyframe interval allows, for 10 minutes. **Recorded departures**: the denominator is `mh_media_stream_ingress_groups` (the task's `mh_media_stream_sources_active` was never landed and is redundant, a media-handler decision; `_sources_declared` would under-read by counting paused, muted and unwatched sources), and the interval is `min()`, the conservative side under an MC config skew.
+**Impact**: Video bitrate spent on keyframes rather than quality and more MH egress load; sustained, more abandonment.
+**Runbook**: [MH Scenario 20: Video Keyframe Storm](../runbooks/mh-incident-response.md#scenario-20-video-keyframe-storm)
+
+**PromQL**:
+```promql
+(
+  sum(rate(mh_media_group_starts_total{direction="ingress"}[10m]))
+  /
+  sum(avg_over_time(mh_media_stream_ingress_groups[10m]))
+) > 0.5 / min(mc_media_video_keyframe_min_interval_seconds)
+and
+sum(avg_over_time(mh_media_stream_ingress_groups[10m])) > 0
+```
+`for: 10m`
+
+Check MH pod age first (post-roll bursts are expected), then split request storm vs self-key loop on client-media's Video Keyframes Produced by Cause.
+
+#### MHVideoSubscriberBacklogResets
+
+**Severity**: Warning
+**Condition**: `subscriber_backlog` resets above 10% of egress group starts fleet-wide for 15 minutes. The ratio over-reads (resets are per destination, up to 3 per egress group start, and not a subset of starts). **Small-fleet residual, recorded**: with fewer than ~30 active stream destinations (Kind included) one slow subscriber can hold it; no floor, because no type-blind series counts stream destinations.
+**Impact**: Video freezes on affected paths until the next group start; fleet-wide, egress capacity is short.
+**Runbook**: [MH Scenario 21: Slow Video Subscriber (Stream-Credit Stall)](../runbooks/mh-incident-response.md#scenario-21-slow-video-subscriber-stream-credit-stall)
+
+**PromQL**:
+```promql
+(
+  sum(rate(mh_media_group_resets_total{reason="subscriber_backlog"}[15m]))
+  /
+  sum(rate(mh_media_group_starts_total{direction="egress"}[15m]))
+) > 0.10
+and
+sum(rate(mh_media_group_starts_total{direction="egress"}[15m])) > 0
+```
+`for: 15m`
+
+Read MH Media's Stream-Path Group Resets by Reason (per destination), split by pod, and the meeting size before treating it as systemic. Per-path recovery is a panel, never an alert.
+
+#### MHVideoEdgeStuckPending
+
+**Severity**: Warning
+**Condition**: The oldest pending stream edge older than 10 x the directed minimum keyframe interval for 5 minutes. Pending has no give-up timeout while assigned and nothing retries, so this is a missing event.
+**Impact**: A frozen or blank tile for a slot MC reports live, with every liveness signal healthy.
+**Runbook**: [MH Scenario 22: Video Slot Stuck Pending](../runbooks/mh-incident-response.md#scenario-22-video-slot-stuck-pending)
+
+**PromQL**:
+```promql
+max(mh_media_edge_pending_oldest_seconds) > 10 * max(mc_media_video_keyframe_min_interval_seconds)
+```
+`for: 5m`
+
+Blind spot: an edge whose publisher is not on this handler is never pending; `ClientVideoSlotUnfulfilled` covers it. Accepted residual: an unreported capture that never starts (an open permission prompt) stays pending until this or A9 fires; never widen the threshold for it.
+
+#### MHPausedSourceIngress
+
+**Severity**: Warning
+**Condition**: Frames on PAUSED (client-muted) source streams above 1% of every ingress frame forwarded, for 15 minutes. Counted, not dropped (R-17); 1% over 15m tolerates the legitimate race at a toggle. The denominator is the existing once-per-ingress-frame `forwarded{ingress}`; paused is a subset of it.
+**Impact**: Media from users who believe they are muted may reach other participants: a client privacy defect.
+**Runbook**: [MH Scenario 23: Client Sending While Client-Muted](../runbooks/mh-incident-response.md#scenario-23-client-sending-while-client-muted)
+
+**PromQL**:
+```promql
+(
+  sum(rate(mh_media_paused_source_frames_total[15m]))
+  /
+  sum(rate(mh_media_frames_forwarded_total{direction="ingress"}[15m]))
+) > 0.01
+and
+sum(rate(mh_media_frames_forwarded_total{direction="ingress"}[15m])) > 0
+```
+`for: 15m`
+
+Never add the paused counter to an ingress received total.
+
+#### MHTransportInconsistent
+
+**Severity**: Warning
+**Condition**: MH refused policy applies as `rejected_transport_inconsistent` continuously for 15 minutes, or dropped at least one ingress stream as `transport_mismatch` within the last 20 minutes: version skew within the v3 era, or a cutover applied out of the required order (config -> MH -> MC -> SDK). Before any rollback: `transport_mismatch` alone, on one pod, may be one misbehaving client (that arm is client-reachable; the apply arm is not). The mismatch arm can be one-shot (the SDK does not re-key after MH's stop, and MH requests no keyframe for a datagram-declared source), and no other rule backstops it (`MHVideoEdgeStuckPending` never sees datagram edges), so it is `increase()[20m] > 0` — one refused stream fires it after `for: 15m` (a recorded departure from the task's `rate()[5m]`). The persistent apply-arm case is backstopped by `MCMediaGenerationDivergence`.
+**Impact**: Affected streams refused or never programmed; that stream's media is lost while signalling reads healthy.
+**Runbook**: [MH deployment: Mixed-Transport Rollback Hazard](../runbooks/mh-deployment.md#mixed-transport-rollback-hazard)
+
+**PromQL**:
+```promql
+sum(rate(mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}[5m])) > 0
+or
+sum(increase(mh_media_frames_dropped_total{reason="transport_mismatch"}[20m])) > 0
+```
+`for: 15m`
+
+MC's per-stream echo mismatch is not duplicated here: it pages as `MCMediaGenerationDivergence`. Rollback across the v2→v3 break is all components together (R-25).
+
 ### Deliberate absences (MH)
 
 These are recorded so that the absence reads as a decision, not an omission:
@@ -1141,6 +1274,14 @@ These are recorded so that the absence reads as a decision, not an omission:
 2. No RegisterMeeting-apply alert (same gate).
 3. **No teardown-never-arrives rule — recorded here, but an OPEN obligation, not a design decision.** An edge-holding leaked meeting is caught by `MHMediaEgressEdgeHeadroomLow`'s LEAK fork. A ZERO-edge leaked registration has no alert: its first symptom is `rejected_meeting_cap` at the cap. The instrument exists, and only authorship remains. Tracked in `docs/TODO.md` §Observability Debt, "No leading indicator for registered-meeting exhaustion", with owners and trigger. *(Corrected 2026-09-30, story 2 task 18: this entry previously assigned the rule to task 18, which never carried it.)*
 4. **`mh_media_egress_stream_ceiling_recommended_min` has no alert, by design** (story 2 task 16). It is ADVISORY: the ceiling a demo of the configured size needs, published so an operator can compare it with `mh_media_egress_stream_ceiling`. Nothing enforces it, which is exactly why it is spelled `_recommended_min` and not `_threshold` (`docs/observability/label-taxonomy.md` §R4 suffix rule: a threshold spelling tells a responder that something automatic is watching).
+
+5. **Story 3 stream path — no alert, by decision (OBS-B):**
+   - **Stream-path drops per path** (`unmatched_stream`, `transport_mismatch` outside `MHTransportInconsistent`'s fleet arm, `stream_rate_limited`, `partial_frame_discard`) and per-path group resets: R-12 accepts per-path recovery. Panels on MH Media.
+   - **Recovery requests `duplicate`**: many receivers losing one group is normal; the counter dedupe is the bound working, and junk is bounded by QUIC flow control.
+   - **`counter_ahead`** (MH recovery outcome) and the client's **`honoured_counter_ahead`**: diagnostic, and client-reported on one side.
+   - **Version-skew signals** — MH codec `unknown_version`, MC's refusal of an SDK lacking header version 3 (`mc_session_join_failures_total{error_type="header_version_unsupported"}`), the client's v2-directive reject (`dt_client_media_send_directive_header_version_refused_total`) and `dt_client_media_send_directive_kind_missing_total`: expected during a rollout (R-25 is confirmed: rollback across the v3 cutover is all components together), so panels only, listed for operations' rollout scenario.
+   - **MH memory**: R-21's startup validation of backlog cap x stream ceiling against the pod limit makes backlog OOM structurally impossible; `MHHighMemory` suffices. The backlog in-use gauge (`mh_media_egress_stream_backlog_bytes`, added at OBS-B) is drawn against that charge bound on MH Media.
+   - **`mh_media_keyframe_request_write_failures_total`**: no rule of its own because its consequence — edges waiting on a request that cannot be delivered (the publisher self-keys only for its own targets' starts and its own abandonments, never for MH's resets or new subscriber edges) — fires `MHVideoEdgeStuckPending`; this counter is that alert's diagnosis input.
 
 **Remaining unbuilt candidates** (aspirational — thresholds are unratified):
 - `MHHighPacketLoss` - Packet loss >1%
@@ -1192,6 +1333,59 @@ sum(dt_client_media_kek_retention_violations_total) > 0
 
 **A zero-forever tripwire against a future SDK refactor, not a live-condition detector.** The invariant is unit-tested, and there is no known legitimate cause. The remedy is an SDK rollback, not an operator action.
 
+#### ClientVideoServerMutedSenderFrames
+
+**Severity**: Warning
+**Condition**: Receivers dropping video frames as `sender_server_muted` at any sustained rate for 10 minutes (equality matchers only).
+**Impact**: If MH's ingress drop fails, a server-muted participant's video reaches other devices; receivers still refuse to render it.
+**Runbook**: [MH Scenario 19: Server Mute Not Taking Effect At Ingress (video arm)](../runbooks/mh-incident-response.md#scenario-19-server-mute-not-taking-effect-at-ingress)
+
+**PromQL**:
+```promql
+sum(rate(dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video"}[5m])) > 0
+```
+`for: 10m`
+
+**Corroborating, not proof**: the proof is MH's `mh_media_frames_dropped_total{reason="server_muted"}`. **Warning, not page**: the security criterion's "pages toward the server-mute runbook" means routes to it; the counter is client-reported, so a patched client could page on-call at will — and could equally suppress it, so silence is not evidence the mute holds.
+
+#### ClientVideoDecodeErrorRatio
+
+**Severity**: Warning
+**Condition**: Video decoder failure EVENTS above 1% of accepted video frames for 10 minutes (events per frame, not a per-frame error rate).
+**Impact**: Frozen or blank video tiles while audio and every server-side signal read healthy.
+**Runbook**: [MC Scenario 22: Client Video Decode Failures](../runbooks/mc-incident-response.md#scenario-22-client-video-decode-failures)
+
+**PromQL**:
+```promql
+(
+  sum(rate(dt_client_media_decoder_errors_total{media_kind="video"}[5m]))
+  /
+  sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[5m]))
+) > 0.01
+and
+sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[5m])) > 0
+```
+`for: 10m`
+
+**Recorded residual**: under total decode failure the ratio is about 1 / (fps x max(directed keyframe interval, decoder restart backoff)). At the deployed 500 ms default that is ~3.3%, within reach; above ~3.3 s at 30 fps a totally failed decoder stays below 1% and is **unalerted while the slot is open** — it surfaces at slot exit on the unfulfilled histogram, and `ClientVideoSlotUnfulfilled` fires only if such exits keep arriving fleet-wide. The `[5m]` window (task text: `[10m]`) is the G5 collector-expiration constraint.
+
+#### ClientVideoSlotUnfulfilled
+
+**Severity**: Warning
+**Condition**: The p95 time live video slots show neither video nor an avatar above 10 x the directed minimum keyframe interval (ms) for 5 minutes.
+**Impact**: Blank or frozen tiles for people MC says are live, while every server-side signal can read healthy.
+**Runbook**: [MC Scenario 23: Client Video Slot Unfulfilled](../runbooks/mc-incident-response.md#scenario-23-client-video-slot-unfulfilled)
+
+**PromQL**:
+```promql
+histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[5m]))) > 10 * 1000 * max(mc_media_video_keyframe_min_interval_seconds)
+and
+sum(rate(dt_client_media_slot_unfulfilled_duration_ms_count{media_kind="video"}[5m])) > 0
+```
+`for: 5m`
+
+Observed at episode **exit only**, every exit including teardown, so a slot stuck all session appears once, at leave: one stuck slot cannot fire this, a fleet pattern does. **Recorded departures**: `[5m]` window (G5) and `for: 5m` (task text: `[15m]`/`15m`) because sparse exit-time observations cannot sustain a `for:` longer than the window. The gauge `dt_client_media_slots_unfulfilled` is panel-only (last-writer-wins).
+
 ### Deliberate absences (client receive path)
 
 `MCMediaMissingKeyMaterial` covers four key-delivery reject reasons. `unwrap_failed` joined it in story 2 task 16, partly because nothing else watched it. That same argument applies to the other receive-path drop reasons, so their absence is recorded here as a decision rather than inherited. Each is visible on **client-media panel 3** (Frame Drops by Reason), and none is alerted:
@@ -1199,7 +1393,7 @@ sum(dt_client_media_kek_retention_violations_total) > 0
 - **`signature_invalid`, `decrypt_failed`, `replay_detected`** (receive-path crypto). Any authenticated roster member can drive each of them at every receiver by authoring the frames, and transit corruption also lands on `signature_invalid`. A fleet-ratio threshold on them would be attacker-controllable. No baseline exists to set one, and a per-sender split, the dimension that would make them actionable, is barred by ADR-0036 §11. Their triage owners differ, as recorded in the guard's `NOT_KEY_DELIVERY` reasons: `security` for forgery, `client` for sender key-schedule defects.
 - **The codec structural rejects (every `media-protocol` `RejectReason`, `key_bearing_discardable` included) and `no_transmit_key`.** These are byte-determined, so a malformed or non-conforming sender produces them, and so can anyone authoring frames. A codec regression shows as a step on panel 3 at a release boundary. `no_transmit_key` is a protocol violation, and the `protocol`/`client` code owns it.
 - **`sender_not_assigned`** is misrouting, whose remedy is MC placement and MH forwarding. It is covered on the server side by MC's slot and send-target metrics, not by a client alert.
-- **Story 3's receive-side slot and stream drops — `self_sender`, `sender_server_muted`, `decode_over_bound`, `stream_partial_reset`, `stream_slot_mismatch`** — are not key delivery (each carries its reason in `NOT_KEY_DELIVERY`). `self_sender`, `sender_server_muted` and `stream_slot_mismatch` are decided against receiver-held state, so a ratio threshold on them would be attacker-drivable for the same reason as the crypto reasons above; `decode_over_bound` and `stream_partial_reset` are sender/transport conformance faults with no baseline. Visible on panel 3, not alerted.
+- **Story 3's receive-side slot and stream drops — `self_sender`, `decode_over_bound`, `stream_partial_reset`, `stream_slot_mismatch`** — are not key delivery (each carries its reason in `NOT_KEY_DELIVERY`). `self_sender` and `stream_slot_mismatch` are decided against receiver-held state, so a ratio threshold on them would be attacker-drivable for the same reason as the crypto reasons above; `decode_over_bound` and `stream_partial_reset` are sender/transport conformance faults with no baseline. Visible on panel 3 and on Video Receive Drops (story 3 tokens), not alerted. **`sender_server_muted` is the exception and IS alerted** (`ClientVideoServerMutedSenderFrames`, story 3 OBS-B) as corroborating evidence of a server-mute leak, at warning precisely because it is client-drivable.
 
 **Whether any of these should alert is an open decision, not a closed one.** It is tracked in `docs/TODO.md` §Observability Debt ("Receive-path crypto drop reasons have no alert"), with the trigger being the first observed baseline.
 
@@ -1211,28 +1405,32 @@ sum(dt_client_media_kek_retention_violations_total) > 0
 
 ### Deliberate absences (client video send path, story 3 C-A2)
 
-None of the video send-path series below is alerted yet. Each lands with catalog and panel entries (`docs/observability/metrics/client.md`, `infra/grafana/dashboards/client-media.json`); the alert inventory for video is story 3 OBS-B's (A1–A9).
+None of the video send-path series below is alerted; each decision was made at story 3 OBS-B and is final until its stated trigger. Catalog and panel entries: `docs/observability/metrics/client.md`, `infra/grafana/dashboards/client-media.json`.
 
 | Series | Alert | Reason |
 |---|---|---|
-| `dt_client_media_keyframes_produced_total{source}` | none yet — story 3 OBS-B | A1 (keyframe storm) is MH-side; the client `source` split is its triage input |
-| `dt_client_media_send_groups_abandoned_total` | none yet — story 3 OBS-B | A2 (fleet backlog resets) is MH-side; read against `keyframes_produced{source="abandonment"}` |
-| `dt_client_media_send_groups_stopped_total{outcome}` | none yet — story 3 OBS-B | no baseline yet; `open_stalled` is the only MAX_STREAMS-starvation signal anywhere |
-| `dt_client_media_encode_queue_dropped_total` | none yet — story 3 OBS-B | device-pressure signal; no baseline yet |
-| `dt_client_media_encoder_errors_total` | none yet — story 3 OBS-B | fatal per encoder instance; no baseline yet |
-| `dt_client_media_send_directive_encoding_refused_total` | none yet — story 3 OBS-B | reads zero against a conforming MC |
-| `dt_client_media_keyframe_min_interval_clamped_total` | panel only, BY DECISION (task text) | reads zero against a correct MC; a drift / hostile-controller signal |
+| `dt_client_media_keyframes_produced_total{source}` | none, BY DECISION | A1 `MHVideoKeyframeStorm` is MH-side; the client `source` split is its diagnosis panel |
+| `dt_client_media_send_groups_abandoned_total` | none, BY DECISION | A2 `MHVideoSubscriberBacklogResets` is the fleet signal; read against `keyframes_produced{source="abandonment"}` |
+| `dt_client_media_send_groups_stopped_total{outcome}` | none, BY DECISION (until a baseline exists) | `open_stalled` is the only MAX_STREAMS-starvation signal anywhere; panel |
+| `dt_client_media_encode_queue_dropped_total` | none, BY DECISION | a device-pressure signal of the user's environment; panel |
+| `dt_client_media_encoder_errors_total` | none, BY DECISION (until a baseline exists) | fatal per encoder instance; panel |
+| `dt_client_media_send_directive_encoding_refused_total` | none, BY DECISION | reads zero against a conforming MC; a rollout-skew signal, panel only |
+| `dt_client_media_keyframe_min_interval_clamped_total` | panel only, BY DECISION (task text) | a build-time equality guard (`validate-keyframe-floor-sync.sh`) makes it non-zero only across a rollout skew |
+| `dt_client_media_send_directive_kind_missing_total`, `dt_client_media_send_directive_header_version_refused_total` | none, BY DECISION | version-skew signals expected during a rollout (R-25); panel only |
+| `dt_client_media_keyframe_requests_received_total{outcome}` | none, BY DECISION | `honoured_counter_ahead` is diagnostic; the storm signal is MH-side (A1) |
+| `dt_client_media_keyframe_requests_unattributed_total`, `dt_client_media_mh_control_channel_ended_total` | none, BY DECISION | `malformed` is a handler defect visible on its panel; a dead control channel shows as A3/A9 on the video it starves |
+| `dt_client_media_capture_failures_total{outcome}` | none, BY DECISION | the user's environment (permission, device) |
 
 ### Deliberate absences (client video receive path, story 3 C-B)
 
-None of the video receive series below is alerted by C-B; the video alert inventory (A1–A9) is story 3 OBS-B's.
+The video receive decisions below were made at story 3 OBS-B.
 
 | Series | Alert | Reason |
 |---|---|---|
-| `dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video"}` | none yet — story 3 OBS-B (A5) | MH 19 selects on it; the threshold must tolerate the per-mute burst (catalog: residual race) |
-| `dt_client_media_recovery_requests_sent_total{source}` | none yet — story 3 OBS-B | bounded per slot by groups received; MH counts forwarded vs deduped |
-| `dt_client_media_incoming_streams_refused_total` | none yet — story 3 OBS-B | an MH stream-concurrency defect signal; no baseline yet |
-| `dt_client_media_slot_unfulfilled_duration_ms` | none yet — story 3 OBS-B (A9 `ClientVideoSlotUnfulfilled`) | the fleet-meaningful unfulfilled signal; observed on exit only |
+| `dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video"}` | `ClientVideoServerMutedSenderFrames` (A5) | above; `for: 10m` tolerates the per-mute burst |
+| `dt_client_media_recovery_requests_sent_total{source}` | none, BY DECISION | bounded per slot by loss events; MH counts forwarded vs deduped (`duplicate` is the bound working) |
+| `dt_client_media_incoming_streams_refused_total` | none, BY DECISION (until a baseline exists) | an MH stream-concurrency defect signal; panel |
+| `dt_client_media_slot_unfulfilled_duration_ms` | `ClientVideoSlotUnfulfilled` (A9) | above; observed on exit only |
 | `dt_client_media_slots_unfulfilled` | panel only, BY DECISION | single-writer gauge: last-writer-wins across browsers, never a fleet count |
 | `dt_client_media_active_source_intervals_total` | none | a decode-activity rate, read with the unfulfilled histogram |
 | `dt_client_media_time_to_first_render_ms`, `dt_client_media_slot_active_to_first_render_ms` | none, BY DECISION | open objectives: observed, never gated (ADR-0036 §10) |

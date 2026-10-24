@@ -186,8 +186,27 @@ JSON before it was removed (O-21, `docs/TODO.md`).
 
 **Purpose**: MC's side of the ADR-0036 media path — the counterpart of **MH Media Path**.
 
-**Rows**: Media Routing (ADR-0036 §8), Client Media Signalling (ADR-0036 §5, §6), Media Connectivity
-(ADR-0036 §9), KEK Lifecycle (ADR-0036 §4 Rotation).
+**Rows**: Media Routing (ADR-0036 §8), Client Media Signalling (ADR-0036 §5, §6), Slots and Mute by
+Kind (story 3), Video Send Directives (story 3), Media Connectivity (ADR-0036 §9), KEK Lifecycle
+(ADR-0036 §4 Rotation).
+
+**Story 3 (OBS-B) layout and alert-linked panels.** Every alert-linked panel draws its alert's
+threshold: a gauge-derived threshold as a second plotted series, a fixed policy number or an
+any-occurrence rule as a red threshold line.
+
+| Panel | Split / alert | Note |
+|---|---|---|
+| Pushes Counted by MCMediaGenerationDivergence (ALERTED, page) | `MCMediaGenerationDivergence`'s negated selector, line at 0 | per-stream `transport_mode_mismatch` since story 3 |
+| Send Directive Failures (ALERTED: defect pages, rest warns) | `MCMediaSendDirectiveDefect` and `MCMediaSendDirectiveFailures` selectors, line at 0 | classes: `DirectiveOutcome::alert_class()`; withdrawals never read here |
+| Slot States by Kind | `by (media_kind, slot_state)` | `source_muted` is in no query; unreachable is NOT a slot state here |
+| Receive Slot Fill vs Cap | per `media_kind` (fixed: previously summed both kinds against per-kind caps) | |
+| Receive Slot Cap | per `media_kind` | video at 0 = the R-26 lever applied |
+| Unreachable Senders Named | kind-free by design | read beside Not-Yet-Connected Senders |
+| Client Mute Requests by Kind and Outcome / Server Mute Requests by Kind | `by (media_kind, ...)`, SEPARATE panels | never one panel summing client and server mute (`label-taxonomy.md`, `action`) |
+| Send Directive Withdrawals by Kind and Reason | `by (media_kind, reason)` | withdrawals are healthy |
+| Directed Video Minimum Keyframe Interval | stat | threshold source for A1, A3 and A9 |
+| Join Refusals - Story 3 Media Join Values | `by (error_type)` | `reconnect_publish_set_mismatch` not production-reachable today |
+| Mean Send Targets per Directive | per-kind numerator over the kind-free directive denominator (`ignoring(media_kind) group_left`) | |
 
 **Panels and their metrics**: read them from the JSON, as for MC Overview (ADR-0031).
 
@@ -208,7 +227,7 @@ not a source of Grafana's projected `dashboards` volume (which would make it sil
 **Default Time Range**: Last 6 hours
 **Refresh**: 1 minute
 
-**Related Alerts**: `MCMediaGenerationDivergence`, `MCMediaMissingKeyMaterial`,
+**Related Alerts**: `MCMediaGenerationDivergence`, `MCMediaSendDirectiveDefect`, `MCMediaSendDirectiveFailures`, `MCMediaMissingKeyMaterial` (its per-kind ratio is drawn on **Client SDK Media Path**),
 `MCKekRotationOverdue`, `MCKekPushFailureRate`, `MCKekRotationStorm`, `MCClientKekConflictingKey`
 and `MCClientRosterKeyRebind` (both client-origin tripwires, panelled on **Client SDK Media Path**) (for the last two named on
 key issuance, and for `MCMediaMissingKeyMaterial`, issuance itself is read on MC Overview; see below).
@@ -286,8 +305,18 @@ The media-path **triage** board: where an operator goes to answer *why*, after
 | Per-Stream Egress Costs (bytes/s) | What enforced per-stream audio and video costs the running process loaded, in bytes (config reflection; a step means a pod started on different config) |
 | Stream-Path Group Starts by Direction (stream-per-group) | Stream-per-group churn (story 3 MH-A2): attributed publisher groups in, downlink groups opened out. MH is type-blind; MC's assignment is what makes stream-transport traffic video |
 | Stream-Path Group Resets by Reason (per destination) | Which downlink groups MH abandoned for one destination, and why (`subscriber_backlog`, `publisher_reset`, `publisher_stall`, `source_ended`, `edge_removed`). `increase()`; one per group abandoned for a destination, whether or not its stream opened |
-| Live Stream-Path Ingress Groups and Declared Stream Sources | Publisher group streams being read now (process-wide) and `STREAM_PER_GROUP` sources declared across installed policies |
-| Uni Streams per Connection Limit / Egress Backlog Cap per Destination / Mid-Frame Stall Bound (config) | The per-connection uni-stream limit (count), the per-destination backlog cap (bytes) and the mid-frame stall bound (seconds) the running process enforces — one panel each, in its own unit (config reflection) |
+| Live Stream-Path Ingress Groups and Declared Stream Sources | Publisher group streams being read now (process-wide; `MHVideoKeyframeStorm`'s denominator) and `STREAM_PER_GROUP` sources declared across installed policies (NOT a denominator: it counts paused, muted and unwatched sources) |
+| Uni Streams per Connection Limit / Egress Backlog Cap per Destination / Mid-Frame Stall Bound (config) | The per-connection uni-stream limit (count), the per-destination backlog cap (bytes) and the mid-frame stall bound (seconds) the running process enforces — one panel each, in its own unit (config reflection). The per-connection limit is never drawn as a line over the process-wide groups gauge |
+| Group Starts per Open Ingress Group vs Keyframe Ceiling | `MHVideoKeyframeStorm`'s ratio against its threshold series `0.5 / min(mc_media_video_keyframe_min_interval_seconds)` |
+| Subscriber-Backlog Reset Share | `MHVideoSubscriberBacklogResets`' ratio, line at 10%; over-reads, and a single slow path can cross it on a small fleet |
+| Stream-Path Backlog In Use vs Charge Bound | `mh_media_egress_stream_backlog_bytes` (added at story 3 OBS-B; tick-sampled every 10 s from per-destination budgets) per pod against cap x stream ceiling, the R-21 boot-check charge term — not memory |
+| Stream-Path Ingress Drops (attribution, rate limit, partial frame) | `unmatched_stream`, `transport_mismatch`, `stream_rate_limited` (once per refused stream), `partial_frame_discard`; per-path drops are not alerted |
+| MHTransportInconsistent Arms (ALERTED) | both arms, line at 0 |
+| Paused-Source Arrivals / Paused-Source Share of Ingress (ALERTED) | arrivals per pod; `MHPausedSourceIngress`' ratio, line at 1% |
+| Keyframe Requests Sent / Recovery Requests by Outcome / Keyframe Request Write Failures | MH's keyframe demand by trigger, receiver requests by outcome (`duplicate` is the dedupe bound working), undeliverable requests |
+| Pending Edges / Oldest Pending Edge / Pending Duration / Pending Exits by Outcome | Oldest Pending Edge draws `MHVideoEdgeStuckPending`'s threshold series `10 * max(mc_media_video_keyframe_min_interval_seconds)`; Pending Duration is the server-side decomposition of the slot-active-to-first-render open objective |
+
+**Rows** (story 3 OBS-B): Forward Path and Frame Drops; Egress Admission and Policy Bounds; Stream Transport (stream-per-group); Keyframes, Recovery and Pending Edges. **Type-blind**: no MH panel title or legend claims a series is "video" from an MH label (MH carries no `media_kind`); stream-transport panels say in their descriptions that MC's assignment is what makes that traffic video. **Entry-point split**: there is no `entry_point` label — codec reject tokens on Ingress Drops by Reason are the decode entry point, `relay_rewrite_failed` on Egress Drops by Reason is the `rewrite_relay_region` entry point.
 
 Two conventions this board depends on, both easy to break by well-meaning edit:
 
@@ -353,8 +382,13 @@ accounting identity `received = accepted + sum(drops by reason)`.
   - the other two install-refusal arms;
   - `decode_queue_dropped_total` (post-accept, never part of the accounting identity);
   - **KEK Rotations vs Generations Retained**, which reads `kek_generations_retained_total` AGAINST `kek_updates_total{source="kek_update"}`. Rotations rising while retentions stay flat is the signal, and neither series alone says anything.
-  - story 3 C-A2's video send-path series, panel only until story 3 OBS-B: `keyframes_produced_total{source}`, `send_groups_abandoned_total`, `send_groups_stopped_total{outcome}`, `encode_queue_dropped_total`, `encoder_errors_total`, `send_directive_encoding_refused_total`, and `keyframe_min_interval_clamped_total` (panel only BY DECISION, task text).
-  - story 3 C-B's video receive series, panel only until story 3 OBS-B: `recovery_requests_sent_total{source}`, `incoming_streams_refused_total`, `slot_unfulfilled_duration_ms` (histogram; the fleet unfulfilled signal), `slots_unfulfilled` (single-writer gauge, panel only BY DECISION), `active_source_intervals_total`, `time_to_first_render_ms` and `slot_active_to_first_render_ms` (open objectives, never gated).
+  - story 3 C-A2's video send-path series, panel only BY DECISION (story 3 OBS-B; reasons in `docs/observability/alerts.md` §Deliberate absences): `keyframes_produced_total{source}` (the diagnosis panel for `MHVideoKeyframeStorm`), `send_groups_abandoned_total`, `send_groups_stopped_total{outcome}`, `encode_queue_dropped_total`, `encoder_errors_total`, `send_directive_encoding_refused_total`, and `keyframe_min_interval_clamped_total`.
+  - story 3 C-B's video receive series: `recovery_requests_sent_total{source}`, `incoming_streams_refused_total`, `slots_unfulfilled` (single-writer gauge), `active_source_intervals_total` (distinct active video sources), `time_to_first_render_ms` and `slot_active_to_first_render_ms` (open objectives, never gated; `docs/observability/slos.md`) are panel only BY DECISION. `slot_unfulfilled_duration_ms` is ALERTED (below).
+- **Story 3 OBS-B alert-linked panels**, each drawing its alert's threshold: Video From Server-Muted Senders (`ClientVideoServerMutedSenderFrames`, line at 0), Video Decoder Failures per Accepted Frame (`ClientVideoDecodeErrorRatio`, line at 1%), Missing-Key-Material Drop Share by Kind (`MCMediaMissingKeyMaterial` per kind, line at 5%), and Video Slot Unfulfilled Duration (p95) with `ClientVideoSlotUnfulfilled`'s threshold series `10 * 1000 * max(mc_media_video_keyframe_min_interval_seconds)`.
+
+**Rows** (story 3 OBS-B): Receive Path (per kind); Send Path (per kind); Key Lifecycle (kind-free); Video Send; Video Receive.
+
+**`media_kind` split** (SSoT: `docs/observability/metrics/client.md` §`media_kind`). Split by `media_kind`: Frames Received / Accepted, Frame Drops by Reason, Non-Dropping Wrapped-Key Outcomes, Downlink Continuity and Decode, Undeclared Stream IDs, Silent Active Sources, Decode Queue Drops, Datagrams Sent, Send Drops by Reason, Egress Queue Depth, Time to First Media Frame, the mute half of Key and Mute Lifecycle, Directive Faults' kind-missing series, and every video panel. **Kind-free by design** (session-level series; each description says so): Capture Source, the three Key Tripwires, KEK Retention Anomalies, KEK Install Refusals, KEK Rotations vs Generations Retained, Keyframe Requests Without a Kind, MH Control Channel Ended, Directive Faults' header-version series, and the KEK half of Key and Mute Lifecycle.
 
 The capture-source panel's value is not a browser count: the only signal is the presence of `mode="test_tone"`. The panel list itself is in the JSON.
 

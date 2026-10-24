@@ -10,6 +10,19 @@
   "liveNow": false,
   "panels": [
     {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 210,
+      "panels": [],
+      "title": "Forward Path and Frame Drops",
+      "type": "row"
+    },
+    {
       "datasource": {
         "type": "prometheus",
         "uid": "$datasource"
@@ -68,7 +81,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 0
+        "y": 1
       },
       "id": 2,
       "options": {
@@ -161,7 +174,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 0
+        "y": 1
       },
       "id": 3,
       "options": {
@@ -200,7 +213,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Frames MH discarded on the publisher-to-relay side, broken out by reason - the WHY behind the Media Frame Drops by Direction panel on the Media Handler - Overview dashboard, which answers only WHETHER and on which side. A FLAT LINE AT ZERO ON A REASON MEANS NO DROPS OF THAT REASON OCCURRED - and since loopback was removed (story 2 R-3) a flat panel no longer stands for any special healthy-loopback state. A solo participant is directed to send nothing (mc_media_send_directives_total{outcome=\"emitted_empty_targets\"}), so a solo meeting puts no frame on this panel at all. Some ingress reasons are legitimately NON-ZERO in a healthy fleet: server_muted is the BACKSTOP behind a withdrawn send directive (MC-B): under a host mute it reads near zero because a compliant client stops sending, and non-zero means frames were sent anyway - in flight across the withdrawal, or a client sending against a withdrawn directive (read it against whether a mute was intended), and transport_receive_dropped has a legitimately non-zero tail. Every reason in this family is pre-registered at zero at process start (resolve_media_handles), so the healthy reading is a flat zero series, NOT 'No data'. A genuine 'No data' here is a fault in the metrics pipeline - recorder not installed, scrape failing, pod down, or wrong job label - and must never be read as 'no drops occurred'. The sentence this replaces claimed a Prometheus counter materialises no series until first incremented and that 'No data' was therefore the normal reading: true of a lazily-created counter, but never true of THIS family, and it contradicted the present-and-flat-at-zero paragraph below it. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on. TWO REASONS ARE DECLARED BUT CANNOT FIRE TODAY AND ARE NOT LIVE DETECTORS: partial_frame_discard (unreachable until video - audio is one frame per datagram, so the stream-carried path has no producer) and stream_rate_limited (unreachable until uni-streams/video, for the same reason - MH opens no uni-streams this story). A permanently flat series for either is correct, not a fault; do not go looking for a bug behind it. A FLAT PANEL IS AMBIGUOUS AND ALWAYS WILL BE: this family reads present-and-flat-at-zero both when the handler is idle and when no media session ever started, and the two are byte-identical here. Discriminate with Media Session Starts by Outcome first, then with mh_media_frames_dropped_total{reason=\"transport_receive_dropped\"} - flat means no datagram ever arrived, moving means MH received them and never read them. Counted as increase() rather than rate() per ADR-0029 Category A: a single discrete drop under rate() renders as a near-zero rate at any realistic scrape cadence, which reads IDENTICAL TO HEALTHY on the one panel whose purpose is that a single drop is visible. The reason vocabulary and its direction mapping are NOT restated here - see docs/observability/metrics/mh-service.md §Media Forward Path. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
+      "description": "Frames MH discarded on the publisher-to-relay side, broken out by reason - the WHY behind the Media Frame Drops by Direction panel on the Media Handler - Overview dashboard, which answers only WHETHER and on which side. A FLAT LINE AT ZERO ON A REASON MEANS NO DROPS OF THAT REASON OCCURRED - and since loopback was removed (story 2 R-3) a flat panel no longer stands for any special healthy-loopback state. A solo participant is directed to send nothing (mc_media_send_directives_total{outcome=\"emitted_empty_targets\"}), so a solo meeting puts no frame on this panel at all. Some ingress reasons are legitimately NON-ZERO in a healthy fleet: server_muted is the BACKSTOP behind a withdrawn send directive (MC-B): under a host mute it reads near zero because a compliant client stops sending, and non-zero means frames were sent anyway - in flight across the withdrawal, or a client sending against a withdrawn directive (read it against whether a mute was intended), and transport_receive_dropped has a legitimately non-zero tail. Every reason in this family is pre-registered at zero at process start (resolve_media_handles), so the healthy reading is a flat zero series, NOT 'No data'. A genuine 'No data' here is a fault in the metrics pipeline - recorder not installed, scrape failing, pod down, or wrong job label - and must never be read as 'no drops occurred'. The sentence this replaces claimed a Prometheus counter materialises no series until first incremented and that 'No data' was therefore the normal reading: true of a lazily-created counter, but never true of THIS family, and it contradicted the present-and-flat-at-zero paragraph below it. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on. TWO REASONS ARE DECLARED BUT CANNOT FIRE TODAY AND ARE NOT LIVE DETECTORS: partial_frame_discard (unreachable until video - audio is one frame per datagram, so the stream-carried path has no producer) and stream_rate_limited (unreachable until uni-streams/video, for the same reason - MH opens no uni-streams this story). A permanently flat series for either is correct, not a fault; do not go looking for a bug behind it. A FLAT PANEL IS AMBIGUOUS AND ALWAYS WILL BE: this family reads present-and-flat-at-zero both when the handler is idle and when no media session ever started, and the two are byte-identical here. Discriminate with Media Session Starts by Outcome first, then with mh_media_frames_dropped_total{reason=\"transport_receive_dropped\"} - flat means no datagram ever arrived, moving means MH received them and never read them. Counted as increase() rather than rate() per ADR-0029 Category A: a single discrete drop under rate() renders as a near-zero rate at any realistic scrape cadence, which reads IDENTICAL TO HEALTHY on the one panel whose purpose is that a single drop is visible. The reason vocabulary and its direction mapping are NOT restated here - see docs/observability/metrics/mh-service.md §Media Forward Path. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook. ENTRY-POINT SPLIT (story 3): the media-protocol codec reject tokens (unknown_version, truncated, payload_length_exceeds_max, ...) appear ONLY here, direction=ingress: they are the decode_datagram / stream header-decode entry point. A failure of the rewrite_relay_region entry point is NOT a codec token on this panel: it is relay_rewrite_failed on Egress Drops by Reason (direction=egress). There is no entry_point label; direction is the split.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -254,7 +267,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 9
       },
       "id": 4,
       "options": {
@@ -293,7 +306,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Frames MH discarded on the relay-to-subscriber side, broken out by reason. Counted per edge for every reason here EXCEPT `no_subscriber`, which counts once per FRAME because the frame reached zero edges and there is no per-edge event to count (docs/observability/metrics/mh-service.md §Media Forward Path). A responder must not scale the `no_subscriber` series as an edge count. LOOPBACK WAS REMOVED IN STORY 2 (R-3), SO A FLAT ZERO NO LONGER MEANS ANYTHING SPECIAL, and two reasons are routinely NON-ZERO in a healthy meeting: connection_closed (a subscriber left underneath a send) and no_subscriber (MH received a frame from a sender whose installed policy names no egress edge for it - ordinarily the in-flight tail when a sender's last holder leaves, before the sender's updated, empty send directive takes effect). Neither is a fault at that level; do not read a non-zero no_subscriber as MH failing. A solo participant does NOT feed no_subscriber: MC directs it to send nothing (mc_media_send_directives_total{outcome=\"emitted_empty_targets\"}), so it produces no frames here at all. SUSTAINED no_subscriber is the catalog's reading - a publisher connected and sending while nobody is subscribed to it, remedy MC's assignment (docs/observability/metrics/mh-service.md §Media Forward Path). Every reason in this family is pre-registered at zero at process start (resolve_media_handles), so the healthy reading is a flat zero series, NOT 'No data'. A genuine 'No data' here is a fault in the metrics pipeline - recorder not installed, scrape failing, pod down, or wrong job label - and must never be read as 'no drops occurred'. The sentence this replaces claimed a Prometheus counter materialises no series until first incremented and that 'No data' was therefore the normal reading: true of a lazily-created counter, but never true of THIS family, and it contradicted the present-and-flat-at-zero paragraph below it. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on. TWO REASONS ARE DECLARED BUT CANNOT FIRE TODAY AND ARE NOT LIVE DETECTORS: partial_frame_discard (unreachable until video - audio is one frame per datagram, so the stream-carried path has no producer) and stream_rate_limited (unreachable until uni-streams/video, for the same reason - MH opens no uni-streams this story). A permanently flat series for either is correct, not a fault; do not go looking for a bug behind it. A FLAT PANEL IS AMBIGUOUS AND ALWAYS WILL BE: this family reads present-and-flat-at-zero both when the handler is idle and when no media session ever started, and the two are byte-identical here. Discriminate with Media Session Starts by Outcome first, then with mh_media_frames_dropped_total{reason=\"transport_receive_dropped\"} - flat means no datagram ever arrived, moving means MH received them and never read them. Counted as increase() rather than rate() per ADR-0029 Category A: a single discrete drop under rate() renders as a near-zero rate at any realistic scrape cadence, which reads IDENTICAL TO HEALTHY on the one panel whose purpose is that a single drop is visible. The reason vocabulary and its direction mapping are NOT restated here - see docs/observability/metrics/mh-service.md §Media Forward Path. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
+      "description": "Frames MH discarded on the relay-to-subscriber side, broken out by reason. Counted per edge for every reason here EXCEPT `no_subscriber`, which counts once per FRAME because the frame reached zero edges and there is no per-edge event to count (docs/observability/metrics/mh-service.md §Media Forward Path). A responder must not scale the `no_subscriber` series as an edge count. LOOPBACK WAS REMOVED IN STORY 2 (R-3), SO A FLAT ZERO NO LONGER MEANS ANYTHING SPECIAL, and two reasons are routinely NON-ZERO in a healthy meeting: connection_closed (a subscriber left underneath a send) and no_subscriber (MH received a frame from a sender whose installed policy names no egress edge for it - ordinarily the in-flight tail when a sender's last holder leaves, before the sender's updated, empty send directive takes effect). Neither is a fault at that level; do not read a non-zero no_subscriber as MH failing. A solo participant does NOT feed no_subscriber: MC directs it to send nothing (mc_media_send_directives_total{outcome=\"emitted_empty_targets\"}), so it produces no frames here at all. SUSTAINED no_subscriber is the catalog's reading - a publisher connected and sending while nobody is subscribed to it, remedy MC's assignment (docs/observability/metrics/mh-service.md §Media Forward Path). Every reason in this family is pre-registered at zero at process start (resolve_media_handles), so the healthy reading is a flat zero series, NOT 'No data'. A genuine 'No data' here is a fault in the metrics pipeline - recorder not installed, scrape failing, pod down, or wrong job label - and must never be read as 'no drops occurred'. The sentence this replaces claimed a Prometheus counter materialises no series until first incremented and that 'No data' was therefore the normal reading: true of a lazily-created counter, but never true of THIS family, and it contradicted the present-and-flat-at-zero paragraph below it. There is deliberately no 'or vector(0)' in this query: it would fabricate a series and flatten the by-reason breakdown that triage depends on. TWO REASONS ARE DECLARED BUT CANNOT FIRE TODAY AND ARE NOT LIVE DETECTORS: partial_frame_discard (unreachable until video - audio is one frame per datagram, so the stream-carried path has no producer) and stream_rate_limited (unreachable until uni-streams/video, for the same reason - MH opens no uni-streams this story). A permanently flat series for either is correct, not a fault; do not go looking for a bug behind it. A FLAT PANEL IS AMBIGUOUS AND ALWAYS WILL BE: this family reads present-and-flat-at-zero both when the handler is idle and when no media session ever started, and the two are byte-identical here. Discriminate with Media Session Starts by Outcome first, then with mh_media_frames_dropped_total{reason=\"transport_receive_dropped\"} - flat means no datagram ever arrived, moving means MH received them and never read them. Counted as increase() rather than rate() per ADR-0029 Category A: a single discrete drop under rate() renders as a near-zero rate at any realistic scrape cadence, which reads IDENTICAL TO HEALTHY on the one panel whose purpose is that a single drop is visible. The reason vocabulary and its direction mapping are NOT restated here - see docs/observability/metrics/mh-service.md §Media Forward Path. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook. ENTRY-POINT SPLIT (story 3): relay_rewrite_failed here (direction=egress) is the rewrite_relay_region entry point; the codec tokens on Ingress Drops by Reason are the decode entry point. There is no entry_point label.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -347,7 +360,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 9
       },
       "id": 5,
       "options": {
@@ -414,7 +427,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 16
+        "y": 17
       },
       "id": 6,
       "options": {
@@ -507,7 +520,7 @@
         "h": 8,
         "w": 9,
         "x": 6,
-        "y": 16
+        "y": 17
       },
       "id": 7,
       "options": {
@@ -600,7 +613,7 @@
         "h": 8,
         "w": 9,
         "x": 15,
-        "y": 16
+        "y": 17
       },
       "id": 19,
       "options": {
@@ -633,6 +646,19 @@
       ],
       "title": "Mean Fan-out (egress forwards per ingress forward)",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "id": 211,
+      "panels": [],
+      "title": "Egress Admission and Policy Bounds",
+      "type": "row"
     },
     {
       "datasource": {
@@ -693,7 +719,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 24
+        "y": 26
       },
       "id": 8,
       "options": {
@@ -786,7 +812,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 24
+        "y": 26
       },
       "id": 9,
       "options": {
@@ -890,7 +916,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 34
       },
       "id": 10,
       "options": {
@@ -1005,7 +1031,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 34
       },
       "id": 18,
       "options": {
@@ -1109,7 +1135,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 40
+        "y": 42
       },
       "id": 12,
       "options": {
@@ -1213,7 +1239,7 @@
         "h": 8,
         "w": 8,
         "x": 12,
-        "y": 40
+        "y": 42
       },
       "id": 13,
       "options": {
@@ -1280,7 +1306,7 @@
         "h": 8,
         "w": 4,
         "x": 20,
-        "y": 40
+        "y": 42
       },
       "id": 14,
       "options": {
@@ -1414,7 +1440,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 48
+        "y": 50
       },
       "id": 11,
       "options": {
@@ -1529,7 +1555,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 48
+        "y": 50
       },
       "id": 17,
       "options": {
@@ -1633,7 +1659,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 56
+        "y": 58
       },
       "id": 15,
       "options": {
@@ -1748,7 +1774,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 56
+        "y": 58
       },
       "id": 16,
       "options": {
@@ -1783,109 +1809,24 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
-      "description": "Per-stream ingress attribution drops (story 3 R-20). unmatched_stream: the uplink relay id names no stream MC declared for the bound sender (declaration drift, or a sender labelling outside its declaration). transport_mismatch: a declared stream on another transport (a sender or contract fault). Zero is healthy: both are zero-initialised, so a flat 0 is calm and an ABSENT series is a fault. Saturation-or-input tokens, deliberately not on the Zero-Forever panel. Ingress drops, inside the ingress accounting identity. Rates (ADR-0029); pod-level, no identity. Layout and alerts: OBS-B. key_custody=operator.",
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "axisLabel": "Frames/s"
-          }
-        },
-        "overrides": []
-      },
+      "collapsed": false,
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 1,
+        "w": 24,
         "x": 0,
-        "y": 64
+        "y": 66
       },
-      "id": 20,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "editorMode": "code",
-          "expr": "sum by (reason) (rate(mh_media_frames_dropped_total{direction=\"ingress\",reason=~\"unmatched_stream|transport_mismatch\"}[$__rate_interval]))",
-          "legendFormat": "{{reason}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Attribution Drops (unmatched_stream / transport_mismatch)",
-      "type": "timeseries"
+      "id": 212,
+      "panels": [],
+      "title": "Stream Transport (stream-per-group, story 3)",
+      "type": "row"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "mh_media_paused_source_frames_total: frames on a PAUSED (client-muted) source stream (story 3 R-17). An ARRIVAL OVERLAY, NOT A DROP: PAUSED forwards, so these frames are already in mh_media_frames_forwarded_total{direction=\"ingress\"}; never add this to the received total. Brief arrivals around a mute toggle are expected; SUSTAINED is a client sending while client-muted (runbook and alert: OPS-B / OBS-B). Rates (ADR-0029). key_custody=operator.",
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "axisLabel": "Frames/s"
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 64
-      },
-      "id": 21,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "editorMode": "code",
-          "expr": "sum by (instance) (rate(mh_media_paused_source_frames_total[$__rate_interval]))",
-          "legendFormat": "paused arrivals {{instance}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Paused-Source Arrivals",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "$datasource"
-      },
-      "description": "mh_media_group_starts_total (story 3 MH-A2). ingress: accepted publisher group streams whose first frame was attributed (refused or attribution-failed streams never count); egress: downlink group streams actually opened to subscribers. Egress over ingress is the mean destinations a group reaches. Rates (ADR-0029); pod-level, no kind, no identity. Layout and alerts: OBS-B. key_custody=operator.",
+      "description": "mh_media_group_starts_total (story 3 MH-A2). ingress: accepted publisher group streams whose first frame was attributed (refused or attribution-failed streams never count); egress: downlink group streams actually opened to subscribers. Egress over ingress is the mean destinations a group reaches. Rates (ADR-0029); pod-level, no kind, no identity. key_custody=operator. Alert-linked: MHVideoKeyframeStorm reads the ingress rate (see Group Starts per Open Ingress Group); MHVideoSubscriberBacklogResets reads the egress rate. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -1899,7 +1840,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 72
+        "y": 67
       },
       "id": 22,
       "options": {
@@ -1934,7 +1875,111 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "mh_media_group_resets_total (story 3 R-12): downlink group streams MH RESET for ONE destination (never finished: a half-written frame never looks complete). One per downlink group abandoned for a destination, whether or not its uni stream was opened (a full channel or backlog overflow on an edge with N live downlinks counts 1+N); not a subset of group starts. subscriber_backlog = a slow destination past MH_EGRESS_STREAM_BACKLOG_BYTES; publisher_reset / publisher_stall = the publisher side ended the group mid-frame; source_ended / edge_removed = routine leave / reassignment. Drop-contract resets of an already-gone subscriber are deliberately uncounted. Counts groups, not frames. Zero-initialised: flat 0 is calm, ABSENT is a pipeline fault. increase() per interval (ADR-0029 Category A). Layout and alerts (A2): OBS-B. key_custody=operator.",
+      "description": "MHVideoKeyframeStorm's ratio: fleet ingress group starts per open publisher group stream, i.e. 1 / mean group lifetime, against the rule's threshold 0.5 / min(mc_media_video_keyframe_min_interval_seconds) (half the rate the directed minimum keyframe interval allows; MC's gauge, no literal). Every ingress group start is a keyframe. Above the line for 10 minutes fires the rule; check MH pod age first (a burst after an MH roll is expected), then split request storm vs self-key loop on client-media Video Keyframes Produced by Cause. The rule uses a 10m window; this panel uses the rate interval. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 67
+      },
+      "id": 196,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mh_media_group_starts_total{direction=\"ingress\"}[$__rate_interval])) / sum(avg_over_time(mh_media_stream_ingress_groups[$__rate_interval]))",
+          "legendFormat": "group starts per open group per second",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "0.5 / min(mc_media_video_keyframe_min_interval_seconds)",
+          "legendFormat": "MHVideoKeyframeStorm threshold",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Group Starts per Open Ingress Group vs Keyframe Ceiling (stream transport)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_group_resets_total (story 3 R-12): downlink group streams MH RESET for ONE destination (never finished: a half-written frame never looks complete). One per downlink group abandoned for a destination, whether or not its uni stream was opened (a full channel or backlog overflow on an edge with N live downlinks counts 1+N); not a subset of group starts. subscriber_backlog = a slow destination past MH_EGRESS_STREAM_BACKLOG_BYTES; publisher_reset / publisher_stall = the publisher side ended the group mid-frame; source_ended / edge_removed = routine leave / reassignment. Drop-contract resets of an already-gone subscriber are deliberately uncounted. Counts groups, not frames. Zero-initialised: flat 0 is calm, ABSENT is a pipeline fault. increase() per interval (ADR-0029 Category A). key_custody=operator. Per-path recovery stays on this panel (story 3 R-12 accepts it); the fleet share is alerted (MHVideoSubscriberBacklogResets, see Subscriber-Backlog Reset Share). Split by pod (instance) so a responder can see when one pod carries that alert: on a small fleet one slow subscriber can hold it. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -1947,8 +1992,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 72
+        "x": 0,
+        "y": 75
       },
       "id": 23,
       "options": {
@@ -1969,8 +2014,8 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "sum by (reason) (increase(mh_media_group_resets_total[$__rate_interval]))",
-          "legendFormat": "{{reason}}",
+          "expr": "sum by (instance, reason) (increase(mh_media_group_resets_total[$__rate_interval]))",
+          "legendFormat": "{{reason}} {{instance}}",
           "range": true,
           "refId": "A"
         }
@@ -1983,7 +2028,104 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "mh_media_stream_ingress_groups: publisher group streams being read now, process-wide (RAII-moved, a true count). mh_media_stream_sources_declared: STREAM_PER_GROUP source streams declared across installed policies (recomputed at each apply/release). Gauges, bare (ADR-0029). The per-CONNECTION uni-stream limit is in the bounds panel and is NOT the limit of the process-wide groups gauge. key_custody=operator.",
+      "description": "MHVideoSubscriberBacklogResets' ratio: subscriber_backlog resets over egress group starts, fleet-wide; the red line is the rule's 10%. It OVER-READS the true share (resets are per destination, up to three per egress group start, and not a subset of starts). On a fleet with fewer than about 30 active stream destinations (Kind included) a single slow subscriber can cross the line: read Stream-Path Group Resets by Reason (per destination), split by pod, and the meeting size first. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.1
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 75
+      },
+      "id": 197,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mh_media_group_resets_total{reason=\"subscriber_backlog\"}[$__rate_interval])) / sum(rate(mh_media_group_starts_total{direction=\"egress\"}[$__rate_interval]))",
+          "legendFormat": "subscriber_backlog resets / egress group starts",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Subscriber-Backlog Reset Share (stream transport, fleet)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_stream_ingress_groups: publisher group streams being read now, process-wide (RAII-moved, a true count). mh_media_stream_sources_declared: STREAM_PER_GROUP source streams declared across installed policies (recomputed at each apply/release). Gauges, bare (ADR-0029). The per-CONNECTION uni-stream limit is in the bounds panel and is NOT the limit of the process-wide groups gauge. key_custody=operator. mh_media_stream_ingress_groups is the A1 (MHVideoKeyframeStorm) denominator: about one open group per actively-sending source per handler. mh_media_stream_sources_declared is NOT: it counts PAUSED, DROP_AT_INGRESS and unwatched sources too. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -1995,7 +2137,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 80
+        "y": 83
       },
       "id": 24,
       "options": {
@@ -2041,7 +2183,111 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "mh_media_uni_streams_per_connection_limit: the declared QUIC max_concurrent_uni_streams handed to quinn, PER CONNECTION (not the limit of the process-wide groups gauge). Gauge, bare; flat by design, a step is a config roll. key_custody=operator.",
+      "description": "mh_media_egress_stream_backlog_bytes: bytes charged across every destination's stream backlog on the pod, SAMPLED every 10 s by the session actor from the per-destination budgets (never per chunk; a writer still draining after its edge left the snapshot is not counted, a short tail). The second line is the pod's CHARGE BOUND, mh_media_egress_stream_backlog_limit_bytes x mh_media_egress_stream_ceiling: the backlog term story 3 R-21's startup check validates against the pod memory limit. It is the charge bound, NOT memory (real allocation adds a factor on top), so in-use near the line is backlog pressure, not an OOM warning; MHHighMemory is the memory alert. The per-destination cap stays its own stat. Gauges, bare (ADR-0029). key_custody=operator. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 83
+      },
+      "id": 198,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_egress_stream_backlog_bytes)",
+          "legendFormat": "in use {{instance}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (instance) (mh_media_egress_stream_backlog_limit_bytes * mh_media_egress_stream_ceiling)",
+          "legendFormat": "charge bound {{instance}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Stream-Path Backlog In Use vs Charge Bound",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_uni_streams_per_connection_limit: the declared QUIC max_concurrent_uni_streams handed to quinn, PER CONNECTION (not the limit of the process-wide groups gauge). Gauge, bare; flat by design, a step is a config roll. key_custody=operator. Shown as its own stat, never as a threshold line over the process-wide groups gauge.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -2052,8 +2298,8 @@
       "gridPos": {
         "h": 8,
         "w": 4,
-        "x": 12,
-        "y": 80
+        "x": 0,
+        "y": 91
       },
       "id": 25,
       "options": {
@@ -2099,8 +2345,8 @@
       "gridPos": {
         "h": 8,
         "w": 4,
-        "x": 16,
-        "y": 80
+        "x": 4,
+        "y": 91
       },
       "id": 26,
       "options": {
@@ -2146,8 +2392,8 @@
       "gridPos": {
         "h": 8,
         "w": 4,
-        "x": 20,
-        "y": 80
+        "x": 8,
+        "y": 91
       },
       "id": 27,
       "options": {
@@ -2182,7 +2428,323 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "mh_media_keyframe_requests_sent_total: KeyframeRequests actually WRITTEN to publishers, once per (source stream, GoP counter), never retried. initial = every MH-originated request (join, switch, subscriber connect, recovery after any abandonment, repair of a group refused at the stream-open limit), not first-join only; receiver_recovery = a remapped receiver RecoveryRequest. Rates (ADR-0029). Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "description": "Per-stream ingress attribution drops (story 3 R-20). unmatched_stream: the uplink relay id names no stream MC declared for the bound sender (declaration drift, or a sender labelling outside its declaration). transport_mismatch: a declared stream on another transport (a sender or contract fault). Zero is healthy: both are zero-initialised, so a flat 0 is calm and an ABSENT series is a fault. Saturation-or-input tokens, deliberately not on the Zero-Forever panel. Ingress drops, inside the ingress accounting identity. Rates (ADR-0029); pod-level, no identity. key_custody=operator. Also stream_rate_limited (a stream refused at the stream-open rate limit, after its header was read) and partial_frame_discard (a group stream ended while a frame HEADER was only partly buffered; a stream ending mid-PAYLOAD is not counted here - that frame is already forwarded{ingress} - and shows as group resets instead; MH's own teardown/abort also counts here, so a small tail on disconnects is normal, not a zero-forever signal). On the stream path transport_mismatch, unmatched_stream and stream_rate_limited count ONCE PER REFUSED STREAM (the stream is stopped), so they are lower bounds on frames lost; server_muted and no_policy count per frame (Ingress Drops by Reason). transport_mismatch is one arm of MHTransportInconsistent (see that panel). TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Frames/s"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 91
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(mh_media_frames_dropped_total{direction=\"ingress\",reason=~\"unmatched_stream|transport_mismatch|stream_rate_limited|partial_frame_discard\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Stream-Path Ingress Drops (attribution, rate limit, partial frame)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The two arms of MHTransportInconsistent: policy applies refused as rejected_transport_inconsistent (an egress's candidates declare different transport modes, or a candidate names an undeclared source stream) and ingress streams dropped as transport_mismatch (a declared stream on the wrong transport). Either above the red line at 0 for 15 minutes fires the rule: version skew within the v3 era or a mis-ordered cutover. MC's own per-stream echo mismatch pages separately (MC Media, MCMediaGenerationDivergence). Rates (ADR-0029). key_custody=operator. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video. Zero is healthy: the counter is zero-initialised, so a flat 0 is calm and an ABSENT series is a fault (pipeline or pod), not calm. The rule's mismatch arm is increase(...[20m]) > 0, not a rate: on the stream path a refused stream can be the only event (the SDK does not re-key after MH's stop, and MH requests no keyframe for a datagram-declared source), so one refusal must hold the rule past its for: 15m. Its user symptom is silence on those subscribers' slots.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 99
+      },
+      "id": 201,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mh_media_policy_applies_total{outcome=\"rejected_transport_inconsistent\"}[$__rate_interval]))",
+          "legendFormat": "rejected_transport_inconsistent (policy applies)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mh_media_frames_dropped_total{reason=\"transport_mismatch\"}[$__rate_interval]))",
+          "legendFormat": "transport_mismatch (ingress streams)",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "MHTransportInconsistent Arms (ALERTED)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_paused_source_frames_total: frames on a PAUSED (client-muted) source stream (story 3 R-17). An ARRIVAL OVERLAY, NOT A DROP: PAUSED forwards, so these frames are already in mh_media_frames_forwarded_total{direction=\"ingress\"}; never add this to the received total. Brief arrivals around a mute toggle are expected; SUSTAINED is a client sending while client-muted (alert MHPausedSourceIngress, drawn as a ratio on Paused-Source Share of Ingress; MH runbook Scenario 23). Rates (ADR-0029). key_custody=operator. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Frames/s"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 99
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (instance) (rate(mh_media_paused_source_frames_total[$__rate_interval]))",
+          "legendFormat": "paused arrivals {{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Paused-Source Arrivals",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "MHPausedSourceIngress' ratio: frames arriving on PAUSED (client-muted) source streams over every ingress frame forwarded (mh_media_frames_forwarded_total{direction=ingress}, once per ingress frame; paused is a subset of it). The red line is the rule's 1%, which tolerates the legitimate race at a mute toggle; sustained above it for 15 minutes is a client sending while its user muted - a client privacy defect. These frames are forwarded, never dropped (story 3 R-17). TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 107
+      },
+      "id": 202,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mh_media_paused_source_frames_total[$__rate_interval])) / sum(rate(mh_media_frames_forwarded_total{direction=\"ingress\"}[$__rate_interval]))",
+          "legendFormat": "paused / forwarded ingress",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Paused-Source Share of Ingress (ALERTED)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 115
+      },
+      "id": 213,
+      "panels": [],
+      "title": "Keyframes, Recovery and Pending Edges (story 3)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_keyframe_requests_sent_total: KeyframeRequests actually WRITTEN to publishers, once per (source stream, GoP counter), never retried. initial = every MH-originated request (join, switch, subscriber connect, recovery after any abandonment, repair of a group refused at the stream-open limit), not first-join only; receiver_recovery = a remapped receiver RecoveryRequest. Rates (ADR-0029). Story 3 MH-B; pod-level, no kind, no identity, no counter value. key_custody=operator. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -2196,7 +2758,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 88
+        "y": 116
       },
       "id": 28,
       "options": {
@@ -2231,7 +2793,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "mh_media_recovery_requests_received_total: receiver RecoveryRequests by outcome (forwarded, duplicate, stale, counter_ahead, source_mismatch, unmapped_slot, malformed). Deduped by counter against the same per-source record as MH's own requests. forwarded = accepted for forwarding, not delivered (delivery: keyframe_requests_sent{trigger=receiver_recovery}). Rates (ADR-0029). Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "description": "mh_media_recovery_requests_received_total: receiver RecoveryRequests by outcome (forwarded, duplicate, stale, counter_ahead, source_mismatch, unmapped_slot, malformed). Deduped by counter against the same per-source record as MH's own requests. forwarded = accepted for forwarding, not delivered (delivery: keyframe_requests_sent{trigger=receiver_recovery}). Rates (ADR-0029). Story 3 MH-B; pod-level, no kind, no identity, no counter value. key_custody=operator. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -2245,7 +2807,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 88
+        "y": 116
       },
       "id": 29,
       "options": {
@@ -2280,7 +2842,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "mh_media_edges_pending: stream edges waiting for a group start from an assigned FORWARD source (subscriber and publisher both on this handler), tick-sampled every 10 s. Summed across pods. Nothing retries: a stuck pending edge is a missing event. Blind spot: an edge whose publisher is not connected to this handler is excluded; that case shows on the client's unfulfilled-slot series (dt_client_media_slots_unfulfilled). Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "description": "mh_media_edges_pending: stream edges waiting for a group start from an assigned FORWARD source (subscriber and publisher both on this handler), tick-sampled every 10 s. Summed across pods. Nothing retries: a stuck pending edge is a missing event. Blind spot: an edge whose publisher is not connected to this handler is excluded; that case shows on the client's unfulfilled-slot series (dt_client_media_slots_unfulfilled). Story 3 MH-B; pod-level, no kind, no identity, no counter value. key_custody=operator. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -2294,7 +2856,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 96
+        "y": 124
       },
       "id": 30,
       "options": {
@@ -2329,7 +2891,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "mh_media_edge_pending_oldest_seconds: age of the oldest pending edge per pod (max), tick-sampled; 0 when none. Max across pods. Excludes edges whose publisher is not connected to this handler (see the client's unfulfilled-slot series). Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "description": "mh_media_edge_pending_oldest_seconds: age of the oldest pending edge per pod (max), tick-sampled; 0 when none. Max across pods. Excludes edges whose publisher is not connected to this handler (see the client's unfulfilled-slot series). Story 3 MH-B; pod-level, no kind, no identity, no counter value. key_custody=operator. ALERT-LINKED: MHVideoEdgeStuckPending fires when this exceeds the second line, 10 x mc_media_video_keyframe_min_interval_seconds (MC's gauge; no literal), for 5 minutes. Pending has no give-up timeout while assigned and nothing retries, so a line above the threshold is a missing event. Its blind spot (publisher not on this handler) is the client's Video Slot Unfulfilled Duration panel. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -2341,7 +2903,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 96
+        "y": 124
       },
       "id": 31,
       "options": {
@@ -2366,6 +2928,17 @@
           "legendFormat": "oldest pending",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "10 * max(mc_media_video_keyframe_min_interval_seconds)",
+          "legendFormat": "MHVideoEdgeStuckPending threshold (10 x directed min keyframe interval)",
+          "range": true,
+          "refId": "B"
         }
       ],
       "title": "Oldest Pending Edge",
@@ -2376,7 +2949,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "mh_media_keyframe_request_write_failures_total: keyframe requests never delivered (a failed control-stream write, and every request counted at once after that publisher's control stream failed). Expected-empty: zero is healthy — zero-initialised, so a healthy reading is a flat 0 and an ABSENT series is a fault, not calm. Rate (ADR-0029). Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "description": "mh_media_keyframe_request_write_failures_total: keyframe requests never delivered (a failed control-stream write, and every request counted at once after that publisher's control stream failed). Expected-empty: zero is healthy — zero-initialised, so a healthy reading is a flat 0 and an ABSENT series is a fault, not calm. Rate (ADR-0029). Story 3 MH-B; pod-level, no kind, no identity, no counter value. key_custody=operator. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -2390,7 +2963,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 96
+        "y": 124
       },
       "id": 32,
       "options": {
@@ -2425,7 +2998,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "mh_media_edge_pending_duration_seconds: how long pending episodes lasted, observed at EXIT only (buckets to 300 s): a still-stuck edge shows only on Oldest Pending Edge. p50/p99 from _bucket. Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "description": "mh_media_edge_pending_duration_seconds: how long pending episodes lasted, observed at EXIT only (buckets to 300 s): a still-stuck edge shows only on Oldest Pending Edge. p50/p99 from _bucket. Story 3 MH-B; pod-level, no kind, no identity, no counter value. key_custody=operator. The server-side decomposition of the slot-active-to-first-render open objective (docs/observability/slos.md): the MH half of a slot's wait. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -2437,7 +3010,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 104
+        "y": 132
       },
       "id": 33,
       "options": {
@@ -2483,7 +3056,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "mh_media_edge_pending_exits_total: one per pending exit (group_start, abandoned_source_left, superseded, paused_forward_nothing = PAUSED or DROP_AT_INGRESS, edge_removed incl. the subscriber leaving the handler). Rates (ADR-0029). Story 3 MH-B; pod-level, no kind, no identity, no counter value. Layout, alert-linked panels and thresholds: OBS-B. key_custody=operator.",
+      "description": "mh_media_edge_pending_exits_total: one per pending exit (group_start, abandoned_source_left, superseded, paused_forward_nothing = PAUSED or DROP_AT_INGRESS, edge_removed incl. the subscriber leaving the handler). Rates (ADR-0029). Story 3 MH-B; pod-level, no kind, no identity, no counter value. key_custody=operator. TYPE-BLIND: MH carries no media_kind; this is stream-per-group (stream transport) traffic, which MC's assignment is what makes video.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -2497,7 +3070,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 104
+        "y": 132
       },
       "id": 34,
       "options": {

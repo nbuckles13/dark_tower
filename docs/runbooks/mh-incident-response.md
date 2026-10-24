@@ -2124,9 +2124,14 @@ that is MC's half (MC Scenario 21). If the slot reads ACTIVE but nothing renders
 **Severity**: Warning
 **Runbook Section**: `#scenario-20-video-keyframe-storm`
 
-**What this is.** Ingress video group starts per declared stream-per-group source (`mh_media_stream_sources_declared`) have stayed above half the
-rate the minimum keyframe interval allows (0.5 / `mc_media_video_keyframe_min_interval_seconds`)
-for 10 minutes. The alert reads `mh_media_group_starts_total{direction="ingress"}`, which MH counts
+**What this is.** Ingress video group starts per open publisher group stream
+(`mh_media_stream_ingress_groups`, averaged over the window) have stayed above half the rate the
+minimum keyframe interval allows (0.5 / `min(mc_media_video_keyframe_min_interval_seconds)`) for 10
+minutes. Read as group lifetime: the fleet's mean group is shorter than twice the directed interval.
+The denominator is the open-group gauge, not `mh_media_stream_sources_declared`: declared sources
+include PAUSED, DROP_AT_INGRESS and unwatched streams that key nothing, so dividing by them would
+hide a storm in proportion to idle sources. `min()` over MC instances is the false-positive-safe side
+under an MC config skew. The alert reads `mh_media_group_starts_total{direction="ingress"}`, which MH counts
 itself. A patched client can neither inflate nor hide that series, so it is the server-side
 truth about how often publishers key.
 
@@ -2158,10 +2163,12 @@ truth about how often publishers key.
 **Detection**
 
 ```promql
-# The alert's shape: ingress group starts per declared stream-per-group source, vs the bound.
+# The alert's shape: ingress group starts per open publisher group stream, vs the bound.
 sum(rate(mh_media_group_starts_total{direction="ingress"}[10m]))
-  / clamp_min(sum(mh_media_stream_sources_declared), 1)
-0.5 / max(mc_media_video_keyframe_min_interval_seconds)
+  / clamp_min(sum(avg_over_time(mh_media_stream_ingress_groups[10m])), 1)
+0.5 / min(mc_media_video_keyframe_min_interval_seconds)
+# Idle-source context (not the denominator): declared stream-per-group sources.
+sum(mh_media_stream_sources_declared)
 
 # What MH asked for, and why
 sum by (trigger) (rate(mh_media_keyframe_requests_sent_total[10m]))
@@ -2304,9 +2311,19 @@ client's `dt_client_media_send_groups_stopped_total{outcome="open_stalled"}`.
 
 **Memory: exhaustion is a counted reset, never an OOM kill.** R-21 validates backlog cap × streams
 against `MH_POD_MEMORY_LIMIT_BYTES` (the downward-API limit) at startup, and MH refuses to boot if
-the product does not fit. **There is no backlog-in-use gauge today.** MH exports only the cap,
-`mh_media_egress_stream_backlog_limit_bytes`. Use the cap plus the `subscriber_backlog` reset rate
-as the in-use proxy. The only memory alert is the existing `MHHighMemory`
+the product does not fit. **Backlog in use** is `mh_media_egress_stream_backlog_bytes` (since
+OBS-B: bytes charged across every installed edge's stream backlog on the pod, SAMPLED on the session
+actor's 10 s pending tick, never moved per chunk; a draining writer whose edge already left the
+routing snapshot is not counted, a short tail), beside the per-destination cap `mh_media_egress_stream_backlog_limit_bytes` and the
+pod's charge bound (cap × `mh_media_egress_stream_ceiling`) on the MH Media dashboard. It is the
+CHARGE, not memory: in-use near the bound is backlog pressure, not an OOM warning.
+
+```promql
+max by (instance) (mh_media_egress_stream_backlog_bytes)
+max by (instance) (mh_media_egress_stream_backlog_limit_bytes * mh_media_egress_stream_ceiling)
+```
+
+The only memory alert is the existing `MHHighMemory`
 (`container_memory_usage_bytes / container_spec_memory_limit_bytes` for `container="mh-service"`;
 [Scenario 8](#scenario-8-resource-pressure)). If it fires together with this alert, the
 startup check did not hold, and that is a `media-handler` defect.
@@ -2368,7 +2385,7 @@ sum(mh_media_edges_pending)
 sum by (outcome) (rate(mh_media_edge_pending_exits_total[15m]))   # group_start should dominate
 
 # The client half: ACTIVE video slots showing neither decodable video nor an avatar (no identity)
-histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[15m])))
+histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[5m])))
 max by (media_kind) (dt_client_media_slots_unfulfilled{media_kind="video"})   # ONE browser's last value, not a fleet count; never read as healthy at 0
 ```
 

@@ -113,6 +113,14 @@ async fn a_slow_subscriber_is_reset_at_its_cap_and_nobody_else_is_touched() {
                 EgressTerminal::Open
             );
             assert_eq!(resets(&metrics, GroupResetReason::SubscriberBacklog), 0);
+            // The slow destination holds its queued bytes, and the session
+            // tick's sampler (`publish_pending`, driven here directly) sums
+            // them into the pod gauge: positive control for the 0 below.
+            assert!(rig.cell(11).backlog_used() > 0, "slow edge holds bytes");
+            rig.routing.publish_pending(tokio::time::Instant::now());
+            metrics
+                .gauge("mh_media_egress_stream_backlog_bytes")
+                .assert_value_in_range(1.0..=f64::MAX);
         } else if !crossed {
             crossed = true;
             assert!(
@@ -184,6 +192,12 @@ async fn a_slow_subscriber_is_reset_at_its_cap_and_nobody_else_is_touched() {
     let resumed = &slow.egress_uni_streams()[1];
     assert_eq!(resumed.terminal(), EgressTerminal::Finished);
     assert!(parse_stream(&resumed.bytes())[0].group_start);
+    // Every exit (reset, finish, drain) released its charge, and the next
+    // tick's sample reads 0.
+    rig.routing.publish_pending(tokio::time::Instant::now());
+    metrics
+        .gauge("mh_media_egress_stream_backlog_bytes")
+        .assert_value(0.0);
 }
 
 /// ADR §10: concurrent unfinished groups stay at or below the application

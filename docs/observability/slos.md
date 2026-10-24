@@ -370,6 +370,31 @@ not the aggregate join latency: the window never appears in `mc_session_join_dur
 which stops at the JoinResponse. Why the window exists (and why it is not a debounce):
 `crates/mc-service/src/media_routing/connectivity.rs`.
 
+### Story 3 open objectives: join-to-first-rendered-video and slot-active-to-first-render
+
+Story 3 (R-30, ADR-0036 §10) adds two video objectives. Both are **OPEN**: no target is ratified, and
+**no test gates on a wall-clock number** for either, for the reasons above.
+
+| Objective | Histogram (client, `media_kind="video"`) | Measurement points |
+|---|---|---|
+| **Join-to-first-rendered-video** | `dt_client_media_time_to_first_render_ms` | From the video receiver's start (media start) to the first video frame RENDERED in any slot — delivered to the embedder's attached `VideoSink` without throwing. One sample per session. Read beside `dt_client_time_to_first_media_frame_ms{media_kind="video"}` (the WIRE boundary): a healthy wire time with no render time is "arriving but not showing". |
+| **Slot-active-to-first-render** | `dt_client_media_slot_active_to_first_render_ms` | From a video slot turning ACTIVE to its first rendered frame from its current source. One sample per ACTIVE entry that renders. **Survivorship-biased**: an entry that exits unrendered is not observed; read it with `dt_client_media_slot_unfulfilled_duration_ms`, which observes every exit (and feeds the `ClientVideoSlotUnfulfilled` alert, which is a fault detector, not this objective). |
+
+**Server-side decomposition of slot-active-to-first-render**: `mh_media_edge_pending_duration_seconds`
+(MH, observed at pending exit) is MH's half of the wait — an edge assigned a source, waiting for that
+source's group start. The rest is publisher keying and the receiver's decode and render. The MH
+histogram is type-blind; MC's assignment is what makes a stream edge video.
+
+Buckets are the SDK constants (`FIRST_RENDER_BUCKETS_MS`, `SLOT_UNFULFILLED_BUCKETS_MS` in
+`packages/sdk-core/src/media/setup/mediaMetrics.ts`); MH's are in its catalog row. Each extends past the
+10 s maximum directed keyframe interval.
+
+**What would close them**: measured distributions on Kind (the lower test profile) **and** on real
+networks at the production codec profile, then a ratified target with an error budget — story 8
+(performance). Until then the panels on `client-media.json` and `mh-media.json` are observation, and the
+alert thresholds (`MHVideoEdgeStuckPending`, `ClientVideoSlotUnfulfilled`: ten directed keyframe
+intervals) are fault bounds derived from config, **not** these objectives' targets.
+
 ### What *is* gated, so "never a gate" is not read as "unverified"
 
 The media path's correctness is gated **structurally** — on invariants that are deterministic and do
@@ -395,6 +420,7 @@ forward-path gates, Tier 2 regression deltas, Tier 3 non-gating objective).
 | `MCRegisterMeetingFailureRate` re-assert-failure alert | The MH target, then the handler-restart story | meeting-controller (rule), media-handler + observability + operations (reviewers) |
 | GC and AC availability numerators count client-attributable 4xx. GC's error class is `status_code=~"[45].."`; AC's numerator is `ac_errors_total` across ALL `error_category` values, including `authentication`, `authorization` and `validation` (400/409 client rejections) | Own scoping — moves a shipped baseline | observability |
 | No SLO for the MC→MH control plane's applied-generation echo | Handler-restart story | observability + operations |
+| Join-to-first-rendered-video and slot-active-to-first-render **targets** (story 3 R-30; histograms and measurement points in §Join-to-first-media above). Open by decision: observed, never gated | Kind and real-network measurements; story 8 (performance) | observability + client |
 | KEK **rotation latency** (departure → every remaining member holding the new generation) — **explicitly OPEN, no number ratified** (story 2 task 16). Instruments exist: `mc_meeting_kek_rotation_duration_seconds` and the pending-age gauge against the published W and overdue-threshold gauges. The only rule is `MCKekRotationOverdue`, a confidentiality page on a W multiple, not a latency objective. Do not read that page's threshold as the objective | Story 8 (performance) | observability + meeting-controller + security |
 
 Debt and rationale for each: `docs/TODO.md` §Observability Debt.

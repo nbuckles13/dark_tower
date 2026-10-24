@@ -754,16 +754,9 @@ fn media_kind_probe_point(marker: &str, kind: Option<Value>) -> NumberDataPoint 
             value: Some(AnyValue { value: Some(v) }),
         });
     }
-    let now_ns = u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos(),
-    )
-    .expect("timestamp fits u64");
     NumberDataPoint {
         attributes,
-        time_unix_nano: now_ns,
+        time_unix_nano: now_unix_ns(),
         value: Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(0)),
         ..Default::default()
     }
@@ -907,4 +900,278 @@ async fn test_metrics_media_kind_value_rule_fires_and_applies() {
             .any(|s| s.metric.get(MEDIA_KIND_KEY).map(String::as_str) == Some("bogus")),
         "media-kind-value-rule: a `{MEDIA_KIND_KEY}=\"bogus\"` series was stored"
     );
+}
+
+// ============================================================================
+// Story 3 OBS-B: FIRE + APPLY for the client video alert rules
+// (ClientVideoServerMutedSenderFrames A5, ClientVideoDecodeErrorRatio A6,
+// ClientVideoSlotUnfulfilled A9)
+// ============================================================================
+
+/// The client alert rules file the FIRE probes derive their expressions from.
+#[cfg(feature = "observability")]
+const CLIENT_RULES_FILE: &str = "client-alerts.yaml";
+
+#[cfg(feature = "observability")]
+fn now_unix_ns() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos(),
+    )
+    .expect("timestamp fits u64")
+}
+
+/// Datapoint attributes for a FIRE post: the per-run marker, the constant
+/// custody, the video kind and (when the selector needs it) a reason. Nothing
+/// else — no identity of any kind.
+#[cfg(feature = "observability")]
+fn fire_attrs(marker: &str, reason: Option<&str>) -> Vec<KeyValue> {
+    let mut v = vec![
+        string_attr("client_version", marker),
+        string_attr("key_custody", "operator"),
+        string_attr(env_tests::fixtures::metric_hygiene::MEDIA_KIND_KEY, "video"),
+    ];
+    if let Some(r) = reason {
+        v.push(string_attr("reason", r));
+    }
+    v
+}
+
+/// One DELTA monotonic Sum datapoint, as the SDK exports a counter.
+#[cfg(feature = "observability")]
+fn delta_counter(name: &str, value: i64, attrs: Vec<KeyValue>, start: u64, time: u64) -> Metric {
+    use opentelemetry_proto::tonic::metrics::v1::{number_data_point, AggregationTemporality, Sum};
+    Metric {
+        name: name.to_string(),
+        data: Some(Data::Sum(Sum {
+            data_points: vec![NumberDataPoint {
+                attributes: attrs,
+                start_time_unix_nano: start,
+                time_unix_nano: time,
+                value: Some(number_data_point::Value::AsInt(value)),
+                ..Default::default()
+            }],
+            aggregation_temporality: AggregationTemporality::Delta as i32,
+            is_monotonic: true,
+        })),
+        ..Default::default()
+    }
+}
+
+/// One DELTA histogram datapoint with `count` observations of `value` each.
+#[cfg(feature = "observability")]
+fn delta_histogram(
+    name: &str,
+    bounds: &[f64],
+    value: f64,
+    count: u64,
+    attrs: Vec<KeyValue>,
+    start: u64,
+    time: u64,
+) -> Metric {
+    use opentelemetry_proto::tonic::metrics::v1::{
+        AggregationTemporality, Histogram, HistogramDataPoint,
+    };
+    let idx = bounds
+        .iter()
+        .position(|b| value <= *b)
+        .unwrap_or(bounds.len());
+    let mut bucket_counts = vec![0_u64; bounds.len() + 1];
+    bucket_counts[idx] = count;
+    Metric {
+        name: name.to_string(),
+        data: Some(Data::Histogram(Histogram {
+            data_points: vec![HistogramDataPoint {
+                attributes: attrs,
+                start_time_unix_nano: start,
+                time_unix_nano: time,
+                count,
+                sum: Some(value * count as f64),
+                bucket_counts,
+                explicit_bounds: bounds.to_vec(),
+                ..Default::default()
+            }],
+            aggregation_temporality: AggregationTemporality::Delta as i32,
+        })),
+        ..Default::default()
+    }
+}
+
+/// `SLOT_UNFULFILLED_BUCKETS_MS` read out of the SDK source (its SSoT).
+/// COULD-NOT-EVALUATE if the const cannot be found or parsed.
+#[cfg(feature = "observability")]
+fn sdk_slot_unfulfilled_bounds() -> Vec<f64> {
+    use env_tests::fixtures::alert_rules_loaded::{ts_numeric_array_const, SDK_MEDIA_METRICS_TS};
+    let path = env_tests::repo_root().join(SDK_MEDIA_METRICS_TS);
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("COULD-NOT-EVALUATE: cannot read {}: {e}", path.display()));
+    ts_numeric_array_const(&src, "SLOT_UNFULFILLED_BUCKETS_MS")
+        .unwrap_or_else(|e| panic!("COULD-NOT-EVALUATE: {SDK_MEDIA_METRICS_TS}: {e}"))
+}
+
+/// (story 3 OBS-B) The client video alert rules FIRE and APPLY on the deployed
+/// pipeline: GC proxy (user JWT) -> collector (`delta_to_cumulative`) ->
+/// Prometheus scrape -> the rule's OWN expression.
+///
+/// For each rule the committed expr is read from `client-alerts.yaml`, and ONE
+/// matcher (`client_version="<per-run marker>"`) is added to each `dt_client_*`
+/// selector by the span-based kernel — nothing else changes, and the MC gauge
+/// selector A9 compares against is untouched. So the marked expr can be
+/// satisfied only by THIS run's posts: it must be EMPTY before them and
+/// NON-EMPTY after. The `for:` duration is never waited out, and no latency
+/// number is asserted: the A9 observation value is derived from the live MC
+/// gauge (twice the rule's bound), never a literal.
+///
+/// Env-tests are Rust, so the "patched client" of A5 (a receiver reporting
+/// `sender_server_muted` drops) is this authenticated OTLP post of the
+/// counter, the same bytes a browser would send.
+///
+/// Counters and histograms are DELTA, as the SDK exports them; two posts are
+/// sent, the second only after the first is visible in Prometheus (so they land
+/// in different scrapes), so `rate()` sees an increase. Two requests, each
+/// carrying all four series (A5's drops, A6's decoder errors and accepted
+/// frames, A9's histogram), well inside GC's per-user rate limit.
+///
+/// This is the FIRE of the client pipeline. The client rules' APPLY is carried
+/// by `dt-guard client-metrics-export` (names, label keys),
+/// `packages/web-app/tests/clientMetricNames.test.ts` (names, label values) and
+/// the browser read-backs (the live pipe).
+#[cfg(feature = "observability")]
+#[tokio::test]
+async fn test_story3_client_video_alerts_fire_and_apply() {
+    use env_tests::fixtures::alert_rules_loaded::{committed_alert_expr, inject_marker};
+    use env_tests::fixtures::metrics::{
+        eventually_returns_series, mc_video_min_keyframe_interval_seconds,
+    };
+
+    let cluster = cluster().await;
+    let token = shared_user_token(cluster).await;
+    let gc = GcClient::new(&cluster.gc_base_url);
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+
+    let run = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let cases = [
+        ("ClientVideoServerMutedSenderFrames", "a5"),
+        ("ClientVideoDecodeErrorRatio", "a6"),
+        ("ClientVideoSlotUnfulfilled", "a9"),
+    ];
+    let mut marked = Vec::new();
+    for (alert, short) in cases {
+        let expr = committed_alert_expr(CLIENT_RULES_FILE, alert);
+        let marker = format!("et31-fire-{short}-{run}");
+        let (m, n) = inject_marker(&expr, "dt_client_", "client_version", &marker)
+            .unwrap_or_else(|e| panic!("COULD-NOT-EVALUATE: marking `{alert}`: {e}"));
+        assert!(
+            n >= 1,
+            "COULD-NOT-EVALUATE: `{alert}` has no dt_client_ selector to mark: {expr}"
+        );
+        // Precondition: nothing but this run's (not yet sent) posts can match.
+        let pre = prom
+            .query_promql(&m)
+            .await
+            .unwrap_or_else(|e| panic!("COULD-NOT-EVALUATE: `{m}` failed: {e}"));
+        assert!(
+            pre.data.result.is_empty(),
+            "FIRE-PRECONDITION-NOT-EMPTY: `{alert}`'s marked expression already returns a \
+             series before this run posted anything; the marker is per run, so the probe is \
+             not isolated: {m}"
+        );
+        marked.push((alert, marker, m));
+    }
+
+    // A9's observation: twice the rule's bound, derived from the LIVE gauge.
+    let interval = mc_video_min_keyframe_interval_seconds(&prom).await;
+    let a9_value_ms = 2.0 * 10.0 * 1000.0 * interval;
+    let bounds = sdk_slot_unfulfilled_bounds();
+
+    let body = |start: u64, time: u64| -> Vec<u8> {
+        let m = |i: usize| marked[i].1.as_str();
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![
+                        delta_counter(
+                            "dt_client_media_frames_dropped_total",
+                            10,
+                            fire_attrs(m(0), Some("sender_server_muted")),
+                            start,
+                            time,
+                        ),
+                        delta_counter(
+                            "dt_client_media_decoder_errors_total",
+                            10,
+                            fire_attrs(m(1), None),
+                            start,
+                            time,
+                        ),
+                        delta_counter(
+                            "dt_client_media_frames_accepted_total",
+                            100,
+                            fire_attrs(m(1), None),
+                            start,
+                            time,
+                        ),
+                        delta_histogram(
+                            "dt_client_media_slot_unfulfilled_duration_ms",
+                            &bounds,
+                            a9_value_ms,
+                            20,
+                            fire_attrs(m(2), None),
+                            start,
+                            time,
+                        ),
+                    ],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+        .encode_to_vec()
+    };
+
+    let t0 = now_unix_ns();
+    let first = body(t0.saturating_sub(1_000_000_000), t0);
+    let resp = gc
+        .raw_ingest_telemetry("metrics", Some(token), Some(PROTOBUF_CT), first)
+        .await
+        .expect("network request should succeed");
+    assert_eq!(resp.status().as_u16(), 202, "FIRE post 1 must be accepted");
+
+    // The first post is visible (so the second lands in a LATER scrape).
+    let first_marker = &marked[0].1;
+    let visible = eventually_returns_series(
+        &prom,
+        &format!(r#"dt_client_media_frames_dropped_total{{client_version="{first_marker}"}}"#),
+    )
+    .await;
+    assert!(
+        visible,
+        "FIRE-NOT-OBSERVED: the first post never reached Prometheus via GC -> collector -> \
+         scrape; investigate the pipe before the rules"
+    );
+
+    let t1 = now_unix_ns();
+    let second = body(t0, t1);
+    let resp = gc
+        .raw_ingest_telemetry("metrics", Some(token), Some(PROTOBUF_CT), second)
+        .await
+        .expect("network request should succeed");
+    assert_eq!(resp.status().as_u16(), 202, "FIRE post 2 must be accepted");
+
+    for (alert, _, m) in &marked {
+        let fired = eventually_returns_series(&prom, m).await;
+        assert!(
+            fired,
+            "FIRE-NOT-OBSERVED: `{alert}` — its committed expression from {CLIENT_RULES_FILE}, \
+             with exactly one client_version marker matcher added to each dt_client selector \
+             and nothing else, returned no series after two posts of an adverse condition. \
+             Either the rule cannot fire on real client data (a selector/label the pipe does not \
+             carry, or a threshold the condition cannot reach) or the posts were not stored: \
+             {m}"
+        );
+    }
 }

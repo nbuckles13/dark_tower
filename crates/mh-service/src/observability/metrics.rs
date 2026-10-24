@@ -1873,6 +1873,13 @@ pub struct MediaMetricHandles {
     /// `mh_media_stream_ingress_groups`: publisher group streams being read
     /// right now, process-wide (moved by an RAII guard, never last-writer-wins).
     stream_ingress_groups: Gauge,
+    /// `mh_media_egress_stream_backlog_bytes`: bytes held across every
+    /// destination's stream backlog on the pod, tick-sampled: summed from every
+    /// per-destination budget's `used()` by `RoutingTable::publish_pending` on
+    /// the session actor's 10 s tick, never per chunk. Blind spot: a writer
+    /// still draining after its edge left the snapshot is not counted (a short
+    /// tail).
+    egress_stream_backlog_bytes: Gauge,
     /// `mh_media_keyframe_requests_sent_total`, indexed by [`KeyframeTrigger::ALL`].
     keyframe_requests_sent: [Counter; 2],
     /// `mh_media_keyframe_request_write_failures_total`.
@@ -2007,6 +2014,14 @@ impl MediaMetricHandles {
     #[must_use]
     pub const fn stream_ingress_groups(&self) -> &Gauge {
         &self.stream_ingress_groups
+    }
+
+    /// The pod's stream backlog in-use gauge, SET (tick-sampled) by
+    /// `RoutingTable::publish_pending` from every destination budget's
+    /// `used()` on the session actor's 10 s tick, never per chunk.
+    #[must_use]
+    pub const fn egress_stream_backlog_bytes(&self) -> &Gauge {
+        &self.egress_stream_backlog_bytes
     }
 
     /// `mh_media_keyframe_requests_sent_total{trigger}`: one per request
@@ -2190,6 +2205,14 @@ pub fn resolve_media_handles() -> MediaMetricHandles {
         "mh_media_stream_ingress_groups",
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     );
+    // Stream backlog in use (story 3 R-21): tick-sampled, SET by
+    // `RoutingTable::publish_pending` like the pending gauges; present at zero
+    // from boot.
+    let egress_stream_backlog_bytes = gauge!(
+        "mh_media_egress_stream_backlog_bytes",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    );
+    egress_stream_backlog_bytes.set(0.0);
 
     // Keyframe and recovery requests, pending edges (story 3 R-4, R-10, R-13,
     // R-30). No kind, no identity, no counter value, no timing: pod-level only.
@@ -2246,6 +2269,7 @@ pub fn resolve_media_handles() -> MediaMetricHandles {
         group_starts,
         group_resets,
         stream_ingress_groups,
+        egress_stream_backlog_bytes,
         keyframe_requests_sent,
         keyframe_request_write_failures,
         recovery_requests,

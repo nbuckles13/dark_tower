@@ -1,7 +1,7 @@
 //! On-demand keyframes and receiver recovery at MH (story 3 MH-B; R-4, R-9,
 //! R-10, R-11, R-12, R-13, R-30, R-33; story Design §Wire freeze, Amendment 4).
 //!
-//! One meeting of four real participants (A and E publish video, B and C
+//! One meeting of five real participants (A, E and F publish video, B and C
 //! receive), each joined through GC -> MC and connected to BOTH Kind MH pods.
 //! The forwarding policy is INJECTED on both pods through
 //! `env_tests::fixtures::injection` acting as MC, at a generation above MC's.
@@ -40,6 +40,23 @@
 //!     `TargetAbandoned` (inside E's minimum interval, through its single
 //!     deferral).
 //!
+//! (f) STUCK PENDING (story 3 OBS-B; FIRE for `MHVideoEdgeStuckPending`, A3):
+//!     F publishes with the never-keying source (`GroupStartSource::None`): one
+//!     stream-start group start, then CONTINUATION frames forever. Once MH has
+//!     seen F, C's edge on F is installed mid-group, so it waits for a group
+//!     start that never comes while continuations keep arriving — the strong
+//!     case (a silent publisher would only prove that nothing arriving does
+//!     not exit pending). MH requests a keyframe once (F's log records it,
+//!     unanswered: proof MH saw F's frames), and nothing retries. When each
+//!     pod's oldest pending age passes the rule's gauge-derived bound, the
+//!     rule's OWN expression (read from `mh-alerts.yaml`) returns a series.
+//!     PRECONDITION (asserted per pod, FIRE-PRECONDITION): every edge is
+//!     removed first and each pod's oldest pending age must fall to the bound
+//!     or below, so a stale pending edge from an earlier phase (B's edge on
+//!     the stopped A) cannot carry the FIRE.
+//!     The `for:` is never waited out, and no latency is asserted: the wait is
+//!     bounded by a poll on the gauge (a scrape settle, not a pass condition).
+//!
 //! Across the run, every publisher log records at most ONE request per
 //! (stream, counter) — per publisher CONNECTION, i.e. per pod.
 //!
@@ -55,10 +72,10 @@
 //!
 //! # Edge sum (README per-file edge-sum header rule)
 //!
-//! One test fn; P = 4 participants, each with N = 3 audio slots and at most
-//! M = 2 video slots: 4 x (3 + 2) = 20 (planned at most 30).
+//! One test fn; P = 5 participants, each with N = 4 audio slots and at most
+//! M = 2 video slots: 5 x (4 + 2) = 30 (planned at most 30).
 //!
-//! Edge-sum (concurrent Σ P×(N+M)): 20
+//! Edge-sum (concurrent Σ P×(N+M)): 30
 
 #![cfg(feature = "flows")]
 
@@ -111,6 +128,10 @@ const ABANDON_AFTER_FRAMES: u32 = 25;
 const B_SLOT_A: u32 = 700;
 const C_SLOT_A: u32 = 701;
 const C_SLOT_E: u32 = 703;
+const C_SLOT_F: u32 = 705;
+
+/// The rule whose FIRE half phase (f) is.
+const A3_ALERT: &str = "MHVideoEdgeStuckPending";
 /// A slot id B does not hold: `unmapped_slot`.
 const UNMAPPED_SLOT: u32 = 999;
 
@@ -278,21 +299,23 @@ async fn test_on_demand_keyframes_and_recovery() {
     let auth = AuthClient::new(&cluster.ac_base_url);
     let gc = GcClient::new(&cluster.gc_base_url);
     let mut ps =
-        participant::meeting_of(&auth, &gc, "Video Keyframes 39", &["A", "B", "C", "E"]).await;
+        participant::meeting_of(&auth, &gc, "Video Keyframes 39", &["A", "B", "C", "E", "F"]).await;
     let (x, y) = participant::two_offered_handlers("KEYFRAMES", &ps);
-    let (a, b, c, e) = (
+    let (a, b, c, e, f) = (
         ps[0].sender_id(),
         ps[1].sender_id(),
         ps[2].sender_id(),
         ps[3].sender_id(),
+        ps[4].sender_id(),
     );
     let mut sessions = open_sessions("KEYFRAMES", &ps, &[&x, &y]).await;
 
-    ps[0].declare(&[11, 12, 13], &[]).await;
-    ps[1].declare(&[21, 22, 23], &[]).await;
-    ps[2].declare(&[31, 32, 33], &[]).await;
-    ps[3].declare(&[41, 42, 43], &[]).await;
-    let all = [a, b, c, e];
+    ps[0].declare(&[11, 12, 13, 14], &[]).await;
+    ps[1].declare(&[21, 22, 23, 24], &[]).await;
+    ps[2].declare(&[31, 32, 33, 34], &[]).await;
+    ps[3].declare(&[41, 42, 43, 44], &[]).await;
+    ps[4].declare(&[51, 52, 53, 54], &[]).await;
+    let all = [a, b, c, e, f];
     let bound = window + participant::VIEW_MARGIN;
     for (i, me) in all.iter().enumerate() {
         let want: BTreeSet<u32> = all.iter().copied().filter(|s| s != me).collect();
@@ -348,7 +371,7 @@ async fn test_on_demand_keyframes_and_recovery() {
         v
     };
     let sources = || {
-        [a, e]
+        [a, e, f]
             .into_iter()
             .map(|s| {
                 injection::declared_source(
@@ -778,6 +801,137 @@ async fn test_on_demand_keyframes_and_recovery() {
         let (log, session) = p.stop().await;
         parked.push(session);
         assert_one_request_per_counter("KEYFRAMES (e)", &format!("E (pod {pod})"), &log);
+    }
+
+    eprintln!("[39] phase (f) STUCK PENDING: start");
+    let a3_expr =
+        env_tests::fixtures::alert_rules_loaded::committed_alert_expr("mh-alerts.yaml", A3_ALERT)
+            .trim()
+            .to_string();
+    // Recorded, not asserted: the expression is fleet-wide (max over pods), so
+    // a pending edge left by an unrelated suite could legitimately satisfy it
+    // already. The positive evidence below is per pod and ordered on F.
+    let pre = prom
+        .query_promql(&a3_expr)
+        .await
+        .unwrap_or_else(|e| panic!("COULD-NOT-EVALUATE: `{a3_expr}` failed: {e}"));
+    eprintln!(
+        "[39] phase (f): {A3_ALERT}'s expression returns {} series BEFORE the stuck edge \
+         (recorded control)",
+        pre.data.result.len()
+    );
+    let interval =
+        env_tests::fixtures::metrics::mc_video_min_keyframe_interval_seconds(&prom).await;
+    let bound_secs = 10.0 * interval;
+    // Failure bound for the oldest-pending poll: the edge must AGE past the
+    // bound, so the bound itself is added to the scrape/tick allowance (an
+    // interval above 9 s would otherwise outlast PINNED_METRIC_BOUND alone).
+    let pending_poll_bound =
+        Duration::from_secs_f64(bound_secs) + env_tests::fixtures::metrics::PINNED_METRIC_BOUND;
+
+    // FIRE-PRECONDITION, asserted per pod: remove every edge (B's edge on the
+    // stopped A from the earlier phases is otherwise still pending and aging,
+    // and would satisfy the oldest-pending poll below on its own). With no edge
+    // installed nothing can be pending, so each pod's oldest age must fall to
+    // the bound or below; only then is C's edge on F the one that crosses it.
+    install_all(&mut injections, 3, Vec::new(), sources()).await;
+    for h in &handlers {
+        poll_until_pinned_instance(
+            &prom,
+            "max by (instance) (mh_media_edge_pending_oldest_seconds)",
+            &h.pod_ip,
+            env_tests::fixtures::metrics::PINNED_METRIC_BOUND,
+            Duration::from_secs(2),
+            "FIRE-PRECONDITION: KEYFRAMES (f) NO STALE PENDING EDGE",
+            &format!(
+                "<= {bound_secs}s with no edge installed (a stale pending edge would make the \
+                 A3 FIRE below vacuous)"
+            ),
+            |v| v <= bound_secs,
+        )
+        .await;
+    }
+
+    let starts_promql = r#"sum by (instance) (mh_media_group_starts_total{direction="ingress"})"#;
+    let starts_base = injection::baselines(&prom, starts_promql).await;
+    let f_cfg = VideoPublisherConfig {
+        group_start: GroupStartSource::None,
+        frame_interval: FRAME_INTERVAL,
+        ..VideoPublisherConfig::new(f)
+    };
+    let f_pubs: Vec<RunningPublisher> = urls
+        .iter()
+        .map(|u| RunningPublisher::spawn(sessions[4].remove(*u).expect("F's session"), f_cfg))
+        .collect();
+    // MH has SEEN F's stream-start group on each pod before C's edge goes in,
+    // so the edge enters pending MID-GROUP, with continuations flowing.
+    injection::assert_rise(
+        &prom,
+        &handlers,
+        starts_promql,
+        &starts_base,
+        1,
+        "KEYFRAMES (f) F SEEN",
+    )
+    .await;
+    install_all(
+        &mut injections,
+        4,
+        vec![injection::declared_edge(
+            (c << 8) | 5,
+            c,
+            C_SLOT_F,
+            f,
+            VIDEO_SEND_ID,
+        )],
+        sources(),
+    )
+    .await;
+    // MH asked F once for a keyframe (it has F's counter, i.e. F's frames are
+    // arriving), and F never answers: the never-keying source.
+    for (pod, p) in f_pubs.iter().enumerate() {
+        until_log("KEYFRAMES (f)", &format!("F (pod {pod})"), p, |log| {
+            requests(log).iter().any(|(_, stream, _, outcome)| {
+                *stream == u32::from(VIDEO_SEND_ID) && *outcome == RequestOutcome::NotRequestDriven
+            })
+        })
+        .await;
+        assert!(
+            p.log()
+                .iter()
+                .filter(|ev| matches!(ev, PublisherEvent::GroupStart { .. }))
+                .count()
+                <= 1,
+            "KEYFRAMES (f): F (pod {pod}) started a second group; the never-keying source must \
+             send continuations only"
+        );
+    }
+    for h in &handlers {
+        poll_until_pinned_instance(
+            &prom,
+            "max by (instance) (mh_media_edge_pending_oldest_seconds)",
+            &h.pod_ip,
+            pending_poll_bound,
+            Duration::from_secs(2),
+            "KEYFRAMES (f) OLDEST PENDING",
+            &format!(
+                "> {bound_secs}s (10 x mc_media_video_keyframe_min_interval_seconds): C's edge \
+                 on the never-keying F stays pending while F's continuations arrive"
+            ),
+            |v| v > bound_secs,
+        )
+        .await;
+    }
+    let fired = env_tests::fixtures::metrics::eventually_returns_series(&prom, &a3_expr).await;
+    assert!(
+        fired,
+        "FIRE-NOT-OBSERVED: KEYFRAMES (f): `{A3_ALERT}`'s committed expression, read from \
+         mh-alerts.yaml, returned no series although each pod's oldest pending age passed the \
+         bound: {a3_expr}"
+    );
+    for p in f_pubs {
+        let (_, session) = p.stop().await;
+        parked.push(session);
     }
 
     eprintln!("[39] phase CLEANUP: start");

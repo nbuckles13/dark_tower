@@ -760,6 +760,238 @@ groups:
           impact: "Repeated disconnection of WebTransport sessions on this pod. Users on this pod lose media each restart."
           runbook_url: "docs/runbooks/mh-incident-response.md#scenario-11-pod-restarting-frequently"
 
+  # ======================================================================
+  # STORY 3 STREAM-PER-GROUP ("video") WARNINGS — OBS-B
+  # ======================================================================
+  # Authored by observability (story 3 OBS-B: one owner per alert); media-
+  # handler reviews; operations owns the runbook targets, no rules. All
+  # `warning`: R-12 accepts repeated per-path recovery. TYPE-BLIND: no MH
+  # series carries media_kind; "Video" here is the stream-per-group transport,
+  # which MC's assignment makes video.
+  # MC GAUGE DEPENDENCY (A1, A3): `mc_media_video_keyframe_min_interval_seconds`
+  # is MC's boot gauge from the validated directive value
+  # (MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS) — server-side, never client-reported
+  # (client gauges are last-writer-wins, so a patched client could suppress
+  # the rule). If no MC is scraped the RHS is empty and the rule SILENTLY stops
+  # evaluating; MCDown covers that. Both sides stay fully aggregated (no `by`)
+  # so their empty label sets match.
+  # APPLY for every rule: env-test 33 extracts each selector from the committed
+  # expr and asserts it returns a series from a real pod.
+  - name: mh-media-video-warning
+    interval: 60s
+    rules:
+      # ADR-0031 block — MHVideoKeyframeStorm (A1; R-11, R-12)
+      # MEANS: fleet-wide, groups (each one a keyframe) start about as fast as
+      # the directed interval allows: a request storm, or a self-key loop (the
+      # publisher keys whenever a target has no group in progress, including
+      # after its own abandonment). R-12 accepts one such path, not the fleet.
+      # PROVENANCE: a publisher keys at most once per max(directed interval,
+      # 100 ms floor) (R-11; validate-keyframe-floor-sync.sh pins MC's floor to
+      # the client's), so per sending source starts/s <= 1/interval; fire at
+      # half: 0.5/interval. The ratio is 1 / mean group lifetime.
+      # DENOMINATOR (departure, recorded): the task's
+      # `mh_media_stream_sources_active` was never landed and media-handler
+      # ruled it redundant. `mh_media_stream_ingress_groups` (RAII count of
+      # groups being read; ~1 per sending source per handler) is the live
+      # active-source measure. `_sources_declared` would under-read: it counts
+      # PAUSED, DROP_AT_INGRESS and unwatched sources, which send nothing.
+      # Caveats: the gauge rises at stream accept before attribution, and
+      # groups overlap at a boundary; both transient, bounded by the
+      # per-connection uni-stream limit, and err toward NOT firing.
+      # avg_over_time so a storm ending with all groups closed still reads;
+      # the guard sits on that same expression.
+      # min() (departure from the task's max(), recorded): the threshold FALLS
+      # as the interval rises, so min() is the conservative side under an MC
+      # config skew. Post-MH-roll bursts are expected: check pod age first.
+      # CLIENT-DRIVABLE (security, Gate 3): one publisher keying faster than
+      # directed (patched; bounded only by MH's stream-open rate limit)
+      # inflates the numerator and can carry the average on a small fleet.
+      # DEMONSTRATION (ADR-0036 §11, both halves):
+      #   | FIRE  | not induced: needs a fleet driven to its cap; one path is R-12's | — |
+      #   | APPLY | env-test 33: each selector of this expr | >= 1 series on a real pod |
+      - alert: MHVideoKeyframeStorm
+        expr: |
+          (
+            sum(rate(mh_media_group_starts_total{direction="ingress"}[10m]))
+            /
+            sum(avg_over_time(mh_media_stream_ingress_groups[10m]))
+          ) > 0.5 / min(mc_media_video_keyframe_min_interval_seconds)
+          and
+          sum(avg_over_time(mh_media_stream_ingress_groups[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-stream
+        annotations:
+          summary: "MH stream-path group starts are near the directed keyframe ceiling fleet-wide ({{ $value }} per open group per second)"
+          description: "Fleet publisher group starts per open ingress group have exceeded 0.5 / mc_media_video_keyframe_min_interval_seconds for 10 minutes: publishers are being driven toward their keyframe cap. CHECK MH POD AGE FIRST (a burst after an MH roll is expected). Then split on client-media Video Keyframes Produced by Cause: source=request means a request storm (mh_media_keyframe_requests_sent_total, mh_media_recovery_requests_received_total); source=abandonment means publishers re-keying after their own backlog abandonments (dt_client_media_send_groups_abandoned_total). One such path is accepted (R-12). A single publisher keying faster than directed (patched or buggy) can carry this average on a small fleet: check whether starts concentrate on one pod and whether stream_rate_limited drops are climbing before treating it as a fleet storm. If no MC is scraped this rule cannot evaluate (MCDown)."
+          impact: "Video bitrate goes to keyframes instead of quality and MH egress load rises; sustained, it feeds more abandonment. No media is lost outright."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-20-video-keyframe-storm"
+
+      # ADR-0031 block — MHVideoSubscriberBacklogResets (A2; R-10, R-12, R-21)
+      # MEANS: a systemic share of downlink groups is abandoned for subscriber
+      # backlog (MH_EGRESS_STREAM_BACKLOG_BYTES per destination); the leading
+      # indicator for egress exhaustion. Fleet only; per-path stays a panel.
+      # OVER-READS: resets are not a subset of egress starts (abandon before
+      # open; one overflow on an edge with N <= 2 live downlinks counts 1+N), so
+      # one slow path contributes at most 3p (p = its share of egress starts).
+      # SMALL-FLEET RESIDUAL: one path crosses 10% once p > ~3.3%, i.e. fewer
+      # than ~30 active stream destinations (Kind included). No floor, by
+      # decision (observability, Gate 1): no type-blind series counts stream
+      # destinations and an instance-breadth guard is fakeable, so any floor
+      # would be invented. The annotation sends the responder to pod and
+      # meeting size first. Guard on the denominator; `for:` = window.
+      # DEMONSTRATION (ADR-0036 §11, both halves):
+      #   | FIRE  | numerator only: env-test 38 phase (f) drives subscriber_backlog resets on one path | the counter rises; the ratio is not evaluated there |
+      #   | APPLY | env-test 33: each selector of this expr | >= 1 series on a real pod |
+      - alert: MHVideoSubscriberBacklogResets
+        expr: |
+          (
+            sum(rate(mh_media_group_resets_total{reason="subscriber_backlog"}[15m]))
+            /
+            sum(rate(mh_media_group_starts_total{direction="egress"}[15m]))
+          ) > 0.10
+          and
+          sum(rate(mh_media_group_starts_total{direction="egress"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-stream
+        annotations:
+          summary: "MH is abandoning a large share of stream-path downlink groups for subscriber backlog ({{ $value | humanizePercentage }})"
+          description: "subscriber_backlog resets have exceeded 10% of egress group starts fleet-wide for 15 minutes: subscriber destinations overflow their per-destination backlog (mh_media_egress_stream_backlog_limit_bytes) and MH resets their groups. The ratio over-reads the true share (resets are per destination and not a subset of starts). READ POD AND MEETING SIZE FIRST: on a small fleet (fewer than about 30 active stream destinations, Kind included) one slow subscriber can hold this; check MH Media's Stream-Path Group Resets by Reason (per destination), which is split by pod, before treating it as systemic. Per-path recovery is expected; this is the leading indicator for egress exhaustion."
+          impact: "Subscribers on affected paths see video freeze until the next group start; fleet-wide, egress capacity is short of the subscribed video."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-21-slow-video-subscriber-stream-credit-stall"
+
+      # ADR-0031 block — MHVideoEdgeStuckPending (A3; R-4, R-10, amendment 4)
+      # MEANS: a stream edge has been PENDING (assigned a FORWARD source, no
+      # group start) longer than any healthy exit takes. Pending is MH-internal,
+      # has NO GIVE-UP TIMEOUT while assigned, and nothing retries, so this is a
+      # MISSING EVENT and this gauge its only detector (new edges, new
+      # subscribers, post-abandonment resyncs, switches).
+      # PROVENANCE: each exit needs one group start, produced within one
+      # directed interval (the publisher keys any target with no group in
+      # progress, holding an early request as its single deferral); 10
+      # intervals (5 s at the default) adds transit margin and the 10 s sampler
+      # tick. max(): the bound SCALES UP with the interval, so max() is the
+      # conservative side under skew. Never widen it for the accepted residual:
+      # a directed capture that never starts unreported (an open permission
+      # prompt) stays pending until this or A9 fires — loud, owned by client
+      # capture-state reporting. Sub-bitrate uplinks re-enter pending (R-12),
+      # hence warning. BLIND SPOT: an edge whose publisher is not on this
+      # handler is never pending; ClientVideoSlotUnfulfilled covers it.
+      # Tick-sampled gauge, 0 from boot; `for: 5m`.
+      # CLIENT-DRIVABLE (security, Gate 3): max() means ONE edge holds it, and
+      # a patched publisher directed to send that never starts a group (the 39
+      # fixture's shape) holds it indefinitely; one stuck edge is not a fleet
+      # fault.
+      # DEMONSTRATION (ADR-0036 §11, both halves):
+      #   | FIRE  | env-test 39 phase (f): assigned publisher sends continuations, never a group start | this expr (from this file) returns a series past the gauge bound |
+      #   | APPLY | env-test 33: each selector of this expr | >= 1 series on a real pod |
+      - alert: MHVideoEdgeStuckPending
+        expr: |
+          max(mh_media_edge_pending_oldest_seconds) > 10 * max(mc_media_video_keyframe_min_interval_seconds)
+        for: 5m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-stream
+        annotations:
+          summary: "An MH stream edge has been waiting for a group start far past the directed keyframe interval ({{ $value }}s)"
+          description: "mh_media_edge_pending_oldest_seconds has exceeded 10 x mc_media_video_keyframe_min_interval_seconds for 5 minutes: an assigned stream edge has seen no group start for far longer than a publisher takes to key. Nothing retries, so this is a missing event, not a slow retry. Check MH pod age first. Then read mh_media_edge_pending_exits_total and mh_media_keyframe_requests_sent_total{trigger=initial}: no request means MH never saw the source (the publisher should key unprompted); requests with no exit mean the publisher is not answering; mh_media_keyframe_request_write_failures_total rising means the request never reached the publisher (its control stream is gone). max() means one edge holds this, and a patched publisher that is directed but never starts a group holds it indefinitely: one stuck edge is not a fleet fault. A directed camera whose capture never starts (an open permission prompt) holds this until reported. Blind spot: a publisher not connected to this handler is never pending here (ClientVideoSlotUnfulfilled covers it). If no MC is scraped this rule cannot evaluate (MCDown)."
+          impact: "At least one subscriber sees a frozen or blank tile for a slot MC reports live, while every liveness signal reads healthy."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-22-video-slot-stuck-pending"
+
+      # ADR-0031 block — MHPausedSourceIngress (A4; R-17)
+      # MEANS: frames arrive on a stream MC's policy marks PAUSED (client-
+      # muted). Sustained: media leaves a device its user muted — a CLIENT
+      # PRIVACY DEFECT. COUNTED, NOT DROPPED (R-17): a resume keyframe that
+      # beats MC's update must still reach subscribers; 1% over 15m tolerates
+      # that race. DENOMINATOR is the existing once-per-ingress-frame
+      # forwarded{ingress} (MH-A1 keeps that identity on the stream path, at
+      # header completion); paused is incremented at that same site, after it
+      # (media/forward.rs, media/stream_ingress.rs), so paused ⊆
+      # forwarded{ingress}. Never add paused to a received total; no second
+      # ingress counter. Guard on the denominator; `for:` = window.
+      # DEMONSTRATION (ADR-0036 §11, both halves):
+      #   | FIRE  | counter only: env-test 37 phase (e) sends on a PAUSED stream | paused counter rises; the ratio is not evaluated |
+      #   | APPLY | env-test 33: each selector of this expr | >= 1 series on a real pod |
+      - alert: MHPausedSourceIngress
+        expr: |
+          (
+            sum(rate(mh_media_paused_source_frames_total[15m]))
+            /
+            sum(rate(mh_media_frames_forwarded_total{direction="ingress"}[15m]))
+          ) > 0.01
+          and
+          sum(rate(mh_media_frames_forwarded_total{direction="ingress"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-stream
+        annotations:
+          summary: "Clients are sending media on streams their users muted ({{ $value | humanizePercentage }} of ingress)"
+          description: "mh_media_paused_source_frames_total has exceeded 1% of mh_media_frames_forwarded_total{direction=ingress} for 15 minutes: frames arrive on source streams MC marks PAUSED (client-muted). MH forwards them by design (a resume keyframe that beats MC's update must reach subscribers), and 1% over 15 minutes tolerates that race at a toggle. Sustained, a client keeps sending after its user muted: a client privacy defect, not an MH fault. Correlate with SDK release and dt_client_media_mute_transitions_total. Never add this counter to an ingress received total."
+          impact: "Media from users who believe they are muted may be reaching other participants."
+          runbook_url: "docs/runbooks/mh-incident-response.md#scenario-23-client-sending-while-client-muted"
+
+      # ADR-0031 block — MHTransportInconsistent (A8; R-20, R-25)
+      # MEANS (either arm): rejected_transport_inconsistent — an egress's
+      # candidates declare different transport modes, or a candidate names an
+      # undeclared source stream (mixed meetings are legal; an edge's transport
+      # derives from its candidate's declared stream); transport_mismatch — a
+      # declared stream arrived on the wrong transport (once per refused
+      # stream). Scope: skew within the v3 era or a cutover applied out of the
+      # required order (config -> MH -> MC -> SDK); rollback across v2->v3 is all components
+      # together (R-25). Warning, `for: 15m` absorbs a rollout tail.
+      # SPARSE ARMS vs `for: 15m` over [5m] (observability, Gate 3): each event
+      # holds the condition ~5m, so the rule fires only while events recur.
+      #   apply arm: a refused apply installs nothing, so MC's confirm reads a
+      #     generation mismatch on that push and re-pushes on every structural
+      #     change; the persistent case is backstopped by MC's PAGE
+      #     MCMediaGenerationDivergence on the same push.
+      #   mismatch arm: CAN BE ONE-SHOT (media-handler, Gate 3). On the stream
+      #     path it is a uni stream for a source DECLARED DATAGRAM; MH
+      #     STOP_SENDINGs it, the SDK does not re-key after an MH stop
+      #     (videoEgress.ts, "whoever decides an abandonment repairs it"), and
+      #     MH requests no keyframe for a datagram-declared source (its edges
+      #     are datagram edges, never pending, so MHVideoEdgeStuckPending can
+      #     NOT backstop it). That is the default for a mis-ordered cutover.
+      #     So this arm is `increase()[20m] > 0` (DEPARTURE from the task's
+      #     rate()[5m], recorded): one refused stream holds the condition past
+      #     `for: 15m` plus the evaluation interval, matching "any non-zero is
+      #     a skew signal". Its user symptom is silence on those subscribers'
+      #     slots.
+      # MC's own
+      # per-stream echo mismatch is NOT duplicated: it pages via
+      # MCMediaGenerationDivergence (operations confirmed). No ratio, no guard.
+      # CLIENT-DRIVABLE ARM (security, Gate 3): `transport_mismatch` can come
+      # from ONE client sending a declared stream on the wrong transport;
+      # `rejected_transport_inconsistent` comes from MC's RegisterMeeting and
+      # is not client-reachable. Only-transport_mismatch on one pod may be one
+      # misbehaving client, not skew: the annotation says check before rollback.
+      # DEMONSTRATION (ADR-0036 §11, both halves):
+      #   | FIRE  | env-test 37: phase (c) wrong-transport stream; phase (f) refused registrations | each arm (selected by content) returns a series |
+      #   | APPLY | env-test 33: each selector of this expr | >= 1 series on a real pod |
+      - alert: MHTransportInconsistent
+        expr: |
+          sum(rate(mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}[5m])) > 0
+          or
+          sum(increase(mh_media_frames_dropped_total{reason="transport_mismatch"}[20m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: mh-service
+          component: media-control-plane
+        annotations:
+          summary: "MH sees transport-mode disagreement between declared streams and what arrives or is assigned ({{ $value }}: apply arm per second, mismatch arm count in 20m)"
+          description: "MH has refused policy applies as rejected_transport_inconsistent continuously for 15 minutes (candidates declaring different transport modes, or naming an undeclared source stream), or dropped at least one ingress stream as transport_mismatch within the last 20 minutes (a declared stream on the wrong transport; a single refusal can be the only event). MC, MH and the SDK disagree about which stream rides which transport: version skew within the v3 era, or a cutover applied out of the required order (config -> MH -> MC -> SDK). Check which component rolled last. BEFORE ANY ROLLBACK: transport_mismatch alone, concentrated on one pod, may be one misbehaving client rather than skew (one client can produce it; rejected_transport_inconsistent comes only from MC's registrations). Rollback across the v2 to v3 break is all components together. MC's own per-stream echo mismatch pages separately as MCMediaGenerationDivergence."
+          impact: "Affected streams are refused or never programmed: participants on the mismatched path lose that stream's media while signalling reads healthy."
+          runbook_url: "docs/runbooks/mh-deployment.md#mixed-transport-rollback-hazard"
+
   - name: mh-service-info
     interval: 60s
     rules:

@@ -457,9 +457,10 @@ sum(increase(mh_media_policy_applies_total{outcome="rejected_transport_inconsist
 mh_media_stream_admission_rejection_ratio
 mh_media_stream_admission_rejection_ratio_threshold
 
-# 3. Backlog and memory. NO backlog-in-use gauge exists: read the cap beside the
-#    subscriber_backlog reset rate (item 5) as the in-use proxy (MH Scenario 21).
-mh_media_egress_stream_backlog_limit_bytes
+# 3. Backlog and memory: backlog in use against the pod's charge bound (cap x stream ceiling),
+#    then memory (MH Scenario 21). In-use is the CHARGE, not memory.
+max by (instance) (mh_media_egress_stream_backlog_bytes)
+max by (instance) (mh_media_egress_stream_backlog_limit_bytes * mh_media_egress_stream_ceiling)
 container_memory_usage_bytes{container="mh-service"} / container_spec_memory_limit_bytes{container="mh-service"}   # MHHighMemory's ratio; limit reaches MH as MH_POD_MEMORY_LIMIT_BYTES
 
 # 4. Pending edges: count, and oldest age against the min keyframe interval that scales A3 (MH Scenario 22)
@@ -503,8 +504,10 @@ count(dt_client_media_frames_received_total{media_kind="video"})
   [§Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard) before anything else.
 - [ ] 2. The MH admission rejection ratio is below its threshold gauge on every pod
   ([MH Scenario 18](mh-incident-response.md#scenario-18-media-egress-budget-exhaustion)).
-- [ ] 3. MH backlog and memory are in bounds. **There is no backlog-in-use gauge today.** Read the
-  cap (`mh_media_egress_stream_backlog_limit_bytes`) beside the item-5 reset rate as the proxy. Memory
+- [ ] 3. MH backlog and memory are in bounds. Backlog in use (`mh_media_egress_stream_backlog_bytes`)
+  stays below the pod's charge bound (`mh_media_egress_stream_backlog_limit_bytes` ×
+  `mh_media_egress_stream_ceiling`) and returns toward 0 as meetings end (sampled every 10 s, so
+  expect step changes, not a smooth line). Memory
   vs `MH_POD_MEMORY_LIMIT_BYTES` stays well under `MHHighMemory`'s threshold, because startup validated
   cap × streams against that limit ([MH Scenario 21](mh-incident-response.md#scenario-21-slow-video-subscriber-stream-credit-stall)).
 - [ ] 4. `mh_media_edges_pending` follows joins and returns to near zero.
@@ -1126,7 +1129,14 @@ fields `echo_arm` and `echo_stream_number`, never as labels (and no sender id):
 *(History: before MC-A, MC compared the single superseded `RegisterMeetingResponse.transport_mode`,
 and the token had its story-2 meaning.)*
 
-**MH side: warning A8 (`for: 15m`), written by OBS-B.**
+**MH side: warning `MHTransportInconsistent` (A8; `mh-alerts.yaml`, OBS-B).** Two arms with
+different firing shapes. The **apply arm** (`rate()[5m] > 0`, `for: 15m`) fires only while refusals
+RECUR for 15 minutes; a one-off refusal in a quiet meeting is backstopped by MC's page
+(`MCMediaGenerationDivergence` on the same push). The **mismatch arm**
+(`increase(mh_media_frames_dropped_total{reason="transport_mismatch"}[20m]) > 0`) fires on a
+**single** refused stream, because that event can be the only one (see the `transport_mismatch` row
+below): it fires once `for: 15m` elapses after that refusal and clears about 20 minutes after it,
+so it can be active for only ~5 minutes, and clearing is not recovery.
 `mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}` (MH-A1) means MH refused
 a whole registration. It has two arms, and their remedies differ:
 - **One egress's candidates' declared streams differ in transport.** This is a contract fault in
@@ -1143,7 +1153,7 @@ reasons separate the per-frame causes, and their remedies differ:
 
 | `mh_media_frames_dropped_total{direction="ingress", reason=…}` (MH-A1) | Means | Remedy |
 |---|---|---|
-| `transport_mismatch` | The frame matched a declared stream, keyed by (connection-bound sender, uplink relay `stream_id` = the publisher-stamped `SendStream.stream_number`), but arrived on the other transport. | A **sender or contract fault**: a client sending video as datagrams or audio on a stream. Route to `client`, with `media-handler`. |
+| `transport_mismatch` | The frame matched a declared stream, keyed by (connection-bound sender, uplink relay `stream_id` = the publisher-stamped `SendStream.stream_number`), but arrived on the other transport. **It can be ONE-SHOT and the stream stays dark:** a group stream for a source declared datagram is STOP_SENDING'd, the SDK does not re-key after an MH stop, and MH requests no keyframe for a datagram-declared source (its edges are never pending, so `MHVideoEdgeStuckPending` cannot see it). Subscribers of that source get silence on its slot; nothing server-side repairs it, and the publisher's rejoin (a fresh directed start) is the user-side recovery. | **Fork before any rollback.** (1) Fleet-wide or on several pods, and some component rolled recently: a **cutover applied out of the required order** (config → MH → MC → SDK), the default cause; complete the order, see [Story 3 cutover](#story-3-cutover-see-each-other-order-skew-detection-rollback). (2) Only on one pod, no recent rollout: likely **one misbehaving client** (a single client can produce it); route to `client`, with `media-handler`. Never roll back on (2). |
 | `unmatched_stream` | No declared stream matches (sender, uplink `stream_id`). | **MC/MH declaration drift**: MC did not list a stream the publisher is sending. At intermediate branch commits before MC-B (never in a shipped build), that includes a story-2 MC registering on MH-A1's transitional no-`source_streams` path. Route to `meeting-controller`, and check the MC build first. |
 
 **Against a story-2 MH (before MH-A1)** none of these exist. The registration is rejected **whole**
