@@ -53,7 +53,15 @@ spec:
   # Spike S6 finding: locally this passed only because rootless podman rewrites the
   # host's source address; a rootful Docker runner delivers the real source and
   # Calico enforces the policy.
-  - from: []
+  # Run 7: `from: []` also admitted other namespaces' pods (40_resilience caught it),
+  # so admit only non-pod sources. 192.168.0.0/16 is Kind's podSubnet
+  # (kind-config.yaml.tmpl) -- spike only; the real fix belongs in an overlay
+  # (prod admits the ingress gateway instead).
+  - from:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 192.168.0.0/16
     ports:
     - protocol: TCP
       port: 8082
