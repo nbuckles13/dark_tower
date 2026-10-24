@@ -1716,7 +1716,10 @@ client-media board's *Video Slot Unfulfilled* panels rise. One of these is non-z
 **Where to look next.** `dt_client_media_recovery_requests_sent_total{source}` says whether the
 client asked for recovery and why; MH's own recovery-request outcome counters say whether MH
 forwarded it (`duplicate`, `stale`, `counter_ahead`, `source_mismatch` are not forwarded). Then
-[`mh-incident-response.md`](mh-incident-response.md) for the MH half.
+[`mc-incident-response.md` Scenario 23](mc-incident-response.md#scenario-23-client-video-slot-unfulfilled)
+for the fork on MH's pending gauge, and
+[`mh-incident-response.md` Scenario 22](mh-incident-response.md#scenario-22-video-slot-stuck-pending)
+for the MH half.
 
 **A flat recovery counter is not "no losses".** A recovery-request WRITE that fails is not counted on
 `recovery_requests_sent_total`; it surfaces only once per session as the `mediaFault`
@@ -1727,6 +1730,119 @@ before reading a flat line as healthy.
 video slots declared, no video receiver is built at all (the SDK gates it on declared video slots) and
 audio is unaffected. Server-side, MC's `MC_MAX_VIDEO_RECEIVE_SLOTS=0` lever turns video off for every
 client (R-26).
+
+---
+
+### F23 — Camera permission denied
+
+**Symptom.** You joined as a video publisher and your own tile reads "your camera stopped working;
+others see your camera as off: camera permission was denied". Everyone else sees your video slot as an avatar ("turned their
+camera off"), never as a frozen or pending tile. Audio is unaffected.
+
+**What it means.** The browser refused `getUserMedia` for the camera. R-19 requires a failed or
+revoked camera to present to others as video-muted, and the SDK counts it:
+`dt_client_media_capture_failures_total{media_kind="video", outcome="permission_denied"}`. The other
+outcomes on that series point elsewhere: `no_device`, `device_unavailable` (another app holds the
+camera), `unsupported`, `platform_unsupported`, `unknown`, and `ended` (the camera was unplugged or
+the permission was revoked mid-call).
+
+**Fix.**
+- Re-grant the camera for this exact origin (`http://<org-subdomain>.localhost:5173`) in Chrome's
+  address-bar site settings, then reload. A permission granted to a different subdomain does not
+  carry over.
+- No camera on this machine, or several participants on one box: use the test-pattern build
+  (`DT_TEST_PATTERN=1 scripts/dev-web.sh`; see `scripts/dev-web.sh --help`, §VIDEO DEMO) rather than
+  sharing one camera.
+- A permission prompt left OPEN, neither accepted nor denied, is different. It reports no
+  failure, so watchers' slots can stay unfulfilled. That is a known accepted residual: see F26 and
+  [`mc-incident-response.md` Scenario 23](mc-incident-response.md#scenario-23-client-video-slot-unfulfilled).
+
+### F24 — "No video in a tab"
+
+**Symptom.** A tab shows no video from anyone (or from one person), while audio works.
+
+**Fork in this order. The slot text on each video cell is the diagnosis** (`data-slot-state` carries
+the raw wire token):
+
+1. **Media start failed with `VideoCodecUnsupportedError`.** The browser cannot encode or decode VP8 at
+   the directed profile. R-8 makes that fail loudly at media start, never mid-call. The browser test
+   substrate is probed for VP8 the same way (R-28), so a red Layer-7 VP8 precondition on the same
+   machine is the same cause. Use a current Chrome. Mid-call decode errors are NOT this: see
+   [`mc-incident-response.md` Scenario 22](mc-incident-response.md#scenario-22-client-video-decode-failures).
+2. **The test-pattern camera is not built in.** `DT_TEST_PATTERN=1` is a **build-time** gate
+   (`__DT_TEST_PATTERN__` in `packages/web-app/vite.config.ts`), absent from the production bundle by
+   design (R-27, proven by the bundle test). Setting it after the bundle was built does nothing.
+   Relaunch `scripts/dev-web.sh` with it set. Its startup banner prints `test pattern: ON requested`.
+3. **Video cap 0, or the slot reads `unavailable`** ("this meeting allows fewer video slots"). This is
+   the per-kind cap or the R-26 video-off lever (`MC_MAX_VIDEO_RECEIVE_SLOTS=0`). See F18.
+   `VITE_DT_VIDEO_RECEIVE_SLOTS=0` declares no video slots at all.
+4. **The slot reads an `avatar_*` reason.** These are correct states, not faults:
+   - `avatar_no_video` ("is not sending video"): that participant publishes no video, or receives
+     only;
+   - `avatar_client_muted` ("turned their camera off"): they muted, or their camera failed (F23);
+   - `avatar_server_muted` ("camera was turned off by the host").
+
+   `fewer_sources_than_slots` means nobody is left to fill the slot.
+5. **The slot reads `active` and shows nothing.** That is F26.
+
+For decoder errors and video drop tokens, use
+[`mc-incident-response.md` Scenario 22](mc-incident-response.md#scenario-22-client-video-decode-failures)
+rather than a copy here. Stream-level drops are F22.
+
+### F25 — A v2 directive is refused: a stale MC against a v3 SDK
+
+**Symptom.** You joined and are watched, but you send nothing on either kind, so nobody sees or hears
+you. `dt_client_media_send_directive_header_version_refused_total` is non-zero. It is kind-free,
+one per refused directive, and reads zero forever against a conforming MC.
+
+**What it means.** MC directed a frame header version this SDK cannot send. v3 is the only version
+(R-22), so the SDK refuses the **whole** directive, fail-closed: nothing is sent. The cause is an MC
+image from before the story-3 cutover serving a story-3 bundle. Check the MC image on both MC pods.
+The skew rows and the all-together rollback rule are in
+[`mh-deployment.md` §Story 3 cutover](mh-deployment.md#story-3-cutover-see-each-other-order-skew-detection-rollback).
+The reverse skew, an old SDK meeting the new MC, is refused at join as
+`header_version_unsupported` ([`mc-incident-response.md` Scenario 8](mc-incident-response.md#scenario-8-join-failures)).
+
+**Fix.** Redeploy so MC and the bundle are from the same side of the cutover, then reload every tab.
+On the WSL2 host, use `./infra/kind/scripts/setup.sh` (§3 Step 1). Inside a devloop container the
+equivalent is `dev-cluster deploy`.
+
+### F26 — A live slot shows neither video nor an avatar (unfulfilled)
+
+**Symptom.** A video cell reads `active` ("showing ..."), but shows a frozen frame or the previous
+avatar and never updates. The R-35 statistics overlay (F27) shows that slot's *unfulfilled* time
+growing. On the client-media board the *Video Slot Unfulfilled* panels rise
+(`dt_client_media_slot_unfulfilled_duration_ms`, `dt_client_media_slots_unfulfilled`). Neither
+series carries an identity or slot id.
+
+**What it means.** MC says real video should be arriving and nothing decodable is. Each episode
+should end within one minimum keyframe interval. **Do not triage it here.** It forks on MH's pending
+gauge, and the full ladder is
+[`mc-incident-response.md` Scenario 23](mc-incident-response.md#scenario-23-client-video-slot-unfulfilled),
+which points to MH Scenario 22 for the MH half. Locally, the cheapest checks are:
+- whether the publisher's own tile reports a camera problem (F23);
+- whether its permission prompt is still open, which is the accepted residual;
+- whether F22's stream drops are rising.
+
+### F27 — Local triage tools: the R-7 self-check and the R-35 statistics overlay
+
+**What they are.** "Show debug options" opens a panel, off by default, on the join screen and in the
+meeting (`packages/web-app/src/views/DebugPanel.svelte`). It holds two tools:
+- **Camera and microphone self-check (R-7).** It renders your camera and shows a microphone LEVEL
+  METER, straight from the local capture, never through the encoder, packetiser or a handler. The
+  microphone is metered and never played back, because audible playback in a meeting would be
+  re-captured and sent. Use it to
+  separate "my device or permission is broken" (F23) from "the call path is broken" before you join.
+- **Statistics overlay (R-35).** Per slot and per sent stream it shows packet and bit rates,
+  jitter-buffer depth, decode and drop counts, keyframes, and unfulfilled time. It is the fastest way
+  to see which slot is stuck (F26) or which drop is rising (F22), on this machine.
+
+**They are LOCAL ONLY. Nothing in the panel is sent, recorded or reported.** Neither tool exports
+anything to telemetry (enforced by `packages/web-app/tests/debugNeverExported.test.ts`). The only
+persisted bit is whether the panel was open (`darktower.debugPanel.v1` in `localStorage`). The
+self-check never re-opens a device without a fresh click. So the panel cannot be used to read
+another participant's media, and it is not evidence an operator can collect from a user. Ask the
+user to read the numbers out, or to screenshot the panel.
 
 ---
 

@@ -84,6 +84,8 @@ container name, so `kubectl ... deployment/mc-service` fails with
    - [Scenario 19: KEK Rotation Stalled](#scenario-19-kek-rotation-stalled)
    - [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
    - [Scenario 21: Server Mute Not Enforced](#scenario-21-server-mute-not-enforced)
+   - [Scenario 22: Client Video Decode Failures](#scenario-22-client-video-decode-failures)
+   - [Scenario 23: Client Video Slot Unfulfilled](#scenario-23-client-video-slot-unfulfilled)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -1179,6 +1181,20 @@ Triage by the `error_type` label on `mc_session_join_failures_total`:
       never adopted. **Not production-reachable today**: actor-level reconnect is not wired to the
       WebTransport accept path, so a browser reconnect is a fresh join. A non-zero value means
       that wiring landed or a test harness is driving it.
+    - **After join: a later redeclaration is judged too (story 3 R-2).** It is not a join failure,
+      so it never reaches `mc_session_join_failures_total`. It lands on
+      `mc_media_receive_capability_declarations_total{outcome}`. A redeclaration that would leave the
+      participant neither publishing nor receiving is refused, and the previous declaration stays in
+      force. Each rejection token's meaning is in
+      [§Client media signalling](#client-media-signalling--where-to-look-no-scenario-number-yet) item 1.
+    - **Which refusal means version skew?** At join, the skew refusal is `header_version_unsupported`
+      (an old SDK lacking header version 3); its row is in
+      [`mh-deployment.md` §Skew detection](mh-deployment.md#skew-detection-one-row-per-one-component-skew-across-the-cutover).
+      Since MC-A that gate runs before the capability parse, so `media_kind_unspecified` (a slot
+      with no kind or an unknown kind value) is a v3-client defect, not skew
+      ([§Client media signalling](#client-media-signalling--where-to-look-no-scenario-number-yet)).
+      `reconnect_publish_set_mismatch` is the "reconnect with a different publish set" refusal
+      (wire-freeze ruling 4). It is refused, counted and never adopted.
 
 **Remediation**:
 
@@ -2013,8 +2029,11 @@ fleet problem and points at a client release, not an MC deploy:
 receiving nothing — refused, the previous declaration stays in force; a refusal, not a success),
 `declaration_budget_exhausted` (the client blew
 `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS` on one connection — a re-declaration
-loop). `media_kind_unspecified` most often means a **version-skewed** client, not
-one that forgot a field: read a rise as client-fleet skew first. A join-carried declaration that
+loop). `media_kind_unspecified` is a slot with no kind or an unknown kind value. *(Corrected
+2026-10-24, story 3 OPS-B: this used to say "read a rise as client-fleet skew first". Since MC-A the
+join's header-version gate refuses a pre-ADR-0036 peer first, as `header_version_unsupported`,
+before the capability is parsed. So a skewed peer cannot reach this token, and it is now a v3-client
+defect.)* A join-carried declaration that
 fails here is also a join failure, `error_type="receive_capability_invalid"` — two views of one
 event; alert on the join series.
 
@@ -2547,6 +2566,29 @@ long rather than its threshold being high — see the comment on the rule.
 > lost. (The ratio this alert fires on is unaffected — numerator and denominator were buffered in the
 > same batch and compress together — which is why it is ratio-shaped and why an absolute-rate alert
 > on a `dt_client_*` series would fire on the artefact alone.)
+
+> **Per kind, since story 3 (OPS-B).** `MCMediaMissingKeyMaterial` (A7) is re-derived per
+> `media_kind`, so read the drop series split by kind before choosing an arm:
+>
+> ```promql
+> sum by (media_kind, reason) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
+> ```
+>
+> - **Video only.** Point at R-14's video key rotation. Video transmit keys rotate at every group
+>   start, on every period T (configured separately from audio's), and on every KEK receipt. The
+>   new key rides in-band on the first frames after any key change, and a key-bearing frame is
+>   never discardable. MH starts every subscriber at a group start, so a receiver holds the key
+>   unless it lost that group's key-bearing frames. Its one recovery request per loss event brings
+>   the next group start. **That lost-key-bearing-frame loss does not surface on A7's query.** It
+>   shows as `dt_client_media_frames_dropped_total{reason="no_transmit_key", media_kind="video"}`,
+>   a recovery-requesting loss. Video-only drops on A7's four reasons point at video's KEK-receipt
+>   rotation and wrap instead. Sustained video-only
+>   drops with audio clean mean the key-bearing frames are not arriving, or not being honoured, at
+>   group starts. Route to `client`. Check [Scenario 22](#scenario-22-client-video-decode-failures)
+>   and [Scenario 23](#scenario-23-client-video-slot-unfulfilled) for the same receivers.
+> - **Audio only.** Story 2's paths, the arms below, unchanged.
+> - **Both kinds.** The session-level key path (KEK push, roster): the arms below, starting with
+>   `MCKekPushFailureRate`'s split.
 
 #### First fork — is this key material at all? "The sixth person can't be heard"
 
@@ -3142,6 +3184,12 @@ rotation is [Scenario 16](#scenario-16-missing-key-material), rotation arm.
 **Severity**: triage on report
 **Runbook Section**: `#scenario-18-a-participant-hears-only-part-of-the-roster`
 
+> **Sees or hears, since story 3.** This scenario covers "I can see some people but not others" as
+> well as hearing. The heading is kept because its anchor is linked from `client-dev-local.md` and
+> from this runbook. Video-specific rules are in arm (b-video) below. Every connectivity arm,
+> (a) to (f), applies to video unchanged: a video slot fills only from a participant sharing a
+> connected handler with the subscriber.
+
 **Symptom**: "I can hear some people but not others", or "I can't hear anyone", in a meeting where
 everyone joined successfully, is on the roster, and no alert is firing. **Fork on the cause before
 acting — their remedies are opposite.**
@@ -3223,6 +3271,41 @@ published as `mc_media_receive_slot_cap{media_kind="audio"}`) and an over-cap de
 truncated: the excess slots show `unavailable`
 (`mc_media_slot_states_total{slot_state="unavailable"}`), never a rejection; the SDK no longer
 refuses or counts this itself.
+
+**(b-video) Video slots: per-kind caps, truncation, fill and stability (story 3, R-1/R-3/R-26).**
+Video is its own kind with its own cap, and most "I can't see X" reports in a healthy meeting are
+one of these EXPECTED shapes:
+- **Per-kind caps.** `MC_MAX_AUDIO_RECEIVE_SLOTS` and `MC_MAX_VIDEO_RECEIVE_SLOTS` (MC's own ConfigMap,
+  read at startup; `mc_media_receive_slot_cap{media_kind}`). A client declaring more video slots
+  than the cap is **truncated** to the cap. Each excess slot reports `unavailable` permanently for that
+  declaration (R-1): `mc_media_slot_states_total{media_kind="video", slot_state="unavailable"}`. It is
+  never a join failure.
+- **Video cap 0 is video off** (the R-26 lever, [`mc-deployment.md` §Video-off lever](mc-deployment.md#video-off-lever)).
+  Every video slot reads `unavailable` and no camera is directed. Audio is unaffected.
+- **Receive-only and audio-only participants occupy video slots** and show as `avatar_no_video`
+  (R-3). A video slot takes ANY participant sharing a connected handler with the subscriber, never
+  the subscriber itself. So in a meeting with receive-only members, "I see an avatar, not X's video"
+  is the fill rule working.
+- **The fill rule, per kind:** first, the earliest joiner already holding a slot of the OTHER kind
+  but not this one (pair completion); then the earliest eligible joiner holding no slot of this kind.
+- **Stability beats pairing.** No join, leave, mute or other-kind redeclaration moves an occupied
+  slot, so a later joiner does not displace anyone. A same-kind redeclaration keeps occupants by
+  ordinal (shrinking drops the tail). Losing connectivity frees or moves an edge (arms a to f). Seeing someone without hearing them, or the reverse, is a
+  correct outcome when the two kinds' slots filled in different orders.
+- **Muted is not missing.** `avatar_client_muted` and `avatar_server_muted` (server wins) are slot
+  states, not absences. See [Scenario 21](#scenario-21-server-mute-not-enforced).
+- **Unreachable is still reported by `unreachable_sender_ids`**, for video as for audio, and never as
+  a slot state.
+
+Remedy for over-subscription: raise the client's M or the video cap. **Both have costs, so check
+ceiling headroom first** ([MH Scenario 18](mh-incident-response.md#scenario-18-media-egress-budget-exhaustion)):
+- `VITE_DT_VIDEO_RECEIVE_SLOTS` is a **build-time** Vite variable, so raising it means rebuilding
+  and redeploying the web-app bundle. It is not a runtime knob.
+- Raising the cap costs an MC restart per pod (`mc-deployment.md`).
+- Either one raises video egress edges per MH. That demand counts against
+  `mh_media_egress_stream_ceiling`, and the recommended minimum (P×(N+M)) is sized for M=4.
+
+A live video slot (`active`) that shows nothing is not this scenario. Go to [Scenario 23](#scenario-23-client-video-slot-unfulfilled).
 
 **(c) MH refused the WHOLE snapshot on a policy bound — a REAL fault.** MC co-locates edges: in an
 all-connected meeting **every** edge lands on ONE handler while the other carries none, and MC does
@@ -3507,6 +3590,19 @@ drop is the BACKSTOP against a patched client. A participant's `UnmuteRequest` i
 the host; it never lifts the mute. A server mute survives a reconnect within grace, and does not
 survive a fresh join. A server UNMUTE restores the directive whatever the client mute.
 
+**Per kind: four independent controls (R-15; OPS-B).** Client audio, client video, server audio
+and server video mute are independent and compose. **A request about one kind never changes the
+other kind's state**, so "the host muted my video and my audio stayed on" is correct. Read every
+step below **per `media_kind`**. Server mute and unmute of either kind are **host-only**. The
+requester is taken from the connection, never from the message. Refusals are counted
+(`mc_media_mute_requests_rejected_total{surface}`, `mc_media_server_mute_requests_total{outcome}`).
+Refusal REPLIES are rationed per connection, and suppressions are counted
+(`mc_media_refusal_replies_suppressed_total{surface}`). A host's mute WORK is rate-limited
+(`rate_limited`). For the video
+kind, "camera light still on after server mute" and "video not resuming after server unmute" have
+their own sub-arms in
+[MH Scenario 19](mh-incident-response.md#scenario-19-server-mute-not-taking-effect-at-ingress) (video arm).
+
 **Step 1 — did the host's request land?**
 
 ```promql
@@ -3586,6 +3682,144 @@ there.
 
 **MH-side arms, including the ownership gap** (a registration MC did not send overwriting the muted
 set): [`mh-incident-response.md` Scenario 19](mh-incident-response.md#scenario-19-server-mute-not-taking-effect-at-ingress).
+
+---
+
+### Scenario 22: Client Video Decode Failures
+
+**Alert**: `ClientVideoDecodeErrorRatio` (A6, warning: above 1% for 10m; rule owned by observability, OBS-B). Client-reported alerts anchor in this runbook by precedent (Scenario 16).
+**Severity**: Warning
+**Runbook Section**: `#scenario-22-client-video-decode-failures`
+
+**What this is.** Receivers' VP8 decoders are erroring on more than 1% of the video frames they
+accepted (`dt_client_media_decoder_errors_total{media_kind="video"}` over
+`dt_client_media_frames_accepted_total{media_kind="video"}`). The series is **client-reported**, so
+it corroborates and can be inflated. Before trusting a quiet board, check that client video series
+are reaching Prometheus at all (`gc-deployment.md` §When the client series go quiet). Users see
+frozen or corrupted tiles. Each loss event sends one recovery request, so a healthy pipeline
+recovers on the next keyframe.
+
+**Detection**
+
+```promql
+sum(rate(dt_client_media_decoder_errors_total{media_kind="video"}[10m]))
+  / clamp_min(sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[10m])), 1e-9)
+
+# Split by build: a new SDK rollout shows as one client_version
+sum by (client_version) (rate(dt_client_media_decoder_errors_total{media_kind="video"}[10m]))
+
+# Neighbouring video losses (each has its own fork below)
+sum by (reason) (rate(dt_client_media_frames_dropped_total{media_kind="video"}[10m]))
+sum(rate(dt_client_media_decode_queue_dropped_total{media_kind="video"}[10m]))
+```
+
+**Diagnosis: forks.**
+- **Before or after decrypt?** Decoder errors are AFTER verify and decrypt. If the drop series shows
+  verify, decrypt or missing-key rejects (`signature_invalid`, `decrypt_failed`, `unwrap_failed`,
+  `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry`), that is a key or identity
+  problem, not a decoder one. Go to [Scenario 16](#scenario-16-missing-key-material).
+- **VP8 decoder support or browser.** R-8 makes an unsupported browser fail loudly at media start
+  (`VideoCodecUnsupportedError`), so **mid-call decoder errors are not "VP8 unsupported"**. A
+  browser update that changed decoder behaviour shows as a rise across one browser family and
+  several `client_version`s. Route to `client`.
+- **One publisher or fleet-wide?** No series names a publisher, by design (ADR-0036 §11). Tell them
+  apart from reports: everyone failing on one person's tile points at that sender's build or
+  encoder. The tile names the participant, because MC does not log slot occupancy, and for a live
+  video slot MC does not even name the source (R-5). Scenario 18 Step 0 then gives that
+  participant's connected handlers and per-handler edge counts. Never take a per-stream dump. Fleet-wide,
+  following one `client_version` or a `media-codec-profile` change, points at a new SDK rollout or a
+  codec-profile change. Correlate it with the last deploy.
+- **Client drop tokens on video** (`dt_client_media_frames_dropped_total{media_kind="video", reason}`;
+  semantics from C-B):
+  - `decode_over_bound`: decoded video above the client's configured receive bounds (resolution or
+    frame rate, R-6), dropped and counted. A sender encoding above the directed profile (a patched or
+    misconfigured encoder), or a client bound that does not admit the profile
+    (`client-dev-local.md` F21).
+  - `stream_partial_reset`: a frame cut by its stream's end, usually MH abandoning the group (R-12).
+    Bursts are normal on a slow path; sustained means repeated abandonment
+    ([MH Scenario 21](mh-incident-response.md#scenario-21-slow-video-subscriber-stream-credit-stall)).
+  - `stream_slot_mismatch`: a downlink group stream named a slot this client never declared for
+    video, or changed slot mid-stream. MH guarantees one stream per slot, so sustained means an MH
+    slot-mapping defect. Route to `media-handler`.
+  - `self_sender`: the frame's verified sender is this client. A video slot never holds the
+    subscriber itself (R-3), so this is a routing defect. Route to `meeting-controller` and
+    `media-handler`.
+
+**Resolution.** No server-side lever fixes a decoder. Identify the build and roll the web-app bundle
+forward or back. For a codec-profile change, revert the profile. That rolls MC and MH together
+(`mh-deployment.md` §Rollout With Media Flowing), so plan it. If video is unusable fleet-wide, the
+video-off lever ([`mc-deployment.md` §Video-off lever](mc-deployment.md#video-off-lever)) keeps
+audio while you roll back.
+
+**Escalation**: `client` for decoder and build forks; `media-handler` for `stream_slot_mismatch` and
+sustained `stream_partial_reset`; `meeting-controller` + `media-handler` for `self_sender`; Scenario 16
+routing for key or identity rejects.
+
+**Related**: [Scenario 23](#scenario-23-client-video-slot-unfulfilled);
+[`client-dev-local.md` §5 Failure modes](client-dev-local.md#5-failure-modes) (F22, F24);
+`docs/observability/metrics/client.md`.
+
+---
+
+### Scenario 23: Client Video Slot Unfulfilled
+
+**Alert**: `ClientVideoSlotUnfulfilled` (A9, warning: p95 of `dt_client_media_slot_unfulfilled_duration_ms` above 10 × the minimum keyframe interval for 15m; rule owned by observability, OBS-B). `dt_client_media_slots_unfulfilled` is a panel only.
+**Severity**: Warning
+**Runbook Section**: `#scenario-23-client-video-slot-unfulfilled`
+
+**What this is.** A video slot MC reports ACTIVE has shown neither decodable video nor an avatar for
+too long (Amendment 4). Each episode should end within one minimum interval of a keyframe
+(`mc_media_video_keyframe_min_interval_seconds`). The series is **client-reported**, so it
+corroborates and can be inflated. It carries no identity and no slot ids. The client measures
+every exit from the state, teardown included. **The histogram is observed on EXIT only**, so a slot
+stuck for a whole session appears only at that session's teardown, and the p95 lags a live
+incident. `dt_client_media_slots_unfulfilled` is single-writer-meaningful: many browsers write one
+series, so it reads as one browser's last value. It helps on a single-browser dev run and is not a
+fleet count. Users see a frozen picture or the previous avatar.
+
+**Detection**
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[15m])))
+10 * 1000 * max(mc_media_video_keyframe_min_interval_seconds)     # same unit (ms)
+max by (media_kind) (dt_client_media_slots_unfulfilled{media_kind="video"})   # ONE browser's last value, not a fleet count; never read as healthy at 0
+
+# The MH half, for the first fork
+max(mh_media_edge_pending_oldest_seconds)
+sum(mh_media_edges_pending)
+```
+
+**Diagnosis: forks.**
+- **MH pending is also high: this is the MH half.** Go to
+  [MH Scenario 22](mh-incident-response.md#scenario-22-video-slot-stuck-pending).
+- **MH pending is flat: MH believes it is forwarding.** The loss is on the receive side:
+  - decoder errors or decode drops: go to [Scenario 22](#scenario-22-client-video-decode-failures);
+  - verify, decrypt or missing-key rejects: go to [Scenario 16](#scenario-16-missing-key-material).
+
+  A receiver sends one recovery request per loss event, taking sender and counter from the failing
+  frame (`dt_client_media_recovery_requests_sent_total{source}`; MH's outcomes on
+  `mh_media_recovery_requests_received_total{outcome}`). **A stream reset before any header sends
+  nothing**, and it is MH's to recover. A flat client recovery counter beside a reset-before-header
+  pattern is MH's missing request, not the client's.
+- **Accepted residual: a camera that never starts.** A directed camera whose capture never begins
+  without reporting a mute or capture failure (for example a permission prompt left open) stays
+  unfulfilled until A3 or A9 fires. That is loud, not masked. The fix is the client's
+  capture-state reporting (R-19). Escalate to `client`.
+- **One publisher or fleet-wide**, as in [Scenario 22](#scenario-22-client-video-decode-failures):
+  the participant comes from the reporter's tile, never from a per-stream dump.
+
+**Resolution.** As in MH Scenario 22: no runtime lever repairs a missing event. A reload of the
+affected participant clears the symptom. The durable fix is in the owing component. The video-off
+lever ([`mc-deployment.md` §Video-off lever](mc-deployment.md#video-off-lever)) applies only if the
+defect is widespread.
+
+**Escalation**: `media-handler` when MH pending is high (MH Scenario 22's forks); `client` for
+decode, capture-state and recovery-request faults; Scenario 16 routing for key rejects.
+
+**Related**: [MH Scenario 22](mh-incident-response.md#scenario-22-video-slot-stuck-pending);
+[Scenario 22](#scenario-22-client-video-decode-failures); `client-dev-local.md` F26.
+
+---
 
 ## Diagnostic Commands
 

@@ -692,6 +692,12 @@ same re-derivation asked of the MH registered-meeting-count entry.
 
 **Their stated residual stands**: a name that reaches a spreading helper through a variable, or through an import from another file, is invisible to the static scan, and the behavioural half covers only the paths it drives. The collector's `keep_keys` omission of `meeting_id_hash` means a violation is still stripped at the store, so it would be harmless and undetectable at once. That is why the two tests, not the strip, are the control. **Remaining open**: dashboard references to `dt_client_*` names are still unchecked by any guard (the "Demonstrated" paragraph above). Close this entry when a dashboard-side check lands.
 
+### No MH backlog-in-use series: OBS-B's spec assumes one (filed 2026-10-24 by story 3 OPS-B; raised by @observability)
+
+**Owner**: media-handler (the series, with catalog, test and guard coverage), observability (the OBS-B "backlog-in-use beside backlog-cap" panel). **Trigger**: before, or together with, story 3 OBS-B.
+
+MH-A2 shipped only the per-destination cap gauge, `mh_media_egress_stream_backlog_limit_bytes`. There is no in-use series, although the OBS-B spec assumes MH-A2 provided "backlog cap and in-use". A panel built on the assumed name would sit on an empty selector. The runbook sites that use a proxy today (the cap plus the `mh_media_group_resets_total{reason="subscriber_backlog"}` rate, with memory via `MHHighMemory`'s expression) are `docs/runbooks/mh-incident-response.md` Scenario 21 (§Memory) and `docs/runbooks/mh-deployment.md` watch-list item 3. Update both when the series lands. **Constraint (security):** any backlog-in-use series must be a pod-level aggregate only. A per-stream or per-destination backlog gauge would be a per-stream size signal, which ADR-0036 §11 bars. **Task-sized**: it is a new MH metric with catalog, dashboard, zero-init and presence-guard coverage.
+
 ### No leading indicator for registered-meeting exhaustion — the "teardown-never-arrives" rule (filed 2026-09-30; unassigned)
 
 **Owner**: operations (rule) + observability (threshold). **Trigger**: the next devloop that touches `infra/docker/prometheus/rules/mh-alerts.yaml` or MH's registration lifecycle. **Provenance**: `docs/devloop-outputs/2026-09-30-media-ops-multi-party/`. Earlier text (the `mh-alerts.yaml` header written at story 2 task 11 and the MH metrics catalog) assigned this rule to story 2 task 18. Neither the story nor task 18's prompt carries it, so task 18 did not invent it. It re-pointed every one of those sites here.
@@ -708,6 +714,13 @@ same re-derivation asked of the MH registered-meeting-count entry.
 **Owner**: infrastructure (guard machinery), observability (policy). **Trigger**: the next devloop that edits `crates/dt-guard/src/alert_rules.rs`, or the next broken-anchor incident.
 
 `crates/dt-guard/src/alert_rules.rs::validate_runbook_url` strips the `#fragment` and checks only that the file exists. A mistyped or renamed scenario heading therefore passes Layers 1-6 green while every alert that points at it lands on the top of a 2,000-line runbook. `docs/observability/alert-conventions.md`'s "Must resolve to an existing file" is the honest scope today. Story 2 task 18 derived its new fragments by hand from the GFM slug rule and recorded the heading-to-anchor pairs in its devloop output. That is a manual check, not a control. **Task-sized, not a one-line fix**: it needs a GFM slugger matching GitHub's (lowercase; punctuation dropped except `-` and `_`; spaces become `-`, so ` / ` becomes `--`; duplicate headings get `-1` suffixes), fixtures, and a sweep of every rule file's existing fragments. All of them resolve as of 2026-09-30 (a manual sweep by @test, 296 links), and nothing keeps them resolving.
+
+*Story 3 addendum (2026-10-24, OPS-B; raised by @test at review).* Still open, and the exposure grows. OPS-B created eight anchors (MH 20–23, MC 22–23, plus the existing MH 19 / MC 16 targets) that OBS-B's alerts A1–A9 will link to, and they were verified only by a local slug check in `docs/devloop-outputs/2026-10-24-story3-ops-b-video-runbooks/main.md`. The fix lives in `crates/dt-guard/src/alert_rules.rs::validate_runbook_url` (the `url.split('#')` strip). Beyond the slugger above it must also:
+- resolve explicit `<a id="…">` anchors (e.g. `mc-incident-response.md#send-directive-wiring`);
+- exclude headings inside code fences;
+- report a positive control, with at least one fragment resolved per run, so a slugger that matches nothing cannot pass vacuously.
+
+It also needs positive and negative fixtures.
 
 ### Receive-path crypto drop reasons have no alert (2026-09-30, story 2 task 16)
 

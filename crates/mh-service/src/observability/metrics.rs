@@ -1337,9 +1337,10 @@ pub enum MediaDropReason {
     /// A publisher connection exceeded its per-connection unidirectional
     /// stream **creation-rate** cap (`MH_STREAM_OPENS_PER_CONNECTION_PER_SEC`).
     ///
-    /// Enforced at accept, before a single byte of the stream is read, by
-    /// `crate::media::caps::TokenBucket` in `crate::media::stream_ingress`; the
-    /// refused stream is `STOP_SENDING`'d with
+    /// Enforced at accept by `crate::media::caps::TokenBucket` in
+    /// `crate::media::stream_ingress`. The over-limit stream has ONLY its fixed
+    /// header read (its group counter recorded, so MH repairs a declared source by
+    /// its own keyframe request), then is `STOP_SENDING`'d with
     /// [`crate::transport::INGRESS_REFUSED`].
     ///
     /// **One increment per refused STREAM, on a frames counter.** A refused

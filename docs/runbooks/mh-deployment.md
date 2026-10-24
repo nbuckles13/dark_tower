@@ -156,7 +156,7 @@ console.
 |---|---|---|---|
 | **Old SDK → new MC** | The join is refused before admission, because `ParticipantCapabilities.supported_header_versions` (signaling.proto) lacks 3 (an empty list included). The refusal uses the generic join-refusal shape and echoes no version. | `mc_session_join_failures_total{error_type="header_version_unsupported"}` | MC-A |
 | **v3 frames → old MH**, and **v2 frames → new MH** | Every frame is dropped at MH ingress. Audio is **totally** silent on that handler. | `mh_media_frames_dropped_total{direction="ingress",reason="unknown_version"}` | live today (codec token, `crates/media-protocol/src/codec.rs`) |
-| **Old MC directs `header_version` 2 → v3 SDK** | The SDK refuses the directive and sends nothing for that kind. | The exported client directive-fault series, under its header-version-refused reason. Its series and token names are fixed by C-A1 in `docs/observability/metrics/client.md`; this runbook does not pre-empt them. | C-A1 |
+| **Old MC directs `header_version` 2 → v3 SDK** | The SDK refuses the WHOLE directive, fail-closed, so neither kind sends (`client-dev-local.md` F25). | `dt_client_media_send_directive_header_version_refused_total` (kind-free, zero-initialised at join, reads zero forever against a conforming MC). | C-A1 |
 | **New MC → story-2 MH** (video egress) | The whole registration is rejected, so the meeting's audio goes dark too. A story-2 MH that ACCEPTS a registration (an audio-only meeting, one transport) echoes no `applied_source_streams`; that reads `transport_mode_mismatch`, `echo_arm=absent_from_echo`. | MH: `mh_media_policy_applies_total{outcome="rejected_invalid"}`. MC: the RPC fails, so nothing lands on `mc_media_policy_pushes_total`. Read `mc_register_meeting_total{status="error"}` and the WARN "RegisterMeeting RPC failed" (target `mc.grpc.mh_client`). | live today; see [Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard) |
 | **Old MC → new MH** (registration) | The old MC sends no `source_streams`, so the shipped MH refuses every egress-bearing registration **whole** (audio dark). It clears when the new MC re-registers. Both the forward order (between steps b and c) and the reversed by-hand rollback pass through this. | MH: `mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}`. This is also A8's selector, so A8 can fire if the window is held past its `for: 15m`. MC: the old MC's RegisterMeeting fails, read as above. | MH-A1 + MC-B |
 
@@ -440,6 +440,102 @@ histogram_quantile(0.95,
 - [ ] `mh_active_connections` follows expected diurnal/load pattern (no clamping at 0, no unexplained spikes)
 - [ ] *Additional (beyond R-36)*: WebTransport handshake P95 trailing-1h trend is flat (slow-leak detection — JWKS or connection-pool drift)
 - [ ] *Additional (beyond R-36)*: `mc_register_meeting_duration_seconds` P95 trailing-1h trend is flat (leading indicator for the timeout counter; see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
+
+#### Story 3 video: the 24-hour watch list, in the order things rise first
+
+This list is the single home for the watch-list queries. `mc-deployment.md` points here and lists
+only its MC-side items. Read the items in this order, because an earlier item usually explains a
+later one. Every query is pod-level or fleet-level, with no meeting, participant, sender or stream
+identity.
+
+```promql
+# 1. Transport contract mismatch -- both EXPECTED AT ZERO. Non-zero: §Mixed-Transport Rollback Hazard.
+sum(increase(mc_media_policy_pushes_total{outcome="transport_mode_mismatch"}[24h]))
+sum(increase(mh_media_policy_applies_total{outcome="rejected_transport_inconsistent"}[24h]))
+
+# 2. Admission rejection ratio vs its threshold gauge (per pod; MH Scenario 18)
+mh_media_stream_admission_rejection_ratio
+mh_media_stream_admission_rejection_ratio_threshold
+
+# 3. Backlog and memory. NO backlog-in-use gauge exists: read the cap beside the
+#    subscriber_backlog reset rate (item 5) as the in-use proxy (MH Scenario 21).
+mh_media_egress_stream_backlog_limit_bytes
+container_memory_usage_bytes{container="mh-service"} / container_spec_memory_limit_bytes{container="mh-service"}   # MHHighMemory's ratio; limit reaches MH as MH_POD_MEMORY_LIMIT_BYTES
+
+# 4. Pending edges: count, and oldest age against the min keyframe interval that scales A3 (MH Scenario 22)
+sum(mh_media_edges_pending)
+max(mh_media_edge_pending_oldest_seconds)
+max(mc_media_video_keyframe_min_interval_seconds)
+
+# 5. Fleet subscriber_backlog reset ratio (MH Scenario 21; alert A2)
+sum(rate(mh_media_group_resets_total{reason="subscriber_backlog"}[1h]))
+  / clamp_min(sum(rate(mh_media_group_starts_total{direction="egress"}[1h])), 1e-9)
+
+# 6. Ingress group starts per source vs 1 / min interval (MH Scenario 20; alert A1)
+sum(rate(mh_media_group_starts_total{direction="ingress"}[1h])) / clamp_min(sum(mh_media_stream_sources_declared), 1)
+1 / max(mc_media_video_keyframe_min_interval_seconds)
+
+# 7. Recovery-request outcomes (MH Scenario 20 arm c)
+sum by (outcome) (increase(mh_media_recovery_requests_received_total{outcome=~"duplicate|stale|counter_ahead|source_mismatch"}[24h]))
+
+# 8. MH server_muted drops (MH Scenario 19 video arm)
+sum(rate(mh_media_frames_dropped_total{direction="ingress",reason="server_muted"}[1h]))
+
+# 9. MC policy-push rate under mute churn (R-17 bounds it)
+sum(rate(mc_media_policy_pushes_total[1h]))
+sum(rate(mc_media_mute_requests_total[1h]))
+
+# 10. Client video decode drops (MC Scenario 22; alert A6)
+sum(rate(dt_client_media_decoder_errors_total{media_kind="video"}[1h]))
+  / clamp_min(sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[1h])), 1e-9)
+
+# 11. Unfulfilled video slots: the p95 (A9) is the check (MC Scenario 23). The gauge is ONE
+#     browser's last value (single-writer), not a fleet count; never read it as healthy at 0.
+histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[1h])))
+max by (media_kind) (dt_client_media_slots_unfulfilled{media_kind="video"})
+
+# 12. A client VIDEO series is present in Prometheus at all (R-29). Empty = the client pipe is dead.
+count(dt_client_media_frames_received_total{media_kind="video"})
+```
+
+- [ ] 1. MC `transport_mode_mismatch` and MH `rejected_transport_inconsistent` are both **zero**.
+  Non-zero means a component is on the wrong side of the cutover, so work
+  [§Mixed-Transport Rollback Hazard](#mixed-transport-rollback-hazard) before anything else.
+- [ ] 2. The MH admission rejection ratio is below its threshold gauge on every pod
+  ([MH Scenario 18](mh-incident-response.md#scenario-18-media-egress-budget-exhaustion)).
+- [ ] 3. MH backlog and memory are in bounds. **There is no backlog-in-use gauge today.** Read the
+  cap (`mh_media_egress_stream_backlog_limit_bytes`) beside the item-5 reset rate as the proxy. Memory
+  vs `MH_POD_MEMORY_LIMIT_BYTES` stays well under `MHHighMemory`'s threshold, because startup validated
+  cap × streams against that limit ([MH Scenario 21](mh-incident-response.md#scenario-21-slow-video-subscriber-stream-credit-stall)).
+- [ ] 4. `mh_media_edges_pending` follows joins and returns to near zero.
+  `mh_media_edge_pending_oldest_seconds` stays well under A3's threshold
+  ([MH Scenario 22](mh-incident-response.md#scenario-22-video-slot-stuck-pending)). A rising
+  oldest age is a missing-event bug, never a slow retry.
+- [ ] 5. The fleet `subscriber_backlog` reset ratio is well under A2's threshold (MH Scenario 21). This is the leading
+  indicator for egress exhaustion.
+- [ ] 6. Ingress group starts per source stay well under 1 / min interval, except for a burst right
+  after an MH roll, which is expected ([MH Scenario 20](mh-incident-response.md#scenario-20-video-keyframe-storm) arm a).
+- [ ] 7. Recovery-request outcomes: `duplicate` and `stale` may be non-zero (shared loss). A
+  sustained `counter_ahead` or `source_mismatch` is a client or contract fault.
+- [ ] 8. MH `server_muted` drops. **Flat under an applied mute is the healthy state**: a compliant
+  client stops capture when its directive is withdrawn. A brief blip at mute onset (frames in
+  flight before the withdrawal lands) is expected. A SUSTAINED rise means a client is still
+  sending after withdrawal. MH is holding the line, but the device is still capturing, so work the
+  "camera light still on" sub-arm via `mc_media_send_directive_withdrawals_total{reason="server_muted"}`
+  ([MH Scenario 19](mh-incident-response.md#scenario-19-server-mute-not-taking-effect-at-ingress) video arm).
+- [ ] 9. The MC policy-push rate under mute churn stays bounded (R-17) and does not track the
+  mute-request rate one-for-one.
+- [ ] 10. *(Only meaningful if item 12 holds: confirm item 12 before reading this as green.)*
+  The client video decode-error ratio is well under A6's threshold
+  ([MC Scenario 22](mc-incident-response.md#scenario-22-client-video-decode-failures)).
+- [ ] 11. *(Only meaningful if item 12 holds: confirm item 12 before reading this as green.)*
+  The `dt_client_media_slot_unfulfilled_duration_ms` p95 is well under A9's threshold. It is
+  observed on exit only, so it lags. The `dt_client_media_slots_unfulfilled` gauge is one browser's
+  last value, so a zero proves nothing
+  ([MC Scenario 23](mc-incident-response.md#scenario-23-client-video-slot-unfulfilled)).
+- [ ] 12. **A client video series is present in Prometheus at all** (R-29). An empty result is not
+  "no problems". A dead client pipe leaves every client alert (A5, A6, A9) green. Work
+  `gc-deployment.md` §When the client series go quiet.
 
 ### Rollback criteria
 
