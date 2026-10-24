@@ -2864,7 +2864,7 @@ tasks:
   slug: 2026-10-24-story3-obs-b-video-alerts-dashboards
   tag: story-2026-10-07-see-each-other-task-20
 - id: 21
-  status: pending
+  status: completed
   specialist: test
   deps:
   - 16
@@ -2970,6 +2970,7 @@ tasks:
     - Evidence artifacts (traces, HARs) are not promoted to the repo, since they contain live tokens (`packages/web-app/e2e/README.md`).
 
     WIRE FREEZE: where this prompt and the story file's Design §Wire freeze (docs/user-stories/2026-10-07-see-each-other.md) disagree, the story file wins; stop and report rather than improvising.
+  slug: 2026-10-24-story3-see-each-other-manual-test-plan
   tag: story-2026-10-07-see-each-other-task-21
   tier: light
   tier_reason: evidence capture and a manual test plan; no code or contract change
