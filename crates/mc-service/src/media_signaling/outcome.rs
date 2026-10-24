@@ -72,9 +72,11 @@ pub enum CapabilityOutcome {
     PinnedSenderIdOutOfRange,
     /// A slot left `media_kind` unset, or named a value outside the enum.
     ///
-    /// Most likely a **version-skewed client that meant audio** — the proto's
-    /// zero is what a pre-ADR-0036 peer's `AUDIO = 0` decodes to — not a client
-    /// that forgot a field. Read a rising rate as client-fleet skew first.
+    /// Since story 3 MC-A this is a **v3-client defect, not version skew**: the
+    /// proto's zero is what a pre-ADR-0036 peer's `AUDIO = 0` decodes to, but the
+    /// join's header-version gate (`validate_join_media`) refuses such a peer
+    /// first, as `header_version_unsupported`, before the capability is parsed.
+    /// Read skew on that join failure, not here.
     MediaKindUnspecified,
     /// A slot named a real kind this story does not serve
     /// (`MEDIA_KIND_VIDEO_SCREEN`). Rejected, never accepted-and-ignored

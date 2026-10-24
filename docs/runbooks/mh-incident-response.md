@@ -31,6 +31,10 @@
    - [Scenario 17: Media Datagram Drop](#scenario-17-media-datagram-drop)
    - [Scenario 18: Media Egress Budget Exhaustion](#scenario-18-media-egress-budget-exhaustion)
    - [Scenario 19: Server Mute Not Taking Effect At Ingress](#scenario-19-server-mute-not-taking-effect-at-ingress)
+   - [Scenario 20: Video Keyframe Storm](#scenario-20-video-keyframe-storm)
+   - [Scenario 21: Slow Video Subscriber (Stream-Credit Stall)](#scenario-21-slow-video-subscriber-stream-credit-stall)
+   - [Scenario 22: Video Slot Stuck Pending](#scenario-22-video-slot-stuck-pending)
+   - [Scenario 23: Client Sending While Client-Muted](#scenario-23-client-sending-while-client-muted)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -1496,7 +1500,7 @@ fire), `MHCallerTypeRejected` (Scenario 7 — the Step 4 escalation route).
 > `infra/docker/prometheus/rules/mh-alerts.yaml` cite their anchors. Renumbering would have broken
 > four guard-resolved links.
 
-**What this is.** Audio is carried one frame per **QUIC datagram** (ADR-0036 §1). *(Scope, corrected 2026-10-21, story 3 OPS-A: the media path is no longer datagram-only. From MH-A2, video rides one QUIC unidirectional stream per group beside datagram audio in the same meeting. This scenario covers the datagram path. Stream-path drops and resets are MH-A2's and MH-B's reasons, and their scenarios (slow video subscriber, keyframe storm, stuck pending) are OPS-B's.)* Datagrams are
+**What this is.** Audio is carried one frame per **QUIC datagram** (ADR-0036 §1). *(Scope, corrected 2026-10-21, story 3 OPS-A: the media path is no longer datagram-only. From MH-A2, video rides one QUIC unidirectional stream per group beside datagram audio in the same meeting. This scenario covers the datagram path. Stream-path drops and resets are MH-A2's and MH-B's reasons, and their scenarios are [Scenario 20](#scenario-20-video-keyframe-storm), [Scenario 21](#scenario-21-slow-video-subscriber-stream-credit-stall) and [Scenario 22](#scenario-22-video-slot-stuck-pending), shipped by OPS-B.)* Datagrams are
 lossy by design and by transport: there is no retransmission and no ordering guarantee. Drops occur
 at **both ends of the hop**, the two ends have different owners, and only one of them is visible to
 MH.
@@ -1855,6 +1859,28 @@ look for who is creating them. **Do not raise `MH_MAX_REGISTERED_MEETINGS`**: it
 ceiling in code, and a larger cap only postpones the same exhaustion. The full arm is Scenario 13's
 meeting-cap callout.
 
+**Video, since story 3: real video bytes now flow, and the cost model changed.**
+- **Stream costs are derived, not configured.** MH derives each per-stream egress cost from the
+  shared `media-codec-profile` bitrate plus a code-derived per-frame overhead × frame rate, for audio
+  and video (`mh_media_stream_cost_audio_bytes_per_second`, `mh_media_stream_cost_video_bytes_per_second`;
+  the *Per-Stream Egress Costs* panel). The `MH_STREAM_COST_*` keys are retired. **The ceiling divides
+  the budget by the LARGER cost**, because MH stays type-blind: it cannot tell an audio edge from a
+  video edge at admission. A ceiling that dropped sharply at the story-3 deploy is that division, not
+  a regression.
+- **`EGRESS_STREAM_CEILING_RECOMMENDED_MIN` is now P×(N+M) = 6×(5+4) = 54**
+  (`mh_media_egress_stream_ceiling_recommended_min`; `crates/mh-service/src/config.rs`). A ceiling
+  below that gauge is an unsized budget for the demo shape (Arm A's first check).
+- **Relief that keeps audio: the R-26 video-off lever**, `MC_MAX_VIDEO_RECEIVE_SLOTS=0`. It keeps
+  audio, costs an MC restart per pod and never rolls MH
+  ([`mh-deployment.md` §Operator levers for media](mh-deployment.md#operator-levers-for-media-video-off-and-nothing-else)).
+  Use it before any rollback.
+- **Leading indicator for the load arm: the fleet backlog-reset alert**, `MHVideoSubscriberBacklogResets`
+  (A2, [Scenario 21](#scenario-21-slow-video-subscriber-stream-credit-stall)). Subscribers' paths
+  saturate and MH resets their groups before admission refuses. A2 firing with edge headroom
+  falling is Arm A arriving.
+- A patched publisher keying without cause is also egress pressure
+  ([Scenario 20](#scenario-20-video-keyframe-storm) arm (d)).
+
 **What this scenario is NOT.**
 - **Not `MHMediaEgressQueueOverflowRate`.** That is the §1 transport queue shedding datagrams on a
   live subscriber ([Scenario 17](#scenario-17-media-datagram-drop)). Admission refuses policies and
@@ -1878,13 +1904,16 @@ meeting-cap arm and the ownership-reject recovery order);
 
 ### Scenario 19: Server Mute Not Taking Effect At Ingress
 
-**Alert**: none, by decision. A non-zero muted-drop rate is healthy moderation, and the inverse
+**Alert**: none on MH's own drop counter, by decision. A non-zero muted-drop rate is healthy moderation, and the inverse
 ("a mute that should be dropping is not") needs a per-meeting correlation ADR-0036 §11 bars.
 The decision's home is the `DELIBERATELY NO ALERT` comment in `infra/docker/prometheus/rules/mc-alerts.yaml`.
+**Since story 3**, `ClientVideoServerMutedSenderFrames` (A5, warning; client-reported, video only; rule owned by
+observability, OBS-B) anchors here. It is receive-side corroboration that MH's video ingress drop failed,
+not proof: see the video arm below.
 **Severity**: triage on report, as a moderation failure. Arm 2 is a security incident.
 **Runbook Section**: `#scenario-19-server-mute-not-taking-effect-at-ingress`
 
-**The report**: "The host muted someone and we can still hear them."
+**The report**: "The host muted someone and we can still hear (or see) them."
 
 **How it is enforced (story 2 R-9).** A host's server mute is decided at MC and carried to MH as
 `server_muted_sources` on the meeting's next registration snapshot. A change to the muted set alone
@@ -2019,12 +2048,455 @@ reading is `mc_register_meeting_total{status="error"}` and the WARN "RegisterMee
 A push that was answered but not applied, `generation_mismatch` or `no_applied_generation`, is
 [MC Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence).)*
 
+#### Video arm — per declared stream, enforced in slot terms (story 3)
+
+**"We can still SEE them" is triaged here too, and enforcement is per declared stream.** MC
+declares the muted kind's stream with SourceStream disposition `DROP_AT_INGRESS`. MH attributes each
+ingress frame by (connection-bound sender, uplink relay-region `stream_id` = the MC send id), looks
+it up in `source_streams`, and never parses the payload (wire-freeze Amendment 3). **The uplink
+label is publisher-set and unauthenticated.** A frame relabelled onto the other stream's id reaches
+only slots of the OTHER kind, and receivers take the decoder from the slot kind. That is why R-16
+still holds, and it is stated in terms of slots: **nothing from a sender whose video is
+server-muted reaches any subscriber's video slot, however it is labelled or transported, while audio
+keeps flowing.** Audio still flowing under a video server mute is correct and is not a failed mute.
+
+**Proof of enforcement is MH's own counter**:
+`mh_media_frames_dropped_total{direction="ingress",reason="server_muted"}` rising on the handler.
+Since MC-B a compliant client stops capture when the video directive is withdrawn, so flat drops
+under an applied mute are the healthy state. Rising drops mean a client that kept sending and MH
+held the line.
+
+**Receive-side corroboration, not proof**:
+`dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video"}`, alerted as
+`ClientVideoServerMutedSenderFrames` (A5, warning, 10m; rule owned by observability, OBS-B). It
+counts video frames that reached a receiver from a sender that receiver knows is server-muted for
+video. The receiver drops them, so nothing renders. Any sustained value is the receiver-side signal
+that **MH's video ingress drop failed**: the frames got past MH. It is client-reported, so it
+corroborates and does not prove. Read it against MH's `server_muted` drops and work Arm 3 (applied
+but not enforced) if MH's counter is flat on the handler while A5 fires. **A short burst at server
+UNMUTE is benign**: the publisher's resume keyframe beat `ParticipantMuteUpdate` to the receiver,
+which re-requests it, counted as `dt_client_media_recovery_requests_sent_total{source="server_mute_lifted"}`.
+If that series moves with the burst, it is unmute churn, not an MH failure, so do not route it to Arm 3.
+
+```promql
+sum(rate(mh_media_frames_dropped_total{direction="ingress",reason="server_muted"}[5m]))
+sum(rate(dt_client_media_frames_dropped_total{reason="sender_server_muted",media_kind="video"}[5m]))
+sum by (media_kind) (increase(mc_media_send_directive_withdrawals_total{reason="server_muted"}[15m]))
+```
+
+**Sub-arm: "Camera light still on after server mute".** MC withdraws that kind's directive (R-16),
+so capture should stop and, for video, the camera light goes off. A client still capturing means
+the withdrawal was **lost or ignored**:
+- `mc_media_send_directive_withdrawals_total{media_kind="video", reason="server_muted"}` did NOT
+  rise for an `applied` mute of a **watched** kind: MC did not withdraw, or could not deliver
+  (`mc_media_slot_view_emissions_total{outcome="delivery_failed"}`). That is MC's half,
+  [MC Scenario 21 Step 1b](mc-incident-response.md#scenario-21-server-mute-not-enforced);
+- it did not rise because the kind was **unwatched**: its directive was already withdrawn
+  (`reason="unwatched"`), so no new withdrawal is expected and the camera should already be off.
+  The track stops on ANY empty-targets withdrawal. A camera that is on here is the client ignoring
+  its empty targets. Route it to `client` and `security`;
+- it DID rise: the client ignored its empty targets. That is a client fault (privacy), so route it to
+  `client` and `security`.
+
+Meanwhile MH's backstop still drops at ingress, so `server_muted` drops rise. No subscriber's video
+slot receives the frames, but the device is still capturing, and that is the user-visible harm.
+
+**Sub-arm: "Video not resuming after server unmute".** A server unmute restores capture **unless the
+participant is client-muted** (R-18). The participant gets a non-suppressible notice when it happens.
+**Check client mute state first**: holders' slot reads `avatar_client_muted` (no longer
+`avatar_server_muted`) and the participant's own camera control is off. The remedy is that the
+participant turns their camera on. If the slot reads `avatar_server_muted` after an `applied` unmute,
+that is MC's half (MC Scenario 21). If the slot reads ACTIVE but nothing renders, go to
+[Scenario 22](#scenario-22-video-slot-stuck-pending).
+
 **Escalation**: `client` for Arm 1's optimistic rendering; `security` + `meeting-controller` for Arm 2;
-`media-handler` for Arm 3; `meeting-controller` for Arm 4.
+`media-handler` for Arm 3 (and for A5 firing while MH's `server_muted` drops are flat); `meeting-controller` for Arm 4 and for a withdrawal that did not rise; `client` + `security` for a camera still capturing after a delivered withdrawal.
 
 **Related**: [MC Scenario 21](mc-incident-response.md#scenario-21-server-mute-not-enforced);
 [MC Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence);
 `docs/observability/metrics/mh-service.md` (the `server_muted` drop reason).
+
+---
+
+### Scenario 20: Video Keyframe Storm
+
+**Alert**: `MHVideoKeyframeStorm` (A1, warning; rule owned by observability, OBS-B)
+**Severity**: Warning
+**Runbook Section**: `#scenario-20-video-keyframe-storm`
+
+**What this is.** Ingress video group starts per declared stream-per-group source (`mh_media_stream_sources_declared`) have stayed above half the
+rate the minimum keyframe interval allows (0.5 / `mc_media_video_keyframe_min_interval_seconds`)
+for 10 minutes. The alert reads `mh_media_group_starts_total{direction="ingress"}`, which MH counts
+itself. A patched client can neither inflate nor hide that series, so it is the server-side
+truth about how often publishers key.
+
+**Context: there is no keyframe interval (R-9). Keyframes are event-driven (Amendment 4).**
+- **The publisher keys any directed target that has no group in progress**: at a directed start,
+  when a target is added, and after an abandonment it decided itself (its per-target backlog cap).
+  One keyframe reaches every target of the stream, because there is one encoder (R-12). **It never
+  re-keys for a stream MH refused or stopped (STOP_SENDING).** Whoever decides an abandonment
+  repairs it, so MH requests a keyframe when it wants that stream again.
+- **MH requests at most once per (source stream, counter)**, only for a source it has already seen,
+  and never retries (R-10). Count: `mh_media_keyframe_requests_sent_total{trigger="initial"}`.
+- **Receivers send one unpaced recovery request per loss event.** MH remaps slot to source stream and
+  forwards at most one per (source stream, counter):
+  `mh_media_keyframe_requests_sent_total{trigger="receiver_recovery"}`. Every request is counted by
+  outcome on `mh_media_recovery_requests_received_total{outcome}`, and only `forwarded` ones are
+  handed upstream (R-13). `forwarded` means accepted into the publisher's newest-only outbox, not
+  written. It can exceed `requests_sent{trigger="receiver_recovery"}`, because a newer request
+  replaces a queued one, and a write to a dead control stream counts on
+  `mh_media_keyframe_request_write_failures_total` instead.
+- **The publisher honours a request only for a stream it is sending to that handler**, with a
+  counter at least its current one. Every keyframe is bounded by max(MC-directed
+  `min_keyframe_interval_ms`, published as `mc_media_video_keyframe_min_interval_seconds` and
+  configured as `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`; the client's compiled floor). A keyframe that
+  would come too soon is held as the single deferral, never dropped (R-10–R-12). **So forwarded
+  requests are bounded by groups, and groups are bounded by that interval.** A sustained rate near
+  the bound means something keeps creating loss events or targets. It does not mean a counter is
+  looping.
+
+**Detection**
+
+```promql
+# The alert's shape: ingress group starts per declared stream-per-group source, vs the bound.
+sum(rate(mh_media_group_starts_total{direction="ingress"}[10m]))
+  / clamp_min(sum(mh_media_stream_sources_declared), 1)
+0.5 / max(mc_media_video_keyframe_min_interval_seconds)
+
+# What MH asked for, and why
+sum by (trigger) (rate(mh_media_keyframe_requests_sent_total[10m]))
+# What receivers asked for, by outcome
+sum by (outcome) (rate(mh_media_recovery_requests_received_total[10m]))
+# Abandonments that precede re-keys
+sum by (reason) (rate(mh_media_group_resets_total[10m]))
+```
+
+All of these are pod-level and carry no identity. Nothing in this scenario needs a meeting,
+participant, sender or stream id. Per-participant investigation, if it is needed at all, uses MC's
+assignment state, never a per-stream dump. MC does not log slot occupancy. The publisher behind a
+failing tile comes from user reports, and MC Scenario 18 Step 0 then gives that participant's
+connected handlers and per-handler edge counts.
+
+**Diagnosis: fork FIRST on MH pod age.**
+
+```bash
+kubectl get pods -n dark-tower -l app=mh-service -o custom-columns=POD:.metadata.name,STARTED:.status.startTime
+```
+
+**(a) A burst right after an MH roll or restart is EXPECTED in this story.** Every subscriber
+reconnects and is held for a group start, so every directed target keys at once. Resume and
+keyframe jitter after a mass reconnect is story 4's work (the ADR-0036 addendum's story-4 line).
+**Do not tune it away.** If the rate decays to baseline within a few intervals of the pods becoming
+Ready, close the alert as this arm. A burst on a pod that has NOT restarted is one of the arms below.
+
+**(b) A lossy-path recovery loop (R-12): accepted, bounded by the minimum interval.** A path whose
+capacity is below the fixed bitrate abandons groups and recovers again and again. The signature is
+`mh_media_group_resets_total{reason="subscriber_backlog"}` rising alongside the group starts
+(MH abandoning toward a slow subscriber, then requesting with `trigger="initial"`). A lossy UPLINK
+re-keys on its own abandonment instead. That shows on the client series
+`dt_client_media_keyframes_produced_total{source="abandonment"}` (client-media board, *Video
+Keyframes Produced by Cause*). Both shapes are accepted in this story and bounded by the interval.
+The real fix (bitrate adaptation, simulcast, a give-up threshold) is a later media-resilience story.
+If `subscriber_backlog` is high **across the fleet**, this is also
+[Scenario 21](#scenario-21-slow-video-subscriber-stream-credit-stall).
+
+**(c) A recovery-request flood (R-13) cannot raise the keyframe rate.** One forward per (source
+stream, counter) serves every receiver, so a flood moves the outcome counters, not group starts.
+Read `mh_media_recovery_requests_received_total{outcome}`:
+- high `duplicate`: many receivers lost the same group. That is shared loss, usually arm (b) or an
+  uplink problem, and it is healthy dedupe;
+- sustained `counter_ahead` or `source_mismatch`: a client or contract fault. A small
+  `source_mismatch` tail right after a source change is normal;
+- `unmapped_slot` or `malformed`: a client fault.
+
+**There is no rate-limit drop for recovery requests and no recovery-rate key.** Junk costs MH a
+fixed-size parse and a lookup, bounded by QUIC flow control.
+
+**(d) A patched or faulty publisher keying without cause.** Group starts run above what forwarded
+requests and target changes explain. Read the client series
+`dt_client_media_keyframes_produced_total{source}`, with values `request`, `directive_start` and
+`abandonment` (client-media board, *Video Keyframes Produced by Cause*). If `request` is small and
+`abandonment` is flat while MH counts more ingress group starts than those causes add up to, the
+publisher is keying outside the contract. **The publisher-side bound is enforced by the client**,
+so a patched client can exceed it. It is visible here and as egress pressure
+([Scenario 18](#scenario-18-media-egress-budget-exhaustion)). The client series is client-reported
+and can be inflated, so it corroborates the cause. MH's own count is the proof.
+
+**Resolution**
+- **No runtime lever except the R-26 video-off lever**, `MC_MAX_VIDEO_RECEIVE_SLOTS=0`. It turns
+  video off for every meeting and leaves audio untouched, and it costs an MC restart per pod
+  ([`mh-deployment.md` §Operator levers for media](mh-deployment.md#operator-levers-for-media-video-off-and-nothing-else),
+  [`mc-deployment.md` §Video-off lever](mc-deployment.md#video-off-lever)). Use it only if egress
+  pressure from the storm threatens audio (Scenario 18).
+- **MH has no keyframe-request or recovery tuning key. Do not look for one, and do not offer one.**
+  The retry, aggregation and recovery-rate keys were removed with Amendment 4.
+- Raising `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS` lowers the bound for a conforming client only, and it
+  rolls MC (`mc-deployment.md` §Configuration Reference). It is a capacity decision, not an incident
+  remedy. It does nothing against arm (d).
+- Arm (a): wait it out. Arm (b): accepted, so file it as evidence for the media-resilience story if
+  it is sustained. Arms (c) and (d): identify the client build. A dominant `client_version` on the
+  client series points at a release.
+
+**Escalation**: `client` for arms (c) and (d) (a request or keying contract fault; involve `security`
+if a build appears deliberately patched); `media-handler` if group starts rise with no matching
+cause on either side; operations for a sustained arm (b) across the fleet (capacity, Scenario 21).
+
+**Related**: [Scenario 21](#scenario-21-slow-video-subscriber-stream-credit-stall),
+[Scenario 22](#scenario-22-video-slot-stuck-pending),
+[Scenario 18](#scenario-18-media-egress-budget-exhaustion);
+`docs/observability/metrics/mh-service.md` (group starts, keyframe and recovery requests).
+
+---
+
+### Scenario 21: Slow Video Subscriber (Stream-Credit Stall)
+
+**Alert**: `MHVideoSubscriberBacklogResets` (A2, warning; rule owned by observability, OBS-B). It is fleet-level only.
+**Severity**: Warning
+**Runbook Section**: `#scenario-21-slow-video-subscriber-stream-credit-stall`
+
+**What this is.** Fleet-wide, `mh_media_group_resets_total{reason="subscriber_backlog"}` has run
+above 10% of egress group starts for 15 minutes. One bad path cannot reach 10% of the fleet. **So
+firing means a systemic capacity problem, and it is the leading indicator for egress exhaustion**
+([Scenario 18](#scenario-18-media-egress-budget-exhaustion)). Per-path recovery is a panel, not a
+page (R-12). One user on a slow link never pages.
+
+**Context**
+- MH forwards video **cut-through** (R-21). It reads the frame header, enforcing the maximum
+  payload against the length field before anything is accepted, rewrites the header per subscriber,
+  and passes payload bytes on as they arrive. MH holds only a header and the chunk in flight per
+  incoming stream.
+- Each subscriber stream has a capped backlog, `MH_EGRESS_STREAM_BACKLOG_BYTES` (published as
+  `mh_media_egress_stream_backlog_limit_bytes`). Past the cap MH **resets that destination's group
+  stream only**. It never stalls the publisher, the source's other destinations or anyone's audio.
+  The subscriber returns to waiting for a group start, and MH recovers it with its own
+  once-per-counter keyframe request (R-12).
+- Resets count groups, never frames. They are **not a subset** of egress group starts, because a
+  group can be abandoned before its stream opens. The 10% ratio is a fleet health ratio, not a
+  "share of groups lost" (`docs/observability/metrics/mh-service.md`, `mh_media_group_resets_total`).
+
+**Detection**
+
+```promql
+# The alert's shape, fleet-wide
+sum(rate(mh_media_group_resets_total{reason="subscriber_backlog"}[15m]))
+  / clamp_min(sum(rate(mh_media_group_starts_total{direction="egress"}[15m])), 1e-9)
+
+# Per pod, to see whether one handler dominates
+sum by (instance) (rate(mh_media_group_resets_total{reason="subscriber_backlog"}[15m]))
+```
+
+**Diagnosis: read the rows, in this order.**
+
+| Signal | What it means | Next |
+|---|---|---|
+| `mh_media_group_resets_total{reason="subscriber_backlog"}` | Slow subscribers: a destination's backlog overflowed, its writer fell two groups behind, or its downlink channel was full. | Fleet-wide → capacity (Resolution). One pod → that pod's egress (Scenario 18 per-pod reading). |
+| `mh_media_group_resets_total{reason="publisher_stall"}` | A publisher stalled mid-frame past `MH_STREAM_MID_FRAME_STALL_MS` (`mh_media_stream_mid_frame_stall_seconds`), so MH reset its downstream streams. | Uplink capacity or a client encoder stall. Sustained → `client`. |
+| `{reason="publisher_reset"}`, `{reason="source_ended"}`, `{reason="edge_removed"}` | **Normal lifecycle**: the publisher reset its group, the source ended or left, MC removed the edge or the meeting ended. | Only a sudden fleet-wide jump matters, and it usually tracks an MC or MH roll. |
+| `mh_media_frames_dropped_total{reason="stream_rate_limited"}` | Stream opens above `MH_STREAM_OPENS_PER_CONNECTION_PER_SEC`, refused at accept after only the fixed header is read. MH records the source's counter and repairs a declared source with its own keyframe request (`trigger="initial"`). **One per refused stream**, so it is a lower bound on frames. A conforming publisher opens at most one group stream per keyframe, so it stays under the limit while the limit is at least 1 / min interval. **Nothing validates that pairing at boot**: MH reads no keyframe interval, and the key is only range-checked. The shipped values (10 opens/s against a 500 ms interval, 2/s) leave the margin, but at MC's 100 ms floor (10/s) a conforming publisher plus target changes can reach it. | First confirm `mc_media_video_keyframe_min_interval_seconds` has not been lowered toward 0.1 and the configured limit was not lowered. Re-check the pairing whenever `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS` changes. Sustained non-zero with a sane config means a publisher churning group streams: `client`. |
+| `mh_media_frames_dropped_total{reason="partial_frame_discard"}` | A publisher's group stream ended while a frame header was partly buffered. Counts on every non-clean end, MH's own aborts included. | Tracks publisher disconnects. Sustained without disconnects → `media-handler`. |
+
+**Concurrency: there is NO event counter, by design. Do not hunt for one.** quinn's flow control
+stops the peer opening streams past the declared limit, so the event cannot happen at MH and
+nothing counts it. Triage it from the declared-limit config gauge
+`mh_media_uni_streams_per_connection_limit` beside the concurrent-ingress-groups gauge
+`mh_media_stream_ingress_groups`. On the publisher side, MAX_STREAMS starvation shows only as the
+client's `dt_client_media_send_groups_stopped_total{outcome="open_stalled"}`.
+
+**Memory: exhaustion is a counted reset, never an OOM kill.** R-21 validates backlog cap × streams
+against `MH_POD_MEMORY_LIMIT_BYTES` (the downward-API limit) at startup, and MH refuses to boot if
+the product does not fit. **There is no backlog-in-use gauge today.** MH exports only the cap,
+`mh_media_egress_stream_backlog_limit_bytes`. Use the cap plus the `subscriber_backlog` reset rate
+as the in-use proxy. The only memory alert is the existing `MHHighMemory`
+(`container_memory_usage_bytes / container_spec_memory_limit_bytes` for `container="mh-service"`;
+[Scenario 8](#scenario-8-resource-pressure)). If it fires together with this alert, the
+startup check did not hold, and that is a `media-handler` defect.
+
+**Resolution**
+- **Fleet-wide `subscriber_backlog`** is a capacity problem: subscribers' paths cannot carry the
+  fixed bitrate. The relief, in order:
+  1. If egress admission is also refusing, work [Scenario 18](#scenario-18-media-egress-budget-exhaustion).
+  2. The R-26 video-off lever, `MC_MAX_VIDEO_RECEIVE_SLOTS=0`. It keeps audio and costs an MC
+     restart per pod ([`mh-deployment.md` §Operator levers for media](mh-deployment.md#operator-levers-for-media-video-off-and-nothing-else)).
+  3. A lower-bitrate `media-codec-profile`. That is a config change that rolls MC and MH together,
+     and it sheds media sessions on the MH pods (`mh-deployment.md` §Rollout With Media Flowing),
+     so it is a planned change, not an incident step.
+- **Do not raise `MH_EGRESS_STREAM_BACKLOG_BYTES` to stop resets.** It moves memory, not capacity:
+  a deeper backlog on a path that cannot drain only delays the reset. The startup memory check
+  may then refuse to boot.
+- Repeated recovery on one path below the fixed bitrate is accepted in this story (R-12). The
+  give-up threshold and "poor connection" state belong to a later media-resilience story.
+
+**Escalation**: operations for capacity; `media-handler` if `MHHighMemory` fires with this alert or
+`partial_frame_discard` rises without disconnects; `client` for `publisher_stall` or
+`stream_rate_limited`.
+
+**Related**: [Scenario 18](#scenario-18-media-egress-budget-exhaustion) (egress exhaustion, which
+this alert leads); [Scenario 20](#scenario-20-video-keyframe-storm) arm (b) (the lossy-path loop
+seen from the keyframe side).
+
+---
+
+### Scenario 22: Video Slot Stuck Pending
+
+**Alert**: `MHVideoEdgeStuckPending` (A3, warning; rule owned by observability, OBS-B)
+**Severity**: Warning
+**Runbook Section**: `#scenario-22-video-slot-stuck-pending`
+
+**What this is.** `mh_media_edge_pending_oldest_seconds` has exceeded
+10 × `mc_media_video_keyframe_min_interval_seconds` for 5 minutes. The count is
+`mh_media_edges_pending`. There is no MH retry interval to compare against any more: retries were
+removed with Amendment 4.
+
+**Context.** "Pending" means a stream edge whose subscriber is connected here and whose assigned
+FORWARD source is connected here, but which has seen no group start yet. Pending is **MH-internal**
+(R-4):
+- **There is no client slot state for pending, and no give-up timeout while the source stays
+  assigned.** MH's gauge is the only server-side detector. The client keeps showing what the slot
+  showed before (R-4/R-5), so **users see a frozen picture or avatar, not a spinner**.
+- **Nothing retries** (Amendment 4). A directed target with no group in progress gets a keyframe
+  from the publisher within one minimum interval, and a seen source gets one MH request per counter.
+  **Stuck pending is therefore a MISSING-EVENT BUG**: someone owed a keyframe or a request and
+  never sent it. It is never a slow retry. The gauge and A3 exist to make that loud.
+- An MH→MC switch-completion report does not exist until story 5. MC cannot see pending.
+
+**Detection**
+
+```promql
+max(mh_media_edge_pending_oldest_seconds)
+10 * max(mc_media_video_keyframe_min_interval_seconds)
+sum(mh_media_edges_pending)
+sum by (outcome) (rate(mh_media_edge_pending_exits_total[15m]))   # group_start should dominate
+
+# The client half: ACTIVE video slots showing neither decodable video nor an avatar (no identity)
+histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[15m])))
+max by (media_kind) (dt_client_media_slots_unfulfilled{media_kind="video"})   # ONE browser's last value, not a fleet count; never read as healthy at 0
+```
+
+The fleet signal is the histogram. It is observed on EXIT only, so a slot stuck for a whole session
+appears only at that session's teardown, and the p95 lags a live incident.
+
+**If the client unfulfilled series rises together with MH pending, this is the scenario.** If MH
+pending is flat, MH believes it is forwarding. The receive half is then
+[MC Scenario 23](mc-incident-response.md#scenario-23-client-video-slot-unfulfilled).
+
+**Diagnosis: fork in this order.**
+
+**(a) Is the publisher directed?** An undirected source cannot answer a keyframe request (R-11).
+Read MC's directive outcomes and withdrawals
+([MC §send-directive wiring](mc-incident-response.md#send-directive-wiring)):
+`mc_media_send_directives_total{outcome}` and
+`mc_media_send_directive_withdrawals_total{media_kind="video", reason}`. A withdrawal is healthy.
+Pending is a bug here only when MC both holds the source in a live slot AND withdrew its video.
+That is an MC disagreement between its slot table and its directive, so escalate to
+`meeting-controller`.
+
+**(b) Did the publisher key, or refuse?** A directed target with no group in progress gets a
+keyframe within the minimum interval, unrequested (R-12). An unseen source correctly gets no MH
+request. Read `dt_client_media_keyframes_produced_total{source}` and the client refusal reasons on
+`dt_client_media_keyframe_requests_received_total{outcome}` (C-A1/C-A2). **No refusal should leave a
+slot pending.**
+- persistent `not_sending` ("not sending to that handler"): MC's directive and MH's edge disagree,
+  or the start did not key. A request naming a stream number that is no published kind's directed
+  stream lands on `dt_client_media_keyframe_requests_unattributed_total{outcome="not_sending"}`
+  instead, so read both series;
+- persistent `stale_counter`: the newer group is not reaching this handler. Either the publisher
+  abandoned toward it with no `abandonment` keyframe (R-12), or MH refused it (fork e);
+- `min_interval` is a deferral, not a refusal. **Pending past one interval means the deferred
+  keyframe was lost.**
+
+**(c) Capture failure not presented as muted.** R-19 requires a failed or revoked camera to present
+as video-muted. A pending source whose client reports a camera failure
+(`dt_client_media_capture_failures_total{media_kind="video", outcome}`, including `ended`) is a
+client bug: that source should present to others as video-muted (R-19), not as a live slot.
+
+**(d) Recovery-request outcomes**, per wire-freeze ruling 2, on
+`mh_media_recovery_requests_received_total{outcome}`:
+- `source_mismatch`: a request that arrived after a source change. Normal in small numbers;
+- `counter_ahead`: a counter higher than MH has seen. A client or contract fault.
+
+A slot that receives nothing from its NEW source is MH's to recover (R-13), not the receiver's. So
+pending on a fresh switch with no `initial` request from MH, once the source has been seen, is an MH
+missing-event bug.
+
+**(e) Ingress refused.** Read `mh_media_frames_dropped_total` with reason `stream_rate_limited`,
+`unmatched_stream` or `transport_mismatch` (MH's attribution and stream-limit drops, MH-A1/MH-A2).
+Also read `mh_media_frames_dropped_total{direction="ingress",reason="unknown_version"}`, a v2
+sender's frames dropped at MH ingress (the client never sees them; see [`mh-deployment.md` §Skew detection](mh-deployment.md#skew-detection-one-row-per-one-component-skew-across-the-cutover)).
+**The publisher does not re-key a stream MH refused or stopped (STOP_SENDING).** MH requests when it
+wants the stream again. So **pending after a refusal that clears, with no MH request following, is
+an MH missing-event bug**: `mh_media_keyframe_requests_sent_total{trigger="initial"}` should move.
+
+**(f) A server-muted source showing as pending is an MC bug.** The slot should be
+`avatar_server_muted`, with the directive withdrawn (R-16), and MH exits pending as
+`paused_forward_nothing`. Go to [MC Scenario 21](mc-incident-response.md#scenario-21-server-mute-not-enforced).
+
+**Resolution.** No operator lever repairs a missing event. The affected subscriber or publisher can
+reload, which is a fresh join and a fresh directed start that keys. That clears the symptom and
+destroys nothing an investigator needs, because the metrics carry no identity anyway. The durable
+fix is the code path that owed the event. **Do not restart MH**: it sheds every session on the pod
+and recovers nothing a reload would not. The video-off lever
+([`mh-deployment.md` §Operator levers for media](mh-deployment.md#operator-levers-for-media-video-off-and-nothing-else))
+applies only if the defect is widespread.
+
+**Escalation**: `meeting-controller` for (a) and (f); `client` for (b) and (c) and a client-side
+`counter_ahead`; `media-handler` for (d) and (e) when MH owed the request.
+
+**Related**: [MC Scenario 23](mc-incident-response.md#scenario-23-client-video-slot-unfulfilled),
+[Scenario 20](#scenario-20-video-keyframe-storm), [Scenario 21](#scenario-21-slow-video-subscriber-stream-credit-stall).
+
+---
+
+### Scenario 23: Client Sending While Client-Muted
+
+**Alert**: `MHPausedSourceIngress` (A4, warning; rule owned by observability, OBS-B)
+**Severity**: Warning. Treat it as a **client privacy defect**.
+**Runbook Section**: `#scenario-23-client-sending-while-client-muted`
+
+**What this is.** `mh_media_paused_source_frames_total` has run above 1% of ingress
+(`mh_media_frames_forwarded_total{direction="ingress"}`) for 15 minutes. **This is a CLIENT PRIVACY
+DEFECT, not a mute-enforcement failure.** Under client mute nothing of that kind may leave the
+device: no silence, no DTX, no video (R-17). MH learns client mute only from MC's policy, as the
+stream's PAUSED disposition. **MH never drops on client mute** (R-17), which is why this is an
+arrival counter and not a drop. The frames are forwarded, so a resume keyframe that beats MC's
+policy update still reaches subscribers. **A short burst at unmute is expected** for exactly that
+reason. Sustained arrivals mean a muted client is still transmitting.
+
+**Detection**
+
+```promql
+sum(rate(mh_media_paused_source_frames_total[15m]))
+  / clamp_min(sum(rate(mh_media_frames_forwarded_total{direction="ingress"}[15m])), 1e-9)
+
+# Corroboration from the client side, both kinds (per-kind, no identity)
+sum by (media_kind, client_version) (increase(dt_client_media_mute_transitions_total[1h]))
+sum by (media_kind, client_version) (rate(dt_client_media_frames_sent_total[15m]))
+```
+
+**Diagnosis: forks.**
+- **SDK version or stale bundle.** Split the client series by `client_version`. One version
+  dominating means a build regression, or a tab running a pre-fix bundle that needs a reload.
+- **The capture path did not stop.** A video client mute must stop the camera track. An audio client
+  mute keeps the mic open and stops SENDING. If one kind is affected, the fault is that kind's mute
+  path in the SDK.
+- **A debug or test source wired into the send path.**
+  - The R-7 self-check never reaches the encoder or a handler (`packages/web-app/tests/debugNeverExported.test.ts`).
+    One that does is a client and security defect.
+  - The R-27 test-pattern camera exists only in a `DT_TEST_PATTERN=1` dev build. There it replaces
+    the camera, is sent, and must obey video mute exactly like the camera. A production-mode build
+    refuses `DT_TEST_PATTERN=1` and the bundle test proves the pattern absent, so a fleet client
+    sending it means a dev build was deployed. Identify the `client_version`; that is a client and
+    security defect.
+
+**Resolution.** **There is no operator remedy beyond identifying the build.** No operator path to an
+individual's media exists, by design. Do not look for one and do not create one. Identify the
+`client_version`, and roll the web-app bundle forward or back. A server mute
+([Scenario 19](#scenario-19-server-mute-not-taking-effect-at-ingress)) is a host's moderation
+action, not a remedy for this defect.
+
+**Escalation**: `client` and `security`, always.
+
+**Related**: [Scenario 19](#scenario-19-server-mute-not-taking-effect-at-ingress) (server mute; MH
+DOES drop there); `docs/observability/metrics/mh-service.md` (`mh_media_paused_source_frames_total`).
 
 ---
 

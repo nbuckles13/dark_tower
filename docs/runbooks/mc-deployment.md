@@ -1762,6 +1762,21 @@ sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
 > **MC-restart floor adoptions do NOT appear in the "No unconfirmed pushes" gate, by design.** A rolled MC pod's first push to a live handler is answered with the pre-restart generation; MC records that on `mc_media_policy_generation_adoptions_total` INSTEAD of `generation_mismatch`, so the gate stays green on a healthy rollout. Expect `increase(mc_media_policy_generation_adoptions_total{outcome="adopted"}[30m])` to be non-zero after an MC roll with live meetings — **at most one per live (meeting, handler)**, which is the value with that bound. The sibling `{outcome="superseded"}` counts restart-floor replies discarded for a newer render (routine churn) and has NO such bound, so do not read the unlabelled total as a meeting count. A FAILED adoption is recorded as `generation_mismatch` and fails the gate, correctly. See the metrics catalog entry for why this is a sibling counter and not a sixth `outcome` value.
 - [ ] Cross-check the MH-side checklist (link above) for the full set of MH-side checks (handshake, JWT, timeout, MH→MC delivery success rate, active connections)
 
+**Story 3 video: the 24-hour watch list.** The list, in rise order, and every query live in one
+place: [`mh-deployment.md` §Story 3 video: the 24-hour watch list](mh-deployment.md#story-3-video-the-24-hour-watch-list-in-the-order-things-rise-first).
+They are not duplicated here. The MC-side items to own at the 24-hour mark:
+
+- [ ] Item 1: `mc_media_policy_pushes_total{outcome="transport_mode_mismatch"}` is zero. If not, do NOT
+  roll MC back alone ([Mixed-Transport Rollback Hazard](mh-deployment.md#mixed-transport-rollback-hazard)).
+- [ ] Items 4 and 6: the thresholds are scaled by `mc_media_video_keyframe_min_interval_seconds`
+  (`MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`), so confirm the gauge reads the configured value on both MC pods.
+- [ ] Item 8 (MC half): a server mute shows `mc_media_send_directive_withdrawals_total{reason="server_muted"}`
+  rising for a watched kind ([MC Scenario 21](mc-incident-response.md#scenario-21-server-mute-not-enforced) Step 1b).
+- [ ] Item 9: the MC policy-push rate under mute churn stays bounded (R-17).
+- [ ] Items 10 to 12: the client video series. These are client-reported and anchor in
+  `mc-incident-response.md` Scenarios 22 and 23. Check item 12 (a client video series is present at
+  all) before trusting items 10 and 11: a dead client pipe leaves those alerts green.
+
 **Rollback (MC half)** *(within the v3 era only; across the story-3 cutover nothing rolls back alone — [§Story 3 cutover](#story-3-cutover-see-each-other-the-mc-view))*: same as the join-flow rollback above — `kubectl rollout undo deployment/mc-0 -n dark-tower` and `kubectl rollout undo deployment/mc-1 -n dark-tower` (MC ships as two per-ordinal Deployments; there is no Deployment named `mc-service` — that string is a Service, a PDB and a container name. Form per `docs/runbooks/mh-deployment.md`). **Carve-out — do NOT roll MC back for sustained `no_applied_generation` (and, from story 3, for `transport_mode_mismatch`: [Mixed-Transport Rollback Hazard](mh-deployment.md#mixed-transport-rollback-hazard)).** If `mc_media_policy_pushes_total{outcome="no_applied_generation"}` is climbing with retries exhausted after a deploy, MH is below the ADR-0036 §8 contract and **the remedy is to roll MH forward, not MC back**: rolling MC back returns it to `policy_generation: 0` registrations, which MH installs nothing for — the pre-change media blackhole, not a fix. If the issue is on the MH side (handshake, JWT, RegisterMeeting timeouts), follow the rollback criteria + `mh-service` rollback documented in `docs/runbooks/mh-deployment.md` §"Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination" → "Rollback criteria".
 
 **Carve-out #2 — do NOT roll MC back on a media-session decline spike.** Since
