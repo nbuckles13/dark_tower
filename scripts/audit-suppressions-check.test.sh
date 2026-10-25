@@ -190,25 +190,16 @@ assert_status "sentinel-Bprime-token" "REASON=suppression-override-without-test-
 # cases above already cover override-resolution + the no-sentinel-fallback path.
 
 # === dependabot-ignore guard (security a1, mechanical enforcement) =============
-# The check reads REPO_ROOT/.github/dependabot.yml (fixed path, not override-able), so
-# this test hermetically backs up the real file, swaps fixtures, asserts, and restores.
+# Fixtures live in $WORK and reach the check through the sentinel-gated
+# DEVLOOP_DEPENDABOT_YML override; the real .github/dependabot.yml is never written.
 #
 # DETERMINISM (test-rot fix, @test Gate-2): these cases run UNDER the sentinel with a
 # FUTURE-dated fixture manifest + injected AUDIT_SUPPRESSIONS_NOW, so __date_check stays
 # green regardless of the real clock and the DEPENDABOT assertion is what's under test.
 # Without this they read the real seed against the real clock and short-circuit on
-# `suppression-past-due` after 2026-09-01. The dependabot.yml swap is orthogonal (fixed
-# path) and stays. dbot_run() = check invocation with sentinel + future fixture + dbot env.
-REPO_ROOT_T="$(cd "${__here}/.." && pwd)"
-DBOT="${REPO_ROOT_T}/.github/dependabot.yml"
-DBOT_BAK="${WORK}/dependabot.yml.bak"
-dbot_had_file=0
-if [[ -f "$DBOT" ]]; then cp "$DBOT" "$DBOT_BAK"; dbot_had_file=1; fi
-restore_dbot() {
-  if [[ "$dbot_had_file" -eq 1 ]]; then cp "$DBOT_BAK" "$DBOT"; else rm -f "$DBOT"; fi
-}
-# Augment the EXIT trap to also restore dependabot.yml (in addition to rm -rf WORK).
-trap 'restore_dbot; rm -rf "$WORK"' EXIT
+# `suppression-past-due` after 2026-09-01. dbot_run() = check invocation with sentinel +
+# future fixture + the fixture dependabot.yml.
+DBOT="${WORK}/dependabot.yml"
 
 # Future-dated fixture manifest + matching derived files so date/sync/quality all pass,
 # isolating the dependabot check as the only thing that can fail.
@@ -220,23 +211,28 @@ dbot_run() {
       DEVLOOP_SUPPRESSIONS_MANIFEST="$DBOT_M" \
       DEVLOOP_CARGO_AUDIT_TOML="${WORK}/cargo.audit.toml" \
       DEVLOOP_AUDIT_IGNORE_JSON="${WORK}/pnpm.ignore.json" \
+      DEVLOOP_DEPENDABOT_YML="$DBOT" \
       AUDIT_SUPPRESSIONS_NOW="2026-06-06" \
       "$CHECK" 2>&1
 }
 
 # populated ignore: block -> FAIL dependabot-ignore-present
-mkdir -p "${REPO_ROOT_T}/.github"
 printf 'version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: "/"\n    schedule:\n      interval: weekly\n    ignore:\n      - dependency-name: "rsa"\n' > "$DBOT"
 out="$(dbot_run)"; rc=$?
 assert_exit "dependabot-ignore-populated-fail" 1 "$rc"
 assert_status "dependabot-ignore-token" "REASON=dependabot-ignore-present" "$out"
+# ...and it came from the fixture: the message names the file that was checked.
+assert_status "dependabot-override-honored" "FAIL: ${DBOT} contains a non-empty" "$out"
+# The override alone, without the sentinel, is refused like every other override.
+out="$(env -i PATH="$PATH" HOME="$HOME" DEVLOOP_DEPENDABOT_YML="$DBOT" "$CHECK" 2>&1)"; rc=$?
+assert_exit "dependabot-override-without-sentinel-fail" 1 "$rc"
+assert_status "dependabot-override-without-sentinel-token" "REASON=suppression-override-without-test-sentinel" "$out"
 # empty ignore: key followed by another key -> NOT flagged (clean)
 printf 'version: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: "/"\n    ignore:\n    schedule:\n      interval: weekly\n' > "$DBOT"
 out="$(dbot_run)"; assert_exit "dependabot-empty-ignore-ok" 0 "$?"
 # comment-only mention of ignore: -> NOT flagged (the real-file shape)
 printf '# Do NOT add an `ignore:` block here to suppress advisories.\nversion: 2\nupdates:\n  - package-ecosystem: cargo\n    directory: "/"\n    schedule:\n      interval: weekly\n' > "$DBOT"
 out="$(dbot_run)"; assert_exit "dependabot-comment-ignore-ok" 0 "$?"
-restore_dbot
 
 # === GATE-side filter FAIL-SAFE (security §D.1.2 PATH-1, @code-reviewer/@security F4) ===
 # _audit_gate.sh::audit_read_pnpm_suppressions on a malformed .pnpm-audit-ignore.json must
