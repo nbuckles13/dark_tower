@@ -6,9 +6,18 @@ name: Spike S6 - Kind + Layer 7 on a GitHub-hosted runner
 # /tmp/devloop paths at its runtime dir, so layer7.sh takes its existing
 # socket-present lane (no new mechanism).
 
+# Trust tiers (image-caching spike, 2026-10-25). The spike EMULATES the real
+# triggers with two branches; in production read `refs/heads/main` for
+# `spike/ci-kind` and `pull_request` for `spike/ci-kind-pr`:
+#   main tier: a `build` job (no test or third-party test code) gates the build
+#     context, builds every image once with the layer cache, pushes to GHCR by
+#     digest; `layer7` pulls those digests and never holds the cache token or a
+#     package-write token.
+#   pr tier: one job builds in-job (cache read from the base branch, writes only
+#     its own scope) and pushes nothing. Fork PRs are read-only by platform rule.
 on:
   push:
-    branches: [ spike/ci-kind ]
+    branches: [ spike/ci-kind, spike/ci-kind-pr ]
 
 permissions:
   contents: read
@@ -20,11 +29,82 @@ env:
   HOST_GATEWAY_IP: 10.255.255.254  # devloop-helper DEFAULT_HOST_GATEWAY_IP
   SLUG: ci
   PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright  # run 6: layer7 defaults to the image path /opt/ms-playwright
+  # Separate CI package namespace; never `latest`. Consumers pull by digest.
+  DT_IMAGE_REGISTRY: ghcr.io/nbuckles13/dark-tower-ci
+  TIER: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/spike/ci-kind') && 'main' || 'pr' }}
 
 jobs:
+  build:
+    # main tier only (the expression mirrors env.TIER; env is not readable here).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/spike/ci-kind'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write   # push CI images; this job runs no test code
+    outputs:
+      image_refs: ${{ steps.push.outputs.image_refs }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: "spike-ci-kind-build"
+          cache-on-failure: true
+          cache-bin: false
+
+      - name: Gate - build context holds no key material
+        # Before any cache or registry credential exists in this job.
+        run: |
+          cargo build --release -p dt-guard
+          scripts/guards/simple/validate-docker-context.sh
+
+      - name: Actions cache credentials for BuildKit
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+
+      - name: Create docker-container builder
+        run: docker buildx create --name dt-ci --driver docker-container --bootstrap --use
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+        run: echo "${GH_TOKEN}" | docker login ghcr.io -u "${GH_ACTOR}" --password-stdin
+
+      - name: Build once, push by digest
+        id: push
+        env:
+          DT_IMAGE_SOURCE_REV: ${{ github.sha }}
+          DT_IMAGE_BUILD_CACHE: gha
+        run: |
+          start=$(date +%s)
+          infra/ci/build-push-images.sh /tmp/image-refs.txt
+          echo "image builds: $(( $(date +%s) - start ))s"
+          cat /tmp/image-refs.txt
+          { echo "image_refs<<EOF_REFS"; cat /tmp/image-refs.txt; echo "EOF_REFS"; } >> "$GITHUB_OUTPUT"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
+
   layer7:
+    needs: build
+    # Runs after a successful build (main tier) or with build skipped (pr tier).
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: read    # pull the CI images; no write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -108,10 +188,26 @@ jobs:
           sudo systemctl restart docker
           docker info --format 'driver={{.Driver}}'
 
-      - name: BuildKit builder + Actions cache credentials (image caching spike)
+      - name: (main tier) Use the build job's images, pinned by digest
+        if: env.TIER == 'main'
+        env:
+          IMAGE_REFS: ${{ needs.build.outputs.image_refs }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+        run: |
+          printf '%s\n' "${IMAGE_REFS}" > /tmp/prebuilt-images.txt
+          cat /tmp/prebuilt-images.txt
+          [ "$(grep -c '@sha256:' /tmp/prebuilt-images.txt)" -ge 5 ] || { echo "::error::expected 5 digest-pinned refs"; exit 1; }
+          echo "DT_PREBUILT_IMAGES=/tmp/prebuilt-images.txt" >> "$GITHUB_ENV"
+          echo "${GH_TOKEN}" | docker login ghcr.io -u "${GH_ACTOR}" --password-stdin
+
+      - name: (pr tier) Actions cache credentials for BuildKit
+        # Self-scoped: a PR run's cache writes are readable only by that PR.
+        if: env.TIER == 'pr'
         uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
 
-      - name: Create docker-container builder
+      - name: (pr tier) Build in-job with the layer cache
+        if: env.TIER == 'pr'
         run: |
           docker buildx create --name dt-ci --driver docker-container --bootstrap
           echo "BUILDX_BUILDER=dt-ci" >> "$GITHUB_ENV"

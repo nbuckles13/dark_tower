@@ -27,6 +27,7 @@ pub mod counter_zero_init;
 pub mod cross_boundary_classification;
 pub mod cross_boundary_scope;
 pub mod dashboard_panels;
+pub mod docker_context;
 pub mod env_config;
 pub mod grafana_datasources;
 pub mod gsa_sync;
