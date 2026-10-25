@@ -1717,6 +1717,8 @@ new findings against a diff that had already been through a full review round, i
 
 ### Fixed during round 2
 
+> S-2 row: **REVERSED 2026-10-24** (human decision, story 3 R-15 fix; see ADR-0036 §5 amendment 2026-10-24 and docs/devloop-outputs/2026-10-24-r15-client-mute-roster/). Self-mute now fans out on every real transition. The text below is S-2 as originally judged and is kept as the record.
+
 | # | Reviewer | Finding | Fixed by |
 |---|----------|---------|----------|
 | S-2 | security | Client-reachable mute fan-out delivered **zero bytes to zero clients** (`MuteChanged` is never wire-serialized — two producers, no consumer) while costing an O(N) clone-and-await on the shared meeting-actor task. `MuteWorkLimiter` is per-connection; the resource is per-meeting; MC has no per-meeting roster cap (`MC_MAX_PARTICIPANTS` is an MC-wide accept-loop cap). Aggregate O(N²), and reachable by a buggy client *release*, not only an attacker. Confirmed diff-created: at base `1d755455`, `update_self_mute`'s only caller was a test. | implementer — broadcast removed, `handle_self_mute` now synchronous, retirement condition at the site |
@@ -1827,7 +1829,7 @@ diff that had already been through a complete review round.
 
 ### Security Specialist
 **Verdict**: RESOLVED-FIXED — 3 found, 3 fixed, 0 deferred.
-S-1 confirmed fixed on re-derivation and not re-opened. **S-2**: the diff's new `MuteRequest` arm made
+S-1 confirmed fixed on re-derivation and not re-opened. **REVERSED 2026-10-24** (human decision, story 3 R-15 fix; see ADR-0036 §5 amendment 2026-10-24 and docs/devloop-outputs/2026-10-24-r15-client-mute-roster/). Self-mute now fans out on every real transition. The text below is S-2 as originally judged and is kept as the record. **S-2**: the diff's new `MuteRequest` arm made
 `broadcast_update` client-reachable, but `MuteChanged` has no consumer — the O(N) awaited fan-out
 delivered **zero bytes to zero clients** while a per-connection limiter tried to bound a per-meeting
 resource, with no per-meeting roster cap in MC. Removed structurally. **S-3**: the capability-rejection
