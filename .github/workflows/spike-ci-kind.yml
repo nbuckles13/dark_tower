@@ -116,6 +116,12 @@ jobs:
         run: |
           sudo ip addr add "${HOST_GATEWAY_IP}/32" dev lo
           echo "${HOST_GATEWAY_IP} host.containers.internal" | sudo tee -a /etc/hosts
+          # Run 8: Vite bound [::1]:5173 only (localhost -> ::1 first here) while Playwright
+          # polls 127.0.0.1:5173. Record the resolution, then make localhost IPv4-only.
+          getent ahosts localhost || true
+          sudo sed -i -E '/^::1/ s/\s(localhost)(\s|$)/ /' /etc/hosts
+          cat /etc/hosts
+          getent ahosts localhost
 
       - name: Build devloop-helper
         run: |
