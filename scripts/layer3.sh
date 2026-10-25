@@ -17,8 +17,13 @@ assert_no_ci_sentinel_leak
 layer_lifecycle_begin 3
 "${__here}/lang/_get_base_ref.sh" >/dev/null
 
-# Use run_and_emit (dry-reviewer F2) instead of inline if/else — single source
-# of truth for STATUS line emission + exit-code mapping.
+# Every entry runs through run_and_emit (dry-reviewer F2) — single source of truth for
+# STATUS line emission + exit-code mapping — CONCURRENTLY: parallel_queue_run (_common.sh)
+# runs DEVLOOP_LAYER3_JOBS of them at a time (default 4; Layer 3 is bounded by its longest
+# suite, setup.test.sh, at that width) and replays each one's output in the order listed
+# here. That is only sound because every entry is hermetic: its own temp dirs, no fixed
+# shared path, no write to a real repo file. A suite that needs any of those must be fixed,
+# not added here.
 # The audit-suppressions guard is auto-discovered by run-guards.sh (simple/*.sh); its
 # SELF-TEST is wired explicitly here (task #47) — there is no *.test.sh auto-runner, so an
 # unrun test is untested. This drives the check's FAIL branches (past-due/drift/malformed/
@@ -33,13 +38,13 @@ layer_lifecycle_begin 3
 # consumes them — so do not "consolidate" that one here to match the pattern. The reasoning
 # lives once, at its invocation in compile.sh.
 {
-  run_and_emit "guards" "${__here}/guards/run-guards.sh" || true
-  run_and_emit "changed-helpers-test" "${__here}/lang/_changed_helpers.test.sh" || true
-  run_and_emit "audit-suppressions-selftest" "${__here}/audit-suppressions-check.test.sh" || true
-  run_and_emit "audit-gate-test" "${__here}/lang/_audit_gate.test.sh" || true
-  run_and_emit "ts-audit-decision-test" "${__here}/lang/ts/audit.test.sh" || true
-  run_and_emit "pnpm-helpers-test" "${__here}/lang/_pnpm.test.sh" || true
-  run_and_emit "layer7-selftest" "${__here}/layer7.test.sh" || true
+  parallel_queue_add "guards" "${__here}/guards/run-guards.sh"
+  parallel_queue_add "changed-helpers-test" "${__here}/lang/_changed_helpers.test.sh"
+  parallel_queue_add "audit-suppressions-selftest" "${__here}/audit-suppressions-check.test.sh"
+  parallel_queue_add "audit-gate-test" "${__here}/lang/_audit_gate.test.sh"
+  parallel_queue_add "ts-audit-decision-test" "${__here}/lang/ts/audit.test.sh"
+  parallel_queue_add "pnpm-helpers-test" "${__here}/lang/_pnpm.test.sh"
+  parallel_queue_add "layer7-selftest" "${__here}/layer7.test.sh"
   # Org-subdomain drift guard SELF-TEST (story R-7, task #3). The guard itself is
   # auto-discovered by run-guards.sh above and runs on every devloop — but a PASSING guard
   # exercises none of its failure branches, and those branches are its entire value: a check
@@ -49,14 +54,14 @@ layer_lifecycle_begin 3
   # DEVLOOP_TEST-gated SUBDOMAIN_GUARD_ROOT seam. Deliberately NOT under guards/simple/:
   # run-guards.sh's `find -name '*.sh'` matches `*.test.sh` too, so it would be auto-run as a
   # guard as well as here. No cluster.
-  run_and_emit "subdomain-regex-guard-selftest" "${__here}/guards/validate-subdomain-regex-sync.test.sh" || true
+  parallel_queue_add "subdomain-regex-guard-selftest" "${__here}/guards/validate-subdomain-regex-sync.test.sh"
   # dev-cluster vocabulary guard SELF-TEST (ADR-0038 step 3): same shape and reason. The
   # guard (auto-discovered above) keeps every `dev-cluster <verb>` / Kind-script `--flag`
   # remedy spelling live; this drives its failure branches (retired verb/flag, client/helper
   # allowlist drift, empty remedy site, missing scan root) and its no-false-positive prose
   # case against synthetic trees via the DEVLOOP_TEST-gated DT_VERBS_GUARD_ROOT seam.
   # Deliberately NOT under guards/simple/ (find -name '*.sh'). No cluster.
-  run_and_emit "dev-cluster-verbs-guard-selftest" "${__here}/guards/validate-dev-cluster-verbs.test.sh" || true
+  parallel_queue_add "dev-cluster-verbs-guard-selftest" "${__here}/guards/validate-dev-cluster-verbs.test.sh"
   # Slug-class sync self-test (story task #4, R-8): same shape and same reason as the
   # subdomain guard above. validate-slug-class-sync.sh pins /close-story's read-time slug
   # regex to the canonical `manifest::SLUG_PATTERN`; in-tree it always passes, so its drift
@@ -65,60 +70,60 @@ layer_lifecycle_begin 3
   # missing, canonical declaration renamed), where a grep-based guard would otherwise compare
   # nothing and report success. Deliberately NOT under guards/simple/ for the same
   # find -name '*.sh' reason. No cluster.
-  run_and_emit "slug-class-sync-guard-selftest" "${__here}/guards/validate-slug-class-sync.test.sh" || true
+  parallel_queue_add "slug-class-sync-guard-selftest" "${__here}/guards/validate-slug-class-sync.test.sh"
   # Keyframe-floor sync self-test (story 3 C-A2): validate-keyframe-floor-sync.sh pins the
   # SDK's compiled keyframe floor to MC's MIN_KEYFRAME_INTERVAL_MS_FLOOR; in-tree it always
   # passes, so its drift and literal-not-found branches are exercised here against edited
   # COPIES of the real files via the KEYFRAME_FLOOR_SYNC_*_SRC seams. Same find -name '*.sh'
   # reason for living outside guards/simple/. No cluster.
-  run_and_emit "keyframe-floor-sync-guard-selftest" "${__here}/guards/validate-keyframe-floor-sync.test.sh" || true
+  parallel_queue_add "keyframe-floor-sync-guard-selftest" "${__here}/guards/validate-keyframe-floor-sync.test.sh"
   # Counter-zero-init self-test (ADR-0036 story-1 counter-visibility fix): the guard PASSES on
   # every real run (all four services are zero-init'd), so its failure branches — the positive
   # control (a planted lazy counter MUST fire), the exempt/malformed/mutual-exclusion paths, the
   # slot()-witness predicate, the entrypoint-not-called check, and the scope-liveness tokens —
   # are exercised here against synthetic roots. Deliberately NOT under guards/simple/ (the
   # find -name '*.sh' reason). No cluster.
-  run_and_emit "counter-zero-init-selftest" "${__here}/guards/counter-zero-init.test.sh" || true
+  parallel_queue_add "counter-zero-init-selftest" "${__here}/guards/counter-zero-init.test.sh"
   # Disk-guard self-test (envtest-infra-reliability devloop): forces
   # check_build_disk_space's trip branch so the `REASON=insufficient-disk` operator contract
   # (§6.7) is covered — Gate-2's rebuild only hits the guard's pass path. No cluster needed
   # (real df, absurd DEVLOOP_MIN_DISK_GB).
-  run_and_emit "setup-disk-guard-selftest" "${__here}/setup.test.sh" || true
+  parallel_queue_add "setup-disk-guard-selftest" "${__here}/setup.test.sh"
   # The Rust test verb (ADR-0038 devloop 2): dispatcher arg-passthrough, and the unit-test
   # DB migration failing LOUDLY before cargo (sqlx absent / migrate run failing) with a
   # positive control. PATH-shimmed cargo/sqlx/pg_isready; no DB, no real cargo.
-  run_and_emit "rust-test-verb-selftest" "${__here}/lang/rust/behavior-equivalence.test.sh" || true
+  parallel_queue_add "rust-test-verb-selftest" "${__here}/lang/rust/behavior-equivalence.test.sh"
   # Orchestrator lane-integrity (task #56): exercises layer-all's exit-code/summary/budget/
   # bypass-closure behavior end-to-end via the DEVLOOP_TEST-gated LAYER_SCRIPT_DIR stub seam
   # — the layer-all-level seams layer7.test.sh structurally cannot reach. No cluster.
-  run_and_emit "layer-all-orchestrator-test" "${__here}/layer-all.test.sh" || true
+  parallel_queue_add "layer-all-orchestrator-test" "${__here}/layer-all.test.sh"
   # Long-running entry scripts (devloop.sh, run-story.sh) are wrapped `{ ... exit; }` so an
   # edit landing mid-run cannot shift bash's read offset. Static; no cluster.
-  run_and_emit "parse-whole-script-test" "${__here}/parse-whole-script.test.sh" || true
+  parallel_queue_add "parse-whole-script-test" "${__here}/parse-whole-script.test.sh"
   # The devloop model's single home is .claude/settings.json (no agent/skill/script pins).
-  run_and_emit "model-single-home-test" "${__here}/model-single-home.test.sh" || true
+  parallel_queue_add "model-single-home-test" "${__here}/model-single-home.test.sh"
   # Absorb self-test: absorb-devloop.sh's interrupted-absorb resume contract (refuses an
   # incomplete resolution, a foreign paused pick or an unrelated merge; otherwise finishes
   # the paused commit and absorbs the rest, recording origins so a resolved commit is never
   # picked twice). Hermetic — throwaway repos, real git. No cluster.
-  run_and_emit "absorb-devloop-selftest" "${__here}/../infra/devloop/absorb-devloop.test.sh" || true
+  parallel_queue_add "absorb-devloop-selftest" "${__here}/../infra/devloop/absorb-devloop.test.sh"
   # devloop.sh copies container Claude memories out before every dev-container removal.
-  run_and_emit "memory-harvest-selftest" "${__here}/../infra/devloop/memory-harvest.test.sh" || true
+  parallel_queue_add "memory-harvest-selftest" "${__here}/../infra/devloop/memory-harvest.test.sh"
   # Story-runner self-test (ADR-0035 §12): the runner drives unattended
   # skip-permissions sessions and reaches `git reset --hard` + `git clean -fdq`
   # from a classification decision, with zero tests before this file. Hermetic —
   # real runner, throwaway fixture repo via the DEVLOOP_TEST-gated
   # STORY_REPO_ROOT/DT_STORY seams; stub claude/sleep/date, real git, real
   # dt-story. No cluster, no network, no real sessions.
-  run_and_emit "run-story-selftest" "${__here}/workflow/run-story.test.sh" || true
+  parallel_queue_add "run-story-selftest" "${__here}/workflow/run-story.test.sh"
   # Devloop log reader self-test: a synthetic stream-json session pins each phase signal
   # against its false-positive twin, the view filters, and the follow loop moving to the
   # next task's log. Hermetic; no cluster.
-  run_and_emit "devloop-log-selftest" "${__here}/workflow/devloop-log.test.sh" || true
+  parallel_queue_add "devloop-log-selftest" "${__here}/workflow/devloop-log.test.sh"
   # Dev-tool binary home (scripts/lib/tool-bins.sh): source-safety, unconditional
   # assignments, crate allow-list, pinned --target-dir, stale release-profile binary
   # removal, exec-mode missing-binary token. Hermetic — fake root + PATH-stubbed cargo.
-  run_and_emit "tool-bins-selftest" "${__here}/lib/tool-bins.test.sh" || true
+  parallel_queue_add "tool-bins-selftest" "${__here}/lib/tool-bins.test.sh"
   # Guard-runner self-test (fast-fail-guards devloop): pins run-guards.sh's timeout
   # emission + the violation/timeout counter split + the ladder-mirror exit precedence
   # (PRECONDITION>0 → exit 2 dominant), all via a PATH-stubbed `timeout` (hermetic, no real
@@ -127,7 +132,7 @@ layer_lifecycle_begin 3
   # this test derives the expected exit from status_to_exit_code at test time. Deliberately
   # NOT under guards/simple/ — run-guards.sh's `find simple -name '*.sh'` would auto-run it as
   # a guard too. No cluster.
-  run_and_emit "run-guards-selftest" "${__here}/guards/run-guards.test.sh" || true
+  parallel_queue_add "run-guards-selftest" "${__here}/guards/run-guards.test.sh"
   # Frame-vector drift guard SELF-TEST (story task 8, extended at task 15). The
   # guard itself is auto-discovered by run-guards.sh above and passes on every
   # devloop — but a passing guard exercises none of its failure branches, and
@@ -154,7 +159,7 @@ layer_lifecycle_begin 3
   # the DEVLOOP_TEST-gated FRAME_VECTORS_ROOT seam; no cluster, no network, no
   # cargo. Deliberately NOT under guards/simple/ for the same `find -name '*.sh'`
   # reason as its neighbours above.
-  run_and_emit "frame-vectors-guard-selftest" "${__here}/guards/validate-frame-vectors.test.sh" || true
+  parallel_queue_add "frame-vectors-guard-selftest" "${__here}/guards/validate-frame-vectors.test.sh"
   # dev-web preflight contract self-test (release-premise-and-preflight-guards devloop):
   # pins the WARN→HARD-FAIL escalation of the MC/MH WebTransport checks, which an
   # exit-code assertion structurally CANNOT pin — `check_port` sets HARD_FAIL without
@@ -171,7 +176,7 @@ layer_lifecycle_begin 3
   # Hermetic: PATH-stubbed ss/curl/getent, temp repo root, AC_PORT/GC_PORT overrides.
   # No cluster, no network. Deliberately NOT under guards/simple/ — run-guards.sh's
   # `find simple -name '*.sh'` would auto-run it as a guard.
-  run_and_emit "dev-web-preflight-selftest" "${__here}/dev-web.test.sh" || true
+  parallel_queue_add "dev-web-preflight-selftest" "${__here}/dev-web.test.sh"
   # Media-path telemetry deny SELF-TEST (ADR-0036 §11). The guard itself is
   # auto-discovered by run-guards.sh above and PASSES on every run — the media
   # directory is clean and is meant to stay that way — so a real run exercises
@@ -200,11 +205,11 @@ layer_lifecycle_begin 3
   # misuse). No cluster, no network, no cargo. Deliberately NOT under
   # guards/simple/ — run-guards.sh's `find simple -name '*.sh'` would auto-run
   # it as a production guard as well as here.
-  run_and_emit "media-telemetry-deny-selftest" "${__here}/guards/media-telemetry-deny.test.sh" || true
+  parallel_queue_add "media-telemetry-deny-selftest" "${__here}/guards/media-telemetry-deny.test.sh"
   # _common.sh unit tests (ADR-0037 §D7 wires this in — it was orphaned/unrun, docs/TODO.md:2006). Hosts
   # the STATUS-aggregation precedence, fail_fast_mode, AND the fmt_mode truth table (incl. the two
   # load-bearing apply-opt-in-loses-to-CI/override cells). Hermetic: pure bash, no cargo/cluster/network.
-  run_and_emit "common-selftest" "${__here}/lang/_common.test.sh" || true
+  parallel_queue_add "common-selftest" "${__here}/lang/_common.test.sh"
   # Dispatcher, wrapper-trap and base-ref resolver unit tests (2026-10-06 — all three were
   # orphaned/unrun). _dispatch.test.sh carries the N/A emitter allow-list, the replacement
   # detection for N/A ranking below OK (ADR-0033 2026-10-06 amendment), and the
@@ -213,29 +218,29 @@ layer_lifecycle_begin 3
   # bare STATUS= line, so none casts a vote in this layer's aggregate beyond run_and_emit's own.
   # (_get_base_ref.behavior-equivalence.test.sh is deliberately NOT wired: it runs the whole
   # real layer-all.sh inside a fixture repo, ~7 min, and two cases are stale — docs/TODO.md.)
-  run_and_emit "dispatch-selftest" "${__here}/lang/_dispatch.test.sh" || true
-  run_and_emit "wrapper-trap-selftest" "${__here}/lang/_wrapper_trap.test.sh" || true
-  run_and_emit "get-base-ref-selftest" "${__here}/lang/_get_base_ref.test.sh" || true
+  parallel_queue_add "dispatch-selftest" "${__here}/lang/_dispatch.test.sh"
+  parallel_queue_add "wrapper-trap-selftest" "${__here}/lang/_wrapper_trap.test.sh"
+  parallel_queue_add "get-base-ref-selftest" "${__here}/lang/_get_base_ref.test.sh"
   # Layer-script skeleton conventions (no raw date/LAYER=/STATUS=/trap/aggregation in layerN.sh);
   # read-only scan, hermetic, ~0.02s. Also orphaned until 2026-10-06.
-  run_and_emit "layer-skeleton-selftest" "${__here}/lang/_layer_skeleton.test.sh" || true
+  parallel_queue_add "layer-skeleton-selftest" "${__here}/lang/_layer_skeleton.test.sh"
   # Rust fmt wrapper integration (ADR-0037 §D7): stubbed `cargo` on PATH (hermetic — a PATH stub, NOT the
   # real toolchain, so the "no cargo" invariant above holds), argv-asserted mode dispatch + the four-arm
   # apply pre-pass + positive controls. Under scripts/lang/rust/ (NOT guards/simple/ — the find-name reason).
-  run_and_emit "rust-fmt-selftest" "${__here}/lang/rust/fmt.test.sh" || true
+  parallel_queue_add "rust-fmt-selftest" "${__here}/lang/rust/fmt.test.sh"
   # Proto fmt wrapper + _buf.sh preflight (ADR-0037 §D7 COLLAPSE branch): stubbed `pnpm` on PATH (hermetic
   # — a PATH stub, NOT the real toolchain/buf), asserting the four-token preflight taxonomy, the P-6 version-
   # precedence (version-mismatch beats format), the buf rc map (drift=100/parse=1, INVERSE of rust), the
   # apply post-condition re-check, and the GSA WARN anchor. The pnpm-unavailable discriminator proves the
   # lane never falls back to a bare-PATH buf (the COLLAPSE decision).
-  run_and_emit "proto-fmt-selftest" "${__here}/lang/proto/fmt.test.sh" || true
+  parallel_queue_add "proto-fmt-selftest" "${__here}/lang/proto/fmt.test.sh"
   # Proto GOLDEN-FORMAT behavioral pin (ADR-0037 §D7; @security control). UNLIKE the stubbed fmt self-tests
   # above, this runs the REAL `pnpm exec buf` (offline, no network, sub-second over a ~25-line fixture — the
   # same node-tooling-in-Layer-3 precedent as ts-fmt-selftest). It asserts the pinned buf is idempotent on the
   # committed golden and normalizes a deformed copy back to it, so a @bufbuild/buf bump that reformats reds
   # here and its diff is the review evidence — the disjoint control the version assertion (green on a bump)
   # cannot provide. Fail-loud via the shared preflight; never a skip.
-  run_and_emit "proto-golden-format-selftest" "${__here}/lang/proto/golden-format.test.sh" || true
+  parallel_queue_add "proto-golden-format-selftest" "${__here}/lang/proto/golden-format.test.sh"
   # TS fmt wrapper integration (ADR-0037 §D7). DELIBERATELY NOT STUBBED (unlike rust/proto's PATH stubs):
   # the TS lane forwards `-- <flag>` through `nx run-many` to prettier, and bare prettier with no mode
   # flag exits 0 (vacuous pass), so ONLY the REAL nx→prettier chain proves the flag arrives — a stub
@@ -244,17 +249,18 @@ layer_lifecycle_begin 3
   # offline), never the repo tree; NX_DAEMON=false + isolated NX_CACHE_DIRECTORY so no stale graph/cache
   # is served. Node tooling, NOT cargo — the "no cargo" invariant above is about compiler cost/variance
   # in the fast tier; nx+prettier over tiny fixtures run ~10s (budget recorded with @operations per §6.3).
-  run_and_emit "ts-fmt-selftest" "${__here}/lang/ts/fmt.test.sh" || true
+  parallel_queue_add "ts-fmt-selftest" "${__here}/lang/ts/fmt.test.sh"
   # Fmt-lane SSoT policy guard SELF-TEST (ADR-0037 §D7/§D9). The guard (auto-discovered under
   # guards/simple/) PASSES on the real tree, so its failure branches — the SSoT-bypass detector, the
   # attesting-gate prefix checks, the pre-commit check-only form, and the comment-vs-code discriminator
   # that keeps the bypass detector from forbidding documentation — are exercised here against synthetic
   # fixtures via the FMT_SSOT_* seams. Deliberately NOT under guards/simple/ (the find -name '*.sh'
   # reason). No cluster.
-  run_and_emit "fmt-lane-ssot-guard-selftest" "${__here}/guards/validate-fmt-lane-ssot.test.sh" || true
+  parallel_queue_add "fmt-lane-ssot-guard-selftest" "${__here}/guards/validate-fmt-lane-ssot.test.sh"
   # TS-fmt proto-exclusion standing guard SELF-TEST (ADR-0037 §D7; @dry-reviewer). The guard (auto-discovered
   # under guards/simple/) PASSES on the real tree, so its failure branches — the missing proto-ignore line,
   # a format-target cwd, and the zero-targets vacuity guard — are exercised here against synthetic config via
   # the TSFMT_* seams. Deliberately NOT under guards/simple/ (the find -name '*.sh' reason). No cluster.
-  run_and_emit "ts-fmt-proto-excluded-guard-selftest" "${__here}/guards/validate-ts-fmt-proto-excluded.test.sh" || true
+  parallel_queue_add "ts-fmt-proto-excluded-guard-selftest" "${__here}/guards/validate-ts-fmt-proto-excluded.test.sh"
+  parallel_queue_run "${DEVLOOP_LAYER3_JOBS:-4}" || true
 } | tee_collect_statuses

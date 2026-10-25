@@ -479,6 +479,52 @@ else
 fi
 rm -rf "$__cleanup_marks"
 
+# =============================================================================
+# parallel_queue_run — output replayed in registration order (not completion order),
+# STATUS lines intact, stdin closed, a job that dies before reporting is a FAIL, the
+# job cap holds, and a bad cap is a loud FAIL.
+# =============================================================================
+__pq="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nsleep 0.4; echo a-out; echo a-err >&2\n' > "$__pq/a.sh"
+printf '#!/usr/bin/env bash\necho b-out; exit 1\n' > "$__pq/b.sh"
+printf '#!/usr/bin/env bash\nif read -r x; then echo "c-read:$x"; else echo c-eof; fi\n' > "$__pq/c.sh"
+printf '#!/usr/bin/env bash\nkill -9 "$PPID"\n' > "$__pq/d.sh"
+printf '#!/usr/bin/env bash\nd="$1"; : > "$d/run.$$"; ls "$d"/run.* | wc -l >> "$d/seen"; sleep 0.3; rm -f "$d/run.$$"\n' > "$__pq/cap.sh"
+printf '#!/usr/bin/env bash\nexec "%s/cap.sh" "%s/capdir"\n' "$__pq" "$__pq" > "$__pq/e.sh"
+chmod +x "$__pq"/*.sh; mkdir -p "$__pq/capdir"
+
+assert_pq() {
+  local label="$1" ok="$2" why="$3"
+  if [[ "$ok" == 1 ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); FAILURES+=("[parallel:${label}] ${why}"); fi
+}
+set +e
+__pq_out="$(echo stdin-leaked | DEVLOOP_TMP="$__pq/tmp" bash -c '
+  set -euo pipefail; source "$1"; d="$2"
+  for j in a b c d; do parallel_queue_add "$j" "$d/$j.sh"; done
+  parallel_queue_run 4' _ "${__here}/_common.sh" "$__pq" 2>"$__pq/stderr")"; __pq_rc=$?
+set -e
+__pq_want=$'a-out\nSTATUS=OK REASON=a-passed\nb-out\nSTATUS=FAIL REASON=b-failed\nc-eof\nSTATUS=OK REASON=c-passed\nSTATUS=FAIL REASON=d-runner-died'
+assert_pq "registration-order" "$([[ "$__pq_out" == "$__pq_want" ]] && echo 1 || echo 0)" "stdout=[${__pq_out}]"
+assert_pq "returns-0" "$([[ "$__pq_rc" == 0 ]] && echo 1 || echo 0)" "rc=${__pq_rc}"
+assert_pq "stderr-replayed" "$(grep -qx 'a-err' "$__pq/stderr" && echo 1 || echo 0)" "a's stderr missing"
+assert_pq "died-named" "$(grep -q "d.sh exited before reporting" "$__pq/stderr" && echo 1 || echo 0)" "no runner-died note"
+assert_pq "work-dir-removed" "$([[ -z "$(ls -A "$__pq/tmp" 2>/dev/null)" ]] && echo 1 || echo 0)" "left: $(ls -A "$__pq/tmp")"
+
+DEVLOOP_TMP="$__pq/tmp" bash -c '
+  set -euo pipefail; source "$1"; d="$2"
+  for j in 1 2 3 4 5; do parallel_queue_add "e$j" "$d/e.sh"; done
+  parallel_queue_run 2' _ "${__here}/_common.sh" "$__pq" >/dev/null 2>&1
+__pq_max="$(sort -n "$__pq/capdir/seen" | tail -n1)"
+assert_pq "cap-holds" "$([[ "$__pq_max" == 2 ]] && echo 1 || echo 0)" "max concurrent=${__pq_max}, want 2 (cap 2, 5 jobs)"
+
+set +e
+__pq_bad="$(DEVLOOP_TMP="$__pq/tmp" bash -c 'source "$1"; parallel_queue_add x /bin/true; parallel_queue_run 0' \
+  _ "${__here}/_common.sh" 2>/dev/null)"; __pq_bad_rc=$?
+set -e
+assert_pq "bad-cap-fails-loud" "$([[ "$__pq_bad_rc" == 1 && "$__pq_bad" == "STATUS=FAIL REASON=parallel-jobs-invalid" ]] && echo 1 || echo 0)" \
+  "rc=${__pq_bad_rc} stdout=[${__pq_bad}]"
+rm -rf "$__pq"
+
 # Summary.
 printf '\n_common.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [[ $FAIL -gt 0 ]]; then
