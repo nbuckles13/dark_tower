@@ -75,16 +75,28 @@ COPY .cargo/ .cargo/
 COPY --from=planner /build/recipe.json recipe.json
 
 # Build dependencies only - this layer is cached unless Cargo.toml/Cargo.lock change
-RUN cargo chef cook --release --recipe-path recipe.json --package gc-service
+# ONE builder for every service image (CI image-caching): this chef/planner/builder
+# block is byte-identical in infra/docker/{ac,gc,mc,mh}-service/Dockerfile, so
+# BuildKit computes the same cache keys and the workspace compiles once per change
+# instead of once per image. One package per cargo invocation, deliberately: a
+# single `cargo build -p a -p b` unifies dependency features across packages, so
+# each binary could differ from `cargo build -p <svc>`. Sequential builds share
+# the target dir, so crates with identical features still compile once.
+RUN for p in ac-service gc-service mc-service mh-service; do \
+        cargo chef cook --release --recipe-path recipe.json --package "$p" || exit 1; \
+    done
 
 # Copy actual source code
 COPY . .
 
 # Build the application (dependencies are already cached)
-RUN cargo build --release --package gc-service
+RUN for p in ac-service gc-service mc-service mh-service; do \
+        cargo build --release --package "$p" || exit 1; \
+    done
 
 # Strip debug symbols to reduce binary size
-RUN strip target/release/gc-service
+RUN strip target/release/auth-controller target/release/gc-service \
+    target/release/mc-service target/release/mh-service
 
 # ========================================
 # Stage 4: Minimal Production Runtime (Default)

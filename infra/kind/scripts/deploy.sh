@@ -277,21 +277,39 @@ IMAGE_BUILD_TARGET="runtime"
 # Actions runtime token in the environment). A failed cache export never fails
 # the build (ignore-error); a cache miss just builds.
 image_build_flags() {
-    local repo="$1" name
-    name="${repo#localhost/}"
+    local repo="$1" scope
     printf '%s\n' "--target" "${IMAGE_BUILD_TARGET}"
     image_build_args "${repo}" || return 1
     case "${DT_IMAGE_BUILD_CACHE:-}" in
         "") ;;
         gha)
-            printf '%s\n' "--cache-from" "type=gha,scope=${name}" \
-                "--cache-to" "type=gha,mode=max,scope=${name},ignore-error=true"
+            scope="$(image_cache_scope "${repo}")" || return 1
+            printf '%s\n' "--cache-from" "type=gha,scope=${scope}" \
+                "--cache-to" "type=gha,mode=max,scope=${scope},ignore-error=true"
             ;;
         *)
             log_error "DT_IMAGE_BUILD_CACHE='${DT_IMAGE_BUILD_CACHE}' is not a known cache backend (gha)"
             return 1
             ;;
     esac
+}
+
+# The layer-cache scope for <repo>: derived from its Dockerfile's build
+# instructions before the `${IMAGE_BUILD_TARGET}` stage (comments and blank lines
+# dropped — they do not affect BuildKit cache keys). Images whose builder stages
+# are identical (the four service images) share one scope, so their dependency
+# layers are stored once; a builder that drifts gets its own scope automatically.
+# Fails when the Dockerfile has no `AS ${IMAGE_BUILD_TARGET}` stage.
+image_cache_scope() {
+    local df="${PROJECT_ROOT}/infra/docker/${1#localhost/}/Dockerfile" sum
+    if ! grep -qE "^FROM .* AS ${IMAGE_BUILD_TARGET}([[:space:]]|\$)" "${df}"; then
+        log_error "${df} has no 'AS ${IMAGE_BUILD_TARGET}' stage to build."
+        return 1
+    fi
+    sum="$(awk -v t="${IMAGE_BUILD_TARGET}" \
+        '$0 ~ ("^FROM .* AS " t "([[:space:]]|$)") { exit } !/^[[:space:]]*(#|$)/' "${df}" \
+        | sha256sum)" || return 1
+    printf 'builder-%s\n' "${sum:0:16}"
 }
 
 # The digest-pinned image to use for <repo> instead of building it, from
@@ -343,9 +361,13 @@ build_content_tagged_image() {
         fi
         iid="$(cat "${iid_file}" 2>/dev/null || true)"
         rm -f "${iid_file}"
+        if [[ -z "${iid}" ]]; then
+            log_error "Image build of ${repo} wrote no image ID (--iidfile empty); refusing to guess a tag."
+            return 1
+        fi
     fi
     if [[ -z "${iid}" ]]; then
-        log_error "No image ID for ${repo}; refusing to guess a tag."
+        log_error "No image ID for prebuilt ${repo}; refusing to guess a tag."
         return 1
     fi
     tag="$(content_tag "${iid}")" || return 1
