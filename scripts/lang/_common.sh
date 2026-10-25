@@ -200,6 +200,73 @@ run_and_emit() {
   fi
 }
 
+# Concurrent run_and_emit for independent scripts (Layer 3's self-tests).
+#
+#   parallel_queue_add <reason-prefix> <script>   # register, in the order output should read
+#   parallel_queue_run <max-jobs>                 # run the queue, then empty it
+#
+# Each script runs as `run_and_emit <prefix> <script>` in the background with stdin closed
+# and its stdout/stderr captured. Output is replayed to stdout/stderr in REGISTRATION order,
+# each script's as soon as it and every script before it have finished, so the log reads as
+# a serial run would and its STATUS lines reach tee_collect_statuses unchanged. A script
+# that dies before run_and_emit reports (killed, or the subshell aborted) gets an explicit
+# `STATUS=FAIL REASON=<prefix>-runner-died`: a missing STATUS line must never read as a pass.
+#
+# Only for scripts that share no mutable state; anything that writes a fixed path or a real
+# repo file must stay serial (or be fixed to use its own temp dir).
+#
+# Bash 4.0-compatible (no `wait -n`, no namerefs): completion is polled by PID.
+# Returns: 0 when the queue ran (per-script results are in the STATUS lines, as with a
+#          serial `run_and_emit ... || true`); 1 if <max-jobs> is not a positive integer,
+#          after emitting STATUS=FAIL REASON=parallel-jobs-invalid.
+__PQ_NAMES=()
+__PQ_SCRIPTS=()
+parallel_queue_add() {
+  __PQ_NAMES+=("$1")
+  __PQ_SCRIPTS+=("$2")
+}
+
+parallel_queue_run() {
+  local jobs="$1" n=${#__PQ_NAMES[@]} dir i launched=0 flushed=0 running progressed
+  local -a pids=()
+  if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+    echo "parallel_queue_run: max-jobs must be a positive integer, got '${jobs}'" >&2
+    emit_status FAIL "parallel-jobs-invalid"
+    __PQ_NAMES=() __PQ_SCRIPTS=()
+    return 1
+  fi
+  init_devloop_tmp
+  dir="$(mktemp -d "${DEVLOOP_TMP}/parallel.XXXXXX")"
+  while (( flushed < n )); do
+    progressed=0
+    running=0
+    for ((i = flushed; i < launched; i++)); do
+      kill -0 "${pids[i]}" 2>/dev/null && running=$((running + 1))
+    done
+    while (( launched < n && running < jobs )); do
+      ( run_and_emit "${__PQ_NAMES[launched]}" "${__PQ_SCRIPTS[launched]}" \
+          >"${dir}/${launched}.out" 2>"${dir}/${launched}.err" </dev/null || true
+        : >"${dir}/${launched}.reported" ) &
+      pids[launched]=$!
+      launched=$((launched + 1)) running=$((running + 1)) progressed=1
+    done
+    while (( flushed < launched )) && ! kill -0 "${pids[flushed]}" 2>/dev/null; do
+      wait "${pids[flushed]}" 2>/dev/null || true
+      cat "${dir}/${flushed}.out" 2>/dev/null || true
+      cat "${dir}/${flushed}.err" >&2 2>/dev/null || true
+      if [[ ! -e "${dir}/${flushed}.reported" ]]; then
+        echo "parallel_queue_run: ${__PQ_SCRIPTS[flushed]} exited before reporting a status" >&2
+        emit_status FAIL "${__PQ_NAMES[flushed]}-runner-died"
+      fi
+      flushed=$((flushed + 1)) progressed=1
+    done
+    (( progressed )) || sleep 0.1
+  done
+  rm -rf "$dir"
+  __PQ_NAMES=() __PQ_SCRIPTS=()
+  return 0
+}
+
 # Parse the LAST STATUS= line from a log file; print just the enum value.
 # Single source of truth for STATUS= line shape — used by layer-all.sh,
 # verify-completion.sh, and (in Wave 2) CI YAML's grep.
