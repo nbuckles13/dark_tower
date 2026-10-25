@@ -232,8 +232,9 @@ test('an unreachable participant is ON the roster, marked with the wire token â€
   await expect.element(c).toHaveAttribute('data-reachability', 'reachable');
 });
 
-test('server mute and client mute are DISTINCT tokens; client mute is unknown with no slot evidence', async () => {
+test('server mute and client mute are DISTINCT tokens; client mute is the roster fact, never a slot', async () => {
   const { session, screen } = await joinedRig();
+  // Slots that would have said something under the old (slot-derived) rule.
   session.fire('streamAssignments', {
     assignments: [
       assignment(258, 'avatar_client_muted', 0),
@@ -246,19 +247,29 @@ test('server mute and client mute are DISTINCT tokens; client mute is unknown wi
     audioServerMuted: true,
     videoServerMuted: false,
     serverMutedBy: 'h',
+    audioClientMuted: false,
   });
   const b = screen.getByTestId('participant-b');
   const c = screen.getByTestId('participant-c');
   const h = screen.getByTestId('participant-h');
-  // b: slot avatar_client_muted, no server mute -> client-muted.
-  await expect.element(b).toHaveAttribute('data-client-muted', 'true');
+  // b: a slot reads avatar_client_muted, but MC has reported no fact -> unknown.
+  await expect.element(b).toHaveAttribute('data-client-muted', 'unknown');
   await expect.element(b).toHaveAttribute('data-server-muted', 'false');
-  // c: server-muted -> the slot's avatar state says nothing about their own mic.
+  // c: server-muted AND a client fact: both shown, independently.
   await expect.element(c).toHaveAttribute('data-server-muted', 'true');
-  await expect.element(c).toHaveAttribute('data-client-muted', 'unknown');
+  await expect.element(c).toHaveAttribute('data-client-muted', 'false');
   await expect.element(screen.getByTestId('participant-server-muted-c')).toMatchTextContent('Hal');
-  // h: in no slot of ours -> no wire fact either way.
+  // h: in no slot of ours; its own update makes it known (story 3 R-15).
   await expect.element(h).toHaveAttribute('data-client-muted', 'unknown');
+  session.fire('participantMuteChanged', {
+    participantId: 'h',
+    audioServerMuted: false,
+    videoServerMuted: false,
+    audioClientMuted: true,
+    videoClientMuted: false,
+  });
+  await expect.element(h).toHaveAttribute('data-client-muted', 'true');
+  await expect.element(h).toHaveAttribute('data-client-muted-video', 'false');
 });
 
 test('host controls are absent for a non-host', async () => {

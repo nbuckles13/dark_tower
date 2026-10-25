@@ -11,13 +11,14 @@
 - Service entry point (fleet-gauge samplers) → `crates/mc-service/src/main.rs`
 - Config (env loading, TLS, advertise addresses, ADR-0036 media keys, `Config::kek_lifecycle`) → `crates/mc-service/src/config.rs`
 - Error types (McError hierarchy) → `crates/mc-service/src/errors.rs`
-- Media kinds (`MediaKindLabel`, `served_kind`, `PublishSet`), the ONE per-kind mute parser + merge (`MuteChange`, `KindDecision`), and the server/client mute halves (`ServerMutedKinds` / `ClientMutedKinds`) → `crates/mc-service/src/media_kind.rs`
+- Media kinds (`MediaKindLabel`, `served_kind`, `PublishSet`), the ONE per-kind mute parser + merge (`MuteChange`, generic `KindDecision`), the server/client mute halves (`ServerMutedKinds` / `ClientMutedKinds`), and client-mute FACTS (`ClientMuteFacts`, set iff reported; the one `effective()` projection) → `crates/mc-service/src/media_kind.rs`
 - Auth: McJwtValidator, validate_meeting_token, validate_guest_token → `crates/mc-service/src/auth/mod.rs`
 - Actors: controller, meeting, participant, messages, session (HMAC/HKDF), metrics → `crates/mc-service/src/actors/`
 
 ## Meeting Actor (single composer + connectivity home)
 - Structural-change drivers (join, leave choke-point `remove_and_broadcast_left`, capability, mute, MH connect/disconnect, reconnect + publish-set check) → `crates/mc-service/src/actors/meeting.rs:handle_join()`/`handle_reconnect()`/`handle_disconnect()`/`handle_media_connected()`/`handle_media_disconnected()`
 - Media state (slot table, frozen handler set, connectivity, push workers, slot-view flush, `MutedSourceCensus`, test-only `MeetingSeams`) → `crates/mc-service/src/actors/meeting_media.rs`; send-directive withdrawal counting → `meeting_media.rs:flush_one()`
+- Client-mute roster fan-out (per-meeting bucket, FIFO latest-state-wins, story 3 R-15 fix) → `crates/mc-service/src/actors/client_mute_fanout.rs`; driver → `actors/meeting.rs:flush_client_mute()`; shared token bucket → `crates/mc-service/src/client_work_limiter.rs`
 - Teardown fence + generation eviction on both teardown paths → `crates/mc-service/src/actors/controller.rs`
 - `DisconnectCause`, `SenderLookup` (folded into `MeetingMessage::MediaConnected`) → `crates/mc-service/src/actors/messages.rs`; cause-cell + `handle_kek_update` → `actors/participant.rs`
 
@@ -38,7 +39,7 @@
 - KEK rotation lifecycle (`KekLifecycle`, `RotationTrigger`, `KekPushOutcome`) → `crates/mc-service/src/media_admission/rotation.rs`; driver + test-only `force_kek_rotation` → `actors/meeting.rs`
 
 ## Transport & gRPC
-- WebTransport server (accept loop, TLS, idle timeout) → `crates/mc-service/src/webtransport/server.rs`; connection (join flow, bridge loop, boundary validation) → `webtransport/connection.rs`; `encode_participant_update` → `webtransport/handler.rs`
+- WebTransport server (accept loop, TLS, idle timeout) → `crates/mc-service/src/webtransport/server.rs`; connection (join flow, bridge loop, boundary validation) → `webtransport/connection.rs`; `encode_participant_update` and the ONE roster-entry builder `roster_entry` → `webtransport/handler.rs`
 - GC client (registration, heartbeats, `notify_meeting_ended`, `MeetingEndedQueue`) → `crates/mc-service/src/grpc/gc_client.rs`; GC→MC assignment → `grpc/mc_service.rs`
 - MH client (`register_meeting`, `end_meeting`, MhRegistrationClient trait) → `crates/mc-service/src/grpc/mh_client.rs`
 - MH→MC notifications → `crates/mc-service/src/grpc/media_coordination.rs:resolve_and_record()`; auth layer (R-22) → `grpc/auth_interceptor.rs`

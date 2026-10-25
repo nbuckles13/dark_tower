@@ -13,8 +13,9 @@ use crate::actors::{
 };
 use crate::actors::{JoinMedia, MediaRoutingDeps};
 use crate::auth::McJwtValidator;
+use crate::client_work_limiter::ClientWorkLimiter;
 use crate::errors::McError;
-use crate::media_kind::{MuteChange, NoKindNamed};
+use crate::media_kind::{ClientMuteFacts, MuteChange, NoKindNamed};
 use crate::media_routing::{HandlerEndpoint, HandlerId, MeetingHandlers};
 use crate::media_signaling::{
     CapabilityOutcome, ClientMediaConfig, DirectiveOutcome, MediaKindLabel, MuteOutcome,
@@ -32,7 +33,7 @@ use common::jwt::MeetingRole;
 use prost::Message;
 use proto_gen::dark_tower::signaling::v1::{
     self, client_message, server_message, ClientMessage, ErrorMessage, JoinResponse,
-    MediaServerInfo, Participant, ServerMessage,
+    MediaServerInfo, ServerMessage,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -698,7 +699,8 @@ pub async fn handle_connection(
         "JoinResponse sent"
     );
 
-    // Step 8b (story 2 R-11): replay who is server-muted RIGHT NOW, written
+    // Step 8b (story 2 R-11): replay who is SERVER-muted RIGHT NOW (client mute
+    // already rode the JoinResponse roster -- one carrier per fact), written
     // directly after the JoinResponse and before the bridge loop starts
     // forwarding queued updates — the snapshot was taken in the join's own actor
     // turn, and every later change is queued behind it, so the joiner sees
@@ -1067,7 +1069,7 @@ async fn handle_media_connection_update(
 /// A Rust constant rather than a config key, matching
 /// [`MAX_MH_STATUSES_PER_UPDATE`] and [`MAX_CLIENT_STRING_BYTES`] in this file:
 /// these are client-input security caps with no operator-tuning story.
-const MUTE_WORK_BURST: u32 = 8;
+pub(crate) const MUTE_WORK_BURST: u32 = 8;
 
 /// Rejection RESPONSES a fresh connection may be sent immediately.
 ///
@@ -1089,7 +1091,7 @@ const CAPABILITY_REJECTION_REFILL_INTERVAL_MS: u64 = 1_000;
 ///
 /// Above any human toggle rate and roughly three to four orders of magnitude
 /// below what a client can send on an idle QUIC connection.
-const MUTE_WORK_REFILL_INTERVAL_MS: u64 = 250;
+pub(crate) const MUTE_WORK_REFILL_INTERVAL_MS: u64 = 250;
 
 /// Server-mute work tokens a fresh connection may spend immediately.
 ///
@@ -1135,88 +1137,6 @@ const UNMUTE_REQUEST_BURST: u32 = 2;
 
 /// Milliseconds per refilled unmute-request token — 5 s.
 const UNMUTE_REQUEST_REFILL_INTERVAL_MS: u64 = 5_000;
-
-/// Per-connection token bucket bounding a repeatable client-driven action.
-///
-/// # Why a rate limit and NOT a budget
-///
-/// The receive-capability path takes a cumulative budget for ACCEPTED
-/// declarations because re-declaring is rare and a client that stops
-/// re-declaring loses nothing. Every action bounded here is the opposite: a
-/// repeatable steady-state path that must keep working for the life of the
-/// session. A cumulative budget would spend out and then permanently deny — for
-/// instance freezing `audio_self_muted` on the roster so every other
-/// participant renders a live speaker as muted, or silencing the error a client
-/// needs in order to correct its declaration.
-///
-/// A rate limit bounds work per unit time and never permanently denies. See
-/// `media_signaling`'s module doc for the criterion in general form.
-///
-/// # One instance per bounded path, deliberately never a shared bucket
-///
-/// [`MediaSignalingContext`] holds a separate bucket for every bounded path —
-/// client mute, client-mute rejection replies, capability rejection replies,
-/// server mute, server-mute refusal replies, unmute requests — so that
-/// flooding ANY one of them cannot suppress any other on the same connection.
-/// A shared bucket would make each path a denial vector against the rest,
-/// which is the amplification problem one level down.
-#[derive(Debug)]
-struct ClientWorkLimiter {
-    tokens: u32,
-    burst: u32,
-    refill_interval_ms: u64,
-    refilled_at: Instant,
-}
-
-impl ClientWorkLimiter {
-    fn new(now: Instant, burst: u32, refill_interval_ms: u64) -> Self {
-        Self {
-            tokens: burst,
-            burst,
-            refill_interval_ms,
-            refilled_at: now,
-        }
-    }
-
-    /// Refill, then spend one token. `false` means the caller must do no work.
-    ///
-    /// Tokens are spent ONLY on work actually about to be done — the caller
-    /// short-circuits identical repeats before reaching here. Draining the
-    /// bucket on no-op messages would let a client spamming a steady state
-    /// suppress its own next genuine toggle, and would report `rate_limited`
-    /// while the expensive path was never approached.
-    fn try_spend(&mut self, now: Instant) -> bool {
-        self.refill(now);
-        if self.tokens == 0 {
-            return false;
-        }
-        self.tokens -= 1;
-        true
-    }
-
-    fn refill(&mut self, now: Instant) {
-        let elapsed_ms = now.saturating_duration_since(self.refilled_at).as_millis();
-        let earned = elapsed_ms / u128::from(self.refill_interval_ms);
-        if earned == 0 {
-            return;
-        }
-        if earned >= u128::from(self.burst) {
-            // Long enough idle that the bucket is full however the arithmetic
-            // is rounded; reset the clock rather than advance it, which also
-            // keeps `Duration` multiplication away from overflow.
-            self.tokens = self.burst;
-            self.refilled_at = now;
-            return;
-        }
-        // `earned < self.burst` here, so the narrowing cannot lose a token.
-        let earned = u32::try_from(earned).unwrap_or(self.burst);
-        self.tokens = self.tokens.saturating_add(earned).min(self.burst);
-        // Advance by exactly what was granted, so a sub-interval remainder is
-        // carried rather than discarded — otherwise a client polling just under
-        // the interval would earn nothing forever.
-        self.refilled_at += Duration::from_millis(u64::from(earned) * self.refill_interval_ms);
-    }
-}
 
 /// `message_kind` for the rejection `ErrorMessage` on the capability path.
 const SIGNALING_KIND_CAPABILITY_REJECTION: &str = "capability_rejection";
@@ -1280,11 +1200,13 @@ struct MediaSignalingContext {
     /// equals a KNOWN value here; the actor, not this cache, merges the
     /// request (story 3 MC-B), so an unknown kind can never be coerced.
     ///
-    /// SOUND because `audio_self_muted`/`video_self_muted` have exactly ONE
-    /// writer in the tree (`MeetingActor::handle_self_mute`), fed only by this
-    /// connection; `handle_server_mute` writes only the `*_server_muted`
-    /// fields. Unknown at join, so the first report always reaches the actor.
-    last_reported_mute: [Option<bool>; 2],
+    /// SOUND because the roster's client-mute facts (`Participant::client_muted`)
+    /// have exactly ONE writer in the tree (`MeetingActor::handle_self_mute`),
+    /// fed only by this connection, and this cache mirrors the actor's resulting
+    /// facts exactly; `handle_server_mute` writes only the `*_server_muted`
+    /// fields. Unknown at join, so the first report always reaches the actor
+    /// (and, as MC's first FACT for that kind, always fans out to peers).
+    last_reported_mute: ClientMuteFacts,
     /// Bounds client-driven mute work (a RATE limit: mute is a repeatable
     /// steady-state user action, and a cumulative budget would permanently deny
     /// it).
@@ -1580,6 +1502,19 @@ async fn handle_mute_request(
         }
     };
 
+    // 1b. Publish set (story 3 R-15 fix): a client-mute FACT exists only for a
+    // kind this participant publishes (fixed for the membership), so a named
+    // unpublished kind is IGNORED -- no fact, no fan-out, no MH disposition, no
+    // reply -- and counted `not_published`, BEFORE the no-op short-circuit,
+    // the token and any actor hop. A published kind in the same request still
+    // applies. Expected zero: the stock SDK never reports an unpublished kind.
+    for kind in change.unpublished(media.publishes) {
+        metrics::record_mute_request(kind, MuteOutcome::NotPublished);
+    }
+    let Some(change) = change.published_only(media.publishes) else {
+        return;
+    };
+
     // 2. Short-circuit a no-op BEFORE the actor hop and before the limiter:
     // every NAMED kind already equals what the actor last confirmed for this
     // connection. An unknown cached kind (fresh connection, or a reconnect into
@@ -1587,7 +1522,7 @@ async fn handle_mute_request(
     // merges against the roster and is idempotent per kind -- decides.
     if change
         .named()
-        .all(|(kind, muted)| kind.of(media.last_reported_mute) == Some(muted))
+        .all(|(kind, muted)| media.last_reported_mute.get(kind) == Some(muted))
     {
         record_mute_for_each(change, MuteOutcome::Unchanged);
         return;
@@ -1605,9 +1540,11 @@ async fn handle_mute_request(
         // §5 enforces client mute at CAPTURE on the client, so there is no
         // window in which someone believes they have stopped transmitting and
         // has not. What a dropped report DOES cost (story 3 MC-B): MC's view of
-        // that kind is stale -- its MH disposition (PAUSED vs FORWARD) and its
-        // holders' slot state. A dropped UNMUTE therefore leaves the
-        // participant shown as client-muted (an avatar; receivers ignore its
+        // that kind is stale -- its MH disposition (PAUSED vs FORWARD), its
+        // holders' slot state, and (since the story 3 R-15 fix) the client-mute
+        // fact EVERY other participant's roster shows, not only slot holders.
+        // A dropped UNMUTE therefore leaves the participant shown as
+        // client-muted to the whole room (an avatar; receivers ignore its
         // frames) while it is sending. Because a request names only the kind it
         // changes, ONLY A LATER REPORT OF THE SAME KIND heals it; a toggle of
         // the other kind does not. Accepted: the bucket (burst 8, 4 per second
@@ -1641,7 +1578,7 @@ async fn handle_mute_request(
             // authoritative; this connection is its only self-mute writer), only
             // AFTER the actor accepted the report: assigning before the await
             // would record a report the actor never received.
-            media.last_reported_mute = MediaKindLabel::per_kind(|k| Some(decision.state(k)));
+            media.last_reported_mute = ClientMuteFacts::from(decision);
             for (kind, _) in change.named() {
                 let outcome = if decision.changed(kind) {
                     MuteOutcome::Applied
@@ -2141,7 +2078,7 @@ impl MediaSignalingContext {
             publishes,
             declaration_budget: config.max_receive_capability_declarations,
             declaration,
-            last_reported_mute: [None; 2],
+            last_reported_mute: ClientMuteFacts::UNKNOWN,
             mute_limiter: ClientWorkLimiter::new(
                 limiter_start,
                 MUTE_WORK_BURST,
@@ -2375,41 +2312,7 @@ fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinRe
     let existing_participants = result
         .participants
         .iter()
-        .map(|p| Participant {
-            participant_id: p.participant_id.clone(),
-            name: p.display_name.clone(),
-            streams: Vec::new(),
-            joined_at: 0,
-            // ADR-0036 §4: the roster carries the sender id and the identity
-            // signing public key, and NO other key material — no meeting KEK,
-            // no wrapped transmit key, no key id, no thumbprint.
-            //
-            // `sender_id` is `Some` of a `NonZeroU16`, so it can never be
-            // `Some(0)`: 0 is reserved-invalid, and N participants sharing it
-            // would collide on one roster identity and — via key id, derived
-            // wrap nonce — on one AES-GCM nonce.
-            //
-            // `identity_public_key` is either exactly 32 bytes or EMPTY. Never
-            // any other length: MC refuses the join otherwise.
-            //
-            // This is the chain a receiver walks: key id -> sender_id -> this
-            // roster entry -> identity_public_key, for Ed25519 verification.
-            // Trust on first use: same-keyholder consistency, never a verified
-            // identity.
-            sender_id: Some(u32::from(p.sender_id.get().get())),
-            // `None` MUST serialize to EMPTY BYTES, never to a zero-filled
-            // 32-byte array. An explicit `match` rather than
-            // `unwrap_or_default()` because the failure mode is silent and
-            // strictly worse than empty: a present-looking all-zero key makes a
-            // consumer take the VERIFY path and never see the "no key
-            // published" signal the contract defines. It would fail closed
-            // (all-zeros is not a valid Ed25519 point) but it destroys the
-            // distinction accept-absent rests on. Do not "simplify" this.
-            identity_public_key: match &p.identity_public_key {
-                Some(key) => key.as_bytes().to_vec(),
-                None => Vec::new(),
-            },
-        })
+        .map(crate::webtransport::handler::roster_entry)
         .collect();
 
     // The meeting's FULL frozen handler set (ADR-0036 §9, R-33): every

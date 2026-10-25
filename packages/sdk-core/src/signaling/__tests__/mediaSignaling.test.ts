@@ -15,6 +15,8 @@ import { generateIdentityKeyPair } from '../../media/frame/ed25519.js';
 import { HEADER_VERSION } from '../../media/frame/wireConstants.js';
 import { SignalingClient } from '../SignalingClient.js';
 import type {
+  JoinedEvent,
+  ParticipantJoinedEvent,
   ParticipantMuteEvent,
   SendDirectiveEvent,
   StreamAssignmentsEvent,
@@ -24,6 +26,7 @@ import {
   decodeOutboundClientMessages,
   framedJoinResponse,
   framedMeetingKekUpdate,
+  framedParticipantJoined,
   framedParticipantLeft,
   framedSendDirective,
   LeaveReason,
@@ -43,6 +46,7 @@ interface Rig {
   readonly transport: MockWebTransport;
   readonly kekSource: MeetingKekHolder;
   readonly roster: RosterIdentityKeys;
+  readonly joined: JoinedEvent;
   deliver(bytes: Uint8Array): void;
   outbound(): ReturnType<typeof decodeOutboundClientMessages>;
 }
@@ -68,12 +72,13 @@ async function joinedRig(joinResponse: Uint8Array, identityPublicKey?: Uint8Arra
   transport.simulateReady();
   await waitFor(() => transport.getOpenedBidiStreams().length > 0);
   transport.simulateServerMessage(0, joinResponse);
-  await joining;
+  const joined = await joining;
   return {
     client,
     transport,
     kekSource,
     roster,
+    joined,
     deliver: (bytes) => transport.simulateServerMessage(0, bytes),
     outbound: () => decodeOutboundClientMessages(transport.getOutboundBidiWrites(0)),
   };
@@ -484,15 +489,86 @@ describe("a leave removes the leaver's roster key — a second cutoff beside the
   });
 });
 
-describe('server mute state from the wire (story 2 R-10/R-11)', () => {
-  it('projects SERVER mute and who applied it; the self-mute snapshot is not projected', async () => {
+describe('client mute of others from the wire, presence preserved (story 3 R-15)', () => {
+  // `ClientMuteFacts`: wire `optional bool`, absent = no fact. These go through
+  // the real encode -> frame -> decode path, so a present `false` that the codec
+  // dropped (proto3 implicit presence) would read as absent and fail here.
+  it('roster entries carry client mute with presence: Some(false) stays false, absent stays absent', async () => {
+    const rig = await joinedRig(
+      framedJoinResponse({
+        senderId: 258,
+        participants: [
+          { participantId: 'm', name: 'Muted', audioClientMuted: true, videoClientMuted: false },
+          { participantId: 'f', name: 'Fresh' },
+        ],
+      }),
+    );
+    const joined = rig.joined.existingParticipants;
+    expect(joined[0]).toStrictEqual({
+      participantId: 'm',
+      name: 'Muted',
+      senderId: undefined,
+      audioClientMuted: true,
+      videoClientMuted: false,
+    });
+    // Absent: the keys are not there at all — never a coerced `false`.
+    expect('audioClientMuted' in joined[1]!).toBe(false);
+    expect('videoClientMuted' in joined[1]!).toBe(false);
+  });
+
+  it('ParticipantJoined carries the same projection (absent and present)', async () => {
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    const seen: ParticipantJoinedEvent[] = [];
+    rig.client.on('participantJoined', (e) => seen.push(e));
+    rig.deliver(framedParticipantJoined('f', 'Fresh'));
+    rig.deliver(framedParticipantJoined('g', 'Gil', { videoClientMuted: false }));
+    await waitFor(() => seen.length > 1);
+    expect('audioClientMuted' in seen[0]!.participant).toBe(false);
+    expect('videoClientMuted' in seen[0]!.participant).toBe(false);
+    expect(seen[1]!.participant.videoClientMuted).toBe(false);
+    expect('audioClientMuted' in seen[1]!.participant).toBe(false);
+  });
+
+  it('ParticipantMuteUpdate projects client mute per kind, with presence, beside unchanged server mute', async () => {
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     const seen: ParticipantMuteEvent[] = [];
     rig.client.on('participantMuteChanged', (e) => seen.push(e));
     rig.deliver(
       framedParticipantMuteUpdate({
         participantId: 'b',
-        audioSelfMuted: true,
+        audioClientMuted: true,
+        videoClientMuted: false,
+        audioServerMuted: true,
+        serverMutedBy: 'host',
+      }),
+    );
+    rig.deliver(framedParticipantMuteUpdate({ participantId: 'b', audioServerMuted: false }));
+    await waitFor(() => seen.length > 1);
+    expect(seen[0]).toStrictEqual({
+      participantId: 'b',
+      audioServerMuted: true,
+      videoServerMuted: false,
+      serverMutedBy: 'host',
+      audioClientMuted: true,
+      videoClientMuted: false,
+    });
+    // Absent on the wire (e.g. a rolled-back MC): no client-mute key at all.
+    expect(seen[1]).toStrictEqual({
+      participantId: 'b',
+      audioServerMuted: false,
+      videoServerMuted: false,
+    });
+  });
+});
+
+describe('server mute state from the wire (story 2 R-10/R-11)', () => {
+  it('projects SERVER mute and who applied it', async () => {
+    const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+    const seen: ParticipantMuteEvent[] = [];
+    rig.client.on('participantMuteChanged', (e) => seen.push(e));
+    rig.deliver(
+      framedParticipantMuteUpdate({
+        participantId: 'b',
         audioServerMuted: true,
         serverMutedBy: 'host',
       }),

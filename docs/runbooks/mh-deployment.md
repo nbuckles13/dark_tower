@@ -485,6 +485,9 @@ sum(rate(mh_media_frames_dropped_total{direction="ingress",reason="server_muted"
 # 9. MC policy-push rate under mute churn (R-17 bounds it)
 sum(rate(mc_media_policy_pushes_total[1h]))
 sum(rate(mc_media_mute_requests_total[1h]))
+# ...and the client-mute ROSTER fan-out it now also drives (story 3 R-15 fix; paced
+# per meeting, awaiting_token = indicators lagging, never lost BY THE BOUND; MC runbook counter 4)
+sum by (outcome) (rate(mc_media_client_mute_fanouts_total[1h]))
 
 # 10. Client video decode drops (MC Scenario 22; alert A6)
 sum(rate(dt_client_media_decoder_errors_total{media_kind="video"}[1h]))

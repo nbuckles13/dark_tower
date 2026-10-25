@@ -2209,6 +2209,11 @@ connection driving meeting-wide work?** Note the failure predicate is stated
 counted, and the SDK names only the kind it changed. **Rates roughly HALVED at MC-B
 (2026-10-23)** against the story-3 interim that counted both kinds on every request
 (which had roughly doubled them) — a counting-unit change, not a traffic drop.
+**Every join adds `applied` since the story 3 R-15 fix (2026-10-24)**: the SDK
+reports each kind it publishes once after joining, and a first report is a fact
+change, so `applied` gains about one per published kind per join with no human
+toggle — mute "activity" now tracks join churn. Compare against last week
+accordingly; also a counting-unit change, not a traffic change.
 Request-level outcomes (`unchanged`, `rate_limited`, `actor_unavailable`) land once
 on each named kind. A request naming NO kind is rejected and counted on
 `mc_media_mute_requests_rejected_total{surface="client_mute", reason="no_kind_named"}`
@@ -2223,10 +2228,11 @@ sum by (outcome) (rate(mc_media_mute_requests_total{outcome=~"rate_limited|actor
 
 | Token | Meaning |
 |---|---|
-| `applied` | This named kind's flag moved; the meeting actor re-renders (the stream's PAUSED disposition at MH) and re-emits the changed slot view to the subscribers HOLDING this source whose view changed. A camera button is `{media_kind="video", outcome="applied"}` alone (audio is not named), and it is healthy. A failed re-emit is counted by the actor on counter 2 and on `mc_media_slot_view_emissions_total{outcome="composition_failed"}`. |
+| `applied` | This named kind's client-mute FACT changed — a participant's FIRST report of a kind counts, even `false` (story 3 R-15 fix: MC holds no fact until reported, peers show "unknown" until then). The meeting actor owes every OTHER participant a roster fan-out (paced per meeting — `mc_media_client_mute_fanouts_total`) and, when the muted projection moved, re-renders (the stream's PAUSED disposition at MH) and re-emits the changed slot view to the subscribers HOLDING this source whose view changed. A camera button is `{media_kind="video", outcome="applied"}` alone (audio is not named), and it is healthy. A failed re-emit is counted by the actor on counter 2 and on `mc_media_slot_view_emissions_total{outcome="composition_failed"}`. |
 | `unchanged` | This named kind's state did not move: the identical repeat (no actor hop), or a named kind the actor found already in that state. **Not a denominator — see below.** |
-| `rate_limited` | The per-connection mute-work token bucket is exhausted (burst 8, sustained 4/s — `MUTE_WORK_BURST` / `MUTE_WORK_REFILL_INTERVAL_MS` in `webtransport/connection.rs`). |
+| `rate_limited` | The per-connection mute-work token bucket is exhausted (`MUTE_WORK_BURST` / `MUTE_WORK_REFILL_INTERVAL_MS` in `webtransport/connection.rs`). |
 | `actor_unavailable` | Environmental and terminal. Pairs with `meeting_state_unavailable` above — check actor health, Scenarios 1 and 2. |
+| `not_published` | **Expected zero** (story 3 R-15 fix). The request named a kind the participant does not publish; MC ignored that kind (no fact, no fan-out, no reply). Not a failure, not an alert, never a denominator (decided before the token and any actor hop). A stock SDK sends none, so a non-zero rate means a modified client or an SDK regression — escalate to `client`. |
 
 **`unchanged` must NOT appear in a ratio denominator** — same rule, same reason,
 as `accepted_unchanged` on the declarations counter. The no-op short-circuit
@@ -2245,25 +2251,56 @@ approached. Same family as the positive-predicate note above: an asymmetry that
 looks like an inconsistency and is load-bearing.
 
 **`rate_limited` is not by itself an incident.** A human never reaches the bound —
-8 toggles of burst is more than any push-to-talk flurry, and 4/s sustained is
-orders of magnitude above human rates. A sustained non-zero rate means **one
+`MUTE_WORK_BURST` toggles is more than any push-to-talk flurry, and the sustained
+rate is orders of magnitude above human rates. A sustained non-zero rate means **one
 connection** is toggling far above human rates: read it as a client-side repeat
 loop or reactive-state bug first, an abusive peer second. Either way the blast
 radius is that one connection.
 
 **The dropped report is safe, and this is why**: ADR-0036 §5 enforces client mute
 **at capture, on the client**, so when MC drops a report the audio genuinely
-stopped — only the indicator other participants see is stale, and it self-corrects
-on that client's next toggle. Do not escalate a `rate_limited` rate as an
+stopped — only the indicator other participants see is stale (since the story 3
+R-15 fix, the indicator the WHOLE ROOM sees, not only slot holders), and it
+self-corrects on that client's next toggle of that kind. Do not escalate a `rate_limited` rate as an
 audio-leak risk; it is not one.
 
 **Why the bound exists at all, and what it protects**: this is the only
 repeatable client-driven path that puts work on the **shared meeting actor's
-mailbox** — one actor hop plus a re-emit to the source's holders. Unbounded, one
-client toggling in a loop spends that at line rate. The resulting fan-out is also
-bounded per MEETING by the actor's per-turn flush bound — whose visible edge is
-`mc_media_slot_view_emissions_total{outcome="deferred"}` (routine under load; the
-views still converge) — so do not route a meeting-wide latency investigation here.
+mailbox** — one actor hop, a re-emit to the source's holders, and (since the story
+3 R-15 fix, 2026-10-24, which reversed story-2 security S-2's removal of it) a
+**roster fan-out to every other participant**: N-1 awaited sends per applied
+report. So applied client mute IS meeting-wide work. This bucket bounds each
+SENDER; N connections each within their own bucket are not bounded by it. The
+meeting-wide bounds are the per-meeting client-mute fan-out bucket
+(`CLIENT_MUTE_FANOUT_BURST` / `CLIENT_MUTE_FANOUT_REFILL_INTERVAL_MS`,
+`actors/client_mute_fanout.rs`), whose visible edge is
+`mc_media_client_mute_fanouts_total{outcome="awaiting_token"}`, and the per-turn
+slot-view flush bound, whose edge is
+`mc_media_slot_view_emissions_total{outcome="deferred"}` (both routine under load).
+
+**"Mute indicators are slow / lag in a big meeting"**: read
+`sum by (outcome) (increase(mc_media_client_mute_fanouts_total[5m]))`. Under
+churn the per-meeting bound DELAYS facts — peers' indicators LAG, FIFO, latest
+state wins — and the bound never drops a fact (delivery loss is a
+`participant_update_muted` drop on counter 5, which DOES leave that observer
+diverged until the subject's next change): non-zero
+`awaiting_token` confirms the bound is pacing, and the indicator converges once
+churn stops. `awaiting_token` counts pending-subject-flushes (a subject waiting
+across k flushes counts k), NOT delayed toggles, so it is not "the fraction of
+toggles delayed". If it is zero, the lag is elsewhere: a
+`participant_update_muted` drop on counter 5 (no re-sync until that
+participant's next change) or the client.
+
+**"A participant shows mic: unknown / camera: unknown"** (a state that exists since the
+story 3 R-15 fix): MC holds no client-mute fact for a kind until that participant reports it.
+(a) Right after a join it is EXPECTED until the participant's post-join report lands (about
+one RTT). A kind the participant does not publish stays unknown by design. (b) Persistent for
+ONE participant: their report never reached MC. Check `mc_media_mute_requests_total{outcome=~"rate_limited|actor_unavailable"}`.
+An OLD SDK build does not report after join, so it stays unknown until that participant's
+first toggle, by design. (c) Persistent for EVERYONE, as seen by one observer: that observer
+is on an MC without the R-15 fields (a rollback or mixed versions). That is expected
+degradation, not a fault. (d) It is never a privacy issue: capture enforces client mute
+whatever others see.
 
 **Caveat that also applies to `mc_media_slot_states_total` above**: both counters
 are skewable by one participant (and slot states also by meeting churn, since the
@@ -2321,8 +2358,11 @@ muted participant's `UnmuteRequest` relays to the host once per request. An unmu
 a mute — only a host's server-unmute does — so `relayed` rising with the
 participant still muted is correct behaviour, not a fault. A
 `participant_update_muted` drop on counter 5 is the one drop here with no
-re-sync path: that client shows a wrong mute indicator until the next mute
-change on that participant. For "a host muted someone and they are still
+re-sync path: that client shows a stale mute indicator — server OR client mute,
+since the story 3 R-15 fix both ride `ParticipantMuteUpdate` — until the next
+mute change on that participant (or the observer's rejoin). The drop is the
+participant-actor-to-stream hop; the meeting actor's send into the participant
+mailbox is awaited and does not drop. For "a host muted someone and they are still
 heard", go to Scenario 21.
 
 ---
@@ -3701,8 +3741,10 @@ snapshot as every other policy change, so a push that is failing fails for the m
 **Not a mute problem**: a participant who muted THEMSELF (client mute, enforced at capture, ADR-0036
 §5) — `mc_media_mute_requests_total`. The slot state tells them apart, per kind:
 `avatar_client_muted` versus `avatar_server_muted`, server winning when both (story 2's single
-`source_muted` covered both; MC-B deleted it). The `ParticipantMuteUpdate` a client receives also
-carries who muted whom.
+`source_muted` covered both; MC-B deleted it). The `ParticipantMuteUpdate` a client receives
+carries all four controls plus who muted whom — for EVERY participant, whether or not a slot of the
+observer's carries them (story 3 R-15 fix, 2026-10-24) — so a client indicator can be checked without
+a slot: client mute per kind is on the roster entry at join and on each later update.
 
 **Benign arm of "I was unmuted by the host and nobody can hear me"**: the host lifted the server
 mute, which RESTORED the participant's send directive — but the participant is still CLIENT-muted

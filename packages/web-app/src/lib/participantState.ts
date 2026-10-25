@@ -9,18 +9,25 @@
 //
 //   * reachability  <- `StreamAssignments.unreachable_sender_ids` (per subscriber);
 //   * server mute   <- `ParticipantMuteUpdate`, PER KIND (who, and who muted them);
-//   * client mute   <- the participant's own slot of THAT kind reading
-//                      `avatar_client_muted` while MC reports no server mute of
-//                      that kind (video: also the verified live render, R-5).
+//   * client mute   <- the participant's ROSTER mute facts, PER KIND: their roster
+//                      entry's `*_client_muted`, moved by every later
+//                      `ParticipantMuteUpdate` (the store's participant cell,
+//                      sdk-core `ClientMuteFacts`). NEVER from slots.
 //
 // FOUR INDICATORS PER PARTICIPANT (story 3 R-15): client audio, client video,
 // server audio, server video. CLIENT MUTE IS TRI-STATE per kind, deliberately:
-// self-mute does not fan out on the roster, so the ONLY wire signal is a slot's
-// `avatar_client_muted`. A participant no slot of that kind of ours carries has
-// no wire fact either way, and `false` there would assert "not muted" from
-// absence. That case is `unknown`. So is a kind that is server-muted: the slot
-// reads `avatar_server_muted` (server wins), which says nothing about their own
-// device.
+// `unknown` is "no fact has arrived yet" (MC has not heard from the participant,
+// or an MC that predates the fields), and `false` there would assert "not
+// muted" from absence. Once a fact arrives it is shown whatever this client's
+// slots carry — a participant no slot of ours shows still has a known client
+// mute — and whatever their server mute: the server indicators say what the
+// host did, the client ones what the participant did, and a server mute still
+// wins where it decides what is SEEN (the slot reads `avatar_server_muted`,
+// `slotState.ts`). History: until 2026-10-24 self-mute did not fan out (story
+// 2's S-2), so client mute was read from a slot's `avatar_client_muted` and was
+// `unknown` for anyone outside our slots or server-muted; the ADR-0036 §5
+// amendment of 2026-10-24 reversed that — client mute per kind is visible to
+// everyone in the meeting.
 //
 // NAMES ARE BOUNDED AND TEXT ONLY. Every rendered name — the roster's, and the
 // server-muted-by name (the only "reason" a muted participant sees: the proto's
@@ -31,11 +38,10 @@
 
 import { MAX_DISPLAY_NAME_LENGTH } from '@darktower/sdk-core';
 import type {
+  ClientMuteFacts,
   MediaCaptureFailureOutcome,
   PublishKind,
   RosterParticipant,
-  StreamAssignmentEvent,
-  VideoRenderState,
 } from '@darktower/sdk-core';
 import type { MediaStore } from '@darktower/sdk-svelte';
 
@@ -157,14 +163,10 @@ export interface ServerMuteFacts {
 
 /** The media facts one participant's indicators read (that participant's cells, passed in). */
 export interface MediaFacts {
-  /** MC's assignment of this participant's paired AUDIO slot, if any. */
-  readonly audioSlot: StreamAssignmentEvent | undefined;
-  /** MC's assignment of this participant's paired VIDEO slot, if any. */
-  readonly videoSlot: StreamAssignmentEvent | undefined;
-  /** What that video slot renders (the SDK's verified live sender, R-5). */
-  readonly videoRender: VideoRenderState | undefined;
   readonly unreachableSenderIds: readonly number[];
   readonly serverMute: ServerMuteFacts;
+  /** Their client mute per kind; `undefined` = no fact yet (`unknown`). */
+  readonly clientMute: ClientMuteFacts;
 }
 
 /** Everything a row or tile renders about one other participant's mute state. */
@@ -176,34 +178,23 @@ export interface ParticipantIndicators {
   readonly serverMutedByName: string | undefined;
 }
 
-function clientMuteFrom(
-  slot: StreamAssignmentEvent | undefined,
-  serverMuted: boolean,
-  liveForThem: boolean,
-): ClientMuteToken {
-  if (serverMuted) return 'unknown';
-  if (slot?.slotState === 'avatar_client_muted') return 'true';
-  if (slot?.slotState === 'active' || liveForThem) return 'false';
-  return 'unknown';
+function clientMuteToken(fact: boolean | undefined): ClientMuteToken {
+  if (fact === undefined) return 'unknown';
+  return fact ? 'true' : 'false';
 }
 
 /**
- * Read ONE participant's media facts from the store's CELLS — their server-mute
- * cell, their pair, and the two slots the pair names — so a `$derived` over it
- * tracks only that participant (story 3 granularity). Pairing is by sender id
- * (R-3), never slot index.
+ * Read ONE participant's media facts from the store's CELLS — their mute cell
+ * (all four facts) and the meeting's unreachable set — so a `$derived` over it
+ * tracks only that participant (story 3 granularity). No slot is read: what a
+ * slot shows is `slotState.ts`'s business, never a mute fact.
  */
 export function mediaFactsFor(media: MediaStore, participant: RosterParticipant): MediaFacts {
-  const pair = participant.senderId === undefined ? undefined : media.pairOf(participant.senderId);
-  const audioSlotId = pair?.audioSlotId;
-  const videoSlotId = pair?.videoSlotId;
-  const video = videoSlotId === undefined ? undefined : media.slot(videoSlotId);
+  const cell = media.participant(participant.participantId);
   return {
-    audioSlot: audioSlotId === undefined ? undefined : media.slot(audioSlotId).assignment,
-    videoSlot: video?.assignment,
-    videoRender: video?.render,
     unreachableSenderIds: media.unreachableSenderIds,
-    serverMute: media.participant(participant.participantId),
+    serverMute: cell,
+    clientMute: cell,
   };
 }
 
@@ -219,15 +210,11 @@ export function participantIndicators(
       ? 'source_unreachable'
       : 'reachable';
   const { audioServerMuted, videoServerMuted, serverMutedBy } = media.serverMute;
-  const liveVideo =
-    senderId !== undefined &&
-    media.videoRender?.kind === 'active' &&
-    media.videoRender.senderId === senderId;
   return {
     reachability,
     clientMuted: {
-      audio: clientMuteFrom(media.audioSlot, audioServerMuted, false),
-      video: clientMuteFrom(media.videoSlot, videoServerMuted, liveVideo),
+      audio: clientMuteToken(media.clientMute.audioClientMuted),
+      video: clientMuteToken(media.clientMute.videoClientMuted),
     },
     serverMuted: { audio: audioServerMuted, video: videoServerMuted },
     serverMutedByName:

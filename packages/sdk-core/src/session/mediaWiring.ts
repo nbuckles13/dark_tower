@@ -97,11 +97,21 @@ export function rosterInvalidationListener(
  * Deliberately BEST-EFFORT: ADR-0036 §5 requires client mute to hold WITHOUT
  * the server honouring it, so a failed report must not undo the local
  * suppression; nothing is actionable and nothing is safe to log about it.
+ *
+ * Only a PUBLISHED kind is reported (story 3 R-15): the publish set is fixed for
+ * the membership, a kind outside it has no client-mute fact to give peers (it
+ * stays "unknown" to them, never a false "on"), and MC refuses it as
+ * `not_published` — which stays a non-stock signal. Local mute state is
+ * untouched either way.
  */
-export function bestEffortMuteReport(signaling: {
-  sendMuteRequest(kind: MediaKindToken, muted: boolean): Promise<unknown>;
-}): (kind: MediaKindToken, muted: boolean) => void {
+export function bestEffortMuteReport(
+  signaling: {
+    sendMuteRequest(kind: MediaKindToken, muted: boolean): Promise<unknown>;
+  },
+  publish: readonly MediaKindToken[],
+): (kind: MediaKindToken, muted: boolean) => void {
   return (kind, muted) => {
+    if (!publish.includes(kind)) return;
     void signaling.sendMuteRequest(kind, muted).catch(() => {});
   };
 }

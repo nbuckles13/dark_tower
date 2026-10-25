@@ -21,7 +21,9 @@
   //     and not from frame counts (that inverts dangerously: a transport stall
   //     would display "muted" beside a live microphone);
   //   * far-end state reads `store.media.slots[].slotState`, straight off the
-  //     wire (§6);
+  //     wire (§6) — what a slot SHOWS. Another participant's own client mute is
+  //     NOT read from slots: it is a roster fact in their participant cell
+  //     (`lib/participantState.ts`; ADR-0036 §5 amendment 2026-10-24);
   //   * "audio is coming back" reads `store.media.firstMediaFrameMs`;
   //   * a broken pipeline reads `store.media.lastMediaFault`, so a fault shows as
   //     a fault instead of as silence;

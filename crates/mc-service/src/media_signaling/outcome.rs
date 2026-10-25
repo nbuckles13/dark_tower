@@ -252,7 +252,7 @@ pub enum DirectiveOutcome {
 ///   required for a repeatable steady-state user action (mute is one toggle per
 ///   utterance, forever).
 ///
-/// Budgeting mute would freeze `audio_self_muted` on the roster for the rest of
+/// Budgeting mute would freeze a client-mute fact on the roster for the rest of
 /// the session, so every other participant renders a live speaker as muted.
 /// That is a worse failure than the amplification it would prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,15 +284,24 @@ pub enum MuteOutcome {
     /// The meeting actor could not be reached. Environmental; the connection is
     /// already terminal by the time this can happen.
     ActorUnavailable,
+    /// The request named a kind this participant does not PUBLISH (its fixed
+    /// join publish set). That kind was ignored: no fact recorded, nothing
+    /// fanned out, no MH disposition (story 3 R-15 fix). Decided on the
+    /// connection BEFORE the no-op short-circuit, the token and any actor hop,
+    /// so it is free to drive and never a ratio denominator. Not a failure.
+    /// EXPECTED ZERO: the stock SDK gates every report on its publish set, so
+    /// a non-zero rate means a modified client or an SDK regression.
+    NotPublished,
 }
 
 impl MuteOutcome {
     /// Every variant, for exhaustive metric-vocabulary tests.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Applied,
         Self::Unchanged,
         Self::RateLimited,
         Self::ActorUnavailable,
+        Self::NotPublished,
     ];
 
     /// Bounded metric-label form.
@@ -303,6 +312,7 @@ impl MuteOutcome {
             Self::Unchanged => "unchanged",
             Self::RateLimited => "rate_limited",
             Self::ActorUnavailable => "actor_unavailable",
+            Self::NotPublished => "not_published",
         }
     }
 
@@ -662,6 +672,43 @@ impl SlotViewEmission {
     }
 }
 
+/// What one client-mute roster fan-out step did (story 3 R-15 fix): the
+/// visible edge of the meeting actor's PER-MEETING fan-out bound
+/// (`actors::client_mute_fanout`).
+///
+/// Counted per SUBJECT, never per recipient, and it does NOT partition
+/// transitions: a subject waiting across k flushes counts `awaiting_token` k
+/// times, then `fanned_out` once -- or nothing more, if it left the meeting or
+/// a server-mute update already carried its state. Both are success;
+/// sustained `awaiting_token` means the bound is DELAYING facts, never
+/// dropping them.
+/// Spellings are distinct from every other media vocabulary (the
+/// shared-spelling rule below), so `emitted`/`sent`/`deferred` are not used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientMuteFanoutOutcome {
+    /// A subject's full snapshot was composed and handed to the awaited
+    /// per-recipient sends -- NOT delivered (per-recipient wire loss is
+    /// `mc_participant_outbound_messages_dropped_total{payload_kind="participant_update_muted"}`).
+    FannedOut,
+    /// A subject was still pending at the end of a flush, waiting for the next
+    /// per-meeting token.
+    AwaitingToken,
+}
+
+impl ClientMuteFanoutOutcome {
+    /// Every variant, for zero-init and exhaustive vocabulary tests.
+    pub const ALL: [Self; 2] = [Self::FannedOut, Self::AwaitingToken];
+
+    /// Bounded metric-label form.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FannedOut => "fanned_out",
+            Self::AwaitingToken => "awaiting_token",
+        }
+    }
+}
+
 impl DirectiveOutcome {
     /// Every variant, for exhaustive metric-vocabulary tests.
     pub const ALL: [Self; 7] = [
@@ -1011,7 +1058,7 @@ mod tests {
     /// finds it documented under two metrics with different remedies has to
     /// guess which they are looking at.
     #[test]
-    fn the_four_vocabularies_do_not_share_spellings() {
+    fn media_signaling_vocabularies_do_not_share_spellings() {
         let mut seen: HashSet<&str> = HashSet::new();
         for label in CapabilityOutcome::ALL
             .iter()
@@ -1019,6 +1066,7 @@ mod tests {
             .chain(DirectiveOutcome::ALL.iter().map(|o| o.label()))
             .chain(MuteOutcome::ALL.iter().map(|o| o.label()))
             .chain(SlotViewEmission::ALL.iter().map(|o| o.label()))
+            .chain(ClientMuteFanoutOutcome::ALL.iter().map(|o| o.label()))
         {
             assert!(
                 seen.insert(label),

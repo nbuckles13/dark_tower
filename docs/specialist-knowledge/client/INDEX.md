@@ -43,7 +43,7 @@
 ## Web Application (`packages/web-app/src/`)
 - Join + publish-set chooser → `views/JoinMeeting.svelte`; one attempt (build/bind/join, roster DOM) → `views/MeetingRoom.svelte`; in-meeting (audio rows, video grid, own controls, R-19) → `views/InMeeting.svelte`; tile / four indicators / R-18 notice / roster row + per-kind host controls → `views/{VideoSlotTile,MuteIndicators,ResumeNotice,ParticipantRow}.svelte`
 - Local-only debug panel (R-7 loopback, R-35 overlay) → `views/DebugPanel.svelte`, `lib/{selfCheck,debugStats,debugToggle}.ts`, scan `tests/debugNeverExported.test.ts`; SDK → `session/localDebugSurface.ts`, `media/lifecycle/localStats.ts`, `media/setup/localPreview.ts`
-- Slot-state copy (ONE exhaustive table) → `lib/slotState.ts`; participant copy, bounded names, self camera → `lib/participantState.ts`; auth/meeting views → `views/{SignIn,SignUp,CreateMeeting}.svelte`
+- Slot-state copy (ONE exhaustive table) → `lib/slotState.ts`; participant copy + client mute from roster facts (never slots), bounded names, self camera → `lib/participantState.ts`; auth/meeting views → `views/{SignIn,SignUp,CreateMeeting}.svelte`
 - Session wiring, config, error text → `lib/{session,config,errorText}.ts`; test-only build defines (one predicate) → `vite/testDefines.ts`; test levers → `lib/testLevers.ts`
 - E2E bus (incl. `videoSlots`, `sendCounts`) + per-lane analysis + render-surface lumas (under `__E2E_HOOKS__`) → `lib/{e2eBus,e2eAnalysis}.ts`; contract round-trip → `__tests__/e2eBus.test.ts`
 - Vite proxy / cert fingerprints → `vite.config.ts`, `vite/fingerprints.ts`; prod-absence bundle scan → `tests/bundle-content.test.ts`
@@ -55,7 +55,7 @@
 - Fixtures + MC/MH metric read-backs; multi-party cohort (N+1 registered in global setup) → `fixtures.ts`, `mcMetrics.ts`, `instanceCounters.ts`, `s1Diagnostic.ts`, `cohort.ts`, `cohortContexts.ts`, `global-setup.ts`
 - Receive evidence + tone detection + window stop rule → `receiveEvidence.ts`, `toneDetector.ts`, `windowSampling.ts`
 - Credential scan, shared client metric names, config.env reader → `{credentialScan,clientMetricNames,configEnv}.ts`
-- Specs → `*.spec.ts` (story 2: multi-party-hear, partial-connectivity, server-mute, kek-rotation, over-subscription, solo-participant; story 3: multi-party-see, publish-mixes, video-over-subscription, client-mute-video, server-mute-video, late-joiner-video, kek-rotation-video, watched-only-video, video-codec-unavailable); video harness → `{videoScenario,videoPlan,videoBusShape,videoEvidence,failureDiagnostics}.ts`, `cohortContexts.ts:joinPlanMember`, `configEnv.ts:readMcReceiveCaps`
+- Specs → `*.spec.ts` (story 2: multi-party-hear, partial-connectivity, server-mute, kek-rotation, over-subscription, solo-participant; story 3: multi-party-see, publish-mixes, video-over-subscription, client-mute-video, client-mute-roster, server-mute-video, late-joiner-video, kek-rotation-video, watched-only-video, video-codec-unavailable); video harness → `{videoScenario,videoPlan,videoBusShape,videoEvidence,failureDiagnostics}.ts`, `cohortContexts.ts:joinPlanMember`, `configEnv.ts:readMcReceiveCaps`
 - Env contract + catalog → `env.ts`, `README.md`; Playwright config → `packages/web-app/playwright.config.ts`; node-tier specs → `packages/web-app/tests/`
 - Layer 7 lane + per-run org provisioning → `scripts/layer7.sh`, `infra/kind/scripts/setup.sh:provision_run_org()`
 - Subdomain-pattern drift guard → `scripts/guards/simple/validate-subdomain-regex-sync.sh`

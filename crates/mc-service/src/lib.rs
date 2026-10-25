@@ -144,6 +144,7 @@ compile_error!(
 
 pub mod actors;
 pub mod auth;
+pub(crate) mod client_work_limiter;
 pub mod config;
 pub mod errors;
 pub mod grpc;

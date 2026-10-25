@@ -608,6 +608,7 @@ test('four indicators per participant, each its own token: client/server x audio
     audioServerMuted: false,
     videoServerMuted: true,
     serverMutedBy: 'self',
+    audioClientMuted: true,
   });
   const tile = screen.getByTestId('video-slot-1');
   await expect
@@ -619,7 +620,8 @@ test('four indicators per participant, each its own token: client/server x audio
   await expect
     .element(tile.getByTestId('mute-audio-client-b'))
     .toHaveAttribute('data-muted', 'true');
-  // Server-muted video says nothing about their own camera.
+  // No client VIDEO fact yet (the update carried none): unknown, whatever the
+  // slot or the server mute say.
   await expect
     .element(tile.getByTestId('mute-video-client-b'))
     .toHaveAttribute('data-muted', 'unknown');

@@ -100,9 +100,9 @@ test.describe('story 2 S3: server mute, and client structural mute', () => {
         // Flat vocabulary (story 3): the server cause wins on the slot.
         await waitForSenderSlotState(r, b, 'avatar_server_muted');
         await waitForRosterToken(r, b, 'data-server-muted', 'true');
-        // Distinct from client mute: a server-muted slot says nothing about
-        // B's own microphone while B is server-muted.
-        await waitForRosterToken(r, b, 'data-client-muted', 'unknown');
+        // Distinct from client mute (story 3 R-15): B's own microphone is a
+        // roster fact, independent of the server mute — B never muted it.
+        await waitForRosterToken(r, b, 'data-client-muted', 'false');
       }
       // B's own client: server-muted shown, its client mute untouched.
       await expect(b.page.getByTestId('server-mute-state')).toHaveAttribute(

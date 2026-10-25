@@ -28,6 +28,7 @@
 //! - [`metrics`] - Mailbox monitoring and actor metrics
 //! - [`session`] - Session binding token generation and validation
 
+pub(crate) mod client_mute_fanout;
 pub mod controller;
 pub mod meeting;
 pub mod meeting_media;

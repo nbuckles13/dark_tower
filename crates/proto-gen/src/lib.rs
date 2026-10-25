@@ -201,6 +201,10 @@ impl fmt::Debug for dark_tower::signaling::v1::Participant {
             .field("joined_at", &self.joined_at)
             .field("sender_id", &self.sender_id)
             .field("identity_public_key_len", &self.identity_public_key.len())
+            // Not identity: the per-kind client-mute facts (set iff MC knows,
+            // story 3 R-15 fix), already visible to every meeting member.
+            .field("audio_client_muted", &self.audio_client_muted)
+            .field("video_client_muted", &self.video_client_muted)
             .finish()
     }
 }

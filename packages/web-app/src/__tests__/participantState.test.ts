@@ -3,7 +3,7 @@
 
 import { expect, test } from 'vitest';
 import { MAX_DISPLAY_NAME_LENGTH } from '@darktower/sdk-core';
-import type { StreamAssignmentEvent } from '@darktower/sdk-core';
+import { MediaStore } from '@darktower/sdk-svelte';
 import {
   CAMERA_FAILURE_TEXT,
   PARTICIPANT_TEXT,
@@ -12,6 +12,7 @@ import {
   boundedName,
   nameForParticipantId,
   nameForSenderId,
+  mediaFactsFor,
   participantIndicators,
   selfCameraState,
   type MediaFacts,
@@ -24,27 +25,19 @@ const roster = [
 ];
 const ctx = { roster, selfParticipantId: 'self' };
 
-function slot(
-  senderId: number,
-  slotState: StreamAssignmentEvent['slotState'],
-  mediaKind: 'audio' | 'video' = 'audio',
-): StreamAssignmentEvent {
-  return { slotId: 0, mediaKind, senderId, mediaHandlerUrl: 'https://mh', slotState };
-}
-
 const NOT_SERVER_MUTED = {
   audioServerMuted: false,
   videoServerMuted: false,
   serverMutedBy: undefined,
 };
 
+const NO_CLIENT_FACT = { audioClientMuted: undefined, videoClientMuted: undefined };
+
 function facts(over: Partial<MediaFacts> = {}): MediaFacts {
   return {
-    audioSlot: undefined,
-    videoSlot: undefined,
-    videoRender: undefined,
     unreachableSenderIds: [],
     serverMute: NOT_SERVER_MUTED,
+    clientMute: NO_CLIENT_FACT,
     ...over,
   };
 }
@@ -78,65 +71,159 @@ test('reachability is the wire token when the sender id is in the unreachable se
   ).toBe('reachable');
 });
 
-test.each([
-  ['active audio slot -> not muted', { audioSlot: slot(258, 'active') }, 'false'],
-  [
-    'avatar_client_muted audio slot, no server mute -> client-muted',
-    { audioSlot: slot(258, 'avatar_client_muted') },
-    'true',
-  ],
-  ['no slot carries them -> unknown', {}, 'unknown'],
-  [
-    'only a VIDEO slot carries them -> audio is unknown',
-    { videoSlot: slot(258, 'avatar_client_muted', 'video') },
-    'unknown',
-  ],
-  ['withheld slot -> unknown', { audioSlot: slot(258, 'withheld_by_congestion') }, 'unknown'],
-  [
-    'audio server-muted -> unknown (the slot state says nothing about their mic)',
-    {
-      audioSlot: slot(258, 'avatar_server_muted'),
-      serverMute: { ...NOT_SERVER_MUTED, audioServerMuted: true, serverMutedBy: 'c' },
-    },
-    'unknown',
-  ],
-] as const)('client AUDIO mute: %s', (_label, over, expected) => {
-  expect(participantIndicators(roster[0]!, facts(over), ctx).clientMuted.audio).toBe(expected);
+// Story 3 R-15: client mute is the participant's ROSTER fact (the store's
+// participant cell), per kind, tri-state: `unknown` ONLY before a fact.
+const FACT = { none: undefined, off: false, on: true } as const;
+const TOKEN = { none: 'unknown', off: 'false', on: 'true' } as const;
+const FACT_KEYS = ['none', 'off', 'on'] as const;
+
+test.each(
+  FACT_KEYS.flatMap((audio) =>
+    FACT_KEYS.flatMap((video) =>
+      [false, true].map((serverMuted) => [audio, video, serverMuted] as const),
+    ),
+  ),
+)(
+  'client mute: audio=%s video=%s (server-muted both kinds: %s) -> the fact, per kind',
+  (audio, video, serverMuted) => {
+    const view = participantIndicators(
+      roster[0]!,
+      facts({
+        clientMute: { audioClientMuted: FACT[audio], videoClientMuted: FACT[video] },
+        serverMute: serverMuted
+          ? { audioServerMuted: true, videoServerMuted: true, serverMutedBy: 'c' }
+          : NOT_SERVER_MUTED,
+      }),
+      ctx,
+    );
+    // Server mute no longer forces `unknown`: the client indicator reports
+    // what the participant did, the server one what the host did.
+    expect(view.clientMuted).toEqual({ audio: TOKEN[audio], video: TOKEN[video] });
+    expect(view.serverMuted).toEqual({ audio: serverMuted, video: serverMuted });
+  },
+);
+
+test('a client-mute fact never moves a server indicator, and a server mute never moves a client one', () => {
+  const serverOnly = participantIndicators(
+    roster[0]!,
+    facts({ serverMute: { ...NOT_SERVER_MUTED, audioServerMuted: true, serverMutedBy: 'c' } }),
+    ctx,
+  );
+  expect(serverOnly.clientMuted).toEqual({ audio: 'unknown', video: 'unknown' });
+  const clientOnly = participantIndicators(
+    roster[0]!,
+    facts({ clientMute: { audioClientMuted: true, videoClientMuted: true } }),
+    ctx,
+  );
+  expect(clientOnly.serverMuted).toEqual({ audio: false, video: false });
+  expect(clientOnly.serverMutedByName).toBeUndefined();
 });
 
-test('client VIDEO mute is per kind: avatar_client_muted on their video slot, or false while live', () => {
+test('a participant with NO sender id (no slot can ever carry them) still shows their client mute', () => {
   expect(
     participantIndicators(
-      roster[0]!,
-      facts({ videoSlot: slot(258, 'avatar_client_muted', 'video') }),
+      roster[2]!,
+      facts({ clientMute: { audioClientMuted: false, videoClientMuted: true } }),
       ctx,
     ).clientMuted,
-  ).toEqual({ audio: 'unknown', video: 'true' });
-  // A live video slot names no sender; the verified render tag does (R-5).
-  expect(
-    participantIndicators(
-      roster[0]!,
-      facts({
-        videoSlot: { ...slot(258, 'active', 'video'), senderId: undefined },
-        videoRender: { kind: 'active', senderId: 258 },
-      }),
-      ctx,
-    ).clientMuted.video,
-  ).toBe('false');
-  // Video server-muted: unknown for video, audio untouched.
-  expect(
-    participantIndicators(
-      roster[0]!,
-      facts({
-        audioSlot: slot(258, 'active'),
-        videoSlot: slot(258, 'avatar_server_muted', 'video'),
-        serverMute: { ...NOT_SERVER_MUTED, videoServerMuted: true },
-      }),
-      ctx,
-    ),
-  ).toMatchObject({
-    clientMuted: { audio: 'false', video: 'unknown' },
-    serverMuted: { audio: false, video: true },
+  ).toEqual({ audio: 'false', video: 'true' });
+});
+
+// Through the REAL store and `mediaFactsFor`: what a row renders reads the
+// participant cell only — never a slot, and independent of arrival order.
+function storeWith(apply: (store: MediaStore) => void): MediaStore {
+  const store = new MediaStore();
+  apply(store);
+  return store;
+}
+
+const bea = roster[0]!; // sender 258
+
+test('NO slot fallback: a slot saying avatar_client_muted does not override the fact false', () => {
+  const store = storeWith((s) => {
+    s.applyRosterEntry({ participantId: 'b', audioClientMuted: false, videoClientMuted: false });
+    s.applyStreamAssignments({
+      unreachableSenderIds: [],
+      assignments: [
+        {
+          slotId: 0,
+          mediaKind: 'audio',
+          senderId: 258,
+          mediaHandlerUrl: 'https://mh',
+          slotState: 'avatar_client_muted',
+        },
+        {
+          slotId: 1,
+          mediaKind: 'video',
+          senderId: 258,
+          mediaHandlerUrl: 'https://mh',
+          slotState: 'avatar_client_muted',
+        },
+      ],
+    });
+  });
+  expect(participantIndicators(bea, mediaFactsFor(store, bea), ctx).clientMuted).toEqual({
+    audio: 'false',
+    video: 'false',
+  });
+  // And a slot alone, with no fact, is still `unknown` — never read as a fact.
+  const slotOnly = storeWith((s) =>
+    s.applyStreamAssignments({
+      unreachableSenderIds: [],
+      assignments: [
+        {
+          slotId: 0,
+          mediaKind: 'audio',
+          senderId: 258,
+          mediaHandlerUrl: 'https://mh',
+          slotState: 'avatar_client_muted',
+        },
+      ],
+    }),
+  );
+  expect(participantIndicators(bea, mediaFactsFor(slotOnly, bea), ctx).clientMuted.audio).toBe(
+    'unknown',
+  );
+});
+
+test('arrival order does not matter: server-then-client and client-then-server render the same', () => {
+  const server = {
+    participantId: 'b',
+    audioServerMuted: true,
+    videoServerMuted: false,
+    serverMutedBy: 'c',
+  } as const;
+  const client = { participantId: 'b', audioClientMuted: true, videoClientMuted: false } as const;
+  const a = storeWith((s) => {
+    s.applyParticipantMute(server);
+    s.applyRosterEntry(client);
+  });
+  const b = storeWith((s) => {
+    s.applyRosterEntry(client);
+    s.applyParticipantMute(server);
+  });
+  const viewA = participantIndicators(bea, mediaFactsFor(a, bea), ctx);
+  expect(viewA).toEqual(participantIndicators(bea, mediaFactsFor(b, bea), ctx));
+  expect(viewA).toMatchObject({
+    clientMuted: { audio: 'true', video: 'false' },
+    serverMuted: { audio: true, video: false },
+    serverMutedByName: 'Cid',
+  });
+});
+
+test('mic and camera are independent: moving one kind leaves the other fact alone', () => {
+  const store = storeWith((s) => {
+    s.applyRosterEntry({ participantId: 'b', audioClientMuted: false, videoClientMuted: false });
+    s.applyParticipantMute({
+      participantId: 'b',
+      audioServerMuted: false,
+      videoServerMuted: false,
+      videoClientMuted: true,
+    });
+  });
+  expect(participantIndicators(bea, mediaFactsFor(store, bea), ctx).clientMuted).toEqual({
+    audio: 'false',
+    video: 'true',
   });
 });
 

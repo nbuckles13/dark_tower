@@ -85,20 +85,21 @@ export class MeetingStore {
   applyJoined(event: JoinedEvent): void {
     this.#participants = [...event.existingParticipants];
     this.media.registerParticipant(event.participantId);
-    for (const p of event.existingParticipants) this.media.registerParticipant(p.participantId);
+    for (const p of event.existingParticipants) this.media.applyRosterEntry(p);
   }
 
   /** Append a participant (`participantJoined`); idempotent on participantId. */
   applyParticipantJoined(event: ParticipantJoinedEvent): void {
     const id = event.participant.participantId;
     if (this.#participants.some((p) => p.participantId === id)) return;
-    this.media.registerParticipant(id);
+    this.media.applyRosterEntry(event.participant);
     this.#participants = [...this.#participants, event.participant];
   }
 
   /** Remove a participant by id (`participantLeft`). */
   applyParticipantLeft(event: ParticipantLeftEvent): void {
     this.#participants = this.#participants.filter((p) => p.participantId !== event.participantId);
+    this.media.applyParticipantLeft(event.participantId);
   }
 
   /** Record a connected MH URL (`mediaConnected`); dedup'd. */

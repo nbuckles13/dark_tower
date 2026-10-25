@@ -1,6 +1,7 @@
 //! Shared encoding utilities for WebTransport signaling messages.
 
-use crate::actors::messages::{LeaveReason, ParticipantStateUpdate};
+use crate::actors::messages::{LeaveReason, ParticipantInfo, ParticipantStateUpdate};
+use crate::media_kind::MediaKindLabel;
 use crate::webtransport::trace::inject_current_context;
 
 use proto_gen::dark_tower::signaling::v1::{
@@ -41,54 +42,71 @@ pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_LEFT: &str = "participant_update_left"
 ///
 /// A separate value by DEMONSTRATED CONSUMER NEED, not message-type taxonomy
 /// (the same rule that keeps `signaling_raw` one value): a dropped mute update
-/// has no re-sync path. Join/leave state is rebuilt from the roster, but
-/// who-muted-whom is delivered ONLY by the live broadcast and the late-joiner
-/// replay, so a drop leaves that client rendering a wrong indicator until the
-/// next mute change on that participant — which may never come. Past
-/// participle, matching `_joined` / `_left`, so `participant_update.*` still
-/// recovers the merged series.
+/// has no re-sync path. Join/leave state is rebuilt from the roster, but mute
+/// state after join is delivered ONLY by these updates -- server mute (the live
+/// broadcast and the late-joiner replay) and, since the story 3 R-15 fix,
+/// client mute (the per-meeting fan-out; the join roster carries only the
+/// snapshot at join). So a drop leaves that client rendering a stale indicator
+/// until the next mute change on that participant, or the observer's rejoin --
+/// which may never come. Client- and server-mute updates share this value: the
+/// same message, the same consequence, the same remedy. Past participle,
+/// matching `_joined` / `_left`, so `participant_update.*` still recovers the
+/// merged series.
 pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED: &str = "participant_update_muted";
+
+/// THE one builder of a roster entry (`Participant`), for both carriers: the
+/// join response's `existing_participants` (`connection.rs`) and the
+/// `ParticipantJoined` fan-out (below). One builder, so a field cannot be set
+/// on one carrier and forgotten on the other.
+pub fn roster_entry(info: &ParticipantInfo) -> Participant {
+    Participant {
+        participant_id: info.participant_id.clone(),
+        name: info.display_name.clone(),
+        streams: Vec::new(),
+        joined_at: 0,
+        // ADR-0036 §4: the roster carries the sender id and the identity
+        // signing public key, and NO other key material — no meeting KEK, no
+        // wrapped transmit key, no key id, no thumbprint.
+        //
+        // Populated on the fan-out as well as on the join response, so a
+        // participant already in the meeting can resolve a later joiner's
+        // frames: key id -> sender_id -> this entry -> identity_public_key.
+        //
+        // `Some` of a `NonZeroU16`, so never `Some(0)`: 0 is reserved-invalid,
+        // and N participants sharing it would collide on one roster identity
+        // and — via key id, derived wrap nonce — on one AES-GCM nonce. Trust on
+        // first use: same-keyholder consistency, never a verified identity.
+        sender_id: Some(u32::from(info.sender_id.get().get())),
+        // `identity_public_key` is either exactly 32 bytes or EMPTY (MC refuses
+        // the join otherwise). `None` MUST become EMPTY BYTES, never a
+        // zero-filled 32-byte array: an all-zero key reads as present, sends a
+        // consumer down the verify path, and silently destroys the "no key
+        // published" signal. Explicit `match`, never `unwrap_or_default()`. Do
+        // not "simplify" this.
+        identity_public_key: match &info.identity_public_key {
+            Some(key) => key.as_bytes().to_vec(),
+            None => Vec::new(),
+        },
+        // Client mute, set iff MC knows (`None` = ABSENT = "unknown" to peers,
+        // never unmuted). Server mute is not on the roster: the replay carries it.
+        audio_client_muted: info.client_muted.get(MediaKindLabel::Audio),
+        video_client_muted: info.client_muted.get(MediaKindLabel::Video),
+    }
+}
 
 /// Encode a `ParticipantStateUpdate` for the wire.
 ///
 /// `ParticipantJoined`, `ParticipantLeft` and `ParticipantMuteUpdate` are
 /// serialized. Other variants are logged but return `None`.
 ///
-/// THE ONE SERIALIZER for `MuteChanged`: the live server-mute broadcast and the
-/// late-joiner replay both reach the wire through this function, so a mute
-/// applied before you join and one applied after cannot be encoded two ways.
+/// THE ONE SERIALIZER for `MuteChanged`: the server-mute broadcast, the
+/// client-mute fan-out and the late-joiner replay all reach the wire through
+/// this function, so a mute applied before you join and one applied after
+/// cannot be encoded two ways.
 pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<EncodedUpdate> {
     match update {
         ParticipantStateUpdate::Joined(info) => {
-            let participant = Participant {
-                participant_id: info.participant_id.clone(),
-                name: info.display_name.clone(),
-                streams: Vec::new(),
-                joined_at: 0,
-                // ADR-0036 §4: sender id and identity signing key are the only
-                // roster additions, and no other key material rides here — no
-                // meeting KEK, no wrapped transmit key, no thumbprint.
-                //
-                // Populated on the fan-out as well as on the join response, so
-                // a participant already in the meeting can resolve a later
-                // joiner's frames: key id -> sender_id -> this entry ->
-                // identity_public_key. Publishing only on the join response
-                // would leave existing members unable to attribute new frames.
-                //
-                // `Some` of a `NonZeroU16`, so never `Some(0)` — 0 is
-                // reserved-invalid. Trust on first use: same-keyholder
-                // consistency, never a verified identity.
-                sender_id: Some(u32::from(info.sender_id.get().get())),
-                // `None` MUST become EMPTY BYTES, never a zero-filled 32-byte
-                // array — see the same choke-point in `connection.rs`. An
-                // all-zero key reads as present, sends a consumer down the
-                // verify path, and silently destroys the "no key published"
-                // signal. Explicit `match`, never `unwrap_or_default()`.
-                identity_public_key: match &info.identity_public_key {
-                    Some(key) => key.as_bytes().to_vec(),
-                    None => Vec::new(),
-                },
-            };
+            let participant = roster_entry(info);
             // R-57: carry the current server-side trace context to the client on
             // the fan-out broadcast (bounded W3C IDs only).
             let (trace_parent, trace_state) = inject_current_context();
@@ -130,8 +148,7 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Enco
         }
         ParticipantStateUpdate::MuteChanged {
             participant_id,
-            audio_self_muted,
-            video_self_muted,
+            client_muted,
             audio_server_muted,
             video_server_muted,
             server_muted_by,
@@ -147,11 +164,13 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Enco
                     message: Some(server_message::Message::ParticipantMuteUpdate(
                         ParticipantMuteUpdate {
                             participant_id: participant_id.clone(),
-                            audio_self_muted: *audio_self_muted,
-                            video_self_muted: *video_self_muted,
                             audio_server_muted: *audio_server_muted,
                             video_server_muted: *video_server_muted,
                             server_muted_by: server_muted_by.clone(),
+                            // Set iff MC knows (`None` = ABSENT), on EVERY
+                            // mute update, server-mute ones included.
+                            audio_client_muted: client_muted.get(MediaKindLabel::Audio),
+                            video_client_muted: client_muted.get(MediaKindLabel::Video),
                         },
                     )),
                     trace_parent,
@@ -185,6 +204,7 @@ mod tests {
     use crate::actors::messages::{
         LeaveReason, ParticipantInfo, ParticipantStateUpdate, ParticipantStatus,
     };
+    use crate::media_kind::ClientMuteFacts;
     use proto_gen::dark_tower::signaling::v1::{self, server_message};
 
     fn make_participant_info(id: &str, name: &str) -> ParticipantInfo {
@@ -192,8 +212,7 @@ mod tests {
             participant_id: id.to_string(),
             user_id: "user-1".to_string(),
             display_name: name.to_string(),
-            audio_self_muted: false,
-            video_self_muted: false,
+            client_muted: ClientMuteFacts::UNKNOWN,
             audio_server_muted: false,
             video_server_muted: false,
             status: ParticipantStatus::Connected,
@@ -308,35 +327,91 @@ mod tests {
         }
     }
 
+    /// Every field reaches the wire, who-muted-whom included, and each client
+    /// fact keeps its PRESENCE: `Some(false)` stays a fact, `None` stays absent
+    /// (set iff MC knows) -- on a server-mute frame as on a client-mute one.
     #[test]
     fn test_encode_mute_changed_is_a_participant_mute_update() {
+        for (facts, audio, video) in [
+            ([Some(true), Some(false)], Some(true), Some(false)),
+            ([None, Some(true)], None, Some(true)),
+            ([None, None], None, None),
+        ] {
+            let update = ParticipantStateUpdate::MuteChanged {
+                participant_id: "part-1".to_string(),
+                client_muted: ClientMuteFacts::from_facts(facts),
+                audio_server_muted: true,
+                video_server_muted: false,
+                server_muted_by: "host-1".to_string(),
+            };
+            let encoded = encode_participant_update(&update).expect("MuteChanged is wire-visible");
+            assert_eq!(encoded.payload_kind, PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED);
+            let Some(server_message::Message::ParticipantMuteUpdate(m)) =
+                encoded.server_message.message
+            else {
+                panic!("expected a ParticipantMuteUpdate");
+            };
+            assert_eq!(
+                m,
+                ParticipantMuteUpdate {
+                    participant_id: "part-1".to_string(),
+                    audio_server_muted: true,
+                    video_server_muted: false,
+                    server_muted_by: "host-1".to_string(),
+                    audio_client_muted: audio,
+                    video_client_muted: video,
+                },
+                "{facts:?}"
+            );
+        }
+    }
+
+    /// The retired tags 2/3 never reach the wire from MC's encoder: a
+    /// `MuteChanged` with both client facts set encodes fields 7 and 8 only
+    /// (server flags false and `server_muted_by` empty are proto3 defaults).
+    #[test]
+    fn a_mute_update_never_emits_the_retired_tags_2_and_3() {
+        use prost::Message;
         let update = ParticipantStateUpdate::MuteChanged {
-            participant_id: "part-1".to_string(),
-            audio_self_muted: true,
-            video_self_muted: false,
-            audio_server_muted: true,
+            participant_id: String::new(),
+            client_muted: ClientMuteFacts::from_facts([Some(true), Some(true)]),
+            audio_server_muted: false,
             video_server_muted: false,
-            server_muted_by: "host-1".to_string(),
+            server_muted_by: String::new(),
         };
-        let encoded = encode_participant_update(&update).expect("MuteChanged is wire-visible");
-        assert_eq!(encoded.payload_kind, PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED);
+        let encoded = encode_participant_update(&update).unwrap();
         let Some(server_message::Message::ParticipantMuteUpdate(m)) =
             encoded.server_message.message
         else {
             panic!("expected a ParticipantMuteUpdate");
         };
+        // Field 7 and 8, varint wire type: keys 0x38 and 0x40. Nothing else.
+        assert_eq!(m.encode_to_vec(), vec![0x38, 0x01, 0x40, 0x01]);
+    }
+
+    /// ONE roster builder for both carriers: the client facts ride it with
+    /// presence intact, and `ParticipantJoined` carries exactly that entry.
+    #[test]
+    fn the_roster_entry_carries_client_facts_set_iff_known() {
+        let mut info = make_participant_info("part-9", "Nine");
+        let fresh = roster_entry(&info);
         assert_eq!(
-            m,
-            ParticipantMuteUpdate {
-                participant_id: "part-1".to_string(),
-                audio_self_muted: true,
-                video_self_muted: false,
-                audio_server_muted: true,
-                video_server_muted: false,
-                server_muted_by: "host-1".to_string(),
-            },
-            "every field reaches the wire, who-muted-whom included"
+            (fresh.audio_client_muted, fresh.video_client_muted),
+            (None, None),
+            "a participant that has reported nothing is ABSENT, never false"
         );
+        info.client_muted = ClientMuteFacts::from_facts([Some(false), Some(true)]);
+        let entry = roster_entry(&info);
+        assert_eq!(
+            (entry.audio_client_muted, entry.video_client_muted),
+            (Some(false), Some(true))
+        );
+        let joined = encode_participant_update(&ParticipantStateUpdate::Joined(info)).unwrap();
+        let Some(server_message::Message::ParticipantJoined(j)) = joined.server_message.message
+        else {
+            panic!("expected ParticipantJoined");
+        };
+        assert_eq!(j.participant, Some(entry));
     }
 
     #[test]

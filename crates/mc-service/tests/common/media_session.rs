@@ -148,6 +148,9 @@ pub struct Session {
     pub user: String,
     /// MC's participant id for this session, read off the `JoinResponse`.
     pub participant_id: String,
+    /// `JoinResponse.existing_participants`, as MC sent it (the roster
+    /// snapshot, client-mute facts included).
+    pub existing_participants: Vec<proto_gen::dark_tower::signaling::v1::Participant>,
     /// The meeting joined.
     pub meeting_id: String,
 }
@@ -669,18 +672,20 @@ async fn try_join_full(
     let resp = tokio::time::timeout(Duration::from_secs(5), read_server_message(&mut recv))
         .await
         .expect("join response timeout");
-    let (participant_id, sender_id, media_servers, max_kind_receive_slots) = match resp.message {
-        Some(server_message::Message::JoinResponse(r)) => (
-            r.participant_id.clone(),
-            r.sender_id.expect("MC allocates a sender id at join"),
-            r.media_servers
-                .into_iter()
-                .map(|m| m.media_handler_url)
-                .collect::<Vec<String>>(),
-            (r.max_audio_receive_slots, r.max_video_receive_slots),
-        ),
-        other => return Err(format!("{other:?}")),
-    };
+    let (participant_id, sender_id, media_servers, max_kind_receive_slots, existing_participants) =
+        match resp.message {
+            Some(server_message::Message::JoinResponse(r)) => (
+                r.participant_id.clone(),
+                r.sender_id.expect("MC allocates a sender id at join"),
+                r.media_servers
+                    .into_iter()
+                    .map(|m| m.media_handler_url)
+                    .collect::<Vec<String>>(),
+                (r.max_audio_receive_slots, r.max_video_receive_slots),
+                r.existing_participants,
+            ),
+            other => return Err(format!("{other:?}")),
+        };
 
     let mut session = Session {
         conn,
@@ -694,6 +699,7 @@ async fn try_join_full(
         pending: std::collections::VecDeque::new(),
         user: user.to_string(),
         participant_id,
+        existing_participants,
         meeting_id: meeting_id.to_string(),
     };
     session.take_join_view().await;
