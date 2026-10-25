@@ -1221,7 +1221,9 @@ async fn refusal_replies_past_the_burst_are_withheld_and_counted() {
 }
 
 /// The legacy both-kinds frame helper still names both kinds explicitly (an
-/// explicit `false` is an unmute, never "unchanged").
+/// explicit `false` is an unmute, never "unchanged"). From an AUDIO-ONLY
+/// publisher (the trio), the named video kind is not published, so it is
+/// counted `not_published` and ignored; audio still applies.
 #[tokio::test]
 async fn a_both_kinds_client_mute_names_both_kinds() {
     let (stack, rig) = start_stack("sm-both").await;
@@ -1231,18 +1233,186 @@ async fn a_both_kinds_client_mute_names_both_kinds() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while snap
         .counter("mc_media_mute_requests_total")
-        .with_labels(&[("outcome", "unchanged"), ("media_kind", "video")])
+        .with_labels(&[("outcome", "applied"), ("media_kind", "audio")])
         .delta()
         < 1
     {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "video was not counted"
+            "audio was not applied"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     snap.counter("mc_media_mute_requests_total")
-        .with_labels(&[("outcome", "applied"), ("media_kind", "audio")])
+        .with_labels(&[("outcome", "not_published"), ("media_kind", "video")])
         .assert_delta(1);
     let _ = stack;
+}
+
+// ============================================================================
+// Story 3 R-15 fix: client mute is a roster fact for every participant
+// (reverses story-2 S-2; ADR-0036 §5 amendment 2026-10-24)
+// ============================================================================
+
+/// A client `MuteRequest` reaches ANOTHER session as a `ParticipantMuteUpdate`
+/// about the requester (the subject is always the connection's own
+/// participant -- `MuteRequest` names no one), carrying the client facts with
+/// the server flags unset; an identical repeat emits nothing, fenced by the
+/// next real transition being the NEXT update B sees about A.
+#[tokio::test]
+async fn a_client_mute_reaches_other_sessions_and_a_repeat_reaches_no_one() {
+    let (stack, rig) = start_stack("cm-wire").await;
+    let [_h, (mut a, _, _), (mut b, _, _)] = av_trio(&rig, &stack, "cm-wire-m").await;
+    let a_id = a.participant_id.clone();
+    let snap = MetricAssertion::snapshot();
+
+    a.write(mute_kinds_frame(Some(true), None)).await;
+    let first = b.expect_mute_update_for(&a_id).await;
+    assert_eq!(
+        (first.audio_client_muted, first.video_client_muted),
+        (Some(true), None),
+        "audio is a fact now; video was never reported, so it is ABSENT"
+    );
+    assert!(!first.audio_server_muted && !first.video_server_muted);
+    assert!(first.server_muted_by.is_empty());
+
+    a.write(mute_kinds_frame(Some(true), None)).await; // no-op
+    a.write(mute_kinds_frame(None, Some(true))).await; // the fence
+    let next = b.expect_mute_update_for(&a_id).await;
+    assert_eq!(
+        (next.audio_client_muted, next.video_client_muted),
+        (Some(true), Some(true)),
+        "the next update about A is the fence; a no-op emission would have been (Some(true), None)"
+    );
+    // One fan-out per REAL transition (counted per subject, not per
+    // recipient), none for the no-op, and the per-meeting bucket never engaged.
+    snap.counter("mc_media_client_mute_fanouts_total")
+        .with_labels(&[("outcome", "fanned_out")])
+        .assert_delta(2);
+    snap.counter("mc_media_client_mute_fanouts_total")
+        .with_labels(&[("outcome", "awaiting_token")])
+        .assert_delta(0);
+    let _ = stack;
+}
+
+/// A first unmuted report (`None -> Some(false)`) reaches the actor -- the
+/// connection's cache never short-circuits a first report -- and fans out as
+/// a fact, but is a MEDIA no-op: no push and no generation advance before the
+/// fence (the host's mute of B is the NEXT push, exactly one generation on).
+#[tokio::test]
+async fn a_first_unmuted_report_fans_out_and_neither_pushes_nor_advances_the_generation() {
+    let (stack, rig) = start_stack("cm-first").await;
+    let [(mut h, _, _), (mut a, _, _), (mut b, _, _)] = av_trio(&rig, &stack, "cm-first-m").await;
+    let before = pushes_to(&stack, "cm-first-m", MH);
+    let last = before.last().expect("the trio pushed").policy_generation;
+
+    a.write(mute_kinds_frame(Some(false), Some(false))).await;
+    let u = b.expect_mute_update_for(&a.participant_id.clone()).await;
+    assert_eq!(
+        (u.audio_client_muted, u.video_client_muted),
+        (Some(false), Some(false))
+    );
+
+    h.write(server_mute_frame(&b.participant_id, true)).await;
+    let fence = push_until(&stack, "cm-first-m", MH, "the fence", |c| {
+        dropped(c) == vec![(b.sender_id, 0)]
+    })
+    .await;
+    assert_eq!(
+        fence.policy_generation,
+        last + 1,
+        "the first-false report advanced no generation"
+    );
+    assert_eq!(
+        pushes_to(&stack, "cm-first-m", MH).len(),
+        before.len() + 1,
+        "and made no push"
+    );
+}
+
+/// The join roster carries each participant's client-mute facts SET IFF
+/// KNOWN: a muted kind `Some(true)`, a reported-unmuted kind `Some(false)`,
+/// and a never-reported participant ABSENT on both -- on the late joiner's
+/// `existing_participants` and on the `ParticipantJoined` the others receive.
+#[tokio::test]
+async fn the_join_roster_carries_client_mute_facts_set_iff_known() {
+    let (stack, rig) = start_stack("cm-roster").await;
+    let [(h, _, _), (mut a, _, _), (mut b, _, _)] = av_trio(&rig, &stack, "cm-roster-m").await;
+    a.write(mute_kinds_frame(None, Some(true))).await;
+    b.write(mute_kinds_frame(Some(false), Some(false))).await;
+    let _ = h;
+    // Both reports applied (fenced by their own fan-out to the other).
+    let _ = b.expect_mute_update_for(&a.participant_id.clone()).await;
+    let _ = a.expect_mute_update_for(&b.participant_id.clone()).await;
+
+    let late = join_as(&rig, &stack, "cm-roster-m", "user-late").await;
+    let facts = |id: &str| {
+        let p = late
+            .existing_participants
+            .iter()
+            .find(|p| p.participant_id == id)
+            .unwrap_or_else(|| panic!("{id} is on the roster"));
+        (p.audio_client_muted, p.video_client_muted)
+    };
+    assert_eq!(facts(&a.participant_id), (None, Some(true)));
+    assert_eq!(facts(&b.participant_id), (Some(false), Some(false)));
+    assert_eq!(
+        facts(&h.participant_id),
+        (None, None),
+        "never reported: ABSENT"
+    );
+
+    let joined = loop {
+        let msg = a.next_server_message().await.expect("a hears the join");
+        if let Some(server_message::Message::ParticipantJoined(j)) = msg.message {
+            break j.participant.expect("an entry");
+        }
+    };
+    assert_eq!(joined.participant_id, late.participant_id);
+    assert_eq!(
+        (joined.audio_client_muted, joined.video_client_muted),
+        (None, None),
+        "a fresh joiner has reported nothing: unknown to peers, never unmuted"
+    );
+}
+
+/// Story 3 R-15 fix: a client-mute fact exists only for a kind the
+/// participant PUBLISHES. An audio-only participant's video reports (false,
+/// then true) record no fact, fan out nothing and count `not_published` once
+/// each; a mixed request applies audio only. Fenced: B's first update about A
+/// is the mixed request's, carrying video ABSENT.
+#[tokio::test]
+async fn a_client_mute_of_an_unpublished_kind_is_ignored_and_counted() {
+    let (stack, rig) = start_stack("cm-unpub").await;
+    let (_h, mut a, mut b) = trio(&rig, &stack, "cm-unpub-m").await;
+    let snap = MetricAssertion::snapshot();
+
+    a.write(mute_kinds_frame(None, Some(false))).await;
+    a.write(mute_kinds_frame(None, Some(true))).await;
+    a.write(mute_kinds_frame(Some(true), Some(true))).await; // mixed: the fence
+    let first = b.expect_mute_update_for(&a.participant_id.clone()).await;
+    assert_eq!(
+        (first.audio_client_muted, first.video_client_muted),
+        (Some(true), None),
+        "the first update about A is the mixed request's; video never became a fact"
+    );
+    snap.counter("mc_media_mute_requests_total")
+        .with_labels(&[("outcome", "not_published"), ("media_kind", "video")])
+        .assert_delta(3);
+    snap.counter("mc_media_mute_requests_total")
+        .with_labels(&[("outcome", "applied"), ("media_kind", "audio")])
+        .assert_delta(1);
+    snap.counter("mc_media_client_mute_fanouts_total")
+        .with_labels(&[("outcome", "fanned_out")])
+        .assert_delta(1);
+    let late = join_as(&rig, &stack, "cm-unpub-m", "user-late").await;
+    let entry = late
+        .existing_participants
+        .iter()
+        .find(|p| p.participant_id == a.participant_id)
+        .expect("A is on the roster");
+    assert_eq!(
+        (entry.audio_client_muted, entry.video_client_muted),
+        (Some(true), None)
+    );
 }

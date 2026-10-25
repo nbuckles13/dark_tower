@@ -1014,6 +1014,53 @@ QUIC's connection-level keepalive** (§1), not by media flow, so a long mute doe
 > - **Devices.** The microphone stays open on an audio mute of either cause, and only stops
 >   sending; only a video mute, client or server, stops the camera.
 
+> **Amendment (2026-10-24, story 3 R-15 fix — client mute is visible to every participant;
+> reverses story-2 security judgment S-2).** The two amendments above stay visible; this adds who
+> LEARNS each control, which neither stated.
+>
+> - **What S-2 judged (2026-09-03, `docs/devloop-outputs/2026-09-03-mc-client-media-signaling/`).**
+>   A self-mute did not fan out to the roster: the subscriber-visible signal was the slot state
+>   (*avatar — client-muted*), a participant's own client already knows its own mute, and the
+>   fan-out was an O(roster) awaited broadcast on the shared meeting actor bounded only per
+>   connection — O(N²) per meeting, with no per-meeting participant cap. So a participant no slot
+>   of yours carried was "unknown" to you.
+> - **The decision (human, 2026-10-24).** **Client mute, per kind, is visible to every participant
+>   in the meeting**, whether or not any of their slots carries that participant — as server mute
+>   already was. The manual test that prompted it: with five participants, one participant's
+>   roster showed another as "mic: unknown / camera: unknown" because no slot carried them.
+> - **Carriers.** Client mute rides the roster entry at join (`Participant.*_client_muted`, on the
+>   join response and on `ParticipantJoined`) and then `ParticipantMuteUpdate`, which MC now sends
+>   on every real client-mute transition to every participant except the subject. Each update is a
+>   full snapshot of what MC knows: the server fields and `server_muted_by` always, each client
+>   field iff MC knows it (absent = no fact). Server mute is unchanged: the post-join replay, then the
+>   same update. The fields are **set iff MC knows**: MC holds no client-mute fact for a kind until
+>   the participant reports it, and never one for a kind the participant does not publish (such a
+>   report is ignored and counted). An absent field is "unknown", never unmuted; a peer cannot tell
+>   an unpublished kind from an unreported one. The slot state is
+>   unchanged and still drives slot rendering.
+> - **What made the reversal safe: a per-meeting bound.** The fan-out is not a direct broadcast. A
+>   transition enqueues its participant on a per-meeting queue served FIFO under a per-meeting
+>   token bucket (`crates/mc-service/src/actors/client_mute_fanout.rs`), and each fan-out is
+>   composed from current roster state when sent (latest state wins). The meeting-wide cost is
+>   therefore bounded by that bucket's rate times the roster, not by N senders each within their
+>   own per-connection bucket. Its visible edge is
+>   `mc_media_client_mute_fanouts_total{outcome="awaiting_token"}`. The per-meeting participant cap
+>   S-2 noted as missing is still missing; it now bounds only the pre-existing slot-view re-emit
+>   (tracked in `docs/TODO.md`).
+> - **Caveats, accepted under the decision.**
+>   - (a) A participant listed in another subscriber's `unreachable_sender_ids` (no media to that
+>     subscriber) now exposes its mute *timing* to that subscriber. For a push-to-talk user that is a
+>     coarse voice-activity signal (§11's concern, applied to mute-toggle timestamps).
+>   - (b) A report the per-connection mute bucket drops leaves MC's fact stale, and that
+>     staleness is now visible to the whole room rather than to slot holders only; it heals on the
+>     participant's next report of that kind.
+>   - (c) Under churn, facts are **delayed** by the bound (bounded by the FIFO queue and the
+>     bucket rate), never dropped by it; per-recipient delivery loss is the separate, counted
+>     wire-hop drop, which leaves that observer stale until the participant's next change. Clients
+>     must not infer or count transitions from these updates.
+>   - No per-participant, per-toggle log or metric carrying participant identity at info level or
+>     above on the fan-out path; counters with bounded labels only.
+
 ---
 
 ## 6. What clients receive

@@ -167,7 +167,9 @@ const RETENTION_GENERICS: &[&str] = &["$state", "$derived", "writable", "readabl
 /// measurement (2026-07-30: `SignalingClient` **468** lines, then `MeetingSession` 302,
 /// `MediaTransport` 226; 2000 was ~4x. 2026-09-30, story 2 task 15: `MeetingSession`
 /// **737** lines after the server-mute surface landed, past 2000 / 3, so raised to 2400,
-/// ~3.3x) is a convenience for the reader, NOT the thing the invariant rests on.
+/// ~3.3x. 2026-10-24, story 3 R-15 fix: `MeetingSession` **815** lines after the post-join
+/// client-mute re-report, past 2400 / 3, so raised to 3000, ~3.7x) is a convenience for
+/// the reader, NOT the thing the invariant rests on.
 ///
 /// That distinction is the finding: the first version of that test compared 2000 against
 /// a hardcoded 468 in this same file, so it evaluated `2000 >= 1404` forever regardless
@@ -199,7 +201,7 @@ const RETENTION_GENERICS: &[&str] = &["$state", "$derived", "writable", "readabl
 ///
 /// On trip it calls [`warn_skip`] rather than silently returning a truncated field set —
 /// a truncated set under-matches, which is this guard's worst failure shape.
-const MAX_DECL_BLOCK_LINES: usize = 2400;
+const MAX_DECL_BLOCK_LINES: usize = 3000;
 
 // ---------------------------------------------------------------------------
 // Field-name matching — segment equality over the CATEGORY_A partition

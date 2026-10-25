@@ -7,7 +7,7 @@
 // maps the wire types onto these plain shapes at the dispatch boundary.
 //
 // `senderId` is `number | undefined` (proto `optional uint32`, ADR-0036 §2).
-// The roster is intentionally minimal for this story (participantId + name);
+// The roster is intentionally minimal (participantId + name + sender id + client mute);
 // per-slot stream metadata arrives with the receive-capability model (§6).
 
 import { LeaveReason } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
@@ -17,8 +17,15 @@ import type { MediaKindToken, OpenMediaKindToken } from '../media/mediaKind.js';
 
 export { SignalingCodec } from './codecMap.js';
 
-/** A participant in the meeting roster (minimal shape for this story). */
-export interface RosterParticipant {
+/**
+ * A participant in the meeting roster (minimal shape for this story), with the
+ * client mute MC held for them when it built the entry (wire
+ * `Participant.audio_client_muted` / `video_client_muted`; presence rule at
+ * {@link ClientMuteFacts}). It is the SEED of that fact, not a second home: a
+ * consumer applies it to wherever it keeps client mute, and later
+ * `ParticipantMuteEvent`s move it.
+ */
+export interface RosterParticipant extends ClientMuteFacts {
   readonly participantId: string;
   readonly name: string;
   /**
@@ -28,6 +35,23 @@ export interface RosterParticipant {
    * roster entry — presentation only, never attribution.
    */
   readonly senderId?: number | undefined;
+}
+
+/**
+ * CLIENT MUTE OF OTHERS IS A ROSTER FACT (story 3 R-15; ADR-0036 §5 amendment
+ * 2026-10-24, reversing story 2's S-2). MC carries each participant's client
+ * mute, per kind, on two carriers: the roster entry (`RosterParticipant`, from
+ * `JoinResponse.existing_participants` and `ParticipantJoined`) and every
+ * `ParticipantMuteUpdate` (`ParticipantMuteEvent`). Both are wire `optional bool`.
+ *
+ * THE ONE PRESENCE RULE: per kind, the latest PRESENT value is the fact. ABSENT
+ * is "no fact" — it changes nothing, and is never read as `false` (an MC that
+ * has not heard from the participant yet, or a rolled-back MC that predates the
+ * fields, sends it absent). Until a present value arrives the kind is UNKNOWN.
+ */
+export interface ClientMuteFacts {
+  readonly audioClientMuted?: boolean | undefined;
+  readonly videoClientMuted?: boolean | undefined;
 }
 
 /**
@@ -41,16 +65,19 @@ export const MAX_RELAYED_PARTICIPANT_ID_LENGTH = 256;
 /**
  * Payload of `participantMuteChanged` (proto `ParticipantMuteUpdate`).
  *
- * SERVER mute only (ADR-0036 §5, story 2 R-11), PER KIND (story 3 R-15): MC emits
- * this when a participant's server mute changes, and replays it right after the
- * join response for every participant server-muted in EITHER kind, carrying both
- * kinds' flags. So a participant with no update is server-unmuted in both kinds
- * (known, not unknown). The proto's self-mute booleans are deliberately NOT
- * projected: MC sends them as informational snapshots taken at the server-mute
- * change, so they go stale on the next self-mute and are not a self-mute source
- * (the subscriber-visible signal is the slot's `avatar_client_muted`).
+ * ALL FOUR mute facts of one participant, PER KIND (story 3 R-15). MC emits this
+ * on every real change of any of them (server mute, and — since the ADR-0036 §5
+ * amendment 2026-10-24 — the participant's own client mute, to everyone else),
+ * and replays it right after the join response for every participant
+ * server-muted in EITHER kind.
+ *
+ *   * SERVER mute: both kinds always carried, so a participant with no update
+ *     is server-unmuted in both kinds (known, not unknown).
+ *   * CLIENT mute: the {@link ClientMuteFacts} presence rule — absent changes
+ *     nothing. The client-mute fields NEVER touch the server-mute ones: a
+ *     client-mute change cannot clear a server mute.
  */
-export interface ParticipantMuteEvent {
+export interface ParticipantMuteEvent extends ClientMuteFacts {
   readonly participantId: string;
   /** Whether this participant's audio is server-muted (enforced at MH ingress). */
   readonly audioServerMuted: boolean;

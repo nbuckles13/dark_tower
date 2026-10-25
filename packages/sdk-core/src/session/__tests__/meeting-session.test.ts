@@ -2496,25 +2496,103 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     rig.session.disconnect();
   });
 
+  function muteReports(rig: { outbound: () => ReturnType<typeof decodeOutboundClientMessages> }) {
+    return rig
+      .outbound()
+      .filter((m) => m.message.case === 'muteRequest')
+      .map((m) => m.message.value as { audioMuted?: boolean; videoMuted?: boolean })
+      .map((v) => [v.audioMuted, v.videoMuted]);
+  }
+
+  /** Join with `publish`, after `beforeJoin` ran on the not-yet-joined session. */
+  async function joinPublishing(
+    publish: readonly ('audio' | 'video')[],
+    beforeJoin: (session: MeetingSession) => void = () => {},
+  ) {
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks, { publish });
+    beforeJoin(session);
+    const joining = session.join({
+      meetingCode: MEETING_CODE,
+      orgSubdomain: 'acme',
+      credentials: LOGIN,
+    });
+    await driveJoin(mocks, 'all', { participantId: SELF, senderId: 258, meetingKek: KEK });
+    await joining;
+    await settle();
+    const mc = mocks.get(MC_ENDPOINT)!;
+    return { session, outbound: () => decodeOutboundClientMessages(mc.getOutboundBidiWrites(0)) };
+  }
+
+  it('R-15: on entering Joined the session reports EVERY published kind explicitly, one kind per request', async () => {
+    // MC holds no client-mute fact for a joiner until it reports one; `false`
+    // is a fact too. Decoded from the wire, so a dropped `false` would show.
+    const rig = await joinPublishing(['audio', 'video']);
+    expect(muteReports(rig)).toEqual([
+      [false, undefined],
+      [undefined, false],
+    ]);
+    rig.session.disconnect();
+  });
+
+  it('R-15: a kind this participant does NOT publish is never reported (no false "camera: on")', async () => {
+    const rig = await joinPublishing(['audio']);
+    expect(muteReports(rig)).toEqual([[false, undefined]]);
+    rig.session.disconnect();
+  });
+
+  it('R-15: a mute set BEFORE the join reaches MC in the post-join report (never sent before Joined)', async () => {
+    const rig = await joinPublishing(['audio', 'video'], (session) => session.setVideoMuted(true));
+    expect(muteReports(rig)).toEqual([
+      [false, undefined],
+      [undefined, true],
+    ]);
+    rig.session.disconnect();
+  });
+
   it('per-kind client mute: each kind changes alone, and each report names ONLY that kind', async () => {
-    const rig = await joinedRig();
-    await rig.session.startMedia();
+    const rig = await joinPublishing(['audio', 'video']);
     rig.session.setVideoMuted(true);
     rig.session.setAudioMuted(true);
     rig.session.setVideoMuted(false);
     await settle();
     expect(rig.session.muteState).toEqual({ audioMuted: true, videoMuted: false });
-    const reports = rig
-      .outbound()
-      .filter((m) => m.message.case === 'muteRequest')
-      .map((m) => m.message.value as { audioMuted?: boolean; videoMuted?: boolean })
-      .map((v) => [v.audioMuted, v.videoMuted]);
+    // Past the two post-join reports (pinned by their own tests above).
+    const reports = muteReports(rig).slice(2);
     // Decoded from the wire: the unnamed kind is ABSENT (MC: unchanged), never
     // its current value and never an explicit false.
     expect(reports).toEqual([
       [undefined, true],
       [true, undefined],
       [undefined, false],
+    ]);
+    rig.session.disconnect();
+  });
+
+  it('R-15: an audio-only session toggling VIDEO sends no MuteRequest (before media)', async () => {
+    const rig = await joinPublishing(['audio']);
+    const before = muteReports(rig).length;
+    rig.session.setVideoMuted(true);
+    rig.session.setVideoMuted(false);
+    rig.session.setVideoMuted(true);
+    await settle();
+    expect(rig.session.muteState.videoMuted).toBe(true);
+    expect(muteReports(rig)).toHaveLength(before);
+    rig.session.disconnect();
+  });
+
+  it('R-15: a toggle of an UNPUBLISHED kind changes local state but is never reported (pipeline running)', async () => {
+    // Audio-only rig, media started: audio goes through the pipeline's report,
+    // video through the session's — one gate for both.
+    const rig = await joinedRig();
+    await rig.session.startMedia();
+    rig.session.setVideoMuted(true);
+    rig.session.setAudioMuted(true);
+    await settle();
+    expect(rig.session.muteState).toEqual({ audioMuted: true, videoMuted: true });
+    expect(muteReports(rig)).toEqual([
+      [false, undefined], // the post-join report: audio only
+      [true, undefined],
     ]);
     rig.session.disconnect();
   });
@@ -2568,6 +2646,40 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
     rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
     rig.mc.simulateServerMessage(0, muteSelf(false));
+    await settle();
+    expect(rig.resumed).toEqual(['audio']);
+    rig.session.disconnect();
+  });
+
+  it('R-15/R-18: own-copy updates that move only CLIENT mute never fire the notice nor touch capture', async () => {
+    // @security Gate 1: a client-mute fact on THIS participant's own copy is
+    // not a server-mute edge. Server fields unchanged throughout.
+    const rig = await startedSending();
+    const stops = rig.capture.stopCount;
+    const clientOnly = (serverMuted: boolean, clientMuted: boolean) =>
+      framedParticipantMuteUpdate({
+        participantId: SELF,
+        audioServerMuted: serverMuted,
+        audioClientMuted: clientMuted,
+        videoClientMuted: clientMuted,
+      });
+    rig.mc.simulateServerMessage(0, clientOnly(false, true));
+    rig.mc.simulateServerMessage(0, clientOnly(false, false));
+    await settle();
+    expect(rig.resumed).toEqual([]);
+    expect(rig.capture.stopCount).toBe(stops);
+    expect(rig.session.muteState).toEqual({ audioMuted: false, videoMuted: false });
+
+    // While server-muted (latched), client-only copies neither fire nor clear
+    // the latch: the resumed directive still fires exactly one event.
+    rig.mc.simulateServerMessage(0, muteSelf(true));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
+    rig.mc.simulateServerMessage(0, clientOnly(true, true));
+    rig.mc.simulateServerMessage(0, clientOnly(true, false));
+    await settle();
+    expect(rig.resumed).toEqual([]);
+    rig.mc.simulateServerMessage(0, muteSelf(false));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
     await settle();
     expect(rig.resumed).toEqual(['audio']);
     rig.session.disconnect();

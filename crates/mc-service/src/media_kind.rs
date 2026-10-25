@@ -288,8 +288,8 @@ impl ClientMutedKinds {
     /// Client-muted on neither kind.
     pub const NONE: Self = Self([false; 2]);
 
-    /// From the roster's per-kind self-mute flags (`audio_self_muted`,
-    /// `video_self_muted`), laid out by [`MediaKindLabel::index`].
+    /// From per-kind client-mute flags, laid out by [`MediaKindLabel::index`].
+    /// The roster builds this ONLY through [`ClientMuteFacts::effective`].
     #[must_use]
     pub const fn from_client_flags(flags: [bool; 2]) -> Self {
         Self(flags)
@@ -299,6 +299,59 @@ impl ClientMutedKinds {
     #[must_use]
     pub fn is_muted(self, kind: MediaKindLabel) -> bool {
         kind.of(self.0)
+    }
+}
+
+/// What MC KNOWS of a participant's client mute, per kind (story 3 R-15 fix):
+/// `None` until that participant has reported the kind, then its last
+/// reported value. Laid out by [`MediaKindLabel::index`].
+///
+/// Two readers, deliberately different:
+/// - the WIRE carries the facts as they are (`Participant` /
+///   `ParticipantMuteUpdate` `*_client_muted`, set iff `Some`), so a peer shows
+///   "unknown" rather than an unmuted MC never heard;
+/// - MEDIA POLICY (PAUSED disposition, slot state) reads [`Self::effective`],
+///   THE one place an unknown kind is treated as not muted -- which is what MC
+///   has always done before a participant's first report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClientMuteFacts([Option<bool>; 2]);
+
+impl ClientMuteFacts {
+    /// Nothing reported for either kind (a fresh joiner).
+    pub const UNKNOWN: Self = Self([None; 2]);
+
+    /// From per-kind facts laid out by [`MediaKindLabel::index`].
+    #[must_use]
+    pub const fn from_facts(facts: [Option<bool>; 2]) -> Self {
+        Self(facts)
+    }
+
+    /// The per-kind facts, laid out by [`MediaKindLabel::index`] (the shape
+    /// [`MuteChange::apply`] merges against).
+    #[must_use]
+    pub const fn facts(self) -> [Option<bool>; 2] {
+        self.0
+    }
+
+    /// What MC knows of `kind`: `None` = never reported.
+    #[must_use]
+    pub fn get(self, kind: MediaKindLabel) -> Option<bool> {
+        kind.of(self.0)
+    }
+
+    /// The media-policy projection: an unreported kind is not muted. THE ONE
+    /// `unwrap_or(false)` for client mute in MC.
+    #[must_use]
+    pub fn effective(self) -> ClientMutedKinds {
+        ClientMutedKinds::from_client_flags(MediaKindLabel::per_kind(|k| {
+            self.get(k).unwrap_or(false)
+        }))
+    }
+}
+
+impl From<KindDecision<Option<bool>>> for ClientMuteFacts {
+    fn from(decision: KindDecision<Option<bool>>) -> Self {
+        Self(decision.state)
     }
 }
 
@@ -358,17 +411,40 @@ impl MuteChange {
             .filter_map(move |k| self.get(k).map(|muted| (k, muted)))
     }
 
+    /// This request restricted to the kinds `publishes` contains, or `None` if
+    /// it names no published kind. A client-mute fact exists only for a kind
+    /// the participant publishes (story 3 R-15 fix): an unpublished kind is
+    /// ignored, never recorded.
+    #[must_use]
+    pub fn published_only(self, publishes: PublishSet) -> Option<Self> {
+        let kept = MediaKindLabel::per_kind(|k| self.get(k).filter(|_| publishes.publishes(k)));
+        (kept != [None; 2]).then_some(Self(kept))
+    }
+
+    /// The kinds this request NAMES that `publishes` does not contain.
+    pub fn unpublished(self, publishes: PublishSet) -> impl Iterator<Item = MediaKindLabel> {
+        self.named()
+            .map(|(k, _)| k)
+            .filter(move |k| !publishes.publishes(*k))
+    }
+
     /// Merge this request into `current` (per kind, laid out by
     /// [`MediaKindLabel::index`]): a named kind takes its asked-for value, an
     /// unnamed kind keeps its current value. The ONE merge both mute writers
     /// use, so "a request about one kind never changes the other" is a property
     /// of this function.
+    ///
+    /// Generic over the per-kind state: server mute merges into `bool` flags,
+    /// client mute into [`ClientMuteFacts`]' `Option<bool>` facts (where a first
+    /// report `None -> Some(_)` is a change of the FACT -- see
+    /// [`KindDecision::effective_moved`] for the media question).
     #[must_use]
-    pub fn apply(self, current: [bool; 2]) -> KindDecision {
-        let state = MediaKindLabel::per_kind(|k| self.get(k).unwrap_or(k.of(current)));
+    pub fn apply<S: Copy + PartialEq + From<bool>>(self, current: [S; 2]) -> KindDecision<S> {
+        let state = MediaKindLabel::per_kind(|k| self.get(k).map_or(k.of(current), S::from));
         KindDecision {
             changed: MediaKindLabel::per_kind(|k| k.of(state) != k.of(current)),
             state,
+            previous: current,
         }
     }
 }
@@ -381,21 +457,22 @@ impl MuteChange {
 /// Constructible only by [`MuteChange::apply`]; read through kind-keyed
 /// accessors, so no caller can mis-index audio and video.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KindDecision {
+pub struct KindDecision<S = bool> {
     changed: [bool; 2],
-    state: [bool; 2],
+    state: [S; 2],
+    previous: [S; 2],
 }
 
-impl KindDecision {
-    /// Did `kind`'s flag move?
+impl<S: Copy> KindDecision<S> {
+    /// Did `kind`'s state move?
     #[must_use]
     pub fn changed(self, kind: MediaKindLabel) -> bool {
         kind.of(self.changed)
     }
 
-    /// `kind`'s flag after the merge.
+    /// `kind`'s state after the merge.
     #[must_use]
-    pub fn state(self, kind: MediaKindLabel) -> bool {
+    pub fn state(self, kind: MediaKindLabel) -> S {
         kind.of(self.state)
     }
 
@@ -403,6 +480,18 @@ impl KindDecision {
     #[must_use]
     pub fn is_unchanged(self) -> bool {
         !self.changed.contains(&true)
+    }
+}
+
+impl KindDecision<Option<bool>> {
+    /// The MEDIA question on a client-mute decision: did the media-policy
+    /// projection ([`ClientMuteFacts::effective`]) move? A first report of
+    /// `false` changes the fact (so it is not [`Self::is_unchanged`] and the
+    /// fact fans out) but not the projection, so nothing re-renders.
+    #[must_use]
+    pub fn effective_moved(self) -> bool {
+        ClientMuteFacts::from_facts(self.previous).effective()
+            != ClientMuteFacts::from_facts(self.state).effective()
     }
 }
 
@@ -518,6 +607,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Client mute merges into FACTS: a first report (either value) is a fact
+    /// change; only a report that moves the `unwrap_or(false)` projection is a
+    /// media change; a repeat is neither; an unnamed kind stays unknown.
+    #[test]
+    fn a_client_fact_decision_separates_the_wire_question_from_the_media_one() {
+        let unknown = ClientMuteFacts::UNKNOWN.facts();
+        let first_false = MuteChange::parse(Some(false), None).unwrap().apply(unknown);
+        assert!(!first_false.is_unchanged(), "None -> Some(false) fans out");
+        assert!(!first_false.effective_moved(), "...but re-renders nothing");
+        assert_eq!(first_false.state(AU), Some(false));
+        assert_eq!(first_false.state(VI), None, "unnamed kind stays unknown");
+
+        let first_true = MuteChange::parse(None, Some(true)).unwrap().apply(unknown);
+        assert!(!first_true.is_unchanged() && first_true.effective_moved());
+
+        let known = ClientMuteFacts::from(first_true).facts();
+        let repeat = MuteChange::parse(None, Some(true)).unwrap().apply(known);
+        assert!(repeat.is_unchanged() && !repeat.effective_moved());
+        assert_eq!(
+            ClientMuteFacts::from(first_true).effective(),
+            ClientMutedKinds::from_client_flags([false, true])
+        );
+    }
+
+    /// An unpublished kind is dropped from a client-mute request; a published
+    /// kind in the same request survives; a request naming only unpublished
+    /// kinds is nothing.
+    #[test]
+    fn a_change_restricted_to_the_publish_set_drops_only_unpublished_kinds() {
+        let audio_only = PublishSet::of(&[AU]);
+        let mixed = MuteChange::parse(Some(true), Some(true)).unwrap();
+        let kept = mixed.published_only(audio_only).unwrap();
+        assert_eq!((kept.get(AU), kept.get(VI)), (Some(true), None));
+        assert_eq!(mixed.unpublished(audio_only).collect::<Vec<_>>(), vec![VI]);
+        let video_only = MuteChange::parse(None, Some(false)).unwrap();
+        assert_eq!(video_only.published_only(audio_only), None);
+        assert_eq!(
+            video_only.published_only(PublishSet::of(&[AU, VI])),
+            Some(video_only)
+        );
+        assert_eq!(mixed.unpublished(PublishSet::of(&[AU, VI])).count(), 0);
     }
 
     #[test]

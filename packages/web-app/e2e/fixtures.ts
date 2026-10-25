@@ -1746,6 +1746,94 @@ export async function recordedVideoTrackStates(page: Page): Promise<string[]> {
   });
 }
 
+// ============================================================================
+// Story 3 R-15: every client-mute token a roster row ever RENDERED
+// ============================================================================
+
+/** The two roster-row client-mute attributes (`ParticipantRow.svelte`), by kind. ONE home. */
+export const ROSTER_CLIENT_MUTE_ATTRIBUTE = {
+  audio: 'data-client-muted',
+  video: 'data-client-muted-video',
+} as const satisfies Record<MuteKind, string>;
+
+/**
+ * Install a TEST-OWNED recorder on `page` of every client-mute token any roster
+ * row renders, from now on: a MutationObserver over the whole document for
+ * added rows (`childList` — a row is CREATED with its first value already set,
+ * so an attribute-only observer would miss it) and for changes of the two
+ * attributes. It asserts nothing about timing: a spec reads the recorded
+ * sequence and checks that a WRONG value never reached the DOM, which holds or
+ * fails whatever the interleaving. Existing rows are recorded at install.
+ */
+export async function installRosterMuteRecorder(page: Page): Promise<void> {
+  await page.evaluate((attributes) => {
+    type Entry = { row: string; attribute: string; value: string };
+    const log: Entry[] = [];
+    (window as { __e2e_roster_mute__?: Entry[] }).__e2e_roster_mute__ = log;
+    const record = (el: Element): void => {
+      const row = el.getAttribute('data-testid');
+      if (row === null || !row.startsWith('participant-')) return;
+      for (const attribute of attributes) {
+        const value = el.getAttribute(attribute);
+        if (value !== null) log.push({ row, attribute, value });
+      }
+    };
+    const selector = attributes.map((a) => `[${a}]`).join(',');
+    const scan = (root: Element): void => {
+      if (root.matches(selector)) record(root);
+      for (const el of root.querySelectorAll(selector)) record(el);
+    };
+    scan(document.body);
+    new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        if (m.type === 'attributes' && m.target instanceof Element) {
+          const row = m.target.getAttribute('data-testid');
+          const value = m.target.getAttribute(m.attributeName ?? '');
+          if (row !== null && row.startsWith('participant-') && value !== null) {
+            log.push({ row, attribute: m.attributeName ?? '', value });
+          }
+        }
+        for (const node of m.addedNodes) if (node instanceof Element) scan(node);
+      }
+    }).observe(document.body, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeOldValue: true,
+      attributeFilter: attributes,
+    });
+  }, Object.values(ROSTER_CLIENT_MUTE_ATTRIBUTE));
+}
+
+/**
+ * The client-mute tokens `page`'s roster row for `participantId` rendered since
+ * {@link installRosterMuteRecorder}, per kind, consecutive repeats collapsed.
+ * THROWS if the recorder is missing or never saw that row (the positive
+ * control: an empty sequence must not read as "no wrong value").
+ */
+export async function recordedRosterMute(
+  page: Page,
+  participantId: string,
+): Promise<Record<MuteKind, string[]>> {
+  const row = `participant-${participantId}`;
+  const log = await page.evaluate(
+    () =>
+      (window as { __e2e_roster_mute__?: { row: string; attribute: string; value: string }[] })
+        .__e2e_roster_mute__,
+  );
+  if (log === undefined) throw new Error('HARNESS: the roster mute recorder is not installed');
+  const mine = log.filter((e) => e.row === row);
+  if (mine.length === 0) {
+    throw new Error(`RECORDER POSITIVE CONTROL: no roster row ${row} was ever recorded`);
+  }
+  const per = (kind: MuteKind): string[] =>
+    mine
+      .filter((e) => e.attribute === ROSTER_CLIENT_MUTE_ATTRIBUTE[kind])
+      .map((e) => e.value)
+      .filter((v, i, all) => i === 0 || all[i - 1] !== v);
+  return { audio: per('audio'), video: per('video') };
+}
+
 /** The page's current meeting-KEK generation from its own bus (`kekGeneration`), or `undefined`. */
 export async function kekGeneration(page: Page): Promise<number | undefined> {
   const { kekGeneration: event } = await latestBusEventsOf(page, ['kekGeneration']);

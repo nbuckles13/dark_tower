@@ -347,8 +347,9 @@ async fn a_repeated_identical_mute_report_does_no_work() {
     }
     b.expect_no_media().await;
     // One increment per (request, named kind); the interim names both kinds.
-    // Audio: the 4 repeats. Video: the 4 repeats plus the first report, whose
-    // video flag did not move.
+    // Audio: the 4 repeats. Video: A publishes audio only, so every named
+    // video kind (the first report and the 4 repeats) is `not_published`
+    // (story 3 R-15 fix: no client-mute fact for an unpublished kind).
     snap.counter("mc_media_mute_requests_total")
         .with_labels(&[
             ("outcome", "unchanged"),
@@ -358,7 +359,7 @@ async fn a_repeated_identical_mute_report_does_no_work() {
         .assert_delta(4);
     snap.counter("mc_media_mute_requests_total")
         .with_labels(&[
-            ("outcome", "unchanged"),
+            ("outcome", "not_published"),
             ("media_kind", "video"),
             ("key_custody", "operator"),
         ])
@@ -369,10 +370,11 @@ async fn a_repeated_identical_mute_report_does_no_work() {
     assert_eq!(unmuted.assignments[0].slot_state, SlotState::Active as i32);
 }
 
-/// Story 3: a video-only mute by an AUDIO-ONLY publisher changes nothing any
-/// subscriber is told (it publishes no video, so no holder's view and no
-/// disposition moves) — yet it is `applied` (the actor recomposed and found
-/// nothing changed), and an audio mute still re-emits.
+/// Story 3: a video mute by an AUDIO-ONLY publisher changes nothing any
+/// subscriber is told: since the story 3 R-15 fix the connection ignores the
+/// unpublished kind outright (`not_published`: no fact, no fan-out, no
+/// disposition), and an audio mute still re-emits. The first report's audio
+/// `false` is `applied`: MC's first fact for that kind, a media no-op.
 #[tokio::test]
 async fn a_video_only_mute_by_an_audio_only_publisher_re_emits_nothing() {
     let (stack, rig) = start_stack("mcs-mute-video").await;
@@ -403,17 +405,20 @@ async fn a_video_only_mute_by_an_audio_only_publisher_re_emits_nothing() {
             ("key_custody", "operator"),
         ])
     };
-    mute("applied", "video").assert_delta(2);
-    mute("unchanged", "video").assert_delta(1);
-    mute("applied", "audio").assert_delta(1);
-    mute("unchanged", "audio").assert_delta(2);
+    mute("not_published", "video").assert_delta(3);
+    mute("applied", "video").assert_delta(0);
+    mute("unchanged", "video").assert_delta(0);
+    mute("applied", "audio").assert_delta(2);
+    mute("unchanged", "audio").assert_delta(1);
 }
 
 #[tokio::test]
 async fn mute_work_is_rate_limited_and_the_limit_is_not_permanent() {
     // A client alternating `audio_muted` defeats both equality short-circuits,
-    // so each message would otherwise drive a meeting-actor hop and a re-emit
-    // to every holder. The per-connection token bucket bounds it.
+    // so each message would otherwise drive a meeting-actor hop, a re-emit
+    // to every holder and (story 3 R-15 fix) a roster fan-out owed to every
+    // other participant. The per-connection token bucket bounds it per sender;
+    // the per-meeting fan-out bucket bounds the fan-out across senders.
     //
     // The expected counter values are DERIVED from the wire: each applied
     // toggle changes B's view exactly once, so B's received count fixes the
@@ -454,11 +459,13 @@ async fn mute_work_is_rate_limited_and_the_limit_is_not_permanent() {
     mute("applied", "audio").assert_delta(applied);
     let rate_limited = mute("rate_limited", "audio").delta();
     let unchanged = mute("unchanged", "audio").delta();
-    // Request-level outcomes count once per named kind (the interim names both),
-    // so video mirrors audio's `rate_limited`; video's flag never moves, so
-    // every served request is video `unchanged` and none is video `applied`.
-    mute("rate_limited", "video").assert_delta(rate_limited);
-    mute("unchanged", "video").assert_delta(unchanged + applied);
+    // Request-level outcomes count once per named kind (the interim names both).
+    // A publishes audio only, so every named video kind is `not_published`,
+    // decided BEFORE the token (story 3 R-15 fix): video never reaches the
+    // limiter, and no video cell but `not_published` moves.
+    mute("not_published", "video").assert_delta(TOGGLES);
+    mute("rate_limited", "video").assert_delta(0);
+    mute("unchanged", "video").assert_delta(0);
     mute("applied", "video").assert_delta(0);
     assert_eq!(
         rate_limited + unchanged,

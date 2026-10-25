@@ -44,10 +44,19 @@ export interface SlotView {
   readonly render: VideoRenderState | undefined;
 }
 
-/** What a component reads about ONE participant's server mute (story 3 R-15). */
+/**
+ * What a component reads about ONE participant's mute state (story 3 R-15): the
+ * ONE home of all four facts. Server mute is two-state (MC always carries both
+ * kinds). Client mute is TRI-STATE, `undefined` = no fact yet (sdk-core
+ * `ClientMuteFacts`: the latest PRESENT value wins; absent changes nothing).
+ */
 export interface ParticipantMediaView {
   readonly audioServerMuted: boolean;
   readonly videoServerMuted: boolean;
+  /** This participant's own audio client mute, as MC reports it; `undefined` = no fact. */
+  readonly audioClientMuted: boolean | undefined;
+  /** This participant's own video client mute, as MC reports it; `undefined` = no fact. */
+  readonly videoClientMuted: boolean | undefined;
   /** Participant id of whoever applied it, when MC said. Resolve via the roster to render. */
   readonly serverMutedBy: string | undefined;
   /** This participant asked the host to lift their server mute (host clients only). */
@@ -110,10 +119,12 @@ export class SlotCell implements SlotView {
   }
 }
 
-/** One participant's server-mute cells. */
+/** One participant's mute cells (server and client, per kind). */
 export class ParticipantMediaCell implements ParticipantMediaView {
   #audioServerMuted = $state(false);
   #videoServerMuted = $state(false);
+  #audioClientMuted = $state<boolean | undefined>(undefined);
+  #videoClientMuted = $state<boolean | undefined>(undefined);
   #serverMutedBy = $state<string | undefined>(undefined);
   #unmuteRequested = $state(false);
 
@@ -127,6 +138,14 @@ export class ParticipantMediaCell implements ParticipantMediaView {
 
   get serverMutedBy(): string | undefined {
     return this.#serverMutedBy;
+  }
+
+  get audioClientMuted(): boolean | undefined {
+    return this.#audioClientMuted;
+  }
+
+  get videoClientMuted(): boolean | undefined {
+    return this.#videoClientMuted;
   }
 
   get unmuteRequested(): boolean {
@@ -144,6 +163,23 @@ export class ParticipantMediaCell implements ParticipantMediaView {
     if (this.#videoServerMuted !== video) this.#videoServerMuted = video;
     const nextBy = audio || video ? by : undefined;
     if (this.#serverMutedBy !== nextBy) this.#serverMutedBy = nextBy;
+  }
+
+  /**
+   * THE one client-mute write, for every carrier (roster seed and
+   * `ParticipantMuteUpdate`). `undefined` for a kind = absent on the wire = no
+   * change: absence never clears a known fact. Change-only. Never touches
+   * server mute.
+   */
+  setClientMute(audio: boolean | undefined, video: boolean | undefined): void {
+    if (audio !== undefined && this.#audioClientMuted !== audio) this.#audioClientMuted = audio;
+    if (video !== undefined && this.#videoClientMuted !== video) this.#videoClientMuted = video;
+  }
+
+  /** Forget the client-mute facts (the participant left): back to no fact. */
+  clearClientMute(): void {
+    if (this.#audioClientMuted !== undefined) this.#audioClientMuted = undefined;
+    if (this.#videoClientMuted !== undefined) this.#videoClientMuted = undefined;
   }
 
   setUnmuteRequested(requested: boolean): void {
@@ -239,6 +275,8 @@ export const EMPTY_PARTICIPANT: ParticipantMediaView = Object.freeze({
   audioServerMuted: false,
   videoServerMuted: false,
   serverMutedBy: undefined,
+  audioClientMuted: undefined,
+  videoClientMuted: undefined,
   unmuteRequested: false,
 });
 

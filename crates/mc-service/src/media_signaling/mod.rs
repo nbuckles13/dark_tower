@@ -57,7 +57,7 @@
 //!   Applied as `SLOT_VIEW_FLUSH_BATCH` in `actors::meeting_media`, whose doc
 //!   points back here.
 //!
-//! Budgeting mute would freeze `audio_self_muted` on the roster once spent, so
+//! Budgeting mute would freeze a client-mute fact on the roster once spent, so
 //! every other participant would render a live speaker as muted for the rest of
 //! the meeting. A limiter that converts an amplification bound into a
 //! correctness failure is the wrong limiter.
@@ -88,9 +88,9 @@ pub use directive::{
     AUDIO_FRAME_RATE_MIN_HZ, MIN_KEYFRAME_INTERVAL_MS_CEILING, MIN_KEYFRAME_INTERVAL_MS_FLOOR,
 };
 pub use outcome::{
-    CapabilityOutcome, DirectiveOutcome, MediaKindLabel, MuteOutcome, MuteRejection, MuteSurface,
-    RefusalReplySurface, ServerMuteAction, ServerMuteOutcome, SlotViewEmission,
-    UnmuteRequestOutcome, WithdrawalReason,
+    CapabilityOutcome, ClientMuteFanoutOutcome, DirectiveOutcome, MediaKindLabel, MuteOutcome,
+    MuteRejection, MuteSurface, RefusalReplySurface, ServerMuteAction, ServerMuteOutcome,
+    SlotViewEmission, UnmuteRequestOutcome, WithdrawalReason,
 };
 
 /// The configured inputs to client-facing media signalling, as one value.

@@ -20,9 +20,9 @@ use crate::media_routing::{
     divergence_magnitude, FloorAdoption, PolicyPushOutcome, SettleOutcome, Unapplied,
 };
 use crate::media_signaling::{
-    slot_state_label, CapabilityOutcome, DirectiveOutcome, MediaKindLabel, MuteOutcome,
-    MuteRejection, MuteSurface, RefusalReplySurface, ServerMuteAction, ServerMuteOutcome,
-    SlotViewEmission, UnmuteRequestOutcome, WithdrawalReason,
+    slot_state_label, CapabilityOutcome, ClientMuteFanoutOutcome, DirectiveOutcome, MediaKindLabel,
+    MuteOutcome, MuteRejection, MuteSurface, RefusalReplySurface, ServerMuteAction,
+    ServerMuteOutcome, SlotViewEmission, UnmuteRequestOutcome, WithdrawalReason,
 };
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -765,6 +765,32 @@ pub fn record_slot_view_emission(outcome: SlotViewEmission) {
     .increment(1);
 }
 
+/// Record one step of the client-mute roster fan-out (story 3 R-15 fix).
+///
+/// Metric: `mc_media_client_mute_fanouts_total`
+/// Labels: `outcome`, `key_custody`
+/// Cardinality: bounded by `ClientMuteFanoutOutcome::ALL`
+///
+/// The visible edge of the meeting actor's PER-MEETING client-mute fan-out
+/// bound. One increment per SUBJECT event, never per recipient; does NOT
+/// partition transitions (see [`ClientMuteFanoutOutcome`]). Both outcomes are
+/// success -- no failure predicate, no alert. KIND-FREE: one fan-out carries all
+/// four controls.
+///
+/// `count` subject events at once (a flush counts every still-pending subject
+/// in one call); 0 records nothing.
+pub fn record_client_mute_fanout(outcome: ClientMuteFanoutOutcome, count: u64) {
+    if count == 0 {
+        return;
+    }
+    counter!(
+        "mc_media_client_mute_fanouts_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(count);
+}
+
 /// Record the unreachable senders named in one emitted `StreamAssignments`.
 ///
 /// Metric: `mc_media_unreachable_senders_total`
@@ -1125,10 +1151,11 @@ pub fn set_video_keyframe_min_interval(min_keyframe_interval_ms: u32) {
 /// Answers *"is client mute being applied, and when it is not, why?"*, and it is
 /// the only visibility into the mute-work rate limiter. Mute is the one
 /// repeatable client-driven path that puts work on the SHARED meeting actor's
-/// mailbox — one `GetState` roster snapshot per composition — so `rate_limited`
-/// is the series that says a connection is driving mute recomposition hard
-/// enough to be clamped. That cost is dominated by the PER-CONNECTION
-/// composition; see the note below on why this is not a meeting-wide signal.
+/// mailbox — an actor hop, a roster fan-out owed to every other participant,
+/// and a slot-view re-emit to the source's holders — so `rate_limited` is the
+/// series that says a connection is driving mute work hard enough to be
+/// clamped, per connection; the note below describes the meeting-wide cost
+/// and where its bound is visible.
 ///
 /// The success set is `{applied}` (the unreachable `applied_no_recompose` was
 /// removed). **`unchanged` is not a failure** — this kind did not move,
@@ -1144,12 +1171,25 @@ pub fn set_video_keyframe_min_interval(min_keyframe_interval_ms: u32) {
 /// human rates, which is a client defect or an abusive peer, and it is bounded
 /// to that connection either way.
 ///
-/// **It is NOT a meeting-wide contention signal.** It was documented as one
-/// while `handle_self_mute` still drove an O(N) awaited `broadcast_update`;
-/// security's S-2 removed that fan-out on the judgment that no consumer needed it, so what
-/// remains on the SHARED meeting actor is one `GetState` roster snapshot per
-/// composition — a queue slot, not head-of-line blocking. Do not route a
-/// meeting-wide latency investigation here.
+/// **`applied` means MC recorded a changed client-mute FACT for that kind**,
+/// a participant's first report included (story 3 R-15 fix: `None ->
+/// Some(false)` is applied and fans out to peers, though it moves no media).
+/// **Counting-unit shift, not a traffic change (2026-10-24):** the SDK reports
+/// every kind it publishes once after each join, so `applied` gains one per
+/// published kind per join with no human toggle -- it rises with join churn.
+/// Compare against last week accordingly.
+///
+/// **An applied client mute IS meeting-wide work again** (story 3 R-15 fix,
+/// 2026-10-24, reversing security S-2's 2026-09-03 removal of the fan-out):
+/// every applied report owes a full-snapshot roster fan-out to the other
+/// N-1 participants, AWAITED sends on the shared meeting actor. That fan-out
+/// is bounded PER CONNECTION by the mute-work bucket and PER MEETING by the
+/// client-mute fan-out bucket (`actors::client_mute_fanout`), whose edge is
+/// `mc_media_client_mute_fanouts_total{outcome="awaiting_token"}`. Under churn
+/// the bound DELAYS facts and never drops one (per-recipient delivery loss is
+/// `payload_kind="participant_update_muted"`, stale until the subject's next
+/// change); read that series, not this one,
+/// for "mute indicators are slow in a big meeting".
 pub fn record_mute_request(kind: MediaKindLabel, outcome: MuteOutcome) {
     counter!(
         "mc_media_mute_requests_total",
@@ -2259,6 +2299,9 @@ pub fn zero_initialize_counters() {
     for o in SlotViewEmission::ALL {
         counter!("mc_media_slot_view_emissions_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
+    for o in ClientMuteFanoutOutcome::ALL {
+        counter!("mc_media_client_mute_fanouts_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
     for k in MediaKindLabel::ALL {
         for s in SLOT_STATES {
             counter!("mc_media_slot_states_total", "slot_state" => slot_state_label(*s), MEDIA_KIND_LABEL => k.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
@@ -3258,6 +3301,25 @@ mod tests {
                     (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
                 ])
                 .assert_delta(1);
+        }
+    }
+
+    /// `mc_media_client_mute_fanouts_total` — each outcome lands on its own
+    /// cell and no other.
+    #[test]
+    fn record_client_mute_fanout_counts_each_outcome_on_its_own_cell() {
+        for outcome in ClientMuteFanoutOutcome::ALL {
+            let snap = MetricAssertion::snapshot();
+            record_client_mute_fanout(outcome, 3);
+            record_client_mute_fanout(outcome, 0);
+            for other in ClientMuteFanoutOutcome::ALL {
+                snap.counter("mc_media_client_mute_fanouts_total")
+                    .with_labels(&[
+                        ("outcome", other.label()),
+                        (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                    ])
+                    .assert_delta(if other == outcome { 3 } else { 0 });
+            }
         }
     }
 

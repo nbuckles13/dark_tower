@@ -426,15 +426,43 @@ The camera-light checks below read `self-camera-state` and the bus `sendTracks.c
       client-media *Video From Server-Muted Senders (ALERTED)* and mh-media *Ingress Drops by
       Reason* (`server_muted`). The normal shape is flat drops near zero, because the directive is
       withdrawn.
+- [ ] **4i Client mute of a participant OUTSIDE your slots (R-15, the 2026-10-24 repro).** Lift every
+      server mute from 4c–4f first. **E joins as the fifth participant** (both kinds; same N=3,
+      M=3), so A's three audio and three video slots already hold B, C and D, and E is in **none of
+      A's slots**. Confirm that at A from the bus: in
+      `ev.filter(e => e.type === 'slotAssignments').at(-1).assignments`, no entry's `senderId` is
+      E's (E's own `joined` event gives it), and E has no tile at A.
+  - [ ] **Before any toggle**, A's roster row for E reads **"mic: on"** and **"camera: on"**
+        (`participant-<E>` has `data-client-muted="false"` and `data-client-muted-video="false"`).
+        **Never "mic: unknown" / "camera: unknown"**, which was the 2026-10-24 defect. At most a
+        brief "unknown" right as E appears.
+  - [ ] E clicks **Mute**: A's row for E reads "mic: muted by them". E unmutes: "mic: on".
+  - [ ] E clicks **Turn camera off**: A's row for E reads "camera: off by them". E turns it back on:
+        "camera: on".
+  - [ ] Each toggle shows the same way at **B, C and D** too, whether or not E is in their slots.
+  - [ ] **Joining with a mute already on.** E turns its camera off, then **F** (a sixth profile,
+        or a leaver's) joins: F's row for E reads "camera: off by them" at once, from the join
+        roster.
+  - [ ] **Server mute still wins where it decides what is seen.** A server-mutes E's microphone:
+        A's row for E shows "mic: muted by host" **beside** E's own "mic: on" (both facts, not
+        "unknown"). Lift it again.
+  - [ ] E (and F) leave before Phase 5, which uses the four-member cohort.
 - [ ] **A request about one kind never changes the other.** Across 4a–4f, the other kind's
       indicator and media never moved. Note any exception.
 - [ ] mc-media *Client Mute Requests by Kind and Outcome*, *Server Mute Requests by Kind*, *Unmute
-      Requests* and *Server-Muted Sources* moved as above.
+      Requests* and *Server-Muted Sources* moved as above. *Client Mute Fan-outs* shows
+      `fanned_out` rising with each 4i toggle and `awaiting_token` flat at zero: hand toggles never
+      reach the per-meeting bound.
 
 Automated equivalents:
 
 - Client mute: `packages/web-app/e2e/client-mute-video.spec.ts`, "video mute ends the camera and
   shows avatar_client_muted; audio mute keeps the mic open and video flowing".
+- Client mute outside the observer's slots (4i): `packages/web-app/e2e/client-mute-roster.spec.ts`,
+  "the observer sees every client-mute fact from the roster, never from slots"; derivation
+  `packages/web-app/src/__tests__/participantState.test.ts` ("NO slot fallback …"); presence on
+  the wire `packages/sdk-core/src/signaling/__tests__/mediaSignaling.test.ts` ("client mute of
+  others from the wire, presence preserved").
 - Server mute and the notice: `packages/web-app/e2e/server-mute-video.spec.ts`, "server video mute
   ends the camera everywhere; unmute resumes with a non-suppressible notice; client mute composes".
   It covers 4d–4f, including Escape, click-outside and a re-render.
@@ -836,7 +864,7 @@ bounds, not objectives**. Do not read them as targets. The first 24 hours after 
 | 1 See and hear by content | `multi-party-see.spec.ts` (3 layers + tone, oracle-predicted) | Seeing the tiles; rendered names and pairing |
 | 2 Publish mixes, refusal | `publish-mixes.spec.ts`, `27_mc_slot_placement.rs` | Rendered avatars and refusal copy |
 | 3 Truncation / under-fill | `video-over-subscription.spec.ts`; under-fill via the oracle; `inMeeting.test.ts` / `slotState.test.ts` (distinct state copy) | **The under-fill copy is asserted by no test** (candidate) |
-| 4 Four mutes, notice, non-host | `client-mute-video.spec.ts`, `server-mute-video.spec.ts`, `server-mute.spec.ts` (audio non-host), `35_…`, `37_…` | Rendered indicators; **a video-kind non-host browser refusal** (candidate) |
+| 4 Four mutes, notice, non-host | `client-mute-video.spec.ts`, `client-mute-roster.spec.ts` (4i), `server-mute-video.spec.ts`, `server-mute.spec.ts` (audio non-host), `35_…`, `37_…` | Rendered indicators; **a video-kind non-host browser refusal** (candidate) |
 | 5 Watched-only | `watched-only-video.spec.ts` | The physical light (Phase 10) |
 | 6 Rotation, late joiner | `kek-rotation-video.spec.ts`, `late-joiner-video.spec.ts`, `videoReceiver.test.ts` | "No visible stall"; a clean first picture by eye |
 | 7 Camera revoked | Unit and component only | **No browser equivalent** (candidate: a spec that stops the camera track mid-call via `forceCameraCapture` and asserts `avatar_client_muted` at peers) |

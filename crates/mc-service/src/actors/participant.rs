@@ -548,8 +548,9 @@ impl ParticipantActor {
 
     /// Handle a participant state update.
     ///
-    /// `ParticipantJoined`, `ParticipantLeft` and — as of story 2 task 12 — the
-    /// SERVER-mute `ParticipantMuteUpdate` are serialized to the wire (see
+    /// `ParticipantJoined`, `ParticipantLeft` and `ParticipantMuteUpdate` (server
+    /// mute since story 2 task 12; client mute too since the story 3 R-15 fix)
+    /// are serialized to the wire (see
     /// `webtransport::handler::encode_participant_update`, the one encoder).
     /// `Disconnected` and `Reconnected` are logged only.
     async fn handle_update(&mut self, update: ParticipantStateUpdate) {
@@ -714,6 +715,7 @@ impl ParticipantActor {
 mod tests {
     use super::*;
     use crate::actors::messages::MhState;
+    use crate::media_kind::ClientMuteFacts;
     use common::observability::testing::MetricAssertion;
 
     /// A bare actor wired to a stream channel of exactly `capacity`, so a test
@@ -1197,8 +1199,7 @@ mod tests {
             participant_id: "part-new".to_string(),
             user_id: "user-new".to_string(),
             display_name: "New User".to_string(),
-            audio_self_muted: false,
-            video_self_muted: false,
+            client_muted: ClientMuteFacts::UNKNOWN,
             audio_server_muted: false,
             video_server_muted: false,
             status: super::super::messages::ParticipantStatus::Connected,
@@ -1252,8 +1253,7 @@ mod tests {
         // who-muted-whom has no other carrier.
         let update = ParticipantStateUpdate::MuteChanged {
             participant_id: "part-other".to_string(),
-            audio_self_muted: false,
-            video_self_muted: false,
+            client_muted: ClientMuteFacts::UNKNOWN,
             audio_server_muted: true,
             video_server_muted: false,
             server_muted_by: "host-1".to_string(),

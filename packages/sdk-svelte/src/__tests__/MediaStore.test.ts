@@ -17,6 +17,7 @@ import { MeetingSessionState } from '@darktower/sdk-core';
 import type { StreamAssignmentEvent, VideoReceiveView, VideoSink } from '@darktower/sdk-core';
 import type { TileSurface } from '../components/VideoTile.svelte';
 import { MediaStore } from '../stores/MediaStore.svelte.js';
+import { MeetingStore } from '../stores/MeetingStore.svelte.js';
 import BoundHarness from './helpers/BoundHarness.svelte';
 import GranularityHarness from './helpers/GranularityHarness.svelte';
 import CellGranularityHarness from './helpers/CellGranularityHarness.svelte';
@@ -318,6 +319,94 @@ test('server mutes come ONLY from participantMuteChanged, per participant and pe
   expect(store.participant('b').serverMutedBy).toBeUndefined();
 });
 
+test('client mute of others (R-15): roster seeds, updates move, ABSENT never changes a fact', () => {
+  const store = new MeetingStore();
+  // No fact yet: unknown, never a coerced false.
+  expect(store.media.participant('m').audioClientMuted).toBeUndefined();
+  store.applyJoined({
+    participantId: 'self',
+    existingParticipants: [
+      { participantId: 'm', name: 'M', audioClientMuted: true, videoClientMuted: false },
+      { participantId: 'f', name: 'F' },
+    ],
+    mediaServers: [],
+    correlationId: '',
+    bindingToken: '',
+  });
+  expect(store.media.participant('m').audioClientMuted).toBe(true);
+  expect(store.media.participant('m').videoClientMuted).toBe(false);
+  // Absent on the roster: still no fact.
+  expect(store.media.participant('f').audioClientMuted).toBeUndefined();
+  expect(store.media.participant('f').videoClientMuted).toBeUndefined();
+
+  // A ParticipantJoined with both absent: unknown, then the joiner's report.
+  store.applyParticipantJoined({ participant: { participantId: 'j', name: 'J' } });
+  expect(store.media.participant('j').audioClientMuted).toBeUndefined();
+  store.media.applyParticipantMute({
+    participantId: 'j',
+    audioServerMuted: false,
+    videoServerMuted: false,
+    audioClientMuted: true,
+    videoClientMuted: false,
+  });
+  expect(store.media.participant('j').audioClientMuted).toBe(true);
+  expect(store.media.participant('j').videoClientMuted).toBe(false);
+
+  // An update with the client fields ABSENT (e.g. a rolled-back MC's server
+  // mute) leaves the known facts exactly as they were.
+  store.media.applyParticipantMute({
+    participantId: 'm',
+    audioServerMuted: true,
+    videoServerMuted: false,
+    serverMutedBy: 'h',
+  });
+  expect(store.media.participant('m').audioClientMuted).toBe(true);
+  expect(store.media.participant('m').videoClientMuted).toBe(false);
+  // Per kind: moving video leaves audio alone.
+  store.media.applyParticipantMute({
+    participantId: 'm',
+    audioServerMuted: true,
+    videoServerMuted: false,
+    serverMutedBy: 'h',
+    videoClientMuted: true,
+  });
+  expect(store.media.participant('m').audioClientMuted).toBe(true);
+  expect(store.media.participant('m').videoClientMuted).toBe(true);
+});
+
+test('a client-mute change can NEVER clear a server mute (R-15, server mute wins)', () => {
+  const store = new MediaStore();
+  store.applyParticipantMute({
+    participantId: 'b',
+    audioServerMuted: true,
+    videoServerMuted: true,
+    serverMutedBy: 'h',
+    audioClientMuted: false,
+  });
+  // A roster seed is client-only by type; it cannot reach the server cells.
+  store.applyRosterEntry({ participantId: 'b', audioClientMuted: true, videoClientMuted: true });
+  expect(store.participant('b')).toMatchObject({
+    audioServerMuted: true,
+    videoServerMuted: true,
+    serverMutedBy: 'h',
+    audioClientMuted: true,
+    videoClientMuted: true,
+  });
+});
+
+test('a participant who LEAVES has their client-mute facts forgotten; a rejoin starts unknown', () => {
+  const store = new MeetingStore();
+  store.applyParticipantJoined({
+    participant: { participantId: 'r', name: 'R', audioClientMuted: true, videoClientMuted: true },
+  });
+  expect(store.media.participant('r').audioClientMuted).toBe(true);
+  store.applyParticipantLeft({ participantId: 'r', reason: 'voluntary' });
+  expect(store.media.participant('r').audioClientMuted).toBeUndefined();
+  expect(store.media.participant('r').videoClientMuted).toBeUndefined();
+  store.applyParticipantJoined({ participant: { participantId: 'r', name: 'R' } });
+  expect(store.media.participant('r').audioClientMuted).toBeUndefined();
+});
+
 test('an unmute request is held only while the requester IS server-muted, and clears on lift', () => {
   const store = new MediaStore();
   // A relay for someone not server-muted is not a pending request.
@@ -483,6 +572,20 @@ test('a slot state change recomputes ONLY that tile; a mute change ONLY that par
   expect(counts.tile3).toBe(muteBase.tile3);
   expect(counts.tile4).toBe(muteBase.tile4);
   expect(counts.rowX).toBeGreaterThan(muteBase.rowX); // positive control
+
+  // A CLIENT-mute fact (story 3 R-15) is the same per-participant cell: only
+  // that participant's row.
+  const clientBase = { ...counts };
+  session.fire('participantMuteChanged', {
+    participantId: 'y',
+    audioServerMuted: false,
+    videoServerMuted: false,
+    audioClientMuted: true,
+  });
+  await expect.element(screen.getByTestId('row-y')).toHaveTextContent('client-audio:true');
+  expect(counts.rowX).toBe(clientBase.rowX);
+  expect(counts.tile3).toBe(clientBase.tile3);
+  expect(counts.rowY).toBeGreaterThan(clientBase.rowY); // positive control
 
   // A render transition is a slot change too: only that tile.
   const renderBase = { ...counts };

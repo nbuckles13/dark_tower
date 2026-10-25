@@ -4,7 +4,9 @@
   // Everything here is a wire fact rendered, never an inference from silence:
   // reachability from `unreachable_sender_ids`, server mute PER KIND (and who
   // applied it) from `ParticipantMuteUpdate`, client mute per kind from the
-  // participant's own slot of that kind. The `data-*` attributes carry the TOKENS
+  // participant's roster mute facts (their roster entry, moved by every later
+  // `ParticipantMuteUpdate`) — never from slots, so a participant none of our
+  // slots shows still has a known client mute. The `data-*` attributes carry the TOKENS
   // a test asserts on; the text comes from `lib/participantState.ts`.
   //
   // It reads only THIS participant's store cells (`mediaFactsFor`), so another

@@ -1976,7 +1976,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Client MuteRequest dispositions (ADR-0036 \u00a75). COUNTING UNIT: one increment per (request, NAMED kind) - a per-kind field ABSENT on the wire means unchanged and is not counted, and the SDK names only the kind it changes. TWO COUNTING-UNIT CHANGES, NEITHER A TRAFFIC CHANGE: rates roughly doubled at story 3 OBS-A (an interim that counted both kinds on every request) and roughly HALVED again at MC-B (2026-10-23) - compare against last week accordingly. A request naming NO kind is not counted here (Mute Requests Rejected). It PARTITIONS (report, named kind) pairs. A moved flag of EITHER kind is applied (the actor flips the stream's disposition FORWARD <-> PAUSED and re-emits), so a camera button lands on media_kind=\"video\" applied. Split by media_kind. CLIENT mute only: server mute is its own panel and must never be summed with this one (label-taxonomy.md, the action contract). THE SUCCESS SET IS {applied} (applied_no_recompose, unreachable since MC-A, was removed by MC-B) - the failure predicate is outcome=~\"rate_limited|actor_unavailable\", NOT outcome!=\"applied\", which would count a routine state as a failure. GREEN applied: this kind's flag moved and the meeting actor re-emits the changed slot view to the subscribers HOLDING this source; a failed re-emit is counted by the actor on Send Directives and on Slot View Emissions outcome=composition_failed. BLUE unchanged: THIS NAMED KIND's state did not move - either the identical repeat (no actor hop) or a named kind the actor found already in that state - not a failure. USE applied AS ANY RATIO DENOMINATOR, NOT unchanged: the no-op short-circuit runs before any actor hop, roster read or recomposition, so unchanged is client-inflatable at line rate, and a fraction-applied ratio computed over it is a number one participant can drive to zero. unchanged is exempt from the limiter on purpose - reversing that ordering would let a client spamming a steady state drain its own bucket on no-ops and suppress its next genuine toggle. ORANGE rate_limited is the visible edge of the mute-work token bucket (per connection; burst MUTE_WORK_BURST, one token refilled per MUTE_WORK_REFILL_INTERVAL_MS - both in crates/mc-service/src/webtransport/connection.rs, cited rather than restated). Client mute is the only repeatable client-driven path that puts work on the SHARED meeting actor's mailbox - one actor hop plus a re-emit to the source's holders, which the actor bounds per meeting per turn (Slot View Emissions outcome=deferred), and its MH re-pushes are latest-wins per handler (one in flight, one pending). This is NOT a meeting-wide contention signal; do not route a meeting-wide latency investigation to this panel. A HUMAN NEVER REACHES THIS LIMITER, so a sustained non-zero rate means one connection is toggling far above human rates - a client-side repeat loop first, an abusive peer second - and it is bounded to that connection either way. It is a rate limit and NOT a budget on purpose: a budget would permanently freeze that participant's self-mute once spent. A dropped report never lets media out (\u00a75 enforces client mute at CAPTURE), but it leaves MC's view of that kind stale (PAUSED/avatar) until the participant's next report of the SAME kind. RED actor_unavailable is environmental and terminal. No meeting identifier, participant id, slot id or sender id appears as a label.",
+      "description": "Client MuteRequest dispositions (ADR-0036 \u00a75). COUNTING UNIT: one increment per (request, NAMED kind) - a per-kind field ABSENT on the wire means unchanged and is not counted, and the SDK names only the kind it changes. THREE COUNTING-UNIT CHANGES, NONE A TRAFFIC CHANGE: rates roughly doubled at story 3 OBS-A (an interim that counted both kinds on every request), roughly HALVED again at MC-B (2026-10-23), and since the story 3 R-15 fix (2026-10-24) every join adds one applied per PUBLISHED kind (the SDK's post-join report; a first report is a fact change), so applied rises with join rate, not only toggling - compare against last week accordingly. A request naming NO kind is not counted here (Mute Requests Rejected). It PARTITIONS (report, named kind) pairs. A changed client-mute FACT of EITHER kind is applied - since the story 3 R-15 fix (2026-10-24) a participant's FIRST report of a kind is a fact change even when false (MC holds no fact until reported; peers show unknown until then), so it is applied and fans out to the roster though it moves no media; a fact that moves the muted projection also flips the stream's disposition FORWARD <-> PAUSED and re-emits. A camera button lands on media_kind=\"video\" applied. Split by media_kind. CLIENT mute only: server mute is its own panel and must never be summed with this one (label-taxonomy.md, the action contract). THE SUCCESS SET IS {applied} (applied_no_recompose, unreachable since MC-A, was removed by MC-B) - the failure predicate is outcome=~\"rate_limited|actor_unavailable\", NOT outcome!=\"applied\", which would count a routine state as a failure. GREEN applied: this kind's fact changed; the meeting actor owes every OTHER participant a roster fan-out (Client Mute Fan-outs, per-meeting bound) and, when the projection moved, re-emits the changed slot view to the subscribers HOLDING this source; a failed re-emit is counted by the actor on Send Directives and on Slot View Emissions outcome=composition_failed. BLUE unchanged: THIS NAMED KIND's state did not move - either the identical repeat (no actor hop) or a named kind the actor found already in that state - not a failure. USE applied AS ANY RATIO DENOMINATOR, NOT unchanged: the no-op short-circuit runs before any actor hop, roster read or recomposition, so unchanged is client-inflatable at line rate, and a fraction-applied ratio computed over it is a number one participant can drive to zero. unchanged is exempt from the limiter on purpose - reversing that ordering would let a client spamming a steady state drain its own bucket on no-ops and suppress its next genuine toggle. ORANGE rate_limited is the visible edge of the mute-work token bucket (per connection; burst MUTE_WORK_BURST, one token refilled per MUTE_WORK_REFILL_INTERVAL_MS - both in crates/mc-service/src/webtransport/connection.rs, cited rather than restated). Client mute is the only repeatable client-driven path that puts work on the SHARED meeting actor's mailbox - one actor hop, a roster fan-out owed to the other N-1 participants (AWAITED sends; story 3 R-15 fix, 2026-10-24, reversing story-2 security S-2's removal of that fan-out), and a re-emit to the source's holders, which the actor bounds per meeting per turn (Slot View Emissions outcome=deferred); its MH re-pushes are latest-wins per handler (one in flight, one pending). THIS BUCKET BOUNDS EACH SENDER, NOT THE MEETING: N connections each within their own bucket are not bounded here. The meeting-wide bound on the roster fan-out is the per-meeting fan-out bucket (CLIENT_MUTE_FANOUT_BURST, CLIENT_MUTE_FANOUT_REFILL_INTERVAL_MS - crates/mc-service/src/actors/client_mute_fanout.rs), whose edge is Client Mute Fan-outs outcome=awaiting_token; under churn the bound DELAYS facts and never drops one (per-recipient delivery loss is Dropped Outbound Messages payload_kind=participant_update_muted, stale until the subject's next change). For 'mute indicators are slow in a big meeting', read that panel, not this one. A HUMAN NEVER REACHES THIS LIMITER, so a sustained non-zero rate means one connection is toggling far above human rates - a client-side repeat loop first, an abusive peer second - and it is bounded to that connection either way. It is a rate limit and NOT a budget on purpose: a budget would permanently freeze that participant's client-mute fact once spent. A dropped report never lets media out (\u00a75 enforces client mute at CAPTURE), but it leaves MC's view of that kind stale (PAUSED/avatar, and the client-mute indicator EVERY other participant sees) until the participant's next report of the SAME kind. RED actor_unavailable is environmental and terminal. GREY not_published (story 3 R-15 fix) is EXPECTED ZERO: the request named a kind this participant does not publish; MC ignored that kind (no fact, no fan-out, no reply) and a published kind in the same request still applied. Not a failure (the predicate above excludes it), decided before the token and any actor hop, so never a denominator; a stock SDK produces none, so non-zero means a modified client or an SDK regression. No meeting identifier, participant id, slot id or sender id appears as a label.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2080,6 +2080,21 @@
                 "id": "color",
                 "value": {
                   "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "not_published"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#8e8e8e",
                   "mode": "fixed"
                 }
               }
@@ -2405,12 +2420,136 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mc_media_client_mute_fanouts_total: the visible edge of the meeting actor's PER-MEETING bound on the client-mute ROSTER fan-out (story 3 R-15 fix, 2026-10-24; ADR-0036 \u00a75 amendment of that date). Every applied client-mute report owes the other participants a full ParticipantMuteUpdate snapshot; the per-meeting bucket (CLIENT_MUTE_FANOUT_BURST at once, one more per CLIENT_MUTE_FANOUT_REFILL_INTERVAL_MS - crates/mc-service/src/actors/client_mute_fanout.rs) paces those fan-outs FIFO, latest-state-wins. COUNTING UNIT: one increment per SUBJECT event, NEVER per recipient - do not compare against N-1-scaled delivery counts. GREEN fanned_out (a solo participant's included, zero recipients): one subject's snapshot was COMPOSED and handed to the awaited sends to every other participant present - composed, NOT delivered (per-recipient wire loss is Dropped Outbound Messages payload_kind=participant_update_muted). YELLOW awaiting_token: one subject still pending at the end of a flush. IT DOES NOT PARTITION TRANSITIONS: it counts pending-subject-flushes - a subject waiting across k flushes counts awaiting_token k times, then fanned_out once (or nothing more if it left the meeting or a server-mute update already carried its state), and a subject toggled many times while pending is fanned out once with its latest state - so awaiting_token/fanned_out is NOT the fraction of toggles delayed. Both outcomes are success: no failure predicate, no alert. Sustained awaiting_token means the bound is DELAYING facts - peers' mute indicators LAG; the bound never drops a fact (per-recipient delivery loss is participant_update_muted, not this panel). Usage: 'mute indicators are slow in a big meeting' - non-zero awaiting_token confirms the per-meeting bound is pacing; zero rules it out (check participant_update_muted drops next). Kind-free (one fan-out carries all four controls). No meeting, participant or sender identity appears as a label. Zero is healthy for awaiting_token: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero - it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "fanned_out"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "awaiting_token"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "yellow",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 91
+      },
+      "id": 196,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (increase(mc_media_client_mute_fanouts_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Client Mute Fan-outs",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 91
+        "y": 99
       },
       "id": 194,
       "panels": [],
@@ -2476,7 +2615,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 92
+        "y": 100
       },
       "id": 188,
       "options": {
@@ -2539,7 +2678,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 92
+        "y": 100
       },
       "id": 189,
       "options": {
@@ -2632,7 +2771,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 100
+        "y": 108
       },
       "id": 195,
       "options": {
@@ -2672,7 +2811,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 108
+        "y": 116
       },
       "id": 163,
       "panels": [],
@@ -2799,7 +2938,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 109
+        "y": 117
       },
       "id": 164,
       "options": {
@@ -2923,7 +3062,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 109
+        "y": 117
       },
       "id": 165,
       "options": {
@@ -3016,7 +3155,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 117
+        "y": 125
       },
       "id": 166,
       "options": {
@@ -3109,7 +3248,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 117
+        "y": 125
       },
       "id": 167,
       "options": {
@@ -3233,7 +3372,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 125
+        "y": 133
       },
       "id": 168,
       "options": {
@@ -3326,7 +3465,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 125
+        "y": 133
       },
       "id": 169,
       "options": {
@@ -3389,7 +3528,7 @@
         "h": 4,
         "w": 12,
         "x": 0,
-        "y": 133
+        "y": 141
       },
       "id": 170,
       "options": {
@@ -3429,7 +3568,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 137
+        "y": 145
       },
       "id": 171,
       "panels": [],
@@ -3495,7 +3634,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 138
+        "y": 146
       },
       "id": 172,
       "options": {
@@ -3610,7 +3749,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 138
+        "y": 146
       },
       "id": 173,
       "options": {
@@ -3703,7 +3842,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 146
+        "y": 154
       },
       "id": 174,
       "options": {
@@ -3818,7 +3957,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 146
+        "y": 154
       },
       "id": 175,
       "options": {
@@ -3922,7 +4061,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 154
+        "y": 162
       },
       "id": 176,
       "options": {
@@ -3985,7 +4124,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 154
+        "y": 162
       },
       "id": 177,
       "options": {

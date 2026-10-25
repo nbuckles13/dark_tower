@@ -66,6 +66,7 @@ import {
 import type {
   ClientMessage,
   ErrorMessage,
+  Participant,
   ServerMessage,
 } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 
@@ -79,8 +80,10 @@ import { mediaKindToken, slotStateToken, wireMediaKind } from './slotStateMap.js
 import { singleKindMuteFields } from './muteRequest.js';
 import type { MediaKindToken } from '../media/mediaKind.js';
 import type {
+  ClientMuteFacts,
   ParticipantMuteEvent,
   PublishKind,
+  RosterParticipant,
   UnmuteRequestedEvent,
   ReceiveSlotDeclaration,
   RosterKeySink,
@@ -200,6 +203,32 @@ export interface SignalingEventMap {
 /** Bound an MC-relayed id; an empty string reads as absent. */
 function relayedId(raw: string): string | undefined {
   return raw === '' ? undefined : raw.slice(0, MAX_RELAYED_PARTICIPANT_ID_LENGTH);
+}
+
+/**
+ * The wire's client-mute pair, presence preserved (`optional bool` -> `boolean |
+ * undefined`; absent is "no fact", never coerced to `false` — `ClientMuteFacts`).
+ * ONE projection for both carriers, the roster entry and `ParticipantMuteUpdate`.
+ */
+function clientMuteFactsOf(wire: {
+  readonly audioClientMuted?: boolean | undefined;
+  readonly videoClientMuted?: boolean | undefined;
+}): ClientMuteFacts {
+  return {
+    ...(wire.audioClientMuted !== undefined ? { audioClientMuted: wire.audioClientMuted } : {}),
+    ...(wire.videoClientMuted !== undefined ? { videoClientMuted: wire.videoClientMuted } : {}),
+  };
+}
+
+/** ONE wire -> public roster entry map, for `JoinResponse` and `ParticipantJoined` alike. */
+function rosterParticipantOf(p: Participant): RosterParticipant {
+  return {
+    participantId: p.participantId,
+    name: p.name,
+    // `optional uint32` -> `number | undefined`; never coerced to 0.
+    senderId: p.senderId,
+    ...clientMuteFactsOf(p),
+  };
 }
 
 interface Deferred<T> {
@@ -621,11 +650,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           // stays 0 (legal; video 0 is the video-off lever).
           maxAudioReceiveSlots: jr.maxAudioReceiveSlots,
           maxVideoReceiveSlots: jr.maxVideoReceiveSlots,
-          existingParticipants: jr.existingParticipants.map((p) => ({
-            participantId: p.participantId,
-            name: p.name,
-            senderId: p.senderId,
-          })),
+          existingParticipants: jr.existingParticipants.map(rosterParticipantOf),
           mediaServers: jr.mediaServers.map((m) => m.mediaHandlerUrl),
           correlationId: jr.correlationId,
           bindingToken: jr.bindingToken,
@@ -638,13 +663,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         const participant = message.value.participant;
         if (participant !== undefined) {
           this.#rosterKeys.joined([participant]);
-          this.emit('participantJoined', {
-            participant: {
-              participantId: participant.participantId,
-              name: participant.name,
-              senderId: participant.senderId,
-            },
-          });
+          this.emit('participantJoined', { participant: rosterParticipantOf(participant) });
         }
         return;
       }
@@ -717,9 +736,10 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         return;
       }
       case 'participantMuteUpdate': {
-        // SERVER mute only, per kind (see `ParticipantMuteEvent`); the self-mute
-        // snapshot booleans are informational and deliberately dropped here.
-        // Ids are MC-relayed: bounded before they leave the decode boundary.
+        // All four mute facts, per kind (see `ParticipantMuteEvent`). Client
+        // mute is `optional bool`, passed through with its presence (absent =
+        // no fact, never `false`; `ClientMuteFacts`). Ids are MC-relayed:
+        // bounded before they leave the decode boundary.
         // One rule for both relays: an empty id carries nothing renderable and
         // is dropped (as for `unmuteRequest` below).
         const update = message.value;
@@ -732,6 +752,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           audioServerMuted: update.audioServerMuted,
           videoServerMuted: update.videoServerMuted,
           ...(serverMutedBy !== undefined ? { serverMutedBy } : {}),
+          ...clientMuteFactsOf(update),
         });
         return;
       }

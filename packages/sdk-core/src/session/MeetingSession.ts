@@ -513,6 +513,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       // the key for a sender the roster structurally cannot tell us about.
       await this.#seedOwnRosterKey();
       this.#setState(MeetingSessionState.Joined);
+      this.#reportClientMuteAfterJoin(signaling);
       this.#emitJoinAttempt('success', FailureStage.None);
       this.emit('joined', joined);
       return joined;
@@ -601,7 +602,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       declaration: this.#slots.declaration,
       media: this.#media,
       mute: this.#mediaState.mute,
-      reportMute: bestEffortMuteReport(signaling),
+      reportMute: bestEffortMuteReport(signaling, this.#slots.publish),
       seams: this.#seams,
       verification: this.#receiveVerification,
       clock: this.#clock,
@@ -721,13 +722,35 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     return this.#mediaState.mute.snapshot();
   }
 
+  /**
+   * Report the current client mute of every PUBLISHED kind to MC once, on
+   * entering `Joined` (story 3 R-15). `JoinRequest` carries no initial mute and
+   * MC holds no client-mute fact for a joiner until it reports one, so without
+   * this a mute set before or during the join (when {@link #clientMuteChanged}
+   * does not send) would never reach MC, and everyone else would read this
+   * participant as UNKNOWN until the next toggle. Explicit per kind, `false`
+   * included: an unmuted kind is a fact too. A kind this participant does not
+   * publish is NOT reported: "camera: on" for a participant with no camera in
+   * the meeting would be a false fact, so it stays unknown to peers. ONE kind
+   * per request (`muteRequest.ts`), on the same ordered stream as every later
+   * toggle, so a later toggle cannot be overtaken by this snapshot.
+   * Best-effort, like every client-mute report.
+   */
+  #reportClientMuteAfterJoin(signaling: SignalingClient): void {
+    const { audioMuted, videoMuted } = this.muteState;
+    const report = bestEffortMuteReport(signaling, this.#slots.publish);
+    report('audio', audioMuted);
+    report('video', videoMuted);
+  }
+
   #clientMuteChanged(kind: PublishKind, muted: boolean, snapshot: MuteSnapshot | undefined): void {
     if (!snapshot) return;
     this.emit('muteChanged', snapshot);
-    // Best-effort, ONE kind per request: the other kind's field stays absent,
-    // so MC leaves it exactly as it is (`signaling/muteRequest.ts`).
-    if (this.#state === MeetingSessionState.Joined) {
-      void this.#signaling?.sendMuteRequest(kind, muted).catch(() => undefined);
+    // ONE report path (`bestEffortMuteReport`: one kind per request, PUBLISHED
+    // kinds only, best-effort), sent only once joined.
+    const signaling = this.#signaling;
+    if (this.#state === MeetingSessionState.Joined && signaling !== undefined) {
+      bestEffortMuteReport(signaling, this.#slots.publish)(kind, muted);
     }
   }
 

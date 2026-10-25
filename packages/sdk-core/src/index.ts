@@ -147,6 +147,7 @@ export type {
   MhConnectionStatusReport,
   ParticipantJoinedEvent,
   ParticipantLeftEvent,
+  ClientMuteFacts,
   ParticipantMuteEvent,
   RosterParticipant,
   SignalingCapabilities,

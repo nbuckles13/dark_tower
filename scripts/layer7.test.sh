@@ -821,6 +821,20 @@ SOCK="$PRESENT_SOCK"; export ENVCMD="$MH_SUITE_STUB"
     --context kind-devloop-fixture -n dark-tower port-forward --address 127.0.0.1 \
     pod/mh-0-stale 1:50053 ) &
 __stale_pid=$!
+# The subshell must have EXEC'd before the reaper's /proc scan runs: until then its
+# cmdline is still bash, the reaper finds nothing and reports "reaped: 0" (a race,
+# not a reaper fault). Bounded wait (5 s); never landing is a loud harness failure.
+__stale_execd=0
+for _ in $(seq 1 100); do
+  if grep -qa 'port-forward' "/proc/${__stale_pid}/cmdline" 2>/dev/null; then
+    __stale_execd=1
+    break
+  fi
+  sleep 0.05
+done
+if [[ "$__stale_execd" != "1" ]]; then
+  FAIL=$((FAIL + 1)); FAILURES+=("[mh-reap-setup] stale forward pid ${__stale_pid} never exec'd as the kubectl port-forward stand-in within 5s")
+fi
 run_layer7 "$OUT" "$ERR"
 assert_exit   "mh-reap-exit0" 0 "$RC"
 assert_status "mh-reap-reported" "stale MH gRPC port-forwards reaped: 1" "$(cat "$ERR")"

@@ -5,7 +5,7 @@
 
 use super::participant::ParticipantActorHandle;
 use crate::errors::McError;
-use crate::media_kind::{KindDecision, MuteChange};
+use crate::media_kind::{ClientMuteFacts, KindDecision, MuteChange};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -250,7 +250,7 @@ pub enum MeetingMessage {
         change: MuteChange,
         /// The per-kind decision, or `None` if the participant is no longer on
         /// the roster.
-        respond_to: oneshot::Sender<Option<KindDecision>>,
+        respond_to: oneshot::Sender<Option<KindDecision<Option<bool>>>>,
     },
 
     /// Apply or lift a server mute on a participant by meeting policy
@@ -559,10 +559,9 @@ pub struct ParticipantInfo {
     pub user_id: String,
     /// Display name.
     pub display_name: String,
-    /// Whether audio is self-muted.
-    pub audio_self_muted: bool,
-    /// Whether video is self-muted.
-    pub video_self_muted: bool,
+    /// What MC knows of this participant's client mute, per kind (`None` until
+    /// reported). Published on the roster as `Participant.*_client_muted`.
+    pub client_muted: ClientMuteFacts,
     /// Whether audio is server-muted (enforced, ADR-0036 §5).
     pub audio_server_muted: bool,
     /// Whether video is server-muted (enforced, ADR-0036 §5).
@@ -716,18 +715,18 @@ pub enum ParticipantStateUpdate {
         participant_id: String,
         reason: LeaveReason,
     },
-    /// A participant's SERVER mute changed — or, on the late-joiner replay, a
-    /// participant is server-muted at the moment someone joins.
+    /// A participant's mute state, as a FULL snapshot: sent when its SERVER
+    /// mute changes (to everyone), when its CLIENT mute fact changes (to
+    /// everyone else, under the per-meeting fan-out bound; story 3 R-15 fix,
+    /// reversing story-2 S-2), and on the late-joiner replay of server mutes.
     ///
-    /// Wire-visible as `ParticipantMuteUpdate` (story 2 R-11). Emitted only for
-    /// SERVER mute: self-mute does not fan out to the roster (security S-2's
-    /// judgment — the subscriber-visible signal is the slot state, `SLOT_STATE_AVATAR_CLIENT_MUTED`).
-    /// So the two self-mute booleans ride along as INFORMATIONAL snapshots and
-    /// are not a self-mute source for any client.
+    /// Wire-visible as `ParticipantMuteUpdate` (story 2 R-11). Every field is
+    /// current at composition, so a client-mute frame never regresses a server
+    /// mute and vice versa.
     MuteChanged {
         participant_id: String,
-        audio_self_muted: bool,
-        video_self_muted: bool,
+        /// Client-mute facts, per kind; `None` goes on the wire as ABSENT.
+        client_muted: ClientMuteFacts,
         audio_server_muted: bool,
         video_server_muted: bool,
         /// Participant id of whoever applied the server mute; empty when
@@ -995,8 +994,7 @@ mod tests {
             participant_id: "p1".to_string(),
             user_id: "u1".to_string(),
             display_name: "Test User".to_string(),
-            audio_self_muted: false,
-            video_self_muted: true,
+            client_muted: ClientMuteFacts::from_facts([None, Some(true)]),
             audio_server_muted: false,
             video_server_muted: false,
             status: ParticipantStatus::Connected,

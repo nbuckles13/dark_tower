@@ -70,6 +70,9 @@ export interface JoinResponseInit {
     name: string;
     senderId?: number;
     identityPublicKey?: Uint8Array;
+    /** `Participant.*_client_muted` (`optional bool`); omitted = absent on the wire. */
+    audioClientMuted?: boolean;
+    videoClientMuted?: boolean;
   }[];
   mediaServers?: string[];
   correlationId?: string;
@@ -93,6 +96,7 @@ export function buildJoinResponse(init: JoinResponseInit = {}) {
         name: p.name,
         ...(p.senderId !== undefined ? { senderId: p.senderId } : {}),
         ...(p.identityPublicKey !== undefined ? { identityPublicKey: p.identityPublicKey } : {}),
+        ...clientMuteInit(p),
       }),
     ),
     kekGeneration: init.kekGeneration ?? 0,
@@ -111,9 +115,26 @@ export function buildJoinResponse(init: JoinResponseInit = {}) {
   });
 }
 
-export function buildParticipantJoined(participantId: string, name: string) {
+/** The wire's client-mute pair; an omitted kind stays ABSENT (never `false`). */
+interface ClientMuteInit {
+  audioClientMuted?: boolean;
+  videoClientMuted?: boolean;
+}
+
+function clientMuteInit(init: ClientMuteInit): ClientMuteInit {
+  return {
+    ...(init.audioClientMuted !== undefined ? { audioClientMuted: init.audioClientMuted } : {}),
+    ...(init.videoClientMuted !== undefined ? { videoClientMuted: init.videoClientMuted } : {}),
+  };
+}
+
+export function buildParticipantJoined(
+  participantId: string,
+  name: string,
+  clientMute: ClientMuteInit = {},
+) {
   return create(ParticipantJoinedSchema, {
-    participant: create(ParticipantSchema, { participantId, name }),
+    participant: create(ParticipantSchema, { participantId, name, ...clientMuteInit(clientMute) }),
   });
 }
 
@@ -135,10 +156,14 @@ export function framedJoinResponse(init: JoinResponseInit = {}): Uint8Array {
 }
 
 /** Frame a `ParticipantJoined` ServerMessage. */
-export function framedParticipantJoined(participantId: string, name: string): Uint8Array {
+export function framedParticipantJoined(
+  participantId: string,
+  name: string,
+  clientMute: ClientMuteInit = {},
+): Uint8Array {
   return frameServerMessage({
     case: 'participantJoined',
-    value: buildParticipantJoined(participantId, name),
+    value: buildParticipantJoined(participantId, name, clientMute),
   });
 }
 
@@ -341,16 +366,17 @@ export function framedMeetingKekUpdate(kek: Uint8Array, generation: number): Uin
 
 export { MediaKind, SlotState };
 
-export function buildParticipantMuteUpdate(init: {
-  participantId: string;
-  audioSelfMuted?: boolean;
-  audioServerMuted: boolean;
-  videoServerMuted?: boolean;
-  serverMutedBy?: string;
-}) {
+export function buildParticipantMuteUpdate(
+  init: ClientMuteInit & {
+    participantId: string;
+    audioServerMuted: boolean;
+    videoServerMuted?: boolean;
+    serverMutedBy?: string;
+  },
+) {
   return create(ParticipantMuteUpdateSchema, {
     participantId: init.participantId,
-    audioSelfMuted: init.audioSelfMuted ?? false,
+    ...clientMuteInit(init),
     audioServerMuted: init.audioServerMuted,
     videoServerMuted: init.videoServerMuted ?? false,
     serverMutedBy: init.serverMutedBy ?? '',

@@ -332,6 +332,8 @@ fn join_response_roundtrips_kek_generation_and_sender_id() {
             joined_at: 0,
             sender_id: Some(2),
             identity_public_key: vec![0x11; 32],
+            audio_client_muted: Some(false),
+            video_client_muted: None,
         }],
         media_servers: Vec::new(),
         correlation_id: "c-1".to_string(),
@@ -396,6 +398,63 @@ fn sender_id_zero_survives_as_a_present_zero_not_absence() {
     });
     assert_eq!(cap.slots[0].pinned_sender_id, Some(0));
     assert_ne!(cap.slots[0].pinned_sender_id, None);
+}
+
+/// Story 3 R-15 fix: client-mute facts are `optional bool` on BOTH carriers
+/// (`Participant`, `ParticipantMuteUpdate`) because ABSENT means "no fact" --
+/// a peer renders "unknown", never unmuted. The load-bearing half is that
+/// `Some(false)` survives as `Some(false)`, distinct from `None`; a bare
+/// `bool` would collapse an explicit unmute into "never reported".
+#[test]
+fn client_mute_facts_keep_presence_on_both_carriers() {
+    for facts in [
+        (None, None),
+        (Some(false), Some(false)),
+        (Some(true), Some(false)),
+        (None, Some(true)),
+    ] {
+        let p = roundtrip(&Participant {
+            participant_id: "p-1".to_string(),
+            audio_client_muted: facts.0,
+            video_client_muted: facts.1,
+            ..Default::default()
+        });
+        assert_eq!((p.audio_client_muted, p.video_client_muted), facts);
+        let u = roundtrip(&ParticipantMuteUpdate {
+            participant_id: "p-1".to_string(),
+            audio_client_muted: facts.0,
+            video_client_muted: facts.1,
+            ..Default::default()
+        });
+        assert_eq!((u.audio_client_muted, u.video_client_muted), facts);
+    }
+    // Presence is on the wire: an explicit false is encoded, absence is not.
+    let present = ParticipantMuteUpdate {
+        audio_client_muted: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(top_level_field_numbers(&present.encode_to_vec()), vec![7]);
+    assert!(ParticipantMuteUpdate::default().encode_to_vec().is_empty());
+}
+
+/// The retired informational tags 2/3 (`audio_self_muted`,
+/// `video_self_muted`) are never emitted: a message carrying every field
+/// encodes 1 and 4-8 only, so an old reader can never decode a stale snapshot
+/// from a new sender.
+#[test]
+fn participant_mute_update_never_encodes_the_retired_tags() {
+    let full = ParticipantMuteUpdate {
+        participant_id: "p-1".to_string(),
+        audio_server_muted: true,
+        video_server_muted: true,
+        server_muted_by: "host".to_string(),
+        audio_client_muted: Some(true),
+        video_client_muted: Some(true),
+    };
+    assert_eq!(
+        top_level_field_numbers(&full.encode_to_vec()),
+        vec![1, 4, 5, 6, 7, 8]
+    );
 }
 
 #[test]
