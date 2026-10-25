@@ -32,6 +32,7 @@
 #   AUDIT_SUPPRESSIONS_NOW         — "today" override (default: real `date -u +%F`)
 #   DEVLOOP_AUDIT_IGNORE_JSON      — .pnpm-audit-ignore.json path override (default: repo-root)
 #   DEVLOOP_CARGO_AUDIT_TOML       — .cargo/audit.toml path override (default: repo-root)
+#   DEVLOOP_DEPENDABOT_YML         — .github/dependabot.yml path override (default: repo-root)
 # DO NOT change the gating to a truthy `-n` test — `DEVLOOP_TEST=0` must NOT enable
 # overrides (that is the bypass operations refinement #1 closes).
 set -euo pipefail
@@ -63,6 +64,7 @@ __any_override_present() {
   [[ -n "${AUDIT_SUPPRESSIONS_NOW:-}" ]] && return 0
   [[ -n "${DEVLOOP_AUDIT_IGNORE_JSON:-}" ]] && return 0
   [[ -n "${DEVLOOP_CARGO_AUDIT_TOML:-}" ]] && return 0
+  [[ -n "${DEVLOOP_DEPENDABOT_YML:-}" ]] && return 0
   return 1
 }
 
@@ -88,6 +90,14 @@ __pnpm_ignore_json_path() {
     printf '%s\n' "$DEVLOOP_AUDIT_IGNORE_JSON"
   else
     printf '%s\n' "${REPO_ROOT}/.pnpm-audit-ignore.json"
+  fi
+}
+
+__dependabot_yml_path() {
+  if __test_sentinel_active && [[ -n "${DEVLOOP_DEPENDABOT_YML:-}" ]]; then
+    printf '%s\n' "$DEVLOOP_DEPENDABOT_YML"
+  else
+    printf '%s\n' "${REPO_ROOT}/.github/dependabot.yml"
   fi
 }
 
@@ -311,7 +321,8 @@ read_cargo_audit_ignore_ids() {
 # `#`) are excluded so the prohibition text does not self-trip.
 # Returns 0 if clean (no real non-empty ignore block), 1 if a populated ignore block exists.
 __dependabot_ignore_check() {
-  local f="${REPO_ROOT}/.github/dependabot.yml"
+  local f
+  f="$(__dependabot_yml_path)"
   [[ -f "$f" ]] || return 0
   # awk exits 0 when a populated `ignore:` list entry is found (the VIOLATION), else 1.
   if awk '
@@ -328,7 +339,7 @@ __dependabot_ignore_check() {
     # Single exit point: an in-rule `exit` falls through to END, so decide here.
     END { exit !found }
   ' "$f"; then
-    echo "FAIL: .github/dependabot.yml contains a non-empty 'ignore:' block — Dependabot is for bump PRs ONLY and must NOT be a suppression surface. The ONLY sanctioned suppression channel is audit-suppressions.toml (ADR-0033 §11). See docs/contributor/audit-suppressions.md." >&2
+    echo "FAIL: ${f} contains a non-empty 'ignore:' block — Dependabot is for bump PRs ONLY and must NOT be a suppression surface. The ONLY sanctioned suppression channel is audit-suppressions.toml (ADR-0033 §11). See docs/contributor/audit-suppressions.md." >&2
     return 1
   fi
   return 0
