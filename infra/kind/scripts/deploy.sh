@@ -276,6 +276,23 @@ build_content_tagged_image() {
     local build_args
     build_args="$(image_build_args "${repo}")" || return 1
     [[ -z "${build_args}" ]] || mapfile -t args <<< "${build_args}"
+    # SPIKE (image caching, step 1): opt-in BuildKit layer cache shared across CI
+    # runs. Unset = unchanged behaviour. `gha` = GitHub Actions cache, scoped per
+    # image; needs BUILDX_BUILDER pointing at a docker-container builder and the
+    # Actions runtime token in the environment. --load puts the result in the
+    # daemon so the existing tag + kind load path is unchanged.
+    case "${DT_IMAGE_BUILD_CACHE:-}" in
+        "") ;;
+        gha)
+            args+=(--load
+                   --cache-from "type=gha,scope=${name}"
+                   --cache-to "type=gha,mode=max,scope=${name}")
+            ;;
+        *)
+            log_error "DT_IMAGE_BUILD_CACHE='${DT_IMAGE_BUILD_CACHE}' is not a known cache backend (gha)"
+            return 1
+            ;;
+    esac
     iid_file="$(mktemp "${TMPDIR:-/tmp}/dt-iid.XXXXXX")"
     log_step "Building ${repo} container image..."
     if ! ${cmd} build --iidfile "${iid_file}" "${args[@]}" \

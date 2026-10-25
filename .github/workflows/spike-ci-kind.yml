@@ -108,6 +108,15 @@ jobs:
           sudo systemctl restart docker
           docker info --format 'driver={{.Driver}}'
 
+      - name: BuildKit builder + Actions cache credentials (image caching spike)
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+
+      - name: Create docker-container builder
+        run: |
+          docker buildx create --name dt-ci --driver docker-container --bootstrap
+          echo "BUILDX_BUILDER=dt-ci" >> "$GITHUB_ENV"
+          echo "DT_IMAGE_BUILD_CACHE=gha" >> "$GITHUB_ENV"
+
       - name: Use rootful docker, not the preinstalled podman
         # devloop-helper picks podman when it is on PATH; the spike measures the docker path.
         run: |
