@@ -17,6 +17,9 @@ source "${__here}/_test_helpers.sh"
 set +e  # the gate returns non-zero (1=skip, 2=indeterminate) by design; assert, don't abort
 
 REPO_ROOT="$(cd "${__here}/../.." && pwd)"
+# A directory outside every case repo, for the root-outside-repo case.
+OUTSIDE_ROOT="$(mktemp -d)"
+trap 'rm -rf "$OUTSIDE_ROOT"' EXIT
 
 # -----------------------------------------------------------------------------
 # Part 1 — PREDICATE logic (audit_dep_changed_rust / _ts) against an injected cache.
@@ -423,10 +426,10 @@ case_orphan() {
 scan_case case_orphan
 assert_discovery_failed "orphan manifest" "AUDIT_DISCOVERY: cargo locate-project failed for orphan/Cargo.toml"
 rm -rf "$CASE_DIR"
-# A workspace root outside the repo.
+# A workspace root outside the repo (OUTSIDE_ROOT, made at the top: the setup runs in
+# scan_case's subshell).
 case_root_outside() {
-  local elsewhere; elsewhere="$(mktemp -d)"
-  sed -i "s|^fz/Cargo.toml\t.*|fz/Cargo.toml\t${elsewhere}/Cargo.toml|" stub_locate
+  sed -i "s|^fz/Cargo.toml\t.*|fz/Cargo.toml\t${OUTSIDE_ROOT}/Cargo.toml|" stub_locate
 }
 scan_case case_root_outside
 assert_discovery_failed "root outside repo" "AUDIT_DISCOVERY: workspace root of fz/Cargo.toml is outside the repo"

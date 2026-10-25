@@ -85,17 +85,13 @@ run_isolated() {
       "$GET_BASE_REF"
 }
 
-# Cleanup helper — removes a tempdir registered for cleanup.
-__TEMPDIRS=()
+# Every case's tempdir lives under one root removed on exit. (Callers use
+# `tmp=$(mktemp_register)`, a subshell, so a registry array would never reach the trap.)
+__TEMPROOT="$(mktemp -d)"
 mktemp_register() {
-  local d
-  d=$(mktemp -d)
-  __TEMPDIRS+=("$d")
-  printf '%s\n' "$d"
+  mktemp -d "${__TEMPROOT}/case.XXXXXX"
 }
-trap '
-  for d in "${__TEMPDIRS[@]}"; do rm -rf "$d"; done
-' EXIT
+trap 'rm -rf "$__TEMPROOT"' EXIT
 
 # -----------------------------------------------------------------------------
 # Cases
