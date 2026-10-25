@@ -44,3 +44,4 @@ pub mod service_type;
 pub mod observability;
 
 // Spike: cache-measurement touch (forces own-crate rebuild in every service image).
+// Spike: cache-measurement touch 2.
