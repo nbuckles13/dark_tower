@@ -1,0 +1,9 @@
+# Paths whose changes need the repository owner's review before they reach main
+# (enforced by the "PR merge" ruleset's "Require review from Code Owners"). The
+# base branch's copy applies, so a PR cannot remove itself from review.
+#
+# CI workflows run with repository tokens; the image build context and CI build
+# script decide what ends up in published images.
+/.github/          @nbuckles13
+/.dockerignore     @nbuckles13
+/infra/ci/         @nbuckles13
