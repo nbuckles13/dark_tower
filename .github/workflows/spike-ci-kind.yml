@@ -85,6 +85,11 @@ jobs:
       - name: Install pnpm dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Generate TS protobuf code
+        # Run 9: layer7 runs `pnpm --filter web-app test:e2e`, which bypasses the Nx
+        # codegen dependency; a clean checkout has no packages/sdk-core/src/proto.
+        run: pnpm exec nx run proto-gen:codegen
+
       - name: Install Playwright Chromium
         run: pnpm --filter @darktower/web-app exec playwright install --with-deps chromium
 
