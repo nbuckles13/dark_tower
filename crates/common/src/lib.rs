@@ -42,3 +42,5 @@ pub mod service_type;
 /// The `observability::testing` submodule is only compiled when `cfg(test)`
 /// is active or the `test-utils` feature is enabled.
 pub mod observability;
+
+// Spike: cache-measurement touch (forces own-crate rebuild in every service image).
