@@ -23,7 +23,8 @@ import { InMemoryMetricsSink } from '@darktower/test-utils';
 import { ReplayWindow, TransmitKeyCache } from '../../frame/receivePath.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { gateFor, kekHolderWith } from '../../__tests__/helpers.js';
-import { MEDIA_KIND_LABELS, MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKind } from '../../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { FirstMediaObserver } from '../../setup/measurement.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import { HopSequenceMonitor } from '../hopSequenceMonitor.js';
@@ -55,7 +56,7 @@ function makeHarness(): Harness {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaKindMetrics(
     { clientVersion: '0.0.0-test', orgId: 'demo' },
-    MEDIA_KIND_LABELS.Audio,
+    MediaKind.AUDIO,
     sink,
   );
   const roster = new RosterIdentityKeys(8);

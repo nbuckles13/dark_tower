@@ -7,11 +7,11 @@
 // `dt-guard`'s media-path deny is Rust-only, its metric-label scanner reads
 // `crates/`, and `ts_pii.rs` scans only `console.*` / `logger.*` call sites. So
 // the structural control is the constructors' SHAPE — two named strings (and,
-// per kind, a closed media kind), never a label bag — and these assertions are
+// per kind, a wire media kind), never a label bag — and these assertions are
 // what pin it.
 //
 // They are ALSO the drift guard between the two label bags in `mediaMetrics.ts`:
-// the per-kind `mediaMetricLabels` (four keys) and `MediaSessionMetrics`'
+// the per-kind `mediaMetricLabels` (five keys) and `MediaSessionMetrics`'
 // `#sessionLabels` literal (three keys). `dt-guard client-metrics-export` does
 // not compare them; the exact-set assertions below do.
 
@@ -33,7 +33,9 @@ import {
   MEDIA_KEYFRAME_UNATTRIBUTED_OUTCOMES,
   MEDIA_MH_CONTROL_CHANNEL_ENDINGS,
   MEDIA_KEK_INSTALL_REFUSALS,
-  MEDIA_KIND_LABELS,
+  CONTENT_KIND_LABEL_VALUES,
+  MEDIA_KIND_LABEL_PROJECTION,
+  MEDIA_KIND_LABEL_VALUES,
   MEDIA_ROSTER_KEY_CHANGES,
   MEDIA_KEK_RETENTION_ANOMALIES,
   MEDIA_KEK_SOURCES,
@@ -46,13 +48,19 @@ import {
   MediaMetrics,
   MediaSessionMetrics,
   mediaMetricLabels,
-  type MediaKindLabel,
+  projectMediaKind,
+  publishedKindMetricLabels,
+  type LabelledMediaKind,
 } from '../mediaMetrics.js';
+import { MediaKind } from '../../../proto/dark_tower/signaling/v1/signaling_pb.js';
 
 const IDENTITY = { clientVersion: '1.2.3', orgId: 'acme' };
 const SESSION_KEYS = ['client_version', 'key_custody', 'org_id'];
-const PER_KIND_KEYS = [...SESSION_KEYS, 'media_kind'].sort();
-const KINDS: readonly MediaKindLabel[] = Object.values(MEDIA_KIND_LABELS);
+const PER_KIND_KEYS = [...SESSION_KEYS, 'media_kind', 'content_kind'].sort();
+/** Every wire kind the projection labels (screen included: the handle is kind-generic). */
+const KINDS: readonly LabelledMediaKind[] = Object.keys(MEDIA_KIND_LABEL_PROJECTION).map(
+  (k) => Number(k) as LabelledMediaKind,
+);
 
 /** Every PER-KIND emitter, each with the one discriminator it may add (or none). */
 const PER_KIND_EMITTERS: [string, (m: MediaKindMetrics) => void, string | null][] = [
@@ -201,12 +209,13 @@ describe('the emitter tables are complete (positive control)', () => {
 });
 
 describe('mediaMetricLabels builds the PER-KIND set by ALLOW-LIST', () => {
-  it.each(KINDS)('produces exactly the four keys for %s', (kind) => {
+  it.each(KINDS)('produces exactly the five keys for wire kind %s', (kind) => {
     expect(mediaMetricLabels(IDENTITY, kind)).toEqual({
       client_version: '1.2.3',
       org_id: 'acme',
       key_custody: 'operator',
-      media_kind: kind,
+      media_kind: MEDIA_KIND_LABEL_PROJECTION[kind].media_kind,
+      content_kind: MEDIA_KIND_LABEL_PROJECTION[kind].content_kind,
     });
   });
 
@@ -215,7 +224,7 @@ describe('mediaMetricLabels builds the PER-KIND set by ALLOW-LIST', () => {
     // storage cannot read it; MC can. No metric, log, span attribute or document
     // may carry an end-to-end or zero-trust boolean, because the default
     // deployment is neither.
-    const labels = mediaMetricLabels(IDENTITY, MEDIA_KIND_LABELS.Audio);
+    const labels = mediaMetricLabels(IDENTITY, MediaKind.AUDIO);
     expect(labels.key_custody).toBe('operator');
     for (const key of Object.keys(labels)) {
       expect(key).not.toMatch(/end_to_end|e2e|zero_trust/i);
@@ -229,34 +238,61 @@ describe('mediaMetricLabels builds the PER-KIND set by ALLOW-LIST', () => {
     const sink = new InMemoryMetricsSink();
     const metrics = new MediaMetrics(ambient, sink);
     emitEverything(metrics);
-    new MediaKindMetrics(ambient, MEDIA_KIND_LABELS.Video, sink).frameSent();
+    new MediaKindMetrics(ambient, MediaKind.VIDEO_CAMERA, sink).frameSent();
     const keys = new Set(sink.getRecordedMetrics().flatMap((m) => Object.keys(m.labels)));
     expect(keys.has('meeting_id_hash')).toBe(false);
     expect(keys.has('participant_id')).toBe(false);
   });
 });
 
-describe('the media_kind vocabulary matches its single source of truth', () => {
-  it('equals the `media_kind` row of docs/observability/label-taxonomy.md', () => {
-    const here = dirname(fileURLToPath(import.meta.url));
-    const doc = readFileSync(
-      resolve(here, '../../../../../../docs/observability/label-taxonomy.md'),
-      'utf8',
+// The cross-artifact drift (this record vs the taxonomy projection table, MC's
+// `KindLabels::from_proto` and the collector's exact rules) is `dt-guard`'s; the
+// taxonomy is parsed THERE and nowhere in TypeScript. These are the runtime
+// properties of the projection itself.
+describe('the wire-kind label projection', () => {
+  const GENERATED: readonly number[] = Object.values(MediaKind).filter(
+    (v): v is number => typeof v === 'number',
+  );
+
+  it('labels EVERY generated wire kind except UNSPECIFIED — no more, no fewer', () => {
+    expect(GENERATED.length, 'generated MediaKind enum has no numeric values').toBeGreaterThan(1);
+    expect([...KINDS].sort()).toEqual(GENERATED.filter((v) => v !== MediaKind.UNSPECIFIED).sort());
+  });
+
+  it.each(KINDS)("projectMediaKind(%s) returns that kind's record entry", (kind) => {
+    expect(projectMediaKind(kind)).toBe(MEDIA_KIND_LABEL_PROJECTION[kind]);
+  });
+
+  it('THROWS on UNSPECIFIED and on a number the enum does not name (open at runtime)', () => {
+    expect(() => projectMediaKind(MediaKind.UNSPECIFIED)).toThrow(/has no metric labels/);
+    expect(() => projectMediaKind(99 as MediaKind)).toThrow(/has no metric labels/);
+    // Forced past the compile-time bar: the runtime throw is the second line.
+    expect(
+      () => new MediaKindMetrics(IDENTITY, MediaKind.UNSPECIFIED as LabelledMediaKind, undefined),
+    ).toThrow();
+  });
+
+  it('a published kind projects through the one wire mapping (audio→AUDIO, video→VIDEO_CAMERA)', () => {
+    expect(publishedKindMetricLabels('audio')).toBe(MEDIA_KIND_LABEL_PROJECTION[MediaKind.AUDIO]);
+    expect(publishedKindMetricLabels('video')).toBe(
+      MEDIA_KIND_LABEL_PROJECTION[MediaKind.VIDEO_CAMERA],
     );
-    const row = doc.split('\n').find((line) => line.startsWith('| `media_kind` |'));
-    expect(row, 'no `| `media_kind` |` table row in label-taxonomy.md').toBeDefined();
-    const valueCell = row!.split('|')[2] ?? '';
-    const values = [...valueCell.matchAll(/`([^`]+)`/g)].map((m) => m[1]);
-    expect(values.length, 'media_kind taxonomy row has no backticked values').toBeGreaterThan(0);
-    expect(new Set(values)).toEqual(new Set(KINDS));
+  });
+
+  it('the exported value sets are exactly the projection columns', () => {
+    const all = Object.values(MEDIA_KIND_LABEL_PROJECTION);
+    expect(new Set(MEDIA_KIND_LABEL_VALUES)).toEqual(new Set(all.map((l) => l.media_kind)));
+    expect(new Set(CONTENT_KIND_LABEL_VALUES)).toEqual(new Set(all.map((l) => l.content_kind)));
+    expect(MEDIA_KIND_LABEL_VALUES.length).toBeGreaterThan(0);
+    expect(CONTENT_KIND_LABEL_VALUES.length).toBeGreaterThan(0);
   });
 
   it('never uses the collector rewrite sentinel', () => {
-    expect(KINDS).not.toContain('invalid');
+    expect([...MEDIA_KIND_LABEL_VALUES, ...CONTENT_KIND_LABEL_VALUES]).not.toContain('invalid');
   });
 });
 
-describe('every PER-KIND emission carries exactly the four-key set plus its discriminator', () => {
+describe('every PER-KIND emission carries exactly the five-key set plus its discriminator', () => {
   for (const kind of KINDS) {
     it.each(PER_KIND_EMITTERS)(`%s (${kind})`, (name, emit, discriminator) => {
       const sink = new InMemoryMetricsSink();
@@ -266,15 +302,17 @@ describe('every PER-KIND emission carries exactly the four-key set plus its disc
       expect(record?.name).toBe(name);
       const expected = discriminator ? [...PER_KIND_KEYS, discriminator].sort() : PER_KIND_KEYS;
       expect(Object.keys(record!.labels).sort()).toEqual(expected);
-      expect(record!.labels.media_kind).toBe(kind);
+      // All or none: both kind labels, from the one projection entry.
+      expect(record!.labels.media_kind).toBe(MEDIA_KIND_LABEL_PROJECTION[kind].media_kind);
+      expect(record!.labels.content_kind).toBe(MEDIA_KIND_LABEL_PROJECTION[kind].content_kind);
       expect(record!.labels.key_custody).toBe('operator');
     });
   }
 
   it('resolves DISTINCT handles per kind: an audio emission never reads as video', () => {
     const sink = new InMemoryMetricsSink();
-    const audio = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Audio, sink);
-    const video = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Video, sink);
+    const audio = new MediaKindMetrics(IDENTITY, MediaKind.AUDIO, sink);
+    const video = new MediaKindMetrics(IDENTITY, MediaKind.VIDEO_CAMERA, sink);
     expect(audio.labels).not.toBe(video.labels);
     audio.frameReceived();
     audio.frameReceived();
@@ -300,6 +338,7 @@ describe('every SESSION-LEVEL emission is kind-free', () => {
     const expected = discriminator ? [...SESSION_KEYS, discriminator].sort() : SESSION_KEYS;
     expect(Object.keys(record!.labels).sort()).toEqual(expected);
     expect(Object.keys(record!.labels)).not.toContain('media_kind');
+    expect(Object.keys(record!.labels)).not.toContain('content_kind');
     expect(record!.labels.key_custody).toBe('operator');
   });
 });
@@ -316,9 +355,12 @@ describe('the session container', () => {
       histogram: (...a: unknown[]) => recorded.push(a),
     } as unknown as ConstructorParameters<typeof MediaMetrics>[1];
     const metrics = new MediaMetrics(IDENTITY, sink);
-    expect(metrics.audio.kind).toBe('audio');
-    expect(metrics.video.kind).toBe('video');
+    expect(metrics.audio.kind).toBe(MediaKind.AUDIO);
+    expect(metrics.video.kind).toBe(MediaKind.VIDEO_CAMERA);
+    expect(metrics.audio.labels).toMatchObject({ media_kind: 'audio', content_kind: 'main' });
+    expect(metrics.video.labels).toMatchObject({ media_kind: 'video', content_kind: 'main' });
     expect(Object.keys(metrics.session.labels)).not.toContain('media_kind');
+    expect(Object.keys(metrics.session.labels)).not.toContain('content_kind');
     expect(recorded, 'constructing the handles emitted a series').toEqual([]);
   });
 });
@@ -372,7 +414,7 @@ describe('the drop counter carries the frozen reject vocabulary', () => {
     const file = loadFrameVectors();
     const dropping = file.reject_reasons.filter((r) => r.drops_frame).map((r) => r.token);
     const sink = new InMemoryMetricsSink();
-    const metrics = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Audio, sink);
+    const metrics = new MediaKindMetrics(IDENTITY, MediaKind.AUDIO, sink);
     for (const token of dropping) {
       metrics.frameDropped(token as never);
     }
@@ -388,7 +430,7 @@ describe('the drop counter carries the frozen reject vocabulary', () => {
     // `received = accepted + sum(drops by reason)` in aggregate, silently, long
     // after the label set is frozen.
     const sink = new InMemoryMetricsSink();
-    const metrics = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Audio, sink);
+    const metrics = new MediaKindMetrics(IDENTITY, MediaKind.AUDIO, sink);
     metrics.wrapOutcome(NON_DROPPING_REASON);
     const dropped = sink
       .getRecordedMetrics()
@@ -493,7 +535,7 @@ describe('story 2 task 13 media metrics', () => {
 
   it('the deficit counter adds the COUNT, and 0 is a legal zero-initialisation', () => {
     const sink = new InMemoryMetricsSink();
-    const m = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Audio, sink);
+    const m = new MediaKindMetrics(IDENTITY, MediaKind.AUDIO, sink);
     m.receiveSourceDeficit(0);
     m.receiveSourceDeficit(3);
     expect(sink.getRecordedMetrics().map((r) => r.value)).toEqual([0, 3]);
@@ -549,7 +591,7 @@ describe('story 3 C-A1 vocabularies', () => {
 describe('video receive series (story 3 C-B)', () => {
   it('the unfulfilled histogram declares its boundaries from the SSoT const, with a bucket above 100 s', () => {
     const sink = new InMemoryMetricsSink();
-    const m = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Video, sink);
+    const m = new MediaKindMetrics(IDENTITY, MediaKind.VIDEO_CAMERA, sink);
     m.slotUnfulfilledDurationMs(5);
     const [obs] = sink.getRecordedMetrics();
     expect(obs?.boundaries).toEqual(SLOT_UNFULFILLED_BUCKETS_MS);
@@ -563,7 +605,7 @@ describe('video receive series (story 3 C-B)', () => {
 
   it('both first-render histograms declare the first-render boundaries, past the 10 s maximum keyframe interval', () => {
     const sink = new InMemoryMetricsSink();
-    const m = new MediaKindMetrics(IDENTITY, MEDIA_KIND_LABELS.Video, sink);
+    const m = new MediaKindMetrics(IDENTITY, MediaKind.VIDEO_CAMERA, sink);
     m.timeToFirstRenderMs(1);
     m.slotActiveToFirstRenderMs(1);
     for (const obs of sink.getRecordedMetrics())

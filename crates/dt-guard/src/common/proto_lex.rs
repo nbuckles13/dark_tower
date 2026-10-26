@@ -3,12 +3,20 @@
 //!
 //! POLICY-FREE on purpose (@dry-reviewer / @infrastructure condition 3-4): it
 //! knows the proto STATEMENT grammar only -- `;` ends a statement, `{` opens a
-//! scope, `}` closes one -- and nothing about what any guard looks for. The
-//! per-kind field-name guard (`proto_per_kind_fields`) is its first consumer;
-//! the two bash proto guards (`validate-proto-no-any.sh`,
-//! `validate-internal-proto-no-key-material.sh`) carry the same `//`-strip and
-//! normalisation and are tracked to port here (`docs/TODO.md` §Polyglot
-//! Pipeline Follow-ups).
+//! scope, `}` closes one -- and nothing about what any guard looks for. Its
+//! consumers are the three proto guards: `proto_per_kind_fields`,
+//! `proto_no_any` and `internal_proto_no_key_material` (the latter two ported
+//! from bash 2026-10-26, retiring the bash copies of this strip/normaliser).
+//! File discovery is `common::proto_files`.
+//!
+//! # Deltas from the retired bash normaliser (stated so nobody "restores
+//! # parity" by loosening)
+//!
+//! - String-aware: `//` and `/*` inside a `"..."` literal are text, neither
+//!   stripped nor refused (bash's `sed 's://.*::'` stripped them).
+//! - NEW refusals, both fail-closed: a `'` outside strings and comments, and
+//!   unbalanced braces.
+//! - Tokens carry real 1-based line numbers (bash cited statement text).
 //!
 //! # What it does
 //!
@@ -96,6 +104,96 @@ impl std::fmt::Display for LexError {
 }
 
 impl std::error::Error for LexError {}
+
+/// One scope of a lexed file: the file root, or a `{ ... }` declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    /// The normalised header (`message Foo`, `rpc X(A) returns (B)`, ...), or
+    /// `None` for the file root.
+    pub header: Option<String>,
+    /// 1-based line the header starts on (1 for the root).
+    pub line: usize,
+    /// Declared scopes enclosing this one: 0 for the root AND for a
+    /// top-level declaration (tell them apart by `header`).
+    pub nesting: usize,
+    /// The statements DIRECTLY in this scope (not in nested ones), as
+    /// `(line, normalised text)`.
+    pub statements: Vec<(usize, String)>,
+}
+
+/// Group `tokens` into [`Scope`]s: the root first, then each declaration in
+/// source order. The ONE scope walker the proto guards share (@dry-reviewer
+/// C): callers filter by `header` / `nesting`, never re-track depth.
+#[must_use]
+pub fn scopes(tokens: &[Token]) -> Vec<Scope> {
+    let mut out = vec![Scope {
+        header: None,
+        line: 1,
+        nesting: 0,
+        statements: Vec::new(),
+    }];
+    let mut stack = vec![0usize];
+    for t in tokens {
+        match t {
+            Token::Open { line, header } => {
+                out.push(Scope {
+                    header: Some(header.clone()),
+                    line: *line,
+                    nesting: stack.len() - 1,
+                    statements: Vec::new(),
+                });
+                stack.push(out.len() - 1);
+            }
+            Token::Close { .. } => {
+                // `lex` guarantees balance; never pop the root.
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+            }
+            Token::Statement { line, text } => {
+                let at = stack.last().copied().unwrap_or(0);
+                if let Some(scope) = out.get_mut(at) {
+                    scope.statements.push((*line, text.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The value NAMES of the TOP-LEVEL `enum <enum_name>` (a depth-0 declaration;
+/// a same-named enum nested in a message is a different type and is never
+/// returned), as `(line, name)` in source order: the text before `=` of each
+/// statement directly in that scope. Policy-free: which values a caller keeps
+/// (prefixes, the zero value) is the caller's.
+#[must_use]
+pub fn enum_values(scopes: &[Scope], enum_name: &str) -> Vec<(usize, String)> {
+    let header = format!("enum {enum_name}");
+    scopes
+        .iter()
+        .filter(|s| s.nesting == 0 && s.header.as_deref() == Some(header.as_str()))
+        .flat_map(|s| s.statements.iter())
+        .filter_map(|(line, text)| {
+            let (name, _) = text.split_once('=')?;
+            let name = name.trim();
+            (!name.is_empty()).then(|| (*line, name.to_string()))
+        })
+        .collect()
+}
+
+/// If normalised statement `text` starts with keyword `kw` on an identifier
+/// boundary (followed by a non-identifier byte, or the end), the rest after
+/// it; else `None`. `import"x"` and `import "x"` both start with `import`;
+/// `imports x` does not.
+#[must_use]
+pub fn starts_with_keyword<'a>(text: &'a str, kw: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(kw)?;
+    (!rest
+        .bytes()
+        .next()
+        .is_some_and(crate::common::ident::is_ident_byte))
+    .then_some(rest)
+}
 
 /// Collapse whitespace runs to one space, trim, and join `a . b` to `a.b`.
 #[must_use]
@@ -319,5 +417,71 @@ mod tests {
             })
             .collect();
         assert_eq!(shape, ["{", "{", "{", ";", "}", "}", "}"]);
+    }
+
+    #[test]
+    fn scopes_group_direct_statements_with_nesting() {
+        let tokens = lex("package p;\nmessage A {\n  int32 a = 1;\n  enum B {\n    X = 0;\n  }\n}\nenum C { Y = 0; }\n").unwrap();
+        let s = scopes(&tokens);
+        let shape: Vec<(Option<&str>, usize, usize, Vec<&str>)> = s
+            .iter()
+            .map(|sc| {
+                (
+                    sc.header.as_deref(),
+                    sc.line,
+                    sc.nesting,
+                    sc.statements.iter().map(|(_, t)| t.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (None, 1, 0, vec!["package p"]),
+                (Some("message A"), 2, 0, vec!["int32 a = 1"]),
+                (Some("enum B"), 4, 1, vec!["X = 0"]),
+                (Some("enum C"), 8, 0, vec!["Y = 0"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn enum_values_reads_only_the_top_level_enum() {
+        let src = "enum MediaKind {\n  MEDIA_KIND_UNSPECIFIED = 0;\n  MEDIA_KIND_AUDIO = 1;\n  option allow_alias = true;\n}\n\
+                   message M {\n  enum MediaKind {\n    NESTED_ONLY = 0;\n  }\n}\n";
+        let sc = scopes(&lex(src).unwrap());
+        let names: Vec<String> = enum_values(&sc, "MediaKind")
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "MEDIA_KIND_UNSPECIFIED",
+                "MEDIA_KIND_AUDIO",
+                "option allow_alias"
+            ]
+        );
+        assert_eq!(enum_values(&sc, "MediaKind")[1].0, 3);
+        assert!(enum_values(&sc, "Missing").is_empty());
+        // Nested-only declaration: nothing.
+        let nested = scopes(&lex("message M {\n  enum MediaKind {\n    A = 0;\n  }\n}\n").unwrap());
+        assert!(enum_values(&nested, "MediaKind").is_empty());
+    }
+
+    #[test]
+    fn starts_with_keyword_needs_an_identifier_boundary() {
+        assert_eq!(
+            starts_with_keyword("import \"a.proto\"", "import"),
+            Some(" \"a.proto\"")
+        );
+        assert_eq!(
+            starts_with_keyword("import\"a.proto\"", "import"),
+            Some("\"a.proto\"")
+        );
+        assert_eq!(starts_with_keyword("import", "import"), Some(""));
+        assert_eq!(starts_with_keyword("imports x", "import"), None);
+        assert_eq!(starts_with_keyword("import_x y", "import"), None);
+        assert_eq!(starts_with_keyword("x import", "import"), None);
     }
 }

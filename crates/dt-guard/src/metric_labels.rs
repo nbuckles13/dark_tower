@@ -16,10 +16,15 @@
 //!   Lazy reasons emit `lazy_pii_safe_reason` AND discard the marker.
 //!   Suppresses Cat B only (NOT Cat A, NOT Rule 2 cardinality, NOT Rule 3 naming).
 
+use crate::common::kind_labels::{
+    is_projection_value, KindKeys, LABELS_RS, MH_CRATE_PREFIX, RUST_PROJECTION_HOME,
+};
 use crate::common::path_safety::to_repo_relative;
 use crate::common::scan::warn_skip;
 use crate::common::status::emit_ok;
-use crate::common::test_code_filter::is_scan_exempt;
+use crate::common::test_code_filter::{
+    compute_test_block_ranges, is_line_in_test_block, is_scan_exempt,
+};
 use crate::ignore::is_lazy_reason;
 use crate::metric_macros::{MacroKind, MACRO_NAME_ALTERNATION};
 use anyhow::{Context, Result};
@@ -50,6 +55,16 @@ pub const LAZY_PII_SAFE_REASON_RULE_ID: &str = "lazy_pii_safe_reason";
 pub const METRIC_NAME_LENGTH_RULE_ID: &str = "metric_name_length";
 pub const METRIC_NAME_NAMING_RULE_ID: &str = "metric_name_naming";
 pub const PARSE_ERROR_RULE_ID: &str = "parse_error";
+/// A `media_kind` / `content_kind` label whose value is not a projection
+/// `.label()` call, outside the Rust projection home (label-taxonomy.md
+/// §"Carried: `media_kind` and `content_kind`").
+pub const KIND_LABEL_LITERAL_RULE_ID: &str = "kind_label_literal";
+/// A kind label on an `mh-service` metric: MH is type-blind (ADR-0036 §7).
+pub const KIND_LABEL_ON_MH_RULE_ID: &str = "kind_label_on_mh";
+/// The kind-label rules could not evaluate their input (key constants
+/// unresolved, projection home missing or holding no values, no kind-labelled
+/// site seen). Never "fixed" by loosening a content rule.
+pub const KIND_LABEL_VACUOUS_RULE_ID: &str = "kind_label_vacuous";
 
 /// Opener for a `metrics`-crate macro invocation.
 ///
@@ -880,14 +895,88 @@ fn find_metric_files(repo_root: &Path) -> Vec<PathBuf> {
 // Entry point
 // -----------------------------------------------------------------------------
 
-pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
-    let rs_files = find_metric_files(repo_root);
-    if rs_files.is_empty() {
-        emit_ok("metric-labels-no-files");
-        return Ok(());
-    }
+/// Per-run tallies of the kind-label rules: the positive control that the
+/// matcher saw real sites (zero is vacuity, not a clean pass).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct KindStats {
+    /// Metric-macro label args whose key is a kind key, outside test code.
+    pub sites: usize,
+}
 
+/// The kind-label rules' inputs: the resolved keys, or the vacuity finding
+/// that stands in for them.
+fn load_kind_keys(repo_root: &Path, findings: &mut Vec<Finding>) -> Option<KindKeys> {
+    let vacuous = |message: String| Finding {
+        file: LABELS_RS.to_string(),
+        line: 0,
+        rule_id: KIND_LABEL_VACUOUS_RULE_ID,
+        message,
+    };
+    let keys = match std::fs::read_to_string(repo_root.join(LABELS_RS)) {
+        Ok(src) => match KindKeys::load(&src) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                findings.push(vacuous(e));
+                None
+            }
+        },
+        Err(e) => {
+            findings.push(vacuous(format!("cannot read {LABELS_RS}: {e}")));
+            None
+        }
+    };
+    // The Rust projection home must exist and hold the projection: a moved or
+    // emptied home would leave the allowance pointing at nothing.
+    let home_ok = std::fs::read_to_string(repo_root.join(RUST_PROJECTION_HOME))
+        .is_ok_and(|src| rust_home_holds_the_projection(&src));
+    if !home_ok {
+        findings.push(Finding {
+            file: RUST_PROJECTION_HOME.to_string(),
+            line: 0,
+            rule_id: KIND_LABEL_VACUOUS_RULE_ID,
+            message: format!(
+                "the Rust kind-label projection home {RUST_PROJECTION_HOME} is missing or \
+                 holds no `label()` value literals; update RUST_PROJECTION_HOME \
+                 (common::kind_labels) in the same change that moves it"
+            ),
+        });
+    }
+    keys
+}
+
+/// The `pub const fn label(self) -> &'static str` value functions of the Rust
+/// projection home, as the number of string-literal match arms in each.
+fn rust_home_label_arms(src: &str) -> Vec<usize> {
+    const LABEL_FN: &str = "pub const fn label(self) -> &'static str {";
+    src.match_indices(LABEL_FN)
+        .map(|(at, _)| {
+            let body = src.get(at + LABEL_FN.len()..).unwrap_or("");
+            // The fn body ends at the first line that closes it at the
+            // method's own indentation (`    }`).
+            let end = body.find("\n    }\n").unwrap_or(body.len());
+            body.get(..end).unwrap_or("").matches("=> \"").count()
+        })
+        .collect()
+}
+
+/// Whether the Rust projection home holds the projection: `struct
+/// KindLabels`, its `from_proto`, and ONE value function per kind key, each
+/// with at least two value arms (a closed set has at least two values).
+fn rust_home_holds_the_projection(src: &str) -> bool {
+    let arms = rust_home_label_arms(src);
+    src.contains("pub struct KindLabels")
+        && src.contains("pub const fn from_proto(")
+        && arms.len() == crate::common::kind_labels::KIND_LABEL_KEYS.len()
+        && arms.iter().all(|n| *n >= 2)
+}
+
+/// Every finding over the real tree, plus the files scanned and the kind
+/// tallies (for the positive-control tests).
+fn collect(repo_root: &Path) -> Result<(Vec<Finding>, usize, KindStats)> {
+    let rs_files = find_metric_files(repo_root);
     let mut findings: Vec<Finding> = Vec::new();
+    let mut stats = KindStats::default();
+    let kind = load_kind_keys(repo_root, &mut findings);
     for rs_path in &rs_files {
         let rel_path = to_repo_relative(repo_root, rs_path);
         let src = std::fs::read_to_string(rs_path)
@@ -905,10 +994,33 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
 
         let stripped = strip_comments_preserve_layout(&src);
         check_source(&stripped, &rel_path, &markers, &mut findings);
+        if let Some(kind) = &kind {
+            check_kind_labels(&stripped, &rel_path, kind, &mut findings, &mut stats);
+        }
+    }
+    if kind.is_some() && stats.sites == 0 {
+        findings.push(Finding {
+            file: "crates".to_string(),
+            line: 0,
+            rule_id: KIND_LABEL_VACUOUS_RULE_ID,
+            message: "no metric-macro label arg keyed by a kind label was recognised in the \
+                      tree; MC's per-kind recorders carry several, so the matcher is not \
+                      seeing them"
+                .to_string(),
+        });
+    }
+    Ok((findings, rs_files.len(), stats))
+}
+
+pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
+    let (findings, files, _) = collect(repo_root)?;
+    if files == 0 && findings.is_empty() {
+        emit_ok("metric-labels-no-files");
+        return Ok(());
     }
 
     if findings.is_empty() {
-        emit_ok(format!("metric-labels-clean-{}-files", rs_files.len()));
+        emit_ok(format!("metric-labels-clean-{files}-files"));
         return Ok(());
     }
     for f in &findings {
@@ -917,8 +1029,65 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
     anyhow::bail!(
         "metric-labels: {} violation(s) across {} file(s)",
         findings.len(),
-        rs_files.len()
+        files
     );
+}
+
+/// The kind-label rules over one comment-stripped file. Test code is exempt
+/// (`#[cfg(test)]` blocks via `common::test_code_filter`; test PATHS never
+/// reach here, `find_metric_files` drops them).
+fn check_kind_labels(
+    stripped_src: &str,
+    rel_path: &str,
+    kind: &KindKeys,
+    findings: &mut Vec<Finding>,
+    stats: &mut KindStats,
+) {
+    let test_blocks = compute_test_block_ranges(stripped_src);
+    for inv in find_macro_invocations(stripped_src) {
+        if inv.kind.is_describe() || is_line_in_test_block(&test_blocks, inv.start_lineno) {
+            continue;
+        }
+        let Some(body) = inv.body.as_ref() else {
+            continue; // reported as parse_error by `check_source`
+        };
+        for arg in split_top_level_args(body).iter().skip(1) {
+            let Some(idx) = find_top_level_fatarrow(arg) else {
+                continue;
+            };
+            let (key_expr, val_expr) = (
+                arg.get(..idx).unwrap_or(""),
+                arg.get(idx + 2..).unwrap_or(""),
+            );
+            let Some(key) = kind.key_of(key_expr) else {
+                continue;
+            };
+            stats.sites += 1;
+            if rel_path.starts_with(MH_CRATE_PREFIX) {
+                findings.push(Finding {
+                    file: rel_path.to_string(),
+                    line: inv.start_lineno,
+                    rule_id: KIND_LABEL_ON_MH_RULE_ID,
+                    message: format!(
+                        "`{key}` on an MH metric: MH is type-blind (ADR-0036 §7) and labels \
+                         by behaviour, never by kind — remove the label"
+                    ),
+                });
+            } else if rel_path != RUST_PROJECTION_HOME && !is_projection_value(val_expr) {
+                findings.push(Finding {
+                    file: rel_path.to_string(),
+                    line: inv.start_lineno,
+                    rule_id: KIND_LABEL_LITERAL_RULE_ID,
+                    message: format!(
+                        "`{key}` value `{}` is not a projection value: take a `KindLabels` \
+                         (crates/mc-service/src/media_kind.rs) and pass `….{key}.label()`; \
+                         kind-label values are spelled only in the projection home",
+                        val_expr.trim()
+                    ),
+                });
+            }
+        }
+    }
 }
 
 #[expect(
@@ -1483,5 +1652,215 @@ mod tests {
         assert_eq!(literal_value_too_long(&long), Some(65));
         let short = r#""short""#;
         assert_eq!(literal_value_too_long(short), None);
+    }
+
+    // -- Kind-label rules (2026-10-26) ----------------------------------------
+
+    const KIND_LABELS_RS: &str = r#"
+pub const MEDIA_KIND_LABEL: &str = "media_kind";
+pub const CONTENT_KIND_LABEL: &str = "content_kind";
+"#;
+    const MC: &str = "crates/mc-service/src/observability/metrics.rs";
+
+    fn kind_findings_with(
+        src: &str,
+        path: &str,
+        keys: &KindKeys,
+    ) -> (Vec<(&'static str, String, usize)>, KindStats) {
+        let mut f = Vec::new();
+        let mut stats = KindStats::default();
+        check_kind_labels(
+            &strip_comments_preserve_layout(src),
+            path,
+            keys,
+            &mut f,
+            &mut stats,
+        );
+        (
+            f.into_iter().map(|x| (x.rule_id, x.file, x.line)).collect(),
+            stats,
+        )
+    }
+
+    fn kind_findings(src: &str, path: &str) -> (Vec<(&'static str, String, usize)>, KindStats) {
+        kind_findings_with(src, path, &KindKeys::load(KIND_LABELS_RS).unwrap())
+    }
+
+    /// Each red form, with the exact (rule, file, line) it must produce.
+    const RED: &[(&str, usize)] = &[
+        // const key, literal value
+        ("fn a() {\n    counter!(\"m\", MEDIA_KIND_LABEL => \"audio\").increment(1);\n}\n", 2),
+        // literal key, literal value
+        ("fn a() {\n    counter!(\"m\", \"content_kind\" => \"main\").increment(1);\n}\n", 2),
+        // path-qualified const key, bare variable value
+        ("fn a(v: &str) {\n\n    gauge!(\"m\", common::observability::labels::MEDIA_KIND_LABEL => v).set(1.0);\n}\n", 3),
+        // brace form, `.to_string()` literal
+        ("fn a() {\n    counter!{\"m\", CONTENT_KIND_LABEL => \"screen\".to_string()}.increment(1);\n}\n", 2),
+    ];
+
+    #[test]
+    fn kind_label_literal_hits_every_red_form_at_its_line() {
+        for (src, line) in RED {
+            let (f, stats) = kind_findings(src, MC);
+            assert_eq!(
+                f,
+                vec![(KIND_LABEL_LITERAL_RULE_ID, MC.to_string(), *line)],
+                "{src}"
+            );
+            assert_eq!(stats.sites, 1, "{src}");
+        }
+    }
+
+    #[test]
+    fn projection_values_home_comments_and_tests_stay_green() {
+        let green = "fn a(l: KindLabels) {\n    counter!(\"m\", MEDIA_KIND_LABEL => l.media_kind.label(), CONTENT_KIND_LABEL => l.content_kind.label()).increment(1);\n    // counter!(\"m\", MEDIA_KIND_LABEL => \"audio\");\n}\n#[cfg(test)]\nmod tests {\n    fn t() { counter!(\"m\", MEDIA_KIND_LABEL => \"audio\").increment(1); }\n}\n";
+        let (f, stats) = kind_findings(green, MC);
+        assert!(f.is_empty(), "{f:?}");
+        assert_eq!(
+            stats.sites, 2,
+            "both projection-valued keys are seen; test code is not"
+        );
+        // The home may spell values.
+        let (f, _) = kind_findings(RED[0].0, RUST_PROJECTION_HOME);
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn any_kind_key_on_mh_is_kind_label_on_mh() {
+        let mh = "crates/mh-service/src/observability/metrics.rs";
+        let src = "fn a(l: KindLabels) {\n    counter!(\"mh_media_x\", MEDIA_KIND_LABEL => l.media_kind.label()).increment(1);\n}\n";
+        let (f, _) = kind_findings(src, mh);
+        assert_eq!(f, vec![(KIND_LABEL_ON_MH_RULE_ID, mh.to_string(), 2)]);
+    }
+
+    /// The neutered-matcher proof: with an EMPTY key set every red fixture goes
+    /// green and nothing is seen, so the reds above come from the matcher.
+    #[test]
+    fn red_kind_fixtures_go_green_with_the_key_set_neutered() {
+        let neutered = KindKeys::with_keys(KIND_LABELS_RS, &[]).unwrap();
+        for (src, _) in RED {
+            let (f, stats) = kind_findings_with(src, MC, &neutered);
+            assert!(f.is_empty(), "{src}: {f:?}");
+            assert_eq!(stats.sites, 0);
+        }
+    }
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    /// Positive control on the REAL tree: clean of kind findings, the home
+    /// resolved, and the matcher demonstrably saw MC's kind-labelled sites.
+    #[test]
+    fn the_real_tree_is_kind_clean_and_non_vacuous() {
+        let (findings, files, stats) = collect(&repo_root()).unwrap();
+        let kind: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.starts_with("kind_label"))
+            .collect();
+        assert!(kind.is_empty(), "{kind:?}");
+        assert!(files > 0);
+        assert!(
+            stats.sites >= 10,
+            "MC's per-kind recorders + zero-init: saw {}",
+            stats.sites
+        );
+    }
+
+    /// A literal planted into a copy of REAL `metrics.rs` must hit.
+    #[test]
+    fn a_literal_planted_in_real_mc_metrics_hits() {
+        let real = std::fs::read_to_string(repo_root().join(MC)).unwrap();
+        let planted = real.replacen(
+            "MEDIA_KIND_LABEL => labels.media_kind.label(),",
+            "MEDIA_KIND_LABEL => \"audio\",",
+            1,
+        );
+        assert_ne!(
+            planted, real,
+            "the plant site moved; re-anchor this control"
+        );
+        let (f, _) = kind_findings(&planted, MC);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].0, KIND_LABEL_LITERAL_RULE_ID);
+    }
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    const HOME_OK: &str = "pub struct KindLabels;\nimpl KindLabels {\n    pub const fn from_proto(k: K) -> Option<Self> { None }\n}\nimpl A {\n    pub const fn label(self) -> &'static str {\n        match self {\n            Self::A => \"audio\",\n            Self::V => \"video\",\n        }\n    }\n}\nimpl C {\n    pub const fn label(self) -> &'static str {\n        match self {\n            Self::M => \"main\",\n            Self::S => \"screen\",\n        }\n    }\n}\n";
+
+    #[test]
+    fn missing_labels_or_home_is_vacuous() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = Vec::new();
+        assert!(load_kind_keys(dir.path(), &mut f).is_none());
+        let rules: Vec<_> = f.iter().map(|x| (x.rule_id, x.file.as_str())).collect();
+        assert_eq!(
+            rules,
+            vec![
+                (KIND_LABEL_VACUOUS_RULE_ID, LABELS_RS),
+                (KIND_LABEL_VACUOUS_RULE_ID, RUST_PROJECTION_HOME)
+            ]
+        );
+    }
+
+    /// A home that exists but lost the projection (value arms removed, or the
+    /// constructs gone) is vacuous, not a pass.
+    #[test]
+    fn a_present_home_without_the_projection_is_vacuous() {
+        assert!(rust_home_holds_the_projection(HOME_OK));
+        let real = std::fs::read_to_string(repo_root().join(RUST_PROJECTION_HOME)).unwrap();
+        assert!(
+            rust_home_holds_the_projection(&real),
+            "the real home holds it"
+        );
+        for broken in [
+            HOME_OK.replace("            Self::V => \"video\",\n", ""),
+            HOME_OK.replace("pub struct KindLabels", "pub struct Other"),
+            HOME_OK.replace(
+                "impl C {\n    pub const fn label",
+                "impl C {\n    pub const fn name",
+            ),
+            "fn x() -> &'static str { match 1 { _ => \"y\" } }\n".to_string(),
+        ] {
+            assert!(!rust_home_holds_the_projection(&broken), "{broken}");
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), LABELS_RS, KIND_LABELS_RS);
+            write(dir.path(), RUST_PROJECTION_HOME, &broken);
+            let mut f = Vec::new();
+            assert!(load_kind_keys(dir.path(), &mut f).is_some());
+            assert_eq!(
+                f.iter()
+                    .map(|x| (x.rule_id, x.file.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![(KIND_LABEL_VACUOUS_RULE_ID, RUST_PROJECTION_HOME)]
+            );
+        }
+    }
+
+    /// Keys and home present, but no kind-keyed site anywhere: vacuous.
+    #[test]
+    fn zero_kind_sites_is_vacuous() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), LABELS_RS, KIND_LABELS_RS);
+        write(dir.path(), RUST_PROJECTION_HOME, HOME_OK);
+        write(
+            dir.path(),
+            "crates/gc-service/src/observability/metrics.rs",
+            "pub fn f() { counter!(\"gc_x_total\", \"region\" => region).increment(1); }\n",
+        );
+        let (f, files, stats) = collect(dir.path()).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(stats.sites, 0);
+        assert_eq!(
+            f.iter()
+                .map(|x| (x.rule_id, x.file.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(KIND_LABEL_VACUOUS_RULE_ID, "crates")]
+        );
     }
 }

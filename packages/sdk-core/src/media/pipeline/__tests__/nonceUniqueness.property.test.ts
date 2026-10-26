@@ -20,7 +20,8 @@ import { bytesToHex } from '../../frame/hex.js';
 import { AES_256_KEY_BYTES, parseSframe } from '../../frame/sframe.js';
 import { kekHolderWith } from '../../__tests__/helpers.js';
 import { MeetingIdentity } from '../../setup/identity.js';
-import { MEDIA_KIND_LABELS, MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKind } from '../../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { TransmitKeyManager } from '../../lifecycle/transmitKeys.js';
 import { EgressPipeline, type DatagramSender } from '../egress.js';
 import { VideoEgress } from '../videoEgress.js';
@@ -53,12 +54,12 @@ describe('nonce uniqueness across audio and video (one manager per sender)', () 
     const sink = new InMemoryMetricsSink();
     const audioMetrics = new MediaKindMetrics(
       { clientVersion: 'v', orgId: 'o' },
-      MEDIA_KIND_LABELS.Audio,
+      MediaKind.AUDIO,
       sink,
     );
     const videoMetrics = new MediaKindMetrics(
       { clientVersion: 'v', orgId: 'o' },
-      MEDIA_KIND_LABELS.Video,
+      MediaKind.VIDEO_CAMERA,
       sink,
     );
     const datagrams: Uint8Array[] = [];

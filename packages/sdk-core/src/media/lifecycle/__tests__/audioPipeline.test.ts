@@ -618,6 +618,7 @@ describe('capture failures are counted by bounded outcome (story 3 R-19, R-30)',
       org_id: 'demo',
       key_custody: 'operator',
       media_kind: 'audio',
+      content_kind: 'main',
       outcome: 'ended',
     });
   });

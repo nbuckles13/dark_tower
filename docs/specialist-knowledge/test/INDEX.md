@@ -29,7 +29,7 @@
 - Test-domain guards → `crates/dt-guard/src/test_coverage.rs`, `test_registration.rs`, `test_rigidity.rs`, `ts_test_removal.rs`
 - Credential-lifetime guard (full-tree); cross-boundary exclusion predicate → `crates/dt-guard/src/ts_retained_credentials.rs`, `cross_boundary_scope.rs`
 - Media telemetry-deny guard + e2e; client-metric export fixtures → `crates/dt-guard/src/telemetry_macros.rs`, `tests/media_telemetry_deny_e2e.rs`, `tests/client_metrics_export_fixtures.rs`, `scripts/guards/simple/media-telemetry-deny.{sh,yaml}`
-- Release-build-profile + env-config guards + e2e → `crates/dt-guard/src/release_build_profile.rs`, `env_config.rs`, `tests/release_build_profile_e2e.rs`; internal-proto no-key-material self-test → `scripts/guards/validate-internal-proto-no-key-material.test.sh`
+- Release-build-profile + env-config guards + e2e → `crates/dt-guard/src/release_build_profile.rs`, `env_config.rs`, `tests/release_build_profile_e2e.rs`; proto guard ports (no-key-material, no-Any) → in-module tests in `crates/dt-guard/src/internal_proto_no_key_material.rs`, `proto_no_any.rs`, e2e `crates/dt-guard/tests/proto_ports_e2e.rs`
 
 ## Media Path Tests (ADR-0036)
 - Cross-language frame-v3 vector generator (non-production reference crypto; only independent check on TS) + suites → `crates/media-vector-gen/src/lib.rs`, `crates/media-vector-gen/tests/`

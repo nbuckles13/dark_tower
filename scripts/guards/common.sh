@@ -41,8 +41,8 @@ fi
 # Print the root a guard scans: the value of the variable NAMED by $1 when — and only
 # when — DEVLOOP_TEST is EXACTLY "1" and that variable is set and non-empty; otherwise
 # <real_root>. The ONE home of the seam every root-scanning guard's self-test uses
-# (validate-subdomain-regex-sync.sh, validate-internal-proto-no-key-material.sh,
-# validate-dev-cluster-verbs.sh).
+# (validate-subdomain-regex-sync.sh, validate-dev-cluster-verbs.sh; the two proto guards
+# that used it became dt-guard subcommands with a `--root` flag on 2026-10-26).
 #
 # WHY THE GATE: a guard's FAILURE branches can only be driven against a synthetic tree,
 # but redirecting the root at a clean tree outside a test would be a SILENT-VALIDATION-

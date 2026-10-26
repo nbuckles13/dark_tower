@@ -104,7 +104,10 @@ impl WebTransportServer {
         // and advertised caps are one value. Video reading 0 is the operator's
         // confirmation that the R-26 video-off lever applied.
         for kind in MediaKindLabel::ALL {
-            metrics::set_receive_slot_cap(kind, kind.of(client_media_config.receive_slot_caps));
+            metrics::set_receive_slot_cap(
+                kind.labels(),
+                kind.of(client_media_config.receive_slot_caps),
+            );
         }
         // The directed minimum keyframe interval, from the SAME validated
         // `VideoEncoding` the video directive carries.
@@ -117,7 +120,7 @@ impl WebTransportServer {
         // mean "not up or not scraped", never "nobody is muted". The
         // controller's health walk then keeps it recomputed from live state.
         for kind in MediaKindLabel::ALL {
-            metrics::set_server_muted_sources(kind, 0);
+            metrics::set_server_muted_sources(kind.labels(), 0);
         }
         // Same discipline: the published settle window is the enforced one.
         metrics::set_connect_settle_window(client_media_config.connect_settle_window);

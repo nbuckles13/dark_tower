@@ -85,15 +85,16 @@ describe('UnfulfilledSlots', () => {
     ]);
   });
 
-  it('labels are exactly the base set + media_kind: no identity, no slot id', () => {
+  it('labels are exactly the base set + media_kind + content_kind: no identity, no slot id', () => {
     const h = harness();
     h.tracker.enter(9);
     h.tracker.exit(9);
     for (const m of h.sink.getRecordedMetrics()) {
       expect(Object.keys(m.labels).sort()).toEqual(
-        ['client_version', 'key_custody', 'media_kind', 'org_id'].sort(),
+        ['client_version', 'content_kind', 'key_custody', 'media_kind', 'org_id'].sort(),
       );
       expect(m.labels['media_kind']).toBe('video');
+      expect(m.labels['content_kind']).toBe('main');
     }
   });
 });

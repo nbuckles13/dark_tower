@@ -1,7 +1,13 @@
 //! Proof-of-trap fixtures for `dt-guard metric-labels` — every emittable rule
 //! ID: `label_secret`, `label_pii`, `label_naming`, `literal_value_length`,
 //! `unbounded_value`, `lazy_pii_safe_reason`, `metric_name_length`,
-//! `metric_name_naming`, `parse_error`.
+//! `metric_name_naming`, `parse_error`, and the kind-label rules
+//! `kind_label_literal`, `kind_label_on_mh`, `kind_label_vacuous`.
+//!
+//! Every fixture tree carries the kind-label SCAFFOLD (the key constants in
+//! `labels.rs`, the Rust projection home, and one projection-valued kind site),
+//! because the kind rules refuse to report clean without them; the
+//! `kind_label_vacuous` case is the tree WITHOUT it.
 //!
 //! Each fixture is a single `crates/gc-service/src/observability/metrics.rs`
 //! (the PRIMARY scan path, which bypasses `is_scan_exempt` and is always
@@ -21,8 +27,32 @@ use std::path::Path;
 
 const METRICS_REL: &str = "crates/gc-service/src/observability/metrics.rs";
 
+const LABELS_REL: &str = "crates/common/src/observability/labels.rs";
+const HOME_REL: &str = "crates/mc-service/src/media_kind.rs";
+const MH_METRICS_REL: &str = "crates/mh-service/src/observability/metrics.rs";
+/// One kind-labelled site whose values come from the projection (green).
+const KIND_SITE: &str = "pub fn k(l: L) { counter!(\"gc_k_total\", MEDIA_KIND_LABEL => l.media_kind.label(), CONTENT_KIND_LABEL => l.content_kind.label()).increment(1); }\n";
+
+/// A projection home the guard accepts: `KindLabels`, `from_proto`, and one
+/// two-valued `label()` per kind key.
+const HOME_BODY: &str = "pub struct KindLabels;\n\
+impl KindLabels {\n    pub const fn from_proto(k: K) -> Option<Self> { None }\n}\n\
+impl A {\n    pub const fn label(self) -> &'static str {\n        match self {\n            Self::A => \"audio\",\n            Self::V => \"video\",\n        }\n    }\n}\n\
+impl C {\n    pub const fn label(self) -> &'static str {\n        match self {\n            Self::M => \"main\",\n            Self::S => \"screen\",\n        }\n    }\n}\n";
+
+/// The kind-label inputs: key constants and a projection home holding values.
+fn write_kind_scaffold(root: &Path) {
+    common::write(
+        root,
+        LABELS_REL,
+        "pub const MEDIA_KIND_LABEL: &str = \"media_kind\";\npub const CONTENT_KIND_LABEL: &str = \"content_kind\";\n",
+    );
+    common::write(root, HOME_REL, HOME_BODY);
+}
+
 fn write_metrics(root: &Path, body: &str) {
-    common::write(root, METRICS_REL, body);
+    write_kind_scaffold(root);
+    common::write(root, METRICS_REL, &format!("{body}{KIND_SITE}"));
 }
 
 fn negatives() -> Vec<Case> {
@@ -141,6 +171,43 @@ fn negatives() -> Vec<Case> {
                 );
             },
             expect: Expect::Exact(&["parse_error"]),
+        },
+        // kind_label_literal: a kind key (constant spelling) whose value is a
+        // literal, outside the projection home.
+        Case {
+            name: "kind_label_literal",
+            build: |root| {
+                write_metrics(
+                    root,
+                    "pub fn f() { counter!(\"gc_x_total\", MEDIA_KIND_LABEL => \"audio\").increment(1); }\n",
+                );
+            },
+            expect: Expect::Exact(&["kind_label_literal"]),
+        },
+        // kind_label_on_mh: a projection-valued kind label, but on an MH metric.
+        Case {
+            name: "kind_label_on_mh",
+            build: |root| {
+                write_metrics(
+                    root,
+                    "pub fn f() { counter!(\"gc_x_total\", \"region\" => region).increment(1); }\n",
+                );
+                common::write(root, MH_METRICS_REL, KIND_SITE);
+            },
+            expect: Expect::Exact(&["kind_label_on_mh"]),
+        },
+        // kind_label_vacuous: the tree WITHOUT the scaffold — no key constants
+        // and no projection home is never "nothing to check".
+        Case {
+            name: "kind_label_vacuous",
+            build: |root| {
+                common::write(
+                    root,
+                    METRICS_REL,
+                    "pub fn f() { counter!(\"gc_x_total\", \"region\" => region).increment(1); }\n",
+                );
+            },
+            expect: Expect::Exact(&["kind_label_vacuous"]),
         },
     ]
 }

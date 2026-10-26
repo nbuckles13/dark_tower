@@ -18,14 +18,16 @@
 //! anchor is absent, so a mutation cannot silently no-op.
 
 use dt_guard::client_metrics_export::{
-    collect_findings, Finding, IdentityPolicy, CLIENT_ALERT_GROUPS_BY_INSTANCE_RULE_ID,
-    DEAD_ALERT_REFERENCE_RULE_ID, EMPTY_INPUT_RULE_ID, EXPIRATION_RELATION_RULE_ID,
-    EXPORTED_WITHOUT_EMITTER_RULE_ID, EXPORTER_SUFFIXING_ENABLED_RULE_ID,
-    EXPORT_SET_MISMATCH_RULE_ID, FORWARDED_KEY_NOT_KEPT_RULE_ID, IDENTITY_KEY_FORWARDED_RULE_ID,
-    KEEP_KEY_NOT_FORWARDED_RULE_ID, LABEL_KEY_NOT_FORWARDED_RULE_ID, MISSING_EXPORT_MARKER_RULE_ID,
-    REJECT_TOKEN_MISCLASSIFIED_RULE_ID, REJECT_TOKEN_UNCLASSIFIED_RULE_ID,
-    SENTINEL_COLLISION_RULE_ID, TRIPWIRE_LIST_STALE_RULE_ID, TRIPWIRE_RATE_WRAPPED_RULE_ID,
-    UNRESOLVED_LABEL_BAG_RULE_ID,
+    collect_findings, identity_label_cases, Finding, IdentityPolicy,
+    CLIENT_ALERT_GROUPS_BY_INSTANCE_RULE_ID, DEAD_ALERT_REFERENCE_RULE_ID, EMPTY_INPUT_RULE_ID,
+    EXPIRATION_RELATION_RULE_ID, EXPORTED_WITHOUT_EMITTER_RULE_ID,
+    EXPORTER_SUFFIXING_ENABLED_RULE_ID, EXPORT_SET_MISMATCH_RULE_ID,
+    FORWARDED_KEY_NOT_KEPT_RULE_ID, IDENTITY_KEY_FORWARDED_RULE_ID, KEEP_KEY_NOT_FORWARDED_RULE_ID,
+    KIND_COLLECTOR_RULE_DRIFT_RULE_ID, KIND_KEY_NOT_KEPT_RULE_ID, KIND_PROJECTION_TS_DRIFT_RULE_ID,
+    KIND_PROJECTION_VACUOUS_RULE_ID, LABEL_KEY_NOT_FORWARDED_RULE_ID,
+    MISSING_EXPORT_MARKER_RULE_ID, REJECT_TOKEN_MISCLASSIFIED_RULE_ID,
+    REJECT_TOKEN_UNCLASSIFIED_RULE_ID, SENTINEL_COLLISION_RULE_ID, TRIPWIRE_LIST_STALE_RULE_ID,
+    TRIPWIRE_RATE_WRAPPED_RULE_ID, UNRESOLVED_LABEL_BAG_RULE_ID,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -47,6 +49,7 @@ const MC_ALERTS: &str = "infra/docker/prometheus/rules/mc-alerts.yaml";
 const CLIENT_ALERTS: &str = "infra/docker/prometheus/rules/client-alerts.yaml";
 const VECTORS: &str = "proto/test-vectors/frame-v3.vectors.json";
 const TAXONOMY: &str = "docs/observability/label-taxonomy.md";
+const SIGNALING_PROTO: &str = "proto/dark_tower/signaling/v1/signaling.proto";
 
 const EXPORTED: &[&str] = &[
     "dt_client_media_frames_sent_total",
@@ -90,6 +93,23 @@ const REJECT_TOKENS: &[(&str, &str, bool)] = &[
     ("stream_slot_mismatch", "codec", true),
 ];
 
+/// The taxonomy's kind rows, projection table and identity-case `pass =` list.
+const KIND_ROWS: &str = "\
+| `media_kind` | `audio`, `video` | Yes | MC and client |
+| `content_kind` | `main`, `screen` | Yes | MC and client |
+
+| Wire `MediaKind` | `media_kind` | `content_kind` |
+|---|---|---|
+| `MEDIA_KIND_UNSPECIFIED` | — | — |
+| `MEDIA_KIND_AUDIO` | `audio` | `main` |
+| `MEDIA_KIND_VIDEO_CAMERA` | `video` | `main` |
+| `MEDIA_KIND_VIDEO_SCREEN` | `video` | `screen` |
+
+```identity-label-cases
+pass = key_custody, media_kind, content_kind
+```
+";
+
 const POLICY_BLOCK: &str = "\
 ```identity-label-policy
 containment = meeting, participant, sender, session, slot, stream
@@ -129,7 +149,9 @@ impl Tree {
         cfg.push_str(
             "  transform/client_metric_labels:\n    metric_statements:\n      - context: datapoint\n        \
              statements:\n          - keep_keys(attributes, [\"client_version\", \"org_id\", \
-             \"key_custody\", \"reason\", \"outcome\", \"action\", \"source\", \"mode\"])\n  \
+             \"key_custody\", \"media_kind\", \"content_kind\", \"reason\", \"outcome\", \"action\", \"source\", \"mode\"])\n          \
+             - set(attributes[\"media_kind\"], \"invalid\") where attributes[\"media_kind\"] != nil and (not IsString(attributes[\"media_kind\"]) or not IsMatch(attributes[\"media_kind\"], \"^(audio|video)$\"))\n          \
+             - set(attributes[\"content_kind\"], \"invalid\") where attributes[\"content_kind\"] != nil and (not IsString(attributes[\"content_kind\"]) or not IsMatch(attributes[\"content_kind\"], \"^(main|screen)$\"))\n  \
              deltatocumulative:\n    max_stale: 20m\nexporters:\n  prometheus:\n    \
              metric_expiration: 10m\n    add_metric_suffixes: false\n",
         );
@@ -137,7 +159,7 @@ impl Tree {
 
         put(
             GC_FILTER,
-            r#"use common::observability::labels::KEY_CUSTODY_LABEL;
+            r#"use common::observability::labels::{CONTENT_KIND_LABEL, KEY_CUSTODY_LABEL, MEDIA_KIND_LABEL};
 
 pub const ALLOWLIST: [&str; 6] = [
     "client_version",
@@ -149,13 +171,15 @@ pub const ALLOWLIST: [&str; 6] = [
     "error.code",
 ];
 
-pub const MEDIA_DATAPOINT_EXTRA: [&str; 6] = [
+pub const MEDIA_DATAPOINT_EXTRA: [&str; 8] = [
     "reason",
     "outcome",
     "action",
     "source",
     "mode",
     KEY_CUSTODY_LABEL,
+    MEDIA_KIND_LABEL,
+    CONTENT_KIND_LABEL,
 ];
 "#
             .into(),
@@ -163,7 +187,9 @@ pub const MEDIA_DATAPOINT_EXTRA: [&str; 6] = [
         put(
             LABELS_RS,
             "pub const KEY_CUSTODY_LABEL: &str = \"key_custody\";\n\
-             pub const KEY_CUSTODY_OPERATOR: &str = \"operator\";\n"
+             pub const KEY_CUSTODY_OPERATOR: &str = \"operator\";\n\
+             pub const MEDIA_KIND_LABEL: &str = \"media_kind\";\n\
+             pub const CONTENT_KIND_LABEL: &str = \"content_kind\";\n"
                 .into(),
         );
 
@@ -175,6 +201,11 @@ import type { MetricsSink, MetricLabels } from '../../telemetry/MetricsSink';
 
 export type MediaFrameDropReason = 'no_roster_entry' | 'no_kek_for_generation' | "unwrap_failed";
 export const KEY_CUSTODY = 'operator';
+export const MEDIA_KIND_LABEL_PROJECTION = {
+  [MediaKind.AUDIO]: { media_kind: 'audio', content_kind: 'main' },
+  [MediaKind.VIDEO_CAMERA]: { media_kind: 'video', content_kind: 'main' },
+  [MediaKind.VIDEO_SCREEN]: { media_kind: 'video', content_kind: 'screen' },
+} as const;
 const DOCS = 'https://example.invalid/docs'; // a URL literal: not a comment
 
 export function mediaMetricLabels(identity: { clientVersion: string; orgId: string }): MetricLabels {
@@ -365,8 +396,14 @@ impl MediaDropReason {
 
         put(VECTORS, vectors_json(REJECT_TOKENS));
         put(
+            SIGNALING_PROTO,
+            "syntax = \"proto3\";\nenum MediaKind {\n  MEDIA_KIND_UNSPECIFIED = 0;\n  \
+             MEDIA_KIND_AUDIO = 1;\n  MEDIA_KIND_VIDEO_CAMERA = 2;\n  MEDIA_KIND_VIDEO_SCREEN = 3;\n}\n"
+                .into(),
+        );
+        put(
             TAXONOMY,
-            format!("# Label taxonomy\n\n### R4\n\n{POLICY_BLOCK}\nMore prose.\n"),
+            format!("# Label taxonomy\n\n{KIND_ROWS}\n### R4\n\n{POLICY_BLOCK}\nMore prose.\n"),
         );
 
         Self { files }
@@ -713,6 +750,56 @@ fn rule4_no_dt_client_literals_at_all_is_empty_input() {
 }
 
 // -----------------------------------------------------------------------------
+// Kind-label projection drift (2026-10-26). The pure-function legs are unit
+// tested in-module; these prove the REAL tree inputs are wired.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn kind_sdk_record_off_the_table_fires_ts_drift() {
+    let f = Tree::valid()
+        .edit(
+            MEDIA_METRICS,
+            "{ media_kind: 'video', content_kind: 'screen' }",
+            "{ media_kind: 'video', content_kind: 'main' }",
+        )
+        .findings();
+    assert_fires(&f, KIND_PROJECTION_TS_DRIFT_RULE_ID);
+}
+
+#[test]
+fn kind_sdk_record_missing_is_vacuous() {
+    let f = Tree::valid()
+        .edit(
+            MEDIA_METRICS,
+            "MEDIA_KIND_LABEL_PROJECTION = {",
+            "PROJECTION = {",
+        )
+        .findings();
+    assert_fires(&f, KIND_PROJECTION_VACUOUS_RULE_ID);
+}
+
+#[test]
+fn kind_collector_rule_off_the_row_fires_rule_drift() {
+    let f = Tree::valid()
+        .edit(COLLECTOR, "^(main|screen)$", "^(main|slides)$")
+        .findings();
+    assert_fires(&f, KIND_COLLECTOR_RULE_DRIFT_RULE_ID);
+}
+
+#[test]
+fn kind_key_dropped_from_gc_extra_is_not_kept() {
+    let f = Tree::valid()
+        .edit(
+            GC_FILTER,
+            "MEDIA_DATAPOINT_EXTRA: [&str; 8]",
+            "MEDIA_DATAPOINT_EXTRA: [&str; 7]",
+        )
+        .edit(GC_FILTER, "    CONTENT_KIND_LABEL,\n];", "];")
+        .findings();
+    assert_fires(&f, KIND_KEY_NOT_KEPT_RULE_ID);
+}
+
+// -----------------------------------------------------------------------------
 // Rule 6: GC parse integrity.
 // -----------------------------------------------------------------------------
 
@@ -721,8 +808,8 @@ fn rule6_parsed_shorter_than_declared_is_empty_input() {
     let f = Tree::valid()
         .edit(
             GC_FILTER,
-            "MEDIA_DATAPOINT_EXTRA: [&str; 6]",
-            "MEDIA_DATAPOINT_EXTRA: [&str; 7]",
+            "MEDIA_DATAPOINT_EXTRA: [&str; 8]",
+            "MEDIA_DATAPOINT_EXTRA: [&str; 9]",
         )
         .findings();
     assert_empty_input_for(&f, GC_FILTER);
@@ -794,7 +881,7 @@ fn rule3_base_allowlist_trace_key_need_not_be_kept() {
 #[test]
 fn rule3_extra_positive_control_missing_is_empty_input() {
     let f = Tree::valid()
-        .edit(GC_FILTER, "[&str; 6] = [\n    \"reason\",", "[&str; 5] = [")
+        .edit(GC_FILTER, "[&str; 8] = [\n    \"reason\",", "[&str; 7] = [")
         .findings();
     assert_empty_input_for(&f, GC_FILTER);
 }
@@ -818,29 +905,8 @@ fn real_identity_cases() -> (Vec<String>, Vec<String>) {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/observability/label-taxonomy.md"),
     )
     .expect("read real label-taxonomy.md");
-    let mut lines = md
-        .lines()
-        .skip_while(|l| l.trim() != "```identity-label-cases");
-    assert!(
-        lines.next().is_some(),
-        "```identity-label-cases block missing"
-    );
-    let (mut fire, mut pass) = (Vec::new(), Vec::new());
-    for line in lines.take_while(|l| l.trim() != "```") {
-        let Some((name, list)) = line.split_once('=') else {
-            continue;
-        };
-        let items = list
-            .split(',')
-            .map(|x| x.trim().to_string())
-            .filter(|x| !x.is_empty());
-        match name.trim() {
-            "fire" => fire.extend(items),
-            "pass" => pass.extend(items),
-            other => panic!("unknown identity-label-cases line {other:?}"),
-        }
-    }
-    (fire, pass)
+    // THE one reader of the block (shared with the kind rules).
+    identity_label_cases(&md).expect("```identity-label-cases block missing")
 }
 
 #[test]
@@ -879,8 +945,8 @@ fn identity_forwarded_extra_key_fires() {
     let f = Tree::valid()
         .edit(
             GC_FILTER,
-            "[&str; 6] = [\n    \"reason\",",
-            "[&str; 7] = [\n    \"reason\",\n    \"stream_id\",",
+            "[&str; 8] = [\n    \"reason\",",
+            "[&str; 9] = [\n    \"reason\",\n    \"stream_id\",",
         )
         .findings();
     assert_fires_with(&f, IDENTITY_KEY_FORWARDED_RULE_ID, "stream_id");

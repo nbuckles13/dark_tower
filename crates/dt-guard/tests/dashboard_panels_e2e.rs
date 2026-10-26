@@ -114,6 +114,22 @@ fn clean_panel() -> String {
 
 fn negatives() -> Vec<Case> {
     vec![
+        // kind_label_co_occurrence: a valid panel whose expr groups by
+        // `media_kind` alone.
+        Case {
+            name: "kind_label_co_occurrence",
+            build: |root| {
+                let p = panel(
+                    "timeseries",
+                    "sum by (media_kind) (increase(gc_x_total[$__rate_interval]))",
+                    "healthy",
+                    true,
+                    "$datasource",
+                );
+                write_tree(root, CATALOG_SEEDED, &p);
+            },
+            expect: Expect::Exact(&["kind_label_co_occurrence"]),
+        },
         Case {
             name: "panel_unit",
             build: |root| {

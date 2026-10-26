@@ -708,7 +708,7 @@ mc_meeting_kek_rotation_pending_age_seconds > mc_meeting_kek_rotation_overdue_th
 #### MCMediaMissingKeyMaterial
 
 **Severity**: Warning
-**Condition**: >5% of received media frames **of one media kind** dropped for missing key material (four reasons: `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry`, `unwrap_failed`), sustained 15 minutes. Since story 3 (OBS-B) numerator, denominator and guard are `sum by (media_kind)`, so a video-only key failure is not diluted by audio and fires on its own; the video re-derivation (R-14 key rules, the frame-rate-free ratio, decode waits landing post-accept) leaves 5% / 15m standing and is in the rule's block.
+**Condition**: >5% of received media frames **of one media kind** dropped for missing key material (four reasons: `no_kek_for_generation`, `kek_generation_stale`, `no_roster_entry`, `unwrap_failed`), sustained 15 minutes. Since story 3 (OBS-B) numerator, denominator and guard are grouped per kind — `sum by (media_kind, content_kind)` since 2026-10-26 — so a video-only key failure is not diluted by audio and fires on its own; **2026-10-26 — series identity, not traffic:** `content_kind` is co-carried on every per-kind series (every series reads `main` until screen share ships, which then fires as its own `(video, screen)` instance rather than diluting the camera); at rollout the new series start empty and `rate()` / the 15m `for:` ramp on them — expected, not an incident; the video re-derivation (R-14 key rules, the frame-rate-free ratio, decode waits landing post-accept) leaves 5% / 15m standing and is in the rule's block.
 **Impact**: Affected participants hear or see nothing (per affected kind) while every server-side signal reads healthy — MH never opens a frame and structurally cannot observe any of the four conditions.
 **Runbook**: [Scenario 16: Missing Key Material](../runbooks/mc-incident-response.md#scenario-16-missing-key-material)
 
@@ -722,12 +722,12 @@ mc_meeting_kek_rotation_pending_age_seconds > mc_meeting_kek_rotation_overdue_th
 **PromQL**:
 ```promql
 (
-  sum by (media_kind) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
+  sum by (media_kind, content_kind) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
   /
-  sum by (media_kind) (rate(dt_client_media_frames_received_total[5m]))
+  sum by (media_kind, content_kind) (rate(dt_client_media_frames_received_total[5m]))
 ) > 0.05
 and
-sum by (media_kind) (rate(dt_client_media_frames_received_total[5m])) > 0
+sum by (media_kind, content_kind) (rate(dt_client_media_frames_received_total[5m])) > 0
 ```
 `for: 15m`
 
@@ -847,7 +847,7 @@ sum(increase(mc_media_send_directives_total{outcome!~"emitted|emitted_empty_targ
 ```
 `for: 0m`
 
-An outcome value here other than `meeting_state_unavailable` means `DirectiveOutcome::alert_class()` and the rules have drifted from the enum: classify it there. **Withdrawals are healthy** and are read from `mc_media_send_directive_withdrawals_total{media_kind, reason}`, never inferred from this counter.
+An outcome value here other than `meeting_state_unavailable` means `DirectiveOutcome::alert_class()` and the rules have drifted from the enum: classify it there. **Withdrawals are healthy** and are read from `mc_media_send_directive_withdrawals_total{media_kind, content_kind, reason}`, never inferred from this counter.
 
 ### Warning Alerts (Media Keys)
 
@@ -1342,9 +1342,11 @@ sum(dt_client_media_kek_retention_violations_total) > 0
 
 **PromQL**:
 ```promql
-sum(rate(dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video"}[5m])) > 0
+sum(rate(dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video", content_kind="main"}[5m])) > 0
 ```
 `for: 10m`
+
+**2026-10-26 — series identity, not traffic:** `content_kind="main"` is co-selected with `media_kind="video"` (every client per-kind series carries both); the rule stays tuned for CAMERA video, and screen share (`content_kind="screen"`) gets its own rule when it ships rather than silently joining this one. At rollout the selector matches only series emitted by SDK builds that carry the label — expected, not an incident.
 
 **Corroborating, not proof**: the proof is MH's `mh_media_frames_dropped_total{reason="server_muted"}`. **Warning, not page**: the security criterion's "pages toward the server-mute runbook" means routes to it; the counter is client-reported, so a patched client could page on-call at will — and could equally suppress it, so silence is not evidence the mute holds.
 
@@ -1358,14 +1360,16 @@ sum(rate(dt_client_media_frames_dropped_total{reason="sender_server_muted", medi
 **PromQL**:
 ```promql
 (
-  sum(rate(dt_client_media_decoder_errors_total{media_kind="video"}[5m]))
+  sum(rate(dt_client_media_decoder_errors_total{media_kind="video", content_kind="main"}[5m]))
   /
-  sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[5m]))
+  sum(rate(dt_client_media_frames_accepted_total{media_kind="video", content_kind="main"}[5m]))
 ) > 0.01
 and
-sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[5m])) > 0
+sum(rate(dt_client_media_frames_accepted_total{media_kind="video", content_kind="main"}[5m])) > 0
 ```
 `for: 10m`
+
+**2026-10-26 — series identity, not traffic:** `content_kind="main"` is co-selected with `media_kind="video"` (every client per-kind series carries both); the rule stays tuned for CAMERA video, and screen share (`content_kind="screen"`) gets its own rule when it ships rather than silently joining this one. At rollout the selector matches only series emitted by SDK builds that carry the label — expected, not an incident.
 
 **Recorded residual**: under total decode failure the ratio is about 1 / (fps x max(directed keyframe interval, decoder restart backoff)). At the deployed 500 ms default that is ~3.3%, within reach; above ~3.3 s at 30 fps a totally failed decoder stays below 1% and is **unalerted while the slot is open** — it surfaces at slot exit on the unfulfilled histogram, and `ClientVideoSlotUnfulfilled` fires only if such exits keep arriving fleet-wide. The `[5m]` window (task text: `[10m]`) is the G5 collector-expiration constraint.
 
@@ -1378,11 +1382,13 @@ sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[5m])) > 0
 
 **PromQL**:
 ```promql
-histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[5m]))) > 10 * 1000 * max(mc_media_video_keyframe_min_interval_seconds)
+histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video", content_kind="main"}[5m]))) > 10 * 1000 * max(mc_media_video_keyframe_min_interval_seconds)
 and
-sum(rate(dt_client_media_slot_unfulfilled_duration_ms_count{media_kind="video"}[5m])) > 0
+sum(rate(dt_client_media_slot_unfulfilled_duration_ms_count{media_kind="video", content_kind="main"}[5m])) > 0
 ```
 `for: 5m`
+
+**2026-10-26 — series identity, not traffic:** `content_kind="main"` is co-selected with `media_kind="video"` (every client per-kind series carries both); the rule stays tuned for CAMERA video, and screen share (`content_kind="screen"`) gets its own rule when it ships rather than silently joining this one. At rollout the selector matches only series emitted by SDK builds that carry the label — expected, not an incident.
 
 Observed at episode **exit only**, every exit including teardown, so a slot stuck all session appears once, at leave: one stuck slot cannot fire this, a fleet pattern does. **Recorded departures**: `[5m]` window (G5) and `for: 5m` (task text: `[15m]`/`15m`) because sparse exit-time observations cannot sustain a `for:` longer than the window. The gauge `dt_client_media_slots_unfulfilled` is panel-only (last-writer-wins).
 
@@ -1427,7 +1433,7 @@ The video receive decisions below were made at story 3 OBS-B.
 
 | Series | Alert | Reason |
 |---|---|---|
-| `dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video"}` | `ClientVideoServerMutedSenderFrames` (A5) | above; `for: 10m` tolerates the per-mute burst |
+| `dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video", content_kind="main"}` | `ClientVideoServerMutedSenderFrames` (A5) | above; `for: 10m` tolerates the per-mute burst |
 | `dt_client_media_recovery_requests_sent_total{source}` | none, BY DECISION | bounded per slot by loss events; MH counts forwarded vs deduped (`duplicate` is the bound working) |
 | `dt_client_media_incoming_streams_refused_total` | none, BY DECISION (until a baseline exists) | an MH stream-concurrency defect signal; panel |
 | `dt_client_media_slot_unfulfilled_duration_ms` | `ClientVideoSlotUnfulfilled` (A9) | above; observed on exit only |

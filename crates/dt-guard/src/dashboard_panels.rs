@@ -16,6 +16,7 @@
 //! `fancy-regex` adopted (DFA linear-time preserved).
 
 use crate::common::grafana::GRAFANA_TEMPLATE_VAR_RE;
+use crate::common::kind_labels::{co_occurrence_gap, co_occurrence_message, KIND_LABEL_KEYS};
 #[cfg(test)]
 use crate::common::metric_catalog::parse_annotations;
 use crate::common::metric_catalog::{parse_annotations_dir, MetricAnnotations, CATALOG_HEAD_RE};
@@ -69,6 +70,7 @@ pub const EXPECTED_EMPTY_SET_EMPTY_RULE_ID: &str = "expected_empty_set_empty";
 /// none stray from another panel) plus a `count()` discriminator. ADR-0029 §C
 /// mixed-class; observability + operations converged.
 pub const MIXED_PANEL_ATTRIBUTION_RULE_ID: &str = "mixed_panel_attribution";
+pub use crate::common::kind_labels::KIND_LABEL_CO_OCCURRENCE_RULE_ID;
 
 /// Panel types on which the counter-window + expected-empty rules apply.
 const COUNTER_PANEL_TYPES: &[&str] = &["stat", "gauge", "bargauge", "timeseries"];
@@ -643,6 +645,19 @@ fn check_dashboard(
                 continue;
             };
 
+            // Kind-label co-occurrence: an expr naming one kind label names
+            // both, so screen share cannot fold silently into a camera panel.
+            // No ignore hatch: the fix is always to name the other key.
+            if let Some((named, missing)) = co_occurrence_gap(expr, &KIND_LABEL_KEYS) {
+                findings.push(Finding {
+                    file: rel_path.to_string(),
+                    panel_id: pid,
+                    panel_title: ptitle.clone(),
+                    rule_id: KIND_LABEL_CO_OCCURRENCE_RULE_ID,
+                    message: co_occurrence_message(named, missing),
+                });
+            }
+
             let mut metric_refs: HashSet<String> = HashSet::new();
             for caps in SERVICE_METRIC_PREFIX_RE.captures_iter(expr) {
                 if let Some(m) = caps.get(1) {
@@ -1062,6 +1077,34 @@ mod tests {
             &mut findings,
         );
         findings.iter().map(|f| f.rule_id.to_string()).collect()
+    }
+
+    #[test]
+    fn a_panel_naming_one_kind_label_fires_co_occurrence() {
+        let one = fired_rules(
+            "timeseries",
+            "max by (media_kind) (mc_media_receive_slot_cap)",
+            "",
+            &[("mc_media_receive_slot_cap", "gauge")],
+            &["mc_media_receive_slot_cap"],
+            "",
+        );
+        assert!(
+            one.contains(&KIND_LABEL_CO_OCCURRENCE_RULE_ID.to_string()),
+            "{one:?}"
+        );
+        let both = fired_rules(
+            "timeseries",
+            "max by (media_kind, content_kind) (mc_media_receive_slot_cap)",
+            "",
+            &[("mc_media_receive_slot_cap", "gauge")],
+            &["mc_media_receive_slot_cap"],
+            "",
+        );
+        assert!(
+            !both.contains(&KIND_LABEL_CO_OCCURRENCE_RULE_ID.to_string()),
+            "{both:?}"
+        );
     }
 
     #[test]

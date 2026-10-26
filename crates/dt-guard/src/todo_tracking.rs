@@ -73,7 +73,19 @@ fn check_main_md(repo_root: &Path, main_md: &Path) -> Result<Vec<Hit>> {
         return Ok(hits);
     };
 
-    let mut in_fence = false;
+    // Fenced regions come from the crate's one fence reader.
+    let fences: Vec<(usize, usize)> = crate::common::markdown_code::scan(&content)
+        .spans
+        .iter()
+        .filter(|sp| {
+            matches!(
+                sp.kind,
+                crate::common::markdown_code::CodeKind::Fenced { .. }
+            )
+        })
+        .map(|sp| (sp.line, sp.end_line))
+        .collect();
+    let in_fence = |idx: usize| fences.iter().any(|(a, b)| (*a..=*b).contains(&(idx + 1)));
     let mut body_run = 0usize;
     for (offset, line) in lines.iter().enumerate().skip(start + 1) {
         let trimmed = line.trim_start();
@@ -81,13 +93,8 @@ fn check_main_md(repo_root: &Path, main_md: &Path) -> Result<Vec<Hit>> {
         if trimmed.starts_with("## ") {
             break;
         }
-        // Fence toggle.
-        if trimmed.starts_with("```") {
-            in_fence = !in_fence;
+        if in_fence(offset) {
             body_run = 0;
-            continue;
-        }
-        if in_fence {
             continue;
         }
         // Blank line resets the body counter.

@@ -13,7 +13,8 @@ import {
   VIDEO_POST_DECODE_REJECT_REASONS,
   type RejectReason,
 } from '../../frame/rejectReason.js';
-import { MEDIA_KIND_LABELS, MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKind } from '../../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type { FrameCounts } from '../frameAccounting.js';
 import { buildTestFrame, type TestFrameSpec, type TestIdentity } from './frameFixtures.js';
 
@@ -91,7 +92,7 @@ export function videoMetrics(): { metrics: MediaKindMetrics; sink: InMemoryMetri
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaKindMetrics(
     { clientVersion: 'v', orgId: 'o' },
-    MEDIA_KIND_LABELS.Video,
+    MediaKind.VIDEO_CAMERA,
     sink,
   );
   return { metrics, sink };

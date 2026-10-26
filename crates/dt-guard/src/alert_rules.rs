@@ -21,6 +21,11 @@
 
 use crate::common::alert_rule_files::loadable_rules_files;
 use crate::common::duration::parse_prometheus_duration;
+use crate::common::kind_labels::{
+    co_occurrence_gap, co_occurrence_gaps, co_occurrence_message, is_promql_shaped,
+    DOC_PROMQL_SCOPE, KIND_LABEL_KEYS,
+};
+use crate::common::markdown_code::{self, CodeKind};
 use crate::common::path_safety::{resolve_cited_path, to_repo_relative};
 use crate::common::status::emit_ok;
 use crate::ignore::{is_lazy_reason, IGNORE_MARKER_HASH_RE};
@@ -46,6 +51,11 @@ pub const ANNOTATION_HYGIENE_RULE_ID: &str = "annotation_hygiene";
 pub const LAZY_IGNORE_REASON_RULE_ID: &str = "lazy_ignore_reason";
 pub const RULE_FILE_LOADING_RULE_ID: &str = "rule_file_loading";
 pub const INVENTORY_EXPR_DRIFT_RULE_ID: &str = "inventory_expr_drift";
+pub use crate::common::kind_labels::KIND_LABEL_CO_OCCURRENCE_RULE_ID;
+/// The docs-PromQL kind-label pass could not evaluate its input: an unclosed
+/// fence, or no in-scope doc / PromQL span / kind-naming span found. Never
+/// "fixed" by editing the docs to dodge the matcher.
+pub const DOC_PROMQL_VACUOUS_RULE_ID: &str = "doc_promql_vacuous";
 
 /// Operator-facing alert inventory. Every `#### <AlertName>` heading here that
 /// names a real rule must restate that rule's `expr` and `for:` exactly.
@@ -307,6 +317,134 @@ fn validate_severity(sev: Option<&String>) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Docs PromQL: the kind-label co-occurrence rule over the copy-paste surfaces
+// (observability F3, 2026-10-26). Every fenced block (ANY language — some
+// runbook PromQL is unlabelled) and every inline span under
+// `kind_labels::DOC_PROMQL_SCOPE` that is PromQL-shaped
+// (`kind_labels::is_promql_shaped`) is checked per unit, like a rule expr. No
+// ignore hatch: a dated note quoting an OLD form is rephrased without a
+// selector, never suppressed.
+//
+// Files: a sorted walk of `*.md` under the scope dirs, not `git ls-files`:
+// the e2e fixtures are hermetic non-git roots, and the scope dirs hold only
+// authored docs (no build output or scratch), so a tracked-file filter would
+// buy nothing there while breaking the hermetic fixtures.
+// -----------------------------------------------------------------------------
+
+/// What the docs pass saw: its positive control (all must be non-zero).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DocPromqlStats {
+    pub docs: usize,
+    pub promql_spans: usize,
+    pub kind_spans: usize,
+}
+
+fn doc_finding(file: &str, line: usize, rule_id: &'static str, message: String) -> Finding {
+    Finding {
+        file: file.to_string(),
+        alert: "-".to_string(),
+        line,
+        rule_id,
+        message,
+        secret_pattern: None,
+    }
+}
+
+/// The in-scope Markdown files, repo-relative and sorted.
+fn doc_promql_files(repo_root: &Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for dir in DOC_PROMQL_SCOPE {
+        let base = repo_root.join(dir.trim_end_matches('/'));
+        if !base.is_dir() {
+            continue;
+        }
+        // An unreadable entry is an error, never a silently smaller scope.
+        for entry in walkdir::WalkDir::new(&base).sort_by_file_name() {
+            let entry = entry.with_context(|| format!("walk {dir}"))?;
+            if entry.file_type().is_file() && entry.path().extension().is_some_and(|e| e == "md") {
+                out.push(to_repo_relative(repo_root, entry.path()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The docs pass over one document's text (pure, for the self-tests).
+fn check_doc_text(
+    rel: &str,
+    md: &str,
+    keys: &[&str],
+    stats: &mut DocPromqlStats,
+    out: &mut Vec<Finding>,
+) {
+    stats.docs += 1;
+    let code = markdown_code::scan(md);
+    if let Some(line) = code.unclosed {
+        out.push(doc_finding(
+            rel,
+            line,
+            DOC_PROMQL_VACUOUS_RULE_ID,
+            "unclosed code fence: the rest of the document cannot be told apart from code, so \
+             it was not checked; close the fence"
+                .to_string(),
+        ));
+    }
+    for span in &code.spans {
+        if !is_promql_shaped(&span.text, keys) {
+            continue;
+        }
+        stats.promql_spans += 1;
+        if keys
+            .iter()
+            .any(|k| crate::common::ident::names_identifier(&span.text, k))
+        {
+            stats.kind_spans += 1;
+        }
+        // One finding per unit gap: a fence holds several queries.
+        for (named, missing) in co_occurrence_gaps(&span.text, keys) {
+            out.push(doc_finding(
+                rel,
+                span.line,
+                KIND_LABEL_CO_OCCURRENCE_RULE_ID,
+                co_occurrence_message(named, missing),
+            ));
+        }
+    }
+}
+
+/// The docs pass over the tree, with its non-vacuity control.
+fn check_doc_promql(repo_root: &Path, keys: &[&str]) -> Result<(Vec<Finding>, DocPromqlStats)> {
+    let mut out = Vec::new();
+    let mut stats = DocPromqlStats::default();
+    for rel in doc_promql_files(repo_root)? {
+        let md =
+            std::fs::read_to_string(repo_root.join(&rel)).with_context(|| format!("read {rel}"))?;
+        check_doc_text(&rel, &md, keys, &mut stats, &mut out);
+    }
+    if stats.docs == 0 || stats.promql_spans == 0 || stats.kind_spans == 0 {
+        out.push(doc_finding(
+            DOC_PROMQL_SCOPE.join(", ").as_str(),
+            0,
+            DOC_PROMQL_VACUOUS_RULE_ID,
+            format!(
+                "the docs PromQL pass saw {} doc(s), {} PromQL span(s), {} naming a kind key: it \
+                 verified nothing. A wrong root or a broken extractor — not a docs change to make",
+                stats.docs, stats.promql_spans, stats.kind_spans
+            ),
+        ));
+    }
+    Ok((out, stats))
+}
+
+/// The kind-label co-occurrence rule over one `expr`: every PromQL expression
+/// that names `media_kind` also names `content_kind`, and vice versa, so screen
+/// share cannot fold silently into a camera-tuned rule the day it ships.
+fn kind_co_occurrence_violation(expr: &str) -> Option<String> {
+    let (named, missing) = co_occurrence_gap(expr, &KIND_LABEL_KEYS)?;
+    Some(co_occurrence_message(named, missing))
 }
 
 fn validate_for_field(for_val: Option<&String>, expr: Option<&String>) -> Result<(), String> {
@@ -859,53 +997,55 @@ struct InventoryEntry {
 ///    [`check_inventory_drift`].
 fn parse_alert_inventory(md: &str) -> Vec<InventoryEntry> {
     let lines: Vec<&str> = md.lines().collect();
+    // The crate's ONE fence parser (`common::markdown_code`); this reader keeps
+    // its own properties on top of it, below.
+    let code = markdown_code::scan(md);
     let mut out: Vec<InventoryEntry> = Vec::new();
-    // NO INDEXING BELOW — every cursor read goes through `lines.get(..)`, so
-    // the bound and the access are ONE operation. The previous shape had them
-    // as two facts that had to agree (`while m < lines.len()` followed by
-    // `lines[m]`), which is the weaker construction for the same reason this
-    // devloop's set-equality assertions exist: two encodings of one condition
-    // drift, and here the drift is a panic inside a Layer-3 guard.
     for (idx, line) in lines.iter().enumerate() {
         let Some(name) = line.strip_prefix("#### ") else {
             continue;
         };
         let name = name.trim().to_string();
         let heading_line = idx + 1;
-        let mut j = idx + 1;
+        // PROPERTY 2: any ATX heading ends this entry (1-based, exclusive).
+        let section_end = lines
+            .iter()
+            .enumerate()
+            .skip(idx + 1)
+            .find(|(_, l)| is_atx_heading(l))
+            .map_or(lines.len() + 1, |(j, _)| j + 1);
+        // PROPERTY 1: the FIRST ```promql fence of the entry wins.
+        // PROPERTY 3: the parser tolerates an indented fence.
+        let fence = code.spans.iter().find(|sp| {
+            sp.line > heading_line
+                && sp.line < section_end
+                && sp.kind
+                    == CodeKind::Fenced {
+                        lang: "promql".to_string(),
+                    }
+        });
         let mut promql: Option<Vec<String>> = None;
         let mut for_line: Option<String> = None;
         let mut for_inside_fence = false;
-        // PROPERTY 2: any ATX heading ends this entry.
-        while let Some(cur) = lines.get(j).filter(|l| !is_atx_heading(l)) {
-            // PROPERTY 3: trim before comparing, so an indented fence is found.
-            // PROPERTY 1: `promql.is_none()` — first fence wins.
-            if cur.trim() == "```promql" && promql.is_none() {
-                let mut body: Vec<String> = Vec::new();
-                let mut k = j + 1;
-                while let Some(fence_line) = lines.get(k).filter(|l| l.trim() != "```") {
-                    if fence_line.trim_start().starts_with("for:") {
-                        for_inside_fence = true;
-                    }
-                    body.push((*fence_line).to_string());
-                    k += 1;
-                }
-                promql = Some(body);
-                // The `for:` line is the next NON-BLANK line after the fence.
-                let mut m = k + 1;
-                while lines.get(m).is_some_and(|l| l.trim().is_empty()) {
-                    m += 1;
-                }
-                if let Some(rest) = lines
-                    .get(m)
-                    .and_then(|l| l.trim().strip_prefix("`for: "))
-                    .and_then(|rest| rest.strip_suffix('`'))
-                {
-                    for_line = Some(rest.to_string());
-                }
-                j = k;
+        if let Some(fence) = fence {
+            let body: Vec<String> = if fence.text.is_empty() {
+                Vec::new()
+            } else {
+                fence.text.split('\n').map(str::to_string).collect()
+            };
+            for_inside_fence = body.iter().any(|l| l.trim_start().starts_with("for:"));
+            promql = Some(body);
+            // The `for:` line is the next NON-BLANK line after the fence
+            // (`end_line` is 1-based, so it is the 0-based index after it).
+            let mut m = fence.end_line;
+            while lines.get(m).is_some_and(|l| l.trim().is_empty()) {
+                m += 1;
             }
-            j += 1;
+            for_line = lines
+                .get(m)
+                .and_then(|l| l.trim().strip_prefix("`for: "))
+                .and_then(|rest| rest.strip_suffix('`'))
+                .map(str::to_string);
         }
         out.push(InventoryEntry {
             alert: name,
@@ -1101,6 +1241,10 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
         });
     }
 
+    // Docs PromQL pass: merged into the same report, never an early return.
+    let (doc_findings, _) = check_doc_promql(repo_root, &KIND_LABEL_KEYS)?;
+    all_findings.extend(doc_findings);
+
     if yaml_files.is_empty() && all_findings.is_empty() {
         emit_ok("alert-rules-no-files");
         return Ok(());
@@ -1159,6 +1303,16 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
 
                 let for_str = yml_str(rule.for_duration.as_ref());
                 let expr_str = yml_str(rule.expr.as_ref());
+                if let Some(msg) = expr_str.as_deref().and_then(kind_co_occurrence_violation) {
+                    all_findings.push(Finding {
+                        file: rel_path.clone(),
+                        alert: alert_name.clone(),
+                        line: rule_line,
+                        rule_id: KIND_LABEL_CO_OCCURRENCE_RULE_ID,
+                        message: msg,
+                        secret_pattern: None,
+                    });
+                }
                 if let Err(msg) = validate_for_field(for_str.as_ref(), expr_str.as_ref()) {
                     all_findings.push(Finding {
                         file: rel_path.clone(),
@@ -1924,5 +2078,116 @@ up == 0
     fn check_hygiene_ipv4_allowlist() {
         assert!(check_hygiene("see 127.0.0.1 here").is_none());
         assert!(check_hygiene("see 10.0.5.7 here").is_some());
+    }
+
+    // -- kind_label_co_occurrence (2026-10-26) ---------------------------------
+
+    #[test]
+    fn an_expr_naming_one_kind_label_hits_and_both_or_neither_pass() {
+        let one = "sum by (media_kind) (rate(dt_client_x[5m])) > 0";
+        let msg = kind_co_occurrence_violation(one).expect("positive control must hit");
+        assert!(
+            msg.contains("`media_kind`") && msg.contains("`content_kind`"),
+            "{msg}"
+        );
+        assert!(kind_co_occurrence_violation("rate(x{content_kind=\"main\"}[5m]) > 0").is_some());
+        assert!(kind_co_occurrence_violation(
+            "sum by (media_kind, content_kind) (rate(x{media_kind=\"video\", content_kind=\"main\"}[5m])) > 0"
+        )
+        .is_none());
+        assert!(kind_co_occurrence_violation("sum(rate(x[5m])) > 0").is_none());
+    }
+
+    // -- Docs PromQL kind-label pass (2026-10-26) ------------------------------
+
+    fn doc_rules(md: &str, keys: &[&str]) -> (Vec<(&'static str, usize)>, DocPromqlStats) {
+        let mut out = Vec::new();
+        let mut stats = DocPromqlStats::default();
+        check_doc_text("docs/runbooks/x.md", md, keys, &mut stats, &mut out);
+        (
+            out.into_iter().map(|f| (f.rule_id, f.line)).collect(),
+            stats,
+        )
+    }
+
+    /// Each red form with the exact line it must produce.
+    const DOC_RED: &[(&str, usize)] = &[
+        // inline span
+        ("prose\nread `x{media_kind=\"video\"}` here\n", 2),
+        // unlabelled fence
+        ("a\nb\n```\nsum by (media_kind) (rate(x[5m]))\n```\n", 3),
+        // promql fence
+        ("```promql\nsum(rate(a{media_kind=\"v\", content_kind=\"main\"}[5m])) / sum(rate(b{media_kind=\"v\"}[5m]))\n```\n", 1),
+        // key list
+        ("the cap `mc_media_receive_slot_cap{media_kind}`\n", 1),
+    ];
+
+    #[test]
+    fn doc_promql_hits_every_red_form_at_its_line() {
+        for (md, line) in DOC_RED {
+            let (f, _) = doc_rules(md, &KIND_LABEL_KEYS);
+            assert_eq!(f, vec![(KIND_LABEL_CO_OCCURRENCE_RULE_ID, *line)], "{md}");
+        }
+    }
+
+    #[test]
+    fn bare_names_both_keys_and_non_promql_spans_stay_green() {
+        let md = "the `media_kind` label\n`x{media_kind=\"v\", content_kind=\"main\"}`\n```rust\nlet media_kind = 1;\n```\n`{{media_kind}}/{{content_kind}}`\n";
+        let (f, stats) = doc_rules(md, &KIND_LABEL_KEYS);
+        assert!(f.is_empty(), "{f:?}");
+        assert_eq!(stats.promql_spans, 2, "the selector and the legend");
+        assert_eq!(stats.kind_spans, 2);
+    }
+
+    #[test]
+    fn an_unclosed_fence_is_vacuity() {
+        let (f, _) = doc_rules("a\n```\nsum(x)\n", &KIND_LABEL_KEYS);
+        assert_eq!(f, vec![(DOC_PROMQL_VACUOUS_RULE_ID, 2)]);
+    }
+
+    /// The neutered-matcher proof: with an EMPTY key set every red goes green.
+    #[test]
+    fn red_doc_fixtures_go_green_with_the_key_set_neutered() {
+        for (md, _) in DOC_RED {
+            let (f, _) = doc_rules(md, &[]);
+            assert!(f.is_empty(), "{md}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn dated_records_are_out_of_scope_and_an_empty_scope_is_vacuous() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let w = |rel: &str, body: &str| {
+            let p = tmp.path().join(rel);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(p, body).expect("write");
+        };
+        w("docs/devloop-outputs/x/main.md", "`x{media_kind=\"v\"}`\n");
+        w("docs/decisions/adr.md", "`x{media_kind=\"v\"}`\n");
+        let (f, stats) = check_doc_promql(tmp.path(), &KIND_LABEL_KEYS).expect("pass");
+        assert_eq!(stats.docs, 0);
+        assert_eq!(
+            f.iter().map(|x| x.rule_id).collect::<Vec<_>>(),
+            vec![DOC_PROMQL_VACUOUS_RULE_ID]
+        );
+        w(
+            "docs/runbooks/r.md",
+            "`x{media_kind=\"v\", content_kind=\"main\"}`\n",
+        );
+        let (f, stats) = check_doc_promql(tmp.path(), &KIND_LABEL_KEYS).expect("pass");
+        assert!(f.is_empty(), "{f:?}");
+        assert_eq!(stats.docs, 1);
+    }
+
+    /// Positive control on the REAL docs: scanned, PromQL spans recognised,
+    /// kind-naming spans recognised, and clean.
+    #[test]
+    fn the_real_docs_are_clean_and_non_vacuous() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (f, stats) = check_doc_promql(&root, &KIND_LABEL_KEYS).expect("pass");
+        assert!(f.is_empty(), "{f:?}");
+        assert!(stats.docs > 10, "{stats:?}");
+        assert!(stats.promql_spans > 100, "{stats:?}");
+        assert!(stats.kind_spans > 20, "{stats:?}");
     }
 }

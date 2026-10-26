@@ -13,18 +13,19 @@
 // emitter's literals (`packages/sdk-core/src/media/setup/mediaMetrics.ts`) —
 // fail-closed. The live read-back ties them to the rule Prometheus LOADED.
 
-import { MEDIA_KEK_SOURCES, MEDIA_KIND_LABELS } from '@darktower/sdk-core';
+import { MEDIA_KEK_SOURCES, publishedKindMetricLabels } from '@darktower/sdk-core';
 
 /** The alert whose selector the R-27 exactness read-back checks. */
 export const MISSING_KEY_MATERIAL_ALERT = 'MCMediaMissingKeyMaterial';
 
 /**
- * The grouping label EVERY `sum` in that alert's expression carries (story 3
- * OBS-B: the rule is per kind — numerator, denominator AND non-zero guard). An
+ * The grouping labels EVERY `sum` in that alert's expression carries (story 3
+ * OBS-B: the rule is per kind — numerator, denominator AND non-zero guard; both
+ * kind labels since 2026-10-26, as `sumGroupingsIn` reports them). An
  * ungrouped guard under `and` would match no label set and silently kill the
  * rule, so the drift test requires all three.
  */
-export const MISSING_KEY_MATERIAL_GROUPING = 'media_kind';
+export const MISSING_KEY_MATERIAL_GROUPING = 'media_kind,content_kind';
 
 /** How many `sum` aggregations that alert's expression has (numerator, denominator, guard). */
 export const MISSING_KEY_MATERIAL_SUM_COUNT = 3;
@@ -49,13 +50,18 @@ export const KEK_UPDATES = 'dt_client_media_kek_updates_total';
 export const KEK_UPDATE_SOURCE = MEDIA_KEK_SOURCES.KekUpdate;
 
 /**
- * The `media_kind` label values the R-29 read-backs select (story 3 OBS-A) —
- * imported from the SDK's vocabulary, never retyped. The audio read-back is
- * `multi-party-hear.spec.ts`'s; the VIDEO read-back is `multi-party-see.spec.ts`'s
- * (story 3 C-C1).
+ * The `media_kind` + `content_kind` label values the R-29 read-backs select
+ * (story 3 OBS-A; `content_kind` co-carried since 2026-10-26) — taken from the
+ * SDK's ONE projection (`publishedKindMetricLabels`), never retyped
+ * (`dt-guard ts-name-guard-dt-client`'s kind-literal rule covers this directory).
+ * The audio read-back is `multi-party-hear.spec.ts`'s; the VIDEO read-back is
+ * `multi-party-see.spec.ts`'s (story 3 C-C1). Mic and camera are both
+ * `content_kind="main"`; nothing publishes screen share yet.
  */
-export const MEDIA_KIND_AUDIO = MEDIA_KIND_LABELS.Audio;
-export const MEDIA_KIND_VIDEO = MEDIA_KIND_LABELS.Video;
+export const MEDIA_KIND_AUDIO = publishedKindMetricLabels('audio').media_kind;
+export const MEDIA_KIND_VIDEO = publishedKindMetricLabels('video').media_kind;
+export const CONTENT_KIND_AUDIO = publishedKindMetricLabels('audio').content_kind;
+export const CONTENT_KIND_VIDEO = publishedKindMetricLabels('video').content_kind;
 
 /** Previous KEK generations demoted and retained — a COUNTER (S6 asserts a delta). */
 export const KEK_GENERATIONS_RETAINED = 'dt_client_media_kek_generations_retained_total';
@@ -85,7 +91,8 @@ export function reasonAlternationIn(expr: string): string[] {
 
 /**
  * The grouping clause of every `sum` aggregation in a PromQL expression, in
- * order: `'media_kind'` for `sum by (media_kind) (`, `''` for a bare `sum(`.
+ * order, whitespace removed: `'media_kind,content_kind'` for
+ * `sum by (media_kind, content_kind) (`, `''` for a bare `sum(`.
  * A `sum` with any other modifier shape (e.g. `sum without (...)`) is reported as
  * the placeholder `'<unrecognised sum shape>'`, so the caller's equality check
  * fails loudly rather than skipping it.

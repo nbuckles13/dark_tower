@@ -84,6 +84,8 @@ import {
   KEK_GENERATIONS_RETAINED,
   KEK_UPDATES,
   KEK_UPDATE_SOURCE,
+  CONTENT_KIND_AUDIO,
+  CONTENT_KIND_VIDEO,
   MEDIA_KIND_AUDIO,
   MEDIA_KIND_VIDEO,
   RECEIVED_COUNTER,
@@ -413,7 +415,7 @@ const MH_KEYFRAME_REQUESTS_SENT_PROMQL =
   'sum by (instance, trigger) (mh_media_keyframe_requests_sent_total)';
 const MH_KEYFRAME_WRITE_FAILURES_PROMQL =
   'sum by (instance) (mh_media_keyframe_request_write_failures_total)';
-const MC_VIDEO_SLOT_STATES_PROMQL = `sum by (instance, slot_state) (mc_media_slot_states_total{media_kind="${MEDIA_KIND_VIDEO}"})`;
+const MC_VIDEO_SLOT_STATES_PROMQL = `sum by (instance, slot_state) (mc_media_slot_states_total{media_kind="${MEDIA_KIND_VIDEO}", content_kind="${CONTENT_KIND_VIDEO}"})`;
 const MC_UNREACHABLE_SENDERS_PROMQL = 'sum by (instance) (mc_media_unreachable_senders_total)';
 
 /** One labelled diagnostic read: its name and the raw rows, formatted. */
@@ -484,19 +486,21 @@ export async function videoDiagnosticReads(): Promise<readonly DiagnosticRead[]>
 
 const SENT_SUM_PROMQL = `sum by (instance) (${SEND_COUNTER})`;
 const RECEIVED_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER})`;
-// Story 3 OBS-A (R-29): the same counter split by `media_kind`. The audio arm
-// proves all three hops carry the label (SDK emission, GC datapoint tier,
-// collector keep_keys + exact value rule); the KIND-LESS arm (`media_kind=""`
-// matches series WITHOUT the label) must NOT rise, which proves no SDK path still
-// emits the pre-split three-key bag.
-const RECEIVED_AUDIO_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER}{media_kind="${MEDIA_KIND_AUDIO}"})`;
+// Story 3 OBS-A (R-29): the same counter split by kind. The audio arm selects
+// BOTH kind labels (`content_kind` co-carried since 2026-10-26), so it proves all
+// three hops carry both (SDK emission, GC datapoint tier, collector keep_keys +
+// exact value rules); the KIND-LESS arm (`=""` matches series WITHOUT the label)
+// selects a series missing EITHER label and must NOT rise, which proves the two
+// labels arrive all-or-none and no SDK path emits a bag without them.
+const RECEIVED_AUDIO_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER}{media_kind="${MEDIA_KIND_AUDIO}", content_kind="${CONTENT_KIND_AUDIO}"})`;
 // Story 3 C-C1 (R-29): the VIDEO arms — received AND sent, so both halves of
-// the video client series are proven to carry `media_kind="video"` end to end.
+// the video client series are proven to carry `media_kind="video"` (and
+// `content_kind="main"`: camera) end to end.
 // The series is born when video is first DIRECTED (lazily), so only a baseline
 // taken before the joins -> above delta can see it.
-const RECEIVED_VIDEO_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER}{media_kind="${MEDIA_KIND_VIDEO}"})`;
-const SENT_VIDEO_SUM_PROMQL = `sum by (instance) (${SEND_COUNTER}{media_kind="${MEDIA_KIND_VIDEO}"})`;
-const RECEIVED_KINDLESS_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER}{media_kind=""})`;
+const RECEIVED_VIDEO_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER}{media_kind="${MEDIA_KIND_VIDEO}", content_kind="${CONTENT_KIND_VIDEO}"})`;
+const SENT_VIDEO_SUM_PROMQL = `sum by (instance) (${SEND_COUNTER}{media_kind="${MEDIA_KIND_VIDEO}", content_kind="${CONTENT_KIND_VIDEO}"})`;
+const RECEIVED_KINDLESS_SUM_PROMQL = `sum by (instance) (${RECEIVED_COUNTER}{media_kind=""} or ${RECEIVED_COUNTER}{content_kind=""})`;
 const KEK_UPDATES_SUM_PROMQL = `sum by (instance) (${KEK_UPDATES}{source="${KEK_UPDATE_SOURCE}"})`;
 const KEK_RETAINED_SUM_PROMQL = `sum by (instance) (${KEK_GENERATIONS_RETAINED})`;
 

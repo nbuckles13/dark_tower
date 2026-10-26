@@ -17,7 +17,7 @@
 //
 // So this is structural rather than disciplined: {@link MediaKindMetrics}'s and
 // {@link MediaSessionMetrics}' constructors take TWO NAMED STRINGS (plus, for the
-// per-kind handle, a closed `MediaKindLabel` union value), never a
+// per-kind handle, a wire `MediaKind`), never a
 // `MetricLabels` bag. There is no spread to inherit from and nothing to prune,
 // so `meeting_id_hash` is not merely absent — it is UNREPRESENTABLE at this
 // boundary. A deletion-based helper (`{...labels, meeting_id_hash: undefined}`)
@@ -28,8 +28,9 @@
 // PER-KIND HANDLES AND SESSION-LEVEL HANDLES ARE DIFFERENT TYPES
 // ---------------------------------------------------------------------------
 //
-// Every media series whose subject has a media kind carries `media_kind`
-// (`audio` | `video`); the session-level series (KEK lifecycle, roster key
+// Every media series whose subject has a media kind carries BOTH `media_kind`
+// and `content_kind` (all or none — they come from ONE projection,
+// {@link projectMediaKind}); the session-level series (KEK lifecycle, roster key
 // changes, capture source) do NOT, because one session event labelled per kind
 // would be counted twice. The split is by TYPE: {@link MediaKindMetrics} has no
 // session method and {@link MediaSessionMetrics} takes no kind, so emitting a
@@ -66,6 +67,9 @@ import type { KekRetentionOutcome } from '../../config/clientConfig.js';
 import type { RejectReason } from '../frame/rejectReason.js';
 import type { WrapOutcome } from '../frame/receivePath.js';
 import type { CaptureFailure } from './captureFailure.js';
+import { MediaKind } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
+import { wireMediaKind } from '../../signaling/slotStateMap.js';
+import type { MediaKindToken } from '../mediaKind.js';
 
 /**
  * Key custody, fixed at `operator` (ADR-0036 §4). A LABEL, never a boolean.
@@ -587,36 +591,86 @@ export interface MediaMetricIdentity {
   readonly orgId: string;
 }
 
+/** A wire kind that has metric labels: every generated `MediaKind` except the proto3 zero value. */
+export type LabelledMediaKind = Exclude<MediaKind, MediaKind.UNSPECIFIED>;
+
 /**
- * The `media_kind` label vocabulary — closed, two values.
+ * THE client label projection: wire `MediaKind` → the co-carried
+ * `media_kind` + `content_kind` label values. The ONLY place in the SDK that
+ * spells either label's values (`dt-guard ts-name-guard-dt-client`'s kind-literal
+ * rule names this file as the TypeScript projection home and fails any other
+ * site that writes one).
  *
- * ANCHOR (DRY): the `media_kind` row of the label taxonomy
- * (`docs/observability/label-taxonomy.md`) is the single source of truth; this
- * is its client code home, and `__tests__/mediaMetrics.test.ts` fails if the two
- * disagree. MC's Rust home is `MediaKindLabel` in
- * `crates/mc-service/src/media_kind.rs`; the collector bounds the
- * value with an EXACT `^(audio|video)$` rewrite to `invalid`
- * (`infra/services/otel-collector/collector.yaml`). Deliberately NOT the
- * generated proto `MediaKind` (four wire values incl. unspecified and screen),
- * and NOT the public `media/mediaKind.ts` tokens (`unknown` included).
+ * ANCHOR (DRY): the projection table and the `media_kind` / `content_kind` rows
+ * of `docs/observability/label-taxonomy.md` are the single source of truth. MC's
+ * Rust home is `KindLabels::from_proto` in `crates/mc-service/src/media_kind.rs`;
+ * `dt-guard` reads THIS record, the taxonomy, and the collector's exact
+ * `^(audio|video)$` / `^(main|screen)$` rules and fails on any disagreement. So
+ * the entries keep the FIXED one-line shape below — the guard parses it.
+ *
+ * `satisfies Record<LabelledMediaKind, …>` makes a new wire kind a compile error
+ * here. Deliberately NOT the public `media/mediaKind.ts` tokens (`unknown`
+ * included, no screen).
  *
  * `invalid` is the collector's reserved rewrite sentinel and must never become a
  * value here.
  */
-export const MEDIA_KIND_LABELS = {
-  Audio: 'audio',
-  Video: 'video',
-} as const;
+export const MEDIA_KIND_LABEL_PROJECTION = {
+  [MediaKind.AUDIO]: { media_kind: 'audio', content_kind: 'main' },
+  [MediaKind.VIDEO_CAMERA]: { media_kind: 'video', content_kind: 'main' },
+  [MediaKind.VIDEO_SCREEN]: { media_kind: 'video', content_kind: 'screen' },
+} as const satisfies Readonly<
+  Record<LabelledMediaKind, { readonly media_kind: string; readonly content_kind: string }>
+>;
 
-/** One of {@link MEDIA_KIND_LABELS}. Derived, never retyped at a call site. */
-export type MediaKindLabel = (typeof MEDIA_KIND_LABELS)[keyof typeof MEDIA_KIND_LABELS];
+/** The labels one wire kind projects to. */
+export type MediaKindMetricLabels = (typeof MEDIA_KIND_LABEL_PROJECTION)[LabelledMediaKind];
+/** One `media_kind` value. Derived from the projection, never retyped. */
+export type MediaKindLabel = MediaKindMetricLabels['media_kind'];
+/** One `content_kind` value. Derived from the projection, never retyped. */
+export type ContentKindLabel = MediaKindMetricLabels['content_kind'];
+
+/**
+ * Project a wire kind onto its labels. THROWS on `UNSPECIFIED` and on any
+ * number the generated enum does not name: protobuf-es enums are open at
+ * runtime, and an unlabelled per-kind series must be impossible, not quietly
+ * mislabelled. The input is always SDK-chosen (handle construction at setup),
+ * never a wire-received value, so a throw here is a programming error.
+ */
+export function projectMediaKind(kind: MediaKind): MediaKindMetricLabels {
+  if (!Object.hasOwn(MEDIA_KIND_LABEL_PROJECTION, kind)) {
+    throw new Error(`media kind ${String(kind)} has no metric labels`);
+  }
+  return MEDIA_KIND_LABEL_PROJECTION[kind as LabelledMediaKind];
+}
+
+/**
+ * The labels of a kind this SDK PUBLISHES (audio, camera video), via the one
+ * wire mapping `signaling/slotStateMap.ts:wireMediaKind`. The public way to name
+ * a label value (the e2e read-backs select with it); the wire enum is not part
+ * of the SDK's public surface.
+ */
+export function publishedKindMetricLabels(kind: MediaKindToken): MediaKindMetricLabels {
+  return projectMediaKind(wireMediaKind(kind));
+}
+
+/** Every `media_kind` value the projection yields (deduplicated). */
+export const MEDIA_KIND_LABEL_VALUES: readonly MediaKindLabel[] = [
+  ...new Set(Object.values(MEDIA_KIND_LABEL_PROJECTION).map((l) => l.media_kind)),
+];
+/** Every `content_kind` value the projection yields (deduplicated). */
+export const CONTENT_KIND_LABEL_VALUES: readonly ContentKindLabel[] = [
+  ...new Set(Object.values(MEDIA_KIND_LABEL_PROJECTION).map((l) => l.content_kind)),
+];
 
 /**
  * Build a PER-KIND media-path label set BY ALLOW-LIST.
  *
  * The complete set, and there is no path by which it grows: `client_version`,
- * `org_id`, `key_custody`, `media_kind`. Callers pass two named strings and a
- * closed-union kind, so no ambient label bag can reach a media metric.
+ * `org_id`, `key_custody`, `media_kind`, `content_kind`. Callers pass two named
+ * strings and a wire kind, so no ambient label bag can reach a media metric. The
+ * two kind labels come from ONE {@link projectMediaKind} call, so a series
+ * carries both or neither.
  *
  * The returned object literal must stay SPREAD-FREE: `dt-guard
  * client-metrics-export` resolves `this.#base` to exactly these keys and fails
@@ -624,13 +678,15 @@ export type MediaKindLabel = (typeof MEDIA_KIND_LABELS)[keyof typeof MEDIA_KIND_
  */
 export function mediaMetricLabels(
   identity: MediaMetricIdentity,
-  kind: MediaKindLabel,
+  kind: LabelledMediaKind,
 ): MetricLabels {
+  const kindLabels = projectMediaKind(kind);
   return {
     client_version: identity.clientVersion,
     org_id: identity.orgId,
     key_custody: KEY_CUSTODY,
-    media_kind: kind,
+    media_kind: kindLabels.media_kind,
+    content_kind: kindLabels.content_kind,
   };
 }
 
@@ -642,18 +698,26 @@ export function mediaMetricLabels(
  */
 export class MediaKindMetrics {
   readonly #sink: MetricsSink | undefined;
-  readonly #kind: MediaKindLabel;
+  readonly #kind: LabelledMediaKind;
   /** Resolved once. Every emission below spreads THIS, never any other set. */
   readonly #base: MetricLabels;
 
-  constructor(identity: MediaMetricIdentity, kind: MediaKindLabel, sink: MetricsSink | undefined) {
+  /**
+   * `kind` is a {@link LabelledMediaKind}: passing `UNSPECIFIED` is a compile
+   * error. {@link projectMediaKind} still throws for a value forced past the type.
+   */
+  constructor(
+    identity: MediaMetricIdentity,
+    kind: LabelledMediaKind,
+    sink: MetricsSink | undefined,
+  ) {
     this.#kind = kind;
     this.#base = mediaMetricLabels(identity, kind);
     this.#sink = sink;
   }
 
-  /** The kind every series of this handle carries. */
-  get kind(): MediaKindLabel {
+  /** The wire kind whose labels every series of this handle carries. */
+  get kind(): LabelledMediaKind {
     return this.#kind;
   }
 
@@ -1252,7 +1316,7 @@ export class MediaMetrics {
 
   constructor(identity: MediaMetricIdentity, sink: MetricsSink | undefined) {
     this.session = new MediaSessionMetrics(identity, sink);
-    this.audio = new MediaKindMetrics(identity, MEDIA_KIND_LABELS.Audio, sink);
-    this.video = new MediaKindMetrics(identity, MEDIA_KIND_LABELS.Video, sink);
+    this.audio = new MediaKindMetrics(identity, wireMediaKind('audio'), sink);
+    this.video = new MediaKindMetrics(identity, wireMediaKind('video'), sink);
   }
 }

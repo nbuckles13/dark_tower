@@ -390,16 +390,25 @@ it is bounded live in the taxonomy — it is the *first* home for a label that m
 one service emits. **Which labels a given metric carries** lives here. Neither is a
 copy of the other.
 
-### `media_kind` — per-kind series carry it, session-level series do not (story 3 R-29)
+### `media_kind` + `content_kind` — per-kind series carry both, session-level series neither (story 3 R-29; `content_kind` 2026-10-26)
 
-What the label is and its value set (`audio`, `video`) live in
-`docs/observability/label-taxonomy.md` (the `media_kind` row). Which client series carry it
+What the labels are, their value sets (`media_kind`: `audio`, `video`; `content_kind`:
+`main`, `screen`) and the projection from the wire `MediaKind` live in
+`docs/observability/label-taxonomy.md` (the `media_kind` / `content_kind` rows and the
+projection table). The SDK's one code home is `MEDIA_KIND_LABEL_PROJECTION`
+(`packages/sdk-core/src/media/setup/mediaMetrics.ts`). Which client series carry them
 lives here:
+
+**2026-10-26 — series identity, not traffic.** `content_kind` is co-carried on EVERY
+per-kind series (all or none: both come from one `projectMediaKind` call in
+`mediaMetricLabels`, so no series can carry one without the other). Nothing publishes
+screen share yet, so every client series reads `content_kind="main"`; a per-kind series'
+identity gains a label, its counts do not change.
 
 | Class | Label set | Series |
 |---|---|---|
-| **Per-kind** | `client_version`, `org_id`, `key_custody=operator`, **`media_kind`** (+ own discriminator) | `frames_sent`, `send_dropped`, `send_queue_depth`, `frames_received`, `frames_accepted`, `frames_dropped`, `key_wrap_outcomes`, `downlink_gap_frames`, `downlink_reorder`, `undeclared_stream_id`, `decoder_errors`, `mute_transitions`, `decode_queue_dropped`, `receive_source_deficit`, `capture_failures`, `keyframe_requests_received`, `send_directive_kind_missing`, `keyframes_produced`, `send_groups_abandoned`, `send_groups_stopped`, `encode_queue_dropped`, `keyframe_min_interval_clamped`, `encoder_errors`, `send_directive_encoding_refused`, `recovery_requests_sent` (+`source`), `incoming_streams_refused`, `slot_unfulfilled_duration_ms`, `slots_unfulfilled`, `active_source_intervals`, `time_to_first_render_ms`, `slot_active_to_first_render_ms` (all `dt_client_media_*`), and `dt_client_time_to_first_media_frame_ms` |
-| **Kind-free (session-level)** | `client_version`, `org_id`, `key_custody=operator` (+ own discriminator), **no `media_kind` key at all** | `dt_client_media_kek_updates_total`, `_kek_retention_violations_total`, `_kek_retention_anomalies_total`, `_kek_install_refusals_total`, `_kek_generations_retained_total`, `_roster_key_rebinds_total`, `dt_client_media_capture_source`, `_send_directive_header_version_refused_total`, `_keyframe_requests_unattributed_total`, `_mh_control_channel_ended_total` |
+| **Per-kind** | `client_version`, `org_id`, `key_custody=operator`, **`media_kind`**, **`content_kind`** (+ own discriminator) | `frames_sent`, `send_dropped`, `send_queue_depth`, `frames_received`, `frames_accepted`, `frames_dropped`, `key_wrap_outcomes`, `downlink_gap_frames`, `downlink_reorder`, `undeclared_stream_id`, `decoder_errors`, `mute_transitions`, `decode_queue_dropped`, `receive_source_deficit`, `capture_failures`, `keyframe_requests_received`, `send_directive_kind_missing`, `keyframes_produced`, `send_groups_abandoned`, `send_groups_stopped`, `encode_queue_dropped`, `keyframe_min_interval_clamped`, `encoder_errors`, `send_directive_encoding_refused`, `recovery_requests_sent` (+`source`), `incoming_streams_refused`, `slot_unfulfilled_duration_ms`, `slots_unfulfilled`, `active_source_intervals`, `time_to_first_render_ms`, `slot_active_to_first_render_ms` (all `dt_client_media_*`), and `dt_client_time_to_first_media_frame_ms` |
+| **Kind-free (session-level)** | `client_version`, `org_id`, `key_custody=operator` (+ own discriminator), **no `media_kind` or `content_kind` key at all** | `dt_client_media_kek_updates_total`, `_kek_retention_violations_total`, `_kek_retention_anomalies_total`, `_kek_install_refusals_total`, `_kek_generations_retained_total`, `_roster_key_rebinds_total`, `dt_client_media_capture_source`, `_send_directive_header_version_refused_total`, `_keyframe_requests_unattributed_total`, `_mh_control_channel_ended_total` |
 
 **Why the session-level series are kind-free.** A KEK arrival, a retention anomaly, an
 install refusal, a retained generation and a roster rebind each happen ONCE per session
@@ -414,23 +423,21 @@ handle exists from join, but constructing a handle emits nothing: video series a
 or zero-initialised at first direction (`keyframes_produced`, `send_groups_abandoned`),
 and `send_directive_kind_missing` zero-inits for video at join only when video is
 published. The video read-back (`packages/web-app/e2e/multi-party-see.spec.ts`, story 3 C-C1) is baseline -> rise, not presence. **Cardinality:** each per-kind series doubles (x2) once
-video emits; a patched client can add a third value, `invalid`, via the collector's
+video emits; `content_kind` adds no series today (one value per kind until screen share
+ships, when video gains a `screen` series); a patched client can add a third value, `invalid`, via the collector's
 exact rewrite (`collector.yaml` `delta_to_cumulative` figure).
 
-**Pipeline.** GC admits the key on datapoints only (`MEDIA_DATAPOINT_EXTRA`; stripped on
-spans and exemplars); the collector keeps it (`keep_keys` group 2) and rewrites any value
-other than exactly `audio`/`video` to `invalid`. Proven end to end by
-`crates/env-tests/tests/31_gc_telemetry.rs` (value rule) and the R-29 step of
-`packages/web-app/e2e/multi-party-hear.spec.ts` (audio read-back).
-
-### Declared, not yet carried: `content_kind`
-
-| Label | State |
-|---|---|
-| `content_kind` | **Declared, not carried.** No media-path metric emits it today. Values in `label-taxonomy.md`. |
-
-**Do not write a dashboard query or an alert that selects on it** — the selector would
-match nothing and yield an empty series rather than an error.
+**Pipeline.** GC admits both keys on datapoints only (`MEDIA_DATAPOINT_EXTRA`; stripped
+on spans and exemplars); the collector keeps them (`keep_keys` group 2) and rewrites any
+value other than exactly `audio`/`video` (resp. `main`/`screen`) to `invalid`, and a
+datapoint carrying one kind key without the other (or one `invalid`) to `invalid` on both
+(all or none at the store). **2026-10-26 rollout:** tabs still running a pre-2026-10-26
+SDK (`media_kind` only) read `invalid`/`invalid` until reloaded — that is not a patched
+client. Proven end
+to end by `crates/env-tests/tests/31_gc_telemetry.rs` (value rules) and the R-29 steps of
+`packages/web-app/e2e/multi-party-hear.spec.ts` / `multi-party-see.spec.ts` (read-backs
+select `media_kind` AND `content_kind="main"`; the kind-less arm fails on a series missing
+either label).
 
 ### The transmit/receive convention
 
@@ -455,9 +462,9 @@ specifically **no meeting, participant or stream dimension, hashed or otherwise*
 
 Plus one **fixed non-identity** label: `key_custody=operator` (ADR-0036 §4). It is not a
 dimension in the cardinality sense, having exactly one value by construction, and R-26
-requires it. Per-kind series add the bounded non-identity **`media_kind`** (story 3); the
-media-path label set is therefore *four* labels on a per-kind series and *three* on a
-session-level one; describing it as "only `client_version` and `org_id`" would be false
+requires it. Per-kind series add the bounded non-identity **`media_kind`** (story 3) and
+**`content_kind`** (co-carried since 2026-10-26); the media-path label set is therefore
+*five* labels on a per-kind series and *three* on a session-level one; describing it as "only `client_version` and `org_id`" would be false
 against the wire.
 
 **Why a hash does not help, stated because it is the obvious-looking escape hatch.** A
@@ -505,7 +512,7 @@ exported names, identity-shaped keys, and the export decision for every
 `dt_client_*` literal in non-test sdk-core — see the block at the top of this file).
 
 **Every metric in this section carries `client_version`, `org_id` and
-`key_custody=operator`, plus `media_kind` on the per-kind series (§`media_kind` above),
+`key_custody=operator`, plus `media_kind` and `content_kind` on the per-kind series (§`media_kind` + `content_kind` above),
 and nothing else beyond its own bounded discriminator.**
 No meeting, participant, or stream dimension, hashed or otherwise. See
 §Naming convention for the two label sets and why the join set is not this one.
@@ -582,14 +589,14 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 - **Type**: Counter
 - **Description**: Datagrams that left the device on the media datagram path — **one increment per target handler per captured frame**, not one per frame. A sender whose edges span two handlers (ADR-0036 §9; story 2 task 20) advances this twice for one captured frame.
 - **THE NAME SAYS FRAMES; THE VALUE COUNTS DATAGRAMS — and that matches `dt_client_media_frames_received_total`**, which has counted datagrams-at-the-wire since story 1 (stated in `docs/runbooks/client-dev-local.md`'s green-signal table). The divergence is a **family convention documented on both sides**, not a defect on one: sent and received are in the SAME unit, so the `sent`/`received` pair and every cross-end comparison against `mh_media_*` stay unit-comparable — a two-handler sender's datagrams are split across two handlers, and each handler sees only its own, so the aggregate still reconciles. Do not "fix" either name without moving both.
-- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`, `content_kind`).
 - **Usage**: the denominator for the send-drop ratio — **and the unit is the reason it is correct.** `dt_client_media_send_dropped_total` is raised inside the per-lane send path (`packages/sdk-core/src/media/pipeline/egress.ts`), so it is per-send-attempt by construction. Counting *frames* here while counting *attempts* there would make one captured frame that succeeded on handler A and was refused on handler B read as **50% loss on a sender that reached handler A perfectly**. Both sides count datagrams, so the ratio is a real loss fraction. Any future change to either counting point must move both or the ratio silently stops meaning loss.
-- **VIDEO (story 3 C-A2) is different, and the ratio does NOT mean loss there.** For `media_kind="video"` this counts frame WRITES per target on a group stream (`media/pipeline/videoEgress.ts`), not datagrams. Video's send-drop ratio covers ONLY `not_connected` and `gop_counter_exhausted`: video loses frames by GROUP DISCIPLINE — backlog discarded at a cap trip, unsent backlog of a superseded group, frames skipped on a stopped target or while a target awaits a (possibly held) keyframe — and those decisions are counted on `dt_client_media_send_groups_abandoned_total`, `dt_client_media_send_groups_stopped_total` and `dt_client_media_encode_queue_dropped_total`, never per frame here. A "video loss ratio" built from this pair reads ~0 during a frozen tile; read the group series instead.
+- **VIDEO (story 3 C-A2) is different, and the ratio does NOT mean loss there.** For `media_kind="video", content_kind="main"` this counts frame WRITES per target on a group stream (`media/pipeline/videoEgress.ts`), not datagrams. Video's send-drop ratio covers ONLY `not_connected` and `gop_counter_exhausted`: video loses frames by GROUP DISCIPLINE — backlog discarded at a cap trip, unsent backlog of a superseded group, frames skipped on a stopped target or while a target awaits a (possibly held) keyframe — and those decisions are counted on `dt_client_media_send_groups_abandoned_total`, `dt_client_media_send_groups_stopped_total` and `dt_client_media_encode_queue_dropped_total`, never per frame here. A "video loss ratio" built from this pair reads ~0 during a frozen tile; read the group series instead.
 
 ### `dt_client_media_send_dropped_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: per-kind base (incl. `media_kind`) + `reason` — a NEW bounded vocabulary, **not** the frame reject
+- **Labels**: per-kind base (incl. `media_kind`, `content_kind`) + `reason` — a NEW bounded vocabulary, **not** the frame reject
   taxonomy.
 - **Permitted values**:
 
@@ -618,7 +625,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   enters the queue and nothing is dropped. Mute is
   `dt_client_media_mute_transitions_total` and nothing else.
 - **Video (story 3 C-A2)**: only `not_connected` and `gop_counter_exhausted` are
-  emitted for `media_kind="video"`; video's group-discipline losses are on the
+  emitted for `media_kind="video", content_kind="main"`; video's group-discipline losses are on the
   group series (see `dt_client_media_frames_sent_total`'s VIDEO note).
 
 ### `dt_client_media_send_queue_depth`
@@ -628,7 +635,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   application egress lanes — one lane per target handler (story 2 task 20: a
   sender sends to every handler owning one of its edges), each bounded
   independently.
-- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`, `content_kind`).
 - **Usage**: read against the configured bound (default 10 frames = 200 ms at
   20 ms/frame). The application bound trips BEFORE the transport high-water mark
   — asserted at setup — so a rising depth here is back-pressure we can count
@@ -648,22 +655,22 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   you need per-browser queue depth, it is not available from this signal at all.
 
 ### `dt_client_media_frames_received_total`
-- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `MCMediaMissingKeyMaterial`'s denominator and guard, `sum by (media_kind)`.
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `MCMediaMissingKeyMaterial`'s denominator and guard, `sum by (media_kind, content_kind)`.
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Frames received on the media path, counted at the PARSE
   boundary before any verification: one per datagram for audio, one per frame at
   its first byte on a group stream for video (story 3 C-B).
-- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`, `content_kind`).
 - **Usage**: the left-hand side of the accounting identity above, and the signal
   that distinguishes "nothing arriving" from "arriving and failing". See the
   counting-point note.
 
 ### `dt_client_media_frames_dropped_total`
-- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoServerMutedSenderFrames` reads `reason="sender_server_muted", media_kind="video"`; `MCMediaMissingKeyMaterial` reads the four key-delivery reasons `sum by (media_kind)`.
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoServerMutedSenderFrames` reads `reason="sender_server_muted", media_kind="video", content_kind="main"`; `MCMediaMissingKeyMaterial` reads the four key-delivery reasons `sum by (media_kind, content_kind)`.
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: per-kind base (incl. `media_kind`) + `reason` — the frozen frame-reject vocabulary, whose SSoT is
+- **Labels**: per-kind base (incl. `media_kind`, `content_kind`) + `reason` — the frozen frame-reject vocabulary, whose SSoT is
   `proto/test-vectors/frame-v3.vectors.json` → `reject_reasons`. Membership of
   THIS counter is carried by `drops_frame`: every token but one.
   `wrap_key_id_mismatch` is the only `false` and **must never appear here**: the
@@ -748,7 +755,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   - `stream_slot_mismatch` — a downlink group stream named a slot that is not one
     of this client's declared VIDEO slots (an undeclared id, or an audio slot id:
     the namespaces share one id space; lead ruling E2, which also bumps
-    `dt_client_media_undeclared_stream_id_total{media_kind="video"}`), or changed
+    `dt_client_media_undeclared_stream_id_total{media_kind="video", content_kind="main"}`), or changed
     slot mid-stream. The stream is aborted; this counts the offending frame and any
     frame already read behind it (§The receive-path accounting identity). A
     sustained rate is an MH slot-mapping defect: MH guarantees each downlink stream
@@ -771,7 +778,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
     video-server-muted (latest `ParticipantMuteUpdate`) when it ARRIVED. Dropped
     after verify, before decrypt; never rendered. The receiver-side signal that
     MH's ingress drop failed — `ClientVideoServerMutedSenderFrames` (A5) and MH runbook scenario 19 select on
-    `{reason="sender_server_muted", media_kind="video"}`. **Residual race, by
+    `{reason="sender_server_muted", media_kind="video", content_kind="main"}`. **Residual race, by
     design:** a `ParticipantMuteUpdate` can reach this client before MH applies
     DROP_AT_INGRESS, so frames in flight during that window count here on every
     ordinary server mute — **a short burst per mute is expected and is not an MH
@@ -782,12 +789,12 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
     (`dt_client_media_recovery_requests_sent_total{source="server_mute_lifted"}`).
 
 ### `dt_client_media_frames_accepted_total`
-- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoDecodeErrorRatio`'s denominator and guard (`media_kind="video"`).
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoDecodeErrorRatio`'s denominator and guard (`media_kind="video", content_kind="main"`).
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: Frames that completed the receive path — verified, replay-
   checked, decrypted — and were handed to the audio decoder.
-- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`, `content_kind`).
 - **NAMED `accepted`, NOT `played`.** A frame handed to a decoder is not played.
   Silent audio with this counter climbing means the fault is downstream of the
   handoff — the decoder, the output device, or a suspended audio context — and
@@ -796,7 +803,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 ### `dt_client_media_key_wrap_outcomes_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: per-kind base (incl. `media_kind`) + `outcome` — the NON-DROPPING wrapped-key outcomes (no count is
+- **Labels**: per-kind base (incl. `media_kind`, `content_kind`) + `outcome` — the NON-DROPPING wrapped-key outcomes (no count is
   restated here: the list below is the operator-facing artifact, and a second
   encoding of its length only rots). The frame was ACCEPTED in every case; none
   ever reaches the drop counter.
@@ -885,7 +892,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 - **Type**: Counter
 - **Description**: Frames MISSING between each media handler's egress and this
   client's ingress, measured as gaps in the relay hop sequence.
-- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`). `stream_id` is bounded internal state and is **never** a
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`, `content_kind`). `stream_id` is bounded internal state and is **never** a
   label.
 - **Increments by the SIZE of each gap, not by one per gap event** — a counter of
   missing numbers is comparable against `dt_client_media_frames_received_total`
@@ -914,7 +921,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 - **Type**: Counter
 - **Description**: Datagrams arriving at or below the running hop-sequence
   high-water mark.
-- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`, `content_kind`).
 - **Usage**: the subtrahend in `gap_frames - reorder`. Kept separate from the gap
   counter so the subtraction is possible at all.
 
@@ -926,8 +933,8 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   audio text below**: on a group stream the relay id SELECTS the slot pipeline, so
   a stream naming an undeclared or non-video slot is aborted and its frame counted
   `frames_dropped_total{reason="stream_slot_mismatch"}`; this diagnostic is bumped
-  beside it (`media_kind="video"`) so the cause stays distinguishable.
-- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
+  beside it (`media_kind="video", content_kind="main"`) so the cause stays distinguishable.
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`, `content_kind`).
 - **Usage**: the relay region is UNAUTHENTICATED — a media handler writes
   `stream_id` freely and nobody signs it — so an undeclared value creates NO
   receiver state and is counted here instead. The frame itself is still verified
@@ -935,7 +942,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   to slots this subscriber did not ask for.
 
 ### `dt_client_media_decoder_errors_total`
-- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoDecodeErrorRatio`'s numerator (`media_kind="video"`): failure EVENTS per accepted frame.
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoDecodeErrorRatio`'s numerator (`media_kind="video", content_kind="main"`): failure EVENTS per accepted frame.
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
 - **Description**: A decoder's terminal error callback fired. **Audio: one
@@ -946,7 +953,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   request (`source="decoder_error"`). A fault class affecting every lane (a codec
   or platform fault) can therefore advance this up to N times for N active
   senders, and its magnitude is **not comparable with pre-story-2 history**.
-- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`). **No `reason`** — `AudioDecoder` provides no bounded
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`, `content_kind`). **No `reason`** — `AudioDecoder` provides no bounded
   one, and an unbounded label here would be the cardinality hazard §11 exists to
   prevent.
 - **Usage**: the ONLY counter covering the accepted→audible segment, which the
@@ -967,7 +974,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   chunk (fails closed), a short/malformed VP8 key-frame header, and held frames
   the never-render re-check refuses (a sender server-muted, or with no roster
   participant, after its frame decoded).
-- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`).
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`, `content_kind`).
 - **ACCOUNTING BOUNDARY — POST-ACCEPT, and deliberately NOT a
   `frames_dropped_total{reason}` value.** Every frame counted here was already
   counted on `dt_client_media_frames_accepted_total`, so it sits DOWNSTREAM of
@@ -995,7 +1002,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   request REPLACED while queued (at most one per slot) and a FAILED write are
   **not counted**; a failed write surfaces as an event-once transport
   `mediaFault` on the session (not exported) and is never re-sent.
-- **Labels**: per-kind base (`media_kind="video"`) + `source` — the CAUSE, a closed
+- **Labels**: per-kind base (`media_kind="video", content_kind="main"`, `content_kind="main"`) + `source` — the CAUSE, a closed
   per-metric vocabulary, `MEDIA_RECOVERY_SOURCES` in `mediaMetrics.ts`, SIX
   values (the task text's five plus `server_mute_lifted`, an observability
   extension at C-B Gate 1 — OBS-B: the vocabulary has 6 values):
@@ -1030,13 +1037,13 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   already reading `media.videoReceive.maxIncomingStreams` streams (floor
   `2 x M + VIDEO_STREAM_CAP_HEADROOM`) and was cancelled unread — refused, never
   queued. **Outside the frame accounting identity**: no frame was parsed.
-- **Labels**: per-kind base only (`media_kind="video"`).
+- **Labels**: per-kind base only (`media_kind="video", content_kind="main"`, `content_kind="main"`).
 - **Zero-initialised** at video receiver start. A sustained rate means MH is
   opening far more concurrent group streams than the subscriber's slots need.
 - **Alert**: none. **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_slot_unfulfilled_duration_ms`
-- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoSlotUnfulfilled` (p95 of `_bucket{media_kind="video"}`, guard on `_count`).
+- **Alerts** (story 3 OBS-B; `docs/observability/alerts.md`): `ClientVideoSlotUnfulfilled` (p95 of `_bucket{media_kind="video", content_kind="main"}`, guard on `_count`).
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Histogram. **Unit: ms**, one observation per EXIT from the unfulfilled state.
 - **Description**: How long a video slot MC reports ACTIVE showed neither
@@ -1059,7 +1066,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   `packages/sdk-core/src/media/setup/mediaMetrics.ts` (the SSoT; extends past
   100 s, 10x the 10 000 ms maximum keyframe interval). Changing a boundary splits
   the `le` series across client versions.
-- **Labels**: per-kind base only (`media_kind="video"`). **No identity and no slot id.**
+- **Labels**: per-kind base only (`media_kind="video", content_kind="main"`, `content_kind="main"`). **No identity and no slot id.**
 - **The fleet-meaningful unfulfilled signal** (unlike the gauge below): A9
   `ClientVideoSlotUnfulfilled` reads it. Feeds the R-35 local
   overlay through a NEVER-exported snapshot getter
@@ -1078,7 +1085,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   per-browser label, ADR-0036 §11), so `sum()` or `max()` over it is ONE
   browser's last value, and one browser's teardown `0` can mask another browser's
   stuck slot. Never alert on it; the fleet signal is the histogram above.
-- **Labels**: per-kind base only (`media_kind="video"`). No identity, no slot id.
+- **Labels**: per-kind base only (`media_kind="video", content_kind="main"`, `content_kind="main"`). No identity, no slot id.
 
 ### `dt_client_media_active_source_intervals_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
@@ -1092,7 +1099,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   identical-identity browsers is last-writer-wins; counter deltas sum.
   `rate(dt_client_media_active_source_intervals_total[5m]) * export_interval_s`
   is the fleet's mean count of decoded video sources.
-- **Labels**: per-kind base only (`media_kind="video"`). No sender.
+- **Labels**: per-kind base only (`media_kind="video", content_kind="main"`, `content_kind="main"`). No sender.
 - **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_time_to_first_render_ms`
@@ -1100,13 +1107,13 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 - **Type**: Histogram. One sample per session (video).
 - **Description**: ms from video receiver start (media start) to the first video
   frame RENDERED in any slot. **Open objective: observed, never gated** (ADR-0036 §10).
-- **Read with `dt_client_time_to_first_media_frame_ms{media_kind="video"}`**: that
+- **Read with `dt_client_time_to_first_media_frame_ms{media_kind="video", content_kind="main"}`**: that
   one is the WIRE boundary, this one the RENDER boundary — a healthy wire time with
   no render time is the "arriving but not showing" read.
 - **Buckets**: `FIRST_RENDER_BUCKETS_MS` in `mediaMetrics.ts` (SSoT; to 30 s, past
   the 10 s maximum keyframe interval). Changing a boundary splits the `le` series
   across client versions.
-- **Labels**: per-kind base only (`media_kind="video"`).
+- **Labels**: per-kind base only (`media_kind="video", content_kind="main"`, `content_kind="main"`).
 
 ### `dt_client_media_slot_active_to_first_render_ms`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
@@ -1117,12 +1124,12 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   observed here — read it with `dt_client_media_slot_unfulfilled_duration_ms`,
   which observes every exit.
 - **Buckets**: `FIRST_RENDER_BUCKETS_MS` (as above).
-- **Labels**: per-kind base only (`media_kind="video"`).
+- **Labels**: per-kind base only (`media_kind="video", content_kind="main"`, `content_kind="main"`).
 
 ### `dt_client_media_mute_transitions_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: per-kind base (incl. `media_kind`) + `action` — `mute`, `unmute`.
+- **Labels**: per-kind base (incl. `media_kind`, `content_kind`) + `action` — `mute`, `unmute`.
 - **Usage**: client mute is enforced at CAPTURE and does not depend on the server
   honouring it; MC keeps the send directive active throughout. This counter, not
   frame absence, is how mute state is observed — *muted*, *silent* and *the
@@ -1131,7 +1138,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 ### `dt_client_media_kek_updates_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: session base (kind-free; see §`media_kind`) + `source` — `join_response` (the KEK carried on the join
+- **Labels**: session base (kind-free; see §`media_kind` + `content_kind`) + `source` — `join_response` (the KEK carried on the join
   response, including a reconnect re-issue) or `kek_update` (a KEK pushed over
   signaling, which only a rotation sends). **A reconnect re-issue counts as
   `join_response`, merged with a first join; a rotation's CAUSE is not
@@ -1170,7 +1177,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 - **Description**: The KEK holder would have retained more than one previous
   generation; the retention guard (run after every install) trimmed and zeroized
   the excess.
-- **Labels**: session base only (`client_version`, `org_id`, `key_custody`) — **kind-free** (session-level; see §`media_kind`).
+- **Labels**: session base only (`client_version`, `org_id`, `key_custody`) — **kind-free** (session-level; see §`media_kind` + `content_kind`).
 - **Fleet contract: reads zero forever; alertable at `> 0`** — the same contract
   form as `dt_client_media_send_dropped_total{reason="transport_send_refused"}`.
 - **A ZERO-FOREVER TRIPWIRE AGAINST A FUTURE REFACTOR — NOT A DETECTOR FOR A LIVE
@@ -1202,7 +1209,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 ### `dt_client_media_kek_retention_anomalies_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: session base (kind-free; see §`media_kind`) + `outcome` — this metric's own domain, exactly
+- **Labels**: session base (kind-free; see §`media_kind` + `content_kind`) + `outcome` — this metric's own domain, exactly
   `floor_substituted`, `ceiling_clamped`, `below_rewrap_latency`. `outcome` is a
   per-metric vocabulary (`docs/observability/label-taxonomy.md`); never
   aggregate it across metric names.
@@ -1249,7 +1256,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 ### `dt_client_media_kek_install_refusals_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: session base (kind-free; see §`media_kind`) + `outcome` — this metric's own domain, exactly `conflicting_key`,
+- **Labels**: session base (kind-free; see §`media_kind` + `content_kind`) + `outcome` — this metric's own domain, exactly `conflicting_key`,
   `older_generation`, `malformed`. **`outcome`, not `reason`**: `reason` is
   reserved for per-FRAME drops with exactly two homes
   (`docs/observability/label-taxonomy.md`), and a third family there would break
@@ -1297,7 +1304,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   join, nor on an idempotent (same generation, same bytes) or refused install.
   The increment lands on the install, not on first use of the previous
   generation.
-- **Labels**: session base only (`client_version`, `org_id`, `key_custody`) — **kind-free** (session-level; see §`media_kind`).
+- **Labels**: session base only (`client_version`, `org_id`, `key_custody`) — **kind-free** (session-level; see §`media_kind` + `content_kind`).
 - **Fleet signal is the PAIR**: `dt_client_media_kek_updates_total{source="kek_update"}`
   rising while this stays flat means rotations are happening and nothing is
   being retained — an audio gap at every rotation. **Neither series alone says
@@ -1316,7 +1323,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 - **Description**: Changes to a LIVE sender's roster key — **one increment per
   event, not per purged key**. A first binding (new sender, or keyless→key) and
   an equal-bytes update are not counted.
-- **Labels**: session base (kind-free; see §`media_kind`) + `outcome` — a per-metric vocabulary, two values that point at
+- **Labels**: session base (kind-free; see §`media_kind` + `content_kind`) + `outcome` — a per-metric vocabulary, two values that point at
   DIFFERENT fixes and carry DIFFERENT contracts:
   - `rebind` — the live `sender_id` bound to DIFFERENT, well-formed key bytes.
     MC never legitimately rebinds a LIVE id. It DOES reissue an id to a new
@@ -1366,7 +1373,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   a `test_tone` series outside a dev environment means a test-tone build
   (story 2 R-7, Vite build-time define `__DT_TEST_TONE__`) is serving real
   users, whose microphones are then not being sent at all.
-- **Labels**: session base (kind-free; see §`media_kind`) + `mode` — `microphone` | `test_tone`, a closed, bounded,
+- **Labels**: session base (kind-free; see §`media_kind` + `content_kind`) + `mode` — `microphone` | `test_tone`, a closed, bounded,
   identity-free vocabulary (`MediaCaptureSourceMode` in
   `packages/sdk-core/src/media/setup/mediaMetrics.ts`). The value is a
   **build-time** property of the bundle, not per user. The `test_tone` token
@@ -1424,7 +1431,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   `getMetricExportIntervalMs()`). Premise: the encoder runs with DTX off
   (`lifecycle/muteState.ts`), so a live, unmuted sender always produces frames
   and zero decoded frames is a real fault, not silence.
-- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`). **No sender, slot or mode label** — ever.
+- **Labels**: per-kind base only (`client_version`, `org_id`, `key_custody`, `media_kind`, `content_kind`). **No sender, slot or mode label** — ever.
 - **A counter, not a gauge — deliberately.** N browsers with identical label sets
   (no per-browser label, ADR-0036 §11) write one stream identity, so a gauge is
   last-writer-wins at the collector: one healthy browser's `0` would erase a
@@ -1445,7 +1452,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 ### `dt_client_media_capture_failures_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: per-kind base (`client_version`, `org_id`, `key_custody`, `media_kind`)
+- **Labels**: per-kind base (`client_version`, `org_id`, `key_custody`, `media_kind`, `content_kind`)
   + `outcome`. **`outcome`, not `reason`** (story 3 C-A1, taxonomy owner's ruling):
   `reason` is reserved for the two per-FRAME drop families
   (`docs/observability/label-taxonomy.md`), and a capture failure is not a frame
@@ -1494,7 +1501,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   counted on `dt_client_media_keyframes_produced_total{source="request"}`);
   `honoured` / `honoured_counter_ahead` when keyed now. A request for the AUDIO
   stream is `not_sending` on the audio handle (audio has no keyframes).
-- **NOT zero-initialised** (story 3 E4 ruling): a `media_kind="video"` series before
+- **NOT zero-initialised** (story 3 E4 ruling): a `media_kind="video", content_kind="main"` series before
   video flows would let the video read-back pass vacuously, and audio has no
   keyframes.
 - **Never summed by `outcome`** with `..._keyframe_requests_unattributed_total`:
@@ -1506,7 +1513,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 ### `dt_client_media_keyframe_requests_unattributed_total`
 - **Exported**: yes — reaches Prometheus through the collector's metric-name allowlist (`infra/services/otel-collector/collector.yaml`).
 - **Type**: Counter
-- **Labels**: session base (kind-free; see §`media_kind`) + `outcome`, exactly
+- **Labels**: session base (kind-free; see §`media_kind` + `content_kind`) + `outcome`, exactly
   `not_sending` (a well-formed request naming a stream number that is no
   published kind's directed stream) and `malformed` (undecodable, oversized,
   empty or an unknown variant on the MH control stream — a framing failure also
@@ -1575,7 +1582,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   never produces an `abandonment` keyframe (MH's decision; MH requests when it
   wants the stream again). An unsolicited platform key chunk is not a decision and
   is not counted here (it restarts the gate's interval clock).
-- **Zero-initialised** for all three `source` values on `media_kind="video"` when
+- **Zero-initialised** for all three `source` values on `media_kind="video", content_kind="main"` when
   a video stream is FIRST DIRECTED (never at join: no video series before video
   flows). Audio never emits it.
 - **No GoP value, timing, stream number or sender** in any label.
@@ -1599,7 +1606,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   stall is counted NOWHERE on MH (quinn enforces it), so
   `send_groups_stopped_total{outcome="open_stalled"}` is its only signal. A flat
   value here does NOT mean the peer refused nothing.
-- **Zero-initialised** on `media_kind="video"` when a video stream is first
+- **Zero-initialised** on `media_kind="video", content_kind="main"` when a video stream is first
   directed. Read against `rate(dt_client_media_keyframes_produced_total{source="abandonment"})`.
 - **Alert**: none, by decision; the fleet signal is `MHVideoSubscriberBacklogResets`. **Panel**:
   `infra/grafana/dashboards/client-media.json`.
@@ -1620,7 +1627,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   {reason="not_connected"}`.
 - **`open_stalled` is the ONLY signal for MAX_STREAMS starvation**: quinn enforces
   the limit, and MH has no event to count (`mh_media_uni_streams_per_connection_limit`).
-- **Zero-initialised** for all three outcomes on `media_kind="video"` when a video
+- **Zero-initialised** for all three outcomes on `media_kind="video", content_kind="main"` when a video
   stream is first directed. Never summed by `outcome` across series.
 - **Alert**: none, by decision (story 3 OBS-B; `docs/observability/alerts.md` §Deliberate absences). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
@@ -1635,7 +1642,7 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
   rides the next encoded frame. Mirrors `dt_client_media_decode_queue_dropped_total`
   on the other side.
 - **Audio never emits it**: audio has no pre-encode bound.
-- **Zero-initialised** on `media_kind="video"` when a video stream is first directed.
+- **Zero-initialised** on `media_kind="video", content_kind="main"` when a video stream is first directed.
 - **Alert**: none, by decision (story 3 OBS-B; `docs/observability/alerts.md` §Deliberate absences). **Panel**: `infra/grafana/dashboards/client-media.json`.
 
 ### `dt_client_media_keyframe_min_interval_clamped_total`
@@ -1697,9 +1704,9 @@ counter, `dt_client_media_incoming_streams_refused_total`, unit streams).
 - **Description**: Wall-clock ms from media pipeline start to the first media
   frame **of that kind** arriving at the wire. **Unit: one sample per kind per
   session** — once video emits, one join yields one `audio` and one `video` sample,
-  never two samples of one quantity; read it `by (media_kind)`.
+  never two samples of one quantity; read it `by (media_kind, content_kind)`.
 - **Labels**: the **media-path per-kind** set (`client_version`, `org_id`,
-  `key_custody`, `media_kind`). **NOT a frozen-roster member**, notwithstanding its
+  `key_custody`, `media_kind`, `content_kind`). **NOT a frozen-roster member**, notwithstanding its
   name's resemblance to `dt_client_time_to_first_mh_connected_ms` — the
   difference is what it observes, not what it is called.
 - **Buckets**: OTel defaults (no boundaries declared; deferred with the media dashboards).

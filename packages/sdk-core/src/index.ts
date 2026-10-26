@@ -361,7 +361,8 @@ export {
   MEDIA_CAPTURE_FAILURE_OUTCOMES,
   MEDIA_KEYFRAME_SOURCES,
   MEDIA_MUTE_ACTIONS,
-  MEDIA_KIND_LABELS,
+  CONTENT_KIND_LABEL_VALUES,
+  MEDIA_KIND_LABEL_VALUES,
   MEDIA_SEND_DROP_REASONS,
   MEDIA_RECOVERY_SOURCES,
   SLOT_UNFULFILLED_BUCKETS_MS,
@@ -370,6 +371,7 @@ export {
   MediaMetrics,
   MediaSessionMetrics,
   mediaMetricLabels,
+  publishedKindMetricLabels,
 } from './media/setup/mediaMetrics.js';
 export type {
   MediaKekInstallRefusal,
@@ -378,7 +380,9 @@ export type {
   MediaCaptureFailureOutcome,
   MediaCaptureSourceMode,
   MediaKeyframeSource,
+  ContentKindLabel,
   MediaKindLabel,
+  MediaKindMetricLabels,
   MediaMetricIdentity,
   MediaMuteAction,
   MediaSendDropReason,

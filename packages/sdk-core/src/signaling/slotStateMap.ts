@@ -66,6 +66,6 @@ export function mediaKindToken(kind: MediaKind): OpenMediaKindToken {
  * The send direction for the two kinds this client declares and publishes:
  * the closed wire values only (`MEDIA_KIND_AUDIO`, `MEDIA_KIND_VIDEO_CAMERA`).
  */
-export function wireMediaKind(kind: MediaKindToken): MediaKind {
+export function wireMediaKind(kind: MediaKindToken): MediaKind.AUDIO | MediaKind.VIDEO_CAMERA {
   return kind === 'audio' ? MediaKind.AUDIO : MediaKind.VIDEO_CAMERA;
 }

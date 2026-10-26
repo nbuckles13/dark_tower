@@ -21,7 +21,11 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ALL_REJECT_REASONS, MEDIA_KIND_LABELS } from '@darktower/sdk-core';
+import {
+  ALL_REJECT_REASONS,
+  CONTENT_KIND_LABEL_VALUES,
+  MEDIA_KIND_LABEL_VALUES,
+} from '@darktower/sdk-core';
 import {
   ALL_ASSERTED_CLIENT_NAMES,
   MISSING_KEY_MATERIAL_ALERT,
@@ -31,7 +35,10 @@ import {
   clientNamesIn,
   sumGroupingsIn,
   reasonAlternationIn,
+  CONTENT_KIND_AUDIO,
+  CONTENT_KIND_VIDEO,
   MEDIA_KIND_AUDIO,
+  MEDIA_KIND_VIDEO,
 } from '../e2e/clientMetricNames.js';
 
 const REPO = resolve(__dirname, '../../..');
@@ -106,6 +113,9 @@ describe('sumGroupingsIn — self-test', () => {
       'media_kind',
       '',
     ]);
+    expect(sumGroupingsIn('sum by (media_kind, content_kind) (a)')).toEqual([
+      'media_kind,content_kind',
+    ]);
     expect(sumGroupingsIn('sum without (x) (a)')).toEqual(['<unrecognised sum shape>']);
     expect(sumGroupingsIn('max(a)')).toEqual([]);
   });
@@ -148,7 +158,7 @@ describe(`${MISSING_KEY_MATERIAL_ALERT} <-> clientMetricNames <-> emitter`, () =
     expect(unknown, 'reason-drift: the rule selects reasons the SDK never emits').toEqual([]);
   });
 
-  it('is PER KIND: numerator, denominator AND guard are all `sum by (media_kind)`', () => {
+  it('is PER KIND: numerator, denominator AND guard are all `sum by (media_kind, content_kind)`', () => {
     const groupings = sumGroupingsIn(expr ?? '');
     expect(
       groupings.length,
@@ -156,7 +166,7 @@ describe(`${MISSING_KEY_MATERIAL_ALERT} <-> clientMetricNames <-> emitter`, () =
     ).toBe(MISSING_KEY_MATERIAL_SUM_COUNT);
     expect(
       groupings,
-      'grouping-drift: every sum must group by media_kind; an ungrouped guard under `and` silently kills the rule',
+      'grouping-drift: every sum must group by media_kind, content_kind; an ungrouped guard under `and` silently kills the rule',
     ).toEqual(Array(MISSING_KEY_MATERIAL_SUM_COUNT).fill(MISSING_KEY_MATERIAL_GROUPING));
   });
 
@@ -167,12 +177,16 @@ describe(`${MISSING_KEY_MATERIAL_ALERT} <-> clientMetricNames <-> emitter`, () =
   });
 });
 
-describe('the R-29 media_kind read-back value', () => {
-  it('is a value of the SDK media_kind vocabulary, and is `audio`', () => {
-    // Imported, not retyped; pinned so a rename on the SDK side cannot silently
-    // retarget the read-back to a kind that does not flow yet.
-    expect(Object.values(MEDIA_KIND_LABELS)).toContain(MEDIA_KIND_AUDIO);
-    expect(MEDIA_KIND_AUDIO).toBe('audio');
+describe('the R-29 kind-label read-back values', () => {
+  it('are values of the SDK projection: audio/main and video/main', () => {
+    // Imported, not retyped; pinned so a change on the SDK side cannot silently
+    // retarget a read-back to a kind that does not flow yet (screen share).
+    expect(MEDIA_KIND_LABEL_VALUES).toContain(MEDIA_KIND_AUDIO);
+    expect(MEDIA_KIND_LABEL_VALUES).toContain(MEDIA_KIND_VIDEO);
+    expect(CONTENT_KIND_LABEL_VALUES).toContain(CONTENT_KIND_AUDIO);
+    expect(CONTENT_KIND_LABEL_VALUES).toContain(CONTENT_KIND_VIDEO);
+    expect([MEDIA_KIND_AUDIO, CONTENT_KIND_AUDIO]).toEqual(['audio', 'main']);
+    expect([MEDIA_KIND_VIDEO, CONTENT_KIND_VIDEO]).toEqual(['video', 'main']);
   });
 });
 
@@ -209,6 +223,7 @@ describe('client-alerts.yaml selectors <-> SDK vocabulary (story 3 OBS-B)', () =
   const rules = alertNames(text).map((name) => ({ name, expr: alertExpr(text, name) ?? '' }));
   const reasons = rules.flatMap((r) => labelValuesIn(r.expr, 'reason'));
   const kinds = rules.flatMap((r) => labelValuesIn(r.expr, 'media_kind'));
+  const contentKinds = rules.flatMap((r) => labelValuesIn(r.expr, 'content_kind'));
 
   it('POSITIVE CONTROL (no-client-rules): at least one rule is found, each with an expr', () => {
     expect(rules.length, `no-client-rules: no "- alert:" item in ${CLIENT_RULES}`).toBeGreaterThan(
@@ -244,13 +259,34 @@ describe('client-alerts.yaml selectors <-> SDK vocabulary (story 3 OBS-B)', () =
     );
   });
 
-  it('every selected media_kind is a value of MEDIA_KIND_LABELS', () => {
-    const known: readonly string[] = Object.values(MEDIA_KIND_LABELS);
+  it('every selected media_kind is a value of MEDIA_KIND_LABEL_VALUES', () => {
+    const known: readonly string[] = MEDIA_KIND_LABEL_VALUES;
     const unknown = kinds.filter((k) => !known.includes(k));
     expect(
       unknown,
       'media-kind-value-drift: a client rule selects a media_kind the SDK never emits',
     ).toEqual([]);
+  });
+
+  it('every selected content_kind is a value of CONTENT_KIND_LABEL_VALUES', () => {
+    const known: readonly string[] = CONTENT_KIND_LABEL_VALUES;
+    const unknown = contentKinds.filter((k) => !known.includes(k));
+    expect(
+      unknown,
+      'content-kind-value-drift: a client rule selects a content_kind the SDK never emits',
+    ).toEqual([]);
+  });
+
+  it('ALL OR NONE: a rule selecting a media_kind value also selects a content_kind value, per selector', () => {
+    // 2026-10-26: the two labels are co-carried; a selector pinning only one
+    // silently widens to screen share once it ships.
+    const lone = rules
+      .flatMap((r) => [...r.expr.matchAll(/\{[^}]*\}/g)].map((m) => [r.name, m[0]] as const))
+      .filter(
+        ([, sel]) => /\bmedia_kind\s*=~?\s*"/.test(sel) !== /\bcontent_kind\s*=~?\s*"/.test(sel),
+      )
+      .map(([name, sel]) => `${name}: ${sel}`);
+    expect(lone, 'kind-label-pairing: selector names one kind label without the other').toEqual([]);
   });
 
   it('every dt_client_* name a client rule selects is a literal the emitter registers', () => {

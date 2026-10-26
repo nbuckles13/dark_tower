@@ -773,12 +773,21 @@ groups:
       # for no triage gain. The reason fork lives in Scenario 16.
       #
       # PER KIND (story 3 OBS-B, R-29). Numerator, denominator AND guard are
-      # `sum by (media_kind)`, so a video-only key failure is not diluted by
-      # audio's higher frame rate, and the alert fires once per affected kind.
+      # `sum by (media_kind, content_kind)`, so a video-only key failure is not
+      # diluted by audio's higher frame rate, and the alert fires once per
+      # affected kind.
+      # 2026-10-26 — SERIES IDENTITY, NOT TRAFFIC: every per-kind client series
+      # now co-carries `content_kind` (label-taxonomy.md §query rule: an expr
+      # naming one kind key names both). Every series reads `main` today, so
+      # the fired set is unchanged; when screen share ships it becomes its own
+      # (video, screen) instance instead of diluting the camera's ratio. At
+      # rollout the new series start empty: `rate()` and the 15m `for:` ramp on
+      # them — expected, not an incident.
       # The guard MUST carry the same grouping: an ungrouped guard under `and`
       # has no matching label set and the rule would go silently dead. The
       # guard stays on `received` (never `accepted`; the inversion above).
-      # `media_kind` survives the client pipeline since OBS-A (keep_keys;
+      # `media_kind` (and `content_kind`, 2026-10-26) survive the client
+      # pipeline (keep_keys;
       # dt-guard client-metrics-export rule 2 checks it), and every per-kind
       # handle stamps it, so no series falls outside the grouping.
       #
@@ -810,12 +819,12 @@ groups:
       - alert: MCMediaMissingKeyMaterial
         expr: |
           (
-            sum by (media_kind) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
+            sum by (media_kind, content_kind) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
             /
-            sum by (media_kind) (rate(dt_client_media_frames_received_total[5m]))
+            sum by (media_kind, content_kind) (rate(dt_client_media_frames_received_total[5m]))
           ) > 0.05
           and
-          sum by (media_kind) (rate(dt_client_media_frames_received_total[5m])) > 0
+          sum by (media_kind, content_kind) (rate(dt_client_media_frames_received_total[5m])) > 0
         for: 15m
         labels:
           severity: warning

@@ -40,10 +40,10 @@ def counter(name, labels, value, start, end):
         "attributes": attrs(labels), "startTimeUnixNano": str(start), "timeUnixNano": str(end), "asInt": str(value)}]}}
 
 
-def mk_int_counter(name, labels, value, start, end):
-    """A counter whose `media_kind` is an INT, not a string (the IsString arm)."""
+def mk_int_counter(name, labels, value, start, end, key="media_kind"):
+    """A counter whose `key` (a kind label) is an INT, not a string (the IsString arm)."""
     c = counter(name, labels, value, start, end)
-    c["sum"]["dataPoints"][0]["attributes"].append({"key": "media_kind", "value": {"intValue": "7"}})
+    c["sum"]["dataPoints"][0]["attributes"].append({"key": key, "value": {"intValue": "7"}})
     return c
 
 
@@ -202,12 +202,26 @@ def filtering():
                 dict(BASE, org_id="filt-forge", key_custody="end_to_end", reason="0f8fad5b-d9cb-469f-a165-70867728950e"), 4, t0, t1),
         # story 3 R-29: the EXACT media_kind value rule (per-kind names; the
         # kind-free session name proves the nil-guard does not stamp the key).
-        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-audio", media_kind="audio"), 1, t0, t1),
-        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-bogus", media_kind="bogus"), 1, t0, t1),
-        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-prefix", media_kind="audio_x"), 1, t0, t1),
-        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-suffix", media_kind="xvideo"), 1, t0, t1),
-        mk_int_counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-int"), 1, t0, t1),
+        # Each carries a valid content_kind too: a LONE kind key is poisoned
+        # to invalid/invalid by the pair rules (2026-10-26), see ck-lone-*.
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-audio", media_kind="audio", content_kind="main"), 1, t0, t1),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-bogus", media_kind="bogus", content_kind="main"), 1, t0, t1),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-prefix", media_kind="audio_x", content_kind="main"), 1, t0, t1),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-suffix", media_kind="xvideo", content_kind="main"), 1, t0, t1),
+        mk_int_counter("dt_client_media_frames_sent_total", dict(BASE, org_id="mk-int", content_kind="main"), 1, t0, t1),
         counter("dt_client_media_kek_retention_violations_total", dict(BASE, org_id="mk-sessionfree"), 1, t0, t1),
+        # 2026-10-26: the EXACT content_kind value rule, mirroring media_kind's
+        # cases (main passes; bogus, prefix, suffix and int are rewritten), and
+        # the pair-poisoning rules (either key `invalid` or ABSENT => both `invalid`).
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="ck-main", media_kind="video", content_kind="main"), 1, t0, t1),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="ck-screen", media_kind="video", content_kind="screen"), 1, t0, t1),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="ck-bogus", media_kind="audio", content_kind="bogus"), 1, t0, t1),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="ck-prefix", media_kind="audio", content_kind="main_x"), 1, t0, t1),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="ck-suffix", media_kind="audio", content_kind="xscreen"), 1, t0, t1),
+        mk_int_counter("dt_client_media_frames_sent_total", dict(BASE, org_id="ck-int", media_kind="audio"), 1, t0, t1, key="content_kind"),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="ck-poisoned-by-media", media_kind="bogus", content_kind="main"), 1, t0, t1),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="ck-lone-media", media_kind="audio"), 1, t0, t1),
+        counter("dt_client_media_frames_sent_total", dict(BASE, org_id="ck-lone-content", content_kind="main"), 1, t0, t1),
     ])
     settle()
     t = scrape()
@@ -242,7 +256,7 @@ def filtering():
     _, labels = value(t, "dt_client_media_key_wrap_outcomes_total", {"org_id": "filt-anchor"})
     check("(anchor) legal substring + illegal surroundings rewritten", (labels or {}).get("outcome"), "invalid")
     _, labels = value(t, "dt_client_media_frames_received_total", {"org_id": "filt-nil"})
-    check("(nil-guard) never-sent labels stay absent", sorted(k for k in (labels or {}) if k in ("reason", "outcome", "action", "source", "mode", "media_kind")), [])
+    check("(nil-guard) never-sent labels stay absent", sorted(k for k in (labels or {}) if k in ("reason", "outcome", "action", "source", "mode", "media_kind", "content_kind")), [])
     check("(real) client_version 0.0.0 survives", (labels or {}).get("client_version"), "0.0.0")
     _, labels = value(t, "dt_client_media_frames_dropped_total", {"org_id": "filt-real"})
     check("(real) token kek_generation_stale survives", (labels or {}).get("reason"), "kek_generation_stale")
@@ -255,6 +269,15 @@ def filtering():
     v, labels = value(t, "dt_client_media_kek_retention_violations_total", {"org_id": "mk-sessionfree"})
     check("(media_kind nil-guard) kind-free series arrives", v, 1.0)
     check("(media_kind nil-guard) kind-free series carries no media_kind", "media_kind" in (labels or {}), False)
+    check("(content_kind nil-guard) kind-free series carries no content_kind", "content_kind" in (labels or {}), False)
+    for org, want in (("ck-main", ("video", "main")), ("ck-screen", ("video", "screen")),
+                      ("ck-bogus", ("invalid", "invalid")), ("ck-prefix", ("invalid", "invalid")),
+                      ("ck-suffix", ("invalid", "invalid")), ("ck-int", ("invalid", "invalid")),
+                      ("ck-poisoned-by-media", ("invalid", "invalid")),
+                      ("ck-lone-media", ("invalid", "invalid")), ("ck-lone-content", ("invalid", "invalid"))):
+        _, labels = value(t, "dt_client_media_frames_sent_total", {"org_id": org})
+        check(f"(content_kind exact + pair) {org}", ((labels or {}).get("media_kind"), (labels or {}).get("content_kind")), want)
+    check("(content_kind exact) bogus never stored", 'content_kind="bogus"' in t, False)
     check("names verbatim (no unit suffix)", "dt_client_time_to_first_media_frame_ms_milliseconds" in t, False)
     check("names verbatim (no doubled _total)", "_total_total" in t, False)
 

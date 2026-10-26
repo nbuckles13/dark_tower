@@ -14,7 +14,8 @@ import { unpackKeyId } from '../../frame/keyId.js';
 import { parseSframe, AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { MeetingIdentity } from '../../setup/identity.js';
 import { kekHolderWith } from '../../__tests__/helpers.js';
-import { MEDIA_KIND_LABELS, MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKind } from '../../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { TransmitKeyManager } from '../../lifecycle/transmitKeys.js';
 import { uplinkRelayStreamId } from '../sendId.js';
 import { VideoEgress, type GroupStreamOpener } from '../videoEgress.js';
@@ -47,7 +48,7 @@ async function makeRig(options: RigOptions = {}) {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaKindMetrics(
     { clientVersion: 'v', orgId: 'o' },
-    MEDIA_KIND_LABELS.Video,
+    MediaKind.VIDEO_CAMERA,
     sink,
   );
   const mocks = new Map<string, MockWebTransport>();

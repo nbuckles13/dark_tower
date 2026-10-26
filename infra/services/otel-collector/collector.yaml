@@ -178,7 +178,7 @@ processors:
           # GROUP 2 — the per-metric discriminators (global-controller's + security's),
           # the same widening applied to GC's datapoint tier
           # (`MEDIA_DATAPOINT_EXTRA`) minus key_custody (which is in group 1):
-          # reason, outcome, action, source, mode, media_kind. So group 1 ∪
+          # reason, outcome, action, source, mode, media_kind, content_kind. So group 1 ∪
           # group 2 ⊇ `MEDIA_DATAPOINT_EXTRA` (dt-guard rule 3).
           # `mode` (story 2 task 13) is carried only by
           # `dt_client_media_capture_source` — `microphone` | `test_tone`, a
@@ -188,7 +188,10 @@ processors:
           # `docs/observability/label-taxonomy.md`; carried by every PER-KIND
           # client media series and absent from the session-level ones (KEK,
           # roster, capture source). Its value rule is the exact one in block
-          # (c) below.
+          # (c) below. `content_kind` (2026-10-26) is the closed vocabulary
+          # {main, screen}, co-carried with `media_kind` on exactly the same
+          # series (all or none), SSoT the `content_kind` row and the projection
+          # table of the same doc; its exact rule sits beside media_kind's.
           #
           # Two groups rather than a flat list because the next editor must
           # know WHICH owner to consult for a given key; flattened, they edit
@@ -225,7 +228,7 @@ processors:
           # go dark. NO MERGED LIST IS CORRECT FOR BOTH QUESTIONS.
           # `dt-guard client-metrics-export` (G4) asserts this list is a SUBSET
           # of GC's two, so the two encodings cannot drift apart silently.
-          - keep_keys(attributes, ["client_version", "org_id", "key_custody", "reason", "outcome", "action", "source", "mode", "media_kind"])
+          - keep_keys(attributes, ["client_version", "org_id", "key_custody", "reason", "outcome", "action", "source", "mode", "media_kind", "content_kind"])
 
           # --- key_custody: asserted here, not accepted from a browser ---
           #
@@ -326,6 +329,35 @@ processors:
           # parentheses keep BOTH anchors on BOTH alternatives: unparenthesised,
           # `^audio|video$` would admit `audio…` prefixes and `…video` suffixes.
           - set(attributes["media_kind"], "invalid") where attributes["media_kind"] != nil and (not IsString(attributes["media_kind"]) or not IsMatch(attributes["media_kind"], "^(audio|video)$"))
+
+          # --- content_kind: the same EXACT allowlist, for the same reasons ---
+          #
+          # Closed and two-valued ({main, screen}, the `content_kind` row and the
+          # projection table of `docs/observability/label-taxonomy.md`), so the
+          # exact rule bounds the distinct-value count exactly as media_kind's
+          # does. Same `!= nil` guard (kind-free series must not be stamped) and
+          # the same parenthesised, double-anchored alternation. `dt-guard
+          # client-metrics-export` (`kind_collector_rule_drift`) ties both
+          # alternations to the taxonomy rows.
+          - set(attributes["content_kind"], "invalid") where attributes["content_kind"] != nil and (not IsString(attributes["content_kind"]) or not IsMatch(attributes["content_kind"], "^(main|screen)$"))
+          # A kind label poisons its PAIR: once either key is `invalid` OR
+          # ABSENT while the other is present, both are `invalid`. The honest
+          # SDK cannot emit a lone key (both come from one projection call), so
+          # a lone key is always a patched client. The two lone-key lines run
+          # first and the two poisoning lines finish the pair. All four are
+          # value-agnostic on purpose: they name no vocabulary value, so they
+          # cannot drift from the taxonomy. Together they keep all-or-none true
+          # at the store and the adversarial kind tuples per name at 6 (4 value
+          # pairs + invalid/invalid + absent/absent) instead of 11. See the
+          # stream budget below. Only client metrics reach this transform: the
+          # strict `dt_client_*` name filter runs first, and MC/MH/GC/AC
+          # metrics are scraped by Prometheus, never sent through this pipeline.
+          # At rollout, a tab still on a pre-2026-10-26 SDK (media_kind only)
+          # reads invalid/invalid until reloaded: not a patched client.
+          - set(attributes["content_kind"], "invalid") where attributes["media_kind"] != nil and attributes["content_kind"] == nil
+          - set(attributes["media_kind"], "invalid") where attributes["content_kind"] != nil and attributes["media_kind"] == nil
+          - set(attributes["content_kind"], "invalid") where attributes["media_kind"] == "invalid" and attributes["content_kind"] != nil
+          - set(attributes["media_kind"], "invalid") where attributes["content_kind"] == "invalid" and attributes["media_kind"] != nil
 
   # ---------------------------------------------------------------------
   # COLLECTOR-CLOCK RESTAMP — the ordering authority at the trust boundary.
@@ -516,17 +548,52 @@ processors:
   # The honest figure (3.03) is still at/above the 3-run trigger: no cap
   # change in C-B. C-C1 (task 17) adds the next names and, if it adds any
   # stream, takes the honest figure below 3 runs and so RAISES THE CAP.
-  # Kept at 500 (operations ruling, story 3 task 2): this is a fail-closed
+  # 2026-10-26 (`docs/devloop-outputs/2026-10-26-mediakind-metric-labels/`)
+  # — `content_kind` is a new KEPT KEY on every per-kind series (series
+  # identity, not traffic). No new name. Per per-run `org_id`:
+  #   - honest TODAY (every series reads `main`): 67 x 2 + 19 + 12 = 165
+  #     -> ~3.0 runs, UNCHANGED (the key adds no tuple until screen emits);
+  #   - honest ONCE SCREEN SHARE EMITS (video gains a `screen` tuple, the 12
+  #     video-only receive names too): 67 x 3 + 19 + 12 x 2 = 244 -> ~2.0 runs;
+  #   - adversarial, per-kind names: block (c)'s value rules, lone-key rules
+  #     and pair-poisoning leave at most 6 kind tuples per name — the 4 value
+  #     pairs (audio|video x main|screen), invalid/invalid, and absent/absent
+  #     (a patched client can omit both keys; the earlier x3 left that tuple
+  #     out). Without the lone-key rules it would be 11, without any pair rule
+  #     9. 67 x 6 + 19 + 12 x 6 = 493 -> ~2.0 runs at 1000;
+  #   - adversarial, kind keys forged onto EVERY name (nothing scopes the keys
+  #     to per-kind names): (67 + 19 + 12) x 6 = 588 -> ~1.7 runs at 1000.
+  # THESE ADVERSARIAL FIGURES ARE A FLOOR, NOT A BOUND: `reason`, `outcome`,
+  # `action`, `source` and `mode` are bounded in CHARSET, not COUNT (GC
+  # `telemetry_filter.rs` module doc), so a patched client can mint streams
+  # past any fixed cap. The cap is a fail-closed backstop, not the bound.
+  # The cap is RAISED 500 -> 1000 here (observability + security + operations
+  # rulings): honest-today is unchanged, but honest-with-screen is already
+  # below the 3-run trigger and the per-kind adversarial figure would be ~1.0
+  # run at 500. At 1000: honest today ~6.1 runs, honest with screen ~4.1,
+  # adversarial ~2.0 per-kind (the floor previously accepted for C-B).
+  # MEMORY (deployment.yaml quotes the denominator, so here too): the raise
+  # adds at most 500 `delta_to_cumulative` accumulators (labels + one value
+  # + timestamps, or a histogram's buckets: order of a KiB each) plus as many
+  # exporter series — an ESTIMATED low single-digit MiB, against the 512Mi
+  # limit and the ~200 MiB measured floor (`otelcol_process_memory_rss`).
+  # Estimated, not measured: re-measure with the acceptance harness if the
+  # cap moves again.
+  # Was kept at 500 (operations ruling, story 3 task 2): this is a fail-closed
   # tripwire, not a capacity estimate, and per-run orgs overlap only within
   # `max_stale`. Because of the multiplier, every PER-KIND name a later task
-  # adds costs 2 streams per org honestly (3 adversarially), so the video
-  # tasks that add names recompute these three lines. TRIGGER: if the
-  # honest-once-video headroom drops below 3 concurrent runs, raise the cap in
-  # the task that crosses it.
+  # adds costs, per org: an audio-only name 1 stream honestly; a video name 1
+  # today, 2 once screen emits; any per-kind name 6 adversarially. Recompute
+  # the lines above when a name or a value set is added. TRIGGER: if the
+  # honest-WITH-SCREEN headroom drops below 3 concurrent runs at the current
+  # cap, raise the cap in the task that crosses it (it is ~4.1 at 1000).
+  # STALE TABS AT ROLLOUT: a browser still running a pre-2026-10-26 SDK sends
+  # `media_kind` without `content_kind`, so the lone-key rule stores it as
+  # invalid/invalid until that tab reloads. That is not a patched client.
   # Recompute this figure whenever a name or a label value set is added.
   delta_to_cumulative:
     max_stale: 15m
-    max_streams: 500
+    max_streams: 1000
 
 exporters:
   # `debug` is the DEV-ONLY sink (this collector is the Kind/dev deployment;

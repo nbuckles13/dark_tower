@@ -375,9 +375,9 @@ which stops at the JoinResponse. Why the window exists (and why it is not a debo
 Story 3 (R-30, ADR-0036 §10) adds two video objectives. Both are **OPEN**: no target is ratified, and
 **no test gates on a wall-clock number** for either, for the reasons above.
 
-| Objective | Histogram (client, `media_kind="video"`) | Measurement points |
+| Objective | Histogram (client, `media_kind="video", content_kind="main"`) | Measurement points |
 |---|---|---|
-| **Join-to-first-rendered-video** | `dt_client_media_time_to_first_render_ms` | From the video receiver's start (media start) to the first video frame RENDERED in any slot — delivered to the embedder's attached `VideoSink` without throwing. One sample per session. Read beside `dt_client_time_to_first_media_frame_ms{media_kind="video"}` (the WIRE boundary): a healthy wire time with no render time is "arriving but not showing". |
+| **Join-to-first-rendered-video** | `dt_client_media_time_to_first_render_ms` | From the video receiver's start (media start) to the first video frame RENDERED in any slot — delivered to the embedder's attached `VideoSink` without throwing. One sample per session. Read beside `dt_client_time_to_first_media_frame_ms{media_kind="video", content_kind="main"}` (the WIRE boundary): a healthy wire time with no render time is "arriving but not showing". |
 | **Slot-active-to-first-render** | `dt_client_media_slot_active_to_first_render_ms` | From a video slot turning ACTIVE to its first rendered frame from its current source. One sample per ACTIVE entry that renders. **Survivorship-biased**: an entry that exits unrendered is not observed; read it with `dt_client_media_slot_unfulfilled_duration_ms`, which observes every exit (and feeds the `ClientVideoSlotUnfulfilled` alert, which is a fault detector, not this objective). |
 
 **Server-side decomposition of slot-active-to-first-render**: `mh_media_edge_pending_duration_seconds`

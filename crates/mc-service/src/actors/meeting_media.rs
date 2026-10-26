@@ -204,7 +204,7 @@ impl MutedSourceCensus {
     pub fn publish(&self) {
         let totals = self.totals();
         for kind in MediaKindLabel::ALL {
-            metrics::set_server_muted_sources(kind, kind.of(totals));
+            metrics::set_server_muted_sources(kind.labels(), kind.of(totals));
         }
     }
 
@@ -1080,7 +1080,7 @@ impl MeetingMedia {
             // `stream_kinds` is parallel to `directive.streams`, projected once
             // at composition, so there is no fallible lookup here.
             for (kind, stream) in stream_kinds.iter().zip(&directive.streams) {
-                metrics::record_send_targets(*kind, stream.targets.len());
+                metrics::record_send_targets(kind.labels(), stream.targets.len());
             }
             delivered &= send(
                 connection,
@@ -1099,13 +1099,13 @@ impl MeetingMedia {
                     } else {
                         WithdrawalReason::Unwatched
                     };
-                    metrics::record_send_directive_withdrawal(*kind, reason);
+                    metrics::record_send_directive_withdrawal(kind.labels(), reason);
                 }
             }
         }
         if assignments_changed && delivered {
             for (kind, state) in &composition.slot_states {
-                metrics::record_slot_state(*kind, *state);
+                metrics::record_slot_state(kind.labels(), *state);
             }
             delivered &= send_message(connection, &assignments_message).await;
         }

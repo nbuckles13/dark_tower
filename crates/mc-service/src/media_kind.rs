@@ -23,13 +23,18 @@
 
 use proto_gen::dark_tower::signaling::v1::{ClientMediaState, MediaKind};
 
-/// A media kind MC serves, and the label of a series whose subject has one
-/// (`media_kind` label; story 3 OBS-A).
+/// A media kind MC serves, and the `media_kind` metric-label VALUE of a
+/// series whose subject has one (story 3 OBS-A).
 ///
-/// ANCHOR (DRY): the `media_kind` row of `docs/observability/label-taxonomy.md`
-/// is the single source of truth for this value set; the test
-/// `media_kind_label_matches_the_taxonomy_row` reads that row, so the two cannot
-/// drift silently. The key constant is `common::observability::labels::MEDIA_KIND_LABEL`.
+/// NOT the label projection. A wire kind becomes metric labels ONLY through
+/// [`KindLabels::from_proto`], which yields this value together with its
+/// [`ContentKind`] (the two labels are co-carried, all or none); a served kind
+/// gets its pair from [`Self::labels`], which is DERIVED from that one
+/// projection. ANCHOR (DRY): the `media_kind` / `content_kind` rows and the
+/// projection table of `docs/observability/label-taxonomy.md` are the single
+/// source of truth; `media_kind_label_matches_the_taxonomy_row` reads them. The
+/// key constants are `common::observability::labels::{MEDIA_KIND_LABEL,
+/// CONTENT_KIND_LABEL}`.
 ///
 /// Distinct from the wire `proto_gen::dark_tower::signaling::v1::MediaKind`,
 /// which has four values (`UNSPECIFIED`, `AUDIO`, `VIDEO_CAMERA`,
@@ -39,14 +44,14 @@ use proto_gen::dark_tower::signaling::v1::{ClientMediaState, MediaKind};
 ///
 /// # Two wire mappings, deliberately NOT collapsed
 ///
-/// - [`Self::from_proto`] is the LABEL projection: every labellable wire kind
-///   maps to a label (screen share is `video` until session 2's
-///   `content_kind`), so a recorder is never handed an unlabelled kind.
+/// - [`KindLabels::from_proto`] is the LABEL projection: every labellable wire
+///   kind maps to a label pair (screen share is `video`/`screen`), so a
+///   recorder is never handed an unlabelled kind.
 /// - [`served_kind`] is ADMISSION: the closed set of kinds this story SERVES.
 ///   It refuses `VIDEO_SCREEN` ([`KindRefusal::Unsupported`]), so merging the
 ///   two would fail open on screen share. The
 ///   `served_kind_agrees_with_the_label_projection` test pins that wherever
-///   admission yields a kind, the label projection yields the same one.
+///   admission yields a kind, the label projection yields its pair.
 ///
 /// Since story 3 MC-A this is ALSO the slot table's kind (per-kind slot
 /// vectors, edges, egress ids), so there is no third kind enum.
@@ -58,8 +63,7 @@ pub enum MediaKindLabel {
     /// `audio` (the wire `MEDIA_KIND_AUDIO`).
     Audio,
     /// `video`. As a served kind: the camera only ([`served_kind`] refuses
-    /// screen share). As a label projection ([`Self::from_proto`]) a screen
-    /// kind also labels `video`.
+    /// screen share).
     Video,
 }
 
@@ -67,7 +71,9 @@ impl MediaKindLabel {
     /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
     pub const ALL: [Self; 2] = [Self::Audio, Self::Video];
 
-    /// Bounded metric-label form.
+    /// The `media_kind` label value. One of the two value homes of the Rust
+    /// projection (with [`ContentKind::label`]); `dt-guard metric-labels`
+    /// (`kind_label_literal`) allows these literals in this file only.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -143,24 +149,107 @@ impl MediaKindLabel {
         Self::ALL.map(&mut f)
     }
 
-    /// The label for a wire media kind, or `None` for `UNSPECIFIED`.
+    /// This served kind's label pair: [`KindLabels::from_proto`] of
+    /// [`Self::to_proto`], so there is no second served-to-label mapping.
+    #[must_use]
+    pub fn labels(self) -> KindLabels {
+        self.of(SERVED_LABELS)
+    }
+}
+
+/// The `content_kind` label value: what a media series' content is.
+///
+/// `main` is the participant's own microphone or camera; `screen` is content
+/// share. ANCHOR (DRY): the `content_kind` row of
+/// `docs/observability/label-taxonomy.md`. Never constructed outside
+/// [`KindLabels::from_proto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContentKind {
+    /// `main` (`MEDIA_KIND_AUDIO`, `MEDIA_KIND_VIDEO_CAMERA`).
+    Main,
+    /// `screen` (`MEDIA_KIND_VIDEO_SCREEN`). No series carries it until content
+    /// share ships: no served kind projects to it.
+    Screen,
+}
+
+impl ContentKind {
+    /// Every variant, for exhaustive vocabulary tests.
+    pub const ALL: [Self; 2] = [Self::Main, Self::Screen];
+
+    /// The `content_kind` label value. The other value home of the Rust
+    /// projection (with [`MediaKindLabel::label`]).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Screen => "screen",
+        }
+    }
+}
+
+/// The metric labels of a series whose subject has a media kind: `media_kind`
+/// and `content_kind`, ALWAYS together (all or none).
+///
+/// Recorders take this type, never a bare [`MediaKindLabel`], so a series
+/// cannot be stamped with one key and not the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KindLabels {
+    /// The `media_kind` value.
+    pub media_kind: MediaKindLabel,
+    /// The `content_kind` value.
+    pub content_kind: ContentKind,
+}
+
+impl KindLabels {
+    /// THE label projection: a wire media kind to its label pair, or `None` for
+    /// `UNSPECIFIED`. The Rust half of the projection table in
+    /// `docs/observability/label-taxonomy.md` (the TS half is the SDK's
+    /// `projectMediaKind`).
     ///
-    /// Exhaustive with no wildcard arm, so a new wire variant is a compile error
-    /// here rather than a silent mislabel.
+    /// Exhaustive with no wildcard arm, so a new wire variant is a compile
+    /// error here rather than a silent mislabel.
     #[must_use]
     pub const fn from_proto(kind: MediaKind) -> Option<Self> {
-        match kind {
-            MediaKind::Audio => Some(Self::Audio),
-            MediaKind::VideoCamera => Some(Self::Video),
-            // DELIBERATE: screen share is `media_kind="video"` plus
-            // `content_kind` in the taxonomy. `content_kind` is declared but not
-            // carried (session 2, `mediakind-metric-labels`), so a screen slot
-            // is labelled `video` until it is.
-            MediaKind::VideoScreen => Some(Self::Video),
+        let (media_kind, content_kind) = match kind {
+            MediaKind::Audio => (MediaKindLabel::Audio, ContentKind::Main),
+            MediaKind::VideoCamera => (MediaKindLabel::Video, ContentKind::Main),
+            MediaKind::VideoScreen => (MediaKindLabel::Video, ContentKind::Screen),
             // Rejected at every parse boundary that admits a kind; it has no
             // honest label.
-            MediaKind::Unspecified => None,
-        }
+            MediaKind::Unspecified => return None,
+        };
+        Some(Self {
+            media_kind,
+            content_kind,
+        })
+    }
+
+    /// The label pair of every SERVED kind, in [`MediaKindLabel::ALL`] order:
+    /// exactly the tuples an MC series can carry, so the zero-init set. No
+    /// `screen` tuple is here because no kind is served as screen.
+    #[must_use]
+    pub const fn served() -> [Self; 2] {
+        SERVED_LABELS
+    }
+}
+
+/// [`MediaKindLabel::labels`] laid out by [`MediaKindLabel::index`], built from
+/// the one projection at COMPILE time.
+const SERVED_LABELS: [KindLabels; 2] = [
+    project_served(MediaKindLabel::Audio),
+    project_served(MediaKindLabel::Video),
+];
+
+/// Only ever evaluated in the const initializer above, so a served kind with no
+/// projection is a compile error, never a runtime panic.
+#[expect(
+    clippy::panic,
+    reason = "const-evaluated only (SERVED_LABELS): a served kind without a label projection fails the BUILD"
+)]
+const fn project_served(kind: MediaKindLabel) -> KindLabels {
+    match KindLabels::from_proto(kind.to_proto()) {
+        Some(labels) => labels,
+        None => panic!("every served kind has a label projection"),
     }
 }
 
@@ -191,7 +280,7 @@ pub enum KindRefusal {
 ///
 /// Exhaustive with no wildcard arm over the decoded enum, so a new wire
 /// variant is a compile error here. See [`MediaKindLabel`] for why this and
-/// [`MediaKindLabel::from_proto`] are two mappings.
+/// [`KindLabels::from_proto`] are two mappings.
 ///
 /// # Errors
 ///
@@ -852,6 +941,7 @@ impl<S: Copy + PartialEq> KindDecision<S> {
 mod tests {
     use super::*;
     use proto_gen::dark_tower::signaling::v1 as wire;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const A: i32 = MediaKind::Audio as i32;
     const V: i32 = MediaKind::VideoCamera as i32;
@@ -950,7 +1040,12 @@ mod tests {
             MediaKind::VideoScreen,
         ] {
             if let Ok(served) = served_kind(kind as i32) {
-                assert_eq!(MediaKindLabel::from_proto(kind), Some(served), "{kind:?}");
+                assert_eq!(
+                    KindLabels::from_proto(kind),
+                    Some(served.labels()),
+                    "{kind:?}"
+                );
+                assert_eq!(served.labels().media_kind, served);
                 assert_eq!(served.to_proto(), kind);
             }
         }
@@ -1223,5 +1318,328 @@ mod tests {
         assert!(RequestedKinds::of(&[AU])
             .server_muted_among(camera_muted)
             .is_empty());
+    }
+
+    // -- The projection vs the taxonomy (the Rust RUNTIME leg) ---------------
+    //
+    // The taxonomy's `media_kind` / `content_kind` rows and projection table
+    // are the hub; this leg pins MC's RUNTIME projection to them. The other
+    // legs (SDK record, collector rules + keep_keys, GC EXTRA) are file-vs-file
+    // and live in `dt-guard client-metrics-export`, whose table reader anchors
+    // on the SAME markers as `TAXONOMY_TABLE_ROW_PREFIX` below (a crate
+    // boundary keeps the two readers apart).
+
+    const TAXONOMY: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/observability/label-taxonomy.md"
+    );
+    /// A projection-table row starts with a backticked wire name.
+    const TAXONOMY_TABLE_ROW_PREFIX: &str = "| `MEDIA_KIND_";
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Drift {
+        /// VACUITY: the input could not be read as a taxonomy (a construct is
+        /// missing or the parse count is wrong). Never "fixed" by loosening a
+        /// content comparison.
+        Vacuous(String),
+        /// A value the wire enum accepts has no table row (the expected row set
+        /// is DERIVED from `MediaKind::try_from`, never a hand count).
+        MissingRow { wire: String },
+        /// The table row for a wire kind disagrees with `KindLabels::from_proto`.
+        TableVsRust {
+            wire: String,
+            table: Option<(String, String)>,
+            rust: Option<(String, String)>,
+        },
+        /// A label row's value set differs from the values the code can emit.
+        RowVsCode {
+            key: &'static str,
+            row: BTreeSet<String>,
+            code: BTreeSet<String>,
+        },
+        /// A label row's value set differs from that label's projection column.
+        RowVsTable {
+            key: &'static str,
+            row: BTreeSet<String>,
+            table: BTreeSet<String>,
+        },
+    }
+
+    /// The backticked tokens of one markdown cell.
+    fn ticked(cell: &str) -> Vec<String> {
+        cell.split('`')
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, t)| t.to_string())
+            .collect()
+    }
+
+    /// The value set of the `| `key` |` label row: exactly one row, non-empty.
+    ///
+    /// SIBLING READERS (a crate boundary keeps them apart, ADR-0028; same
+    /// markers): `crates/dt-guard/src/client_metrics_export.rs`
+    /// (`kind_taxonomy`, the file-vs-file legs) and
+    /// `crates/env-tests/src/fixtures/metric_hygiene.rs` (`taxonomy_row_values`).
+    /// This crate cannot reach dt-guard, and only this one has the runtime
+    /// projection.
+    fn label_row(doc: &str, key: &'static str) -> Result<BTreeSet<String>, Drift> {
+        let marker = format!("| `{key}` |");
+        let rows: Vec<&str> = doc
+            .lines()
+            .filter(|l| l.trim_start().starts_with(&marker))
+            .collect();
+        let [row] = rows.as_slice() else {
+            return Err(Drift::Vacuous(format!(
+                "want exactly one `{key}` label row, found {}",
+                rows.len()
+            )));
+        };
+        let values: BTreeSet<String> = ticked(row.split('|').nth(2).unwrap_or_default())
+            .into_iter()
+            .collect();
+        if values.is_empty() {
+            return Err(Drift::Vacuous(format!("`{key}` row parsed no values")));
+        }
+        Ok(values)
+    }
+
+    type TableRow = Option<(String, String)>;
+
+    /// The projection table: wire name -> label pair (`—` = no labels).
+    fn projection_table(doc: &str) -> Result<BTreeMap<String, TableRow>, Drift> {
+        let mut table = BTreeMap::new();
+        for line in doc
+            .lines()
+            .filter(|l| l.trim_start().starts_with(TAXONOMY_TABLE_ROW_PREFIX))
+        {
+            let cells: Vec<&str> = line.split('|').collect();
+            let (Some(wire), Some(media), Some(content)) =
+                (cells.get(1), cells.get(2), cells.get(3))
+            else {
+                return Err(Drift::Vacuous(format!("short table row: {line:?}")));
+            };
+            let [wire] = ticked(wire).try_into().map_err(|_| {
+                Drift::Vacuous(format!("table row has no single wire name: {line:?}"))
+            })?;
+            let pair = match (ticked(media).as_slice(), ticked(content).as_slice()) {
+                ([m], [c]) => Some((m.clone(), c.clone())),
+                ([], []) if media.trim() == "—" && content.trim() == "—" => None,
+                _ => return Err(Drift::Vacuous(format!("unparseable table row: {line:?}"))),
+            };
+            if table.insert(wire.clone(), pair).is_some() {
+                return Err(Drift::Vacuous(format!("duplicate table row for {wire}")));
+            }
+        }
+        if table.is_empty() {
+            return Err(Drift::Vacuous("parsed 0 projection-table rows".to_string()));
+        }
+        Ok(table)
+    }
+
+    fn pair_of(labels: KindLabels) -> (String, String) {
+        (
+            labels.media_kind.label().to_string(),
+            labels.content_kind.label().to_string(),
+        )
+    }
+
+    /// Every drift between the taxonomy text and MC's runtime projection.
+    fn runtime_drift(doc: &str) -> Vec<Drift> {
+        let parsed = (
+            label_row(doc, "media_kind"),
+            label_row(doc, "content_kind"),
+            projection_table(doc),
+        );
+        let (media_row, content_row, table) = match parsed {
+            (Ok(m), Ok(c), Ok(t)) => (m, c, t),
+            (m, c, t) => {
+                return [m.err(), c.err(), t.err()].into_iter().flatten().collect();
+            }
+        };
+        let mut drift = Vec::new();
+
+        // Every value the open wire enum accepts (swept past the max, so a new
+        // variant without a row reds) has exactly the row Rust projects.
+        let mut accepted = BTreeSet::new();
+        for raw in 0..=8 {
+            let Ok(kind) = MediaKind::try_from(raw) else {
+                continue;
+            };
+            let wire = kind.as_str_name().to_string();
+            accepted.insert(wire.clone());
+            let rust = KindLabels::from_proto(kind).map(pair_of);
+            match table.get(&wire) {
+                None => drift.push(Drift::MissingRow { wire }),
+                Some(row) if *row != rust => drift.push(Drift::TableVsRust {
+                    wire,
+                    table: row.clone(),
+                    rust,
+                }),
+                Some(_) => {}
+            }
+        }
+        // A row naming a value the enum does not accept.
+        for wire in table.keys().filter(|w| !accepted.contains(*w)) {
+            drift.push(Drift::TableVsRust {
+                wire: wire.clone(),
+                table: table.get(wire).cloned().flatten(),
+                rust: None,
+            });
+        }
+
+        let code_media: BTreeSet<String> = MediaKindLabel::ALL
+            .iter()
+            .map(|k| k.label().to_string())
+            .collect();
+        let code_content: BTreeSet<String> = ContentKind::ALL
+            .iter()
+            .map(|k| k.label().to_string())
+            .collect();
+        let col_media: BTreeSet<String> = table.values().flatten().map(|p| p.0.clone()).collect();
+        let col_content: BTreeSet<String> = table.values().flatten().map(|p| p.1.clone()).collect();
+        for (key, row, code, col) in [
+            ("media_kind", media_row, code_media, col_media),
+            ("content_kind", content_row, code_content, col_content),
+        ] {
+            if row != code {
+                drift.push(Drift::RowVsCode {
+                    key,
+                    row: row.clone(),
+                    code,
+                });
+            }
+            if row != col {
+                drift.push(Drift::RowVsTable {
+                    key,
+                    row,
+                    table: col,
+                });
+            }
+        }
+        drift
+    }
+
+    /// THE anchor (extended 2026-10-26 to `content_kind` and the projection
+    /// table): the real taxonomy agrees with MC's runtime projection.
+    #[test]
+    fn media_kind_label_matches_the_taxonomy_row() {
+        let doc = std::fs::read_to_string(TAXONOMY).expect("label taxonomy must be readable");
+        assert_eq!(runtime_drift(&doc), Vec::new());
+    }
+
+    /// A minimal taxonomy that agrees with the projection, to mutate below.
+    const GOOD: &str = "\
+| `media_kind` | `audio`, `video` | Yes | MC |
+| `content_kind` | `main`, `screen` | Yes | MC |
+| `MEDIA_KIND_UNSPECIFIED` | — | — |
+| `MEDIA_KIND_AUDIO` | `audio` | `main` |
+| `MEDIA_KIND_VIDEO_CAMERA` | `video` | `main` |
+| `MEDIA_KIND_VIDEO_SCREEN` | `video` | `screen` |
+";
+
+    #[test]
+    fn the_good_fixture_is_clean() {
+        assert_eq!(runtime_drift(GOOD), Vec::new());
+    }
+
+    #[test]
+    fn a_table_row_disagreeing_with_rust_is_that_drift() {
+        let doc = GOOD.replace(
+            "| `MEDIA_KIND_VIDEO_CAMERA` | `video` | `main` |",
+            "| `MEDIA_KIND_VIDEO_CAMERA` | `video` | `screen` |",
+        );
+        assert!(runtime_drift(&doc).contains(&Drift::TableVsRust {
+            wire: "MEDIA_KIND_VIDEO_CAMERA".into(),
+            table: Some(("video".into(), "screen".into())),
+            rust: Some(("video".into(), "main".into())),
+        }));
+    }
+
+    #[test]
+    fn a_missing_row_is_named_and_a_duplicate_or_absent_table_is_vacuous() {
+        let missing = GOOD.replace("| `MEDIA_KIND_VIDEO_SCREEN` | `video` | `screen` |\n", "");
+        let drift = runtime_drift(&missing);
+        assert!(
+            drift.contains(&Drift::MissingRow {
+                wire: "MEDIA_KIND_VIDEO_SCREEN".into()
+            }),
+            "{drift:?}"
+        );
+        let dup = format!("{GOOD}| `MEDIA_KIND_AUDIO` | `audio` | `main` |\n");
+        assert!(
+            matches!(runtime_drift(&dup).as_slice(), [Drift::Vacuous(m)] if m.contains("duplicate"))
+        );
+        let no_table: String = GOOD
+            .lines()
+            .filter(|l| !l.starts_with(TAXONOMY_TABLE_ROW_PREFIX))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(
+            matches!(runtime_drift(&no_table).as_slice(), [Drift::Vacuous(m)] if m.contains("parsed 0"))
+        );
+    }
+
+    #[test]
+    fn a_stale_row_value_is_row_drift_not_table_drift() {
+        // The doc still says `slides`: the row disagrees with the code AND
+        // with the projection column; the projection itself is intact.
+        let doc = GOOD.replace("`main`, `screen`", "`main`, `slides`");
+        let drift = runtime_drift(&doc);
+        assert!(drift
+            .iter()
+            .all(|d| !matches!(d, Drift::TableVsRust { .. } | Drift::Vacuous(_))));
+        assert!(drift.iter().any(|d| matches!(
+            d,
+            Drift::RowVsCode {
+                key: "content_kind",
+                ..
+            }
+        )));
+        assert!(drift.iter().any(|d| matches!(
+            d,
+            Drift::RowVsTable {
+                key: "content_kind",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_row_value_no_wire_kind_projects_is_row_vs_table() {
+        let doc = GOOD.replace("`audio`, `video` | Yes", "`audio`, `video`, `data` | Yes");
+        assert!(runtime_drift(&doc)
+            .iter()
+            .any(|d| matches!(d, Drift::RowVsTable { key: "media_kind", row, .. } if row.contains("data"))));
+    }
+
+    #[test]
+    fn a_missing_label_row_is_vacuous() {
+        let doc: String = GOOD
+            .lines()
+            .filter(|l| !l.starts_with("| `content_kind`"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(
+            matches!(runtime_drift(&doc).as_slice(), [Drift::Vacuous(m)] if m.contains("content_kind"))
+        );
+    }
+
+    /// Supersedes `media_kind_label_projects_every_wire_kind_without_a_wildcard`
+    /// (`media_signaling::outcome`): the pair, for all four wire values.
+    #[test]
+    fn the_projection_maps_every_wire_kind_to_its_pair() {
+        let pair = |k| KindLabels::from_proto(k).map(pair_of);
+        let p = |m: &str, c: &str| Some((m.to_string(), c.to_string()));
+        assert_eq!(pair(MediaKind::Audio), p("audio", "main"));
+        assert_eq!(pair(MediaKind::VideoCamera), p("video", "main"));
+        assert_eq!(pair(MediaKind::VideoScreen), p("video", "screen"));
+        assert_eq!(pair(MediaKind::Unspecified), None);
+        // Served kinds never project to screen: no series pre-publishes it.
+        assert!(KindLabels::served()
+            .iter()
+            .all(|l| l.content_kind == ContentKind::Main));
+        for k in MediaKindLabel::ALL {
+            assert_eq!(k.of(KindLabels::served()), k.labels());
+        }
     }
 }

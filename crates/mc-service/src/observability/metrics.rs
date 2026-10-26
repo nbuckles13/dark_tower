@@ -15,14 +15,15 @@
 //! Maximum 1,000 unique label combinations per metric.
 
 use crate::media_admission::SenderBindingOutcome;
+use crate::media_kind::KindLabels;
 use crate::media_routing::teardown::{EndMeetingOutcome, QuiesceOutcome};
 use crate::media_routing::{
     divergence_magnitude, FloorAdoption, PolicyPushOutcome, SettleOutcome, Unapplied,
 };
 use crate::media_signaling::{
-    slot_state_label, CapabilityOutcome, ClientMuteFanoutOutcome, DirectiveOutcome, MediaKindLabel,
-    MuteOutcome, MuteRejection, MuteSurface, RefusalReplySurface, ServerMuteAction,
-    ServerMuteOutcome, SlotViewEmission, UnmuteRequestOutcome, WithdrawalReason,
+    slot_state_label, CapabilityOutcome, ClientMuteFanoutOutcome, DirectiveOutcome, MuteOutcome,
+    MuteRejection, MuteSurface, RefusalReplySurface, ServerMuteAction, ServerMuteOutcome,
+    SlotViewEmission, UnmuteRequestOutcome, WithdrawalReason,
 };
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -708,8 +709,8 @@ pub fn record_send_directive(outcome: DirectiveOutcome) {
 /// Record one slot state conveyed to a subscriber.
 ///
 /// Metric: `mc_media_slot_states_total`
-/// Labels: `slot_state`, `media_kind`, `key_custody`
-/// Cardinality: bounded by the proto `SlotState` enum x `MediaKindLabel::ALL` (2)
+/// Labels: `slot_state`, `media_kind`, `content_kind`, `key_custody`
+/// Cardinality: bounded by the proto `SlotState` enum x `KindLabels::served()` (2)
 ///
 /// `kind` is the DECLARED slot's kind (`DeclaredSlot::kind_label`, projected at
 /// parse), never a frame's: the subject of a slot state is the slot. Both kinds
@@ -734,13 +735,14 @@ pub fn record_send_directive(outcome: DirectiveOutcome) {
 /// visible rather than absent. Keeping the vocabulary identical to the wire's is
 /// also what makes this distribution comparable with the client's.
 pub fn record_slot_state(
-    kind: MediaKindLabel,
+    labels: KindLabels,
     state: proto_gen::dark_tower::signaling::v1::SlotState,
 ) {
     counter!(
         "mc_media_slot_states_total",
         "slot_state" => slot_state_label(state),
-        MEDIA_KIND_LABEL => kind.label(),
+        MEDIA_KIND_LABEL => labels.media_kind.label(),
+        CONTENT_KIND_LABEL => labels.content_kind.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(1);
@@ -855,8 +857,8 @@ pub fn record_not_yet_connected_senders(count: usize) {
 /// Record the targets on ONE stream of an emitted `SendDirective`.
 ///
 /// Metric: `mc_media_send_targets_total`
-/// Labels: `media_kind`, `key_custody`
-/// Cardinality: 2 (`MediaKindLabel::ALL`)
+/// Labels: `media_kind`, `content_kind`, `key_custody`
+/// Cardinality: 2 (`KindLabels::served()`)
 ///
 /// Counted PER STREAM, labelled with that stream's kind (story 3 OBS-A) — never
 /// summed across a directive's streams, which would put video targets on an
@@ -869,14 +871,15 @@ pub fn record_not_yet_connected_senders(count: usize) {
 /// The co-location objective (fewest send targets per sender) made
 /// observable: ~1 in an all-connected meeting, rising only with genuinely
 /// partial connectivity.
-pub fn record_send_targets(kind: MediaKindLabel, count: usize) {
+pub fn record_send_targets(labels: KindLabels, count: usize) {
     if count == 0 {
         return;
     }
     let count = u64::try_from(count).unwrap_or(u64::MAX);
     counter!(
         "mc_media_send_targets_total",
-        MEDIA_KIND_LABEL => kind.label(),
+        MEDIA_KIND_LABEL => labels.media_kind.label(),
+        CONTENT_KIND_LABEL => labels.content_kind.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(count);
@@ -1051,8 +1054,8 @@ pub fn record_policy_generation_adoption(outcome: FloorAdoption) {
 /// Publish the configured receive-slot cap for one kind.
 ///
 /// Metric: `mc_media_receive_slot_cap`
-/// Labels: `media_kind`, `key_custody`
-/// Cardinality: 2 (`MediaKindLabel::ALL`), BOTH published at boot
+/// Labels: `media_kind`, `content_kind`, `key_custody`
+/// Cardinality: 2 (`KindLabels::served()`), BOTH published at boot
 ///
 /// Story 3 MC-A: one cap per kind (`MC_MAX_AUDIO_RECEIVE_SLOTS`,
 /// `MC_MAX_VIDEO_RECEIVE_SLOTS`), each published from
@@ -1066,12 +1069,13 @@ pub fn record_policy_generation_adoption(outcome: FloorAdoption) {
 /// A CONFIG ECHO, not a utilisation gauge: set once at boot. There is no
 /// numerator to divide it by; truncation is read off
 /// `mc_media_slot_states_total{slot_state="unavailable"}`.
-pub fn set_receive_slot_cap(kind: MediaKindLabel, cap: u8) {
+pub fn set_receive_slot_cap(labels: KindLabels, cap: u8) {
     // `u8` by type, so the conversion is total and exact.
     let value = f64::from(cap);
     gauge!(
         "mc_media_receive_slot_cap",
-        MEDIA_KIND_LABEL => kind.label(),
+        MEDIA_KIND_LABEL => labels.media_kind.label(),
+        CONTENT_KIND_LABEL => labels.content_kind.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .set(value);
@@ -1081,8 +1085,8 @@ pub fn set_receive_slot_cap(kind: MediaKindLabel, cap: u8) {
 /// stream went from non-empty to EMPTY targets (story 3 R-8).
 ///
 /// Metric: `mc_media_send_directive_withdrawals_total`
-/// Labels: `media_kind`, `reason`, `key_custody`
-/// Cardinality: `MediaKindLabel::ALL` (2) x `WithdrawalReason::ALL` (2),
+/// Labels: `media_kind`, `content_kind`, `reason`, `key_custody`
+/// Cardinality: `KindLabels::served()` (2) x `WithdrawalReason::ALL` (2),
 /// zero-initialised as the full cross product
 ///
 /// Reason = the CURRENT cause at delivery: `server_muted` if that kind of the
@@ -1098,10 +1102,11 @@ pub fn set_receive_slot_cap(kind: MediaKindLabel, cap: u8) {
 /// `mc_media_send_directives_total{outcome="emitted_empty_targets"}` so a
 /// withdrawal is never read as total media failure. No meeting, participant,
 /// sender, slot or stream identity.
-pub fn record_send_directive_withdrawal(kind: MediaKindLabel, reason: WithdrawalReason) {
+pub fn record_send_directive_withdrawal(labels: KindLabels, reason: WithdrawalReason) {
     counter!(
         "mc_media_send_directive_withdrawals_total",
-        MEDIA_KIND_LABEL => kind.label(),
+        MEDIA_KIND_LABEL => labels.media_kind.label(),
+        CONTENT_KIND_LABEL => labels.content_kind.label(),
         "reason" => reason.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
@@ -1132,8 +1137,8 @@ pub fn set_video_keyframe_min_interval(min_keyframe_interval_ms: u32) {
 /// Record the disposition of one client `MuteRequest` FOR ONE NAMED KIND.
 ///
 /// Metric: `mc_media_mute_requests_total`
-/// Labels: `outcome`, `media_kind`, `key_custody`
-/// Cardinality: `MuteOutcome::ALL` x `MediaKindLabel::ALL` (2), zero-initialised
+/// Labels: `outcome`, `media_kind`, `content_kind`, `key_custody`
+/// Cardinality: `MuteOutcome::ALL` x `KindLabels::served()` (2), zero-initialised
 ///
 /// # Counting unit: one increment per (request, NAMED kind)
 ///
@@ -1191,11 +1196,12 @@ pub fn set_video_keyframe_min_interval(min_keyframe_interval_ms: u32) {
 /// `payload_kind="participant_update_muted"`, stale until the subject's next
 /// change); read that series, not this one,
 /// for "mute indicators are slow in a big meeting".
-pub fn record_mute_request(kind: MediaKindLabel, outcome: MuteOutcome) {
+pub fn record_mute_request(labels: KindLabels, outcome: MuteOutcome) {
     counter!(
         "mc_media_mute_requests_total",
         "outcome" => outcome.label(),
-        MEDIA_KIND_LABEL => kind.label(),
+        MEDIA_KIND_LABEL => labels.media_kind.label(),
+        CONTENT_KIND_LABEL => labels.content_kind.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(1);
@@ -1209,7 +1215,7 @@ pub fn record_mute_request(kind: MediaKindLabel, outcome: MuteOutcome) {
 ///
 /// Metric: `mc_media_server_mute_requests_total`
 /// Labels: `action` (`ServerMuteAction::ALL`), `outcome` (`ServerMuteOutcome::ALL`),
-/// `media_kind` (`MediaKindLabel::ALL`), `key_custody`
+/// `media_kind` + `content_kind` (`KindLabels::served()`), `key_custody`
 /// Cardinality: 24 (2 x 6 x 2), zero-initialised as the FULL cross product
 ///
 /// # Counting unit: one increment per (request, named kind)
@@ -1235,7 +1241,7 @@ pub fn record_mute_request(kind: MediaKindLabel, outcome: MuteOutcome) {
 /// are in the `mc.webtransport.connection` decision log, where identity is
 /// legitimate.
 pub fn record_server_mute_request(
-    kind: MediaKindLabel,
+    labels: KindLabels,
     action: ServerMuteAction,
     outcome: ServerMuteOutcome,
 ) {
@@ -1243,7 +1249,8 @@ pub fn record_server_mute_request(
         "mc_media_server_mute_requests_total",
         "action" => action.label(),
         "outcome" => outcome.label(),
-        MEDIA_KIND_LABEL => kind.label(),
+        MEDIA_KIND_LABEL => labels.media_kind.label(),
+        CONTENT_KIND_LABEL => labels.content_kind.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(1);
@@ -1334,8 +1341,8 @@ pub fn record_refusal_reply_suppressed(surface: RefusalReplySurface) {
 /// right now for ONE kind, summed across this pod's meetings.
 ///
 /// Metric: `mc_media_server_muted_sources`
-/// Labels: `media_kind`, `key_custody`
-/// Cardinality: 2 (`MediaKindLabel::ALL`), both present at zero from start
+/// Labels: `media_kind`, `content_kind`, `key_custody`
+/// Cardinality: 2 (`KindLabels::served()`), both present at zero from start
 ///
 /// A participant server-muted on both kinds is one source per kind, so it reads
 /// `1` on each series. `sum(mc_media_server_muted_sources)` across kinds is
@@ -1353,7 +1360,7 @@ pub fn record_refusal_reply_suppressed(surface: RefusalReplySurface) {
 /// exit path. Present at zero from process start. Pod-level and identity-free
 /// by design (ADR-0036 §11): it answers "is any mute in force on this MC pod",
 /// NOT "in this meeting".
-pub fn set_server_muted_sources(kind: MediaKindLabel, total: u64) {
+pub fn set_server_muted_sources(labels: KindLabels, total: u64) {
     #[expect(
         clippy::cast_precision_loss,
         reason = "a participant count; exact in f64 far beyond any roster cap"
@@ -1361,7 +1368,8 @@ pub fn set_server_muted_sources(kind: MediaKindLabel, total: u64) {
     let value = total as f64;
     gauge!(
         "mc_media_server_muted_sources",
-        MEDIA_KIND_LABEL => kind.label(),
+        MEDIA_KIND_LABEL => labels.media_kind.label(),
+        CONTENT_KIND_LABEL => labels.content_kind.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .set(value);
@@ -1673,7 +1681,7 @@ pub fn record_display_name_resolution(outcome: &str) {
 // call sites — qualified (`actors/meeting.rs`) and unqualified (below) — keep
 // resolving through this module unchanged.
 pub use common::observability::labels::{
-    KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR, MEDIA_KIND_LABEL,
+    CONTENT_KIND_LABEL, KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR, MEDIA_KIND_LABEL,
 };
 
 /// Record that a meeting KEK was generated.
@@ -2256,23 +2264,23 @@ pub fn zero_initialize_counters() {
     }
     // The FULL kind x reason cross product, so `server_muted` reads "present and
     // flat" when no mute withdrew a directive (runbook Scenario 21).
-    for k in MediaKindLabel::ALL {
+    for l in KindLabels::served() {
         for r in WithdrawalReason::ALL {
-            counter!("mc_media_send_directive_withdrawals_total", MEDIA_KIND_LABEL => k.label(), "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+            counter!("mc_media_send_directive_withdrawals_total", MEDIA_KIND_LABEL => l.media_kind.label(), CONTENT_KIND_LABEL => l.content_kind.label(), "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
         }
     }
-    for k in MediaKindLabel::ALL {
+    for l in KindLabels::served() {
         for o in MuteOutcome::ALL {
-            counter!("mc_media_mute_requests_total", "outcome" => o.label(), MEDIA_KIND_LABEL => k.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+            counter!("mc_media_mute_requests_total", "outcome" => o.label(), MEDIA_KIND_LABEL => l.media_kind.label(), CONTENT_KIND_LABEL => l.content_kind.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
         }
     }
     // The FULL kind x action x outcome cross product, unreachable cells included (a
     // non-host never reaches `unknown_target`, and that cell staying at zero is
     // what the R-8 ordering test reads — absent would prove nothing).
-    for k in MediaKindLabel::ALL {
+    for l in KindLabels::served() {
         for a in ServerMuteAction::ALL {
             for o in ServerMuteOutcome::ALL {
-                counter!("mc_media_server_mute_requests_total", "action" => a.label(), "outcome" => o.label(), MEDIA_KIND_LABEL => k.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+                counter!("mc_media_server_mute_requests_total", "action" => a.label(), "outcome" => o.label(), MEDIA_KIND_LABEL => l.media_kind.label(), CONTENT_KIND_LABEL => l.content_kind.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
             }
         }
     }
@@ -2309,11 +2317,11 @@ pub fn zero_initialize_counters() {
     for o in ClientMuteFanoutOutcome::ALL {
         counter!("mc_media_client_mute_fanouts_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
-    for k in MediaKindLabel::ALL {
+    for l in KindLabels::served() {
         for s in SLOT_STATES {
-            counter!("mc_media_slot_states_total", "slot_state" => slot_state_label(*s), MEDIA_KIND_LABEL => k.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+            counter!("mc_media_slot_states_total", "slot_state" => slot_state_label(*s), MEDIA_KIND_LABEL => l.media_kind.label(), CONTENT_KIND_LABEL => l.content_kind.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
         }
-        counter!("mc_media_send_targets_total", MEDIA_KIND_LABEL => k.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+        counter!("mc_media_send_targets_total", MEDIA_KIND_LABEL => l.media_kind.label(), CONTENT_KIND_LABEL => l.content_kind.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
     // key_custody-only media counters (cardinality 1)
     counter!("mc_media_unreachable_senders_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
@@ -2422,6 +2430,7 @@ pub fn zero_initialize_counters() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media_kind::MediaKindLabel;
     use common::observability::testing::MetricAssertion;
     use common::token_manager::TokenRefreshEvent;
 
@@ -2493,20 +2502,20 @@ mod tests {
         for kind in MediaKindLabel::ALL {
             let k = kind.label();
             present_at_zero(&format!(
-                r#"mc_media_send_targets_total{{media_kind="{k}",key_custody="operator"}}"#
+                r#"mc_media_send_targets_total{{media_kind="{k}",content_kind="main",key_custody="operator"}}"#
             ));
             present_at_zero(&format!(
-                r#"mc_media_slot_states_total{{slot_state="active",media_kind="{k}",key_custody="operator"}}"#
+                r#"mc_media_slot_states_total{{slot_state="active",media_kind="{k}",content_kind="main",key_custody="operator"}}"#
             ));
             present_at_zero(&format!(
-                r#"mc_media_mute_requests_total{{outcome="applied",media_kind="{k}",key_custody="operator"}}"#
+                r#"mc_media_mute_requests_total{{outcome="applied",media_kind="{k}",content_kind="main",key_custody="operator"}}"#
             ));
             present_at_zero(&format!(
-                r#"mc_media_server_mute_requests_total{{action="mute",outcome="unknown_target",media_kind="{k}",key_custody="operator"}}"#
+                r#"mc_media_server_mute_requests_total{{action="mute",outcome="unknown_target",media_kind="{k}",content_kind="main",key_custody="operator"}}"#
             ));
             for r in WithdrawalReason::ALL {
                 present_at_zero(&format!(
-                    r#"mc_media_send_directive_withdrawals_total{{media_kind="{k}",reason="{}",key_custody="operator"}}"#,
+                    r#"mc_media_send_directive_withdrawals_total{{media_kind="{k}",content_kind="main",reason="{}",key_custody="operator"}}"#,
                     r.label()
                 ));
             }
@@ -3132,12 +3141,13 @@ mod tests {
             for action in ServerMuteAction::ALL {
                 for outcome in ServerMuteOutcome::ALL {
                     let snap = MetricAssertion::snapshot();
-                    record_server_mute_request(kind, action, outcome);
+                    record_server_mute_request(kind.labels(), action, outcome);
                     snap.counter("mc_media_server_mute_requests_total")
                         .with_labels(&[
                             ("action", action.label()),
                             ("outcome", outcome.label()),
                             (MEDIA_KIND_LABEL, kind.label()),
+                            (CONTENT_KIND_LABEL, "main"),
                             (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
                         ])
                         .assert_delta(1);
@@ -3159,11 +3169,12 @@ mod tests {
         for kind in MediaKindLabel::ALL {
             for outcome in MuteOutcome::ALL {
                 let snap = MetricAssertion::snapshot();
-                record_mute_request(kind, outcome);
+                record_mute_request(kind.labels(), outcome);
                 snap.counter("mc_media_mute_requests_total")
                     .with_labels(&[
                         ("outcome", outcome.label()),
                         (MEDIA_KIND_LABEL, kind.label()),
+                        (CONTENT_KIND_LABEL, "main"),
                         (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
                     ])
                     .assert_delta(1);
@@ -3177,11 +3188,12 @@ mod tests {
         use proto_gen::dark_tower::signaling::v1::SlotState;
         for kind in MediaKindLabel::ALL {
             let snap = MetricAssertion::snapshot();
-            record_slot_state(kind, SlotState::Active);
+            record_slot_state(kind.labels(), SlotState::Active);
             snap.counter("mc_media_slot_states_total")
                 .with_labels(&[
                     ("slot_state", "active"),
                     (MEDIA_KIND_LABEL, kind.label()),
+                    (CONTENT_KIND_LABEL, "main"),
                     (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
                 ])
                 .assert_delta(1);
@@ -3192,8 +3204,8 @@ mod tests {
     #[test]
     fn record_send_targets_is_per_kind() {
         let snap = MetricAssertion::snapshot();
-        record_send_targets(MediaKindLabel::Audio, 2);
-        record_send_targets(MediaKindLabel::Video, 0);
+        record_send_targets(MediaKindLabel::Audio.labels(), 2);
+        record_send_targets(MediaKindLabel::Video.labels(), 0);
         snap.counter("mc_media_send_targets_total")
             .with_labels(&[(MEDIA_KIND_LABEL, "audio")])
             .assert_delta(2);
@@ -3206,10 +3218,11 @@ mod tests {
     #[test]
     fn set_receive_slot_cap_publishes_the_kind() {
         let snap = MetricAssertion::snapshot();
-        set_receive_slot_cap(MediaKindLabel::Audio, 4);
+        set_receive_slot_cap(MediaKindLabel::Audio.labels(), 4);
         snap.gauge("mc_media_receive_slot_cap")
             .with_labels(&[
                 (MEDIA_KIND_LABEL, "audio"),
+                (CONTENT_KIND_LABEL, "main"),
                 (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
             ])
             .assert_value(4.0);
@@ -3268,11 +3281,12 @@ mod tests {
     #[test]
     fn set_server_muted_sources_publishes_the_level() {
         let snap = MetricAssertion::snapshot();
-        set_server_muted_sources(MediaKindLabel::Audio, 3);
-        set_server_muted_sources(MediaKindLabel::Video, 1);
+        set_server_muted_sources(MediaKindLabel::Audio.labels(), 3);
+        set_server_muted_sources(MediaKindLabel::Video.labels(), 1);
         snap.gauge("mc_media_server_muted_sources")
             .with_labels(&[
                 (MEDIA_KIND_LABEL, "audio"),
+                (CONTENT_KIND_LABEL, "main"),
                 (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
             ])
             .assert_value(3.0);

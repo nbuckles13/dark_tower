@@ -110,46 +110,86 @@ close.
 
 **`ac_rate_limit_decisions_total{action}` does not satisfy this definition and is not blessed by it.** Its values are `{allowed, rejected}` — a decision reached, which is `outcome`'s meaning — and its own catalog row calls them "Rate limit decision". It predates this row, and after MC lands it is **one non-conforming instance against two conforming ones**. It is recorded under §Non-canonical aliases and migrates under that section's coordinated-migration process; it is **not** evidence that `action` may carry result values, and a new metric must not cite it as precedent. Widening this row to accommodate it was considered and rejected: a definition covering both "what was asked" and "what happened" excludes nothing, which would make `action` the bucket a new metric reaches for instead of choosing between `operation` and `outcome`.
 
-### Carried: `media_kind`, by MC and the client SDK only; declared, not yet carried: `content_kind` `[reviewer-only]`
+### Carried: `media_kind` and `content_kind`, together, by MC and the client SDK only `[reviewer-only]`
 
 Registered here at declaration (story 2) because §Adding a new shared label fires on
-intent. Story 3 (task 2, R-29) made `media_kind` CARRIED; `content_kind` is still only
-declared.
+intent. Story 3 (task 2, R-29) made `media_kind` CARRIED; `content_kind` is carried since
+2026-10-26 (`docs/devloop-outputs/2026-10-26-mediakind-metric-labels/`), on exactly the
+series that carry `media_kind`: **all or none**, never one without the other.
 
 | Label | Bounded values | Emitted today? | Carried by |
 |---|---|---|---|
 | `media_kind` | `audio`, `video` | **Yes** (story 3) | MC (`mc_media_*` series whose subject has a kind) and the client SDK (per-kind `dt_client_media_*` series) — **never MH** |
-| `content_kind` | `main`, `slides` | **No** | Not yet (content share is out of story 3's scope) |
+| `content_kind` | `main`, `screen` | **Yes** (2026-10-26) | Every series that carries `media_kind`, and no other — **never MH** |
 
-**This row is the single source of truth for the `media_kind` value set.** Its code
-homes are the SDK's `MediaKindLabel` union (`packages/sdk-core/src/media/setup/mediaMetrics.ts`)
-and MC's `MediaKindLabel` enum (`crates/mc-service/src/media_kind.rs`, `ALL` +
-`label()`), whose unit tests each parse the row above; the key spelling lives in
-`crates/common/src/observability/labels.rs::MEDIA_KIND_LABEL`. On the client pipeline
-GC admits the KEY only (`MEDIA_DATAPOINT_EXTRA`), and the collector's EXACT
-`^(audio|video)$` rule rewrites anything else to `invalid` — so a stored client series
-carries at most `audio`, `video` or `invalid` (`invalid` = a patched client).
+**Projection from the wire `MediaKind`.** Every label pair is a projection of the proto
+`MediaKind` (`proto/dark_tower/signaling/v1/signaling.proto`), never a call-site choice:
+
+| Wire `MediaKind` | `media_kind` | `content_kind` |
+|---|---|---|
+| `MEDIA_KIND_UNSPECIFIED` | — | — |
+| `MEDIA_KIND_AUDIO` | `audio` | `main` |
+| `MEDIA_KIND_VIDEO_CAMERA` | `video` | `main` |
+| `MEDIA_KIND_VIDEO_SCREEN` | `video` | `screen` |
+
+`—` = no labels: `UNSPECIFIED` is refused at every boundary that admits a kind, and no
+series is ever labelled with it.
+
+**The two rows and this table are the single source of truth for both value sets and the
+projection.** There is ONE projection per language: MC's `KindLabels::from_proto`
+(`crates/mc-service/src/media_kind.rs`; value literals in `MediaKindLabel::label` and
+`ContentKind::label`) and the SDK's `projectMediaKind`
+(`packages/sdk-core/src/media/setup/mediaMetrics.ts`, `MEDIA_KIND_LABEL_PROJECTION`). The
+key spellings live in `crates/common/src/observability/labels.rs` (`MEDIA_KIND_LABEL`,
+`CONTENT_KIND_LABEL`). Drift is mechanical, with the table as the hub:
+
+- Rust runtime == table: `media_kind_label_matches_the_taxonomy_row` (mc-service).
+- SDK record, collector exact-value rules, collector `keep_keys`, GC `MEDIA_DATAPOINT_EXTRA`
+  and the `pass =` list below == table / rows: `dt-guard client-metrics-export`
+  (`kind_projection_*`, `kind_key_not_kept`).
+- Value literals outside the two projection homes: `dt-guard metric-labels` and
+  `dt-guard ts-name-guard-dt-client` (`kind_label_literal`).
+- Every `{…}` selector and every `by|without|on|ignoring|group_left|group_right (…)` clause
+  that names one key names both — in alert rules, dashboards, and the copy-paste PromQL of
+  `docs/observability/**` and `docs/runbooks/**` (fences of any language and inline spans):
+  `dt-guard alert-rules-policy` / `dashboard-panels` (`kind_label_co_occurrence`).
+
+On the client pipeline GC admits the KEYS only (`MEDIA_DATAPOINT_EXTRA`), and the
+collector's EXACT `^(audio|video)$` and `^(main|screen)$` rules rewrite anything else to
+`invalid`, and a datapoint with one kind key but not the other becomes `invalid` on both — so a
+stored client series carries at most those values or `invalid` (`invalid` = a patched client,
+or, at the 2026-10-26 rollout only, a tab still running the previous SDK until it reloads).
 
 Both value sets are **closed and enumerable**, which is the property that makes them
-admissible: each is a small fixed set fixed by the media pipeline's own type system, not
-a free-form string, so neither can grow unboundedly at runtime. Adding a value is a
-protocol change, not a call-site decision. Screen share is `media_kind="video"` with
-`content_kind="slides"` once content share lands; MC maps the wire's `VIDEO_SCREEN` to
-`video` today.
+admissible: each is fixed by the wire enum, not a free-form string, so neither can grow at
+runtime. Adding a value is a protocol change, not a call-site decision.
 
-**MH is type-blind and NEVER carries `media_kind`** (ADR-0036 §7: "Any proposal that
+**No series carries `content_kind="screen"` until content share ships**: no served kind
+projects to it (MC's `served_kind` refuses `VIDEO_SCREEN`, and the SDK publishes no screen
+kind). So `screen` is pinned at the projection, never by a series assertion — an absent
+series reads 0.
+
+**Query rule (2026-10-26): every PromQL expression that names `media_kind` also names
+`content_kind`**, in grouping (`by (media_kind, content_kind)`, `ignoring(media_kind,
+content_kind)`) and in selectors. The camera-tuned video alerts and panels select
+`media_kind="video", content_kind="main"`; screen share gets its own reviewed thresholds
+when it ships. Without this, screen traffic would fold silently into camera-tuned
+expressions the day it ships.
+
+**MH is type-blind and NEVER carries `media_kind` or `content_kind`** (ADR-0036 §7: "Any proposal that
 switches on media type inside MH is a design error to be rewritten as a behaviour").
 MH labels by behaviour only — a drop or outcome `reason`, a pipeline `direction` —
 never by kind. No `mh_*` series carries the stream's transport or disposition as a label
 either: MH's attribution outcomes are reasons (`unmatched_stream`, `transport_mismatch`,
 `server_muted`), paused-source arrivals are their own series carrying only `key_custody`
 (`mh_media_paused_source_frames_total`), and MH never learns which kind a declared stream
-is — only how it is transported and what to do with it (story 3 R-20, R-29). The live hygiene kernel enforces it on the stored series
-(`crates/env-tests/src/fixtures/metric_hygiene.rs`, `Rule::MediaKindOnMh`, applied by
-`32_media_metric_hygiene.rs`); there is no source-level check yet (`docs/TODO.md`
-§Guard Coverage Gaps).
+is — only how it is transported and what to do with it (story 3 R-20, R-29). It is enforced at source by `dt-guard metric-labels` (`kind_label_on_mh`: either key in a
+metric macro under `crates/mh-service/`; the remaining bound is in `docs/TODO.md` §Guard
+Coverage Gaps) and on the stored series by the live hygiene kernel
+(`crates/env-tests/src/fixtures/metric_hygiene.rs`, `Rule::KindLabelOnMh`, applied by
+`32_media_metric_hygiene.rs`).
 
-**Kind-free on purpose.** A series whose subject has no kind does not carry the label,
+**Kind-free on purpose.** A series whose subject has no kind carries NEITHER label,
 because a per-kind split would double-count one event or invent a value: the client's
 session-level KEK, roster and capture-source series; MC's `mc_media_send_directives_total`
 (composed per participant before any stream exists), `mc_media_unreachable_senders_total`
@@ -159,12 +199,9 @@ names), and `mc_media_mute_requests_rejected_total` (a request refused WHOLE for
 applied no kind). The
 per-series lists and reasons are in the catalogs.
 
-**`content_kind` is declared, not carried.** No metric emits it. Do not write a dashboard
-query or an alert selecting on it — an unmatched selector yields an empty series rather
-than an error, so it fails silently. Which metrics carry a label is recorded in the
-per-service catalogs (`docs/observability/metrics/*.md`), which is the home for *which
-labels a metric carries*; this section is the home for *what the label is and what values
-it may take*.
+Which metrics carry the labels is recorded in the per-service catalogs
+(`docs/observability/metrics/*.md`), which is the home for *which labels a metric
+carries*; this section is the home for *what the labels are and what values they may take*.
 
 ### Non-canonical aliases (flagged by reviewers, not the guard) `[reviewer-only]`
 
@@ -665,7 +702,7 @@ matcher that drifts goes red in whichever crate drifted. Add a row here, never t
 
 ```identity-label-cases
 fire = participant_id, meeting_id_hash, stream_id, key_id, kek_id, meetingId, session.id, slot_index, slot_id, x_sender_idx, user, frame_hash, user-id, key-id, sender-id, frame-hash
-pass = key_custody, org_id, slot_state, media_kind, client_version, reason, outcome, action, source, mode, trigger, payload_kind, instance, job, le, otel_scope_name, otel_scope_version, valid, monkey_business, direction, status
+pass = key_custody, org_id, slot_state, media_kind, content_kind, client_version, reason, outcome, action, source, mode, trigger, payload_kind, instance, job, le, otel_scope_name, otel_scope_version, valid, monkey_business, direction, status
 ```
 
 **Matcher semantics.**
