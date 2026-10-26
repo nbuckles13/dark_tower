@@ -89,10 +89,23 @@ RUN for p in ac-service gc-service mc-service mh-service; do \
 # Copy actual source code
 COPY . .
 
-# Build the application (dependencies are already cached)
-RUN for p in ac-service gc-service mc-service mh-service; do \
-        cargo build --release --package "$p" || exit 1; \
-    done
+# Build the services in parallel, each in its own copy of the cooked target dir
+# (cargo serialises builds that share one). Each build stays a separate
+# `cargo build -p <svc>`, so every binary is exactly what that command produces;
+# the gain is the four fat-LTO links (single-threaded) overlapping. Only the
+# binaries leave this step; the copies are removed in the same layer.
+RUN set -u; pids=""; \
+    for p in ac-service gc-service mc-service mh-service; do \
+        cp -a target "target-$p"; \
+        CARGO_TARGET_DIR="target-$p" cargo build --release --package "$p" > "build-$p.log" 2>&1 & \
+        pids="$pids $!"; \
+    done; \
+    rc=0; for pid in $pids; do wait "$pid" || rc=1; done; \
+    for p in ac-service gc-service mc-service mh-service; do echo "=== $p"; cat "build-$p.log"; done; \
+    [ "$rc" -eq 0 ] || { echo "a service build failed (logs above)" >&2; exit 1; }; \
+    cp target-ac-service/release/auth-controller target-gc-service/release/gc-service \
+        target-mc-service/release/mc-service target-mh-service/release/mh-service target/release/ && \
+    rm -rf target-*-service build-*.log
 
 # Strip debug symbols to reduce binary size
 RUN strip target/release/auth-controller target/release/gc-service \

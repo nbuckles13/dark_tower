@@ -42,8 +42,6 @@ jobs:
     permissions:
       contents: read
       packages: write   # push CI images; this job runs no test code
-    outputs:
-      image_refs: ${{ steps.push.outputs.image_refs }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -90,21 +88,30 @@ jobs:
           infra/ci/build-push-images.sh /tmp/image-refs.txt
           echo "image builds: $(( $(date +%s) - start ))s"
           cat /tmp/image-refs.txt
-          { echo "image_refs<<EOF_REFS"; cat /tmp/image-refs.txt; echo "EOF_REFS"; } >> "$GITHUB_OUTPUT"
+
+      - name: Publish the digest list to this run
+        # An artifact, not a job output: layer7 starts without `needs: build` so its
+        # setup overlaps the image builds, and collects the list when build finishes.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-refs
+          path: /tmp/image-refs.txt
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Log out of GHCR
         if: always()
         run: docker logout ghcr.io
 
   layer7:
-    needs: build
-    # Runs after a successful build (main tier) or with build skipped (pr tier).
-    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    # No `needs: build`: setup runs while the main-tier build job builds images,
+    # and the "wait for the build job" step joins the two before deploy.
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
       contents: read
       packages: read    # pull the CI images; no write
+      actions: read     # read this run's job status (wait for build)
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -188,19 +195,6 @@ jobs:
           sudo systemctl restart docker
           docker info --format 'driver={{.Driver}}'
 
-      - name: (main tier) Use the build job's images, pinned by digest
-        if: env.TIER == 'main'
-        env:
-          IMAGE_REFS: ${{ needs.build.outputs.image_refs }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_ACTOR: ${{ github.actor }}
-        run: |
-          printf '%s\n' "${IMAGE_REFS}" > /tmp/prebuilt-images.txt
-          cat /tmp/prebuilt-images.txt
-          [ "$(grep -c '@sha256:' /tmp/prebuilt-images.txt)" -ge 5 ] || { echo "::error::expected 5 digest-pinned refs"; exit 1; }
-          echo "DT_PREBUILT_IMAGES=/tmp/prebuilt-images.txt" >> "$GITHUB_ENV"
-          echo "${GH_TOKEN}" | docker login ghcr.io -u "${GH_ACTOR}" --password-stdin
-
       - name: (pr tier) Actions cache credentials for BuildKit
         # Self-scoped: a PR run's cache writes are readable only by that PR.
         if: env.TIER == 'pr'
@@ -237,6 +231,44 @@ jobs:
         run: |
           echo "build-helper,$(date -u +%s)" >> /tmp/spike/phases.csv
           cargo build --release -p devloop-helper
+
+      - name: (main tier) Wait for the build job
+        # Fails loudly if build fails, is cancelled, or does not finish in time.
+        # Runs before any test code: nothing in this job can have written the
+        # artifact the next step downloads.
+        if: env.TIER == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jobs="repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs"
+          for _ in $(seq 1 240); do
+            state="$(gh api "${jobs}" --jq '[.jobs[] | select(.name == "build")] | if length == 1 then .[0] | "\(.status) \(.conclusion)" else "ambiguous \(length)" end')"
+            case "${state}" in
+              "completed success") echo "build job succeeded"; exit 0 ;;
+              completed*|ambiguous*) echo "::error::build job: ${state}"; exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo "::error::build job still running after 60 min (${state})"; exit 1
+
+      - name: (main tier) Download the digest list
+        if: env.TIER == 'main'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-refs
+          path: /tmp/image-refs
+
+      - name: (main tier) Use the build job's images, pinned by digest
+        if: env.TIER == 'main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+        run: |
+          cp /tmp/image-refs/image-refs.txt /tmp/prebuilt-images.txt
+          cat /tmp/prebuilt-images.txt
+          [ "$(grep -c '@sha256:' /tmp/prebuilt-images.txt)" -ge 5 ] || { echo "::error::expected 5 digest-pinned refs"; exit 1; }
+          echo "DT_PREBUILT_IMAGES=/tmp/prebuilt-images.txt" >> "$GITHUB_ENV"
+          echo "${GH_TOKEN}" | docker login ghcr.io -u "${GH_ACTOR}" --password-stdin
 
       - name: Run Layer 7
         env:
