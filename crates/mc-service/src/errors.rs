@@ -124,7 +124,7 @@ pub enum McError {
     #[error("Header version unsupported")]
     HeaderVersionUnsupported,
 
-    /// `JoinRequest.publish_kinds` named an unserved kind (`UNSPECIFIED`,
+    /// `JoinRequest.published_kinds` named an unserved kind (`UNSPECIFIED`,
     /// `VIDEO_SCREEN`, an unknown value) or a duplicate (story 3 R-2).
     /// Rejected, never ignored.
     #[error("Publish kinds rejected")]

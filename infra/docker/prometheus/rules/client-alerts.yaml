@@ -21,7 +21,7 @@
 # marks a client-origin series with a client remedy
 # (docs/observability/alert-conventions.md §Alert naming).
 #
-# LOADING: this file is in the `prometheus-rules` configMapGenerator
+# LOADING: this file is in the `prometheus-rules-client` configMapGenerator
 # (infra/docker/prometheus/kustomization.yaml) and matches both `rule_files`
 # globs. `dt-guard alert-rules-policy` fails if those sets diverge, and
 # crates/env-tests/tests/33_alert_rules_loaded.rs fails if Prometheus did not

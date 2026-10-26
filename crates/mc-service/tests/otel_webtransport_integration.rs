@@ -114,7 +114,10 @@ async fn join_with_trace(
             // no attestation check this story.
             identity_public_key: sample_identity_public_key(),
             // Story 3 R-2: the suite publishes audio (story-2 shape).
-            publish_kinds: vec![proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32],
+            published_kinds: vec![proto_gen::dark_tower::signaling::v1::PublishedKind {
+                media_kind: proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32,
+                client_muted: false,
+            }],
             receive_capability: None,
         })),
     };

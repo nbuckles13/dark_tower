@@ -123,7 +123,7 @@ declared.
 
 **This row is the single source of truth for the `media_kind` value set.** Its code
 homes are the SDK's `MediaKindLabel` union (`packages/sdk-core/src/media/setup/mediaMetrics.ts`)
-and MC's `MediaKindLabel` enum (`crates/mc-service/src/media_signaling/outcome.rs`, `ALL` +
+and MC's `MediaKindLabel` enum (`crates/mc-service/src/media_kind.rs`, `ALL` +
 `label()`), whose unit tests each parse the row above; the key spelling lives in
 `crates/common/src/observability/labels.rs::MEDIA_KIND_LABEL`. On the client pipeline
 GC admits the KEY only (`MEDIA_DATAPOINT_EXTRA`), and the collector's EXACT
@@ -154,8 +154,9 @@ because a per-kind split would double-count one event or invent a value: the cli
 session-level KEK, roster and capture-source series; MC's `mc_media_send_directives_total`
 (composed per participant before any stream exists), `mc_media_unreachable_senders_total`
 and `mc_media_not_yet_connected_senders_total` (properties of a sender relative to a
-subscriber), `mc_media_unmute_requests_total` (no per-kind presence on the wire), and
-`mc_media_mute_requests_rejected_total` (the rejected request names no kind). The
+subscriber), `mc_media_unmute_requests_total` (one outcome per request across the kinds it
+names), and `mc_media_mute_requests_rejected_total` (a request refused WHOLE for its kind list
+applied no kind). The
 per-series lists and reasons are in the catalogs.
 
 **`content_kind` is declared, not carried.** No metric emits it. Do not write a dashboard

@@ -15,12 +15,15 @@ use crate::actors::{JoinMedia, MediaRoutingDeps};
 use crate::auth::McJwtValidator;
 use crate::client_work_limiter::ClientWorkLimiter;
 use crate::errors::McError;
-use crate::media_kind::{ClientMuteFacts, MuteChange, NoKindNamed};
+use crate::media_kind::{
+    ClientKindState, ClientMediaStates, MuteChange, NotPublished, RequestListRefusal,
+    RequestedKinds,
+};
 use crate::media_routing::{HandlerEndpoint, HandlerId, MeetingHandlers};
 use crate::media_signaling::{
-    CapabilityOutcome, ClientMediaConfig, DirectiveOutcome, MediaKindLabel, MuteOutcome,
-    MuteRejection, MuteSurface, PublishSet, ReceiveCapabilityDeclaration, RefusalReplySurface,
-    ServerMuteAction, ServerMuteOutcome, SlotDemand, UnmuteRequestOutcome,
+    CapabilityOutcome, ClientMediaConfig, DirectiveOutcome, MuteOutcome, MuteRejection,
+    MuteSurface, PublishSet, ReceiveCapabilityDeclaration, RefusalReplySurface, ServerMuteAction,
+    ServerMuteOutcome, SlotDemand, UnmuteRequestOutcome,
 };
 use crate::observability::metrics;
 use crate::redis::{MhAssignmentData, MhAssignmentStore};
@@ -588,7 +591,7 @@ pub async fn handle_connection(
             JoinMedia {
                 deps: Arc::clone(&media_deps),
                 handlers,
-                publishes: join_media.publishes,
+                declared: join_media.declared,
                 demand: join_media.demand,
             },
         )
@@ -699,26 +702,9 @@ pub async fn handle_connection(
         "JoinResponse sent"
     );
 
-    // Step 8b (story 2 R-11): replay who is SERVER-muted RIGHT NOW (client mute
-    // already rode the JoinResponse roster -- one carrier per fact), written
-    // directly after the JoinResponse and before the bridge loop starts
-    // forwarding queued updates — the snapshot was taken in the join's own actor
-    // turn, and every later change is queued behind it, so the joiner sees
-    // snapshot-then-deltas. Through the SAME encoder as a live broadcast.
-    for update in &join_result.server_mute_replay {
-        let Some(encoded) = crate::webtransport::handler::encode_participant_update(update) else {
-            continue;
-        };
-        if let Err(e) = write_framed_message(&mut send_stream, &encoded.server_message).await {
-            warn!(
-                target: "mc.webtransport.connection",
-                connection_id = %connection_id,
-                error = %e,
-                "Failed to replay server-mute state to the joiner"
-            );
-            return Err(e);
-        }
-    }
+    // There is no Step 8b server-mute replay (retired 2026-10-25): every
+    // roster entry on the JoinResponse already carries each kind's server mute
+    // and its imposer (`Participant.media_states`), one carrier per fact.
 
     // Step 9: The per-connection media-signalling context (ADR-0036 §5, §6):
     // the live meeting handle plus the per-connection bounds. The MH push and
@@ -731,7 +717,7 @@ pub async fn handle_connection(
         &join_result,
         client_media_config,
         is_host,
-        join_media.publishes,
+        join_media.declared,
         join_media.declaration,
     );
 
@@ -912,9 +898,9 @@ async fn run_bridge_loop(
 ///   mute — see [`handle_server_mute_request`] for the order of checks.
 /// - `UnmuteRequest` (R-10): a server-muted participant asks the host(s);
 ///   NOTIFIES, never clears — see [`handle_unmute_request`].
-/// - All other messages, INCLUDING `UnmuteResponse` (the host lifts a mute
-///   with a `ServerMuteRequest`, so there is one lift path under one authority):
-///   ignored, logged at debug.
+/// - All other messages: ignored, logged at debug. (The host lifts a mute
+///   only with a `ServerMuteRequest`, one lift path under one authority; the
+///   never-used `UnmuteResponse` was deleted 2026-10-25.)
 ///
 /// # A client that never declares is never told to send
 ///
@@ -970,7 +956,7 @@ async fn handle_client_message(
             handle_server_mute_request(&request, connection_id, participant_handle, media).await;
         }
         Some(client_message::Message::UnmuteRequest(request)) => {
-            handle_unmute_request(&request, connection_id, media).await;
+            handle_unmute_request(&request, connection_id, participant_handle, media).await;
         }
         Some(_) => {
             debug!(
@@ -1190,23 +1176,23 @@ struct MediaSignalingContext {
     /// Doubles as the identical-redeclaration short-circuit: an unchanged
     /// declaration is answered without an actor hop.
     declaration: Option<ReceiveCapabilityDeclaration>,
-    /// This participant's client-mute state PER KIND as the meeting actor
-    /// last CONFIRMED it to this connection (laid out by
-    /// [`MediaKindLabel::index`]); `None` = unknown.
+    /// This participant's client state PER KIND as the meeting actor last
+    /// CONFIRMED it to this connection, seeded at join from the same
+    /// declaration the actor admitted.
     ///
     /// The mute-path counterpart of the identical-redeclaration short-circuit:
     /// `MuteRequest` is otherwise the cheapest way to drive an actor hop from a
     /// ~4-byte message. A request short-circuits only when EVERY kind it names
-    /// equals a KNOWN value here; the actor, not this cache, merges the
-    /// request (story 3 MC-B), so an unknown kind can never be coerced.
+    /// already equals the state here; the actor, not this cache, merges the
+    /// request (story 3 MC-B).
     ///
-    /// SOUND because the roster's client-mute facts (`Participant::client_muted`)
-    /// have exactly ONE writer in the tree (`MeetingActor::handle_self_mute`),
-    /// fed only by this connection, and this cache mirrors the actor's resulting
-    /// facts exactly; `handle_server_mute` writes only the `*_server_muted`
-    /// fields. Unknown at join, so the first report always reaches the actor
-    /// (and, as MC's first FACT for that kind, always fans out to peers).
-    last_reported_mute: ClientMuteFacts,
+    /// SOUND because the roster's client state (`Participant::media.client`)
+    /// has exactly ONE writer in the tree (`MeetingActor::handle_self_mute`),
+    /// fed only by this connection (and a reconnect, which builds a fresh
+    /// connection and so a fresh cache), and this cache mirrors the actor's
+    /// resulting state exactly; `handle_server_mute` writes only the server
+    /// half.
+    last_reported_mute: ClientMediaStates,
     /// Bounds client-driven mute work (a RATE limit: mute is a repeatable
     /// steady-state user action, and a cumulative budget would permanently deny
     /// it).
@@ -1249,6 +1235,10 @@ struct MediaSignalingContext {
     server_mute_refusal_reply_limiter: ClientWorkLimiter,
     /// Bounds `UnmuteRequest`s relayed to the host(s).
     unmute_request_limiter: ClientWorkLimiter,
+    /// Bounds the REPLIES to refused `UnmuteRequest`s (never the counting).
+    unmute_rejection_reply_limiter: ClientWorkLimiter,
+    /// One-shot bound on the unmute refusal-reply-suppressed WARN.
+    unmute_rejection_reply_suppressed_logged: bool,
     /// One-shot bound on the server-mute refusal WARN (refusals always counted).
     server_mute_refusal_logged: bool,
     /// One-shot bound on the server-mute rate-limit WARN.
@@ -1457,10 +1447,11 @@ fn record_mute_for_each(change: MuteChange, outcome: MuteOutcome) {
 ///
 /// # Four steps, in this order, and the order is the security property
 ///
-/// 1. **Shape** — a request naming NO kind is refused before the limiter and
-///    before any actor hop, counted on the kind-free
-///    `mc_media_mute_requests_rejected_total`, and answered with one generic,
-///    rationed error ([`reject_no_kind_named`]).
+/// 1. **Shape, then publish set** — an empty, malformed or duplicated kind
+///    list, or one naming a kind this participant does not publish (screen
+///    included), is refused WHOLE before the limiter and before any actor hop,
+///    counted on the kind-free `mc_media_mute_requests_rejected_total`, and
+///    answered with one generic, rationed error ([`reject_mute_request`]).
 /// 2. **Identical repeat** — every named kind equals this connection's cached,
 ///    actor-confirmed state: returns before the actor hop and before spending a
 ///    token, so a client stuck on one state costs a compare.
@@ -1486,13 +1477,13 @@ async fn handle_mute_request(
     participant_handle: &ParticipantActorHandle,
     media: &mut MediaSignalingContext,
 ) {
-    // 1. Shape.
-    let change = match MuteChange::parse(request.audio_muted, request.video_muted) {
+    // 1. Shape: empty, malformed or duplicated lists are refused WHOLE.
+    let change = match MuteChange::parse(&request.changes) {
         Ok(change) => change,
-        Err(no_kind) => {
-            reject_no_kind_named(
+        Err(refusal) => {
+            reject_mute_request(
                 MuteSurface::ClientMute,
-                no_kind,
+                MuteRejectCause::List(refusal),
                 connection_id,
                 participant_handle,
                 media,
@@ -1502,29 +1493,35 @@ async fn handle_mute_request(
         }
     };
 
-    // 1b. Publish set (story 3 R-15 fix): a client-mute FACT exists only for a
-    // kind this participant publishes (fixed for the membership), so a named
-    // unpublished kind is IGNORED -- no fact, no fan-out, no MH disposition, no
-    // reply -- and counted `not_published`, BEFORE the no-op short-circuit,
-    // the token and any actor hop. A published kind in the same request still
-    // applies. Expected zero: the stock SDK never reports an unpublished kind.
-    for kind in change.unpublished(media.publishes) {
-        metrics::record_mute_request(kind, MuteOutcome::NotPublished);
-    }
-    let Some(change) = change.published_only(media.publishes) else {
-        return;
+    // 1b. Publish set (ADR-0036 §5 amendment 2026-10-25): a request naming a
+    // kind this participant does not publish (fixed for the membership;
+    // `VIDEO_SCREEN` included) is refused WHOLE -- nothing applied, not even a
+    // published kind in the same request -- BEFORE the no-op short-circuit,
+    // the token and any actor hop. Expected zero: the stock SDK never names an
+    // unpublished kind. The proven change is the only thing the actor accepts.
+    let change = match change.against(media.publishes) {
+        Ok(change) => change,
+        Err(NotPublished) => {
+            reject_mute_request(
+                MuteSurface::ClientMute,
+                MuteRejectCause::NotPublished,
+                connection_id,
+                participant_handle,
+                media,
+            )
+            .await;
+            return;
+        }
     };
 
     // 2. Short-circuit a no-op BEFORE the actor hop and before the limiter:
     // every NAMED kind already equals what the actor last confirmed for this
-    // connection. An unknown cached kind (fresh connection, or a reconnect into
-    // an existing roster entry) never short-circuits, so the actor -- which
-    // merges against the roster and is idempotent per kind -- decides.
-    if change
-        .named()
-        .all(|(kind, muted)| media.last_reported_mute.get(kind) == Some(muted))
-    {
-        record_mute_for_each(change, MuteOutcome::Unchanged);
+    // connection. The actor still merges against the roster and is idempotent
+    // per kind.
+    if change.change().named().all(|(kind, muted)| {
+        media.last_reported_mute.get(kind) == ClientKindState::published(muted)
+    }) {
+        record_mute_for_each(change.change(), MuteOutcome::Unchanged);
         return;
     }
 
@@ -1534,7 +1531,7 @@ async fn handle_mute_request(
     // GENUINE toggle, and would report `rate_limited` for a path that was never
     // approached.
     if !media.mute_limiter.try_spend(Instant::now()) {
-        record_mute_for_each(change, MuteOutcome::RateLimited);
+        record_mute_for_each(change.change(), MuteOutcome::RateLimited);
 
         // The report is DROPPED, not queued. Capture-side safety holds: ADR-0036
         // §5 enforces client mute at CAPTURE on the client, so there is no
@@ -1573,13 +1570,26 @@ async fn handle_mute_request(
         .update_self_mute(media.participant_id.clone(), change)
         .await
     {
-        Ok(Some(decision)) => {
+        // The actor re-checked the proof against the roster and refused it:
+        // counted and answered like the connection-side refusal, never
+        // masked as `unchanged` (code-quality CR-4).
+        Ok(Some(Err(NotPublished))) => {
+            reject_mute_request(
+                MuteSurface::ClientMute,
+                MuteRejectCause::NotPublished,
+                connection_id,
+                participant_handle,
+                media,
+            )
+            .await;
+        }
+        Ok(Some(Ok(decision))) => {
             // Cache the actor's RESULTING state for both kinds (the roster is
             // authoritative; this connection is its only self-mute writer), only
             // AFTER the actor accepted the report: assigning before the await
             // would record a report the actor never received.
-            media.last_reported_mute = ClientMuteFacts::from(decision);
-            for (kind, _) in change.named() {
+            media.last_reported_mute = ClientMediaStates::from(decision);
+            for (kind, _) in change.change().named() {
                 let outcome = if decision.changed(kind) {
                     MuteOutcome::Applied
                 } else {
@@ -1596,7 +1606,7 @@ async fn handle_mute_request(
                 connection_id = %connection_id,
                 "Client mute not recorded: participant no longer on the meeting roster"
             );
-            record_mute_for_each(change, MuteOutcome::ActorUnavailable);
+            record_mute_for_each(change.change(), MuteOutcome::ActorUnavailable);
         }
         // The actor channel or its reply failed: the actor is gone.
         Err(e) => {
@@ -1606,7 +1616,7 @@ async fn handle_mute_request(
                 error = %e,
                 "Failed to record client mute on the meeting actor"
             );
-            record_mute_for_each(change, MuteOutcome::ActorUnavailable);
+            record_mute_for_each(change.change(), MuteOutcome::ActorUnavailable);
         }
     }
 }
@@ -1629,9 +1639,16 @@ const SIGNALING_KIND_MUTE_REJECTION: &str = "mute_rejection";
 /// reason. A bounded `&'static str`; no client value is ever echoed back.
 const SERVER_MUTE_REFUSED_MESSAGE: &str = "Server mute request refused";
 
-/// The ONE client-visible rejection of a malformed client `MuteRequest` (story
-/// 3 MC-B: one naming no kind). Bounded and static.
+/// The ONE client-visible rejection of a refused client `MuteRequest` (story
+/// 3 MC-B; any kind-list refusal). Bounded and static.
 const MUTE_REJECTED_MESSAGE: &str = "Mute request refused";
+
+/// `message_kind` for the unmute-request rejection `ErrorMessage`.
+const SIGNALING_KIND_UNMUTE_REJECTION: &str = "unmute_rejection";
+
+/// The ONE client-visible rejection of a refused `UnmuteRequest` (a kind-list
+/// refusal). Bounded and static.
+const UNMUTE_REJECTED_MESSAGE: &str = "Unmute request refused";
 
 /// Handle a post-join `ServerMuteRequest` (ADR-0036 §5, §7; story 2 R-8..R-11;
 /// story 3 R-15, R-16).
@@ -1646,16 +1663,18 @@ const MUTE_REJECTED_MESSAGE: &str = "Mute request refused";
 ///    the control; the single wire error below is defence in depth on top of
 ///    it (it collapses the one case where this layer and the actor read
 ///    different vintages of the role).
-/// 2. **Shape** — a host's request naming NO kind is refused with the same
-///    generic error, counted on the kind-free
+/// 2. **Shape** — a host's empty, malformed or duplicated kind list is refused
+///    with the same generic error, counted on the kind-free
 ///    `mc_media_mute_requests_rejected_total`, and spends no token.
 /// 3. **Rate limit** — a host's work only, from a bucket no looser than client
 ///    mute's ([`SERVER_MUTE_WORK_BURST`]).
-/// 4. **The actor**, which re-checks authority against its roster (AND-composed)
-///    and then resolves the target, and changes ONLY the named kinds.
+/// 4. **The actor**, which re-checks authority against its roster (AND-composed),
+///    resolves the target, refuses the WHOLE request if it names a kind the
+///    target does not publish (`not_published` on the kind-free counter; the
+///    SAME wire reply as an unknown target), and changes ONLY the named kinds.
 ///
-/// A request naming no kind -- from a host OR a non-host -- is counted ONLY on
-/// the kind-free counter (it has no kind to put on a per-kind cell), so
+/// A malformed kind list -- from a host OR a non-host -- is counted ONLY on the
+/// kind-free counter (it has no valid kind to put on a per-kind cell), so
 /// `not_permitted` undercounts non-hosts by exactly those requests.
 ///
 /// The requester is `media.participant_id` — the AUTHENTICATED connection's own
@@ -1672,7 +1691,7 @@ async fn handle_server_mute_request(
     media: &mut MediaSignalingContext,
 ) {
     // A pure function of the message: reads no meeting state.
-    let parsed = MuteChange::parse(request.audio_muted, request.video_muted);
+    let parsed = MuteChange::parse(&request.changes);
 
     // 1. Authority.
     if !media.is_host {
@@ -1688,10 +1707,10 @@ async fn handle_server_mute_request(
                 )
                 .await;
             }
-            Err(no_kind) => {
-                reject_no_kind_named(
+            Err(refusal) => {
+                reject_mute_request(
                     MuteSurface::ServerMute,
-                    no_kind,
+                    MuteRejectCause::List(refusal),
                     connection_id,
                     participant_handle,
                     media,
@@ -1705,10 +1724,10 @@ async fn handle_server_mute_request(
     // 2. Shape (host).
     let change = match parsed {
         Ok(change) => change,
-        Err(no_kind) => {
-            reject_no_kind_named(
+        Err(refusal) => {
+            reject_mute_request(
                 MuteSurface::ServerMute,
-                no_kind,
+                MuteRejectCause::List(refusal),
                 connection_id,
                 participant_handle,
                 media,
@@ -1783,8 +1802,8 @@ async fn handle_server_mute_request(
                 requester_participant_id = %media.participant_id,
                 target_participant_id = %target,
                 outcome = outcome.label(),
-                audio_muted = ?change.get(MediaKindLabel::Audio),
-                video_muted = ?change.get(MediaKindLabel::Video),
+                // Per kind AS ASKED, from the closed label set.
+                asked = %change,
                 "Server mute decision"
             );
         }
@@ -1802,32 +1821,53 @@ async fn handle_server_mute_request(
     }
 }
 
-/// Count, bound-log and answer a mute request that names NO kind (story 3
-/// MC-B), on either surface. The ONE rejection path for both, so the two cannot
-/// drift.
+/// Why a mute-family request is refused WHOLE before any kind is counted.
+#[derive(Debug, Clone, Copy)]
+enum MuteRejectCause {
+    /// The kind list is empty, malformed or duplicated.
+    List(RequestListRefusal),
+    /// A named kind is not one the subject publishes.
+    NotPublished,
+}
+
+impl MuteRejectCause {
+    fn reason(self) -> MuteRejection {
+        match self {
+            Self::List(refusal) => MuteRejection::of_list(refusal),
+            Self::NotPublished => MuteRejection::NotPublished,
+        }
+    }
+}
+
+/// Count, bound-log and answer a mute-family request refused WHOLE for its
+/// kind list (story 3 MC-B; extended 2026-10-25), on any surface. The ONE
+/// rejection path for all three, so they cannot drift.
 ///
 /// Counted once on the kind-free `mc_media_mute_requests_rejected_total`
-/// (never on a per-kind cell: there is no kind), before any token or actor hop.
-/// The internal cause is kept in a one-shot DEBUG line (no identity, no
-/// request content beyond its shape); the client gets the surface's one generic
-/// error, rationed like every other refusal reply ([`reply_mute_refusal`]). On
-/// the server-mute surface that reply is byte-identical to a named-kind
-/// refusal, so a non-host learns nothing from the difference.
-async fn reject_no_kind_named(
+/// (never on a per-kind cell: the request applied no kind), before any token
+/// or actor hop -- except a server mute's `not_published`, which the actor
+/// decides and [`refuse_server_mute`] routes here. The internal cause is kept
+/// in a one-shot DEBUG line (no identity, no request content beyond its
+/// reason); the client gets the surface's one generic error, rationed like
+/// every other refusal reply ([`reply_mute_refusal`]). On the server-mute
+/// surface that reply is byte-identical to every other server-mute refusal, so
+/// a non-host learns nothing from the difference.
+async fn reject_mute_request(
     surface: MuteSurface,
-    cause: NoKindNamed,
+    cause: MuteRejectCause,
     connection_id: &str,
     participant_handle: &ParticipantActorHandle,
     media: &mut MediaSignalingContext,
 ) {
-    metrics::record_mute_request_rejected(surface, MuteRejection::NoKindNamed);
+    let reason = cause.reason();
+    metrics::record_mute_request_rejected(surface, reason);
     if !media.mute_rejection_logged {
         media.mute_rejection_logged = true;
         debug!(
             target: "mc.webtransport.connection",
             connection_id = %connection_id,
             surface = surface.label(),
-            error = %cause,
+            reason = reason.label(),
             "Mute request rejected. Further rejections on this connection are counted, not \
              logged."
         );
@@ -1853,6 +1893,18 @@ async fn refuse_server_mute(
     let outcome = match refusal {
         ServerMuteRefusal::NotPermitted => ServerMuteOutcome::NotPermitted,
         ServerMuteRefusal::UnknownTarget => ServerMuteOutcome::UnknownTarget,
+        // Refused WHOLE for its kind list: kind-free, same reply.
+        ServerMuteRefusal::NotPublished => {
+            reject_mute_request(
+                MuteSurface::ServerMute,
+                MuteRejectCause::NotPublished,
+                connection_id,
+                participant_handle,
+                media,
+            )
+            .await;
+            return;
+        }
     };
     record_server_mute_for_each(change, outcome);
 
@@ -1866,10 +1918,9 @@ async fn refuse_server_mute(
             requester_participant_id = %media.participant_id,
             target_participant_id = target.unwrap_or(""),
             outcome = outcome.label(),
-            // What was asked for, per kind (absent = not asked; never
+            // What was asked for, per kind (`unchanged` = not asked; never
             // identity).
-            audio_muted = ?change.get(MediaKindLabel::Audio),
-            video_muted = ?change.get(MediaKindLabel::Video),
+            asked = %change,
             "Server-mute request refused. Further refusals on this connection are counted, not \
              logged."
         );
@@ -1910,6 +1961,13 @@ async fn reply_mute_refusal(
             v1::ErrorCode::InvalidRequest,
             MUTE_REJECTED_MESSAGE,
             SIGNALING_KIND_MUTE_REJECTION,
+        ),
+        MuteSurface::UnmuteRequest => (
+            &mut media.unmute_rejection_reply_limiter,
+            &mut media.unmute_rejection_reply_suppressed_logged,
+            v1::ErrorCode::InvalidRequest,
+            UNMUTE_REJECTED_MESSAGE,
+            SIGNALING_KIND_UNMUTE_REJECTION,
         ),
     };
     if !limiter.try_spend(Instant::now()) {
@@ -1955,8 +2013,31 @@ async fn reply_mute_refusal(
 async fn handle_unmute_request(
     request: &v1::UnmuteRequest,
     connection_id: &str,
+    participant_handle: &ParticipantActorHandle,
     media: &mut MediaSignalingContext,
 ) {
+    // Shape, then publish set: refused WHOLE (kind-free, rationed generic
+    // reply) before the token and any actor hop, as on the mute surfaces.
+    let kinds = match RequestedKinds::parse(&request.media_kinds) {
+        Ok(kinds) => kinds
+            .against(media.publishes)
+            .map_err(|NotPublished| MuteRejectCause::NotPublished),
+        Err(refusal) => Err(MuteRejectCause::List(refusal)),
+    };
+    let kinds = match kinds {
+        Ok(kinds) => kinds,
+        Err(cause) => {
+            reject_mute_request(
+                MuteSurface::UnmuteRequest,
+                cause,
+                connection_id,
+                participant_handle,
+                media,
+            )
+            .await;
+            return;
+        }
+    };
     if !media.unmute_request_limiter.try_spend(Instant::now()) {
         metrics::record_unmute_request(UnmuteRequestOutcome::RateLimited);
         if !media.unmute_rate_limit_logged {
@@ -1972,11 +2053,7 @@ async fn handle_unmute_request(
     }
     let outcome = match media
         .meeting_handle
-        .request_unmute(
-            media.participant_id.clone(),
-            request.request_audio,
-            request.request_video,
-        )
+        .request_unmute(media.participant_id.clone(), kinds)
         .await
     {
         Ok(UnmuteRelay::Relayed { .. }) => UnmuteRequestOutcome::Relayed,
@@ -2043,7 +2120,7 @@ fn media_signaling_context(
     join_result: &JoinResult,
     config: ClientMediaConfig,
     is_host: bool,
-    publishes: PublishSet,
+    declared: ClientMediaStates,
     declaration: ReceiveCapabilityDeclaration,
 ) -> MediaSignalingContext {
     MediaSignalingContext::new(
@@ -2051,7 +2128,7 @@ fn media_signaling_context(
         join_result.participant_id.clone(),
         &config,
         is_host,
-        publishes,
+        declared,
         Some(declaration),
     )
 }
@@ -2064,7 +2141,7 @@ impl MediaSignalingContext {
         participant_id: String,
         config: &ClientMediaConfig,
         is_host: bool,
-        publishes: PublishSet,
+        declared: ClientMediaStates,
         declaration: Option<ReceiveCapabilityDeclaration>,
     ) -> Self {
         // One clock reading for every bucket: they start together at join, so a
@@ -2075,10 +2152,10 @@ impl MediaSignalingContext {
             meeting_handle,
             participant_id,
             receive_slot_caps: config.receive_slot_caps,
-            publishes,
+            publishes: declared.publish_set(),
             declaration_budget: config.max_receive_capability_declarations,
             declaration,
-            last_reported_mute: ClientMuteFacts::UNKNOWN,
+            last_reported_mute: declared,
             mute_limiter: ClientWorkLimiter::new(
                 limiter_start,
                 MUTE_WORK_BURST,
@@ -2115,6 +2192,12 @@ impl MediaSignalingContext {
                 UNMUTE_REQUEST_BURST,
                 UNMUTE_REQUEST_REFILL_INTERVAL_MS,
             ),
+            unmute_rejection_reply_limiter: ClientWorkLimiter::new(
+                limiter_start,
+                MUTE_REFUSAL_REPLY_BURST,
+                MUTE_REFUSAL_REPLY_REFILL_INTERVAL_MS,
+            ),
+            unmute_rejection_reply_suppressed_logged: false,
             server_mute_refusal_logged: false,
             server_mute_rate_limit_logged: false,
             server_mute_refusal_reply_suppressed_logged: false,
@@ -2240,8 +2323,9 @@ async fn read_meeting_handlers(
 /// A join's validated media declaration (story 3 R-2).
 #[derive(Debug)]
 struct ValidatedJoinMedia {
-    /// What the participant publishes, fixed for the membership.
-    publishes: PublishSet,
+    /// What the participant publishes (fixed for the membership) and each
+    /// published kind's initial client mute.
+    declared: ClientMediaStates,
     /// The receive declaration AS SENT (seeds the redeclaration short-circuit).
     declaration: ReceiveCapabilityDeclaration,
     /// The same declaration truncated to this MC's per-kind caps.
@@ -2253,12 +2337,12 @@ struct ValidatedJoinMedia {
 /// 1. **Header version.** `supported_header_versions` must contain
 ///    `PROTOCOL_VERSION` (v3 is the only version, R-22; no allowlist, no
 ///    floor; absent capabilities = an empty list = refused). FIRST, so a
-///    pre-story (v2) SDK — which also sends no `publish_kinds` — is counted
-///    `header_version_unsupported`, the operator's "old SDK meets new MC"
-///    signal (`docs/runbooks/mc-deployment.md` §Story 3 cutover), never
+///    pre-story (v2) SDK is counted `header_version_unsupported`, the
+///    operator's "old SDK meets new MC" signal
+///    (`docs/runbooks/mc-deployment.md` §Story 3 cutover), never
 ///    `publish_kind_invalid`. A linear `contains`, no allocation.
-/// 2. **Publish set** — closed {AUDIO, VIDEO_CAMERA}; first invalid or
-///    duplicate fails.
+/// 2. **Published kinds** — closed {AUDIO, VIDEO_CAMERA}; first invalid or
+///    duplicate fails (`publish_kind_invalid`). Empty is a receive-only join.
 /// 3. **Receive declaration** — the SAME parser as the post-join path (absent =
 ///    zero slots).
 /// 4. **Neither publish nor receive** — judged on the declaration AS SENT,
@@ -2283,8 +2367,9 @@ fn validate_join_media(
         return Err(McError::HeaderVersionUnsupported);
     }
 
-    let publishes =
-        PublishSet::parse(&request.publish_kinds).map_err(|_| McError::PublishKindInvalid)?;
+    let declared = ClientMediaStates::parse_declaration(&request.published_kinds)
+        .map_err(|_| McError::PublishKindInvalid)?;
+    let publishes = declared.publish_set();
 
     let declaration = match &request.receive_capability {
         None => ReceiveCapabilityDeclaration::empty(),
@@ -2300,7 +2385,7 @@ fn validate_join_media(
 
     let demand = declaration.clone().truncate(media.receive_slot_caps);
     Ok(ValidatedJoinMedia {
-        publishes,
+        declared,
         declaration,
         demand,
     })
@@ -2371,8 +2456,11 @@ fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinRe
         // `WebTransportServer::new` publishes as `mc_media_receive_slot_cap` —
         // one value, three readers. INFORMATIONAL: MC truncates, the client
         // needs no pre-check. `u8` widened by `u32::from`: total, never `as`.
-        max_audio_receive_slots: Some(u32::from(MediaKindLabel::Audio.of(media.receive_slot_caps))),
-        max_video_receive_slots: Some(u32::from(MediaKindLabel::Video.of(media.receive_slot_caps))),
+        // Exactly one entry per known kind (CONVENTIONS §6): every kind needs a
+        // cap.
+        receive_slot_caps: crate::webtransport::handler::receive_slot_caps(|kind| {
+            u32::from(kind.of(media.receive_slot_caps))
+        }),
     }
 }
 
@@ -2380,6 +2468,7 @@ fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinRe
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::media_signaling::MediaKindLabel;
     use crate::observability::metrics::{
         KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR, MEDIA_KIND_LABEL,
     };
@@ -2394,7 +2483,7 @@ mod tests {
         use common::observability::testing::MetricAssertion;
 
         let snap = MetricAssertion::snapshot();
-        let both = MuteChange::parse(Some(true), Some(false)).unwrap();
+        let both = MuteChange::from_asks([Some(true), Some(false)]).unwrap();
         record_server_mute_for_each(both, ServerMuteOutcome::NotPermitted);
         record_mute_for_each(both, MuteOutcome::RateLimited);
 
@@ -2429,7 +2518,7 @@ mod tests {
         }
 
         let snap = MetricAssertion::snapshot();
-        let audio_only = MuteChange::parse(Some(true), None).unwrap();
+        let audio_only = MuteChange::one(MediaKindLabel::Audio, true);
         record_server_mute_for_each(audio_only, ServerMuteOutcome::RateLimited);
         record_mute_for_each(audio_only, MuteOutcome::RateLimited);
         snap.counter("mc_media_server_mute_requests_total")
@@ -2591,7 +2680,7 @@ mod tests {
                 "test-part".to_string(),
                 &config,
                 is_host,
-                PublishSet::of(&[MediaKindLabel::Audio]),
+                ClientMediaStates::live(PublishSet::of(&[MediaKindLabel::Audio])),
                 None,
             ),
             task,
@@ -2629,7 +2718,13 @@ mod tests {
                 supported_codecs: Vec::new(),
                 supported_header_versions,
             }),
-            publish_kinds: publish.into_iter().map(|k| k as i32).collect(),
+            published_kinds: publish
+                .into_iter()
+                .map(|k| v1::PublishedKind {
+                    media_kind: k as i32,
+                    client_muted: false,
+                })
+                .collect(),
             receive_capability: slots.map(|slots| v1::ReceiveCapability {
                 slots: slots
                     .into_iter()
@@ -2709,8 +2804,66 @@ mod tests {
             );
         }
         let mut unknown = join_request(v3(), Vec::new(), None);
-        unknown.publish_kinds = vec![99];
+        unknown.published_kinds = vec![v1::PublishedKind {
+            media_kind: 99,
+            client_muted: false,
+        }];
         assert_eq!(refusal(&unknown), Some("publish_kind_invalid"));
+        // A duplicate is judged on KIND only: conflicting values are still a
+        // duplicate, never last-wins.
+        let mut conflicting = join_request(v3(), Vec::new(), None);
+        conflicting.published_kinds = [true, false]
+            .map(|client_muted| v1::PublishedKind {
+                media_kind: v1::MediaKind::Audio as i32,
+                client_muted,
+            })
+            .to_vec();
+        assert_eq!(refusal(&conflicting), Some("publish_kind_invalid"));
+    }
+
+    /// Test plan 1-3 (re-pointed, no-compat): the ordering table pins the
+    /// first-wins reason, and an EMPTY `published_kinds` is a legal
+    /// receive-only join, admitted with every kind NOT_PUBLISHED.
+    #[test]
+    fn the_join_refusal_order_and_an_empty_publish_list_is_receive_only() {
+        // {v2 header + bad kind}: the header wins.
+        assert_eq!(
+            refusal(&join_request(
+                Some(vec![2]),
+                vec![v1::MediaKind::Unspecified],
+                None
+            )),
+            Some("header_version_unsupported")
+        );
+        // {bad kind + invalid receive capability}: the kind wins.
+        assert_eq!(
+            refusal(&join_request(
+                v3(),
+                vec![v1::MediaKind::VideoScreen],
+                Some(vec![(0, v1::MediaKind::VideoScreen)])
+            )),
+            Some("publish_kind_invalid")
+        );
+        // Empty: receive-only, admitted.
+        let receive_only = join_request(v3(), Vec::new(), Some(vec![(0, v1::MediaKind::Audio)]));
+        assert_eq!(refusal(&receive_only), None);
+        let validated = validate_join_media(&receive_only, &test_client_media_config()).unwrap();
+        assert_eq!(validated.declared, ClientMediaStates::NOT_PUBLISHING);
+    }
+
+    /// The declaration's initial client mute is the admitted state.
+    #[test]
+    fn the_join_declaration_carries_each_published_kinds_initial_client_mute() {
+        let mut r = join_request(v3(), Vec::new(), None);
+        r.published_kinds = vec![v1::PublishedKind {
+            media_kind: v1::MediaKind::Audio as i32,
+            client_muted: true,
+        }];
+        let validated = validate_join_media(&r, &test_client_media_config()).unwrap();
+        assert_eq!(
+            validated.declared,
+            ClientMediaStates::from_declared([Some(true), None])
+        );
     }
 
     #[test]
@@ -2767,7 +2920,7 @@ mod tests {
             .demand
             .kept_slot_ids(MediaKindLabel::Video)
             .is_empty());
-        assert!(validated.publishes.is_empty());
+        assert!(validated.declared.publish_set().is_empty());
     }
 
     /// Over-cap is a truncation at join, never a refusal (R-1).
@@ -2811,7 +2964,6 @@ mod tests {
             kek_generation: 0,
             kek_rotation_debounce_seconds: 60,
             participant_handle: handle,
-            server_mute_replay: Vec::new(),
             media_handlers: MeetingHandlers::new([HandlerEndpoint {
                 id: HandlerId::new("mh-0"),
                 webtransport_url: "https://mh-0.test:4434".to_string(),
@@ -2820,11 +2972,23 @@ mod tests {
             .unwrap(),
         };
         let response = build_join_response(&result, &config);
-        assert_eq!(response.max_audio_receive_slots, Some(8));
         assert_eq!(
-            response.max_video_receive_slots,
-            Some(0),
-            "a present 0: video off"
+            response.receive_slot_caps,
+            vec![
+                v1::ReceiveSlotCap {
+                    media_kind: v1::MediaKind::Audio as i32,
+                    max_slots: 8,
+                },
+                v1::ReceiveSlotCap {
+                    media_kind: v1::MediaKind::VideoCamera as i32,
+                    max_slots: 0, // a present 0: video off
+                },
+                v1::ReceiveSlotCap {
+                    media_kind: v1::MediaKind::VideoScreen as i32,
+                    max_slots: 0,
+                },
+            ],
+            "exactly one entry per known kind (CONVENTIONS §6)"
         );
     }
 
@@ -2832,12 +2996,12 @@ mod tests {
     async fn test_handle_client_message_unhandled_type() {
         let (handle, _task) = test_participant_handle();
         let (mut media, _meeting) = test_media_context();
-        // `UnmuteResponse` has no dispatch arm by design (the host lifts a mute
-        // with a `ServerMuteRequest`); it must fall through to the ignored
-        // branch without panicking.
+        // `StreamQualityUpdate` has no dispatch arm (the deleted
+        // `UnmuteResponse` was the previous fixture here); it must fall
+        // through to the ignored branch without panicking.
         let msg = ClientMessage {
-            message: Some(client_message::Message::UnmuteResponse(
-                v1::UnmuteResponse::default(),
+            message: Some(client_message::Message::StreamQualityUpdate(
+                v1::StreamQualityUpdate::default(),
             )),
             trace_parent: String::new(),
             trace_state: String::new(),
@@ -2875,8 +3039,16 @@ mod tests {
             message: Some(client_message::Message::ServerMuteRequest(
                 v1::ServerMuteRequest {
                     participant_id: target.to_string(),
-                    audio_muted: Some(true),
-                    video_muted: Some(false),
+                    changes: vec![
+                        v1::MuteChange {
+                            media_kind: v1::MediaKind::Audio as i32,
+                            muted: true,
+                        },
+                        v1::MuteChange {
+                            media_kind: v1::MediaKind::VideoCamera as i32,
+                            muted: false,
+                        },
+                    ],
                     reason: String::new(),
                 },
             )),
@@ -3113,7 +3285,7 @@ mod tests {
             .server_mute(
                 "test-part".to_string(),
                 "host".to_string(),
-                MuteChange::parse(Some(true), None).unwrap(),
+                MuteChange::one(MediaKindLabel::Audio, true),
             )
             .await
             .unwrap()
@@ -3122,8 +3294,7 @@ mod tests {
         let snap = common::observability::testing::MetricAssertion::snapshot();
         let forged = ClientMessage {
             message: Some(client_message::Message::UnmuteRequest(v1::UnmuteRequest {
-                request_audio: true,
-                request_video: false,
+                media_kinds: vec![v1::MediaKind::Audio as i32],
                 participant_id: "forged-victim".to_string(),
             })),
             trace_parent: String::new(),
@@ -3162,8 +3333,7 @@ mod tests {
         let (mut media, _meeting) = test_media_context_as(false);
         let msg = ClientMessage {
             message: Some(client_message::Message::UnmuteRequest(v1::UnmuteRequest {
-                request_audio: true,
-                request_video: false,
+                media_kinds: vec![v1::MediaKind::Audio as i32],
                 participant_id: String::new(),
             })),
             trace_parent: String::new(),

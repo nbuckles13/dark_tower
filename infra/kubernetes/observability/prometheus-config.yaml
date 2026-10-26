@@ -7,7 +7,7 @@
 # Scrape jobs (see `prometheus.yml`): prometheus, ac-service, gc-service,
 # mc-service, mh-service, kube-state-metrics, node-exporter, kubelet.
 #
-# NOTE: the `prometheus-config` and `prometheus-rules` ConfigMaps are GENERATED
+# NOTE: the `prometheus-config` and `prometheus-rules-<svc>` ConfigMaps are GENERATED
 # by `configMapGenerator` in `kustomization.yaml` -- from
 # `infra/kubernetes/observability/prometheus.yml` and from
 # `infra/docker/prometheus/rules/` respectively. They are deliberately not
@@ -122,9 +122,26 @@ spec:
         - name: config
           configMap:
             name: prometheus-config
+        # ONE directory from one ConfigMap per rules file (generated in
+        # infra/docker/prometheus/kustomization.yaml, which says why they are
+        # split). Not `optional:`: a missing ConfigMap fails pod start rather
+        # than silently loading fewer rules. A new rules file needs a source
+        # here, or `dt-guard kustomize` R-21 fails.
         - name: rules
-          configMap:
-            name: prometheus-rules
+          projected:
+            sources:
+              - configMap:
+                  name: prometheus-rules-ac
+              - configMap:
+                  name: prometheus-rules-client
+              - configMap:
+                  name: prometheus-rules-gc
+              - configMap:
+                  name: prometheus-rules-mc
+              - configMap:
+                  name: prometheus-rules-mh
+              - configMap:
+                  name: prometheus-rules-otel
         - name: data
           emptyDir: {}
 ---

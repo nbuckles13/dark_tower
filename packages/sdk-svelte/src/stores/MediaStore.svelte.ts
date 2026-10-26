@@ -46,12 +46,12 @@
 import type {
   CameraHealthChangedEvent,
   CaptureResumedAfterServerMuteEvent,
-  ClientMuteFacts,
   MediaCaptureFailureOutcome,
   MediaFault,
   MuteSnapshot,
   ParticipantMuteEvent,
   PublishKind,
+  RosterParticipant,
   StreamAssignmentEvent,
   StreamAssignmentsEvent,
   UnmuteRequestedEvent,
@@ -242,23 +242,13 @@ export class MediaStore {
   }
 
   /**
-   * Seed `participant`'s client mute from its roster entry (`joined`'s
-   * `existingParticipants`, `participantJoined`), through the SAME setter as
-   * {@link applyParticipantMute}: an absent kind is no fact and changes nothing.
+   * Seed `participant`'s per-kind state from its roster entry (`joined`'s
+   * `existingParticipants`, `participantJoined`), through the SAME write as
+   * {@link applyParticipantMute}: a full snapshot of every kind. A rejoin under
+   * the same id is seeded afresh, so nothing is cleared on leave.
    */
-  applyRosterEntry(participant: ClientMuteFacts & { readonly participantId: string }): void {
-    this.#participantCells
-      .ensure(participant.participantId)
-      .setClientMute(participant.audioClientMuted, participant.videoClientMuted);
-  }
-
-  /**
-   * The participant left: their client-mute facts are forgotten (back to no
-   * fact), so a later roster entry under the same id starts UNKNOWN rather than
-   * inheriting a stale value. The cell itself stays (readers hold it).
-   */
-  applyParticipantLeft(participantId: string): void {
-    this.#participantCells.ensure(participantId).clearClientMute();
+  applyRosterEntry(participant: RosterParticipant): void {
+    this.#participantCells.ensure(participant.participantId).apply(participant.mediaStates);
   }
 
   /** Apply a `captureResumedAfterServerMute` event: latch the notice for its kind. */
@@ -279,8 +269,7 @@ export class MediaStore {
    */
   applyParticipantMute(event: ParticipantMuteEvent): void {
     const cell = this.#participantCells.ensure(event.participantId);
-    cell.setServerMute(event.audioServerMuted, event.videoServerMuted, event.serverMutedBy);
-    cell.setClientMute(event.audioClientMuted, event.videoClientMuted);
+    cell.apply(event.mediaStates);
     if (!cell.serverMutedAny) cell.setUnmuteRequested(false);
   }
 

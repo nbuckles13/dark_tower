@@ -121,7 +121,7 @@ pub struct ClientMediaConfig {
     ///
     /// THE values MC truncates every declaration to, publishes
     /// (`mc_media_receive_slot_cap{media_kind}`) and advertises
-    /// (`JoinResponse.max_audio_receive_slots` / `max_video_receive_slots`).
+    /// (`JoinResponse.receive_slot_caps`, one entry per kind).
     pub receive_slot_caps: [u8; 2],
     /// Maximum ACCEPTED declarations per connection
     /// (`MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`).

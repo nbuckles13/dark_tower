@@ -31,7 +31,15 @@
 //
 // No metric, log or trace is emitted here; nothing frame-rate touches a cell.
 
-import type { StreamAssignmentEvent, VideoRenderState } from '@darktower/sdk-core';
+import type {
+  ClientMediaStateToken,
+  KindMediaState,
+  PublishKind,
+  ParticipantMediaStates,
+  StreamAssignmentEvent,
+  VideoRenderState,
+} from '@darktower/sdk-core';
+import { MEDIA_KIND_TOKENS, perMediaKind } from '@darktower/sdk-core';
 
 /** What a component reads about ONE slot. */
 export interface SlotView {
@@ -45,20 +53,35 @@ export interface SlotView {
 }
 
 /**
- * What a component reads about ONE participant's mute state (story 3 R-15): the
- * ONE home of all four facts. Server mute is two-state (MC always carries both
- * kinds). Client mute is TRI-STATE, `undefined` = no fact yet (sdk-core
- * `ClientMuteFacts`: the latest PRESENT value wins; absent changes nothing).
+ * What a component reads about ONE kind of ONE participant (story 3 R-15; wire
+ * `MediaKindState`). Client state and server mute are independent.
+ */
+export interface KindMediaView {
+  /**
+   * The participant's own state for this kind, as MC reports it. `undefined`
+   * ONLY for a participant MC has sent no state for — never a roster
+   * participant (its cell is seeded from its roster entry before the roster
+   * lists it, `MeetingStore`), only this client's OWN cell before a self
+   * update. It is NOT a display state: there is no "unknown" to render, and a
+   * reader that meets it has a wiring bug (`participantState.ts` fails loudly).
+   */
+  readonly clientState: ClientMediaStateToken | undefined;
+  /** Whether this kind is server-muted. */
+  readonly serverMuted: boolean;
+  /** Participant id of whoever server-muted this kind; only while `serverMuted`. */
+  readonly serverMutedBy: string | undefined;
+}
+
+/**
+ * What a component reads about ONE participant's mute state: per kind, the ONE
+ * home of all of it (seeded by the roster entry, moved by every
+ * `ParticipantMuteUpdate` — each a FULL snapshot).
  */
 export interface ParticipantMediaView {
-  readonly audioServerMuted: boolean;
-  readonly videoServerMuted: boolean;
-  /** This participant's own audio client mute, as MC reports it; `undefined` = no fact. */
-  readonly audioClientMuted: boolean | undefined;
-  /** This participant's own video client mute, as MC reports it; `undefined` = no fact. */
-  readonly videoClientMuted: boolean | undefined;
-  /** Participant id of whoever applied it, when MC said. Resolve via the roster to render. */
-  readonly serverMutedBy: string | undefined;
+  /** One kind's cells; a reader of one kind tracks only that kind. */
+  kind(kind: PublishKind): KindMediaView;
+  /** Whether MC reports this participant server-muted in ANY kind. */
+  readonly serverMutedAny: boolean;
   /** This participant asked the host to lift their server mute (host clients only). */
   readonly unmuteRequested: boolean;
 }
@@ -119,67 +142,60 @@ export class SlotCell implements SlotView {
   }
 }
 
-/** One participant's mute cells (server and client, per kind). */
-export class ParticipantMediaCell implements ParticipantMediaView {
-  #audioServerMuted = $state(false);
-  #videoServerMuted = $state(false);
-  #audioClientMuted = $state<boolean | undefined>(undefined);
-  #videoClientMuted = $state<boolean | undefined>(undefined);
+/** One kind's cells of one participant. */
+export class KindMediaCell implements KindMediaView {
+  #clientState = $state<ClientMediaStateToken | undefined>(undefined);
+  #serverMuted = $state(false);
   #serverMutedBy = $state<string | undefined>(undefined);
-  #unmuteRequested = $state(false);
 
-  get audioServerMuted(): boolean {
-    return this.#audioServerMuted;
+  get clientState(): ClientMediaStateToken | undefined {
+    return this.#clientState;
   }
 
-  get videoServerMuted(): boolean {
-    return this.#videoServerMuted;
+  get serverMuted(): boolean {
+    return this.#serverMuted;
   }
 
   get serverMutedBy(): string | undefined {
     return this.#serverMutedBy;
   }
 
-  get audioClientMuted(): boolean | undefined {
-    return this.#audioClientMuted;
+  /** Change-only write of one kind's snapshot. Client and server never touch each other. */
+  set(state: KindMediaState): void {
+    if (this.#clientState !== state.clientState) this.#clientState = state.clientState;
+    if (this.#serverMuted !== state.serverMuted) this.#serverMuted = state.serverMuted;
+    const nextBy = state.serverMuted ? state.serverMutedBy : undefined;
+    if (this.#serverMutedBy !== nextBy) this.#serverMutedBy = nextBy;
   }
+}
 
-  get videoClientMuted(): boolean | undefined {
-    return this.#videoClientMuted;
+/** One participant's mute cells, per kind. */
+export class ParticipantMediaCell implements ParticipantMediaView {
+  /** One cell per kind, over the SDK's one kind list. */
+  readonly #kinds: Readonly<Record<PublishKind, KindMediaCell>> = perMediaKind(
+    () => new KindMediaCell(),
+  );
+  #unmuteRequested = $state(false);
+
+  kind(kind: PublishKind): KindMediaCell {
+    return this.#kinds[kind];
   }
 
   get unmuteRequested(): boolean {
     return this.#unmuteRequested;
   }
 
-  /** Whether MC reports this participant server-muted in EITHER kind. */
   get serverMutedAny(): boolean {
-    return this.#audioServerMuted || this.#videoServerMuted;
-  }
-
-  /** Change-only writes from one `ParticipantMuteUpdate`. */
-  setServerMute(audio: boolean, video: boolean, by: string | undefined): void {
-    if (this.#audioServerMuted !== audio) this.#audioServerMuted = audio;
-    if (this.#videoServerMuted !== video) this.#videoServerMuted = video;
-    const nextBy = audio || video ? by : undefined;
-    if (this.#serverMutedBy !== nextBy) this.#serverMutedBy = nextBy;
+    return Object.values(this.#kinds).some((k) => k.serverMuted);
   }
 
   /**
-   * THE one client-mute write, for every carrier (roster seed and
-   * `ParticipantMuteUpdate`). `undefined` for a kind = absent on the wire = no
-   * change: absence never clears a known fact. Change-only. Never touches
-   * server mute.
+   * THE one write, for every carrier (roster seed and `ParticipantMuteUpdate`):
+   * every kind, from a FULL snapshot (the SDK refuses anything else, so there
+   * is no absent kind to skip). Change-only per cell.
    */
-  setClientMute(audio: boolean | undefined, video: boolean | undefined): void {
-    if (audio !== undefined && this.#audioClientMuted !== audio) this.#audioClientMuted = audio;
-    if (video !== undefined && this.#videoClientMuted !== video) this.#videoClientMuted = video;
-  }
-
-  /** Forget the client-mute facts (the participant left): back to no fact. */
-  clearClientMute(): void {
-    if (this.#audioClientMuted !== undefined) this.#audioClientMuted = undefined;
-    if (this.#videoClientMuted !== undefined) this.#videoClientMuted = undefined;
+  apply(states: ParticipantMediaStates): void {
+    for (const kind of MEDIA_KIND_TOKENS) this.#kinds[kind].set(states[kind]);
   }
 
   setUnmuteRequested(requested: boolean): void {
@@ -270,13 +286,17 @@ export class CellRegistry<K, C extends V, V> {
 /** The view of a slot MC has never named and the SDK has never rendered. */
 export const EMPTY_SLOT: SlotView = Object.freeze({ assignment: undefined, render: undefined });
 
-/** The view of a participant MC has never reported server-muted. */
-export const EMPTY_PARTICIPANT: ParticipantMediaView = Object.freeze({
-  audioServerMuted: false,
-  videoServerMuted: false,
+/** One kind of a participant MC has sent no state for. */
+const EMPTY_KIND: KindMediaView = Object.freeze({
+  clientState: undefined,
+  serverMuted: false,
   serverMutedBy: undefined,
-  audioClientMuted: undefined,
-  videoClientMuted: undefined,
+});
+
+/** The view of a participant MC has sent no state for (see {@link KindMediaView.clientState}). */
+export const EMPTY_PARTICIPANT: ParticipantMediaView = Object.freeze({
+  kind: () => EMPTY_KIND,
+  serverMutedAny: false,
   unmuteRequested: false,
 });
 

@@ -433,9 +433,9 @@ The camera-light checks below read `self-camera-state` and the bus `sendTracks.c
       `ev.filter(e => e.type === 'slotAssignments').at(-1).assignments`, no entry's `senderId` is
       E's (E's own `joined` event gives it), and E has no tile at A.
   - [ ] **Before any toggle**, A's roster row for E reads **"mic: on"** and **"camera: on"**
-        (`participant-<E>` has `data-client-muted="false"` and `data-client-muted-video="false"`).
-        **Never "mic: unknown" / "camera: unknown"**, which was the 2026-10-24 defect. At most a
-        brief "unknown" right as E appears.
+        (`participant-<E>` has `data-client-state="live"` and `data-client-state-video="live"`)
+        **from the moment the row appears**. "unknown" no longer exists as a state (2026-10-25);
+        seeing it anywhere is a failure.
   - [ ] E clicks **Mute**: A's row for E reads "mic: muted by them". E unmutes: "mic: on".
   - [ ] E clicks **Turn camera off**: A's row for E reads "camera: off by them". E turns it back on:
         "camera: on".
@@ -444,9 +444,27 @@ The camera-light checks below read `self-camera-state` and the bus `sendTracks.c
         or a leaver's) joins: F's row for E reads "camera: off by them" at once, from the join
         roster.
   - [ ] **Server mute still wins where it decides what is seen.** A server-mutes E's microphone:
-        A's row for E shows "mic: muted by host" **beside** E's own "mic: on" (both facts, not
-        "unknown"). Lift it again.
-  - [ ] E (and F) leave before Phase 5, which uses the four-member cohort.
+        A's row for E shows "mic: muted by host" **beside** E's own "mic: on" (both states,
+        independent). Lift it again.
+  - [ ] E (and F) leave before 4j.
+- [ ] **4j "Not publishing", never "unknown" (2026-10-25, every per-kind fact keyed by kind).**
+      **G joins audio-only** (Join view: microphone only; a fifth profile, or a leaver's), while A
+      (host), B, C and D are in the meeting. **No one toggles anything.**
+  - [ ] At once, every other participant's row for G reads **"mic: on"** and **"camera: not
+        publishing"** (`data-client-state-video="not_published"`), from G's join alone. There is no
+        "camera: on" and no blank or "unknown" moment first.
+  - [ ] At A (host), G's row has **no** "Turn camera off for everyone" control
+        (`server-mute-video-<G>` is absent); the microphone control is there.
+  - [ ] G clicks **Mute**: every row for G reads "mic: muted by them"; the camera still reads "camera:
+        not publishing". G unmutes: "mic: on".
+  - [ ] In browser devtools on A, `document.body.innerText.includes('unknown')` is `false` (the
+        camera-failure reason text aside, which only appears for a failed camera).
+  - [ ] mc-media's mute-refusal panel (`mc_media_mute_requests_rejected_total`) shows
+        `reason="not_published"` flat at zero for both `client_mute` and `server_mute`: a stock
+        client never names an unpublished kind. No browser console shows a
+        `[dt-signaling-contract]` WARN (MC sent a malformed per-kind snapshot; the session would
+        have ended).
+  - [ ] G leaves before Phase 5, which uses the four-member cohort.
 - [ ] **A request about one kind never changes the other.** Across 4a–4f, the other kind's
       indicator and media never moved. Note any exception.
 - [ ] mc-media *Client Mute Requests by Kind and Outcome*, *Server Mute Requests by Kind*, *Unmute
@@ -458,11 +476,12 @@ Automated equivalents:
 
 - Client mute: `packages/web-app/e2e/client-mute-video.spec.ts`, "video mute ends the camera and
   shows avatar_client_muted; audio mute keeps the mic open and video flowing".
-- Client mute outside the observer's slots (4i): `packages/web-app/e2e/client-mute-roster.spec.ts`,
-  "the observer sees every client-mute fact from the roster, never from slots"; derivation
-  `packages/web-app/src/__tests__/participantState.test.ts` ("NO slot fallback …"); presence on
-  the wire `packages/sdk-core/src/signaling/__tests__/mediaSignaling.test.ts` ("client mute of
-  others from the wire, presence preserved").
+- Client state outside the observer's slots, and "not publishing" (4i, 4j):
+  `packages/web-app/e2e/client-mute-roster.spec.ts`, "the observer sees every client state from
+  the roster, never from slots, never unknown" (its late joiner is audio-only); derivation
+  `packages/web-app/src/__tests__/participantState.test.ts` ("NO slot fallback …"); no host
+  control for an unpublished kind `packages/web-app/src/__tests__/joinMeeting.test.ts`; the wire
+  contract (missing / malformed / unknown kind) `packages/sdk-core/src/signaling/__tests__/mediaKindStates.test.ts`.
 - Server mute and the notice: `packages/web-app/e2e/server-mute-video.spec.ts`, "server video mute
   ends the camera everywhere; unmute resumes with a non-suppressible notice; client mute composes".
   It covers 4d–4f, including Escape, click-outside and a re-render.

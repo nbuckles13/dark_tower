@@ -34,7 +34,7 @@ import {
 } from './fixtures.js';
 import type { InstanceCounters } from './instanceCounters.js';
 import type { JoinedMember, Member } from './cohortContexts.js';
-import type { JoinedBusEvent, MuteKind, ROSTER_CLIENT_MUTE_ATTRIBUTE } from './fixtures.js';
+import type { JoinedBusEvent, MuteKind, ROSTER_CLIENT_STATE_ATTRIBUTE } from './fixtures.js';
 
 /** What the video helpers need of a member: its label and page. */
 export type PageMember = Pick<Member, 'label' | 'page'>;
@@ -322,7 +322,7 @@ export async function waitForRosterToken(
   receiver: PageMember,
   subject: BoundMember,
   attribute:
-    'data-reachability' | 'data-server-muted' | (typeof ROSTER_CLIENT_MUTE_ATTRIBUTE)[MuteKind],
+    'data-reachability' | 'data-server-muted' | (typeof ROSTER_CLIENT_STATE_ATTRIBUTE)[MuteKind],
   value: string,
   timeoutMs = 20_000,
 ): Promise<void> {

@@ -665,15 +665,10 @@ async fn test_publish_mixes_render_per_kind_and_refusals_are_twinned() {
                 .receiving(&s_audio, &s_video),
         )
         .await;
-    let cap = s
-        .join
-        .max_video_receive_slots
-        .expect("MC sends the video cap");
+    let cap =
+        mc_session::slot_cap(&s.join, MediaKind::VideoCamera).expect("MC sends the video cap");
     assert!(
-        s.join
-            .max_audio_receive_slots
-            .expect("MC sends the audio cap")
-            >= 3
+        mc_session::slot_cap(&s.join, MediaKind::Audio).expect("MC sends the audio cap") >= 3
             && cap >= 4,
         "{PHASE}: PRECONDITION — the scenario declares 3 audio + 4 video slots within the caps"
     );
@@ -868,7 +863,7 @@ async fn test_video_over_subscription_truncates_to_unavailable() {
         )
         .await;
     assert_eq!(
-        s.join.max_video_receive_slots,
+        mc_session::slot_cap(&s.join, MediaKind::VideoCamera),
         Some(u32::try_from(cap).unwrap()),
         "{PHASE}: the JoinResponse video cap is the configured one"
     );

@@ -14,7 +14,7 @@ import {
   type ConfigValueSource,
   type ReceiveSlotsSource,
 } from '../config/clientConfig.js';
-import type { PublishKind, ReceiveSlotDeclaration } from '../signaling/events.js';
+import type { PublishKind, ReceiveSlotCaps, ReceiveSlotDeclaration } from '../signaling/events.js';
 import type { ReceiveSlotsDiagnostics, MeetingSessionOptions } from './events.js';
 import {
   classifySlotCap,
@@ -35,9 +35,8 @@ export class SlotPlan {
   readonly mediaConfigSource: ConfigValueSource;
   readonly #audioSource: ReceiveSlotsSource;
   readonly #videoSource: ReceiveSlotsSource;
-  /** `JoinResponse.max_{audio,video}_receive_slots`, verbatim (`undefined` = absent). */
-  #audioCap: number | undefined;
-  #videoCap: number | undefined;
+  /** `JoinResponse.receive_slot_caps`, verbatim (`undefined` = not joined yet). */
+  #caps: ReceiveSlotCaps | undefined;
 
   /**
    * Resolve from session options. THROWS typed, before anything is used: an
@@ -68,18 +67,15 @@ export class SlotPlan {
    * Record the caps THIS session's join reported, and log one bounded line:
    * numbers and fixed tokens only, never the join response or options.
    */
-  joined(audioCap: number | undefined, videoCap: number | undefined): void {
-    this.#audioCap = audioCap;
-    this.#videoCap = videoCap;
-    const cap = (value: number | undefined): string =>
-      value === undefined ? 'unknown' : String(value);
+  joined(caps: ReceiveSlotCaps): void {
+    this.#caps = caps;
     const { audioSlots, videoSlots } = this.mediaConfig.receive;
     console.info(
       '[dt-media-slots]',
       `publishing [${this.publish.join(',')}]; declared N=${audioSlots} audio ` +
         `(${this.#audioSource}), M=${videoSlots} video (${this.#videoSource}); ` +
-        `server caps audio ${cap(audioCap)}, video ${cap(videoCap)}` +
-        (videoCap === 0 ? ' (video disabled)' : ''),
+        `server caps audio ${caps.audio}, video ${caps.video}` +
+        (caps.video === 0 ? ' (video disabled)' : ''),
     );
   }
 
@@ -92,13 +88,13 @@ export class SlotPlan {
         declared: audioSlots,
         slotIds: declaredSlotIds(this.declaration, 'audio'),
         source: this.#audioSource,
-        serverCap: classifySlotCap(this.#audioCap),
+        serverCap: classifySlotCap(this.#caps?.audio),
       },
       video: {
         declared: videoSlots,
         slotIds: declaredSlotIds(this.declaration, 'video'),
         source: this.#videoSource,
-        serverCap: classifySlotCap(this.#videoCap),
+        serverCap: classifySlotCap(this.#caps?.video),
       },
     };
   }

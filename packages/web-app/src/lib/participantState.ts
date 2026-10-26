@@ -8,26 +8,26 @@
 // reported) and the stores hold verbatim, never from frames arriving or not:
 //
 //   * reachability  <- `StreamAssignments.unreachable_sender_ids` (per subscriber);
-//   * server mute   <- `ParticipantMuteUpdate`, PER KIND (who, and who muted them);
-//   * client mute   <- the participant's ROSTER mute facts, PER KIND: their roster
-//                      entry's `*_client_muted`, moved by every later
-//                      `ParticipantMuteUpdate` (the store's participant cell,
-//                      sdk-core `ClientMuteFacts`). NEVER from slots.
+//   * per-kind state <- the participant's ROSTER entry `media_states`, moved by
+//                       every later `ParticipantMuteUpdate` (the store's
+//                       participant cell, one `KindMediaView` per kind): their
+//                       own client state, and the server mute (and who applied
+//                       it). NEVER from slots.
 //
 // FOUR INDICATORS PER PARTICIPANT (story 3 R-15): client audio, client video,
-// server audio, server video. CLIENT MUTE IS TRI-STATE per kind, deliberately:
-// `unknown` is "no fact has arrived yet" (MC has not heard from the participant,
-// or an MC that predates the fields), and `false` there would assert "not
-// muted" from absence. Once a fact arrives it is shown whatever this client's
-// slots carry — a participant no slot of ours shows still has a known client
-// mute — and whatever their server mute: the server indicators say what the
-// host did, the client ones what the participant did, and a server mute still
-// wins where it decides what is SEEN (the slot reads `avatar_server_muted`,
-// `slotState.ts`). History: until 2026-10-24 self-mute did not fan out (story
-// 2's S-2), so client mute was read from a slot's `avatar_client_muted` and was
-// `unknown` for anyone outside our slots or server-muted; the ADR-0036 §5
-// amendment of 2026-10-24 reversed that — client mute per kind is visible to
-// everyone in the meeting.
+// server audio, server video. THE CLIENT STATE per kind is MC's
+// `ClientMediaState`: `not_published` (they joined without that kind),
+// `live`, or `client_muted`. There is NO "unknown" (ADR-0036 §5 amendment
+// 2026-10-25): every roster entry carries every kind, and a snapshot that does
+// not is a contract fault the SDK ends the session on. The client state is
+// shown whatever this client's slots carry — a participant no slot of ours
+// shows still has a known state — and whatever their server mute: the server
+// indicators say what the host did, the client ones what the participant did,
+// and a server mute still wins where it decides what is SEEN (the slot reads
+// `avatar_server_muted`, `slotState.ts`). History: until 2026-10-24 client mute
+// was read from slots and was "unknown" outside them; until 2026-10-25 it was
+// "unknown" until the participant's post-join report, and for any kind they did
+// not publish.
 //
 // NAMES ARE BOUNDED AND TEXT ONLY. Every rendered name — the roster's, and the
 // server-muted-by name (the only "reason" a muted participant sees: the proto's
@@ -36,34 +36,33 @@
 // never markup. An id the roster does not know renders as a bounded placeholder,
 // never as the raw wire string (@security M4).
 
-import { MAX_DISPLAY_NAME_LENGTH } from '@darktower/sdk-core';
+import { MAX_DISPLAY_NAME_LENGTH, MEDIA_KIND_TOKENS, perMediaKind } from '@darktower/sdk-core';
 import type {
-  ClientMuteFacts,
+  ClientMediaStateToken,
   MediaCaptureFailureOutcome,
   PublishKind,
   RosterParticipant,
 } from '@darktower/sdk-core';
-import type { MediaStore } from '@darktower/sdk-svelte';
+import type { KindMediaView, MediaStore } from '@darktower/sdk-svelte';
 
 /** A roster row's reachability token: the wire's `source_unreachable`, or reachable. */
 export type ReachabilityToken = 'source_unreachable' | 'reachable';
 
-/** Client mute of another participant, as far as the wire can say. */
-export type ClientMuteToken = 'true' | 'false' | 'unknown';
+/**
+ * Another participant's own state for one kind — the SDK's closed
+ * `ClientMediaStateToken`, rendered verbatim (DOM `data-client-state*`).
+ */
+export type ClientStateToken = ClientMediaStateToken;
 
 /** The two kinds a participant has indicators for: the SDK's media-kind vocabulary. */
 export type IndicatorKind = PublishKind;
 
 /**
- * Every media kind, in the order the UI lists them — DERIVED from an
- * exhaustive `Record` over the SDK's kind union, so a new kind fails to compile
- * here rather than silently missing from the indicators, host controls and
- * resume notices that iterate this.
+ * Every media kind, in the order the UI lists them: the SDK's ONE derived list
+ * (`MEDIA_KIND_TOKENS`), so a new kind reaches the indicators, host controls
+ * and resume notices that iterate this without an edit here.
  */
-const KIND_ORDER: Readonly<Record<PublishKind, number>> = { audio: 0, video: 1 };
-export const MEDIA_KINDS: readonly PublishKind[] = (Object.keys(KIND_ORDER) as PublishKind[]).sort(
-  (a, b) => KIND_ORDER[a] - KIND_ORDER[b],
-);
+export const MEDIA_KINDS: readonly PublishKind[] = MEDIA_KIND_TOKENS;
 
 /** Every user-facing string about mute and identity. Tests assert tokens, never these. */
 export const PARTICIPANT_TEXT = {
@@ -87,22 +86,29 @@ export const PARTICIPANT_TEXT = {
 } as const;
 
 /**
- * The four indicators' text, by kind and cause, per tri-state value. One home:
- * a tile and a row render the same participant with the same words.
+ * The four indicators' text, by kind and cause, per state. One home: a tile
+ * and a row render the same participant with the same words. The client table
+ * is exhaustive over the SDK's `ClientMediaStateToken` (a new state fails to
+ * compile here).
  */
 export const INDICATOR_TEXT = {
   client: {
-    audio: { true: 'mic: muted by them', false: 'mic: on', unknown: 'mic: unknown' },
-    video: { true: 'camera: off by them', false: 'camera: on', unknown: 'camera: unknown' },
-  },
+    audio: {
+      not_published: 'mic: not publishing',
+      live: 'mic: on',
+      client_muted: 'mic: muted by them',
+    },
+    video: {
+      not_published: 'camera: not publishing',
+      live: 'camera: on',
+      client_muted: 'camera: off by them',
+    },
+  } satisfies Record<IndicatorKind, Readonly<Record<ClientStateToken, string>>>,
   server: {
     audio: { true: 'mic: muted by host', false: 'mic: not host-muted' },
     video: { true: 'camera: off by host', false: 'camera: not host-blocked' },
-  },
-} as const satisfies Record<
-  'client' | 'server',
-  Record<IndicatorKind, Readonly<Record<string, string>>>
->;
+  } satisfies Record<IndicatorKind, Readonly<Record<'true' | 'false', string>>>,
+} as const;
 
 /** "… turned off for everyone by <name>" — the one spelling of the server-mute indicator. */
 export function serverMutedByText(name: string, kind: IndicatorKind): string {
@@ -154,47 +160,45 @@ export function participantIdForSenderId(
   return participantForSenderId(senderId, ctx)?.participantId;
 }
 
-/** One participant's server mute, as the store's participant cell reports it. */
-export interface ServerMuteFacts {
-  readonly audioServerMuted: boolean;
-  readonly videoServerMuted: boolean;
-  readonly serverMutedBy: string | undefined;
-}
-
 /** The media facts one participant's indicators read (that participant's cells, passed in). */
 export interface MediaFacts {
   readonly unreachableSenderIds: readonly number[];
-  readonly serverMute: ServerMuteFacts;
-  /** Their client mute per kind; `undefined` = no fact yet (`unknown`). */
-  readonly clientMute: ClientMuteFacts;
+  /** Their per-kind cells (client state, server mute, who applied it). */
+  readonly kind: (kind: IndicatorKind) => KindMediaView;
 }
 
 /** Everything a row or tile renders about one other participant's mute state. */
 export interface ParticipantIndicators {
   readonly reachability: ReachabilityToken;
-  readonly clientMuted: Readonly<Record<IndicatorKind, ClientMuteToken>>;
+  readonly clientState: Readonly<Record<IndicatorKind, ClientStateToken>>;
   readonly serverMuted: Readonly<Record<IndicatorKind, boolean>>;
-  /** Resolved (bounded) name of whoever applied a server mute; only while server-muted. */
-  readonly serverMutedByName: string | undefined;
-}
-
-function clientMuteToken(fact: boolean | undefined): ClientMuteToken {
-  if (fact === undefined) return 'unknown';
-  return fact ? 'true' : 'false';
+  /** Resolved (bounded) name of whoever applied each kind's server mute; only while muted. */
+  readonly serverMutedByName: Readonly<Record<IndicatorKind, string | undefined>>;
 }
 
 /**
- * Read ONE participant's media facts from the store's CELLS — their mute cell
- * (all four facts) and the meeting's unreachable set — so a `$derived` over it
- * tracks only that participant (story 3 granularity). No slot is read: what a
- * slot shows is `slotState.ts`'s business, never a mute fact.
+ * A listed participant's client state. Its cell is seeded from its roster
+ * entry BEFORE the roster lists it (`MeetingStore`), so `undefined` here is a
+ * wiring bug, never a display state — failed loudly, never rendered as a guess.
+ */
+function clientStateOf(view: KindMediaView, kind: IndicatorKind): ClientStateToken {
+  if (view.clientState === undefined) {
+    throw new Error(`a listed participant has no ${kind} state: its media cell was never seeded`);
+  }
+  return view.clientState;
+}
+
+/**
+ * Read ONE participant's media facts from the store's CELLS — their per-kind
+ * cells and the meeting's unreachable set — so a `$derived` over it tracks only
+ * that participant (story 3 granularity). No slot is read: what a slot shows is
+ * `slotState.ts`'s business, never a mute fact.
  */
 export function mediaFactsFor(media: MediaStore, participant: RosterParticipant): MediaFacts {
   const cell = media.participant(participant.participantId);
   return {
     unreachableSenderIds: media.unreachableSenderIds,
-    serverMute: cell,
-    clientMute: cell,
+    kind: (kind) => cell.kind(kind),
   };
 }
 
@@ -209,16 +213,14 @@ export function participantIndicators(
     senderId !== undefined && media.unreachableSenderIds.includes(senderId)
       ? 'source_unreachable'
       : 'reachable';
-  const { audioServerMuted, videoServerMuted, serverMutedBy } = media.serverMute;
   return {
     reachability,
-    clientMuted: {
-      audio: clientMuteToken(media.clientMute.audioClientMuted),
-      video: clientMuteToken(media.clientMute.videoClientMuted),
-    },
-    serverMuted: { audio: audioServerMuted, video: videoServerMuted },
-    serverMutedByName:
-      audioServerMuted || videoServerMuted ? nameForParticipantId(serverMutedBy, ctx) : undefined,
+    clientState: perMediaKind((k) => clientStateOf(media.kind(k), k)),
+    serverMuted: perMediaKind((k) => media.kind(k).serverMuted),
+    serverMutedByName: perMediaKind((k) => {
+      const view = media.kind(k);
+      return view.serverMuted ? nameForParticipantId(view.serverMutedBy, ctx) : undefined;
+    }),
   };
 }
 

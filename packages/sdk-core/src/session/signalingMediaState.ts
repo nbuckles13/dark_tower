@@ -8,20 +8,24 @@
 //     `startMedia()` builds the pipeline; the cached values are replayed ONCE
 //     when the pipeline's listeners are attached (listeners installed first),
 //     and later ones go straight through — no double-apply, no race.
-//   * Server mute per participant, BOTH kinds, from `ParticipantMuteUpdate` —
-//     the unchanged kind a host's per-kind request carries. Absent =
-//     server-unmuted in both kinds: MC replays an update for every participant
-//     server-muted in EITHER kind right after the join response
-//     (`crates/mc-service/src/actors/meeting.rs::server_mute_replay`).
+//   * Server mute per participant, BOTH kinds: seeded from each roster entry's
+//     `media_states` (`joined`'s existing participants, `participantJoined`)
+//     and moved by every `ParticipantMuteUpdate` — one snapshot carrier, then
+//     deltas (CONVENTIONS §6; the post-join replay is gone). Absent = a
+//     participant not on the roster: server-unmuted. THIS participant's own
+//     entry is never on its roster; a fresh join starts server-unmuted, and
+//     its own server mute arrives only on its own `ParticipantMuteUpdate`.
 //   * The R-18 tracker, fed THIS participant's own mute updates from creation
 //     and the effective per-kind send state from the directive listener.
 //   * Client mute, both kinds — ONE `MuteState` shared by the pipeline and the
 //     mute report.
 
 import { MuteState, type MuteSnapshot } from '../media/lifecycle/muteState.js';
+import { MEDIA_KIND_TOKENS, perMediaKind } from '../media/mediaKind.js';
 import type { SignalingClient } from '../signaling/SignalingClient.js';
 import type {
   PublishKind,
+  RosterParticipant,
   SendDirectiveEvent,
   StreamAssignmentsEvent,
 } from '../signaling/events.js';
@@ -41,7 +45,7 @@ export class SignalingMediaState {
   readonly #resume: ServerMuteResumeTracker;
   /** This participant's own id, from the `JoinResponse`; selects the SELF mute update. */
   #selfParticipantId: string | undefined;
-  readonly #serverMute = new Map<string, { audio: boolean; video: boolean }>();
+  readonly #serverMute = new Map<string, Readonly<Record<PublishKind, boolean>>>();
   #latestDirective: SendDirectiveEvent | undefined;
   #latestAssignments: StreamAssignmentsEvent | undefined;
   #listeners: MediaStateListeners | undefined;
@@ -61,11 +65,13 @@ export class SignalingMediaState {
    */
   observe(signaling: SignalingClient): void {
     this.#signaling = signaling;
-    // `joined` is emitted before `join()` resolves, so the SELF mute replay that
-    // follows the join response is recognised.
+    // `joined` is emitted before `join()` resolves, so a SELF mute update that
+    // follows the join response is recognised, and the roster seeds server mute.
     signaling.on('joined', (e) => {
       this.#selfParticipantId = e.participantId;
+      for (const p of e.existingParticipants) this.#seedServerMute(p);
     });
+    signaling.on('participantJoined', (e) => this.#seedServerMute(e.participant));
     signaling.on('participantLeft', (e) => this.#serverMute.delete(e.participantId));
     signaling.on('streamAssignments', (e) => {
       this.#latestAssignments = e;
@@ -77,19 +83,21 @@ export class SignalingMediaState {
     });
     signaling.on('participantMuteChanged', (e) => {
       const wasVideoMuted = this.#serverMute.get(e.participantId)?.video ?? false;
-      this.#serverMute.set(e.participantId, {
-        audio: e.audioServerMuted,
-        video: e.videoServerMuted,
-      });
+      this.#seedServerMute(e);
       // R-18: only THIS participant's own update feeds the tracker; another
       // participant's never touches the self latch.
       if (e.participantId === this.#selfParticipantId) {
-        this.#resume.apply({ type: 'selfServerMute', kind: 'audio', muted: e.audioServerMuted });
-        this.#resume.apply({ type: 'selfServerMute', kind: 'video', muted: e.videoServerMuted });
+        for (const kind of MEDIA_KIND_TOKENS) {
+          this.#resume.apply({
+            type: 'selfServerMute',
+            kind,
+            muted: e.mediaStates[kind].serverMuted,
+          });
+        }
       }
       // The video server-mute -> unmute EDGE (story 3 C-B, observability O2):
       // the video receiver re-requests a frame it dropped as muted at arrival.
-      if (wasVideoMuted && !e.videoServerMuted) {
+      if (wasVideoMuted && !e.mediaStates.video.serverMuted) {
         const senderId = signaling.senderIdOf(e.participantId);
         if (senderId !== undefined) this.#onVideoServerMuteLifted?.(senderId);
       }
@@ -104,6 +112,24 @@ export class SignalingMediaState {
     this.#listeners = listeners;
     if (this.#latestAssignments) listeners.onAssignments(this.#latestAssignments);
     if (this.#latestDirective) listeners.onDirective(this.#latestDirective);
+  }
+
+  /** Record one participant's per-kind server mute from a roster entry or an update. */
+  #seedServerMute(p: Pick<RosterParticipant, 'participantId' | 'mediaStates'>): void {
+    this.#serverMute.set(
+      p.participantId,
+      perMediaKind((kind) => p.mediaStates[kind].serverMuted),
+    );
+  }
+
+  /** The kinds THIS participant's own latest update says are server-muted (R-10). */
+  selfServerMutedKinds(): PublishKind[] {
+    const self =
+      this.#selfParticipantId === undefined
+        ? undefined
+        : this.#serverMute.get(this.#selfParticipantId);
+    if (self === undefined) return [];
+    return MEDIA_KIND_TOKENS.filter((kind) => self[kind]);
   }
 
   /** Set `kind`'s client mute; the new both-kinds snapshot on a real change, else `undefined`. */
@@ -136,8 +162,8 @@ export class SignalingMediaState {
    * A VERIFIED video sender's server-mute state per the latest
    * `ParticipantMuteUpdate`, through the roster's ONE participant <-> sender
    * index. `unmapped` when no roster participant maps to the sender — never
-   * rendered (security S2). Absent update = unmuted (MC replays every muted
-   * participant right after the join response).
+   * rendered (security S2). A participant's state is seeded from its roster
+   * entry and moved by every update.
    */
   videoMuteState(senderId: number): 'muted' | 'unmuted' | 'unmapped' {
     const participantId = this.#signaling?.participantIdOf(senderId);

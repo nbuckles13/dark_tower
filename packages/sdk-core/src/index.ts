@@ -147,8 +147,12 @@ export type {
   MhConnectionStatusReport,
   ParticipantJoinedEvent,
   ParticipantLeftEvent,
-  ClientMuteFacts,
+  ClientMediaStateToken,
+  KindMediaState,
+  ParticipantMediaStates,
   ParticipantMuteEvent,
+  PublishedKindDeclaration,
+  ReceiveSlotCaps,
   RosterParticipant,
   SignalingCapabilities,
   UnmuteRequestedEvent,
@@ -490,6 +494,9 @@ export type {
   ReceiveVerificationRecorder,
   ReceiveVerificationSnapshot,
 } from './media/pipeline/receiveVerification.js';
+// The canonical runtime list of media kinds (derived from an exhaustive Record
+// over the kind union): iterate it instead of hand-pairing audio / video.
+export { MEDIA_KIND_TOKENS, perMediaKind } from './media/mediaKind.js';
 export type {
   PublishKind,
   ReceiveSlotDeclaration,

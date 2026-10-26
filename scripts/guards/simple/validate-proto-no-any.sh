@@ -68,6 +68,7 @@ trap 'rm -rf "$work"' EXIT
 
 # Same normalisation as validate-internal-proto-no-key-material.sh: join lines, collapse
 # whitespace (and around `.`), break at `;` `{` `}`. Runs AFTER the `//` strip.
+# Duplicated by crates/dt-guard/src/common/proto_lex.rs; port tracked in docs/TODO.md §Polyglot Pipeline Follow-ups.
 normalise() {
   tr '\n' ' ' < "$1" \
     | sed -E 's/[[:space:]]*\.[[:space:]]*/./g; s/[[:space:]]+/ /g' \

@@ -1057,8 +1057,8 @@ pub fn record_policy_generation_adoption(outcome: FloorAdoption) {
 /// Story 3 MC-A: one cap per kind (`MC_MAX_AUDIO_RECEIVE_SLOTS`,
 /// `MC_MAX_VIDEO_RECEIVE_SLOTS`), each published from
 /// `ClientMediaConfig::receive_slot_caps` — the SAME values MC truncates every
-/// declaration to and advertises as `JoinResponse.max_audio_receive_slots` /
-/// `max_video_receive_slots` — so the published, enforced and advertised caps
+/// declaration to and advertises as `JoinResponse.receive_slot_caps` (one
+/// entry per kind) — so the published, enforced and advertised caps
 /// cannot drift. `media_kind="video"` reading **0** is a real sample, and it is
 /// how an operator confirms the R-26 video-off lever applied
 /// (`docs/runbooks/mc-deployment.md` §Video-off lever).
@@ -1142,8 +1142,9 @@ pub fn set_video_keyframe_min_interval(min_keyframe_interval_ms: u32) {
 /// SDK names only the kind it changed, so rates roughly HALVED at MC-B against
 /// the interim both-kinds count -- a counting-unit change, not a traffic
 /// change). A request naming NO kind is not counted here: it is rejected and
-/// counted on `mc_media_mute_requests_rejected_total{surface="client_mute"}`.
-/// Request-level outcomes (`unchanged` on an identical repeat, `rate_limited`,
+/// counted on `mc_media_mute_requests_rejected_total{surface="client_mute"}`,
+/// as is (since 2026-10-25) a request naming an unpublished kind -- refused
+/// WHOLE, so it applied no kind. Request-level outcomes (`unchanged` on an identical repeat, `rate_limited`,
 /// `actor_unavailable`) count once per named kind; `applied`/`unchanged`
 /// otherwise come from the meeting actor's per-kind decision. The named kinds
 /// are `MuteChange::named` (`media_kind.rs`).
@@ -1272,25 +1273,31 @@ pub fn record_unmute_request(outcome: UnmuteRequestOutcome) {
     .increment(1);
 }
 
-/// Record a mute request rejected before any kind could be counted (story 3
-/// MC-B): today only a request naming NO kind (both per-kind fields absent).
+/// Record a mute-family request refused WHOLE for its kind list (story 3
+/// MC-B; extended 2026-10-25): the list is empty, malformed, or names a kind
+/// the subject does not publish (screen included).
 ///
 /// Metric: `mc_media_mute_requests_rejected_total`
-/// Labels: `surface` (`MuteSurface::ALL`: `client_mute`, `server_mute`),
-/// `reason` (`MuteRejection::ALL`), `key_custody`
-/// Cardinality: 2, zero-initialised
+/// Labels: `surface` (`MuteSurface::ALL`: `client_mute`, `server_mute`,
+/// `unmute_request`), `reason` (`MuteRejection::ALL`: `no_kind_named`,
+/// `media_kind_unspecified`, `duplicate_kind`, `not_published`), `key_custody`
+/// Cardinality: 3 x 4 = 12, zero-initialised, every cell reachable from a
+/// modified client
 ///
-/// KIND-FREE ON PURPOSE: the request names no kind, so it cannot land on the
-/// per-kind mute counters without inventing one (`docs/observability/label-taxonomy.md`
-/// "Kind-free on purpose"). One increment per rejected request. On the
-/// server-mute surface it counts EVERY requester, host or not (authority is
-/// still checked first and a non-host gets the same generic refusal), so
-/// `mc_media_server_mute_requests_total{outcome="not_permitted"}` undercounts
-/// non-hosts by exactly these requests.
+/// KIND-FREE ON PURPOSE: a refused request applied no kind, so it cannot land
+/// on the per-kind mute counters without inventing one (`docs/observability/label-taxonomy.md`
+/// "Kind-free on purpose"). One increment per refused request. On the
+/// server-mute surface the SHAPE reasons count EVERY requester, host or not
+/// (authority is still checked first and a non-host gets the same generic
+/// refusal), so `mc_media_server_mute_requests_total{outcome="not_permitted"}`
+/// undercounts non-hosts by exactly those requests; server-mute
+/// `not_published` is decided by the actor for a host only.
 ///
-/// CLIENT-INFLATABLE: a shape check before any rate-limit token or actor hop,
-/// so one connection drives it at line rate. Never a ratio denominator; no
-/// alert. Zero is healthy; an ABSENT series is a pipeline fault.
+/// CLIENT-INFLATABLE: one connection drives it at line rate. Never a ratio
+/// denominator; no alert. EXPECTED EMPTY for the stock client (it names only
+/// kinds it publishes, and only server-muted ones on unmute; web-app offers no
+/// host control for a NOT_PUBLISHED kind). An ABSENT series is a pipeline
+/// fault.
 pub fn record_mute_request_rejected(surface: MuteSurface, reason: MuteRejection) {
     counter!(
         "mc_media_mute_requests_rejected_total",
@@ -2122,7 +2129,7 @@ const TOKEN_ERROR_CATEGORIES: &[&str] = &[
 /// value is NOT evidence that failure mode is reachable on the join path; it is
 /// the visibility ("0 jwt_validation failures") this fix exists to create. Emit
 /// site: `connection.rs` via `e.error_type_label()`, a wildcard-free mapping.
-const JOIN_FAILURE_ERROR_TYPES: &[&str] = &[
+pub const JOIN_FAILURE_ERROR_TYPES: &[&str] = &[
     "jwt_validation",
     "internal",
     "meeting_not_found",

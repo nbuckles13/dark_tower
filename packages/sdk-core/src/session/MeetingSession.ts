@@ -26,7 +26,7 @@ import { transmitRewrapLatencyMs, type MediaConfig } from '../config/clientConfi
 import { SignalingMediaState } from './signalingMediaState.js';
 import { SlotPlan } from './slotPlan.js';
 import type { SlotPair } from '../signaling/pairing.js';
-import type { PublishKind } from '../signaling/events.js';
+import type { PublishedKindDeclaration, PublishKind } from '../signaling/events.js';
 import { AuthApiClient } from '../http/AuthApiClient.js';
 import { bytesToHex } from '../media/frame/hex.js';
 import { MeetingApiClient } from '../http/MeetingApiClient.js';
@@ -201,8 +201,9 @@ function signalingFailureStage(err: unknown): FailureStage {
       case SignalingErrorCode.Timeout:
         return FailureStage.McSignalingConnect;
       // Everything else is a server-authored `ErrorMessage` code (Unauthorized,
-      // Forbidden, NotFound, InternalError, …): the channel opened and the server
-      // REJECTED the join → join-response stage.
+      // Forbidden, NotFound, InternalError, …), or a join response that broke the
+      // kind-keyed contract (`ContractFault`): the channel opened and the
+      // server's answer failed the join → join-response stage.
       default:
         return FailureStage.McJoinResponse;
     }
@@ -237,7 +238,10 @@ function closeReasonForError(err: unknown): CloseReason {
         return CloseReason.AuthFailed;
       case SignalingErrorCode.Timeout:
         return CloseReason.Timeout;
+      // ContractFault: MC sent a message outside the contract and the client
+      // closed. A server error, never `normal`.
       case SignalingErrorCode.InternalError:
+      case SignalingErrorCode.ContractFault:
         return CloseReason.ServerError;
       default:
         // Transport-close-derived errors carry a numeric closeCode; map it.
@@ -332,6 +336,8 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
    * Only this boolean survives `join()`; see `meetingRole.ts`.
    */
   #isHost = false;
+  /** What the join declared per published kind (`#declarePublish`). */
+  #declaredClientMute: readonly PublishedKindDeclaration[] = [];
 
   constructor(options: MeetingSessionOptions) {
     super();
@@ -490,7 +496,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
 
       // --- joined ---
       this.#senderId = joined.senderId;
-      this.#slots.joined(joined.maxAudioReceiveSlots, joined.maxVideoReceiveSlots);
+      this.#slots.joined(joined.receiveSlotCaps);
       // OUR OWN key goes into the roster resolver, and this is NOT a self-trust
       // branch.
       //
@@ -513,7 +519,7 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       // the key for a sender the roster structurally cannot tell us about.
       await this.#seedOwnRosterKey();
       this.#setState(MeetingSessionState.Joined);
-      this.#reportClientMuteAfterJoin(signaling);
+      this.#catchUpClientMuteAfterJoin(signaling);
       this.#emitJoinAttempt('success', FailureStage.None);
       this.emit('joined', joined);
       return joined;
@@ -723,24 +729,36 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   }
 
   /**
-   * Report the current client mute of every PUBLISHED kind to MC once, on
-   * entering `Joined` (story 3 R-15). `JoinRequest` carries no initial mute and
-   * MC holds no client-mute fact for a joiner until it reports one, so without
-   * this a mute set before or during the join (when {@link #clientMuteChanged}
-   * does not send) would never reach MC, and everyone else would read this
-   * participant as UNKNOWN until the next toggle. Explicit per kind, `false`
-   * included: an unmuted kind is a fact too. A kind this participant does not
-   * publish is NOT reported: "camera: on" for a participant with no camera in
-   * the meeting would be a false fact, so it stays unknown to peers. ONE kind
-   * per request (`muteRequest.ts`), on the same ordered stream as every later
-   * toggle, so a later toggle cannot be overtaken by this snapshot.
-   * Best-effort, like every client-mute report.
+   * The publish declaration for the join: every published kind with its client
+   * mute as of NOW (story 3 R-15), so MC holds a definite state for this
+   * participant from the first roster entry peers see — there is no "unknown"
+   * window and no post-join report. Remembered, for
+   * {@link #catchUpClientMuteAfterJoin}.
    */
-  #reportClientMuteAfterJoin(signaling: SignalingClient): void {
-    const { audioMuted, videoMuted } = this.muteState;
+  #declarePublish(): PublishedKindDeclaration[] {
+    const declared = this.#slots.publish.map((kind) => ({
+      kind,
+      clientMuted: this.#mediaState.mute.isMuted(kind),
+    }));
+    this.#declaredClientMute = declared;
+    return declared;
+  }
+
+  /**
+   * The JOIN-WINDOW CATCH-UP, not a re-report: a client-mute toggle between
+   * building the join declaration and entering `Joined` is not sent
+   * ({@link #clientMuteChanged} sends only once joined), so on entering Joined
+   * report each published kind whose mute DIFFERS from what the join declared —
+   * normally none, so normally nothing is sent. A kind toggled and toggled back
+   * matches the declaration and sends nothing (MC already holds that value).
+   * One kind per request, on the same ordered stream as every later toggle.
+   */
+  #catchUpClientMuteAfterJoin(signaling: SignalingClient): void {
     const report = bestEffortMuteReport(signaling, this.#slots.publish);
-    report('audio', audioMuted);
-    report('video', videoMuted);
+    for (const { kind, clientMuted } of this.#declaredClientMute) {
+      const now = this.#mediaState.mute.isMuted(kind);
+      if (now !== clientMuted) report(kind, now);
+    }
   }
 
   #clientMuteChanged(kind: PublishKind, muted: boolean, snapshot: MuteSnapshot | undefined): void {
@@ -804,12 +822,15 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
 
   /**
    * Ask the host to lift THIS participant's server mute (R-10). Only notifies the
-   * host; the server-muted state changes when MC says so, never before.
+   * host; the server-muted state changes when MC says so, never before. Names
+   * exactly the kinds this participant's own copy says are server-muted.
    *
-   * @throws {SignalingError} `Transport` if called before a settled join.
+   * @throws {SignalingError} `Transport` if called before a settled join;
+   *   `InvalidRequest` (nothing sent) when no kind is server-muted.
    */
   async requestUnmute(): Promise<void> {
-    await this.#requireJoinedSignaling('requestUnmute').sendUnmuteRequest();
+    const signaling = this.#requireJoinedSignaling('requestUnmute');
+    await signaling.sendUnmuteRequest(this.#mediaState.selfServerMutedKinds());
   }
 
   #requireJoinedSignaling(what: string): SignalingClient {
@@ -1004,8 +1025,9 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         joinToken: joinResp.token,
         participantName,
         ...(this.#identity?.publicKey ? { identityPublicKey: this.#identity.publicKey } : {}),
-        // The frozen fields, never the options object (story 3 R-2).
-        publishKinds: this.#slots.publish,
+        // The frozen fields, never the options object (story 3 R-2), each
+        // published kind with its client mute NOW (`#declaredClientMute`).
+        publish: this.#declarePublish(),
         receiveSlots: this.#slots.declaration,
         capabilities: { supportedCodecs: this.#vp8?.ok === true ? [SignalingCodec.Vp8] : [] },
       });

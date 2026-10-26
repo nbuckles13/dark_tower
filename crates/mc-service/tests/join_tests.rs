@@ -211,7 +211,10 @@ async fn join_and_read_response(
             // about identity.
             identity_public_key: sample_identity_public_key(),
             // Story 3 R-2: the suite publishes audio (story-2 shape).
-            publish_kinds: vec![proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32],
+            published_kinds: vec![proto_gen::dark_tower::signaling::v1::PublishedKind {
+                media_kind: proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32,
+                client_muted: false,
+            }],
             receive_capability: None,
         })),
     };
@@ -278,7 +281,10 @@ async fn join_keep_open(
             // about identity.
             identity_public_key: sample_identity_public_key(),
             // Story 3 R-2: the suite publishes audio (story-2 shape).
-            publish_kinds: vec![proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32],
+            published_kinds: vec![proto_gen::dark_tower::signaling::v1::PublishedKind {
+                media_kind: proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32,
+                client_muted: false,
+            }],
             receive_capability: None,
         })),
     };
@@ -533,8 +539,10 @@ async fn test_join_wrong_first_message_returns_invalid_request() {
         trace_parent: String::new(),
         trace_state: String::new(),
         message: Some(client_message::Message::MuteRequest(MuteRequest {
-            audio_muted: Some(true),
-            video_muted: Some(false),
+            changes: vec![proto_gen::dark_tower::signaling::v1::MuteChange {
+                media_kind: proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32,
+                muted: true,
+            }],
         })),
     };
 
@@ -897,7 +905,10 @@ async fn test_participant_joined_notification_via_bridge() {
             // about identity.
             identity_public_key: sample_identity_public_key(),
             // Story 3 R-2: the suite publishes audio (story-2 shape).
-            publish_kinds: vec![proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32],
+            published_kinds: vec![proto_gen::dark_tower::signaling::v1::PublishedKind {
+                media_kind: proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32,
+                client_muted: false,
+            }],
             receive_capability: None,
         })),
     };
@@ -962,7 +973,10 @@ async fn test_participant_joined_notification_via_bridge() {
             // about identity.
             identity_public_key: sample_identity_public_key(),
             // Story 3 R-2: the suite publishes audio (story-2 shape).
-            publish_kinds: vec![proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32],
+            published_kinds: vec![proto_gen::dark_tower::signaling::v1::PublishedKind {
+                media_kind: proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32,
+                client_muted: false,
+            }],
             receive_capability: None,
         })),
     };

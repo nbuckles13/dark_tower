@@ -5,7 +5,9 @@
 
 use super::participant::ParticipantActorHandle;
 use crate::errors::McError;
-use crate::media_kind::{ClientMuteFacts, KindDecision, MuteChange};
+use crate::media_kind::{
+    ClientKindState, KindDecision, MediaStates, MuteChange, PublishedMuteChange, RequestedKinds,
+};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -143,10 +145,12 @@ pub enum MeetingMessage {
         connection_id: String,
         correlation_id: String,
         binding_token: String,
-        /// The publish set the reconnecting client PRESENTS. Compared as a SET
-        /// against the roster entry's fixed set before any state changes; a
-        /// mismatch is refused and counted (story 3 R-2), never adopted.
-        publishes: crate::media_kind::PublishSet,
+        /// The publish declaration the reconnecting client PRESENTS. Its kind
+        /// SET is compared against the roster entry's fixed set before any
+        /// state changes; a mismatch is refused and counted (story 3 R-2),
+        /// never adopted. On a match its client-mute values are adopted as a
+        /// client-mute change, through the same merge as a `MuteRequest`.
+        declared: crate::media_kind::ClientMediaStates,
         /// The reconnect's receive declaration, treated as a redeclaration
         /// (`None` keeps the declaration in force).
         demand: Option<crate::media_signaling::SlotDemand>,
@@ -243,14 +247,17 @@ pub enum MeetingMessage {
     },
 
     /// Record a participant's own CLIENT mute, per kind (ADR-0036 §5; story 3
-    /// R-17). Only the kinds the request names move ([`MuteChange`]); the
-    /// participant is the AUTHENTICATED connection's own id.
+    /// R-17). Only the kinds the request names move; the change was proven at
+    /// the connection to name only published kinds ([`PublishedMuteChange`]).
+    /// The participant is the AUTHENTICATED connection's own id.
     UpdateSelfMute {
         participant_id: String,
-        change: MuteChange,
+        change: PublishedMuteChange,
         /// The per-kind decision, or `None` if the participant is no longer on
         /// the roster.
-        respond_to: oneshot::Sender<Option<KindDecision<Option<bool>>>>,
+        respond_to: oneshot::Sender<
+            Option<Result<KindDecision<ClientKindState>, crate::media_kind::NotPublished>>,
+        >,
     },
 
     /// Apply or lift a server mute on a participant by meeting policy
@@ -281,8 +288,8 @@ pub enum MeetingMessage {
     RequestUnmute {
         /// The AUTHENTICATED requester (the connection's own participant id).
         participant_id: String,
-        request_audio: bool,
-        request_video: bool,
+        /// The kinds asked about, parsed and publish-checked at the connection.
+        kinds: RequestedKinds,
         respond_to: oneshot::Sender<UnmuteRelay>,
     },
 
@@ -498,17 +505,6 @@ pub struct JoinResult {
     pub kek_rotation_debounce_seconds: u32,
     /// Handle to the spawned ParticipantActor.
     pub participant_handle: ParticipantActorHandle,
-    /// Who is server-muted RIGHT NOW, as `MuteChanged` values, snapshotted in the
-    /// join's own actor turn (story 2 R-11).
-    ///
-    /// The roster `Participant` message carries no mute state, so without this
-    /// a joiner could not render who-muted-whom until the next mute change. The
-    /// connection writes these through the SAME encoder as a live broadcast,
-    /// immediately after the `JoinResponse`, so replay and live cannot diverge.
-    /// Taken in the join turn, and every later change is queued to this
-    /// participant from that turn on — so it arrives snapshot-then-deltas by
-    /// construction.
-    pub server_mute_replay: Vec<ParticipantStateUpdate>,
     /// The meeting's FROZEN handler set (ADR-0036 §9). `JoinResponse.media_servers`
     /// carries every handler in it: every participant is offered the whole set
     /// and connects to all it can. The frozen value, never the Redis read this
@@ -559,13 +555,9 @@ pub struct ParticipantInfo {
     pub user_id: String,
     /// Display name.
     pub display_name: String,
-    /// What MC knows of this participant's client mute, per kind (`None` until
-    /// reported). Published on the roster as `Participant.*_client_muted`.
-    pub client_muted: ClientMuteFacts,
-    /// Whether audio is server-muted (enforced, ADR-0036 §5).
-    pub audio_server_muted: bool,
-    /// Whether video is server-muted (enforced, ADR-0036 §5).
-    pub video_server_muted: bool,
+    /// The full per-kind mute state (client state, server mute and its
+    /// imposer). Published on the roster as `Participant.media_states`.
+    pub media: MediaStates,
     /// Connection status.
     pub status: ParticipantStatus,
     /// This participant's per-meeting sender id (ADR-0036 §2, §4).
@@ -627,6 +619,12 @@ pub enum ServerMuteRefusal {
     /// An authorized requester named a participant not in this meeting.
     /// Reachable ONLY for a host requester, by the ordering above.
     UnknownTarget,
+    /// An authorized requester named a kind the TARGET does not publish
+    /// (`VIDEO_SCREEN` included). The WHOLE request is refused, nothing
+    /// applied (ADR-0036 §5 amendment 2026-10-25). Reachable only for a host,
+    /// after the target lookup, and answered with the SAME wire refusal as
+    /// `UnknownTarget`: no oracle beyond the roster the host already sees.
+    NotPublished,
 }
 
 /// What became of a participant's `UnmuteRequest`.
@@ -716,22 +714,19 @@ pub enum ParticipantStateUpdate {
         reason: LeaveReason,
     },
     /// A participant's mute state, as a FULL snapshot: sent when its SERVER
-    /// mute changes (to everyone), when its CLIENT mute fact changes (to
+    /// mute changes (to everyone), and when its CLIENT mute changes (to
     /// everyone else, under the per-meeting fan-out bound; story 3 R-15 fix,
-    /// reversing story-2 S-2), and on the late-joiner replay of server mutes.
+    /// reversing story-2 S-2). There is no late-joiner replay (retired
+    /// 2026-10-25): the roster entry carries the full state.
     ///
     /// Wire-visible as `ParticipantMuteUpdate` (story 2 R-11). Every field is
     /// current at composition, so a client-mute frame never regresses a server
     /// mute and vice versa.
     MuteChanged {
         participant_id: String,
-        /// Client-mute facts, per kind; `None` goes on the wire as ABSENT.
-        client_muted: ClientMuteFacts,
-        audio_server_muted: bool,
-        video_server_muted: bool,
-        /// Participant id of whoever applied the server mute; empty when
-        /// neither kind is server-muted.
-        server_muted_by: String,
+        /// The full per-kind state (client state, server mute and its
+        /// imposer), encoded as `ParticipantMuteUpdate.media_states`.
+        media: MediaStates,
     },
     /// A participant disconnected (still in grace period).
     Disconnected { participant_id: String },
@@ -994,9 +989,7 @@ mod tests {
             participant_id: "p1".to_string(),
             user_id: "u1".to_string(),
             display_name: "Test User".to_string(),
-            client_muted: ClientMuteFacts::from_facts([None, Some(true)]),
-            audio_server_muted: false,
-            video_server_muted: false,
+            media: MediaStates::default(),
             status: ParticipantStatus::Connected,
             sender_id: crate::media_admission::fixtures::sample_sender_id(),
             identity_public_key: crate::media_admission::fixtures::sample_identity_key(),

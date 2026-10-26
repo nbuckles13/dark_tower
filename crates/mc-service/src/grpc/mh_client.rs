@@ -750,7 +750,7 @@ mod tests {
             }])
             .unwrap();
         let mut table = SlotTable::new();
-        let av = PublishSet::of(&[MediaKindLabel::Audio, MediaKindLabel::Video]);
+        let av = PublishSet::of(&MediaKindLabel::ALL);
         let (a, b) = (
             SenderId::from_nonzero(NonZeroU16::new(1).unwrap()),
             SenderId::from_nonzero(NonZeroU16::new(2).unwrap()),

@@ -83,9 +83,11 @@ export class MeetingStore {
 
   /** Seed the roster from the `joined` event's `existingParticipants`. */
   applyJoined(event: JoinedEvent): void {
-    this.#participants = [...event.existingParticipants];
+    // Cells are seeded BEFORE the roster lists anyone, so no reader ever meets
+    // a listed participant without a per-kind state (`KindMediaView.clientState`).
     this.media.registerParticipant(event.participantId);
     for (const p of event.existingParticipants) this.media.applyRosterEntry(p);
+    this.#participants = [...event.existingParticipants];
   }
 
   /** Append a participant (`participantJoined`); idempotent on participantId. */
@@ -99,7 +101,6 @@ export class MeetingStore {
   /** Remove a participant by id (`participantLeft`). */
   applyParticipantLeft(event: ParticipantLeftEvent): void {
     this.#participants = this.#participants.filter((p) => p.participantId !== event.participantId);
-    this.media.applyParticipantLeft(event.participantId);
   }
 
   /** Record a connected MH URL (`mediaConnected`); dedup'd. */

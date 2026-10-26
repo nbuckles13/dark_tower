@@ -20,7 +20,7 @@
 // each from that participant's own E2E bus (never a Prometheus aggregate).
 //
 // Wire tokens only: slot `data-slot-state`, roster `data-server-muted` /
-// `data-client-muted`, and the SDK error's `serverCode` on the bus.
+// `data-client-state`, and the SDK error's `serverCode` on the bus.
 
 import { expect, test } from 'playwright/test';
 import {
@@ -102,7 +102,7 @@ test.describe('story 2 S3: server mute, and client structural mute', () => {
         await waitForRosterToken(r, b, 'data-server-muted', 'true');
         // Distinct from client mute (story 3 R-15): B's own microphone is a
         // roster fact, independent of the server mute — B never muted it.
-        await waitForRosterToken(r, b, 'data-client-muted', 'false');
+        await waitForRosterToken(r, b, 'data-client-state', 'live');
       }
       // B's own client: server-muted shown, its client mute untouched.
       await expect(b.page.getByTestId('server-mute-state')).toHaveAttribute(
@@ -200,7 +200,7 @@ test.describe('story 2 S3: server mute, and client structural mute', () => {
       ]);
       for (const r of [host, b]) {
         await waitForSenderSlotState(r, c, 'avatar_client_muted');
-        await waitForRosterToken(r, c, 'data-client-muted', 'true');
+        await waitForRosterToken(r, c, 'data-client-state', 'client_muted');
         await waitForRosterToken(r, c, 'data-server-muted', 'false');
       }
 

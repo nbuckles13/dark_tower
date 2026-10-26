@@ -856,6 +856,90 @@ test_na_emitter_allowlist() {
 }
 
 # -----------------------------------------------------------------------------
+# Test: every Nx `test*` target is reached by a lane, or is a NAMED exemption
+# -----------------------------------------------------------------------------
+# A lane reaches a TS test by TARGET NAME (`nx run-many -t <names> --all`), so a
+# project whose test target has any other name is silently outside every lane.
+# That is how `proto-gen:test` (packages/proto-gen/scripts/verify-codegen.sh)
+# sat red while Layers 1-6 passed, until 2026-10-25. The lane names are DERIVED
+# from scripts/lang/ts/test.sh's `-t` list and layer7.sh's browser command, not
+# restated here. They are read from EXECUTED lines only (`__code_lines` drops
+# comments). A comment naming a target the command no longer runs must not count
+# as reaching it (@observability F5); its negative control is below. CI (`pnpm test:unit` / `pnpm test:component`) runs those same
+# names. Nx infers targets from package.json scripts too, so both files are read.
+# That a lane's non-zero exit reds its layer is run_and_emit's contract, pinned
+# in _common.test.sh rather than re-pinned here.
+__nx_lane_exempt() {   # name -> 0 if exempt. One line, one reason.
+  case "$1" in
+    test:watch) return 0 ;;             # interactive vitest watcher, never a gate
+    test:capacity-evidence) return 0 ;; # manual-test-plan evidence run (see-each-other §Capacity evidence)
+    *) return 1 ;;
+  esac
+}
+
+# Bash source minus whole-line comments and trailing ` # ...` comments.
+__code_lines() {
+  sed -E -e '/^[[:space:]]*#/d' -e 's/[[:space:]]+#.*$//' "$1"
+}
+
+# Lane target names from <ts-test-script> and <layer7-script>, one per line.
+__nx_lane_names() {
+  __code_lines "$1" | grep -oE 'nx run-many -t [^-]+' | sed -E 's/^nx run-many -t //' | tr ' ' '\n' | grep -E '^test' || true
+  __code_lines "$2" | grep -oE 'web-app test:[a-z0-9:-]+' | sed -E 's/^web-app //' | sort -u || true
+}
+
+test_nx_test_targets_reached_by_a_lane() {
+  local repo; repo="$(cd "${__here}/../.." && pwd)"
+  local lane_names
+  lane_names="$(__nx_lane_names "${__here}/ts/test.sh" "${repo}/scripts/layer7.sh")"
+
+  # Negative control on the derivation: a target named only in a comment (the
+  # header line and a trailing comment) while the executed command runs another
+  # must NOT be derived.
+  local tmp; tmp=$(mktemp -d)
+  printf '%s\n' '#!/usr/bin/env bash' '# TS test: nx run-many -t test:ghost' \
+    'run_and_emit "nx-test" pnpm exec nx run-many -t test:unit --all  # was: nx run-many -t test:gone' \
+    > "${tmp}/test.sh"
+  printf '%s\n' '# 2. Browser E2E (`pnpm --filter @darktower/web-app test:ghost-e2e`)' \
+    'browser_cmd=(pnpm --filter @darktower/web-app test:e2e)' > "${tmp}/layer7.sh"
+  local synth; synth="$(__nx_lane_names "${tmp}/test.sh" "${tmp}/layer7.sh")"
+  rm -rf "$tmp"
+  if [[ "$synth" == $'test:unit\ntest:e2e' ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1)); FAILURES+=("[nx-lane-names-comment-blind] derivation read a comment: expected 'test:unit test:e2e', got: $(tr '\n' ' ' <<<"$synth")")
+  fi
+  # Positive control on the derivation: an empty or broken parse must not pass.
+  assert_pattern_in "nx-lane-names-derived-test-unit" '^test:unit$' "$lane_names"
+  assert_pattern_in "nx-lane-names-derived-e2e" '^test:e2e$' "$lane_names"
+
+  local f project targets t seen=0 orphans=""
+  for f in "${repo}"/packages/*/project.json "${repo}"/packages/*/package.json; do
+    [[ -f "$f" ]] || continue
+    project="$(basename "$(dirname "$f")")"
+    targets="$(jq -r '((.targets // {}) | keys[]), ((.scripts // {}) | keys[])' "$f")" || {
+      FAIL=$((FAIL + 1)); FAILURES+=("[nx-lane-parse] jq could not read ${f}"); continue; }
+    while IFS= read -r t; do
+      [[ "$t" == test* ]] || continue
+      seen=$((seen + 1))
+      grep -qxF -- "$t" <<<"$lane_names" && continue
+      __nx_lane_exempt "$t" && continue
+      orphans+=" ${project}:${t}"
+    done <<<"$targets"
+  done
+  # Positive control on discovery: the oracle that motivated this test is seen
+  # under its lane name.
+  assert_pattern_in "nx-lane-proto-gen-is-test-unit" '"test:unit"' "$(cat "${repo}/packages/proto-gen/project.json")"
+  if [[ "$seen" -eq 0 ]]; then
+    FAIL=$((FAIL + 1)); FAILURES+=("[nx-lane-discovery] no test* target found under packages/ — discovery is broken, not clean")
+  elif [[ -n "$orphans" ]]; then
+    FAIL=$((FAIL + 1)); FAILURES+=("[nx-lane-orphan] test target(s) no lane runs:${orphans}. Rename to a lane name (test:unit / test:component), or add a reasoned __nx_lane_exempt entry")
+  else
+    PASS=$((PASS + 1))
+  fi
+}
+
+# -----------------------------------------------------------------------------
 # Run all
 # -----------------------------------------------------------------------------
 
@@ -876,6 +960,7 @@ test_na_beside_ok_aggregates_ok
 test_l6_no_dep_change_shape_reads_na
 test_empty_lang_root_is_wiring_fault
 test_na_emitter_allowlist
+test_nx_test_targets_reached_by_a_lane
 
 printf '\n_dispatch.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
 if [[ $FAIL -gt 0 ]]; then

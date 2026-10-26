@@ -9,6 +9,7 @@ import { MeetingSessionState } from '@darktower/sdk-core';
 import type { MeetingStore } from '../stores/MeetingStore.svelte.js';
 import BoundHarness from './helpers/BoundHarness.svelte';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
+import { mediaStates } from './helpers/mediaStates.js';
 
 test('component renders reactive store state and live roster', async () => {
   const session = new MockMeetingSession();
@@ -19,10 +20,14 @@ test('component renders reactive store state and live roster', async () => {
   session.fire('stateChange', MeetingSessionState.Joined);
   await expect.element(screen.getByTestId('state')).toHaveTextContent(MeetingSessionState.Joined);
 
-  session.fire('participantJoined', { participant: { participantId: 'a', name: 'Ann' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'a', name: 'Ann', mediaStates: mediaStates() },
+  });
   await expect.element(screen.getByTestId('participant-a')).toHaveTextContent('Ann');
 
-  session.fire('participantJoined', { participant: { participantId: 'b', name: 'Bob' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'b', name: 'Bob', mediaStates: mediaStates() },
+  });
   await expect.element(screen.getByTestId('participant-b')).toHaveTextContent('Bob');
 
   session.fire('participantLeft', { participantId: 'a', reason: 'voluntary' });
@@ -51,7 +56,9 @@ test('unmount tears down the subscription — no leak (post-unmount events ignor
   // and must not throw — the listeners are gone.
   expect(() => {
     session.fire('stateChange', MeetingSessionState.Disconnecting);
-    session.fire('participantJoined', { participant: { participantId: 'z', name: 'Zed' } });
+    session.fire('participantJoined', {
+      participant: { participantId: 'z', name: 'Zed', mediaStates: mediaStates() },
+    });
     session.fire('mediaConnected', 'https://mh-0:4433');
   }).not.toThrow();
 

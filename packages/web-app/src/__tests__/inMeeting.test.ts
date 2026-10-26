@@ -24,6 +24,7 @@ import type { MeetingSession, StreamAssignmentEvent } from '@darktower/sdk-core'
 import { MeetingStore, subscribeSession } from '@darktower/sdk-svelte';
 import InMeeting from '../views/InMeeting.svelte';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
+import { mediaStates } from './helpers/mediaStates.js';
 
 function slot(overrides: Partial<StreamAssignmentEvent> = {}): StreamAssignmentEvent {
   return {
@@ -365,7 +366,10 @@ test('each filled slot names the roster participant MC placed there; an unfilled
   session.fire('joined', {
     participantId: 'self',
     senderId: 1,
-    existingParticipants: [{ participantId: 'b', name: 'Bea', senderId: 258 }],
+    receiveSlotCaps: { audio: 8, video: 8 },
+    existingParticipants: [
+      { participantId: 'b', name: 'Bea', senderId: 258, mediaStates: mediaStates() },
+    ],
     mediaServers: [],
     correlationId: 'c',
     bindingToken: 't',
@@ -405,9 +409,7 @@ test('own SERVER mute is a separate indicator, driven only by the wire; asking t
 
   session.fire('participantMuteChanged', {
     participantId: 'self',
-    audioServerMuted: true,
-    videoServerMuted: false,
-    serverMutedBy: 'nobody-we-know',
+    mediaStates: mediaStates({ audio: { serverMuted: true, serverMutedBy: 'nobody-we-know' } }),
   });
   await expect
     .element(screen.getByTestId('server-mute-state'))
@@ -428,8 +430,7 @@ test('own SERVER mute is a separate indicator, driven only by the wire; asking t
 
   session.fire('participantMuteChanged', {
     participantId: 'self',
-    audioServerMuted: false,
-    videoServerMuted: false,
+    mediaStates: mediaStates(),
   });
   await expect
     .element(screen.getByTestId('server-mute-state'))
@@ -440,8 +441,7 @@ test('nothing in the view calls a server mute a ban', async () => {
   const { session, screen } = await mount();
   session.fire('participantMuteChanged', {
     participantId: 'self',
-    audioServerMuted: true,
-    videoServerMuted: false,
+    mediaStates: mediaStates({ audio: { serverMuted: true } }),
   });
   await expect
     .element(screen.getByTestId('server-mute-state'))
@@ -453,8 +453,7 @@ test('the "asked" label belongs to ONE server-mute episode: a re-mute starts wit
   const { session, screen } = await mount();
   session.fire('participantMuteChanged', {
     participantId: 'self',
-    audioServerMuted: true,
-    videoServerMuted: false,
+    mediaStates: mediaStates({ audio: { serverMuted: true } }),
   });
   await screen.getByTestId('request-unmute').click();
   await vi.waitFor(() => expect(session.unmuteRequestCalls).toBe(1));
@@ -462,14 +461,12 @@ test('the "asked" label belongs to ONE server-mute episode: a re-mute starts wit
 
   session.fire('participantMuteChanged', {
     participantId: 'self',
-    audioServerMuted: false,
-    videoServerMuted: false,
+    mediaStates: mediaStates(),
   });
   await expect.element(screen.getByTestId('request-unmute')).not.toBeInTheDocument();
   session.fire('participantMuteChanged', {
     participantId: 'self',
-    audioServerMuted: true,
-    videoServerMuted: false,
+    mediaStates: mediaStates({ audio: { serverMuted: true } }),
   });
   await expect
     .element(screen.getByTestId('request-unmute'))
@@ -483,9 +480,10 @@ test('the "asked" label belongs to ONE server-mute episode: a re-mute starts wit
 const ROSTER_JOIN = {
   participantId: 'self',
   senderId: 1,
+  receiveSlotCaps: { audio: 8, video: 8 },
   existingParticipants: [
-    { participantId: 'b', name: 'Bea', senderId: 258 },
-    { participantId: 'c', name: 'Cid', senderId: 259 },
+    { participantId: 'b', name: 'Bea', senderId: 258, mediaStates: mediaStates() },
+    { participantId: 'c', name: 'Cid', senderId: 259, mediaStates: mediaStates() },
   ],
   mediaServers: [],
   correlationId: 'c',
@@ -605,10 +603,10 @@ test('four indicators per participant, each its own token: client/server x audio
   });
   session.fire('participantMuteChanged', {
     participantId: 'b',
-    audioServerMuted: false,
-    videoServerMuted: true,
-    serverMutedBy: 'self',
-    audioClientMuted: true,
+    mediaStates: mediaStates({
+      audio: { clientState: 'client_muted' },
+      video: { clientState: 'live', serverMuted: true, serverMutedBy: 'self' },
+    }),
   });
   const tile = screen.getByTestId('video-slot-1');
   await expect
@@ -619,12 +617,12 @@ test('four indicators per participant, each its own token: client/server x audio
     .toHaveAttribute('data-muted', 'false');
   await expect
     .element(tile.getByTestId('mute-audio-client-b'))
-    .toHaveAttribute('data-muted', 'true');
-  // No client VIDEO fact yet (the update carried none): unknown, whatever the
-  // slot or the server mute say.
+    .toHaveAttribute('data-client-state', 'client_muted');
+  // The client VIDEO state is the participant's, whatever the slot or the
+  // server mute say.
   await expect
     .element(tile.getByTestId('mute-video-client-b'))
-    .toHaveAttribute('data-muted', 'unknown');
+    .toHaveAttribute('data-client-state', 'live');
   const texts = ['audio-client', 'video-client', 'audio-server', 'video-server'].map((k) =>
     tile.getByTestId(`mute-${k}-b`).element().textContent?.trim(),
   );
@@ -637,7 +635,9 @@ test('names are rendered as TEXT, never markup, and bounded (security: XSS paylo
     '<img src=x onerror="window.__xss=1">' + 'a'.repeat(80) + '<script>window.__xss=2</script>';
   session.fire('joined', {
     ...ROSTER_JOIN,
-    existingParticipants: [{ participantId: 'b', name: payload, senderId: 258 }],
+    existingParticipants: [
+      { participantId: 'b', name: payload, senderId: 258, mediaStates: mediaStates() },
+    ],
   });
   session.fire('streamAssignments', {
     unreachableSenderIds: [],
@@ -648,9 +648,7 @@ test('names are rendered as TEXT, never markup, and bounded (security: XSS paylo
   });
   session.fire('participantMuteChanged', {
     participantId: 'self',
-    audioServerMuted: true,
-    videoServerMuted: false,
-    serverMutedBy: 'b',
+    mediaStates: mediaStates({ audio: { serverMuted: true, serverMutedBy: 'b' } }),
   });
   await expect.element(screen.getByTestId('video-slot-1')).toHaveTextContent('<img');
   expect(screen.container.querySelector('img')).toBeNull();
@@ -702,8 +700,7 @@ test('own SERVER video mute has its own indicator; the camera reads host_off', a
   const { session, screen } = await mount([], { audio: 1, video: 0, publish: ['audio', 'video'] });
   session.fire('participantMuteChanged', {
     participantId: 'self',
-    audioServerMuted: false,
-    videoServerMuted: true,
+    mediaStates: mediaStates({ video: { serverMuted: true } }),
   });
   await expect
     .element(screen.getByTestId('server-mute-state-video'))
@@ -744,8 +741,7 @@ test('R-18: the notice appears ONLY from the SDK event, per kind, as an alertdia
   // A server-unmute update alone does not raise it (C-A1's SDK event is the SSoT).
   session.fire('participantMuteChanged', {
     participantId: 'self',
-    audioServerMuted: false,
-    videoServerMuted: false,
+    mediaStates: mediaStates(),
   });
   await expect.element(screen.getByTestId('resume-notice-video')).not.toBeInTheDocument();
   session.fire('captureResumedAfterServerMute', { kind: 'video' });

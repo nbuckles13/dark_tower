@@ -103,15 +103,42 @@ pub fn mute_frame(audio_muted: bool, video_muted: bool) -> bytes::BytesMut {
     mute_kinds_frame(Some(audio_muted), Some(video_muted))
 }
 
-/// A framed `MuteRequest` with each kind's presence as given (`None` = absent,
-/// i.e. "that kind unchanged"; both `None` is the rejected shape).
+/// A framed `MuteRequest` with each kind's presence as given (`None` = no
+/// entry, i.e. "that kind unchanged"; both `None` is the rejected empty list).
 pub fn mute_kinds_frame(audio_muted: Option<bool>, video_muted: Option<bool>) -> bytes::BytesMut {
+    mute_changes_frame(&kind_changes(audio_muted, video_muted))
+}
+
+/// The kind-keyed `changes` list for per-kind asks (`None` = no entry).
+pub fn kind_changes(audio: Option<bool>, video: Option<bool>) -> Vec<(i32, bool)> {
+    mc_service::media_kind::MediaKindLabel::ALL
+        .into_iter()
+        .zip([audio, video])
+        .filter_map(|(kind, muted)| muted.map(|m| (kind.to_proto() as i32, m)))
+        .collect()
+}
+
+fn mute_changes(changes: &[(i32, bool)]) -> Vec<proto_gen::dark_tower::signaling::v1::MuteChange> {
+    changes
+        .iter()
+        .map(
+            |&(media_kind, muted)| proto_gen::dark_tower::signaling::v1::MuteChange {
+                media_kind,
+                muted,
+            },
+        )
+        .collect()
+}
+
+/// A framed `MuteRequest` carrying exactly `changes` as raw `(media_kind,
+/// muted)` entries -- malformed lists included (UNSPECIFIED, unknown numbers,
+/// duplicates, screen).
+pub fn mute_changes_frame(changes: &[(i32, bool)]) -> bytes::BytesMut {
     encode_framed(&ClientMessage {
         trace_parent: String::new(),
         trace_state: String::new(),
         message: Some(client_message::Message::MuteRequest(MuteRequest {
-            audio_muted,
-            video_muted,
+            changes: mute_changes(changes),
         })),
     })
 }
@@ -136,8 +163,8 @@ pub struct Session {
     pub sender_id: u32,
     /// `JoinResponse.media_servers`, as MC sent it.
     pub media_servers: Vec<String>,
-    /// `JoinResponse.max_audio_receive_slots` / `max_video_receive_slots`.
-    pub max_kind_receive_slots: (Option<u32>, Option<u32>),
+    /// `JoinResponse.receive_slot_caps`, as MC sent it.
+    pub receive_slot_caps: Vec<proto_gen::dark_tower::signaling::v1::ReceiveSlotCap>,
     /// The `SendDirective` MC emitted in the join turn.
     pub join_directive: Option<SendDirective>,
     /// The `StreamAssignments` MC emitted in the join turn.
@@ -153,6 +180,24 @@ pub struct Session {
     pub existing_participants: Vec<proto_gen::dark_tower::signaling::v1::Participant>,
     /// The meeting joined.
     pub meeting_id: String,
+}
+
+impl Session {
+    /// `kind`'s advertised receive-slot cap: `receive_slot_caps` must carry
+    /// EXACTLY one entry for it (CONVENTIONS §6).
+    #[must_use]
+    pub fn slot_cap(&self, kind: MediaKind) -> u32 {
+        let mut entries = self
+            .receive_slot_caps
+            .iter()
+            .filter(|c| c.media_kind == kind as i32);
+        let cap = entries
+            .next()
+            .expect("an entry for every known kind")
+            .max_slots;
+        assert!(entries.next().is_none(), "exactly one entry per kind");
+        cap
+    }
 }
 
 impl Session {
@@ -539,8 +584,9 @@ pub async fn try_join_as(
 /// story 2's shape: publish audio, header v3, no join-carried declaration.
 #[derive(Debug, Clone)]
 pub struct JoinShape {
-    /// `JoinRequest.publish_kinds`, raw.
-    pub publish_kinds: Vec<i32>,
+    /// `JoinRequest.published_kinds` as raw `(media_kind, client_muted)`
+    /// entries (empty = receive-only).
+    pub publish: Vec<(i32, bool)>,
     /// `ParticipantCapabilities.supported_header_versions`.
     pub header_versions: Vec<u32>,
     /// `JoinRequest.receive_capability` (`None` = absent).
@@ -550,7 +596,7 @@ pub struct JoinShape {
 impl Default for JoinShape {
     fn default() -> Self {
         Self {
-            publish_kinds: vec![MediaKind::Audio as i32],
+            publish: vec![(MediaKind::Audio as i32, false)],
             header_versions: vec![u32::from(media_protocol::frame::PROTOCOL_VERSION)],
             receive: None,
         }
@@ -558,13 +604,24 @@ impl Default for JoinShape {
 }
 
 impl JoinShape {
-    /// Publish exactly `kinds`.
+    /// Publish exactly `kinds`, each live (not client-muted).
     #[must_use]
     pub fn publishing(kinds: &[MediaKind]) -> Self {
         Self {
-            publish_kinds: kinds.iter().map(|k| *k as i32).collect(),
+            publish: kinds.iter().map(|k| (*k as i32, false)).collect(),
             ..Self::default()
         }
+    }
+
+    /// Mark the already-published `kind` client-muted at join.
+    #[must_use]
+    pub fn client_muted(mut self, kind: MediaKind) -> Self {
+        for (k, muted) in &mut self.publish {
+            if *k == kind as i32 {
+                *muted = true;
+            }
+        }
+        self
     }
 
     /// Carry `slots` as the join's receive declaration.
@@ -660,7 +717,16 @@ async fn try_join_full(
             correlation_id: String::new(),
             binding_token: String::new(),
             identity_public_key: sample_identity_public_key(),
-            publish_kinds: shape.publish_kinds,
+            published_kinds: shape
+                .publish
+                .into_iter()
+                .map(|(media_kind, client_muted)| {
+                    proto_gen::dark_tower::signaling::v1::PublishedKind {
+                        media_kind,
+                        client_muted,
+                    }
+                })
+                .collect(),
             receive_capability: shape
                 .receive
                 .map(|slots| proto_gen::dark_tower::signaling::v1::ReceiveCapability { slots }),
@@ -672,7 +738,7 @@ async fn try_join_full(
     let resp = tokio::time::timeout(Duration::from_secs(5), read_server_message(&mut recv))
         .await
         .expect("join response timeout");
-    let (participant_id, sender_id, media_servers, max_kind_receive_slots, existing_participants) =
+    let (participant_id, sender_id, media_servers, receive_slot_caps, existing_participants) =
         match resp.message {
             Some(server_message::Message::JoinResponse(r)) => (
                 r.participant_id.clone(),
@@ -681,7 +747,7 @@ async fn try_join_full(
                     .into_iter()
                     .map(|m| m.media_handler_url)
                     .collect::<Vec<String>>(),
-                (r.max_audio_receive_slots, r.max_video_receive_slots),
+                r.receive_slot_caps,
                 r.existing_participants,
             ),
             other => return Err(format!("{other:?}")),
@@ -693,7 +759,7 @@ async fn try_join_full(
         recv,
         sender_id,
         media_servers,
-        max_kind_receive_slots,
+        receive_slot_caps,
         join_directive: None,
         join_assignments: None,
         pending: std::collections::VecDeque::new(),
@@ -719,14 +785,19 @@ pub fn server_mute_kinds_frame(
     audio_muted: Option<bool>,
     video_muted: Option<bool>,
 ) -> bytes::BytesMut {
+    server_mute_changes_frame(target, &kind_changes(audio_muted, video_muted))
+}
+
+/// A framed `ServerMuteRequest` naming `target` with exactly `changes` as raw
+/// `(media_kind, muted)` entries (malformed lists included).
+pub fn server_mute_changes_frame(target: &str, changes: &[(i32, bool)]) -> bytes::BytesMut {
     encode_framed(&ClientMessage {
         trace_parent: String::new(),
         trace_state: String::new(),
         message: Some(client_message::Message::ServerMuteRequest(
             proto_gen::dark_tower::signaling::v1::ServerMuteRequest {
                 participant_id: target.to_string(),
-                audio_muted,
-                video_muted,
+                changes: mute_changes(changes),
                 reason: String::new(),
             },
         )),
@@ -737,14 +808,19 @@ pub fn server_mute_kinds_frame(
 /// CLIENT writes into the field MC overwrites on relay — pass another
 /// participant's id to exercise the forgery path.
 pub fn unmute_request_frame(claimed_participant_id: &str) -> bytes::BytesMut {
+    unmute_kinds_frame(claimed_participant_id, &[MediaKind::Audio as i32])
+}
+
+/// A framed `UnmuteRequest` naming exactly `media_kinds` (raw; malformed lists
+/// included).
+pub fn unmute_kinds_frame(claimed_participant_id: &str, media_kinds: &[i32]) -> bytes::BytesMut {
     encode_framed(&ClientMessage {
         trace_parent: String::new(),
         trace_state: String::new(),
         message: Some(client_message::Message::UnmuteRequest(
             proto_gen::dark_tower::signaling::v1::UnmuteRequest {
-                request_audio: true,
-                request_video: false,
                 participant_id: claimed_participant_id.to_string(),
+                media_kinds: media_kinds.to_vec(),
             },
         )),
     })

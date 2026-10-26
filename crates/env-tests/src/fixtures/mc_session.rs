@@ -25,8 +25,9 @@ use bytes::{BufMut, BytesMut};
 use prost::Message;
 use proto_gen::dark_tower::signaling::v1::{
     client_message, mh_client_message, server_message, ClientMessage, ErrorMessage, JoinRequest,
-    JoinResponse, MediaKind, MhClientMessage, MhConnectRequest, ParticipantCapabilities,
-    ReceiveCapability, ReceiveSlot, ServerMessage,
+    JoinResponse, MediaKind, MhClientMessage, MhConnectRequest, MuteChange,
+    ParticipantCapabilities, ParticipantMuteUpdate, PublishedKind, ReceiveCapability, ReceiveSlot,
+    ServerMessage,
 };
 use std::time::Duration;
 
@@ -249,9 +250,10 @@ pub fn receive_capability(audio_slot_ids: &[u32], video_slot_ids: &[u32]) -> Rec
 /// methods so MC observes exactly the malformed declaration under test.
 #[derive(Clone, Debug)]
 pub struct JoinDeclaration {
-    /// Raw `MediaKind` values: raw so an invalid, unknown or duplicate value
-    /// can be sent unchanged.
-    pub publish_kinds: Vec<i32>,
+    /// The published kinds as raw `(media_kind, client_muted)` entries: raw so
+    /// an invalid, unknown or duplicate value can be sent unchanged. Empty =
+    /// receive-only.
+    pub publish: Vec<(i32, bool)>,
     pub receive_capability: Option<ReceiveCapability>,
     pub header_versions: Vec<u32>,
 }
@@ -259,7 +261,7 @@ pub struct JoinDeclaration {
 impl Default for JoinDeclaration {
     fn default() -> Self {
         Self {
-            publish_kinds: vec![MediaKind::Audio as i32],
+            publish: vec![(MediaKind::Audio as i32, false)],
             receive_capability: None,
             header_versions: vec![current_header_version()],
         }
@@ -267,17 +269,29 @@ impl Default for JoinDeclaration {
 }
 
 impl JoinDeclaration {
-    /// Replace the publish set (empty = receive-only).
+    /// Replace the publish set, each kind live (empty = receive-only).
     #[must_use]
     pub fn publishing(mut self, kinds: &[MediaKind]) -> Self {
-        self.publish_kinds = kinds.iter().map(|k| *k as i32).collect();
+        self.publish = kinds.iter().map(|k| (*k as i32, false)).collect();
         self
     }
 
-    /// Replace the publish set with raw values (negative cases).
+    /// Replace the publish set with raw kind values, each live (negative
+    /// cases).
     #[must_use]
     pub fn publishing_raw(mut self, kinds: &[i32]) -> Self {
-        self.publish_kinds = kinds.to_vec();
+        self.publish = kinds.iter().map(|k| (*k, false)).collect();
+        self
+    }
+
+    /// Mark the already-published `kind` client-muted at join.
+    #[must_use]
+    pub fn client_muted(mut self, kind: MediaKind) -> Self {
+        for (k, muted) in &mut self.publish {
+            if *k == kind as i32 {
+                *muted = true;
+            }
+        }
         self
     }
 
@@ -295,6 +309,56 @@ impl JoinDeclaration {
         self.header_versions = versions.to_vec();
         self
     }
+}
+
+/// `kind`'s advertised receive-slot cap on a `JoinResponse`, if MC sent
+/// EXACTLY one entry for it (CONVENTIONS §6: `receive_slot_caps` carries one
+/// entry per known kind). `None` = no entry; a duplicate panics.
+#[must_use]
+pub fn slot_cap(response: &JoinResponse, kind: MediaKind) -> Option<u32> {
+    let mut entries = response
+        .receive_slot_caps
+        .iter()
+        .filter(|c| c.media_kind == kind as i32);
+    let cap = entries.next().map(|c| c.max_slots);
+    assert!(
+        entries.next().is_none(),
+        "two receive_slot_caps entries for {kind:?}"
+    );
+    cap
+}
+
+/// Is `kind` server-muted on a mute update? Panics unless the snapshot
+/// carries EXACTLY one entry for the kind (CONVENTIONS §6).
+#[must_use]
+pub fn server_muted(update: &ParticipantMuteUpdate, kind: MediaKind) -> bool {
+    let mut entries = update
+        .media_states
+        .iter()
+        .filter(|s| s.media_kind == kind as i32);
+    let entry = entries
+        .next()
+        .unwrap_or_else(|| panic!("no media_states entry for {kind:?}"));
+    assert!(
+        entries.next().is_none(),
+        "two media_states entries for {kind:?}"
+    );
+    entry.server_muted
+}
+
+/// The kind-keyed `changes` of a mute request from per-kind asks (`None` = no
+/// entry: that kind unchanged).
+#[must_use]
+pub fn mute_changes(audio: Option<bool>, video: Option<bool>) -> Vec<MuteChange> {
+    [(MediaKind::Audio, audio), (MediaKind::VideoCamera, video)]
+        .into_iter()
+        .filter_map(|(kind, muted)| {
+            muted.map(|muted| MuteChange {
+                media_kind: kind as i32,
+                muted,
+            })
+        })
+        .collect()
 }
 
 /// Build the MC `JoinRequest` — the ONE place its field list lives in env-tests.
@@ -319,8 +383,15 @@ pub fn join_request_with(
         correlation_id: String::new(),
         binding_token: String::new(),
         identity_public_key: sample_identity_public_key(),
-        publish_kinds: declaration.publish_kinds.clone(),
         receive_capability: declaration.receive_capability.clone(),
+        published_kinds: declaration
+            .publish
+            .iter()
+            .map(|&(media_kind, client_muted)| PublishedKind {
+                media_kind,
+                client_muted,
+            })
+            .collect(),
     }
 }
 
@@ -622,7 +693,13 @@ mod tests {
     #[test]
     fn the_default_join_is_an_audio_publisher_on_the_current_header_version() {
         let req = join_request("m", "t", "n");
-        assert_eq!(req.publish_kinds, vec![MediaKind::Audio as i32]);
+        assert_eq!(
+            req.published_kinds,
+            vec![PublishedKind {
+                media_kind: MediaKind::Audio as i32,
+                client_muted: false,
+            }]
+        );
         assert!(
             req.receive_capability.is_none(),
             "absent = zero slots of each kind"
@@ -656,16 +733,17 @@ mod tests {
             .receiving(&[], &[4])
             .header_versions(&[2]);
         let req = join_request_with("m", "t", "n", &d);
+        let kinds: Vec<i32> = req.published_kinds.iter().map(|k| k.media_kind).collect();
         assert_eq!(
-            req.publish_kinds,
+            kinds,
             vec![MediaKind::Audio as i32, MediaKind::Audio as i32, 99]
         );
         assert_eq!(req.capabilities.unwrap().supported_header_versions, vec![2]);
         assert_eq!(req.receive_capability.unwrap().slots.len(), 1);
         let none = join_request_with("m", "t", "n", &JoinDeclaration::default().publishing(&[]));
         assert!(
-            none.publish_kinds.is_empty(),
-            "receive-only is an EMPTY set"
+            none.published_kinds.is_empty(),
+            "receive-only is an EMPTY list"
         );
     }
 }

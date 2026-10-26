@@ -23,6 +23,62 @@ enum MediaKind {
   MEDIA_KIND_VIDEO_SCREEN = 3;
 }
 
+// ----------------------------------------------------------------------------
+// Kind-keyed per-kind facts (docs/protocol/CONVENTIONS.md §6; ADR-0036 §5
+// amendment 2026-10-25). Every per-kind fact on this wire is a repeated entry
+// keyed by `MediaKind media_kind`, never a hand-named audio_/video_ pair
+// (enforced by `dt-guard proto-per-kind-fields`). The validation rules -- one
+// entry per kind, what is malformed, what a receiver does about it -- are
+// stated ONCE, in CONVENTIONS §6; the fields below cite it.
+// ----------------------------------------------------------------------------
+
+// A participant's own (client) media state for one kind, as MC knows it.
+// There is NO "unknown" value: MC knows every kind's state from the join's
+// `published_kinds`. `UNSPECIFIED` is the proto3 zero value only and is
+// MALFORMED wherever it is read, never a display state (CONVENTIONS §6).
+enum ClientMediaState {
+  CLIENT_MEDIA_STATE_UNSPECIFIED = 0;
+  // The participant does not publish this kind (fixed for the membership,
+  // story 3 R-2). Render "not publishing".
+  CLIENT_MEDIA_STATE_NOT_PUBLISHED = 1;
+  // Published and not client-muted.
+  CLIENT_MEDIA_STATE_LIVE = 2;
+  // Published and client-muted by the participant (enforced at capture).
+  CLIENT_MEDIA_STATE_CLIENT_MUTED = 3;
+}
+
+// One kind's full mute state: the participant's client state and the
+// meeting's server mute, which are INDEPENDENT and compose (R-15). Element of
+// the server snapshot lists `Participant.media_states` and
+// `ParticipantMuteUpdate.media_states`: exactly one entry per known
+// non-UNSPECIFIED `MediaKind` (CONVENTIONS §6). MC emits `VIDEO_SCREEN` as
+// NOT_PUBLISHED, `server_muted` false, `server_muted_by` empty until screen
+// share has mute semantics; receivers validate it like any kind and do not
+// check its value.
+message MediaKindState {
+  MediaKind media_kind = 1;
+  ClientMediaState client_state = 2;
+  // Server mute of this kind: directive withdrawn + ingress drop (ADR-0036
+  // §5). Always false on a NOT_PUBLISHED kind (a server mute of an unpublished
+  // kind is refused).
+  bool server_muted = 3;
+  // Participant id of the host who imposed THIS kind's server mute. Empty iff
+  // `server_muted` is false: MC never server-mutes without an authenticated
+  // requester, and an unmute of one kind never touches another kind's.
+  //
+  // SECURITY: server-to-client, but relayed identity. Truncate before logging
+  // (256-byte bound, as `MhConnectionStatus.mh_url`); never log unbounded;
+  // render as text, never markup.
+  string server_muted_by = 4;
+}
+
+// One kind's receive-slot cap. Element of `JoinResponse.receive_slot_caps`.
+message ReceiveSlotCap {
+  MediaKind media_kind = 1;
+  // 0 is a present 0 (for video: video off, R-26), never "unknown".
+  uint32 max_slots = 2;
+}
+
 // Codec vocabulary, defined once for both directions: what a participant
 // declares it can handle (`ParticipantCapabilities.supported_codecs`) and what
 // MC directs it to produce (`EncodingParameters.codec`).
@@ -153,10 +209,10 @@ enum SlotState {
   // connected handler with the subscriber, receive-only participants included.
   SLOT_STATE_AVATAR_NO_VIDEO = 8;
   // Steady and permanent for the declaration: this declared slot is over MC's
-  // per-kind cap (`JoinResponse.max_audio_receive_slots` /
-  // `max_video_receive_slots`) and was TRUNCATED. No sender, no url; echoes the
-  // declared `slot_id`. Changes only on a redeclaration. A video cap of 0 makes
-  // every video slot UNAVAILABLE (the video-off lever, story 3 R-26).
+  // per-kind cap (`JoinResponse.receive_slot_caps`) and was TRUNCATED. No
+  // sender, no url; echoes the declared `slot_id`. Changes only on a
+  // redeclaration. A video cap of 0 makes every video slot UNAVAILABLE (the
+  // video-off lever, story 3 R-26).
   // Truncation never fails a join (supersedes story 2 R-1's reject rule).
   SLOT_STATE_UNAVAILABLE = 9;
   // Steady avatar: the named participant client-muted this kind. Both kinds.
@@ -274,27 +330,13 @@ message JoinRequest {
   // label, never a span attribute, never a per-frame log dimension.
   bytes identity_public_key = 7;
 
-  // What this participant publishes (story 3 R-2): any subset of
-  // {`MEDIA_KIND_AUDIO`, `MEDIA_KIND_VIDEO_CAMERA`}. EMPTY means it publishes
-  // nothing (receive-only). FIXED FOR THE MEMBERSHIP: camera off is mute, not a
-  // capability change, and a reconnect presenting a different publish SET
-  // (order-insensitive) is refused and counted -- otherwise a participant could
-  // slip out from under a mute by rejoining with a different set.
-  //
-  // MC VALIDATES FIRST, and rejects (generic, counted) -- never ignores -- a set
-  // containing `MEDIA_KIND_UNSPECIFIED`, `MEDIA_KIND_VIDEO_SCREEN` (a kind this
-  // story does not serve), an unknown value (the enum is open, so an unknown
-  // number decodes as an integer), or a duplicate.
-  //
-  // THEN THE NEITHER-PUBLISH-NOR-RECEIVE REFUSAL: a join with no publish kinds
-  // and no slots in `receive_capability` AS SENT -- judged before per-kind
-  // truncation -- is refused at join with a generic, counted reason, never
-  // admitted to a silent empty meeting. Truncation itself never fails a join
-  // (`SLOT_STATE_UNAVAILABLE`).
-  repeated MediaKind publish_kinds = 8;
+  // Pre-2026-10-25: `repeated MediaKind publish_kinds = 8;`, superseded by
+  // `published_kinds` (10), which also carries each kind's initial client mute.
+  reserved 8;
+  reserved "publish_kinds";
 
   // The INITIAL receive declaration, carried on the join so the
-  // neither-publish-nor-receive check above runs at join. ABSENT means zero
+  // neither-publish-nor-receive check (`published_kinds`) runs at join. ABSENT means zero
   // slots of each kind -- not an error by itself; the participant is admitted
   // if it publishes something. Same validation as the post-join path.
   //
@@ -302,6 +344,34 @@ message JoinRequest {
   // path; a redeclaration that would leave the participant neither publishing
   // nor receiving is refused (generic, counted).
   ReceiveCapability receive_capability = 9;
+
+  // What this participant publishes and each published kind's initial client
+  // mute (story 3 R-2; ADR-0036 §5 amendment 2026-10-25). EMPTY = publishes
+  // nothing (receive-only). FIXED FOR THE MEMBERSHIP: camera off is mute, not a
+  // capability change, and a reconnect presenting a different kind SET
+  // (order-insensitive, by kind only) is refused and counted -- otherwise a
+  // participant could slip out from under a mute by rejoining with a different
+  // set. A reconnect's `client_muted` values are adopted as a client-mute change.
+  //
+  // A map by kind (CONVENTIONS §6). MC VALIDATES FIRST, and rejects (generic,
+  // counted `publish_kind_invalid`) -- never ignores or deduplicates -- an entry
+  // whose kind is `MEDIA_KIND_UNSPECIFIED`, an unknown number, or
+  // `MEDIA_KIND_VIDEO_SCREEN` (a kind this story does not serve), or a duplicate
+  // kind (two entries for one kind are a duplicate whatever their
+  // `client_muted`).
+  //
+  // THEN THE NEITHER-PUBLISH-NOR-RECEIVE REFUSAL: a join with no published kinds
+  // and no slots in `receive_capability` AS SENT -- judged before per-kind
+  // truncation -- is refused at join with a generic, counted reason, never
+  // admitted to a silent empty meeting. Truncation itself never fails a join
+  // (`SLOT_STATE_UNAVAILABLE`).
+  repeated PublishedKind published_kinds = 10;
+}
+
+// One published kind and its client mute at the moment the join was built.
+message PublishedKind {
+  MediaKind media_kind = 1;
+  bool client_muted = 2;
 }
 
 // Information about the media server.
@@ -420,15 +490,18 @@ message Participant {
   // path), NOT task 3 — same owner as the sender_id and meeting_kek checks.
   bytes identity_public_key = 6;
 
-  // This participant's client mute, per kind, as of the MC actor turn that
-  // built this entry; any later `ParticipantMuteUpdate` for this participant
-  // supersedes it. Set iff MC knows: ABSENT until the participant has reported
-  // that kind, and absent MUST NOT be rendered as unmuted (presence rules and
-  // the carrier map: the Mute-state section header). Client mute only — server
-  // mute is not on the roster.
-  optional bool audio_client_muted = 7;
-  // As `audio_client_muted`, for video.
-  optional bool video_client_muted = 8;
+  // Pre-2026-10-25: `optional bool audio_client_muted = 7; optional bool
+  // video_client_muted = 8;` (client mute only, absent = "unknown"). Replaced
+  // by the kind-keyed `media_states` (CONVENTIONS §6).
+  reserved 7, 8;
+  reserved "audio_client_muted", "video_client_muted";
+
+  // This participant's full mute state, per kind (client state AND server
+  // mute), as of the MC actor turn that built this entry; any later
+  // `ParticipantMuteUpdate` for this participant supersedes it. Exactly one
+  // entry per known kind (CONVENTIONS §6; carrier map: the Mute-state section
+  // header).
+  repeated MediaKindState media_states = 9;
 }
 
 // Response to join request (ADR-0023 Session Binding Token Pattern)
@@ -664,21 +737,28 @@ message JoinResponse {
   reserved 12;
   reserved "max_receive_slots";
 
-  // MC's per-kind receive-slot caps (story 3 R-1, R-23):
-  // `MC_MAX_AUDIO_RECEIVE_SLOTS` and `MC_MAX_VIDEO_RECEIVE_SLOTS`, in MC's own
-  // ConfigMap so the video-off lever (a video cap of 0) rolls MC only. THE
-  // canonical statement of these two fields' rules.
+  // Pre-2026-10-25: `optional uint32 max_audio_receive_slots = 13; optional
+  // uint32 max_video_receive_slots = 14;`, replaced by the kind-keyed
+  // `receive_slot_caps` (15).
+  reserved 13, 14;
+  reserved "max_audio_receive_slots", "max_video_receive_slots";
+
+  // MC's per-kind receive-slot caps (story 3 R-1, R-23): `MC_MAX_AUDIO_RECEIVE_SLOTS`
+  // and `MC_MAX_VIDEO_RECEIVE_SLOTS`, in MC's own ConfigMap so the video-off
+  // lever (a video cap of 0) rolls MC only. THE canonical statement of these
+  // caps' rules.
   //
-  // INFORMATIONAL, for runtime readability of the effective caps. MC
-  // TRUNCATES: a declaration with more slots of a kind than its cap keeps the
-  // first `cap` slots of that kind IN DECLARATION ORDER, and every excess slot
-  // is reported `SLOT_STATE_UNAVAILABLE` -- visible, never a silent
-  // participant, never a join failure. A client therefore needs no
-  // pre-check and MUST NOT shrink its declaration from these values.
+  // REQUIRED, exactly one entry per known kind (CONVENTIONS §6); MC sends
+  // `VIDEO_SCREEN` as 0 (this story serves no screen slots). An empty,
+  // incomplete or duplicated list is a protocol error: the client fails the
+  // join loudly.
   //
-  // 0 is LEGAL for either kind (a video cap of 0 disables video, R-26).
-  // Absent means an MC that does not send them; the caps are then unknown,
-  // which costs a client nothing because truncation is reported per slot.
+  // INFORMATIONAL beyond that, for runtime readability of the effective caps.
+  // MC TRUNCATES: a declaration with more slots of a kind than its cap keeps
+  // the first `cap` slots of that kind IN DECLARATION ORDER, and every excess
+  // slot is reported `SLOT_STATE_UNAVAILABLE` -- visible, never a silent
+  // participant, never a join failure. A client therefore needs no pre-check
+  // and MUST NOT shrink its declaration from these values.
   //
   // PER SESSION. The values describe the MC instance that served THIS join.
   // Instances can differ during a configuration rollout, and an ADR-0023
@@ -687,8 +767,7 @@ message JoinResponse {
   //
   // NOT IDENTITY OR KEY MATERIAL: bounded configuration values, safe to log.
   // OBSERVABILITY: log values, never metric labels.
-  optional uint32 max_audio_receive_slots = 13;
-  optional uint32 max_video_receive_slots = 14;
+  repeated ReceiveSlotCap receive_slot_caps = 15;
 }
 
 // Reason for participant leaving.
@@ -747,78 +826,75 @@ enum LeaveReason {
 // whatever the client mute, so it resumes capture unless the participant is
 // client-muted (see `ParticipantMuteUpdate` for the notice it requires).
 //
-// PER-KIND FIELDS ARE `optional bool` on both request messages. ABSENT means
-// "that kind is unchanged"; a request with BOTH absent is refused with a
-// generic message and counted, and changes nothing. TAG-COMPATIBLE BUT NOT
-// SEMANTICS-COMPATIBLE with a pre-optional encoder: a proto3 implicit-presence
-// `bool` omits `false` from the wire, so an old sender's `false` (an unmute)
-// is indistinguishable from absent and reads as "unchanged". Senders MUST set
-// every kind they mean to change, including an explicit `false`.
+// PER-KIND REQUESTS ARE KIND-KEYED (`repeated MuteChange changes`; a map by
+// kind, CONVENTIONS §6). A kind with NO entry is UNCHANGED; an entry with
+// `muted = false` is an explicit unmute. MC refuses the WHOLE request --
+// generic message, counted on `mc_media_mute_requests_rejected_total`, nothing
+// applied -- when the list is empty, names `MEDIA_KIND_UNSPECIFIED` or an
+// unknown number, names a kind twice, or names a kind the subject does not
+// publish (`MEDIA_KIND_VIDEO_SCREEN` included: nobody publishes it). Never a
+// partial apply.
 //
-// WHO SEES WHAT, AND WHERE A CLIENT LEARNS IT (the carrier map; story 3 R-15
-// fix, ADR-0036 §5 amendment 2026-10-24). Every participant sees every other
-// participant's client mute AND server mute, per kind, whether or not any of
-// its slots carries that participant. Story-2 security judgment S-2 (self-mute
-// does not fan out; slot state is the only client-mute signal) is REVERSED by
-// that amendment.
+// WHO SEES WHAT, AND WHERE A CLIENT LEARNS IT (the carrier map; ADR-0036 §5
+// amendments 2026-10-24 and 2026-10-25). Every participant sees every other
+// participant's client state AND server mute, per kind, whether or not any of
+// its slots carries that participant (story-2 S-2 stays reversed). ONE RULE,
+// one message type for both halves:
 //
-//   Client mute: snapshot on the roster entry (`Participant.audio_client_muted`
-//   / `video_client_muted`, on `JoinResponse.existing_participants` and on
-//   `ParticipantJoined`), then deltas on `ParticipantMuteUpdate` (same field
-//   names and tags).
+//   Snapshot: `Participant.media_states` on `JoinResponse.existing_participants`
+//   and on `ParticipantJoined`. Then deltas: `ParticipantMuteUpdate.media_states`
+//   (each a full snapshot). There is no post-JoinResponse server-mute replay
+//   (retired 2026-10-25: the roster entry carries server mute).
 //
-//   Server mute: snapshot by the post-JoinResponse replay (one
-//   `ParticipantMuteUpdate` per participant server-muted in either kind, so
-//   `server_muted_by` / R-11 have one carrier), then deltas on
-//   `ParticipantMuteUpdate`.
+//   A joiner learns its OWN server mute only from its own copy of
+//   `ParticipantMuteUpdate`. A fresh join starts server-unmuted; a reconnect
+//   within the grace period has no self carrier at join (pre-existing; the SDK
+//   has no reconnect).
 //
-// CLIENT-MUTE FIELDS ARE SET IFF MC KNOWS (`optional bool`, everywhere they
-// appear). MC holds no client-mute fact for a kind until that participant has
-// reported it (`MuteRequest`); until then the field is ABSENT, never `false`.
-// ABSENT means "no fact": consumers MUST NOT render it as unmuted and render
-// "unknown" instead. On entering joined, a client MUST report its current
-// client mute for every kind in its `JoinRequest.publish_kinds`, explicit
-// `false` included (one kind per `MuteRequest` is fine). A kind it does not
-// publish is never reported and stays ABSENT (no fact) for the whole
-// membership; MC ignores a report for it (`MuteRequest`). A peer cannot
-// distinguish an unpublished kind from an unreported one: both are absent and
-// render "unknown". A fresh join or a rejoin is therefore "unknown" to peers
-// until that report lands. That window is display-only -- capture is enforced
-// locally -- so it is never a reason to trust the roster for capture. The
-// latest PRESENT value wins; an absent field on a later message changes
-// nothing.
+// NO UNKNOWN STATE. MC knows every kind's state from the join's
+// `published_kinds` (published kinds with their initial client mute; every
+// other kind NOT_PUBLISHED), so every snapshot is definite from the first
+// message. There is no post-join report obligation.
 
 // Request to update client-mute status.
 //
 // The participant's own client mute, per kind. Enforced at capture. MC
 // reflects it to MH as `SOURCE_DISPOSITION_PAUSED` (forward nothing, never an
 // ingress drop) and to holders as `SLOT_STATE_AVATAR_CLIENT_MUTED`; it never
-// changes the send directive. Absent = unchanged; both absent is refused with
-// a generic message and counted (section header). A kind not in the
-// participant's `JoinRequest.publish_kinds` is ignored: no fact recorded,
-// nothing fanned out, counted (`not_published`); a published kind in the same
-// request still applies.
+// changes the send directive. Refusals: section header.
 message MuteRequest {
-  optional bool audio_muted = 1;
-  optional bool video_muted = 2;
+  // Pre-2026-10-25: `optional bool audio_muted = 1; optional bool video_muted
+  // = 2;`, replaced by the kind-keyed `changes` (CONVENTIONS §6).
+  reserved 1, 2;
+  reserved "audio_muted", "video_muted";
+
+  repeated MuteChange changes = 3;
+}
+
+// One kind's requested mute: set `media_kind` to `muted`. Shared by
+// `MuteRequest` and `ServerMuteRequest` (the authority is the enclosing
+// message). REQUESTS ONLY: deliberately not `MediaKindState`, whose server and
+// client-state fields would be meaningless and attacker-settable here.
+message MuteChange {
+  MediaKind media_kind = 1;
+  bool muted = 2;
 }
 
 // Notification of participant mute state change.
 //
-// EMISSION (carrier map and presence rules: Mute-state section header). Every
-// message is a FULL SNAPSHOT of what MC knows, never a delta: the server
-// fields and `server_muted_by` always, each client field iff MC knows it
-// (absent = no fact). A request that changes nothing emits nothing.
+// EMISSION (carrier map: Mute-state section header). Every message is a FULL
+// SNAPSHOT of what MC knows -- `media_states`, exactly one entry per known kind
+// (CONVENTIONS §6) -- never a delta. A request that changes nothing emits
+// nothing.
 //   - A server-mute change goes to EVERY participant, the subject included
 //     (R-10, R-11, R-18 below).
-//   - A client-mute change (a reported fact changed, including the first
-//     report of a kind) goes to every participant EXCEPT the subject. It is
+//   - A client-mute change goes to every participant EXCEPT the subject. It is
 //     coalesced latest-state-wins under a per-meeting bound (ADR-0036 §5
-//     amendment 2026-10-24): under churn a fact may be delayed by the bound,
+//     amendment 2026-10-24): under churn a change may be delayed by the bound,
 //     never dropped by it, and intermediate transitions may be skipped.
 //     Clients MUST NOT infer or count transitions from these messages.
-//   - The subject's own copy (server-mute changes only) carries its client-mute
-//     fields too; the subject MUST NOT treat them as a capture command. Client
+//   - The subject's own copy (server-mute changes only) carries its client
+//     state too; the subject MUST NOT treat it as a capture command. Client
 //     mute is enforced locally.
 //
 // SELF COPY AND RESUMED CAPTURE (story 3 R-18). A participant learns its OWN
@@ -834,49 +910,38 @@ message MuteRequest {
 message ParticipantMuteUpdate {
   string participant_id = 1;
 
-  // Pre-2026-10-24: `bool audio_self_muted = 2; bool video_self_muted = 3;`,
-  // informational snapshots taken at a server-mute change and never a
-  // client-mute source. Retired rather than re-pointed: an old MC still writes
-  // them, and a reader trusting them as facts would show a stale value that
-  // never updates. The fresh optional tags 7/8 below replace them.
-  reserved 2, 3;
-
+  // Pre-2026-10-24: `bool audio_self_muted = 2; bool video_self_muted = 3;`
+  // (informational snapshots, never a client-mute source). Pre-2026-10-25:
+  // `bool audio_server_muted = 4; bool video_server_muted = 5; string
+  // server_muted_by = 6; optional bool audio_client_muted = 7; optional bool
+  // video_client_muted = 8;`. All replaced by the kind-keyed `media_states`
+  // (CONVENTIONS §6); attribution is now per kind
+  // (`MediaKindState.server_muted_by`).
+  reserved 2 to 8;
   reserved "audio_self_muted", "video_self_muted";
+  reserved "audio_server_muted", "video_server_muted", "server_muted_by";
+  reserved "audio_client_muted", "video_client_muted";
 
-  bool audio_server_muted = 4; // Directive withdrawn + ingress drop (ADR-0036 §5)
-  bool video_server_muted = 5; // Directive withdrawn + ingress drop (ADR-0036 §5)
-
-  // Participant id of the actor who applied the server mute, if any.
-  //
-  // SECURITY: server-to-client, but relayed identity. Truncate before logging
-  // (256-byte bound, as `MhConnectionStatus.mh_url`); never log unbounded.
-  string server_muted_by = 6;
-
-  // Client mute: enforced at capture, PAUSED at MH. Set iff MC knows (section
-  // header); absent = no fact.
-  optional bool audio_client_muted = 7;
-  // As `audio_client_muted`, for video.
-  optional bool video_client_muted = 8;
+  repeated MediaKindState media_states = 9;
 }
 
 // Server-mute request: mute a participant by meeting policy (ADR-0036 §5).
 // Enforced by MC (the kind's send directive is withdrawn) and MH (ingress
 // drop, the backstop), unlike `MuteRequest`, which the client enforces at
-// capture. Renamed from the pre-ADR-0036 `HostMuteRequest`; same message, same
-// tag, no behaviour change.
+// capture. Renamed from the pre-ADR-0036 `HostMuteRequest`.
 //
 // Host-only, requester taken from the connection, refused generically and
-// counted, rate-bounded (story 2 R-8; story 3 R-15 extends it per kind).
-//
-// Per-kind fields are `optional bool` (story 3 R-15; presence rules at the
-// section header). Each kind is independent: absent = unchanged, and both
-// absent is refused with the generic message and counted. Before MC-B, MC
-// folded both fields into one mute/unmute action, so a request about one kind
-// could change the other.
+// counted, rate-bounded (story 2 R-8; story 3 R-15 extends it per kind). A
+// non-host receives the same refusal whatever it sends, malformed lists
+// included. Kind-keyed (section header); a kind the TARGET does not publish
+// refuses the whole request with the same reply as an unknown target.
 message ServerMuteRequest {
   string participant_id = 1;
-  optional bool audio_muted = 2;
-  optional bool video_muted = 3;
+
+  // Pre-2026-10-25: `optional bool audio_muted = 2; optional bool video_muted
+  // = 3;`, replaced by the kind-keyed `changes` (CONVENTIONS §6).
+  reserved 2, 3;
+  reserved "audio_muted", "video_muted";
 
   // Optional free-text reason. Accepted by MC but NOT relayed:
   // `ParticipantMuteUpdate` has no reason field, so the muted participant
@@ -885,6 +950,8 @@ message ServerMuteRequest {
   // SECURITY: client-controlled. Consumers MUST truncate before logging
   // (256-byte bound) and MUST NOT render it as trusted markup.
   string reason = 4;
+
+  repeated MuteChange changes = 5;
 }
 
 // Participant request to unmute after being server-muted.
@@ -893,8 +960,10 @@ message ServerMuteRequest {
 // MC->host as `ServerMessage.unmute_request`. Receiving it does NOT lift a
 // server mute (R-10); see `participant_id`.
 message UnmuteRequest {
-  bool request_audio = 1;
-  bool request_video = 2;
+  // Pre-2026-10-25: `bool request_audio = 1; bool request_video = 2;`,
+  // replaced by the kind-keyed `media_kinds` (CONVENTIONS §6).
+  reserved 1, 2;
+  reserved "request_audio", "request_video";
 
   // Server-stamped on the MC->host relay: MC sets this to the requester's
   // participant id from the authenticated connection and OVERWRITES any value
@@ -904,21 +973,26 @@ message UnmuteRequest {
   // wire; only the MC-stamped relay value is trustworthy. Identity relayed to
   // the host: truncate before logging (256-byte bound, as
   // `MhConnectionStatus.mh_url`), never log unbounded (same register as
-  // `ParticipantMuteUpdate.server_muted_by`). Receiving this does NOT lift a
-  // server mute; only the host's ServerMuteRequest with that kind set false does
+  // `MediaKindState.server_muted_by`). Receiving this does NOT lift a server
+  // mute; only the host's ServerMuteRequest with that kind set false does
   // (R-10).
   //
   // Tag 3, not 1 as `participant_id` is on most messages in this file, because
   // 1 and 2 were taken when it was added. Deliberate; do not renumber.
   string participant_id = 3;
+
+  // The kinds the participant asks to have lifted (a map by kind,
+  // CONVENTIONS §6). Client->MC: refused whole (generic, counted) when empty,
+  // malformed, or naming a kind the requester does not publish. MC->host
+  // relay: re-encoded by MC from the PARSED set, restricted to the kinds
+  // currently server-muted for the requester -- never the client's bytes.
+  repeated MediaKind media_kinds = 4;
 }
 
-// Response to an unmute request from a participant with mute authority.
-message UnmuteResponse {
-  string participant_id = 1;
-  bool audio_approved = 2;
-  bool video_approved = 3;
-}
+// `UnmuteResponse` (`participant_id = 1; audio_approved = 2; video_approved =
+// 3`) was DELETED 2026-10-25: no sender or receiver existed (the host lifts a
+// mute with `ServerMuteRequest`). Its envelope tags are reserved in
+// `ClientMessage` and `ServerMessage`.
 
 // ============================================================================
 // ADR-0023: MC Migration / Redirect
@@ -1052,8 +1126,7 @@ message ReceiveCapability {
   // capped PER KIND by server-side configuration (ADR-0036 §6, amendment
   // 2026-10-13): MC TRUNCATES each kind to its cap and reports every excess
   // slot `SLOT_STATE_UNAVAILABLE`, never rejecting the declaration for its
-  // count; the caps are advertised on `JoinResponse.max_audio_receive_slots`
-  // / `max_video_receive_slots`.
+  // count; the caps are advertised on `JoinResponse.receive_slot_caps`.
   repeated ReceiveSlot slots = 1;
 }
 
@@ -1563,6 +1636,11 @@ message ClientMessage {
 
   reserved "subscribe_to_layout", "update_layout", "unsubscribe_layout";
 
+  // Was `UnmuteResponse unmute_response = 10;`, deleted 2026-10-25 (never
+  // sent or handled).
+  reserved 10;
+  reserved "unmute_response";
+
   // Variant tags stay below 20; tags 20+ are envelope-level (see below).
   oneof message {
     JoinRequest join_request = 1;
@@ -1572,7 +1650,6 @@ message ClientMessage {
     MuteRequest mute_request = 7;
     ServerMuteRequest server_mute_request = 8;
     UnmuteRequest unmute_request = 9;
-    UnmuteResponse unmute_response = 10;
     // browser-client-join R-60: replaces MediaConnectionFailed; tag 11
     // reused (one-time wire break — no on-wire clients exist outside
     // this codebase per Clarification Question 9).
@@ -1782,6 +1859,11 @@ message ServerMessage {
   // `StreamAssignment`'s `media_handler_url`.
   reserved 5;
 
+  // Was `UnmuteResponse unmute_response = 10;`, deleted 2026-10-25 (never
+  // sent or handled).
+  reserved 10;
+  reserved "unmute_response";
+
   // Variant tags stay below 20; tags 20+ are envelope-level.
   oneof message {
     JoinResponse join_response = 1;
@@ -1793,7 +1875,6 @@ message ServerMessage {
     // ADR-0023: Additional server messages
     ParticipantMuteUpdate participant_mute_update = 8;
     UnmuteRequest unmute_request = 9; // Participant's request, relayed
-    UnmuteResponse unmute_response = 10; // Response, relayed to participant
     RedirectToMc redirect_to_mc = 11; // MC migration redirect
     // ADR-0036 §6 / §5 / §4
     StreamAssignments stream_assignments = 12;

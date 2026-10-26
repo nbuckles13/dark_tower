@@ -33,8 +33,10 @@ function setup() {
   const mute = (video: boolean, audio = false) =>
     signaling.fire('participantMuteChanged', {
       participantId: 'p1',
-      audioServerMuted: audio,
-      videoServerMuted: video,
+      mediaStates: {
+        audio: { clientState: 'live', serverMuted: audio },
+        video: { clientState: 'live', serverMuted: video },
+      },
     });
   return { signaling, state, lifted, mute };
 }

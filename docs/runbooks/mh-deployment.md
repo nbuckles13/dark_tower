@@ -179,6 +179,8 @@ re-scoped in [Rollback for the media path](#rollback-for-the-media-path).
 2. **WITHIN the v3 era, one component by one version holds** (R-25): MH, MC or the SDK, between
    builds that both contain story 3, with the other components and the ConfigMaps in place. It
    starts, serves and never degrades audio. Video may be absent.
+   **Except MC and the SDK bundle from 2026-10-25 (ADR-0036 §5 amendment of that date): MC and
+   client deploy and revert together.**
 3. **ACROSS the cutover, roll back everything together.** MH, MC, the SDK bundle and the config
    go back as one action. No step proposes a v2 component serving beside a v3 one. The window is
    an outage, not a mode.

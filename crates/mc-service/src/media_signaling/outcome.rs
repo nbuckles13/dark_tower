@@ -284,24 +284,18 @@ pub enum MuteOutcome {
     /// The meeting actor could not be reached. Environmental; the connection is
     /// already terminal by the time this can happen.
     ActorUnavailable,
-    /// The request named a kind this participant does not PUBLISH (its fixed
-    /// join publish set). That kind was ignored: no fact recorded, nothing
-    /// fanned out, no MH disposition (story 3 R-15 fix). Decided on the
-    /// connection BEFORE the no-op short-circuit, the token and any actor hop,
-    /// so it is free to drive and never a ratio denominator. Not a failure.
-    /// EXPECTED ZERO: the stock SDK gates every report on its publish set, so
-    /// a non-zero rate means a modified client or an SDK regression.
-    NotPublished,
+    // `not_published` moved 2026-10-25 to the kind-free
+    // `MuteRejection::NotPublished`: a request naming an unpublished kind is
+    // now refused WHOLE, so it applied no kind to label.
 }
 
 impl MuteOutcome {
     /// Every variant, for exhaustive metric-vocabulary tests.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 4] = [
         Self::Applied,
         Self::Unchanged,
         Self::RateLimited,
         Self::ActorUnavailable,
-        Self::NotPublished,
     ];
 
     /// Bounded metric-label form.
@@ -312,7 +306,6 @@ impl MuteOutcome {
             Self::Unchanged => "unchanged",
             Self::RateLimited => "rate_limited",
             Self::ActorUnavailable => "actor_unavailable",
-            Self::NotPublished => "not_published",
         }
     }
 
@@ -330,6 +323,8 @@ impl MuteOutcome {
 /// Re-exported from its leaf home, [`crate::media_kind`], so the OBS-A call
 /// sites that import it from here keep compiling.
 pub use crate::media_kind::MediaKindLabel;
+
+use crate::media_kind::{KindListRefusal, KindRefusal, RequestListRefusal};
 
 /// The verb a server-mute request asked for (`mc_media_server_mute_requests_total{action}`).
 ///
@@ -529,9 +524,10 @@ pub enum RefusalReplySurface {
 
 impl RefusalReplySurface {
     /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::Mute(MuteSurface::ClientMute),
         Self::Mute(MuteSurface::ServerMute),
+        Self::Mute(MuteSurface::UnmuteRequest),
         Self::Capability,
     ];
 
@@ -556,11 +552,16 @@ pub enum MuteSurface {
     ClientMute,
     /// A host's `ServerMuteRequest`.
     ServerMute,
+    /// A participant's `UnmuteRequest` (story 3, 2026-10-25: kind-keyed, so it
+    /// can be refused for its kind list too). Spelled after the wire MESSAGE,
+    /// unlike the two above, which name the operation: "unmute" alone would
+    /// read as a host lifting a mute, which is `server_mute`.
+    UnmuteRequest,
 }
 
 impl MuteSurface {
     /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
-    pub const ALL: [Self; 2] = [Self::ClientMute, Self::ServerMute];
+    pub const ALL: [Self; 3] = [Self::ClientMute, Self::ServerMute, Self::UnmuteRequest];
 
     /// Bounded metric-label form.
     #[must_use]
@@ -568,34 +569,73 @@ impl MuteSurface {
         match self {
             Self::ClientMute => "client_mute",
             Self::ServerMute => "server_mute",
+            Self::UnmuteRequest => "unmute_request",
         }
     }
 }
 
-/// Why a mute request was rejected BEFORE any kind could be counted
-/// (`mc_media_mute_requests_rejected_total{reason}`; story 3 MC-B).
+/// Why a mute-family request was refused WHOLE for its kind list
+/// (`mc_media_mute_requests_rejected_total{surface, reason}`; story 3 MC-B,
+/// extended 2026-10-25).
 ///
-/// KIND-FREE on purpose: the rejected request names no kind, so it cannot land
-/// on the per-kind mute counters without inventing one. CLIENT-INFLATABLE (a
-/// shape check before any token or actor hop): never a ratio denominator, no
-/// alert.
+/// Definition: a request refused WHOLE for its kind list -- the list is empty,
+/// malformed, or names a kind the subject does not publish. KIND-FREE because
+/// a refused request applied no kind. CLIENT-INFLATABLE: never a ratio
+/// denominator, no alert. `media_kind_unsupported` is deliberately NOT a reason
+/// here (it stays a capability outcome): a screen entry is `not_published` on
+/// every surface, because nobody publishes screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuteRejection {
-    /// Both per-kind fields absent (`MuteChange::parse` refused it). Counted
-    /// for EVERY requester on the server-mute surface, host or not, so
-    /// `not_permitted` there undercounts non-hosts by exactly these requests.
+    /// The list is empty. Counted for EVERY requester on the server-mute
+    /// surface, host or not (as are the other shape reasons), so
+    /// `not_permitted` there undercounts non-hosts by exactly the
+    /// `no_kind_named`, `media_kind_unspecified` and `duplicate_kind` requests.
     NoKindNamed,
+    /// An entry named `MEDIA_KIND_UNSPECIFIED` or an unknown number.
+    MediaKindUnspecified,
+    /// Two entries named the same kind.
+    DuplicateKind,
+    /// A named kind is one the subject does not publish (`VIDEO_SCREEN`
+    /// included). Client mute and unmute: decided on the connection. Server
+    /// mute: decided by the meeting actor after authority and the target
+    /// lookup (host requests only).
+    NotPublished,
 }
 
 impl MuteRejection {
     /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
-    pub const ALL: [Self; 1] = [Self::NoKindNamed];
+    pub const ALL: [Self; 4] = [
+        Self::NoKindNamed,
+        Self::MediaKindUnspecified,
+        Self::DuplicateKind,
+        Self::NotPublished,
+    ];
 
     /// Bounded metric-label form.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::NoKindNamed => "no_kind_named",
+            Self::MediaKindUnspecified => "media_kind_unspecified",
+            Self::DuplicateKind => "duplicate_kind",
+            Self::NotPublished => "not_published",
+        }
+    }
+
+    /// THE mapping of a request-list refusal onto the counted reason. A screen
+    /// entry (`KindRefusal::Unsupported`) is `not_published` on every
+    /// mute-family surface.
+    #[must_use]
+    pub fn of_list(refusal: RequestListRefusal) -> Self {
+        match refusal {
+            RequestListRefusal::NoKindNamed => Self::NoKindNamed,
+            RequestListRefusal::List(KindListRefusal::Duplicate) => Self::DuplicateKind,
+            RequestListRefusal::List(KindListRefusal::Kind(KindRefusal::Unspecified)) => {
+                Self::MediaKindUnspecified
+            }
+            RequestListRefusal::List(KindListRefusal::Kind(KindRefusal::Unsupported)) => {
+                Self::NotPublished
+            }
         }
     }
 }
@@ -1134,7 +1174,7 @@ mod tests {
             assert_eq!(k.index(), i);
             assert_eq!(k.of(MediaKindLabel::per_kind(|x| x)), k);
             assert_eq!(k.of(MediaKindLabel::per_kind(MediaKindLabel::index)), i);
-            assert_eq!(k.pick("audio", "video"), k.label());
+            assert_eq!(k.of(["audio", "video"]), k.label());
         }
     }
 
@@ -1161,6 +1201,35 @@ mod tests {
         let labels: HashSet<&str> = RefusalReplySurface::ALL.iter().map(|s| s.label()).collect();
         assert_eq!(labels.len(), RefusalReplySurface::ALL.len());
         assert_eq!(MuteRejection::NoKindNamed.label(), "no_kind_named");
+        assert_eq!(MuteSurface::UnmuteRequest.label(), "unmute_request");
+        // Screen on any mute-family surface is `not_published` (one mapping,
+        // shared by all three surfaces).
+        assert_eq!(
+            MuteRejection::of_list(RequestListRefusal::List(KindListRefusal::Kind(
+                KindRefusal::Unsupported
+            ))),
+            MuteRejection::NotPublished
+        );
+        assert_eq!(
+            MuteRejection::of_list(RequestListRefusal::List(KindListRefusal::Kind(
+                KindRefusal::Unspecified
+            ))),
+            MuteRejection::MediaKindUnspecified
+        );
+        assert_eq!(
+            MuteRejection::of_list(RequestListRefusal::List(KindListRefusal::Duplicate)),
+            MuteRejection::DuplicateKind
+        );
+        assert_eq!(
+            MuteRejection::of_list(RequestListRefusal::NoKindNamed),
+            MuteRejection::NoKindNamed
+        );
+        let reasons: HashSet<&str> = MuteRejection::ALL.iter().map(|r| r.label()).collect();
+        assert_eq!(reasons.len(), MuteRejection::ALL.len());
+        assert!(
+            !reasons.contains("media_kind_unsupported"),
+            "media_kind_unsupported stays a capability outcome"
+        );
     }
 
     #[test]

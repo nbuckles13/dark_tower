@@ -71,16 +71,24 @@ import type {
 } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 
 import { closesConnection, mapErrorCode, staticMessageFor } from './errorCodeMap.js';
-import { MAX_RELAYED_PARTICIPANT_ID_LENGTH, mapLeaveReason } from './events.js';
+import { mapLeaveReason } from './events.js';
 import { takeMeetingKek, type MeetingKekSink } from './kekIntake.js';
 import { MEDIA_KEK_SOURCES } from '../media/setup/mediaMetrics.js';
 import { SUPPORTED_HEADER_VERSIONS } from '../media/frame/frameCodec.js';
 import { RosterKeyFeed } from './rosterKeyFeed.js';
 import { mediaKindToken, slotStateToken, wireMediaKind } from './slotStateMap.js';
-import { singleKindMuteFields } from './muteRequest.js';
+import { singleKindMuteChanges } from './muteRequest.js';
+import {
+  boundRelayedId,
+  CONTRACT_FAULT_REASONS,
+  decodeMediaStates,
+  decodeReceiveSlotCaps,
+  decodeRelayedKinds,
+  type ContractFaultReason,
+} from './mediaKindStates.js';
 import type { MediaKindToken } from '../media/mediaKind.js';
 import type {
-  ClientMuteFacts,
+  ParticipantMediaStates,
   ParticipantMuteEvent,
   PublishKind,
   RosterParticipant,
@@ -194,41 +202,35 @@ export interface SignalingEventMap {
    * from that frame's own `key_id.sender_id`, never from an assignment.
    */
   streamAssignments: StreamAssignmentsEvent;
-  /** A participant's SERVER mute changed, or was replayed at join (story 2 R-11). */
+  /** A participant's per-kind mute state changed (a full snapshot; story 2 R-11, story 3 R-15). */
   participantMuteChanged: ParticipantMuteEvent;
   /** MC relayed a server-muted participant's unmute request (host only, R-10). */
   unmuteRequested: UnmuteRequestedEvent;
 }
 
-/** Bound an MC-relayed id; an empty string reads as absent. */
-function relayedId(raw: string): string | undefined {
-  return raw === '' ? undefined : raw.slice(0, MAX_RELAYED_PARTICIPANT_ID_LENGTH);
-}
-
-/**
- * The wire's client-mute pair, presence preserved (`optional bool` -> `boolean |
- * undefined`; absent is "no fact", never coerced to `false` — `ClientMuteFacts`).
- * ONE projection for both carriers, the roster entry and `ParticipantMuteUpdate`.
- */
-function clientMuteFactsOf(wire: {
-  readonly audioClientMuted?: boolean | undefined;
-  readonly videoClientMuted?: boolean | undefined;
-}): ClientMuteFacts {
-  return {
-    ...(wire.audioClientMuted !== undefined ? { audioClientMuted: wire.audioClientMuted } : {}),
-    ...(wire.videoClientMuted !== undefined ? { videoClientMuted: wire.videoClientMuted } : {}),
-  };
-}
-
 /** ONE wire -> public roster entry map, for `JoinResponse` and `ParticipantJoined` alike. */
-function rosterParticipantOf(p: Participant): RosterParticipant {
+function rosterParticipantOf(
+  p: Participant,
+  mediaStates: ParticipantMediaStates,
+): RosterParticipant {
   return {
     participantId: p.participantId,
     name: p.name,
     // `optional uint32` -> `number | undefined`; never coerced to 0.
     senderId: p.senderId,
-    ...clientMuteFactsOf(p),
+    mediaStates,
   };
+}
+
+/**
+ * A decode that ends the session: the static message plus the bounded reason.
+ * Never wire content (the decoded message may hold the meeting KEK).
+ */
+function contractFaultError(reason: ContractFaultReason): SignalingError {
+  return new SignalingError(
+    SignalingErrorCode.ContractFault,
+    `${staticMessageFor(SignalingErrorCode.ContractFault)} (${reason})`,
+  );
 }
 
 interface Deferred<T> {
@@ -475,8 +477,8 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     });
     // Copied and frozen: the caller's array cannot change what this
     // membership publishes (story 3 R-2), and a future reconnect re-sends this.
-    const publishKinds = Object.freeze([...params.publishKinds]);
-    this.#publishKinds = publishKinds;
+    const publish = Object.freeze(params.publish.map((p) => Object.freeze({ ...p })));
+    this.#publishKinds = Object.freeze(publish.map((p) => p.kind));
     const joinRequest = create(JoinRequestSchema, {
       meetingId: params.meetingId,
       joinToken: params.joinToken,
@@ -493,10 +495,14 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       ...(params.identityPublicKey !== undefined
         ? { identityPublicKey: params.identityPublicKey }
         : {}),
-      // Story 3 R-2: what this participant publishes and its INITIAL receive
-      // declaration ride the join, so MC's neither-publish-nor-receive check
-      // runs here. Closed wire kinds only.
-      publishKinds: publishKinds.map(wireMediaKind),
+      // Story 3 R-2: what this participant publishes (with each kind's client
+      // mute, so peers never see a joiner without a state) and its INITIAL
+      // receive declaration ride the join, so MC's neither-publish-nor-receive
+      // check runs here. Empty is receive-only. Closed wire kinds only.
+      publishedKinds: publish.map((p) => ({
+        mediaKind: wireMediaKind(p.kind),
+        clientMuted: p.clientMuted,
+      })),
       receiveCapability: receiveCapabilityMessage(params.receiveSlots),
     });
     const clientMessage = create(ClientMessageSchema, {
@@ -631,6 +637,22 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     switch (message.case) {
       case 'joinResponse': {
         const jr = message.value;
+        // CONTRACT CHECK FIRST, before ANY side effect (KEK intake, roster keys,
+        // stored ids): a malformed snapshot applies nothing and fails the join.
+        const caps = decodeReceiveSlotCaps(jr.receiveSlotCaps);
+        if (caps === undefined) {
+          this.#contractFault(CONTRACT_FAULT_REASONS.ReceiveSlotCapsMalformed);
+          return;
+        }
+        const existingParticipants: RosterParticipant[] = [];
+        for (const p of jr.existingParticipants) {
+          const mediaStates = decodeMediaStates(p.mediaStates);
+          if (mediaStates === undefined) {
+            this.#contractFault(CONTRACT_FAULT_REASONS.MediaStatesMalformed);
+            return;
+          }
+          existingParticipants.push(rosterParticipantOf(p, mediaStates));
+        }
         // R-17: store for future reconnection (storage only).
         this.#correlationId = jr.correlationId;
         this.#bindingToken = jr.bindingToken;
@@ -646,11 +668,10 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           // `optional uint32` → `number | undefined`. Absence is passed
           // through, never coerced to 0 (ADR-0036 §2: 0 is reserved-invalid).
           senderId: jr.senderId,
-          // `optional uint32`: absent stays absent (caps unknown), a present 0
-          // stays 0 (legal; video 0 is the video-off lever).
-          maxAudioReceiveSlots: jr.maxAudioReceiveSlots,
-          maxVideoReceiveSlots: jr.maxVideoReceiveSlots,
-          existingParticipants: jr.existingParticipants.map(rosterParticipantOf),
+          // Required, one per kind; a present 0 stays 0 (video 0 is the
+          // video-off lever).
+          receiveSlotCaps: caps,
+          existingParticipants,
           mediaServers: jr.mediaServers.map((m) => m.mediaHandlerUrl),
           correlationId: jr.correlationId,
           bindingToken: jr.bindingToken,
@@ -662,8 +683,17 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       case 'participantJoined': {
         const participant = message.value.participant;
         if (participant !== undefined) {
+          const mediaStates = decodeMediaStates(participant.mediaStates);
+          // A fault ends the session: the participant is never added half-known
+          // (and never silently dropped, which would hide them).
+          if (mediaStates === undefined) {
+            this.#contractFault(CONTRACT_FAULT_REASONS.MediaStatesMalformed);
+            return;
+          }
           this.#rosterKeys.joined([participant]);
-          this.emit('participantJoined', { participant: rosterParticipantOf(participant) });
+          this.emit('participantJoined', {
+            participant: rosterParticipantOf(participant, mediaStates),
+          });
         }
         return;
       }
@@ -736,32 +766,34 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         return;
       }
       case 'participantMuteUpdate': {
-        // All four mute facts, per kind (see `ParticipantMuteEvent`). Client
-        // mute is `optional bool`, passed through with its presence (absent =
-        // no fact, never `false`; `ClientMuteFacts`). Ids are MC-relayed:
-        // bounded before they leave the decode boundary.
-        // One rule for both relays: an empty id carries nothing renderable and
-        // is dropped (as for `unmuteRequest` below).
+        // A FULL per-kind snapshot (`ParticipantMuteEvent`), through the one
+        // decoder; a contract fault ends the session and applies nothing. Ids
+        // are MC-relayed: bounded before they leave the decode boundary, and an
+        // empty one carries nothing renderable and is dropped (as for
+        // `unmuteRequest` below).
         const update = message.value;
-        const participantId = relayedId(update.participantId);
+        const mediaStates = decodeMediaStates(update.mediaStates);
+        if (mediaStates === undefined) {
+          this.#contractFault(CONTRACT_FAULT_REASONS.MediaStatesMalformed);
+          return;
+        }
+        const participantId = boundRelayedId(update.participantId);
         if (participantId === undefined) return;
-        const anyServerMuted = update.audioServerMuted || update.videoServerMuted;
-        const serverMutedBy = anyServerMuted ? relayedId(update.serverMutedBy) : undefined;
-        this.emit('participantMuteChanged', {
-          participantId,
-          audioServerMuted: update.audioServerMuted,
-          videoServerMuted: update.videoServerMuted,
-          ...(serverMutedBy !== undefined ? { serverMutedBy } : {}),
-          ...clientMuteFactsOf(update),
-        });
+        this.emit('participantMuteChanged', { participantId, mediaStates });
         return;
       }
       case 'unmuteRequest': {
         // MC's relay to the host. `participant_id` is MC-stamped from the
         // requester's authenticated connection; an empty one carries nothing
         // renderable and is dropped rather than shown as "someone".
-        const requester = relayedId(message.value.participantId);
-        if (requester !== undefined) this.emit('unmuteRequested', { participantId: requester });
+        const requester = boundRelayedId(message.value.participantId);
+        if (requester === undefined) return;
+        const kinds = decodeRelayedKinds(message.value.mediaKinds);
+        if (kinds === undefined) {
+          this.#contractFault(CONTRACT_FAULT_REASONS.UnmuteRequestMalformed);
+          return;
+        }
+        this.emit('unmuteRequested', { participantId: requester, kinds });
         return;
       }
       case 'error': {
@@ -815,8 +847,11 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
    * an unwatched kind withdraws it (signaling.proto `SendDirective`; ADR-0036
    * §5, amendments 2026-10-13 and 2026-10-23).
    *
-   * ONE KIND PER REQUEST (story 3 R-15): `kind` at `muted`; the other kind's
-   * field is left ABSENT, which MC reads as "unchanged". See `muteRequest.ts`.
+   * ONE KIND PER REQUEST (story 3 R-15): one `MuteChange` for `kind` at
+   * `muted`; a kind absent from `changes` is "unchanged" at MC. See
+   * `muteRequest.ts`. A kind this participant does not publish is refused
+   * WHOLE by MC (`not_published`), so the session never sends one
+   * (`mediaWiring.ts:bestEffortMuteReport`).
    *
    * @throws {SignalingError} `Transport` if called before join settled or after teardown.
    */
@@ -825,7 +860,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     const clientMessage = create(ClientMessageSchema, {
       message: {
         case: 'muteRequest',
-        value: create(MuteRequestSchema, singleKindMuteFields(kind, muted)),
+        value: create(MuteRequestSchema, { changes: singleKindMuteChanges(kind, muted) }),
       },
     });
     await this.runInJoinContext(() => this.#sendClientMessage(stream, clientMessage));
@@ -838,9 +873,9 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
    * TARGET AND ACTION ONLY. The message has no requester field, and none is
    * invented: MC identifies the requester from this authenticated connection and
    * decides authority itself. `reason` is left empty (it is client-controlled and
-   * MC does not relay it). ONE KIND PER REQUEST (story 3 R-15): the
-   * target's `kind` at `muted`; the other kind's field is left ABSENT, so MC
-   * leaves the target's other kind exactly as it is (`muteRequest.ts`). A
+   * MC does not relay it). ONE KIND PER REQUEST (story 3 R-15): one
+   * `MuteChange` for the target's `kind` at `muted`; MC leaves every kind
+   * absent from `changes` exactly as it is (`muteRequest.ts`). A
    * refusal arrives as a post-join `FORBIDDEN` session error, which does NOT
    * close the connection (`errorCodeMap.closesConnection`).
    *
@@ -857,7 +892,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         case: 'serverMuteRequest',
         value: create(ServerMuteRequestSchema, {
           participantId: targetParticipantId,
-          ...singleKindMuteFields(kind, muted),
+          changes: singleKindMuteChanges(kind, muted),
         }),
       },
     });
@@ -865,20 +900,31 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   }
 
   /**
-   * Ask the host to lift this participant's server mute (R-10).
+   * Ask the host to lift this participant's server mute (R-10) for `kinds` —
+   * the kinds this participant's own copy says ARE server-muted (MC relays only
+   * when the requester is server-muted in a kind it names, and refuses an empty
+   * list as `no_kind_named`).
    *
    * NOTIFIES ONLY: MC relays it to the host and never clears the mute on it. No
    * `participant_id` is sent — MC stamps the requester from this connection and
    * overwrites any client value anyway.
    *
-   * @throws {SignalingError} `Transport` if called before join settled or after teardown.
+   * @throws {SignalingError} `InvalidRequest` (local, nothing sent) for an empty
+   *   or duplicated `kinds`; `Transport` if called before join settled or after
+   *   teardown.
    */
-  async sendUnmuteRequest(): Promise<void> {
+  async sendUnmuteRequest(kinds: readonly MediaKindToken[]): Promise<void> {
     const stream = this.#requireOpenStream('sendUnmuteRequest');
+    if (kinds.length === 0 || new Set(kinds).size !== kinds.length) {
+      throw new SignalingError(
+        SignalingErrorCode.InvalidRequest,
+        'an unmute request names each server-muted kind once, and at least one',
+      );
+    }
     const clientMessage = create(ClientMessageSchema, {
       message: {
         case: 'unmuteRequest',
-        value: create(UnmuteRequestSchema, { requestAudio: true, requestVideo: false }),
+        value: create(UnmuteRequestSchema, { mediaKinds: kinds.map(wireMediaKind) }),
       },
     });
     await this.runInJoinContext(() => this.#sendClientMessage(stream, clientMessage));
@@ -902,6 +948,18 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       unreachableSenderIds: [...this.#lastUnreachable],
     };
     this.emit('streamAssignments', event);
+  }
+
+  /**
+   * END the session on a malformed kind-keyed snapshot (`mediaKindStates.ts`):
+   * WARN with the bounded reason (a fixed literal and a closed vocabulary — no
+   * identifier, no wire content), then terminate with the typed `ContractFault`
+   * error — `join()` rejects with it during the join, `error` is emitted after
+   * it, and the connection closes either way. The caller applies nothing.
+   */
+  #contractFault(reason: ContractFaultReason): void {
+    console.warn('[dt-signaling-contract]', `malformed kind-keyed snapshot from MC: ${reason}`);
+    this.#terminate(contractFaultError(reason));
   }
 
   #requireOpenStream(what: string): WebTransportBidirectionalStream {

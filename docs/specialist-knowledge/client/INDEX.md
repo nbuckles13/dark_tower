@@ -10,8 +10,8 @@
 - Signaling client / meeting session (single-use per join) → `signaling/SignalingClient.ts`, `session/MeetingSession.ts`
 - Session event surface (mute / first-media / slot / fault) → `session/events.ts:MeetingSessionEventMap`; `StreamAssignments` + unreachable senders → `signaling/events.ts:StreamAssignmentsEvent`
 - Session↔media wiring (rebind purge, KEK observer, per-kind send directives, video encoding validation, MH control sink → keyframe gate) → `session/mediaWiring.ts:sendDirectiveListener`, `validateVideoEncoding`, `mhControlSink`
-- Signalling media state (E3 cache, mute) + R-18 tracker (S1); publish set + slot plan + declaration + capture source (audio + video/test pattern) → `session/{signalingMediaState,serverMuteResume,slotPlan,mediaSelection}.ts`; session-owned transmit keys + KEK subscription + VP8 join probe → `MeetingSession.ts:startMedia`
-- Flat slot-state map (exhaustive `Record<SlotState, …>`) + pairing view + single-kind mute builder (other kind absent = unchanged) → `signaling/{slotStateMap,pairing,muteRequest}.ts`
+- Signalling media state (E3 cache, mute, server mute seeded from roster) + R-18 tracker (S1); publish set + slot plan + declaration + capture source (audio + video/test pattern) → `session/{signalingMediaState,serverMuteResume,slotPlan,mediaSelection}.ts`; session-owned transmit keys + KEK subscription + VP8 join probe → `MeetingSession.ts:startMedia`; join publish declaration + join-window mute catch-up → `MeetingSession.ts:#declarePublish`, `#catchUpClientMuteAfterJoin`
+- Flat slot-state map (exhaustive `Record<SlotState, …>`) + pairing view + single-kind `MuteChange` builder + THE kind-keyed snapshot decoder (CONVENTIONS §6: one entry per known kind, else session-fatal `ContractFault` + bounded `[dt-signaling-contract]` WARN) → `signaling/{slotStateMap,pairing,muteRequest,mediaKindStates}.ts`
 - Host role hint → `session/meetingRole.ts`; base64url → `encoding/base64url.ts`; error codes (closing vs refusal) → `signaling/errorCodeMap.ts:closesConnection()`, `errors/`
 - WebTransport length-prefix framing → `framing/{length-prefix,sendFramed}.ts`; connection mgmt, datagrams, uni streams, MH control channel → `transport/`, `media/MediaTransport.ts:sendRecoveryRequest`
 - HTTP/3 meeting API; generated protobuf-es types (gitignored); wire→public codec oracle; validation SSoT → `http/`, `proto/dark_tower/`, `signaling/codecMap.ts`, `validation/limits.ts`
@@ -37,13 +37,13 @@
 - Join-label roster guards → `__tests__/{joinLabelSpread,joinLabelRoster,stripComments}.ts`
 
 ## Svelte Adapter (`packages/sdk-svelte/src/`)
-- Roster store → `stores/MeetingStore.svelte.ts`; media/mute/slot/fault store + R-18 notice latch → `stores/MediaStore.svelte.ts`; per-slot / per-participant / pairing cells (readers never construct) → `stores/mediaCells.svelte.ts:CellRegistry`
+- Roster store → `stores/MeetingStore.svelte.ts`; media/mute/slot/fault store + R-18 notice latch → `stores/MediaStore.svelte.ts`; per-slot / per-participant (per-kind `KindMediaCell`) / pairing cells (readers never construct) → `stores/mediaCells.svelte.ts:CellRegistry`
 - Session-to-store binding → `stores/bindMeetingSession.ts`; granularity proof (tile / participant / frames) → `__tests__/MediaStore.test.ts`; video render surface (canvas `VideoSink`, `onSurface`) → `components/VideoTile.svelte`
 
 ## Web Application (`packages/web-app/src/`)
 - Join + publish-set chooser → `views/JoinMeeting.svelte`; one attempt (build/bind/join, roster DOM) → `views/MeetingRoom.svelte`; in-meeting (audio rows, video grid, own controls, R-19) → `views/InMeeting.svelte`; tile / four indicators / R-18 notice / roster row + per-kind host controls → `views/{VideoSlotTile,MuteIndicators,ResumeNotice,ParticipantRow}.svelte`
 - Local-only debug panel (R-7 loopback, R-35 overlay) → `views/DebugPanel.svelte`, `lib/{selfCheck,debugStats,debugToggle}.ts`, scan `tests/debugNeverExported.test.ts`; SDK → `session/localDebugSurface.ts`, `media/lifecycle/localStats.ts`, `media/setup/localPreview.ts`
-- Slot-state copy (ONE exhaustive table) → `lib/slotState.ts`; participant copy + client mute from roster facts (never slots), bounded names, self camera → `lib/participantState.ts`; auth/meeting views → `views/{SignIn,SignUp,CreateMeeting}.svelte`
+- Slot-state copy (ONE exhaustive table) → `lib/slotState.ts`; participant copy + per-kind client state (`not_published`/`live`/`client_muted`, no "unknown") from roster cells (never slots), bounded names, self camera → `lib/participantState.ts`; auth/meeting views → `views/{SignIn,SignUp,CreateMeeting}.svelte`
 - Session wiring, config, error text → `lib/{session,config,errorText}.ts`; test-only build defines (one predicate) → `vite/testDefines.ts`; test levers → `lib/testLevers.ts`
 - E2E bus (incl. `videoSlots`, `sendCounts`) + per-lane analysis + render-surface lumas (under `__E2E_HOOKS__`) → `lib/{e2eBus,e2eAnalysis}.ts`; contract round-trip → `__tests__/e2eBus.test.ts`
 - Vite proxy / cert fingerprints → `vite.config.ts`, `vite/fingerprints.ts`; prod-absence bundle scan → `tests/bundle-content.test.ts`

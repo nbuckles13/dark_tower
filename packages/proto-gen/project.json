@@ -10,14 +10,16 @@
         "{workspaceRoot}/proto/**/*.proto",
         "{workspaceRoot}/proto/buf.yaml",
         "{workspaceRoot}/proto/buf.gen.yaml",
+        "{projectRoot}/scripts/codegen.sh",
+        "{projectRoot}/scripts/codegen-paths.sh",
         "{projectRoot}/package.json"
       ],
       "outputs": [
         "{workspaceRoot}/packages/sdk-core/src/proto/**/*_pb.ts"
       ],
       "options": {
-        "command": "pnpm exec buf generate",
-        "cwd": "proto"
+        "command": "bash scripts/codegen.sh",
+        "cwd": "packages/proto-gen"
       },
       "cache": true
     },
@@ -33,7 +35,7 @@
       },
       "cache": true
     },
-    "test": {
+    "test:unit": {
       "executor": "nx:run-commands",
       "dependsOn": ["codegen"],
       "inputs": [
@@ -41,6 +43,7 @@
         "{workspaceRoot}/proto/buf.yaml",
         "{workspaceRoot}/proto/buf.gen.yaml",
         "{projectRoot}/scripts/verify-codegen.sh",
+        "{projectRoot}/scripts/codegen-paths.sh",
         "{projectRoot}/package.json"
       ],
       "options": {

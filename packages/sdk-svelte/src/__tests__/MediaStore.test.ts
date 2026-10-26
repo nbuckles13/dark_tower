@@ -22,6 +22,7 @@ import BoundHarness from './helpers/BoundHarness.svelte';
 import GranularityHarness from './helpers/GranularityHarness.svelte';
 import CellGranularityHarness from './helpers/CellGranularityHarness.svelte';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
+import { mediaStates } from './helpers/mediaStates.js';
 
 function slot(overrides: Partial<StreamAssignmentEvent> = {}): StreamAssignmentEvent {
   return {
@@ -234,7 +235,9 @@ test('a mute toggle does not recompute the roster projection', async () => {
   const screen = await render(GranularityHarness, { session, counts });
 
   session.fire('stateChange', MeetingSessionState.Joined);
-  session.fire('participantJoined', { participant: { participantId: 'a', name: 'Ann' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'a', name: 'Ann', mediaStates: mediaStates() },
+  });
   await expect.element(screen.getByTestId('roster-text')).toHaveTextContent('Ann');
 
   const rosterBaseline = counts.roster;
@@ -257,7 +260,9 @@ test('a mute toggle does not recompute the roster projection', async () => {
   expect(counts.mute).toBeGreaterThan(muteBaseline);
 
   const rosterBeforeJoin = counts.roster;
-  session.fire('participantJoined', { participant: { participantId: 'b', name: 'Bob' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'b', name: 'Bob', mediaStates: mediaStates() },
+  });
   await expect.element(screen.getByTestId('roster-text')).toHaveTextContent('Ann,Bob');
   expect(counts.roster).toBeGreaterThan(rosterBeforeJoin);
 });
@@ -269,13 +274,17 @@ test('a roster change does not recompute the mute projection', async () => {
   const session = new MockMeetingSession();
   const screen = await render(GranularityHarness, { session, counts });
 
-  session.fire('participantJoined', { participant: { participantId: 'a', name: 'Ann' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'a', name: 'Ann', mediaStates: mediaStates() },
+  });
   await expect.element(screen.getByTestId('roster-text')).toHaveTextContent('Ann');
 
   const muteBaseline = counts.mute;
   const rosterBaseline = counts.roster;
 
-  session.fire('participantJoined', { participant: { participantId: 'b', name: 'Bob' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'b', name: 'Bob', mediaStates: mediaStates() },
+  });
   await expect.element(screen.getByTestId('roster-text')).toHaveTextContent('Ann,Bob');
 
   expect(counts.mute).toBe(muteBaseline);
@@ -289,153 +298,183 @@ test('a roster change does not recompute the mute projection', async () => {
 
 test('server mutes come ONLY from participantMuteChanged, per participant and per kind', () => {
   const store = new MediaStore();
-  expect(store.participant('b').audioServerMuted).toBe(false);
-  expect(store.participant('b').videoServerMuted).toBe(false);
+  expect(store.participant('b').kind('audio').serverMuted).toBe(false);
+  expect(store.participant('b').kind('video').serverMuted).toBe(false);
   store.applyParticipantMute({
     participantId: 'b',
-    audioServerMuted: true,
-    videoServerMuted: false,
+    mediaStates: mediaStates({ audio: { serverMuted: true, serverMutedBy: 'h' } }),
+  });
+  expect(store.participant('b').kind('audio')).toMatchObject({
+    serverMuted: true,
     serverMutedBy: 'h',
   });
-  expect(store.participant('b').audioServerMuted).toBe(true);
-  expect(store.participant('b').videoServerMuted).toBe(false);
-  expect(store.participant('b').serverMutedBy).toBe('h');
+  expect(store.participant('b').kind('video').serverMuted).toBe(false);
   store.applyParticipantMute({
     participantId: 'c',
-    audioServerMuted: false,
-    videoServerMuted: true,
+    mediaStates: mediaStates({ video: { serverMuted: true, serverMutedBy: 'h2' } }),
   });
   // Another participant's update leaves b exactly as it was.
-  expect(store.participant('b').audioServerMuted).toBe(true);
-  expect(store.participant('c').videoServerMuted).toBe(true);
+  expect(store.participant('b').kind('audio').serverMuted).toBe(true);
+  expect(store.participant('c').kind('video')).toMatchObject({
+    serverMuted: true,
+    serverMutedBy: 'h2',
+  });
   store.applyParticipantMute({
     participantId: 'b',
-    audioServerMuted: false,
-    videoServerMuted: false,
-    serverMutedBy: 'h',
+    mediaStates: mediaStates({ audio: { serverMuted: false, serverMutedBy: 'h' } }),
   });
-  expect(store.participant('b').audioServerMuted).toBe(false);
+  expect(store.participant('b').kind('audio').serverMuted).toBe(false);
   // Who muted is meaningful only while muted.
-  expect(store.participant('b').serverMutedBy).toBeUndefined();
+  expect(store.participant('b').kind('audio').serverMutedBy).toBeUndefined();
 });
 
-test('client mute of others (R-15): roster seeds, updates move, ABSENT never changes a fact', () => {
+test('per-kind state of others (R-15): roster seeds every kind, updates move it, no "unknown"', () => {
   const store = new MeetingStore();
-  // No fact yet: unknown, never a coerced false.
-  expect(store.media.participant('m').audioClientMuted).toBeUndefined();
   store.applyJoined({
     participantId: 'self',
+    receiveSlotCaps: { audio: 8, video: 8 },
     existingParticipants: [
-      { participantId: 'm', name: 'M', audioClientMuted: true, videoClientMuted: false },
-      { participantId: 'f', name: 'F' },
+      {
+        participantId: 'm',
+        name: 'M',
+        mediaStates: mediaStates({
+          audio: { clientState: 'client_muted' },
+          video: { clientState: 'not_published' },
+        }),
+      },
+      { participantId: 'f', name: 'F', mediaStates: mediaStates() },
     ],
     mediaServers: [],
     correlationId: '',
     bindingToken: '',
   });
-  expect(store.media.participant('m').audioClientMuted).toBe(true);
-  expect(store.media.participant('m').videoClientMuted).toBe(false);
-  // Absent on the roster: still no fact.
-  expect(store.media.participant('f').audioClientMuted).toBeUndefined();
-  expect(store.media.participant('f').videoClientMuted).toBeUndefined();
+  expect(store.media.participant('m').kind('audio').clientState).toBe('client_muted');
+  expect(store.media.participant('m').kind('video').clientState).toBe('not_published');
+  expect(store.media.participant('f').kind('audio').clientState).toBe('live');
 
-  // A ParticipantJoined with both absent: unknown, then the joiner's report.
-  store.applyParticipantJoined({ participant: { participantId: 'j', name: 'J' } });
-  expect(store.media.participant('j').audioClientMuted).toBeUndefined();
-  store.media.applyParticipantMute({
-    participantId: 'j',
-    audioServerMuted: false,
-    videoServerMuted: false,
-    audioClientMuted: true,
-    videoClientMuted: false,
+  // A ParticipantJoined of someone who joined muted: muted AT ONCE.
+  store.applyParticipantJoined({
+    participant: {
+      participantId: 'j',
+      name: 'J',
+      mediaStates: mediaStates({ audio: { clientState: 'client_muted' } }),
+    },
   });
-  expect(store.media.participant('j').audioClientMuted).toBe(true);
-  expect(store.media.participant('j').videoClientMuted).toBe(false);
+  expect(store.media.participant('j').kind('audio').clientState).toBe('client_muted');
+  expect(store.media.participant('j').kind('video').clientState).toBe('live');
 
-  // An update with the client fields ABSENT (e.g. a rolled-back MC's server
-  // mute) leaves the known facts exactly as they were.
+  // An update is a full snapshot: per kind, moving video leaves audio as stated.
   store.media.applyParticipantMute({
     participantId: 'm',
-    audioServerMuted: true,
-    videoServerMuted: false,
-    serverMutedBy: 'h',
+    mediaStates: mediaStates({
+      audio: { clientState: 'client_muted' },
+      video: { clientState: 'not_published', serverMuted: false },
+    }),
   });
-  expect(store.media.participant('m').audioClientMuted).toBe(true);
-  expect(store.media.participant('m').videoClientMuted).toBe(false);
-  // Per kind: moving video leaves audio alone.
-  store.media.applyParticipantMute({
-    participantId: 'm',
-    audioServerMuted: true,
-    videoServerMuted: false,
-    serverMutedBy: 'h',
-    videoClientMuted: true,
-  });
-  expect(store.media.participant('m').audioClientMuted).toBe(true);
-  expect(store.media.participant('m').videoClientMuted).toBe(true);
+  expect(store.media.participant('m').kind('audio').clientState).toBe('client_muted');
 });
 
-test('a client-mute change can NEVER clear a server mute (R-15, server mute wins)', () => {
+test('the roster is seeded BEFORE it lists anyone: no listed participant is ever unseeded', () => {
+  const store = new MeetingStore();
+  const seenUnseeded: string[] = [];
+  // Read the cells the instant the roster changes (as a component would).
+  const check = () => {
+    for (const p of store.participants) {
+      if (store.media.participant(p.participantId).kind('audio').clientState === undefined) {
+        seenUnseeded.push(p.participantId);
+      }
+    }
+  };
+  store.applyJoined({
+    participantId: 'self',
+    receiveSlotCaps: { audio: 8, video: 8 },
+    existingParticipants: [{ participantId: 'a', name: 'A', mediaStates: mediaStates() }],
+    mediaServers: [],
+    correlationId: '',
+    bindingToken: '',
+  });
+  check();
+  store.applyParticipantJoined({
+    participant: { participantId: 'b', name: 'B', mediaStates: mediaStates() },
+  });
+  check();
+  expect(store.participants.map((p) => p.participantId)).toEqual(['a', 'b']);
+  expect(seenUnseeded).toEqual([]);
+  // Positive control: an id the roster never listed IS unseeded (the EMPTY view).
+  expect(store.media.participant('never').kind('audio').clientState).toBeUndefined();
+});
+
+test('client and server mute are independent per kind: neither write clears the other', () => {
   const store = new MediaStore();
   store.applyParticipantMute({
     participantId: 'b',
-    audioServerMuted: true,
-    videoServerMuted: true,
-    serverMutedBy: 'h',
-    audioClientMuted: false,
+    mediaStates: mediaStates({
+      audio: { clientState: 'live', serverMuted: true, serverMutedBy: 'h' },
+      video: { clientState: 'live', serverMuted: true, serverMutedBy: 'h' },
+    }),
   });
-  // A roster seed is client-only by type; it cannot reach the server cells.
-  store.applyRosterEntry({ participantId: 'b', audioClientMuted: true, videoClientMuted: true });
-  expect(store.participant('b')).toMatchObject({
-    audioServerMuted: true,
-    videoServerMuted: true,
+  // A client-state change (the participant muted) arrives with server mute unchanged.
+  store.applyParticipantMute({
+    participantId: 'b',
+    mediaStates: mediaStates({
+      audio: { clientState: 'client_muted', serverMuted: true, serverMutedBy: 'h' },
+      video: { clientState: 'client_muted', serverMuted: true, serverMutedBy: 'h' },
+    }),
+  });
+  expect(store.participant('b').kind('audio')).toMatchObject({
+    clientState: 'client_muted',
+    serverMuted: true,
     serverMutedBy: 'h',
-    audioClientMuted: true,
-    videoClientMuted: true,
+  });
+  expect(store.participant('b').kind('video')).toMatchObject({
+    clientState: 'client_muted',
+    serverMuted: true,
   });
 });
 
-test('a participant who LEAVES has their client-mute facts forgotten; a rejoin starts unknown', () => {
+test('a participant who LEAVES and rejoins is seeded afresh by the new roster entry', () => {
   const store = new MeetingStore();
   store.applyParticipantJoined({
-    participant: { participantId: 'r', name: 'R', audioClientMuted: true, videoClientMuted: true },
+    participant: {
+      participantId: 'r',
+      name: 'R',
+      mediaStates: mediaStates({ audio: { clientState: 'client_muted' } }),
+    },
   });
-  expect(store.media.participant('r').audioClientMuted).toBe(true);
   store.applyParticipantLeft({ participantId: 'r', reason: 'voluntary' });
-  expect(store.media.participant('r').audioClientMuted).toBeUndefined();
-  expect(store.media.participant('r').videoClientMuted).toBeUndefined();
-  store.applyParticipantJoined({ participant: { participantId: 'r', name: 'R' } });
-  expect(store.media.participant('r').audioClientMuted).toBeUndefined();
+  store.applyParticipantJoined({
+    participant: {
+      participantId: 'r',
+      name: 'R',
+      mediaStates: mediaStates({ video: { clientState: 'not_published' } }),
+    },
+  });
+  expect(store.media.participant('r').kind('audio').clientState).toBe('live');
+  expect(store.media.participant('r').kind('video').clientState).toBe('not_published');
 });
 
 test('an unmute request is held only while the requester IS server-muted, and clears on lift', () => {
   const store = new MediaStore();
   // A relay for someone not server-muted is not a pending request.
-  store.applyUnmuteRequested({ participantId: 'b' });
+  store.applyUnmuteRequested({ participantId: 'b', kinds: ['audio'] });
   expect(store.participant('b').unmuteRequested).toBe(false);
 
   store.applyParticipantMute({
     participantId: 'b',
-    audioServerMuted: true,
-    videoServerMuted: false,
-    serverMutedBy: 'h',
+    mediaStates: mediaStates({ audio: { serverMuted: true, serverMutedBy: 'h' } }),
   });
-  store.applyUnmuteRequested({ participantId: 'b' });
+  store.applyUnmuteRequested({ participantId: 'b', kinds: ['audio'] });
   expect(store.participant('b').unmuteRequested).toBe(true);
   // The request lifts NOTHING: b is still server-muted (R-10).
-  expect(store.participant('b').audioServerMuted).toBe(true);
+  expect(store.participant('b').kind('audio').serverMuted).toBe(true);
 
   // Lifting audio while VIDEO stays server-muted keeps the request pending.
   store.applyParticipantMute({
     participantId: 'b',
-    audioServerMuted: false,
-    videoServerMuted: true,
+    mediaStates: mediaStates({ video: { serverMuted: true, serverMutedBy: 'h' } }),
   });
   expect(store.participant('b').unmuteRequested).toBe(true);
-  store.applyParticipantMute({
-    participantId: 'b',
-    audioServerMuted: false,
-    videoServerMuted: false,
-  });
+  store.applyParticipantMute({ participantId: 'b', mediaStates: mediaStates() });
   expect(store.participant('b').unmuteRequested).toBe(false);
 });
 
@@ -558,14 +597,17 @@ test('a slot state change recomputes ONLY that tile; a mute change ONLY that par
 
   // The roster creates participant cells (MeetingStore -> registerParticipant),
   // so a FIRST server mute is not a creation edge for anyone else's row.
-  session.fire('participantJoined', { participant: { participantId: 'x', name: 'X' } });
-  session.fire('participantJoined', { participant: { participantId: 'y', name: 'Y' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'x', name: 'X', mediaStates: mediaStates() },
+  });
+  session.fire('participantJoined', {
+    participant: { participantId: 'y', name: 'Y', mediaStates: mediaStates() },
+  });
   await expect.element(screen.getByTestId('row-y')).toHaveTextContent('audio-ok');
   const muteBase = { ...counts };
   session.fire('participantMuteChanged', {
     participantId: 'x',
-    audioServerMuted: false,
-    videoServerMuted: true,
+    mediaStates: mediaStates({ video: { serverMuted: true, serverMutedBy: 'h' } }),
   });
   await expect.element(screen.getByTestId('row-x')).toHaveTextContent('video-server-muted');
   expect(counts.rowY).toBe(muteBase.rowY);
@@ -578,11 +620,9 @@ test('a slot state change recomputes ONLY that tile; a mute change ONLY that par
   const clientBase = { ...counts };
   session.fire('participantMuteChanged', {
     participantId: 'y',
-    audioServerMuted: false,
-    videoServerMuted: false,
-    audioClientMuted: true,
+    mediaStates: mediaStates({ audio: { clientState: 'client_muted' } }),
   });
-  await expect.element(screen.getByTestId('row-y')).toHaveTextContent('client-audio:true');
+  await expect.element(screen.getByTestId('row-y')).toHaveTextContent('client-audio:client_muted');
   expect(counts.rowX).toBe(clientBase.rowX);
   expect(counts.tile3).toBe(clientBase.tile3);
   expect(counts.rowY).toBeGreaterThan(clientBase.rowY); // positive control

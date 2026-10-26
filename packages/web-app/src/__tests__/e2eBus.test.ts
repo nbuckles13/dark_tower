@@ -10,6 +10,7 @@ import { E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS, installE2EHooks } from '../lib/e2eB
 import { createE2EInstrumentation, type E2EInstrumentation } from '../lib/e2eAnalysis.js';
 import { parseSendCounts, parseVideoSlots } from '../../e2e/videoBusShape.js';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
+import { mediaStates } from './helpers/mediaStates.js';
 
 /** Build a `MediaFrameCounts` from a partial, so a test states only what it varies. */
 function counts(over: Partial<MediaFrameCounts>): MediaFrameCounts {
@@ -74,7 +75,8 @@ test('joined projection drops bindingToken and correlationId (whitelist)', () =>
   session.fire('joined', {
     participantId: 'self',
     senderId: 123,
-    existingParticipants: [{ participantId: 'a', name: 'Ann' }],
+    receiveSlotCaps: { audio: 8, video: 8 },
+    existingParticipants: [{ participantId: 'a', name: 'Ann', mediaStates: mediaStates() }],
     mediaServers: ['https://mh-0:4433'],
     correlationId: 'CORR_SECRET',
     bindingToken: 'BINDING_SECRET',
@@ -235,6 +237,7 @@ test('receiveSlots: publish set, N, M, sources and per-kind caps are projected o
   session.fire('joined', {
     participantId: 'self',
     senderId: 7,
+    receiveSlotCaps: { audio: 8, video: 8 },
     existingParticipants: [],
     mediaServers: [],
     correlationId: 'corr',
@@ -426,35 +429,32 @@ test('participantMute / unmuteRequested are whitelist projections of the wire', 
   install(session);
   session.fire('participantMuteChanged', {
     participantId: 'b',
-    audioServerMuted: true,
-    videoServerMuted: false,
-    serverMutedBy: 'h',
+    mediaStates: {
+      audio: { clientState: 'client_muted', serverMuted: true, serverMutedBy: 'h' },
+      video: {
+        clientState: 'not_published',
+        serverMuted: false,
+        ...({ rogue: 'SECRET' } as object),
+      },
+    },
     ...({ rogue: 'SECRET' } as object),
   });
-  session.fire('participantMuteChanged', {
-    participantId: 'b',
-    audioServerMuted: false,
-    videoServerMuted: false,
-  });
-  session.fire('unmuteRequested', { participantId: 'b' });
+  session.fire('unmuteRequested', { participantId: 'b', kinds: ['audio', 'video'] });
   expect(events().filter((e) => e['type'] === 'participantMute')).toEqual([
     {
       type: 'participantMute',
       participantId: 'b',
-      audioServerMuted: true,
-      videoServerMuted: false,
-      serverMutedBy: 'h',
-    },
-    {
-      type: 'participantMute',
-      participantId: 'b',
-      audioServerMuted: false,
-      videoServerMuted: false,
+      mediaStates: {
+        audio: { clientState: 'client_muted', serverMuted: true, serverMutedBy: 'h' },
+        video: { clientState: 'not_published', serverMuted: false },
+      },
     },
   ]);
+  expect(JSON.stringify(events())).not.toContain('SECRET');
   expect(events().find((e) => e['type'] === 'unmuteRequested')).toEqual({
     type: 'unmuteRequested',
     participantId: 'b',
+    kinds: ['audio', 'video'],
   });
 });
 
@@ -462,9 +462,11 @@ test('roster projections carry the stringified sender id, and only when MC set o
   const session = new MockMeetingSession();
   install(session);
   session.fire('participantJoined', {
-    participant: { participantId: 'b', name: 'Bea', senderId: 5 },
+    participant: { participantId: 'b', name: 'Bea', senderId: 5, mediaStates: mediaStates() },
   });
-  session.fire('participantJoined', { participant: { participantId: 'c', name: 'Cid' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'c', name: 'Cid', mediaStates: mediaStates() },
+  });
   expect(events().filter((e) => e['type'] === 'participantJoined')).toEqual([
     { type: 'participantJoined', participantId: 'b', name: 'Bea', senderId: '5' },
     { type: 'participantJoined', participantId: 'c', name: 'Cid' },

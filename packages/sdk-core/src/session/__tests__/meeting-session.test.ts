@@ -46,6 +46,7 @@ import {
 } from '../../__tests__/joinLabelRoster.js';
 import { MeetingUnauthorizedError } from '../../errors/MeetingError.js';
 import {
+  ClientMediaState,
   ConnectionState,
   KeyframeRequestSchema,
   MediaKind,
@@ -1644,8 +1645,7 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
     readonly audio?: { count: number; source: 'configured' | 'default' };
     readonly video?: { count: number; source: 'configured' | 'default' };
     readonly publish?: readonly ('audio' | 'video')[];
-    readonly maxAudioReceiveSlots?: number;
-    readonly maxVideoReceiveSlots?: number;
+    readonly receiveSlotCaps?: { audio?: number; video?: number };
     readonly extra?: Partial<MeetingSessionOptions>;
   }): Promise<{
     session: MeetingSession;
@@ -1674,12 +1674,7 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
     await driveJoin(mocks, 'all', {
       senderId: 258,
       meetingKek: KEK,
-      ...(opts.maxAudioReceiveSlots !== undefined
-        ? { maxAudioReceiveSlots: opts.maxAudioReceiveSlots }
-        : {}),
-      ...(opts.maxVideoReceiveSlots !== undefined
-        ? { maxVideoReceiveSlots: opts.maxVideoReceiveSlots }
-        : {}),
+      ...(opts.receiveSlotCaps !== undefined ? { receiveSlotCaps: opts.receiveSlotCaps } : {}),
     });
     await joining;
     return { session, mocks, sink };
@@ -1707,7 +1702,9 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
       video: { count: 3, source: 'configured' },
     });
     const join = joinRequest(rig.mocks);
-    expect(join.publishKinds).toEqual([MediaKind.AUDIO]);
+    expect(join.publishedKinds.map((k) => [k.mediaKind, k.clientMuted])).toEqual([
+      [MediaKind.AUDIO, false],
+    ]);
     expect(slotsOf(join.receiveCapability)).toEqual([
       [0, MediaKind.AUDIO],
       [1, MediaKind.AUDIO],
@@ -2017,7 +2014,9 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
     publish.length = 0;
     expect(rig.session.receiveSlots.publish).toEqual(['audio']);
     expect(Object.isFrozen(rig.session.receiveSlots.publish)).toBe(true);
-    expect(joinRequest(rig.mocks).publishKinds).toEqual([MediaKind.AUDIO]);
+    expect(joinRequest(rig.mocks).publishedKinds.map((k) => k.mediaKind)).toEqual([
+      MediaKind.AUDIO,
+    ]);
     rig.session.disconnect();
   });
 
@@ -2025,7 +2024,10 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
     vi.spyOn(console, 'info').mockImplementation(() => {});
     const rig = await joinedWith({ publish: ['audio', 'video'] });
     expect(rig.session.receiveSlots.publish).toEqual(['audio', 'video']);
-    expect(joinRequest(rig.mocks).publishKinds).toEqual([MediaKind.AUDIO, MediaKind.VIDEO_CAMERA]);
+    expect(joinRequest(rig.mocks).publishedKinds.map((k) => k.mediaKind)).toEqual([
+      MediaKind.AUDIO,
+      MediaKind.VIDEO_CAMERA,
+    ]);
     rig.session.disconnect();
   });
 
@@ -2054,7 +2056,8 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
   it('a receive-only participant (publishes nothing, declares slots) is NOT refused', async () => {
     vi.spyOn(console, 'info').mockImplementation(() => {});
     const rig = await joinedWith({ publish: [], audio: { count: 1, source: 'configured' } });
-    expect(joinRequest(rig.mocks).publishKinds).toEqual([]);
+    // Empty: receive-only.
+    expect(joinRequest(rig.mocks).publishedKinds).toEqual([]);
     rig.session.disconnect();
   });
 
@@ -2063,8 +2066,7 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
     const rig = await joinedWith({
       audio: { count: 3, source: 'configured' },
       video: { count: 2, source: 'configured' },
-      maxAudioReceiveSlots: 8,
-      maxVideoReceiveSlots: 0,
+      receiveSlotCaps: { audio: 8, video: 0 },
     });
     expect(rig.session.receiveSlots).toEqual({
       publish: ['audio'],
@@ -2085,19 +2087,17 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
     rig.session.disconnect();
   });
 
-  it('ABSENT caps (an MC that does not send them) read as unknown, never coerced to 0', async () => {
-    vi.spyOn(console, 'info').mockImplementation(() => {});
-    const rig = await joinedWith({});
-    expect(rig.session.receiveSlots.audio.serverCap).toEqual({ state: 'unknown' });
-    expect(rig.session.receiveSlots.video.serverCap).toEqual({ state: 'unknown' });
-    rig.session.disconnect();
+  it('before the join, the caps read as unknown (nothing learned yet), never coerced to 0', () => {
+    const session = makeSession(new Map());
+    expect(session.receiveSlots.audio.serverCap).toEqual({ state: 'unknown' });
+    expect(session.receiveSlots.video.serverCap).toEqual({ state: 'unknown' });
   });
 
   it('OVER-CAP IS NOT REFUSED LOCALLY: the whole declaration is sent and the retired counter never emits', async () => {
     vi.spyOn(console, 'info').mockImplementation(() => {});
     const rig = await joinedWith({
       audio: { count: 5, source: 'configured' },
-      maxAudioReceiveSlots: 4,
+      receiveSlotCaps: { audio: 4 },
     });
     await rig.session.startMedia();
     expect(slotsOf(joinRequest(rig.mocks).receiveCapability)).toHaveLength(5);
@@ -2138,8 +2138,7 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
     const rig = await joinedWith({
       audio: { count: 2, source: 'configured' },
       video: { count: 1, source: 'configured' },
-      maxAudioReceiveSlots: 8,
-      maxVideoReceiveSlots: 0,
+      receiveSlotCaps: { audio: 8, video: 0 },
     });
     const line = info.mock.calls.map((c) => c.join(' ')).find((l) => l.includes('dt-media-slots'));
     expect(line).toBe(
@@ -2266,7 +2265,7 @@ describe('join label bag — PRIMARY, behavioural (ADR-0036 §11; story 2 task 1
     await driveJoin(mocks, 'partial', {
       senderId: 258,
       meetingKek: new Uint8Array(32).fill(1),
-      maxAudioReceiveSlots: 8,
+      receiveSlotCaps: { audio: 8 },
     });
     await joining;
     await session.startMedia();
@@ -2355,18 +2354,55 @@ describe('MeetingSession — host hint and server mute (story 2 R-8/R-10/R-11)',
     expect(JSON.stringify(roleWarns)).not.toContain('opaque-meeting-token');
   });
 
-  it('setServerMute sends target + action; requestUnmute sends an unmute request', async () => {
+  it('setServerMute sends target + action for ONE kind', async () => {
     const { session, mc } = await joined(meetingJwt({ role: 'host' }));
     await session.setServerMute('participant-b', 'audio', true);
-    await session.requestUnmute();
     const messages = decodeOutboundClientMessages(mc.getOutboundBidiWrites(0));
     const mute = messages.find((m) => m.message.case === 'serverMuteRequest');
-    expect(mute?.message.value).toMatchObject({
-      participantId: 'participant-b',
-      audioMuted: true,
+    if (mute?.message.case !== 'serverMuteRequest') throw new Error('no ServerMuteRequest sent');
+    expect(mute.message.value.participantId).toBe('participant-b');
+    expect(mute.message.value.changes.map((c) => [c.mediaKind, c.muted])).toEqual([
+      [MediaKind.AUDIO, true],
+    ]);
+  });
+
+  it.each([
+    ['camera only', { video: { serverMuted: true, serverMutedBy: 'h' } }, [MediaKind.VIDEO_CAMERA]],
+    ['microphone only', { audio: { serverMuted: true, serverMutedBy: 'h' } }, [MediaKind.AUDIO]],
+    [
+      'both',
+      {
+        audio: { serverMuted: true, serverMutedBy: 'h' },
+        video: { serverMuted: true, serverMutedBy: 'h' },
+      },
+      [MediaKind.AUDIO, MediaKind.VIDEO_CAMERA],
+    ],
+  ] as const)(
+    'requestUnmute names exactly the kinds its own copy says are server-muted (%s)',
+    async (_label, states, onWire) => {
+      const { session, mc } = await joined(meetingJwt({ role: 'participant' }));
+      const updates: unknown[] = [];
+      session.on('participantMuteChanged', (e) => updates.push(e));
+      mc.simulateServerMessage(
+        0,
+        framedParticipantMuteUpdate({ participantId: 'participant-self', states }),
+      );
+      await waitFor(() => updates.length > 0);
+      await session.requestUnmute();
+      const messages = decodeOutboundClientMessages(mc.getOutboundBidiWrites(0));
+      const request = messages.find((m) => m.message.case === 'unmuteRequest');
+      if (request?.message.case !== 'unmuteRequest') throw new Error('no UnmuteRequest sent');
+      expect(request.message.value.mediaKinds).toEqual(onWire);
+    },
+  );
+
+  it('requestUnmute while NOT server-muted is refused locally and sends nothing', async () => {
+    const { session, mc } = await joined(meetingJwt({ role: 'participant' }));
+    await expect(session.requestUnmute()).rejects.toMatchObject({
+      signalingCode: SignalingErrorCode.InvalidRequest,
     });
-    expect((mute?.message.value as { videoMuted?: boolean }).videoMuted).toBeUndefined();
-    expect(messages.some((m) => m.message.case === 'unmuteRequest')).toBe(true);
+    const messages = decodeOutboundClientMessages(mc.getOutboundBidiWrites(0));
+    expect(messages.some((m) => m.message.case === 'unmuteRequest')).toBe(false);
   });
 
   it('refuses both before a settled join', async () => {
@@ -2392,19 +2428,19 @@ describe('MeetingSession — host hint and server mute (story 2 R-8/R-10/R-11)',
       0,
       framedParticipantMuteUpdate({
         participantId: 'b',
-        audioServerMuted: true,
-        serverMutedBy: 'h',
+        states: { audio: { serverMuted: true, serverMutedBy: 'h' } },
       }),
     );
     mc.simulateServerMessage(0, framedUnmuteRequestRelay('b'));
     await waitFor(() => mutes.length > 0 && requests.length > 0);
     expect(mutes[0]).toEqual({
       participantId: 'b',
-      audioServerMuted: true,
-      videoServerMuted: false,
-      serverMutedBy: 'h',
+      mediaStates: {
+        audio: { clientState: 'live', serverMuted: true, serverMutedBy: 'h' },
+        video: { clientState: 'live', serverMuted: false },
+      },
     });
-    expect(requests[0]).toEqual({ participantId: 'b' });
+    expect(requests[0]).toEqual({ participantId: 'b', kinds: ['audio'] });
   });
 });
 
@@ -2496,12 +2532,22 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     rig.session.disconnect();
   });
 
+  /** Every MuteRequest on the wire, as its (kind, muted) changes. */
   function muteReports(rig: { outbound: () => ReturnType<typeof decodeOutboundClientMessages> }) {
     return rig
       .outbound()
-      .filter((m) => m.message.case === 'muteRequest')
-      .map((m) => m.message.value as { audioMuted?: boolean; videoMuted?: boolean })
-      .map((v) => [v.audioMuted, v.videoMuted]);
+      .flatMap((m) => (m.message.case === 'muteRequest' ? [m.message.value] : []))
+      .map((v) => v.changes.map((c) => [c.mediaKind, c.muted]));
+  }
+
+  const A = MediaKind.AUDIO;
+  const V = MediaKind.VIDEO_CAMERA;
+
+  /** The publish declaration the JoinRequest carried, as (kind, clientMuted). */
+  function declared(rig: { outbound: () => ReturnType<typeof decodeOutboundClientMessages> }) {
+    const join = rig.outbound().find((m) => m.message.case === 'joinRequest');
+    if (join?.message.case !== 'joinRequest') throw new Error('no JoinRequest was sent');
+    return join.message.value.publishedKinds.map((k) => [k.mediaKind, k.clientMuted]);
   }
 
   /** Join with `publish`, after `beforeJoin` ran on the not-yet-joined session. */
@@ -2524,29 +2570,76 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     return { session, outbound: () => decodeOutboundClientMessages(mc.getOutboundBidiWrites(0)) };
   }
 
-  it('R-15: on entering Joined the session reports EVERY published kind explicitly, one kind per request', async () => {
-    // MC holds no client-mute fact for a joiner until it reports one; `false`
-    // is a fact too. Decoded from the wire, so a dropped `false` would show.
+  it('R-15: the JOIN declares every published kind with its client mute; NOTHING is re-reported after join', async () => {
     const rig = await joinPublishing(['audio', 'video']);
-    expect(muteReports(rig)).toEqual([
-      [false, undefined],
-      [undefined, false],
+    expect(declared(rig)).toEqual([
+      [A, false],
+      [V, false],
     ]);
+    // FENCE, not end-of-test absence: the FIRST MuteRequest after Joined is the
+    // explicit toggle below — no post-join report precedes it.
+    rig.session.setAudioMuted(true);
+    await settle();
+    expect(muteReports(rig)).toEqual([[[A, true]]]);
     rig.session.disconnect();
   });
 
-  it('R-15: a kind this participant does NOT publish is never reported (no false "camera: on")', async () => {
+  it('R-15: a kind this participant does NOT publish is not declared (peers see not_published)', async () => {
     const rig = await joinPublishing(['audio']);
-    expect(muteReports(rig)).toEqual([[false, undefined]]);
+    expect(declared(rig)).toEqual([[A, false]]);
     rig.session.disconnect();
   });
 
-  it('R-15: a mute set BEFORE the join reaches MC in the post-join report (never sent before Joined)', async () => {
+  it('R-15: a mute set BEFORE the join rides the declaration, and is not re-sent after join', async () => {
     const rig = await joinPublishing(['audio', 'video'], (session) => session.setVideoMuted(true));
-    expect(muteReports(rig)).toEqual([
-      [false, undefined],
-      [undefined, true],
+    expect(declared(rig)).toEqual([
+      [A, false],
+      [V, true],
     ]);
+    rig.session.setAudioMuted(true);
+    await settle();
+    expect(muteReports(rig)).toEqual([[[A, true]]]);
+    rig.session.disconnect();
+  });
+
+  /** Join, toggling via `during` in the JOIN WINDOW: after the JoinRequest, before Joined. */
+  async function joinTogglingInWindow(during: (session: MeetingSession) => void) {
+    const mocks = new Map<string, MockWebTransport>();
+    const session = makeSession(mocks, { publish: ['audio', 'video'] });
+    session.on('stateChange', (state) => {
+      if (state === MeetingSessionState.Joining) during(session);
+    });
+    const joining = session.join({
+      meetingCode: MEETING_CODE,
+      orgSubdomain: 'acme',
+      credentials: LOGIN,
+    });
+    await driveJoin(mocks, 'all', { participantId: SELF, senderId: 258, meetingKek: KEK });
+    await joining;
+    await settle();
+    const mc = mocks.get(MC_ENDPOINT)!;
+    return { session, outbound: () => decodeOutboundClientMessages(mc.getOutboundBidiWrites(0)) };
+  }
+
+  it('JOIN-WINDOW CATCH-UP: a toggle between the JoinRequest and Joined sends exactly ONE MuteRequest, the CURRENT value', async () => {
+    const rig = await joinTogglingInWindow((session) => session.setVideoMuted(true));
+    expect(declared(rig)).toEqual([
+      [A, false],
+      [V, false],
+    ]);
+    expect(muteReports(rig)).toEqual([[[V, true]]]);
+    rig.session.disconnect();
+  });
+
+  it('JOIN-WINDOW CATCH-UP: toggled and toggled BACK sends nothing (MC already holds that value)', async () => {
+    const rig = await joinTogglingInWindow((session) => {
+      session.setVideoMuted(true);
+      session.setVideoMuted(false);
+    });
+    // Fenced: the first MuteRequest is the explicit post-join toggle.
+    rig.session.setAudioMuted(true);
+    await settle();
+    expect(muteReports(rig)).toEqual([[[A, true]]]);
     rig.session.disconnect();
   });
 
@@ -2557,15 +2650,9 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     rig.session.setVideoMuted(false);
     await settle();
     expect(rig.session.muteState).toEqual({ audioMuted: true, videoMuted: false });
-    // Past the two post-join reports (pinned by their own tests above).
-    const reports = muteReports(rig).slice(2);
-    // Decoded from the wire: the unnamed kind is ABSENT (MC: unchanged), never
-    // its current value and never an explicit false.
-    expect(reports).toEqual([
-      [undefined, true],
-      [true, undefined],
-      [undefined, false],
-    ]);
+    // Decoded from the wire: ONE change per request; the unnamed kind is
+    // absent (MC: unchanged), never restated.
+    expect(muteReports(rig)).toEqual([[[V, true]], [[A, true]], [[V, false]]]);
     rig.session.disconnect();
   });
 
@@ -2590,10 +2677,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     rig.session.setAudioMuted(true);
     await settle();
     expect(rig.session.muteState).toEqual({ audioMuted: true, videoMuted: true });
-    expect(muteReports(rig)).toEqual([
-      [false, undefined], // the post-join report: audio only
-      [true, undefined],
-    ]);
+    expect(muteReports(rig)).toEqual([[[A, true]]]);
     rig.session.disconnect();
   });
 
@@ -2603,8 +2687,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
       0,
       framedParticipantMuteUpdate({
         participantId: 'b',
-        audioServerMuted: false,
-        videoServerMuted: true,
+        states: { audio: { serverMuted: false }, video: { serverMuted: true } },
       }),
     );
     await settle();
@@ -2613,8 +2696,15 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
       .outbound()
       .filter((m) => m.message.case === 'serverMuteRequest')
       .map((m) => m.message.value);
-    expect(sent).toEqual([expect.objectContaining({ participantId: 'b', audioMuted: true })]);
-    expect((sent[0] as { videoMuted?: boolean }).videoMuted).toBeUndefined();
+    expect(
+      sent.map((r) => [
+        (r as { participantId: string }).participantId,
+        (r as { changes: { mediaKind: MediaKind; muted: boolean }[] }).changes.map((c) => [
+          c.mediaKind,
+          c.muted,
+        ]),
+      ]),
+    ).toEqual([['b', [[MediaKind.AUDIO, true]]]]);
     rig.session.disconnect();
   });
 
@@ -2627,7 +2717,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
   }
 
   const muteSelf = (muted: boolean) =>
-    framedParticipantMuteUpdate({ participantId: SELF, audioServerMuted: muted });
+    framedParticipantMuteUpdate({ participantId: SELF, states: { audio: { serverMuted: muted } } });
 
   it('R-18: unmute update BEFORE the resumed directive fires exactly one event', async () => {
     const rig = await startedSending();
@@ -2659,9 +2749,15 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     const clientOnly = (serverMuted: boolean, clientMuted: boolean) =>
       framedParticipantMuteUpdate({
         participantId: SELF,
-        audioServerMuted: serverMuted,
-        audioClientMuted: clientMuted,
-        videoClientMuted: clientMuted,
+        states: {
+          audio: {
+            serverMuted,
+            clientState: clientMuted ? ClientMediaState.CLIENT_MUTED : ClientMediaState.LIVE,
+          },
+          video: {
+            clientState: clientMuted ? ClientMediaState.CLIENT_MUTED : ClientMediaState.LIVE,
+          },
+        },
       });
     rig.mc.simulateServerMessage(0, clientOnly(false, true));
     rig.mc.simulateServerMessage(0, clientOnly(false, false));
@@ -2736,7 +2832,10 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     const rig = await startedSending();
     rig.mc.simulateServerMessage(
       0,
-      framedParticipantMuteUpdate({ participantId: 'someone-else', audioServerMuted: true }),
+      framedParticipantMuteUpdate({
+        participantId: 'someone-else',
+        states: { audio: { serverMuted: true } },
+      }),
     );
     rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
     rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
@@ -2911,24 +3010,21 @@ describe('MeetingSession — video receive wiring (story 3 C-B)', () => {
       0,
       framedParticipantMuteUpdate({
         participantId: 'p-video',
-        audioServerMuted: false,
-        videoServerMuted: true,
+        states: { audio: { serverMuted: false }, video: { serverMuted: true } },
       }),
     );
     rig.mc.simulateServerMessage(
       0,
       framedParticipantMuteUpdate({
         participantId: 'p-video',
-        audioServerMuted: true,
-        videoServerMuted: true,
+        states: { audio: { serverMuted: true }, video: { serverMuted: true } },
       }),
     );
     rig.mc.simulateServerMessage(
       0,
       framedParticipantMuteUpdate({
         participantId: 'p-video',
-        audioServerMuted: true,
-        videoServerMuted: false,
+        states: { audio: { serverMuted: true }, video: { serverMuted: false } },
       }),
     );
     await waitFor(() => lifted.mock.calls.length > 0);
@@ -2945,5 +3041,55 @@ describe('MeetingSession — video receive wiring (story 3 C-B)', () => {
     expect(video.mock.calls).toEqual([[300]]);
     expect(audio.mock.calls).toEqual([[300]]);
     rig.session.disconnect();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A malformed kind-keyed snapshot at the session (CONVENTIONS §6): the join
+// fails LOUDLY, typed, on the existing join-response stage.
+// ---------------------------------------------------------------------------
+
+describe('MeetingSession — malformed kind-keyed snapshot', () => {
+  it('a JoinResponse without receive_slot_caps fails the join: typed, mc_join_response, server_error, WARNed', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const mocks = new Map<string, MockWebTransport>();
+    const sink = new InMemoryMetricsSink();
+    const session = makeSession(mocks, { metricsSink: sink });
+    const joining = session.join({
+      meetingCode: MEETING_CODE,
+      orgSubdomain: 'acme',
+      credentials: LOGIN,
+    });
+    joining.catch(() => {});
+    await waitFor(() => mocks.has(MC_ENDPOINT));
+    const mc = mocks.get(MC_ENDPOINT)!;
+    mc.simulateReady();
+    await waitFor(() => mc.getOpenedBidiStreams().length > 0);
+    mc.simulateServerMessage(0, framedJoinResponse({ senderId: 258, rawReceiveSlotCaps: [] }));
+    const err = await joining.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(SignalingError);
+    expect((err as SignalingError).signalingCode).toBe(SignalingErrorCode.ContractFault);
+    expect(session.state).not.toBe(MeetingSessionState.Joined);
+    sink.assertCounter(
+      'dt_client_join_attempts_total',
+      { status: 'failure', failure_stage: 'mc_join_response' },
+      1,
+    );
+    // A client-initiated close on a malformed snapshot is never `normal`.
+    sink.assertCounter(
+      'dt_client_signaling_connection_total',
+      { status: 'failure', close_reason: 'server_error' },
+      1,
+    );
+    const contract = warn.mock.calls.filter((c) => c[0] === '[dt-signaling-contract]');
+    expect(contract).toEqual([
+      [
+        '[dt-signaling-contract]',
+        'malformed kind-keyed snapshot from MC: receive_slot_caps_malformed',
+      ],
+    ]);
   });
 });

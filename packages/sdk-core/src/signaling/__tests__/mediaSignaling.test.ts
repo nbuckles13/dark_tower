@@ -18,6 +18,7 @@ import type {
   JoinedEvent,
   ParticipantJoinedEvent,
   ParticipantMuteEvent,
+  PublishedKindDeclaration,
   SendDirectiveEvent,
   StreamAssignmentsEvent,
   UnmuteRequestedEvent,
@@ -35,6 +36,8 @@ import {
   framedUnmuteRequestRelay,
   MediaKind,
   SlotState,
+  ClientMediaState,
+  LIVE_STATES,
   waitFor,
 } from './helpers.js';
 
@@ -65,7 +68,7 @@ async function joinedRig(joinResponse: Uint8Array, identityPublicKey?: Uint8Arra
     meetingId: 'm',
     joinToken: 'jwt',
     participantName: 'self',
-    publishKinds: ['audio'],
+    publish: [{ kind: 'audio', clientMuted: false }],
     receiveSlots: [{ slotId: 0, mediaKind: 'audio' }],
     ...(identityPublicKey ? { identityPublicKey } : {}),
   });
@@ -126,7 +129,7 @@ describe('the meeting KEK never survives the decode boundary', () => {
       meetingId: 'm',
       joinToken: 'jwt',
       participantName: 'self',
-      publishKinds: ['audio'],
+      publish: [{ kind: 'audio', clientMuted: false }],
       receiveSlots: [],
     });
     transport.simulateReady();
@@ -392,13 +395,14 @@ describe('client sends', () => {
     expect((capability?.message.value as { slots: unknown[] }).slots).toEqual([]);
   });
 
-  it('reports client mute, naming only the changed kind', async () => {
+  it('reports client mute as ONE MuteChange for the changed kind', async () => {
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     await rig.client.sendMuteRequest('audio', true);
     const mute = rig.outbound().find((m) => m.message.case === 'muteRequest');
-    const value = mute?.message.value as { audioMuted?: boolean; videoMuted?: boolean };
-    expect(value.audioMuted).toBe(true);
-    expect(value.videoMuted).toBeUndefined();
+    if (mute?.message.case !== 'muteRequest') throw new Error('no MuteRequest sent');
+    expect(mute.message.value.changes.map((c) => [c.mediaKind, c.muted])).toEqual([
+      [MediaKind.AUDIO, true],
+    ]);
   });
 
   it('a server-mute request carries TARGET AND ACTION ONLY — no requester, no reason', async () => {
@@ -409,27 +413,42 @@ describe('client sends', () => {
     await rig.client.sendServerMuteRequest('participant-b', 'audio', false);
     const sent = rig
       .outbound()
-      .filter((m) => m.message.case === 'serverMuteRequest')
-      .map((m) => m.message.value);
-    expect(sent).toHaveLength(2);
-    expect(sent[0]).toMatchObject({
-      participantId: 'participant-b',
-      audioMuted: true,
-      reason: '',
-    });
-    expect((sent[0] as { videoMuted?: boolean }).videoMuted).toBeUndefined();
-    expect(sent[1]).toMatchObject({ participantId: 'participant-b', audioMuted: false });
+      .flatMap((m) => (m.message.case === 'serverMuteRequest' ? [m.message.value] : []));
+    expect(
+      sent.map((r) => [r.participantId, r.reason, r.changes.map((c) => [c.mediaKind, c.muted])]),
+    ).toEqual([
+      ['participant-b', '', [[MediaKind.AUDIO, true]]],
+      ['participant-b', '', [[MediaKind.AUDIO, false]]],
+    ]);
   });
 
-  it('an unmute request asks for audio and names nobody (MC stamps the requester)', async () => {
+  it.each([
+    [['audio'], [MediaKind.AUDIO]],
+    [['video'], [MediaKind.VIDEO_CAMERA]],
+    [
+      ['audio', 'video'],
+      [MediaKind.AUDIO, MediaKind.VIDEO_CAMERA],
+    ],
+  ] as const)(
+    'an unmute request names exactly the kinds %j and nobody (MC stamps the requester)',
+    async (kinds, onWire) => {
+      const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
+      await rig.client.sendUnmuteRequest(kinds);
+      const request = rig.outbound().find((m) => m.message.case === 'unmuteRequest');
+      expect(request?.message.value).toMatchObject({ mediaKinds: onWire, participantId: '' });
+    },
+  );
+
+  it('refuses an EMPTY or duplicated unmute request locally, sending nothing', async () => {
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
-    await rig.client.sendUnmuteRequest();
-    const request = rig.outbound().find((m) => m.message.case === 'unmuteRequest');
-    expect(request?.message.value).toMatchObject({
-      requestAudio: true,
-      requestVideo: false,
-      participantId: '',
+    const before = rig.outbound().length;
+    await expect(rig.client.sendUnmuteRequest([])).rejects.toMatchObject({
+      signalingCode: 'INVALID_REQUEST',
     });
+    await expect(rig.client.sendUnmuteRequest(['audio', 'audio'])).rejects.toMatchObject({
+      signalingCode: 'INVALID_REQUEST',
+    });
+    expect(rig.outbound()).toHaveLength(before);
   });
 
   it('refuses every send before a settled join', async () => {
@@ -437,7 +456,7 @@ describe('client sends', () => {
     await expect(client.sendReceiveCapability([])).rejects.toThrow();
     await expect(client.sendMuteRequest('audio', true)).rejects.toThrow();
     await expect(client.sendServerMuteRequest('p', 'audio', true)).rejects.toThrow();
-    await expect(client.sendUnmuteRequest()).rejects.toThrow();
+    await expect(client.sendUnmuteRequest(['audio'])).rejects.toThrow();
   });
 });
 
@@ -489,104 +508,110 @@ describe("a leave removes the leaver's roster key — a second cutoff beside the
   });
 });
 
-describe('client mute of others from the wire, presence preserved (story 3 R-15)', () => {
-  // `ClientMuteFacts`: wire `optional bool`, absent = no fact. These go through
-  // the real encode -> frame -> decode path, so a present `false` that the codec
-  // dropped (proto3 implicit presence) would read as absent and fail here.
-  it('roster entries carry client mute with presence: Some(false) stays false, absent stays absent', async () => {
+describe('per-kind state of others from the wire (story 3 R-15; CONVENTIONS §6)', () => {
+  // Through the real encode -> frame -> decode path. The contract table
+  // (missing / malformed / unknown kind) is `mediaKindStates.test.ts`.
+  it('roster entries carry every kind state: not publishing, live, client-muted', async () => {
     const rig = await joinedRig(
       framedJoinResponse({
         senderId: 258,
         participants: [
-          { participantId: 'm', name: 'Muted', audioClientMuted: true, videoClientMuted: false },
+          {
+            participantId: 'm',
+            name: 'Muted',
+            mediaStates: {
+              audio: { clientState: ClientMediaState.CLIENT_MUTED },
+              video: { clientState: ClientMediaState.NOT_PUBLISHED },
+            },
+          },
           { participantId: 'f', name: 'Fresh' },
         ],
       }),
     );
-    const joined = rig.joined.existingParticipants;
-    expect(joined[0]).toStrictEqual({
-      participantId: 'm',
-      name: 'Muted',
-      senderId: undefined,
-      audioClientMuted: true,
-      videoClientMuted: false,
-    });
-    // Absent: the keys are not there at all — never a coerced `false`.
-    expect('audioClientMuted' in joined[1]!).toBe(false);
-    expect('videoClientMuted' in joined[1]!).toBe(false);
+    expect(rig.joined.existingParticipants).toStrictEqual([
+      {
+        participantId: 'm',
+        name: 'Muted',
+        senderId: undefined,
+        mediaStates: {
+          audio: { clientState: 'client_muted', serverMuted: false },
+          video: { clientState: 'not_published', serverMuted: false },
+        },
+      },
+      { participantId: 'f', name: 'Fresh', senderId: undefined, mediaStates: LIVE_STATES },
+    ]);
   });
 
-  it('ParticipantJoined carries the same projection (absent and present)', async () => {
+  it('a ParticipantJoined of a participant who joined muted is muted at once — no report needed', async () => {
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     const seen: ParticipantJoinedEvent[] = [];
     rig.client.on('participantJoined', (e) => seen.push(e));
-    rig.deliver(framedParticipantJoined('f', 'Fresh'));
-    rig.deliver(framedParticipantJoined('g', 'Gil', { videoClientMuted: false }));
-    await waitFor(() => seen.length > 1);
-    expect('audioClientMuted' in seen[0]!.participant).toBe(false);
-    expect('videoClientMuted' in seen[0]!.participant).toBe(false);
-    expect(seen[1]!.participant.videoClientMuted).toBe(false);
-    expect('audioClientMuted' in seen[1]!.participant).toBe(false);
+    rig.deliver(
+      framedParticipantJoined('g', 'Gil', {
+        audio: { clientState: ClientMediaState.CLIENT_MUTED },
+      }),
+    );
+    await waitFor(() => seen.length > 0);
+    expect(seen[0]?.participant.mediaStates.audio.clientState).toBe('client_muted');
+    expect(seen[0]?.participant.mediaStates.video.clientState).toBe('live');
   });
 
-  it('ParticipantMuteUpdate projects client mute per kind, with presence, beside unchanged server mute', async () => {
+  it('ParticipantMuteUpdate is a full per-kind snapshot: client and server independent', async () => {
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     const seen: ParticipantMuteEvent[] = [];
     rig.client.on('participantMuteChanged', (e) => seen.push(e));
     rig.deliver(
       framedParticipantMuteUpdate({
         participantId: 'b',
-        audioClientMuted: true,
-        videoClientMuted: false,
-        audioServerMuted: true,
-        serverMutedBy: 'host',
+        states: {
+          audio: {
+            clientState: ClientMediaState.CLIENT_MUTED,
+            serverMuted: true,
+            serverMutedBy: 'host',
+          },
+          video: { clientState: ClientMediaState.LIVE },
+        },
       }),
     );
-    rig.deliver(framedParticipantMuteUpdate({ participantId: 'b', audioServerMuted: false }));
-    await waitFor(() => seen.length > 1);
+    await waitFor(() => seen.length > 0);
     expect(seen[0]).toStrictEqual({
       participantId: 'b',
-      audioServerMuted: true,
-      videoServerMuted: false,
-      serverMutedBy: 'host',
-      audioClientMuted: true,
-      videoClientMuted: false,
-    });
-    // Absent on the wire (e.g. a rolled-back MC): no client-mute key at all.
-    expect(seen[1]).toStrictEqual({
-      participantId: 'b',
-      audioServerMuted: false,
-      videoServerMuted: false,
+      mediaStates: {
+        audio: { clientState: 'client_muted', serverMuted: true, serverMutedBy: 'host' },
+        video: { clientState: 'live', serverMuted: false },
+      },
     });
   });
 });
 
 describe('server mute state from the wire (story 2 R-10/R-11)', () => {
-  it('projects SERVER mute and who applied it', async () => {
+  it('projects SERVER mute and who applied it, PER KIND', async () => {
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     const seen: ParticipantMuteEvent[] = [];
     rig.client.on('participantMuteChanged', (e) => seen.push(e));
     rig.deliver(
       framedParticipantMuteUpdate({
         participantId: 'b',
-        audioServerMuted: true,
-        serverMutedBy: 'host',
+        states: {
+          audio: { serverMuted: true, serverMutedBy: 'host-1' },
+          video: { serverMuted: true, serverMutedBy: 'host-2' },
+        },
       }),
     );
-    rig.deliver(framedParticipantMuteUpdate({ participantId: 'b', audioServerMuted: false }));
-    await waitFor(() => seen.length > 1);
-    expect(seen[0]).toEqual({
-      participantId: 'b',
-      audioServerMuted: true,
-      videoServerMuted: false,
-      serverMutedBy: 'host',
-    });
     // Unmuted: no `serverMutedBy`, even if MC were to send a stale one.
-    expect(seen[1]).toEqual({
-      participantId: 'b',
-      audioServerMuted: false,
-      videoServerMuted: false,
+    rig.deliver(
+      framedParticipantMuteUpdate({
+        participantId: 'b',
+        states: { audio: { serverMuted: false, serverMutedBy: 'stale' } },
+      }),
+    );
+    await waitFor(() => seen.length > 1);
+    expect(seen[0]?.mediaStates).toEqual({
+      audio: { clientState: 'live', serverMuted: true, serverMutedBy: 'host-1' },
+      video: { clientState: 'live', serverMuted: true, serverMutedBy: 'host-2' },
     });
+    expect(seen[1]?.mediaStates).toEqual(LIVE_STATES);
+    expect('serverMutedBy' in seen[1]!.mediaStates.audio).toBe(false);
   });
 
   it('bounds MC-relayed ids to 256 before they leave the decode boundary', async () => {
@@ -596,21 +621,20 @@ describe('server mute state from the wire (story 2 R-10/R-11)', () => {
     rig.deliver(
       framedParticipantMuteUpdate({
         participantId: 'p'.repeat(300),
-        audioServerMuted: true,
-        serverMutedBy: 'h'.repeat(300),
+        states: { audio: { serverMuted: true, serverMutedBy: 'h'.repeat(300) } },
       }),
     );
     await waitFor(() => seen.length > 0);
     expect(seen[0]?.participantId).toHaveLength(256);
-    expect(seen[0]?.serverMutedBy).toHaveLength(256);
+    expect(seen[0]?.mediaStates.audio.serverMutedBy).toHaveLength(256);
   });
 
   it('drops a mute update with an EMPTY participant id (the same rule as the unmute relay)', async () => {
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     const seen: ParticipantMuteEvent[] = [];
     rig.client.on('participantMuteChanged', (e) => seen.push(e));
-    rig.deliver(framedParticipantMuteUpdate({ participantId: '', audioServerMuted: true }));
-    rig.deliver(framedParticipantMuteUpdate({ participantId: 'b', audioServerMuted: true }));
+    rig.deliver(framedParticipantMuteUpdate({ participantId: '' }));
+    rig.deliver(framedParticipantMuteUpdate({ participantId: 'b' }));
     await waitFor(() => seen.length > 0);
     expect(seen.map((e) => e.participantId)).toEqual(['b']);
   });
@@ -622,91 +646,108 @@ describe('server mute state from the wire (story 2 R-10/R-11)', () => {
     rig.deliver(framedUnmuteRequestRelay(''));
     rig.deliver(framedUnmuteRequestRelay('b'));
     await waitFor(() => seen.length > 0);
-    expect(seen).toEqual([{ participantId: 'b' }]);
+    expect(seen).toEqual([{ participantId: 'b', kinds: ['audio'] }]);
   });
 });
 
 describe('story 3 C-A1: join contract and per-kind mute requests', () => {
-  it('the JoinRequest carries publish_kinds and the full receive_capability, closed kinds, id order', async () => {
-    const transport = new MockWebTransport();
-    const client = new SignalingClient({ connect: () => transport });
-    const publish: ('audio' | 'video')[] = ['audio'];
-    const joining = client.join({
-      webtransportEndpoint: ENDPOINT,
-      meetingId: 'm',
-      joinToken: 'jwt',
-      participantName: 'self',
-      publishKinds: publish,
-      receiveSlots: [
-        { slotId: 0, mediaKind: 'audio' },
-        { slotId: 1, mediaKind: 'video' },
-      ],
-    });
-    transport.simulateReady();
-    await waitFor(() => transport.getOpenedBidiStreams().length > 0);
-    transport.simulateServerMessage(0, framedJoinResponse({ senderId: 258 }));
-    await joining;
-    const join = decodeOutboundClientMessages(transport.getOutboundBidiWrites(0))[0];
-    expect(join?.message.case).toBe('joinRequest');
-    const request = join?.message.value as {
-      publishKinds: MediaKind[];
-      receiveCapability?: { slots: { slotId: number; mediaKind: MediaKind }[] };
-    };
-    expect(request.publishKinds).toEqual([MediaKind.AUDIO]);
-    expect(request.receiveCapability?.slots.map((s) => [s.slotId, s.mediaKind])).toEqual([
-      [0, MediaKind.AUDIO],
-      [1, MediaKind.VIDEO_CAMERA],
-    ]);
-    // Stored frozen beside correlation/binding for a future reconnect; the
-    // caller's array cannot change it.
-    publish.push('video');
-    expect(client.publishKinds).toEqual(['audio']);
-    expect(Object.isFrozen(client.publishKinds)).toBe(true);
-  });
-
-  // Decoded from the bytes actually written: ABSENT (`undefined`) is what MC
-  // reads as "unchanged", and is distinct on the wire from an explicit `false`
-  // (an unmute) -- the mix-up the per-kind contract exists to prevent.
   it.each([
-    ['audio', true],
-    ['audio', false],
-    ['video', true],
-    ['video', false],
+    ['receive-only: EMPTY', [], []],
+    ['audio-only', [{ kind: 'audio', clientMuted: false }], [[MediaKind.AUDIO, false]]],
+    [
+      'audio + camera',
+      [
+        { kind: 'audio', clientMuted: false },
+        { kind: 'video', clientMuted: false },
+      ],
+      [
+        [MediaKind.AUDIO, false],
+        [MediaKind.VIDEO_CAMERA, false],
+      ],
+    ],
+    [
+      'joined muted (each kind its own value)',
+      [
+        { kind: 'audio', clientMuted: true },
+        { kind: 'video', clientMuted: false },
+      ],
+      [
+        [MediaKind.AUDIO, true],
+        [MediaKind.VIDEO_CAMERA, false],
+      ],
+    ],
   ] as const)(
-    'a MuteRequest names ONLY the changed kind (%s=%s); the other is absent on the wire',
-    async (kind, muted) => {
+    'the JoinRequest carries the publish DECLARATION (%s) and the full receive_capability',
+    async (_label, declared, onWire) => {
+      const transport = new MockWebTransport();
+      const client = new SignalingClient({ connect: () => transport });
+      const publish: PublishedKindDeclaration[] = declared.map((d) => ({ ...d }));
+      const joining = client.join({
+        webtransportEndpoint: ENDPOINT,
+        meetingId: 'm',
+        joinToken: 'jwt',
+        participantName: 'self',
+        publish,
+        receiveSlots: [
+          { slotId: 0, mediaKind: 'audio' },
+          { slotId: 1, mediaKind: 'video' },
+        ],
+      });
+      transport.simulateReady();
+      await waitFor(() => transport.getOpenedBidiStreams().length > 0);
+      transport.simulateServerMessage(0, framedJoinResponse({ senderId: 258 }));
+      await joining;
+      const join = decodeOutboundClientMessages(transport.getOutboundBidiWrites(0))[0];
+      if (join?.message.case !== 'joinRequest') throw new Error('first message is not the join');
+      const request = join.message.value;
+      expect(request.publishedKinds.map((k) => [k.mediaKind, k.clientMuted])).toEqual(onWire);
+      expect(request.receiveCapability?.slots.map((s) => [s.slotId, s.mediaKind])).toEqual([
+        [0, MediaKind.AUDIO],
+        [1, MediaKind.VIDEO_CAMERA],
+      ]);
+      // Stored frozen beside correlation/binding; the caller's array cannot change it.
+      publish.push({ kind: 'video', clientMuted: true });
+      expect(client.publishKinds).toEqual(declared.map((d) => d.kind));
+      expect(Object.isFrozen(client.publishKinds)).toBe(true);
+    },
+  );
+
+  // Decoded from the bytes actually written: exactly ONE MuteChange naming the
+  // changed kind; every other kind is absent from `changes` (= unchanged at MC).
+  it.each([
+    ['audio', true, MediaKind.AUDIO],
+    ['audio', false, MediaKind.AUDIO],
+    ['video', true, MediaKind.VIDEO_CAMERA],
+    ['video', false, MediaKind.VIDEO_CAMERA],
+  ] as const)(
+    'a MuteRequest names ONLY the changed kind (%s=%s)',
+    async (kind, muted, wireKind) => {
       const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
       await rig.client.sendMuteRequest(kind, muted);
       const mute = rig.outbound().find((m) => m.message.case === 'muteRequest');
-      const value = mute?.message.value as { audioMuted?: boolean; videoMuted?: boolean };
-      const [named, other] =
-        kind === 'audio'
-          ? [value.audioMuted, value.videoMuted]
-          : [value.videoMuted, value.audioMuted];
-      // PRESENCE on the wire (`optional bool`): an explicit false is sent, not omitted.
-      expect(named).toBe(muted);
-      expect(other).toBeUndefined();
+      if (mute?.message.case !== 'muteRequest') throw new Error('no MuteRequest sent');
+      // An explicit `false` is sent as an entry, never omitted.
+      expect(mute.message.value.changes.map((c) => [c.mediaKind, c.muted])).toEqual([
+        [wireKind, muted],
+      ]);
     },
   );
 
   it.each([
-    ['audio', true],
-    ['audio', false],
-    ['video', true],
-    ['video', false],
+    ['audio', true, MediaKind.AUDIO],
+    ['audio', false, MediaKind.AUDIO],
+    ['video', true, MediaKind.VIDEO_CAMERA],
+    ['video', false, MediaKind.VIDEO_CAMERA],
   ] as const)(
-    'a ServerMuteRequest names ONLY the changed kind (%s=%s); the other is absent on the wire',
-    async (kind, muted) => {
+    'a ServerMuteRequest names ONLY the changed kind (%s=%s)',
+    async (kind, muted, wireKind) => {
       const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
       await rig.client.sendServerMuteRequest('b', kind, muted);
       const sent = rig.outbound().find((m) => m.message.case === 'serverMuteRequest');
-      const value = sent?.message.value as { audioMuted?: boolean; videoMuted?: boolean };
-      const [named, other] =
-        kind === 'audio'
-          ? [value.audioMuted, value.videoMuted]
-          : [value.videoMuted, value.audioMuted];
-      expect(named).toBe(muted);
-      expect(other).toBeUndefined();
+      if (sent?.message.case !== 'serverMuteRequest') throw new Error('no ServerMuteRequest sent');
+      expect(sent.message.value.changes.map((c) => [c.mediaKind, c.muted])).toEqual([
+        [wireKind, muted],
+      ]);
     },
   );
 

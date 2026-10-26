@@ -41,8 +41,8 @@ use proto_gen::dark_tower::signaling::v1::{
 
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::media_session::{
-    audio_slots, capability_frame, join_as, mute_frame, slot, start_stack, start_stack_with,
-    Session,
+    audio_slots, capability_frame, join_as, mute_frame, mute_kinds_frame, slot, start_stack,
+    start_stack_with, Session,
 };
 use test_common::{
     client_media_config, encode_framed, mh_handler, seed_meeting_with_handlers,
@@ -259,7 +259,7 @@ async fn mute_unmute_cycle_leaves_the_send_directive_untouched() {
 
     // --- A mutes: B, who holds A, sees AVATAR_CLIENT_MUTED; nobody gets a
     // directive ---
-    a.write(mute_frame(true, false)).await;
+    a.write(mute_kinds_frame(Some(true), None)).await;
     let muted = b.expect_assignments().await;
     assert_eq!(
         muted.assignments[0].slot_state,
@@ -273,7 +273,7 @@ async fn mute_unmute_cycle_leaves_the_send_directive_untouched() {
     );
 
     // --- A unmutes: B's slot flips back ---
-    a.write(mute_frame(false, false)).await;
+    a.write(mute_kinds_frame(Some(false), None)).await;
     let unmuted = b.expect_assignments().await;
     assert_eq!(unmuted.assignments[0].slot_state, SlotState::Active as i32);
 
@@ -335,7 +335,7 @@ async fn a_repeated_identical_mute_report_does_no_work() {
     let (mut a, mut b) = declared_pair(&rig, &stack, "mcs-meeting-r").await;
     let snap = MetricAssertion::snapshot();
 
-    a.write(mute_frame(true, false)).await;
+    a.write(mute_kinds_frame(Some(true), None)).await;
     let muted = b.expect_assignments().await;
     assert_eq!(
         muted.assignments[0].slot_state,
@@ -343,13 +343,10 @@ async fn a_repeated_identical_mute_report_does_no_work() {
     );
 
     for _ in 0..4 {
-        a.write(mute_frame(true, false)).await;
+        a.write(mute_kinds_frame(Some(true), None)).await;
     }
     b.expect_no_media().await;
-    // One increment per (request, named kind); the interim names both kinds.
-    // Audio: the 4 repeats. Video: A publishes audio only, so every named
-    // video kind (the first report and the 4 repeats) is `not_published`
-    // (story 3 R-15 fix: no client-mute fact for an unpublished kind).
+    // One increment per (request, named kind): the 4 repeats name audio only.
     snap.counter("mc_media_mute_requests_total")
         .with_labels(&[
             ("outcome", "unchanged"),
@@ -357,24 +354,26 @@ async fn a_repeated_identical_mute_report_does_no_work() {
             ("key_custody", "operator"),
         ])
         .assert_delta(4);
-    snap.counter("mc_media_mute_requests_total")
-        .with_labels(&[
-            ("outcome", "not_published"),
-            ("media_kind", "video"),
-            ("key_custody", "operator"),
-        ])
-        .assert_delta(5);
+    for outcome in ["applied", "unchanged"] {
+        snap.counter("mc_media_mute_requests_total")
+            .with_labels(&[
+                ("outcome", outcome),
+                ("media_kind", "video"),
+                ("key_custody", "operator"),
+            ])
+            .assert_delta(0);
+    }
 
-    a.write(mute_frame(false, false)).await;
+    a.write(mute_kinds_frame(Some(false), None)).await;
     let unmuted = b.expect_assignments().await;
     assert_eq!(unmuted.assignments[0].slot_state, SlotState::Active as i32);
 }
 
-/// Story 3: a video mute by an AUDIO-ONLY publisher changes nothing any
-/// subscriber is told: since the story 3 R-15 fix the connection ignores the
-/// unpublished kind outright (`not_published`: no fact, no fan-out, no
-/// disposition), and an audio mute still re-emits. The first report's audio
-/// `false` is `applied`: MC's first fact for that kind, a media no-op.
+/// Story 3: a request naming video from an AUDIO-ONLY publisher changes
+/// nothing any subscriber is told: since 2026-10-25 the connection refuses the
+/// WHOLE request (`rejected_total{reason="not_published"}`: no state, no
+/// fan-out, no disposition, even for the audio it also names), and an
+/// audio-only mute still re-emits.
 #[tokio::test]
 async fn a_video_only_mute_by_an_audio_only_publisher_re_emits_nothing() {
     let (stack, rig) = start_stack("mcs-mute-video").await;
@@ -384,6 +383,8 @@ async fn a_video_only_mute_by_an_audio_only_publisher_re_emits_nothing() {
 
     a.write(mute_frame(false, true)).await;
     a.write(mute_frame(false, false)).await;
+    let _ = a.expect_error().await;
+    let _ = a.expect_error().await;
     b.expect_no_media().await;
     assert_eq!(
         stack.mh_reg_client.calls().len(),
@@ -391,7 +392,7 @@ async fn a_video_only_mute_by_an_audio_only_publisher_re_emits_nothing() {
         "no stream of A's changed disposition: the identical re-render is not re-pushed"
     );
 
-    a.write(mute_frame(true, false)).await;
+    a.write(mute_kinds_frame(Some(true), None)).await;
     let muted = b.expect_assignments().await;
     assert_eq!(
         muted.assignments[0].slot_state,
@@ -405,11 +406,17 @@ async fn a_video_only_mute_by_an_audio_only_publisher_re_emits_nothing() {
             ("key_custody", "operator"),
         ])
     };
-    mute("not_published", "video").assert_delta(3);
+    snap.counter("mc_media_mute_requests_rejected_total")
+        .with_labels(&[
+            ("surface", "client_mute"),
+            ("reason", "not_published"),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(2);
     mute("applied", "video").assert_delta(0);
     mute("unchanged", "video").assert_delta(0);
-    mute("applied", "audio").assert_delta(2);
-    mute("unchanged", "audio").assert_delta(1);
+    mute("applied", "audio").assert_delta(1);
+    mute("unchanged", "audio").assert_delta(0);
 }
 
 #[tokio::test]
@@ -432,7 +439,7 @@ async fn mute_work_is_rate_limited_and_the_limit_is_not_permanent() {
     let snap = MetricAssertion::snapshot();
 
     for i in 0..TOGGLES {
-        a.write(mute_frame(i % 2 == 0, false)).await;
+        a.write(mute_kinds_frame(Some(i % 2 == 0), None)).await;
     }
 
     let mut applied = 0u64;
@@ -459,11 +466,8 @@ async fn mute_work_is_rate_limited_and_the_limit_is_not_permanent() {
     mute("applied", "audio").assert_delta(applied);
     let rate_limited = mute("rate_limited", "audio").delta();
     let unchanged = mute("unchanged", "audio").delta();
-    // Request-level outcomes count once per named kind (the interim names both).
-    // A publishes audio only, so every named video kind is `not_published`,
-    // decided BEFORE the token (story 3 R-15 fix): video never reaches the
-    // limiter, and no video cell but `not_published` moves.
-    mute("not_published", "video").assert_delta(TOGGLES);
+    // Request-level outcomes count once per named kind; the toggles name
+    // audio only, so no video cell moves.
     mute("rate_limited", "video").assert_delta(0);
     mute("unchanged", "video").assert_delta(0);
     mute("applied", "video").assert_delta(0);
@@ -479,8 +483,8 @@ async fn mute_work_is_rate_limited_and_the_limit_is_not_permanent() {
 
     // NOT PERMANENT: the drain waited out a read timeout, so the bucket has
     // refilled; one of these two is necessarily a transition.
-    a.write(mute_frame(true, false)).await;
-    a.write(mute_frame(false, false)).await;
+    a.write(mute_kinds_frame(Some(true), None)).await;
+    a.write(mute_kinds_frame(Some(false), None)).await;
     let recovered = b.expect_assignments().await;
     assert_eq!(recovered.assignments.len(), 1);
 }
@@ -668,13 +672,15 @@ async fn an_over_cap_declaration_is_truncated_to_unavailable_and_counted_accepte
     let _ = b.settle().await;
 
     assert_eq!(
-        a.max_kind_receive_slots,
         (
-            Some(audio_cap),
-            Some(u32::from(MediaKindLabel::Video.of(cap)))
+            a.slot_cap(MediaKind::Audio),
+            a.slot_cap(MediaKind::VideoCamera),
+            a.slot_cap(MediaKind::VideoScreen),
         ),
-        "advertised == configured, per kind"
+        (audio_cap, u32::from(MediaKindLabel::Video.of(cap)), 0),
+        "advertised == configured, per kind; screen serves no slots"
     );
+    assert_eq!(a.receive_slot_caps.len(), 3, "one entry per known kind");
 
     let snap = MetricAssertion::snapshot();
     a.write(capability_frame(audio_slots(audio_cap + 1))).await;
@@ -714,7 +720,7 @@ async fn a_lowered_configured_cap_truncates_at_the_configured_value() {
     let (stack, rig) = start_stack_with("mcs-cap-low", config).await;
     let mut a = solo(&rig, &stack, "mcs-meeting-h2").await;
     let _ = a.settle().await;
-    assert_eq!(a.max_kind_receive_slots.0, Some(2));
+    assert_eq!(a.slot_cap(MediaKind::Audio), 2);
     a.write(capability_frame(audio_slots(3))).await;
     let assignments = a
         .assignments_until("the truncated view", |x| x.assignments.len() == 3)

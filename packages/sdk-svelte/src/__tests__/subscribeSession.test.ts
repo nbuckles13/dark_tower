@@ -7,6 +7,7 @@ import { MeetingSessionState, SdkError, SdkErrorCode } from '@darktower/sdk-core
 import { MeetingStore } from '../stores/MeetingStore.svelte.js';
 import { subscribeSession } from '../stores/bindMeetingSession.js';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
+import { mediaStates } from './helpers/mediaStates.js';
 
 test('seeds store from session.state at subscribe time', () => {
   const session = new MockMeetingSession();
@@ -27,14 +28,17 @@ test('reacts to each SDK event', () => {
   session.fire('joined', {
     participantId: 'self',
     senderId: 7,
-    existingParticipants: [{ participantId: 'a', name: 'Ann' }],
+    existingParticipants: [{ participantId: 'a', name: 'Ann', mediaStates: mediaStates() }],
+    receiveSlotCaps: { audio: 8, video: 8 },
     mediaServers: [],
     correlationId: 'c',
     bindingToken: 'b',
   });
   expect(store.participants.map((p) => p.participantId)).toEqual(['a']);
 
-  session.fire('participantJoined', { participant: { participantId: 'b', name: 'Bob' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'b', name: 'Bob', mediaStates: mediaStates() },
+  });
   expect(store.participants.map((p) => p.participantId)).toEqual(['a', 'b']);
 
   session.fire('participantLeft', { participantId: 'a', reason: 'voluntary' });
@@ -48,11 +52,10 @@ test('reacts to each SDK event', () => {
 
   session.fire('participantMuteChanged', {
     participantId: 'b',
-    audioServerMuted: true,
-    videoServerMuted: false,
+    mediaStates: mediaStates({ audio: { serverMuted: true } }),
   });
-  expect(store.media.participant('b').audioServerMuted).toBe(true);
-  session.fire('unmuteRequested', { participantId: 'b' });
+  expect(store.media.participant('b').kind('audio').serverMuted).toBe(true);
+  session.fire('unmuteRequested', { participantId: 'b', kinds: ['audio'] });
   expect(store.media.participant('b').unmuteRequested).toBe(true);
 
   // Story 3 C-C1: render state, the R-18 latch and camera health, same binding.
@@ -72,12 +75,17 @@ test("the roster carries each participant's sender id through, never coerced", (
   session.fire('joined', {
     participantId: 'self',
     senderId: 7,
-    existingParticipants: [{ participantId: 'a', name: 'Ann', senderId: 9 }],
+    existingParticipants: [
+      { participantId: 'a', name: 'Ann', senderId: 9, mediaStates: mediaStates() },
+    ],
+    receiveSlotCaps: { audio: 8, video: 8 },
     mediaServers: [],
     correlationId: 'c',
     bindingToken: 'b',
   });
-  session.fire('participantJoined', { participant: { participantId: 'b', name: 'Bob' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'b', name: 'Bob', mediaStates: mediaStates() },
+  });
   expect(store.participants.map((p) => p.senderId)).toEqual([9, undefined]);
 });
 
@@ -93,17 +101,18 @@ test('aggregate unsubscribe stops all further updates', () => {
 
   // After unsubscribe every listener is gone — subsequent events are ignored.
   session.fire('stateChange', MeetingSessionState.Disconnecting);
-  session.fire('participantJoined', { participant: { participantId: 'x', name: 'X' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'x', name: 'X', mediaStates: mediaStates() },
+  });
   session.fire('mediaConnected', 'https://mh-9:4433');
   session.fire('participantMuteChanged', {
     participantId: 'x',
-    audioServerMuted: true,
-    videoServerMuted: false,
+    mediaStates: mediaStates({ audio: { serverMuted: true } }),
   });
   session.fire('captureResumedAfterServerMute', { kind: 'audio' });
   session.fire('videoSlotRenderChanged', { slotId: 4, state: { kind: 'unavailable' } });
   session.fire('cameraHealthChanged', { failure: 'ended' });
-  expect(store.media.participant('x').audioServerMuted).toBe(false);
+  expect(store.media.participant('x').kind('audio').serverMuted).toBe(false);
   expect(store.media.resumeNoticePending('audio')).toBe(false);
   expect(store.media.slot(4).render).toBeUndefined();
   expect(store.media.cameraFailure).toBeUndefined();

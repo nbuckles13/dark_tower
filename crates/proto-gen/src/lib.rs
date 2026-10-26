@@ -109,7 +109,7 @@ impl fmt::Debug for dark_tower::signaling::v1::JoinRequest {
             .field("identity_public_key_len", &self.identity_public_key.len())
             // Story 3 join declarations: closed enum values and slot ids, no
             // credential or PII -- in the clear for join-refusal triage.
-            .field("publish_kinds", &self.publish_kinds)
+            .field("published_kinds", &self.published_kinds)
             .field("receive_capability", &self.receive_capability)
             .finish()
     }
@@ -151,8 +151,7 @@ impl fmt::Debug for dark_tower::signaling::v1::JoinResponse {
             // MC's per-kind receive-slot caps (story 3): bounded configuration
             // values, not key material -- in the clear, so an operator
             // triaging "hears nobody" can see the caps the client was told.
-            .field("max_audio_receive_slots", &self.max_audio_receive_slots)
-            .field("max_video_receive_slots", &self.max_video_receive_slots)
+            .field("receive_slot_caps", &self.receive_slot_caps)
             .finish()
     }
 }
@@ -201,10 +200,11 @@ impl fmt::Debug for dark_tower::signaling::v1::Participant {
             .field("joined_at", &self.joined_at)
             .field("sender_id", &self.sender_id)
             .field("identity_public_key_len", &self.identity_public_key.len())
-            // Not identity: the per-kind client-mute facts (set iff MC knows,
-            // story 3 R-15 fix), already visible to every meeting member.
-            .field("audio_client_muted", &self.audio_client_muted)
-            .field("video_client_muted", &self.video_client_muted)
+            // One entry per known kind: client state, server mute, and its
+            // imposer (`server_muted_by`, a participant id -- the same kind of
+            // identifier as `participant_id` above, not PII), all already
+            // visible to every meeting member.
+            .field("media_states", &self.media_states)
             .finish()
     }
 }

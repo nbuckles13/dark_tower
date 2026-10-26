@@ -8,26 +8,24 @@
 #   - silent codegen plugin failure (exit 0 but no output)
 #   - plugin/option drift that produces files with different names or strips
 #     message classes (e.g. wrong target=, wrong import_extension, plugin swap) —
-#     the pre-generate clean ensures stale outputs from a prior config can't
-#     mask a broken current config (per @test Gate 3 finding 2026-05-06)
+#     the clean in codegen.sh, before every generate, ensures stale outputs
+#     from a prior config can't mask a broken current config (per @test Gate 3
+#     finding 2026-05-06)
 #   - wrong output directory layout
 #
-# Invoked by the Nx target `proto-gen:test` (cwd: packages/proto-gen).
+# READ-ONLY: it asserts over the output of the `codegen` target (its
+# `dependsOn`) and never deletes or regenerates. Before 2026-10-25 it did both
+# itself, which would race the parallel unit tests that import the same files
+# (see codegen.sh). It was also not reached by any lane until 2026-10-25, which
+# is how it sat red on the retired `publishKinds` name while Layers 1-6 passed.
+#
+# Invoked by the Nx target `proto-gen:test:unit` (cwd: packages/proto-gen), so it
+# runs in Layer 4 (scripts/lang/ts/test.sh) and in CI (`pnpm test:unit`).
 set -euo pipefail
 
-# Resolve repo root from this script's location (allow direct invocation too).
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-
-OUT_DIR="${REPO_ROOT}/packages/sdk-core/src/proto"
-
-# Clean any prior outputs so this run's assertions cannot be satisfied by stale
-# files left behind by a previous (possibly differently-configured) codegen run.
-mkdir -p "${OUT_DIR}"
-find "${OUT_DIR}" -type f \( -name '*_pb.ts' -o -name '*_pb.js' -o -name '*_pb.d.ts' \) -delete
-
-cd "${REPO_ROOT}/proto"
-pnpm exec buf generate
+# shellcheck source=./codegen-paths.sh
+source "$(dirname "${BASH_SOURCE[0]}")/codegen-paths.sh"
+OUT_DIR="${CODEGEN_OUT_DIR}"
 
 assert_generated() {
   local file="$1"
@@ -192,6 +190,57 @@ assert_message_field_absent() {
   echo "verify-codegen: OK — ${msg}.${field} absent from ${file}"
 }
 
+# Declaration-anchored PRESENCE (2026-10-25): the twin of
+# `assert_not_generated`. `assert_generated` is a bare substring grep, so a
+# name that only survives in a doc comment (or as a prefix of a longer one)
+# would satisfy it; new message/enum symbols are asserted on their export
+# declaration instead.
+assert_exported() {
+  local file="$1"
+  local symbol="$2"
+  local path="${OUT_DIR}/${file}"
+  if [[ ! -f "${path}" ]]; then
+    echo "verify-codegen: FAIL — expected file not produced: ${path}" >&2
+    exit 1
+  fi
+  if ! grep -qE "^export (type|enum|const) ${symbol}\\b" "${path}"; then
+    echo "verify-codegen: FAIL — no export declaration for '${symbol}': ${path}" >&2
+    exit 1
+  fi
+  echo "verify-codegen: OK — ${symbol} exported from ${file}"
+}
+
+# Oneof-CASE oracle (2026-10-25). A deleted oneof variant leaves no export of
+# its own, and its message name may be reused elsewhere, so the check matches
+# the generated discriminant line (`case: "<name>";`) only. A POSITIVE CONTROL
+# case must be found by the same matcher, so a changed generator layout fails
+# loudly instead of reporting a false "absent".
+oneof_case_count() {
+  local path="$1"
+  local case_name="$2"
+  grep -cE "^[[:space:]]+case: \"${case_name}\";" "${path}" || true
+}
+
+assert_oneof_case_absent() {
+  local file="$1"
+  local case_name="$2"
+  local control="$3"
+  local path="${OUT_DIR}/${file}"
+  if [[ ! -f "${path}" ]]; then
+    echo "verify-codegen: FAIL — cannot check absence, file not produced: ${path}" >&2
+    exit 1
+  fi
+  if [[ "$(oneof_case_count "${path}" "${control}")" -lt 1 ]]; then
+    echo "verify-codegen: FAIL — positive control oneof case '${control}' not found: ${path}" >&2
+    exit 1
+  fi
+  if [[ "$(oneof_case_count "${path}" "${case_name}")" -ne 0 ]]; then
+    echo "verify-codegen: FAIL — deleted oneof case '${case_name}' still generated: ${path}" >&2
+    exit 1
+  fi
+  echo "verify-codegen: OK — oneof case ${case_name} absent from ${file}"
+}
+
 assert_generated "dark_tower/signaling/v1/signaling_pb.ts" "JoinRequest"
 assert_generated "dark_tower/internal/v1/internal_pb.ts" "FastHeartbeatResponse"
 assert_generated "dark_tower/internal/v1/internal_pb.ts" "ComprehensiveHeartbeatResponse"
@@ -294,9 +343,6 @@ done
 # keyframe/recovery messages. Field names in protoc-gen-es casing, read from a
 # regenerated output.
 for symbol in \
-  publishKinds \
-  maxAudioReceiveSlots \
-  maxVideoReceiveSlots \
   minKeyframeIntervalMs \
   MhServerMessage \
   KeyframeRequest \
@@ -335,10 +381,66 @@ assert_not_generated "dark_tower/internal/v1/internal_pb.ts" MutedSource
 assert_message_field_absent "dark_tower/internal/v1/internal_pb.ts" EgressStream transportMode supersedeOnIndependentFrame
 assert_message_field_absent "dark_tower/internal/v1/internal_pb.ts" RegisterMeetingRequest serverMutedSources sourceStreams
 assert_message_field_absent "dark_tower/internal/v1/internal_pb.ts" RegisterMeetingResponse transportMode appliedSourceStreams
-assert_message_field_absent "dark_tower/signaling/v1/signaling_pb.ts" JoinResponse maxReceiveSlots maxAudioReceiveSlots
+assert_message_field_absent "dark_tower/signaling/v1/signaling_pb.ts" JoinResponse maxReceiveSlots receiveSlotCaps
 # The surviving `transportMode` declarations are still matched by the same
 # helper, so the absences above cannot be a matcher that never matches.
 assert_message_field "dark_tower/internal/v1/internal_pb.ts" SourceStream transportMode
 assert_message_field "dark_tower/internal/v1/internal_pb.ts" SourceStreamEcho transportMode
+
+# 2026-10-25 (ADR-0036 §5 amendment; CONVENTIONS §6) — every per-kind fact is
+# a repeated entry keyed by `MediaKind`. Presence is declaration-anchored
+# (export / field / enum-member declarations); every retired field pair is
+# asserted ABSENT member-scoped, each with a positive control in the same
+# message, so neither a half-done migration nor a rename-back passes.
+SIG="dark_tower/signaling/v1/signaling_pb.ts"
+for symbol in ClientMediaState MediaKindState PublishedKind MuteChange ReceiveSlotCap; do
+  assert_exported "${SIG}" "${symbol}"
+done
+for member in UNSPECIFIED NOT_PUBLISHED LIVE CLIENT_MUTED; do
+  assert_enum_member "${SIG}" ClientMediaState "${member}"
+done
+assert_message_field "${SIG}" JoinRequest publishedKinds
+assert_message_field "${SIG}" JoinResponse receiveSlotCaps
+assert_message_field "${SIG}" Participant mediaStates
+assert_message_field "${SIG}" ParticipantMuteUpdate mediaStates
+assert_message_field "${SIG}" MuteRequest changes
+assert_message_field "${SIG}" ServerMuteRequest changes
+assert_message_field "${SIG}" UnmuteRequest mediaKinds
+for field in mediaKind clientState serverMuted serverMutedBy; do
+  assert_message_field "${SIG}" MediaKindState "${field}"
+done
+for field in mediaKind maxSlots; do
+  assert_message_field "${SIG}" ReceiveSlotCap "${field}"
+done
+for field in mediaKind clientMuted; do
+  assert_message_field "${SIG}" PublishedKind "${field}"
+done
+for field in mediaKind muted; do
+  assert_message_field "${SIG}" MuteChange "${field}"
+done
+
+assert_message_field_absent "${SIG}" JoinRequest publishKinds publishedKinds
+for field in maxAudioReceiveSlots maxVideoReceiveSlots; do
+  assert_message_field_absent "${SIG}" JoinResponse "${field}" receiveSlotCaps
+done
+for field in audioClientMuted videoClientMuted; do
+  assert_message_field_absent "${SIG}" Participant "${field}" mediaStates
+done
+for field in \
+  audioSelfMuted videoSelfMuted \
+  audioServerMuted videoServerMuted serverMutedBy \
+  audioClientMuted videoClientMuted; do
+  assert_message_field_absent "${SIG}" ParticipantMuteUpdate "${field}" mediaStates
+done
+for field in audioMuted videoMuted; do
+  assert_message_field_absent "${SIG}" MuteRequest "${field}" changes
+  assert_message_field_absent "${SIG}" ServerMuteRequest "${field}" changes
+done
+for field in requestAudio requestVideo; do
+  assert_message_field_absent "${SIG}" UnmuteRequest "${field}" mediaKinds
+done
+# `UnmuteResponse` is deleted as a message and as a variant of BOTH envelopes.
+assert_not_generated "${SIG}" UnmuteResponse
+assert_oneof_case_absent "${SIG}" unmuteResponse unmuteRequest
 
 echo "verify-codegen: all checks passed"

@@ -31,6 +31,7 @@ use dt_guard::media_telemetry_deny;
 use dt_guard::metric_coverage;
 use dt_guard::metric_labels;
 use dt_guard::no_insecure_browser_flags;
+use dt_guard::proto_per_kind_fields;
 use dt_guard::release_build_profile;
 use dt_guard::rust_log_secrets;
 use dt_guard::rust_pii;
@@ -102,6 +103,16 @@ enum Command {
     /// Standing prohibition on browser/test-harness settings that disable
     /// certificate validation, disable web security, or force an insecure origin.
     NoInsecureBrowserFlags {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// No proto field may encode a media kind in its name: per-kind facts
+    /// are keyed by `MediaKind` (docs/protocol/CONVENTIONS.md §6).
+    ProtoPerKindFields {
         /// Repository root for path resolution.
         #[arg(long)]
         root: PathBuf,
@@ -463,6 +474,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::NoInsecureBrowserFlags { root, explain } => {
             no_insecure_browser_flags::run(&root, explain)
         }
+        Command::ProtoPerKindFields { root, explain } => proto_per_kind_fields::run(&root, explain),
         Command::ReleaseBuildProfile { root, explain } => {
             release_build_profile::run(&root, explain)
         }
