@@ -94,14 +94,34 @@ COPY . .
 # `cargo build -p <svc>`, so every binary is exactly what that command produces;
 # the gain is the four fat-LTO links (single-threaded) overlapping. Only the
 # binaries leave this step; the copies are removed in the same layer.
-RUN set -u; pids=""; \
+#
+# The four builds share ONE job budget, the cap in .cargo/config.toml (build.jobs,
+# or CARGO_BUILD_JOBS as cargo itself prefers): a jobserver FIFO that every cargo
+# inherits through CARGO_MAKEFLAGS, the protocol GNU make speaks. Each client
+# holds one implicit token, so the FIFO carries (cap - 4) and at most `cap` rustc
+# processes run across all four. A cap below 4 cannot be honoured in parallel and
+# fails the build rather than silently exceeding it.
+RUN set -u; \
+    cap="${CARGO_BUILD_JOBS:-$(sed -n 's/^jobs[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' .cargo/config.toml)}"; \
+    case "$cap" in ''|*[!0-9]*) echo "cannot read build.jobs from .cargo/config.toml (got '$cap')" >&2; exit 1 ;; esac; \
+    [ "$cap" -ge 4 ] || { echo "build.jobs=$cap is below the 4 parallel service builds" >&2; exit 1; }; \
+    mkfifo /tmp/jobserver && exec 3<>/tmp/jobserver; \
+    i=4; while [ "$i" -lt "$cap" ]; do printf '+' >&3; i=$((i + 1)); done; \
+    export CARGO_MAKEFLAGS="-j --jobserver-auth=fifo:/tmp/jobserver"; \
+    ( peak=0; while :; do \
+        n=$(cat /proc/[0-9]*/comm 2>/dev/null | grep -cx rustc); \
+        [ "$n" -gt "$peak" ] && { peak=$n; echo "$peak" > /tmp/rustc-peak; }; sleep 0.2; \
+      done ) & sampler=$!; \
+    pids=""; \
     for p in ac-service gc-service mc-service mh-service; do \
         cp -a target "target-$p"; \
         CARGO_TARGET_DIR="target-$p" cargo build --release --package "$p" > "build-$p.log" 2>&1 & \
         pids="$pids $!"; \
     done; \
     rc=0; for pid in $pids; do wait "$pid" || rc=1; done; \
+    kill "$sampler"; \
     for p in ac-service gc-service mc-service mh-service; do echo "=== $p"; cat "build-$p.log"; done; \
+    echo "job cap $cap; peak concurrent rustc $(cat /tmp/rustc-peak 2>/dev/null || echo 0)"; \
     [ "$rc" -eq 0 ] || { echo "a service build failed (logs above)" >&2; exit 1; }; \
     cp target-ac-service/release/auth-controller target-gc-service/release/gc-service \
         target-mc-service/release/mc-service target-mh-service/release/mh-service target/release/ && \
