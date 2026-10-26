@@ -503,9 +503,11 @@ fn join_media_with(
         .expect("fixture handler set is non-empty and duplicate-free"),
         // The actor-driven suite joins as an audio publisher with no
         // join-carried declaration (it declares post-join), story 2's shape.
-        publishes: mc_service::media_signaling::PublishSet::of(&[
-            mc_service::media_signaling::MediaKindLabel::Audio,
-        ]),
+        declared: mc_service::media_kind::ClientMediaStates::live(
+            mc_service::media_signaling::PublishSet::of(&[
+                mc_service::media_signaling::MediaKindLabel::Audio,
+            ]),
+        ),
         demand: mc_service::media_signaling::ReceiveCapabilityDeclaration::empty()
             .truncate(client_media_config().receive_slot_caps),
     }

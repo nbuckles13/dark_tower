@@ -1495,9 +1495,9 @@ export async function expectDeclaredReceiveSlots(
     `${label}: the build declares M=${String(video?.['declared'])} video slots, the scenario ` +
       `needs M=${expectedVideoSlots} (SUITE_VIDEO_RECEIVE_SLOTS). ${restart}`,
   ).toBe(expectedVideoSlots);
-  // BOTH caps, the same rule per kind. MC always sends both
-  // (`JoinResponse.max_audio_receive_slots` / `max_video_receive_slots`), so
-  // `unknown` is a failure for either kind: an MC that stopped sending one. A
+  // BOTH caps, the same rule per kind. MC always sends every kind
+  // (`JoinResponse.receive_slot_caps`; the SDK refuses a join without them), so
+  // `unknown` is a failure for either kind. A
   // video cap of 0 is LEGAL (the R-26 lever) and reads `known`, never `unknown`
   // (`classifySlotCap`); with the suite's M=0 the video bound is trivially met,
   // and `known` is what proves the field arrived.
@@ -1747,17 +1747,21 @@ export async function recordedVideoTrackStates(page: Page): Promise<string[]> {
 }
 
 // ============================================================================
-// Story 3 R-15: every client-mute token a roster row ever RENDERED
+// Story 3 R-15: every client-state token a roster row ever RENDERED
 // ============================================================================
 
-/** The two roster-row client-mute attributes (`ParticipantRow.svelte`), by kind. ONE home. */
-export const ROSTER_CLIENT_MUTE_ATTRIBUTE = {
-  audio: 'data-client-muted',
-  video: 'data-client-muted-video',
+/**
+ * The two roster-row client-state attributes (`ParticipantRow.svelte`), by
+ * kind. ONE home. Values are the SDK's `ClientMediaStateToken`
+ * (`not_published` | `live` | `client_muted`); there is no "unknown".
+ */
+export const ROSTER_CLIENT_STATE_ATTRIBUTE = {
+  audio: 'data-client-state',
+  video: 'data-client-state-video',
 } as const satisfies Record<MuteKind, string>;
 
 /**
- * Install a TEST-OWNED recorder on `page` of every client-mute token any roster
+ * Install a TEST-OWNED recorder on `page` of every client-state token any roster
  * row renders, from now on: a MutationObserver over the whole document for
  * added rows (`childList` — a row is CREATED with its first value already set,
  * so an attribute-only observer would miss it) and for changes of the two
@@ -1765,7 +1769,7 @@ export const ROSTER_CLIENT_MUTE_ATTRIBUTE = {
  * sequence and checks that a WRONG value never reached the DOM, which holds or
  * fails whatever the interleaving. Existing rows are recorded at install.
  */
-export async function installRosterMuteRecorder(page: Page): Promise<void> {
+export async function installRosterStateRecorder(page: Page): Promise<void> {
   await page.evaluate((attributes) => {
     type Entry = { row: string; attribute: string; value: string };
     const log: Entry[] = [];
@@ -1802,16 +1806,16 @@ export async function installRosterMuteRecorder(page: Page): Promise<void> {
       attributeOldValue: true,
       attributeFilter: attributes,
     });
-  }, Object.values(ROSTER_CLIENT_MUTE_ATTRIBUTE));
+  }, Object.values(ROSTER_CLIENT_STATE_ATTRIBUTE));
 }
 
 /**
- * The client-mute tokens `page`'s roster row for `participantId` rendered since
- * {@link installRosterMuteRecorder}, per kind, consecutive repeats collapsed.
+ * The client-state tokens `page`'s roster row for `participantId` rendered since
+ * {@link installRosterStateRecorder}, per kind, consecutive repeats collapsed.
  * THROWS if the recorder is missing or never saw that row (the positive
  * control: an empty sequence must not read as "no wrong value").
  */
-export async function recordedRosterMute(
+export async function recordedRosterState(
   page: Page,
   participantId: string,
 ): Promise<Record<MuteKind, string[]>> {
@@ -1828,7 +1832,7 @@ export async function recordedRosterMute(
   }
   const per = (kind: MuteKind): string[] =>
     mine
-      .filter((e) => e.attribute === ROSTER_CLIENT_MUTE_ATTRIBUTE[kind])
+      .filter((e) => e.attribute === ROSTER_CLIENT_STATE_ATTRIBUTE[kind])
       .map((e) => e.value)
       .filter((v, i, all) => i === 0 || all[i - 1] !== v);
   return { audio: per('audio'), video: per('video') };

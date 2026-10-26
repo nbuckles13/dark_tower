@@ -71,6 +71,15 @@ export const SignalingErrorCode = {
    * a join itself and is the authority (story 3 R-2).
    */
   NothingToPublishOrReceive: 'NOTHING_TO_PUBLISH_OR_RECEIVE',
+  /**
+   * LOCAL: the meeting controller sent a malformed kind-keyed snapshot
+   * (docs/protocol/CONVENTIONS.md §6; `signaling/mediaKindStates.ts`): a
+   * missing, duplicate or unknown kind, or an unnamed client state, in
+   * `receive_slot_caps` / `media_states` — an MC bug. The session ends and
+   * nothing from the message is applied (never a guessed or "unknown" state);
+   * the bounded reason is logged (`[dt-signaling-contract]`).
+   */
+  ContractFault: 'CONTRACT_FAULT',
 } as const;
 
 export type SignalingErrorCode = (typeof SignalingErrorCode)[keyof typeof SignalingErrorCode];

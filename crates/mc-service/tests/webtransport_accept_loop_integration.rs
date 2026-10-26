@@ -129,7 +129,10 @@ async fn open_bi_send_join(
             // no attestation check this story.
             identity_public_key: sample_identity_public_key(),
             // Story 3 R-2: the suite publishes audio (story-2 shape).
-            publish_kinds: vec![proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32],
+            published_kinds: vec![proto_gen::dark_tower::signaling::v1::PublishedKind {
+                media_kind: proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32,
+                client_muted: false,
+            }],
             receive_capability: None,
         })),
     };
@@ -424,8 +427,10 @@ async fn accept_loop_records_session_join_failure_internal_for_wrong_first_messa
         trace_parent: String::new(),
         trace_state: String::new(),
         message: Some(client_message::Message::MuteRequest(MuteRequest {
-            audio_muted: Some(true),
-            video_muted: Some(false),
+            changes: vec![proto_gen::dark_tower::signaling::v1::MuteChange {
+                media_kind: proto_gen::dark_tower::signaling::v1::MediaKind::Audio as i32,
+                muted: true,
+            }],
         })),
     };
     let encoded = mute_msg.encode_to_vec();

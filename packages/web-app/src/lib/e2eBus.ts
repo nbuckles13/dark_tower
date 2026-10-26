@@ -239,19 +239,31 @@ export function installE2EHooks(
       }),
     );
 
-    // Story 2 R-10/R-11: SERVER mute from the wire, and the host's relay of an
-    // unmute request. Participant ids only (already bounded by the SDK).
+    // Story 2 R-10/R-11, story 3 R-15: the per-kind mute snapshot from the
+    // wire, and the host's relay of an unmute request. A WHITELIST projection
+    // per kind; participant ids only (already bounded by the SDK).
     session.on('participantMuteChanged', (event) =>
       bus.emit({
         type: 'participantMute',
         participantId: event.participantId,
-        audioServerMuted: event.audioServerMuted,
-        videoServerMuted: event.videoServerMuted,
-        ...(event.serverMutedBy !== undefined ? { serverMutedBy: event.serverMutedBy } : {}),
+        mediaStates: Object.fromEntries(
+          Object.entries(event.mediaStates).map(([kind, k]) => [
+            kind,
+            {
+              clientState: k.clientState,
+              serverMuted: k.serverMuted,
+              ...(k.serverMutedBy !== undefined ? { serverMutedBy: k.serverMutedBy } : {}),
+            },
+          ]),
+        ),
       }),
     );
     session.on('unmuteRequested', (event) =>
-      bus.emit({ type: 'unmuteRequested', participantId: event.participantId }),
+      bus.emit({
+        type: 'unmuteRequested',
+        participantId: event.participantId,
+        kinds: [...event.kinds],
+      }),
     );
 
     // The build knobs the suite asserts before any media assertion, so a dev

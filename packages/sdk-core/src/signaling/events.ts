@@ -19,13 +19,12 @@ export { SignalingCodec } from './codecMap.js';
 
 /**
  * A participant in the meeting roster (minimal shape for this story), with the
- * client mute MC held for them when it built the entry (wire
- * `Participant.audio_client_muted` / `video_client_muted`; presence rule at
- * {@link ClientMuteFacts}). It is the SEED of that fact, not a second home: a
- * consumer applies it to wherever it keeps client mute, and later
- * `ParticipantMuteEvent`s move it.
+ * per-kind media state MC held for them when it built the entry (wire
+ * `Participant.media_states`, decoded by `mediaKindStates.ts`). It is the SEED
+ * of that state, not a second home: a consumer applies it to wherever it keeps
+ * per-participant mute, and later `ParticipantMuteEvent`s move it.
  */
-export interface RosterParticipant extends ClientMuteFacts {
+export interface RosterParticipant {
   readonly participantId: string;
   readonly name: string;
   /**
@@ -35,24 +34,52 @@ export interface RosterParticipant extends ClientMuteFacts {
    * roster entry — presentation only, never attribution.
    */
   readonly senderId?: number | undefined;
+  /** Every kind's client and server mute state, as of the MC turn that built the entry. */
+  readonly mediaStates: ParticipantMediaStates;
 }
 
 /**
- * CLIENT MUTE OF OTHERS IS A ROSTER FACT (story 3 R-15; ADR-0036 §5 amendment
- * 2026-10-24, reversing story 2's S-2). MC carries each participant's client
- * mute, per kind, on two carriers: the roster entry (`RosterParticipant`, from
- * `JoinResponse.existing_participants` and `ParticipantJoined`) and every
- * `ParticipantMuteUpdate` (`ParticipantMuteEvent`). Both are wire `optional bool`.
+ * A participant's own (client) media state for one kind (wire
+ * `ClientMediaState`). There is NO "unknown": MC knows every kind's state from
+ * the participant's join declaration, and a snapshot that does not say is a
+ * contract fault that ends the session, never a third display state.
  *
- * THE ONE PRESENCE RULE: per kind, the latest PRESENT value is the fact. ABSENT
- * is "no fact" — it changes nothing, and is never read as `false` (an MC that
- * has not heard from the participant yet, or a rolled-back MC that predates the
- * fields, sends it absent). Until a present value arrives the kind is UNKNOWN.
+ *   * `not_published` — the participant does not publish this kind (fixed for
+ *     the membership, story 3 R-2);
+ *   * `live`          — published and not client-muted;
+ *   * `client_muted`  — published and muted by the participant (enforced at
+ *     their capture).
  */
-export interface ClientMuteFacts {
-  readonly audioClientMuted?: boolean | undefined;
-  readonly videoClientMuted?: boolean | undefined;
+export type ClientMediaStateToken = 'not_published' | 'live' | 'client_muted';
+
+/**
+ * ONE kind's full mute state (wire `MediaKindState`). Client state and server
+ * mute are INDEPENDENT and compose (story 3 R-15): a client-mute change never
+ * touches `serverMuted`, and a server mute never rewrites `clientState`.
+ */
+export interface KindMediaState {
+  readonly clientState: ClientMediaStateToken;
+  /** Whether THIS kind is server-muted (directive withdrawn + MH ingress drop). */
+  readonly serverMuted: boolean;
+  /**
+   * Participant id of whoever applied THIS kind's server mute; present only
+   * while `serverMuted`. MC's own value, bounded to
+   * {@link MAX_RELAYED_PARTICIPANT_ID_LENGTH}. Resolve it against the roster to
+   * render; never render or log the raw string.
+   */
+  readonly serverMutedBy?: string | undefined;
 }
+
+/**
+ * Every kind's state for one participant, keyed by the SDK's media-kind token.
+ * Required for every kind: the wire's one-entry-per-kind rule
+ * (CONVENTIONS §6) is enforced at decode, so a consumer never meets an absent
+ * kind.
+ */
+export type ParticipantMediaStates = Readonly<Record<MediaKindToken, KindMediaState>>;
+
+/** MC's per-kind receive-slot caps (wire `JoinResponse.receive_slot_caps`). A 0 is a real 0. */
+export type ReceiveSlotCaps = Readonly<Record<MediaKindToken, number>>;
 
 /**
  * Bound on an MC-relayed participant id before it enters a public payload (the
@@ -65,40 +92,33 @@ export const MAX_RELAYED_PARTICIPANT_ID_LENGTH = 256;
 /**
  * Payload of `participantMuteChanged` (proto `ParticipantMuteUpdate`).
  *
- * ALL FOUR mute facts of one participant, PER KIND (story 3 R-15). MC emits this
- * on every real change of any of them (server mute, and — since the ADR-0036 §5
- * amendment 2026-10-24 — the participant's own client mute, to everyone else),
- * and replays it right after the join response for every participant
- * server-muted in EITHER kind.
- *
- *   * SERVER mute: both kinds always carried, so a participant with no update
- *     is server-unmuted in both kinds (known, not unknown).
- *   * CLIENT mute: the {@link ClientMuteFacts} presence rule — absent changes
- *     nothing. The client-mute fields NEVER touch the server-mute ones: a
- *     client-mute change cannot clear a server mute.
+ * A FULL SNAPSHOT of one participant's per-kind state, never a delta. MC emits
+ * it on every real change of a server mute (to everyone, the subject included)
+ * and of the participant's own client state (to everyone else, coalesced
+ * latest-state-wins: intermediate transitions may be skipped, so never count
+ * transitions from these). The subject MUST NOT treat its own copy's
+ * `clientState` as a capture command: client mute is enforced locally.
  */
-export interface ParticipantMuteEvent extends ClientMuteFacts {
+export interface ParticipantMuteEvent {
   readonly participantId: string;
-  /** Whether this participant's audio is server-muted (enforced at MH ingress). */
-  readonly audioServerMuted: boolean;
-  /** Whether this participant's video is server-muted (enforced at MH ingress). */
-  readonly videoServerMuted: boolean;
-  /**
-   * Participant id of whoever applied the server mute, when muted and MC said.
-   * MC's own value, bounded to {@link MAX_RELAYED_PARTICIPANT_ID_LENGTH}. Resolve it
-   * against the roster to render; never render or log the raw string.
-   */
-  readonly serverMutedBy?: string | undefined;
+  readonly mediaStates: ParticipantMediaStates;
 }
 
 /**
  * Payload of `unmuteRequested` — MC relayed a server-muted participant's request
  * to be unmuted to THIS client (only a host receives it). It NOTIFIES; it never
  * lifts the mute (R-10). `participantId` is MC-stamped from the requester's
- * authenticated connection, bounded like {@link ParticipantMuteEvent.serverMutedBy}.
+ * authenticated connection, bounded like {@link KindMediaState.serverMutedBy}.
  */
 export interface UnmuteRequestedEvent {
   readonly participantId: string;
+  /**
+   * The kinds the requester asks to have lifted — MC's re-encoding, restricted
+   * to the kinds currently server-muted for the requester. Non-empty, no
+   * duplicates (a relay that is not is a contract fault and never reaches this
+   * event).
+   */
+  readonly kinds: readonly MediaKindToken[];
 }
 
 /**
@@ -125,15 +145,14 @@ export interface JoinedEvent {
   readonly participantId: string;
   readonly senderId?: number | undefined;
   /**
-   * MC's per-kind receive-slot caps (`JoinResponse.max_audio_receive_slots` /
-   * `max_video_receive_slots`, story 3 R-1), passed through verbatim:
-   * `undefined` when absent (an MC that does not send them — the caps are then
-   * UNKNOWN), and a present `0` kept as `0` (legal: a video cap of 0 is the
-   * video-off lever, R-26). Never coerced. Informational only: MC truncates, so
-   * a client never shrinks its declaration from these.
+   * MC's per-kind receive-slot caps (`JoinResponse.receive_slot_caps`, story 3
+   * R-1). REQUIRED on the wire, one entry per kind (CONVENTIONS §6): a join
+   * response without them is a contract fault and never reaches this event. A
+   * `0` is kept as `0` (legal: a video cap of 0 is the video-off lever, R-26).
+   * Informational only: MC truncates, so a client never shrinks its
+   * declaration from these.
    */
-  readonly maxAudioReceiveSlots?: number | undefined;
-  readonly maxVideoReceiveSlots?: number | undefined;
+  readonly receiveSlotCaps: ReceiveSlotCaps;
   readonly existingParticipants: readonly RosterParticipant[];
   readonly mediaServers: readonly string[];
   readonly correlationId: string;
@@ -246,6 +265,12 @@ export interface RosterKeySink {
  * share is not a kind this story serves and is unrepresentable here.
  */
 export type PublishKind = MediaKindToken;
+
+/** One published kind and its client mute when the join was built (wire `PublishedKind`). */
+export interface PublishedKindDeclaration {
+  readonly kind: PublishKind;
+  readonly clientMuted: boolean;
+}
 
 /** One receive slot this client declares it can render (ADR-0036 §6). */
 export interface ReceiveSlotDeclaration {
@@ -441,11 +466,13 @@ export interface SignalingJoinParams {
   /** Optional advertised capabilities. */
   readonly capabilities?: SignalingCapabilities;
   /**
-   * What this participant publishes (`JoinRequest.publish_kinds`, story 3 R-2).
-   * FIXED FOR THE MEMBERSHIP: MC refuses a reconnect presenting a different
-   * set. Copied and frozen by the client; never re-read from the caller.
+   * What this participant publishes, each kind with its client mute at the
+   * moment the join is built (`JoinRequest.published_kinds`; story 3 R-2).
+   * Empty = receive-only. FIXED FOR THE
+   * MEMBERSHIP: MC refuses a reconnect presenting a different kind set. Copied
+   * and frozen by the client; never re-read from the caller.
    */
-  readonly publishKinds: readonly PublishKind[];
+  readonly publish: readonly PublishedKindDeclaration[];
   /**
    * The INITIAL receive declaration (`JoinRequest.receive_capability`), in slot
    * id order (`session/mediaSelection.ts:receiveDeclaration`).

@@ -37,7 +37,7 @@
   });
   function rowText(id: string): string {
     const p = store.media.participant(id);
-    return `${p.audioServerMuted ? 'audio-server-muted' : 'audio-ok'} ${p.videoServerMuted ? 'video-server-muted' : 'video-ok'} client-audio:${String(p.audioClientMuted)}`;
+    return `${p.kind('audio').serverMuted ? 'audio-server-muted' : 'audio-ok'} ${p.kind('video').serverMuted ? 'video-server-muted' : 'video-ok'} client-audio:${String(p.kind('audio').clientState)}`;
   }
   const rowX = $derived.by(() => {
     counts.rowX += 1;

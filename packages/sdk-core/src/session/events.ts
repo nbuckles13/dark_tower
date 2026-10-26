@@ -189,10 +189,12 @@ export interface MeetingSessionEventMap {
    */
   mediaFault: MediaFault;
   /**
-   * A participant's SERVER mute changed (or was replayed at join) — ADR-0036 §5,
-   * story 2 R-11. Includes this participant's own. The ONLY source for rendering
-   * server-muted state: nothing flips it locally, not even this client's own
-   * unmute request.
+   * A participant's per-kind mute state changed (server mute, or another
+   * participant's own client state) — ADR-0036 §5, story 2 R-11, story 3 R-15.
+   * A full snapshot. Includes this participant's own server-mute changes. With
+   * the roster entry's `mediaStates`, the ONLY source for rendering another
+   * participant's mute state: nothing flips it locally, not even this client's
+   * own unmute request.
    */
   participantMuteChanged: ParticipantMuteEvent;
   /** A server-muted participant asked the host to unmute them (host only; R-10). */
@@ -253,13 +255,13 @@ export interface StartMediaOptions {
 
 /**
  * MC's per-kind receive-slot cap as this session learned it from `JoinResponse`
- * (`max_audio_receive_slots` / `max_video_receive_slots`; the proto comment is
- * the canonical statement).
+ * (`receive_slot_caps`; the proto comment is the canonical statement).
  *
  *   * `known` — MC advertised a cap. 0 is LEGAL (a video cap of 0 is the
  *     video-off lever, story 3 R-26), never folded into `unknown`.
- *   * `unknown` — absent: an MC that does not send them, or no join yet.
- *     Never coerced to 0, which would read as "video disabled".
+ *   * `unknown` — not joined yet. Once joined the caps are known: a join
+ *     response without them is a contract fault that fails the join. Never
+ *     coerced to 0, which would read as "video disabled".
  *
  * Informational: MC TRUNCATES an over-cap declaration (excess slots report
  * `unavailable`), so a client never shrinks its declaration from this.

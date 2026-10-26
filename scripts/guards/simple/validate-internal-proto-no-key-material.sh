@@ -145,6 +145,7 @@ fi
 # input rather than lean on another layer. So: join lines, collapse whitespace around `.`
 # and elsewhere, and break at `;` `{` `}`. Runs AFTER the `//` strip. Reported findings
 # cite the offending STATEMENT text, since source line numbers do not survive the join.
+# Duplicated by crates/dt-guard/src/common/proto_lex.rs; port tracked in docs/TODO.md §Polyglot Pipeline Follow-ups.
 normalise() {
   tr '\n' ' ' < "$1" \
     | sed -E 's/[[:space:]]*\.[[:space:]]*/./g; s/[[:space:]]+/ /g' \

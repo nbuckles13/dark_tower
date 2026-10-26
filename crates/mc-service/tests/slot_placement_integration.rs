@@ -51,7 +51,7 @@ use proto_gen::dark_tower::signaling::v1::{SlotState, TransportMode};
 
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::media_session::{
-    audio_slots, capability_frame, connection_id_for, join_as, join_as_on, mute_frame,
+    audio_slots, capability_frame, connection_id_for, join_as, join_as_on, mute_kinds_frame,
     notify_connected, notify_disconnected, start_stack,
 };
 use test_common::{
@@ -768,7 +768,7 @@ async fn rapid_distinct_redeclarations_are_bounded_and_do_not_starve_peers() {
         vec![Some(a.sender_id)]
     );
     // ... and a mute by B still reaches A, who holds B.
-    b.write(mute_frame(true, false)).await;
+    b.write(mute_kinds_frame(Some(true), None)).await;
     a.assignments_until("B shown muted in A's view", |x| {
         x.assignments.iter().any(|s| {
             s.sender_id == Some(b.sender_id) && s.slot_state == SlotState::AvatarClientMuted as i32
@@ -976,9 +976,11 @@ async fn a_reconnect_in_grace_keeps_slots_and_re_sends_only_the_reconnectors_vie
             "conn-b2".to_string(),
             joins[1].correlation_id.clone(),
             joins[1].binding_token.clone(),
-            mc_service::media_signaling::PublishSet::of(&[
-                mc_service::media_signaling::MediaKindLabel::Audio,
-            ]),
+            mc_service::media_kind::ClientMediaStates::live(
+                mc_service::media_signaling::PublishSet::of(&[
+                    mc_service::media_signaling::MediaKindLabel::Audio,
+                ]),
+            ),
             None,
         )
         .await

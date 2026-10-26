@@ -1,5 +1,23 @@
-# Generates the `prometheus-rules` ConfigMap from THE one on-disk copy of the
-# alert rules, so the cluster never gets a hand-mirrored second set.
+# Generates the `prometheus-rules-<svc>` ConfigMaps from THE one on-disk copy of
+# the alert rules, so the cluster never gets a hand-mirrored second set.
+#
+# ONE GENERATOR PER RULES FILE, PROJECTED INTO ONE DIRECTORY (2026-10-25). Until
+# then a single `prometheus-rules` generator held every file, and it reached 80%
+# of the 262144-byte `last-applied-configuration` cap that `dt-guard kustomize`
+# (`configmap_annotation_size`) enforces. So every new alert tipped it over a
+# budget its own task had not filled. Each file is now its own ConfigMap: the
+# largest (mc) is about a third of the cap, and a new rules file never inherits
+# another file's size. The Prometheus Deployment
+# (`infra/kubernetes/observability/prometheus-config.yaml`) mounts them as ONE
+# `projected` volume at `/etc/prometheus/rules`, so the `rule_files` glob is
+# unchanged. This is the same shape as Grafana's per-group dashboards.
+#
+# ADDING A RULES FILE therefore means three places: `rules/<svc>-alerts.yaml`,
+# a generator here, and a source in that projected volume. Forget the generator
+# and `dt-guard alert-rules-policy` fails (below). Forget the projected source
+# and `dt-guard kustomize` R-21 fails (a generated ConfigMap no pod references).
+# The sources are not `optional:`, so a missing ConfigMap fails pod start loudly
+# rather than silently loading fewer rules.
 #
 # WHY THIS KUSTOMIZATION LIVES HERE AND NOT IN
 # `infra/kubernetes/observability/`, WHERE THE REST OF THE STACK IS.
@@ -19,8 +37,8 @@
 # empirically: `files: [rules/*-alerts.yaml]` fails with an evalsymlink error on
 # the literal path. So a new `<svc>-alerts.yaml` can be inside Prometheus's
 # `rule_files` glob, pass every existing guard, and still never be mounted and
-# never load. `dt-guard alert-rules-policy` parses THIS list and asserts it
-# equals the loadable-rules-file set defined in
+# never load. `dt-guard alert-rules-policy` parses the files of EVERY generator
+# below and asserts their union equals the loadable-rules-file set defined in
 # `crates/dt-guard/src/alert_rules.rs`, failing on a difference in EITHER
 # direction. Add the file here when you add it to `rules/`.
 #
@@ -32,16 +50,28 @@ kind: Kustomization
 
 namespace: dark-tower-observability
 
+# Labels for every generator in this file, stated once.
+generatorOptions:
+  labels:
+    app: prometheus
+    component: monitoring
+
 configMapGenerator:
-  - name: prometheus-rules
-    options:
-      labels:
-        app: prometheus
-        component: monitoring
+  - name: prometheus-rules-ac
     files:
       - rules/ac-alerts.yaml
+  - name: prometheus-rules-client
+    files:
       - rules/client-alerts.yaml
+  - name: prometheus-rules-gc
+    files:
       - rules/gc-alerts.yaml
+  - name: prometheus-rules-mc
+    files:
       - rules/mc-alerts.yaml
+  - name: prometheus-rules-mh
+    files:
       - rules/mh-alerts.yaml
+  - name: prometheus-rules-otel
+    files:
       - rules/otel-alerts.yaml

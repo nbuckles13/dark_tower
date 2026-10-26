@@ -65,6 +65,8 @@ vi.mock('@darktower/sdk-core', async (importOriginal) => {
 
 // Imported after the mock is registered (vi.mock is hoisted regardless).
 import JoinMeeting from '../views/JoinMeeting.svelte';
+import { mediaStates } from './helpers/mediaStates.js';
+import { INDICATOR_TEXT } from '../lib/participantState.js';
 
 const config: DemoConfig = {
   acOriginTemplate: 'http://{subdomain}.localhost:5173',
@@ -101,10 +103,14 @@ test('renders join controls and a live roster from the store', async () => {
 
   const screen = await submitted(session);
   await vi.waitFor(() => expect(session.joinCalls).toBe(1));
-  session.fire('participantJoined', { participant: { participantId: 'a', name: 'Ann' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'a', name: 'Ann', mediaStates: mediaStates() },
+  });
   await expect.element(screen.getByTestId('participant-a')).toHaveTextContent('Ann');
 
-  session.fire('participantJoined', { participant: { participantId: 'b', name: 'Bob' } });
+  session.fire('participantJoined', {
+    participant: { participantId: 'b', name: 'Bob', mediaStates: mediaStates() },
+  });
   session.fire('participantLeft', { participantId: 'a', reason: 'voluntary' });
   await expect.element(screen.getByTestId('participant-a')).not.toBeInTheDocument();
   await expect.element(screen.getByTestId('participant-b')).toHaveTextContent('Bob');
@@ -185,10 +191,11 @@ async function joinedRig(opts: { isHost?: boolean } = {}) {
   session.fire('joined', {
     participantId: 'self',
     senderId: 1,
+    receiveSlotCaps: { audio: 8, video: 8 },
     existingParticipants: [
-      { participantId: 'b', name: 'Bea', senderId: 258 },
-      { participantId: 'c', name: 'Cid', senderId: 259 },
-      { participantId: 'h', name: 'Hal', senderId: 260 },
+      { participantId: 'b', name: 'Bea', senderId: 258, mediaStates: mediaStates() },
+      { participantId: 'c', name: 'Cid', senderId: 259, mediaStates: mediaStates() },
+      { participantId: 'h', name: 'Hal', senderId: 260, mediaStates: mediaStates() },
     ],
     mediaServers: [],
     correlationId: 'x',
@@ -219,7 +226,7 @@ test('an unreachable participant is ON the roster, marked with the wire token â€
   const c = screen.getByTestId('participant-c');
   await expect.element(c).toHaveAttribute('data-reachability', 'source_unreachable');
   await expect.element(c).toHaveAttribute('data-server-muted', 'false');
-  await expect.element(c).toHaveAttribute('data-client-muted', 'unknown');
+  await expect.element(c).toHaveAttribute('data-client-state', 'live');
   await expect
     .element(screen.getByTestId('participant-b'))
     .toHaveAttribute('data-reachability', 'reachable');
@@ -244,32 +251,48 @@ test('server mute and client mute are DISTINCT tokens; client mute is the roster
   });
   session.fire('participantMuteChanged', {
     participantId: 'c',
-    audioServerMuted: true,
-    videoServerMuted: false,
-    serverMutedBy: 'h',
-    audioClientMuted: false,
+    mediaStates: mediaStates({
+      audio: { clientState: 'live', serverMuted: true, serverMutedBy: 'h' },
+    }),
   });
   const b = screen.getByTestId('participant-b');
   const c = screen.getByTestId('participant-c');
   const h = screen.getByTestId('participant-h');
   // b: a slot reads avatar_client_muted, but MC has reported no fact -> unknown.
-  await expect.element(b).toHaveAttribute('data-client-muted', 'unknown');
+  await expect.element(b).toHaveAttribute('data-client-state', 'live');
   await expect.element(b).toHaveAttribute('data-server-muted', 'false');
   // c: server-muted AND a client fact: both shown, independently.
   await expect.element(c).toHaveAttribute('data-server-muted', 'true');
-  await expect.element(c).toHaveAttribute('data-client-muted', 'false');
+  await expect.element(c).toHaveAttribute('data-client-state', 'live');
   await expect.element(screen.getByTestId('participant-server-muted-c')).toMatchTextContent('Hal');
   // h: in no slot of ours; its own update makes it known (story 3 R-15).
-  await expect.element(h).toHaveAttribute('data-client-muted', 'unknown');
+  await expect.element(h).toHaveAttribute('data-client-state', 'live');
   session.fire('participantMuteChanged', {
     participantId: 'h',
-    audioServerMuted: false,
-    videoServerMuted: false,
-    audioClientMuted: true,
-    videoClientMuted: false,
+    mediaStates: mediaStates({
+      audio: { clientState: 'client_muted' },
+      video: { clientState: 'live' },
+    }),
   });
-  await expect.element(h).toHaveAttribute('data-client-muted', 'true');
-  await expect.element(h).toHaveAttribute('data-client-muted-video', 'false');
+  await expect.element(h).toHaveAttribute('data-client-state', 'client_muted');
+  await expect.element(h).toHaveAttribute('data-client-state-video', 'live');
+});
+
+test('a kind the participant does NOT publish reads "not publishing" and has NO host control', async () => {
+  const { session, screen } = await joinedRig({ isHost: true });
+  session.fire('participantMuteChanged', {
+    participantId: 'b',
+    mediaStates: mediaStates({ video: { clientState: 'not_published' } }),
+  });
+  const row = screen.getByTestId('participant-b');
+  await expect.element(row).toHaveAttribute('data-client-state-video', 'not_published');
+  await expect
+    .element(row.getByTestId('mute-video-client-b'))
+    .toHaveTextContent(INDICATOR_TEXT.client.video.not_published);
+  // MC refuses a server mute of an unpublished kind: the control is not offered.
+  await expect.element(screen.getByTestId('server-mute-video-b')).not.toBeInTheDocument();
+  await expect.element(screen.getByTestId('server-mute-audio-b')).toBeInTheDocument();
+  expect(row.element().textContent).not.toMatch(/unknown/);
 });
 
 test('host controls are absent for a non-host', async () => {
@@ -292,15 +315,13 @@ test('the host affordance sends target + action, and its label follows the WIRE,
 
   session.fire('participantMuteChanged', {
     participantId: 'b',
-    audioServerMuted: true,
-    videoServerMuted: false,
-    serverMutedBy: 'self',
+    mediaStates: mediaStates({ audio: { serverMuted: true, serverMutedBy: 'self' } }),
   });
   await expect.element(button).toHaveAttribute('aria-pressed', 'true');
   await expect.element(screen.getByTestId('participant-server-muted-b')).toMatchTextContent('you');
 
   // A relayed unmute request is shown to the host; it lifts nothing.
-  session.fire('unmuteRequested', { participantId: 'b' });
+  session.fire('unmuteRequested', { participantId: 'b', kinds: ['audio'] });
   await expect.element(screen.getByTestId('unmute-requested-b')).toBeInTheDocument();
   await expect
     .element(screen.getByTestId('participant-b'))
@@ -312,8 +333,7 @@ test('the host affordance sends target + action, and its label follows the WIRE,
   );
   session.fire('participantMuteChanged', {
     participantId: 'b',
-    audioServerMuted: false,
-    videoServerMuted: false,
+    mediaStates: mediaStates(),
   });
   await expect.element(button).toHaveAttribute('aria-pressed', 'false');
   await expect.element(screen.getByTestId('unmute-requested-b')).not.toBeInTheDocument();
@@ -330,9 +350,7 @@ test('the host has a SEPARATE affordance per kind; a video request never touches
   );
   session.fire('participantMuteChanged', {
     participantId: 'b',
-    audioServerMuted: false,
-    videoServerMuted: true,
-    serverMutedBy: 'self',
+    mediaStates: mediaStates({ video: { serverMuted: true, serverMutedBy: 'self' } }),
   });
   await expect.element(video).toHaveAttribute('aria-pressed', 'true');
   await expect.element(audio).toHaveAttribute('aria-pressed', 'false');

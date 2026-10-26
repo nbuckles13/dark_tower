@@ -81,7 +81,7 @@ use std::time::{Duration, Instant};
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::gc_client::GcClient;
 use env_tests::fixtures::mc_session::JoinDeclaration;
-use env_tests::fixtures::mc_session::{self, MhSession};
+use env_tests::fixtures::mc_session::{self, mute_changes, server_muted, MhSession};
 use env_tests::fixtures::media::{
     assert_relayed_on_slot, audio_datagram, bind_until_received, drain, AUDIO_SEND_ID,
 };
@@ -170,8 +170,7 @@ fn server_mute(
         message: Some(client_message::Message::ServerMuteRequest(
             ServerMuteRequest {
                 participant_id: target.to_string(),
-                audio_muted,
-                video_muted,
+                changes: mute_changes(audio_muted, video_muted),
                 reason: String::new(),
             },
         )),
@@ -766,8 +765,7 @@ const FRAME_DEADLINE: Duration = Duration::from_secs(45);
 fn mute_request(audio_muted: Option<bool>, video_muted: Option<bool>) -> ClientMessage {
     ClientMessage {
         message: Some(client_message::Message::MuteRequest(MuteRequest {
-            audio_muted,
-            video_muted,
+            changes: mute_changes(audio_muted, video_muted),
         })),
         trace_parent: String::new(),
         trace_state: String::new(),
@@ -1139,7 +1137,7 @@ async fn test_video_server_mute_withdraws_drops_a_patched_publisher_and_unmute_r
         &mut p,
         &format!("{PHASE} 1 MUTE"),
         bound,
-        |u| u.video_server_muted && !u.audio_server_muted,
+        |u| server_muted(u, VIDEO) && !server_muted(u, AUDIO),
         |d| kind_targets(d, VIDEO).is_empty(),
     )
     .await;
@@ -1390,7 +1388,7 @@ async fn test_video_server_mute_withdraws_drops_a_patched_publisher_and_unmute_r
         &mut p,
         &format!("{PHASE} 3 UNMUTE"),
         bound,
-        |u| !u.video_server_muted,
+        |u| !server_muted(u, VIDEO),
         |d| !kind_targets(d, VIDEO).is_empty(),
     )
     .await;
@@ -1424,7 +1422,7 @@ async fn test_video_server_mute_withdraws_drops_a_patched_publisher_and_unmute_r
         &mut p,
         &format!("{PHASE} 4 AUDIO MUTE"),
         bound,
-        |u| u.audio_server_muted && !u.video_server_muted,
+        |u| server_muted(u, AUDIO) && !server_muted(u, VIDEO),
         |d| kind_targets(d, AUDIO).is_empty(),
     )
     .await;
@@ -1459,7 +1457,7 @@ async fn test_video_server_mute_withdraws_drops_a_patched_publisher_and_unmute_r
         &mut p,
         &format!("{PHASE} 4 AUDIO UNMUTE"),
         bound,
-        |u| !u.audio_server_muted,
+        |u| !server_muted(u, AUDIO),
         |d| !kind_targets(d, AUDIO).is_empty(),
     )
     .await;

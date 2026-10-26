@@ -99,10 +99,10 @@ export function rosterInvalidationListener(
  * suppression; nothing is actionable and nothing is safe to log about it.
  *
  * Only a PUBLISHED kind is reported (story 3 R-15): the publish set is fixed for
- * the membership, a kind outside it has no client-mute fact to give peers (it
- * stays "unknown" to them, never a false "on"), and MC refuses it as
- * `not_published` — which stays a non-stock signal. Local mute state is
- * untouched either way.
+ * the membership, peers see an unpublished kind as `not_published` whatever
+ * this client's local mute says, and MC refuses a request naming one WHOLE and
+ * counts it `not_published` — which must stay a non-stock signal, so a stock
+ * client never sends one. Local mute state is untouched either way.
  */
 export function bestEffortMuteReport(
   signaling: {

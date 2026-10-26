@@ -6,9 +6,10 @@ import { expect, test } from 'vitest';
 import { MeetingSessionState, SdkError, SdkErrorCode } from '@darktower/sdk-core';
 import type { JoinedEvent, RosterParticipant } from '@darktower/sdk-core';
 import { MeetingStore } from '../stores/MeetingStore.svelte.js';
+import { mediaStates } from './helpers/mediaStates.js';
 
 function roster(id: string, name: string): RosterParticipant {
-  return { participantId: id, name };
+  return { participantId: id, name, mediaStates: mediaStates() };
 }
 
 function joined(existing: readonly RosterParticipant[]): JoinedEvent {
@@ -16,6 +17,7 @@ function joined(existing: readonly RosterParticipant[]): JoinedEvent {
     participantId: 'self',
     senderId: 42,
     existingParticipants: existing,
+    receiveSlotCaps: { audio: 8, video: 8 },
     mediaServers: [],
     correlationId: 'corr',
     bindingToken: 'binding-secret',

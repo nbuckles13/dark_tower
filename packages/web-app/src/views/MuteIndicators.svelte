@@ -1,7 +1,8 @@
 <script lang="ts">
   // The FOUR mute indicators for one participant (story 3 R-15): client audio,
   // client video, server audio, server video — each its own element, its own
-  // token (`data-muted`) and its own visibly distinct text + glyph, so "muted
+  // token (client: `data-client-state`, the SDK's `ClientMediaStateToken`;
+  // server: `data-muted`) and its own visibly distinct text + glyph, so "muted
   // their microphone" can never be mistaken for "the host turned the camera
   // off". Rendered from wire facts only (`lib/participantState.ts`).
   import {
@@ -25,9 +26,9 @@
     <span
       class="indicator client"
       data-testid={`mute-${kind}-client-${participantId}`}
-      data-muted={indicators.clientMuted[kind]}
+      data-client-state={indicators.clientState[kind]}
       ><span aria-hidden="true">{GLYPH.client[kind]}</span>
-      {INDICATOR_TEXT.client[kind][indicators.clientMuted[kind]]}</span
+      {INDICATOR_TEXT.client[kind][indicators.clientState[kind]]}</span
     >
   {/each}
   {#each MEDIA_KINDS as kind (kind)}

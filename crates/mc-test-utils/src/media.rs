@@ -137,3 +137,63 @@ pub fn meeting_assignment_for(
         .cloned()
         .expect("fixture assignment must cover its own handler")
 }
+
+// ---------------------------------------------------------------------------
+// Kind-keyed snapshot readers (ADR-0036 §5 amendment 2026-10-25; CONVENTIONS §6)
+// ---------------------------------------------------------------------------
+
+/// `kind`'s entry of a server snapshot list (`Participant.media_states`,
+/// `ParticipantMuteUpdate.media_states`). Panics unless the list carries
+/// EXACTLY one entry for the kind -- the completeness rule every MC test
+/// reads through, so "exactly one per kind" is asserted in one place.
+#[must_use]
+pub fn media_state_entry(
+    states: &[proto_gen::dark_tower::signaling::v1::MediaKindState],
+    kind: proto_gen::dark_tower::signaling::v1::MediaKind,
+) -> &proto_gen::dark_tower::signaling::v1::MediaKindState {
+    let mut it = states.iter().filter(|s| s.media_kind == kind as i32);
+    let Some(entry) = it.next() else {
+        panic!("no media_states entry for {kind:?}: {states:?}");
+    };
+    assert!(it.next().is_none(), "two media_states entries for {kind:?}");
+    entry
+}
+
+/// `kind`'s client state on a server snapshot list (a decoded value; an
+/// unknown number panics).
+#[must_use]
+pub fn client_state_of(
+    states: &[proto_gen::dark_tower::signaling::v1::MediaKindState],
+    kind: proto_gen::dark_tower::signaling::v1::MediaKind,
+) -> proto_gen::dark_tower::signaling::v1::ClientMediaState {
+    let raw = media_state_entry(states, kind).client_state;
+    let Ok(state) = proto_gen::dark_tower::signaling::v1::ClientMediaState::try_from(raw) else {
+        panic!("unknown client_state {raw} for {kind:?}");
+    };
+    state
+}
+
+/// `kind`'s `(server_muted, server_muted_by)` on a server snapshot list.
+#[must_use]
+pub fn server_mute_of(
+    states: &[proto_gen::dark_tower::signaling::v1::MediaKindState],
+    kind: proto_gen::dark_tower::signaling::v1::MediaKind,
+) -> (bool, String) {
+    let entry = media_state_entry(states, kind);
+    (entry.server_muted, entry.server_muted_by.clone())
+}
+
+/// The (audio, camera) client states on a server snapshot list.
+#[must_use]
+pub fn client_states_av(
+    states: &[proto_gen::dark_tower::signaling::v1::MediaKindState],
+) -> (
+    proto_gen::dark_tower::signaling::v1::ClientMediaState,
+    proto_gen::dark_tower::signaling::v1::ClientMediaState,
+) {
+    use proto_gen::dark_tower::signaling::v1::MediaKind;
+    (
+        client_state_of(states, MediaKind::Audio),
+        client_state_of(states, MediaKind::VideoCamera),
+    )
+}

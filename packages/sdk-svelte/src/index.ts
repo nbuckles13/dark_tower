@@ -10,7 +10,12 @@
 
 export { MeetingStore } from './stores/MeetingStore.svelte.js';
 export { MediaStore } from './stores/MediaStore.svelte.js';
-export type { PairView, ParticipantMediaView, SlotView } from './stores/mediaCells.svelte.js';
+export type {
+  KindMediaView,
+  PairView,
+  ParticipantMediaView,
+  SlotView,
+} from './stores/mediaCells.svelte.js';
 
 // Story 3 C-C1: the slot's render surface. Binds a canvas as the slot's
 // `VideoSink`; decoded frames are drawn there and never touch a store.

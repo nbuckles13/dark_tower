@@ -1,12 +1,12 @@
 //! Shared encoding utilities for WebTransport signaling messages.
 
 use crate::actors::messages::{LeaveReason, ParticipantInfo, ParticipantStateUpdate};
-use crate::media_kind::MediaKindLabel;
+use crate::media_kind::{served_kind, KindRefusal, MediaKindLabel, MediaStates, KNOWN_WIRE_KINDS};
 use crate::webtransport::trace::inject_current_context;
 
 use proto_gen::dark_tower::signaling::v1::{
-    self, server_message, Participant, ParticipantJoined, ParticipantLeft, ParticipantMuteUpdate,
-    ServerMessage,
+    self, server_message, ClientMediaState, MediaKindState, Participant, ParticipantJoined,
+    ParticipantLeft, ParticipantMuteUpdate, ReceiveSlotCap, ServerMessage,
 };
 use tracing::debug;
 
@@ -87,11 +87,56 @@ pub fn roster_entry(info: &ParticipantInfo) -> Participant {
             Some(key) => key.as_bytes().to_vec(),
             None => Vec::new(),
         },
-        // Client mute, set iff MC knows (`None` = ABSENT = "unknown" to peers,
-        // never unmuted). Server mute is not on the roster: the replay carries it.
-        audio_client_muted: info.client_muted.get(MediaKindLabel::Audio),
-        video_client_muted: info.client_muted.get(MediaKindLabel::Video),
+        // The full per-kind state, both halves (the one carrier; there is no
+        // server-mute replay).
+        media_states: media_kind_states(&info.media),
     }
+}
+
+/// THE ONE per-kind mute encoder (`Participant.media_states` and
+/// `ParticipantMuteUpdate.media_states`): exactly one entry per KNOWN wire
+/// kind (CONVENTIONS §6), never `UNSPECIFIED`.
+///
+/// A served kind carries the roster's state; `server_muted_by` is set IFF that
+/// kind is server-muted (it is the attribution store's own value, so the two
+/// cannot disagree). An unserved known kind (`VIDEO_SCREEN` today) is the MC
+/// invariant constant: NOT_PUBLISHED, not server-muted, no imposer.
+#[must_use]
+pub fn media_kind_states(media: &MediaStates) -> Vec<MediaKindState> {
+    KNOWN_WIRE_KINDS
+        .iter()
+        .map(|&wire| match served_kind(wire as i32) {
+            Ok(kind) => {
+                let imposer = media.server.imposer(kind);
+                MediaKindState {
+                    media_kind: wire as i32,
+                    client_state: media.client.get(kind).to_proto() as i32,
+                    server_muted: imposer.is_some(),
+                    server_muted_by: imposer.unwrap_or_default().to_string(),
+                }
+            }
+            Err(KindRefusal::Unsupported | KindRefusal::Unspecified) => MediaKindState {
+                media_kind: wire as i32,
+                client_state: ClientMediaState::NotPublished as i32,
+                server_muted: false,
+                server_muted_by: String::new(),
+            },
+        })
+        .collect()
+}
+
+/// `JoinResponse.receive_slot_caps`: exactly one entry per KNOWN wire kind
+/// (CONVENTIONS §6), from `cap_of` for a served kind; an unserved known kind
+/// (`VIDEO_SCREEN` today) is 0 -- this story serves no slots of it.
+#[must_use]
+pub fn receive_slot_caps(cap_of: impl Fn(MediaKindLabel) -> u32) -> Vec<ReceiveSlotCap> {
+    KNOWN_WIRE_KINDS
+        .iter()
+        .map(|&wire| ReceiveSlotCap {
+            media_kind: wire as i32,
+            max_slots: served_kind(wire as i32).map_or(0, &cap_of),
+        })
+        .collect()
 }
 
 /// Encode a `ParticipantStateUpdate` for the wire.
@@ -99,10 +144,10 @@ pub fn roster_entry(info: &ParticipantInfo) -> Participant {
 /// `ParticipantJoined`, `ParticipantLeft` and `ParticipantMuteUpdate` are
 /// serialized. Other variants are logged but return `None`.
 ///
-/// THE ONE SERIALIZER for `MuteChanged`: the server-mute broadcast, the
-/// client-mute fan-out and the late-joiner replay all reach the wire through
-/// this function, so a mute applied before you join and one applied after
-/// cannot be encoded two ways.
+/// THE ONE SERIALIZER for `MuteChanged`: the server-mute broadcast and the
+/// client-mute fan-out both reach the wire through this function, and the
+/// roster entry through [`media_kind_states`] too, so a mute applied before
+/// you join and one applied after cannot be encoded two ways.
 pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<EncodedUpdate> {
     match update {
         ParticipantStateUpdate::Joined(info) => {
@@ -148,12 +193,9 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Enco
         }
         ParticipantStateUpdate::MuteChanged {
             participant_id,
-            client_muted,
-            audio_server_muted,
-            video_server_muted,
-            server_muted_by,
+            media,
         } => {
-            // `server_muted_by` is MC's OWN value — the requester's participant
+            // Each `server_muted_by` is MC's OWN value — the requester's participant
             // id from the authenticated connection, never parsed off the wire —
             // so there is no emit-side truncation here. The proto's "truncate
             // before logging" obligation is the RECEIVER's.
@@ -164,13 +206,9 @@ pub fn encode_participant_update(update: &ParticipantStateUpdate) -> Option<Enco
                     message: Some(server_message::Message::ParticipantMuteUpdate(
                         ParticipantMuteUpdate {
                             participant_id: participant_id.clone(),
-                            audio_server_muted: *audio_server_muted,
-                            video_server_muted: *video_server_muted,
-                            server_muted_by: server_muted_by.clone(),
-                            // Set iff MC knows (`None` = ABSENT), on EVERY
-                            // mute update, server-mute ones included.
-                            audio_client_muted: client_muted.get(MediaKindLabel::Audio),
-                            video_client_muted: client_muted.get(MediaKindLabel::Video),
+                            // A FULL snapshot on EVERY mute update, server-mute
+                            // and client-mute ones alike.
+                            media_states: media_kind_states(media),
                         },
                     )),
                     trace_parent,
@@ -204,17 +242,66 @@ mod tests {
     use crate::actors::messages::{
         LeaveReason, ParticipantInfo, ParticipantStateUpdate, ParticipantStatus,
     };
-    use crate::media_kind::ClientMuteFacts;
-    use proto_gen::dark_tower::signaling::v1::{self, server_message};
+    use crate::media_kind::{ClientMediaStates, MuteChange};
+    use proto_gen::dark_tower::signaling::v1::{self, server_message, MediaKind};
+
+    /// A state with `kind` server-muted by `who`.
+    fn server_muted(mut media: MediaStates, kind: MediaKindLabel, who: &str) -> MediaStates {
+        let _ = media.server.apply(MuteChange::one(kind, true), who);
+        media
+    }
+
+    fn entry(kind: MediaKind, client: ClientMediaState, by: &str) -> MediaKindState {
+        MediaKindState {
+            media_kind: kind as i32,
+            client_state: client as i32,
+            server_muted: !by.is_empty(),
+            server_muted_by: by.to_string(),
+        }
+    }
+
+    /// The top-level field numbers present in an encoded message (a minimal
+    /// tag walker: varint and length-delimited fields only, which is all
+    /// these messages use).
+    fn field_numbers(bytes: &[u8]) -> Vec<u64> {
+        fn varint(b: &[u8], i: &mut usize) -> u64 {
+            let mut v = 0u64;
+            let mut shift = 0;
+            loop {
+                let byte = b[*i];
+                *i += 1;
+                v |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    return v;
+                }
+                shift += 7;
+            }
+        }
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let key = varint(bytes, &mut i);
+            out.push(key >> 3);
+            match key & 7 {
+                0 => {
+                    varint(bytes, &mut i);
+                }
+                2 => {
+                    let len = usize::try_from(varint(bytes, &mut i)).unwrap();
+                    i += len;
+                }
+                other => panic!("unexpected wire type {other}"),
+            }
+        }
+        out
+    }
 
     fn make_participant_info(id: &str, name: &str) -> ParticipantInfo {
         ParticipantInfo {
             participant_id: id.to_string(),
             user_id: "user-1".to_string(),
             display_name: name.to_string(),
-            client_muted: ClientMuteFacts::UNKNOWN,
-            audio_server_muted: false,
-            video_server_muted: false,
+            media: MediaStates::default(),
             status: ParticipantStatus::Connected,
             sender_id: crate::media_admission::fixtures::sample_sender_id(),
             identity_public_key: crate::media_admission::fixtures::sample_identity_key(),
@@ -327,57 +414,126 @@ mod tests {
         }
     }
 
-    /// Every field reaches the wire, who-muted-whom included, and each client
-    /// fact keeps its PRESENCE: `Some(false)` stays a fact, `None` stays absent
-    /// (set iff MC knows) -- on a server-mute frame as on a client-mute one.
+    /// A `MuteChanged` encodes as a full kind-keyed snapshot: one entry per
+    /// known kind, each kind's own client state and imposer, screen as the
+    /// NOT_PUBLISHED constant.
     #[test]
     fn test_encode_mute_changed_is_a_participant_mute_update() {
-        for (facts, audio, video) in [
-            ([Some(true), Some(false)], Some(true), Some(false)),
-            ([None, Some(true)], None, Some(true)),
-            ([None, None], None, None),
-        ] {
-            let update = ParticipantStateUpdate::MuteChanged {
+        let media = server_muted(
+            MediaStates {
+                client: ClientMediaStates::from_declared([Some(true), None]),
+                ..MediaStates::default()
+            },
+            MediaKindLabel::Audio,
+            "host-1",
+        );
+        let update = ParticipantStateUpdate::MuteChanged {
+            participant_id: "part-1".to_string(),
+            media,
+        };
+        let encoded = encode_participant_update(&update).expect("MuteChanged is wire-visible");
+        assert_eq!(encoded.payload_kind, PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED);
+        let Some(server_message::Message::ParticipantMuteUpdate(m)) =
+            encoded.server_message.message
+        else {
+            panic!("expected a ParticipantMuteUpdate");
+        };
+        assert_eq!(
+            m,
+            ParticipantMuteUpdate {
                 participant_id: "part-1".to_string(),
-                client_muted: ClientMuteFacts::from_facts(facts),
-                audio_server_muted: true,
-                video_server_muted: false,
-                server_muted_by: "host-1".to_string(),
-            };
-            let encoded = encode_participant_update(&update).expect("MuteChanged is wire-visible");
-            assert_eq!(encoded.payload_kind, PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED);
-            let Some(server_message::Message::ParticipantMuteUpdate(m)) =
-                encoded.server_message.message
-            else {
-                panic!("expected a ParticipantMuteUpdate");
-            };
-            assert_eq!(
-                m,
-                ParticipantMuteUpdate {
-                    participant_id: "part-1".to_string(),
-                    audio_server_muted: true,
-                    video_server_muted: false,
-                    server_muted_by: "host-1".to_string(),
-                    audio_client_muted: audio,
-                    video_client_muted: video,
-                },
-                "{facts:?}"
-            );
+                media_states: vec![
+                    entry(MediaKind::Audio, ClientMediaState::ClientMuted, "host-1"),
+                    entry(MediaKind::VideoCamera, ClientMediaState::NotPublished, ""),
+                    entry(MediaKind::VideoScreen, ClientMediaState::NotPublished, ""),
+                ],
+            }
+        );
+    }
+
+    /// The encoder's invariants, over every state combination: exactly one
+    /// entry per known kind, never UNSPECIFIED, `server_muted_by` set iff
+    /// `server_muted`, and VIDEO_SCREEN always the MC constant.
+    #[test]
+    fn media_kind_states_is_complete_and_server_muted_by_tracks_server_muted() {
+        for declared in [[None, None], [Some(false), None], [Some(true), Some(false)]] {
+            for muted in [
+                None,
+                Some(MediaKindLabel::Audio),
+                Some(MediaKindLabel::Video),
+            ] {
+                let mut media = MediaStates {
+                    client: ClientMediaStates::from_declared(declared),
+                    ..MediaStates::default()
+                };
+                if let Some(kind) = muted {
+                    media = server_muted(media, kind, "h");
+                }
+                let states = media_kind_states(&media);
+                let kinds: Vec<i32> = states.iter().map(|s| s.media_kind).collect();
+                assert_eq!(
+                    kinds,
+                    KNOWN_WIRE_KINDS
+                        .iter()
+                        .map(|k| *k as i32)
+                        .collect::<Vec<_>>()
+                );
+                for s in &states {
+                    assert_ne!(s.client_state, ClientMediaState::Unspecified as i32);
+                    assert_eq!(s.server_muted, !s.server_muted_by.is_empty(), "{s:?}");
+                }
+                let screen = states
+                    .iter()
+                    .find(|s| s.media_kind == MediaKind::VideoScreen as i32)
+                    .unwrap();
+                assert_eq!(
+                    screen,
+                    &entry(MediaKind::VideoScreen, ClientMediaState::NotPublished, "")
+                );
+            }
         }
     }
 
-    /// The retired tags 2/3 never reach the wire from MC's encoder: a
-    /// `MuteChanged` with both client facts set encodes fields 7 and 8 only
-    /// (server flags false and `server_muted_by` empty are proto3 defaults).
+    /// `receive_slot_caps`: one entry per known kind, the served kinds' caps
+    /// as configured (0 included), screen 0.
     #[test]
-    fn a_mute_update_never_emits_the_retired_tags_2_and_3() {
+    fn receive_slot_caps_carries_every_known_kind() {
+        let caps = receive_slot_caps(|k| k.of([8, 0]));
+        assert_eq!(
+            caps,
+            vec![
+                ReceiveSlotCap {
+                    media_kind: MediaKind::Audio as i32,
+                    max_slots: 8
+                },
+                ReceiveSlotCap {
+                    media_kind: MediaKind::VideoCamera as i32,
+                    max_slots: 0
+                },
+                ReceiveSlotCap {
+                    media_kind: MediaKind::VideoScreen as i32,
+                    max_slots: 0
+                },
+            ]
+        );
+    }
+
+    /// The retired tags 2-8 never reach the wire from MC's encoder: a
+    /// `MuteChanged` encodes fields 1 and 9 only, whatever the state.
+    #[test]
+    fn a_mute_update_never_emits_the_retired_tags_2_to_8() {
         use prost::Message;
+        let media = server_muted(
+            MediaStates {
+                client: ClientMediaStates::from_declared([Some(true), Some(true)]),
+                ..MediaStates::default()
+            },
+            MediaKindLabel::Video,
+            "h",
+        );
         let update = ParticipantStateUpdate::MuteChanged {
-            participant_id: String::new(),
-            client_muted: ClientMuteFacts::from_facts([Some(true), Some(true)]),
-            audio_server_muted: false,
-            video_server_muted: false,
-            server_muted_by: String::new(),
+            participant_id: "p".to_string(),
+            media,
         };
         let encoded = encode_participant_update(&update).unwrap();
         let Some(server_message::Message::ParticipantMuteUpdate(m)) =
@@ -385,33 +541,50 @@ mod tests {
         else {
             panic!("expected a ParticipantMuteUpdate");
         };
-        // Field 7 and 8, varint wire type: keys 0x38 and 0x40. Nothing else.
-        assert_eq!(m.encode_to_vec(), vec![0x38, 0x01, 0x40, 0x01]);
+        let fields = field_numbers(&m.encode_to_vec());
+        assert!(!fields.is_empty());
+        assert!(fields.iter().all(|f| *f == 1 || *f == 9), "{fields:?}");
+        let entry = roster_entry(&make_participant_info("p", "P")).encode_to_vec();
+        assert!(
+            !field_numbers(&entry).iter().any(|f| *f == 7 || *f == 8),
+            "the roster's retired client-mute tags are never written"
+        );
     }
 
-    /// ONE roster builder for both carriers: the client facts ride it with
-    /// presence intact, and `ParticipantJoined` carries exactly that entry.
+    /// ONE roster builder for both carriers: the full per-kind state rides it
+    /// (definite from admission: NOT_PUBLISHED explicit), and
+    /// `ParticipantJoined` carries exactly that entry.
     #[test]
-    fn the_roster_entry_carries_client_facts_set_iff_known() {
+    fn the_roster_entry_carries_one_definite_state_per_known_kind() {
         let mut info = make_participant_info("part-9", "Nine");
-        let fresh = roster_entry(&info);
-        assert_eq!(
-            (fresh.audio_client_muted, fresh.video_client_muted),
-            (None, None),
-            "a participant that has reported nothing is ABSENT, never false"
+        let receive_only = roster_entry(&info);
+        assert!(receive_only
+            .media_states
+            .iter()
+            .all(|s| s.client_state == ClientMediaState::NotPublished as i32 && !s.server_muted));
+        info.media = server_muted(
+            MediaStates {
+                client: ClientMediaStates::from_declared([Some(false), Some(true)]),
+                ..MediaStates::default()
+            },
+            MediaKindLabel::Audio,
+            "host",
         );
-        info.client_muted = ClientMuteFacts::from_facts([Some(false), Some(true)]);
-        let entry = roster_entry(&info);
+        let entry_ = roster_entry(&info);
         assert_eq!(
-            (entry.audio_client_muted, entry.video_client_muted),
-            (Some(false), Some(true))
+            entry_.media_states,
+            vec![
+                entry(MediaKind::Audio, ClientMediaState::Live, "host"),
+                entry(MediaKind::VideoCamera, ClientMediaState::ClientMuted, ""),
+                entry(MediaKind::VideoScreen, ClientMediaState::NotPublished, ""),
+            ]
         );
         let joined = encode_participant_update(&ParticipantStateUpdate::Joined(info)).unwrap();
         let Some(server_message::Message::ParticipantJoined(j)) = joined.server_message.message
         else {
             panic!("expected ParticipantJoined");
         };
-        assert_eq!(j.participant, Some(entry));
+        assert_eq!(j.participant, Some(entry_));
     }
 
     #[test]

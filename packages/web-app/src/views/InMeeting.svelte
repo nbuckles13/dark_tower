@@ -100,20 +100,23 @@
   const videoSlotIds = declared.video.slotIds;
   const publishes = (kind: PublishKind): boolean => declared.publish.includes(kind);
 
-  /** This participant's own server mute, per kind, as MC last reported it. */
+  /**
+   * This participant's own server mute, per kind, as MC last reported it (its
+   * own `ParticipantMuteUpdate`; a fresh join starts server-unmuted). Only the
+   * server half of the self cell is read: own client mute is
+   * `store.media.audioMuted` / `videoMuted`, the SDK's local state.
+   */
   const ownServerMute = $derived(
     selfParticipantId === undefined ? undefined : store.media.participant(selfParticipantId),
   );
-  const ownServerMutedAny = $derived(
-    ownServerMute !== undefined &&
-      (ownServerMute.audioServerMuted || ownServerMute.videoServerMuted),
-  );
-  const ownServerMutedBy = $derived(
-    nameForParticipantId(ownServerMute?.serverMutedBy, {
+  const ownServerMuted = (kind: PublishKind): boolean =>
+    ownServerMute?.kind(kind).serverMuted ?? false;
+  const ownServerMutedAny = $derived(ownServerMute?.serverMutedAny ?? false);
+  const ownServerMutedBy = (kind: PublishKind): string =>
+    nameForParticipantId(ownServerMute?.kind(kind).serverMutedBy, {
       roster: store.participants,
       selfParticipantId,
-    }),
-  );
+    });
   /**
    * Whether this participant has asked the host to unmute it — a local record of
    * the ASK only, scoped to ONE server-mute episode: cleared when MC reports
@@ -129,7 +132,7 @@
     selfCameraState({
       publishesVideo: publishes('video'),
       cameraFailure: store.media.cameraFailure,
-      videoServerMuted: ownServerMute?.videoServerMuted ?? false,
+      videoServerMuted: ownServerMuted('video'),
       videoMuted: store.media.videoMuted,
     }),
   );
@@ -357,19 +360,16 @@
     MC's `ParticipantMuteUpdate`. Never described as a ban (R-10).
     (`server-mute-state` is the AUDIO indicator, the story-2 testid.)
   -->
-  <p data-testid="server-mute-state" data-server-muted={ownServerMute?.audioServerMuted ?? false}>
-    {#if ownServerMute?.audioServerMuted}
-      {serverMutedByText(ownServerMutedBy, 'audio')}
+  <p data-testid="server-mute-state" data-server-muted={ownServerMuted('audio')}>
+    {#if ownServerMuted('audio')}
+      {serverMutedByText(ownServerMutedBy('audio'), 'audio')}
     {:else}
       {PARTICIPANT_TEXT.ownNotServerMuted.audio}
     {/if}
   </p>
-  <p
-    data-testid="server-mute-state-video"
-    data-server-muted={ownServerMute?.videoServerMuted ?? false}
-  >
-    {#if ownServerMute?.videoServerMuted}
-      {serverMutedByText(ownServerMutedBy, 'video')}
+  <p data-testid="server-mute-state-video" data-server-muted={ownServerMuted('video')}>
+    {#if ownServerMuted('video')}
+      {serverMutedByText(ownServerMutedBy('video'), 'video')}
     {:else}
       {PARTICIPANT_TEXT.ownNotServerMuted.video}
     {/if}

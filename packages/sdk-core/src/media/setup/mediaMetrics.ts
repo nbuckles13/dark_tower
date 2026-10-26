@@ -594,7 +594,7 @@ export interface MediaMetricIdentity {
  * (`docs/observability/label-taxonomy.md`) is the single source of truth; this
  * is its client code home, and `__tests__/mediaMetrics.test.ts` fails if the two
  * disagree. MC's Rust home is `MediaKindLabel` in
- * `crates/mc-service/src/media_signaling/outcome.rs`; the collector bounds the
+ * `crates/mc-service/src/media_kind.rs`; the collector bounds the
  * value with an EXACT `^(audio|video)$` rewrite to `invalid`
  * (`infra/services/otel-collector/collector.yaml`). Deliberately NOT the
  * generated proto `MediaKind` (four wire values incl. unspecified and screen),

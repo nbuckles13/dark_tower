@@ -51,6 +51,8 @@ const STATIC_MESSAGE: Record<SignalingErrorCode, string> = {
     'The publish set names a media kind this client cannot publish',
   [SignalingErrorCode.NothingToPublishOrReceive]:
     'The session would neither publish nor receive any media',
+  [SignalingErrorCode.ContractFault]:
+    'The meeting controller sent a signalling message this client cannot accept',
 };
 
 /**

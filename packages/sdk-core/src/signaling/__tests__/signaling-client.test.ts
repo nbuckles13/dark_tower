@@ -50,6 +50,7 @@ import {
   framedStreamPublished,
   waitFor,
   type JoinResponseInit,
+  LIVE_STATES,
 } from './helpers.js';
 
 function startJoin(
@@ -63,7 +64,7 @@ function startJoin(
     meetingId: 'meet-1',
     joinToken: 'secret-jwt',
     participantName: 'Ada',
-    publishKinds: ['audio'],
+    publish: [{ kind: 'audio', clientMuted: false }],
     receiveSlots: [],
     ...overrides,
   });
@@ -199,8 +200,8 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
     expect(typeof joined.senderId).toBe('number');
     expect(joined.senderId).toBe(4242);
     expect(joined.existingParticipants).toEqual([
-      { participantId: 'p1', name: 'Bob' },
-      { participantId: 'p2', name: 'Carol' },
+      { participantId: 'p1', name: 'Bob', mediaStates: LIVE_STATES },
+      { participantId: 'p2', name: 'Carol', mediaStates: LIVE_STATES },
     ]);
     expect(joined.mediaServers).toEqual(['https://mh1.example', 'https://mh2.example']);
     expect(onJoined).toHaveBeenCalledTimes(1);
@@ -209,29 +210,22 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
   });
 
   it.each([
-    ['present', 8, 8],
-    ['absent (caps unknown)', undefined, undefined],
-    ['a present 0 (legal: video off), kept as 0', 0, 0],
+    ['distinct per kind', { audio: 8, video: 3 }],
+    ['a present 0 (legal: video off), kept as 0', { audio: 4, video: 0 }],
   ] as const)(
-    'passes JoinResponse.max_{audio,video}_receive_slots through verbatim when %s',
-    async (_label, onWire, expected) => {
+    'passes JoinResponse.receive_slot_caps through per kind when %s',
+    async (_label, caps) => {
       const wt = new MockWebTransport();
       const { client, joinPromise } = startJoin(wt);
       wt.simulateReady();
       await waitFor(() => wt.getOpenedBidiStreams().length > 0);
       wt.simulateServerMessage(
         0,
-        framedJoinResponse({
-          participantId: 'p-self',
-          senderId: 1,
-          ...(onWire !== undefined
-            ? { maxAudioReceiveSlots: onWire, maxVideoReceiveSlots: onWire }
-            : {}),
-        }),
+        framedJoinResponse({ participantId: 'p-self', senderId: 1, receiveSlotCaps: caps }),
       );
       const joined = (await joinPromise) as Awaited<ReturnType<SignalingClient['join']>>;
-      expect(joined.maxAudioReceiveSlots).toBe(expected);
-      expect(joined.maxVideoReceiveSlots).toBe(expected);
+      // Screen's cap is validated but not projected: the SDK has no screen kind.
+      expect(joined.receiveSlotCaps).toEqual(caps);
       client.close();
     },
   );
@@ -280,7 +274,7 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
     wt.simulateServerMessage(0, framedParticipantJoined('p7', 'Dave'));
     await waitFor(() => onJoinedParticipant.mock.calls.length > 0);
     expect(onJoinedParticipant).toHaveBeenCalledWith({
-      participant: { participantId: 'p7', name: 'Dave' },
+      participant: { participantId: 'p7', name: 'Dave', mediaStates: LIVE_STATES },
     });
     client.close();
   });
@@ -316,7 +310,7 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
     await waitFor(() => onJoinedParticipant.mock.calls.length > 0);
     expect(onJoinedParticipant).toHaveBeenCalledTimes(1);
     expect(onJoinedParticipant).toHaveBeenCalledWith({
-      participant: { participantId: 'p3', name: 'Faye' },
+      participant: { participantId: 'p3', name: 'Faye', mediaStates: LIVE_STATES },
     });
     client.close();
   });
@@ -507,7 +501,7 @@ describe('SignalingClient — trace injection (R-19)', () => {
         meetingId: 'm',
         joinToken: 'secret-jwt',
         participantName: 'Ada',
-        publishKinds: ['audio'],
+        publish: [{ kind: 'audio', clientMuted: false }],
         receiveSlots: [],
       }),
     );
@@ -640,7 +634,7 @@ describe('SignalingClient — framing edge cases (R-16/R-18)', () => {
     await waitFor(() => onParticipantJoined.mock.calls.length > 0);
     expect(onJoined).toHaveBeenCalledTimes(1);
     expect(onParticipantJoined).toHaveBeenCalledWith({
-      participant: { participantId: 'p9', name: 'Eve' },
+      participant: { participantId: 'p9', name: 'Eve', mediaStates: LIVE_STATES },
     });
     client.close();
   });
@@ -676,7 +670,7 @@ describe('SignalingClient — lifecycle & teardown', () => {
         meetingId: 'm',
         joinToken: 't',
         participantName: 'n',
-        publishKinds: ['audio'],
+        publish: [{ kind: 'audio', clientMuted: false }],
         receiveSlots: [],
       }),
     ).rejects.toBeInstanceOf(SignalingError);

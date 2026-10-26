@@ -715,7 +715,7 @@ impl ParticipantActor {
 mod tests {
     use super::*;
     use crate::actors::messages::MhState;
-    use crate::media_kind::ClientMuteFacts;
+    use crate::media_kind::{MediaKindLabel, MediaStates, MuteChange};
     use common::observability::testing::MetricAssertion;
 
     /// A bare actor wired to a stream channel of exactly `capacity`, so a test
@@ -1199,9 +1199,7 @@ mod tests {
             participant_id: "part-new".to_string(),
             user_id: "user-new".to_string(),
             display_name: "New User".to_string(),
-            client_muted: ClientMuteFacts::UNKNOWN,
-            audio_server_muted: false,
-            video_server_muted: false,
+            media: MediaStates::default(),
             status: super::super::messages::ParticipantStatus::Connected,
             sender_id: crate::media_admission::fixtures::sample_sender_id(),
             identity_public_key: crate::media_admission::fixtures::sample_identity_key(),
@@ -1251,12 +1249,13 @@ mod tests {
 
         // A server-mute update reaches the stream (story 2 task 12, R-11):
         // who-muted-whom has no other carrier.
+        let mut media = MediaStates::default();
+        let _ = media
+            .server
+            .apply(MuteChange::one(MediaKindLabel::Audio, true), "host-1");
         let update = ParticipantStateUpdate::MuteChanged {
             participant_id: "part-other".to_string(),
-            client_muted: ClientMuteFacts::UNKNOWN,
-            audio_server_muted: true,
-            video_server_muted: false,
-            server_muted_by: "host-1".to_string(),
+            media,
         };
         handle.send_update(update).await.unwrap();
 

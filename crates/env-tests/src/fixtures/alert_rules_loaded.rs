@@ -836,10 +836,12 @@ mod tests {
     fn mounted_set_is_read_from_the_configmap_list() {
         let k = concat!(
             "configMapGenerator:\n",
-            "  - name: prometheus-rules\n",
+            "  - name: prometheus-rules-mc\n",
             "    files:\n",
             "      # rules/_template-service-alerts.yaml is deliberately absent\n",
             "      - rules/mc-alerts.yaml\n",
+            "  - name: prometheus-rules-mh\n",
+            "    files:\n",
             "      - rules/mh-alerts.yaml   # media handler\n",
         );
         let got = mounted_rules_files(k).expect("parses");
@@ -848,8 +850,9 @@ mod tests {
             ["mc-alerts.yaml".to_string(), "mh-alerts.yaml".to_string()]
                 .into_iter()
                 .collect(),
-            "a standalone comment must not declare a file (fail-open), and an \
-             inline comment must not un-declare one"
+            "the mounted set is the union over EVERY generator (one per rules \
+             file since 2026-10-25); a standalone comment must not declare a \
+             file (fail-open), and an inline comment must not un-declare one"
         );
     }
 

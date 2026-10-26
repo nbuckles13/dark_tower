@@ -12,6 +12,7 @@
 use std::time::Duration;
 
 use common::observability::testing::MetricAssertion;
+use mc_service::media_kind::ClientMediaStates;
 use mc_service::media_signaling::{MediaKindLabel, PublishSet, ReceiveCapabilityDeclaration};
 use proto_gen::dark_tower::signaling::v1::{
     Codec, MediaKind, ReceiveCapability, SendDirective, SlotState, StreamAssignments, TransportMode,
@@ -598,7 +599,9 @@ async fn a_reconnect_presenting_a_different_publish_set_is_refused_and_never_ado
             "conn-a2".to_string(),
             joined.correlation_id.clone(),
             joined.binding_token.clone(),
-            PublishSet::of(&[MediaKindLabel::Audio, MediaKindLabel::Video]),
+            // A different set AND a changed client mute (audio muted): the
+            // set check must refuse before any client mute is adopted.
+            ClientMediaStates::from_declared([Some(true), Some(false)]),
             None,
         )
         .await;
@@ -610,6 +613,12 @@ async fn a_reconnect_presenting_a_different_publish_set_is_refused_and_never_ado
         "got {refused:?}"
     );
     join_failure(&snap, "reconnect_publish_set_mismatch").assert_delta(1);
+    snap.counter("mc_media_client_mute_fanouts_total")
+        .with_labels(&[("outcome", "fanned_out")])
+        .assert_delta(0);
+    snap.counter("mc_media_client_mute_fanouts_total")
+        .with_labels(&[("outcome", "awaiting_token")])
+        .assert_delta(0);
 
     // The entry is untouched: the SAME binding still reconnects with the
     // ORIGINAL set (the refusal rotated nothing) ...
@@ -618,7 +627,7 @@ async fn a_reconnect_presenting_a_different_publish_set_is_refused_and_never_ado
             "conn-a3".to_string(),
             joined.correlation_id.clone(),
             joined.binding_token.clone(),
-            PublishSet::of(&[MediaKindLabel::Audio]),
+            ClientMediaStates::live(PublishSet::of(&[MediaKindLabel::Audio])),
             None,
         )
         .await
@@ -626,13 +635,25 @@ async fn a_reconnect_presenting_a_different_publish_set_is_refused_and_never_ado
     // ... and a push FORCED after the refusal (B's join changes the snapshot)
     // declares A's audio only. No push after the refusal ever carries A's
     // stream 1.
-    let (_b, _rx_b) = actor_join(
+    let (b, _rx_b) = actor_join(
         &stack,
         &meeting,
         "b",
         test_join_media(&stack, &[mh_handler(HANDLER)]),
     )
     .await;
+    // B's roster shows A's audio still LIVE: the refused declaration's client
+    // mute was never adopted either.
+    let a_on_roster = b
+        .participants
+        .iter()
+        .find(|p| p.participant_id == "part-a")
+        .expect("A is on B's roster");
+    assert_eq!(
+        a_on_roster.media.client.get(MediaKindLabel::Audio),
+        mc_service::media_kind::ClientKindState::Live,
+        "the refused reconnect's client mute was never adopted"
+    );
     let calls = pushes_beyond(&stack, pushes).await;
     let a_streams = |c: &test_common::RegisterMeetingCall| -> Vec<u8> {
         c.assignment
@@ -721,7 +742,14 @@ async fn the_cap_and_keyframe_interval_gauges_echo_the_directed_configuration() 
     snap.gauge("mc_media_video_keyframe_min_interval_seconds")
         .with_labels(&[("key_custody", "operator")])
         .assert_value(f64::from(directed) / 1000.0);
-    assert_eq!(p.max_kind_receive_slots, (Some(6), Some(0)));
+    assert_eq!(
+        (
+            p.slot_cap(MediaKind::Audio),
+            p.slot_cap(MediaKind::VideoCamera),
+            p.slot_cap(MediaKind::VideoScreen)
+        ),
+        (6, 0, 0)
+    );
 }
 
 /// R-2 at the reconnect seam: a reconnect's declaration is a REDECLARATION, so
@@ -747,7 +775,7 @@ async fn a_reconnect_redeclaring_to_nothing_is_counted_and_keeps_the_previous_de
     )
     .await;
     let mut media = test_join_media(&stack, &[mh_handler(HANDLER)]);
-    media.publishes = PublishSet::NONE;
+    media.declared = ClientMediaStates::NOT_PUBLISHING;
     media.demand = ReceiveCapabilityDeclaration::parse(
         &ReceiveCapability {
             slots: vec![audio(0)],
@@ -793,7 +821,7 @@ async fn a_reconnect_redeclaring_to_nothing_is_counted_and_keeps_the_previous_de
             "conn-r2".to_string(),
             r.correlation_id.clone(),
             r.binding_token.clone(),
-            PublishSet::NONE,
+            ClientMediaStates::NOT_PUBLISHING,
             Some(empty),
         )
         .await

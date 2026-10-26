@@ -16,6 +16,7 @@ pub mod metric_catalog;
 pub mod path_safety;
 pub mod pii_vocabulary;
 pub mod pod_spec;
+pub mod proto_lex;
 pub mod scan;
 pub mod scope;
 pub mod services;

@@ -383,8 +383,8 @@ export interface ReceiverStateConfig {
  * of slot ids).
  *
  * N AND M ARE REQUESTS. MC caps each kind (`MC_MAX_AUDIO_RECEIVE_SLOTS`,
- * `MC_MAX_VIDEO_RECEIVE_SLOTS`, advertised on `JoinResponse.max_audio_receive_slots`
- * / `max_video_receive_slots`) and TRUNCATES an over-cap declaration: the excess
+ * `MC_MAX_VIDEO_RECEIVE_SLOTS`, advertised on `JoinResponse.receive_slot_caps`)
+ * and TRUNCATES an over-cap declaration: the excess
  * slots report `unavailable` on the wire, visibly, never a join failure. So the
  * SDK has no over-cap pre-check and never shrinks a declaration (the proto
  * forbids it). Story 2's whole-declaration rejection and its client counter

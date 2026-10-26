@@ -209,6 +209,7 @@ pub const STORY_3_EAGER_MC_SERIES: &[&str] = &[
     "mc_media_mute_requests_total",
     "mc_media_server_mute_requests_total",
     "mc_media_unmute_requests_total",
+    "mc_media_mute_requests_rejected_total",
 ];
 
 /// R4 identity vocabulary, CONTAINMENT half: nouns long enough to match as a

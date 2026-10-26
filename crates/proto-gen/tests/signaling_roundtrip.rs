@@ -307,8 +307,8 @@ fn join_request_roundtrips_raw_identity_public_key() {
         correlation_id: String::new(),
         binding_token: String::new(),
         identity_public_key: key.clone(),
-        publish_kinds: Vec::new(),
         receive_capability: None,
+        published_kinds: Vec::new(),
     });
 
     assert_eq!(out.identity_public_key, key);
@@ -332,8 +332,7 @@ fn join_response_roundtrips_kek_generation_and_sender_id() {
             joined_at: 0,
             sender_id: Some(2),
             identity_public_key: vec![0x11; 32],
-            audio_client_muted: Some(false),
-            video_client_muted: None,
+            media_states: vec![kind_state(MediaKind::Audio, ClientMediaState::Live, "")],
         }],
         media_servers: Vec::new(),
         correlation_id: "c-1".to_string(),
@@ -342,8 +341,7 @@ fn join_response_roundtrips_kek_generation_and_sender_id() {
         meeting_kek: kek.clone(),
         kek_generation: 65535,
         kek_rotation_debounce_seconds: 0,
-        max_audio_receive_slots: None,
-        max_video_receive_slots: None,
+        receive_slot_caps: Vec::new(),
     });
 
     assert_eq!(out.sender_id, Some(65535));
@@ -400,61 +398,79 @@ fn sender_id_zero_survives_as_a_present_zero_not_absence() {
     assert_ne!(cap.slots[0].pinned_sender_id, None);
 }
 
-/// Story 3 R-15 fix: client-mute facts are `optional bool` on BOTH carriers
-/// (`Participant`, `ParticipantMuteUpdate`) because ABSENT means "no fact" --
-/// a peer renders "unknown", never unmuted. The load-bearing half is that
-/// `Some(false)` survives as `Some(false)`, distinct from `None`; a bare
-/// `bool` would collapse an explicit unmute into "never reported".
-#[test]
-fn client_mute_facts_keep_presence_on_both_carriers() {
-    for facts in [
-        (None, None),
-        (Some(false), Some(false)),
-        (Some(true), Some(false)),
-        (None, Some(true)),
-    ] {
-        let p = roundtrip(&Participant {
-            participant_id: "p-1".to_string(),
-            audio_client_muted: facts.0,
-            video_client_muted: facts.1,
-            ..Default::default()
-        });
-        assert_eq!((p.audio_client_muted, p.video_client_muted), facts);
-        let u = roundtrip(&ParticipantMuteUpdate {
-            participant_id: "p-1".to_string(),
-            audio_client_muted: facts.0,
-            video_client_muted: facts.1,
-            ..Default::default()
-        });
-        assert_eq!((u.audio_client_muted, u.video_client_muted), facts);
+/// One `MediaKindState` entry.
+fn kind_state(kind: MediaKind, client: ClientMediaState, by: &str) -> MediaKindState {
+    MediaKindState {
+        media_kind: kind as i32,
+        client_state: client as i32,
+        server_muted: !by.is_empty(),
+        server_muted_by: by.to_string(),
     }
-    // Presence is on the wire: an explicit false is encoded, absence is not.
-    let present = ParticipantMuteUpdate {
-        audio_client_muted: Some(false),
-        ..Default::default()
-    };
-    assert_eq!(top_level_field_numbers(&present.encode_to_vec()), vec![7]);
-    assert!(ParticipantMuteUpdate::default().encode_to_vec().is_empty());
 }
 
-/// The retired informational tags 2/3 (`audio_self_muted`,
-/// `video_self_muted`) are never emitted: a message carrying every field
-/// encodes 1 and 4-8 only, so an old reader can never decode a stale snapshot
-/// from a new sender.
+/// ADR-0036 §5 amendment 2026-10-25: the per-kind state is a kind-keyed
+/// `repeated MediaKindState` on BOTH carriers (`Participant`,
+/// `ParticipantMuteUpdate`, the same field name and tag 9). Order, every
+/// client state, a present `false` and the imposer survive; the wire does not
+/// dedupe (a receiver must SEE a duplicate to treat it as a protocol error).
+#[test]
+fn media_states_roundtrip_on_both_carriers() {
+    let states = vec![
+        kind_state(MediaKind::Audio, ClientMediaState::ClientMuted, "host"),
+        kind_state(MediaKind::VideoCamera, ClientMediaState::Live, ""),
+        kind_state(MediaKind::VideoScreen, ClientMediaState::NotPublished, ""),
+        kind_state(MediaKind::Audio, ClientMediaState::Live, ""),
+    ];
+    let p = roundtrip(&Participant {
+        participant_id: "p-1".to_string(),
+        media_states: states.clone(),
+        ..Default::default()
+    });
+    assert_eq!(p.media_states, states);
+    let u = roundtrip(&ParticipantMuteUpdate {
+        participant_id: "p-1".to_string(),
+        media_states: states.clone(),
+    });
+    assert_eq!(u.media_states, states);
+    assert_eq!(
+        top_level_field_numbers(&u.encode_to_vec()),
+        vec![1, 9, 9, 9, 9]
+    );
+}
+
+/// `ClientMediaState`'s numbers are pinned, and its zero value is the
+/// malformed `UNSPECIFIED`: an unset entry decodes as 0, never as a state.
+#[test]
+fn client_media_state_zero_is_unspecified_and_the_values_are_pinned() {
+    assert_eq!(ClientMediaState::Unspecified as i32, 0);
+    assert_eq!(ClientMediaState::NotPublished as i32, 1);
+    assert_eq!(ClientMediaState::Live as i32, 2);
+    assert_eq!(ClientMediaState::ClientMuted as i32, 3);
+    let out = roundtrip(&MediaKindState::default());
+    assert_eq!(out.client_state, ClientMediaState::Unspecified as i32);
+}
+
+/// The retired tags are never emitted: a fully populated update encodes 1 and
+/// 9 only, so an old reader can never decode a stale per-kind field from a new
+/// sender (Participant 7/8, ParticipantMuteUpdate 2-8 reserved).
 #[test]
 fn participant_mute_update_never_encodes_the_retired_tags() {
     let full = ParticipantMuteUpdate {
         participant_id: "p-1".to_string(),
-        audio_server_muted: true,
-        video_server_muted: true,
-        server_muted_by: "host".to_string(),
-        audio_client_muted: Some(true),
-        video_client_muted: Some(true),
+        media_states: vec![kind_state(
+            MediaKind::Audio,
+            ClientMediaState::ClientMuted,
+            "h",
+        )],
     };
-    assert_eq!(
-        top_level_field_numbers(&full.encode_to_vec()),
-        vec![1, 4, 5, 6, 7, 8]
-    );
+    assert_eq!(top_level_field_numbers(&full.encode_to_vec()), vec![1, 9]);
+    let roster = Participant {
+        participant_id: "p-1".to_string(),
+        media_states: full.media_states.clone(),
+        ..Default::default()
+    };
+    let fields = top_level_field_numbers(&roster.encode_to_vec());
+    assert!(!fields.contains(&7) && !fields.contains(&8), "{fields:?}");
 }
 
 #[test]
@@ -571,8 +587,10 @@ fn server_mute_request_roundtrips_through_the_client_envelope() {
         message: Some(client_message::Message::ServerMuteRequest(
             ServerMuteRequest {
                 participant_id: "p-2".to_string(),
-                audio_muted: Some(true),
-                video_muted: Some(false),
+                changes: vec![
+                    mute_change(MediaKind::Audio, true),
+                    mute_change(MediaKind::VideoCamera, false),
+                ],
                 reason: "policy".to_string(),
             },
         )),
@@ -583,8 +601,13 @@ fn server_mute_request_roundtrips_through_the_client_envelope() {
     match roundtrip(&envelope).message {
         Some(client_message::Message::ServerMuteRequest(m)) => {
             assert_eq!(m.participant_id, "p-2");
-            assert_eq!(m.audio_muted, Some(true));
-            assert_eq!(m.video_muted, Some(false));
+            assert_eq!(
+                m.changes,
+                vec![
+                    mute_change(MediaKind::Audio, true),
+                    mute_change(MediaKind::VideoCamera, false),
+                ]
+            );
         }
         other => panic!("expected ServerMuteRequest, got {other:?}"),
     }
@@ -872,83 +895,93 @@ fn debug_redaction_survives_the_enclosing_envelope() {
 // Story 3 (see-each-other): per-kind mute presence (R-15)
 // ---------------------------------------------------------------------------
 
-/// Four (audio, video) combinations that together cover all three presence
-/// states for each kind -- absent (= that kind unchanged), present-true,
-/// present-false -- survive the wire on BOTH request messages. `Some(false)`
-/// is the cell an implicit-presence `bool` could not carry -- it is an unmute,
-/// and it must never collapse into "unchanged".
-#[test]
-fn per_kind_mute_presence_survives_on_both_requests() {
-    let cells = [
-        (None, None),
-        (Some(true), None),
-        (None, Some(false)),
-        (Some(false), Some(true)),
-    ];
-    for (audio, video) in cells {
-        let client = roundtrip(&MuteRequest {
-            audio_muted: audio,
-            video_muted: video,
-        });
-        assert_eq!((client.audio_muted, client.video_muted), (audio, video));
-
-        let server = roundtrip(&ServerMuteRequest {
-            participant_id: "p-2".to_string(),
-            audio_muted: audio,
-            video_muted: video,
-            reason: String::new(),
-        });
-        assert_eq!((server.audio_muted, server.video_muted), (audio, video));
+/// One `MuteChange` entry.
+fn mute_change(kind: MediaKind, muted: bool) -> MuteChange {
+    MuteChange {
+        media_kind: kind as i32,
+        muted,
     }
 }
 
-/// Presence is ON THE WIRE, not only in the Rust type: an explicit `false`
-/// emits its tag and an absent kind emits nothing. Checked from the bytes.
+/// A kind-keyed request list survives by value AND order, duplicates and an
+/// explicit `muted = false` included, on BOTH request messages (an absent kind
+/// is "unchanged"; a present false is an unmute, never collapsed into it), and
+/// `UnmuteRequest.media_kinds` likewise.
 #[test]
-fn explicit_false_emits_its_tag_and_absent_emits_none() {
-    let fields = top_level_field_numbers(
-        &MuteRequest {
-            audio_muted: Some(false),
-            video_muted: None,
-        }
-        .encode_to_vec(),
-    );
-    assert_eq!(fields, vec![1], "present-false audio (tag 1) only");
-
-    let fields = top_level_field_numbers(
-        &ServerMuteRequest {
-            participant_id: "p".to_string(),
-            audio_muted: None,
-            video_muted: Some(false),
+fn kind_keyed_request_lists_survive_on_every_request() {
+    let lists = [
+        vec![],
+        vec![mute_change(MediaKind::Audio, false)],
+        vec![
+            mute_change(MediaKind::VideoCamera, true),
+            mute_change(MediaKind::Audio, false),
+            mute_change(MediaKind::Audio, true),
+        ],
+    ];
+    for changes in lists {
+        let client = roundtrip(&MuteRequest {
+            changes: changes.clone(),
+        });
+        assert_eq!(client.changes, changes);
+        let server = roundtrip(&ServerMuteRequest {
+            participant_id: "p-2".to_string(),
+            changes: changes.clone(),
             reason: String::new(),
-        }
-        .encode_to_vec(),
+        });
+        assert_eq!(server.changes, changes);
+    }
+    let unmute = roundtrip(&UnmuteRequest {
+        participant_id: "p".to_string(),
+        media_kinds: vec![MediaKind::VideoCamera as i32, MediaKind::Audio as i32],
+    });
+    assert_eq!(
+        unmute.media_kinds,
+        vec![MediaKind::VideoCamera as i32, MediaKind::Audio as i32]
     );
-    assert_eq!(fields, vec![1, 3], "participant_id and present-false video");
 }
 
-/// Tag-compatible with a pre-optional encoder: an old `bool audio_muted = 1`
-/// set to `true` is the bytes `08 01`, and decodes as `Some(true)`.
+/// The retired per-kind request tags never reach the wire: `MuteRequest`
+/// emits only 3, `ServerMuteRequest` 1/4/5, `UnmuteRequest` 3/4 -- and the
+/// retired `MuteRequest` tag 1 from an old sender decodes as an EMPTY list,
+/// which MC refuses (`no_kind_named`), never as an implicit unmute.
 #[test]
-fn old_shape_true_decodes_as_present_true() {
+fn kind_keyed_requests_use_only_their_fresh_tags() {
+    assert_eq!(
+        top_level_field_numbers(
+            &MuteRequest {
+                changes: vec![mute_change(MediaKind::Audio, false)],
+            }
+            .encode_to_vec()
+        ),
+        vec![3]
+    );
+    assert_eq!(
+        top_level_field_numbers(
+            &ServerMuteRequest {
+                participant_id: "p".to_string(),
+                changes: vec![mute_change(MediaKind::Audio, true)],
+                reason: "r".to_string(),
+            }
+            .encode_to_vec()
+        ),
+        vec![1, 4, 5]
+    );
+    assert_eq!(
+        top_level_field_numbers(
+            &UnmuteRequest {
+                participant_id: "p".to_string(),
+                media_kinds: vec![MediaKind::Audio as i32],
+            }
+            .encode_to_vec()
+        ),
+        vec![3, 4]
+    );
     let old_true_audio = [0x08u8, 0x01];
     let out = MuteRequest::decode(&old_true_audio[..]).expect("old bytes decode");
-    assert_eq!(out.audio_muted, Some(true));
-    assert_eq!(out.video_muted, None);
-}
-
-/// NOT semantics-compatible: an old encoder OMITS `false` (implicit presence),
-/// so an old sender's UNMUTE arrives as no bytes at all and decodes as
-/// "unchanged". This pins the hazard the proto comment names -- a pre-P1
-/// client's unmute reads as unchanged now that MC honours absence (MC-B) --
-/// so nobody "fixes" it by guessing.
-#[test]
-fn old_shape_false_is_indistinguishable_from_absent() {
-    let old_false_both: [u8; 0] = [];
-    let out = MuteRequest::decode(&old_false_both[..]).expect("empty decodes");
-    assert_eq!(out.audio_muted, None);
-    assert_eq!(out.video_muted, None);
-    assert_eq!(out, MuteRequest::default());
+    assert!(
+        out.changes.is_empty(),
+        "a pre-2026-10-25 request names no kind"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,14 +1042,23 @@ fn unknown_enum_values_decode_as_open_integers() {
     assert!(SlotState::try_from(assignment.slot_state).is_err());
 
     let join = roundtrip(&JoinRequest {
-        publish_kinds: vec![MediaKind::Audio as i32, UNKNOWN_ENUM_VALUE],
+        published_kinds: vec![PublishedKind {
+            media_kind: UNKNOWN_ENUM_VALUE,
+            client_muted: false,
+        }],
         ..Default::default()
     });
-    assert_eq!(
-        join.publish_kinds,
-        vec![MediaKind::Audio as i32, UNKNOWN_ENUM_VALUE]
-    );
-    assert!(MediaKind::try_from(join.publish_kinds[1]).is_err());
+    let kind = join.published_kinds[0].media_kind;
+    assert_eq!(kind, UNKNOWN_ENUM_VALUE);
+    assert!(MediaKind::try_from(kind).is_err());
+
+    let state = roundtrip(&MediaKindState {
+        media_kind: UNKNOWN_ENUM_VALUE,
+        client_state: UNKNOWN_ENUM_VALUE,
+        ..Default::default()
+    });
+    assert_eq!(state.media_kind, UNKNOWN_ENUM_VALUE);
+    assert!(ClientMediaState::try_from(state.client_state).is_err());
 
     let encoding = roundtrip(&EncodingParameters {
         codec: UNKNOWN_ENUM_VALUE,
@@ -1066,23 +1108,32 @@ fn stream_assignment_sender_presence_survives_per_state() {
 // Story 3: join declarations and caps (R-1, R-2, R-23)
 // ---------------------------------------------------------------------------
 
-/// The publish set survives by value AND order, duplicates included: MC must
-/// SEE a duplicate to reject and count it, so the wire must not dedupe.
+/// The published kinds survive by value AND order, conflicting duplicates
+/// included (MC must SEE a duplicate to reject it); empty = receive-only.
 #[test]
-fn publish_kinds_keep_order_and_duplicates() {
+fn published_kinds_keep_order_and_duplicates() {
+    let empty = roundtrip(&JoinRequest::default());
+    assert!(empty.published_kinds.is_empty(), "empty = receive-only");
+
     let kinds = vec![
-        MediaKind::VideoCamera as i32,
-        MediaKind::Audio as i32,
-        MediaKind::Audio as i32,
+        PublishedKind {
+            media_kind: MediaKind::VideoCamera as i32,
+            client_muted: true,
+        },
+        PublishedKind {
+            media_kind: MediaKind::Audio as i32,
+            client_muted: false,
+        },
+        PublishedKind {
+            media_kind: MediaKind::Audio as i32,
+            client_muted: true,
+        },
     ];
     let out = roundtrip(&JoinRequest {
-        publish_kinds: kinds.clone(),
+        published_kinds: kinds.clone(),
         ..Default::default()
     });
-    assert_eq!(out.publish_kinds, kinds);
-
-    let empty = roundtrip(&JoinRequest::default());
-    assert!(empty.publish_kinds.is_empty(), "empty = publishes nothing");
+    assert_eq!(out.published_kinds, kinds);
 }
 
 /// `JoinRequest.receive_capability` ABSENT (zero slots of each kind) is
@@ -1121,22 +1172,36 @@ fn join_receive_capability_absent_empty_and_populated_are_distinct() {
     assert_eq!(slots[1].media_kind, MediaKind::VideoCamera as i32);
 }
 
-/// The per-kind caps survive absent / present-0 / present-n, independently. 0
-/// is LEGAL (the video-off lever) and must stay distinct from absent. (Tag
-/// numbers are pinned from the bytes in `story_3_frozen_tags_are_on_the_wire`;
-/// a round trip through one codegen cannot catch a wrong tag.)
+/// The kind-keyed caps survive by value and order, a present 0 (the video-off
+/// lever) included -- a 0 entry still emits its element, and the retired tags
+/// 13/14 decode as nothing. (Tag numbers
+/// are pinned from the bytes in `story_3_frozen_tags_are_on_the_wire`.)
 #[test]
-fn per_kind_receive_caps_absent_zero_and_value_are_distinct() {
-    for (audio, video) in [(None, None), (Some(8), Some(0)), (Some(0), Some(4))] {
-        let out = roundtrip(&JoinResponse {
-            participant_id: "p-1".to_string(),
-            max_audio_receive_slots: audio,
-            max_video_receive_slots: video,
-            ..Default::default()
-        });
-        assert_eq!(out.max_audio_receive_slots, audio);
-        assert_eq!(out.max_video_receive_slots, video);
-    }
+fn receive_slot_caps_roundtrip_with_a_present_zero() {
+    let caps = vec![
+        ReceiveSlotCap {
+            media_kind: MediaKind::Audio as i32,
+            max_slots: 8,
+        },
+        ReceiveSlotCap {
+            media_kind: MediaKind::VideoCamera as i32,
+            max_slots: 0,
+        },
+        ReceiveSlotCap {
+            media_kind: MediaKind::VideoScreen as i32,
+            max_slots: 0,
+        },
+    ];
+    let out = roundtrip(&JoinResponse {
+        participant_id: "p-1".to_string(),
+        receive_slot_caps: caps.clone(),
+        ..Default::default()
+    });
+    assert_eq!(out.receive_slot_caps, caps);
+    // The retired tags 13/14 are reserved: their bytes populate nothing.
+    let retired = [0x68u8, 0x08, 0x70, 0x04]; // 13: 8, 14: 4
+    let decoded = JoinResponse::decode(&retired[..]).expect("unknown tags are skipped");
+    assert!(decoded.receive_slot_caps.is_empty());
 }
 
 /// The redacting `Debug` impls are hand-maintained field lists: the new
@@ -1146,13 +1211,18 @@ fn per_kind_receive_caps_absent_zero_and_value_are_distinct() {
 fn debug_shows_story_3_join_fields_in_the_clear() {
     let response = JoinResponse {
         meeting_kek: vec![0xC3u8; 32],
-        max_audio_receive_slots: Some(8),
-        max_video_receive_slots: Some(4),
+        receive_slot_caps: vec![ReceiveSlotCap {
+            media_kind: MediaKind::Audio as i32,
+            max_slots: 8,
+        }],
         ..Default::default()
     };
     let rendered = format!("{response:?}");
-    assert!(rendered.contains("max_audio_receive_slots: Some(8)"));
-    assert!(rendered.contains("max_video_receive_slots: Some(4)"));
+    assert!(
+        rendered
+            .contains("receive_slot_caps: [ReceiveSlotCap { media_kind: Audio, max_slots: 8 }]"),
+        "{rendered}"
+    );
     assert!(
         !rendered.contains("195, 195"),
         "KEK bytes must not be printed"
@@ -1160,11 +1230,18 @@ fn debug_shows_story_3_join_fields_in_the_clear() {
 
     let request = JoinRequest {
         join_token: "eyJ.super-secret-jwt".to_string(),
-        publish_kinds: vec![MediaKind::Audio as i32],
+        published_kinds: vec![PublishedKind {
+            media_kind: MediaKind::Audio as i32,
+            client_muted: true,
+        }],
         ..Default::default()
     };
     let rendered = format!("{request:?}");
-    assert!(rendered.contains("publish_kinds: [1]"));
+    assert!(
+        rendered
+            .contains("published_kinds: [PublishedKind { media_kind: Audio, client_muted: true }]"),
+        "{rendered}"
+    );
     assert!(rendered.contains("receive_capability: None"));
     assert!(!rendered.contains("super-secret-jwt"));
 }
@@ -1294,23 +1371,22 @@ fn mh_connect_request_keeps_tag_1() {
 fn story_3_frozen_tags_are_on_the_wire() {
     let join = top_level_field_numbers(
         &JoinRequest {
-            publish_kinds: vec![MediaKind::Audio as i32],
             receive_capability: Some(ReceiveCapability::default()),
+            published_kinds: vec![PublishedKind::default()],
             ..Default::default()
         }
         .encode_to_vec(),
     );
-    assert_eq!(join, vec![8, 9]);
+    assert_eq!(join, vec![9, 10]);
 
     let caps = top_level_field_numbers(
         &JoinResponse {
-            max_audio_receive_slots: Some(0),
-            max_video_receive_slots: Some(0),
+            receive_slot_caps: vec![ReceiveSlotCap::default(), ReceiveSlotCap::default()],
             ..Default::default()
         }
         .encode_to_vec(),
     );
-    assert_eq!(caps, vec![13, 14]);
+    assert_eq!(caps, vec![15, 15]);
 
     let encoding = top_level_field_numbers(
         &EncodingParameters {

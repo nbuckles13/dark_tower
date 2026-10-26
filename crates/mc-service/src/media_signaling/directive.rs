@@ -587,7 +587,12 @@ impl MediaStreamPolicy {
     fn stream_for(&self, kind: MediaKindLabel) -> (u8, EncodingParameters, TransportMode) {
         (
             stream_number_of(kind),
-            kind.pick(self.audio.to_proto(), self.video.to_proto()),
+            // Two differently-typed configurations, not a per-kind pair of one
+            // fact: an explicit match, not a per-kind accessor.
+            match kind {
+                MediaKindLabel::Audio => self.audio.to_proto(),
+                MediaKindLabel::Video => self.video.to_proto(),
+            },
             transport_of(kind),
         )
     }
@@ -965,7 +970,7 @@ mod tests {
     fn a_server_muted_kind_is_withdrawn_and_the_other_kind_is_untouched() {
         use crate::media_routing::SourceMute;
         for kind in [AU, VI] {
-            let muted_flags = kind.pick([true, false], [false, true]);
+            let muted_flags = MediaKindLabel::per_kind(|k| k == kind);
             let (assignment, set) = watched_av(SourceMute::from_flags(muted_flags, [false; 2]));
             let (unmuted, _, _) = build_send_directive(
                 sender(1),

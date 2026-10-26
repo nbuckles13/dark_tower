@@ -45,6 +45,7 @@ pub mod metric_coverage;
 pub mod metric_labels;
 pub mod metric_macros;
 pub mod no_insecure_browser_flags;
+pub mod proto_per_kind_fields;
 pub mod release_build_profile;
 pub mod rust_log_secrets;
 pub mod rust_pii;

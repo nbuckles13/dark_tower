@@ -700,7 +700,8 @@ async fn test_second_participant_receives_join_notification() {
     //
     // Story 3: every join carries its declaration, so each joiner is sent its
     // own SendDirective and StreamAssignments in its JOIN TURN — after its
-    // JoinResponse (and any server-mute replay), and before any later roster
+    // JoinResponse (there is no server-mute replay since 2026-10-25: the
+    // roster entry carries server mute), and before any later roster
     // broadcast. That is the contract; skip that media traffic here (user 1's
     // join-turn view, and any re-emit caused by user 2's join).
     let notification = loop {

@@ -11,7 +11,7 @@
 - Service entry point (fleet-gauge samplers) → `crates/mc-service/src/main.rs`
 - Config (env loading, TLS, advertise addresses, ADR-0036 media keys, `Config::kek_lifecycle`) → `crates/mc-service/src/config.rs`
 - Error types (McError hierarchy) → `crates/mc-service/src/errors.rs`
-- Media kinds (`MediaKindLabel`, `served_kind`, `PublishSet`), the ONE per-kind mute parser + merge (`MuteChange`, generic `KindDecision`), the server/client mute halves (`ServerMutedKinds` / `ClientMutedKinds`), and client-mute FACTS (`ClientMuteFacts`, set iff reported; the one `effective()` projection) → `crates/mc-service/src/media_kind.rs`
+- Media kinds (`MediaKindLabel`, `served_kind`, `KNOWN_WIRE_KINDS`), the ONE kind-keyed list parser (`parse_kind_list`, `KindListRefusal`), the per-kind state MC stores (`ClientMediaStates` = publish set + client mute per kind, `ServerMuteAttribution` = server mute + imposer per kind, together `MediaStates`), request types (`MuteChange` → `PublishedMuteChange` via `against`, `RequestedKinds`) and the media-policy halves (`ServerMutedKinds` / `ClientMutedKinds`) → `crates/mc-service/src/media_kind.rs`
 - Auth: McJwtValidator, validate_meeting_token, validate_guest_token → `crates/mc-service/src/auth/mod.rs`
 - Actors: controller, meeting, participant, messages, session (HMAC/HKDF), metrics → `crates/mc-service/src/actors/`
 
@@ -30,16 +30,16 @@
 - Meeting end: quiesce → `EndMeeting` plan → outcome classifier → `media_routing/teardown.rs`; exit hand-off → `actors/meeting.rs:hand_off_teardown()`
 
 ## Client Media Signalling (ADR-0036 §5/§6)
-- Join media validation (header version, publish set, initial declaration) → `crates/mc-service/src/webtransport/connection.rs:validate_join_media()`
+- Join media validation (header version, `publish` declaration present, kinds, initial declaration) → `crates/mc-service/src/webtransport/connection.rs:validate_join_media()`
 - Capability parse + per-kind `SlotDemand` truncation → `crates/mc-service/src/media_signaling/capability.rs`; send directive (`VideoEncoding`; server-mute withdrawal via the `ServerMutedKinds` input, no client-mute input — compile_fail doctest) → `media_signaling/directive.rs`; `StreamAssignments` construction → `media_signaling/assignments.rs`; outcome vocabularies → `media_signaling/outcome.rs`
-- Mute (four controls, per kind): client mute dispatch (shape → no-op short-circuit → limiter → actor) → `crates/mc-service/src/webtransport/connection.rs:handle_mute_request()`; server mute (authority → shape → limiter → actor) → `handle_server_mute_request()`/`refuse_server_mute()`; both-absent rejection + rationed replies → `reject_no_kind_named()`/`reply_mute_refusal()`; unmute relay → `handle_unmute_request()`; actor side (roster merge, `server_muted_by`, R-18 self update before the directive) → `actors/meeting.rs:handle_self_mute()`/`handle_server_mute()`/`handle_request_unmute()`/`server_mute_replay()`; withdrawal reason (`server_muted` vs `unwatched`) → `actors/meeting_media.rs:flush_one()`
+- Mute (four controls, per kind, kind-keyed wire): client mute dispatch (shape → publish set → no-op short-circuit → limiter → actor) → `crates/mc-service/src/webtransport/connection.rs:handle_mute_request()`; server mute (authority → shape → limiter → actor: target, `not_published`) → `handle_server_mute_request()`/`refuse_server_mute()`; whole-request kind-list refusals + rationed replies → `reject_mute_request()`/`reply_mute_refusal()`; unmute (shape → publish set → limiter → relay of the server-muted kinds only) → `handle_unmute_request()`; actor side (merge, per-kind attribution, R-18 self update before the directive, reconnect adoption) → `actors/meeting.rs:handle_self_mute()`/`handle_server_mute()`/`handle_request_unmute()`/`handle_reconnect()`; withdrawal reason (`server_muted` vs `unwatched`) → `actors/meeting_media.rs:flush_one()`
 
 ## Media Admission (ADR-0036 §4)
 - Module root → `crates/mc-service/src/media_admission/`; `IdentityPublicKey` → `identity_key.rs`; `SenderIdAllocator` → `sender_id.rs`; `AdmissionEpoch` → `epoch.rs`; `MeetingKeyState::rotate` → `kek.rs`; `SenderBindingOutcome` → `binding_response.rs`
 - KEK rotation lifecycle (`KekLifecycle`, `RotationTrigger`, `KekPushOutcome`) → `crates/mc-service/src/media_admission/rotation.rs`; driver + test-only `force_kek_rotation` → `actors/meeting.rs`
 
 ## Transport & gRPC
-- WebTransport server (accept loop, TLS, idle timeout) → `crates/mc-service/src/webtransport/server.rs`; connection (join flow, bridge loop, boundary validation) → `webtransport/connection.rs`; `encode_participant_update` and the ONE roster-entry builder `roster_entry` → `webtransport/handler.rs`
+- WebTransport server (accept loop, TLS, idle timeout) → `crates/mc-service/src/webtransport/server.rs`; connection (join flow, bridge loop, boundary validation) → `webtransport/connection.rs`; `encode_participant_update`, the ONE roster-entry builder `roster_entry` and the ONE per-kind encoders `media_kind_states` / `receive_slot_caps` (one entry per known kind) → `webtransport/handler.rs`
 - GC client (registration, heartbeats, `notify_meeting_ended`, `MeetingEndedQueue`) → `crates/mc-service/src/grpc/gc_client.rs`; GC→MC assignment → `grpc/mc_service.rs`
 - MH client (`register_meeting`, `end_meeting`, MhRegistrationClient trait) → `crates/mc-service/src/grpc/mh_client.rs`
 - MH→MC notifications → `crates/mc-service/src/grpc/media_coordination.rs:resolve_and_record()`; auth layer (R-22) → `grpc/auth_interceptor.rs`
@@ -48,7 +48,7 @@
 - Metric wrappers + Cat B matrix (`KEY_CUSTODY_LABEL` on media emissions) → `crates/mc-service/src/observability/metrics.rs`; catalog → `docs/observability/metrics/mc-service.md`; alert inventory → `docs/observability/alerts.md`
 
 ## Protocols
-- Client signaling (join, mute, server mute, ReceiveCapability, SendDirective, StreamAssignments, KEK) → `proto/dark_tower/signaling/v1/signaling.proto`
+- Client signaling (join, mute, server mute, ReceiveCapability, SendDirective, StreamAssignments, KEK) → `proto/dark_tower/signaling/v1/signaling.proto`; kind-keyed field rules → `docs/protocol/CONVENTIONS.md` §6, enforced by `dt-guard proto-per-kind-fields` (`crates/dt-guard/src/proto_per_kind_fields.rs`)
 - Internal RPCs (RegisterMc, AssignMeeting, MediaCoordinationService, RegisterMeeting, EndMeeting) → `proto/dark_tower/internal/v1/internal.proto`
 - MC→AC: token management → `crates/common/src/token_manager.rs`; JWKS → `crates/common/src/jwt.rs:JwksClient`
 

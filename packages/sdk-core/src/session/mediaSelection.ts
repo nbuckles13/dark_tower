@@ -100,8 +100,9 @@ export function declaredSlotIds(
 }
 
 /**
- * Classify a per-kind cap from `JoinResponse.max_{audio,video}_receive_slots`
- * as received (`undefined` = absent = unknown). 0 is LEGAL (a video cap of 0 is
+ * Classify a per-kind cap from `JoinResponse.receive_slot_caps` as received
+ * (`undefined` = not joined yet = unknown; once joined the caps are required,
+ * so a joined session always reads `known`). 0 is LEGAL (a video cap of 0 is
  * the video-off lever, R-26) and is `known`, never folded into unknown.
  * Informational: MC truncates, so a client never shrinks its declaration.
  */

@@ -238,8 +238,10 @@ pub struct JoinMedia {
     pub deps: Arc<MediaRoutingDeps>,
     /// The meeting's handler set, as read for this join.
     pub handlers: MeetingHandlers,
-    /// What the joiner publishes, fixed for its membership (story 3 R-2).
-    pub publishes: PublishSet,
+    /// What the joiner publishes (fixed for its membership, story 3 R-2) and
+    /// each published kind's initial client mute: the parsed join
+    /// `published_kinds`.
+    pub declared: crate::media_kind::ClientMediaStates,
     /// The joiner's initial receive declaration, validated and truncated at
     /// the connection (`JoinRequest.receive_capability`; absent = zero slots).
     pub demand: SlotDemand,
@@ -323,7 +325,9 @@ pub(crate) fn test_join_media() -> JoinMedia {
             grpc_endpoint: "http://mh-0.test:50053".to_string(),
         }])
         .unwrap(),
-        publishes: PublishSet::of(&[MediaKindLabel::Audio]),
+        declared: crate::media_kind::ClientMediaStates::live(PublishSet::of(&[
+            MediaKindLabel::Audio,
+        ])),
         demand: crate::media_signaling::ReceiveCapabilityDeclaration::empty().truncate([8, 4]),
     }
 }
@@ -660,10 +664,7 @@ impl MeetingMedia {
         };
         self.slots.set_demand(
             view.sender,
-            [
-                demand.kept_slot_ids(MediaKindLabel::Audio),
-                demand.kept_slot_ids(MediaKindLabel::Video),
-            ],
+            MediaKindLabel::per_kind(|k| demand.kept_slot_ids(k)),
         );
         view.declaration = Some(demand);
         Ok(())
@@ -1258,8 +1259,8 @@ mod census_tests {
     fn publish_sets_every_kind_including_zero_after_the_last_video_mute_ends() {
         let census = MutedSourceCensus::default();
         let snap = MetricAssertion::snapshot();
-        census.set("m-1", MediaKindLabel::per_kind(|k| k.pick(2, 1)));
-        census.set("m-2", MediaKindLabel::per_kind(|k| k.pick(1, 0)));
+        census.set("m-1", [2, 1]);
+        census.set("m-2", [1, 0]);
         census.publish();
         snap.gauge("mc_media_server_muted_sources")
             .with_labels(&[(MEDIA_KIND_LABEL, "audio")])

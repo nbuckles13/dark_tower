@@ -10,7 +10,9 @@ import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
 
 import { FrameDecoder, encodeFrame } from '../../framing/length-prefix.js';
 import { HEADER_VERSION } from '../../media/frame/wireConstants.js';
+import type { MessageInitShape } from '@bufbuild/protobuf';
 import {
+  ClientMediaState,
   ClientMessageSchema,
   Codec,
   ErrorCode,
@@ -19,6 +21,7 @@ import {
   LeaveReason,
   EncodingParametersSchema,
   MediaKind,
+  type MediaKindStateSchema,
   MediaServerInfoSchema,
   MeetingKekUpdateSchema,
   ParticipantMuteUpdateSchema,
@@ -26,6 +29,7 @@ import {
   ParticipantJoinedSchema,
   ParticipantLeftSchema,
   ParticipantSchema,
+  type ReceiveSlotCapSchema,
   SendDirectiveSchema,
   SendStreamSchema,
   SendTargetSchema,
@@ -37,7 +41,7 @@ import {
 } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type { ClientMessage } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 
-export { ErrorCode, LeaveReason };
+export { ClientMediaState, ErrorCode, LeaveReason };
 
 /** Wrap any `ServerMessage.message` oneof into a framed (4-byte BE prefixed) payload. */
 export function frameServerMessage(message: Parameters<typeof buildServerMessage>[0]): Uint8Array {
@@ -70,9 +74,10 @@ export interface JoinResponseInit {
     name: string;
     senderId?: number;
     identityPublicKey?: Uint8Array;
-    /** `Participant.*_client_muted` (`optional bool`); omitted = absent on the wire. */
-    audioClientMuted?: boolean;
-    videoClientMuted?: boolean;
+    /** Per-kind state (defaults: audio + camera LIVE, screen NOT_PUBLISHED). */
+    mediaStates?: MediaStatesInit;
+    /** The wire list VERBATIM (malformed-list tests); overrides `mediaStates`. */
+    rawMediaStates?: RawMediaKindState[];
   }[];
   mediaServers?: string[];
   correlationId?: string;
@@ -80,10 +85,71 @@ export interface JoinResponseInit {
   // Present so a test can construct the leak scenario: the meeting KEK is on the
   // wire but must never be projected into `JoinedEvent` (events.ts guarantee).
   meetingKek?: Uint8Array;
-  /** `JoinResponse.max_audio_receive_slots`; omitted = absent on the wire. */
-  maxAudioReceiveSlots?: number;
-  /** `JoinResponse.max_video_receive_slots`; omitted = absent on the wire. */
-  maxVideoReceiveSlots?: number;
+  /** `JoinResponse.receive_slot_caps` per kind (defaults {@link DEFAULT_RECEIVE_SLOT_CAPS}). */
+  receiveSlotCaps?: { audio?: number; video?: number; screen?: number };
+  /** The wire caps list VERBATIM (old-MC / malformed tests); overrides `receiveSlotCaps`. */
+  rawReceiveSlotCaps?: RawReceiveSlotCap[];
+}
+
+/** One raw wire `MediaKindState` (any numbers, for malformed-list tests). */
+export type RawMediaKindState = MessageInitShape<typeof MediaKindStateSchema>;
+/** One raw wire `ReceiveSlotCap`. */
+export type RawReceiveSlotCap = MessageInitShape<typeof ReceiveSlotCapSchema>;
+
+/** One kind's state in a test snapshot; omitted fields take the defaults. */
+export interface KindStateInit {
+  clientState?: ClientMediaState;
+  serverMuted?: boolean;
+  serverMutedBy?: string;
+}
+
+/** A participant's per-kind snapshot in tests; every known kind is always emitted. */
+export interface MediaStatesInit {
+  audio?: KindStateInit;
+  video?: KindStateInit;
+  screen?: KindStateInit;
+}
+
+/** The PUBLIC projection of `mediaStatesList()`'s defaults: what a decoded default entry reads. */
+export const LIVE_STATES = {
+  audio: { clientState: 'live', serverMuted: false },
+  video: { clientState: 'live', serverMuted: false },
+} as const;
+
+/** The caps a test JoinResponse carries unless it says otherwise. */
+export const DEFAULT_RECEIVE_SLOT_CAPS = { audio: 8, video: 8, screen: 0 } as const;
+
+/** A COMPLETE, valid `media_states` list: one entry per known kind (CONVENTIONS §6). */
+export function mediaStatesList(init: MediaStatesInit = {}): RawMediaKindState[] {
+  const entry = (
+    mediaKind: MediaKind,
+    k: KindStateInit | undefined,
+    fallback: ClientMediaState,
+  ): RawMediaKindState => ({
+    mediaKind,
+    clientState: k?.clientState ?? fallback,
+    serverMuted: k?.serverMuted ?? false,
+    serverMutedBy: k?.serverMutedBy ?? '',
+  });
+  return [
+    entry(MediaKind.AUDIO, init.audio, ClientMediaState.LIVE),
+    entry(MediaKind.VIDEO_CAMERA, init.video, ClientMediaState.LIVE),
+    entry(MediaKind.VIDEO_SCREEN, init.screen, ClientMediaState.NOT_PUBLISHED),
+  ];
+}
+
+/** A COMPLETE, valid `receive_slot_caps` list. */
+export function receiveSlotCapsList(
+  init: { audio?: number; video?: number; screen?: number } = {},
+): RawReceiveSlotCap[] {
+  return [
+    { mediaKind: MediaKind.AUDIO, maxSlots: init.audio ?? DEFAULT_RECEIVE_SLOT_CAPS.audio },
+    { mediaKind: MediaKind.VIDEO_CAMERA, maxSlots: init.video ?? DEFAULT_RECEIVE_SLOT_CAPS.video },
+    {
+      mediaKind: MediaKind.VIDEO_SCREEN,
+      maxSlots: init.screen ?? DEFAULT_RECEIVE_SLOT_CAPS.screen,
+    },
+  ];
 }
 
 export function buildJoinResponse(init: JoinResponseInit = {}) {
@@ -96,7 +162,7 @@ export function buildJoinResponse(init: JoinResponseInit = {}) {
         name: p.name,
         ...(p.senderId !== undefined ? { senderId: p.senderId } : {}),
         ...(p.identityPublicKey !== undefined ? { identityPublicKey: p.identityPublicKey } : {}),
-        ...clientMuteInit(p),
+        mediaStates: p.rawMediaStates ?? mediaStatesList(p.mediaStates),
       }),
     ),
     kekGeneration: init.kekGeneration ?? 0,
@@ -106,35 +172,36 @@ export function buildJoinResponse(init: JoinResponseInit = {}) {
     correlationId: init.correlationId ?? '',
     bindingToken: init.bindingToken ?? '',
     meetingKek: init.meetingKek ?? new Uint8Array(),
-    ...(init.maxAudioReceiveSlots !== undefined
-      ? { maxAudioReceiveSlots: init.maxAudioReceiveSlots }
-      : {}),
-    ...(init.maxVideoReceiveSlots !== undefined
-      ? { maxVideoReceiveSlots: init.maxVideoReceiveSlots }
-      : {}),
+    receiveSlotCaps: init.rawReceiveSlotCaps ?? receiveSlotCapsList(init.receiveSlotCaps),
   });
 }
 
-/** The wire's client-mute pair; an omitted kind stays ABSENT (never `false`). */
-interface ClientMuteInit {
-  audioClientMuted?: boolean;
-  videoClientMuted?: boolean;
+/** A participant's states for `ParticipantJoined`: a snapshot init, or the raw list. */
+export type ParticipantStatesInit = MediaStatesInit | { raw: RawMediaKindState[] };
+
+function statesList(init: ParticipantStatesInit): RawMediaKindState[] {
+  return 'raw' in init ? init.raw : mediaStatesList(init);
 }
 
-function clientMuteInit(init: ClientMuteInit): ClientMuteInit {
-  return {
-    ...(init.audioClientMuted !== undefined ? { audioClientMuted: init.audioClientMuted } : {}),
-    ...(init.videoClientMuted !== undefined ? { videoClientMuted: init.videoClientMuted } : {}),
-  };
+/** A joiner's verification material, for roster-key tests. */
+export interface JoinerKeyInit {
+  senderId?: number;
+  identityPublicKey?: Uint8Array;
 }
 
 export function buildParticipantJoined(
   participantId: string,
   name: string,
-  clientMute: ClientMuteInit = {},
+  states: ParticipantStatesInit = {},
+  key: JoinerKeyInit = {},
 ) {
   return create(ParticipantJoinedSchema, {
-    participant: create(ParticipantSchema, { participantId, name, ...clientMuteInit(clientMute) }),
+    participant: create(ParticipantSchema, {
+      participantId,
+      name,
+      ...key,
+      mediaStates: statesList(states),
+    }),
   });
 }
 
@@ -159,11 +226,12 @@ export function framedJoinResponse(init: JoinResponseInit = {}): Uint8Array {
 export function framedParticipantJoined(
   participantId: string,
   name: string,
-  clientMute: ClientMuteInit = {},
+  states: ParticipantStatesInit = {},
+  key: JoinerKeyInit = {},
 ): Uint8Array {
   return frameServerMessage({
     case: 'participantJoined',
-    value: buildParticipantJoined(participantId, name, clientMute),
+    value: buildParticipantJoined(participantId, name, states, key),
   });
 }
 
@@ -366,20 +434,13 @@ export function framedMeetingKekUpdate(kek: Uint8Array, generation: number): Uin
 
 export { MediaKind, SlotState };
 
-export function buildParticipantMuteUpdate(
-  init: ClientMuteInit & {
-    participantId: string;
-    audioServerMuted: boolean;
-    videoServerMuted?: boolean;
-    serverMutedBy?: string;
-  },
-) {
+export function buildParticipantMuteUpdate(init: {
+  participantId: string;
+  states?: ParticipantStatesInit;
+}) {
   return create(ParticipantMuteUpdateSchema, {
     participantId: init.participantId,
-    ...clientMuteInit(init),
-    audioServerMuted: init.audioServerMuted,
-    videoServerMuted: init.videoServerMuted ?? false,
-    serverMutedBy: init.serverMutedBy ?? '',
+    mediaStates: statesList(init.states ?? {}),
   });
 }
 
@@ -393,13 +454,19 @@ export function framedParticipantMuteUpdate(
 }
 
 /** MC's relay of a participant's unmute request to the host (`participant_id` MC-stamped). */
-export function buildUnmuteRequestRelay(participantId: string) {
-  return create(UnmuteRequestSchema, { requestAudio: true, participantId });
+export function buildUnmuteRequestRelay(
+  participantId: string,
+  mediaKinds: MediaKind[] = [MediaKind.AUDIO],
+) {
+  return create(UnmuteRequestSchema, { mediaKinds, participantId });
 }
 
-export function framedUnmuteRequestRelay(participantId: string): Uint8Array {
+export function framedUnmuteRequestRelay(
+  participantId: string,
+  mediaKinds?: MediaKind[],
+): Uint8Array {
   return frameServerMessage({
     case: 'unmuteRequest',
-    value: buildUnmuteRequestRelay(participantId),
+    value: buildUnmuteRequestRelay(participantId, mediaKinds),
   });
 }

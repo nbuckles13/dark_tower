@@ -1160,16 +1160,17 @@ Triage by the `error_type` label on `mc_session_join_failures_total`:
       [Scenario 17](#scenario-17-kek-rotation-storm--flapping-participant); if one sender went
       inaudible to incumbents only after a reset, read its stale-SDK-bundle paragraph first.
 
-12. **Story 3 join-media refusals (MC-A).** All five reach the client as `ERROR_CODE_INVALID_REQUEST`
-    "Invalid join request", so only this label splits them. MC checks the first four after the
-    JWT, meeting binding and identity key, in this order (catalog:
-    `docs/observability/metrics/mc-service.md` §`mc_session_join_failures_total`):
+12. **Story 3 join-media refusals (MC-A, extended 2026-10-25).** All reach the client as
+    `ERROR_CODE_INVALID_REQUEST` "Invalid join request", so only this label splits them. MC checks
+    all but `reconnect_publish_set_mismatch` after the JWT, meeting binding and identity key, in
+    this order (catalog: `docs/observability/metrics/mc-service.md` §`mc_session_join_failures_total`):
     - **`header_version_unsupported`** — the join's `supported_header_versions` lacks 3. An **old
       bundle or stale SDK** meeting the new MC (a pre-story v2 SDK lands here, never on
       `publish_kind_invalid`). Fix: users reload; if it is broad, check for a client rollback or a
       partial bundle rollout ([`mh-deployment.md` §Story 3 cutover](mh-deployment.md#story-3-cutover-see-each-other-order-skew-detection-rollback)).
-    - **`publish_kind_invalid`** — `publish_kinds` named UNSPECIFIED, VIDEO_SCREEN, an unknown
-      value or a duplicate. A **client bug**; correlate with a client release. No MC-side fix.
+    - **`publish_kind_invalid`** — `published_kinds` named UNSPECIFIED, VIDEO_SCREEN, an unknown
+      value or a duplicate kind (an EMPTY list is a legal receive-only join, judged next by the
+      neither-publish-nor-receive check). A **client bug**; correlate with a client release. No MC-side fix.
     - **`receive_capability_invalid`** — the join-carried receive declaration failed MC's parser.
       A **client bug**. The specific cause is on
       `mc_media_receive_capability_declarations_total{outcome}` for the same event — read it there;
@@ -2209,15 +2210,16 @@ connection driving meeting-wide work?** Note the failure predicate is stated
 counted, and the SDK names only the kind it changed. **Rates roughly HALVED at MC-B
 (2026-10-23)** against the story-3 interim that counted both kinds on every request
 (which had roughly doubled them) — a counting-unit change, not a traffic drop.
-**Every join adds `applied` since the story 3 R-15 fix (2026-10-24)**: the SDK
-reports each kind it publishes once after joining, and a first report is a fact
-change, so `applied` gains about one per published kind per join with no human
-toggle — mute "activity" now tracks join churn. Compare against last week
-accordingly; also a counting-unit change, not a traffic change.
+**Counting change, 2026-10-25 (dated; not a traffic change): joins no longer add
+`applied`.** From the story 3 R-15 fix (2026-10-24) until then, the SDK reported each kind
+after joining and `applied` tracked join churn; since the MediaKind change the join's
+`publish` declaration carries the initial state, so `applied` again tracks human toggles.
+In the same change `not_published` left this counter (see below).
 Request-level outcomes (`unchanged`, `rate_limited`, `actor_unavailable`) land once
-on each named kind. A request naming NO kind is rejected and counted on
-`mc_media_mute_requests_rejected_total{surface="client_mute", reason="no_kind_named"}`
-instead (client-inflatable, expected zero; never a denominator):
+on each named kind. A request refused for its kind list -- empty, malformed, or naming a
+kind the participant does not publish -- is counted on
+`mc_media_mute_requests_rejected_total{surface="client_mute", reason}` instead
+(client-inflatable, expected zero; never a denominator):
 
 ```promql
 # POSITIVE form on purpose. Do NOT "harmonise" this to outcome!~"..." to match
@@ -2228,11 +2230,11 @@ sum by (outcome) (rate(mc_media_mute_requests_total{outcome=~"rate_limited|actor
 
 | Token | Meaning |
 |---|---|
-| `applied` | This named kind's client-mute FACT changed — a participant's FIRST report of a kind counts, even `false` (story 3 R-15 fix: MC holds no fact until reported, peers show "unknown" until then). The meeting actor owes every OTHER participant a roster fan-out (paced per meeting — `mc_media_client_mute_fanouts_total`) and, when the muted projection moved, re-renders (the stream's PAUSED disposition at MH) and re-emits the changed slot view to the subscribers HOLDING this source whose view changed. A camera button is `{media_kind="video", outcome="applied"}` alone (audio is not named), and it is healthy. A failed re-emit is counted by the actor on counter 2 and on `mc_media_slot_view_emissions_total{outcome="composition_failed"}`. |
+| `applied` | This named kind's client state moved (`LIVE` <-> `CLIENT_MUTED`; every kind is definite from the join, so there is no "first report"). The meeting actor owes every OTHER participant a roster fan-out (paced per meeting — `mc_media_client_mute_fanouts_total`) and re-renders (the stream's PAUSED disposition at MH) and re-emits the changed slot view to the subscribers HOLDING this source whose view changed. A camera button is `{media_kind="video", outcome="applied"}` alone (audio is not named), and it is healthy. A failed re-emit is counted by the actor on counter 2 and on `mc_media_slot_view_emissions_total{outcome="composition_failed"}`. |
 | `unchanged` | This named kind's state did not move: the identical repeat (no actor hop), or a named kind the actor found already in that state. **Not a denominator — see below.** |
 | `rate_limited` | The per-connection mute-work token bucket is exhausted (`MUTE_WORK_BURST` / `MUTE_WORK_REFILL_INTERVAL_MS` in `webtransport/connection.rs`). |
 | `actor_unavailable` | Environmental and terminal. Pairs with `meeting_state_unavailable` above — check actor health, Scenarios 1 and 2. |
-| `not_published` | **Expected zero** (story 3 R-15 fix). The request named a kind the participant does not publish; MC ignored that kind (no fact, no fan-out, no reply). Not a failure, not an alert, never a denominator (decided before the token and any actor hop). A stock SDK sends none, so a non-zero rate means a modified client or an SDK regression — escalate to `client`. |
+| ~~`not_published`~~ | **Moved 2026-10-25** to `mc_media_mute_requests_rejected_total{reason="not_published"}`: a request naming a kind the participant does not publish (screen included) is now refused WHOLE (nothing applied, a generic reply). Expected zero; a non-zero rate means a modified client or an SDK regression — escalate to `client`. |
 
 **`unchanged` must NOT appear in a ratio denominator** — same rule, same reason,
 as `accepted_unchanged` on the declarations counter. The no-op short-circuit
@@ -2291,16 +2293,13 @@ toggles delayed". If it is zero, the lag is elsewhere: a
 `participant_update_muted` drop on counter 5 (no re-sync until that
 participant's next change) or the client.
 
-**"A participant shows mic: unknown / camera: unknown"** (a state that exists since the
-story 3 R-15 fix): MC holds no client-mute fact for a kind until that participant reports it.
-(a) Right after a join it is EXPECTED until the participant's post-join report lands (about
-one RTT). A kind the participant does not publish stays unknown by design. (b) Persistent for
-ONE participant: their report never reached MC. Check `mc_media_mute_requests_total{outcome=~"rate_limited|actor_unavailable"}`.
-An OLD SDK build does not report after join, so it stays unknown until that participant's
-first toggle, by design. (c) Persistent for EVERYONE, as seen by one observer: that observer
-is on an MC without the R-15 fields (a rollback or mixed versions). That is expected
-degradation, not a fault. (d) It is never a privacy issue: capture enforces client mute
-whatever others see.
+**"A participant shows camera: not publishing" (or mic)** (since 2026-10-25 there is no
+"unknown" state: every kind's state is definite from the join). That participant joined without
+that kind -- an audio-only device, a receive-only join -- and the set is fixed for the
+membership; it is correct, not a fault. If they meant to publish it, a rejoin with the device
+publishes it. A malformed per-kind snapshot from MC ends the client's session loudly (a
+`[dt-signaling-contract]` console WARN; at join it is `failure_stage="mc_join_response"`) -- an
+MC encoder defect: escalate to `meeting-controller`. It is never a privacy issue: capture enforces client mute whatever others see.
 
 **Caveat that also applies to `mc_media_slot_states_total` above**: both counters
 are skewable by one participant (and slot states also by meeting churn, since the
@@ -3655,8 +3654,9 @@ still on after a server mute", or the reverse, "I was unmuted by the host and no
 **How server mute works (story 2 task 12, R-8..R-11; per kind since story 3 MC-B, R-15..R-18).**
 Only a HOST (the meeting creator's `MeetingRole::Host` claim) may server-mute, and each request
 names the kinds it changes (an unnamed kind is unchanged). For a muted kind MC, in one structural
-change: records the mute; broadcasts who-muted-whom to every participant (including the muted one,
-FIRST, and replays it to late joiners); declares that kind's stream `DROP_AT_INGRESS` in
+change: records the mute and its imposer per kind; broadcasts who-muted-whom to every participant
+(including the muted one, FIRST; late joiners read it off their roster entry, since there is no
+replay since 2026-10-25); declares that kind's stream `DROP_AT_INGRESS` in
 `source_streams` on the next registration snapshot to every handler (edges kept, so MH counts what
 it drops; the disposition change advances `policy_generation`); **withdraws that kind's send
 directive** (the stream stays listed with empty targets, so the client stops capture and, for
@@ -3687,9 +3687,11 @@ sum by (action, outcome, media_kind) (increase(mc_media_server_mute_requests_tot
 One increment per (request, NAMED kind), `action` being that kind's direction — so one
 host request muting audio reads `mute/applied/audio` and nothing on video (the SDK names only the
 kind it changes). **Rates roughly halved at MC-B (2026-10-23)** against the story-3 interim that
-counted both kinds on every request — counting unit, not traffic. A request naming NO kind is
-counted only on `mc_media_mute_requests_rejected_total{surface="server_mute", reason="no_kind_named"}`
-(any requester, so `not_permitted` undercounts non-hosts by exactly those). `applied` is the success. `unchanged` means THIS named kind was already in the requested state; another named kind may still have been applied and pushed. `not_permitted`
+counted both kinds on every request — counting unit, not traffic. A request refused for its kind
+list is counted only on `mc_media_mute_requests_rejected_total{surface="server_mute", reason}`:
+the shape reasons for any requester (so `not_permitted` undercounts non-hosts by exactly those),
+and `not_published` -- a kind the TARGET does not publish, screen included, refused whole since
+2026-10-25 with the same reply as an unknown target -- for a host only. `applied` is the success. `unchanged` means THIS named kind was already in the requested state; another named kind may still have been applied and pushed. `not_permitted`
 means the requester was not a host — refused BEFORE the target was looked at, so a non-host learns
 nothing. `unknown_target` (host only) means the named participant is not in the meeting.
 `rate_limited` is the per-connection bound. The `mc.webtransport.connection` INFO line

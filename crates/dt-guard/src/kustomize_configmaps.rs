@@ -212,8 +212,9 @@ pub(crate) fn judge_size(name: &str, measured: usize, file: &Path) -> Option<Con
              JSON-escaped, in that annotation, so past the cap cluster setup fails with \
              `metadata.annotations: Too long`. Remedy: split a file out into its own \
              configMapGenerator entry (as mc-media.json was split from mc-overview.json), \
-             and, for a dashboard, add the new group to Grafana's projected dashboards \
-             volume (R-21 fails a group no pod mounts).",
+             and add the new ConfigMap to the projected volume that mounts its siblings: \
+             Grafana's dashboards volume for a dashboard, Prometheus's rules volume for \
+             an alert-rules file (R-21 fails a generated ConfigMap no pod mounts).",
             permille / 10,
             permille % 10,
             ANNOTATION_SIZE_LIMIT_BYTES,

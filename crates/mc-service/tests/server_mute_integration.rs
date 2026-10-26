@@ -30,13 +30,18 @@ use std::time::Duration;
 use common::observability::testing::{MetricAssertion, MetricSnapshot};
 use mc_service::media_kind::MediaKindLabel;
 use mc_service::media_routing::SourceDispositionPlan as Disposition;
+use mc_service::media_signaling::{
+    MuteOutcome, MuteRejection, ServerMuteAction, ServerMuteOutcome, UnmuteRequestOutcome,
+};
+use mc_service::observability::metrics::JOIN_FAILURE_ERROR_TYPES;
 use proto_gen::dark_tower::signaling::v1::{
-    server_message, ErrorMessage, MediaKind, SendDirective, SendStream, ServerMessage, SlotState,
-    StreamAssignment, StreamAssignments,
+    server_message, ClientMediaState, ErrorMessage, MediaKind, SendDirective, SendStream,
+    ServerMessage, SlotState, StreamAssignment, StreamAssignments,
 };
 use test_common::media_session::{
-    audio_slots, capability_frame, join_as, join_as_host, join_shaped, mute_frame,
-    mute_kinds_frame, server_mute_frame, server_mute_kinds_frame, slot, start_stack,
+    audio_slots, capability_frame, join_as, join_as_host, join_shaped, mute_changes_frame,
+    mute_frame, mute_kinds_frame, server_mute_changes_frame, server_mute_frame,
+    server_mute_kinds_frame, slot, start_stack, try_join_shaped, unmute_kinds_frame,
     unmute_request_frame, JoinShape, Session,
 };
 use test_common::{seed_meeting_with_mh, TestStackHandles};
@@ -169,9 +174,17 @@ async fn av_trio(
     [(h, hv.0, hv.1), (a, av.0, av.1), (b, bv.0, bv.1)]
 }
 
+use mc_test_utils::media::{
+    client_state_of as client_of, client_states_av as clients, server_mute_of as server_of,
+};
+
+const LIVE: ClientMediaState = ClientMediaState::Live;
+const MUTED: ClientMediaState = ClientMediaState::ClientMuted;
+const NOT_PUBLISHED: ClientMediaState = ClientMediaState::NotPublished;
+
 /// The directive's stream for `kind` (audio 0, video 1).
 fn stream_of(d: &SendDirective, kind: MediaKindLabel) -> &SendStream {
-    let number = kind.pick(0, 1);
+    let number = kind.of([0, 1]);
     d.streams
         .iter()
         .find(|s| s.stream_number == number)
@@ -182,18 +195,15 @@ fn stream_of(d: &SendDirective, kind: MediaKindLabel) -> &SendStream {
 fn slots_of(a: &StreamAssignments, kind: MediaKindLabel) -> Vec<StreamAssignment> {
     a.assignments
         .iter()
-        .filter(|s| kind.pick(s.slot_id < 10, s.slot_id >= 10))
+        .filter(|s| kind.of([s.slot_id < 10, s.slot_id >= 10]))
         .cloned()
         .collect()
 }
 
 /// A server-mute request about ONE kind (the other absent: unchanged).
 fn server_mute_one(target: &str, kind: MediaKindLabel, muted: bool) -> bytes::BytesMut {
-    server_mute_kinds_frame(
-        target,
-        kind.pick(Some(muted), None),
-        kind.pick(None, Some(muted)),
-    )
+    let [audio, video] = MediaKindLabel::per_kind(|k| (k == kind).then_some(muted));
+    server_mute_kinds_frame(target, audio, video)
 }
 
 /// The next `ErrorMessage`, whole (code AND text), skipping other traffic.
@@ -207,17 +217,12 @@ async fn next_error(s: &mut Session) -> ErrorMessage {
 }
 
 /// Every cell of both per-kind mute counters, for "nothing per-kind moved".
+/// The label sets are the production vocabularies' own `ALL`, so a new kind
+/// or outcome is covered here without an edit.
 fn assert_no_per_kind_mute_cell_moved(snap: &MetricSnapshot) {
-    for kind in ["audio", "video"] {
-        for action in ["mute", "unmute"] {
-            for outcome in [
-                "applied",
-                "unchanged",
-                "not_permitted",
-                "unknown_target",
-                "rate_limited",
-                "actor_unavailable",
-            ] {
+    for kind in MediaKindLabel::ALL.map(MediaKindLabel::label) {
+        for action in ServerMuteAction::ALL.map(ServerMuteAction::label) {
+            for outcome in ServerMuteOutcome::ALL.map(ServerMuteOutcome::label) {
                 snap.counter("mc_media_server_mute_requests_total")
                     .with_labels(&[
                         ("action", action),
@@ -227,7 +232,7 @@ fn assert_no_per_kind_mute_cell_moved(snap: &MetricSnapshot) {
                     .assert_delta(0);
             }
         }
-        for outcome in ["applied", "unchanged", "rate_limited", "actor_unavailable"] {
+        for outcome in MuteOutcome::ALL.map(MuteOutcome::label) {
             snap.counter("mc_media_mute_requests_total")
                 .with_labels(&[("outcome", outcome), ("media_kind", kind)])
                 .assert_delta(0);
@@ -697,7 +702,7 @@ async fn the_self_mute_update_precedes_the_directive_change_and_the_holders_slot
         let a_id = a.participant_id.clone();
         let a_sender = a.sender_id;
         let server_muted = |u: &proto_gen::dark_tower::signaling::v1::ParticipantMuteUpdate| {
-            kind.pick(u.audio_server_muted, u.video_server_muted)
+            server_of(&u.media_states, kind.to_proto()).0
         };
 
         for muted in [true, false] {
@@ -1058,36 +1063,57 @@ async fn the_muted_participant_is_told_it_is_server_muted_and_by_whom() {
     let (mut h, mut a, _b) = trio(&rig, &stack, "sm-target-m").await;
     h.write(server_mute_frame(&a.participant_id, true)).await;
     let update = a.expect_mute_update_for(&a.participant_id.clone()).await;
-    assert!(update.audio_server_muted);
-    assert!(!update.video_server_muted, "video was not named");
-    assert_eq!(update.server_muted_by, h.participant_id);
+    assert_eq!(
+        server_of(&update.media_states, MediaKind::Audio),
+        (true, h.participant_id.clone())
+    );
+    assert_eq!(
+        server_of(&update.media_states, MediaKind::VideoCamera),
+        (false, String::new()),
+        "video was not named"
+    );
 }
 
-/// A joiner arriving AFTER a mute is told about it immediately — the first
-/// message after its `JoinResponse` — not at the next mute change.
+/// A joiner arriving AFTER a mute learns it from its ROSTER entry (ADR-0036 §5
+/// amendment 2026-10-25: one carrier, no replay). Fence for "no replay": the
+/// host then mutes ANOTHER participant, and that update is the FIRST mute
+/// update the joiner receives.
 #[tokio::test]
-async fn a_late_joiner_is_told_who_is_server_muted_right_after_its_join_response() {
+async fn a_late_joiners_roster_carries_who_is_server_muted_and_no_replay_follows() {
     let (stack, rig) = start_stack("sm-late").await;
-    let (mut h, a, _b) = trio(&rig, &stack, "sm-late-m").await;
+    let [(mut h, _, _), (a, _, _), (b, _, _)] = av_trio(&rig, &stack, "sm-late-m").await;
     h.write(server_mute_kinds_frame(&a.participant_id, None, Some(true)))
         .await;
     let _ = h.expect_mute_update_for(&a.participant_id.clone()).await;
 
     let mut late = join_as(&rig, &stack, "sm-late-m", "user-late").await;
-    let first = late
-        .next_server_message()
-        .await
-        .expect("a message follows the JoinResponse");
-    let Some(server_message::Message::ParticipantMuteUpdate(update)) = first.message else {
-        panic!("the replay is the FIRST thing after the JoinResponse, got {first:?}");
-    };
-    assert_eq!(update.participant_id, a.participant_id);
-    assert!(
-        update.video_server_muted,
-        "the replay carries per-kind state"
+    let entry = late
+        .existing_participants
+        .iter()
+        .find(|p| p.participant_id == a.participant_id)
+        .expect("A is on the roster");
+    assert_eq!(
+        server_of(&entry.media_states, MediaKind::VideoCamera),
+        (true, h.participant_id.clone()),
+        "the roster carries per-kind server mute and its imposer"
     );
-    assert!(!update.audio_server_muted);
-    assert_eq!(update.server_muted_by, h.participant_id);
+    assert_eq!(
+        server_of(&entry.media_states, MediaKind::Audio),
+        (false, String::new())
+    );
+
+    h.write(server_mute_kinds_frame(&b.participant_id, Some(true), None))
+        .await;
+    let first = loop {
+        let m = late.next_server_message().await.expect("the fence arrives");
+        if let Some(server_message::Message::ParticipantMuteUpdate(u)) = m.message {
+            break u;
+        }
+    };
+    assert_eq!(
+        first.participant_id, b.participant_id,
+        "no replay frame about A precedes the fence"
+    );
 }
 
 // ============================================================================
@@ -1134,7 +1160,7 @@ async fn an_unmute_request_reaches_the_host_as_the_requester_and_leaves_the_mute
         relayed.participant_id, a.participant_id,
         "the relay names the authenticated requester, never the client's claim"
     );
-    assert!(relayed.request_audio);
+    assert_eq!(relayed.media_kinds, vec![MediaKind::Audio as i32]);
     snap.counter("mc_media_unmute_requests_total")
         .with_labels(&[("outcome", "relayed"), ("key_custody", "operator")])
         .assert_delta(1);
@@ -1220,45 +1246,54 @@ async fn refusal_replies_past_the_burst_are_withheld_and_counted() {
     assert_eq!(replies, SENT - 1, "exactly the burst is answered");
 }
 
-/// The legacy both-kinds frame helper still names both kinds explicitly (an
-/// explicit `false` is an unmute, never "unchanged"). From an AUDIO-ONLY
-/// publisher (the trio), the named video kind is not published, so it is
-/// counted `not_published` and ignored; audio still applies.
+/// The both-kinds frame helper names both kinds explicitly (an explicit
+/// `false` is an unmute, never "unchanged"). From an AUDIO-ONLY publisher (the
+/// trio), the named video kind is not published, so the WHOLE request is
+/// refused (ADR-0036 §5 amendment 2026-10-25): audio is NOT applied.
 #[tokio::test]
-async fn a_both_kinds_client_mute_names_both_kinds() {
+async fn a_both_kinds_client_mute_from_an_audio_only_publisher_is_refused_whole() {
     let (stack, rig) = start_stack("sm-both").await;
     let (_h, mut a, _b) = trio(&rig, &stack, "sm-both-m").await;
     let snap = MetricAssertion::snapshot();
     a.write(mute_frame(true, false)).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while snap
-        .counter("mc_media_mute_requests_total")
-        .with_labels(&[("outcome", "applied"), ("media_kind", "audio")])
-        .delta()
-        < 1
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "audio was not applied"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    snap.counter("mc_media_mute_requests_total")
-        .with_labels(&[("outcome", "not_published"), ("media_kind", "video")])
-        .assert_delta(1);
+    assert_eq!(next_error(&mut a).await.message, "Mute request refused");
+    rejected(&snap, "client_mute", "not_published").assert_delta(1);
+    assert_no_per_kind_mute_cell_moved(&snap);
     let _ = stack;
 }
 
 // ============================================================================
 // Story 3 R-15 fix: client mute is a roster fact for every participant
-// (reverses story-2 S-2; ADR-0036 §5 amendment 2026-10-24)
+// (reverses story-2 S-2; ADR-0036 §5 amendments 2026-10-24 and 2026-10-25)
 // ============================================================================
+
+/// `mc_media_mute_requests_rejected_total{surface, reason}`.
+fn rejected<'a>(
+    snap: &'a MetricSnapshot,
+    surface: &'a str,
+    reason: &'a str,
+) -> common::observability::testing::CounterQuery<'a> {
+    snap.counter("mc_media_mute_requests_rejected_total")
+        .with_labels(&[
+            ("surface", surface),
+            ("reason", reason),
+            ("key_custody", "operator"),
+        ])
+}
+
+/// Exactly one `{surface, reason}` cell moved by one; every other reason on
+/// that surface did not.
+fn assert_rejected_exactly(snap: &MetricSnapshot, surface: &str, reason: &str) {
+    for r in MuteRejection::ALL.map(MuteRejection::label) {
+        rejected(snap, surface, r).assert_delta(u64::from(r == reason));
+    }
+}
 
 /// A client `MuteRequest` reaches ANOTHER session as a `ParticipantMuteUpdate`
 /// about the requester (the subject is always the connection's own
-/// participant -- `MuteRequest` names no one), carrying the client facts with
-/// the server flags unset; an identical repeat emits nothing, fenced by the
-/// next real transition being the NEXT update B sees about A.
+/// participant -- `MuteRequest` names no one), carrying the full per-kind state
+/// with no server mute; an identical repeat emits nothing, fenced by the next
+/// real transition being the NEXT update B sees about A.
 #[tokio::test]
 async fn a_client_mute_reaches_other_sessions_and_a_repeat_reaches_no_one() {
     let (stack, rig) = start_stack("cm-wire").await;
@@ -1268,21 +1303,27 @@ async fn a_client_mute_reaches_other_sessions_and_a_repeat_reaches_no_one() {
 
     a.write(mute_kinds_frame(Some(true), None)).await;
     let first = b.expect_mute_update_for(&a_id).await;
+    assert_eq!(clients(&first.media_states), (MUTED, LIVE));
+    for kind in [
+        MediaKind::Audio,
+        MediaKind::VideoCamera,
+        MediaKind::VideoScreen,
+    ] {
+        assert_eq!(server_of(&first.media_states, kind), (false, String::new()));
+    }
     assert_eq!(
-        (first.audio_client_muted, first.video_client_muted),
-        (Some(true), None),
-        "audio is a fact now; video was never reported, so it is ABSENT"
+        client_of(&first.media_states, MediaKind::VideoScreen),
+        NOT_PUBLISHED,
+        "screen rides as the MC constant"
     );
-    assert!(!first.audio_server_muted && !first.video_server_muted);
-    assert!(first.server_muted_by.is_empty());
 
     a.write(mute_kinds_frame(Some(true), None)).await; // no-op
     a.write(mute_kinds_frame(None, Some(true))).await; // the fence
     let next = b.expect_mute_update_for(&a_id).await;
     assert_eq!(
-        (next.audio_client_muted, next.video_client_muted),
-        (Some(true), Some(true)),
-        "the next update about A is the fence; a no-op emission would have been (Some(true), None)"
+        clients(&next.media_states),
+        (MUTED, MUTED),
+        "the next update about A is the fence; a no-op emission would have been (MUTED, LIVE)"
     );
     // One fan-out per REAL transition (counted per subject, not per
     // recipient), none for the no-op, and the per-meeting bucket never engaged.
@@ -1295,124 +1336,384 @@ async fn a_client_mute_reaches_other_sessions_and_a_repeat_reaches_no_one() {
     let _ = stack;
 }
 
-/// A first unmuted report (`None -> Some(false)`) reaches the actor -- the
-/// connection's cache never short-circuits a first report -- and fans out as
-/// a fact, but is a MEDIA no-op: no push and no generation advance before the
-/// fence (the host's mute of B is the NEXT push, exactly one generation on).
+/// Test plan 6: a participant that JOINS client-muted is PAUSED at MH from its
+/// first registration snapshot (no `MuteRequest` ever sent), and an unmute
+/// moves it to FORWARD at the next generation -- the initial state is live
+/// state, not a frozen one.
 #[tokio::test]
-async fn a_first_unmuted_report_fans_out_and_neither_pushes_nor_advances_the_generation() {
-    let (stack, rig) = start_stack("cm-first").await;
-    let [(mut h, _, _), (mut a, _, _), (mut b, _, _)] = av_trio(&rig, &stack, "cm-first-m").await;
-    let before = pushes_to(&stack, "cm-first-m", MH);
-    let last = before.last().expect("the trio pushed").policy_generation;
-
-    a.write(mute_kinds_frame(Some(false), Some(false))).await;
-    let u = b.expect_mute_update_for(&a.participant_id.clone()).await;
-    assert_eq!(
-        (u.audio_client_muted, u.video_client_muted),
-        (Some(false), Some(false))
-    );
-
-    h.write(server_mute_frame(&b.participant_id, true)).await;
-    let fence = push_until(&stack, "cm-first-m", MH, "the fence", |c| {
-        dropped(c) == vec![(b.sender_id, 0)]
+async fn a_joined_muted_publisher_is_paused_at_once_and_an_unmute_forwards_it() {
+    let (stack, rig) = start_stack("cm-joined-muted").await;
+    const M: &str = "cm-joined-muted-m";
+    seed_meeting_with_mh(&stack, M).await;
+    let mut h = join_as_host(&rig, &stack, M, "host").await;
+    h.write(capability_frame(audio_slots(2))).await;
+    let _ = h.settle().await;
+    let mut a = join_shaped(
+        &rig,
+        &stack,
+        M,
+        "user-a",
+        false,
+        JoinShape::default().client_muted(MediaKind::Audio),
+    )
+    .await;
+    let _ = a.settle().await;
+    let paused = push_until(&stack, M, MH, "a's stream is declared", |c| {
+        disposition(c, a.sender_id, 0).is_some()
     })
     .await;
     assert_eq!(
-        fence.policy_generation,
-        last + 1,
-        "the first-false report advanced no generation"
+        disposition(&paused, a.sender_id, 0),
+        Some(Disposition::Paused),
+        "joined muted: PAUSED from the first snapshot that declares it"
     );
+
+    a.write(mute_kinds_frame(Some(false), None)).await;
+    let forwarded = push_until(&stack, M, MH, "the unmute", |c| {
+        disposition(c, a.sender_id, 0) == Some(Disposition::Forward)
+    })
+    .await;
     assert_eq!(
-        pushes_to(&stack, "cm-first-m", MH).len(),
-        before.len() + 1,
-        "and made no push"
+        forwarded.policy_generation,
+        paused.policy_generation + 1,
+        "FORWARD at the next generation"
     );
 }
 
-/// The join roster carries each participant's client-mute facts SET IFF
-/// KNOWN: a muted kind `Some(true)`, a reported-unmuted kind `Some(false)`,
-/// and a never-reported participant ABSENT on both -- on the late joiner's
+/// The join roster carries every participant's DEFINITE per-kind state (ADR-0036
+/// §5 amendment 2026-10-25): a muted kind CLIENT_MUTED, a live kind LIVE, an
+/// unpublished kind NOT_PUBLISHED, and a participant that joined muted is
+/// CLIENT_MUTED without ever sending a `MuteRequest` -- on the late joiner's
 /// `existing_participants` and on the `ParticipantJoined` the others receive.
 #[tokio::test]
-async fn the_join_roster_carries_client_mute_facts_set_iff_known() {
+async fn the_join_roster_carries_definite_client_states_with_no_mute_request() {
     let (stack, rig) = start_stack("cm-roster").await;
     let [(h, _, _), (mut a, _, _), (mut b, _, _)] = av_trio(&rig, &stack, "cm-roster-m").await;
     a.write(mute_kinds_frame(None, Some(true))).await;
-    b.write(mute_kinds_frame(Some(false), Some(false))).await;
-    let _ = h;
-    // Both reports applied (fenced by their own fan-out to the other).
     let _ = b.expect_mute_update_for(&a.participant_id.clone()).await;
-    let _ = a.expect_mute_update_for(&b.participant_id.clone()).await;
+    let audio_only = join_as(&rig, &stack, "cm-roster-m", "user-ao").await;
 
-    let late = join_as(&rig, &stack, "cm-roster-m", "user-late").await;
-    let facts = |id: &str| {
+    let late = join_shaped(
+        &rig,
+        &stack,
+        "cm-roster-m",
+        "user-late",
+        false,
+        JoinShape::publishing(&[MediaKind::Audio, MediaKind::VideoCamera])
+            .client_muted(MediaKind::Audio),
+    )
+    .await;
+    let states = |id: &str| {
         let p = late
             .existing_participants
             .iter()
             .find(|p| p.participant_id == id)
             .unwrap_or_else(|| panic!("{id} is on the roster"));
-        (p.audio_client_muted, p.video_client_muted)
+        clients(&p.media_states)
     };
-    assert_eq!(facts(&a.participant_id), (None, Some(true)));
-    assert_eq!(facts(&b.participant_id), (Some(false), Some(false)));
+    assert_eq!(states(&a.participant_id), (LIVE, MUTED));
+    assert_eq!(states(&b.participant_id), (LIVE, LIVE));
+    assert_eq!(states(&h.participant_id), (LIVE, LIVE));
     assert_eq!(
-        facts(&h.participant_id),
-        (None, None),
-        "never reported: ABSENT"
+        states(&audio_only.participant_id),
+        (LIVE, NOT_PUBLISHED),
+        "an audio-only publisher's camera is NOT_PUBLISHED, never unknown"
     );
 
     let joined = loop {
-        let msg = a.next_server_message().await.expect("a hears the join");
+        let msg = b.next_server_message().await.expect("b hears the join");
         if let Some(server_message::Message::ParticipantJoined(j)) = msg.message {
-            break j.participant.expect("an entry");
+            let p = j.participant.expect("an entry");
+            if p.participant_id == late.participant_id {
+                break p;
+            }
         }
     };
-    assert_eq!(joined.participant_id, late.participant_id);
     assert_eq!(
-        (joined.audio_client_muted, joined.video_client_muted),
-        (None, None),
-        "a fresh joiner has reported nothing: unknown to peers, never unmuted"
+        clients(&joined.media_states),
+        (MUTED, LIVE),
+        "the joiner's declared mute rides its own ParticipantJoined"
     );
 }
 
-/// Story 3 R-15 fix: a client-mute fact exists only for a kind the
-/// participant PUBLISHES. An audio-only participant's video reports (false,
-/// then true) record no fact, fan out nothing and count `not_published` once
-/// each; a mixed request applies audio only. Fenced: B's first update about A
-/// is the mixed request's, carrying video ABSENT.
+/// Inverts the R-15 "ignored and counted" test (ADR-0036 §5 amendment
+/// 2026-10-25): a client mute naming a kind the participant does not publish
+/// is refused WHOLE -- the published audio in the same request is NOT applied
+/// -- counted kind-free, answered generically, and changes nothing. Fenced: B's
+/// first update about A is a LATER valid toggle, showing audio still LIVE
+/// before it.
 #[tokio::test]
-async fn a_client_mute_of_an_unpublished_kind_is_ignored_and_counted() {
+async fn a_client_mute_naming_an_unpublished_kind_is_refused_whole() {
     let (stack, rig) = start_stack("cm-unpub").await;
     let (_h, mut a, mut b) = trio(&rig, &stack, "cm-unpub-m").await;
     let snap = MetricAssertion::snapshot();
 
-    a.write(mute_kinds_frame(None, Some(false))).await;
-    a.write(mute_kinds_frame(None, Some(true))).await;
-    a.write(mute_kinds_frame(Some(true), Some(true))).await; // mixed: the fence
+    a.write(mute_kinds_frame(Some(true), Some(true))).await; // mixed
+    assert_eq!(next_error(&mut a).await.message, "Mute request refused");
+    assert_rejected_exactly(&snap, "client_mute", "not_published");
+    assert_no_per_kind_mute_cell_moved(&snap);
+
+    a.write(mute_kinds_frame(Some(true), None)).await; // the fence
     let first = b.expect_mute_update_for(&a.participant_id.clone()).await;
     assert_eq!(
-        (first.audio_client_muted, first.video_client_muted),
-        (Some(true), None),
-        "the first update about A is the mixed request's; video never became a fact"
+        clients(&first.media_states),
+        (MUTED, NOT_PUBLISHED),
+        "the first update about A is the fence; the refused request applied nothing"
     );
-    snap.counter("mc_media_mute_requests_total")
-        .with_labels(&[("outcome", "not_published"), ("media_kind", "video")])
-        .assert_delta(3);
-    snap.counter("mc_media_mute_requests_total")
-        .with_labels(&[("outcome", "applied"), ("media_kind", "audio")])
-        .assert_delta(1);
     snap.counter("mc_media_client_mute_fanouts_total")
         .with_labels(&[("outcome", "fanned_out")])
         .assert_delta(1);
-    let late = join_as(&rig, &stack, "cm-unpub-m", "user-late").await;
-    let entry = late
-        .existing_participants
-        .iter()
-        .find(|p| p.participant_id == a.participant_id)
-        .expect("A is on the roster");
+}
+
+/// Test plan 2: every kind-list refusal, on every surface, lands on exactly
+/// its own `{surface, reason}` cell, moves no per-kind cell, is answered with
+/// the surface's one generic reply, and changes nothing (fence: a later valid
+/// request is what B sees next). Screen is `not_published` on all three
+/// surfaces.
+#[tokio::test]
+async fn every_kind_list_refusal_is_counted_on_its_own_cell_on_every_surface() {
+    const A: i32 = MediaKind::Audio as i32;
+    const V: i32 = MediaKind::VideoCamera as i32;
+    const S: i32 = MediaKind::VideoScreen as i32;
+    const U: i32 = MediaKind::Unspecified as i32;
+    let cases: [(&str, Vec<(i32, bool)>); 7] = [
+        ("no_kind_named", vec![]),
+        ("media_kind_unspecified", vec![(U, true)]),
+        ("media_kind_unspecified", vec![(77, true)]),
+        ("duplicate_kind", vec![(A, true), (A, false)]),
+        ("not_published", vec![(S, true)]),
+        ("not_published", vec![(V, true)]), // the trio publishes audio only
+        // Mixed: a published kind does not carry an unpublished one -- the
+        // whole list is refused.
+        ("not_published", vec![(A, true), (S, true)]),
+    ];
+    let (stack, rig) = start_stack("cm-refusals").await;
+    // A fresh trio per case: each surface's refusal REPLY is rationed per
+    // connection (burst `MUTE_REFUSAL_REPLY_BURST`), so one connection would
+    // run out of replies before the table did.
+    for (i, (reason, changes)) in cases.iter().enumerate() {
+        let (mut h, mut a, mut b) = trio(&rig, &stack, &format!("cm-refusals-m-{i}")).await;
+        // Client mute.
+        let snap = MetricAssertion::snapshot();
+        a.write(mute_changes_frame(changes)).await;
+        assert_eq!(
+            next_error(&mut a).await.message,
+            "Mute request refused",
+            "{reason}"
+        );
+        assert_rejected_exactly(&snap, "client_mute", reason);
+        assert_no_per_kind_mute_cell_moved(&snap);
+
+        // Server mute, from the host.
+        let snap = MetricAssertion::snapshot();
+        h.write(server_mute_changes_frame(&a.participant_id, changes))
+            .await;
+        assert_eq!(
+            next_error(&mut h).await.message,
+            "Server mute request refused",
+            "{reason}"
+        );
+        assert_rejected_exactly(&snap, "server_mute", reason);
+        assert_no_per_kind_mute_cell_moved(&snap);
+
+        // Unmute request (kinds only).
+        let kinds: Vec<i32> = changes.iter().map(|(k, _)| *k).collect();
+        let snap = MetricAssertion::snapshot();
+        a.write(unmute_kinds_frame("", &kinds)).await;
+        assert_eq!(
+            next_error(&mut a).await.message,
+            "Unmute request refused",
+            "{reason}"
+        );
+        assert_rejected_exactly(&snap, "unmute_request", reason);
+        for outcome in UnmuteRequestOutcome::ALL.map(UnmuteRequestOutcome::label) {
+            snap.counter("mc_media_unmute_requests_total")
+                .with_labels(&[("outcome", outcome), ("key_custody", "operator")])
+                .assert_delta(0);
+        }
+        // Fence: nothing above changed A; a valid toggle is B's next update
+        // about A, with no server mute.
+        a.write(mute_kinds_frame(Some(true), None)).await;
+        let u = b.expect_mute_update_for(&a.participant_id.clone()).await;
+        assert_eq!(clients(&u.media_states), (MUTED, NOT_PUBLISHED), "{reason}");
+        for kind in [MediaKind::Audio, MediaKind::VideoCamera] {
+            assert_eq!(server_of(&u.media_states, kind), (false, String::new()));
+        }
+    }
+    let _ = stack;
+}
+
+/// Security Gate 1 point 1 / 6(c), must-hold 1: a host's server mute of a
+/// kind the TARGET does not publish is refused with a reply BYTE-identical to
+/// an unknown target's; a NON-host's reply is byte-identical to the
+/// well-formed not-permitted reply WHATEVER it sends (empty list, duplicate,
+/// UNSPECIFIED, screen), and each malformed list is counted kind-free on its
+/// own reason cell.
+#[tokio::test]
+async fn a_server_mute_of_an_unpublished_kind_answers_like_an_unknown_target() {
+    use prost::Message as _;
+    let (stack, rig) = start_stack("sm-unpub").await;
+    let (mut h, mut a, mut b) = trio(&rig, &stack, "sm-unpub-m").await;
+
+    h.write(server_mute_kinds_frame("ghost", Some(true), None))
+        .await;
+    let unknown = next_error(&mut h).await;
+    let snap = MetricAssertion::snapshot();
+    h.write(server_mute_kinds_frame(&b.participant_id, None, Some(true)))
+        .await;
+    let unpublished = next_error(&mut h).await;
     assert_eq!(
-        (entry.audio_client_muted, entry.video_client_muted),
-        (Some(true), None)
+        unpublished.encode_to_vec(),
+        unknown.encode_to_vec(),
+        "not_published is indistinguishable from unknown_target on the wire"
     );
+    assert_rejected_exactly(&snap, "server_mute", "not_published");
+    assert_no_per_kind_mute_cell_moved(&snap);
+
+    // The non-host reference: a WELL-FORMED request from B (a non-host).
+    let snap = MetricAssertion::snapshot();
+    b.write(server_mute_kinds_frame(&a.participant_id, Some(true), None))
+        .await;
+    let not_permitted = next_error(&mut b).await;
+    assert_eq!(not_permitted.message, "Server mute request refused");
+    snap.counter("mc_media_server_mute_requests_total")
+        .with_labels(&[
+            ("action", "mute"),
+            ("outcome", "not_permitted"),
+            ("media_kind", "audio"),
+        ])
+        .assert_delta(1);
+
+    // Four malformed lists from A (a non-host): within A's server-mute
+    // refusal-reply burst, so every one is answered.
+    const AUDIO: i32 = MediaKind::Audio as i32;
+    let malformed: [(&str, Vec<(i32, bool)>); 4] = [
+        ("no_kind_named", vec![]),
+        ("duplicate_kind", vec![(AUDIO, true), (AUDIO, false)]),
+        (
+            "media_kind_unspecified",
+            vec![(MediaKind::Unspecified as i32, true)],
+        ),
+        ("not_published", vec![(MediaKind::VideoScreen as i32, true)]),
+    ];
+    for (reason, changes) in &malformed {
+        let snap = MetricAssertion::snapshot();
+        a.write(server_mute_changes_frame(&b.participant_id, changes))
+            .await;
+        let reply = next_error(&mut a).await;
+        assert_eq!(
+            reply.encode_to_vec(),
+            not_permitted.encode_to_vec(),
+            "{reason}: a non-host's refusal is byte-identical whatever it sends"
+        );
+        assert_rejected_exactly(&snap, "server_mute", reason);
+        assert_no_per_kind_mute_cell_moved(&snap);
+    }
+    let _ = stack;
+}
+
+/// Test plan 1: every join refusal for the published kinds leaves NO
+/// trace -- the exact `error_type` cell, no roster entry, and no
+/// `ParticipantJoined` at an existing peer, fenced by a later VALID join being
+/// the peer's next join notice. The duplicate case has CONFLICTING values, so
+/// refusal (not last-wins) is what is proven.
+#[tokio::test]
+async fn a_refused_join_leaves_no_trace() {
+    const A: i32 = MediaKind::Audio as i32;
+    let cases: [Vec<(i32, bool)>; 4] = [
+        vec![(MediaKind::Unspecified as i32, false)],
+        vec![(4242, false)],
+        vec![(MediaKind::VideoScreen as i32, false)],
+        vec![(A, true), (A, false)],
+    ];
+    let (stack, rig) = start_stack("join-refused").await;
+    const M: &str = "join-refused-m";
+    seed_meeting_with_mh(&stack, M).await;
+    let mut peer = join_as(&rig, &stack, M, "user-peer").await;
+    for (i, publish) in cases.into_iter().enumerate() {
+        let snap = MetricAssertion::snapshot();
+        let shape = JoinShape {
+            publish,
+            ..JoinShape::default()
+        };
+        let refused = try_join_shaped(&rig, &stack, M, &format!("user-bad-{i}"), shape).await;
+        let err = refused.err().expect("refused");
+        assert!(
+            err.contains("InvalidRequest") && err.contains("Invalid join request"),
+            "case {i}: the one generic refusal, got {err}"
+        );
+        // Exactly one join-failure cell moved: every other join-reachable
+        // `error_type` (the zero-init set, itself pinned to `McError`) did not.
+        assert!(
+            JOIN_FAILURE_ERROR_TYPES.contains(&"publish_kind_invalid"),
+            "positive control: the expected cell is in the iterated set"
+        );
+        for e in JOIN_FAILURE_ERROR_TYPES {
+            snap.counter("mc_session_join_failures_total")
+                .with_labels(&[("error_type", e)])
+                .assert_delta(u64::from(*e == "publish_kind_invalid"));
+        }
+    }
+    // Fence: the next join notice the peer sees is the VALID joiner's.
+    let good = join_as(&rig, &stack, M, "user-good").await;
+    let joined = loop {
+        let m = peer.next_server_message().await.expect("the join notice");
+        if let Some(server_message::Message::ParticipantJoined(j)) = m.message {
+            break j.participant.expect("an entry");
+        }
+    };
+    assert_eq!(
+        joined.participant_id, good.participant_id,
+        "no refused joiner was announced"
+    );
+    assert_eq!(
+        good.existing_participants
+            .iter()
+            .map(|p| p.participant_id.clone())
+            .collect::<Vec<_>>(),
+        vec![peer.participant_id.clone()],
+        "no refused joiner is on the roster"
+    );
+}
+
+/// Test plan 3 (no-compat): an EMPTY `published_kinds` is a legal receive-only
+/// join -- the only observable meaning of an absent list -- and peers see the
+/// joiner with EVERY known kind NOT_PUBLISHED (all three entries).
+#[tokio::test]
+async fn an_empty_publish_list_joins_receive_only_with_every_kind_not_published() {
+    let (stack, rig) = start_stack("join-recv-only").await;
+    const M: &str = "join-recv-only-m";
+    seed_meeting_with_mh(&stack, M).await;
+    let mut peer = join_as(&rig, &stack, M, "user-peer").await;
+    let shape = JoinShape {
+        publish: Vec::new(),
+        ..JoinShape::default()
+    }
+    .receiving(vec![slot(0, MediaKind::Audio)]);
+    let ro = try_join_shaped(&rig, &stack, M, "user-ro", shape)
+        .await
+        .expect("receive-only is admitted");
+    let joined = loop {
+        let m = peer.next_server_message().await.expect("the join notice");
+        if let Some(server_message::Message::ParticipantJoined(j)) = m.message {
+            break j.participant.expect("an entry");
+        }
+    };
+    assert_eq!(joined.participant_id, ro.participant_id);
+    assert_eq!(joined.media_states.len(), 3, "one entry per known kind");
+    for kind in [
+        MediaKind::Audio,
+        MediaKind::VideoCamera,
+        MediaKind::VideoScreen,
+    ] {
+        assert_eq!(
+            client_of(&joined.media_states, kind),
+            NOT_PUBLISHED,
+            "{kind:?}"
+        );
+        assert_eq!(
+            server_of(&joined.media_states, kind),
+            (false, String::new())
+        );
+    }
 }

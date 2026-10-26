@@ -335,7 +335,7 @@ impl SourceMuteView {
             .get(&sender)
             .copied()
             .unwrap_or(SourceMute::new(
-                ServerMutedKinds::from_server_flags([true; 2]),
+                ServerMutedKinds::ALL_MUTED,
                 ClientMutedKinds::NONE,
             ))
     }
@@ -487,11 +487,7 @@ impl SlotTable {
         let Some(member) = self.members.get_mut(&rank) else {
             return false;
         };
-        let [audio, video] = slot_ids;
-        for (kind, ids) in [
-            (MediaKindLabel::Audio, audio),
-            (MediaKindLabel::Video, video),
-        ] {
+        for (kind, ids) in MediaKindLabel::ALL.into_iter().zip(slot_ids) {
             kind.of_mut(&mut member.slots).resize(ids.len(), None);
             *kind.of_mut(&mut member.slot_ids) = ids;
         }

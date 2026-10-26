@@ -148,8 +148,15 @@ message JoinRequest {
   string correlation_id = 5;              // ADR-0023 session recovery
   string binding_token = 6;               // ADR-0023 session recovery
   bytes identity_public_key = 7;          // raw Ed25519, 32 bytes (ADR-0036 §4)
-  repeated MediaKind publish_kinds = 8;   // story 3: fixed publish set; empty = publishes nothing
+  reserved 8;                             // was: publish_kinds (2026-10-25)
+  reserved "publish_kinds";
   ReceiveCapability receive_capability = 9; // story 3: initial declaration; absent = zero slots
+  repeated PublishedKind published_kinds = 10; // fixed publish set + initial client mute; empty = publishes nothing
+}
+
+message PublishedKind {                   // CONVENTIONS §6: at most one entry per kind
+  MediaKind media_kind = 1;
+  bool client_muted = 2;
 }
 
 message ParticipantCapabilities {
@@ -170,7 +177,8 @@ enum Codec {
 }
 ```
 
-**Story 3 join rules (R-2, R-22).** `publish_kinds` is fixed for the membership
+**Story 3 join rules (R-2, R-22).** The publish set (`published_kinds`, keyed by
+kind since 2026-10-25, each entry carrying the kind's initial client mute) is fixed for the membership
 (a reconnect presenting a different set is refused and counted); UNSPECIFIED,
 `VIDEO_SCREEN`, unknown and duplicate values are rejected and counted, never
 ignored; a join that would neither publish nor receive — judged on the
@@ -179,7 +187,7 @@ declaration as sent, before truncation — is refused generically and counted. A
 `receive_capability` is validated by the same parser as a post-join
 redeclaration (a malformed one refuses the join); over-cap slots are truncated,
 never refused. MC checks, in this order, after the JWT, meeting binding and
-identity key and before admission: header version, `publish_kinds`,
+identity key and before admission: header version, `published_kinds`,
 `receive_capability`, then neither-publish-nor-receive. Every refusal is
 `ERROR_CODE_INVALID_REQUEST` with the one generic message "Invalid join request";
 the cause is only on `mc_session_join_failures_total{error_type}`
@@ -213,8 +221,14 @@ message JoinResponse {
   uint32 kek_rotation_debounce_seconds = 11;    // W (story 2); 0/absent = older MC
   reserved 12;                                  // was: max_receive_slots (deleted by MC-B)
   reserved "max_receive_slots";
-  optional uint32 max_audio_receive_slots = 13; // story 3: per-kind cap, informational; always set
-  optional uint32 max_video_receive_slots = 14; // story 3: per-kind cap, informational; always set; 0 = video off
+  reserved 13, 14;                              // was: max_audio/video_receive_slots (2026-10-25)
+  reserved "max_audio_receive_slots", "max_video_receive_slots";
+  repeated ReceiveSlotCap receive_slot_caps = 15; // per-kind cap, informational; one per known kind; 0 = off
+}
+
+message ReceiveSlotCap {
+  MediaKind media_kind = 1;
+  uint32 max_slots = 2;
 }
 
 message Participant {
@@ -224,6 +238,23 @@ message Participant {
   uint64 joined_at = 4;
   optional uint32 sender_id = 5;
   bytes identity_public_key = 6;                // raw Ed25519, 32 bytes
+  reserved 7, 8;                                // was: audio/video_client_muted (2026-10-25)
+  reserved "audio_client_muted", "video_client_muted";
+  repeated MediaKindState media_states = 9;     // exactly one per known kind (CONVENTIONS §6)
+}
+
+message MediaKindState {
+  MediaKind media_kind = 1;
+  ClientMediaState client_state = 2;            // UNSPECIFIED is malformed
+  bool server_muted = 3;
+  string server_muted_by = 4;                   // empty iff not server-muted
+}
+
+enum ClientMediaState {
+  CLIENT_MEDIA_STATE_UNSPECIFIED = 0;
+  CLIENT_MEDIA_STATE_NOT_PUBLISHED = 1;
+  CLIENT_MEDIA_STATE_LIVE = 2;
+  CLIENT_MEDIA_STATE_CLIENT_MUTED = 3;
 }
 
 message MediaServerInfo {
@@ -250,6 +281,11 @@ violation the client surfaces loudly, and the value is per session.
 > `max_receive_slots` (absent on the wire). MC-B (2026-10-23) deleted it and
 > reserved tag 12 and the name. `MC_MAX_RECEIVE_SLOTS` is no longer read.
 > The normative rules are on the two per-kind fields in `signaling.proto`.
+>
+> **Superseded 2026-10-25 (CONVENTIONS §6).** Tags 13/14 are reserved; the
+> per-kind caps ride `receive_slot_caps` (tag 15), one `ReceiveSlotCap` per
+> known kind (`VIDEO_SCREEN` at 0). Same values, same truncation semantics; the
+> normative rules are on `receive_slot_caps` in `signaling.proto`.
 
 **`sender_id` (ADR-0036 §2).** The joiner's per-meeting numeric sender id, and the
 first half of the attribution chain. A `uint32` on the wire carrying 16-bit
@@ -578,6 +614,20 @@ client reports itself muted, which is what makes unmute instantaneous and keeps
 > (`mc_media_mute_requests_rejected_total`). Client mute is a `PAUSED` source at MH
 > (never an ingress drop); server mute is the directive withdrawal plus
 > `DROP_AT_INGRESS`.
+>
+> **Superseded 2026-10-25 (ADR-0036 §5 amendment 2026-10-25; CONVENTIONS §6).**
+> Every per-kind fact is a repeated entry keyed by `MediaKind`, not a field pair:
+> `MuteRequest.changes` / `ServerMuteRequest.changes` (`MuteChange{media_kind,
+> muted}`), `UnmuteRequest.media_kinds`, and the snapshots
+> `Participant.media_states` / `ParticipantMuteUpdate.media_states`
+> (`MediaKindState`, exactly one entry per known kind). A request list that is
+> empty, names a duplicate, `MEDIA_KIND_UNSPECIFIED`/an unknown number, or a kind
+> the subject does not publish (`VIDEO_SCREEN` always) is refused whole and
+> counted on `mc_media_mute_requests_rejected_total{surface, reason}`; a host's
+> `not_published` server mute replies byte-identically to an unknown target.
+> `UnmuteResponse` is deleted (tag 10 reserved on both envelopes) and the
+> post-join server-mute replay is retired: the roster snapshot carries it. There
+> is no compatibility tolerance — MC and client deploy and revert together.
 
 
 #### StreamQualityUpdate (Bidirectional)

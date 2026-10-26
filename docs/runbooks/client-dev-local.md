@@ -1589,8 +1589,8 @@ replaces static fill.
 never fill. Audio from the kept slots plays normally.
 
 **Why.** N and M are REQUESTS. Each kind has its own server cap (`MC_MAX_AUDIO_RECEIVE_SLOTS`,
-`MC_MAX_VIDEO_RECEIVE_SLOTS`, advertised on `JoinResponse.max_audio_receive_slots` /
-`max_video_receive_slots`). MC **truncates** an over-cap declaration: it keeps the
+`MC_MAX_VIDEO_RECEIVE_SLOTS`, advertised on `JoinResponse.receive_slot_caps`, one entry
+per kind). MC **truncates** an over-cap declaration: it keeps the
 lowest ids up to the cap and reports every excess slot `unavailable`, permanently for that
 declaration — visible, never a join failure. A video cap of 0 is the video-off lever (story 3
 R-26): every video slot reads `unavailable`. The SDK no longer pre-checks the cap; MC is the only
@@ -1602,9 +1602,11 @@ authority. Caps are read once at MC startup, so a cap change applies after the M
   line `[dt-media-slots] publishing [...]; declared N=... audio (...), M=... video (...); server
   caps audio ..., video ...`. `source: default` means the variable was not set and the SDK default
   applied. `serverCapState` should read `known` for BOTH kinds (a video cap of 0 is legal and
-  reads `known`). **`serverCapState: unknown` is a FAULT**: MC always sends both per-kind caps, so
-  `unknown` means the controller stopped sending one (or a pre-story-3 controller is serving) —
-  check the MC image and its startup line's `max_audio_receive_slots` / `max_video_receive_slots`.
+  reads `known`). `serverCapState: unknown` appears only BEFORE the join: a join response without
+  a complete `receive_slot_caps` fails the join (`CONTRACT_FAULT`, a `[dt-signaling-contract]`
+  console WARN, `failure_stage="mc_join_response"`), so a joined session never reads `unknown`.
+  For the configured caps, see the MC startup line's `max_audio_receive_slots` /
+  `max_video_receive_slots`.
 - In the cluster: truncation shows on `mc_media_slot_states_total{slot_state="unavailable"}`
   beside `mc_media_receive_slot_cap{media_kind}` — see the receive-capability section of
   [`mc-incident-response.md`](mc-incident-response.md). (Story 2's whole-declaration rejection,

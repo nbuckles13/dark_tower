@@ -247,6 +247,59 @@ the omission reads as a decision rather than an oversight.
    only in the direction where a real value collapses to the fail-closed
    reading; check that before relying on it.
 
+### 6. Kind-keyed repeated fields: every per-kind fact is keyed by `MediaKind`
+
+Added 2026-10-25 (ADR-0036 §5 amendment of that date). A fact that varies by
+media kind is a **repeated entry keyed by `MediaKind media_kind`**, never a
+hand-named pair of fields (`audio_muted` / `video_muted`). A pair encodes the
+kind in the field NAME, so a new kind becomes a schema change at every site and
+a consumer can read one half and forget the other.
+
+```proto
+message MuteChange { MediaKind media_kind = 1; bool muted = 2; }
+message MuteRequest { repeated MuteChange changes = 3; }
+```
+
+**A kind-keyed repeated field is a MAP BY KIND: at most one entry per kind.**
+The rules, stated once here and cited by the field comments:
+
+- **A receiver of a CLIENT message (MC)** rejects the WHOLE message -- a
+  generic reply, counted, nothing applied, never a partial apply -- when any
+  entry names `MEDIA_KIND_UNSPECIFIED`, an unknown enum number (MC is
+  authoritative on what it serves, so "unknown number" is read as
+  UNSPECIFIED), or a kind the context does not serve, or when two entries name
+  one kind (judged on the kind alone, whatever their values). An EMPTY request
+  list (`MuteRequest`, `ServerMuteRequest`, `UnmuteRequest`) is refused the
+  same way. A well-formed entry that is semantically inapplicable (a kind the
+  subject does not publish) is the message's own semantics, stated at the
+  message.
+- **On a REQUEST an absent kind means "unchanged"**; a present entry with a
+  `false` value is an explicit change (an unmute), never "unchanged".
+- **On a SNAPSHOT a server sends** (`Participant.media_states`,
+  `ParticipantMuteUpdate.media_states`, `JoinResponse.receive_slot_caps`) the
+  sender MUST emit **exactly one entry per KNOWN non-UNSPECIFIED `MediaKind`**,
+  `VIDEO_SCREEN` included (as its defined constant while it has no
+  semantics: `NOT_PUBLISHED`, not server-muted, 0 slots). There is no "absent =
+  unknown" state.
+- **A client receiving a snapshot** treats as a PROTOCOL ERROR -- the session
+  fails loudly, nothing is applied and nothing is guessed -- a MISSING entry for
+  a kind it knows, a duplicate, `MEDIA_KIND_UNSPECIFIED` or an unknown kind
+  NUMBER, or an UNSPECIFIED/unknown value of an enum-typed entry field (e.g.
+  `ClientMediaState`). There is no compatibility tolerance: MC and client deploy
+  and revert together. It validates a `VIDEO_SCREEN` entry like any other kind
+  and does not check its value.
+- **Enum zero values are UNSPECIFIED and malformed** wherever they are read
+  in a kind-keyed entry (e.g. `CLIENT_MEDIA_STATE_UNSPECIFIED`): never a
+  display state.
+
+**Enforcement**: `dt-guard proto-per-kind-fields`
+(`scripts/guards/simple/validate-proto-per-kind-fields.sh`) fails any field
+whose name carries a media-kind token. Its vocabulary is DERIVED from the
+`MediaKind` enum plus a short synonym list, and its allow-list ships empty;
+both live in `crates/dt-guard/src/proto_per_kind_fields.rs`, which is the one
+place to read them. `reserved` names are exempt structurally (history stays
+greppable). A reasoned exception is a policy change with @protocol.
+
 ## Why STANDARD, not a custom ruleset
 
 We adopted the full buf STANDARD ruleset rather than carving exceptions because

@@ -256,7 +256,7 @@ then, deliberately; do not widen `keep_keys` to make the finding go away.
   - `failure_stage`: `none` (on success), `signup`, `credential_invalid`,
     `gc_create_token`, `gc_join`, `mc_signaling_connect`, `mc_join_response`,
     `mh_connect`, `internal`
-- **Cardinality**: Low (2 statuses × 9 stages = 18, before implicit labels).
+- **Cardinality**: Low (one series per status × stage, before implicit labels).
 - **Emission honesty** (task #14 — which stages the browser client actually
   emits):
   - `gc_create_token` is **RESERVED, never emitted by this client**. The browser
@@ -351,8 +351,11 @@ then, deliberately; do not widen `keep_keys` to make the finding go away.
   the success×{auth_failed,timeout,…} cells are unreachable by design; dashboards
   should not read them as a gap. On **failure**, `close_reason` is mapped from the
   bounded `SignalingErrorCode` (`Unauthorized`/`Forbidden`→`auth_failed`,
-  `Timeout`→`timeout`, `InternalError`→`server_error`, else
-  `normalizeCloseReason(closeCode)`) — the join-reject `SignalingError` usually
+  `Timeout`→`timeout`, `InternalError` and `ContractFault`→`server_error`, else
+  `normalizeCloseReason(closeCode)`) — a `ContractFault` is the client closing
+  on a malformed kind-keyed snapshot from MC (CONVENTIONS §6), a server error and
+  never `normal`; a fault AFTER the join closes the connection but emits nothing
+  here (this metric is join-scoped). The join-reject `SignalingError` usually
   carries no numeric `closeCode`, so the code-based mapping alone would collapse
   to `unknown`; the `SignalingErrorCode` mapping preserves the real signal on the
   common failure paths.

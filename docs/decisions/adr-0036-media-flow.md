@@ -1061,6 +1061,44 @@ QUIC's connection-level keepalive** (§1), not by media flow, so a long mute doe
 >   - No per-participant, per-toggle log or metric carrying participant identity at info level or
 >     above on the fan-out path; counters with bounded labels only.
 
+> **Amendment (2026-10-25, story 3 — every per-kind fact keyed by `MediaKind`; no unknown state).**
+> The three amendments above stay visible; this supersedes, without editing them, the 2026-10-24
+> amendment's field-level carriers ("`Participant.*_client_muted`", "set iff MC knows", "absent =
+> unknown", "the post-join replay"). Human decision of 2026-10-24/25; wire rulings by @protocol,
+> security confirmed (story Design §Wire freeze Amendment 6).
+>
+> - **(a) The join carries the initial client mute.** `JoinRequest.published_kinds` names each
+>   published kind and its client mute at join (empty = receive-only). MC therefore knows every
+>   kind's state at admission (published kinds LIVE or CLIENT_MUTED, every other kind
+>   NOT_PUBLISHED), and **there is no "unknown" state**: the R-15 post-join report and the
+>   "unknown until it lands" window are gone. A participant that joins muted is PAUSED at MH from its
+>   first registration snapshot.
+> - **(b) Refusal, not ignore.** A client mute, server mute or unmute request that names a kind the
+>   subject does not publish (`VIDEO_SCREEN` included: nobody publishes it) is refused WHOLE --
+>   nothing applied, not even a published kind in the same request -- counted on the kind-free
+>   `mc_media_mute_requests_rejected_total{reason="not_published"}`. A server mute's check runs in
+>   the meeting actor after authority and the target lookup, and answers with the same reply as an
+>   unknown target. Malformed kind lists (empty, unspecified/unknown kind, duplicate) are refused the
+>   same way (docs/protocol/CONVENTIONS.md §6).
+> - **(c) Per-kind server-mute attribution; one carrier.** `MediaKindState.server_muted_by` names
+>   each kind's own imposer, empty iff that kind is not server-muted, so an unmute of one kind never
+>   re-attributes the other's; the message-level `server_muted_by` and its recency rule are gone.
+>   Every roster entry (`Participant.media_states`) and every `ParticipantMuteUpdate` carries the
+>   FULL per-kind state -- client state, server mute, imposer -- exactly one entry per known kind
+>   (`VIDEO_SCREEN` as NOT_PUBLISHED / not server-muted until screen share has mute semantics). The
+>   post-JoinResponse server-mute replay is retired: the roster entry carries it, so two carriers
+>   can no longer disagree. A joiner still learns its OWN server mute only from its own update (a
+>   fresh join starts server-unmuted).
+> - **(d) S-2 stays reversed.** The per-meeting client-mute fan-out bound is unchanged; a join no
+>   longer drives it (each joiner's state rides its own `ParticipantJoined`), and a reconnect's
+>   declared client mute is adopted through the same merge and the same bound as a `MuteRequest`.
+> - **(e) Malformed per-kind data fails loudly; no compatibility layer.** Every server snapshot
+>   (`media_states`, `JoinResponse.receive_slot_caps`) carries exactly one entry per known kind; a
+>   client treats a missing, duplicate, unspecified or unknown kind (or an unknown client state) as a
+>   protocol error and ends the session loudly (CONVENTIONS §6). No old client or MC exists (human
+>   direction, 2026-10-25), so nothing is tolerated for compatibility: **MC and client deploy and
+>   revert together.**
+
 ---
 
 ## 6. What clients receive
