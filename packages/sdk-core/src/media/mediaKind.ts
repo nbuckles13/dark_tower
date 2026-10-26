@@ -8,8 +8,8 @@
 // The wire enum is mapped onto these in ONE place,
 // `signaling/slotStateMap.ts:mediaKindToken` (closed, fail-closed to
 // `unknown`), and back in `wireMediaKind`. The metric label vocabulary
-// (`setup/mediaMetrics.ts:MEDIA_KIND_LABELS`) is a separate, telemetry-owned
-// projection with its own rules.
+// (`setup/mediaMetrics.ts:MEDIA_KIND_LABEL_PROJECTION`, keyed by the wire enum)
+// is a separate, telemetry-owned projection with its own rules.
 
 /** The two media kinds this SDK publishes, declares and mutes. */
 export type MediaKindToken = 'audio' | 'video';

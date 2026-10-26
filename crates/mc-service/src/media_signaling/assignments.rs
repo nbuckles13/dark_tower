@@ -529,9 +529,7 @@ mod tests {
             .iter()
             .map(|a| {
                 (
-                    MediaKind::try_from(a.media_kind)
-                        .ok()
-                        .and_then(MediaKindLabel::from_proto),
+                    crate::media_kind::served_kind(a.media_kind).ok(),
                     a.slot_state,
                 )
             })

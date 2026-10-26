@@ -25,12 +25,14 @@ use dt_guard::gsa_sync;
 use dt_guard::histogram_buckets;
 use dt_guard::infrastructure_metrics;
 use dt_guard::instrument_skip_all;
+use dt_guard::internal_proto_no_key_material;
 use dt_guard::knowledge_index;
 use dt_guard::kustomize;
 use dt_guard::media_telemetry_deny;
 use dt_guard::metric_coverage;
 use dt_guard::metric_labels;
 use dt_guard::no_insecure_browser_flags;
+use dt_guard::proto_no_any;
 use dt_guard::proto_per_kind_fields;
 use dt_guard::release_build_profile;
 use dt_guard::rust_log_secrets;
@@ -103,6 +105,26 @@ enum Command {
     /// Standing prohibition on browser/test-harness settings that disable
     /// certificate validation, disable web security, or force an insecure origin.
     NoInsecureBrowserFlags {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// No proto may use `google.protobuf.Any`: the premise of buf.yaml's
+    /// `MESSAGE_NO_DELETE` exception (docs/protocol/CONVENTIONS.md §Enforcement).
+    ProtoNoAny {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// No key material crosses the MC->MH contract (ADR-0036 §4), mechanised
+    /// for `proto/dark_tower/internal/v1/internal.proto`.
+    InternalProtoNoKeyMaterial {
         /// Repository root for path resolution.
         #[arg(long)]
         root: PathBuf,
@@ -473,6 +495,10 @@ fn run(cli: Cli) -> Result<()> {
         Command::DashboardPanels { root, explain } => dashboard_panels::run(&root, explain),
         Command::NoInsecureBrowserFlags { root, explain } => {
             no_insecure_browser_flags::run(&root, explain)
+        }
+        Command::ProtoNoAny { root, explain } => proto_no_any::run(&root, explain),
+        Command::InternalProtoNoKeyMaterial { root, explain } => {
+            internal_proto_no_key_material::run(&root, explain)
         }
         Command::ProtoPerKindFields { root, explain } => proto_per_kind_fields::run(&root, explain),
         Command::ReleaseBuildProfile { root, explain } => {

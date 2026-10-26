@@ -38,8 +38,12 @@ fn write_loading_apparatus(root: &Path) {
         "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n\
          configMapGenerator:\n  - name: prometheus-rules\n    files:\n      - rules/mc-alerts.yaml\n",
     );
-    common::write(root, RUNBOOK_OK, "# runbook\n");
+    common::write(root, RUNBOOK_OK, RUNBOOK_BODY);
 }
+
+/// The runbook every fixture carries: one PromQL span naming BOTH kind labels,
+/// so the docs kind-label pass is non-vacuous and clean.
+const RUNBOOK_BODY: &str = "# runbook\n\n`x{media_kind=\"video\", content_kind=\"main\"}`\n";
 
 /// One alert file with a single `MyAlert` rule. Each argument is the field to
 /// perturb; the defaults (via [`valid_alert`]) are all-valid.
@@ -92,6 +96,35 @@ fn write_with_apparatus(root: &Path, alert: &str) {
 
 fn negatives() -> Vec<Case> {
     vec![
+        // doc_promql_vacuous: the docs pass sees no kind-naming PromQL span (a
+        // runbook with prose only) — it verified nothing.
+        Case {
+            name: "doc_promql_vacuous",
+            build: |root| {
+                write_with_apparatus(root, &valid_alert());
+                common::write(root, RUNBOOK_OK, "# runbook\n");
+            },
+            expect: Expect::Exact(&["doc_promql_vacuous"]),
+        },
+        // kind_label_co_occurrence: the expr names `media_kind` but not
+        // `content_kind` (everything else valid).
+        Case {
+            name: "kind_label_co_occurrence",
+            build: |root| {
+                write_with_apparatus(
+                    root,
+                    &alert_yaml(
+                        RUNBOOK_OK,
+                        "warning",
+                        "5m",
+                        "sum by (media_kind) (rate(mc_x_total[5m])) > 0",
+                        "all good here",
+                        false,
+                    ),
+                );
+            },
+            expect: Expect::Exact(&["kind_label_co_occurrence"]),
+        },
         // runbook_url branch (i): repo-root escape → resolve_cited_path None.
         Case {
             name: "runbook_url_repo_root_escape",
@@ -211,7 +244,7 @@ fn negatives() -> Vec<Case> {
         Case {
             name: "rule_file_loading",
             build: |root| {
-                common::write(root, RUNBOOK_OK, "# runbook\n");
+                common::write(root, RUNBOOK_OK, RUNBOOK_BODY);
                 common::write(
                     root,
                     "infra/docker/prometheus/rules/mc-alerts.yml",

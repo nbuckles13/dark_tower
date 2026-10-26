@@ -124,12 +124,16 @@ groups:
       # it and does the discriminating work (MCMediaMissingKeyMaterial shape).
       # In Rust the "patched client" is the OTLP post (env-tests are not a
       # browser).
+      # 2026-10-26 (series identity, not traffic): content_kind="main" is
+      # co-selected with media_kind="video" — this rule is tuned for CAMERA
+      # video; screen share (content_kind="screen") gets its own rules when it
+      # ships rather than silently joining this one.
       # DEMONSTRATION (ADR-0036 §11, both halves):
       #   | FIRE  | env-test 31: OTLP post of sender_server_muted video drops under a marker | marked expr empty before, non-empty after |
       #   | APPLY | names: client-metrics-export rule 2; label values: web-app clientMetricNames.test.ts; live pipe: browser read-backs | every selector term binds to an emitted name/value |
       - alert: ClientVideoServerMutedSenderFrames
         expr: |
-          sum(rate(dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video"}[5m])) > 0
+          sum(rate(dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video", content_kind="main"}[5m])) > 0
         for: 10m
         labels:
           severity: warning
@@ -156,18 +160,22 @@ groups:
       # counter exists to make it fps-free (recovery_requests_sent
       # {source="decoder_error"} is the same event). Guard on the denominator;
       # 1% is the rule's own policy.
+      # 2026-10-26 (series identity, not traffic): content_kind="main" is
+      # co-selected with media_kind="video" — this rule is tuned for CAMERA
+      # video; screen share (content_kind="screen") gets its own rules when it
+      # ships rather than silently joining this one.
       # DEMONSTRATION (ADR-0036 §11, both halves):
       #   | FIRE  | env-test 31: OTLP post of decoder errors and accepted frames under a marker | marked expr empty before, non-empty after |
       #   | APPLY | names: client-metrics-export rule 2; label values: web-app clientMetricNames.test.ts; live pipe: browser read-backs | every selector term binds to an emitted name/value |
       - alert: ClientVideoDecodeErrorRatio
         expr: |
           (
-            sum(rate(dt_client_media_decoder_errors_total{media_kind="video"}[5m]))
+            sum(rate(dt_client_media_decoder_errors_total{media_kind="video", content_kind="main"}[5m]))
             /
-            sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[5m]))
+            sum(rate(dt_client_media_frames_accepted_total{media_kind="video", content_kind="main"}[5m]))
           ) > 0.01
           and
-          sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[5m])) > 0
+          sum(rate(dt_client_media_frames_accepted_total{media_kind="video", content_kind="main"}[5m])) > 0
         for: 10m
         labels:
           severity: warning
@@ -195,19 +203,23 @@ groups:
       # cannot fire this, a fleet pattern does. `for: 5m` with [5m]
       # (departure from the task's 15m, recorded): observations are sparse and
       # land at exit, so `for:` must not exceed the window. media_kind="video"
-      # on both selectors (only video emits it; keeps the rule on the
-      # runbooks' series). The gauge dt_client_media_slots_unfulfilled is
-      # PANEL-ONLY (last-writer-wins). If no MC is scraped the RHS is empty and
+      # (with content_kind="main", 2026-10-26) on both selectors (only video
+      # emits it; keeps the rule on the runbooks' series). The gauge
+      # dt_client_media_slots_unfulfilled is PANEL-ONLY (last-writer-wins). If no MC is scraped the RHS is empty and
       # the rule cannot evaluate (MCDown). A9's FIRE observation is derived
       # from the live MC gauge, never a literal.
+      # 2026-10-26 (series identity, not traffic): content_kind="main" is
+      # co-selected with media_kind="video" — this rule is tuned for CAMERA
+      # video; screen share (content_kind="screen") gets its own rules when it
+      # ships rather than silently joining this one.
       # DEMONSTRATION (ADR-0036 §11, both halves):
       #   | FIRE  | env-test 31: OTLP histogram observation above the gauge-derived bound | marked expr empty before, non-empty after |
       #   | APPLY | names: client-metrics-export rule 2; label values: web-app clientMetricNames.test.ts; live pipe: browser read-backs | every selector term binds to an emitted name/value |
       - alert: ClientVideoSlotUnfulfilled
         expr: |
-          histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[5m]))) > 10 * 1000 * max(mc_media_video_keyframe_min_interval_seconds)
+          histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video", content_kind="main"}[5m]))) > 10 * 1000 * max(mc_media_video_keyframe_min_interval_seconds)
           and
-          sum(rate(dt_client_media_slot_unfulfilled_duration_ms_count{media_kind="video"}[5m])) > 0
+          sum(rate(dt_client_media_slot_unfulfilled_duration_ms_count{media_kind="video", content_kind="main"}[5m])) > 0
         for: 5m
         labels:
           severity: warning

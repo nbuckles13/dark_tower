@@ -1041,8 +1041,10 @@ describe('every media metric stays aggregate across senders', () => {
       // Story 2 task 13: `dt_client_media_capture_source{mode}` — build-time,
       // identity-free, datapoint-only (GC MEDIA_DATAPOINT_EXTRA / keep_keys).
       'mode',
-      // Story 3 OBS-A: the closed `media_kind` {audio, video} on per-kind series.
+      // Story 3 OBS-A: the closed `media_kind` {audio, video} on per-kind series,
+      // co-carried with `content_kind` {main, screen} (2026-10-26).
       'media_kind',
+      'content_kind',
     ]);
     const FORBIDDEN = /sender|meeting|stream|participant|slot/;
     for (const m of recorded) {

@@ -9,7 +9,7 @@
 
 ## Proto Definitions
 - Signaling (client↔MC) → `proto/dark_tower/signaling/v1/signaling.proto`; internal (service↔service) → `proto/dark_tower/internal/v1/internal.proto`
-- Codegen build script + skip_debug → `crates/proto-gen/build.rs`; re-exports, module wiring, redacting Debug → `crates/proto-gen/src/lib.rs`
+- Codegen build script + skip_debug → `crates/proto-gen/build.rs`; re-exports, module wiring, redacting Debug → `crates/proto-gen/src/lib.rs`; No-`Any` guard (MESSAGE_NO_DELETE premise) → `crates/dt-guard/src/proto_no_any.rs`; MediaKind → metric-label projection → `crates/mc-service/src/media_kind.rs:KindLabels::from_proto` + `packages/sdk-core/src/media/setup/mediaMetrics.ts:MEDIA_KIND_LABEL_PROJECTION`, table in `docs/observability/label-taxonomy.md`, drift legs in `media_kind.rs` tests + `crates/dt-guard/src/client_metrics_export.rs`
 
 ## Media Protocol Crate (frame header v3, ADR-0036 §2 + Appendix)
 - Crate root; no-crypto/no-telemetry scope, lint denies → `crates/media-protocol/src/lib.rs`
@@ -27,7 +27,7 @@
 - DisconnectReason enum (bounded for metrics)
 
 ## ADR-0036 MC→MH Control Plane (internal.proto, 2026-09-01 reshape)
-All shapes in `internal.proto`. No-key-material rule → its header + `scripts/guards/simple/validate-internal-proto-no-key-material.sh`; server mute → `SourceStream.disposition` (`MutedSource` deleted by MC-B); teardown → `EndMeetingRequest`
+All shapes in `internal.proto`. No-key-material rule → its header + `dt-guard internal-proto-no-key-material` (`crates/dt-guard/src/internal_proto_no_key_material.rs`, wrapper `scripts/guards/simple/validate-internal-proto-no-key-material.sh`); server mute → `SourceStream.disposition` (`MutedSource` deleted by MC-B); teardown → `EndMeetingRequest`
 - Self-contained forwarding instruction (§6; NOT parallel lists) → `EgressStream`; empty-but-named meeting-level rules → `SelectionRules`
 - `sender_id`-is-meeting-scoped MUST (no global index; malformed rejects, not-yet-connected holds) → `SubscriberSlot`; key-id-pair source ref, not `MediaStream` (§7 type-blind) → `CandidateSource`
 - Output-derived generation, three-"generation" trap list, task-5/6 ordering constraint → `RegisterMeetingRequest.policy_generation`

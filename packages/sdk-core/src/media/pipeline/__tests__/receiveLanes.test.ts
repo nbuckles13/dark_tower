@@ -7,7 +7,8 @@
 import { describe, expect, it } from 'vitest';
 import { FakeAudioCodecs, InMemoryMetricsSink, RecordingPlaybackSink } from '@darktower/test-utils';
 
-import { MEDIA_KIND_LABELS, MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKind } from '../../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { ReceiveLanes, type SlotAssignment } from '../receiveLanes.js';
 
 async function settle(): Promise<void> {
@@ -25,11 +26,7 @@ function rig(opts: { declared?: number[]; pendingFrames?: number; maxLanes?: num
   const playback = new RecordingPlaybackSink();
   let faults = 0;
   const lanes = new ReceiveLanes({
-    metrics: new MediaKindMetrics(
-      { clientVersion: 'v', orgId: 'o' },
-      MEDIA_KIND_LABELS.Audio,
-      sink,
-    ),
+    metrics: new MediaKindMetrics({ clientVersion: 'v', orgId: 'o' }, MediaKind.AUDIO, sink),
     decoderFactory: codecs.decoderFactory as never,
     playback: playback as never,
     sampleRateHz: 48_000,

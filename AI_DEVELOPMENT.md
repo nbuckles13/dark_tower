@@ -105,7 +105,7 @@ Each specialist has one file, `docs/specialist-knowledge/{specialist}/INDEX.md`.
 docs/specialist-knowledge/security/INDEX.md
 - Service auth (OAuth 2.0 Client Credentials) → ADR-0003 | Key rotation → ADR-0008 | ...
 - sender_id allocation, never reused → crates/mc-service/src/media_admission/sender_id.rs:SenderIdAllocator::allocate()
-- No key material on the MC→MH contract → scripts/guards/simple/validate-internal-proto-no-key-material.sh
+- No key material on the MC→MH contract → crates/dt-guard/src/internal_proto_no_key_material.rs (wrapper scripts/guards/simple/validate-internal-proto-no-key-material.sh)
 ```
 
 **How it works**:

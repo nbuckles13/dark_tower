@@ -31,7 +31,8 @@ import { InMemoryMetricsSink } from '@darktower/test-utils';
 import { DEFAULT_CLIENT_CONFIG } from '../../../config/clientConfig.js';
 import { MeetingIdentity } from '../../setup/identity.js';
 import { kekHolderWith } from '../../__tests__/helpers.js';
-import { MEDIA_KIND_LABELS, MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKind } from '../../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { AES_256_KEY_BYTES } from '../../frame/sframe.js';
 import { decodeFrame } from '../../frame/frameCodec.js';
 import { parseSframe } from '../../frame/sframe.js';
@@ -90,11 +91,7 @@ async function makeRig(
   transmitKeys: TransmitKeyManager = new TransmitKeyManager(SENDER_ID),
 ): Promise<Rig> {
   const sink = new InMemoryMetricsSink();
-  const metrics = new MediaKindMetrics(
-    { clientVersion: 'v', orgId: 'o' },
-    MEDIA_KIND_LABELS.Audio,
-    sink,
-  );
+  const metrics = new MediaKindMetrics({ clientVersion: 'v', orgId: 'o' }, MediaKind.AUDIO, sink);
   const kekSource = kekHolderWith(KEK, 0);
   const identity = await MeetingIdentity.create();
   const senders = new Map<string, RecordingSender>();

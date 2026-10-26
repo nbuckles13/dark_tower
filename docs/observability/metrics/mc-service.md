@@ -350,32 +350,42 @@ it is bounded live in the taxonomy — it is the *first* home for a label that m
 one service emits. **Which labels a given metric carries** lives here. Neither is a
 copy of the other.
 
-### `media_kind` — which MC series carry it, and which are kind-free on purpose (story 3 R-29)
+### `media_kind` + `content_kind` — which MC series carry them, and which are kind-free on purpose (story 3 R-29; `content_kind` 2026-10-26)
 
-What the label is and its value set live in `docs/observability/label-taxonomy.md` (the
-`media_kind` row). The Rust vocabulary is `media_signaling::MediaKindLabel` (`ALL` +
-`label()`; `from_proto` maps the wire `MediaKind` exhaustively: `AUDIO`->`audio`,
-`VIDEO_CAMERA`->`video`, `VIDEO_SCREEN`->`video` with `content_kind` left uncarried,
-`UNSPECIFIED`->no label). Every recorder below takes the enum, never a string, so a call
-site that forgets the kind does not compile. The value always comes from MC's own state
-(a declared slot's kind, a directive stream's kind, which mute field a request names,
-the per-participant server-mute flags), never from a client string.
+What the labels are, their value sets and the projection from the wire `MediaKind` live
+in `docs/observability/label-taxonomy.md` (the `media_kind` / `content_kind` rows and the
+projection table). The Rust projection is `media_kind::KindLabels::from_proto`
+(`AUDIO`->`audio`/`main`, `VIDEO_CAMERA`->`video`/`main`, `VIDEO_SCREEN`->`video`/`screen`,
+`UNSPECIFIED`->no labels); a served kind's pair is `MediaKindLabel::labels()`, derived from
+that one projection. Every recorder below takes a `KindLabels`, never a string or a bare
+kind, so a call site cannot stamp `media_kind` without `content_kind` (all or none), and
+`dt-guard metric-labels` (`kind_label_literal`) fails any kind value that is not a
+projection `.label()` call. The kind always comes from MC's own state (a declared slot's
+kind, a directive stream's kind, which mute entry a request names, the per-participant
+server-mute flags), never from a client string. **No MC series carries `screen`**: no
+served kind projects to it (`served_kind` refuses `VIDEO_SCREEN`) — see the projection, not
+a count.
 
-**Per-kind** (carry `media_kind`): `mc_media_slot_states_total`,
+**Per-kind** (carry BOTH `media_kind` and `content_kind`): `mc_media_slot_states_total`,
 `mc_media_send_targets_total`, `mc_media_receive_slot_cap`, `mc_media_mute_requests_total`,
 `mc_media_server_mute_requests_total`, `mc_media_server_muted_sources`,
-`mc_media_send_directive_withdrawals_total`. Every new label combination, `video`
-included, is zero-initialised at startup; the receive-slot cap is instead SET at boot for
-both kinds from the configured caps (a `video` reading of 0 is the R-26 lever, not a
-zero-init). So **any MC `media_kind="video"` read-back is baseline -> rise;
-presence is vacuous** (`crates/env-tests/tests/36_mc_media_kind_labels.rs` is the audio
-precedent).
+`mc_media_send_directive_withdrawals_total`. Every new label combination over the SERVED
+pairs (`KindLabels::served()`: `audio`/`main`, `video`/`main`), `video` included, is
+zero-initialised at startup; the receive-slot cap is instead SET at boot for both kinds
+from the configured caps (a `video` reading of 0 is the R-26 lever, not a zero-init). So
+**any MC `media_kind="video", content_kind="main"` read-back is baseline -> rise; presence is vacuous**
+(`crates/env-tests/tests/36_mc_media_kind_labels.rs` is the audio precedent).
+
+**2026-10-26 — series identity, not traffic.** `content_kind` was added to every series
+above: each is a NEW series at rollout, so `rate()` / `increase()` across the deploy
+boundary and any alert `for:` timer reset. No traffic changed (every series reads `main`).
+Queries name both labels (label-taxonomy.md §query rule).
 
 **Kind-free on purpose — do not "fix" these by adding the label:**
 
 | Series | Why there is no honest kind |
 |---|---|
-| `mc_media_send_directives_total` | A `SendDirective` is composed per participant across ALL its streams, and its failure outcomes (`assignment_failed`, `meeting_state_unavailable`, `handler_url_unresolved`, `unknown_stream_number`, `transport_mode_unspecified`) occur before any stream exists. The kind split for directive activity is on `mc_media_send_targets_total` (here) and `mc_media_send_directive_withdrawals_total{media_kind, reason}`. |
+| `mc_media_send_directives_total` | A `SendDirective` is composed per participant across ALL its streams, and its failure outcomes (`assignment_failed`, `meeting_state_unavailable`, `handler_url_unresolved`, `unknown_stream_number`, `transport_mode_unspecified`) occur before any stream exists. The kind split for directive activity is on `mc_media_send_targets_total` (here) and `mc_media_send_directive_withdrawals_total{media_kind, content_kind, reason}`. |
 | `mc_media_unreachable_senders_total`, `mc_media_not_yet_connected_senders_total` | Unreachability / not-yet-connected is a property of a SENDER relative to a subscriber's handlers or connection, not of a kind. |
 | `mc_media_unmute_requests_total` | Its outcome (`relayed`, `not_server_muted`, `no_host_connected`, …) is decided ONCE per request across the kinds it names. A request refused for its kind list (empty, malformed, or naming an unpublished kind) is not counted here at all: it is on `mc_media_mute_requests_rejected_total{surface="unmute_request"}` (since 2026-10-25). |
 | `mc_media_slot_view_emissions_total`, `mc_media_receive_capability_declarations_total`, `mc_media_refusal_replies_suppressed_total` | Per participant / per declaration / per reply, not per kind. |
@@ -745,9 +755,9 @@ span would record as attributes, on a surface no guard covers.
 - **Description**: Slot states conveyed to subscribers (ADR-0036 §6)
 - **Labels**:
   - `slot_state`: `unspecified`, `active`, `withheld_by_congestion`, `fewer_sources_than_slots`, `source_unreachable`, `switch_pending`, `avatar_no_video`, `unavailable`, `avatar_client_muted`, `avatar_server_muted` (the story-3 flat-enum values, in the domain since P1, emitted since MC-A). Story 2's `source_muted` LEFT the domain on 2026-10-23 with its wire value (`SLOT_STATE_SOURCE_MUTED` deleted and reserved by MC-B): the series is now ABSENT, not flat, and no query may select it.
-  - `media_kind`: `audio`, `video` (`MediaKindLabel::ALL`; SSoT the `media_kind` row of `docs/observability/label-taxonomy.md`)
+  - `media_kind`: `audio`, `video`; `content_kind`: `main` (served kinds; `KindLabels::served()`; SSoT the `media_kind` / `content_kind` rows of `docs/observability/label-taxonomy.md`)
   - `key_custody`: single value `operator`
-- **Cardinality**: bounded at the type level by the proto `SlotState` enum, mirrored exhaustively by `media_signaling::slot_state_label`, x 2 kinds; the full `SLOT_STATES x MediaKindLabel::ALL` cross product is zero-initialised. `media_kind` is the DECLARED SLOT's kind (carried on the parsed `DeclaredSlot`), never a frame's. Both kinds move.
+- **Cardinality**: bounded at the type level by the proto `SlotState` enum, mirrored exhaustively by `media_signaling::slot_state_label`, x 2 served label pairs; the full `SLOT_STATES x KindLabels::served()` cross product is zero-initialised. `media_kind` is the DECLARED SLOT's kind (carried on the parsed `DeclaredSlot`), never a frame's. Both kinds move.
 - **The bucketed slot-state signal ADR-0036 §11 mandates**, joined to no identity: it answers *how many and how bad*; **MC's own assignment state answers *who***, at investigation time, in a system that legitimately holds that mapping. There is no per-slot series and must not be one.
 - **The label domain MIRRORS THE WIRE ENUM EXHAUSTIVELY** — every named `SlotState` variant, not only the ones MC can reach today. A hand-picked subset needs editing the moment §7 makes `switch_pending` live, and a `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be *visible* rather than absent. Keeping the vocabulary identical to the wire's is also what makes this distribution comparable with the client's.
 - **Emitted since story 3 MC-A**: `active`, `avatar_no_video`, `avatar_client_muted`, `avatar_server_muted`, `fewer_sources_than_slots`, `unavailable`. (`source_muted` is gone from the domain: an image that still emits it predates the story-3 cutover.)
@@ -768,11 +778,11 @@ span would record as attributes, on a surface no guard covers.
 - **Description**: Client `MuteRequest` dispositions (ADR-0036 §5 client mute)
 - **Labels**:
   - `outcome`: `applied`, `unchanged`, `rate_limited`, `actor_unavailable` (`applied_no_recompose`, unreachable since MC-A, was removed by MC-B on 2026-10-23; `not_published` MOVED on 2026-10-25 to `mc_media_mute_requests_rejected_total{reason="not_published"}`: both series are now absent here)
-  - `media_kind`: `audio`, `video` (`MediaKindLabel::ALL`; SSoT the `media_kind` row of `docs/observability/label-taxonomy.md`)
+  - `media_kind`: `audio`, `video`; `content_kind`: `main` (served kinds; `KindLabels::served()`; SSoT the `media_kind` / `content_kind` rows of `docs/observability/label-taxonomy.md`)
   - `key_custody`: single value `operator`
-- **Cardinality**: bounded at the type level by `MuteOutcome::ALL` x `MediaKindLabel::ALL`, zero-initialised as the full cross product
+- **Cardinality**: bounded at the type level by `MuteOutcome::ALL` x `KindLabels::served()`, zero-initialised as the full cross product
 - **COUNTING UNIT: one increment per (request, NAMED kind)**, not per request. A per-kind field ABSENT on the wire means "that kind unchanged" and is not counted; the SDK names only the kind it changed. **Counting-unit changes, none a traffic change:** story 3 OBS-A roughly DOUBLED every rate here (an interim in which MC applied and counted both kinds on every request), MC-B (2026-10-23) roughly HALVED it again (only named kinds count), and the story 3 R-15 fix (2026-10-24) added one `applied` per PUBLISHED kind per JOIN (the SDK's post-join report). **A fourth change, 2026-10-25 (ADR-0036 §5 amendment of that date), none a traffic change: `applied` no longer rises with join rate** -- the join's `published_kinds` carries the initial state, so there is no post-join report (the SDK's join-window catch-up sends only a kind toggled between building the JoinRequest and Joined, normally nothing). In the same change `not_published` MOVED to `mc_media_mute_requests_rejected_total{reason="not_published"}`, and a request naming a published kind plus an unpublished one, which used to count `applied` for the published kind, is now refused WHOLE and counts NOTHING here. A reconnect's declared client mute is not a `MuteRequest` and is not counted here (it does count a fan-out when it changes something; not production-reachable). Compare against last week accordingly. A request refused for its kind list (empty, malformed, or naming an unpublished kind) is not counted here: it is counted on `mc_media_mute_requests_rejected_total{surface="client_mute"}`. Request-level outcomes (`unchanged` short-circuit, `rate_limited`, `actor_unavailable`) count once per named kind; all run AFTER the kind-list check. Otherwise the outcome comes from the meeting actor's per-kind decision: a named kind is `applied` iff its client state moved (`LIVE` <-> `CLIENT_MUTED`), else `unchanged` — for `video` as for `audio`. There is no "first report" case: every kind is definite from the join. An applied change flips the stream's disposition FORWARD <-> `PAUSED` and re-emits `AVATAR_CLIENT_MUTED` to its holders.
-- **This metric PARTITIONS (mute report, named kind) pairs.** Every `MuteRequest` whose kind list passes validation lands in exactly one bucket PER NAMED KIND; whole-request refusals live on `mc_media_mute_requests_rejected_total`. `sum without (media_kind)` is (report, kind) pairs — reports received when every report names one kind, as the SDK's do.
+- **This metric PARTITIONS (mute report, named kind) pairs.** Every `MuteRequest` whose kind list passes validation lands in exactly one bucket PER NAMED KIND; whole-request refusals live on `mc_media_mute_requests_rejected_total`. `sum without (media_kind, content_kind)` is (report, kind) pairs — reports received when every report names one kind, as the SDK's do.
 - **THE SUCCESS SET IS `{applied}`.** The failure predicate is `outcome=~"rate_limited|actor_unavailable"`, **not** `outcome!="applied"` — that would count a routine state as a failure.
 - **THIS PREDICATE IS STATED POSITIVELY WHILE ITS TWO NEIGHBOURS ARE NEGATED, AND THAT IS DELIBERATE — do not harmonise it.** `mc_media_receive_capability_declarations_total` and `mc_media_send_directives_total` both use `outcome!~"..."`, which is correct for *them* because their success sets are closed and small. Here the enumeration is on the failure side, so **a variant added later defaults to NOT being counted as a failure** rather than silently joining the failure set the way a negated predicate would. A new disposition should have to be classified deliberately, not inherit "page-worthy" by omission. If a later pass makes these three consistent, it should move the others to positive form, not this one to negative.
   - `applied` — this kind's client state changed and was reported to the meeting actor, which owes every OTHER participant a roster fan-out (full `ParticipantMuteUpdate` snapshot, under the per-meeting bound — `mc_media_client_mute_fanouts_total`) and re-renders (the stream's `PAUSED` disposition rides `source_streams`) and re-emits the changed slot view to the subscribers HOLDING this source. Any composition failure on that re-emit is counted by the actor on `mc_media_send_directives_total` and `mc_media_slot_view_emissions_total{outcome="composition_failed"}` — it is no longer visible only in logs.
@@ -810,11 +820,11 @@ span would record as attributes, on a surface no guard covers.
 - **Type**: Counter
 - **Description**: `ServerMuteRequest` dispositions — a host's server mute of another participant (ADR-0036 §5, §7; story 2 R-8, R-9)
 - **Labels**:
-  - `action`: `mute`, `unmute` — the verb the request ASKED for **for that kind** (story 3: per kind, `ServerMuteAction::from_muted`), never its result. `changes: [{AUDIO, muted: true}, {VIDEO_CAMERA, muted: false}]` counts `action="mute",media_kind="audio"` AND `action="unmute",media_kind="video"`. Before story 3 it was request-level (`mute` if either kind was requested muted)
+  - `action`: `mute`, `unmute` — the verb the request ASKED for **for that kind** (story 3: per kind, `ServerMuteAction::from_muted`), never its result. `changes: [{AUDIO, muted: true}, {VIDEO_CAMERA, muted: false}]` counts `action="mute",media_kind="audio", content_kind="main"` AND `action="unmute",media_kind="video", content_kind="main"`. Before story 3 it was request-level (`mute` if either kind was requested muted)
   - `outcome`: `applied`, `unchanged`, `not_permitted`, `unknown_target`, `rate_limited`, `actor_unavailable`
-  - `media_kind`: `audio`, `video` (`MediaKindLabel::ALL`; SSoT the `media_kind` row of `docs/observability/label-taxonomy.md`)
+  - `media_kind`: `audio`, `video`; `content_kind`: `main` (served kinds; `KindLabels::served()`; SSoT the `media_kind` / `content_kind` rows of `docs/observability/label-taxonomy.md`)
   - `key_custody`: single value `operator`
-- **Cardinality**: 24 (2 x 6 x 2), bounded at the type level by `ServerMuteAction::ALL` x `ServerMuteOutcome::ALL` x `MediaKindLabel::ALL`, and **zero-initialised as the FULL cross product, unreachable cells included** — so an absent series means "not up or not scraped", never zero
+- **Cardinality**: 24 (2 x 6 x 2), bounded at the type level by `ServerMuteAction::ALL` x `ServerMuteOutcome::ALL` x `KindLabels::served()`, and **zero-initialised as the FULL cross product, unreachable cells included** — so an absent series means "not up or not scraped", never zero
 - **Deliberately SEPARATE from `mc_media_mute_requests_total`, and not merely because the names overlap.** Client mute and server mute differ in decider (the participant about itself versus a host about someone else), enforcement point (client capture, ADR-0036 §5, versus MH ingress, §7) and remedy. A merged series would make every existing client-mute query silently count moderation events.
 - **`action` is NOT A JOIN KEY with `dt_client_media_mute_transitions_total{action}`**, whose value set is byte-identical: that series is a local user's capture-side toggle, this one a host's moderation decision. Summing `by(action)` across the two metric names means nothing (`docs/observability/label-taxonomy.md`, the `action` row).
 - **COUNTING UNIT: one increment per (request, NAMED kind)**, in exactly one `outcome` per kind — so `sum()` is (request, named kind) pairs. An ABSENT per-kind field means "unchanged" and is not counted; the SDK names only the kind it changes. Rates roughly doubled at story 3 OBS-A (interim: both kinds applied and counted) and roughly HALVED at MC-B (2026-10-23) — counting unit, not traffic. Request-level refusals (`not_permitted`, `unknown_target`, `rate_limited`, `actor_unavailable`) count once per named kind with that kind's action. `applied`/`unchanged` are per named kind: the actor reports which kinds changed, and its whole-request `unchanged` is exactly "every named kind unchanged".
@@ -893,9 +903,9 @@ span would record as attributes, on a surface no guard covers.
 ### `mc_media_server_muted_sources`
 - **Type**: Gauge
 - **Description**: How many (participant, kind) sources MC believes are SERVER-muted right now, SUMMED across this pod's meetings
-- **Labels**: `media_kind` (`audio`, `video`), `key_custody` (single value `operator`)
+- **Labels**: `media_kind` (`audio`, `video`), `content_kind` (`main`), `key_custody` (single value `operator`)
 - **Cardinality**: 2 (one per kind), both present at zero from process start
-- **A STATE level, not an event rate.** Counting unit: server-muted (participant, kind) SOURCES in force on this MC pod — NOT mute events, and NOT participants: a participant server-muted on both kinds reads 1 on each kind. `sum without (media_kind)` is muted sources; `{media_kind="audio"}` is muted audio sources. Recomputed per (meeting, kind) by the census. A mute applied yesterday is still counted here; `mc_media_server_mute_requests_total` stays flat for it.
+- **A STATE level, not an event rate.** Counting unit: server-muted (participant, kind) SOURCES in force on this MC pod — NOT mute events, and NOT participants: a participant server-muted on both kinds reads 1 on each kind. `sum without (media_kind, content_kind)` is muted sources; `{media_kind="audio", content_kind="main"}` is muted audio sources. Recomputed per (meeting, kind) by the census. A mute applied yesterday is still counted here; `mc_media_server_mute_requests_total` stays flat for it.
 - **Present at zero from process start**, so ABSENT means "not up or not scraped", never "nobody is muted".
 - **Recomputed and `set` from live state, never delta-maintained.** Each meeting actor writes its ABSOLUTE count into a census; the controller's health walk prunes meetings that no longer exist and re-sets the pod total (the load-bearing publish), and every mute change also publishes (freshness only). So an actor that dies without running its exit path cannot leave a phantom count behind.
 - **Read it against MH's enforcement — at FLEET level, and directionally.** `sum(mc_media_server_muted_sources)` across MC instances AND kinds — since story 3 MC-A each kind's server mute reaches MH as that stream's `DROP_AT_INGRESS` disposition in `source_streams` (`media_routing/assignment.rs`), so a video server mute drops video at ingress just as an audio one drops audio (story 2 was audio only, and summing across kinds then manufactured a false disagreement) — against `sum(rate(mh_media_frames_dropped_total{reason="server_muted"}[5m]))` across MH instances. Per instance the comparison means nothing: MC and MH meeting sets do not nest (a meeting on mc-0 has edges on mh-0 and/or mh-1, and each handler serves both MCs). A level and a counter are NEVER divided. **Since MC-B (2026-10-23) gauge > 0 with fleet drops near zero is the NORMAL shape**: a server mute withdraws the kind's send directive, so a compliant client stops sending and MH has nothing to drop; the comparison now detects only a sender that ignored its empty targets. The primary MC-side evidence that a mute took is `mc_media_send_directive_withdrawals_total{reason="server_muted"}`. Gauge > 0 with flat drops is a CANDIDATE disagreement only after excluding, first, a compliant client that honoured the withdrawal (the dominant cause), then a muted participant who is silent, disconnected, in grace or not yet on a handler (and a server mute of a kind the participant does not publish has no stream to drop). Same class of caveat as `mc_media_generation_divergence`.
@@ -957,10 +967,10 @@ span would record as attributes, on a surface no guard covers.
 - **Type**: Counter
 - **Description**: Send targets carried on each emitted `SendDirective`, counted PER STREAM by that stream's kind (story 3: previously summed across streams, unlabelled)
 - **Labels**:
-  - `media_kind`: `audio`, `video` (`MediaKindLabel::ALL`; SSoT the `media_kind` row of `docs/observability/label-taxonomy.md`)
+  - `media_kind`: `audio`, `video`; `content_kind`: `main` (served kinds; `KindLabels::served()`; SSoT the `media_kind` / `content_kind` rows of `docs/observability/label-taxonomy.md`)
   - `key_custody`: single value `operator`
 - **Cardinality**: 2 (one per kind), zero-initialised
-- **Per stream, so the TOTAL is unchanged**: `sum without (media_kind)` equals the old summed value, so the dashboard's mean-targets ratio (`sum()/sum()`) reads the same. **The denominator `mc_media_send_directives_total` is kind-free**, so a per-kind version of that ratio needs `sum by (media_kind)(…targets…) / ignoring(media_kind) group_left sum(…directives…)` — a plain `by (media_kind)` on both sides matches nothing. Once video streams exist, total targets per directive rises with the number of streams (OBS-B re-derives the panel per kind)
+- **Per stream, so the TOTAL is unchanged**: `sum without (media_kind, content_kind)` equals the old summed value, so the dashboard's mean-targets ratio (`sum()/sum()`) reads the same. **The denominator `mc_media_send_directives_total` is kind-free**, so a per-kind version of that ratio needs `sum by (media_kind, content_kind)(…targets…) / ignoring(media_kind, content_kind) group_left sum(…directives…)` — a plain `by (media_kind, content_kind)` on both sides matches nothing. Once video streams exist, total targets per directive rises with the number of streams (OBS-B re-derives the panel per kind)
 - **The co-location objective, made observable.** A sender sends to every handler owning one of its edges (ADR-0036 §9 multi-handler send), and MC's edge policy minimises that. Mean targets per emitted directive: `rate(mc_media_send_targets_total[5m]) / rate(mc_media_send_directives_total{outcome="emitted"}[5m])` — ~1 when participants reach every handler; above 1 only with genuinely partial connectivity. A sustained rise with healthy connectivity means co-location has degraded, which shows up otherwise only as client uplink cost.
 - **Only CHANGED directives are recorded** (same boundary as `emitted`), so this is emission-weighted too.
 - **Usage**: Are senders being spread across handlers more than connectivity requires?
@@ -1019,7 +1029,7 @@ span would record as attributes, on a surface no guard covers.
 - **Type**: Gauge
 - **Description**: The configured maximum receive slots per declaration, per kind (`MC_MAX_AUDIO_RECEIVE_SLOTS` for `audio`, `MC_MAX_VIDEO_RECEIVE_SLOTS` for `video`)
 - **Labels**:
-  - `media_kind`: `audio`, `video` — BOTH published at boot. **A `media_kind="video"` reading of 0 is how an operator confirms the R-26 video-off lever applied** (`MC_MAX_VIDEO_RECEIVE_SLOTS=0`; audio's floor is 1)
+  - `media_kind`: `audio`, `video`; `content_kind`: `main` — BOTH published at boot. **A `media_kind="video", content_kind="main"` reading of 0 is how an operator confirms the R-26 video-off lever applied** (`MC_MAX_VIDEO_RECEIVE_SLOTS=0`; audio's floor is 1)
   - `key_custody`: single value `operator`
 - **Cardinality**: 2
 - **A CONFIG ECHO, NOT A UTILISATION GAUGE.** Set once, when the WebTransport server is built, from the very `ClientMediaConfig::max_receive_slots` every declaration is truncated against — so the published caps, the enforced caps and the `JoinResponse.receive_slot_caps` entries (tag 15, one per kind) clients read are one value per kind. Caps are read ONCE at startup; a change applies after the MC restart, and live slot vectors are never re-truncated. There is no numerator: do not build a "slots used / cap" ratio on it.
@@ -1032,10 +1042,10 @@ span would record as attributes, on a surface no guard covers.
 - **Type**: Counter
 - **Description**: Stream WITHDRAWALS: a delivered `SendDirective` whose stream of this kind went from non-empty to EMPTY targets (story 3 R-8)
 - **Labels**:
-  - `media_kind`: `audio`, `video` (`MediaKindLabel::ALL`; SSoT the `media_kind` row of `docs/observability/label-taxonomy.md`)
+  - `media_kind`: `audio`, `video`; `content_kind`: `main` (served kinds; `KindLabels::served()`; SSoT the `media_kind` / `content_kind` rows of `docs/observability/label-taxonomy.md`)
   - `reason`: `unwatched` (nobody holds this stream in a slot any more; emitted since MC-A), `server_muted` (the kind was server-muted, so its directive is withdrawn whatever its watchers; emitted since MC-B)
   - `key_custody`: single value `operator`
-- **Cardinality**: 4 (`MediaKindLabel::ALL` x `WithdrawalReason::ALL`), zero-initialised as the full cross product
+- **Cardinality**: 4 (`KindLabels::served()` x `WithdrawalReason::ALL`), zero-initialised as the full cross product
 - **Counted per TRANSITION, never per re-render.** A re-sent directive whose stream already had empty targets does not count, and a reconnect's fresh view does not count. The reason is the CURRENT cause at delivery: `server_muted` if that kind is server-muted, else `unwatched`. A server mute of an already-unwatched (already-empty) stream is no transition and counts nothing; a server UNMUTE is never counted (the restoration shows as `mc_media_send_directives_total{outcome="emitted"}`). Every kind in the participant's publish set is ALWAYS listed on the directive (audio stream 0 first, video stream 1); an unwatched kind is listed with empty targets, an unpublished kind never — so a withdrawal is a listed stream going empty.
 - **Counted on DELIVERY, unlike `mc_media_send_directives_total` (composition).** A withdrawal whose delivery failed is visible only on `mc_media_slot_view_emissions_total{outcome="delivery_failed"}`.
 - **A withdrawal is NOT media failure.** Nobody watching a camera is routine, and so is a host's server mute. Read it beside `mc_media_send_directives_total{outcome="emitted_empty_targets"}` before concluding anything is broken.

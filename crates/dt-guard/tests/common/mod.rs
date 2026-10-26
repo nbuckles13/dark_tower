@@ -352,6 +352,33 @@ pub fn source_rule_ids(guard_src_basename: &str) -> BTreeSet<String> {
         .unwrap_or_else(|e| panic!("reading guard source {}: {e}", path.display()));
     let mut out = BTreeSet::new();
     for line in src.lines() {
+        // A rule id SHARED across guards lives in `src/common/<module>.rs` and
+        // is re-exported by each host as one line:
+        // `pub use crate::common::<module>::<IDENT>_RULE_ID;`. Resolve it there,
+        // so the shared id is in this guard's inventory without a restated literal.
+        if let Some(path) = line
+            .trim_start()
+            .strip_prefix("pub use crate::common::")
+            .and_then(|r| r.strip_suffix(';'))
+        {
+            if let Some((module, name)) = path.split_once("::") {
+                if name.ends_with("_RULE_ID") {
+                    let shared = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("src/common")
+                        .join(format!("{module}.rs"));
+                    let shared_src = std::fs::read_to_string(&shared)
+                        .unwrap_or_else(|e| panic!("reading shared {}: {e}", shared.display()));
+                    let decl = format!("pub const {name}: &str = \"");
+                    let value = shared_src
+                        .lines()
+                        .find_map(|l| l.trim_start().strip_prefix(decl.as_str()))
+                        .and_then(|r| r.split('"').next())
+                        .unwrap_or_else(|| panic!("{name} not declared in {}", shared.display()));
+                    out.insert(value.to_string());
+                }
+            }
+            continue;
+        }
         // Match `pub const <IDENT>_RULE_ID: &str = "<value>";`. Line-based,
         // no regex dependency; the const shape is uniform across all guards
         // (verified with @paired-test).

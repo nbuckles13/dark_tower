@@ -9,7 +9,8 @@
 import { describe, expect, it } from 'vitest';
 import { InMemoryMetricsSink } from '@darktower/test-utils';
 
-import { MEDIA_KIND_LABELS, MediaKindMetrics } from '../mediaMetrics.js';
+import { MediaKindMetrics } from '../mediaMetrics.js';
+import { MediaKind } from '../../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { FirstMediaObserver } from '../measurement.js';
 
 function rig(): {
@@ -19,11 +20,7 @@ function rig(): {
   tick(): void;
 } {
   const sink = new InMemoryMetricsSink();
-  const metrics = new MediaKindMetrics(
-    { clientVersion: 'v', orgId: 'o' },
-    MEDIA_KIND_LABELS.Audio,
-    sink,
-  );
+  const metrics = new MediaKindMetrics({ clientVersion: 'v', orgId: 'o' }, MediaKind.AUDIO, sink);
   let now = 0;
   const observed: number[] = [];
   const observer = new FirstMediaObserver(

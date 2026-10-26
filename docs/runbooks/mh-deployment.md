@@ -491,17 +491,19 @@ sum(rate(mc_media_mute_requests_total[1h]))
 # per meeting, awaiting_token = indicators lagging, never lost BY THE BOUND; MC runbook counter 4)
 sum by (outcome) (rate(mc_media_client_mute_fanouts_total[1h]))
 
+# 2026-10-26 (series identity, not traffic): client per-kind series carry content_kind beside media_kind; "main" = mic/camera (no screen share yet).
 # 10. Client video decode drops (MC Scenario 22; alert A6)
-sum(rate(dt_client_media_decoder_errors_total{media_kind="video"}[1h]))
-  / clamp_min(sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[1h])), 1e-9)
+sum(rate(dt_client_media_decoder_errors_total{media_kind="video", content_kind="main"}[1h]))
+  / clamp_min(sum(rate(dt_client_media_frames_accepted_total{media_kind="video", content_kind="main"}[1h])), 1e-9)
 
 # 11. Unfulfilled video slots: the p95 (A9) is the check (MC Scenario 23). The gauge is ONE
 #     browser's last value (single-writer), not a fleet count; never read it as healthy at 0.
-histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[1h])))
-max by (media_kind) (dt_client_media_slots_unfulfilled{media_kind="video"})
+histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video", content_kind="main"}[1h])))
+max by (media_kind, content_kind) (dt_client_media_slots_unfulfilled{media_kind="video", content_kind="main"})
 
 # 12. A client VIDEO series is present in Prometheus at all (R-29). Empty = the client pipe is dead.
-count(dt_client_media_frames_received_total{media_kind="video"})
+#     Empty can ALSO mean content_kind was stripped (GC MEDIA_DATAPOINT_EXTRA / collector keep_keys).
+count(dt_client_media_frames_received_total{media_kind="video", content_kind="main"})
 ```
 
 - [ ] 1. MC `transport_mode_mismatch` and MH `rejected_transport_inconsistent` are both **zero**.
@@ -1219,7 +1221,7 @@ touches MH ([Operator levers](#operator-levers-for-media-video-off-and-nothing-e
   to send. **Audio is unaffected.** MC reads the cap once at startup and never re-truncates a live
   slot vector, so it applies to declarations made after the new MC pods are up (the restart
   reconnects everyone). Confirm it on
-  `mc_media_receive_slot_cap{media_kind="video"}` reading 0 on both MC pods.
+  `mc_media_receive_slot_cap{media_kind="video", content_kind="main"}` reading 0 on both MC pods.
   - **Its cost.** The key lives in `infra/services/mc-service/config.env` **only**, never in
     `media-codec-profile`, so pulling it **never rolls MH** and never sheds an MH session. The MC
     ConfigMap is content-addressed (ADR-0038 §2), so the change **rolls both MC pods**. It is

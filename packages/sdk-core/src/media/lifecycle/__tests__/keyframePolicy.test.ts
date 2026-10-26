@@ -7,7 +7,8 @@ import { describe, expect, it } from 'vitest';
 import { InMemoryMetricsSink } from '@darktower/test-utils';
 
 import { KEYFRAME_MIN_INTERVAL_FLOOR_MS } from '../../../config/clientConfig.js';
-import { MEDIA_KIND_LABELS, MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKindMetrics } from '../../setup/mediaMetrics.js';
+import { MediaKind } from '../../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { KeyframeGate } from '../keyframePolicy.js';
 
 const A = 'https://mh-a';
@@ -49,7 +50,7 @@ function rig(opts: { awaiting?: number } = {}) {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaKindMetrics(
     { clientVersion: 'v', orgId: 'o' },
-    MEDIA_KIND_LABELS.Video,
+    MediaKind.VIDEO_CAMERA,
     sink,
   );
   const time = manualTime();

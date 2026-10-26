@@ -72,9 +72,12 @@
 
 use crate::common::alert_rule_files::{load_rule_exprs_from, loadable_rules_files, LoadedRuleExpr};
 use crate::common::duration::parse_prometheus_duration;
+use crate::common::kind_labels::KIND_LABEL_KEYS;
 use crate::common::metric_catalog::CATALOG_HEAD_RE;
+use crate::common::rust_consts::rust_str_consts;
 use crate::common::status::emit_ok;
 use crate::common::test_code_filter::{is_test_path, strip_comments};
+use crate::common::ts_lex::skip_ws;
 use crate::common::ts_lex::{lex, Lexed, StrLit};
 use crate::ts_retained_credentials::segments;
 use anyhow::{Context, Result};
@@ -151,6 +154,18 @@ pub const TRIPWIRE_LIST_STALE_RULE_ID: &str = "tripwire_list_stale";
 pub const REJECT_TOKEN_UNCLASSIFIED_RULE_ID: &str = "reject_token_unclassified";
 pub const REJECT_TOKEN_MISCLASSIFIED_RULE_ID: &str = "reject_token_misclassified";
 pub const EXPORTER_SUFFIXING_ENABLED_RULE_ID: &str = "exporter_suffixing_enabled";
+/// The SDK's kind-label projection record disagrees with the taxonomy table.
+pub const KIND_PROJECTION_TS_DRIFT_RULE_ID: &str = "kind_projection_ts_drift";
+/// A collector exact kind-value rule disagrees with its taxonomy row (or is
+/// not an anchored, parenthesised alternation).
+pub const KIND_COLLECTOR_RULE_DRIFT_RULE_ID: &str = "kind_collector_rule_drift";
+/// A kind key missing from collector `keep_keys`, GC `MEDIA_DATAPOINT_EXTRA`
+/// or the taxonomy `pass =` list: the label is dropped, or an identity matcher
+/// would reject it, while every series still looks valid.
+pub const KIND_KEY_NOT_KEPT_RULE_ID: &str = "kind_key_not_kept";
+/// The kind-projection inputs could not be read as expected (a construct is
+/// missing or a parse count is wrong). Distinct from every content token.
+pub const KIND_PROJECTION_VACUOUS_RULE_ID: &str = "kind_projection_vacuous";
 
 /// Labels present on a stored client series that the collector's `keep_keys`
 /// never sees, because they are added AFTER it: `job`/`instance` are the
@@ -385,19 +400,6 @@ static MATCH_ARM_LITERAL_RE: Lazy<Regex> = Lazy::new(|| {
 static ALL_LEN_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"ALL:\s*\[Self;\s*(\d+)\s*\]").expect("static pattern compiles"));
 
-/// `pub const NAME: &str = "value";` in a Rust source file.
-#[expect(
-    clippy::disallowed_methods,
-    clippy::expect_used,
-    reason = "canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
-)]
-static RUST_STR_CONST_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(
-        r#"(?m)^\s*pub\s+const\s+([A-Z][A-Z0-9_]*)\s*:\s*&(?:'static\s+)?str\s*=\s*"([^"]*)"\s*;"#,
-    )
-    .expect("static pattern compiles")
-});
-
 /// A direct `MetricsSink` method call in TS source.
 #[expect(
     clippy::disallowed_methods,
@@ -624,19 +626,6 @@ fn rust_str_array(src: &str, const_name: &str) -> (Vec<String>, Option<usize>) {
     (out, declared)
 }
 
-/// `pub const NAME: &str = "value";` pairs in a Rust source file.
-fn rust_str_consts(src: &str) -> HashMap<String, String> {
-    RUST_STR_CONST_RE
-        .captures_iter(src)
-        .filter_map(|c| {
-            Some((
-                c.get(1)?.as_str().to_string(),
-                c.get(2)?.as_str().to_string(),
-            ))
-        })
-        .collect()
-}
-
 /// Collect the string literals on the right of `Self::Variant => "literal",`
 /// match arms.
 fn rust_match_arm_literals(src: &str, enum_hint: &str) -> Vec<String> {
@@ -781,20 +770,21 @@ impl IdentityPolicy {
     /// in `containment`) fails — every one of those is an extraction failure.
     #[must_use]
     pub fn parse_doc(md: &str) -> Option<Self> {
-        let mut lines = md
-            .lines()
-            .skip_while(|l| l.trim() != "```identity-label-policy");
-        lines.next()?;
+        // Through the crate's one fence reader; an unclosed block is still an
+        // extraction failure (`closed` below).
+        let code = crate::common::markdown_code::scan(md);
+        let block = code.spans.iter().find(|sp| {
+            sp.kind
+                == crate::common::markdown_code::CodeKind::Fenced {
+                    lang: "identity-label-policy".to_string(),
+                }
+        })?;
+        let closed = code.unclosed != Some(block.line);
         let mut containment = None;
         let mut segment = None;
         let mut exempt = None;
-        let mut closed = false;
-        for line in lines {
+        for line in block.text.lines() {
             let t = line.trim();
-            if t == "```" {
-                closed = true;
-                break;
-            }
             if t.is_empty() {
                 continue;
             }
@@ -934,14 +924,6 @@ fn arg_end(lexed: &Lexed, from: usize) -> Option<usize> {
         i += 1;
     }
     None
-}
-
-fn skip_ws(text: &str, mut i: usize) -> usize {
-    let bytes = text.as_bytes();
-    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
-        i += 1;
-    }
-    i
 }
 
 fn trimmed_range(text: &str, start: usize, end: usize) -> (usize, usize) {
@@ -1640,6 +1622,10 @@ pub struct Inputs {
     rules: Option<Vec<PreparedExpr>>,
     vectors: Option<Vec<RejectReasonRow>>,
     identity: Option<IdentityPolicy>,
+    /// The raw texts the kind-projection drift rules read; `None` if any was
+    /// kind-projection drift rules; `None` if any was missing (already
+    /// reported by `read_required`).
+    kind_texts: Option<KindTexts>,
 }
 
 /// The sdk-core walker: every `*.ts` under [`SDK_SRC`] that is not a test path
@@ -1739,6 +1725,29 @@ fn load_inputs(root: &Path) -> Result<(Inputs, Vec<Finding>)> {
         }
     }
     if let Some(md) = read_required(root, LABEL_TAXONOMY, &mut f)? {
+        let kind_inputs = (
+            std::fs::read_to_string(root.join(MEDIA_METRICS_TS)),
+            std::fs::read_to_string(root.join(COLLECTOR_CONFIG)),
+            std::fs::read_to_string(root.join(SIGNALING_PROTO)),
+        );
+        match kind_inputs {
+            (Ok(ts), Ok(collector), Ok(proto)) => {
+                inp.kind_texts = Some(KindTexts {
+                    taxonomy: md.clone(),
+                    ts,
+                    collector,
+                    proto,
+                });
+            }
+            _ => f.push(Finding::new(
+                MEDIA_METRICS_TS,
+                KIND_PROJECTION_VACUOUS_RULE_ID,
+                format!(
+                    "cannot read {MEDIA_METRICS_TS}, {COLLECTOR_CONFIG} and {SIGNALING_PROTO} \
+                     for the kind-label projection drift rules"
+                ),
+            )),
+        }
         match IdentityPolicy::parse_doc(&md) {
             Some(p) => inp.identity = Some(p),
             None => f.push(empty_input(
@@ -2829,6 +2838,460 @@ fn check_reject_partition(inp: &Inputs) -> Vec<Finding> {
 }
 
 // -----------------------------------------------------------------------------
+// Kind-label projection drift (2026-10-26).
+//
+// The `media_kind` / `content_kind` rows and the projection table of
+// `docs/observability/label-taxonomy.md` are the HUB. MC's RUNTIME projection is
+// pinned to them in `crates/mc-service/src/media_kind.rs`
+// (`media_kind_label_matches_the_taxonomy_row`, which reads the table on the
+// SAME markers as `kind_taxonomy` below — a crate boundary keeps the two
+// readers apart). The file-vs-file legs live here, on this module's existing
+// readers: the SDK record through `ts_lex`, the collector through
+// `collector_keep_keys` and `collector_exact_rule`, GC through its resolved
+// `MEDIA_DATAPOINT_EXTRA`. Rust == table and TS == table give Rust == TS.
+// -----------------------------------------------------------------------------
+
+/// A projection-table row starts with a backticked wire name.
+const KIND_TABLE_ROW_PREFIX: &str = "| `MEDIA_KIND_";
+/// Where the wire `MediaKind` enum is declared. The EXPECTED table rows (every
+/// value) and SDK entries (every value but `UNSPECIFIED`) are DERIVED from it,
+/// never hand counts, and still asserted EXACTLY.
+const SIGNALING_PROTO: &str = "proto/dark_tower/signaling/v1/signaling.proto";
+/// The wire enum's zero value: in the table with no labels, never in the SDK record.
+const KIND_UNSPECIFIED: &str = "MEDIA_KIND_UNSPECIFIED";
+/// The SDK record's declaration.
+const KIND_TS_RECORD: &str = "MEDIA_KIND_LABEL_PROJECTION = {";
+/// The generated-enum prefix the SDK keys its record by, and the wire-name
+/// prefix the taxonomy table uses.
+const KIND_TS_KEY_PREFIX: &str = "[MediaKind.";
+const KIND_WIRE_PREFIX: &str = "MEDIA_KIND_";
+
+type KindPair = Option<(String, String)>;
+
+/// The taxonomy's kind facts.
+#[derive(Debug)]
+struct KindTaxonomy {
+    /// Label key -> its row's value set.
+    rows: BTreeMap<&'static str, BTreeSet<String>>,
+    /// Wire name -> label pair (`None` = `—`, no labels).
+    table: BTreeMap<String, KindPair>,
+    /// The ```identity-label-cases `pass =` keys.
+    pass: BTreeSet<String>,
+}
+
+fn kind_vacuous(file: &str, message: String) -> Finding {
+    Finding::new(file, KIND_PROJECTION_VACUOUS_RULE_ID, message)
+}
+
+/// The backticked tokens of one markdown cell.
+fn ticked(cell: &str) -> Vec<String> {
+    cell.split('`')
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(_, t)| t.to_string())
+        .collect()
+}
+
+/// The ```identity-label-cases block of the taxonomy: `(fire, pass)` lists,
+/// read INSIDE that fence only (through `common::markdown_code`), so a prose
+/// line or another block saying `pass = …` cannot satisfy it. `None` if the
+/// block is absent. THE one reader: the kind rules and the identity-matcher
+/// case-table test both call it.
+#[must_use]
+pub fn identity_label_cases(md: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let code = crate::common::markdown_code::scan(md);
+    let block = code.spans.iter().find(|sp| {
+        sp.kind
+            == crate::common::markdown_code::CodeKind::Fenced {
+                lang: "identity-label-cases".to_string(),
+            }
+    })?;
+    let (mut fire, mut pass) = (Vec::new(), Vec::new());
+    for line in block.text.lines() {
+        let Some((name, list)) = line.split_once('=') else {
+            continue;
+        };
+        let items = list
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty());
+        match name.trim() {
+            "fire" => fire.extend(items),
+            "pass" => pass.extend(items),
+            _ => {}
+        }
+    }
+    Some((fire, pass))
+}
+
+/// One label row's value set: exactly one `| `key` |` row, non-empty.
+fn kind_row(md: &str, key: &str) -> Result<BTreeSet<String>, Finding> {
+    let marker = format!("| `{key}` |");
+    let found: Vec<&str> = md
+        .lines()
+        .filter(|l| l.trim_start().starts_with(&marker))
+        .collect();
+    let [row] = found.as_slice() else {
+        return Err(kind_vacuous(
+            LABEL_TAXONOMY,
+            format!("want exactly one `{key}` label row, found {}", found.len()),
+        ));
+    };
+    let values: BTreeSet<String> = ticked(row.split('|').nth(2).unwrap_or_default())
+        .into_iter()
+        .collect();
+    if values.is_empty() {
+        return Err(kind_vacuous(
+            LABEL_TAXONOMY,
+            format!("`{key}` row parsed no values"),
+        ));
+    }
+    Ok(values)
+}
+
+/// The projection table: wire name -> label pair (`—` = no labels).
+fn kind_table(md: &str) -> Result<BTreeMap<String, KindPair>, Finding> {
+    let vac = |m: String| kind_vacuous(LABEL_TAXONOMY, m);
+    let mut table = BTreeMap::new();
+    for line in md
+        .lines()
+        .filter(|l| l.trim_start().starts_with(KIND_TABLE_ROW_PREFIX))
+    {
+        let cells: Vec<&str> = line.split('|').collect();
+        let (Some(w), Some(m), Some(c)) = (cells.get(1), cells.get(2), cells.get(3)) else {
+            return Err(vac(format!("short projection-table row: {line:?}")));
+        };
+        let [wire] = <[String; 1]>::try_from(ticked(w)).map_err(|_| {
+            vac(format!(
+                "projection-table row has no single wire name: {line:?}"
+            ))
+        })?;
+        let pair = match (ticked(m).as_slice(), ticked(c).as_slice()) {
+            ([m], [c]) => Some((m.clone(), c.clone())),
+            ([], []) if m.trim() == "—" && c.trim() == "—" => None,
+            _ => return Err(vac(format!("unparseable projection-table row: {line:?}"))),
+        };
+        if table.insert(wire.clone(), pair).is_some() {
+            return Err(vac(format!("duplicate projection-table row for {wire}")));
+        }
+    }
+    if table.is_empty() {
+        return Err(vac("parsed 0 projection-table rows".to_string()));
+    }
+    Ok(table)
+}
+
+/// Read the taxonomy's kind rows, projection table and `pass =` list.
+///
+/// SIBLING READERS (crate boundaries, ADR-0028, keep them apart; all three
+/// anchor on the same `| `key` |` / `| `MEDIA_KIND_` markers):
+/// `crates/mc-service/src/media_kind.rs` tests (`label_row`, the runtime
+/// leg) and `crates/env-tests/src/fixtures/metric_hygiene.rs`
+/// (`taxonomy_row_values`). Neither of those crates can reach dt-guard.
+fn kind_taxonomy(md: &str) -> Result<KindTaxonomy, Finding> {
+    let mut rows = BTreeMap::new();
+    for key in KIND_LABEL_KEYS {
+        rows.insert(key, kind_row(md, key)?);
+    }
+    let table = kind_table(md)?;
+    let pass: BTreeSet<String> = identity_label_cases(md)
+        .map(|(_, pass)| pass.into_iter().collect())
+        .unwrap_or_default();
+    if pass.is_empty() {
+        return Err(kind_vacuous(
+            LABEL_TAXONOMY,
+            "no ```identity-label-cases `pass =` list".to_string(),
+        ));
+    }
+    Ok(KindTaxonomy { rows, table, pass })
+}
+
+/// The SDK's projection record, through `ts_lex`: wire name -> label pair.
+/// Each entry must be exactly `[MediaKind.X]: { media_kind: '…', content_kind: '…' }`.
+fn kind_ts_record(src: &str) -> Result<BTreeMap<String, (String, String)>, Finding> {
+    let vac = |m: String| kind_vacuous(MEDIA_METRICS_TS, m);
+    let lexed = crate::common::ts_lex::lex(src);
+    let text = &lexed.text;
+    let decl = text
+        .match_indices(KIND_TS_RECORD)
+        .find(|(i, _)| lexed.string_at(*i).is_none())
+        .map(|(i, _)| i)
+        .ok_or_else(|| vac(format!("`{KIND_TS_RECORD}` not found")))?;
+    let open = decl + KIND_TS_RECORD.len() - 1;
+    let close = matching_close(&lexed, open)
+        .ok_or_else(|| vac(format!("`{KIND_TS_RECORD}` has no closing brace")))?;
+    let mut out = BTreeMap::new();
+    for (a, b) in split_top_level(&lexed, open + 1, close, b',') {
+        let (a, b) = trimmed_range(text, a, b);
+        if a >= b {
+            continue; // trailing comma
+        }
+        let entry = text.get(a..b).unwrap_or("");
+        let bad = || {
+            vac(format!(
+                "unparseable projection entry at line {}: {entry:?}",
+                lexed.line_of(a)
+            ))
+        };
+        let rest = entry.strip_prefix(KIND_TS_KEY_PREFIX).ok_or_else(bad)?;
+        let variant_len = rest.find(']').ok_or_else(bad)?;
+        let variant = rest.get(..variant_len).unwrap_or("");
+        // Offsets of the `{ … }` value inside `text`.
+        let brace = text
+            .get(a..b)
+            .and_then(|e| e.find('{'))
+            .map(|i| a + i)
+            .ok_or_else(bad)?;
+        let brace_close = matching_close(&lexed, brace).ok_or_else(bad)?;
+        let mut fields = BTreeMap::new();
+        for (fa, fb) in split_top_level(&lexed, brace + 1, brace_close, b',') {
+            let (fa, fb) = trimmed_range(text, fa, fb);
+            if fa >= fb {
+                continue;
+            }
+            let field = text.get(fa..fb).unwrap_or("");
+            let colon = field.find(':').ok_or_else(bad)?;
+            let key = field.get(..colon).unwrap_or("").trim();
+            let v = skip_ws(text, fa + colon + 1);
+            let lit = lexed
+                .string_starting_at(v)
+                .filter(|l| l.is_static())
+                .ok_or_else(bad)?;
+            fields.insert(key.to_string(), lit.body(text).to_string());
+        }
+        let [media_key, content_key] = KIND_LABEL_KEYS;
+        let (Some(m), Some(c), 2) = (fields.get(media_key), fields.get(content_key), fields.len())
+        else {
+            return Err(bad());
+        };
+        let wire = format!("{KIND_WIRE_PREFIX}{variant}");
+        if out.insert(wire, (m.clone(), c.clone())).is_some() {
+            return Err(vac(format!(
+                "duplicate projection entry for MediaKind.{variant}"
+            )));
+        }
+    }
+    if out.is_empty() {
+        return Err(vac("parsed 0 projection entries".to_string()));
+    }
+    Ok(out)
+}
+
+/// Every value of the TOP-LEVEL wire `MediaKind` enum, through
+/// `proto_lex::enum_values` (a nested `enum MediaKind` inside a message is
+/// never the wire vocabulary). A lex error is surfaced, never an empty set.
+fn proto_media_kinds(proto_src: &str) -> Result<BTreeSet<String>, String> {
+    let tokens = crate::common::proto_lex::lex(proto_src).map_err(|e| e.to_string())?;
+    Ok(crate::common::proto_lex::enum_values(
+        &crate::common::proto_lex::scopes(&tokens),
+        "MediaKind",
+    )
+    .into_iter()
+    .map(|(_, name)| name)
+    .filter(|name| name.starts_with(KIND_WIRE_PREFIX))
+    .collect())
+}
+
+/// The pattern of the collector's exact value rule for `key`:
+/// `IsMatch(attributes["key"], "<pattern>")` on a `set(attributes["key"], "invalid")` line.
+fn collector_exact_rule(cfg: &str, key: &str) -> Vec<String> {
+    let set = format!("set(attributes[\"{key}\"], \"{REWRITE_SENTINEL}\")");
+    let is_match = format!("IsMatch(attributes[\"{key}\"], \"");
+    cfg.lines()
+        .filter(|l| l.trim_start().starts_with("- ") && l.contains(&set))
+        .filter_map(|l| {
+            let at = l.find(&is_match)? + is_match.len();
+            let rest = l.get(at..)?;
+            Some(rest.get(..rest.find('"')?)?.to_string())
+        })
+        .collect()
+}
+
+/// The value set of an exact, anchored, parenthesised alternation
+/// `^(a|b)$`, or `None` for any other shape.
+fn exact_alternation(pattern: &str) -> Option<BTreeSet<String>> {
+    let inner = pattern.strip_prefix("^(")?.strip_suffix(")$")?;
+    let values: BTreeSet<String> = inner.split('|').map(str::to_string).collect();
+    values
+        .iter()
+        .all(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+        .then_some(values)
+}
+
+/// The raw texts the kind-projection drift rules read.
+#[derive(Debug)]
+struct KindTexts {
+    taxonomy: String,
+    ts: String,
+    collector: String,
+    proto: String,
+}
+
+/// Leg: the taxonomy's projection table lists EXACTLY the wire values.
+fn kind_table_leg(tax: &KindTaxonomy, wire: &BTreeSet<String>) -> Option<Finding> {
+    let table_wires: BTreeSet<String> = tax.table.keys().cloned().collect();
+    (&table_wires != wire).then(|| {
+        kind_vacuous(
+            LABEL_TAXONOMY,
+            format!(
+                "projection-table rows {table_wires:?} are not exactly the wire MediaKind values \
+                 {wire:?} ({SIGNALING_PROTO})"
+            ),
+        )
+    })
+}
+
+/// Leg: the SDK record == the table (labelled rows only; `—` rows absent),
+/// over EXACTLY the labelled wire values.
+fn kind_ts_leg(tax: &KindTaxonomy, wire: &BTreeSet<String>, ts_src: &str) -> Option<Finding> {
+    let labelled: BTreeSet<String> = wire
+        .iter()
+        .filter(|w| *w != KIND_UNSPECIFIED)
+        .cloned()
+        .collect();
+    let ts = match kind_ts_record(ts_src) {
+        Err(f) => return Some(f),
+        Ok(ts) => ts,
+    };
+    if ts.keys().cloned().collect::<BTreeSet<_>>() != labelled {
+        return Some(kind_vacuous(
+            MEDIA_METRICS_TS,
+            format!(
+                "SDK projection entries {:?} are not exactly the labelled wire MediaKind \
+                 values {labelled:?} ({SIGNALING_PROTO})",
+                ts.keys().collect::<Vec<_>>()
+            ),
+        ));
+    }
+    let want: BTreeMap<&String, &(String, String)> = tax
+        .table
+        .iter()
+        .filter_map(|(w, p)| p.as_ref().map(|p| (w, p)))
+        .collect();
+    let got: BTreeMap<&String, &(String, String)> = ts.iter().collect();
+    (want != got).then(|| {
+        Finding::new(
+            MEDIA_METRICS_TS,
+            KIND_PROJECTION_TS_DRIFT_RULE_ID,
+            format!(
+                "the SDK projection record {got:?} differs from the taxonomy projection \
+                 table {want:?} ({LABEL_TAXONOMY}); fix the side that is wrong"
+            ),
+        )
+    })
+}
+
+/// Leg: each kind key's collector exact rule == its taxonomy row.
+fn kind_collector_leg(tax: &KindTaxonomy, cfg: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for (key, row) in &tax.rows {
+        let rules = collector_exact_rule(cfg, key);
+        let [pattern] = rules.as_slice() else {
+            out.push(kind_vacuous(
+                COLLECTOR_CONFIG,
+                format!(
+                    "want exactly one exact `{key}` value rule, found {}",
+                    rules.len()
+                ),
+            ));
+            continue;
+        };
+        match exact_alternation(pattern) {
+            None => out.push(Finding::new(
+                COLLECTOR_CONFIG,
+                KIND_COLLECTOR_RULE_DRIFT_RULE_ID,
+                format!(
+                    "the `{key}` rule pattern {pattern:?} is not an anchored, parenthesised \
+                     alternation `^(a|b)$`; unparenthesised, `^a|b$` admits prefixes and suffixes"
+                ),
+            )),
+            Some(values) if &values != row => out.push(Finding::new(
+                COLLECTOR_CONFIG,
+                KIND_COLLECTOR_RULE_DRIFT_RULE_ID,
+                format!("the `{key}` rule admits {values:?}; the taxonomy row is {row:?}"),
+            )),
+            Some(_) => {}
+        }
+    }
+    out
+}
+
+/// Leg: every kind key is kept (collector), forwarded (GC) and on the
+/// identity case table's `pass =` list.
+fn kind_kept_leg(tax: &KindTaxonomy, cfg: &str, gc_extra: Option<&[String]>) -> Vec<Finding> {
+    let keep = collector_keep_keys(cfg);
+    let mut out = Vec::new();
+    for key in KIND_LABEL_KEYS {
+        for (present, home) in [
+            (
+                keep.iter().any(|k| k == key),
+                format!("{COLLECTOR_CONFIG} keep_keys"),
+            ),
+            (
+                gc_extra.is_some_and(|e| e.iter().any(|k| k == key)),
+                format!("{GC_FILTER} MEDIA_DATAPOINT_EXTRA"),
+            ),
+            (
+                tax.pass.contains(key),
+                format!("{LABEL_TAXONOMY} identity-label-cases `pass =`"),
+            ),
+        ] {
+            if !present {
+                out.push(Finding::new(
+                    &home,
+                    KIND_KEY_NOT_KEPT_RULE_ID,
+                    format!(
+                        "kind key `{key}` is missing from {home}: the label is stripped (or an \
+                         identity matcher is untested on it) while every series still looks valid"
+                    ),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Every kind-projection drift over the given texts. Pure, so each leg is fed
+/// adverse inputs in the tests.
+fn kind_projection_findings(texts: &KindTexts, gc_extra: Option<&[String]>) -> Vec<Finding> {
+    let wire = match proto_media_kinds(&texts.proto) {
+        Ok(w) if w.contains(KIND_UNSPECIFIED) => w,
+        Ok(_) => {
+            return vec![kind_vacuous(
+                SIGNALING_PROTO,
+                format!(
+                    "no top-level `enum MediaKind` with `{KIND_UNSPECIFIED}` in {SIGNALING_PROTO}"
+                ),
+            )]
+        }
+        Err(e) => {
+            return vec![kind_vacuous(
+                SIGNALING_PROTO,
+                format!("{SIGNALING_PROTO} could not be lexed: {e}"),
+            )]
+        }
+    };
+    let tax = match kind_taxonomy(&texts.taxonomy) {
+        Ok(t) => t,
+        Err(f) => return vec![f],
+    };
+    let mut out = Vec::new();
+    out.extend(kind_table_leg(&tax, &wire));
+    out.extend(kind_ts_leg(&tax, &wire, &texts.ts));
+    out.extend(kind_collector_leg(&tax, &texts.collector));
+    out.extend(kind_kept_leg(&tax, &texts.collector, gc_extra));
+    out
+}
+
+/// The kind-projection drift rules over the real inputs.
+fn check_kind_projection(inp: &Inputs) -> Vec<Finding> {
+    let Some(texts) = inp.kind_texts.as_ref() else {
+        return Vec::new(); // reported at load
+    };
+    kind_projection_findings(texts, inp.gc.as_ref().map(|g| g.extra.as_slice()))
+}
+
+// -----------------------------------------------------------------------------
 // Run.
 // -----------------------------------------------------------------------------
 
@@ -2837,7 +3300,7 @@ fn check_reject_partition(inp: &Inputs) -> Vec<Finding> {
 /// [`EMPTY_INPUT_RULE_ID`] finding.
 pub fn collect_findings(repo_root: &Path) -> Result<Vec<Finding>> {
     let (inp, mut findings) = load_inputs(repo_root)?;
-    let checks: [fn(&Inputs) -> Vec<Finding>; 13] = [
+    let checks: [fn(&Inputs) -> Vec<Finding>; 14] = [
         check_export_set,
         check_export_markers,
         check_emitters,
@@ -2851,6 +3314,7 @@ pub fn collect_findings(repo_root: &Path) -> Result<Vec<Finding>> {
         check_alert_references,
         check_tripwires,
         check_reject_partition,
+        check_kind_projection,
     ];
     for check in checks {
         findings.extend(check(&inp));
@@ -3178,5 +3642,228 @@ impl MediaDropReason {
                 "{path} missing must be an empty-input finding: {findings:?}"
             );
         }
+    }
+
+    // -- Kind-label projection drift (2026-10-26) ------------------------------
+
+    const KIND_MD: &str = "\
+| `media_kind` | `audio`, `video` | Yes | MC |
+| `content_kind` | `main`, `screen` | Yes | MC |
+| `MEDIA_KIND_UNSPECIFIED` | — | — |
+| `MEDIA_KIND_AUDIO` | `audio` | `main` |
+| `MEDIA_KIND_VIDEO_CAMERA` | `video` | `main` |
+| `MEDIA_KIND_VIDEO_SCREEN` | `video` | `screen` |
+```identity-label-cases
+pass = key_custody, media_kind, content_kind
+```
+";
+    const KIND_TS: &str = "\
+// MEDIA_KIND_LABEL_PROJECTION = { comment, not code }
+export const MEDIA_KIND_LABEL_PROJECTION = {
+  [MediaKind.AUDIO]: { media_kind: 'audio', content_kind: 'main' },
+  [MediaKind.VIDEO_CAMERA]: { media_kind: 'video', content_kind: 'main' },
+  [MediaKind.VIDEO_SCREEN]: { media_kind: 'video', content_kind: 'screen' },
+} as const;
+";
+    const KIND_CFG: &str = r#"
+          - keep_keys(attributes, ["client_version", "media_kind", "content_kind"])
+          - set(attributes["media_kind"], "invalid") where attributes["media_kind"] != nil and (not IsString(attributes["media_kind"]) or not IsMatch(attributes["media_kind"], "^(audio|video)$"))
+          - set(attributes["content_kind"], "invalid") where attributes["content_kind"] != nil and (not IsString(attributes["content_kind"]) or not IsMatch(attributes["content_kind"], "^(main|screen)$"))
+          - set(attributes["content_kind"], "invalid") where attributes["media_kind"] == "invalid" and attributes["content_kind"] != nil
+"#;
+
+    const KIND_PROTO: &str = "syntax = \"proto3\";\nenum MediaKind {\n  MEDIA_KIND_UNSPECIFIED = 0;\n  MEDIA_KIND_AUDIO = 1;\n  MEDIA_KIND_VIDEO_CAMERA = 2;\n  MEDIA_KIND_VIDEO_SCREEN = 3;\n}\n";
+
+    fn texts(md: &str, ts: &str, cfg: &str, proto: &str) -> KindTexts {
+        KindTexts {
+            taxonomy: md.to_string(),
+            ts: ts.to_string(),
+            collector: cfg.to_string(),
+            proto: proto.to_string(),
+        }
+    }
+
+    fn kind_extra() -> Vec<String> {
+        vec!["media_kind".into(), "content_kind".into()]
+    }
+
+    fn kind_rules(md: &str, ts: &str, cfg: &str, extra: &[String]) -> Vec<(&'static str, String)> {
+        kind_projection_findings(&texts(md, ts, cfg, KIND_PROTO), Some(extra))
+            .into_iter()
+            .map(|f| (f.rule_id, f.file))
+            .collect()
+    }
+
+    #[test]
+    fn kind_good_fixture_is_clean() {
+        assert_eq!(
+            kind_rules(KIND_MD, KIND_TS, KIND_CFG, &kind_extra()),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn kind_ts_record_disagreeing_with_the_table_is_ts_drift() {
+        let ts = KIND_TS.replace(
+            "[MediaKind.VIDEO_CAMERA]: { media_kind: 'video', content_kind: 'main' }",
+            "[MediaKind.VIDEO_CAMERA]: { media_kind: 'video', content_kind: 'screen' }",
+        );
+        assert_eq!(
+            kind_rules(KIND_MD, &ts, KIND_CFG, &kind_extra()),
+            vec![(
+                KIND_PROJECTION_TS_DRIFT_RULE_ID,
+                MEDIA_METRICS_TS.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_reflowed_or_dropped_ts_entry_is_vacuity_not_drift() {
+        let reflowed = KIND_TS.replace(
+            "{ media_kind: 'audio', content_kind: 'main' }",
+            "{ media_kind: AUDIO, content_kind: 'main' }",
+        );
+        let dropped = KIND_TS.replace(
+            "  [MediaKind.VIDEO_SCREEN]: { media_kind: 'video', content_kind: 'screen' },\n",
+            "",
+        );
+        let missing = KIND_TS.replace("MEDIA_KIND_LABEL_PROJECTION = {", "PROJECTION = {");
+        for ts in [reflowed, dropped, missing] {
+            assert_eq!(
+                kind_rules(KIND_MD, &ts, KIND_CFG, &kind_extra()),
+                vec![(
+                    KIND_PROJECTION_VACUOUS_RULE_ID,
+                    MEDIA_METRICS_TS.to_string()
+                )],
+                "{ts}"
+            );
+        }
+    }
+
+    /// The expected sets come from the proto: a new wire value with no table
+    /// row and no SDK entry is reported, though every count still "matches".
+    #[test]
+    fn a_new_wire_value_without_a_row_or_entry_is_vacuity_from_the_proto() {
+        let proto = KIND_PROTO.replace("}\n", "  MEDIA_KIND_AUDIO_SCREEN = 4;\n}\n");
+        let got: Vec<_> = kind_projection_findings(
+            &texts(KIND_MD, KIND_TS, KIND_CFG, &proto),
+            Some(&kind_extra()),
+        )
+        .into_iter()
+        .map(|f| (f.rule_id, f.file))
+        .collect();
+        assert_eq!(
+            got,
+            vec![
+                (KIND_PROJECTION_VACUOUS_RULE_ID, LABEL_TAXONOMY.to_string()),
+                (
+                    KIND_PROJECTION_VACUOUS_RULE_ID,
+                    MEDIA_METRICS_TS.to_string()
+                ),
+            ]
+        );
+        let none =
+            kind_projection_findings(&texts(KIND_MD, KIND_TS, KIND_CFG, ""), Some(&kind_extra()));
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].rule_id, KIND_PROJECTION_VACUOUS_RULE_ID);
+    }
+
+    #[test]
+    fn a_collector_rule_off_the_row_or_unanchored_is_rule_drift() {
+        let slides = KIND_CFG.replace("^(main|screen)$", "^(main|slides)$");
+        let unanchored = KIND_CFG.replace("^(audio|video)$", "^audio|video$");
+        for cfg in [slides, unanchored] {
+            assert_eq!(
+                kind_rules(KIND_MD, KIND_TS, &cfg, &kind_extra()),
+                vec![(
+                    KIND_COLLECTOR_RULE_DRIFT_RULE_ID,
+                    COLLECTOR_CONFIG.to_string()
+                )],
+                "{cfg}"
+            );
+        }
+        // A missing rule is vacuity (the pair-poisoning line is not an exact rule).
+        let missing: String = KIND_CFG
+            .lines()
+            .filter(|l| !l.contains("^(main|screen)$"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            kind_rules(KIND_MD, KIND_TS, &missing, &kind_extra()),
+            vec![(
+                KIND_PROJECTION_VACUOUS_RULE_ID,
+                COLLECTOR_CONFIG.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_kind_key_dropped_anywhere_is_not_kept() {
+        let no_keep = KIND_CFG.replace(", \"content_kind\"])", "])");
+        assert_eq!(
+            kind_rules(KIND_MD, KIND_TS, &no_keep, &kind_extra()),
+            vec![(
+                KIND_KEY_NOT_KEPT_RULE_ID,
+                format!("{COLLECTOR_CONFIG} keep_keys")
+            )]
+        );
+        assert_eq!(
+            kind_rules(KIND_MD, KIND_TS, KIND_CFG, &["media_kind".to_string()]),
+            vec![(
+                KIND_KEY_NOT_KEPT_RULE_ID,
+                format!("{GC_FILTER} MEDIA_DATAPOINT_EXTRA")
+            )]
+        );
+        let no_pass = KIND_MD.replace(", content_kind\n", "\n");
+        assert_eq!(
+            kind_rules(&no_pass, KIND_TS, KIND_CFG, &kind_extra()),
+            vec![(
+                KIND_KEY_NOT_KEPT_RULE_ID,
+                format!("{LABEL_TAXONOMY} identity-label-cases `pass =`")
+            )]
+        );
+    }
+
+    #[test]
+    fn a_stale_or_broken_taxonomy_is_reported_on_the_taxonomy() {
+        // The doc still saying `slides`: the TS record and the collector now
+        // disagree with the ROW, so drift is reported, never silence.
+        let slides = KIND_MD.replace("`main`, `screen`", "`main`, `slides`");
+        assert_eq!(
+            kind_rules(&slides, KIND_TS, KIND_CFG, &kind_extra()),
+            vec![(
+                KIND_COLLECTOR_RULE_DRIFT_RULE_ID,
+                COLLECTOR_CONFIG.to_string()
+            )]
+        );
+        let dup = format!("{KIND_MD}| `MEDIA_KIND_AUDIO` | `audio` | `main` |\n");
+        let no_row = KIND_MD.replace("| `content_kind` |", "| content_kind |");
+        for md in [dup, no_row] {
+            assert_eq!(
+                kind_rules(&md, KIND_TS, KIND_CFG, &kind_extra()),
+                vec![(KIND_PROJECTION_VACUOUS_RULE_ID, LABEL_TAXONOMY.to_string())],
+                "{md}"
+            );
+        }
+    }
+
+    /// Positive control: the REAL inputs parse to exactly 4 table rows and 3 SDK
+    /// entries, and the real tree has no kind finding.
+    #[test]
+    fn the_real_kind_inputs_parse_and_agree() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let md = std::fs::read_to_string(root.join(LABEL_TAXONOMY)).unwrap();
+        let ts = std::fs::read_to_string(root.join(MEDIA_METRICS_TS)).unwrap();
+        let proto = std::fs::read_to_string(root.join(SIGNALING_PROTO)).unwrap();
+        let wire = proto_media_kinds(&proto).expect("real proto lexes");
+        assert!(wire.len() > 1, "{wire:?}");
+        assert_eq!(kind_taxonomy(&md).unwrap().table.len(), wire.len());
+        assert_eq!(kind_ts_record(&ts).unwrap().len(), wire.len() - 1);
+        let findings = collect_findings(&root).unwrap();
+        let kind: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.starts_with("kind_"))
+            .collect();
+        assert!(kind.is_empty(), "{kind:?}");
     }
 }

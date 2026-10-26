@@ -2067,7 +2067,7 @@ under an applied mute are the healthy state. Rising drops mean a client that kep
 held the line.
 
 **Receive-side corroboration, not proof**:
-`dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video"}`, alerted as
+`dt_client_media_frames_dropped_total{reason="sender_server_muted", media_kind="video", content_kind="main"}`, alerted as
 `ClientVideoServerMutedSenderFrames` (A5, warning, 10m; rule owned by observability, OBS-B). It
 counts video frames that reached a receiver from a sender that receiver knows is server-muted for
 video. The receiver drops them, so nothing renders. Any sustained value is the receiver-side signal
@@ -2080,14 +2080,15 @@ If that series moves with the burst, it is unmute churn, not an MH failure, so d
 
 ```promql
 sum(rate(mh_media_frames_dropped_total{direction="ingress",reason="server_muted"}[5m]))
-sum(rate(dt_client_media_frames_dropped_total{reason="sender_server_muted",media_kind="video"}[5m]))
-sum by (media_kind) (increase(mc_media_send_directive_withdrawals_total{reason="server_muted"}[15m]))
+# 2026-10-26 (series identity, not traffic): client per-kind series carry content_kind beside media_kind; "main" = mic/camera (no screen share yet).
+sum(rate(dt_client_media_frames_dropped_total{reason="sender_server_muted",media_kind="video", content_kind="main"}[5m]))
+sum by (media_kind, content_kind) (increase(mc_media_send_directive_withdrawals_total{reason="server_muted"}[15m]))
 ```
 
 **Sub-arm: "Camera light still on after server mute".** MC withdraws that kind's directive (R-16),
 so capture should stop and, for video, the camera light goes off. A client still capturing means
 the withdrawal was **lost or ignored**:
-- `mc_media_send_directive_withdrawals_total{media_kind="video", reason="server_muted"}` did NOT
+- `mc_media_send_directive_withdrawals_total{media_kind="video", content_kind="main", reason="server_muted"}` did NOT
   rise for an `applied` mute of a **watched** kind: MC did not withdraw, or could not deliver
   (`mc_media_slot_view_emissions_total{outcome="delivery_failed"}`). That is MC's half,
   [MC Scenario 21 Step 1b](mc-incident-response.md#scenario-21-server-mute-not-enforced);
@@ -2385,8 +2386,9 @@ sum(mh_media_edges_pending)
 sum by (outcome) (rate(mh_media_edge_pending_exits_total[15m]))   # group_start should dominate
 
 # The client half: ACTIVE video slots showing neither decodable video nor an avatar (no identity)
-histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[5m])))
-max by (media_kind) (dt_client_media_slots_unfulfilled{media_kind="video"})   # ONE browser's last value, not a fleet count; never read as healthy at 0
+# 2026-10-26 (series identity, not traffic): client per-kind series carry content_kind beside media_kind; "main" = mic/camera (no screen share yet).
+histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video", content_kind="main"}[5m])))
+max by (media_kind, content_kind) (dt_client_media_slots_unfulfilled{media_kind="video", content_kind="main"})   # ONE browser's last value, not a fleet count; never read as healthy at 0
 ```
 
 The fleet signal is the histogram. It is observed on EXIT only, so a slot stuck for a whole session
@@ -2402,7 +2404,7 @@ pending is flat, MH believes it is forwarding. The receive half is then
 Read MC's directive outcomes and withdrawals
 ([MC §send-directive wiring](mc-incident-response.md#send-directive-wiring)):
 `mc_media_send_directives_total{outcome}` and
-`mc_media_send_directive_withdrawals_total{media_kind="video", reason}`. A withdrawal is healthy.
+`mc_media_send_directive_withdrawals_total{media_kind="video", content_kind="main", reason}`. A withdrawal is healthy.
 Pending is a bug here only when MC both holds the source in a live slot AND withdrew its video.
 That is an MC disagreement between its slot table and its directive, so escalate to
 `meeting-controller`.
@@ -2423,7 +2425,7 @@ slot pending.**
 
 **(c) Capture failure not presented as muted.** R-19 requires a failed or revoked camera to present
 as video-muted. A pending source whose client reports a camera failure
-(`dt_client_media_capture_failures_total{media_kind="video", outcome}`, including `ended`) is a
+(`dt_client_media_capture_failures_total{media_kind="video", content_kind="main", outcome}`, including `ended`) is a
 client bug: that source should present to others as video-muted (R-19), not as a live slot.
 
 **(d) Recovery-request outcomes**, per wire-freeze ruling 2, on
@@ -2485,8 +2487,9 @@ sum(rate(mh_media_paused_source_frames_total[15m]))
   / clamp_min(sum(rate(mh_media_frames_forwarded_total{direction="ingress"}[15m])), 1e-9)
 
 # Corroboration from the client side, both kinds (per-kind, no identity)
-sum by (media_kind, client_version) (increase(dt_client_media_mute_transitions_total[1h]))
-sum by (media_kind, client_version) (rate(dt_client_media_frames_sent_total[15m]))
+# 2026-10-26 (series identity, not traffic): client per-kind series carry content_kind beside media_kind; "main" = mic/camera (no screen share yet).
+sum by (media_kind, content_kind, client_version) (increase(dt_client_media_mute_transitions_total[1h]))
+sum by (media_kind, content_kind, client_version) (rate(dt_client_media_frames_sent_total[15m]))
 ```
 
 **Diagnosis: forks.**

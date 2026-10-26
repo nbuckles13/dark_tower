@@ -24,7 +24,8 @@ rules from the start; pre-existing deviations are draining via the R-61 chain.
   still typed by the deleted message must change type or be deleted, and the
   type and reserve-aware rules catch that. If `Any` (or any other type-URL
   carrier) is ever introduced, this exception must be revisited; the `Any`
-  half is mechanised by `scripts/guards/simple/validate-proto-no-any.sh`, which
+  half is mechanised by `dt-guard proto-no-any` (`crates/dt-guard/src/proto_no_any.rs`,
+  wrapper `scripts/guards/simple/validate-proto-no-any.sh`), which
   fails Layer 3 on any `any.proto` import or `google.protobuf.Any` reference. Accepted
   residual: a top-level message that no other proto references but that a peer
   decodes directly (e.g. a stream envelope) is no longer protected by buf; its

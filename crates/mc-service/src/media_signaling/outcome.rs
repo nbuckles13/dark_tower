@@ -1117,55 +1117,6 @@ mod tests {
 
     /// ANCHOR (DRY) drift check: the value set is read from the taxonomy row
     /// itself, never restated here.
-    #[test]
-    fn media_kind_label_matches_the_taxonomy_row() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../docs/observability/label-taxonomy.md"
-        );
-        let doc = std::fs::read_to_string(path).expect("label taxonomy must be readable");
-        let rows: Vec<&str> = doc
-            .lines()
-            .filter(|l| l.trim_start().starts_with("| `media_kind` |"))
-            .collect();
-        assert_eq!(
-            rows.len(),
-            1,
-            "exactly one `media_kind` row must exist in the taxonomy: {rows:?}"
-        );
-        let cell = rows[0].split('|').nth(2).expect("value cell");
-        let from_doc: HashSet<&str> = cell
-            .split('`')
-            .enumerate()
-            .filter(|(i, _)| i % 2 == 1)
-            .map(|(_, t)| t)
-            .collect();
-        assert!(
-            !from_doc.is_empty(),
-            "taxonomy row parsed no values: {cell:?}"
-        );
-        let from_code: HashSet<&str> = MediaKindLabel::ALL.iter().map(|k| k.label()).collect();
-        assert_eq!(from_code, from_doc);
-    }
-
-    #[test]
-    fn media_kind_label_projects_every_wire_kind_without_a_wildcard() {
-        use proto_gen::dark_tower::signaling::v1::MediaKind;
-        assert_eq!(
-            MediaKindLabel::from_proto(MediaKind::Audio),
-            Some(MediaKindLabel::Audio)
-        );
-        assert_eq!(
-            MediaKindLabel::from_proto(MediaKind::VideoCamera),
-            Some(MediaKindLabel::Video)
-        );
-        assert_eq!(
-            MediaKindLabel::from_proto(MediaKind::VideoScreen),
-            Some(MediaKindLabel::Video)
-        );
-        assert_eq!(MediaKindLabel::from_proto(MediaKind::Unspecified), None);
-    }
-
     /// `index()` is a bijection onto `0..ALL.len()` and agrees with `ALL`'s
     /// order, so `per_kind` / `of` can never alias two kinds.
     #[test]

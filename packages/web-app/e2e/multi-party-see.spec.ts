@@ -18,10 +18,11 @@
 // S1's three audio layers). Every video publisher's announced pattern id is its
 // own join-bound sender id (a separate check; layer 3 never uses it).
 //
-// R-29: `dt_client_media_frames_{received,sent}_total{media_kind="video"}` rise
+// R-29: `dt_client_media_frames_{received,sent}_total{media_kind="video",
+// content_kind="main"}` rise
 // above baselines taken BEFORE the first join (the series is born when video is
-// first directed, so only a delta can see it), and nothing arrives kind-less
-// over the same window.
+// first directed, so only a delta can see it), and nothing arrives missing
+// either kind label over the same window.
 //
 // No wall-clock gate: every wait is a liveness bound, every window uses the
 // shared stop rule (`windowSampling.ts`).
@@ -71,25 +72,26 @@ test.describe('story 3: N+1 participants see and hear each other by content', ()
         }
       }
 
-      await test.step('R-29: video client series carry media_kind="video" end to end', async () => {
+      await test.step('R-29: video client series carry media_kind="video", content_kind="main" end to end', async () => {
         await Promise.all(members.map((m) => flushTelemetry(m.page)));
         await waitForClientCounterAbove(
           'received_video',
           receivedVideo,
-          'R-29: the received-frames counter never reached Prometheus with media_kind="video". ' +
-            'EMPTY means media_kind was stripped (GC MEDIA_DATAPOINT_EXTRA / collector keep_keys) ' +
-            'or no video was received.',
+          'R-29: the received-frames counter never reached Prometheus with media_kind="video", ' +
+            'content_kind="main". EMPTY means a kind label was stripped (GC MEDIA_DATAPOINT_EXTRA / ' +
+            'collector keep_keys) or no video was received.',
         );
         await waitForClientCounterAbove(
           'sent_video',
           sentVideo,
-          'R-29: the sent-frames counter never reached Prometheus with media_kind="video".',
+          'R-29: the sent-frames counter never reached Prometheus with media_kind="video", ' +
+            'content_kind="main".',
         );
         // The absence half, over the SAME window the video arms just proved live.
         await expectClientCounterNotAbove(
           'received_kindless',
           receivedKindless,
-          'R-29: received frames reached Prometheus WITHOUT media_kind.',
+          'R-29: received frames reached Prometheus WITHOUT media_kind or WITHOUT content_kind.',
         );
       });
     } finally {

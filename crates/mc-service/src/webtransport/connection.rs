@@ -1432,7 +1432,7 @@ async fn reject_capability(
 /// request names; a request naming none never reaches here).
 fn record_mute_for_each(change: MuteChange, outcome: MuteOutcome) {
     for (kind, _) in change.named() {
-        metrics::record_mute_request(kind, outcome);
+        metrics::record_mute_request(kind.labels(), outcome);
     }
 }
 
@@ -1595,7 +1595,7 @@ async fn handle_mute_request(
                 } else {
                     MuteOutcome::Unchanged
                 };
-                metrics::record_mute_request(kind, outcome);
+                metrics::record_mute_request(kind.labels(), outcome);
             }
         }
         // This participant left the roster: the connection is already
@@ -1625,7 +1625,11 @@ async fn handle_mute_request(
 /// THAT kind's asked-for direction (`ServerMuteAction::from_muted`).
 fn record_server_mute_for_each(change: MuteChange, outcome: ServerMuteOutcome) {
     for (kind, muted) in change.named() {
-        metrics::record_server_mute_request(kind, ServerMuteAction::from_muted(muted), outcome);
+        metrics::record_server_mute_request(
+            kind.labels(),
+            ServerMuteAction::from_muted(muted),
+            outcome,
+        );
     }
 }
 
@@ -1781,7 +1785,7 @@ async fn handle_server_mute_request(
                     ServerMuteOutcome::Unchanged
                 };
                 metrics::record_server_mute_request(
-                    kind,
+                    kind.labels(),
                     ServerMuteAction::from_muted(muted),
                     outcome,
                 );

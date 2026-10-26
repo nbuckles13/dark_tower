@@ -21,17 +21,32 @@
 
 use crate::common::explain::{print_finding, Finding};
 use crate::common::git_changes::get_all_changed_files;
+use crate::common::kind_labels::{KIND_LABEL_KEYS, TS_PROJECTION_HOME};
 use crate::common::status::emit_ok;
+use crate::common::ts_lex::{lex, skip_ws, Lexed};
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::path::{Path, PathBuf};
 
 pub const METRIC_NAME_RULE_ID: &str = "metric_name";
+/// A `media_kind` / `content_kind` value spelled as a literal outside the TS
+/// projection home (`common::kind_labels::TS_PROJECTION_HOME`).
+pub const KIND_LABEL_LITERAL_RULE_ID: &str = "kind_label_literal";
+/// The kind-literal rule could not evaluate its input (home missing or holding
+/// no value literals). Never "fixed" by loosening the content rule.
+pub const KIND_LABEL_VACUOUS_RULE_ID: &str = "kind_label_vacuous";
 
 const EXTENSIONS: &[&str] = &[".ts", ".tsx", ".svelte"];
 
 const SCOPE_PREFIXES: &[&str] = &["packages/sdk-core/src/", "packages/web-app/src/"];
+
+/// Extra scope for the KIND-LITERAL rule ONLY, never the R-26 name rule: the
+/// acceptance harness builds PromQL read-backs here (`mcMetrics.ts`,
+/// `clientMetricNames.ts`), and a hand-written `media_kind="audio"` there is
+/// exactly the drift the rule closes. Kept out of [`SCOPE_PREFIXES`] on
+/// purpose: adding it there would silently widen metric-NAME checking to e2e.
+const KIND_LITERAL_EXTRA_SCOPE: &[&str] = &["packages/web-app/e2e/"];
 
 const EXCLUDED_PATH_PATTERNS: &[&str] = &["/node_modules/", "/dist/", "/__tests__/"];
 
@@ -148,6 +163,12 @@ fn dynamic_name_exempt(
 }
 
 fn is_in_scope(path: &Path) -> bool {
+    is_in_scope_of(path, SCOPE_PREFIXES)
+}
+
+/// The same exclusions as the name rule (tests, specs, `dist`, declarations),
+/// over an explicit prefix list.
+fn is_in_scope_of(path: &Path, prefixes: &[&str]) -> bool {
     let Some(s) = path.to_str() else {
         return false;
     };
@@ -157,7 +178,214 @@ fn is_in_scope(path: &Path) -> bool {
     if EXCLUDED_FILE_SUFFIXES.iter().any(|suf| s.ends_with(suf)) {
         return false;
     }
-    SCOPE_PREFIXES.iter().any(|prefix| s.starts_with(prefix))
+    prefixes.iter().any(|prefix| s.starts_with(prefix))
+}
+
+/// Is `path` in the KIND-LITERAL rule's scope: the name rule's scope plus
+/// [`KIND_LITERAL_EXTRA_SCOPE`].
+fn is_in_kind_scope(path: &Path) -> bool {
+    is_in_scope_of(path, SCOPE_PREFIXES) || is_in_scope_of(path, KIND_LITERAL_EXTRA_SCOPE)
+}
+
+// ---------------------------------------------------------------------------
+// Kind-label literal rule (2026-10-26; label-taxonomy.md §"Carried:
+// `media_kind` and `content_kind`"). The values of the two kind labels are
+// spelled ONLY in the TS projection home; every other site reads them from
+// `projectMediaKind` / `MEDIA_KIND_LABEL_PROJECTION`.
+//
+// Two literal positions, both read through `common::ts_lex` (comments
+// stripped, string spans known), so a literal in a comment is green:
+//  * OBJECT form — a kind key (bare identifier or quoted) outside any string,
+//    followed by `:`, `=`, `==` or `===` / `!=` / `!==`, then a string or
+//    template literal: `{ media_kind: 'audio' }`, `l.content_kind === 'main'`.
+//  * PROMQL form — inside a string or template literal, a kind key followed by
+//    `=`, `!=`, `=~` or `!~` and a `"` whose next char is a letter:
+//    `media_kind="audio"`. `media_kind="${MEDIA_KIND_AUDIO}"` is green (the
+//    value comes from the projection through a constant).
+// ---------------------------------------------------------------------------
+
+/// One kind-literal hit: 1-based line and the key it was spelled for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KindHit {
+    line: usize,
+    key: &'static str,
+}
+
+/// Length of the comparison/assignment operator at `i` in the OBJECT form.
+fn object_op_len(text: &str, i: usize) -> Option<usize> {
+    let rest = text.get(i..)?;
+    ["===", "!==", "==", "!=", ":", "="]
+        .iter()
+        .find(|op| rest.starts_with(**op) && !rest.starts_with("::") && !rest.starts_with("=>"))
+        .map(|op| op.len())
+}
+
+/// Every kind-literal hit in TS source, over the given key set (the seam for
+/// the neutered-matcher proof).
+fn kind_literal_hits(src: &str, keys: &[&'static str]) -> Vec<KindHit> {
+    let lexed: Lexed = lex(src);
+    let text = &lexed.text;
+    let mut hits = Vec::new();
+    for key in keys {
+        for (pos, _) in text.match_indices(key) {
+            let after_key = pos + key.len();
+            let before = text.get(..pos).and_then(|t| t.chars().next_back());
+            let after = text.get(after_key..).and_then(|t| t.chars().next());
+            let ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+            if before.is_some_and(ident_char) || after.is_some_and(ident_char) {
+                continue;
+            }
+            match lexed.string_at(pos) {
+                // OBJECT form, quoted key: the whole literal IS the key.
+                Some(lit) if lit.body(text) == *key => {
+                    if object_value_is_literal(&lexed, lit.end) {
+                        hits.push(KindHit {
+                            line: lexed.line_of(pos),
+                            key,
+                        });
+                    }
+                }
+                // PROMQL form: inside a string.
+                Some(_) => {
+                    if promql_value_is_literal(text, after_key) {
+                        hits.push(KindHit {
+                            line: lexed.line_of(pos),
+                            key,
+                        });
+                    }
+                }
+                // OBJECT form, bare key.
+                None => {
+                    if object_value_is_literal(&lexed, after_key) {
+                        hits.push(KindHit {
+                            line: lexed.line_of(pos),
+                            key,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    hits.sort_by_key(|h| (h.line, h.key));
+    hits
+}
+
+/// After a key at `from` (optionally closing a computed access `x['key']`):
+/// an object operator, then a string/template literal.
+fn object_value_is_literal(lexed: &Lexed, from: usize) -> bool {
+    let mut i = skip_ws(&lexed.text, from);
+    if lexed.text.as_bytes().get(i) == Some(&b']') {
+        i = skip_ws(&lexed.text, i + 1);
+    }
+    let Some(op) = object_op_len(&lexed.text, i) else {
+        return false;
+    };
+    let v = skip_ws(&lexed.text, i + op);
+    lexed.string_starting_at(v).is_some()
+}
+
+/// After a key inside a string at `from`: a PromQL matcher operator, then `"`
+/// and a letter (a hand-written value, not `${…}`).
+fn promql_value_is_literal(text: &str, from: usize) -> bool {
+    let i = skip_ws(text, from);
+    let Some(rest) = text.get(i..) else {
+        return false;
+    };
+    let op = ["=~", "!~", "!=", "="]
+        .iter()
+        .find(|op| rest.starts_with(**op))
+        .map_or(0, |op| op.len());
+    if op == 0 {
+        return false;
+    }
+    // PromQL string values may be `"…"`, `'…'` or `` `…` `` (inside a TS
+    // template a backtick arrives escaped as `` \` ``).
+    let v = skip_ws(text, i + op);
+    let rest = text.get(v..).unwrap_or("");
+    let rest = rest.strip_prefix('\\').unwrap_or(rest);
+    let mut chars = rest.chars();
+    matches!(chars.next(), Some('"' | '\'' | '`'))
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+}
+
+/// Every in-scope TS file of the kind rule, repo-relative and sorted: the FULL
+/// tree, not the changed set (a literal must not survive because its file is
+/// untouched).
+fn kind_scope_files(repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for prefix in SCOPE_PREFIXES.iter().chain(KIND_LITERAL_EXTRA_SCOPE) {
+        let dir = repo_root.join(prefix.trim_end_matches('/'));
+        if !dir.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&dir)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(|e| e.file_name() != "node_modules" && e.file_name() != "dist")
+        {
+            // An unreadable entry is an error, never a silently smaller scope.
+            let entry = entry.with_context(|| format!("walk {prefix}"))?;
+            let Ok(rel) = entry.path().strip_prefix(repo_root) else {
+                continue;
+            };
+            let rel = PathBuf::from(rel.to_string_lossy().replace('\\', "/"));
+            let is_source = EXTENSIONS
+                .iter()
+                .any(|ext| rel.to_string_lossy().ends_with(ext));
+            if entry.file_type().is_file() && is_source && is_in_kind_scope(&rel) {
+                out.push(rel);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// One kind-rule finding: `(rule, file, line, message)`.
+type KindFinding = (&'static str, String, usize, String);
+
+/// The kind rule over the tree: its findings and the number of literals SEEN
+/// in the home (the positive control: zero is vacuity).
+fn kind_findings(repo_root: &Path, keys: &[&'static str]) -> Result<(Vec<KindFinding>, usize)> {
+    let mut out = Vec::new();
+    let home_seen = match std::fs::read_to_string(repo_root.join(TS_PROJECTION_HOME)) {
+        Ok(src) => kind_literal_hits(&src, keys).len(),
+        Err(_) => 0,
+    };
+    if home_seen == 0 {
+        out.push((
+            KIND_LABEL_VACUOUS_RULE_ID,
+            TS_PROJECTION_HOME.to_string(),
+            0,
+            format!(
+                "the TS kind-label projection home {TS_PROJECTION_HOME} is missing or holds no \
+                 kind-label value literals; update TS_PROJECTION_HOME (common::kind_labels) in \
+                 the same change that moves it"
+            ),
+        ));
+    }
+    for rel in kind_scope_files(repo_root)? {
+        let rel_s = rel.to_string_lossy().to_string();
+        if rel_s == TS_PROJECTION_HOME {
+            continue;
+        }
+        let src = std::fs::read_to_string(repo_root.join(&rel))
+            .with_context(|| format!("reading {rel_s}"))?;
+        for hit in kind_literal_hits(&src, keys) {
+            out.push((
+                KIND_LABEL_LITERAL_RULE_ID,
+                rel_s.clone(),
+                hit.line,
+                format!(
+                    "`{}` value spelled as a literal; take it from the projection \
+                     (`projectMediaKind` / `MEDIA_KIND_LABEL_PROJECTION` in {TS_PROJECTION_HOME})",
+                    hit.key
+                ),
+            ));
+        }
+    }
+    Ok((out, home_seen))
 }
 
 struct Hit {
@@ -341,12 +569,50 @@ fn scan_file(repo_root: &Path, path: &Path) -> Result<Vec<Hit>> {
     Ok(hits)
 }
 
+/// The run's verdict over both rules: fail ONCE naming every count, so
+/// neither rule's findings mask the other's.
+fn verdict(name_count: usize, kind_count: usize) -> Result<()> {
+    match (name_count, kind_count) {
+        (0, 0) => Ok(()),
+        (n, 0) => anyhow::bail!("ts-metric-name-violation-{n}"),
+        (0, k) => anyhow::bail!("ts-kind-label-violation-{k}"),
+        (n, k) => anyhow::bail!("ts-metric-name-violation-{n}-and-kind-label-violation-{k}"),
+    }
+}
+
 pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
-    // Scaffold-now / fire-later: if neither target package exists yet, exit clean.
+    // The kind-literal rule runs FIRST, over the FULL scope, independent of
+    // the changed set the name rule reads — and before the scaffold exit
+    // below, so a wrong root or a moved package (projection home missing)
+    // reds as `kind_label_vacuous` instead of reporting OK.
+    let (kind, _) = kind_findings(repo_root, &KIND_LABEL_KEYS)?;
+    for (rule, file, line, message) in &kind {
+        if explain {
+            let policy = format!("ts-name-guard-dt-client::{rule}");
+            print_finding(&Finding {
+                file,
+                row: *line,
+                col: 0,
+                policy: &policy,
+                matched: message,
+                extras: &[],
+                src_file: file!(),
+                src_line: line!(),
+            });
+        } else {
+            println!("VIOLATION: {file}:{line} ({rule}) {message}");
+        }
+    }
+    // Both rules always run and report; the run fails ONCE via `verdict`.
+    let kind_count = kind.len();
+
+    // Scaffold-now / fire-later: if neither target package exists yet, the
+    // NAME rule has nothing to read.
     let any_target_present = SCOPE_PREFIXES
         .iter()
         .any(|prefix| repo_root.join(prefix.trim_end_matches('/')).is_dir());
     if !any_target_present {
+        verdict(0, kind_count)?;
         emit_ok("ts-name-guard-dt-client-targets-absent");
         return Ok(());
     }
@@ -361,6 +627,7 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
         .collect();
 
     if in_scope.is_empty() {
+        verdict(0, kind_count)?;
         emit_ok("ts-name-guard-dt-client-no-files");
         return Ok(());
     }
@@ -372,6 +639,7 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
     }
 
     if all_hits.is_empty() {
+        verdict(0, kind_count)?;
         emit_ok(format!(
             "ts-name-guard-dt-client-clean-{}-files",
             in_scope.len()
@@ -409,7 +677,7 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
         }
     }
 
-    anyhow::bail!("ts-metric-name-violation-{}", all_hits.len())
+    verdict(all_hits.len(), kind_count)
 }
 
 #[cfg(test)]
@@ -783,5 +1051,171 @@ meter.createGauge(\"dt_client_c\");";
         let v = violations(&src);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], "<non-literal or interpolated metric name>");
+    }
+
+    // -- Kind-label literal rule (2026-10-26) ---------------------------------
+
+    fn kind_lines(src: &str) -> Vec<(usize, &'static str)> {
+        kind_literal_hits(src, &KIND_LABEL_KEYS)
+            .into_iter()
+            .map(|h| (h.line, h.key))
+            .collect()
+    }
+
+    /// Each red form with the exact (line, key) it must produce.
+    const KIND_RED: &[(&str, usize, &str)] = &[
+        ("const q = `x{media_kind='audio'}`;\n", 1, "media_kind"),
+        (
+            "const q = `x{content_kind=\\`main\\`}`;\n",
+            1,
+            "content_kind",
+        ),
+        (
+            "if (labels['media_kind'] === 'video') {}\n",
+            1,
+            "media_kind",
+        ),
+        (
+            "const a = 1;\nconst l = { media_kind: 'audio' };\n",
+            2,
+            "media_kind",
+        ),
+        (
+            "const l = {\n  'content_kind': \"main\",\n};\n",
+            2,
+            "content_kind",
+        ),
+        ("const l = { media_kind: `video` };\n", 1, "media_kind"),
+        ("if (x.content_kind === 'main') {}\n", 1, "content_kind"),
+        (
+            "const q = `sum(x{media_kind=\"audio\"})`;\n",
+            1,
+            "media_kind",
+        ),
+        (
+            "const q = 'x{content_kind=~\"main|screen\"}';\n",
+            1,
+            "content_kind",
+        ),
+    ];
+
+    #[test]
+    fn kind_literal_hits_every_red_form_at_its_line() {
+        for (src, line, key) in KIND_RED {
+            assert_eq!(kind_lines(src), vec![(*line, *key)], "{src}");
+        }
+    }
+
+    #[test]
+    fn projection_reads_interpolation_comments_and_longer_names_stay_green() {
+        for src in [
+            "const l = { media_kind: p.media_kind, content_kind: p.content_kind };\n",
+            "const q = `x{media_kind=\"${MEDIA_KIND_AUDIO}\"}`;\n",
+            "// { media_kind: 'audio' }\n/* content_kind: 'main' */\n",
+            "const o = { media_kind_unsupported: 'x', outcome: 'media_kind' };\n",
+            "const s = 'by (media_kind, content_kind)';\n",
+        ] {
+            assert_eq!(kind_lines(src), vec![], "{src}");
+        }
+    }
+
+    /// The neutered-matcher proof: an empty key set turns every red green.
+    #[test]
+    fn red_kind_fixtures_go_green_with_the_key_set_neutered() {
+        for (src, _, _) in KIND_RED {
+            assert!(kind_literal_hits(src, &[]).is_empty(), "{src}");
+        }
+    }
+
+    /// The e2e widening is the kind rule's own scope: an e2e helper is in it,
+    /// and NOT in the R-26 name rule's scope.
+    #[test]
+    fn e2e_helpers_are_in_the_kind_scope_only() {
+        let e2e = Path::new("packages/web-app/e2e/mcMetrics.ts");
+        assert!(is_in_kind_scope(e2e));
+        assert!(!is_in_scope(e2e));
+        assert!(!is_in_kind_scope(Path::new(
+            "packages/web-app/e2e/multi-party-hear.spec.ts"
+        )));
+        let src = "const q = `x{media_kind=\"audio\"}`;\nmeter.createCounter('not_r26');\n";
+        assert_eq!(kind_lines(src), vec![(1, "media_kind")]);
+    }
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    /// Positive control on the REAL tree: no literal outside the home, the
+    /// home's six values (3 entries x 2 keys) SEEN, and real files scanned.
+    #[test]
+    fn the_real_tree_is_kind_clean_and_the_home_is_seen() {
+        let (findings, home_seen) = kind_findings(&repo_root(), &KIND_LABEL_KEYS).unwrap();
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(home_seen, 6, "the projection record's 3 x 2 value literals");
+        let files = kind_scope_files(&repo_root()).unwrap();
+        assert!(
+            files.iter().any(|f| f.starts_with("packages/web-app/e2e")),
+            "e2e scanned"
+        );
+        assert!(
+            files.iter().any(|f| f.starts_with("packages/sdk-core/src")),
+            "sdk scanned"
+        );
+    }
+
+    /// A literal planted into a copy of the REAL e2e helper must hit.
+    #[test]
+    fn a_literal_planted_in_a_real_e2e_helper_hits() {
+        let real =
+            std::fs::read_to_string(repo_root().join("packages/web-app/e2e/mcMetrics.ts")).unwrap();
+        let planted = format!("{real}\nconst PLANTED = `x{{media_kind=\"video\"}}`;\n");
+        assert_eq!(kind_lines(&real), vec![]);
+        assert_eq!(kind_lines(&planted).len(), 1);
+    }
+
+    #[test]
+    fn a_missing_or_valueless_home_is_vacuous() {
+        let dir = tempfile::tempdir().unwrap();
+        let (f, seen) = kind_findings(dir.path(), &KIND_LABEL_KEYS).unwrap();
+        assert_eq!(seen, 0);
+        assert_eq!(
+            f.iter().map(|x| (x.0, x.1.as_str())).collect::<Vec<_>>(),
+            vec![(KIND_LABEL_VACUOUS_RULE_ID, TS_PROJECTION_HOME)]
+        );
+        // Present but holding no kind value literals.
+        let home = dir.path().join(TS_PROJECTION_HOME);
+        std::fs::create_dir_all(home.parent().unwrap()).unwrap();
+        std::fs::write(&home, "export const x = { media_kind: kind };\n").unwrap();
+        let (f, seen) = kind_findings(dir.path(), &KIND_LABEL_KEYS).unwrap();
+        assert_eq!(seen, 0);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].0, KIND_LABEL_VACUOUS_RULE_ID);
+    }
+
+    /// A wrong root (no target package at all) is NOT ok: the kind rule runs
+    /// before the scaffold exit and reds on the missing home.
+    #[test]
+    fn a_run_over_an_empty_root_is_not_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(dir.path(), false).unwrap_err().to_string();
+        assert_eq!(err, "ts-kind-label-violation-1");
+    }
+
+    /// Neither rule masks the other: the verdict names both counts.
+    #[test]
+    fn the_verdict_names_both_rules_counts() {
+        assert!(verdict(0, 0).is_ok());
+        assert_eq!(
+            verdict(2, 0).unwrap_err().to_string(),
+            "ts-metric-name-violation-2"
+        );
+        assert_eq!(
+            verdict(0, 3).unwrap_err().to_string(),
+            "ts-kind-label-violation-3"
+        );
+        assert_eq!(
+            verdict(2, 3).unwrap_err().to_string(),
+            "ts-metric-name-violation-2-and-kind-label-violation-3"
+        );
     }
 }

@@ -335,6 +335,32 @@ What MC operators need from it:
   on Kind, `deploy.sh` from the last pre-story-3 commit, then the bundle.
 - **For a video-only incident, use the [video-off lever](#video-off-lever) BEFORE any rollback.**
 
+### Kind-label `content_kind` (2026-10-26): receiving side first, series identity changes
+
+`docs/devloop-outputs/2026-10-26-mediakind-metric-labels/` adds `content_kind` beside
+`media_kind` on every per-kind MC and client series. It is ONE revert unit — GC
+(`MEDIA_DATAPOINT_EXTRA` admits the key), the OTel collector (`keep_keys` + the exact
+`^(main|screen)$` rule), MC, the browser SDK, and the alert rules + dashboards — and it has
+one safe direction:
+
+- **Roll out the receiving side (GC + collector) BEFORE MC and the SDK; revert it AFTER them.**
+  A client emitting `content_kind` into a GC that does not admit the key gets the label
+  stripped on every honest client and counted on `gc_telemetry_pii_attributes_dropped_total`
+  as a datapoint drop, and its `main`/`screen` points collapse into one series. On Kind the
+  single `deploy.sh` converge applies all of them together; the bundle follows.
+- **Expected at rollout, not an incident.** Every per-kind series is a NEW series (series
+  identity, not traffic). `rate()` / `increase()` panels ramp on the new series, and the
+  `for:`-gated ratio alerts (`MCMediaMissingKeyMaterial`, the client video alerts) restart
+  their timers. Every series reads `content_kind="main"` until screen share ships.
+- **Open tabs do not deploy atomically** (see [§0](#0-roll-the-browser-sdk-first-story-2-task-20-and-later)
+  and the stale-bundle tail above). FORWARD: a tab still on the previous bundle sends
+  `media_kind` without `content_kind`; the collector's all-or-none rule stores it as
+  `media_kind="invalid", content_kind="invalid"`, so it is invisible to the
+  `content_kind="main"` panels and alerts until it reloads. A burst of `invalid` right after
+  rollout is that tail, not a patched client. REVERT: tabs on the new bundle keep sending
+  `content_kind` into the reverted GC, so `gc_telemetry_pii_attributes_dropped_total{kind="datapoint"}`
+  ticks until they reload — expected, not a leak.
+
 ### 0. Roll the browser SDK first (story 2 task 20 and later)
 
 > **Scope (corrected 2026-10-21, story 3 OPS-A, R-25): this step does NOT apply to the story-3
@@ -570,7 +596,7 @@ kubectl logs deployment/mc-1 -n dark-tower | grep "Configuration loaded successf
 - [ ] `video_min_keyframe_interval_ms` matches `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS` in
       `infra/services/mc-service/config.env` (MC's own ConfigMap since amendment 4 — not
       `profile.env`).
-      The same values are readable at runtime on `mc_media_receive_slot_cap{media_kind}`
+      The same values are readable at runtime on `mc_media_receive_slot_cap{media_kind, content_kind}`
       and `mc_media_video_keyframe_min_interval_seconds`.
 - [ ] **mc-0 and mc-1 report identical values.** They read one shared ConfigMap,
       so a difference means one Deployment's `configMapKeyRef` block is stale —
@@ -875,9 +901,9 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 | `MC_TLS_KEY_PATH` | **Yes** | PEM private key for the WebTransport server. Existence checked at startup, with the same caveat as `MC_TLS_CERT_PATH` above. | None | `/etc/mc-tls/tls.key` |
 | `MC_GRPC_ADVERTISE_ADDRESS` | **Yes** | Address GC uses to reach this pod's gRPC. Built from the downward-API `POD_IP`. | None | `http://$(POD_IP):50052` |
 | `MC_WEBTRANSPORT_ADVERTISE_ADDRESS` | **Yes** | Address GC hands clients for this pod. **Per-instance** — from `mc-0-config` / `mc-1-config`, not the shared ConfigMap. | None | `https://127.0.0.1:4433` |
-| `MC_MAX_RECEIVE_SLOTS` *(RETIRED by story 3)* | No — **no longer read by MC**; ref `optional: true` | Superseded by the per-kind caps below (in story 2 it was a **TOTAL** across kinds, rejected an over-cap declaration whole as `slot_count_over_cap`, and was published as `mc_media_receive_slot_cap{media_kind="audio"}`; none of that happens now). **The key MUST stay in the ConfigMap until the rollback window closes**: a one-version MC rollback to the pre-MC-A image still hard-reads it. Deletion is scheduled in `docs/TODO.md` §Media Path Obligations, "Delete the story-3 retired config keys". Do not tune it. | `8` (in ConfigMap) | `8` |
-| `MC_MAX_AUDIO_RECEIVE_SLOTS` *(story 3)* | **Yes** (hard ref) | Max AUDIO receive slots per client (R-1). Each kind is **truncated** to its own cap: excess slots report `SLOT_STATE_UNAVAILABLE`, which is visible, **never a join failure** (this supersedes story 2's whole-declaration reject). Bounds `MIN_AUDIO_RECEIVE_SLOTS..=MAX_AUDIO_RECEIVE_SLOTS` (1..=64) in `crates/mc-service/src/config.rs`; out of range refuses boot. The floor is not 0, because an audio cap of 0 would be a silent total outage that reads as valid config. Read ONCE at startup; live slot vectors are never re-truncated. Carried to clients as the AUDIO entry of `JoinResponse.receive_slot_caps` (tag 15, one entry per kind) and published as `mc_media_receive_slot_cap{media_kind="audio"}`. | `8` (in ConfigMap) | `8` |
-| `MC_MAX_VIDEO_RECEIVE_SLOTS` *(story 3)* | **Yes** (hard ref) | Max VIDEO receive slots per client (R-1), truncated like audio. Bounds `MIN_VIDEO_RECEIVE_SLOTS..=MAX_VIDEO_RECEIVE_SLOTS` (0..=64) in `crates/mc-service/src/config.rs`. **0 is legal: it is the [video-off lever](#video-off-lever)** (R-26). It lives in this ConfigMap only, never in `media-codec-profile`, so changing it rolls MC and never MH. Read once at startup, like audio. Carried as the VIDEO_CAMERA entry of `JoinResponse.receive_slot_caps` (tag 15, one entry per kind) and published as `mc_media_receive_slot_cap{media_kind="video"}`; 0 confirms the lever. | `4` (in ConfigMap) | `0` = video off |
+| `MC_MAX_RECEIVE_SLOTS` *(RETIRED by story 3)* | No — **no longer read by MC**; ref `optional: true` | Superseded by the per-kind caps below (in story 2 it was a **TOTAL** across kinds, rejected an over-cap declaration whole as `slot_count_over_cap`, and was published on the audio slot-cap gauge; none of that happens now). **The key MUST stay in the ConfigMap until the rollback window closes**: a one-version MC rollback to the pre-MC-A image still hard-reads it. Deletion is scheduled in `docs/TODO.md` §Media Path Obligations, "Delete the story-3 retired config keys". Do not tune it. | `8` (in ConfigMap) | `8` |
+| `MC_MAX_AUDIO_RECEIVE_SLOTS` *(story 3)* | **Yes** (hard ref) | Max AUDIO receive slots per client (R-1). Each kind is **truncated** to its own cap: excess slots report `SLOT_STATE_UNAVAILABLE`, which is visible, **never a join failure** (this supersedes story 2's whole-declaration reject). Bounds `MIN_AUDIO_RECEIVE_SLOTS..=MAX_AUDIO_RECEIVE_SLOTS` (1..=64) in `crates/mc-service/src/config.rs`; out of range refuses boot. The floor is not 0, because an audio cap of 0 would be a silent total outage that reads as valid config. Read ONCE at startup; live slot vectors are never re-truncated. Carried to clients as the AUDIO entry of `JoinResponse.receive_slot_caps` (tag 15, one entry per kind) and published as `mc_media_receive_slot_cap{media_kind="audio", content_kind="main"}`. | `8` (in ConfigMap) | `8` |
+| `MC_MAX_VIDEO_RECEIVE_SLOTS` *(story 3)* | **Yes** (hard ref) | Max VIDEO receive slots per client (R-1), truncated like audio. Bounds `MIN_VIDEO_RECEIVE_SLOTS..=MAX_VIDEO_RECEIVE_SLOTS` (0..=64) in `crates/mc-service/src/config.rs`. **0 is legal: it is the [video-off lever](#video-off-lever)** (R-26). It lives in this ConfigMap only, never in `media-codec-profile`, so changing it rolls MC and never MH. Read once at startup, like audio. Carried as the VIDEO_CAMERA entry of `JoinResponse.receive_slot_caps` (tag 15, one entry per kind) and published as `mc_media_receive_slot_cap{media_kind="video", content_kind="main"}`; 0 confirms the lever. | `4` (in ConfigMap) | `0` = video off |
 | `MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS` | **Yes** | Per-connection budget on *accepted* capability declarations. Bounds client-driven O(N) meeting-actor work; over-budget declarations are rejected and counted. | `64` (in ConfigMap) | `64` |
 | `MC_AUDIO_CODEC`, `MC_AUDIO_MAX_BITRATE_BPS`, `MC_AUDIO_FRAME_RATE_HZ` *(RETIRED by story 3)* | No — **no longer read by MC**; refs `optional: true` | Superseded by `MEDIA_AUDIO_CODEC`, `MEDIA_AUDIO_MAX_BITRATE_BPS` and `MEDIA_AUDIO_FRAME_RATE_HZ` in the shared profile (rows below); the directive clients receive carries the profile's values. **The keys MUST stay in the ConfigMap until the rollback window closes**: a one-version MC rollback to the pre-MC-A image still hard-reads, validates and directs them, so keep them equal to the profile's audio keys until deletion. Deletion is scheduled with `MC_MAX_RECEIVE_SLOTS`. | `opus` / `48000` / `50` (in ConfigMap) | — |
 | `MEDIA_VIDEO_CODEC`, `MEDIA_VIDEO_WIDTH`, `MEDIA_VIDEO_HEIGHT`, `MEDIA_VIDEO_FRAME_RATE_HZ`, `MEDIA_VIDEO_MAX_BITRATE_BPS` *(story 3)* | **Yes** (hard ref to ConfigMap **`media-codec-profile`**) | The VP8 send directive MC gives video publishers (R-8). MC reads all eight profile keys. Bounds (`crates/mc-service/src/media_signaling/directive.rs`): VP8 only; width and height `VIDEO_DIMENSION_MIN_PX..=VIDEO_DIMENSION_MAX_PX` (16..=1920); frame rate `VIDEO_FRAME_RATE_MIN_HZ..=VIDEO_FRAME_RATE_MAX_HZ` (1..=60); bitrate `VIDEO_BITRATE_MIN_BPS..=VIDEO_BITRATE_MAX_BPS` (100000..=4000000). An unknown codec or an out-of-bounds value refuses boot and never falls back. MH also derives its video cost from the frame rate and bitrate, so **editing any profile key rolls mc-0, mc-1, mh-0 and mh-1 together**, and the MH roll sheds every session on each pod. | `profile.env` | — |
@@ -970,9 +996,9 @@ This subsection carries only the MC procedure.
 - **When it applies.** MC reads the caps ONCE at startup and never re-truncates a live slot
   vector; the lever applies to declarations made after the MC restart — and that restart
   reconnects everyone, so in practice every participant re-joins under the new cap.
-- **Confirm.** `mc_media_receive_slot_cap{media_kind="video"}` reads **0 on both mc-0 and mc-1**
+- **Confirm.** `mc_media_receive_slot_cap{media_kind="video", content_kind="main"}` reads **0 on both mc-0 and mc-1**
   (and the startup line's `max_video_receive_slots=0`), and
-  `mc_media_slot_states_total{media_kind="video",slot_state="unavailable"}` rises while every
+  `mc_media_slot_states_total{media_kind="video", content_kind="main",slot_state="unavailable"}` rises while every
   other video slot state stays flat.
 - **Undo.** Make the reverse edit the same way. It costs another MC roll, and restores directives.
 - **A host's server unmute can resume a participant's camera or microphone** (R-18), at any time

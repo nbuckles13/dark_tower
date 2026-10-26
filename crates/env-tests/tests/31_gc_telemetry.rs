@@ -722,12 +722,13 @@ async fn test_traces_pii_nonallowlisted_span_attr_filtered() {
 }
 
 // ============================================================================
-// Story 3 R-29: the collector's EXACT `media_kind` value rule, end to end
+// Story 3 R-29 (+ `content_kind`, 2026-10-26): the collector's EXACT kind
+// value rules, end to end
 // ============================================================================
 
-/// The media-kind label key (pinned against `common` in the hygiene kernel).
+/// The kind label keys (pinned against `common` in the hygiene kernel).
 #[cfg(feature = "observability")]
-use env_tests::fixtures::metric_hygiene::MEDIA_KIND_KEY;
+use env_tests::fixtures::metric_hygiene::{CONTENT_KIND_KEY, MEDIA_KIND_KEY};
 
 /// An EXPORTED, per-kind client name that NO alert or browser read-back
 /// selects on, written at value 0. Not `frames_received`: that feeds
@@ -742,15 +743,24 @@ const MEDIA_KIND_PROBE_METRIC: &str = "dt_client_media_send_queue_depth";
 /// and shape-checked by the collector), so the read-back selects only this
 /// run's case and a stale series from an earlier run cannot satisfy it.
 #[cfg(feature = "observability")]
-fn media_kind_probe_point(marker: &str, kind: Option<Value>) -> NumberDataPoint {
+fn media_kind_probe_point(
+    key: &str,
+    companion: (&str, &str),
+    marker: &str,
+    kind: Option<Value>,
+) -> NumberDataPoint {
     let mut attributes = vec![
         string_attr("client_version", marker),
         string_attr("key_custody", "operator"),
     ];
     if let Some(v) = kind {
+        // The other kind key, valid: a LONE kind key is poisoned to
+        // invalid/invalid by the collector's pair rules (all or none), which
+        // would mask the value rule under test.
+        attributes.push(string_attr(companion.0, companion.1));
         attributes.push(KeyValue {
             key_strindex: 0,
-            key: MEDIA_KIND_KEY.to_string(),
+            key: key.to_string(),
             value: Some(AnyValue { value: Some(v) }),
         });
     }
@@ -777,6 +787,41 @@ fn media_kind_probe_point(marker: &str, kind: Option<Value>) -> NumberDataPoint 
 #[cfg(feature = "observability")]
 #[tokio::test]
 async fn test_metrics_media_kind_value_rule_fires_and_applies() {
+    kind_value_rule_fires_and_applies(
+        MEDIA_KIND_KEY,
+        "video",
+        (CONTENT_KIND_KEY, "main"),
+        "mk",
+        "^(audio|video)$",
+    )
+    .await;
+}
+
+/// (2026-10-26) The `content_kind` twin: same three cases plus `absent`, under
+/// the collector's exact `^(main|screen)$` rule. Each probe also carries a
+/// valid `media_kind` (a lone key is poisoned by the pair rules); only the
+/// probed key is asserted.
+#[cfg(feature = "observability")]
+#[tokio::test]
+async fn test_metrics_content_kind_value_rule_fires_and_applies() {
+    kind_value_rule_fires_and_applies(
+        CONTENT_KIND_KEY,
+        "main",
+        (MEDIA_KIND_KEY, "audio"),
+        "ck",
+        "^(main|screen)$",
+    )
+    .await;
+}
+
+#[cfg(feature = "observability")]
+async fn kind_value_rule_fires_and_applies(
+    key: &str,
+    good: &str,
+    companion: (&str, &str),
+    tag: &str,
+    rule: &str,
+) {
     let cluster = cluster().await;
     let token = shared_user_token(cluster).await;
     let gc = GcClient::new(&cluster.gc_base_url);
@@ -788,11 +833,7 @@ async fn test_metrics_media_kind_value_rule_fires_and_applies() {
     // `!= nil` conjunct live — it must arrive with no media_kind at all, never
     // `invalid`.
     let cases: [(&str, Option<Value>, Option<&str>); 4] = [
-        (
-            "video",
-            Some(Value::StringValue("video".into())),
-            Some("video"),
-        ),
+        (good, Some(Value::StringValue(good.into())), Some(good)),
         (
             "bogus",
             Some(Value::StringValue("bogus".into())),
@@ -803,7 +844,7 @@ async fn test_metrics_media_kind_value_rule_fires_and_applies() {
     ];
     let markers: Vec<String> = cases
         .iter()
-        .map(|(name, _, _)| format!("et31-mk-{name}-{run}"))
+        .map(|(name, _, _)| format!("et31-{tag}-{name}-{run}"))
         .collect();
 
     let body = ExportMetricsServiceRequest {
@@ -817,7 +858,9 @@ async fn test_metrics_media_kind_value_rule_fires_and_applies() {
                         data_points: cases
                             .iter()
                             .zip(&markers)
-                            .map(|((_, v, _), m)| media_kind_probe_point(m, v.clone()))
+                            .map(|((_, v, _), m)| {
+                                media_kind_probe_point(key, companion, m, v.clone())
+                            })
                             .collect(),
                     })),
                     ..Default::default()
@@ -881,15 +924,14 @@ async fn test_metrics_media_kind_value_rule_fires_and_applies() {
             .iter()
             .filter(|s| s.metric.get("client_version") == Some(marker))
             .collect();
-        let kinds: Vec<Option<&String>> =
-            mine.iter().map(|s| s.metric.get(MEDIA_KIND_KEY)).collect();
+        let kinds: Vec<Option<&String>> = mine.iter().map(|s| s.metric.get(key)).collect();
         assert_eq!(
             kinds,
             vec![want.map(str::to_string).as_ref()],
             "media-kind-value-rule: case `{name}` must arrive as exactly one series with \
-             {MEDIA_KIND_KEY}={want:?}; got {kinds:?}. `bogus`/int surviving means the \
-             collector's exact `^(audio|video)$` rewrite is not in the deployed config; \
-             `video` rewritten means the rule is over-tight; `absent` acquiring a value \
+             {key}={want:?}; got {kinds:?}. `bogus`/int surviving means the \
+             collector's exact `{rule}` rewrite is not in the deployed config; \
+             `{good}` rewritten means the rule is over-tight; `absent` acquiring a value \
              means the rule's `!= nil` guard is broken and kind-free series are being \
              stamped `invalid`."
         );
@@ -897,8 +939,8 @@ async fn test_metrics_media_kind_value_rule_fires_and_applies() {
     assert!(
         !result
             .iter()
-            .any(|s| s.metric.get(MEDIA_KIND_KEY).map(String::as_str) == Some("bogus")),
-        "media-kind-value-rule: a `{MEDIA_KIND_KEY}=\"bogus\"` series was stored"
+            .any(|s| s.metric.get(key).map(String::as_str) == Some("bogus")),
+        "media-kind-value-rule: a `{key}=\"bogus\"` series was stored"
     );
 }
 
@@ -932,6 +974,12 @@ fn fire_attrs(marker: &str, reason: Option<&str>) -> Vec<KeyValue> {
         string_attr("client_version", marker),
         string_attr("key_custody", "operator"),
         string_attr(env_tests::fixtures::metric_hygiene::MEDIA_KIND_KEY, "video"),
+        // The video alerts select the camera (`content_kind="main"`) since
+        // 2026-10-26 (label-taxonomy.md §query rule).
+        string_attr(
+            env_tests::fixtures::metric_hygiene::CONTENT_KIND_KEY,
+            "main",
+        ),
     ];
     if let Some(r) = reason {
         v.push(string_attr("reason", r));

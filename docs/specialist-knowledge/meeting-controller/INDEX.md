@@ -11,7 +11,7 @@
 - Service entry point (fleet-gauge samplers) → `crates/mc-service/src/main.rs`
 - Config (env loading, TLS, advertise addresses, ADR-0036 media keys, `Config::kek_lifecycle`) → `crates/mc-service/src/config.rs`
 - Error types (McError hierarchy) → `crates/mc-service/src/errors.rs`
-- Media kinds (`MediaKindLabel`, `served_kind`, `KNOWN_WIRE_KINDS`), the ONE kind-keyed list parser (`parse_kind_list`, `KindListRefusal`), the per-kind state MC stores (`ClientMediaStates` = publish set + client mute per kind, `ServerMuteAttribution` = server mute + imposer per kind, together `MediaStates`), request types (`MuteChange` → `PublishedMuteChange` via `against`, `RequestedKinds`) and the media-policy halves (`ServerMutedKinds` / `ClientMutedKinds`) → `crates/mc-service/src/media_kind.rs`
+- Media kinds (`MediaKindLabel`, `served_kind`, `KNOWN_WIRE_KINDS`), THE metric-label projection (`KindLabels::from_proto` -> `media_kind` + `content_kind`, `ContentKind`, `MediaKindLabel::labels()`; runtime-vs-taxonomy anchor `media_kind_label_matches_the_taxonomy_row`), the ONE kind-keyed list parser (`parse_kind_list`, `KindListRefusal`), the per-kind state MC stores (`ClientMediaStates` = publish set + client mute per kind, `ServerMuteAttribution` = server mute + imposer per kind, together `MediaStates`), request types (`MuteChange` → `PublishedMuteChange` via `against`, `RequestedKinds`) and the media-policy halves (`ServerMutedKinds` / `ClientMutedKinds`) → `crates/mc-service/src/media_kind.rs`
 - Auth: McJwtValidator, validate_meeting_token, validate_guest_token → `crates/mc-service/src/auth/mod.rs`
 - Actors: controller, meeting, participant, messages, session (HMAC/HKDF), metrics → `crates/mc-service/src/actors/`
 
@@ -45,7 +45,7 @@
 - MH→MC notifications → `crates/mc-service/src/grpc/media_coordination.rs:resolve_and_record()`; auth layer (R-22) → `grpc/auth_interceptor.rs`
 - Redis fenced client, MhAssignmentStore, `get_mh_assignment` → `crates/mc-service/src/redis/client.rs`; Lua → `redis/lua_scripts.rs`
 - Health, system info → `crates/mc-service/src/observability/health.rs`, `crates/mc-service/src/system_info.rs`
-- Metric wrappers + Cat B matrix (`KEY_CUSTODY_LABEL` on media emissions) → `crates/mc-service/src/observability/metrics.rs`; catalog → `docs/observability/metrics/mc-service.md`; alert inventory → `docs/observability/alerts.md`
+- Metric wrappers + Cat B matrix (`KEY_CUSTODY_LABEL` on media emissions; per-kind recorders take `KindLabels`) → `crates/mc-service/src/observability/metrics.rs`; catalog → `docs/observability/metrics/mc-service.md`; alert inventory → `docs/observability/alerts.md`
 
 ## Protocols
 - Client signaling (join, mute, server mute, ReceiveCapability, SendDirective, StreamAssignments, KEK) → `proto/dark_tower/signaling/v1/signaling.proto`; kind-keyed field rules → `docs/protocol/CONVENTIONS.md` §6, enforced by `dt-guard proto-per-kind-fields` (`crates/dt-guard/src/proto_per_kind_fields.rs`)

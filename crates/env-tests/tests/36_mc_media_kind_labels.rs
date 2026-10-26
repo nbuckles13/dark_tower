@@ -1,5 +1,5 @@
-//! Env-tests: MC media series carry `media_kind` after a real join (story 3
-//! task 2, R-29; ADR-0036 §11).
+//! Env-tests: MC media series carry `media_kind` and `content_kind` after a
+//! real join (story 3 task 2, R-29; `content_kind` 2026-10-26; ADR-0036 §11).
 //!
 //! # Why this is not in `32_media_metric_hygiene.rs`
 //!
@@ -37,7 +37,10 @@ use std::time::Duration;
 
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::gc_client::GcClient;
-use env_tests::fixtures::metric_hygiene::{MEDIA_KIND_AUDIO, MEDIA_KIND_KEY, MEDIA_KIND_VALUES};
+use env_tests::fixtures::metric_hygiene::{
+    CONTENT_KIND_KEY, CONTENT_KIND_MAIN, CONTENT_KIND_VALUES, MEDIA_KIND_AUDIO, MEDIA_KIND_KEY,
+    MEDIA_KIND_VALUES,
+};
 use env_tests::fixtures::metrics::{
     format_instance_map, poll_until_any_instance_above, settled_baseline, InstanceCounters,
     PrometheusClient,
@@ -70,7 +73,9 @@ async fn cluster() -> ClusterConnection {
 }
 
 fn audio_sum(name: &str) -> String {
-    format!("sum by (instance) ({name}{{{MEDIA_KIND_KEY}=\"{MEDIA_KIND_AUDIO}\"}})")
+    format!(
+        "sum by (instance) ({name}{{{MEDIA_KIND_KEY}=\"{MEDIA_KIND_AUDIO}\",{CONTENT_KIND_KEY}=\"{CONTENT_KIND_MAIN}\"}})"
+    )
 }
 
 #[tokio::test]
@@ -128,7 +133,7 @@ async fn test_mc_slot_states_and_send_targets_carry_media_kind_audio_after_a_joi
                 format!(
                     "{TRIAGE_RISE}: `{promql}` rose on no MC instance after a join that composed \
                      a view and a directive (baseline {}, now {}). EMPTY means MC no longer \
-                     labels {name} with {MEDIA_KIND_KEY}=\"{MEDIA_KIND_AUDIO}\"; flat means the recorder is \
+                     labels {name} with {MEDIA_KIND_KEY}=\"{MEDIA_KIND_AUDIO}\",{CONTENT_KIND_KEY}=\"{CONTENT_KIND_MAIN}\"; flat means the recorder is \
                      not reached.",
                     format_instance_map(baseline),
                     format_instance_map(current)
@@ -151,6 +156,7 @@ async fn test_mc_slot_states_and_send_targets_carry_media_kind_audio_after_a_joi
         for s in raw.iter().filter(|s| {
             s.metric.get("__name__").map(String::as_str) == Some(name)
                 && s.metric.get(MEDIA_KIND_KEY).map(String::as_str) == Some(MEDIA_KIND_AUDIO)
+                && s.metric.get(CONTENT_KIND_KEY).map(String::as_str) == Some(CONTENT_KIND_MAIN)
         }) {
             let instance = s.metric.get("instance").cloned().unwrap_or_default();
             let v: f64 = s
@@ -175,13 +181,18 @@ async fn test_mc_slot_states_and_send_targets_carry_media_kind_audio_after_a_joi
             !s.metric
                 .get(MEDIA_KIND_KEY)
                 .is_some_and(|k| MEDIA_KIND_VALUES.contains(&k.as_str()))
+                || !s
+                    .metric
+                    .get(CONTENT_KIND_KEY)
+                    .is_some_and(|k| CONTENT_KIND_VALUES.contains(&k.as_str()))
         })
         .map(|s| &s.metric)
         .collect();
     assert!(
         bad.is_empty(),
-        "{TRIAGE_DOMAIN}: {} series of {SLOT_STATES}/{SEND_TARGETS} lack {MEDIA_KIND_KEY} or \
-         carry a value outside {MEDIA_KIND_VALUES:?}: {bad:?}",
+        "{TRIAGE_DOMAIN}: {} series of {SLOT_STATES}/{SEND_TARGETS} lack {MEDIA_KIND_KEY} / \
+         {CONTENT_KIND_KEY} or carry a value outside {MEDIA_KIND_VALUES:?} / \
+         {CONTENT_KIND_VALUES:?}: {bad:?}",
         bad.len()
     );
 }

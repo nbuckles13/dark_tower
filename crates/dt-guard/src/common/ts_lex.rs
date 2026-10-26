@@ -103,6 +103,17 @@ impl Lexed {
     }
 }
 
+/// The first non-ASCII-whitespace offset at or after `i` in `text`. THE one
+/// copy, shared by every `ts_lex` consumer that walks [`Lexed::text`].
+#[must_use]
+pub fn skip_ws(text: &str, mut i: usize) -> usize {
+    let bytes = text.as_bytes();
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    i
+}
+
 enum Frame {
     Template,
     /// Inside `${ … }`; the count is the nesting depth of plain `{` braces.

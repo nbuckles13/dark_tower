@@ -856,6 +856,13 @@ or Grafana normally. Three things about their shape will otherwise cost you an a
   `dt_client_*` series by `instance` groups by collector**, and every browser collapses into one
   series per `{client_version, org_id, key_custody}`. That is deliberate: it is what lets the
   collector sum across browsers without a per-participant label.
+- **2026-10-26 — per-kind series carry `content_kind` beside `media_kind` (series identity, not
+  traffic).** Every per-kind `dt_client_media_*` series carries both labels or neither; nothing
+  publishes screen share yet, so every client series reads `content_kind="main"`. A selector that
+  pins `media_kind="video"` should also pin `content_kind="main"` (camera) so it does not silently
+  absorb screen share when that ships. A series with `media_kind` and no `content_kind` (or the
+  reverse) is a pipeline fault — a GC `MEDIA_DATAPOINT_EXTRA` or collector `keep_keys` drift — not a
+  client state.
 - **An empty result no longer means one thing.** Five controls on the collector's metrics path drop
   client data by design — the name allowlist, the temporality gate (a stale browser bundle emitting
   cumulative), `keep_keys`, the stream cap, and `memory_limiter` under pressure — and all five look
@@ -1565,7 +1572,7 @@ is inaudible to you until someone you can hear leaves.** That is the designed be
 - **Effective N**: count the audio cells in the in-meeting slot grid (`data-testid="slot-list"`, one
   cell per declared slot, each naming its sender). The E2E bus `receiveSlots.audio.declared` and the
   console line `[dt-media-slots] publishing [...]; declared N=... audio` show the same number. The
-  server cap is `mc_media_receive_slot_cap{media_kind="audio"}`, also on the bus as
+  server cap is `mc_media_receive_slot_cap{media_kind="audio", content_kind="main"}`, also on the bus as
   `receiveSlots.audio.serverCap` (absent only on a controller that sends no per-kind cap — a fault, F18).
 - If every cell is filled and the unheard participants are the latest joiners, it is static fill.
 - If a cell says fewer sources, or an unheard participant is marked unreachable on the roster, it is
@@ -1608,7 +1615,7 @@ authority. Caps are read once at MC startup, so a cap change applies after the M
   For the configured caps, see the MC startup line's `max_audio_receive_slots` /
   `max_video_receive_slots`.
 - In the cluster: truncation shows on `mc_media_slot_states_total{slot_state="unavailable"}`
-  beside `mc_media_receive_slot_cap{media_kind}` — see the receive-capability section of
+  beside `mc_media_receive_slot_cap{media_kind, content_kind}` — see the receive-capability section of
   [`mc-incident-response.md`](mc-incident-response.md). (Story 2's whole-declaration rejection,
   `slot_count_over_cap`, is retired.)
 - `scripts/dev-web.sh --check` prints both values beside both on-disk caps and a NOTICE when one
@@ -1701,14 +1708,14 @@ rebuild the web app. The effective values are logged once at receiver start
 
 **Symptom.** A video slot MC reports `active` shows a frozen frame or the previous avatar, and the
 client-media board's *Video Slot Unfulfilled* panels rise. One of these is non-zero:
-`dt_client_media_frames_dropped_total{media_kind="video", reason="stream_slot_mismatch"}`,
+`dt_client_media_frames_dropped_total{media_kind="video", content_kind="main", reason="stream_slot_mismatch"}`,
 `{reason="stream_partial_reset"}`, or `dt_client_media_incoming_streams_refused_total`.
 
 **What it means.**
 - `stream_slot_mismatch` — a downlink group stream named a slot this client never declared for
   video (or an audio slot id), or changed slot mid-stream; the client aborts that stream. MH
   guarantees one stream per slot, so a sustained rate is an MH slot-mapping defect
-  (`undeclared_stream_id_total{media_kind="video"}` rises beside it for undeclared ids).
+  (`undeclared_stream_id_total{media_kind="video", content_kind="main"}` rises beside it for undeclared ids).
 - `stream_partial_reset` — a frame was cut by its stream's end: MH abandoned the group (RESET,
   R-12; the client then sends a `group_abandoned` recovery request) or the stream FINished mid-frame.
   Bursts are normal on a slow path; sustained means repeated abandonment — see MH's backlog resets.
@@ -1743,7 +1750,7 @@ camera off"), never as a frozen or pending tile. Audio is unaffected.
 
 **What it means.** The browser refused `getUserMedia` for the camera. R-19 requires a failed or
 revoked camera to present to others as video-muted, and the SDK counts it:
-`dt_client_media_capture_failures_total{media_kind="video", outcome="permission_denied"}`. The other
+`dt_client_media_capture_failures_total{media_kind="video", content_kind="main", outcome="permission_denied"}`. The other
 outcomes on that series point elsewhere: `no_device`, `device_unavailable` (another app holds the
 camera), `unsupported`, `platform_unsupported`, `unknown`, and `ended` (the camera was unplugged or
 the permission was revoked mid-call).

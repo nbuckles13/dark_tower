@@ -198,15 +198,23 @@ any-occurrence rule as a red threshold line.
 |---|---|---|
 | Pushes Counted by MCMediaGenerationDivergence (ALERTED, page) | `MCMediaGenerationDivergence`'s negated selector, line at 0 | per-stream `transport_mode_mismatch` since story 3 |
 | Send Directive Failures (ALERTED: defect pages, rest warns) | `MCMediaSendDirectiveDefect` and `MCMediaSendDirectiveFailures` selectors, line at 0 | classes: `DirectiveOutcome::alert_class()`; withdrawals never read here |
-| Slot States by Kind | `by (media_kind, slot_state)` | `source_muted` is in no query; unreachable is NOT a slot state here |
-| Receive Slot Fill vs Cap | per `media_kind` (fixed: previously summed both kinds against per-kind caps) | |
-| Receive Slot Cap | per `media_kind` | video at 0 = the R-26 lever applied |
+| Slot States by Kind | `by (media_kind, content_kind, slot_state)` | `source_muted` is in no query; unreachable is NOT a slot state here |
+| Receive Slot Fill vs Cap | per (`media_kind`, `content_kind`) (fixed: previously summed both kinds against per-kind caps) | |
+| Receive Slot Cap | per (`media_kind`, `content_kind`) | video at 0 = the R-26 lever applied |
 | Unreachable Senders Named | kind-free by design | read beside Not-Yet-Connected Senders |
-| Client Mute Requests by Kind and Outcome / Server Mute Requests by Kind | `by (media_kind, ...)`, SEPARATE panels | never one panel summing client and server mute (`label-taxonomy.md`, `action`) |
-| Send Directive Withdrawals by Kind and Reason | `by (media_kind, reason)` | withdrawals are healthy |
+| Client Mute Requests by Kind and Outcome / Server Mute Requests by Kind | `by (media_kind, content_kind, ...)`, SEPARATE panels | never one panel summing client and server mute (`label-taxonomy.md`, `action`) |
+| Send Directive Withdrawals by Kind and Reason | `by (media_kind, content_kind, reason)` | withdrawals are healthy |
 | Directed Video Minimum Keyframe Interval | stat | threshold source for A1, A3 and A9 |
 | Join Refusals - Story 3 Media Join Values | `by (error_type)` | `reconnect_publish_set_mismatch` not production-reachable today |
-| Mean Send Targets per Directive | per-kind numerator over the kind-free directive denominator (`ignoring(media_kind) group_left`) | |
+| Mean Send Targets per Directive | per-kind numerator over the kind-free directive denominator (`ignoring(media_kind, content_kind) group_left`) | |
+
+**2026-10-26 — series identity, not traffic.** Every per-kind MC series co-carries
+`content_kind` (label-taxonomy.md §"Carried: `media_kind` and `content_kind`"), and every panel
+query above that names `media_kind` also names `content_kind` (grouping, `ignoring()`, legends
+`{{media_kind}}/{{content_kind}}`), enforced by `dt-guard dashboard-panels`
+(`kind_label_co_occurrence`). Every series reads `main` until screen share ships, which then
+appears as its own `video`/`screen` line rather than folding into the camera's. At rollout the
+per-kind series start new, so `rate()` panels ramp on them — expected, not an incident.
 
 **Panels and their metrics**: read them from the JSON, as for MC Overview (ADR-0031).
 

@@ -45,8 +45,8 @@
 //!
 //! No suppression path but [`ALLOW`], which ships EMPTY.
 
-use crate::common::path_safety::to_repo_relative;
-use crate::common::proto_lex::{lex, Token};
+use crate::common::proto_files::proto_files;
+use crate::common::proto_lex::{enum_values, lex, scopes, Token};
 use crate::common::status::{emit_ok, emit_scope};
 use anyhow::{bail, Result};
 use std::collections::BTreeSet;
@@ -204,41 +204,18 @@ pub fn derive_vocabulary(files: &[(String, String)]) -> Vocabulary {
     let mut vocab = BTreeSet::new();
     for (_, content) in files {
         let Ok(tokens) = lex(content) else { continue };
-        let mut depth_in_enum: Option<usize> = None;
-        let mut depth = 0usize;
-        for t in &tokens {
-            match t {
-                Token::Open { header, .. } => {
-                    depth += 1;
-                    if depth_in_enum.is_none() && header == "enum MediaKind" {
-                        depth_in_enum = Some(depth);
-                    }
-                }
-                Token::Close { .. } => {
-                    if depth_in_enum == Some(depth) {
-                        depth_in_enum = None;
-                    }
-                    depth = depth.saturating_sub(1);
-                }
-                Token::Statement { text, .. } if depth_in_enum == Some(depth) => {
-                    let Some((value, _)) = text.split_once('=') else {
-                        continue;
-                    };
-                    let value = value.trim();
-                    let Some(kind) = value.strip_prefix("MEDIA_KIND_") else {
-                        continue;
-                    };
-                    if kind == "UNSPECIFIED" {
-                        continue;
-                    }
-                    vocab.extend(
-                        kind.split('_')
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_ascii_lowercase),
-                    );
-                }
-                Token::Statement { .. } => {}
+        for (_, value) in enum_values(&scopes(&tokens), "MediaKind") {
+            let Some(kind) = value.strip_prefix("MEDIA_KIND_") else {
+                continue;
+            };
+            if kind == "UNSPECIFIED" {
+                continue;
             }
+            vocab.extend(
+                kind.split('_')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_ascii_lowercase),
+            );
         }
     }
     if !vocab.is_empty() {
@@ -389,29 +366,6 @@ pub fn check_with(files: &[(String, String)], vocab: &Vocabulary, allow: &[Allow
             .filter(|h| !allowed.contains(h.subject.as_str())),
     );
     report
-}
-
-/// Every `proto/**/*.proto` under `root`, root-relative and sorted, with its
-/// content.
-///
-/// # Errors
-///
-/// An unreadable file.
-pub fn proto_files(root: &Path) -> Result<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    let base = root.join("proto");
-    if !base.is_dir() {
-        return Ok(out);
-    }
-    for entry in walkdir::WalkDir::new(&base).sort_by_file_name() {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type().is_file() && path.extension().is_some_and(|e| e == "proto") {
-            let rel = to_repo_relative(root, path).replace('\\', "/");
-            out.push((rel, std::fs::read_to_string(path)?));
-        }
-    }
-    Ok(out)
 }
 
 /// Run the guard over `root`.

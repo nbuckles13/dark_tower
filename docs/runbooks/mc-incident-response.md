@@ -1679,6 +1679,15 @@ Expected recovery time: bounded by the upstream MH/network fix; once resolved, i
 
 ---
 
+> **2026-10-26 — kind labels, series identity, not traffic.** Every per-kind MC and client
+> series carries `content_kind` beside `media_kind` (all or none; `main` = microphone/camera,
+> and no series carries `screen` until screen share ships). Every query in Scenarios 12–23
+> that names `media_kind` also names `content_kind`. A query copied from before this date
+> that names only `media_kind` still matches, but it would pool screen share into the
+> camera's numbers once screen share ships, so add the second label. At rollout the per-kind
+> series start new, so `rate()` ramps and `for:` timers restart. That is expected, not an
+> incident ([mc-deployment.md](mc-deployment.md#kind-label-content_kind-2026-10-26-receiving-side-first-series-identity-changes)).
+
 ### Scenario 12: RegisterMeeting Coordination Failures
 
 **Alert**: No alert today; surfaces in `mc_register_meeting_total{status="error"}` rate, `mc_register_meeting_duration_seconds` p95, and `RegisterMeeting retries exhausted` error logs at target `mc.register_meeting.trigger`. A second, distinct string — `RegisterMeeting failed terminally; not retried` — is a **different fault with the opposite remedy**; see Symptoms. May also co-fire MH-side [Scenario 13: RegisterMeeting Timeout — Clients Kicked](mh-incident-response.md#scenario-13-registermeeting-timeout--clients-kicked).
@@ -2040,7 +2049,7 @@ event; alert on the join series.
 
 **Over-cap is not a rejection.** Each kind is **truncated** to its own cap
 (`MC_MAX_AUDIO_RECEIVE_SLOTS`, `MC_MAX_VIDEO_RECEIVE_SLOTS`, published on
-`mc_media_receive_slot_cap{media_kind}`): the excess slots report `unavailable` on
+`mc_media_receive_slot_cap{media_kind, content_kind}`): the excess slots report `unavailable` on
 `mc_media_slot_states_total{slot_state="unavailable"}`, never a rejection and never a join failure
 (`slot_count_over_cap` is retired with story 3 MC-A, and the SDK no longer refuses or counts an
 over-cap declaration locally since C-A1). A cap below legitimate clients' N for a kind is a
@@ -2125,7 +2134,7 @@ dark until a structural change recomposes it successfully.
    must stay clear for 15 minutes after the rollback completes. File against `meeting-controller`
    with the ERROR lines either way.
 
-**Withdrawals: `mc_media_send_directive_withdrawals_total{media_kind, reason}`.** This is the
+**Withdrawals: `mc_media_send_directive_withdrawals_total{media_kind, content_kind, reason}`.** This is the
 per-kind, per-cause record of a published kind being directed to send nothing. `reason="unwatched"`
 is emitted since MC-A; `reason="server_muted"` since MC-B (zero-initialised, so "present and flat"
 is meaningful). The reason is the cause at delivery; a server mute of an already-unwatched stream is
@@ -2138,7 +2147,7 @@ a reconnect's fresh view); a withdrawal whose delivery failed shows only on
 | `reason` | Class | What it means | Read it against |
 |---|---|---|---|
 | `unwatched` | **normal** | The last subscriber holding this publisher's kind in a slot left or re-declared (R-8). A new watcher restores the directive within the same structural change. | Roster churn. A sustained high rate with a stable roster is a slot-fill question (Scenario 18), not a directive fault. |
-| `server_muted` | **normal** (moderation) | A host server-muted that kind (R-16). Capture stops, and for video the camera light goes off. | `mc_media_server_mute_requests_total{action="mute",outcome="applied",media_kind="<same kind>"}` (Scenario 21). The `action` matcher matters: the counter counts per kind, so an applied unmute of the same kind would otherwise match. |
+| `server_muted` | **normal** (moderation) | A host server-muted that kind (R-16). Capture stops, and for video the camera light goes off. | `mc_media_server_mute_requests_total{action="mute",outcome="applied",media_kind="<same kind>", content_kind="main"}` (Scenario 21). The `action` matcher matters: the counter counts per kind, so an applied unmute of the same kind would otherwise match. |
 
 The faults are a **missing** withdrawal and a withdrawal that did not take, never the existence of
 one. A server mute of a WATCHED stream that did not move `{reason="server_muted"}` for that kind is
@@ -2203,7 +2212,7 @@ named in `StreamAssignments.unreachable_sender_ids` instead (see Scenario 18 and
 defect** — that value should never reach the wire — and is visible here
 precisely because the vocabulary was not pruned to the reachable subset.
 
-**4. `mc_media_mute_requests_total{outcome, media_kind}` — is client mute landing, and is one
+**4. `mc_media_mute_requests_total{outcome, media_kind, content_kind}` — is client mute landing, and is one
 connection driving meeting-wide work?** Note the failure predicate is stated
 **positively**, unlike the two above. **Counting unit: one increment per
 (request, NAMED kind)** — an absent per-kind field means "unchanged" and is not
@@ -2230,7 +2239,7 @@ sum by (outcome) (rate(mc_media_mute_requests_total{outcome=~"rate_limited|actor
 
 | Token | Meaning |
 |---|---|
-| `applied` | This named kind's client state moved (`LIVE` <-> `CLIENT_MUTED`; every kind is definite from the join, so there is no "first report"). The meeting actor owes every OTHER participant a roster fan-out (paced per meeting — `mc_media_client_mute_fanouts_total`) and re-renders (the stream's PAUSED disposition at MH) and re-emits the changed slot view to the subscribers HOLDING this source whose view changed. A camera button is `{media_kind="video", outcome="applied"}` alone (audio is not named), and it is healthy. A failed re-emit is counted by the actor on counter 2 and on `mc_media_slot_view_emissions_total{outcome="composition_failed"}`. |
+| `applied` | This named kind's client state moved (`LIVE` <-> `CLIENT_MUTED`; every kind is definite from the join, so there is no "first report"). The meeting actor owes every OTHER participant a roster fan-out (paced per meeting — `mc_media_client_mute_fanouts_total`) and re-renders (the stream's PAUSED disposition at MH) and re-emits the changed slot view to the subscribers HOLDING this source whose view changed. A camera button is `{media_kind="video", content_kind="main", outcome="applied"}` alone (audio is not named), and it is healthy. A failed re-emit is counted by the actor on counter 2 and on `mc_media_slot_view_emissions_total{outcome="composition_failed"}`. |
 | `unchanged` | This named kind's state did not move: the identical repeat (no actor hop), or a named kind the actor found already in that state. **Not a denominator — see below.** |
 | `rate_limited` | The per-connection mute-work token bucket is exhausted (`MUTE_WORK_BURST` / `MUTE_WORK_REFILL_INTERVAL_MS` in `webtransport/connection.rs`). |
 | `actor_unavailable` | Environmental and terminal. Pairs with `meeting_state_unavailable` above — check actor health, Scenarios 1 and 2. |
@@ -2347,7 +2356,7 @@ any `composition_failed`; `client` for the capability rejection tokens and for a
 sustained `rate_limited` (a repeat loop in the SDK's mute path). For "I can hear
 some people but not others", go to Scenario 18 first.
 
-**6. `mc_media_server_mute_requests_total{action,outcome,media_kind}` and
+**6. `mc_media_server_mute_requests_total{action,outcome,media_kind,content_kind}` and
 `mc_media_unmute_requests_total{outcome}` — did a host's server mute (or a
 participant's request to be unmuted) land?** Both are client-facing signalling:
 the first counts a host's `ServerMuteRequest` dispositions **once per (request,
@@ -2645,7 +2654,8 @@ long rather than its threshold being high — see the comment on the rule.
 > `media_kind`, so read the drop series split by kind before choosing an arm:
 >
 > ```promql
-> sum by (media_kind, reason) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
+> # 2026-10-26 (series identity, not traffic): client per-kind series carry content_kind beside media_kind; "main" = mic/camera (no screen share yet).
+> sum by (media_kind, content_kind, reason) (rate(dt_client_media_frames_dropped_total{reason=~"no_kek_for_generation|kek_generation_stale|no_roster_entry|unwrap_failed"}[5m]))
 > ```
 >
 > - **Video only.** Point at R-14's video key rotation. Video transmit keys rotate at every group
@@ -2654,7 +2664,7 @@ long rather than its threshold being high — see the comment on the rule.
 >   never discardable. MH starts every subscriber at a group start, so a receiver holds the key
 >   unless it lost that group's key-bearing frames. Its one recovery request per loss event brings
 >   the next group start. **That lost-key-bearing-frame loss does not surface on A7's query.** It
->   shows as `dt_client_media_frames_dropped_total{reason="no_transmit_key", media_kind="video"}`,
+>   shows as `dt_client_media_frames_dropped_total{reason="no_transmit_key", media_kind="video", content_kind="main"}`,
 >   a recovery-requesting loss. Video-only drops on A7's four reasons point at video's KEK-receipt
 >   rotation and wrap instead. Sustained video-only
 >   drops with audio clean mean the key-bearing frames are not arriving, or not being honoured, at
@@ -2674,8 +2684,8 @@ fault.
 - **Slot-cap truncation.** The client's audio receive-slot count N exceeded MC's per-kind cap
   (`MC_MAX_AUDIO_RECEIVE_SLOTS`; video has its own, `MC_MAX_VIDEO_RECEIVE_SLOTS`). MC truncates each
   kind to its cap and the excess slots show `unavailable` — never a whole-declaration rejection, so
-  the listener hears up to the cap, never nobody. Read `mc_media_receive_slot_cap{media_kind="audio"}`
-  beside `mc_media_slot_states_total{media_kind="audio",slot_state="unavailable"}`. A rising
+  the listener hears up to the cap, never nobody. Read `mc_media_receive_slot_cap{media_kind="audio", content_kind="main"}`
+  beside `mc_media_slot_states_total{media_kind="audio", content_kind="main",slot_state="unavailable"}`. A rising
   `unavailable` with the cap below the client's configured N is a configuration mismatch, not a key
   fault. Client side: `client-dev-local.md` F18. *(Story 2 rejected an over-cap declaration whole as
   `slot_count_over_cap`; that token is retired since story 3 MC-A.)*
@@ -2683,7 +2693,7 @@ fault.
   senders than slots, the earliest joiners hold the slots, and a later joiner is inaudible to that
   listener until a slot frees, which happens when someone leaves. That is designed behaviour, not a
   fault. Read effective N (the client's declared slot count, on the UI's slot rows and the E2E bus
-  `receiveSlots.declared`) and `mc_media_receive_slot_cap{media_kind="audio"}`. If the number of other senders the
+  `receiveSlots.declared`) and `mc_media_receive_slot_cap{media_kind="audio", content_kind="main"}`. If the number of other senders the
   listener shares a handler with exceeds N, the unheard participants are the latest joiners. Nothing
   drops, nothing is counted as a drop, and `mc_media_slot_states_total{slot_state="active"}` is
   healthy. Client side: `client-dev-local.md` F17. Speaker-based selection, story 5, replaces static
@@ -3341,7 +3351,7 @@ reporter's slots are all full with earlier joiners: the N+2th sender gets no slo
 unreachable set ("no slot" is not "unreachable"), and the reporter's slots show `ACTIVE` for the
 earliest joiners. **Remedy: raise the client's audio N** (`VITE_DT_AUDIO_RECEIVE_SLOTS`; story 3
 C-A1 retired the single `VITE_DT_RECEIVE_SLOTS`), within the audio cap. The cap is per kind (`MC_MAX_AUDIO_RECEIVE_SLOTS` for this audio arm,
-published as `mc_media_receive_slot_cap{media_kind="audio"}`) and an over-cap declaration is
+published as `mc_media_receive_slot_cap{media_kind="audio", content_kind="main"}`) and an over-cap declaration is
 truncated: the excess slots show `unavailable`
 (`mc_media_slot_states_total{slot_state="unavailable"}`), never a rejection; the SDK no longer
 refuses or counts this itself.
@@ -3350,9 +3360,9 @@ refuses or counts this itself.
 Video is its own kind with its own cap, and most "I can't see X" reports in a healthy meeting are
 one of these EXPECTED shapes:
 - **Per-kind caps.** `MC_MAX_AUDIO_RECEIVE_SLOTS` and `MC_MAX_VIDEO_RECEIVE_SLOTS` (MC's own ConfigMap,
-  read at startup; `mc_media_receive_slot_cap{media_kind}`). A client declaring more video slots
+  read at startup; `mc_media_receive_slot_cap{media_kind, content_kind}`). A client declaring more video slots
   than the cap is **truncated** to the cap. Each excess slot reports `unavailable` permanently for that
-  declaration (R-1): `mc_media_slot_states_total{media_kind="video", slot_state="unavailable"}`. It is
+  declaration (R-1): `mc_media_slot_states_total{media_kind="video", content_kind="main", slot_state="unavailable"}`. It is
   never a join failure.
 - **Video cap 0 is video off** (the R-26 lever, [`mc-deployment.md` §Video-off lever](mc-deployment.md#video-off-lever)).
   Every video slot reads `unavailable` and no camera is directed. Audio is unaffected.
@@ -3681,7 +3691,7 @@ their own sub-arms in
 **Step 1 — did the host's request land?**
 
 ```promql
-sum by (action, outcome, media_kind) (increase(mc_media_server_mute_requests_total[15m]))
+sum by (action, outcome, media_kind, content_kind) (increase(mc_media_server_mute_requests_total[15m]))
 ```
 
 One increment per (request, NAMED kind), `action` being that kind's direction — so one
@@ -3705,7 +3715,7 @@ error at all.
 **Step 1b — did MC withdraw the directive?** For a server MUTE of a kind someone was watching:
 
 ```promql
-sum by (media_kind) (increase(mc_media_send_directive_withdrawals_total{reason="server_muted"}[15m]))
+sum by (media_kind, content_kind) (increase(mc_media_send_directive_withdrawals_total{reason="server_muted"}[15m]))
 ```
 
 It rises by one per muted, watched stream when the withdrawn directive is DELIVERED. It is
@@ -3715,7 +3725,7 @@ withdraw (an MC defect) or could not deliver
 light is still on, the client did not act on the empty targets — a client-side fault (C-C1 /
 `client-dev-local.md`); MH's ingress drop still holds the line meanwhile (Step 3).
 
-**Step 2 — does MC believe a mute is in force?** `mc_media_server_muted_sources{media_kind}` is the
+**Step 2 — does MC believe a mute is in force?** `mc_media_server_muted_sources{media_kind, content_kind}` is the
 number of server-muted (participant, kind) SOURCES MC holds, per kind, summed across this pod's
 meetings — a participant muted on both kinds is 1 on `audio` and 1 on `video`, not 2 participants. It is identity-free by
 design (ADR-0036 §11): it answers "is any mute in force on this MC pod", never "in THIS meeting";
@@ -3771,8 +3781,8 @@ set): [`mh-incident-response.md` Scenario 19](mh-incident-response.md#scenario-1
 **Runbook Section**: `#scenario-22-client-video-decode-failures`
 
 **What this is.** Receivers' VP8 decoders are erroring on more than 1% of the video frames they
-accepted (`dt_client_media_decoder_errors_total{media_kind="video"}` over
-`dt_client_media_frames_accepted_total{media_kind="video"}`). The series is **client-reported**, so
+accepted (`dt_client_media_decoder_errors_total{media_kind="video", content_kind="main"}` over
+`dt_client_media_frames_accepted_total{media_kind="video", content_kind="main"}`). The series is **client-reported**, so
 it corroborates and can be inflated. Before trusting a quiet board, check that client video series
 are reaching Prometheus at all (`gc-deployment.md` §When the client series go quiet). Users see
 frozen or corrupted tiles. Each loss event sends one recovery request, so a healthy pipeline
@@ -3782,15 +3792,16 @@ recovers on the next keyframe.
 
 ```promql
 # Client windows are [5m], below the collector's 10m metric_expiration (client-metrics-export G5), as the alert's are.
-sum(rate(dt_client_media_decoder_errors_total{media_kind="video"}[5m]))
-  / clamp_min(sum(rate(dt_client_media_frames_accepted_total{media_kind="video"}[5m])), 1e-9)
+# 2026-10-26 (series identity, not traffic): client per-kind series carry content_kind beside media_kind; "main" = mic/camera (no screen share yet).
+sum(rate(dt_client_media_decoder_errors_total{media_kind="video", content_kind="main"}[5m]))
+  / clamp_min(sum(rate(dt_client_media_frames_accepted_total{media_kind="video", content_kind="main"}[5m])), 1e-9)
 
 # Split by build: a new SDK rollout shows as one client_version
-sum by (client_version) (rate(dt_client_media_decoder_errors_total{media_kind="video"}[5m]))
+sum by (client_version) (rate(dt_client_media_decoder_errors_total{media_kind="video", content_kind="main"}[5m]))
 
 # Neighbouring video losses (each has its own fork below)
-sum by (reason) (rate(dt_client_media_frames_dropped_total{media_kind="video"}[5m]))
-sum(rate(dt_client_media_decode_queue_dropped_total{media_kind="video"}[5m]))
+sum by (reason) (rate(dt_client_media_frames_dropped_total{media_kind="video", content_kind="main"}[5m]))
+sum(rate(dt_client_media_decode_queue_dropped_total{media_kind="video", content_kind="main"}[5m]))
 ```
 
 **Diagnosis: forks.**
@@ -3809,7 +3820,7 @@ sum(rate(dt_client_media_decode_queue_dropped_total{media_kind="video"}[5m]))
   participant's connected handlers and per-handler edge counts. Never take a per-stream dump. Fleet-wide,
   following one `client_version` or a `media-codec-profile` change, points at a new SDK rollout or a
   codec-profile change. Correlate it with the last deploy.
-- **Client drop tokens on video** (`dt_client_media_frames_dropped_total{media_kind="video", reason}`;
+- **Client drop tokens on video** (`dt_client_media_frames_dropped_total{media_kind="video", content_kind="main", reason}`;
   semantics from C-B):
   - `decode_over_bound`: decoded video above the client's configured receive bounds (resolution or
     frame rate, R-6), dropped and counted. A sender encoding above the directed profile (a patched or
@@ -3860,9 +3871,10 @@ fleet count. Users see a frozen picture or the previous avatar.
 **Detection**
 
 ```promql
-histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video"}[5m])))
+# 2026-10-26 (series identity, not traffic): client per-kind series carry content_kind beside media_kind; "main" = mic/camera (no screen share yet).
+histogram_quantile(0.95, sum by (le) (rate(dt_client_media_slot_unfulfilled_duration_ms_bucket{media_kind="video", content_kind="main"}[5m])))
 10 * 1000 * max(mc_media_video_keyframe_min_interval_seconds)     # same unit (ms)
-max by (media_kind) (dt_client_media_slots_unfulfilled{media_kind="video"})   # ONE browser's last value, not a fleet count; never read as healthy at 0
+max by (media_kind, content_kind) (dt_client_media_slots_unfulfilled{media_kind="video", content_kind="main"})   # ONE browser's last value, not a fleet count; never read as healthy at 0
 
 # The MH half, for the first fork
 max(mh_media_edge_pending_oldest_seconds)

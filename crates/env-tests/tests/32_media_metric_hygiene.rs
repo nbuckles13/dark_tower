@@ -28,7 +28,7 @@
 //!
 //! # MH is type-blind (ADR-0036 §7; story 3 R-29)
 //!
-//! `check_series` also carries `Rule::MediaKindOnMh`: no `mh_*` series may carry
+//! `check_series` also carries `Rule::KindLabelOnMh`: no `mh_*` series may carry
 //! `media_kind`. Its FIRES half is the kernel fixtures
 //! (`mh_media_kind_fires_on_*`); this live fetch is its APPLIES half, and the MH
 //! anchor plus the eager-admission presence checks below are its positive
@@ -247,6 +247,21 @@ async fn media_metric_labels_carry_no_meeting_identifier_and_no_overclaim() {
         "metric-hygiene: inspected {} series across jobs [{JOBS}]; \
          mc_media_* present: {mc_media_present}; mh_* series checked for media_kind: {mh_series}",
         series.len()
+    );
+
+    // Non-empty precondition of `Rule::KindLabelsSplit` (all or none): MC
+    // zero-initialises its per-kind families at boot (STORY_3_EAGER_MC_SERIES
+    // above), so at least one stored series carries BOTH kind keys. Zero would
+    // make "no split" vacuous; that is a scrape/registration problem, not a
+    // label-policy violation, so it reports under the scrape token.
+    let kind_labelled = metric_hygiene::kind_labelled_series_count(&series);
+    assert!(
+        kind_labelled > 0,
+        "{TRIAGE_SCRAPE}: no scraped series carries both `{}` and `{}`, so the all-or-none \
+         kind-label rule observed nothing. MC's zero-initialised per-kind families carry both; \
+         their absence means the MC pod is not scraped or its labels regressed.",
+        metric_hygiene::MEDIA_KIND_KEY,
+        metric_hygiene::CONTENT_KIND_KEY
     );
 
     let violations = check_series(&series);

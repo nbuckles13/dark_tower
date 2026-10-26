@@ -30,10 +30,10 @@
 //! HONEST client only at this hop. Downstream the collector bounds them
 //! differently: for the first five its charset regex bounds bytes and charset,
 //! not count, so a patched client can inflate their distinct-value count; for
-//! `media_kind` its EXACT `^(audio|video)$` rewrite to `invalid` does bound the
-//! distinct-value count (at most three values reach a stored series). GC
-//! deliberately applies no value rule to `media_kind` — see
-//! [`MEDIA_DATAPOINT_EXTRA`].
+//! `media_kind` / `content_kind` its EXACT `^(audio|video)$` / `^(main|screen)$`
+//! rewrites to `invalid` do bound the distinct-value count (at most three
+//! values each reach a stored series). GC deliberately applies no value rule to
+//! either — see [`MEDIA_DATAPOINT_EXTRA`].
 //!
 //! Traversal is strictly fixed-depth over the structural message tree. The value
 //! checks read a value's discriminant (and, for the two keys above, a short
@@ -53,7 +53,9 @@
 //! forwards ONLY the re-encoded bytes — the original body is never proxied.
 
 use crate::observability::metrics;
-use common::observability::labels::{KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR, MEDIA_KIND_LABEL};
+use common::observability::labels::{
+    CONTENT_KIND_LABEL, KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR, MEDIA_KIND_LABEL,
+};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
@@ -115,23 +117,32 @@ pub const ALLOWLIST: [&str; 12] = [
 /// unguarded copy of a TypeScript-owned vocabulary whose own SSoT is a Guarded
 /// Shared Area.
 ///
-/// `media_kind` ([`MEDIA_KIND_LABEL`], story 3 R-29) is the closed vocabulary
-/// {`audio`, `video`}. Its single source of truth is the `media_kind` row of
-/// `docs/observability/label-taxonomy.md` (§"Carried: `media_kind`, by MC and
-/// the client SDK only"); the SDK's `MediaKindLabel` is its client code home.
-/// It is the one key story 3 adds. Like the five discriminators above — NOT
-/// like `key_custody`, whose value GC checks in `custody_value_ok` — GC bounds
-/// only its KEY and its value SHAPE (scalar). The content bound is the
-/// collector's EXACT `^(audio|video)$` rewrite to `invalid` on the metrics
-/// path, and that collector rule is the ONLY value bound. GC deliberately does
-/// NOT drop a bad value: a drop here would strip `media_kind="bogus"` before
-/// the collector saw it, making the collector rule dead and its rewrite
-/// unobservable (`crates/env-tests/tests/31_gc_telemetry.rs` proves the
-/// rewrite fires end to end, and `media_kind_value_is_not_checked_here` below
-/// pins this side). GC -> collector is the only metrics path, so the pipeline
-/// as a whole stays bounded. Not mirrored as a Rust enum here either: GC does
-/// not import MC's `MediaKindLabel`.
-pub const MEDIA_DATAPOINT_EXTRA: [&str; 7] = [
+/// `media_kind` ([`MEDIA_KIND_LABEL`], story 3 R-29) and `content_kind`
+/// ([`CONTENT_KIND_LABEL`], 2026-10-26) are the closed vocabularies
+/// {`audio`, `video`} and {`main`, `screen`}, always co-carried. Their single
+/// source of truth is the `media_kind` / `content_kind` rows and the projection
+/// table of `docs/observability/label-taxonomy.md`; the SDK's
+/// `projectMediaKind` is their client code home. Like the five discriminators
+/// above — NOT like `key_custody`, whose value GC checks in `custody_value_ok`
+/// — GC bounds only their KEYS and value SHAPE (scalar). The content bound is
+/// the collector's EXACT `^(audio|video)$` / `^(main|screen)$` rewrites to
+/// `invalid` on the metrics path, and those collector rules are the ONLY value
+/// bound. GC deliberately does NOT drop a bad value: a drop here would strip
+/// `media_kind="bogus"` before the collector saw it, making the collector rule
+/// dead and its rewrite unobservable (`crates/env-tests/tests/31_gc_telemetry.rs`
+/// proves both rewrites fire end to end, and `media_kind_value_is_not_checked_here`
+/// / `content_kind_value_is_not_checked_here` below pin this side). GC ->
+/// collector is the only metrics path, so the pipeline as a whole stays bounded.
+///
+/// So GC holds the KEYS and NO value of either vocabulary, and is inside the
+/// scope of the kind-label guards like every crate (`dt-guard metric-labels`
+/// `kind_label_literal`; `dt-guard client-metrics-export` `kind_key_not_kept`
+/// pins these two keys here). The `"audio"` / `"video"` / `"main"` strings in
+/// this file's tests are opaque fixture payload exercising KEY admission — the
+/// `"bogus"` cases prove GC never reads them — exempt as test code in every
+/// crate, not as a GC carve-out. Not mirrored as a Rust enum here either: GC
+/// does not import MC's projection.
+pub const MEDIA_DATAPOINT_EXTRA: [&str; 8] = [
     "reason",
     "outcome",
     "action",
@@ -139,6 +150,7 @@ pub const MEDIA_DATAPOINT_EXTRA: [&str; 7] = [
     "mode",
     KEY_CUSTODY_LABEL,
     MEDIA_KIND_LABEL,
+    CONTENT_KIND_LABEL,
 ];
 
 /// Which key tier applies at a given call site.
@@ -1239,10 +1251,10 @@ mod tests {
     // ---- Media datapoint tier (blocker 2) ----------------------------------
 
     #[test]
-    fn media_datapoint_extra_has_exactly_7_keys() {
+    fn media_datapoint_extra_has_exactly_8_keys() {
         // The one deliberate length literal: the tripwire that makes adding a
         // key a conscious edit. Everything else derives from the const.
-        assert_eq!(MEDIA_DATAPOINT_EXTRA.len(), 7);
+        assert_eq!(MEDIA_DATAPOINT_EXTRA.len(), 8);
     }
 
     /// The media-key fixtures below must cover the const EXACTLY, so a seventh
@@ -1265,6 +1277,7 @@ mod tests {
             string_attr("mode", "test_tone"),
             string_attr(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
             string_attr(MEDIA_KIND_LABEL, "audio"),
+            string_attr(CONTENT_KIND_LABEL, "main"),
         ]
     }
 
@@ -1280,6 +1293,7 @@ mod tests {
             string_attr("mode", "test_tone"),
             string_attr(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
             string_attr(MEDIA_KIND_LABEL, "video"),
+            string_attr(CONTENT_KIND_LABEL, "screen"),
         ];
         assert_fixture_covers_media_keys(&media);
         let mut attrs = media;
@@ -1298,6 +1312,7 @@ mod tests {
             ("mode", "test_tone"),
             (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
             (MEDIA_KIND_LABEL, "video"),
+            (CONTENT_KIND_LABEL, "screen"),
             ("client_version", "0.0.0"),
         ] {
             assert!(
@@ -1411,6 +1426,21 @@ mod tests {
         assert!(
             pairs(sum_dp_attrs(&req)).contains(&(MEDIA_KIND_LABEL, "bogus".to_string())),
             "media_kind must survive with its value byte-identical; got {:?}",
+            pairs(sum_dp_attrs(&req))
+        );
+    }
+
+    #[test]
+    fn content_kind_value_is_not_checked_here() {
+        // Twin of `media_kind_value_is_not_checked_here`: the collector's exact
+        // `^(main|screen)$` rewrite is the only value bound for this key too.
+        let mut req = sum_req_with(vec![string_attr(CONTENT_KIND_LABEL, "bogus")]);
+        let counts = filter_metrics(&mut req, TEST_ORG);
+
+        assert_eq!(counts.datapoint, 0, "nothing may be dropped");
+        assert!(
+            pairs(sum_dp_attrs(&req)).contains(&(CONTENT_KIND_LABEL, "bogus".to_string())),
+            "content_kind must survive with its value byte-identical; got {:?}",
             pairs(sum_dp_attrs(&req))
         );
     }

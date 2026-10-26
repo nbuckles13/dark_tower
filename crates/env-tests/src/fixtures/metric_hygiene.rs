@@ -67,10 +67,15 @@ pub enum Rule {
     MediaPathIdentity,
     /// R4 — a media-path series without `key_custody="operator"`.
     MissingKeyCustody,
-    /// ADR-0036 §7 — an `mh_*` series carrying [`MEDIA_KIND_KEY`]. MH is
-    /// TYPE-BLIND: it labels by behaviour it was told (e.g. transport
-    /// `datagram`/`stream`), never by media kind (story 3 R-29).
-    MediaKindOnMh,
+    /// ADR-0036 §7 — an `mh_*` series carrying [`MEDIA_KIND_KEY`] or
+    /// [`CONTENT_KIND_KEY`]. MH is TYPE-BLIND: it labels by behaviour it was
+    /// told (e.g. transport `datagram`/`stream`), never by media kind (story 3
+    /// R-29; widened to `content_kind` 2026-10-26).
+    KindLabelOnMh,
+    /// Taxonomy §"Carried: `media_kind` and `content_kind`" — the two kind keys
+    /// are co-carried, ALL OR NONE: a series carrying one without the other is
+    /// a recorder stamping half a projection.
+    KindLabelsSplit,
 }
 
 /// One breach, carrying enough context for a runbook entry to be actionable.
@@ -145,22 +150,54 @@ pub const KEY_CUSTODY_OPERATOR: &str = "operator";
 /// The media-kind label KEY. Mirrors
 /// `crates/common/src/observability/labels.rs::MEDIA_KIND_LABEL` (this crate
 /// does not depend on `common`), pinned by
-/// [`tests::media_kind_key_matches_common`]. Carried by MC and client media
+/// [`tests::kind_keys_match_common`]. Carried by MC and client media
 /// series (values `audio`/`video`, SSoT the `media_kind` row of
 /// `docs/observability/label-taxonomy.md`) and by NO `mh_*` series
-/// ([`Rule::MediaKindOnMh`]).
+/// ([`Rule::KindLabelOnMh`]).
 pub const MEDIA_KIND_KEY: &str = "media_kind";
 
 /// The closed `media_kind` value set. ANCHOR (DRY): the `media_kind` row of
 /// `docs/observability/label-taxonomy.md` is the SSoT; pinned against that row
-/// by [`tests::media_kind_values_match_the_taxonomy_row`].
+/// by [`tests::kind_values_match_the_taxonomy_rows`].
 pub const MEDIA_KIND_VALUES: [&str; 2] = [MEDIA_KIND_AUDIO, "video"];
 
 /// The `audio` member of [`MEDIA_KIND_VALUES`] — the kind every live series
 /// carries until video emits.
 pub const MEDIA_KIND_AUDIO: &str = "audio";
 
-/// Metric-name prefix of every MH series — the scope of [`Rule::MediaKindOnMh`].
+/// The content-kind label KEY, co-carried with [`MEDIA_KIND_KEY`] (all or none,
+/// [`Rule::KindLabelsSplit`]). Mirrors
+/// `crates/common/src/observability/labels.rs::CONTENT_KIND_LABEL`, pinned by
+/// [`tests::kind_keys_match_common`].
+pub const CONTENT_KIND_KEY: &str = "content_kind";
+
+/// The closed `content_kind` value set. ANCHOR (DRY): the `content_kind` row of
+/// `docs/observability/label-taxonomy.md`, pinned by
+/// [`tests::kind_values_match_the_taxonomy_rows`]. Restated rather than read
+/// from MC's or dt-guard's reader because this crate depends on neither
+/// (ADR-0028); this test is the third Rust reader of those rows, on the same
+/// `| `key` |` markers.
+pub const CONTENT_KIND_VALUES: [&str; 2] = [CONTENT_KIND_MAIN, "screen"];
+
+/// The `main` member of [`CONTENT_KIND_VALUES`] — the value every live series
+/// carries until content share ships (no served kind projects to `screen`).
+pub const CONTENT_KIND_MAIN: &str = "main";
+
+/// How many series carry BOTH kind keys: the non-empty precondition of
+/// [`Rule::KindLabelsSplit`] (zero kind-labelled series would make "no split"
+/// vacuous). Callers assert it is non-zero with a reason distinct from a
+/// content violation.
+#[must_use]
+pub fn kind_labelled_series_count(series: &[Series]) -> usize {
+    series
+        .iter()
+        .filter(|s| {
+            s.labels.contains_key(MEDIA_KIND_KEY) && s.labels.contains_key(CONTENT_KIND_KEY)
+        })
+        .count()
+}
+
+/// Metric-name prefix of every MH series — the scope of [`Rule::KindLabelOnMh`].
 /// Deliberately the whole service namespace, not `mh_media_`: type-blindness is
 /// a property of MH, not of its media-path subset.
 pub const MH_SERIES_PREFIX: &str = "mh_";
@@ -365,20 +402,34 @@ pub fn check_series(series: &[Series]) -> Vec<Violation> {
             }
         }
 
-        // ADR-0036 §7 — MH is type-blind. EXACT key match: `media_kind` is a
-        // fixed key spelling, and containment would misfire on a legitimate
-        // behaviour key that happened to contain it.
+        // ADR-0036 §7 — MH is type-blind. EXACT key match: the kind keys are
+        // fixed spellings, and containment would misfire on a legitimate
+        // behaviour key that happened to contain one.
         if s.name.starts_with(MH_SERIES_PREFIX) {
-            if let Some(v) = s.labels.get(MEDIA_KIND_KEY) {
-                out.push(Violation {
-                    rule: Rule::MediaKindOnMh,
-                    series: s.name.clone(),
-                    detail: format!(
-                        "MH series carries `{MEDIA_KIND_KEY}=\"{v}\"`; MH is type-blind \
-                         (ADR-0036 §7) and labels by behaviour, never by kind"
-                    ),
-                });
+            for key in [MEDIA_KIND_KEY, CONTENT_KIND_KEY] {
+                if let Some(v) = s.labels.get(key) {
+                    out.push(Violation {
+                        rule: Rule::KindLabelOnMh,
+                        series: s.name.clone(),
+                        detail: format!(
+                            "MH series carries `{key}=\"{v}\"`; MH is type-blind \
+                             (ADR-0036 §7) and labels by behaviour, never by kind"
+                        ),
+                    });
+                }
             }
+        }
+
+        // All or none: the two kind keys are one projection.
+        if s.labels.contains_key(MEDIA_KIND_KEY) != s.labels.contains_key(CONTENT_KIND_KEY) {
+            out.push(Violation {
+                rule: Rule::KindLabelsSplit,
+                series: s.name.clone(),
+                detail: format!(
+                    "series carries exactly one of `{MEDIA_KIND_KEY}` / `{CONTENT_KIND_KEY}`; \
+                     the two are co-carried, all or none (label-taxonomy.md)"
+                ),
+            });
         }
 
         for (k, v) in &s.labels {
@@ -1077,43 +1128,95 @@ mod tests {
         );
     }
 
-    /// The restated `media_kind` VALUES must equal the taxonomy row, as a set.
-    #[test]
-    fn media_kind_values_match_the_taxonomy_row() {
-        let doc = repo_file("docs/observability/label-taxonomy.md");
+    /// The value set of the one `| `key` |` taxonomy row.
+    ///
+    /// SIBLING READERS (crate boundaries keep them apart, ADR-0028; same
+    /// markers): `crates/mc-service/src/media_kind.rs` tests (`label_row`) and
+    /// `crates/dt-guard/src/client_metrics_export.rs` (`kind_taxonomy`).
+    /// env-tests depends on neither crate.
+    fn taxonomy_row_values(doc: &str, key: &str) -> std::collections::BTreeSet<String> {
         let rows: Vec<&str> = doc
             .lines()
-            .filter(|l| l.starts_with(&format!("| `{MEDIA_KIND_KEY}` |")))
+            .filter(|l| l.starts_with(&format!("| `{key}` |")))
             .collect();
-        assert_eq!(
-            rows.len(),
-            1,
-            "exactly one `{MEDIA_KIND_KEY}` taxonomy row: {rows:?}"
-        );
+        assert_eq!(rows.len(), 1, "exactly one `{key}` taxonomy row: {rows:?}");
         let cell = rows[0].split('|').nth(2).expect("row has a values cell");
-        let doc_values: std::collections::BTreeSet<&str> =
-            cell.split('`').skip(1).step_by(2).collect();
-        assert!(
-            !doc_values.is_empty(),
-            "parsed no values from {:?}",
-            rows[0]
-        );
-        let ours: std::collections::BTreeSet<&str> = MEDIA_KIND_VALUES.into_iter().collect();
-        assert_eq!(
-            ours, doc_values,
-            "MEDIA_KIND_VALUES drifted from the taxonomy row"
-        );
+        let values: std::collections::BTreeSet<String> = cell
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        assert!(!values.is_empty(), "parsed no values from {:?}", rows[0]);
+        values
     }
 
-    /// The restated `media_kind` key must equal common's constant.
+    /// The restated kind VALUES must equal the taxonomy rows, as sets.
     #[test]
-    fn media_kind_key_matches_common() {
+    fn kind_values_match_the_taxonomy_rows() {
+        let doc = repo_file("docs/observability/label-taxonomy.md");
+        for (key, ours) in [
+            (MEDIA_KIND_KEY, MEDIA_KIND_VALUES),
+            (CONTENT_KIND_KEY, CONTENT_KIND_VALUES),
+        ] {
+            let ours: std::collections::BTreeSet<String> =
+                ours.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                ours,
+                taxonomy_row_values(&doc, key),
+                "{key} values drifted from the taxonomy row"
+            );
+        }
+    }
+
+    /// The restated kind keys must equal common's constants.
+    #[test]
+    fn kind_keys_match_common() {
         let src = repo_file("crates/common/src/observability/labels.rs");
-        let want = format!("MEDIA_KIND_LABEL: &str = \"{MEDIA_KIND_KEY}\"");
-        assert!(
-            src.contains(&want),
-            "common's MEDIA_KIND_LABEL no longer equals {MEDIA_KIND_KEY:?}"
-        );
+        for want in [
+            format!("MEDIA_KIND_LABEL: &str = \"{MEDIA_KIND_KEY}\""),
+            format!("CONTENT_KIND_LABEL: &str = \"{CONTENT_KIND_KEY}\""),
+        ] {
+            assert!(src.contains(&want), "common no longer declares {want}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // All or none (2026-10-26). FIRES half; 32's live fetch is the APPLIES
+    // half, with `kind_labelled_series_count` as its non-empty precondition.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_series_with_one_kind_key_is_a_split() {
+        for (key, value) in [(MEDIA_KIND_KEY, "audio"), (CONTENT_KIND_KEY, "main")] {
+            let v = check_series(&[s(
+                "mc_media_send_targets_total",
+                &[(key, value), ("key_custody", "operator")],
+            )]);
+            assert_eq!(count(&v, Rule::KindLabelsSplit), 1, "{key}: {v:?}");
+        }
+    }
+
+    #[test]
+    fn both_or_neither_kind_key_is_not_a_split_and_is_counted() {
+        let series = [
+            s(
+                "dt_client_media_frames_received_total",
+                &[
+                    (MEDIA_KIND_KEY, "audio"),
+                    (CONTENT_KIND_KEY, "main"),
+                    ("key_custody", "operator"),
+                ],
+            ),
+            s(
+                "mc_media_send_directives_total",
+                &[("key_custody", "operator")],
+            ),
+        ];
+        let v = check_series(&series);
+        assert_eq!(count(&v, Rule::KindLabelsSplit), 0, "{v:?}");
+        assert_eq!(kind_labelled_series_count(&series), 1);
+        assert_eq!(kind_labelled_series_count(&series[1..]), 0);
     }
 
     // ------------------------------------------------------------------
@@ -1131,7 +1234,16 @@ mod tests {
                 (MEDIA_KIND_KEY, "video"),
             ],
         )]);
-        assert_eq!(count(&v, Rule::MediaKindOnMh), 1, "{v:?}");
+        assert_eq!(count(&v, Rule::KindLabelOnMh), 1, "{v:?}");
+    }
+
+    #[test]
+    fn mh_content_kind_fires_too() {
+        let v = check_series(&[s(
+            "mh_media_frames_forwarded_total",
+            &[("key_custody", "operator"), (CONTENT_KIND_KEY, "main")],
+        )]);
+        assert_eq!(count(&v, Rule::KindLabelOnMh), 1, "{v:?}");
     }
 
     #[test]
@@ -1140,7 +1252,7 @@ mod tests {
             "mh_webtransport_connections_total",
             &[("status", "ok"), (MEDIA_KIND_KEY, "audio")],
         )]);
-        assert_eq!(count(&v, Rule::MediaKindOnMh), 1, "{v:?}");
+        assert_eq!(count(&v, Rule::KindLabelOnMh), 1, "{v:?}");
     }
 
     #[test]
@@ -1151,6 +1263,7 @@ mod tests {
                 &[
                     ("slot_state", "active"),
                     (MEDIA_KIND_KEY, "audio"),
+                    (CONTENT_KIND_KEY, "main"),
                     ("key_custody", "operator"),
                 ],
             ),
@@ -1160,6 +1273,7 @@ mod tests {
                     ("client_version", "0.0.0"),
                     ("org_id", "o"),
                     (MEDIA_KIND_KEY, "audio"),
+                    (CONTENT_KIND_KEY, "main"),
                     ("key_custody", "operator"),
                 ],
             ),
@@ -1174,7 +1288,7 @@ mod tests {
             // Exact match: a key merely CONTAINING the spelling is not this rule.
             s("mh_test_series", &[("media_kind_x", "1")]),
         ]);
-        assert_eq!(count(&v, Rule::MediaKindOnMh), 0, "{v:?}");
+        assert_eq!(count(&v, Rule::KindLabelOnMh), 0, "{v:?}");
     }
 
     /// The restated `operator` value must equal common's constant.

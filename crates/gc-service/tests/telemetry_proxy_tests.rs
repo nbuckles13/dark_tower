@@ -14,7 +14,7 @@ use test_common::jwt_fixtures::{TestKeypair, TestUserClaims};
 
 use anyhow::Result;
 use chrono::Utc;
-use common::observability::labels::MEDIA_KIND_LABEL;
+use common::observability::labels::{CONTENT_KIND_LABEL, MEDIA_KIND_LABEL};
 use common::secret::SecretString;
 use common::token_manager::TokenReceiver;
 use gc_service::config::Config;
@@ -1061,8 +1061,8 @@ fn str_kv(key: &str, value: &str) -> KeyValue {
 async fn media_kind_survives_on_a_metric_datapoint_and_is_stripped_from_spans_and_exemplars(
     pool: PgPool,
 ) -> Result<()> {
-    // Story 3 R-29: `media_kind` is in the DATAPOINT-ONLY tier
-    // (`MEDIA_DATAPOINT_EXTRA`). Proven on the real user-JWT path against the
+    // Story 3 R-29 (+ `content_kind`, 2026-10-26): both kind keys are in the
+    // DATAPOINT-ONLY tier (`MEDIA_DATAPOINT_EXTRA`). Proven on the real user-JWT path against the
     // bytes GC actually forwards: kept on a Sum datapoint, byte-identical;
     // stripped from that datapoint's exemplar and from a span.
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -1081,9 +1081,15 @@ async fn media_kind_survives_on_a_metric_datapoint_and_is_stripped_from_spans_an
                     name: "dt_client_media_frames_received_total".to_string(),
                     data: Some(Data::Sum(Sum {
                         data_points: vec![NumberDataPoint {
-                            attributes: vec![str_kv(MEDIA_KIND_LABEL, "video")],
+                            attributes: vec![
+                                str_kv(MEDIA_KIND_LABEL, "video"),
+                                str_kv(CONTENT_KIND_LABEL, "main"),
+                            ],
                             exemplars: vec![Exemplar {
-                                filtered_attributes: vec![str_kv(MEDIA_KIND_LABEL, "video")],
+                                filtered_attributes: vec![
+                                    str_kv(MEDIA_KIND_LABEL, "video"),
+                                    str_kv(CONTENT_KIND_LABEL, "main"),
+                                ],
                                 ..Default::default()
                             }],
                             ..Default::default()
@@ -1104,7 +1110,10 @@ async fn media_kind_survives_on_a_metric_datapoint_and_is_stripped_from_spans_an
                 scope: None,
                 spans: vec![Span {
                     name: "join".to_string(),
-                    attributes: vec![str_kv(MEDIA_KIND_LABEL, "video")],
+                    attributes: vec![
+                        str_kv(MEDIA_KIND_LABEL, "video"),
+                        str_kv(CONTENT_KIND_LABEL, "main"),
+                    ],
                     ..Default::default()
                 }],
                 schema_url: String::new(),
@@ -1147,29 +1156,30 @@ async fn media_kind_survives_on_a_metric_datapoint_and_is_stripped_from_spans_an
         unreachable!("payload was built with a Sum; the filter never changes the data kind");
     };
     let dp = &sum.data_points[0];
-    let kind = dp.attributes.iter().find(|kv| kv.key == MEDIA_KIND_LABEL);
-    assert!(
-        matches!(
-            kind.and_then(|kv| kv.value.as_ref()).and_then(|v| v.value.as_ref()),
-            Some(Value::StringValue(v)) if v == "video"
-        ),
-        "media_kind must survive on the datapoint byte-identical; got {:?}",
-        dp.attributes
-    );
-    assert!(
-        !dp.exemplars[0]
-            .filtered_attributes
-            .iter()
-            .any(|kv| kv.key == MEDIA_KIND_LABEL),
-        "exemplars take the BASE tier; media_kind must be stripped there"
-    );
-
     let fwd_t = ExportTraceServiceRequest::decode(t_body.as_slice())?;
     let span = &fwd_t.resource_spans[0].scope_spans[0].spans[0];
-    assert!(
-        !span.attributes.iter().any(|kv| kv.key == MEDIA_KIND_LABEL),
-        "media_kind is datapoint-only and must be stripped from spans; got {:?}",
-        span.attributes
-    );
+    for (key, value) in [(MEDIA_KIND_LABEL, "video"), (CONTENT_KIND_LABEL, "main")] {
+        let kept = dp.attributes.iter().find(|kv| kv.key == key);
+        assert!(
+            matches!(
+                kept.and_then(|kv| kv.value.as_ref()).and_then(|v| v.value.as_ref()),
+                Some(Value::StringValue(v)) if v == value
+            ),
+            "{key} must survive on the datapoint byte-identical; got {:?}",
+            dp.attributes
+        );
+        assert!(
+            !dp.exemplars[0]
+                .filtered_attributes
+                .iter()
+                .any(|kv| kv.key == key),
+            "exemplars take the BASE tier; {key} must be stripped there"
+        );
+        assert!(
+            !span.attributes.iter().any(|kv| kv.key == key),
+            "{key} is datapoint-only and must be stripped from spans; got {:?}",
+            span.attributes
+        );
+    }
     Ok(())
 }
