@@ -47,3 +47,4 @@ pub mod observability;
 // Spike: cache-measurement touch 2.
 // Spike: cache-measurement touch 3.
 // Spike: cache-measurement touch 4.
+// Spike: cache-measurement touch 5.
