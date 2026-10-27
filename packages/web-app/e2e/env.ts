@@ -18,10 +18,16 @@
 // the GC join response's `media_servers` (ADR-0030 — topology never computed
 // client-side).
 //
+// The Vite dev server's listen address is NOT owned here: it lives in
+// vite/devServer.ts (shared with vite.config.ts), and this module derives the
+// default page-origin port and the loopback host from it — see `loopbackBase`.
+//
 // ONE exception to "env-overridable value with a documented default":
 // `E2E_ORG_SUBDOMAIN` is REQUIRED and has no default (R-7). See `readSubdomain`.
 
 /** One resolved setting plus where it came from (env override vs default). */
+import { DEV_SERVER_HOST, DEV_SERVER_PORT } from '../vite/devServer.js';
+
 interface Resolved {
   readonly value: string;
   readonly source: 'env' | 'default';
@@ -107,7 +113,10 @@ const orgSubdomain = readSubdomain('E2E_ORG_SUBDOMAIN');
 // sets both they must agree (checked below). scripts/layer7.sh exports
 // E2E_ORG_SUBDOMAIN ONLY — never E2E_BASE_URL, which would reintroduce exactly
 // the drift this check exists to catch.
-const baseUrl = readUrl('E2E_BASE_URL', `http://${orgSubdomain.value}.localhost:5173`);
+const baseUrl = readUrl(
+  'E2E_BASE_URL',
+  `http://${orgSubdomain.value}.localhost:${DEV_SERVER_PORT}`,
+);
 const parsedBaseUrl = new URL(baseUrl.value);
 const baseUrlLabel = parsedBaseUrl.hostname.split('.')[0] ?? '';
 if (baseUrlLabel !== orgSubdomain.value) {
@@ -124,8 +133,21 @@ if (baseUrlLabel !== orgSubdomain.value) {
 // follow an E2E_BASE_URL override. Node does not resolve `*.localhost` names
 // (that is a browser behavior — see `toLoopbackUrl`); the browser itself still
 // navigates to `baseUrl` with the org-subdomain Host.
+//
+// The loopback host is the dev server's LISTEN address (vite/devServer.ts), not a
+// second literal: a name here would resolve by resolver order and could miss a
+// literal bind (the [::1]-vs-127.0.0.1 hang on a v6-first CI runner). An IPv6
+// literal must be bracketed for the WHATWG URL hostname setter, which silently
+// IGNORES an unbracketed `::1` — so bracket, then assert the swap took effect.
 const loopbackBase = new URL(baseUrl.value);
-loopbackBase.hostname = '127.0.0.1';
+loopbackBase.hostname = DEV_SERVER_HOST.includes(':') ? `[${DEV_SERVER_HOST}]` : DEV_SERVER_HOST;
+const devServerHost = loopbackBase.hostname.replace(/^\[(.*)\]$/, '$1');
+if (devServerHost !== DEV_SERVER_HOST) {
+  throw new Error(
+    `e2e/env.ts: loopback swap produced host "${loopbackBase.hostname}" from ` +
+      `DEV_SERVER_HOST="${DEV_SERVER_HOST}" (vite/devServer.ts) — not a valid literal address?`,
+  );
+}
 const acUrl = readUrl('E2E_AC_URL', 'http://127.0.0.1:8443');
 const gcUrl = readUrl('E2E_GC_URL', 'http://127.0.0.1:8444');
 const prometheusUrl = readUrl('E2E_PROMETHEUS_URL', 'http://127.0.0.1:9090');
@@ -147,6 +169,21 @@ export const e2eEnv = {
    * load-bearing for navigation.
    */
   loopbackBaseUrl: loopbackBase.origin,
+  /**
+   * The address a Playwright-STARTED Vite must listen on so `loopbackBaseUrl`
+   * reaches it: host unbracketed (Vite `--host` form) and port, both read back
+   * from `loopbackBaseUrl` itself — so they follow an E2E_BASE_URL port override
+   * and cannot disagree with what the readiness probe dials.
+   */
+  devServerListen: {
+    host: devServerHost,
+    port:
+      loopbackBase.port === ''
+        ? loopbackBase.protocol === 'https:'
+          ? '443'
+          : '80'
+        : loopbackBase.port,
+  },
   /** AC NodePort (health probe only — auth traffic flows through the Vite proxy). */
   acUrl: acUrl.value,
   /** GC NodePort (health probe + `bootstrapMeeting`'s direct POST /api/v1/meetings). */

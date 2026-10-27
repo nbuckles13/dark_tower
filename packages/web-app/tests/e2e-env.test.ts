@@ -119,6 +119,43 @@ test('a well-formed per-run subdomain resolves and E2E_BASE_URL DERIVES from it'
   // Node does not necessarily resolve `*.localhost`, so Node-side probes get loopback —
   // derived once here rather than in each consumer, so the Vite port is encoded once.
   expect(e2eEnv.loopbackBaseUrl).toBe('http://127.0.0.1:5173');
+  // ...and a Playwright-started Vite is told to listen exactly there.
+  expect(e2eEnv.devServerListen).toEqual({ host: '127.0.0.1', port: '5173' });
+});
+
+test('the Vite bind and the Node-side probe address are ONE value (vite/devServer.ts)', async () => {
+  // The CI-runner hang this pins: Vite bound the NAME `localhost`, which a v6-first resolver
+  // turned into [::1] only, while readiness dialled 127.0.0.1. Both sides must now read the
+  // same literal: vite.config.ts's `server.host`/`port`, and env.ts's loopback derivation.
+  process.env.E2E_ORG_SUBDOMAIN = 'e2e-0123456789abcdef';
+  const { DEV_SERVER_HOST, DEV_SERVER_PORT } = await import('../vite/devServer.js');
+  const { default: viteConfig } = await import('../vite.config.js');
+  const resolved =
+    typeof viteConfig === 'function'
+      ? await viteConfig({ mode: 'development', command: 'serve' })
+      : viteConfig;
+  expect(resolved.server?.host).toBe(DEV_SERVER_HOST);
+  expect(resolved.server?.port).toBe(DEV_SERVER_PORT);
+  expect(resolved.server?.strictPort).toBe(true);
+  const { e2eEnv } = await loadEnvModule();
+  expect(e2eEnv.devServerListen).toEqual({ host: DEV_SERVER_HOST, port: String(DEV_SERVER_PORT) });
+  expect(new URL(e2eEnv.loopbackBaseUrl).port).toBe(String(DEV_SERVER_PORT));
+});
+
+test('an IPv6 DEV_SERVER_HOST is bracketed in the URL and bare for Vite --host', async () => {
+  // The WHATWG URL hostname setter silently IGNORES an unbracketed `::1`, which would leave
+  // the probe dialling `<org>.localhost` (ENOTFOUND in Node). Flipping the bind to ::1 must
+  // stay a one-line change in vite/devServer.ts.
+  process.env.E2E_ORG_SUBDOMAIN = 'e2e-0123456789abcdef';
+  vi.resetModules();
+  vi.doMock('../vite/devServer.js', () => ({ DEV_SERVER_HOST: '::1', DEV_SERVER_PORT: 5173 }));
+  try {
+    const { e2eEnv } = await import('../e2e/env.js');
+    expect(e2eEnv.loopbackBaseUrl).toBe('http://[::1]:5173');
+    expect(e2eEnv.devServerListen).toEqual({ host: '::1', port: '5173' });
+  } finally {
+    vi.doUnmock('../vite/devServer.js');
+  }
 });
 
 test('E2E_BASE_URL whose host label disagrees with the subdomain throws', async () => {
@@ -139,6 +176,8 @@ test('E2E_BASE_URL that AGREES with the subdomain is accepted', async () => {
   const { e2eEnv } = await loadEnvModule();
   expect(e2eEnv.baseUrl).toBe('http://e2e-0123456789abcdef.localhost:5199');
   expect(e2eEnv.loopbackBaseUrl).toBe('http://127.0.0.1:5199');
+  // The port override reaches the Playwright-started server's listen port too.
+  expect(e2eEnv.devServerListen).toEqual({ host: '127.0.0.1', port: '5199' });
 });
 
 // ---------------------------------------------------------------------------

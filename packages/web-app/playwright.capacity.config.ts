@@ -5,7 +5,8 @@
 // the fake-media flags and NO cert-bypass flag), matching ONLY
 // `e2e/capacity.evidence.ts`. A recorded run, not a gate: the default
 // `test:e2e` (Layer 7) never matches that file. Run it with
-// `pnpm --filter @darktower/web-app test:capacity-evidence`; the record lands in
+// `pnpm nx run web-app:test:capacity-evidence` (through Nx so proto codegen runs
+// first; `pnpm test:capacity-evidence` in this package is the same call); the record lands in
 // the manual test plan's "Capacity evidence" section.
 
 import { defineConfig } from 'playwright/test';

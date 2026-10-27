@@ -9,6 +9,7 @@ import {
   TEST_PATTERN_ENV,
   resolveOptInTestDefine,
 } from './vite/testDefines.js';
+import { DEV_SERVER_HOST, DEV_SERVER_PORT } from './vite/devServer.js';
 
 // R-30: web-app dev/build config.
 //
@@ -74,6 +75,14 @@ export default defineConfig(({ mode }) => ({
   },
   plugins: [svelte()],
   server: {
+    // Listen address: a LITERAL loopback, never the name `localhost` (whose bind follows
+    // resolver order — the [::1]-only bind that hung the E2E suite on a v6-first runner).
+    // Rationale and the 127.0.0.1-vs-::1 choice: vite/devServer.ts. strictPort: a taken
+    // port fails loudly instead of Vite silently moving to the next one, which every
+    // `:5173` origin (page, AC origin template, Playwright readiness) would then miss.
+    host: DEV_SERVER_HOST,
+    port: DEV_SERVER_PORT,
+    strictPort: true,
     // AC needs the subdomain in the Host header (ADR-0020 org extraction), so the
     // auth proxy PRESERVES Host (changeOrigin:false) and forwards WHATEVER `*.localhost`
     // label the page was served on — this proxy is subdomain-AGNOSTIC and needs no change
