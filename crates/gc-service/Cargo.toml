@@ -14,7 +14,7 @@ workspace = true
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
-tower-http = { workspace = true, features = ["trace", "timeout", "cors"] }
+tower-http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
@@ -77,7 +77,6 @@ anyhow = { workspace = true }
 http-body-util = { workspace = true }
 wiremock = { workspace = true }
 futures = { workspace = true }
-tower = { workspace = true, features = ["util"] }
 # Re-export for integration tests (metrics-exporter-prometheus is also in deps)
 metrics-exporter-prometheus = { workspace = true }
 # JWT/base64 used in test code (auth_layer async_tests)

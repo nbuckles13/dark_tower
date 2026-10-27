@@ -53,6 +53,7 @@ pub mod rust_log_secrets;
 pub mod rust_pii;
 pub mod rust_secrets;
 pub mod secret_patterns;
+pub mod service_dep_exclusion;
 pub mod telemetry_macros;
 pub mod test_coverage;
 pub mod test_registration;
