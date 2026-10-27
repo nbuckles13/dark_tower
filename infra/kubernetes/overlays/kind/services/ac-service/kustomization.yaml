@@ -11,6 +11,13 @@ resources:
 # dev so the AC OTel exemplar is validated end-to-end.
 patches:
   - path: configmap-otel-patch.yaml
+  # Kind stands the NodePort in for production's ingress gateway: admit
+  # non-pod sources to AC's HTTP port (see the patch file for why that is the
+  # narrowest rule that works, and the podSubnet drift guard).
+  - path: network-policy-nodeport-patch.yaml
+    target:
+      kind: NetworkPolicy
+      name: ac-service
 
 labels:
   - pairs:

@@ -113,6 +113,53 @@ async fn test_network_policy_blocks_cross_namespace() {
     }
 }
 
+/// Test that NetworkPolicy blocks cross-namespace traffic to GC's HTTP port.
+///
+/// GC's HTTP port is externally reachable (the ingress gateway in production,
+/// the NodePort in Kind), which once tempted an admit-all `from: []` rule on
+/// it, and that admitted every pod in every namespace too. The Kind overlay's
+/// NodePort rule admits only NON-pod sources, so a pod in another namespace
+/// must still be blocked. GC's allowed external path is exercised by every
+/// env-test that calls GC through `ENV_TEST_GC_URL` (the NodePort).
+#[tokio::test]
+#[serial]
+async fn test_network_policy_blocks_cross_namespace_to_gc() {
+    let test_namespace = "canary-test-isolated";
+
+    let canary = CanaryPod::deploy(test_namespace).await.unwrap_or_else(|e| {
+        panic!(
+            "Failed to deploy canary pod in {}: {}. \
+                 Ensure kubectl is configured and has permissions to create namespaces/pods.",
+            test_namespace, e
+        )
+    });
+
+    let target_url = "http://gc-service.dark-tower.svc.cluster.local:8080/health";
+    let can_reach = canary.can_reach(target_url).await;
+
+    // Cleanup before asserting (ensure cleanup even on failure)
+    let cleanup_result = canary.cleanup().await;
+    let namespace_result = cleanup_test_namespace(test_namespace);
+
+    assert!(
+        !can_reach,
+        "Canary pod in '{}' namespace should NOT be able to reach GC service at {}. \
+         GC's NetworkPolicy admits external clients only via the ingress gateway (prod) \
+         or non-pod sources (Kind overlay); a pod in another namespace reaching it is a \
+         SECURITY GAP. Expected: Connection blocked/timeout. Got: Connection succeeded.",
+        test_namespace, target_url
+    );
+
+    // A failed cleanup leaks a pod or namespace into the next run: fail
+    // loudly, after the primary assertion so it never hides that result.
+    if let Err(e) = cleanup_result {
+        panic!("canary cleanup failed (pod leaked into {test_namespace}): {e}");
+    }
+    if let Err(e) = namespace_result {
+        panic!("test namespace cleanup failed ({test_namespace} leaked): {e}");
+    }
+}
+
 /// Delete a test namespace created by a NetworkPolicy test. Errors are
 /// returned, never discarded: a leaked namespace breaks the next run.
 fn cleanup_test_namespace(namespace: &str) -> Result<(), String> {
