@@ -8,7 +8,9 @@
 #   3. dt-story dev-tool build — produces DT_STORY_BIN for the Layer-3
 #      `validate-story-manifest.sh` guard (story-runner manifest schema check).
 #      Same build-once-before-guards pattern as dt-guard.
-#   4. ADR-0036 §11 release-build feature gate — a NEGATIVE compile assertion.
+#   4. `dt-guard service-dep-exclusion` — no sqlx in MC/MH's resolved graph
+#      (it runs `cargo tree`, so it is here rather than in Layer 3).
+#   5. ADR-0036 §11 release-build feature gate — a NEGATIVE compile assertion.
 #      Not a build; see the block above its invocation for why it lives here.
 # The tools build with the non-LTO `devtools` profile (Cargo.toml), not the services'
 # fat-LTO release profile: measured 2026-10-26 (docs/devloop-outputs/
@@ -22,6 +24,15 @@ install_wrapper_exit_trap  # task #50: emit STATUS=FAIL if we abort before emitt
 run_and_emit "cargo-build" cargo build --workspace "${CARGO_LOCKED[@]}" --quiet "$@"
 run_and_emit "cargo-build-dt-guard" dt_build_tool dt-guard "${CARGO_LOCKED[@]}" --quiet "$@"
 run_and_emit "cargo-build-dt-story" dt_build_tool dt-story "${CARGO_LOCKED[@]}" --quiet "$@"
+
+# Service dependency-graph exclusion (no sqlx in MC/MH) — a dt-guard subcommand, but it
+# INVOKES CARGO (`cargo tree -p <svc>`: resolution only, no compile), so it runs here,
+# for the same reason as the release-feature gate below, and NOT as a guards/simple/
+# wrapper that run-guards.sh would auto-discover into Layer 3. Placed after the dt-guard
+# build that produces the binary. Policy and rationale:
+# crates/dt-guard/src/service_dep_exclusion.rs.
+__repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+run_and_emit "service-dep-exclusion" "${DT_GUARD:-$DT_GUARD_BIN}" service-dep-exclusion --root "$__repo_root"
 
 # ADR-0036 §11 release-build feature gate — asserts mh-service's `per-frame-trace`
 # `compile_error!` (crates/mh-service/src/lib.rs) BOTH fires under the release profile with

@@ -58,8 +58,26 @@ tokio-util = "0.7"
 
 # Web frameworks
 axum = "0.8"
-tower = "0.5"
-tower-http = "0.7"
+# FEATURE UNIFICATION. The feature sets of `tower`, `tower-http` and `wtransport`
+# are declared HERE, once, and members inherit them with a bare
+# `{ workspace = true }`; `futures` and `getrandom-02` (below) are pulled into every
+# service through `common` for the same reason. Each
+# service image is a separate `cargo build -p <svc>` in one shared target dir, so a
+# crate resolved with different features per service is compiled once PER feature
+# set, and every crate above it (axum, tonic, hyper-util, reqwest, the OTel crates,
+# common) is compiled again with it. Every feature listed here is additive API
+# surface (a module, layer or re-export) that gates no dependency and changes no
+# existing code path, so a service that does not call it is unaffected.
+# Deliberately NOT unified this way: `common`'s `db` feature (would put sqlx into
+# MC/MH — dt-guard `service-dep-graph` fails if it does) and any TLS/crypto
+# provider selection (ring vs aws-lc-rs), which can change runtime behaviour.
+#
+# `util` is already on in every service via tonic/axum; declaring it keeps the
+# `tower::ServiceExt` the ac/gc tests use from depending on that.
+tower = { version = "0.5", features = ["util"] }
+# Union of the layers the services use: `trace` (common's request spans, all
+# services), `cors` (AC, GC), `timeout` (AC, GC), `set-header` (AC).
+tower-http = { version = "0.7", features = ["trace", "cors", "timeout", "set-header"] }
 # HTTP types (HeaderMap/HeaderName/HeaderValue) shared by axum/reqwest/tonic.
 # Direct dep for `common::observability::otel_http` (R-56 HTTP propagation);
 # previously only transitive.
@@ -67,7 +85,13 @@ http = "1"
 
 # QUIC/WebTransport
 quinn = "0.11"
-wtransport = "0.7"
+# `quinn` feature: unlocks `ServerConfigBuilder::with_custom_transport`, which is
+# how ADR-0036 §1's explicit `quinn::TransportConfig` reaches the MH endpoint. It is
+# purely additive re-export surface (`wtransport`'s own `[features] quinn = []`
+# gates no dependency; wtransport already depends on the same quinn 0.11 we do).
+# Declared at the workspace (not only in mh-service) so MC and MH resolve one
+# wtransport — see the feature-unification note above `tower`.
+wtransport = { version = "0.7", features = ["quinn"] }
 
 # Lock-free snapshot publication. Readers take an `Arc` with no guard lifetime
 # (`ArcSwap::load_full`), which `tokio::sync::watch` cannot offer: its
@@ -162,7 +186,19 @@ metrics-exporter-prometheus = "0.18"
 # HTTP client. Every consumer uses rustls with defaults off.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 http-body-util = "0.1"
+# `common` depends on this for feature unification only (see its manifest).
 futures = "0.3.31"
+# FEATURE UNIFICATION ONLY, consumed by `common` — no code uses it. ring (via
+# rustls/jsonwebtoken/quinn) depends on getrandom 0.2; AC, GC and MC also get its
+# `std` feature from another dependent (bcrypt in AC, `rand` 0.8 via redis in GC/MC),
+# MH alone did not, so in MH
+# ring, rustls, quinn-proto, reqwest and everything above them compiled a second
+# time. getrandom 0.2's `std` gates ONE module (`error_impls`: `std::error::Error`
+# for `getrandom::Error` and `From<Error> for std::io::Error`); the OS entropy
+# source and every code path are unchanged. This is not a crypto-provider choice.
+# Renamed so it cannot be mistaken for a direct getrandom dependency; a bump past
+# 0.2 here would silently stop unifying (ring still asks for 0.2).
+getrandom-02 = { package = "getrandom", version = "0.2", features = ["std"] }
 tokio-stream = "0.1"
 
 # CLI and parsing (dt-guard, dt-story, devloop-helper, env-tests)

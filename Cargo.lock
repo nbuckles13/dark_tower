@@ -593,6 +593,8 @@ dependencies = [
  "bytes",
  "chrono",
  "criterion",
+ "futures",
+ "getrandom 0.2.16",
  "http",
  "jsonwebtoken",
  "metrics",

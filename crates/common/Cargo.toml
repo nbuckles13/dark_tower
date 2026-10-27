@@ -43,7 +43,7 @@ tonic = { workspace = true }
 http = { workspace = true }
 # Shared request-span builders for tower-http `TraceLayer`s (R-56 inbound
 # extraction hosts), so every service's request span has one definition.
-tower-http = { workspace = true, features = ["trace"] }
+tower-http = { workspace = true }
 tower = { workspace = true }
 
 # OpenTelemetry SDK + OTLP-gRPC exporter + tracing bridge for `observability::otel`.
@@ -60,6 +60,19 @@ jsonwebtoken = { workspace = true }
 
 # HTTP client for token management
 reqwest = { workspace = true }
+
+# FEATURE UNIFICATION ONLY — no `use futures` in this crate. `redis` (GC, MC)
+# depends on `futures` with default features, which turns on `futures-util`'s
+# `channel` and `io` modules; AC and MH have no such dependent, so before this
+# entry `futures-util` resolved four ways across the services and `tower`,
+# `tonic`, `axum`, `hyper-util`, `reqwest` and the OTel crates were each compiled
+# once per service. Every service depends on `common`, so this one line makes
+# the set identical everywhere. `channel`/`io` only add modules and extension
+# traits; no existing code path changes. See the note above `tower` in the
+# root Cargo.toml.
+futures = { workspace = true }
+# FEATURE UNIFICATION ONLY — see the `getrandom-02` workspace entry.
+getrandom-02 = { workspace = true }
 
 # Test-only deps, gated behind the `test-utils` feature.
 # Used exclusively by `observability::testing::MetricAssertion`.
