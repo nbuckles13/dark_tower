@@ -48,6 +48,27 @@ spec:
     ports:
     - protocol: TCP
       port: 8082
+  # Allow ingress from external clients (browser sign-in, token acquisition) via
+  # the INGRESS GATEWAY: in production external traffic reaches AC only through
+  # the gateway, so the gateway's pods are the only external-facing source this
+  # base admits. The selector is the placeholder identity of a gateway not yet
+  # chosen (cloud-deploy debates pending): when one is deployed, its namespace
+  # and pod label must match this rule (and the same rule in gc-service's
+  # policy), or this rule is edited to match it. In Kind no such namespace
+  # exists, so this rule admits nothing there; the Kind overlay adds the
+  # NodePort path instead (infra/kubernetes/overlays/kind/services/ac-service/
+  # network-policy-nodeport-patch.yaml). Never `from: []`: that admits every
+  # pod in every namespace (40_resilience asserts it cannot).
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: dark-tower-ingress
+      podSelector:
+        matchLabels:
+          app: ingress-gateway
+    ports:
+    - protocol: TCP
+      port: 8082
   # Allow ingress from Prometheus for metrics scraping
   - from:
     - namespaceSelector:

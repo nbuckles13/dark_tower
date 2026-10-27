@@ -1,0 +1,27 @@
+# Kind-only delta to the gc-service NetworkPolicy (JSON6902, appended to
+# spec.ingress; a strategic-merge patch would REPLACE the whole list, since
+# NetworkPolicy ingress rules have no merge key).
+#
+# Same rule, same reasoning as
+# infra/kubernetes/overlays/kind/services/ac-service/network-policy-nodeport-patch.yaml
+# (read it there): admit clients on the host reaching gc-service's HTTP port
+# through its NodePort (nodeport.yaml), i.e. any source that is NOT a pod.
+# Production admits the ingress gateway instead (base policy). Every pod,
+# including one in another namespace, stays DENIED
+# (crates/env-tests/tests/40_resilience.rs asserts it). GC gRPC (50051) is NOT
+# opened: only MC/MH reach it, in-cluster.
+#
+# The except CIDR MUST equal `networking.podSubnet` in infra/kind/kind-config.yaml
+# and infra/kind/kind-config.yaml.tmpl (the single source of truth);
+# scripts/setup.test.sh [kind-netpol-podsubnet-sync] fails on drift.
+- op: add
+  path: /spec/ingress/-
+  value:
+    from:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 192.168.0.0/16
+    ports:
+    - protocol: TCP
+      port: 8080

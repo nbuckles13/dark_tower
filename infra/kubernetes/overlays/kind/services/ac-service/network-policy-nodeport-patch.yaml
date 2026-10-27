@@ -1,0 +1,37 @@
+# Kind-only delta to the ac-service NetworkPolicy (JSON6902, appended to
+# spec.ingress; a strategic-merge patch would REPLACE the whole list, since
+# NetworkPolicy ingress rules have no merge key).
+#
+# WHAT IT ADMITS: clients on the host (browser, env-tests, the devloop
+# container) reaching ac-service through its NodePort (nodeport.yaml). In
+# production that traffic arrives through the ingress gateway instead, which
+# the base policy admits; this rule stands in for the gateway in Kind only.
+#
+# WHY THIS SHAPE: NodePort traffic is DNATed to the pod by kube-proxy, and
+# Calico's workload policy is evaluated on the forward path, BEFORE kube-proxy's
+# MASQUERADE in POSTROUTING, so the policy sees the client's address as it
+# arrived at the Kind node (on a rootful Docker host: the host side of the kind
+# network; rootless podman rewrites it, which masked the gap locally until the
+# GitHub-runner spike). That address depends on the container runtime and is
+# stated nowhere in the tree, so the rule admits the one property that IS
+# stated: "not a pod". Every pod source address, including a pod in another
+# namespace dialling the NodePort or the ClusterIP, lies in the cluster's
+# podSubnet and stays DENIED (crates/env-tests/tests/40_resilience.rs asserts
+# it). Traffic originated on the node itself (kubelet probes) never needed a rule.
+#
+# The except CIDR MUST equal `networking.podSubnet` in infra/kind/kind-config.yaml
+# and infra/kind/kind-config.yaml.tmpl (the single source of truth);
+# scripts/setup.test.sh [kind-netpol-podsubnet-sync] fails on drift.
+# IPv4 only, like the Kind cluster: a dual-stack cluster needs a ::/0 rule
+# excepting the IPv6 podSubnet too (until then IPv6 clients fail loudly).
+- op: add
+  path: /spec/ingress/-
+  value:
+    from:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 192.168.0.0/16
+    ports:
+    - protocol: TCP
+      port: 8082

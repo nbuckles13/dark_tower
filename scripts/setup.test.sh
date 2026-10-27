@@ -551,6 +551,61 @@ else
   FAILURES+=("[single-control-plane-node] kind-config.yaml(${cp_static})/kind-config.yaml.tmpl(${cp_tmpl}) must EACH declare EXACTLY ONE control-plane node — the 49/41 name-length caps assume it (a 2nd shifts the real cap to 48/40; the pinned cap tests would stay green). Adjust the caps at all four sites if this changes.")
 fi
 
+# --- [kind-netpol-podsubnet-sync] The Kind overlay admits host clients to AC/GC through their
+#     NodePorts with ONE rule: ipBlock 0.0.0.0/0 EXCEPT the cluster's podSubnet (the overlay's
+#     network-policy-nodeport-patch.yaml explains why that is the narrowest rule that works).
+#     The except CIDR is what keeps every pod — above all another namespace's
+#     (40_resilience) — DENIED, so it restates a fact the kind config owns. CLAUDE.md SSoT:
+#     guard the drift. Checked on the RENDERED overlay (a patch that stops applying, or targets
+#     the wrong policy, fails here too, not only a wrong CIDR), and non-vacuously: exactly one
+#     podSubnet per config, exactly one ipBlock per rendered policy, exactly one except entry.
+#     The bases must carry NO ipBlock and NO `from: []` (admit-all: the latent bug this replaced;
+#     production admits the ingress gateway instead). kubectl is required, never skipped.
+podsubnet_of() { sed -nE 's/^[[:space:]]*podSubnet:[[:space:]]*"?([^"#[:space:]]+)"?.*$/\1/p' "$1"; }
+ps_static="$(podsubnet_of "$KIND_STATIC")"
+ps_tmpl="$(podsubnet_of "$KIND_TMPL")"
+netpol_fail=()
+if [[ -z "$ps_static" || "$ps_static" == *$'\n'* || "$ps_static" != "$ps_tmpl" ]]; then
+  netpol_fail+=("kind-config.yaml podSubnet '${ps_static}' and kind-config.yaml.tmpl podSubnet '${ps_tmpl}' must each be exactly one value, and equal")
+elif ! command -v kubectl >/dev/null 2>&1; then
+  netpol_fail+=("kubectl is not on PATH, so the Kind overlay's NetworkPolicies cannot be rendered (never skipped: install kubectl)")
+else
+  for svc in ac-service gc-service; do
+    base_np="${REPO_ROOT}/infra/services/${svc}/network-policy.yaml"
+    # Comment lines are dropped first: the base explains, in prose, why it carries neither.
+    if grep -vE '^[[:space:]]*#' "$base_np" | grep -qE 'ipBlock|from:[[:space:]]*\[\]'; then
+      netpol_fail+=("${base_np#"${REPO_ROOT}"/} carries an ipBlock or \`from: []\`; the base (production) admits external clients only via the ingress gateway, the Kind NodePort rule belongs in the overlay")
+    fi
+    if ! rendered="$(kubectl kustomize "${REPO_ROOT}/infra/kubernetes/overlays/kind/services/${svc}" 2>&1)"; then
+      netpol_fail+=("kubectl kustomize overlays/kind/services/${svc} failed: ${rendered}")
+      continue
+    fi
+    # The NetworkPolicy document named ${svc}, alone.
+    np="$(awk -v want="$svc" '
+      function flush() { if (k == "NetworkPolicy" && n == want) printf "%s", buf; buf = ""; k = ""; n = ""; m = 0 }
+      /^---/ { flush(); next }
+      { buf = buf $0 "\n" }
+      /^kind: / { k = $2 }
+      /^metadata:/ { m = 1; next }
+      /^[^ ]/ { m = 0 }
+      m && /^  name: / { n = $2 }
+      END { flush() }' <<<"$rendered")"
+    n_ipblock="$(grep -c 'ipBlock:' <<<"$np" || true)"
+    cidr="$(sed -nE 's/^[[:space:]]*cidr:[[:space:]]*([^[:space:]]+).*$/\1/p' <<<"$np")"
+    excepts="$(awk '/^[[:space:]]*except:/ { f = 1; next } f && /^[[:space:]]*- / { sub(/^[[:space:]]*- /, ""); print; next } { f = 0 }' <<<"$np")"
+    if [[ "$n_ipblock" != "1" || "$cidr" != "0.0.0.0/0" || "$excepts" != "$ps_static" ]]; then
+      netpol_fail+=("rendered ${svc} NetworkPolicy (Kind overlay) must carry exactly ONE ipBlock {cidr: 0.0.0.0/0, except: [${ps_static}]} (the kind podSubnet); got ipBlocks=${n_ipblock} cidr='${cidr}' except='${excepts//$'\n'/,}'")
+    fi
+  done
+fi
+if (( ${#netpol_fail[@]} == 0 )); then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  for __m in "${netpol_fail[@]}"; do FAILURES+=("[kind-netpol-podsubnet-sync] ${__m}"); done
+fi
+unset netpol_fail ps_static ps_tmpl svc base_np rendered np n_ipblock cidr excepts __m
+
 # --- devloop.sh launch-time slug cap 41. Reject exits BEFORE any container/cluster creation:
 #     run in a NON-git temp dir ($WORK) so a passing slug can't proceed to real work, and prove
 #     the podman stub never ran on the reject.
