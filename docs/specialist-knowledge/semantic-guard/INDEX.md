@@ -11,27 +11,33 @@
 - KEK emission sites (named in checks.md §Credential Leak) → `media_admission/kek.rs:MeetingKeyState::rotate()`, `epoch.rs:AdmissionEpoch::admit()`
 - KEK push path (typed `KekPush`, never `SignalingPayload::Raw`) → `actors/messages.rs:ParticipantMessage::KekUpdate` → `actors/participant.rs:handle_kek_update()`
 - Rotation lifecycle log (`mc.kek.lifecycle`) → `media_admission/rotation.rs:collect_push_outcomes()`, `actors/meeting.rs:rotation_failed()`
-- Frame-v3 + wrapped-key redacting Debug → `crates/media-protocol/src/frame.rs`
-- Redaction control (`skip_debug` set + `RedactedLen` hand-Debug) → `crates/proto-gen/build.rs`, `crates/proto-gen/src/lib.rs`
+- Frame-v3 + wrapped-key redacting Debug → `crates/media-protocol/src/frame.rs` | redaction control (`skip_debug`, `RedactedLen`) → `crates/proto-gen/build.rs`, `src/lib.rs`
 - Signaling contract (`JoinResponse.meeting_kek`, `MeetingKekUpdate`, `unreachable_sender_ids`) → `proto/dark_tower/signaling/v1/signaling.proto`
 - MC→MH internal contract (RegisterMeeting + EndMeeting; no-key-material header rule) → `proto/dark_tower/internal/v1/internal.proto`
 
 ## MC Media Routing & MH Coordination (`crates/mc-service/src/`)
 - Routing control plane (assignment / generation / slots / placement / edges / connectivity) → `media_routing/`
+- Per-kind vocabulary (`MediaKindLabel`, `served_kind()`, `PublishSet`) → `media_kind.rs` | send directive + outcome counting → `media_signaling/directive.rs:build_send_directive()`, `outcome.rs`
+- Per-kind mute fan-out + client work bound → `actors/client_mute_fanout.rs`, `client_work_limiter.rs` | reconnect counting → `actors/meeting.rs:handle_reconnect()`
 - RegisterMeeting push worker → `media_routing/pusher.rs:HandlerPusher`; published by `actors/meeting_media.rs:render_and_publish()`
 - EndMeeting teardown → `media_routing/teardown.rs` | MH client trait → `grpc/mh_client.rs:MhRegistrationClient` | binding resolve → `grpc/media_coordination.rs`
 
 ## MH Media Hot Path (telemetry-free by construction)
 - Forward path (no tracing/metrics macros) → `crates/mh-service/src/media/`
+- Stream attribution (per-frame, never cached; exhaustive rejection) → `routing/mod.rs:RoutingSnapshot::attribute()`, `PolicyRejection::outcome()`
+- Stream egress (non-awaiting push; sole abandon counting site) → `media/downlink.rs:Downlink::abandon()` | stream ingress → `media/stream_ingress.rs`
+- On-demand keyframes (slot map + Notify writer) → `media/keyframe.rs:PublisherKeyframes`
 - Transport seam → `crates/mh-service/src/transport/mod.rs`, `webtransport/media_transport.rs`
 - Sender binding (`SenderBindings`, `bind()`, `start_media_session`) → `crates/mh-service/src/session/mod.rs`
-- Egress-budget admission → `crates/mh-service/src/session/admission.rs` | EndMeeting handler → `grpc/mh_service.rs:end_meeting()`
+- Egress-budget admission → `session/admission.rs` | EndMeeting handler → `grpc/mh_service.rs:end_meeting()`
 
 ## Client SDK Media (credential-leak items 5-10 + credential lifetime)
 - Hot path (no console/logger/metric names) → `packages/sdk-core/src/media/pipeline/`
 - Custody siblings (KEK, roster keys, allow-list metric projection) → `packages/sdk-core/src/media/setup/`
 - TS KEK sink control (generation-scoped intake) → `packages/sdk-core/src/signaling/kekIntake.ts` | receive verification → `media/pipeline/receiveVerification.ts`
-- Layout-deny test → `packages/sdk-core/src/media/__tests__/hotPathLayout.test.ts` | whitelist-projection SAFE example → `packages/web-app/src/lib/e2eBus.ts`
+- Layout-deny test → `packages/sdk-core/src/media/__tests__/hotPathLayout.test.ts` | window-exposed sinks → `packages/web-app/src/lib/e2eBus.ts` (whitelist SAFE example), `debugStats.ts`
+- Video publish key lifetime (session-owned, cleared on every exit) → `media/lifecycle/transmitKeys.ts:TransmitKeyManager` | seal → `media/pipeline/frameSeal.ts`
+- Video publish/receive lifecycles → `media/lifecycle/VideoPublisher.ts`, `VideoReceiver.ts` | egress/ingress → `media/pipeline/videoEgress.ts`, `videoIngress.ts`
 - Media store → `packages/sdk-svelte/src/stores/MediaStore.svelte.ts`
 
 ## Media Telemetry Deny & Key-Custody Fixtures
@@ -39,32 +45,27 @@
 - Macro-vocab SSoT → `crates/dt-guard/src/telemetry_macros.rs`, `metric_macros.rs` | scope liveness → `crates/dt-guard/src/common/scope.rs`
 - Key-custody fixtures + harness (fixture-verification runs) → `crates/dt-guard/tests/credential_leak_key_custody_fixtures.rs`
 - Client metrics export drift guard (allow-list ↔ collector ↔ catalog) → `crates/dt-guard/src/client_metrics_export.rs` | collector → `infra/services/otel-collector/collector.yaml`
+- Kind-label vocabulary (metric labels) → `crates/dt-guard/src/common/kind_labels.rs` | per-kind proto fields → `crates/dt-guard/src/proto_per_kind_fields.rs`
 
 ## MC Actors & WebTransport (`crates/mc-service/src/`)
 - Actors (controller, meeting, participant, messages, metrics) → `actors/*.rs`
-- Server (accept loop, TLS, capacity gate) → `webtransport/server.rs:WebTransportServer`
-- Connection handler (join flow, post-join media dispatch, bridge loop) → `webtransport/connection.rs:handle_connection()`
+- Server (accept, TLS, capacity gate) → `webtransport/server.rs:WebTransportServer` | join/media dispatch/bridge → `webtransport/connection.rs:handle_connection()`
 
 ## Authentication Seams
 - Common JWT (types, JWKS, validator, HasIat) → `crates/common/src/jwt.rs` | Token refresh → `common/src/token_manager.rs`
-- GC JWT → `crates/gc-service/src/auth/jwt.rs` | MC JWT (McJwtValidator) → `crates/mc-service/src/auth/mod.rs`
-- MC WebTransport JWT check (pre-actor) → `crates/mc-service/src/webtransport/connection.rs:handle_connection()`
-- MH gRPC auth interceptor → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor`
-- JwtError → service error mapping → `crates/gc-service/src/errors.rs`, `crates/mc-service/src/errors.rs`
+- GC JWT → `crates/gc-service/src/auth/jwt.rs` | MC JWT (McJwtValidator, checked pre-actor in `handle_connection()`) → `crates/mc-service/src/auth/mod.rs`
+- MH gRPC auth → `crates/mh-service/src/grpc/auth_interceptor.rs:MhAuthInterceptor` | JwtError mapping → `crates/gc-service/src/errors.rs`, `crates/mc-service/src/errors.rs`
 
 ## GC Handlers, Repositories & MH Selection
-- Create/Join/Guest/Settings handlers → `crates/gc-service/src/handlers/meetings.rs` | routes → `routes/mod.rs:build_routes()`
-- Insert-error classification (SQLSTATE, not prose) → `repositories/meetings.rs:classify_insert_error()`
+- Handlers → `crates/gc-service/src/handlers/meetings.rs` | routes → `routes/mod.rs:build_routes()` | insert-error (SQLSTATE) → `repositories/meetings.rs:classify_insert_error()`
 - Refusal → HTTP + `error.code` → `errors.rs:GcError` | MH selection (weighted random) → `services/mh_selection.rs:MhSelectionService`
 
 ## Devloop Tooling (`scripts/workflow/`, `crates/dt-story/`)
-- Story runner seams + failure lanes → `run-story.sh` | Stop hook (fail-closed) → `devloop-stop-hook.sh`
-- Manifest schema, `Slug`, fence-safe emit → `crates/dt-story/src/manifest.rs`; block extraction → `markdown.rs:find_manifest_block()`
+- Story runner → `run-story.sh` | Stop hook (fail-closed) → `devloop-stop-hook.sh` | manifest schema → `crates/dt-story/src/manifest.rs`
 - Manifest guard → `scripts/guards/simple/validate-story-manifest.sh` | Planning / closing → `.claude/skills/{user-story,close-story}/SKILL.md`
 
 ## Observability
-- GC metrics → `crates/gc-service/src/observability/metrics.rs` | MC → `crates/mc-service/src/observability/metrics.rs`
-- MH media metrics → `crates/mh-service/src/observability/metrics.rs` | catalogs → `docs/observability/metrics/`
+- Service metrics (`observability/metrics.rs`) → `crates/gc-service/src/`, `crates/mc-service/src/`, `crates/mh-service/src/` | catalogs → `docs/observability/metrics/`
 - Alerts → `infra/docker/prometheus/rules/{gc,mc,mh,client}-alerts.yaml` | docs → `docs/observability/alerts.md`, `dashboards.md`
 
 ## E2E Env-Tests, Cluster & Network (`crates/env-tests/`)

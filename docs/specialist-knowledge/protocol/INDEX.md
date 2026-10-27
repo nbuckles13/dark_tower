@@ -9,7 +9,9 @@
 
 ## Proto Definitions
 - Signaling (client↔MC) → `proto/dark_tower/signaling/v1/signaling.proto`; internal (service↔service) → `proto/dark_tower/internal/v1/internal.proto`
-- Codegen build script + skip_debug → `crates/proto-gen/build.rs`; re-exports, module wiring, redacting Debug → `crates/proto-gen/src/lib.rs`; No-`Any` guard (MESSAGE_NO_DELETE premise) → `crates/dt-guard/src/proto_no_any.rs`; MediaKind → metric-label projection → `crates/mc-service/src/media_kind.rs:KindLabels::from_proto` + `packages/sdk-core/src/media/setup/mediaMetrics.ts:MEDIA_KIND_LABEL_PROJECTION`, table in `docs/observability/label-taxonomy.md`, drift legs in `media_kind.rs` tests + `crates/dt-guard/src/client_metrics_export.rs`
+- Codegen build script + skip_debug → `crates/proto-gen/build.rs`; re-exports (prost::Message, tonic) consumed by services, module wiring, redacting Debug → `crates/proto-gen/src/lib.rs`; TS codegen + path list → `packages/proto-gen/scripts/codegen.sh`, `codegen-paths.sh`
+- Proto guards share one lexer → `crates/dt-guard/src/common/proto_lex.rs` (file set `common/proto_files.rs`); No-`Any` (MESSAGE_NO_DELETE premise) → `crates/dt-guard/src/proto_no_any.rs`
+- MediaKind → metric-label projection → `crates/mc-service/src/media_kind.rs:KindLabels::from_proto` + `packages/sdk-core/src/media/setup/mediaMetrics.ts:MEDIA_KIND_LABEL_PROJECTION`, table in `docs/observability/label-taxonomy.md`, drift legs in `media_kind.rs` tests + `crates/dt-guard/src/client_metrics_export.rs`
 
 ## Media Protocol Crate (frame header v3, ADR-0036 §2 + Appendix)
 - Crate root; no-crypto/no-telemetry scope, lint denies → `crates/media-protocol/src/lib.rs`
@@ -26,23 +28,22 @@
 - MediaHandlerRegistryService (MH→GC): RegisterMH, SendLoadReport
 - DisconnectReason enum (bounded for metrics)
 
-## ADR-0036 MC→MH Control Plane (internal.proto, 2026-09-01 reshape)
+## ADR-0036 MC→MH Control Plane (internal.proto)
 All shapes in `internal.proto`. No-key-material rule → its header + `dt-guard internal-proto-no-key-material` (`crates/dt-guard/src/internal_proto_no_key_material.rs`, wrapper `scripts/guards/simple/validate-internal-proto-no-key-material.sh`); server mute → `SourceStream.disposition` (`MutedSource` deleted by MC-B); teardown → `EndMeetingRequest`
 - Self-contained forwarding instruction (§6; NOT parallel lists) → `EgressStream`; empty-but-named meeting-level rules → `SelectionRules`
 - `sender_id`-is-meeting-scoped MUST (no global index; malformed rejects, not-yet-connected holds) → `SubscriberSlot`; key-id-pair source ref, not `MediaStream` (§7 type-blind) → `CandidateSource`
 - Output-derived generation, three-"generation" trap list, task-5/6 ordering constraint → `RegisterMeetingRequest.policy_generation`
 - **Applied**-never-received echo, zero=nothing-applied, all-edges-or-none, canonical `outcome` label set → `RegisterMeetingResponse.applied_generation`
-- Story 3: per-stream declarations, dispositions, attribution rule, per-kind mute in slot terms (single home) → `SourceStream`/`SourceDisposition`; empty `source_streams` with egress = reject (no fallback) → `RegisterMeetingRequest.source_streams`; per-stream echo + UNSPECIFIED-is-a-mismatch rule → `applied_source_streams`; superseded fields deleted + reserved by MC-B (tags: EgressStream 6, RegisterMeetingRequest 7, RegisterMeetingResponse 5, JoinResponse 12, SlotState 2)
+- Per-stream declarations, dispositions, attribution rule, per-kind mute in slot terms (single home) → `SourceStream`/`SourceDisposition`; empty `source_streams` with egress = reject (no fallback) → `RegisterMeetingRequest.source_streams`; per-stream echo + UNSPECIFIED-is-a-mismatch rule → `applied_source_streams`; superseded fields deleted + reserved by MC-B (tags: EgressStream 6, RegisterMeetingRequest 7, RegisterMeetingResponse 5, JoinResponse 12, SlotState 2)
 - Restart detection, per-process → `.process_start_epoch_ms`
+- MC encode + per-stream echo compare → `crates/mc-service/src/media_routing/confirm.rs:first_echo_mismatch()`; kind→stream_number/transport → `media_routing/assignment.rs:stream_number_of()`, `transport_of()`; MH parse → `crates/mh-service/src/routing/sources.rs`, lookup → `routing/mod.rs:RoutingSnapshot::attribute()`
 - Wire-shape tests + "what these do NOT assert" header → `crates/proto-gen/tests/internal_roundtrip.rs` (shared byte walker `tests/common/mod.rs`); runtime MUSTs → `docs/TODO.md` §Media Path Obligations
 
 ## gRPC Endpoints (server + client per RPC)
 - GC→MC AssignMeetingWithMh → `crates/gc-service/src/services/mc_client.rs`; GC MH selection → `services/mh_selection.rs`; MC server + MediaCoordinationService → `crates/mc-service/src/grpc/mc_service.rs`, `media_coordination.rs`; MH→MC client → `crates/mh-service/src/grpc/mc_client.rs`
 - MC→MH RegisterMeeting/EndMeeting → `crates/mc-service/src/grpc/mh_client.rs:register_meeting()`, `:end_meeting()`; MH server → `crates/mh-service/src/grpc/mh_service.rs:register_meeting()`, `:end_meeting()`
 - Per-meeting edge set (which MHs get a RegisterMeeting) → `crates/mc-service/src/media_routing/edges.rs`; EndMeeting fan-out plan → `media_routing/teardown.rs:end_meeting_plan()`
-
-## Auth Layer Pattern (JWKS-based async tower Layer)
-- MH / MC service-token auth layers → `crates/mh-service/src/grpc/auth_interceptor.rs`, `crates/mc-service/src/grpc/auth_interceptor.rs`
+- MH / MC service-token auth layers (JWKS tower Layer) → `crates/mh-service/src/grpc/auth_interceptor.rs`, `crates/mc-service/src/grpc/auth_interceptor.rs`
 
 ## ADR-0036 Media Contract (signaling.proto)
 All message/enum shapes → `proto/dark_tower/signaling/v1/signaling.proto`
@@ -53,7 +54,7 @@ All message/enum shapes → `proto/dark_tower/signaling/v1/signaling.proto`
 - `sender_id` contract (1..=65535, zero invalid) → `JoinResponse.sender_id`; meeting KEK + generation → `JoinResponse.meeting_kek`, `MeetingKekUpdate`
 - W carried on the wire, retention `min(W/2, ceiling)` derived at client → `JoinResponse.kek_rotation_debounce_seconds`; per-subscriber cross-handler set → `StreamAssignments.unreachable_sender_ids`; SOURCE_UNREACHABLE retained-unemitted → `SlotState`
 - Roster identity key → `Participant.identity_public_key`; four mute controls, kind-keyed carrier map → Mute-state section header; self-copy-before-directive → `ParticipantMuteUpdate`. Kind-keyed per-kind facts (`MediaKindState`, `ClientMediaState`, `MuteChange`, `ReceiveSlotCap`; validation rule → `docs/protocol/CONVENTIONS.md` §6; field-name guard → `crates/dt-guard/src/proto_per_kind_fields.rs`, vocabulary derived from `MediaKind`). Story-3 join → `JoinRequest.published_kinds`; per-kind caps/truncation → `JoinResponse.receive_slot_caps`; min keyframe interval SSoT → `EncodingParameters.min_keyframe_interval_ms`; hop-local relay id → `SendStream.stream_number`; sender presence per state → `StreamAssignment.sender_id`
-- MH bidi stream: `RecoveryRequest` (client→MH), `MhServerMessage.KeyframeRequest` (MH→client), rules in the section above `RecoveryRequest`
+- MH bidi stream: `RecoveryRequest` (client→MH), `MhServerMessage.KeyframeRequest` (MH→client), rules in the section above `RecoveryRequest`; MH per-publisher dedupe → `crates/mh-service/src/media/keyframe.rs:PublisherKeyframes`; SDK → `packages/sdk-core/src/media/lifecycle/recoveryRequestQueue.ts`, `keyframePolicy.ts`
 - Redacting `Debug` → `crates/proto-gen/build.rs`, `src/lib.rs`; wire-shape tests → `crates/proto-gen/tests/signaling_roundtrip.rs`
 - Codegen oracle (presence + absence, both protos) → `packages/proto-gen/scripts/verify-codegen.sh`; SDK codec vocabulary → `packages/sdk-core/src/signaling/codecMap.ts`
 
@@ -61,15 +62,14 @@ All message/enum shapes → `proto/dark_tower/signaling/v1/signaling.proto`
 - MediaConnectionUpdate (R-60) + ServerMuteRequest (`handle_server_mute_request()`) → `crates/mc-service/src/webtransport/connection.rs`
 - `StreamAssignments` builder (slot states, `unreachable_sender_ids`) → `crates/mc-service/src/media_signaling/assignments.rs:build_stream_assignments()`
 - `MeetingKekUpdate` coalescing over W → `crates/mc-service/src/media_admission/rotation.rs`; KEK minting → `media_admission/kek.rs`
+- MC served-kind admission (SCREEN refused) + publish set → `crates/mc-service/src/media_kind.rs:served_kind()`, `PublishSet`
 - SDK KEK intake → `packages/sdk-core/src/signaling/kekIntake.ts:takeMeetingKek()`; retention `min(W/2, ceiling)` → `packages/sdk-core/src/media/setup/kekSource.ts:RetentionGuard`
 
-## HTTP API Error Contracts
-- GC error taxonomy (status + `error.code` + `error_type`) → `crates/gc-service/src/errors.rs`; meeting-creation refusals → `crates/gc-service/src/repositories/meetings.rs`
+## Integration Seams
+- GC HTTP error taxonomy (status + `error.code` + `error_type`) → `crates/gc-service/src/errors.rs`; meeting-creation refusals → `crates/gc-service/src/repositories/meetings.rs`
+- MH gRPC metrics (method cardinality) → `crates/mh-service/src/observability/metrics.rs:record_grpc_request()`
 
 ## Story Manifest Schema (dt-story)
 - Contract → ADR-0035; schema + `v1` marker → `crates/dt-story/src/manifest.rs`; block discovery → `crates/dt-story/src/markdown.rs:find_manifest_block()`; CLI → `crates/dt-story/src/main.rs`
 - Guards → `scripts/guards/simple/validate-story-manifest.sh`, `validate-slug-class-sync.sh`
 
-## Integration Seams
-- Proto-gen consumed by services (re-exports prost::Message, tonic) → `crates/proto-gen/src/lib.rs`
-- MH gRPC metrics (method cardinality) → `crates/mh-service/src/observability/metrics.rs:record_grpc_request()`
