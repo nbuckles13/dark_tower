@@ -1,0 +1,48 @@
+name: Prune CI images
+
+# Deletes CI image versions (namespace: infra/ci/ci-images.sh) past the retention
+# window. Schedules run only on the default branch; workflow_dispatch exists to
+# exercise it (dry run by default). Runs no build or test code — only
+# infra/ci/prune-ci-images.sh and the deploy.sh functions it sources.
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  # Spike only: workflow_dispatch needs the file on the default branch, so a push
+  # to this branch exercises the job (always a dry run).
+  push:
+    branches: [ spike/ci-kind-prune ]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: List what would be deleted without deleting it
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prune-ci-images
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write   # delete package versions
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prune
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DT_CI_IMAGE_RETENTION_DAYS: '7'
+          # Deletes only on the schedule or a manual run with dry_run unticked; any
+          # other trigger is a dry run (the script's default).
+          DT_PRUNE_DELETE: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)) && '1' || '0' }}
+        run: infra/ci/prune-ci-images.sh

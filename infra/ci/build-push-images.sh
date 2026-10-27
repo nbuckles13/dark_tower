@@ -3,7 +3,7 @@
 # digest-pinned refs for the test job (deploy.sh DT_PREBUILT_IMAGES).
 #
 # Usage: infra/ci/build-push-images.sh <out-file>
-#   DT_IMAGE_REGISTRY   registry prefix, e.g. ghcr.io/<owner>/dark-tower-ci (required)
+#   DT_IMAGE_REGISTRY   registry prefix (default: infra/ci/ci-images.sh)
 #   DT_IMAGE_SOURCE_REV source revision; becomes the traceability tag git-<rev> (required)
 #   DT_IMAGE_BUILD_CACHE optional layer cache backend (see deploy.sh image_build_flags)
 #
@@ -14,7 +14,8 @@
 set -euo pipefail
 
 out="${1:?usage: build-push-images.sh <out-file>}"
-: "${DT_IMAGE_REGISTRY:?DT_IMAGE_REGISTRY is required}"
+# shellcheck source=./ci-images.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ci-images.sh"
 : "${DT_IMAGE_SOURCE_REV:?DT_IMAGE_SOURCE_REV is required}"
 [[ "${DT_IMAGE_SOURCE_REV}" =~ ^[0-9a-f]{40}$ ]] \
     || { echo "ERROR: DT_IMAGE_SOURCE_REV must be a full git sha" >&2; exit 1; }

@@ -300,16 +300,24 @@ image_build_flags() {
 # are identical (the four service images) share one scope, so their dependency
 # layers are stored once; a builder that drifts gets its own scope automatically.
 # Fails when the Dockerfile has no `AS ${IMAGE_BUILD_TARGET}` stage.
+# (scripts/guards/simple/validate-shared-image-builder.sh holds the service images
+# to ONE scope through these same two functions.)
 image_cache_scope() {
-    local df="${PROJECT_ROOT}/infra/docker/${1#localhost/}/Dockerfile" sum
+    local sum
+    sum="$(image_builder_instructions "$1" | sha256sum)" || return 1
+    printf 'builder-%s\n' "${sum:0:16}"
+}
+
+# The build instructions of <repo>'s Dockerfile before the target stage, without
+# comments or blank lines: what image_cache_scope hashes.
+image_builder_instructions() {
+    local df="${PROJECT_ROOT}/infra/docker/${1#localhost/}/Dockerfile"
     if ! grep -qE "^FROM .* AS ${IMAGE_BUILD_TARGET}([[:space:]]|\$)" "${df}"; then
         log_error "${df} has no 'AS ${IMAGE_BUILD_TARGET}' stage to build."
         return 1
     fi
-    sum="$(awk -v t="${IMAGE_BUILD_TARGET}" \
-        '$0 ~ ("^FROM .* AS " t "([[:space:]]|$)") { exit } !/^[[:space:]]*(#|$)/' "${df}" \
-        | sha256sum)" || return 1
-    printf 'builder-%s\n' "${sum:0:16}"
+    awk -v t="${IMAGE_BUILD_TARGET}" \
+        '$0 ~ ("^FROM .* AS " t "([[:space:]]|$)") { exit } !/^[[:space:]]*(#|$)/' "${df}"
 }
 
 # The digest-pinned image to use for <repo> instead of building it, from
