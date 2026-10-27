@@ -89,9 +89,11 @@
 //! Stated once, at module level, so a future contributor does not "complete"
 //! the guard by adding these:
 //!
-//! * `.github/workflows/ci-client.yml`'s `cargo build --release` line builds the
-//!   **host** `dt-guard` binary (as `scripts/lang/rust/compile.sh` does for the
-//!   pipeline). Different artifact class; not an encoding of this premise.
+//! * `dt_build_tool` in `scripts/lib/tool-bins.sh` (called by
+//!   `.github/workflows/ci-client.yml`, `scripts/lang/rust/compile.sh` and
+//!   `.githooks/pre-commit`) builds the **host** `dt-guard`/`dt-story` binaries
+//!   with the non-LTO `devtools` profile. Different artifact class; not an
+//!   encoding of this premise.
 //! * `docs/BUILD_REQUIREMENTS.md` carries an illustrative Dockerfile.
 //!   Documentation, not a build path.
 //! * `RUSTFLAGS` appears legitimately in prose in six-plus tracked docs (mold
