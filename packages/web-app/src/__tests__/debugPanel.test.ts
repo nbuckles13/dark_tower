@@ -216,8 +216,8 @@ test('unmount clears the sampler; a zero time gap and a counter reset render "â€
   now = 3_000;
   timer.tick();
   await expect.element(rate).toHaveTextContent('â€”');
-  await expect.element(screen.getByTestId('debug-panel')).not.toHaveTextContent('NaN');
-  await expect.element(screen.getByTestId('debug-panel')).not.toHaveTextContent('Infinity');
+  await expect.element(screen.getByTestId('debug-panel')).not.toMatchTextContent('NaN');
+  await expect.element(screen.getByTestId('debug-panel')).not.toMatchTextContent('Infinity');
   screen.unmount();
   expect(timer.active).toBe(0);
   const readsAtUnmount = calls;
@@ -265,7 +265,7 @@ test('before media starts the overlay says so; drops render by closed token', as
   };
   timer.tick();
   const drops = screen.getByTestId('debug-stats-slot-video:3').getByTestId('drops');
-  await expect.element(drops).toHaveTextContent('replay_detected: 2');
-  await expect.element(drops).toHaveTextContent('local: 4');
+  await expect.element(drops).toMatchTextContent('replay_detected: 2');
+  await expect.element(drops).toMatchTextContent('local: 4');
   screen.unmount();
 });

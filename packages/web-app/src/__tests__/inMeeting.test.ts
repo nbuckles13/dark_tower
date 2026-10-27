@@ -513,7 +513,7 @@ test('the video grid has one tile per declared video slot, raw wire token on dat
   await expect.element(two).toHaveAttribute('data-slot-state', 'avatar_client_muted');
   await expect.element(two).toHaveAttribute('data-rendered', 'avatar');
   await expect.element(two).toHaveAttribute('data-participant-id', 'b');
-  await expect.element(two).toHaveTextContent('Bea turned their camera off');
+  await expect.element(two).toMatchTextContent('Bea turned their camera off');
   const three = screen.getByTestId('video-slot-3');
   await expect.element(three).toHaveAttribute('data-rendered', 'empty');
   await expect.element(three).toHaveTextContent('this meeting allows fewer video slots');
@@ -546,7 +546,7 @@ test('audio and video PAIR by sender id, never by slot index (R-3)', async () =>
   // Bea's tile shows her AUDIO state inline: one participant, not two.
   await expect
     .element(screen.getByTestId('video-slot-audio-2'))
-    .toHaveTextContent('Bea muted their microphone');
+    .toMatchTextContent('Bea muted their microphone');
   await expect.element(screen.getByTestId('slot-1')).toHaveAttribute('data-paired-video-slot', '2');
   await expect.element(screen.getByTestId('slot-0')).toHaveAttribute('data-paired-video-slot', '3');
 });
@@ -650,7 +650,7 @@ test('names are rendered as TEXT, never markup, and bounded (security: XSS paylo
     participantId: 'self',
     mediaStates: mediaStates({ audio: { serverMuted: true, serverMutedBy: 'b' } }),
   });
-  await expect.element(screen.getByTestId('video-slot-1')).toHaveTextContent('<img');
+  await expect.element(screen.getByTestId('video-slot-1')).toMatchTextContent('<img');
   expect(screen.container.querySelector('img')).toBeNull();
   expect(screen.container.querySelector('script')).toBeNull();
   expect((window as { __xss?: number }).__xss).toBeUndefined();
@@ -689,7 +689,7 @@ test('R-19: a failed camera is shown to its owner WITH the reason', async () => 
     .toHaveAttribute('data-camera-state', 'failed');
   await expect
     .element(screen.getByTestId('self-camera-state'))
-    .toHaveTextContent('camera permission was denied');
+    .toMatchTextContent('camera permission was denied');
   session.fire('cameraHealthChanged', { failure: undefined });
   await expect
     .element(screen.getByTestId('self-camera-state'))
@@ -725,7 +725,7 @@ test('R-28: a media-start fault (VP8 unusable) surfaces in the UI, and no media 
   });
   await expect
     .element(screen.getByTestId('media-fault'))
-    .toHaveTextContent('cannot encode and decode VP8');
+    .toMatchTextContent('cannot encode and decode VP8');
   await expect.element(screen.getByTestId('media-error')).toBeInTheDocument();
   await expect.element(screen.getByTestId('mute-toggle')).not.toBeInTheDocument();
   await expect.element(screen.getByTestId('video-mute-toggle')).not.toBeInTheDocument();
@@ -750,7 +750,7 @@ test('R-18: the notice appears ONLY from the SDK event, per kind, as an alertdia
   await expect.element(video).toBeVisible();
   await expect.element(video).toHaveAttribute('role', 'alertdialog');
   await expect.element(video).toHaveAttribute('aria-live', 'assertive');
-  await expect.element(video).toHaveTextContent('The host turned your camera back on');
+  await expect.element(video).toMatchTextContent('The host turned your camera back on');
   // Two kinds, two notices.
   await expect.element(screen.getByTestId('resume-notice-audio')).toBeVisible();
 });

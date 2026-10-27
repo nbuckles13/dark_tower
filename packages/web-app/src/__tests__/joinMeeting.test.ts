@@ -106,14 +106,14 @@ test('renders join controls and a live roster from the store', async () => {
   session.fire('participantJoined', {
     participant: { participantId: 'a', name: 'Ann', mediaStates: mediaStates() },
   });
-  await expect.element(screen.getByTestId('participant-a')).toHaveTextContent('Ann');
+  await expect.element(screen.getByTestId('participant-a')).toMatchTextContent('Ann');
 
   session.fire('participantJoined', {
     participant: { participantId: 'b', name: 'Bob', mediaStates: mediaStates() },
   });
   session.fire('participantLeft', { participantId: 'a', reason: 'voluntary' });
   await expect.element(screen.getByTestId('participant-a')).not.toBeInTheDocument();
-  await expect.element(screen.getByTestId('participant-b')).toHaveTextContent('Bob');
+  await expect.element(screen.getByTestId('participant-b')).toMatchTextContent('Bob');
 });
 
 test('surfaces an error via last-error without leaking a non-allowlisted field', async () => {
@@ -168,8 +168,8 @@ test('a choice that would neither publish nor receive shows the SDK refusal — 
   );
   const screen = await submitted(session);
   const refusal = screen.getByTestId('last-error');
-  await expect.element(refusal).toHaveTextContent('neither publish nor receive');
-  await expect.element(refusal).toHaveTextContent('Choose the microphone or the camera');
+  await expect.element(refusal).toMatchTextContent('neither publish nor receive');
+  await expect.element(refusal).toMatchTextContent('Choose the microphone or the camera');
   // Nothing joined.
   expect(session.joinCalls).toBe(0);
   await expect.element(screen.getByTestId('in-meeting')).not.toBeInTheDocument();
@@ -288,7 +288,7 @@ test('a kind the participant does NOT publish reads "not publishing" and has NO 
   await expect.element(row).toHaveAttribute('data-client-state-video', 'not_published');
   await expect
     .element(row.getByTestId('mute-video-client-b'))
-    .toHaveTextContent(INDICATOR_TEXT.client.video.not_published);
+    .toMatchTextContent(INDICATOR_TEXT.client.video.not_published);
   // MC refuses a server mute of an unpublished kind: the control is not offered.
   await expect.element(screen.getByTestId('server-mute-video-b')).not.toBeInTheDocument();
   await expect.element(screen.getByTestId('server-mute-audio-b')).toBeInTheDocument();
