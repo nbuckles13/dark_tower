@@ -34,16 +34,28 @@
 # cannot move a resolved dep graph); an indeterminate diff still RUNS.
 # DEVLOOP_AUDIT_FORCE_RUN=1 forces a run (weekly scheduled scan); force-RUN-only.
 #
+# ATTRIBUTION (_audit_gate.sh, DEVLOOP_AUDIT_BLOCK_ON): every finding is reported as an
+# `AUDIT_FINDING=NEW|PREEXISTING <id> <crate>@<version> <title>` line; by default only NEW
+# ones block. A tracked lock is compared with the same lock at the diff base. An untracked
+# (freshly resolved) graph has no base to compare: its findings are NEW only if the change
+# touched that workspace's own Cargo.toml, else PREEXISTING (the fresh resolution moves
+# with crates.io, not with the diff; a vulnerable crate the change does bring in through a
+# shared path dependency lands in the tracked root lock too, and blocks there).
+#
 # OUTCOME (one STATUS line; every graph is scanned, no short-circuit):
 #   cargo-audit-discovery-failed   the graph set could not be established (nothing scanned),
 #                                  or not every discovered graph was scanned (`scanned N of M`:
 #                                  the AUDIT_GRAPH lines that DID print are real results — read them)
 #   cargo-lockfile-resolve-failed  an untracked graph did not resolve: unevaluated, a REPAIR
-#   cargo-audit-failed             cargo-audit failed on some graph: an advisory (REMEDIATE),
-#                                  or the tool itself (e.g. advisory-DB fetch; exit 1 too) —
-#                                  its output just above the AUDIT_GRAPH line says which
-# Each graph prints `AUDIT_GRAPH=<lock> LOCK=tracked|resolved RESULT=ok|audit-failed|resolve-failed`
-# to stderr, so the failing graph is named. Triage: docs/runbooks/devloop-validation.md §6.6.
+#   cargo-audit-failed             a blocking finding on some graph (REMEDIATE), or the tool
+#                                  itself failed (no usable --json report, e.g. advisory-DB
+#                                  fetch) — the lines just above the AUDIT_GRAPH line say which
+#   cargo-audit-passed-preexisting-advisories
+#                                  OK: findings exist but every one is already on the base
+#   audit-block-on-invalid         PRECONDITION_FAILURE: DEVLOOP_AUDIT_BLOCK_ON is not a known value
+# Each graph prints `AUDIT_GRAPH=<lock> LOCK=tracked|resolved RESULT=ok|preexisting-advisories|
+# audit-failed|resolve-failed` to stderr, so the failing graph is named. Triage:
+# docs/runbooks/devloop-validation.md §6.6.
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "${BASH_SOURCE[0]}")/../_audit_gate.sh"
@@ -69,6 +81,12 @@ install_wrapper_exit_trap restore_pending_lock
 __repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"
 # Every scan runs from here: cargo-audit reads .cargo/audit.toml from the cwd.
 cd "$__repo_root"
+
+# A config fault is loud even when the gate would skip.
+if ! block_on="$(audit_block_on)"; then
+  emit_status PRECONDITION_FAILURE audit-block-on-invalid
+  exit 2
+fi
 
 gate_rc=0
 audit_gate audit_dep_changed_rust || gate_rc=$?
@@ -96,6 +114,58 @@ if [[ -f "$__cargo_audit_toml" ]]; then
   applied="$({ grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}' "$__cargo_audit_toml" || [[ $? -eq 1 ]]; } | sort -u | paste -sd, -)"
   [[ -n "$applied" ]] && echo "SUPPRESSED=${applied}" >&2
 fi
+
+echo "AUDIT_BLOCK_ON=${block_on}" >&2
+__AUDIT_BASE=""
+[[ "$block_on" == "introduced" ]] && audit_resolve_base
+
+# The findings of a cargo-audit --json report as TSV rows (id, crate, version, title, source).
+# Exits non-zero on anything that is not a cargo-audit report: the caller treats that as
+# the tool failing, never as a clean scan.
+read -r -d '' __cargo_rows_py <<'PY' || true
+import json, sys
+d = json.loads(sys.stdin.read())
+v = d["vulnerabilities"]
+for x in v["list"]:
+    title = (x["advisory"].get("title") or "").replace("\t", " ").replace("\n", " ")
+    print("\t".join([x["advisory"]["id"], x["package"]["name"], x["package"]["version"], title,
+                     x["package"].get("source") or ""]))
+if v.get("found") and not v["list"]:
+    sys.exit(3)
+PY
+
+# Scan one lock and attribute its findings; sets __scan to ok | preexisting-advisories |
+# audit-failed. <how> is `tracked` (compare with the lock at the base) or `resolved:<manifest>`.
+scan_lock() {
+  local lock="$1" how="$2" json rc=0 rows base_lock="" assume=0 arc=0
+  json="$(cargo audit --json -f "$lock" </dev/null)" || rc=$?
+  if ! rows="$(printf '%s' "$json" | python3 -c "$__cargo_rows_py")"; then
+    echo "cargo audit: no usable --json report for ${lock} (rc=${rc}) — the tool failed, not an advisory" >&2
+    __scan=audit-failed; return
+  fi
+  if [[ -z "$rows" ]]; then
+    if [[ "$rc" -eq 0 ]]; then __scan=ok; else
+      echo "cargo audit: exited ${rc} on ${lock} with no findings — the tool failed, not an advisory" >&2
+      __scan=audit-failed
+    fi
+    return
+  fi
+  if [[ "$block_on" == "introduced" ]]; then
+    if [[ "$how" == tracked ]]; then
+      base_lock="$(mktemp)"
+      audit_base_file "$lock" "$base_lock" || { rm -f "$base_lock"; base_lock=""; }
+    elif [[ -n "$__AUDIT_BASE" ]] && ! diff_touches_root_files "${how#resolved:}"; then
+      assume=1
+    fi
+  fi
+  printf '%s\n' "$rows" | audit_attribute cargo "$base_lock" "$assume" || arc=$?
+  [[ -n "$base_lock" ]] && rm -f "$base_lock"
+  case "$arc" in
+    0) __scan="preexisting-advisories" ;;
+    1) __scan=audit-failed ;;
+    *) echo "cargo audit: could not attribute the findings for ${lock} — blocking" >&2; __scan=audit-failed ;;
+  esac
+}
 
 # -----------------------------------------------------------------------------
 # Discovery: repo-relative workspace roots ("." = the repo root), one per line,
@@ -133,7 +203,7 @@ audit_workspace() {
   if [[ "$ws" == "." ]]; then manifest="Cargo.toml"; lock="Cargo.lock"
   else manifest="${ws}/Cargo.toml"; lock="${ws}/Cargo.lock"; fi
   if git ls-files --error-unmatch -- "$lock" >/dev/null 2>&1; then
-    if cargo audit -f "$lock" </dev/null >&2; then result=ok; else result=audit-failed; fi
+    scan_lock "$lock" tracked; result="$__scan"
     echo "AUDIT_GRAPH=${lock} LOCK=tracked RESULT=${result}" >&2
   else
     # Untracked: resolve fresh into place. A developer's lock (e.g. one reproducing a
@@ -146,7 +216,7 @@ audit_workspace() {
     fi
     __pending_lock="${lock}|${backup}"
     if cargo generate-lockfile --manifest-path "$manifest" </dev/null >&2; then
-      if cargo audit -f "$lock" </dev/null >&2; then result=ok; else result=audit-failed; fi
+      scan_lock "$lock" "resolved:${manifest}"; result="$__scan"
     else
       result=resolve-failed
     fi
@@ -177,12 +247,14 @@ echo "AUDIT_GRAPHS=${graphs} $(paste -sd' ' <<<"$workspaces")" >&2
 
 resolve_failed=0
 audit_failed=0
+preexisting=0
 scanned=0
 while IFS= read -r ws; do
   audit_workspace "$ws"
   scanned=$((scanned + 1))
   case "$__result" in
     ok) ;;
+    preexisting-advisories) preexisting=1 ;;
     audit-failed) audit_failed=1 ;;
     *) resolve_failed=1 ;;
   esac
@@ -200,5 +272,13 @@ if [[ "$resolve_failed" -eq 1 ]]; then
 elif [[ "$audit_failed" -eq 1 ]]; then
   emit_status FAIL cargo-audit-failed
   exit 1
+fi
+if [[ "$preexisting" -eq 1 ]]; then
+  echo "WARN AUDIT_PREEXISTING: the AUDIT_FINDING=PREEXISTING advisories above are already on the diff base — not introduced by this change, so not blocking. The scheduled audit (audit-drift issue) owns them; fix them on main." >&2
+  # In CI, also as an annotation on the run/PR, so they are seen without opening the log.
+  # (stdout: GitHub reads workflow commands there; the STATUS parser reads only ^STATUS=.)
+  [[ -z "${GITHUB_ACTIONS:-}" ]] || echo "::warning title=Pre-existing advisories::this change did not introduce them, so the audit passed; they are on the base branch and tracked by the scheduled audit (audit-drift issue). AUDIT_FINDING=PREEXISTING lines in the Layer 6 log name them."
+  emit_status OK cargo-audit-passed-preexisting-advisories
+  exit 0
 fi
 emit_status OK cargo-audit-passed

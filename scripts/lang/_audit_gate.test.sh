@@ -141,7 +141,13 @@ rm -rf "$nogit"
 #                    with <dir>/stub_abort it first deletes the wrapper's backup dir (so the
 #                    restore's `cp` fails: a set -e abort), with <dir>/stub_sigterm it then
 #                    SIGTERMs the wrapper.
-#   audit -f <lock>  fails for a lock listed in <dir>/stub_audit_fail.
+#   audit --json -f <lock>
+#                    prints a cargo-audit JSON report: one finding (exit 1) for a lock in
+#                    <dir>/stub_audit_fail (`<lock>[\t<crate>\t<version>]`, default
+#                    stubcrate@0.0.1); nothing usable (exit 1) for a lock in
+#                    <dir>/stub_audit_toolfail; otherwise a clean report (exit 0, or
+#                    exit 1 for a lock in <dir>/stub_audit_rc1). Findings carry the
+#                    crates.io registry source, as real ones do.
 #
 # The Cargo tree: root workspace with members m, c and independent roots fz, fd; root
 # lock tracked once a part commits, fz/fd locks untracked. m maps to `<dir>/m/../Cargo.toml`
@@ -158,6 +164,7 @@ make_wrapper_repo() {
     cp "${REPO_ROOT}/scripts/lang/_get_base_ref.sh" scripts/lang/_get_base_ref.sh
     cp "${REPO_ROOT}/scripts/lang/_audit_gate.sh" scripts/lang/_audit_gate.sh
     cp "${REPO_ROOT}/scripts/lang/_audit_suppressions_lib.sh" scripts/lang/_audit_suppressions_lib.sh
+    cp "${REPO_ROOT}/scripts/lang/_audit_attribute.py" scripts/lang/_audit_attribute.py
     cp "${REPO_ROOT}/scripts/lang/rust/audit.sh" scripts/lang/rust/audit.sh
     for m in Cargo.toml m/Cargo.toml c/Cargo.toml fz/Cargo.toml fd/Cargo.toml; do
       printf '# fixture manifest\n' > "$m"
@@ -190,8 +197,16 @@ case "\$1" in
     [[ -e "\$d/stub_sigterm" ]] && kill -TERM "\$PPID"
     exit 0 ;;
   audit)
-    [[ \$# -eq 3 && "\$2" == -f ]] || { echo "stub: unexpected: \$*" >&2; exit 97; }
-    grep -qxF -- "\$3" "\$d/stub_audit_fail" 2>/dev/null && { echo "stub: advisory in \$3"; exit 1; }
+    [[ \$# -eq 4 && "\$2 \$3" == "--json -f" ]] || { echo "stub: unexpected: \$*" >&2; exit 97; }
+    grep -qxF -- "\$4" "\$d/stub_audit_toolfail" 2>/dev/null && { echo "stub: advisory-db fetch failed" >&2; exit 1; }
+    row="\$(awk -F'\\t' -v l="\$4" '\$1 == l { print; exit }' "\$d/stub_audit_fail" 2>/dev/null)"
+    if [[ -n "\$row" ]]; then
+      crate="\$(cut -sf2 <<<"\$row")"; ver="\$(cut -sf3 <<<"\$row")"
+      printf '{"vulnerabilities":{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-2099-0001","title":"stub advisory"},"package":{"name":"%s","version":"%s","source":"registry+https://github.com/rust-lang/crates.io-index"}}]}}\\n' "\${crate:-stubcrate}" "\${ver:-0.0.1}"
+      exit 1
+    fi
+    printf '{"vulnerabilities":{"found":false,"count":0,"list":[]}}\\n'
+    grep -qxF -- "\$4" "\$d/stub_audit_rc1" 2>/dev/null && exit 1
     exit 0 ;;
   *) echo "stub: unexpected cargo subcommand: \$*" >&2; exit 97 ;;
 esac
@@ -276,7 +291,7 @@ exec %q "$@"
   )
   run_wrapper "$dir"
   # 1 only if the scanner itself ran over the root lock.
-  WRAP_CALLED="$(called_with "$dir" "audit -f Cargo.lock")"
+  WRAP_CALLED="$(called_with "$dir" "audit --json -f Cargo.lock")"
   rm -rf "$dir"
 }
 
@@ -314,6 +329,7 @@ scan_case() {
     cd "$CASE_DIR"
     mkdir -p .cargo; printf '[advisories]\nignore = []\n' > .cargo/audit.toml
     git add -A; git commit -qm seed
+    git update-ref refs/remotes/origin/main HEAD   # a trusted base: local-mergebase
     echo "bumped" > Cargo.lock   # dep-manifest change -> gate must RUN
     "$setup"
   )
@@ -332,29 +348,30 @@ scan_case case_plain
 assert_status "graphs: clean -> OK" "STATUS=OK REASON=cargo-audit-passed" "$WRAP_OUT"
 assert_rc "graphs: clean -> exit 0" 0 "$WRAP_RC"
 assert_status "graphs: discovered set is exactly root + fd + fz" "AUDIT_GRAPHS=3 . fd fz" "$WRAP_OUT"
-assert_rc "graphs: root audited as-is" 1 "$(called_with "$CASE_DIR" "audit -f Cargo.lock")"
+assert_rc "graphs: root audited as-is" 1 "$(called_with "$CASE_DIR" "audit --json -f Cargo.lock")"
 assert_rc "graphs: tracked root lock never regenerated" 0 "$(grep -c 'generate-lockfile --manifest-path Cargo.toml' "${CASE_DIR}/cargo_calls")"
 assert_rc "graphs: untracked-lock root fz resolved fresh" 1 "$(called_with "$CASE_DIR" "generate-lockfile --manifest-path fz/Cargo.toml")"
-assert_rc "graphs: untracked-lock root fz audited" 1 "$(called_with "$CASE_DIR" "audit -f fz/Cargo.lock")"
+assert_rc "graphs: untracked-lock root fz audited" 1 "$(called_with "$CASE_DIR" "audit --json -f fz/Cargo.lock")"
 assert_rc "graphs: untracked-lock root fd resolved fresh" 1 "$(called_with "$CASE_DIR" "generate-lockfile --manifest-path fd/Cargo.toml")"
-assert_rc "graphs: untracked-lock root fd audited" 1 "$(called_with "$CASE_DIR" "audit -f fd/Cargo.lock")"
+assert_rc "graphs: untracked-lock root fd audited" 1 "$(called_with "$CASE_DIR" "audit --json -f fd/Cargo.lock")"
 assert_rc "graphs: manifest mapped to root via m/../ dedups (no m graph)" 0 "$(grep -c 'm/Cargo.lock' "${CASE_DIR}/cargo_calls")"
 assert_rc "graphs: second manifest mapped to root dedups (no c graph)" 0 "$(grep -c 'c/Cargo.lock' "${CASE_DIR}/cargo_calls")"
 # Suppression parity: every scan from the repo root (where .cargo/audit.toml lives), with
 # no argument beyond `-f <lock>` — no line runs elsewhere or carries anything else.
 assert_rc "graphs: every audit from the repo root, -f only" 0 \
-  "$(grep '|audit' "${CASE_DIR}/cargo_calls" | grep -cvxE "$(printf '%s' "$CASE_DIR" | sed 's/[][\.*^$/]/\\&/g')\|audit -f (Cargo|fd/Cargo|fz/Cargo)\.lock")"
+  "$(grep '|audit' "${CASE_DIR}/cargo_calls" | grep -cvxE "$(printf '%s' "$CASE_DIR" | sed 's/[][\.*^$/]/\\&/g')\|audit --json -f (Cargo|fd/Cargo|fz/Cargo)\.lock")"
 assert_rc "graphs: no fresh lock left behind (fz)" 1 "$([[ ! -e "${CASE_DIR}/fz/Cargo.lock" ]] && echo 1 || echo 0)"
 rm -rf "$CASE_DIR"
 
 # An advisory in the FIRST resolved graph: the later graph is still scanned (no
-# short-circuit), the failing graph is named, the token is the advisory one.
-case_fd_advisory() { echo "fd/Cargo.lock" > stub_audit_fail; }
+# short-circuit), the failing graph is named, the token is the advisory one. The change
+# touches fd/Cargo.toml, so the finding is attributable to it (see Part 6).
+case_fd_advisory() { echo "fd/Cargo.lock" > stub_audit_fail; echo "# touched" >> fd/Cargo.toml; }
 scan_case case_fd_advisory
 assert_status "advisory -> cargo-audit-failed" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
 assert_rc "advisory -> exit 1" 1 "$WRAP_RC"
 assert_status "advisory -> failing graph named" "AUDIT_GRAPH=fd/Cargo.lock LOCK=resolved RESULT=audit-failed" "$WRAP_OUT"
-assert_rc "advisory -> later graph still audited" 1 "$(called_with "$CASE_DIR" "audit -f fz/Cargo.lock")"
+assert_rc "advisory -> later graph still audited" 1 "$(called_with "$CASE_DIR" "audit --json -f fz/Cargo.lock")"
 rm -rf "$CASE_DIR"
 
 # A resolve failure is "could not evaluate", never an advisory — and it outranks one.
@@ -363,7 +380,7 @@ scan_case case_fz_unresolvable
 assert_status "resolve failure -> cargo-lockfile-resolve-failed" "STATUS=FAIL REASON=cargo-lockfile-resolve-failed" "$WRAP_OUT"
 assert_rc "resolve failure -> exit 1" 1 "$WRAP_RC"
 assert_status "resolve failure -> graph named" "AUDIT_GRAPH=fz/Cargo.lock LOCK=resolved RESULT=resolve-failed" "$WRAP_OUT"
-assert_rc "resolve failure -> unresolved lock not audited" 0 "$(called_with "$CASE_DIR" "audit -f fz/Cargo.lock")"
+assert_rc "resolve failure -> unresolved lock not audited" 0 "$(called_with "$CASE_DIR" "audit --json -f fz/Cargo.lock")"
 rm -rf "$CASE_DIR"
 
 # A developer's local untracked lock comes back byte-identical: clean, advisory, resolve failure.
@@ -375,7 +392,7 @@ for mode in clean advisory unresolvable; do
     printf 'my local lock\x00\nfrom a crash repro\n' > fz/Cargo.lock
     cp fz/Cargo.lock dev-lock.orig
     case "$mode" in
-      advisory) echo "fz/Cargo.lock" > stub_audit_fail ;;
+      advisory) echo "fz/Cargo.lock" > stub_audit_fail; echo "# touched" >> fz/Cargo.toml ;;
       unresolvable) echo "fz/Cargo.toml" > stub_resolve_fail ;;
     esac
   }
@@ -442,7 +459,7 @@ scan_case case_abort_mid_scan
 assert_status "set -e abort -> STATUS fallback kept" "STATUS=FAIL REASON=wrapper-aborted-early-exit-1" "$WRAP_OUT"
 assert_rc "set -e abort -> exit 1" 1 "$WRAP_RC"
 assert_status "set -e abort -> backup path printed" "AUDIT_LOCK_BACKUP=" "$WRAP_OUT"
-assert_rc "set -e abort -> no later graph scanned" 0 "$(called_with "$CASE_DIR" "audit -f fz/Cargo.lock")"
+assert_rc "set -e abort -> no later graph scanned" 0 "$(called_with "$CASE_DIR" "audit --json -f fz/Cargo.lock")"
 rm -rf "$CASE_DIR"
 
 # fd is the FIRST resolved graph (sorted), so the signal lands while ITS lock is replaced.
@@ -458,5 +475,195 @@ assert_rc "SIGTERM -> dev lock byte-identical" 0 \
 assert_status "SIGTERM -> a STATUS=FAIL line" "STATUS=FAIL" "$WRAP_OUT"
 assert_rc "SIGTERM -> nonzero exit" 1 "$(( WRAP_RC != 0 ))"
 rm -rf "$CASE_DIR"
+
+# -----------------------------------------------------------------------------
+# Part 6 — attribution (DEVLOOP_AUDIT_BLOCK_ON). A finding blocks only if the change
+# brought its crate@version in; one already in the lock at the diff base is reported and
+# passes. attr_case <base-lock> <head-lock> <stub_audit_fail> [env…] commits <base-lock>
+# as the root Cargo.lock, writes <head-lock> over it (a dep change), and runs the wrapper.
+# -----------------------------------------------------------------------------
+LOCK_VULN=$'[[package]]\nname = "vulncrate"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n'
+LOCK_OTHER=$'[[package]]\nname = "othercrate"\nversion = "2.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n'
+attr_case() {
+  local base="$1" head="$2" fail="$3"; shift 3
+  CASE_DIR="$(mktemp -d)"
+  make_wrapper_repo "$CASE_DIR"
+  (
+    cd "$CASE_DIR"
+    mkdir -p .cargo; printf '[advisories]\nignore = []\n' > .cargo/audit.toml
+    printf '%s' "$base" > Cargo.lock
+    git add -A; git commit -qm seed
+    git update-ref refs/remotes/origin/main HEAD   # a trusted base: local-mergebase
+    printf '%s' "$head" > Cargo.lock
+    printf '%s\n' "$fail" > stub_audit_fail
+  )
+  WRAP_OUT="$(cd "$CASE_DIR" && env -i PATH="${CASE_DIR}/stubbin:$PATH" HOME="$CASE_DIR" TMPDIR="${CASE_DIR}/tmp" \
+        DEVLOOP_TMP="${CASE_DIR}/tmp/devloop" "$@" bash scripts/lang/rust/audit.sh 2>&1)"; WRAP_RC=$?
+}
+FINDING=$'Cargo.lock\tvulncrate\t1.0.0'
+# Re-run the wrapper in $CASE_DIR with extra env (after adjusting the repo).
+rerun_wrapper() {
+  WRAP_OUT="$(cd "$CASE_DIR" && env -i PATH="${CASE_DIR}/stubbin:$PATH" HOME="$CASE_DIR" TMPDIR="${CASE_DIR}/tmp" \
+        DEVLOOP_TMP="${CASE_DIR}/tmp/devloop" "$@" bash scripts/lang/rust/audit.sh 2>&1)"; WRAP_RC=$?
+}
+
+# Already on the base, the change did not touch it: reported, not blocking.
+attr_case "$LOCK_VULN" "${LOCK_VULN}${LOCK_OTHER}" "$FINDING"
+assert_status "attr: preexisting -> OK token" "STATUS=OK REASON=cargo-audit-passed-preexisting-advisories" "$WRAP_OUT"
+assert_rc "attr: preexisting -> exit 0" 0 "$WRAP_RC"
+assert_status "attr: preexisting -> finding reported" "AUDIT_FINDING=PREEXISTING RUSTSEC-2099-0001 vulncrate@1.0.0" "$WRAP_OUT"
+assert_status "attr: preexisting -> graph result" "AUDIT_GRAPH=Cargo.lock LOCK=tracked RESULT=preexisting-advisories" "$WRAP_OUT"
+assert_status "attr: preexisting -> WARN" "WARN AUDIT_PREEXISTING" "$WRAP_OUT"
+assert_status "attr: default mode named" "AUDIT_BLOCK_ON=introduced" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# Brought in by the change: blocks.
+attr_case "$LOCK_OTHER" "${LOCK_OTHER}${LOCK_VULN}" "$FINDING"
+assert_status "attr: introduced -> FAIL" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
+assert_rc "attr: introduced -> exit 1" 1 "$WRAP_RC"
+assert_status "attr: introduced -> finding NEW" "AUDIT_FINDING=NEW RUSTSEC-2099-0001 vulncrate@1.0.0" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# A different version of a crate already on the base is still introduced.
+attr_case "$LOCK_VULN" "${LOCK_VULN/1.0.0/1.0.1}" $'Cargo.lock\tvulncrate\t1.0.1'
+assert_status "attr: new version of a base crate -> FAIL" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# Only a change-free base is trusted. No origin/main -> local-no-mergebase (base = HEAD,
+# which holds the change): the preexisting case must block.
+attr_case "$LOCK_VULN" "${LOCK_VULN}${LOCK_OTHER}" "$FINDING"
+git -C "$CASE_DIR" update-ref -d refs/remotes/origin/main
+rerun_wrapper
+assert_status "attr: untrusted base (no merge-base) -> FAIL" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
+assert_status "attr: untrusted base -> named" "no change-free diff base (BASE_SOURCE=local-no-mergebase)" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# CI: a genuine push compares with HEAD~1 (trusted); a workflow_dispatch's HEAD~1 is of an
+# arbitrary commit (untrusted). Both force-run: a push diff is HEAD~1..HEAD, which the
+# uncommitted head lock is not part of.
+attr_case "$LOCK_VULN" "${LOCK_VULN}${LOCK_OTHER}" "$FINDING"
+git -C "$CASE_DIR" commit -q --allow-empty -m second
+rerun_wrapper GITHUB_ACTIONS=1 GITHUB_EVENT_NAME=push DEVLOOP_AUDIT_FORCE_RUN=1
+assert_status "attr: CI push base trusted -> OK token" "STATUS=OK REASON=cargo-audit-passed-preexisting-advisories" "$WRAP_OUT"
+rerun_wrapper GITHUB_ACTIONS=1 GITHUB_EVENT_NAME=workflow_dispatch DEVLOOP_AUDIT_FORCE_RUN=1
+assert_status "attr: CI dispatch base untrusted -> FAIL" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
+assert_status "attr: CI dispatch -> named" "no change-free diff base (BASE_SOURCE=ci-dispatch)" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# BLOCK_ON=all: the preexisting case blocks.
+attr_case "$LOCK_VULN" "${LOCK_VULN}${LOCK_OTHER}" "$FINDING" DEVLOOP_AUDIT_BLOCK_ON=all
+assert_status "attr: all -> FAIL" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
+assert_status "attr: all -> finding NEW" "AUDIT_FINDING=NEW RUSTSEC-2099-0001 vulncrate@1.0.0" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# An unknown value is a loud config fault, before any scan.
+attr_case "$LOCK_VULN" "${LOCK_VULN}${LOCK_OTHER}" "$FINDING" DEVLOOP_AUDIT_BLOCK_ON=new
+assert_status "attr: invalid -> PRECONDITION_FAILURE" "STATUS=PRECONDITION_FAILURE REASON=audit-block-on-invalid" "$WRAP_OUT"
+assert_rc "attr: invalid -> exit 2" 2 "$WRAP_RC"
+assert_rc "attr: invalid -> nothing scanned" 0 "$(cat "${CASE_DIR}/cargo_calls" 2>/dev/null | grep -c '|audit')"
+rm -rf "$CASE_DIR"
+
+# A tool failure (no usable JSON) is never attributed away.
+attr_case "$LOCK_VULN" "${LOCK_VULN}${LOCK_OTHER}" ""
+printf 'Cargo.lock\n' > "${CASE_DIR}/stub_audit_toolfail"
+WRAP_OUT="$(cd "$CASE_DIR" && env -i PATH="${CASE_DIR}/stubbin:$PATH" HOME="$CASE_DIR" TMPDIR="${CASE_DIR}/tmp" \
+      DEVLOOP_TMP="${CASE_DIR}/tmp/devloop" bash scripts/lang/rust/audit.sh 2>&1)"; WRAP_RC=$?
+assert_status "attr: tool failure -> FAIL" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
+assert_status "attr: tool failure -> named" "the tool failed, not an advisory" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# A freshly resolved graph has no base: a finding there is PREEXISTING unless the change
+# touched that workspace's own manifest (the touched case is case_fd_advisory above).
+case_fz_untouched_advisory() { echo "fz/Cargo.lock" > stub_audit_fail; }
+scan_case case_fz_untouched_advisory
+assert_status "attr: resolved graph, manifest untouched -> OK token" "STATUS=OK REASON=cargo-audit-passed-preexisting-advisories" "$WRAP_OUT"
+assert_status "attr: resolved graph, manifest untouched -> PREEXISTING" "AUDIT_FINDING=PREEXISTING RUSTSEC-2099-0001 stubcrate@0.0.1" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# A resolved graph with NO trusted base is not attributed away, even with its manifest
+# untouched (fail-closed).
+case_fz_untouched_nobase() { echo "fz/Cargo.lock" > stub_audit_fail; git update-ref -d refs/remotes/origin/main; }
+scan_case case_fz_untouched_nobase
+assert_status "attr: resolved graph, untrusted base -> FAIL" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
+assert_status "attr: resolved graph, untrusted base -> NEW" "AUDIT_FINDING=NEW RUSTSEC-2099-0001 stubcrate@0.0.1" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# The attributor failing (rc 2) blocks, named.
+attr_case "$LOCK_VULN" "${LOCK_VULN}${LOCK_OTHER}" "$FINDING"
+rm "${CASE_DIR}/scripts/lang/_audit_attribute.py"; rerun_wrapper
+assert_status "attr: attributor unavailable -> FAIL" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
+assert_status "attr: attributor unavailable -> named" "could not attribute the findings for Cargo.lock" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# A clean report with a non-zero exit is the tool failing, not a pass.
+attr_case "$LOCK_VULN" "${LOCK_VULN}${LOCK_OTHER}" ""
+printf 'Cargo.lock\n' > "${CASE_DIR}/stub_audit_rc1"; rerun_wrapper
+assert_status "attr: clean report, rc 1 -> FAIL" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
+assert_status "attr: clean report, rc 1 -> named" "with no findings — the tool failed" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# The rest of the trust table: a first commit (base = HEAD) and a non-push CI event are
+# untrusted.
+attr_case "$LOCK_VULN" "${LOCK_VULN}${LOCK_OTHER}" "$FINDING"
+rerun_wrapper GITHUB_ACTIONS=1 GITHUB_EVENT_NAME=push DEVLOOP_AUDIT_FORCE_RUN=1
+assert_status "attr: CI first commit untrusted -> FAIL" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
+assert_status "attr: CI first commit -> named" "BASE_SOURCE=ci-push-first-commit" "$WRAP_OUT"
+git -C "$CASE_DIR" commit -q --allow-empty -m second
+rerun_wrapper GITHUB_ACTIONS=1 GITHUB_EVENT_NAME=schedule DEVLOOP_AUDIT_FORCE_RUN=1
+assert_status "attr: CI non-push event untrusted -> FAIL" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
+assert_status "attr: CI non-push -> named" "no change-free diff base (BASE_SOURCE=ci-push-main)" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# _audit_attribute.py directly: fail-closed edges and the pnpm lock parser.
+ATTR="${REPO_ROOT}/scripts/lang/_audit_attribute.py"
+attr_t="$(mktemp -d)"
+printf '%s' "$LOCK_VULN" > "${attr_t}/Cargo.lock"
+out="$(printf 'RUSTSEC-1\tvulncrate\t1.0.0\n' | python3 "$ATTR" cargo "" 0)"; rc=$?
+assert_rc "attribute: no base -> NEW (rc 1)" 1 "$rc"
+assert_status "attribute: no base -> NEW line" "AUDIT_FINDING=NEW RUSTSEC-1 vulncrate@1.0.0" "$out"
+out="$(printf 'RUSTSEC-1\tvulncrate\t1.0.0\n' | python3 "$ATTR" cargo "${attr_t}/missing.lock" 0)"; rc=$?
+assert_rc "attribute: unreadable base -> NEW (rc 1)" 1 "$rc"
+out="$(printf 'RUSTSEC-1\tvulncrate\t1.0.0\tt\tregistry+https://github.com/rust-lang/crates.io-index\n' | python3 "$ATTR" cargo "${attr_t}/Cargo.lock" 0)"; rc=$?
+assert_rc "attribute: in base (same source) -> rc 0" 0 "$rc"
+printf 'RUSTSEC-1\tvulncrate\n' | python3 "$ATTR" cargo "${attr_t}/Cargo.lock" 0 >/dev/null; rc=$?
+assert_rc "attribute: malformed row -> rc 2" 2 "$rc"
+python3 "$ATTR" cargo "${attr_t}/Cargo.lock" maybe </dev/null >/dev/null 2>&1; rc=$?
+assert_rc "attribute: bad args -> rc 2" 2 "$rc"
+# Source is part of the cargo identity: the base had a same-version git fork (a [patch]
+# remediation); the crates.io crate a change brings back is NEW. [[patch.unused]] is not
+# in the graph and never counts.
+REG="registry+https://github.com/rust-lang/crates.io-index"
+printf '[[package]]
+name = "foo"
+version = "1.2.3"
+source = "git+https://example.org/foo#abc"
+
+[[patch.unused]]
+name = "bar"
+version = "2.0.0"
+
+[[package]]
+name = "baz"
+version = "3.0.0"
+source = "%s"
+' "$REG" > "${attr_t}/src.lock"
+out="$(printf 'R1	foo	1.2.3	t	%s
+R2	bar	2.0.0	t	
+R3	baz	3.0.0	t	%s
+' "$REG" "$REG" | python3 "$ATTR" cargo "${attr_t}/src.lock" 0)"
+assert_status "attribute: cargo source differs -> NEW" "AUDIT_FINDING=NEW R1 foo@1.2.3" "$out"
+assert_status "attribute: cargo patch.unused ignored -> NEW" "AUDIT_FINDING=NEW R2 bar@2.0.0" "$out"
+assert_status "attribute: cargo same source -> PREEXISTING" "AUDIT_FINDING=PREEXISTING R3 baz@3.0.0" "$out"
+printf "lockfileVersion: '9.0'\nimporters:\n  .:\n    packageManagerDependencies:\n      pnpm: 12.8.1\npackages:\n  pnpm@12.8.1:\n    resolution: {}\n---\nlockfileVersion: '9.0'\noverrides:\n  undici@7.29.0: 7.29.1\npatchedDependencies:\n  left-pad@1.3.0:\n    hash: x\npackages:\n  '@scope/pkg@1.2.3':\n    resolution: {}\n  undici@7.29.1:\n    resolution: {}\nsnapshots:\n  vitest@5.0.5(@types/node@22.1.0):\n    dependencies:\n      undici: 7.29.1\n" > "${attr_t}/pnpm-lock.yaml"
+out="$(printf 'G1\t@scope/pkg\t1.2.3\nG2\tundici\t7.29.1\nG3\tvitest\t5.0.5\nG4\tundici\t7.29.0\nG5\tleft-pad\t?\nG6\tleft-pad\t1.3.0\nG7\tpnpm\t12.8.1\n' | python3 "$ATTR" pnpm "${attr_t}/pnpm-lock.yaml" 0)"; rc=$?
+assert_rc "attribute: pnpm, some new -> rc 1" 1 "$rc"
+assert_status "attribute: pnpm scoped key" "AUDIT_FINDING=PREEXISTING G1 @scope/pkg@1.2.3" "$out"
+assert_status "attribute: pnpm plain key" "AUDIT_FINDING=PREEXISTING G2 undici@7.29.1" "$out"
+assert_status "attribute: pnpm snapshot key with peers" "AUDIT_FINDING=PREEXISTING G3 vitest@5.0.5" "$out"
+assert_status "attribute: pnpm other version (an overrides: key does not count)" "AUDIT_FINDING=NEW G4 undici@7.29.0" "$out"
+assert_status "attribute: pnpm unknown version" "AUDIT_FINDING=NEW G5 left-pad@?" "$out"
+assert_status "attribute: pnpm patchedDependencies key does not count" "AUDIT_FINDING=NEW G6 left-pad@1.3.0" "$out"
+assert_status "attribute: pnpm toolchain document does not count" "AUDIT_FINDING=NEW G7 pnpm@12.8.1" "$out"
+rm -rf "$attr_t"
 
 report_results "scripts/lang/_audit_gate.test.sh"

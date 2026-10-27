@@ -296,6 +296,24 @@ test_ci_push() {
   __pop_cwd
 }
 
+# 6b. ci-dispatch: a workflow_dispatch also uses HEAD~1 but is labelled apart — it runs on
+# an arbitrary commit, so audit attribution must not trust it as a change-free base.
+test_ci_dispatch() {
+  local tmp; tmp=$(mktemp_register)
+  __push_cwd "$tmp"
+  init_repo_with_origin "$tmp"
+  echo "x" > a.txt
+  git add a.txt
+  git commit -q -m "feat: a"
+  out=$(run_isolated \
+          GITHUB_ACTIONS=1 \
+          GITHUB_EVENT_NAME=workflow_dispatch \
+          2>&1 >/dev/null)
+  assert_base_ref_line_well_formed "ci-dispatch" "$out"
+  assert_base_source "ci-dispatch" "ci-dispatch" "$out"
+  __pop_cwd
+}
+
 # 7. ci-push-first-commit: push event but only one commit (no HEAD~1).
 test_ci_push_first_commit() {
   local tmp; tmp=$(mktemp_register)
@@ -366,6 +384,7 @@ test_ci_pr
 test_ci_pr_merge_base_vs_tip
 test_local_clean_merge_base_regression
 test_ci_push
+test_ci_dispatch
 test_ci_push_first_commit
 test_ci_pr_base_ref_unreachable
 

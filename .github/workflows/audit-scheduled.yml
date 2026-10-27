@@ -113,6 +113,10 @@ jobs:
         id: scan
         env:
           DEVLOOP_AUDIT_FORCE_RUN: '1'
+          # The drift-catcher blocks on EVERY finding: PR and devloop scans block only on
+          # findings the change introduced (ADR-0033 §11, 2026-10-26), so this is the run
+          # that notices a new advisory against what is already on main.
+          DEVLOOP_AUDIT_BLOCK_ON: 'all'
         run: |
           set +e
           ./scripts/audit.sh 2>&1 | tee "${RUNNER_TEMP}/audit-output.txt"

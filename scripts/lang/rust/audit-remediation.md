@@ -8,7 +8,7 @@
      — reachable ONLY during a headless run with a red audit, i.e. the
      worst available discovery conditions. Use inline `backtick spans`. -->
 Clear all outstanding Rust dependency advisories so `cargo audit` (forced,
-DEVLOOP_AUDIT_FORCE_RUN=1) reports zero unsuppressed findings at or above the
+DEVLOOP_AUDIT_FORCE_RUN=1 DEVLOOP_AUDIT_BLOCK_ON=all) reports zero unsuppressed findings at or above the
 configured threshold. This task was auto-appended by the story runner because
 the forced Layer-6 Rust audit went red at story close.
 
@@ -45,7 +45,7 @@ SUPPRESSION IS GOVERNED — it is NOT the easy way out:
   they must scrutinize the exposure analysis. Do not let a suppression slip
   through as an incidental diff.
 
-Acceptance: `DEVLOOP_AUDIT_FORCE_RUN=1 scripts/lang/rust/audit.sh` emits STATUS=OK
+Acceptance: `DEVLOOP_AUDIT_FORCE_RUN=1 DEVLOOP_AUDIT_BLOCK_ON=all scripts/lang/rust/audit.sh` emits STATUS=OK
 (zero unsuppressed advisories); any suppression added is justified, expiring, and
 security-reviewed; `docs/TODO.md` §Dependency Vulnerabilities (cargo audit) /
 §Supply Chain updated to reflect what changed. No cluster behavior; the

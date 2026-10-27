@@ -1222,7 +1222,9 @@ audit_scan() {
         [ -f "$sh" ] || continue
         lang="$(basename "$(dirname "$sh")")"
         set +e
-        DEVLOOP_AUDIT_FORCE_RUN=1 "$sh" >"$RUN_DIR/audit-${lang}.log" 2>&1
+        # BLOCK_ON=all: the story-close scan remediates every advisory in the tree, not
+        # only ones the story introduced (ADR-0033 §11, 2026-10-26).
+        DEVLOOP_AUDIT_FORCE_RUN=1 DEVLOOP_AUDIT_BLOCK_ON=all "$sh" >"$RUN_DIR/audit-${lang}.log" 2>&1
         rc=$?
         set -e
         if [ "$rc" -eq 1 ]; then
