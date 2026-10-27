@@ -4,12 +4,13 @@
 - Client architecture (SDK, testing, deployment, E2EE) → ADR-0028; debate → `docs/debates/2026-02-28-client-architecture/debate.md`
 - Media flow (multi-handler §9, slot model §6, hot-path layout §11, KEK lifecycle) → ADR-0036
 - Crypto algorithms → ADR-0027; auth/meeting access → ADR-0020; observability → ADR-0011, ADR-0031; guards → ADR-0015; tests → ADR-0005
-- Story 2 (hear each other) + manual test plan → `docs/user-stories/2026-09-21-hear-each-other.md`, `docs/user-stories/2026-09-21-hear-each-other-manual-test-plan.md`
+- Stories + manual test plans: 2 (hear) → `docs/user-stories/2026-09-21-hear-each-other.md`, `docs/user-stories/2026-09-21-hear-each-other-manual-test-plan.md`; 3 (see) → `docs/user-stories/2026-10-07-see-each-other.md`, `docs/user-stories/2026-10-07-see-each-other-manual-test-plan.md`
 
 ## SDK Core: Session & Signaling (`packages/sdk-core/src/`)
+- Media-kind token SSoT (`MEDIA_KIND_TOKENS`, `perMediaKind`) + the ONE wire↔token mapping → `media/mediaKind.ts`, `signaling/slotStateMap.ts:mediaKindToken()`, `wireMediaKind()`
 - Signaling client / meeting session (single-use per join) → `signaling/SignalingClient.ts`, `session/MeetingSession.ts`
 - Session event surface (mute / first-media / slot / fault) → `session/events.ts:MeetingSessionEventMap`; `StreamAssignments` + unreachable senders → `signaling/events.ts:StreamAssignmentsEvent`
-- Session↔media wiring (rebind purge, KEK observer, per-kind send directives, video encoding validation, MH control sink → keyframe gate) → `session/mediaWiring.ts:sendDirectiveListener`, `validateVideoEncoding`, `mhControlSink`
+- Session↔media wiring (rebind purge, KEK observer, per-kind send directives, video encoding validation, MH control sink → keyframe gate, publish-set-gated mute report) → `session/mediaWiring.ts:sendDirectiveListener`, `validateVideoEncoding`, `mhControlSink`, `bestEffortMuteReport`
 - Signalling media state (E3 cache, mute, server mute seeded from roster) + R-18 tracker (S1); publish set + slot plan + declaration + capture source (audio + video/test pattern) → `session/{signalingMediaState,serverMuteResume,slotPlan,mediaSelection}.ts`; session-owned transmit keys + KEK subscription + VP8 join probe → `MeetingSession.ts:startMedia`; join publish declaration + join-window mute catch-up → `MeetingSession.ts:#declarePublish`, `#catchUpClientMuteAfterJoin`
 - Flat slot-state map (exhaustive `Record<SlotState, …>`) + pairing view + single-kind `MuteChange` builder + THE kind-keyed snapshot decoder (CONVENTIONS §6: one entry per known kind, else session-fatal `ContractFault` + bounded `[dt-signaling-contract]` WARN) → `signaling/{slotStateMap,pairing,muteRequest,mediaKindStates}.ts`
 - Host role hint → `session/meetingRole.ts`; base64url → `encoding/base64url.ts`; error codes (closing vs refusal) → `signaling/errorCodeMap.ts:closesConnection()`, `errors/`
@@ -20,7 +21,7 @@
 - Client config SSoT → `config/clientConfig.ts` (`parseReceiveSlots()`, `deriveKekRetention()`, video knobs + `videoConfigLogLine()`, video receive bounds `videoReceive` + `videoReceiveConfigLogLine()`, keyframe floor `KEYFRAME_MIN_INTERVAL_FLOOR_MS`); export interval → `telemetry/telemetryConfig.ts:getMetricExportIntervalMs()`; MC↔SDK floor guard → `scripts/guards/simple/validate-keyframe-floor-sync.sh`
 
 ## SDK Core: Media Pipeline (`packages/sdk-core/src/media/`)
-- Frame codec + signing → `frame/{frameCodec,ed25519,wireConstants}.ts`; header v3 + sendable/supported versions → `frameCodec.ts:HEADER_VERSION_V3`, `__tests__/frameCodec.v3.test.ts`; hot-path layout rule → `__tests__/hotPathLayout.test.ts`
+- Frame codec + signing + reject reasons → `frame/{frameCodec,ed25519,wireConstants,rejectReason}.ts`; header v3 + sendable/supported versions → `frameCodec.ts:HEADER_VERSION_V3`, `__tests__/frameCodec.v3.test.ts`; hot-path layout rule → `__tests__/hotPathLayout.test.ts`
 - Egress (seal once, per-target fan-out) + uplink stamp = MC send id → `pipeline/{egress,egressQueue,sendId,frameSeal}.ts`; proof → `pipeline/__tests__/egress.multiTarget.test.ts`
 - Video egress (group streams, backlog reset, hop at write) → `pipeline/videoEgress.ts`; publish lifecycle (camera gate + R-19 → `cameraHealthChanged`, keyframe gate + `producedBySource`, `sendTotals`) → `lifecycle/{VideoPublisher,cameraGate,keyframePolicy}.ts`; nonce property → `pipeline/__tests__/nonceUniqueness.property.test.ts`
 - Ingress + slot-edge gate + per-sender receive lanes → `pipeline/{ingress,receiveLanes,playbackSink}.ts`; proof → `lifecycle/__tests__/audioPipeline.multiSender.test.ts`
@@ -29,7 +30,7 @@
 - Video receive orchestrator (sinks, evidence incl. `framesDecoded`, pairing live senders), recovery queue, unfulfilled series, per-kind receiver-state binding, per-handler read loops → `lifecycle/{VideoReceiver,recoveryRequestQueue,unfulfilledSlots,receiverState,receiveTransports}.ts`
 - Pipeline lifecycle (per-transport receive, transmit keys, mute) + interval signals (capture presence, receive-source deficit) → `lifecycle/{AudioPipeline,receiveTransports,transmitKeys,muteState,intervalSignals,receiveSourceDeficit}.ts`
 - Capture (mic, tone, camera, test pattern — spec home `web-app/e2e/README.md`) / playback / Opus / VP8 (decoder config + key-frame header dims) → `setup/{capture,testTone,videoCapture,videoCaptureBrowser,testPattern,meetingSenderId,audioPlayback,opus,vp8,vp8Encoder,vp8Decoder}.ts`; VideoSink / VideoDecoder seams → `setup/seams.ts`
-- Media metric handles + allow-listed labels → `setup/mediaMetrics.ts`
+- Media metric handles + allow-listed labels + kind-label projection → `setup/mediaMetrics.ts:MEDIA_KIND_LABEL_PROJECTION`
 
 ## SDK Core: Key Material
 - KEK holder (current + one previous) → `media/setup/kekSource.ts`; KEK intake/scrub → `signaling/kekIntake.ts`, `__tests__/serverMessageSinkScan.test.ts`
@@ -48,9 +49,6 @@
 - E2E bus (incl. `videoSlots`, `sendCounts`) + per-lane analysis + render-surface lumas (under `__E2E_HOOKS__`) → `lib/{e2eBus,e2eAnalysis}.ts`; contract round-trip → `__tests__/e2eBus.test.ts`
 - Vite proxy / cert fingerprints → `vite.config.ts`, `vite/fingerprints.ts`; prod-absence bundle scan → `tests/bundle-content.test.ts`
 
-## Client Telemetry (`packages/sdk-core/src/telemetry/`)
-- OTel sinks / trace propagation / close-reason / logger / name guard → `{OtelMetricsSink,NoopMetricsSink,tracePropagation,closeReason,logger,nameGuard}.ts`
-
 ## Browser E2E Harness (`packages/web-app/e2e/`)
 - Fixtures + MC/MH metric read-backs; multi-party cohort (N+1 registered in global setup) → `fixtures.ts`, `mcMetrics.ts`, `instanceCounters.ts`, `s1Diagnostic.ts`, `cohort.ts`, `cohortContexts.ts`, `global-setup.ts`
 - Receive evidence + tone detection + window stop rule → `receiveEvidence.ts`, `toneDetector.ts`, `windowSampling.ts`
@@ -68,8 +66,9 @@
 - Media frame format → `crates/media-protocol/`; vectors → `proto/test-vectors/`; meeting-token claims → `crates/common/src/jwt.rs:MeetingTokenClaims`
 
 ## Observability
+- SDK telemetry (OTel sinks / trace propagation / close-reason / logger / name guard) → `packages/sdk-core/src/telemetry/{OtelMetricsSink,NoopMetricsSink,tracePropagation,closeReason,logger,nameGuard}.ts`
 - Metrics catalog + grandfathered label roster → `docs/observability/metrics/client.md`; label rules → `docs/observability/label-taxonomy.md`; alerts / dashboard → `infra/docker/prometheus/rules/client-alerts.yaml`, `infra/grafana/dashboards/client-media.json`
+- Kind-label projection drift guard (TS ↔ collector ↔ GC) → `crates/dt-guard/src/client_metrics_export.rs:kind_projection_findings()`; client name/kind-literal guard → `scripts/guards/simple/ts/name-guard-dt-client.sh`
 
 ## Toolchain & Build
-- Node version SSoT → `.nvmrc`; pnpm overrides and settings → `pnpm-workspace.yaml`; dev-web preflight → `scripts/dev-web.sh`
-- Secure-context runbook → `docs/runbooks/client-dev-local.md`; client CI → `.github/workflows/ci-client.yml`
+- Node version SSoT → `.nvmrc`; pnpm → `pnpm-workspace.yaml`; dev-web preflight → `scripts/dev-web.sh`; secure-context runbook → `docs/runbooks/client-dev-local.md`; client CI → `.github/workflows/ci-client.yml`

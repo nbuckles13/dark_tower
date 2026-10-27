@@ -39,7 +39,8 @@
 ## Client telemetry proxy (OTLP ingest -> collector)
 - Routes `/api/v1/telemetry/v1/{metrics,traces}` -> `crates/gc-service/src/routes/mod.rs:build_routes()`
 - Ingest handlers, body limit, rate limiter -> `crates/gc-service/src/handlers/telemetry.rs:ingest_metrics()`, `ingest_traces()`, `TelemetryState`
-- Attribute allowlist, media datapoint tier, `org_id` stamped from `UserClaims` -> `crates/gc-service/src/services/telemetry_filter.rs:ALLOWLIST`, `MEDIA_DATAPOINT_EXTRA`, `filter_metrics()`, `filter_traces()`
+- Attribute allowlist, media datapoint tier (`media_kind`/`content_kind` admitted at the browser trust boundary), `org_id` stamped from `UserClaims`, `key_custody` value rule -> `crates/gc-service/src/services/telemetry_filter.rs:ALLOWLIST`, `MEDIA_DATAPOINT_EXTRA`, `custody_value_ok()`, `filter_metrics()`, `filter_traces()`
+- Shared label-key vocabulary (SSoT with MC recorders) -> `crates/common/src/observability/labels.rs:MEDIA_KIND_LABEL`, `CONTENT_KIND_LABEL`, `KEY_CUSTODY_LABEL`
 - Upstream forwarder -> `crates/gc-service/src/services/telemetry_forwarder.rs:TelemetryForwarder`
 
 ## Meeting-refusal taxonomy
@@ -66,8 +67,7 @@
 ## Tests
 - Meeting creation + the three refusal causes -> `crates/gc-service/tests/meeting_create_tests.rs`
 - Meeting join/guest/settings tests -> `crates/gc-service/tests/meeting_tests.rs`
-- MC/MH assignment tests -> `crates/gc-service/tests/mc_assignment_rpc_tests.rs`, `crates/gc-service/tests/meeting_assignment_tests.rs`; HTTP join stickiness -> `crates/gc-service/tests/meeting_tests.rs` (`test_join_sticky_*`)
-- Auth integration tests -> `crates/gc-service/tests/auth_tests.rs`
+- MC/MH assignment tests -> `crates/gc-service/tests/mc_assignment_rpc_tests.rs`, `crates/gc-service/tests/meeting_assignment_tests.rs`; HTTP join stickiness -> `crates/gc-service/tests/meeting_tests.rs` (`test_join_sticky_*`); auth -> `crates/gc-service/tests/auth_tests.rs`
 - Per-metric-cluster integration tests (ADR-0032) -> `crates/gc-service/tests/*_metrics_integration.rs`
 - `error_type` label coverage -> `crates/gc-service/tests/meeting_creation_metrics_integration.rs`, `crates/gc-service/tests/errors_metric_integration.rs`
 - Telemetry proxy tests -> `crates/gc-service/tests/telemetry_proxy_tests.rs`, `crates/gc-service/tests/telemetry_metrics_integration.rs`
