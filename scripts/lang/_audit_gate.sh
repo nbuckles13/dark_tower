@@ -124,6 +124,80 @@ audit_dep_changed_ts() {
 }
 
 # -----------------------------------------------------------------------------
+# Attribution: which findings BLOCK (ADR-0033 §11 amendment, 2026-10-26).
+#
+# A scan that runs still reports every finding. What blocks depends on
+# DEVLOOP_AUDIT_BLOCK_ON:
+#   introduced (default)  only findings the change brought in: the advisory's package at
+#                         that version is NOT in the lockfile at the diff base. A finding
+#                         already on the base is reported (AUDIT_FINDING=PREEXISTING, a
+#                         WARN line, a *-preexisting-advisories OK token) and left to the
+#                         scheduled full scan, which owns drift on main. Without this, a
+#                         new advisory against main reds every lockfile-touching PR and
+#                         devloop until main is fixed, though none of them caused it.
+#   all                   every finding blocks: the scheduled drift-catcher and the
+#                         story-close scan (run-story.sh) set this.
+# Any other value is a config fault (PRECONDITION_FAILURE audit-block-on-invalid), never
+# a silent default. The knob can only make a scan stricter than the default, so it needs
+# no test-sentinel gating. Fail-closed: an unresolvable base, or a lockfile absent at the
+# base, makes every finding NEW. Suppression is unchanged and separate: audit.toml /
+# .pnpm-audit-ignore.json still decide what is reported at all.
+# -----------------------------------------------------------------------------
+audit_block_on() {
+  local v="${DEVLOOP_AUDIT_BLOCK_ON:-introduced}"
+  case "$v" in
+    introduced|all) printf '%s\n' "$v" ;;
+    *) echo "DEVLOOP_AUDIT_BLOCK_ON must be 'introduced' or 'all', got '${v}'" >&2; return 1 ;;
+  esac
+}
+
+# Resolve the diff base once per wrapper run into __AUDIT_BASE (empty = none usable).
+# Also (re)populates the changed-files cache, which a force-run skipped.
+#
+# Only a base that cannot already contain the change is trusted for attribution:
+#   ci-pr            merge-base of the PR with its target branch
+#   local-mergebase  merge-base with origin/main
+#   ci-push-main     HEAD~1, on a genuine `push` event only (the previous tip of the pushed branch)
+# Anything else — local-no-mergebase and ci-push-first-commit (base = HEAD, which holds the
+# change), ci-dispatch (HEAD~1 of an arbitrary commit), or an unrecognised source — leaves
+# no base, so every finding counts as introduced (fail-closed).
+audit_resolve_base() {
+  local err src
+  err="$(mktemp)"
+  __AUDIT_BASE="$("${__audit_gate_here}/_get_base_ref.sh" 2>"$err")" || __AUDIT_BASE=""
+  src="$(sed -n 's/.*BASE_SOURCE=\([^ ]*\).*/\1/p' "$err" | tail -n1)"
+  cat "$err" >&2
+  rm -f "$err"
+  case "$src" in
+    ci-pr|local-mergebase) ;;
+    ci-push-main) [[ "${GITHUB_EVENT_NAME:-}" == "push" ]] || __AUDIT_BASE="" ;;
+    *) __AUDIT_BASE="" ;;
+  esac
+  if [[ -z "$__AUDIT_BASE" ]]; then
+    echo "AUDIT_ATTRIBUTION: no change-free diff base (BASE_SOURCE=${src:-none}) — every finding counts as introduced" >&2
+  fi
+}
+
+# Write repo-relative <path> as it was at __AUDIT_BASE into <out>.
+# Returns 0 written; 1 no base, or <path> absent there (the caller attributes every
+# finding as NEW).
+audit_base_file() {
+  local path="$1" out="$2"
+  [[ -n "${__AUDIT_BASE:-}" ]] || return 1
+  if ! git -C "$__audit_repo_root" show "${__AUDIT_BASE}:${path}" > "$out" 2>/dev/null; then
+    echo "AUDIT_ATTRIBUTION: ${path} absent at base ${__AUDIT_BASE:0:12} — every finding counts as introduced" >&2
+    return 1
+  fi
+}
+
+# audit_attribute <cargo|pnpm> <base-lock-or-empty> <assume-preexisting:0|1>, findings TSV
+# on stdin (see _audit_attribute.py). AUDIT_FINDING= lines go to stderr.
+# Returns 0 no NEW finding; 1 at least one NEW; 2 bad input.
+audit_attribute() {
+  python3 "${__audit_gate_here}/_audit_attribute.py" "$@" >&2
+}
+
+# -----------------------------------------------------------------------------
 # Suppression-filter (ts side). The rust side needs NO filter helper: cargo-audit
 # reads .cargo/audit.toml natively (the wrapper passes no flags), so suppression is
 # applied by cargo-audit itself from the tracked derived file.

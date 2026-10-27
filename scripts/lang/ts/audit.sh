@@ -21,6 +21,11 @@
 # resolved dep graph); an indeterminate diff still RUNS. DEVLOOP_AUDIT_FORCE_RUN=1 forces
 # a run (weekly scheduled scan); force-RUN-only.
 #
+# ATTRIBUTION (_audit_gate.sh, DEVLOOP_AUDIT_BLOCK_ON): each unsuppressed high/critical
+# advisory is reported as `AUDIT_FINDING=NEW|PREEXISTING <id> <pkg>@<version> <title>`; by
+# default only NEW ones (the package at that version is not in pnpm-lock.yaml at the diff
+# base) fail the scan. All-PREEXISTING -> OK pnpm-audit-passed-preexisting-advisories + WARN.
+#
 # FILTER fail-mode (security §D.1.2 PATH-1): if .pnpm-audit-ignore.json is malformed,
 # the filter applies ZERO suppressions and PROCEEDS (every advisory surfaces; the scan
 # can still go RED) + emits a loud stderr WARN. It MUST NOT abort the scan — a
@@ -30,6 +35,12 @@ set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "${BASH_SOURCE[0]}")/../_audit_gate.sh"
 install_wrapper_exit_trap  # task #50: emit STATUS=FAIL if we abort before emitting
+
+# A config fault is loud even when the gate would skip.
+if ! block_on="$(audit_block_on)"; then
+  emit_status PRECONDITION_FAILURE audit-block-on-invalid
+  exit 2
+fi
 
 gate_rc=0
 audit_gate audit_dep_changed_ts || gate_rc=$?
@@ -87,24 +98,34 @@ if not isinstance(data, dict) or "advisories" not in data:
 THRESH = {"high", "critical"}
 applied = set()
 remaining = []
+rows = []
 
-def consider(adv_id, severity):
+def consider(adv_id, severity, adv):
     if severity not in THRESH:
         return
     if adv_id in suppressed:
         applied.add(adv_id)
-    else:
-        remaining.append(adv_id)
+        return
+    remaining.append(adv_id)
+    # One attribution row per affected installed version. An advisory with no findings
+    # gets a "?" version, which can never match the base lock: it is attributed NEW.
+    title = (adv.get("title") or "").replace("\t", " ").replace("\n", " ")
+    name = adv.get("module_name") or "?"
+    versions = {f.get("version") for f in (adv.get("findings") or []) if f.get("version")} or {"?"}
+    for ver in sorted(versions):
+        rows.append("\t".join([adv_id, name, ver, title]))
 
 # npm-audit v1 shape: {"advisories": {id: {"severity":..., "github_advisory_id":...}}}
 for _, adv in (data.get("advisories") or {}).items():
     sev = (adv.get("severity") or "").lower()
     aid = adv.get("github_advisory_id") or (adv.get("cves") or [None])[0] or str(adv.get("id"))
-    consider(aid, sev)
+    consider(aid, sev, adv)
 
 print(("FAIL" if remaining else "OK"),
       "applied=" + ",".join(sorted(applied)),
       "remaining=" + ",".join(sorted(set(remaining))))
+for r in rows:
+    print("ROW\t" + r)
 PY
 decision="$(printf '%s' "$audit_json" | python3 -c "$__audit_decide_py" "$pnpm_rc" "${suppressed[@]+"${suppressed[@]}"}")" || true
 
@@ -127,6 +148,23 @@ fi
 if printf '%s\n' "$decision" | grep -q '^FAIL'; then
   remaining_ids="$(printf '%s\n' "$decision" | sed -n 's/.*remaining=\([^ ]*\).*/\1/p')"
   echo "pnpm audit: unsuppressed high/critical advisories remain: ${remaining_ids:-<see pnpm audit output>}" >&2
+  base_lock="" arc=0
+  if [[ "$block_on" == "introduced" ]]; then
+    audit_resolve_base
+    base_lock="$(mktemp)"
+    audit_base_file pnpm-lock.yaml "$base_lock" || { rm -f "$base_lock"; base_lock=""; }
+  fi
+  printf '%s\n' "$decision" | sed -n 's/^ROW\t//p' | audit_attribute pnpm "$base_lock" 0 || arc=$?
+  [[ -n "$base_lock" ]] && rm -f "$base_lock"
+  if [[ "$arc" -eq 0 ]]; then
+    echo "WARN AUDIT_PREEXISTING: the AUDIT_FINDING=PREEXISTING advisories above are already on the diff base — not introduced by this change, so not blocking. The scheduled audit (audit-drift issue) owns them; fix them on main." >&2
+  # In CI, also as an annotation on the run/PR, so they are seen without opening the log.
+  # (stdout: GitHub reads workflow commands there; the STATUS parser reads only ^STATUS=.)
+  [[ -z "${GITHUB_ACTIONS:-}" ]] || echo "::warning title=Pre-existing advisories::this change did not introduce them, so the audit passed; they are on the base branch and tracked by the scheduled audit (audit-drift issue). AUDIT_FINDING=PREEXISTING lines in the Layer 6 log name them."
+    emit_status OK "pnpm-audit-passed-preexisting-advisories"
+    exit 0
+  fi
+  [[ "$arc" -eq 1 ]] || echo "pnpm audit: could not attribute the findings — blocking" >&2
   emit_status FAIL "pnpm-audit-failed"
   exit 1
 fi

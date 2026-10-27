@@ -85,7 +85,14 @@ main() {
       # CI on push: HEAD~1, with HEAD fallback for first-commit edge case.
       if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
         base="HEAD~1"
-        source="ci-push-main"
+        # A manual dispatch runs on any branch at any commit, so HEAD~1 there is not a
+        # "previous state of a long-lived branch": label it apart so consumers that need
+        # a change-free base (audit attribution) can tell.
+        if [[ "${GITHUB_EVENT_NAME:-}" == "workflow_dispatch" ]]; then
+          source="ci-dispatch"
+        else
+          source="ci-push-main"
+        fi
       else
         base="HEAD"
         source="ci-push-first-commit"
