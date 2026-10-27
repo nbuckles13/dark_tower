@@ -42,6 +42,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+use common::{dt_guard_bin, git};
+
 /// Fixture directory, relative to the dt-guard crate root.
 const LENS_DIR: &str = "tests/fixtures/credential_leak_key_custody/lens";
 
@@ -331,31 +334,6 @@ const FLOOR_EXTENT: &[(&str, bool)] = &[
     // In no vocabulary in any form, and no backstop at a log site.
     ("meetingKek", false),
 ];
-
-/// Locate the guard binary. Cargo builds this crate's own `dt-guard` bin for
-/// integration tests and pins its path at compile time via `CARGO_BIN_EXE_*`,
-/// so this resolves under any target dir (plain `cargo test`, the Layer-4
-/// release build, `cargo llvm-cov`'s separate target dir in CI). `DT_GUARD`
-/// remains the documented override for pointing at a specific shipped binary.
-fn dt_guard_bin() -> PathBuf {
-    std::env::var_os("DT_GUARD").map_or_else(
-        || PathBuf::from(env!("CARGO_BIN_EXE_dt-guard")),
-        PathBuf::from,
-    )
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
 
 #[test]
 fn mechanical_floor_extent_is_pinned_per_spelling() {

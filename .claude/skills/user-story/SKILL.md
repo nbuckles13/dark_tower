@@ -335,7 +335,7 @@ tasks: []
 **Then append one task at a time**, writing each prompt to a temp file first so no prompt text ever reaches a command line:
 
 ```bash
-target/release/dt-story add-task "$STORY" \
+scripts/lib/tool-bins.sh dt-story add-task "$STORY" \
   --specialist <name> \
   --prompt-file /tmp/task-<n>.prompt \
   --tag "story-{story-slug}-task-<n>" \
@@ -372,8 +372,8 @@ target/release/dt-story add-task "$STORY" \
 Emitting the manifest is not the same as having emitted it, exactly as setting a redirect is not the same as being redirected (R-1's own principle, applied to this skill). Both checks must pass before the story is reported Ready.
 
 ```bash
-target/release/dt-story validate "$STORY"          # 1. schema + semantic check
-target/release/dt-story list-tasks "$STORY" | jq -r '[.[].id] | @csv'   # 2. id-set check
+scripts/lib/tool-bins.sh dt-story validate "$STORY"          # 1. schema + semantic check
+scripts/lib/tool-bins.sh dt-story list-tasks "$STORY" | jq -r '[.[].id] | @csv'   # 2. id-set check
 ```
 
 1. **`validate` must exit 0.** It also rejects a zero-task manifest, which catches an emission that never got past the skeleton — that state otherwise *asserts the story is complete* (`next` exits 3 = AllDone).

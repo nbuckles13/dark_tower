@@ -42,6 +42,7 @@ use dt_guard::test_coverage;
 use dt_guard::test_registration;
 use dt_guard::test_rigidity;
 use dt_guard::todo_tracking;
+use dt_guard::tool_bin_paths;
 use dt_guard::ts_dev_trust;
 use dt_guard::ts_exports_map;
 use dt_guard::ts_metric_naming;
@@ -156,6 +157,18 @@ enum Command {
     /// `main.rs` for a module `lib.rs` also declares): that compiles the module
     /// and runs its unit tests twice.
     BinLibSingleCompile {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// Dev-tool binaries (dt-guard, dt-story) have one path home,
+    /// `scripts/lib/tool-bins.sh`: no literal tool-binary path or
+    /// profile-selecting tool build elsewhere, and its profile name exists in
+    /// Cargo.toml as a custom profile.
+    ToolBinPaths {
         /// Repository root for path resolution.
         #[arg(long)]
         root: PathBuf,
@@ -507,6 +520,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::BinLibSingleCompile { root, explain } => {
             bin_lib_single_compile::run(&root, explain)
         }
+        Command::ToolBinPaths { root, explain } => tool_bin_paths::run(&root, explain),
         Command::WorkspaceDeps { root, explain } => workspace_deps::run(&root, explain),
         Command::MediaTelemetryDeny { root, explain } => media_telemetry_deny::run(&root, explain),
         Command::MetricLabels { root, explain } => metric_labels::run(&root, explain),

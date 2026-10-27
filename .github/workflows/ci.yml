@@ -42,7 +42,7 @@ jobs:
         # Tools are keyed off explicit per-shard flags, never off `layers` contents. A
         # layer moved without its flag fails loudly (tool-not-found), never silently.
         include:
-          # L3's guards consume the release dt-guard/dt-story that L1's
+          # L3's guards consume the dev-tool dt-guard/dt-story that L1's
           # scripts/lang/rust/compile.sh builds, so 1 and 3 share a job.
           - shard: guards
             layers: "1,2,3,6,7"
@@ -194,7 +194,7 @@ jobs:
       # (ADR-0037 §D7 COLLAPSE) — no separate buf-setup-action install.
       #
       # No separate dt-guard/dt-story build here: Layer 3's guards consume
-      # target/release/{dt-guard,dt-story}, which scripts/lang/rust/compile.sh (Layer 1,
+      # DT_GUARD_BIN/DT_STORY_BIN (scripts/lib/tool-bins.sh), which scripts/lang/rust/compile.sh (Layer 1,
       # always-run) builds earlier in this same shard. A missing binary still fails Layer 3
       # loudly (scripts/guards/simple/_dt_guard_wrapper.sh), never skips.
 
@@ -449,9 +449,13 @@ jobs:
           # cargo-llvm-cov exported (not a hardcoded target/llvm-cov-target path).
           export DT_GUARD="${CARGO_LLVM_COV_TARGET_DIR:?}/debug/dt-guard"
           # Fail loudly rather than let the bash suites fall back to the
-          # uninstrumented target/release/dt-guard (rust-cache may restore it).
+          # uninstrumented dev-tool binary (DT_GUARD_BIN; rust-cache may restore it).
+          # Compared against the path tool-bins.sh resolves, never a retyped literal,
+          # so a profile/path move cannot make this check vacuous.
           [ -n "${DT_GUARD}" ] && [ -x "${DT_GUARD}" ] || { echo "::error::instrumented DT_GUARD missing or not executable: ${DT_GUARD}"; exit 1; }
-          [ "${DT_GUARD}" != "${PWD}/target/release/dt-guard" ] || { echo "::error::DT_GUARD points at the uninstrumented release binary"; exit 1; }
+          # shellcheck source=/dev/null
+          source scripts/lib/tool-bins.sh
+          [ "$(realpath -m "${DT_GUARD}")" != "$(realpath -m "${DT_GUARD_BIN}")" ] || { echo "::error::DT_GUARD points at the uninstrumented dev-tool binary ${DT_GUARD_BIN}"; exit 1; }
 
           # SSoT: derive the suite list (the script fails on drift/floor). set -e
           # catches its non-zero exit BEFORE we read the file.
@@ -469,7 +473,7 @@ jobs:
             if DT_GUARD="${DT_GUARD}" bash "${s}"; then :; else rc=1; fi
             after=$(find "${PROFRAW_DIR}" -maxdepth 1 -name '*.profraw' | wc -l)
             if [ "${after}" -le "${before}" ]; then
-              echo "::error::${s} produced NO new profraw (${before} -> ${after}) — the binary under DT_GUARD was not instrumented (did DT_GUARD resolve to the plain target/release/dt-guard?)"
+              echo "::error::${s} produced NO new profraw (${before} -> ${after}) — the binary under DT_GUARD was not instrumented (did DT_GUARD resolve to the uninstrumented dev-tool binary ${DT_GUARD_BIN}?)"
               rc=1
             fi
           done

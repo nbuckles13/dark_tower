@@ -20,9 +20,10 @@
 //! v1 file would silently become v2-marked on the first `complete`. The
 //! reason a required-field removal (`branch`, 2026-08-17) needs no bump is
 //! that there is no version skew to support: one producer, all consumers
-//! in-tree, and `preflight-story.sh` requires a `target/release/dt-story`
-//! built from the same tree. Read "v1" as a discriminator for the block, not
-//! as a compatibility promise the code is able to keep.
+//! in-tree, and `preflight-story.sh` requires a dt-story binary
+//! (`DT_STORY_BIN`, `scripts/lib/tool-bins.sh`) built from the same tree.
+//! Read "v1" as a discriminator for the block, not as a compatibility
+//! promise the code is able to keep.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};

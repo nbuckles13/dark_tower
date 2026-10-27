@@ -191,6 +191,17 @@ lto = true
 codegen-units = 1
 strip = true
 
+# Dev-tool binaries (dt-guard, dt-story): the guard/story-runner tooling the validation
+# pipeline builds on every run. Release's fat LTO + 1 codegen unit is tuned for the
+# shipped services and made a dt-guard rebuild cost ~19-33s (cold 38s) for no benefit to
+# a tool whose runtime is ~3s either way; this profile keeps opt-level 3 and drops LTO.
+# The profile NAME has one other home, scripts/lib/tool-bins.sh (DT_TOOLS_PROFILE), which
+# derives every binary path from it; `dt-guard tool-bin-paths` fails on drift between them.
+[profile.devtools]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 [profile.dev]
 opt-level = 0
 debug = true

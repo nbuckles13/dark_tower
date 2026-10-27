@@ -60,7 +60,7 @@ matches = glob("docs/user-stories/*{slug}.md")     # suffix match; exact form al
 **Read task state from the `dt-story` manifest** — never from a markdown table. Per ADR-0035 §4 the manifest is the only home for task status and the devloop-output slug.
 
 ```bash
-target/release/dt-story list-tasks docs/user-stories/{story-file}.md
+scripts/lib/tool-bins.sh dt-story list-tasks docs/user-stories/{story-file}.md
 ```
 
 **Use `list-tasks`, NOT `next`.** `next` mutates on exactly one path — selecting an escalated task reopens it (status back to `pending`, `escalation` cleared, file rewritten) — and that path is reachable **precisely when the completeness check would fail**. A completeness probe built on `next` is therefore safe only when it passes and destructive when it fails, which is the inverse of what an audit gate must be: it would erase the record that a task was escalated at the exact moment someone is auditing the story, and Phase 3 stages `docs/user-stories/`, so the mutation would ride into a commit. `list-tasks` is read-only.
@@ -80,7 +80,7 @@ already closed and re-closing is not supported.
 **Completeness check**: every task's `status` MUST be **positively** `completed`.
 
 ```bash
-target/release/dt-story list-tasks "$STORY" | jq -e 'length > 0 and all(.[]; .status == "completed")'
+scripts/lib/tool-bins.sh dt-story list-tasks "$STORY" | jq -e 'length > 0 and all(.[]; .status == "completed")'
 ```
 
 Assert `completed` positively — do **not** test for the absence of `pending`. `Status` has **three** variants, so `all(.status != "pending")` silently passes a story with an **escalated** task, which is strictly weaker than the check this replaces. Otherwise escalate:
@@ -109,7 +109,7 @@ That literal is pinned to `manifest::SLUG_PATTERN` (the canonical class, enforce
 - **Some do, but this task does not** → a live recording failure. **Hard-fail**, naming the task id, the runner's corresponding `STORY_RUN: NO-SLUG task=N cause=...` line, and the repair:
 
   ```
-  target/release/dt-story complete docs/user-stories/{story}.md {id} --slug {slug}
+  scripts/lib/tool-bins.sh dt-story complete docs/user-stories/{story}.md {id} --slug {slug}
   ```
 
   That gesture works on an already-completed task (slug is last-writer-wins), so it repairs the record in place.

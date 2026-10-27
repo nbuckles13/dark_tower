@@ -58,6 +58,7 @@ pub mod test_coverage;
 pub mod test_registration;
 pub mod test_rigidity;
 pub mod todo_tracking;
+pub mod tool_bin_paths;
 pub mod ts_dev_trust;
 pub mod ts_exports_map;
 pub mod ts_metric_naming;

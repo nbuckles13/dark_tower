@@ -121,12 +121,13 @@ resolve_run_base() {
 # scripts/lang/<lang>/audit-remediation.md, docs/user-stories/*,
 # docs/devloop-outputs/*, .devloop-escalation.json, audit-suppressions.toml.
 # So the root redirect SUBSUMES three of the five. The single exception is
-# target/release/dt-story — a BUILT ARTIFACT that must keep pointing at the real
+# the dt-story binary (DT_STORY_BIN, scripts/lib/tool-bins.sh) — a BUILT ARTIFACT that must keep pointing at the real
 # binary while the tree moves, which is the whole reason it needs its own seam.
 # DO NOT add a third seam for a path that is already CWD-relative.
 #
 #   STORY_REPO_ROOT — repo root override (default: BASH_SOURCE-derived)
-#   DT_STORY        — dt-story binary override (default: target/release/dt-story)
+#   DT_STORY        — dt-story binary override (default: DT_STORY_BIN from
+#                     scripts/lib/tool-bins.sh, sourced from REAL_REPO_ROOT)
 #
 # DEVLOOP_TMP is NOT a seam. It is a PRE-EXISTING redirect (see RUN_DIR /
 # RUN_BASE below) that predates this block; the sentinel adds a CONSTRAINT on
@@ -355,12 +356,18 @@ if __test_sentinel_active; then __seam_assert_run_dir_isolated; fi
 
 # dt-story binary. SEAM (see the header): a BUILT ARTIFACT that must NOT move
 # with the tree, which is why the root redirect cannot cover it.
-# Deliberately NOT written as "${DT_STORY:-target/release/dt-story}": that form
+# Deliberately NOT written as "${DT_STORY:-$DT_STORY_BIN}": that form
 # would silently honor an ambient DT_STORY with no sentinel and no fail-loud —
 # and this variable selects the binary that executes `complete` and `escalate`
 # against the real manifest. The (2) guard above is the only thing between an
-# inherited env var and that.
-DT_STORY="target/release/dt-story"
+# inherited env var and that. tool-bins.sh is sourced from REAL_REPO_ROOT (the
+# BASH_SOURCE-derived tree), never from the seam-redirectable REPO_ROOT, so a
+# fixture tree's copy can never be the one that runs; it assigns unconditionally
+# and reads no env var, so sourcing it cannot reopen this gate. Its path is
+# absolute, so the `cd` below does not move it.
+# shellcheck source=../lib/tool-bins.sh
+source "${REAL_REPO_ROOT}/scripts/lib/tool-bins.sh"
+DT_STORY="$DT_STORY_BIN"
 
 # TWO SLUG CLASSES, deliberately different, each named so neither drifts and
 # neither gets "helpfully" unified into the other.
@@ -657,7 +664,7 @@ slog "STORY_RUN: RUN-DIR ${RUN_DIR} source=${__run_dir_source}"
 if [ -n "$STOP_AFTER" ]; then
   if ! stop_tasks_json="$("$DT_STORY" list-tasks "$STORY_FILE" 2>/dev/null)" \
      || [ -z "$stop_tasks_json" ]; then
-    slogerr "STORY_RUN: STOP-AFTER-UNVERIFIABLE — '${DT_STORY} list-tasks' could not answer, so --stop-after cannot be validated. Causes: dt-story not built, a stale binary predating the 'list-tasks' verb, or an unparseable manifest. To tell them apart run: ${DT_STORY} validate ${STORY_FILE} — green means the binary is stale (cargo build --release -p dt-guard -p dt-story), red means the manifest is."
+    slogerr "STORY_RUN: STOP-AFTER-UNVERIFIABLE — '${DT_STORY} list-tasks' could not answer, so --stop-after cannot be validated. Causes: dt-story not built, a stale binary predating the 'list-tasks' verb, or an unparseable manifest. To tell them apart run: ${DT_STORY} validate ${STORY_FILE} — green means the binary is stale (rebuild: ${DT_TOOLS_BUILD_CMD}), red means the manifest is."
     exit 2
   fi
   # Branch on jq's rc for the same reason as stop_blockers below: empty is
@@ -668,7 +675,7 @@ if [ -n "$STOP_AFTER" ]; then
   # own contract.
   if ! stop_status="$(jq -r --argjson id "$STOP_AFTER" \
       '.[] | select(.id == $id) | .status' <<<"$stop_tasks_json" 2>&1)"; then
-    slogerr "STORY_RUN: STOP-AFTER-UNVERIFIABLE — could not read task status from '${DT_STORY} list-tasks' output while validating --stop-after=${STOP_AFTER}: ${stop_status}. The binary exited 0 with output that is not the JSON array its contract declares; rebuild with cargo build --release -p dt-guard -p dt-story and investigate."
+    slogerr "STORY_RUN: STOP-AFTER-UNVERIFIABLE — could not read task status from '${DT_STORY} list-tasks' output while validating --stop-after=${STOP_AFTER}: ${stop_status}. The binary exited 0 with output that is not the JSON array its contract declares; rebuild with ${DT_TOOLS_BUILD_CMD} and investigate."
     exit 2
   fi
   if [ -z "$stop_status" ]; then
@@ -1963,7 +1970,7 @@ while :; do
   #       slug class whose drift was silent. security(exit-2) vs ops(full+warn)
   #       was resolved to exit-2 (fail-loud beats masking a stale environment).
   if ! [[ "$tier" =~ ^(full|light)$ ]]; then
-    slogerr "STORY_RUN: INVALID-TIER task=${id} — tier '${tier}' is not 'full' or 'light'. A tier of 'null' means a STALE dt-story that predates the tier field (rebuild: cargo build --release -p dt-guard -p dt-story); any other value is a malformed manifest.tier the serde enum manifest::Tier should have rejected. Not coercing to full — that would mask the fault."
+    slogerr "STORY_RUN: INVALID-TIER task=${id} — tier '${tier}' is not 'full' or 'light'. A tier of 'null' means a STALE dt-story that predates the tier field (rebuild: ${DT_TOOLS_BUILD_CMD}); any other value is a malformed manifest.tier the serde enum manifest::Tier should have rejected. Not coercing to full — that would mask the fault."
     exit 2
   fi
   prompt_file="$RUN_DIR/task-${id}.prompt"

@@ -10,45 +10,10 @@
 //! untracked `docs/devloop-outputs/x/main.md` (carrying the plan table) plus
 //! the untracked drift files appear via `git ls-files --others`.
 
-#![expect(
-    clippy::panic,
-    reason = "integration-test fixture helper (`git`) outside a #[test] fn; a git command that fails to spawn or exits non-zero MUST abort loudly rather than degrade to a vacuous pass (ADR-0002 test carve-out, clippy.toml §Integration tests)"
-)]
-
 mod common;
 
-use common::{assert_clean, assert_parity, run_all, Case, Expect};
+use common::{assert_clean, assert_parity, git, run_all, Case, Expect};
 use std::path::Path;
-use std::process::Command;
-
-/// Run `git` in `root` hermetically: explicit identity, no global/system
-/// config, no signing, pinned default branch. Aborts loudly on failure.
-fn git(root: &Path, args: &[&str]) {
-    let mut full: Vec<&str> = vec![
-        "-c",
-        "user.name=dt-guard-e2e",
-        "-c",
-        "user.email=dt-guard-e2e@example.invalid",
-        "-c",
-        "commit.gpgsign=false",
-        "-c",
-        "init.defaultBranch=main",
-    ];
-    full.extend_from_slice(args);
-    let out = Command::new("git")
-        .current_dir(root)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args(&full)
-        .output()
-        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
-    assert!(
-        out.status.success(),
-        "git {args:?} failed:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
 
 /// `git init` + a committed baseline so HEAD exists (the dirty-tree branch of
 /// `get_active_edit_paths` diffs against HEAD).

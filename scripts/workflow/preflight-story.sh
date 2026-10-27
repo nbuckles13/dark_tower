@@ -24,6 +24,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
+# The one home for the dev-tool binary paths + recovery command. Sourced from this
+# script's own tree (BASH_SOURCE-derived), never from an inherited variable. No env
+# override is read for the dt-story path here — same rule as run-story.sh's DT_STORY.
+# shellcheck source=../lib/tool-bins.sh
+source "${REPO_ROOT}/scripts/lib/tool-bins.sh"
 
 STORY_FILE="${1:?usage: preflight-story.sh <story-file.md>}"
 fail() { echo "PREFLIGHT: FAIL $*" >&2; exit 2; }
@@ -64,7 +69,7 @@ fi
 command -v claude >/dev/null 2>&1 || fail "claude CLI not found"
 command -v jq >/dev/null 2>&1 || fail "jq not found"
 # Guard binaries. ONE check naming ONE command, deliberately: the old line named
-# only `-p dt-story`, which steers operators into the built-the-wrong-subset
+# only the dt-story crate, which steers operators into the built-the-wrong-subset
 # state, and a second half-command beside it would move that trap one line over
 # rather than close it. dt-guard matters here because ~15 always-run Layer-3
 # wrappers consume it and exit 1 when it is missing — which reaches the runner's
@@ -75,16 +80,16 @@ command -v jq >/dev/null 2>&1 || fail "jq not found"
 # Layer 3 consumed them. It is still right — every task's gate depends on
 # dt-guard, and asserting a dependency at start beats discovering it at Layer 3
 # on the wrong lane — so do not "fix" the strictness.
-[ -x target/release/dt-story ] && [ -x target/release/dt-guard ] \
-  || fail "guard binaries not built (cargo build --release -p dt-guard -p dt-story)"
+[ -x "$DT_STORY_BIN" ] && [ -x "$DT_GUARD_BIN" ] \
+  || fail "guard binaries not built at ${DT_TOOLS_DIR} (run: ${DT_TOOLS_BUILD_CMD})"
 [ -f "$STORY_FILE" ] || fail "story file not found: ${STORY_FILE}"
 
 # Two causes, named, because the bare "story manifest invalid" sent readers
 # hunting a manifest bug for what was a stale binary — and after the 2026-08-17
 # `branch` removal a STALE BINARY MEETING A BRANCH-LESS MANIFEST is the most
 # likely cause of this message. Mirrors the shape run-story.sh already uses.
-target/release/dt-story validate "$STORY_FILE" \
-  || fail "story manifest invalid (see dt-story's stderr above for the violations). TWO CAUSES, and the error text distinguishes them: (1) the manifest genuinely violates the schema — fix ${STORY_FILE}; or (2) target/release/dt-story is STALE and disagrees with the manifest's schema — rebuild with 'cargo build --release -p dt-guard -p dt-story'. An unknown-field error naming a field the current schema does not have (e.g. 'branch') is always cause 2."
+"$DT_STORY_BIN" validate "$STORY_FILE" \
+  || fail "story manifest invalid (see dt-story's stderr above for the violations). TWO CAUSES, and the error text distinguishes them: (1) the manifest genuinely violates the schema — fix ${STORY_FILE}; or (2) ${DT_STORY_BIN} is STALE and disagrees with the manifest's schema — rebuild with '${DT_TOOLS_BUILD_CMD}'. An unknown-field error naming a field the current schema does not have (e.g. 'branch') is always cause 2."
 
 # Capability probe: assert the VERBS consumed, not the artifacts hoped for.
 # `[ -x ]` proves existence, not currency — a dt-story predating the `list-tasks`
@@ -106,9 +111,9 @@ target/release/dt-story validate "$STORY_FILE" \
 # carries a JSON array on stdout, so rc-0-with-empty-stdout is a state that
 # contract says cannot occur. That guarantee is per-verb, not crate-wide —
 # `validate` and `complete` both legitimately exit 0 with empty stdout.
-target/release/dt-story list-tasks --help >/dev/null 2>&1 \
-  || fail "target/release/dt-story is STALE — it has no 'list-tasks' verb, which --stop-after validation depends on (cargo build --release -p dt-guard -p dt-story)"
-lt_out="$(target/release/dt-story list-tasks "$STORY_FILE")" \
+"$DT_STORY_BIN" list-tasks --help >/dev/null 2>&1 \
+  || fail "${DT_STORY_BIN} is STALE — it has no 'list-tasks' verb, which --stop-after validation depends on (run: ${DT_TOOLS_BUILD_CMD})"
+lt_out="$("$DT_STORY_BIN" list-tasks "$STORY_FILE")" \
   || fail "dt-story list-tasks failed on ${STORY_FILE} despite validate passing — investigate before running the story"
 [ -n "$lt_out" ] \
   || fail "dt-story list-tasks exited 0 with EMPTY stdout, which its contract (see the list-tasks bullet in crates/dt-story/src/main.rs's module doc) says cannot happen — the binary and its declared contract disagree; rebuild and investigate"

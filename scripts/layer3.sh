@@ -111,6 +111,10 @@ layer_lifecycle_begin 3
   # STORY_REPO_ROOT/DT_STORY seams; stub claude/sleep/date, real git, real
   # dt-story. No cluster, no network, no real sessions.
   run_and_emit "run-story-selftest" "${__here}/workflow/run-story.test.sh" || true
+  # Dev-tool binary home (scripts/lib/tool-bins.sh): source-safety, unconditional
+  # assignments, crate allow-list, pinned --target-dir, stale release-profile binary
+  # removal, exec-mode missing-binary token. Hermetic — fake root + PATH-stubbed cargo.
+  run_and_emit "tool-bins-selftest" "${__here}/lib/tool-bins.test.sh" || true
   # Guard-runner self-test (fast-fail-guards devloop): pins run-guards.sh's timeout
   # emission + the violation/timeout counter split + the ladder-mirror exit precedence
   # (PRECONDITION>0 → exit 2 dominant), all via a PATH-stubbed `timeout` (hermetic, no real

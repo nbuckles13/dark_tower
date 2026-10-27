@@ -136,7 +136,9 @@ source "${__here}/../lang/_test_helpers.sh"
 
 RUN_STORY="${__here}/run-story.sh"
 STOP_HOOK="${__here}/devloop-stop-hook.sh"
-REAL_DT_STORY="${REAL_REPO_ROOT}/target/release/dt-story"
+# shellcheck source=../lib/tool-bins.sh
+source "${REAL_REPO_ROOT}/scripts/lib/tool-bins.sh"
+REAL_DT_STORY="$DT_STORY_BIN"
 
 # The runner exits 1 and 2 on most cases here; set -e must NOT abort the
 # harness on a captured non-zero. report_results provides the final exit code.
@@ -147,11 +149,11 @@ set +e
 # is worse, because it reports green. Layer 1 builds dt-story, but layer3.sh is
 # routinely run standalone.
 if [ ! -x "$REAL_DT_STORY" ]; then
-  printf 'run-story.test.sh: PRECONDITION — dt-story not built but the runner suite needs it (cargo build --release -p dt-guard -p dt-story)\n' >&2
+  printf 'run-story.test.sh: PRECONDITION — dt-story not built at %s but the runner suite needs it (run: %s)\n' "$REAL_DT_STORY" "$DT_TOOLS_BUILD_CMD" >&2
   exit 2
 fi
 if ! "$REAL_DT_STORY" list-tasks --help >/dev/null 2>&1; then
-  printf 'run-story.test.sh: PRECONDITION — target/release/dt-story is STALE (no `list-tasks` verb; --stop-after validation depends on it). Rebuild: cargo build --release -p dt-guard -p dt-story\n' >&2
+  printf 'run-story.test.sh: PRECONDITION — %s is STALE (no `list-tasks` verb; --stop-after validation depends on it). Rebuild: %s\n' "$REAL_DT_STORY" "$DT_TOOLS_BUILD_CMD" >&2
   exit 2
 fi
 
@@ -821,6 +823,15 @@ for sentinel in "" "0" "false" "yes"; do
   assert_status    "${label}-token" "SEAM-OVERRIDE-WITHOUT-TEST-SENTINEL" "$OUTPUT"
   assert_no_marker "${label}-no-preflight" "$MARK" 'ran.*'
 done
+# A2: an ambient DT_STORY ALONE (no sentinel, no root override). run-story now
+# takes its default from scripts/lib/tool-bins.sh; this pins that sourcing it did
+# not turn the DT_STORY seam into an honoured env default — the override is still
+# refused, before any work, rather than selecting the binary that runs
+# `complete`/`escalate`. (STORY_REPO_ROOT= empty is "absent" to the runner.)
+run_story DEVLOOP_TEST= STORY_REPO_ROOT= DT_STORY=/bogus/dt-story -- fixture
+assert_exit      "a2-ambient-dt-story-only-exit2" 2 "$RC"
+assert_status    "a2-ambient-dt-story-only-token" "SEAM-OVERRIDE-WITHOUT-TEST-SENTINEL" "$OUTPUT"
+assert_no_marker "a2-ambient-dt-story-only-no-preflight" "$MARK" 'ran.*'
 
 # =============================================================================
 # (B) CONTAINMENT — both halves  (R-1)

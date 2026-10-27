@@ -30,7 +30,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=../lang/_test_helpers.sh
 source "${REPO_ROOT}/scripts/lang/_test_helpers.sh"
 
-DT_GUARD="${DT_GUARD:-${REPO_ROOT}/target/release/dt-guard}"
+# shellcheck source=../lib/tool-bins.sh
+source "${REPO_ROOT}/scripts/lib/tool-bins.sh"
+DT_GUARD="${DT_GUARD:-$DT_GUARD_BIN}"
 if [[ ! -x "$DT_GUARD" ]]; then
   printf '  - [precondition] dt-guard binary missing or not executable at %s\n' "$DT_GUARD"
   printf '\n%s: 0 passed, 1 failed\n' "$0"
