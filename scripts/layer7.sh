@@ -10,6 +10,41 @@
 #      the browser suite with a loud stderr note — fixing the Rust failures comes first;
 #      the browser suite runs on the retry).
 #
+# NEVER CONCURRENTLY ON ONE CLUSTER (analysed 2026-10-26 when CI time was the motive; do not
+# "parallelise" Phase 2 without re-reading this). The two suites share pods, and the overlap
+# is not benign in either direction:
+#   * env-test S9 (crates/env-tests/tests/28_mh_egress_admission.rs) deliberately drives one
+#     MH past its stream ceiling for up to ADMISSION_BOUND. Meanwhile GC drops that handler
+#     from new-meeting placement (gc-service mc_assignment.rs, `current_streams <
+#     max_streams`) and MH refuses new streams — so a browser meeting started then gets one
+#     handler (partial-connectivity S10a needs two) or refused streams (the multi-party
+#     specs), i.e. a flaky browser FAIL billed to the diff.
+#   * the browser suite proves server-side effects by MC-wide counter rises
+#     (packages/web-app/e2e/mcMetrics.ts): mc_session_join_failures_total{jwt_validation},
+#     mc_participant_mh_status_total, mc_participant_leaves_total. The Rust suite drives the
+#     SAME series (24_join_flow.rs test_mc_rejects_invalid_meeting_token, 26_mh_quic.rs
+#     Scenario 7, every teardown), so concurrent runs turn those proofs into false greens.
+# The supported way to overlap them is ONE SUITE PER CLUSTER: the CI-only DEVLOOP_LAYER7_SUITE
+# selector below, one CI job per suite, each with its own Kind cluster.
+#
+# SUITE SELECTOR — DEVLOOP_LAYER7_SUITE=<one of LAYER7_SUITES in lang/_common.sh:
+# env-tests | browser-e2e>. Unset/empty = BOTH suites, exactly as described above (every
+# devloop, run-story and local caller). Set = ONLY that suite's Phase-1 preconditions and
+# Phase-2 run; the other suite's are not touched (env-tests: no 1g dev-cert / Chromium /
+# media-codec-profile checks; browser-e2e: no 1i MH gRPC forwards, no env-test build/run). All
+# shared Phase-1 steps (gate, provision, deploy, health, observability, per-run org) still run.
+#   TRUST BOUNDARY: it narrows what Layer 7 VALIDATES, so it is a validation-disable lever,
+#   and it is refused (PRECONDITION_FAILURE, exit 2) unless GITHUB_ACTIONS is set and
+#   DEVLOOP_FMT_CHECK_ONLY is not — the same convenience gate as layer-all.sh `--layers`.
+#   GITHUB_ACTIONS is trivially settable, so the gate is NOT what keeps a subset from passing
+#   as full Layer 7; three structural facts are: (1) layer-all.sh refuses the variable outside
+#   `--layers` shard mode, and shard mode writes no Gate-2 verdict; (2) `--aggregate` requires
+#   the layer-7 shards' SUITE= fields to cover LAYER7_SUITES exactly; (3) a subset run emits
+#   `STATUS=OK REASON=subset-<suite>-only` FIRST, so the layer's LAYER= line names the subset.
+#   Deliberately NOT a DEVLOOP_TEST-gated seam: it redirects and executes nothing, and
+#   DEVLOOP_TEST can never be set in CI, where it is needed.
+#   An unknown value is PRECONDITION_FAILURE layer7-suite-invalid (never a silent "run both").
+#
 # ALWAYS-RUN (ADR-0033 §3; user ruling 2026-06-26, task #56): Layer 7 attempts the
 # env-test suite on every devloop regardless of diff surface — business-logic changes
 # can break integration even when no infra/proto file is touched. The ONLY clean SKIP is
@@ -22,12 +57,15 @@
 # FOUR terminal lanes, each a STATUS line through the lifecycle (the browser suite adds
 # REASON tokens — browser-e2e-passed / browser-e2e-failed / dev-certs-missing /
 # playwright-browser-missing / media-codec-profile-unresolved / browser-vp8-unsupported —
+# and the selector adds subset-<suite>-only / layer7-suite-invalid / layer7-suite-outside-ci —
 # but NO new lanes):
 #   SKIPPED-NO-CLUSTER (exit 0) — socket ABSENT + `GITHUB_ACTIONS` set (CI, no cluster, not
 #                                 provisionable). The ONLY clean-skip case; below OK. A
 #                                 PRESENT socket runs even in CI (forward-compatible).
 #   OK                 (exit 0) — every suite that ran was green (both the Rust env-tests
-#                                 and the browser E2E, which now always runs).
+#                                 and the browser E2E, which now always runs — or, in a
+#                                 CI shard, the one DEVLOOP_LAYER7_SUITE names, preceded by
+#                                 `REASON=subset-<suite>-only`).
 #   FAIL               (exit 1) — IMPLEMENTER lane: a suite returned non-zero on a
 #                                 confirmed-healthy cluster (the diff's problem), OR
 #                                 `provision`/`deploy` failed on the TREE
@@ -182,7 +220,8 @@ BROWSER_E2E_TIMEOUT="${DEVLOOP_BROWSER_E2E_TIMEOUT:-1500}"
 # was RETIRED: gate coverage is now independent of change-detection, so the browser E2E
 # suite runs on every Layer-7 run, exactly like the Rust env-tests. It stays subject to
 # its Phase-1g preconditions (dev-cert fingerprints + Playwright Chromium) and to the
-# sequential-after-Rust / env-red-skips-browser-this-attempt discipline below. There is no
+# sequential-after-Rust / env-red-skips-browser-this-attempt discipline below (and, in a CI
+# shard only, to the DEVLOOP_LAYER7_SUITE selector — header §SUITE SELECTOR). There is no
 # longer a "no diff" case for the browser suite, so the SKIPPED-NO-DIFF browser-e2e-no-diff
 # lane is gone.
 
@@ -199,6 +238,36 @@ BROWSER_E2E_TIMEOUT="${DEVLOOP_BROWSER_E2E_TIMEOUT:-1500}"
 # Args: (none)  Returns: 0 if the helper socket is present, 1 otherwise.
 __env_test_cluster_available() {
   [[ -S "$DEVLOOP_HELPER_SOCKET" ]]
+}
+
+# The DEVLOOP_LAYER7_SUITE selection, resolved once by __layer7_resolve_suite (empty = all).
+__LAYER7_SUITE=""
+
+# True iff suite $1 runs in this invocation (always, when no subset is selected).
+# Args: $1=suite name from LAYER7_SUITES  Returns: 0 if it runs, 1 otherwise.
+__suite_selected() {
+  [[ -z "$__LAYER7_SUITE" || "$__LAYER7_SUITE" == "$1" ]]
+}
+
+# Validate DEVLOOP_LAYER7_SUITE and its trust boundary (header §SUITE SELECTOR), before any
+# cluster work. Unset/empty: no-op, both suites. Otherwise exactly one LAYER7_SUITES name,
+# under GITHUB_ACTIONS and outside an attesting (DEVLOOP_FMT_CHECK_ONLY) run — else the
+# operator lane, loudly. Sets __LAYER7_SUITE.
+__layer7_resolve_suite() {
+  local sel="${DEVLOOP_LAYER7_SUITE:-}"
+  [[ -n "$sel" ]] || return 0
+  if ! layer7_suite_known "$sel"; then
+    precondition_fail layer7-suite-invalid \
+      "DEVLOOP_LAYER7_SUITE=${sel@Q} is not a Layer-7 suite (valid: ${LAYER7_SUITES[*]}; unset = all)" \
+      "set exactly one suite name, or unset it to run every suite"
+  fi
+  if [[ -z "${GITHUB_ACTIONS:-}" || -n "${DEVLOOP_FMT_CHECK_ONLY:-}" ]]; then
+    precondition_fail layer7-suite-outside-ci \
+      "DEVLOOP_LAYER7_SUITE=${sel} narrows Layer 7 to one suite, which is allowed only in a CI shard (GITHUB_ACTIONS set, not an attesting DEVLOOP_FMT_CHECK_ONLY run) — a devloop / run-story / local Layer 7 runs every suite" \
+      "unset DEVLOOP_LAYER7_SUITE"
+  fi
+  __LAYER7_SUITE="$sel"
+  printf 'Layer7: LAYER7_SUITE=%s — CI shard: ONLY this suite runs here; the other Layer-7 suite(s) are NOT run by this invocation. Layer 7 is complete only with its sibling shard(s), which layer-all.sh --aggregate proves.\n' "$sel" >&2
 }
 
 # -----------------------------------------------------------------------------
@@ -1090,6 +1159,8 @@ __layer7_main() {
   # _get_base_ref.sh for its (retired) diff arms, which created it as a side effect; with no
   # diff inspection left, create it explicitly (layer-all.sh does too; a standalone run must).
   init_devloop_tmp
+  # Suite selector FIRST: a refused or invalid selection must not spend a cluster bring-up.
+  __layer7_resolve_suite
 
   # --- Environment / cluster gate (FAIL-CLOSED) -------------------------------
   # The clean-skip lane (SKIPPED-NO-CLUSTER, exit 0) is reachable ONLY when a cluster is
@@ -1128,6 +1199,14 @@ __layer7_main() {
     precondition_fail local-helper-not-running \
       "no devloop helper socket at ${DEVLOOP_HELPER_SOCKET} and this is not CI — a local devloop expects a running cluster" \
       "start the devloop cluster (run devloop.sh on the host); to run only layers 1-6 invoke the individual scripts/layerN.sh"
+  fi
+
+  # Subset visibility (header §SUITE SELECTOR, fact 3). Emitted AFTER the gate, deliberately:
+  # every path from here ends OK / FAIL / PRECONDITION_FAILURE, so this OK can never out-rank
+  # the SKIPPED-NO-CLUSTER skip above (OK ranks above it). Emitted BEFORE every other status,
+  # so on a green subset run the LAYER= line's REASON is this token, not a suite's -passed.
+  if [[ -n "$__LAYER7_SUITE" ]]; then
+    emit_status OK "subset-${__LAYER7_SUITE}-only" | tee_collect_statuses
   fi
 
   # ======================= PHASE 1 — pre-suite (operator lane) ===============
@@ -1460,36 +1539,42 @@ __layer7_main() {
   #     requirement forbids). AC/GC/Prometheus reachability is deliberately NOT re-checked
   #     here: steps (e)/(f) above already confirmed the very endpoints the browser suite's
   #     global-setup probes (same ports.json-derived URLs — see the Phase-2 export).
-  t_step=$(layer_now)
-  # WebTransport cert fingerprints: without BOTH pinned hashes the browser refuses the
-  # MC/MH self-signed certs (serverCertificateHashes) and every join spec can only time
-  # out at the handshake. Writer: scripts/generate-dev-certs.sh; same canonical keys the
-  # Vite loader (packages/web-app/vite/fingerprints.ts) and the suite's global-setup read.
-  if ! jq -e '(.MC_CERT_SHA256 // "" | length > 0) and (.MH_CERT_SHA256 // "" | length > 0)' \
-      "$BROWSER_E2E_FINGERPRINTS" >/dev/null 2>&1; then
-    precondition_fail dev-certs-missing \
-      "WebTransport dev cert fingerprints missing/incomplete at ${BROWSER_E2E_FINGERPRINTS} (need MC_CERT_SHA256 + MH_CERT_SHA256) — the browser cannot pin the MC/MH certs, so the browser E2E suite would only time out" \
-      "run scripts/generate-dev-certs.sh on the host, then restart the Vite dev server if one is running (fingerprints are read at Vite config time)"
+  #     Skipped ONLY when a CI shard selects DEVLOOP_LAYER7_SUITE=env-tests (header §SUITE
+  #     SELECTOR): these are facts about the browser suite alone, and that shard never runs it.
+  if __suite_selected browser-e2e; then
+    t_step=$(layer_now)
+    # WebTransport cert fingerprints: without BOTH pinned hashes the browser refuses the
+    # MC/MH self-signed certs (serverCertificateHashes) and every join spec can only time
+    # out at the handshake. Writer: scripts/generate-dev-certs.sh; same canonical keys the
+    # Vite loader (packages/web-app/vite/fingerprints.ts) and the suite's global-setup read.
+    if ! jq -e '(.MC_CERT_SHA256 // "" | length > 0) and (.MH_CERT_SHA256 // "" | length > 0)' \
+        "$BROWSER_E2E_FINGERPRINTS" >/dev/null 2>&1; then
+      precondition_fail dev-certs-missing \
+        "WebTransport dev cert fingerprints missing/incomplete at ${BROWSER_E2E_FINGERPRINTS} (need MC_CERT_SHA256 + MH_CERT_SHA256) — the browser cannot pin the MC/MH certs, so the browser E2E suite would only time out" \
+        "run scripts/generate-dev-certs.sh on the host, then restart the Vite dev server if one is running (fingerprints are read at Vite config time)"
+    fi
+    # Playwright Chromium: same location the runner itself resolves (PLAYWRIGHT_BROWSERS_PATH).
+    if ! compgen -G "${PLAYWRIGHT_BROWSERS_DIR}/chromium*" >/dev/null; then
+      precondition_fail playwright-browser-missing \
+        "no Playwright Chromium installation under ${PLAYWRIGHT_BROWSERS_DIR} — the browser E2E suite cannot launch a browser" \
+        "run 'pnpm exec playwright install chromium' (the devloop image is expected to bake it; see infra/devloop/Dockerfile)"
+    fi
+    # Story 3 R-28, the VP8 substrate probe's inputs. The verdict file is REMOVED first, so only
+    # this run's global-setup can write it (a stale one could otherwise route this run). Then the
+    # DEPLOYED profile is resolved and dumped — the probe runs at the profile the cluster directs,
+    # so INF-C's Kind test-profile patch is probed by construction. The probe itself runs in the
+    # browser suite's global-setup (Phase 2), FIRST: a pre-suite run here is impossible without a
+    # TS runner outside Playwright, and a Playwright run would trigger global-setup's cohort
+    # registration (AC budget). Residual, accepted: a substrate defect surfaces only after the
+    # Rust suite, and not at all on an attempt whose Rust suite fails.
+    rm -f "$VP8_VERDICT_FILE" "$MEDIA_CODEC_PROFILE_DUMP"
+    export E2E_VP8_VERDICT_FILE="$VP8_VERDICT_FILE"
+    __dump_media_codec_profile "$(__kind_context "$cluster_name")" "$MEDIA_CODEC_PROFILE_DUMP"
+    export E2E_MEDIA_CODEC_PROFILE_ENV="$MEDIA_CODEC_PROFILE_DUMP"
+    emit_step_duration browser-e2e-preconditions "$t_step"
+  else
+    printf 'Layer7: Phase-1g browser preconditions (dev certs, Chromium, media-codec-profile) NOT checked — browser-e2e is not selected (LAYER7_SUITE=%s).\n' "$__LAYER7_SUITE" >&2
   fi
-  # Playwright Chromium: same location the runner itself resolves (PLAYWRIGHT_BROWSERS_PATH).
-  if ! compgen -G "${PLAYWRIGHT_BROWSERS_DIR}/chromium*" >/dev/null; then
-    precondition_fail playwright-browser-missing \
-      "no Playwright Chromium installation under ${PLAYWRIGHT_BROWSERS_DIR} — the browser E2E suite cannot launch a browser" \
-      "run 'pnpm exec playwright install chromium' (the devloop image is expected to bake it; see infra/devloop/Dockerfile)"
-  fi
-  # Story 3 R-28, the VP8 substrate probe's inputs. The verdict file is REMOVED first, so only
-  # this run's global-setup can write it (a stale one could otherwise route this run). Then the
-  # DEPLOYED profile is resolved and dumped — the probe runs at the profile the cluster directs,
-  # so INF-C's Kind test-profile patch is probed by construction. The probe itself runs in the
-  # browser suite's global-setup (Phase 2), FIRST: a pre-suite run here is impossible without a
-  # TS runner outside Playwright, and a Playwright run would trigger global-setup's cohort
-  # registration (AC budget). Residual, accepted: a substrate defect surfaces only after the
-  # Rust suite, and not at all on an attempt whose Rust suite fails.
-  rm -f "$VP8_VERDICT_FILE" "$MEDIA_CODEC_PROFILE_DUMP"
-  export E2E_VP8_VERDICT_FILE="$VP8_VERDICT_FILE"
-  __dump_media_codec_profile "$(__kind_context "$cluster_name")" "$MEDIA_CODEC_PROFILE_DUMP"
-  export E2E_MEDIA_CODEC_PROFILE_ENV="$MEDIA_CODEC_PROFILE_DUMP"
-  emit_step_duration browser-e2e-preconditions "$t_step"
 
   # (i) MH gRPC port-forwards for the env-test suite (story 2 task 11). The MH teardown
   #     env-test calls each handler's gRPC directly (as the meeting-controller service
@@ -1501,28 +1586,33 @@ __layer7_main() {
   #     no procps, so a `pkill` here is a permanent silent no-op. The scan is narrowed to
   #     kubectl processes carrying THIS cluster's pod/mh- forward, so the helper's own svc/
   #     forwards are untouched. The new forwards are stopped on every exit path through the
-  #     lifecycle's cleanup hook.
-  t_step=$(layer_now)
-  local mh_n mh_port
-  __reap_stale_mh_forwards \
-    "--context $(__kind_context "$cluster_name") -n dark-tower port-forward --address 127.0.0.1 pod/mh-"
-  layer_register_cleanup __stop_mh_grpc_forwards
-  for mh_n in 0 1; do
-    # `// empty` + the -z check: a ports.json without this key is a DIFFERENT fault from a
-    # missing ports.json (ports-json-missing), so it gets its own token. The `|| mh_port=""`
-    # is the same device as step (h)'s one sanctioned `|| true`, for the same reason: without
-    # it a jq failure kills the layer under `set -e` with no STATUS line and no lane; with it
-    # the emptiness reaches the named lane two lines down. It swallows nothing.
-    mh_port="$(jq -r ".ports.mh_${mh_n}_grpc // empty" "$ENV_TEST_PORTS_JSON" 2>/dev/null)" \
-      || mh_port=""
-    if [[ -z "$mh_port" ]]; then
-      precondition_fail mh-grpc-port-unallocated \
-        "ports.json has no '.ports.mh_${mh_n}_grpc' — no local port is allocated for the mh-${mh_n} gRPC forward the MH teardown env-test needs" \
-        "re-run 'dev-cluster provision' so the helper rewrites /tmp/devloop/ports.json with a complete ports block; inspect it with: jq .ports /tmp/devloop/ports.json"
-    fi
-    __start_mh_grpc_forward "$mh_n" "$(__kind_context "$cluster_name")" "$mh_port"
-  done
-  emit_step_duration mh-grpc-forwards "$t_step"
+  #     lifecycle's cleanup hook. Skipped ONLY when a CI shard selects
+  #     DEVLOOP_LAYER7_SUITE=browser-e2e: the browser suite never reaches MH gRPC.
+  if __suite_selected env-tests; then
+    t_step=$(layer_now)
+    local mh_n mh_port
+    __reap_stale_mh_forwards \
+      "--context $(__kind_context "$cluster_name") -n dark-tower port-forward --address 127.0.0.1 pod/mh-"
+    layer_register_cleanup __stop_mh_grpc_forwards
+    for mh_n in 0 1; do
+      # `// empty` + the -z check: a ports.json without this key is a DIFFERENT fault from a
+      # missing ports.json (ports-json-missing), so it gets its own token. The `|| mh_port=""`
+      # is the same device as step (h)'s one sanctioned `|| true`, for the same reason: without
+      # it a jq failure kills the layer under `set -e` with no STATUS line and no lane; with it
+      # the emptiness reaches the named lane two lines down. It swallows nothing.
+      mh_port="$(jq -r ".ports.mh_${mh_n}_grpc // empty" "$ENV_TEST_PORTS_JSON" 2>/dev/null)" \
+        || mh_port=""
+      if [[ -z "$mh_port" ]]; then
+        precondition_fail mh-grpc-port-unallocated \
+          "ports.json has no '.ports.mh_${mh_n}_grpc' — no local port is allocated for the mh-${mh_n} gRPC forward the MH teardown env-test needs" \
+          "re-run 'dev-cluster provision' so the helper rewrites /tmp/devloop/ports.json with a complete ports block; inspect it with: jq .ports /tmp/devloop/ports.json"
+      fi
+      __start_mh_grpc_forward "$mh_n" "$(__kind_context "$cluster_name")" "$mh_port"
+    done
+    emit_step_duration mh-grpc-forwards "$t_step"
+  else
+    printf 'Layer7: Phase-1i MH gRPC forwards NOT started — env-tests is not selected (LAYER7_SUITE=%s); only the env-test suite uses them.\n' "$__LAYER7_SUITE" >&2
+  fi
 
   # ======================= PHASE 2 — run the suites (no grep) ================
   # Cluster is confirmed healthy. ANY non-zero from a suite is a test FAIL (exit 1,
@@ -1533,41 +1623,49 @@ __layer7_main() {
   # suppressions overrides. assert_no_ci_sentinel_leak (run at the top of layer-all.sh /
   # layer3.sh) hard-fails the pipeline if DEVLOOP_TEST leaks into CI, so this seam can never
   # redirect the real suite in production. Outside the test sentinel the override is ignored.
-  local -a env_test_cmd
-  if [[ "${DEVLOOP_TEST:-}" == "1" && -n "${DEVLOOP_ENV_TEST_CMD:-}" ]]; then
-    # Split on spaces only (IFS is \n\t here); the seam takes a simple command or a
-    # path to a fake suite script.
-    IFS=' ' read -r -a env_test_cmd <<<"$DEVLOOP_ENV_TEST_CMD"
-  else
-    # --no-fail-fast: one failing env-test binary must not hide the others' results
-    # (every test runner runs to completion; scripts/layer7.test.sh pins it).
-    env_test_cmd=(cargo test --no-fail-fast -p env-tests --features all)
-  fi
-
-  local rc
-  set +e
-  timeout "$ENV_TEST_TIMEOUT" "${env_test_cmd[@]}" 2>&1 | tee "$ENV_TEST_LOG"
-  rc=${PIPESTATUS[0]}
-  set -e
-
-  if [[ "$rc" -eq 0 ]]; then
-    emit_status OK env-tests-passed | tee_collect_statuses
-  else
-    # No grep: a non-zero suite on a confirmed-healthy cluster is the diff's problem.
-    # (timeout's 124 included — a hang on a healthy cluster is a test problem.)
-    printf 'Layer7: env-test suite exited %s (full output: %s).\n' "$rc" "$ENV_TEST_LOG" >&2
-    if [[ "$rc" -eq 124 ]]; then
-      # Same FAIL lane (no reclassification) — but a budget overrun must not read like any
-      # other test failure, or it is diagnosed by hand (story 3 task 10's Gate 2).
-      printf 'Layer7: env-test suite hit DEVLOOP_ENV_TEST_TIMEOUT=%ss (rc 124) — if no test hung, the suite outgrew the budget: re-measure from the per-binary "finished in" lines (devloop-validation.md §6.7).\n' "$ENV_TEST_TIMEOUT" >&2
+  # `local rc` lives OUTSIDE the selection: a browser-e2e-only shard has no Rust result, and
+  # 0 there is what lets its browser suite run (the after-pass rule below needs one).
+  local rc=0
+  if __suite_selected env-tests; then
+    local -a env_test_cmd
+    if [[ "${DEVLOOP_TEST:-}" == "1" && -n "${DEVLOOP_ENV_TEST_CMD:-}" ]]; then
+      # Split on spaces only (IFS is \n\t here); the seam takes a simple command or a
+      # path to a fake suite script.
+      IFS=' ' read -r -a env_test_cmd <<<"$DEVLOOP_ENV_TEST_CMD"
+    else
+      # --no-fail-fast: one failing env-test binary must not hide the others' results
+      # (every test runner runs to completion; scripts/layer7.test.sh pins it).
+      env_test_cmd=(cargo test --no-fail-fast -p env-tests --features all)
     fi
-    emit_status FAIL env-tests-failed | tee_collect_statuses
+
+    set +e
+    timeout "$ENV_TEST_TIMEOUT" "${env_test_cmd[@]}" 2>&1 | tee "$ENV_TEST_LOG"
+    rc=${PIPESTATUS[0]}
+    set -e
+
+    if [[ "$rc" -eq 0 ]]; then
+      emit_status OK env-tests-passed | tee_collect_statuses
+    else
+      # No grep: a non-zero suite on a confirmed-healthy cluster is the diff's problem.
+      # (timeout's 124 included — a hang on a healthy cluster is a test problem.)
+      printf 'Layer7: env-test suite exited %s (full output: %s).\n' "$rc" "$ENV_TEST_LOG" >&2
+      if [[ "$rc" -eq 124 ]]; then
+        # Same FAIL lane (no reclassification) — but a budget overrun must not read like any
+        # other test failure, or it is diagnosed by hand (story 3 task 10's Gate 2).
+        printf 'Layer7: env-test suite hit DEVLOOP_ENV_TEST_TIMEOUT=%ss (rc 124) — if no test hung, the suite outgrew the budget: re-measure from the per-binary "finished in" lines (devloop-validation.md §6.7).\n' "$ENV_TEST_TIMEOUT" >&2
+      fi
+      emit_status FAIL env-tests-failed | tee_collect_statuses
+    fi
   fi
 
   # --- Browser E2E (task #19, R-48): sequentially AFTER the Rust suite, same cluster ---
   # The browser suite ALWAYS runs (2026-08-20 — no longer diff-triggered), subject only to
-  # the env-red-skips-this-attempt discipline below and the Phase-1g preconditions above.
-  if [[ "$rc" -ne 0 ]]; then
+  # the env-red-skips-this-attempt discipline below and the Phase-1g preconditions above —
+  # and, in a CI shard, to DEVLOOP_LAYER7_SUITE (header §SUITE SELECTOR; never concurrent).
+  if ! __suite_selected browser-e2e; then
+    # env-tests-only shard: already announced (subset-env-tests-only STATUS + stderr note).
+    printf 'Layer7: browser-e2e not run by this invocation — not selected (LAYER7_SUITE=%s); its CI sibling shard runs it.\n' "$__LAYER7_SUITE" >&2
+  elif [[ "$rc" -ne 0 ]]; then
     # Shared single-attempt budget (Gate-1 Q1 ruling): with the Rust suite already FAIL,
     # running the browser suite against the same possibly-diff-broken backend adds
     # attribution noise, not signal. Loud + greppable (stable `browser-e2e-not-run:`

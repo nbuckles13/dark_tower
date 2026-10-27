@@ -367,6 +367,8 @@ run_layer7() {
   ( cd "$REPO_ROOT" && env -i \
       PATH="$PATH" HOME="$HOME" \
       ${CI_FLAG:+GITHUB_ACTIONS="$CI_FLAG"} \
+      ${SUITE_SEL:+DEVLOOP_LAYER7_SUITE="$SUITE_SEL"} \
+      ${FMT_CHECK_ONLY:+DEVLOOP_FMT_CHECK_ONLY="$FMT_CHECK_ONLY"} \
       DEVLOOP_TEST=1 \
       DEVLOOP_TMP="${WORK}/devloop-tmp" \
       DEVLOOP_HELPER_SOCKET="${SOCK}" \
@@ -434,7 +436,7 @@ reset_case() {
   unset FAKE_CLUSTER_EXISTS FAKE_PODS_HEALTHY FAKE_WRITE_IN_PROGRESS FAKE_STATUS_RC \
         FAKE_DC_PROVISION_RC FAKE_DC_PROVISION_OUT FAKE_DC_DEPLOY_RC FAKE_DC_DEPLOY_OUT \
         FAKE_PROM_READY FAKE_LOKI_READY \
-        ENVCMD CI_FLAG BROWSER_CMD FP_JSON PW_DIR \
+        ENVCMD CI_FLAG SUITE_SEL FMT_CHECK_ONLY BROWSER_CMD FP_JSON PW_DIR \
         FAKE_PROVISION_RC FAKE_PROVISION_TOKEN FAKE_PROVISION_SLEEP FAKE_PROBE_CODE \
         FAKE_AC_READY FAKE_SUITE_RC PORTS_JSON_OVERRIDE SETUP_SH_OVERRIDE \
         ORG_PROBE_OVERRIDE PROVISION_TIMEOUT \
@@ -1927,6 +1929,170 @@ for f in "$PW_CONFIG" "${REPO_ROOT}"/packages/*/vitest*.config.ts "${REPO_ROOT}"
   assert_absent "no-maxfailures-${f#"${REPO_ROOT}"/}" "maxFailures" "$(code_of "$f")"
   assert_absent "no-bail-config-${f#"${REPO_ROOT}"/}" "bail:" "$(code_of "$f")"
 done
+
+# === Suite selector — DEVLOOP_LAYER7_SUITE (layer7.sh header §SUITE SELECTOR) =================
+# CI may run Layer 7 one suite per job, each job on its own cluster (never both suites
+# concurrently on one cluster — see the header). These cases pin: the default is unchanged; a
+# subset is VISIBLE (a leading `subset-<suite>-only` STATUS that the LAYER= line inherits) and
+# skips ONLY the unselected suite's Phase-1 preconditions and run; outside CI it is refused; an
+# unknown value is refused; and the subset OK can never out-rank the CI clean skip.
+DUMP_FILE="${WORK}/devloop-tmp/layer-7-media-codec-profile.env"
+# The last STATUS= line on stdout is the lifecycle's own layer summary.
+last_status() { grep '^STATUS=' "$1" | tail -n1; }
+
+# (S1) DEFAULT UNCHANGED: no selector -> both suites run, both suites' Phase-1 steps run, and
+#      no subset token / LAYER7_SUITE note is emitted anywhere.
+reset_case
+SOCK="$PRESENT_SOCK"; export ENVCMD="$SUITE_STUB" BROWSER_CMD="$BROWSER_STUB"
+rm -f "$DUMP_FILE"
+run_layer7 "$OUT" "$ERR"
+assert_exit      "sel-default-exit0"            0 "$RC"
+assert_marker    "sel-default-env-ran"          "$MARKERS" "ran.env-suite"
+assert_marker    "sel-default-browser-ran"      "$MARKERS" "ran.browser-suite"
+assert_status    "sel-default-env-status"       "STATUS=OK REASON=env-tests-passed" "$(cat "$OUT")"
+assert_status    "sel-default-browser-status"   "STATUS=OK REASON=browser-e2e-passed" "$(cat "$OUT")"
+assert_status    "sel-default-1g-ran"           "STEP=browser-e2e-preconditions" "$(cat "$ERR")"
+assert_status    "sel-default-1i-ran"           "STEP=mh-grpc-forwards" "$(cat "$ERR")"
+assert_rc        "sel-default-profile-dumped"   0 "$([[ -s "$DUMP_FILE" ]] && echo 0 || echo 1)"
+assert_absent    "sel-default-no-subset-token"  "subset-" "$(cat "$OUT")"
+assert_absent    "sel-default-no-suite-note"    "LAYER7_SUITE" "$(cat "$ERR")"
+reset_case
+
+# (S2) env-tests ONLY (CI): visible subset token FIRST, env suite runs, browser suite does not,
+#      and the browser-only Phase-1g preconditions do NOT fire — both are broken here (incomplete
+#      fingerprints, no Chromium), which would be PRECONDITION_FAILURE on a default run.
+reset_case
+SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL=env-tests ENVCMD="$SUITE_STUB" BROWSER_CMD="$BROWSER_STUB" \
+  FP_JSON="$INCOMPLETE_FP" PW_DIR="$EMPTY_PW_DIR"
+rm -f "$DUMP_FILE"  # DEVLOOP_TMP persists across cases: a dump from an earlier case would make the absence check vacuous
+run_layer7 "$OUT" "$ERR"
+assert_exit      "sel-env-exit0"                0 "$RC"
+assert_rc        "sel-env-subset-first"         0 "$([[ "$(grep -m1 '^STATUS=' "$OUT")" == "STATUS=OK REASON=subset-env-tests-only" ]] && echo 0 || echo "1 ($(grep -m1 '^STATUS=' "$OUT"))")"
+assert_status    "sel-env-env-passed"           "STATUS=OK REASON=env-tests-passed" "$(cat "$OUT")"
+assert_absent    "sel-env-no-browser-status"    "REASON=browser-e2e" "$(cat "$OUT")"
+assert_marker    "sel-env-env-ran"              "$MARKERS" "ran.env-suite"
+assert_no_marker "sel-env-browser-not-run"      "$MARKERS" "ran.browser-suite"
+assert_status    "sel-env-layer-line-names-it"  "RESULT=OK REASON=subset-env-tests-only" "$(grep '^LAYER=7 START=' "$ERR")"
+assert_status    "sel-env-stderr-note"          "LAYER7_SUITE=env-tests" "$(cat "$ERR")"
+assert_absent    "sel-env-1g-not-run"           "STEP=browser-e2e-preconditions" "$(cat "$ERR")"
+assert_rc        "sel-env-no-profile-dump"      0 "$([[ ! -e "$DUMP_FILE" ]] && echo 0 || echo 1)"
+assert_status    "sel-env-1i-still-runs"        "STEP=mh-grpc-forwards" "$(cat "$ERR")"
+assert_absent    "sel-env-no-after-pass-note"   "browser-e2e-not-run:" "$(cat "$ERR")"
+reset_case
+
+# (S3) env-tests ONLY, red suite -> FAIL env-tests-failed (exit 1); the subset token does not
+#      soften it.
+reset_case
+SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL=env-tests ENVCMD="false"
+run_layer7 "$OUT" "$ERR"
+assert_exit      "sel-env-red-exit1"            1 "$RC"
+assert_status    "sel-env-red-status"           "STATUS=FAIL REASON=env-tests-failed" "$(cat "$OUT")"
+assert_status    "sel-env-red-summary"          "STATUS=FAIL REASON=layer7-summary" "$(last_status "$OUT")"
+reset_case
+
+# (S4) env-tests ONLY still requires EVERY precondition the env suite needs: the MH gRPC
+#      forwards (1i) and the shared health/observability steps.
+reset_case
+SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL=env-tests ENVCMD="$SUITE_STUB" PORTS_JSON_OVERRIDE="$PORTS_NO_MH1"
+run_layer7 "$OUT" "$ERR"
+assert_exit      "sel-env-needs-1i-exit2"       2 "$RC"
+assert_status    "sel-env-needs-1i-token"       "REASON=mh-grpc-port-unallocated" "$(cat "$OUT")"
+assert_no_marker "sel-env-needs-1i-no-suite"    "$MARKERS" "ran.env-suite"
+reset_case
+SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL=env-tests ENVCMD="$SUITE_STUB" FAKE_PROM_READY=0
+run_layer7 "$OUT" "$ERR"
+assert_exit      "sel-env-needs-prom-exit2"     2 "$RC"
+assert_status    "sel-env-needs-prom-token"     "REASON=observability-prometheus-not-ready" "$(cat "$OUT")"
+reset_case
+
+# (S5) browser-e2e ONLY (CI): the browser suite runs with no Rust result to gate it, the env
+#      suite does not, and the env-only Phase-1i forwards do NOT run — ports.json here lacks
+#      mh_1_grpc, which would be PRECONDITION_FAILURE mh-grpc-port-unallocated if they did.
+reset_case
+SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL=browser-e2e ENVCMD="$SUITE_STUB" BROWSER_CMD="$BROWSER_STUB" \
+  PORTS_JSON_OVERRIDE="$PORTS_NO_MH1"; rm -f "${WORK}/seen-e2e-subdomain"
+run_layer7 "$OUT" "$ERR"
+assert_exit      "sel-browser-exit0"            0 "$RC"
+assert_rc        "sel-browser-subset-first"     0 "$([[ "$(grep -m1 '^STATUS=' "$OUT")" == "STATUS=OK REASON=subset-browser-e2e-only" ]] && echo 0 || echo "1 ($(grep -m1 '^STATUS=' "$OUT"))")"
+assert_status    "sel-browser-passed"           "STATUS=OK REASON=browser-e2e-passed" "$(cat "$OUT")"
+assert_absent    "sel-browser-no-env-status"    "REASON=env-tests" "$(cat "$OUT")"
+assert_marker    "sel-browser-ran"              "$MARKERS" "ran.browser-suite"
+assert_no_marker "sel-browser-env-not-run"      "$MARKERS" "ran.env-suite"
+assert_absent    "sel-browser-1i-not-run"       "STEP=mh-grpc-forwards" "$(cat "$ERR")"
+assert_status    "sel-browser-1g-ran"           "STEP=browser-e2e-preconditions" "$(cat "$ERR")"
+assert_status    "sel-browser-org-exported"     "e2e-" "$(cat "${WORK}/seen-e2e-subdomain" 2>/dev/null)"
+assert_status    "sel-browser-layer-line"       "RESULT=OK REASON=subset-browser-e2e-only" "$(grep '^LAYER=7 START=' "$ERR")"
+reset_case
+
+# (S6) browser-e2e ONLY still requires its own Phase-1g preconditions, and a red browser suite
+#      is FAIL browser-e2e-failed.
+reset_case
+SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL=browser-e2e PW_DIR="$EMPTY_PW_DIR"
+run_layer7 "$OUT" "$ERR"
+assert_exit      "sel-browser-needs-pw-exit2"   2 "$RC"
+assert_status    "sel-browser-needs-pw-token"   "REASON=playwright-browser-missing" "$(cat "$OUT")"
+reset_case
+SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL=browser-e2e FP_JSON="$INCOMPLETE_FP"
+run_layer7 "$OUT" "$ERR"
+assert_status    "sel-browser-needs-certs-token" "REASON=dev-certs-missing" "$(cat "$OUT")"
+reset_case
+SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL=browser-e2e BROWSER_CMD="false"
+run_layer7 "$OUT" "$ERR"
+assert_exit      "sel-browser-red-exit1"        1 "$RC"
+assert_status    "sel-browser-red-status"       "STATUS=FAIL REASON=browser-e2e-failed" "$(cat "$OUT")"
+reset_case
+
+# (S7) REFUSED OUTSIDE CI — and inside an attesting (DEVLOOP_FMT_CHECK_ONLY) run even under
+#      CI: PRECONDITION_FAILURE layer7-suite-outside-ci, exit 2, BEFORE any cluster work.
+for sel in env-tests browser-e2e; do
+  reset_case
+  SOCK="$PRESENT_SOCK"; export SUITE_SEL="$sel" ENVCMD="$SUITE_STUB" BROWSER_CMD="$BROWSER_STUB"
+  run_layer7 "$OUT" "$ERR"
+  assert_exit      "sel-local-${sel}-exit2"       2 "$RC"
+  assert_status    "sel-local-${sel}-token"       "STATUS=PRECONDITION_FAILURE REASON=layer7-suite-outside-ci" "$(cat "$OUT")"
+  assert_no_marker "sel-local-${sel}-no-cluster"  "$MARKERS" "dc.calls"
+  assert_no_marker "sel-local-${sel}-no-suite"    "$MARKERS" "ran.*-suite"
+done
+reset_case
+SOCK="$PRESENT_SOCK"; export CI_FLAG=true FMT_CHECK_ONLY=1 SUITE_SEL=env-tests ENVCMD="$SUITE_STUB"
+run_layer7 "$OUT" "$ERR"
+assert_exit      "sel-attesting-exit2"          2 "$RC"
+assert_status    "sel-attesting-token"          "REASON=layer7-suite-outside-ci" "$(cat "$OUT")"
+assert_no_marker "sel-attesting-no-cluster"     "$MARKERS" "dc.calls"
+reset_case
+
+# (S8) AN UNKNOWN VALUE FAILS LOUDLY (never a silent "run both" or "run none"), before any
+#      cluster work — including the plausible-looking list and case variants.
+for bad in bogus all "env-tests,browser-e2e" Env-Tests " env-tests"; do
+  reset_case
+  SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL="$bad" ENVCMD="$SUITE_STUB" BROWSER_CMD="$BROWSER_STUB"
+  run_layer7 "$OUT" "$ERR"
+  lbl="${bad//[^a-zA-Z0-9]/_}"
+  assert_exit      "sel-invalid-${lbl}-exit2"      2 "$RC"
+  assert_status    "sel-invalid-${lbl}-token"      "STATUS=PRECONDITION_FAILURE REASON=layer7-suite-invalid" "$(cat "$OUT")"
+  assert_no_marker "sel-invalid-${lbl}-no-cluster" "$MARKERS" "dc.calls"
+  assert_no_marker "sel-invalid-${lbl}-no-suite"   "$MARKERS" "ran.*-suite"
+done
+reset_case
+
+# (S9) The subset OK must NEVER out-rank the CI clean skip: CI + no cluster + a selector is
+#      still SKIPPED-NO-CLUSTER (exit 0) with no subset STATUS line (OK ranks above the skip,
+#      so emitting it before the gate would turn every no-cluster CI run into a fake OK).
+reset_case
+SOCK="$ABSENT_SOCK"; export CI_FLAG=true SUITE_SEL=env-tests
+run_layer7 "$OUT" "$ERR"
+assert_exit      "sel-skip-exit0"               0 "$RC"
+assert_status    "sel-skip-summary"             "STATUS=SKIPPED-NO-CLUSTER REASON=layer7-summary" "$(last_status "$OUT")"
+assert_absent    "sel-skip-no-subset-ok"        "subset-" "$(cat "$OUT")"
+reset_case
+
+# (S10) ONE HOME for the suite list: the selector validates against lang/_common.sh's
+#       LAYER7_SUITES (never a private copy), and the subset tokens are derived from it.
+# shellcheck disable=SC2016  # a literal code needle, deliberately unexpanded
+assert_status "sel-validates-against-ssot"  'layer7_suite_known "$sel"' "$(code_of "$LAYER7")"
+# shellcheck disable=SC2016  # a literal code needle, deliberately unexpanded
+assert_status "sel-token-derived"           'emit_status OK "subset-${__LAYER7_SUITE}-only"' "$(code_of "$LAYER7")"
+assert_absent "sel-no-private-suite-list"   'LAYER7_SUITES=(' "$(code_of "$LAYER7")"
 
 # === Per-suite wall-clock defaults: ONE home, one pinned restatement ==========================
 # scripts/layer7.sh owns DEVLOOP_ENV_TEST_TIMEOUT / DEVLOOP_BROWSER_E2E_TIMEOUT defaults; the

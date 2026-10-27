@@ -659,4 +659,107 @@ run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d"
 h15_full="$(summary_block "$LA_OUT")"
 assert_exit "h15-summary-block-identical" 0 "$([[ -n "$h15_full" && "$h15_agg" == "$h15_full" ]] && echo 0 || echo "1 (agg: ${h15_agg//$'\n'/|} full: ${h15_full//$'\n'/|})")"
 
+# =============================================================================
+# (I) LAYER-7 SUITE SPLIT — DEVLOOP_LAYER7_SUITE (scripts/layer7.sh header §SUITE SELECTOR).
+#     CI may run Layer 7 as one shard PER SUITE (each on its own cluster). layer-all passes the
+#     variable to layer7.sh by inheritance, records it as SUITE= on the shard's layer-7 line,
+#     refuses it anywhere that could stand for the whole pipeline, and the aggregate accepts a
+#     split layer 7 only when the SUITE= fields cover LAYER7_SUITES exactly.
+# =============================================================================
+# A layer-7 stub that records the selector it inherited (the pass-through proof).
+mk_l7_recorder() {
+  cat > "$1/layer7.sh" <<'STUB'
+#!/usr/bin/env bash
+printf 'STATUS=OK REASON=layer7-ok\n'
+printf '%s\n' "${DEVLOOP_LAYER7_SUITE-<unset>}" > "${DEVLOOP_TMP}/ran.layer7"
+STUB
+  chmod +x "$1/layer7.sh"
+}
+
+# (I1) shard --layers 6,7 + env-tests: the stub inherits the value, the banner names it, and
+#      the summary carries SUITE= on the layer-7 line only.
+d="$(new_stubdir)"; mk_l7_recorder "$d"
+run_shard "$d" 6,7 DEVLOOP_LAYER7_SUITE=env-tests
+assert_exit   "i1-split-shard-exit0"  0 "$LA_RC"
+assert_status "i1-split-passthrough"  "env-tests" "$(cat "$LA_DT/ran.layer7" 2>/dev/null)"
+assert_status "i1-split-banner"       "CI_SHARD=1 LAYERS=6,7 LAYER7_SUITE=env-tests" "$(cat "$LA_ERR")"
+i1_sum="$(sed 's/DURATION=[0-9]*/DURATION=D/' "$LA_DT/layer-summary.txt" 2>/dev/null)"
+assert_exit   "i1-split-summary-exact" 0 "$([[ "$i1_sum" == $'LAYER=6 RESULT=OK DURATION=D RC=0\nLAYER=7 RESULT=OK DURATION=D RC=0 SUITE=env-tests' ]] && echo 0 || echo "1 (${i1_sum//$'\n'/|})")"
+
+# (I2) DEFAULT UNCHANGED: no selector -> layer 7 inherits nothing and its line has no SUITE=.
+d="$(new_stubdir)"; mk_l7_recorder "$d"
+run_shard "$d" 7
+assert_status "i2-default-no-selector" "<unset>" "$(cat "$LA_DT/ran.layer7" 2>/dev/null)"
+assert_absent "i2-default-no-suite"    "SUITE=" "$(cat "$LA_DT/layer-summary.txt" 2>/dev/null)"
+assert_absent "i2-default-banner"      "LAYER7_SUITE" "$(cat "$LA_ERR")"
+
+# (I3) REFUSALS (exit 2, no layer runs): a FULL run (the Gate-2 authority), a --max-layer
+#      fast lane, an unknown suite, and a shard that does not include layer 7.
+d="$(new_stubdir)"
+run_la "$d" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_LAYER7_SUITE=env-tests
+assert_exit      "i3-full-refused-exit2"  2 "$LA_RC"
+assert_status    "i3-full-refused-token"  "REASON=layer7-suite-outside-shard" "$(cat "$LA_ERR")"
+assert_no_marker "i3-full-no-stub"        "$LA_DT" 'ran.layer*'
+run_la_args "$d" "--max-layer 6" DEVLOOP_TEST=1 LAYER_SCRIPT_DIR="$d" DEVLOOP_LAYER7_SUITE=browser-e2e
+assert_exit      "i3-fast-refused-exit2"  2 "$LA_RC"
+assert_status    "i3-fast-refused-token"  "REASON=layer7-suite-outside-shard" "$(cat "$LA_ERR")"
+run_shard "$d" 7 DEVLOOP_LAYER7_SUITE=all
+assert_exit      "i3-invalid-exit2"       2 "$LA_RC"
+assert_status    "i3-invalid-token"       "REASON=layer7-suite-invalid" "$(cat "$LA_ERR")"
+assert_no_marker "i3-invalid-no-stub"     "$LA_DT" 'ran.layer*'
+run_shard "$d" 1,3 DEVLOOP_LAYER7_SUITE=env-tests
+assert_exit      "i3-no-layer7-exit2"     2 "$LA_RC"
+assert_status    "i3-no-layer7-token"     "REASON=layer7-suite-without-layer7" "$(cat "$LA_ERR")"
+assert_no_marker "i3-no-layer7-no-stub"   "$LA_DT" 'ran.layer*'
+
+# (I4) AGGREGATE over a split layer 7: worst status, max duration, both shards named.
+# mk_split_partition <aggdir> <env-tests status> <env rc> <browser-e2e status> <browser rc>
+mk_split_partition() {
+  mk_summary "$1" guards "LAYER=1 RESULT=OK DURATION=1 RC=0" "LAYER=2 RESULT=OK DURATION=1 RC=0" \
+    "LAYER=3 RESULT=OK DURATION=1 RC=0" "LAYER=6 RESULT=OK DURATION=1 RC=0"
+  mk_summary "$1" test "LAYER=4 RESULT=OK DURATION=1 RC=0"
+  mk_summary "$1" lint "LAYER=5 RESULT=OK DURATION=1 RC=0"
+  mk_summary "$1" l7-browser "LAYER=7 RESULT=$4 DURATION=250 RC=$5 SUITE=browser-e2e"
+  mk_summary "$1" l7-env "LAYER=7 RESULT=$2 DURATION=400 RC=$3 SUITE=env-tests"
+}
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_split_partition "$a" OK 0 OK 0; run_agg "$a"
+assert_exit   "i4-split-green-exit0"    0 "$LA_RC"
+assert_status "i4-split-cell"           "LAYER=7 RESULT=OK DURATION=400" "$(cat "$LA_OUT")"
+assert_status "i4-split-shards-named"   "l7-browser+l7-env" "$(cat "$LA_OUT")"
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_split_partition "$a" OK 0 FAIL 1; run_agg "$a"
+assert_exit   "i4-split-one-red-exit1"  1 "$LA_RC"
+assert_status "i4-split-one-red-cell"   "LAYER=7 RESULT=FAIL" "$(cat "$LA_OUT")"
+assert_status "i4-split-one-red-triage" "FAILURE_TRIAGE LAYER=7 SHARD=l7-browser+l7-env" "$(cat "$LA_ERR")"
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_split_partition "$a" PRECONDITION_FAILURE 2 OK 0; run_agg "$a"
+assert_exit   "i4-split-operator-exit2" 2 "$LA_RC"
+assert_status "i4-split-operator-cell"  "LAYER=7 RESULT=PRECONDITION_FAILURE" "$(cat "$LA_OUT")"
+
+# (I5) Every malformed split is exit 2 with its own REASON — above all a DROPPED suite, the one
+#      way a split could otherwise read as a green Layer 7.
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_split_partition "$a" OK 0 OK 0; rm "$a/l7-browser/layer-summary.txt"; agg_case i5-missing-suite missing-suite
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_split_partition "$a" OK 0 OK 0; mk_summary "$a" l7-env2 "LAYER=7 RESULT=OK DURATION=1 RC=0 SUITE=env-tests"; agg_case i5-duplicate-suite duplicate-suite
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_split_partition "$a" OK 0 OK 0; mk_summary "$a" zzz-whole "LAYER=7 RESULT=OK DURATION=1 RC=0"; agg_case i5-whole-after-suites duplicate-layer
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_split_partition "$a" OK 0 OK 0; mk_summary "$a" aaa-whole "LAYER=7 RESULT=OK DURATION=1 RC=0"; agg_case i5-suite-after-whole duplicate-layer
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_split_partition "$a" OK 0 OK 0; mk_summary "$a" lint "LAYER=5 RESULT=OK DURATION=1 RC=0 SUITE=env-tests"; agg_case i5-suite-on-other-layer malformed-line
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_split_partition "$a" OK 0 OK 0; mk_summary "$a" l7-browser "LAYER=7 RESULT=OK DURATION=1 RC=0 SUITE=browser"; agg_case i5-unknown-suite unknown-suite
+
+# (I6) ROUND TRIP: real per-suite shards (stub layers) feed the aggregate, one per LAYER7_SUITES
+#      entry — the shard writer and the split-aware parser agree.
+d="$(new_stubdir)"; a="$(mktemp -d "$WORK/agg.XXXXXX")"
+for part in guards:1,2,3,6 test:4 lint:5; do
+  run_shard "$d" "${part#*:}"
+  mkdir -p "$a/${part%%:*}"; cp "$LA_DT/layer-summary.txt" "$a/${part%%:*}/"
+done
+# The suite list is READ from its one home (lang/_common.sh) in a subshell — this suite does
+# not source _common.sh (see the header) — so a new suite is round-tripped with no edit here.
+mapfile -t i6_suites < <(bash -c 'source "$1/lang/_common.sh" && printf "%s\n" "${LAYER7_SUITES[@]}"' _ "$__here")
+assert_exit "i6-suite-list-read" 0 "$(( ${#i6_suites[@]} >= 2 ? 0 : 1 ))"
+for suite in "${i6_suites[@]}"; do
+  run_shard "$d" 7 DEVLOOP_LAYER7_SUITE="$suite"
+  mkdir -p "$a/l7-$suite"; cp "$LA_DT/layer-summary.txt" "$a/l7-$suite/"
+done
+run_agg "$a"
+assert_exit   "i6-split-round-trip-exit0" 0 "$LA_RC"
+assert_status "i6-split-round-trip-l7"    "LAYER=7 RESULT=OK" "$(cat "$LA_OUT")"
+
 report_results "scripts/layer-all.test.sh"
