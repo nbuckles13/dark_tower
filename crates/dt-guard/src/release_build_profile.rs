@@ -167,6 +167,7 @@
 //! while looking like it does — the same inertness this guard exists to
 //! prevent, turned on itself.
 
+use crate::common::cargo_cli::{logical_lines, selected_profile, SelectedProfile};
 use crate::common::cargo_manifest::{
     members_contain_glob, read_root_manifest, ManifestError, WorkspaceTable,
 };
@@ -247,88 +248,6 @@ struct CargoInvocation {
     line: usize,
     /// Logical line: physical lines joined across `\` continuations.
     text: String,
-}
-
-/// Join `\`-continued physical lines into logical lines, keeping the line
-/// number of the FIRST physical line.
-///
-/// Without this a `cargo build \` / `    --release ...` split — perfectly
-/// legal Dockerfile syntax — reads as a `cargo build` with no profile flag
-/// and the guard false-fails. A guard that false-fails gets bypassed, so the
-/// join is not a nicety.
-fn logical_lines(content: &str) -> Vec<(usize, String)> {
-    let mut out: Vec<(usize, String)> = Vec::new();
-    let mut pending: Option<(usize, String)> = None;
-    for (idx, raw) in content.lines().enumerate() {
-        let line_no = idx + 1;
-        let trimmed_end = raw.trim_end();
-        let continues = trimmed_end.ends_with('\\');
-        let body = trimmed_end.strip_suffix('\\').unwrap_or(trimmed_end);
-        match pending.as_mut() {
-            Some((_, acc)) => {
-                acc.push(' ');
-                acc.push_str(body.trim());
-            }
-            None => pending = Some((line_no, body.trim().to_string())),
-        }
-        if !continues {
-            if let Some(entry) = pending.take() {
-                out.push(entry);
-            }
-        }
-    }
-    if let Some(entry) = pending.take() {
-        out.push(entry);
-    }
-    out
-}
-
-/// The profile a cargo invocation selects, if it names one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SelectedProfile {
-    /// `--release` or `--profile release`.
-    Release,
-    /// `--profile <name>` for some non-release name.
-    Named(String),
-    /// No profile flag at all — cargo defaults to `dev`.
-    None,
-}
-
-/// Extract the profile a cargo command line selects.
-///
-/// Accepts BOTH `--release` and `--profile release`: they are semantically
-/// identical, and requiring the literal `--release` would false-fail a
-/// legitimate release build expressed the long way.
-fn selected_profile(cmd: &str) -> SelectedProfile {
-    let tokens: Vec<&str> = cmd.split_whitespace().collect();
-    // `enumerate` rather than an index loop: the lookahead for
-    // `--profile <name>` needs the position, but nothing here should be able
-    // to index out of range. ADR-0002 no-panic — a guard that panics on
-    // malformed input is worse than one that fails cleanly, because a panic
-    // inside Layer 3 reads as a crashed pipeline rather than a finding.
-    for (i, t) in tokens.iter().enumerate() {
-        if *t == "--release" || *t == "-r" {
-            return SelectedProfile::Release;
-        }
-        if let Some(name) = t.strip_prefix("--profile=") {
-            return profile_from_name(name);
-        }
-        if *t == "--profile" {
-            if let Some(name) = tokens.get(i + 1) {
-                return profile_from_name(name);
-            }
-        }
-    }
-    SelectedProfile::None
-}
-
-fn profile_from_name(name: &str) -> SelectedProfile {
-    let name = name.trim_matches(['"', '\'']);
-    if name == "release" {
-        SelectedProfile::Release
-    } else {
-        SelectedProfile::Named(name.to_string())
-    }
 }
 
 /// Does this logical line invoke `cargo build` (the line producing the

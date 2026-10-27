@@ -22,13 +22,14 @@
 //! `CARGO_BIN_EXE_dt-guard` (pinned by cargo at test-compile), NOT
 //! `assert_cmd::cargo_bin` — the latter re-derives `target/debug` and
 //! mis-resolves under `cargo llvm-cov`'s separate target dir. `DT_GUARD`
-//! stays the documented override. Mirrors `dt_guard_bin()` in
-//! `tests/credential_leak_key_custody_fixtures.rs` (added in `c5ca799`).
+//! stays the documented override. This is the one copy;
+//! `tests/credential_leak_key_custody_fixtures.rs` (which had its own since
+//! `c5ca799`) uses it.
 
-// Shared across five test binaries; each uses a subset of these helpers, so
-// `dead_code` is expected per-binary and `allow` (not `expect`) is correct —
-// the binary that happens to use everything would make `expect(dead_code)`
-// unfulfilled.
+// Shared across several test binaries (count deliberately not restated); each
+// uses a subset of these helpers, so `dead_code` is expected per-binary and
+// `allow` (not `expect`) is correct — the binary that happens to use everything
+// would make `expect(dead_code)` unfulfilled.
 #![allow(dead_code)]
 #![expect(
     clippy::unwrap_used,
@@ -49,6 +50,37 @@ pub fn dt_guard_bin() -> PathBuf {
         || PathBuf::from(env!("CARGO_BIN_EXE_dt-guard")),
         PathBuf::from,
     )
+}
+
+/// Run `git` in `root` hermetically: explicit identity, no global/system
+/// config, no signing, pinned default branch. Aborts loudly on failure. The
+/// ONE git helper for the e2e suites (it would otherwise inherit the
+/// developer's global config, templates and signing).
+pub fn git(root: &Path, args: &[&str]) {
+    let mut full: Vec<&str> = vec![
+        "-c",
+        "user.name=dt-guard-e2e",
+        "-c",
+        "user.email=dt-guard-e2e@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "init.defaultBranch=main",
+    ];
+    full.extend_from_slice(args);
+    let out = Command::new("git")
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(&full)
+        .output()
+        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// A throwaway synthetic repo root. Built under the session scratchpad when

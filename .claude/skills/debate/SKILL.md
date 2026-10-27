@@ -292,7 +292,7 @@ layer 3. Run the same wrapper layer 3 runs:
 
     ./scripts/guards/simple/validate-knowledge-index.sh
 
-It must print STATUS=OK. Use the wrapper, NOT `target/release/dt-guard`
+It must print STATUS=OK. Use the wrapper, NOT the dt-guard binary
 directly — the wrapper resolves the binary, honours a DT_GUARD override, and
 reports `STATUS=FAIL REASON=dt-guard-binary-missing` instead of a bash
 file-not-found when the build is absent (a debug-only container is common,

@@ -18,7 +18,8 @@
 # Contract:
 #   - $1 (required): the dt-guard subcommand to invoke (e.g. `cite-no-line-numbers`).
 #   - DT_GUARD env override: if set + executable, used directly; otherwise
-#     defaults to `$REPO_ROOT/target/release/dt-guard`.
+#     defaults to DT_GUARD_BIN from `scripts/lib/tool-bins.sh` (the one home for
+#     the dev-tool binary paths). No fallback to any other path.
 #   - On missing/non-executable binary: writes `STATUS=FAIL REASON=dt-guard-binary-missing`
 #     to stdout and exits 1 BEFORE invoking the subcommand.
 #   - On success: `exec`s the binary with `--root "$REPO_ROOT"` (so this
@@ -69,7 +70,9 @@ if [[ ! -e "$REPO_ROOT/.git" ]]; then
     echo "STATUS=FAIL REASON=dt-guard-wrapper-repo-root-not-found"
     exit 1
 fi
-DT_GUARD="${DT_GUARD:-$REPO_ROOT/target/release/dt-guard}"
+# shellcheck source=../../lib/tool-bins.sh
+source "$REPO_ROOT/scripts/lib/tool-bins.sh"
+DT_GUARD="${DT_GUARD:-$DT_GUARD_BIN}"
 
 [[ -x "$DT_GUARD" ]] || {
     echo "STATUS=FAIL REASON=dt-guard-binary-missing"

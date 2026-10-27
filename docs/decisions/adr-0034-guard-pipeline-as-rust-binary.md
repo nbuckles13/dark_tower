@@ -94,7 +94,8 @@ Every shell guard collapses to:
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-DT_GUARD="${DT_GUARD:-$REPO_ROOT/target/release/dt-guard}"
+source "$REPO_ROOT/scripts/lib/tool-bins.sh"   # the one home for the binary path (amended 2026-10-26)
+DT_GUARD="${DT_GUARD:-$DT_GUARD_BIN}"
 [[ -x "$DT_GUARD" ]] || { echo "STATUS=FAIL REASON=dt-guard-binary-missing"; exit 1; }
 "$DT_GUARD" <subcommand> --root "$REPO_ROOT" "$@"
 ```
@@ -248,7 +249,7 @@ Calendar time ~2-3 weeks with normal PR review cadence. **Working end-state on d
 - **REPL-debugging ergonomics regress.** `python3 -i` interactive false-positive triage is not available under cargo. Mitigation: `dt-guard --explain <subcommand> <input>` debug surface (§7) replaces the REPL workflow for the common case of "show me what matched and why."
 - **Lookbehind restructuring labor.** Three patterns require port-side restructuring with ~5 LoC caller-side adjustment + ~30 LoC of test scaffolding to lock boundary semantics. One-time cost in one module (`cite_extract.rs`), not a recurring tax on new guards.
 - **YAML-deserialization ceremony.** `#[derive(Deserialize)]` struct hierarchies for alert-rule YAML / dashboard JSON are ~1.3-1.5× LoC of Python's dict-walk. Real loss-case; offset by compile-time schema validation Python can't offer.
-- **`cargo build --release` Layer-1 budget cost.** dt-guard incremental cold build ~5-15s; ~0s warm with sccache. Operations to monitor; mitigation is workspace-split (`dt-guard-core` lib + `dt-guard` bin) only if modules cross 30, not preemptively.
+- **Layer-1 build cost.** dt-guard incremental cold build ~5-15s; ~0s warm with sccache. Operations to monitor; mitigation is workspace-split (`dt-guard-core` lib + `dt-guard` bin) only if modules cross 30, not preemptively. **Amended 2026-10-26** (`docs/devloop-outputs/2026-10-26-devtools-build-profile/`): the estimate assumed the workspace release profile's cost was the crate's; it was not. Under `[profile.release]` (fat LTO, 1 codegen unit, tuned for the services) the measured cost reached cold 38s / per-edit 19-33s at 42 subcommands. dt-guard and dt-story now build with a dedicated non-LTO `[profile.devtools]`, with their paths derived from one home (`scripts/lib/tool-bins.sh`, guarded by `dt-guard tool-bin-paths`) — see §When to Revisit.
 
 ### Neutral
 
@@ -340,8 +341,8 @@ Status values: ✅ Done | 🚧 In Progress | ❌ Pending | ⏸️ Deferred
 
 ## When to Revisit
 
-- **Subcommand count ≥10**: re-debate whether to split `dt-guard` into 2-3 focused binaries (e.g., `dt-cite`, `dt-yaml-policy`).
-- **Cold-cache Layer 1 `cargo build` exceeds budget**: workspace-split (`dt-guard-core` lib + `dt-guard` bin) becomes load-bearing.
+- **Subcommand count ≥10**: re-debate whether to split `dt-guard` into 2-3 focused binaries (e.g., `dt-cite`, `dt-yaml-policy`). **Amended 2026-10-26**: this trigger is about count and `--help` discoverability ONLY. Build cost is not an argument for a split: it is driven by the cargo profile, not the subcommand count — each split binary would keep whatever profile it is built with, and an edit to shared `common/` code would still rebuild all of them.
+- **Cold-cache Layer 1 dt-guard build exceeds budget**: first check the build profile (`[profile.devtools]`, named in `scripts/lib/tool-bins.sh`) — that, not crate size, was the cause when this trigger fired in 2026-10 (fat LTO: cold 38s, per-edit 19-33s; non-LTO: cold ~16s, per-edit ~1-7s, guard runtime unchanged). A workspace-split (`dt-guard-core` lib + `dt-guard` bin) becomes load-bearing only if the non-LTO build still breaches budget.
 - **A new structured-text validation surface emerges that doesn't fit `regex` + `serde_yaml`** (e.g., a real PromQL parser is needed, not just window-walking). Evaluate `prometheus-http-api` or grammar-driven tools.
 - **`cargo audit` flake rate or false-positive rate degrades**: revisit audit triage workflow.
 - **Rust author pool issues at 6 months**: if guard contributions are blocked on Rust unfamiliarity in measurable ways, revisit the trade. (Mitigation candidates: better `--explain` ergonomics, expanded code-comment culture, pair-author conventions.)

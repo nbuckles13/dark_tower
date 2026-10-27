@@ -47,7 +47,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=../lang/_test_helpers.sh
 source "${REPO_ROOT}/scripts/lang/_test_helpers.sh"
 
-DT_GUARD="${DT_GUARD:-${REPO_ROOT}/target/release/dt-guard}"
+# shellcheck source=../lib/tool-bins.sh
+source "${REPO_ROOT}/scripts/lib/tool-bins.sh"
+DT_GUARD="${DT_GUARD:-$DT_GUARD_BIN}"
 if [[ ! -x "$DT_GUARD" ]]; then
   # Fail loudly. A skip here would make the whole suite a no-op exactly when
   # the binary is broken, which is the failure class this file exists for.

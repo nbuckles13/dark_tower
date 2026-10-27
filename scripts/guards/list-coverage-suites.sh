@@ -35,7 +35,7 @@
 #
 #   SECOND GREP (defense-in-depth): the bounded marker leaves one evasion — a
 #   suite that BOTH moves out of `scripts/guards/` AND stops matching
-#   `DT_GUARD` (e.g. hardcodes `target/release/dt-guard`). That is itself the
+#   `DT_GUARD` (e.g. hardcodes a dt-guard binary path). That is itself the
 #   anti-pattern (a binary invocation not routed through the overridable
 #   `$DT_GUARD`), so this script also fails on any non-`$DT_GUARD` dt-guard
 #   binary invocation anywhere under `scripts/`, naming file:line + the remedy.
@@ -66,7 +66,12 @@ for f in "${ALL_TEST_SH[@]}"; do
   # override, not a `# coverage-exempt:` marker that merely names it in prose.
   # One process, no pipe: `grep -v ... | grep -q` under pipefail drops a suite
   # whenever `grep -q` exits early and the writer dies of SIGPIPE.
-  if awk '!/^[[:space:]]*#/ && /DT_GUARD/ { found = 1; exit } END { exit !found }' "$f"; then
+  # WHOLE WORD, as an explicit POSIX ERE: `DT_GUARD_BIN` (scripts/lib/tool-bins.sh's
+  # uninstrumented default) must not select a suite on its own — a suite that names
+  # only that would be pulled into the coverage job and fail its profraw delta. Not
+  # `\<`/`\>`/`\b`: mawk and BSD awk lack them, and an unsupported boundary fails
+  # open or empties the selection.
+  if awk '!/^[[:space:]]*#/ && /(^|[^A-Za-z0-9_])DT_GUARD([^A-Za-z0-9_]|$)/ { found = 1; exit } END { exit !found }' "$f"; then
     SELECTED+=("$f")
   fi
 done
@@ -116,7 +121,10 @@ explaining why it is not a coverage suite, or route it through \"\$DT_GUARD\" if
 done
 
 # --- SECOND GREP: non-$DT_GUARD dt-guard binary invocations ----------------
-# Match a hardcoded binary path (target/.../dt-guard) or a bare `dt-guard`
+# Policy: invocations route through the overridable "$DT_GUARD". The other half —
+# no literal tool-binary PATH anywhere — is owned by `dt-guard tool-bin-paths`;
+# do not widen this grep into a second path rule.
+# Match a hardcoded dt-guard binary path or a bare `dt-guard`
 # command, on lines that are NOT comments, NOT cargo invocations, and do NOT
 # route through $DT_GUARD. Fail with file:line + remedy.
 while IFS= read -r hit; do
@@ -127,7 +135,7 @@ coverage job can point it at the instrumented binary:
 done < <(
   # An INVOCATION is `<path-or-bare>dt-guard <subcommand>` — the binary
   # followed by a lowercase subcommand token. This deliberately does NOT match
-  # an existence check (`[ -x target/release/dt-guard ]` → followed by `]`) or
+  # an existence check (`[ -x <dir>/dt-guard ]` → followed by `]`) or
   # cargo's `-p dt-guard` package flag (followed by ` -`/newline).
   grep -rInE '(^|[[:space:];&|(/])dt-guard[[:space:]]+[a-z]' \
     --include='*.test.sh' --include='*.sh' scripts 2>/dev/null \

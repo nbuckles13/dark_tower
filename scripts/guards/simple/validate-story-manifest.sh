@@ -6,14 +6,20 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
-BIN=target/release/dt-story
+# shellcheck source=../../lib/tool-bins.sh
+source scripts/lib/tool-bins.sh
+BIN="$DT_STORY_BIN"
 # Version-agnostic discovery: matching the `v1` suffix here would make a
 # future marker bump silently select zero files and exit 0 — a masked gate.
 # Any version dt-story cannot parse must reach `validate` and fail loudly.
 files="$(grep -l '# task-metadata (dt-story manifest ' docs/user-stories/*.md 2>/dev/null || true)"
 [ -z "$files" ] && exit 0   # no manifests in tree yet — nothing to validate
 
-[ -x "$BIN" ] || { echo "dt-story not built but manifests exist (cargo build --release -p dt-story)"; exit 1; }
+[ -x "$BIN" ] || {
+  echo "STATUS=FAIL REASON=dt-story-binary-missing"
+  echo "dt-story not built at ${BIN} but manifests exist — run: ${DT_TOOLS_BUILD_CMD}"
+  exit 1
+}
 
 rc=0
 while IFS= read -r f; do

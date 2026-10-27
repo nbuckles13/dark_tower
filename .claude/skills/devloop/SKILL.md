@@ -621,10 +621,10 @@ slug (ADR-0035 §4; the §Devloop Tracking table it replaces is retired).
 **Only when `DEVLOOP_HEADLESS` is unset** (an interactive `/devloop`, not a
 `HEADLESS RUN` invocation — this includes a run-story task and any
 audit-remediation devloop the runner appends at story close):
-`target/release/dt-story complete <story-file> <task-id> --slug <this
-devloop's output slug>`, included in the Step 8 commit. Build it first if the
-tree is cold — `cargo build --release -p dt-guard -p dt-story` — otherwise this
-gesture fails with "no such file or directory" and no next step. Under `HEADLESS RUN`
+`scripts/lib/tool-bins.sh dt-story complete <story-file> <task-id> --slug <this
+devloop's output slug>`, included in the Step 8 commit. If the tree is cold it
+fails with `STATUS=FAIL REASON=dt-story-binary-missing` — build it with
+`scripts/lib/tool-bins.sh build` and retry. Under `HEADLESS RUN`
 the runner records completion itself **after its own gates pass**, so doing
 it here would assert a verdict before the pipeline has issued one — which
 ADR-0035 §3 reserves to the runner.
