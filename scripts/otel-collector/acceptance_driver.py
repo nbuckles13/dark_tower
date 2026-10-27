@@ -169,6 +169,46 @@ def skew():
     check("skew/late/future all accumulate", c, float(want))
 
 
+def concurrent(writers=8, rounds=25):
+    """Same-identity writers exporting AT THE SAME INSTANT (S5).
+
+    S1 posts strictly one-after-another, so it cannot see the race this covers:
+    each OTLP request runs on its own collector goroutine, the clock restamp
+    happens before `delta_to_cumulative` takes its per-stream lock, and a point
+    stamped earlier but locked later is dropped as out of order. The real
+    trigger is browsers in one meeting flushing together (kek-rotation.spec.ts).
+    `batch/client_metric_order` is what serializes this; without it the total
+    reads short and `otelcol_deltatocumulative_datapoints{error=...}` rises.
+    """
+    import threading
+    print(f"== S5 {writers} same-identity delta writers posting concurrently, {rounds} rounds")
+    lab = dict(BASE, org_id="concurrent")
+    barrier = threading.Barrier(writers)
+    errors = []
+
+    def writer():
+        last = now_ns()
+        try:
+            for _ in range(rounds):
+                barrier.wait(timeout=30)
+                end = now_ns()
+                post([counter(CTR, lab, 1, last, end)])
+                last = end
+        except Exception as e:  # surfaced below; a lost post must not read as a drop
+            errors.append(repr(e))
+            barrier.abort()
+
+    threads = [threading.Thread(target=writer) for _ in range(writers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check("concurrent writers: every post succeeded", errors, [])
+    settle()
+    c, _ = value(scrape(), CTR, {"org_id": "concurrent"})
+    check("concurrent writers: no increment dropped", c, float(writers * rounds))
+
+
 def stale(gap):
     print(f"== S7 stale reset (run with max_stale 20s override): delta 5, idle {gap:g}s > max_stale, delta 6")
     lab = dict(BASE, org_id="stale")
@@ -290,6 +330,8 @@ if __name__ == "__main__":
         idle(float(sys.argv[5]) if len(sys.argv) > 5 else 20.0)
     if only in ("all", "skew"):
         skew()
+    if only in ("all", "concurrent"):
+        concurrent()
     if only == "stale":
         stale(float(sys.argv[5]) if len(sys.argv) > 5 else 40.0)
     if only in ("all", "filter"):

@@ -25,7 +25,7 @@
 #   scripts/otel-collector/acceptance.sh <image>            # candidate image
 #   scripts/otel-collector/acceptance.sh <image> <scenario> [idle-seconds]
 #
-# Scenarios: all (default) | two | idle | skew | filter | sdk | stale
+# Scenarios: all (default) | two | idle | skew | concurrent | filter | sdk | stale
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)

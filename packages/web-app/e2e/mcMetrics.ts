@@ -526,6 +526,67 @@ const CLIENT_COUNTER_PROMQL: Record<ClientCounter, string> = {
   kek_retained: KEK_RETAINED_SUM_PROMQL,
 };
 
+/**
+ * The collector accumulator's REJECTED datapoints, by cause — a diagnostic for a
+ * client counter that fell short, never an assertion. `delta_to_cumulative`
+ * counts every point it processes on `otelcol_deltatocumulative_datapoints`
+ * (collector self-telemetry, `otel-collector-telemetry` job) and attaches
+ * `error=<Go error type>` to the ones it DROPS (e.g. `delta.ErrOutOfOrder`,
+ * `delta.ErrOlderStart`, `limit`). A drop there loses an increment PERMANENTLY,
+ * so no poll budget recovers it. The name is matched with and without `_total`
+ * because the suffix has moved between collector versions.
+ */
+const ACCUMULATOR_DROPS_BY_CAUSE_PROMQL =
+  'sum by (error) ({__name__=~"otelcol_deltatocumulative_datapoints(_total)?",error!=""})';
+
+/** Accumulator drops, `error` cause -> count (empty = none ever). */
+export type AccumulatorDrops = ReadonlyMap<string, number>;
+
+/** Current accumulator-drop snapshot. Take it BEFORE the action under test. */
+export async function collectorAccumulatorDropsByCause(): Promise<AccumulatorDrops> {
+  const map = new Map<string, number>();
+  for (const row of await promInstantRows(ACCUMULATOR_DROPS_BY_CAUSE_PROMQL)) {
+    const raw = row.value?.[1];
+    const parsed = raw === undefined || raw.trim() === '' ? Number.NaN : Number(raw);
+    if (!Number.isFinite(parsed)) {
+      throw new Error(
+        `Prometheus returned a non-numeric sample "${String(raw)}" for ${ACCUMULATOR_DROPS_BY_CAUSE_PROMQL}`,
+      );
+    }
+    map.set(row.metric?.['error'] ?? '<no error label>', parsed);
+  }
+  return map;
+}
+
+/** "since baseline" rendering of accumulator drops, for a failure message. */
+async function describeAccumulatorDropsSince(baseline: AccumulatorDrops): Promise<string> {
+  let current: AccumulatorDrops;
+  try {
+    current = await collectorAccumulatorDropsByCause();
+  } catch (e) {
+    return `Collector accumulator-drop diagnostic could not be read: ${String(e)}`;
+  }
+  const rises = [...current.entries()]
+    .map(([cause, value]) => [cause, value - (baseline.get(cause) ?? 0)] as const)
+    .filter(([, delta]) => delta > 0)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  if (rises.length === 0) {
+    return (
+      'Collector delta_to_cumulative dropped NO datapoints since the baseline, so the missing ' +
+      'increment never reached the accumulator: look upstream (the SDK export, GC proxy, the ' +
+      "collector's filters/memory_limiter via otelcol_processor_incoming/outgoing_items)."
+    );
+  }
+  return (
+    `Collector delta_to_cumulative DROPPED datapoints since the baseline: {${rises
+      .map(([cause, delta]) => `${cause}=+${delta}`)
+      .join(', ')}} (collector-wide, so a concurrent suite can contribute). A drop there loses ` +
+    'the increment permanently; ErrOutOfOrder means concurrent same-stream exports reached the ' +
+    'accumulator out of stamp order — check batch/client_metric_order is still immediately ' +
+    'before transform/client_metric_clock in infra/services/otel-collector/collector.yaml.'
+  );
+}
+
 /** Current per-instance snapshot of a client counter (empty = never exported yet). */
 export async function clientCounterByInstance(which: ClientCounter): Promise<InstanceCounters> {
   return promInstantByInstance(CLIENT_COUNTER_PROMQL[which]);
@@ -540,20 +601,34 @@ export async function waitForClientCounterAbove(
   which: ClientCounter,
   baseline: InstanceCounters,
   why: string,
-  options: PollOptions & { minDelta?: number } = {},
+  options: PollOptions & {
+    minDelta?: number;
+    /**
+     * A {@link collectorAccumulatorDropsByCause} snapshot taken before the
+     * action under test. When given, a timeout names any accumulator drops
+     * since then, so a lost increment is distinguishable from a slow one.
+     */
+    accumulatorDropsBaseline?: AccumulatorDrops;
+  } = {},
 ): Promise<void> {
-  await pollUntilAnyInstanceAbove(
-    CLIENT_COUNTER_PROMQL[which],
-    baseline,
-    options,
-    (lastObserved, timeoutMs) =>
-      `${CLIENT_COUNTER_PROMQL[which]} did not rise ${
-        options.minDelta === undefined ? 'above' : `by >= ${options.minDelta} over`
-      } baseline ${formatInstanceMap(baseline)} within ${timeoutMs}ms (last observed: ` +
-      `${lastObserved}). ${why} If the vector is EMPTY, nothing with this exact name reached ` +
-      `Prometheus: check the SDK export (flushMetrics), GC's /api/v1/telemetry proxy, the ` +
-      `collector's Prometheus exporter (add_metric_suffixes) and its scrape job.`,
-  );
+  try {
+    await pollUntilAnyInstanceAbove(
+      CLIENT_COUNTER_PROMQL[which],
+      baseline,
+      options,
+      (lastObserved, timeoutMs) =>
+        `${CLIENT_COUNTER_PROMQL[which]} did not rise ${
+          options.minDelta === undefined ? 'above' : `by >= ${options.minDelta} over`
+        } baseline ${formatInstanceMap(baseline)} within ${timeoutMs}ms (last observed: ` +
+        `${lastObserved}). ${why} If the vector is EMPTY, nothing with this exact name reached ` +
+        `Prometheus: check the SDK export (flushMetrics), GC's /api/v1/telemetry proxy, the ` +
+        `collector's Prometheus exporter (add_metric_suffixes) and its scrape job.`,
+    );
+  } catch (e) {
+    if (options.accumulatorDropsBaseline === undefined || !(e instanceof Error)) throw e;
+    e.message = `${e.message} ${await describeAccumulatorDropsSince(options.accumulatorDropsBaseline)}`;
+    throw e;
+  }
 }
 
 /**

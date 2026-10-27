@@ -360,6 +360,46 @@ processors:
           - set(attributes["media_kind"], "invalid") where attributes["content_kind"] == "invalid" and attributes["media_kind"] != nil
 
   # ---------------------------------------------------------------------
+  # SERIALIZER — what makes the restamp below an ORDER, not just a clock read.
+  # ---------------------------------------------------------------------
+  #
+  # The OTLP receiver runs every request on its own goroutine, and every
+  # processor after it runs on THAT goroutine. `delta_to_cumulative` locks
+  # PER STREAM, and only around the aggregation itself; it rejects a point
+  # whose `time` is `<=` the stream's last (`ErrOutOfOrder`,
+  # `internal/delta/delta.go` at the pinned tag). So without this, two
+  # concurrent exports carrying the SAME stream — two browsers in one meeting
+  # flushing together, e.g. both counting one KEK rotation push — can be
+  # stamped A-then-B by the restamp and reach the accumulator's lock
+  # B-then-A. A's increment is then DROPPED, permanently, visible only as
+  # `otelcol_deltatocumulative_datapoints{error="delta.ErrOutOfOrder"}` on
+  # the collector's own telemetry. The window is microseconds on an idle
+  # node and widens under CPU starvation: it is how `kek-rotation.spec.ts`
+  # (two remaining clients flushed together, `minDelta: 2`) timed out on a
+  # 4-core CI runner — and, in production, how a fleet total under-counts
+  # exactly when many browsers report at once.
+  #
+  # The batch processor with NO `metadata_keys` has ONE shard and ONE
+  # goroutine, which hands each batch to the next consumer synchronously.
+  # Placed IMMEDIATELY before `transform/client_metric_clock`, it puts the
+  # stamp and the accumulation on that single goroutine, so stamp order IS
+  # accumulation order. ITS POSITION IS THE FIX: anything inserted between it
+  # and `delta_to_cumulative` that fans out again reopens the race, and so
+  # would `metadata_keys` (one goroutine per shard).
+  #
+  # COST: the receiver acknowledges once a request is queued here, so an
+  # error raised AFTER this point (the clock transform's `propagate`) is
+  # logged by the collector instead of being returned to GC. Every processor
+  # that can refuse a request — `memory_limiter` and the filters — still runs
+  # BEFORE it on the request's own goroutine, so those refusals still reach
+  # GC. The defaults (`timeout` 200ms, `send_batch_size` 8192, no
+  # `send_batch_max_size`) are deliberate: a point waits at most the 200ms
+  # timeout before reaching the accumulator (8192 points per batch is far
+  # beyond browser export volume), which is far below the SDK's 10s export
+  # cadence and the `otel-collector` job's 10s scrape.
+  batch/client_metric_order: {}
+
+  # ---------------------------------------------------------------------
   # COLLECTOR-CLOCK RESTAMP — the ordering authority at the trust boundary.
   # ---------------------------------------------------------------------
   #
@@ -378,7 +418,9 @@ processors:
   # set timestamps to 0 to satisfy the PROMETHEUS EXPORTER's internal
   # `start == prev.end` accumulator check, depended on those internals, and
   # hid genuine resets. This gives `delta_to_cumulative` monotonic,
-  # collector-owned timestamps so its DOCUMENTED ordering contract holds. It
+  # collector-owned timestamps so its DOCUMENTED ordering contract holds —
+  # monotonic only because `batch/client_metric_order` above serializes the
+  # stamp and the accumulation onto one goroutine (see its comment). It
   # hides no reset, because a delta datapoint has no reset semantics: each
   # point is an increment, and a browser that restarts its counters must be
   # summed into the fleet total, not subtracted from it.
@@ -718,5 +760,5 @@ service:
       exporters: [debug]
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, filter/client_metric_names, filter/client_metric_temporality, transform/client_metric_labels, transform/client_metric_clock, delta_to_cumulative]
+      processors: [memory_limiter, filter/client_metric_names, filter/client_metric_temporality, transform/client_metric_labels, batch/client_metric_order, transform/client_metric_clock, delta_to_cumulative]
       exporters: [debug, prometheus]

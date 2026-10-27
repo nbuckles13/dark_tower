@@ -26,6 +26,14 @@
 //     read ~0 on correct behaviour. A per-instance baseline taken before the
 //     leave (absent = 0) and polled to baseline + k keeps "a counter, assert a
 //     delta" without that blind spot.
+//     The remaining pages are flushed CONCURRENTLY on purpose: both carry a
+//     delta for the same stream at the same instant, which is the production
+//     shape of a rotation. Before `batch/client_metric_order`
+//     (infra/services/otel-collector/collector.yaml) the collector could stamp
+//     those two exports in one order and accumulate them in the other, dropping
+//     one as out of order — the 4-core CI timeout. Do NOT serialize the flushes
+//     to "fix" a recurrence; the timeout message reports the accumulator's drops
+//     since the pre-leave baseline, which says which side lost the increment.
 //
 // BUDGET: from MC's own configuration — W (`MC_KEK_ROTATION_DEBOUNCE_SECONDS`,
 // infra/services/mc-service/config.env) plus the disconnect grace (MC's config or
@@ -49,6 +57,7 @@ import { mcRotationBudget, ROTATION_POLL_MARGIN_MS } from './configEnv.js';
 import { bootstrapMeeting, flushTelemetry, kekGeneration } from './fixtures.js';
 import {
   clientCounterByInstance,
+  collectorAccumulatorDropsByCause,
   mhAdmissionRejectionsByInstance,
   waitForClientCounterAbove,
 } from './mcMetrics.js';
@@ -83,6 +92,7 @@ test.describe('story 2 S6 (joiner half): KEK rotation on leave', () => {
       }
       const updatesBaseline = await clientCounterByInstance('kek_update');
       const retainedBaseline = await clientCounterByInstance('kek_retained');
+      const accumulatorDropsBaseline = await collectorAccumulatorDropsByCause();
 
       await leaveGracefully(leaver.page);
       await leaver.context.close();
@@ -111,13 +121,13 @@ test.describe('story 2 S6 (joiner half): KEK rotation on leave', () => {
         'kek_update',
         updatesBaseline,
         'S6: the rotation push reached the remaining clients but not Prometheus.',
-        { minDelta: remaining.length },
+        { minDelta: remaining.length, accumulatorDropsBaseline },
       );
       await waitForClientCounterAbove(
         'kek_retained',
         retainedBaseline,
         'S6: the remaining clients did not report retaining the demoted generation.',
-        { minDelta: remaining.length },
+        { minDelta: remaining.length, accumulatorDropsBaseline },
       );
 
       // The joiner, AFTER the rotation: holds only the current KEK, and opens

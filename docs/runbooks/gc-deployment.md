@@ -1520,7 +1520,8 @@ number.
 
    It extracts `config.yaml` from the committed
    `infra/services/otel-collector/collector.yaml` (so it cannot drift from what
-   ships) and runs the two-writer, single-writer-idle, clock-skew, staleness and
+   ships) and runs the two-writer, single-writer-idle, clock-skew,
+   concurrent-writer (same-stream exports racing into `delta_to_cumulative`), staleness and
    filtering cases. On a readiness failure it prints the `components` hint.
 
 2. **Component presence, from the image itself** — if step 1 fails at startup:
@@ -1530,7 +1531,7 @@ number.
      --image=<candidate-image> -- components
    ```
 
-   `delta_to_cumulative`, `filter`, `transform`, `memory_limiter`, `health_check`,
+   `delta_to_cumulative`, `batch`, `filter`, `transform`, `memory_limiter`, `health_check`,
    the `otlp` receiver and the `prometheus` exporter must all be listed.
 
 3. **Readiness surface still answers.** The probes and the cluster-setup gate both
