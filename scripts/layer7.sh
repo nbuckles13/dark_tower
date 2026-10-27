@@ -4,7 +4,7 @@
 # TWO Phase-2 suites since task #19 (R-48), run SEQUENTIALLY against the same cluster
 # under the same single-attempt budget:
 #   1. Rust env-tests (`cargo test --no-fail-fast -p env-tests --features all`) — ALWAYS attempted.
-#   2. Browser E2E (`pnpm --filter @darktower/web-app test:e2e`) — runs WHENEVER Layer 7
+#   2. Browser E2E (`pnpm exec nx run web-app:test:e2e`) — runs WHENEVER Layer 7
 #      runs (2026-08-20: the diff-trigger was retired; subject only to its Phase-1g
 #      preconditions), AFTER the Rust suite and only when it passed (an env-test FAIL skips
 #      the browser suite with a loud stderr note — fixing the Rust failures comes first;
@@ -1580,7 +1580,14 @@ __layer7_main() {
     if [[ "${DEVLOOP_TEST:-}" == "1" && -n "$BROWSER_E2E_CMD_OVERRIDE" ]]; then
       IFS=' ' read -r -a browser_cmd <<<"$BROWSER_E2E_CMD_OVERRIDE"
     else
-      browser_cmd=(pnpm --filter @darktower/web-app test:e2e)
+      # Through the Nx task graph, NOT `pnpm --filter … test:e2e`: the web-app `test:e2e`
+      # target declares `dependsOn: proto-gen:codegen` (packages/web-app/project.json), and
+      # only an nx invocation honours it. The generated `packages/sdk-core/src/proto/**` is
+      # gitignored, so a pnpm-filter run on a clean checkout died on a missing `_pb.js`
+      # (FAIL browser-e2e-failed for an absent build artifact). Same shape as the layer 1-6
+      # TS wrappers (lang/ts/*.sh: `pnpm exec nx …`); codegen is Nx-cached, so it costs
+      # ~nothing when proto/ is unchanged.
+      browser_cmd=(pnpm exec nx run web-app:test:e2e)
     fi
 
     # Suite URLs: the SAME ports.json-derived values the Rust suite just used (exported

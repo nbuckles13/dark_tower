@@ -1931,20 +1931,21 @@ pnpm nx run web-app:test:unit        # Node-tier prod-bundle-content assertion (
 `test:unit` is not a general unit suite — it asserts that dev-only strings are absent from a
 production build, and does not exercise the join path at all.
 
-The **browser E2E suite** (the Playwright harness from story tasks #18/#19) runs through Playwright,
-not Nx, and unlike the two Vitest tiers above it needs the cluster up *and* the dev-cert
+The **browser E2E suite** (the Playwright harness from story tasks #18/#19) also runs through Nx
+(so proto codegen runs first, F5 — a `pnpm --filter … test:e2e` bypass fails on a clean
+checkout), and unlike the two Vitest tiers above it needs the cluster up *and* the dev-cert
 fingerprints present (§3):
 
 ```bash
 # --- WSL2 ---
-pnpm --filter @darktower/web-app test:e2e
+pnpm nx run web-app:test:e2e
 ```
 
 `packages/web-app/playwright.config.ts` + `packages/web-app/e2e/` (specs, `global-setup.ts`,
 fixtures) own this; its `global-setup.ts` reads the dev-cert fingerprints from
 `infra/docker/certs/fingerprints.json` (the `fingerprints.env` beside it is the shell-sourceable
 form of the same MC/MH pair — one writer, `scripts/generate-dev-certs.sh`). This is the same lane
-`scripts/layer7.sh` runs as a **diff-triggered** step *after* the Rust env-tests and only if they
+`scripts/layer7.sh` runs (same nx invocation) on every Layer 7 *after* the Rust env-tests and only if they
 pass; it is gated on `fingerprints.json` and a Playwright Chromium being present (missing either is a
 Layer-7 `PRECONDITION_FAILURE`, not a silent skip). `packages/web-app/e2e/README.md` owns the
 specifics.

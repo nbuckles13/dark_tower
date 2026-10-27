@@ -280,9 +280,19 @@ loopback by default) are unaffected — the rule applies only to the page origin
 ## Running
 
 ```bash
-cd packages/web-app
-pnpm test:e2e            # or: pnpm exec playwright test
+pnpm nx run web-app:test:e2e   # from the repo root; `pnpm test:e2e` in this package is the same nx call
 ```
+
+Always go through Nx: the target depends on `proto-gen:codegen`, and the generated
+`packages/sdk-core/src/proto/**` is gitignored — a bare `pnpm exec playwright test`
+on a clean checkout finds no tests (`Cannot find module …_pb.js`).
+
+The dev server listens on the literal loopback in `vite/devServer.ts`
+(`127.0.0.1:5173`), never the name `localhost` — Node binds only the first address
+the resolver returns for a name, so a `::1`-first host used to leave Vite on `[::1]`
+while readiness polled `127.0.0.1`. Playwright passes that same address to
+`pnpm dev --host … --port …` and polls it (`e2eEnv.loopbackBaseUrl`); the browser
+reaches it through `<org>.localhost`, which Chromium resolves to loopback itself.
 
 Playwright starts `pnpm dev` itself (or reuses a running one — it **must** be
 dev mode: a `pnpm preview`/prod server has the `__E2E_HOOKS__` bus
@@ -323,7 +333,7 @@ so an org's live-meeting count only climbs toward
 run against a cap of 10 used to fail partway with a 403 the pipeline blamed on
 the diff. A default here would silently restore that: green on the first run of
 the day, 403 later. Running the suite by hand therefore needs an explicit value,
-e.g. `E2E_ORG_SUBDOMAIN=demo pnpm --filter @darktower/web-app test:e2e` against
+e.g. `E2E_ORG_SUBDOMAIN=demo pnpm nx run web-app:test:e2e` against
 a hand-seeded org.
 
 `E2E_BASE_URL` **derives** from `E2E_ORG_SUBDOMAIN` rather than being a second

@@ -72,7 +72,15 @@ export default defineConfig({
     // Dev mode is load-bearing: `__E2E_HOOKS__` (the window.__darktower_test__
     // bus) and the dev cert-fingerprint define are compile-time gates that only
     // exist in dev builds. Never point this at `pnpm preview`/a prod build.
-    command: 'pnpm dev',
+    //
+    // Listen address: passed EXPLICITLY, read back from the same `loopbackBaseUrl`
+    // that `url` below polls (e2e/env.ts, itself derived from vite/devServer.ts) —
+    // one value for "where Vite binds" and "where readiness dials", so a resolver
+    // that answers `localhost` with ::1 first can no longer split them. Redundant
+    // with vite.config.ts's own default on purpose: it also carries an E2E_BASE_URL
+    // port override, which the config default cannot see. `--strictPort` is in the
+    // config too (a taken port fails loudly, never silently moves).
+    command: `pnpm dev --host ${e2eEnv.devServerListen.host} --port ${e2eEnv.devServerListen.port} --strictPort`,
     // Story 2 R-30 / story 3 R-1: the suite's N and M, written once in
     // e2e/cohort.ts and derived here. Only reaches a server Playwright STARTS; a
     // reused one keeps the values it was started with, so every multi-party

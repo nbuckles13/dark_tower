@@ -1941,4 +1941,24 @@ assert_rc "browser-timeout-default-extracted" 1 "$([[ "$browser_default" =~ ^[0-
 assert_status "runbook-env-test-timeout-default" "\`DEVLOOP_ENV_TEST_TIMEOUT\` default ${env_test_default}s" "$(cat "$RUNBOOK_DV")"
 assert_status "runbook-browser-timeout-default" "\`DEVLOOP_BROWSER_E2E_TIMEOUT\` default ${browser_default}s" "$(cat "$RUNBOOK_DV")"
 
+# === Browser suite runs through the Nx task graph (codegen dependency) ========================
+# The generated `packages/sdk-core/src/proto/**` is gitignored; only an nx invocation honours the
+# web-app `test:e2e` target's `dependsOn: proto-gen:codegen`. A `pnpm --filter … test:e2e` run on a
+# clean checkout failed on a missing `_pb.js` (CI spike on a fresh runner). Pin both halves: the
+# call site goes through nx, and the target it names still declares the dependency (and is never
+# cached — a live-cluster suite replayed from cache would be a green that tested nothing).
+WEB_APP_PROJECT_JSON="${REPO_ROOT}/packages/web-app/project.json"
+assert_status "browser-e2e-via-nx" \
+  'browser_cmd=(pnpm exec nx run web-app:test:e2e)' "$(code_of "$LAYER7")"
+assert_absent "browser-e2e-no-pnpm-filter-bypass" 'pnpm --filter @darktower/web-app test:e2e' "$(code_of "$LAYER7")"
+# Same contract for the opt-in capacity-evidence run (it shares playwright.config.ts's harness).
+for tgt in test:e2e test:capacity-evidence; do
+  assert_status "browser-target-codegen-dep-${tgt#test:}" 'codegen-dep-ok cache-off' "$(python3 -c '
+import json, sys
+t = json.load(open(sys.argv[1]))["targets"][sys.argv[2]]
+dep = {"projects": ["proto-gen"], "target": "codegen"} in t.get("dependsOn", [])
+print(("codegen-dep-ok" if dep else "codegen-dep-MISSING") + (" cache-off" if t.get("cache") is False else " cache-NOT-off"))
+' "$WEB_APP_PROJECT_JSON" "$tgt")"
+done
+
 report_results "scripts/layer7.test.sh"

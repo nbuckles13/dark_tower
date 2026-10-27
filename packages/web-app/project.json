@@ -40,10 +40,20 @@
     },
     "test:e2e": {
       "executor": "nx:run-commands",
+      "cache": false,
       "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
       "options": {
         "cwd": "packages/web-app",
         "command": "playwright test"
+      }
+    },
+    "test:capacity-evidence": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
+      "options": {
+        "cwd": "packages/web-app",
+        "command": "playwright test --config playwright.capacity.config.ts"
       }
     },
     "lint": {
