@@ -110,8 +110,13 @@ SHARD_SUMMARY_FILE="layer-summary.txt"
 # Then TOTAL_RESULT = worst status, exit = max(status_to_exit_code(TOTAL), every RC) — the
 # same aggregation and observed-rc FLOOR as a single invocation.
 aggregate_shard_summaries() {
-  local dir="$1" f line n status dur rc shard
+  local dir="$1" f line n status dur rc shard suite
   local -a files=()
+  # Layer LAYER_MAX may be SPLIT across shards by suite (DEVLOOP_LAYER7_SUITE): one line per
+  # suite, each carrying SUITE=. suite_shard maps suite -> the shard that ran it; split_seen
+  # marks that layer LAYER_MAX arrived split (so a whole-layer line beside it is a duplicate).
+  local -A suite_shard=()
+  local split_seen=0
   agg_fail() {
     printf 'PRECONDITION_FAILURE: --aggregate: %s REASON=aggregate-%s\n' "$2" "$1" >&2
     printf 'STATUS=PRECONDITION_FAILURE REASON=aggregate-%s\n' "$1"
@@ -123,15 +128,43 @@ aggregate_shard_summaries() {
   for f in "${files[@]}"; do
     shard="$(basename "$(dirname "$f")")"
     while IFS= read -r line || [[ -n "$line" ]]; do
-      if [[ ! "$line" =~ ^LAYER=([1-9][0-9]*)\ RESULT=([A-Z/_-]+)\ DURATION=([0-9]+)\ RC=([0-9]+)$ ]]; then
+      if [[ ! "$line" =~ ^LAYER=([1-9][0-9]*)\ RESULT=([A-Z/_-]+)\ DURATION=([0-9]+)\ RC=([0-9]+)(\ SUITE=([a-z0-9-]+))?$ ]]; then
         agg_fail malformed-line "${f}: unparseable line ${line@Q}"; return 2
       fi
       n="${BASH_REMATCH[1]}"; status="${BASH_REMATCH[2]}"; dur="${BASH_REMATCH[3]}"; rc="${BASH_REMATCH[4]}"
+      suite="${BASH_REMATCH[6]}"
       if [[ "$status" != "UNKNOWN" && "$(__status_rank "$status")" -ge "$(__status_rank UNKNOWN)" ]]; then
         agg_fail unknown-status "${f}: layer ${n} RESULT=${status} is not a pipeline status"; return 2
       fi
       if (( n > LAYER_MAX )); then
         agg_fail layer-out-of-range "${f}: layer ${n} is outside 1..${LAYER_MAX}"; return 2
+      fi
+      if [[ -n "$suite" ]]; then
+        # A suite-split layer-LAYER_MAX line: merge it (worst status, max rc, max duration —
+        # the suites ran in parallel jobs) instead of rejecting the second one as a duplicate.
+        if (( n != LAYER_MAX )); then
+          agg_fail malformed-line "${f}: SUITE= is only valid on layer ${LAYER_MAX} (got it on layer ${n})"; return 2
+        fi
+        if ! layer7_suite_known "$suite"; then
+          agg_fail unknown-suite "${f}: layer ${n} SUITE=${suite} is not one of: ${LAYER7_SUITES[*]}"; return 2
+        fi
+        if [[ -n "${suite_shard[$suite]:-}" ]]; then
+          agg_fail duplicate-suite "layer ${n} suite ${suite} reported by both ${suite_shard[$suite]} and ${shard}"; return 2
+        fi
+        if [[ -n "${layer_status[$n]:-}" && "$split_seen" -eq 0 ]]; then
+          agg_fail duplicate-layer "layer ${n} reported whole by ${layer_shard[$n]} and as suite ${suite} by ${shard}"; return 2
+        fi
+        suite_shard[$suite]="$shard"
+        if (( split_seen )); then
+          layer_status[n]="$(aggregate_worst_status "${layer_status[$n]}" "$status")"
+          (( dur > layer_dur[n] )) && layer_dur[n]="$dur"
+          (( rc > layer_rc[n] )) && layer_rc[n]="$rc"
+          layer_shard[$n]="${layer_shard[$n]}+${shard}"
+        else
+          layer_status[n]="$status"; layer_dur[n]="$dur"; layer_rc[n]="$rc"; layer_shard[$n]="$shard"
+          split_seen=1
+        fi
+        continue
       fi
       if [[ -n "${layer_status[$n]:-}" ]]; then
         agg_fail duplicate-layer "layer ${n} reported by both ${layer_shard[$n]} and ${shard}"; return 2
@@ -139,6 +172,15 @@ aggregate_shard_summaries() {
       layer_status[$n]="$status"; layer_dur[$n]="$dur"; layer_rc[$n]="$rc"; layer_shard[$n]="$shard"
     done < "$f"
   done
+  # A split layer LAYER_MAX is complete only when EVERY suite was run by some shard: a suite
+  # dropped from the CI partition must fail here, never read as a green Layer 7.
+  if (( split_seen )); then
+    local s missing_suites=""
+    for s in "${LAYER7_SUITES[@]}"; do
+      [[ -n "${suite_shard[$s]:-}" ]] || missing_suites="${missing_suites:+${missing_suites},}${s}"
+    done
+    [[ -z "$missing_suites" ]] || { agg_fail missing-suite "layer ${LAYER_MAX} suite(s) ${missing_suites} reported by no shard — a suite-split layer ${LAYER_MAX} must cover: ${LAYER7_SUITES[*]}"; return 2; }
+  fi
   local missing=""
   for n in "${layers_to_run[@]}"; do
     [[ -n "${layer_status[$n]:-}" ]] || missing="${missing:+${missing},}${n}"
@@ -268,6 +310,32 @@ case "$mode" in
 esac
 layer_hi="${layers_to_run[-1]}"
 
+# --- Layer-7 suite selector (DEVLOOP_LAYER7_SUITE; scripts/layer7.sh header §SUITE SELECTOR) ---
+# Passed to layer7.sh by plain environment inheritance, like every other layer knob
+# (DEVLOOP_ENV_TEST_TIMEOUT, ...); this script adds no flag for it. It is a CI-SHARD-ONLY
+# narrowing of Layer 7, so it is refused here in every mode that could stand for the whole
+# pipeline: a full run (the Gate-2 authority — a verdict over half of Layer 7 would be a
+# forged PASS) and a --max-layer fast lane. In shard mode it must name a known suite AND the
+# shard must include layer LAYER_MAX — a selector with nothing to select is a CI wiring bug,
+# never silently ignored. The shard records it as SUITE= on its layer-LAYER_MAX summary line,
+# and --aggregate (which runs no layer, so ignores the variable) requires those fields to
+# cover LAYER7_SUITES exactly.
+layer7_suite="${DEVLOOP_LAYER7_SUITE:-}"
+if [[ -n "$layer7_suite" && "$mode" != "aggregate" ]]; then
+  if [[ "$mode" != "shard" ]]; then
+    printf 'PRECONDITION_FAILURE: DEVLOOP_LAYER7_SUITE=%q runs only part of Layer %s, which is allowed only in a CI shard (--layers ...,%s); a full or --max-layer run always runs every suite — unset it. REASON=layer7-suite-outside-shard\n' "$layer7_suite" "$LAYER_MAX" "$LAYER_MAX" >&2
+    exit 2
+  fi
+  if ! layer7_suite_known "$layer7_suite"; then
+    printf 'PRECONDITION_FAILURE: DEVLOOP_LAYER7_SUITE=%q is not a Layer-%s suite (valid: %s). REASON=layer7-suite-invalid\n' "$layer7_suite" "$LAYER_MAX" "${LAYER7_SUITES[*]}" >&2
+    exit 2
+  fi
+  if [[ "$layer_hi" != "$LAYER_MAX" ]]; then
+    printf 'PRECONDITION_FAILURE: DEVLOOP_LAYER7_SUITE=%s is set but this shard (--layers %s) does not run layer %s. REASON=layer7-suite-without-layer%s\n' "$layer7_suite" "$layers_arg" "$LAYER_MAX" "$LAYER_MAX" >&2
+    exit 2
+  fi
+fi
+
 # The per-layer accumulators (layer_status / layer_dur / layer_rc) are declared at the top
 # ("One result model"), i.e. BEFORE the EXIT trap installs, so emit_gate2_verdict's namerefs
 # always bind to existing (possibly-empty) arrays, even on an early exit that fires before
@@ -389,7 +457,7 @@ if (( fast_lane )); then
   printf 'FAST_LANE=1 LAYERS=%d-%d — developer inner-loop check; NOT an authority Gate-2 run; no verdict emitted. Layer %d (shared cluster) is the Lead Gate 2.\n' "$layer_lo" "$layer_hi" "$LAYER_MAX" >&2
 fi
 if (( shard_mode )); then
-  printf 'CI_SHARD=1 LAYERS=%s — runs these layers from scratch; no verdict emitted; the Test Suite job aggregates every shard (--aggregate).\n' "$layers_arg" >&2
+  printf 'CI_SHARD=1 LAYERS=%s%s — runs these layers from scratch; no verdict emitted; the Test Suite job aggregates every shard (--aggregate).\n' "$layers_arg" "${layer7_suite:+ LAYER7_SUITE=${layer7_suite}}" >&2
 fi
 
 for n in "${layers_to_run[@]}"; do
@@ -505,7 +573,11 @@ print_layer_summary
 # (--aggregate). One line per layer this shard ran, in the shape the aggregate parses.
 if (( shard_mode )); then
   for n in "${layers_to_run[@]}"; do
-    printf 'LAYER=%d RESULT=%s DURATION=%s RC=%s\n' "$n" "${layer_status[$n]:-UNKNOWN}" "${layer_dur[$n]:-0}" "${layer_rc[$n]:-0}"
+    # SUITE= only on the layer-LAYER_MAX line of a suite-selected shard (validated above);
+    # its absence means "every Layer-7 suite", which is what --aggregate assumes.
+    suite_field=""
+    if [[ -n "$layer7_suite" && "$n" -eq "$LAYER_MAX" ]]; then suite_field=" SUITE=${layer7_suite}"; fi
+    printf 'LAYER=%d RESULT=%s DURATION=%s RC=%s%s\n' "$n" "${layer_status[$n]:-UNKNOWN}" "${layer_dur[$n]:-0}" "${layer_rc[$n]:-0}" "$suite_field"
   done > "${DEVLOOP_TMP}/${SHARD_SUMMARY_FILE}"
 fi
 

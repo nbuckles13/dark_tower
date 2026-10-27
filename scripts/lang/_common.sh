@@ -52,6 +52,22 @@ DEVLOOP_TMP="${DEVLOOP_TMP:-/tmp/devloop}"
 # the last. A plain assignment (not readonly): several wrappers source this file twice.
 LAYER_MAX=7
 
+# Layer LAYER_MAX's Phase-2 suites, in run order. The ONE home of the list: layer7.sh
+# validates DEVLOOP_LAYER7_SUITE against it, and layer-all.sh --aggregate requires the CI
+# shards' SUITE= fields to cover it exactly (a suite no shard ran fails the aggregate).
+# A plain assignment for the same reason as LAYER_MAX.
+LAYER7_SUITES=(env-tests browser-e2e)
+
+# True iff $1 is exactly one name from LAYER7_SUITES.
+# Args: $1=candidate  Returns: 0 if known, 1 otherwise.
+layer7_suite_known() {
+  local s
+  for s in "${LAYER7_SUITES[@]}"; do
+    [[ "$1" == "$s" ]] && return 0
+  done
+  return 1
+}
+
 init_devloop_tmp() {
   mkdir -p "$DEVLOOP_TMP"
   chmod 700 "$DEVLOOP_TMP"
