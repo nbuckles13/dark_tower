@@ -573,7 +573,7 @@ test('a slot state change recomputes ONLY that tile; a mute change ONLY that par
 
   // A never-written cell is READ first (inside a $derived), then written: the
   // factory constructs only, so no state_unsafe_mutation.
-  await expect.element(screen.getByTestId('tile-3')).toHaveTextContent('none');
+  await expect.element(screen.getByTestId('tile-3')).toMatchTextContent('none');
   session.fire('streamAssignments', {
     unreachableSenderIds: [],
     assignments: [
@@ -581,7 +581,7 @@ test('a slot state change recomputes ONLY that tile; a mute change ONLY that par
       slot({ slotId: 4, mediaKind: 'video', senderId: 8, slotState: 'avatar_no_video' }),
     ],
   });
-  await expect.element(screen.getByTestId('tile-4')).toHaveTextContent('avatar_no_video');
+  await expect.element(screen.getByTestId('tile-4')).toMatchTextContent('avatar_no_video');
 
   const base = { ...counts };
   session.fire('streamAssignments', {
@@ -591,7 +591,7 @@ test('a slot state change recomputes ONLY that tile; a mute change ONLY that par
       slot({ slotId: 4, mediaKind: 'video', senderId: 8, slotState: 'avatar_no_video' }),
     ],
   });
-  await expect.element(screen.getByTestId('tile-3')).toHaveTextContent('avatar_client_muted');
+  await expect.element(screen.getByTestId('tile-3')).toMatchTextContent('avatar_client_muted');
   expect(counts.tile4).toBe(base.tile4);
   expect(counts.tile3).toBeGreaterThan(base.tile3); // positive control
 
@@ -603,13 +603,13 @@ test('a slot state change recomputes ONLY that tile; a mute change ONLY that par
   session.fire('participantJoined', {
     participant: { participantId: 'y', name: 'Y', mediaStates: mediaStates() },
   });
-  await expect.element(screen.getByTestId('row-y')).toHaveTextContent('audio-ok');
+  await expect.element(screen.getByTestId('row-y')).toMatchTextContent('audio-ok');
   const muteBase = { ...counts };
   session.fire('participantMuteChanged', {
     participantId: 'x',
     mediaStates: mediaStates({ video: { serverMuted: true, serverMutedBy: 'h' } }),
   });
-  await expect.element(screen.getByTestId('row-x')).toHaveTextContent('video-server-muted');
+  await expect.element(screen.getByTestId('row-x')).toMatchTextContent('video-server-muted');
   expect(counts.rowY).toBe(muteBase.rowY);
   expect(counts.tile3).toBe(muteBase.tile3);
   expect(counts.tile4).toBe(muteBase.tile4);
@@ -622,7 +622,7 @@ test('a slot state change recomputes ONLY that tile; a mute change ONLY that par
     participantId: 'y',
     mediaStates: mediaStates({ audio: { clientState: 'client_muted' } }),
   });
-  await expect.element(screen.getByTestId('row-y')).toHaveTextContent('client-audio:client_muted');
+  await expect.element(screen.getByTestId('row-y')).toMatchTextContent('client-audio:client_muted');
   expect(counts.rowX).toBe(clientBase.rowX);
   expect(counts.tile3).toBe(clientBase.tile3);
   expect(counts.rowY).toBeGreaterThan(clientBase.rowY); // positive control
@@ -630,7 +630,7 @@ test('a slot state change recomputes ONLY that tile; a mute change ONLY that par
   // A render transition is a slot change too: only that tile.
   const renderBase = { ...counts };
   session.fire('videoSlotRenderChanged', { slotId: 4, state: { kind: 'unavailable' } });
-  await expect.element(screen.getByTestId('tile-4')).toHaveTextContent('unavailable');
+  await expect.element(screen.getByTestId('tile-4')).toMatchTextContent('unavailable');
   expect(counts.tile3).toBe(renderBase.tile3);
   expect(counts.rowX).toBe(renderBase.rowX);
 });
@@ -655,7 +655,7 @@ test('decoded frames NEVER touch the store: a paint recomputes nothing and is co
     },
   });
   session.fire('videoSlotRenderChanged', { slotId: 3, state: { kind: 'active', senderId: 7 } });
-  await expect.element(screen.getByTestId('tile-3')).toHaveTextContent('active');
+  await expect.element(screen.getByTestId('tile-3')).toMatchTextContent('active');
   await expect.poll(() => sinks.get(3)).toBeDefined();
   const base = { ...counts };
   const canvas = new OffscreenCanvas(64, 36);
