@@ -1,6 +1,8 @@
-# Paths whose changes need the repository owner's review before they reach main
-# (enforced by the "PR merge" ruleset's "Require review from Code Owners"). The
-# base branch's copy applies, so a PR cannot remove itself from review.
+# Paths whose changes the repository owner reviews before they reach main. This
+# file requests that review; it does not enforce it: the "PR merge" ruleset's
+# "Require review from Code Owners" is off, because a sole maintainer cannot
+# approve their own PR. Turn it on once there is a second reviewer (the base
+# branch's copy of this file then applies, so a PR cannot remove itself).
 #
 # CI workflows run with repository tokens; the image build context and CI build
 # script decide what ends up in published images.
