@@ -112,7 +112,7 @@ tonic-prost = "0.14"
 
 # Database clients
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate"] }
-redis = { version = "0.26", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.6", features = ["tokio-comp", "connection-manager"] }
 
 # Observability
 tracing = "0.1"
