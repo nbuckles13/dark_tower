@@ -98,7 +98,7 @@ jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
 
 # Serial test execution for stateful tests
-serial_test = "3.1"
+serial_test = "4.0"
 
 # Time utilities for timestamp checks
 chrono = { workspace = true }
