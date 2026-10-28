@@ -262,32 +262,120 @@ image_build_args() {
     esac
 }
 
-# Build a first-party image, tag it by its content, load it into Kind unless
-# the node already holds that ref, and record it in BUILT_REFS. `localhost/<name>` is built from
+# The Dockerfile stage every first-party image is built from: the hardened
+# distroless `runtime` stage. Never the default (last) stage — in the service
+# Dockerfiles that is `runtime-with-healthcheck`, distroless :debug with a
+# busybox shell. Shared by this converge and the CI image build
+# (infra/ci/build-push-images.sh), so Kind runs what would be published.
+IMAGE_BUILD_TARGET="runtime"
+
+# Every `docker build` flag for <repo> except output/tag flags, one per line:
+# the target stage, the build-args (image_build_args), and the opt-in BuildKit
+# layer cache. The ONE flag source for both build paths (local converge, CI push).
+# DT_IMAGE_BUILD_CACHE: unset = no cache flags; `gha` = GitHub Actions cache,
+# scoped per image (needs BUILDX_BUILDER = a docker-container builder and the
+# Actions runtime token in the environment). A failed cache export never fails
+# the build (ignore-error); a cache miss just builds.
+image_build_flags() {
+    local repo="$1" scope
+    printf '%s\n' "--target" "${IMAGE_BUILD_TARGET}"
+    image_build_args "${repo}" || return 1
+    case "${DT_IMAGE_BUILD_CACHE:-}" in
+        "") ;;
+        gha)
+            scope="$(image_cache_scope "${repo}")" || return 1
+            printf '%s\n' "--cache-from" "type=gha,scope=${scope}" \
+                "--cache-to" "type=gha,mode=max,scope=${scope},ignore-error=true"
+            ;;
+        *)
+            log_error "DT_IMAGE_BUILD_CACHE='${DT_IMAGE_BUILD_CACHE}' is not a known cache backend (gha)"
+            return 1
+            ;;
+    esac
+}
+
+# The layer-cache scope for <repo>: derived from its Dockerfile's build
+# instructions before the `${IMAGE_BUILD_TARGET}` stage (comments and blank lines
+# dropped — they do not affect BuildKit cache keys). Images whose builder stages
+# are identical (the four service images) share one scope, so their dependency
+# layers are stored once; a builder that drifts gets its own scope automatically.
+# Fails when the Dockerfile has no `AS ${IMAGE_BUILD_TARGET}` stage.
+# (scripts/guards/simple/validate-shared-image-builder.sh holds the service images
+# to ONE scope through these same two functions.)
+image_cache_scope() {
+    local sum
+    sum="$(image_builder_instructions "$1" | sha256sum)" || return 1
+    printf 'builder-%s\n' "${sum:0:16}"
+}
+
+# The build instructions of <repo>'s Dockerfile before the target stage, without
+# comments or blank lines: what image_cache_scope hashes.
+image_builder_instructions() {
+    local df="${PROJECT_ROOT}/infra/docker/${1#localhost/}/Dockerfile"
+    if ! grep -qE "^FROM .* AS ${IMAGE_BUILD_TARGET}([[:space:]]|\$)" "${df}"; then
+        log_error "${df} has no 'AS ${IMAGE_BUILD_TARGET}' stage to build."
+        return 1
+    fi
+    awk -v t="${IMAGE_BUILD_TARGET}" \
+        '$0 ~ ("^FROM .* AS " t "([[:space:]]|$)") { exit } !/^[[:space:]]*(#|$)/' "${df}"
+}
+
+# The digest-pinned image to use for <repo> instead of building it, from
+# DT_PREBUILT_IMAGES (a file of `<repo> <registry>/<name>@sha256:<64 hex>` lines,
+# written by the CI build job). Fails loudly when the file lacks <repo> or the
+# ref is not digest-pinned — a tag could be repointed between build and test.
+prebuilt_image_ref() {
+    local repo="$1" ref
+    ref="$(awk -v r="${repo}" '$1 == r { print $2 }' "${DT_PREBUILT_IMAGES}")" || return 1
+    if [[ ! "${ref}" =~ ^[a-z0-9./_-]+@sha256:[0-9a-f]{64}$ ]]; then
+        log_error "DT_PREBUILT_IMAGES (${DT_PREBUILT_IMAGES}) has no digest-pinned ref for ${repo} (got '${ref}'); refusing to build or guess."
+        return 1
+    fi
+    printf '%s\n' "${ref}"
+}
+
+# Produce a first-party image, tag it by its content, load it into Kind unless
+# the node already holds that ref, and record it in BUILT_REFS. With
+# DT_PREBUILT_IMAGES set the image is PULLED by digest (CI: built once by the
+# build job, tested here); otherwise `localhost/<name>` is built from
 # infra/docker/<name>/Dockerfile with the repo root as context (convention —
 # first_party_repos() fails on a repo without that Dockerfile).
 # Usage: build_content_tagged_image <repo>
 build_content_tagged_image() {
-    local repo="$1" name cmd iid_file iid tag ref args=()
+    local repo="$1" name cmd iid_file iid tag ref src args=()
     name="${repo#localhost/}"
     cmd="$(container_cmd)"
-    # Fast-fail on insufficient host disk before the (multi-minute) cold build.
-    check_build_disk_space "${cmd}"
-    local build_args
-    build_args="$(image_build_args "${repo}")" || return 1
-    [[ -z "${build_args}" ]] || mapfile -t args <<< "${build_args}"
-    iid_file="$(mktemp "${TMPDIR:-/tmp}/dt-iid.XXXXXX")"
-    log_step "Building ${repo} container image..."
-    if ! ${cmd} build --iidfile "${iid_file}" "${args[@]}" \
-            -f "${PROJECT_ROOT}/infra/docker/${name}/Dockerfile" "${PROJECT_ROOT}"; then
+    if [[ -n "${DT_PREBUILT_IMAGES:-}" ]]; then
+        src="$(prebuilt_image_ref "${repo}")" || return 1
+        log_step "Pulling prebuilt ${repo} (${src})..."
+        ${cmd} pull "${src}" || { log_error "Pull failed: ${src}"; return 1; }
+        iid="$(${cmd} image inspect --format '{{.Id}}' "${src}")" || return 1
+    else
+        # Fast-fail on insufficient host disk before the (multi-minute) cold build.
+        check_build_disk_space "${cmd}"
+        local flags
+        flags="$(image_build_flags "${repo}")" || return 1
+        mapfile -t args <<< "${flags}"
+        # A docker-container builder (cache path) keeps results in its own store;
+        # --load puts the image in the daemon for the tag + kind load below.
+        [[ -z "${DT_IMAGE_BUILD_CACHE:-}" ]] || args+=(--load)
+        iid_file="$(mktemp "${TMPDIR:-/tmp}/dt-iid.XXXXXX")"
+        log_step "Building ${repo} container image..."
+        if ! ${cmd} build --iidfile "${iid_file}" "${args[@]}" \
+                -f "${PROJECT_ROOT}/infra/docker/${name}/Dockerfile" "${PROJECT_ROOT}"; then
+            rm -f "${iid_file}"
+            log_error "Image build failed: ${repo}"
+            return 1
+        fi
+        iid="$(cat "${iid_file}" 2>/dev/null || true)"
         rm -f "${iid_file}"
-        log_error "Image build failed: ${repo}"
-        return 1
+        if [[ -z "${iid}" ]]; then
+            log_error "Image build of ${repo} wrote no image ID (--iidfile empty); refusing to guess a tag."
+            return 1
+        fi
     fi
-    iid="$(cat "${iid_file}" 2>/dev/null || true)"
-    rm -f "${iid_file}"
     if [[ -z "${iid}" ]]; then
-        log_error "Image build of ${repo} wrote no image ID (--iidfile empty); refusing to guess a tag."
+        log_error "No image ID for prebuilt ${repo}; refusing to guess a tag."
         return 1
     fi
     tag="$(content_tag "${iid}")" || return 1

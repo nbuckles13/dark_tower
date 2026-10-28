@@ -14,7 +14,9 @@
 # (32 jobs each) with two devloops running exhausted the VM on 2026-09-27.
 #
 # The cap is PER cargo invocation: two devloops building at once still double the
-# load (docs/TODO.md, cross-devloop build coordination).
+# load (docs/TODO.md, cross-devloop build coordination). The service image builder,
+# which runs four cargo builds in parallel, shares this ONE number across them via
+# a jobserver (infra/docker/*-service/Dockerfile).
 #
 # To change it for YOUR machine without changing it for everyone: export
 # `CARGO_BUILD_JOBS=N` (raise on a bigger box, lower on a weaker one) or pass
