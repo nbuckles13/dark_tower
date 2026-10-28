@@ -19,6 +19,7 @@ use dt_guard::counter_zero_init;
 use dt_guard::cross_boundary_classification;
 use dt_guard::cross_boundary_scope;
 use dt_guard::dashboard_panels;
+use dt_guard::docker_context;
 use dt_guard::env_config;
 use dt_guard::grafana_datasources;
 use dt_guard::gsa_sync;
@@ -147,6 +148,15 @@ enum Command {
     /// Release-build premise: assert shipped artifacts are built with
     /// debug-assertions off, so ADR-0036 §11's compile-time control is armed.
     ReleaseBuildProfile {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// The image build context (`.dockerignore` allowlist) holds no key material or secret files.
+    DockerContext {
         /// Repository root for path resolution.
         #[arg(long)]
         root: PathBuf,
@@ -529,6 +539,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::ReleaseBuildProfile { root, explain } => {
             release_build_profile::run(&root, explain)
         }
+        Command::DockerContext { root, explain } => docker_context::run(&root, explain),
         Command::BinLibSingleCompile { root, explain } => {
             bin_lib_single_compile::run(&root, explain)
         }
