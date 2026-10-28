@@ -2115,7 +2115,7 @@ assert_status "runbook-browser-timeout-default" "\`DEVLOOP_BROWSER_E2E_TIMEOUT\`
 # cached — a live-cluster suite replayed from cache would be a green that tested nothing).
 WEB_APP_PROJECT_JSON="${REPO_ROOT}/packages/web-app/project.json"
 assert_status "browser-e2e-via-nx" \
-  'browser_cmd=(pnpm exec nx run web-app:test:e2e)' "$(code_of "$LAYER7")"
+  'browser_cmd=(pnpm exec nx run web-app:test:e2e "$NX_PIPELINE_OUTPUT_STYLE")' "$(code_of "$LAYER7")"
 assert_absent "browser-e2e-no-pnpm-filter-bypass" 'pnpm --filter @darktower/web-app test:e2e' "$(code_of "$LAYER7")"
 # Same contract for the opt-in capacity-evidence run (it shares playwright.config.ts's harness).
 for tgt in test:e2e test:capacity-evidence; do

@@ -95,6 +95,8 @@ __layer7_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 __repo_root="$(cd "${__layer7_dir}/.." && pwd)"
 # shellcheck source=lang/_common.sh
 source "${__layer7_dir}/lang/_common.sh"
+# shellcheck source=lang/_pnpm.sh
+source "${__layer7_dir}/lang/_pnpm.sh"  # NX_PIPELINE_OUTPUT_STYLE for the browser suite
 
 # --- Test seams, DEVLOOP_TEST-gated (security; same class as LAYER_SCRIPT_DIR) ---
 # These three env overrides REDIRECT or EXECUTE the cluster machinery: the dev-cluster
@@ -1684,8 +1686,9 @@ __layer7_main() {
       # gitignored, so a pnpm-filter run on a clean checkout died on a missing `_pb.js`
       # (FAIL browser-e2e-failed for an absent build artifact). Same shape as the layer 1-6
       # TS wrappers (lang/ts/*.sh: `pnpm exec nx …`); codegen is Nx-cached, so it costs
-      # ~nothing when proto/ is unchanged.
-      browser_cmd=(pnpm exec nx run web-app:test:e2e)
+      # ~nothing when proto/ is unchanged. Output style from _pnpm.sh, like those wrappers, so
+      # an agent shell still gets the failing spec's output inline.
+      browser_cmd=(pnpm exec nx run web-app:test:e2e "$NX_PIPELINE_OUTPUT_STYLE")
     fi
 
     # Suite URLs: the SAME ports.json-derived values the Rust suite just used (exported
