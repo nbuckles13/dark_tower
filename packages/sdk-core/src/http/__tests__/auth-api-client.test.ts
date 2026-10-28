@@ -21,7 +21,7 @@ import { ValidationError } from '../../errors/ValidationError.js';
 const AC_TEMPLATE = 'https://{subdomain}.localhost:8443';
 
 const server = setupServer();
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
@@ -189,7 +189,7 @@ describe('AuthApiClient.login', () => {
 
 describe('AuthApiClient client-side validation (R-11 / R-31)', () => {
   it('rejects an invalid subdomain before any network call (injection prevention)', async () => {
-    // onUnhandledRequest: 'error' means any fetch would fail the test; assert none fires.
+    // onUnhandledFrame: 'error' means any fetch would fail the test; assert none fires.
     await expect(
       client().register({
         subdomain: 'Bad_Sub!',

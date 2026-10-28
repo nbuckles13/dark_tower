@@ -20,7 +20,7 @@ const GC_BASE = 'https://localhost:8444';
 const VALID_CODE = 'Abc123Def456'; // 12-char base62
 
 const server = setupServer();
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+beforeAll(() => server.listen({ onUnhandledFrame: 'error' }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
