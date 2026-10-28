@@ -2391,7 +2391,10 @@ rv_arg="$(cat "${REPO_ROOT}"/infra/docker/*/Dockerfile "${REPO_ROOT}/infra/devlo
 assert_rc "rust-version-dockerfiles-nonvacuous" 0 "$([[ "$rv_files" -ge 6 && "$rv_from" -eq "$rv_files" && "$rv_arg" -eq "$rv_files" ]] && echo 0 || echo "1 (files=${rv_files} from=${rv_from} arg=${rv_arg})")"
 rv_install="$(cat "${REPO_ROOT}"/.github/workflows/*.yml | grep -cE '^[[:space:]]+rustup toolchain install$')"
 assert_rc "rust-version-workflows-read-the-file" 0 "$([[ "$rv_install" -ge 4 ]] && echo 0 || echo "1 (${rv_install} no-arg installs)")"
-assert_rc "dockerignore-excludes-rust-toolchain" 0 "$(grep -qx 'rust-toolchain.toml' "${REPO_ROOT}/.dockerignore" && echo 0 || echo 1)"
+# .dockerignore is an allowlist (dt-guard docker-context enforces the dialect):
+# rust-toolchain.toml stays out of the build context because `*` excludes it and
+# no `!` line re-includes it — the image reads RUST_VERSION as a build-arg only.
+assert_rc "dockerignore-excludes-rust-toolchain" 0 "$(grep -qx '\*' "${REPO_ROOT}/.dockerignore" && ! grep -qE '^!rust-toolchain\.toml/?$' "${REPO_ROOT}/.dockerignore" && echo 0 || echo 1)"
 # cargo-chef: ONE value (infra/cargo-tools.versions, read by deploy.sh), no Dockerfile default,
 # never an unpinned install.
 chef_sites="$(cat "${REPO_ROOT}"/infra/docker/*-service/Dockerfile | grep -c 'cargo install cargo-chef --locked --version "=${CARGO_CHEF_VERSION}"')"
