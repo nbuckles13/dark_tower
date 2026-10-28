@@ -41,7 +41,7 @@ pub fn gather_system_info() -> SystemInfo {
     sys.refresh_all();
 
     // Get global CPU usage (average across all cores)
-    let cpu_percent = sys.global_cpu_info().cpu_usage() as u32;
+    let cpu_percent = sys.global_cpu_usage() as u32;
 
     // Calculate memory usage percentage
     let total_memory = sys.total_memory();
