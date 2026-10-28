@@ -169,7 +169,7 @@ secrecy = { version = "0.10", features = ["serde"] }
 hex = "0.4"
 
 # JWT
-jsonwebtoken = "9.3"
+jsonwebtoken = "11.1"
 # `default-features = false` drops the `simd-unsafe` default (0.23+), the crate's
 # only `unsafe` code: we use only the scalar `general_purpose` engines. Every
 # member inherits this entry (no member-level literal, which would re-enable
