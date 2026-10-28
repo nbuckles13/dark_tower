@@ -56,7 +56,7 @@ hex = { workspace = true }
 base64 = { workspace = true }
 
 # System information for comprehensive heartbeats (ADR-0023 Phase 6c)
-sysinfo = "0.30"
+sysinfo = "0.39"
 
 # Metrics (ADR-0011 Observability, ADR-0023 Section 11)
 metrics = { workspace = true }
