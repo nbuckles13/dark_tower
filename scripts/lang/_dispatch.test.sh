@@ -885,7 +885,8 @@ __code_lines() {
 # Lane target names from <ts-test-script> and <layer7-script>, one per line.
 __nx_lane_names() {
   __code_lines "$1" | grep -oE 'nx run-many -t [^-]+' | sed -E 's/^nx run-many -t //' | tr ' ' '\n' | grep -E '^test' || true
-  __code_lines "$2" | grep -oE 'web-app test:[a-z0-9:-]+' | sed -E 's/^web-app //' | sort -u || true
+  # layer7.sh names the target as an nx project:target (`nx run web-app:test:e2e`).
+  __code_lines "$2" | grep -oE 'web-app:test:[a-z0-9:-]+' | sed -E 's/^web-app://' | sort -u || true
 }
 
 test_nx_test_targets_reached_by_a_lane() {
@@ -901,7 +902,7 @@ test_nx_test_targets_reached_by_a_lane() {
     'run_and_emit "nx-test" pnpm exec nx run-many -t test:unit --all  # was: nx run-many -t test:gone' \
     > "${tmp}/test.sh"
   printf '%s\n' '# 2. Browser E2E (`pnpm --filter @darktower/web-app test:ghost-e2e`)' \
-    'browser_cmd=(pnpm --filter @darktower/web-app test:e2e)' > "${tmp}/layer7.sh"
+    'browser_cmd=(pnpm exec nx run web-app:test:e2e "$NX_PIPELINE_OUTPUT_STYLE")' > "${tmp}/layer7.sh"
   local synth; synth="$(__nx_lane_names "${tmp}/test.sh" "${tmp}/layer7.sh")"
   rm -rf "$tmp"
   if [[ "$synth" == $'test:unit\ntest:e2e' ]]; then
