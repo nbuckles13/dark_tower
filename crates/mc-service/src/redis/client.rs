@@ -458,7 +458,7 @@ impl FencedRedisClient {
                 record_redis_latency("hset", start.elapsed());
                 r
             }
-            Err(e) if e.kind() == redis::ErrorKind::NoScriptError => {
+            Err(e) if e.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) => {
                 // Script not cached, use EVAL
                 let mut eval_cmd = redis::cmd("EVAL");
                 eval_cmd
