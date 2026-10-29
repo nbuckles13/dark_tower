@@ -361,4 +361,118 @@ mod tests {
             ]
         );
     }
+
+    /// A fresh scratch root for one test (removed first, so a crashed earlier
+    /// run cannot leak state into this one).
+    fn scratch(test: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dt-guard-docker-context-{test}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn rules(out: &[Violation]) -> Vec<String> {
+        let mut got: Vec<_> = out
+            .iter()
+            .map(|v| format!("{} {}", v.path, v.rule))
+            .collect();
+        got.sort();
+        got
+    }
+
+    #[test]
+    fn run_passes_a_clean_context_and_fails_a_dirty_one() {
+        let dir = scratch("run");
+        std::fs::create_dir_all(dir.join("ctx")).unwrap();
+        std::fs::write(dir.join("ctx").join("lib.rs"), "fn f() {}").unwrap();
+        // No .dockerignore: unreadable is an error, never a pass.
+        let missing = run(&dir, false).unwrap_err().to_string();
+        assert!(
+            missing.contains("docker-context-dockerignore-unreadable"),
+            "{missing}"
+        );
+
+        std::fs::write(dir.join(DOCKERIGNORE), "*\n!ctx/\n").unwrap();
+        assert!(run(&dir, false).is_ok());
+
+        std::fs::write(dir.join("ctx").join("id_ed25519"), "x").unwrap();
+        let dirty = run(&dir, false).unwrap_err().to_string();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(dirty, "docker-context-violations-1");
+    }
+
+    #[test]
+    fn value_shape_secrets_are_flagged_in_data_files_not_source() {
+        let dir = scratch("value-shape");
+        let inc = dir.join("ctx");
+        std::fs::create_dir_all(&inc).unwrap();
+        // Assembled at runtime so this file does not itself trip secret scanners.
+        let key = format!("key = \"{}{}\"\n", "AKIA", "ABCDEFGHIJKLMNOP");
+        std::fs::write(inc.join("settings.toml"), &key).unwrap();
+        std::fs::write(inc.join("fixture.rs"), &key).unwrap();
+        let allow = Allowlist {
+            includes: vec!["ctx".into()],
+            excluded_dir_names: vec![],
+        };
+        let mut out = Vec::new();
+        scan(&dir, &allow, &mut out);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // .rs source belongs to rust-no-hardcoded-secrets; the data file is ours.
+        assert_eq!(
+            rules(&out),
+            vec!["ctx/settings.toml content:AWS access key"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_includes_and_symlinks_are_violations() {
+        let dir = scratch("missing-symlink");
+        let inc = dir.join("ctx");
+        std::fs::create_dir_all(&inc).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", inc.join("link")).unwrap();
+        let allow = Allowlist {
+            includes: vec!["ctx".into(), "absent".into()],
+            excluded_dir_names: vec![],
+        };
+        let mut out = Vec::new();
+        scan(&dir, &allow, &mut out);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            rules(&out),
+            vec!["absent include-missing", "ctx/link symlink"]
+        );
+    }
+
+    /// Needs a non-root user: root reads mode-000 files regardless (CI runners
+    /// and the devloop container run tests unprivileged).
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_files_and_directories_are_violations_not_skips() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("unreadable");
+        let inc = dir.join("ctx");
+        std::fs::create_dir_all(inc.join("locked")).unwrap();
+        std::fs::write(inc.join("sealed.txt"), "x").unwrap();
+        let none = std::fs::Permissions::from_mode(0o000);
+        std::fs::set_permissions(inc.join("sealed.txt"), none.clone()).unwrap();
+        std::fs::set_permissions(inc.join("locked"), none).unwrap();
+        let allow = Allowlist {
+            includes: vec!["ctx".into()],
+            excluded_dir_names: vec![],
+        };
+        let mut out = Vec::new();
+        scan(&dir, &allow, &mut out);
+        let open = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(inc.join("locked"), open.clone()).unwrap();
+        std::fs::set_permissions(inc.join("sealed.txt"), open).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let got = rules(&out);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got[0].starts_with("ctx walk-error:"), "{got:?}");
+        assert!(got[1].starts_with("ctx/sealed.txt unreadable:"), "{got:?}");
+    }
 }
