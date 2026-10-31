@@ -266,7 +266,7 @@ image_build_args() {
 # distroless `runtime` stage. Never the default (last) stage — in the service
 # Dockerfiles that is `runtime-with-healthcheck`, distroless :debug with a
 # busybox shell. Shared by this converge and the CI image build
-# (infra/ci/build-push-images.sh), so Kind runs what would be published.
+# (infra/ci/build-images.sh), so Kind runs what would be published.
 IMAGE_BUILD_TARGET="runtime"
 
 # Every `docker build` flag for <repo> except output/tag flags, one per line:
@@ -320,14 +320,16 @@ image_builder_instructions() {
         '$0 ~ ("^FROM .* AS " t "([[:space:]]|$)") { exit } !/^[[:space:]]*(#|$)/' "${df}"
 }
 
-# The digest-pinned image to use for <repo> instead of building it, from
-# DT_PREBUILT_IMAGES (a file of `<repo> <registry>/<name>@sha256:<64 hex>` lines,
-# written by the CI build job). Fails loudly when the file lacks <repo> or the
-# ref is not digest-pinned — a tag could be repointed between build and test.
+# The content-pinned image to use for <repo> instead of building it, from
+# DT_PREBUILT_IMAGES (a file of `<repo> <ref>` lines written by the CI build job,
+# infra/ci/build-images.sh). <ref> is either `<registry>/<name>@sha256:<64 hex>`
+# (pulled by digest) or a bare image ID `sha256:<64 hex>` (already loaded into the
+# local store from a build archive; never pulled). Fails loudly when the file lacks
+# <repo> or the ref is neither — a tag could be repointed between build and test.
 prebuilt_image_ref() {
     local repo="$1" ref
     ref="$(awk -v r="${repo}" '$1 == r { print $2 }' "${DT_PREBUILT_IMAGES}")" || return 1
-    if [[ ! "${ref}" =~ ^[a-z0-9./_-]+@sha256:[0-9a-f]{64}$ ]]; then
+    if [[ ! "${ref}" =~ ^([a-z0-9./_-]+@)?sha256:[0-9a-f]{64}$ ]]; then
         log_error "DT_PREBUILT_IMAGES (${DT_PREBUILT_IMAGES}) has no digest-pinned ref for ${repo} (got '${ref}'); refusing to build or guess."
         return 1
     fi
@@ -336,8 +338,8 @@ prebuilt_image_ref() {
 
 # Produce a first-party image, tag it by its content, load it into Kind unless
 # the node already holds that ref, and record it in BUILT_REFS. With
-# DT_PREBUILT_IMAGES set the image is PULLED by digest (CI: built once by the
-# build job, tested here); otherwise `localhost/<name>` is built from
+# DT_PREBUILT_IMAGES set the image is PULLED by digest, or taken by image ID
+# from the local store (CI: built once by the build job, tested here); otherwise `localhost/<name>` is built from
 # infra/docker/<name>/Dockerfile with the repo root as context (convention —
 # first_party_repos() fails on a repo without that Dockerfile).
 # Usage: build_content_tagged_image <repo>
@@ -347,9 +349,15 @@ build_content_tagged_image() {
     cmd="$(container_cmd)"
     if [[ -n "${DT_PREBUILT_IMAGES:-}" ]]; then
         src="$(prebuilt_image_ref "${repo}")" || return 1
-        log_step "Pulling prebuilt ${repo} (${src})..."
-        ${cmd} pull "${src}" || { log_error "Pull failed: ${src}"; return 1; }
-        iid="$(${cmd} image inspect --format '{{.Id}}' "${src}")" || return 1
+        if [[ "${src}" == sha256:* ]]; then
+            log_step "Using prebuilt ${repo} (image ${src}) from the local store..."
+            iid="$(${cmd} image inspect --format '{{.Id}}' "${src}")" \
+                || { log_error "Prebuilt image ${src} for ${repo} is not in the local store; refusing to pull or build."; return 1; }
+        else
+            log_step "Pulling prebuilt ${repo} (${src})..."
+            ${cmd} pull "${src}" || { log_error "Pull failed: ${src}"; return 1; }
+            iid="$(${cmd} image inspect --format '{{.Id}}' "${src}")" || return 1
+        fi
     else
         # Fast-fail on insufficient host disk before the (multi-minute) cold build.
         check_build_disk_space "${cmd}"

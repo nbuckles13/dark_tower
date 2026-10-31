@@ -12,7 +12,7 @@
 # The package list is the build's own (deploy.sh first_party_repos), so a new
 # image is pruned without anyone remembering to add it.
 #
-# The CI namespace holds only `git-<40 hex>` tags (build-push-images.sh) and the
+# The CI namespace holds only `git-<40 hex>` tags (build-images.sh --push) and the
 # untagged child manifests each push creates (platform image, attestation).
 # Age is the whole policy: a child is as old as its parent, so an expired
 # untagged version belongs to an expired parent. That reasoning only holds while

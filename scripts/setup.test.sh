@@ -1744,6 +1744,12 @@ case "\$1" in
       shift
     done ;;
   save) for a in "\$@"; do :; done; : > "\${a}" ;;
+  image)
+    # With STUB_LOCAL_IMAGES set, the local store holds exactly those image IDs.
+    if [[ "\$2" == inspect && -n "\${STUB_LOCAL_IMAGES+x}" ]]; then
+      for r in \${STUB_LOCAL_IMAGES}; do [[ "\$r" == "\${@: -1}" ]] && { echo "\$r"; exit 0; }; done
+      exit 1
+    fi ;;
   info)
     : > "${MARK}/ran.runtime-info"
     [[ "\${STUB_RUNTIME_INFO:-}" != fail ]] || exit 1
@@ -2735,6 +2741,33 @@ out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DEVLOOP_MIN_DISK_GB=0 STUB_IID="
 assert_rc "iidfile-empty-fails" 1 "$rc"
 assert_status "iidfile-empty-says-so" "wrote no image ID" "$out"
 assert_absent "iidfile-empty-never-tags" "tag " "$(cat "${MARK}/podman.calls" 2>/dev/null | grep -v '^build')"
+
+# --- DT_PREBUILT_IMAGES: a bare image ID is taken from the local store, never pulled or built --
+LOCAL_IID="sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+PREBUILT="${WORK}/prebuilt-images.txt"
+RUN_PREBUILT='KIND_EXPERIMENTAL_PROVIDER=podman; build_content_tagged_image localhost/gc-service && echo "ref=${BUILT_REFS[localhost/gc-service]}"'
+printf 'localhost/gc-service %s\n' "$LOCAL_IID" > "$PREBUILT"
+reset_marks
+out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_PREBUILT_IMAGES="$PREBUILT" STUB_LOCAL_IMAGES="$LOCAL_IID" \
+  src_run "$DEPLOY" "$RUN_PREBUILT" 2>&1)"; rc=$?
+assert_rc "prebuilt-local-id-ok" 0 "$rc"
+assert_status "prebuilt-local-id-content-tagged" "ref=localhost/gc-service:sha-cccccccccccccccc" "$out"
+assert_rc "prebuilt-local-id-never-pulls-or-builds" 0 "$([[ -z "$(grep -sE '^(pull|build)' "${MARK}/podman.calls")" ]] && echo 0 || echo 1)"
+reset_marks
+out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_PREBUILT_IMAGES="$PREBUILT" STUB_LOCAL_IMAGES="" \
+  src_run "$DEPLOY" "$RUN_PREBUILT" 2>&1)"; rc=$?
+assert_rc "prebuilt-local-id-absent-fails" 1 "$rc"
+assert_status "prebuilt-local-id-absent-says-so" "is not in the local store" "$out"
+assert_rc "prebuilt-local-id-absent-never-pulls-or-builds" 0 "$([[ -z "$(grep -sE '^(pull|build)' "${MARK}/podman.calls")" ]] && echo 0 || echo 1)"
+# Anything not pinned to content (a tag, a short ID, a digest without its registry name) is refused.
+for bad in "ghcr.io/o/dark-tower-ci/gc-service:git-x" "sha256:cccc" "@${LOCAL_IID}"; do
+  printf 'localhost/gc-service %s\n' "$bad" > "$PREBUILT"
+  reset_marks
+  out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_PREBUILT_IMAGES="$PREBUILT" STUB_LOCAL_IMAGES="$LOCAL_IID" \
+    src_run "$DEPLOY" "$RUN_PREBUILT" 2>&1)"; rc=$?
+  assert_rc "prebuilt-unpinned-refused (${bad})" 1 "$rc"
+  assert_status "prebuilt-unpinned-says-so (${bad})" "refusing to build or guess" "$out"
+done
 
 # --- The devloop container no longer migrates (test.sh is the one owner) ---------------------
 entry_code="$(grep -vE '^[[:space:]]*#' "${REPO_ROOT}/infra/devloop/entrypoint.sh")"
