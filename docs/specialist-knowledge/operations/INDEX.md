@@ -6,6 +6,7 @@
 - Host-side cluster helper → ADR-0030; Dashboard metrics (counters vs rates) → ADR-0029; Service-owned dashboards/alerts → ADR-0031; Metric testability (presence guard, Cat A/B/C rollout, per-service SLO sub-targets) → ADR-0032
 - Polyglot validation pipeline → ADR-0033; guard pipeline as `dt-guard` binary → ADR-0034; deterministic story runner → ADR-0035
 - Media flow — transport parameters §1, MC→MH control plane §8, verification §10, telemetry + operational config §11 → ADR-0036
+- MH replacement + migration (heartbeat, health fn, AcquireMediaHandler, SIGTERM drain, hostPort slots + `mh.sh`, GC register supersede; supersedes ADR-0036 §8 re-assert, §9 frozen set, §11 shed) → ADR-0039; runbook/alert change list → `docs/debates/2026-10-28-mh-replacement-and-migration/runbook-alert-changes.md`
 
 ## Media Path (ADR-0036)
 - MH transport parameters, startup validation, derived drain window, pod-memory ledger (`MH_POD_MEMORY_LIMIT_BYTES`) → `crates/mh-service/src/config.rs:from_vars()`, `QuicTransportParams`, `DrainWindowSource`, `check_pod_memory()`, `SHUTDOWN_SETTLE_TARGET_SECONDS`, `SHUTDOWN_MARGIN_SECONDS`

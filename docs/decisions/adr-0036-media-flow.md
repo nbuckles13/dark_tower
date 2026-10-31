@@ -1351,6 +1351,12 @@ must be designed knowing that per-subscriber exclusions are where they will land
 
 ## 8. The MC→MH control plane
 
+> **Superseded in part by ADR-0039 (2026-10-28).** The recovery model below — periodic re-assert as the
+> whole recovery story, the cadence as a recovery-time bound, restart detection via
+> `process_start_epoch_ms`, and channel connectivity as a fast-path trigger — is replaced by
+> ADR-0039's MH→MC heartbeat, health function and handler replacement. The full-snapshot
+> `RegisterMeeting` push, the applied-generation echo and the per-stream transport echo remain.
+
 ### What this solves
 
 MC must tell MH how to forward media: which sources reach which subscribers, in which slots, at what
@@ -1489,6 +1495,10 @@ periodic tick has intrinsically.**
 ---
 
 ## 9. Multiple media handlers
+
+> **Amended by ADR-0039 (2026-10-28).** A meeting's handler set is no longer frozen at first join: MC
+> owns a mutable, versioned set, replaces handlers through GC, and tells clients via a full-snapshot
+> `MediaHandlerSet` (replacing `JoinResponse.media_servers`). The visibility rule below is unchanged.
 
 **Media routes only within a handler.** Handler-to-handler cascade is future work and must not be
 precluded.
@@ -1685,6 +1695,10 @@ also closes the mirror of the oversized transport buffer in §1.
 **Ingress denial-of-service caps**: maximum frame payload before any allocation; per-connection
 concurrent-stream and creation-rate limits enforced before per-frame work; a bounded datagram queue
 with drop-oldest; a server-side slot cap.
+
+> **Reversed by ADR-0039 (2026-10-28):** MH drains on SIGTERM (reports DRAINING to GC and MC, keeps
+> forwarding while MC migrates its meetings, exits when empty or at grace − margin). The paragraph
+> below is the superseded v1 decision.
 
 **MH sheds media sessions on restart, and that is the decision, not merely the current behaviour.**
 Shutdown marks not-ready, cancels, and sleeps two seconds inside a thirty-five second grace period,
@@ -2021,9 +2035,9 @@ sections for what is settled.*
 Each story ends in something a person can demonstrate in a browser:
 
 1. **Hear yourself** — single-client audio loopback through the handler. *(delivered — `docs/user-stories/2026-08-27-hear-yourself-through-handler.md`)*
-2. **Hear each other** — **N+1 participants hear each other**, where **N = a configurable number of client audio receive slots** (N may be 1 or larger); a static fill (join-order), *not* speaker-based selection; plus **server mute** and **KEK rotation on leave**. Enabled by story 1's deliberately general N=1 assignment. *(planned — `docs/user-stories/2026-09-21-hear-each-other.md`; scope re-confirmed 2026-09-22: loopback removed outright; participants may span the meeting's handler set with the N+1 rule applied within a handler and cross-handler peers reported unreachable per §9 — no cascade and no client multi-handler send, which stay in story 6; attestation stays out.)*
-3. **See each other** — video. *(planned — `docs/user-stories/2026-10-07-see-each-other.md`: independent N audio and M video slots, on-demand keyframes, four mute controls, flat slot states, header v3. Its profile-derived stream cost — MH deriving both egress costs from the shared `media-codec-profile` — is **interim**, pending the adaptive-capacity story below.)*
-4. **Survive a handler restart** — §8 periodic re-assert of policy. *(2026-10-13: gains resume and keyframe jitter after a mass reconnect, moved from story 3.)*
+2. **Hear each other** — **N+1 participants hear each other**, where **N = a configurable number of client audio receive slots** (N may be 1 or larger); a static fill (join-order), *not* speaker-based selection; plus **server mute** and **KEK rotation on leave**. Enabled by story 1's deliberately general N=1 assignment. *(delivered — `docs/user-stories/2026-09-21-hear-each-other.md`; scope re-confirmed 2026-09-22: loopback removed outright; participants may span the meeting's handler set with the N+1 rule applied within a handler and cross-handler peers reported unreachable per §9 — no cascade and no client multi-handler send, which stay in story 6; attestation stays out.)*
+3. **See each other** — video. *(delivered — `docs/user-stories/2026-10-07-see-each-other.md`: independent N audio and M video slots, on-demand keyframes, four mute controls, flat slot states, header v3. Its profile-derived stream cost — MH deriving both egress costs from the shared `media-codec-profile` — is **interim**, pending the adaptive-capacity story below.)*
+4. **Survive losing a handler** — MH replacement and migration per ADR-0039: MH→MC heartbeat, health function, GC replacement, migration via the join path, `media_dial` dial tokens, per-incarnation MH addressing (hostPort slots, on-demand `mh.sh`), and a "poor man's" planned transfer. *(Re-scoped 2026-10-28 from "§8 periodic re-assert" by the ADR-0039 debate. 2026-10-13: gains resume and keyframe jitter after a mass reconnect, moved from story 3.)*
 5. **A crowded room picks the right speakers** — **dynamic (active-speaker) selection**, replacing story 2's static fill when there are more senders than a receiver's slots. *(2026-10-13: a dynamic switch keeps the old source directed until MH confirms the swap landed on the new source's keyframe, which needs the MH-to-MC switch-completion report deferred from story 3 R-4.)*
 6. **Two handlers, one meeting** — cross-handler forwarding.
 7. **Historical meeting debug** — per-meeting/per-client quality records with a retention posture (a §11 amendment).

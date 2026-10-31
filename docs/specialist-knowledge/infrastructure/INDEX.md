@@ -9,7 +9,7 @@
 - Service-owned dashboards + alert rules (per-service files, `_template-*` shapes) -> ADR-0031
 - Guard pipeline as Rust binary `dt-guard` (single-crate, subcommand-per-policy) -> `docs/decisions/adr-0034-guard-pipeline-as-rust-binary.md`
 - Deterministic story runner (serial/single-branch/single-container, substrate, gates) -> `docs/decisions/adr-0035-story-runner.md`
-- Media flow; §11 compile-time controls, media-path telemetry deny, control self-tests -> `docs/decisions/adr-0036-media-flow.md`
+- Media flow; §11 compile-time controls, media-path telemetry deny, control self-tests -> `docs/decisions/adr-0036-media-flow.md`; MH replacement/migration, §7 MH addressing + provisioning (hostPort slots, `mh.sh`, GC registration rule) -> `docs/decisions/adr-0039-mh-replacement-and-migration.md`
 
 ## Code Locations
 - Service Dockerfiles -> `infra/docker/{ac,gc,mc,mh}-service/Dockerfile`; migrations image (sqlx-cli + `migrations/`) -> `infra/docker/db-migrate/Dockerfile`; Compose (local tests) -> `docker-compose.test.yml`; dev TLS certs (CA + MC + MH) -> `scripts/generate-dev-certs.sh`

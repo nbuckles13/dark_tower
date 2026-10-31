@@ -4,6 +4,7 @@
 - MC architecture, actor model, session binding, capacity → ADR-0023
 - User auth, meeting access, join flow → ADR-0020
 - Media flow (admission/KEK §4, client signalling §5/§6, slots + edges §7/§9, policy push + teardown §8, hygiene §11) → ADR-0036
+- MH replacement + migration (heartbeat, health fn, mutable versioned handler set, AcquireMediaHandler, RELEASED fence, `media_dial`; supersedes ADR-0036 §8 re-assert and §9 frozen set) → ADR-0039 (`docs/decisions/adr-0039-mh-replacement-and-migration.md`); debate record → `docs/debates/2026-10-28-mh-replacement-and-migration/`
 - Content-addressed per-service config env root → ADR-0038
 - Observability: metrics facade → ADR-0011; testability (`MetricAssertion`, presence guard, rollout SLO) → ADR-0032; service-owned dashboards and alerts → ADR-0031
 

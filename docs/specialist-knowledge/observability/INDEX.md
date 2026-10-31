@@ -2,7 +2,7 @@
 
 ## Architecture & Design
 - Observability framework (metrics, tracing, dashboards, alerts, SLOs) -> ADR-0011
-- Media flow — forward path, key custody §4, media-path telemetry prohibition §11 -> ADR-0036
+- Media flow — forward path, key custody §4, media-path telemetry prohibition §11 -> ADR-0036; MH replacement/migration (heartbeat, `trigger` vocab, required client-loss metric §8) -> `docs/decisions/adr-0039-mh-replacement-and-migration.md`, contract `docs/debates/2026-10-28-mh-replacement-and-migration/telemetry-contract.md`
 - Validation pipeline + cross-boundary ownership model -> ADR-0024, ADR-0024 §6; polyglot layers -> ADR-0033
 - Client architecture (telemetry, metrics, dashboards, synthetic probe) -> ADR-0028; dashboard counter-vs-rate presentation -> ADR-0029
 - Host-side cluster helper -> ADR-0030; service-owned dashboards/alerts -> ADR-0031; metric testability -> ADR-0032

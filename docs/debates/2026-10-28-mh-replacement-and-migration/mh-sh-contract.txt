@@ -1,0 +1,69 @@
+O-4 MERGED CONTRACT (infrastructure + test; incorporates the GC and ops asks): infra/kind/scripts/mh.sh as a test-callable tool (R4-6)
+
+1. INVOCATION. One script for host and devloop container, using the caller's kubeconfig.
+   - The cluster is selected via lib/common.sh dt_init_cluster_env (DT_CLUSTER_NAME -> kind-<name>), never "current context".
+   - Dependencies: kubectl + jq only.
+   - Addresses are the rendered per-slot ConfigMap values, so they are dialable from the caller's side.
+   - No helper verb, and no GC or database access (GC ask).
+
+2. STREAMS. stdout carries one JSON object per invocation, with --json only. stderr carries human text plus exactly ONE final machine line: `MH_RESULT STATUS=OK|FAIL REASON=<token> [SLOT=<k>] [DETAIL=...]`.
+
+3. EXIT CODES + TOKENS. The token list has ONE home, an array in mh.sh. mh.test.sh asserts both directions (every token emitted by some case, every emitted token listed).
+   0 OK
+   1 FAIL         mh-rollout-failed, drain-timeout, not-available-timeout
+   2 PRECONDITION usage, no-kubeconfig, no-template
+   3 CAPACITY     mh-no-free-slot
+   4 REFUSED      last-serving-mh, stuck-terminating, foreign-owner
+   5 BUSY         mh-pool-busy (DETAIL=holder=<owner>)
+   Ops' runbook branches on last-serving-mh / stuck-terminating / drain-timeout; each is a distinct token.
+   On not-available-timeout, `up` leaves the pod in place for diagnosis and prints the drain command (fail loudly, no silent self-clean).
+
+4. list --json (schema_version 1; additive only; mh.test.sh pins the key set):
+   {schema_version, template_revision, baseline, slots:[{slot, host_port, address, pod_uid,
+     state: free|starting|serving|draining|terminating, terminating_past_grace: bool,
+     deployment|null, pod|null, revision|null, stale: bool (revision != template_revision),
+     owner|null, restart_count|null}]}
+   - Every slot always appears, including free ones.
+   - No handler_id in v1. Test doesn't need it, and address is enough for ops' runbook. MH holds no K8s credentials to annotate itself. A field can be added later if MH exposes it on its health endpoint.
+   - list takes no lock.
+
+5. VERBS.
+   - up [--slot k] [--owner ID] --json prints its slot's list entry plus "created": bool.
+     Slot choice is next-fit (ADR-0039 §7, agreed with ops), not lowest-free.
+     It returns only when the Deployment is Available. Available = MH /ready = RegisterMH accepted, with MH's immediate post-register load report making the MH GC-selectable within one RPC (GC ask: readiness, not GC state). The timeout is derived.
+     Idempotent: with --slot k and a live current-revision MH of the same owner already there, it exits 0 with "created": false.
+   - drain <k> [--owner ID] [--no-wait] [--force] returns once the pod and Deployment are gone, bounded by the pod's terminationGracePeriodSeconds plus a margin (else drain-timeout).
+     --no-wait returns after SIGTERM has been delivered, for mid-drain observation.
+     Idempotent: an empty slot exits 0 with "drained": false.
+   - drain --owner ID --all is run teardown.
+   - upgrade is as agreed in ADR-0039 (serial, resumable via replaces=).
+
+6. OWNERSHIP + LOCK.
+   - Label dark-tower.io/mh-owner: `baseline` for deploy.sh's MHs, `manual` by default, and the Layer 7 per-run token for fixtures.
+   - drain of an MH with a different owner gives foreign-owner unless --force.
+   - Mutations (up, drain, each upgrade step) take a coordination.k8s.io Lease `mh-pool` in dark-tower: an atomic create with holder and expiry, reclaimed only after expiry. This closes the concurrent-drain race that could remove the last serving MH.
+   - The Lease covers ONLY the decision plus create/delete call (seconds). The Ready/gone waits happen outside it, so BUSY is rare and short. The fixture retries BUSY within a bound.
+   - The AlreadyExists check plus the hostPort lock remain as backstops.
+
+7. SHARED CLUSTERS.
+   - Allocation and drain are safe under concurrency.
+   - Whole-run correctness of Layer 7 on a shared cluster stays unsupported (the existing one-suite-per-cluster rule), but it fails loudly: before and after each resilience leg, the fixture's assert_baseline() fails with REASON=foreign-mh-activity if it finds foreign-owner MHs or a non-baseline pool.
+   - The leak check is per-owner: nothing left with owner=<run>, and the baseline count == B as an eventual poll.
+
+8. FIXTURE (test owns it): crates/env-tests/src/fixtures/mh_pool.rs, with snapshot(), up() -> MhSlot, MhSlot::drain() (explicit, asserted), assert_baseline(), and the shareProcessNamespace injector preflight. The mh.sh path has one home: layer7.sh exports it, and the fixture fails loudly when it is unset.
+   (a) After up(), the fixture waits for Prometheus `up{job="mh-service",pod="<pod>"}==1` (the pod name comes from list/up JSON) before taking any MH metric baseline. mh.sh itself stays Prometheus-free. Drain outcomes are read from MC, never from the exiting MH.
+   (b) Explicit test teardown runs `mh.sh drain --owner <run> --all`. That also reclaims a pod left behind by not-available-timeout. The Drop backstop only prints that same `--all` command.
+   (c) Before each destructive leg, assert_baseline() requires that no MH has an owner outside {baseline, <run>} and that the baseline count == B. Otherwise it fails with REASON=foreign-mh-activity.
+   Incarnation identity in tests comes from pod_uid/restart_count (mh.sh) and handler_ref (client). There is NO GC lookup of handler_id; the earlier round-3 "handler_id from GC by address" is withdrawn.
+
+9. SELF-TEST (infra owns it): infra/kind/scripts/mh.test.sh, hermetic with a PATH-stub kubectl, wired into scripts/layer3.sh (the hermetic script self-test layer). It covers:
+   - next-fit and the AlreadyExists race;
+   - every exit code and token;
+   - idempotent up and drain;
+   - foreign-owner;
+   - the Lease busy path and expired-Lease reclaim;
+   - stuck-terminating;
+   - the --no-wait return point;
+   - the list key set.
+
+Out of scope: CI runs no Kind or Layer 7 (an existing gap, recorded).

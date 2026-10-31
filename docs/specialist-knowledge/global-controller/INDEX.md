@@ -7,14 +7,15 @@
 - Service-to-service auth (OAuth 2.0 client credentials); gRPC scopes, two-layer auth (JWKS + service_type routing) -> ADR-0003
 - No-panic policy (DB row decoding must use `try_get`) -> ADR-0002
 - Metric testability (four-tier pattern, MetricAssertion, per-failure-class mechanism table) -> ADR-0032
+- MH replacement/migration (MC->GC AcquireMediaHandler, exclusion not veto, MC owns handler set; planned drain) -> ADR-0039 (`docs/decisions/adr-0039-mh-replacement-and-migration.md`)
+- RegisterMH endpoint rules (allowlists, supersede/reject arms) -> `docs/debates/2026-10-28-mh-replacement-and-migration/gc-register-rule.txt`
 
 ## Code Locations
 - Entrypoint (HTTP + gRPC dual-server startup) -> `crates/gc-service/src/main.rs`
 - Route definitions and AppState -> `crates/gc-service/src/routes/mod.rs:build_routes()`
 - Configuration (env vars, thresholds) -> `crates/gc-service/src/config.rs:Config::from_env()`
 - Error enum: HTTP status, `error.code`, `error_type` metric label -> `crates/gc-service/src/errors.rs:GcError`
-- JWT validation (validate + validate_raw for gRPC failure_reason classification) -> `crates/gc-service/src/auth/jwt.rs`
-- JWKS caching; claims extraction -> `crates/gc-service/src/auth/jwks.rs:JwksClient::get_key()`, `crates/gc-service/src/auth/claims.rs`
+- JWT validation (validate + validate_raw for gRPC failure_reason); JWKS caching; claims -> `crates/gc-service/src/auth/jwt.rs`, `crates/gc-service/src/auth/jwks.rs:JwksClient::get_key()`, `crates/gc-service/src/auth/claims.rs`
 - HTTP auth middleware (service + user token: require_auth, require_user_auth) -> `crates/gc-service/src/middleware/auth.rs`
 - gRPC auth layer (Tower, two-layer: scope + service_type routing per ADR-0003); failure_reason classifier -> `crates/gc-service/src/grpc/auth_layer.rs:GrpcAuthLayer`, `classify_jwt_error()`
 - Meeting handlers (create, join, guest-token, settings) -> `crates/gc-service/src/handlers/meetings.rs`
@@ -29,8 +30,7 @@
 - AC HTTP client (meeting/guest tokens) -> `crates/gc-service/src/services/ac_client.rs:AcClient`
 - MC/MH repositories (register, heartbeat, staleness) -> `crates/gc-service/src/repositories/` (`meeting_controllers.rs`, `media_handlers.rs`)
 - Meetings repository (create with limit check, audit log) -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository::create_meeting_with_limit_check()`
-- Assignment repository (weighted select, atomic assign incl. ENDED-row revival per meeting incarnation) -> `crates/gc-service/src/repositories/meeting_assignments.rs:MeetingAssignmentsRepository::atomic_assign()`
-- Assignment end + batch jobs keyed on (meeting, region) -> `meeting_assignments.rs:end_assignment()`, `end_stale_assignments()`, `cleanup_old_assignments()`
+- Assignment repository (weighted select, atomic assign incl. ENDED-row revival; end + batch jobs keyed on (meeting, region)) -> `crates/gc-service/src/repositories/meeting_assignments.rs:MeetingAssignmentsRepository::atomic_assign()`, `end_assignment()`, `end_stale_assignments()`, `cleanup_old_assignments()`
 - Generic health checker loop -> `crates/gc-service/src/tasks/generic_health_checker.rs`
 - Assignment cleanup (soft/hard delete) -> `crates/gc-service/src/tasks/assignment_cleanup.rs`
 - Observability metrics (incl. join metrics) -> `crates/gc-service/src/observability/metrics.rs`
