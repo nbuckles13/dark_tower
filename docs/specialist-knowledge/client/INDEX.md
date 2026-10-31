@@ -3,6 +3,7 @@
 ## Architecture & Design
 - Client architecture (SDK, testing, deployment, E2EE) → ADR-0028; debate → `docs/debates/2026-02-28-client-architecture/debate.md`
 - Media flow (multi-handler §9, slot model §6, hot-path layout §11, KEK lifecycle) → ADR-0036
+- MH replacement/migration (handler-set reconcile, `media_dial` dial token, MH close codes, client metrics, test gates) → ADR-0039 (`docs/decisions/adr-0039-mh-replacement-and-migration.md`); gates → `docs/debates/2026-10-28-mh-replacement-and-migration/test-gates.md`
 - Crypto algorithms → ADR-0027; auth/meeting access → ADR-0020; observability → ADR-0011, ADR-0031; guards → ADR-0015; tests → ADR-0005
 - Stories + manual test plans: 2 (hear) → `docs/user-stories/2026-09-21-hear-each-other.md`, `docs/user-stories/2026-09-21-hear-each-other-manual-test-plan.md`; 3 (see) → `docs/user-stories/2026-10-07-see-each-other.md`, `docs/user-stories/2026-10-07-see-each-other-manual-test-plan.md`
 

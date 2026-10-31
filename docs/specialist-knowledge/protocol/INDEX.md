@@ -3,6 +3,7 @@
 ## Architecture & Design
 - API versioning → ADR-0004; user auth meeting access → ADR-0020
 - Media flow: frame format, sender auth, KEK model, send/receive contract → ADR-0036
+- MH replacement/migration (heartbeat + fence, AcquireMediaHandler, MediaHandlerSet/handler_ref, media_dial, ReleaseCause, MhCloseCode, RegisterMH endpoint rule; supersedes ADR-0036 §8 re-assert and §9 frozen set) → `docs/decisions/adr-0039-mh-replacement-and-migration.md`
 - Proto conventions (buf STANDARD, `vN`, bare RPC names, distinct response types, reserve-the-vacated-tag-and-name §5, intentional-wire-break protocol) → `docs/protocol/CONVENTIONS.md`
 - API contracts → `docs/API_CONTRACTS.md`; WebTransport flow/framing → `docs/WEBTRANSPORT_FLOW.md`
 - Client architecture (frame codec, SFrame layering, trace context fields) → ADR-0028
@@ -24,8 +25,7 @@
 - MediaHandlerService (MC→MH): RegisterMeeting + EndMeeting — forwarding policy gains fields, not sibling RPCs (ADR-0036 §8); teardown is its own RPC (story 2 R-20; mc_id-mismatch → FAILED_PRECONDITION, not an authz control). `Register`, `RouteMedia`, `StreamTelemetry` retired 2026-09-01; tombstone block in the proto
 - MediaCoordinationService (MH→MC): NotifyParticipantConnected/Disconnected — `NotifyParticipantConnectedResponse` carries the participant→`sender_id` binding (load-bearing gate on MH media accept, R-15); MC builder → `crates/mc-service/src/media_admission/binding_response.rs`; MH validates via `crates/mh-service/src/routing/mod.rs`→`SenderId::from_wire()`, bound single-sourced at `media_protocol::frame::KEY_ID_SENDER_ID_BITS` (no `common` helper)
 - MeetingControllerService (GC→MC): AssignMeetingWithMh
-- GlobalControllerService (MC→GC): RegisterMC, FastHeartbeat, ComprehensiveHeartbeat
-- MediaHandlerRegistryService (MH→GC): RegisterMH, SendLoadReport
+- GlobalControllerService (MC→GC): RegisterMC, FastHeartbeat, ComprehensiveHeartbeat; MediaHandlerRegistryService (MH→GC): RegisterMH, SendLoadReport
 - DisconnectReason enum (bounded for metrics)
 
 ## ADR-0036 MC→MH Control Plane (internal.proto)

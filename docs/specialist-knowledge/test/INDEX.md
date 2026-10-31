@@ -7,7 +7,7 @@
 - Metric testability + `MetricAssertion` → ADR-0032; polyglot validation pipeline → ADR-0033
 - Guard pipeline as Rust binary; test-reliability §Impl Notes → ADR-0034
 - Deterministic story runner; runner suite §E; manifest single home §4 → ADR-0035
-- Media-flow contract (keyless MH, TS-only frame crypto, multi-party fan-out); sed-test worked example → ADR-0036, `.claude/skills/devloop/review-protocol.md`
+- Media-flow contract (keyless MH, TS-only frame crypto, multi-party fan-out); sed-test worked example → ADR-0036, `.claude/skills/devloop/review-protocol.md`; MH replacement/migration (heartbeat, `assess`, fence, hostPort slots, resilience legs) + per-service gates → ADR-0039, `docs/debates/2026-10-28-mh-replacement-and-migration/test-gates.md`
 
 ## Validation Pipeline & Script Self-Tests
 - Layers + orchestrator; self-test wiring (no `*.test.sh` auto-runner) → `scripts/layer1.sh`..`scripts/layer7.sh`, `scripts/layer-all.sh`

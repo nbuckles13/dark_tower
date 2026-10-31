@@ -1,0 +1,62 @@
+INFRA PROPOSAL v2 (MH addressing and provisioning): answers to the lead's questions (1)-(8) and to every round-3 requirement. Changes from v1 are marked [v2].
+
+CORE. Slot = hostPort. Each MH pod's webtransport containerPort declares hostPort: <slot port> (UDP). The scheduler places at most one pod per hostPort per node, and a Terminating (draining) pod keeps its hostPort until it is gone. So a RollingUpdate surge, a ReplicaSet replacement after a delete, or an eviction replacement (ops R1) all stay Pending until the old process has exited. Two concurrent holders are impossible by construction (protocol: confirmed; GC's registration check is only a backstop). No WebTransport Service exists any more; the per-instance NodePort Services are deleted. The ClusterIP mh-service for gRPC/health stays.
+
+(1) REUSE.
+- In-place container restart (kubelet, restartPolicy Always): ALLOWED. Same pod, same pod IP, same slot, new process, new handler_id. The old process is dead, so it is not "alive on the same URL" (MH, ops R1 and protocol's invariant text agree). GC supersede (both endpoints match) fires exactly here. obs: MHPodRestartingFrequently therefore stays meaningful.
+- A NEW pod on a freed slot: allowed only once the previous pod OBJECT is gone. The kubelet releases the hostPort at that point, which is also when the scheduler admits a new holder.
+- [v2] NO time quarantine (declining ops R5 and the MH margin). An in-place restart already reuses the address immediately, and the ruling accepts that. Every hazard a quarantine would cover is covered identically in both cases: a stale client dial fails media_dial aud (WRONG_HANDLER), handler_ref is never reused per meeting, and GC retires the dead row. A quarantine would need release-time state for no requirement the restart case doesn't already waive. If the lead or user wants it anyway, it is a small add to mh.sh (a release timestamp annotation on a per-slot lease).
+- test #3: please assert handler_id != dead handler_id, not address !=. Asserting address != would contradict the accepted restart case.
+- GC: a new pod on a reused slot has a NEW pod IP, so "both endpoints match" will NOT fire. Its previous holder can only be dead or exited-after-drain, because the platform guarantees that. So the register rule should be "a registration retires any OTHER row with the same webtransport_endpoint" (ops R6), counted. If you want a loud tripwire, log ERROR and add outcome=superseded_live when the retired row was fresh and not DRAINING. Your call.
+
+(2) KIND REACHABILITY: pre-mapped UDP port pool, option (a). Host-routable LB IPs don't work on WSL2/rootless podman.
+- Pool size K has ONE home: the helper port table (crates/devloop-helper/src/ports.rs). The kind-config MH extraPortMappings block, the slot ConfigMaps, the GC port allowlist and the static host-mode kind-config.yaml are derived from it, with a drift guard. Changing K means recreating the cluster (stated in the runbook).
+- [v2] K = 6 at ZERO extra host-port cost: offsets +20..+25 today are MH-0/1 health/gRPC/WT, and the four health/gRPC mappings are dead ("NOTHING LISTENS"). Budget: baseline 2 + warm spare 1 + planned-transfer target 1 + 1 rollout headroom + 1 slack. A crash in place consumes no slot.
+- Exhaustion fails loudly at provision time: `mh.sh up` exits nonzero with MH_FAILED REASON=mh-no-free-slot. An upgrade with no free slot refuses before touching the old MH (ops R4).
+- Leak check (test #1c): at Layer 7 exit, live mh-s* == baseline and GC healthy non-draining rows == baseline; otherwise fail with the list.
+
+(3) CREATOR: one script, used by humans, env-tests and deploy.sh. No helper verb, no operator.
+- `infra/kind/scripts/mh.sh` uses the caller's existing kubeconfig (host or devloop container; same trust as kubectl today, ADR-0030 unchanged). GC/MC/MH hold no K8s credentials (security E-4).
+- Template: the base keeps ONE MH Deployment template, replacing mh-0/mh-1 (DRY). [v2] deploy.sh renders it within the ONE root render (hash-named ConfigMaps, content-tagged image) and stores the rendered template in-cluster as ConfigMap `mh-template` (data, not pod-consumed, so outside R-21). The root apply excludes the MH workload. mh.sh therefore never needs a local render or a matching checkout.
+- Commands:
+    up [--slot k] [--json]  creates Deployment mh-s<k> (replicas 1) with labels mh-slot=k and mh-revision=<template hash>, hostPort = slot k's port, and advertise address from ConfigMap mh-slot-<k>-config. It takes the lowest free slot; the create is atomic (AlreadyExists -> next slot). It waits for Available (= /ready = GC-registered + first load report = GC-selectable), then prints {deployment, pod, slot, webtransport_address}. The test fixture shells out to it; handler_id is found by the fixture from GC by address.
+    drain <k>  sends SIGTERM via a foreground delete of mh-s<k> -> DRAINING -> MC migrates -> exit -> pod gone -> hostPort released -> object gone. It refuses on the last serving MH without --force.
+    upgrade  for each live MH whose revision != the template revision, serially: up (annotated replaces=<old slot>) -> Available -> drain old -> wait gone. Idempotent and resumable: on rerun, a Ready replacement with replaces=k only triggers drain k. deploy.sh calls it after the root apply, then tops up to baseline B (B is config, default 2, matching GC's initial count). Rollback = the same converge from the previous checkout, which renders the previous revision and upgrades to it. ops R2: `kubectl rollout undo` is gone from the runbook.
+    list  shows slot, revision, pod phase, address.
+- Scale-up = up. Scale-down = drain. Image prune must keep every image a live MH pod references (prune runs after upgrade, so live revisions are <= current + previous).
+
+(4) DRAINING STAYS REACHABLE BY CONSTRUCTION. Traffic arrives through hostPort DNAT, not a Service, so readiness gates nothing on the client path. MH KEEPS set_not_ready on SIGTERM (main.rs:643): it correctly marks the pod not-Available for mh.sh/rollout status. publishNotReadyAddresses is moot (no WT Service). ops R3 holds by construction too: the address is the pod's hostPort, which the kubelet frees only when the pod terminates, so it cannot be torn down before the drain ends and there is no ordering logic to get wrong.
+
+(5) TEMPLATE INVARIANTS, guarded (dt-guard kustomize on the MH template; machinery mine):
+- labels app=mh-service + component=media (MC netpol egress, MH netpol, Prometheus pod-SD);
+- ports 8083 health/metrics, 50053 gRPC, 4434/UDP with hostPort;
+- the mh-service-tls Secret mount: ONE shared dev cert for every incarnation (client constraint 1, security E-3);
+- shareProcessNamespace: true — Kind overlay ONLY (test's zombie injector; guarded present in Kind, absent from base and every non-Kind render; superseded the base placement after security review);
+- MH NetworkPolicy stays label-selected (E-5). It must admit UDP 4434 on the portmap DNAT path, which is in my spike.
+Plus an env-test asserting every live MH pod's advertised address is unique and equals its slot ConfigMap value (test #6).
+
+(6) GC ALLOWLIST FORMS (config keys injected by manifests, values derived, never retyped):
+- webtransport_endpoint: scheme https; GC_MH_WT_ALLOWED_HOSTS = list of exact hosts or ".suffix" entries; GC_MH_WT_ALLOWED_PORTS = port set.
+  - Kind: hosts = {127.0.0.1 or DT_HOST_GATEWAY_IP}, rendered by the same render_env_overlay that renders the slot addresses; ports = the slot port set, derived from the same slot table.
+  - Prod analogue: hosts = {".mh.<region>.<zone>"}, ports = {443}.
+- grpc_endpoint: scheme pinned grpc:// (https:// once internal TLS lands, separately); GC_MH_GRPC_ALLOWED_CIDRS = CIDR set. The pod IP is already per-incarnation, so no per-handler DNS is needed internally.
+  - Kind: the podSubnet, derived from kind-config networking.podSubnet (192.168.0.0/16), not retyped.
+  - Prod: the MH pool's pod or node CIDR.
+- In-place restart keeps both the pod IP and the client address, so GC supersede fires there; a reused slot is handled by the rule in (1).
+
+(7) NODE MAINTENANCE. MHs ARE still Deployment-managed (mh-s<k>), so plain `kubectl drain` works: the eviction respects the PDB, the evicted pod drains, and the controller's replacement is held Pending by the hostPort until the old pod exits, then starts in place. Kind is single-node, so this is mostly moot there. Runbook for planned maintenance: `mh.sh up` elsewhere -> `mh.sh drain` -> drain the node. Multi-node rescheduling semantics belong to the cloud-deploy debate (under option A the address = the node).
+
+(8) STORY 4 BUILDS (Kind only):
+- the MH template collapse;
+- the hostPort slot pool (K=6) in helper ports.rs + kind-config;
+- per-slot ConfigMaps;
+- deploy.sh: root exclusion, mh-template ConfigMap, upgrade + top-up;
+- mh.sh;
+- GC allowlist config values for Kind;
+- layer7 MH gRPC port-forward by label;
+- env-test label discovery (MH_INSTANCES -> label);
+- guards + env-test;
+- leak check;
+- the portmap/NetworkPolicy spike first. Fallback if UDP hostPort or the policy fails under Calico: StatefulSet-per-slot (at-most-one per identity) behind per-slot NodePort Services with publishNotReadyAddresses.
+NOT story 4 (cloud-deploy work): per-incarnation DNS + wildcard MH-only cert + record teardown (E-1/E-2), the prod provisioning controller/desired-count loop (R7), multi-node/hostNetwork option A. The design does not depend on them.
+OUT OF SCOPE, TODO entry: mc-0/mc-1 have the same surge-shares-URL bug.

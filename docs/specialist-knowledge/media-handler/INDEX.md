@@ -2,7 +2,8 @@
 
 ## Architecture & Design
 - SFU architecture, MH registration/load reports → ADR-0010 (Section 4a); MH assignment/selection → ADR-0023 (Section 5)
-- Media flow: frame v3 (§2), forward path (§7), control plane (§8), multi-handler edges (§9), transport seam (§10), sender binding (§11) → ADR-0036
+- Media flow: frame v3 (§2), forward path (§7), control plane (§8), multi-handler edges (§9), transport seam (§10), sender binding (§11) → ADR-0036 (§8 recovery model, §9 frozen set, §11 shed-on-restart superseded by ADR-0039)
+- MH replacement/migration: MH→MC heartbeat (§1), heartbeat-response fence + `ReleaseCause` (§6), slot addressing, SIGTERM drain, close codes, QUIC idle (§7), telemetry (§8) → `docs/decisions/adr-0039-mh-replacement-and-migration.md`; debate record → `docs/debates/2026-10-28-mh-replacement-and-migration/`
 - Actor pattern → ADR-0001; service auth + gRPC scopes → ADR-0003; fuzzing → ADR-0006; deploy parity / config-key ordering → ADR-0038
 - Observability: metrics facade → ADR-0011; dashboards → ADR-0029; service-owned dashboards/alerts → ADR-0031; metric testability → ADR-0032
 - User stories: QUIC connection → `docs/user-stories/2026-04-12-mh-quic-connection.md`; hear-each-other (story 2) → `docs/user-stories/2026-09-21-hear-each-other.md`; see-each-other (story 3) + manual test plan → `docs/user-stories/2026-10-07-see-each-other.md`, `2026-10-07-see-each-other-manual-test-plan.md`
