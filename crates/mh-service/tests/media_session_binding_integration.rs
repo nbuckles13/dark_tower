@@ -1357,6 +1357,27 @@ async fn a_superseded_sessions_late_disconnect_names_only_its_own_connection_id(
          the live second session's connectivity"
     );
 
+    // The second session binds only after MC's REPLY reaches MH, which is later
+    // than the Connected the mock just captured. Wait until it holds the entry:
+    // ending the first session before then would have the first teardown unbind
+    // its own (still current) entry, and the compare-and-remove this test pins
+    // would never run.
+    let stop = Instant::now() + Duration::from_secs(5);
+    while suite
+        .session_manager
+        .sender_bindings()
+        .holding_connection(&meeting, sender)
+        .as_deref()
+        != Some(second.connection_id.as_str())
+    {
+        assert!(
+            Instant::now() < stop,
+            "precondition: the second session must take over the binding within 5s before the \
+             first session ends"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
     // End the FIRST session only. Clean close: the server's read returns
     // `Ok(None)`, the `ClientClosed` arm.
     first_send
@@ -1385,9 +1406,8 @@ async fn a_superseded_sessions_late_disconnect_names_only_its_own_connection_id(
         suite
             .session_manager
             .sender_bindings()
-            .holder_of(&meeting, sender)
-            .as_deref(),
-        Some(PARTICIPANT),
+            .holding_connection(&meeting, sender),
+        Some(second.connection_id.clone()),
         "the superseded session's teardown must leave the live session's binding in place"
     );
 }
