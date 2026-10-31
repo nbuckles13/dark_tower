@@ -1667,6 +1667,19 @@ impl SenderBindings {
             .get(&(meeting.clone(), sender))
             .map(|held| held.participant_id.clone())
     }
+
+    /// The connection currently holding `sender` in `meeting`, if any.
+    ///
+    /// [`Self::holder_of`] names the participant, which cannot tell a reconnect's
+    /// two sessions apart; this names the session, which is what
+    /// [`Self::unbind`]'s compare-and-remove keys on.
+    #[must_use]
+    pub fn holding_connection(&self, meeting: &MeetingKey, sender: SenderId) -> Option<String> {
+        self.bindings
+            .load()
+            .get(&(meeting.clone(), sender))
+            .map(|held| held.connection_id.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
