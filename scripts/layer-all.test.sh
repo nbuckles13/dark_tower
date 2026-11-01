@@ -762,4 +762,45 @@ run_agg "$a"
 assert_exit   "i6-split-round-trip-exit0" 0 "$LA_RC"
 assert_status "i6-split-round-trip-l7"    "LAYER=7 RESULT=OK" "$(cat "$LA_OUT")"
 
+# (I7) SUBSET AGGREGATE — `--aggregate DIR --layers 7` (ci.yml's non-required Layer 7 check,
+#      over the per-suite jobs only). Exactly the listed layers, every suite once; the full
+#      aggregate (H, I4-I6) is unchanged.
+run_agg_args() {  # run_agg_args <arg>...
+  LA_OUT="$WORK/agg.out"; LA_ERR="$WORK/agg.err"
+  env -i PATH="$PATH" HOME="$HOME" DEVLOOP_TMP="$WORK/agg.dt" bash "$LAYER_ALL" "$@" >"$LA_OUT" 2>"$LA_ERR"
+  LA_RC=$?
+}
+mk_l7_only() {  # mk_l7_only <aggdir> <env-tests status> <env rc> <browser-e2e status> <browser rc>
+  mk_summary "$1" l7-browser "LAYER=7 RESULT=$4 DURATION=250 RC=$5 SUITE=browser-e2e"
+  mk_summary "$1" l7-env "LAYER=7 RESULT=$2 DURATION=400 RC=$3 SUITE=env-tests"
+}
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_l7_only "$a" OK 0 OK 0; run_agg_args --aggregate "$a" --layers 7
+assert_exit   "i7-subset-green-exit0"   0 "$LA_RC"
+assert_status "i7-subset-cell"          "LAYER=7 RESULT=OK DURATION=400" "$(cat "$LA_OUT")"
+assert_absent "i7-subset-only-scope"    "LAYER=1 " "$(cat "$LA_OUT")"
+run_agg_args --layers 7 --aggregate "$a"
+assert_exit   "i7-subset-either-order"  0 "$LA_RC"
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_l7_only "$a" OK 0 FAIL 1; run_agg_args --aggregate "$a" --layers 7
+assert_exit   "i7-subset-red-exit1"     1 "$LA_RC"
+assert_status "i7-subset-red-triage"    "FAILURE_TRIAGE LAYER=7 SHARD=l7-browser+l7-env" "$(cat "$LA_ERR")"
+# A dropped suite, a layer outside the scope, and an empty scope dir are all exit 2.
+subset_case() {  # subset_case <label> <reason>  (aggregate the dir in $a over --layers 7)
+  run_agg_args --aggregate "$a" --layers 7
+  assert_exit   "$1-exit2"  2 "$LA_RC"
+  assert_status "$1-reason" "REASON=aggregate-$2" "$(cat "$LA_OUT")"
+}
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_l7_only "$a" OK 0 OK 0; rm "$a/l7-env/layer-summary.txt"; subset_case i7-subset-missing-suite missing-suite
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_l7_only "$a" OK 0 OK 0; mk_summary "$a" test "LAYER=4 RESULT=OK DURATION=1 RC=0"; subset_case i7-subset-out-of-scope layer-out-of-scope
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_summary "$a" test "LAYER=4 RESULT=OK DURATION=1 RC=0"; subset_case i7-subset-other-layer-only layer-out-of-scope
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; subset_case i7-subset-empty no-summaries
+# The full aggregate still requires every layer: the Layer 7 jobs alone are not a pipeline.
+a="$(mktemp -d "$WORK/agg.XXXXXX")"; mk_l7_only "$a" OK 0 OK 0; agg_case i7-full-needs-all-layers missing-layer
+# Invalid lists, and --max-layer beside --aggregate, are still refused before reading anything.
+run_agg_args --aggregate "$a" --layers 7,3
+assert_exit   "i7-subset-bad-list-exit2"  2 "$LA_RC"
+assert_status "i7-subset-bad-list-token"  "REASON=shard-layer-list-invalid" "$(cat "$LA_ERR")"
+run_agg_args --aggregate "$a" --max-layer 3
+assert_exit   "i7-max-with-aggregate-exit2" 2 "$LA_RC"
+assert_status "i7-max-with-aggregate-says"  "mutually exclusive" "$(cat "$LA_ERR")"
+
 report_results "scripts/layer-all.test.sh"

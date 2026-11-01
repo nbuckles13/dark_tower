@@ -1370,6 +1370,22 @@ of Layer 7 would be a forged PASS), for an unknown value (`layer7-suite-invalid`
 whose `--layers` omits 7 (`layer7-suite-without-layer7`). `--aggregate` ignores it, because it
 runs no layer.
 
+**Layer 7 on Kind runs beside the pipeline, not yet as a required check.** The guards shard
+still runs layer 7 with no cluster (the CI clean skip), so `Test Suite` is unchanged. The
+`Layer 7 (<suite>)` jobs run the real Layer 7, one per `LAYER7_SUITES` entry, each on its own
+Kind cluster brought up by `devloop-helper` on the runner (layer7.sh's socket-present lane).
+The `Layer 7` job checks them with a **subset aggregate**,
+`./scripts/layer-all.sh --aggregate <dir> --layers 7`: exactly the listed layers (a line for any
+other layer is `aggregate-layer-out-of-scope`), with every suite once. Images are built once
+per run by a separate job and never by the Layer 7 jobs. The **trigger** picks the tier:
+a push to `main` runs `Layer 7 images (main)`, which pushes to the CI registry
+(`infra/ci/ci-images.sh`) and hands over digests; every other trigger runs `Layer 7 images`,
+which has no registry token and hands over docker archives in the run's artifact. The Layer 7
+jobs hold no cache or registry-write token in either tier. `ci-images-prune.yml` deletes CI
+image versions past their retention daily. **To make Layer 7 required**: drop 7 from the guards
+shard's `layers`, give `Test Suite` `needs: [pipeline, layer7]`, download the
+`layer7-summary-*` artifacts beside the shard summaries, and delete the `Layer 7` job.
+
 ### Job map
 
 | Job | Layers | Tools it installs (matrix flags) | Local repro |
@@ -1378,6 +1394,9 @@ runs no layer.
 | `Pipeline (test, layers 4)` | 4 test (cargo-nextest + doctests, TS) | postgres, sqlx-cli (cached by version), cargo-nextest, Playwright | `./scripts/layer4.sh` |
 | `Pipeline (lint, layers 5)` | 5 lint (clippy, TS lint) | — | `./scripts/layer5.sh` |
 | `Test Suite` | none — aggregates | — | `./scripts/layer-all.sh --aggregate <dir of */layer-summary.txt>` |
+| `Layer 7 images (main)` / `Layer 7 images` | none — builds the five images once (push by digest / docker archives) | dt-guard (build-context gates), buildx | `infra/ci/build-images.sh --archive <dir>` (needs docker + buildx) |
+| `Layer 7 (env-tests)` / `Layer 7 (browser-e2e)` | 7, one suite each (`DEVLOOP_LAYER7_SUITE`), not required | kind (version + sha256 pinned in ci.yml), devloop-helper, Playwright (browser-e2e) | `./scripts/layer7.sh` in a devloop (both suites, one cluster) |
+| `Layer 7` | none — subset aggregate of the two above, not required | — | `./scripts/layer-all.sh --aggregate <dir> --layers 7` |
 
 L1 and L3 share a shard on purpose: L3's guards consume the release `dt-guard`/`dt-story` that
 L1's `scripts/lang/rust/compile.sh` builds. A layer moved to another shard needs its tool flags
@@ -1395,6 +1414,7 @@ moved with it; a missing tool fails loudly (tool not found), never silently.
 | `REASON=aggregate-duplicate-suite` / `-unknown-suite` | Two layer-7 shards ran the same suite, or a `SUITE=` value is not in `LAYER7_SUITES`. | Fix the matrix's `DEVLOOP_LAYER7_SUITE` values. |
 | `REASON=aggregate-malformed-line` / `-unknown-status` / `-layer-out-of-range` | A summary line is not the exact shape layer-all writes (`LAYER=n RESULT=s DURATION=d RC=r`, plus ` SUITE=<suite>` on a suite-split layer-7 line only), or carries a status that is not a pipeline status (incl. `NOT-RUN` — CI shards always run all their layers). | The writer and parser live in the same file (`scripts/layer-all.sh`); a mismatch is a wiring bug, infrastructure lane. |
 | `REASON=aggregate-no-summaries` / `-dir-unreadable` | Nothing was downloaded. | Usually every shard died before upload — open the shard jobs. |
+| `REASON=aggregate-layer-out-of-scope` (`Layer 7` job only) | A summary given to `--aggregate … --layers 7` reports a layer outside that list. | The download pattern picked up a non-Layer-7 summary: fix the artifact names in ci.yml (`layer7-summary-*` vs `layer-summary-*`). |
 
 ### Rolling back
 

@@ -52,6 +52,8 @@ jobs:
         include:
           # L3's guards consume the dev-tool dt-guard/dt-story that L1's
           # scripts/lang/rust/compile.sh builds, so 1 and 3 share a job.
+          # Layer 7 here is the CI clean skip (no cluster); the real Layer 7 runs in the
+          # non-required `Layer 7 (...)` jobs below until it becomes required.
           - shard: guards
             layers: "1,2,3,6,7"
             timeout_minutes: 20  # projected cold ~9 min
@@ -305,6 +307,396 @@ jobs:
         # See the Gate-2 backstop note on the "Run pipeline shard" step above.
         if: always()
         run: ./scripts/layer-all.sh --aggregate shard-summaries
+
+  # ---------------------------------------------------------------------------------------
+  # Layer 7 on Kind — NOT YET A REQUIRED CHECK. The guards shard above still runs layer 7
+  # with no cluster (SKIPPED-NO-CLUSTER), so `Test Suite` is unchanged; these jobs run the
+  # real Layer 7, one suite per Kind cluster (DEVLOOP_LAYER7_SUITE, scripts/layer7.sh
+  # header), and the `Layer 7` job checks them with a subset aggregate. Making it required
+  # = move 7 out of the guards shard and feed these summaries to `Test Suite`.
+  # Runbook: docs/runbooks/devloop-validation.md §8.7.
+  #
+  # Trust tiers. The tier is decided by the TRIGGER, which GitHub records and repo code
+  # cannot change; `push` to main is merged code (main requires a pull request).
+  #   main  (push to refs/heads/main): `Layer 7 images (main)` builds every image once and
+  #         pushes it to the CI registry (infra/ci/ci-images.sh) by digest; the Layer 7
+  #         jobs pull those digests.
+  #   other (pull_request, push to develop, workflow_dispatch): `Layer 7 images` builds the
+  #         same images with no registry token, writes only its own cache scope, and hands
+  #         them to the Layer 7 jobs as docker archives inside this run. Fork PRs get a
+  #         read-only token by platform rule.
+  # In neither tier do the Layer 7 jobs (which run test code) hold a cache or
+  # registry-write token.
+  layer7-images-main:
+    name: Layer 7 images (main)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write   # push the CI images
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "ci-layer7-images"
+          cache-on-failure: true
+          cache-bin: false
+
+      - name: Gate - build context holds no key material
+        # Before any cache or registry credential exists in this job.
+        run: |
+          bash -c 'source scripts/lib/tool-bins.sh && dt_build_tool dt-guard --locked --quiet'
+          scripts/guards/simple/validate-docker-context.sh
+          scripts/guards/simple/validate-shared-image-builder.sh
+
+      - name: Actions cache credentials for BuildKit
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+
+      - name: Create docker-container builder
+        run: docker buildx create --name dt-ci --driver docker-container --bootstrap --use
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+        run: echo "${GH_TOKEN}" | docker login ghcr.io -u "${GH_ACTOR}" --password-stdin
+
+      - name: Build once, push by digest
+        env:
+          DT_IMAGE_SOURCE_REV: ${{ github.sha }}
+          DT_IMAGE_BUILD_CACHE: gha
+        run: |
+          mkdir -p /tmp/images
+          infra/ci/build-images.sh --push /tmp/images/image-refs.txt
+          cat /tmp/images/image-refs.txt
+
+      - name: Publish the digest list to this run
+        # An artifact, not a job output: the Layer 7 jobs start without `needs:` so their
+        # setup overlaps the image builds, and collect the list when this job finishes.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: layer7-images
+          path: /tmp/images/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
+
+  layer7-images:
+    name: Layer 7 images
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "ci-layer7-images"
+          cache-on-failure: true
+          cache-bin: false
+
+      - name: Gate - build context holds no key material
+        # The archives are downloadable by anyone who can read this run.
+        run: |
+          bash -c 'source scripts/lib/tool-bins.sh && dt_build_tool dt-guard --locked --quiet'
+          scripts/guards/simple/validate-docker-context.sh
+          scripts/guards/simple/validate-shared-image-builder.sh
+
+      - name: Actions cache credentials for BuildKit
+        # A pull_request run's cache writes are scoped to that PR; it reads main's.
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+
+      - name: Create docker-container builder
+        run: docker buildx create --name dt-ci --driver docker-container --bootstrap --use
+
+      - name: Build once, archive by image ID
+        env:
+          DT_IMAGE_BUILD_CACHE: gha
+        run: |
+          infra/ci/build-images.sh --archive /tmp/images
+          cat /tmp/images/image-refs.txt
+          ls -la /tmp/images
+
+      - name: Publish the images to this run
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: layer7-images
+          path: /tmp/images/
+          retention-days: 1
+          if-no-files-found: error
+
+  layer7:
+    name: Layer 7 (${{ matrix.suite }})
+    # No `needs:`: setup runs while the tier's images job builds, and the "Wait for the
+    # images job" step joins the two before deploy.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read    # main tier: pull the CI images by digest
+      actions: read     # read this run's job status (wait for the images job)
+    strategy:
+      # Every suite reports even when another is red: the `Layer 7` aggregate needs both.
+      fail-fast: false
+      matrix:
+        # Must equal LAYER7_SUITES (scripts/lang/_common.sh): the `Layer 7` aggregate fails
+        # on a suite missing from here (aggregate-missing-suite) or unknown there.
+        suite: [ env-tests, browser-e2e ]
+    env:
+      SLUG: ci
+      # kind is installed only here (devs install their own); pinned by version AND digest.
+      KIND_VERSION: v0.33.0
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+      # layer7.sh defaults to the devloop image's /opt/ms-playwright.
+      PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
+      IMAGES_JOB: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'Layer 7 images (main)' || 'Layer 7 images' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # layer-all.sh's merge-base precondition needs full history.
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler socat  # socat: dev-cluster client transport
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # One key per suite: parallel jobs saving one key would race.
+          shared-key: "ci-layer7-${{ matrix.suite }}"
+          cache-on-failure: true
+          cache-bin: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
+
+      - name: Install pnpm dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        if: matrix.suite == 'browser-e2e'
+        run: pnpm --filter @darktower/web-app exec playwright install --with-deps chromium
+
+      - name: Install kind
+        run: |
+          curl -fsSLo /tmp/kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_SHA256}  /tmp/kind" | sha256sum -c -
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          kind version
+
+      - name: Classic Docker image store (kind load compatibility)
+        # With Docker's containerd image store, `kind load` of multi-arch images fails
+        # (`ctr images import --all-platforms`: content digest not found). Merged into
+        # the runner's daemon.json, not replacing it.
+        run: |
+          f=/etc/docker/daemon.json
+          cur="$(sudo cat "$f" 2>/dev/null || true)"
+          [ -n "${cur}" ] || cur='{}'
+          jq '.features["containerd-snapshotter"] = false' <<< "${cur}" | sudo tee "$f.new"
+          sudo mv "$f.new" "$f"
+          sudo systemctl restart docker
+          docker info --format 'driver={{.Driver}}'
+
+      - name: Use rootful docker, not the preinstalled podman
+        # devloop-helper picks podman when it is on PATH.
+        run: |
+          p="$(command -v podman || true)"
+          if [ -n "$p" ]; then sudo mv "$p" "$p.disabled"; fi
+          ! command -v podman
+
+      - name: Give the runner the dev container's view of the host
+        # Kind binds NodePorts and the apiserver on the helper's host-gateway IP, and the
+        # helper writes URLs/kubeconfig against host.containers.internal. The IP is read
+        # from its one home (devloop-helper's DEFAULT_HOST_GATEWAY_IP), never retyped.
+        run: |
+          ip="$(sed -n 's/^const DEFAULT_HOST_GATEWAY_IP: &str = "\([0-9.]*\)";$/\1/p' crates/devloop-helper/src/commands.rs)"
+          [[ "${ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::could not read DEFAULT_HOST_GATEWAY_IP (got '${ip}')"; exit 1; }
+          sudo ip addr add "${ip}/32" dev lo
+          echo "${ip} host.containers.internal" | sudo tee -a /etc/hosts
+
+      - name: Build devloop-helper
+        run: cargo build --release -p devloop-helper
+
+      - name: Wait for the images job
+        # Fails loudly if the tier's images job fails, is cancelled, or does not finish in
+        # time. Every job in this run is the same trust tier (the trigger decides it).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jobs="repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100"
+          for _ in $(seq 1 120); do
+            state="$(gh api "${jobs}" --jq "[.jobs[] | select(.name == \"${IMAGES_JOB}\")] | if length == 1 then .[0] | \"\\(.status) \\(.conclusion)\" else \"ambiguous \\(length)\" end")"
+            case "${state}" in
+              "completed success") echo "${IMAGES_JOB}: succeeded"; exit 0 ;;
+              completed*|ambiguous*) echo "::error::${IMAGES_JOB}: ${state}"; exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo "::error::${IMAGES_JOB} still running after 30 min (${state})"; exit 1
+
+      - name: Download the images job's output
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: layer7-images
+          path: /tmp/images
+
+      - name: (main) Use the pushed images, pinned by digest
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_ACTOR: ${{ github.actor }}
+        run: |
+          cat /tmp/images/image-refs.txt
+          [ "$(grep -cE '^localhost/[a-z0-9-]+ [a-z0-9./_-]+@sha256:[0-9a-f]{64}$' /tmp/images/image-refs.txt)" -ge 5 ] \
+            || { echo "::error::expected 5 digest-pinned refs"; exit 1; }
+          ! ls /tmp/images/*.tar 2>/dev/null || { echo "::error::the main tier pulls from the registry; unexpected archives"; exit 1; }
+          echo "DT_PREBUILT_IMAGES=/tmp/images/image-refs.txt" >> "$GITHUB_ENV"
+          echo "${GH_TOKEN}" | docker login ghcr.io -u "${GH_ACTOR}" --password-stdin
+
+      - name: (other) Load the archived images, pinned by image ID
+        if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+        run: |
+          cat /tmp/images/image-refs.txt
+          [ "$(grep -cE '^localhost/[a-z0-9-]+ sha256:[0-9a-f]{64}$' /tmp/images/image-refs.txt)" -ge 5 ] \
+            || { echo "::error::expected 5 image-ID refs"; exit 1; }
+          for tar in /tmp/images/*.tar; do docker load -i "${tar}"; done
+          # deploy.sh refuses any listed ID the store does not hold; checked here too so a
+          # mismatch names the image instead of surfacing mid-deploy.
+          while read -r repo id; do
+            docker image inspect "${id}" >/dev/null || { echo "::error::${repo}: ${id} not loaded"; exit 1; }
+          done < /tmp/images/image-refs.txt
+          rm -f /tmp/images/*.tar
+          echo "DT_PREBUILT_IMAGES=/tmp/images/image-refs.txt" >> "$GITHUB_ENV"
+
+      - name: Run Layer 7 (${{ matrix.suite }})
+        id: shard
+        env:
+          KUBECONFIG: /tmp/devloop/kubeconfig
+          DEVLOOP_LAYER7_SUITE: ${{ matrix.suite }}
+        # The helper is launched in THIS step: the runner kills a step's background
+        # processes when the step ends. layer7.sh then takes its existing socket-present
+        # lane through the canonical /tmp/devloop paths (no CI-specific mechanism).
+        run: |
+          mkdir -p "/tmp/devloop-${SLUG}"
+          chmod 700 "/tmp/devloop-${SLUG}"
+          nohup target/release/devloop-helper "${SLUG}" --project-root "$GITHUB_WORKSPACE" \
+            >> "/tmp/devloop-${SLUG}/helper-stdout.log" 2>> "/tmp/devloop-${SLUG}/helper-stderr.log" &
+          for _ in $(seq 1 60); do [ -S "/tmp/devloop-${SLUG}/helper.sock" ] && break; sleep 1; done
+          [ -S "/tmp/devloop-${SLUG}/helper.sock" ] || { cat "/tmp/devloop-${SLUG}/helper-stderr.log"; exit 1; }
+          ln -sfn "/tmp/devloop-${SLUG}" /tmp/devloop
+          infra/devloop/dev-cluster status || { echo "::error::dev-cluster status failed"; exit 1; }
+          set +e
+          ./scripts/layer-all.sh --layers 7
+          rc=$?
+          set -e
+          # A running helper means Layer 7 must not have taken the no-cluster skip.
+          summary="$(sed -n 's/^summary-path=//p' "$GITHUB_OUTPUT" | tail -1)"
+          if grep -qs 'RESULT=SKIPPED-NO-CLUSTER' "${summary}"; then
+            echo "::error::Layer 7 skipped despite a running helper"; exit 1
+          fi
+          exit $rc
+
+      - name: Upload Layer 7 summary
+        # Always: a red suite's summary must still reach the `Layer 7` aggregate.
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: layer7-summary-${{ matrix.suite }}
+          path: ${{ steps.shard.outputs.summary-path }}
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: Collect cluster and helper logs
+        if: always()
+        run: |
+          mkdir -p /tmp/layer7-logs
+          cp -rL /tmp/devloop-${SLUG}/*.log /tmp/devloop-${SLUG}/ports.json /tmp/layer7-logs/ 2>/dev/null || true
+
+      - name: Upload cluster and helper logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: layer7-logs-${{ matrix.suite }}
+          path: /tmp/layer7-logs/
+          if-no-files-found: warn
+          retention-days: 5
+
+  layer7-aggregate:
+    # Not required yet (see the block comment above `layer7-images-main`).
+    name: Layer 7
+    needs: layer7
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every suite to have succeeded
+        env:
+          SUITES_RESULT: ${{ needs.layer7.result }}
+        run: |
+          if [ "${SUITES_RESULT}" != "success" ]; then
+            echo "::error::Layer 7 suites result is '${SUITES_RESULT}', not success — open the red 'Layer 7 (...)' job"
+            exit 1
+          fi
+
+      - name: Checkout code
+        if: always()
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download suite summaries
+        if: always()
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: layer7-summary-*
+          path: layer7-summaries
+
+      - name: Aggregate Layer 7
+        # Every LAYER7_SUITES entry exactly once, and nothing but layer 7.
+        if: always()
+        run: ./scripts/layer-all.sh --aggregate layer7-summaries --layers 7
 
   coverage:
     name: Code Coverage
