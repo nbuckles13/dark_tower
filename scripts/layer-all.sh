@@ -105,7 +105,10 @@ SHARD_SUMMARY_FILE="layer-summary.txt"
 #   * each line must match one anchored shape with a KNOWN status (a status
 #     __status_rank ranks below its fail-closed catch-all, or UNKNOWN — the token a layer
 #     with no STATUS line records). The file is never sourced/eval'd;
-#   * every layer 1..LAYER_MAX must appear EXACTLY once across all summaries;
+#   * every layer 1..LAYER_MAX must appear EXACTLY once across all summaries — or, with
+#     `--layers L,...` beside `--aggregate`, exactly the listed layers and no other (a
+#     check over a subset of the jobs, e.g. ci.yml's non-required Layer 7 jobs; the
+#     required `Test Suite` always aggregates the whole pipeline);
 #   * any violation, or no summary at all, is PRECONDITION_FAILURE (exit 2) with a REASON.
 # Then TOTAL_RESULT = worst status, exit = max(status_to_exit_code(TOTAL), every RC) — the
 # same aggregation and observed-rc FLOOR as a single invocation.
@@ -117,6 +120,8 @@ aggregate_shard_summaries() {
   # marks that layer LAYER_MAX arrived split (so a whole-layer line beside it is a duplicate).
   local -A suite_shard=()
   local split_seen=0
+  local -A agg_scope=()
+  for n in "${layers_to_run[@]}"; do agg_scope[$n]=1; done
   agg_fail() {
     printf 'PRECONDITION_FAILURE: --aggregate: %s REASON=aggregate-%s\n' "$2" "$1" >&2
     printf 'STATUS=PRECONDITION_FAILURE REASON=aggregate-%s\n' "$1"
@@ -138,6 +143,9 @@ aggregate_shard_summaries() {
       fi
       if (( n > LAYER_MAX )); then
         agg_fail layer-out-of-range "${f}: layer ${n} is outside 1..${LAYER_MAX}"; return 2
+      fi
+      if [[ -z "${agg_scope[$n]:-}" ]]; then
+        agg_fail layer-out-of-scope "${f}: layer ${n} is not one of the aggregated layers (${layers_to_run[*]})"; return 2
       fi
       if [[ -n "$suite" ]]; then
         # A suite-split layer-LAYER_MAX line: merge it (worst status, max rc, max duration —
@@ -185,7 +193,7 @@ aggregate_shard_summaries() {
   for n in "${layers_to_run[@]}"; do
     [[ -n "${layer_status[$n]:-}" ]] || missing="${missing:+${missing},}${n}"
   done
-  [[ -z "$missing" ]] || { agg_fail missing-layer "layer(s) ${missing} reported by no shard — the CI partition must cover 1..${LAYER_MAX}"; return 2; }
+  [[ -z "$missing" ]] || { agg_fail missing-layer "layer(s) ${missing} reported by no shard — the CI partition must cover ${layers_to_run[*]}"; return 2; }
 
   # Same totals and the same exit rule as one invocation: max(mapped status, every RC).
   local worst_rc=0 mapped
@@ -236,14 +244,21 @@ aggregate_shard_summaries() {
 #     EXIT trap below is not installed for it); its output is the shard summary file,
 #     which only the aggregate reads. Local users keep `--max-layer`.
 #   * `--aggregate` runs no layer and writes no verdict; it only reads summary files.
+#     `--aggregate DIR --layers L,...` narrows it to exactly those layers (see
+#     aggregate_shard_summaries); it is the one pairing of the modes allowed.
 layer_lo=1
 layer_hi="$LAYER_MAX"
 layers_arg=""
 aggregate_dir=""
 mode="full"
-set_mode() {  # one mode per invocation; --max-layer / --layers / --aggregate are exclusive
+aggregate_subset=0
+set_mode() {  # one mode per invocation; --max-layer / --layers / --aggregate are exclusive,
+              # except --aggregate with --layers (a subset aggregate), in either order
+  if [[ "$mode" == "aggregate" && "$1" == "shard" ]] || [[ "$mode" == "shard" && "$1" == "aggregate" ]]; then
+    mode="aggregate"; aggregate_subset=1; return
+  fi
   if [[ "$mode" != "full" && "$mode" != "$1" ]]; then
-    printf 'PRECONDITION_FAILURE: --max-layer, --layers and --aggregate are mutually exclusive.\n' >&2
+    printf 'PRECONDITION_FAILURE: --max-layer, --layers and --aggregate are mutually exclusive (except --aggregate DIR --layers L,...).\n' >&2
     exit 2
   fi
   mode="$1"
@@ -259,11 +274,25 @@ while (( $# )); do
     --layers=*)    set_mode shard; layers_arg="${1#--layers=}" ;;
     --aggregate)   need_value "$@"; set_mode aggregate; shift; aggregate_dir="$1" ;;
     --aggregate=*) set_mode aggregate; aggregate_dir="${1#--aggregate=}" ;;
-    *) printf 'PRECONDITION_FAILURE: unknown argument %q — layer-all.sh accepts only --max-layer N, --layers L,... (CI) or --aggregate DIR.\n' "$1" >&2; exit 2 ;;
+    *) printf 'PRECONDITION_FAILURE: unknown argument %q — layer-all.sh accepts only --max-layer N, --layers L,... (CI), --aggregate DIR, or --aggregate DIR --layers L,....\n' "$1" >&2; exit 2 ;;
   esac
   shift
 done
 is_layer_number() { [[ "$1" =~ ^[1-9][0-9]*$ ]] && (( $1 >= 1 && $1 <= LAYER_MAX )); }
+# Parse $layers_arg (ascending, distinct, comma-separated 1..LAYER_MAX) into layers_to_run,
+# or refuse. Shared by a shard (--layers) and a subset aggregate (--aggregate --layers).
+parse_layers_arg() {
+  local n prev=0
+  IFS=',' read -r -a __shard_list <<< "$layers_arg"
+  for n in "${__shard_list[@]}"; do
+    if ! is_layer_number "$n" || (( n <= prev )); then
+      printf 'PRECONDITION_FAILURE: --layers must be ascending, distinct integers 1..%s, comma-separated (got %q). REASON=shard-layer-list-invalid\n' "$LAYER_MAX" "$layers_arg" >&2
+      exit 2
+    fi
+    layers_to_run+=("$n"); prev=$n
+  done
+  (( ${#layers_to_run[@]} )) || { printf 'PRECONDITION_FAILURE: --layers is empty. REASON=shard-layer-list-invalid\n' >&2; exit 2; }
+}
 
 fast_lane=0
 shard_mode=0
@@ -287,16 +316,7 @@ case "$mode" in
       printf 'PRECONDITION_FAILURE: --layers is the CI shard mode (GITHUB_ACTIONS only, never a run-story gate / pre-commit); locally use --max-layer N or the full pipeline. REASON=shard-outside-ci\n' >&2
       exit 2
     fi
-    prev=0
-    IFS=',' read -r -a __shard_list <<< "$layers_arg"
-    for n in "${__shard_list[@]}"; do
-      if ! is_layer_number "$n" || (( n <= prev )); then
-        printf 'PRECONDITION_FAILURE: --layers must be ascending, distinct integers 1..%s, comma-separated (got %q). REASON=shard-layer-list-invalid\n' "$LAYER_MAX" "$layers_arg" >&2
-        exit 2
-      fi
-      layers_to_run+=("$n"); prev=$n
-    done
-    (( ${#layers_to_run[@]} )) || { printf 'PRECONDITION_FAILURE: --layers is empty. REASON=shard-layer-list-invalid\n' >&2; exit 2; }
+    parse_layers_arg
     shard_mode=1
     # CI reads the summary's path from here (the upload step's `path:`), so the file name
     # and directory live only in this script: emitted up front, before any layer can fail.
@@ -305,7 +325,11 @@ case "$mode" in
     fi
     ;;
   aggregate)
-    for (( n = 1; n <= LAYER_MAX; n++ )); do layers_to_run+=("$n"); done
+    if (( aggregate_subset )); then
+      parse_layers_arg
+    else
+      for (( n = 1; n <= LAYER_MAX; n++ )); do layers_to_run+=("$n"); done
+    fi
     ;;
 esac
 layer_hi="${layers_to_run[-1]}"
