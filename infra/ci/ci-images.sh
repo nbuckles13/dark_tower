@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # The CI image namespace: ONE definition for the scripts that push to it
-# (build-push-images.sh) and prune it (prune-ci-images.sh). Separate from any
+# (build-images.sh --push) and prune it (prune-ci-images.sh). Separate from any
 # release namespace; consumers pull by digest, never by tag.
 #
 # DT_IMAGE_REGISTRY, when set, wins (a fork or a test points elsewhere);
