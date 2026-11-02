@@ -20,7 +20,7 @@
   "dependencies": {
     "@darktower/sdk-core": "workspace:*",
     "@darktower/sdk-svelte": "workspace:*",
-    "svelte": "5.57.2"
+    "svelte": "5.57.3"
   },
   "devDependencies": {
     "@opentelemetry/api": "catalog:",
