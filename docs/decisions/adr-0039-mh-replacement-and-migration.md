@@ -134,7 +134,11 @@ and a blip. It is counted on the MH side (§8):
     ignored. GC owns the length cap
     and pushes it to MC in `RegisterMCResponse.max_exclude_handler_ids` (0/absent fails MC
     registration); MC derives its per-meeting attempt bound from it.
-  - **GC alone chooses**, among healthy, fresh, under-ceiling candidates. GC's own health view of the
+  - **GC alone chooses**, among healthy, fresh, under-ceiling candidates, with **the same
+    weighted-random selection as initial allocation** (one function; the exclude list is applied
+    inside the candidate query, before the least-loaded cut). That randomness is what spreads a burst
+    of replacements from many MCs across handlers (user ruling, 2026-10-31); MH admission
+    (`STREAM_CEILING`/`EDGE_CAP` refusals, §1) is the hard backstop. GC's own health view of the
     replaced handler is a metric label (`gc_view`), **never a veto** (it lags MC's detector by
     up to the MH staleness bound, k × the load-report interval, 30 s by default). GC persists nothing per meeting: **MC's versioned in-memory handler set is the sole
     authority**; Redis `MhAssignmentData` is GC's hand-off, read once when the meeting actor is
@@ -144,9 +148,10 @@ and a blip. It is counted on the MH side (§8):
     `FAILED_PRECONDITION` (caller not the meeting's MC — anti-misroute only; `controller_id` is
     self-asserted, recorded gap; not retried, loud), `INVALID_ARGUMENT` (over-length/malformed — MC bug, not retried).
   - No capacity / GC down: MC continues on survivors and retries with bounded, jittered backoff,
-    gated by **one shared per-MC limiter** for GC calls and migration starts, plus a per-meeting
-    minimum interval between replacements and the per-meeting attempt bound derived from
-    `max_exclude_handler_ids`; a meeting at its bound stops acquiring (loud, counted). A meeting with zero
+    bounded per meeting by a minimum interval between replacements and the attempt bound derived
+    from `max_exclude_handler_ids`. There is no per-MC limiter (user ruling, 2026-10-31): it could not
+    protect a shared MH or GC from other MCs and would only delay the tail of a crashed handler's
+    meetings; a meeting at its bound stops acquiring (loud, counted). A meeting with zero
     handlers is an explicit, counted, paged "awaiting handler" state.
 - **Register before token, everywhere, including first join.** Inside MC a handler is first
   *Registering*: it is in MC's set, its heartbeats get OWNED, and the binding gate admits it. It
@@ -259,12 +264,13 @@ migration or redial.
   `MC_MEDIA_DIAL_TOKEN_TTL_SECONDS`: default 300, hard-fails outside [60, 900].
 - **Delivery**: every `MediaHandlerSet` carries a token for **every** member.
   - MC re-pushes each participant's set every TTL/3, jittered per participant, through the existing
-    per-turn coalesced flush and the shared limiter. It also pushes on every membership change and
+    per-turn coalesced flush. It also pushes on every membership change and
     on (re)join.
   - A token-only refresh keeps `handler_set_version` and the refs (§4).
   - A `MediaConnectionUpdate` FAILED for an in-set ref triggers an immediate, rate-limited re-push
     of that participant's set. That is a credential re-push to the sender only, never routing input.
-  - `MediaDialTokenRequest`/`MediaDialToken` are deleted, and the AC endpoint/scope is dropped.
+  - No AC mint endpoint, scope or `MediaDialTokenRequest`/`MediaDialToken` exists (proposed in
+    round 3, dropped in round 4 before implementation), so nothing on AC changes.
   - `MhConnectRequest.join_token` is replaced by `media_dial_token`.
 - **MH verifies at accept, before holding anything**:
   - size cap; alg pinned to EdDSA; `kid`/`jwk` headers ignored;
@@ -313,7 +319,8 @@ never arrive. Each mechanism below covers one of those failures.
   `verdict {OWNED, RELEASED}` plus a `ReleaseCause` on RELEASED. RELEASED means "not in my set", and
   MH ends the meeting through `handle_end_meeting`, closing its sessions with `HANDLER_RELEASED`
   and sending no `Disconnected`. OWNED does nothing. A verdict of `UNSPECIFIED` (proto zero) is
-  malformed: MH counts it and takes no action. MH never self-fences on MC silence.
+  malformed: MH counts it and takes no action. MH does not act on short MC silence; the only
+  silence rule is the owner-silence release below.
   - Cause rules: a removed handler gets its removal trigger. A meeting with no MC actor gets
     `MEETING_ENDED` (answered by MC's router; no tombstone needed). A live meeting whose set never
     held this handler gets `UNSPECIFIED`, counted as a misroute.
@@ -322,11 +329,18 @@ never arrive. Each mechanism below covers one of those failures.
   - **Owner check**: the heartbeat carries the meeting's registered `mc_id`. An MC that is not that MC
     answers `FAILED_PRECONDITION`, never RELEASED, and MH counts it and takes no action. This stops a
     stale MC endpoint whose IP was reused by *another* MC pod from releasing a live meeting.
-  - **Incidental consequence, not an MC-failover mechanism**: an MC restarted with the same id has no
-    actors, so it answers RELEASED(`MEETING_ENDED`) and the MHs end its predecessor's meetings within
-    one interval. Those meetings are already lost when MC restarts (MC failure is out of scope), and
-    releasing them reclaims MH capacity. The burst is bounded at one release per meeting per
-    interval, spread by the first-send jitter.
+  - **MC restart (incidental, not an MC-failover mechanism)**: MC's id is generated per process
+    (`MC_ID` is unset in our deploy), so a restarted MC has a new id and answers its predecessor's
+    meetings' heartbeats with `FAILED_PRECONDITION`. Those meetings are already lost (MC failure is out
+    of scope); MH holds them until the owner-silence release below reclaims the capacity.
+  - **Owner-silence release** (user ruling, 2026-10-31): MH ends a meeting when it has had no
+    communication from the meeting's owning MC for `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS`
+    (default 900). Communication means a `RegisterMeeting` or `EndMeeting` from that MC, or a
+    heartbeat answered with a verdict by it; transport errors and `FAILED_PRECONDITION` do not count.
+    Sessions close with `HANDLER_RELEASED`, and the release is counted with its own cause. It is safe
+    because the bound is far beyond N: an MC that cannot reach MH for that long has already declared
+    it dead and moved off, and an MH that stops heartbeating a meeting is declared dead by a live MC.
+    MH validates the value at startup against a floor well above the largest heartbeat interval.
 - **One enum**: `ReleaseCause {UNSPECIFIED, HEARTBEAT_TIMEOUT, APPLY_LAG, PLANNED_TRANSFER,
   MEETING_ENDED}` serves `AcquireMediaHandler.trigger` (`MEETING_ENDED` and `UNSPECIFIED` are `INVALID_ARGUMENT` there),
   `EndMeetingRequest.cause` (new; rejects `UNSPECIFIED`) and the RELEASED verdict (where `UNSPECIFIED` is
@@ -451,8 +465,8 @@ Full contract: `docs/debates/2026-10-28-mh-replacement-and-migration/telemetry-c
     expected to be zero, and any increase is a WARNING.
   - The census behind `first_declarations_total` is one MC-wide `HandlerCensus` on the
     `MutedSourceCensus` pattern, pruned on the controller health walk. Handler ids are never labels.
-  - Every UNKNOWN series is deleted. The AC mint counter and the `token_unavailable` outcome are
-    deleted. `mh_register_meeting_timeouts_total` is deleted.
+  - Every UNKNOWN series is deleted (none of them, nor the round-3 AC mint counter and
+    `token_unavailable` outcome, was ever implemented). `mh_register_meeting_timeouts_total` is deleted.
   - New `mc_media_handler_set_pushes_total{reason=join|change|token_refresh|failed_report}`; the
     token TTL and the derived refresh interval (TTL/3) are published as config gauges.
   - MH's `mh_jwt_validations_total` uses `token_type="media_dial"`, and its client-path
@@ -543,13 +557,14 @@ history); ConfigMap generations referenced by a live MH pod are never pruned.
 ### Negative
 
 - A heartbeat per (meeting, handler) runs continuously, and one MH death produces one Dead
-  declaration per meeting, bounded by the shared per-MC limiter.
+  declaration per meeting and one replacement request each, spread across handlers by GC's
+  weighted-random selection (the same load shape as a top-of-hour join spike).
 - MC re-pushes every participant's handler set every TTL/3 to refresh dial tokens.
 - A meeting's first join waits one internal `RegisterMeeting` round-trip before its reply.
 - A gray-failed MH stays GC-selectable (known gap, §3).
-- A meeting whose MC endpoint now answers as a different `mc_id` is held by MH, since MH never acts on
-  `FAILED_PRECONDITION`, until MH restarts or is drained. It is visible on
-  `mh_media_meetings_without_clients`.
+- A meeting whose MC endpoint now answers as a different `mc_id` (an MC restart) is held by MH, since
+  MH never acts on `FAILED_PRECONDITION`, until the owner-silence release (default 15 min). It is
+  visible on `mh_media_meetings_without_clients`.
 - A planned transfer costs a small blip until multi-handler send lands.
 - Kind's address pool is fixed at cluster creation (changing K recreates the cluster).
 
@@ -586,7 +601,8 @@ or MC restart". Moot: "MC's `policy_generation` resets to 1…" and "`EndMeeting
 a late `RegisterMeeting`" (no periodic re-push; the RELEASED fence also covers late registrations). Superseded: "`handler_id` is a per-INCARNATION token…" (stable handler id) — per-incarnation
 `handler_id` is now the intended identity; rewrite the entry. Narrowed: "A meeting whose MC never sends
 `EndMeeting` is never reclaimed" — the failed/exhausted-`EndMeeting` arm is reclaimed via the
-RELEASED(MEETING_ENDED) for a meeting with no MC actor; the MC-crash arm stays (MC failure out of scope).
+RELEASED(MEETING_ENDED) for a meeting with no MC actor, and the MC-crash arm by the owner-silence
+release (§6); MC failover itself stays out of scope.
 
 ## Participants
 
