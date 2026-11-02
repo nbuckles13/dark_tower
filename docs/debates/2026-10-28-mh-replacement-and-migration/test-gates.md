@@ -29,9 +29,9 @@ Rules for every gate: deadlines read `tokio::time::Instant` and are tested with 
 - (R4-1: the decode-limit boot validation is deleted on MC and MH.)
 
 ## GC
-- AcquireMediaHandler table: {A,B,C} excluding {A,B} → C; excluding all → RESOURCE_EXHAUSTED; current ∪ removed are both excluded by id; a current id with no GC row → FAILED_PRECONDITION; a draining MH is never granted; the length cap on the exclude sum holds.
+- AcquireMediaHandler table: {A,B,C} excluding {A,B} → C; excluding all → RESOURCE_EXHAUSTED; one exclude list (current ∪ removed ∪ refused-at-admission) excluded by id, unknown ids ignored (ADR-0039 §3); a caller that is not the meeting's MC → FAILED_PRECONDITION; a draining MH is never granted; the length cap on the exclude sum holds.
 - The eligibility/exclusion predicate in Rust, plus a `#[sqlx::test]` proving the SQL matches it. The shared selection function enforces the same invariant at initial assignment.
-- MC declares X failed while GC sees X healthy → the grant is still issued, gc_view=healthy label. GC rejects token_type=media_dial. L4-9: gc_mh_replacement_requests_total{trigger,outcome,gc_view} rises per report with no handler_id label, and the `gc.mh.replacement_report` INFO event carries the ids. With a seeded RNG, selection is identical with and without reports (evidence only).
+- MC declares X failed while GC sees X healthy → the grant is still issued, gc_view=healthy label. GC rejects an MC-signed media_dial token (key outside AC's JWKS, and HS256); the positive arm is that an AC token is accepted. L4-9: gc_mh_replacement_requests_total{trigger,outcome,gc_view} rises per report with no handler_id label, and the `gc.mh.replacement_report` INFO event carries the ids. With a seeded RNG, selection is identical with and without reports (evidence only).
 - Metric integration tests per ADR-0032.
 
 ## Protocol
@@ -42,7 +42,7 @@ Rules for every gate: deadlines read `tokio::time::Instant` and are tested with 
 - Remove ref 1 + add ref 2 with an IDENTICAL URL → a real close+open (not deduped).
 - A slot's decoder and replay window survive a set diff; no SessionMedia/TransmitKeyManager rebuild; key id strictly increases across a swap after generation 0.
 - media_dial (L4-3, L4-4): the diff keys on handler_ref only, and a token-only refresh (same refs and URLs, new tokens) causes NO close/open (distinguishing). The client keeps the latest token per in-set ref (scoped R-23) and reuses it for redials. The token is opaque, never parsed. After DECLINED for a ref, the client makes no dial until a set carrying a newer token for that ref arrives, then exactly one dial (injected clock). A refresh arriving while the ref is parked releases it and dials.
-- Close codes: WRONG_HANDLER, BINDING_CONFLICT and MC_UNAVAILABLE → counted, no loss report, backoff redial while the ref is in the set; HANDLER_RELEASED → expected, no report if the ref has left the set, otherwise grace then DISCONNECTED + redial; DECLINED → terminal for that ref, FAILED reported; no code → loss report + redial.
+- Close codes: WRONG_HANDLER, BINDING_CONFLICT and MC_UNAVAILABLE → counted, no loss report, backoff redial while the ref is in the set; HANDLER_RELEASED → expected, no report if the ref has left the set, otherwise grace then DISCONNECTED + redial; DECLINED → token dead, not handler dead: park the ref, report FAILED, exactly one dial when a set with a newer token arrives (ADR-0039 §5); no code → loss report + redial.
 - The loss report echoes handler_ref + handler_set_version.
 - Join with an empty handler set (L4-2) followed by a set naming a handler → normal media; past the configured bound with no handler, exactly one notice, and the session is kept.
 
@@ -70,7 +70,7 @@ Freeze item 2 (live-set address uniqueness) + GC's hardcoded "up to 2" initial s
 
 ## Round 3 (user ruling: per-incarnation addressing, on-demand MH): SUPERSEDES the mh-2 items above
 - Kind MHs live on hostPort slots (K=6, single home `crates/devloop-helper/src/ports.rs`), managed by `infra/kind/scripts/mh.sh up|drain|list`. The static mh-2 and the "mh-2 scaled to 0" leg are dropped.
-- mh.sh: machine-readable output and distinct exit codes (no-free-slot vs failure); `up` returns only once the MH is GC-selectable; hermetic self-test `infra/kind/scripts/mh.test.sh` (PATH-stub kubectl, `scripts/layer7.test.sh` style) covering lowest-free-slot, the AlreadyExists race, no free slot → loud failure, and refusing to drain the last serving MH.
+- mh.sh: machine-readable output and distinct exit codes (no-free-slot vs failure); `up` returns only once the MH is GC-selectable; hermetic self-test `infra/kind/scripts/mh.test.sh` (PATH-stub kubectl, `scripts/layer7.test.sh` style) covering next-fit slot choice (ADR-0039 §7), the AlreadyExists race, no free slot → loud failure, and refusing to drain the last serving MH.
 - Legs (`#[serial]`, each restores count == B in asserted teardown): crash (B), planned = `mh up` + `mh drain` (B+1), survivor-path drain = `mh drain` without up, then restore (B−1). End-of-Layer-7 check: `mh list` count == B and no slot in Terminating.
 - Injector (crash and zombie): `shareProcessNamespace: true` in the slot template; a same-UID `kubectl debug --target` container sends `kill -KILL <mh pid>` (crash: in-place restart) or STOP/CONT (zombie). Never `kubectl delete pod --force --grace-period=0`, which defeats the hostPort lock.
 - Crash assertions: new handler_ref and restart_count+1 (handler_id is not observed); the address MAY equal the dead handler's (sequential slot reuse); the client does a real close+open on the same URL; the media_dial aud fast-fail is the residual guard.
