@@ -167,14 +167,14 @@ jobs:
 
       - name: Install cargo-audit
         if: matrix.needs_audit
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-audit@${{ steps.pins.outputs.cargo-audit }}
 
       - name: Install cargo-nextest
         # Layer 4's test runner (scripts/lang/rust/test.sh checks the version against the pin).
         if: matrix.needs_nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-nextest@${{ steps.pins.outputs.cargo-nextest }}
 
@@ -766,7 +766,7 @@ jobs:
           echo "cargo-llvm-cov=${v}" >> "$GITHUB_OUTPUT"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-llvm-cov@${{ steps.pins.outputs.cargo-llvm-cov }}
 
