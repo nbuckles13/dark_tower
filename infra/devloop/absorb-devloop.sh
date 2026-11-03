@@ -48,6 +48,10 @@
 #   4  — working tree dirty; refuses to run
 
 set -euo pipefail
+# clone_head_branch: read the worktree's HEAD as a file — never run git with the
+# container-writable worktree as the repo (see infra/lib/clone-head.sh).
+# shellcheck source=../lib/clone-head.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/clone-head.sh"
 
 # ─── Args + helpers ─────────────────────────────────────────────
 
@@ -91,8 +95,8 @@ if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null || [[ -d "$GIT_DIR_ABS/
     PICK_IN_PROGRESS=true
 fi
 
-SOURCE_BRANCH="$(git -C "$WORKTREE" branch --show-current 2>/dev/null || true)"
-[[ -n "$SOURCE_BRANCH" ]] || fail "Source worktree is in detached HEAD; cannot identify branch."
+SOURCE_BRANCH="$(clone_head_branch "$WORKTREE" || true)"
+[[ -n "$SOURCE_BRANCH" ]] || fail "Source worktree is in detached HEAD (or its HEAD is unreadable); cannot identify branch."
 
 TARGET_BRANCH="$(git branch --show-current)"
 say "Source: $SOURCE_BRANCH @ $WORKTREE"
@@ -105,7 +109,8 @@ cleanup() { git branch -D "$TMP_REF" 2>/dev/null || true; }
 trap cleanup EXIT
 
 say "Fetching $SOURCE_BRANCH from worktree..."
-git fetch "$WORKTREE" "+${SOURCE_BRANCH}:${TMP_REF}" >/dev/null 2>&1 || \
+# The one fetch-from-clone (infra/lib/clone-head.sh): fsck, no tags, delete-then-create.
+fetch_from_clone "$REPO_ROOT" "$WORKTREE" "$SOURCE_BRANCH" "refs/heads/${TMP_REF}" >/dev/null 2>&1 || \
     fail "Fetch failed (is the worktree branch '$SOURCE_BRANCH' valid?)"
 
 # ─── Resume an interrupted absorb ───────────────────────────────
