@@ -109,6 +109,10 @@ layer_lifecycle_begin 3
   parallel_queue_add "absorb-devloop-selftest" "${__here}/../infra/devloop/absorb-devloop.test.sh"
   # devloop.sh copies container Claude memories out before every dev-container removal.
   parallel_queue_add "memory-harvest-selftest" "${__here}/../infra/devloop/memory-harvest.test.sh"
+  # devloop.sh argument handling + `--pr <n>` mode: every PR-mode refusal fires before any clone
+  # or podman call; the happy path clones the PR head and pushes back through the exit menu.
+  # Hermetic — real devloop.sh and git, bare fixture origin, PATH-stubbed gh/podman, no kind.
+  parallel_queue_add "devloop-pr-selftest" "${__here}/../infra/devloop/devloop-pr.test.sh"
   # Story-runner self-test (ADR-0035 §12): the runner drives unattended
   # skip-permissions sessions and reaches `git reset --hard` + `git clean -fdq`
   # from a classification decision, with zero tests before this file. Hermetic —

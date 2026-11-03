@@ -177,4 +177,21 @@ assert_rc     "ff-exit0" 0 "$RC"
 assert_status "ff-strategy" "Plan: fast-forward 3" "$OUT"
 assert_status "ff-same-shas" "$(git -C "$W" rev-parse HEAD)" "$(git -C "$T" rev-parse HEAD)"
 
+# === (7) the worktree's branch comes from its HEAD file (infra/lib/clone-head.sh) =====
+fixture headfile
+git -C "$T" reset -q --hard HEAD~1
+absorb --dry-run "$W"
+assert_rc     "headfile-exit0" 0 "$RC"
+assert_status "headfile-branch-read" "Source: feature/headfile @" "$OUT"
+# A tag the container planted (named like a branch, so it would shadow it) is not imported.
+git -C "$W" tag main HEAD
+git -C "$W" tag -a -m x planted HEAD~1
+absorb --dry-run "$W"
+assert_rc     "planted-tag-exit0" 0 "$RC"
+assert_rc     "planted-tag-host-has-none" 1 "$(git -C "$T" show-ref -q --tags && echo 0 || echo 1)"
+git -C "$W" checkout -q --detach
+absorb "$W"
+assert_rc     "detached-worktree-refused" 2 "$RC"
+assert_status "detached-worktree-named" "detached HEAD" "$OUT"
+
 report_results "infra/devloop/absorb-devloop.test.sh"

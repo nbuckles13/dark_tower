@@ -9,24 +9,66 @@
 # they stay running. Re-run this script to re-attach.
 #
 # Usage:
-#   ./devloop.sh [--rebuild] [--recreate] <task-slug> [base-branch]
+#   ./devloop.sh [--rebuild] [--recreate] <task-slug> [base-branch] [-- <command...>]
+#   ./devloop.sh [--rebuild] [--recreate] --pr <number> <task-slug> [-- <command...>]
 #   ./devloop.sh --rebuild                              # rebuild image only
 #   ./devloop.sh --refresh-creds <task-slug>
+#   ./devloop.sh --destroy <task-slug>
 #
 # Options:
 #   --rebuild         Force rebuild the dev container image (exits if no task-slug)
 #   --recreate        Destroy and recreate containers, preserving the local clone
 #   --refresh-creds   Copy fresh OAuth credentials into a running container
 #                     (credentials mode only; token mode redirects to --recreate)
+#   --destroy         Tear down containers, helper, Kind cluster and the clone
+#   --pr <number>     Fix an existing open GitHub PR in place (see "PR mode" below)
+#   -- <command...>   Run <command> in the container instead of the interactive attach
 #
 # Examples:
 #   ./devloop.sh td-42-rate-limiting                     # branches from current branch
 #   ./devloop.sh td-42-rate-limiting main                # branches from main
+#   ./devloop.sh --pr 117 fix-cargo-bump                # work on PR #117's own branch
 #   ./devloop.sh --rebuild                              # just rebuild the image
 #   ./devloop.sh --rebuild td-42-rate-limiting
 #   ./devloop.sh --recreate td-42-rate-limiting         # new containers, same clone
 #   ./devloop.sh --rebuild --recreate td-42-rate-limiting  # rebuild image + recreate
 #   ./devloop.sh --refresh-creds td-42-rate-limiting   # from another terminal
+#   ./devloop.sh --destroy td-42-rate-limiting         # tear down (push first)
+#
+# PR mode (--pr <number>):
+#   The clone is checked out on the PR's head branch at the PR's current head commit, with
+#   the PR's base branch as the base. Slug, containers and cluster are named by <task-slug>
+#   as usual; re-running the same command re-attaches. The exit menu pushes to the PR's head
+#   branch (never force) and never offers to create a branch or PR. The PR is looked up in
+#   the repo `origin` points at (gh -R), must be OPEN, and must not come from a fork. Every
+#   refusal (ERROR: PR_MODE_REFUSED REASON=...) happens before any clone or container exists.
+#   Not combinable with a positional base-branch, --destroy or --refresh-creds.
+#   - Return path is the exit menu's push, NOT /absorb-devloop: absorb would cherry-pick the
+#     PR's commits (e.g. a dependency bump) onto your current host branch.
+#   - Dependabot PRs: once you push to a dependabot/* branch, Dependabot stops rebasing that
+#     PR, and `@dependabot rebase` / `@dependabot recreate` force-push over the branch and
+#     DISCARD your commits.
+#   - Push rejected (someone, e.g. Dependabot, pushed meanwhile): the menu fetches origin's
+#     branch on the host and hands it to the container as a git bundle under /tmp/devloop; it
+#     prints the one command to run INSIDE the container (fetch the bundle, rebase). Exit and
+#     push again from the menu. The container needs no GitHub access. Never force-push.
+#   - The host repo keeps a local <head> branch after --destroy. If the PR moves later, the
+#     next --pr run refuses it as stale (REASON=local-branch-stale): `git branch -D <head>`.
+#
+# Host-side rule: once its container exists, the clone's .git (config, hooks) is writable from
+# inside it, so this script never runs git or gh with the clone as the repo or cwd. The exit
+# menu fetches the clone's branch into the host repo (refs/devloop/<slug>/head) and lists and
+# pushes from there, to origin's URL, never forced. Do not run git against the clone on the host
+# yourself either (see infra/lib/clone-head.sh).
+#
+# Clone on the wrong branch: if an existing clone's checked-out branch (detached HEAD
+# included) is not the one this run expects (feature/<slug>, or the PR head with --pr), the
+# run refuses before anything starts (ERROR: CLONE_BRANCH_MISMATCH). This is the one
+# deliberate change to invocations without --pr: before, such a clone re-attached and the
+# exit menu listed HEAD's commits but pushed / opened a PR for feature/<slug> — a different
+# branch. Fix: switch back INSIDE the container (`podman exec -it -w /work devloop-<slug>-dev
+# git switch <branch>` — never `git -C <clone>` on the host; if the containers are stopped, start
+# them first: `podman start devloop-<slug>-dev devloop-<slug>-db`), or --pr <n>, or --destroy.
 #
 # Prerequisites:
 #   - podman installed
@@ -123,6 +165,12 @@ read_playwright_version() {
 # installs, read through the ONE reader. The Dockerfile ARGs have no defaults.
 # shellcheck source=../lib/cargo-tools.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/cargo-tools.sh"
+# clone_head_branch: the clone's branch read from its HEAD file. Host-side rule (see the lib):
+# once a container exists, the host never runs git with the clone as its repo — the clone's
+# .git/config and hooks are container-writable. Commits leave the clone only via
+# fetch_clone_branch (a host-repo fetch FROM it); every push is from the host repo.
+# shellcheck source=../lib/clone-head.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/clone-head.sh"
 read_cargo_tool_version() {
     local script_dir="$1" tool="$2"
     cargo_tool_version "${script_dir}/../../infra/cargo-tools.versions" "$tool" || exit 1
@@ -189,15 +237,51 @@ if [[ -z "$DEVLOOP_CONTAINER_MEMORY" ]]; then
     DEVLOOP_CONTAINER_MEMORY="$(( __mem_total_kib * 70 / 100 / 1024 ))m"
 fi
 [[ "$DEVLOOP_CONTAINER_MEMORY" =~ ^[1-9][0-9]*[kmg]$ ]] || { echo "ERROR: DEVLOOP_CONTAINER_MEMORY='${DEVLOOP_CONTAINER_MEMORY}' is not a podman size like 10g or 9500m." >&2; exit 1; }
+# PR mode (--pr <n>): empty = off. Every PR-mode refusal goes through pr_refuse so the
+# operator (and devloop-pr.test.sh) gets ONE stable token line, then the remedy lines.
+USAGE_BASE="devloop.sh [--rebuild|--refresh-creds|--recreate|--destroy] <task-slug> [base-branch] [-- <command...>]"
+USAGE_PR="devloop.sh [--rebuild] [--recreate] --pr <number> <task-slug> [-- <command...>]"
+# The ONE push: from the HOST repo (its own trusted config and hooks — never the clone's),
+# to origin's URL, fully-qualified destination, no `+`, so never a forced update.
+# host_push_cmd <source-commit> <branch> sets HOST_PUSH (argv); every push site and every
+# manual-push hint is built from it.
+host_push_cmd() { HOST_PUSH=(git -C "$REPO_ROOT" push "$GITHUB_REMOTE" "${1}:refs/heads/${2}"); }
+# manual_push_hint <branch>: the copy-pasteable host-side push of the clone's <branch> — the
+# same fetch_from_clone (flag set CLONE_FETCH_ARGS) and host_push_cmd the menu runs.
+manual_push_hint() {
+    host_push_cmd "$DEVLOOP_REF" "$1"
+    printf 'git -C %s update-ref -d %s; git -C %s %s %s refs/heads/%s:%s && %s' \
+        "$REPO_ROOT" "$DEVLOOP_REF" "$REPO_ROOT" "${CLONE_FETCH_ARGS[*]}" "$CLONE_DIR" "$1" "$DEVLOOP_REF" "${HOST_PUSH[*]}"
+}
+PR_NUMBER=""
+pr_refuse() {
+    local reason="$1"; shift
+    echo "ERROR: PR_MODE_REFUSED REASON=${reason} PR=${PR_NUMBER:-?}" >&2
+    local line
+    for line in "$@"; do echo "  ${line}" >&2; done
+    exit 1
+}
 while [[ "${1:-}" == --* ]]; do
     case "$1" in
         --rebuild) REBUILD_IMAGE=true; shift ;;
         --refresh-creds) REFRESH_CREDS=true; shift ;;
         --recreate) RECREATE=true; shift ;;
         --destroy) DESTROY=true; shift ;;
+        --pr)
+            [[ -z "$PR_NUMBER" ]] || pr_refuse pr-given-twice "--pr may be given once."
+            # Validated BEFORE it reaches gh: a value like `-R…` or `--web` would be read as a gh option.
+            [[ "${2:-}" =~ ^[1-9][0-9]*$ ]] || pr_refuse bad-pr-number "--pr takes a PR number (got '${2:-}')."
+            PR_NUMBER="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+if [[ -n "$PR_NUMBER" ]]; then
+    # Teardown and credential refresh must never depend on a PR lookup (the PR may be merged,
+    # gh may be down) — and silently ignoring --pr there would hide a mistyped command.
+    $DESTROY && pr_refuse with-destroy "--destroy needs no PR: devloop.sh --destroy <task-slug>"
+    $REFRESH_CREDS && pr_refuse with-refresh-creds "--refresh-creds needs no PR: devloop.sh --refresh-creds <task-slug>"
+    [[ -n "${1:-}" && "$1" != "--" ]] || pr_refuse no-slug "Usage: ${USAGE_PR}"
+fi
 
 # --rebuild with no task-slug: just build the image and exit
 if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
@@ -208,7 +292,7 @@ if $REBUILD_IMAGE && [ -z "${1:-}" ]; then
     exit 0
 fi
 
-TASK_SLUG="${1:?Usage: devloop.sh [--rebuild|--refresh-creds|--recreate|--destroy] <task-slug> [base-branch] [-- <command...>]}"
+TASK_SLUG="${1:?Usage: ${USAGE_BASE} | ${USAGE_PR}}"
 shift
 # Kind cluster names must be DNS labels (a-z, 0-9, hyphens only).
 if [[ ! "$TASK_SLUG" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
@@ -252,6 +336,9 @@ fi
 # drifting from the one it describes. Unattended story runs are just:
 #   devloop.sh <slug> -- scripts/workflow/run-story.sh <story> --stop-after=1
 if [[ -n "${1:-}" && "$1" != "--" ]]; then
+    [[ -z "$PR_NUMBER" ]] || pr_refuse with-base-branch \
+        "--pr takes its base branch from the PR (got positional base '$1')." \
+        "Usage: devloop.sh --pr ${PR_NUMBER} ${TASK_SLUG} [-- <command...>]"
     BASE_BRANCH="$1"
     shift
 else
@@ -270,7 +357,12 @@ CLONE_DIR="${REPO_ROOT}/../worktrees/${TASK_SLUG}"
 DEV_CONTAINER="devloop-${TASK_SLUG}-dev"
 DB_CONTAINER="devloop-${TASK_SLUG}-db"
 IMAGE="darktower-dev:latest"
+# Default branch/base; PR mode (--pr) replaces both with the PR's head/base in resolve_pr.
 BRANCH_NAME="feature/${TASK_SLUG}"
+# Host-repo ref the exit menu fetches the clone's branch into (fetch_clone_branch); removed by cleanup.
+DEVLOOP_REF="refs/devloop/${TASK_SLUG}/head"
+# Host-repo ref the push-rejected recovery fetches origin's moved branch into; removed by cleanup.
+DEVLOOP_REMOTE_REF="refs/devloop/${TASK_SLUG}/remote"
 GITHUB_REMOTE="$(git -C "$REPO_ROOT" remote get-url origin)"
 
 # Git identity — defaults to your git config
@@ -319,7 +411,7 @@ refresh_credentials() {
         echo "  so there is nothing to refresh in place. To pick up a rotated token (or to move a" >&2
         echo "  container created in credentials mode onto the token), recreate its containers —" >&2
         echo "  the clone, story-run ledgers and Kind cluster are preserved:" >&2
-        echo "    devloop.sh --recreate ${TASK_SLUG}" >&2
+        echo "    devloop.sh --recreate ${TASK_SLUG}   (add --pr <number> if this slug was started with --pr)" >&2
         exit 1
     fi
     if [ ! -f "${HOME}/.claude/.credentials.json" ]; then
@@ -419,6 +511,8 @@ cleanup() {
 
     echo "Removing clone: ${CLONE_DIR}"
     rm -rf "$CLONE_DIR"
+    git -C "$REPO_ROOT" update-ref -d "$DEVLOOP_REF" 2>/dev/null || true
+    git -C "$REPO_ROOT" update-ref -d "$DEVLOOP_REMOTE_REF" 2>/dev/null || true
     echo "Story-runner ledger retained (survives --destroy by design): ${STORY_RUNS_HOST}"
     echo "Cleaned up."
 }
@@ -429,6 +523,177 @@ cleanup() {
 if $DESTROY; then
     cleanup
     exit 0
+fi
+
+# ─── Branch resolution + pre-flight (before ANY image build, helper, clone or container) ───
+
+# A branch name from GitHub (PR mode) must be safe as ONE plain argv element in every git call.
+# check-ref-format alone is not enough: it accepts `+foo` (a leading `+` makes a fetch/push
+# refspec FORCED), `@` (= HEAD), `$(…)` and backticks. The allowlist closes those; `..`,
+# a trailing `/` or `.lock` are refused explicitly. dependabot/cargo/x-1.2.3 passes.
+safe_branch_name() {
+    local b="$1"
+    [[ "$b" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || return 1
+    [[ "$b" != *..* && "$b" != */ && "$b" != *.lock && "$b" != *//* ]] || return 1
+    git check-ref-format --branch "$b" >/dev/null 2>&1
+}
+
+# PR mode: ONE gh lookup, pinned with -R to the repo `origin` points at — the repo
+# ensure_branch_ref fetches from and the clone pushes to — so an `upstream` remote or
+# `gh repo set-default` cannot resolve PR <n> in a different repo. gh's stderr is left
+# visible: on failure it is what says not-found vs auth vs network (one token, decided by
+# exit status, never by gh's wording). Sets BRANCH_NAME/BASE_BRANCH and PR_HEAD_OID/PR_URL.
+resolve_pr() {
+    command -v gh >/dev/null 2>&1 \
+        || pr_refuse gh-missing "PR mode needs the GitHub CLI (gh) on the host, authenticated for ${GITHUB_REMOTE}."
+    local out state cross head_owner head_repo head_ref head_oid base_ref url
+    # \u001f (unit separator), not a tab: tab is IFS whitespace, so `read` would collapse an
+    # empty field and shift every later one. Every field is stringified, so null -> "null".
+    if ! out="$(gh pr view "$PR_NUMBER" -R "$GITHUB_REMOTE" \
+            --json state,isCrossRepository,headRepositoryOwner,headRepository,headRefName,headRefOid,baseRefName,url \
+            --jq '[.state, .isCrossRepository, .headRepositoryOwner.login, .headRepository.name, .headRefName, .headRefOid, .baseRefName, .url] | map(tostring) | join("\u001f")')"; then
+        pr_refuse lookup-failed "gh pr view ${PR_NUMBER} -R ${GITHUB_REMOTE} failed (gh's message is above: not found, auth or network)."
+    fi
+    IFS=$'\x1f' read -r state cross head_owner head_repo head_ref head_oid base_ref url <<< "$out"
+    if [[ "$state" != "OPEN" ]]; then
+        local hints=("PR #${PR_NUMBER} is ${state:-unknown}; --pr works only on an open PR.")
+        if [ -d "$CLONE_DIR" ]; then
+            # Name the real branch only once it is known to be a safe name (it is not vetted yet).
+            local b="<branch>"
+            safe_branch_name "$head_ref" && b="$head_ref"
+            hints+=("A clone for '${TASK_SLUG}' exists: ${CLONE_DIR}"
+                "  Push un-pushed work by hand (from the host repo, never git inside the clone):"
+                "    $(manual_push_hint "$b")"
+                "  That updates the branch only, not the ${state:-closed} PR (and recreates the branch if GitHub deleted it);"
+                "  open a new PR if the work is still wanted."
+                "  Then tear down: $0 --destroy ${TASK_SLUG}")
+        fi
+        pr_refuse not-open "${hints[@]}"
+    fi
+    # Fork check fails CLOSED: anything but the literal `false` (true, null, missing) refuses,
+    # and the head repo must be the PR's own (base) repo, read from the PR's url.
+    local url_re="^https://[^/]+/([^/]+)/([^/]+)/pull/${PR_NUMBER}\$"
+    [[ "$url" =~ $url_re ]] \
+        || pr_refuse unexpected-url "gh returned url '${url}', expected https://<host>/<owner>/<repo>/pull/${PR_NUMBER}."
+    if [[ "$cross" != "false" || "$head_owner" != "${BASH_REMATCH[1]}" || "$head_repo" != "${BASH_REMATCH[2]}" ]]; then
+        pr_refuse fork "PR #${PR_NUMBER} head is ${head_owner}/${head_repo} (isCrossRepository=${cross}); base is ${BASH_REMATCH[1]}/${BASH_REMATCH[2]}." \
+            "Fork PRs are not supported: their head branch is not on origin, so the exit menu could not push to it."
+    fi
+    [[ "$head_oid" =~ ^[0-9a-f]{40}$ ]] || pr_refuse unexpected-head-oid "gh returned head commit '${head_oid}'."
+    local which name
+    for which in head base; do
+        [[ "$which" == head ]] && name="$head_ref" || name="$base_ref"
+        safe_branch_name "$name" || pr_refuse unsafe-ref \
+            "PR #${PR_NUMBER} ${which} branch '${name}' is not a plain branch name (allowed: [A-Za-z0-9][A-Za-z0-9._/-]*, no '..', no trailing '/' or '.lock')."
+    done
+    BRANCH_NAME="$head_ref"
+    BASE_BRANCH="$base_ref"
+    PR_HEAD_OID="$head_oid"
+    PR_URL_RESOLVED="$url"
+}
+
+# THE "is the clone on BRANCH_NAME" check (pre-flight, both modes). A clone on any other
+# branch (or a detached HEAD) is broken for this run: the exit menu would list HEAD's commits
+# but push/create a PR for BRANCH_NAME, a different branch. The clone is a host directory, so
+# the operator can always fix it from the host. Returns 0 when there is no clone yet or it is
+# on BRANCH_NAME; otherwise prints the ERROR + remedies and returns 1 (the caller exits).
+check_clone_branch() {
+    [ -d "$CLONE_DIR" ] || return 0
+    local cur
+    cur="$(clone_head_branch "$CLONE_DIR")" || cur="(no branch: detached HEAD or not a git clone)"
+    [[ "$cur" == "$BRANCH_NAME" ]] && return 0
+    echo "ERROR: CLONE_BRANCH_MISMATCH CLONE=${CLONE_DIR} ON=${cur} EXPECTED=${BRANCH_NAME}" >&2
+    echo "  This run works on ${BRANCH_NAME}; the clone is on ${cur}. Nothing was started." >&2
+    # In the container, never `git -C <clone>` on the host (its .git is container-writable).
+    echo "  Switch it back (keeps everything), INSIDE the container while it is up: podman exec -it -w /work ${DEV_CONTAINER} git switch ${BRANCH_NAME}" >&2
+    # Pre-flight runs before this script starts anything; after a reboot/podman stop they are down.
+    # Both: a later re-attach checks only the dev container, so the DB must be up too.
+    echo "  If the containers are stopped, start them first: podman start ${DEV_CONTAINER} ${DB_CONTAINER}" >&2
+    if [[ -z "$PR_NUMBER" ]]; then
+        echo "  If this clone was made with --pr, re-run with: $0 --pr <number> ${TASK_SLUG}" >&2
+    else
+        echo "  If this slug belongs to another PR or task, re-run with that --pr <number> (or none), or pick another <task-slug>." >&2
+    fi
+    echo "  Or tear it down: $0 --destroy ${TASK_SLUG}   (deletes the clone — push first)" >&2
+    return 1
+}
+
+# Make sure the host has refs/heads/$BRANCH_NAME when origin has it (PR iteration), fetching
+# it if only origin does. In PR mode it must ALSO be exactly the PR head the lookup vetted:
+# absent on origin, a stale host branch, or a head that moved between lookup and fetch all
+# refuse — a stale or diverged branch is never overwritten. Idempotent; PR mode runs it in
+# pre-flight (so these refusals precede every podman call) and ensure_clone runs it again.
+ensure_branch_ref() {
+    local fetched=false rc
+    if ! git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
+        local err=""
+        rc=0
+        err="$(git ls-remote --exit-code "$GITHUB_REMOTE" "refs/heads/${BRANCH_NAME}" 2>&1 >/dev/null)" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            echo "Fetching remote branch: ${BRANCH_NAME}"
+            # Fully-qualified refspec: no `+`, so never a forced update.
+            git fetch "$GITHUB_REMOTE" "refs/heads/${BRANCH_NAME}:refs/heads/${BRANCH_NAME}"
+            fetched=true
+        elif [[ -n "$PR_NUMBER" ]]; then
+            [ "$rc" -eq 2 ] || pr_refuse origin-unreachable "git ls-remote ${GITHUB_REMOTE} failed (rc=${rc}): ${err}"
+            pr_refuse head-not-on-origin "Branch ${BRANCH_NAME} is not on ${GITHUB_REMOTE}."
+        elif [ "$rc" -ne 2 ]; then
+            # Not refused: an offline start keeps working, as before — but never silently.
+            echo "WARNING: git ls-remote ${GITHUB_REMOTE} failed (rc=${rc}): ${err}" >&2
+            echo "  Cannot tell whether ${BRANCH_NAME} exists on origin; creating a new ${BRANCH_NAME} from ${BASE_BRANCH}." >&2
+            echo "  If it already exists on origin (PR iteration), this DIVERGES from it and a later push will be rejected." >&2
+        fi
+    fi
+    [[ -n "$PR_NUMBER" ]] || return 0
+    local have
+    have="$(git rev-parse -q --verify "refs/heads/${BRANCH_NAME}^{commit}")" || have=""
+    [[ "$have" == "$PR_HEAD_OID" ]] && return 0
+    if $fetched; then
+        pr_refuse head-moved "PR #${PR_NUMBER} head was ${PR_HEAD_OID} at lookup; origin's ${BRANCH_NAME} is now ${have}." \
+            "Someone pushed meanwhile — re-run the same command."
+    fi
+    pr_refuse local-branch-stale "The host repo's local ${BRANCH_NAME} is ${have}; PR #${PR_NUMBER} head is ${PR_HEAD_OID}." \
+        "Not overwritten (it may hold your commits). If it holds nothing you need: git -C ${REPO_ROOT} branch -D ${BRANCH_NAME}" \
+        "If it is just behind: git -C ${REPO_ROOT} fetch origin refs/heads/${BRANCH_NAME}:refs/heads/${BRANCH_NAME}"
+}
+
+# The Dependabot caveat, printed at launch and above the exit menu's push (one text, one test).
+dependabot_caveat() {
+    [[ "$BRANCH_NAME" == dependabot/* ]] || return 0
+    echo "WARNING: ${BRANCH_NAME} is a Dependabot branch. Once you push to it Dependabot stops rebasing this PR," >&2
+    echo "  and '@dependabot rebase' / '@dependabot recreate' force-push over it, DISCARDING your commits." >&2
+}
+
+PR_HEAD_OID=""
+PR_URL_RESOLVED=""
+[[ -z "$PR_NUMBER" ]] || resolve_pr
+
+# Re-entry carries the mode. REENTER_ARGS: what the printed hints tell the operator to run.
+# RERUN_ARGS: what the menu's [r] execs (today's form also re-passes the base branch;
+# PR mode must not — a positional base is refused with --pr).
+if [[ -n "$PR_NUMBER" ]]; then
+    REENTER_ARGS=(--pr "$PR_NUMBER" "$TASK_SLUG")
+    RERUN_ARGS=("${REENTER_ARGS[@]}")
+else
+    REENTER_ARGS=("$TASK_SLUG")
+    RERUN_ARGS=("$TASK_SLUG" "$BASE_BRANCH")
+fi
+
+if ! check_clone_branch; then
+    [[ -z "$PR_NUMBER" ]] || pr_refuse clone-branch-mismatch "The clone for '${TASK_SLUG}' is not on PR #${PR_NUMBER}'s head branch (see above)."
+    exit 1
+fi
+if [[ -n "$PR_NUMBER" ]]; then
+    [ -d "$CLONE_DIR" ] || ensure_branch_ref
+    echo "=== PR mode: #${PR_NUMBER} ${PR_URL_RESOLVED} ==="
+    echo "  head:  ${BRANCH_NAME} @ ${PR_HEAD_OID:0:12}"
+    echo "  base:  ${BASE_BRANCH}"
+    if [ -d "$CLONE_DIR" ]; then
+        echo "  clone: ${CLONE_DIR} (existing, on ${BRANCH_NAME})"
+    else
+        echo "  clone: ${CLONE_DIR} (new)"
+    fi
+    dependabot_caveat
 fi
 
 # Build the devloop-helper binary (ADR-0030).
@@ -613,10 +878,130 @@ menu_reenter_or_cleanup() {
     read -p "Choice: " -n 1 -r
     echo
     case $REPLY in
-        r|R) exec "$0" "$TASK_SLUG" "$BASE_BRANCH" ;;
+        r|R) exec "$0" "${RERUN_ARGS[@]}" ;;
         d|D) cleanup ;;
-        *) echo "Containers still running. Re-enter with: $0 ${TASK_SLUG}" ;;
+        *) echo "Containers still running. Re-enter with: $0 ${REENTER_ARGS[*]}" ;;
     esac
+}
+
+# Take the clone's BRANCH_NAME out into the HOST repo: the ONE host-side operation against the
+# clone once its container exists (upload-pack runs in the clone: no hooks, pack hooks only
+# from protected config). Lands on a private ref, deleted first so the fetch only ever CREATES
+# it (never a forced update, and a rebased clone branch still fetches). Sets CLONE_SHA; every
+# later listing and push works on host objects with host config.
+fetch_clone_branch() {
+    CLONE_SHA=""
+    # The one fetch-from-clone (infra/lib/clone-head.sh): fsck, no tags, delete-then-create.
+    if ! fetch_from_clone "$REPO_ROOT" "$CLONE_DIR" "$BRANCH_NAME" "$DEVLOOP_REF"; then
+        echo "WARNING: could not read ${BRANCH_NAME} from the clone ${CLONE_DIR} (git's message is above); nothing can be listed or pushed." >&2
+        return 1
+    fi
+    CLONE_SHA="$(git -C "$REPO_ROOT" rev-parse --verify "${DEVLOOP_REF}^{commit}")"
+}
+
+# Sets COMMITS (CLONE_SHA's commits since BASE_BRANCH) and BASE_LABEL (what they were compared
+# against), in the HOST repo: its local <base>, else its origin/<base> remote-tracking ref.
+# Deliberately no fetch: the listing is informational, and the label names the host ref used —
+# if that ref is behind GitHub the list can include commits already on the base.
+# Returns 1 (with a WARNING) when neither ref exists or git fails — never a silent "no commits".
+commits_since_base() {
+    COMMITS=""; BASE_LABEL=""
+    local ref
+    if git -C "$REPO_ROOT" rev-parse -q --verify "refs/heads/${BASE_BRANCH}^{commit}" >/dev/null; then
+        ref="refs/heads/${BASE_BRANCH}"; BASE_LABEL="${BASE_BRANCH}"
+    elif git -C "$REPO_ROOT" rev-parse -q --verify "refs/remotes/origin/${BASE_BRANCH}^{commit}" >/dev/null; then
+        ref="refs/remotes/origin/${BASE_BRANCH}"; BASE_LABEL="origin/${BASE_BRANCH} (host's remote-tracking ref, not fetched now)"
+    else
+        echo "WARNING: cannot list commits since ${BASE_BRANCH}: the host repo has neither refs/heads/${BASE_BRANCH} nor refs/remotes/origin/${BASE_BRANCH}." >&2
+        return 1
+    fi
+    COMMITS="$(git -C "$REPO_ROOT" log --oneline "${ref}..${CLONE_SHA}")" || {
+        echo "WARNING: git log ${ref}..${CLONE_SHA} failed in ${REPO_ROOT}." >&2
+        return 1
+    }
+}
+
+# Sets UNPUSHED: CLONE_SHA's commits not on origin's BRANCH_NAME, asked of origin itself
+# (ls-remote) and computed in the host repo. Anything it cannot establish is "unknown" with a
+# WARNING — never "nothing to push".
+unpushed_commits() {
+    UNPUSHED="(unknown — see WARNING above)"
+    local out rc=0 remote_sha
+    out="$(git -C "$REPO_ROOT" ls-remote "$GITHUB_REMOTE" "refs/heads/${BRANCH_NAME}")" || rc=$?
+    remote_sha="${out%%[[:space:]]*}"
+    if [ "$rc" -ne 0 ] || [[ ! "$remote_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "WARNING: cannot tell what is unpushed: no ${BRANCH_NAME} found on ${GITHUB_REMOTE} (ls-remote rc=${rc})." >&2
+        return 0
+    fi
+    if ! git -C "$REPO_ROOT" cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+        git -C "$REPO_ROOT" fetch -q --no-tags --no-write-fetch-head "$GITHUB_REMOTE" "refs/heads/${BRANCH_NAME}" || true
+    fi
+    if ! git -C "$REPO_ROOT" cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+        echo "WARNING: cannot tell what is unpushed: origin's ${BRANCH_NAME} (${remote_sha}) could not be fetched into the host repo." >&2
+        return 0
+    fi
+    UNPUSHED="$(git -C "$REPO_ROOT" log --oneline "${remote_sha}..${CLONE_SHA}")"
+}
+
+# Push CLONE_SHA to origin's BRANCH_NAME from the host repo (host_push_cmd). Returns git's rc;
+# a rejection (the branch moved on GitHub) prints the recovery.
+host_push() {
+    host_push_cmd "$CLONE_SHA" "$BRANCH_NAME"
+    echo "Pushing ${CLONE_SHA:0:12} to ${GITHUB_REMOTE} refs/heads/${BRANCH_NAME} (from the host repo) ..."
+    if "${HOST_PUSH[@]}"; then
+        return 0
+    fi
+    echo "ERROR: push of ${BRANCH_NAME} was rejected (git's message is above)." >&2
+    print_push_recovery >&2
+    return 1
+}
+
+# The push-rejected recovery (the branch moved on GitHub, e.g. Dependabot rebased it). The
+# rebase happens INSIDE the container — container-authored content never runs on the host (a
+# host-side rebase would run the repo's hooks from the container's checkout). The host, with
+# its own credentials, fetches origin's branch and writes it as a thin git bundle into a FRESH
+# mktemp -d dir under the per-slug runtime mount (never into the clone: a pre-planted symlink
+# there would make the host overwrite a host file; never a push into the clone: receive-pack
+# would run the clone's hooks on the host). The container then fetches from the bundle and
+# rebases; on exit the menu pushes host-side as usual, never forced.
+print_push_recovery() {
+    echo "  The branch probably moved on GitHub (e.g. Dependabot rebased it). Never force-push."
+    local mounts rc=0
+    mounts="$(podman inspect --format '{{range .Mounts}}{{println .Destination}}{{end}}' "$DEV_CONTAINER")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "  ERROR: podman inspect ${DEV_CONTAINER} failed (rc=${rc}; podman's message is above)."
+        echo "  Recreate it (clone kept): $0 --recreate ${REENTER_ARGS[*]} — then exit and push again."
+        return 0
+    fi
+    if ! grep -qx /tmp/devloop <<< "$mounts"; then
+        echo "  ${DEV_CONTAINER} has no /tmp/devloop mount (it predates that mount being unconditional)."
+        echo "  Recreate it (clone kept): $0 --recreate ${REENTER_ARGS[*]} — then exit and push again."
+        return 0
+    fi
+    [ -d "$HELPER_RUNTIME_DIR" ] || { echo "  ERROR: ${HELPER_RUNTIME_DIR} is missing; recreate: $0 --recreate ${REENTER_ARGS[*]}"; return 0; }
+    git -C "$REPO_ROOT" update-ref -d "$DEVLOOP_REMOTE_REF" 2>/dev/null || true
+    if ! git -C "$REPO_ROOT" fetch -q --no-tags --no-write-fetch-head "$GITHUB_REMOTE" \
+            "refs/heads/${BRANCH_NAME}:${DEVLOOP_REMOTE_REF}"; then
+        echo "  ERROR: could not fetch origin's ${BRANCH_NAME} into the host repo (git's message is above)."
+        return 0
+    fi
+    local dir
+    dir="$(mktemp -d "${HELPER_RUNTIME_DIR}/rebase.XXXXXX")" || { echo "  ERROR: mktemp -d in ${HELPER_RUNTIME_DIR} failed."; return 0; }
+    # Thin bundle: only what origin has beyond the clone's commit (the clone has the rest).
+    if ! git -C "$REPO_ROOT" bundle create -q "${dir}/head.bundle" "$DEVLOOP_REMOTE_REF" "^${CLONE_SHA}"; then
+        echo "  ERROR: could not bundle origin's ${BRANCH_NAME} (git's message is above). An empty bundle means origin has"
+        echo "  nothing the clone lacks, so the rejection is not a moved branch (permissions? protection rules?)."
+        return 0
+    fi
+    echo "  Origin's ${BRANCH_NAME} is ready for the container. Re-enter ([r]) and, INSIDE the container, run:"
+    echo "    \$ git fetch /tmp/devloop/${dir##*/}/head.bundle +${DEVLOOP_REMOTE_REF}:refs/remotes/origin/${BRANCH_NAME} && git rebase origin/${BRANCH_NAME}"
+    echo "  then re-check and exit; this menu pushes again (from the host, never forced)."
+}
+
+push_to_pr() {
+    host_push && echo "Pushed. PR updated."
+    echo ""
+    menu_reenter_or_cleanup
 }
 
 is_container_running() {
@@ -637,12 +1022,8 @@ ensure_clone() {
 
     # Ensure the branch exists locally before cloning.
     # If it only exists on the remote (e.g., PR iteration), fetch it first.
-    if ! git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
-        if git ls-remote --exit-code --heads "$GITHUB_REMOTE" "$BRANCH_NAME" &>/dev/null; then
-            echo "Fetching remote branch: ${BRANCH_NAME}"
-            git fetch "$GITHUB_REMOTE" "${BRANCH_NAME}:${BRANCH_NAME}"
-        fi
-    fi
+    # In PR mode this also pins it to the vetted PR head (see ensure_branch_ref).
+    ensure_branch_ref
 
     echo "Creating local clone: ${CLONE_DIR}"
     if git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
@@ -653,8 +1034,18 @@ ensure_clone() {
         git clone --local --branch "$BASE_BRANCH" "$REPO_ROOT" "$CLONE_DIR"
         git -C "$CLONE_DIR" checkout -b "$BRANCH_NAME"
     fi
+    # The only host git calls WITH THE CLONE AS ITS REPO (checkout -b above, set-url and the
+    # rev-parse below): they run only on the clone `git clone` created moments ago in this call
+    # (the early return covers an existing clone), before any container can have written into it.
     # Point origin at GitHub (not the local repo)
     git -C "$CLONE_DIR" remote set-url origin "$GITHUB_REMOTE"
+    if [[ -n "$PR_NUMBER" ]] && [[ "$(git -C "$CLONE_DIR" rev-parse HEAD)" != "$PR_HEAD_OID" ]]; then
+        # This run created the clone moments ago (no container yet, nothing of the operator's
+        # in it). Left behind, the next run would re-attach to the unvetted commit.
+        rm -rf "$CLONE_DIR"
+        pr_refuse head-moved "The new clone's HEAD is not PR #${PR_NUMBER}'s head ${PR_HEAD_OID}; the clone was removed." \
+            "Re-run the same command."
+    fi
 }
 
 # ─── Validate Prerequisites ─────────────────────────────────────
@@ -723,13 +1114,8 @@ if command -v kind &>/dev/null; then
         # umask, not `mkdir -p -m`: -m applies only to the deepest directory.
         (umask 077 && mkdir -p "$HELPER_RUNTIME_DIR")
         if launch_helper; then
-            # Mount the helper runtime directory into the container. This is a read-write
-            # mount because: (1) the unix socket requires rw for client connections, and
-            # (2) files like kubeconfig/ports.json are created after container start (by
-            # dev-cluster provision) so individual ro file mounts aren't possible (files must
-            # exist at mount time). Accepted risk: container can modify host-generated
-            # files, but blast radius is limited to the dev session's own state.
-            EXTRA_PODMAN_ARGS+=(-v "$HELPER_RUNTIME_DIR:/tmp/devloop:Z")
+            # The helper runtime directory itself is mounted at /tmp/devloop for every
+            # container (see the per-slug runtime mount in Phase 1).
             EXTRA_PODMAN_ARGS+=(-e "KUBECONFIG=/tmp/devloop/kubeconfig")
         else
             echo "ERROR: Failed to start devloop helper. Cluster features disabled." >&2
@@ -807,6 +1193,20 @@ if ! is_container_running "$DEV_CONTAINER"; then
         # By name, same reason as the token above.
         EXTRA_PODMAN_ARGS+=(-e ANTHROPIC_API_KEY)
     fi
+
+    # Per-slug runtime mount — UNCONDITIONAL (with or without Kind): host
+    # /tmp/devloop-<slug> -> container /tmp/devloop. Carries the helper socket, kubeconfig and
+    # ports.json when Kind is present, and in every mode the push-rejected recovery's bundle
+    # (print_push_recovery) — the one way origin's commits reach a container that has no
+    # GitHub access. Read-write because: (1) the unix socket requires rw for client
+    # connections, and (2) files like kubeconfig/ports.json are created after container start
+    # (by dev-cluster provision) so individual ro file mounts aren't possible. Accepted risk:
+    # the container can modify host-generated files there, but blast radius is limited to the
+    # dev session's own state; host code that writes into it uses fresh mktemp -d dirs.
+    # Helper presence inside the container is the SOCKET, not this directory (layer7.sh).
+    # umask, not `mkdir -p -m`: -m applies only to the deepest directory.
+    (umask 077 && mkdir -p "$HELPER_RUNTIME_DIR")
+    EXTRA_PODMAN_ARGS+=(-v "$HELPER_RUNTIME_DIR:/tmp/devloop:Z")
 
     # Story-runner ledger mount (ADR-0037 D5) — UNCONDITIONAL (not gated on kind,
     # unlike the helper mount): the ledger must persist even on the no-cluster path.
@@ -958,7 +1358,7 @@ if $TOKEN_MODE; then
         echo "WARNING: ${DEV_CONTAINER} was not created with the current token (it predates token" >&2
         echo "  mode, or the token was rotated since). It is still using whatever credential it" >&2
         echo "  started with. Recreate it (clone, ledgers and cluster preserved):" >&2
-        echo "    devloop.sh --recreate ${TASK_SLUG}" >&2
+        echo "    devloop.sh --recreate ${REENTER_ARGS[*]}" >&2
     fi
 elif [ -f "${HOME}/.claude/.credentials.json" ]; then
     podman exec "$DEV_CONTAINER" mkdir -p /home/dev/.claude 2>/dev/null || true
@@ -1006,12 +1406,13 @@ if [ ${#EXEC_CMD[@]} -gt 0 ]; then
     # one that finished.
     echo ""
     echo "=== exited rc=${EXEC_RC} ==="
-    EXEC_COMMITS=$(git -C "$CLONE_DIR" log --oneline "${BASE_BRANCH}..HEAD" 2>/dev/null || true)
-    if [ -n "$EXEC_COMMITS" ]; then
-        echo "Commits on ${BRANCH_NAME}:"
-        echo "$EXEC_COMMITS"
-    else
-        echo "No new commits on ${BRANCH_NAME}."
+    if fetch_clone_branch && commits_since_base; then
+        if [ -n "$COMMITS" ]; then
+            echo "Commits on ${BRANCH_NAME} since ${BASE_LABEL}:"
+            echo "$COMMITS"
+        else
+            echo "No new commits on ${BRANCH_NAME} since ${BASE_LABEL}."
+        fi
     fi
     # Left running deliberately: teardown deletes the clone (and with it any
     # unpushed commits) and the run evidence under the helper runtime dir, and for
@@ -1021,7 +1422,7 @@ if [ ${#EXEC_CMD[@]} -gt 0 ]; then
     # it is how it ends up running overnight after a run that finished.
     echo ""
     echo "Still running: ${DEV_CONTAINER}, ${DB_CONTAINER}, and the dev-cluster helper (Kind)."
-    echo "  Re-enter:  $0 ${TASK_SLUG}"
+    echo "  Re-enter:  $0 ${REENTER_ARGS[*]}"
     echo "  Tear down: $0 --destroy ${TASK_SLUG}   (deletes the clone — push first)"
     exit "$EXEC_RC"
 fi
@@ -1034,21 +1435,41 @@ harvest_container_memory "$DEV_CONTAINER" "$TASK_SLUG" "$REPO_ROOT" || true
 
 echo ""
 
-COMMITS=$(git -C "$CLONE_DIR" log --oneline "${BASE_BRANCH}..HEAD" 2>/dev/null || true)
+# Everything below works on the HOST repo: the clone's branch is fetched out once
+# (fetch_clone_branch) and no git/gh runs with the clone as its repo or cwd.
+if ! fetch_clone_branch; then
+    echo ""
+    menu_reenter_or_cleanup
+    exit
+fi
 
-# Check if a PR already exists for this branch
-PR_URL=$(cd "$CLONE_DIR" && gh pr list --head "$BRANCH_NAME" --state open --json url -q '.[0].url' 2>/dev/null) || true
+COMMITS_KNOWN=true
+commits_since_base || COMMITS_KNOWN=false
+
+# Check if a PR already exists for this branch — pinned to origin with -R, never resolved from
+# the clone's config. gh's failure is reported, not read as "no PR". `--head` matches by branch
+# NAME only (a fork PR can share it), so PR mode takes the row whose number is the PR it was
+# started on; otherwise the first row, as before.
+PR_URL=""
+PR_QUERY_RC=0
+PR_ROWS=$(gh pr list -R "$GITHUB_REMOTE" --head "$BRANCH_NAME" --state open --json number,url \
+    --jq '.[] | "\(.number)\t\(.url)"') || PR_QUERY_RC=$?
+if [ "$PR_QUERY_RC" -ne 0 ]; then
+    echo "WARNING: could not query open PRs for ${BRANCH_NAME} (gh rc=${PR_QUERY_RC}; gh's message, if any, is above)." >&2
+else
+    PR_URL=$(awk -F'\t' -v n="$PR_NUMBER" '(n == "" && NR == 1) || (n != "" && $1 == n) { print $2; exit }' <<< "$PR_ROWS")
+fi
 
 if [ -n "$PR_URL" ]; then
     echo "=== PR exists: ${PR_URL} ==="
     echo ""
 
-    # Check for unpushed commits on the branch
-    UNPUSHED=$(git -C "$CLONE_DIR" log --oneline "origin/${BRANCH_NAME}..HEAD" 2>/dev/null || true)
+    unpushed_commits
     if [ -n "$UNPUSHED" ]; then
         echo "Unpushed commits:"
         echo "$UNPUSHED"
         echo ""
+        dependabot_caveat
         echo "  [p] Push to update PR"
         echo "  [r] Re-enter container"
         echo "  [d] Destroy containers and clone (un-pushed changes will be lost)"
@@ -1056,23 +1477,32 @@ if [ -n "$PR_URL" ]; then
         read -p "Choice: " -n 1 -r
         echo
         case $REPLY in
-            p|P)
-                git -C "$CLONE_DIR" push origin "$BRANCH_NAME"
-                echo "Pushed. PR updated."
-                echo ""
-                menu_reenter_or_cleanup
-                ;;
-            r|R) exec "$0" "$TASK_SLUG" "$BASE_BRANCH" ;;
+            p|P) push_to_pr ;;
+            r|R) exec "$0" "${RERUN_ARGS[@]}" ;;
             d|D) cleanup ;;
-            *) echo "Containers still running. Re-enter with: $0 ${TASK_SLUG}" ;;
+            *) echo "Containers still running. Re-enter with: $0 ${REENTER_ARGS[*]}" ;;
         esac
     else
         menu_reenter_or_cleanup
     fi
 
-elif [ -n "$COMMITS" ]; then
-    echo "=== Commits on ${BRANCH_NAME} (no open PR) ==="
-    echo "$COMMITS"
+elif [[ -n "$PR_NUMBER" ]]; then
+    # PR mode never offers to create a branch or PR.
+    if [ "$PR_QUERY_RC" -eq 0 ]; then
+        echo "WARNING: PR #${PR_NUMBER} is no longer open (no open PR #${PR_NUMBER} for head ${BRANCH_NAME})." >&2
+    fi
+    echo "Not offering a push. To push anyway (updates the branch only, not a closed PR):"
+    echo "  $(manual_push_hint "$BRANCH_NAME")"
+    echo ""
+    menu_reenter_or_cleanup
+
+elif [ -n "$COMMITS" ] || ! $COMMITS_KNOWN; then
+    if $COMMITS_KNOWN; then
+        echo "=== Commits on ${BRANCH_NAME} since ${BASE_LABEL} (no open PR) ==="
+        echo "$COMMITS"
+    else
+        echo "=== ${BRANCH_NAME} (no open PR; commits since ${BASE_BRANCH} unknown — see WARNING above) ==="
+    fi
     echo ""
     echo "  [c] Push and create PR into ${BASE_BRANCH}"
     echo "  [p] Push branch to origin (no PR)"
@@ -1084,30 +1514,40 @@ elif [ -n "$COMMITS" ]; then
 
     case $REPLY in
         c|C)
-            # Stateless PR creation from commit history (per eee1739: no
-            # .devloop-pr.json state file). --fill populates the PR title/body
-            # from the commit(s). --base must already exist on origin; gh fails
-            # loudly here if it does not, and the branch is still pushed.
-            if git -C "$CLONE_DIR" push -u origin "$BRANCH_NAME"; then
-                (cd "$CLONE_DIR" && gh pr create --base "$BASE_BRANCH" --head "$BRANCH_NAME" --fill) \
-                    || echo "PR creation failed (is ${BASE_BRANCH} on origin?). Branch is pushed — create the PR manually: gh pr create --base ${BASE_BRANCH} --head ${BRANCH_NAME} --fill"
+            # Stateless PR creation from commit history (per eee1739: no .devloop-pr.json
+            # state file). Title/body are built here from the HOST repo's view of the pushed
+            # commits, as `--fill` would (one commit: its subject/body; several: the branch
+            # name + the subjects) — `--fill` itself reads git in the cwd. --base must already
+            # exist on origin; gh fails loudly here if it does not, and the branch is still pushed.
+            if host_push; then
+                PR_TITLE="$BRANCH_NAME"; PR_BODY=""
+                if $COMMITS_KNOWN && [ "$(wc -l <<< "$COMMITS")" -eq 1 ] && [ -n "$COMMITS" ]; then
+                    PR_TITLE="$(git -C "$REPO_ROOT" log -1 --format=%s "$CLONE_SHA")"
+                    PR_BODY="$(git -C "$REPO_ROOT" log -1 --format=%b "$CLONE_SHA")"
+                elif $COMMITS_KNOWN; then
+                    PR_BODY="$(sed 's/^[0-9a-f]* /- /' <<< "$COMMITS")"
+                fi
+                gh pr create -R "$GITHUB_REMOTE" --base "$BASE_BRANCH" --head "$BRANCH_NAME" \
+                    --title "$PR_TITLE" --body "$PR_BODY" \
+                    || echo "PR creation failed (is ${BASE_BRANCH} on origin?). Branch is pushed — create the PR manually: gh pr create -R ${GITHUB_REMOTE} --base ${BASE_BRANCH} --head ${BRANCH_NAME}"
             fi
             echo ""
             menu_reenter_or_cleanup
             ;;
         p|P)
-            git -C "$CLONE_DIR" push -u origin "$BRANCH_NAME"
-            echo "Pushed ${BRANCH_NAME}. Open a PR when ready: gh pr create --base ${BASE_BRANCH} --head ${BRANCH_NAME} --fill"
+            if host_push; then
+                echo "Pushed ${BRANCH_NAME}. Open a PR when ready: gh pr create -R ${GITHUB_REMOTE} --base ${BASE_BRANCH} --head ${BRANCH_NAME}"
+            fi
             echo ""
             menu_reenter_or_cleanup
             ;;
-        r|R) exec "$0" "$TASK_SLUG" "$BASE_BRANCH" ;;
+        r|R) exec "$0" "${RERUN_ARGS[@]}" ;;
         d|D) cleanup ;;
-        *) echo "Containers still running. Re-enter with: $0 ${TASK_SLUG}" ;;
+        *) echo "Containers still running. Re-enter with: $0 ${REENTER_ARGS[*]}" ;;
     esac
 
 else
-    echo "No new commits on ${BRANCH_NAME}."
+    echo "No new commits on ${BRANCH_NAME} since ${BASE_LABEL}."
     echo ""
     menu_reenter_or_cleanup
 fi
