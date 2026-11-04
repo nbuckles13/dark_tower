@@ -14,8 +14,10 @@
 # Covers: every PR-mode refusal fires BEFORE any clone or podman call (each lookup-stage
 # case also proves gh WAS asked, so it died at the intended check); the happy path (clone
 # on a slash-containing head branch at the PR head, menu detects the PR, pushes to it,
-# never offers create; re-attach; [r] re-exec keeps --pr; push rejection; PR closed or gh
-# failing mid-session); the clone-branch mismatch refused in both modes (detached HEAD
+# never offers create; re-attach; [r] re-exec keeps --pr; PR closed or gh failing
+# mid-session); a rejected push PRINTS the absorb recovery with this run's values, runs nothing
+# and runs no git with the clone as repo/cwd (git shim) — and the printed steps, followed
+# verbatim against a Dependabot-style rewritten head, land the fix; the clone-branch mismatch refused in both modes (detached HEAD
 # included) and a matching re-attach; and the commits-since-base listing in a clone with
 # no local base branch (masked as "No new commits" before).
 #
@@ -31,11 +33,11 @@ source "${REPO_ROOT}/scripts/lang/_test_helpers.sh"
 
 WORK="$(mktemp -d)"
 # The PR-mode slug is unique per run: devloop.sh's per-slug runtime dir is the REAL
-# /tmp/devloop-<slug> (shared with the helper binary, not relocatable), which the push-rejected
-# recovery writes into and --destroy removes — it must never be a live devloop's.
+# /tmp/devloop-<slug> (shared with the helper binary, not relocatable), which --destroy
+# removes — it must never be a live devloop's.
 PS="dlprtest${$}${RANDOM}"
 trap 'rm -rf "$WORK" "/tmp/devloop-${PS}"' EXIT
-# devloop.sh creates it (0700) with the container; the tests model a container already running.
+# devloop.sh creates it (0700) only with the Kind helper; made here so --destroy's removal is observable.
 (umask 077 && mkdir -p "/tmp/devloop-${PS}")
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid
@@ -64,12 +66,10 @@ case "\$1" in
   container) [[ "\$2" == exists ]] && exit 1 ;;
   exec)
     # The interactive attach: run the case's "session" (commit, flip a fixture, ...).
-    if [[ " \$* " == *" claude "* && -n "\${STUB_SESSION:-}" ]]; then bash "\$STUB_SESSION" >&2; fi
+    # Without the git shim: the session is the CONTAINER's git, not the host's.
+    if [[ " \$* " == *" claude "* && -n "\${STUB_SESSION:-}" ]]; then PATH="${SYS}" bash "\$STUB_SESSION" >&2; fi
     exit 0 ;;
   cp) exit 0 ;;
-  inspect)
-    [[ "\${STUB_NOMOUNT:-}" == fail ]] && { echo "Error: no such container" >&2; exit 125; }
-    [[ -n "\${STUB_NOMOUNT:-}" ]] || printf '/work\n/tmp/devloop\n'; exit 0 ;;
 esac
 echo "podman stub: unmodelled: \$*" >&2; exit 91
 EOF
@@ -98,7 +98,21 @@ fi
 if [[ "\$1 \$2" == "pr create" ]]; then echo "https://github.com/acme/tower/pull/99"; exit 0; fi
 echo "gh stub: unmodelled: \$*" >&2; exit 91
 EOF
-chmod +x "${BIN}/podman" "${BIN}/gh" "${NOGH}/podman"
+# git shim: every host git call devloop.sh makes is logged (cwd, GIT_DIR, GIT_WORK_TREE, argv),
+# then the real git runs. clone_git_calls reads the log.
+cat > "${BIN}/git" <<EOF
+#!/usr/bin/env bash
+printf 'cwd=%s|GIT_DIR=%s|GIT_WORK_TREE=%s|argv= %s\n' "\$PWD" "\${GIT_DIR:-}" "\${GIT_WORK_TREE:-}" "\$*" >> "${STUBLOG}/git.log"
+exec "${SYS}/git" "\$@"
+EOF
+chmod +x "${BIN}/podman" "${BIN}/gh" "${NOGH}/podman" "${BIN}/git"
+# clone_git_calls <slug> <log-text>: the logged git calls that had the clone as repo or cwd (cwd,
+# GIT_DIR, GIT_WORK_TREE, -C, --git-dir, --work-tree). The clone path as a fetch SOURCE (from
+# the host repo — fetch_from_clone) is not one of them.
+clone_git_calls() {
+  local w="worktrees/${1}"
+  grep -E "^cwd=[^|]*${w}(/[^|]*)?\||\|GIT_DIR=[^|]*${w}|\|GIT_WORK_TREE=[^|]*${w}| -C [^ ]*${w}( |/|\$)|--(git-dir|work-tree)[= ][^ ]*${w}" <<< "$2" || true
+}
 
 HEADREF="dependabot/cargo/x-1.2.3"
 C=""; ORIGIN=""; H=""; OUT=""; RC=0; HEAD_OID=""; MAIN_OID=""
@@ -137,7 +151,7 @@ dl() {
       GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
       GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid \
       ANTHROPIC_API_KEY=dummy DEVLOOP_CONTAINER_MEMORY=1g STUB_RUNNING="devloop-${running}-dev" \
-      STUB_SESSION="${STUB_SESSION:-}" STUB_NOMOUNT="${STUB_NOMOUNT:-}" bash "$DEVLOOP" "$@" 2>&1)"
+      STUB_SESSION="${STUB_SESSION:-}" bash "$DEVLOOP" "$@" 2>&1)"
   RC=$?
   set -e
 }
@@ -145,7 +159,7 @@ log() { cat "${STUBLOG}/$1.log" 2>/dev/null || true; }
 
 # Hostile clone (security S-R1): the container can write the clone's .git/config and hooks,
 # and host git run WITH THE CLONE AS ITS REPO would execute them. hostile_session <clone>
-# <subject> writes ${C}/session.sh, run as the "session": a commit, then a commit carrying a
+# <subject> writes ${C}/session.sh, run as the "session": a commit, then a (non-empty) commit carrying a
 # gpgsig header on top, then (last, so the session's own git calls don't trip them) hooks and
 # config that would fire on a host-side push/log/status in the clone. Markers land in ${C}/markers.
 MARKBIN="${WORK}/markbin"; mkdir -p "$MARKBIN"
@@ -161,7 +175,7 @@ hostile_session() {
 set -e
 cd $(printf '%q' "$cl")
 printf '%s\\n' $(printf '%q' "$subj") >> work; git add work; git commit -qm $(printf '%q' "$subj")
-tree=\$(git rev-parse 'HEAD^{tree}'); parent=\$(git rev-parse HEAD)
+printf '%s signed\\n' $(printf '%q' "$subj") >> work; git add work; tree=\$(git write-tree); parent=\$(git rev-parse HEAD)
 sha=\$(printf 'tree %s\\nparent %s\\nauthor t <t@e> 1700000000 +0000\\ncommitter t <t@e> 1700000000 +0000\\ngpgsig -----BEGIN PGP SIGNATURE-----\\n \\n -----END PGP SIGNATURE-----\\n\\n%s signed\\n' "\$tree" "\$parent" $(printf '%q' "$subj") | git hash-object -t commit -w --stdin)
 git update-ref "refs/heads/\$(git symbolic-ref --short HEAD)" "\$sha"
 for h in pre-push post-checkout pre-commit; do cp $(printf '%q' "${MARKBIN}/hook") ".git/hooks/\$h"; done
@@ -264,6 +278,9 @@ PRE='git -C "$H" branch -q "$HEADREF" main' \
 # (OIDs are asserted after the call: the arguments above expand BEFORE the case's fixture exists.)
 assert_status "lk-stale-local-names-both-shas" "is ${MAIN_OID}; PR #7 head is ${HEAD_OID}" "$OUT"
 assert_status "lk-stale-local-not-overwritten" "$MAIN_OID" "$(git -C "$H" rev-parse "$HEADREF")"
+assert_status "lk-stale-local-inspect" "Inspect: git -C ${H} fetch origin && git -C ${H} log --oneline origin/${HEADREF}..${HEADREF}" "$OUT"
+assert_status "lk-stale-local-delete-if-empty" "If that prints nothing: git -C ${H} branch -D ${HEADREF}" "$OUT"
+assert_status "lk-stale-local-just-behind" "If it is just behind: git -C ${H} fetch origin refs/heads/${HEADREF}:refs/heads/${HEADREF}" "$OUT"
 PRE='git -C "$H" remote set-url origin "${C}/nowhere.git"; ORIGIN="${C}/nowhere.git"' \
   refused_at_lookup lk-origin-unreachable origin-unreachable "git ls-remote "
 assert_absent "lk-origin-unreachable-not-absent" "head-not-on-origin" "$OUT"
@@ -328,55 +345,125 @@ assert_status "exec-commits-label" "Commits on ${HEADREF} since main:" "$OUT"
 assert_status "exec-commit-listed" "fix build" "$OUT"
 assert_status "exec-reenter-keeps-pr" "Re-enter:  ${DEVLOOP} --pr 7 ${PS}" "$OUT"
 
-# Push rejected: the PR head moved on origin; recovery printed, origin untouched, no force.
-git clone -q "$ORIGIN" "${C}/other"; git -C "${C}/other" checkout -q "$HEADREF"
-printf 'rebased\n' > "${C}/other/r"; git -C "${C}/other" add r; git -C "${C}/other" commit -qm "dependabot rebase"
-git -C "${C}/other" push -q origin "$HEADREF"
+# Push rejected: Dependabot REWROTE the PR head (bump re-made, with a different patch, on a moved
+# main; force-pushed). The menu only PRINTS the recovery: this run's values, nothing run, no git
+# with the clone as repo/cwd, nothing planted in the clone fires.
+git clone -q "$ORIGIN" "${C}/other"
+printf 'main moved\n' > "${C}/other/m"; git -C "${C}/other" add m; git -C "${C}/other" commit -qm "main moves"
+git -C "${C}/other" push -q origin HEAD:main
+git -C "${C}/other" checkout -qb rewritten
+printf 'bump v2\n' > "${C}/other/g"; git -C "${C}/other" add g; git -C "${C}/other" commit -qm "bump x to 1.2.3"
+git -C "${C}/other" push -q -f origin "rewritten:refs/heads/${HEADREF}"
 moved="$(git -C "$ORIGIN" rev-parse "refs/heads/${HEADREF}")"
-printf 'cd %q && printf more >> h && git add h && git commit -qm "more fixes"\n' "$CL" > "${C}/session.sh"
+hostile_session "$CL" "more fixes"
 STUB_SESSION="${C}/session.sh" dl "pq" "$BIN" ${PS} --pr 7 ${PS}
+REB="${C}/${PS}-rebase"; ABSORB="${__here}/absorb-devloop.sh"
+STEPS_TEXT="$(grep '^    \$ ' <<< "$OUT" || true)"
 assert_rc     "reject-rc" 0 "$RC"
 assert_status "reject-error" "ERROR: push of ${HEADREF} was rejected" "$OUT"
 assert_status "reject-origin-untouched" "$moved" "$(git -C "$ORIGIN" rev-parse "refs/heads/${HEADREF}")"
 assert_status "reject-never-force" "Never force-push" "$OUT"
-assert_status "reject-back-to-menu" "Re-enter with: ${DEVLOOP} --pr 7 ${PS}" "$OUT"
-# The recovery: the host bundled origin's moved branch into a fresh dir under the per-slug
-# runtime mount; the printed `$ ` line runs INSIDE the container. Run it as the container
-# would — in the clone, with container /tmp/devloop = host /tmp/devloop-<slug> — end to end.
-assert_status "reject-bundle-asked-mount" "inspect --format" "$(log podman)"
-recovery="$(sed -n 's/^    \$ //p' <<< "$OUT")"
-assert_status "reject-recovery-is-bundle-fetch" "git fetch /tmp/devloop/rebase." "$recovery"
-assert_status "reject-recovery-rebases" "&& git rebase origin/${HEADREF}" "$recovery"
-assert_rc     "reject-bundle-fresh-dir" 0 "$(compgen -G "/tmp/devloop-${PS}/rebase.*/head.bundle" >/dev/null && echo 0 || echo 1)"
+assert_status "reject-pr-wording" "PR #7's branch ${HEADREF} probably moved" "$OUT"
+# The local <head> (ensure_branch_ref made it at launch) blocks the worktree add: its remedy comes
+# FIRST, and since it is still the launch head (-D loses nothing) it is step 1 of the block.
+assert_status "reject-first-section" "First, or the worktree add below refuses:" "$OUT"
+assert_status "reject-local-head-at-launch" "It is still PR #7's head from this run's launch (${HEAD_OID:0:12})" "$OUT"
+assert_status "reject-local-head-loses-nothing" "so deleting it loses nothing (first step below)" "$OUT"
+assert_absent "reject-local-head-not-may-hold" "may hold your commits" "$OUT"
+assert_status "reject-steps-in-order" "\
+    \$ git -C ${H} branch -D ${HEADREF}
+    \$ git -C ${H} fetch origin
+    \$ git -C ${H} worktree add -b ${HEADREF} ${REB} origin/${HEADREF}
+    \$ cd ${REB} && ${ABSORB} ${H}/../worktrees/${PS}
+    \$ git -C ${H} push ${ORIGIN} refs/heads/${HEADREF}:refs/heads/${HEADREF}  # never force" "$STEPS_TEXT"
+assert_status "reject-five-steps" "5" "$(grep -c . <<< "$STEPS_TEXT")"
+assert_absent "reject-no-pr-create" "gh pr create" "$OUT"
+assert_status "reject-skill-form" "/absorb-devloop ${PS} run from that worktree" "$OUT"
+assert_status "reject-dry-run" "${ABSORB} --dry-run ${H}/../worktrees/${PS}" "$OUT"
+assert_status "reject-skip-note" "git cherry-pick --skip   — it goes on with your remaining commits" "$OUT"
+assert_status "reject-no-rerun" "Do NOT rerun absorb after a skip" "$OUT"
+assert_status "reject-destroy-only-after" "ONLY after the push succeeded" "$OUT"
+assert_status "reject-destroy-abs" "cd ${H} && git -C ${H} worktree remove ${REB} && ${__here}/devloop.sh --destroy ${PS}" "$OUT"
+# Nothing was run.
+assert_rc     "reject-no-rebase-dir" 1 "$([[ -e "$REB" ]] && echo 0 || echo 1)"
 assert_rc     "reject-no-host-worktree" 1 "$(git -C "$H" worktree list | grep -q rebase && echo 0 || echo 1)"
-assert_rc     "reject-nothing-written-into-clone" 1 "$([[ -n "$(git -C "$CL" status --porcelain --ignored)" ]] && echo 0 || echo 1)"
-set +e; rec_out="$(cd "$CL" && bash -ec "${recovery//\/tmp\/devloop\//\/tmp\/devloop-${PS}\/}" 2>&1)"; rec_rc=$?; set -e
-assert_rc     "reject-recovery-runs-in-container" 0 "$rec_rc"
-assert_status "reject-recovery-rebased" "more fixes|dependabot rebase|" "$(git -C "$CL" log --format=%s -2 | tr '\n' '|')"
-# ...then exit again: the menu pushes the rebased commit host-side, unforced.
-dl "pq" "$BIN" "${PS}" --pr 7 "${PS}"
-assert_status "reject-repush-done" "Pushed. PR updated." "$OUT"
-assert_status "reject-repush-landed" "$(git -C "$CL" rev-parse HEAD)" "$(git -C "$ORIGIN" rev-parse "refs/heads/${HEADREF}")"
-assert_status "reject-repush-on-top-of-moved" "more fixes|dependabot rebase|" "$(git -C "$ORIGIN" log --format=%s -2 "refs/heads/${HEADREF}" | tr '\n' '|')"
+assert_status "reject-local-head-untouched" "$HEAD_OID" "$(git -C "$H" rev-parse "refs/heads/${HEADREF}")"
+GL="$(log git)"
+assert_status "reject-shim-saw-host-push" "argv= -C ${H} push ${ORIGIN} " "$GL"
+assert_absent "reject-shim-no-worktree-add" "worktree add" "$GL"
+assert_absent "reject-shim-no-fetch-origin" " fetch origin" "$GL"
+assert_absent "reject-shim-no-branch-delete" "branch -D" "$GL"
+assert_status "reject-no-git-in-clone" "none" "$(c="$(clone_git_calls "$PS" "$GL")"; [[ -z "$c" ]] && echo none || echo "$c")"
+assert_status "reject-matcher-control-cwd" "cwd=${CL}|" "$(clone_git_calls "$PS" "cwd=${CL}|GIT_DIR=|GIT_WORK_TREE=|argv= rev-parse HEAD")"
+assert_status "reject-matcher-control-C" "rev-parse" "$(clone_git_calls "$PS" "cwd=/x|GIT_DIR=|GIT_WORK_TREE=|argv= -C ${H}/../worktrees/${PS} rev-parse HEAD")"
+assert_status "reject-matcher-control-gitdir" "rev-parse" "$(clone_git_calls "$PS" "cwd=/x|GIT_DIR=${CL}/.git|GIT_WORK_TREE=|argv= rev-parse HEAD")"
+assert_absent "reject-no-podman-inspect" "inspect" "$(log podman)"
+assert_absent "reject-no-unmodelled" "unmodelled" "$OUT"
+assert_not_hostile "reject" "$CL"
 
-# A container without the /tmp/devloop mount (created before it was unconditional): told to
-# recreate, nothing fetched or bundled.
+# Positive control: run the printed `$ ` lines IN PRINTED ORDER on the host (-D, fetch, add);
+# absorb stops on the PR's original bump (its patch changed upstream); the printed skip; the
+# printed push. Every host git call is guarded, so a regression fails a named assertion and the
+# suite still runs to its summary.
+mapfile -t STEPS <<< "$(sed 's/^    \$ //' <<< "$STEPS_TEXT")"
+run_host() { (cd "$H" && eval "$1") >/dev/null 2>&1; }   # one printed step, from the host repo
+set +e
+run_host "${STEPS[0]}" && run_host "${STEPS[1]}" && run_host "${STEPS[2]}"; ctl_rc=$?
+set -e
+assert_rc     "ctl-delete-fetch-add-in-order" 0 "$ctl_rc"
+dry="$(cd "$REB" 2>/dev/null && "$ABSORB" --dry-run "$PS" 2>&1 || true)"
+assert_status "ctl-slug-form-same-clone" "Source: ${HEADREF} @ ${REB}/../worktrees/${PS}" "$dry"
+set +e; abs_out="$(cd "$H" && eval "${STEPS[3]}" 2>&1)"; abs_rc=$?; set -e
+assert_rc     "ctl-absorb-stops-on-bump" 3 "$abs_rc"
+assert_status "ctl-absorb-stopped-on-original" "could not apply ${HEAD_OID:0:7}" "$abs_out"
+set +e; git -C "$REB" cherry-pick --skip >/dev/null 2>&1; skip_rc=$?; set -e
+assert_rc     "ctl-skip-finishes" 0 "$skip_rc"
+# The printed warning is real: an absorb rerun after the skip queues the bump again and stops.
+set +e; run_host "${STEPS[3]}"; rerun_rc=$?; git -C "$REB" cherry-pick --abort >/dev/null 2>&1; abort_rc=$?; set -e
+assert_rc     "ctl-rerun-after-skip-loops" 3 "$rerun_rc"
+assert_rc     "ctl-rerun-aborted" 0 "$abort_rc"
+set +e; run_host "${STEPS[4]}"; push_rc=$?; set -e
+assert_rc     "ctl-push" 0 "$push_rc"
+assert_status "ctl-on-top-of-rewritten" "$moved" "$(git -C "$ORIGIN" rev-list "refs/heads/${HEADREF}" | grep -x "$moved" || true)"
+assert_status "ctl-fix-once" "1" "$(git -C "$ORIGIN" log --format=%s "${moved}..refs/heads/${HEADREF}" | grep -c '^more fixes$' || true)"
+assert_status "ctl-bump-once" "1" "$(git -C "$ORIGIN" log --format=%s "main..refs/heads/${HEADREF}" | grep -c '^bump x to 1.2.3$' || true)"
+assert_status "ctl-bump-is-rewritten" "bump v2" "$(git -C "$ORIGIN" show "refs/heads/${HEADREF}:g" 2>&1)"
+set +e; git -C "$H" worktree remove "$REB" >/dev/null 2>&1; rc_=$?; set -e
+assert_rc     "ctl-worktree-removed" 0 "$rc_"
+
+# Rejected again, now with the host's local <head> MOVED since launch (it holds the absorbed
+# result): -D is offered only after an inspect, never as "loses nothing", never as a `$ ` step.
 printf 'cd %q && printf again >> h && git add h && git commit -qm "again"\n' "$CL" > "${C}/session.sh"
-git -C "${C}/other" pull -q --rebase=false origin "$HEADREF" >/dev/null 2>&1 || true
-printf 'x\n' > "${C}/other/x"; git -C "${C}/other" add x; git -C "${C}/other" commit -qm "moved again"
-git -C "${C}/other" push -q origin "HEAD:refs/heads/${HEADREF}"
-STUB_NOMOUNT=1 STUB_SESSION="${C}/session.sh" dl "pq" "$BIN" "${PS}" --pr 7 "${PS}"
-assert_status "nomount-rejected" "was rejected" "$OUT"
-assert_status "nomount-recreate-hint" "has no /tmp/devloop mount" "$OUT"
-assert_status "nomount-recreate-cmd" "--recreate --pr 7 ${PS}" "$OUT"
-assert_absent "nomount-no-bundle-cmd" "git fetch /tmp/devloop/" "$OUT"
-# podman inspect itself failing is reported as that (with podman's stderr), not as "predates".
-STUB_NOMOUNT=fail dl "pq" "$BIN" "${PS}" --pr 7 "${PS}"
-assert_status "inspectfail-rejected" "was rejected" "$OUT"
-assert_status "inspectfail-named" "ERROR: podman inspect devloop-${PS}-dev failed (rc=125" "$OUT"
-assert_status "inspectfail-podman-stderr" "Error: no such container" "$OUT"
-assert_absent "inspectfail-not-predates" "predates" "$OUT"
-assert_absent "inspectfail-no-bundle-cmd" "git fetch /tmp/devloop/" "$OUT"
+STUB_SESSION="${C}/session.sh" dl "pq" "$BIN" ${PS} --pr 7 ${PS}
+assert_status "reject2-rejected" "was rejected" "$OUT"
+assert_status "reject2-may-hold" "The host repo's local ${HEADREF} is at $(git -C "$H" rev-parse "refs/heads/${HEADREF}"); it may hold your commits" "$OUT"
+assert_status "reject2-inspect" "Inspect: git -C ${H} fetch origin && git -C ${H} log --oneline origin/${HEADREF}..${HEADREF}" "$OUT"
+assert_status "reject2-delete-if-empty" "If that prints nothing: git -C ${H} branch -D ${HEADREF}" "$OUT"
+assert_absent "reject2-not-loses-nothing" "loses nothing" "$OUT"
+assert_absent "reject2-delete-not-a-step" "    \$ git -C ${H} branch -D" "$OUT"
+# A leftover <slug>-rebase worktree on <head>: named, plain remove (no --force).
+set +e; git -C "$H" worktree add -q "$REB" "$HEADREF" >/dev/null 2>&1; rc_=$?; set -e
+assert_rc     "reject3-setup" 0 "$rc_"
+dl "pq" "$BIN" ${PS} --pr 7 ${PS}
+assert_status "reject3-checked-out-elsewhere" "${HEADREF} is checked out in the worktree ${REB}" "$OUT"
+assert_status "reject3-remove" "has uncommitted work): git -C ${H} worktree remove ${REB}" "$OUT"
+assert_absent "reject3-no-force" "--force" "$OUT"
+set +e; git -C "$H" worktree remove "$REB" >/dev/null 2>&1; rc_=$?; set -e
+assert_rc     "reject3-teardown" 0 "$rc_"
+# A leftover <slug>-rebase that is NOT a registered worktree: inspect, then rm -r (printed only).
+mkdir -p "${REB}/junk"
+dl "pq" "$BIN" ${PS} --pr 7 ${PS}
+assert_status "reject5-not-a-worktree" "${REB} exists and is not a git worktree: inspect it, then remove it: rm -r ${REB}" "$OUT"
+assert_absent "reject5-no-worktree-remove-remedy" "is a leftover worktree" "$OUT"
+assert_rc     "reject5-dir-kept" 0 "$([[ -d "${REB}/junk" ]] && echo 0 || echo 1)"
+rm -rf "$REB"
+# <head> checked out in REPO_ROOT itself: switch, not remove.
+set +e; git -C "$H" checkout -q "$HEADREF" >/dev/null 2>&1; rc_=$?; set -e
+assert_rc     "reject4-setup" 0 "$rc_"
+dl "pq" "$BIN" ${PS} --pr 7 ${PS}
+assert_status "reject4-in-repo-root" "${HEADREF} is checked out in ${H} itself. Switch it: git -C ${H} switch <another-branch>" "$OUT"
+set +e; git -C "$H" checkout -q main >/dev/null 2>&1; rc_=$?; set -e
+assert_rc     "reject4-teardown" 0 "$rc_"
 
 # PR closed during the session: warning + manual push hint, no push/create arm.
 printf 'jq %q %q > %q.t && mv %q.t %q\n' '.state = "CLOSED"' "${FIX}/pr-7.json" "${FIX}/pr-7.json" "${FIX}/pr-7.json" "${FIX}/pr-7.json" > "${C}/session.sh"
@@ -435,6 +522,22 @@ assert_rc     "nopr-p-rc" 0 "$RC"
 assert_status "nopr-p-pushed" "Pushed feature/s3." "$OUT"
 assert_status "nopr-p-landed" "$(git -C "$(clone s3)" rev-parse HEAD)" "$(git -C "$ORIGIN" rev-parse refs/heads/feature/s3 2>&1)"
 assert_not_hostile "nopr-p" "$(clone s3)"
+
+# Non-PR [c] rejected (feature/s3 moved on origin): branch wording, no PR wording, the recovery
+# ends with gh pr create, no local-branch remedy (the host has no local feature/s3).
+git clone -q -b feature/s3 "$ORIGIN" "${C}/o3"
+printf 'x\n' > "${C}/o3/x"; git -C "${C}/o3" add x; git -C "${C}/o3" commit -qm "moved"; git -C "${C}/o3" push -q origin feature/s3
+printf 'cd %q && printf y >> y && git add y && git commit -qm "nopr more"\n' "$(clone s3)" > "${C}/session.sh"
+STUB_SESSION="${C}/session.sh" dl "cq" "$BIN" s3 s3 main
+assert_status "nopr-c-reject-error" "ERROR: push of feature/s3 was rejected" "$OUT"
+assert_status "nopr-c-reject-branch-wording" "The branch feature/s3 probably moved" "$OUT"
+assert_absent "nopr-c-reject-no-pr-wording" "PR #" "$OUT"
+assert_absent "nopr-c-reject-no-pr-original" "the PR's original commit" "$OUT"
+assert_status "nopr-c-reject-step-add" "    \$ git -C ${H} worktree add -b feature/s3 ${C}/s3-rebase origin/feature/s3" "$OUT"
+assert_status "nopr-c-reject-create-last" "    \$ gh pr create -R ${ORIGIN} --base main --head feature/s3" "$(grep '^    \$ ' <<< "$OUT" | tail -1)"
+assert_absent "nopr-c-reject-no-local-remedy" "branch -D" "$OUT"
+assert_absent "nopr-c-reject-no-pr-created" "pr create" "$(log gh)"
+assert_status "nopr-c-reject-no-git-in-clone" "none" "$(c="$(clone_git_calls s3 "$(log git)")"; [[ -z "$c" ]] && echo none || echo "$c")"
 
 # Non-PR, origin unreachable at start: loud WARNING (git's stderr + divergence risk), not refused.
 git -C "$H" remote set-url origin "${C}/nowhere.git"
@@ -497,5 +600,11 @@ assert_status "base-unknown-warning" "cannot list commits since release: the hos
 assert_status "base-unknown-header" "commits since release unknown" "$OUT"
 assert_status "base-unknown-create-offered" "[c] Push and create PR into release" "$OUT"
 assert_absent "base-unknown-not-masked" "No new commits" "$OUT"
+
+# The per-slug /tmp/devloop mount exists ONLY with the Kind helper (no case models `podman run`,
+# so this is a structural check): exactly one such mount, inside devloop.sh's `if launch_helper` arm.
+helper_arm="$(awk '/^        if launch_helper; then$/ {on=1; next} on && /^        else$/ {exit} on' "$DEVLOOP")"
+assert_status "mount-only-with-helper" '-v "$HELPER_RUNTIME_DIR:/tmp/devloop:Z"' "$helper_arm"
+assert_status "mount-exactly-once" "1" "$(grep -c -- ':/tmp/devloop:Z' "$DEVLOOP")"
 
 report_results "infra/devloop/devloop-pr.test.sh"
