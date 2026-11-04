@@ -19,15 +19,21 @@ DEVLOOP_MEMORY_INBOX="${DEVLOOP_MEMORY_INBOX:-${HOME}/.cache/devloop/memory-inbo
 # host_memory_dir <repo-root> — the host project's memory dir, for whichever
 # machine, user and checkout path devloop.sh runs from. Claude Code keeps its
 # config in $CLAUDE_CONFIG_DIR (default ~/.claude) and keys a project by its path
-# with every non-alphanumeric character replaced by `-`.
+# with every non-alphanumeric character replaced by `-`. Every git worktree of a
+# repo shares the main checkout's memory, so a worktree path is first resolved to
+# the main checkout (the parent of the shared git dir); a non-git path is used as is.
 # DEVLOOP_MEMORY_SEED_DIR overrides it.
 host_memory_dir() {
     if [[ -n "${DEVLOOP_MEMORY_SEED_DIR:-}" ]]; then
         printf '%s' "$DEVLOOP_MEMORY_SEED_DIR"
         return
     fi
+    local root="$1" common
+    if common="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+        root="$(dirname "$common")"
+    fi
     printf '%s/projects/%s/memory' "${CLAUDE_CONFIG_DIR:-${HOME}/.claude}" \
-        "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
+        "$(printf '%s' "$root" | sed 's/[^A-Za-z0-9]/-/g')"
 }
 
 # seed_container_memory <container> <repo-root> — copy the host memory into a new
