@@ -189,7 +189,7 @@ impl AcceptLoopRig {
         }
     }
 
-    /// Generate a self-signed Ed25519 cert (SAN `["localhost", "127.0.0.1"]`)
+    /// Generate a self-signed ECDSA P-256 cert (SAN `["localhost", "127.0.0.1"]`)
     /// and write PEMs into a temp dir.
     ///
     /// Ported from `crates/mh-service/tests/common/accept_loop_rig.rs`. Uses
@@ -213,7 +213,8 @@ impl AcceptLoopRig {
         let key_path: PathBuf = tempdir.path().join("key.pem");
 
         std::fs::write(&cert_path, cert.cert.pem()).expect("failed to write cert PEM");
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).expect("failed to write key PEM");
+        std::fs::write(&key_path, cert.signing_key.serialize_pem())
+            .expect("failed to write key PEM");
 
         let cert_path_s = cert_path
             .to_str()
