@@ -30,7 +30,7 @@
 | Implementer | `implementer` |
 | Implementing Specialist | `infrastructure` |
 | Tier | `full` |
-| Iteration | `1` |
+| Iteration | `2` (human review 1; iteration start commit `86f38ed8`) |
 | Security | `security` |
 | Test | `test` |
 | Observability | `observability` |
@@ -113,14 +113,12 @@ NOT NEEDED - single-script tooling change with a fully specified behaviour
 
 | Path | Classification | Owner (if not mine) |
 |------|----------------|---------------------|
-| `infra/devloop/devloop.sh` | Mine | — |
-| `infra/devloop/devloop-pr.test.sh` (new) | Mine | — |
-| `scripts/layer3.sh` (wire the new self-test) | Mine | — |
-| `docs/decisions/adr-0025-containerized-devloop.md` (§7 usage line) | Mine | — |
-| `docs/specialist-knowledge/infrastructure/INDEX.md` (pointer to new test) | Mine | — |
-| `infra/lib/clone-head.sh` (new; review S-R1: read a clone's HEAD as a file) | Mine | — |
-| `infra/devloop/absorb-devloop.sh` (review S-R1: branch via clone-head.sh, not git in the worktree) | Mine | — |
-| `infra/devloop/absorb-devloop.test.sh` (HEAD-file read + detached case) | Mine | — |
+| `infra/devloop/devloop.sh` (iteration 2: absorb recovery, mount revert) | Mine | — |
+| `infra/devloop/devloop-pr.test.sh` (iteration 2: reject/recovery cases) | Mine | — |
+
+<!-- Iteration 2 rows only (the scope guard diffs against the iteration start commit 86f38ed8). Iteration 1's rows
+     (also scripts/layer3.sh, ADR-0025 §7, INDEX.md, infra/lib/clone-head.sh, absorb-devloop.sh + test) are in
+     86f38ed8 and § Files Modified. -->
 
 ---
 
@@ -427,6 +425,189 @@ Not spawned (diff touches no `checks.md` surface).
 ## Accepted Deferrals
 
 - (none surfaced in this devloop)
+
+---
+
+## Human Review (Iteration 2)
+
+**Requested mode**: `--light`. **Run as full panel**: Lead ruled the change ineligible for `--light`. It deliberately relaxes a host/container trust-boundary control set in iteration 1 (security-critical code), and it removes a container mount. Per the ambiguity rule, it runs in full mode.
+
+**Feedback**: "Replace the push-rejected bundle recovery in devloop.sh with the existing /absorb-devloop path, and put the /tmp/devloop mount back behind Kind.
+
+Why: the bundle exists so that 'container-authored content never runs on the host'. The standard return path already crosses that line, and the project accepts it: /absorb-devloop cherry-picks clone commits on the host, and .githooks/pre-commit runs cargo fmt/clippy on them, which compiles build.rs and proc macros. A rejected push can take the same path. The rule that does matter stays: the host never runs git with the clone as its repo or cwd. Absorb already honours it via fetch_from_clone.
+
+Changes:
+1. Remove print_push_recovery, the head.bundle/mktemp step and DEVLOOP_REMOTE_REF, along with their cleanup and docs. host_push stays as it is: a host-repo push, never forced.
+2. Revert the unconditional per-slug /tmp/devloop mount: mount HELPER_RUNTIME_DIR only when the Kind helper launches, as before, and restore the original accepted-risk comment there. The story-runner ledger mount is unaffected.
+3. On a rejected push, print the recovery with this run's real values filled in, and never run it automatically:
+     git -C <REPO_ROOT> fetch origin
+     git -C <REPO_ROOT> worktree add -b <head> ../<slug>-rebase origin/<head>
+     cd ../<slug>-rebase && /absorb-devloop <slug>   (or infra/devloop/absorb-devloop.sh <slug>)
+     git push origin <head>   (never force)
+     then: git worktree remove ../<slug>-rebase, and devloop.sh --destroy <slug>
+   Note in the message: if absorb stops on the PR's original commit (its patch changed in the upstream rebase), skip it with git cherry-pick --skip and rerun. If a local <head> branch already exists in the host repo, the worktree add will refuse. Print the git branch -D remedy rather than overwriting it.
+4. Header docs: replace the 'Push rejected' bullet with the flow above. Change 'Return path is the exit menu's push, NOT /absorb-devloop' so it says absorb is the return path when a push is rejected, into a host worktree on the PR branch and never your current branch. Record the trust-boundary reasoning above in one or two lines, so a future reviewer doesn't re-add the bundle.
+5. Tests: drop the bundle and mount cases in devloop-pr.test.sh. Add a case asserting that a rejected push prints the recovery with the correct branch and slug, and runs no git against the clone.
+
+Security: confirm both residual risks from the previous round (the timed head.bundle write and the unconditional mount) are gone, and that nothing new runs git with the clone as its repo."
+
+### Plan (iteration 2)
+
+Files changed: `infra/devloop/devloop.sh`, `infra/devloop/devloop-pr.test.sh`,
+`docs/specialist-knowledge/infrastructure/INDEX.md` (pointer), this main.md. No change to `infra/lib/clone-head.sh`,
+`absorb-devloop.sh`, ADR-0025 (neither mentions the bundle or the mount).
+
+1. **Remove** `print_push_recovery`, `DEVLOOP_REMOTE_REF` (definition + its `update-ref -d` in cleanup), the
+   `podman inspect` mount probe, the mktemp/bundle step and the "older containers lack the mount → --recreate" path.
+   `host_push` / `host_push_cmd` unchanged (host-repo push to origin's URL, never forced).
+2. **Mount reverted** to the a595bd87 shape: `-v HELPER_RUNTIME_DIR:/tmp/devloop:Z` only inside `if launch_helper`,
+   with the original accepted-risk comment verbatim; the unconditional Phase-1 block and its `mkdir` are deleted.
+   Story-runner ledger mount untouched.
+3. **New `print_absorb_recovery`** (called by `host_push` on rejection, stderr; prints only, runs nothing but one
+   read-only `git -C REPO_ROOT rev-parse` of `refs/heads/<head>` in the HOST repo). Real values: `REPO_ROOT`,
+   `<head>`=BRANCH_NAME, slug, `REBASE_DIR=${REPO_ROOT%/*}/<slug>-rebase` (a sibling of REPO_ROOT, so absorb's
+   `<toplevel>/../worktrees/<slug>` resolves to this run's clone). Paths `%q`-quoted. Copy-paste lines carry a `$ ` prefix:
+   ```
+   $ git -C <REPO_ROOT> fetch origin
+   $ git -C <REPO_ROOT> worktree add -b <head> <REBASE_DIR> origin/<head>
+   $ cd <REBASE_DIR> && <SCRIPT_DIR>/absorb-devloop.sh <slug>      (Claude Code: /absorb-devloop <slug> in that worktree)
+   $ git push origin <head>                                          (never force)
+   then: git -C <REPO_ROOT> worktree remove <REBASE_DIR>; <$0> --destroy <slug>
+   ```
+   plus the note: if absorb stops on the PR's original commit (patch changed by the upstream rebase) →
+   `git cherry-pick --skip`, rerun the absorb. If the host already has `refs/heads/<head>` (always true in PR mode:
+   ensure_branch_ref created it), print that the worktree add will refuse, its SHA, and the remedy
+   `git -C <REPO_ROOT> branch -D <head>` (only if it holds nothing you need) — never overwritten by the script.
+   Works unchanged for non-PR `[p]`/`[c]` rejections (`feature/<slug>`).
+4. **Header docs**: "Push rejected" bullet → the flow above; "Return path" bullet → menu push normally, absorb into a
+   host worktree on the PR branch (never your current branch) when the push is rejected; two-line trust-boundary
+   rationale: absorb's cherry-pick runs the repo's pre-commit hook (cargo fmt/clippy → build.rs, proc macros) on
+   container-authored commits — the same accepted crossing as every /absorb-devloop; the rule that is kept is that the
+   host never runs git with the clone as repo/cwd (absorb uses fetch_from_clone). Do not re-add a host-made bundle /
+   container-writable mount for this.
+5. **Tests** (`devloop-pr.test.sh`): delete the bundle cases (`reject-bundle-*`, `reject-recovery-*`, repush) and the
+   `nomount-*` / `inspectfail-*` cases and the stub's `inspect` arm (podman stub then exits 91 on any inspect — proves
+   none happens). New `reject-*`: hostile clone (plants live, positive control) + origin moved → `[p]` rejected →
+   output has the exact `$ ` lines with this run's REPO_ROOT/head/slug/REBASE_DIR, the cherry-pick --skip note, the
+   `branch -D <head>` remedy; nothing auto-run (no `<slug>-rebase` dir, no worktree, origin + host `<head>`
+   unchanged); no planted hook/config fired, decoy untouched; no podman inspect. Then a positive control executes the
+   printed lines (after the printed branch -D) and asserts origin's head = moved head + the fix on top, then cleans the
+   worktree. Non-PR `[p]` rejection on `feature/<slug>` with no local branch: recovery names `feature/<slug>`, no
+   `branch -D` remedy. Header comment of the suite + the `/tmp/devloop-<PS>` comment updated (no recovery writes there).
+
+**Plan deltas (Gate-1 input from observability + operations)**
+- **D1 `cherry-pick --skip` + rerun LOOPS — reproduced** (scratch repo, the real absorb-devloop.sh): after `--skip`
+  the sequencer finishes your commits, but a rerun of absorb re-queues the skipped commit (no patch-id match, no `-x`
+  record) and stops on it again. Printed text therefore says: `git cherry-pick --skip` continues with your commits; if
+  it stops again, resolve, `git add`, `git cherry-pick --continue`; do NOT rerun absorb after a skip. ONE path only
+  (Lead ruling: the `checkout --ours` + rerun alternative is dropped — it records an empty commit on the PR branch).
+- **D2 paths**: `REBASE_DIR` absolute, sibling of REPO_ROOT, used in add / cd / remove. The script line uses the HOST's
+  `${SCRIPT_DIR}/absorb-devloop.sh` with this run's clone as an absolute PATH (absorb accepts one), so it does not
+  depend on the sibling layout or on the PR branch's copy of the script; the `/absorb-devloop <slug>` form is printed as
+  the Claude Code alternative (works because REBASE_DIR is a sibling — test asserts absorb resolves the same clone).
+  `--dry-run` first suggested on a note line.
+- **D3 pre-checks, detected in the HOST repo only, each printed with real values, never run**: local `<head>` exists →
+  `git -C <REPO_ROOT> log --oneline origin/<head>..<head>` (must be empty) then `branch -D <head>`; `<head>` checked out
+  in some worktree (`worktree list --porcelain`) → `git -C <REPO_ROOT> worktree remove <path>`; REBASE_DIR already
+  exists → same remedy. 
+- **D4** `git push origin <head>` labelled with origin's URL (= the URL host_push used); `fetch origin` / `push origin`
+  consistent. "Run `<$0> --destroy <slug>` ONLY after the push succeeded — the clone is the only copy of the commits."
+- **D5 [c] rejection** (no PR was created): host_push gets the mode, and the recovery adds a final
+  `gh pr create -R <remote> --base <base> --head <head>` step. Wording says "branch", and "PR" only in PR mode.
+- **D6 tests**: a PATH `git` shim (logs cwd + argv, execs the real git) for the reject run asserts no git invocation
+  has the clone as `-C` or cwd and that no `worktree add` / `fetch origin` ran; the end-to-end control runs the printed
+  `$ ` lines.
+- INFLIGHT_MARKER only `-f`-tests the dir, so no mkdir needed on the no-Kind path; ledger mount and F5 `podman start`
+  hints untouched.
+
+**Plan deltas round 2 (Gate-1 asks; supersede the above where they differ)**
+- **E1 (security) local `<head>` wording by SHA**: `rev-parse -q --verify refs/heads/<head>^{commit}` in REPO_ROOT.
+  == PR_HEAD_OID → "still the PR head this run started from; that commit is in the clone and the PR — deleting it
+  loses nothing" + `branch -D`. Any other SHA / non-PR mode → "moved since launch or predates this run and MAY hold
+  your commits", SHA, `git -C <REPO_ROOT> log --oneline origin/<head>..<head>` (inspect; must be empty), `-D` only "if it
+  holds nothing you need". Tests for both. The (b) text is ONE helper `local_branch_delete_hint`, also used by
+  `pr_refuse local-branch-stale` (DRY P3).
+- **E2 (ops/obs) checked out elsewhere**: from `worktree list --porcelain` (host repo). Main worktree (REPO_ROOT) →
+  `git -C <REPO_ROOT> switch <other-branch>`; another worktree → `git -C <REPO_ROOT> worktree remove <path>` (no
+  `--force`); REBASE_DIR left over → same plain remove.
+- **E3 (code-reviewer)** destroy line is `${SCRIPT_DIR}/devloop.sh --destroy <slug>` (absolute; `$0` may be relative
+  and the operator has `cd`'d); every value `%q`-quoted. Line reads "ONLY after the push succeeded: worktree remove …;
+  … --destroy …".
+- **E4 (DRY P1)** the printed push is `host_push_cmd refs/heads/<head> <head>` →
+  `git -C <REPO_ROOT> push <origin URL> refs/heads/<head>:refs/heads/<head>` (the one never-forced push; the worktree
+  shares refs with REPO_ROOT). `fetch origin` stays by NAME (it must update `origin/<head>` for the worktree add).
+- **E5 (DRY P2)** absorb line passes the absolute CLONE_DIR (absorb accepts a path); `/absorb-devloop <slug>` as the
+  Claude Code alternative, with a comment at REBASE_DIR on why it is a sibling; the control runs the printed line.
+- **E6 (ops)** cherry-pick note mentions `--dry-run` first.
+- **E8 (obs)** non-PR wording: no "PR" in the recovery for a non-PR branch; a `[c]` rejection ends with
+  `gh pr create -R <remote> --base <base> --head <head>`.
+- **E7 (test/obs) control on the realistic shape**: origin's head is REWRITTEN (bump re-made on a moved main with a
+  conflicting patch, force-updated in the bare origin). The control runs the printed `$ ` lines verbatim; absorb stops
+  rc 3 on the original bump; `git cherry-pick --skip` (as printed); then the printed push; asserts origin = rewritten
+  head + the fix, the original bump not reintroduced. Git shim (`${BIN}/git` → `${SYS}/git`, logs cwd + argv): negative
+  = no call with cwd under the clone or `-C`/`--git-dir`/`--work-tree` into it, and no `worktree add`/`fetch origin`
+  during the reject run; positive controls = log contains the host push; matcher flags a synthetic `cwd=<clone>` line.
+  podman.log has no `inspect`, output has no "unmodelled". parse-whole-script.test.sh re-run. The shim also logs
+  GIT_DIR/GIT_WORK_TREE (in the negative matcher). The control also proves the "never rerun after a skip" warning:
+  an absorb rerun after the skip stops again (rc 3) on the original bump; it is aborted, then the printed push runs.
+
+
+**Lead ruling (spec deviation, D1)**: the spec's "`git cherry-pick --skip` and rerun" loops. Observability and the implementer reproduced it with the real absorb-devloop.sh: a rerun re-queues the skipped commit. The printed text instead says: skip, then `git cherry-pick --continue` if it stops again, and never rerun absorb after a skip. The `checkout --ours` + rerun alternative was dropped (it leaves an empty commit on the PR branch, and a single path is clearer).
+
+### Implementation (iteration 2)
+- `devloop.sh`: `print_push_recovery`, `DEVLOOP_REMOTE_REF` (+ cleanup line), the inspect probe and the bundle are
+  gone; the `/tmp/devloop` mount is byte-identical to a595bd87 (inside `if launch_helper`, original comment). New
+  `print_absorb_recovery [create]` (called by `host_push`; `[c]` passes `create`) and `local_branch_delete_hint`
+  (also behind `pr_refuse local-branch-stale`). Header "Return path" + "Push rejected" bullets rewritten, with the
+  trust-boundary lines.
+- `devloop-pr.test.sh` (405 cases): bundle/nomount/inspectfail cases and the stub's `inspect` arm removed; git shim +
+  `clone_git_calls` (with three matcher controls); reject case on a Dependabot-style rewritten head (exact printed
+  values, nothing run, no clone git, hostile plants silent); positive control follows the printed text (the printed
+  `-D`, fetch, add, absorb → rc 3 on the original bump, `--skip`, push) → origin = rewritten head + fix once; proves a
+  rerun after the skip stops again; local `<head>` moved → inspect-first wording; leftover worktree → plain remove;
+  `<head>` in REPO_ROOT → switch; non-PR `[c]` → branch wording, `gh pr create` last, no `-D`. The session runs
+  without the shim (container git). hostile_session's gpgsig commit is now non-empty (an empty one stops absorb's
+  cherry-pick — fixture artefact, not product behaviour).
+- INDEX.md line 31 names `print_absorb_recovery` / `local_branch_delete_hint`.
+
+### Gate 1 (iteration 2) — Plan Confirmations
+
+| Reviewer | Plan Status |
+|----------|-------------|
+| Security | confirmed |
+| Test | confirmed |
+| Observability | confirmed |
+| Code Quality | confirmed |
+| DRY | confirmed |
+| Operations | confirmed |
+
+### Gate 3 (iteration 2) — Verdicts
+
+| Reviewer | Verdict | Findings | Fixed | Deferred | Notes |
+|----------|---------|----------|-------|----------|-------|
+| Security | CLEAR (re-confirmed on e79de514) | 0 | 0 | 0 | residuals (a) gone; (b) no clone git; (c) recovery print-only, no force, no HEAD push |
+| Test | RESOLVED-FIXED (e79de514) | 2 | 2 | 0 | 7 mutations on a copy, all killed |
+| Observability | RESOLVED-FIXED (e79de514) | 3 | 3 | 0 | O1 remedy-before-steps; O2 CLONE_DIR; O3 non-worktree leftover |
+| Code Quality | RESOLVED-FIXED (e79de514) | 2 | 2 | 0 | F1 CLONE_DIR; F2 %q; also confirmed local_branch_delete_hint ordering fix |
+| DRY | RESOLVED-FIXED (e79de514) | 3 | 3 | 0 | D1 CLONE_DIR; D2 manual_pr_create_hint; D3 header pointer |
+| Operations | RESOLVED-FIXED (e79de514) | 3 | 3 | 0 | F1 cd-before-remove + && chain; F2 remedies first; F3 non-worktree leftover |
+
+### Iteration 2 — Result
+
+**Mode**: full panel (the operator requested `--light`; it was ineligible as a trust-boundary change). **Tier**: full; Gate 1 ran, and all six reviewers confirmed.
+
+**Gate 2**: `DEVLOOP_FMT_APPLY=1 ./scripts/layer-all.sh` on the frozen tree (devloop.sh `e79de514`, devloop-pr.test.sh `26925310`, INDEX.md `5a8720db`; hashes verified before and after) gave **TOTAL_RESULT=OK**. Layers 1–7 all OK, 1429s, with devloop-pr-selftest at 418/418.
+
+**Verdicts**: Security CLEAR; Test, Observability, Code Quality, DRY and Operations RESOLVED-FIXED; 0 deferred.
+
+**Notable in this iteration**:
+- **Spec deviation D1:** the operator's "cherry-pick --skip and rerun" loops (reproduced), so the printed text says skip, then `--continue`, and never rerun. A test pins the loop.
+- **Bug found and fixed in-loop:** `local_branch_delete_hint` was introduced in this iteration but defined after its pre-flight caller, so the `local-branch-stale` refusal printed no remedy. It is now defined earlier, and positive assertions cover it.
+- **Trust boundary:** both iteration-1 residuals (the timed `head.bundle` write and the unconditional `/tmp/devloop` mount) are removed. The mount is identical to `a595bd87`. Nothing runs git with the clone as its repo or cwd; a git shim with positive controls covers this.
+
+**Safe-revert unit (iteration 2)**: the whole iteration-2 commit. Reverting it alone restores iteration 1's bundle recovery and unconditional mount, a consistent prior state.
+
+**Accepted deferrals (iteration 2)**: none.
 
 ---
 
