@@ -211,7 +211,7 @@ criterion = "0.5"
 wiremock = "0.6"
 tempfile = "3"
 assert_cmd = "2"
-rcgen = "0.13"
+rcgen = "0.14"
 # Used by no member: the pin the two root-`exclude` fuzz workspaces share. They cannot
 # inherit, so each repeats it, and dt-guard workspace-deps R3 binds both to this entry.
 # No Dependabot PR ever reaches it (absent from Cargo.lock; the fuzz crates cannot have a
