@@ -278,9 +278,9 @@ As in §Objective (1)–(5).
 
 | Reviewer | Verdict | Findings | Fixed | Deferred | Notes |
 |----------|---------|----------|-------|----------|-------|
-| Security | RESOLVED-FIXED (round 3, 3f8d2ddb) | 6 (S-R4 withdrawn) | 5 | 0 | S-R1 container→host escape (pre-existing) fixed in-loop; residuals: bundle mktemp symlink race (negligible), /tmp/devloop mount now unconditional |
+| Security | RESOLVED-FIXED (round 3, 3f8d2ddb) | 6 (S-R4 withdrawn) | 5 | 0 | S-R1 container→host escape (pre-existing) fixed in-loop; iteration-1 residuals (bundle mktemp symlink race, unconditional /tmp/devloop mount) both removed in iteration 2 |
 | Test | RESOLVED-FIXED (round 3, 3f8d2ddb) | 4 (T1 withdrawn) | 3 | 0 | |
-| Observability | pending (reopened for F4) | 4 (F1 withdrawn) | 2 | 0 | F4 podman-inspect misdiagnosis open |
+| Observability | RESOLVED-FIXED | 5 (F1 withdrawn) | 4 | 0 | F4 podman-inspect misdiagnosis fixed (code later removed with the bundle in iteration 2) |
 | Code Quality | RESOLVED-FIXED (round 3, 3f8d2ddb) | 3 (F1 withdrawn) | 2 | 0 | F2 ruled: WARNING not refusal in non-PR mode |
 | DRY | RESOLVED-FIXED (round 3, 3f8d2ddb) | 5 | 5 | 0 | |
 | Operations | RESOLVED-FIXED (round 3, 3f8d2ddb) | 5 (OPS-1 withdrawn) | 4 | 0 | OPS-4 bundle-in-container design |
@@ -610,6 +610,16 @@ Files changed: `infra/devloop/devloop.sh`, `infra/devloop/devloop-pr.test.sh`,
 **Accepted deferrals (iteration 2)**: none.
 
 ---
+
+## Post-loop host changes (after iteration 2)
+
+Made on the host during the manual test plan, outside the devloop panel; reviewed instead by
+`security` and `infrastructure` subagents on the uncommitted diff (findings fixed, re-checked):
+PR-mode `-- <command>` ends in the exit menu (also on a failing command); push-rejected recovery
+is one in-container `git fetch` (anonymous HTTPS) + `git rebase --onto FETCH_HEAD <clone base>`
+chosen by repo visibility, host absorb as fallback; clone-containment check for the safe
+`branch -D`; `--no-cluster` with a container cluster-mode label; `--destroy` deletes the
+unchanged local branch devloop.sh created; quieter default output. See the commit messages.
 
 ## Rollback Procedure
 
