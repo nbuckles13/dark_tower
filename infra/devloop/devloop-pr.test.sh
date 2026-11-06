@@ -51,7 +51,8 @@ SYS="${WORK}/sys"; mkdir -p "$SYS"
 for f in /usr/bin/* /bin/*; do
   n="${f##*/}"
   case "$n" in gh|kind|podman|cargo) continue ;; esac
-  [[ -e "${SYS}/${n}" ]] || ln -s "$f" "${SYS}/${n}"
+  # -L too: a dangling link (seen on CI runners) fails -e, and /bin/* repeats /usr/bin/* names.
+  [[ -e "${SYS}/${n}" || -L "${SYS}/${n}" ]] || ln -s "$f" "${SYS}/${n}"
 done
 # Required tools not under /usr/bin or /bin (e.g. a runner image that installs jq elsewhere):
 # link the one on PATH. Never a stubbed name. Loud (stdout, which CI shows) if still missing.
