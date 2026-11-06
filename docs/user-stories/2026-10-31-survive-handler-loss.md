@@ -849,7 +849,7 @@ Human-readable intent only. Status and devloop output live in the manifest below
 | R-24 | GC-1 |
 | R-25 | GC-2 |
 | R-26 | GC-1 |
-| R-27 | I-1 |
+| R-27 | I-1, I-2 (host-publish UDP leg) |
 | R-28 | I-2, I-3, T-1 |
 | R-29 | I-5, I-2 |
 | R-30 | I-2, OPS |
@@ -1439,6 +1439,7 @@ tasks:
     5. SAME-COMMIT CONSUMERS of fixed instances (cut by invariant: "no fixed MH instances anywhere")
     - env-tests: test 01 (crates/env-tests/tests/01_mh_deployment_config.rs), test 02 where it reads MH, and crates/env-tests/src/fixtures/deployment_config.rs move from per-instance mh-0/mh-1 ConfigMaps/Deployments to the template and slot ConfigMaps. KIND_SIZING_RESTORE_CMD is updated if it names mh-N.
     - NEW R-28 env-test, paired with test: every live MH pod's advertised address is unique and equals its slot ConfigMap value. Resolve pods via `mh.sh list --json`. T-1 later hoists it into the mh_pool fixture.
+    - NEW R-27 publish-leg env-test, paired with test (obligation inherited from I-1; see the Gate zero RESULT and Scope bullets in the Deployment section): send a UDP datagram from the env-test runner to the host gateway on a slot's UDP extraPortMapping and prove it is delivered end to end to that slot's MH. Gate zero sent node-direct because the old 30830/30530 mappings were TCP-only, so the Kind/podman host-publish UDP leg is unproven until this test passes. A failure here is a slot-design failure: escalate, do not work around it.
     - scripts/dev-web.sh (R-32, client reviews): the MH preflight stops globbing mh-[0-9]*-config.env and reads `mh.sh list --json`.
       - Hard-fail when fewer than `baseline` MHs are live and listening.
       - Run today's per-port listener and address-family check on each occupied slot; empty slots are normal.
@@ -1463,7 +1464,7 @@ tasks:
 
     REMAINING HOST-SIDE ACTIONS (not devloop steps; state them in the devloop summary): rebuild devloop-helper on the host (ports.rs changed), then recreate every existing Kind cluster to get the 6 slot mappings. The first deploy, and any rollback across this commit, needs a recreate (R-30).
 
-    COVERS: code, deploy, unit-tests, env-tests (R-28 address invariant; existing MH env-tests green on slots).
+    COVERS: code, deploy, unit-tests, env-tests (R-28 address invariant; R-27 host-publish UDP leg; existing MH env-tests green on slots).
   tag: story-2026-10-31-survive-handler-loss-task-I-2
 - id: 10
   status: pending
