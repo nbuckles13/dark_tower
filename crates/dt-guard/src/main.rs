@@ -126,8 +126,9 @@ enum Command {
         #[arg(long)]
         explain: bool,
     },
-    /// No key material crosses the MC->MH contract (ADR-0036 §4), mechanised
-    /// for `proto/dark_tower/internal/v1/internal.proto`.
+    /// No secret or media-key material on the internal contract; exactly
+    /// allow-listed public verification keys only (ADR-0036 §4, ADR-0039 §5),
+    /// mechanised for `proto/dark_tower/internal/v1/internal.proto`.
     InternalProtoNoKeyMaterial {
         /// Repository root for path resolution.
         #[arg(long)]

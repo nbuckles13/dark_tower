@@ -41,7 +41,7 @@
 - Media-path telemetry deny (config-driven scope, distinct scope-liveness tokens, no suppression) -> `crates/dt-guard/src/media_telemetry_deny.rs`, manifest `scripts/guards/simple/media-telemetry-deny.yaml`, self-test `scripts/guards/media-telemetry-deny.test.sh`
 - Macro-family vocabularies (`ALL` derives the alternation) -> `crates/dt-guard/src/metric_macros.rs`, `telemetry_macros.rs`; scope-liveness predicate -> `crates/dt-guard/src/common/scope.rs`
 - Client credential-retention guard (field vocabulary from `common::pii_vocabulary`) -> `crates/dt-guard/src/ts_retained_credentials.rs`, wrapper `scripts/guards/simple/ts/no-retained-credentials.sh`
-- Proto guards on the shared lexer (`common/proto_lex.rs`: statements, scopes, `scopes()` walker; discovery `common/proto_files.rs`) -> `crates/dt-guard/src/proto_per_kind_fields.rs`, `proto_no_any.rs`, `internal_proto_no_key_material.rs` (`--root` flag, no seam; e2e `crates/dt-guard/tests/proto_ports_e2e.rs`)
+- Proto guards on the shared lexer (`common/proto_lex.rs`: statements, scopes, `scopes()` walker, the ONE field reader `fields()`/`field_decl()`; discovery `common/proto_files.rs`) -> `crates/dt-guard/src/proto_per_kind_fields.rs`, `proto_no_any.rs`, `internal_proto_no_key_material.rs` (`--root` flag, no seam; check-1 key allow-list `ALLOWED_BYTES_FIELDS` + `resolve_key_allowlist()` (ADR-0039 §5; membership: security); e2e `crates/dt-guard/tests/proto_ports_e2e.rs`)
 - Cross-language frame-vector fixtures -> `scripts/guards/simple/validate-frame-vectors.sh`, self-test `scripts/guards/validate-frame-vectors.test.sh`
 
 ## Validation Pipeline & Toolchain (ADR-0033)

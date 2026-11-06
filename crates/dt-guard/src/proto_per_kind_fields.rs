@@ -46,7 +46,7 @@
 //! No suppression path but [`ALLOW`], which ships EMPTY.
 
 use crate::common::proto_files::proto_files;
-use crate::common::proto_lex::{enum_values, lex, scopes, Token};
+use crate::common::proto_lex::{enum_values, fields, lex, scopes};
 use crate::common::status::{emit_ok, emit_scope};
 use anyhow::{bail, Result};
 use std::collections::BTreeSet;
@@ -154,50 +154,6 @@ pub fn name_tokens(name: &str) -> Vec<String> {
     out
 }
 
-/// The recognised field name of a statement inside a message or oneof, if it
-/// is a field declaration. Excludes `option`, `reserved`, `extensions`,
-/// `syntax`, `package`, `import` and everything that is not
-/// `[label] <type|map<K,V>> <name> = <number> [options]`.
-#[must_use]
-pub fn field_name(statement: &str) -> Option<&str> {
-    let first = statement.split(' ').next().unwrap_or("");
-    if matches!(
-        first,
-        "option" | "reserved" | "extensions" | "syntax" | "package" | "import" | "extend"
-    ) {
-        return None;
-    }
-    let (lhs, rhs) = statement.split_once('=')?;
-    let number = rhs.trim().split([' ', '[']).next()?;
-    // A proto intLit: decimal, `0x` hex or octal -- first char a digit, the
-    // rest alphanumeric (infra F2: hex numbers must not slip past).
-    if !number.chars().next().is_some_and(|c| c.is_ascii_digit())
-        || !number.chars().all(|c| c.is_ascii_alphanumeric())
-    {
-        return None;
-    }
-    let lhs = lhs.trim();
-    let name = lhs.rsplit(' ').next()?;
-    let ty = lhs.strip_suffix(name).unwrap_or("").trim();
-    let ty = ty
-        .strip_prefix("optional ")
-        .or_else(|| ty.strip_prefix("repeated "))
-        .or_else(|| ty.strip_prefix("required "))
-        .unwrap_or(ty);
-    let valid_ident = |s: &str| {
-        s.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    };
-    let valid_type = ty.starts_with("map<") && ty.ends_with('>')
-        || (!ty.is_empty()
-            && ty
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.'));
-    (valid_ident(name) && valid_type).then_some(name)
-}
-
 /// Derive the vocabulary from every `enum MediaKind` in `files`.
 #[must_use]
 pub fn derive_vocabulary(files: &[(String, String)]) -> Vocabulary {
@@ -222,13 +178,6 @@ pub fn derive_vocabulary(files: &[(String, String)]) -> Vocabulary {
         vocab.extend(SYNONYMS.iter().map(|s| (*s).to_string()));
     }
     Vocabulary(vocab)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Scope {
-    Message,
-    Oneof,
-    Other,
 }
 
 /// Evaluate `files` (root-relative path, content) against `vocab` and
@@ -266,68 +215,30 @@ pub fn check_with(files: &[(String, String)], vocab: &Vocabulary, allow: &[Allow
                 continue;
             }
         };
-        let mut package = String::new();
-        let mut stack: Vec<(Scope, String)> = Vec::new();
-        let mut file_fields = 0usize;
-        for t in &tokens {
-            match t {
-                Token::Open { header, .. } => {
-                    let mut words = header.split(' ');
-                    let entry = match (words.next(), words.next()) {
-                        (Some("message"), Some(name)) => (Scope::Message, name.to_string()),
-                        (Some("oneof"), Some(name)) => (Scope::Oneof, name.to_string()),
-                        _ => (Scope::Other, String::new()),
-                    };
-                    stack.push(entry);
-                }
-                Token::Close { .. } => {
-                    stack.pop();
-                }
-                Token::Statement { line, text } => {
-                    if stack.is_empty() {
-                        if let Some(p) = text.strip_prefix("package ") {
-                            package = p.trim().to_string();
-                        }
-                        continue;
-                    }
-                    if text.starts_with("reserved ") {
-                        report.reserved_seen += 1;
-                        continue;
-                    }
-                    let in_field_scope = matches!(
-                        stack.last().map(|s| s.0),
-                        Some(Scope::Message | Scope::Oneof)
-                    );
-                    if !in_field_scope {
-                        continue;
-                    }
-                    let Some(name) = field_name(text) else {
-                        continue;
-                    };
-                    file_fields += 1;
-                    let mut path: Vec<&str> = Vec::new();
-                    if !package.is_empty() {
-                        path.push(&package);
-                    }
-                    path.extend(
-                        stack
-                            .iter()
-                            .filter(|(s, _)| *s == Scope::Message)
-                            .map(|(_, n)| n.as_str()),
-                    );
-                    path.push(name);
-                    let fq = path.join(".");
-                    if name_tokens(name).iter().any(|tok| vocab.0.contains(tok)) {
-                        hits.push(Finding {
-                            rule: Rule::Field,
-                            file: file.clone(),
-                            line: *line,
-                            subject: fq,
-                        });
-                    }
-                }
+        // `reserved` counts at any non-root depth (enum scopes included),
+        // structurally exempt: `field_decl` never recognises it.
+        report.reserved_seen += scopes(&tokens)
+            .iter()
+            .filter(|sc| sc.header.is_some())
+            .flat_map(|sc| sc.statements.iter())
+            .filter(|(_, t)| t.starts_with("reserved "))
+            .count();
+        let file_fields = fields(&tokens);
+        for f in &file_fields {
+            if name_tokens(&f.name).iter().any(|tok| vocab.0.contains(tok)) {
+                hits.push(Finding {
+                    rule: Rule::Field,
+                    file: file.clone(),
+                    line: f.line,
+                    subject: if f.message.is_empty() {
+                        f.name.clone()
+                    } else {
+                        format!("{}.{}", f.message, f.name)
+                    },
+                });
             }
         }
+        let file_fields = file_fields.len();
         report.fields_scanned += file_fields;
         if file_fields == 0 {
             report
@@ -679,29 +590,6 @@ mod tests {
                 .count(),
             2
         );
-    }
-
-    #[test]
-    fn field_recogniser_excludes_non_fields() {
-        for s in [
-            "option java_package = \"x\"",
-            "reserved 1, 2",
-            "reserved \"audio\"",
-            "extensions 100 to 199",
-            "syntax = \"proto3\"",
-            "MEDIA_KIND_AUDIO = 1",
-            "rpc Foo(Bar) returns (Baz)",
-        ] {
-            assert_eq!(field_name(s), None, "{s}");
-        }
-        assert_eq!(field_name("optional uint32 a = 13"), Some("a"));
-        assert_eq!(
-            field_name("map<string, Foo> m = 2 [deprecated = true]"),
-            Some("m")
-        );
-        assert_eq!(field_name("google.protobuf.Timestamp t = 3"), Some("t"));
-        assert_eq!(field_name("bool a = 0x2"), Some("a"));
-        assert_eq!(field_name("bool a = 017"), Some("a"));
     }
 
     #[test]
