@@ -22,8 +22,11 @@
 # no local base branch (masked as "No new commits" before).
 #
 # Wired into scripts/layer3.sh. Consumes scripts/lang/_test_helpers.sh.
-set -euo pipefail
+set -Eeuo pipefail
 IFS=$'\n\t'
+# CI shows only a self-test's STDOUT: an abort under set -e must say where, there.
+# (Only under errexit: dl and friends run expected failures inside `set +e`.)
+trap '__rc=$?; [[ $- == *e* ]] && echo "devloop-pr.test.sh: ABORTED at line ${LINENO} (rc=${__rc}): ${BASH_COMMAND}"' ERR
 
 __here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${__here}/../.." && pwd)"
@@ -50,8 +53,11 @@ for f in /usr/bin/* /bin/*; do
   case "$n" in gh|kind|podman|cargo) continue ;; esac
   [[ -e "${SYS}/${n}" ]] || ln -s "$f" "${SYS}/${n}"
 done
+# Required tools not under /usr/bin or /bin (e.g. a runner image that installs jq elsewhere):
+# link the one on PATH. Never a stubbed name. Loud (stdout, which CI shows) if still missing.
 for t in git jq awk bash; do
-  [[ -x "${SYS}/${t}" ]] || { echo "FATAL: ${t} not found in /usr/bin or /bin — cannot run hermetically" >&2; exit 1; }
+  if [[ ! -x "${SYS}/${t}" ]] && p="$(command -v "$t" 2>/dev/null)" && [[ -n "$p" ]]; then ln -s "$p" "${SYS}/${t}"; fi
+  [[ -x "${SYS}/${t}" ]] || { echo "FATAL: ${t} not found (looked in /usr/bin, /bin and PATH) — cannot run hermetically"; exit 1; }
 done
 
 BIN="${WORK}/bin"; NOGH="${WORK}/bin-nogh"; mkdir -p "$BIN" "$NOGH"
