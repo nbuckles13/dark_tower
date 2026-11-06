@@ -942,7 +942,7 @@ tasks:
   slug: 2026-11-06-gate-zero-hostport-policy
   tag: story-2026-10-31-survive-handler-loss-task-I-1
 - id: 2
-  status: pending
+  status: completed
   specialist: infrastructure
   prompt: |-
     Story 4 task I-4 (infrastructure): an exact allow-list construct for the internal-proto key-material guard, landing with an EMPTY list.
@@ -989,6 +989,7 @@ tasks:
     (a) No config keys. (b) No retirements. (c) No metric series. (d) No service test-gates section; the guard's own fixtures are the gate. (e) N/A.
 
     COVERS: code, unit-tests.
+  slug: 2026-11-06-internal-proto-key-allowlist
   tag: story-2026-10-31-survive-handler-loss-task-I-4
 - id: 3
   status: pending
