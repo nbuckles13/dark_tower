@@ -50,6 +50,7 @@ pub mod no_insecure_browser_flags;
 pub mod proto_no_any;
 pub mod proto_per_kind_fields;
 pub mod release_build_profile;
+pub mod resolved_features;
 pub mod rust_log_secrets;
 pub mod rust_pii;
 pub mod rust_secrets;

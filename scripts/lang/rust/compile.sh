@@ -10,6 +10,9 @@
 #      Same build-once-before-guards pattern as dt-guard.
 #   4. `dt-guard service-dep-exclusion` — no sqlx in MC/MH's resolved graph
 #      (it runs `cargo tree`, so it is here rather than in Layer 3).
+#   4b. `cargo fetch` (all platforms) then `dt-guard resolved-features` —
+#      crypto-provider features resolve as `resolved_features/policy.rs` requires
+#      (it runs `cargo metadata`; same reason).
 #   5. ADR-0036 §11 release-build feature gate — a NEGATIVE compile assertion.
 #      Not a build; see the block above its invocation for why it lives here.
 # The tools build with the non-LTO `devtools` profile (Cargo.toml), not the services'
@@ -33,6 +36,19 @@ run_and_emit "cargo-build-dt-story" dt_build_tool dt-story "${CARGO_LOCKED[@]}" 
 # crates/dt-guard/src/service_dep_exclusion.rs.
 __repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 run_and_emit "service-dep-exclusion" "${DT_GUARD:-$DT_GUARD_BIN}" service-dep-exclusion --root "$__repo_root"
+
+# Crypto-provider features as resolved by cargo match
+# crates/dt-guard/src/resolved_features/policy.rs (ADR-0027); machinery and scope:
+# crates/dt-guard/src/resolved_features/mod.rs. INVOKES CARGO (`cargo metadata
+# --offline --locked`: resolution only), so it runs here for the same reason as
+# service-dep-exclusion above.
+# `cargo metadata` without `--filter-platform` needs EVERY platform's package sources;
+# the host-only workspace build above does not download them, so on a cold registry
+# (fresh CI cache, new devloop volume, rust-cache key miss on any Cargo.lock change)
+# `--offline` would fail. Fetch all platforms first, as its own labelled lane: a
+# network failure reds HERE, and the guard stays offline and deterministic.
+run_and_emit "cargo-fetch-all-platforms" cargo fetch "${CARGO_LOCKED[@]}"
+run_and_emit "resolved-features" "${DT_GUARD:-$DT_GUARD_BIN}" resolved-features --root "$__repo_root"
 
 # ADR-0036 §11 release-build feature gate — asserts mh-service's `per-frame-trace`
 # `compile_error!` (crates/mh-service/src/lib.rs) BOTH fires under the release profile with

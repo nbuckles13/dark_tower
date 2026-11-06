@@ -127,3 +127,150 @@ fn every_workspace_fuzz_target_has_a_file_a_bin_and_a_nightly_entry() {
          from the matrix"
     );
 }
+
+/// `(crate, target, seed_cmd)` for every matrix entry that declares a `seed_cmd:`
+/// (the line after `target:`). Non-empty, or the seed checks below would be vacuous.
+fn seed_cmds() -> Vec<(String, String, String)> {
+    let workflow = read(&repo_root().join(".github/workflows/fuzz-nightly.yml"));
+    let lines: Vec<&str> = workflow.lines().map(str::trim).collect();
+    let out: Vec<(String, String, String)> = lines
+        .windows(3)
+        .filter_map(|w| {
+            let krate = w[0].strip_prefix("- crate: ")?;
+            let target = w[1].strip_prefix("target: ")?;
+            let cmd = w[2].strip_prefix("seed_cmd: ")?;
+            Some((krate.to_string(), target.to_string(), cmd.to_string()))
+        })
+        .collect();
+    assert!(
+        !out.is_empty(),
+        "no `seed_cmd:` in fuzz-nightly.yml (expected one after `target:`)"
+    );
+    out
+}
+
+/// The value after `--example` in a seed command, if any.
+fn example_of(cmd: &str) -> Option<&str> {
+    let mut words = cmd.split_whitespace();
+    words.find(|w| *w == "--example")?;
+    words.next()
+}
+
+/// `(crate name, crate dir)` for every directory under `crates/`.
+fn crate_dirs() -> Vec<(String, PathBuf)> {
+    std::fs::read_dir(repo_root().join("crates"))
+        .expect("crates/ is readable")
+        .map(|e| {
+            let dir = e.expect("dir entry").path();
+            let name = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("crate dir name")
+                .to_string();
+            (name, dir)
+        })
+        .collect()
+}
+
+// Seeds are generated at fuzz time, never committed, so a seed generator that a
+// matrix entry should run but does not means that target is silently fuzzed
+// unseeded: the nightly's "Verify seed corpus" step only covers entries that
+// DECLARE a `seed_cmd`. The four tests below close that from each direction.
+
+/// Every `--example X` a `seed_cmd` names exists as `crates/<crate>/fuzz/examples/X.rs`.
+#[test]
+fn every_seed_cmd_example_exists() {
+    for (krate, target, cmd) in &seed_cmds() {
+        if let Some(example) = example_of(cmd) {
+            let file = repo_root().join(format!("crates/{krate}/fuzz/examples/{example}.rs"));
+            assert!(
+                file.is_file(),
+                "{krate}/{target}: seed_cmd names --example {example}, but {} does not exist",
+                file.display()
+            );
+        }
+    }
+}
+
+/// A crate-wide generator (a `seed_cmd` naming no `--example`, e.g. a `--test` that
+/// writes every target's corpus) is declared by EVERY matrix entry of its crate, so
+/// a deleted field or a new target added without one cannot fuzz unseeded.
+#[test]
+fn crate_wide_seed_cmd_is_declared_by_every_entry_of_its_crate() {
+    let seed_cmds = seed_cmds();
+    let matrix = matrix();
+    for (krate, _, cmd) in seed_cmds.iter().filter(|(_, _, c)| example_of(c).is_none()) {
+        for target in matrix.get(krate).into_iter().flatten() {
+            let declared = seed_cmds
+                .iter()
+                .find(|(k, t, _)| k == krate && t == target)
+                .map(|(_, _, c)| c);
+            assert_eq!(
+                declared,
+                Some(cmd),
+                "{krate}/{target}: {krate} has the crate-wide seed_cmd `{cmd}`, so every \
+                 {krate} matrix entry must declare it"
+            );
+        }
+    }
+}
+
+/// Anchor for the crate-wide rule, which passes vacuously if EVERY entry's
+/// `seed_cmd` is deleted: a crate with a `tests/corpus_seeds.rs` generator has at
+/// least one `seed_cmd` running it.
+#[test]
+fn every_corpus_seeds_test_is_run_by_a_seed_cmd() {
+    let seed_cmds = seed_cmds();
+    let mut checked = 0;
+    for (krate, dir) in crate_dirs() {
+        if !dir.join("tests/corpus_seeds.rs").is_file() {
+            continue;
+        }
+        assert!(
+            seed_cmds
+                .iter()
+                .any(|(k, _, c)| *k == krate && c.contains("--test corpus_seeds")),
+            "{krate} has tests/corpus_seeds.rs (a seed generator) but no fuzz-nightly \
+             seed_cmd runs `--test corpus_seeds`"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no crates/*/tests/corpus_seeds.rs found");
+}
+
+/// Every `crates/<crate>/fuzz/examples/*.rs` is the `seed_cmd` (`--example <stem>`)
+/// of exactly one matrix entry of that crate.
+#[test]
+fn every_fuzz_seed_example_is_run_by_exactly_one_nightly_entry() {
+    let seed_cmds = seed_cmds();
+    let mut checked = 0;
+    for (krate, dir) in crate_dirs() {
+        let Ok(examples) = std::fs::read_dir(dir.join("fuzz/examples")) else {
+            continue;
+        };
+        for example in examples {
+            let path = example.expect("dir entry").path();
+            if path.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("example stem")
+                .to_string();
+            let runners: Vec<&String> = seed_cmds
+                .iter()
+                .filter(|(k, _, cmd)| *k == krate && example_of(cmd) == Some(stem.as_str()))
+                .map(|(_, t, _)| t)
+                .collect();
+            assert_eq!(
+                runners.len(),
+                1,
+                "{krate}/fuzz/examples/{stem}.rs must be the seed_cmd (`--example {stem}`) of \
+                 exactly one fuzz-nightly matrix entry; found {runners:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no crates/*/fuzz/examples/*.rs found");
+}

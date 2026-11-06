@@ -19,9 +19,9 @@ See [Platform-Specific Instructions](#platform-specific-installation) for other 
 
 ### Cryptography Performance
 
-Dark Tower uses **ring** for cryptographic operations (TLS, JWT signing, password hashing). The `ring` library includes highly-optimized implementations of cryptographic algorithms written in C and assembly:
+Dark Tower uses **ring** for its direct cryptographic operations and for TLS, and **aws-lc-rs** (inside `jsonwebtoken`) for JWT signing and verification; which backend is approved where is decided in [ADR-0027](decisions/adr-0027-approved-crypto.md). Both include highly-optimized implementations of cryptographic algorithms written in C and assembly:
 
-- **EdDSA (Ed25519)**: Used for JWT signing in Auth Controller
+- **EdDSA (Ed25519)**: JWT signing/verification (aws-lc-rs via `jsonwebtoken`); signing-key generation (ring)
 - **AES-256-GCM**: Used for encrypting signing keys at rest
 - **TLS/QUIC**: Used for WebTransport and HTTPS connections
 
@@ -40,7 +40,7 @@ Dark Tower uses Protocol Buffers for service-to-service communication. The `prot
 
 ### 1. C/C++ Compiler
 
-**Purpose**: Compile native code in dependencies like `ring`, `bcrypt`
+**Purpose**: Compile native code in dependencies like `ring`, `aws-lc-sys`, `bcrypt`
 
 **Minimum Version**:
 - GCC: 7.0+
@@ -49,6 +49,7 @@ Dark Tower uses Protocol Buffers for service-to-service communication. The `prot
 
 **Required By**:
 - `ring` v0.17.14 (primary crypto library)
+- `aws-lc-sys` (AWS-LC, via `aws-lc-rs` inside `jsonwebtoken`)
 - `ring` v0.16.20 (via wtransport dependency)
 - `bcrypt` v0.15.1 (password hashing)
 - Many transitive dependencies (libc, getrandom, parking_lot_core, etc.)
@@ -209,8 +210,20 @@ pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-prot
 **Used by**:
 - `rustls` → TLS for Auth Controller HTTPS
 - `quinn` → QUIC for WebTransport (Meeting/Media Controllers)
-- `jsonwebtoken` → JWT signing (Auth Controller)
 - `webpki` → Certificate verification
+- Auth Controller signing-key generation and encryption at rest
+
+#### aws-lc-rs / aws-lc-sys
+
+**What it does**: JWT EdDSA signing and verification — reached ONLY through `jsonwebtoken`'s `aws_lc_rs` backend (ADR-0027; `dt-guard resolved-features` fails Layer 1 on any other path to it)
+
+**Native code**: AWS-LC (BoringSSL-derived C and assembly)
+
+**Build requirements**:
+- C compiler (gcc/clang/MSVC); on Linux x86_64/aarch64 the crate ships prebuilt bindings, so no CMake, Clang or NASM is needed there
+- Other platforms may additionally need CMake (see the aws-lc-rs platform requirements)
+
+**Used by**: `jsonwebtoken` → JWT signing (Auth Controller) and validation (every service)
 
 #### bcrypt v0.15.1
 
@@ -472,7 +485,7 @@ With native dependencies, expect longer build times on first build:
 
 Native dependencies provide significant runtime performance improvements:
 
-| Operation | Pure Rust | With ring | Speedup |
+| Operation | Pure Rust | With ring / aws-lc | Speedup |
 |-----------|-----------|-----------|---------|
 | EdDSA signature | ~500 μs | ~50 μs | 10x |
 | AES-256-GCM | ~1 ms | ~10 μs | 100x |
@@ -481,7 +494,7 @@ Native dependencies provide significant runtime performance improvements:
 *bcrypt is intentionally slow (password hashing)
 
 **For Dark Tower**:
-- Auth Controller can validate 20,000 JWTs/sec (with ring's EdDSA)
+- Auth Controller can validate 20,000 JWTs/sec (with aws-lc-rs EdDSA via `jsonwebtoken`)
 - WebTransport can handle 10,000+ concurrent connections (with ring's QUIC crypto)
 
 ---

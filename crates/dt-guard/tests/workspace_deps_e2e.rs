@@ -20,7 +20,7 @@ use tempfile::TempDir;
 
 const ROOT: &str = "[workspace]\nmembers = [\"a\", \"b\"]\nexclude = [\"fuzz\"]\n\
                     [workspace.dependencies]\nserde = \"1.0\"\n\
-                    base64 = { version = \"0.23\", default-features = false }\n\
+                    base64 = { version = \"0.23\", default-features = false, features = [\"std\"] }\n\
                     tokio = \"1\"\n";
 
 /// Every SINGLE_VERSION_CRATES entry exactly once (R4's anchor).
@@ -89,7 +89,7 @@ fn assert_fails_with(root: &Path, token: &str) -> String {
 
 const A_CLEAN: &str = "[dependencies]\nserde = { workspace = true, features = [\"derive\"] }\n";
 const FUZZ_CLEAN: &str =
-    "[dependencies]\nbase64 = { version = \"0.23\", default-features = false }\n";
+    "[dependencies]\nbase64 = { version = \"0.23\", default-features = false, features = [\"std\"] }\n";
 
 #[test]
 fn clean_fixture_passes_with_member_count() {
@@ -123,6 +123,20 @@ fn r2_positive_control() {
 fn r3_positive_control_default_features() {
     let dir = fixture(A_CLEAN, "", "[dependencies]\nbase64 = \"0.23\"\n", LOCK_OK);
     assert_fails_with(dir.path(), "excluded-workspace-version-drift");
+}
+
+#[test]
+fn r3_positive_control_features() {
+    // base64 mirrors version + `default-features = false` but drops the root's
+    // `std`: only the features axis can catch it.
+    let dir = fixture(
+        A_CLEAN,
+        "",
+        "[dependencies]\nbase64 = { version = \"0.23\", default-features = false }\n",
+        LOCK_OK,
+    );
+    let out = assert_fails_with(dir.path(), "excluded-workspace-version-drift");
+    assert!(out.contains("is missing features [`std`]"), "{out}");
 }
 
 #[test]

@@ -10,7 +10,7 @@
 //! |---|---|---|
 //! | R1 | `workspace-dep-redeclared` | a member declares a dep that IS in `[workspace.dependencies]` without `workspace = true` |
 //! | R2 | `dep-pinned-in-multiple-members` | a registry dep carries a literal version in ≥2 distinct crates (members and root-`exclude` crates alike) and is NOT in `[workspace.dependencies]` |
-//! | R3 | `excluded-workspace-version-drift` | a crate under root `[workspace] exclude` (an independent workspace, e.g. the fuzz crates) pins a workspace dep at a different requirement, or keeps default features the root disables |
+//! | R3 | `excluded-workspace-version-drift` | a crate under root `[workspace] exclude` (an independent workspace, e.g. the fuzz crates) pins a workspace dep at a different requirement, or its default-features setting differs from the root's (either direction), or it does not enable every feature the root entry enables |
 //! | R6 | `dependabot-cargo-block-names-excluded-crate` | a cargo block in `.github/dependabot.yml` lists a root-`exclude` crate (or a glob) in `directory`/`directories`. Resolution is layout-dependent — dependabot-core cannot resolve `crates/media-protocol/fuzz` (its path dep inherits from a root it never fetches) — and with no tracked lockfile a block could only ever PR a new major |
 //! | R4 | `facade-crate-duplicated` | `Cargo.lock` holds more than one version of a [`SINGLE_VERSION_CRATES`] crate |
 //! | R5 | `member-default-features-ignored` | a member writes `{ workspace = true, default-features = false }` against a workspace entry that keeps default features (cargo ignores the member flag with only a warning, so features silently turn on) |
@@ -164,6 +164,11 @@ pub struct Scope {
 struct WsDep {
     req: Option<String>,
     default_features: Option<bool>,
+    features: BTreeSet<String>,
+    /// The root entry's `features`/`default-features` could not be read. Already
+    /// reported as a precondition; rules comparing against it must not run
+    /// (comparing against an empty set would be a vacuous pass).
+    malformed: bool,
 }
 
 pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
@@ -254,7 +259,7 @@ pub fn evaluate(repo_root: &Path) -> (Vec<Hit>, Scope) {
         return (hits, scope);
     }
 
-    let ws_deps = workspace_dep_table(&workspace);
+    let ws_deps = workspace_dep_table(&workspace, &mut hits);
     scope.workspace_deps = ws_deps.len();
     if ws_deps.is_empty() {
         // Precondition AND keep going: R2 is exactly the rule that matters when
@@ -296,33 +301,65 @@ pub fn evaluate(repo_root: &Path) -> (Vec<Hit>, Scope) {
     (hits, scope)
 }
 
-/// Root `[workspace.dependencies]` reduced to what the rules compare.
-fn workspace_dep_table(workspace: &WorkspaceTable) -> BTreeMap<String, WsDep> {
-    workspace
-        .dependencies
-        .as_ref()
-        .map(|deps| {
-            deps.iter()
-                .map(|(key, value)| {
-                    let (package, spec) = classify_dep(key, value);
-                    let ws = match spec {
-                        DepSpec::Version {
-                            req,
-                            default_features,
-                        } => WsDep {
-                            req: Some(req),
-                            default_features,
-                        },
-                        _ => WsDep {
-                            req: None,
-                            default_features: None,
-                        },
-                    };
-                    (package, ws)
-                })
-                .collect()
+/// Root `[workspace.dependencies]` reduced to what the rules compare. A
+/// malformed entry is a precondition hit (never a vacuous "requires nothing").
+fn workspace_dep_table(workspace: &WorkspaceTable, hits: &mut Vec<Hit>) -> BTreeMap<String, WsDep> {
+    let Some(deps) = workspace.dependencies.as_ref() else {
+        return BTreeMap::new();
+    };
+    deps.iter()
+        .map(|(key, value)| {
+            let (package, spec) = classify_dep(key, value);
+            let ws = match spec {
+                DepSpec::Version {
+                    req,
+                    default_features,
+                    features,
+                } => WsDep {
+                    req: Some(req),
+                    default_features,
+                    features,
+                    malformed: false,
+                },
+                DepSpec::Malformed { detail } => {
+                    hits.push(precondition(
+                        WORKSPACE_MANIFEST_UNREADABLE,
+                        "Cargo.toml",
+                        format!(
+                            "[workspace.dependencies] `{key}`: {detail} — rules comparing \
+                             against this entry could not be evaluated"
+                        ),
+                    ));
+                    WsDep {
+                        req: None,
+                        default_features: None,
+                        features: BTreeSet::new(),
+                        malformed: true,
+                    }
+                }
+                _ => WsDep {
+                    req: None,
+                    default_features: None,
+                    features: BTreeSet::new(),
+                    malformed: false,
+                },
+            };
+            (package, ws)
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+/// A dependency whose `features`/`default-features` could not be read: a
+/// precondition on the declaring manifest, never a pass.
+fn malformed_dep_hit(rel: &str, dep: &DepDecl, detail: &str) -> Hit {
+    precondition(
+        MEMBER_MANIFEST_UNREADABLE,
+        rel,
+        format!(
+            "[{}] `{}`: {detail} — this dependency could not be evaluated",
+            dep.table, dep.key
+        ),
+    )
 }
 
 /// Record a literal-version declaration not covered by the workspace table (R2 input).
@@ -593,6 +630,10 @@ fn check_member_dep(
     ws_deps: &BTreeMap<String, WsDep>,
     hits: &mut Vec<Hit>,
 ) {
+    if let DepSpec::Malformed { detail } = &dep.spec {
+        hits.push(malformed_dep_hit(rel, dep, detail));
+        return;
+    }
     let Some(ws) = ws_deps.get(&dep.package) else {
         return;
     };
@@ -608,6 +649,7 @@ fn check_member_dep(
         }),
         DepSpec::WorkspaceInherit {
             default_features: Some(false),
+            ..
         } if ws.default_features != Some(false) => hits.push(Hit {
             rule_id: MEMBER_DEFAULT_FEATURES_IGNORED,
             file: rel.to_string(),
@@ -623,34 +665,62 @@ fn check_member_dep(
 }
 
 /// R3 for one dependency of an excluded independent workspace.
+///
+/// An excluded crate cannot inherit, so it repeats the root entry; R3 binds the
+/// repeat to the root on three axes:
+///
+/// 1. **Version requirement** — identical.
+/// 2. **Default features** — identical setting. Root off ⇒ excluded off (else
+///    defaults the root deliberately disabled, e.g. base64's `simd-unsafe`, come
+///    back in the fuzz graph). Root on ⇒ excluded on (else the fuzz build drops a
+///    feature the root's code paths rely on).
+/// 3. **Explicit features** — the excluded crate's `features` ⊇ the root's.
+///    Extra features are fine; a missing one is the jsonwebtoken failure mode: a
+///    crypto backend selected only by a feature (`aws_lc_rs`) compiles without
+///    it and panics at the first sign/verify.
+///
+/// Axes 2 and 3 are one check on the "effective" set — `features ∪ {default}`
+/// when defaults are on — required to be a superset, plus the root-off ⇒
+/// excluded-off direction, which a superset cannot express. Only a root entry
+/// that is itself a version spec is compared (a root `path`/`git` entry has no
+/// registry requirement to mirror).
 fn check_excluded_dep(
     rel: &str,
     dep: &DepDecl,
     ws_deps: &BTreeMap<String, WsDep>,
     hits: &mut Vec<Hit>,
 ) {
+    if let DepSpec::Malformed { detail } = &dep.spec {
+        hits.push(malformed_dep_hit(rel, dep, detail));
+        return;
+    }
     let Some(ws) = ws_deps.get(&dep.package) else {
         return;
     };
+    if ws.malformed {
+        return; // reported once, as a root-manifest precondition
+    }
     let DepSpec::Version {
         req,
         default_features,
+        features,
     } = &dep.spec
     else {
         return;
     };
-    if let Some(ws_req) = &ws.req {
-        if ws_req != req {
-            hits.push(Hit {
-                rule_id: EXCLUDED_WORKSPACE_VERSION_DRIFT,
-                file: rel.to_string(),
-                detail: format!(
-                    "[{}] `{}` requires \"{req}\" but root [workspace.dependencies] requires \
-                     \"{ws_req}\" — this crate cannot inherit, so its literal must match",
-                    dep.table, dep.key
-                ),
-            });
-        }
+    let Some(ws_req) = &ws.req else {
+        return;
+    };
+    if ws_req != req {
+        hits.push(Hit {
+            rule_id: EXCLUDED_WORKSPACE_VERSION_DRIFT,
+            file: rel.to_string(),
+            detail: format!(
+                "[{}] `{}` requires \"{req}\" but root [workspace.dependencies] requires \
+                 \"{ws_req}\" — this crate cannot inherit, so its literal must match",
+                dep.table, dep.key
+            ),
+        });
     }
     if ws.default_features == Some(false) && *default_features != Some(false) {
         hits.push(Hit {
@@ -663,6 +733,61 @@ fn check_excluded_dep(
             ),
         });
     }
+    let root_effective = effective_features(ws.default_features, &ws.features);
+    let excluded_effective = effective_features(*default_features, features);
+    let missing: Vec<&str> = root_effective
+        .difference(&excluded_effective)
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let named: Vec<String> = missing
+        .iter()
+        .filter(|f| **f != DEFAULT_PSEUDO_FEATURE)
+        .map(|f| format!("`{f}`"))
+        .collect();
+    if !named.is_empty() {
+        parts.push(format!(
+            "is missing features [{}] that root [workspace.dependencies] enables",
+            named.join(", ")
+        ));
+    }
+    if missing.contains(&DEFAULT_PSEUDO_FEATURE) {
+        parts.push(
+            "sets `default-features = false` but root [workspace.dependencies] keeps default \
+             features"
+                .to_string(),
+        );
+    }
+    hits.push(Hit {
+        rule_id: EXCLUDED_WORKSPACE_VERSION_DRIFT,
+        file: rel.to_string(),
+        detail: format!(
+            "[{}] `{}` {} — this crate cannot inherit, so it must enable them too",
+            dep.table,
+            dep.key,
+            parts.join(" and ")
+        ),
+    });
+}
+
+/// Stands for "default features on" in R3's effective-feature comparison. Not a
+/// legal user feature name to collide with: cargo reserves `default`.
+const DEFAULT_PSEUDO_FEATURE: &str = "default";
+
+/// `features ∪ {"default"}` unless defaults are disabled. Sorted (BTreeSet), so
+/// the missing-feature list in a finding is deterministic.
+fn effective_features(
+    default_features: Option<bool>,
+    features: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut set = features.clone();
+    if default_features != Some(false) {
+        set.insert(DEFAULT_PSEUDO_FEATURE.to_string());
+    }
+    set
 }
 
 /// `Cargo.lock` package name → set of resolved versions.
@@ -893,28 +1018,227 @@ mod tests {
         );
         let a = pkg("a", "");
         let b = pkg("b", "");
-        // Drift: serde requirement differs; base64 keeps default features.
+        // Drift: serde requirement differs; base64 keeps default features the
+        // root disables AND lacks the root's `std` (one hit per axis).
         let fuzz = "[package]\nname = \"f\"\nversion = \"0.0.0\"\n[workspace]\n\
                     [dependencies]\nserde = \"1.0.200\"\nbase64 = \"0.23\"\n";
         let dir = ws(&root, &[("a", &a), ("b", &b), ("fuzz", fuzz)], None);
         root_only_dependabot(&dir);
         let got = rules(&dir);
-        assert_eq!(
-            got,
-            vec![
-                EXCLUDED_WORKSPACE_VERSION_DRIFT,
-                EXCLUDED_WORKSPACE_VERSION_DRIFT
-            ]
+        assert_eq!(got, vec![EXCLUDED_WORKSPACE_VERSION_DRIFT; 3]);
+
+        // FLIPPED (was the "allowed direction" before R3 compared features):
+        // an excluded crate disabling defaults the root KEEPS is drift too — it
+        // can drop a feature the root relies on exactly like a missing explicit
+        // one. Default-features must match the root in both directions.
+        let fuzz_off = "[package]\nname = \"f\"\nversion = \"0.0.0\"\n[workspace]\n\
+                        [dependencies]\nserde = { version = \"1.0\", default-features = false }\n";
+        let dir = ws(&root, &[("a", &a), ("b", &b), ("fuzz", fuzz_off)], None);
+        root_only_dependabot(&dir);
+        let hits = evaluate(dir.path()).0;
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0]
+                .detail
+                .contains("sets `default-features = false` but root"),
+            "{}",
+            hits[0].detail
         );
 
-        // Allowed direction: matching requirement; excluded crate disabling
-        // defaults the root keeps is fine.
+        // Mirroring the root exactly passes.
         let fuzz_ok = "[package]\nname = \"f\"\nversion = \"0.0.0\"\n[workspace]\n\
-                       [dependencies]\nserde = { version = \"1.0\", default-features = false }\n\
-                       base64 = { version = \"0.23\", default-features = false }\n";
+                       [dependencies]\nserde = \"1.0\"\n\
+                       base64 = { version = \"0.23\", default-features = false, features = [\"std\"] }\n";
         let dir = ws(&root, &[("a", &a), ("b", &b), ("fuzz", fuzz_ok)], None);
         root_only_dependabot(&dir);
         assert!(rules(&dir).is_empty());
+    }
+
+    /// R3 features fixture: root pins `jwt` with one backend feature and `multi`
+    /// with two; `fuzz_deps` is the excluded crate's dependency table body.
+    fn r3_features_hits(fuzz_deps: &str) -> Vec<Hit> {
+        let root = "[workspace]\nmembers = [\"a\"]\nexclude = [\"fuzz\"]\n\
+                    [workspace.dependencies]\nplain = \"1\"\n\
+                    jwt = { version = \"11.1\", default-features = false, features = [\"aws_lc_rs\"] }\n\
+                    multi = { version = \"2\", features = [\"zeta\", \"alpha\"] }\n";
+        let a = pkg("a", "");
+        let fuzz =
+            format!("[package]\nname = \"f\"\nversion = \"0.0.0\"\n[workspace]\n{fuzz_deps}");
+        let dir = ws(root, &[("a", &a), ("fuzz", &fuzz)], None);
+        root_only_dependabot(&dir);
+        evaluate(dir.path()).0
+    }
+
+    #[test]
+    fn r3_missing_feature_fires_once_naming_it() {
+        let hits = r3_features_hits(
+            "[dependencies]\njwt = { version = \"11.1\", default-features = false }\n",
+        );
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].rule_id, EXCLUDED_WORKSPACE_VERSION_DRIFT);
+        assert!(
+            hits[0].detail.contains("is missing features [`aws_lc_rs`]"),
+            "{}",
+            hits[0].detail
+        );
+    }
+
+    #[test]
+    fn r3_different_backend_feature_fires() {
+        // rust_crypto in place of aws_lc_rs: the root's feature is still missing.
+        let hits = r3_features_hits(
+            "[dependencies]\njwt = { version = \"11.1\", default-features = false, \
+             features = [\"rust_crypto\"] }\n",
+        );
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0].detail.contains("[`aws_lc_rs`]"),
+            "{}",
+            hits[0].detail
+        );
+    }
+
+    #[test]
+    fn r3_two_missing_features_are_one_hit_sorted() {
+        let hits = r3_features_hits("[dependencies]\nmulti = \"2\"\n");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0]
+                .detail
+                .contains("is missing features [`alpha`, `zeta`]"),
+            "{}",
+            hits[0].detail
+        );
+    }
+
+    #[test]
+    fn r3_exact_and_superset_features_pass() {
+        assert!(r3_features_hits(
+            "[dependencies]\njwt = { version = \"11.1\", default-features = false, \
+             features = [\"aws_lc_rs\"] }\nmulti = { version = \"2\", features = [\"alpha\", \"zeta\"] }\n"
+        )
+        .is_empty());
+        assert!(r3_features_hits(
+            "[dependencies]\njwt = { version = \"11.1\", default-features = false, \
+             features = [\"aws_lc_rs\", \"extra\"] }\nmulti = { version = \"2\", \
+             features = [\"alpha\", \"zeta\", \"more\"] }\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn r3_root_string_form_passes_against_anything_with_defaults() {
+        // A string-form root entry requires only "defaults on"; extra features
+        // on the excluded side are fine.
+        assert!(r3_features_hits(
+            "[dependencies]\nplain = { version = \"1\", features = [\"x\", \"y\"] }\n"
+        )
+        .is_empty());
+        assert!(r3_features_hits("[dependencies]\nplain = \"1\"\n").is_empty());
+    }
+
+    #[test]
+    fn r3_rename_and_target_tables_are_still_matched() {
+        let hits = r3_features_hits(
+            "[dependencies]\nrenamed = { package = \"jwt\", version = \"11.1\", \
+             default-features = false }\n\
+             [target.'cfg(unix)'.dependencies]\nmulti = { version = \"2\", features = [\"alpha\"] }\n",
+        );
+        let details: Vec<&str> = hits.iter().map(|h| h.detail.as_str()).collect();
+        assert_eq!(hits.len(), 2, "{details:?}");
+        assert!(details
+            .iter()
+            .any(|d| d.contains("`renamed`") && d.contains("[`aws_lc_rs`]")));
+        assert!(details
+            .iter()
+            .any(|d| d.contains("target.cfg(unix).dependencies") && d.contains("[`zeta`]")));
+    }
+
+    #[test]
+    fn r3_malformed_features_are_a_precondition_on_either_side() {
+        // Excluded side.
+        let hits = r3_features_hits(
+            "[dependencies]\njwt = { version = \"11.1\", default-features = false, \
+             features = \"aws_lc_rs\" }\n",
+        );
+        assert_eq!(
+            hits.iter().map(|h| h.rule_id).collect::<Vec<_>>(),
+            vec![MEMBER_MANIFEST_UNREADABLE],
+            "{hits:?}"
+        );
+        // Root side: the entry is reported, and R3 does not run against it (an
+        // empty "required" set would be a vacuous pass).
+        let root = "[workspace]\nmembers = [\"a\"]\nexclude = [\"fuzz\"]\n\
+                    [workspace.dependencies]\njwt = { version = \"11.1\", features = [1] }\n";
+        let a = pkg("a", "");
+        let fuzz = "[package]\nname = \"f\"\nversion = \"0.0.0\"\n[workspace]\n\
+                    [dependencies]\njwt = \"11.1\"\n";
+        let dir = ws(root, &[("a", &a), ("fuzz", fuzz)], None);
+        root_only_dependabot(&dir);
+        assert_eq!(rules(&dir), vec![WORKSPACE_MANIFEST_UNREADABLE]);
+        // Member side.
+        let a = pkg(
+            "a",
+            "[dependencies]\nserde = { workspace = true, features = \"derive\" }\n",
+        );
+        let b = pkg("b", "");
+        assert_eq!(
+            rules(&ws(ROOT, &[("a", &a), ("b", &b)], None)),
+            vec![MEMBER_MANIFEST_UNREADABLE]
+        );
+    }
+
+    /// REAL-TREE positive control, bound to the actual files at compile time:
+    /// the shipped ac-service fuzz manifest passes R3 against the shipped root,
+    /// and the same manifest with `aws_lc_rs` deleted fires exactly one R3 hit
+    /// naming it. The fuzz crate is never compiled by the pipeline, so this
+    /// guard is the only per-PR gate on its jsonwebtoken backend.
+    #[test]
+    fn r3_real_fuzz_manifest_passes_and_fires_without_aws_lc_rs() {
+        const ROOT_SRC: &str = include_str!("../../../Cargo.toml");
+        const FUZZ_SRC: &str = include_str!("../../ac-service/fuzz/Cargo.toml");
+        const FUZZ_REL: &str = "crates/ac-service/fuzz/Cargo.toml";
+        let root: crate::common::cargo_manifest::RootManifest<toml::Value> =
+            toml::from_str(ROOT_SRC).unwrap();
+        let workspace = root.workspace.unwrap();
+        assert!(
+            workspace
+                .exclude
+                .iter()
+                .any(|e| e == "crates/ac-service/fuzz"),
+            "the real root no longer excludes the ac-service fuzz crate; rebind this control"
+        );
+        let mut setup_hits = Vec::new();
+        let ws_deps = workspace_dep_table(&workspace, &mut setup_hits);
+        assert!(setup_hits.is_empty(), "{setup_hits:?}");
+        let r3 = |src: &str| {
+            let mut hits = Vec::new();
+            for dep in member_dependencies(src).unwrap() {
+                check_excluded_dep(FUZZ_REL, &dep, &ws_deps, &mut hits);
+            }
+            hits
+        };
+
+        let clean = r3(FUZZ_SRC);
+        assert!(
+            clean.is_empty(),
+            "real fuzz manifest drifts from root: {clean:?}"
+        );
+
+        assert!(
+            FUZZ_SRC.contains("\"aws_lc_rs\""),
+            "the real fuzz manifest no longer names aws_lc_rs; rebind this control"
+        );
+        let adverse = r3(&FUZZ_SRC.replace("\"aws_lc_rs\"", ""));
+        assert_eq!(adverse.len(), 1, "{adverse:?}");
+        assert_eq!(adverse[0].rule_id, EXCLUDED_WORKSPACE_VERSION_DRIFT);
+        assert!(
+            adverse[0]
+                .detail
+                .contains("`jsonwebtoken` is missing features [`aws_lc_rs`]"),
+            "{}",
+            adverse[0].detail
+        );
     }
 
     #[test]

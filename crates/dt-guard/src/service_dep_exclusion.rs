@@ -44,12 +44,12 @@
 //! database (it encodes `common`'s `db` boundary), with the owning service
 //! specialist for any entry added for another reason.
 
+use crate::common::cargo_invoke::run_cargo;
 use crate::common::explain::{print_finding, Finding};
 use crate::common::status::{emit_ok, emit_scope};
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::Command;
 
 /// One service and the crates that must never appear in its resolved graph.
 #[derive(Debug, Clone, Copy)]
@@ -245,9 +245,7 @@ fn cargo_tree(
     service: &str,
     mode: FeatureMode,
 ) -> std::result::Result<String, String> {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut cmd = Command::new(cargo);
-    cmd.current_dir(repo_root).args([
+    let mut args = vec![
         "tree",
         "--locked",
         "-p",
@@ -260,17 +258,11 @@ fn cargo_tree(
         "none",
         "--format",
         "{p}",
-    ]);
+    ];
     if mode == FeatureMode::All {
-        cmd.arg("--all-features");
+        args.push("--all-features");
     }
-    let output = cmd.output().map_err(|e| format!("spawning cargo: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let head: Vec<&str> = stderr.lines().take(5).collect();
-        return Err(format!("exit {}: {}", output.status, head.join(" | ")));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    run_cargo(repo_root, &args)
 }
 
 #[cfg(test)]
