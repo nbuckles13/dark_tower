@@ -1054,7 +1054,7 @@ tasks:
   slug: 2026-11-06-sec-a-media-dial-lens
   tag: story-2026-10-31-survive-handler-loss-task-SEC-A
 - id: 4
-  status: pending
+  status: completed
   specialist: test
   prompt: |-
     T-0: Env-test MH discovery by label
@@ -1090,6 +1090,7 @@ tasks:
 
     PAIRING AND DEPENDENCIES
     Dependencies: none. I-2 (infrastructure) depends on this task. Pair with infrastructure (layer7.sh lane semantics and the port-map constraint). Tier: full (Layer 7 lane change plus a shared env-test fixture seam).
+  slug: 2026-11-06-env-test-mh-discovery-by-label
   tag: story-2026-10-31-survive-handler-loss-task-T-0
 - id: 5
   status: pending
