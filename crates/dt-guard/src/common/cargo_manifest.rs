@@ -14,7 +14,7 @@
 //! window.
 
 use serde::de::DeserializeOwned;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
@@ -89,11 +89,17 @@ pub fn members_contain_glob(members: &[String]) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DepSpec {
     /// `{ workspace = true, ... }` — inherits from `[workspace.dependencies]`.
-    WorkspaceInherit { default_features: Option<bool> },
+    /// `features` are the member's ADDITIONS (cargo unions them with the
+    /// workspace entry's).
+    WorkspaceInherit {
+        default_features: Option<bool>,
+        features: BTreeSet<String>,
+    },
     /// A registry dependency carrying its own version requirement.
     Version {
         req: String,
         default_features: Option<bool>,
+        features: BTreeSet<String>,
     },
     /// `{ path = ... }` (with or without a version).
     Path,
@@ -102,6 +108,42 @@ pub enum DepSpec {
     /// A table with none of the above (e.g. only `optional`/`features`) —
     /// not a version pin, not inheritance.
     Other,
+    /// A `features` that is not an array of strings, or a `default-features`
+    /// that is not a bool. Cargo rejects both, but the excluded fuzz manifests
+    /// are never compiled by the pipeline, so on that side this reader is the
+    /// only one: reading the value as "no features" / "unset" would make a
+    /// features-superset rule FAIL-OPEN. Consumers MUST treat this as a
+    /// precondition, never as a pass and never as [`DepSpec::Other`].
+    Malformed { detail: String },
+}
+
+/// The `default-features` (either spelling) and `features` keys of a dependency
+/// table, read FAIL-CLOSED: a present-but-wrong-shaped value is an error, never
+/// a silent `None` / empty set.
+fn feature_keys(t: &toml::Table) -> Result<(Option<bool>, BTreeSet<String>), String> {
+    let default_features = match t
+        .get("default-features")
+        .or_else(|| t.get("default_features"))
+    {
+        None => None,
+        Some(v) => Some(
+            v.as_bool()
+                .ok_or_else(|| format!("`default-features` is not a bool ({v})"))?,
+        ),
+    };
+    let features = match t.get("features") {
+        None => BTreeSet::new(),
+        Some(toml::Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("`features` holds a non-string element ({item})"))
+            })
+            .collect::<Result<_, _>>()?,
+        Some(v) => return Err(format!("`features` is not an array ({v})")),
+    };
+    Ok((default_features, features))
 }
 
 /// One dependency declaration in a crate manifest.
@@ -127,6 +169,7 @@ pub fn classify_dep(key: &str, value: &toml::Value) -> (String, DepSpec) {
             DepSpec::Version {
                 req: req.clone(),
                 default_features: None,
+                features: BTreeSet::new(),
             },
         ),
         toml::Value::Table(t) => {
@@ -135,13 +178,16 @@ pub fn classify_dep(key: &str, value: &toml::Value) -> (String, DepSpec) {
                 .and_then(toml::Value::as_str)
                 .unwrap_or(key)
                 .to_string();
-            // Cargo accepts both spellings.
-            let default_features = t
-                .get("default-features")
-                .or_else(|| t.get("default_features"))
-                .and_then(toml::Value::as_bool);
+            // Cargo accepts both `default-features` spellings.
+            let (default_features, features) = match feature_keys(t) {
+                Ok(keys) => keys,
+                Err(detail) => return (package, DepSpec::Malformed { detail }),
+            };
             let spec = if t.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
-                DepSpec::WorkspaceInherit { default_features }
+                DepSpec::WorkspaceInherit {
+                    default_features,
+                    features,
+                }
             } else if t.contains_key("path") {
                 DepSpec::Path
             } else if t.contains_key("git") {
@@ -150,6 +196,7 @@ pub fn classify_dep(key: &str, value: &toml::Value) -> (String, DepSpec) {
                 DepSpec::Version {
                     req: req.to_string(),
                     default_features,
+                    features,
                 }
             } else {
                 DepSpec::Other
@@ -212,17 +259,20 @@ h = { optional = true }
 "#;
         let deps = member_dependencies(src).unwrap();
         let by_key = |k: &str| deps.iter().find(|d| d.key == k).unwrap().clone();
+        let set = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<BTreeSet<_>>();
         assert_eq!(
             by_key("a").spec,
             DepSpec::Version {
                 req: "1.0".into(),
-                default_features: None
+                default_features: None,
+                features: set(&[]),
             }
         );
         assert_eq!(
             by_key("b").spec,
             DepSpec::WorkspaceInherit {
-                default_features: None
+                default_features: None,
+                features: set(&["x"]),
             }
         );
         assert_eq!(by_key("c").spec, DepSpec::Path);
@@ -231,17 +281,71 @@ h = { optional = true }
             by_key("e").spec,
             DepSpec::Version {
                 req: "2".into(),
-                default_features: Some(false)
+                default_features: Some(false),
+                features: set(&[]),
             }
         );
         assert_eq!(by_key("f").package, "real-f");
         assert_eq!(
             by_key("g").spec,
             DepSpec::WorkspaceInherit {
-                default_features: Some(false)
+                default_features: Some(false),
+                features: set(&[]),
             }
         );
         assert_eq!(by_key("h").spec, DepSpec::Other);
+    }
+
+    #[test]
+    fn features_are_read_as_a_sorted_set() {
+        let deps = member_dependencies(
+            "[dependencies]\na = { version = \"1\", features = [\"z\", \"a\", \"z\"] }\n",
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &deps[0].spec,
+                DepSpec::Version { features, .. }
+                    if features.iter().map(String::as_str).eq(["a", "z"])
+            ),
+            "{:?}",
+            deps[0].spec
+        );
+    }
+
+    #[test]
+    fn malformed_feature_keys_fail_closed() {
+        // Every wrong shape is Malformed, never an empty set / unset flag
+        // (which a superset rule would read as "requires nothing" = pass).
+        for (body, needle) in [
+            (
+                "a = { version = \"1\", features = \"std\" }",
+                "not an array",
+            ),
+            (
+                "a = { version = \"1\", features = [\"std\", 1] }",
+                "non-string element",
+            ),
+            (
+                "a = { workspace = true, features = { x = 1 } }",
+                "not an array",
+            ),
+            (
+                "a = { version = \"1\", default-features = \"no\" }",
+                "not a bool",
+            ),
+            (
+                "a = { version = \"1\", default_features = 0 }",
+                "not a bool",
+            ),
+        ] {
+            let deps = member_dependencies(&format!("[dependencies]\n{body}\n")).unwrap();
+            assert!(
+                matches!(&deps[0].spec, DepSpec::Malformed { detail } if detail.contains(needle)),
+                "{body}: expected Malformed naming `{needle}`, got {:?}",
+                deps[0].spec
+            );
+        }
     }
 
     #[test]

@@ -36,6 +36,7 @@ use dt_guard::no_insecure_browser_flags;
 use dt_guard::proto_no_any;
 use dt_guard::proto_per_kind_fields;
 use dt_guard::release_build_profile;
+use dt_guard::resolved_features;
 use dt_guard::rust_log_secrets;
 use dt_guard::rust_pii;
 use dt_guard::rust_secrets;
@@ -191,6 +192,18 @@ enum Command {
     /// that service's per-package resolved dependency graph. Invokes `cargo tree`,
     /// so it is wired in Layer 1 (`scripts/lang/rust/compile.sh`), not Layer 3.
     ServiceDepExclusion {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+    },
+    /// Crypto-provider features as resolved by cargo match
+    /// `resolved_features/policy.rs` (ADR-0027).
+    /// Invokes `cargo metadata`, so it is wired in Layer 1
+    /// (`scripts/lang/rust/compile.sh`), not Layer 3.
+    ResolvedFeatures {
         /// Repository root for path resolution.
         #[arg(long)]
         root: PathBuf,
@@ -547,6 +560,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::ServiceDepExclusion { root, explain } => {
             service_dep_exclusion::run(&root, explain)
         }
+        Command::ResolvedFeatures { root, explain } => resolved_features::run(&root, explain),
         Command::WorkspaceDeps { root, explain } => workspace_deps::run(&root, explain),
         Command::MediaTelemetryDeny { root, explain } => media_telemetry_deny::run(&root, explain),
         Command::MetricLabels { root, explain } => metric_labels::run(&root, explain),

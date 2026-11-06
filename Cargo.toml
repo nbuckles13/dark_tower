@@ -69,8 +69,12 @@ axum = "0.8"
 # surface (a module, layer or re-export) that gates no dependency and changes no
 # existing code path, so a service that does not call it is unaffected.
 # Deliberately NOT unified this way: `common`'s `db` feature (would put sqlx into
-# MC/MH — dt-guard `service-dep-graph` fails if it does) and any TLS/crypto
-# provider selection (ring vs aws-lc-rs), which can change runtime behaviour.
+# MC/MH — dt-guard `service-dep-graph` fails if it does).
+# Crypto-provider selection (ring vs aws-lc-rs) is the opposite case: it IS pinned
+# once, at workspace level, because each provider-selecting crate needs exactly one
+# provider across the whole build — jsonwebtoken's backend sits on its entry below,
+# and rustls stays ring-only because metrics-exporter-prometheus's defaults are off.
+# dt-guard `resolved-features` enforces the resolved result. Rationale: ADR-0027.
 #
 # `util` is already on in every service via tonic/axum; declaring it keeps the
 # `tower::ServiceExt` the ac/gc tests use from depending on that.
@@ -168,8 +172,14 @@ bcrypt = "0.15"
 secrecy = { version = "0.10", features = ["serde"] }
 hex = "0.4"
 
-# JWT
-jsonwebtoken = "11.1"
+# JWT. Exactly one crypto backend feature: with zero or with both of `aws_lc_rs` /
+# `rust_crypto`, every sign/verify panics at runtime (it still compiles).
+# `rust_crypto` is not enabled. `use_pem` (the only default) is dropped: every key
+# loads via `from_ed_der`. Members inherit with a bare `{ workspace = true }` (no
+# member-level `features`); the excluded `crates/ac-service/fuzz` workspace repeats
+# this entry and dt-guard workspace-deps R3 binds it (version, defaults, features).
+# dt-guard `resolved-features` checks the resolved backend. Rationale: ADR-0027.
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs"] }
 # `default-features = false` drops the `simd-unsafe` default (0.23+), the crate's
 # only `unsafe` code: we use only the scalar `general_purpose` engines. Every
 # member inherits this entry (no member-level literal, which would re-enable
@@ -181,7 +191,11 @@ base64 = { version = "0.23", default-features = false, features = ["std"] }
 # Metrics. `metrics` is the process-global recorder facade; it and the exporter
 # move together (dt-guard workspace-deps R4 fails on a second `metrics` in the lock).
 metrics = "0.24"
-metrics-exporter-prometheus = "0.18"
+# Defaults off, no features: we install with `install_recorder`/`build_recorder`
+# and serve /metrics from our own axum routes, so neither `http-listener` nor
+# `push-gateway` is used — and `push-gateway` enables hyper-rustls `aws-lc-rs`,
+# giving rustls a second crypto provider next to ring (ADR-0027: TLS uses ring).
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # HTTP client. Every consumer uses rustls with defaults off.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -189,7 +203,7 @@ http-body-util = "0.1"
 # `common` depends on this for feature unification only (see its manifest).
 futures = "0.3.31"
 # FEATURE UNIFICATION ONLY, consumed by `common` — no code uses it. ring (via
-# rustls/jsonwebtoken/quinn) depends on getrandom 0.2; AC, GC and MC also get its
+# rustls/quinn) depends on getrandom 0.2; AC, GC and MC also get its
 # `std` feature from another dependent (bcrypt in AC, `rand` 0.8 via redis in GC/MC),
 # MH alone did not, so in MH
 # ring, rustls, quinn-proto, reqwest and everything above them compiled a second

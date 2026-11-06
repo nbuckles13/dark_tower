@@ -11,4 +11,9 @@
 !proto/
 !migrations/
 **/target/
+# Root-`exclude` fuzz workspaces: no image builds or reads them, and locally they hold
+# untracked, generated content the build context would otherwise ship and that
+# validate-docker-context scans: the generated EdDSA JWT seed (fuzz/corpus/jwt_validation/),
+# libFuzzer corpora and crash artifacts.
+**/fuzz/
 **/node_modules/

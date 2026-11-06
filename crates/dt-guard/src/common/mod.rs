@@ -5,6 +5,7 @@
 
 pub mod alert_rule_files;
 pub mod cargo_cli;
+pub mod cargo_invoke;
 pub mod cargo_manifest;
 pub mod duration;
 pub mod explain;

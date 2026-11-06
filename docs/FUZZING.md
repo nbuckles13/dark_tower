@@ -248,6 +248,29 @@ Two properties make this the preferred shape, and both are worth copying:
   lint-clean and never executed a single decode. If you write a corpus
   generator, put it where the pipeline runs it.
 
+For `ac-service`'s `jwt_validation` the generator is
+`crates/ac-service/fuzz/examples/gen_jwt_seed.rs` (its header is the canonical
+description). It writes one EdDSA token that verifies against the target's
+fixed key into `crates/ac-service/fuzz/corpus/jwt_validation/valid_eddsa`
+(anchored on the fuzz crate, whatever the cwd), reads it back, and exits
+non-zero unless it decodes `Ok` with the target's exact key and `Validation`.
+The token is a really-signed JWT, so it is generated, never committed. From
+`crates/ac-service`:
+
+```bash
+cargo +nightly run --manifest-path fuzz/Cargo.toml --example gen_jwt_seed
+cargo +nightly fuzz run jwt_validation
+```
+
+This one lives in `examples/` despite the warning above, because its
+assertions do execute: fuzz-nightly runs it before every `jwt_validation` run.
+
+**fuzz-nightly wiring.** A matrix entry's optional `seed_cmd` (placed after
+`target:`) is run from `crates/<crate>` before fuzzing. A target that declares
+one fails the job if generation fails or `fuzz/corpus/<target>` is still empty,
+so it is never fuzzed unseeded. `crates/media-protocol/tests/fuzz_wiring.rs`
+requires every `fuzz/examples/*.rs` to be named by exactly one `seed_cmd`.
+
 For other crates, add valid inputs from existing tests:
 
 ```bash

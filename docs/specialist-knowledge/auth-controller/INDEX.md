@@ -8,6 +8,7 @@
 - Integration test infrastructure -> ADR-0009
 - User auth & meeting access claims -> ADR-0020
 - Observability framework -> ADR-0011
+- Approved crypto + jsonwebtoken backend (`aws_lc_rs` only; rustls on ring) -> ADR-0027; enforced by `crates/dt-guard/src/resolved_features/policy.rs` (policy content co-owned with security)
 - Metric testability (AC backfill is Cat C test-only; no accept-loop-style work) -> ADR-0032
 
 ## Code Locations
