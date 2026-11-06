@@ -5,6 +5,7 @@ pub mod auth_client;
 pub mod collector;
 pub mod deployment_config;
 pub mod egress_admission;
+pub mod gate_zero;
 pub mod gc_client;
 pub mod injection;
 pub mod kube;

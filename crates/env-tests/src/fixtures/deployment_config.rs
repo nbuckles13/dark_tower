@@ -367,7 +367,8 @@ pub fn quantity_to_bytes(q: &str) -> Result<u64, String> {
 }
 
 /// The newest live pod matching `instance=<instance>`, from
-/// [`crate::fixtures::kube::live_pods_json`] (the one pod-list call).
+/// [`crate::fixtures::kube::live_pods_json`] (the per-instance pod-list
+/// wrapper over `kube::kubectl_get_json`).
 ///
 /// Never skips: an empty pod set or an all-terminating one is a hard failure
 /// with its own message. Terminating pods are ignored, and of the rest the
