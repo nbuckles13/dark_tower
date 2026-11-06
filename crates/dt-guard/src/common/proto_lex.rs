@@ -9,6 +9,14 @@
 //! from bash 2026-10-26, retiring the bash copies of this strip/normaliser).
 //! File discovery is `common::proto_files`.
 //!
+//! Two shared kernels sit on the tokens: [`scopes()`], the ONE scope walker,
+//! and [`fields()`] (with its per-statement recogniser [`field_decl()`]), the
+//! ONE field reader -- package-prefixed, oneof-transparent message paths plus
+//! the declared label, type, name and options. Its consumers are
+//! `proto_per_kind_fields` (field-name policy) and
+//! `internal_proto_no_key_material` (the check-1 key allow-list); a new proto
+//! guard that needs fields uses it, never a private package/message stack.
+//!
 //! # Deltas from the retired bash normaliser (stated so nobody "restores
 //! # parity" by loosening)
 //!
@@ -168,10 +176,7 @@ pub fn scopes(tokens: &[Token]) -> Vec<Scope> {
 /// (prefixes, the zero value) is the caller's.
 #[must_use]
 pub fn enum_values(scopes: &[Scope], enum_name: &str) -> Vec<(usize, String)> {
-    let header = format!("enum {enum_name}");
-    scopes
-        .iter()
-        .filter(|s| s.nesting == 0 && s.header.as_deref() == Some(header.as_str()))
+    top_level(scopes, "enum", enum_name)
         .flat_map(|s| s.statements.iter())
         .filter_map(|(line, text)| {
             let (name, _) = text.split_once('=')?;
@@ -179,6 +184,210 @@ pub fn enum_values(scopes: &[Scope], enum_name: &str) -> Vec<(usize, String)> {
             (!name.is_empty()).then(|| (*line, name.to_string()))
         })
         .collect()
+}
+
+/// One field declaration as [`field_decl`] recognises it, borrowed from the
+/// statement text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldDecl<'a> {
+    /// `optional`, `repeated` or `required`, if present.
+    pub label: Option<&'a str>,
+    /// The declared type with the label stripped (`bytes`, `map<K, V>`,
+    /// `google.protobuf.BytesValue`, ...).
+    pub ty: &'a str,
+    /// The field name.
+    pub name: &'a str,
+    /// A `[...]` options suffix follows the field number.
+    pub has_options: bool,
+}
+
+/// The field declaration in a normalised statement inside a message or oneof,
+/// if it is one. Excludes `option`, `reserved`, `extensions`, `syntax`,
+/// `package`, `import`, `extend` and everything that is not
+/// `[label] <type|map<K,V>> <name> = <number> [options]`. The field number is
+/// a proto intLit: decimal, `0x` hex or octal (first char a digit, the rest
+/// alphanumeric -- infra F2: hex numbers must not slip past).
+#[must_use]
+pub fn field_decl(statement: &str) -> Option<FieldDecl<'_>> {
+    let first = statement.split(' ').next().unwrap_or("");
+    if matches!(
+        first,
+        "option" | "reserved" | "extensions" | "syntax" | "package" | "import" | "extend"
+    ) {
+        return None;
+    }
+    let (lhs, rhs) = statement.split_once('=')?;
+    let rhs = rhs.trim();
+    let number = rhs.split([' ', '[']).next()?;
+    if !number.chars().next().is_some_and(|c| c.is_ascii_digit())
+        || !number.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let has_options = !rhs.get(number.len()..).unwrap_or("").trim().is_empty();
+    let lhs = lhs.trim();
+    let name = lhs.rsplit(' ').next()?;
+    let ty = lhs.strip_suffix(name).unwrap_or("").trim();
+    let (label, ty) = ["optional", "repeated", "required"]
+        .into_iter()
+        .find_map(|l| {
+            ty.strip_prefix(l)
+                .and_then(|rest| rest.strip_prefix(' '))
+                .map(|rest| (Some(l), rest))
+        })
+        .unwrap_or((None, ty));
+    let valid_ident = |s: &str| {
+        s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let valid_type = ty.starts_with("map<") && ty.ends_with('>')
+        || (!ty.is_empty()
+            && ty
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.'));
+    (valid_ident(name) && valid_type).then_some(FieldDecl {
+        label,
+        ty,
+        name,
+        has_options,
+    })
+}
+
+/// One field declaration of a lexed file, located.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Field {
+    /// Index into [`scopes()`] (of the same tokens) of the field's IMMEDIATE
+    /// scope.
+    pub scope: usize,
+    /// Index of this statement within `scopes()[scope].statements`.
+    /// `(scope, statement)` is the statement's IDENTITY: unique by
+    /// construction, whatever the text or line (two identical declarations on
+    /// one line never share it).
+    pub statement: usize,
+    /// 1-based line, copied verbatim from the lexer's `Token::Statement`.
+    pub line: usize,
+    /// The normalised statement, copied verbatim from the lexer's
+    /// `Token::Statement` (never rebuilt from the parts below), so a caller
+    /// keying on `(line, text)` agrees with [`scopes()`] by construction.
+    pub text: String,
+    /// The enclosing message path: the last top-level `package` seen so far
+    /// (omitted when none), then every enclosing `message` name outermost
+    /// first. A oneof is TRANSPARENT here (its members belong to the message).
+    pub message: String,
+    /// The enclosing oneof's name, when the field is a oneof member.
+    pub oneof: Option<String>,
+    /// The immediate enclosing scope is a `message` AND every enclosing
+    /// scope is a `message` (no oneof or other declaration on the path).
+    pub direct_in_message: bool,
+    /// See [`FieldDecl::label`].
+    pub label: Option<String>,
+    /// See [`FieldDecl::ty`].
+    pub ty: String,
+    /// See [`FieldDecl::name`].
+    pub name: String,
+    /// See [`FieldDecl::has_options`].
+    pub has_options: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldScope {
+    Message,
+    Oneof,
+    Other,
+}
+
+/// Every field declaration in `tokens`, in source order: a statement whose
+/// IMMEDIATE scope is a `message` or a `oneof` and which [`field_decl`]
+/// recognises. Statements in any other scope (`enum`, `service`, `rpc`,
+/// `extend`, ...) are never fields. Policy-free: what a field may be named or
+/// typed is the caller's.
+#[must_use]
+pub fn fields(tokens: &[Token]) -> Vec<Field> {
+    let mut out = Vec::new();
+    let mut package = String::new();
+    let mut stack: Vec<(FieldScope, String, usize)> = Vec::new();
+    // Same numbering as `scopes()`: the root is 0, each `{` the next index.
+    let mut opened = 0usize;
+    // Statements seen so far per scope index, same counting as `scopes()`.
+    let mut per_scope: Vec<usize> = vec![0];
+    for t in tokens {
+        match t {
+            Token::Open { header, .. } => {
+                opened += 1;
+                per_scope.push(0);
+                let mut words = header.split(' ');
+                let (kind, name) = match (words.next(), words.next()) {
+                    (Some("message"), Some(name)) => (FieldScope::Message, name.to_string()),
+                    (Some("oneof"), Some(name)) => (FieldScope::Oneof, name.to_string()),
+                    _ => (FieldScope::Other, String::new()),
+                };
+                stack.push((kind, name, opened));
+            }
+            Token::Close { .. } => {
+                stack.pop();
+            }
+            Token::Statement { line, text } => {
+                let at = stack.last().map_or(0, |(_, _, idx)| *idx);
+                let ordinal = per_scope.get(at).copied().unwrap_or(0);
+                if let Some(n) = per_scope.get_mut(at) {
+                    *n += 1;
+                }
+                let Some((immediate, scope_name, scope)) = stack.last() else {
+                    if let Some(p) = text.strip_prefix("package ") {
+                        package = p.trim().to_string();
+                    }
+                    continue;
+                };
+                if *immediate == FieldScope::Other {
+                    continue;
+                }
+                let Some(decl) = field_decl(text) else {
+                    continue;
+                };
+                let mut path: Vec<&str> = Vec::new();
+                if !package.is_empty() {
+                    path.push(&package);
+                }
+                path.extend(
+                    stack
+                        .iter()
+                        .filter(|(k, _, _)| *k == FieldScope::Message)
+                        .map(|(_, n, _)| n.as_str()),
+                );
+                out.push(Field {
+                    scope: *scope,
+                    statement: ordinal,
+                    line: *line,
+                    text: text.clone(),
+                    message: path.join("."),
+                    oneof: (*immediate == FieldScope::Oneof).then(|| scope_name.clone()),
+                    direct_in_message: stack.iter().all(|(k, _, _)| *k == FieldScope::Message),
+                    label: decl.label.map(str::to_string),
+                    ty: decl.ty.to_string(),
+                    name: decl.name.to_string(),
+                    has_options: decl.has_options,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Every TOP-LEVEL declaration `<kw> <name>` (a depth-0 scope with exactly
+/// that header; the root, whose `nesting` is also 0, has no header and never
+/// matches; a same-named NESTED declaration is a different type and is never
+/// returned), in source order. The ONE home of that lookup (@dry-reviewer).
+pub fn top_level<'a>(
+    scopes: &'a [Scope],
+    kw: &str,
+    name: &str,
+) -> impl Iterator<Item = &'a Scope> + 'a {
+    let header = format!("{kw} {name}");
+    scopes
+        .iter()
+        .filter(move |s| s.nesting == 0 && s.header.as_deref() == Some(header.as_str()))
 }
 
 /// If normalised statement `text` starts with keyword `kw` on an identifier
@@ -467,6 +676,141 @@ mod tests {
         // Nested-only declaration: nothing.
         let nested = scopes(&lex("message M {\n  enum MediaKind {\n    A = 0;\n  }\n}\n").unwrap());
         assert!(enum_values(&nested, "MediaKind").is_empty());
+    }
+
+    /// Moved from `proto_per_kind_fields` with the recogniser (every original
+    /// assertion verbatim through the `field_name` shim), plus the parts the
+    /// recogniser used to discard.
+    #[test]
+    fn field_recogniser_excludes_non_fields() {
+        let field_name = |s| field_decl(s).map(|d| d.name);
+        for s in [
+            "option java_package = \"x\"",
+            "reserved 1, 2",
+            "reserved \"audio\"",
+            "extensions 100 to 199",
+            "syntax = \"proto3\"",
+            "MEDIA_KIND_AUDIO = 1",
+            "rpc Foo(Bar) returns (Baz)",
+        ] {
+            assert_eq!(field_name(s), None, "{s}");
+        }
+        assert_eq!(field_name("optional uint32 a = 13"), Some("a"));
+        assert_eq!(
+            field_name("map<string, Foo> m = 2 [deprecated = true]"),
+            Some("m")
+        );
+        assert_eq!(field_name("google.protobuf.Timestamp t = 3"), Some("t"));
+        assert_eq!(field_name("bool a = 0x2"), Some("a"));
+        assert_eq!(field_name("bool a = 017"), Some("a"));
+    }
+
+    #[test]
+    fn field_decl_reports_label_type_and_options() {
+        let d = |s| field_decl(s).unwrap();
+        assert_eq!(
+            d("bytes k = 9"),
+            FieldDecl {
+                label: None,
+                ty: "bytes",
+                name: "k",
+                has_options: false
+            }
+        );
+        assert_eq!(d("optional bytes k = 9").label, Some("optional"));
+        assert_eq!(d("optional bytes k = 9").ty, "bytes");
+        assert_eq!(d("repeated bytes k = 9").label, Some("repeated"));
+        assert_eq!(d("map<string, bytes> k = 9").ty, "map<string, bytes>");
+        assert_eq!(d("map<string, bytes> k = 9").label, None);
+        assert!(d("bytes k = 9 [deprecated = true]").has_options);
+        assert!(d("bytes k = 9[deprecated = true]").has_options);
+        assert!(!d("bytes k = 0x9").has_options);
+        // A type that merely starts with a label word is not a label.
+        assert_eq!(d("optionalish.T k = 9").label, None);
+        assert_eq!(d("optionalish.T k = 9").ty, "optionalish.T");
+    }
+
+    #[test]
+    fn fields_carry_oneof_transparent_paths_and_skip_other_scopes() {
+        let src = "package p.v1;\n\
+                   message A {\n\
+                     bytes a = 1;\n\
+                     oneof c {\n\
+                       string o = 2;\n\
+                     }\n\
+                     message B {\n\
+                       int32 b = 3;\n\
+                     }\n\
+                     enum E {\n\
+                       X = 0;\n\
+                     }\n\
+                     extend Foo {\n\
+                       bytes ext = 100;\n\
+                     }\n\
+                     reserved 9;\n\
+                     option deprecated = true;\n\
+                   }\n\
+                   service S {\n\
+                     rpc R(A) returns (A);\n\
+                   }\n";
+        let f = fields(&lex(src).unwrap());
+        let shape: Vec<(usize, &str, &str, Option<&str>, bool)> = f
+            .iter()
+            .map(|f| {
+                (
+                    f.line,
+                    f.message.as_str(),
+                    f.name.as_str(),
+                    f.oneof.as_deref(),
+                    f.direct_in_message,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (3, "p.v1.A", "a", None, true),
+                (5, "p.v1.A", "o", Some("c"), false),
+                (8, "p.v1.A.B", "b", None, true),
+            ]
+        );
+        assert_eq!(f[0].text, "bytes a = 1");
+        // `scope` indexes `scopes()` of the same tokens, and that scope
+        // directly holds the statement.
+        let sc = scopes(&lex(src).unwrap());
+        for field in &f {
+            assert_eq!(
+                sc[field.scope].statements[field.statement],
+                (field.line, field.text.clone()),
+                "{field:?}"
+            );
+        }
+        // Identity, not content: two identical same-line declarations get
+        // distinct `(scope, statement)`, in one scope and across scopes.
+        let twins = fields(
+            &lex("message A { bytes k = 1; bytes k = 1; } message B { bytes k = 1; }").unwrap(),
+        );
+        let ids: Vec<(usize, usize)> = twins.iter().map(|f| (f.scope, f.statement)).collect();
+        assert_eq!(ids, vec![(1, 0), (1, 1), (2, 0)]);
+        assert_eq!(sc[f[1].scope].header.as_deref(), Some("oneof c"));
+        // No package: the path is the message chain alone.
+        let bare = fields(&lex("message M { int32 x = 1; }").unwrap());
+        assert_eq!(bare[0].message, "M");
+    }
+
+    #[test]
+    fn top_level_returns_depth_zero_declarations_only() {
+        let sc = scopes(
+            &lex("message X { }\nmessage Outer {\n  message X { }\n}\nenum X { A = 0; }\n")
+                .unwrap(),
+        );
+        let lines: Vec<usize> = top_level(&sc, "message", "X").map(|s| s.line).collect();
+        assert_eq!(lines, vec![1]);
+        assert_eq!(top_level(&sc, "enum", "X").count(), 1);
+        assert_eq!(top_level(&sc, "message", "Missing").count(), 0);
+        // Nested-only: nothing.
+        let nested = scopes(&lex("message Outer {\n  message X { }\n}\n").unwrap());
+        assert_eq!(top_level(&nested, "message", "X").count(), 0);
     }
 
     #[test]
