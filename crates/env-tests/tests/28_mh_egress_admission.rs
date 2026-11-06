@@ -15,9 +15,9 @@
 //! MH refuses the push that would cross its ceiling. A direct `RegisterMeeting`
 //! would skip the half that decides how many streams a real meeting asks for.
 //!
-//! (It is no longer that the suite CANNOT call MH directly. Since story 2 task
-//! 11, Layer 7 forwards each MH pod's gRPC port and
-//! `29_mh_meeting_teardown.rs` calls it with the Kind meeting-controller
+//! (It is no longer that the suite CANNOT call MH directly: the
+//! `fixtures::mh_grpc` fixture forwards each live MH pod's gRPC port per test,
+//! and `29_mh_meeting_teardown.rs` calls it with the Kind meeting-controller
 //! credential. That relaxes the credential convention only: ADR-0028's crate
 //! layering is unchanged — the suite still links no service crate.)
 //!
@@ -30,7 +30,9 @@
 //! count satisfying the pigeonhole condition of the shared-handler edge model
 //! (story 2 task 20, ADR-0036 §9): every participant connects to every handler
 //! it is offered, so every subscriber fills all `S` slots, the meeting totals
-//! `P * S` streams across at most two handlers, and whichever edge chooser MC
+//! `P * S` streams across at most two handlers (GC selects up to two per
+//! meeting, `crates/gc-service/src/services/mh_selection.rs` — a per-meeting
+//! cap, not the number of MH pods), and whichever edge chooser MC
 //! uses one handler holds at least half. Require `P * S > 2 * ceiling`. (With
 //! MC's co-locating chooser and full connectivity every stream is on ONE
 //! handler, which exceeds the ceiling sooner; the half bound is what holds for
@@ -126,23 +128,19 @@ use env_tests::fixtures::egress_admission::{
 };
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, GcClientError};
 use env_tests::fixtures::kube::{
-    configmap_key, configmap_name_for_all, configmap_u64, MC_INSTANCES, MH_INSTANCES, REDEPLOY_HINT,
+    configmap_key, configmap_name_for_all, configmap_u64, live_mh_pods, MC_INSTANCES, MH_INSTANCES,
+    REDEPLOY_HINT,
 };
 use env_tests::fixtures::mc_session::{self, McSession, MhSession};
 use env_tests::fixtures::metrics::{
-    gauge_by_live_pod, instances_exceeding_baseline, poll_until_any_instance_above,
-    settled_baseline, InstanceCounters,
+    gauge_by_pods, instance_for_pod_ip, instance_is_pod, instances_exceeding_baseline,
+    poll_until_any_instance_above, settled_baseline, InstanceCounters,
 };
 use env_tests::fixtures::{AuthClient, PrometheusClient};
 use env_tests::repo_root;
 use proto_gen::dark_tower::signaling::v1::{
     client_message, ClientMessage, MediaKind, ReceiveCapability, ReceiveSlot,
 };
-
-/// Both Kind MH instances (`kube::MH_INSTANCES`) must publish every admission
-/// gauge; every config-published one is read from EACH live pod
-/// (`gauge_by_live_pod`), never a terminated predecessor's series.
-const MH_INSTANCE_COUNT: usize = MH_INSTANCES.len();
 
 /// Scrape-convergence bound for eagerly-published gauges.
 const GAUGE_PRESENT_BOUND: Duration = Duration::from_secs(60);
@@ -221,10 +219,14 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
 
     // ---- PRECONDITION: read everything from the live system ----------------
-    let ceilings = gauge_by_live_pod(
+    // EVERY live MH pod, found by label ONCE for this test (no fixed name or
+    // count): each must publish every admission gauge, read from that pod
+    // (`gauge_by_pods`), never a terminated predecessor's series.
+    let mh_pods = live_mh_pods().await;
+    let ceilings = gauge_by_pods(
         &prom,
         "mh_media_egress_stream_ceiling",
-        MH_INSTANCES,
+        &mh_pods,
         GAUGE_PRESENT_BOUND,
     )
     .await;
@@ -277,24 +279,24 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
     // room for even one participant's slots could refuse the whole meeting
     // before any ADMITTED decision, starving the positive control. So EVERY
     // instance needs headroom >= `slots`.
-    let edges = gauge_by_live_pod(
+    let edges = gauge_by_pods(
         &prom,
         "mh_media_egress_edges",
-        MH_INSTANCES,
+        &mh_pods,
         GAUGE_PRESENT_BOUND,
     )
     .await;
-    let registered = gauge_by_live_pod(
+    let registered = gauge_by_pods(
         &prom,
         "mh_media_registered_meetings",
-        MH_INSTANCES,
+        &mh_pods,
         GAUGE_PRESENT_BOUND,
     )
     .await;
-    let registered_limit = gauge_by_live_pod(
+    let registered_limit = gauge_by_pods(
         &prom,
         "mh_media_registered_meetings_limit",
-        MH_INSTANCES,
+        &mh_pods,
         GAUGE_PRESENT_BOUND,
     )
     .await;
@@ -495,10 +497,10 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
     }
 
     // ---- GAUGES: ratio and threshold present on every instance -------------
-    let ratios = gauge_by_live_pod(
+    let ratios = gauge_by_pods(
         &prom,
         "mh_media_stream_admission_rejection_ratio",
-        MH_INSTANCES,
+        &mh_pods,
         GAUGE_PRESENT_BOUND,
     )
     .await;
@@ -514,10 +516,10 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
             panic!("PRECONDITION: MH_EGRESS_REJECTION_RATIO_THRESHOLD={raw:?} is not a number: {e}")
         })
     };
-    let thresholds = gauge_by_live_pod(
+    let thresholds = gauge_by_pods(
         &prom,
         "mh_media_stream_admission_rejection_ratio_threshold",
-        MH_INSTANCES,
+        &mh_pods,
         GAUGE_PRESENT_BOUND,
     )
     .await;
@@ -568,14 +570,26 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
         );
         let join = expr.replacen(" > ", " > bool ", 1);
         let joined = prom.instance_counter_map(&join).await;
-        assert_eq!(
+        // Per POD, not a bare count: a count could be met by a stale or extra
+        // instance standing in for a pod whose series is missing.
+        let unmatched: Vec<String> = mh_pods
+            .iter()
+            .filter(|pod| instance_for_pod_ip(&joined, &pod.ip).is_none())
+            .map(|pod| format!("{} ({})", pod.name, pod.ip))
+            .collect();
+        let extra: Vec<&String> = joined
+            .keys()
+            .filter(|instance| !mh_pods.iter().any(|pod| instance_is_pod(instance, &pod.ip)))
+            .collect();
+        assert!(
+            unmatched.is_empty() && extra.is_empty() && joined.len() == mh_pods.len(),
+            "ALERT-JOIN-EMPTY: `{join}` ({alert}'s comparison) matched {} instance(s) for {} live \
+             MH pod(s). Live pods with NO joined series: {unmatched:?}. Joined instances that are \
+             no live MH pod: {extra:?}. A pod missing here means the two gauges' label sets have \
+             diverged, so the alert can never fire. Both must carry exactly key_custody plus the \
+             scrape labels (crates/mh-service/src/observability/metrics.rs). Matched: {joined:?}",
             joined.len(),
-            MH_INSTANCE_COUNT,
-            "ALERT-JOIN-EMPTY: `{join}` ({alert}'s comparison) matched {} instance(s), expected \
-             {MH_INSTANCE_COUNT}: the two gauges' label sets have diverged, so the alert can \
-             never fire. Both must carry exactly key_custody plus the scrape labels \
-             (crates/mh-service/src/observability/metrics.rs). Matched: {joined:?}",
-            joined.len()
+            mh_pods.len()
         );
     }
 

@@ -44,7 +44,7 @@
 //! 12. `test_edge_churn_at_a_new_generation_does_not_stall_unrelated_egress`
 //!     — runtime edge churn (R-4) does not stall an unrelated flow.
 //!
-//! S4 and the churn test program MH DIRECTLY through the Layer-7 per-pod gRPC
+//! S4 and the churn test program MH DIRECTLY through the fixture-owned per-pod gRPC
 //! forwards (`env_tests::fixtures::mh_grpc`), each for a case no public path
 //! reaches. S4 proves survival across a re-assert at the SAME generation, and
 //! MC sends no RPC for an unchanged snapshot until story 4's §8 cadence (the
@@ -1301,7 +1301,7 @@ async fn server_mute_s4() {
     .await;
     assert_relayed_on_slot("S4 PRE", &pre[&MARK_A], b_slot, MARK_A, "A");
 
-    // INJECT on both pods: the same A <-> B edges MC would program, plus A muted.
+    // INJECT on every live MH pod: the same A <-> B edges MC would program, plus A muted.
     let handlers = injectable_handlers(&prom, BASELINE_SETTLE_BOUND).await;
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;
     let cleanup = ReleaseOnDrop::new(token.clone());
@@ -1560,7 +1560,7 @@ async fn test_two_concurrent_senders_into_one_receiver_are_never_misattributed()
 /// Injected directly (see [`Injection`]) because only a direct registration
 /// can change ONE edge while leaving every participant's connectivity — and
 /// so MC's own view — unchanged. Everyone connects to ONE handler, so all of
-/// MC's edges are there and the injection targets both pods identically.
+/// MC's edges are there and the injection targets every live MH pod identically.
 #[tokio::test]
 #[serial_test::serial(mh_notifications)]
 async fn test_edge_churn_at_a_new_generation_does_not_stall_unrelated_egress() {

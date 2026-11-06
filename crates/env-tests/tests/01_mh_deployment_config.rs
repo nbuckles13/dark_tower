@@ -729,7 +729,7 @@ async fn test_policy_bounds_reported_by_running_mh_match_configmap() {
 
     for &(key, gauge, conversion) in CONFIG_GAUGES {
         for (pod, cm) in &pods {
-            let (instance, pod_name, pod_ip) = (&pod.instance, &pod.name, &pod.ip);
+            let (instance, pod_name, pod_ip) = (pod.display_id(), &pod.name, &pod.ip);
             let deployed = positive(cm, SHARED_CONFIGMAP, key);
             let value = gauge_on_live_pod(&prom, gauge, pod, GAUGE_PRESENT_BOUND).await;
             let series = format!("instance at {pod_ip}");
@@ -821,16 +821,17 @@ async fn test_kind_egress_stream_ceiling_meets_demo_requirement() {
     // documented rule over the deployed values is
     // `test_running_mh_publishes_the_deployed_stream_ceiling`'s job.
     use env_tests::cluster::ClusterConnection;
-    use env_tests::fixtures::metrics::gauge_by_live_pod;
+    use env_tests::fixtures::kube::live_mh_pods;
+    use env_tests::fixtures::metrics::gauge_by_pods;
     use env_tests::fixtures::PrometheusClient;
     let cluster = ClusterConnection::new()
         .await
         .expect("Failed to connect to cluster - ensure port-forwards are running");
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
-    let ceilings = gauge_by_live_pod(
+    let ceilings = gauge_by_pods(
         &prom,
         "mh_media_egress_stream_ceiling",
-        MH_INSTANCES,
+        &live_mh_pods().await,
         GAUGE_PRESENT_BOUND,
     )
     .await;
@@ -915,7 +916,8 @@ fn mh_documented_ceiling(budget_bps: u64, audio_bps: u64, video_bps: u64) -> u64
 #[tokio::test]
 async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
     use env_tests::cluster::ClusterConnection;
-    use env_tests::fixtures::metrics::gauge_by_live_pod;
+    use env_tests::fixtures::kube::live_mh_pods;
+    use env_tests::fixtures::metrics::gauge_by_pods;
     use env_tests::fixtures::PrometheusClient;
 
     let cm = fetch_configmap(&shared_configmap());
@@ -927,10 +929,12 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
         .await
         .expect("Failed to connect to cluster - ensure port-forwards are running");
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
-    let ceilings = gauge_by_live_pod(
+    // EVERY live MH pod by label, once for this test (the Prometheus pin).
+    let mh_pods = live_mh_pods().await;
+    let ceilings = gauge_by_pods(
         &prom,
         "mh_media_egress_stream_ceiling",
-        MH_INSTANCES,
+        &mh_pods,
         GAUGE_PRESENT_BOUND,
     )
     .await;
@@ -945,10 +949,10 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
         );
     }
 
-    let mins = gauge_by_live_pod(
+    let mins = gauge_by_pods(
         &prom,
         "mh_media_egress_stream_ceiling_recommended_min",
-        MH_INSTANCES,
+        &mh_pods,
         GAUGE_PRESENT_BOUND,
     )
     .await;
@@ -972,7 +976,8 @@ async fn test_running_mh_publishes_the_deployed_stream_ceiling() {
 #[tokio::test]
 async fn test_running_mh_publishes_the_derived_stream_costs() {
     use env_tests::cluster::ClusterConnection;
-    use env_tests::fixtures::metrics::gauge_by_live_pod;
+    use env_tests::fixtures::kube::live_mh_pods;
+    use env_tests::fixtures::metrics::gauge_by_pods;
     use env_tests::fixtures::PrometheusClient;
 
     let (audio, video) = oracle_costs_bps(&fetch_configmap(&profile_configmap()));
@@ -980,12 +985,15 @@ async fn test_running_mh_publishes_the_derived_stream_costs() {
         .await
         .expect("Failed to connect to cluster - ensure port-forwards are running");
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    // EVERY live MH pod by label, once for this test (the Prometheus pin; the
+    // ConfigMap reads above stay per instance until slot ConfigMaps exist).
+    let mh_pods = live_mh_pods().await;
     for (gauge, bits) in [
         ("mh_media_stream_cost_audio_bytes_per_second", audio),
         ("mh_media_stream_cost_video_bytes_per_second", video),
     ] {
         let expected = bits.div_ceil(8);
-        let values = gauge_by_live_pod(&prom, gauge, MH_INSTANCES, GAUGE_PRESENT_BOUND).await;
+        let values = gauge_by_pods(&prom, gauge, &mh_pods, GAUGE_PRESENT_BOUND).await;
         for (instance, value) in &values {
             assert_eq!(
                 *value, expected as f64,

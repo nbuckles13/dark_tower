@@ -2,8 +2,8 @@
 //! R-17, R-20, R-21, R-33).
 //!
 //! One meeting of three real participants (A publishes, B and C receive),
-//! each joined through GC -> MC and connected to BOTH Kind MH pods. The
-//! forwarding policy is INJECTED on both pods through
+//! each joined through GC -> MC and connected to BOTH of the meeting's MH handlers. The
+//! forwarding policy is INJECTED on every live MH pod through
 //! `env_tests::fixtures::injection` acting as MC, at a generation above MC's:
 //! A declares audio (send id 0, DATAGRAM) and video (send id 1,
 //! STREAM_PER_GROUP); B and C declare audio. B and C hold MC's own audio
@@ -56,10 +56,9 @@ use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::injection::{
     self, assert_mc_programmed_a_carrying_pod, injectable_handlers, install_all, Injection,
 };
-use env_tests::fixtures::kube::MH_INSTANCES;
 use env_tests::fixtures::media::{audio_datagram, AUDIO_SEND_ID, VIDEO_SEND_ID};
 use env_tests::fixtures::metrics::{
-    gauge_by_live_pod, group_reset_promql, paused_promql, reason_promql,
+    gauge_by_pods, group_reset_promql, paused_promql, reason_promql,
 };
 use env_tests::fixtures::mh_grpc::{self, ReleaseOnDrop};
 use env_tests::fixtures::participant::{self, open_sessions, AUDIO};
@@ -618,13 +617,13 @@ async fn test_stream_per_group_video_forwarding() {
     )
     .await;
     // Read from EACH live MH pod, never a terminated predecessor's series
-    // (which after a roll still carries the OLD cap), and the two must agree:
+    // (which after a roll still carries the OLD cap), and they must all agree:
     // the cap comes from one ConfigMap, so a disagreement is a pod that
     // predates the config — never resolved by taking the larger.
-    let backlog_gauge = gauge_by_live_pod(
+    let backlog_gauge = gauge_by_pods(
         &prom,
         "mh_media_egress_stream_backlog_limit_bytes",
-        MH_INSTANCES,
+        &mh_grpc::pins(&handlers),
         env_tests::fixtures::metrics::PINNED_METRIC_BOUND,
     )
     .await;

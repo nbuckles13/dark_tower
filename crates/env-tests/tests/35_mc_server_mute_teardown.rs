@@ -80,6 +80,7 @@ use std::time::{Duration, Instant};
 
 use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::gc_client::GcClient;
+use env_tests::fixtures::kube::live_mh_pods;
 use env_tests::fixtures::mc_session::JoinDeclaration;
 use env_tests::fixtures::mc_session::{self, mute_changes, server_muted, MhSession};
 use env_tests::fixtures::media::{
@@ -648,10 +649,10 @@ async fn test_meeting_end_releases_every_handler_even_with_a_straggler() {
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;
     let cleanup = ReleaseOnDrop::new(token.clone());
     let probe_mc = format!("env-test-35-probe-{}", uuid::Uuid::new_v4().simple());
-    for handler in mh_grpc::handlers() {
+    for handler in mh_grpc::handlers().await {
         let name = handler.name.clone();
         let mut client = mh_grpc::connect(&handler).await;
-        cleanup.record(&handler.grpc_url, &meeting_id, &probe_mc);
+        cleanup.record(&handler, &meeting_id, &probe_mc);
         let reply = client
             .register_meeting(authed(
                 &token,
@@ -1000,6 +1001,9 @@ async fn test_video_server_mute_withdraws_drops_a_patched_publisher_and_unmute_r
     let _serialised = SERVER_MUTED_PRODUCERS.lock().await;
     let cluster = cluster().await;
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    // EVERY live MH pod, resolved ONCE for this test (before any baseline): every
+    // pinned check below reads this same snapshot.
+    let mh_pods = live_mh_pods().await;
     let bound = participant::settle_window(&cluster).await + VIEW_MARGIN;
     let auth = AuthClient::new(&cluster.ac_base_url);
     let gc = GcClient::new(&cluster.gc_base_url);
@@ -1229,8 +1233,8 @@ async fn test_video_server_mute_withdraws_drops_a_patched_publisher_and_unmute_r
         k > 0,
         "{PHASE} 2a: positive control — P transmitted on every pod"
     );
-    for handler in mh_grpc::handlers() {
-        let base = instance_for_pod_ip(&dropped_base, &handler.pod_ip).map_or(0.0, |(_, v)| v);
+    for pod in &mh_pods {
+        let base = instance_for_pod_ip(&dropped_base, &pod.ip).map_or(0.0, |(_, v)| v);
         #[expect(
             clippy::cast_precision_loss,
             reason = "a frame count of a few dozen; exact in f64"
@@ -1239,10 +1243,10 @@ async fn test_video_server_mute_withdraws_drops_a_patched_publisher_and_unmute_r
         poll_until_pinned_instance(
             &prom,
             &reason_promql("server_muted"),
-            &handler.pod_ip,
+            &pod.ip,
             PINNED_METRIC_BOUND,
             Duration::from_secs(2),
-            &format!("{PHASE} 2a DROPS ({})", handler.name),
+            &format!("{PHASE} 2a DROPS ({})", pod.name),
             ">= own baseline + K (P's label-1 frames to this pod while muted)",
             |v| v >= want,
         )
@@ -1321,15 +1325,15 @@ async fn test_video_server_mute_withdraws_drops_a_patched_publisher_and_unmute_r
             break;
         }
     }
-    for handler in mh_grpc::handlers() {
-        let base = instance_for_pod_ip(&mismatch_base, &handler.pod_ip).map_or(0.0, |(_, v)| v);
+    for pod in &mh_pods {
+        let base = instance_for_pod_ip(&mismatch_base, &pod.ip).map_or(0.0, |(_, v)| v);
         poll_until_pinned_instance(
             &prom,
             &reason_promql("transport_mismatch"),
-            &handler.pod_ip,
+            &pod.ip,
             PINNED_METRIC_BOUND,
             Duration::from_secs(2),
-            &format!("{PHASE} 2b MISMATCH ({})", handler.name),
+            &format!("{PHASE} 2b MISMATCH ({})", pod.name),
             ">= own baseline + 1 (datagrams may be lost, so not K)",
             |v| v > base,
         )
@@ -1505,6 +1509,9 @@ async fn test_client_video_mute_pauses_without_touching_the_directive_and_a_stor
     const TOGGLES: u32 = 5;
     let cluster = cluster().await;
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+    // EVERY live MH pod, resolved ONCE for this test (before any baseline): every
+    // pinned check below reads this same snapshot.
+    let mh_pods = live_mh_pods().await;
     let bound = participant::settle_window(&cluster).await + VIEW_MARGIN;
     let auth = AuthClient::new(&cluster.ac_base_url);
     let gc = GcClient::new(&cluster.gc_base_url);
@@ -1657,8 +1664,8 @@ async fn test_client_video_mute_pauses_without_touching_the_directive_and_a_stor
         k > 0,
         "{PHASE} PAUSED: positive control — P transmitted on every pod"
     );
-    for handler in mh_grpc::handlers() {
-        let base = instance_for_pod_ip(&paused_base, &handler.pod_ip).map_or(0.0, |(_, v)| v);
+    for pod in &mh_pods {
+        let base = instance_for_pod_ip(&paused_base, &pod.ip).map_or(0.0, |(_, v)| v);
         #[expect(
             clippy::cast_precision_loss,
             reason = "a frame count of a few dozen; exact in f64"
@@ -1667,10 +1674,10 @@ async fn test_client_video_mute_pauses_without_touching_the_directive_and_a_stor
         poll_until_pinned_instance(
             &prom,
             &paused_promql(),
-            &handler.pod_ip,
+            &pod.ip,
             PINNED_METRIC_BOUND,
             Duration::from_secs(2),
-            &format!("{PHASE} PAUSED ARRIVALS ({})", handler.name),
+            &format!("{PHASE} PAUSED ARRIVALS ({})", pod.name),
             ">= own baseline + K (P's frames to this pod while client-muted)",
             |v| v >= want,
         )

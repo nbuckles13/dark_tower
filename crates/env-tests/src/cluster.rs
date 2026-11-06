@@ -260,7 +260,7 @@ impl ClusterConnection {
                 message: format!("No addresses found for '{}'", addr_str),
             })?;
 
-        TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| {
+        tcp_accepts(&addr, Duration::from_secs(5)).map_err(|e| {
             ClusterError::HealthCheckFailed {
                 message: format!(
                     "Port-forward not detected on {}:{}. Run './infra/kind/scripts/setup.sh' to start port-forwards. TCP error: {}",
@@ -395,6 +395,16 @@ impl ClusterConnection {
             false
         }
     }
+}
+
+/// Does something accept a TCP connection at `addr` within `timeout`? The ONE
+/// TCP-accept probe in this crate (the cluster port-forward check above, and
+/// the env-test MH gRPC forward's readiness in `fixtures/mh_grpc.rs`).
+///
+/// # Errors
+/// The connection attempt failed or timed out.
+pub(crate) fn tcp_accepts(addr: &std::net::SocketAddr, timeout: Duration) -> std::io::Result<()> {
+    TcpStream::connect_timeout(addr, timeout).map(drop)
 }
 
 #[cfg(test)]

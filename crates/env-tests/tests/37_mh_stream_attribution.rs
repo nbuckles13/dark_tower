@@ -2,8 +2,8 @@
 //! R-16, R-17, R-20, R-33).
 //!
 //! One meeting of three real participants (A publishes, B and C receive),
-//! each joined through GC -> MC and connected to BOTH Kind MH pods. The
-//! forwarding policy is INJECTED on both pods with explicit `source_streams`
+//! each joined through GC -> MC and connected to BOTH of the meeting's MH handlers. The
+//! forwarding policy is INJECTED on every live MH pod with explicit `source_streams`
 //! (so the test controls the mixed declarations and the relabelling, and can
 //! give A a video slot MC would not place in this shape), through the shared
 //! `env_tests::fixtures::injection::Injection` helper, at a generation above
@@ -17,7 +17,7 @@
 //! Phases, run SEQUENTIALLY inside ONE test fn so no two concurrent fns ever
 //! produce the same reason token:
 //!
-//! (a) the mixed DATAGRAM + STREAM_PER_GROUP registration applies on both pods
+//! (a) the mixed DATAGRAM + STREAM_PER_GROUP registration applies on every live MH pod
 //!     and its per-stream echo lists every declared source stream;
 //! (b) per-kind server mute: A's AUDIO at DROP_AT_INGRESS drops A's audio at
 //!     every receiver while the stream stays declared (echoed);
@@ -111,7 +111,7 @@ const TEST_FRAMES: u32 = 20;
 /// overflows it before the ingress loop reads, quinn evicts the oldest, and
 /// the excess lands on `transport_receive_dropped` instead of the reason under
 /// test (observed at Gate 2: 6 of 20 counted, 14 on
-/// `transport_receive_dropped`, on both pods). Paced, every test frame is read
+/// `transport_receive_dropped`, on every live MH pod). Paced, every test frame is read
 /// and attributed, which is what makes the `>= TEST_FRAMES` counter gates
 /// sound on the lossless Kind link. Every pacing interval uses
 /// `MissedTickBehavior::Delay`. A shortfall's failure message names
@@ -380,7 +380,7 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
     }
     let slot = |i: usize, from: u32| ps[i].slot_for(from, AUDIO);
 
-    // (a) INJECT the mixed registration on both pods.
+    // (a) INJECT the mixed registration on every live MH pod.
     let handlers =
         injectable_handlers(&prom, env_tests::fixtures::metrics::BASELINE_SETTLE_BOUND).await;
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;

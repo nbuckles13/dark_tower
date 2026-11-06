@@ -11,7 +11,7 @@
 //!   on ONE handler at once — the demo meeting or the largest per-file
 //!   concurrent edge sum, whichever is larger — plus the edges a previous
 //!   file's disconnected participants still hold. Counted per handler; that
-//!   is conservative, since one file's meetings may spread over both MHs.
+//!   is conservative, since one file's meetings may spread over several MHs.
 //! - UPPER side ([`max_s9_feasible_ceiling`]): two different kinds of bound,
 //!   kept textually apart. [`MAX_S9_PARTICIPANTS`] is an ECONOMIC feasibility
 //!   limit — how many real AC registrations and GC/MC/MH joins one test may
@@ -56,7 +56,7 @@ pub const MAX_PER_FILE_EDGE_SUM: u64 = 72;
 /// Edges still installed from the PREVIOUS file when the next one starts:
 /// disconnected participants hold their edges through MC's reconnect grace
 /// window (`MC_DISCONNECT_GRACE_PERIOD_SECONDS`) while Layer-7 files run back
-/// to back. Observed, not derived: mh-0 at 39 installed streams with no live
+/// to back. Observed, not derived: one MH pod at 39 installed streams with no live
 /// load during story 2 task 20's Gate 2 (the history is in the Kind budget
 /// patch header). Shrinking it, shortening the grace period, or serialising the
 /// env-tests to make a window fit was considered and rejected — an empty

@@ -390,8 +390,10 @@ pub fn fetch_live_pod(instance: &str) -> Value {
 /// label is `pod IP:port`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LivePod {
-    /// The `instance` label (e.g. `mh-0`).
-    pub instance: String,
+    /// The `instance` label this pod was resolved BY (`live_pod(instance)`, a
+    /// per-instance read), or `None` for a pod discovered by a service label
+    /// (`kube::live_mh_pods`), which assumes no instance naming.
+    pub instance: Option<String>,
     /// The serving pod's `metadata.name`.
     pub name: String,
     /// The serving pod's `status.podIP`.
@@ -412,9 +414,18 @@ pub fn live_pod(instance: &str) -> LivePod {
         .unwrap_or_else(|| panic!("PRECONDITION: pod {name} ({instance}) has no status.podIP"))
         .to_string();
     LivePod {
-        instance: instance.to_string(),
+        instance: Some(instance.to_string()),
         name,
         ip,
+    }
+}
+
+impl LivePod {
+    /// How keys and messages name this pod: the instance label it was resolved
+    /// by, else (label-discovered) its pod name.
+    #[must_use]
+    pub fn display_id(&self) -> &str {
+        self.instance.as_deref().unwrap_or(&self.name)
     }
 }
 
@@ -436,7 +447,7 @@ pub fn newest_live_pod(pods: &Value, instance: &str) -> Result<Value, String> {
     }
     items
         .iter()
-        .filter(|p| p.pointer("/metadata/deletionTimestamp").is_none())
+        .filter(|p| !crate::fixtures::kube::is_terminating(p))
         .max_by_key(|p| {
             p.pointer("/metadata/creationTimestamp")
                 .and_then(Value::as_str)

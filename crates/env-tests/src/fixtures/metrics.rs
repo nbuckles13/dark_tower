@@ -1,6 +1,6 @@
 //! Prometheus client fixture for querying metrics.
 
-use crate::fixtures::deployment_config::{live_pod, LivePod};
+use crate::fixtures::deployment_config::LivePod;
 use crate::fixtures::kube::REDEPLOY_HINT;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -944,7 +944,7 @@ pub async fn settled_baseline(
 /// Right after a deploy rolls the pods, the `>= min_instances` count can be
 /// satisfied by a TERMINATED predecessor's series, still scraped and still
 /// carrying the OLD value. So for any value compared against config or a
-/// sizing bound, use [`gauge_by_live_pod`] / [`gauge_on_live_pod`]; use this
+/// sizing bound, use [`gauge_by_pods`] / [`gauge_on_live_pod`]; use this
 /// helper only for presence, or for a map that is then pinned per pod.
 ///
 /// # Panics
@@ -1011,7 +1011,8 @@ pub async fn gauge_on_live_pod(
             "PRESENCE ({}, pod {}): `{metric}` is published at process start, so absence is a \
              scrape/startup problem (the pod is not scraped, or the publish ran before the \
              recorder) — NOT a configuration mismatch",
-            pod.instance, pod.name
+            pod.display_id(),
+            pod.name
         ),
         "present",
         |_| true,
@@ -1019,33 +1020,31 @@ pub async fn gauge_on_live_pod(
     .await
 }
 
-/// [`gauge_on_live_pod`] for EVERY instance in `instances`: one entry per live
-/// pod, keyed `"<instance> (<pod IP>)"`, and nothing from a pod that is not
-/// serving. Every instance must be present — a missing pod or series is a
-/// PRECONDITION / PRESENCE failure, never a smaller map a window check could
-/// pass on with one handler down.
+/// [`gauge_on_live_pod`] for EVERY pod in `pods` — already resolved, e.g. the
+/// label-discovered MH set (`kube::live_mh_pods`, or `mh_grpc::pins` of a
+/// test's own handlers, so injection and pin share ONE lookup). Keyed
+/// `"<display id> (<pod IP>)"`, and nothing from a pod that is not in `pods`.
+/// Every pod must be present — a missing series is a PRESENCE failure, never a
+/// smaller map a window check could pass on with one handler down.
 ///
 /// # Panics
-///
-/// An instance has no live pod or no series ([`gauge_on_live_pod`]), or two
-/// instances resolve to one pod IP.
-pub async fn gauge_by_live_pod(
+/// A pod has no series ([`gauge_on_live_pod`]), or two pods share a pod IP.
+pub async fn gauge_by_pods(
     prom: &PrometheusClient,
     metric: &str,
-    instances: &[&str],
+    pods: &[LivePod],
     timeout: Duration,
 ) -> InstanceCounters {
-    let pods: Vec<LivePod> = instances.iter().map(|i| live_pod(i)).collect();
-    distinct_pod_ips(&pods).unwrap_or_else(|e| panic!("PRECONDITION: `{metric}`: {e}"));
+    distinct_pod_ips(pods).unwrap_or_else(|e| panic!("PRECONDITION: `{metric}`: {e}"));
     let mut values = InstanceCounters::new();
-    for pod in &pods {
+    for pod in pods {
         let value = gauge_on_live_pod(prom, metric, pod, timeout).await;
-        values.insert(format!("{} ({})", pod.instance, pod.ip), value);
+        values.insert(format!("{} ({})", pod.display_id(), pod.ip), value);
     }
     values
 }
 
-/// PURE check behind [`gauge_by_live_pod`]: every instance resolved to its OWN
+/// PURE check behind [`gauge_by_pods`]: every pod resolved to its OWN
 /// pod IP. Two instances on one IP would read one handler twice and present
 /// it as both.
 ///
@@ -1062,10 +1061,20 @@ pub fn distinct_pod_ips(pods: &[LivePod]) -> Result<(), String> {
             pods.len(),
             ips.len(),
             pods.iter()
-                .map(|p| format!("{}={}", p.instance, p.ip))
+                .map(|p| format!("{}={}", p.display_id(), p.ip))
                 .collect::<Vec<_>>()
         ))
     }
+}
+
+/// Is the scrape `instance` (`pod IP:port`) the pod at `pod_ip`? The ONE home of
+/// the pinning rule: matched on the `"<ip>:"` PREFIX, and the colon is
+/// load-bearing (`10.0.0.1` must not match `10.0.0.10:8083`).
+#[must_use]
+pub fn instance_is_pod(instance: &str, pod_ip: &str) -> bool {
+    instance
+        .strip_prefix(pod_ip)
+        .is_some_and(|rest| rest.starts_with(':'))
 }
 
 /// The `instance` entry that belongs to the pod at `pod_ip`, if present.
@@ -1084,10 +1093,9 @@ pub fn instance_for_pod_ip<'a>(
     map: &'a InstanceCounters,
     pod_ip: &str,
 ) -> Option<(&'a String, f64)> {
-    let prefix = format!("{pod_ip}:");
     let mut matches = map
         .iter()
-        .filter(|(instance, _)| instance.starts_with(&prefix));
+        .filter(|(instance, _)| instance_is_pod(instance, pod_ip));
     let first = matches.next().map(|(instance, value)| (instance, *value));
     let extra: Vec<&String> = matches.map(|(instance, _)| instance).collect();
     assert!(
@@ -1613,6 +1621,13 @@ mod tests {
     }
 
     #[test]
+    fn instance_is_pod_needs_the_colon() {
+        assert!(instance_is_pod("10.0.0.1:8083", "10.0.0.1"));
+        assert!(!instance_is_pod("10.0.0.10:8083", "10.0.0.1"));
+        assert!(!instance_is_pod("10.0.0.1", "10.0.0.1"));
+    }
+
+    #[test]
     #[should_panic(expected = "more than one instance matches pod IP")]
     fn instance_for_pod_ip_refuses_an_ambiguous_pin() {
         let map: InstanceCounters = std::collections::HashMap::from([
@@ -1624,14 +1639,14 @@ mod tests {
 
     #[test]
     fn distinct_pod_ips_rejects_a_shared_ip() {
-        let pod = |i: &str, ip: &str| LivePod {
-            instance: i.to_string(),
-            name: format!("{i}-x"),
+        let pod = |name: &str, ip: &str| LivePod {
+            instance: None,
+            name: name.to_string(),
             ip: ip.to_string(),
         };
-        assert!(distinct_pod_ips(&[pod("mh-0", "10.0.0.1"), pod("mh-1", "10.0.0.2")]).is_ok());
+        assert!(distinct_pod_ips(&[pod("mh-a", "10.0.0.1"), pod("mh-b", "10.0.0.2")]).is_ok());
         assert!(
-            distinct_pod_ips(&[pod("mh-0", "10.0.0.1"), pod("mh-1", "10.0.0.1")])
+            distinct_pod_ips(&[pod("mh-a", "10.0.0.1"), pod("mh-b", "10.0.0.1")])
                 .unwrap_err()
                 .contains("only 1 distinct pod IP")
         );

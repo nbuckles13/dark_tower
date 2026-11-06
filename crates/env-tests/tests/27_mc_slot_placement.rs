@@ -19,7 +19,7 @@
 //! Which Kind handler is "one" and which "the other" is picked arbitrarily from
 //! the OBSERVED set; nothing depends on which handler is which. Ordering is
 //! deliberate (@operations OPS-7, @test): a broken environment — a NodePort
-//! down, a network-policy regression, an unhealthy mh-1 — produces exactly the
+//! down, a network-policy regression, an unhealthy MH — produces exactly the
 //! connected-set shape this phase asserts, so:
 //!
 //! 1. PRECONDITION: every client is offered exactly two distinct handlers
