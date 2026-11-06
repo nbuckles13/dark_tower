@@ -992,7 +992,7 @@ tasks:
   slug: 2026-11-06-internal-proto-key-allowlist
   tag: story-2026-10-31-survive-handler-loss-task-I-4
 - id: 3
-  status: pending
+  status: completed
   specialist: security
   prompt: |-
     SEC-A: Security policy content for MC-minted dial credentials
@@ -1051,6 +1051,7 @@ tasks:
     - The docs/TODO.md entry is still open, and the new paragraph does not duplicate existing text.
 
     CROSS-TASK OBLIGATIONS (a)-(e): none applies. There are no config keys, retirements or series, this is not a service task, and there are no labels. State this in the devloop output.
+  slug: 2026-11-06-sec-a-media-dial-lens
   tag: story-2026-10-31-survive-handler-loss-task-SEC-A
 - id: 4
   status: pending
