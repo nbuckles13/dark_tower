@@ -100,7 +100,10 @@ A `devloop.sh` script manages the full lifecycle:
 
 ```
 ./devloop.sh <task-slug> [base-branch]
+./devloop.sh --pr <number> <task-slug>   # fix an existing same-repo PR in place
 ```
+
+The script header (`infra/devloop/devloop.sh`) is the authoritative usage, including PR mode and its Dependabot caveat.
 
 1. Creates git clone (idempotent)
 2. Starts containers in background (idempotent)

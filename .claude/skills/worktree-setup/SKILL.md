@@ -60,10 +60,15 @@ This works even when run from a worktree.
 
 ```bash
 cd "$MAIN_REPO"
-git worktree add "$WORKTREE_PATH" "$BRANCH_NAME"
+if git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
+    git worktree add "$WORKTREE_PATH" "$BRANCH_NAME"          # existing branch
+else
+    git worktree add -b "$BRANCH_NAME" "$WORKTREE_PATH" main  # new branch from main
+fi
 ```
 
-If the branch doesn't exist, git will create it. If it exists, git will check it out.
+`git worktree add <path> <branch>` does NOT create a missing branch (it errors on an unknown
+ref), hence `-b` for a new one.
 
 **Handle errors**:
 - If path already exists: error message
@@ -165,7 +170,9 @@ cd /path/to/worktree
 git worktree remove .
 ```
 
-**Note**: Removing a worktree does NOT delete the branch, only the working directory.
+**Note**: Removing a worktree does NOT delete the branch, only the working directory. After the
+branch's PR is squash-merged, delete it with `git branch -D <branch>` — `git branch -d` refuses,
+because a squash merge never makes the branch an ancestor of main.
 
 ## Troubleshooting
 

@@ -2380,7 +2380,7 @@ dl_rust_any="$(grep -c -- '--build-arg "RUST_VERSION=' <<< "$DLSH")"
 dl_rust_set="$(grep -cF 'RUST_VERSION="$(read_rust_version "$script_dir")"' <<< "$DLSH")"
 assert_rc "devloop-sh-one-build-site" 0 "$([[ "$dl_builds" -eq 1 && "$dl_callers" -eq 2 && "$dl_rust_var" -eq 1 && "$dl_rust_any" -eq 1 && "$dl_rust_set" -eq 1 ]] && echo 0 || echo "1 (builds=${dl_builds} callers=${dl_callers} var=${dl_rust_var} any=${dl_rust_any} from-reader=${dl_rust_set})")"
 assert_rc "devloop-sh-no-literal-rust-assignment" 0 "$(grep -qE '(^|[^_A-Z])RUST_VERSION=["'"'"']?[0-9]' <<< "$DLSH" && echo 1 || echo 0)"
-assert_status "devloop-sh-helper-built-from-repo-root" '(cd "$REPO_ROOT" && cargo build --release -p devloop-helper' "$DLSH"
+assert_status "devloop-sh-helper-built-from-repo-root" '(cd "$REPO_ROOT" && quiet_unless_fails cargo build --release -p devloop-helper' "$DLSH"
 
 # No literal Rust version anywhere it could drift. Positive controls keep the scans non-vacuous.
 rust_literal_sites() {  # $1 = root; prints one line per literal Rust-version site

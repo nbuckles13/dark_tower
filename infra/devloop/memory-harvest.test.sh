@@ -79,6 +79,11 @@ harvest_before_removal devloop-a-dev a >/dev/null; assert_rc "gate-passes-on-suc
 # Seed: the host memory dir is copied into a new container; key derivation.
 assert_status "host-dir-key" "/.claude/projects/-home-nathan-code-dark-tower/memory" "$(DEVLOOP_MEMORY_SEED_DIR='' CLAUDE_CONFIG_DIR='' host_memory_dir /home/nathan/code/dark_tower)"
 assert_status "host-dir-other-checkout" "/.claude/projects/-srv-src-my-repo-2/memory" "$(DEVLOOP_MEMORY_SEED_DIR='' CLAUDE_CONFIG_DIR='' host_memory_dir /srv/src/my.repo_2)"
+GITMAIN="${WORK}/main.repo"; git init -q "$GITMAIN" && git -C "$GITMAIN" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init \
+    && git -C "$GITMAIN" worktree add -q "${WORK}/wt.x" 2>/dev/null
+GITKEY="$(printf '%s' "$GITMAIN" | sed 's/[^A-Za-z0-9]/-/g')"
+assert_status "host-dir-worktree-uses-main" "/cfg/projects/${GITKEY}/memory" "$(DEVLOOP_MEMORY_SEED_DIR='' CLAUDE_CONFIG_DIR=/cfg host_memory_dir "${WORK}/wt.x")"
+assert_status "host-dir-main-checkout" "/cfg/projects/${GITKEY}/memory" "$(DEVLOOP_MEMORY_SEED_DIR='' CLAUDE_CONFIG_DIR=/cfg host_memory_dir "$GITMAIN")"
 assert_rc "host-dir-config-dir" 0 "$([[ "$(DEVLOOP_MEMORY_SEED_DIR='' CLAUDE_CONFIG_DIR=/cfg host_memory_dir /r)" == /cfg/projects/-r/memory ]] && echo 0 || echo 1)"
 SEED="${WORK}/seed"; mkdir -p "$SEED"
 printf -- '- [k](k.md) — k\n' > "${SEED}/MEMORY.md"; printf 'keep\n' > "${SEED}/k.md"
