@@ -68,7 +68,10 @@ case "\$1" in
     # The interactive attach: run the case's "session" (commit, flip a fixture, ...).
     # Without the git shim: the session is the CONTAINER's git, not the host's.
     if [[ " \$* " == *" claude "* && -n "\${STUB_SESSION:-}" ]]; then PATH="${SYS}" bash "\$STUB_SESSION" >&2; fi
+    # A \`-- <command>\` exec (not the claude attach) exits with STUB_EXEC_RC (default 0).
+    if [[ " \$* " == *" -w /work "* && " \$* " != *" claude "* ]]; then exit "\${STUB_EXEC_RC:-0}"; fi
     exit 0 ;;
+  inspect) printf '%s\n' "\${STUB_LABEL:-}"; exit 0 ;;
   cp) exit 0 ;;
 esac
 echo "podman stub: unmodelled: \$*" >&2; exit 91
@@ -94,6 +97,10 @@ if [[ "\$1 \$2" == "pr list" ]]; then
   ((\${#files[@]})) || { echo '[]' | jq -r "\$jqx"; exit; }
   jq -s --arg h "\$head" '[.[] | select(.headRefName == \$h and .state == "OPEN") | {number, url}]' "\${files[@]}" \
     | jq -r "\$jqx"; exit
+fi
+if [[ "\$1 \$2" == "repo view" ]]; then
+  if [[ -f "${FIX}/visibility.fail" ]]; then echo "repo view failed" >&2; exit 1; fi
+  cat "${FIX}/visibility" 2>/dev/null || echo PUBLIC; exit 0
 fi
 if [[ "\$1 \$2" == "pr create" ]]; then echo "https://github.com/acme/tower/pull/99"; exit 0; fi
 echo "gh stub: unmodelled: \$*" >&2; exit 91
@@ -151,7 +158,8 @@ dl() {
       GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
       GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid \
       ANTHROPIC_API_KEY=dummy DEVLOOP_CONTAINER_MEMORY=1g STUB_RUNNING="devloop-${running}-dev" \
-      STUB_SESSION="${STUB_SESSION:-}" bash "$DEVLOOP" "$@" 2>&1)"
+      STUB_SESSION="${STUB_SESSION:-}" STUB_EXEC_RC="${STUB_EXEC_RC:-0}" STUB_LABEL="${STUB_LABEL:-}" \
+      bash "$DEVLOOP" "$@" 2>&1)"
   RC=$?
   set -e
 }
@@ -291,7 +299,7 @@ PRE='mkpr 7 ".headRefOid = \"$MAIN_OID\""' \
 assert_status "lk-head-moved-names-both-shas" "head was ${MAIN_OID} at lookup; origin's ${HEADREF} is now ${HEAD_OID}" "$OUT"
 PRE='git clone -q "$H" "$(clone ${PS})"' KEEP_CLONE=1 \
   refused_at_lookup lk-closed-with-clone not-open "push" '.state = "CLOSED"'
-assert_status "lk-closed-with-clone-host-side" "fetch -q --no-tags --no-write-fetch-head ${H}/../worktrees/${PS} refs/heads/${HEADREF}:refs/devloop/${PS}/head && git -C ${H} push ${ORIGIN} refs/devloop/${PS}/head:refs/heads/${HEADREF}" "$OUT"
+assert_status "lk-closed-with-clone-host-side" "fetch -q --no-tags --no-write-fetch-head ${H}/../worktrees/${PS} refs/heads/${HEADREF}:refs/devloop/${PS}/head && git -C ${H} push -q ${ORIGIN} refs/devloop/${PS}/head:refs/heads/${HEADREF}" "$OUT"
 assert_status "lk-closed-with-clone-fsck" "-c fetch.fsckObjects=true fetch" "$OUT"
 assert_status "lk-closed-with-clone-branch-only-note" "updates the branch only, not the CLOSED PR" "$OUT"
 PRE='git clone -q "$H" "$(clone ${PS})"' KEEP_CLONE=1 \
@@ -311,7 +319,8 @@ assert_status "happy-origin-is-github-stand-in" "$ORIGIN" "$(git -C "$CL" remote
 assert_status "happy-banner" "=== PR mode: #7 https://github.com/acme/tower/pull/7 ===" "$OUT"
 assert_status "happy-banner-head" "head:  ${HEADREF} @ ${HEAD_OID:0:12}" "$OUT"
 assert_status "happy-banner-new" "(new)" "$OUT"
-assert_status "happy-dependabot-caveat" "is a Dependabot branch" "$OUT"
+# The Dependabot caveat belongs at the push decision (exit menu), not in the launch output.
+assert_absent "happy-no-caveat-at-launch" "is a Dependabot branch" "$(sed '/^=== PR exists/,$d' <<< "$OUT")"
 assert_status "happy-podman-reached" "exec -it devloop-${PS}-dev claude" "$(log podman)"
 assert_status "happy-menu-picks-pr-by-number" "=== PR exists: https://github.com/acme/tower/pull/7 ===" "$OUT"
 assert_absent "happy-no-create" "[c] Push and create" "$OUT"
@@ -325,6 +334,7 @@ assert_status "push-reattached" "(existing, on ${HEADREF})" "$OUT"
 assert_absent "push-no-mismatch" "CLONE_BRANCH_MISMATCH" "$OUT"
 assert_status "push-unpushed-listed" "fix build" "$OUT"
 assert_status "push-done" "Pushed. PR updated." "$OUT"
+assert_status "push-caveat-at-menu" "is a Dependabot branch" "$OUT"
 assert_status "push-landed-on-pr-head" "$(git -C "$CL" rev-parse HEAD)" "$(git -C "$ORIGIN" rev-parse "refs/heads/${HEADREF}")"
 assert_absent "push-no-create" "[c] Push and create" "$OUT"
 assert_status "push-signed-commit-listed" "fix build signed" "$OUT"
@@ -338,12 +348,46 @@ assert_rc     "rerun-rc" 0 "$RC"
 assert_status "rerun-banner-twice" "2" "$(grep -c '^=== PR mode: #7' <<< "$OUT")"
 assert_absent "rerun-not-refused" "PR_MODE_REFUSED" "$OUT"
 
-# `--` exec form in PR mode: commits listed against the labelled base, hint keeps --pr.
-dl "" "$BIN" ${PS} --pr 7 ${PS} -- true
+# `--` exec form in PR mode ends with the normal exit menu (PR mode is never unattended).
+# Everything is pushed (above): the menu sees the PR, nothing unpushed, offers no push.
+dl "q" "$BIN" ${PS} --pr 7 ${PS} -- true
 assert_rc     "exec-rc" 0 "$RC"
-assert_status "exec-commits-label" "Commits on ${HEADREF} since main:" "$OUT"
-assert_status "exec-commit-listed" "fix build" "$OUT"
-assert_status "exec-reenter-keeps-pr" "Re-enter:  ${DEVLOOP} --pr 7 ${PS}" "$OUT"
+assert_status "exec-ran-command" "Running in devloop-${PS}-dev: true" "$OUT"
+assert_status "exec-rc-reported" "=== exited rc=0 ===" "$OUT"
+assert_status "exec-menu-sees-pr" "=== PR exists:" "$OUT"
+assert_absent "exec-nothing-unpushed" "Unpushed commits:" "$OUT"
+assert_absent "exec-no-claude" "exec -it devloop-${PS}-dev claude" "$(log podman)"
+assert_status "exec-reenter-keeps-pr" "Re-enter with: ${DEVLOOP} --pr 7 ${PS}" "$OUT"
+
+# A new commit in the clone (as a `-- bash` hand fix makes): the menu lists only it as unpushed
+# and [p] lands it on the PR head from the host repo, never forced.
+printf 'exec fix\n' > "${CL}/exec-fix"; git -C "$CL" add exec-fix; git -C "$CL" commit -qm "exec fix"
+dl "pq" "$BIN" ${PS} --pr 7 ${PS} -- true
+assert_rc     "exec-push-rc" 0 "$RC"
+assert_status "exec-unpushed-listed" "exec fix" "$(grep -A2 '^Unpushed commits:' <<< "$OUT")"
+assert_absent "exec-unpushed-only-new" "fix build" "$(grep -A2 '^Unpushed commits:' <<< "$OUT")"
+assert_status "exec-pushed" "Pushed. PR updated." "$OUT"
+assert_status "exec-push-landed" "$(git -C "$CL" rev-parse HEAD)" "$(git -C "$ORIGIN" rev-parse "refs/heads/${HEADREF}")"
+assert_absent "exec-push-unforced" "forced update" "$OUT"
+
+# A FAILING command (a red layer-all, a rebase conflict) still ends in the menu, rc reported.
+STUB_EXEC_RC=3 dl "q" "$BIN" ${PS} --pr 7 ${PS} -- false
+assert_status "exec-fail-rc-reported" "=== exited rc=3 ===" "$OUT"
+assert_status "exec-fail-menu-reached" "=== PR exists:" "$OUT"
+
+# [r] from the exec-form menu re-runs the same command, not Claude.
+dl "rq" "$BIN" ${PS} --pr 7 ${PS} -- true
+assert_status "exec-rerun-same-command" "2" "$(grep -c "^Running in devloop-${PS}-dev: true" <<< "$OUT")"
+assert_absent "exec-rerun-no-claude" "exec -it devloop-${PS}-dev claude" "$(log podman)"
+
+# Without --pr the `--` form still reports and exits, never prompting (run-story's unattended
+# contract). The podman stub's exec is a no-op returning 0, so rc propagation is not modelled.
+STUB_EXEC_RC=2 dl "" "$BIN" plainexec plainexec -- false
+assert_rc     "plain-exec-rc-propagated" 2 "$RC"
+assert_status "plain-exec-reported" "=== exited rc=2 ===" "$OUT"
+assert_status "plain-exec-still-running" "Still running: devloop-plainexec-dev" "$OUT"
+assert_status "plain-exec-reenter" "Re-enter:  ${DEVLOOP} plainexec" "$OUT"
+assert_absent "plain-exec-no-menu" "Choice:" "$OUT"
 
 # Push rejected: Dependabot REWROTE the PR head (bump re-made, with a different patch, on a moved
 # main; force-pushed). The menu only PRINTS the recovery: this run's values, nothing run, no git
@@ -356,6 +400,38 @@ printf 'bump v2\n' > "${C}/other/g"; git -C "${C}/other" add g; git -C "${C}/oth
 git -C "${C}/other" push -q -f origin "rewritten:refs/heads/${HEADREF}"
 moved="$(git -C "$ORIGIN" rev-parse "refs/heads/${HEADREF}")"
 hostile_session "$CL" "more fixes"
+# Relaunch after the rebase: the PR lookup now reports the rewritten head, so the host's local
+# <head> (the launch head) is no longer the PR head — but the clone still contains it.
+mkpr 7 ".headRefOid = \"$moved\""
+# Public repo: ONLY the container-rebase command — one devloop.sh line that fetches anonymously
+# from the PR's repo (derived from the PR url) and ends in the menu for [p]. No host fallback.
+echo PUBLIC > "${FIX}/visibility"
+dl "pq" "$BIN" ${PS} --pr 7 ${PS}
+assert_status "pub-rejected" "was rejected" "$OUT"
+assert_status "pub-container-rebase-cmd" "${DEVLOOP} --pr 7 ${PS} -- bash -c 'GIT_TERMINAL_PROMPT=0 git fetch -q https://github.com/acme/tower.git refs/heads/${HEADREF} && git -c advice.skippedCherryPicks=false rebase --onto FETCH_HEAD ${HEAD_OID}'" "$OUT"
+# Run the printed in-container script (url -> the fixture origin) in a fresh copy of the clone's
+# branch: it lands the clone's own commits on the REWRITTEN head and never replays the original
+# bump (a plain rebase would conflict: both bumps add g with different content).
+INNER="$(grep -o "bash -c '[^']*'" <<< "$OUT" | head -1 | sed "s/^bash -c '//; s/'\$//; s#https://github.com/acme/tower.git#${ORIGIN}#")"
+RB="${C}/rebase-run"; git init -q "$RB"
+git -C "$RB" fetch -q "$CL" "refs/heads/${HEADREF}:refs/heads/${HEADREF}"; git -C "$RB" checkout -q "$HEADREF"
+RB_RC=0; (cd "$RB" && bash -c "$INNER") >/dev/null 2>&1 || RB_RC=$?
+assert_rc     "pub-rebase-runs" 0 "$RB_RC"
+assert_status "pub-rebase-on-rewritten" "bump v2" "$(cat "${RB}/g" 2>&1)"
+assert_status "pub-rebase-bump-once" "1" "$(git -C "$RB" log --format=%s "$MAIN_OID..HEAD" 2>/dev/null | grep -c '^bump x to 1.2.3$' || true)"
+assert_status "pub-rebase-keeps-fixes" "exec fix" "$(git -C "$RB" log --format=%s "${moved}..HEAD" 2>&1)"
+assert_status "pub-conflict-note" "re-enter with -- bash, resolve," "$OUT"
+assert_absent "pub-no-host-fallback" "worktree add" "$OUT"
+assert_status "pub-visibility-asked" "repo view https://github.com/acme/tower --json visibility" "$(log gh)"
+# Visibility unknown: both, with a WARNING (never silently the wrong one).
+touch "${FIX}/visibility.fail"
+dl "pq" "$BIN" ${PS} --pr 7 ${PS}
+assert_status "unk-warning" "WARNING: could not read the repo's visibility" "$OUT"
+assert_status "unk-container-cmd" "-- bash -c 'GIT_TERMINAL_PROMPT=0 git fetch" "$OUT"
+assert_status "unk-fallback" "worktree add -b ${HEADREF}" "$OUT"
+rm -f "${FIX}/visibility.fail"
+# Private repo: the host-side fallback only (the scenario below runs its steps).
+echo PRIVATE > "${FIX}/visibility"
 STUB_SESSION="${C}/session.sh" dl "pq" "$BIN" ${PS} --pr 7 ${PS}
 REB="${C}/${PS}-rebase"; ABSORB="${__here}/absorb-devloop.sh"
 STEPS_TEXT="$(grep '^    \$ ' <<< "$OUT" || true)"
@@ -364,18 +440,21 @@ assert_status "reject-error" "ERROR: push of ${HEADREF} was rejected" "$OUT"
 assert_status "reject-origin-untouched" "$moved" "$(git -C "$ORIGIN" rev-parse "refs/heads/${HEADREF}")"
 assert_status "reject-never-force" "Never force-push" "$OUT"
 assert_status "reject-pr-wording" "PR #7's branch ${HEADREF} probably moved" "$OUT"
+assert_absent "reject-private-no-container-cmd" "-- bash -c" "$OUT"
+assert_status "reject-private-labelled" "The repo is PRIVATE, so the container cannot fetch it anonymously; recover on the host:" "$OUT"
+assert_status "reject-header-once" "1" "$(grep -c 'probably moved on origin' <<< "$OUT")"
 # The local <head> (ensure_branch_ref made it at launch) blocks the worktree add: its remedy comes
 # FIRST, and since it is still the launch head (-D loses nothing) it is step 1 of the block.
 assert_status "reject-first-section" "First, or the worktree add below refuses:" "$OUT"
-assert_status "reject-local-head-at-launch" "It is still PR #7's head from this run's launch (${HEAD_OID:0:12})" "$OUT"
-assert_status "reject-local-head-loses-nothing" "so deleting it loses nothing (first step below)" "$OUT"
+assert_status "reject-local-head-in-clone" "It is at ${HEAD_OID:0:12}, which the clone's ${HEADREF} contains" "$OUT"
+assert_status "reject-local-head-loses-nothing" "so deleting it loses nothing while the clone exists (first step below) — do not --destroy before the push." "$OUT"
 assert_absent "reject-local-head-not-may-hold" "may hold your commits" "$OUT"
 assert_status "reject-steps-in-order" "\
     \$ git -C ${H} branch -D ${HEADREF}
     \$ git -C ${H} fetch origin
     \$ git -C ${H} worktree add -b ${HEADREF} ${REB} origin/${HEADREF}
     \$ cd ${REB} && ${ABSORB} ${H}/../worktrees/${PS}
-    \$ git -C ${H} push ${ORIGIN} refs/heads/${HEADREF}:refs/heads/${HEADREF}  # never force" "$STEPS_TEXT"
+    \$ git -C ${H} push -q ${ORIGIN} refs/heads/${HEADREF}:refs/heads/${HEADREF}  # never force" "$STEPS_TEXT"
 assert_status "reject-five-steps" "5" "$(grep -c . <<< "$STEPS_TEXT")"
 assert_absent "reject-no-pr-create" "gh pr create" "$OUT"
 assert_status "reject-skill-form" "/absorb-devloop ${PS} run from that worktree" "$OUT"
@@ -389,7 +468,7 @@ assert_rc     "reject-no-rebase-dir" 1 "$([[ -e "$REB" ]] && echo 0 || echo 1)"
 assert_rc     "reject-no-host-worktree" 1 "$(git -C "$H" worktree list | grep -q rebase && echo 0 || echo 1)"
 assert_status "reject-local-head-untouched" "$HEAD_OID" "$(git -C "$H" rev-parse "refs/heads/${HEADREF}")"
 GL="$(log git)"
-assert_status "reject-shim-saw-host-push" "argv= -C ${H} push ${ORIGIN} " "$GL"
+assert_status "reject-shim-saw-host-push" "argv= -C ${H} push -q ${ORIGIN} " "$GL"
 assert_absent "reject-shim-no-worktree-add" "worktree add" "$GL"
 assert_absent "reject-shim-no-fetch-origin" " fetch origin" "$GL"
 assert_absent "reject-shim-no-branch-delete" "branch -D" "$GL"
@@ -397,7 +476,10 @@ assert_status "reject-no-git-in-clone" "none" "$(c="$(clone_git_calls "$PS" "$GL
 assert_status "reject-matcher-control-cwd" "cwd=${CL}|" "$(clone_git_calls "$PS" "cwd=${CL}|GIT_DIR=|GIT_WORK_TREE=|argv= rev-parse HEAD")"
 assert_status "reject-matcher-control-C" "rev-parse" "$(clone_git_calls "$PS" "cwd=/x|GIT_DIR=|GIT_WORK_TREE=|argv= -C ${H}/../worktrees/${PS} rev-parse HEAD")"
 assert_status "reject-matcher-control-gitdir" "rev-parse" "$(clone_git_calls "$PS" "cwd=/x|GIT_DIR=${CL}/.git|GIT_WORK_TREE=|argv= rev-parse HEAD")"
-assert_absent "reject-no-podman-inspect" "inspect" "$(log podman)"
+# The recovery inspects no container (the bundle era checked mounts); the only inspect is the
+# re-attach's cluster-label read.
+assert_absent "reject-no-mount-inspect" ".Mounts" "$(log podman)"
+assert_status "reject-only-label-inspect" "0" "$(grep inspect <<< "$(log podman)" | grep -vc 'devloop.cluster' || true)"
 assert_absent "reject-no-unmodelled" "unmodelled" "$OUT"
 assert_not_hostile "reject" "$CL"
 
@@ -469,7 +551,7 @@ assert_rc     "reject4-teardown" 0 "$rc_"
 printf 'jq %q %q > %q.t && mv %q.t %q\n' '.state = "CLOSED"' "${FIX}/pr-7.json" "${FIX}/pr-7.json" "${FIX}/pr-7.json" "${FIX}/pr-7.json" > "${C}/session.sh"
 STUB_SESSION="${C}/session.sh" dl "q" "$BIN" ${PS} --pr 7 ${PS}
 assert_status "closed-mid-warning" "WARNING: PR #7 is no longer open" "$OUT"
-assert_status "closed-mid-manual-push" "push ${ORIGIN} refs/devloop/${PS}/head:refs/heads/${HEADREF}" "$OUT"
+assert_status "closed-mid-manual-push" "push -q ${ORIGIN} refs/devloop/${PS}/head:refs/heads/${HEADREF}" "$OUT"
 assert_absent "closed-mid-no-push-arm" "[p] Push" "$OUT"
 assert_absent "closed-mid-no-create" "[c] Push and create" "$OUT"
 
@@ -498,6 +580,66 @@ assert_rc     "destroy-rc" 0 "$RC"
 assert_rc     "destroy-drops-host-refs" 1 "$(git -C "$H" for-each-ref "refs/devloop/${PS}" | grep -q . && echo 0 || echo 1)"
 assert_rc     "destroy-drops-clone" 1 "$([[ -e "$CL" ]] && echo 0 || echo 1)"
 assert_rc     "destroy-drops-runtime-dir" 1 "$([[ -e "/tmp/devloop-${PS}" ]] && echo 0 || echo 1)"
+# The local <head> devloop.sh created was moved since (the reject recovery rebuilt it): kept, loudly.
+assert_status "destroy-keeps-moved-branch" "Kept local branch ${HEADREF}: it moved since devloop.sh created it" "$OUT"
+assert_rc     "destroy-moved-branch-still-there" 0 "$(git -C "$H" rev-parse -q --verify "refs/heads/${HEADREF}" >/dev/null && echo 0 || echo 1)"
+assert_rc     "destroy-drops-branch-record" 1 "$(git -C "$H" config --get-regexp "^devloop\\.${PS}\\." >/dev/null && echo 0 || echo 1)"
+
+# ── --no-cluster, and --destroy deleting the unchanged local <head> it created ──
+fixture nocluster
+mkpr 7
+dl "q" "$BIN" ${PS} --no-cluster --pr 7 ${PS}
+assert_rc     "nocl-rc" 0 "$RC"
+assert_status "nocl-infra-skipped" "cluster=skipped (--no-cluster; Layer 7 needs it: run scripts/layer-all.sh --max-layer 6)" "$OUT"
+assert_status "nocl-reenter-keeps-flag" "Re-enter with: ${DEVLOOP} --no-cluster --pr 7 ${PS}" "$OUT"
+assert_status "nocl-branch-recorded" "$HEADREF" "$(git -C "$H" config --get "devloop.${PS}.createdBranch")"
+STUB_LABEL=on dl "q" "$BIN" ${PS} --no-cluster --pr 7 ${PS}
+assert_status "nocl-label-mismatch-warned" "was created with a cluster; its helper and Kind cluster from earlier" "$OUT"
+STUB_LABEL=off dl "q" "$BIN" ${PS} --no-cluster --pr 7 ${PS}
+assert_absent "nocl-label-match-quiet" "was created with" "$OUT"
+# Two upstream rewrites in a row (e.g. Dependabot rebases twice): each printed recovery replays
+# ONLY the clone's own commits. The second must rebase from the head the first rebased onto
+# (devloop.<slug>.lastOnto), not the launch head — that range would replay the re-made bump.
+CL2="$(clone "$PS")"
+printf 'fix1\n' > "${CL2}/fix1"; git -C "$CL2" add fix1; git -C "$CL2" commit -qm "fix one"
+rewrite() {  # <bump content>: force-push a re-made bump on a moved main; prints the new head
+  local o="${C}/rw"; rm -rf "$o"; git clone -q "$ORIGIN" "$o"
+  printf '%s\n' "$1" > "${o}/m"; git -C "$o" add m; git -C "$o" commit -qm "main moves"; git -C "$o" push -q origin HEAD:main
+  git -C "$o" checkout -qb rw origin/main 2>/dev/null || git -C "$o" checkout -qb rw
+  printf '%s\n' "$1" > "${o}/g"; git -C "$o" add g; git -C "$o" commit -qm "bump x to 1.2.3"
+  git -C "$o" push -q -f origin "rw:refs/heads/${HEADREF}"; git -C "$ORIGIN" rev-parse "refs/heads/${HEADREF}"
+}
+run_inner() {  # run the printed in-container script in CL2 (url -> fixture origin)
+  local inner; inner="$(grep -o "bash -c '[^']*'" <<< "$OUT" | head -1 | sed "s/^bash -c '//; s/'\$//; s#https://github.com/acme/tower.git#${ORIGIN}#")"
+  (cd "$CL2" && bash -c "$inner") >/dev/null 2>&1
+}
+echo PUBLIC > "${FIX}/visibility"
+R1="$(rewrite 'bump r1')"; mkpr 7 ".headRefOid = \"$R1\""
+dl "pq" "$BIN" ${PS} --no-cluster --pr 7 ${PS}
+assert_status "twice1-rejected" "was rejected" "$OUT"
+assert_status "twice1-base-is-launch-head" "rebase --onto FETCH_HEAD ${HEAD_OID}'" "$OUT"
+assert_status "twice1-keeps-no-cluster" "${DEVLOOP} --no-cluster --pr 7 ${PS} -- bash -c" "$OUT"
+assert_status "twice1-lastonto-recorded" "$R1" "$(git -C "$H" config --get "devloop.${PS}.lastOnto")"
+T_RC=0; run_inner || T_RC=$?
+assert_rc     "twice1-rebase-runs" 0 "$T_RC"
+R2="$(rewrite 'bump r2')"; mkpr 7 ".headRefOid = \"$R2\""
+dl "pq" "$BIN" ${PS} --no-cluster --pr 7 ${PS}
+assert_status "twice2-rejected" "was rejected" "$OUT"
+assert_status "twice2-base-is-first-onto" "rebase --onto FETCH_HEAD ${R1}'" "$OUT"
+T_RC=0; run_inner || T_RC=$?
+assert_rc     "twice2-rebase-runs" 0 "$T_RC"
+assert_status "twice2-on-second-rewrite" "bump r2" "$(cat "${CL2}/g")"
+assert_status "twice2-bump-once" "1" "$(git -C "$CL2" log --format=%s "${R2}~1..HEAD" | grep -c '^bump x to 1.2.3$' || true)"
+assert_status "twice2-fix-kept" "fix one" "$(git -C "$CL2" log --format=%s "${R2}..HEAD")"
+dl "" "$BIN" "${PS}" --no-cluster --destroy "${PS}"
+assert_rc     "nocl-with-destroy-refused" 1 "$RC"
+assert_status "nocl-with-destroy-msg" "--no-cluster only applies to a launch/re-attach" "$OUT"
+dl "" "$BIN" "${PS}" --destroy "${PS}"
+assert_rc     "destroy-unchanged-rc" 0 "$RC"
+assert_status "destroy-deletes-unchanged-branch" "Deleted local branch ${HEADREF} (created by devloop.sh from origin, unchanged since)." "$OUT"
+assert_rc     "destroy-unchanged-branch-gone" 1 "$(git -C "$H" rev-parse -q --verify "refs/heads/${HEADREF}" >/dev/null && echo 0 || echo 1)"
+assert_rc     "destroy-unchanged-record-gone" 1 "$(git -C "$H" config --get-regexp "^devloop\\.${PS}\\." >/dev/null && echo 0 || echo 1)"
+assert_rc     "destroy-main-untouched" 0 "$(git -C "$H" rev-parse -q --verify refs/heads/main >/dev/null && echo 0 || echo 1)"
 
 # ── Without --pr ───────────────────────────────────────────────────────────────
 fixture nopr
