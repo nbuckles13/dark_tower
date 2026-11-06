@@ -156,23 +156,60 @@ Action:   <action>
 PR action: <the overall next step — e.g. "decide (cause 2), then one fix devloop covering causes 1–2">
 ```
 
-One PR gets **one** fix devloop covering all its code causes; route it to the owner of the
-cause that needs the most domain judgment and `--paired-with` the others' owners.
+One PR gets **one** fix covering all its code causes; route it to the owner of the cause that
+needs the most domain judgment and `--paired-with` the others' owners.
 
-For **fix**, print the commands, filled in:
+**Size the fix by the fix's own diff, not the PR's.** The PR's existing change (e.g. a
+Dependabot bump touching `Cargo.toml`) was already judged at Step 3 and is judged again at
+merge; it does not make the fix heavier. Pick the lightest tier that fits — when unsure,
+go one tier heavier:
+
+| Tier | When (all must hold) | Flow |
+|---|---|---|
+| **Mechanical** | cause fully identified; fix is a few lines; the fix's diff touches no `--light` exclusion (`.claude/skills/devloop/SKILL.md` §Lightweight Mode) and no GSA path | no devloop — a shell in the container (`-- bash`): edit, `scripts/layer-all.sh`, commit, exit, `[p]` |
+| **Light** | fix is small but needs judgment (e.g. an API migration with choices); still no exclusion or GSA in the fix's diff | `/devloop --light` |
+| **Full** | the fix's diff touches a `--light` exclusion or a GSA path, or an owner-review rule (Step 3) applies to what the *fix* changes, or the cause needs a decision | `/devloop` (full) |
+
+State the chosen tier and the reason in the report's `Action:` line. An owner-review rule that
+applies to the PR's *existing* change (e.g. dependabot.yml's buf / tonic-prost notes on the bump)
+does not raise the fix's tier: it becomes **merge after review by <owners>** (Step 7).
+
+For **fix**, print the commands for the chosen tier, filled in. Slug: lowercase, <= 41 chars,
+e.g. `pr<n>-<dep>`; run `devloop.sh` from a host checkout or worktree.
+
+**`--no-cluster`** skips the devloop's Kind cluster — a large saving for small fixes. Suggest it
+only for the **Mechanical** tier, and only when no failed check is a Layer 7 lane (`Layer 7
+(env-tests)`, `Layer 7 (browser-e2e)`) and the fix's diff does not touch what Layer 7 exercises
+(service runtime code under `crates/*-service/src/`, `infra/`, deploy manifests,
+`packages/web-app/`). Validate with `scripts/layer-all.sh --max-layer 6` — Layer 7 fails loudly
+without a cluster, by design — and CI runs Layer 7. Never suggest it for Light / Full: a
+`/devloop`'s Gate 2 runs every layer and needs the cluster. Say in the `Action:` line whether it
+applies and why.
+
+**Mechanical** — a shell in the container, no Claude session:
 
 ```
-infra/devloop/devloop.sh --pr <n> <slug>        # from a host checkout/worktree; slug: lowercase, <= 41 chars, e.g. pr<n>-<dep>
+infra/devloop/devloop.sh [--no-cluster] --pr <n> <slug> -- bash
+# in the container shell:
+<the edit, file:line by file:line>
+scripts/layer-all.sh [--max-layer 6]            # must pass before committing; --max-layer 6 with --no-cluster
+git add -A && git commit -m "<subject: what the fix adapts to>"   # -A: -am would miss new files
+exit
+# back on the host: the exit menu (shown even if the shell exited non-zero) lists the unpushed
+# commit — pick [p] to push to the PR
+```
+
+**Light / Full** — Claude in the container:
+
+```
+infra/devloop/devloop.sh --pr <n> <slug>
 # inside the container:
-/devloop "PR <n> (<author>) <what the PR does>; CI fails: <cause, one line>.
+/devloop [--light] "PR <n> (<author>) <what the PR does>; CI fails: <cause, one line>.
 <evidence lines>
 <known fix or migration path, if identified — else: find the root cause>
 Reproduce with scripts/layer-all.sh and make all layers pass. Keep the PR's intent<, for Dependabot: do not revert or pin back the bump>. <Review rules from Step 3, if any>. If the fix needs a decision, stop and raise it." --specialist=<specialist> [--paired-with=<owner>]
 # exit with [p] to push to the PR
 ```
-
-Add `--light` only when the fix is clearly small and touches none of the `--light` exclusions
-(`.claude/skills/devloop/SKILL.md` §Lightweight Mode) — when unsure, leave it off.
 
 For Dependabot PRs that need a fix, remind: once anyone pushes to the branch, Dependabot stops
 rebasing it, and `@dependabot rebase` / `@dependabot recreate` would discard the pushed commits.
@@ -185,5 +222,13 @@ Only after the user confirms, and one PR at a time:
 - **Merge**: `gh pr merge <n> --squash --delete-branch`, then confirm with
   `gh pr view <n> --json state,mergedAt`. After each merge, the remaining PRs' bases moved —
   re-check `mergeable` (and, for lockfile PRs, expect conflicts) before merging the next.
+  Then print the cleanup for that PR's devloop, if one exists (`podman ps` shows
+  `devloop-<slug>-dev`; the slug is the one from its fix command): `infra/devloop/devloop.sh
+  --destroy <slug>`. It removes the containers, cluster and clone, and the local PR branch
+  devloop.sh created when it is unchanged (it says so if it keeps one). Do not run it — the
+  user does, after checking nothing in the clone is unpushed.
 - **Rerun**: `gh run rerun <run-id> --failed`.
+- **Review** (merge after review by <owners>): spawn each owning specialist as a reviewer of
+  `gh pr diff <n>` with the rule that requires them (e.g. the dependabot.yml note); report their
+  verdicts, then offer the merge.
 - **Fix**: the user runs the printed commands; this skill does not start devloops.
