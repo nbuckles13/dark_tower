@@ -153,20 +153,10 @@ chmod +x "$FAKE_DC"
 # Phase-1h reads to address the provisioning target).
 PORTS="${WORK}/ports.json"
 cat > "$PORTS" <<'EOF'
-{"cluster_name":"devloop-fixture","container_urls":{"ac":"http://ac:8082","gc":"http://gc:8080","prometheus":"http://prom:9090","grafana":"http://graf:3000","loki":"http://loki:3100"},"ports":{"mh_0_grpc":38021,"mh_1_grpc":38024}}
+{"cluster_name":"devloop-fixture","container_urls":{"ac":"http://ac:8082","gc":"http://gc:8080","prometheus":"http://prom:9090","grafana":"http://graf:3000","loki":"http://loki:3100"}}
 EOF
 
-# Same file with `.ports.mh_1_grpc` ABSENT — drives Phase-1i's mh-grpc-port-unallocated lane
-# (a present ports.json missing one key is a DIFFERENT fault from ports-json-missing).
-PORTS_NO_MH1="${WORK}/ports-no-mh1.json"
-cat > "$PORTS_NO_MH1" <<'EOF'
-{"cluster_name":"devloop-fixture","container_urls":{"ac":"http://ac:8082","gc":"http://gc:8080","prometheus":"http://prom:9090","grafana":"http://graf:3000","loki":"http://loki:3100"},"ports":{"mh_0_grpc":38021}}
-EOF
-
-# Fake kubectl for Phase-1i (injected via DEVLOOP_KUBECTL). `get pods` prints FAKE_MH_PODS
-# live pods (default 1) as "name ip"; `port-forward` records its PID (so a case can prove the
-# lifecycle cleanup killed it) and then either stays up (default) or exits at once
-# (FAKE_FORWARD_EXIT=1) to drive mh-grpc-forward-not-ready.
+# Fake kubectl (injected via DEVLOOP_KUBECTL) for the Phase-1g media-codec-profile resolution.
 FAKE_KUBECTL="${WORK}/fake-kubectl"
 cat > "$FAKE_KUBECTL" <<'EOF'
 #!/usr/bin/env bash
@@ -196,45 +186,10 @@ case "$args" in
     [[ "${FAKE_PROFILE_CM_RC:-0}" == "0" ]] || { echo 'Error from server (NotFound)' >&2; exit 1; }
     printf '{"data":{"MEDIA_VIDEO_CODEC":"vp8","MEDIA_VIDEO_WIDTH":"320","MEDIA_VIDEO_HEIGHT":"180","MEDIA_AUDIO_CODEC":"opus"}}\n'
     ;;
-  *" get pods "*)
-    n="${args##*instance=mh-}"; n="${n%% *}"
-    # A rollout's terminating predecessor, listed FIRST (three fields: it carries a
-    # deletionTimestamp). Layer 7 must skip it and still resolve the one live pod.
-    if [[ "${FAKE_MH_TERMINATING:-0}" == "1" ]]; then
-      printf 'mh-%s-old 10.0.%s.99 2026-09-25T00:00:00Z\n' "$n" "$n"
-    fi
-    for ((i = 0; i < ${FAKE_MH_PODS:-1}; i++)); do
-      printf 'mh-%s-fake%s 10.0.%s.%s \n' "$n" "$i" "$n" "$((i + 10))"
-    done
-    ;;
-  *" port-forward "*)
-    pod="${args##*pod/}"; pod="${pod%% *}"
-    port="${args##* }"; port="${port%%:*}"
-    printf '%s' "$$" > "${FAKE_DC_MARKERS}/forward.${pod}.pid"
-    if [[ "${FAKE_FORWARD_EXIT:-0}" == "1" ]]; then
-      echo "error: unable to listen on port: bind: address already in use" >&2
-      exit 1
-    fi
-    # "Listening": the fake probe accepts this port only while THIS process lives. `exec`
-    # keeps the PID, so the recorded PID is the sleep the cleanup must kill.
-    printf '%s' "$$" > "${FAKE_DC_MARKERS}/listen.${port}"
-    exec sleep 300
-    ;;
   *) exit 0 ;;
 esac
 EOF
 chmod +x "$FAKE_KUBECTL"
-# Stateful readiness probe ($1=host $2=port): accepts only while the fake forward that
-# claimed this port is alive — or unconditionally with FAKE_PORT_OCCUPIED=1, which models a
-# port something else already holds (the host-run case the pre-forward check exists for).
-FAKE_MH_PROBE="${WORK}/fake-mh-probe"
-cat > "$FAKE_MH_PROBE" <<'EOF'
-#!/usr/bin/env bash
-[[ "${FAKE_PORT_OCCUPIED:-0}" == "1" ]] && exit 0
-f="${FAKE_DC_MARKERS}/listen.${2}"
-[[ -f "$f" ]] && kill -0 "$(cat "$f")" 2>/dev/null
-EOF
-chmod +x "$FAKE_MH_PROBE"
 
 # Same file with `.cluster_name` ABSENT — drives Phase-1h's fail-closed context check.
 # A separate fixture rather than a FAKE_* flag: the condition IS the file's content.
@@ -413,12 +368,6 @@ run_layer7() {
       FAKE_DC_MARKERS="${MARKERS}" \
       DEVLOOP_SELF_HEAL_STATUS_TIMEOUT="${STATUS_TIMEOUT:-20}" \
       DEVLOOP_KUBECTL="${FAKE_KUBECTL}" \
-      DEVLOOP_MH_FORWARD_PROBE="${FAKE_MH_PROBE}" \
-      DEVLOOP_MH_FORWARD_BUDGET="${MH_FORWARD_BUDGET:-5}" \
-      FAKE_MH_PODS="${FAKE_MH_PODS:-1}" \
-      FAKE_FORWARD_EXIT="${FAKE_FORWARD_EXIT:-0}" \
-      FAKE_PORT_OCCUPIED="${FAKE_PORT_OCCUPIED:-0}" \
-      FAKE_MH_TERMINATING="${FAKE_MH_TERMINATING:-0}" \
       FAKE_PROFILE_GENERATIONS="${FAKE_PROFILE_GENERATIONS:-1}" \
       FAKE_PROFILE_CM_RC="${FAKE_PROFILE_CM_RC:-0}" \
       FAKE_PROFILE_PODS_RC="${FAKE_PROFILE_PODS_RC:-0}" \
@@ -443,7 +392,6 @@ reset_case() {
         FAKE_STATUS_SLEEP FAKE_APISERVER_REACHABLE FAKE_PODS_FLIP_AFTER FAKE_RECREATE_OUTCOME \
         FAKE_RECREATE_NO_FLIP FAKE_RECREATE_RC FAKE_RECREATE_EVIDENCE FAKE_RECREATE_ATTEMPT \
         FAKE_RESTORE_OUTCOME FAKE_RESTORE_RC FAKE_RESTORE_ATTEMPT STATUS_TIMEOUT \
-        FAKE_MH_PODS FAKE_FORWARD_EXIT MH_FORWARD_BUDGET FAKE_PORT_OCCUPIED FAKE_MH_TERMINATING \
         FAKE_PROFILE_GENERATIONS FAKE_PROFILE_CM_RC FAKE_PROFILE_PODS_RC FAKE_PROFILE_PODS_GARBAGE
   # Markers are per-case evidence; a stale one from the previous case would make
   # assert_no_marker report a stub that never ran (and assert_marker pass vacuously).
@@ -714,11 +662,11 @@ assert_exit   "phase2-ok-exit0"  0 "$RC"
 assert_status "phase2-ok-status" "STATUS=OK REASON=env-tests-passed" "$(cat "$OUT")"
 reset_case
 
-# === Phase-1i MH gRPC port-forwards (story 2 task 11) =========================
-# The env-test calls each MH pod's gRPC directly. Layer 7 forwards pod/mh-N (resolved by the
-# instance=mh-N label) to the slug's allocated .ports.mh_N_grpc, exports the URL and the pod
-# IP (the Prometheus `instance` pin), and stops the forwards through the lifecycle cleanup
-# hook on EVERY exit path — never a `trap` in layer7.sh.
+# === Retired Phase-1i (story 4 T-0): Layer 7 starts NO MH gRPC forwards ======
+# The env-test fixture (crates/env-tests/src/fixtures/mh_grpc.rs) discovers MH pods by label
+# and owns its per-test forwards on local port 0. Layer 7 must export none of the retired
+# ENV_TEST_MH_* variables. Positive control: the suite stub DID run (its marker), so the
+# all-<unset> record is evidence rather than an empty file from a suite that never started.
 MH_SUITE_STUB="${WORK}/suite-env-mh.sh"
 cat > "$MH_SUITE_STUB" <<EOF
 #!/usr/bin/env bash
@@ -729,149 +677,27 @@ exit 0
 EOF
 chmod +x "$MH_SUITE_STUB"
 
-# A forward the fake recorded is DEAD after layer7 exits (the cleanup ran).
-assert_forward_stopped() {  # $1=label  $2=pod name
-  local pidf="${MARKERS}/forward.${2}.pid" pid
-  if [[ ! -f "$pidf" ]]; then
-    FAIL=$((FAIL + 1)); FAILURES+=("[${1}] no forward was started for ${2} (${pidf} absent)")
-    return
-  fi
-  pid="$(cat "$pidf")"
-  if kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null
-    FAIL=$((FAIL + 1)); FAILURES+=("[${1}] forward for ${2} (pid ${pid}) still running after layer7 exited")
-  else
-    PASS=$((PASS + 1))
-  fi
-}
-
-# Green: both forwards started, the suite sees both URLs and pod IPs, both stopped at exit.
 reset_case
 SOCK="$PRESENT_SOCK"; export ENVCMD="$MH_SUITE_STUB"
 rm -f "${WORK}/seen-mh-env"
 run_layer7 "$OUT" "$ERR"
-assert_exit   "mh-forward-green-exit0" 0 "$RC"
-assert_status "mh-forward-green-env" \
-  "http://127.0.0.1:38021|http://127.0.0.1:38024|10.0.0.10|10.0.1.10" \
-  "$(cat "${WORK}/seen-mh-env" 2>/dev/null; echo " [stderr-tail:$(tail -n 5 "$ERR" | tr "\n" " ")]")"
-assert_forward_stopped "mh-forward-green-stopped-0" "mh-0-fake0"
-assert_forward_stopped "mh-forward-green-stopped-1" "mh-1-fake0"
+assert_exit   "mh-env-retired-exit0" 0 "$RC"
+assert_marker "mh-env-retired-suite-ran" "$MARKERS" "ran.env-suite"
+assert_rc     "mh-env-retired-all-unset" 0 \
+  "$([[ "$(cat "${WORK}/seen-mh-env" 2>/dev/null)" == "<unset>|<unset>|<unset>|<unset>" ]] && echo 0 || echo "1 ($(cat "${WORK}/seen-mh-env" 2>/dev/null || echo 'no record'))")"
+# Positive control for the absence below: this run DOES emit step-duration lines to $ERR.
+assert_status "mh-env-retired-steps-timed" "LAYER=7 STEP=" "$(cat "$ERR")"
+assert_absent "mh-env-retired-no-step" "STEP=mh-grpc-forwards" "$(cat "$ERR")"
 reset_case
 
-# A ports.json without .ports.mh_1_grpc → its own token, suite never runs, and the mh-0
-# forward that DID start is still stopped (cleanup on the precondition_fail path).
-reset_case
-SOCK="$PRESENT_SOCK"; export ENVCMD="$MH_SUITE_STUB" PORTS_JSON_OVERRIDE="$PORTS_NO_MH1"
-run_layer7 "$OUT" "$ERR"
-assert_exit      "mh-port-unallocated-exit2" 2 "$RC"
-assert_status    "mh-port-unallocated-token" "REASON=mh-grpc-port-unallocated" "$(cat "$OUT")"
-assert_no_marker "mh-port-unallocated-no-suite" "$MARKERS" "ran.env-suite"
-assert_forward_stopped "mh-port-unallocated-stops-mh0" "mh-0-fake0"
-reset_case
-
-# Not exactly one live pod → mh-pod-unresolved (never guess which handler to call).
-for pods in 0 2; do
-  reset_case
-  SOCK="$PRESENT_SOCK"; export ENVCMD="$MH_SUITE_STUB" FAKE_MH_PODS="$pods"
-  run_layer7 "$OUT" "$ERR"
-  assert_exit      "mh-pods-${pods}-exit2" 2 "$RC"
-  assert_status    "mh-pods-${pods}-token" "REASON=mh-pod-unresolved" "$(cat "$OUT")"
-  assert_no_marker "mh-pods-${pods}-no-suite" "$MARKERS" "ran.env-suite"
-  reset_case
+# STATIC drift guard on the retirement: none of the Phase-1i machinery, seams, tokens or
+# exports is left in layer7.sh (comments included: a stale mention misleads triage).
+# Positive controls: the file was read, and a needle that MUST hit does.
+assert_rc     "mh-1i-retired-layer7-readable" 0 "$([[ -s "$LAYER7" ]] && echo 0 || echo 1)"
+assert_status "mh-1i-retired-control-needle" "KUBECTL_BIN" "$(cat "$LAYER7")"
+for needle in ENV_TEST_MH_ mh-grpc mh-pod-unresolved MH_FORWARD __start_mh_grpc_forward __reap_stale_mh_forwards mh_0_grpc mh_1_grpc; do
+  assert_absent "mh-1i-retired-${needle}" "$needle" "$(cat "$LAYER7")"
 done
-
-# The forward process exits before accepting (e.g. EADDRINUSE on the host) → fails fast.
-reset_case
-SOCK="$PRESENT_SOCK"; export ENVCMD="$MH_SUITE_STUB" FAKE_FORWARD_EXIT=1
-run_layer7 "$OUT" "$ERR"
-assert_exit      "mh-forward-exits-exit2" 2 "$RC"
-assert_status    "mh-forward-exits-token" "REASON=mh-grpc-forward-not-ready" "$(cat "$OUT")"
-assert_status    "mh-forward-exits-cause" "address already in use" "$(cat "$ERR")"
-assert_no_marker "mh-forward-exits-no-suite" "$MARKERS" "ran.env-suite"
-reset_case
-
-# The port is already held before the forward starts (on the host, Kind's extraPortMapping
-# accepts on it) → its own token, rather than a readiness pass against the wrong listener.
-reset_case
-SOCK="$PRESENT_SOCK"; export ENVCMD="$MH_SUITE_STUB" FAKE_PORT_OCCUPIED=1 MH_FORWARD_BUDGET=1
-run_layer7 "$OUT" "$ERR"
-assert_exit      "mh-port-occupied-exit2" 2 "$RC"
-assert_status    "mh-port-occupied-token" "REASON=mh-grpc-port-occupied" "$(cat "$OUT")"
-assert_no_marker "mh-port-occupied-no-suite" "$MARKERS" "ran.env-suite"
-reset_case
-
-# A terminating predecessor pod (deletionTimestamp set) is skipped: the one LIVE pod is
-# resolved and pinned, rather than tripping mh-pod-unresolved or pinning the dying pod.
-reset_case
-SOCK="$PRESENT_SOCK"; export ENVCMD="$MH_SUITE_STUB" FAKE_MH_TERMINATING=1
-rm -f "${WORK}/seen-mh-env"
-run_layer7 "$OUT" "$ERR"
-assert_exit   "mh-terminating-skipped-exit0" 0 "$RC"
-assert_status "mh-terminating-skipped-live-pod" \
-  "http://127.0.0.1:38021|http://127.0.0.1:38024|10.0.0.10|10.0.1.10" \
-  "$(cat "${WORK}/seen-mh-env" 2>/dev/null)"
-reset_case
-
-# A stale forward from an earlier run (its cmdline matches THIS cluster's pattern) is
-# REAPED before the new forwards start, and the reap reports it. The container has no
-# pkill, so this is the /proc scan's proof that it actually kills something.
-reset_case
-SOCK="$PRESENT_SOCK"; export ENVCMD="$MH_SUITE_STUB"
-# argv[0] is literally `kubectl` (the reaper only considers kubectl processes); python3
-# ignores the trailing args, which are what the reaper's pattern matches.
-( exec -a kubectl python3 -c 'import time; time.sleep(300)' \
-    --context kind-devloop-fixture -n dark-tower port-forward --address 127.0.0.1 \
-    pod/mh-0-stale 1:50053 ) &
-__stale_pid=$!
-# The subshell must have EXEC'd before the reaper's /proc scan runs: until then its
-# cmdline is still bash, the reaper finds nothing and reports "reaped: 0" (a race,
-# not a reaper fault). Bounded wait (5 s); never landing is a loud harness failure.
-__stale_execd=0
-for _ in $(seq 1 100); do
-  if grep -qa 'port-forward' "/proc/${__stale_pid}/cmdline" 2>/dev/null; then
-    __stale_execd=1
-    break
-  fi
-  sleep 0.05
-done
-if [[ "$__stale_execd" != "1" ]]; then
-  FAIL=$((FAIL + 1)); FAILURES+=("[mh-reap-setup] stale forward pid ${__stale_pid} never exec'd as the kubectl port-forward stand-in within 5s")
-fi
-run_layer7 "$OUT" "$ERR"
-assert_exit   "mh-reap-exit0" 0 "$RC"
-assert_status "mh-reap-reported" "stale MH gRPC port-forwards reaped: 1" "$(cat "$ERR")"
-# Reap the zombie (it is this shell's child) and read its fate: killed by SIGTERM.
-wait "$__stale_pid" 2>/dev/null; __stale_rc=$?
-if [[ "$__stale_rc" == "143" ]]; then
-  PASS=$((PASS + 1))
-else
-  kill "$__stale_pid" 2>/dev/null
-  FAIL=$((FAIL + 1)); FAILURES+=("[mh-reap-killed] stale forward pid ${__stale_pid} was not killed by the reap (wait rc=${__stale_rc})")
-fi
-reset_case
-
-# An UNRELATED forward — another cluster's context — is NOT reaped. Nor is a NON-kubectl
-# process whose argv merely contains this cluster's pattern (e.g. a shell whose script
-# text mentions it — the case that once killed the shell that wrote this test).
-reset_case
-SOCK="$PRESENT_SOCK"; export ENVCMD="$MH_SUITE_STUB"
-( exec -a kubectl python3 -c 'import time; time.sleep(300)' \
-    --context kind-some-other-cluster -n dark-tower port-forward --address 127.0.0.1 \
-    pod/mh-0-x 1:50053 ) &
-__other_pid=$!
-python3 -c 'import time; time.sleep(300)' \
-  --context kind-devloop-fixture -n dark-tower port-forward --address 127.0.0.1 pod/mh-0-y 1:50053 &
-__bystander_pid=$!
-run_layer7 "$OUT" "$ERR"
-for __spared in "other-cluster:${__other_pid}" "non-kubectl:${__bystander_pid}"; do
-  if kill -0 "${__spared#*:}" 2>/dev/null; then
-    PASS=$((PASS + 1)); kill "${__spared#*:}"
-  else
-    FAIL=$((FAIL + 1)); FAILURES+=("[mh-reap-scoped] the ${__spared%%:*} process was reaped")
-  fi
-done
-wait "$__other_pid" "$__bystander_pid" 2>/dev/null
-reset_case
 
 # === Phase-1f observability readiness (user ruling (a) — per-probe hard/soft) =========
 # Prometheus HARD: not-ready → PRECONDITION_FAILURE (exit 2, operator lane), BEFORE the suite.
@@ -1224,8 +1050,8 @@ printf '#!/usr/bin/env bash\ngit rev-parse HEAD >/dev/null\n' > "$GIT_PROBE_SUIT
     DEVLOOP_HEALTH_BUDGET=0 DEVLOOP_SETUP_SH="$FAKE_SETUP" DEVLOOP_ORG_PROBE="$FAKE_ORG_PROBE_BIN" \
     FAKE_PROBE_CODE=401 FAKE_AC_READY=1 FAKE_PROM_READY=1 FAKE_LOKI_READY=1 \
     DEVLOOP_BROWSER_E2E_CMD=true DEVLOOP_FINGERPRINTS_JSON="$GOOD_FP" PLAYWRIGHT_BROWSERS_PATH="$GOOD_PW_DIR" \
-    FAKE_DC_MARKERS="$MARKERS" DEVLOOP_KUBECTL="$FAKE_KUBECTL" DEVLOOP_MH_FORWARD_PROBE="$FAKE_MH_PROBE" \
-    FAKE_MH_PODS=1 bash "${DIFFREPO}/scripts/layer7.sh" ) >"$OUT" 2>"$ERR"; RC=$?
+    FAKE_DC_MARKERS="$MARKERS" DEVLOOP_KUBECTL="$FAKE_KUBECTL" \
+    bash "${DIFFREPO}/scripts/layer7.sh" ) >"$OUT" 2>"$ERR"; RC=$?
 assert_exit "no-diff-staged-infra-exit0" 0 "$RC"
 assert_rc "no-diff-staged-infra-exactly-provision-deploy" 0 "$([[ "$(tr '\n' ' ' < "${MARKERS}/dc.calls" 2>/dev/null)" == "provision deploy " ]] && echo 0 || echo "1 ($(tr '\n' ' ' < "${MARKERS}/dc.calls" 2>/dev/null))")"
 assert_absent "no-diff-git-never-asked-merge-base" "merge-base" "$(cat "${WORK}/git.calls" 2>/dev/null)"
@@ -1952,7 +1778,7 @@ assert_marker    "sel-default-browser-ran"      "$MARKERS" "ran.browser-suite"
 assert_status    "sel-default-env-status"       "STATUS=OK REASON=env-tests-passed" "$(cat "$OUT")"
 assert_status    "sel-default-browser-status"   "STATUS=OK REASON=browser-e2e-passed" "$(cat "$OUT")"
 assert_status    "sel-default-1g-ran"           "STEP=browser-e2e-preconditions" "$(cat "$ERR")"
-assert_status    "sel-default-1i-ran"           "STEP=mh-grpc-forwards" "$(cat "$ERR")"
+assert_absent    "sel-default-no-1i"            "STEP=mh-grpc-forwards" "$(cat "$ERR")"
 assert_rc        "sel-default-profile-dumped"   0 "$([[ -s "$DUMP_FILE" ]] && echo 0 || echo 1)"
 assert_absent    "sel-default-no-subset-token"  "subset-" "$(cat "$OUT")"
 assert_absent    "sel-default-no-suite-note"    "LAYER7_SUITE" "$(cat "$ERR")"
@@ -1976,7 +1802,7 @@ assert_status    "sel-env-layer-line-names-it"  "RESULT=OK REASON=subset-env-tes
 assert_status    "sel-env-stderr-note"          "LAYER7_SUITE=env-tests" "$(cat "$ERR")"
 assert_absent    "sel-env-1g-not-run"           "STEP=browser-e2e-preconditions" "$(cat "$ERR")"
 assert_rc        "sel-env-no-profile-dump"      0 "$([[ ! -e "$DUMP_FILE" ]] && echo 0 || echo 1)"
-assert_status    "sel-env-1i-still-runs"        "STEP=mh-grpc-forwards" "$(cat "$ERR")"
+assert_absent    "sel-env-no-1i"                "STEP=mh-grpc-forwards" "$(cat "$ERR")"
 assert_absent    "sel-env-no-after-pass-note"   "browser-e2e-not-run:" "$(cat "$ERR")"
 reset_case
 
@@ -1990,14 +1816,8 @@ assert_status    "sel-env-red-status"           "STATUS=FAIL REASON=env-tests-fa
 assert_status    "sel-env-red-summary"          "STATUS=FAIL REASON=layer7-summary" "$(last_status "$OUT")"
 reset_case
 
-# (S4) env-tests ONLY still requires EVERY precondition the env suite needs: the MH gRPC
-#      forwards (1i) and the shared health/observability steps.
-reset_case
-SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL=env-tests ENVCMD="$SUITE_STUB" PORTS_JSON_OVERRIDE="$PORTS_NO_MH1"
-run_layer7 "$OUT" "$ERR"
-assert_exit      "sel-env-needs-1i-exit2"       2 "$RC"
-assert_status    "sel-env-needs-1i-token"       "REASON=mh-grpc-port-unallocated" "$(cat "$OUT")"
-assert_no_marker "sel-env-needs-1i-no-suite"    "$MARKERS" "ran.env-suite"
+# (S4) env-tests ONLY still requires EVERY shared precondition the env suite needs (health,
+#      observability).
 reset_case
 SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL=env-tests ENVCMD="$SUITE_STUB" FAKE_PROM_READY=0
 run_layer7 "$OUT" "$ERR"
@@ -2006,11 +1826,10 @@ assert_status    "sel-env-needs-prom-token"     "REASON=observability-prometheus
 reset_case
 
 # (S5) browser-e2e ONLY (CI): the browser suite runs with no Rust result to gate it, the env
-#      suite does not, and the env-only Phase-1i forwards do NOT run — ports.json here lacks
-#      mh_1_grpc, which would be PRECONDITION_FAILURE mh-grpc-port-unallocated if they did.
+#      suite does not.
 reset_case
-SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL=browser-e2e ENVCMD="$SUITE_STUB" BROWSER_CMD="$BROWSER_STUB" \
-  PORTS_JSON_OVERRIDE="$PORTS_NO_MH1"; rm -f "${WORK}/seen-e2e-subdomain"
+SOCK="$PRESENT_SOCK"; export CI_FLAG=true SUITE_SEL=browser-e2e ENVCMD="$SUITE_STUB" BROWSER_CMD="$BROWSER_STUB"
+rm -f "${WORK}/seen-e2e-subdomain"
 run_layer7 "$OUT" "$ERR"
 assert_exit      "sel-browser-exit0"            0 "$RC"
 assert_rc        "sel-browser-subset-first"     0 "$([[ "$(grep -m1 '^STATUS=' "$OUT")" == "STATUS=OK REASON=subset-browser-e2e-only" ]] && echo 0 || echo "1 ($(grep -m1 '^STATUS=' "$OUT"))")"
@@ -2018,7 +1837,6 @@ assert_status    "sel-browser-passed"           "STATUS=OK REASON=browser-e2e-pa
 assert_absent    "sel-browser-no-env-status"    "REASON=env-tests" "$(cat "$OUT")"
 assert_marker    "sel-browser-ran"              "$MARKERS" "ran.browser-suite"
 assert_no_marker "sel-browser-env-not-run"      "$MARKERS" "ran.env-suite"
-assert_absent    "sel-browser-1i-not-run"       "STEP=mh-grpc-forwards" "$(cat "$ERR")"
 assert_status    "sel-browser-1g-ran"           "STEP=browser-e2e-preconditions" "$(cat "$ERR")"
 assert_status    "sel-browser-org-exported"     "e2e-" "$(cat "${WORK}/seen-e2e-subdomain" 2>/dev/null)"
 assert_status    "sel-browser-layer-line"       "RESULT=OK REASON=subset-browser-e2e-only" "$(grep '^LAYER=7 START=' "$ERR")"

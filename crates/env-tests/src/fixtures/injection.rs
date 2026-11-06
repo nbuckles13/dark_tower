@@ -120,8 +120,8 @@ pub const INJECTION_MARGIN: u64 = 16;
 /// MC's own `mc_id`. It persists until the pod restarts only if MC never
 /// completes that `EndMeeting`. The id is a fresh GC meeting per run, so no
 /// later run reuses it. Manual recovery, if needed: `EndMeeting`
-/// for the id on the pod through the Layer-7 gRPC forward with the MC
-/// credential (`env_tests::fixtures::mh_grpc`). Not a converge
+/// for the id on the pod through an `env_tests::fixtures::mh_grpc::handlers`
+/// forward with the MC credential. Not a converge
 /// (`REDEPLOY_HINT`): pods whose image/config are unchanged are not restarted,
 /// so a converge leaves the wedge in place. A later run is not blocked by it —
 /// its meeting id is fresh — unless leaked registrations reach the cap, which
@@ -149,12 +149,12 @@ impl<'a> Injection<'a> {
     /// can INSTALL (empty, generation 1) first. That is harmless ONLY because
     /// this meeting's MC snapshot for such a pod is itself empty at generation
     /// 1 — MC's own push then no-ops as equal and truthfully confirms `match`.
-    /// **Do not reuse this helper for a meeting shape where BOTH pods carry
-    /// edges**: a probe that won the race would swallow MC's first real push
+    /// **Do not reuse this helper for a meeting shape where MORE THAN ONE pod
+    /// carries edges**: a probe that won the race would swallow MC's first real push
     /// (equal generation, no swap) while MC recorded `match` for content that
     /// was never installed. The real precondition — that MC HAS programmed the
     /// carrying pod past its pre-edge render — is
-    /// [`assert_mc_programmed_a_carrying_pod`], checked across both pods.
+    /// [`assert_mc_programmed_a_carrying_pod`], checked across every pod.
     pub async fn open(
         handler: &'a Handler,
         token: &'a str,
@@ -164,7 +164,7 @@ impl<'a> Injection<'a> {
         let meeting_id = owner.gc.meeting_id.to_string();
         let mc_id = owner.gc.mc_assignment.mc_id.clone();
         let mc_grpc_endpoint = owner.gc.mc_assignment.grpc_endpoint.clone();
-        cleanup.record(&handler.grpc_url, &meeting_id, &mc_id);
+        cleanup.record(handler, &meeting_id, &mc_id);
         let mut injection = Injection {
             handler,
             client: mh_grpc::connect(handler).await,
@@ -341,25 +341,18 @@ pub fn assert_mc_programmed_a_carrying_pod(injections: &[Injection<'_>]) {
     );
 }
 
-/// Both MH pods Layer 7 exports. Every injection in this file goes to BOTH
-/// with the same policy, so no test needs to know which pod serves which
-/// WebTransport URL.
-#[must_use]
-pub fn both_handlers() -> Vec<Handler> {
-    let hs = mh_grpc::handlers();
-    assert_eq!(hs.len(), 2, "PRECONDITION: Layer 7 exports two MH pods");
-    hs
-}
-
-/// [`both_handlers`], after a PRECONDITION that each pod can register one more
-/// meeting: an injection registers a NEW meeting id on BOTH pods. Pods persist
+/// EVERY live MH pod ([`mh_grpc::handlers`]: found by label, at least one,
+/// none Terminating or not Ready), after a PRECONDITION that each pod can
+/// register one more meeting: an injection registers a NEW meeting id on EVERY
+/// pod, with the same policy, so no test needs to know which pod serves which
+/// WebTransport URL. Pods persist
 /// across runs (ADR-0038: nothing restarts an unchanged MH), so a pod can hold
 /// registrations a killed harness never released (see [`Injection`]'s "If
 /// cleanup is skipped"). At the cap, the injection would be refused as
 /// `rejected_meeting_cap` — a confusing registration refusal rather than the
 /// named leak it is. Read from the published gauges, per pinned pod.
 pub async fn injectable_handlers(prom: &PrometheusClient, settle_bound: Duration) -> Vec<Handler> {
-    let handlers = both_handlers();
+    let handlers = mh_grpc::handlers().await;
     let registered = gauge_by_instance_present(
         prom,
         "mh_media_registered_meetings",

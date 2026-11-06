@@ -19,9 +19,11 @@
 
 use std::collections::BTreeSet;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+use crate::fixtures::deployment_config::LivePod;
 use crate::NAMESPACE;
 
 /// The ONE remediation for "the cluster is not running the tree's
@@ -71,7 +73,8 @@ pub const PROFILE_CONFIGMAP: &str = "media-codec-profile";
 
 /// The Kind MH instances (the per-instance Deployments `mh-0`, `mh-1`). ONE
 /// list for every suite that reads per-instance MH state, so a caller of
-/// `gauge_by_live_pod` / [`configmap_name_for_all`] cannot pass a partial set.
+/// [`configmap_name_for_all`] cannot pass a partial set. (Runtime Prometheus pins
+/// use [`live_mh_pods`] instead: no instance names.)
 pub const MH_INSTANCES: &[&str] = &["mh-0", "mh-1"];
 
 /// The Kind MC instances (`mc-0`, `mc-1`). See [`MH_INSTANCES`].
@@ -134,9 +137,210 @@ pub fn agree_on_generation(
 /// `kubectl` cannot run, fails, or prints unparseable output.
 #[must_use]
 pub fn live_pods_json(instance: &str) -> Value {
-    let selector = format!("instance={instance}");
-    kubectl_get_json(&["pods", "-n", NAMESPACE, "-l", &selector])
+    pods_json(&format!("instance={instance}"))
+}
+
+/// `kubectl get pods -n dark-tower -l <selector> -o json`, parsed — the ONE
+/// pod-list call shape (namespace pinned in the argv, never the context's
+/// default). [`live_pods_json`] is its per-instance form.
+///
+/// # Panics
+/// `kubectl` cannot run, fails, or prints unparseable output.
+#[must_use]
+pub fn pods_json(selector: &str) -> Value {
+    kubectl_get_json(&["pods", "-n", NAMESPACE, "-l", selector])
         .unwrap_or_else(|e| panic!("PRECONDITION: {e}"))
+}
+
+/// The label every MH pod carries, whatever Deployment, slot or incarnation
+/// created it (ADR-0039 §7 template invariant). Env-tests find the MHs to talk
+/// to by THIS label from the live pod list — never by a fixed instance name or
+/// count.
+pub const MH_SELECTOR: &str = "app=mh-service";
+
+/// Is `pod` terminating (it has a `metadata.deletionTimestamp`)? The ONE home
+/// of that rule for every pod reader here.
+#[must_use]
+pub fn is_terminating(pod: &Value) -> bool {
+    pod.pointer("/metadata/deletionTimestamp").is_some()
+}
+
+/// Does `pod` report the `Ready` condition as `"True"`? A pod with no
+/// conditions at all (Pending) or `Ready=False` is not Ready.
+#[must_use]
+pub fn is_ready(pod: &Value) -> bool {
+    pod.pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|c| {
+            c.get("type").and_then(Value::as_str) == Some("Ready")
+                && c.get("status").and_then(Value::as_str) == Some("True")
+        })
+}
+
+/// A label-selected pod list, partitioned. `serving` holds the non-terminating,
+/// Ready pods (with their IP); the other two buckets name every pod that is NOT
+/// serving, so a caller can refuse them instead of silently working on a subset.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PodPartition {
+    pub serving: Vec<LivePod>,
+    pub terminating: Vec<String>,
+    pub not_ready: Vec<String>,
+}
+
+/// PURE: partition a `kubectl get pods -o json` document. Terminating pods go to
+/// `terminating` (even if still Ready), non-terminating not-Ready pods to
+/// `not_ready`, and the rest to `serving` as label-discovered [`LivePod`]s
+/// (`instance: None`). The pod NAME and the pod IP come from the SAME object, so
+/// the pod a test calls and the Prometheus `instance` it pins are one pod.
+///
+/// # Errors
+/// No `items` array, a pod without `metadata.name`, or a Ready pod without
+/// `status.podIP` (`no-pod-ip`).
+pub fn partition_serving(pods: &Value, selector: &str) -> Result<PodPartition, String> {
+    let items = pods
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("kubectl output for -l {selector} has no `items` array"))?;
+    let mut out = PodPartition::default();
+    for p in items {
+        let name = p
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("a pod matching -l {selector} has no metadata.name"))?
+            .to_string();
+        if is_terminating(p) {
+            out.terminating.push(name);
+        } else if !is_ready(p) {
+            out.not_ready.push(name);
+        } else {
+            let ip = p
+                .pointer("/status/podIP")
+                .and_then(Value::as_str)
+                .filter(|ip| !ip.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "no-pod-ip: pod {name} (-l {selector}) is Ready but has no status.podIP"
+                    )
+                })?
+                .to_string();
+            out.serving.push(LivePod {
+                instance: None,
+                name,
+                ip,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// PURE verdict on one [`PodPartition`]: EVERY matching pod is serving, and
+/// there is at least one. A Terminating or not-Ready pod is refused, never
+/// dropped — dropping it would quietly turn "every live MH" into a subset (a
+/// crash-looping or still-starting MH the test never injects into or pins).
+///
+/// # Errors
+/// Distinct texts per cause: `zero-pods`, `terminating`, `not-ready`.
+pub fn require_all_serving(
+    partition: &PodPartition,
+    selector: &str,
+) -> Result<Vec<LivePod>, String> {
+    if partition.serving.is_empty()
+        && partition.terminating.is_empty()
+        && partition.not_ready.is_empty()
+    {
+        return Err(format!(
+            "zero-pods: no pod matches -n {NAMESPACE} -l {selector} — nothing to test against; \
+             the service is not deployed or the label has drifted"
+        ));
+    }
+    if !partition.terminating.is_empty() {
+        return Err(format!(
+            "terminating: pod(s) {:?} matching -l {selector} are Terminating (serving: {:?}) — \
+             the set of handlers is changing under the test",
+            partition.terminating,
+            names(&partition.serving)
+        ));
+    }
+    if !partition.not_ready.is_empty() {
+        return Err(format!(
+            "not-ready: pod(s) {:?} matching -l {selector} are not Ready (serving: {:?}) — a \
+             starting or crash-looping pod would be silently left out",
+            partition.not_ready,
+            names(&partition.serving)
+        ));
+    }
+    Ok(partition.serving.clone())
+}
+
+fn names(pods: &[LivePod]) -> Vec<&str> {
+    pods.iter().map(|p| p.name.as_str()).collect()
+}
+
+/// How long [`live_mh_pods`] waits for the MH pod set to settle: an old
+/// ReplicaSet's pod can still be inside its termination grace after a converge
+/// (`rollout status` does not wait for it), and a starting pod needs time to
+/// turn Ready. The K8s-resource-update SLA (60s).
+pub const MH_POD_SETTLE: crate::eventual::ConsistencyCategory =
+    crate::eventual::ConsistencyCategory::K8sResourceUpdate;
+
+/// EVERY live MH pod, found by [`MH_SELECTOR`] — no fixed name or count.
+///
+/// Re-lists (bounded by [`MH_POD_SETTLE`]) until [`require_all_serving`] holds,
+/// then returns the serving set from that ONE snapshot.
+///
+/// # Panics
+/// PRECONDITION (`mh-pods-unserving`) at the bound, with the last snapshot's
+/// verdict: zero MH pods, or one still Terminating / not Ready. Never a subset.
+/// Do NOT loosen this for a test that kills an MH: such a test waits for its
+/// replacement to be Ready before anything resolves handlers.
+pub async fn live_mh_pods() -> Vec<LivePod> {
+    let last: Arc<Mutex<Result<Vec<LivePod>, String>>> =
+        Arc::new(Mutex::new(Err("not listed yet".to_string())));
+    let settled = crate::eventual::assert_eventually(MH_POD_SETTLE, || {
+        let last = Arc::clone(&last);
+        async move {
+            // kubectl blocks: run it on the blocking pool, never on the test's
+            // (current-thread) runtime thread that drives live sessions.
+            let verdict = join_blocking(
+                tokio::task::spawn_blocking(|| {
+                    partition_serving(&pods_json(MH_SELECTOR), MH_SELECTOR)
+                        .and_then(|p| require_all_serving(&p, MH_SELECTOR))
+                })
+                .await,
+            );
+            let ok = verdict.is_ok();
+            *last.lock().unwrap_or_else(|p| p.into_inner()) = verdict;
+            ok
+        }
+    })
+    .await;
+    let last = std::mem::replace(
+        &mut *last.lock().unwrap_or_else(|p| p.into_inner()),
+        Err(String::new()),
+    );
+    match (settled, last) {
+        (Ok(()), Ok(pods)) => pods,
+        (_, Err(e)) | (Err(e), Ok(_)) => panic!(
+            "PRECONDITION (mh-pods-unserving): after {:?}: {e}. Inspect: kubectl -n {NAMESPACE} \
+             get pods -l {MH_SELECTOR} -o wide",
+            MH_POD_SETTLE.timeout()
+        ),
+    }
+}
+
+/// The value of a `spawn_blocking` task, re-raising its panic AS ITSELF (so a
+/// PRECONDITION text survives, rather than becoming a bare `JoinError`).
+///
+/// # Panics
+/// The task panicked (re-raised), or was cancelled.
+pub(crate) fn join_blocking<T>(joined: Result<T, tokio::task::JoinError>) -> T {
+    match joined {
+        Ok(v) => v,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => panic!("a blocking env-test fixture task was cancelled: {e}"),
+    }
 }
 
 /// PURE core of [`configmap_name_for`]: from a `kubectl get pods -o json`
@@ -159,10 +363,7 @@ pub fn resolve_generation(pods: &Value, instance: &str, base: &str) -> Result<St
         .get("items")
         .and_then(Value::as_array)
         .ok_or_else(|| format!("kubectl output for instance={instance} has no `items` array"))?;
-    let live: Vec<&Value> = items
-        .iter()
-        .filter(|p| p.pointer("/metadata/deletionTimestamp").is_none())
-        .collect();
+    let live: Vec<&Value> = items.iter().filter(|p| !is_terminating(p)).collect();
     if live.is_empty() {
         return Err(format!(
             "no live pod matches -n {NAMESPACE} -l instance={instance} ({} terminating); \
@@ -535,5 +736,111 @@ mod tests {
     fn profile_readers_are_exactly_mc_then_mh() {
         let both: Vec<&str> = MC_INSTANCES.iter().chain(MH_INSTANCES).copied().collect();
         assert_eq!(PROFILE_READERS, both.as_slice());
+    }
+
+    // ---- label discovery: partition_serving / require_all_serving ---------
+
+    fn mh(name: &str, ip: &str, ready: Option<&str>) -> Value {
+        let mut p = json!({"metadata": {"name": name}, "status": {"podIP": ip}});
+        if let Some(status) = ready {
+            p["status"]["conditions"] = json!([{"type": "PodScheduled", "status": "True"}, {"type": "Ready", "status": status}]);
+        }
+        p
+    }
+
+    fn served(pods: &[Value]) -> PodPartition {
+        partition_serving(&json!({"items": pods}), MH_SELECTOR).expect("partitions")
+    }
+
+    #[test]
+    fn three_ready_pods_all_serve_no_fixed_count() {
+        let p = served(&[
+            mh("a", "10.0.0.1", Some("True")),
+            mh("b", "10.0.0.2", Some("True")),
+            mh("c", "10.0.0.3", Some("True")),
+        ]);
+        let got = require_all_serving(&p, MH_SELECTOR).expect("all serving");
+        let names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(got[1].ip, "10.0.0.2", "name and IP come from the same pod");
+        assert!(got.iter().all(|p| p.instance.is_none()));
+    }
+
+    #[test]
+    fn a_terminating_pod_is_excluded_from_serving_even_when_ready() {
+        let p = served(&[
+            terminating(mh("old", "10.0.0.9", Some("True"))),
+            mh("new", "10.0.0.1", Some("True")),
+        ]);
+        assert_eq!(p.terminating, ["old"]);
+        assert_eq!(names(&p.serving), ["new"]);
+    }
+
+    #[test]
+    fn a_terminating_pod_is_refused_not_dropped() {
+        let p = served(&[
+            terminating(mh("old", "10.0.0.9", Some("True"))),
+            mh("new", "10.0.0.1", Some("True")),
+        ]);
+        let err = require_all_serving(&p, MH_SELECTOR).unwrap_err();
+        assert!(err.starts_with("terminating:"), "{err}");
+        assert!(err.contains("old"), "{err}");
+    }
+
+    #[test]
+    fn not_ready_pods_are_excluded_from_serving() {
+        // Ready=False, and a Pending pod with no conditions at all.
+        let p = served(&[
+            mh("a", "10.0.0.1", Some("True")),
+            mh("b", "10.0.0.2", Some("True")),
+            mh("starting", "10.0.0.3", Some("False")),
+            mh("pending", "", None),
+        ]);
+        assert_eq!(names(&p.serving), ["a", "b"]);
+        assert_eq!(p.not_ready, ["starting", "pending"]);
+    }
+
+    #[test]
+    fn a_mixed_set_is_refused_naming_the_not_ready_pod() {
+        let p = served(&[
+            mh("a", "10.0.0.1", Some("True")),
+            mh("b", "10.0.0.2", Some("True")),
+            mh("starting", "10.0.0.3", Some("False")),
+        ]);
+        let err = require_all_serving(&p, MH_SELECTOR).unwrap_err();
+        assert!(err.starts_with("not-ready:"), "{err}");
+        assert!(err.contains("starting"), "{err}");
+    }
+
+    #[test]
+    fn zero_pods_is_its_own_refusal() {
+        let err = require_all_serving(&served(&[]), MH_SELECTOR).unwrap_err();
+        assert!(err.starts_with("zero-pods:"), "{err}");
+    }
+
+    #[test]
+    fn a_ready_pod_without_an_ip_is_refused() {
+        let err = partition_serving(&json!({"items": [mh("a", "", Some("True"))]}), MH_SELECTOR)
+            .unwrap_err();
+        assert!(err.starts_with("no-pod-ip:"), "{err}");
+    }
+
+    #[test]
+    fn a_pod_list_without_items_is_refused() {
+        assert!(partition_serving(&json!({"kind": "PodList"}), MH_SELECTOR)
+            .unwrap_err()
+            .contains("no `items` array"));
+    }
+
+    #[test]
+    fn readiness_reads_only_the_ready_condition() {
+        assert!(is_ready(&mh("a", "1", Some("True"))));
+        assert!(!is_ready(&mh("a", "1", Some("False"))));
+        assert!(!is_ready(&mh("a", "1", None)));
+        assert!(!is_ready(
+            &json!({"status": {"conditions": [{"type": "PodScheduled", "status": "True"}]}})
+        ));
+        assert!(is_terminating(&terminating(mh("a", "1", None))));
+        assert!(!is_terminating(&mh("a", "1", None)));
     }
 }

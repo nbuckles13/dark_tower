@@ -26,7 +26,7 @@
 //! meeting on the pod. Suites 26/27/28 share these pods, so a two-edge
 //! registration is refused whenever they happen to be near the ceiling while
 //! their meetings drain — which is exactly how this test failed at Gate 2
-//! (mh-0 at 39 installed streams against a ceiling of 40,
+//! (one MH pod at 39 installed streams against a ceiling of 40,
 //! `mh_media_policy_applies_total{outcome="rejected_stream_ceiling"}` = 4 on
 //! that pod, `applied_generation` 0 instead of 5; the edges drained to 0 minutes
 //! later, so nothing had leaked). With zero edges the projection is unchanged by
@@ -74,9 +74,10 @@
 //!
 //! # How it reaches MH
 //!
-//! Directly, as the meeting-controller service principal: Layer 7
-//! (`scripts/layer7.sh`, step (i)) forwards each MH POD's gRPC port and exports
-//! `ENV_TEST_MH_{0,1}_GRPC_URL` plus `ENV_TEST_MH_{0,1}_POD_IP`. MC's own
+//! Directly, as the meeting-controller service principal, to EVERY live MH pod
+//! (found by label; `env_tests::fixtures::mh_grpc::handlers`) through a per-test
+//! gRPC port-forward the fixture owns, pinning each pod's metrics by its pod IP
+//! from the same lookup. MC's own
 //! `EndMeeting` is proved end to end through public APIs by env-test 35. This
 //! suite drives the arms MC can never produce: a mismatched `mc_id` is
 //! unreachable through MC at all (MC always sends its own), and the release is
@@ -176,7 +177,7 @@ async fn a_long_running_mh_pod_releases_an_ended_meeting_and_admits_like_a_fresh
         .await
         .expect("PRECONDITION: cluster connection (ENV_TEST_* URLs)");
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
-    let handlers = handlers();
+    let handlers = handlers().await;
 
     // PRECONDITION — the AC-issued meeting-controller token, never minted here,
     // from the credentials MC itself is deployed with. A refusal names the
@@ -298,7 +299,7 @@ async fn exercise_one_handler(
     // 1. Register at HELD_GENERATION with an EMPTY policy (module docs: "This
     //    test registers NO edges"). The auth positive control: an error status
     //    here is the token or the forward, never teardown logic.
-    cleanup.record(&handler.grpc_url, &meeting_id, &owner_mc);
+    cleanup.record(handler, &meeting_id, &owner_mc);
     let mut first = register(&meeting_id, &owner_mc, HELD_GENERATION);
     if declared {
         first.source_streams = vec![PROBE_SOURCE_STREAM];
@@ -459,7 +460,7 @@ async fn exercise_one_handler(
     //    installs, exactly as on a pod that never saw it. Step 2 showed the
     //    same request refused as stale while the meeting was held, so an
     //    install here happens only if the release dropped the meeting's state.
-    cleanup.record(&handler.grpc_url, &meeting_id, &owner_mc);
+    cleanup.record(handler, &meeting_id, &owner_mc);
     let again = client
         .register_meeting(authed(token, register(&meeting_id, &owner_mc, 1)))
         .await

@@ -154,8 +154,8 @@ pub fn audio_datagram(stream_sequence: u32, marker: u8) -> bytes::Bytes {
 
 /// Send marked datagrams from every sender each round until `receiver` has
 /// received one bearing each sender's marker; return the raw received datagram
-/// per marker. Shared by both binding arms, so mh-0 and mh-1 are proven with the
-/// SAME loop. Bounded by [`BINDING_DEADLINE`]; `phase` names the failure.
+/// per marker. Shared by both binding arms, so each MH the meeting uses is
+/// proven with the SAME loop. Bounded by [`BINDING_DEADLINE`]; `phase` names the failure.
 ///
 /// Ordering is send-until-received under the deadline: any arrival reflects a
 /// post-declaration policy (the receiver's edges exist only after it declares) —

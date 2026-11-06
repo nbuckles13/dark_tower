@@ -13,7 +13,7 @@ Before running these tests, ensure:
    - Grafana: `localhost:3000`
    - Loki (optional): `localhost:3100`
 3. **kubectl in PATH**: Required for NetworkPolicy diagnostics, secret exposure validation, and reading the deployed ConfigMaps
-4. **MH gRPC forwards (for `29_mh_meeting_teardown`)**: Layer 7 (`scripts/layer7.sh`, step (i)) starts a per-POD `kubectl port-forward` to each MH pod's gRPC port and exports `ENV_TEST_MH_{0,1}_GRPC_URL` and `ENV_TEST_MH_{0,1}_POD_IP`. The setup script does NOT start these. Run that test through Layer 7, or export the four variables yourself; it fails loudly when they are unset.
+4. **MH discovery and gRPC forwards (MH suites 26, 28, 29, 35, 37, 38, 39)**: the tests find every live MH pod by label (`app=mh-service`, `fixtures/kube.rs::live_mh_pods`) and start their OWN per-test `kubectl port-forward --address 127.0.0.1 pod/<pod> :50053` (local port 0, `fixtures/mh_grpc.rs::handlers`), stopped when the test's handlers drop. Nothing to export: they need only kubectl access to the `dark-tower` namespace. Every MH pod must be Ready and none Terminating (bounded wait, then a loud `PRECONDITION (mh-pods-unserving)`).
 
 ## Test Categories
 

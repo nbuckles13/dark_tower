@@ -2,8 +2,8 @@
 //! R-10, R-11, R-12, R-13, R-30, R-33; story Design §Wire freeze, Amendment 4).
 //!
 //! One meeting of five real participants (A, E and F publish video, B and C
-//! receive), each joined through GC -> MC and connected to BOTH Kind MH pods.
-//! The forwarding policy is INJECTED on both pods through
+//! receive), each joined through GC -> MC and connected to BOTH of the meeting's MH handlers.
+//! The forwarding policy is INJECTED on every live MH pod through
 //! `env_tests::fixtures::injection` acting as MC, at a generation above MC's.
 //! Video comes from T-A's keyless `VideoPublisher` with
 //! `GroupStartSource::OnKeyframeRequest`, reading MH's `KeyframeRequest`s off
@@ -83,12 +83,9 @@ use env_tests::cluster::ClusterConnection;
 use env_tests::fixtures::injection::{
     self, assert_mc_programmed_a_carrying_pod, injectable_handlers, install_all, Injection,
 };
-use env_tests::fixtures::kube::MH_INSTANCES;
 use env_tests::fixtures::mc_session::MhSession;
 use env_tests::fixtures::media::VIDEO_SEND_ID;
-use env_tests::fixtures::metrics::{
-    gauge_by_live_pod, group_reset_promql, poll_until_pinned_instance,
-};
+use env_tests::fixtures::metrics::{gauge_by_pods, group_reset_promql, poll_until_pinned_instance};
 use env_tests::fixtures::mh_grpc::{self, ReleaseOnDrop};
 use env_tests::fixtures::participant::{self, open_sessions, AUDIO};
 use env_tests::fixtures::video::backlog::backlog_payload_len;
@@ -388,13 +385,13 @@ async fn test_on_demand_keyframes_and_recovery() {
     // (phase d); the same publisher runs every A phase, so its counter never
     // restarts within its binding.
     // Read from EACH live MH pod, never a terminated predecessor's series
-    // (which after a roll still carries the OLD cap), and the two must agree:
+    // (which after a roll still carries the OLD cap), and they must all agree:
     // the cap comes from one ConfigMap, so a disagreement is a pod that
     // predates the config — never resolved by taking the larger.
-    let backlog_gauge = gauge_by_live_pod(
+    let backlog_gauge = gauge_by_pods(
         &prom,
         "mh_media_egress_stream_backlog_limit_bytes",
-        MH_INSTANCES,
+        &mh_grpc::pins(&handlers),
         env_tests::fixtures::metrics::PINNED_METRIC_BOUND,
     )
     .await;
