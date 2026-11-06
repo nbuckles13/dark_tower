@@ -75,6 +75,7 @@ crates/env-tests/
     ├── 25_auth_security.rs    # P1 security tests
     ├── 30_observability.rs    # P1 observability tests
     ├── 40_resilience.rs       # P2 resilience tests (stubs)
+    ├── 41_gate_zero_hostport_policy.rs # Gate zero: MH policy on the UDP hostPort DNAT path (own binary)
     └── 90_runbook.rs          # P2 runbook validation (stubs)
 ```
 

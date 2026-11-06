@@ -125,8 +125,9 @@ pub fn agree_on_generation(
     Ok(names.into_iter().next().expect("non-empty, checked above"))
 }
 
-/// `kubectl get pods -n dark-tower -l instance=<instance> -o json`, parsed.
-/// THE one pod-list call (also behind
+/// `kubectl get pods -n dark-tower -l instance=<instance> -o json`, parsed —
+/// the PRECONDITION-panic wrapper over [`kubectl_get_json`] (the ONE
+/// kubectl-get-json kernel) for the per-instance pod list (also behind
 /// `deployment_config::fetch_live_pod`).
 ///
 /// # Panics
@@ -134,20 +135,8 @@ pub fn agree_on_generation(
 #[must_use]
 pub fn live_pods_json(instance: &str) -> Value {
     let selector = format!("instance={instance}");
-    let output = Command::new("kubectl")
-        .args([
-            "get", "pods", "-n", NAMESPACE, "-l", &selector, "-o", "json",
-        ])
-        .output()
-        .unwrap_or_else(|e| panic!("PRECONDITION: could not run kubectl: {e}"));
-    assert!(
-        output.status.success(),
-        "PRECONDITION: kubectl get pods -n {NAMESPACE} -l {selector} failed (exit {:?})",
-        output.status.code()
-    );
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
-        panic!("PRECONDITION: could not parse kubectl get pods -l {selector} output: {e}")
-    })
+    kubectl_get_json(&["pods", "-n", NAMESPACE, "-l", &selector])
+        .unwrap_or_else(|e| panic!("PRECONDITION: {e}"))
 }
 
 /// PURE core of [`configmap_name_for`]: from a `kubectl get pods -o json`
@@ -380,6 +369,32 @@ pub fn deployment_env_value(deployment: &str, var: &str) -> String {
         "PRECONDITION: deployment {deployment} sets no literal {var}"
     );
     value
+}
+
+/// `kubectl get <args...> -o json`, parsed. The Result-returning reader for
+/// callers that map failures into their own typed error (e.g. the gate-zero
+/// `GateZeroError::Precondition`) instead of the PRECONDITION panics above.
+///
+/// # Errors
+///
+/// `kubectl` cannot run, exits non-zero, or prints unparseable output.
+pub fn kubectl_get_json(args: &[&str]) -> Result<Value, String> {
+    let output = Command::new("kubectl")
+        .arg("get")
+        .args(args)
+        .args(["-o", "json"])
+        .output()
+        .map_err(|e| format!("could not run kubectl: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl get {} failed (exit {:?}): {}",
+            args.join(" "),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("could not parse kubectl get {} output: {e}", args.join(" ")))
 }
 
 #[cfg(test)]

@@ -30,6 +30,7 @@ async fn test_same_namespace_connectivity() {
     // The AC NetworkPolicy allows traffic from pods with app=gc-service
     let config = CanaryConfig {
         labels: "app=gc-service,test=network-policy".to_string(),
+        ..CanaryConfig::default()
     };
 
     let canary = CanaryPod::deploy_with_config("dark-tower", config)
