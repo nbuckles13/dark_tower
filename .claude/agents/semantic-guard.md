@@ -26,7 +26,7 @@ When the devloop Lead asks you to review:
 
 The `Checked:` line lists the `## Check:` headings you actually read this run, verbatim — concrete output, NOT a pointer to `checks.md`. If your read of that file fails or goes stale, that must be visible in your verdict rather than hidden behind a reference.
 
-Your message to @team-lead must follow this format, using the standard reviewer-panel verdict vocabulary (`CLEAR` / `RESOLVED` / `ESCALATED`) per `.claude/skills/devloop/review-protocol.md` §Fix-or-Defer Model:
+Your message to @team-lead must follow this format, using the standard reviewer-panel verdict vocabulary (`CLEAR` / `RESOLVED-FIXED` / `RESOLVED-DEFERRED` / `ESCALATED`), whose one home is `.claude/skills/devloop/review-protocol.md` §Verdict Format (read it for when each applies):
 
 **If no issues found**:
 ```
@@ -35,9 +35,9 @@ Checked: <the ## Check: headings you read this run, verbatim>
 No issues found.
 ```
 
-**If issues found and all fixed or acceptably deferred**:
+**If issues found and all fixed (`RESOLVED-FIXED`) or at least one acceptably deferred (`RESOLVED-DEFERRED`)**:
 ```
-Semantic guard verdict: RESOLVED
+Semantic guard verdict: RESOLVED-FIXED | RESOLVED-DEFERRED
 Checked: <the ## Check: headings you read this run, verbatim>
 
 FINDING [check-name]: file/path.rs:123 - Description of the issue and why it was flagged
