@@ -890,7 +890,7 @@ The **only** home for per-task machine state (ADR-0035 §4). Emitted with `dt-st
 story: 2026-10-31-survive-handler-loss
 tasks:
 - id: 1
-  status: pending
+  status: completed
   specialist: infrastructure
   prompt: |-
     Story 4 task I-1 (infrastructure): Gate zero — prove UDP hostPort reachability and NetworkPolicy enforcement on the hostPort DNAT path in Kind.
@@ -939,6 +939,7 @@ tasks:
     (a) No new config keys. (b) No retirements. (c) No new metric series. (d) test-gates.md "Gate zero" line is implemented here. (e) The canary's labels never become metric labels.
 
     COVERS: env-tests.
+  slug: 2026-11-06-gate-zero-hostport-policy
   tag: story-2026-10-31-survive-handler-loss-task-I-1
 - id: 2
   status: pending
