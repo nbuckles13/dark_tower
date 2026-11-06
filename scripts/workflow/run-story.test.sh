@@ -1431,11 +1431,34 @@ chmod +x "${WORK}/dt-story-stale"
 run_story DT_STORY="${WORK}/dt-story-stale" -- fixture --stop-after=1
 assert_exit   "l2-unverifiable-exit2" 2 "$RC"
 assert_status "l2-unverifiable-token" "STOP-AFTER-UNVERIFIABLE" "$OUTPUT"
-assert_status "l2-names-not-built"    "not built" "$OUTPUT"
-assert_status "l2-names-stale"        "stale" "$OUTPUT"
-assert_status "l2-names-malformed"    "manifest" "$OUTPUT"
-assert_status "l2-names-disambiguator" "validate" "$OUTPUT"
+assert_status "l2-stale-diagnosed"    "binary is stale" "$OUTPUT"
+assert_status "l2-stale-names-build"  "scripts/lib/tool-bins.sh build" "$OUTPUT"
+assert_absent "l2-stale-not-manifest" "does not validate" "$OUTPUT"
 assert_absent "l2-not-an-id-message"  "STOP-AFTER-UNKNOWN-TASK" "$OUTPUT"
+
+# L2b: list-tasks AND validate fail -> the runner diagnoses the manifest itself
+# and relays validate's own output, not a rebuild instruction.
+cat > "${WORK}/dt-story-badmanifest" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in list-tasks) exit 2 ;; validate) echo "stub: bad manifest" >&2; exit 2 ;; *) exit 0 ;; esac
+STUB
+chmod +x "${WORK}/dt-story-badmanifest"
+run_story DT_STORY="${WORK}/dt-story-badmanifest" -- fixture --stop-after=1
+assert_exit   "l2b-badmanifest-exit2"     2 "$RC"
+assert_status "l2b-badmanifest-diagnosed" "does not validate" "$OUTPUT"
+assert_status "l2b-relays-validate"       "stub: bad manifest" "$OUTPUT"
+assert_absent "l2b-not-stale"             "binary is stale" "$OUTPUT"
+
+# L2c: no binary at all -> refused up front with the build command, with or
+# without --stop-after (every path consults dt-story).
+run_story DT_STORY="${WORK}/dt-story-absent" -- fixture --stop-after=1
+assert_exit   "l2c-not-built-stop-after-exit2" 2 "$RC"
+assert_status "l2c-not-built-stop-after-token" "DT-STORY-NOT-BUILT" "$OUTPUT"
+assert_status "l2c-not-built-stop-after-build" "scripts/lib/tool-bins.sh build" "$OUTPUT"
+run_story DT_STORY="${WORK}/dt-story-absent" -- fixture
+assert_exit   "l2c-not-built-exit2" 2 "$RC"
+assert_status "l2c-not-built-token" "DT-STORY-NOT-BUILT" "$OUTPUT"
+assert_status "l2c-not-built-build" "scripts/lib/tool-bins.sh build" "$OUTPUT"
 
 # L3 (OPS-3): tree_dirty's rc-2 branch. Its fix is the one that is MESSAGE-only
 # on an already-correct lane, which is the wrong-message class this diff repairs

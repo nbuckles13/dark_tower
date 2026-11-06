@@ -645,6 +645,16 @@ elif [ -n "${DEVLOOP_STORY_RUN_BASE:-}" ]; then __run_dir_source="DEVLOOP_STORY_
 else __run_dir_source="default"; fi
 slog "STORY_RUN: RUN-DIR ${RUN_DIR} source=${__run_dir_source}"
 
+# --- dt-story must exist before anything consults it -------------------------
+# Every path below (--stop-after validation, `next`, `complete`, `escalate`)
+# runs the binary. A missing one is the common case on a fresh clone or
+# container, and the runner can tell that apart on its own, so it names the
+# one recovery command instead of listing possible causes.
+if [ ! -x "$DT_STORY" ]; then
+  slogerr "STORY_RUN: DT-STORY-NOT-BUILT — no executable dt-story at ${DT_STORY}. Build it: ${DT_TOOLS_BUILD_CMD}"
+  exit 2
+fi
+
 # --- --stop-after validated against the MANIFEST, not as a bare integer (R-5) --
 # A number that names no task, or names one the story never reaches, was
 # silently ignored and the runner continued to the end. A flag that silently
@@ -656,15 +666,19 @@ slog "STORY_RUN: RUN-DIR ${RUN_DIR} source=${__run_dir_source}"
 # bash-side YAML parse: a second parser would drift the moment the schema moves.
 #
 # Any non-zero from list-tasks means "this binary cannot answer", NOT
-# "id not found". Preflight has not run at this point, so the rc space here is
-# 0 ok / 2 stale-or-malformed / 127 not built / 126 not executable, and clap's
-# unrecognized-subcommand exit collides with dt-story's own EXIT_MALFORMED —
-# so the message names all three causes and hands over the one command that
-# separates them rather than guessing.
+# "id not found". A missing binary was refused above, so what remains is a
+# stale binary or a malformed manifest — and clap's unrecognized-subcommand
+# exit collides with dt-story's own EXIT_MALFORMED, so the rc cannot separate
+# them. `validate` can: the runner runs it itself and reports the one cause
+# with its one remedy, rather than handing the operator a diagnostic to run.
 if [ -n "$STOP_AFTER" ]; then
   if ! stop_tasks_json="$("$DT_STORY" list-tasks "$STORY_FILE" 2>/dev/null)" \
      || [ -z "$stop_tasks_json" ]; then
-    slogerr "STORY_RUN: STOP-AFTER-UNVERIFIABLE — '${DT_STORY} list-tasks' could not answer, so --stop-after cannot be validated. Causes: dt-story not built, a stale binary predating the 'list-tasks' verb, or an unparseable manifest. To tell them apart run: ${DT_STORY} validate ${STORY_FILE} — green means the binary is stale (rebuild: ${DT_TOOLS_BUILD_CMD}), red means the manifest is."
+    if stop_validate_out="$("$DT_STORY" validate "$STORY_FILE" 2>&1)"; then
+      slogerr "STORY_RUN: STOP-AFTER-UNVERIFIABLE — the manifest validates but '${DT_STORY} list-tasks' could not answer: the binary is stale (predates 'list-tasks'). Rebuild: ${DT_TOOLS_BUILD_CMD}"
+    else
+      slogerr "STORY_RUN: STOP-AFTER-UNVERIFIABLE — the manifest in ${STORY_FILE} does not validate, so --stop-after cannot be checked. Fix the manifest. dt-story validate said: ${stop_validate_out}"
+    fi
     exit 2
   fi
   # Branch on jq's rc for the same reason as stop_blockers below: empty is
