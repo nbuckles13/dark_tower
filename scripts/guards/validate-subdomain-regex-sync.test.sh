@@ -41,8 +41,8 @@ trap 'rm -rf "$WORK"' EXIT
 
 CANON='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
 
-# Build a synthetic tree carrying exactly the ground truth the guard pins: the seven enumerated
-# sites in their real delimiter forms, plus the three test occurrences, for a total of ten. The
+# Build a synthetic tree carrying exactly the ground truth the guard pins: the eight enumerated
+# sites in their real delimiter forms, plus the three test occurrences, for a total of eleven. The
 # tree is `git init`ed and staged at the end (the guard's sweep is `git grep`, tracked-only).
 # Each case then mutates ONE thing, so a failure names one cause; a case that adds a NEW file
 # re-stages it.
@@ -61,6 +61,8 @@ mk_tree() {  # $1 = root
     > "$r/packages/web-app/e2e/env.ts"
   printf "    local subdomain_re='%s'\n" "$CANON" \
     > "$r/infra/kind/scripts/setup.sh"
+  printf "readonly MH_OWNER_RE='%s'\n" "$CANON" \
+    > "$r/infra/kind/scripts/mh.sh"
   {
     printf 'const SUBDOMAIN_PATTERN: &str = r"%s";\n' "$CANON"
     printf '        assert_eq!(SUBDOMAIN_PATTERN, "%s");\n' "$CANON"
@@ -90,7 +92,7 @@ mk_tree() {  # $1 = root
   #
   # `-Af` — FORCE past any global core.excludesFile (@security S4). Without it, a developer
   # whose global gitignore matches a fixture path (e.g. `*.md`, so DATABASE_SCHEMA.md) would
-  # leave that file unstaged, dropping the pinned total below 10 and reding every case for a
+  # leave that file unstaged, dropping the pinned total below 11 and reding every case for a
   # reason unrelated to what it tests. Force-add makes the fixture hermetic against the host.
   git init -q "$r"
   git -C "$r" add -Af
@@ -115,7 +117,7 @@ T="$(new_tree)"
 run_guard "$T"
 assert_rc     "pristine-exit0"  0 "$G_RC"
 assert_status "pristine-status" "STATUS=OK REASON=subdomain-regex-in-sync" "$G_OUT"
-assert_status "pristine-counts" "7 enumerated site(s) in sync; 10 total occurrence(s)" "$G_OUT"
+assert_status "pristine-counts" "8 enumerated site(s) in sync; 11 total occurrence(s)" "$G_OUT"
 
 # === (2) A SITE'S LITERAL DRIFTS → FAIL, naming that site ====================================
 # The headline case: someone loosens the bound in one place. `{0,61}` -> `{0,62}` is a
@@ -139,7 +141,7 @@ run_guard "$T"
 assert_rc     "missing-exit1"  1 "$G_RC"
 assert_status "missing-names-file" "enumerated site is MISSING: packages/sdk-core/src/validation/limits.ts" "$G_OUT"
 # The partial-comparison guard fires too: five of six matching is not evidence of sync.
-assert_status "missing-partial-comparison" "of 7 enumerated sites matched" "$G_OUT"
+assert_status "missing-partial-comparison" "of 8 enumerated sites matched" "$G_OUT"
 
 # === (4) A SEVENTH ENCODING APPEARS → FAIL until it is enumerated deliberately ================
 # The site table alone cannot see a copy added somewhere new; the repo-wide total can. Growth
@@ -153,7 +155,7 @@ printf 'const SUB: &str = r"%s";\n' "$CANON" > "$T/crates/gc-service/src/validat
 git -C "$T" add -Af
 run_guard "$T"
 assert_rc     "seventh-exit1" 1 "$G_RC"
-assert_status "seventh-count" "found 11 occurrences of the org-subdomain pattern in scanned source, expected exactly 10" "$G_OUT"
+assert_status "seventh-count" "found 12 occurrences of the org-subdomain pattern in scanned source, expected exactly 11" "$G_OUT"
 assert_status "seventh-names-new-file" "crates/gc-service/src/validate.rs" "$G_OUT"
 
 # === (5) AN OCCURRENCE DISAPPEARS → FAIL (the count is pinned in BOTH directions) ============
@@ -163,7 +165,7 @@ T="$(new_tree)"
 printf 'if [[ "$sub1" =~ ^[a-z0-9-]+$ ]]; then\n' > "$T/scripts/layer7.test.sh"
 run_guard "$T"
 assert_rc     "removed-exit1" 1 "$G_RC"
-assert_status "removed-count" "found 9 occurrences of the org-subdomain pattern in scanned source, expected exactly 10" "$G_OUT"
+assert_status "removed-count" "found 10 occurrences of the org-subdomain pattern in scanned source, expected exactly 11" "$G_OUT"
 
 # === (6) THE GUARD'S OWN EXTRACTION BREAKS → FAIL LOUDLY, never a silent pass ================
 # An empty tree yields zero hits, at which point every comparison in the guard is trivially
@@ -189,16 +191,16 @@ T="$(new_tree)"
 # its shared seam helper by relative path.
 mkdir -p "${WORK}/skew/simple"; cp "$(dirname "$GUARD")/../common.sh" "${WORK}/skew/common.sh"
 SKEWED="${WORK}/skew/simple/guard-skewed.sh"
-sed 's/^readonly EXPECTED_SITE_COUNT=7$/readonly EXPECTED_SITE_COUNT=8/' "$GUARD" > "$SKEWED"
+sed 's/^readonly EXPECTED_SITE_COUNT=8$/readonly EXPECTED_SITE_COUNT=9/' "$GUARD" > "$SKEWED"
 # Prove the injection actually took, or this case tests the unmodified guard and passes for
 # the wrong reason.
-if grep -q 'EXPECTED_SITE_COUNT=8' "$SKEWED"; then PASS=$((PASS+1)); else
+if grep -q 'EXPECTED_SITE_COUNT=9' "$SKEWED"; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1))
   FAILURES+=("[count-skew-fixture] could not inject a skewed EXPECTED_SITE_COUNT into a copy of the guard — the constant was renamed or reformatted, so this case is VACUOUS until the sed is repaired")
 fi
 skew_out="$(DEVLOOP_TEST=1 SUBDOMAIN_GUARD_ROOT="$T" bash "$SKEWED" 2>&1)"; skew_rc=$?
 assert_rc     "count-skew-exit1"  1 "$skew_rc"
-assert_status "count-skew-named"  "site table holds 7 entries but EXPECTED_SITE_COUNT is 8" "$skew_out"
+assert_status "count-skew-named"  "site table holds 8 entries but EXPECTED_SITE_COUNT is 9" "$skew_out"
 
 # === (8) SEAM INERTNESS: SUBDOMAIN_GUARD_ROOT is IGNORED without DEVLOOP_TEST ================
 # The seam redirects what the guard examines, so honoring it in production would be a
@@ -217,19 +219,19 @@ empty="$(mktemp -d "${WORK}/inert.XXXXXX")"
 # `DEVLOOP_TEST=1 bash <this file>` → 20 passed / 2 failed; with `env -u` → 22 / 0 either way.
 inert_out="$(env -u DEVLOOP_TEST SUBDOMAIN_GUARD_ROOT="$empty" bash "$GUARD" 2>&1)"; inert_rc=$?
 assert_rc     "seam-inert-exit0"  0 "$inert_rc"
-assert_status "seam-inert-scanned-real-repo" "7 enumerated site(s) in sync" "$inert_out"
+assert_status "seam-inert-scanned-real-repo" "8 enumerated site(s) in sync" "$inert_out"
 
 # === (9) REPO_ROOT IS NOT A GIT TOP LEVEL → FAIL, naming THAT (not "found zero") =============
 # The sweep is `git grep`, and `git -C` resolves UPWARD, so a REPO_ROOT that is not itself a
 # git top level would scan the wrong tree (a subdirectory of an enclosing repo) or nothing at
 # all — surfacing as a bare "found zero" that names the wrong cause. The guard's precondition
-# (@security S2) must catch this. Proven FAIL-CLOSED: the fixture carries all ten real
+# (@security S2) must catch this. Proven FAIL-CLOSED: the fixture carries all eleven real
 # occurrences ON DISK, then has its `.git` stripped — so a filesystem walk (the old grep -rn)
 # WOULD have found and counted them, but the tracked-only guard must red because git cannot see
 # them, and must say so ("not the top level of a git work tree"), NOT falsely report zero. This
 # is the case that distinguishes "the content is missing" from "I could not look".
 T="$(new_tree)"                 # populated AND git-init'd by mk_tree...
-rm -rf "$T/.git"                # ...then de-repo'd: 10 occurrences on disk, no git to see them
+rm -rf "$T/.git"                # ...then de-repo'd: 11 occurrences on disk, no git to see them
 run_guard "$T"
 assert_rc     "nogit-exit1"        1 "$G_RC"
 assert_status "nogit-named"        "is not the top level of a git work tree" "$G_OUT"
