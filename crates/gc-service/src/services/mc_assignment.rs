@@ -23,6 +23,7 @@
 //! - All database operations use parameterized queries
 //! - Error messages are generic to prevent information leakage
 
+use crate::config::MhRegistryConfig;
 use crate::errors::GcError;
 use crate::observability::metrics;
 use crate::repositories::{weighted_random_select, McAssignment, MeetingAssignmentsRepository};
@@ -157,6 +158,7 @@ impl McAssignmentService {
     /// * `meeting_id` - Meeting to assign
     /// * `region` - Region to assign in
     /// * `gc_id` - ID of this GC instance
+    /// * `mh_registry` - MH staleness bound and initial handler count for selection
     ///
     /// # Returns
     ///
@@ -176,6 +178,7 @@ impl McAssignmentService {
         meeting_id: &str,
         region: &str,
         gc_id: &str,
+        mh_registry: &MhRegistryConfig,
     ) -> Result<AssignmentWithMh, GcError> {
         // Start timing for metrics (ADR-0011)
         let start = Instant::now();
@@ -240,7 +243,13 @@ impl McAssignmentService {
         // (assignment reuse) rate in docs/observability/metrics/gc-service.md
         // (under `gc_mc_assignments_total`) depends on that; a second callsite
         // must update that expression.
-        let mh_selection = MhSelectionService::select_mhs_for_meeting(pool, region).await?;
+        let mh_selection = MhSelectionService::select_mhs_for_meeting(
+            pool,
+            region,
+            mh_registry.staleness_bound(),
+            mh_registry.initial_handlers_per_meeting(),
+        )
+        .await?;
 
         let mh_ids: Vec<&str> = mh_selection
             .handlers

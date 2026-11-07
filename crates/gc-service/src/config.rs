@@ -8,6 +8,7 @@ use common::secret::SecretString;
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Default rate limit in requests per minute.
@@ -58,6 +59,233 @@ pub const DEFAULT_TELEMETRY_PROXY_RATE_LIMIT_PER_MINUTE: u32 = 60;
 pub const DEFAULT_OTEL_SAMPLE_RATE: f64 = 1.0;
 /// Default deployment environment when `DEPLOYMENT_ENVIRONMENT` is unset.
 pub const DEFAULT_DEPLOYMENT_ENVIRONMENT: &str = "development";
+
+// =============================================================================
+// MH registry freshness (ADR-0039 §10, R-24/R-26)
+//
+// All four keys are REQUIRED: `ConfigError::MissingEnvVar`, no Rust default.
+// Their reference values live in `infra/services/gc-service/config.env`, the
+// artifact an operator reads; a `DEFAULT_*` constant here would be a second
+// copy of the same value. The `MissingEnvVar("...")` constructor and its key
+// literal stay on ONE line at each site: `dt-guard env-config` discovers
+// required keys by a single-line regex over this file.
+// =============================================================================
+
+/// The four REQUIRED MH registry keys. (Presence checks are spelled out per
+/// key in `MhRegistryConfig::from_vars` for `dt-guard env-config`; this list
+/// is for consumers that enumerate them, e.g. tests.)
+pub const MH_REGISTRY_KEYS: [&str; 4] = [
+    "GC_MH_LOAD_REPORT_INTERVAL_MS",
+    "GC_MH_STALENESS_MULTIPLIER",
+    "GC_MH_REGISTRY_RETENTION_SECONDS",
+    "GC_MH_INITIAL_HANDLERS_PER_MEETING",
+];
+
+/// Bounds of `GC_MH_LOAD_REPORT_INTERVAL_MS`, milliseconds.
+const MIN_MH_LOAD_REPORT_INTERVAL_MS: u64 = 1_000;
+const MAX_MH_LOAD_REPORT_INTERVAL_MS: u64 = 60_000;
+/// Bounds of `GC_MH_STALENESS_MULTIPLIER` (k).
+const MIN_MH_STALENESS_MULTIPLIER: u64 = 2;
+const MAX_MH_STALENESS_MULTIPLIER: u64 = 10;
+/// Upper bound of `GC_MH_REGISTRY_RETENTION_SECONDS` (30 days). The lower
+/// bound is derived: retention must exceed the staleness bound. The cap exists
+/// so an absurd value fails HERE, at startup, rather than overflowing the
+/// millisecond bind or PostgreSQL's interval range on every health-check tick.
+const MAX_MH_REGISTRY_RETENTION_SECONDS: u64 = 2_592_000;
+/// Bounds of `GC_MH_INITIAL_HANDLERS_PER_MEETING`.
+const MIN_MH_INITIAL_HANDLERS_PER_MEETING: u64 = 1;
+pub(crate) const MAX_MH_INITIAL_HANDLERS_PER_MEETING: u64 = 4;
+
+/// GC's media-handler registry timing and sizing (ADR-0039 §10).
+///
+/// `staleness_bound` = k × `load_report_interval`, computed once here. It is
+/// the ONLY MH staleness value in GC: selection, the stale sweep and the
+/// `gc_mh_available` recompute all read it, and so does the published
+/// `gc_mh_staleness_threshold_seconds` gauge. `load_report_interval` is the
+/// value pushed to every MH in `RegisterMHResponse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MhRegistryConfig {
+    load_report_interval_ms: u64,
+    staleness_multiplier: u64,
+    staleness_bound: Duration,
+    retention: Duration,
+    initial_handlers_per_meeting: usize,
+}
+
+impl MhRegistryConfig {
+    /// Validate and build. Every failure names its key.
+    ///
+    /// # Errors
+    ///
+    /// `ConfigError::InvalidMhRegistryConfig` when a value is out of range or
+    /// retention does not exceed the derived staleness bound.
+    pub fn new(
+        load_report_interval_ms: u64,
+        staleness_multiplier: u64,
+        retention_seconds: u64,
+        initial_handlers_per_meeting: u64,
+    ) -> Result<Self, ConfigError> {
+        in_range(
+            "GC_MH_LOAD_REPORT_INTERVAL_MS",
+            load_report_interval_ms,
+            MIN_MH_LOAD_REPORT_INTERVAL_MS,
+            MAX_MH_LOAD_REPORT_INTERVAL_MS,
+        )?;
+        in_range(
+            "GC_MH_STALENESS_MULTIPLIER",
+            staleness_multiplier,
+            MIN_MH_STALENESS_MULTIPLIER,
+            MAX_MH_STALENESS_MULTIPLIER,
+        )?;
+        in_range(
+            "GC_MH_INITIAL_HANDLERS_PER_MEETING",
+            initial_handlers_per_meeting,
+            MIN_MH_INITIAL_HANDLERS_PER_MEETING,
+            MAX_MH_INITIAL_HANDLERS_PER_MEETING,
+        )?;
+        if retention_seconds > MAX_MH_REGISTRY_RETENTION_SECONDS {
+            return Err(ConfigError::InvalidMhRegistryConfig(format!(
+                "GC_MH_REGISTRY_RETENTION_SECONDS must be at most {}, got {}",
+                MAX_MH_REGISTRY_RETENTION_SECONDS, retention_seconds
+            )));
+        }
+
+        let staleness_bound_ms = load_report_interval_ms
+            .checked_mul(staleness_multiplier)
+            .ok_or_else(|| {
+                ConfigError::InvalidMhRegistryConfig(
+                    "GC_MH_STALENESS_MULTIPLIER x GC_MH_LOAD_REPORT_INTERVAL_MS overflows"
+                        .to_string(),
+                )
+            })?;
+        let retention_ms = retention_seconds.checked_mul(1_000).ok_or_else(|| {
+            ConfigError::InvalidMhRegistryConfig(
+                "GC_MH_REGISTRY_RETENTION_SECONDS overflows in milliseconds".to_string(),
+            )
+        })?;
+        if retention_ms <= staleness_bound_ms {
+            return Err(ConfigError::InvalidMhRegistryConfig(format!(
+                "GC_MH_REGISTRY_RETENTION_SECONDS ({} ms) must exceed the MH staleness bound \
+                 GC_MH_STALENESS_MULTIPLIER x GC_MH_LOAD_REPORT_INTERVAL_MS ({} ms)",
+                retention_ms, staleness_bound_ms
+            )));
+        }
+        let initial_handlers_per_meeting =
+            usize::try_from(initial_handlers_per_meeting).map_err(|_| {
+                ConfigError::InvalidMhRegistryConfig(
+                    "GC_MH_INITIAL_HANDLERS_PER_MEETING does not fit usize".to_string(),
+                )
+            })?;
+
+        Ok(Self {
+            load_report_interval_ms,
+            staleness_multiplier,
+            staleness_bound: Duration::from_millis(staleness_bound_ms),
+            retention: Duration::from_millis(retention_ms),
+            initial_handlers_per_meeting,
+        })
+    }
+
+    /// Parse the four REQUIRED keys from `vars` and validate (the one parse
+    /// path: `Config::from_vars` and gc-test-utils' reference config both
+    /// call this).
+    ///
+    /// # Errors
+    ///
+    /// `MissingEnvVar` naming an absent key; `InvalidMhRegistryConfig`
+    /// naming a malformed or out-of-range one.
+    pub fn from_vars(vars: &HashMap<String, String>) -> Result<Self, ConfigError> {
+        // MH registry freshness (ADR-0039 §10). REQUIRED; one-line
+        // `MissingEnvVar(` + literal per key for `dt-guard env-config`.
+        let mh_load_report_interval_ms = parse_u64(
+            "GC_MH_LOAD_REPORT_INTERVAL_MS",
+            vars.get("GC_MH_LOAD_REPORT_INTERVAL_MS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("GC_MH_LOAD_REPORT_INTERVAL_MS".to_string())
+            })?,
+        )?;
+        let mh_staleness_multiplier = parse_u64(
+            "GC_MH_STALENESS_MULTIPLIER",
+            vars.get("GC_MH_STALENESS_MULTIPLIER").ok_or_else(|| {
+                ConfigError::MissingEnvVar("GC_MH_STALENESS_MULTIPLIER".to_string())
+            })?,
+        )?;
+        let mh_registry_retention_seconds = parse_u64(
+            "GC_MH_REGISTRY_RETENTION_SECONDS",
+            vars.get("GC_MH_REGISTRY_RETENTION_SECONDS")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("GC_MH_REGISTRY_RETENTION_SECONDS".to_string())
+                })?,
+        )?;
+        let mh_initial_handlers_per_meeting = parse_u64(
+            "GC_MH_INITIAL_HANDLERS_PER_MEETING",
+            vars.get("GC_MH_INITIAL_HANDLERS_PER_MEETING")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("GC_MH_INITIAL_HANDLERS_PER_MEETING".to_string())
+                })?,
+        )?;
+        Self::new(
+            mh_load_report_interval_ms,
+            mh_staleness_multiplier,
+            mh_registry_retention_seconds,
+            mh_initial_handlers_per_meeting,
+        )
+    }
+
+    /// Load-report interval pushed to MH at registration.
+    pub fn load_report_interval(&self) -> Duration {
+        Duration::from_millis(self.load_report_interval_ms)
+    }
+
+    /// The same interval in milliseconds, the unit of
+    /// `RegisterMHResponse.load_report_interval_ms`.
+    pub fn load_report_interval_ms(&self) -> u64 {
+        self.load_report_interval_ms
+    }
+
+    /// The staleness multiplier k.
+    pub fn staleness_multiplier(&self) -> u64 {
+        self.staleness_multiplier
+    }
+
+    /// The one MH staleness bound (k × interval).
+    pub fn staleness_bound(&self) -> Duration {
+        self.staleness_bound
+    }
+
+    /// Registry retention: rows with no load report for this long are deleted.
+    pub fn retention(&self) -> Duration {
+        self.retention
+    }
+
+    /// Number of MHs selected for a new meeting (upper bound; fewer when fewer
+    /// candidates exist).
+    pub fn initial_handlers_per_meeting(&self) -> usize {
+        self.initial_handlers_per_meeting
+    }
+}
+
+/// Range-check an already-parsed value, naming the key on failure.
+fn in_range(key: &str, value: u64, min: u64, max: u64) -> Result<(), ConfigError> {
+    if value < min || value > max {
+        return Err(ConfigError::InvalidMhRegistryConfig(format!(
+            "{} must be in [{}, {}], got {}",
+            key, min, max, value
+        )));
+    }
+    Ok(())
+}
+
+/// Parse an already-fetched REQUIRED value as `u64`, naming the key.
+///
+/// The presence check is deliberately at the call site (see the section note).
+fn parse_u64(key: &str, raw: &str) -> Result<u64, ConfigError> {
+    raw.trim().parse::<u64>().map_err(|e| {
+        ConfigError::InvalidMhRegistryConfig(format!(
+            "{} must be a non-negative integer, got '{}': {}",
+            key, raw, e
+        ))
+    })
+}
 
 /// Global Controller configuration.
 ///
@@ -146,6 +374,9 @@ pub struct Config {
     /// `HeaderValue` are dropped (with a warn) at `CorsLayer` build time, never
     /// widening the allowlist. Not secret — shown in Debug output.
     pub cors_allowed_origins: Vec<String>,
+
+    /// MH registry timing and sizing (ADR-0039 §10). Not secret.
+    pub mh_registry: MhRegistryConfig,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -178,6 +409,7 @@ impl fmt::Debug for Config {
             .field("otel_sample_rate", &self.otel_sample_rate)
             .field("environment", &self.environment)
             .field("cors_allowed_origins", &self.cors_allowed_origins)
+            .field("mh_registry", &self.mh_registry)
             .finish()
     }
 }
@@ -204,6 +436,9 @@ pub enum ConfigError {
 
     #[error("Invalid OTel configuration: {0}")]
     InvalidOtelConfig(String),
+
+    #[error("Invalid MH registry configuration: {0}")]
+    InvalidMhRegistryConfig(String),
 }
 
 impl Config {
@@ -452,6 +687,8 @@ impl Config {
             })
             .unwrap_or_default();
 
+        let mh_registry = MhRegistryConfig::from_vars(vars)?;
+
         // When OTel is enabled the endpoint is required: fail fast with a clear
         // message rather than letting init_otel reject an empty/unparseable URL.
         if otel_enabled && otel_endpoint.trim().is_empty() {
@@ -481,6 +718,7 @@ impl Config {
             otel_sample_rate,
             environment,
             cors_allowed_origins,
+            mh_registry,
         })
     }
 
@@ -514,7 +752,142 @@ mod tests {
             ),
             ("GC_CLIENT_ID".to_string(), "test-gc-client".to_string()),
             ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
+            // Test-local MH registry values (validation is what these tests
+            // exercise; the shipped values are config.env's).
+            (
+                "GC_MH_LOAD_REPORT_INTERVAL_MS".to_string(),
+                "2000".to_string(),
+            ),
+            ("GC_MH_STALENESS_MULTIPLIER".to_string(), "4".to_string()),
+            (
+                "GC_MH_REGISTRY_RETENTION_SECONDS".to_string(),
+                "600".to_string(),
+            ),
+            (
+                "GC_MH_INITIAL_HANDLERS_PER_MEETING".to_string(),
+                "3".to_string(),
+            ),
         ])
+    }
+
+    #[test]
+    fn test_mh_registry_values_and_derived_bound() {
+        let config = Config::from_vars(&base_vars()).unwrap();
+        let mh = config.mh_registry;
+        assert_eq!(mh.load_report_interval(), Duration::from_millis(2000));
+        assert_eq!(mh.staleness_multiplier(), 4);
+        assert_eq!(mh.staleness_bound(), Duration::from_millis(8000));
+        assert_eq!(mh.retention(), Duration::from_secs(600));
+        assert_eq!(mh.initial_handlers_per_meeting(), 3);
+    }
+
+    #[test]
+    fn test_mh_registry_each_key_missing_fails_naming_key() {
+        for key in MH_REGISTRY_KEYS {
+            let mut vars = base_vars();
+            vars.remove(key);
+            let err = Config::from_vars(&vars).expect_err("missing key must fail");
+            assert!(
+                matches!(&err, ConfigError::MissingEnvVar(k) if k == key),
+                "{key} missing: expected MissingEnvVar naming it, got {err:?}"
+            );
+        }
+    }
+
+    /// (key, value, accepted). Retention is held at its max so the interval
+    /// and multiplier bounds are exercised independently of retention > bound.
+    #[test]
+    fn test_mh_registry_range_table() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("GC_MH_LOAD_REPORT_INTERVAL_MS", "999", false),
+            ("GC_MH_LOAD_REPORT_INTERVAL_MS", "1000", true),
+            ("GC_MH_LOAD_REPORT_INTERVAL_MS", "60000", true),
+            ("GC_MH_LOAD_REPORT_INTERVAL_MS", "60001", false),
+            ("GC_MH_LOAD_REPORT_INTERVAL_MS", "ten", false),
+            ("GC_MH_LOAD_REPORT_INTERVAL_MS", "-1", false),
+            ("GC_MH_STALENESS_MULTIPLIER", "1", false),
+            ("GC_MH_STALENESS_MULTIPLIER", "2", true),
+            ("GC_MH_STALENESS_MULTIPLIER", "10", true),
+            ("GC_MH_STALENESS_MULTIPLIER", "11", false),
+            ("GC_MH_STALENESS_MULTIPLIER", "x", false),
+            ("GC_MH_INITIAL_HANDLERS_PER_MEETING", "0", false),
+            ("GC_MH_INITIAL_HANDLERS_PER_MEETING", "1", true),
+            ("GC_MH_INITIAL_HANDLERS_PER_MEETING", "4", true),
+            ("GC_MH_INITIAL_HANDLERS_PER_MEETING", "5", false),
+            ("GC_MH_INITIAL_HANDLERS_PER_MEETING", "", false),
+            ("GC_MH_REGISTRY_RETENTION_SECONDS", "2592000", true),
+            ("GC_MH_REGISTRY_RETENTION_SECONDS", "2592001", false),
+            (
+                "GC_MH_REGISTRY_RETENTION_SECONDS",
+                "18446744073709551615",
+                false,
+            ),
+            ("GC_MH_REGISTRY_RETENTION_SECONDS", "1h", false),
+        ];
+        for (key, value, accepted) in cases {
+            let mut vars = base_vars();
+            vars.insert(
+                "GC_MH_REGISTRY_RETENTION_SECONDS".to_string(),
+                "2592000".to_string(),
+            );
+            vars.insert((*key).to_string(), (*value).to_string());
+            let result = Config::from_vars(&vars);
+            if *accepted {
+                assert!(
+                    result.is_ok(),
+                    "{key}={value} should be accepted: {result:?}"
+                );
+            } else {
+                let err = result.expect_err("out-of-range value must fail");
+                assert!(
+                    matches!(&err, ConfigError::InvalidMhRegistryConfig(msg) if msg.contains(key)),
+                    "{key}={value}: expected InvalidMhRegistryConfig naming the key, got {err:?}"
+                );
+            }
+        }
+    }
+
+    /// Retention must strictly exceed k × interval, compared in milliseconds.
+    #[test]
+    fn test_mh_registry_retention_must_exceed_bound() {
+        let mut vars = base_vars();
+        vars.insert(
+            "GC_MH_LOAD_REPORT_INTERVAL_MS".to_string(),
+            "1000".to_string(),
+        );
+        vars.insert("GC_MH_STALENESS_MULTIPLIER".to_string(), "2".to_string());
+        // Bound = 2000 ms. Retention 2 s == bound → refused.
+        vars.insert(
+            "GC_MH_REGISTRY_RETENTION_SECONDS".to_string(),
+            "2".to_string(),
+        );
+        let err = Config::from_vars(&vars).expect_err("retention == bound must fail");
+        assert!(
+            matches!(&err, ConfigError::InvalidMhRegistryConfig(msg)
+                if msg.contains("GC_MH_REGISTRY_RETENTION_SECONDS")),
+            "retention == bound: got {err:?}"
+        );
+        vars.insert(
+            "GC_MH_REGISTRY_RETENTION_SECONDS".to_string(),
+            "1".to_string(),
+        );
+        let err = Config::from_vars(&vars).expect_err("retention < bound must fail");
+        assert!(
+            matches!(&err, ConfigError::InvalidMhRegistryConfig(msg)
+                if msg.contains("GC_MH_REGISTRY_RETENTION_SECONDS")),
+            "retention < bound: got {err:?}"
+        );
+        // 3 s > 2000 ms → accepted (boundary positive arm).
+        vars.insert(
+            "GC_MH_REGISTRY_RETENTION_SECONDS".to_string(),
+            "3".to_string(),
+        );
+        let config = Config::from_vars(&vars).expect("retention > bound accepted");
+        assert_eq!(
+            config.mh_registry.staleness_bound(),
+            Duration::from_millis(2000)
+        );
+        assert_eq!(config.mh_registry.retention(), Duration::from_secs(3));
     }
 
     #[test]

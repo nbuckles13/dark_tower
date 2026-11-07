@@ -23,4 +23,5 @@
 
 pub mod grpc_auth;
 pub mod jwt_fixtures;
+pub mod mh_registry;
 pub mod otel_support;

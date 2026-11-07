@@ -82,7 +82,7 @@ impl TestGcServer {
     /// * `Err(anyhow::Error)` - If server spawn fails
     pub async fn spawn(pool: PgPool) -> Result<Self, anyhow::Error> {
         // Build configuration for test environment
-        let vars = HashMap::from([
+        let mut vars = HashMap::from([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://test/test".to_string(),
@@ -97,6 +97,7 @@ impl TestGcServer {
             ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
         ]);
 
+        vars.extend(crate::reference_config::reference_mh_registry_vars());
         let config = Config::from_vars(&vars)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 

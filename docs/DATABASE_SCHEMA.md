@@ -239,39 +239,57 @@ CREATE INDEX idx_controllers_heartbeat ON meeting_controllers(last_heartbeat_at)
 
 ### 8. Media Handlers Table
 
-Tracks registered media handlers.
+GC's registry of Media Handlers (ADR-0010 §4a, ADR-0039 §7/§10). Mirrors
+`migrations/20260124000001_mh_registry.sql` exactly.
 
 ```sql
-CREATE TABLE media_handlers (
+CREATE TABLE IF NOT EXISTS media_handlers (
     handler_id VARCHAR(255) PRIMARY KEY,
-    region VARCHAR(50) NOT NULL,
-    endpoint TEXT NOT NULL,
-
-    -- Capacity
-    max_streams INTEGER NOT NULL,
+    region TEXT NOT NULL,
+    webtransport_endpoint VARCHAR(512) NOT NULL,
+    grpc_endpoint VARCHAR(512) NOT NULL,
+    max_streams INTEGER NOT NULL DEFAULT 1000,
     current_streams INTEGER NOT NULL DEFAULT 0,
-    max_bitrate_mbps INTEGER NOT NULL,
-    current_bitrate_mbps INTEGER NOT NULL DEFAULT 0,
-
-    -- Health
-    health_status VARCHAR(20) NOT NULL DEFAULT 'healthy',
+    health_status VARCHAR(20) NOT NULL DEFAULT 'pending'
+        CHECK (health_status IN ('pending', 'healthy', 'degraded', 'unhealthy', 'draining')),
+    cpu_usage_percent REAL,
+    memory_usage_percent REAL,
+    bandwidth_usage_percent REAL,
     last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
-    -- Capabilities
-    supports_transcoding BOOLEAN NOT NULL DEFAULT true,
-    supports_mixing BOOLEAN NOT NULL DEFAULT true,
-    supported_codecs TEXT[] DEFAULT ARRAY['VP9', 'AV1', 'H264', 'Opus'],
-
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    metadata JSONB DEFAULT '{}'::jsonb
+    registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_handlers_region ON media_handlers(region);
-CREATE INDEX idx_handlers_health ON media_handlers(health_status);
+-- Healthy MHs in a region (load balancing)
+CREATE INDEX IF NOT EXISTS idx_media_handlers_healthy
+ON media_handlers(region, health_status)
+WHERE health_status = 'healthy';
+
+-- Available MHs with capacity
+CREATE INDEX IF NOT EXISTS idx_media_handlers_available
+ON media_handlers(region, current_streams, max_streams)
+WHERE health_status IN ('healthy', 'degraded') AND current_streams < max_streams;
+
+-- updated_at maintained by trigger update_media_handlers_updated_at
+-- (BEFORE UPDATE, FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()).
 ```
 
-> **`media_handlers.max_streams DEFAULT 1000` is intentionally retained and unreachable.** The deployed default (in `migrations/20260124000001_mh_registry.sql`, which is authoritative over the sketch above) is never applied: GC's register upsert always binds the `max_streams` value MH advertises (once the MH egress-budget code task ships, the stream ceiling MH derives from its egress budget). It is NOT MH's former `DEFAULT_MAX_STREAMS` constant — the two only coincided numerically. No migration removes it, because the ADR-0036 arc forbids one.
+- **`handler_id` is per incarnation.** Every MH process start registers a new id; an in-place restart
+  in the same slot gets a new row, and the previous incarnation's row stays behind until retention
+  deletes it. `last_heartbeat_at` is refreshed by registration and by every load report.
+- **Staleness** is one bound, `B = GC_MH_STALENESS_MULTIPLIER × GC_MH_LOAD_REPORT_INTERVAL_MS`
+  (computed once at GC startup; the interval is the one GC pushes to MH in `RegisterMHResponse`). A row
+  whose `last_heartbeat_at` is older than `B` is never a selection candidate, is marked `unhealthy` by
+  GC's sweep (draining rows included: a live draining MH keeps reporting DRAINING and is never swept),
+  and counts as `unhealthy` in `gc_mh_available`. Only `health_status = 'healthy'` rows are candidates,
+  so a draining MH is never selected.
+- **Retention**: rows whose `last_heartbeat_at` is older than `GC_MH_REGISTRY_RETENTION_SECONDS` are
+  deleted on GC's MH health-checker tick. GC refuses to start unless retention > `B` (compared in
+  milliseconds), so a reporting MH is never deleted. A load report for a deleted row matches no row
+  (NOT_FOUND "Handler not registered") and never recreates it; the MH re-registers. No foreign key
+  references this table.
+
+> **`media_handlers.max_streams DEFAULT 1000` is intentionally retained and unreachable.** The default is never applied: GC's register upsert always binds the `max_streams` value MH advertises (once the MH egress-budget code task ships, the stream ceiling MH derives from its egress budget). It is NOT MH's former `DEFAULT_MAX_STREAMS` constant — the two only coincided numerically. No migration removes it: ADR-0039 R-25 ("no schema migration").
 
 ### 9. Audit Logs Table
 

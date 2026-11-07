@@ -19,7 +19,7 @@
 
 use std::collections::BTreeSet;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -287,8 +287,9 @@ pub const MH_POD_SETTLE: crate::eventual::ConsistencyCategory =
 
 /// EVERY live MH pod, found by [`MH_SELECTOR`] — no fixed name or count.
 ///
-/// Re-lists (bounded by [`MH_POD_SETTLE`]) until [`require_all_serving`] holds,
-/// then returns the serving set from that ONE snapshot.
+/// [`settled_serving_pods`] bounded by [`MH_POD_SETTLE`]: re-lists until
+/// [`require_all_serving`] holds, then returns the serving set from that ONE
+/// snapshot.
 ///
 /// # Panics
 /// PRECONDITION (`mh-pods-unserving`) at the bound, with the last snapshot's
@@ -296,38 +297,90 @@ pub const MH_POD_SETTLE: crate::eventual::ConsistencyCategory =
 /// Do NOT loosen this for a test that kills an MH: such a test waits for its
 /// replacement to be Ready before anything resolves handlers.
 pub async fn live_mh_pods() -> Vec<LivePod> {
-    let last: Arc<Mutex<Result<Vec<LivePod>, String>>> =
-        Arc::new(Mutex::new(Err("not listed yet".to_string())));
-    let settled = crate::eventual::assert_eventually(MH_POD_SETTLE, || {
-        let last = Arc::clone(&last);
-        async move {
-            // kubectl blocks: run it on the blocking pool, never on the test's
-            // (current-thread) runtime thread that drives live sessions.
-            let verdict = join_blocking(
-                tokio::task::spawn_blocking(|| {
-                    partition_serving(&pods_json(MH_SELECTOR), MH_SELECTOR)
-                        .and_then(|p| require_all_serving(&p, MH_SELECTOR))
-                })
-                .await,
-            );
-            let ok = verdict.is_ok();
-            *last.lock().unwrap_or_else(|p| p.into_inner()) = verdict;
-            ok
+    settled_serving_pods(MH_SELECTOR, MH_POD_SETTLE.timeout(), "mh-pods-unserving")
+        .await
+        .1
+}
+
+/// How often [`settled_serving_pods`] re-lists.
+const SETTLE_POLL: Duration = Duration::from_secs(1);
+
+/// The ONE settle kernel for a label-selected pod set: re-list `selector`
+/// (bounded by `timeout`) until [`require_all_serving`] holds — every matching
+/// pod Ready and none Terminating, at least one — and return that ONE
+/// snapshot's document together with its serving set, so a caller reading pod
+/// specs and a caller pinning pod IPs see the same pods.
+///
+/// Waiting is for the TRANSIENT states right after a converge (`rollout
+/// status` returns while an old ReplicaSet's pod is still inside its
+/// termination grace). At the bound the last verdict fails loudly; a pod that
+/// stays Terminating or not Ready is never dropped.
+///
+/// # Panics
+/// PRECONDITION (`<reason>`) at the bound, with the last snapshot's verdict.
+pub async fn settled_serving_pods(
+    selector: &str,
+    timeout: Duration,
+    reason: &str,
+) -> (Value, Vec<LivePod>) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let sel = selector.to_string();
+        // kubectl blocks: run it on the blocking pool, never on the test's
+        // (current-thread) runtime thread that drives live sessions.
+        let (doc, verdict) = join_blocking(
+            tokio::task::spawn_blocking(move || {
+                let doc = pods_json(&sel);
+                let verdict =
+                    partition_serving(&doc, &sel).and_then(|p| require_all_serving(&p, &sel));
+                (doc, verdict)
+            })
+            .await,
+        );
+        match verdict {
+            Ok(pods) => return (doc, pods),
+            Err(e) if std::time::Instant::now() >= deadline => panic!(
+                "PRECONDITION ({reason}): after {timeout:?}: {e}. Inspect: kubectl -n {NAMESPACE} \
+                 get pods -l {selector} -o wide"
+            ),
+            Err(_) => tokio::time::sleep(SETTLE_POLL).await,
         }
-    })
-    .await;
-    let last = std::mem::replace(
-        &mut *last.lock().unwrap_or_else(|p| p.into_inner()),
-        Err(String::new()),
-    );
-    match (settled, last) {
-        (Ok(()), Ok(pods)) => pods,
-        (_, Err(e)) | (Err(e), Ok(_)) => panic!(
-            "PRECONDITION (mh-pods-unserving): after {:?}: {e}. Inspect: kubectl -n {NAMESPACE} \
-             get pods -l {MH_SELECTOR} -o wide",
-            MH_POD_SETTLE.timeout()
-        ),
     }
+}
+
+/// PURE: the largest `spec.terminationGracePeriodSeconds` over EVERY pod in a
+/// `kubectl get pods -o json` document, Terminating ones included (the pod
+/// being waited out carries the grace it was deleted with). Read from the live
+/// specs, never a manifest: the API server always stores the field (it
+/// defaults it), so its absence is a loud error, not a guess.
+///
+/// # Errors
+/// No `items`, zero pods, or a pod without the field.
+pub fn max_termination_grace(pods: &Value, selector: &str) -> Result<Duration, String> {
+    let items = pods
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("kubectl output for -l {selector} has no `items` array"))?;
+    let mut max: Option<u64> = None;
+    for p in items {
+        let name = p
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unnamed pod>");
+        let grace = p
+            .pointer("/spec/terminationGracePeriodSeconds")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "pod {name} (-l {selector}) has no spec.terminationGracePeriodSeconds; the \
+                     API server always stores it, so this document is not a live pod list"
+                )
+            })?;
+        max = Some(max.map_or(grace, |m| m.max(grace)));
+    }
+    max.map(Duration::from_secs).ok_or_else(|| {
+        format!("zero-pods: no pod matches -n {NAMESPACE} -l {selector}; no grace to wait out")
+    })
 }
 
 /// The value of a `spawn_blocking` task, re-raising its panic AS ITSELF (so a
@@ -602,6 +655,33 @@ pub fn kubectl_get_json(args: &[&str]) -> Result<Value, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn max_termination_grace_takes_the_largest_including_terminating() {
+        let pods = json!({"items": [
+            {"metadata": {"name": "new"}, "spec": {"terminationGracePeriodSeconds": 35}},
+            {"metadata": {"name": "old", "deletionTimestamp": "2026-11-07T00:00:00Z"},
+             "spec": {"terminationGracePeriodSeconds": 50}},
+        ]});
+        assert_eq!(
+            max_termination_grace(&pods, "app=x"),
+            Ok(Duration::from_secs(50))
+        );
+    }
+
+    #[test]
+    fn max_termination_grace_refuses_missing_field_and_zero_pods() {
+        let missing = json!({"items": [{"metadata": {"name": "p"}, "spec": {}}]});
+        let e = max_termination_grace(&missing, "app=x").unwrap_err();
+        assert!(
+            e.contains("pod p") && e.contains("terminationGracePeriodSeconds"),
+            "{e}"
+        );
+        let e = max_termination_grace(&json!({"items": []}), "app=x").unwrap_err();
+        assert!(e.starts_with("zero-pods"), "{e}");
+        let e = max_termination_grace(&json!({}), "app=x").unwrap_err();
+        assert!(e.contains("no `items`"), "{e}");
+    }
 
     const BASE: &str = "mh-service-config";
     const GEN_A: &str = "mh-service-config-7f2kd9h4mt";

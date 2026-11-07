@@ -14,7 +14,7 @@ use crate::observability::metrics;
 use crate::repositories::{MediaHandlersRepository, MhCandidate};
 use ring::rand::{SecureRandom, SystemRandom};
 use sqlx::PgPool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::instrument;
 
 /// Result of MH selection for a meeting.
@@ -45,14 +45,17 @@ pub struct MhSelectionService;
 impl MhSelectionService {
     /// Select MHs for a meeting in a region.
     ///
-    /// Selects up to 2 MH peers using weighted random selection based on load
-    /// ratio. All selected handlers are active/active -- there is no
-    /// primary/backup distinction.
+    /// Selects up to `initial_handlers_per_meeting` (`GC_MH_INITIAL_HANDLERS_PER_MEETING`)
+    /// distinct MH peers using weighted random selection based on load ratio,
+    /// each pick drawn from the candidates not yet picked. All selected
+    /// handlers are active/active -- there is no primary/backup distinction.
     ///
     /// # Arguments
     ///
     /// * `pool` - Database connection pool
     /// * `region` - Region to select MHs from
+    /// * `staleness_bound` - The MH staleness bound (`MhRegistryConfig::staleness_bound`)
+    /// * `initial_handlers_per_meeting` - Upper bound on handlers selected
     ///
     /// # Returns
     ///
@@ -66,11 +69,14 @@ impl MhSelectionService {
     pub async fn select_mhs_for_meeting(
         pool: &PgPool,
         region: &str,
+        staleness_bound: Duration,
+        initial_handlers_per_meeting: usize,
     ) -> Result<MhSelection, GcError> {
         let start = Instant::now();
 
         // Get candidate MHs
-        let candidates = MediaHandlersRepository::get_candidate_mhs(pool, region).await?;
+        let candidates =
+            MediaHandlersRepository::get_candidate_mhs(pool, region, staleness_bound).await?;
 
         if candidates.is_empty() {
             tracing::warn!(
@@ -91,52 +97,35 @@ impl MhSelectionService {
             "Found candidate MHs for selection"
         );
 
-        let mut handlers = Vec::new();
+        let mut handlers = Vec::with_capacity(initial_handlers_per_meeting);
+        let mut remaining = candidates;
 
-        // Select first MH using weighted random
-        let first = weighted_random_select(&candidates).ok_or_else(|| {
-            GcError::ServiceUnavailable("No media handlers available in this region".to_string())
-        })?;
+        while handlers.len() < initial_handlers_per_meeting {
+            let Some(picked) = weighted_random_select(&remaining).cloned() else {
+                break;
+            };
+            tracing::debug!(
+                target: "gc.service.mh_selection",
+                mh_id = %picked.handler_id,
+                load_ratio = picked.load_ratio,
+                mh_index = handlers.len(),
+                "Selected MH"
+            );
+            remaining.retain(|c| c.handler_id != picked.handler_id);
+            handlers.push(MhAssignmentInfo {
+                mh_id: picked.handler_id,
+                webtransport_endpoint: picked.webtransport_endpoint,
+                grpc_endpoint: picked.grpc_endpoint,
+            });
+        }
 
-        handlers.push(MhAssignmentInfo {
-            mh_id: first.handler_id.clone(),
-            webtransport_endpoint: first.webtransport_endpoint.clone(),
-            grpc_endpoint: first.grpc_endpoint.clone(),
-        });
-
-        tracing::debug!(
-            target: "gc.service.mh_selection",
-            mh_id = %first.handler_id,
-            load_ratio = first.load_ratio,
-            mh_index = 0,
-            "Selected MH"
-        );
-
-        // Try to select a second MH peer (different from first)
-        if candidates.len() > 1 {
-            let remaining: Vec<_> = candidates
-                .iter()
-                .filter(|c| c.handler_id != first.handler_id)
-                .collect();
-
-            if !remaining.is_empty() {
-                // Convert to owned for weighted_random_select
-                let remaining_owned: Vec<MhCandidate> = remaining.into_iter().cloned().collect();
-                if let Some(second) = weighted_random_select(&remaining_owned) {
-                    tracing::debug!(
-                        target: "gc.service.mh_selection",
-                        mh_id = %second.handler_id,
-                        load_ratio = second.load_ratio,
-                        mh_index = 1,
-                        "Selected MH"
-                    );
-                    handlers.push(MhAssignmentInfo {
-                        mh_id: second.handler_id.clone(),
-                        webtransport_endpoint: second.webtransport_endpoint.clone(),
-                        grpc_endpoint: second.grpc_endpoint.clone(),
-                    });
-                }
-            }
+        if handlers.is_empty() {
+            // Unreachable with a non-empty candidate list and N >= 1 (config
+            // floor), but never return an empty selection.
+            metrics::record_mh_selection("error", false, start.elapsed());
+            return Err(GcError::ServiceUnavailable(
+                "No media handlers available in this region".to_string(),
+            ));
         }
 
         let has_multiple = handlers.len() > 1;

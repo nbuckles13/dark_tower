@@ -502,6 +502,67 @@ pub fn record_mh_selection(status: &str, has_multiple: bool, duration: Duration)
 }
 
 // ============================================================================
+// MH Registry Metrics (ADR-0039 §8, §10)
+// ============================================================================
+
+/// `gc_mh_load_reports_total` outcome: the UPDATE matched the handler's row.
+pub const MH_LOAD_REPORT_ACCEPTED: &str = "accepted";
+/// `gc_mh_load_reports_total` outcome: no row for the handler (NOT_FOUND). A
+/// dead process never reports, so this means a process GC has no row for is
+/// alive (deleted by retention, lost registry, or a live duplicate).
+pub const MH_LOAD_REPORT_UNKNOWN_HANDLER: &str = "unknown_handler";
+const MH_LOAD_REPORT_OUTCOMES: &[&str] = &[MH_LOAD_REPORT_ACCEPTED, MH_LOAD_REPORT_UNKNOWN_HANDLER];
+
+/// Record one MH load report outcome.
+///
+/// Metric: `gc_mh_load_reports_total`
+/// Labels: `outcome` (`accepted` | `unknown_handler`). No handler id label.
+/// Invalid-argument rejections and DB errors are NOT counted here
+/// (`gc_db_queries_total` covers DB errors).
+pub fn record_mh_load_report(outcome: &'static str) {
+    counter!("gc_mh_load_reports_total", "outcome" => outcome).increment(1);
+}
+
+/// `gc_mh_available` region label for rows outside GC's own region.
+///
+/// The MH-asserted region string is never a label value: rows are bucketed
+/// to GC's own configured region or this constant.
+pub const MH_AVAILABLE_OTHER_REGION: &str = "other";
+
+/// Recompute-and-set `gc_mh_available{region, state}` from registry counts.
+///
+/// Sets the FULL closed label set — {`own_region`, `"other"`} × the five
+/// states — every call, writing 0 for any combination absent from `rows`, so a
+/// state or region that empties (e.g. its last row is retention-deleted) reads
+/// 0 rather than its last value. Called with `&[]` at startup to zero-init.
+pub fn set_mh_available(own_region: &str, rows: &[crate::repositories::MhAvailabilityRow]) {
+    for (is_own, region) in [(true, own_region), (false, MH_AVAILABLE_OTHER_REGION)] {
+        for state in CONTROLLER_STATUSES {
+            let count: u64 = rows
+                .iter()
+                .filter(|r| r.own_region == is_own && r.state.as_db_str() == state)
+                .map(|r| r.count)
+                .sum();
+            gauge!("gc_mh_available",
+                "region" => region.to_string(),
+                "state" => state
+            )
+            .set(count as f64);
+        }
+    }
+}
+
+/// Publish the MH registry config gauges (set once at startup).
+///
+/// Metrics: `gc_mh_load_report_interval_seconds`,
+/// `gc_mh_staleness_threshold_seconds`. Both read the same `MhRegistryConfig`
+/// values that the `RegisterMHResponse` push and every freshness query use.
+pub fn set_mh_registry_config_gauges(config: &crate::config::MhRegistryConfig) {
+    gauge!("gc_mh_load_report_interval_seconds").set(config.load_report_interval().as_secs_f64());
+    gauge!("gc_mh_staleness_threshold_seconds").set(config.staleness_bound().as_secs_f64());
+}
+
+// ============================================================================
 // Meeting Creation Metrics
 // ============================================================================
 
@@ -1000,6 +1061,8 @@ const GC_DB_QUERY_OPERATIONS: &[&str] = &[
     "register_mh",
     "update_load_report",
     "mark_stale_mh_unhealthy",
+    "delete_expired_mh",
+    "count_available_mh",
     "get_candidate_mhs",
     "get_handler",
     "get_healthy_assignment",
@@ -1103,6 +1166,10 @@ pub fn zero_initialize_counters() {
             counter!("gc_cors_preflight_total", "origin_class" => *oc, "status" => *s).increment(0);
         }
     }
+    // gc_mh_load_reports_total{outcome}
+    for o in MH_LOAD_REPORT_OUTCOMES {
+        counter!("gc_mh_load_reports_total", "outcome" => *o).increment(0);
+    }
     // gc_grpc_mc_calls_total{method, status} (un-exempted — closed at emit sites)
     for m in GRPC_MC_METHODS {
         for s in GRPC_MC_STATUSES {
@@ -1166,6 +1233,12 @@ mod tests {
         present_at_zero(r#"gc_cors_preflight_total{origin_class="allowed",status="200"}"#);
         // db_queries: the rare error series that were previously masked.
         present_at_zero(r#"gc_db_queries_total{operation="atomic_assign",status="error"}"#);
+        present_at_zero(r#"gc_mh_load_reports_total{outcome="accepted"}"#);
+        present_at_zero(r#"gc_mh_load_reports_total{outcome="unknown_handler"}"#);
+        present_at_zero(r#"gc_db_queries_total{operation="delete_expired_mh",status="success"}"#);
+        present_at_zero(r#"gc_db_queries_total{operation="delete_expired_mh",status="error"}"#);
+        present_at_zero(r#"gc_db_queries_total{operation="count_available_mh",status="success"}"#);
+        present_at_zero(r#"gc_db_queries_total{operation="count_available_mh",status="error"}"#);
 
         let total_series = rendered
             .lines()

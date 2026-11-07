@@ -86,6 +86,7 @@ async fn test_assign_meeting_with_mh_success(pool: PgPool) {
         "meeting-001",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await;
 
@@ -129,6 +130,7 @@ async fn test_assign_meeting_with_mh_retries_on_rejection(pool: PgPool) {
         "meeting-retry-001",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await;
 
@@ -155,6 +157,7 @@ async fn test_assign_meeting_with_mh_fails_after_max_retries(pool: PgPool) {
         "meeting-fail-001",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await;
 
@@ -214,6 +217,7 @@ async fn test_assign_meeting_with_mh_invalid_request_fails_fast(pool: PgPool) {
         "meeting-invalid-001",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await;
 
@@ -284,6 +288,7 @@ async fn test_invalid_request_claim_on_wellformed_request_preserves_failover(poo
         "meeting-wellformed-001",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await;
 
@@ -326,6 +331,7 @@ async fn test_assign_meeting_with_mh_no_mcs(pool: PgPool) {
         "meeting-no-mc",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await;
 
@@ -354,6 +360,7 @@ async fn test_assign_meeting_with_mh_no_mhs(pool: PgPool) {
         "meeting-no-mh",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await;
 
@@ -390,6 +397,7 @@ async fn test_assign_meeting_with_mh_returns_existing(pool: PgPool) {
         "meeting-existing",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await
     .expect("first assignment should succeed");
@@ -405,6 +413,7 @@ async fn test_assign_meeting_with_mh_returns_existing(pool: PgPool) {
         "meeting-existing",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await
     .expect("reuse should succeed");
@@ -463,6 +472,7 @@ async fn test_reuse_path_skips_mh_selection_on_empty_pool(pool: PgPool) {
         "meeting-sticky",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await
     .expect("new assignment should succeed with a healthy MH pool");
@@ -483,6 +493,7 @@ async fn test_reuse_path_skips_mh_selection_on_empty_pool(pool: PgPool) {
         "meeting-sticky",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await
     .expect("reuse must not depend on a live MH pool");
@@ -514,6 +525,7 @@ async fn test_reuse_path_skips_mh_selection_on_empty_pool(pool: PgPool) {
         "meeting-unassigned",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await
     .expect_err("a new assignment must fail with an empty MH pool");
@@ -553,6 +565,7 @@ async fn test_assign_meeting_with_mh_retries_on_rpc_error(pool: PgPool) {
         "meeting-rpc-error",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await;
 
@@ -582,6 +595,7 @@ async fn test_assign_meeting_with_mh_mixed_rejection_then_accept(pool: PgPool) {
         "meeting-mixed-001",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await;
 
@@ -614,6 +628,18 @@ async fn test_mh_selection_includes_multiple_handlers(pool: PgPool) {
         "meeting-with-multiple-mh",
         "us-east-1",
         "gc-test",
+        // About selection SIZE, so N is test-local (not config.env's value);
+        // the shipped bound keeps the seeded rows fresh.
+        &{
+            let shipped = gc_test_utils::reference_mh_registry();
+            gc_service::config::MhRegistryConfig::new(
+                shipped.load_report_interval_ms(),
+                shipped.staleness_multiplier(),
+                shipped.retention().as_secs(),
+                2,
+            )
+            .expect("valid registry")
+        },
     )
     .await;
 
@@ -625,10 +651,10 @@ async fn test_mh_selection_includes_multiple_handlers(pool: PgPool) {
         .expect("a new assignment carries the selection sent to MC");
 
     // Should have multiple MH handlers (since we have multiple MHs)
-    assert!(
-        selection.handlers.len() >= 2,
-        "Should have multiple MH handlers when multiple MHs available, got {}",
-        selection.handlers.len()
+    assert_eq!(
+        selection.handlers.len(),
+        2,
+        "Should select exactly N=2 handlers when 3 MHs are available"
     );
 
     // Handlers should be different
@@ -653,6 +679,7 @@ async fn test_mh_selection_single_mh_one_handler(pool: PgPool) {
         "meeting-single-mh",
         "us-east-1",
         "gc-test",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await;
 
@@ -707,6 +734,7 @@ async fn test_concurrent_assignment_same_meeting(pool: PgPool) {
             "meeting-concurrent",
             "us-east-1",
             "gc-test",
+            &gc_test_utils::reference_mh_registry(),
         )
         .await
     });
@@ -720,6 +748,7 @@ async fn test_concurrent_assignment_same_meeting(pool: PgPool) {
             "meeting-concurrent",
             "us-east-1",
             "gc-test",
+            &gc_test_utils::reference_mh_registry(),
         )
         .await
     });

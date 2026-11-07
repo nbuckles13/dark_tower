@@ -4,8 +4,21 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/mod.rs"]
+mod test_common;
+
 use gc_service::repositories::{HealthStatus, MediaHandlersRepository};
+use gc_service::services::MhSelectionService;
 use sqlx::PgPool;
+use std::collections::BTreeSet;
+use std::time::Duration;
+use test_common::mh_registry::{freshness_registry, ms, seed};
+
+/// Shipped staleness bound, for tests NOT about freshness (taken from
+/// config.env via gc-test-utils, never retyped).
+fn shipped_bound() -> Duration {
+    gc_test_utils::reference_mh_registry().staleness_bound()
+}
 
 /// Test MH registration creates a new handler.
 #[sqlx::test(migrations = "../../migrations")]
@@ -152,99 +165,218 @@ async fn test_load_report_unknown_handler(pool: PgPool) {
     );
 }
 
-/// Test marking stale handlers as unhealthy.
+/// A healthy handler older than the bound is marked unhealthy.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_mark_stale_handlers_unhealthy(pool: PgPool) {
-    // Register a handler
-    MediaHandlersRepository::register_mh(
-        &pool,
-        "stale-mh",
-        "us-east-1",
-        "https://mh:443",
-        "grpc://mh:50051",
-        1000,
-    )
-    .await
-    .expect("Registration should succeed");
+    let bound = freshness_registry(2).staleness_bound();
+    seed(&pool, "stale-mh", "us-east-1", "healthy", ms(bound) * 2).await;
 
-    // Update to healthy
-    MediaHandlersRepository::update_load_report(
-        &pool,
-        "stale-mh",
-        10,
-        HealthStatus::Healthy,
-        None,
-        None,
-        None,
-    )
-    .await
-    .expect("Load report should succeed");
-
-    // Backdate heartbeat to make it stale
-    sqlx::query(
-        "UPDATE media_handlers SET last_heartbeat_at = NOW() - INTERVAL '60 seconds' WHERE handler_id = $1"
-    )
-    .bind("stale-mh")
-    .execute(&pool)
-    .await
-    .expect("Backdate should succeed");
-
-    // Mark stale handlers (threshold 30 seconds)
-    let count = MediaHandlersRepository::mark_stale_handlers_unhealthy(&pool, 30)
+    let count = MediaHandlersRepository::mark_stale_handlers_unhealthy(&pool, bound)
         .await
         .expect("Mark stale should succeed");
-
     assert_eq!(count, 1, "Should mark one handler as unhealthy");
 
     let handler = MediaHandlersRepository::get_handler(&pool, "stale-mh")
         .await
         .expect("Query should succeed")
         .expect("Handler should exist");
-
     assert_eq!(handler.health_status, HealthStatus::Unhealthy);
 }
 
-/// Test draining handlers are not marked unhealthy.
+/// A draining handler that stopped reporting goes unhealthy (ADR-0039 §10:
+/// the sweep no longer skips DRAINING); a draining handler still reporting
+/// stays draining (positive arm).
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_draining_handler_not_marked_unhealthy(pool: PgPool) {
-    // Register a handler
-    MediaHandlersRepository::register_mh(
+async fn test_stale_draining_handler_marked_unhealthy_fresh_one_kept(pool: PgPool) {
+    let bound = freshness_registry(2).staleness_bound();
+    seed(
         &pool,
-        "draining-mh",
+        "draining-stale",
         "us-east-1",
-        "https://mh:443",
-        "grpc://mh:50051",
-        1000,
+        "draining",
+        ms(bound) * 2,
     )
-    .await
-    .expect("Registration should succeed");
-
-    // Set to draining with old heartbeat
-    sqlx::query(
-        "UPDATE media_handlers SET health_status = 'draining', last_heartbeat_at = NOW() - INTERVAL '60 seconds' WHERE handler_id = $1"
+    .await;
+    seed(
+        &pool,
+        "draining-fresh",
+        "us-east-1",
+        "draining",
+        ms(bound) / 4,
     )
-    .bind("draining-mh")
-    .execute(&pool)
-    .await
-    .expect("Update should succeed");
+    .await;
 
-    // Mark stale handlers (threshold 30 seconds)
-    let count = MediaHandlersRepository::mark_stale_handlers_unhealthy(&pool, 30)
+    let count = MediaHandlersRepository::mark_stale_handlers_unhealthy(&pool, bound)
         .await
         .expect("Mark stale should succeed");
+    assert_eq!(count, 1, "only the stale draining handler transitions");
 
-    assert_eq!(count, 0, "Should not mark draining handler");
-
-    let handler = MediaHandlersRepository::get_handler(&pool, "draining-mh")
+    let stale = MediaHandlersRepository::get_handler(&pool, "draining-stale")
         .await
-        .expect("Query should succeed")
-        .expect("Handler should exist");
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale.health_status, HealthStatus::Unhealthy);
+    let fresh = MediaHandlersRepository::get_handler(&pool, "draining-fresh")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fresh.health_status, HealthStatus::Draining);
+}
 
-    assert_eq!(
-        handler.health_status,
-        HealthStatus::Draining,
-        "Handler should remain draining"
-    );
+/// Selection eligibility, asserted as a SET of ids: only a fresh healthy row
+/// is a candidate; stale healthy, fresh draining, unhealthy, pending and
+/// degraded rows never are.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_candidate_set_excludes_draining_stale_and_non_healthy(pool: PgPool) {
+    let bound = freshness_registry(2).staleness_bound();
+    let fresh = ms(bound) / 4;
+    seed(&pool, "fresh-healthy", "us-east-1", "healthy", fresh).await;
+    seed(
+        &pool,
+        "stale-healthy",
+        "us-east-1",
+        "healthy",
+        ms(bound) * 2,
+    )
+    .await;
+    seed(&pool, "fresh-draining", "us-east-1", "draining", fresh).await;
+    seed(&pool, "fresh-unhealthy", "us-east-1", "unhealthy", fresh).await;
+    seed(&pool, "fresh-pending", "us-east-1", "pending", fresh).await;
+    seed(&pool, "fresh-degraded", "us-east-1", "degraded", fresh).await;
+
+    let ids: BTreeSet<String> =
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", bound)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.handler_id)
+            .collect();
+    assert_eq!(ids, BTreeSet::from(["fresh-healthy".to_string()]));
+}
+
+/// The candidate freshness bound is bound in MILLISECONDS (B = 3750 ms): a
+/// row at −3200 ms is a candidate (a bound truncated to 3 s would drop it), a
+/// row at −3900 ms is not (a bound rounded to 4 s would keep it). Rows only
+/// age between the backdate and the query, so the 550 ms slack on the fresh
+/// row is the margin that matters; seeding runs right before the query.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_candidate_bound_is_milliseconds(pool: PgPool) {
+    let bound = freshness_registry(2).staleness_bound();
+    assert_eq!(bound, Duration::from_millis(3750));
+    seed(&pool, "ms-stale", "us-east-1", "healthy", 3900).await;
+    seed(&pool, "ms-fresh", "us-east-1", "healthy", 3200).await;
+
+    let ids: BTreeSet<String> =
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", bound)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.handler_id)
+            .collect();
+    assert_eq!(ids, BTreeSet::from(["ms-fresh".to_string()]));
+}
+
+/// `GC_MH_INITIAL_HANDLERS_PER_MEETING` governs the selection size: N=1 and
+/// N=3 against 4 candidates select exactly N distinct handlers (the shipped
+/// default 2 alone could not distinguish a hardcoded 2).
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_selection_size_follows_initial_handlers_config(pool: PgPool) {
+    for id in ["sel-a", "sel-b", "sel-c", "sel-d"] {
+        seed(&pool, id, "us-east-1", "healthy", 0).await;
+    }
+    for n in [1_u64, 3] {
+        let reg = freshness_registry(n);
+        let selection = MhSelectionService::select_mhs_for_meeting(
+            &pool,
+            "us-east-1",
+            reg.staleness_bound(),
+            reg.initial_handlers_per_meeting(),
+        )
+        .await
+        .expect("selection");
+        let ids: BTreeSet<&str> = selection
+            .handlers
+            .iter()
+            .map(|h| h.mh_id.as_str())
+            .collect();
+        assert_eq!(selection.handlers.len(), reg.initial_handlers_per_meeting());
+        assert_eq!(
+            ids.len(),
+            selection.handlers.len(),
+            "selected handlers are distinct"
+        );
+    }
+    // Fewer candidates than N: all of them, never an error.
+    let reg = freshness_registry(4);
+    sqlx::query("DELETE FROM media_handlers WHERE handler_id IN ('sel-c', 'sel-d')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let selection = MhSelectionService::select_mhs_for_meeting(
+        &pool,
+        "us-east-1",
+        reg.staleness_bound(),
+        reg.initial_handlers_per_meeting(),
+    )
+    .await
+    .expect("selection");
+    assert_eq!(selection.handlers.len(), 2);
+}
+
+/// Retention: a row older than retention is deleted; a stale-but-younger row
+/// is kept. A load report for the deleted id updates nothing and does not
+/// recreate the row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_retention_deletes_only_expired_rows(pool: PgPool) {
+    let reg = freshness_registry(2);
+    seed(
+        &pool,
+        "expired",
+        "us-east-1",
+        "unhealthy",
+        ms(reg.retention()) + 5_000,
+    )
+    .await;
+    seed(
+        &pool,
+        "stale-kept",
+        "us-east-1",
+        "unhealthy",
+        ms(reg.staleness_bound()) * 2,
+    )
+    .await;
+
+    let deleted = MediaHandlersRepository::delete_expired_handlers(&pool, reg.retention())
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+    assert!(MediaHandlersRepository::get_handler(&pool, "expired")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(MediaHandlersRepository::get_handler(&pool, "stale-kept")
+        .await
+        .unwrap()
+        .is_some());
+
+    let updated = MediaHandlersRepository::update_load_report(
+        &pool,
+        "expired",
+        1,
+        HealthStatus::Healthy,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!updated, "load report for a deleted row matches nothing");
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM media_handlers WHERE handler_id = 'expired'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 0, "a load report never recreates a deleted row");
 }
 
 /// Test get candidate MHs returns healthy handlers with capacity.
@@ -314,9 +446,10 @@ async fn test_get_candidate_mhs(pool: PgPool) {
     .expect("Load report should succeed");
 
     // Get candidates
-    let candidates = MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1")
-        .await
-        .expect("Query should succeed");
+    let candidates =
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound())
+            .await
+            .expect("Query should succeed");
 
     // Should return up to 5 healthy candidates with capacity
     assert!(!candidates.is_empty(), "Should return candidates");
@@ -394,25 +527,28 @@ async fn test_get_candidate_mhs_filters_by_region(pool: PgPool) {
     .expect("Load report should succeed");
 
     // Get candidates for us-east-1
-    let us_east_candidates = MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1")
-        .await
-        .expect("Query should succeed");
+    let us_east_candidates =
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound())
+            .await
+            .expect("Query should succeed");
 
     assert_eq!(us_east_candidates.len(), 1);
     assert_eq!(us_east_candidates[0].handler_id, "us-east-mh");
 
     // Get candidates for eu-west-1
-    let eu_west_candidates = MediaHandlersRepository::get_candidate_mhs(&pool, "eu-west-1")
-        .await
-        .expect("Query should succeed");
+    let eu_west_candidates =
+        MediaHandlersRepository::get_candidate_mhs(&pool, "eu-west-1", shipped_bound())
+            .await
+            .expect("Query should succeed");
 
     assert_eq!(eu_west_candidates.len(), 1);
     assert_eq!(eu_west_candidates[0].handler_id, "eu-west-mh");
 
     // Get candidates for non-existent region
-    let empty_candidates = MediaHandlersRepository::get_candidate_mhs(&pool, "ap-south-1")
-        .await
-        .expect("Query should succeed");
+    let empty_candidates =
+        MediaHandlersRepository::get_candidate_mhs(&pool, "ap-south-1", shipped_bound())
+            .await
+            .expect("Query should succeed");
 
     assert!(empty_candidates.is_empty());
 }
@@ -466,9 +602,10 @@ async fn test_load_report_with_degraded_health_status(pool: PgPool) {
     assert_eq!(handler.memory_usage_percent, Some(80.0));
 
     // Degraded handler should NOT be returned as candidate for new meetings
-    let candidates = MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1")
-        .await
-        .expect("Query should succeed");
+    let candidates =
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound())
+            .await
+            .expect("Query should succeed");
 
     assert!(
         candidates.is_empty(),
@@ -510,9 +647,10 @@ async fn test_get_candidate_mhs_all_at_max_capacity(pool: PgPool) {
     }
 
     // Get candidates - should return empty since all are at capacity
-    let candidates = MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1")
-        .await
-        .expect("Query should succeed");
+    let candidates =
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound())
+            .await
+            .expect("Query should succeed");
 
     assert!(
         candidates.is_empty(),
@@ -575,9 +713,10 @@ async fn test_candidate_selection_load_ratio_boundary(pool: PgPool) {
     .await
     .expect("Load report should succeed");
 
-    let candidates = MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1")
-        .await
-        .expect("Query should succeed");
+    let candidates =
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound())
+            .await
+            .expect("Query should succeed");
 
     // Should have exactly 1 candidate (almost-full-mh)
     assert_eq!(candidates.len(), 1, "Should return exactly one candidate");

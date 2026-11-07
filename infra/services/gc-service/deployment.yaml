@@ -109,6 +109,30 @@ spec:
             configMapKeyRef:
               name: gc-service-config
               key: CORS_ALLOWED_ORIGINS
+        # MH registry freshness (ADR-0039 §10). REQUIRED in GC (no Rust
+        # default), so these are hard refs (no `optional: true`): a key missing
+        # from the ConfigMap fails container creation
+        # (CreateContainerConfigError), never a later tick.
+        - name: GC_MH_LOAD_REPORT_INTERVAL_MS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_MH_LOAD_REPORT_INTERVAL_MS
+        - name: GC_MH_STALENESS_MULTIPLIER
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_MH_STALENESS_MULTIPLIER
+        - name: GC_MH_REGISTRY_RETENTION_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_MH_REGISTRY_RETENTION_SECONDS
+        - name: GC_MH_INITIAL_HANDLERS_PER_MEETING
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_MH_INITIAL_HANDLERS_PER_MEETING
         # DATABASE_URL is COMPOSED from the credential's one owner, postgres-secret
         # (infra/services/postgres/secret.yaml) — never a second literal copy. Kubernetes
         # dependent env vars: PG_* MUST be declared before DATABASE_URL, or `$(PG_*)`

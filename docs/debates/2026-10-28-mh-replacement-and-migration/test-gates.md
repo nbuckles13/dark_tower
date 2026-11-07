@@ -34,6 +34,22 @@ Rules for every gate: deadlines read `tokio::time::Instant` and are tested with 
 - MC declares X failed while GC sees X healthy → the grant is still issued, gc_view=healthy label. GC rejects an MC-signed media_dial token (key outside AC's JWKS, and HS256); the positive arm is that an AC token is accepted. L4-9: gc_mh_replacement_requests_total{trigger,outcome,gc_view} rises per report with no handler_id label, and the `gc.mh.replacement_report` INFO event carries the ids. With a seeded RNG, selection is identical with and without reports (evidence only).
 - Metric integration tests per ADR-0032.
 
+### GC freshness (GC-1: R-24, R-26)
+One staleness bound `B = k × I` (`GC_MH_STALENESS_MULTIPLIER` × `GC_MH_LOAD_REPORT_INTERVAL_MS`, computed once in `MhRegistryConfig`) governs selection, the sweep and `gc_mh_available`. Tests ABOUT freshness pass their own bound. Every other test takes the reference values from `infra/services/gc-service/config.env` through `gc-test-utils`, so nothing is retyped.
+- Sweep, one `#[sqlx::test]`: stale draining → unhealthy, fresh draining → draining, stale healthy → unhealthy, fresh healthy → healthy. It replaces the old skips-draining test, which encoded the opposite rule.
+- Millisecond binding: `B = 3750 ms`. A row at −3200 ms must be fresh, so a bound truncated to 3 s fails. A row at −3900 ms must be stale, so a bound rounded up to 4 s fails. NOW() is not frozen and rows only age, so the stale row can only get staler; the fresh row has 550 ms of slack and is seeded immediately before the query under test.
+- Selection: the candidate SET by id. A fresh healthy row is in; stale healthy, fresh draining, unhealthy and pending rows are out. Initial handler count with N=1 and N=3 and enough candidates gives exactly N distinct handlers (the default 2 alone can't tell the hardcoded 2 apart).
+- Retention: a row older than R is deleted, and a stale row younger than R is kept. A load report for the deleted id returns NOT_FOUND, increments `gc_mh_load_reports_total{outcome="unknown_handler"}` by 1, leaves `accepted` unobserved, and `count(*)` for that id stays 0 (never recreated). Positive arm: a live row's report gives `accepted` +1. An invalid-argument report increments neither outcome.
+- Tick order, in one tick: sweep → retention → gauge. A row past R is deleted and left out of `gc_mh_available`; a row that is stale but younger than R counts as `unhealthy`. A second tick after a state change shows recompute-and-set: a combination that disappeared goes to 0, never accumulates.
+- `gc_mh_available{region,state}`: a fresh row counts under its reported state, and a row older than B counts as `unhealthy`. `region` is GC's own `GC_REGION` or `"other"` (the MH-asserted string is never a label value), with no id labels. All 2 × 5 combinations are zero-initialised and set on every tick.
+- Config: a table over the four keys asserting the key named in the `ConfigError`. Each key missing, non-numeric, below min or above max fails; min and max are accepted. `R == B` fails (k=2, I=1000, R=2 s) and R=3 s passes. Retention above its 30 d cap (2592000 s) fails.
+- Interval push: a non-default configured I (2500) appears in `RegisterMHResponse.load_report_interval_ms` (a default-valued test would pass against the deleted constant).
+- Env-test `crates/env-tests/tests/03_gc_deployment_config.rs` (smoke), per serving GC pod:
+  - The four `GC_MH_*` keys are hard `configMapKeyRef`s into the one `gc-service-config` generation every pod resolves.
+  - `gc_mh_load_report_interval_seconds` and `gc_mh_staleness_threshold_seconds` equal deployed I and deployed k × deployed I (read from the live ConfigMap, `MsToSeconds`).
+  - Every replica's `sum by (instance) (gc_mh_available{state="healthy"})` is ≥ the live MH pod count. The count is asserted ≥ 1 (`no-live-mh`), and the check is per replica, never a cross-replica sum.
+  - The wait is a failure-only ceiling of B + the MetricsScrape ceiling.
+
 ## Protocol
 - Roundtrip tests for every new message (`internal_roundtrip.rs`, `signaling_roundtrip.rs`). ServingState UNSPECIFIED is rejected. A SendTarget/StreamAssignment ref not in the current set is counted and ignored. `verify-codegen.sh` absence checks: process_start_epoch_ms, connection_id legacy-empty, SendTarget/StreamAssignment.media_handler_url, JoinResponse.media_servers, MhConnectionStatus.mh_url.
 
