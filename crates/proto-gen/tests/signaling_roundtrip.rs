@@ -88,10 +88,12 @@ fn send_directive_roundtrips_encoding_targets_and_header_version() {
                 SendTarget {
                     media_handler_url: "https://mh-1.example/mh".to_string(),
                     transport_mode: TransportMode::Datagram as i32,
+                    handler_ref: 0,
                 },
                 SendTarget {
                     media_handler_url: "https://mh-2.example/mh".to_string(),
                     transport_mode: TransportMode::StreamPerGroup as i32,
+                    handler_ref: 0,
                 },
             ],
         }],
@@ -142,6 +144,7 @@ fn stream_assignment_roundtrips_full_attribution_shape() {
             media_handler_url: "https://mh-1.example/mh".to_string(),
             slot_state: SlotState::Active as i32,
             switch_command_id: None,
+            handler_ref: 0,
         }],
         unreachable_sender_ids: Vec::new(),
     };
@@ -165,6 +168,7 @@ fn switch_pending_carries_the_requesting_command_identifier() {
         media_handler_url: "https://mh-1.example/mh".to_string(),
         slot_state: SlotState::SwitchPending as i32,
         switch_command_id: Some(u64::MAX),
+        handler_ref: 0,
     };
 
     let out = roundtrip(&assignment);
@@ -188,6 +192,7 @@ fn assignment_without_a_source_keeps_sender_absent() {
             media_handler_url: String::new(),
             slot_state: state as i32,
             switch_command_id: None,
+            handler_ref: 0,
         });
         assert_eq!(
             out.sender_id, None,
@@ -342,6 +347,7 @@ fn join_response_roundtrips_kek_generation_and_sender_id() {
         kek_generation: 65535,
         kek_rotation_debounce_seconds: 0,
         receive_slot_caps: Vec::new(),
+        media_handler_set: None,
     });
 
     assert_eq!(out.sender_id, Some(65535));
@@ -555,6 +561,7 @@ fn unreachable_sender_ids_roundtrip_by_value_and_order() {
             media_handler_url: "https://mh-0.example/mh".to_string(),
             slot_state: SlotState::Active as i32,
             switch_command_id: None,
+            handler_ref: 0,
         }],
         unreachable_sender_ids: vec![9, 2, 65535],
     });
@@ -851,14 +858,16 @@ fn debug_never_prints_participant_pii_through_the_join_broadcast() {
 }
 
 #[test]
-fn debug_never_prints_the_mh_connect_join_token() {
-    // `MhConnectRequest.join_token` is a bearer meeting JWT and rides inside
-    // `MhClientMessage`, which derives `Debug` transitively. Same redaction as
-    // the join path, asserted through the envelope that would leak it.
+fn debug_never_prints_the_mh_connect_tokens() {
+    // `MhConnectRequest` carries two bearer credentials (`join_token` until
+    // story 4 P3, and `media_dial_token`) and rides inside `MhClientMessage`,
+    // which derives `Debug` transitively. Same redaction as the join path,
+    // asserted through the envelope that would leak them.
     let envelope = MhClientMessage {
         message: Some(mh_client_message::Message::ConnectRequest(
             MhConnectRequest {
                 join_token: "eyJhbGciOiJFZERTQSJ9.super-secret-mh-jwt".to_string(),
+                media_dial_token: DIAL_TOKEN_A.to_string(),
             },
         )),
         trace_parent: String::new(),
@@ -866,8 +875,9 @@ fn debug_never_prints_the_mh_connect_join_token() {
     };
 
     let rendered = format!("{envelope:?}");
-    assert!(!rendered.contains("super-secret-mh-jwt"));
-    assert!(rendered.contains("<redacted"));
+    assert!(!rendered.contains("super-secret-mh-jwt"), "{rendered}");
+    assert_redacts_tokens(&rendered, &[DIAL_TOKEN_A]);
+    assert!(rendered.contains("MhConnectRequest"), "{rendered}");
 }
 
 #[test]
@@ -1094,6 +1104,7 @@ fn stream_assignment_sender_presence_survives_per_state() {
             media_handler_url: String::new(),
             slot_state: state as i32,
             switch_command_id: None,
+            handler_ref: 0,
         });
         assert_eq!(out.sender_id, sender, "{kind:?} {state:?}");
         assert_eq!(out.slot_state, state as i32);
@@ -1349,6 +1360,7 @@ fn mh_connect_request_keeps_tag_1() {
         message: Some(mh_client_message::Message::ConnectRequest(
             MhConnectRequest {
                 join_token: "jwt".to_string(),
+                media_dial_token: String::new(),
             },
         )),
         trace_parent: String::new(),
@@ -1415,4 +1427,296 @@ fn story_3_frozen_tags_are_on_the_wire() {
         .encode_to_vec(),
     );
     assert_eq!(recovery, vec![1, 2, 3]);
+}
+
+// ---------------------------------------------------------------------------
+// Story 4 (survive-handler-loss): handler set, refs, dial token, close codes
+// (ADR-0039 §4, §5, §7). Contract only: client set-diffing, the "non-member
+// ref is counted and ignored" rule (owned by C1) and MH's close behaviour
+// (MH-CLOSE) are runtime rules pinned in `docs/TODO.md` §Media Path
+// Obligations, not asserted here.
+// ---------------------------------------------------------------------------
+
+/// Synthetic JWS-shaped dial tokens: `header.payload.signature`. Distinct per
+/// entry so a redaction that covers only the first handler fails.
+const DIAL_TOKEN_A: &str =
+    "eyJhbGciOiJFZERTQSJ9.c3ludGhldGljLWRpYWwtcGF5bG9hZC1B.c3ludGhldGljLXNpZy1B";
+const DIAL_TOKEN_B: &str =
+    "eyJhbGciOiJFZERTQSJ9.c3ludGhldGljLWRpYWwtcGF5bG9hZC1C.c3ludGhldGljLXNpZy1C";
+
+/// One shared redaction check: neither any token nor any of its three JWS
+/// segments may appear, and a redaction placeholder must (so an impl that
+/// prints nothing at all cannot pass).
+fn assert_redacts_tokens(rendered: &str, tokens: &[&str]) {
+    for token in tokens {
+        assert!(!rendered.contains(token), "token printed: {rendered}");
+        for segment in token.split('.') {
+            assert!(
+                !rendered.contains(segment),
+                "token segment {segment:?} printed: {rendered}"
+            );
+        }
+    }
+    assert!(rendered.contains("<redacted"), "no placeholder: {rendered}");
+}
+
+fn handler(url: &str, handler_ref: u32, token: &str) -> MediaServerInfo {
+    MediaServerInfo {
+        media_handler_url: url.to_string(),
+        handler_ref,
+        media_dial_token: token.to_string(),
+    }
+}
+
+/// `handler_set_version` is uint64: a value above u32::MAX proves the width.
+const WIDE_VERSION: u64 = 1 << 40;
+
+fn two_handler_set() -> MediaHandlerSet {
+    MediaHandlerSet {
+        handler_set_version: WIDE_VERSION,
+        handlers: vec![
+            handler("https://mh-a.example/mh", u32::MAX, DIAL_TOKEN_A),
+            handler("https://mh-b.example/mh", 7, DIAL_TOKEN_B),
+        ],
+    }
+}
+
+#[test]
+fn media_server_info_roundtrips_on_fresh_tags_never_reserved_2() {
+    let info = handler("https://mh-a.example/mh", u32::MAX, DIAL_TOKEN_A);
+    assert_eq!(
+        top_level_field_numbers(&info.encode_to_vec()),
+        vec![1, 3, 4]
+    );
+    let out = roundtrip(&info);
+    assert_eq!(out.media_handler_url, "https://mh-a.example/mh");
+    assert_eq!(out.handler_ref, u32::MAX);
+    assert_eq!(out.media_dial_token, DIAL_TOKEN_A);
+}
+
+#[test]
+fn media_handler_set_roundtrips_wide_version_and_ordered_entries() {
+    let set = two_handler_set();
+    assert_eq!(top_level_field_numbers(&set.encode_to_vec()), vec![1, 2, 2]);
+    let out = roundtrip(&set);
+    assert_eq!(out.handler_set_version, WIDE_VERSION);
+    assert_eq!(
+        out.handlers, set.handlers,
+        "order and per-entry values survive"
+    );
+}
+
+#[test]
+fn empty_media_handler_set_with_a_version_roundtrips() {
+    // The join-time set MAY be empty (no RegisterMeeting confirmed yet).
+    let out = roundtrip(&MediaHandlerSet {
+        handler_set_version: 1,
+        handlers: Vec::new(),
+    });
+    assert_eq!(out.handler_set_version, 1);
+    assert!(out.handlers.is_empty());
+}
+
+#[test]
+fn join_response_handler_set_absent_empty_and_populated_are_distinct() {
+    let superseded = vec![handler("https://mh-a.example/mh", 0, "")];
+    let absent = roundtrip(&JoinResponse {
+        media_servers: superseded.clone(),
+        ..Default::default()
+    });
+    assert_eq!(absent.media_handler_set, None);
+
+    let empty = roundtrip(&JoinResponse {
+        media_handler_set: Some(MediaHandlerSet::default()),
+        ..Default::default()
+    });
+    assert_eq!(empty.media_handler_set, Some(MediaHandlerSet::default()));
+
+    // Additive window: the superseded list and the new set coexist on the wire.
+    let both = JoinResponse {
+        media_servers: superseded.clone(),
+        media_handler_set: Some(two_handler_set()),
+        ..Default::default()
+    };
+    assert_eq!(top_level_field_numbers(&both.encode_to_vec()), vec![4, 16]);
+    let out = roundtrip(&both);
+    assert_eq!(out.media_servers, superseded);
+    assert_eq!(out.media_handler_set, Some(two_handler_set()));
+}
+
+#[test]
+fn media_handler_set_roundtrips_through_the_server_envelope_below_tag_20() {
+    let envelope = ServerMessage {
+        message: Some(server_message::Message::MediaHandlerSet(two_handler_set())),
+        trace_parent: String::new(),
+        trace_state: String::new(),
+    };
+    let tags = top_level_field_numbers(&envelope.encode_to_vec());
+    assert_eq!(tags, vec![15]);
+    assert!(tags.iter().all(|t| *t < 20), "variant tags stay below 20");
+    match roundtrip(&envelope).message {
+        Some(server_message::Message::MediaHandlerSet(set)) => {
+            assert_eq!(set, two_handler_set());
+        }
+        other => panic!("expected MediaHandlerSet, got {other:?}"),
+    }
+}
+
+#[test]
+fn send_target_and_stream_assignment_carry_a_genuine_uint32_ref() {
+    let target = SendTarget {
+        media_handler_url: "https://mh-a.example/mh".to_string(),
+        transport_mode: TransportMode::Datagram as i32,
+        handler_ref: u32::MAX,
+    };
+    assert_eq!(
+        top_level_field_numbers(&target.encode_to_vec()),
+        vec![1, 2, 3]
+    );
+    let out = roundtrip(&target);
+    assert_eq!(out.handler_ref, u32::MAX);
+    assert_eq!(out.media_handler_url, "https://mh-a.example/mh");
+
+    let assignment = StreamAssignment {
+        slot_id: 1,
+        media_handler_url: "https://mh-a.example/mh".to_string(),
+        handler_ref: u32::MAX,
+        ..Default::default()
+    };
+    assert_eq!(
+        top_level_field_numbers(&assignment.encode_to_vec()),
+        vec![6, 9, 12]
+    );
+    let out = roundtrip(&assignment);
+    assert_eq!(out.handler_ref, u32::MAX);
+    assert_eq!(out.media_handler_url, "https://mh-a.example/mh");
+}
+
+#[test]
+fn mh_connect_request_carries_both_tokens_distinctly() {
+    let request = MhConnectRequest {
+        join_token: "jwt".to_string(),
+        media_dial_token: DIAL_TOKEN_A.to_string(),
+    };
+    assert_eq!(
+        top_level_field_numbers(&request.encode_to_vec()),
+        vec![1, 2]
+    );
+    let out = roundtrip(&request);
+    assert_eq!(out.join_token, "jwt");
+    assert_eq!(out.media_dial_token, DIAL_TOKEN_A);
+}
+
+#[test]
+fn mh_connection_status_echoes_ref_and_wide_version() {
+    let status = MhConnectionStatus {
+        mh_url: "https://mh-a.example/mh".to_string(),
+        state: ConnectionState::Failed as i32,
+        handler_ref: u32::MAX,
+        handler_set_version: WIDE_VERSION,
+        ..Default::default()
+    };
+    assert_eq!(
+        top_level_field_numbers(&status.encode_to_vec()),
+        vec![1, 2, 6, 7]
+    );
+    let out = roundtrip(&MediaConnectionUpdate {
+        statuses: vec![status.clone()],
+    });
+    assert_eq!(out.statuses, vec![status]);
+}
+
+/// The close code rides the WebTransport application close code, NOT a
+/// protobuf field, so these numbers ARE the wire contract: a renumber must
+/// fail here.
+#[test]
+fn mh_close_code_numbers_are_pinned() {
+    let pinned = [
+        (MhCloseCode::Unspecified, 0, "MH_CLOSE_CODE_UNSPECIFIED"),
+        (MhCloseCode::WrongHandler, 1, "MH_CLOSE_CODE_WRONG_HANDLER"),
+        (
+            MhCloseCode::BindingConflict,
+            2,
+            "MH_CLOSE_CODE_BINDING_CONFLICT",
+        ),
+        (
+            MhCloseCode::McUnavailable,
+            3,
+            "MH_CLOSE_CODE_MC_UNAVAILABLE",
+        ),
+        (
+            MhCloseCode::HandlerReleased,
+            4,
+            "MH_CLOSE_CODE_HANDLER_RELEASED",
+        ),
+        (MhCloseCode::Declined, 5, "MH_CLOSE_CODE_DECLINED"),
+    ];
+    for (code, number, name) in pinned {
+        assert_eq!(code as i32, number, "{name}");
+        assert_eq!(MhCloseCode::from_str_name(name), Some(code));
+        assert_eq!(code.as_str_name(), name);
+        assert_eq!(MhCloseCode::try_from(number), Ok(code));
+    }
+    // A received unknown code is distinguishable (a counted contract fault).
+    assert!(MhCloseCode::try_from(UNKNOWN_ENUM_VALUE).is_err());
+}
+
+#[test]
+fn debug_never_prints_the_dial_token_of_a_media_server_info() {
+    let rendered = format!(
+        "{:?}",
+        handler("https://mh-a.example/mh", 4242, DIAL_TOKEN_A)
+    );
+    assert_redacts_tokens(&rendered, &[DIAL_TOKEN_A]);
+    // Triage identifiers stay legible.
+    assert!(rendered.contains("https://mh-a.example/mh"), "{rendered}");
+    assert!(rendered.contains("handler_ref: 4242"), "{rendered}");
+}
+
+#[test]
+fn debug_never_prints_any_token_of_a_media_handler_set() {
+    let rendered = format!("{:?}", two_handler_set());
+    assert_redacts_tokens(&rendered, &[DIAL_TOKEN_A, DIAL_TOKEN_B]);
+    assert!(
+        rendered.contains(&format!("handler_set_version: {WIDE_VERSION}")),
+        "{rendered}"
+    );
+    assert!(rendered.contains("handler_ref: 7"), "{rendered}");
+}
+
+#[test]
+fn debug_join_response_renders_the_set_and_redacts_both_carriers() {
+    let response = JoinResponse {
+        media_servers: vec![handler("https://mh-superseded.example/mh", 1, DIAL_TOKEN_B)],
+        media_handler_set: Some(MediaHandlerSet {
+            handler_set_version: 3,
+            handlers: vec![handler("https://mh-a.example/mh", 2, DIAL_TOKEN_A)],
+        }),
+        ..Default::default()
+    };
+    let rendered = format!("{response:?}");
+    assert_redacts_tokens(&rendered, &[DIAL_TOKEN_A, DIAL_TOKEN_B]);
+    // The hand-written field list must render the new field, not drop it.
+    assert!(
+        rendered.contains("media_handler_set: Some(MediaHandlerSet {"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("https://mh-a.example/mh"), "{rendered}");
+    assert!(
+        rendered.contains("https://mh-superseded.example/mh"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn debug_never_prints_dial_tokens_through_the_server_envelope() {
+    // The transitive path MC actually logs: `ServerMessage` derives `Debug`.
+    let envelope = ServerMessage {
+        message: Some(server_message::Message::MediaHandlerSet(two_handler_set())),
+        trace_parent: String::new(),
+        trace_state: String::new(),
+    };
+    let rendered = format!("{envelope:?}");
+    assert_redacts_tokens(&rendered, &[DIAL_TOKEN_A, DIAL_TOKEN_B]);
+    assert!(rendered.contains("https://mh-b.example/mh"), "{rendered}");
 }

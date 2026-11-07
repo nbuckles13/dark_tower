@@ -374,15 +374,18 @@ message PublishedKind {
   bool client_muted = 2;
 }
 
-// Information about the media server.
+// One media handler incarnation in a `MediaHandlerSet` (ADR-0039 §4, §5).
 //
-// Kept as a message rather than collapsed to a bare URL string: this is the
-// join-time handler DESCRIPTOR, and ADR-0036 §9 (handler unreachability) and
-// §10 (transport seam) are expected to add per-handler fields to it. The
-// vestigial `reserved 2` is what makes it look unearned today.
+// Kept as a message rather than collapsed to a bare URL string: it is the
+// per-handler DESCRIPTOR, and carries the incarnation ref and dial credential.
 message MediaServerInfo {
   // Server-to-client. Same spelling as `SendTarget.media_handler_url` and
   // `StreamAssignment.media_handler_url` — one name for one concept.
+  //
+  // Belongs to ONE MH incarnation. The rule's authority today is ADR-0039 §7;
+  // its contract home lands above `dark_tower.internal.v1.RegisterMHRequest`
+  // in story 4 GC-2, which retargets this pointer (`docs/TODO.md` §Media Path
+  // Obligations).
   string media_handler_url = 1;
 
   // `connection_token` is not reused, so both halves are reserved (CONVENTIONS
@@ -390,6 +393,85 @@ message MediaServerInfo {
   // future field from silently re-adopting the old identifier.
   reserved 2;
   reserved "connection_token";
+
+  // MC-assigned, one per handler INCARNATION, never reused within a meeting,
+  // even when a later incarnation reuses the address. Zero is invalid and is
+  // never a member of any set: an entry carrying 0 is a client contract fault,
+  // and a `SendTarget`/`StreamAssignment` ref of 0 is a non-member (rule at
+  // `MediaHandlerSet`). The client diffs sets on this ref, never on the url: a
+  // new ref at an old url means close and redial.
+  //
+  // OBSERVABILITY (ADR-0039 §8): per-incarnation identifier; never a metric
+  // label, span attribute, or per-frame log field.
+  uint32 handler_ref = 3;
+
+  // CREDENTIAL (ADR-0039 §5). THE one statement of the dial-token rules;
+  // `MhConnectRequest.media_dial_token` points here.
+  //
+  // A compact JWS, alg EdDSA, signed by MC's per-meeting key, claims exactly
+  // {`token_type` = "media_dial", `sub` (from MC's session, never from the
+  // request), `meeting_id`, `aud` = the handler's `handler_id`, `iat`, `exp`}.
+  // Present on EVERY entry of EVERY set. TTL is
+  // `MC_MEDIA_DIAL_TOKEN_TTL_SECONDS` (default 300; MC refuses to start
+  // outside [60, 900]); MC re-pushes the set at TTL/3. Reusable for any number
+  // of dials within its lifetime.
+  //
+  // OPAQUE to the client: never decoded or parsed (not even for `exp`). The
+  // client retains only the latest token per in-set ref, replaces it per set,
+  // and clears it when the ref leaves the set and at session end (a scoped
+  // R-23 amendment, ADR-0039 §5); every dial (join, redial, retry) uses it.
+  //
+  // Never logged, never a metric label, span attribute or per-frame log field,
+  // and never in a trace, error, serialized state, or the UI. Redacted from
+  // `Debug` (`crates/proto-gen/build.rs` `skip_debug`).
+  string media_dial_token = 4;
+}
+
+// The meeting's media handlers, as told to ONE participant (ADR-0039 §4, §5).
+// THE single home of the handler-set rules; every other handler mention in
+// this file is a ref into this set or a pointer here.
+//
+// FULL SNAPSHOT, REPLACE SEMANTICS. Sent on `JoinResponse.media_handler_set`
+// and as `ServerMessage.media_handler_set` on every membership change and
+// every token refresh. A received set replaces the previous one entirely.
+//
+// MEMBERSHIP. A handler is listed only after MC has confirmed its
+// `RegisterMeeting`, so the join-time set MAY BE EMPTY, with a set message
+// following. No two entries in one set share a `media_handler_url`.
+//
+// ADDRESSES REACH CLIENTS ONLY FROM THIS SET, and the client never dials
+// outside the latest set. Every `handler_ref` elsewhere
+// (`SendTarget.handler_ref`, `StreamAssignment.handler_ref`) MUST be a member
+// of the client's CURRENT set; the client counts and ignores a non-member ref
+// (0 is never a member).
+//
+// The client connects to EVERY handler in the set it can reach — the transport
+// is active/active. What it actually reaches becomes its connected set (as the
+// handlers report it), which is what MC's ADR-0036 §9 reachability is computed
+// from. NON-AUTHORITATIVE for send placement: this set does not
+// decide where a client sends. The sole source of a transmit target is
+// `SendTarget.handler_ref`, on the send directive, and a sender sends to EVERY
+// target it is given. DO NOT DERIVE A TRANSMIT TARGET FROM A RECEIVE-SIDE
+// FIELD: in particular not from the active slot's `StreamAssignment`
+// handler, which names the handler carrying a stream this client RECEIVES,
+// while a sender's targets are the handlers carrying its OUTGOING edges (the
+// ones named on its SUBSCRIBERS' slots, not its own). The two coincide in a
+// single-handler meeting and diverge as soon as edges span handlers, so code
+// written against the coincidence passes every one-handler test and
+// mis-addresses in production. The set is unordered and is not the selection
+// mechanism: its first element carries no relationship to placement.
+message MediaHandlerSet {
+  // A MEMBERSHIP EPOCH. It advances only when membership changes. A token-only
+  // refresh keeps the version AND the refs; the client then only replaces
+  // tokens: no dial, no close. Used to correlate loss reports (echoed in
+  // `MhConnectionStatus.handler_set_version`), never to discard anything, and
+  // never for ordering: every `ServerMessage` rides one ordered stream.
+  //
+  // OBSERVABILITY (ADR-0039 §8): per-incarnation identifier; never a metric
+  // label, span attribute, or per-frame log field.
+  uint64 handler_set_version = 1;
+
+  repeated MediaServerInfo handlers = 2;
 }
 
 // Encoding parameters for one media stream (ADR-0036 §5).
@@ -526,30 +608,9 @@ message JoinResponse {
   reserved "user_id", "encryption_keys";
 
   repeated Participant existing_participants = 3;
-  // Connection bootstrap only: the media handlers this meeting is registered on,
-  // for the client to open transports to. EVERY handler in this list is OFFERED,
-  // and the client connects to ALL IT CAN — the transport is active/active. What
-  // the client actually reaches becomes its connected set, which is what MC's
-  // §9 reachability is computed from.
-  //
-  // NON-AUTHORITATIVE for send placement — this list does not decide where a
-  // client sends. THE SOLE SOURCE OF A TRANSMIT ADDRESS IS
-  // `SendTarget.media_handler_url`, on the send directive, and a sender sends to
-  // EVERY target it is given.
-  //
-  // DO NOT DERIVE A TRANSMIT ADDRESS FROM A RECEIVE-SIDE FIELD. In particular it
-  // is NOT the active slot's `StreamAssignment.media_handler_url`: that names the
-  // handler carrying a stream this client RECEIVES, and a sender's targets are
-  // the handlers carrying its OUTGOING edges — which are the handlers named on
-  // its SUBSCRIBERS' slots, not on its own. The two coincide in a
-  // single-handler meeting and diverge as soon as edges span handlers, so code
-  // written against the coincidence passes every one-handler test and
-  // mis-addresses in production.
-  //
-  // This list is deliberately left unordered and is not the selection mechanism:
-  // relying on its order — selecting off its first element — silently diverges
-  // from the directive. Its first element is not a selection and carries no
-  // relationship to placement.
+  // Superseded by `media_handler_set` (whose message states the handler-set
+  // rules, including NON-AUTHORITATIVE for send placement); kept alongside it
+  // until story 4 P3 deletes it.
   repeated MediaServerInfo media_servers = 4;
   // Session recovery fields (ADR-0023)
   string correlation_id = 6; // UUIDv7, client stores for reconnection
@@ -768,6 +829,13 @@ message JoinResponse {
   // NOT IDENTITY OR KEY MATERIAL: bounded configuration values, safe to log.
   // OBSERVABILITY: log values, never metric labels.
   repeated ReceiveSlotCap receive_slot_caps = 15;
+
+  // The joiner's first handler set; rules at `MediaHandlerSet`. MAY have no
+  // handlers (no `RegisterMeeting` confirmed yet), with a
+  // `ServerMessage.media_handler_set` following. The client treats an ABSENT
+  // set exactly as an empty one (no handlers; wait for the set message), never
+  // as a fault.
+  MediaHandlerSet media_handler_set = 16;
 }
 
 // Reason for participant leaving.
@@ -1137,6 +1205,7 @@ message ReceiveCapability {
 // One destination for a produced stream.
 message SendTarget {
   // Server-to-client. Same spelling as `MediaServerInfo.media_handler_url`.
+  // Superseded by `handler_ref`; kept alongside it until story 4 P3.
   string media_handler_url = 1;
 
   // How to carry this stream to this target.
@@ -1149,6 +1218,14 @@ message SendTarget {
   // itself past that bound, which turns "hold the meeting's audio floor" into
   // a one-line client patch.
   TransportMode transport_mode = 2;
+
+  // The target handler, as a ref into the client's current
+  // `MediaHandlerSet` (membership rule there: a non-member, including 0, is
+  // counted and ignored).
+  //
+  // OBSERVABILITY (ADR-0039 §8): per-incarnation identifier; never a metric
+  // label, span attribute, or per-frame log field.
+  uint32 handler_ref = 3;
 }
 
 // One media stream MC directs a client to produce (ADR-0036 §5).
@@ -1364,7 +1441,9 @@ message StreamAssignment {
   // of every peer whose edge is on another handler.
   //
   // This is a RECEIVE address. It is not a transmit address: see the derivation
-  // warning at `JoinResponse.media_servers`.
+  // warning at `MediaHandlerSet`.
+  //
+  // Superseded by `handler_ref`; kept alongside it until story 4 P3.
   string media_handler_url = 9;
 
   // Why this slot looks the way it does. Explicit because absence of frames is
@@ -1387,6 +1466,14 @@ message StreamAssignment {
   // OBSERVABILITY (ADR-0036 §11): unbounded cardinality. Never a metric label,
   // never a span attribute, never a per-frame log dimension.
   optional uint64 switch_command_id = 11;
+
+  // The handler owning this edge, as a ref into the client's current
+  // `MediaHandlerSet` (membership rule there: a non-member, including 0, is
+  // counted and ignored). Per slot, as for `media_handler_url` above.
+  //
+  // OBSERVABILITY (ADR-0039 §8): per-incarnation identifier; never a metric
+  // label, span attribute, or per-frame log field.
+  uint32 handler_ref = 12;
 }
 
 // The subscriber's current slot assignments.
@@ -1465,9 +1552,9 @@ message StreamAssignments {
   // being absent from my reachable set says nothing about whether two
   // unreachable peers share a handler with each other. Grouping them is the
   // step that turns a reachability bit into a topology map. THE HANDLERS THE
-  // SUBSCRIBER IS CONNECTED TO are already known to it (`JoinResponse.
-  // media_servers` offers the set; each `StreamAssignment.media_handler_url`
-  // names the one carrying that slot); nothing here adds to that.
+  // SUBSCRIBER IS CONNECTED TO are already known to it (`MediaHandlerSet`
+  // offers the set; each `StreamAssignment.handler_ref` names the one carrying
+  // that slot); nothing here adds to that.
   //
   // OBSERVABILITY (ADR-0036 §11): sender ids -- never a metric label, never a
   // span attribute, never a per-frame log dimension.
@@ -1569,6 +1656,8 @@ message MhConnectionStatus {
   // SECURITY: client-controlled. Consumers MUST truncate before logging
   // (current MC handler bound: 256 bytes via floor_char_boundary).
   // SDK SHOULD cap at <= 256 bytes when populating.
+  // Superseded by `handler_ref` + `handler_set_version`; kept alongside them
+  // until story 4 P3.
   string mh_url = 1;
 
   ConnectionState state = 2;
@@ -1584,6 +1673,21 @@ message MhConnectionStatus {
   optional string failure_code = 4;
 
   google.protobuf.Timestamp observed_at = 5;
+
+  // The handler this status pertains to: the `MediaServerInfo.handler_ref` the
+  // client dialed. Client-asserted, like everything in this message.
+  //
+  // OBSERVABILITY (ADR-0039 §8): per-incarnation identifier; never a metric
+  // label, span attribute, or per-frame log field.
+  uint32 handler_ref = 6;
+
+  // The `MediaHandlerSet.handler_set_version` of the set the client held when
+  // the transition happened: the loss-report correlation key (correlate,
+  // never discard; rule at that field). Client-asserted.
+  //
+  // OBSERVABILITY (ADR-0039 §8): per-incarnation identifier; never a metric
+  // label, span attribute, or per-frame log field.
+  uint64 handler_set_version = 7;
 }
 
 // Client report of per-MH media connection state (replaces predecessor
@@ -1620,6 +1724,20 @@ message MhConnectionStatus {
 // hands to any client and NEVER an input to reachability, placement, or edge
 // assignment. A "hint" that reached any of those would be the client-assertable
 // routing input this whole block exists to forbid.
+//
+// TWO FURTHER PERMITTED USES (ADR-0039 §5, §8), which inherit the prohibition
+// above in full: each is still client-asserted and NEVER routing,
+// reachability or placement input.
+//   1. Input to the clients-detected-loss-before-MC evidence (ADR-0039 §8),
+//      and a NON-TRIGGERING second opinion to MC's handler health function
+//      (ADR-0039 §2). Its counting rule has one home,
+//      `docs/debates/2026-10-28-mh-replacement-and-migration/telemetry-contract.md`;
+//      the version is for correlation, never discard
+//      (`MediaHandlerSet.handler_set_version`).
+//   2. A FAILED report for an in-set ref MAY trigger a rate-limited credential
+//      re-push of the set to its sender only.
+//
+// The client sends a report on EVERY transition.
 message MediaConnectionUpdate {
   repeated MhConnectionStatus statuses = 1;
 }
@@ -1673,7 +1791,15 @@ message ClientMessage {
 
 // MH client→server connect envelope; first framed message on a new bidi stream.
 message MhConnectRequest {
-  string join_token = 1; // Meeting JWT; same semantics as JoinRequest.join_token.
+  // Meeting JWT; same semantics as JoinRequest.join_token. Kept alongside
+  // `media_dial_token` until story 4 P3 deletes it. MH-1 makes MH accept
+  // `media_dial_token` ONLY; this field is not an alternative credential.
+  string join_token = 1;
+
+  // CREDENTIAL: the dialed ref's latest `MediaServerInfo.media_dial_token`
+  // (rules stated there). Never logged; never a metric label, span attribute
+  // or per-frame log field.
+  string media_dial_token = 2;
 }
 
 // ============================================================================
@@ -1833,6 +1959,51 @@ message KeyframeRequest {
   uint32 gop_counter = 2;
 }
 
+// Why MH closed a client's WebTransport session (ADR-0039 §5, §7). Emitted by
+// story 4 MH-CLOSE. Carried as the WebTransport APPLICATION CLOSE CODE,
+// NUMERIC ONLY: no reason strings, ever. These numbers are defined once, here,
+// and are the wire contract (they never ride inside a protobuf field).
+//
+// SECURITY (three conditions):
+//   - Every credential failure is the single generic DECLINED: expired beyond
+//     skew, signature, `token_type`, cross-meeting or unregistered meeting,
+//     malformed, oversized, or an AC meeting token. A specific code is sent
+//     only after FULL validation; `aud` is checked last, so WRONG_HANDLER is
+//     reachable only once signature, type, expiry and meeting checks pass.
+//   - Every code concerns only the caller's own token-validated meeting.
+//   - No reason strings (above).
+//
+// Every intentional MH close (decline, release, drain-deadline shed) is a
+// CLEAN close carrying exactly one code; MH never ends a session cleanly
+// without one. TRANSPORT LOSS is the session ending WITHOUT a clean close (the
+// QUIC connection is lost or idles out; the browser's `WebTransport.closed`
+// rejects). UNSPECIFIED (0) is never sent. A clean close reporting 0 (which is
+// also what a clean close without a CLOSE_WEBTRANSPORT_SESSION capsule decodes
+// to) or an unknown code is a counted client contract fault, and is otherwise
+// handled exactly as transport loss: the client never stalls on it.
+// WRONG_HANDLER, BINDING_CONFLICT and MC_UNAVAILABLE are retried by the
+// client, not loss. HANDLER_RELEASED is expected after a set change.
+//
+// EVOLUTION (ordering constraint): a new value is added here, handled by the
+// client, and only then emitted by MH. An MH emitting a value a deployed
+// client does not know counts a contract fault on every such close.
+enum MhCloseCode {
+  MH_CLOSE_CODE_UNSPECIFIED = 0;
+  // The token's `aud` is not this handler's id (after full validation).
+  MH_CLOSE_CODE_WRONG_HANDLER = 1;
+  // MC refused the sender binding because it conflicts with the
+  // participant's existing session on this handler (e.g. one not yet aged out).
+  MH_CLOSE_CODE_BINDING_CONFLICT = 2;
+  // MH could not reach MC to bind the connection.
+  MH_CLOSE_CODE_MC_UNAVAILABLE = 3;
+  // MH no longer serves this meeting (removed from the set, released or shed).
+  MH_CLOSE_CODE_HANDLER_RELEASED = 4;
+  // The credential was refused. Means "token dead", NOT "handler dead": the
+  // client waits for the next set carrying a token for that handler, then
+  // makes exactly one dial.
+  MH_CLOSE_CODE_DECLINED = 5;
+}
+
 // Wrapper envelope for MH→client messages, written on the send half of the
 // client-opened MH bidi stream (parallel to `ServerMessage` for MC). Same
 // framing and size bound as `MhClientMessage`.
@@ -1880,6 +2051,8 @@ message ServerMessage {
     StreamAssignments stream_assignments = 12;
     SendDirective send_directive = 13;
     MeetingKekUpdate meeting_kek_update = 14;
+    // ADR-0039 §4, §5: the participant's handler set (rules at the message).
+    MediaHandlerSet media_handler_set = 15;
   }
 
   // W3C Trace Context (see ClientMessage::trace_parent for format,

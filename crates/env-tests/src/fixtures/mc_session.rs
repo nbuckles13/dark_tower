@@ -566,6 +566,9 @@ pub fn mh_connect_frame(jwt: &str) -> Vec<u8> {
         message: Some(mh_client_message::Message::ConnectRequest(
             MhConnectRequest {
                 join_token: jwt.to_string(),
+                // Story 4 additive contract: populated once MH accepts the
+                // dial token only (MH-1).
+                media_dial_token: String::new(),
             },
         )),
         trace_parent: String::new(),

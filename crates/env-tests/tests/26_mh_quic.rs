@@ -900,6 +900,8 @@ async fn test_mc_media_connection_update_increments_participant_mh_status_metric
                         failure_reason: None,
                         failure_code: None,
                         observed_at: None,
+                        handler_ref: 0,
+                        handler_set_version: 0,
                     }],
                 },
             )),

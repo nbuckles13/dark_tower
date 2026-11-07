@@ -169,6 +169,8 @@ pub fn build_stream_assignments(
             slot_state: slot_state as i32,
             // §7 switching is not in this story.
             switch_command_id: None,
+            // Story 4 additive contract: MC populates the ref in MC-A.
+            handler_ref: 0,
         });
     }
 

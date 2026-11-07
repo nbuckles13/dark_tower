@@ -871,6 +871,8 @@ async fn a_client_supplied_handler_url_never_reaches_a_send_target() {
                     failure_reason: None,
                     failure_code: None,
                     observed_at: None,
+                    handler_ref: 0,
+                    handler_set_version: 0,
                 }],
             },
         )),
@@ -945,6 +947,8 @@ async fn client_reported_status_neither_redirects_nor_narrows_a_per_edge_url() {
             failure_reason: None,
             failure_code: None,
             observed_at: None,
+            handler_ref: 0,
+            handler_set_version: 0,
         }
     };
     for s in [&mut a, &mut b] {
@@ -1018,6 +1022,8 @@ async fn a_client_that_joins_without_a_declaration_is_still_directed_and_stays_h
                     failure_reason: None,
                     failure_code: None,
                     observed_at: None,
+                    handler_ref: 0,
+                    handler_set_version: 0,
                 }],
             },
         )),
