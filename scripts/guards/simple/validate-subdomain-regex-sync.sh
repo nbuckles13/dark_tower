@@ -176,9 +176,9 @@ fi
 # The table alone cannot see a SEVENTH copy someone adds elsewhere. This sweep can, and it
 # reds until the count and the table are updated together.
 #
-# THE SWEEP IS GIT-TRACKED-ONLY, by construction. `git grep` searches the working-tree content
-# of the files git tracks and NOTHING else — so a gitignored build artifact can never be
-# counted: `packages/sdk-core/coverage/**/limits.ts.html`, `.nx/cache/**` copies of limits.ts,
+# THE SWEEP IS GIT-SCOPED, by construction. `git grep --untracked` searches the working-tree
+# content of tracked files plus untracked files that are NOT ignored — so a gitignored build
+# artifact can never be counted: `packages/sdk-core/coverage/**/limits.ts.html`, `.nx/cache/**` copies of limits.ts,
 # and every future generated reflection of a source site are all untracked and simply absent
 # from the scan. This closes BOTH failure modes of the `grep -rn` filesystem walk with a
 # `--exclude-dir` denylist that this guard shipped with:
@@ -190,12 +190,13 @@ fi
 #     +1 masks a deleted tracked pin (-1), nets back to 10, and passes SILENTLY, losing a real
 #     encoding. A denylist is whack-a-mole on the first and blind to the second; tracked-only
 #     is immune to both, and to build-state nondeterminism besides.
-# It NARROWS coverage on purpose, and the trade is right for a merge gate: a new copy is seen
-# once it is STAGED/committed; an UNSTAGED working-tree addition is out of scope by construction
-# (nothing unstaged reaches main, and CI scans committed content). MODIFICATIONS to an
-# already-tracked file are still caught from the working tree with no re-staging — `git grep`
-# reads working-tree content for tracked paths — so a loosened literal in a committed site reds
-# immediately, which is the case that actually matters.
+# UNTRACKED-BUT-NOT-IGNORED files ARE scanned (`--untracked`, which honours .gitignore and
+# core.excludesFile). This scans what `git add -A` would commit. Tracked-only was too narrow: a devloop
+# validates BEFORE its `git add -A` (devloop SKILL step 8), so a brand-new file carrying the
+# literal was invisible to the devloop's own validation and only red the story runner's
+# post-commit gate (story 4 I-5, mh.sh's MH_OWNER_RE). Gitignored artifacts stay out, so
+# both failure modes above stay closed. MODIFICATIONS to tracked files are read from the
+# working tree as before.
 #
 # Flags: `-e "$CANONICAL"` keeps the leading `^` from being read as an option; `-F` is
 # fixed-string; `-I` skips binary files (the old `--binary-files=without-match`). NO `:/`
@@ -229,7 +230,7 @@ if ! __sweep_top="$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null)" 
   violation "REPO_ROOT='${REPO_ROOT}' is not the top level of a git work tree (git absent, not a repo, or a subdirectory of one) — the tracked-file sweep cannot run, so this guard is VACUOUS until the root is corrected; it is not evidence that the sites are in sync"
 else
   mapfile -t sweep_hits < <(
-    git -C "$REPO_ROOT" grep -I -n -F -e "$CANONICAL" -- "${SWEEP_EXCLUDES[@]}" \
+    git -C "$REPO_ROOT" grep --untracked -I -n -F -e "$CANONICAL" -- "${SWEEP_EXCLUDES[@]}" \
       2>/dev/null || true
   )
   total="${#sweep_hits[@]}"
