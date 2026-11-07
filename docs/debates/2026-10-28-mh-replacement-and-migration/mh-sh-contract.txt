@@ -9,23 +9,26 @@ O-4 MERGED CONTRACT (infrastructure + test; incorporates the GC and ops asks): i
 2. STREAMS. stdout carries one JSON object per invocation, with --json only. stderr carries human text plus exactly ONE final machine line: `MH_RESULT STATUS=OK|FAIL REASON=<token> [SLOT=<k>] [DETAIL=...]`.
 
 3. EXIT CODES + TOKENS. The token list has ONE home, an array in mh.sh. mh.test.sh asserts both directions (every token emitted by some case, every emitted token listed).
-   0 OK
-   1 FAIL         mh-rollout-failed, drain-timeout, not-available-timeout
-   2 PRECONDITION usage, no-kubeconfig, no-template
+   0 OK           ok
+   1 FAIL         mh-rollout-failed, drain-timeout, not-available-timeout, kubectl-failed, internal-error
+   2 PRECONDITION usage, no-kubeconfig, no-template, prerequisite-missing
    3 CAPACITY     mh-no-free-slot
    4 REFUSED      last-serving-mh, stuck-terminating, foreign-owner
    5 BUSY         mh-pool-busy (DETAIL=holder=<owner>)
    Ops' runbook branches on last-serving-mh / stuck-terminating / drain-timeout; each is a distinct token.
    On not-available-timeout, `up` leaves the pod in place for diagnosis and prints the drain command (fail loudly, no silent self-clean).
+   [I-5 amendment, Lead-approved 2026-11-07; additive, exit groups unchanged] `ok` is the REASON on every STATUS=OK. kubectl-failed = an unexpected API/kubectl error after startup (an unreachable apiserver at startup is no-kubeconfig), or a malformed value read back from the cluster; internal-error = the EXIT-trap fallback (signal, or an exit that bypassed the emitter); prerequisite-missing = kubectl or jq is not on PATH. mh-rollout-failed is `upgrade`'s (a replacement never went Available; the old MH is untouched); not-available-timeout is `up`'s.
 
 4. list --json (schema_version 1; additive only; mh.test.sh pins the key set):
-   {schema_version, template_revision, baseline, slots:[{slot, host_port, address, pod_uid,
+   {ok, schema_version, template_revision, baseline, slots:[{slot, host_port, address, pod_ip|null, pod_uid,
      state: free|starting|serving|draining|terminating, terminating_past_grace: bool,
      deployment|null, pod|null, revision|null, stale: bool (revision != template_revision),
      owner|null, restart_count|null}]}
    - Every slot always appears, including free ones.
    - No handler_id in v1. Test doesn't need it, and address is enough for ops' runbook. MH holds no K8s credentials to annotate itself. A field can be added later if MH exposes it on its health endpoint.
    - list takes no lock.
+   - [I-5 amendment, Lead-approved] pod_ip (the pod's .status.podIP, null when there is no pod) is additive under schema_version 1; T-1 pins MH Prometheus series by instance=<pod_ip>:8083 (the mh-service scrape job has no `pod` label). Every --json object carries "ok".
+   - CLUSTER-SIDE INTERFACE (produced by deploy.sh in I-2; restated in mh.sh's header): ConfigMap `mh-template` (dark-tower) with data keys deployment.json (the rendered Deployment as JSON), revision, baseline; per-slot ConfigMaps labelled dark-tower.io/mh-slot=<k> with keys MH_WEBTRANSPORT_ADVERTISE_ADDRESS and MH_HOST_PORT, exactly one per slot value (a duplicate is no-template).
 
 5. VERBS.
    - up [--slot k] [--owner ID] --json prints its slot's list entry plus "created": bool.
