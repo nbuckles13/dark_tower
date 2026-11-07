@@ -40,7 +40,7 @@ const DENIED_ORIGIN: &str = "http://evil.test";
 /// Build GC's production router with the given CORS allowlist. Uses a lazy
 /// (never-connecting) pool and a mock MC client; no DB or live server.
 fn build_test_router(allowed_origins: &str) -> Router {
-    let vars = HashMap::from([
+    let mut vars = HashMap::from([
         (
             "DATABASE_URL".to_string(),
             "postgresql://test/test".to_string(),
@@ -52,6 +52,7 @@ fn build_test_router(allowed_origins: &str) -> Router {
             allowed_origins.to_string(),
         ),
     ]);
+    vars.extend(gc_test_utils::reference_mh_registry_vars());
     let config = Config::from_vars(&vars).expect("config should load");
 
     // Lazy pool: `build_routes`/`AppState` need a `PgPool` value, but no test

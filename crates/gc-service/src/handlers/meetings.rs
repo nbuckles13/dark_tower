@@ -442,6 +442,7 @@ pub async fn join_meeting(
         &meeting.meeting_id.to_string(),
         &state.config.region,
         &state.config.gc_id,
+        &state.config.mh_registry,
     )
     .await
     .inspect_err(|_| {
@@ -627,6 +628,7 @@ pub async fn get_guest_token(
         &meeting.meeting_id.to_string(),
         &state.config.region,
         &state.config.gc_id,
+        &state.config.mh_registry,
     )
     .await
     .inspect_err(|_| {

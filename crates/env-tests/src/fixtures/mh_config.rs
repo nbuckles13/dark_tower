@@ -1,12 +1,18 @@
-//! How env-test 01(c) compares a MH config GAUGE with the deployed ConfigMap
-//! value (`tests/01_mh_deployment_config.rs`). PURE, and in the library — not
-//! behind the env-test feature gates — so its branches are unit-tested at
-//! Layer 4 rather than only against a live cluster at Layer 7, where a logic
-//! bug would be triaged as an environment failure.
+//! How the deployment-config env-tests compare a published config GAUGE with
+//! the deployed ConfigMap value. First written for MH (env-test 01(c),
+//! `tests/01_mh_deployment_config.rs`); also used by MC
+//! (`tests/02_mc_deployment_config.rs`) and GC
+//! (`tests/03_gc_deployment_config.rs`, `MsToSeconds` for the MH load-report
+//! interval and the derived staleness bound). The module keeps its MH name as
+//! its first home; the comparison itself is service-neutral. PURE, and in the
+//! library rather than behind the env-test feature gates, so its branches are
+//! unit-tested at Layer 4. At Layer 7, against a live cluster, a logic bug
+//! would be triaged as an environment failure.
 
-/// How MH turns a deployed ConfigMap value into the value it ENFORCES — and
-/// publishes. Each arm is the SAME expression MH's config load uses, so the
-/// comparison against the published gauge is exact, with no tolerance.
+/// How a service turns a deployed ConfigMap value into the value it ENFORCES,
+/// and publishes. Each arm is the SAME expression the reader's config load
+/// uses (the arms cite theirs), so the comparison against the published gauge
+/// is exact, with no tolerance.
 /// `convert` is TOTAL: a bit value that is not a multiple of 8 is valid config
 /// MH floors or ceils, never an error here.
 #[derive(Clone, Copy, Debug)]
@@ -18,9 +24,11 @@ pub enum Conversion {
     BitsToBytesFloor,
     /// `bits.div_ceil(8)` — `EgressAdmission::derive` (the stream costs).
     BitsToBytesCeil,
-    /// `ms as f64 / 1000.0` — `publish_egress_admission`
-    /// (`mh_media_policy_apply_timeout_seconds`). Compared as the integer
-    /// round trip `round(gauge * 1000) == ms`, never as a float equality: the
+    /// `ms as f64 / 1000.0` — MH `publish_egress_admission`
+    /// (`mh_media_policy_apply_timeout_seconds`), MC's keyframe interval, and
+    /// GC's `Duration::as_secs_f64()` config gauges
+    /// (`gc_mh_load_report_interval_seconds`, `gc_mh_staleness_threshold_seconds`).
+    /// Compared as the integer round trip `round(gauge * 1000) == ms`, never as a float equality: the
     /// value crosses Prometheus text exposition and the query API's formatting.
     MsToSeconds,
 }
@@ -129,5 +137,12 @@ mod tests {
             GaugeVerdict::Mismatch("1 s".into())
         );
         assert_eq!(gauge_verdict(MsToSeconds, 1_000, -1.0), GaugeVerdict::Shape);
+        // GC's derived staleness bound (k × I) need not be whole seconds; a
+        // seconds-truncating publisher is a mismatch, not a match.
+        assert_eq!(gauge_verdict(MsToSeconds, 3_750, 3.75), GaugeVerdict::Match);
+        assert_eq!(
+            gauge_verdict(MsToSeconds, 3_750, 3.0),
+            GaugeVerdict::Mismatch("3.75 s".into())
+        );
     }
 }

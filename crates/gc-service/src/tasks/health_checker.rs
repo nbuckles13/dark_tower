@@ -81,21 +81,18 @@ pub async fn start_health_checker(
         "Starting health checker task"
     );
 
-    start_generic_health_checker(
-        pool,
-        staleness_threshold_seconds,
-        cancel_token,
-        "controllers",
-        |pool, threshold| async move {
-            let result =
-                MeetingControllersRepository::mark_stale_controllers_unhealthy(&pool, threshold)
-                    .await;
-            if result.is_ok() {
-                refresh_controller_metrics(&pool).await;
-            }
-            result
-        },
-    )
+    // MC rows keep their own seconds threshold (out of ADR-0039 scope); the
+    // closure captures it, so the shared loop carries no unit. Saturate: an
+    // absurd threshold means "never stale", never a wrapped negative one.
+    let threshold = i64::try_from(staleness_threshold_seconds).unwrap_or(i64::MAX);
+    start_generic_health_checker(pool, cancel_token, "controllers", move |pool| async move {
+        let result =
+            MeetingControllersRepository::mark_stale_controllers_unhealthy(&pool, threshold).await;
+        if result.is_ok() {
+            refresh_controller_metrics(&pool).await;
+        }
+        result
+    })
     .instrument(tracing::info_span!("gc.task.health_checker"))
     .await;
 

@@ -23,6 +23,8 @@
 //! | `register_mh`               | wrapper-Cat-C error (no business-error branch) | Idempotent UPSERT |
 //! | `update_load_report`        | wrapper-Cat-C error (no business-error branch) | UPDATE no-match returns Ok(rows_affected=0) |
 //! | `mark_stale_mh_unhealthy`   | wrapper-Cat-C error (no business-error branch) | UPDATE no-match returns Ok(rows_affected=0) |
+//! | `delete_expired_mh`         | wrapper-Cat-C error (no business-error branch) | DELETE no-match returns Ok(rows_affected=0) |
+//! | `count_available_mh`        | wrapper-Cat-C error (no business-error branch) | aggregate over empty table returns Ok([]) |
 //!
 //! Two wrapper-Cat-C variants in this file:
 //!   1. **No-business-error-branch** (4 ops: `activate_meeting`, `register_mh`,
@@ -380,9 +382,12 @@ async fn db_query_update_load_report_success_emits_op_update_load_report(pool: P
 #[sqlx::test(migrations = "../../migrations")]
 async fn db_query_mark_stale_mh_unhealthy_success_emits_op_mark_stale_mh_unhealthy(pool: PgPool) {
     let snap = MetricAssertion::snapshot();
-    let _ = MediaHandlersRepository::mark_stale_handlers_unhealthy(&pool, 60)
-        .await
-        .unwrap();
+    let _ = MediaHandlersRepository::mark_stale_handlers_unhealthy(
+        &pool,
+        gc_test_utils::reference_mh_registry().staleness_bound(),
+    )
+    .await
+    .unwrap();
 
     snap.counter("gc_db_queries_total")
         .with_labels(&[
@@ -603,5 +608,68 @@ fn db_query_add_participant_error_wrapper_cat_c_orphan() {
     record_db_query("add_participant", "error", Duration::from_millis(7));
     snap.counter("gc_db_queries_total")
         .with_labels(&[("operation", "add_participant"), ("status", "error")])
+        .assert_delta(1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn db_query_delete_expired_mh_success_emits_op_delete_expired_mh(pool: PgPool) {
+    let snap = MetricAssertion::snapshot();
+    let _ = MediaHandlersRepository::delete_expired_handlers(
+        &pool,
+        gc_test_utils::reference_mh_registry().retention(),
+    )
+    .await
+    .unwrap();
+
+    snap.counter("gc_db_queries_total")
+        .with_labels(&[("operation", "delete_expired_mh"), ("status", "success")])
+        .assert_delta(1);
+    snap.counter("gc_db_queries_total")
+        .with_labels(&[("operation", "delete_expired_mh"), ("status", "error")])
+        .assert_delta(0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn db_query_count_available_mh_success_emits_op_count_available_mh(pool: PgPool) {
+    let snap = MetricAssertion::snapshot();
+    let _ = MediaHandlersRepository::count_available_handlers(
+        &pool,
+        gc_test_utils::reference_mh_registry().staleness_bound(),
+        "us-east-1",
+    )
+    .await
+    .unwrap();
+
+    snap.counter("gc_db_queries_total")
+        .with_labels(&[("operation", "count_available_mh"), ("status", "success")])
+        .assert_delta(1);
+    snap.counter("gc_db_queries_total")
+        .with_labels(&[("operation", "count_available_mh"), ("status", "error")])
+        .assert_delta(0);
+}
+
+// This wrapper invocation proves metric wiring (name + label set + recorder
+// registration). It does NOT prove that production code emits it under any
+// real fault — that requires the fault-injection harness in TODO §Observability
+// Debt.
+#[test]
+fn db_query_delete_expired_mh_error_wrapper_cat_c() {
+    let snap = MetricAssertion::snapshot();
+    record_db_query("delete_expired_mh", "error", Duration::from_millis(8));
+    snap.counter("gc_db_queries_total")
+        .with_labels(&[("operation", "delete_expired_mh"), ("status", "error")])
+        .assert_delta(1);
+}
+
+// This wrapper invocation proves metric wiring (name + label set + recorder
+// registration). It does NOT prove that production code emits it under any
+// real fault — that requires the fault-injection harness in TODO §Observability
+// Debt.
+#[test]
+fn db_query_count_available_mh_error_wrapper_cat_c() {
+    let snap = MetricAssertion::snapshot();
+    record_db_query("count_available_mh", "error", Duration::from_millis(9));
+    snap.counter("gc_db_queries_total")
+        .with_labels(&[("operation", "count_available_mh"), ("status", "error")])
         .assert_delta(1);
 }

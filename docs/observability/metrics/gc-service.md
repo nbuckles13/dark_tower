@@ -169,9 +169,9 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Description**: Total database queries executed
 - **Labels**:
   - `operation`: Query operation — a CLOSED set of literals passed at the `record_db_query` call sites (the
-    23 in `GC_DB_QUERY_OPERATIONS`, `observability/metrics.rs`); never a runtime string.
+    25 in `GC_DB_QUERY_OPERATIONS`, `observability/metrics.rs`); never a runtime string.
   - `status`: Query outcome (`success`, `error`) — the binary `if is_ok()` result.
-- **Cardinality**: `operation × {success, error}` = 46 series. Every pair is real (each operation can succeed
+- **Cardinality**: `operation × {success, error}` = 50 series. Every pair is real (each operation can succeed
   or fail), so this is a full enumeration, not a sparse pair-set; a domain check may treat it as the product
   of the two closed lists. Zero-initialized (present-at-zero) — the rare error series (e.g. a failing
   `atomic_assign`) are low-volume and were previously masked. `GC_DB_QUERY_OPERATIONS` is the source of truth.
@@ -526,6 +526,76 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
     sum(rate(gc_mh_selection_duration_seconds_bucket{status="success"}[5m])) by (le)
   )
   ```
+
+---
+
+## MH Registry Metrics (ADR-0039 §8, §10)
+
+GC runs several replicas (`infra/services/gc-service/deployment.yaml`), and EVERY replica runs the MH
+health checker against the same registry and publishes the same config. The gauges below are therefore
+identical across replicas: aggregate with `max`, never `sum` (summing doubles the count). No series here
+carries a handler id, meeting or connection label (ADR-0036 §11, ADR-0039 §8). Per-handler detail is in
+logs (`gc.grpc.mh_service` "Load report for unknown handler" carries `handler_id`).
+
+### `gc_mh_load_reports_total`
+- **Type**: Counter
+- **Description**: MH load reports by outcome, counted in `send_load_report`.
+- **Labels**:
+  - `outcome`: `accepted` (the report's UPDATE matched a row) | `unknown_handler` (no row for the
+    handler: GC's NOT_FOUND "Handler not registered"). Invalid-argument rejections and DB errors are in
+    neither (DB errors: `gc_db_queries_total{operation="update_load_report",status="error"}`).
+- **Cardinality**: 2 series. Zero-initialized.
+- **Semantics**: a dead process never reports, so any `unknown_handler` increase means a process GC has
+  no row for is ALIVE: its row was deleted by retention (e.g. after a GC/DB outage longer than
+  `GC_MH_REGISTRY_RETENTION_SECONDS`; the MH re-registers on its own), a lost registry, or a live
+  duplicate on one address. A load report never recreates a row.
+- **Example**:
+  ```promql
+  sum by(outcome) (increase(gc_mh_load_reports_total[5m]))
+  ```
+
+### `gc_mh_available`
+- **Type**: Gauge (recompute-and-set from the registry on every MH health-checker tick, every 5 s)
+- **Description**: Registered MH rows by region bucket and effective state. Input to the fleet-level
+  `MHDown` (rule owned by OBS-ALERTS).
+- **Labels**:
+  - `region`: exactly `{<GC_REGION value>, "other"}` — `GC_REGION` for rows whose region equals GC's own,
+    `"other"` for every other row. The region string an MH asserts at registration NEVER becomes a label
+    value. Per-region alerts key on the own-region value.
+  - `state`: `pending` | `healthy` | `degraded` | `draining` | `unhealthy`.
+- **Semantics**: a row with a load report within the MH staleness bound (`gc_mh_staleness_threshold_seconds`)
+  counts under its reported state; an older row that retention has not yet deleted counts as `unhealthy`,
+  whatever its stored status. So `unhealthy` is bounded by `GC_MH_REGISTRY_RETENTION_SECONDS`, and the
+  non-`unhealthy` states count only fresh rows. Each tick runs sweep → retention delete → this recompute, so
+  a row just swept reads `unhealthy` and a row just deleted is in no bucket. Every tick sets all 10
+  combinations, writing 0 for empty ones (a state or region that empties reads 0, never its last value);
+  all 10 are set to 0 at startup.
+- **Staleness of the gauge itself**: if the recompute query fails the gauge keeps its previous values; a
+  rising `gc_db_queries_total{operation="count_available_mh",status="error"}` means `gc_mh_available` is
+  stale.
+- **Not to be confused with** `gc_registered_controllers`: that gauge is refreshed only for
+  `controller_type="meeting"`; `gc_mh_available` is the MH-by-state series and applies the staleness bound.
+- **Cardinality**: 10 series.
+- **Example**:
+  ```promql
+  max by(region, state) (gc_mh_available)
+  ```
+
+### `gc_mh_load_report_interval_seconds`
+- **Type**: Gauge (config; set once at startup)
+- **Description**: `GC_MH_LOAD_REPORT_INTERVAL_MS` in seconds — the interval GC pushes to every MH in
+  `RegisterMHResponse` (GC is its single source). It shows GC's CONFIGURED value; an MH adopts it only when
+  it registers, so a running MH may still report at the interval it registered with.
+- **Labels**: none. **Cardinality**: 1.
+- **Example**: `max(gc_mh_load_report_interval_seconds)`
+
+### `gc_mh_staleness_threshold_seconds`
+- **Type**: Gauge (config; set once at startup)
+- **Description**: The MH staleness bound in seconds, derived as `GC_MH_STALENESS_MULTIPLIER` ×
+  `GC_MH_LOAD_REPORT_INTERVAL_MS`. It is the ONE freshness bound GC applies to MHs: selection candidates,
+  the stale sweep (draining included) and `gc_mh_available` all use it.
+- **Labels**: none. **Cardinality**: 1.
+- **Example**: `max(gc_mh_staleness_threshold_seconds)`
 
 ---
 

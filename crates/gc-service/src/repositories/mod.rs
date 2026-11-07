@@ -11,7 +11,7 @@ pub mod participants;
 
 // Media handler types will be used in handlers in future phase
 #[allow(unused_imports)]
-pub use media_handlers::{MediaHandler, MediaHandlersRepository, MhCandidate};
+pub use media_handlers::{MediaHandler, MediaHandlersRepository, MhAvailabilityRow, MhCandidate};
 pub use meeting_assignments::{weighted_random_select, McAssignment, MeetingAssignmentsRepository};
 // McCandidate and MeetingAssignment are used in tests
 #[allow(unused_imports)]

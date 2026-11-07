@@ -709,6 +709,7 @@ async fn test_service_reassigns_an_ended_meeting_as_a_new_incarnation(
         "m-incarnation",
         "us-east-1",
         "gc-1",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await?;
     assert!(first.mh_selection.is_some());
@@ -720,6 +721,7 @@ async fn test_service_reassigns_an_ended_meeting_as_a_new_incarnation(
         "m-incarnation",
         "us-east-1",
         "gc-1",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await?;
     assert!(
@@ -738,6 +740,7 @@ async fn test_service_reassigns_an_ended_meeting_as_a_new_incarnation(
         "m-incarnation",
         "us-east-1",
         "gc-1",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await?;
     assert!(
@@ -766,6 +769,7 @@ async fn test_service_assign_meeting_with_mh_no_healthy_mcs(
         "meeting-1",
         "us-east-1",
         "gc-1",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await;
 
@@ -787,6 +791,7 @@ async fn test_service_assign_meeting_with_mh_success(pool: PgPool) -> Result<(),
         "meeting-1",
         "us-east-1",
         "gc-1",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await?;
 
@@ -819,6 +824,7 @@ async fn test_service_assign_meeting_with_mh_reuses_healthy(
         "meeting-1",
         "us-east-1",
         "gc-1",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await?;
     let first_mc = first.mc_assignment.mc_id.clone();
@@ -830,6 +836,7 @@ async fn test_service_assign_meeting_with_mh_reuses_healthy(
         "meeting-1",
         "us-east-1",
         "gc-2",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await?;
 
@@ -856,8 +863,15 @@ async fn test_service_end_assignment(pool: PgPool) -> Result<(), anyhow::Error> 
 
     // Create assignment using assign_meeting_with_mh
     let mc_client = Arc::new(MockMcClient::accepting());
-    McAssignmentService::assign_meeting_with_mh(&pool, mc_client, "meeting-1", "us-east-1", "gc-1")
-        .await?;
+    McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mc_client,
+        "meeting-1",
+        "us-east-1",
+        "gc-1",
+        &gc_test_utils::reference_mh_registry(),
+    )
+    .await?;
 
     // End assignment
     let ended = McAssignmentService::end_assignment(&pool, "meeting-1", Some("us-east-1")).await?;
@@ -881,8 +895,15 @@ async fn test_service_get_assignment(pool: PgPool) -> Result<(), anyhow::Error> 
 
     // Create assignment
     let mc_client = Arc::new(MockMcClient::accepting());
-    McAssignmentService::assign_meeting_with_mh(&pool, mc_client, "meeting-1", "us-east-1", "gc-1")
-        .await?;
+    McAssignmentService::assign_meeting_with_mh(
+        &pool,
+        mc_client,
+        "meeting-1",
+        "us-east-1",
+        "gc-1",
+        &gc_test_utils::reference_mh_registry(),
+    )
+    .await?;
 
     // Should find it now
     let some = McAssignmentService::get_assignment(&pool, "meeting-1", "us-east-1").await?;
@@ -932,6 +953,7 @@ async fn test_concurrent_assignment_race_condition(pool: PgPool) -> Result<(), a
                     "meeting-concurrent-test",
                     "us-east-1",
                     &format!("gc-{}", i),
+                    &gc_test_utils::reference_mh_registry(),
                 )
                 .await
             })
@@ -1006,6 +1028,7 @@ async fn test_mc_health_transition_creates_new_assignment(
         "meeting-health-test",
         "us-east-1",
         "gc-1",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await?;
 
@@ -1028,6 +1051,7 @@ async fn test_mc_health_transition_creates_new_assignment(
         "meeting-health-test",
         "us-east-1",
         "gc-2",
+        &gc_test_utils::reference_mh_registry(),
     )
     .await?;
 

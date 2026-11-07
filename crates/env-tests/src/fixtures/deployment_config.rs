@@ -1,6 +1,6 @@
 //! Live-cluster DEPLOYMENT-CONFIG assertions shared by the per-service
 //! deployment-config env-tests (`tests/01_mh_deployment_config.rs`,
-//! `tests/02_mc_deployment_config.rs`).
+//! `tests/02_mc_deployment_config.rs`, `tests/03_gc_deployment_config.rs`).
 //!
 //! Hoisted from `01_mh_deployment_config.rs` at its second consumer (story 3):
 //! the pod/ConfigMap fetches, the value shapes, and the wiring check move HERE

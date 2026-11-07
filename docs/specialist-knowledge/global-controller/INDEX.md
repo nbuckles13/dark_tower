@@ -28,11 +28,10 @@
 - MH selection (active/active `handlers: Vec<MhAssignmentInfo>`; `grpc_endpoint` propagated DB→info→proto) -> `crates/gc-service/src/services/mh_selection.rs:MhSelectionService`
 - MC gRPC client (`assign_meeting` RPC carrying per-handler `webtransport_endpoint` + `grpc_endpoint`) -> `crates/gc-service/src/services/mc_client.rs:McClientTrait`
 - AC HTTP client (meeting/guest tokens) -> `crates/gc-service/src/services/ac_client.rs:AcClient`
-- MC/MH repositories (register, heartbeat, staleness) -> `crates/gc-service/src/repositories/` (`meeting_controllers.rs`, `media_handlers.rs`)
+- MC/MH repositories (register, heartbeat, staleness) -> `crates/gc-service/src/repositories/` (`meeting_controllers.rs`, `media_handlers.rs`); MH registry freshness: config (REQUIRED `GC_MH_*`, one staleness bound = k x interval) -> `crates/gc-service/src/config.rs:MhRegistryConfig`; tick (sweep -> retention -> `gc_mh_available`) -> `crates/gc-service/src/tasks/mh_health_checker.rs:mh_registry_tick()`
 - Meetings repository (create with limit check, audit log) -> `crates/gc-service/src/repositories/meetings.rs:MeetingsRepository::create_meeting_with_limit_check()`
 - Assignment repository (weighted select, atomic assign incl. ENDED-row revival; end + batch jobs keyed on (meeting, region)) -> `crates/gc-service/src/repositories/meeting_assignments.rs:MeetingAssignmentsRepository::atomic_assign()`, `end_assignment()`, `end_stale_assignments()`, `cleanup_old_assignments()`
-- Generic health checker loop -> `crates/gc-service/src/tasks/generic_health_checker.rs`
-- Assignment cleanup (soft/hard delete) -> `crates/gc-service/src/tasks/assignment_cleanup.rs`
+- Generic health checker loop -> `crates/gc-service/src/tasks/generic_health_checker.rs`; assignment cleanup (soft/hard delete) -> `crates/gc-service/src/tasks/assignment_cleanup.rs`
 - Observability metrics (incl. join metrics) -> `crates/gc-service/src/observability/metrics.rs`
 - Grafana dashboard -> `infra/grafana/dashboards/gc-overview.json`
 
@@ -71,5 +70,6 @@
 - Per-metric-cluster integration tests (ADR-0032) -> `crates/gc-service/tests/*_metrics_integration.rs`
 - `error_type` label coverage -> `crates/gc-service/tests/meeting_creation_metrics_integration.rs`, `crates/gc-service/tests/errors_metric_integration.rs`
 - Telemetry proxy tests -> `crates/gc-service/tests/telemetry_proxy_tests.rs`, `crates/gc-service/tests/telemetry_metrics_integration.rs`
+- MH registry: gates -> `crates/gc-service/tests/mh_registry_tests.rs`, `crates/gc-service/tests/mh_health_checker_tests.rs` (fixtures `tests/common/mh_registry.rs`); series -> `crates/gc-service/tests/mh_registry_metrics_integration.rs`; shipped config for tests -> `crates/gc-test-utils/src/reference_config.rs:reference_mh_registry()`; env-test -> `crates/env-tests/tests/03_gc_deployment_config.rs`
 - Test harness -> `crates/gc-test-utils/src/server_harness.rs`; per-crate JWT fixtures -> `crates/gc-service/tests/common/jwt_fixtures.rs`
 - Metrics catalog (creation + join, `error_type` value list) -> `docs/observability/metrics/gc-service.md`

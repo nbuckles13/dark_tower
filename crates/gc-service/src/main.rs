@@ -101,6 +101,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // process start (counter-visibility fix). Infallible; must run right after the
     // recorder installs and before any event can fire.
     observability::metrics::zero_initialize_counters();
+    // MH registry config gauges (set once; same values the RegisterMHResponse
+    // push and every freshness query read) and the gc_mh_available closed
+    // label set at 0 before the first health-checker tick.
+    observability::metrics::set_mh_registry_config_gauges(&config.mh_registry);
+    observability::metrics::set_mh_available(&config.region, &[]);
     info!("Prometheus metrics recorder initialized");
 
     info!(
@@ -109,6 +114,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         grpc_bind_address = %config.grpc_bind_address,
         jwt_clock_skew_seconds = config.jwt_clock_skew_seconds,
         mc_staleness_threshold_seconds = config.mc_staleness_threshold_seconds,
+        mh_load_report_interval = ?config.mh_registry.load_report_interval(),
+        mh_staleness_multiplier = config.mh_registry.staleness_multiplier(),
+        mh_staleness_bound = ?config.mh_registry.staleness_bound(),
+        mh_registry_retention = ?config.mh_registry.retention(),
+        mh_initial_handlers_per_meeting = config.mh_registry.initial_handlers_per_meeting(),
         "Configuration loaded successfully"
     );
 
@@ -207,7 +217,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create gRPC services with auth layer
     let mc_service = McService::new(state.clone());
-    let mh_service = MhService::new(Arc::new(db_pool.clone()));
+    let mh_service = MhService::new(
+        Arc::new(db_pool.clone()),
+        state.config.mh_registry.load_report_interval_ms(),
+    );
     let grpc_auth_layer = GrpcAuthLayer::new(jwt_validator);
 
     // Create cancellation token for graceful shutdown
@@ -242,11 +255,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start MH health checker background task
     let mh_health_checker_pool = db_pool.clone();
     let mh_health_checker_token = cancel_token.clone();
-    let mh_staleness_threshold = mc_staleness_threshold; // Use same threshold as MC health checker
+    // The MH bound is GC's own derived value (k × load-report interval), never
+    // the MC threshold (ADR-0039 §10).
+    let mh_registry = state.config.mh_registry;
+    let mh_own_region = state.config.region.clone();
     let mh_health_checker_handle = tokio::spawn(async move {
         start_mh_health_checker(
             mh_health_checker_pool,
-            mh_staleness_threshold,
+            mh_registry,
+            mh_own_region,
             mh_health_checker_token,
         )
         .await;

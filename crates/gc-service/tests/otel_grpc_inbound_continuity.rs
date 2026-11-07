@@ -61,7 +61,7 @@ impl Drop for TestGrpcServer {
 /// Minimal `AppState` for `McService` — `register_mc` only reads
 /// `state.pool`, so the rest of the fields are inert placeholders.
 async fn minimal_app_state(pool: PgPool) -> Arc<AppState> {
-    let vars = HashMap::from([
+    let mut vars = HashMap::from([
         (
             "DATABASE_URL".to_string(),
             "postgresql://test/test".to_string(),
@@ -69,6 +69,7 @@ async fn minimal_app_state(pool: PgPool) -> Arc<AppState> {
         ("GC_CLIENT_ID".to_string(), "test-gc-client".to_string()),
         ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
     ]);
+    vars.extend(gc_test_utils::reference_mh_registry_vars());
     let config = Config::from_vars(&vars).expect("config should load");
     let (_tx, rx) = watch::channel(SecretString::from("test-token"));
     let token_receiver = TokenReceiver::from_watch_receiver(rx);

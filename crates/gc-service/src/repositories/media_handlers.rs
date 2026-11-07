@@ -13,16 +13,46 @@ use crate::errors::GcError;
 use crate::observability::metrics;
 use crate::repositories::HealthStatus;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
-use std::time::Instant;
+use sqlx::{PgPool, Row};
+use std::time::{Duration, Instant};
 use tracing::instrument;
 
-/// Default heartbeat staleness threshold in seconds.
-/// Handlers without heartbeat within this time are considered unhealthy.
-const DEFAULT_HEARTBEAT_STALENESS_SECONDS: i64 = 30;
-
-/// Number of candidate MHs to select for weighted random load balancing.
+/// Number of candidate MHs to select for weighted random load balancing
+/// (the SQL `LIMIT`, a `BIGINT` bind).
+///
+/// Must stay >= the maximum `GC_MH_INITIAL_HANDLERS_PER_MEETING`, or
+/// selection could return fewer handlers than configured with more available.
+/// Enforced at compile time below.
 const LOAD_BALANCING_CANDIDATE_COUNT: i64 = 5;
+const _: () = assert!(
+    LOAD_BALANCING_CANDIDATE_COUNT > 0
+        && LOAD_BALANCING_CANDIDATE_COUNT.unsigned_abs()
+            >= crate::config::MAX_MH_INITIAL_HANDLERS_PER_MEETING,
+    "LOAD_BALANCING_CANDIDATE_COUNT must cover the max initial handlers per meeting"
+);
+
+/// Convert a span to whole milliseconds for a `$n * INTERVAL '1 millisecond'`
+/// bind. Every registry interval goes through here (one convention, no string
+/// concatenation into SQL). Config bounds keep every configured span far below
+/// `i64::MAX` ms; an out-of-range value is an internal error, never a wrap.
+fn bind_ms(span: Duration) -> Result<i64, GcError> {
+    i64::try_from(span.as_millis())
+        .map_err(|_| GcError::Internal("registry interval exceeds i64 milliseconds".to_string()))
+}
+
+/// One `gc_mh_available` aggregate row.
+///
+/// `state` is the row's reported status when it is within the staleness bound,
+/// and `Unhealthy` when it is older than the bound (not yet retention-deleted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MhAvailabilityRow {
+    /// Whether the row's region equals GC's own configured region.
+    pub own_region: bool,
+    /// Effective state (see type docs).
+    pub state: HealthStatus,
+    /// Number of rows.
+    pub count: u64,
+}
 
 /// Media handler record from database.
 #[derive(Debug, Clone)]
@@ -212,22 +242,26 @@ impl MediaHandlersRepository {
 
     /// Mark stale handlers as unhealthy.
     ///
-    /// Handlers that haven't sent a heartbeat within the staleness threshold
-    /// are marked as unhealthy. This is called periodically by the health checker.
+    /// Any handler — draining included — with no load report within the
+    /// staleness bound is marked unhealthy. A live draining MH keeps reporting
+    /// DRAINING, so it is never swept; one that exited must not stay
+    /// 'draining' forever (ADR-0039 §10). Rows already unhealthy are skipped
+    /// so the returned count is transitions only.
     ///
     /// # Arguments
     ///
     /// * `pool` - Database connection pool
-    /// * `staleness_threshold_seconds` - Seconds since last heartbeat to consider stale
+    /// * `staleness_bound` - The MH staleness bound (`MhRegistryConfig::staleness_bound`)
     ///
     /// # Returns
     ///
     /// Returns the number of handlers marked as unhealthy.
-    #[instrument(skip_all, fields(threshold_seconds = staleness_threshold_seconds))]
+    #[instrument(skip_all, fields(staleness_bound = ?staleness_bound))]
     pub async fn mark_stale_handlers_unhealthy(
         pool: &PgPool,
-        staleness_threshold_seconds: i64,
+        staleness_bound: Duration,
     ) -> Result<u64, GcError> {
+        let bound_ms = bind_ms(staleness_bound)?;
         let start = Instant::now();
 
         let query_result = sqlx::query(
@@ -237,12 +271,11 @@ impl MediaHandlersRepository {
                 health_status = 'unhealthy',
                 updated_at = NOW()
             WHERE
-                last_heartbeat_at < NOW() - ($1 || ' seconds')::INTERVAL
+                last_heartbeat_at < NOW() - $1 * INTERVAL '1 millisecond'
                 AND health_status != 'unhealthy'
-                AND health_status != 'draining'
             "#,
         )
-        .bind(staleness_threshold_seconds.to_string())
+        .bind(bound_ms)
         .execute(pool)
         .await;
 
@@ -259,7 +292,7 @@ impl MediaHandlersRepository {
             tracing::warn!(
                 target: "gc.repository.mh",
                 count = count,
-                threshold_seconds = staleness_threshold_seconds,
+                threshold_ms = bound_ms,
                 "Marked stale handlers as unhealthy"
             );
         }
@@ -267,19 +300,132 @@ impl MediaHandlersRepository {
         Ok(count)
     }
 
+    /// Delete registry rows with no load report within `retention`.
+    ///
+    /// Rows are per incarnation (`handler_id`), so a restarted MH leaves its
+    /// old row behind; this bounds the table. Config guarantees retention >
+    /// staleness bound, so a live (reporting) MH — draining or not — is never
+    /// deleted. A load report for a deleted row stays an UPDATE matching zero
+    /// rows (NOT_FOUND); the row is never recreated there.
+    ///
+    /// # Returns
+    ///
+    /// Number of rows deleted.
+    #[instrument(skip_all, fields(retention = ?retention))]
+    pub async fn delete_expired_handlers(
+        pool: &PgPool,
+        retention: Duration,
+    ) -> Result<u64, GcError> {
+        let retention_ms = bind_ms(retention)?;
+        let start = Instant::now();
+
+        let query_result = sqlx::query(
+            r#"
+            DELETE FROM media_handlers
+            WHERE last_heartbeat_at < NOW() - $1 * INTERVAL '1 millisecond'
+            "#,
+        )
+        .bind(retention_ms)
+        .execute(pool)
+        .await;
+
+        let (status, result) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("delete_expired_mh", status, start.elapsed());
+
+        let count = result?.rows_affected();
+
+        if count > 0 {
+            tracing::info!(
+                target: "gc.repository.mh",
+                count = count,
+                retention_ms = retention_ms,
+                "Deleted expired media handler registry rows"
+            );
+        }
+
+        Ok(count)
+    }
+
+    /// Count registry rows by (own region?, effective state) for `gc_mh_available`.
+    ///
+    /// One aggregate. A row within the staleness bound counts under its
+    /// reported state; an older row counts as `unhealthy`. The MH-asserted
+    /// region string is reduced to "equals GC's own region" here, so it never
+    /// leaves the database as a label value.
+    #[instrument(skip_all)]
+    pub async fn count_available_handlers(
+        pool: &PgPool,
+        staleness_bound: Duration,
+        own_region: &str,
+    ) -> Result<Vec<MhAvailabilityRow>, GcError> {
+        let bound_ms = bind_ms(staleness_bound)?;
+        let start = Instant::now();
+
+        let query_result = sqlx::query(
+            r#"
+            SELECT
+                (region = $2) AS own_region,
+                CASE
+                    WHEN last_heartbeat_at < NOW() - $1 * INTERVAL '1 millisecond'
+                        THEN 'unhealthy'
+                    ELSE health_status
+                END AS state,
+                COUNT(*) AS count
+            FROM media_handlers
+            GROUP BY 1, 2
+            "#,
+        )
+        .bind(bound_ms)
+        .bind(own_region)
+        .fetch_all(pool)
+        .await;
+
+        let (status, result) = match query_result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("count_available_mh", status, start.elapsed());
+
+        result?
+            .into_iter()
+            .map(|row| -> Result<MhAvailabilityRow, GcError> {
+                let own_region: bool = row.try_get("own_region")?;
+                let state: String = row.try_get("state")?;
+                let count: i64 = row.try_get("count")?;
+                let count = u64::try_from(count).map_err(|_| {
+                    GcError::Internal("negative COUNT(*) from registry".to_string())
+                })?;
+                Ok(MhAvailabilityRow {
+                    own_region,
+                    state: HealthStatus::from_db_str(&state),
+                    count,
+                })
+            })
+            .collect()
+    }
+
     /// Get candidate MHs for load balancing in a region.
     ///
-    /// Returns up to 5 healthy MHs with capacity, ordered by load ratio (least loaded first).
+    /// Returns up to 5 healthy MHs with capacity and a load report within the
+    /// staleness bound, ordered by load ratio (least loaded first). Only
+    /// `health_status = 'healthy'` qualifies, so a draining, degraded, pending
+    /// or unhealthy MH is never a candidate (ADR-0039 §7).
     ///
     /// # Arguments
     ///
     /// * `pool` - Database connection pool
     /// * `region` - Deployment region
+    /// * `staleness_bound` - The MH staleness bound (`MhRegistryConfig::staleness_bound`)
     #[instrument(skip_all, fields(region = %region))]
     pub async fn get_candidate_mhs(
         pool: &PgPool,
         region: &str,
+        staleness_bound: Duration,
     ) -> Result<Vec<MhCandidate>, GcError> {
+        let bound_ms = bind_ms(staleness_bound)?;
         let start = Instant::now();
 
         let query_result: Result<Vec<MhCandidateRow>, sqlx::Error> = sqlx::query_as(
@@ -296,13 +442,13 @@ impl MediaHandlersRepository {
             WHERE health_status = 'healthy'
               AND region = $1
               AND current_streams < max_streams
-              AND last_heartbeat_at > NOW() - ($2 || ' seconds')::INTERVAL
+              AND last_heartbeat_at > NOW() - $2 * INTERVAL '1 millisecond'
             ORDER BY load_ratio ASC, last_heartbeat_at DESC
             LIMIT $3
             "#,
         )
         .bind(region)
-        .bind(DEFAULT_HEARTBEAT_STALENESS_SECONDS.to_string())
+        .bind(bound_ms)
         .bind(LOAD_BALANCING_CANDIDATE_COUNT)
         .fetch_all(pool)
         .await;

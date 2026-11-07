@@ -87,7 +87,7 @@ impl TestCreateMeetingServer {
             .mount(&mock_server)
             .await;
 
-        let vars = HashMap::from([
+        let mut vars = HashMap::from([
             (
                 "DATABASE_URL".to_string(),
                 "postgresql://test/test".to_string(),
@@ -103,6 +103,7 @@ impl TestCreateMeetingServer {
             ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
         ]);
 
+        vars.extend(gc_test_utils::reference_mh_registry_vars());
         let config = Config::from_vars(&vars)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 

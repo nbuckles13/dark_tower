@@ -24,6 +24,10 @@ pub const DEFAULT_CHECK_INTERVAL_SECONDS: u64 = 5;
 /// Periodically calls `mark_stale_fn` to check for stale entities and mark them
 /// as unhealthy. Exits when the cancellation token is triggered.
 ///
+/// The loop carries no staleness threshold: each wrapper's closure captures its
+/// own, in its own unit (MC: seconds; MH: the `Duration` staleness bound), so
+/// no unit conversion happens in shared code.
+///
 /// Callers should chain `.instrument(tracing::info_span!(...))` on the returned
 /// future to set the tracing span name, and emit startup/shutdown lifecycle logs
 /// with literal `target:` values.
@@ -31,19 +35,17 @@ pub const DEFAULT_CHECK_INTERVAL_SECONDS: u64 = 5;
 /// # Arguments
 ///
 /// * `pool` - Database connection pool
-/// * `staleness_threshold_seconds` - Seconds since last heartbeat to consider stale
 /// * `cancel_token` - Token for graceful shutdown
 /// * `entity_name` - Human-readable entity name for log messages (e.g., "controllers", "handlers")
-/// * `mark_stale_fn` - Closure that marks stale entities as unhealthy.
-///   Takes an owned `PgPool` (cheap to clone) and staleness threshold.
+/// * `mark_stale_fn` - Closure that marks stale entities as unhealthy and
+///   returns how many it marked. Takes an owned `PgPool` (cheap to clone).
 pub async fn start_generic_health_checker<F, Fut>(
     pool: PgPool,
-    staleness_threshold_seconds: u64,
     cancel_token: CancellationToken,
     entity_name: &'static str,
     mark_stale_fn: F,
 ) where
-    F: Fn(PgPool, i64) -> Fut + Send,
+    F: Fn(PgPool) -> Fut + Send,
     Fut: Future<Output = Result<u64, GcError>> + Send,
 {
     let mut interval = tokio::time::interval(Duration::from_secs(DEFAULT_CHECK_INTERVAL_SECONDS));
@@ -51,7 +53,7 @@ pub async fn start_generic_health_checker<F, Fut>(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                match mark_stale_fn(pool.clone(), staleness_threshold_seconds as i64).await {
+                match mark_stale_fn(pool.clone()).await {
                     Ok(count) => {
                         if count > 0 {
                             warn!(

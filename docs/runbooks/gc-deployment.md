@@ -621,6 +621,28 @@ psql $DATABASE_URL
 | `BIND_ADDRESS` | No | TCP bind address for HTTP server | `0.0.0.0:8080` | `0.0.0.0:8080` |
 | `JWT_CLOCK_SKEW_SECONDS` | No | Allowed clock skew for JWT validation | `60` | `60` |
 | `RUST_LOG` | No | Logging level | `info` | `info,gc_service=debug` |
+| `GC_MH_LOAD_REPORT_INTERVAL_MS` | **Yes** | Load-report interval (ms) GC pushes to every MH in `RegisterMHResponse`; range [1000, 60000]. The MH staleness bound is derived from it: B = `GC_MH_STALENESS_MULTIPLIER` × this. Published as `gc_mh_load_report_interval_seconds` (GC's configured value, not the cadence running MHs use). **Not a one-step change**: an MH adopts the interval only when it registers, but a new B applies fleet-wide as soon as GC rolls, and every MH's live cadence must stay well below every GC replica's B. To lower it: roll GC, then roll the MH fleet so every MH re-registers and adopts the new interval (each new pod is a new incarnation): `kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower` (replaced by `mh.sh upgrade` once story task I-2 lands). **Rolling the MH fleet sheds every media session on each pod it restarts**, so schedule it as a media-disrupting event ([`mh-deployment.md` §Rollout With Media Flowing](mh-deployment.md#rollout-with-media-flowing)). Do the lowering in one step only if k × new interval stays comfortably above the old interval; otherwise raise the multiplier first, in a separate rollout. To raise it: keep the new interval well below the current B (k × old interval), or raise the multiplier first. | Reference `10000` (config.env) | `10000` |
+| `GC_MH_STALENESS_MULTIPLIER` | **Yes** | k in B = k × `GC_MH_LOAD_REPORT_INTERVAL_MS`, the ONE MH freshness bound (selection, stale sweep incl. draining, `gc_mh_available`); range [2, 10]. Published as `gc_mh_staleness_threshold_seconds`. Takes effect when GC rolls. Raising k is always safe; lowering k shrinks B immediately and follows the same cadence-below-every-replica's-B rule as the interval. | Reference `3` | `3` |
+| `GC_MH_REGISTRY_RETENTION_SECONDS` | **Yes** | Registry rows with no load report for this long are deleted on the MH health-checker tick (rows are per MH incarnation). Must exceed B (compared in ms) and be at most `2592000` (30 d); otherwise startup fails. | Reference `3600` | `3600` |
+| `GC_MH_INITIAL_HANDLERS_PER_MEETING` | **Yes** | MHs selected for a NEW meeting (fewer if fewer are selectable); range [1, 4]. Existing meetings are unaffected. | Reference `2` | `2` |
+
+The four `GC_MH_*` keys have no compiled-in default; their reference values live in
+`infra/services/gc-service/config.env`. A bad key fails the new GC pods in one of two ways, and in both the
+old ReplicaSet keeps serving; fix `config.env` and re-apply:
+
+| Cause | Signal | Where the answer is |
+|---|---|---|
+| Key absent from the `gc-service-config` ConfigMap (the Deployment's `configMapKeyRef` is hard) | `CreateContainerConfigError`: no container ever runs | `kubectl describe pod -n dark-tower -l app=gc-service` names the missing key. `kubectl logs` is **empty** |
+| Key present but out of range, non-numeric, or retention ≤ the staleness bound | `CrashLoopBackOff` | `kubectl logs --previous -n dark-tower -l app=gc-service`: the `ConfigError` names the key |
+
+The shared explanation of why the `kubectl logs` reflex misleads here is `mc-deployment.md`
+[§Config-failure triage](mc-deployment.md#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three).
+
+**Expected recovery after a GC or database outage longer than `GC_MH_REGISTRY_RETENTION_SECONDS`:** the
+first MH health-checker tick after recovery deletes every MH row (all are older than retention). Each MH's
+next load report gets NOT_FOUND, and it re-registers on its own within about one load-report interval.
+Until then there are no selectable MHs, so expect a brief burst of meeting refusals and of
+`gc_mh_load_reports_total{outcome="unknown_handler"}` (= MH alive, row gone). This self-heals; do not chase it.
 
 ### Kubernetes Secrets
 

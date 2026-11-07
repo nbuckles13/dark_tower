@@ -9,6 +9,7 @@
 //! - Handler IDs are validated for format
 //! - Sensitive fields are not logged
 
+use crate::observability::metrics;
 use crate::repositories::{HealthStatus, MediaHandlersRepository};
 use chrono::Utc;
 use proto_gen::dark_tower::internal::v1::{
@@ -19,9 +20,6 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
-
-/// Default load report interval in milliseconds (10 seconds).
-const DEFAULT_LOAD_REPORT_INTERVAL_MS: u64 = 10_000;
 
 /// Maximum allowed handler ID length.
 const MAX_HANDLER_ID_LENGTH: usize = 255;
@@ -35,12 +33,20 @@ const MAX_ENDPOINT_LENGTH: usize = 255;
 /// gRPC service for MH registration and load reports.
 pub struct MhService {
     pool: Arc<PgPool>,
+    /// Load-report interval pushed in `RegisterMHResponse`, in milliseconds.
+    /// GC is its single source (`GC_MH_LOAD_REPORT_INTERVAL_MS`); it is the
+    /// same value the staleness bound derives from.
+    load_report_interval_ms: u64,
 }
 
 impl MhService {
-    /// Create a new MH service.
-    pub fn new(pool: Arc<PgPool>) -> Self {
-        Self { pool }
+    /// Create a new MH service. `load_report_interval_ms` is
+    /// `MhRegistryConfig::load_report_interval_ms` (validated at config load).
+    pub fn new(pool: Arc<PgPool>, load_report_interval_ms: u64) -> Self {
+        Self {
+            pool,
+            load_report_interval_ms,
+        }
     }
 
     /// Validate a handler ID.
@@ -171,7 +177,7 @@ impl MediaHandlerRegistryService for MhService {
         Ok(Response::new(RegisterMhResponse {
             accepted: true,
             message: "Registered successfully".to_string(),
-            load_report_interval_ms: DEFAULT_LOAD_REPORT_INTERVAL_MS,
+            load_report_interval_ms: self.load_report_interval_ms,
         }))
     }
 
@@ -244,6 +250,7 @@ impl MediaHandlerRegistryService for MhService {
         })?;
 
         if !updated {
+            metrics::record_mh_load_report(metrics::MH_LOAD_REPORT_UNKNOWN_HANDLER);
             tracing::warn!(
                 target: "gc.grpc.mh_service",
                 handler_id = %req.handler_id,
@@ -251,6 +258,7 @@ impl MediaHandlerRegistryService for MhService {
             );
             return Err(Status::not_found("Handler not registered"));
         }
+        metrics::record_mh_load_report(metrics::MH_LOAD_REPORT_ACCEPTED);
 
         // Use current timestamp from chrono (consistent with rest of codebase)
         let timestamp = Utc::now().timestamp() as u64;
@@ -266,11 +274,6 @@ impl MediaHandlerRegistryService for MhService {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_default_load_report_interval() {
-        assert_eq!(DEFAULT_LOAD_REPORT_INTERVAL_MS, 10_000);
-    }
 
     // === Handler ID Validation Tests ===
 
@@ -393,9 +396,20 @@ mod integration_tests {
     use super::*;
     use sqlx::PgPool;
 
+    /// Test-local registry config. 2500 ms is deliberately NOT the shipped
+    /// interval, so the push test cannot pass against a hardcoded constant.
+    fn registry(interval_ms: u64) -> crate::config::MhRegistryConfig {
+        crate::config::MhRegistryConfig::new(interval_ms, 3, 3600, 2)
+            .expect("valid test registry config")
+    }
+
+    fn service(pool: PgPool) -> MhService {
+        MhService::new(Arc::new(pool), registry(2500).load_report_interval_ms())
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_register_mh_success(pool: PgPool) {
-        let service = MhService::new(Arc::new(pool.clone()));
+        let service = service(pool.clone());
 
         let request = Request::new(RegisterMhRequest {
             handler_id: "test-mh-001".to_string(),
@@ -409,10 +423,8 @@ mod integration_tests {
         let inner = response.into_inner();
 
         assert!(inner.accepted);
-        assert_eq!(
-            inner.load_report_interval_ms,
-            DEFAULT_LOAD_REPORT_INTERVAL_MS
-        );
+        // The configured interval is what MH is told (GC is the single source).
+        assert_eq!(inner.load_report_interval_ms, 2500);
 
         // Verify handler was created
         let handler = MediaHandlersRepository::get_handler(&pool, "test-mh-001")
@@ -426,7 +438,7 @@ mod integration_tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_register_mh_validation_errors(pool: PgPool) {
-        let service = MhService::new(Arc::new(pool));
+        let service = service(pool);
 
         // Empty handler_id
         let request = Request::new(RegisterMhRequest {
@@ -479,7 +491,7 @@ mod integration_tests {
     /// exhausted handler sort as the least loaded — fail-open placement.
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_send_load_report_rejects_current_streams_above_i32(pool: PgPool) {
-        let service = MhService::new(Arc::new(pool.clone()));
+        let service = service(pool.clone());
         MediaHandlersRepository::register_mh(
             &pool,
             "overflow-mh",
@@ -505,7 +517,7 @@ mod integration_tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_send_load_report_success(pool: PgPool) {
-        let service = MhService::new(Arc::new(pool.clone()));
+        let service = service(pool.clone());
 
         // First register the handler
         MediaHandlersRepository::register_mh(
@@ -547,7 +559,7 @@ mod integration_tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_send_load_report_unknown_handler(pool: PgPool) {
-        let service = MhService::new(Arc::new(pool));
+        let service = service(pool);
 
         let request = Request::new(SendLoadReportRequest {
             handler_id: "unknown-handler".to_string(),
@@ -565,7 +577,7 @@ mod integration_tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_send_load_report_empty_handler_id(pool: PgPool) {
-        let service = MhService::new(Arc::new(pool));
+        let service = service(pool);
 
         let request = Request::new(SendLoadReportRequest {
             handler_id: "".to_string(),

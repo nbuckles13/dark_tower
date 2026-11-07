@@ -1,17 +1,30 @@
 //! MH health checker background task.
 //!
-//! Periodically checks for stale Media Handlers and marks them as unhealthy.
-//! Handlers are considered stale if they haven't sent a load report within
-//! the configured threshold.
+//! Every tick (ADR-0039 §10), in this order:
+//! 1. **sweep** — rows with no load report within the MH staleness bound,
+//!    draining included, are marked unhealthy;
+//! 2. **retention** — rows with no load report within the registry retention
+//!    are deleted (rows are per incarnation, so this bounds the table);
+//! 3. **availability** — `gc_mh_available{region, state}` is recomputed and set
+//!    from the registry, so a row just swept reads `unhealthy` and a row just
+//!    deleted is gone from every bucket.
 //!
-//! This is a thin wrapper around the generic health checker, parameterized for
-//! Media Handlers.
+//! Each step runs regardless of the others' outcome. A retention or
+//! availability failure is logged here at error with a literal `step` field; a
+//! sweep failure is returned and logged once by the generic loop. Every failing
+//! step's `gc_db_queries_total` error series is recorded by the repository.
+//!
+//! The loop itself is the generic health checker; the MH closure captures the
+//! `MhRegistryConfig` so the bound never passes through a unit-less parameter.
 //!
 //! # Graceful Shutdown
 //!
 //! The task supports graceful shutdown via a cancellation token. When the token
 //! is cancelled, the task completes its current iteration and exits cleanly.
 
+use crate::config::MhRegistryConfig;
+use crate::errors::GcError;
+use crate::observability::metrics;
 use crate::repositories::MediaHandlersRepository;
 use crate::tasks::generic_health_checker::{
     start_generic_health_checker, DEFAULT_CHECK_INTERVAL_SECONDS,
@@ -20,41 +33,86 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, Instrument};
 
+/// Run one MH registry tick: sweep, then retention, then availability.
+///
+/// Returns the sweep's result (the number of rows marked unhealthy) for the
+/// generic loop's logging; retention and availability failures are logged
+/// here and do not short-circuit.
+pub async fn mh_registry_tick(
+    pool: &PgPool,
+    registry: &MhRegistryConfig,
+    own_region: &str,
+) -> Result<u64, GcError> {
+    // A sweep failure is returned (not logged here): the generic loop logs
+    // every `Err` once ("Failed to check for stale handlers").
+    let swept =
+        MediaHandlersRepository::mark_stale_handlers_unhealthy(pool, registry.staleness_bound())
+            .await;
+
+    if let Err(e) =
+        MediaHandlersRepository::delete_expired_handlers(pool, registry.retention()).await
+    {
+        tracing::error!(
+            target: "gc.task.mh_health_checker",
+            step = "retention",
+            error = %e,
+            "MH registry tick step failed"
+        );
+    }
+
+    match MediaHandlersRepository::count_available_handlers(
+        pool,
+        registry.staleness_bound(),
+        own_region,
+    )
+    .await
+    {
+        Ok(rows) => metrics::set_mh_available(own_region, &rows),
+        Err(e) => {
+            // The gauge keeps its previous values; this error log and
+            // gc_db_queries_total{operation="count_available_mh",status="error"}
+            // are the staleness signal.
+            tracing::error!(
+                target: "gc.task.mh_health_checker",
+                step = "availability",
+                error = %e,
+                "MH registry tick step failed; gc_mh_available not refreshed"
+            );
+        }
+    }
+
+    swept
+}
+
 /// Start the MH health checker background task.
 ///
-/// This task runs in a loop, checking for stale handlers every 5 seconds.
-/// It will exit gracefully when the cancellation token is triggered.
+/// Runs [`mh_registry_tick`] every 5 seconds until the cancellation token is
+/// triggered.
 ///
 /// # Arguments
 ///
 /// * `pool` - Database connection pool
-/// * `staleness_threshold_seconds` - Seconds since last heartbeat to consider stale
+/// * `registry` - MH registry config (staleness bound, retention)
+/// * `own_region` - GC's configured region (the `gc_mh_available` own-region bucket)
 /// * `cancel_token` - Token for graceful shutdown
-///
-/// # Returns
-///
-/// Returns when the cancellation token is triggered.
 pub async fn start_mh_health_checker(
     pool: PgPool,
-    staleness_threshold_seconds: u64,
+    registry: MhRegistryConfig,
+    own_region: String,
     cancel_token: CancellationToken,
 ) {
     info!(
         target: "gc.task.mh_health_checker",
-        staleness_threshold = staleness_threshold_seconds,
+        staleness_bound = ?registry.staleness_bound(),
+        retention = ?registry.retention(),
         check_interval = DEFAULT_CHECK_INTERVAL_SECONDS,
         "Starting MH health checker task"
     );
 
-    start_generic_health_checker(
-        pool,
-        staleness_threshold_seconds,
-        cancel_token,
-        "handlers",
-        |pool, threshold| async move {
-            MediaHandlersRepository::mark_stale_handlers_unhealthy(&pool, threshold).await
-        },
-    )
+    start_generic_health_checker(pool, cancel_token, "handlers", move |pool| {
+        let own_region = own_region.clone();
+        async move { mh_registry_tick(&pool, &registry, &own_region).await }
+    })
     .instrument(tracing::info_span!("gc.task.mh_health_checker"))
     .await;
 
@@ -73,233 +131,7 @@ mod tests {
     fn test_default_check_interval() {
         assert_eq!(DEFAULT_CHECK_INTERVAL_SECONDS, 5);
     }
-
-    #[tokio::test]
-    async fn test_cancellation_token_stops_task() {
-        // Create a mock cancellation that triggers immediately
-        let cancel_token = CancellationToken::new();
-        let cancel_clone = cancel_token.clone();
-
-        // Cancel immediately
-        cancel_clone.cancel();
-
-        // The task should return quickly since it's cancelled
-        // We can't easily test without a real database, but we can verify
-        // the cancellation token works
-        assert!(cancel_token.is_cancelled());
-    }
 }
 
-/// Integration tests for MH health checker task requiring database.
-#[cfg(test)]
-mod integration_tests {
-    use super::*;
-    use crate::repositories::{HealthStatus, MediaHandlersRepository};
-    use sqlx::PgPool;
-    use std::time::Duration;
-
-    /// Test that the MH health checker task starts and stops gracefully.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn test_mh_health_checker_starts_and_stops(pool: PgPool) {
-        let cancel_token = CancellationToken::new();
-        let cancel_clone = cancel_token.clone();
-
-        // Spawn the health checker task
-        let handle = tokio::spawn(start_mh_health_checker(pool, 30, cancel_token));
-
-        // Let it run briefly (not long enough for a full interval)
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Cancel the task
-        cancel_clone.cancel();
-
-        // Task should complete within a reasonable time
-        let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
-        assert!(
-            result.is_ok(),
-            "MH health checker should stop within 2 seconds after cancellation"
-        );
-        result.unwrap().expect("Task should not panic");
-    }
-
-    /// Test that the health checker marks stale handlers as unhealthy.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn test_mh_health_checker_marks_stale_handlers(pool: PgPool) {
-        // Register a handler with an old heartbeat (manually set via SQL)
-        MediaHandlersRepository::register_mh(
-            &pool,
-            "stale-mh-001",
-            "us-east-1",
-            "https://stale-mh:443",
-            "grpc://stale-mh:50051",
-            1000,
-        )
-        .await
-        .expect("Failed to register handler");
-
-        // Update heartbeat to healthy status first
-        MediaHandlersRepository::update_load_report(
-            &pool,
-            "stale-mh-001",
-            10,
-            HealthStatus::Healthy,
-            Some(20.0),
-            Some(30.0),
-            Some(40.0),
-        )
-        .await
-        .expect("Failed to update heartbeat");
-
-        // Manually backdate the heartbeat to make it stale (older than 1 second)
-        sqlx::query(
-            "UPDATE media_handlers SET last_heartbeat_at = NOW() - INTERVAL '10 seconds' WHERE handler_id = $1"
-        )
-        .bind("stale-mh-001")
-        .execute(&pool)
-        .await
-        .expect("Failed to backdate heartbeat");
-
-        let cancel_token = CancellationToken::new();
-        let cancel_clone = cancel_token.clone();
-
-        // Spawn the real MH health checker (1 second staleness threshold). The
-        // interval's first tick fires immediately, so the loop drives the
-        // mark-stale closure within milliseconds. This exercises the full
-        // loop -> closure -> repository -> DB wiring.
-        let pool_clone = pool.clone();
-        let handle = tokio::spawn(start_mh_health_checker(pool_clone, 1, cancel_token));
-
-        // Poll for the status flip instead of sleeping a fixed duration. The
-        // generous 10s ceiling only absorbs wall-clock scheduling delay under
-        // parallel test load; locally this resolves in milliseconds. It removes
-        // the race because we assert as soon as the row flips, not after a fixed
-        // window that can be missed under saturation.
-        let polled = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let handler = MediaHandlersRepository::get_handler(&pool, "stale-mh-001")
-                    .await
-                    .expect("Failed to get handler")
-                    .expect("Handler should exist");
-                if handler.health_status == HealthStatus::Unhealthy {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await;
-
-        // Cancel the task and await teardown.
-        cancel_clone.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
-
-        assert!(
-            polled.is_ok(),
-            "Stale handler should be marked unhealthy by the health checker loop within 10s"
-        );
-
-        // Confirm the final state.
-        let handler = MediaHandlersRepository::get_handler(&pool, "stale-mh-001")
-            .await
-            .expect("Failed to get handler")
-            .expect("Handler should exist");
-
-        assert_eq!(
-            handler.health_status,
-            HealthStatus::Unhealthy,
-            "Stale handler should be marked as unhealthy"
-        );
-    }
-
-    /// Test that healthy handlers with recent heartbeats are not marked unhealthy.
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn test_mh_health_checker_preserves_healthy_handlers(pool: PgPool) {
-        // Register a handler with fresh heartbeat
-        MediaHandlersRepository::register_mh(
-            &pool,
-            "healthy-mh-001",
-            "us-west-2",
-            "https://healthy-mh:443",
-            "grpc://healthy-mh:50051",
-            1000,
-        )
-        .await
-        .expect("Failed to register handler");
-
-        // Update heartbeat to healthy status (just registered, so heartbeat is fresh)
-        MediaHandlersRepository::update_load_report(
-            &pool,
-            "healthy-mh-001",
-            5,
-            HealthStatus::Healthy,
-            Some(10.0),
-            Some(20.0),
-            Some(15.0),
-        )
-        .await
-        .expect("Failed to update heartbeat");
-
-        // Drive the staleness check synchronously with a long threshold (60s); the
-        // freshly-heartbeated handler is not stale, so nothing should be marked.
-        let marked = MediaHandlersRepository::mark_stale_handlers_unhealthy(&pool, 60)
-            .await
-            .expect("mark_stale_handlers_unhealthy should succeed");
-        assert_eq!(marked, 0, "No healthy handler should be marked");
-
-        // Verify the handler is still healthy
-        let handler = MediaHandlersRepository::get_handler(&pool, "healthy-mh-001")
-            .await
-            .expect("Failed to get handler")
-            .expect("Handler should exist");
-
-        assert_eq!(
-            handler.health_status,
-            HealthStatus::Healthy,
-            "Healthy handler with recent heartbeat should remain healthy"
-        );
-    }
-
-    /// Test that draining handlers are not marked unhealthy (even if stale).
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn test_mh_health_checker_skips_draining_handlers(pool: PgPool) {
-        // Register a handler and set it to draining status
-        MediaHandlersRepository::register_mh(
-            &pool,
-            "draining-mh-001",
-            "eu-west-1",
-            "https://draining-mh:443",
-            "grpc://draining-mh:50051",
-            500,
-        )
-        .await
-        .expect("Failed to register handler");
-
-        // Set status to draining via direct SQL
-        sqlx::query(
-            "UPDATE media_handlers SET health_status = 'draining', last_heartbeat_at = NOW() - INTERVAL '10 seconds' WHERE handler_id = $1"
-        )
-        .bind("draining-mh-001")
-        .execute(&pool)
-        .await
-        .expect("Failed to set draining status");
-
-        // Drive the staleness check synchronously with a short threshold (1s). The
-        // handler is stale but draining, so the predicate excludes it and nothing
-        // should be marked.
-        let marked = MediaHandlersRepository::mark_stale_handlers_unhealthy(&pool, 1)
-            .await
-            .expect("mark_stale_handlers_unhealthy should succeed");
-        assert_eq!(marked, 0, "Draining handler should not be marked");
-
-        // Verify the handler is still draining (not marked unhealthy)
-        let handler = MediaHandlersRepository::get_handler(&pool, "draining-mh-001")
-            .await
-            .expect("Failed to get handler")
-            .expect("Handler should exist");
-
-        assert_eq!(
-            handler.health_status,
-            HealthStatus::Draining,
-            "Draining handler should not be marked unhealthy"
-        );
-    }
-}
+// DB-backed tick/sweep tests live in `tests/mh_health_checker_tests.rs`, next
+// to the shared fixtures in `tests/common/mh_registry.rs`.
