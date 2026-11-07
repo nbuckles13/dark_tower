@@ -138,6 +138,9 @@ readonly MH_KUBECTL_TIMEOUT_DEFAULT_S=5
 
 # THE one definition of a valid owner (a subset of the K8s label-value rule). It is also a
 # selector-injection control: an owner is compared, never spliced into a `-l` selector.
+# ANCHOR: the org-subdomain rule (migrations/20250118000001_initial_schema.sql subdomain_format),
+# because Layer 7's owner token is the per-run org subdomain. Drift-guarded by
+# scripts/guards/simple/validate-subdomain-regex-sync.sh.
 readonly MH_OWNER_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
 readonly MH_SLOT_RE='^(0|[1-9][0-9]{0,3})$'
 # The Lease holder is <owner>@<host>:<pid>; its owner part is DERIVED from MH_OWNER_RE.

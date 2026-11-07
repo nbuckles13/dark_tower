@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # validate-subdomain-regex-sync.sh — org-subdomain pattern drift guard (story R-7, task #3).
 #
-# THE PROBLEM. The DNS-label rule for `organizations.subdomain` is encoded in SEVEN places
+# THE PROBLEM. The DNS-label rule for `organizations.subdomain` is encoded in EIGHT places
 # across four languages plus the schema doc. Every one of the copies has been independently
 # ruled *required*: they sit at distinct trust boundaries (database CHECK, shell validator
 # before a SQL boundary, two client-side config-time validators, a Rust fixture, the schema
-# specification doc), and collapsing them
+# specification doc, mh.sh's owner validator), and collapsing them
 # would remove defense-in-depth rather than duplication. CLAUDE.md's rule for exactly this
 # situation is "derive one from the other, **or add a guard that fails validation on drift**".
-# This is that guard: it converts SEVEN copies into one ENFORCED encoding.
+# This is that guard: it converts EIGHT copies into one ENFORCED encoding.
 #
 # WHY IT MATTERS, CONCRETELY. Since R-7, a malformed org subdomain throws at Playwright
 # CONFIG-LOAD (packages/web-app/e2e/env.ts is imported by playwright.config.ts), so the
@@ -81,13 +81,19 @@ readonly SITES=(
   # mode: last touched 2025-11-22 while the migrations moved on. An unenforced doc mirror
   # drifts, which is this guard's entire thesis.
   "docs/DATABASE_SCHEMA.md|CHECK (subdomain ~ '${CANONICAL}')"
+  # infra/kind/scripts/mh.sh's MH_OWNER_RE. Not a coincidental lookalike: the Layer 7 run
+  # token that env-test fixtures pass as `--owner` IS the per-run org subdomain
+  # (layer7.sh __generate_org_subdomain), so mh.sh must accept every subdomain the schema
+  # accepts. The owner is also a K8s label value; the rule is a subset of that, which is why
+  # loosening the SSoT must be checked against mh.sh in the same commit.
+  "infra/kind/scripts/mh.sh|readonly MH_OWNER_RE='${CANONICAL}'"
 )
 
 # PINNED INDEPENDENTLY of the array's own length — comparing the array to itself would be
 # circular and would pass no matter how many rows were added or dropped.
-readonly EXPECTED_SITE_COUNT=7
+readonly EXPECTED_SITE_COUNT=8
 
-# Total occurrences of the canonical literal in scanned source. Seven enforced sites plus three
+# Total occurrences of the canonical literal in scanned source. Eight enforced sites plus three
 # TEST occurrences that pin the literal in place: crates/env-tests/.../auth_client.rs's
 # in-crate byte-identity assertion, scripts/layer7.test.sh's DNS-label case, and this guard's
 # own self-test fixture (scripts/guards/validate-subdomain-regex-sync.test.sh). Those three
@@ -100,7 +106,7 @@ readonly EXPECTED_SITE_COUNT=7
 # exactly like the two assertions above, and it is self-checking besides: if its copy drifted,
 # its synthetic fixture would stop matching the delimiter-exact SITES table and its pristine
 # case would red.
-readonly EXPECTED_TOTAL_OCCURRENCES=10
+readonly EXPECTED_TOTAL_OCCURRENCES=11
 
 # EXCLUSIONS ARE NARROWED TO THE AUDIT TRAIL, not to docs/ wholesale (@dry-reviewer).
 # The sweep runs over GIT-TRACKED files only (see step (3) below), so build artifacts,
@@ -110,7 +116,7 @@ readonly EXPECTED_TOTAL_OCCURRENCES=10
 #   - `docs/devloop-outputs/**` and `docs/user-stories/**` are dated records that quote the
 #     pattern as it stood on a given day; rewriting them when the rule changes would destroy
 #     the audit trail the repo keeps on purpose, so they are out. They ARE tracked and DO carry
-#     the literal (verified: excluding them is exactly what keeps the pinned total at 10).
+#     the literal (verified: excluding them is exactly what keeps the pinned total at 11).
 #   - this guard's own file, whose `readonly CANONICAL=` line would otherwise self-count.
 # Everything else tracked IS scanned — notably `docs/DATABASE_SCHEMA.md`, which opens "This
 # document defines the data models for PostgreSQL" and is therefore a live spec mirror, not a
