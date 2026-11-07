@@ -443,4 +443,38 @@ done
 assert_not_generated "${SIG}" UnmuteResponse
 assert_oneof_case_absent "${SIG}" unmuteResponse unmuteRequest
 
+# Story 4 P1 (ADR-0039 §1, §5, §6) — the internal release vocabulary, the
+# per-(meeting, handler) heartbeat and the registration's new fields. Presence
+# only: P1 is additive (no field deleted, no rpc added; `meetingHeartbeat` lands
+# with MC-B1). Declaration-anchored, so a name surviving only in a comment
+# cannot satisfy it.
+INT="dark_tower/internal/v1/internal_pb.ts"
+for symbol in ReleaseCause ServingState HeartbeatVerdict ApplyRefusal \
+  MeetingHeartbeatRequest MeetingHeartbeatResponse; do
+  assert_exported "${INT}" "${symbol}"
+done
+for member in UNSPECIFIED HEARTBEAT_TIMEOUT APPLY_LAG PLANNED_TRANSFER MEETING_ENDED; do
+  assert_enum_member "${INT}" ReleaseCause "${member}"
+done
+for member in UNSPECIFIED SERVING DRAINING; do
+  assert_enum_member "${INT}" ServingState "${member}"
+done
+for member in UNSPECIFIED OWNED RELEASED; do
+  assert_enum_member "${INT}" HeartbeatVerdict "${member}"
+done
+for member in UNSPECIFIED INVALID TRANSPORT_INCONSISTENT STREAM_CEILING EDGE_CAP; do
+  assert_enum_member "${INT}" ApplyRefusal "${member}"
+done
+for field in meetingId mcId handlerId servingState drainRemainingMs \
+  appliedGeneration applyRefusal connectionIds; do
+  assert_message_field "${INT}" MeetingHeartbeatRequest "${field}"
+done
+for field in verdict cause; do
+  assert_message_field "${INT}" MeetingHeartbeatResponse "${field}"
+done
+for field in heartbeatIntervalMs mediaDialPublicKey; do
+  assert_message_field "${INT}" RegisterMeetingRequest "${field}"
+done
+assert_message_field "${INT}" EndMeetingRequest cause
+
 echo "verify-codegen: all checks passed"

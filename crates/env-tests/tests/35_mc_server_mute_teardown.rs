@@ -102,7 +102,7 @@ use env_tests::fixtures::video::{
     VideoPublisherConfig, VideoSubscriber, VideoTransport,
 };
 use env_tests::fixtures::AuthClient;
-use proto_gen::dark_tower::internal::v1::EndMeetingRequest;
+use proto_gen::dark_tower::internal::v1::{EndMeetingRequest, ReleaseCause};
 use proto_gen::dark_tower::signaling::v1::{
     client_message, server_message, ClientMessage, MediaKind, MuteRequest, ParticipantMuteUpdate,
     SendDirective, SendStream, ServerMuteRequest, SlotState, StreamAssignment, StreamAssignments,
@@ -688,6 +688,7 @@ async fn test_meeting_end_releases_every_handler_even_with_a_straggler() {
                 EndMeetingRequest {
                     meeting_id: meeting_id.clone(),
                     mc_id: probe_mc.clone(),
+                    cause: ReleaseCause::MeetingEnded as i32,
                 },
             ))
             .await

@@ -105,7 +105,11 @@ mailbox delay cannot age an entry. The send into the actor waits for less than o
 never dropped silently (a drop is counted). There is no process-wide liveness table. Inputs: last accepted entry time, applied-vs-sent generation and when the lag started,
 `apply_refusal`, serving state, and client loss reports. An entry is accepted as liveness only if its
 `applied_generation` is not lower than the last accepted one for that (meeting, handler), so a
-replayed or stale heartbeat reads as lag, never as fresh liveness.
+stale or reordered heartbeat reads as lag, never as fresh liveness. This is NOT replay protection:
+an equal-generation replay or a forged heartbeat still reads as live: MC authenticates only the
+caller's service.write.mc token, never which handler sent it (handler_id is self-asserted,
+S1b-extended), and the plaintext MH->MC channel exposes that bearer token to an on-path observer
+(S6 residual). (Erratum 2026-11-06, story 4 task P1: the original text overclaimed replay.)
 
 - **Dead** = entry age > N, the clock starting at the first confirmed `RegisterMeeting` for that pair.
   One-way: a removed handler is never re-added to that meeting.

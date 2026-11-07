@@ -139,7 +139,7 @@ use env_tests::fixtures::mh_grpc::{
 use env_tests::fixtures::PrometheusClient;
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
 use proto_gen::dark_tower::internal::v1::{
-    EndMeetingRequest, RegisterMeetingRequest, SourceDisposition, SourceStream,
+    EndMeetingRequest, RegisterMeetingRequest, ReleaseCause, SourceDisposition, SourceStream,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use tonic::transport::Channel;
@@ -378,6 +378,7 @@ async fn exercise_one_handler(
             EndMeetingRequest {
                 meeting_id: meeting_id.clone(),
                 mc_id: intruder_mc,
+                cause: ReleaseCause::MeetingEnded as i32,
             },
         ))
         .await
@@ -417,6 +418,7 @@ async fn exercise_one_handler(
             EndMeetingRequest {
                 meeting_id: meeting_id.clone(),
                 mc_id: owner_mc.clone(),
+                cause: ReleaseCause::MeetingEnded as i32,
             },
         ))
         .await
@@ -439,6 +441,7 @@ async fn exercise_one_handler(
             EndMeetingRequest {
                 meeting_id: meeting_id.clone(),
                 mc_id: owner_mc.clone(),
+                cause: ReleaseCause::MeetingEnded as i32,
             },
         ))
         .await
@@ -505,6 +508,7 @@ async fn exercise_one_handler(
             EndMeetingRequest {
                 meeting_id: meeting_id.clone(),
                 mc_id: owner_mc,
+                cause: ReleaseCause::MeetingEnded as i32,
             },
         ))
         .await

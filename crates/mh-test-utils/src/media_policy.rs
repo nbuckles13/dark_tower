@@ -121,6 +121,8 @@ pub fn register_request(
         selection_rules: None,
         policy_generation,
         source_streams,
+        heartbeat_interval_ms: 0,
+        media_dial_public_key: Vec::new(),
     }
 }
 

@@ -78,7 +78,9 @@ use crate::fixtures::kube::{deployment_env_value, join_blocking, live_mh_pods, s
 use crate::fixtures::AuthClient;
 use crate::NAMESPACE;
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
-use proto_gen::dark_tower::internal::v1::{EndMeetingRequest, RegisterMeetingRequest};
+use proto_gen::dark_tower::internal::v1::{
+    EndMeetingRequest, RegisterMeetingRequest, ReleaseCause,
+};
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
@@ -523,6 +525,8 @@ pub fn probe_registration(
         selection_rules: None,
         policy_generation: generation,
         source_streams: Vec::new(),
+        heartbeat_interval_ms: 0,
+        media_dial_public_key: Vec::new(),
     }
 }
 
@@ -604,6 +608,7 @@ impl Drop for ReleaseOnDrop {
                                 EndMeetingRequest {
                                     meeting_id: o.meeting_id.clone(),
                                     mc_id: o.mc_id.clone(),
+                                    cause: ReleaseCause::MeetingEnded as i32,
                                 },
                             ))
                             .await

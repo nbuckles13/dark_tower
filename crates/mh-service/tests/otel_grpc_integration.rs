@@ -251,6 +251,8 @@ async fn test_inbound_register_meeting_reparents_handler_span_to_injected_trace(
         selection_rules: None,
         policy_generation: 0,
         source_streams: Vec::new(),
+        heartbeat_interval_ms: 0,
+        media_dial_public_key: Vec::new(),
     });
     let auth_value: MetadataValue<_> = format!("Bearer {token}")
         .parse()
@@ -321,6 +323,8 @@ async fn test_inbound_register_meeting_no_traceparent_gets_fresh_trace_id() {
         selection_rules: None,
         policy_generation: 0,
         source_streams: Vec::new(),
+        heartbeat_interval_ms: 0,
+        media_dial_public_key: Vec::new(),
     });
     let auth_value: MetadataValue<_> = format!("Bearer {token}")
         .parse()

@@ -27,7 +27,9 @@ use common::jwt::ServiceClaims;
 use common::observability::testing::MetricAssertion;
 use mh_service::session::SessionManagerHandle;
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
-use proto_gen::dark_tower::internal::v1::{EndMeetingRequest, RegisterMeetingRequest};
+use proto_gen::dark_tower::internal::v1::{
+    EndMeetingRequest, RegisterMeetingRequest, ReleaseCause,
+};
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};
@@ -65,6 +67,8 @@ fn req_with_bearer(token: Option<&str>) -> Request<RegisterMeetingRequest> {
         selection_rules: None,
         policy_generation: 0,
         source_streams: Vec::new(),
+        heartbeat_interval_ms: 0,
+        media_dial_public_key: Vec::new(),
     });
     if let Some(t) = token {
         let value: MetadataValue<_> = format!("Bearer {t}")
@@ -359,6 +363,7 @@ fn end_meeting_with_bearer(token: Option<&str>) -> Request<EndMeetingRequest> {
     let mut request = Request::new(EndMeetingRequest {
         meeting_id: "meeting-auth-end".to_string(),
         mc_id: "mc-auth-end".to_string(),
+        cause: ReleaseCause::MeetingEnded as i32,
     });
     if let Some(t) = token {
         let value: MetadataValue<_> = format!("Bearer {t}")

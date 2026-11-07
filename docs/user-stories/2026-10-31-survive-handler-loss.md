@@ -1868,7 +1868,7 @@ tasks:
     10. Extend scripts/guards/semantic/checks.md credential-leak items 11-13 (MC key custody) to the dial signing key and tokens: never in logs, metrics, traces, errors or Debug.
 
     TESTS (test-gates.md §MC media_dial items; paused time; seeded RNG)
-    - Per-meeting keypair; only the public key is on RegisterMeetingRequest; it is absent from logs, Debug output and AC's JWKS.
+    - Per-meeting keypair; RegisterMeetingRequest.media_dial_public_key is byte-equal to the meeting keypair's verifying-key bytes, and (distinguishing inputs) not equal to the meeting KEK nor to the signing seed/PKCS#8; every minted token verifies against exactly the bytes on the wire; the key is absent from logs, Debug output and AC's JWKS.
     - Every set entry carries a token: verify with the public key; sub = the session's own (distinguishing input: another roster member's sub must not appear), aud = that handler_id, exp = iat + TTL.
     - Paused time across several TTLs: an in-set client never holds only an expired token.
     - Token-only refresh keeps handler_set_version and refs; membership change advances it.

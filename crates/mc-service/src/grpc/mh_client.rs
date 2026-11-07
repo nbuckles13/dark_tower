@@ -323,6 +323,12 @@ impl MhClient {
             // an MH reject. A disposition change is an assignment change, so
             // the generation above advanced for it.
             source_streams: build_source_streams(programming.assignment),
+            // Story 4: MC does not emit a heartbeat cadence until MC-B1, and MH
+            // does not enforce non-zero until MH-2 (the field's ORDERING rule).
+            heartbeat_interval_ms: 0,
+            // Story 4: the public half of the meeting's dial keypair is
+            // populated by MC-D; MH does not verify against it until MH-1.
+            media_dial_public_key: Vec::new(),
         };
 
         let grpc_request = self.add_auth(request)?;
@@ -532,6 +538,7 @@ impl MhClient {
             .add_auth(EndMeetingRequest {
                 meeting_id: call.meeting_id.clone(),
                 mc_id: call.mc_id.clone(),
+                cause: call.cause.into(),
             })
             .map_err(|e| EndMeetingFailure {
                 kind: EndMeetingFailureKind::Other,
@@ -824,9 +831,15 @@ mod tests {
             selection_rules: None,
             policy_generation: p.policy_generation.get(),
             source_streams: Vec::new(),
+            heartbeat_interval_ms: 0,
+            media_dial_public_key: Vec::new(),
         };
-        // `RegisterMeetingRequest` has no bytes-typed field at all, so this is
-        // structural rather than a scan: there is nowhere for a key to go.
+        // `RegisterMeetingRequest`'s ONE bytes-typed field is
+        // `media_dial_public_key`, a PUBLIC verification key, and it is empty
+        // here: MC-D populates the public half only. Every other field is
+        // identity, edges, behaviours or a generation, so there is nowhere else
+        // for a key to go.
+        assert!(request.media_dial_public_key.is_empty());
         assert_eq!(request.policy_generation, 1);
         assert!(request.selection_rules.is_none());
         assert_eq!(request.egress_streams.len(), 2);
