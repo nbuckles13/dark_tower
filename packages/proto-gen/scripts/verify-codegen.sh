@@ -221,6 +221,22 @@ oneof_case_count() {
   grep -cE "^[[:space:]]+case: \"${case_name}\";" "${path}" || true
 }
 
+# Presence twin (story 4 P2), same matcher; also the absence check's control.
+assert_oneof_case() {
+  local file="$1"
+  local case_name="$2"
+  local path="${OUT_DIR}/${file}"
+  if [[ ! -f "${path}" ]]; then
+    echo "verify-codegen: FAIL — expected file not produced: ${path}" >&2
+    exit 1
+  fi
+  if [[ "$(oneof_case_count "${path}" "${case_name}")" -lt 1 ]]; then
+    echo "verify-codegen: FAIL — oneof case '${case_name}' not generated: ${path}" >&2
+    exit 1
+  fi
+  echo "verify-codegen: OK — oneof case ${case_name} in ${file}"
+}
+
 assert_oneof_case_absent() {
   local file="$1"
   local case_name="$2"
@@ -230,10 +246,8 @@ assert_oneof_case_absent() {
     echo "verify-codegen: FAIL — cannot check absence, file not produced: ${path}" >&2
     exit 1
   fi
-  if [[ "$(oneof_case_count "${path}" "${control}")" -lt 1 ]]; then
-    echo "verify-codegen: FAIL — positive control oneof case '${control}' not found: ${path}" >&2
-    exit 1
-  fi
+  # Positive control first: the same matcher must find a declared case.
+  assert_oneof_case "${file}" "${control}"
   if [[ "$(oneof_case_count "${path}" "${case_name}")" -ne 0 ]]; then
     echo "verify-codegen: FAIL — deleted oneof case '${case_name}' still generated: ${path}" >&2
     exit 1
@@ -476,5 +490,30 @@ for field in heartbeatIntervalMs mediaDialPublicKey; do
   assert_message_field "${INT}" RegisterMeetingRequest "${field}"
 done
 assert_message_field "${INT}" EndMeetingRequest cause
+
+# Story 4 P2 (ADR-0039 §4, §5, §7) — the signalling handler set, refs, dial
+# token and close codes. Presence only: P2 is additive (the superseded url
+# fields and `join_token` stay until P3, which adds their absence checks).
+for symbol in MediaHandlerSet MhCloseCode; do
+  assert_exported "${SIG}" "${symbol}"
+done
+for member in UNSPECIFIED WRONG_HANDLER BINDING_CONFLICT MC_UNAVAILABLE \
+  HANDLER_RELEASED DECLINED; do
+  assert_enum_member "${SIG}" MhCloseCode "${member}"
+done
+for field in handlerSetVersion handlers; do
+  assert_message_field "${SIG}" MediaHandlerSet "${field}"
+done
+for field in handlerRef mediaDialToken; do
+  assert_message_field "${SIG}" MediaServerInfo "${field}"
+done
+assert_message_field "${SIG}" SendTarget handlerRef
+assert_message_field "${SIG}" StreamAssignment handlerRef
+assert_message_field "${SIG}" JoinResponse mediaHandlerSet
+assert_message_field "${SIG}" MhConnectRequest mediaDialToken
+for field in handlerRef handlerSetVersion; do
+  assert_message_field "${SIG}" MhConnectionStatus "${field}"
+done
+assert_oneof_case "${SIG}" mediaHandlerSet
 
 echo "verify-codegen: all checks passed"

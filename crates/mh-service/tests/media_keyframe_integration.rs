@@ -761,6 +761,7 @@ async fn non_recovery_messages_and_framing_breaks_are_malformed() {
         message: Some(mh_client_message::Message::ConnectRequest(
             MhConnectRequest {
                 join_token: "x".repeat(10),
+                media_dial_token: String::new(),
             },
         )),
         ..MhClientMessage::default()

@@ -701,6 +701,8 @@ pub fn build_send_directive(
             targets.push(SendTarget {
                 media_handler_url: url.to_string(),
                 transport_mode: transport_mode as i32,
+                // Story 4 additive contract: MC populates the ref in MC-A.
+                handler_ref: 0,
             });
         }
         any_target |= !targets.is_empty();

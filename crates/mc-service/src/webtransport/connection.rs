@@ -2417,6 +2417,10 @@ fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinRe
         .iter()
         .map(|h| MediaServerInfo {
             media_handler_url: h.webtransport_url.clone(),
+            // Story 4 additive contract: MC populates the ref and dial token
+            // in MC-A / MC-D.
+            handler_ref: 0,
+            media_dial_token: String::new(),
         })
         .collect();
 
@@ -2465,6 +2469,8 @@ fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinRe
         receive_slot_caps: crate::webtransport::handler::receive_slot_caps(|kind| {
             u32::from(kind.of(media.receive_slot_caps))
         }),
+        // Story 4 additive contract: MC sends the handler set in MC-A / MC-D.
+        media_handler_set: None,
     }
 }
 

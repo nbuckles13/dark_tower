@@ -30,17 +30,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // carries `join_token` (a bearer meeting JWT) and `binding_token` (the
     // HMAC session-binding credential).
     //
-    // `MhConnectRequest` is here on the identical mechanism: its `join_token`
-    // is documented as "same semantics as JoinRequest.join_token" (a bearer
-    // meeting JWT), it rides inside `MhClientMessage` which derives `Debug`
-    // transitively, and `crates/mh-service/src/webtransport/connection.rs`'s
-    // malformed-envelope `warn!` arms are one `?envelope` away from logging it.
-    // The `\btoken\b` guard gap above applies verbatim.
+    // `MhConnectRequest` is here on the identical mechanism: it carries two
+    // bearer credentials, `join_token` (a meeting JWT, "same semantics as
+    // JoinRequest.join_token", until story 4 P3 deletes it) and
+    // `media_dial_token` (the MC-minted dial JWS, ADR-0039 §5). It rides inside
+    // `MhClientMessage`, which derives `Debug` transitively, and
+    // `crates/mh-service/src/webtransport/connection.rs`'s malformed-envelope
+    // `warn!` arms are one `?envelope` away from logging it. The `\btoken\b`
+    // guard gap above applies verbatim.
+    //
+    // `MediaServerInfo` carries `media_dial_token` on every entry of every
+    // handler set, and `MediaHandlerSet` holds a list of them. Both are reached
+    // through `JoinResponse` and through `ServerMessage`'s derived oneof
+    // `Debug` (the transitive path MC logs). `MediaServerInfo` is the one impl
+    // that redacts the token; `MediaHandlerSet` delegates to it, and is here so
+    // its rendering stays hand-written rather than derived.
     tonic_prost_build::configure()
         .skip_debug(["dark_tower.signaling.v1.JoinRequest"])
         .skip_debug(["dark_tower.signaling.v1.JoinResponse"])
         .skip_debug(["dark_tower.signaling.v1.MeetingKekUpdate"])
         .skip_debug(["dark_tower.signaling.v1.MhConnectRequest"])
+        .skip_debug(["dark_tower.signaling.v1.MediaServerInfo"])
+        .skip_debug(["dark_tower.signaling.v1.MediaHandlerSet"])
         // `Participant` carries `name` (PII, ADR-0011 membership disclosure) and
         // `identity_public_key` (a stable per-participant identifier). It is
         // broadcast on every join via `ParticipantJoined`, which rides inside

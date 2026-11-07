@@ -1211,6 +1211,7 @@ mod frame_bound_tests {
                     media_handler_url: String::new(),
                     slot_state: 9,
                     switch_command_id: None,
+                    handler_ref: 0,
                 })
                 .collect(),
             unreachable_sender_ids: Vec::new(),

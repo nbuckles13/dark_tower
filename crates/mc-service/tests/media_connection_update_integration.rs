@@ -106,6 +106,8 @@ fn status(url: &str, state: ConnectionState) -> MhConnectionStatus {
         failure_reason: None,
         failure_code: None,
         observed_at: None,
+        handler_ref: 0,
+        handler_set_version: 0,
     }
 }
 

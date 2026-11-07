@@ -42,9 +42,9 @@ pub mod dark_tower {
 // Redacting `Debug` for credential- and key-bearing signalling messages
 // ---------------------------------------------------------------------------
 //
-// prost's derived `Debug` is suppressed for these five messages in
-// `build.rs` (`skip_debug`), so the impls below are the ONLY `Debug` they
-// have. They are written rather than omitted because the enclosing envelopes
+// prost's derived `Debug` is suppressed for the messages in `build.rs`'s
+// `skip_debug` set, so the impls below are the ONLY `Debug` they have. They
+// are written rather than omitted because the enclosing envelopes
 // (`ClientMessage`, `ServerMessage`) derive `Debug` transitively and callers
 // legitimately format them — omitting the impl would break those call sites
 // and invite someone to remove the `skip_debug` entry instead.
@@ -59,13 +59,14 @@ pub mod dark_tower {
 // `binding_token` the length is a protocol constant — 0 when absent, else fixed
 // (KEK 32 bytes; `binding_token` is hex(HMAC-SHA256) = 64 chars,
 // `crates/mc-service/src/actors/session.rs:57`) — so it is not a function of the
-// secret at all. `join_token` is the one field whose length DOES vary with its
-// value (a JWT grows with its claims); disclosing it is acceptable because a
-// bearer JWT's confidentiality rests on its bytes, not its size, and the coarse
-// length narrows nothing usable for an attacker who lacks the token. The rule
-// for the next author is STRICTER than these fields need: if you add a field
-// whose length could itself narrow the secret's value, render presence
-// (`<empty>` / `<present>`), NOT length.
+// secret at all. `join_token` and `media_dial_token` are the fields whose
+// length DOES vary with their value (a JWT/JWS grows with its claims; the
+// dial token's EdDSA signature is fixed-size); disclosing them is acceptable
+// because a bearer token's confidentiality rests on its bytes, not its size,
+// and the coarse length narrows nothing usable for an attacker who lacks the
+// token. The rule for the next author is STRICTER than these fields need: if
+// you add a field whose length could itself narrow the secret's value, render
+// presence (`<empty>` / `<present>`), NOT length.
 use core::fmt;
 
 /// Length-only redaction placeholder for a secret field. Rendered WITHOUT the
@@ -129,6 +130,8 @@ impl fmt::Debug for dark_tower::signaling::v1::JoinResponse {
                 "existing_participants_count",
                 &self.existing_participants.len(),
             )
+            // Through `MediaServerInfo`'s redacting `Debug`: each entry
+            // carries a `media_dial_token`.
             .field("media_servers", &self.media_servers)
             // NOT redacted, deliberately: `correlation_id` is an identifier,
             // not a credential — possessing it does not authenticate a
@@ -152,6 +155,9 @@ impl fmt::Debug for dark_tower::signaling::v1::JoinResponse {
             // values, not key material -- in the clear, so an operator
             // triaging "hears nobody" can see the caps the client was told.
             .field("receive_slot_caps", &self.receive_slot_caps)
+            // Through `MediaHandlerSet`'s redacting `Debug` (tokens redacted
+            // by `MediaServerInfo`'s).
+            .field("media_handler_set", &self.media_handler_set)
             .finish()
     }
 }
@@ -173,13 +179,47 @@ impl fmt::Debug for dark_tower::signaling::v1::MeetingKekUpdate {
 
 /// Redacting `Debug`; see the SAFETY INVARIANT block above `RedactedLen`.
 /// `join_token` is a bearer meeting JWT (same semantics as
-/// `JoinRequest.join_token`), so this envelope carries the same redaction the
-/// join path does — otherwise a malformed-envelope `?envelope` log in
-/// `crates/mh-service/src/webtransport/connection.rs` prints it.
+/// `JoinRequest.join_token`) and `media_dial_token` is the MC-minted dial
+/// credential, so this envelope carries the same redaction the join path does
+/// — otherwise a malformed-envelope `?envelope` log in
+/// `crates/mh-service/src/webtransport/connection.rs` prints them.
 impl fmt::Debug for dark_tower::signaling::v1::MhConnectRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MhConnectRequest")
             .field("join_token", &RedactedLen(self.join_token.len()))
+            .field(
+                "media_dial_token",
+                &RedactedLen(self.media_dial_token.len()),
+            )
+            .finish()
+    }
+}
+
+/// Redacting `Debug`; see the SAFETY INVARIANT block above `RedactedLen`.
+/// THE one impl that redacts `media_dial_token` on the server-to-client path
+/// (ADR-0039 §5 credential). The address and the ref are triage identifiers,
+/// not secrets, and print in the clear.
+impl fmt::Debug for dark_tower::signaling::v1::MediaServerInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MediaServerInfo")
+            .field("media_handler_url", &self.media_handler_url)
+            .field("handler_ref", &self.handler_ref)
+            .field(
+                "media_dial_token",
+                &RedactedLen(self.media_dial_token.len()),
+            )
+            .finish()
+    }
+}
+
+/// Hand-written so the rendering never falls back to a derived walk; each
+/// entry goes through `MediaServerInfo`'s redacting `Debug`, which is the only
+/// place the token is redacted.
+impl fmt::Debug for dark_tower::signaling::v1::MediaHandlerSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MediaHandlerSet")
+            .field("handler_set_version", &self.handler_set_version)
+            .field("handlers", &self.handlers)
             .finish()
     }
 }

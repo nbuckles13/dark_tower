@@ -81,6 +81,9 @@ pub async fn write_mh_connect_with_trace(
         message: Some(mh_client_message::Message::ConnectRequest(
             MhConnectRequest {
                 join_token: jwt.to_string(),
+                // Story 4 additive contract: populated once MH accepts the
+                // dial token only (MH-1).
+                media_dial_token: String::new(),
             },
         )),
         trace_parent: trace_parent.to_string(),
