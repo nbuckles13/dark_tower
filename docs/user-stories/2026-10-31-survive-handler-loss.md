@@ -1295,7 +1295,7 @@ tasks:
   tier: light
   tier_reason: 'GC-only registry/config change: no proto or wire change (load_report_interval_ms already exists), no auth/crypto, no GSA, one service'
 - id: 8
-  status: pending
+  status: completed
   specialist: infrastructure
   deps:
   - 1
@@ -1382,6 +1382,7 @@ tasks:
     INDEX: add a pointer for mh.sh and mh.test.sh in docs/specialist-knowledge/infrastructure/INDEX.md and run scripts/guards/simple/validate-knowledge-index.sh.
 
     COVERS: code, unit-tests (hermetic self-test). No env-tests: the script is not deployed or called until I-2.
+  slug: 2026-11-07-mh-sh-pool-tool
   tag: story-2026-10-31-survive-handler-loss-task-I-5
 - id: 9
   status: pending
