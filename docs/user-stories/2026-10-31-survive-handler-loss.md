@@ -1242,7 +1242,7 @@ tasks:
   slug: 2026-11-07-story4-signaling-contract
   tag: story-2026-10-31-survive-handler-loss-task-P2
 - id: 7
-  status: pending
+  status: completed
   specialist: global-controller
   prompt: |-
     Story 4 task GC-1: GC registry freshness and configuration
@@ -1290,6 +1290,7 @@ tasks:
 
     Same commit: config keys + config.env values + runbook rows; every series with its panel, catalog entry and test; the deleted constants and their test updates.
     Cross-task obligations: (a) config reference rows; (b) no retirements here beyond the deleted constants; (c) panel + catalog + zero-init + ADR-0032 test per series; (d) implement the GC freshness gates of test-gates.md, paired with test; (e) R4 label hygiene: no id labels.
+  slug: 2026-11-07-gc-mh-registry-freshness
   tag: story-2026-10-31-survive-handler-loss-task-GC-1
   tier: light
   tier_reason: 'GC-only registry/config change: no proto or wire change (load_report_interval_ms already exists), no auth/crypto, no GSA, one service'
