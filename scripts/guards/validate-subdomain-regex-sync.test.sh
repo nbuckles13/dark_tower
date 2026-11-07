@@ -158,6 +158,28 @@ assert_rc     "seventh-exit1" 1 "$G_RC"
 assert_status "seventh-count" "found 12 occurrences of the org-subdomain pattern in scanned source, expected exactly 11" "$G_OUT"
 assert_status "seventh-names-new-file" "crates/gc-service/src/validate.rs" "$G_OUT"
 
+# === (4b) A NEW ENCODING IN AN UNSTAGED FILE → FAIL ==========================================
+# Devloops validate before `git add -A`, so a brand-new file is untracked when the guard runs.
+# Tracked-only scanning missed exactly this (story 4 I-5's mh.sh). The guard must see it.
+T="$(new_tree)"
+mkdir -p "$T/crates/gc-service/src"
+printf 'const SUB: &str = r"%s";\n' "$CANON" > "$T/crates/gc-service/src/unstaged.rs"
+run_guard "$T"
+assert_rc     "unstaged-exit1" 1 "$G_RC"
+assert_status "unstaged-count" "found 12 occurrences of the org-subdomain pattern in scanned source, expected exactly 11" "$G_OUT"
+assert_status "unstaged-names-new-file" "crates/gc-service/src/unstaged.rs" "$G_OUT"
+
+# === (4c) A GITIGNORED COPY IS NOT COUNTED ===================================================
+# The positive arm of 4b: build artifacts (coverage/, .nx/) must stay out of the sweep.
+T="$(new_tree)"
+mkdir -p "$T/coverage"
+printf 'coverage/\n' > "$T/.gitignore"
+git -C "$T" add -f .gitignore
+printf 'const SUBDOMAIN_REGEX = /%s/;\n' "$CANON" > "$T/coverage/limits.ts.html"
+run_guard "$T"
+assert_rc     "ignored-exit0" 0 "$G_RC"
+assert_status "ignored-counts" "8 enumerated site(s) in sync; 11 total occurrence(s)" "$G_OUT"
+
 # === (5) AN OCCURRENCE DISAPPEARS → FAIL (the count is pinned in BOTH directions) ============
 # A test assertion that pinned the literal being quietly dropped is drift too: the encoding
 # stops being checked and nothing else notices.
