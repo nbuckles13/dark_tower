@@ -45,6 +45,14 @@ layer_lifecycle_begin 3
   parallel_queue_add "ts-audit-decision-test" "${__here}/lang/ts/audit.test.sh"
   parallel_queue_add "pnpm-helpers-test" "${__here}/lang/_pnpm.test.sh"
   parallel_queue_add "layer7-selftest" "${__here}/layer7.test.sh"
+  # MH pool tool self-test (story 4 I-5): infra/kind/scripts/mh.sh's machine contract (one
+  # MH_RESULT line, grouped exit codes, next-fit, the mh-pool Lease, drain/upgrade refusals) is
+  # consumed by deploy.sh, the env-test mh_pool fixture and the ops runbook, and nothing calls the
+  # script before I-2 — this is its only exerciser. Hermetic: a stateful PATH-stub kubectl over
+  # per-case JSON state; no cluster, no network, no cargo. It also pins MH_TOKENS == the contract
+  # doc's token list in both directions. Its groups run concurrently inside the suite (the
+  # timeout cases wait real seconds), so its wall time is its longest group.
+  parallel_queue_add "mh-pool-tool-selftest" "${__here}/../infra/kind/scripts/mh.test.sh"
   # Org-subdomain drift guard SELF-TEST (story R-7, task #3). The guard itself is
   # auto-discovered by run-guards.sh above and runs on every devloop — but a PASSING guard
   # exercises none of its failure branches, and those branches are its entire value: a check
