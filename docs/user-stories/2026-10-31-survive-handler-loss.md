@@ -1176,7 +1176,7 @@ tasks:
   slug: 2026-11-06-story4-internal-contract-p1
   tag: story-2026-10-31-survive-handler-loss-task-P1
 - id: 6
-  status: pending
+  status: completed
   specialist: protocol
   prompt: |-
     Task P2: Story-4 signaling contract, additive, plus TS codegen
@@ -1239,6 +1239,7 @@ tasks:
     (c) No series emitted.
     (d) Test-gates Protocol section, as above.
     (e) handler_ref, handler_set_version and tokens are never metric labels, span attributes or per-frame log fields. State that at each field.
+  slug: 2026-11-07-story4-signaling-contract
   tag: story-2026-10-31-survive-handler-loss-task-P2
 - id: 7
   status: pending
