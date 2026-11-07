@@ -49,8 +49,9 @@ use mh_service::session::SessionManagerHandle;
 use mh_test_utils::admission::fixture_policy_limits;
 use mh_test_utils::media_policy::{egress, register_request};
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
-use proto_gen::dark_tower::internal::v1::EgressStream;
-use proto_gen::dark_tower::internal::v1::{EndMeetingRequest, RegisterMeetingRequest};
+use proto_gen::dark_tower::internal::v1::{
+    EgressStream, EndMeetingRequest, RegisterMeetingRequest, ReleaseCause,
+};
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request};
@@ -126,6 +127,7 @@ impl Rig {
         let request = self.authed(EndMeetingRequest {
             meeting_id: meeting_id.to_string(),
             mc_id: mc_id.to_string(),
+            cause: ReleaseCause::MeetingEnded as i32,
         });
         self.client
             .end_meeting(request)

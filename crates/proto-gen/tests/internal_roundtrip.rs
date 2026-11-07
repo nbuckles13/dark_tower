@@ -45,6 +45,29 @@
 //! - **A mismatch is `FAILED_PRECONDITION`, not an `acknowledged: false`
 //!   reply**: a status is not a message field. What this crate CAN pin is why
 //!   the rule exists — see `default_end_meeting_response_is_not_an_acknowledgement`.
+//!
+//! Story 4 (ADR-0039) adds the rules below. Each is a RECEIVER's behaviour, so
+//! a wire test can only show that the distinguishing value SURVIVES the wire
+//! (which the tests in the story-4 section do); whether the receiver then
+//! acts correctly needs the receiver. Their enforcement owners are named once,
+//! at the proto field and in `docs/TODO.md` §Media Path Obligations, and are
+//! deliberately not restated here:
+//!
+//! - **`ServingState` UNSPECIFIED is rejected** (`MeetingHeartbeatRequest`).
+//! - **An `mc_id` that is not the meeting's registered MC is answered
+//!   `FAILED_PRECONDITION`, never RELEASED** — a status, not a field.
+//! - **Reconcile is remove-only**: a heartbeat never adds connectivity, and a
+//!   key is retired only if bound before the PREVIOUS heartbeat.
+//! - **A `HeartbeatVerdict` UNSPECIFIED is counted and acted on in no way.**
+//! - **`EndMeetingRequest.cause` UNSPECIFIED is rejected.**
+//! - **`heartbeat_interval_ms` 0 rejects the registration.**
+//! - **The registration record is upserted before policy validation**, so a
+//!   policy refusal still records the meeting and rebinds `mc_id`.
+//! - **Owner-silence counts only accepted owner messages and answered
+//!   verdicts.**
+//! - **`media_dial_public_key` of any length but 32 rejects the registration**
+//!   (31 and 33 bytes are representable on the wire; see
+//!   `media_dial_public_key_survives_byte_exact_and_any_length_is_representable`).
 
 // Test code: a failed decode IS the failure signal here, so panicking is the
 // assertion mechanism rather than a defect.
@@ -66,10 +89,12 @@
 )]
 
 use proto_gen::dark_tower::internal::v1::{
-    CandidateSource, DisconnectReason, EgressStream, EndMeetingRequest, EndMeetingResponse,
+    ApplyRefusal, CandidateSource, DisconnectReason, EgressStream, EndMeetingRequest,
+    EndMeetingResponse, HeartbeatVerdict, MeetingHeartbeatRequest, MeetingHeartbeatResponse,
     NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
     NotifyParticipantDisconnectedRequest, RegisterMeetingRequest, RegisterMeetingResponse,
-    SelectionRules, SourceDisposition, SourceStream, SourceStreamEcho, SubscriberSlot,
+    ReleaseCause, SelectionRules, ServingState, SourceDisposition, SourceStream, SourceStreamEcho,
+    SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use proto_gen::Message;
@@ -113,6 +138,8 @@ fn egress_stream_carries_edge_and_behaviours_in_one_message() {
         selection_rules: Some(SelectionRules {}),
         policy_generation: 7,
         source_streams: Vec::new(),
+        heartbeat_interval_ms: 0,
+        media_dial_public_key: Vec::new(),
     };
 
     let decoded = roundtrip(&req);
@@ -147,6 +174,8 @@ fn empty_egress_stream_set_is_legal_and_survives() {
         selection_rules: None,
         policy_generation: 1,
         source_streams: Vec::new(),
+        heartbeat_interval_ms: 0,
+        media_dial_public_key: Vec::new(),
     };
 
     let decoded = roundtrip(&req);
@@ -170,6 +199,8 @@ fn selection_rules_presence_is_distinguishable_from_absence() {
         selection_rules: None,
         policy_generation: 1,
         source_streams: Vec::new(),
+        heartbeat_interval_ms: 0,
+        media_dial_public_key: Vec::new(),
     };
 
     let absent = roundtrip(&base);
@@ -207,6 +238,8 @@ fn applied_generation_is_independent_of_the_requested_generation() {
         selection_rules: None,
         policy_generation: 7,
         source_streams: Vec::new(),
+        heartbeat_interval_ms: 0,
+        media_dial_public_key: Vec::new(),
     });
 
     let echoed = roundtrip(&RegisterMeetingResponse {
@@ -405,6 +438,8 @@ fn populated_request() -> RegisterMeetingRequest {
         selection_rules: None,
         policy_generation: 4,
         source_streams: Vec::new(),
+        heartbeat_interval_ms: 0,
+        media_dial_public_key: Vec::new(),
     }
 }
 
@@ -413,9 +448,11 @@ fn end_meeting_request_roundtrips() {
     let out = roundtrip(&EndMeetingRequest {
         meeting_id: "meeting-1".to_string(),
         mc_id: "mc-7".to_string(),
+        cause: ReleaseCause::MeetingEnded as i32,
     });
     assert_eq!(out.meeting_id, "meeting-1");
     assert_eq!(out.mc_id, "mc-7");
+    assert_eq!(out.cause, ReleaseCause::MeetingEnded as i32);
 }
 
 /// Why an `mc_id` mismatch is a gRPC error status and never
@@ -828,4 +865,279 @@ fn source_stream_and_echo_frozen_tags_are_on_the_wire() {
 
     let echoed = top_level_field_numbers(&echo(1, 1, TransportMode::Datagram).encode_to_vec());
     assert_eq!(echoed, vec![1, 2, 3]);
+}
+
+// ---------------------------------------------------------------------------
+// Story 4 (ADR-0039 §1, §5, §6): the release vocabulary, the per-(meeting,
+// handler) heartbeat, and the registration's cadence and dial-key fields.
+//
+// Every zero on these fields is a REJECT or MALFORMED reading except one,
+// `ApplyRefusal`'s, which means "no refusal" by design. The default-decode
+// tests below pin each zero to its fail-closed reading, so a peer that omits a
+// field is read exactly as the proto says.
+// ---------------------------------------------------------------------------
+
+// Frozen tags of the story-4 fields, as literals (the in-file precedent:
+// boundary tests pin tags as literals against `top_level_field_numbers`).
+const HB_MEETING_ID: u64 = 1;
+const HB_CONNECTION_IDS: u64 = 8;
+const RMR_POLICY_GENERATION: u64 = 6;
+const RMR_HEARTBEAT_INTERVAL_MS: u64 = 9;
+const RMR_MEDIA_DIAL_PUBLIC_KEY: u64 = 10;
+const EMR_CAUSE: u64 = 3;
+
+const KEY: [u8; 32] = [
+    0x00, 0xFF, 0x01, 0xFE, 0x00, 0x00, 0xFF, 0xFF, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+    0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x00, 0x7F, 0x80, 0x81, 0x00, 0xFF, 0x00, 0xFF, 0x00,
+];
+
+fn heartbeat() -> MeetingHeartbeatRequest {
+    MeetingHeartbeatRequest {
+        meeting_id: "meeting-1".to_string(),
+        mc_id: "mc-1".to_string(),
+        handler_id: "mh-1".to_string(),
+        serving_state: ServingState::Draining as i32,
+        drain_remaining_ms: 4_500,
+        // Above u32::MAX: the field is uint64 like the generation it reports.
+        applied_generation: u64::from(u32::MAX) + 7,
+        apply_refusal: ApplyRefusal::EdgeCap as i32,
+        connection_ids: vec!["c-2".to_string(), "c-1".to_string(), "c-2".to_string()],
+    }
+}
+
+/// Every field by value. `connection_ids` keeps ORDER and DUPLICATES: the wire
+/// neither dedupes nor sorts, so the remove-only reconcile sees exactly what
+/// MH sent.
+#[test]
+fn meeting_heartbeat_request_roundtrips_every_field_by_value() {
+    let sent = heartbeat();
+    let got = roundtrip(&sent);
+    assert_eq!(got.meeting_id, "meeting-1");
+    assert_eq!(got.mc_id, "mc-1");
+    assert_eq!(got.handler_id, "mh-1");
+    assert_eq!(got.serving_state, ServingState::Draining as i32);
+    assert_eq!(got.drain_remaining_ms, 4_500);
+    assert_eq!(got.applied_generation, u64::from(u32::MAX) + 7);
+    assert_eq!(got.apply_refusal, ApplyRefusal::EdgeCap as i32);
+    assert_eq!(got.connection_ids, vec!["c-2", "c-1", "c-2"]);
+    assert_eq!(got, sent);
+}
+
+/// RELEASED with the misroute cause (UNSPECIFIED) and RELEASED with a removal
+/// trigger stay distinct on the wire: MH's count of misroutes, and its
+/// `trigger` projection, depend on it.
+#[test]
+fn meeting_heartbeat_response_roundtrips_and_released_causes_stay_distinct() {
+    let removal = MeetingHeartbeatResponse {
+        verdict: HeartbeatVerdict::Released as i32,
+        cause: ReleaseCause::HeartbeatTimeout as i32,
+    };
+    let misroute = MeetingHeartbeatResponse {
+        verdict: HeartbeatVerdict::Released as i32,
+        cause: ReleaseCause::Unspecified as i32,
+    };
+    assert_eq!(roundtrip(&removal), removal);
+    assert_eq!(roundtrip(&misroute), misroute);
+    assert_ne!(removal.encode_to_vec(), misroute.encode_to_vec());
+    let owned = roundtrip(&MeetingHeartbeatResponse {
+        verdict: HeartbeatVerdict::Owned as i32,
+        cause: ReleaseCause::Unspecified as i32,
+    });
+    assert_eq!(owned.verdict, HeartbeatVerdict::Owned as i32);
+    assert_eq!(owned.cause, ReleaseCause::Unspecified as i32);
+}
+
+/// The registration's cadence survives, and does not disturb the policy it
+/// rides with.
+#[test]
+fn heartbeat_interval_ms_roundtrips() {
+    let got = roundtrip(&RegisterMeetingRequest {
+        heartbeat_interval_ms: 2_000,
+        media_dial_public_key: KEY.to_vec(),
+        ..populated_request()
+    });
+    assert_eq!(got.heartbeat_interval_ms, 2_000);
+    assert_eq!(got.policy_generation, 4);
+    assert_eq!(got.egress_streams.len(), 1);
+}
+
+/// 32 bytes containing 0x00 and 0xFF survive byte-exact. 31 and 33 bytes are
+/// REPRESENTABLE: the exactly-32 rule is a receiver reject, not a wire
+/// property, which is why it is named in this file's header.
+#[test]
+fn media_dial_public_key_survives_byte_exact_and_any_length_is_representable() {
+    let got = roundtrip(&RegisterMeetingRequest {
+        media_dial_public_key: KEY.to_vec(),
+        ..populated_request()
+    });
+    assert_eq!(got.media_dial_public_key, KEY.to_vec());
+    for len in [31, 33] {
+        let key = vec![0xA5; len];
+        let got = roundtrip(&RegisterMeetingRequest {
+            media_dial_public_key: key.clone(),
+            ..populated_request()
+        });
+        assert_eq!(got.media_dial_public_key, key, "{len} bytes");
+    }
+}
+
+/// Every new tag, read from the bytes against its frozen literal.
+#[test]
+fn story4_frozen_tags_are_on_the_wire() {
+    let one_id = MeetingHeartbeatRequest {
+        connection_ids: vec!["c-1".to_string()],
+        ..heartbeat()
+    };
+    let expected = vec![HB_MEETING_ID, 2, 3, 4, 5, 6, 7, HB_CONNECTION_IDS];
+    assert_eq!(top_level_field_numbers(&one_id.encode_to_vec()), expected);
+
+    let response = MeetingHeartbeatResponse {
+        verdict: HeartbeatVerdict::Released as i32,
+        cause: ReleaseCause::PlannedTransfer as i32,
+    };
+    let expected = vec![1, 2];
+    assert_eq!(top_level_field_numbers(&response.encode_to_vec()), expected);
+
+    let register = RegisterMeetingRequest {
+        heartbeat_interval_ms: 2_000,
+        media_dial_public_key: KEY.to_vec(),
+        ..populated_request()
+    };
+    let (interval, key) = (RMR_HEARTBEAT_INTERVAL_MS, RMR_MEDIA_DIAL_PUBLIC_KEY);
+    let fields = top_level_field_numbers(&register.encode_to_vec());
+    assert!(
+        fields.contains(&interval) && fields.contains(&key),
+        "{fields:?}"
+    );
+
+    let end = EndMeetingRequest {
+        meeting_id: "m".to_string(),
+        mc_id: "mc".to_string(),
+        cause: ReleaseCause::MeetingEnded as i32,
+    };
+    let cause = EMR_CAUSE;
+    assert_eq!(
+        top_level_field_numbers(&end.encode_to_vec()),
+        vec![1, 2, cause]
+    );
+}
+
+/// Enum numbers are frozen, and every UNSPECIFIED is 0.
+#[test]
+fn story4_enum_numbers_are_pinned() {
+    assert_eq!(ReleaseCause::Unspecified as i32, 0);
+    assert_eq!(ReleaseCause::HeartbeatTimeout as i32, 1);
+    assert_eq!(ReleaseCause::ApplyLag as i32, 2);
+    assert_eq!(ReleaseCause::PlannedTransfer as i32, 3);
+    assert_eq!(ReleaseCause::MeetingEnded as i32, 4);
+
+    assert_eq!(ServingState::Unspecified as i32, 0);
+    assert_eq!(ServingState::Serving as i32, 1);
+    assert_eq!(ServingState::Draining as i32, 2);
+
+    assert_eq!(HeartbeatVerdict::Unspecified as i32, 0);
+    assert_eq!(HeartbeatVerdict::Owned as i32, 1);
+    assert_eq!(HeartbeatVerdict::Released as i32, 2);
+
+    assert_eq!(ApplyRefusal::Unspecified as i32, 0);
+    assert_eq!(ApplyRefusal::Invalid as i32, 1);
+    assert_eq!(ApplyRefusal::TransportInconsistent as i32, 2);
+    assert_eq!(ApplyRefusal::StreamCeiling as i32, 3);
+    assert_eq!(ApplyRefusal::EdgeCap as i32, 4);
+}
+
+/// What a peer that sends nothing decodes to. Each zero lands on its
+/// fail-closed reading: a verdict that is neither OWNED nor RELEASED, a
+/// serving state and a cause that are rejected, an interval that rejects the
+/// registration. `ApplyRefusal`'s zero is the ONE deliberately non-reject
+/// zero: "no refusal".
+#[test]
+fn default_decodes_land_on_the_fail_closed_reading() {
+    let response = MeetingHeartbeatResponse::decode(&[][..]).expect("empty decodes");
+    assert_eq!(response.verdict, HeartbeatVerdict::Unspecified as i32);
+    assert_ne!(response.verdict, HeartbeatVerdict::Owned as i32);
+    assert_ne!(response.verdict, HeartbeatVerdict::Released as i32);
+    assert_eq!(response.cause, ReleaseCause::Unspecified as i32);
+
+    let request = MeetingHeartbeatRequest::decode(&[][..]).expect("empty decodes");
+    assert_eq!(request.serving_state, ServingState::Unspecified as i32);
+    assert_ne!(request.serving_state, ServingState::Serving as i32);
+    assert_eq!(request.apply_refusal, ApplyRefusal::Unspecified as i32);
+    assert_eq!(request.applied_generation, 0);
+    assert!(request.connection_ids.is_empty());
+
+    let end = EndMeetingRequest::decode(&[][..]).expect("empty decodes");
+    assert_eq!(end.cause, ReleaseCause::Unspecified as i32);
+
+    let register = RegisterMeetingRequest::decode(&[][..]).expect("empty decodes");
+    assert_eq!(register.heartbeat_interval_ms, 0);
+    assert!(register.media_dial_public_key.is_empty());
+}
+
+/// Open enums: an unknown number on every new enum field survives as its
+/// integer (for the receiver to reject or count), and never maps to a named
+/// value.
+#[test]
+fn unknown_story4_enum_values_decode_as_open_integers() {
+    let request = roundtrip(&MeetingHeartbeatRequest {
+        serving_state: UNKNOWN_ENUM_VALUE,
+        apply_refusal: UNKNOWN_ENUM_VALUE,
+        ..heartbeat()
+    });
+    assert_eq!(request.serving_state, UNKNOWN_ENUM_VALUE);
+    assert_eq!(request.apply_refusal, UNKNOWN_ENUM_VALUE);
+
+    let response = roundtrip(&MeetingHeartbeatResponse {
+        verdict: UNKNOWN_ENUM_VALUE,
+        cause: UNKNOWN_ENUM_VALUE,
+    });
+    assert_eq!(response.verdict, UNKNOWN_ENUM_VALUE);
+    assert_eq!(response.cause, UNKNOWN_ENUM_VALUE);
+
+    let end = roundtrip(&EndMeetingRequest {
+        meeting_id: "m".to_string(),
+        mc_id: "mc".to_string(),
+        cause: UNKNOWN_ENUM_VALUE,
+    });
+    assert_eq!(end.cause, UNKNOWN_ENUM_VALUE);
+
+    assert!(ServingState::try_from(UNKNOWN_ENUM_VALUE).is_err());
+    assert!(ApplyRefusal::try_from(UNKNOWN_ENUM_VALUE).is_err());
+    assert!(HeartbeatVerdict::try_from(UNKNOWN_ENUM_VALUE).is_err());
+    assert!(ReleaseCause::try_from(UNKNOWN_ENUM_VALUE).is_err());
+}
+
+/// An EMPTY `connection_ids` emits no field, so it is one observable with an
+/// absent list: MC reads both as "MH holds none for this meeting" and, under
+/// the remove-only reconcile, may retire every key bound before the previous
+/// heartbeat. The positive control shows a populated list does emit it.
+#[test]
+fn empty_connection_ids_emit_no_field_and_a_populated_list_does() {
+    let tag = HB_CONNECTION_IDS;
+    let empty = MeetingHeartbeatRequest {
+        connection_ids: Vec::new(),
+        ..heartbeat()
+    };
+    let fields = top_level_field_numbers(&empty.encode_to_vec());
+    assert!(!fields.contains(&tag), "{fields:?}");
+    assert!(
+        fields.contains(&HB_MEETING_ID),
+        "positive control: the rest of the message is present"
+    );
+    assert!(top_level_field_numbers(&heartbeat().encode_to_vec()).contains(&tag));
+}
+
+/// An EMPTY `media_dial_public_key` emits no field (this commit's MC sends
+/// it empty until MC-D); a populated one does.
+#[test]
+fn empty_media_dial_public_key_emits_no_field_and_a_populated_one_does() {
+    let tag = RMR_MEDIA_DIAL_PUBLIC_KEY;
+    let empty = top_level_field_numbers(&populated_request().encode_to_vec());
+    assert!(!empty.contains(&tag), "{empty:?}");
+    assert!(empty.contains(&RMR_POLICY_GENERATION), "positive control");
+    let populated = RegisterMeetingRequest {
+        media_dial_public_key: KEY.to_vec(),
+        ..populated_request()
+    };
+    assert!(top_level_field_numbers(&populated.encode_to_vec()).contains(&tag));
 }

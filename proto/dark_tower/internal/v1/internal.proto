@@ -129,7 +129,7 @@ import "dark_tower/signaling/v1/signaling.proto";
 //     `policy_generation` N with one source not yet connected IS faithfully
 //     applied, so the echo advances to N; the absent source is reported through
 //     slot state. Gating the echo on source connectivity would peg MC's §8
-//     comparison into permanent divergence-and-re-assert for any legitimately
+//     comparison into permanent divergence-and-re-push for any legitimately
 //     absent source -- a NEW false-alarm bug, in the very field that exists to
 //     prevent false liveness. The case where the echo must NOT advance is the
 //     snapshot never being installed at all (mailbox full, apply errored), and
@@ -536,7 +536,11 @@ message ComprehensiveHeartbeatRequest {
 // behaviours, server mute, selection rules -- is a field on the full
 // `RegisterMeetingRequest` snapshot, never a new method. A second
 // forwarding-policy RPC would reintroduce exactly the partial-state and
-// ordering problems the full-snapshot re-assert exists to eliminate.
+// ordering problems the full-snapshot registration exists to eliminate.
+// There is no periodic re-assert (ADR-0039 §1 drops the cadence): MC sends a
+// registration when the policy changes, when it programs a handler, and when
+// it re-publishes to a lagging handler. MH's per-meeting liveness and
+// applied-generation report is `MeetingHeartbeatRequest`.
 //
 // MEETING LIFECYCLE TEARDOWN IS A DISTINCT CONCERN WITH ITS OWN RPC
 // (`EndMeeting`, story 2 R-20). It changes no forwarding policy; it releases a
@@ -563,14 +567,33 @@ service MediaHandlerService {
 //
 // THIS MESSAGE IS THE CONTROL PLANE (ADR-0036 §8). It is a FULL SNAPSHOT, not a
 // delta: MH replaces its policy for this meeting wholesale, which is what makes
-// a re-assert idempotent and what makes restart recovery a re-send rather than
-// a reconciliation.
+// a re-send of the same snapshot idempotent rather than a reconciliation.
+//
+// TWO THINGS HAPPEN ON RECEIPT, AND THEY FAIL SEPARATELY (ADR-0039 §1):
+//   - The REGISTRATION RECORD (`mc_id`, `mc_grpc_endpoint`,
+//     `heartbeat_interval_ms`, `media_dial_public_key`) is upserted. A
+//     malformed record field -- an id failing validation,
+//     `heartbeat_interval_ms` 0, a `media_dial_public_key` that is not exactly
+//     32 bytes -- REJECTS THE WHOLE REQUEST BEFORE THE UPSERT: nothing is
+//     recorded and the prior record (key, interval, `mc_id`) stays in force.
+//   - The FORWARDING POLICY (everything else) is applied after, and
+//     independently of, the upsert. Its refusals (`ApplyRefusal`, stale,
+//     per-meeting bounds, transient) never roll the record back; the
+//     all-or-none rule is stated once, at
+//     `RegisterMeetingResponse.applied_generation`.
+// Record rejects are NOT apply refusals and never appear in `ApplyRefusal`.
+// INTERIM (enforcement owner: MH-2, which starts heartbeats at the upsert and
+// so must upsert before policy validation): until then, MH validates the whole
+// request, policy included, BEFORE the upsert, so ANY validation reject records
+// nothing and does not rebind `mc_id`. The interim is the stricter direction.
 //
 // NO KEY MATERIAL CROSSES THIS CONTRACT (ADR-0036 §4, Appendix). No KEK, no
 // transmit key, no key id, no wrapped material, ever. MH is keyless, and that is
 // a structural guard rather than a convention. The `connection_token` this
 // reshape deletes was the only credential this file ever carried; nothing
-// replaces it under another name.
+// replaces it under another name. The ONE `bytes` field on this contract is a
+// PUBLIC verification key, `media_dial_public_key` below; its comment is the
+// whole statement of why it is not key material.
 message RegisterMeetingRequest {
   string meeting_id = 1;
   string mc_id = 2;
@@ -687,8 +710,8 @@ message RegisterMeetingRequest {
   // send here. An entry for a sender never attached here is harmlessly held;
   // MH infers nothing about other handlers from what this list omits.
   //
-  // PART OF THE FULL SNAPSHOT: it rides every registration, so a mute survives
-  // a re-assert and an MH restart. It is swapped atomically with the rest of the
+  // PART OF THE FULL SNAPSHOT: it rides every registration, so a re-sent
+  // snapshot never drops a mute. It is swapped atomically with the rest of the
   // snapshot (all-edges-or-none, `RegisterMeetingResponse.applied_generation`),
   // so a failed or stale apply leaves the PRIOR list live. Any change to it,
   // a disposition included, IS an assignment-output change, and MC MUST advance
@@ -707,6 +730,51 @@ message RegisterMeetingRequest {
   // registration rejects as `rejected_transport_inconsistent`; an egress with
   // no candidate forwards nothing and applies. There is no fallback reading.
   repeated SourceStream source_streams = 8;
+
+  // The interval at which MH sends `MeetingHeartbeatRequest` for THIS meeting
+  // (ADR-0039 §1). DERIVED BY MC as one third of its single value
+  // `MC_MH_HEARTBEAT_TIMEOUT_MS` (mc-service config; default and range:
+  // ADR-0039 §1, held by MC's config and runbook, not restated here). MH HAS NO
+  // CADENCE CONFIG, so the two ends cannot drift: MH uses exactly this value.
+  //
+  // ZERO REJECTS THE REGISTRATION (a record reject; see the message header).
+  // Enforcement owner: MH-2.
+  //
+  // ORDERING: MH's rejection of 0 lands WITH or AFTER MC emitting a non-zero
+  // value (MC-B1) fleet-wide, NEVER BEFORE; rollback reverses (MH first). Out
+  // of order it rejects every registration -- the trap stated at
+  // `policy_generation`'s ORDERING CONSTRAINT.
+  //
+  // OBSERVABILITY: never a metric label.
+  uint32 heartbeat_interval_ms = 9;
+
+  // PUBLIC Ed25519 key, exactly 32 bytes, else the registration is rejected; populated only from the meeting's dial keypair; the private half never leaves MC's meeting actor; NOT media key material (ADR-0036 §4)
+  //
+  // The single entry in `dt-guard internal-proto-no-key-material`'s
+  // `ALLOWED_BYTES_FIELDS`. Never string-encoded to dodge that guard, and never
+  // in any JWKS. Populated by MC-D; verified against by MH-1. The length reject
+  // is a record reject (see the message header): the prior key stays in force.
+  //
+  // KEY SELECTION IS EXCLUSIVE (ADR-0039 §5). MH selects the verification key
+  // for a `media_dial` token ONLY by the token's `meeting_id` claim, from that
+  // meeting's current registration. The token's `kid`, `jwk` and `x5*` headers
+  // never select or supply a key, and a token for an unregistered meeting is
+  // DECLINED. An AC-signed token never verifies against this key, and a
+  // `media_dial` token never verifies against AC's keys.
+  //
+  // NOT AN OWNERSHIP OR AUTHORIZATION CONTROL. Each accepted registration
+  // replaces the meeting's key. MC never rotates it within a meeting actor, so
+  // a changed key means a new MC meeting actor. MH does not verify that the
+  // registrant owns the meeting, so a `service.write.mh` holder can replace the
+  // key (ADR-0039 residual; ciphertext-only impact; docs/TODO.md "MH does not
+  // verify meeting ownership").
+  //
+  // ORDERING: MH-1's length rejection lands WITH or AFTER MC-D populating this
+  // field fleet-wide, NEVER BEFORE; rollback reverses (MH first).
+  //
+  // OBSERVABILITY: never a metric label, span attribute or log field; only the
+  // key's presence or length may be logged.
+  bytes media_dial_public_key = 10;
 }
 
 // Response to meeting registration (ADR-0036 §8).
@@ -738,17 +806,28 @@ message RegisterMeetingResponse {
   // leaving the field.
   //
   // "REFLECTS" MEANS THE COMPLETE SNAPSHOT FOR THIS GENERATION IS INSTALLED.
-  // Apply is all-edges-or-none: any per-edge failure fails the whole apply and
-  // leaves the PRIOR generation live. A partial install is not a representable
-  // state, so this field is never a partial reflection. Stated rather than left
-  // to inference -- a strict reading of "actually reflects" already excludes a
-  // partial install (a partial reflection is not a reflection of N), but an
-  // inferred invariant is the kind that decays, and the failure it prevents is a
-  // forward path reflecting NEITHER N nor N-1 while the echo claims N. The
-  // concrete future is not someone ignoring the rule: it is someone with a good
-  // reason to change the apply shape -- incremental per-edge application is the
-  // obvious optimisation once meetings are large, and it is a PERFORMANCE change
-  // nobody would think to route past a correctness constraint.
+  // Apply is ALL-OR-NONE (ADR-0039 §1; this is the single statement of the
+  // invariant): an apply installs the meeting's complete new snapshot (edges,
+  // source-stream declarations, dispositions) in one atomic swap, or installs
+  // nothing. On EVERY refusal -- stale (lower than installed), every
+  // non-UNSPECIFIED `ApplyRefusal`, per-meeting bounds, and transient (mailbox
+  // full, timeout, actor unavailable) -- the previously installed snapshot
+  // KEEPS FORWARDING UNCHANGED, and `applied_generation` (this response AND
+  // `MeetingHeartbeatRequest.applied_generation`) keeps reporting that
+  // installed generation, or 0 if none was ever installed for this
+  // registration. An EQUAL generation is a no-op reported as applied. The
+  // registration record is upserted independently of the apply, and a refusal
+  // does not roll it back (`RegisterMeetingRequest` header). A partial install
+  // is not a representable state, so this field is never a partial reflection.
+  // Stated rather than left to inference -- a strict reading of "actually
+  // reflects" already excludes a partial install (a partial reflection is not a
+  // reflection of N), but an inferred invariant is the kind that decays, and
+  // the failure it prevents is a forward path reflecting NEITHER N nor N-1
+  // while the echo claims N. The concrete future is not someone ignoring the
+  // rule: it is someone with a good reason to change the apply shape --
+  // incremental per-edge application is the obvious optimisation once meetings
+  // are large, and it is a PERFORMANCE change nobody would think to route past
+  // a correctness constraint.
   //
   // A pending source does NOT hold this back; see
   // `SubscriberSlot.sender_id` for why per-edge liveness is the §6 slot state's
@@ -758,7 +837,7 @@ message RegisterMeetingResponse {
   // that has never successfully applied any policy for this meeting reports 0.
   // It is therefore ALSO what a pre-reshape MH's absent field decodes to, and
   // the two readings agree -- in both cases MC's correct action is identical (do
-  // not believe policy is live; re-assert). Valid applied values start at 1,
+  // not believe policy is live; re-register). Valid applied values start at 1,
   // matching `RegisterMeetingRequest.policy_generation`.
   //
   // OBSERVABILITY (ADR-0036 §11): not label material -- see
@@ -798,8 +877,10 @@ message RegisterMeetingResponse {
   // the same two-ends-must-agree treatment §8 gives transport mode. That catches
   // a misrouted or misconfigured handler registering as another.
   //
-  // OBSERVABILITY: acceptable as a metric label -- pod/handler level IS §11's
-  // stated aggregation floor.
+  // OBSERVABILITY: NEVER a metric label on MC or GC series (ADR-0039 §8):
+  // handler ids are per incarnation and replacement mints new ones, so the
+  // series set would grow without bound over MC uptime. Per-handler views come
+  // from the MH pod's own series. Log lines only.
   string handler_id = 3;
 
   // Unix epoch milliseconds at which THIS MH PROCESS started, so MC can detect a
@@ -872,8 +953,9 @@ message RegisterMeetingResponse {
 // `MH_MAX_TOTAL_EGRESS_EDGES` budget ratchets down with pod uptime. Different
 // callee, different purpose; neither substitutes for the other.
 //
-// NO GENERATION AND NO REASON FIELD, deliberately. Teardown is unconditional
-// by meeting id, so ordering is MC's obligation. BEFORE CALLING THIS, MC MUST
+// NO GENERATION FIELD, deliberately. `cause` is a release REASON, never an
+// ordering or authorization control: teardown stays unconditional by meeting
+// id, so ordering is MC's obligation. BEFORE CALLING THIS, MC MUST
 // QUIESCE EVERY `RegisterMeeting` PUSH FOR THE MEETING:
 //   (a) no new attempt starts -- including retries and backoff; and
 //   (b) every attempt already issued has RETURNED (with a response or an
@@ -887,10 +969,13 @@ message RegisterMeetingResponse {
 // before. Enforcement owner: the MC teardown task (per-meeting cancellation
 // plus a tracker of issued attempts, awaited before the call).
 //
-// THREE RACES, THREE DIFFERENT FATES. This paragraph once stated them as one
+// TWO RACES, TWO DIFFERENT FATES. This paragraph once stated them as one
 // accepted residual; story 2 task 12 closed the first and ordered the second,
 // so stating them together would now overstate the coverage in one direction
-// and understate the remaining obligation in the other.
+// and understate the remaining obligation in the other. (A third, a periodic
+// re-assert landing after this release, is moot: ADR-0039 §1 drops the
+// cadence, and a late registration on a handler MC has released is answered
+// RELEASED by `MeetingHeartbeatResponse`.)
 //
 //   (A) An attempt whose client-side deadline expired returned an error to MC,
 //       but its policy is still QUEUED on MH's config mailbox behind this
@@ -899,9 +984,7 @@ message RegisterMeetingResponse {
 //       so the queued apply finds nothing to install. Enforced in mh-service
 //       and unit-tested; the refusal is observable via MH's
 //       `mh_media_released_meeting_apply_refusals_total` counter. This check
-//       refuses APPLIES for an UNREGISTERED meeting and has no window: it is
-//       orthogonal to both fence options for (C), since a re-assert
-//       re-registers the meeting and passes it by design.
+//       refuses APPLIES for an UNREGISTERED meeting and has no window.
 //
 //   (B) An attempt still genuinely IN FLIGHT when MC's quiesce bound expires,
 //       whose upsert lands AFTER this release and re-registers the meeting.
@@ -916,13 +999,6 @@ message RegisterMeetingResponse {
 //       this tree would go red, and nothing observes it. Do not read (B) as
 //       closed.
 //
-//   (C) Story 4's periodic re-assert. STILL OPEN, and the fence is still
-//       REQUIRED: a re-assert is a fresh RegisterMeeting whose upsert
-//       re-registers the meeting, so (A)'s check passes it by construction and
-//       (B)'s ordering does not apply -- nothing is racing a deadline, the
-//       re-assert is simply due. Recorded in docs/TODO.md,
-//       "`EndMeeting` has no fence against a late `RegisterMeeting`".
-//
 // SEMANTICS (enforced by `MhMediaService::end_meeting` and the session actor's
 // release in crates/mh-service):
 //   - UNKNOWN OR ALREADY-RELEASED `meeting_id` -> idempotent no-op,
@@ -935,9 +1011,12 @@ message RegisterMeetingResponse {
 //     Forgetting the generation is required, not tidy: MC drops its own
 //     per-(meeting, handler) generations at teardown, so a meeting later
 //     re-created under the same id pushes from 1 again, and that must be a
-//     FRESH INSTALL, never "stale". Pending (provisional) connections are left
-//     to the existing registration timeout -- one may be a re-join racing the
-//     teardown, and the next registration rescues it. MH closing a connection
+//     FRESH INSTALL, never "stale". Pending (provisional) connections -- those
+//     still awaiting their bind -- follow `cause`: on `MEETING_ENDED` they are
+//     left to the bind outcome and the existing registration timeout (one may
+//     be a re-join racing the teardown, and the next registration rescues it);
+//     on a removal cause they are closed with `HANDLER_RELEASED` (ADR-0039
+//     §6), because the handler is leaving the meeting. MH closing a connection
 //     is NOT the client's meeting-ended signal; MC's signalling is. A client
 //     reconnecting afterwards is held pending like any other.
 //   - `mc_id` MISMATCH -> REJECTED with gRPC `FAILED_PRECONDITION`, counted by
@@ -945,16 +1024,22 @@ message RegisterMeetingResponse {
 //     `acknowledged: false` (ambiguous with the no-op): a different MC must
 //     never tear down another MC's meeting. Legitimate failover RE-REGISTERS
 //     FIRST (overwriting `mc_id`), then may release.
+//   - CALLER RETRY: a mismatch rejection MUST NOT be retried (it cannot
+//     succeed without a re-register). Transport failures are retried bounded,
+//     with backoff. MC teardown never blocks on the ack.
 //
 // `mc_id` IS SELF-ASSERTED AND IS NOT AN AUTHORIZATION CONTROL, in the same
 // register as `RegisterMeetingRequest.policy_generation`'s "NOT A SECURITY
 // TOKEN". It is compared against the `mc_id` of the most recent
-// VALIDATION-PASSING `RegisterMeeting` for this meeting (the value the caller
-// sent as `RegisterMeetingRequest.mc_id`) -- NOT gated on that registration's
-// generation outcome, or a failover MC re-registering at a generation <= the
-// applied one would leave the old `mc_id` in place and be unable to release,
-// stranding the meeting and leaking its budget. A registration rejected as
-// invalid does not rebind it. The check guards against a misrouted or stale MC.
+// RECORD-VALIDATION-PASSING `RegisterMeeting` for this meeting (the value the
+// caller sent as `RegisterMeetingRequest.mc_id`) -- NOT gated on that
+// registration's generation outcome, or a failover MC re-registering at a
+// generation <= the applied one would leave the old `mc_id` in place and be
+// unable to release, stranding the meeting and leaking its budget. A
+// registration whose RECORD is rejected does not rebind it; until MH-2 moves
+// policy validation after the upsert, ANY validation reject (policy included)
+// does not rebind it (`RegisterMeetingRequest` header, INTERIM). The check
+// guards against a misrouted or stale MC.
 // Nothing binds the caller's identity to `mc_id`; see the docs/TODO.md entry
 // "MH does not verify meeting ownership".
 //
@@ -971,16 +1056,6 @@ message RegisterMeetingResponse {
 // acks, wrong `mc_id` errors). The only uniform alternative is idempotent-accept
 // on mismatch, which is forbidden above.
 //
-// ROLLOUT (R-24). MH gains this RPC before any MC calls it; rollback reverses
-// (MC back first). An MC talking to a one-version-older MH gets UNIMPLEMENTED:
-// that is EXPECTED AND NON-FATAL -- MC counts it, does NOT retry it, and
-// teardown at MC and GC proceeds. The older MH keeps the meeting's state and
-// budget until it restarts (today's behaviour), and a same-id re-registration at
-// generation 1 reads as stale there until then -- surfacing as MC's
-// applied/sent mismatch. A mismatch rejection MUST NOT be retried (it cannot
-// succeed without a re-register). Transport failures are retried bounded, with
-// backoff. MC teardown never blocks on the ack.
-//
 // OPERATOR-VISIBLE SYMPTOM of an erroneous or misrouted release: every
 // participant of exactly one meeting is dropped at once, handler-side, with no
 // client-visible cause.
@@ -992,6 +1067,21 @@ message EndMeetingRequest {
   // MUST equal the `RegisterMeetingRequest.mc_id` this MC registered the
   // meeting with. Not a secret; see the comment above.
   string mc_id = 2;
+
+  // WHY this release happens (ADR-0039 §6). Valid values: see `ReleaseCause`
+  // (UNSPECIFIED is rejected here; enforcement owner: MH-2). It decides only
+  // the fate of connections still awaiting their bind (SEMANTICS above); it
+  // never conditions WHETHER MH releases. Its metric projection is
+  // `ReleaseCause`'s.
+  //
+  // Meeting teardown sends `MEETING_ENDED`; a handler removal (MC-B2) sends
+  // its removal trigger.
+  //
+  // ORDERING: MH-2's rejection of UNSPECIFIED lands WITH or AFTER an MC that
+  // sends a cause is fleet-wide, NEVER BEFORE; rollback reverses (MH first).
+  // Out of order, teardown is refused and the meeting's edge budget leaks until
+  // owner-silence release or an MH restart.
+  ReleaseCause cause = 3;
 }
 
 // Response to `EndMeeting`.
@@ -1418,4 +1508,212 @@ message NotifyParticipantDisconnectedRequest {
 // Response to participant disconnected notification
 message NotifyParticipantDisconnectedResponse {
   bool acknowledged = 1;
+}
+
+// ============================================================================
+// MH replacement contract (ADR-0039 §1, §2, §6): release vocabulary and the
+// per-(meeting, handler) heartbeat. The `rpc MeetingHeartbeat` line lands on
+// `MediaCoordinationService` with MC's server implementation (story 4 MC-B1);
+// a tonic server trait has no default methods, so the rpc cannot precede it.
+// ============================================================================
+
+// Why a handler stops serving a meeting (ADR-0039 §6, "One enum"). THE single
+// vocabulary for every carrier; no carrier keeps its own list.
+//
+// VALIDITY PER CARRIER, stated once here (carrier fields point at this):
+//   - `AcquireMediaHandlerRequest.trigger` (GC-3): UNSPECIFIED and
+//     MEETING_ENDED are `INVALID_ARGUMENT`.
+//   - `EndMeetingRequest.cause`: UNSPECIFIED is rejected.
+//   - `MeetingHeartbeatResponse.cause` on a RELEASED verdict: UNSPECIFIED is
+//     ONLY the documented misroute case (rules at that message).
+//
+// OBSERVABILITY: every service projects its `trigger` metric label from this
+// enum (compare `KindLabels::from_proto`); the label value is the lowercase
+// value suffix (`heartbeat_timeout`, `apply_lag`, `planned_transfer`,
+// `meeting_ended`). Which values a given series admits is owned by that
+// series' catalog entry (e.g. MH's release counter takes removal values only;
+// `meeting_ended` stays on its teardown counter). UNSPECIFIED is NEVER a
+// `trigger` value: a misroute is counted as MC's heartbeat outcome
+// `released_unassigned`. MH's owner-silence
+// release (`trigger="owner_silence"`) is DELIBERATELY OUTSIDE this enum -- an
+// MH-local decision that never crosses the wire -- so do not add an
+// OWNER_SILENCE value here
+// (docs/debates/2026-10-28-mh-replacement-and-migration/telemetry-contract.md).
+enum ReleaseCause {
+  RELEASE_CAUSE_UNSPECIFIED = 0;
+  // MC declared the handler Dead: no accepted heartbeat within its timeout.
+  RELEASE_CAUSE_HEARTBEAT_TIMEOUT = 1;
+  // MC declared the handler Impaired: applied generation lagging too long, or
+  // a load-dependent `ApplyRefusal`.
+  RELEASE_CAUSE_APPLY_LAG = 2;
+  // A deliberate move off a DRAINING handler (rolling upgrade, scale-down).
+  RELEASE_CAUSE_PLANNED_TRANSFER = 3;
+  // The meeting itself ended; not a handler removal.
+  RELEASE_CAUSE_MEETING_ENDED = 4;
+}
+
+// Whether the handler is accepting this meeting's work (ADR-0039 §1).
+// UNSPECIFIED (the proto3 default) is REJECTED by the receiver; it is never
+// read as SERVING. Enforcement owner: MC-B1.
+enum ServingState {
+  SERVING_STATE_UNSPECIFIED = 0;
+  SERVING_STATE_SERVING = 1;
+  // The handler is shutting down; `drain_remaining_ms` says how long it has.
+  SERVING_STATE_DRAINING = 2;
+}
+
+// MC's answer to one heartbeat (ADR-0039 §6). Named `HeartbeatVerdict`, not a
+// bare `Verdict`, because a package-scope enum must say what it is a verdict
+// on. It is NOT a metric outcome vocabulary: MC's
+// `mc_media_handler_heartbeats_total{outcome}` splits RELEASED by cause and
+// adds `owner_mismatch` (an error status, not a verdict); the consumer metric
+// owns its label set.
+enum HeartbeatVerdict {
+  // MALFORMED: a received UNSPECIFIED verdict is counted by MH and acted on in
+  // no way -- never read as OWNED, never as RELEASED. Enforcement owner: MH-2.
+  HEARTBEAT_VERDICT_UNSPECIFIED = 0;
+  // This handler is in the meeting's set. MH does nothing.
+  HEARTBEAT_VERDICT_OWNED = 1;
+  // "Not in my set": MH ends the meeting (see `MeetingHeartbeatResponse`).
+  HEARTBEAT_VERDICT_RELEASED = 2;
+}
+
+// MH's latest deterministic apply refusal for this (meeting, handler)
+// (ADR-0039 §1). A 1:1 projection of MH's deterministic refusals:
+// `PolicyApplyOutcome::RejectedInvalid`,
+// `PolicyApplyOutcome::RejectedTransportInconsistent`,
+// `PolicyApplyOutcome::RejectedStreamCeiling`
+// (crates/mh-service/src/observability/metrics.rs), and
+// `ApplyFailure::EdgeCapExceeded` inside `apply_failed`
+// (crates/mh-service/src/session/mod.rs). The projection's one code home is
+// MH's exhaustive match (MH-2), so a new refusal variant is a compile error
+// there, not a silent gap here.
+//
+// It reflects the LATEST apply and CLEARS on success. Transient failures
+// (mailbox full, timeout, actor unavailable) never appear here: they surface
+// as `applied_generation` lag. Record rejects (`RegisterMeetingRequest`
+// header) are not apply refusals and never appear here either.
+enum ApplyRefusal {
+  // NO REFUSAL. The one zero value on this contract that is NOT a reject: the
+  // latest apply succeeded (or nothing has been refused).
+  APPLY_REFUSAL_UNSPECIFIED = 0;
+  // MC contract fault: loud, no replacement.
+  APPLY_REFUSAL_INVALID = 1;
+  // MC contract fault: loud, no replacement.
+  APPLY_REFUSAL_TRANSPORT_INCONSISTENT = 2;
+  // Load-dependent: feeds MC's replace path.
+  APPLY_REFUSAL_STREAM_CEILING = 3;
+  // Load-dependent: feeds MC's replace path.
+  APPLY_REFUSAL_EDGE_CAP = 4;
+}
+
+// One heartbeat for one (meeting, handler), MH -> MC (ADR-0039 §1, §2, §6).
+//
+// DELIVERY. One unary heartbeat per (meeting, handler), to that meeting's MC
+// meeting actor. The interval is that meeting's
+// `RegisterMeetingRequest.heartbeat_interval_ms`. Heartbeats START AT THE
+// REGISTRATION UPSERT, not at the first successful apply: a meeting whose first
+// apply is refused reports `applied_generation` 0 plus its `apply_refusal`,
+// never silence. Each meeting's first send is jittered in [0, interval);
+// DRAINING resets every deadline to now. NOT RETRIED -- the next tick is the
+// retry -- and each attempt's deadline is shorter than the interval, so at
+// most one heartbeat per meeting is outstanding and they arrive in order.
+//
+// OWNER CHECK. `mc_id` is the meeting's REGISTERED MC. An MC that is not that
+// MC MUST answer `FAILED_PRECONDITION`, NEVER RELEASED; MH counts it and takes
+// no action. The check runs FIRST, before any verdict -- including the
+// router's no-meeting-actor answer -- so a heartbeat misrouted to another MC
+// can never end a live meeting. Enforcement owner: MC-B1.
+//
+// RECONCILE IS REMOVE-ONLY. A heartbeat MUST NEVER ADD connectivity: the
+// `sender_id` bind (`NotifyParticipantConnectedResponse`) is the only add path,
+// and MC never looks up an incoming id. MC walks its own live keys for this
+// (meeting, handler) and retires a key absent from `connection_ids` ONLY IF it
+// recorded that bind before the PREVIOUS heartbeat for this (meeting, handler)
+// arrived. Enforcement owner: MC-B1.
+//
+// NOT AN AUTHORIZATION CONTROL. This rides the plaintext, MC-unauthenticated
+// MH->MC channel (the S6 residual, docs/TODO.md §Media Path Obligations).
+// `handler_id` and `mc_id` are SELF-ASSERTED by the sending MH pod: another MH
+// pod can forge heartbeats for a dead handler and suppress failover (ADR-0039
+// S1b-extended residual, detected by
+// `mc_media_handler_client_loss_disagreements_total`). The owner check above
+// is anti-misroute, not authentication.
+//
+// OWNER-SILENCE RELEASE. MH never self-fences on short MC silence. MH ends a
+// meeting (sessions closed with `HANDLER_RELEASED`) after
+// `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS` (mh-service config; default and
+// range: ADR-0039 §6, held by MH's config and runbook, not restated here) with
+// no communication from its owning MC. Communication means a `RegisterMeeting`
+// that passes record validation or an `EndMeeting` that MH accepts, from that
+// MC, or a heartbeat answered with a verdict by it; a request MH rejects,
+// errors, and `FAILED_PRECONDITION` do not count. MC ids are per process. This
+// is NOT an MC-failover mechanism. Enforcement owner: MH-3.
+// ORDERING: MC gains `MeetingHeartbeat` before any MH heartbeats; rollback
+// reverses (MH first). An MH whose heartbeats are answered `UNIMPLEMENTED` is
+// facing a deploy-order fault, not owner silence (whether MH exempts it is
+// MH-3's decision).
+//
+// SIZE AND VALIDATION. Size is bounded by the per-meeting caps MC already
+// enforces. Ids and counts are validated with the `validate_id_field` pattern
+// (crates/mc-service/src/grpc/media_coordination.rs).
+//
+// OBSERVABILITY: `meeting_id`, `mc_id`, `handler_id`, `connection_ids`,
+// `applied_generation` and `drain_remaining_ms` values are NEVER metric labels.
+// Ids go in log lines only, and heartbeats are logged on state transitions
+// only, never per heartbeat. The bounded enums MAY back bounded labels; each
+// consumer metric owns its own label set.
+message MeetingHeartbeatRequest {
+  string meeting_id = 1;
+  // The meeting's registered MC (see OWNER CHECK above).
+  string mc_id = 2;
+  string handler_id = 3;
+  // UNSPECIFIED is rejected (`ServingState`).
+  ServingState serving_state = 4;
+  // Set IFF `serving_state` is DRAINING: milliseconds of drain grace left,
+  // RELATIVE (so no clock skew). MH's grace period is the only copy of the
+  // value; this is a report of it, never a second configuration.
+  uint32 drain_remaining_ms = 5;
+  // REFERENCES `RegisterMeetingResponse.applied_generation` (what it means,
+  // all-or-none, 0 = nothing installed) and does not restate it.
+  // Heartbeat-only rule: an entry whose value is LOWER than the last accepted
+  // one for this (meeting, handler) is LAG, never liveness -- so a stale or
+  // reordered (lower-generation) heartbeat cannot read as fresh. This is NOT
+  // replay protection: an equal-generation replay or a forged heartbeat reads
+  // as live (see NOT AN AUTHORIZATION CONTROL above).
+  uint64 applied_generation = 6;
+  // Latest deterministic apply refusal; UNSPECIFIED = none (`ApplyRefusal`).
+  ApplyRefusal apply_refusal = 7;
+  // The connection ids for which MH has BEGUN `NotifyParticipantConnected` and
+  // not yet sent `NotifyParticipantDisconnected` -- a superset that includes
+  // in-flight binds, which is safe for the remove-only reconcile above. Empty
+  // means "MH holds none for this meeting". Same opaque values as
+  // `NotifyParticipantConnectedRequest.connection_id`.
+  repeated string connection_ids = 8;
+}
+
+// MC's verdict on one heartbeat (ADR-0039 §6).
+//
+// OWNED does nothing. RELEASED means "this handler is not in my set": MH ends
+// the meeting through the `EndMeeting` release path, closing its sessions with
+// `HANDLER_RELEASED` and sending NO `NotifyParticipantDisconnected`. This is
+// the retry for a lost `EndMeeting`: a zombie handler is exactly the one an
+// `EndMeeting` cannot reach. Enforcement owner: MH-2.
+//
+// CAUSE RULES ON RELEASED (valid values otherwise: `ReleaseCause`):
+//   - a handler MC removed from the meeting gets its removal trigger;
+//   - a heartbeat whose `mc_id` is this MC, for a meeting with no MC meeting
+//     actor, gets `MEETING_ENDED`, answered by MC's router (no tombstone);
+//   - a live meeting whose set never held this handler gets UNSPECIFIED -- a
+//     misroute, counted.
+// On OWNED, `cause` is unset.
+//
+// TRUST: MH acts on this verdict because of WHERE it came from, not because it
+// is authenticated. MH does not authenticate MC (S6, docs/TODO.md §Media Path
+// Obligations), so whatever answers at the registered `mc_grpc_endpoint` can
+// return RELEASED and end this meeting on this MH. Network policy is the only
+// control today.
+message MeetingHeartbeatResponse {
+  HeartbeatVerdict verdict = 1;
+  ReleaseCause cause = 2;
 }

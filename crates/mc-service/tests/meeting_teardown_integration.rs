@@ -23,6 +23,7 @@ use common::observability::testing::MetricAssertion;
 use mc_service::grpc::{MhClient, MhRegistrationClient};
 use mc_service::redis::{MhAssignmentStore, MhEndpointInfo};
 use mc_test_utils::mock_mh::{MediaHandlerStub, MediaHandlerStubHandle, StubEvent};
+use proto_gen::dark_tower::internal::v1::ReleaseCause;
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::media_session::{audio_slots, capability_frame, join_as};
 use test_common::{
@@ -199,11 +200,13 @@ async fn an_ownership_rejection_is_counted_and_not_retried() {
     // The teardown's COMPLETION (GC being told) is the signal that no further
     // attempt will follow — no timed wait for an absence.
     notifier.wait_for(1, Duration::from_secs(10)).await;
-    assert_eq!(
-        stub.end_meeting_requests().len(),
-        1,
-        "a mismatch is never retried"
-    );
+    let sent = stub.end_meeting_requests();
+    assert_eq!(sent.len(), 1, "a mismatch is never retried");
+    // The cause MC puts on the wire for a meeting teardown is MEETING_ENDED,
+    // never the proto3 default UNSPECIFIED that MH-2 will reject
+    // (`EndMeetingRequest.cause`): pinned through the real client, not only
+    // in the plan.
+    assert_eq!(sent[0].cause, ReleaseCause::MeetingEnded as i32);
     snap.counter("mc_media_end_meeting_total")
         .with_labels(&[
             ("outcome", "rejected_ownership"),

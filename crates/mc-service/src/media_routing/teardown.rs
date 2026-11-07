@@ -46,13 +46,15 @@
 //!
 //! # No key material
 //!
-//! A release carries a meeting id and an MC id. Nothing else.
+//! A release carries a meeting id, an MC id and a [`ReleaseCause`]. Nothing
+//! else.
 
 use super::generation::PolicyGenerations;
 use super::placement::MeetingHandlers;
 use crate::grpc::mh_client::{MH_CONNECT_TIMEOUT, MH_RPC_TIMEOUT};
 use crate::grpc::MhRegistrationClient;
 use crate::observability::metrics;
+use proto_gen::dark_tower::internal::v1::ReleaseCause;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -352,6 +354,10 @@ pub struct EndMeetingCall {
     pub meeting_id: String,
     /// The `mc_id` this MC registered the meeting with.
     pub mc_id: String,
+    /// Why this release happens (`EndMeetingRequest.cause`). Set where the plan
+    /// is built, never at the transport: [`end_meeting_plan`] is meeting
+    /// teardown, so it is always [`ReleaseCause::MeetingEnded`].
+    pub cause: ReleaseCause,
 }
 
 /// The pure teardown decision: which calls, to whom, carrying what.
@@ -364,6 +370,8 @@ pub struct EndMeetingCall {
 ///   field every `PushTarget.mc_id` reads — never re-derived here. A mismatch is
 ///   rejected by MH by design.
 /// - Requires a [`Quiesced`], so no plan exists while pushes might be issuing.
+/// - Every call carries [`ReleaseCause::MeetingEnded`]: this plan is the
+///   meeting ending, never a handler removal.
 #[must_use]
 pub fn end_meeting_plan(
     meeting_id: &str,
@@ -378,6 +386,7 @@ pub fn end_meeting_plan(
             mh_grpc_endpoint: h.grpc_endpoint.clone(),
             meeting_id: meeting_id.to_string(),
             mc_id: mc_id.to_string(),
+            cause: ReleaseCause::MeetingEnded,
         })
         .collect()
 }
@@ -719,16 +728,19 @@ mod tests {
                     mh_grpc_endpoint: "http://mh-0.example:50053".to_string(),
                     meeting_id: "meeting-7".to_string(),
                     mc_id: "mc-self".to_string(),
+                    cause: ReleaseCause::MeetingEnded,
                 },
                 EndMeetingCall {
                     handler_id: "mh-1".to_string(),
                     mh_grpc_endpoint: "http://mh-1.example:50053".to_string(),
                     meeting_id: "meeting-7".to_string(),
                     mc_id: "mc-self".to_string(),
+                    cause: ReleaseCause::MeetingEnded,
                 },
             ],
             "EVERY handler in the frozen set, none extra, none missing, each carrying this \
-             MC's own id and the meeting being released"
+             MC's own id, the meeting being released, and MEETING_ENDED (never UNSPECIFIED, \
+             which MH rejects)"
         );
     }
 

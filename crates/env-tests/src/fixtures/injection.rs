@@ -18,7 +18,7 @@ use crate::fixtures::PrometheusClient;
 use proto_gen::dark_tower::internal::v1::media_handler_service_client::MediaHandlerServiceClient;
 use proto_gen::dark_tower::internal::v1::{
     CandidateSource, EgressStream, EndMeetingRequest, RegisterMeetingRequest,
-    RegisterMeetingResponse, SourceDisposition, SourceStream, SubscriberSlot,
+    RegisterMeetingResponse, ReleaseCause, SourceDisposition, SourceStream, SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 
@@ -215,6 +215,8 @@ impl<'a> Injection<'a> {
             selection_rules: None,
             policy_generation: generation,
             source_streams: sources,
+            heartbeat_interval_ms: 0,
+            media_dial_public_key: Vec::new(),
         };
         self.client
             .register_meeting(mh_grpc::authed(self.token, request))
@@ -247,6 +249,8 @@ impl<'a> Injection<'a> {
             selection_rules: None,
             policy_generation: generation,
             source_streams: sources,
+            heartbeat_interval_ms: 0,
+            media_dial_public_key: Vec::new(),
         };
         match self
             .client
@@ -308,6 +312,7 @@ impl<'a> Injection<'a> {
                 EndMeetingRequest {
                     meeting_id: self.meeting_id.clone(),
                     mc_id: self.mc_id.clone(),
+                    cause: ReleaseCause::MeetingEnded as i32,
                 },
             ))
             .await

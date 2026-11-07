@@ -121,7 +121,14 @@ const ALLOWED_BYTES_FIELDS_AT: (&str, u32) = (file!(), line!() + 1 + 9);
 /// fail-loud validation of every entry) are @infrastructure MACHINERY.
 /// NEVER string-encode a key (base64 in a `string`, hex, ...) to dodge this
 /// guard: that is the same key material in a costume (ADR-0039 §5).
-pub const ALLOWED_BYTES_FIELDS: &[AllowedBytesField] = &[];
+pub const ALLOWED_BYTES_FIELDS: &[AllowedBytesField] = &[
+    // ADR-0039 §5: the meeting's PUBLIC Ed25519 `media_dial` verification key.
+    // @security-reviewed content (story 4 P1); the only entry.
+    AllowedBytesField {
+        message: "dark_tower.internal.v1.RegisterMeetingRequest",
+        field: "media_dial_public_key",
+    },
+];
 // -----------------------------------------------------------------------------
 
 /// One [`ALLOWED_BYTES_FIELDS`] entry.
@@ -671,13 +678,18 @@ mod tests {
         (real(INTERNAL_PROTO), real(SIGNALING_PROTO))
     }
 
-    /// Insert `decl` right after the last pre-existing field of
-    /// `RegisterMeetingRequest` (the bash `plant_field`). Returns the 1-based
+    /// Insert `decl` inside `RegisterMeetingRequest`, right after its
+    /// `source_streams` field (the bash `plant_field`). Returns the 1-based
     /// line the planted text starts on.
     fn plant(internal: &str, decl: &str) -> (String, usize) {
+        plant_after(internal, ANCHOR, decl)
+    }
+
+    /// [`plant`] after an explicit `anchor` line.
+    fn plant_after(internal: &str, anchor: &str, decl: &str) -> (String, usize) {
         let at = internal
             .lines()
-            .position(|l| l == ANCHOR)
+            .position(|l| l == anchor)
             .expect("precondition: anchor present in internal.proto");
         let mut lines: Vec<&str> = internal.lines().collect();
         lines.insert(at + 1, decl);
@@ -715,6 +727,10 @@ mod tests {
         let s = read_optional(&root, SIGNALING_PROTO).unwrap();
         let r = eval(i.as_deref(), s.as_deref());
         assert!(r.findings.is_empty(), "{:?}", r.findings);
+        assert_eq!(
+            r.key_allowlist_entries, 1,
+            "the shipped entry was validated, not vacuously absent"
+        );
         assert!(r.statements > 0 && r.headers > 0, "{r:?}");
         assert_eq!(r.imports, 1);
         assert!(r.refs > 0, "the canonical TransportMode refs are SEEN");
@@ -1049,6 +1065,7 @@ mod tests {
     };
     const LISTED: &str = "  bytes listed = 90;";
 
+    /// Evaluate `internal` with EXACTLY `list` -- no shipped entry implied.
     fn eval_with(internal: &str, list: &[AllowedBytesField]) -> Report {
         let (_, s) = tree();
         check_with(
@@ -1059,6 +1076,15 @@ mod tests {
             ALLOWED_IMPORTS,
             list,
         )
+    }
+
+    /// Evaluate with the SHIPPED list plus `extra`, as production would see a
+    /// tree carrying both. The real tree declares the shipped field, so the
+    /// construct fixtures below (which plant `listed` beside it) use this to
+    /// keep the real field exempt and their expected findings exact; the
+    /// shipped entry adds 1 to every `key_allowlist_entries`.
+    fn eval_shipped_plus(internal: &str, extra: &[AllowedBytesField]) -> Report {
+        eval_with(internal, &[ALLOWED_BYTES_FIELDS, extra].concat())
     }
 
     fn bytes_red(line: usize, subject: &str) -> Finding {
@@ -1086,12 +1112,105 @@ mod tests {
     }
 
     /// The membership pin (@security S7, Lead ruling): the shipped list is
-    /// reviewed CONTENT. P1 replaces this with an exact `assert_eq!` on its
-    /// one (message, field) pair, so the entry arrives as a deliberate,
-    /// security-reviewed test diff, never only as a const edit.
+    /// reviewed CONTENT, pinned here as a written-out literal (never a shared
+    /// const), so any change to the membership arrives as a deliberate,
+    /// security-reviewed test diff, never only as a const edit. The one entry
+    /// is ADR-0039 §5's public `media_dial` verification key (story 4 P1).
     #[test]
     fn shipped_key_allowlist_is_reviewed_content() {
-        assert_eq!(ALLOWED_BYTES_FIELDS, &[] as &[AllowedBytesField]);
+        assert_eq!(
+            ALLOWED_BYTES_FIELDS,
+            &[AllowedBytesField {
+                message: "dark_tower.internal.v1.RegisterMeetingRequest",
+                field: "media_dial_public_key",
+            }]
+        );
+    }
+
+    // ---- the SHIPPED list against the REAL internal.proto -----------------
+
+    /// The real field's declaration, exactly as internal.proto carries it.
+    const REAL_KEY_DECL: &str = "  bytes media_dial_public_key = 10;";
+
+    /// The real tree with `REAL_KEY_DECL` replaced by `with`, after asserting
+    /// the original line is present exactly once (a reformat of the field
+    /// fails loudly here instead of making the mutation a silent no-op).
+    fn real_with_key_decl(with: &str) -> (String, usize) {
+        let (i, _) = tree();
+        assert_eq!(
+            i.lines().filter(|l| *l == REAL_KEY_DECL).count(),
+            1,
+            "precondition: the real declaration is present exactly once"
+        );
+        let line = line_of(&i, REAL_KEY_DECL);
+        let mutated = i.replacen(REAL_KEY_DECL, with, 1);
+        assert_ne!(mutated, i, "precondition: mutation applied");
+        (mutated, line)
+    }
+
+    /// The non-vacuity pair for `the_real_tree_is_clean_and_non_vacuous`: the
+    /// SAME real tree with an EMPTY list reds exactly once, at the real
+    /// field. So the shipped entry is what makes it green, and the field
+    /// really is a plain `bytes` declaration the guard sees.
+    #[test]
+    fn the_real_tree_with_an_empty_list_reds_exactly_at_the_key_field() {
+        let (i, _) = tree();
+        let r = eval_with(&i, &[]);
+        assert_eq!(
+            r.findings,
+            vec![bytes_red(
+                line_of(&i, REAL_KEY_DECL),
+                "bytes media_dial_public_key = 10"
+            )]
+        );
+        assert_eq!(r.key_allowlist_entries, 0);
+    }
+
+    /// Positive control on the real tree with the shipped list: a SECOND
+    /// `bytes` field in the listed message reds `internal-proto-bytes-field`,
+    /// and only it.
+    #[test]
+    fn a_second_bytes_field_beside_the_real_key_reds() {
+        let (i, line) = plant_after(&tree().0, REAL_KEY_DECL, "  bytes extra_key = 11;");
+        let r = eval_with(&i, ALLOWED_BYTES_FIELDS);
+        assert_eq!(r.findings, vec![bytes_red(line, "bytes extra_key = 11")]);
+        assert_eq!(r.findings[0].rule.id(), "internal-proto-bytes-field");
+    }
+
+    /// Renaming the real field leaves the shipped entry naming nothing:
+    /// `field-not-found`, ranked first, plus the renamed field's own red.
+    #[test]
+    fn renaming_the_real_key_field_invalidates_the_shipped_entry() {
+        let (i, line) = real_with_key_decl("  bytes media_dial_pub_key = 10;");
+        let r = eval_with(&i, ALLOWED_BYTES_FIELDS);
+        assert_eq!(
+            r.findings,
+            vec![
+                invalid(0, &ALLOWED_BYTES_FIELDS[0], "field-not-found"),
+                bytes_red(line, "bytes media_dial_pub_key = 10"),
+            ]
+        );
+        assert_eq!(
+            r.findings[0].rule.id(),
+            "internal-proto-key-allowlist-invalid"
+        );
+    }
+
+    /// Retyping the real field (here to `string`, the "string-encode it"
+    /// dodge) leaves the entry resolving to a non-`bytes` declaration:
+    /// `non-plain-bytes`, at the declaration.
+    #[test]
+    fn retyping_the_real_key_field_invalidates_the_shipped_entry() {
+        let (i, line) = real_with_key_decl("  string media_dial_public_key = 10;");
+        let r = eval_with(&i, ALLOWED_BYTES_FIELDS);
+        assert_eq!(
+            r.findings,
+            vec![invalid(line, &ALLOWED_BYTES_FIELDS[0], "non-plain-bytes")]
+        );
+        assert_eq!(
+            r.findings[0].rule.id(),
+            "internal-proto-key-allowlist-invalid"
+        );
     }
 
     /// Positive arm and its paired negative on ONE planted tree: the list,
@@ -1100,12 +1219,12 @@ mod tests {
     fn a_listed_bytes_field_passes_and_the_same_tree_unlisted_reds() {
         let (i, _) = tree();
         let (i, line) = plant(&i, LISTED);
-        let r = eval_with(&i, &[ENTRY]);
+        let r = eval_shipped_plus(&i, &[ENTRY]);
         assert!(r.findings.is_empty(), "{:?}", r.findings);
-        assert_eq!(r.key_allowlist_entries, 1);
-        let r = eval_with(&i, &[]);
+        assert_eq!(r.key_allowlist_entries, 2);
+        let r = eval_shipped_plus(&i, &[]);
         assert_eq!(r.findings, vec![bytes_red(line, "bytes listed = 90")]);
-        assert_eq!(r.key_allowlist_entries, 0);
+        assert_eq!(r.key_allowlist_entries, 1);
     }
 
     /// The same field name elsewhere stays red: a different top-level
@@ -1155,7 +1274,7 @@ mod tests {
                 .next()
                 .expect("precondition: planted line");
             assert_eq!(
-                eval_with(i, &[ENTRY]).findings,
+                eval_shipped_plus(i, &[ENTRY]).findings,
                 vec![bytes_red(line, subject)],
                 "{label}"
             );
@@ -1183,7 +1302,7 @@ mod tests {
                 field: "listed",
             };
             assert_eq!(
-                eval_with(&i, &[e]).findings,
+                eval_shipped_plus(&i, &[e]).findings,
                 vec![
                     invalid(0, &e, "message-not-found"),
                     bytes_red(line, "bytes listed = 90")
@@ -1199,7 +1318,7 @@ mod tests {
     fn a_renamed_or_deleted_listed_field_is_invalid() {
         let (i, _) = tree();
         let (renamed, line) = plant(&i, "  bytes listed_v2 = 90;");
-        let r = eval_with(&renamed, &[ENTRY]);
+        let r = eval_shipped_plus(&renamed, &[ENTRY]);
         assert_eq!(
             r.findings,
             vec![
@@ -1215,7 +1334,7 @@ mod tests {
         assert_eq!(first, Some(Rule::KeyAllowlistInvalid));
         // Deleted: an otherwise clean tree reds ONLY on the entry.
         assert_eq!(
-            eval_with(&i, &[ENTRY]).findings,
+            eval_shipped_plus(&i, &[ENTRY]).findings,
             vec![invalid(0, &ENTRY, "field-not-found")]
         );
     }
@@ -1272,7 +1391,7 @@ mod tests {
                     subject: r.into(),
                 });
             }
-            assert_eq!(eval_with(&i, &[ENTRY]).findings, want, "{decl}");
+            assert_eq!(eval_shipped_plus(&i, &[ENTRY]).findings, want, "{decl}");
         }
     }
 
@@ -1284,7 +1403,7 @@ mod tests {
         let (i, _) = tree();
         let (oneof, at) = plant(&i, "  oneof choice {\n    bytes listed = 90;\n  }");
         assert_eq!(
-            eval_with(&oneof, &[ENTRY]).findings,
+            eval_shipped_plus(&oneof, &[ENTRY]).findings,
             vec![
                 invalid(at + 1, &ENTRY, "non-plain-bytes"),
                 bytes_red(at + 1, "bytes listed = 90")
@@ -1292,14 +1411,14 @@ mod tests {
         );
         let (extend, at) = plant(&i, "  extend Foo {\n    bytes listed = 100;\n  }");
         assert_eq!(
-            eval_with(&extend, &[ENTRY]).findings,
+            eval_shipped_plus(&extend, &[ENTRY]).findings,
             vec![
                 invalid(0, &ENTRY, "field-not-found"),
                 bytes_red(at + 1, "bytes listed = 100")
             ]
         );
         let (direct, _) = plant(&i, LISTED);
-        assert!(eval_with(&direct, &[ENTRY]).findings.is_empty());
+        assert!(eval_shipped_plus(&direct, &[ENTRY]).findings.is_empty());
     }
 
     /// Token equality, not substrings (S3): prefix/suffix names red, and the
@@ -1313,7 +1432,7 @@ mod tests {
             "  bytes listed = 90; bytes other = 93;\n  bytes listed_v2 = 91;\n  bytes x_listed = 92;",
         );
         assert_eq!(
-            eval_with(&i, &[ENTRY]).findings,
+            eval_shipped_plus(&i, &[ENTRY]).findings,
             vec![
                 bytes_red(line, "bytes other = 93"),
                 bytes_red(line + 1, "bytes listed_v2 = 91"),
@@ -1330,7 +1449,7 @@ mod tests {
         let (i, _) = tree();
         let (dup, line) = plant(&i, "  bytes listed = 90;\n  bytes listed = 91;");
         assert_eq!(
-            eval_with(&dup, &[ENTRY]).findings,
+            eval_shipped_plus(&dup, &[ENTRY]).findings,
             vec![
                 invalid(line, &ENTRY, "duplicate-declaration"),
                 bytes_red(line, "bytes listed = 90"),
@@ -1339,7 +1458,7 @@ mod tests {
         );
         let (one, _) = plant(&i, LISTED);
         assert_eq!(
-            eval_with(&one, &[ENTRY, ENTRY]).findings,
+            eval_shipped_plus(&one, &[ENTRY, ENTRY]).findings,
             vec![invalid(0, &ENTRY, "duplicate-entry")]
         );
     }
@@ -1353,14 +1472,14 @@ mod tests {
             message: "dark_tower.internal.v1.NoSuchMessage",
             field: "k",
         };
-        let r = eval_with(&i, &[ENTRY, stale]);
+        let r = eval_shipped_plus(&i, &[ENTRY, stale]);
         assert_eq!(r.findings, vec![invalid(0, &stale, "message-not-found")]);
         // Both components named, on the finding the GUARD returned.
         assert!(
             r.findings[0].subject.contains(stale.message)
                 && r.findings[0].subject.contains(stale.field)
         );
-        assert_eq!(r.key_allowlist_entries, 2);
+        assert_eq!(r.key_allowlist_entries, 3);
     }
 
     /// Only check 1 consults the list (S5): check 2 still reds in the listed
@@ -1374,7 +1493,7 @@ mod tests {
             "  bytes listed = 90;\n  dark_tower.signaling.v1.MeetingKekUpdate u = 91;\n  bytes k = 92; // guard:ignore(needed)",
         );
         assert_eq!(
-            eval_with(&i, &[ENTRY]).findings,
+            eval_shipped_plus(&i, &[ENTRY]).findings,
             vec![
                 Finding {
                     rule: Rule::CrossPackageType,
@@ -1395,7 +1514,7 @@ mod tests {
         );
         let hl = line_of(&header, probe);
         assert_eq!(
-            eval_with(&header, &[ENTRY]).findings,
+            eval_shipped_plus(&header, &[ENTRY]).findings,
             vec![
                 bytes_red(
                     hl,
@@ -1434,12 +1553,15 @@ mod tests {
             let i = format!("{base}{decl}\n");
             let line = line_of(&i, decl);
             assert_eq!(
-                eval_with(&i, &[e]).findings,
+                eval_shipped_plus(&i, &[e]).findings,
                 vec![bytes_red(line, &format!("bytes {field} = 1"))],
                 "{decl}"
             );
             let only = format!("{base}{alone}\n");
-            assert!(eval_with(&only, &[e]).findings.is_empty(), "{alone}");
+            assert!(
+                eval_shipped_plus(&only, &[e]).findings.is_empty(),
+                "{alone}"
+            );
         }
     }
 
@@ -1450,12 +1572,15 @@ mod tests {
     /// (`a_listed_bytes_field_passes_and_the_same_tree_unlisted_reds`).
     #[test]
     fn an_identical_same_line_declaration_elsewhere_stays_red() {
-        let (i, line) = plant(
+        // Planted after the message's LAST field, so the early `}` closes
+        // `RegisterMeetingRequest` with every real field still inside it.
+        let (i, line) = plant_after(
             &tree().0,
+            REAL_KEY_DECL,
             "  bytes listed = 90; } message Evil { bytes listed = 90;",
         );
         assert_eq!(
-            eval_with(&i, &[ENTRY]).findings,
+            eval_shipped_plus(&i, &[ENTRY]).findings,
             vec![bytes_red(line, "bytes listed = 90")]
         );
     }
@@ -1474,7 +1599,7 @@ mod tests {
             field: "listed",
         };
         let subject = |src: &str, list: &[AllowedBytesField]| {
-            eval_with(src, list)
+            eval_shipped_plus(src, list)
                 .findings
                 .into_iter()
                 .find(|f| f.rule == Rule::KeyAllowlistInvalid)
@@ -1508,7 +1633,7 @@ mod tests {
     #[test]
     fn invalid_entry_location_points_at_the_const_or_the_declaration() {
         let (i, _) = tree();
-        let r = eval_with(&i, &[ENTRY]);
+        let r = eval_shipped_plus(&i, &[ENTRY]);
         let (file, line) = location(&r.findings[0]);
         assert_eq!(file, file!());
         let src = real("crates/dt-guard/src/internal_proto_no_key_material.rs");
@@ -1519,10 +1644,10 @@ mod tests {
             "the location is the const's own first line"
         );
         let (string, at) = plant(&i, "  string listed = 90;");
-        let r = eval_with(&string, &[ENTRY]);
+        let r = eval_shipped_plus(&string, &[ENTRY]);
         assert_eq!(location(&r.findings[0]), (INTERNAL_PROTO, at));
         let (bytes, at) = plant(&i, "  bytes k = 90;");
-        let r = eval_with(&bytes, &[]);
+        let r = eval_shipped_plus(&bytes, &[]);
         assert_eq!(location(&r.findings[0]), (INTERNAL_PROTO, at));
     }
 

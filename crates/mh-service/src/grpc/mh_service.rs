@@ -523,7 +523,7 @@ mod tests {
     // One fixture home for all three test sites that build these messages —
     // see `mh_test_utils::media_policy` for why.
     use mh_test_utils::media_policy::{egress, register_request};
-    use proto_gen::dark_tower::internal::v1::{CandidateSource, EgressStream};
+    use proto_gen::dark_tower::internal::v1::{CandidateSource, EgressStream, ReleaseCause};
     use proto_gen::dark_tower::signaling::v1::TransportMode;
 
     use std::sync::Arc;
@@ -588,6 +588,8 @@ mod tests {
             selection_rules: None,
             policy_generation: 0,
             source_streams: Vec::new(),
+            heartbeat_interval_ms: 0,
+            media_dial_public_key: Vec::new(),
         })
     }
 
@@ -607,6 +609,7 @@ mod tests {
         Request::new(EndMeetingRequest {
             meeting_id: meeting_id.to_string(),
             mc_id: mc_id.to_string(),
+            cause: ReleaseCause::MeetingEnded as i32,
         })
     }
 

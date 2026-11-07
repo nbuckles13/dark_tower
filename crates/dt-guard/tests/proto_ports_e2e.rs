@@ -98,6 +98,28 @@ fn a_bytes_field_fails_with_its_token() {
     );
 }
 
+/// Through the binary: renaming the one allow-listed key field (ADR-0039 §5)
+/// leaves the shipped entry naming nothing, and the guard's REASON is the
+/// allow-list token (it outranks the renamed field's own bytes red).
+#[test]
+fn a_renamed_allowlisted_key_field_fails_with_the_allowlist_token() {
+    const DECL: &str = "  bytes media_dial_public_key = 10;";
+    let real = std::fs::read_to_string(repo_root().join(INTERNAL)).unwrap();
+    assert_eq!(
+        real.lines().filter(|l| *l == DECL).count(),
+        1,
+        "precondition: the real declaration is present exactly once"
+    );
+    let dir = tree(|s| s.replacen(DECL, "  bytes media_dial_pub_key = 10;", 1));
+    let (ok, out) = run_guard("internal-proto-no-key-material", dir.path());
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("STATUS=FAIL REASON=internal-proto-key-allowlist-invalid"),
+        "{out}"
+    );
+    assert!(out.contains("field-not-found"), "{out}");
+}
+
 #[test]
 fn a_tree_without_protos_is_vacuous_for_both() {
     let dir = tempfile::tempdir().unwrap();

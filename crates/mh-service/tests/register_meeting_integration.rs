@@ -58,6 +58,8 @@ fn authed_request(
         selection_rules: None,
         policy_generation: 0,
         source_streams: Vec::new(),
+        heartbeat_interval_ms: 0,
+        media_dial_public_key: Vec::new(),
     });
     let value: MetadataValue<_> = format!("Bearer {token}")
         .parse()
