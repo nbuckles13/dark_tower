@@ -1093,7 +1093,7 @@ tasks:
   slug: 2026-11-06-env-test-mh-discovery-by-label
   tag: story-2026-10-31-survive-handler-loss-task-T-0
 - id: 5
-  status: pending
+  status: completed
   specialist: protocol
   deps:
   - 2
@@ -1173,6 +1173,7 @@ tasks:
     (c) No series are emitted here.
     (d) Test-gates Protocol section, as above.
     (e) Label hygiene: every comment that names an id states it is never a label.
+  slug: 2026-11-06-story4-internal-contract-p1
   tag: story-2026-10-31-survive-handler-loss-task-P1
 - id: 6
   status: pending
