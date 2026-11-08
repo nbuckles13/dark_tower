@@ -8,8 +8,8 @@
 //!    `-n dark-tower`".)
 //! 2. Story 2/3 configuration surface (story 2 R-19, R-22, R-23, R-24; story 3
 //!    R-21, R-23): MH's egress-budget chain, §8 policy keys, story-3 stream
-//!    keys and shared media-codec-profile keys are wired into BOTH
-//!    instances, carry parseable values that satisfy the relationships MH
+//!    keys and shared media-codec-profile keys are wired into the ONE MH
+//!    pool template and EVERY live MH pod, carry parseable values that satisfy the relationships MH
 //!    boot-checks, are what the running process actually loaded (where MH
 //!    publishes them), and — on Kind — size a stream ceiling inside the Kind
 //!    window and run the committed Kind test codec profile. Retiring keys are
@@ -22,6 +22,10 @@
 //!
 //! - side (a) `.spec.containers[name=mh-service].env[name=MH_TERMINATION_GRACE_SECONDS].value`
 //! - side (b) `.spec.terminationGracePeriodSeconds` **of that same pod**
+//!
+//! for EVERY live MH pod (found by `app=mh-service`, ADR-0039 §7 — there are
+//! no fixed MH instances), and for the rendered template deploy.sh stores in
+//! ConfigMap `mh-template` (what `mh.sh` instantiates every MH from).
 //!
 //! Nothing here runs `kustomize`. The two sides are equal only if the kustomize
 //! `replacements:` block in `infra/services/mh-service/kustomization.yaml` was
@@ -66,7 +70,8 @@
 //! each assertion proves something different. Keep (a) and (c) adjacent in
 //! any rewrite: they look similar and neither covers the other.
 //!
-//! - **(a) Wiring proves the REFERENCE.** For both `mh-0` and `mh-1`, every key
+//! - **(a) Wiring proves the REFERENCE.** For the `mh-template` pod template
+//!   AND every live MH pod, every key
 //!   in [`WIRED_KEYS`] is present on the live pod as a HARD `configMapKeyRef` to
 //!   the ONE generation of ITS base (`mh-service-config` or, for the story-3
 //!   profile keys, `media-codec-profile`) that pod is wired to, whose `key`
@@ -78,9 +83,9 @@
 //!   `env_tests::fixtures::deployment_config` (unit-tested at Layer 4). This is
 //!   the per-workload coverage `dt-guard env-config` cannot give yet: its rule
 //!   1 only engages once the MH code task makes these reads required, and its
-//!   rule 3 is satisfied if EITHER workload references a key — so "present in
-//!   mh-0, missing from mh-1" is guard-green today and CrashLoops mh-1 the
-//!   moment the required-read image ships. The static twin of the `key == name`
+//!   rule 3 is satisfied if ANY workload references a key — so a live MH pod
+//!   instantiated from a stale or hand-edited template can miss a ref the
+//!   tree has, and CrashLoop the moment the required-read image ships. The static twin of the `key == name`
 //!   half is `dt-guard env-config`'s `configmap_key_name_mismatch`; this
 //!   version exists for a cluster that does not match its manifests (a hand
 //!   `kubectl apply -f`, a partial rollout). Do not delete either as redundant.
@@ -91,7 +96,7 @@
 //!   configuration value in [`CONFIG_GAUGES`], the value the running MH
 //!   PROCESS publishes (a static gauge `publish_egress_admission` sets at
 //!   startup from the field enforcement reads) equals the deployed ConfigMap
-//!   value of THAT instance's generation, under MH's own conversion (bits →
+//!   value of THAT pod's generation, under MH's own conversion (bits →
 //!   bytes, ms → s). It is the assertion here about what the running process
 //!   observed. It reads gauges, not the startup log line: a log line is lost
 //!   to kubelet log rotation on a long-lived pod, and pods survive across
@@ -117,7 +122,8 @@
 //!   handler must carry plus the retained-edge floor, at most what the S9
 //!   exhaustion test can exceed.
 //! - **(f) Kind test codec profile.** The live `media-codec-profile`
-//!   generation MC and MH resolve (one generation across all four pods) holds
+//!   generation MC and MH resolve (one generation across every MC instance and
+//!   every MH pool pod) holds
 //!   exactly the base keys, with every value the committed Kind test-profile
 //!   patch sets (story 3 R-28).
 //!
@@ -173,35 +179,61 @@
 
 use env_tests::fixtures::deployment_config::{
     check_key_ref, check_resource_field_ref, check_shape, cm_value, container, fetch_configmap,
-    fetch_live_pod, kind_patch_overrides, live_pod, parse_positive, pod_name_of,
-    tree_configmap_data, PatchOverride, RefKind, ValueShape, KIND_SIZING_RESTORE,
-    KIND_TEST_PROFILE_PATCH, PROFILE_BASE_ENV,
+    kind_patch_overrides, parse_positive, pod_name_of, tree_configmap_data, PatchOverride, RefKind,
+    ValueShape, KIND_SIZING_RESTORE, KIND_TEST_PROFILE_PATCH, PROFILE_BASE_ENV,
 };
 use env_tests::fixtures::egress_admission::{
     kind_window_lower_bound, max_s9_feasible_ceiling, required_edges, DEMO_M, DEMO_N, DEMO_P,
     MAX_PER_FILE_EDGE_SUM, MAX_S9_PARTICIPANTS, RETAINED_EDGE_FLOOR,
 };
 use env_tests::fixtures::kube::{
-    configmap_name_for, configmap_name_for_all, MC_INSTANCES, MH_INSTANCES, PROFILE_CONFIGMAP,
-    PROFILE_READERS, REDEPLOY_HINT,
+    configmap_name_for_all, configmap_name_for_selector, configmap_name_for_selectors,
+    generation_in_pod, is_terminating, live_mh_pods_with_specs, pods_json,
+    profile_reader_selectors, MC_INSTANCES, MH_SELECTOR, PROFILE_CONFIGMAP, REDEPLOY_HINT,
 };
 use env_tests::fixtures::mh_config::{gauge_verdict, Conversion, GaugeVerdict};
+use env_tests::fixtures::mh_pool::{template_as_pod, template_deployment};
 use env_tests::NAMESPACE;
 use serde_json::Value;
 
 const CONTAINER: &str = "mh-service";
 const GRACE_ENV: &str = "MH_TERMINATION_GRACE_SECONDS";
 
-/// Asserts one instance's deployed env value equals its own pod spec's grace.
-fn assert_grace_matches_pod_spec(instance: &str) {
-    let pod = fetch_live_pod(instance);
+/// Every live (non-terminating) MH pod object, by [`MH_SELECTOR`]. Never
+/// empty: zero pods is a PRECONDITION panic, so no per-pod loop below can pass
+/// vacuously.
+fn live_mh_pod_objects() -> Vec<Value> {
+    let doc = pods_json(MH_SELECTOR);
+    let pods: Vec<Value> = doc
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|p| !is_terminating(p))
+        .cloned()
+        .collect();
+    assert!(
+        !pods.is_empty(),
+        "PRECONDITION: no live pod matches -n {NAMESPACE} -l {MH_SELECTOR}: every per-pod \
+         assertion here would pass vacuously. The MH pool is empty (deploy.sh tops it up to the \
+         baseline via mh.sh) or the label drifted."
+    );
+    pods
+}
 
+/// The rendered template as a pod-shaped object (see `mh_pool::template_as_pod`).
+fn template_pod() -> Value {
+    template_as_pod(&template_deployment())
+}
+
+/// Asserts a pod-shaped object's deployed env value equals its own spec's grace.
+fn assert_grace_matches_pod_spec(pod: &Value) {
     // Extract every scalar BEFORE formatting anything, so no `Value` and no env
     // array can reach a panic message. See the PII policy in the module doc.
     let pod_name = pod
         .pointer("/metadata/name")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("pod matched by instance={instance} has no metadata.name"))
+        .unwrap_or_else(|| panic!("an MH pod object has no metadata.name"))
         .to_string();
 
     let spec_grace = pod
@@ -284,14 +316,19 @@ fn assert_grace_matches_pod_spec(instance: &str) {
     );
 }
 
+/// The template mh.sh instantiates carries the derived grace (the ONE
+/// `replacements:` entry ran in deploy.sh's render).
 #[tokio::test]
-async fn test_mh_0_termination_grace_matches_pod_spec() {
-    assert_grace_matches_pod_spec("mh-0");
+async fn test_mh_template_termination_grace_matches_its_pod_spec() {
+    assert_grace_matches_pod_spec(&template_pod());
 }
 
+/// Every live MH pod carries the derived grace — whatever slot or incarnation.
 #[tokio::test]
-async fn test_mh_1_termination_grace_matches_pod_spec() {
-    assert_grace_matches_pod_spec("mh-1");
+async fn test_every_live_mh_pod_termination_grace_matches_its_pod_spec() {
+    for pod in live_mh_pod_objects() {
+        assert_grace_matches_pod_spec(&pod);
+    }
 }
 
 // =============================================================================
@@ -307,22 +344,23 @@ async fn test_mh_1_termination_grace_matches_pod_spec() {
 /// [`shared_configmap`] — never use this bare name as a live object name.
 const SHARED_CONFIGMAP: &str = "mh-service-config";
 
-/// The live `mh-service-config` generation `instance`'s pod references.
-fn shared_configmap_for(instance: &str) -> String {
-    configmap_name_for(instance, SHARED_CONFIGMAP)
+/// The live `base` generation ONE pod object references.
+fn generation_of(pod: &Value, base: &str) -> String {
+    generation_in_pod(pod, base).unwrap_or_else(|e| panic!("PRECONDITION: {e}"))
 }
 
-/// The live `mh-service-config` generation BOTH MH instances reference — for
-/// the cluster-wide assertions. The instances sharing one generation is itself
+/// The live `mh-service-config` generation EVERY live MH pod references — for
+/// the cluster-wide assertions. The pods sharing one generation is itself
 /// asserted (by the fixture): two generations means they run different config.
 fn shared_configmap() -> String {
-    configmap_name_for_all(MH_INSTANCES, SHARED_CONFIGMAP)
+    configmap_name_for_selector(MH_SELECTOR, SHARED_CONFIGMAP)
 }
 
-/// Every key wired into BOTH MH workloads as a HARD ref: `(key, generator
-/// base, shape)`. ONE table, iterated for every instance — never a second copy
-/// per instance or per test. The base column is needed because the profile
-/// keys come from a DIFFERENT ConfigMap (resolved per instance and base).
+/// Every key wired into the MH template (hence every MH pod) as a HARD ref:
+/// `(key, generator base, shape)`. ONE table, iterated for the template and
+/// every pod — never a second copy per pod or per test. The base column is
+/// needed because the profile keys come from a DIFFERENT ConfigMap (resolved
+/// per pod and base).
 const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
     // Egress-budget chain (story 2 R-19, R-23).
     (
@@ -407,7 +445,7 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
 
 /// RETIRING MH keys (two-deploy retirement, step 1 — docs/TODO.md §Media Path
 /// Obligations, "Delete the story-3 retired config keys"). Each ref must be
-/// present on BOTH instances and `optional: true`, AND the key must STILL be
+/// present on the template and every MH pod and `optional: true`, AND the key must STILL be
 /// present and parseable in the live generation: the current image reads none
 /// of them, but the PREVIOUS image (the rollback target until step 2) reads all
 /// but `MH_MAX_STREAMS` as REQUIRED, and under an optional ref an absent key is
@@ -529,9 +567,9 @@ fn oracle_costs_bps(profile_cm: &Value) -> (u64, u64) {
     (audio, video)
 }
 
-/// The live profile generation BOTH MH instances reference.
+/// The live profile generation EVERY MH pod references.
 fn profile_configmap() -> String {
-    configmap_name_for_all(MH_INSTANCES, PROFILE_CONFIGMAP)
+    configmap_name_for_selector(MH_SELECTOR, PROFILE_CONFIGMAP)
 }
 
 /// A strictly-positive deployed integer, or a panic naming the key and base.
@@ -539,13 +577,14 @@ fn positive(cm: &Value, base: &str, key: &str) -> u64 {
     parse_positive(key, &cm_value(cm, base, key), base).unwrap_or_else(|e| panic!("{e}"))
 }
 
-/// (a) wiring + (b) parse, for one instance, plus the relationships between
-/// deployed values that a reading image refuses to boot on.
-fn assert_story2_keys_wired(instance: &str) {
-    // The generation THIS instance's pod references, per base — so the values
-    // checked below are the config in effect for this pod.
-    let mh_cm_name = shared_configmap_for(instance);
-    let profile_cm_name = configmap_name_for(instance, PROFILE_CONFIGMAP);
+/// (a) wiring + (b) parse, for one pod-shaped object (the template or a live
+/// pod), plus the relationships between deployed values that a reading image
+/// refuses to boot on.
+fn assert_story2_keys_wired(pod: &Value) {
+    // The generation THIS pod references, per base — so the values checked
+    // below are the config in effect for this pod.
+    let mh_cm_name = generation_of(pod, SHARED_CONFIGMAP);
+    let profile_cm_name = generation_of(pod, PROFILE_CONFIGMAP);
     let mh_cm = fetch_configmap(&mh_cm_name);
     let profile_cm = fetch_configmap(&profile_cm_name);
     let live = |base: &str| -> (&str, &Value) {
@@ -555,8 +594,6 @@ fn assert_story2_keys_wired(instance: &str) {
             (mh_cm_name.as_str(), &mh_cm)
         }
     };
-    let pod = fetch_live_pod(instance);
-
     // Positive control that CAN fail: the table wires every base this file
     // covers (a table that quietly lost the profile rows would otherwise pass
     // on what remains), and the retiring list is not empty.
@@ -569,12 +606,12 @@ fn assert_story2_keys_wired(instance: &str) {
     assert!(!RETIRING_KEYS.is_empty());
     for &(key, base, shape) in WIRED_KEYS {
         let (cm_name, cm) = live(base);
-        check_key_ref(&pod, CONTAINER, key, cm_name, RefKind::Hard)
+        check_key_ref(pod, CONTAINER, key, cm_name, RefKind::Hard)
             .unwrap_or_else(|e| panic!("{e}"));
         check_shape(key, &cm_value(cm, base, key), shape, base).unwrap_or_else(|e| panic!("{e}"));
     }
     for &(key, shape) in RETIRING_KEYS {
-        check_key_ref(&pod, CONTAINER, key, &mh_cm_name, RefKind::Optional)
+        check_key_ref(pod, CONTAINER, key, &mh_cm_name, RefKind::Optional)
             .unwrap_or_else(|e| panic!("{e}"));
         // STILL present and parseable: the current image still reads it.
         check_shape(
@@ -587,10 +624,10 @@ fn assert_story2_keys_wired(instance: &str) {
     }
 
     let (env, target, resource) = MEMORY_LIMIT_ENV;
-    check_resource_field_ref(&pod, CONTAINER, env, target, resource)
+    check_resource_field_ref(pod, CONTAINER, env, target, resource)
         .unwrap_or_else(|e| panic!("{e}"));
 
-    assert_removed_keys_absent(&pod, &mh_cm);
+    assert_removed_keys_absent(pod, &mh_cm);
     assert_deployed_relationships(&mh_cm);
 }
 
@@ -645,8 +682,8 @@ fn assert_removed_keys_absent(pod: &Value, mh_cm: &Value) {
         assert!(
             !env.contains(key),
             "pod {pod_name}: env {key} is present, but story 3 amendment 4 removed it from MH \
-             (R-23). Remove the ref from infra/services/mh-service/mh-0-deployment.yaml and \
-             mh-1-deployment.yaml (and the key from config.env, if it is an MH key)."
+             (R-23). Remove the ref from the MH template infra/services/mh-service/deployment.yaml \
+             (and the key from config.env, if it is an MH key)."
         );
     }
     for key in REMOVED_KEYS.iter().filter(|key| key.starts_with("MH_")) {
@@ -689,15 +726,19 @@ fn assert_deployed_relationships(mh_cm: &Value) {
     );
 }
 
+/// The template mh.sh instantiates every MH from, then every live MH pod (a
+/// pod from an older template revision, or a hand-applied one, is checked as
+/// itself — never assumed equal to the template).
 #[tokio::test]
-async fn test_story2_keys_wired_into_every_mh_instance() {
-    for instance in MH_INSTANCES {
-        assert_story2_keys_wired(instance);
+async fn test_story2_keys_wired_into_the_mh_template_and_every_mh_pod() {
+    assert_story2_keys_wired(&template_pod());
+    for pod in live_mh_pod_objects() {
+        assert_story2_keys_wired(&pod);
     }
 }
 
 /// (c) What the RUNNING process loaded equals the deployed ConfigMap, for every
-/// row of [`CONFIG_GAUGES`], per MH instance against ITS OWN ConfigMap
+/// row of [`CONFIG_GAUGES`], per live MH pod against ITS OWN ConfigMap
 /// generation. Read from the static gauges MH publishes at startup — not the
 /// startup log line, which log rotation loses on a long-lived pod. Three
 /// distinct outcomes per row: no data (the gauge is absent for this pod), shape
@@ -714,18 +755,20 @@ async fn test_policy_bounds_reported_by_running_mh_match_configmap() {
         .expect("Failed to connect to cluster - ensure port-forwards are running");
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
 
-    // Per instance: its own generation and its own live pod. Every read is
+    // Per pod: its own generation, from its own spec. Every read is
     // pinned to that pod (`gauge_on_live_pod`): right after a deploy rolls MH,
     // the terminating predecessor is still a scrape target for its drain
     // window, so "enough instances have the series" can be satisfied before
     // the NEW pod's first scrape. Its PRESENCE panic is the no-data branch.
-    let pods: Vec<_> = MH_INSTANCES
-        .iter()
-        .map(|&instance| {
-            let cm = fetch_configmap(&shared_configmap_for(instance));
-            (live_pod(instance), cm)
+    let pods: Vec<_> = live_mh_pods_with_specs()
+        .await
+        .into_iter()
+        .map(|(pod, spec)| {
+            let cm = fetch_configmap(&generation_of(&spec, SHARED_CONFIGMAP));
+            (pod, cm)
         })
         .collect();
+    assert!(!pods.is_empty(), "live_mh_pods_with_specs returned no pod");
 
     for &(key, gauge, conversion) in CONFIG_GAUGES {
         for (pod, cm) in &pods {
@@ -986,7 +1029,7 @@ async fn test_running_mh_publishes_the_derived_stream_costs() {
         .expect("Failed to connect to cluster - ensure port-forwards are running");
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
     // EVERY live MH pod by label, once for this test (the Prometheus pin; the
-    // ConfigMap reads above stay per instance until slot ConfigMaps exist).
+    // ConfigMap read above is the one generation every MH pod shares).
     let mh_pods = live_mh_pods().await;
     for (gauge, bits) in [
         ("mh_media_stream_cost_audio_bytes_per_second", audio),
@@ -1022,7 +1065,7 @@ async fn test_running_mh_publishes_the_derived_stream_costs() {
 /// stable.
 #[tokio::test]
 async fn test_kind_media_codec_profile_is_the_committed_test_profile() {
-    let generation = configmap_name_for_all(PROFILE_READERS, PROFILE_CONFIGMAP);
+    let generation = configmap_name_for_selectors(&profile_reader_selectors(), PROFILE_CONFIGMAP);
     let live = fetch_configmap(&generation);
     assert_eq!(
         live.pointer("/metadata/labels/environment")

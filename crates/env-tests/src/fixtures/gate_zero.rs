@@ -34,10 +34,11 @@ pub const CANARY_PREFIX: &str = "gate-zero-canary";
 /// on `container="mh-service"`.
 pub const CANARY_CONTAINER: &str = "gate-zero-canary";
 
-/// The two node hostPorts. Today's MH-0 health / gRPC Kind containerPorts,
-/// with nothing listening behind them; the gate sends to them on the NODE IP
-/// directly (the Kind extraPortMappings for them are TCP, so the host-publish
-/// leg is not on this test's path — see the story Design section). Preflight
+/// The two node hostPorts: the retired MH-0 health / gRPC Kind containerPorts
+/// (story 4 I-2 deleted their extraPortMappings), with nothing listening
+/// behind them and outside the MH slot range. The gate sends to them on the
+/// NODE IP directly, so no Kind mapping is on its path; the host-publish UDP
+/// leg of the real slots is `tests/43_mh_slot_publish_udp.rs`. Preflight
 /// asserts no pod declares them as hostPort and no Service uses them as a
 /// nodePort.
 pub const HOST_PORTS: [u16; 2] = [30830, 30530];
@@ -653,8 +654,8 @@ pub fn refuse_calico_policies(kind: &str, list: &Value) -> Result<(), String> {
 }
 
 /// The canary Pod for one phase. Labels = EXACTLY `labels` (the live policy's
-/// matchLabels; no `instance`, so no MH ReplicaSet adopts it and no
-/// per-instance Service selects it). A readiness probe that cannot pass keeps
+/// matchLabels; no `dark-tower.io/mh-slot`, so no MH pool ReplicaSet — whose
+/// selector adds that label — adopts it). A readiness probe that cannot pass keeps
 /// it out of every Service's ready endpoints. Only the two UDP ports.
 #[must_use]
 pub fn canary_manifest(
@@ -821,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn services_needing_instance_do_not_select_the_canary() {
+    fn services_needing_more_labels_do_not_select_the_canary() {
         let labels: BTreeMap<String, String> = [("app", "mh-service"), ("component", "media")]
             .into_iter()
             .map(|(k, v)| (k.into(), v.into()))
@@ -829,8 +830,8 @@ mod tests {
         let list = json!({"items": [
             {"metadata": {"name": "mh-service"},
              "spec": {"selector": {"app": "mh-service", "component": "media"}}},
-            {"metadata": {"name": "mh-service-0"},
-             "spec": {"selector": {"app": "mh-service", "component": "media", "instance": "mh-0"},
+            {"metadata": {"name": "mh-slot-0"},
+             "spec": {"selector": {"app": "mh-service", "component": "media", "dark-tower.io/mh-slot": "0"},
                       "publishNotReadyAddresses": true}},
         ]});
         assert_eq!(
@@ -858,7 +859,7 @@ mod tests {
             "spec": {"ports": [{"nodePort": 30830}]}}]});
         assert_eq!(nodeport_claims(&svcs, &HOST_PORTS), vec!["n/s"]);
         let none = json!({"items": [{"metadata": {"namespace": "n", "name": "s"},
-            "spec": {"ports": [{"nodePort": 30434}]}}]});
+            "spec": {"ports": [{"nodePort": 31999}]}}]});
         assert!(nodeport_claims(&none, &HOST_PORTS).is_empty());
     }
 
@@ -866,7 +867,7 @@ mod tests {
     fn leftovers_are_matched_by_prefix_only() {
         let pods = json!({"items": [
             {"metadata": {"name": "gate-zero-canary-abcd1234"}, "status": {"phase": "Failed"}},
-            {"metadata": {"name": "mh-0-xyz"}, "status": {"phase": "Running"}},
+            {"metadata": {"name": "mh-s0-7d9f8c6b5-xyz12"}, "status": {"phase": "Running"}},
         ]});
         assert_eq!(
             leftover_canaries(&pods),

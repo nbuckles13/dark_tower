@@ -999,7 +999,7 @@ fn write_port_map_shell(path: &Path, alloc: &PortAllocation) -> Result<(), Helpe
     writeln!(
         file,
         "MH_HEALTH_PORT={}",
-        alloc.port(PortOffsets::MH_0_HEALTH)
+        alloc.port(PortOffsets::MH_HEALTH)
     )?;
     writeln!(file, "POSTGRES_PORT={}", alloc.port(PortOffsets::POSTGRES))?;
     writeln!(
@@ -1019,16 +1019,10 @@ fn write_port_map_shell(path: &Path, alloc: &PortAllocation) -> Result<(), Helpe
         "MC_1_WEBTRANSPORT_PORT={}",
         alloc.port(PortOffsets::MC_1_WEBTRANSPORT)
     )?;
-    writeln!(
-        file,
-        "MH_0_WEBTRANSPORT_PORT={}",
-        alloc.port(PortOffsets::MH_0_WEBTRANSPORT)
-    )?;
-    writeln!(
-        file,
-        "MH_1_WEBTRANSPORT_PORT={}",
-        alloc.port(PortOffsets::MH_1_WEBTRANSPORT)
-    )?;
+    // No MH WebTransport lines: MH addresses are per hostPort SLOT, and the
+    // slot table is read back from the rendered kind-config
+    // (deploy.sh:mh_slot_table) and the live pool (mh.sh list --json), never
+    // from fixed per-instance variables.
 
     file.flush()?;
     Ok(())
@@ -2682,7 +2676,7 @@ current-context: kind-devloop-test
         let expected = [
             ("AC_HTTP_PORT", alloc.port(PortOffsets::AC_HTTP)),
             ("GC_HTTP_PORT", alloc.port(PortOffsets::GC_HTTP)),
-            ("MH_HEALTH_PORT", alloc.port(PortOffsets::MH_0_HEALTH)),
+            ("MH_HEALTH_PORT", alloc.port(PortOffsets::MH_HEALTH)),
             ("POSTGRES_PORT", alloc.port(PortOffsets::POSTGRES)),
             ("PROMETHEUS_PORT", alloc.port(PortOffsets::PROMETHEUS)),
             ("GRAFANA_PORT", alloc.port(PortOffsets::GRAFANA)),
@@ -2695,14 +2689,6 @@ current-context: kind-devloop-test
                 "MC_1_WEBTRANSPORT_PORT",
                 alloc.port(PortOffsets::MC_1_WEBTRANSPORT),
             ),
-            (
-                "MH_0_WEBTRANSPORT_PORT",
-                alloc.port(PortOffsets::MH_0_WEBTRANSPORT),
-            ),
-            (
-                "MH_1_WEBTRANSPORT_PORT",
-                alloc.port(PortOffsets::MH_1_WEBTRANSPORT),
-            ),
         ];
         for (name, port) in &expected {
             let line = format!("{name}={port}");
@@ -2711,6 +2697,13 @@ current-context: kind-devloop-test
                 "port-map.env missing '{line}', contents:\n{contents}"
             );
         }
+        // MH slots are not port-map variables (deploy reads the kind-config).
+        let mh_lines: Vec<&str> = contents.lines().filter(|l| l.starts_with("MH_")).collect();
+        assert_eq!(
+            mh_lines,
+            vec![format!("MH_HEALTH_PORT={}", alloc.port(PortOffsets::MH_HEALTH)).as_str()],
+            "port-map.env must carry no per-instance MH variable:\n{contents}"
+        );
 
         // Verify every non-comment, non-empty line matches the scripts' DT_PORT_MAP validation regex
         #[expect(

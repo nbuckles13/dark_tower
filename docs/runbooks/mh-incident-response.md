@@ -5,6 +5,18 @@
 **On-Call Rotation**: PagerDuty - Dark Tower MH Team
 **History**: `git log --follow -- docs/runbooks/mh-incident-response.md`
 
+> **First triage command for any MH page: `./infra/kind/scripts/mh.sh list`** (every hostPort slot:
+> state, owner, address, pod, revision, `stale`). MH is a pool of per-slot Deployments `mh-s<k>`;
+> there is no `mh-service` Deployment and MH has no rollout history. In the commands below,
+> `<mh-pod>` is a pod name, `<k>` a slot number and `<owner>` that slot's `owner` (normally
+> `baseline`) from that list. Replacing an MH keeps its owner: `mh.sh up --owner <owner>`, then
+> `mh.sh drain <k> --owner <owner>` (without `--owner`, both default to `manual`: the drain refuses
+> `foreign-owner`, and forcing it leaves a stray `manual` MH the next deploy never removes).
+> **Rolling back with `git checkout <previous-good-commit> && deploy.sh`:** if that commit predates
+> the slot pool (story 4 I-2), read `mh-deployment.md` "ROLLING ACROSS THE SLOT-POOL CHANGE" first
+> (helper rebuild + cluster recreate; otherwise deploy fails `blueprint-changed`). Never `rollout restart` an
+> `mh-s<k>`, and never `kubectl delete pod --force --grace-period=0` an MH pod.
+
 ---
 
 ## Table of Contents
@@ -123,7 +135,7 @@ Infrastructure Team / SRE Lead
 **Immediate Response**:
 
 1. Confirm pod state: `kubectl get pods -n dark-tower -l app=mh-service`
-2. Check recent deployment: `kubectl rollout history deployment/mh-service -n dark-tower`
+2. Check recent deployment: `./infra/kind/scripts/mh.sh list` (each slot's `revision` and `stale`; MH has no rollout history)
 3. If recent bad deploy suspected, prepare rollback.
 4. Post to `#incidents` and page MC team so they can redirect new meeting assignments away from the failing MH.
 
@@ -139,15 +151,15 @@ Infrastructure Team / SRE Lead
 
 ```bash
 # Option A: Rollback (if recent deployment is the cause)
-kubectl rollout undo deployment/mh-service -n dark-tower
-kubectl rollout status deployment/mh-service -n dark-tower
+git checkout <previous-good-commit> && ./infra/kind/scripts/deploy.sh   # MH has no rollout history; deploy runs mh.sh upgrade
+./infra/kind/scripts/mh.sh list   # every slot serving, none stale
 
 # Option B: Force reschedule (transient node issue)
 kubectl delete pods -n dark-tower -l app=mh-service
 
 # Option C: Increase memory limits if OOMKilled
-kubectl patch deployment/mh-service -n dark-tower -p \
-  '{"spec":{"template":{"spec":{"containers":[{"name":"mh-service","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
+# MH has no live Deployment to patch: raise resources.limits in infra/services/mh-service/deployment.yaml,
+# then ./infra/kind/scripts/deploy.sh (mh.sh upgrade replaces every MH, start-new-then-drain-old)
 ```
 
 Expected recovery: 1-3 minutes.
@@ -185,11 +197,11 @@ sum by(token_type) (rate(mh_jwt_validations_total{result="failure"}[5m]))
 
 # AC service health + JWKS reachability from MH
 kubectl get pods -n dark-tower -l app=ac-service
-kubectl exec -it deployment/mh-service -n dark-tower -- \
+kubectl exec -it pod/<mh-pod> -n dark-tower -- \
   curl -s http://ac-service.dark-tower.svc.cluster.local:8080/.well-known/jwks.json | head -c 500
 
 # Clock skew (JWTs are time-sensitive)
-kubectl exec -it deployment/mh-service -n dark-tower -- date -u
+kubectl exec -it pod/<mh-pod> -n dark-tower -- date -u
 kubectl exec -it deployment/ac-service -n dark-tower -- date -u
 
 # MH logs at debug level for failure reasons
@@ -240,7 +252,7 @@ kubectl logs -n dark-tower -l app=mh-service --tail=500 | grep -iE "jwt|jwks|tok
 
 ```bash
 # MH -> GC connectivity from MH pod
-kubectl exec -it deployment/mh-service -n dark-tower -- \
+kubectl exec -it pod/<mh-pod> -n dark-tower -- \
   curl -i http://gc-service.dark-tower.svc.cluster.local:8080/health
 
 # MH logs for heartbeat errors
@@ -269,8 +281,8 @@ kubectl describe networkpolicy mh-service -n dark-tower
 **Recovery**:
 
 ```bash
-# Force re-registration + fresh heartbeat loop
-kubectl rollout restart deployment/mh-service -n dark-tower
+# Force re-registration + fresh heartbeat loop: a new MH process, one at a time
+./infra/kind/scripts/mh.sh up --owner <owner> && ./infra/kind/scripts/mh.sh drain <k> --owner <owner>
 ```
 
 **Related Alerts**: `MHHighRegistrationLatency`, `MHTokenRefreshFailures`, `MHGCHeartbeatLatencyHigh`.
@@ -313,7 +325,7 @@ kubectl rollout restart deployment/mh-service -n dark-tower
 ```bash
 # MH -> GC network latency
 # (from MH pod)
-kubectl exec -it deployment/mh-service -n dark-tower -- \
+kubectl exec -it pod/<mh-pod> -n dark-tower -- \
   ping -c 5 gc-service.dark-tower.svc.cluster.local
 ```
 
@@ -337,9 +349,8 @@ kubectl exec -it deployment/mh-service -n dark-tower -- \
 
 **Impact**: Subset of users unable to establish media. Connections already
 established are unaffected. Note that MH has **no horizontal-scaling lever at
-incident time** — instances are per-instance Deployments with their own
-NodePort Services and port mappings, so adding one is a manifest change, not
-a `kubectl scale`. Combined with a tripped accept guard meaning flood-or-leak
+incident time** beyond the K hostPort slots — `./infra/kind/scripts/mh.sh up` adds an MH on a
+free slot (K is fixed at cluster creation), never a `kubectl scale`. Combined with a tripped accept guard meaning flood-or-leak
 rather than demand, the only responses are find-the-source or restart. MTTR
 is one rollout.
 
@@ -395,11 +406,10 @@ kubectl top pods -n dark-tower -l app=mh-service
 **Recovery**:
 
 ```bash
-# There is no `mh-service` Deployment. MH runs as per-instance Deployments
-# mh-0 and mh-1, each with its own NodePort Service, ConfigMap and Kind port
-# mapping (see infra/services/mh-service/service.yaml). Adding an instance is
-# a manifest change, not a `kubectl scale` — horizontal scaling is NOT an
-# incident-time lever for MH.
+# There is no `mh-service` Deployment. MH runs as a POOL of per-slot
+# Deployments mh-s<k> (one hostPort slot each), managed by
+# ./infra/kind/scripts/mh.sh (`list` shows every slot). Adding an MH is
+# `mh.sh up` onto a free slot (at most K), never `kubectl scale`.
 
 # Rotate TLS (if expired). There is NO cert-manager in this system: the
 # mh-service-tls Secret is created imperatively by
@@ -417,8 +427,8 @@ kubectl top pods -n dark-tower -l app=mh-service
 # Leaf validity is 14 days (Chrome's serverCertificateHashes cap), so expiry
 # is routine, not an exceptional branch.
 
-# Restart (QUIC listener stuck)
-kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower
+# Restart (QUIC listener stuck): replace ONE MH at a time, start-new-then-drain-old
+./infra/kind/scripts/mh.sh up --owner <owner> && ./infra/kind/scripts/mh.sh drain <k> --owner <owner>   # never rollout restart an mh-s<k>
 ```
 
 **Related Alerts**: `MHHighJwtValidationFailures`, `MHWebTransportHandshakeSlow`.
@@ -446,7 +456,7 @@ kubectl rollout restart deployment/mh-0 deployment/mh-1 -n dark-tower
 
 ```bash
 # JWKS fetch latency (if emitted; otherwise AC-side metric)
-kubectl exec -it deployment/mh-service -n dark-tower -- \
+kubectl exec -it pod/<mh-pod> -n dark-tower -- \
   time curl -s http://ac-service.dark-tower.svc.cluster.local:8080/.well-known/jwks.json > /dev/null
 
 # MH CPU utilization
@@ -531,7 +541,7 @@ kubectl rollout history deployment/mc-1 -n dark-tower
 
 ```bash
 kubectl top pods -n dark-tower -l app=mh-service
-kubectl describe deployment mh-service -n dark-tower | grep -A 5 "Limits:"
+kubectl describe pod/<mh-pod> -n dark-tower | grep -A 5 "Limits:"   # <mh-pod>: from ./infra/kind/scripts/mh.sh list
 ```
 
 **Root Cause Investigation**:
@@ -541,10 +551,10 @@ kubectl describe deployment mh-service -n dark-tower | grep -A 5 "Limits:"
 mh_active_connections
 
 # Memory trend (leak if never decreasing)
-container_memory_working_set_bytes{pod=~"mh-service-.*"}
+container_memory_working_set_bytes{container="mh-service"}
 
 # CPU trend
-rate(container_cpu_usage_seconds_total{pod=~"mh-service-.*"}[5m])
+rate(container_cpu_usage_seconds_total{container="mh-service"}[5m])
 ```
 
 **Common Root Causes**:
@@ -556,15 +566,15 @@ rate(container_cpu_usage_seconds_total{pod=~"mh-service-.*"}[5m])
 **Recovery**:
 
 ```bash
-# Scale horizontally
-kubectl scale deployment/mh-service -n dark-tower --replicas=5
+# Scale horizontally: one more MH per free hostPort slot (at most K)
+./infra/kind/scripts/mh.sh up --owner manual
 
 # Increase limits
-kubectl patch deployment/mh-service -n dark-tower -p \
-  '{"spec":{"template":{"spec":{"containers":[{"name":"mh-service","resources":{"limits":{"cpu":"4000m","memory":"2Gi"}}}]}}}}'
+# MH has no live Deployment to patch: raise resources.limits in infra/services/mh-service/deployment.yaml,
+# then ./infra/kind/scripts/deploy.sh (mh.sh upgrade replaces every MH, start-new-then-drain-old)
 
-# Rolling restart (if leak suspected)
-kubectl rollout restart deployment/mh-service -n dark-tower
+# Restart (if leak suspected): one MH at a time, start-new-then-drain-old
+./infra/kind/scripts/mh.sh up --owner <owner> && ./infra/kind/scripts/mh.sh drain <k> --owner <owner>
 ```
 
 **Related Alerts**: `MHHighWebTransportRejections`, `MHWebTransportHandshakeSlow`, `MHPodRestartingFrequently`.
@@ -599,7 +609,7 @@ kubectl rollout restart deployment/mh-service -n dark-tower
 kubectl get pods -n dark-tower -l app=ac-service
 
 # MH -> AC connectivity
-kubectl exec -it deployment/mh-service -n dark-tower -- \
+kubectl exec -it pod/<mh-pod> -n dark-tower -- \
   curl -i http://ac-service.dark-tower.svc.cluster.local:8080/health
 
 # MH logs for token errors
@@ -711,8 +721,8 @@ kubectl describe pod <pod> -n dark-tower
 # Memory / CPU at time of restart
 kubectl top pods -n dark-tower -l app=mh-service
 
-# Recent deployment changes
-kubectl rollout history deployment/mh-service -n dark-tower
+# Recent deployment changes (MH has no rollout history: revision + stale per slot)
+./infra/kind/scripts/mh.sh list
 ```
 
 **Common Root Causes**:
@@ -726,12 +736,12 @@ kubectl rollout history deployment/mh-service -n dark-tower
 **Recovery**:
 
 ```bash
-# Rollback if recent deploy
-kubectl rollout undo deployment/mh-service -n dark-tower
+# Rollback if recent deploy (MH has no rollout history; deploy runs mh.sh upgrade)
+git checkout <previous-good-commit> && ./infra/kind/scripts/deploy.sh
 
 # Increase memory (OOMKilled)
-kubectl patch deployment/mh-service -n dark-tower -p \
-  '{"spec":{"template":{"spec":{"containers":[{"name":"mh-service","resources":{"limits":{"memory":"2Gi"}}}]}}}}'
+# MH has no live Deployment to patch: raise resources.limits in infra/services/mh-service/deployment.yaml,
+# then ./infra/kind/scripts/deploy.sh (mh.sh upgrade replaces every MH, start-new-then-drain-old)
 ```
 
 **Related Alerts**: `MHHighMemory`, `MHDown` (if all pods restart simultaneously); see [Scenario 14: WebTransport Server Startup Failure](#scenario-14-webtransport-server-startup-failure) for the bind/listen/TLS-load variant of this signal.
@@ -843,7 +853,7 @@ histogram_quantile(0.95, rate(mh_gc_heartbeat_latency_seconds_bucket[5m]))
 > ```
 > More than one image means a rollout is in progress; one means it has completed. **Do not reach for `kubectl rollout status deployment/mc-service`** — there is no Deployment by that name (MC ships as `mc-0` and `mc-1`; `mc-service` is a Service, a PDB and a container name), and the `NotFound` it returns reads as "no rollout in progress", which would flip you to actionable during exactly the legitimate mixed-version window this note exists to protect. See `docs/observability/metrics/mh-service.md` §`mh_media_policy_applies_total`.
 
-> **Rollback awareness**: During a deliberate rollback of MH to a pre-RegisterMeeting build, **`mh_register_meeting_timeouts_total` stays flat at zero on the rolled-back pods** (old MH never knew about RegisterMeeting and so never sets up the provisional-accept window) — but client-side coordination breaks silently because MC's `RegisterMeeting` retries are exhausting. If the metric is flat zero on some pods but the user impact is real, check `kubectl rollout history deployment/mh-0 -n dark-tower` and `kubectl rollout history deployment/mh-1 -n dark-tower` for an in-progress rollback before treating as an incident (MH ships as two per-ordinal Deployments; a rollback can touch either, which is why the sentence above says "some pods"). See [MC Scenario 12](mc-incident-response.md#scenario-12-registermeeting-coordination-failures) for the MC-side rollback-aware triage.
+> **Rollback awareness**: During a deliberate rollback of MH to a pre-RegisterMeeting build, **`mh_register_meeting_timeouts_total` stays flat at zero on the rolled-back pods** (old MH never knew about RegisterMeeting and so never sets up the provisional-accept window) — but client-side coordination breaks silently because MC's `RegisterMeeting` retries are exhausting. If the metric is flat zero on some pods but the user impact is real, check `./infra/kind/scripts/mh.sh list` (each slot's `revision` and `stale`; MH has no rollout history) for an in-progress rollback before treating as an incident (during `mh.sh upgrade` old and new revisions coexist, one slot at a time — `stale` in `./infra/kind/scripts/mh.sh list` shows which pods are still old — which is why the sentence above says "some pods"). See [MC Scenario 12](mc-incident-response.md#scenario-12-registermeeting-coordination-failures) for the MC-side rollback-aware triage.
 
 **Immediate Response**:
 
@@ -861,8 +871,8 @@ histogram_quantile(0.95, rate(mh_gc_heartbeat_latency_seconds_bucket[5m]))
 
 ```bash
 # Confirm provisional-kick rate from raw /metrics (counter increase since pod start).
-# THE COUNTER IS PER-POD. Use the AFFECTED pod (`mh-0` or `mh-1`) — a quiet pod
-# proves nothing about a loud one, and a kick rate read off the wrong ordinal is
+# THE COUNTER IS PER-POD. Use the AFFECTED pod (its name from `./infra/kind/scripts/mh.sh list`) — a quiet pod
+# proves nothing about a loud one, and a kick rate read off the wrong pod is
 # how this gets closed as "not reproducing". For the fleet view use the
 # per-pod split of the rate query from Detection above:
 #   sum by(instance) (rate(mh_register_meeting_timeouts_total[5m]))
@@ -874,9 +884,9 @@ histogram_quantile(0.95, rate(mh_gc_heartbeat_latency_seconds_bucket[5m]))
 # and the pod exposes containerPort 8083 — there is no listener on 8080, so a
 # `8080:8080` forward yields connection-refused, not an empty grep.
 # `instance` is `<pod-ip>:8083`, not a pod name (the mh-service scrape job has
-# no pod-name relabel), so map it to an ordinal with:
-#   kubectl get pods -n dark-tower -l app=mh-service -o wide
-kubectl port-forward -n dark-tower deployment/mh-0 8083:8083 &
+# no pod-name relabel), so map it to a pod (and its slot) with:
+#   ./infra/kind/scripts/mh.sh list --json | jq -r '.slots[] | "\(.pod_ip) \(.pod) slot \(.slot)"'
+kubectl port-forward -n dark-tower pod/<mh-pod> 8083:8083 &   # <mh-pod>: from ./infra/kind/scripts/mh.sh list
 curl -s http://localhost:8083/metrics | grep mh_register_meeting_timeouts_total
 # Cross-check receipt-side: how many RegisterMeeting RPCs is MH actually receiving?
 curl -s http://localhost:8083/metrics | grep 'mh_grpc_requests_total.*register_meeting'
@@ -916,9 +926,9 @@ kubectl exec -it deployment/mc-0 -n dark-tower -- \
 # 2. Once MC is delivering RegisterMeeting again, no MH action is needed:
 #    new client connections will be promoted normally; affected users
 #    re-establish via active/active fallback to other assigned MHs.
-# 3. Monitor for resolution — again PER-POD: watch the affected ordinal
-#    (`mh-0` or `mh-1`). Recovery on one pod is not recovery on the other.
-kubectl port-forward -n dark-tower deployment/mh-0 8083:8083 &
+# 3. Monitor for resolution — again PER-POD: watch the affected pod
+#    (`mh.sh list`). Recovery on one pod is not recovery on another.
+kubectl port-forward -n dark-tower pod/<mh-pod> 8083:8083 &   # <mh-pod>: from ./infra/kind/scripts/mh.sh list
 watch -n 15 'curl -s http://localhost:8083/metrics | grep mh_register_meeting_timeouts_total'
 kill %1
 ```
@@ -980,12 +990,13 @@ kubectl get secret -n dark-tower mh-service-tls -o yaml \
   | grep -E "tls.crt|tls.key" | head -4
 
 # Certificate validity (run only when TLS load is the suspected cause; do not paste bodies)
-kubectl exec -it deployment/mh-service -n dark-tower -- \
+kubectl exec -it pod/<mh-pod> -n dark-tower -- \
   openssl x509 -in /certs/tls.crt -noout -dates -subject 2>/dev/null \
   || echo "Pod not running — inspect cert via secret directly"
 
-# Service definition exposes UDP/4434
-kubectl get svc -n dark-tower mh-service -o yaml | grep -A3 "port:"
+# Each MH's UDP/4434 is published through its hostPort SLOT (no Service): the
+# pod's webtransport hostPort == its slot's MH_HOST_PORT
+./infra/kind/scripts/mh.sh list   # slot, host_port, address, pod
 
 # NetworkPolicy / cloud firewall allows UDP ingress on 4434
 kubectl describe networkpolicy mh-service -n dark-tower
@@ -1002,10 +1013,11 @@ kubectl describe networkpolicy mh-service -n dark-tower
 **Recovery**:
 
 ```bash
-# Option A: Rollback (recent bad deploy)
-kubectl rollout history deployment/mh-service -n dark-tower
-kubectl rollout undo deployment/mh-service -n dark-tower
-kubectl rollout status deployment/mh-service -n dark-tower
+# Option A: Rollback (recent bad deploy). MH has no rollout history. If the commit
+# predates the slot pool (story 4 I-2): mh-deployment.md "ROLLING ACROSS THE SLOT-POOL CHANGE" first.
+./infra/kind/scripts/mh.sh list   # which slots run which revision
+git checkout <previous-good-commit> && ./infra/kind/scripts/deploy.sh   # mh.sh upgrade
+./infra/kind/scripts/mh.sh list   # every slot serving, none stale
 
 # Option B: TLS identity broken (Secret missing, malformed, or expired leaf).
 # There is NO cert-manager in this system — do NOT delete the Secret. It is
@@ -1021,9 +1033,9 @@ kubectl rollout status deployment/mh-service -n dark-tower
 # browser client is in the loop, not for recovering the pod bind.
 
 # Option C: Fix bind address (config/ConfigMap regression)
-# Fast lever: roll back to the previous pod template, which still references the
-# previous content-hash-suffixed ConfigMap (nothing prunes old generations).
-kubectl rollout undo deployment/mh-0 deployment/mh-1 -n dark-tower
+# Fast lever: deploy the previous revision (MH has no rollout history); its template
+# still references the previous content-hash-suffixed ConfigMap (nothing prunes old generations).
+git checkout <previous-good-commit> && ./infra/kind/scripts/deploy.sh
 # Durable fix: correct infra/services/mh-service/config.env and apply the
 # environment root (Kind: ./infra/kind/scripts/deploy.sh, or `dev-cluster deploy`).
 # The ConfigMap is content-addressed (ADR-0038), so the apply rolls both MH
@@ -1830,9 +1842,9 @@ higher threshold hides the regression without changing its outcome. The same hol
 budget or `MH_MAX_TOTAL_EGRESS_EDGES`: doubling the bound doubles time-to-onset and fixes nothing.
 
 **Remedy.** Recovery is a restart of **the pod showing the signature**, which releases every held
-edge: `kubectl rollout restart deployment/mh-N -n dark-tower`, then
-`kubectl rollout status deployment/mh-N -n dark-tower`. The leak is per pod. Restart the sibling only
-if it independently shows the signature, and only after the first is Ready again. Restarting both at
+edge: `./infra/kind/scripts/mh.sh up --owner <owner>`, then `./infra/kind/scripts/mh.sh drain <its slot> --owner <owner>` (never
+`rollout restart` an `mh-s<k>`). The leak is per pod. Replace another MH only if it independently
+shows the signature, and only after the first replacement is serving. Restarting both at
 once sheds every meeting on a healthy pod for nothing, and it can empty GC's candidate pool, which
 gives new-meeting 503s ([`gc-incident-response.md` Scenario 3](gc-incident-response.md#scenario-3-mc-assignment-failures)).
 **What a restart costs, stated for the shipped build:** it sheds every media session on the pod, and
@@ -2525,9 +2537,9 @@ DOES drop there); `docs/observability/metrics/mh-service.md` (`mh_media_paused_s
 ### Quick Health Check
 
 ```bash
-kubectl port-forward -n dark-tower deployment/mh-service 8080:8080 &
-curl http://localhost:8080/health      # Liveness
-curl http://localhost:8080/ready       # Readiness
+kubectl port-forward -n dark-tower pod/<mh-pod> 8083:8083 &   # <mh-pod>: from ./infra/kind/scripts/mh.sh list
+curl http://localhost:8083/health      # Liveness
+curl http://localhost:8083/ready       # Readiness
 kill %1
 
 kubectl get pods -n dark-tower -l app=mh-service
@@ -2537,20 +2549,20 @@ kubectl logs -n dark-tower -l app=mh-service --tail=100 | grep -i error
 ### Metrics Analysis
 
 ```bash
-kubectl port-forward -n dark-tower deployment/mh-service 8080:8080 &
+kubectl port-forward -n dark-tower pod/<mh-pod> 8083:8083 &   # <mh-pod>: from ./infra/kind/scripts/mh.sh list
 
 # All metrics
-curl http://localhost:8080/metrics
+curl http://localhost:8083/metrics
 
 # By subsystem
-curl http://localhost:8080/metrics | grep mh_gc_registration
-curl http://localhost:8080/metrics | grep mh_gc_heartbeat
-curl http://localhost:8080/metrics | grep mh_webtransport
-curl http://localhost:8080/metrics | grep mh_jwt_validations
-curl http://localhost:8080/metrics | grep mh_mc_notifications
-curl http://localhost:8080/metrics | grep mh_token_refresh
-curl http://localhost:8080/metrics | grep mh_caller_type_rejected
-curl http://localhost:8080/metrics | grep mh_active_connections
+curl http://localhost:8083/metrics | grep mh_gc_registration
+curl http://localhost:8083/metrics | grep mh_gc_heartbeat
+curl http://localhost:8083/metrics | grep mh_webtransport
+curl http://localhost:8083/metrics | grep mh_jwt_validations
+curl http://localhost:8083/metrics | grep mh_mc_notifications
+curl http://localhost:8083/metrics | grep mh_token_refresh
+curl http://localhost:8083/metrics | grep mh_caller_type_rejected
+curl http://localhost:8083/metrics | grep mh_active_connections
 
 kill %1
 ```
@@ -2571,15 +2583,15 @@ kubectl logs -n dark-tower -l app=mh-service --tail=1000 | grep -iE "gc|register
 ```bash
 kubectl top pods -n dark-tower -l app=mh-service
 kubectl top nodes
-kubectl describe deployment mh-service -n dark-tower | grep -A 5 "Limits:"
-kubectl get events -n dark-tower --field-selector involvedObject.name=mh-service --sort-by='.lastTimestamp'
+kubectl describe pod/<mh-pod> -n dark-tower | grep -A 5 "Limits:"   # <mh-pod>: from ./infra/kind/scripts/mh.sh list
+kubectl get events -n dark-tower --sort-by=.lastTimestamp | grep -E 'mh-s[0-9]+'   # every MH Deployment/ReplicaSet/pod
 ```
 
 ### Network Debugging
 
 ```bash
 # MH -> GC
-kubectl exec -it deployment/mh-service -n dark-tower -- \
+kubectl exec -it pod/<mh-pod> -n dark-tower -- \
   curl -i http://gc-service.dark-tower.svc.cluster.local:8080/health
 
 # MH -> MC. NOT checkable by curl: MC health is 8081 and MC's NetworkPolicy
@@ -2593,7 +2605,7 @@ kubectl get endpoints mc-service -n dark-tower
 # See docs/runbooks/mc-incident-response.md §MC Topology.
 
 # MH -> AC
-kubectl exec -it deployment/mh-service -n dark-tower -- \
+kubectl exec -it pod/<mh-pod> -n dark-tower -- \
   curl -i http://ac-service.dark-tower.svc.cluster.local:8080/health
 
 # Network policies
@@ -2610,15 +2622,14 @@ kubectl describe networkpolicy mh-service -n dark-tower
 **When to use**: Stuck state, memory pressure, suspected listener crash.
 
 ```bash
-kubectl get pods -n dark-tower -l app=mh-service
-kubectl rollout restart deployment/mh-service -n dark-tower
-kubectl rollout status deployment/mh-service -n dark-tower
-kubectl logs -n dark-tower -l app=mh-service --tail=50
+./infra/kind/scripts/mh.sh list
+./infra/kind/scripts/mh.sh up --owner <owner> && ./infra/kind/scripts/mh.sh drain <k> --owner <owner>   # per MH, one at a time; never rollout restart an mh-s<k>
+kubectl logs -n dark-tower -l app=mh-service --tail=50 --prefix
 ```
 
 **Rollback on failure**:
 ```bash
-kubectl rollout undo deployment/mh-service -n dark-tower
+git checkout <previous-good-commit> && ./infra/kind/scripts/deploy.sh   # MH has no rollout history; mh.sh upgrade
 ```
 
 **Impact**: Active WebTransport sessions on restarted pods are terminated. Clients will reconnect to other MH instances (GC reassigns).
@@ -2629,10 +2640,10 @@ kubectl rollout undo deployment/mh-service -n dark-tower
 
 **When to use**: After AC key rotation, when MH is validating against stale keys.
 
-MH caches JWKS with a 5-minute TTL. There is no hot-flush endpoint — a pod restart forces a cold fetch:
+MH caches JWKS with a 5-minute TTL. There is no hot-flush endpoint — a new MH process forces a cold fetch:
 
 ```bash
-kubectl rollout restart deployment/mh-service -n dark-tower
+./infra/kind/scripts/mh.sh up --owner <owner> && ./infra/kind/scripts/mh.sh drain <k> --owner <owner>   # per MH, one at a time
 ```
 
 Alternatively, wait up to 5 minutes for the TTL to expire — JWT validation failures resolve automatically once the cache refreshes.

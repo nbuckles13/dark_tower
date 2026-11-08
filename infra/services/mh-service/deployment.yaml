@@ -1,29 +1,53 @@
+# THE ONE MH TEMPLATE (ADR-0039 §7 "Template invariants"). NEVER APPLIED AS-IS.
+#
+# infra/kind/scripts/deploy.sh renders it in the ONE environment-root render
+# (content-tagged image, hash-named ConfigMap refs), EXCLUDES it from the root
+# apply, and stores the rendered Deployment in-cluster as ConfigMap
+# `mh-template` (data: deployment.json, revision, baseline).
+# infra/kind/scripts/mh.sh instantiates it once per hostPort slot as Deployment
+# `mh-s<k>` (replicas 1), setting ONLY: the slot/revision/owner labels, the
+# webtransport port's hostPort (= the slot's MH_HOST_PORT), and the
+# MH_WEBTRANSPORT_ADVERTISE_ADDRESS configMapKeyRef name (= slot k's ConfigMap,
+# found by label). Every other field below is identical for every MH.
+#
+# Every MH incarnation owns its client-facing address for its whole life: the
+# scheduler admits one pod per hostPort per node, and a Terminating (draining)
+# pod holds it until gone. Never `kubectl delete pod --force --grace-period=0`
+# an MH pod: that is the one way to defeat the slot lock.
+#
+# The labels below (app=mh-service, component=media) are the ONLY source of
+# the labels infra/services/mh-service/network-policy.yaml selects on: a pod
+# without them is selected by no policy (default-allow on every port).
+# scripts/setup.test.sh pins label ⊇ podSelector. Slot/revision/owner labels
+# are pod labels only, never metric labels (telemetry contract §MH).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mh-1
+  name: mh-template
   namespace: dark-tower
   labels:
     app: mh-service
     component: media
-    instance: mh-1
 spec:
   replicas: 1
+  # Recreate, NOT RollingUpdate: a surge pod would ask for the SAME hostPort as
+  # the running one and sit Pending. Upgrades are mh.sh's start-new-then-drain-old
+  # across two slots; an accidental `kubectl rollout restart`/`set image` on an
+  # mh-s<k> is then sequential reuse of that slot (allowed: ADR-0039 §7), never a
+  # stuck surge. Do not use either on an mh-s<k>; use mh.sh.
   strategy:
-    type: RollingUpdate
+    type: Recreate
   selector:
     matchLabels:
       app: mh-service
       component: media
-      instance: mh-1
   template:
     metadata:
       labels:
         app: mh-service
         component: media
-        instance: mh-1
     spec:
-      # SINGLE SOURCE OF TRUTH for this instance's shutdown drain window.
+      # SINGLE SOURCE OF TRUTH for every MH's shutdown drain window.
       # A kustomize replacement (kustomization.yaml) copies this value into the
       # MH_TERMINATION_GRACE_SECONDS env entry below. Once story task #12 lands,
       # MH derives its drain as min(SETTLE_TARGET, grace - MARGIN) from that env
@@ -52,6 +76,10 @@ spec:
         - name: grpc
           containerPort: 50053
           protocol: TCP
+        # The MH binds 4434/UDP in-container for every slot (the NetworkPolicy's
+        # UDP 4434 ingress rule covers every slot after hostPort DNAT). hostPort
+        # is set per slot by mh.sh (= the slot's MH_HOST_PORT); it is the ONLY
+        # hostPort in this pod (none on health/gRPC, no hostNetwork).
         - name: webtransport
           containerPort: 4434
           protocol: UDP
@@ -94,20 +122,15 @@ spec:
         # is two deploys. STEP 1 IS DONE (story 3): this ref is now
         # `optional: true`. Step 2 deletes key and refs together, scheduled in
         # docs/TODO.md §Media Path Obligations, "Delete the story-3 retired
-        # config keys". Keep this identical in mh-0-deployment.yaml and
-        # mh-1-deployment.yaml.
+        # config keys".
         - name: MH_MAX_STREAMS
           valueFrom:
             configMapKeyRef:
               name: mh-service-config
               key: MH_MAX_STREAMS
               optional: true
-        # QUIC transport parameters (ADR-0036 §1). Shared across both MH
-        # instances, so they live in the shared ConfigMap; see the rationale
-        # comments there. Both instances MUST reference all four: dt-guard
-        # env-config check 1 is per-workload, and a var present in mh-0 but
-        # missing from mh-1 CrashLoops that pod alone once task #12 makes
-        # these required.
+        # QUIC transport parameters (ADR-0036 §1). Shared by every MH, so they
+        # live in the shared ConfigMap; see the rationale comments there.
         - name: MH_MAX_CONCURRENT_UNI_STREAMS
           valueFrom:
             configMapKeyRef:
@@ -137,11 +160,10 @@ spec:
         # rule at MH_MEDIA_LATENCY_SAMPLE_RATIO below); do not copy that
         # pattern for a live key.
         #
-        # PER WORKLOAD, NEVER UNION: mh-0-deployment.yaml and
-        # mh-1-deployment.yaml must carry the identical set. `dt-guard
-        # env-config` rule 1 checks per workload; the env-test in
+        # ONE template, so every MH carries the identical set by construction.
+        # `dt-guard env-config` rule 1 checks this workload; the env-test in
         # crates/env-tests/tests/01_mh_deployment_config.rs checks the live
-        # pods.
+        # pods against it.
         - name: MH_EGRESS_BUDGET_BPS
           valueFrom:
             configMapKeyRef:
@@ -243,8 +265,8 @@ spec:
         # (required reads). MH does not read the minimum keyframe interval
         # (MC-only, story 3 amendment 4). Kustomize rewrites this name to the
         # generator's hashed name in the environment-root render, so a profile
-        # edit rolls mc-0, mc-1, mh-0 and mh-1 together — and an MH roll sheds
-        # every media session on the pod. HARD refs.
+        # edit rolls mc-0 and mc-1 and changes the MH template revision (every MH
+        # is replaced by `mh.sh upgrade`, start-new-then-drain-old). HARD refs.
         - name: MEDIA_VIDEO_MAX_BITRATE_BPS
           valueFrom:
             configMapKeyRef:
@@ -336,8 +358,8 @@ spec:
         # kustomize `replacements:` block in
         # infra/services/mh-service/kustomization.yaml overwrites the `"0"`
         # below with that field at BUILD time. Deliberately NOT a ConfigMap
-        # key: it is a per-instance quantity read off this instance's own pod
-        # spec, and a shared key would be exactly the second, drift-prone
+        # key: it is read off this pod spec's own grace (mh.sh also reads the
+        # pod's grace for its drain bound), and a shared key would be exactly the second, drift-prone
         # literal this derivation exists to remove (R-21).
         #
         # `"0"` is a sentinel, not a value. It is invalid — task #12 requires
@@ -403,11 +425,17 @@ spec:
         # gRPC advertise address uses pod IP (cluster-internal, unchanged)
         - name: MH_GRPC_ADVERTISE_ADDRESS
           value: "grpc://$(POD_IP):50053"
-        # Per-instance explicit WebTransport advertise address from instance ConfigMap
+        # Per-SLOT WebTransport advertise address. HARD ref (never optional).
+        # The name here is the template-input placeholder generator
+        # (slot-template.env), which deploy.sh NEVER applies: mh.sh rewrites this
+        # name to slot k's ConfigMap (labelled dark-tower.io/mh-slot=<k>, built by
+        # deploy.sh:render_env_overlay from the slot table). A pod created from an
+        # unrewritten template therefore fails closed (CreateContainerConfigError)
+        # instead of advertising another slot's address.
         - name: MH_WEBTRANSPORT_ADVERTISE_ADDRESS
           valueFrom:
             configMapKeyRef:
-              name: mh-1-config
+              name: mh-slot-template-config
               key: MH_WEBTRANSPORT_ADVERTISE_ADDRESS
         - name: RUST_LOG
           value: "info,mh_service=debug"

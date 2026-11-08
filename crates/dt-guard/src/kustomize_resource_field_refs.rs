@@ -230,7 +230,7 @@ mod tests {
     /// `limits.memory` via the downward API, with `resources` as given.
     fn mh_shaped(resources: &str, field_ref: &str) -> String {
         format!(
-            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: mh-0\nspec:\n  template:\n    spec:\n      containers:\n      - name: mh-service\n        env:\n        - name: MH_POD_MEMORY_LIMIT_BYTES\n          valueFrom:\n            resourceFieldRef: {field_ref}\n{resources}"
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: mh-template\nspec:\n  template:\n    spec:\n      containers:\n      - name: mh-service\n        env:\n        - name: MH_POD_MEMORY_LIMIT_BYTES\n          valueFrom:\n            resourceFieldRef: {field_ref}\n{resources}"
         )
     }
 
@@ -255,7 +255,7 @@ mod tests {
         let f = check_rendered(&mh_shaped("", NAMED), "t");
         assert_eq!(rules(&f), vec![RESOURCE_FIELD_REF_UNDECLARED_RULE_ID]);
         let d = &f[0].detail;
-        assert!(d.contains("Deployment/mh-0"), "{d}");
+        assert!(d.contains("Deployment/mh-template"), "{d}");
         assert!(d.contains("\"mh-service\""), "{d}");
         assert!(d.contains("resources.limits.memory"), "{d}");
         assert!(d.contains("MH_POD_MEMORY_LIMIT_BYTES"), "{d}");

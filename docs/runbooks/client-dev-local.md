@@ -68,14 +68,15 @@ wrong on the other.
 │                                                                            │
 │   Chrome  ──────────────────────────────────────────────────┐              │
 │     │  http://demo.localhost:5173  (the app)                │              │
-│     │  https://127.0.0.1:4433/4434 (QUIC — MC/MH, direct)   │              │
+│     │  https://127.0.0.1:<port> (QUIC — MC NodePorts, MH     │              │
+│     │   slot ports from `mh.sh list`; direct)                │              │
 │     │                                                        │              │
 │     │  reads: C:\Windows\System32\drivers\etc\hosts          │              │
 │     ▼                                                        ▼              │
 │  ┌────────────────────────── WSL2 ──────────────────────────────────────┐  │
 │  │                                                                       │  │
 │  │  Vite dev server  :5173  ──proxy──►  AC :8443  ·  GC :8444 (TCP)     │  │
-│  │  podman rootlessport ──► Kind node ──► NodePorts ──► pods            │  │
+│  │  podman rootlessport ──► Kind node ──► NodePorts/hostPorts ──► pods  │  │
 │  │  kubectl · cargo · pnpm · env-tests · tcpdump · ss                   │  │
 │  │                                                                       │  │
 │  │  reads: /etc/hosts   (a DIFFERENT file from the one Chrome reads)     │  │
@@ -111,11 +112,11 @@ config's own header comment says so), and the browser demo works with exactly on
 | Config | `infra/kind/kind-config.yaml` (committed) | rendered from `infra/kind/kind-config.yaml.tmpl` |
 | Host ports | the fixed `hostPort` values in that file | allocated per-clone, 20000–29999 |
 | Published on | `127.0.0.1` (loopback, per R-37) | the podman host-gateway IP |
-| MC/MH advertise | the committed IPv4 literals in the per-instance `*-config.env` files | rendered to the gateway IP at deploy time (`infra/kind/scripts/deploy.sh:apply_env_root`) |
+| MC/MH advertise | MC: the committed IPv4 literals in `mc-N-config.env`; MH: the slot ConfigMaps deploy renders from the static kind-config's `127.0.0.1` slot mappings (`mh.sh list`) | rendered to the gateway IP at deploy time (`infra/kind/scripts/deploy.sh:render_env_overlay`) |
 
 **Use the static path.** `scripts/dev-web.sh` defaults to the static host ports, and reads the
-MC/MH advertise addresses from the **committed configmap files on disk** — both of which are only
-true under the static topology.
+MC advertise addresses from the **committed configmap files on disk** — only true under the static
+topology. MH addresses it reads LIVE from `infra/kind/scripts/mh.sh list --json`.
 
 `infra/devloop/dev-cluster` is not an alternative you can choose: it is a client that talks to the
 devloop helper over a unix socket at `/tmp/devloop/helper.sock`, which exists only inside a running
@@ -416,8 +417,9 @@ appears to join, and silently returns no audio. See §4 for telling a real join 
 one.
 
 **One limitation to know — it now blocks rather than misleads.**
-`scripts/dev-web.sh::check_wt_endpoint` reads the MC/MH advertise addresses from the committed
-config files (`*-config.env`) **on disk**, not from the live cluster. On the static topology those
+`scripts/dev-web.sh::check_wt_endpoint` reads the MC advertise addresses from the committed
+config files (`mc-N-config.env`) **on disk**, not from the live cluster (MH is read live, via
+`mh.sh list`, so this limitation is MC-only). On the static topology those
 agree. On a devloop cluster the live ConfigMap is rendered with the gateway address and the on-disk
 file holds the host default, so the check
 validates an address nobody is using.
@@ -430,9 +432,11 @@ the live value before believing the failure (substitute the pod the preflight na
 ```bash
 # --- WSL2 ---
 # ConfigMap names are content-hash-suffixed (ADR-0038); resolve the one the pod uses.
-kubectl get configmap -n dark-tower -o jsonpath='{.data.MH_WEBTRANSPORT_ADVERTISE_ADDRESS}' \
-  "$(kubectl get deployment/mh-0 -n dark-tower \
-     -o jsonpath='{.spec.template.spec.containers[?(@.name=="mh-service")].env[?(@.name=="MH_WEBTRANSPORT_ADVERTISE_ADDRESS")].valueFrom.configMapKeyRef.name}')"
+kubectl get configmap -n dark-tower -o jsonpath='{.data.MC_WEBTRANSPORT_ADVERTISE_ADDRESS}' \
+  "$(kubectl get deployment/mc-0 -n dark-tower \
+     -o jsonpath='{.spec.template.spec.containers[?(@.name=="mc-service")].env[?(@.name=="MC_WEBTRANSPORT_ADVERTISE_ADDRESS")].valueFrom.configMapKeyRef.name}')"
+# MH: the live slot addresses directly (no stale-file caveat)
+./infra/kind/scripts/mh.sh list
 ```
 
 If that disagrees with the on-disk file, the preflight is reporting stale data and the cluster may
@@ -931,7 +935,8 @@ Then rung 4:
 ```bash
 # --- WSL2 ---
 getent ahosts localhost | head -1        # ::1 first => mirrored mode prefers IPv6
-ss -uln | grep -E ':(4433|4434)'         # which family actually has a listener
+./infra/kind/scripts/mh.sh list          # note the serving slots' host ports (<mh-port>)
+ss -uln | grep -E ':(4433|<mh-port>)\b'  # which family actually has a listener
 sudo tcpdump -ni any -c 20 'udp and port 4433'
 ```
 
@@ -943,8 +948,9 @@ address-family problem.
 
 **Fix.** MC and MH must advertise the IPv4 literal, not `localhost`. This is already the committed
 default in `infra/services/mc-service/mc-0-config.env` (key
-`MC_WEBTRANSPORT_ADVERTISE_ADDRESS`) and its `mc-1` / `mh-0` / `mh-1` siblings. If a live ConfigMap
-disagrees with the committed file, it was rendered with a gateway address — go to F8.
+`MC_WEBTRANSPORT_ADVERTISE_ADDRESS`) and its `mc-1` sibling, and every MH slot ConfigMap (rendered from
+the static kind-config's `listenAddress: "127.0.0.1"` slot mappings; `mh.sh list` shows them). If a
+live ConfigMap disagrees, it was rendered with a gateway address — go to F8.
 
 **Why absence-of-signal is the evidence here.** `accepted` is recorded the moment the accept loop
 yields — on arrival of the QUIC Initial packet, **before the TLS handshake** and before any JWT

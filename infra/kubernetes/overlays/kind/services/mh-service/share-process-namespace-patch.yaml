@@ -1,0 +1,19 @@
+# KIND-ONLY TEST INSTRUMENTATION (ADR-0039 §9; listed in the ADR-0038
+# "Kind-only test instrumentation" parity allowlist). NEVER in the base, never
+# in any non-Kind render.
+#
+# Lets the resilience env-tests' zombie leg freeze/resume the MH process
+# (SIGSTOP/SIGCONT from an ephemeral debug container) without killing it.
+# A shared PID namespace lets a co-container reach MH's /proc/<pid>/root (TLS
+# key) and /proc/<pid>/environ (MH_CLIENT_SECRET), so the MH pod stays
+# SINGLE-CONTAINER; the only other container that may ever share it is
+# Kind-only test tooling attached by the env-test fixture.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mh-template
+  namespace: dark-tower
+spec:
+  template:
+    spec:
+      shareProcessNamespace: true

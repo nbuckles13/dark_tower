@@ -183,7 +183,8 @@ spec:
         # sibling base infra/services/media-codec-profile/ — its single home,
         # also read by MH. Kustomize rewrites this name to the generator's
         # hashed name in the environment-root render, so a profile edit rolls
-        # mc-0, mc-1, mh-0 and mh-1 together. HARD refs: required reads.
+        # mc-0 and mc-1 together and changes the MH template revision (every MH
+        # is replaced by `mh.sh upgrade`). HARD refs: required reads.
         - name: MEDIA_VIDEO_CODEC
           valueFrom:
             configMapKeyRef:
@@ -260,7 +261,7 @@ spec:
         # keys and refs together (docs/TODO.md §Media Path Obligations,
         # "Delete the story-3 retired config keys"). Why `optional: true`
         # here does not contradict the "DO NOT flip them" rule is stated once,
-        # in infra/services/mh-service/mh-0-deployment.yaml at
+        # in infra/services/mh-service/deployment.yaml at
         # MH_MEDIA_LATENCY_SAMPLE_RATIO.
         - name: MC_MAX_RECEIVE_SLOTS
           valueFrom:

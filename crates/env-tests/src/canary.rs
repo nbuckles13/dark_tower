@@ -619,7 +619,7 @@ mod tests {
             &canary_name("gate-zero-canary")
         ));
         assert!(!is_canary_name("gate-zero-canary", "gate-zero-canary-xyz"));
-        assert!(!is_canary_name("gate-zero-canary", "mh-0-abcdef12"));
+        assert!(!is_canary_name("gate-zero-canary", "mh-s0-abcdef12"));
         assert!(!is_canary_name("canary", "canaryx-abcdef12"));
     }
 

@@ -128,8 +128,8 @@ use env_tests::fixtures::egress_admission::{
 };
 use env_tests::fixtures::gc_client::{CreateMeetingRequest, GcClient, GcClientError};
 use env_tests::fixtures::kube::{
-    configmap_key, configmap_name_for_all, configmap_u64, live_mh_pods, MC_INSTANCES, MH_INSTANCES,
-    REDEPLOY_HINT,
+    configmap_key, configmap_name_for_all, configmap_name_for_selector, configmap_u64,
+    live_mh_pods, MC_INSTANCES, MH_SELECTOR, REDEPLOY_HINT,
 };
 use env_tests::fixtures::mc_session::{self, McSession, MhSession};
 use env_tests::fixtures::metrics::{
@@ -246,10 +246,11 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
         })
         .max()
         .expect("PRECONDITION: at least one ceiling");
-    // Resolved ONCE per test, from EVERY instance (they must agree): the live,
+    // Resolved ONCE per test, from EVERY MC instance and EVERY MH pod (each set
+    // must agree): the live,
     // content-addressed generations the pods run (ADR-0038 §2).
     let mc_config = configmap_name_for_all(MC_INSTANCES, "mc-service-config");
-    let mh_config = configmap_name_for_all(MH_INSTANCES, "mh-service-config");
+    let mh_config = configmap_name_for_selector(MH_SELECTOR, "mh-service-config");
     let slot_cap = configmap_u64(&mc_config, "MC_MAX_AUDIO_RECEIVE_SLOTS");
     let (participants, slots) = size_meeting(ceiling, slot_cap);
 

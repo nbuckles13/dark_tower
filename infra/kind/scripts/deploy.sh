@@ -7,7 +7,9 @@
 #   (content-tagged; loaded into Kind only when the node lacks that ref) ->
 #   PostgreSQL + Redis -> migration Job (Complete) -> seeds -> OTel collector
 #   (Ready-gated, R-54 ordering) -> the ONE environment root
-#   (infra/kubernetes/overlays/kind/) -> wait for every workload -> prune.
+#   (infra/kubernetes/overlays/kind/; the MH template is rendered there but stored
+#   as ConfigMap mh-template, never applied) -> wait for every root workload ->
+#   the MH pool (mh.sh upgrade, then top up to baseline B) -> prune.
 #
 # Content-tagged images and content-addressed ConfigMaps roll EXACTLY the
 # workloads whose image or configuration changed; nothing is restarted
@@ -29,6 +31,16 @@
 # Failure lines (setup-level tokens, relayed by Layer 7 under
 # REASON=cluster-deploy-failed; docs/runbooks/devloop-validation.md §6.7):
 #   DEPLOY_FAILED REASON=<blueprint-changed|blueprint-missing|blueprint-unreadable|collector-rollout-failed|rollout-failed> WORKLOADS=...
+#   DEPLOY_FAILED REASON=<mh-no-free-slot|mh-rollout-failed|mh-pool-failed> MH_TOKEN=<mh.sh REASON|-> SLOT=<k|-> WORKLOADS=<mh-s<k>|->
+#     — the MH pool step (converge_mh_pool), mapped from mh.sh's result token by the ONE table
+#     MH_DEPLOY_REASONS: mh-no-free-slot (no slot for an upgrade or top-up; also deploy's own
+#     B + 1 > K headroom check, MH_TOKEN=-), mh-rollout-failed (mh.sh mh-rollout-failed |
+#     not-available-timeout: a new MH never went Available; the old MH keeps serving), and
+#     mh-pool-failed (EVERY other mh.sh token — kubectl-failed, mh-pool-busy, no-template,
+#     drain-timeout, stuck-terminating, ...: a pool/tool fault, never folded into a rollout).
+#     mh.sh prerequisite-missing maps to prerequisite-missing, and every UNMAPPED token is first
+#     run through classify_env_failure: a dead apiserver/runtime is apiserver-unreachable /
+#     runtime-unreachable (operator lane), MH_TOKEN/SLOT kept on the line.
 #   DEPLOY_FAILED REASON=<insufficient-disk|prerequisite-missing|image-ref-read-failed> WORKLOADS=-
 #   DEPLOY_FAILED REASON=<runtime-unreachable|apiserver-unreachable> STEP=<main step> WORKLOADS=-
 #     — from main's EXIT trap when a step failed AND the shared bounded environment probe
@@ -84,11 +96,11 @@ done
 # The one DEPLOY_FAILED line of this run (Layer 7 lifts it into
 # REASON=cluster-deploy-failed). Records that it was printed, so main's EXIT
 # trap adds its generic `step-failed` line only when no specific one exists.
-# Usage: deploy_failed <reason> <workloads|->
+# Usage: deploy_failed <reason> <workloads|-> [extra fields, placed before WORKLOADS]
 DEPLOY_FAILED_EMITTED=false
 deploy_failed() {
     DEPLOY_FAILED_EMITTED=true
-    echo "DEPLOY_FAILED REASON=$1 WORKLOADS=$2" >&2
+    echo "DEPLOY_FAILED REASON=$1 ${3:+$3 }WORKLOADS=$2" >&2
 }
 
 # Print every container image named in rendered YAML on stdin, one per line.
@@ -610,17 +622,132 @@ cached_render() {
     esac
 }
 
-# The per-instance MC/MH ConfigMaps whose advertise address a devloop cluster
+# The per-instance MC ConfigMaps whose advertise address a devloop cluster
 # overrides, DERIVED from the per-instance generator sources on disk (not a
 # hand-kept list): adding mc-2 means adding mc-2-config.env, and the override
-# follows. Prints `mc-0`, `mc-1`, … one per line, sorted.
+# follows. Prints `mc-0`, `mc-1`, … one per line, sorted. MC ONLY: MH has no
+# fixed instances — its addresses are per hostPort slot (mh_slot_table).
 advertise_instances() {
     local f base
-    for f in "${PROJECT_ROOT}"/infra/services/m[ch]-service/m[ch]-[0-9]*-config.env; do
+    for f in "${PROJECT_ROOT}"/infra/services/mc-service/mc-[0-9]*-config.env; do
         [[ -e "$f" ]] || continue
         base="${f##*/}"
         printf '%s\n' "${base%-config.env}"
     done | sort
+}
+
+# THE client-facing advertise URL for <host> <port> — one formatter for the MC
+# per-instance overrides and the MH slot table.
+advertise_url() {
+    printf 'https://%s:%s\n' "$1" "$2"
+}
+
+# --- MH hostPort slot pool (ADR-0039 §7 "Kind") ------------------------------
+#
+# deploy.sh PRODUCES the cluster-side interface infra/kind/scripts/mh.sh consumes
+# (see mh.sh's header): ConfigMap `mh-template` (deployment.json, revision,
+# baseline) and one ConfigMap per slot labelled dark-tower.io/mh-slot=<k> (keys
+# MH_WEBTRANSPORT_ADVERTISE_ADDRESS, MH_HOST_PORT). TRUST BOUNDARY: write access
+# to those ConfigMaps amounts to "run an arbitrary pod spec with a hostPort" (mh.sh
+# instantiates them). Acceptable in Kind under today's RBAC (the same principal
+# already applies every manifest); slot values come ONLY from mh_slot_table (the
+# blueprint-verified kind-config), never from caller input.
+# The MH pool tool. DT_MH_SH (the same variable scripts/layer7.sh exports for the
+# env-tests) may name another copy; it must be an existing executable.
+MH_SH="${DT_MH_SH:-${SCRIPT_DIR}/mh.sh}"
+# The ONE bash spelling of the slot marker the devloop helper emits before each
+# slot mapping (crates/devloop-helper/src/ports.rs:MH_SLOT_MARKER; pinned equal
+# by scripts/setup.test.sh).
+MH_SLOT_MARKER='# dt:mh-slot='
+# The template Deployment's name in the base (infra/services/mh-service/deployment.yaml).
+MH_TEMPLATE_DEPLOYMENT="mh-template"
+# Docs labelled with this are template INPUTS (the placeholder advertise
+# ConfigMap): rendered, NEVER applied.
+MH_TEMPLATE_INPUT_LABEL="dark-tower.io/mh-template-input"
+MH_SLOT_LABEL="dark-tower.io/mh-slot"
+MH_TEMPLATE_CM="mh-template"
+MH_FLEET_KEY="MH_BASELINE"
+# B's one home (the Kind overlay; see its header).
+MH_FLEET_ENV="${PROJECT_ROOT}/infra/kubernetes/overlays/kind/services/mh-service/mh-fleet.env"
+MH_BASELINE_OWNER="baseline"
+# The kind config the cluster was built from (check_blueprint proved it).
+KIND_CONFIG_FILE="${DT_KIND_CONFIG:-${PROJECT_ROOT}/${DT_STATIC_KIND_CONFIG_REL}}"
+
+# THE slot-table source (ADR-0039 §7; also GC-2's allowlist input): one line per
+# MH hostPort slot, `<slot> <host_port> <advertise_url>`, sorted by slot. Read
+# from the kind config the cluster was built from — the helper's render (from its
+# port table, crates/devloop-helper/src/ports.rs, K's one home) or the static
+# manual-dev file — so the advertised address is by construction where the slot
+# is published: https://<listenAddress>:<hostPort>. Host port == node
+# containerPort == pod hostPort == MH_HOST_PORT. Fails loudly (non-zero, one
+# `mh_slot_table:` line naming the fault) on any malformed table.
+mh_slot_table() {
+    local cfg="${KIND_CONFIG_FILE}" rows k cp hp la proto n=0 seen_k=" " seen_p=" "
+    if [[ ! -f "${cfg}" ]]; then
+        log_error "mh_slot_table: kind config not found: ${cfg}"
+        return 1
+    fi
+    if kind_config_unrendered_line "${cfg}" >/dev/null; then
+        log_error "mh_slot_table: ${cfg} has an unsubstituted \${...} placeholder — it was rendered by a devloop-helper built from an older tree. Rebuild the helper on the HOST, then recreate the cluster ($(remedy "'dev-cluster recreate'" "'./infra/kind/scripts/setup.sh'"))."
+        return 1
+    fi
+    rows="$(awk -v marker="${MH_SLOT_MARKER}" '
+        function flush() { if (slot != "") print slot, (cp == "" ? "-" : cp), (hp == "" ? "-" : hp), (la == "" ? "-" : la), (pr == "" ? "TCP" : pr); slot = ""; cp = ""; hp = ""; la = ""; pr = "" }
+        { line = $0; sub(/^[[:space:]]+/, "", line) }
+        index(line, marker) == 1 { flush(); pending = substr(line, length(marker) + 1); gsub(/[[:space:]]/, "", pending); next }
+        line ~ /^- containerPort:/ { flush(); if (pending != "") { slot = pending; pending = ""; cp = line; sub(/^- containerPort:[[:space:]]*/, "", cp) } ; next }
+        slot != "" && line ~ /^hostPort:/ { hp = line; sub(/^hostPort:[[:space:]]*/, "", hp) }
+        slot != "" && line ~ /^listenAddress:/ { la = line; sub(/^listenAddress:[[:space:]]*/, "", la); gsub(/"/, "", la) }
+        slot != "" && line ~ /^protocol:/ { pr = line; sub(/^protocol:[[:space:]]*/, "", pr) }
+        slot != "" && line !~ /^(hostPort|listenAddress|protocol):/ && line !~ /^#/ && line != "" { flush() }
+        END { flush() }' "${cfg}" | sort -n -k1,1)"
+    if [[ -z "${rows}" ]]; then
+        log_error "mh_slot_table: no MH slot mappings ('${MH_SLOT_MARKER}<k>') in ${cfg} — a cluster built from an older tree or helper. Rebuild the helper on the HOST, then recreate the cluster ($(remedy "'dev-cluster recreate'" "'./infra/kind/scripts/setup.sh'"))."
+        return 1
+    fi
+    while read -r k cp hp la proto; do
+        if [[ ! "${k}" =~ ^(0|[1-9][0-9]{0,3})$ ]]; then
+            log_error "mh_slot_table: slot marker '${MH_SLOT_MARKER}${k}' is not a decimal slot number (${cfg})"; return 1
+        fi
+        if [[ ! "${hp}" =~ ^[1-9][0-9]{0,4}$ ]] || (( hp > 65535 )); then
+            log_error "mh_slot_table: slot ${k}: hostPort '${hp}' is not a port (${cfg})"; return 1
+        fi
+        if [[ "${proto}" != "UDP" ]]; then
+            log_error "mh_slot_table: slot ${k}: protocol is '${proto}', not UDP (${cfg})"; return 1
+        fi
+        if [[ "${cp}" != "${hp}" ]]; then
+            log_error "mh_slot_table: slot ${k}: containerPort ${cp} != hostPort ${hp} — the node port must equal the published port (${cfg})"; return 1
+        fi
+        if [[ ! "${la}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "${la}" == "0.0.0.0" ]]; then
+            log_error "mh_slot_table: slot ${k}: listenAddress '${la}' is not a bound IPv4 address (${cfg})"; return 1
+        fi
+        if [[ -n "${DT_HOST_GATEWAY_IP:-}" && "${la}" != "${DT_HOST_GATEWAY_IP}" ]]; then
+            log_error "mh_slot_table: slot ${k}: listenAddress ${la} != DT_HOST_GATEWAY_IP ${DT_HOST_GATEWAY_IP} — the cluster was built for another gateway. Recreate it ($(remedy "'dev-cluster recreate'" "'./infra/kind/scripts/setup.sh'"))."
+            return 1
+        fi
+        if [[ "${seen_k}" == *" ${k} "* ]]; then
+            log_error "mh_slot_table: duplicate slot ${k} (${cfg})"; return 1
+        fi
+        if [[ "${seen_p}" == *" ${hp} "* ]]; then
+            log_error "mh_slot_table: duplicate slot port ${hp} (${cfg})"; return 1
+        fi
+        seen_k+="${k} "; seen_p+="${hp} "
+        printf '%s %s %s\n' "${k}" "${hp}" "$(advertise_url "${la}" "${hp}")"
+        n=$((n + 1))
+    done <<< "${rows}"
+    (( n > 0 ))
+}
+
+# The pod subnet of the kind config the cluster was built from (GC-2's internal
+# MH gRPC CIDR allowlist input). Fails loudly when absent.
+kind_pod_subnet() {
+    local v
+    v="$(awk '/^[[:space:]]*podSubnet:/ { v = $2; gsub(/"/, "", v); print v; exit }' "${KIND_CONFIG_FILE}")"
+    if [[ ! "${v}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]]; then
+        log_error "kind_pod_subnet: no valid networking.podSubnet in ${KIND_CONFIG_FILE} (got '${v}')"
+        return 1
+    fi
+    printf '%s\n' "${v}"
 }
 
 # The first-party repos (`localhost/<name>`, tag stripped) the cached render $1
@@ -723,8 +850,15 @@ resolve_image_refs() {
 # `:render-required`, which nothing loads). A render with any root repo lacking
 # a resolved ref fails.
 #
+# It ALWAYS carries one ConfigMap generator per MH hostPort slot,
+# `mh-slot-<k>-config` (labelled dark-tower.io/mh-slot=<k>; keys
+# MH_WEBTRANSPORT_ADVERTISE_ADDRESS and MH_HOST_PORT), from mh_slot_table — the
+# per-slot half of mh.sh's cluster-side interface. Content-addressed like every
+# generator; deploy never deletes an old generation (a live MH pod may reference
+# it), it only un-labels it (retire_stale_slot_configmaps).
+#
 # With DT_HOST_GATEWAY_IP set (a devloop cluster) it also carries the advertise
-# address of each MC/MH pod (host-gateway IP + the helper's per-slug port). That
+# address of each MC pod (host-gateway IP + the helper's per-slug port). That
 # used to be `kubectl patch`ed onto the live ConfigMap after apply, which (a)
 # addresses a literal ConfigMap name that no longer exists once names are
 # content-addressed and (b) sits outside the render, so the next apply reverts
@@ -736,7 +870,7 @@ resolve_image_refs() {
 # not fall back to the plain root (that would run placeholder images, or
 # silently advertise localhost).
 render_env_overlay() {
-    local dir="$1" rel inst svc idx svc_uc port_var port instances repos repo ref
+    local dir="$1" rel inst svc idx svc_uc port_var port instances repos repo ref slots k addr
     repos="$(root_repos)" || return 1
     if [[ -z "${repos}" ]]; then
         log_error "render_env_overlay: no first-party (localhost/) images in ${ENV_ROOT_REL}"
@@ -765,6 +899,23 @@ render_env_overlay() {
         } >> "${dir}/kustomization.yaml"
     done <<< "${repos}"
 
+    slots="$(mh_slot_table)" || return 1
+    echo "configMapGenerator:" >> "${dir}/kustomization.yaml"
+    while read -r k port addr; do
+        {
+            echo "  - name: mh-slot-${k}-config"
+            echo "    namespace: dark-tower"
+            echo "    literals:"
+            echo "      - \"MH_WEBTRANSPORT_ADVERTISE_ADDRESS=${addr}\""
+            echo "      - \"MH_HOST_PORT=${port}\""
+            echo "    options:"
+            echo "      labels:"
+            echo "        app: mh-service"
+            echo "        component: media"
+            echo "        ${MH_SLOT_LABEL}: \"${k}\""
+        } >> "${dir}/kustomization.yaml"
+    done <<< "${slots}"
+
     [[ -n "${DT_HOST_GATEWAY_IP:-}" ]] || return 0
     if [[ ! "${DT_HOST_GATEWAY_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "${DT_HOST_GATEWAY_IP}" == "0.0.0.0" ]]; then
         log_error "render_env_overlay: DT_HOST_GATEWAY_IP is invalid: '${DT_HOST_GATEWAY_IP}'"
@@ -772,10 +923,9 @@ render_env_overlay() {
     fi
     instances="$(advertise_instances)"
     if [[ -z "${instances}" ]]; then
-        log_error "render_env_overlay: no per-instance generator sources (infra/services/m[ch]-service/m[ch]-N-config.env) found"
+        log_error "render_env_overlay: no per-instance generator sources (infra/services/mc-service/mc-N-config.env) found"
         return 1
     fi
-    echo "configMapGenerator:" >> "${dir}/kustomization.yaml"
     while IFS= read -r inst; do
         svc="${inst%%-*}"
         idx="${inst#*-}"
@@ -791,15 +941,44 @@ render_env_overlay() {
             echo "    namespace: dark-tower"
             echo "    behavior: merge"
             echo "    literals:"
-            echo "      - \"${svc_uc}_WEBTRANSPORT_ADVERTISE_ADDRESS=https://${DT_HOST_GATEWAY_IP}:${port}\""
+            echo "      - \"${svc_uc}_WEBTRANSPORT_ADVERTISE_ADDRESS=$(advertise_url "${DT_HOST_GATEWAY_IP}" "${port}")\""
         } >> "${dir}/kustomization.yaml"
     done <<< "${instances}"
 }
+
+# Render the wrapper in $1 and print it as ONE JSON object per line (jq -c).
+# YAML -> JSON offline via `kubectl annotate --local` (no apiserver, no file):
+# the marker annotation it needs is stripped again. The render carries Secrets,
+# so it only ever flows through pipes — never a file, never stdout of deploy.
+render_env_root_json() {
+    kubectl kustomize "$1" | yaml_docs_to_json
+}
+
+# THE one YAML -> JSON converter (rendered YAML on stdin -> one JSON object per
+# line): offline `kubectl annotate --local` (no apiserver, no file), its marker
+# annotation stripped again. Pipes only (a render may carry Secrets).
+yaml_docs_to_json() {
+    local mark="dark-tower.io/deploy-render"
+    kubectl annotate --local -f - -o json "${mark}=1" \
+        | jq -c --arg m "${mark}" 'del(.metadata.annotations[$m])
+            | if (.metadata.annotations // {}) == {} then del(.metadata.annotations) else . end'
+}
+
+# jq predicate: is this rendered doc an MH template INPUT (never applied)? The
+# template Deployment itself, and every doc labelled MH_TEMPLATE_INPUT_LABEL
+# (the placeholder advertise ConfigMap).
+MH_TEMPLATE_PART_JQ='def mh_template_part($n; $l): (.kind == "Deployment" and .metadata.name == $n) or (((.metadata.labels // {})[$l] // "") == "true");'
 
 # Apply the environment root, ALWAYS through the wrapper rendered above — chosen
 # HERE and nowhere else, so no caller can apply the plain root (placeholder
 # images; on a devloop cluster, localhost advertise addresses). A render failure
 # aborts; there is no fallback. Requires IMAGE_REFS (resolve_image_refs).
+#
+# The MH template is rendered in this SAME render (content-tagged image,
+# hash-named refs) but EXCLUDED from the apply, together with its template
+# inputs; it is stored as ConfigMap mh-template (write_mh_template) for mh.sh.
+# No `--prune`: nothing here can delete an mh-s<k> Deployment or a ConfigMap
+# generation a live pod references.
 # The body is a subshell so the temp dir's EXIT trap fires on every exit path.
 apply_env_root() (
     set -euo pipefail
@@ -809,19 +988,109 @@ apply_env_root() (
         log_error "Could not render the environment overlay; NOT applying (the plain root runs placeholder images and, on a devloop cluster, advertises localhost)."
         exit 1
     fi
-    log_step "Applying environment root ${ENV_ROOT_REL} (content-tagged images${DT_HOST_GATEWAY_IP:+; devloop advertise addresses via ${DT_HOST_GATEWAY_IP}})..."
-    ${KUBECTL} apply -k "${wrap}"
+    local docs
+    if ! docs="$(render_env_root_json "${wrap}")"; then
+        log_error "Could not render ${ENV_ROOT_REL} to JSON; NOT applying."
+        exit 1
+    fi
+    log_step "Applying environment root ${ENV_ROOT_REL} (content-tagged images${DT_HOST_GATEWAY_IP:+; devloop advertise addresses via ${DT_HOST_GATEWAY_IP}}; MH template stored, not applied)..."
+    printf '%s\n' "${docs}" \
+        | jq -s -c --arg n "${MH_TEMPLATE_DEPLOYMENT}" --arg l "${MH_TEMPLATE_INPUT_LABEL}" \
+            "${MH_TEMPLATE_PART_JQ}"' {apiVersion: "v1", kind: "List", items: [.[] | select(mh_template_part($n; $l) | not)]}' \
+        | ${KUBECTL} apply -f -
+    retire_stale_slot_configmaps "${docs}"
+    write_mh_template "${docs}"
 )
+
+# Un-label (never delete) every ConfigMap labelled MH_SLOT_LABEL that this
+# render did not produce: a superseded hash-named slot generation would
+# otherwise be a duplicate slot to mh.sh (`no-template`). A live MH pod may still
+# reference it by name, so it is kept (ConfigMap generations are never pruned).
+# Args: $1 = the render (render_env_root_json output).
+retire_stale_slot_configmaps() {
+    local current live name
+    current="$(printf '%s\n' "$1" | jq -r --arg l "${MH_SLOT_LABEL}" \
+        'select(.kind == "ConfigMap" and ((.metadata.labels // {})[$l] // "") != "") | .metadata.name')"
+    if [[ -z "${current}" ]]; then
+        log_error "retire_stale_slot_configmaps: the render has no ConfigMap labelled ${MH_SLOT_LABEL}"
+        return 1
+    fi
+    live="$(${KUBECTL} get configmaps -n dark-tower -l "${MH_SLOT_LABEL}" \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')" || return 1
+    while IFS= read -r name; do
+        [[ -n "${name}" ]] || continue
+        grep -qxF "${name}" <<< "${current}" && continue
+        log_info "Retiring superseded slot ConfigMap ${name} (label removed; kept for any live pod that references it)."
+        ${KUBECTL} label configmap "${name}" -n dark-tower "${MH_SLOT_LABEL}-" >/dev/null
+    done <<< "${live}"
+}
+
+# The template revision: the first 16 hex of sha256 over the canonical
+# (sorted-key, compact) rendered Deployment JSON on stdin. THE one derivation.
+mh_template_revision() {
+    jq -S -c . | sha256sum | cut -c1-16
+}
+
+# Store the rendered MH template as ConfigMap mh-template — the template half of
+# mh.sh's cluster-side interface: deployment.json, revision, baseline (B, from
+# the Kind overlay's mh-fleet.env, its one home), plus the additive
+# `previous_images` (the images of the revision this one replaces; carried
+# forward on an unchanged revision) that prune_superseded_images keeps for
+# rollback, because per-slot Deployments have no rollout history.
+# Args: $1 = the render (render_env_root_json output).
+write_mh_template() {
+    local docs="$1" tpl n fleet baseline rev old old_rev old_prev prev
+    tpl="$(printf '%s\n' "${docs}" | jq -c --arg n "${MH_TEMPLATE_DEPLOYMENT}" \
+        'select(.kind == "Deployment" and .metadata.name == $n)')"
+    n="$(grep -c . <<< "${tpl}" || true)"
+    if (( n != 1 )); then
+        log_error "write_mh_template: expected exactly one Deployment/${MH_TEMPLATE_DEPLOYMENT} in ${ENV_ROOT_REL}, found ${n}"
+        return 1
+    fi
+    if [[ "$(jq -r '.spec.template.metadata.labels.app // ""' <<< "${tpl}")" != "mh-service" ]]; then
+        log_error "write_mh_template: Deployment/${MH_TEMPLATE_DEPLOYMENT} pod template is not labelled app=mh-service"
+        return 1
+    fi
+    fleet="$(grep -E "^${MH_FLEET_KEY}=" "${MH_FLEET_ENV}" 2>/dev/null | sed "s/^${MH_FLEET_KEY}=//" || true)"
+    if [[ "$(grep -c . <<< "${fleet}" || true)" -ne 1 || ! "${fleet}" =~ ^[1-9][0-9]{0,2}$ ]]; then
+        log_error "write_mh_template: expected exactly one ${MH_FLEET_KEY}=<integer >= 1> line in ${MH_FLEET_ENV}, got '${fleet//$'\n'/,}'"
+        return 1
+    fi
+    baseline="${fleet}"
+    rev="$(mh_template_revision <<< "${tpl}")"
+    old="$(${KUBECTL} get configmap "${MH_TEMPLATE_CM}" -n dark-tower --ignore-not-found -o json)" || return 1
+    prev=""
+    if [[ -n "${old}" ]]; then
+        old_rev="$(jq -r '.data.revision // ""' <<< "${old}")"
+        old_prev="$(jq -r '.data.previous_images // ""' <<< "${old}")"
+        if [[ "${old_rev}" == "${rev}" ]]; then
+            prev="${old_prev}"
+        else
+            prev="$(jq -r '.data["deployment.json"] // "{}" | fromjson | [.spec.template.spec.containers[]?.image] | unique | join(" ")' <<< "${old}")" || return 1
+        fi
+    fi
+    log_info "MH template revision ${rev} (baseline ${baseline})."
+    ${KUBECTL} create configmap "${MH_TEMPLATE_CM}" -n dark-tower --dry-run=client -o json \
+        --from-literal=deployment.json="${tpl}" \
+        --from-literal=revision="${rev}" \
+        --from-literal=baseline="${baseline}" \
+        --from-literal=previous_images="${prev}" \
+        | jq -c '.metadata.labels = {"app": "mh-service", "managed-by": "dark-tower"}' \
+        | ${KUBECTL} apply -f - >/dev/null
+}
 
 # Workloads the environment root owns, DERIVED from its render (so a new
 # workload is waited on without editing a list): `<namespace> <kind>/<name>`,
 # one per line. With $1 (a repo, e.g. `localhost/mc-service`) set, only the
 # workloads whose pod template runs an image of that repo.
+#
+# The MH template Deployment is EXCLUDED: it is never applied (mh.sh runs the
+# per-slot mh-s<k> instances; converge_mh_pool waits for those).
 env_root_workloads() {
     local repo="${1:-}"
-    cached_render root | awk -v img="${repo:+${repo}:}" '
+    cached_render root | awk -v img="${repo:+${repo}:}" -v tpl="${MH_TEMPLATE_DEPLOYMENT}" '
         function emit() {
-            if (k ~ /^(Deployment|StatefulSet|DaemonSet)$/ && (img == "" || has_img)) print ns " " tolower(k) "/" n
+            if (k ~ /^(Deployment|StatefulSet|DaemonSet)$/ && (img == "" || has_img) && !(k == "Deployment" && n == tpl)) print ns " " tolower(k) "/" n
             k = ""; n = ""; ns = ""; has_img = 0; m = 0
         }
         /^---/ { emit(); next }
@@ -879,6 +1148,112 @@ wait_for_env_root() {
         return 1
     fi
     log_info "All $(wc -l <<< "${workloads}") workloads rolled out."
+}
+
+# --- The MH pool (ADR-0039 §7 "On demand", §10) ------------------------------
+#
+# The ONE mapping from an mh.sh result token to deploy's DEPLOY_FAILED reason.
+# Anything not listed is `mh-pool-failed` (a pool/tool fault — apiserver, lock,
+# template, drain — never folded into a rollout failure). mh.sh's own token and
+# slot ride on the line as MH_TOKEN= / SLOT=.
+declare -A MH_DEPLOY_REASONS=(
+    [mh-no-free-slot]=mh-no-free-slot
+    [mh-rollout-failed]=mh-rollout-failed
+    [not-available-timeout]=mh-rollout-failed
+    [prerequisite-missing]=prerequisite-missing
+)
+MH_DEPLOY_REASON_DEFAULT="mh-pool-failed"
+MH_OUT=""
+
+# Run `mh.sh <args> --json`; its JSON object lands in MH_OUT (a global, NOT
+# stdout: mh_run must run in THIS shell so deploy_failed's "already emitted" flag
+# survives and the EXIT trap adds no second line). On failure, map its
+# `.reason` token (the contract field; never stderr text, never an exit-code
+# literal) to ONE DEPLOY_FAILED line and return 1. mh.sh's human stderr (and its
+# final MH_RESULT line) passes through for diagnosis.
+mh_run() {
+    local out rc=0 token slot reason
+    MH_OUT=""
+    out="$("${MH_SH}" "$@" --json)" || rc=$?
+    if (( rc == 0 )) && jq -e '.ok == true' >/dev/null 2>&1 <<< "${out}"; then
+        MH_OUT="${out}"
+        return 0
+    fi
+    token="$(jq -r '.reason // empty' 2>/dev/null <<< "${out}" || true)"
+    slot="$(jq -r '.slot // empty' 2>/dev/null <<< "${out}" || true)"
+    [[ "${token}" =~ ^[a-z][a-z-]*$ ]] || token="internal-error"
+    [[ "${slot}" =~ ^[0-9]+$ ]] || slot=""
+    reason="${MH_DEPLOY_REASONS[${token}]:-}"
+    if [[ -z "${reason}" ]]; then
+        # Unmapped (kubectl-failed, no-kubeconfig, internal-error, ...): classify the
+        # ENVIRONMENT first, exactly as main's EXIT trap does for every other step,
+        # so a dead apiserver lands in the operator lane, not as a pool fault.
+        reason="$(classify_env_failure apiserver)"
+        reason="${reason:-${MH_DEPLOY_REASON_DEFAULT}}"
+    fi
+    log_error "mh.sh $1 failed: REASON=${token}${slot:+ SLOT=${slot}} (exit ${rc}; see the MH_RESULT line above). Old MHs are untouched and keep serving."
+    local workloads="-"
+    [[ -z "${slot}" ]] || workloads="mh-s${slot}"
+    deploy_failed "${reason}" "${workloads}" "MH_TOKEN=${token} SLOT=${slot:--}"
+    return 1
+}
+
+# jq over a `mh.sh list --json` object: the slots baseline-owned MHs occupy that
+# count toward B (starting or serving; a draining/terminating one is leaving).
+MH_BASELINE_SLOTS_JQ='[.slots[] | select(.owner == $o and (.state == "serving" or .state == "starting")) | .slot]'
+
+# The first-party repo (tag stripped) the MH template runs, from the cached root
+# render (through the ONE YAML->JSON converter; the same tag strip as
+# first_party_repos_of). Empty when it cannot be found.
+mh_template_repo() {
+    cached_render root | yaml_docs_to_json \
+        | jq -r --arg n "${MH_TEMPLATE_DEPLOYMENT}" 'select(.kind == "Deployment" and .metadata.name == $n)
+            | .spec.template.spec.containers[].image | select(startswith("localhost/")) | sub(":[^:/]*$"; "")' \
+        | sort -u
+}
+
+# Converge the MH pool to the tree, after the root (GC must be Ready for an MH
+# to register): `mh.sh upgrade` (serial start-new-then-drain-old for every MH
+# whose revision != mh-template's), then top up with `mh.sh up --owner baseline`
+# (or drain extra baseline MHs, highest slot first) until exactly B baseline MHs
+# serve. B is read back from mh-template (`.baseline`), never retyped. On any
+# failure the old MH keeps serving (mh.sh guarantees it) and ONE DEPLOY_FAILED line
+# names the cause (mh_run).
+converge_mh_pool() {
+    log_step "Converging the MH pool (mh.sh upgrade, then baseline top-up)..."
+    local list k_slots b have k i
+    mh_run list || return 1; list="${MH_OUT}"
+    k_slots="$(jq -r '.slots | length' <<< "${list}")"
+    b="$(jq -r '.baseline' <<< "${list}")"
+    if [[ ! "${b}" =~ ^[1-9][0-9]{0,2}$ || ! "${k_slots}" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "mh.sh list returned baseline '${b}' / ${k_slots} slots: B must be an integer >= 1 and K >= 1 (a B of 0 would 'converge' to zero MHs)."
+        deploy_failed mh-pool-failed - "MH_TOKEN=- SLOT=-"
+        return 1
+    fi
+    if (( b + 1 > k_slots )); then
+        log_error "MH baseline B=${b} needs B+1 <= K hostPort slots (an upgrade starts the new MH before draining the old), but K=${k_slots}. Lower MH_BASELINE (${MH_FLEET_ENV#"${PROJECT_ROOT}"/}) or raise K (crates/devloop-helper/src/ports.rs; cluster recreate)."
+        deploy_failed mh-no-free-slot - "MH_TOKEN=- SLOT=-"
+        return 1
+    fi
+    mh_run upgrade || return 1
+    mh_run list || return 1; list="${MH_OUT}"
+    have="$(jq -r --arg o "${MH_BASELINE_OWNER}" "${MH_BASELINE_SLOTS_JQ}"' | length' <<< "${list}")"
+    for (( i = have; i < b; i++ )); do
+        mh_run up --owner "${MH_BASELINE_OWNER}" || return 1
+    done
+    for (( i = have; i > b; i-- )); do
+        k="$(jq -r --arg o "${MH_BASELINE_OWNER}" "${MH_BASELINE_SLOTS_JQ}"' | max' <<< "${list}")"
+        mh_run drain "${k}" --owner "${MH_BASELINE_OWNER}" || return 1
+        mh_run list || return 1; list="${MH_OUT}"
+    done
+    mh_run list || return 1; list="${MH_OUT}"
+    have="$(jq -r --arg o "${MH_BASELINE_OWNER}" '[.slots[] | select(.owner == $o and .state == "serving" and (.stale | not))] | length' <<< "${list}")"
+    if (( have != b )); then
+        log_error "MH pool did not converge: ${have} current-revision baseline MHs serving, expected B=${b}."
+        deploy_failed mh-pool-failed - "MH_TOKEN=- SLOT=-"
+        return 1
+    fi
+    log_info "MH pool: ${have} baseline MHs serving (B=${b}, K=${k_slots})."
 }
 
 # --- Migrations as an in-cluster Job (ADR-0038 §2 step 3) -----------------
@@ -1128,9 +1503,21 @@ previous_generation_refs() {
 # that devloop's build and its `kind load` makes the load fail LOUDLY there —
 # never wrong code. Only refs THIS cluster's node held are evicted (not every
 # sha-* on the host), which keeps that window narrow.
+#
+# MH (ADR-0039 §10): per-slot Deployments have no rollout history, so the MH repo's
+# keep set is the ref this converge deploys ∪ the images of EVERY LIVE MH pod (an
+# old revision mid-upgrade must crash-restart in place) ∪ mh-template's
+# `previous_images` (the revision before this one, for rollback). If any of those
+# cannot be read, the MH repo is NOT pruned, loudly (PRUNE_SKIPPED). ConfigMap
+# generations referenced by a live MH pod are never pruned (no ConfigMap is).
 prune_superseded_images() {
-    local repo ref cmd node listed keep prev
+    local repo ref cmd node listed keep prev mh_repo mh_tpl_images="" mh_keep="" mh_ok=true
     cmd="$(container_cmd)"
+    mh_repo="$(mh_template_repo)"
+    if [[ -z "${mh_repo}" ]]; then
+        echo "PRUNE_SKIPPED SERVICE=all REASON=mh-repo-unknown (no image in Deployment/${MH_TEMPLATE_DEPLOYMENT} of the root render; not pruning anything)" >&2
+        return 0
+    fi
     node="$(kind_node)"
     if [[ -z "${node}" ]]; then
         echo "PRUNE_WARN REASON=image-prune-failed REF=- WHERE=node (kind lists no node for ${CLUSTER_NAME})" >&2
@@ -1140,8 +1527,21 @@ prune_superseded_images() {
         echo "PRUNE_WARN REASON=image-prune-failed REF=- WHERE=node (crictl images failed in ${node})" >&2
         return 0
     fi
+    if ! mh_tpl_images="$(${KUBECTL} get configmap "${MH_TEMPLATE_CM}" -n dark-tower -o json \
+            | jq -er '(.data["deployment.json"] | fromjson | [.spec.template.spec.containers[]?.image]) + ((.data.previous_images // "") | split(" ")) | .[] | select(. != "")')" \
+        || [[ -z "${mh_tpl_images}" ]]; then
+        echo "PRUNE_SKIPPED SERVICE=mh REASON=template-unreadable (could not read ${MH_TEMPLATE_CM}; MH images kept)" >&2
+        mh_ok=false
+    elif ! mh_keep="$(${KUBECTL} get pods -n dark-tower -l app=mh-service \
+            -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{end}')"; then
+        echo "PRUNE_SKIPPED SERVICE=mh REASON=live-pods-unreadable (could not list live MH pods; MH images kept)" >&2
+        mh_ok=false
+    fi
     for repo in "${!IMAGE_REFS[@]}"; do
-        if [[ "${repo}" == "${MIGRATE_REPO}" ]]; then
+        if [[ "${repo}" == "${mh_repo}" ]]; then
+            [[ "${mh_ok}" == "true" ]] || continue
+            prev="$(printf '%s\n%s\n' "${mh_tpl_images}" "${mh_keep}")"
+        elif [[ "${repo}" == "${MIGRATE_REPO}" ]]; then
             prev="${DEPLOYED_REFS[${repo}]:-}"
         elif ! prev="$(previous_generation_refs "${repo}")"; then
             echo "PRUNE_WARN REASON=image-prune-failed REF=- WHERE=history (could not read the rollout history of ${repo}'s workloads; not pruning it)" >&2
@@ -1372,6 +1772,7 @@ main() {
     step deploy_otel_collector
     step apply_env_root
     step wait_for_env_root
+    step converge_mh_pool
     step prune_superseded_images
     log_info "Deployed: every workload in ${ENV_ROOT_REL} is rolled out."
 }

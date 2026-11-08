@@ -60,12 +60,10 @@ nodes:
       - containerPort: 30080
         hostPort: 3100
         protocol: TCP
-      # MC/MH WebTransport (QUIC/UDP) — per-instance NodePorts.
-      # Each MC/MH instance has its own Deployment + NodePort Service.
-      # Changing instance count requires updating these mappings + per-instance manifests.
-      # Note: Kind UDP support is best-effort; use port-forward as fallback.
+      # MC WebTransport (QUIC/UDP) — per-instance NodePorts.
+      # Each MC instance has its own Deployment + NodePort Service.
       # listenAddress 127.0.0.1 (R-37): browser-client-flow ports; the host browser
-      # reaches MC/MH WebTransport at localhost, so loopback is a strict hardening.
+      # reaches MC WebTransport at localhost, so loopback is a strict hardening.
       #
       # MC-0: hostPort 4433 → nodePort 30433
       - containerPort: 30433
@@ -77,14 +75,42 @@ nodes:
         hostPort: 4435
         listenAddress: "127.0.0.1"
         protocol: UDP
-      # MH-0: hostPort 4434 → nodePort 30434
-      - containerPort: 30434
-        hostPort: 4434
+      # MH WebTransport hostPort SLOTS (ADR-0039 §7 "Kind"), K of them, loopback
+      # (R-37). Host port == node containerPort == the MH pod's webtransport
+      # hostPort (infra/kind/scripts/mh.sh sets it per slot). K's home is
+      # crates/devloop-helper/src/ports.rs; this static list is pinned to it by
+      # ports.rs's `test_static_kind_config_mh_block_matches_slot_table_shape`.
+      # The `# dt:mh-slot=<k>` markers are machine-read by
+      # infra/kind/scripts/deploy.sh:mh_slot_table(). Changing a slot means a
+      # cluster recreate.
+      # dt:mh-slot=0
+      - containerPort: 4440
+        hostPort: 4440
         listenAddress: "127.0.0.1"
         protocol: UDP
-      # MH-1: hostPort 4436 → nodePort 30436
-      - containerPort: 30436
-        hostPort: 4436
+      # dt:mh-slot=1
+      - containerPort: 4441
+        hostPort: 4441
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      # dt:mh-slot=2
+      - containerPort: 4442
+        hostPort: 4442
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      # dt:mh-slot=3
+      - containerPort: 4443
+        hostPort: 4443
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      # dt:mh-slot=4
+      - containerPort: 4444
+        hostPort: 4444
+        listenAddress: "127.0.0.1"
+        protocol: UDP
+      # dt:mh-slot=5
+      - containerPort: 4445
+        hostPort: 4445
         listenAddress: "127.0.0.1"
         protocol: UDP
 

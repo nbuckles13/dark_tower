@@ -4,7 +4,7 @@ kind: Kustomization
 # Shared media codec profile (story 3 R-23/R-24; ADR-0036 §11 "Derive rather
 # than guard"). A GENERATOR-ONLY base: one content-addressed ConfigMap and
 # nothing else — no workload, Service or NetworkPolicy. Its consumers are the
-# mc-{0,1} and mh-{0,1} Deployments in the sibling mc-service and mh-service
+# mc-{0,1} Deployments and the ONE MH template in the sibling mc-service and mh-service
 # bases, whose `configMapKeyRef: {name: media-codec-profile}` entries kustomize
 # rewrites to this generator's hash-suffixed name in the ONE environment-root
 # render (infra/kubernetes/overlays/kind, applied by

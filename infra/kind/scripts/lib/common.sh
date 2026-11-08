@@ -167,8 +167,9 @@ pg_secret_value() {
 missing_prerequisite() {
     local tool
     # `timeout` bounds every environment probe below: without it a probe exits 127
-    # and would read as the environment being down.
-    for tool in kind kubectl timeout; do
+    # and would read as the environment being down. `jq`: deploy.sh splits the root
+    # render (the MH template) and reads infra/kind/scripts/mh.sh's JSON with it.
+    for tool in kind kubectl timeout jq; do
         command -v "${tool}" >/dev/null 2>&1 || { echo "${tool}"; return 1; }
     done
     if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
@@ -186,6 +187,24 @@ ENV_PROBE_TIMEOUT="${DT_ENV_PROBE_TIMEOUT:-10}"
 # runs them for a devloop container, whose operator uses `dev-cluster`; setup.sh
 # sets DT_CALLER=setup.sh; anything else is a person on the host.
 DT_CALLER_DEVLOOP_HELPER="devloop-helper"
+
+# The static manual-dev kind config, relative to the repo root: the kind config
+# when DT_KIND_CONFIG (the helper's per-slug render) is unset. ONE spelling,
+# read by provision.sh (it builds the cluster from it) and deploy.sh (its
+# mh_slot_table reads the MH slot mappings back out of the same file).
+DT_STATIC_KIND_CONFIG_REL="infra/kind/kind-config.yaml"
+
+# Print the first NON-COMMENT line of kind config $1 that still holds a `${...}`
+# placeholder (rc 0), or nothing (rc 1). A placeholder left in a rendered config
+# means the devloop helper that rendered it predates the template (ADR-0030: the
+# helper cannot validate its own changes) — e.g. `${MH_SLOT_PORT_MAPPINGS}`.
+# THE one check, shared by provision.sh (refuses BEFORE any rebuild/delete) and
+# deploy.sh (mh_slot_table). A MISSING or UNREADABLE file is never "clean": it
+# prints `0:<unreadable: <path>>` and returns 0, so every caller refuses it.
+kind_config_unrendered_line() {
+    [[ -r "$1" ]] || { printf '0:<unreadable: %s>\n' "$1"; return 0; }
+    grep -n -v '^[[:space:]]*#' "$1" | grep -m1 '\${'
+}
 # remedy <devloop-container command> <host command> — print the one for this caller.
 remedy() {
     if [[ "${DT_CALLER:-}" == "${DT_CALLER_DEVLOOP_HELPER}" ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi

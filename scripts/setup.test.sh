@@ -1187,6 +1187,33 @@ unlisten() { kill "$LISTENER" 2>/dev/null; wait "$LISTENER" 2>/dev/null; }
 port_config() {  # $1=TCP|UDP $2=port: the copy's kind config maps exactly that host port on 127.0.0.1
   printf 'kind: Cluster\nnodes:\n  - role: control-plane\n    extraPortMappings:\n      - containerPort: 30082\n        hostPort: %s\n        listenAddress: "127.0.0.1"\n        protocol: %s\n' "$2" "$1" > "$PTREE/infra/kind/kind-config.yaml"
 }
+# UNRENDERED kind config (an OLD devloop-helper left `${MH_SLOT_PORT_MAPPINGS}` in it), END TO
+# END over a cluster WITH a recorded blueprint: refused with its own reason BEFORE the blueprint
+# decision — nothing deleted, nothing created, the remedy names the helper rebuild.
+make_ptree; reset_marks; seed_record
+printf '${MH_SLOT_PORT_MAPPINGS}\n' >> "$PTREE/infra/kind/kind-config.yaml"
+prov --yes
+assert_rc "prov-unrendered-rc" 1 "$([[ "$P_RC" -ne 0 ]] && echo 1 || echo 0)"
+assert_status "prov-unrendered-classified" "PROVISION_FAILED REASON=kind-config-unrendered STEP=check_kind_config_rendered" "$P_OUT"
+one_failed_line "prov-unrendered-one-line"
+assert_status "prov-unrendered-names-placeholder" '${MH_SLOT_PORT_MAPPINGS}' "$P_OUT"
+assert_status "prov-unrendered-remedy-rebuild-helper" "rebuild devloop-helper on the HOST" "$P_OUT"
+assert_status "prov-unrendered-remedy-order-explicit" "with the OLD helper still tears the cluster down" "$P_OUT"
+assert_no_marker "prov-unrendered-never-deletes" "$MARK" "ran.kind_delete"
+assert_no_marker "prov-unrendered-never-creates" "$MARK" "ran.kind_create"
+assert_absent "prov-unrendered-no-decision" "BLUEPRINT ACTION=" "$P_OUT"
+# A `${...}` inside a COMMENT is prose, never a placeholder (the static config's header has one):
+# positive control that the check does not fire on it, and does on a real one.
+printf '# uses ${HOST_GATEWAY_IP}\nkind: Cluster\n' > "${WORK}/kc-comment.yaml"
+psrc 'kind_config_unrendered_line "${ARGS[0]}"' "${WORK}/kc-comment.yaml" >/dev/null 2>&1
+assert_rc "prov-unrendered-comment-not-a-placeholder" 1 $?
+psrc 'kind_config_unrendered_line "${ARGS[0]}"' "$PTREE/infra/kind/kind-config.yaml" >/dev/null 2>&1
+assert_rc "prov-unrendered-detector-positive-control" 0 $?
+missing_out="$(psrc 'kind_config_unrendered_line "${ARGS[0]}"' "${WORK}/no-such-kind-config.yaml" 2>&1)"; missing_rc=$?
+assert_rc "prov-unrendered-missing-file-not-clean" 0 "$missing_rc"
+assert_status "prov-unrendered-missing-file-named" "<unreadable: ${WORK}/no-such-kind-config.yaml>" "$missing_out"
+assert_rc "prov-unrendered-reason-is-env-lane" 0 "$(grep -q 'CLUSTER_ENV_REASONS=(.*kind-config-unrendered' "${REPO_ROOT}/scripts/layer7.sh" && echo 0 || echo 1)"
+
 # TCP, END TO END: held -> port-held, and main never reaches `kind create`.
 make_ptree; reset_marks
 if listen tcp 127.0.0.1; then
@@ -1269,7 +1296,7 @@ assert_no_marker "prov-node-probe-only-on-create-failure" "$MARK" "ran.node-prob
 # No `kind` on the host: a PATH of ONLY the plain tools (no stubs, no host kind/kubectl/
 # runtime), so a real host install cannot leak in and the case always runs.
 PNOKIND_BIN="${WORK}/pbin-nokind"; rm -rf "$PNOKIND_BIN"; mkdir -p "$PNOKIND_BIN"
-for t in bash awk grep sed sort mktemp cat cut head tail tr sha256sum date dirname basename rm cp mv env realpath wc sleep tee uname ls mkdir chmod timeout; do
+for t in bash awk grep sed sort mktemp cat cut head tail tr sha256sum date dirname basename rm cp mv env realpath wc sleep tee uname ls mkdir chmod jq timeout; do
   ln -sf "$(command -v "$t")" "$PNOKIND_BIN/$t"
 done
 make_ptree; reset_marks
@@ -1280,7 +1307,7 @@ one_failed_line "prov-prerequisite-missing-one-line"
 # ...and no `timeout` is a named prerequisite for provision too (stubs present, timeout absent).
 PNOTO_BIN="${WORK}/pbin-notimeout"; rm -rf "$PNOTO_BIN"; mkdir -p "$PNOTO_BIN"
 cp "${PBIN}/kind" "${PBIN}/kubectl" "${PBIN}/podman" "${PBIN}/curl" "$PNOTO_BIN/"
-for t in bash awk grep sed sort mktemp cat cut head tail tr sha256sum date dirname basename rm cp mv env realpath wc sleep tee uname ls mkdir chmod; do
+for t in bash awk grep sed sort mktemp cat cut head tail tr sha256sum date dirname basename rm cp mv env realpath wc sleep tee uname ls mkdir chmod jq; do
   ln -sf "$(command -v "$t")" "$PNOTO_BIN/$t"
 done
 make_ptree; reset_marks
@@ -1475,6 +1502,11 @@ fi
 ROOT_DIR="${REPO_ROOT}/infra/kubernetes/overlays/kind"
 RWORK="${WORK}/render"
 mkdir -p "$RWORK"
+# A devloop-shaped kind config for the gateway cases: the REAL static file with every bind
+# moved to the fixture gateway (what the helper renders for DT_HOST_GATEWAY_IP=10.1.2.3).
+STATIC_KIND_CONFIG="${REPO_ROOT}/infra/kind/kind-config.yaml"
+GW_KIND_CONFIG="${RWORK}/kind-config.gw.yaml"
+sed 's/listenAddress: "127.0.0.1"/listenAddress: "10.1.2.3"/' "$STATIC_KIND_CONFIG" > "$GW_KIND_CONFIG"
 
 # render <dir> <out-dir>: kustomize-render <dir> into <out-dir>.yaml and split it into one file
 # per document (on the `---` separator kustomize emits), so documents compare byte-for-byte.
@@ -1524,20 +1556,30 @@ if [[ -n "$REAL_KUBECTL" ]]; then
   RUN_RENDER='cache_renders; '"${SET_REFS}"'; render_env_overlay "${ARGS[0]}"'
   WRAP="${RWORK}/wrap"; mkdir -p "$WRAP"
   DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 MC_1_WEBTRANSPORT_PORT=24435 \
-    MH_0_WEBTRANSPORT_PORT=24434 MH_1_WEBTRANSPORT_PORT=24436 src_run "$DEPLOY" "$RUN_RENDER" "$WRAP" >/dev/null 2>&1
+    DT_KIND_CONFIG="$GW_KIND_CONFIG" src_run "$DEPLOY" "$RUN_RENDER" "$WRAP" >/dev/null 2>&1
   assert_rc "wrapper-renders" 0 $?
   render "$WRAP" "${RWORK}/wrapped"; assert_rc "wrapper-kustomize-builds" 0 $?
   wrapped="$(cat "${RWORK}/wrapped.yaml")"
   assert_status "wrapper-mc-0-advertise" "MC_WEBTRANSPORT_ADVERTISE_ADDRESS: https://10.1.2.3:24433" "$wrapped"
   assert_status "wrapper-mc-1-advertise" "MC_WEBTRANSPORT_ADVERTISE_ADDRESS: https://10.1.2.3:24435" "$wrapped"
-  assert_status "wrapper-mh-0-advertise" "MH_WEBTRANSPORT_ADVERTISE_ADDRESS: https://10.1.2.3:24434" "$wrapped"
-  assert_status "wrapper-mh-1-advertise" "MH_WEBTRANSPORT_ADVERTISE_ADDRESS: https://10.1.2.3:24436" "$wrapped"
-  # Exactly the four per-instance ConfigMap names change (their hash); every other ConfigMap
-  # name, e.g. ac-service-config's, is unchanged, which is "rolls exactly those pods".
+  # Every MH slot ConfigMap carries ITS slot's address and host port, from the slot table
+  # (mh_slot_table over the same kind config) — never a retyped K or port.
+  gw_slots="$(DT_HOST_GATEWAY_IP=10.1.2.3 DT_KIND_CONFIG="$GW_KIND_CONFIG" src_run "$DEPLOY" 'mh_slot_table')"
+  assert_rc "wrapper-slot-table-nonempty" 0 "$([[ "$(grep -c . <<< "$gw_slots")" -ge 2 ]] && echo 0 || echo "1 (${gw_slots})")"
+  while IFS=' ' read -r k port addr; do
+    assert_status "wrapper-mh-slot-${k}-advertise" "MH_WEBTRANSPORT_ADVERTISE_ADDRESS: ${addr}" "$wrapped"
+    assert_status "wrapper-mh-slot-${k}-host-port" "MH_HOST_PORT: \"${port}\"" "$wrapped"
+    assert_status "wrapper-mh-slot-${k}-labelled" "dark-tower.io/mh-slot: \"${k}\"" "$wrapped"
+    assert_rc "wrapper-mh-slot-${k}-address-on-gateway" 0 "$([[ "$addr" == "https://10.1.2.3:${port}" ]] && echo 0 || echo "1 (${addr})")"
+  done <<< "$gw_slots"
+  # Exactly the two MC per-instance ConfigMaps change (their hash) and the K slot ConfigMaps
+  # are added; every other ConfigMap name, e.g. ac-service-config's, is unchanged, which is
+  # "rolls exactly those pods".
   changed="$(comm -3 <(cm_names "${RWORK}/root") <(cm_names "${RWORK}/wrapped") | tr -d '\t' \
     | sed -E 's/-[^-]+$//' | sort -u | tr '\n' ' ')"
-  assert_rc "wrapper-changes-exactly-the-four-instance-configmaps" 0 \
-    "$([[ "$changed" == "mc-0-config mc-1-config mh-0-config mh-1-config " ]] && echo 0 || echo "1 (changed: ${changed})")"
+  want_changed="$( { printf 'mc-0-config\nmc-1-config\n'; while IFS=' ' read -r k _ _; do printf 'mh-slot-%s-config\n' "$k"; done <<< "$gw_slots"; } | sort -u | tr '\n' ' ')"
+  assert_rc "wrapper-changes-exactly-the-mc-instance-and-slot-configmaps" 0 \
+    "$([[ "$changed" == "$want_changed" ]] && echo 0 || echo "1 (changed: ${changed}; want: ${want_changed})")"
   ac_root="$(cm_names "${RWORK}/root" | grep '^ac-service-config-')"
   assert_rc "wrapper-ac-config-present" 0 "$([[ -n "$ac_root" ]] && echo 0 || echo 1)"
   assert_status "wrapper-ac-config-hash-unchanged" "$ac_root" "$(cm_names "${RWORK}/wrapped")"
@@ -1547,20 +1589,25 @@ if [[ -n "$REAL_KUBECTL" ]]; then
   # DRY N1: the wrapper's instance set is DERIVED; it must equal the per-instance generators
   # the root actually renders, so a new instance can never miss its override silently.
   inst_wrapper="$(src_run "$DEPLOY" 'advertise_instances' | tr '\n' ' ')"
-  inst_root="$(cm_names "${RWORK}/root" | grep -E '^m[ch]-[0-9]+-config-' | sed -E 's/-config-[^-]+$//' | sort | tr '\n' ' ')"
+  inst_root="$(cm_names "${RWORK}/root" | grep -E '^mc-[0-9]+-config-' | sed -E 's/-config-[^-]+$//' | sort | tr '\n' ' ')"
   assert_rc "wrapper-instances-equal-root-generators" 0 \
     "$([[ -n "$inst_root" && "$inst_wrapper" == "$inst_root" ]] && echo 0 || echo "1 (wrapper='${inst_wrapper}' root='${inst_root}')")"
   # Invalid inputs fail the render (the caller then refuses to apply anything).
   bad="$(DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 MC_1_WEBTRANSPORT_PORT=70000 \
-    MH_0_WEBTRANSPORT_PORT=24434 MH_1_WEBTRANSPORT_PORT=24436 src_run "$DEPLOY" "$RUN_RENDER" "$WRAP" 2>&1)"; bad_rc=$?
+    DT_KIND_CONFIG="$GW_KIND_CONFIG" src_run "$DEPLOY" "$RUN_RENDER" "$WRAP" 2>&1)"; bad_rc=$?
   assert_rc "wrapper-bad-port-rejected" 1 "$bad_rc"
   assert_status "wrapper-bad-port-named" "MC_1_WEBTRANSPORT_PORT" "$bad"
-  DT_HOST_GATEWAY_IP=10.1.2.3 src_run "$DEPLOY" "$RUN_RENDER" "$WRAP" >/dev/null 2>&1
+  DT_HOST_GATEWAY_IP=10.1.2.3 DT_KIND_CONFIG="$GW_KIND_CONFIG" src_run "$DEPLOY" "$RUN_RENDER" "$WRAP" >/dev/null 2>&1
   assert_rc "wrapper-missing-port-rejected" 1 $?
+  # A gateway the cluster was NOT built for: the slot table refuses (static file binds 127.0.0.1).
+  bad="$(DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 MC_1_WEBTRANSPORT_PORT=24435 \
+    DT_KIND_CONFIG="$STATIC_KIND_CONFIG" src_run "$DEPLOY" "$RUN_RENDER" "$WRAP" 2>&1)"; bad_rc=$?
+  assert_rc "wrapper-slot-gateway-mismatch-rejected" 1 "$bad_rc"
+  assert_status "wrapper-slot-gateway-mismatch-named" "listenAddress 127.0.0.1 != DT_HOST_GATEWAY_IP 10.1.2.3" "$bad"
 
   # --- (D2b) Content-tagged images: the wrapper ALWAYS carries the tags (ADR-0038 §2) -------
   STATIC="${RWORK}/static"; mkdir -p "$STATIC"
-  src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_RENDER" "$STATIC" >/dev/null 2>&1
+  src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_RENDER" "$STATIC" >/dev/null 2>&1
   assert_rc "static-wrapper-renders" 0 $?
   render "$STATIC" "${RWORK}/static-r"; assert_rc "static-wrapper-kustomize-builds" 0 $?
   static_r="$(cat "${RWORK}/static-r.yaml")"
@@ -1623,6 +1670,79 @@ if [[ -n "$REAL_KUBECTL" ]]; then
   pg_from="$(awk -v t="$pg_np" 'NR<t && /^  - from:/{f=NR} NR<t && /^    - /{last=NR} END{print f" "last}' "${REPO_ROOT}/infra/services/postgres/network-policy.yaml")"
   assert_rc "postgres-ingress-db-migrate-single-from-element" 0 "$(sed -n "$(cut -d' ' -f1 <<< "$pg_from"),${pg_np}p" "${REPO_ROOT}/infra/services/postgres/network-policy.yaml" | grep -c '^    - ' | grep -qx 1 && echo 0 || echo 1)"
 
+  # --- (D2d) The MH slot table + the ONE MH template (ADR-0039 §7) --------------------------
+  # The slot marker has ONE spelling per language; they must be equal (the helper EMITS it,
+  # deploy.sh PARSES it).
+  rs_marker="$(sed -nE 's/^pub const MH_SLOT_MARKER: &str = "(.*)";$/\1/p' "${REPO_ROOT}/crates/devloop-helper/src/ports.rs")"
+  sh_marker="$(src_run "$DEPLOY" 'printf "%s" "$MH_SLOT_MARKER"')"
+  assert_rc "mh-slot-marker-rust-equals-bash" 0 "$([[ -n "$rs_marker" && "$rs_marker" == "$sh_marker" ]] && echo 0 || echo "1 (rust='${rs_marker}' bash='${sh_marker}')")"
+  # K from its one home (ports.rs), never retyped here.
+  rs_k="$(sed -nE 's/^ *pub const MH_SLOT_COUNT: u16 = ([0-9]+);$/\1/p' "${REPO_ROOT}/crates/devloop-helper/src/ports.rs")"
+  static_slots="$(src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" 'mh_slot_table' 2>&1)"; st_rc=$?
+  assert_rc "mh-slot-table-static-rc" 0 "$st_rc"
+  assert_rc "mh-slot-table-static-has-k-rows" 0 "$([[ -n "$rs_k" && "$(grep -c . <<< "$static_slots")" -eq "$rs_k" ]] && echo 0 || echo "1 (K=${rs_k}; rows: ${static_slots})")"
+  while IFS=' ' read -r k port addr; do
+    assert_rc "mh-slot-table-static-${k}-loopback-literal" 0 "$([[ "$addr" == "https://127.0.0.1:${port}" ]] && echo 0 || echo "1 (${addr})")"
+    assert_status "mh-slot-table-static-${k}-port-mapped" "hostPort: ${port}" "$(cat "$STATIC_KIND_CONFIG")"
+  done <<< "$static_slots"
+  # Every malformed table fails loudly, each with its own message (+ the positive control above).
+  slot_fixture() { local name="$1"; shift; sed "$@" "$STATIC_KIND_CONFIG" > "${RWORK}/kc-${name}.yaml"; printf '%s' "${RWORK}/kc-${name}.yaml"; }
+  for c in \
+    "zero-slots|/dt:mh-slot=/d|no MH slot mappings" \
+    "placeholder|\$a \${MH_SLOT_PORT_MAPPINGS}|unsubstituted" \
+    "duplicate-slot|s/dt:mh-slot=1$/dt:mh-slot=0/|duplicate slot 0" \
+    "duplicate-port|s/: 4441$/: 4440/|duplicate slot port 4440" \
+    "not-udp|/dt:mh-slot=0$/,/protocol/ s/protocol: UDP/protocol: TCP/|protocol is 'TCP', not UDP" \
+    "node-port-differs|/dt:mh-slot=0$/,/protocol/ s/containerPort: 4440/containerPort: 4999/|containerPort 4999 != hostPort 4440" \
+    "wildcard-bind|/dt:mh-slot=0$/,/protocol/ s/127.0.0.1/0.0.0.0/|is not a bound IPv4 address"; do
+    IFS='|' read -r cname cexpr cmsg <<< "$c"
+    cfile="$(slot_fixture "$cname" -e "$cexpr")"
+    cout="$(DT_KIND_CONFIG="$cfile" src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" 'mh_slot_table' 2>&1)"; crc=$?
+    assert_rc "mh-slot-table-${cname}-rejected" 1 "$crc"
+    assert_status "mh-slot-table-${cname}-named" "$cmsg" "$cout"
+  done
+  # The pod subnet comes from the SAME kind config (GC-2's CIDR input), never retyped.
+  subnet="$(src_run -u DT_KIND_CONFIG "$DEPLOY" 'kind_pod_subnet')"
+  assert_rc "kind-pod-subnet-read" 0 "$([[ "$subnet" =~ ^[0-9.]+/[0-9]+$ ]] && grep -qF "podSubnet: \"${subnet}\"" "$STATIC_KIND_CONFIG" && echo 0 || echo "1 (${subnet})")"
+
+  # The template, from the SAME wrapper render deploy applies (D2b's static wrapper).
+  docs="$(src_run "$DEPLOY" 'render_env_root_json "${ARGS[0]}"' "$STATIC")"
+  assert_rc "mh-template-render-json-nonempty" 0 "$([[ "$(grep -c . <<< "$docs")" -gt 10 ]] && echo 0 || echo 1)"
+  tpl="$(jq -c 'select(.kind == "Deployment" and .metadata.name == "mh-template")' <<< "$docs")"
+  assert_rc "mh-template-exactly-one" 0 "$([[ "$(grep -c . <<< "$tpl")" -eq 1 ]] && echo 0 || echo "1 ($(grep -c . <<< "$tpl"))")"
+  # S1: the pod labels are a SUPERSET of the MH NetworkPolicy's podSelector, read from the
+  # rendered policy (network-policy.yaml), non-empty, with a negative control.
+  np_sel="$(jq -c 'select(.kind == "NetworkPolicy" and .metadata.name == "mh-service") | .spec.podSelector.matchLabels' <<< "$docs")"
+  sel_ok() { jq -e --argjson sel "$1" '. as $t | ($sel | length) > 0 and all($sel | to_entries[]; $t.spec.template.metadata.labels[.key] == .value)' <<< "$2" >/dev/null; }
+  assert_rc "mh-template-labels-cover-np-selector" 0 "$(sel_ok "$np_sel" "$tpl" && echo 0 || echo "1 (selector ${np_sel})")"
+  assert_rc "mh-template-labels-np-negative-control" 1 "$(sel_ok "$np_sel" "$(jq -c 'del(.spec.template.metadata.labels.component)' <<< "$tpl")" && echo 0 || echo 1)"
+  # The advertise ref fails closed: HARD (never optional) and pointing at the never-applied
+  # placeholder generator.
+  adv="$(jq -c '.spec.template.spec.containers[] | select(.name == "mh-service") | .env[] | select(.name == "MH_WEBTRANSPORT_ADVERTISE_ADDRESS") | .valueFrom.configMapKeyRef' <<< "$tpl")"
+  assert_rc "mh-template-advertise-ref-hard" 0 "$(jq -e '(.optional // false) == false and (.name | startswith("mh-slot-template-config-")) and .key == "MH_WEBTRANSPORT_ADVERTISE_ADDRESS"' <<< "$adv" >/dev/null && echo 0 || echo "1 (${adv})")"
+  applied_set="$(jq -s -c --arg n mh-template --arg l dark-tower.io/mh-template-input "$(src_run "$DEPLOY" 'printf "%s" "$MH_TEMPLATE_PART_JQ"')"' [.[] | select(mh_template_part($n; $l) | not)]' <<< "$docs")"
+  assert_rc "mh-template-not-applied" 0 "$(jq -e 'all(.[]; (.kind == "Deployment" and .metadata.name == "mh-template") | not)' <<< "$applied_set" >/dev/null && echo 0 || echo 1)"
+  assert_rc "mh-template-placeholder-never-applied" 0 "$(jq -e --arg n "$(jq -r .name <<< "$adv")" 'all(.[]; .metadata.name != $n)' <<< "$applied_set" >/dev/null && echo 0 || echo 1)"
+  assert_rc "mh-template-inputs-never-applied" 0 "$(jq -e 'all(.[]; ((.metadata.labels // {})["dark-tower.io/mh-template-input"] // "") != "true")' <<< "$applied_set" >/dev/null && echo 0 || echo 1)"
+  assert_rc "mh-slot-configmaps-are-applied" 0 "$([[ "$(jq '[.[] | select(.kind == "ConfigMap" and ((.metadata.labels // {})["dark-tower.io/mh-slot"] // "") != "")] | length' <<< "$applied_set")" -eq "$rs_k" ]] && echo 0 || echo 1)"
+  # S2: no hostPort in the template (mh.sh sets the webtransport one per slot), no hostNetwork.
+  assert_rc "mh-template-no-hostport-no-hostnetwork" 0 "$(jq -e '([.. | objects | select(has("hostPort"))] | length) == 0 and (.spec.template.spec.hostNetwork // false) == false' <<< "$tpl" >/dev/null && echo 0 || echo 1)"
+  assert_rc "mh-template-strategy-recreate" 0 "$([[ "$(jq -r .spec.strategy.type <<< "$tpl")" == Recreate ]] && echo 0 || echo 1)"
+  # S5: refs only — no Secret material inlined.
+  assert_absent "mh-template-no-pem" "BEGIN" "$tpl"
+  assert_rc "mh-template-client-secret-is-a-ref" 0 "$(jq -e '[.spec.template.spec.containers[].env[] | select(.name == "MH_CLIENT_SECRET") | .valueFrom.secretKeyRef.name] == ["mh-service-secrets"]' <<< "$tpl" >/dev/null && echo 0 || echo 1)"
+  # S4: shareProcessNamespace is Kind-only test instrumentation: in the Kind template, absent
+  # from the base render.
+  assert_rc "mh-template-kind-shares-pid-namespace" 0 "$(jq -e '.spec.template.spec.shareProcessNamespace == true' <<< "$tpl" >/dev/null && echo 0 || echo 1)"
+  base_mh="$("$REAL_KUBECTL" kustomize "${REPO_ROOT}/infra/services/mh-service")"
+  assert_rc "mh-base-render-ok" 0 "$([[ "$base_mh" == *"name: mh-template"* ]] && echo 0 || echo 1)"
+  assert_absent "mh-base-never-shares-pid-namespace" "shareProcessNamespace" "$base_mh"
+  # One revision derivation, deterministic, label-valued.
+  r1="$(src_run "$DEPLOY" 'mh_template_revision' <<< "$tpl")"; r2="$(src_run "$DEPLOY" 'mh_template_revision' <<< "$tpl")"
+  assert_rc "mh-template-revision-deterministic" 0 "$([[ "$r1" =~ ^[0-9a-f]{16}$ && "$r1" == "$r2" ]] && echo 0 || echo "1 (${r1} ${r2})")"
+  r3="$(src_run "$DEPLOY" 'mh_template_revision' <<< "$(jq -c '.spec.template.spec.terminationGracePeriodSeconds = 99' <<< "$tpl")")"
+  assert_rc "mh-template-revision-changes-with-content" 0 "$([[ -n "$r3" && "$r3" != "$r1" ]] && echo 0 || echo 1)"
+
   # --- (D3) A data change changes ONLY its consumer's pod template ----------------------------
   # Copy infra/ (the root references bases by relative path), change one key in mc-0's
   # generator source, re-render: the only workload whose document differs must be mc-0.
@@ -1669,7 +1789,23 @@ case "\${args[0]:-}" in
   kustomize)
     [[ -n "\${STUB_KUSTOMIZE_FAIL:-}" && "\${args[1]%/}" == "\${STUB_KUSTOMIZE_FAIL%/}" ]] && { echo "kubectl stub: kustomize of \${args[1]} failed" >&2; exit 1; }
     exec "${REAL_KUBECTL:-/nonexistent-kubectl}" "\${args[@]}" ;;
+  annotate)
+    # deploy.sh's offline YAML->JSON (--local): no apiserver, so the REAL kubectl.
+    exec "${REAL_KUBECTL:-/nonexistent-kubectl}" "\${args[@]}" ;;
+  label)
+    printf '%s\n' "\${args[*]}" >> "${MARK}/labelled"; exit 0 ;;
   apply)
+    if [[ "\${args[1]:-}" == "-f" && "\${args[2]:-}" == "-" ]]; then
+      body="\$(cat)"
+      if [[ "\$(jq -r '.kind' <<< "\$body")" == "List" ]]; then
+        printf '%s\n' "dt-env-root(stdin)" >> "${MARK}/applied"
+        [[ "\${STUB_APPLY_FAIL:-}" != root ]] || { echo "kubectl stub: the apiserver rejected a manifest" >&2; exit 1; }
+        printf '%s\n' "\$body" > "${MARK}/applied.root.json"
+      elif [[ "\$(jq -r '.metadata.name' <<< "\$body")" == "mh-template" ]]; then
+        printf '%s\n' "\$body" > "${MARK}/applied.mh-template.json"
+      fi
+      exit 0
+    fi
     if [[ "\${args[1]:-}" == "-k" ]]; then
       d="\${args[2]}"; printf '%s\n' "\$d" >> "${MARK}/applied"
       if [[ -f "\$d/kustomization.yaml" ]]; then
@@ -1693,7 +1829,11 @@ case "\${args[0]:-}" in
         [[ -n "\${STUB_ROLLOUT_FAIL:-}" && "\${args[2]:-}" == "\${STUB_ROLLOUT_FAIL}" ]] && { echo "kubectl stub: rollout of \${args[2]} timed out" >&2; exit 1; }
         exit 0 ;;
     esac ;;
-  wait|describe|create) exit 0 ;;
+  create)
+    # deploy.sh builds the mh-template ConfigMap with an offline --dry-run=client create.
+    [[ "\${args[1]:-}" == configmap ]] && exec "${REAL_KUBECTL:-/nonexistent-kubectl}" "\${args[@]}"
+    exit 0 ;;
+  wait|describe) exit 0 ;;
   logs) printf 'Applied 20260322000001/migrate add participant tracking (postgres://darktower:hunter2@postgres:5432/x)\n'; exit 0 ;;
   exec) : > "${MARK}/ran.kubectl-exec"; exit 0 ;;
   get)
@@ -1705,12 +1845,19 @@ case "\${args[0]:-}" in
     fi
     [[ -n "\${STUB_GET_FAIL:-}" && "\${args[1]:-}" != "events" ]] && { echo "kubectl stub: get failed" >&2; exit 1; }
     case "\${args[1]:-}" in
+      configmaps) printf '%b' "\${STUB_SLOT_CMS:-}"; exit 0 ;;
+      configmap) [[ -n "\${STUB_MH_TEMPLATE_OLD:-}" ]] && cat "\${STUB_MH_TEMPLATE_OLD}"; exit 0 ;;
       jobs) printf '%b' "\${STUB_JOBS:-}"; exit 0 ;;
       job)
         if [[ -f "${MARK}/jobcond" ]]; then cat "${MARK}/jobcond"; else printf '%s' "\${STUB_JOB_COND_INITIAL:-}"; fi
         printf '\n'; exit 0 ;;
       events) exit 0 ;;
-      pods) printf 'calico-node-x 1/1 Running\n'; exit 0 ;;
+      pods)
+        if [[ "\$*" == *"app=mh-service"* ]]; then
+          [[ -z "\${STUB_MH_PODS_FAIL:-}" ]] || { echo "kubectl stub: pods read failed" >&2; exit 1; }
+          printf '%b' "\${STUB_MH_POD_IMAGES:-}"; exit 0
+        fi
+        printf 'calico-node-x 1/1 Running\n'; exit 0 ;;
       replicasets) [[ -z "\${STUB_RS_FAIL:-}" ]] || { echo "kubectl stub: rs read failed" >&2; exit 1; }; printf '%b' "\${STUB_RS_ROWS:-}"; exit 0 ;;
       controllerrevisions) printf '%b' "\${STUB_CR_ROWS:-}"; exit 0 ;;
       */*)
@@ -1781,17 +1928,45 @@ cat > "${D4_BIN}/sqlx" <<STUB
 exit 0
 STUB
 chmod +x "${D4_BIN}/kubectl" "${D4_BIN}/docker" "${D4_BIN}/podman" "${D4_BIN}/kind" "${D4_BIN}/sqlx"
+# A stateful mh.sh stub (deploy.sh's DT_MH_SH seam) speaking the --json contract: K=6 slots,
+# baseline 2; the first <count> slots hold serving `baseline` MHs. Knobs:
+#   STUB_MH_INITIAL=<n>        baseline MHs before this deploy (default 0)
+#   STUB_MH_FAIL=<verb>:<tok>  that verb fails with mh.sh token <tok> (slot 3)
+#   STUB_MH_BASELINE / STUB_MH_K  override B / K in `list`
+D4_MH="${D4_BIN}/mh.sh"
+cat > "$D4_MH" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${MARK}/mh.calls"
+verb="\$1"
+cnt="\$(cat "${MARK}/mh.count" 2>/dev/null || echo "\${STUB_MH_INITIAL:-0}")"
+if [[ -n "\${STUB_MH_FAIL:-}" && "\${STUB_MH_FAIL%%:*}" == "\$verb" ]]; then
+  printf '{"ok":false,"reason":"%s","slot":3,"detail":"stub"}\n' "\${STUB_MH_FAIL#*:}"
+  echo "MH_RESULT STATUS=FAIL REASON=\${STUB_MH_FAIL#*:} SLOT=3" >&2
+  exit 1
+fi
+case "\$verb" in
+  list)
+    jq -cn --argjson c "\$cnt" --argjson b "\${STUB_MH_BASELINE:-2}" --argjson k "\${STUB_MH_K:-6}" \
+      '{ok:true, schema_version:1, template_revision:"r1", baseline:\$b,
+        slots:[range(0;\$k) as \$i | {slot:\$i, state:(if \$i < \$c then "serving" else "free" end),
+               owner:(if \$i < \$c then "baseline" else null end), stale:false}]}' ;;
+  up) echo \$((cnt + 1)) > "${MARK}/mh.count"; echo '{"ok":true,"created":true}' ;;
+  drain) echo \$((cnt - 1)) > "${MARK}/mh.count"; echo '{"ok":true,"drained":true}' ;;
+  *) echo '{"ok":true}' ;;
+esac
+STUB
+chmod +x "$D4_MH"
 BUILT_TAG="sha-bbbbbbbbbbbbbbbb"
 DEPLOYED_TAG="sha-aaaaaaaaaaaaaaaa"
 D4_REFS='for r in $(root_repos); do IMAGE_REFS[$r]="$r:sha-0123456789abcdef"; done'
 RUN_APPLY='cache_renders; '"${D4_REFS}"'; apply_env_root'
 
 reset_marks
-PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
+PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
 assert_rc "apply-root-plain-rc" 0 $?
 assert_absent "apply-root-plain-never-the-bare-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
-assert_status "apply-root-plain-applied-the-tagged-wrapper" "newTag: sha-" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
-assert_absent "apply-root-plain-no-advertise-merge" "behavior: merge" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
+assert_status "apply-root-plain-applied-the-tagged-wrapper" "localhost/mc-service:sha-0123456789abcdef" "$(cat "${MARK}/applied.root.json" 2>/dev/null)"
+assert_absent "apply-root-plain-no-advertise-merge" "https://10.1.2.3:" "$(cat "${MARK}/applied.root.json" 2>/dev/null)"
 # The retired grafana-sidecar RBAC delete is gone: every cluster is rebuilt by its first
 # provision after ADR-0038 step 3 (no blueprint record), so nothing can carry that Role forward.
 assert_no_marker "apply-root-deletes-nothing" "$MARK" "deleted"
@@ -1799,21 +1974,65 @@ assert_rc "apply-root-plain-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-ro
 
 reset_marks
 PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_HOST_GATEWAY_IP=10.1.2.3 MC_0_WEBTRANSPORT_PORT=24433 \
-  MC_1_WEBTRANSPORT_PORT=24435 MH_0_WEBTRANSPORT_PORT=24434 MH_1_WEBTRANSPORT_PORT=24436 \
+  MC_1_WEBTRANSPORT_PORT=24435 DT_KIND_CONFIG="$GW_KIND_CONFIG" \
   src_run "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
 assert_rc "apply-root-gateway-rc" 0 $?
 assert_absent "apply-root-gateway-not-the-plain-root" "$ROOT_DIR" "$(cat "${MARK}/applied" 2>/dev/null)"
-assert_status "apply-root-gateway-applied-the-wrapper" "behavior: merge" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
-assert_status "apply-root-gateway-wrapper-tagged" "newTag: sha-" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
+assert_status "apply-root-gateway-applied-the-wrapper" "https://10.1.2.3:24433" "$(cat "${MARK}/applied.root.json" 2>/dev/null)"
+assert_status "apply-root-gateway-wrapper-tagged" "localhost/mc-service:sha-0123456789abcdef" "$(cat "${MARK}/applied.root.json" 2>/dev/null)"
 assert_rc "apply-root-gateway-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-root.*" >/dev/null && echo 0 || echo 1)"
 
 reset_marks
-out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_HOST_GATEWAY_IP=10.1.2.3 \
+out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_HOST_GATEWAY_IP=10.1.2.3 DT_KIND_CONFIG="$GW_KIND_CONFIG" \
   src_run "$DEPLOY" "$RUN_APPLY" 2>&1)"; rc=$?
 assert_rc "apply-root-render-failure-aborts" 1 "$rc"
 assert_no_marker "apply-root-render-failure-applies-nothing" "$MARK" "applied"
 assert_status "apply-root-render-failure-says-no-fallback" "NOT applying" "$out"
 assert_rc "apply-root-failure-tempdir-removed" 1 "$(compgen -G "${RWORK}/dt-env-root.*" >/dev/null && echo 0 || echo 1)"
+
+# --- (D4b) deploy.sh PRODUCES exactly the interface mh.sh CONSUMES (mh-sh-contract.txt §4) ------
+# Run the produced mh-template and slot ConfigMaps through mh.sh's OWN validators (sourced, not
+# copied): proves the contract, not the spelling.
+MH_SH_REAL="${REPO_ROOT}/infra/kind/scripts/mh.sh"
+reset_marks
+PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
+assert_rc "contract-apply-rc" 0 $?
+assert_marker "contract-mh-template-written" "$MARK" "applied.mh-template.json"
+tpl_verdict="$(src_run "$MH_SH_REAL" 'jq -c --arg port "$MH_WT_PORT_NAME" --arg env "$MH_ADDRESS_KEY" --arg lre "$MH_LABEL_VALUE_RE" "$(template_jq)" "${ARGS[0]}"' "${MARK}/applied.mh-template.json" 2>&1)"
+assert_rc "contract-template-accepted-by-mh-sh" 0 "$(jq -e 'has("error") | not' <<< "$tpl_verdict" >/dev/null 2>&1 && echo 0 || echo "1 (${tpl_verdict:0:300})")"
+fleet_b="$(sed -nE 's/^MH_BASELINE=([0-9]+)$/\1/p' "${ROOT_DIR}/services/mh-service/mh-fleet.env")"
+assert_rc "contract-baseline-from-mh-fleet" 0 "$([[ -n "$fleet_b" && "$(jq -r '.baseline' <<< "$tpl_verdict" 2>/dev/null)" == "$fleet_b" ]] && echo 0 || echo "1 (fleet=${fleet_b})")"
+jq -c --arg l dark-tower.io/mh-slot '{items: [.items[] | select(.kind == "ConfigMap" and ((.metadata.labels // {})[$l] // "") != "")]}' \
+  "${MARK}/applied.root.json" > "${MARK}/slot-cms.json"
+slots_verdict="$(src_run "$MH_SH_REAL" 'jq -c --arg ls "$MH_LABEL_SLOT" --arg ak "$MH_ADDRESS_KEY" --arg pk "$MH_HOST_PORT_KEY" --arg sre "$MH_SLOT_RE" "$(slots_jq)" "${ARGS[0]}"' "${MARK}/slot-cms.json" 2>&1)"
+static_rows="$(src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" 'mh_slot_table')"
+assert_rc "contract-slots-accepted-by-mh-sh" 0 "$(jq -e 'type == "array" and length > 0' <<< "$slots_verdict" >/dev/null 2>&1 && echo 0 || echo "1 (${slots_verdict:0:300})")"
+assert_rc "contract-slots-equal-the-slot-table" 0 "$([[ "$(jq -r '.[] | "\(.slot) \(.host_port) \(.address)"' <<< "$slots_verdict" 2>/dev/null)" == "$static_rows" ]] && echo 0 || echo 1)"
+# A placeholder name reaching a pod is impossible: the applied set never carries it.
+assert_absent "contract-placeholder-not-applied" "mh-slot-template-config" "$(jq -c '.items[].metadata.name' "${MARK}/applied.root.json")"
+# previous_images: a CHANGED revision records the replaced template's images; the same
+# revision carries the recorded set forward.
+old_rev="$(jq -r '.data.revision' "${MARK}/applied.mh-template.json")"
+jq -c '.data.revision = "0000000000000000" | .data["deployment.json"] = ({spec:{template:{spec:{containers:[{image:"localhost/mh-service:sha-dddddddddddddddd"}]}}}} | tojson)' \
+  "${MARK}/applied.mh-template.json" > "${WORK}/old-tpl-changed.json"
+reset_marks
+STUB_MH_TEMPLATE_OLD="${WORK}/old-tpl-changed.json" PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
+assert_rc "contract-prev-images-on-change" 0 "$([[ "$(jq -r '.data.previous_images' "${MARK}/applied.mh-template.json" 2>/dev/null)" == "localhost/mh-service:sha-dddddddddddddddd" ]] && echo 0 || echo 1)"
+jq -c --arg r "$old_rev" '.data.revision = $r | .data.previous_images = "localhost/mh-service:sha-eeeeeeeeeeeeeeee"' \
+  "${MARK}/applied.mh-template.json" > "${WORK}/old-tpl-same.json"
+reset_marks
+STUB_MH_TEMPLATE_OLD="${WORK}/old-tpl-same.json" PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
+assert_rc "contract-prev-images-carried-forward" 0 "$([[ "$(jq -r '.data.previous_images' "${MARK}/applied.mh-template.json" 2>/dev/null)" == "localhost/mh-service:sha-eeeeeeeeeeeeeeee" ]] && echo 0 || echo 1)"
+# A superseded slot generation is UN-LABELLED (mh.sh would see a duplicate), never deleted.
+cur_slot_cms="$(jq -r --arg l dark-tower.io/mh-slot '.items[] | select(.kind == "ConfigMap" and ((.metadata.labels // {})[$l] // "") != "") | .metadata.name' "${MARK}/applied.root.json" 2>/dev/null)"
+assert_rc "contract-current-slot-cms-known" 0 "$([[ -n "$cur_slot_cms" ]] && echo 0 || echo 1)"
+reset_marks
+STUB_SLOT_CMS="mh-slot-0-config-oldgen1234\n$(printf '%s\\n' $cur_slot_cms)" PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_APPLY" >/dev/null 2>&1
+assert_status "contract-stale-slot-cm-unlabelled" "label configmap mh-slot-0-config-oldgen1234 -n dark-tower dark-tower.io/mh-slot-" "$(cat "${MARK}/labelled" 2>/dev/null)"
+for cm in $cur_slot_cms; do
+  assert_absent "contract-current-slot-cm-kept-labelled-${cm%-*}" "configmap ${cm} " "$(cat "${MARK}/labelled" 2>/dev/null)"
+done
+assert_no_marker "contract-stale-slot-cm-never-deleted" "$MARK" "deleted"
 
 # --- (D5) content_tag: the ONE tag derivation (pure) -------------------------------------------
 ct() { src_run "$DEPLOY" 'content_tag "${ARGS[0]}"' "$1" 2>/dev/null; }
@@ -1948,7 +2167,7 @@ builds() { grep '^build ' "${MARK}/podman.calls" 2>/dev/null | grep -o 'infra/do
 RUN_DEPLOY='check_blueprint() { : > "'"${MARK}"'/ran.blueprint-check"; }; main'
 dep() {
   PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 DT_JOB_POLL_SECONDS=0 \
-    src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_DEPLOY" 2>&1
+    DT_MH_SH="$D4_MH" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_DEPLOY" 2>&1
 }
 ALL_DOCKERFILES="infra/docker/ac-service/Dockerfile infra/docker/db-migrate/Dockerfile infra/docker/gc-service/Dockerfile infra/docker/mc-service/Dockerfile infra/docker/mh-service/Dockerfile "
 reset_marks
@@ -1975,7 +2194,7 @@ assert_status "deploy-tags-by-content" "tag sha256:bbbb" "$(cat "${MARK}/podman.
 # snapshot, never re-render it (the stub logs every kubectl call; kustomize passes through).
 root_renders="$(grep -cE "^kustomize ${ROOT_DIR}/?\$" "${MARK}/kubectl.calls" 2>/dev/null)"
 assert_rc "deploy-renders-the-root-once" 0 "$([[ "$root_renders" == 1 ]] && echo 0 || echo "1 (${root_renders} root renders)")"
-assert_status "deploy-root-carries-built-tags" "name: localhost/mc-service"$'\n'"    newTag: ${BUILT_TAG}" "$(cat "${MARK}/applied.kustomization.yaml" 2>/dev/null)"
+assert_status "deploy-root-carries-built-tags" "localhost/mc-service:${BUILT_TAG}" "$(cat "${MARK}/applied.root.json" 2>/dev/null)"
 assert_no_marker "deploy-restarts-nothing" "$MARK" "restarted"
 assert_status "deploy-runs-the-migration-job" "render_migration_job" "$(cat "${MARK}/applied.migration.yaml" 2>/dev/null)"
 assert_marker "deploy-seeds-after-migrations" "$MARK" "ran.kubectl-exec"
@@ -1996,6 +2215,12 @@ assert_no_marker "deploy-host-sqlx-never-invoked" "$MARK" "ran.host-sqlx"
 assert_status "deploy-postgres-rollout-status" "rollout status statefulset/postgres" "$(cat "${MARK}/kubectl.calls" 2>/dev/null)"
 assert_status "deploy-redis-rollout-status" "rollout status statefulset/redis" "$(cat "${MARK}/kubectl.calls" 2>/dev/null)"
 assert_absent "deploy-no-label-selector-pod-wait" "wait --for=condition=Ready pod -l app=postgres" "$(cat "${MARK}/kubectl.calls" 2>/dev/null)"
+# The MH pool converge runs AFTER every root workload is waited on: upgrade, then top up to B.
+assert_rc "deploy-mh-pool-upgrade-then-top-up" 0 "$([[ "$(grep -oE '^(upgrade|up)' "${MARK}/mh.calls" 2>/dev/null | tr '\n' ' ')" == "upgrade up up " ]] && echo 0 || echo "1 ($(tr '\n' ';' < "${MARK}/mh.calls" 2>/dev/null))")"
+assert_status "deploy-mh-pool-top-up-owner-baseline" "up --owner baseline --json" "$(cat "${MARK}/mh.calls" 2>/dev/null)"
+assert_status "deploy-mh-pool-reported" "MH pool: 2 baseline MHs serving" "$out"
+# The MH template is never waited on as a root workload (it is never applied).
+assert_absent "deploy-never-waits-on-mh-template" "rollout status deployment/mh-template" "$(cat "${MARK}/kubectl.calls" 2>/dev/null)"
 
 # UNCHANGED redeploy (ops F1): current == what ran before (B), rollout history still names A
 # as previous. A must be KEPT (it is what `rollout undo` reaches); only older refs go.
@@ -2010,6 +2235,82 @@ out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$GC_NODE_IMAGES" STUB_RS_ROWS="$GC
 assert_rc "prune-history-unreadable-deploy-still-ok" 0 "$rc"
 assert_status "prune-history-unreadable-warns" "PRUNE_WARN REASON=image-prune-failed REF=- WHERE=history" "$out"
 assert_absent "prune-history-unreadable-evicts-nothing-of-gc" "localhost/gc-service" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
+
+# --- (D8b) The MH pool converge: B baseline MHs, every mh.sh failure mapped by the ONE table ----
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=2 dep)"; rc=$?
+assert_rc "mh-pool-already-at-baseline-rc" 0 "$rc"
+assert_absent "mh-pool-already-at-baseline-no-up" "up --owner" "$(cat "${MARK}/mh.calls" 2>/dev/null)"
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 dep)"; rc=$?
+assert_rc "mh-pool-above-baseline-rc" 0 "$rc"
+assert_status "mh-pool-above-baseline-drains-highest" "drain 2 --owner baseline --json" "$(cat "${MARK}/mh.calls" 2>/dev/null)"
+# The relay regex Layer 7 uses, EXTRACTED from scripts/layer7.sh (never a copy).
+L7_RE="$(sed -nE 's/^ *grep -m1 -oE "\$\{prefix\} (.*)" <<<"\$DC_WRITE_OUT".*/\1/p' "${REPO_ROOT}/scripts/layer7.sh")"
+L7_REASON_SED="$(sed -nE "s/^ *reason=\"\\\$\(sed -E '(.*)' <<<\"\\\$line\"\)\"$/\1/p" "${REPO_ROOT}/scripts/layer7.sh")"
+assert_rc "mh-pool-layer7-relay-regex-extracted" 0 "$([[ -n "$L7_RE" && -n "$L7_REASON_SED" ]] && echo 0 || echo "1 (re='${L7_RE}' sed='${L7_REASON_SED}')")"
+for c in "upgrade:mh-rollout-failed|mh-rollout-failed|3" "up:not-available-timeout|mh-rollout-failed|3" \
+         "up:mh-no-free-slot|mh-no-free-slot|3" "upgrade:mh-pool-busy|mh-pool-failed|3" \
+         "upgrade:kubectl-failed|mh-pool-failed|3" "list:no-template|mh-pool-failed|3" \
+         "up:prerequisite-missing|prerequisite-missing|3"; do
+  IFS='|' read -r fail want slot <<< "$c"
+  tok="${fail#*:}"
+  reset_marks
+  out="$(STUB_JOBS="$JOBS_OK" STUB_MH_FAIL="$fail" dep)"; rc=$?
+  line="DEPLOY_FAILED REASON=${want} MH_TOKEN=${tok} SLOT=${slot} WORKLOADS=mh-s${slot}"
+  assert_rc "mh-pool-${fail}-rc" 1 "$([[ "$rc" -ne 0 ]] && echo 1 || echo 0)"
+  assert_status "mh-pool-${fail}-token" "$line" "$out"
+  assert_rc "mh-pool-${fail}-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
+  relayed="$(grep -m1 -oE "DEPLOY_FAILED ${L7_RE}" <<< "$out" || true)"
+  assert_rc "mh-pool-${fail}-layer7-relays-whole-line" 0 "$([[ "$relayed" == "$line" ]] && echo 0 || echo "1 (relayed='${relayed}')")"
+  assert_rc "mh-pool-${fail}-layer7-reads-deploy-reason" 0 "$([[ "$(sed -E "$L7_REASON_SED" <<< "$relayed")" == "$want" ]] && echo 0 || echo 1)"
+done
+# An UNMAPPED mh.sh token while the apiserver is gone is the ENVIRONMENT (operator lane), never
+# a pool fault: deploy classifies it like every other step, keeping mh.sh's token on the line.
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_FAIL=upgrade:kubectl-failed STUB_READYZ_FAIL=1 dep)"; rc=$?
+assert_status "mh-pool-env-down-classified" "DEPLOY_FAILED REASON=apiserver-unreachable MH_TOKEN=kubectl-failed SLOT=3 WORKLOADS=mh-s3" "$out"
+assert_rc "mh-pool-env-down-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
+assert_marker "mh-pool-env-down-probed" "$MARK" "ran.readyz"
+# B = 0 (or any non-integer) never "converges" to zero MHs: a loud pool failure.
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_BASELINE=0 dep)"; rc=$?
+assert_status "mh-pool-baseline-zero-token" "DEPLOY_FAILED REASON=mh-pool-failed MH_TOKEN=- SLOT=- WORKLOADS=-" "$out"
+assert_rc "mh-pool-baseline-zero-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
+assert_absent "mh-pool-baseline-zero-no-upgrade" "upgrade" "$(cat "${MARK}/mh.calls" 2>/dev/null)"
+# Headroom: B + 1 > K refuses BEFORE touching any MH (no upgrade/up/drain issued).
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_BASELINE=6 STUB_MH_K=6 dep)"; rc=$?
+assert_status "mh-pool-headroom-token" "DEPLOY_FAILED REASON=mh-no-free-slot MH_TOKEN=- SLOT=- WORKLOADS=-" "$out"
+assert_rc "mh-pool-headroom-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
+assert_rc "mh-pool-headroom-touches-nothing" 0 "$([[ -z "$(grep -vE '^list' "${MARK}/mh.calls" 2>/dev/null)" ]] && echo 0 || echo 1)"
+# Prune keep set for MH (ADR-0039 §10): this converge's ref + mh-template's images + its
+# previous_images; anything else of the MH repo goes. Unreadable template -> loud skip.
+MH_NODE_IMAGES="IMAGE TAG ID\nlocalhost/mh-service ${BUILT_TAG} a\nlocalhost/mh-service sha-dddddddddddddddd b\nlocalhost/mh-service sha-eeeeeeeeeeeeeeee c\nlocalhost/mh-service sha-ffffffffffffffff d\n"
+jq -cn '{data: {"deployment.json": ({spec:{template:{spec:{containers:[{image:"localhost/mh-service:sha-dddddddddddddddd"}]}}}} | tojson), revision: "1111111111111111", baseline: "2", previous_images: "localhost/mh-service:sha-eeeeeeeeeeeeeeee"}}' > "${WORK}/prune-tpl.json"
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$MH_NODE_IMAGES" STUB_MH_TEMPLATE_OLD="${WORK}/prune-tpl.json" dep)"; rc=$?
+assert_rc "prune-mh-rc" 0 "$rc"
+assert_status "prune-mh-evicts-outside-keep-set" "localhost/mh-service:sha-ffffffffffffffff" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
+for keep in "${BUILT_TAG}" sha-dddddddddddddddd sha-eeeeeeeeeeeeeeee; do
+  assert_absent "prune-mh-keeps-${keep}" "localhost/mh-service:${keep}" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
+done
+# The LIVE-POD arm: an image only a live MH pod runs (an old revision mid-upgrade) is kept.
+MH_NODE_IMAGES2="${MH_NODE_IMAGES}localhost/mh-service sha-1111111111111111 e\n"
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$MH_NODE_IMAGES2" STUB_MH_TEMPLATE_OLD="${WORK}/prune-tpl.json" \
+  STUB_MH_POD_IMAGES="localhost/mh-service:sha-ffffffffffffffff\n" dep)"; rc=$?
+assert_absent "prune-mh-keeps-live-pod-image" "localhost/mh-service:sha-ffffffffffffffff" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
+assert_status "prune-mh-live-pod-control-evicts-other" "localhost/mh-service:sha-1111111111111111" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
+# The live-pod read fails: loud skip, no MH eviction.
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$MH_NODE_IMAGES" STUB_MH_TEMPLATE_OLD="${WORK}/prune-tpl.json" STUB_MH_PODS_FAIL=1 dep)"; rc=$?
+assert_status "prune-mh-live-pods-unreadable-skips-loudly" "PRUNE_SKIPPED SERVICE=mh REASON=live-pods-unreadable" "$out"
+assert_absent "prune-mh-live-pods-unreadable-evicts-no-mh" "localhost/mh-service" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_IMAGES="$MH_NODE_IMAGES" dep)"; rc=$?
+assert_status "prune-mh-template-unreadable-skips-loudly" "PRUNE_SKIPPED SERVICE=mh REASON=template-unreadable" "$out"
+assert_absent "prune-mh-template-unreadable-evicts-no-mh" "localhost/mh-service" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
 
 # The environment root cannot be RENDERED: the converge stops at cache_renders with ONE
 # classified line, before building or applying anything.
@@ -2077,7 +2378,7 @@ assert_rc "deploy-image-ref-read-failed-one-line" 1 "$(grep -c '^DEPLOY_FAILED' 
 # deploy.sh needs, so a real host runtime cannot leak in and the case always runs.
 NORT_BIN="${WORK}/d4bin-noruntime"; rm -rf "$NORT_BIN"; mkdir -p "$NORT_BIN"
 cp "${D4_BIN}/kubectl" "${D4_BIN}/kind" "${D4_BIN}/sqlx" "$NORT_BIN/"
-for t in bash awk grep sed sort mktemp cat cut head tail tr sha256sum date dirname basename rm cp mv env realpath wc sleep tee uname ls mkdir chmod timeout; do
+for t in bash awk grep sed sort mktemp cat cut head tail tr sha256sum date dirname basename rm cp mv env realpath wc sleep tee uname ls mkdir chmod jq timeout; do
   ln -sf "$(command -v "$t")" "$NORT_BIN/$t"
 done
 reset_marks
@@ -2090,7 +2391,7 @@ assert_status "deploy-prerequisite-missing-names-runtime" "a container runtime (
 # It is a named prerequisite, and the classifier itself names it rather than probing.
 NOTO_BIN="${WORK}/d4bin-notimeout"; rm -rf "$NOTO_BIN"; mkdir -p "$NOTO_BIN"
 cp "${D4_BIN}/kubectl" "${D4_BIN}/kind" "${D4_BIN}/sqlx" "${D4_BIN}/podman" "$NOTO_BIN/"
-for t in bash awk grep sed sort mktemp cat cut head tail tr sha256sum date dirname basename rm cp mv env realpath wc sleep tee uname ls mkdir chmod; do
+for t in bash awk grep sed sort mktemp cat cut head tail tr sha256sum date dirname basename rm cp mv env realpath wc sleep tee uname ls mkdir chmod jq; do
   ln -sf "$(command -v "$t")" "$NOTO_BIN/$t"
 done
 reset_marks
@@ -2165,7 +2466,7 @@ assert_status "deploy-guard-host-names-setup" "./infra/kind/scripts/setup.sh" "$
 assert_absent "deploy-guard-host-not-container-cmd" "dev-cluster provision" "$out"
 reset_marks
 out="$(PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 DT_JOB_POLL_SECONDS=0 STUB_BP_REASON=match STUB_JOBS="$JOBS_OK" \
-  src_run -u DT_HOST_GATEWAY_IP "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"; rc=$?
+  DT_MH_SH="$D4_MH" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_GUARDED" "$PSTUB" 2>&1)"; rc=$?
 assert_rc "deploy-guard-match-proceeds" 0 "$rc"
 # No cluster at all: fails before the check, still naming provision, building nothing.
 reset_marks

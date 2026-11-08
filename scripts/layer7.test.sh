@@ -673,6 +673,7 @@ cat > "$MH_SUITE_STUB" <<EOF
 touch "${MARKERS}/ran.env-suite"
 printf '%s|%s|%s|%s\n' "\${ENV_TEST_MH_0_GRPC_URL-<unset>}" "\${ENV_TEST_MH_1_GRPC_URL-<unset>}" \
   "\${ENV_TEST_MH_0_POD_IP-<unset>}" "\${ENV_TEST_MH_1_POD_IP-<unset>}" > "${WORK}/seen-mh-env"
+printf '%s|%s\n' "\${DT_MH_SH-<unset>}" "\${DT_CLUSTER_NAME-<unset>}" > "${WORK}/seen-mh-pool-env"
 exit 0
 EOF
 chmod +x "$MH_SUITE_STUB"
@@ -685,6 +686,14 @@ assert_exit   "mh-env-retired-exit0" 0 "$RC"
 assert_marker "mh-env-retired-suite-ran" "$MARKERS" "ran.env-suite"
 assert_rc     "mh-env-retired-all-unset" 0 \
   "$([[ "$(cat "${WORK}/seen-mh-env" 2>/dev/null)" == "<unset>|<unset>|<unset>|<unset>" ]] && echo 0 || echo "1 ($(cat "${WORK}/seen-mh-env" 2>/dev/null || echo 'no record'))")"
+# The MH pool tool IS exported (story 4 I-2): DT_MH_SH absolute + existing, and
+# DT_CLUSTER_NAME == ports.json's cluster_name (mh.sh targets kind-<DT_CLUSTER_NAME>).
+seen_pool="$(cat "${WORK}/seen-mh-pool-env" 2>/dev/null || echo 'no record')"
+seen_sh="${seen_pool%%|*}"; seen_cluster="${seen_pool#*|}"
+assert_rc     "mh-pool-env-dt-mh-sh-absolute-existing" 0 \
+  "$([[ "$seen_sh" == /* && -f "$seen_sh" && "$seen_sh" == */infra/kind/scripts/mh.sh ]] && echo 0 || echo "1 (${seen_pool})")"
+assert_rc     "mh-pool-env-cluster-name-from-ports-json" 0 \
+  "$([[ "$seen_cluster" == "$(jq -r '.cluster_name' "$PORTS" 2>/dev/null)" && -n "$seen_cluster" && "$seen_cluster" != "<unset>" ]] && echo 0 || echo "1 (${seen_pool}; ports.json cluster_name=$(jq -r '.cluster_name' "$PORTS" 2>/dev/null))")"
 # Positive control for the absence below: this run DOES emit step-duration lines to $ERR.
 assert_status "mh-env-retired-steps-timed" "LAYER=7 STEP=" "$(cat "$ERR")"
 assert_absent "mh-env-retired-no-step" "STEP=mh-grpc-forwards" "$(cat "$ERR")"

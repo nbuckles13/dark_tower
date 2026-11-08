@@ -77,49 +77,17 @@ nodes:
         listenAddress: "${HOST_GATEWAY_IP}"
         protocol: UDP
 
-      # --- MH-0 (Media Handler instance 0) ---
-      # Offset +20: MH-0 Health (containerPort 30830 = future NodePort)
-      - containerPort: 30830
-        hostPort: ${HOST_PORT_MH_0_HEALTH}
-        listenAddress: "${HOST_GATEWAY_IP}"
-        protocol: TCP
-      # Offset +21: MH-0 gRPC. NOTHING LISTENS BEHIND THIS HOSTPORT: MH gRPC (50053)
-      # is ClusterIP-only and its NetworkPolicy admits only MC, so no NodePort
-      # for it exists or should be added. The env-test route to MH gRPC is
-      # scripts/layer7.sh's `kubectl port-forward deployment/mh-0`, which binds
-      # this slug's allocated port number INSIDE the devloop container's own
-      # netns. Kept because the port allocation is the devloop helper's.
-      - containerPort: 30530
-        hostPort: ${HOST_PORT_MH_0_GRPC}
-        listenAddress: "${HOST_GATEWAY_IP}"
-        protocol: TCP
-      # Offset +22: MH-0 WebTransport (containerPort 30434 = existing NodePort from mh-service-0)
-      - containerPort: 30434
-        hostPort: ${HOST_PORT_MH_0_WEBTRANSPORT}
-        listenAddress: "${HOST_GATEWAY_IP}"
-        protocol: UDP
-
-      # --- MH-1 (Media Handler instance 1) ---
-      # Offset +23: MH-1 Health (containerPort 30831 = future NodePort)
-      - containerPort: 30831
-        hostPort: ${HOST_PORT_MH_1_HEALTH}
-        listenAddress: "${HOST_GATEWAY_IP}"
-        protocol: TCP
-      # Offset +24: MH-1 gRPC. NOTHING LISTENS BEHIND THIS HOSTPORT: MH gRPC (50053)
-      # is ClusterIP-only and its NetworkPolicy admits only MC, so no NodePort
-      # for it exists or should be added. The env-test route to MH gRPC is
-      # scripts/layer7.sh's `kubectl port-forward deployment/mh-1`, which binds
-      # this slug's allocated port number INSIDE the devloop container's own
-      # netns. Kept because the port allocation is the devloop helper's.
-      - containerPort: 30531
-        hostPort: ${HOST_PORT_MH_1_GRPC}
-        listenAddress: "${HOST_GATEWAY_IP}"
-        protocol: TCP
-      # Offset +25: MH-1 WebTransport (containerPort 30436 = existing NodePort from mh-service-1)
-      - containerPort: 30436
-        hostPort: ${HOST_PORT_MH_1_WEBTRANSPORT}
-        listenAddress: "${HOST_GATEWAY_IP}"
-        protocol: UDP
+      # --- MH hostPort slots (ADR-0039 §7 "Kind") ---
+      # Offsets +20..: one UDP mapping per MH slot, RENDERED by devloop-helper
+      # from its slot table (crates/devloop-helper/src/ports.rs:
+      # mh_slot_port_mappings — K has ONE home there; changing K = rebuild the
+      # helper + recreate the cluster). Host port == node containerPort == the MH
+      # pod's webtransport hostPort (infra/kind/scripts/mh.sh sets it per slot);
+      # each mapping is preceded by a `# dt:mh-slot=<k>` marker that
+      # infra/kind/scripts/deploy.sh:mh_slot_table() reads back. There is no MH
+      # health/gRPC mapping: both are ClusterIP-only (env-tests port-forward per
+      # pod on local port 0).
+${MH_SLOT_PORT_MAPPINGS}
 
       # --- Observability ---
       # Offset +100: Prometheus (containerPort 30090 = existing NodePort)

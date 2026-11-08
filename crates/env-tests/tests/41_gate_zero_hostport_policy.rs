@@ -26,9 +26,9 @@
 //! Datagrams go to the canary's NODE IP (`.status.hostIP`) on the hostPort:
 //! node PREROUTING -> CNI-HOSTPORT-DNAT (portmap) -> Calico policy, exactly as
 //! a host-published datagram arrives. The Kind host-publish leg (host gateway
-//! -> node) is NOT exercised: today's Kind mappings for 30830/30530 are TCP
-//! (I-2 owns the UDP slot mappings and their end-to-end env-test). The PASS
-//! line says so.
+//! -> node) is NOT exercised here: 30830/30530 have no Kind mapping (I-2
+//! deleted the old TCP ones). The UDP slot mappings' end-to-end leg is
+//! `43_mh_slot_publish_udp.rs`. The PASS line says so.
 //!
 //! # Verdicts
 //!
@@ -158,7 +158,7 @@ async fn run_gate() -> GateResult<String> {
     Ok(format!(
         "GATE0 PASS policy-on-DNAT: PASS (phases A+B; networkpolicy/{MH_POLICY_NAME} labels={:?}, \
          allowed UDP {} delivered and UDP {DROP_PORT} dropped via EACH hostPort {:?}); \
-         publish-layer UDP leg: NOT EXERCISED (I-2 obligation). {}",
+         publish-layer UDP leg: NOT EXERCISED here (43_mh_slot_publish_udp.rs). {}",
         ev.labels,
         ev.allowed_udp_port,
         HOST_PORTS,
