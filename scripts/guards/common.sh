@@ -72,6 +72,9 @@ get_diff_base() {
     "$(dirname "${BASH_SOURCE[0]}")/../lang/_get_base_ref.sh"
 }
 
+# Every file-list diff here passes --no-renames: diff.renames (default on) would list a
+# rename as its destination only. Rationale: crates/dt-guard/src/common/git_changes.rs.
+#
 # Get files modified compared to diff base (tracked files only)
 # Usage: get_modified_files [path] [extension]
 # Example: get_modified_files . ".rs"
@@ -82,7 +85,7 @@ get_modified_files() {
     base=$(get_diff_base)
 
     local files
-    files=$(git diff --name-only "$base" -- "$path" 2>/dev/null || true)
+    files=$(git diff --no-renames --name-only "$base" -- "$path" 2>/dev/null || true)
 
     if [[ -n "$ext" ]]; then
         echo "$files" | grep "${ext}$" || true
@@ -117,7 +120,7 @@ get_added_files() {
     base=$(get_diff_base)
 
     local files
-    files=$(git diff --name-only --diff-filter=A "$base" -- "$path" 2>/dev/null || true)
+    files=$(git diff --no-renames --name-only --diff-filter=A "$base" -- "$path" 2>/dev/null || true)
 
     if [[ -n "$ext" ]]; then
         echo "$files" | grep "${ext}$" || true
@@ -135,7 +138,7 @@ get_deleted_files() {
     base=$(get_diff_base)
 
     local files
-    files=$(git diff --name-only --diff-filter=D "$base" -- "$path" 2>/dev/null || true)
+    files=$(git diff --no-renames --name-only --diff-filter=D "$base" -- "$path" 2>/dev/null || true)
 
     if [[ -n "$ext" ]]; then
         echo "$files" | grep "${ext}$" || true

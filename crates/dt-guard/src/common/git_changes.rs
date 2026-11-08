@@ -16,12 +16,18 @@
 //! via `std::process::Command` rather than reimplementing the merge-base /
 //! ref-validation logic in Rust.
 //!
-//! ## `--diff-filter=D` exclusive (no rename detection)
+//! ## No rename detection (`--no-renames` on every file-list diff)
 //!
-//! Per @paired-client F2 — [`get_deleted_files`] pins `--diff-filter=D`
-//! exclusively. NO `-M` / `-C` rename detection. A rename appears as
-//! delete+add by design; downstream consumers (`ts_test_removal`) catch the
-//! rename case via same-basename / same-package matching.
+//! Per @paired-client F2 — a rename appears as delete+add by design;
+//! downstream consumers (`ts_test_removal`) catch the rename case via
+//! same-basename / same-package matching. `git diff` honours `diff.renames`
+//! (default ON), so omitting `-M` is NOT enough: without `--no-renames` a
+//! committed rename lists only its destination, and `--diff-filter=D` never
+//! sees the source. That made guards disagree between a devloop's uncommitted
+//! tree (delete + untracked add: both paths) and the story runner's
+//! post-commit gate (rename: destination only) — story 4 I-2's
+//! `mh-0-deployment.yaml -> deployment.yaml` red `cross-boundary-scope` as
+//! "planned but untouched". Same rule as `scripts/lang/_gate2_binding.sh`.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -65,7 +71,7 @@ pub fn get_modified_files(
     let base = get_diff_base(repo_root)?;
     git_diff_name_only(
         repo_root,
-        &["diff", "--name-only", &base, "--"],
+        &["diff", "--no-renames", "--name-only", &base, "--"],
         search_path,
         extensions,
     )
@@ -80,7 +86,7 @@ pub fn get_added_files(
     let base = get_diff_base(repo_root)?;
     git_diff_name_only(
         repo_root,
-        &["diff", "--name-only", "--diff-filter=A", &base, "--"],
+        &["diff", "--no-renames", "--name-only", "--diff-filter=A", &base, "--"],
         search_path,
         extensions,
     )
@@ -96,7 +102,7 @@ pub fn get_deleted_files(
     let base = get_diff_base(repo_root)?;
     git_diff_name_only(
         repo_root,
-        &["diff", "--name-only", "--diff-filter=D", &base, "--"],
+        &["diff", "--no-renames", "--name-only", "--diff-filter=D", &base, "--"],
         search_path,
         extensions,
     )
@@ -194,7 +200,7 @@ pub fn get_active_edit_paths(repo_root: &Path) -> Result<Vec<PathBuf>> {
         // Pending: diff vs HEAD + untracked.
         let diff = Command::new("git")
             .current_dir(repo_root)
-            .args(["diff", "HEAD", "--name-only"])
+            .args(["diff", "--no-renames", "HEAD", "--name-only"])
             .output()
             .with_context(|| format!("git diff HEAD in {}", repo_root.display()))?;
         if diff.status.success() {
@@ -248,6 +254,7 @@ pub fn get_active_edit_paths(repo_root: &Path) -> Result<Vec<PathBuf>> {
                 .current_dir(repo_root)
                 .args([
                     "diff",
+                    "--no-renames",
                     &format!("{effective_head}^"),
                     &effective_head,
                     "--name-only",
@@ -362,6 +369,42 @@ mod tests {
         let stdout = b"vendor/foo.rs\nsrc/main.rs\n";
         let out = filter_lines(stdout, &[".rs"]);
         assert_eq!(out, vec![PathBuf::from("src/main.rs")]);
+    }
+
+    /// Run git in `dir`, panicking on failure (test fixture helper).
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "diff.renames=true"])
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// A committed rename must list BOTH paths on the clean-tree (post-commit)
+    /// branch, exactly as the uncommitted delete + untracked add does — or a
+    /// guard passes in the devloop and fails at the runner's gate.
+    #[test]
+    fn active_edit_paths_lists_both_sides_of_a_committed_rename() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let d = tmp.path();
+        git(d, &["init", "-q"]);
+        let body = "line\n".repeat(50);
+        std::fs::write(d.join("old.yaml"), &body).expect("write");
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-q", "-m", "base"]);
+        std::fs::remove_file(d.join("old.yaml")).expect("rm");
+        std::fs::write(d.join("new.yaml"), format!("{body}extra\n")).expect("write");
+
+        let dirty = get_active_edit_paths(d).expect("dirty");
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-q", "-m", "rename"]);
+        let clean = get_active_edit_paths(d).expect("clean");
+
+        let want = vec![PathBuf::from("new.yaml"), PathBuf::from("old.yaml")];
+        assert_eq!(dirty, want, "uncommitted tree");
+        assert_eq!(clean, want, "post-commit tree must match the uncommitted view");
     }
 
     #[test]
