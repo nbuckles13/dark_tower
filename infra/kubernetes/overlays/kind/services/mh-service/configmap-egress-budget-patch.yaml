@@ -48,7 +48,7 @@
 #   (each was considered and rejected in story 2 or story 3 planning).
 #
 # THE RETAINED-EDGE FLOOR, and why this is DEV HEADROOM, NOT A CAPACITY
-# MODEL. During story 2 task 20's Gate 2, mh-0 reached 39 of 40 installed
+# MODEL. During story 2 task 20's Gate 2, one MH reached 39 of 40 installed
 # streams and refused a registration outright. The cause was NOT real load:
 # disconnected participants hold their edges through MC's reconnect grace
 # window (MC_DISCONNECT_GRACE_PERIOD_SECONDS) while Layer-7 suites run back to

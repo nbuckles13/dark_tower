@@ -563,7 +563,7 @@ __fail_if_helper_lacks_verb() {  # $1 = verb
 __cluster_failed_line() {
   local prefix
   prefix="$(tr '[:lower:]' '[:upper:]' <<<"$1")_FAILED"
-  grep -m1 -oE "${prefix} REASON=[a-z-]+( STEP=[a-z_]+)?( WORKLOADS=[^[:space:]]*)?" <<<"$DC_WRITE_OUT" || true
+  grep -m1 -oE "${prefix} REASON=[a-z-]+( STEP=[a-z_]+)?( MH_TOKEN=[a-z-]+ SLOT=[0-9-]+)?( WORKLOADS=[^[:space:]]*)?" <<<"$DC_WRITE_OUT" || true
 }
 
 # The cluster-failure REASONs that are the ENVIRONMENT (operator lane,
@@ -577,7 +577,7 @@ __cluster_failed_line() {
 # hide it from the implementer. Fail-closed by construction: an unlisted reason
 # is FAIL. scripts/layer7.test.sh extracts every reason both scripts can emit and
 # pins that each lands where this list says.
-readonly CLUSTER_ENV_REASONS=(runtime-unreachable runtime-incapable apiserver-unreachable insufficient-disk prerequisite-missing blueprint-missing blueprint-changed blueprint-unreadable image-ref-read-failed operator-declined port-held)
+readonly CLUSTER_ENV_REASONS=(runtime-unreachable runtime-incapable apiserver-unreachable insufficient-disk prerequisite-missing blueprint-missing blueprint-changed blueprint-unreadable image-ref-read-failed operator-declined port-held kind-config-unrendered)
 
 # Emit the IMPLEMENTER lane for a failure Phase 1 attributes to the tree: a stderr
 # banner plus STATUS=FAIL through the lifecycle (exit 1). Mirrors precondition_fail.
@@ -965,6 +965,19 @@ __env_test_export_urls() {
   return 0
 }
 
+# Export the MH pool tool for the env-tests (ADR-0039 §7; the fixture
+# crates/env-tests/src/fixtures/mh_pool.rs fails loudly when DT_MH_SH is unset):
+#   DT_MH_SH        the ABSOLUTE path of infra/kind/scripts/mh.sh in this tree;
+#   DT_CLUSTER_NAME the devloop cluster (ports.json `.cluster_name`) — mh.sh always
+#                   targets `kind-<DT_CLUSTER_NAME>` (default dark-tower), never the
+#                   current context, so without it mh.sh would read another cluster.
+# Called in Phase 1h right after the cluster name is resolved (fail-closed there).
+# Args: $1 = the devloop cluster name.
+__env_test_export_mh_pool() {
+  export DT_MH_SH="${__repo_root}/infra/kind/scripts/mh.sh"
+  export DT_CLUSTER_NAME="$1"
+}
+
 # Per-step timing (observability — `LAYER=7 STEP=<name> DURATION=<s>`) is provided by
 # `_common.sh::layer_now` + `emit_step_duration`. Using those helpers (rather than a direct
 # timestamp call in this layer body) keeps the `_layer_skeleton.test.sh` "lifecycle owns
@@ -1141,6 +1154,8 @@ __layer7_main() {
       "cannot resolve a kubectl context for the devloop cluster (ports.json '.cluster_name'='${cluster_name:-<empty>}', kubectl $(command -v kubectl >/dev/null 2>&1 && echo present || echo MISSING)) — refusing to provision the per-run organization against an unknown database" \
       "this is a cluster-addressing problem, NOT a database problem: ensure 'dev-cluster provision' completed and wrote /tmp/devloop/ports.json, and that the container kubeconfig is mounted (re-run devloop.sh on the host)"
   fi
+  # The MH pool tool for the env-tests, bound to THIS cluster (resolved just above).
+  __env_test_export_mh_pool "$cluster_name"
   # Folded into org-provision-failed with an explicit cause rather than a sixth token: the
   # runbook is scoped at five and this cause is too rare to earn a dedicated row (@operations).
   run_org="$(__generate_org_subdomain)" || precondition_fail org-provision-failed \

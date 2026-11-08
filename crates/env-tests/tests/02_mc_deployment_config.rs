@@ -23,7 +23,7 @@
 //!   absence (`01_mh_deployment_config.rs` points here).
 //! - **Parse.** Every resolved value has the SHAPE its reader accepts (shape
 //!   only — bounds stay with the readers; no deployed number is restated here).
-//! - **One profile generation.** mc-0, mc-1, mh-0 and mh-1 all resolve the SAME
+//! - **One profile generation.** mc-0, mc-1 and every MH pool pod resolve the SAME
 //!   `media-codec-profile` generation — the shared-source property proven on
 //!   the live cluster rather than by inspection: MC directs exactly the
 //!   encoding MH costs against.
@@ -58,8 +58,8 @@ use env_tests::fixtures::deployment_config::{
     pod_name_of, RefKind, ValueShape,
 };
 use env_tests::fixtures::kube::{
-    configmap_name_for, configmap_name_for_all, MC_INSTANCES, PROFILE_CONFIGMAP, PROFILE_READERS,
-    REDEPLOY_HINT,
+    configmap_name_for, configmap_name_for_selectors, profile_reader_selectors, MC_INSTANCES,
+    PROFILE_CONFIGMAP, REDEPLOY_HINT,
 };
 use env_tests::fixtures::mh_config::{gauge_verdict, Conversion, GaugeVerdict};
 
@@ -239,13 +239,14 @@ async fn test_story3_keys_wired_into_every_mc_instance() {
 }
 
 /// MC and MH resolve the SAME `media-codec-profile` generation: one hashed
-/// name across all four pods. `configmap_name_for_all` resolves each pod's
+/// name across every MC instance and every MH pool pod (found by label, no
+/// fixed MH instances). `configmap_name_for_selectors` resolves each pod's
 /// generation from its spec, rejects a bare name and an in-flight rollout, and
 /// fails on disagreement — two generations would mean MC directs an encoding
 /// MH does not cost against.
 #[tokio::test]
 async fn test_mc_and_mh_resolve_one_media_codec_profile_generation() {
-    let name = configmap_name_for_all(PROFILE_READERS, PROFILE_CONFIGMAP);
+    let name = configmap_name_for_selectors(&profile_reader_selectors(), PROFILE_CONFIGMAP);
     assert!(
         name.starts_with(&format!("{PROFILE_CONFIGMAP}-")),
         "resolved {name:?} is not a hash-suffixed generation of {PROFILE_CONFIGMAP}"

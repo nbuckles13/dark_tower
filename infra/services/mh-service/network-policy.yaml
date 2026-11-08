@@ -27,7 +27,10 @@ spec:
     - protocol: TCP
       port: 50053
   # Allow ingress from external clients (WebTransport media)
-  # In Kind, exposed via NodePort 30434 (mapped to host 4434 in kind-config.yaml)
+  # In Kind, published per MH via a hostPort SLOT (kind-config extraPortMappings;
+  # host port == pod hostPort, DNATed to this container port 4434, so this one
+  # rule covers every slot — policy is evaluated after the hostPort DNAT, proven
+  # by gate zero, crates/env-tests/tests/41_gate_zero_hostport_policy.rs)
   - from: []
     ports:
     - protocol: UDP

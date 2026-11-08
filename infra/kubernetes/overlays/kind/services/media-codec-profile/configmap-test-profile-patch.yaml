@@ -29,8 +29,9 @@
 # refuses to start outside them. MH requires both of its inputs non-zero.
 #
 # ROLL COST. The ConfigMap is content-addressed (ADR-0038 §2) and referenced
-# by mc-0, mc-1, mh-0 and mh-1, so ANY change to this patch — editing it,
-# removing it, or restoring it — rolls all four pods together, and the MH roll
+# by mc-0, mc-1 and the MH template, so ANY change to this patch — editing it,
+# removing it, or restoring it — rolls both MC pods and replaces every MH
+# (deploy.sh runs `mh.sh upgrade`), and the MH replacement
 # drops every live meeting on each pod (participants must rejoin). The
 # consequences are in docs/runbooks/mh-deployment.md §Rollout With Media
 # Flowing; they are not restated here.

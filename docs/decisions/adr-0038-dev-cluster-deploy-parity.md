@@ -101,6 +101,23 @@ pod template. Together with content-tagged images, applying the root rolls **exa
 workloads whose image or configuration changed and nothing else; there is no
 unconditional restart.
 
+**Amendment (2026-11-07, ADR-0039 §7, story 4 I-2) — MH is a pool, not a root workload.** The
+MH template (`infra/services/mh-service/deployment.yaml`) is rendered in the ONE environment-root
+render (content-tagged image, hash-named refs) but **excluded from the apply**: `deploy.sh` stores
+it as ConfigMap `mh-template`, and `infra/kind/scripts/mh.sh` instantiates it per hostPort slot.
+After the root's rollouts, `deploy.sh` runs `mh.sh upgrade` and tops up to the baseline. The
+"rolls exactly what changed" property holds for MH as "every MH whose template revision changed
+is replaced, start-new-then-drain-old".
+
+**Parity allowlist — Kind-only divergences that are test instrumentation.** Every entry here is
+present ONLY in the Kind render, absent from every base and every non-Kind render, and exists
+solely so an env-test can observe or perturb the system; nothing in production behaviour may
+depend on it. Adding an entry is an ADR-level change.
+
+| Divergence | Where | Why (the test that needs it) | Guard |
+|---|---|---|---|
+| `shareProcessNamespace: true` on the MH pod | `infra/kubernetes/overlays/kind/services/mh-service/share-process-namespace-patch.yaml` | ADR-0039 §9 zombie leg (SIGSTOP/SIGCONT the MH process without killing it). The MH pod stays single-container; only Kind-only test tooling may share its PID namespace. | `scripts/setup.test.sh` (present in the Kind template, absent from the base render); the dt-guard rule lands with story 4 I-3. |
+
 ### 3. Layer 7 and the helper
 
 - Layer 7 is `provision && deploy && tests`. It no longer inspects diffs.

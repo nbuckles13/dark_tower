@@ -66,6 +66,8 @@ crates/env-tests/
 │   ├── eventual.rs         # Retry helpers for eventual consistency
 │   ├── fixtures/
 │   │   ├── auth_client.rs  # Token issuance, JWKS operations
+│   │   ├── mh_pool.rs      # `mh.sh list --json` reader (DT_MH_SH), mh-template read
+│   │   ├── mh_address.rs   # R-28 pure address-invariant verdict
 │   │   └── metrics.rs      # Prometheus queries
 │   └── canary.rs           # NetworkPolicy test pods (placeholder)
 └── tests/
@@ -76,6 +78,8 @@ crates/env-tests/
     ├── 30_observability.rs    # P1 observability tests
     ├── 40_resilience.rs       # P2 resilience tests (stubs)
     ├── 41_gate_zero_hostport_policy.rs # Gate zero: MH policy on the UDP hostPort DNAT path (own binary)
+    ├── 42_mh_address_invariant.rs # R-28: every live MH pod advertises its own unique slot address (needs DT_MH_SH)
+    ├── 43_mh_slot_publish_udp.rs  # R-27: host-published UDP reaches each serving slot's own MH (own binary)
     └── 90_runbook.rs          # P2 runbook validation (stubs)
 ```
 

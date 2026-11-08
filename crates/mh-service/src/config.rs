@@ -1814,9 +1814,9 @@ pub struct Config {
     /// tracing knob.
     ///
     /// Optional-with-default rather than required — a REASONED carve-out, not
-    /// a missed instance of story 2's "required keys" flip: both deployments
-    /// declare this the one deliberately `optional:` ref, so the image may roll
-    /// back alone (`infra/services/mh-service/mh-0-deployment.yaml`). Its
+    /// a missed instance of story 2's "required keys" flip: the MH template
+    /// declares this the one deliberately `optional:` ref, so the image may roll
+    /// back alone (`infra/services/mh-service/deployment.yaml`). Its
     /// provenance is reported by [`Self::media_latency_sample_ratio_source`].
     pub media_latency_sample_ratio: f64,
 
@@ -1944,7 +1944,7 @@ pub enum ConfigError {
          flush. A value of 0 means the kustomize replacement did not run — the checked-in literal \
          is a sentinel. Remediation: deploy with `kubectl apply -k`, not `apply -f`, and check \
          spec.template.spec.terminationGracePeriodSeconds in \
-         infra/services/mh-service/mh-{{0,1}}-deployment.yaml"
+         infra/services/mh-service/deployment.yaml"
     )]
     TerminationGraceTooSmall {
         /// The configured termination grace, in seconds.
@@ -3324,7 +3324,7 @@ mod tests {
 
     #[test]
     fn the_zero_termination_grace_sentinel_refuses_to_start() {
-        // `"0"` is what `mh-{0,1}-deployment.yaml` ships as a literal; the
+        // `"0"` is what the MH template (`deployment.yaml`) ships as a literal; the
         // kustomize `replacements:` block overwrites it at build time. A pod
         // that actually reads 0 was deployed with `apply -f` instead of
         // `apply -k`, and must refuse rather than drain for an unchosen window.
@@ -4620,7 +4620,7 @@ mod tests {
                 .take_while(|c| !c.is_whitespace() && !matches!(c, '`' | '"' | '\\' | ')' | ','))
                 .collect();
             let path = path.trim_end_matches('.');
-            // A brace/star glob (`mh-{{0,1}}-deployment.yaml`) names a family,
+            // A brace/star glob (`{mc,mh}-service/*.yaml`) names a family,
             // not a file; the concrete members are cited elsewhere.
             if path.contains(['{', '*']) {
                 continue;
@@ -4802,35 +4802,32 @@ mod tests {
         let kind_patch = include_str!(
             "../../../infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml"
         );
-        for deployment in [
-            include_str!("../../../infra/services/mh-service/mh-0-deployment.yaml"),
-            include_str!("../../../infra/services/mh-service/mh-1-deployment.yaml"),
-        ] {
-            let limit = deployment_memory_limit(deployment);
-            let mut vars = base_vars();
-            // Every shipped value except the in-cluster TLS file paths, which
-            // this test cannot provide.
-            vars.extend(
-                env_file(config_env)
-                    .into_iter()
-                    .filter(|(key, _)| !key.starts_with("MH_TLS_")),
-            );
-            vars.extend(env_file(profile));
-            vars.insert("MH_POD_MEMORY_LIMIT_BYTES".to_string(), limit.to_string());
-            let base = Config::from_vars(&vars).expect("the shipped base config must boot");
-            assert!(base.memory_budget.headroom_bytes() > 0);
+        // THE one MH template: every MH (every per-slot mh-s<k>) is an instance of it.
+        let deployment = include_str!("../../../infra/services/mh-service/deployment.yaml");
+        let limit = deployment_memory_limit(deployment);
+        let mut vars = base_vars();
+        // Every shipped value except the in-cluster TLS file paths, which
+        // this test cannot provide.
+        vars.extend(
+            env_file(config_env)
+                .into_iter()
+                .filter(|(key, _)| !key.starts_with("MH_TLS_")),
+        );
+        vars.extend(env_file(profile));
+        vars.insert("MH_POD_MEMORY_LIMIT_BYTES".to_string(), limit.to_string());
+        let base = Config::from_vars(&vars).expect("the shipped base config must boot");
+        assert!(base.memory_budget.headroom_bytes() > 0);
 
-            let kind_budget = kind_patch
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("MH_EGRESS_BUDGET_BPS:"))
-                .expect("Kind budget patch")
-                .trim()
-                .trim_matches('"')
-                .to_string();
-            vars.insert("MH_EGRESS_BUDGET_BPS".to_string(), kind_budget);
-            let kind = Config::from_vars(&vars).expect("the Kind overlay must boot");
-            assert!(kind.memory_budget.required_bytes > base.memory_budget.required_bytes);
-        }
+        let kind_budget = kind_patch
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("MH_EGRESS_BUDGET_BPS:"))
+            .expect("Kind budget patch")
+            .trim()
+            .trim_matches('"')
+            .to_string();
+        vars.insert("MH_EGRESS_BUDGET_BPS".to_string(), kind_budget);
+        let kind = Config::from_vars(&vars).expect("the Kind overlay must boot");
+        assert!(kind.memory_budget.required_bytes > base.memory_budget.required_bytes);
     }
 
     #[test]

@@ -13,10 +13,10 @@ pub use common::observability::testing::otel::{
     KNOWN_TRACE_ID_U128,
 };
 
-/// MH's deployed `RUST_LOG`, read from the mh-0 manifest.
+/// MH's deployed `RUST_LOG`, read from the ONE MH template (every MH runs it).
 #[must_use]
 pub fn deployed_rust_log() -> String {
     common::observability::testing::otel::deployed_rust_log(
-        "infra/services/mh-service/mh-0-deployment.yaml",
+        "infra/services/mh-service/deployment.yaml",
     )
 }

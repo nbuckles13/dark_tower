@@ -62,6 +62,35 @@ for __d in "${__path_dirs[@]}"; do
   done
 done
 unset __path_dirs __d __f __n
+# The same toolbox WITHOUT jq (the "jq absent" CANNOT VERIFY cause).
+TOOLBOX_NOJQ="$WORK/toolbox-nojq"
+mkdir -p "$TOOLBOX_NOJQ"
+for __f in "$TOOLBOX"/*; do
+  [[ "${__f##*/}" == jq ]] || ln -s "$(readlink "$__f")" "$TOOLBOX_NOJQ/${__f##*/}"
+done
+unset __f
+
+# The MH pool stub's per-slot key set is READ from mh.sh's schema-v1 key list
+# (MH_JQ_PUBLIC), so the stub cannot drift from the real `list --json` shape.
+MH_PUBLIC_KEYS="$(sed -nE "s/^readonly MH_JQ_PUBLIC='def public: \{(.*)\};'\$/\1/p" "$REPO_ROOT/infra/kind/scripts/mh.sh" | tr -d ' ')"
+if [[ ",${MH_PUBLIC_KEYS}," == *,slot,* && ",${MH_PUBLIC_KEYS}," == *,state,* && ",${MH_PUBLIC_KEYS}," == *,address,* ]]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[mh-public-keys-extracted] could not read MH_JQ_PUBLIC from mh.sh (got '${MH_PUBLIC_KEYS}')"); fi
+# mh_list_json <baseline> <k:state:address>... — a schema-v1 `mh.sh list --json` object.
+mh_list_json() {
+  local baseline="$1"; shift
+  local spec slots="[]"
+  for spec in "$@"; do
+    slots="$(jq -c --arg keys "$MH_PUBLIC_KEYS" --arg k "${spec%%:*}" --arg rest "${spec#*:}" '
+      ($rest | split(":")) as $r | ($r[0]) as $state | ($r[1:] | join(":")) as $addr
+      | . + [ (($keys | split(",")) | map({(.): null}) | add)
+              + {slot: ($k | tonumber), state: $state, address: $addr,
+                 host_port: ($addr | split(":") | last | tonumber? // 0),
+                 terminating_past_grace: false, stale: false} ]' <<<"$slots")"
+  done
+  jq -cn --argjson b "$baseline" --argjson s "$slots" '{ok: true, schema_version: 1, template_revision: "r1", baseline: $b, slots: $s}'
+}
+# set_mh_pool <root> <rc> <json> — what the root's stub mh.sh prints/exits.
+set_mh_pool() { printf '%s\n' "$3" >"$1/mh-list.json"; printf '%s\n' "$2" >"$1/mh-list.rc"; }
 
 # ---------------------------------------------------------------------------
 # Fixture: a temp "repo" carrying only what dev-web.sh's preflight reads.
@@ -99,7 +128,7 @@ JSON
   fi
 
   local svc
-  for svc in mc-0 mc-1 mh-0 mh-1; do
+  for svc in mc-0 mc-1; do
     local dir="$root/infra/services/${svc%%-*}-service"
     mkdir -p "$dir"
     local key
@@ -125,6 +154,19 @@ JSON
       printf 'MC_AUDIO_CODEC=opus\n'
     } >"$root/infra/services/mc-service/config.env"
   fi
+  # The MH pool: a stub infra/kind/scripts/mh.sh (dev-web.sh's default path) that prints
+  # mh-list.json and exits mh-list.rc. Default: baseline 2, two serving MHs at the same
+  # advertise address (so one listener fixture serves both), one free slot.
+  mkdir -p "$root/infra/kind/scripts"
+  cat >"$root/infra/kind/scripts/mh.sh" <<SH
+#!/usr/bin/env bash
+[[ "\$1 \$2" == "list --json" ]] || { echo "mh.sh stub: unexpected argv \$*" >&2; exit 2; }
+cat "$root/mh-list.json"
+exit "\$(cat "$root/mh-list.rc")"
+SH
+  chmod +x "$root/infra/kind/scripts/mh.sh"
+  local mh_addr="${advertise:-https://127.0.0.1:4440}"
+  set_mh_pool "$root" 0 "$(mh_list_json 2 "0:serving:${mh_addr}" "1:serving:${mh_addr}" "2:free:https://127.0.0.1:4442")"
   printf '%s' "$root"
 }
 
@@ -247,16 +289,18 @@ out="$(plain "$RUN_OUT")"
 assert_absent "fingerprints-present-no-failure" "fingerprints missing" "$out"
 
 # ===========================================================================
-# (2) Listener missing: HARD FAIL for ALL FOUR instances (MC as well as MH).
+# (2) Listener missing: HARD FAIL for every MC instance AND every serving MH slot.
 #     `ss` present but reporting no listener on the advertised port.
 # ===========================================================================
 root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
 stubs="$(make_stubs ss-present 'udp   UNCONN  0  0   127.0.0.1:9999   0.0.0.0:*')"
 run_check "$root" "$stubs"
 out="$(plain "$RUN_OUT")"
-for label in mc-0 mc-1 mh-0 mh-1; do
-  assert_hard_fail_branch "listener-${label}" "${label}: nothing listening" "$out"
+for label in mc-0 mc-1 "MH slot 0" "MH slot 1"; do
+  assert_hard_fail_branch "listener-${label// /-}" "${label}: nothing listening" "$out"
 done
+# ...and the pool verdict: zero passing serving MHs < baseline 2.
+assert_hard_fail_branch "mh-pool-below-baseline-when-unlistened" "fewer than the baseline 2" "$out"
 assert_status "listener-states-user-impact" "you would hear nothing" "$out"
 assert_status "listener-has-setup-remedy"   "./infra/kind/scripts/setup.sh" "$out"
 
@@ -265,7 +309,9 @@ assert_status "listener-has-setup-remedy"   "./infra/kind/scripts/setup.sh" "$ou
 # live ConfigMap has no advertise address either" — manufacturing the exact
 # false conclusion the remedy exists to prevent. Two-sided: the right form
 # present AND the wrong form absent, so a regression flips this red.
-assert_status "remedy-has-mh-prefixed-key" "{.data.MH_WEBTRANSPORT_ADVERTISE_ADDRESS}" "$out"
+# MH addresses are LIVE (mh.sh list): its remedy names the pool tool, not a stale-file query.
+assert_status "remedy-mh-names-the-pool-tool" "infra/kind/scripts/mh.sh list" "$out"
+assert_absent "remedy-mh-no-fixed-deployment" "deployment/mh-" "$out"
 assert_status "remedy-has-mc-prefixed-key" "{.data.MC_WEBTRANSPORT_ADVERTISE_ADDRESS}" "$out"
 assert_absent "remedy-no-unprefixed-key"   "{.data.WEBTRANSPORT_ADVERTISE_ADDRESS}"    "$out"
 
@@ -276,6 +322,95 @@ run_check "$root" "$stubs"
 out="$(plain "$RUN_OUT")"
 assert_status "listener-present-passes"      "WebTransport listener on 127.0.0.1:4434" "$out"
 assert_absent "listener-present-no-failure"  "nothing listening" "$out"
+# Positive control that the per-slot check RAN on every serving slot (not just a pool verdict).
+assert_status "mh-slot-0-checked" "MH slot 0 WebTransport listener on 127.0.0.1:4434" "$out"
+assert_status "mh-slot-1-checked" "MH slot 1 WebTransport listener on 127.0.0.1:4434" "$out"
+assert_status "mh-pool-at-baseline-passes" "MH pool: 2 MH(s) serving and listening (baseline 2)" "$out"
+assert_absent "mh-pool-at-baseline-no-failure" "fewer than the baseline" "$out"
+
+# ===========================================================================
+# (2b) The MH pool (R-32): baseline rule, slot states, every CANNOT VERIFY cause.
+# ===========================================================================
+L4434='udp   UNCONN  0  0   127.0.0.1:4434   0.0.0.0:*'
+stubs="$(make_stubs ss-present "$L4434")"
+# Fewer serving than the baseline: HARD FAIL naming count, baseline and states.
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+set_mh_pool "$root" 0 "$(mh_list_json 2 "0:serving:https://127.0.0.1:4434" "1:free:https://127.0.0.1:4441")"
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "mh-pool-below-baseline" "only 1 MH(s) serving and listening, fewer than the baseline 2" "$out"
+assert_status "mh-pool-below-baseline-names-states" "slot 0=serving, slot 1=free" "$out"
+assert_status "mh-pool-below-baseline-remedy" "up --owner manual" "$out"
+# A baseline of 0 never turns zero MHs into a pass.
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+set_mh_pool "$root" 0 "$(mh_list_json 0 "0:free:https://127.0.0.1:4440")"
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "mh-pool-baseline-zero-no-mh" "fewer than the baseline 0 (need >= 1)" "$out"
+# A STARTING (or draining) slot is a NOTICE, not counted, not a failure; a free slot is silent.
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+set_mh_pool "$root" 0 "$(mh_list_json 1 "0:serving:https://127.0.0.1:4434" "1:starting:https://127.0.0.1:4441" "2:draining:https://127.0.0.1:4442" "3:free:https://127.0.0.1:4443")"
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_status "mh-pool-starting-is-notice" "MH slot 1: NOTICE — starting" "$out"
+assert_status "mh-pool-draining-is-notice" "MH slot 2: NOTICE — draining" "$out"
+assert_absent "mh-pool-free-slot-silent" "MH slot 3" "$out"
+assert_status "mh-pool-notice-case-passes" "MH pool: 1 MH(s) serving and listening (baseline 1)" "$out"
+# CANNOT VERIFY: mh.sh absent.
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+rm -f "$root/infra/kind/scripts/mh.sh"
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "mh-sh-absent-cannot-verify" "the MH pool tool infra/kind/scripts/mh.sh is absent" "$out"
+assert_status "mh-sh-absent-says-cannot-verify" "CANNOT VERIFY" "$out"
+# CANNOT VERIFY: mh.sh fails — its REASON printed as data, never "0 MHs, skip".
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+set_mh_pool "$root" 2 '{"ok":false,"reason":"no-kubeconfig","slot":null,"detail":"x"}'
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "mh-sh-failed-cannot-verify" "list --json' failed (exit 2, REASON=no-kubeconfig)" "$out"
+assert_absent "mh-sh-failed-not-a-pool-verdict" "MH pool:" "$out"
+# CANNOT VERIFY: malformed JSON / unexpected schema.
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+set_mh_pool "$root" 0 '{"ok":true,"schema_version":2,"baseline":2,"slots":[]}'
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "mh-pool-bad-schema-cannot-verify" "returned malformed JSON or an unexpected schema_version" "$out"
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+set_mh_pool "$root" 0 'not json'
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "mh-pool-not-json-cannot-verify" "returned malformed JSON" "$out"
+# CANNOT VERIFY: a non-integer baseline is malformed (never reaches bash arithmetic).
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+set_mh_pool "$root" 0 "$(mh_list_json 1.5 "0:serving:https://127.0.0.1:4434")"
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "mh-pool-fractional-baseline-cannot-verify" "returned malformed JSON or an unexpected schema_version" "$out"
+assert_status "mh-pool-fractional-baseline-report-completes" "receive slots" "$out"
+# CANNOT VERIFY: a serving slot whose address is not https://host:port is CONFIG DRIFT, not
+# "nothing listening".
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+set_mh_pool "$root" 0 "$(mh_list_json 1 "0:serving:127.0.0.1:4434")"
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "mh-slot-malformed-address-cannot-verify" "advertises '127.0.0.1:4434', not https://host:port" "$out"
+assert_absent "mh-slot-malformed-address-not-unlistened" "MH slot 0: nothing listening" "$out"
+assert_absent "mh-slot-malformed-address-no-add-remedy" "up --owner manual" "$out"
+# CANNOT VERIFY: zero slots (the replacement for "zero config files").
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+set_mh_pool "$root" 0 "$(mh_list_json 2)"
+run_check "$root" "$stubs"; out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "mh-pool-zero-slots-cannot-verify" "the MH pool has ZERO slots" "$out"
+# CANNOT VERIFY: jq absent.
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+RUN_OUT="$(cd "$root" && env -u VITE_DT_RECEIVE_SLOTS -u VITE_DT_AUDIO_RECEIVE_SLOTS -u VITE_DT_VIDEO_RECEIVE_SLOTS -u DT_TEST_TONE -u DT_TEST_LEVERS -u DT_TEST_PATTERN \
+  PATH="${stubs}:${TOOLBOX_NOJQ}" AC_PORT=1 GC_PORT=2 bash "$root/scripts/dev-web.sh" --check 2>&1 || true)"
+out="$(plain "$RUN_OUT")"
+assert_hard_fail_branch "jq-absent-cannot-verify" "jq is not installed" "$out"
+# REAL-ARTIFACT: an address from deploy.sh's slot table over the REAL static kind-config
+# (what the static host topology advertises) takes the IPv4-literal arm and passes.
+real_row="$(R="$REPO_ROOT" bash -c 'unset DT_KIND_CONFIG DT_HOST_GATEWAY_IP; source "$R/infra/kind/scripts/deploy.sh" >/dev/null 2>&1; mh_slot_table' 2>/dev/null | sed -n 1p)"
+real_addr="${real_row##* }"; real_port="${real_addr##*:}"
+if [[ "$real_addr" == https://* && "$real_port" =~ ^[0-9]+$ ]]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[mh-real-slot-address-read] could not read a slot row from deploy.sh:mh_slot_table (got '${real_row}')"); fi
+root="$(make_root with-fingerprints 'https://127.0.0.1:4434')"
+set_mh_pool "$root" 0 "$(mh_list_json 1 "0:serving:${real_addr}")"
+stubs_real="$(make_stubs ss-present "udp   UNCONN  0  0   127.0.0.1:${real_port}   0.0.0.0:*
+${L4434}")"
+run_check "$root" "$stubs_real"; out="$(plain "$RUN_OUT")"
+assert_status "mh-real-slot-address-ipv4-arm-passes" "MH slot 0 WebTransport listener on ${real_addr#https://} (IPv4)" "$out"
 
 # ===========================================================================
 # (3) CANNOT VERIFY branches are HARD FAIL, in two distinct owner lanes.
@@ -298,6 +433,9 @@ stubs="$(make_stubs ss-absent)"
 run_check "$root" "$stubs"
 out="$(plain "$RUN_OUT")"
 assert_hard_fail_branch "ss-missing-cannot-verify" "'ss' is not installed" "$out"
+# The pool verdict must not misdirect: an unverifiable slot never yields "add an MH".
+assert_absent "ss-missing-no-add-mh-remedy" "up --owner manual" "$out"
+assert_status "ss-missing-pool-not-evaluated" "could NOT be evaluated" "$out"
 assert_status "ss-missing-says-cannot-verify" "CANNOT VERIFY" "$out"
 assert_status "ss-missing-has-remedy"         "apt-get install -y iproute2" "$out"
 
@@ -633,6 +771,7 @@ assert_status "ss-broken-says-cannot-verify"   "CANNOT VERIFY" "$out"
 assert_status "ss-broken-warns-off-restart"    "do not restart it on this signal" "$out"
 # Must NOT misattribute to the cluster being down.
 assert_absent "ss-broken-does-not-blame-cluster" "nothing listening" "$out"
+assert_absent "ss-broken-no-add-mh-remedy" "up --owner manual" "$out"
 
 # ===========================================================================
 # (9) OPS-10: the header's CANNOT-RUN enumeration must not under-list the body.
@@ -655,7 +794,8 @@ assert_absent "ss-broken-does-not-blame-cluster" "nothing listening" "$out"
 #     branch therefore reds here until its phrase is added to the header and to
 #     this array — which is the forcing function, not the enumeration itself.
 CANNOT_RUN_CAUSES=("\`ss\` missing" "\`ss\` failed" "no advertise address" "no resolver" \
-                   "no per-instance config sources" "cap file absent" "key absent" "value not an integer")
+                   "no per-instance MC config sources" "mh.sh absent" "jq absent" "mh.sh list failed" \
+                   "malformed pool JSON" "zero MH slots" "malformed slot address" "cap file absent" "key absent" "value not an integer")
 
 for cause in "${CANNOT_RUN_CAUSES[@]}"; do
     assert_status "header-enumerates-cannot-run-cause" "$cause" "$header_block"
@@ -965,12 +1105,16 @@ assert_status "help-second-machine-certs-cited" "scripts/generate-dev-certs.sh" 
 #       fail-open document read just before someone types a flag.
 # Same derived instance set dev-web.sh uses (the per-instance generator sources).
 fact_files=0
-for cm_file in "$REPO_ROOT"/infra/services/m[ch]-service/m[ch]-[0-9]*-config.env; do
+for cm_file in "$REPO_ROOT"/infra/services/mc-service/mc-[0-9]*-config.env; do
   fact_files=$((fact_files + 1))
   adv="$(grep -oE '^[A-Z]+_WEBTRANSPORT_ADVERTISE_ADDRESS=https://[^[:space:]]+' "$cm_file" || true)"
   assert_status "fact-loopback-advertise-[${cm_file##*/}]" 'https://127.0.0.1:443' "$adv"
 done
-assert_rc "fact-loopback-nonvacuous" 0 "$([[ "$fact_files" -ge 4 ]] && echo 0 || echo "1 (${fact_files} files)")"
+assert_rc "fact-loopback-nonvacuous" 0 "$([[ "$fact_files" -ge 2 ]] && echo 0 || echo "1 (${fact_files} files)")"
+# MH: every slot address the static topology advertises (deploy.sh's slot table) is loopback.
+fact_slots="$(R="$REPO_ROOT" bash -c 'unset DT_KIND_CONFIG DT_HOST_GATEWAY_IP; source "$R/infra/kind/scripts/deploy.sh" >/dev/null 2>&1; mh_slot_table' 2>/dev/null)"
+assert_rc "fact-mh-slots-nonvacuous" 0 "$([[ "$(grep -c . <<<"$fact_slots")" -ge 1 ]] && echo 0 || echo 1)"
+assert_rc "fact-mh-slots-all-loopback" 0 "$([[ -z "$(grep -v ' https://127\.0\.0\.1:' <<<"$fact_slots" || true)" ]] && echo 0 || echo 1)"
 san_line="$(grep -E 'printf "(DNS|IP):%s"' "$REPO_ROOT/scripts/generate-dev-certs.sh" || true)"
 assert_status "fact-sans-dns-emitted" 'DNS:%s' "$san_line"
 assert_absent "fact-sans-no-ip-emitted" 'IP:%s' "$san_line"

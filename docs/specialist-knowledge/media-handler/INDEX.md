@@ -67,7 +67,7 @@
 - Env-test fixtures: MH gRPC as MC → `crates/env-tests/src/fixtures/mh_grpc.rs`; injected policy on a real MC's meeting → `fixtures/injection.rs`; S9 sizing + Kind ceiling window → `fixtures/egress_admission.rs:kind_window_lower_bound`; Kind patch-vs-base rule + restore command → `fixtures/deployment_config.rs:kind_patch_overrides`, `KIND_SIZING_RESTORE_CMD`; frames → `fixtures/media.rs`; scrape settle → `fixtures/metrics.rs:service_job_scrape_settle`
 
 ## Infrastructure & Operations
-- Deployments (mh-0/mh-1, all config keys as `configMapKeyRef`) → `infra/services/mh-service/mh-0-deployment.yaml`, `mh-1-deployment.yaml`; config → `infra/services/mh-service/config.env`
+- The ONE MH template (all config keys as `configMapKeyRef`; instantiated per hostPort slot as `mh-s<k>` by `infra/kind/scripts/mh.sh`) → `infra/services/mh-service/deployment.yaml`; config → `infra/services/mh-service/config.env`
 - Kind egress-budget overlay (sized against the DERIVED costs; rolls back with the image) → `infra/kubernetes/overlays/kind/services/mh-service/configmap-egress-budget-patch.yaml`; shared codec profile MH reads → `infra/services/media-codec-profile/profile.env`; Kind test-profile override → `infra/kubernetes/overlays/kind/services/media-codec-profile/configmap-test-profile-patch.yaml`
 - ConfigMap key ↔ env-var guard → `crates/dt-guard/src/env_config.rs`
 - Network policy → `infra/services/mh-service/network-policy.yaml`, `infra/services/mc-service/network-policy.yaml`

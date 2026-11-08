@@ -14,9 +14,9 @@
 //!    looked up against that specific ConfigMap's `data:` block, never against
 //!    a directory-wide union of every key in sight.
 //! 3. Every ConfigMap `data:` key is referenced by at least one workload
-//!    **naming that ConfigMap**. A key in `mh-0-config` referenced only by
-//!    `mh-0-deployment.yaml` is correct; the same key referenced only by
-//!    `mh-1-deployment.yaml` (which names `mh-1-config`) is an orphan. For a
+//!    **naming that ConfigMap**. A key in `mc-0-config` referenced only by
+//!    `mc-0-deployment.yaml` is correct; the same key referenced only by
+//!    `mc-1-deployment.yaml` (which names `mc-1-config`) is an orphan. For a
 //!    shared generator the referencing workload may live in ANY base: a
 //!    profile key referenced by nobody is an orphan; one referenced only by
 //!    MC (not MH) is not.
@@ -368,7 +368,7 @@ struct Workload {
     /// `envFrom` bulk `configMapRef` (all keys might be consumed) and a
     /// malformed `configMapKeyRef` with `name` present but `key` absent (the
     /// intended key is unknowable). Scoped to the NAMED map — an `envFrom` on
-    /// `mh-service-config` says nothing about a sibling `mh-1-config`, so
+    /// `mc-service-config` says nothing about a sibling `mc-1-config`, so
     /// suppression must not spill onto other ConfigMaps in the service.
     ambiguous_cm_names: BTreeSet<String>,
     /// A bulk `envFrom` `configMapRef` whose `name` could not be read. The
@@ -1316,8 +1316,8 @@ data:
             "mh-service",
             "",
             &[
-                ("mh-0-deployment.yaml", MINIMAL_DEPLOYMENT),
-                ("mh-1-deployment.yaml", MINIMAL_DEPLOYMENT),
+                ("mh-a-deployment.yaml", MINIMAL_DEPLOYMENT),
+                ("mh-b-deployment.yaml", MINIMAL_DEPLOYMENT),
             ],
         )]);
         let report = analyze(td.path()).expect("analyze");
@@ -1421,12 +1421,12 @@ spec:
             "",
             &[
                 (
-                    "mh-0-deployment.yaml",
-                    &deployment_ref("mh-0", "mh-0-config", "ADVERTISE"),
+                    "mh-a-deployment.yaml",
+                    &deployment_ref("mh-a", "mh-a-config", "ADVERTISE"),
                 ),
                 (
-                    "mh-0-configmap.yaml",
-                    &configmap("mh-0-config", "ADVERTISE"),
+                    "mh-a-configmap.yaml",
+                    &configmap("mh-a-config", "ADVERTISE"),
                 ),
             ],
         )]);
@@ -1436,28 +1436,28 @@ spec:
 
     #[test]
     fn configmap_key_ref_is_name_scoped() {
-        // mh-1's deployment references mh-0's ConfigMap. The key NAME exists in
+        // mh-b's deployment references mh-a's ConfigMap. The key NAME exists in
         // both, so a directory-wide union calls this clean. Name-scoped
-        // resolution sees that mh-1-config's key is referenced by nobody.
+        // resolution sees that mh-b-config's key is referenced by nobody.
         let td = fixture(&[(
             "mh-service",
             "",
             &[
                 (
-                    "mh-0-deployment.yaml",
-                    &deployment_ref("mh-0", "mh-0-config", "ADVERTISE"),
+                    "mh-a-deployment.yaml",
+                    &deployment_ref("mh-a", "mh-a-config", "ADVERTISE"),
                 ),
                 (
-                    "mh-1-deployment.yaml",
-                    &deployment_ref("mh-1", "mh-0-config", "ADVERTISE"),
+                    "mh-b-deployment.yaml",
+                    &deployment_ref("mh-b", "mh-a-config", "ADVERTISE"),
                 ),
                 (
-                    "mh-0-configmap.yaml",
-                    &configmap("mh-0-config", "ADVERTISE"),
+                    "mh-a-configmap.yaml",
+                    &configmap("mh-a-config", "ADVERTISE"),
                 ),
                 (
-                    "mh-1-configmap.yaml",
-                    &configmap("mh-1-config", "ADVERTISE"),
+                    "mh-b-configmap.yaml",
+                    &configmap("mh-b-config", "ADVERTISE"),
                 ),
             ],
         )]);
@@ -1465,8 +1465,8 @@ spec:
         let orphans = hits_for(&report, ORPHAN_CONFIGMAP_KEY_RULE_ID);
         assert_eq!(orphans.len(), 1, "hits: {:?}", report.hits);
         assert!(
-            orphans[0].detail.contains("mh-1-config"),
-            "expected mh-1-config orphan, got {}",
+            orphans[0].detail.contains("mh-b-config"),
+            "expected mh-b-config orphan, got {}",
             orphans[0].detail
         );
     }
@@ -1477,8 +1477,8 @@ spec:
             "mh-service",
             "",
             &[(
-                "mh-0-deployment.yaml",
-                &deployment_ref("mh-0", "nowhere-config", "ADVERTISE"),
+                "mh-a-deployment.yaml",
+                &deployment_ref("mh-a", "nowhere-config", "ADVERTISE"),
             )],
         )]);
         let report = analyze(td.path()).expect("analyze");
@@ -1494,12 +1494,12 @@ spec:
             "",
             &[
                 (
-                    "mh-0-deployment.yaml",
-                    &deployment_ref("mh-0", "mh-0-config", "ADVERTISE"),
+                    "mh-a-deployment.yaml",
+                    &deployment_ref("mh-a", "mh-a-config", "ADVERTISE"),
                 ),
                 (
-                    "mh-0-configmap.yaml",
-                    &configmap("mh-0-config", "SOMETHING_ELSE"),
+                    "mh-a-configmap.yaml",
+                    &configmap("mh-a-config", "SOMETHING_ELSE"),
                 ),
             ],
         )]);
@@ -1519,7 +1519,7 @@ spec:
             "mh-service",
             "",
             &[
-                ("mh-0-deployment.yaml", MINIMAL_DEPLOYMENT),
+                ("mh-a-deployment.yaml", MINIMAL_DEPLOYMENT),
                 (
                     "configmap.yaml",
                     &configmap("mh-service-config", "OTEL_ENABLED"),
@@ -1571,7 +1571,7 @@ data:
   MH_STREAM_COST_VIDEO_BPS: "2500000"
 "#;
 
-    /// Both instances reading both costs. `crossed` swaps mh-1's VIDEO env to
+    /// Both instances reading both costs. `crossed` swaps mh-b's VIDEO env to
     /// read the AUDIO key — the exact motivating defect.
     fn two_instance_costs(crossed_in_mh1: bool) -> (String, String) {
         let deployment = |name: &str, video_key: &str| {
@@ -1605,8 +1605,8 @@ spec:
             "MH_STREAM_COST_VIDEO_BPS"
         };
         (
-            deployment("mh-0", "MH_STREAM_COST_VIDEO_BPS"),
-            deployment("mh-1", mh1_video_key),
+            deployment("mh-a", "MH_STREAM_COST_VIDEO_BPS"),
+            deployment("mh-b", mh1_video_key),
         )
     }
 
@@ -1622,9 +1622,9 @@ spec:
             "",
             &[
                 (
-                    "mh-0-deployment.yaml",
+                    "mh-a-deployment.yaml",
                     &deployment_env_reads(
-                        "mh-0",
+                        "mh-a",
                         "MH_STREAM_COST_VIDEO_BPS",
                         "mh-service-config",
                         "MH_STREAM_COST_AUDIO_BPS",
@@ -1663,8 +1663,8 @@ spec:
             "mh-service",
             "",
             &[
-                ("mh-0-deployment.yaml", &mh0),
-                ("mh-1-deployment.yaml", &mh1),
+                ("mh-a-deployment.yaml", &mh0),
+                ("mh-b-deployment.yaml", &mh1),
                 ("configmap.yaml", COST_CONFIGMAP),
             ],
         )]);
@@ -1674,16 +1674,16 @@ spec:
 
     #[test]
     fn crossed_ref_in_one_instance_only_blames_that_instance() {
-        // The per-workload case: mh-0 is wired correctly, mh-1 crosses VIDEO
-        // onto AUDIO. Exactly one finding, and it names mh-1 — so the
+        // The per-workload case: mh-a is wired correctly, mh-b crosses VIDEO
+        // onto AUDIO. Exactly one finding, and it names mh-b — so the
         // remediation goes to the pod actually running the wrong value.
         let (mh0, mh1) = two_instance_costs(true);
         let td = fixture(&[(
             "mh-service",
             "",
             &[
-                ("mh-0-deployment.yaml", &mh0),
-                ("mh-1-deployment.yaml", &mh1),
+                ("mh-a-deployment.yaml", &mh0),
+                ("mh-b-deployment.yaml", &mh1),
                 ("configmap.yaml", COST_CONFIGMAP),
             ],
         )]);
@@ -1691,16 +1691,16 @@ spec:
         let crossed = hits_for(&report, CONFIGMAP_KEY_NAME_MISMATCH_RULE_ID);
         assert_eq!(crossed.len(), 1, "hits: {:?}", report.hits);
         assert!(
-            crossed[0].file.ends_with("mh-1-deployment.yaml"),
-            "expected mh-1 to be blamed, got {}",
+            crossed[0].file.ends_with("mh-b-deployment.yaml"),
+            "expected mh-b to be blamed, got {}",
             crossed[0].file.display()
         );
         assert!(
-            crossed[0].detail.contains("workload mh-1"),
+            crossed[0].detail.contains("workload mh-b"),
             "detail must name the workload: {}",
             crossed[0].detail
         );
-        // mh-1 no longer reads the VIDEO key, but mh-0 still does, so no
+        // mh-b no longer reads the VIDEO key, but mh-a still does, so no
         // orphan: the only finding is the crossed ref.
         assert_eq!(report.hits.len(), 1, "hits: {:?}", report.hits);
     }
@@ -1711,13 +1711,13 @@ spec:
 
     #[test]
     fn required_env_var_missing_in_one_instance() {
-        // The "easy to half-do" case: present in mh-0, absent from mh-1. A
-        // union check reports clean while mh-1 CrashLoops on MissingEnvVar —
+        // The "easy to half-do" case: present in mh-a, absent from mh-b. A
+        // union check reports clean while mh-b CrashLoops on MissingEnvVar —
         // half capacity, reported green.
         let with_var = r"apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mh-0
+  name: mh-a
 spec:
   template:
     spec:
@@ -1731,16 +1731,16 @@ spec:
             "mh-service",
             r#"ConfigError::MissingEnvVar("MH_TLS_CERT_PATH".to_string())"#,
             &[
-                ("mh-0-deployment.yaml", with_var),
-                ("mh-1-deployment.yaml", MINIMAL_DEPLOYMENT),
+                ("mh-a-deployment.yaml", with_var),
+                ("mh-b-deployment.yaml", MINIMAL_DEPLOYMENT),
             ],
         )]);
         let report = analyze(td.path()).expect("analyze");
         let missing = hits_for(&report, MISSING_IN_MANIFEST_RULE_ID);
         assert_eq!(missing.len(), 1, "hits: {:?}", report.hits);
         assert!(
-            missing[0].file.ends_with("mh-1-deployment.yaml"),
-            "expected mh-1 to be blamed, got {}",
+            missing[0].file.ends_with("mh-b-deployment.yaml"),
+            "expected mh-b to be blamed, got {}",
             missing[0].file.display()
         );
     }
@@ -1752,7 +1752,7 @@ spec:
         let with_init = r"apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mh-0
+  name: mh-a
 spec:
   template:
     spec:
@@ -1767,7 +1767,7 @@ spec:
         let td = fixture(&[(
             "mh-service",
             r#"ConfigError::MissingEnvVar("MH_TLS_CERT_PATH".to_string())"#,
-            &[("mh-0-deployment.yaml", with_init)],
+            &[("mh-a-deployment.yaml", with_init)],
         )]);
         let report = analyze(td.path()).expect("analyze");
         assert!(report.hits.is_empty(), "unexpected hits: {:?}", report.hits);
@@ -1835,7 +1835,7 @@ spec:
         let env_from = r"apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mh-0
+  name: mh-a
 spec:
   template:
     spec:
@@ -1845,7 +1845,7 @@ spec:
         - configMapRef:
             name: mh-service-config
 ";
-        let td = fixture(&[("mh-service", "", &[("mh-0-deployment.yaml", env_from)])]);
+        let td = fixture(&[("mh-service", "", &[("mh-a-deployment.yaml", env_from)])]);
         let report = analyze(td.path()).expect("analyze");
         assert_eq!(
             hits_for(&report, UNSUPPORTED_ENV_SOURCE_RULE_ID).len(),
@@ -1869,7 +1869,7 @@ spec:
             "mh-service",
             "",
             &[
-                ("mh-0-deployment.yaml", MINIMAL_DEPLOYMENT),
+                ("mh-a-deployment.yaml", MINIMAL_DEPLOYMENT),
                 ("cronjob.yaml", cron),
             ],
         )]);
@@ -1889,7 +1889,7 @@ metadata:
 spec:
   replicas: 1
 ";
-        let td = fixture(&[("mh-service", "", &[("mh-0-deployment.yaml", no_pod)])]);
+        let td = fixture(&[("mh-service", "", &[("mh-a-deployment.yaml", no_pod)])]);
         let report = analyze(td.path()).expect("analyze");
         assert_eq!(
             hits_for(&report, WORKLOAD_MISSING_POD_SPEC_RULE_ID).len(),
@@ -1907,7 +1907,7 @@ spec:
         let td = fixture(&[(
             "mh-service",
             "",
-            &[("mh-0-deployment.yaml", "a:\n  - b\n c\n")],
+            &[("mh-a-deployment.yaml", "a:\n  - b\n c\n")],
         )]);
         assert!(
             analyze(td.path()).is_err(),
@@ -2013,7 +2013,7 @@ spec:
   template:
     spec: {}
 ";
-        let td = fixture(&[("mh-service", "", &[("mh-0-deployment.yaml", empty_pod)])]);
+        let td = fixture(&[("mh-service", "", &[("mh-a-deployment.yaml", empty_pod)])]);
         let report = analyze(td.path()).expect("analyze");
         assert_eq!(
             hits_for(&report, WORKLOAD_MISSING_POD_SPEC_RULE_ID).len(),
@@ -2035,7 +2035,7 @@ spec:
         let malformed = r"apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mh-0
+  name: mh-a
 spec:
   template:
     spec:
@@ -2051,7 +2051,7 @@ spec:
             "mh-service",
             "",
             &[
-                ("mh-0-deployment.yaml", malformed),
+                ("mh-a-deployment.yaml", malformed),
                 (
                     "configmap.yaml",
                     &configmap("mh-service-config", "MH_REGION"),
@@ -2089,7 +2089,7 @@ spec:
             "mh-service",
             "",
             &[
-                ("mh-0-deployment.yaml", &deployment_ref("mh-0", "dup", "A")),
+                ("mh-a-deployment.yaml", &deployment_ref("mh-a", "dup", "A")),
                 ("configmaps.yaml", &dup),
             ],
         )]);
@@ -2133,8 +2133,8 @@ spec:
             "mh-service",
             r#"ConfigError::MissingEnvVar("MH_TLS_CERT_PATH".to_string())"#,
             &[(
-                "mh-0-deployment.yaml",
-                &env_from_deployment("mh-0", "mh-service-config"),
+                "mh-a-deployment.yaml",
+                &env_from_deployment("mh-a", "mh-service-config"),
             )],
         )]);
         let report = analyze(td.path()).expect("analyze");
@@ -2164,8 +2164,8 @@ spec:
             "",
             &[
                 (
-                    "mh-0-deployment.yaml",
-                    &env_from_deployment("mh-0", "mh-service-config"),
+                    "mh-a-deployment.yaml",
+                    &env_from_deployment("mh-a", "mh-service-config"),
                 ),
                 (
                     "configmap.yaml",
@@ -2184,28 +2184,28 @@ spec:
 
     #[test]
     fn env_from_orphan_suppression_is_per_configmap_not_service_wide() {
-        // @test scope-pin. mh-0 bulk-imports mh-service-config; mh-1 does NOT use
-        // envFrom and mh-1-config carries a genuine orphan. That orphan MUST
+        // @test scope-pin. mh-a bulk-imports mh-service-config; mh-b does NOT use
+        // envFrom and mh-b-config carries a genuine orphan. That orphan MUST
         // still fire — envFrom on one ConfigMap says nothing about a sibling.
         // This pins the DECISION that check-3 suppression is per-ConfigMap, not
         // the service-wide `any_env_from` break an earlier revision used. A
-        // service-wide suppression would wrongly silence mh-1-config's orphan.
+        // service-wide suppression would wrongly silence mh-b-config's orphan.
         let td = fixture(&[(
             "mh-service",
             "",
             &[
                 (
-                    "mh-0-deployment.yaml",
-                    &env_from_deployment("mh-0", "mh-service-config"),
+                    "mh-a-deployment.yaml",
+                    &env_from_deployment("mh-a", "mh-service-config"),
                 ),
-                ("mh-1-deployment.yaml", MINIMAL_DEPLOYMENT),
+                ("mh-b-deployment.yaml", MINIMAL_DEPLOYMENT),
                 (
                     "configmap.yaml",
                     &configmap("mh-service-config", "IMPORTED_KEY"),
                 ),
                 (
-                    "mh-1-configmap.yaml",
-                    &configmap("mh-1-config", "REAL_ORPHAN"),
+                    "mh-b-configmap.yaml",
+                    &configmap("mh-b-config", "REAL_ORPHAN"),
                 ),
             ],
         )]);
@@ -2214,11 +2214,11 @@ spec:
         assert_eq!(
             orphans.len(),
             1,
-            "exactly mh-1-config's orphan should survive: {:?}",
+            "exactly mh-b-config's orphan should survive: {:?}",
             report.hits
         );
         assert!(
-            orphans[0].detail.contains("REAL_ORPHAN") && orphans[0].detail.contains("mh-1-config"),
+            orphans[0].detail.contains("REAL_ORPHAN") && orphans[0].detail.contains("mh-b-config"),
             "wrong orphan surfaced: {}",
             orphans[0].detail
         );
@@ -2240,7 +2240,7 @@ spec:
         let unreadable = r"apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mh-0
+  name: mh-a
 spec:
   template:
     spec:
@@ -2254,7 +2254,7 @@ spec:
             "mh-service",
             "",
             &[
-                ("mh-0-deployment.yaml", unreadable),
+                ("mh-a-deployment.yaml", unreadable),
                 (
                     "configmap.yaml",
                     &configmap("mh-service-config", "WOULD_BE_ORPHAN"),
@@ -2289,7 +2289,7 @@ spec:
         let mapping_env_from = r"apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: mh-0
+  name: mh-a
 spec:
   template:
     spec:
@@ -2303,7 +2303,7 @@ spec:
             "mh-service",
             "",
             &[
-                ("mh-0-deployment.yaml", mapping_env_from),
+                ("mh-a-deployment.yaml", mapping_env_from),
                 (
                     "configmap.yaml",
                     &configmap("mh-service-config", "REAL_ORPHAN"),
@@ -2541,7 +2541,7 @@ spec:
             "{:?}",
             report.hits
         );
-        // ac, gc, mc (+ mc-0, mc-1), mh (+ mh-0, mh-1) -- at least one per service.
+        // ac, gc, mc (+ mc-0, mc-1), mh (+ the slot-template placeholder) -- at least one per service.
         assert!(
             report.checked_configmaps >= report.checked_services && report.checked_services == 4,
             "services {} configmaps {}",
@@ -2690,8 +2690,8 @@ data:
                 "mh-service",
                 "",
                 &[(
-                    "mh-0-deployment.yaml",
-                    &deployment_ref("mh-0", "media-codec-profile", "MEDIA_B"),
+                    "mh-a-deployment.yaml",
+                    &deployment_ref("mh-a", "media-codec-profile", "MEDIA_B"),
                 )],
             ),
         ]);
@@ -2799,7 +2799,7 @@ data:
                     ("kustomization.yaml", &mh_kust),
                     (
                         "deployment.yaml",
-                        &deployment_ref("mh-0", "mh-service-config", "K"),
+                        &deployment_ref("mh-a", "mh-service-config", "K"),
                     ),
                     ("config.env", "K=v\n"),
                 ],

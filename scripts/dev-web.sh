@@ -14,9 +14,13 @@
 #   - AC (8443) + GC (8444) host ports answer                 [HARD FAIL]
 #   - MC/MH WebTransport cert fingerprints present            [HARD FAIL]
 #   - MC/MH WebTransport ports have a right-family listener   [HARD FAIL]
-#   - ...including when that check CANNOT RUN. All FIVE causes are  [HARD FAIL]
+#   - at least max(B, 1) MHs serving AND listening, B the     [HARD FAIL]
+#     baseline from `mh.sh list --json` (empty slots normal)
+#   - ...including when that check CANNOT RUN. All ELEVEN causes are [HARD FAIL]
 #     hard fails: `ss` missing, `ss` failed, no advertise address,
-#     no resolver (getent), no per-instance config sources.
+#     no resolver (getent), no per-instance MC config sources,
+#     mh.sh absent, jq absent, mh.sh list failed,
+#     malformed pool JSON, zero MH slots, malformed slot address.
 #     Enumerative, not illustrative — the
 #     runbook cites this block as the severity SSoT, so it must not
 #     under-list. See the contract below.
@@ -88,12 +92,14 @@
 #      getUserMedia and WebTransport are both unavailable there (SECURE CONTEXT
 #      above; the runbook section it cites).
 #   2. The advertise addresses are loopback literals (127.0.0.1): every
-#      infra/services/{mc,mh}-service/{mc,mh}-{0,1}-config.env advertises a
+#      infra/services/mc-service/mc-N-config.env, and every MH slot ConfigMap
+#      (`infra/kind/scripts/mh.sh list` shows them; deploy.sh renders them from
+#      the static kind-config's 127.0.0.1 slot mappings), advertises a
 #      https://127.0.0.1:<port> URL. GC hands those to the browser, so a second
 #      machine's browser dials ITS OWN loopback and reaches nothing. (The ports
-#      are deliberately not restated here — they are in those files and in this
+#      are deliberately not restated here — they are in those sources and in this
 #      preflight's own output, and a copied set goes silently false the day an
-#      instance is added or moved.)
+#      instance or slot is added or moved.)
 #   3. The MC/MH dev leaves carry DNS-only SANs: generate_service_cert() in
 #      scripts/generate-dev-certs.sh writes only DNS: entries, and the
 #      mc-/mh-webtransport leaves list localhost plus service names, no IP.
@@ -172,7 +178,8 @@
 #   Production quality: remove or edit that one patch and redeploy
 #   (infra/kind/scripts/deploy.sh; devloop container: `dev-cluster deploy`);
 #   restore it with `git checkout` plus a deploy BEFORE running Layer 7. Either
-#   switch rolls mc-0, mc-1, mh-0 and mh-1 and DROPS LIVE MEETINGS, and at the
+#   switch rolls mc-0 and mc-1, replaces every MH (deploy.sh runs `mh.sh upgrade`)
+#   and DROPS LIVE MEETINGS, and at the
 #   production profile MH's egress stream ceiling is much lower, so check it
 #   against your meeting size first. The full procedure — the ceiling check,
 #   the budget it may also need, and the one-line restore — is that patch's
@@ -481,13 +488,15 @@ fi
 
 # ─── MC / MH WebTransport reachability (HARD FAIL — this IS the demo) ──
 # The join step dials MC (signaling) then MH (media) over QUIC/WebTransport at
-# the addresses GC advertises to the browser — read here from the per-instance
-# ConfigMap generator sources (infra/services/m[ch]-service/m[ch]-N-config.env),
-# the SSoT for those values. Two failure modes this catches that the
-# AC/GC TCP probes above cannot: nothing published on the MC/MH WT port, and an
-# IPv4/IPv6 loopback family mismatch.
+# the addresses GC advertises to the browser — for MC read here from the
+# per-instance ConfigMap generator sources (infra/services/mc-service/mc-N-config.env),
+# the SSoT for those values; for MH read LIVE from the pool
+# (`infra/kind/scripts/mh.sh list --json`: MH has no fixed instances, every MH
+# owns a hostPort slot and its address comes from that slot's ConfigMap). Two
+# failure modes this catches that the AC/GC TCP probes above cannot: nothing
+# published on the MC/MH WT port, and an IPv4/IPv6 loopback family mismatch.
 #
-# ALL FOUR instances hard-fail, MC as well as MH. The join dials MC for
+# MC and MH BOTH hard-fail. The join dials MC for
 # signaling BEFORE it dials MH for media, so an MC listener gap produces the
 # same silent outcome the MH gap does — in fact "never joined" — behind a yellow
 # `!` that scrolls past. Warning on MC while failing on MH would encode a
@@ -498,8 +507,9 @@ fi
 # docs/runbooks/client-dev-local.md (§5 F1). Deliberately a pointer, not a copy:
 # this script is the fast path, the runbook is the source of prose/diagnosis.
 #
-# KNOWN FALSE POSITIVE, accepted with a named diagnosis rather than softened:
-# the advertise addresses are read from the committed config files on disk,
+# KNOWN FALSE POSITIVE (MC ONLY — MH addresses are read live from mh.sh), accepted
+# with a named diagnosis rather than softened: the MC advertise addresses are read
+# from the committed config files on disk,
 # which is correct for the static host topology this script targets. On a
 # devloop cluster the live ConfigMap is rendered with the host-gateway address
 # (deploy.sh:apply_env_root) and the on-disk value is the host default,
@@ -509,12 +519,16 @@ fi
 # if this ever bites in practice is to read the live ConfigMap, not to soften
 # the check; that is recorded in docs/TODO.md. See runbook §1 and F8.
 #
-# The instance set is DERIVED from the per-instance generator sources — the same
-# glob infra/kind/scripts/deploy.sh:advertise_instances() uses — never a
-# hand-kept list, so a new instance is checked without editing this script.
+# The MC instance set is DERIVED from the per-instance generator sources — the
+# same glob infra/kind/scripts/deploy.sh:advertise_instances() uses — never a
+# hand-kept list, so a new instance is checked without editing this script. MC
+# ONLY (`mc-service/mc-N`): a stray MH per-instance file is never "checked".
 shopt -s nullglob
-WT_CONFIGMAPS=(infra/services/m[ch]-service/m[ch]-[0-9]*-config.env)
+WT_CONFIGMAPS=(infra/services/mc-service/mc-[0-9]*-config.env)
 shopt -u nullglob
+# The MH pool tool (its machine contract: docs/debates/2026-10-28-mh-replacement-and-migration/mh-sh-contract.txt).
+# DT_MH_SH overrides the path (the hermetic seam scripts/dev-web.test.sh uses).
+MH_SH="${DT_MH_SH:-infra/kind/scripts/mh.sh}"
 
 # Snapshot UDP listeners once; note whether "localhost" prefers IPv6 (mirrored).
 # WT_SS_OK distinguishes "ss ran and found no listener" from "ss failed to run".
@@ -585,14 +599,22 @@ wt_listener_remedy() {
     local label="$1"
     echo "      Fix: ./infra/kind/scripts/setup.sh          # bring the cluster up / republish"
     echo "      Check it really is up:  kubectl get pods -n dark-tower"
+    if [[ "$label" == MH* ]]; then
+        # MH addresses are already LIVE (mh.sh list): no stale-file caveat applies.
+        echo "      The live MH pool (slot, state, address):  ${MH_SH} list"
+        return
+    fi
     echo "      On a DEVLOOP cluster this check reads a stale on-disk value — confirm against the live one:"
     echo "        $(wt_live_value_cmd "$label")"
     echo "      If that disagrees with the config file, the preflight is reporting stale data and"
     echo "      the cluster may be healthy (runbook §1, F8). This script targets the static host topology."
 }
 
+# MC: read the advertise URL from a per-instance config FILE, then run the ONE
+# listener/family check (check_wt_url). MH calls check_wt_url directly with the
+# live URL from mh.sh — one code path, two sources.
 check_wt_endpoint() {
-    local file="$1" label="$2" url hostport host port
+    local file="$1" label="$2" url
     # `|| true` makes the not-found branch REACHABLE. Without it, `grep`
     # exiting 1 on no-match propagates through `pipefail` and `set -e` kills
     # the whole preflight at this assignment — so the "no advertise address"
@@ -616,12 +638,22 @@ check_wt_endpoint() {
         echo "      because a check that did not run must never read as a check that passed."
         return
     fi
+    check_wt_url "$url" "$label" "$file" || true
+}
+
+# THE listener + address-family check for one advertised WebTransport URL.
+# $1 = https://host:port, $2 = label, $3 = where the value came from (named in
+# remedies). Returns 0 iff the check PASSED (callers that count passes — the MH
+# baseline — need that), 1 when it ran and FAILED, 2 when it CANNOT VERIFY
+# (ss missing/failed, no resolver) — each non-zero case already `fail`ed.
+check_wt_url() {
+    local url="$1" label="$2" src="$3" hostport host port
     hostport="${url#https://}"; port="${hostport##*:}"; host="${hostport%:*}"
     if [[ "$WT_HAVE_SS" -eq 1 && "$WT_SS_OK" -eq 0 ]]; then
         fail "${label}: CANNOT VERIFY — ${host}:${port} is advertised but 'ss' failed to run, so the listener snapshot is empty and every port would falsely read as unlistened."
         echo "      This is NOT 'the cluster is down' — do not restart it on this signal. Check 'ss -uln' by hand;"
         echo "      a restricted container or missing /proc/net is the usual cause."
-        return
+        return 2
     fi
     if [[ "$WT_HAVE_SS" -eq 0 ]]; then
         # "Could not check" is a hard fail, not a pass. Otherwise not having a
@@ -630,7 +662,7 @@ check_wt_endpoint() {
         fail "${label}: CANNOT VERIFY — ${host}:${port} is advertised but 'ss' is not installed, so no listener check ran."
         echo "      Fix: sudo apt-get install -y iproute2"
         echo "      (Hard fail by policy: an unverifiable critical-path check is not a passing one.)"
-        return
+        return 2
     fi
     case "$host" in
         127.0.0.1|0.0.0.0)                       # IPv4 literal — browser dials IPv4
@@ -639,6 +671,7 @@ check_wt_endpoint() {
             else
                 fail "${label}: nothing listening on ${host}:${port} — the demo would join and you would hear nothing. Not starting the dev server."
                 wt_listener_remedy "$label"
+                return 1
             fi ;;
         ::1|::)                                  # IPv6 literal
             if wt_listener_on "$port" 6; then
@@ -646,6 +679,7 @@ check_wt_endpoint() {
             else
                 fail "${label}: nothing listening on [${host}]:${port} (IPv6) — the demo would join and you would hear nothing. Not starting the dev server."
                 wt_listener_remedy "$label"
+                return 1
             fi ;;
         *)                                       # hostname — name resolution picks the family
             # SILENT-PASS FIX (found by sweeping @dry-reviewer's F-DRY-F method
@@ -666,34 +700,117 @@ check_wt_endpoint() {
             # hostname — the point at which it matters most.
             if [[ -z "$LOCALHOST_FIRST" ]]; then
                 fail "${label}: CANNOT VERIFY — ${host}:${port} advertises a HOSTNAME, but the resolver could not be queried (getent unavailable), so the IPv4/IPv6 family mismatch that silently kills the join cannot be ruled out."
-                echo "      Fix: install glibc's getent (package 'libc-bin'), or set ${host} → the IPv4 literal 127.0.0.1 in $file."
-                return
+                echo "      Fix: install glibc's getent (package 'libc-bin'), or set ${host} → the IPv4 literal 127.0.0.1 in ${src}."
+                return 2
             fi
             local has4=1 has6=1
             wt_listener_on "$port" 4 || has4=0
             wt_listener_on "$port" 6 || has6=0
             if [[ "$LOCALHOST_FIRST" == ::* && "$has6" -eq 0 && "$has4" -eq 1 ]]; then
                 fail "${label} advertises hostname '${host}:${port}', which resolves to IPv6 (${LOCALHOST_FIRST}) under WSL2 mirrored mode, but only an IPv4 listener exists → QUIC times out and you hear nothing."
-                echo "      Fix: set ${host} → the IPv4 literal 127.0.0.1 in $file (see the comment there), then re-run the cluster setup."
+                echo "      Fix: set ${host} → the IPv4 literal 127.0.0.1 in ${src} (see the comment there), then re-run the cluster setup."
+                return 1
             elif [[ "$has4" -eq 1 || "$has6" -eq 1 ]]; then
                 pass "${label} WebTransport listener on ${host}:${port}"
             else
                 fail "${label}: nothing listening on ${host}:${port} — the demo would join and you would hear nothing. Not starting the dev server."
                 wt_listener_remedy "$label"
+                return 1
             fi ;;
     esac
+    return 0
+}
+
+# The MH pool (R-32): the LIVE pool from `mh.sh list --json`, parsed with jq only
+# (no eval, no field ever expanded into a command). Branches on mh.sh's EXIT
+# STATUS and jq-validated fields — never on its stderr wording.
+#   - every SERVING slot gets the listener/family check, and one that passes
+#     counts toward the baseline. Starting/draining/terminating slots are a NOTICE
+#     and are NOT checked: a starting MH may not have bound its listener yet and a
+#     draining one may already have closed it, so either result would mislead.
+#     Free slots are normal.
+#   - fewer than max(B, 1) passing serving MHs is a HARD FAIL (a B of 0 never
+#     turns zero MHs into a pass).
+#   - mh.sh absent, jq absent, mh.sh failing, malformed/unexpected-schema JSON and
+#     a pool with ZERO slots are each a CANNOT VERIFY hard fail.
+check_mh_pool() {
+    local out rc=0 reason baseline need good=0 unverified=0 states="" k state addr r
+    if [[ ! -x "$MH_SH" ]]; then
+        fail "MH: CANNOT VERIFY — the MH pool tool ${MH_SH} is absent or not executable, so the live MH addresses cannot be read."
+        echo "      This is REPO DRIFT (or a wrong DT_MH_SH), not your environment."
+        return
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        fail "MH: CANNOT VERIFY — jq is not installed, so the MH pool (mh.sh list --json) cannot be parsed."
+        echo "      Fix: sudo apt-get install -y jq"
+        return
+    fi
+    out="$("$MH_SH" list --json 2>/dev/null)" || rc=$?
+    if (( rc != 0 )); then
+        reason="$(printf '%s' "$out" | jq -r 'if type == "object" then (.reason // "unknown") else "unknown" end' 2>/dev/null || echo unknown)"
+        [[ "$reason" =~ ^[a-z][a-z-]{0,40}$ ]] || reason="unknown"
+        fail "MH: CANNOT VERIFY — '${MH_SH} list --json' failed (exit ${rc}, REASON=${reason}), so no MH was checked."
+        echo "      Run it by hand for the full message:  ${MH_SH} list"
+        echo "      (no-kubeconfig: the cluster is not reachable; no-template: deploy.sh has not run — ./infra/kind/scripts/setup.sh)"
+        return
+    fi
+    if ! printf '%s' "$out" | jq -e '.ok == true and .schema_version == 1 and (.baseline | type == "number" and . >= 0 and . == floor) and (.slots | type == "array")' >/dev/null 2>&1; then
+        fail "MH: CANNOT VERIFY — '${MH_SH} list --json' returned malformed JSON or an unexpected schema_version (this preflight reads schema 1)."
+        echo "      This is REPO/TOOL DRIFT, not your environment. Nothing to fix locally: report it."
+        return
+    fi
+    if [[ "$(printf '%s' "$out" | jq '.slots | length')" -eq 0 ]]; then
+        fail "MH: CANNOT VERIFY — the MH pool has ZERO slots (no ConfigMap labelled dark-tower.io/mh-slot), so no MH can be checked."
+        echo "      Fix: ./infra/kind/scripts/setup.sh   # deploy renders the slot ConfigMaps"
+        return
+    fi
+    baseline="$(printf '%s' "$out" | jq -r '.baseline')"
+    need=$(( baseline > 1 ? baseline : 1 ))
+    while IFS=$'\t' read -r k state addr; do
+        states+="${states:+, }slot ${k}=${state}"
+        case "$state" in
+            free) ;;
+            serving)
+                if [[ ! "$addr" =~ ^https://[^/[:space:]]+:[0-9]{1,5}$ ]]; then
+                    fail "MH slot ${k}: CANNOT VERIFY — the slot ConfigMap advertises '${addr}', not https://host:port."
+                    echo "      This is REPO/CONFIG DRIFT (deploy.sh:mh_slot_table renders it), not your environment. Nothing to fix locally: report it."
+                    unverified=$((unverified + 1))
+                    continue
+                fi
+                r=0
+                check_wt_url "$addr" "MH slot ${k}" "the MH slot ${k} ConfigMap (${MH_SH} list)" || r=$?
+                case "$r" in
+                    0) good=$((good + 1)) ;;
+                    2) unverified=$((unverified + 1)) ;;
+                esac ;;
+            *) warn "MH slot ${k}: NOTICE — ${state} (mid-rollout or draining); not counted toward the baseline." ;;
+        esac
+    done < <(printf '%s' "$out" | jq -r '.slots[] | [(.slot | tostring), (.state | tostring), (.address // "" | tostring)] | @tsv')
+    if (( good < need && unverified > 0 )); then
+        # Never send the reader to add an MH when the check itself could not run.
+        fail "MH: the baseline ${baseline} could NOT be evaluated: ${unverified} serving slot(s) were unverifiable (see the CANNOT VERIFY lines above); ${good} verified serving and listening."
+        echo "      Fix the CANNOT VERIFY cause above first; do not change the pool on this signal."
+    elif (( good < need )); then
+        fail "MH: only ${good} MH(s) serving and listening, fewer than the baseline ${baseline} (need >= ${need}) — the demo cannot place media. Not starting the dev server."
+        echo "      Pool: ${states}"
+        echo "      Inspect:  ${MH_SH} list"
+        echo "      Add one:  ${MH_SH} up --owner manual     (or redeploy: ./infra/kind/scripts/deploy.sh tops up to the baseline)"
+    else
+        pass "MH pool: ${good} MH(s) serving and listening (baseline ${baseline})"
+    fi
 }
 
 if (( ${#WT_CONFIGMAPS[@]} == 0 )); then
     # Same lane as the no-advertise-address case: the tree drifted from this
     # script's glob. Zero instances checked must never read as all-clear.
-    fail "MC/MH: CANNOT VERIFY — no per-instance config sources match infra/services/m[ch]-service/m[ch]-N-config.env."
+    fail "MC: CANNOT VERIFY — no per-instance config sources match infra/services/mc-service/mc-N-config.env."
     echo "      This is REPO/CONFIG DRIFT, not your environment. Nothing to fix locally: report it."
 fi
 for cm in "${WT_CONFIGMAPS[@]}"; do
     label="${cm##*/}"; label="${label%-config.env}"
     check_wt_endpoint "$cm" "$label"
 done
+check_mh_pool
 
 # ─── Receive slots: client N and M vs the MC per-kind caps ───
 # "Why can't I hear / see the sixth person?" is answered by N and M — each
@@ -728,7 +845,7 @@ done
 # retirement).
 #
 # TWO READERS, NOT ONE HELPER (@dry-reviewer D-2): check_wt_endpoint reads a
-# URL from a PER-INSTANCE ConfigMap with a deliberately UNANCHORED key match;
+# URL from a PER-INSTANCE MC ConfigMap with a deliberately UNANCHORED key match;
 # this reads integers from the SHARED ConfigMap anchored on the data line, so
 # prose that ever names a key in a comment can never match.
 #

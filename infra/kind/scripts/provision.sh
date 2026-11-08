@@ -24,7 +24,9 @@
 #
 # Every provision FAILURE ends with ONE line, classified at the source (Layer 7
 # routes on its REASON — scripts/layer7.sh:CLUSTER_ENV_REASONS):
-#   PROVISION_FAILED REASON=<prerequisite-missing|blueprint-unreadable|operator-declined|port-held|runtime-incapable> STEP=<step>
+#   PROVISION_FAILED REASON=<prerequisite-missing|blueprint-unreadable|operator-declined|port-held|runtime-incapable|kind-config-unrendered> STEP=<step>
+#     kind-config-unrendered: the kind config still holds a `${...}` placeholder — it was
+#     rendered by a devloop helper OLDER than the template; refused BEFORE any rebuild/delete.
 #   PROVISION_FAILED REASON=<runtime-unreachable|apiserver-unreachable|step-failed> STEP=<step>
 #     (from the EXIT trap: the shared bounded probes, else `step-failed` — the tree's)
 # Every run prints ONE decision line:
@@ -89,7 +91,7 @@ source "$(provision_input "${LIB_COMMON_REL}")"
 dt_init_cluster_env
 
 # The kind configuration to build from (a blueprint section of its own).
-KIND_CONFIG="${DT_KIND_CONFIG:-${PROJECT_ROOT}/infra/kind/kind-config.yaml}"   # provision-input-accessor
+KIND_CONFIG="${DT_KIND_CONFIG:-${PROJECT_ROOT}/${DT_STATIC_KIND_CONFIG_REL}}"   # provision-input-accessor
 CALICO_VERSION="v3.27.0"
 # sha256 of the manifest at CALICO_MANIFEST_URL, taken from the fetched artifact
 # (2026-09-29). Applied with cluster-admin, so it is verified before it is
@@ -606,6 +608,18 @@ pstep() {
     "$@"
 }
 
+# Refuse a kind config that still holds a `${...}` placeholder — BEFORE the
+# blueprint decision, so a stale helper can never make provision delete a cluster
+# and then fail `kind create` on unparseable YAML (misread as a runtime problem).
+check_kind_config_rendered() {
+    local line
+    if line="$(kind_config_unrendered_line "${KIND_CONFIG}")"; then
+        provision_failed kind-config-unrendered
+        log_error "The kind config ${KIND_CONFIG} was not fully rendered (line ${line%%:*} still holds a placeholder: ${line#*:}). It was rendered by a devloop-helper binary older than infra/kind/kind-config.yaml.tmpl (ADR-0030: the helper cannot validate its own changes). Nothing was deleted. Fix: rebuild devloop-helper on the HOST from this tree FIRST (re-run infra/devloop/devloop.sh), then $(remedy "'dev-cluster recreate'" "'./infra/kind/scripts/setup.sh'"). Order matters: \`dev-cluster recreate\` run with the OLD helper still tears the cluster down and then fails the same way."
+        exit 1
+    fi
+}
+
 # check_prerequisites (lib/common.sh) with a missing tool classified.
 provision_check_prerequisites() {
     local missing
@@ -640,6 +654,7 @@ main() {
     trap __provision_exit_trap EXIT
     log_info "Provisioning Dark Tower kind cluster '${CLUSTER_NAME}'..."
     pstep provision_check_prerequisites
+    pstep check_kind_config_rendered
     local renewal=false
     PROVISION_STEP=tls_renewal_due
     if tls_renewal_due; then renewal=true; fi

@@ -120,10 +120,10 @@ pub fn check_shape(key: &str, raw: &str, shape: ValueShape, home: &str) -> Resul
 /// # Panics
 /// The pod has no name.
 #[must_use]
-pub fn pod_name_of(pod: &Value, instance: &str) -> String {
+pub fn pod_name_of(pod: &Value, resolved_by: &str) -> String {
     pod.pointer("/metadata/name")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("pod matched by instance={instance} has no metadata.name"))
+        .unwrap_or_else(|| panic!("pod resolved by {resolved_by} has no metadata.name"))
         .to_string()
 }
 
@@ -157,9 +157,9 @@ fn env_entry<'a>(
         .ok_or_else(|| {
             format!(
                 "pod {pod_name} (-n {NAMESPACE}): container {container_name} has no env entry \
-                 {env_name}. Every key must be referenced from EVERY instance's Deployment — per \
-                 workload, never union; a missing ref crash-loops that pod alone once its \
-                 reader requires it."
+                 {env_name}. Every key must be referenced from EVERY workload (each MC \
+                 Deployment; the MH pool template, hence every MH pod) — per workload, never \
+                 union; a missing ref crash-loops that pod alone once its reader requires it."
             )
         })
 }
@@ -669,7 +669,7 @@ mod tests {
 
     fn pod(env: Value, resources: Value) -> Value {
         json!({
-            "metadata": {"name": "mh-0-abc"},
+            "metadata": {"name": "mh-s0-abc"},
             "spec": {"containers": [
                 {"name": "mh-service", "env": env, "resources": resources},
                 {"name": "sidecar"}
@@ -915,19 +915,19 @@ mod tests {
             {"metadata": {"name": "dying", "creationTimestamp": "2026-10-03T00:00:00Z",
                           "deletionTimestamp": "2026-10-03T00:01:00Z"}}
         ]});
-        let p = newest_live_pod(&pods, "mh-0").expect("live");
+        let p = newest_live_pod(&pods, "mc-0").expect("live");
         assert_eq!(
             p.pointer("/metadata/name").and_then(Value::as_str),
             Some("new")
         );
-        assert!(newest_live_pod(&json!({"items": []}), "mh-0")
+        assert!(newest_live_pod(&json!({"items": []}), "mc-0")
             .expect_err("empty")
             .contains("vacuously"));
         let dying = json!({"items": [{"metadata": {"name": "d", "deletionTimestamp": "x"}}]});
-        assert!(newest_live_pod(&dying, "mh-0")
+        assert!(newest_live_pod(&dying, "mc-0")
             .expect_err("dying")
             .contains("terminating"));
-        assert!(newest_live_pod(&json!({}), "mh-0").is_err());
+        assert!(newest_live_pod(&json!({}), "mc-0").is_err());
     }
 
     #[test]

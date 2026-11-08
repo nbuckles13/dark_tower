@@ -957,9 +957,10 @@ mod tests {
     }
 
     /// Positive control for the downward-API rule on the REAL tree: the mh
-    /// base render yields the MH_POD_MEMORY_LIMIT_BYTES ref on BOTH mh-0 and
-    /// mh-1 and is clean; stripping the declared memory limit from the render
-    /// yields exactly one `resource_field_ref_undeclared` per workload. Skips
+    /// base render yields the MH_POD_MEMORY_LIMIT_BYTES ref on the ONE MH
+    /// template (`mh-template`, which every per-slot MH instantiates) and is
+    /// clean; stripping the declared memory limit from the render yields
+    /// exactly one `resource_field_ref_undeclared` for it. Skips
     /// VISIBLY without a kustomize tool, as R-15 does.
     #[test]
     fn real_mh_memory_limit_refs_are_seen_and_guarded() {
@@ -981,7 +982,16 @@ mod tests {
         .expect("build mh");
         assert!(mh.success, "{}", mh.stderr_head);
         let docs = parse_docs(&mh.stdout).expect("parse");
-        for name in ["mh-0", "mh-1"] {
+        let mh_deployments = docs
+            .iter()
+            .filter(|d| d.get("kind").and_then(serde_norway::Value::as_str) == Some("Deployment"))
+            .count();
+        assert_eq!(
+            mh_deployments, 1,
+            "the mh base renders exactly one Deployment (the template)"
+        );
+        {
+            let name = "mh-template";
             let doc = docs
                 .iter()
                 .find(|d| {
@@ -999,7 +1009,7 @@ mod tests {
         }
         let clean = check_rf(&mh.stdout, "mh base");
         assert!(clean.findings.is_empty(), "{:?}", clean.findings);
-        assert!(clean.checked >= 2, "checked {}", clean.checked);
+        assert!(clean.checked >= 1, "checked {}", clean.checked);
         let stripped = mh.stdout.replace(
             "          limits:\n            cpu: 1000m\n            memory: 1Gi\n",
             "          limits:\n            cpu: 1000m\n",
@@ -1009,12 +1019,8 @@ mod tests {
             "the render's limits shape changed; update this control"
         );
         let broken = check_rf(&stripped, "mh base");
-        assert_eq!(broken.findings.len(), 2, "{:?}", broken.findings);
-        for (f, name) in broken
-            .findings
-            .iter()
-            .zip(["Deployment/mh-0", "Deployment/mh-1"])
-        {
+        assert_eq!(broken.findings.len(), 1, "{:?}", broken.findings);
+        for (f, name) in broken.findings.iter().zip(["Deployment/mh-template"]) {
             assert_eq!(f.rule_id, RESOURCE_FIELD_REF_UNDECLARED_RULE_ID);
             assert!(f.detail.contains(name), "{}", f.detail);
         }

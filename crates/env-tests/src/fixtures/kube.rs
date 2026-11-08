@@ -55,39 +55,64 @@ pub const REDEPLOY_HINT: &str = "converge the cluster to the tree: `dev-cluster 
 /// neither the bare base name nor a label selector identifies the config IN
 /// EFFECT. The pod spec does. Terminating pods are ignored.
 ///
+/// For a service with no instance naming (MH: label-discovered pool pods,
+/// ADR-0039 §7), use [`configmap_name_for_selector`].
+///
 /// # Panics
 ///
 /// When `kubectl` cannot run, or [`resolve_generation`] refuses (see there) —
 /// never a guess.
 #[must_use]
 pub fn configmap_name_for(instance: &str, base: &str) -> String {
-    resolve_generation(&live_pods_json(instance), instance, base)
+    configmap_name_for_selector(&instance_selector(instance), base)
+}
+
+/// [`configmap_name_for`] over EVERY live pod matching a label `selector`
+/// (e.g. [`MH_SELECTOR`]): all of them must reference ONE generation of
+/// `base` (two generations = a rollout or upgrade in flight, refused).
+///
+/// # Panics
+///
+/// As [`configmap_name_for`]; also when no live pod matches.
+#[must_use]
+pub fn configmap_name_for_selector(selector: &str, base: &str) -> String {
+    resolve_generation(&pods_json(selector), selector, base)
         .unwrap_or_else(|e| panic!("PRECONDITION: {e}"))
+}
+
+/// The ONE `-l` selector spelling for a per-instance (MC) pod read.
+fn instance_selector(instance: &str) -> String {
+    format!("instance={instance}")
 }
 
 /// The GENERATOR BASE NAME of the shared media codec profile (story 3),
 /// read by MC and MH. Its live name is `media-codec-profile-<hash>`
 /// (ADR-0038 §2), resolved from a pod spec with [`configmap_name_for`] /
-/// [`configmap_name_for_all`]. One home for the deployment-config suites.
+/// [`configmap_name_for_selectors`]. One home for the deployment-config suites.
 pub const PROFILE_CONFIGMAP: &str = "media-codec-profile";
 
-/// The Kind MH instances (the per-instance Deployments `mh-0`, `mh-1`). ONE
-/// list for every suite that reads per-instance MH state, so a caller of
-/// [`configmap_name_for_all`] cannot pass a partial set. (Runtime Prometheus pins
-/// use [`live_mh_pods`] instead: no instance names.)
-pub const MH_INSTANCES: &[&str] = &["mh-0", "mh-1"];
-
-/// The Kind MC instances (`mc-0`, `mc-1`). See [`MH_INSTANCES`].
+/// The Kind MC instances (`mc-0`, `mc-1`). ONE list for every suite that
+/// reads per-instance MC state, so a caller of [`configmap_name_for_all`]
+/// cannot pass a partial set. MH has NO instance list: its pods are a pool
+/// found by [`MH_SELECTOR`] (ADR-0039 §7 — no fixed MH instances anywhere).
 pub const MC_INSTANCES: &[&str] = &["mc-0", "mc-1"];
 
-/// Every reader of [`PROFILE_CONFIGMAP`]: MC and MH, which roll together on a
-/// profile change and must resolve ONE generation.
-pub const PROFILE_READERS: &[&str] = &["mc-0", "mc-1", "mh-0", "mh-1"];
+/// Every reader of [`PROFILE_CONFIGMAP`], as `-l` selectors: each MC instance
+/// and the whole MH pool. MC and MH roll together on a profile change and must
+/// resolve ONE generation.
+#[must_use]
+pub fn profile_reader_selectors() -> Vec<String> {
+    MC_INSTANCES
+        .iter()
+        .map(|i| instance_selector(i))
+        .chain(std::iter::once(MH_SELECTOR.to_string()))
+        .collect()
+}
 
 /// [`configmap_name_for`] over SEVERAL instances that must share one
-/// generation (e.g. both MH instances read `mh-service-config`). Resolving from
-/// one instance and checking another would blame the wrong thing mid-rollout,
-/// so every instance is resolved and they must agree.
+/// generation (e.g. both MC instances read `mc-service-config`). Resolving
+/// from one instance and checking another would blame the wrong thing
+/// mid-rollout, so every instance is resolved and they must agree.
 ///
 /// # Panics
 ///
@@ -95,33 +120,46 @@ pub const PROFILE_READERS: &[&str] = &["mc-0", "mc-1", "mh-0", "mh-1"];
 /// reference different generations (they run different configuration).
 #[must_use]
 pub fn configmap_name_for_all(instances: &[&str], base: &str) -> String {
-    let names: Vec<String> = instances
-        .iter()
-        .map(|i| configmap_name_for(i, base))
-        .collect();
-    agree_on_generation(instances, base, names).unwrap_or_else(|e| panic!("PRECONDITION: {e}"))
+    let selectors: Vec<String> = instances.iter().map(|i| instance_selector(i)).collect();
+    configmap_name_for_selectors(&selectors, base)
 }
 
-/// PURE core of [`configmap_name_for_all`]: the one generation every instance
-/// resolved to.
+/// [`configmap_name_for_all`] over `-l` selectors (each resolved with
+/// [`configmap_name_for_selector`]); they must agree on one generation.
+///
+/// # Panics
+///
+/// As [`configmap_name_for_all`].
+#[must_use]
+pub fn configmap_name_for_selectors(selectors: &[String], base: &str) -> String {
+    let names: Vec<String> = selectors
+        .iter()
+        .map(|s| configmap_name_for_selector(s, base))
+        .collect();
+    let labels: Vec<&str> = selectors.iter().map(String::as_str).collect();
+    agree_on_generation(&labels, base, names).unwrap_or_else(|e| panic!("PRECONDITION: {e}"))
+}
+
+/// PURE core of [`configmap_name_for_selectors`]: the one generation every
+/// pod set (named by its selector) resolved to.
 ///
 /// # Errors
 ///
-/// `names` is empty (no instances), or the instances resolved to different
+/// `names` is empty (no pod sets), or they resolved to different
 /// generations (they run different configuration).
 pub fn agree_on_generation(
-    instances: &[&str],
+    selectors: &[&str],
     base: &str,
     names: Vec<String>,
 ) -> Result<String, String> {
     if names.is_empty() {
         return Err(format!(
-            "configmap_name_for_all called with no instances for {base}"
+            "configmap_name_for_selectors called with no selectors for {base}"
         ));
     }
     if !names.windows(2).all(|w| w[0] == w[1]) {
         return Err(format!(
-            "instances {instances:?} reference DIFFERENT generations of {base}: \
+            "pod sets {selectors:?} reference DIFFERENT generations of {base}: \
              {names:?}. They run different configuration; {REDEPLOY_HINT}."
         ));
     }
@@ -137,7 +175,7 @@ pub fn agree_on_generation(
 /// `kubectl` cannot run, fails, or prints unparseable output.
 #[must_use]
 pub fn live_pods_json(instance: &str) -> Value {
-    pods_json(&format!("instance={instance}"))
+    pods_json(&instance_selector(instance))
 }
 
 /// `kubectl get pods -n dark-tower -l <selector> -o json`, parsed — the ONE
@@ -302,6 +340,34 @@ pub async fn live_mh_pods() -> Vec<LivePod> {
         .1
 }
 
+/// [`live_mh_pods`] with each pod's OBJECT from the same settled snapshot,
+/// for readers of per-pod spec (an MH pool pod's ConfigMap generations are its
+/// own: each slot references its own slot ConfigMap).
+///
+/// # Panics
+/// As [`live_mh_pods`].
+pub async fn live_mh_pods_with_specs() -> Vec<(LivePod, Value)> {
+    let (doc, pods) =
+        settled_serving_pods(MH_SELECTOR, MH_POD_SETTLE.timeout(), "mh-pods-unserving").await;
+    pods.into_iter()
+        .map(|p| {
+            let obj = pod_object(&doc, &p.name)
+                .unwrap_or_else(|| panic!("pod {} vanished from its own snapshot", p.name));
+            (p, obj)
+        })
+        .collect()
+}
+
+/// PURE: the pod named `name` in a `kubectl get pods -o json` document.
+#[must_use]
+pub fn pod_object(doc: &Value, name: &str) -> Option<Value> {
+    doc.get("items")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|p| p.pointer("/metadata/name").and_then(Value::as_str) == Some(name))
+        .cloned()
+}
+
 /// How often [`settled_serving_pods`] re-lists.
 const SETTLE_POLL: Duration = Duration::from_secs(1);
 
@@ -411,15 +477,15 @@ pub(crate) fn join_blocking<T>(joined: Result<T, tokio::task::JoinError>) -> T {
 // ANCHOR (DRY): `scripts/layer7.sh:__dump_media_codec_profile` is a bash TWIN of this rule
 // (with `referenced_configmaps` and `is_generation_of`) for the deployed media-codec-profile;
 // bash cannot call this. Change both together; `scripts/layer7.test.sh` mirrors these cases.
-pub fn resolve_generation(pods: &Value, instance: &str, base: &str) -> Result<String, String> {
+pub fn resolve_generation(pods: &Value, selector: &str, base: &str) -> Result<String, String> {
     let items = pods
         .get("items")
         .and_then(Value::as_array)
-        .ok_or_else(|| format!("kubectl output for instance={instance} has no `items` array"))?;
+        .ok_or_else(|| format!("kubectl output for -l {selector} has no `items` array"))?;
     let live: Vec<&Value> = items.iter().filter(|p| !is_terminating(p)).collect();
     if live.is_empty() {
         return Err(format!(
-            "no live pod matches -n {NAMESPACE} -l instance={instance} ({} terminating); \
+            "no live pod matches -n {NAMESPACE} -l {selector} ({} terminating); \
              cannot resolve which {base} generation is in effect",
             items.len()
         ));
@@ -427,8 +493,8 @@ pub fn resolve_generation(pods: &Value, instance: &str, base: &str) -> Result<St
     let refs: Vec<String> = live.iter().flat_map(|p| referenced_configmaps(p)).collect();
     if refs.iter().any(|r| r == base) {
         return Err(format!(
-            "a live pod of {instance} references the BARE ConfigMap name {base}: it is not \
-             content-addressed (ADR-0038 §2), so a config edit would not roll the pod; \
+            "a live pod matching -l {selector} references the BARE ConfigMap name {base}: it is \
+             not content-addressed (ADR-0038 §2), so a config edit would not roll the pod; \
              {REDEPLOY_HINT}"
         ));
     }
@@ -438,13 +504,32 @@ pub fn resolve_generation(pods: &Value, instance: &str, base: &str) -> Result<St
         .collect();
     if names.len() != 1 {
         return Err(format!(
-            "the live pod(s) of {instance} reference {} generation(s) of ConfigMap {base} \
-             ({names:?}); expected exactly one. Zero: the pod is not wired to {base}. More \
-             than one: a rollout is in flight — wait for it, or {REDEPLOY_HINT}.",
+            "the live pod(s) matching -l {selector} reference {} generation(s) of ConfigMap \
+             {base} ({names:?}); expected exactly one. Zero: the pod is not wired to {base}. \
+             More than one: a rollout (or an MH pool upgrade) is in flight — wait for it, or \
+             {REDEPLOY_HINT}.",
             names.len()
         ));
     }
     Ok(names.into_iter().next().expect("exactly one"))
+}
+
+/// [`resolve_generation`] for ONE pod object (e.g. one MH pool pod, whose
+/// per-slot ConfigMap no other pod shares): the generation of `base` it
+/// references.
+///
+/// # Errors
+/// As [`resolve_generation`].
+pub fn generation_in_pod(pod: &Value, base: &str) -> Result<String, String> {
+    let name = pod
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed pod>");
+    resolve_generation(
+        &serde_json::json!({ "items": [pod] }),
+        &format!("(pod {name})"),
+        base,
+    )
 }
 
 /// Every ConfigMap name a pod's spec references.
@@ -624,6 +709,26 @@ pub fn deployment_env_value(deployment: &str, var: &str) -> String {
     );
     value
 }
+/// The CURRENT container's log of `pod`/`container` in [`NAMESPACE`]
+/// (`kubectl logs`, never `--previous`): after an in-place restart this is the
+/// new process's log.
+///
+/// # Errors
+/// kubectl cannot run or fails (its stderr is returned).
+pub fn container_log(pod: &str, container: &str) -> Result<String, String> {
+    let output = Command::new("kubectl")
+        .args(["logs", pod, "-c", container, "-n", NAMESPACE])
+        .output()
+        .map_err(|e| format!("could not run kubectl: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "kubectl logs {pod} -c {container} failed (exit {:?}): {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
 
 /// `kubectl get <args...> -o json`, parsed. The Result-returning reader for
 /// callers that map failures into their own typed error (e.g. the gate-zero
@@ -709,7 +814,7 @@ mod tests {
             "mh-service-config-extra-7f2kd9h4mt",
             BASE
         ));
-        assert!(!is_generation_of("mh-0-config-7f2kd9h4mt", BASE));
+        assert!(!is_generation_of("mh-slot-0-config-7f2kd9h4mt", BASE));
         assert!(!is_generation_of("mh-service-config-", BASE));
         assert!(!is_generation_of("mh-service-config-7F2KD9H4MT", BASE));
     }
@@ -732,13 +837,13 @@ mod tests {
     #[test]
     fn one_live_generation_resolves() {
         let pods = json!({"items": [pod(GEN_A)]});
-        assert_eq!(resolve_generation(&pods, "mh-0", BASE).unwrap(), GEN_A);
+        assert_eq!(resolve_generation(&pods, MH_SELECTOR, BASE).unwrap(), GEN_A);
     }
 
     #[test]
     fn a_terminating_old_generation_is_ignored() {
         let pods = json!({"items": [terminating(pod(GEN_B)), pod(GEN_A)]});
-        assert_eq!(resolve_generation(&pods, "mh-0", BASE).unwrap(), GEN_A);
+        assert_eq!(resolve_generation(&pods, MH_SELECTOR, BASE).unwrap(), GEN_A);
     }
 
     #[test]
@@ -746,41 +851,54 @@ mod tests {
         let p = json!({"metadata": {"name": "p"}, "spec": {"initContainers": [
             {"envFrom": [{"configMapRef": {"name": GEN_A}}]}]}});
         assert_eq!(
-            resolve_generation(&json!({"items": [p]}), "mh-0", BASE).unwrap(),
+            resolve_generation(&json!({"items": [p]}), MH_SELECTOR, BASE).unwrap(),
             GEN_A
         );
     }
 
     #[test]
     fn zero_generations_is_an_error() {
-        let err = resolve_generation(&json!({"items": [pod("other-7f2kd9h4mt")]}), "mh-0", BASE)
-            .unwrap_err();
+        let err = resolve_generation(
+            &json!({"items": [pod("other-7f2kd9h4mt")]}),
+            MH_SELECTOR,
+            BASE,
+        )
+        .unwrap_err();
         assert!(err.contains("0 generation"), "{err}");
     }
 
     #[test]
     fn two_live_generations_is_an_error() {
-        let err = resolve_generation(&json!({"items": [pod(GEN_A), pod(GEN_B)]}), "mh-0", BASE)
-            .unwrap_err();
+        let err = resolve_generation(
+            &json!({"items": [pod(GEN_A), pod(GEN_B)]}),
+            MH_SELECTOR,
+            BASE,
+        )
+        .unwrap_err();
         assert!(err.contains("2 generation"), "{err}");
     }
 
     #[test]
     fn only_terminating_pods_is_an_error() {
-        let err = resolve_generation(&json!({"items": [terminating(pod(GEN_A))]}), "mh-0", BASE)
-            .unwrap_err();
+        let err = resolve_generation(
+            &json!({"items": [terminating(pod(GEN_A))]}),
+            MH_SELECTOR,
+            BASE,
+        )
+        .unwrap_err();
         assert!(err.contains("no live pod"), "{err}");
     }
 
     #[test]
     fn missing_items_is_an_error() {
-        let err = resolve_generation(&json!({"kind": "PodList"}), "mh-0", BASE).unwrap_err();
+        let err = resolve_generation(&json!({"kind": "PodList"}), MH_SELECTOR, BASE).unwrap_err();
         assert!(err.contains("no `items`"), "{err}");
     }
 
     #[test]
     fn a_bare_base_reference_is_a_not_content_addressed_error() {
-        let err = resolve_generation(&json!({"items": [pod(BASE)]}), "mh-0", BASE).unwrap_err();
+        let err =
+            resolve_generation(&json!({"items": [pod(BASE)]}), MH_SELECTOR, BASE).unwrap_err();
         assert!(
             err.contains("BARE") && err.contains("content-addressed"),
             "{err}"
@@ -791,7 +909,7 @@ mod tests {
     fn instances_on_one_generation_agree() {
         let names = vec![GEN_A.to_owned(), GEN_A.to_owned()];
         assert_eq!(
-            agree_on_generation(&["mh-0", "mh-1"], BASE, names).unwrap(),
+            agree_on_generation(&["instance=mc-0", MH_SELECTOR], BASE, names).unwrap(),
             GEN_A
         );
     }
@@ -799,7 +917,7 @@ mod tests {
     #[test]
     fn instances_on_different_generations_is_an_error() {
         let names = vec![GEN_A.to_owned(), GEN_B.to_owned()];
-        let err = agree_on_generation(&["mh-0", "mh-1"], BASE, names).unwrap_err();
+        let err = agree_on_generation(&["instance=mc-0", MH_SELECTOR], BASE, names).unwrap_err();
         assert!(
             err.contains("DIFFERENT generations") && err.contains(GEN_A) && err.contains(GEN_B),
             "{err}"
@@ -809,13 +927,25 @@ mod tests {
     #[test]
     fn no_instances_is_an_error() {
         let err = agree_on_generation(&[], BASE, vec![]).unwrap_err();
-        assert!(err.contains("no instances"), "{err}");
+        assert!(err.contains("no selectors"), "{err}");
     }
 
     #[test]
-    fn profile_readers_are_exactly_mc_then_mh() {
-        let both: Vec<&str> = MC_INSTANCES.iter().chain(MH_INSTANCES).copied().collect();
-        assert_eq!(PROFILE_READERS, both.as_slice());
+    fn profile_readers_are_every_mc_instance_then_the_mh_pool() {
+        assert_eq!(
+            profile_reader_selectors(),
+            vec!["instance=mc-0", "instance=mc-1", MH_SELECTOR]
+        );
+    }
+
+    #[test]
+    fn generation_in_pod_resolves_one_pod_and_names_it() {
+        assert_eq!(generation_in_pod(&pod(GEN_A), BASE).unwrap(), GEN_A);
+        let err = generation_in_pod(&pod("other-7f2kd9h4mt"), BASE).unwrap_err();
+        assert!(
+            err.contains("(pod p)") && err.contains("0 generation"),
+            "{err}"
+        );
     }
 
     // ---- label discovery: partition_serving / require_all_serving ---------

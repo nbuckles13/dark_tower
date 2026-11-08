@@ -48,7 +48,7 @@
 
 ## Observability Infrastructure
 - Prometheus server config, extracted to one file both Docker and K8s load -> `infra/kubernetes/observability/prometheus.yml`, `infra/docker/prometheus/prometheus.yml`, `infra/docker/prometheus/kustomization.yaml`, `infra/kubernetes/observability/prometheus-config.yaml`, `loki-config.yaml`, `kustomization.yaml`
-- MC/MH probes + scrape config (per-instance workloads) -> `infra/services/mc-service/mc-0-deployment.yaml`, `mc-1-deployment.yaml`, `infra/services/mh-service/mh-0-deployment.yaml`, `mh-1-deployment.yaml`
+- MC/MH probes + scrape config (per-instance workloads) -> `infra/services/mc-service/mc-0-deployment.yaml`, `mc-1-deployment.yaml`, the ONE MH template `infra/services/mh-service/deployment.yaml` (instances `mh-s<k>` by `infra/kind/scripts/mh.sh`; Kind-only `shareProcessNamespace` patch `infra/kubernetes/overlays/kind/services/mh-service/share-process-namespace-patch.yaml`)
 - Kind NodePorts + cluster lifecycle -> `infra/kind/kind-config.yaml`, `infra/kind/kind-config.yaml.tmpl`, `infra/kind/scripts/setup.sh`, `teardown.sh`
 - Devloop helper (port map, status, audit log) -> `crates/devloop-helper/src/commands.rs:write_port_map_shell()`, `cmd_status()`, `parse_pod_health()`, `crates/devloop-helper/src/logging.rs:AuditLog`, `infra/devloop/dev-cluster`, `infra/devloop/devloop.sh`
 - Layer-7 operator lane + per-run org provisioning -> `scripts/layer7.sh:precondition_fail()`, `__generate_org_subdomain()`, `infra/kind/scripts/setup.sh:provision_run_org()`, `crates/env-tests/src/fixtures/auth_client.rs:resolve_org_subdomain()`; tokens `docs/runbooks/devloop-validation.md`

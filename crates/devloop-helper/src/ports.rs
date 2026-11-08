@@ -32,12 +32,29 @@ impl PortOffsets {
     pub const MC_1_HEALTH: u16 = 13;
     pub const MC_1_GRPC: u16 = 14;
     pub const MC_1_WEBTRANSPORT: u16 = 15;
-    pub const MH_0_HEALTH: u16 = 20;
-    pub const MH_0_GRPC: u16 = 21;
-    pub const MH_0_WEBTRANSPORT: u16 = 22;
-    pub const MH_1_HEALTH: u16 = 23;
-    pub const MH_1_GRPC: u16 = 24;
-    pub const MH_1_WEBTRANSPORT: u16 = 25;
+    /// First MH WebTransport hostPort SLOT offset (ADR-0039 §7 "Kind"). Slot
+    /// `k` (0-based) is offset `MH_SLOT_BASE + k`; see [`mh_slot_offsets`].
+    ///
+    /// THE ONE HOME OF K. Changing [`Self::MH_SLOT_COUNT`] (or the base) means
+    /// rebuilding devloop-helper on the host AND recreating every Kind cluster:
+    /// the kind-config `extraPortMappings` are fixed at cluster creation. The
+    /// per-slot mapping block in `infra/kind/kind-config.yaml.tmpl` is RENDERED
+    /// from this table ([`mh_slot_port_mappings`]); the static
+    /// `infra/kind/kind-config.yaml` is pinned to it by a unit test below; and
+    /// `infra/kind/scripts/deploy.sh:mh_slot_table()` reads the slots back out
+    /// of the rendered/static kind-config (never retyping K).
+    ///
+    /// One port value per slot: the host port, the Kind node `containerPort`,
+    /// the pod `hostPort` and the slot ConfigMap's `MH_HOST_PORT` are the SAME
+    /// number. The MH container still binds 4434/UDP; only `hostPort` varies.
+    pub const MH_SLOT_BASE: u16 = 20;
+    /// K, the number of MH hostPort slots.
+    pub const MH_SLOT_COUNT: u16 = 6;
+    /// Local port for `infra/kind/scripts/setup.sh`'s `svc/mh-service` health
+    /// port-forward (`MH_HEALTH_PORT`). Deliberately OUTSIDE the slot range
+    /// (never a slot offset) and not a kind mapping: the forward binds it on
+    /// the host itself.
+    pub const MH_HEALTH: u16 = 31;
     pub const POSTGRES: u16 = 30;
     pub const PROMETHEUS: u16 = 100;
     pub const GRAFANA: u16 = 101;
@@ -48,6 +65,76 @@ impl PortOffsets {
     // reuse — do not re-assign 104. The apiserver binds a single port,
     // `HOST_GATEWAY_IP:HOST_PORT_K8S_API` (offset 103); see
     // `infra/kind/kind-config.yaml.tmpl` (`apiServerAddress`/`apiServerPort`).
+    // Offsets 20..=25 were the retired fixed mh-0/mh-1 health/gRPC/WebTransport
+    // offsets; they are now the MH slot range.
+}
+
+/// True iff no offset in `offsets` falls inside the MH slot range.
+const fn outside_mh_slot_range(mut offsets: &[u16]) -> bool {
+    while let [first, rest @ ..] = offsets {
+        if *first >= PortOffsets::MH_SLOT_BASE
+            && *first < PortOffsets::MH_SLOT_BASE + PortOffsets::MH_SLOT_COUNT
+        {
+            return false;
+        }
+        offsets = rest;
+    }
+    true
+}
+
+// The slot range must stay inside the 20..=29 MH band and never meet another
+// offset (a collision would map two things onto one host port).
+const _: () = {
+    assert!(PortOffsets::MH_SLOT_COUNT > 0);
+    assert!(PortOffsets::MH_SLOT_BASE >= 20);
+    assert!(PortOffsets::MH_SLOT_BASE + PortOffsets::MH_SLOT_COUNT - 1 <= 29);
+    assert!(outside_mh_slot_range(&[
+        PortOffsets::AC_HTTP,
+        PortOffsets::GC_HTTP,
+        PortOffsets::GC_GRPC,
+        PortOffsets::MC_0_HEALTH,
+        PortOffsets::MC_0_GRPC,
+        PortOffsets::MC_0_WEBTRANSPORT,
+        PortOffsets::MC_1_HEALTH,
+        PortOffsets::MC_1_GRPC,
+        PortOffsets::MC_1_WEBTRANSPORT,
+        PortOffsets::MH_HEALTH,
+        PortOffsets::POSTGRES,
+        PortOffsets::PROMETHEUS,
+        PortOffsets::GRAFANA,
+        PortOffsets::LOKI,
+        PortOffsets::K8S_API,
+        104, // retired, never reused
+    ]));
+};
+
+/// The MH slot offsets, slot 0 first (`MH_SLOT_BASE + k` for k in 0..K).
+pub fn mh_slot_offsets() -> impl Iterator<Item = u16> {
+    (0..PortOffsets::MH_SLOT_COUNT).map(|k| PortOffsets::MH_SLOT_BASE + k)
+}
+
+/// The machine marker comment that precedes each MH slot mapping in a
+/// kind-config. ONE Rust spelling (emitted by [`mh_slot_port_mappings`],
+/// expected by the static-file test); the ONE bash spelling is
+/// `infra/kind/scripts/deploy.sh:MH_SLOT_MARKER`, and `scripts/setup.test.sh`
+/// asserts the two are equal.
+pub const MH_SLOT_MARKER: &str = "# dt:mh-slot=";
+
+/// The kind-config `extraPortMappings` block for every MH slot, rendered from
+/// the slot table (substituted for `${MH_SLOT_PORT_MAPPINGS}` in
+/// `kind-config.yaml.tmpl`). One UDP mapping per slot, host port == node
+/// containerPort == pod hostPort, bound on `listen_address` (the host gateway).
+pub fn mh_slot_port_mappings(alloc: &PortAllocation, listen_address: &str) -> String {
+    mh_slot_offsets()
+        .enumerate()
+        .map(|(k, offset)| {
+            let port = alloc.port(offset);
+            format!(
+                "      {MH_SLOT_MARKER}{k}\n      - containerPort: {port}\n        hostPort: {port}\n        listenAddress: \"{listen_address}\"\n        protocol: UDP"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A port allocation for a devloop.
@@ -275,8 +362,6 @@ pub fn verify_ports_available(alloc: &PortAllocation) -> Result<(), HelperError>
         ("mc_0_health", PortOffsets::MC_0_HEALTH),
         ("mc_0_webtransport", PortOffsets::MC_0_WEBTRANSPORT),
         ("mc_1_webtransport", PortOffsets::MC_1_WEBTRANSPORT),
-        ("mh_0_webtransport", PortOffsets::MH_0_WEBTRANSPORT),
-        ("mh_1_webtransport", PortOffsets::MH_1_WEBTRANSPORT),
         ("prometheus", PortOffsets::PROMETHEUS),
         ("k8s_api", PortOffsets::K8S_API),
     ];
@@ -286,6 +371,14 @@ pub fn verify_ports_available(alloc: &PortAllocation) -> Result<(), HelperError>
         if !is_port_available(port) {
             return Err(HelperError::PortAllocation(format!(
                 "port {port} ({name}) is already in use"
+            )));
+        }
+    }
+    for (k, offset) in mh_slot_offsets().enumerate() {
+        let port = alloc.port(offset);
+        if !is_port_available(port) {
+            return Err(HelperError::PortAllocation(format!(
+                "port {port} (mh_slot_{k}) is already in use"
             )));
         }
     }
@@ -317,12 +410,10 @@ pub struct PortEntries {
     pub mc_1_health: u16,
     pub mc_1_grpc: u16,
     pub mc_1_webtransport: u16,
-    pub mh_0_health: u16,
-    pub mh_0_grpc: u16,
-    pub mh_0_webtransport: u16,
-    pub mh_1_health: u16,
-    pub mh_1_grpc: u16,
-    pub mh_1_webtransport: u16,
+    /// `setup.sh`'s `svc/mh-service` health port-forward (local, not mapped).
+    pub mh_health: u16,
+    /// MH hostPort slot ports, slot 0 first (`mh_slot_offsets`).
+    pub mh_slots: Vec<u16>,
     pub postgres: u16,
     pub prometheus: u16,
     pub grafana: u16,
@@ -347,12 +438,8 @@ pub fn generate_port_map(
         mc_1_health: alloc.port(PortOffsets::MC_1_HEALTH),
         mc_1_grpc: alloc.port(PortOffsets::MC_1_GRPC),
         mc_1_webtransport: alloc.port(PortOffsets::MC_1_WEBTRANSPORT),
-        mh_0_health: alloc.port(PortOffsets::MH_0_HEALTH),
-        mh_0_grpc: alloc.port(PortOffsets::MH_0_GRPC),
-        mh_0_webtransport: alloc.port(PortOffsets::MH_0_WEBTRANSPORT),
-        mh_1_health: alloc.port(PortOffsets::MH_1_HEALTH),
-        mh_1_grpc: alloc.port(PortOffsets::MH_1_GRPC),
-        mh_1_webtransport: alloc.port(PortOffsets::MH_1_WEBTRANSPORT),
+        mh_health: alloc.port(PortOffsets::MH_HEALTH),
+        mh_slots: mh_slot_offsets().map(|o| alloc.port(o)).collect(),
         postgres: alloc.port(PortOffsets::POSTGRES),
         prometheus: alloc.port(PortOffsets::PROMETHEUS),
         grafana: alloc.port(PortOffsets::GRAFANA),
@@ -462,28 +549,8 @@ pub fn template_env_vars(alloc: &PortAllocation, host_gateway_ip: &str) -> HashM
         alloc.port(PortOffsets::MC_1_WEBTRANSPORT).to_string(),
     );
     vars.insert(
-        "HOST_PORT_MH_0_HEALTH".to_string(),
-        alloc.port(PortOffsets::MH_0_HEALTH).to_string(),
-    );
-    vars.insert(
-        "HOST_PORT_MH_0_GRPC".to_string(),
-        alloc.port(PortOffsets::MH_0_GRPC).to_string(),
-    );
-    vars.insert(
-        "HOST_PORT_MH_0_WEBTRANSPORT".to_string(),
-        alloc.port(PortOffsets::MH_0_WEBTRANSPORT).to_string(),
-    );
-    vars.insert(
-        "HOST_PORT_MH_1_HEALTH".to_string(),
-        alloc.port(PortOffsets::MH_1_HEALTH).to_string(),
-    );
-    vars.insert(
-        "HOST_PORT_MH_1_GRPC".to_string(),
-        alloc.port(PortOffsets::MH_1_GRPC).to_string(),
-    );
-    vars.insert(
-        "HOST_PORT_MH_1_WEBTRANSPORT".to_string(),
-        alloc.port(PortOffsets::MH_1_WEBTRANSPORT).to_string(),
+        "MH_SLOT_PORT_MAPPINGS".to_string(),
+        mh_slot_port_mappings(alloc, host_gateway_ip),
     );
     vars.insert(
         "HOST_PORT_PROMETHEUS".to_string(),
@@ -572,8 +639,11 @@ mod tests {
         assert_eq!(alloc.port(PortOffsets::MC_0_HEALTH), 24210);
         assert_eq!(alloc.port(PortOffsets::MC_0_WEBTRANSPORT), 24212);
         assert_eq!(alloc.port(PortOffsets::MC_1_WEBTRANSPORT), 24215);
-        assert_eq!(alloc.port(PortOffsets::MH_0_WEBTRANSPORT), 24222);
-        assert_eq!(alloc.port(PortOffsets::MH_1_WEBTRANSPORT), 24225);
+        assert_eq!(
+            mh_slot_offsets().map(|o| alloc.port(o)).collect::<Vec<_>>(),
+            vec![24220, 24221, 24222, 24223, 24224, 24225]
+        );
+        assert_eq!(alloc.port(PortOffsets::MH_HEALTH), 24231);
         assert_eq!(alloc.port(PortOffsets::PROMETHEUS), 24300);
         assert_eq!(alloc.port(PortOffsets::GRAFANA), 24301);
         assert_eq!(alloc.port(PortOffsets::LOKI), 24302);
@@ -786,12 +856,7 @@ mod tests {
             "HOST_PORT_MC_1_HEALTH",
             "HOST_PORT_MC_1_GRPC",
             "HOST_PORT_MC_1_WEBTRANSPORT",
-            "HOST_PORT_MH_0_HEALTH",
-            "HOST_PORT_MH_0_GRPC",
-            "HOST_PORT_MH_0_WEBTRANSPORT",
-            "HOST_PORT_MH_1_HEALTH",
-            "HOST_PORT_MH_1_GRPC",
-            "HOST_PORT_MH_1_WEBTRANSPORT",
+            "MH_SLOT_PORT_MAPPINGS",
             "HOST_PORT_PROMETHEUS",
             "HOST_PORT_GRAFANA",
             "HOST_PORT_LOKI",
@@ -830,5 +895,136 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::metadata(&path).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o600);
+    }
+
+    /// A parsed MH slot mapping: (slot, containerPort, hostPort, listenAddress, protocol).
+    type SlotMapping = (usize, u16, u16, String, String);
+
+    /// Parse every `MH_SLOT_MARKER`-marked mapping out of a kind-config text.
+    /// Each marker must be followed by exactly one `- containerPort:` mapping
+    /// whose four keys all appear before the next mapping/marker.
+    fn parse_slot_mappings(text: &str) -> Vec<SlotMapping> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            let Some(k) = t.strip_prefix(MH_SLOT_MARKER) else {
+                continue;
+            };
+            let k: usize = k
+                .trim()
+                .parse()
+                .expect("slot marker carries a decimal slot");
+            let mut cp = None;
+            let mut hp = None;
+            let mut la = None;
+            let mut proto = None;
+            for (j, l) in lines.iter().enumerate().skip(i + 1) {
+                let l = l.trim();
+                if j > i + 1 && (l.starts_with("- ") || l.starts_with(MH_SLOT_MARKER)) {
+                    break;
+                }
+                let l = l.trim_start_matches("- ");
+                if let Some(v) = l.strip_prefix("containerPort:") {
+                    cp = v.trim().parse::<u16>().ok();
+                } else if let Some(v) = l.strip_prefix("hostPort:") {
+                    hp = v.trim().parse::<u16>().ok();
+                } else if let Some(v) = l.strip_prefix("listenAddress:") {
+                    la = Some(v.trim().trim_matches('"').to_string());
+                } else if let Some(v) = l.strip_prefix("protocol:") {
+                    proto = Some(v.trim().to_string());
+                }
+            }
+            out.push((
+                k,
+                cp.expect("slot mapping has a numeric containerPort"),
+                hp.expect("slot mapping has a numeric hostPort"),
+                la.expect("slot mapping has a listenAddress"),
+                proto.expect("slot mapping has a protocol"),
+            ));
+        }
+        out
+    }
+
+    /// Assert `mappings` is exactly the K-slot table: slots 0..K in order, UDP,
+    /// containerPort == hostPort, bound on `listen`, ports unique.
+    fn assert_slot_table(mappings: &[SlotMapping], listen: &str, expected_ports: &[u16]) {
+        assert_eq!(
+            mappings.len(),
+            usize::from(PortOffsets::MH_SLOT_COUNT),
+            "expected K={} MH slot mappings, found {mappings:?}",
+            PortOffsets::MH_SLOT_COUNT
+        );
+        let mut seen = std::collections::HashSet::new();
+        for (i, (k, cp, hp, la, proto)) in mappings.iter().enumerate() {
+            assert_eq!(*k, i, "slot markers out of order: {mappings:?}");
+            assert_eq!(cp, hp, "slot {k}: containerPort must equal hostPort");
+            assert_eq!(la, listen, "slot {k}: listenAddress");
+            assert_eq!(proto, "UDP", "slot {k}: protocol");
+            assert!(seen.insert(*hp), "slot {k}: duplicate port {hp}");
+        }
+        let ports: Vec<u16> = mappings.iter().map(|m| m.2).collect();
+        assert_eq!(ports, expected_ports);
+    }
+
+    #[test]
+    fn test_mh_slot_offsets_are_k_contiguous() {
+        let offs: Vec<u16> = mh_slot_offsets().collect();
+        assert_eq!(offs.len(), usize::from(PortOffsets::MH_SLOT_COUNT));
+        assert_eq!(offs.first().copied(), Some(PortOffsets::MH_SLOT_BASE));
+        assert!(!offs.contains(&PortOffsets::MH_HEALTH));
+    }
+
+    #[test]
+    fn test_rendered_kind_config_mh_block_equals_slot_table() {
+        let template = include_str!("../../../infra/kind/kind-config.yaml.tmpl");
+        let alloc = PortAllocation {
+            base_port: 24200,
+            slot_index: 21,
+        };
+        let mut vars = template_env_vars(&alloc, "10.255.255.254");
+        vars.insert("CLUSTER_NAME".to_string(), "devloop-x".to_string());
+        let rendered = substitute_template(template, &vars);
+        assert!(
+            !rendered.contains("${"),
+            "rendered kind-config has an unsubstituted placeholder"
+        );
+        let expected: Vec<u16> = mh_slot_offsets().map(|o| alloc.port(o)).collect();
+        assert_slot_table(&parse_slot_mappings(&rendered), "10.255.255.254", &expected);
+        // The retired fixed-instance MH mappings are gone (positive control: the
+        // MC WebTransport NodePort mapping is still there).
+        assert!(rendered.contains("containerPort: 30433"));
+        for retired in ["30434", "30436", "30830", "30831", "30530", "30531"] {
+            assert!(
+                !rendered.contains(&format!("containerPort: {retired}")),
+                "retired MH mapping {retired} still rendered"
+            );
+        }
+    }
+
+    #[test]
+    fn test_static_kind_config_mh_block_matches_slot_table_shape() {
+        // The static manual-dev config cannot be rendered (no allocation), so it
+        // is pinned here: K marked slots, loopback (R-37), UDP, one port each.
+        let text = include_str!("../../../infra/kind/kind-config.yaml");
+        let mappings = parse_slot_mappings(text);
+        let expected: Vec<u16> = (0..PortOffsets::MH_SLOT_COUNT).map(|k| 4440 + k).collect();
+        assert_slot_table(&mappings, "127.0.0.1", &expected);
+    }
+
+    #[test]
+    fn test_parse_slot_mappings_reads_a_marked_block() {
+        // Positive control for the parser itself.
+        let alloc = PortAllocation {
+            base_port: 20000,
+            slot_index: 0,
+        };
+        let block = mh_slot_port_mappings(&alloc, "1.2.3.4");
+        let m = parse_slot_mappings(&block);
+        assert_eq!(m.len(), usize::from(PortOffsets::MH_SLOT_COUNT));
+        assert_eq!(
+            m[0],
+            (0, 20020, 20020, "1.2.3.4".to_string(), "UDP".to_string())
+        );
     }
 }
