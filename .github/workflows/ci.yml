@@ -130,7 +130,7 @@ jobs:
           cache-bin: false
 
       - name: Install pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           run_install: false
 
@@ -167,14 +167,14 @@ jobs:
 
       - name: Install cargo-audit
         if: matrix.needs_audit
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-audit@${{ steps.pins.outputs.cargo-audit }}
 
       - name: Install cargo-nextest
         # Layer 4's test runner (scripts/lang/rust/test.sh checks the version against the pin).
         if: matrix.needs_nextest
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-nextest@${{ steps.pins.outputs.cargo-nextest }}
 
@@ -502,7 +502,7 @@ jobs:
           cache-bin: false
 
       - name: Install pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           run_install: false
 
@@ -766,7 +766,7 @@ jobs:
           echo "cargo-llvm-cov=${v}" >> "$GITHUB_OUTPUT"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-llvm-cov@${{ steps.pins.outputs.cargo-llvm-cov }}
 
