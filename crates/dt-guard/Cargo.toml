@@ -39,7 +39,7 @@ serde_norway = { workspace = true }
 # every divergence is a false-negative window (dotted keys, inline tables,
 # quoted keys). @security ruling 2026-09-01; ADR-0033 audit dep-change gate
 # applies.
-toml = "0.8"
+toml = "1.1"
 walkdir = "2"
 
 [dev-dependencies]
