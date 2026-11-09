@@ -38,7 +38,7 @@
     "@opentelemetry/resources": "2.12.0",
     "@opentelemetry/sdk-metrics": "2.12.0",
     "@opentelemetry/sdk-trace-web": "2.12.0",
-    "@opentelemetry/semantic-conventions": "1.43.0"
+    "@opentelemetry/semantic-conventions": "1.44.0"
   },
   "devDependencies": {
     "@darktower/test-utils": "workspace:*",
