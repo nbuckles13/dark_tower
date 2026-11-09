@@ -86,7 +86,14 @@ pub fn get_added_files(
     let base = get_diff_base(repo_root)?;
     git_diff_name_only(
         repo_root,
-        &["diff", "--no-renames", "--name-only", "--diff-filter=A", &base, "--"],
+        &[
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "--diff-filter=A",
+            &base,
+            "--",
+        ],
         search_path,
         extensions,
     )
@@ -102,7 +109,14 @@ pub fn get_deleted_files(
     let base = get_diff_base(repo_root)?;
     git_diff_name_only(
         repo_root,
-        &["diff", "--no-renames", "--name-only", "--diff-filter=D", &base, "--"],
+        &[
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "--diff-filter=D",
+            &base,
+            "--",
+        ],
         search_path,
         extensions,
     )
@@ -375,11 +389,22 @@ mod tests {
     fn git(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
             .current_dir(dir)
-            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "diff.renames=true"])
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "diff.renames=true",
+            ])
             .args(args)
             .output()
             .expect("spawn git");
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// A committed rename must list BOTH paths on the clean-tree (post-commit)
@@ -404,7 +429,10 @@ mod tests {
 
         let want = vec![PathBuf::from("new.yaml"), PathBuf::from("old.yaml")];
         assert_eq!(dirty, want, "uncommitted tree");
-        assert_eq!(clean, want, "post-commit tree must match the uncommitted view");
+        assert_eq!(
+            clean, want,
+            "post-commit tree must match the uncommitted view"
+        );
     }
 
     #[test]
