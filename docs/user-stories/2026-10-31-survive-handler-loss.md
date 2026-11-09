@@ -1385,7 +1385,7 @@ tasks:
   slug: 2026-11-07-mh-sh-pool-tool
   tag: story-2026-10-31-survive-handler-loss-task-I-5
 - id: 9
-  status: pending
+  status: completed
   specialist: infrastructure
   deps:
   - 1
@@ -1472,6 +1472,7 @@ tasks:
     REMAINING HOST-SIDE ACTIONS (not devloop steps; state them in the devloop summary): rebuild devloop-helper on the host (ports.rs changed), then recreate every existing Kind cluster to get the 6 slot mappings. The first deploy, and any rollback across this commit, needs a recreate (R-30).
 
     COVERS: code, deploy, unit-tests, env-tests (R-28 address invariant; R-27 host-publish UDP leg; existing MH env-tests green on slots).
+  slug: 2026-11-07-mh-hostport-slot-pool
   tag: story-2026-10-31-survive-handler-loss-task-I-2
 - id: 10
   status: pending
