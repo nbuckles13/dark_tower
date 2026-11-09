@@ -148,7 +148,7 @@ governor = { version = "0.10", features = ["std", "dashmap"] }
 # minimal-versions resolve cannot bring the lint back. tonic's copy unifies with it.
 async-trait = "0.1.92"
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Utilities
 # Hoisted to the workspace at story task 16 (@security S16). It was declared
