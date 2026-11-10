@@ -1705,7 +1705,7 @@ tasks:
   slug: 2026-11-10-mc-heartbeat-intake
   tag: story-2026-10-31-survive-handler-loss-task-MC-B1
 - id: 14
-  status: pending
+  status: completed
   specialist: media-handler
   deps:
   - 6
@@ -1756,6 +1756,7 @@ tasks:
 
     CROSS-TASK OBLIGATIONS
     (a) no new config key; (b) nothing retired; (c) as above; (d) test-gates "MH" close-code coverage, paired with test; (e) no id labels. Tier: full (client-facing wire contract).
+  slug: 2026-11-10-mh-close-codes
   tag: story-2026-10-31-survive-handler-loss-task-MH-CLOSE
 - id: 15
   status: pending
