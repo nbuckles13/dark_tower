@@ -99,6 +99,16 @@ fn configured_prometheus_builder() -> Result<PrometheusBuilder, String> {
             &[0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250],
         )
         .map_err(|e| format!("Failed to set MH selection buckets: {e}"))?
+        // MH replacement (AcquireMediaHandler): one ownership read, an optional
+        // replaced-handler read and one candidate query, so the selection
+        // buckets extended to 1 s.
+        .set_buckets_for_metric(
+            Matcher::Prefix("gc_mh_replacement".to_string()),
+            &[
+                0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250, 0.500, 1.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set MH replacement buckets: {e}"))?
         // AC request buckets - sub-second granularity for p95 latency detection
         .set_buckets_for_metric(
             Matcher::Prefix("gc_ac_request".to_string()),
@@ -626,6 +636,193 @@ pub fn record_mh_registration(outcome: MhRegistrationOutcome) {
                 .increment(1);
         }
     }
+}
+
+// ============================================================================
+// MH Replacement Metrics (AcquireMediaHandler, ADR-0039 §3, §8)
+// ============================================================================
+
+/// `gc_mh_replacement_requests_total{trigger}`: why MC is replacing, projected
+/// from `ReleaseCause` (`services::mh_replacement::project_trigger`, the one
+/// projection). `Invalid` only ever appears with outcome `invalid_request`,
+/// for a request whose trigger itself is UNSPECIFIED, MEETING_ENDED or an
+/// unknown number: the raw value never becomes a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacementTrigger {
+    /// `RELEASE_CAUSE_HEARTBEAT_TIMEOUT` (MC declared the handler Dead).
+    HeartbeatTimeout,
+    /// `RELEASE_CAUSE_APPLY_LAG` (MC declared the handler Impaired).
+    ApplyLag,
+    /// `RELEASE_CAUSE_PLANNED_TRANSFER` (move off a draining handler).
+    PlannedTransfer,
+    /// The request's trigger was not a valid replacement cause.
+    Invalid,
+}
+
+impl ReplacementTrigger {
+    /// Every variant.
+    pub const ALL: [ReplacementTrigger; 4] = [
+        ReplacementTrigger::HeartbeatTimeout,
+        ReplacementTrigger::ApplyLag,
+        ReplacementTrigger::PlannedTransfer,
+        ReplacementTrigger::Invalid,
+    ];
+
+    /// The `trigger` label value (also the event's `trigger` field).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            ReplacementTrigger::HeartbeatTimeout => "heartbeat_timeout",
+            ReplacementTrigger::ApplyLag => "apply_lag",
+            ReplacementTrigger::PlannedTransfer => "planned_transfer",
+            ReplacementTrigger::Invalid => "invalid",
+        }
+    }
+}
+
+/// `gc_mh_replacement_requests_total{outcome}` /
+/// `gc_mh_replacement_duration_seconds{outcome}`: the answer GC gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacementOutcome {
+    /// OK with an `MhAssignment`.
+    Granted,
+    /// RESOURCE_EXHAUSTED: no eligible candidate after exclusion.
+    NoCapacity,
+    /// FAILED_PRECONDITION: no active assignment for (meeting, controller).
+    NotOwner,
+    /// INVALID_ARGUMENT: over the cap, a malformed id, or a bad trigger.
+    InvalidRequest,
+    /// INTERNAL: a database failure or a broken registry invariant.
+    Error,
+}
+
+impl ReplacementOutcome {
+    /// Every variant.
+    pub const ALL: [ReplacementOutcome; 5] = [
+        ReplacementOutcome::Granted,
+        ReplacementOutcome::NoCapacity,
+        ReplacementOutcome::NotOwner,
+        ReplacementOutcome::InvalidRequest,
+        ReplacementOutcome::Error,
+    ];
+
+    /// The `outcome` label value (also the event's `outcome` field).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            ReplacementOutcome::Granted => "granted",
+            ReplacementOutcome::NoCapacity => "no_capacity",
+            ReplacementOutcome::NotOwner => "not_owner",
+            ReplacementOutcome::InvalidRequest => "invalid_request",
+            ReplacementOutcome::Error => "error",
+        }
+    }
+}
+
+/// `gc_mh_replacement_requests_total{gc_view}`: GC's own view of the REPLACED
+/// handler at request time. A label only: selection never reads it, and it is
+/// never a veto (it lags MC's detector by up to the staleness bound).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcView {
+    /// Fresh row reporting `healthy`.
+    Healthy,
+    /// Fresh row reporting `degraded`.
+    Degraded,
+    /// Fresh row reporting `unhealthy`.
+    Unhealthy,
+    /// Fresh row reporting `draining`.
+    Draining,
+    /// Fresh row reporting `pending` (registered, no load report yet).
+    Pending,
+    /// Row older than the staleness bound, whatever its status.
+    Stale,
+    /// No `replaced_handler_id` given, or no row for it.
+    Unregistered,
+    /// The request ended before the replaced handler's row was read
+    /// (`invalid_request`, `not_owner`, or an error before the lookup).
+    Unevaluated,
+}
+
+impl GcView {
+    /// Every variant.
+    pub const ALL: [GcView; 8] = [
+        GcView::Healthy,
+        GcView::Degraded,
+        GcView::Unhealthy,
+        GcView::Draining,
+        GcView::Pending,
+        GcView::Stale,
+        GcView::Unregistered,
+        GcView::Unevaluated,
+    ];
+
+    /// The `gc_view` label value (also the event's `gc_view` field).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            GcView::Healthy => "healthy",
+            GcView::Degraded => "degraded",
+            GcView::Unhealthy => "unhealthy",
+            GcView::Draining => "draining",
+            GcView::Pending => "pending",
+            GcView::Stale => "stale",
+            GcView::Unregistered => "unregistered",
+            GcView::Unevaluated => "unevaluated",
+        }
+    }
+}
+
+/// The emitted (trigger, outcome, gc_view) combinations: the ONE statement of
+/// which cells exist, read by zero-init and asserted by the recorder.
+///
+/// - `invalid_request`: any trigger (incl. `invalid`), `gc_view=unevaluated`.
+/// - `not_owner`: a valid trigger, `gc_view=unevaluated`.
+/// - `granted` / `no_capacity`: a valid trigger, an EVALUATED view.
+/// - `error`: a valid trigger, any view (the failure may precede the lookup).
+///
+/// 4 + 3 + 2 × 3 × 7 + 3 × 8 = 73 series.
+#[must_use]
+pub const fn is_emitted_replacement_combination(
+    trigger: ReplacementTrigger,
+    outcome: ReplacementOutcome,
+    gc_view: GcView,
+) -> bool {
+    let valid_trigger = !matches!(trigger, ReplacementTrigger::Invalid);
+    let evaluated = !matches!(gc_view, GcView::Unevaluated);
+    match outcome {
+        ReplacementOutcome::InvalidRequest => !evaluated,
+        ReplacementOutcome::NotOwner => valid_trigger && !evaluated,
+        ReplacementOutcome::Granted | ReplacementOutcome::NoCapacity => valid_trigger && evaluated,
+        ReplacementOutcome::Error => valid_trigger,
+    }
+}
+
+/// Record one `AcquireMediaHandler` request: ONE call per request, on every
+/// exit path (`grpc/mc_service.rs` is the only caller).
+///
+/// Metrics: `gc_mh_replacement_requests_total{trigger, outcome, gc_view}`,
+/// `gc_mh_replacement_duration_seconds{outcome}`. No handler, meeting or
+/// controller labels: ids go in the `gc.mh.replacement_report` event only.
+pub fn record_mh_replacement(
+    trigger: ReplacementTrigger,
+    outcome: ReplacementOutcome,
+    gc_view: GcView,
+    duration: Duration,
+) {
+    debug_assert!(
+        is_emitted_replacement_combination(trigger, outcome, gc_view),
+        "replacement label combination outside the zero-initialised set"
+    );
+    counter!("gc_mh_replacement_requests_total",
+        "trigger" => trigger.label(),
+        "outcome" => outcome.label(),
+        "gc_view" => gc_view.label()
+    )
+    .increment(1);
+    histogram!("gc_mh_replacement_duration_seconds",
+        "outcome" => outcome.label()
+    )
+    .record(duration.as_secs_f64());
 }
 
 /// `gc_mh_available` region label for rows outside GC's own region.
@@ -1171,6 +1368,7 @@ const GC_DB_QUERY_OPERATIONS: &[&str] = &[
     "get_candidate_mhs",
     "get_handler",
     "get_healthy_assignment",
+    "get_active_assignment_region",
     "get_candidate_mcs",
     "atomic_assign",
     "get_current_assignment",
@@ -1290,6 +1488,17 @@ pub fn zero_initialize_counters() {
             }
         }
     }
+    // gc_mh_replacement_requests_total{trigger, outcome, gc_view} — exactly
+    // the 73 emitted cells (`is_emitted_replacement_combination`).
+    for t in ReplacementTrigger::ALL {
+        for o in ReplacementOutcome::ALL {
+            for v in GcView::ALL {
+                if is_emitted_replacement_combination(t, o, v) {
+                    counter!("gc_mh_replacement_requests_total", "trigger" => t.label(), "outcome" => o.label(), "gc_view" => v.label()).increment(0);
+                }
+            }
+        }
+    }
     // gc_mh_load_reports_total{outcome}
     for o in MH_LOAD_REPORT_OUTCOMES {
         counter!("gc_mh_load_reports_total", "outcome" => *o).increment(0);
@@ -1389,6 +1598,28 @@ mod tests {
         present_at_zero(r#"gc_db_queries_total{operation="delete_expired_mh",status="error"}"#);
         present_at_zero(r#"gc_db_queries_total{operation="count_available_mh",status="success"}"#);
         present_at_zero(r#"gc_db_queries_total{operation="count_available_mh",status="error"}"#);
+        present_at_zero(
+            r#"gc_db_queries_total{operation="get_active_assignment_region",status="error"}"#,
+        );
+        // gc_mh_replacement_requests_total: exactly the 73 emitted cells.
+        present_at_zero(
+            r#"gc_mh_replacement_requests_total{trigger="heartbeat_timeout",outcome="granted",gc_view="healthy"}"#,
+        );
+        present_at_zero(
+            r#"gc_mh_replacement_requests_total{trigger="invalid",outcome="invalid_request",gc_view="unevaluated"}"#,
+        );
+        present_at_zero(
+            r#"gc_mh_replacement_requests_total{trigger="apply_lag",outcome="error",gc_view="unevaluated"}"#,
+        );
+        let replacement_series: Vec<&str> = rendered
+            .lines()
+            .filter(|l| l.starts_with("gc_mh_replacement_requests_total{"))
+            .collect();
+        assert_eq!(replacement_series.len(), 73, "{replacement_series:?}");
+        assert!(
+            !rendered.contains(r#"trigger="invalid",outcome="granted""#),
+            "`invalid` trigger only ever pairs with invalid_request"
+        );
 
         let total_series = rendered
             .lines()

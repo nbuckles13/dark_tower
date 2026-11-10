@@ -752,6 +752,48 @@ mod tests {
         assert_permission_denied(&response, "MH calling GlobalControllerService");
     }
 
+    /// `AcquireMediaHandler` (story 4 GC-3) inherits GlobalControllerService's
+    /// meeting-controller routing: an MH can never grant itself handlers. Pinned
+    /// per method so a future routing change cannot silently open it.
+    #[tokio::test]
+    async fn test_layer2_acquire_media_handler_is_meeting_controller_only() {
+        const ACQUIRE_PATH: &str =
+            "/dark_tower.internal.v1.GlobalControllerService/AcquireMediaHandler";
+        let (_mock_server, keypair, layer) = setup_auth_layer().await;
+        let mut svc = layer.layer(NoopService);
+
+        let request = |service_type: &str| {
+            let token = keypair.sign_token(&make_claims("service.write.gc", Some(service_type)));
+            http::Request::builder()
+                .uri(ACQUIRE_PATH)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::default())
+                .unwrap()
+        };
+
+        let response = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(request("media-handler"))
+            .await
+            .unwrap();
+        assert_permission_denied(&response, "MH calling AcquireMediaHandler");
+
+        let response = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(request("meeting-controller"))
+            .await
+            .unwrap();
+        let status = tonic::Status::from_header_map(response.headers());
+        assert!(
+            status.is_none(),
+            "MC token on AcquireMediaHandler should pass through, got: {status:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_layer2_rejects_no_service_type_fail_closed() {
         let (_mock_server, keypair, layer) = setup_auth_layer().await;

@@ -507,6 +507,14 @@ message RegisterMCResponse {
   string message = 2;
   uint64 fast_heartbeat_interval_ms = 3; // 10000ms
   uint64 comprehensive_heartbeat_interval_ms = 4; // 30000ms
+  // GC-owned upper bound on `AcquireMediaHandlerRequest.exclude_handler_ids`
+  // length (GC config GC_MH_MAX_EXCLUDE_HANDLER_IDS), pushed to MC the same way
+  // as the heartbeat intervals above. MC derives its per-meeting replacement
+  // attempt bound from it (cap minus current handler-set size). Zero (absent)
+  // FAILS MC registration (enforced by MC, story 4 MC-C). A change takes effect
+  // for an MC only when it re-registers. Rollout: a GC predating this field
+  // sends 0, so GC rolls before MC-C and never rolls back past it first.
+  uint32 max_exclude_handler_ids = 5;
 }
 
 // Fast heartbeat (10s) - capacity only, minimal payload
@@ -1130,6 +1138,9 @@ service GlobalControllerService {
   rpc FastHeartbeat(FastHeartbeatRequest) returns (FastHeartbeatResponse);
   rpc ComprehensiveHeartbeat(ComprehensiveHeartbeatRequest) returns (ComprehensiveHeartbeatResponse);
   rpc NotifyMeetingEnded(NotifyMeetingEndedRequest) returns (NotifyMeetingEndedResponse);
+  // ADR-0039 §3: grant ONE replacement media handler for a meeting. Rules at
+  // `AcquireMediaHandlerRequest`.
+  rpc AcquireMediaHandler(AcquireMediaHandlerRequest) returns (AcquireMediaHandlerResponse);
 }
 
 // MH→GC service (MHs call this to register and send load reports)
@@ -1182,6 +1193,65 @@ message AssignMeetingWithMhRequest {
 message AssignMeetingWithMhResponse {
   bool accepted = 1; // Whether the MC accepted the assignment
   RejectionReason rejection_reason = 2; // Reason if not accepted
+}
+
+// ============================================================================
+// ADR-0039 §3: MC→GC replacement grant (AcquireMediaHandler)
+// ============================================================================
+
+// MC asks GC for ONE replacement handler after it has already removed the lost
+// one (removal never waits on GC). The rules below are stated ONCE here.
+//
+// EXCLUSION. `exclude_handler_ids` = the meeting's current handlers ∪ handlers
+// removed from it ∪ handlers that refused it at admission, by handler id. GC
+// applies it inside the candidate query, before the least-loaded cut. Unknown
+// ids are ignored (not an error). Duplicates are harmless (set semantics) but
+// COUNT toward the length cap: the cap is checked on the raw list length, before
+// any per-id validation. The cap is `RegisterMCResponse.max_exclude_handler_ids`.
+//
+// NO REGION FIELD. GC derives the region from the meeting's active ownership
+// row; the caller cannot steer selection to another region.
+//
+// SELECTION. GC alone chooses, with the same weighted-random selection as
+// initial allocation (one function). Selection reads neither `trigger` nor
+// `replaced_handler_id` (ADR-0039 §9: evidence only). GC's own health view of
+// the replaced handler is a metric/log label (`gc_view`) and NEVER a veto: a
+// handler MC declared dead is replaced even if GC still sees it healthy.
+//
+// STATUSES (callers branch on the code, NEVER on the message string):
+//   - OK: `assignment` is present (see `AcquireMediaHandlerResponse`).
+//   - INVALID_ARGUMENT: exclude list over the cap; a malformed `meeting_id`,
+//     `controller_id`, exclude id or present `replaced_handler_id`; or an
+//     invalid `trigger` (validity rule at `ReleaseCause`). An MC bug: not
+//     retried.
+//   - FAILED_PRECONDITION: no active ownership row for (`meeting_id`,
+//     `controller_id`). Anti-misroute only: `controller_id` is self-asserted
+//     (recorded gap, ADR-0039 §3), so this is NOT an authorization decision.
+//     Not retried; loud.
+//   - RESOURCE_EXHAUSTED: no eligible candidate after exclusion. MC continues
+//     on survivors and retries with bounded, jittered backoff.
+//   - INTERNAL / UNAVAILABLE / other transport errors: retried with backoff.
+//     UNIMPLEMENTED comes only from a GC predating this rpc (rollout window).
+message AcquireMediaHandlerRequest {
+  string meeting_id = 1; // Meeting needing a handler
+  string controller_id = 2; // Calling MC's id (self-asserted; see STATUSES)
+  repeated string exclude_handler_ids = 3; // See EXCLUSION above
+  // Why the handler was removed. Validity for this carrier: see the
+  // "VALIDITY PER CARRIER" block at `ReleaseCause`.
+  ReleaseCause trigger = 4;
+  // The handler being replaced, when there is one. Label and log context ONLY
+  // (`gc_view`, the `gc.mh.replacement_report` event); never a swap target and
+  // never read by selection. Absent = no single replaced handler. Present but
+  // empty or malformed = INVALID_ARGUMENT (the value reaches a log event).
+  optional string replaced_handler_id = 5;
+}
+
+// The granted handler. On OK `assignment` is ALWAYS present with a non-empty
+// `mh_id` and both endpoints. The proto3 default (no assignment) is NOT a
+// grant: a receiver treats an OK without `assignment`, or with an empty
+// `mh_id`, as a failed attempt (fail closed).
+message AcquireMediaHandlerResponse {
+  MhAssignment assignment = 1;
 }
 
 // ============================================================================
@@ -1587,8 +1657,10 @@ message NotifyParticipantDisconnectedResponse {
 // vocabulary for every carrier; no carrier keeps its own list.
 //
 // VALIDITY PER CARRIER, stated once here (carrier fields point at this):
-//   - `AcquireMediaHandlerRequest.trigger` (GC-3): UNSPECIFIED and
-//     MEETING_ENDED are `INVALID_ARGUMENT`.
+//   - `AcquireMediaHandlerRequest.trigger` (GC-3): UNSPECIFIED,
+//     MEETING_ENDED and any number not defined below are `INVALID_ARGUMENT`
+//     (proto3 enums are open: an unknown number decodes, so it must be
+//     rejected explicitly).
 //   - `EndMeetingRequest.cause`: UNSPECIFIED is rejected.
 //   - `MeetingHeartbeatResponse.cause` on a RELEASED verdict: UNSPECIFIED is
 //     ONLY the documented misroute case (rules at that message).

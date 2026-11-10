@@ -447,8 +447,11 @@ static PROMQL_DT_CLIENT_RANGE_RE: Lazy<Regex> = Lazy::new(|| {
     reason = "canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
 )]
 static PROMQL_GROUPING_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b(by|without|on|ignoring|group_left|group_right)\s*\(([^)]*)\)")
-        .expect("static pattern compiles")
+    let pattern = format!(
+        r"\b({})\s*\(([^)]*)\)",
+        crate::common::promql::label_list_modifier_alternation()
+    );
+    Regex::new(&pattern).expect("static pattern compiles")
 });
 
 /// The key of one label matcher.
@@ -1436,47 +1439,7 @@ struct PreparedExpr {
 }
 
 fn prepare_expr(e: &LoadedRuleExpr) -> PreparedExpr {
-    let mut code = String::new();
-    let mut masked = String::new();
-    let mut quote: Option<char> = None;
-    let mut chars = e.rule.expr.chars().peekable();
-    while let Some(c) = chars.next() {
-        match quote {
-            Some(q) => {
-                code.push(c);
-                if c == '\\' {
-                    masked.push(' ');
-                    if let Some(n) = chars.next() {
-                        code.push(n);
-                        masked.push(' ');
-                    }
-                    continue;
-                }
-                if c == q {
-                    quote = None;
-                    masked.push(c);
-                } else {
-                    masked.push(if c == '\n' { '\n' } else { ' ' });
-                }
-            }
-            None => {
-                if c == '#' {
-                    while let Some(&n) = chars.peek() {
-                        if n == '\n' {
-                            break;
-                        }
-                        chars.next();
-                    }
-                    continue;
-                }
-                if matches!(c, '"' | '\'' | '`') {
-                    quote = Some(c);
-                }
-                code.push(c);
-                masked.push(c);
-            }
-        }
-    }
+    let crate::common::promql::Masked { code, masked } = crate::common::promql::mask(&e.rule.expr);
     PreparedExpr {
         file: e.file.clone(),
         alert: e.rule.alert.clone(),

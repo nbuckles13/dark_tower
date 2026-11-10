@@ -78,6 +78,7 @@ impl GlobalControllerService for MockGc {
             message: "ok".to_string(),
             fast_heartbeat_interval_ms: 10_000,
             comprehensive_heartbeat_interval_ms: 30_000,
+            max_exclude_handler_ids: 16,
         }))
     }
     async fn fast_heartbeat(
@@ -96,6 +97,15 @@ impl GlobalControllerService for MockGc {
         &self,
         _request: Request<NotifyMeetingEndedRequest>,
     ) -> Result<Response<NotifyMeetingEndedResponse>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+
+    async fn acquire_media_handler(
+        &self,
+        _request: Request<proto_gen::dark_tower::internal::v1::AcquireMediaHandlerRequest>,
+    ) -> Result<Response<proto_gen::dark_tower::internal::v1::AcquireMediaHandlerResponse>, Status>
+    {
+        // Not exercised by these tests (MC's replacement client lands in MC-C).
         Err(Status::unimplemented("not used"))
     }
 }

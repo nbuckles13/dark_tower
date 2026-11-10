@@ -12,7 +12,6 @@
 use crate::errors::GcError;
 use crate::observability::metrics;
 use chrono::{DateTime, Utc};
-use ring::rand::{SecureRandom, SystemRandom};
 use sqlx::PgPool;
 use std::time::Instant;
 use tracing::instrument;
@@ -125,6 +124,69 @@ impl MeetingAssignmentsRepository {
             grpc_endpoint: r.grpc_endpoint,
             webtransport_endpoint: r.webtransport_endpoint,
         }))
+    }
+
+    /// Region of the ACTIVE assignment of `meeting_id` to `controller_id`
+    /// (the `AcquireMediaHandler` ownership check, ADR-0039 §3).
+    ///
+    /// `Ok(None)` when no active row pairs this meeting with this controller:
+    /// the meeting does not exist, has ended, or is owned by another
+    /// controller. Callers must not distinguish those cases to the peer.
+    ///
+    /// A sibling of [`Self::get_healthy_assignment`] rather than a reuse: that
+    /// query keys on (meeting, region) and joins MC health; this one keys on
+    /// (meeting, controller), ignores MC health, and returns the region.
+    ///
+    /// # Errors
+    ///
+    /// `GcError::Database` on a query failure. `GcError::Internal` when the
+    /// controller holds the meeting in MORE than one region: the primary key
+    /// (meeting_id, region) allows it, and only MCs being region-bound
+    /// prevents it, so it is a broken invariant, never resolved by picking a row.
+    #[instrument(skip_all)]
+    pub async fn get_active_assignment_region(
+        pool: &PgPool,
+        meeting_id: &str,
+        controller_id: &str,
+    ) -> Result<Option<String>, GcError> {
+        let start = Instant::now();
+
+        // Served by idx_assignments_by_region (meeting_id, region) WHERE
+        // ended_at IS NULL. LIMIT 2: enough to detect a second region.
+        let result: Result<Vec<(String,)>, sqlx::Error> = sqlx::query_as(
+            r#"
+            SELECT region
+            FROM meeting_assignments
+            WHERE meeting_id = $1
+              AND meeting_controller_id = $2
+              AND ended_at IS NULL
+            LIMIT 2
+            "#,
+        )
+        .bind(meeting_id)
+        .bind(controller_id)
+        .fetch_all(pool)
+        .await;
+
+        let (status, rows) = match result {
+            Ok(r) => ("success", Ok(r)),
+            Err(e) => ("error", Err(e)),
+        };
+        metrics::record_db_query("get_active_assignment_region", status, start.elapsed());
+
+        let mut rows = rows?;
+        if rows.len() > 1 {
+            tracing::error!(
+                target: "gc.repository.assignments",
+                meeting_id = %meeting_id,
+                controller_id = %controller_id,
+                "Controller holds one meeting in multiple regions (broken invariant)"
+            );
+            return Err(GcError::Internal(
+                "multiple active assignments for one (meeting, controller) pair".to_string(),
+            ));
+        }
+        Ok(rows.pop().map(|(region,)| region))
     }
 
     /// Get candidate MCs for load balancing in a region.
@@ -602,62 +664,6 @@ impl MeetingAssignmentsRepository {
     }
 }
 
-/// Select an MC from candidates using weighted random selection.
-///
-/// Weight is inversely proportional to load ratio:
-/// - 0% loaded = weight 1.0
-/// - 90% loaded = weight 0.1
-///
-/// This prevents thundering herd to a single MC while preferring less-loaded instances.
-pub fn weighted_random_select(candidates: &[McCandidate]) -> Option<&McCandidate> {
-    if candidates.is_empty() {
-        return None;
-    }
-
-    if candidates.len() == 1 {
-        return candidates.first();
-    }
-
-    // Calculate weights: weight = 1.0 - load_ratio (capped at 0.99 to ensure minimum weight)
-    let weights: Vec<f64> = candidates
-        .iter()
-        .map(|mc| 1.0 - mc.load_ratio.min(0.99))
-        .collect();
-
-    let total: f64 = weights.iter().sum();
-    if total <= 0.0 {
-        return candidates.first();
-    }
-
-    // Generate random value using CSPRNG
-    let rng = SystemRandom::new();
-    let mut random_bytes = [0u8; 8];
-    if rng.fill(&mut random_bytes).is_err() {
-        // Fallback to first candidate if CSPRNG fails
-        tracing::warn!(
-            target: "gc.repository.assignments",
-            "CSPRNG failed, falling back to first candidate"
-        );
-        return candidates.first();
-    }
-
-    // Convert bytes to f64 in range [0, 1)
-    let random_u64 = u64::from_le_bytes(random_bytes);
-    let random_f64 = (random_u64 as f64) / (u64::MAX as f64);
-    let mut choice = random_f64 * total;
-
-    // Select based on weight
-    for (i, weight) in weights.iter().enumerate() {
-        choice -= weight;
-        if choice <= 0.0 {
-            return candidates.get(i);
-        }
-    }
-
-    // Fallback to last candidate (floating point edge case)
-    candidates.last()
-}
-
 // ============================================================================
 // Database Row Types
 // ============================================================================
@@ -690,103 +696,6 @@ struct AtomicAssignResult {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_weighted_random_select_empty() {
-        let candidates: Vec<McCandidate> = vec![];
-        assert!(weighted_random_select(&candidates).is_none());
-    }
-
-    #[test]
-    fn test_weighted_random_select_single() {
-        let candidates = vec![McCandidate {
-            controller_id: "mc-1".to_string(),
-            grpc_endpoint: "https://mc1:50051".to_string(),
-            webtransport_endpoint: None,
-            load_ratio: 0.5,
-        }];
-
-        let selected = weighted_random_select(&candidates);
-        assert!(selected.is_some(), "Expected Some, got None");
-        // Safe to use if-let after assert
-        if let Some(mc) = selected {
-            assert_eq!(mc.controller_id, "mc-1");
-        }
-    }
-
-    #[test]
-    fn test_weighted_random_select_multiple_returns_valid() {
-        let candidates = vec![
-            McCandidate {
-                controller_id: "mc-1".to_string(),
-                grpc_endpoint: "https://mc1:50051".to_string(),
-                webtransport_endpoint: None,
-                load_ratio: 0.1, // Low load, high weight
-            },
-            McCandidate {
-                controller_id: "mc-2".to_string(),
-                grpc_endpoint: "https://mc2:50051".to_string(),
-                webtransport_endpoint: None,
-                load_ratio: 0.9, // High load, low weight
-            },
-        ];
-
-        // Run multiple times to verify it always returns a valid candidate
-        for _ in 0..100 {
-            let selected = weighted_random_select(&candidates);
-            assert!(selected.is_some(), "Expected Some, got None");
-            if let Some(mc) = selected {
-                let mc_id = &mc.controller_id;
-                assert!(mc_id == "mc-1" || mc_id == "mc-2");
-            }
-        }
-    }
-
-    #[test]
-    fn test_weighted_random_select_prefers_lower_load() {
-        let candidates = vec![
-            McCandidate {
-                controller_id: "mc-light".to_string(),
-                grpc_endpoint: "https://mc1:50051".to_string(),
-                webtransport_endpoint: None,
-                load_ratio: 0.0, // Empty, weight = 1.0
-            },
-            McCandidate {
-                controller_id: "mc-heavy".to_string(),
-                grpc_endpoint: "https://mc2:50051".to_string(),
-                webtransport_endpoint: None,
-                load_ratio: 0.99, // Almost full, weight = 0.01
-            },
-        ];
-
-        // Run many times and count selections
-        let mut light_count = 0;
-        let mut heavy_count = 0;
-
-        for _ in 0..1000 {
-            let selected = weighted_random_select(&candidates);
-            assert!(selected.is_some(), "weighted_random_select returned None");
-            if let Some(mc) = selected {
-                match mc.controller_id.as_str() {
-                    "mc-light" => light_count += 1,
-                    "mc-heavy" => heavy_count += 1,
-                    other => {
-                        // Fail test if unexpected MC - this should never happen given test setup
-                        assert_eq!(other, "mc-light", "Unexpected MC selected");
-                    }
-                }
-            }
-        }
-
-        // Light should be selected much more often (100x weight difference)
-        // Allow some variance but light should dominate
-        assert!(
-            light_count > heavy_count * 10,
-            "Expected light ({}) to be selected much more than heavy ({})",
-            light_count,
-            heavy_count
-        );
-    }
 
     #[test]
     fn test_mc_candidate_fields() {

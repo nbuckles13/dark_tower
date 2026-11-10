@@ -100,10 +100,12 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   sum(rate(gc_mc_assignments_total[5m]))
   ```
 - **Example — assignment reuse (join stickiness) rate, R-6**:
-  <!-- ANCHOR (DRY): this identity holds only while `select_mhs_for_meeting` has a single
-       callsite, on the new-assignment branch of `assign_meeting_with_mh`
+  <!-- ANCHOR (DRY): this identity holds only while `gc_mh_selections_total` is recorded at a
+       single site, the new-assignment branch of `assign_meeting_with_mh`
        (crates/gc-service/src/services/mc_assignment.rs, which carries the mirror anchor).
-       A second callsite must update this expression. -->
+       `MhSelectionService::select` has a second caller (AcquireMediaHandler) but records no
+       metrics; replacements are `gc_mh_replacement_requests_total`. A second RECORDING site
+       must update this expression. -->
   ```promql
   1 - (
     sum(rate(gc_mh_selections_total{status="success"}[5m]))
@@ -169,9 +171,9 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 - **Description**: Total database queries executed
 - **Labels**:
   - `operation`: Query operation — a CLOSED set of literals passed at the `record_db_query` call sites (the
-    25 in `GC_DB_QUERY_OPERATIONS`, `observability/metrics.rs`); never a runtime string.
+    26 in `GC_DB_QUERY_OPERATIONS`, `observability/metrics.rs`); never a runtime string.
   - `status`: Query outcome (`success`, `error`) — the binary `if is_ok()` result.
-- **Cardinality**: `operation × {success, error}` = 50 series. Every pair is real (each operation can succeed
+- **Cardinality**: `operation × {success, error}` = 52 series. Every pair is real (each operation can succeed
   or fail), so this is a full enumeration, not a sparse pair-set; a domain check may treat it as the product
   of the two closed lists. Zero-initialized (present-at-zero) — the rare error series (e.g. a failing
   `atomic_assign`) are low-volume and were previously masked. `GC_DB_QUERY_OPERATIONS` is the source of truth.
@@ -181,6 +183,8 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   database failure OR a registry-invariant breach observed under the lock (short supersede DELETE, upsert not
   affecting one row: a GC bug). This is the ONLY signal for a registration that failed internally (it records
   no `gc_mh_registrations_total` outcome); the GC error log line distinguishes the two causes.
+- **`get_active_assignment_region`** (story 4 GC-3): the `AcquireMediaHandler` ownership check. `error` also
+  covers a controller found active in more than one region for one meeting (a broken invariant; GC error log).
 - **Usage**: Track database query rates and failures by operation
 - **Example**:
   ```promql
@@ -500,7 +504,9 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
 ### `gc_mh_selections_total`
 - **Type**: Counter
 - **Description**: Total MH selection attempts. Emitted on the **new-assignment path only** — a
-  join into a meeting that already has a healthy assignment performs no MH selection (R-6).
+  join into a meeting that already has a healthy assignment performs no MH selection (R-6). It is
+  1:1 with NEW assignments' selections: replacement selections (`AcquireMediaHandler`, the same
+  selection function) are NOT counted here — see `gc_mh_replacement_requests_total`.
 - **Labels**:
   - `status`: Selection outcome (success, error). `status="error"` is the empty-MH-pool case; since
     R-6 it **cannot fire for a join into an existing meeting** — only a new meeting can hit it.
@@ -530,6 +536,76 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   ```promql
   histogram_quantile(0.95,
     sum(rate(gc_mh_selection_duration_seconds_bucket{status="success"}[5m])) by (le)
+  )
+  ```
+
+### `gc_mh_replacement_requests_total`
+- **Type**: Counter
+- **Description**: `AcquireMediaHandler` requests (MC asking GC for one replacement handler after removing
+  one; ADR-0039 §3), counted ONCE per request at one site (`McService::acquire_media_handler`), on every exit
+  including `INVALID_ARGUMENT`.
+- **Labels**:
+  - `trigger`: `heartbeat_timeout` | `apply_lag` | `planned_transfer` (projected from `ReleaseCause`) |
+    `invalid` (the request's own trigger was UNSPECIFIED, MEETING_ENDED or an unknown number; ONLY with
+    `outcome="invalid_request"`).
+  - `outcome`: `granted` (OK) | `no_capacity` (RESOURCE_EXHAUSTED: no eligible candidate after exclusion) |
+    `not_owner` (FAILED_PRECONDITION: no active assignment pairs the meeting with the caller's
+    self-asserted controller id) | `invalid_request` (INVALID_ARGUMENT: over the cap, a malformed id, or a
+    bad trigger) | `error` (INTERNAL: database failure or broken invariant).
+  - `gc_view`: GC's view of the REPLACED handler at request time, from its registry row: `healthy` |
+    `degraded` | `unhealthy` | `draining` | `pending` (fresh row, by reported status) | `stale` (row older
+    than the MH staleness bound, whatever its status) | `unregistered` (no `replaced_handler_id`, or no
+    row) | `unevaluated` (the request ended before the row was read).
+- **Emitted combinations** (NOT the full cross product; all are zero-initialized): `invalid_request` with
+  any of the 4 triggers and `gc_view="unevaluated"` (4); `not_owner` with a valid trigger and
+  `unevaluated` (3); `granted` / `no_capacity` with a valid trigger and an evaluated view (2 × 3 × 7 = 42);
+  `error` with a valid trigger and any view (3 × 8 = 24). **73 series**, the single statement being
+  `is_emitted_replacement_combination` in `observability/metrics.rs`.
+- **No id labels**: no handler, meeting or controller id (per-incarnation ids churn; ADR-0039 §8). The
+  per-handler source is the `gc.mh.replacement_report` INFO event (below).
+- **Semantics**: `gc_view` is a label, never a veto; selection reads neither it nor `trigger`. It lags MC's
+  detector by design (MC declares at about its heartbeat timeout; GC goes stale at k × the load-report
+  interval), so a real death is usually requested while GC still says `healthy`. The MC/GC disagreement
+  (partition) view is the query `trigger="heartbeat_timeout", gc_view="healthy"`; there is no second counter,
+  and it is NOT the gray-failure discriminator (see the event). Sustained `no_capacity` means the region has no
+  eligible handler for replacements (alert rule: OBS-ALERTS). `invalid_request` rising after a GC config change
+  lowering `GC_MH_MAX_EXCLUDE_HANDLER_IDS` means MCs still hold the old cap (they adopt it on re-registration;
+  `docs/runbooks/gc-deployment.md`).
+- **Example**:
+  ```promql
+  sum by(outcome) (increase(gc_mh_replacement_requests_total[5m]))
+  sum by(trigger, gc_view) (increase(gc_mh_replacement_requests_total{outcome="granted"}[1h]))
+  ```
+
+**`gc.mh.replacement_report` (INFO log event, not a metric).** One per request whose `replaced_handler_id`
+is present and well-formed, on every outcome, with fields `handler_id` (the REPLACED handler),
+`webtransport_endpoint` (from GC's row; omitted when there is no row or it was not read), `controller_id`
+(omitted if malformed; self-asserted), `caller_sub` (the validated service token's subject; omitted without
+claims), `trigger`, `gc_view`, `outcome` (the counter's label strings). `caller_sub` is today the SHARED MC
+client id, identical for every MC replica: it proves the caller held a meeting-controller credential but does
+NOT distinguish MC instances, so it must never be used to count distinct MCs. GC keeps no in-memory
+corroboration window (2+ replicas would undercount), so "distinct MCs per handler within W" is a LOG QUERY over
+this event. **Evidence rule**: only events that passed the ownership check count, i.e. `outcome` = `granted` | `no_capacity`, or `error` with `gc_view` != `unevaluated` (an evaluated view means ownership and the replaced-row read
+succeeded; an `error` with `gc_view="unevaluated"` may be a failed ownership read). `not_owner` and
+`invalid_request` events can be emitted by any meeting-controller token holder naming any handler. Even
+owner-checked events carry a self-asserted `controller_id`, so "distinct MCs" is spoofable by anyone who knows a
+live (meeting_id, controller_id) pair; that is why automatic quarantine waits on authenticated per-instance MC
+identity (`docs/TODO.md`), and a manual drain stays the operator's call. The gray-failure discriminator is a
+handler reported dead (`heartbeat_timeout` | `apply_lag`) by ≥ 2 distinct MCs while STILL load-reporting healthy
+past the staleness bound; it is never `gc_view` at request time.
+
+### `gc_mh_replacement_duration_seconds`
+- **Type**: Histogram
+- **Description**: `AcquireMediaHandler` handling time (validation, ownership read, optional replaced-handler
+  read, candidate query), recorded with the counter above.
+- **Labels**:
+  - `outcome`: as `gc_mh_replacement_requests_total`.
+- **Buckets**: [0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.250, 0.500, 1.000]
+- **Cardinality**: 5 series (histograms are not zero-initialized).
+- **Example**:
+  ```promql
+  histogram_quantile(0.95,
+    sum by(le) (rate(gc_mh_replacement_duration_seconds_bucket[5m]))
   )
   ```
 

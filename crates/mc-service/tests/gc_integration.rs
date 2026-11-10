@@ -169,6 +169,8 @@ impl GlobalControllerService for MockGcServer {
                     message: "Registration accepted".to_string(),
                     fast_heartbeat_interval_ms: self.fast_heartbeat_interval_ms,
                     comprehensive_heartbeat_interval_ms: self.comprehensive_heartbeat_interval_ms,
+                    // GC's shipped default (GC_MH_MAX_EXCLUDE_HANDLER_IDS).
+                    max_exclude_handler_ids: 16,
                 }))
             }
             MockBehavior::Reject => Ok(Response::new(RegisterMcResponse {
@@ -176,6 +178,7 @@ impl GlobalControllerService for MockGcServer {
                 message: "Registration rejected by mock".to_string(),
                 fast_heartbeat_interval_ms: 0,
                 comprehensive_heartbeat_interval_ms: 0,
+                max_exclude_handler_ids: 0,
             })),
         }
     }
@@ -269,6 +272,15 @@ impl GlobalControllerService for MockGcServer {
         Ok(Response::new(NotifyMeetingEndedResponse {
             acknowledged: true,
         }))
+    }
+
+    async fn acquire_media_handler(
+        &self,
+        _request: Request<proto_gen::dark_tower::internal::v1::AcquireMediaHandlerRequest>,
+    ) -> Result<Response<proto_gen::dark_tower::internal::v1::AcquireMediaHandlerResponse>, Status>
+    {
+        // Not exercised by these tests (MC's replacement client lands in MC-C).
+        Err(Status::unimplemented("not used"))
     }
 }
 

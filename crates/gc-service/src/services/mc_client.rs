@@ -173,14 +173,8 @@ impl McClient {
         };
 
         // Build the request
-        let proto_assignments: Vec<MhAssignment> = mh_assignments
-            .iter()
-            .map(|mh| MhAssignment {
-                mh_id: mh.mh_id.clone(),
-                webtransport_endpoint: mh.webtransport_endpoint.clone(),
-                grpc_endpoint: mh.grpc_endpoint.clone(),
-            })
-            .collect();
+        let proto_assignments: Vec<MhAssignment> =
+            mh_assignments.iter().map(MhAssignment::from).collect();
 
         let request = AssignMeetingWithMhRequest {
             meeting_id: meeting_id.to_string(),

@@ -643,6 +643,7 @@ async fn test_mh_selection_includes_multiple_handlers(pool: PgPool) {
                 shipped.staleness_multiplier(),
                 shipped.retention().as_secs(),
                 2,
+                u64::from(shipped.max_exclude_handler_ids()),
             )
             .expect("valid registry")
         },

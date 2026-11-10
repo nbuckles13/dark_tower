@@ -1,6 +1,8 @@
 //! Meeting Controller gRPC service implementation.
 //!
-//! Implements the `GlobalControllerService` trait for MC registration and heartbeat.
+//! Implements the `GlobalControllerService` trait for MC registration,
+//! heartbeat, meeting-end notification and the `AcquireMediaHandler`
+//! replacement grant (ADR-0039 §3; logic in `services::mh_replacement`).
 //!
 //! # Security
 //!
@@ -8,17 +10,21 @@
 //! - Input validation performed on all requests
 //! - Generic error messages returned to prevent information leakage
 
-use crate::observability::metrics;
+use crate::auth::Claims;
+use crate::observability::metrics::{self, GcView, ReplacementTrigger};
 use crate::repositories::{HealthStatus, MeetingControllersRepository};
 use crate::routes::AppState;
+use crate::services::mh_replacement::{self, Rejection, Report, Validated};
+use crate::services::weighted_pick::{SelectionRng, SystemSelectionRng};
 use crate::services::McAssignmentService;
 use proto_gen::dark_tower::internal::v1::global_controller_service_server::GlobalControllerService;
 use proto_gen::dark_tower::internal::v1::{
-    ComprehensiveHeartbeatRequest, ComprehensiveHeartbeatResponse, FastHeartbeatRequest,
-    FastHeartbeatResponse, NotifyMeetingEndedRequest, NotifyMeetingEndedResponse,
-    RegisterMcRequest, RegisterMcResponse,
+    AcquireMediaHandlerRequest, AcquireMediaHandlerResponse, ComprehensiveHeartbeatRequest,
+    ComprehensiveHeartbeatResponse, FastHeartbeatRequest, FastHeartbeatResponse, MhAssignment,
+    NotifyMeetingEndedRequest, NotifyMeetingEndedResponse, RegisterMcRequest, RegisterMcResponse,
 };
 use std::sync::Arc;
+use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
@@ -34,20 +40,96 @@ const MAX_CONTROLLER_ID_LENGTH: usize = 255;
 /// Maximum allowed meeting ID length.
 const MAX_MEETING_ID_LENGTH: usize = 255;
 
-/// Maximum allowed region length.
-const MAX_REGION_LENGTH: usize = 50;
-
 /// Meeting Controller gRPC service.
 ///
 /// Handles registration and heartbeat requests from Meeting Controllers.
 pub struct McService {
     state: Arc<AppState>,
+    /// Draw source for `AcquireMediaHandler` selection: the system CSPRNG in
+    /// production; a seeded source only via [`Self::with_selection_rng`].
+    selection_rng: Arc<dyn SelectionRng>,
 }
 
 impl McService {
     /// Create a new MC service with the given application state.
     pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
+        Self::with_selection_rng(state, Arc::new(SystemSelectionRng))
+    }
+
+    /// TEST SEAM: inject the selection draw source, so a test can prove that
+    /// `AcquireMediaHandler` selection is identical with and without
+    /// replacement evidence (ADR-0039 §9, seeded RNG). Production uses
+    /// [`Self::new`].
+    pub fn with_selection_rng(state: Arc<AppState>, selection_rng: Arc<dyn SelectionRng>) -> Self {
+        Self {
+            state,
+            selection_rng,
+        }
+    }
+
+    /// Validate an `AcquireMediaHandler` request, cheapest reject first.
+    ///
+    /// On rejection, returns the bounded status and a [`Report`] holding only
+    /// VALIDATED values (a malformed id never reaches a log or a label). The
+    /// trigger is projected before any check, so its label is always defined.
+    fn validate_acquire(
+        req: AcquireMediaHandlerRequest,
+        max_exclude_handler_ids: u32,
+    ) -> Result<Validated, (Rejection, Report)> {
+        let AcquireMediaHandlerRequest {
+            meeting_id,
+            controller_id,
+            exclude_handler_ids,
+            trigger,
+            replaced_handler_id,
+        } = req;
+
+        // Each check runs ONCE; its result feeds both the gate and the Report
+        // (which may carry only values that passed).
+        let trigger = mh_replacement::project_trigger(trigger);
+        let replaced_check = replaced_handler_id
+            .as_deref()
+            .map(|id| super::validate_handler_id(id, "replaced_handler_id"));
+        let controller_check = Self::validate_controller_id(&controller_id);
+        let report = Report {
+            trigger: trigger.unwrap_or(ReplacementTrigger::Invalid),
+            gc_view: GcView::Unevaluated,
+            replaced_handler_id: replaced_handler_id
+                .clone()
+                .filter(|_| matches!(replaced_check, Some(Ok(())))),
+            webtransport_endpoint: None,
+            controller_id: controller_check.is_ok().then(|| controller_id.clone()),
+        };
+        let invalid = |status: Status| (Rejection::InvalidRequest(status), report.clone());
+
+        // The cap is on the RAW list length (duplicates count), checked before
+        // any per-id work.
+        let cap = usize::try_from(max_exclude_handler_ids).unwrap_or(usize::MAX);
+        if exclude_handler_ids.len() > cap {
+            return Err(invalid(Status::invalid_argument(
+                "exclude_handler_ids exceeds max_exclude_handler_ids",
+            )));
+        }
+        Self::validate_meeting_id(&meeting_id).map_err(invalid)?;
+        controller_check.map_err(invalid)?;
+        for id in &exclude_handler_ids {
+            super::validate_handler_id(id, "exclude_handler_ids").map_err(invalid)?;
+        }
+        if let Some(check) = replaced_check {
+            check.map_err(invalid)?;
+        }
+        let Some(trigger) = trigger else {
+            return Err(invalid(Status::invalid_argument(
+                "trigger must be HEARTBEAT_TIMEOUT, APPLY_LAG or PLANNED_TRANSFER",
+            )));
+        };
+        Ok(Validated {
+            meeting_id,
+            controller_id,
+            exclude: exclude_handler_ids,
+            trigger,
+            replaced_handler_id,
+        })
     }
 
     /// Refresh the registered controllers gauge metric.
@@ -86,7 +168,7 @@ impl McService {
         // Allow alphanumeric, hyphens, and underscores
         if !id
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
             return Err(Status::invalid_argument(
                 "controller_id contains invalid characters",
@@ -106,22 +188,11 @@ impl McService {
         // Allow alphanumeric, hyphens, and underscores (same as controller_id)
         if !id
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
             return Err(Status::invalid_argument(
                 "meeting_id contains invalid characters",
             ));
-        }
-        Ok(())
-    }
-
-    /// Validate a region.
-    fn validate_region(region: &str) -> Result<(), Status> {
-        if region.is_empty() {
-            return Err(Status::invalid_argument("region is required"));
-        }
-        if region.len() > MAX_REGION_LENGTH {
-            return Err(Status::invalid_argument("region is too long"));
         }
         Ok(())
     }
@@ -177,7 +248,7 @@ impl GlobalControllerService for McService {
 
         // Validate request fields
         Self::validate_controller_id(&req.id)?;
-        Self::validate_region(&req.region)?;
+        super::validate_region(&req.region)?;
         Self::validate_endpoint(&req.grpc_endpoint, "grpc_endpoint")?;
 
         // WebTransport endpoint is optional but validate if present
@@ -232,6 +303,8 @@ impl GlobalControllerService for McService {
             message: "Registration successful".to_string(),
             fast_heartbeat_interval_ms: DEFAULT_FAST_HEARTBEAT_INTERVAL_MS,
             comprehensive_heartbeat_interval_ms: DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL_MS,
+            // The same config value AcquireMediaHandler enforces.
+            max_exclude_handler_ids: self.state.config.mh_registry.max_exclude_handler_ids(),
         }))
     }
 
@@ -357,6 +430,63 @@ impl GlobalControllerService for McService {
         }))
     }
 
+    /// Grant one replacement media handler (ADR-0039 §3).
+    ///
+    /// Thin: validate → `mh_replacement::acquire` → record the counter,
+    /// histogram and `gc.mh.replacement_report` event ONCE → map to a status.
+    /// Every exit, including `INVALID_ARGUMENT`, passes the single recording
+    /// site. No retry inside GC; MC owns backoff.
+    #[instrument(skip_all, name = "gc.grpc.acquire_media_handler")]
+    async fn acquire_media_handler(
+        &self,
+        request: Request<AcquireMediaHandlerRequest>,
+    ) -> Result<Response<AcquireMediaHandlerResponse>, Status> {
+        let start = Instant::now();
+        // Absent when no auth layer injected claims (test rigs): omitted.
+        let caller_sub = request.extensions().get::<Claims>().map(|c| c.sub.clone());
+        let req = request.into_inner();
+        let registry = &self.state.config.mh_registry;
+
+        let (result, report) = match Self::validate_acquire(req, registry.max_exclude_handler_ids())
+        {
+            Ok(validated) => {
+                mh_replacement::acquire(
+                    &self.state.pool,
+                    registry,
+                    &validated,
+                    self.selection_rng.as_ref(),
+                )
+                .await
+            }
+            Err((rejection, report)) => (Err(rejection), report),
+        };
+
+        let outcome = mh_replacement::outcome(&result);
+        metrics::record_mh_replacement(report.trigger, outcome, report.gc_view, start.elapsed());
+        mh_replacement::emit_report(&report, outcome, caller_sub.as_deref());
+
+        match result {
+            Ok(handler) => Ok(Response::new(AcquireMediaHandlerResponse {
+                assignment: Some(MhAssignment::from(handler)),
+            })),
+            Err(Rejection::InvalidRequest(status)) => Err(status),
+            Err(Rejection::NotOwner) => Err(Status::failed_precondition(
+                "caller is not the meeting's controller",
+            )),
+            Err(Rejection::NoCapacity) => {
+                Err(Status::resource_exhausted("no media handler available"))
+            }
+            Err(Rejection::Error(e)) => {
+                tracing::error!(
+                    target: "gc.grpc.acquire_media_handler",
+                    error = %e,
+                    "AcquireMediaHandler failed"
+                );
+                Err(Status::internal("Replacement failed"))
+            }
+        }
+    }
+
     /// Handle meeting ended notification from a Meeting Controller.
     ///
     /// Called when a meeting ends (last participant leaves). Marks the
@@ -372,7 +502,7 @@ impl GlobalControllerService for McService {
         Self::validate_meeting_id(&req.meeting_id)?;
 
         // Validate region
-        Self::validate_region(&req.region)?;
+        super::validate_region(&req.region)?;
 
         // End the assignment
         let count = McAssignmentService::end_assignment(
@@ -444,18 +574,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_region_valid() {
-        assert!(McService::validate_region("us-east-1").is_ok());
-        assert!(McService::validate_region("eu-west-1").is_ok());
-    }
-
-    #[test]
-    fn test_validate_region_empty() {
-        let err = McService::validate_region("").unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[test]
     fn test_validate_endpoint_valid() {
         assert!(McService::validate_endpoint("http://localhost:50051", "test").is_ok());
         assert!(McService::validate_endpoint("https://mc.example.com:443", "test").is_ok());
@@ -520,25 +638,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_region_at_50_chars() {
-        // Exactly at the limit (50 chars)
-        let region_50 = "r".repeat(50);
-        assert!(
-            McService::validate_region(&region_50).is_ok(),
-            "Region at 50 chars should pass"
-        );
-    }
-
-    #[test]
-    fn test_validate_region_at_51_chars() {
-        // One over the limit (51 chars)
-        let region_51 = "r".repeat(51);
-        let err = McService::validate_region(&region_51).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("too long"));
-    }
-
-    #[test]
     fn test_validate_endpoint_at_255_chars() {
         // Exactly at the limit (255 chars) - need valid URL scheme
         // "https://" is 8 chars, so 247 more chars needed
@@ -564,15 +663,6 @@ mod tests {
         assert!(
             McService::validate_controller_id("a").is_ok(),
             "Controller ID with 1 char should pass"
-        );
-    }
-
-    #[test]
-    fn test_validate_region_at_1_char() {
-        // Minimum valid length (1 char)
-        assert!(
-            McService::validate_region("r").is_ok(),
-            "Region with 1 char should pass"
         );
     }
 
@@ -631,6 +721,18 @@ mod tests {
         let err = McService::validate_meeting_id("meeting@special").unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("invalid characters"));
+    }
+
+    /// ASCII only: a Unicode homoglyph or fullwidth digit is rejected (these
+    /// ids reach the operator-facing replacement evidence log).
+    #[test]
+    fn test_validate_ids_reject_non_ascii() {
+        for id in ["mc-\u{0430}", "\u{FF11}"] {
+            let err = McService::validate_controller_id(id).unwrap_err();
+            assert!(err.message().contains("invalid characters"), "{id:?}");
+            let err = McService::validate_meeting_id(id).unwrap_err();
+            assert!(err.message().contains("invalid characters"), "{id:?}");
+        }
     }
 
     #[test]

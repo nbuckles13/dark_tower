@@ -519,6 +519,14 @@ Expected: `gc_http_requests_total` counter increasing over time.
 
 ### How to Rollback
 
+**Rollback floor: `max_exclude_handler_ids` (Story 4 GC-3).** GC-3 added
+`RegisterMCResponse.max_exclude_handler_ids` (from `GC_MH_MAX_EXCLUDE_HANDLER_IDS`), and
+MC-C makes an MC refuse to register when it is zero or absent. **Once MC-C is deployed, do not
+roll GC back past GC-3 (the commit that adds `max_exclude_handler_ids`) without first rolling MC
+back past MC-C.** An older GC sends 0, so every MC (re)registration fails fleet-wide and no new
+meeting gets an MC. An older GC also answers `AcquireMediaHandler` with `UNIMPLEMENTED`. Before
+MC-C is deployed, GC rollback past GC-3 is safe (the field and rpc are additive and unused).
+
 **Step 1: Identify previous version**
 
 ```bash
@@ -625,6 +633,7 @@ psql $DATABASE_URL
 | `GC_MH_STALENESS_MULTIPLIER` | **Yes** | k in B = k × `GC_MH_LOAD_REPORT_INTERVAL_MS`, the ONE MH freshness bound (selection, stale sweep incl. draining, `gc_mh_available`); range [2, 10]. Published as `gc_mh_staleness_threshold_seconds`. Takes effect when GC rolls. Raising k is always safe; lowering k shrinks B immediately and follows the same cadence-below-every-replica's-B rule as the interval. | Reference `3` | `3` |
 | `GC_MH_REGISTRY_RETENTION_SECONDS` | **Yes** | Registry rows with no load report for this long are deleted on the MH health-checker tick (rows are per MH incarnation). Must exceed B (compared in ms) and be at most `2592000` (30 d); otherwise startup fails. | Reference `3600` | `3600` |
 | `GC_MH_INITIAL_HANDLERS_PER_MEETING` | **Yes** | MHs selected for a NEW meeting (fewer if fewer are selectable); range [1, 4]. Existing meetings are unaffected. | Reference `2` | `2` |
+| `GC_MH_MAX_EXCLUDE_HANDLER_IDS` | **Yes** | Cap on `AcquireMediaHandlerRequest.exclude_handler_ids` (ADR-0039 §3): pushed to every MC in `RegisterMCResponse.max_exclude_handler_ids` and enforced by `AcquireMediaHandler` (longer lists are `INVALID_ARGUMENT`, `gc_mh_replacement_requests_total{outcome="invalid_request"}`). Range [4, 64]; startup refuses a value ≤ `GC_MH_INITIAL_HANDLERS_PER_MEETING`. MC derives its per-meeting attempt bound as cap − current set size, and removed handlers stay excluded for the meeting's life, so a meeting gets about 14 lifetime replacements at the default (16 − 2 initial), then MC stops acquiring (`rate_limited`). **Changes reach an MC only when it re-registers.** Raising is safe: roll GC, then roll MC so each MC adopts the new cap. Lowering: roll GC, then roll MC right after; until each MC re-registers, its replacement requests whose exclude list is longer than the new cap fail, visible as `gc_mh_replacement_requests_total{outcome="invalid_request"}` rising after the GC roll. | Reference `16` | `16` |
 | `GC_MH_WT_ALLOWED_HOSTS` | **Yes** | RegisterMH arm 0, client-facing zone: hosts an MH may advertise in `webtransport_endpoint` (scheme is `https`, fixed in code). Comma-separated exact hosts (DNS name or IP literal) or `.suffix` entries (label boundary, never the apex, never an IP host). Empty, `*`, `.` or a malformed entry fails startup naming the key. Narrowing it does NOT evict registered MHs (existing rows are not re-validated); it affects new registrations only. To change Kind's value change the kind-config / helper port table and redeploy; never edit `config.env`. | **Rendered per environment** (base `config.env` is EMPTY: GC refuses to start without the render). Kind: `deploy.sh` (`gc_mh_allowlist_literals`), from the MH slot table's advertised hosts | host-mode `127.0.0.1` (devloop: the cluster's `DT_HOST_GATEWAY_IP`). Live values: see the command under this table. |
 | `GC_MH_WT_ALLOWED_PORTS` | **Yes** | RegisterMH arm 0, client-facing ports (1–65535; explicit port required in the endpoint). Same change and re-validation rules as the hosts key. | **Rendered per environment** (base `config.env` is EMPTY: GC refuses to start without the render). Kind: `deploy.sh` (`gc_mh_allowlist_literals`), from the slot table's host ports | host-mode `4440`–`4445` (devloop: the helper's per-slug slot ports) |
 | `GC_MH_GRPC_ALLOWED_SCHEMES` | **Yes** | RegisterMH arm 0, internal zone: schemes allowed in `grpc_endpoint` (lowercase URI scheme tokens, whole-token match). **`grpc` = cleartext h2c, unauthenticated**: no TLS and no peer authentication of the MH server, so MC's bearer crosses that channel in cleartext (S6, `docs/TODO.md` §Media Path Obligations). The allowlist bounds where MC sends its credential; it is not peer authentication and does not close S6. Flips by config only to a TLS scheme when S6 mTLS lands. | Base `config.env` value (policy, not topology) | `grpc` |
@@ -638,7 +647,7 @@ generations are never pruned, so a label-selector listing would mix stale and li
 kubectl get cm -n dark-tower "$(kubectl get deploy gc-service -n dark-tower -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="GC_MH_WT_ALLOWED_HOSTS")].valueFrom.configMapKeyRef.name}')" -o yaml | grep GC_MH_
 ```
 
-The `GC_MH_*` registry and allowlist keys have no compiled-in default. The four registry keys' reference
+The `GC_MH_*` registry and allowlist keys have no compiled-in default. The five registry keys' reference
 values live in `infra/services/gc-service/config.env`; of the five allowlist keys only
 `GC_MH_GRPC_ALLOWED_SCHEMES` does, and the four topology keys are EMPTY there by design (a converge that skips
 the deploy render leaves the new GC ReplicaSet in `CrashLoopBackOff` naming the key while the old pods keep

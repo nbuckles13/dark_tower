@@ -17,8 +17,9 @@
 
 use crate::common::alert_rule_files::{rule_exprs, yaml_value_to_json};
 use crate::common::metric_catalog::CATALOG_HEAD_RE;
+use crate::common::promql::service_metric_refs;
 use crate::common::scan::warn_skip;
-use crate::common::services::{CANONICAL_SERVICES, SERVICE_METRIC_PREFIX_RE};
+use crate::common::services::CANONICAL_SERVICES;
 use crate::common::status::emit_ok;
 use crate::metric_macros::MACRO_INVOCATION_WITH_FIRST_ARG_RE;
 use anyhow::{Context, Result};
@@ -159,11 +160,7 @@ fn extract_dashboard_metric_refs(repo_root: &Path) -> Vec<(String, HashSet<Strin
             };
             for t in targets {
                 if let Some(expr) = t.get("expr").and_then(Value::as_str) {
-                    for caps in SERVICE_METRIC_PREFIX_RE.captures_iter(expr) {
-                        if let Some(m) = caps.get(1) {
-                            metrics.insert(m.as_str().to_string());
-                        }
-                    }
+                    metrics.extend(service_metric_refs(expr));
                 }
             }
         }
@@ -211,11 +208,7 @@ fn extract_alert_expr_metric_refs(repo_root: &Path) -> Vec<(String, HashSet<Stri
         let json = yaml_value_to_json(doc);
         let mut metrics = HashSet::new();
         for r in rule_exprs(&json) {
-            for caps in SERVICE_METRIC_PREFIX_RE.captures_iter(&r.expr) {
-                if let Some(m) = caps.get(1) {
-                    metrics.insert(m.as_str().to_string());
-                }
-            }
+            metrics.extend(service_metric_refs(&r.expr));
         }
         out.push((name.to_string(), metrics));
     }

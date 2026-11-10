@@ -23,7 +23,10 @@ use tracing::instrument;
 /// Must stay >= the maximum `GC_MH_INITIAL_HANDLERS_PER_MEETING`, or
 /// selection could return fewer handlers than configured with more available.
 /// Enforced at compile time below.
-const LOAD_BALANCING_CANDIDATE_COUNT: i64 = 5;
+///
+/// `pub` only so tests can size their seeding from it (the exclude-before-LIMIT
+/// and eligibility-matrix tests seed `COUNT + 1` rows) instead of retyping 5.
+pub const LOAD_BALANCING_CANDIDATE_COUNT: i64 = 5;
 const _: () = assert!(
     LOAD_BALANCING_CANDIDATE_COUNT > 0
         && LOAD_BALANCING_CANDIDATE_COUNT.unsigned_abs()
@@ -681,21 +684,31 @@ impl MediaHandlersRepository {
 
     /// Get candidate MHs for load balancing in a region.
     ///
-    /// Returns up to 5 healthy MHs with capacity and a load report within the
-    /// staleness bound, ordered by load ratio (least loaded first). Only
-    /// `health_status = 'healthy'` qualifies, so a draining, degraded, pending
-    /// or unhealthy MH is never a candidate (ADR-0039 §7).
+    /// Returns up to `LOAD_BALANCING_CANDIDATE_COUNT` healthy MHs with capacity
+    /// and a load report within the staleness bound, not in `exclude`, ordered
+    /// by load ratio (least loaded first). Only `health_status = 'healthy'`
+    /// qualifies, so a draining, degraded, pending or unhealthy MH is never a
+    /// candidate (ADR-0039 §7).
+    ///
+    /// The exclusion is applied INSIDE the query, before the least-loaded cut
+    /// (ADR-0039 §3): filtering after the `LIMIT` could return nothing while
+    /// eligible handlers exist. Ids in `exclude` that match no row are simply
+    /// inert. This SQL is the one production copy of the predicate; the
+    /// `eligibility_predicate_matches_sql` matrix in
+    /// `tests/mh_replacement_tests.rs` proves it against a Rust oracle.
     ///
     /// # Arguments
     ///
     /// * `pool` - Database connection pool
     /// * `region` - Deployment region
     /// * `staleness_bound` - The MH staleness bound (`MhRegistryConfig::staleness_bound`)
-    #[instrument(skip_all, fields(region = %region))]
+    /// * `exclude` - Handler ids never to return (empty for initial allocation)
+    #[instrument(skip_all, fields(region = %region, exclude_count = exclude.len()))]
     pub async fn get_candidate_mhs(
         pool: &PgPool,
         region: &str,
         staleness_bound: Duration,
+        exclude: &[String],
     ) -> Result<Vec<MhCandidate>, GcError> {
         let bound_ms = bind_ms(staleness_bound)?;
         let start = Instant::now();
@@ -715,12 +728,14 @@ impl MediaHandlersRepository {
               AND region = $1
               AND current_streams < max_streams
               AND last_heartbeat_at > NOW() - $2 * INTERVAL '1 millisecond'
+              AND NOT (handler_id = ANY($3::text[]))
             ORDER BY load_ratio ASC, last_heartbeat_at DESC
-            LIMIT $3
+            LIMIT $4
             "#,
         )
         .bind(region)
         .bind(bound_ms)
+        .bind(exclude)
         .bind(LOAD_BALANCING_CANDIDATE_COUNT)
         .fetch_all(pool)
         .await;
@@ -753,6 +768,11 @@ impl MediaHandlersRepository {
     /// # Returns
     ///
     /// Returns `Some(MediaHandler)` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// `GcError::Database` on a query failure; `GcError::Internal` for a row
+    /// whose `health_status` is outside the schema's CHECK set.
     #[instrument(skip_all, fields(handler_id = %handler_id))]
     pub async fn get_handler(
         pool: &PgPool,
@@ -791,14 +811,23 @@ impl MediaHandlersRepository {
         };
         metrics::record_db_query("get_handler", status, start.elapsed());
 
-        Ok(row?.map(|r| MediaHandler {
+        let Some(r) = row? else {
+            return Ok(None);
+        };
+        // Strict: the column is CHECK-constrained, so an unknown status is a
+        // contract fault. Fail loudly rather than read it as `unhealthy`
+        // (AcquireMediaHandler's `gc_view` label is derived from it).
+        let health_status = HealthStatus::try_from_db_str(&r.health_status).ok_or_else(|| {
+            GcError::Internal("media_handlers row has an unknown health_status".to_string())
+        })?;
+        Ok(Some(MediaHandler {
             handler_id: r.handler_id,
             region: r.region,
             webtransport_endpoint: r.webtransport_endpoint,
             grpc_endpoint: r.grpc_endpoint,
             max_streams: r.max_streams,
             current_streams: r.current_streams,
-            health_status: HealthStatus::from_db_str(&r.health_status),
+            health_status,
             cpu_usage_percent: r.cpu_usage_percent,
             memory_usage_percent: r.memory_usage_percent,
             bandwidth_usage_percent: r.bandwidth_usage_percent,

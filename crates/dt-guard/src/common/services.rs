@@ -100,7 +100,14 @@ pub const CANONICAL_SERVICES: &[(&str, &str)] = &[
 /// Service-metric reference in PromQL expressions: matches the prefix list
 /// in `CANONICAL_SERVICES` followed by `_<metric-name>`. Capture group 1 =
 /// full metric name (`ac_token_validations_total`, `mh_active_connections`,
-/// etc.). Consumers walk `captures_iter` and read group 1.
+/// etc.).
+///
+/// `pub(crate)` on purpose: run raw over a PromQL expr it also matches label
+/// NAMES that share a service prefix (e.g. `gc_view`). Nothing outside
+/// dt-guard can use it; inside the crate, guards go through
+/// `common::promql::service_metric_refs` (which masks strings/comments and
+/// strips label positions first), and only this module's own regex tests read
+/// it raw.
 ///
 /// Pattern is `\b((?:ac|gc|mc|mh)_[a-z][a-z0-9_]*)`. The alternation is
 /// constructed dynamically from `CANONICAL_SERVICES` so adding a service
@@ -110,7 +117,7 @@ pub const CANONICAL_SERVICES: &[(&str, &str)] = &[
     clippy::expect_used,
     reason = "canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
 )]
-pub static SERVICE_METRIC_PREFIX_RE: Lazy<Regex> = Lazy::new(|| {
+pub(crate) static SERVICE_METRIC_PREFIX_RE: Lazy<Regex> = Lazy::new(|| {
     let alternation: Vec<&str> = CANONICAL_SERVICES.iter().map(|(p, _)| *p).collect();
     let pattern = format!(r"\b((?:{})_[a-z][a-z0-9_]*)", alternation.join("|"));
     Regex::new(&pattern).expect("static pattern compiles")

@@ -1,14 +1,15 @@
-//! P0 Smoke Tests: GC Deployment Configuration (story 4 GC-1: R-24, R-26; GC-2: R-25 wiring)
+//! P0 Smoke Tests: GC Deployment Configuration (story 4 GC-1: R-24, R-26; GC-2: R-25 wiring; GC-3: R-23 cap wiring)
 //!
 //! The GC counterpart of `02_mc_deployment_config.rs`, run against the LIVE
 //! cluster, never a local render. GC has one Deployment with N replicas and no
 //! `instance` label, so pods are found by `gc_fleet::GC_SELECTOR` and EVERY serving
 //! replica is checked (per pod, never one pod standing in for all):
 //!
-//! - **Wiring.** Each key in [`MH_REGISTRY_KEYS`] is a HARD
+//! - **Wiring.** Each key in `gc_fleet::MH_REGISTRY_KEYS` (a drift-tested
+//!   mirror of GC's list, including GC-3's `GC_MH_MAX_EXCLUDE_HANDLER_IDS`) is a HARD
 //!   `configMapKeyRef`, with `key` == env name, to the ONE live generation of
 //!   `gc-service-config` that every GC pod resolves, and its value parses. For
-//!   retention and the initial handler count this is the only in-cluster
+//!   retention, the initial handler count and the exclude cap this is the only in-cluster
 //!   evidence (they have no gauge). The GC-2 endpoint-allowlist keys
 //!   (`gc_fleet::MH_ENDPOINT_ALLOWLIST_KEYS`) are hard refs with non-empty
 //!   values; `44_gc_mh_registration.rs` proves the values admit real slots.
@@ -68,22 +69,13 @@ use env_tests::fixtures::deployment_config::{
 };
 use env_tests::fixtures::gc_fleet::{
     deployed_bound_and_interval_ms, live_gc_pods, GC_CONFIGMAP, GC_CONTAINER as CONTAINER,
-    HEALTHY_PER_REPLICA_PROMQL, INTERVAL_KEY, MH_ENDPOINT_ALLOWLIST_KEYS, MULTIPLIER_KEY,
+    HEALTHY_PER_REPLICA_PROMQL, INTERVAL_KEY, MH_ENDPOINT_ALLOWLIST_KEYS, MH_REGISTRY_KEYS,
+    MULTIPLIER_KEY,
 };
 use env_tests::fixtures::kube::{live_mh_pods, REDEPLOY_HINT};
 use env_tests::fixtures::metrics::poll_until_pinned_instance;
 use env_tests::fixtures::mh_config::{gauge_verdict, Conversion, GaugeVerdict};
 use env_tests::fixtures::PrometheusClient;
-
-/// Every GC-1 key, wired into the GC container as a HARD ref. All four are
-/// REQUIRED reads with a lower bound of at least 1, so the shape is
-/// PositiveInteger. Ranges stay with the reader (`crates/gc-service/src/config.rs`).
-const MH_REGISTRY_KEYS: &[&str] = &[
-    INTERVAL_KEY,
-    MULTIPLIER_KEY,
-    "GC_MH_REGISTRY_RETENTION_SECONDS",
-    "GC_MH_INITIAL_HANDLERS_PER_MEETING",
-];
 
 /// How long a startup gauge may take to be scraped for a pod.
 const GAUGE_PRESENT_BOUND: Duration = Duration::from_secs(60);
@@ -94,8 +86,11 @@ async fn test_gc_mh_registry_keys_wired_into_every_gc_pod() {
     assert!(!MH_REGISTRY_KEYS.is_empty());
     let gc = live_gc_pods().await;
     let cm = fetch_configmap(&gc.configmap);
+    // Every MH registry key (the drift-tested mirror of GC's list) is a HARD
+    // ref with a PositiveInteger value; ranges stay with the reader
+    // (`crates/gc-service/src/config.rs`).
     for pod in &gc.items {
-        for &key in MH_REGISTRY_KEYS {
+        for key in MH_REGISTRY_KEYS {
             check_key_ref(pod, CONTAINER, key, &gc.configmap, RefKind::Hard)
                 .unwrap_or_else(|e| panic!("{e}"));
             check_shape(

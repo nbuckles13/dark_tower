@@ -516,4 +516,16 @@ for field in handlerRef handlerSetVersion; do
 done
 assert_oneof_case "${SIG}" mediaHandlerSet
 
+# Story 4 GC-3 (ADR-0039 §3) — the MC→GC replacement grant and the GC-owned
+# exclude-list cap. Presence only: GC-3 is additive. The rpc itself is checked
+# by Rust compilation (the tonic server trait gains `acquire_media_handler`).
+for symbol in AcquireMediaHandlerRequest AcquireMediaHandlerResponse; do
+  assert_exported "${INT}" "${symbol}"
+done
+for field in meetingId controllerId excludeHandlerIds trigger replacedHandlerId; do
+  assert_message_field "${INT}" AcquireMediaHandlerRequest "${field}"
+done
+assert_message_field "${INT}" AcquireMediaHandlerResponse assignment
+assert_message_field "${INT}" RegisterMCResponse maxExcludeHandlerIds
+
 echo "verify-codegen: all checks passed"

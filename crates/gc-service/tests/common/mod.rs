@@ -21,7 +21,9 @@
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod event_capture;
 pub mod grpc_auth;
 pub mod jwt_fixtures;
+pub mod mc_grpc;
 pub mod mh_registry;
 pub mod otel_support;

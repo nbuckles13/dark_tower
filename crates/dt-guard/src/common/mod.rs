@@ -21,6 +21,7 @@ pub mod metric_catalog;
 pub mod path_safety;
 pub mod pii_vocabulary;
 pub mod pod_spec;
+pub mod promql;
 pub mod proto_files;
 pub mod proto_lex;
 pub mod rust_consts;

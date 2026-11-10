@@ -21,8 +21,9 @@ use crate::common::kind_labels::{co_occurrence_gap, co_occurrence_message, KIND_
 use crate::common::metric_catalog::parse_annotations;
 use crate::common::metric_catalog::{parse_annotations_dir, MetricAnnotations, CATALOG_HEAD_RE};
 use crate::common::path_safety::to_repo_relative;
+use crate::common::promql::{mask, service_metric_refs, strip_label_positions};
 use crate::common::scan::warn_skip;
-use crate::common::services::{CANONICAL_SERVICES, SERVICE_METRIC_PREFIX_RE};
+use crate::common::services::CANONICAL_SERVICES;
 use crate::common::status::emit_ok;
 use crate::ignore::is_lazy_reason;
 use crate::ignore::IGNORE_MARKER_HASH_RE;
@@ -98,17 +99,6 @@ static RATE_WINDOW_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\b(rate|increase|irate)\s*\(\s*[^)]*?\[([^\]]+)\]\s*\)")
         .expect("static pattern compiles")
 });
-
-// PromQL label-matcher span `{…}`. Removed before the Category-B `/` test so a
-// `/` inside a quoted label value is not misread as a division (INFRA-F1). Label
-// matchers do not nest, so `[^}]*` is exact.
-#[expect(
-    clippy::disallowed_methods,
-    clippy::expect_used,
-    reason = "canonical-home static-regex initializer; pattern compiles at load-time or binary fails — ADR-0034 §6 + ADR-0002 §expect-over-allow"
-)]
-static LABEL_MATCHER_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\{[^}]*\}").expect("static pattern compiles"));
 
 // TEMPLATED_DS_RE moved to canonical-home `common::grafana::GRAFANA_TEMPLATE_VAR_RE`
 // per @dry-reviewer F-DRY-4 2026-05-19.
@@ -266,19 +256,6 @@ fn strip_hist_suffix(metric: &str) -> (String, Option<&'static str>) {
         }
     }
     (metric.to_string(), None)
-}
-
-/// Remove PromQL label-matcher `{…}` spans from an expression.
-///
-/// INFRA-F1: the Category-B test (`is_category_b`) keys on a `/` in the expr, but
-/// a `/` can appear INSIDE a quoted label-matcher value (e.g. `{path="/health"}`)
-/// where it is not a division. Testing the de-matched expr keeps such a value from
-/// misclassifying a Category-A `*_total` stat as a Category-B ratio (which would
-/// skip `COUNTER_WINDOW_RULE_ID` — a false negative). PromQL label matchers do not
-/// nest, so a non-greedy `\{[^}]*\}` removal is exact. Mirrors the phantom-`[45]`
-/// window defense (`regex_label_matcher_not_mistaken_for_window`).
-fn strip_label_matchers(expr: &str) -> String {
-    LABEL_MATCHER_RE.replace_all(expr, "").into_owned()
 }
 
 /// Return true iff `metric` appears inside any fn-call from `fn_names`.
@@ -658,24 +635,20 @@ fn check_dashboard(
                 });
             }
 
-            let mut metric_refs: HashSet<String> = HashSet::new();
-            for caps in SERVICE_METRIC_PREFIX_RE.captures_iter(expr) {
-                if let Some(m) = caps.get(1) {
-                    metric_refs.insert(m.as_str().to_string());
-                }
-            }
+            let metric_refs: HashSet<String> = service_metric_refs(expr).into_iter().collect();
 
             // Category-A window distinction (ADR-0029): does this expr wrap a
             // `*_total` COUNTER in a rate-family fn? If so, the WINDOW verdict is
             // panel-type conditional and owned by COUNTER_WINDOW_RULE_ID; the
             // generic Rule 4 defers to it to avoid opposed advice. A ratio /
             // quantile (Category B) keeps the generic behavior.
-            // INFRA-F1: test for division on the expr with label-matcher `{…}`
-            // spans stripped, so a `/` inside a quoted label value (`{path=
-            // "/health"}`) is not read as a ratio and does not misclassify a
-            // Category-A `*_total` stat as Category-B (which would skip the
-            // counter-window rule). `histogram_quantile` cannot hide in a matcher.
-            let dematched_expr = strip_label_matchers(expr);
+            // INFRA-F1: test for division on the expr with strings masked and
+            // label positions stripped (the shared `common::promql` stripper),
+            // so a `/` inside a quoted label value (`{path="/health"}`) is not
+            // read as a ratio and does not misclassify a Category-A `*_total`
+            // stat as Category-B (which would skip the counter-window rule).
+            // `histogram_quantile` cannot hide in a matcher or label list.
+            let dematched_expr = strip_label_positions(&mask(expr).masked);
             let is_category_b =
                 dematched_expr.contains('/') || dematched_expr.contains("histogram_quantile");
             let expr_counter_in_window = !is_category_b
@@ -877,7 +850,8 @@ fn check_dashboard(
         //
         // Residual blind spot (corrected — obs+ops, measured not assumed): both
         // this class test and `metric_not_in_catalog` iterate the SAME
-        // `metric_refs`, collected by `SERVICE_METRIC_PREFIX_RE` (`ac|gc|mc|mh`).
+        // `metric_refs`, collected by `common::promql::service_metric_refs`
+        // (`ac|gc|mc|mh`-prefixed, label positions stripped).
         // A governed panel carrying a NON-service-prefixed `_total` ref is
         // therefore classified on an incomplete ref set, and `metric_not_in_catalog`
         // does NOT backstop it — the two rules share the extractor, they do not
@@ -1077,6 +1051,38 @@ mod tests {
             &mut findings,
         );
         findings.iter().map(|f| f.rule_id.to_string()).collect()
+    }
+
+    /// A service-prefixed LABEL name (`gc_view`, story 4 GC-3) in a `by(…)`
+    /// list or matcher is not a metric ref; the same panel naming an
+    /// undefined metric still fires (positive control: the rule runs).
+    #[test]
+    fn a_service_prefixed_label_is_not_a_metric_ref() {
+        let metrics = [("gc_x_total", "counter")];
+        let ok = fired_rules(
+            "timeseries",
+            r#"sum by(trigger, gc_view) (increase(gc_x_total{gc_view="healthy"}[$__rate_interval]))"#,
+            "",
+            &metrics,
+            &["gc_x_total"],
+            "",
+        );
+        assert!(
+            !ok.contains(&METRIC_NOT_IN_CODE_RULE_ID.to_string()),
+            "{ok:?}"
+        );
+        let undefined = fired_rules(
+            "timeseries",
+            "sum by(trigger, gc_view) (increase(gc_undefined_total[$__rate_interval]))",
+            "",
+            &metrics,
+            &["gc_x_total"],
+            "",
+        );
+        assert!(
+            undefined.contains(&METRIC_NOT_IN_CODE_RULE_ID.to_string()),
+            "{undefined:?}"
+        );
     }
 
     #[test]

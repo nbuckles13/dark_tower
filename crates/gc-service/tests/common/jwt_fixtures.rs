@@ -38,6 +38,79 @@ pub struct TestServiceClaims {
     pub service_type: Option<String>,
 }
 
+/// MC-minted `media_dial` claims exactly as ADR-0039 §5 specifies them
+/// ({token_type, sub, meeting_id, aud, iat, exp}). Never valid at GC: GC
+/// verifies only AC-signed tokens (R-15).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestMediaDialClaims {
+    pub token_type: String,
+    pub sub: String,
+    pub meeting_id: String,
+    pub aud: String,
+    pub iat: i64,
+    pub exp: i64,
+}
+
+/// `media_dial` claims UNION a complete user-claim set, WITHOUT `aud`. Used
+/// by the R-15 signature/alg arms so the payload would be ACCEPTED if signed
+/// by the live AC key: the signing key (or alg) is then the only possible
+/// reason for rejection (`common::jwt` maps claim-shape failures to the same
+/// `InvalidSignature`). `aud` is left out because GC's validator also rejects
+/// any token carrying an `aud` claim (jsonwebtoken validates `aud` with no
+/// expected audience configured), which would over-determine the rejection;
+/// the literal [`TestMediaDialClaims`] arm keeps it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestMediaDialUserShapedClaims {
+    #[serde(flatten)]
+    pub user: TestUserClaims,
+    pub token_type: String,
+    pub meeting_id: String,
+}
+
+impl TestMediaDialClaims {
+    /// A live (valid iat/exp) media_dial claim set.
+    pub fn live(now: i64) -> Self {
+        Self {
+            token_type: "media_dial".to_string(),
+            sub: "participant-1".to_string(),
+            meeting_id: "meeting-1".to_string(),
+            aud: "mh-1".to_string(),
+            iat: now,
+            exp: now + 300,
+        }
+    }
+}
+
+impl TestMediaDialUserShapedClaims {
+    /// A live user-shaped media_dial claim set.
+    pub fn live(now: i64) -> Self {
+        let dial = TestMediaDialClaims::live(now);
+        Self {
+            user: TestUserClaims {
+                sub: dial.sub,
+                org_id: "org-1".to_string(),
+                email: "p1@example.test".to_string(),
+                roles: vec!["user".to_string()],
+                iat: dial.iat,
+                exp: dial.exp,
+                jti: "jti-1".to_string(),
+            },
+            token_type: dial.token_type,
+            meeting_id: dial.meeting_id,
+        }
+    }
+}
+
+/// Sign `claims` with HS256 under `secret`, `kid` in the header: the
+/// algorithm-confusion attack (an HMAC keyed with the PUBLIC key's bytes).
+/// Test-only; GC must reject it at its EdDSA pin.
+pub fn sign_hs256<T: Serialize>(secret: &[u8], kid: &str, claims: &T) -> String {
+    let mut header = Header::new(Algorithm::HS256);
+    header.typ = Some("JWT".to_string());
+    header.kid = Some(kid.to_string());
+    encode(&header, claims, &EncodingKey::from_secret(secret)).expect("sign HS256")
+}
+
 // ============================================================================
 // Keypair
 // ============================================================================
@@ -72,21 +145,22 @@ impl TestKeypair {
     }
 
     pub fn sign_user_token(&self, claims: &TestUserClaims) -> String {
-        let encoding_key = EncodingKey::from_ed_der(&self.private_key_pkcs8);
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.typ = Some("JWT".to_string());
-        header.kid = Some(self.kid.clone());
-
-        encode(&header, claims, &encoding_key).expect("Failed to sign user token")
+        self.sign_claims(claims, Some(&self.kid))
     }
 
     pub fn sign_service_token(&self, claims: &TestServiceClaims) -> String {
+        self.sign_claims(claims, Some(&self.kid))
+    }
+
+    /// Sign arbitrary claims with EdDSA; `kid = None` omits the header's kid
+    /// (the header is then exactly `{"alg":"EdDSA","typ":"JWT"}`, as MC mints
+    /// `media_dial` tokens).
+    pub fn sign_claims<T: Serialize>(&self, claims: &T, kid: Option<&str>) -> String {
         let encoding_key = EncodingKey::from_ed_der(&self.private_key_pkcs8);
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = Some("JWT".to_string());
-        header.kid = Some(self.kid.clone());
-
-        encode(&header, claims, &encoding_key).expect("Failed to sign service token")
+        header.kid = kid.map(str::to_string);
+        encode(&header, claims, &encoding_key).expect("Failed to sign claims")
     }
 
     pub fn jwk_json(&self) -> serde_json::Value {

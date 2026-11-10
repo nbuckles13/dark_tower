@@ -62,9 +62,9 @@ pub const DEFAULT_OTEL_SAMPLE_RATE: f64 = 1.0;
 pub const DEFAULT_DEPLOYMENT_ENVIRONMENT: &str = "development";
 
 // =============================================================================
-// MH registry freshness (ADR-0039 §10, R-24/R-26)
+// MH registry freshness and sizing (ADR-0039 §3, §10; R-23, R-24, R-26)
 //
-// All four keys are REQUIRED: `ConfigError::MissingEnvVar`, no Rust default.
+// All five keys are REQUIRED: `ConfigError::MissingEnvVar`, no Rust default.
 // Their reference values live in `infra/services/gc-service/config.env`, the
 // artifact an operator reads; a `DEFAULT_*` constant here would be a second
 // copy of the same value. The `MissingEnvVar("...")` constructor and its key
@@ -72,14 +72,15 @@ pub const DEFAULT_DEPLOYMENT_ENVIRONMENT: &str = "development";
 // required keys by a single-line regex over this file.
 // =============================================================================
 
-/// The four REQUIRED MH registry keys. (Presence checks are spelled out per
+/// The five REQUIRED MH registry keys. (Presence checks are spelled out per
 /// key in `MhRegistryConfig::from_vars` for `dt-guard env-config`; this list
 /// is for consumers that enumerate them, e.g. tests.)
-pub const MH_REGISTRY_KEYS: [&str; 4] = [
+pub const MH_REGISTRY_KEYS: [&str; 5] = [
     "GC_MH_LOAD_REPORT_INTERVAL_MS",
     "GC_MH_STALENESS_MULTIPLIER",
     "GC_MH_REGISTRY_RETENTION_SECONDS",
     "GC_MH_INITIAL_HANDLERS_PER_MEETING",
+    "GC_MH_MAX_EXCLUDE_HANDLER_IDS",
 ];
 
 // =============================================================================
@@ -166,14 +167,22 @@ const MAX_MH_REGISTRY_RETENTION_SECONDS: u64 = 2_592_000;
 /// Bounds of `GC_MH_INITIAL_HANDLERS_PER_MEETING`.
 const MIN_MH_INITIAL_HANDLERS_PER_MEETING: u64 = 1;
 pub(crate) const MAX_MH_INITIAL_HANDLERS_PER_MEETING: u64 = 4;
+/// Bounds of `GC_MH_MAX_EXCLUDE_HANDLER_IDS` (the cap on
+/// `AcquireMediaHandlerRequest.exclude_handler_ids`, pushed to MC in
+/// `RegisterMCResponse.max_exclude_handler_ids`). It must also exceed
+/// `GC_MH_INITIAL_HANDLERS_PER_MEETING` (cross-checked in `MhRegistryConfig::new`).
+const MIN_MH_MAX_EXCLUDE_HANDLER_IDS: u64 = 4;
+const MAX_MH_MAX_EXCLUDE_HANDLER_IDS: u64 = 64;
 
-/// GC's media-handler registry timing and sizing (ADR-0039 §10).
+/// GC's media-handler registry timing and sizing (ADR-0039 §3, §10).
 ///
 /// `staleness_bound` = k × `load_report_interval`, computed once here. It is
 /// the ONLY MH staleness value in GC: selection, the stale sweep and the
 /// `gc_mh_available` recompute all read it, and so does the published
 /// `gc_mh_staleness_threshold_seconds` gauge. `load_report_interval` is the
-/// value pushed to every MH in `RegisterMHResponse`.
+/// value pushed to every MH in `RegisterMHResponse`. `max_exclude_handler_ids`
+/// is BOTH the value pushed to every MC in `RegisterMCResponse` and the bound
+/// `AcquireMediaHandler` enforces (one source for push and enforcement).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MhRegistryConfig {
     load_report_interval_ms: u64,
@@ -181,6 +190,7 @@ pub struct MhRegistryConfig {
     staleness_bound: Duration,
     retention: Duration,
     initial_handlers_per_meeting: usize,
+    max_exclude_handler_ids: u32,
 }
 
 impl MhRegistryConfig {
@@ -188,13 +198,15 @@ impl MhRegistryConfig {
     ///
     /// # Errors
     ///
-    /// `ConfigError::InvalidMhRegistryConfig` when a value is out of range or
-    /// retention does not exceed the derived staleness bound.
+    /// `ConfigError::InvalidMhRegistryConfig` when a value is out of range,
+    /// retention does not exceed the derived staleness bound, or the exclude
+    /// cap does not exceed the initial handler count.
     pub fn new(
         load_report_interval_ms: u64,
         staleness_multiplier: u64,
         retention_seconds: u64,
         initial_handlers_per_meeting: u64,
+        max_exclude_handler_ids: u64,
     ) -> Result<Self, ConfigError> {
         in_range(
             "GC_MH_LOAD_REPORT_INTERVAL_MS",
@@ -214,6 +226,26 @@ impl MhRegistryConfig {
             MIN_MH_INITIAL_HANDLERS_PER_MEETING,
             MAX_MH_INITIAL_HANDLERS_PER_MEETING,
         )?;
+        in_range(
+            "GC_MH_MAX_EXCLUDE_HANDLER_IDS",
+            max_exclude_handler_ids,
+            MIN_MH_MAX_EXCLUDE_HANDLER_IDS,
+            MAX_MH_MAX_EXCLUDE_HANDLER_IDS,
+        )?;
+        // A meeting's exclude list holds at least its current set, so a cap
+        // at or below the initial count would leave MC no replacement room.
+        if max_exclude_handler_ids <= initial_handlers_per_meeting {
+            return Err(ConfigError::InvalidMhRegistryConfig(format!(
+                "GC_MH_MAX_EXCLUDE_HANDLER_IDS ({}) must exceed \
+                 GC_MH_INITIAL_HANDLERS_PER_MEETING ({})",
+                max_exclude_handler_ids, initial_handlers_per_meeting
+            )));
+        }
+        let max_exclude_handler_ids = u32::try_from(max_exclude_handler_ids).map_err(|_| {
+            ConfigError::InvalidMhRegistryConfig(
+                "GC_MH_MAX_EXCLUDE_HANDLER_IDS does not fit u32".to_string(),
+            )
+        })?;
         if retention_seconds > MAX_MH_REGISTRY_RETENTION_SECONDS {
             return Err(ConfigError::InvalidMhRegistryConfig(format!(
                 "GC_MH_REGISTRY_RETENTION_SECONDS must be at most {}, got {}",
@@ -254,10 +286,11 @@ impl MhRegistryConfig {
             staleness_bound: Duration::from_millis(staleness_bound_ms),
             retention: Duration::from_millis(retention_ms),
             initial_handlers_per_meeting,
+            max_exclude_handler_ids,
         })
     }
 
-    /// Parse the four REQUIRED keys from `vars` and validate (the one parse
+    /// Parse the five REQUIRED keys from `vars` and validate (the one parse
     /// path: `Config::from_vars` and gc-test-utils' reference config both
     /// call this).
     ///
@@ -294,11 +327,18 @@ impl MhRegistryConfig {
                     ConfigError::MissingEnvVar("GC_MH_INITIAL_HANDLERS_PER_MEETING".to_string())
                 })?,
         )?;
+        let mh_max_exclude_handler_ids = parse_u64(
+            "GC_MH_MAX_EXCLUDE_HANDLER_IDS",
+            vars.get("GC_MH_MAX_EXCLUDE_HANDLER_IDS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("GC_MH_MAX_EXCLUDE_HANDLER_IDS".to_string())
+            })?,
+        )?;
         Self::new(
             mh_load_report_interval_ms,
             mh_staleness_multiplier,
             mh_registry_retention_seconds,
             mh_initial_handlers_per_meeting,
+            mh_max_exclude_handler_ids,
         )
     }
 
@@ -332,6 +372,13 @@ impl MhRegistryConfig {
     /// candidates exist).
     pub fn initial_handlers_per_meeting(&self) -> usize {
         self.initial_handlers_per_meeting
+    }
+
+    /// Cap on `AcquireMediaHandlerRequest.exclude_handler_ids` length: pushed
+    /// to MC in `RegisterMCResponse.max_exclude_handler_ids` and enforced by
+    /// `AcquireMediaHandler` (the same value at both sites).
+    pub fn max_exclude_handler_ids(&self) -> u32 {
+        self.max_exclude_handler_ids
     }
 }
 
@@ -847,6 +894,10 @@ mod tests {
                 "GC_MH_INITIAL_HANDLERS_PER_MEETING".to_string(),
                 "3".to_string(),
             ),
+            (
+                "GC_MH_MAX_EXCLUDE_HANDLER_IDS".to_string(),
+                "20".to_string(),
+            ),
             // Test-local RegisterMH allowlist values (these tests exercise the
             // parse; arm behaviour is tested in mh_endpoint_policy.rs).
             (
@@ -939,6 +990,7 @@ mod tests {
         assert_eq!(mh.staleness_bound(), Duration::from_millis(8000));
         assert_eq!(mh.retention(), Duration::from_secs(600));
         assert_eq!(mh.initial_handlers_per_meeting(), 3);
+        assert_eq!(mh.max_exclude_handler_ids(), 20);
     }
 
     #[test]
@@ -975,6 +1027,12 @@ mod tests {
             ("GC_MH_INITIAL_HANDLERS_PER_MEETING", "4", true),
             ("GC_MH_INITIAL_HANDLERS_PER_MEETING", "5", false),
             ("GC_MH_INITIAL_HANDLERS_PER_MEETING", "", false),
+            ("GC_MH_MAX_EXCLUDE_HANDLER_IDS", "3", false),
+            ("GC_MH_MAX_EXCLUDE_HANDLER_IDS", "4", true),
+            ("GC_MH_MAX_EXCLUDE_HANDLER_IDS", "64", true),
+            ("GC_MH_MAX_EXCLUDE_HANDLER_IDS", "65", false),
+            ("GC_MH_MAX_EXCLUDE_HANDLER_IDS", "x", false),
+            ("GC_MH_MAX_EXCLUDE_HANDLER_IDS", "", false),
             ("GC_MH_REGISTRY_RETENTION_SECONDS", "2592000", true),
             ("GC_MH_REGISTRY_RETENTION_SECONDS", "2592001", false),
             (
@@ -1002,6 +1060,32 @@ mod tests {
                 assert!(
                     matches!(&err, ConfigError::InvalidMhRegistryConfig(msg) if msg.contains(key)),
                     "{key}={value}: expected InvalidMhRegistryConfig naming the key, got {err:?}"
+                );
+            }
+        }
+    }
+
+    /// The exclude cap must strictly exceed the initial handler count; the
+    /// error names both keys. initial=4 keeps both values inside [4, 64].
+    #[test]
+    fn test_mh_max_exclude_must_exceed_initial_handlers() {
+        for (initial, cap, accepted) in [("4", "4", false), ("4", "5", true), ("3", "4", true)] {
+            let mut vars = base_vars();
+            vars.insert(
+                "GC_MH_INITIAL_HANDLERS_PER_MEETING".to_string(),
+                initial.to_string(),
+            );
+            vars.insert("GC_MH_MAX_EXCLUDE_HANDLER_IDS".to_string(), cap.to_string());
+            let result = Config::from_vars(&vars);
+            if accepted {
+                assert!(result.is_ok(), "initial={initial} cap={cap}: {result:?}");
+            } else {
+                let err = result.expect_err("cap <= initial must fail");
+                assert!(
+                    matches!(&err, ConfigError::InvalidMhRegistryConfig(msg)
+                        if msg.contains("GC_MH_MAX_EXCLUDE_HANDLER_IDS")
+                            && msg.contains("GC_MH_INITIAL_HANDLERS_PER_MEETING")),
+                    "initial={initial} cap={cap}: expected an error naming both keys, got {err:?}"
                 );
             }
         }
