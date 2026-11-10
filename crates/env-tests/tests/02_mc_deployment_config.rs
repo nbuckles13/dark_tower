@@ -113,6 +113,14 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
         MC_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
+    // media_dial credential TTL (ADR-0039 §5, story 4 MC-D): REQUIRED, and
+    // refused at boot outside [60, 900], so PositiveInteger (bounds stay with
+    // MC's reader).
+    (
+        "MC_MEDIA_DIAL_TOKEN_TTL_SECONDS",
+        MC_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
     // Shared media codec profile: all eight keys MC directs from.
     ("MEDIA_VIDEO_CODEC", PROFILE_CONFIGMAP, ValueShape::Token),
     (

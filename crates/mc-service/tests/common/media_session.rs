@@ -159,8 +159,11 @@ pub struct Session {
     recv: wtransport::stream::RecvStream,
     /// This participant's own sender id, read off the `JoinResponse`.
     pub sender_id: u32,
-    /// `JoinResponse.media_servers`, as MC sent it.
+    /// `JoinResponse.media_servers`, as MC sent it (urls).
     pub media_servers: Vec<String>,
+    /// `JoinResponse.media_servers`, whole entries (url, ref, `media_dial`
+    /// token) — the legacy carrier of the same projection as the set.
+    pub media_server_entries: Vec<proto_gen::dark_tower::signaling::v1::MediaServerInfo>,
     /// `JoinResponse.media_handler_set`, as MC sent it (ADR-0039 §4).
     pub media_handler_set: Option<proto_gen::dark_tower::signaling::v1::MediaHandlerSet>,
     /// `JoinResponse.receive_slot_caps`, as MC sent it.
@@ -741,7 +744,7 @@ async fn try_join_full(
     let (
         participant_id,
         sender_id,
-        media_servers,
+        media_server_entries,
         media_handler_set,
         receive_slot_caps,
         existing_participants,
@@ -749,10 +752,7 @@ async fn try_join_full(
         Some(server_message::Message::JoinResponse(r)) => (
             r.participant_id.clone(),
             r.sender_id.expect("MC allocates a sender id at join"),
-            r.media_servers
-                .into_iter()
-                .map(|m| m.media_handler_url)
-                .collect::<Vec<String>>(),
+            r.media_servers,
             r.media_handler_set,
             r.receive_slot_caps,
             r.existing_participants,
@@ -760,12 +760,17 @@ async fn try_join_full(
         other => return Err(format!("{other:?}")),
     };
 
+    let media_servers = media_server_entries
+        .iter()
+        .map(|m| m.media_handler_url.clone())
+        .collect::<Vec<String>>();
     let mut session = Session {
         conn,
         send,
         recv,
         sender_id,
         media_servers,
+        media_server_entries,
         media_handler_set,
         receive_slot_caps,
         join_directive: None,

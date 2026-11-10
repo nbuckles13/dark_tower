@@ -63,7 +63,7 @@ impl McJwtValidator {
     pub async fn validate_meeting_token(&self, token: &str) -> Result<MeetingTokenClaims, McError> {
         let claims = self.inner.validate::<MeetingTokenClaims>(token).await?;
 
-        if claims.token_type != "meeting" {
+        if claims.token_type != common::jwt::MEETING_TOKEN_TYPE {
             tracing::warn!(
                 target: "mc.auth",
                 token_type = %claims.token_type,
@@ -370,6 +370,202 @@ mod tests {
             matches!(&result, Err(McError::JwtValidation(_))),
             "Expected JwtValidation error for wrong key, got {:?}",
             result
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Cross-meeting KEK guard BY CONSTRUCTION (ADR-0039 §5): MC's join path
+    // verifies only AC-signed tokens (AC JWKS, kid REQUIRED, EdDSA pinned), so
+    // an MC-minted `media_dial` token — kid-less, signed by a key in no JWKS —
+    // is refused there. These arms use the REAL mint.
+    // ---------------------------------------------------------------------
+
+    fn mc_minted_media_dial() -> (crate::media_dial::key::DialSigningKey, String) {
+        let key = crate::media_dial::key::DialSigningKey::from_seed_for_test(&[0x3c; 32]);
+        let token = key
+            .mint(
+                "user-001",
+                "meeting-123",
+                "mh-1",
+                Utc::now().timestamp(),
+                300,
+            )
+            .unwrap()
+            .into_wire();
+        (key, token)
+    }
+
+    fn claims_of(token: &str) -> common::jwt::MediaDialClaims {
+        let payload = token.split('.').nth(1).unwrap();
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
+    }
+
+    async fn jwks_hits(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap_or_default().len()
+    }
+
+    /// Arm a: a kid-less MC-minted `media_dial` is `MissingKid` — decided
+    /// before the JWKS is consulted (hit count 0) — and both join validators
+    /// refuse it. The token is under the size cap, so the size check passed
+    /// first and is not what refused it.
+    #[tokio::test]
+    async fn join_rejects_a_kidless_media_dial_before_consulting_the_jwks() {
+        let (server, _ac, validator) = setup_test_validator().await;
+        let (_key, token) = mc_minted_media_dial();
+        assert!(token.len() < common::jwt::MAX_JWT_SIZE_BYTES);
+
+        let inner = CommonJwtValidator::new(
+            Arc::new(JwksClient::new(format!("{}/.well-known/jwks.json", server.uri())).unwrap()),
+            300,
+        );
+        assert!(matches!(
+            inner.validate::<common::jwt::MediaDialClaims>(&token).await,
+            Err(common::jwt::JwtError::MissingKid)
+        ));
+        assert!(matches!(
+            validator.validate_meeting_token(&token).await,
+            Err(McError::JwtValidation(_))
+        ));
+        assert!(matches!(
+            validator.validate_guest_token(&token).await,
+            Err(McError::JwtValidation(_))
+        ));
+        assert_eq!(
+            jwks_hits(&server).await,
+            0,
+            "refused before any JWKS lookup"
+        );
+    }
+
+    /// Arm b: the SAME MC-minted claim set, re-signed by a foreign key under a
+    /// kid that IS live in the served JWKS. (b1) The join path consults the
+    /// JWKS and refuses. (b2) The cause is the signature: a direct decode
+    /// against the served key with `aud` validation OFF is `InvalidSignature`,
+    /// while the forging key decodes it — so the signature is the only
+    /// difference.
+    ///
+    /// NOTE: `common::jwt::verify_token` also REJECTS any token carrying `aud`
+    /// (jsonwebtoken validates `aud` against an empty expected set) and maps
+    /// that to `InvalidSignature` too. That is a second wall against a
+    /// `media_dial` token, not a bug: do not "fix" it.
+    #[tokio::test]
+    async fn join_rejects_a_media_dial_forged_under_a_live_kid_by_signature() {
+        use jsonwebtoken::{decode, errors::ErrorKind, DecodingKey, Validation};
+        let (server, ac, validator) = setup_test_validator().await;
+        let (_key, minted) = mc_minted_media_dial();
+        let claims = claims_of(&minted);
+        let forger = TestKeypair::new(99, &ac.kid);
+        let forged = forger.sign_token(&claims);
+
+        // b1
+        assert!(matches!(
+            validator.validate_meeting_token(&forged).await,
+            Err(McError::JwtValidation(_))
+        ));
+        assert!(
+            jwks_hits(&server).await >= 1,
+            "past extract_kid: the JWKS was consulted"
+        );
+
+        // b1': attributable to the SIGNATURE on MC's own verifier. The
+        // aud-LESS MC claim set (so verify_token's aud wall is not what
+        // refuses it), forged under the live kid, is exactly InvalidSignature
+        // through the inner validator the join uses; the same claims signed by
+        // the live key pass it — the signature is the only difference.
+        #[derive(serde::Deserialize, Serialize)]
+        struct AudlessDial {
+            sub: String,
+            token_type: String,
+            meeting_id: String,
+            iat: i64,
+            exp: i64,
+        }
+        impl common::jwt::HasIat for AudlessDial {
+            fn iat(&self) -> i64 {
+                self.iat
+            }
+        }
+        let audless = AudlessDial {
+            sub: claims.sub.clone(),
+            token_type: claims.token_type.clone(),
+            meeting_id: claims.meeting_id.clone(),
+            iat: claims.iat,
+            exp: claims.exp,
+        };
+        let inner = CommonJwtValidator::new(
+            Arc::new(JwksClient::new(format!("{}/.well-known/jwks.json", server.uri())).unwrap()),
+            300,
+        );
+        assert!(matches!(
+            inner
+                .validate::<AudlessDial>(&forger.sign_token(&audless))
+                .await,
+            Err(common::jwt::JwtError::InvalidSignature)
+        ));
+        assert!(
+            inner
+                .validate::<AudlessDial>(&ac.sign_token(&audless))
+                .await
+                .is_ok(),
+            "control: the live key's signature over the same claims verifies"
+        );
+
+        // b2
+        let mut no_aud = Validation::new(Algorithm::EdDSA);
+        no_aud.validate_aud = false;
+        let served = DecodingKey::from_ed_der(&ac.public_key_bytes);
+        let err = decode::<common::jwt::MediaDialClaims>(&forged, &served, &no_aud).unwrap_err();
+        assert_eq!(*err.kind(), ErrorKind::InvalidSignature);
+        let forging = DecodingKey::from_ed_der(&forger.public_key_bytes);
+        assert!(decode::<common::jwt::MediaDialClaims>(&forged, &forging, &no_aud).is_ok());
+    }
+
+    /// Arm d: even with a GOOD signature (the live AC key, a served kid), a
+    /// `media_dial` claim set is never accepted where an AC token is expected:
+    /// the `aud` wall refuses it, and with `aud` removed the missing
+    /// meeting/guest fields and the `token_type` check still do. Arm c (positive): an AC meeting token is accepted
+    /// by the same validator.
+    #[tokio::test]
+    async fn a_media_dial_claim_set_is_refused_even_under_the_live_ac_key() {
+        let (_server, ac, validator) = setup_test_validator().await;
+        let (_key, minted) = mc_minted_media_dial();
+        let signed_by_ac = ac.sign_token(&claims_of(&minted));
+        assert!(matches!(
+            validator.validate_meeting_token(&signed_by_ac).await,
+            Err(McError::JwtValidation(_))
+        ));
+        assert!(matches!(
+            validator.validate_guest_token(&signed_by_ac).await,
+            Err(McError::JwtValidation(_))
+        ));
+
+        // The shape and token_type walls on their own: the SAME claim set with
+        // `aud` removed (so verify_token's aud wall is not what refuses it),
+        // signed by the live AC key, is still refused by both validators.
+        let mut no_aud = serde_json::to_value(claims_of(&minted)).unwrap();
+        no_aud.as_object_mut().unwrap().remove("aud");
+        let signed_no_aud = ac.sign_token(&no_aud);
+        assert!(matches!(
+            validator.validate_meeting_token(&signed_no_aud).await,
+            Err(McError::JwtValidation(_))
+        ));
+        assert!(matches!(
+            validator.validate_guest_token(&signed_no_aud).await,
+            Err(McError::JwtValidation(_))
+        ));
+
+        let ac_token = ac.sign_token(&make_meeting_claims());
+        assert!(validator.validate_meeting_token(&ac_token).await.is_ok());
+    }
+
+    /// MC's dial key is never in AC's JWKS (the fixture's served set).
+    #[tokio::test]
+    async fn the_dial_public_key_is_not_in_the_served_jwks() {
+        let (_server, ac, _validator) = setup_test_validator().await;
+        let (key, _token) = mc_minted_media_dial();
+        assert_ne!(
+            ac.jwk_json()["x"].as_str().unwrap(),
+            URL_SAFE_NO_PAD.encode(key.public_key())
         );
     }
 }

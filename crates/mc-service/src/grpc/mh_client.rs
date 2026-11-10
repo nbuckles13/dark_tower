@@ -107,6 +107,11 @@ pub struct MeetingProgramming<'a> {
     /// `RegisterMeetingRequest.heartbeat_interval_ms`: MC's derived interval
     /// (`HeartbeatTiming::interval_ms`, `max(1, floor(N/3))`), never 0.
     pub heartbeat_interval_ms: u32,
+    /// `RegisterMeetingRequest.media_dial_public_key`: the 32-byte PUBLIC half
+    /// of the meeting's `media_dial` signing key (ADR-0039 §5), sent on EVERY
+    /// RegisterMeeting for the meeting. Only these bytes reach the push
+    /// worker; the private half never leaves the meeting actor.
+    pub media_dial_public_key: [u8; 32],
     /// Set by the pusher iff this `(meeting, handler)` has had NO confirmed
     /// push and NO adopted floor in this process lifetime — the "first confirm
     /// after an MC restart" discriminator.
@@ -120,6 +125,39 @@ pub struct MeetingProgramming<'a> {
     /// pages). Never set on a later push, so a higher echo after a confirm —
     /// the `u64::MAX` ratchet wedge, or anything else — still pages.
     pub restart_floor_adoptable: bool,
+}
+
+/// THE construction of a `RegisterMeetingRequest` from one push's programming.
+///
+/// Carries identity, edges, behaviours, a generation, the heartbeat interval
+/// and the PUBLIC dial key. Nothing else — no secret or media-key material.
+fn register_meeting_request(programming: &MeetingProgramming<'_>) -> RegisterMeetingRequest {
+    RegisterMeetingRequest {
+        meeting_id: programming.meeting_id.to_string(),
+        mc_id: programming.mc_id.to_string(),
+        mc_grpc_endpoint: programming.mc_grpc_endpoint.to_string(),
+        egress_streams: build_egress_streams(programming.assignment),
+        // `SelectionRules` is a deliberately-empty named message, and its
+        // PRESENCE distinguishes "MC declared no rules" from "MC did not
+        // speak about rules". This story declares none — ranking, debounce,
+        // churn limits and per-subscriber exclusions are §7's story-5 work
+        // — so `None` is the accurate statement, not a stub left unfilled.
+        selection_rules: None,
+        policy_generation: programming.policy_generation.get(),
+        // Story 3: every published (sender, stream) with its transport and
+        // disposition -- the ONLY carrier of server mute (DROP_AT_INGRESS)
+        // and client mute (PAUSED) since MC-B deleted the sender-level
+        // muted set. Always present: with egress streams, an empty list is
+        // an MH reject. A disposition change is an assignment change, so
+        // the generation above advanced for it.
+        source_streams: build_source_streams(programming.assignment),
+        // ADR-0039 §1: derived once from MC's N (`HeartbeatTiming`), never
+        // 0, so MH-2's zero rejection can land after this (ORDERING rule).
+        heartbeat_interval_ms: programming.heartbeat_interval_ms,
+        // ADR-0039 §5: the PUBLIC half of the meeting's dial keypair, on
+        // every RegisterMeeting. Exactly 32 bytes by type; never string-encoded.
+        media_dial_public_key: programming.media_dial_public_key.to_vec(),
+    }
 }
 
 impl MeetingProgramming<'_> {
@@ -310,32 +348,7 @@ impl MhClient {
             common::observability::otel_grpc::client_interceptor(),
         );
 
-        let request = RegisterMeetingRequest {
-            meeting_id: meeting_id.to_string(),
-            mc_id: programming.mc_id.to_string(),
-            mc_grpc_endpoint: programming.mc_grpc_endpoint.to_string(),
-            egress_streams: build_egress_streams(programming.assignment),
-            // `SelectionRules` is a deliberately-empty named message, and its
-            // PRESENCE distinguishes "MC declared no rules" from "MC did not
-            // speak about rules". This story declares none — ranking, debounce,
-            // churn limits and per-subscriber exclusions are §7's story-5 work
-            // — so `None` is the accurate statement, not a stub left unfilled.
-            selection_rules: None,
-            policy_generation: programming.policy_generation.get(),
-            // Story 3: every published (sender, stream) with its transport and
-            // disposition -- the ONLY carrier of server mute (DROP_AT_INGRESS)
-            // and client mute (PAUSED) since MC-B deleted the sender-level
-            // muted set. Always present: with egress streams, an empty list is
-            // an MH reject. A disposition change is an assignment change, so
-            // the generation above advanced for it.
-            source_streams: build_source_streams(programming.assignment),
-            // ADR-0039 §1: derived once from MC's N (`HeartbeatTiming`), never
-            // 0, so MH-2's zero rejection can land after this (ORDERING rule).
-            heartbeat_interval_ms: programming.heartbeat_interval_ms,
-            // Story 4: the public half of the meeting's dial keypair is
-            // populated by MC-D; MH does not verify against it until MH-1.
-            media_dial_public_key: Vec::new(),
-        };
+        let request = register_meeting_request(programming);
 
         let grpc_request = self.add_auth(request)?;
 
@@ -654,6 +667,7 @@ mod tests {
             assignment,
             policy_generation: NonZeroU64::MIN,
             heartbeat_interval_ms: 2_000,
+            media_dial_public_key: [0x5a; 32],
             restart_floor_adoptable: false,
         }
     }
@@ -804,26 +818,30 @@ mod tests {
     /// Nothing else — and specifically no key material.
     #[test]
     fn built_request_carries_no_key_material() {
+        use crate::media_dial::key::DialSigningKey;
         let assignment = two_party_assignment();
-        let p = programming(&assignment);
-        let request = RegisterMeetingRequest {
-            meeting_id: p.meeting_id.to_string(),
-            mc_id: p.mc_id.to_string(),
-            mc_grpc_endpoint: p.mc_grpc_endpoint.to_string(),
-            egress_streams: build_egress_streams(p.assignment),
-            selection_rules: None,
-            policy_generation: p.policy_generation.get(),
-            source_streams: Vec::new(),
-            heartbeat_interval_ms: 0,
-            media_dial_public_key: Vec::new(),
-        };
-        // `RegisterMeetingRequest`'s ONE bytes-typed field is
-        // `media_dial_public_key`, a PUBLIC verification key, and it is empty
-        // here: MC-D populates the public half only. Every other field is
-        // identity, edges, behaviours or a generation, so there is nowhere else
-        // for a key to go.
-        assert!(request.media_dial_public_key.is_empty());
+        let seed = [0x11_u8; 32];
+        let dial_key = DialSigningKey::from_seed_for_test(&seed);
+        // A KEK-shaped value the field must never carry (distinguishing input).
+        let kek = [0x22_u8; 32];
+        let mut p = programming(&assignment);
+        p.media_dial_public_key = dial_key.public_key();
+        let request = register_meeting_request(&p);
+
+        // `RegisterMeetingRequest`'s ONE bytes-typed field carries exactly the
+        // dial key's PUBLIC half: not the seed, not a KEK.
+        assert_eq!(
+            request.media_dial_public_key,
+            dial_key.public_key().to_vec()
+        );
+        assert_eq!(request.media_dial_public_key.len(), 32);
+        assert_ne!(request.media_dial_public_key, seed.to_vec());
+        assert_ne!(request.media_dial_public_key, kek.to_vec());
+        // Every other field is identity, edges, behaviours or a generation, so
+        // there is nowhere else for a key to go.
+        assert_eq!(request.meeting_id, "meeting-1");
         assert_eq!(request.policy_generation, 1);
+        assert_eq!(request.heartbeat_interval_ms, 2_000);
         assert!(request.selection_rules.is_none());
         assert_eq!(request.egress_streams.len(), 2);
     }

@@ -93,7 +93,7 @@ The kind cluster has these credentials seeded for testing:
 - **Client Secret**: `test-client-secret-dev-999`
 - **Scopes**: `test:all`
 
-`29_mh_meeting_teardown` also uses the seeded **`meeting-controller`** service client — reading its id from the live `mc-0` Deployment and its secret from the live `mc-service-secrets` Secret, never a copy — narrowed to `service.write.mh`, to call MH's `MediaHandlerService` directly: MC does not call `EndMeeting` yet, and a mismatched `mc_id` cannot be produced through MC at all. That relaxes the suite's credential convention only; ADR-0028's layering is unchanged — the MH client comes from `proto-gen`, and the suite links no service crate. The test registers only uuid-named meetings of its own and releases them on every exit path.
+`29_mh_meeting_teardown` also uses the seeded **`meeting-controller`** service client — reading its id from the live `mc-0` Deployment and its secret from the live `mc-service-secrets` Secret, never a copy — narrowed to `service.write.mh`, to call MH's `MediaHandlerService` directly: MC does not call `EndMeeting` yet, and a mismatched `mc_id` cannot be produced through MC at all. That relaxes the suite's credential convention only; the suite's own dependency policy (no service crate, only wire-contract crates) is unchanged — the MH client comes from `proto-gen`, and the suite links no service crate. The test registers only uuid-named meetings of its own and releases them on every exit path.
 
 ## Observability Stack
 

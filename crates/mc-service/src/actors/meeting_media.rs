@@ -157,6 +157,9 @@ pub struct MediaRoutingDeps {
     /// N and its derivations (`MC_MH_HEARTBEAT_TIMEOUT_MS`, ADR-0039 §1): the
     /// interval every push worker sends MH.
     pub heartbeat: crate::media_routing::HeartbeatTiming,
+    /// The `media_dial` credential TTL and its TTL/3 refresh
+    /// (`MC_MEDIA_DIAL_TOKEN_TTL_SECONDS`, ADR-0039 §5).
+    pub media_dial: crate::media_dial::MediaDialTiming,
 }
 
 impl std::fmt::Debug for MediaRoutingDeps {
@@ -287,6 +290,12 @@ pub struct MeetingSeams {
     /// `MeetingMessage::ForceKekRotation` once the removals are recorded, so
     /// coalescing holds structurally instead of racing a real wall-clock W.
     pub kek_debounce_manual: bool,
+    /// Seed the `media_dial` refresh jitter (`None`: OS-seeded, as production).
+    pub dial_refresh_seed: Option<u64>,
+    /// Stamp `media_dial` `iat` from a clock anchored to tokio time at this
+    /// UNIX second, so paused-time tests move `iat` with the refresh arm
+    /// (`None`: the wall clock, as production).
+    pub dial_clock_base_unix: Option<i64>,
 }
 
 /// The handler set in-crate actor tests create a meeting with: one handler,
@@ -350,6 +359,7 @@ pub(crate) fn test_join_media() -> JoinMedia {
             ),
             connect_settle_window: std::time::Duration::from_millis(1500),
             heartbeat: crate::media_routing::HeartbeatTiming::from_timeout_ms(6_000),
+            media_dial: crate::media_dial::MediaDialTiming::from_ttl_seconds(300),
         }),
         declared: crate::media_kind::ClientMediaStates::live(PublishSet::of(&[
             MediaKindLabel::Audio,
@@ -438,10 +448,18 @@ pub(super) struct MeetingMedia {
     /// Non-member handler ids whose RELEASED verdict was already WARNed
     /// (bounded; dropped with the meeting).
     release_noticed: BTreeSet<String>,
+    /// The PUBLIC half of the meeting's `media_dial` key (ADR-0039 §5), copied
+    /// into every push worker's `RegisterMeeting`. The private half is the
+    /// meeting actor's own field and never reaches this struct.
+    media_dial_public_key: [u8; 32],
 }
 
 impl MeetingMedia {
-    pub(super) fn new(meeting_id: String, handlers: MeetingHandlers) -> Self {
+    pub(super) fn new(
+        meeting_id: String,
+        handlers: MeetingHandlers,
+        media_dial_public_key: [u8; 32],
+    ) -> Self {
         let (registrations_tx, registrations_rx) = mpsc::unbounded_channel();
         Self {
             slots: SlotTable::for_meeting(&meeting_id),
@@ -458,7 +476,19 @@ impl MeetingMedia {
             assignment: None,
             liveness: BTreeMap::new(),
             release_noticed: BTreeSet::new(),
+            media_dial_public_key,
         }
+    }
+
+    /// The `media_dial` timing, once a join has installed the routing deps.
+    pub(super) fn media_dial_timing(&self) -> Option<crate::media_dial::MediaDialTiming> {
+        self.deps.as_ref().map(|d| d.media_dial)
+    }
+
+    /// The per-turn flush bound (shared by the slot-view and handler-set
+    /// flushes).
+    pub(super) fn flush_batch(&self) -> usize {
+        self.flush_batch
     }
 
     #[cfg(feature = "test-seams")]
@@ -1046,6 +1076,7 @@ impl MeetingMedia {
                         mc_grpc_endpoint: deps.mc_grpc_endpoint.clone(),
                         handler: endpoint.clone(),
                         heartbeat_interval_ms: deps.heartbeat.interval_ms(),
+                        media_dial_public_key: self.media_dial_public_key,
                         registration: RegistrationReporter::new(
                             registrations.clone(),
                             endpoint.id.clone(),

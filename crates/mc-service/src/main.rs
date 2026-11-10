@@ -558,6 +558,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.grpc_advertise_address.clone(),
         config.client_media_config(),
         config.mh_heartbeat(),
+        config.media_dial(),
         config.max_participants as usize,
         std::time::Duration::from_secs(config.quic_max_idle_timeout_seconds),
         shutdown_token.child_token(),

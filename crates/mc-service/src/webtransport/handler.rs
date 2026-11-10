@@ -4,7 +4,7 @@ use crate::actors::messages::{LeaveReason, ParticipantInfo, ParticipantStateUpda
 use crate::media_kind::{served_kind, KindRefusal, MediaKindLabel, MediaStates, KNOWN_WIRE_KINDS};
 use crate::webtransport::trace::inject_current_context;
 
-use crate::media_routing::ClientHandlerSet;
+use crate::media_routing::{ClientHandlerEntry, ClientHandlerSet};
 use proto_gen::dark_tower::signaling::v1::{
     self, server_message, ClientMediaState, MediaHandlerSet, MediaKindState, MediaServerInfo,
     Participant, ParticipantJoined, ParticipantLeft, ParticipantMuteUpdate, ReceiveSlotCap,
@@ -57,27 +57,39 @@ pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_LEFT: &str = "participant_update_left"
 pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED: &str = "participant_update_muted";
 
 /// THE one projection of the meeting's client-facing handler snapshot onto the
-/// wire (ADR-0039 §4), for every carrier: `JoinResponse.media_handler_set`,
+/// wire (ADR-0039 §4, §5), for every carrier: `JoinResponse.media_handler_set`,
 /// the legacy `JoinResponse.media_servers` (its `handlers`, double-populated
-/// until P3) and the membership-change `ServerMessage`. One projection of one
-/// snapshot, so the legacy field can never list a handler the new set does
-/// not, and nothing lists a handler that is not Active.
+/// until P3) and the `ServerMessage` set. One projection of one snapshot, so
+/// the legacy field can never list a handler the new set does not, and nothing
+/// lists a handler that is not Active.
 ///
-/// `media_dial_token` is empty until MC-D mints it.
-#[must_use]
-pub fn media_handler_set(set: &ClientHandlerSet) -> MediaHandlerSet {
-    MediaHandlerSet {
-        handler_set_version: set.version,
-        handlers: set
-            .handlers
-            .iter()
-            .map(|h| MediaServerInfo {
+/// `token` mints the `media_dial` credential for each entry (`aud` = the
+/// entry's `handler_id`, which itself never reaches the wire). ALL OR NOTHING:
+/// the first mint failure aborts the whole projection, so a set with a
+/// tokenless entry cannot be built.
+///
+/// # Errors
+///
+/// The first error `token` returns.
+pub fn media_handler_set<E>(
+    set: &ClientHandlerSet,
+    mut token: impl FnMut(&ClientHandlerEntry) -> Result<String, E>,
+) -> Result<MediaHandlerSet, E> {
+    let handlers = set
+        .handlers
+        .iter()
+        .map(|h| {
+            Ok(MediaServerInfo {
                 media_handler_url: h.media_handler_url.clone(),
                 handler_ref: h.handler_ref.get(),
-                media_dial_token: String::new(),
+                media_dial_token: token(h)?,
             })
-            .collect(),
-    }
+        })
+        .collect::<Result<Vec<_>, E>>()?;
+    Ok(MediaHandlerSet {
+        handler_set_version: set.version,
+        handlers,
+    })
 }
 
 /// THE one builder of a roster entry (`Participant`), for both carriers: the

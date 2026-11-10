@@ -61,7 +61,7 @@ impl MhJwtValidator {
     pub async fn validate_meeting_token(&self, token: &str) -> Result<MeetingTokenClaims, MhError> {
         let claims = self.inner.validate::<MeetingTokenClaims>(token).await?;
 
-        if claims.token_type != "meeting" {
+        if claims.token_type != common::jwt::MEETING_TOKEN_TYPE {
             tracing::warn!(
                 target: "mh.auth",
                 token_type = %claims.token_type,

@@ -70,6 +70,7 @@ async fn push_with(
             assignment: &assignment,
             policy_generation: NonZeroU64::new(generation).unwrap(),
             heartbeat_interval_ms: 2_000,
+            media_dial_public_key: [0x5a; 32],
             restart_floor_adoptable,
         })
         .await
@@ -450,6 +451,7 @@ async fn an_empty_snapshot_at_a_non_zero_generation_confirms_match() {
             assignment: &empty,
             policy_generation: NonZeroU64::new(3).unwrap(),
             heartbeat_interval_ms: 2_000,
+            media_dial_public_key: [0x5a; 32],
             restart_floor_adoptable: false,
         })
         .await;

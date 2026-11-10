@@ -15,6 +15,7 @@
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 pub mod accept_loop_rig;
+pub mod media_dial;
 pub mod media_session;
 pub mod otel_capture;
 
@@ -107,6 +108,9 @@ pub struct RegisterMeetingCall {
     pub assignment: mc_service::media_routing::HandlerAssignment,
     /// `RegisterMeetingRequest.heartbeat_interval_ms` (ADR-0039 §1).
     pub heartbeat_interval_ms: u32,
+    /// `RegisterMeetingRequest.media_dial_public_key` (ADR-0039 §5): the
+    /// bytes a test verifies every minted token against.
+    pub media_dial_public_key: [u8; 32],
 }
 
 /// One MC→MH call, in ARRIVAL order across both RPCs — so "no
@@ -316,6 +320,7 @@ impl MhRegistrationClient for MockMhRegistrationClient {
                 egress_stream_count: programming.assignment.egress_streams.len(),
                 assignment: programming.assignment.clone(),
                 heartbeat_interval_ms: programming.heartbeat_interval_ms,
+                media_dial_public_key: programming.media_dial_public_key,
             });
         self.events
             .lock()
@@ -561,6 +566,27 @@ pub fn heartbeat_timing() -> mc_service::media_routing::HeartbeatTiming {
     mc_service::media_routing::HeartbeatTiming::from_timeout_ms(6_000)
 }
 
+/// The `media_dial` timing the shared fixtures run with: THE shipped TTL,
+/// read from `infra/services/mc-service/config.env` (the only copy of the
+/// deployed value — MC has no in-code default). Dial-timing tests pass their
+/// own value through [`join_media_with_timing`].
+///
+/// # Panics
+///
+/// If `config.env` stops carrying a parseable `MC_MEDIA_DIAL_TOKEN_TTL_SECONDS`.
+#[must_use]
+pub fn media_dial_timing() -> mc_service::media_dial::MediaDialTiming {
+    const CONFIG_ENV: &str = include_str!("../../../../infra/services/mc-service/config.env");
+    let ttl = CONFIG_ENV
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("MC_MEDIA_DIAL_TOKEN_TTL_SECONDS="))
+        .expect("config.env carries MC_MEDIA_DIAL_TOKEN_TTL_SECONDS")
+        .trim()
+        .parse::<u32>()
+        .expect("MC_MEDIA_DIAL_TOKEN_TTL_SECONDS in config.env is an integer");
+    mc_service::media_dial::MediaDialTiming::from_ttl_seconds(ttl)
+}
+
 fn join_media_with(mh_client: Arc<dyn MhRegistrationClient>) -> mc_service::actors::JoinMedia {
     join_media_with_heartbeat(mh_client, heartbeat_timing())
 }
@@ -570,6 +596,16 @@ fn join_media_with(mh_client: Arc<dyn MhRegistrationClient>) -> mc_service::acto
 pub fn join_media_with_heartbeat(
     mh_client: Arc<dyn MhRegistrationClient>,
     heartbeat: mc_service::media_routing::HeartbeatTiming,
+) -> mc_service::actors::JoinMedia {
+    join_media_with_timing(mh_client, heartbeat, media_dial_timing())
+}
+
+/// [`join_media_on`] with an explicit N and `media_dial` TTL (dial-timing
+/// tests run a non-default TTL so a hardcoded 300 cannot pass).
+pub fn join_media_with_timing(
+    mh_client: Arc<dyn MhRegistrationClient>,
+    heartbeat: mc_service::media_routing::HeartbeatTiming,
+    media_dial: mc_service::media_dial::MediaDialTiming,
 ) -> mc_service::actors::JoinMedia {
     mc_service::actors::JoinMedia {
         deps: Arc::new(mc_service::actors::MediaRoutingDeps {
@@ -583,6 +619,7 @@ pub fn join_media_with_heartbeat(
             ),
             connect_settle_window: client_media_config().connect_settle_window,
             heartbeat,
+            media_dial,
         }),
         // The actor-driven suite joins as an audio publisher with no
         // join-carried declaration (it declares post-join), story 2's shape.

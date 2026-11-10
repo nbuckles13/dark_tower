@@ -664,6 +664,8 @@ pub async fn handle_connection(
 
     // Join flow complete — record success metrics
     metrics::record_session_join("success", None, join_start.elapsed());
+    // The joiner's set reached the wire with the JoinResponse (ADR-0039 §5).
+    metrics::record_handler_set_push(crate::media_dial::HandlerSetPushReason::Join);
 
     debug!(
         target: "mc.webtransport.connection",
@@ -904,6 +906,7 @@ async fn handle_client_message(
                 &trace_state,
                 connection_id,
                 participant_handle,
+                media,
             )
             .await;
         }
@@ -965,10 +968,17 @@ async fn handle_media_connection_update(
     trace_state: &str,
     connection_id: &str,
     participant_handle: &ParticipantActorHandle,
+    media: &mut MediaSignalingContext,
 ) {
     // Reparent THIS span onto the client's per-message trace context (empty →
     // clean root; extraction via the global bounded propagator).
     reparent_current_span(trace_parent, trace_state);
+
+    // ADR-0039 §4/§5: the ref-keyed reports go to the meeting actor (latest
+    // status per (participant, ref); an in-set FAILED may trigger a credential
+    // re-push to THIS participant). Built before the legacy mapping consumes
+    // the update; string-free; UNSPECIFIED/unknown states and ref 0 dropped.
+    let ref_reports = client_handler_reports(&update);
 
     // Bound the per-message fan-out BEFORE doing any per-entry work (R-60
     // security): a hostile client can pack a 64 KiB frame with tens of thousands
@@ -978,7 +988,9 @@ async fn handle_media_connection_update(
     // drop (no client strings logged, mirroring the cap-drop discipline).
     let over_limit = update.statuses.len() > MAX_MH_STATUSES_PER_UPDATE;
     if over_limit {
-        crate::observability::metrics::record_participant_mh_status_dropped("over_limit");
+        crate::observability::metrics::record_participant_mh_status_dropped(
+            crate::observability::metrics::MH_STATUS_DROP_OVER_LIMIT,
+        );
     }
 
     // Map + truncate at the trust boundary: the actor only ever receives bounded
@@ -1002,6 +1014,8 @@ async fn handle_media_connection_update(
         })
         .collect();
 
+    forward_client_handler_reports(ref_reports, connection_id, media).await;
+
     if let Err(e) = participant_handle.record_mh_statuses(statuses).await {
         // Actor gone mid-connection (mailbox receiver dropped). Graceful — no
         // panic; the connection will close on its own. No client-controlled
@@ -1011,6 +1025,80 @@ async fn handle_media_connection_update(
             connection_id = %connection_id,
             error = %e,
             "Failed to deliver MediaConnectionUpdate to participant actor"
+        );
+    }
+}
+
+/// Status-forward hops a fresh connection may make immediately (ADR-0039 §4).
+///
+/// Every `MediaConnectionUpdate` carrying a ref-keyed report is a hop into the
+/// SHARED meeting-actor mailbox, so it is bounded here like every other
+/// client-driven actor hop. A real client reports once per transition per
+/// handler; this is far above that and still bounds a flood.
+pub const MH_STATUS_FORWARD_BURST: u32 = 32;
+
+/// Milliseconds per refilled status-forward token — 4 per second.
+pub const MH_STATUS_FORWARD_REFILL_INTERVAL_MS: u64 = 250;
+
+/// The ref-keyed half of a `MediaConnectionUpdate`: one string-free report per
+/// status with a non-zero `handler_ref` and a known, specified state (bounded
+/// by `MAX_MH_STATUSES_PER_UPDATE`). Client strings never leave the boundary.
+fn client_handler_reports(
+    update: &v1::MediaConnectionUpdate,
+) -> Vec<crate::media_dial::status::ClientHandlerReport> {
+    use crate::media_dial::status::{ClientHandlerReport, ReportedState};
+    update
+        .statuses
+        .iter()
+        .take(MAX_MH_STATUSES_PER_UPDATE)
+        .filter_map(|s| {
+            // The ONE wire decode (`map_connection_state`), narrowed: an
+            // unspecified or unknown state is not recorded by ref.
+            let state = match map_connection_state(s.state) {
+                MhState::Connected => ReportedState::Connected,
+                MhState::Failed => ReportedState::Failed,
+                MhState::Disconnected => ReportedState::Disconnected,
+                MhState::Unspecified => return None,
+            };
+            Some(ClientHandlerReport {
+                handler_ref: std::num::NonZeroU32::new(s.handler_ref)?,
+                handler_set_version: s.handler_set_version,
+                state,
+            })
+        })
+        .collect()
+}
+
+/// Forward ref-keyed reports to the meeting actor, under the connection's
+/// status-forward limiter. An over-rate update is not forwarded and is counted
+/// once (`rate_limited`), never per status.
+async fn forward_client_handler_reports(
+    reports: Vec<crate::media_dial::status::ClientHandlerReport>,
+    connection_id: &str,
+    media: &mut MediaSignalingContext,
+) {
+    if reports.is_empty() {
+        return;
+    }
+    if !media
+        .mh_status_forward_limiter
+        .try_spend(tokio::time::Instant::now().into_std())
+    {
+        crate::observability::metrics::record_participant_mh_status_dropped(
+            crate::observability::metrics::MH_STATUS_DROP_RATE_LIMITED,
+        );
+        return;
+    }
+    if let Err(e) = media
+        .meeting_handle
+        .report_client_handler_statuses(media.participant_id.clone(), reports)
+        .await
+    {
+        debug!(
+            target: "mc.webtransport.connection",
+            connection_id = %connection_id,
+            error = %e,
+            "Failed to deliver handler statuses to meeting actor"
         );
     }
 }
@@ -1216,6 +1304,9 @@ struct MediaSignalingContext {
     server_mute_refusal_reply_suppressed_logged: bool,
     /// One-shot bound on the unmute-request rate-limit WARN.
     unmute_rate_limit_logged: bool,
+    /// Bounds ref-keyed status hops into the meeting actor (ADR-0039 §4).
+    /// Driven by tokio's clock so paused-time tests can refill it.
+    mh_status_forward_limiter: ClientWorkLimiter,
 }
 
 impl MediaSignalingContext {
@@ -2175,6 +2266,11 @@ impl MediaSignalingContext {
             server_mute_rate_limit_logged: false,
             server_mute_refusal_reply_suppressed_logged: false,
             unmute_rate_limit_logged: false,
+            mh_status_forward_limiter: ClientWorkLimiter::new(
+                tokio::time::Instant::now().into_std(),
+                MH_STATUS_FORWARD_BURST,
+                MH_STATUS_FORWARD_REFILL_INTERVAL_MS,
+            ),
         }
     }
 }
@@ -2352,14 +2448,16 @@ fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinRe
         .map(crate::webtransport::handler::roster_entry)
         .collect();
 
-    // The meeting's client-facing handler snapshot (ADR-0039 §4): ACTIVE
-    // handlers only (register before token), taken by the actor when the reply
-    // was sent. ONE projection feeds both the new set and the legacy
-    // `media_servers` (double-populated until C1/P3), so an old SDK never sees
-    // a handler the new set does not list. Every url is the same string every
-    // `SendTarget` / `StreamAssignment` carries (`MeetingHandlers::client_handler`).
-    // Never a Redis read. Order carries no meaning.
-    let media_handler_set = crate::webtransport::handler::media_handler_set(&result.handler_set);
+    // The joiner's handler set (ADR-0039 §4, §5): ACTIVE handlers only
+    // (register before token), each with a `media_dial_token` minted for this
+    // participant, built by the actor through the ONE projection when the
+    // reply was sent. The same entries feed the legacy `media_servers`
+    // (double-populated until C1/P3), so an old SDK never sees a handler the
+    // new set does not list and both carry the same tokens. Every url is the
+    // same string every `SendTarget` / `StreamAssignment` carries
+    // (`MeetingHandlers::client_handler`). Never a Redis read. Order carries
+    // no meaning.
+    let media_handler_set = result.handler_set.clone();
     let media_servers = media_handler_set.handlers.clone();
 
     JoinResponse {
@@ -2889,8 +2987,16 @@ mod tests {
         );
     }
 
-    /// An Active-only snapshot with one handler, as the actor would hand it.
-    fn test_handler_set() -> crate::media_routing::ClientHandlerSet {
+    /// An Active-only set with one handler, minted for one joiner as the actor
+    /// would hand it (the token here is a stand-in; minting is the actor's).
+    fn test_handler_set() -> v1::MediaHandlerSet {
+        crate::webtransport::handler::media_handler_set(&test_client_snapshot(), |h| {
+            Ok::<_, std::convert::Infallible>(format!("token-for-{}", h.handler_id))
+        })
+        .unwrap()
+    }
+
+    fn test_client_snapshot() -> crate::media_routing::ClientHandlerSet {
         use crate::media_routing::{HandlerEndpoint, HandlerId, MeetingHandlers};
         let mut set = MeetingHandlers::from_handoff([
             HandlerEndpoint {
@@ -2910,10 +3016,10 @@ mod tests {
         set.client_snapshot()
     }
 
-    /// ADR-0039 §4: the new set and the legacy `media_servers` are ONE
+    /// ADR-0039 §4/§5: the new set and the legacy `media_servers` are ONE
     /// projection (Active only — mh-1 is still Registering and appears in
-    /// neither), the set is always present, refs are non-zero, and
-    /// `media_dial_token` stays empty until MC-D mints it.
+    /// neither), the set is always present, refs are non-zero, and both carry
+    /// the SAME per-entry `media_dial_token`.
     #[tokio::test]
     async fn the_join_response_double_populates_one_active_only_projection() {
         let (handle, _task) = test_participant_handle();
@@ -2937,17 +3043,31 @@ mod tests {
             handler_set: handler_set.clone(),
         };
         let response = build_join_response(&result, &test_client_media_config());
-        let set = response.media_handler_set.expect("always present");
-        assert_eq!(set.handler_set_version, handler_set.version);
+        let set = response.media_handler_set.clone().expect("always present");
+        assert_eq!(set.handler_set_version, handler_set.handler_set_version);
         assert_eq!(set.handlers.len(), 1, "the Registering mh-1 is not listed");
         assert_eq!(set.handlers[0].media_handler_url, "https://mh-0.test:4434");
         assert_ne!(set.handlers[0].handler_ref, 0);
-        assert!(set.handlers[0].media_dial_token.is_empty(), "MC-D fills it");
-        assert_eq!(response.media_servers, set.handlers, "one projection");
+        assert_eq!(set.handlers[0].media_dial_token, "token-for-mh-0");
+        assert_eq!(
+            response.media_servers, set.handlers,
+            "one projection, same tokens"
+        );
+        // Every carrier's Debug redacts the token (S9 / item 13): the result,
+        // the response, and a ServerMessage carrying the set.
+        let wire_token = set.handlers[0].media_dial_token.clone();
+        assert!(!format!("{result:?}").contains(&wire_token));
+        assert!(!format!("{response:?}").contains(&wire_token));
+        let carried = v1::ServerMessage {
+            message: Some(v1::server_message::Message::MediaHandlerSet(set.clone())),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        };
+        assert!(!format!("{carried:?}").contains(&wire_token));
 
         // An empty snapshot still yields a present, empty set.
         let empty = JoinResult {
-            handler_set: crate::media_routing::ClientHandlerSet::default(),
+            handler_set: v1::MediaHandlerSet::default(),
             ..result
         };
         let response = build_join_response(&empty, &test_client_media_config());
@@ -3367,6 +3487,154 @@ mod tests {
             ])
             .assert_delta(1);
         const { assert!(UNMUTE_REQUEST_BURST < MUTE_WORK_BURST) };
+    }
+
+    fn status_update(statuses: Vec<(u32, v1::ConnectionState)>) -> Vec<u8> {
+        ClientMessage {
+            message: Some(client_message::Message::MediaConnectionUpdate(
+                v1::MediaConnectionUpdate {
+                    statuses: statuses
+                        .into_iter()
+                        .map(|(handler_ref, state)| v1::MhConnectionStatus {
+                            mh_url: "https://mh-0.test:4434".to_string(),
+                            state: state as i32,
+                            handler_ref,
+                            handler_set_version: 3,
+                            ..Default::default()
+                        })
+                        .collect(),
+                },
+            )),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        }
+        .encode_to_vec()
+    }
+
+    /// The ref-keyed half of an update keeps only non-zero refs with a
+    /// specified, known state, and carries no client string.
+    #[test]
+    fn client_handler_reports_drop_ref_zero_and_unspecified_states() {
+        use crate::media_dial::status::ReportedState;
+        let update = v1::MediaConnectionUpdate {
+            statuses: vec![
+                v1::MhConnectionStatus {
+                    handler_ref: 2,
+                    handler_set_version: 7,
+                    state: v1::ConnectionState::Failed as i32,
+                    ..Default::default()
+                },
+                v1::MhConnectionStatus {
+                    handler_ref: 0,
+                    state: v1::ConnectionState::Connected as i32,
+                    ..Default::default()
+                },
+                v1::MhConnectionStatus {
+                    handler_ref: 3,
+                    state: v1::ConnectionState::Unspecified as i32,
+                    ..Default::default()
+                },
+                v1::MhConnectionStatus {
+                    handler_ref: 4,
+                    state: 99,
+                    ..Default::default()
+                },
+            ],
+        };
+        let reports = client_handler_reports(&update);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].handler_ref.get(), 2);
+        assert_eq!(reports[0].handler_set_version, 7);
+        assert_eq!(reports[0].state, ReportedState::Failed);
+    }
+
+    /// The status hop into the shared meeting mailbox is rate-limited per
+    /// connection: exactly BURST updates are FORWARDED (observed in the meeting
+    /// actor's per-ref store), the next is not forwarded and is counted ONCE as
+    /// `rate_limited` (never `over_limit`), an update with nothing ref-keyed
+    /// spends and counts nothing, and a refill lets exactly one more through.
+    /// Distinguishing states: BURST x CONNECTED, then a refused FAILED (still
+    /// CONNECTED after it, and no re-push), then DISCONNECTED after the refill.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_status_forward_hop_is_rate_limited_per_connection() {
+        use crate::media_dial::status::ReportedState;
+        let (participant, _rx) = streamed_participant("test-part");
+        let (mut media, _meeting) = test_media_context();
+        // Join "test-part" so its reports for an in-set ref are recorded.
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(64);
+        let joined = media
+            .meeting_handle
+            .connection_join(
+                "conn-test-part".to_string(),
+                "user-test-part".to_string(),
+                "test-part".to_string(),
+                String::new(),
+                false,
+                None,
+                Some(stream_tx),
+                crate::actors::meeting_media::test_join_media(),
+            )
+            .await
+            .expect("joins");
+        let in_set = joined.handler_set.handlers[0].handler_ref;
+        let latest = |m: &MediaSignalingContext| {
+            let handle = m.meeting_handle.clone();
+            async move {
+                handle
+                    .client_handler_statuses_for_test("test-part")
+                    .await
+                    .unwrap()
+                    .values()
+                    .next()
+                    .map(|r| r.state)
+            }
+        };
+        fn cell<'a>(
+            snap: &'a common::observability::testing::MetricSnapshot,
+            reason: &'static str,
+        ) -> common::observability::testing::CounterQuery<'a> {
+            snap.counter("mc_participant_mh_status_dropped_total")
+                .with_labels(&[("reason", reason)])
+        }
+
+        let snap = common::observability::testing::MetricAssertion::snapshot();
+        let connected = status_update(vec![(in_set, v1::ConnectionState::Connected)]);
+        for _ in 0..MH_STATUS_FORWARD_BURST {
+            handle_client_message(&connected, "c", &participant, &mut media).await;
+        }
+        cell(&snap, "rate_limited").assert_delta(0);
+        assert_eq!(latest(&media).await, Some(ReportedState::Connected));
+        while stream_rx.try_recv().is_ok() {}
+
+        let failed = status_update(vec![(in_set, v1::ConnectionState::Failed)]);
+        handle_client_message(&failed, "c", &participant, &mut media).await;
+        cell(&snap, "rate_limited").assert_delta(1);
+        cell(&snap, "over_limit").assert_delta(0);
+        assert_eq!(
+            latest(&media).await,
+            Some(ReportedState::Connected),
+            "the over-rate FAILED was not forwarded"
+        );
+        tokio::task::yield_now().await;
+        assert!(stream_rx.try_recv().is_err(), "and caused no re-push");
+
+        // Nothing ref-keyed: no hop, no spend, no count.
+        let legacy_only = status_update(vec![(0, v1::ConnectionState::Connected)]);
+        handle_client_message(&legacy_only, "c", &participant, &mut media).await;
+        cell(&snap, "rate_limited").assert_delta(1);
+
+        tokio::time::advance(std::time::Duration::from_millis(
+            MH_STATUS_FORWARD_REFILL_INTERVAL_MS,
+        ))
+        .await;
+        let disconnected = status_update(vec![(in_set, v1::ConnectionState::Disconnected)]);
+        handle_client_message(&disconnected, "c", &participant, &mut media).await;
+        cell(&snap, "rate_limited").assert_delta(1);
+        assert_eq!(
+            latest(&media).await,
+            Some(ReportedState::Disconnected),
+            "the refill forwarded exactly one more"
+        );
     }
 
     #[tokio::test]

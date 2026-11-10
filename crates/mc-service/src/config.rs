@@ -101,6 +101,17 @@ pub const MIN_MH_HEARTBEAT_TIMEOUT_MS: u32 = 1;
 /// [300, 3600] s), so a live MC always answers long before MH gives up on it.
 pub const MAX_MH_HEARTBEAT_TIMEOUT_MS: u32 = 30_000;
 
+/// Smallest legal `MC_MEDIA_DIAL_TOKEN_TTL_SECONDS` (ADR-0039 §5).
+///
+/// MC re-pushes every participant's handler set at TTL/3, so the floor bounds
+/// the per-meeting signing and push rate.
+pub const MIN_MEDIA_DIAL_TOKEN_TTL_SECONDS: u32 = 60;
+
+/// Largest legal `MC_MEDIA_DIAL_TOKEN_TTL_SECONDS` (ADR-0039 §5): the dial
+/// credential is reusable for its whole lifetime, so this bounds how long a
+/// token outlives its holder's departure.
+pub const MAX_MEDIA_DIAL_TOKEN_TTL_SECONDS: u32 = 900;
+
 /// Smallest legal `MC_KEK_ROTATION_DEBOUNCE_SECONDS` (W).
 ///
 /// The floor is set by the CLIENT, not by MC: the client derives its
@@ -400,6 +411,15 @@ pub struct Config {
     /// so the timer, the wire field and the published gauge share one value.
     pub kek_rotation_debounce_seconds: u32,
 
+    /// The `media_dial` credential lifetime in seconds
+    /// (`MC_MEDIA_DIAL_TOKEN_TTL_SECONDS`, ADR-0039 §5).
+    ///
+    /// Required, no Rust default (the shipped value lives in the ConfigMap
+    /// only), bounded [`MIN_MEDIA_DIAL_TOKEN_TTL_SECONDS`]`..=`
+    /// [`MAX_MEDIA_DIAL_TOKEN_TTL_SECONDS`] at load. Projected once through
+    /// [`Config::media_dial`] (TTL and the derived TTL/3 refresh interval).
+    pub media_dial_token_ttl_seconds: u32,
+
     /// Maximum ACCEPTED receive-capability declarations per connection
     /// (`MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`).
     ///
@@ -474,6 +494,10 @@ impl fmt::Debug for Config {
             .field(
                 "kek_rotation_debounce_seconds",
                 &self.kek_rotation_debounce_seconds,
+            )
+            .field(
+                "media_dial_token_ttl_seconds",
+                &self.media_dial_token_ttl_seconds,
             )
             .field(
                 "max_receive_capability_declarations",
@@ -792,6 +816,18 @@ impl Config {
             MAX_KEK_ROTATION_DEBOUNCE_SECONDS,
         )?;
 
+        // ADR-0039 §5 media_dial credential lifetime. Required and bounded on
+        // both sides. `MissingEnvVar(` and the key literal stay on ONE line for
+        // `dt-guard env-config`'s single-line discovery regex.
+        let media_dial_token_ttl_seconds = bounded(
+            "MC_MEDIA_DIAL_TOKEN_TTL_SECONDS",
+            vars.get("MC_MEDIA_DIAL_TOKEN_TTL_SECONDS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MC_MEDIA_DIAL_TOKEN_TTL_SECONDS".to_string())
+            })?,
+            MIN_MEDIA_DIAL_TOKEN_TTL_SECONDS,
+            MAX_MEDIA_DIAL_TOKEN_TTL_SECONDS,
+        )?;
+
         // Per-connection budget on ACCEPTED declarations (client-driven
         // meeting-actor work). Bounded on both sides by the same argument.
         let max_receive_capability_declarations = bounded(
@@ -983,6 +1019,7 @@ impl Config {
             media_connect_settle_ms,
             mh_heartbeat_timeout_ms,
             kek_rotation_debounce_seconds,
+            media_dial_token_ttl_seconds,
             max_receive_capability_declarations,
             audio_encoding,
             video_encoding,
@@ -1014,6 +1051,17 @@ impl Config {
     #[must_use]
     pub fn mh_heartbeat(&self) -> crate::media_routing::HeartbeatTiming {
         crate::media_routing::HeartbeatTiming::from_timeout_ms(self.mh_heartbeat_timeout_ms)
+    }
+
+    /// The `media_dial` credential timing, built from the TTL as validated at
+    /// load (ADR-0039 §5).
+    ///
+    /// The ONE place the TTL becomes timing: the minted `exp`, the TTL/3
+    /// refresh schedule and both published config gauges read it from the
+    /// value returned here.
+    #[must_use]
+    pub fn media_dial(&self) -> crate::media_dial::MediaDialTiming {
+        crate::media_dial::MediaDialTiming::from_ttl_seconds(self.media_dial_token_ttl_seconds)
     }
 
     /// The KEK rotation lifecycle, built from W as validated at load.
@@ -1126,6 +1174,11 @@ mod tests {
                 "MC_KEK_ROTATION_DEBOUNCE_SECONDS".to_string(),
                 "60".to_string(),
             ),
+            // ADR-0039 §5 media_dial credential TTL.
+            (
+                "MC_MEDIA_DIAL_TOKEN_TTL_SECONDS".to_string(),
+                "300".to_string(),
+            ),
         ])
     }
 
@@ -1155,6 +1208,7 @@ mod tests {
             "MC_MEDIA_CONNECT_SETTLE_MS",
             "MC_MH_HEARTBEAT_TIMEOUT_MS",
             "MC_KEK_ROTATION_DEBOUNCE_SECONDS",
+            "MC_MEDIA_DIAL_TOKEN_TTL_SECONDS",
         ] {
             let mut vars = base_vars();
             vars.remove(key);
@@ -2049,6 +2103,46 @@ mod tests {
             vars.insert("MC_MH_HEARTBEAT_TIMEOUT_MS".to_string(), raw.to_string());
             let config = Config::from_vars(&vars).expect(raw);
             assert_eq!(config.mh_heartbeat().interval_ms(), interval_ms, "N={raw}");
+        }
+    }
+
+    /// ADR-0039 §5: the TTL is accepted at exactly its bounds and refused one
+    /// past either bound, or unparseable, with the key named; the refresh
+    /// interval is the one derivation (TTL/3).
+    #[test]
+    fn media_dial_token_ttl_bounds_and_derived_refresh() {
+        for (raw, ttl, refresh) in [("60", 60, 20), ("900", 900, 300), ("120", 120, 40)] {
+            let mut vars = base_vars();
+            vars.insert(
+                "MC_MEDIA_DIAL_TOKEN_TTL_SECONDS".to_string(),
+                raw.to_string(),
+            );
+            let config = Config::from_vars(&vars).expect(raw);
+            let timing = config.media_dial();
+            assert_eq!(
+                timing.ttl(),
+                std::time::Duration::from_secs(ttl),
+                "ttl={raw}"
+            );
+            assert_eq!(
+                timing.refresh_interval(),
+                std::time::Duration::from_secs(refresh),
+                "ttl={raw}"
+            );
+        }
+        for raw in ["59", "901", "abc", "", "-1", "300.5"] {
+            let mut vars = base_vars();
+            vars.insert(
+                "MC_MEDIA_DIAL_TOKEN_TTL_SECONDS".to_string(),
+                raw.to_string(),
+            );
+            match Config::from_vars(&vars) {
+                Err(ConfigError::InvalidValue(msg)) => assert!(
+                    msg.contains("MC_MEDIA_DIAL_TOKEN_TTL_SECONDS") && msg.contains("60..=900"),
+                    "{raw}: the refusal names the key and range: {msg}"
+                ),
+                other => panic!("{raw}: expected InvalidValue, got {other:?}"),
+            }
         }
     }
 }

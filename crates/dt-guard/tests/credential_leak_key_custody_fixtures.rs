@@ -120,15 +120,22 @@ fn lens_fixtures() -> Vec<(String, String)> {
 /// suite exists to detect, relocated into the suite.
 const CATALOG: &[&str] = &[
     "neg_derive_debug_secretbox_wrapper.rs",
+    "neg_dial_signing_key_redacting_wrapper.rs",
     "neg_join_response_kek_delivery.rs",
     "neg_kek_generation_metadata.rs",
+    "neg_media_dial_public_key_register.rs",
     "neg_redacted_len_hand_rolled_debug.rs",
+    "pos_contract_crossing_dial_seed_renamed.rs",
+    "pos_contract_crossing_dial_signing_key.rs",
     "pos_contract_crossing_meeting_kek.rs",
     "pos_contract_crossing_renamed_material.rs",
     "pos_contract_crossing_transmit_key_bytes.rs",
+    "pos_derive_debug_raw_dial_key_bytes.rs",
     "pos_derive_debug_raw_kek_bytes.rs",
+    "pos_mc_log_dial_signing_key.rs",
     "pos_mc_log_meeting_kek.rs",
     "pos_mc_log_transmit_key_bytes.rs",
+    "pos_media_dial_token_raw_payload.rs",
     "pos_skip_debug_entry_removed.rs",
 ];
 

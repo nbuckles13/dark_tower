@@ -32,6 +32,7 @@
 #[path = "common/mod.rs"]
 mod test_common;
 
+use proto_gen::dark_tower::signaling::v1;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -142,8 +143,20 @@ fn frames(rx: &mut mpsc::Receiver<bytes::Bytes>) -> Vec<server_message::Message>
     test_common::drain_frames(rx)
 }
 
-fn refs_of(set: &mc_service::media_routing::ClientHandlerSet) -> BTreeSet<u32> {
-    set.handlers.iter().map(|h| h.handler_ref.get()).collect()
+/// A set's membership — version, then (url, ref) per entry — without its
+/// per-participant `media_dial` tokens (MC-D mints those per recipient).
+fn membership_of(set: &v1::MediaHandlerSet) -> (u64, Vec<(String, u32)>) {
+    (
+        set.handler_set_version,
+        set.handlers
+            .iter()
+            .map(|h| (h.media_handler_url.clone(), h.handler_ref))
+            .collect(),
+    )
+}
+
+fn refs_of(set: &v1::MediaHandlerSet) -> BTreeSet<u32> {
+    set.handlers.iter().map(|h| h.handler_ref).collect()
 }
 
 /// The wire-order rule (module doc): walk the queue tracking the client's
@@ -268,11 +281,24 @@ async fn first_join_parks_until_the_ack_without_stalling_the_meeting() {
             j.handler_set.handlers[0].media_handler_url,
             "wt://mh-a:4433"
         );
-        assert!(j.handler_set.version > 0);
+        assert!(j.handler_set.handler_set_version > 0);
     }
     assert_eq!(
-        a_join.handler_set, b_join.handler_set,
+        a_join.handler_set.handler_set_version, b_join.handler_set.handler_set_version,
         "one snapshot at release"
+    );
+    assert_eq!(
+        refs_of(&a_join.handler_set),
+        refs_of(&b_join.handler_set),
+        "one snapshot at release"
+    );
+    // Each joiner's set carries a token minted for IT (MC-D): never empty,
+    // and never the other joiner's.
+    assert!(!a_join.handler_set.handlers[0].media_dial_token.is_empty());
+    // `assert!`, never `assert_ne!`: a failure must not print a token.
+    assert!(
+        a_join.handler_set.handlers[0].media_dial_token
+            != b_join.handler_set.handlers[0].media_dial_token
     );
 
     // A join after the verdict replies at once, with the same membership.
@@ -284,7 +310,10 @@ async fn first_join_parks_until_the_ack_without_stalling_the_meeting() {
         Duration::ZERO,
         "no park after the verdict"
     );
-    assert_eq!(c_join.handler_set, a_join.handler_set);
+    assert_eq!(
+        membership_of(&c_join.handler_set),
+        membership_of(&a_join.handler_set)
+    );
 
     // B reaches mh-a too, and both settle: the B -> A edge now names mh-a's
     // ref on A's assignment and B's target, AFTER their JoinResponse set.
@@ -353,7 +382,7 @@ async fn no_set_names_a_handler_before_its_registermeeting_ack() {
         vec!["wt://mh-a:4433"],
         "exactly {{mh-a}}: mh-b is unacked"
     );
-    let v1 = a_join.handler_set.version;
+    let v1 = a_join.handler_set.handler_set_version;
 
     // The DISTINGUISHING input: A reaches both handlers, C reaches ONLY mh-b,
     // so mh-b is the pair's only shared handler. Routing over a Registering
@@ -498,7 +527,7 @@ async fn the_version_advances_on_membership_change_and_on_nothing_else() {
     let mut a = start_join(&meeting, "a", join_media_on(Arc::clone(&mh)));
     let a_join = (&mut a.reply).await.unwrap().unwrap();
     // Positive arm: the hand-off add is version 1; mark-active advanced it.
-    assert_eq!(a_join.handler_set.version, 2);
+    assert_eq!(a_join.handler_set.handler_set_version, 2);
 
     // Negative arm: joins, a declaration and connectivity change nothing.
     let mut later = Vec::new();
@@ -517,7 +546,11 @@ async fn the_version_advances_on_membership_change_and_on_nothing_else() {
     let mut e = start_join(&meeting, "e", join_media_on(Arc::clone(&mh)));
     later.push((&mut e.reply).await.unwrap().unwrap());
     for j in &later {
-        assert_eq!(j.handler_set, a_join.handler_set, "same version and refs");
+        assert_eq!(
+            membership_of(&j.handler_set),
+            membership_of(&a_join.handler_set),
+            "same version and refs"
+        );
     }
     assert!(
         handler_sets(&frames(&mut a.rx)).is_empty(),
@@ -554,7 +587,10 @@ async fn a_later_assignment_change_does_not_alter_a_live_meetings_handlers() {
     let first = (&mut first.reply).await.unwrap().unwrap();
     let mut later = start_join(&meeting, "b", test_join_media(&stack));
     let later = (&mut later.reply).await.unwrap().unwrap();
-    assert_eq!(later.handler_set, first.handler_set);
+    assert_eq!(
+        membership_of(&later.handler_set),
+        membership_of(&first.handler_set)
+    );
     let urls: Vec<&str> = later
         .handler_set
         .handlers
