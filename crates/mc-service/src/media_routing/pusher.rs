@@ -135,6 +135,10 @@ pub struct PushTarget {
     pub handler: HandlerEndpoint,
     /// `RegisterMeetingRequest.heartbeat_interval_ms` (MC's derived interval).
     pub heartbeat_interval_ms: u32,
+    /// `RegisterMeetingRequest.media_dial_public_key`: the PUBLIC half of the
+    /// meeting's dial key (ADR-0039 §5). Only these 32 bytes reach the
+    /// worker — never the signing key.
+    pub media_dial_public_key: [u8; 32],
     /// Where this worker reports its handler's registration verdict.
     pub registration: RegistrationReporter,
 }
@@ -433,6 +437,7 @@ async fn push_until_settled(
             assignment: &job.assignment,
             policy_generation: job.generation,
             heartbeat_interval_ms: target.heartbeat_interval_ms,
+            media_dial_public_key: target.media_dial_public_key,
             restart_floor_adoptable: first_confirm && !*floor_adopted,
         };
         match target.mh_client.register_meeting(&programming).await {
@@ -716,6 +721,7 @@ mod tests {
                 grpc_endpoint: "http://mh-0:50053".to_string(),
             },
             heartbeat_interval_ms: 2_000,
+            media_dial_public_key: [0x5a; 32],
             registration: RegistrationReporter::new(tx, HandlerId::new("mh-0"), REF),
         };
         (target, rx)

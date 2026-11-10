@@ -100,6 +100,48 @@ async fn declared_pair(
 // (a) REQUIRED: receive capability in -> send directive + slot assignment out
 // ============================================================================
 
+/// ADR-0039 §5 through a REAL connection: the config gauges echo the TTL and
+/// TTL/3, the JoinResponse's set carries a
+/// `media_dial_token` on every entry, the legacy `media_servers` carries the
+/// byte-identical entries (one projection), and the push is counted
+/// `reason=join` exactly once, when the JoinResponse is written.
+#[tokio::test]
+async fn the_join_response_carries_tokens_and_counts_one_join_push() {
+    // The config gauges are published when the server is built, from the SAME
+    // timing every meeting mints and refreshes with (one derivation, TTL/3).
+    let boot = MetricAssertion::snapshot();
+    let (stack, rig) = start_stack("mcs-dial-join").await;
+    let timing = test_common::media_dial_timing();
+    boot.gauge("mc_media_dial_token_ttl_seconds")
+        .with_labels(&[("key_custody", "operator")])
+        .assert_value(timing.ttl().as_secs_f64());
+    boot.gauge("mc_media_dial_token_refresh_interval_seconds")
+        .with_labels(&[("key_custody", "operator")])
+        .assert_value(timing.refresh_interval().as_secs_f64());
+    seed_meeting_with_mh(&stack, "mcs-dial-join").await;
+    let snap = MetricAssertion::snapshot();
+    let a = join_as(&rig, &stack, "mcs-dial-join", "user-a").await;
+    let set = a
+        .media_handler_set
+        .clone()
+        .expect("the set is always present");
+    assert_eq!(set.handlers.len(), 1);
+    assert!(set.handlers.iter().all(|h| !h.media_dial_token.is_empty()));
+    // `assert!`, never `assert_eq!`: a failure must not print a token.
+    assert!(
+        a.media_server_entries == set.handlers,
+        "one projection, same tokens"
+    );
+    snap.counter("mc_media_handler_set_pushes_total")
+        .with_labels(&[("reason", "join"), ("key_custody", "operator")])
+        .assert_delta(1);
+    for other in ["change", "failed_report", "token_refresh"] {
+        snap.counter("mc_media_handler_set_pushes_total")
+            .with_labels(&[("reason", other), ("key_custody", "operator")])
+            .assert_delta(0);
+    }
+}
+
 #[tokio::test]
 async fn capability_yields_send_directive_and_slot_assignment() {
     let snap = MetricAssertion::snapshot();

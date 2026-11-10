@@ -221,6 +221,10 @@ pub struct ClientHandler<'a> {
 /// One entry of a client-facing snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHandlerEntry {
+    /// The handler's identity: the `aud` of the `media_dial` token minted for
+    /// this entry (ADR-0039 §5). MC-internal — NEVER projected onto the wire
+    /// (the client sees only the url and the ref, S-4).
+    pub handler_id: HandlerId,
     /// The client-facing url.
     pub media_handler_url: String,
     /// The handler's per-incarnation ref.
@@ -531,6 +535,18 @@ impl MeetingHandlers {
             })
     }
 
+    /// Whether `handler_ref` is an ACTIVE member — i.e. in the client-facing
+    /// set every participant was last told (ADR-0039 §4). EXACT comparison
+    /// against the current incarnations; a removed or never-issued ref is not.
+    /// The resolution a client-asserted `MhConnectionStatus.handler_ref` is
+    /// checked with (diagnostic only, never routing).
+    #[must_use]
+    pub fn is_active_ref(&self, handler_ref: NonZeroU32) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.is_active() && m.handler_ref == handler_ref)
+    }
+
     /// The client-facing snapshot: Active members only, with the version.
     #[must_use]
     pub fn client_snapshot(&self) -> ClientHandlerSet {
@@ -541,6 +557,7 @@ impl MeetingHandlers {
                 .iter()
                 .filter(|m| m.is_active())
                 .map(|m| ClientHandlerEntry {
+                    handler_id: m.endpoint.id.clone(),
                     media_handler_url: m.endpoint.webtransport_url.clone(),
                     handler_ref: m.handler_ref,
                 })
@@ -884,6 +901,7 @@ mod tests {
         assert_eq!(
             snap.handlers,
             vec![ClientHandlerEntry {
+                handler_id: hid("mh-1"),
                 media_handler_url: "https://mh-1.example:4434".to_string(),
                 handler_ref: r1,
             }]

@@ -197,7 +197,7 @@ async fn issue_meeting_token_internal(
     let now = Utc::now().timestamp();
     let meeting_claims = MeetingTokenClaims {
         sub: payload.subject_user_id.to_string(),
-        token_type: "meeting".to_string(),
+        token_type: common::jwt::MEETING_TOKEN_TYPE.to_string(),
         meeting_id: payload.meeting_id.to_string(),
         home_org_id: payload.home_org_id.to_string(),
         meeting_org_id: payload.meeting_org_id.to_string(),
@@ -248,7 +248,7 @@ async fn issue_guest_token_internal(
     let now = Utc::now().timestamp();
     let guest_claims = GuestTokenClaims {
         sub: payload.guest_id.to_string(),
-        token_type: "guest".to_string(),
+        token_type: common::jwt::GUEST_TOKEN_TYPE.to_string(),
         meeting_id: payload.meeting_id.to_string(),
         meeting_org_id: payload.meeting_org_id.to_string(),
         participant_type: "guest".to_string(),

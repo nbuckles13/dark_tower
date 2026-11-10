@@ -318,6 +318,15 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: MC_MH_HEARTBEAT_TIMEOUT_MS
+        # ---- media_dial credential TTL (ADR-0039 §5; story 4 MC-D) ----
+        # Required by MC with no Rust default, deliberately NOT `optional:`:
+        # missing or outside [60, 900] refuses boot. Keep in lockstep with the
+        # other mc-N-deployment.yaml. See the key's comment in config.env.
+        - name: MC_MEDIA_DIAL_TOKEN_TTL_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_MEDIA_DIAL_TOKEN_TTL_SECONDS
         # ---- Capacity caps (R-37; story 4 MC-A) ----
         # Required by MC with no Rust default, deliberately NOT `optional:`:
         # missing, unparseable or 0 refuses boot. Keep in lockstep with the

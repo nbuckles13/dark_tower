@@ -335,8 +335,37 @@ pub enum MeetingMessage {
         respond_to: oneshot::Sender<crate::media_routing::HeartbeatVerdict>,
     },
 
+    /// A connection's client-reported handler statuses, keyed by
+    /// `handler_ref` (ADR-0039 §4, §5): recorded per (participant, ref) for
+    /// refs in the current set, and an in-set FAILED may trigger a
+    /// rate-limited credential re-push to THIS participant only. Diagnostic:
+    /// NEVER routing input. `participant_id` is the connection's own identity,
+    /// never a message field.
+    ClientHandlerReports {
+        /// The reporting participant (from the connection, not the message).
+        participant_id: String,
+        /// Bounded, string-free reports (UNSPECIFIED and ref 0 already dropped).
+        reports: Vec<crate::media_dial::status::ClientHandlerReport>,
+    },
+
+    /// The latest client-reported status per in-set ref for one participant.
+    /// **Test builds only.**
+    #[cfg(feature = "test-seams")]
+    ClientHandlerStatusesForTest {
+        /// The participant.
+        participant_id: String,
+        /// The store's view for it.
+        respond_to: oneshot::Sender<
+            std::collections::BTreeMap<
+                std::num::NonZeroU32,
+                crate::media_dial::status::LatestReport,
+            >,
+        >,
+    },
+
     /// Remove a handler from the meeting's set through the actor's ONE
-    /// removal helper (set-only: MC-B2 owns the full removal sequence).
+    /// removal helper, and push the changed Active set to clients (MC-B2 owns
+    /// the rest of the removal sequence: bindings, `EndMeeting`).
     /// **Test builds only.** Responds whether the handler was a member.
     #[cfg(feature = "test-seams")]
     RemoveHandlerForTest {
@@ -420,15 +449,20 @@ pub enum ParticipantMessage {
         respond_to: oneshot::Sender<crate::media_admission::KekPushOutcome>,
     },
 
-    /// Deliver the meeting's client-facing handler set (`MediaHandlerSet`,
-    /// ADR-0039 §4) after a membership change.
+    /// Deliver this participant's handler set (`MediaHandlerSet`, ADR-0039
+    /// §4, §5), already minted for it: one `media_dial_token` per member.
     ///
-    /// A dedicated variant rather than a `Send { SignalingPayload::Raw }`: the
-    /// set is encoded at the participant actor, so when MC-D adds a per-member
-    /// `media_dial_token` the credential never travels the mailbox as raw
-    /// bytes, and a dropped set is counted under its own `payload_kind`.
+    /// A dedicated TYPED variant rather than a `Send { SignalingPayload::Raw }`:
+    /// the token-bearing set crosses the mailbox as the generated
+    /// `MediaHandlerSet`, whose hand-written `Debug` redacts every token
+    /// (`crates/proto-gen` `skip_debug`), and is encoded at the participant
+    /// actor — so a credential never travels as raw bytes (a `Vec<u8>` Debug
+    /// would print the ASCII JWS), and a dropped set is counted under its own
+    /// `payload_kind`.
     HandlerSet {
-        set: crate::media_routing::ClientHandlerSet,
+        set: proto_gen::dark_tower::signaling::v1::MediaHandlerSet,
+        /// Why it was pushed (`mc_media_handler_set_pushes_total{reason}`).
+        reason: crate::media_dial::HandlerSetPushReason,
     },
 
     /// Close the participant actor gracefully.
@@ -591,12 +625,14 @@ pub struct JoinResult {
     pub kek_rotation_debounce_seconds: u32,
     /// Handle to the spawned ParticipantActor.
     pub participant_handle: ParticipantActorHandle,
-    /// The meeting's client-facing handler snapshot (ADR-0039 §4): Active
-    /// handlers only, with the version. The ONE source of both
-    /// `JoinResponse.media_handler_set` and the legacy `media_servers`. Taken
+    /// The joiner's handler set (ADR-0039 §4, §5): the meeting's Active
+    /// handlers with the version, each carrying a `media_dial_token` minted
+    /// for THIS participant. The ONE source of both
+    /// `JoinResponse.media_handler_set` and the legacy `media_servers`. Minted
     /// when the reply is SENT — for a parked join, at release, not at
-    /// admission.
-    pub handler_set: crate::media_routing::ClientHandlerSet,
+    /// admission. The generated type's `Debug` redacts every token, so this
+    /// struct's derived `Debug` cannot print one.
+    pub handler_set: proto_gen::dark_tower::signaling::v1::MediaHandlerSet,
 }
 
 /// Result of a successful reconnection.

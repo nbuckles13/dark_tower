@@ -326,6 +326,23 @@ pub enum MeetingRole {
 }
 
 // =============================================================================
+// Token-type discriminators
+// =============================================================================
+
+/// `token_type` of an AC-issued meeting token ([`MeetingTokenClaims`]).
+///
+/// The `token_type` discriminators are named once, here, so issuers and
+/// validators compare against the same value (anti-token-confusion).
+pub const MEETING_TOKEN_TYPE: &str = "meeting";
+
+/// `token_type` of an AC-issued guest token ([`GuestTokenClaims`]).
+pub const GUEST_TOKEN_TYPE: &str = "guest";
+
+/// `token_type` of an MC-minted `media_dial` credential ([`MediaDialClaims`],
+/// ADR-0039 §5).
+pub const MEDIA_DIAL_TOKEN_TYPE: &str = "media_dial";
+
+// =============================================================================
 // Meeting Token Claims
 // =============================================================================
 
@@ -471,7 +488,7 @@ impl GuestTokenClaims {
     ///
     /// Returns an error message if any of the fixed fields have unexpected values.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.token_type != "guest" {
+        if self.token_type != GUEST_TOKEN_TYPE {
             return Err("Guest token must have token_type 'guest'");
         }
         if self.participant_type != "guest" {
@@ -504,6 +521,90 @@ impl fmt::Debug for GuestTokenClaims {
 }
 
 // =============================================================================
+// Media Dial Claims (ADR-0039 §5)
+// =============================================================================
+
+/// Claims of an MC-minted `media_dial` dial credential (ADR-0039 §5).
+///
+/// THE claims shape for both ends: MC mints through it
+/// (`mc-service` `media_dial::key`), MH verifies through it (story 4 MH-1).
+/// The wire rules are stated once at `signaling.proto`
+/// `MediaServerInfo.media_dial_token`.
+///
+/// # Shape (anti-confusion)
+///
+/// No field has a serde default, so an AC meeting or guest token (which has no
+/// `aud`) never deserializes as this type, and a `media_dial` claim set never
+/// deserializes as [`MeetingTokenClaims`] / [`GuestTokenClaims`] (no
+/// `meeting_org_id`, `participant_type`, `role`). `aud` is ONE string, the
+/// handler's `handler_id`; MC never mints an array.
+///
+/// # Verifying (MH-1)
+///
+/// MUST NOT be verified through [`verify_token`] / [`JwtValidator`]: those
+/// are the AC-JWKS path (kid REQUIRED, `aud` REJECTED). MC's per-meeting dial
+/// key is never in any JWKS, and a `media_dial` token carries no `kid`. A
+/// verifier selects the key ONLY by the `meeting_id` claim from that meeting's
+/// `RegisterMeeting` registration, pins `EdDSA`, ignores `kid`/`jwk` headers,
+/// checks the signature, `exp`/`iat` (configured skew) and [`Self::validate`],
+/// and compares `aud` against its own `handler_id` ITSELF (`validate_aud =
+/// false`, or an explicit aud set) so that a mismatch is reported as
+/// `WRONG_HANDLER` distinctly from every earlier failure (`DECLINED`).
+///
+/// # Security
+///
+/// `sub` (the participant's validated meeting-token `sub`) is redacted in
+/// `Debug`. This type never holds the token string itself.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaDialClaims {
+    /// Subject: the participant's validated AC meeting-token `sub`, from MC's
+    /// session state, never from a request. Redacted in Debug output.
+    pub sub: String,
+    /// Token type discriminator (must be [`MEDIA_DIAL_TOKEN_TYPE`]).
+    pub token_type: String,
+    /// Meeting UUID; selects the verification key at MH.
+    pub meeting_id: String,
+    /// Audience: the target handler's `handler_id` (identity, not URL).
+    pub aud: String,
+    /// Issued-at timestamp (Unix epoch seconds).
+    pub iat: i64,
+    /// Expiration timestamp (Unix epoch seconds), `iat + TTL`.
+    pub exp: i64,
+}
+
+impl MediaDialClaims {
+    /// Check the fixed fields: `token_type` is [`MEDIA_DIAL_TOKEN_TYPE`] and
+    /// `sub` is non-empty. Signature, `exp`/`iat` and `aud` are the
+    /// verifier's (see the type doc).
+    ///
+    /// # Errors
+    ///
+    /// A fixed message naming the failed check (no claim values).
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.token_type != MEDIA_DIAL_TOKEN_TYPE {
+            return Err("media_dial token must have token_type 'media_dial'");
+        }
+        if self.sub.is_empty() {
+            return Err("media_dial token must have a non-empty sub");
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for MediaDialClaims {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MediaDialClaims")
+            .field("sub", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("meeting_id", &self.meeting_id)
+            .field("aud", &self.aud)
+            .field("iat", &self.iat)
+            .field("exp", &self.exp)
+            .finish()
+    }
+}
+
+// =============================================================================
 // HasIat Implementations
 // =============================================================================
 
@@ -526,6 +627,12 @@ impl HasIat for MeetingTokenClaims {
 }
 
 impl HasIat for GuestTokenClaims {
+    fn iat(&self) -> i64 {
+        self.iat
+    }
+}
+
+impl HasIat for MediaDialClaims {
     fn iat(&self) -> i64 {
         self.iat
     }
@@ -3163,5 +3270,84 @@ mod tests {
             validator.clock_skew_seconds,
             MAX_CLOCK_SKEW.as_secs() as i64
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // MediaDialClaims (ADR-0039 §5)
+    // ---------------------------------------------------------------------
+
+    fn media_dial_claims() -> MediaDialClaims {
+        MediaDialClaims {
+            sub: "user-a".to_string(),
+            token_type: MEDIA_DIAL_TOKEN_TYPE.to_string(),
+            meeting_id: "meeting-1".to_string(),
+            aud: "mh-1".to_string(),
+            iat: 1_000,
+            exp: 1_300,
+        }
+    }
+
+    #[test]
+    fn token_type_discriminators_are_the_wire_values() {
+        assert_eq!(MEETING_TOKEN_TYPE, "meeting");
+        assert_eq!(GUEST_TOKEN_TYPE, "guest");
+        assert_eq!(MEDIA_DIAL_TOKEN_TYPE, "media_dial");
+    }
+
+    #[test]
+    fn media_dial_claims_validate_checks_type_and_sub() {
+        assert!(media_dial_claims().validate().is_ok());
+
+        let mut wrong = media_dial_claims();
+        wrong.token_type = MEETING_TOKEN_TYPE.to_string();
+        assert!(wrong.validate().is_err());
+        wrong.token_type = "media_dial_x".to_string();
+        assert!(wrong.validate().is_err());
+
+        let mut empty_sub = media_dial_claims();
+        empty_sub.sub = String::new();
+        assert!(empty_sub.validate().is_err());
+    }
+
+    #[test]
+    fn media_dial_claims_wire_names_are_exact() {
+        let value = serde_json::to_value(media_dial_claims()).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["aud", "exp", "iat", "meeting_id", "sub", "token_type"]
+        );
+        assert!(value["iat"].is_i64() && value["exp"].is_i64());
+        assert!(value["aud"].is_string());
+    }
+
+    #[test]
+    fn an_ac_meeting_token_never_deserializes_as_media_dial_claims() {
+        // Canonical AC meeting claims: no `aud`, so no field default can
+        // admit them as a dial credential.
+        let json = r#"{"sub":"u","token_type":"meeting","meeting_id":"m","meeting_org_id":"o","participant_type":"member","role":"host","capabilities":[],"iat":0,"exp":0,"jti":"j"}"#;
+        assert!(serde_json::from_str::<MediaDialClaims>(json).is_err());
+        // Positive arm: the same parser accepts a real dial claim set.
+        let ok = serde_json::to_string(&media_dial_claims()).unwrap();
+        assert!(serde_json::from_str::<MediaDialClaims>(&ok).is_ok());
+        // And the converse: a dial claim set is not a meeting/guest claim set.
+        assert!(serde_json::from_str::<MeetingTokenClaims>(&ok).is_err());
+        assert!(serde_json::from_str::<GuestTokenClaims>(&ok).is_err());
+    }
+
+    #[test]
+    fn media_dial_claims_debug_redacts_sub() {
+        let mut claims = media_dial_claims();
+        claims.sub = "distinctive-subject-7731".to_string();
+        let rendered = format!("{claims:?}");
+        assert!(!rendered.contains("distinctive-subject-7731"));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(rendered.contains("mh-1"), "non-secret fields stay visible");
     }
 }

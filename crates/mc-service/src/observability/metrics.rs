@@ -1061,6 +1061,50 @@ pub fn set_heartbeat_deadline(heartbeat: HeartbeatTiming) {
     .set(heartbeat.timeout().as_secs_f64());
 }
 
+/// Record one `MediaHandlerSet` delivered to a participant (ADR-0039 §5).
+///
+/// Metric: `mc_media_handler_set_pushes_total`
+/// Labels: `reason` x `key_custody`
+/// Cardinality: bounded at the type level by
+/// [`crate::media_dial::HandlerSetPushReason::ALL`] (4)
+///
+/// Counted at SUCCESSFUL ENQUEUE onto the participant's outbound stream
+/// (`join`: when the `JoinResponse` write succeeds). A full channel is counted
+/// on `mc_participant_outbound_messages_dropped_total{payload_kind=
+/// "media_handler_set"}` instead, so pushes + drops = attempts. One reason per
+/// message (coalesced: join > change > failed_report > token_refresh).
+pub fn record_handler_set_push(reason: crate::media_dial::HandlerSetPushReason) {
+    counter!(
+        "mc_media_handler_set_pushes_total",
+        "reason" => reason.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Publish the `media_dial` TTL and its derived refresh interval.
+///
+/// Metrics: `mc_media_dial_token_ttl_seconds`,
+/// `mc_media_dial_token_refresh_interval_seconds`
+/// Labels: `key_custody` (1)
+///
+/// CONFIG ECHOES set once at boot from the SAME `MediaDialTiming` the mint and
+/// the refresh schedule read (`MC_MEDIA_DIAL_TOKEN_TTL_SECONDS`; refresh =
+/// TTL/3, the nominal cadence — each participant's actual gap is up to a tenth
+/// earlier, never later).
+pub fn set_media_dial_token_timing(timing: &crate::media_dial::MediaDialTiming) {
+    gauge!(
+        "mc_media_dial_token_ttl_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(timing.ttl().as_secs_f64());
+    gauge!(
+        "mc_media_dial_token_refresh_interval_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(timing.refresh_interval().as_secs_f64());
+}
+
 /// Record one MC-restart generation-floor reply.
 ///
 /// Metric: `mc_media_policy_generation_adoptions_total`
@@ -1586,6 +1630,17 @@ pub fn record_mh_notification(event_type: &str) {
     .increment(1);
 }
 
+/// `mc_participant_mh_status_dropped_total{reason="cap"}`: a status for a new
+/// url refused at the participant actor's map cap (per entry).
+pub const MH_STATUS_DROP_CAP: &str = "cap";
+/// `reason="over_limit"`: an update carried more statuses than one update may
+/// (once per update).
+pub const MH_STATUS_DROP_OVER_LIMIT: &str = "over_limit";
+/// `reason="rate_limited"`: a whole update NOT forwarded to the meeting actor
+/// because the connection's status-forward limiter was empty (once per update,
+/// never per status; mutually exclusive with `over_limit` for that update).
+pub const MH_STATUS_DROP_RATE_LIMITED: &str = "rate_limited";
+
 /// Record one per-MH connection status reported by a client `MediaConnectionUpdate` (R-60).
 ///
 /// Metric: `mc_participant_mh_status_total`
@@ -1622,13 +1677,14 @@ pub fn record_participant_mh_status(state: &str) {
 /// Metric: `mc_participant_mh_status_dropped_total`
 /// Labels: `reason`
 ///
-/// Reason values: "cap", "over_limit"
-/// Cardinality: 2.
+/// Reason values: [`MH_STATUS_DROP_CAP`], [`MH_STATUS_DROP_OVER_LIMIT`],
+/// [`MH_STATUS_DROP_RATE_LIMITED`]
+/// Cardinality: 3.
 ///
 /// A bounded counter is used instead of a per-entry log to avoid the
 /// log-amplification vector a hostile client could drive by flooding distinct
 /// `mh_url`s or packing an oversized batch.
-pub fn record_participant_mh_status_dropped(reason: &str) {
+pub fn record_participant_mh_status_dropped(reason: &'static str) {
     counter!("mc_participant_mh_status_dropped_total",
         "reason" => reason.to_string()
     )
@@ -2225,8 +2281,13 @@ const MH_EVENT_TYPES: &[&str] = &["connected", "disconnected"];
 /// `mc_participant_mh_status_total{state}` — proto `ConnectionState` via a total
 /// match with an `unspecified` catch-all in the caller.
 const MH_STATUS_STATES: &[&str] = &["connected", "disconnected", "failed", "unspecified"];
-/// `mc_participant_mh_status_dropped_total{reason}`. Emit sites: literals.
-const MH_STATUS_DROP_REASONS: &[&str] = &["cap", "over_limit"];
+/// `mc_participant_mh_status_dropped_total{reason}`. Emit sites: the
+/// `MH_STATUS_DROP_*` consts.
+const MH_STATUS_DROP_REASONS: &[&str] = &[
+    MH_STATUS_DROP_CAP,
+    MH_STATUS_DROP_OVER_LIMIT,
+    MH_STATUS_DROP_RATE_LIMITED,
+];
 /// `mc_join_display_name_resolved_total{outcome}`. Emit sites: two literals.
 const DISPLAY_NAME_OUTCOMES: &[&str] = &["present", "fallback"];
 /// `mc_join_identity_key_presence_total{presence}`. Emit sites: two literals.
@@ -2396,6 +2457,9 @@ pub fn zero_initialize_counters() {
     }
     for r in HeartbeatAnomaly::ALL {
         counter!("mc_media_handler_heartbeat_anomalies_total", "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for r in crate::media_dial::HandlerSetPushReason::ALL {
+        counter!("mc_media_handler_set_pushes_total", "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
     counter!("mc_media_handler_connected_set_corrections_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     for o in SettleOutcome::ALL {
@@ -2625,6 +2689,19 @@ mod tests {
         present_at_zero(
             r#"mc_media_handler_connected_set_corrections_total{key_custody="operator"}"#,
         );
+        // Story 4 MC-D (ADR-0039 §5): every push reason, and the new status
+        // drop reason.
+        for r in crate::media_dial::HandlerSetPushReason::ALL {
+            present_at_zero(&format!(
+                r#"mc_media_handler_set_pushes_total{{reason="{}",key_custody="operator"}}"#,
+                r.label()
+            ));
+        }
+        for r in MH_STATUS_DROP_REASONS {
+            present_at_zero(&format!(
+                r#"mc_participant_mh_status_dropped_total{{reason="{r}"}}"#
+            ));
+        }
         for s in REGISTER_MEETING_STATUSES {
             present_at_zero(&format!(r#"mc_register_meeting_total{{status="{s}"}}"#));
         }
@@ -3693,8 +3770,8 @@ mod tests {
         record_participant_mh_status("failed");
         record_participant_mh_status("disconnected");
         record_participant_mh_status("unspecified");
-        record_participant_mh_status_dropped("cap");
-        record_participant_mh_status_dropped("over_limit");
+        record_participant_mh_status_dropped(MH_STATUS_DROP_CAP);
+        record_participant_mh_status_dropped(MH_STATUS_DROP_OVER_LIMIT);
 
         snap.counter("mc_participant_mh_status_total")
             .with_labels(&[("state", "connected")])
@@ -3909,5 +3986,53 @@ mod tests {
         assert!(handle.render().contains(
             r#"mc_media_handler_heartbeat_deadline_seconds{key_custody="operator"} 7.5"#
         ));
+    }
+
+    /// `mc_media_handler_set_pushes_total{reason}`: each reason moves only its
+    /// own cell (story 4 MC-D).
+    #[test]
+    fn record_handler_set_push_moves_only_its_reason() {
+        use crate::media_dial::HandlerSetPushReason;
+        for reason in HandlerSetPushReason::ALL {
+            let snap = MetricAssertion::snapshot();
+            record_handler_set_push(reason);
+            for other in HandlerSetPushReason::ALL {
+                snap.counter("mc_media_handler_set_pushes_total")
+                    .with_labels(&[
+                        ("reason", other.label()),
+                        (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                    ])
+                    .assert_delta(u64::from(other == reason));
+            }
+        }
+    }
+
+    /// The two media_dial config gauges echo the TTL and TTL/3 at both bounds.
+    #[test]
+    fn media_dial_config_gauges_echo_ttl_and_refresh() {
+        for (ttl, refresh) in [(60_u32, 20.0), (900, 300.0)] {
+            let snap = MetricAssertion::snapshot();
+            set_media_dial_token_timing(&crate::media_dial::MediaDialTiming::from_ttl_seconds(ttl));
+            snap.gauge("mc_media_dial_token_ttl_seconds")
+                .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
+                .assert_value(f64::from(ttl));
+            snap.gauge("mc_media_dial_token_refresh_interval_seconds")
+                .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
+                .assert_value(refresh);
+        }
+    }
+
+    /// `rate_limited` is its own cell: an over-rate update counts there once
+    /// and never on `over_limit`.
+    #[test]
+    fn mh_status_rate_limited_is_distinct_from_over_limit() {
+        let snap = MetricAssertion::snapshot();
+        record_participant_mh_status_dropped(MH_STATUS_DROP_RATE_LIMITED);
+        snap.counter("mc_participant_mh_status_dropped_total")
+            .with_labels(&[("reason", "rate_limited")])
+            .assert_delta(1);
+        snap.counter("mc_participant_mh_status_dropped_total")
+            .with_labels(&[("reason", "over_limit")])
+            .assert_delta(0);
     }
 }

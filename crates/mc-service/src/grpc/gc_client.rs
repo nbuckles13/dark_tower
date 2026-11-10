@@ -836,6 +836,7 @@ mod tests {
             media_connect_settle_ms: 1500,
             mh_heartbeat_timeout_ms: 6000,
             kek_rotation_debounce_seconds: 60,
+            media_dial_token_ttl_seconds: 300,
             max_receive_capability_declarations: 64,
             audio_encoding: crate::media_signaling::AudioEncoding::new(
                 proto_gen::dark_tower::signaling::v1::Codec::Opus,
@@ -905,6 +906,7 @@ mod tests {
             media_connect_settle_ms: 1500,
             mh_heartbeat_timeout_ms: 6000,
             kek_rotation_debounce_seconds: 60,
+            media_dial_token_ttl_seconds: 300,
             max_receive_capability_declarations: 64,
             audio_encoding: crate::media_signaling::AudioEncoding::new(
                 proto_gen::dark_tower::signaling::v1::Codec::Opus,

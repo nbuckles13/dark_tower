@@ -149,7 +149,11 @@ const MARK: [u8; 3] = [0xA0, 0xB0, 0xC0];
 /// registers it) closes that residual at Layer 7. What IS asserted live: the
 /// set is complete on a healthy cluster, which needs every initial
 /// `RegisterMeeting` acked (an unacked handler is never listed).
-async fn assert_handler_sets_are_ref_addressed_and_registered(phase: &str, ps: &[Participant]) {
+async fn assert_handler_sets_are_ref_addressed_and_registered(
+    phase: &str,
+    ps: &[Participant],
+    join_pushes_baseline: &env_tests::fixtures::metrics::InstanceCounters,
+) {
     let live = env_tests::fixtures::mh_address::live_mh_addresses().await;
     let first = ps[0].handler_set().clone();
     assert!(
@@ -188,15 +192,238 @@ async fn assert_handler_sets_are_ref_addressed_and_registered(phase: &str, ps: &
             );
         }
         assert_eq!(
-            set, &first,
+            membership(set),
+            membership(&first),
             "{phase}/{}: every joiner holds the same version and refs",
             p.label
         );
-        assert!(
-            set.handlers.iter().all(|h| h.media_dial_token.is_empty()),
-            "{phase}: media_dial_token is empty until MC-D"
-        );
     }
+    assert_media_dial_tokens(phase, ps, join_pushes_baseline).await;
+}
+
+/// `mc_media_handler_set_pushes_total{reason="join"}`, per MC instance.
+const JOIN_PUSHES_PROMQL: &str = r#"sum by (instance) (mc_media_handler_set_pushes_total{reason="join",key_custody="operator"})"#;
+
+/// A set's membership — version, then (url, ref) per entry — without the
+/// per-participant `media_dial` tokens.
+fn membership(
+    set: &proto_gen::dark_tower::signaling::v1::MediaHandlerSet,
+) -> (u64, Vec<(String, u32)>) {
+    (
+        set.handler_set_version,
+        set.handlers
+            .iter()
+            .map(|h| (h.media_handler_url.clone(), h.handler_ref))
+            .collect(),
+    )
+}
+
+/// The JSON of one compact-JWS segment (0 = header, 1 = claims). Test-side
+/// decode only: the CLIENT treats the token as opaque. Never printed.
+fn jws_segment(token: &str, index: usize) -> serde_json::Value {
+    use base64::Engine;
+    let segment = token
+        .split('.')
+        .nth(index)
+        .unwrap_or_else(|| panic!("a compact JWS has segment {index}"));
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(segment)
+        .unwrap_or_else(|_| panic!("segment {index} is base64url"));
+    serde_json::from_slice(&bytes).unwrap_or_else(|_| panic!("segment {index} is JSON"))
+}
+
+/// Story 4 MC-D (ADR-0039 §5): a real join's set carries a `media_dial` token
+/// for EVERY member, minted for that participant's own session.
+///
+/// STRUCTURE ONLY, deliberately: the meeting's verification key exists solely
+/// on MC→MH `RegisterMeeting` (MH does not keep it before MH-1) and no debug
+/// surface exposes it, so the signature against the REGISTERED key is proven
+/// at Tier 1b (`crates/mc-service/tests/media_dial_integration.rs`), and MH's
+/// acceptance of the token in MH-1. `aud` is checked against the live MH
+/// pods (MH's `handler_id` is `mh-{pod}-{uuid8}`): each names exactly one
+/// pod, one value per handler, the same across participants, distinct across
+/// handlers. `exp - iat` is read against the LIVE
+/// `mc_media_dial_token_ttl_seconds` gauge — which also proves the gauge
+/// matches what MC actually mints — and the gauge against the ConfigMap; the
+/// join-reason push counter must rise.
+/// Tokens are never printed: field-equality assertions only.
+async fn assert_media_dial_tokens(
+    phase: &str,
+    ps: &[Participant],
+    join_pushes_baseline: &env_tests::fixtures::metrics::InstanceCounters,
+) {
+    let cluster = cluster().await;
+    let prom = env_tests::fixtures::metrics::PrometheusClient::new(&cluster.prometheus_base_url);
+    // The series is scraped and moves on a real join (a Layer-7 presence
+    // proof; shared-cluster counter, so "rose", never an exact delta).
+    env_tests::fixtures::metrics::poll_until_any_instance_above(
+        &prom,
+        JOIN_PUSHES_PROMQL,
+        join_pushes_baseline,
+        env_tests::fixtures::metrics::PINNED_METRIC_BOUND,
+        Duration::from_secs(2),
+        |now| {
+            format!(
+                "{phase}: mc_media_handler_set_pushes_total{{reason=join}} did not rise ({now:?})"
+            )
+        },
+    )
+    .await;
+    let (_, mc_pods) = env_tests::fixtures::kube::settled_serving_pods(
+        "app=mc-service",
+        Duration::from_secs(60),
+        "mc-pods-unserving",
+    )
+    .await;
+    let ttls: BTreeSet<u64> = env_tests::fixtures::metrics::gauge_by_pods(
+        &prom,
+        "mc_media_dial_token_ttl_seconds",
+        &mc_pods,
+        env_tests::fixtures::metrics::PINNED_METRIC_BOUND,
+    )
+    .await
+    .into_values()
+    .map(|v| v.round() as u64)
+    .collect();
+    assert_eq!(
+        ttls.len(),
+        1,
+        "{phase}: every MC pod publishes one TTL ({ttls:?})"
+    );
+    let ttl = i64::try_from(*ttls.iter().next().unwrap()).unwrap();
+    // Cross-check: the gauge echoes the live ConfigMap value.
+    let configured = configmap_u64(
+        &configmap_name_for_all(MC_INSTANCES, "mc-service-config"),
+        "MC_MEDIA_DIAL_TOKEN_TTL_SECONDS",
+    );
+    assert_eq!(
+        u64::try_from(ttl).unwrap(),
+        configured,
+        "{phase}: the published TTL is the ConfigMap's"
+    );
+    // MH's handler_id is `mh-{HOSTNAME}-{uuid8}` (mh-service config.rs,
+    // DEFAULT_MH_ID_PREFIX; HOSTNAME is the pod name). Retyped prefix on
+    // purpose: a format change fails CLOSED here (no pod matches).
+    let mh_pods: Vec<String> = env_tests::fixtures::kube::live_mh_pods()
+        .await
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    assert!(
+        (60..=900).contains(&ttl),
+        "{phase}: the published TTL is in [60, 900]"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let mut aud_of_url: HashMap<String, String> = HashMap::new();
+    for p in ps {
+        let own_sub = jws_segment(&p.token, 1)["sub"]
+            .as_str()
+            .expect("the meeting token carries a sub")
+            .to_string();
+        for entry in &p.handler_set().handlers {
+            assert!(
+                !entry.media_dial_token.is_empty(),
+                "{phase}/{}: every member carries a media_dial token",
+                p.label
+            );
+            let header = jws_segment(&entry.media_dial_token, 0);
+            assert!(
+                header == serde_json::json!({"alg": "EdDSA", "typ": "JWT"}),
+                "{phase}/{}: header is exactly {{alg: EdDSA, typ: JWT}} (no kid)",
+                p.label
+            );
+            let claims = jws_segment(&entry.media_dial_token, 1);
+            let mut keys: Vec<&str> = claims
+                .as_object()
+                .expect("claims object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["aud", "exp", "iat", "meeting_id", "sub", "token_type"],
+                "{phase}/{}: exactly the ADR-0039 §5 claims",
+                p.label
+            );
+            assert_eq!(claims["token_type"], "media_dial", "{phase}/{}", p.label);
+            assert_eq!(
+                claims["meeting_id"].as_str(),
+                Some(p.gc.meeting_id.to_string().as_str()),
+                "{phase}/{}: minted for this meeting",
+                p.label
+            );
+            assert!(
+                claims["sub"].as_str() == Some(own_sub.as_str()),
+                "{phase}/{}: sub is the participant's own meeting-token sub",
+                p.label
+            );
+            for other in ps.iter().filter(|o| o.label != p.label) {
+                let other_sub = jws_segment(&other.token, 1)["sub"].clone();
+                assert!(
+                    claims["sub"] != other_sub,
+                    "{phase}/{}: never another roster member's sub ({})",
+                    p.label,
+                    other.label
+                );
+            }
+            let iat = claims["iat"].as_i64().expect("integer iat");
+            let exp = claims["exp"].as_i64().expect("integer exp");
+            assert_eq!(
+                exp - iat,
+                ttl,
+                "{phase}/{}: exp = iat + the live TTL",
+                p.label
+            );
+            assert!(
+                iat <= now + 30 && now - iat <= ttl,
+                "{phase}/{}: iat is a current wall-clock stamp (iat {iat}, now {now})",
+                p.label
+            );
+            let aud = claims["aud"].as_str().expect("string aud").to_string();
+            let owners: Vec<&String> = mh_pods
+                .iter()
+                .filter(|pod| aud.starts_with(&format!("mh-{pod}-")))
+                .collect();
+            assert_eq!(
+                owners.len(),
+                1,
+                "{phase}/{}: aud {aud} is the handler id of exactly one live MH pod ({mh_pods:?})",
+                p.label
+            );
+            let prior = aud_of_url
+                .entry(entry.media_handler_url.clone())
+                .or_insert_with(|| aud.clone());
+            assert_eq!(
+                *prior, aud,
+                "{phase}/{}: one aud per handler, the same for every participant",
+                p.label
+            );
+        }
+    }
+    let distinct: BTreeSet<&String> = aud_of_url.values().collect();
+    assert_eq!(
+        distinct.len(),
+        aud_of_url.len(),
+        "{phase}: distinct handlers carry distinct aud"
+    );
+    let pods_of_aud: BTreeSet<&String> = aud_of_url
+        .values()
+        .filter_map(|aud| {
+            mh_pods
+                .iter()
+                .find(|pod| aud.starts_with(&format!("mh-{pod}-")))
+        })
+        .collect();
+    assert_eq!(
+        pods_of_aud.len(),
+        aud_of_url.len(),
+        "{phase}: distinct handlers map to distinct MH pods"
+    );
 }
 
 #[tokio::test]
@@ -205,6 +432,14 @@ async fn test_canonical_partial_connectivity_across_two_handlers() {
     let window = settle_window(&cluster).await;
     let auth = AuthClient::new(&cluster.ac_base_url);
     let gc = GcClient::new(&cluster.gc_base_url);
+    let prom = env_tests::fixtures::metrics::PrometheusClient::new(&cluster.prometheus_base_url);
+    let join_pushes_baseline = env_tests::fixtures::metrics::settled_baseline(
+        &prom,
+        JOIN_PUSHES_PROMQL,
+        env_tests::fixtures::metrics::BASELINE_SETTLE_BOUND,
+        "media_dial join pushes",
+    )
+    .await;
     let mut ps = meeting_of(&auth, &gc, "Edge Model Canonical", &["A", "B", "C"]).await;
 
     // 1. PRECONDITION. `x` and `y` are an ARBITRARY labelling of the two.
@@ -212,7 +447,8 @@ async fn test_canonical_partial_connectivity_across_two_handlers() {
     // 1b. Story 4 MC-A: the set every joiner was given (only AFTER the
     // completeness precondition, so a late second ack cannot read as a
     // stability failure).
-    assert_handler_sets_are_ref_addressed_and_registered("CANONICAL", &ps).await;
+    assert_handler_sets_are_ref_addressed_and_registered("CANONICAL", &ps, &join_pushes_baseline)
+        .await;
     let ids: Vec<u32> = ps.iter().map(Participant::sender_id).collect();
 
     // 2. REACH: A opens both; B only x; C only y.

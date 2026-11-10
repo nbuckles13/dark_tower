@@ -56,6 +56,7 @@ async fn register_meeting_success_emits_status_success_and_duration_observation(
             assignment: &assignment,
             policy_generation: std::num::NonZeroU64::MIN,
             heartbeat_interval_ms: 2_000,
+            media_dial_public_key: [0x5a; 32],
             restart_floor_adoptable: false,
         })
         .await;
@@ -99,6 +100,7 @@ async fn register_meeting_not_applied_emits_status_error() {
             assignment: &assignment,
             policy_generation: std::num::NonZeroU64::MIN,
             heartbeat_interval_ms: 2_000,
+            media_dial_public_key: [0x5a; 32],
             restart_floor_adoptable: false,
         })
         .await;
@@ -160,6 +162,7 @@ async fn a_reply_from_another_incarnation_is_handler_replaced_and_gives_no_credi
             assignment: &assignment,
             policy_generation: std::num::NonZeroU64::MIN,
             heartbeat_interval_ms: 2_000,
+            media_dial_public_key: [0x5a; 32],
             restart_floor_adoptable: false,
         })
         .await;
@@ -199,6 +202,7 @@ async fn a_reply_from_another_incarnation_is_handler_replaced_and_gives_no_credi
             assignment: &assignment,
             policy_generation: std::num::NonZeroU64::MIN,
             heartbeat_interval_ms: 2_000,
+            media_dial_public_key: [0x5a; 32],
             restart_floor_adoptable: false,
         })
         .await;

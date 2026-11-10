@@ -1120,6 +1120,47 @@ Retired rather than left as a permanent zero. It counted egress plans for a slot
 
 ---
 
+## Handler Set & `media_dial` Credential Metrics (ADR-0039 §5; story 4 MC-D)
+
+MC signs a short-lived per-handler `media_dial` credential itself (per-meeting
+Ed25519 key, no AC call) and keeps every participant's `MediaHandlerSet`
+carrying a valid token for every member. Every series carries
+`key_custody="operator"` and NO meeting, participant, connection,
+`handler_id`, `handler_ref`, slot or revision label. Tokens and the signing
+key are never logged, labelled or traced.
+
+### `mc_media_handler_set_pushes_total`
+- **Type**: Counter
+- **Description**: `MediaHandlerSet` messages delivered to participants, by why they were sent
+- **Labels**:
+  - `reason`: `join` | `change` | `failed_report` | `token_refresh`
+  - `key_custody`: single value `operator`
+- **Cardinality**: bounded by `media_dial::HandlerSetPushReason::ALL` (4); zero-initialised
+- **Values**: `join` — the (re)joiner's own set (`JoinResponse`, or a reconnect). `change` — a handler-membership change (the set's version advanced), sent at once to every connected participant. `failed_report` — the credential re-push a client's `MediaConnectionUpdate` FAILED for an in-set ref triggers, to that sender only, limited per session (`media_dial::status::FAILED_REPUSH_BURST`). `token_refresh` — the TTL/3 refresh (version and refs unchanged, new tokens).
+- **One reason per message**: several reasons landing on one participant in one actor turn coalesce to the highest, `join > change > failed_report > token_refresh`.
+- **Counted at SUCCESSFUL ENQUEUE** onto the participant's outbound stream (`join`: when the `JoinResponse` write succeeds). A full channel is `mc_participant_outbound_messages_dropped_total{payload_kind="media_handler_set"}` instead, so pushes + drops = attempts.
+- **Usage**: `token_refresh` tracks connected participants / (TTL/3); its absence while participants are connected means the refresh is broken (MH's `mh_jwt_validations_total{token_type="media_dial",failure_reason="expired"}` is the consumer-side signal). Sustained `failed_report` means clients are being DECLINED by handlers (dead tokens). Two different limiters, two different records: an update over the connection's status-forward limiter is NOT forwarded and is counted on `mc_participant_mh_status_dropped_total{reason="rate_limited"}`; a FAILED report that IS forwarded but refused by the per-session re-push limiter (`FAILED_REPUSH_BURST`) is recorded with no re-push, has no metric, and is debug-logged once per session. Statuses for refs outside the set are ignored, with no metric. Signing cost rides the meeting actor's turn: a handler `change` mints participants x handlers tokens in one turn; refreshes and FAILED re-pushes go through the per-turn bounded flush (`SLOT_VIEW_FLUSH_BATCH` participants per turn). The actor's mailbox and message-latency series are the turn-cost signal.
+- **Recorded in**: `actors/participant.rs::handle_handler_set` (`change`, `failed_report`, `token_refresh`, reconnect `join`) and `webtransport/connection.rs` after the `JoinResponse` write (`join`), via `observability/metrics.rs::record_handler_set_push`
+- **Dashboard**: MC Media - Handler Set Pushes by Reason (Handler Set & Dial Credential row)
+
+### `mc_media_dial_token_ttl_seconds`
+- **Type**: Gauge
+- **Description**: The `media_dial` credential lifetime this pod mints with (`MC_MEDIA_DIAL_TOKEN_TTL_SECONDS`), in seconds
+- **Labels**: `key_custody` (1)
+- **A CONFIG ECHO**, set once at boot from the same `MediaDialTiming` the mint (`exp = iat + TTL`) and the refresh schedule read. Range [60, 900]; env-tests read the live value from here.
+- **Recorded in**: `webtransport/server.rs` (`WebTransportServer::new`) via `observability/metrics.rs::set_media_dial_token_timing`
+- **Dashboard**: MC Media - Dial Credential TTL / Refresh Interval (Handler Set & Dial Credential row, stat panel)
+
+### `mc_media_dial_token_refresh_interval_seconds`
+- **Type**: Gauge
+- **Description**: The NOMINAL per-participant refresh interval, TTL/3, in seconds
+- **Labels**: `key_custody` (1)
+- **The one derivation** (`MediaDialTiming::refresh_interval`), shared by the scheduler. Each participant's actual gap is jittered EARLIER by up to a tenth of this (seeded per meeting), never later, so the longest gap between two pushes is TTL/3 < TTL: a held token expires only after about three consecutive dropped pushes.
+- **Recorded in**: `webtransport/server.rs` via `observability/metrics.rs::set_media_dial_token_timing`
+- **Dashboard**: MC Media - Dial Credential TTL / Refresh Interval (Handler Set & Dial Credential row, stat panel)
+
+---
+
 ## Participant Outbound Delivery Metrics
 
 ### `mc_participant_outbound_messages_dropped_total`
@@ -1132,7 +1173,7 @@ Retired rather than left as a permanent zero. It counted egress plans for a slot
 - **`participant_update` was SPLIT into `_joined` / `_left`** (story 2 task 9). The rule applied is **demonstrated consumer need, not message-type taxonomy**: a named consumer — the client's R-18 rebind correlation — cannot do its job with the two merged, because a dropped LEAVE has a consequence a dropped join does not (the client keeps a stale roster entry and later counts a legitimate `sender_id` reissue as a rebind, `dt_client_media_roster_key_rebinds_total{outcome="rebind"}`). Non-zero `participant_update_left` over a window makes that explanation **supported** — not confirmed for any single rebind increment, since this counter is fleet-wide. `signaling_raw` also spans several message types and **stays merged**: that is the same rule returning the other answer, not an unfinished half of this split. The shared stem means `payload_kind=~"participant_update.*"` still recovers the old merged series.
 - **`participant_update_muted` was split out at story 2 task 12, on the same DEMONSTRATED-CONSUMER-NEED rule.** A dropped `ParticipantMuteUpdate` has no re-sync path: join/leave state is rebuilt from the roster, but mute state after join is delivered ONLY by these updates — server mute by the live broadcast and client mute (since the story 3 R-15 fix, 2026-10-24) by the per-meeting fan-out; the join roster carries both only as the snapshot at join (there is no late-joiner replay since 2026-10-25). So a drop leaves that client rendering a stale mute indicator until the next mute change on that participant, or the observer's rejoin — which may never come. Client- and server-mute updates share this value (same message, same consequence, same remedy). This counts the participant-actor-to-stream hop only; the meeting-actor-to-participant hop is an awaited send and does not drop. Distinct consequence, distinct remedy. Past participle, matching `_joined` / `_left`, so `payload_kind=~"participant_update.*"` still recovers the merged series.
 - **`meeting_kek_update`** is the KEK-update kind, a `try_send` site of its own (`OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE`, `actors/participant.rs`): a KEK push the outbound channel dropped. The same event is also `mc_meeting_kek_pushes_total{outcome="dropped_outbound"}` — two angles on one event, one as outbound loss, one as a rotation that did not reach a member. Alert on the push counter (`MCKekPushFailureRate`), not here.
-- **`media_handler_set`** (story 4 MC-A) is the `MediaHandlerSet` kind, a `try_send` site of its own (`OUTBOUND_PAYLOAD_MEDIA_HANDLER_SET`, `actors/participant.rs`), split out on the same DEMONSTRATED-CONSUMER-NEED rule: a dropped set has no re-sync path until the next membership change, so that client keeps dialling the previous membership (no media from a newly registered handler, or dials to a removed one). Expected-empty.
+- **`media_handler_set`** (story 4 MC-A) is the `MediaHandlerSet` kind, a `try_send` site of its own (`OUTBOUND_PAYLOAD_MEDIA_HANDLER_SET`, `actors/participant.rs`), split out on the same DEMONSTRATED-CONSUMER-NEED rule: a dropped set leaves that client on the previous membership or the previous `media_dial` tokens (no media from a newly registered handler, dials to a removed one, or a token nearing expiry). Every push reason (`mc_media_handler_set_pushes_total{reason}`) drops here. Since story 4 MC-D the next TTL/3 refresh heals a drop; an in-set client holds only expired tokens only after about three consecutive drops. Expected-empty.
 - **`participant_update_left` is the named CORRELATOR for the `MCClientRosterKeyRebind` tripwire** (`infra/docker/prometheus/rules/mc-alerts.yaml`). That rule's known cause 3 is a lost `ParticipantLeft` followed by an R-16 `sender_id` reissue. That cause REQUIRES a sender-id-exhaustion epoch reset in the meeting (`mc_meeting_kek_generated_total{trigger="sender_space_exhausted"}`; `media_admission/epoch.rs`), and no reset rules it out. That is the decisive check. `participant_update_left` read over MC's process lifetime only SUPPORTS it. A short-window zero rules nothing out, because the lost Left can precede the reissue by hours. Being fleet-wide, it never CONFIRMS any single rebind increment. It is a correlator, never an alert input.
 - **The client did not receive something MC decided to send.**
 - **EVERY DROP IS COUNTED HERE; ONLY THE FIRST IS LOGGED PER CONNECTION. A SINGLE WARN DOES NOT MEAN A SINGLE DROP.** The WARN at `mc.actor.participant` fires once per participant actor and is deliberately not repeated — a per-message log on a client-drivable path is a log-amplification vector, and a wedged outbound channel drops one message per roster broadcast, i.e. O(participants x events) from one bad connection. **So log-line volume understates drop volume by orders of magnitude, and this counter is the only complete record.** Triaging by `grep` first — which is what people actually do — shows one line and reads as an isolated blip; the truth is the opposite. Take the magnitude from here, never from the log.
@@ -1265,10 +1306,10 @@ which MC records on the participant actor.
 - **Dashboard**: MC Overview - Client-Reported MH Status by State
 
 ### `mc_participant_mh_status_dropped_total`
-- **Expected-empty**: yes — drops are cap/over-limit refusals of client-reported status, zero on a well-behaved client
+- **Expected-empty**: yes — drops are cap, over-limit or rate-limited refusals of client-reported status, zero on a well-behaved client
 - **Type**: Counter
 - **Description**: Total per-MH status drops on the client→MC reporting path,
-  by reason. Two independent security bounds:
+  by reason. Three independent security bounds:
   - `cap`: a per-entry drop when the participant is already tracking the
     per-participant cap (`MAX_MH_STATUSES_PER_PARTICIPANT = 16`) distinct MH
     URLs. Updates to already-tracked MH URLs are always allowed and never
@@ -1276,17 +1317,28 @@ which MC records on the participant actor.
   - `over_limit`: a per-MESSAGE drop when a single `MediaConnectionUpdate`
     carries more than `MAX_MH_STATUSES_PER_UPDATE = 64` statuses (input
     amplification bound); the excess is refused before any per-entry work.
+  - `rate_limited` (story 4 MC-D): a per-MESSAGE drop when the update's
+    ref-keyed reports were NOT forwarded to the meeting actor because the
+    connection's status-forward limiter was empty
+    (`MH_STATUS_FORWARD_BURST`, `webtransport/connection.rs`). Counted once
+    per update, never per status; an update with no ref-keyed report spends
+    and counts nothing. The legacy url-keyed recording still happens.
 - **Labels**:
-  - `reason`: Drop reason — `cap` (per-entry, map full) or `over_limit`
-    (per-message, oversized batch)
-- **Cardinality**: Low (2 reasons)
-- **Usage**: Detect a client flooding distinct MH URLs (`cap`) or packing an
-  oversized batch into one frame (`over_limit`) — both abuse/bug signals. No
+  - `reason`: Drop reason — `cap` (per-entry, map full), `over_limit`
+    (per-message, oversized batch) or `rate_limited` (per-message, the hop
+    into the shared meeting mailbox over rate). Emitted only through the
+    `MH_STATUS_DROP_*` consts; zero-initialised from `MH_STATUS_DROP_REASONS`.
+- **Cardinality**: Low (3 reasons)
+- **Usage**: Detect a client flooding distinct MH URLs (`cap`), packing an
+  oversized batch into one frame (`over_limit`), or sending ref-keyed updates
+  faster than the status-forward limiter allows (`rate_limited`) — all three
+  abuse/bug signals. No
   client-supplied strings are logged on either reject path (security control),
   so this counter is the only signal.
 - **Recorded in**: `actors/participant.rs::handle_record_mh_statuses` (`cap`);
   `webtransport/connection.rs::handle_media_connection_update` (`over_limit`)
-- **Dashboard**: MC Overview - Dropped Client MH Status (cap)
+  and `forward_client_handler_reports` (`rate_limited`)
+- **Dashboard**: MC Overview - Dropped Client MH Status
 
 ---
 

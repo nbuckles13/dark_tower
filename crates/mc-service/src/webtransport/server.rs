@@ -91,6 +91,7 @@ impl WebTransportServer {
         mc_grpc_endpoint: String,
         client_media_config: crate::media_signaling::ClientMediaConfig,
         heartbeat: crate::media_routing::HeartbeatTiming,
+        media_dial: crate::media_dial::MediaDialTiming,
         max_connections: usize,
         quic_max_idle_timeout: Duration,
         cancel_token: CancellationToken,
@@ -121,6 +122,9 @@ impl WebTransportServer {
         }
         // Same discipline: the published settle window is the enforced one.
         metrics::set_connect_settle_window(client_media_config.connect_settle_window);
+        // Same discipline: the published media_dial TTL and TTL/3 are the very
+        // timing every meeting mints and refreshes with (ADR-0039 §5).
+        media_dial.publish_config_gauges();
 
         Self {
             bind_address,
@@ -139,6 +143,7 @@ impl WebTransportServer {
                 ),
                 connect_settle_window: client_media_config.connect_settle_window,
                 heartbeat,
+                media_dial,
             }),
             client_media_config,
             max_connections,

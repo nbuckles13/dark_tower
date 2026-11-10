@@ -333,6 +333,52 @@ impl MeetingActorHandle {
         }
     }
 
+    /// Forward a connection's client-reported handler statuses (ADR-0039 §4,
+    /// §5). Diagnostic only; see `MeetingMessage::ClientHandlerReports`.
+    ///
+    /// # Errors
+    ///
+    /// `McError::Internal` if the actor is gone.
+    pub async fn report_client_handler_statuses(
+        &self,
+        participant_id: String,
+        reports: Vec<crate::media_dial::status::ClientHandlerReport>,
+    ) -> Result<(), McError> {
+        self.sender
+            .send(MeetingMessage::ClientHandlerReports {
+                participant_id,
+                reports,
+            })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
+    }
+
+    /// The latest client-reported status per in-set ref for one participant.
+    /// **Test builds only.**
+    ///
+    /// # Errors
+    ///
+    /// `McError::Internal` if the actor is gone.
+    #[cfg(feature = "test-seams")]
+    pub async fn client_handler_statuses_for_test(
+        &self,
+        participant_id: &str,
+    ) -> Result<
+        std::collections::BTreeMap<std::num::NonZeroU32, crate::media_dial::status::LatestReport>,
+        McError,
+    > {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(MeetingMessage::ClientHandlerStatusesForTest {
+                participant_id: participant_id.to_string(),
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
+    }
+
     /// Remove a handler through the actor's ONE removal helper. **Test builds
     /// only** — see `MeetingMessage::RemoveHandlerForTest`.
     ///
@@ -732,6 +778,19 @@ pub struct MeetingActor {
     kek_lifecycle: Arc<KekLifecycle>,
     /// One long-lived CSPRNG handle for every rotation (ring recommends reuse).
     rng: ring::rand::SystemRandom,
+    /// The meeting's `media_dial` signing key (ADR-0039 §5): generated at
+    /// actor creation, held ONLY here, beside and separate from `admission`
+    /// (never derived from the KEK, never touched by a KEK path), never
+    /// persisted, logged or serialized; dies with the actor. Its redacting
+    /// wrapper exposes only the public half and `mint`.
+    dial_signing_key: crate::media_dial::key::DialSigningKey,
+    /// Where minted `iat` comes from (the wall clock in production).
+    dial_clock: crate::media_dial::DialClock,
+    /// Per-participant TTL/3 refresh schedule and queued set pushes.
+    dial_refresh: crate::media_dial::refresh::DialRefresh,
+    /// Latest client-reported status per (participant, `handler_ref`) and the
+    /// FAILED re-push limiter. Diagnostic: never read by routing.
+    client_statuses: crate::media_dial::status::ClientHandlerStatuses,
     /// Test seam: never auto-fire the rotation; `ForceKekRotation` drives it.
     #[cfg(feature = "test-seams")]
     kek_debounce_manual: bool,
@@ -917,6 +976,14 @@ impl MeetingActor {
             RotationTrigger::MeetingCreated,
         );
 
+        // ADR-0039 §5: the per-meeting `media_dial` signing key, from the SAME
+        // system CSPRNG, as its own value — never derived from the KEK. Fail
+        // closed exactly like the KEK: no fallback, no deterministic key.
+        let dial_signing_key =
+            crate::media_dial::key::DialSigningKey::generate(&rng).map_err(|_| {
+                McError::Internal("Failed to initialise meeting key material".to_string())
+            })?;
+
         // `key_custody=operator` (ADR-0036 §4, §11): media is encrypted between
         // clients; MH, transport and storage cannot read it; MC can. Never
         // described as end-to-end or zero-trust, and never a boolean.
@@ -928,7 +995,7 @@ impl MeetingActor {
         );
 
         let join_park = JoinPark::new(handlers.ids().cloned());
-        let media = MeetingMedia::new(meeting_id.clone(), handlers);
+        let media = MeetingMedia::new(meeting_id.clone(), handlers, dial_signing_key.public_key());
         let kek_debounce = KekRotationDebounce::new(kek_lifecycle.window());
 
         let mut actor = Self {
@@ -952,6 +1019,10 @@ impl MeetingActor {
             kek_debounce,
             kek_lifecycle,
             rng,
+            dial_signing_key,
+            dial_clock: crate::media_dial::DialClock::Wall,
+            dial_refresh: crate::media_dial::refresh::DialRefresh::new(None),
+            client_statuses: crate::media_dial::status::ClientHandlerStatuses::default(),
             #[cfg(feature = "test-seams")]
             kek_debounce_manual: false,
             client_mute_fanout: ClientMuteFanout::new(Instant::now()),
@@ -1040,6 +1111,8 @@ impl MeetingActor {
         };
         let reset_cursor = seams.epoch_reset_cursor;
         let manual = seams.kek_debounce_manual;
+        let dial_refresh_seed = seams.dial_refresh_seed;
+        let dial_clock_base_unix = seams.dial_clock_base_unix;
         Self::spawn_inner(
             meeting_id,
             cancel_token,
@@ -1053,6 +1126,13 @@ impl MeetingActor {
                 actor.media.apply_seams(seams);
                 actor.kek_debounce_manual = manual;
                 actor.wiring = wiring;
+                if dial_refresh_seed.is_some() {
+                    actor.dial_refresh =
+                        crate::media_dial::refresh::DialRefresh::new(dial_refresh_seed);
+                }
+                if let Some(base_unix) = dial_clock_base_unix {
+                    actor.dial_clock = crate::media_dial::DialClock::anchored(base_unix);
+                }
             },
         )
     }
@@ -1084,6 +1164,7 @@ impl MeetingActor {
             let kek_wake = self.kek_wake();
             let fanout_wake = self.client_mute_fanout.next_wake(Instant::now());
             let park_deadline = self.join_park.deadline();
+            let dial_wake = self.dial_refresh.next_wake();
 
             tokio::select! {
                 // Handle cancellation
@@ -1162,7 +1243,24 @@ impl MeetingActor {
                     }
                 } => {
                     self.join_park.expire();
-                    self.release_parked_joins(ReleaseReason::Deadline);
+                    self.release_parked_joins(ReleaseReason::Deadline).await;
+                }
+
+                // A participant's TTL/3 `media_dial` refresh is due (ADR-0039
+                // §5). A tokio timer, so paused test time drives it.
+                () = async {
+                    match dial_wake {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.dial_refresh.collect_due(Instant::now());
+                }
+
+                // Queued handler-set pushes (refresh, FAILED re-push), under
+                // the same per-turn bound as the slot views.
+                () = std::future::ready(()), if self.dial_refresh.has_pending() => {
+                    self.flush_handler_sets().await;
                 }
 
                 // Deferred slot-view work from an earlier turn (the per-turn
@@ -1269,6 +1367,7 @@ impl MeetingActor {
                             .park(ParkedJoin { respond_to, result }, Instant::now());
                     }
                     result => {
+                        let joined = result.as_ref().ok().map(|r| r.participant_id.clone());
                         if respond_to.send(result).is_err() {
                             debug!(
                                 target: "mc.actor.meeting",
@@ -1276,6 +1375,10 @@ impl MeetingActor {
                                 reason = "connection_gone",
                                 "Join reply not delivered: the joining connection stopped waiting"
                             );
+                        } else if let Some(participant_id) = joined {
+                            // The JoinResponse carried a minted set: the
+                            // TTL/3 refresh clock starts now.
+                            self.schedule_dial_refresh(&participant_id);
                         }
                     }
                 }
@@ -1409,13 +1512,35 @@ impl MeetingActor {
                 let _ = respond_to.send(verdict);
             }
 
+            MeetingMessage::ClientHandlerReports {
+                participant_id,
+                reports,
+            } => {
+                self.handle_client_handler_reports(&participant_id, &reports);
+            }
+
+            #[cfg(feature = "test-seams")]
+            MeetingMessage::ClientHandlerStatusesForTest {
+                participant_id,
+                respond_to,
+            } => {
+                let _ = respond_to.send(self.client_statuses.latest(&participant_id));
+            }
+
             #[cfg(feature = "test-seams")]
             MeetingMessage::RemoveHandlerForTest {
                 handler_id,
                 trigger,
                 respond_to,
             } => {
+                let before = self.media.client_snapshot();
                 let removed = self.media.remove_handler(&handler_id, trigger);
+                // The client-facing half of MC-B2's removal sequence: a change
+                // to the Active set goes to every client (with fresh tokens),
+                // and client reports for the removed ref stop counting.
+                if self.media.client_snapshot().handlers != before.handlers {
+                    self.broadcast_handler_set().await;
+                }
                 let _ = respond_to.send(removed);
             }
 
@@ -1483,6 +1608,24 @@ impl MeetingActor {
                 "Participant already in meeting".to_string(),
             ));
         }
+
+        // The joiner's handler set (ADR-0039 §5): Active handlers only, a
+        // `media_dial_token` per member minted for this joiner's validated
+        // `sub`. Minted BEFORE any admission state is built, so a mint failure
+        // refuses the join with nothing to unwind (never a tokenless entry,
+        // never a half-admitted joiner). A parked reply is re-minted at
+        // release.
+        let handler_set = self
+            .mint_handler_set_for(&user_id, media.deps.media_dial)
+            .map_err(|e| {
+                error!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    error = %e,
+                    "Join handler set not minted; join refused"
+                );
+                McError::Internal(format!("Failed to issue media credentials: {e}"))
+            })?;
 
         // ADR-0036 §2/§4, invariant R-35: allocate the sender id BEFORE any
         // other admission state is built, so a failure costs nothing and leaves
@@ -1744,8 +1887,7 @@ impl MeetingActor {
             kek_generation: self.admission.keys().generation(),
             kek_rotation_debounce_seconds: self.kek_lifecycle.window_seconds(),
             participant_handle: conn_handle_for_result,
-            // Active handlers only. A parked reply is refreshed at release.
-            handler_set: self.media.client_snapshot(),
+            handler_set,
         })
     }
 
@@ -1838,6 +1980,8 @@ impl MeetingActor {
                     participant.disconnected_at = Some(Instant::now());
                     participant.connection = None;
                 }
+                // No connection, nothing to refresh: a reconnect re-pushes.
+                self.dial_refresh.forget(participant_id);
 
                 // Broadcast disconnect to other participants (informational; not
                 // serialized to the wire — the roster is only removed on grace
@@ -1892,6 +2036,9 @@ impl MeetingActor {
         // A leaver owes no client-mute fan-out: nobody may hear about it after
         // its `ParticipantLeft`.
         self.client_mute_fanout.remove(participant_id);
+        // Nor any further `media_dial` mint, and its client reports go.
+        self.dial_refresh.forget(participant_id);
+        self.client_statuses.forget(participant_id);
 
         // Broadcast leave to the remaining participants.
         self.broadcast_update(
@@ -2205,6 +2352,14 @@ impl MeetingActor {
             target: "mc.actor.meeting",
             "Participant reconnected"
         );
+
+        // (Re)join: the new connection gets its set — fresh tokens — before
+        // any directive or assignment naming a ref (ADR-0039 §5).
+        self.push_handler_set(
+            &participant_id,
+            crate::media_dial::HandlerSetPushReason::Join,
+        )
+        .await;
 
         // The declaration's client mute is ADOPTED (security Gate 1 point 2;
         // CQ-7): the kind set matched above, so the change is proven against
@@ -2804,7 +2959,7 @@ impl MeetingActor {
             self.broadcast_handler_set().await;
         }
         if self.join_park.record_verdict(&report.handler_id) {
-            self.release_parked_joins(ReleaseReason::Verdicts);
+            self.release_parked_joins(ReleaseReason::Verdicts).await;
         }
         if active_changed && self.media.reroute_all(Instant::now()) {
             self.reconcile_media(Affected::All).await;
@@ -2812,30 +2967,179 @@ impl MeetingActor {
         }
     }
 
-    /// Send the client-facing snapshot to every connected, non-parked
-    /// participant: one full snapshot each, never a diff.
-    async fn broadcast_handler_set(&self) {
-        let set = self.media.client_snapshot();
-        let parked: std::collections::HashSet<&str> =
-            self.join_park.parked_participants().collect();
-        for participant in self.participants.values() {
-            if parked.contains(participant.participant_id.as_str()) {
-                continue;
+    /// Send every connected, non-parked participant its set after a
+    /// membership change: one full snapshot each, never a diff, minted per
+    /// participant (ADR-0039 §5). Immediate (not via the bounded flush): on
+    /// each participant's ordered queue the set must precede any directive or
+    /// assignment naming a new ref. Client reports for refs that left the set
+    /// are pruned here.
+    async fn broadcast_handler_set(&mut self) {
+        let handlers = self.media.handlers();
+        self.client_statuses
+            .retain_refs(|r| handlers.is_active_ref(r));
+        let recipients: Vec<String> = self.participants.keys().cloned().collect();
+        for participant_id in recipients {
+            self.push_handler_set(
+                &participant_id,
+                crate::media_dial::HandlerSetPushReason::Change,
+            )
+            .await;
+        }
+    }
+
+    /// Mint `participant_id`'s handler set: the meeting's Active handlers, one
+    /// `media_dial_token` each (`sub` = the participant's validated
+    /// meeting-token `sub` from the roster, `aud` = the handler's id). All or
+    /// nothing (see `webtransport::handler::media_handler_set`).
+    fn mint_handler_set(
+        &self,
+        participant_id: &str,
+    ) -> Result<
+        proto_gen::dark_tower::signaling::v1::MediaHandlerSet,
+        crate::media_dial::key::MintError,
+    > {
+        use crate::media_dial::key::MintError;
+        let timing = self
+            .media
+            .media_dial_timing()
+            .ok_or(MintError::Unavailable)?;
+        let participant = self
+            .participants
+            .get(participant_id)
+            .ok_or(MintError::Unavailable)?;
+        self.mint_handler_set_for(&participant.user_id, timing)
+    }
+
+    /// [`Self::mint_handler_set`] for an explicit `sub` (the validated
+    /// meeting-token `sub`) and timing: needs no roster entry, so a join can
+    /// mint before it admits anything.
+    fn mint_handler_set_for(
+        &self,
+        sub: &str,
+        timing: crate::media_dial::MediaDialTiming,
+    ) -> Result<
+        proto_gen::dark_tower::signaling::v1::MediaHandlerSet,
+        crate::media_dial::key::MintError,
+    > {
+        let iat = self.dial_clock.now_unix();
+        crate::webtransport::handler::media_handler_set(&self.media.client_snapshot(), |h| {
+            self.dial_signing_key
+                .mint(
+                    sub,
+                    &self.meeting_id,
+                    h.handler_id.as_str(),
+                    iat,
+                    timing.ttl_seconds(),
+                )
+                .map(crate::media_dial::key::MediaDialToken::into_wire)
+        })
+    }
+
+    /// Start (or restart) `participant_id`'s TTL/3 refresh clock: a set was
+    /// just delivered to it.
+    fn schedule_dial_refresh(&mut self, participant_id: &str) {
+        if let Some(timing) = self.media.media_dial_timing() {
+            self.dial_refresh
+                .pushed(participant_id, Instant::now(), &timing);
+        }
+    }
+
+    /// Mint and send `participant_id`'s set now. A participant that is gone,
+    /// disconnected (no connection) or parked (its JoinResponse will carry the
+    /// set) gets nothing. A mint failure skips it — never a partial set — and
+    /// its refresh is rescheduled.
+    async fn push_handler_set(
+        &mut self,
+        participant_id: &str,
+        reason: crate::media_dial::HandlerSetPushReason,
+    ) {
+        let Some(connection) = self
+            .participants
+            .get(participant_id)
+            .and_then(|p| p.connection.clone())
+        else {
+            self.dial_refresh.forget(participant_id);
+            return;
+        };
+        if self
+            .join_park
+            .parked_participants()
+            .any(|p| p == participant_id)
+        {
+            return;
+        }
+        match self.mint_handler_set(participant_id) {
+            Ok(set) => {
+                if connection.send_handler_set(set, reason).await.is_err() {
+                    // The participant actor is gone (its own exit path reports
+                    // the disconnect); a dropped set on a LIVE outbound channel
+                    // is counted by the participant actor.
+                    debug!(
+                        target: "mc.actor.meeting",
+                        meeting_id = %self.meeting_id,
+                        participant_id = %participant_id,
+                        "Handler set not delivered: participant actor mailbox closed"
+                    );
+                }
             }
-            let Some(connection) = &participant.connection else {
-                continue;
-            };
-            if connection.send_handler_set(set.clone()).await.is_err() {
-                // The participant actor is gone (its own exit path reports
-                // the disconnect); a dropped set on a LIVE outbound channel is
-                // counted by the participant actor.
-                debug!(
+            Err(e) => {
+                error!(
                     target: "mc.actor.meeting",
                     meeting_id = %self.meeting_id,
-                    participant_id = %participant.participant_id,
-                    "Handler set not delivered: participant actor mailbox closed"
+                    participant_id = %participant_id,
+                    reason = reason.label(),
+                    error = %e,
+                    "Handler set not minted; participant skipped"
                 );
             }
+        }
+        self.schedule_dial_refresh(participant_id);
+    }
+
+    /// Flush queued handler-set pushes (TTL/3 refreshes, FAILED re-pushes) up
+    /// to the per-turn bound; the rest wait for a later turn.
+    async fn flush_handler_sets(&mut self) {
+        for (participant_id, reason) in self.dial_refresh.take_batch(self.media.flush_batch()) {
+            self.push_handler_set(&participant_id, reason).await;
+        }
+    }
+
+    /// Record a connection's client-reported handler statuses (ADR-0039 §4)
+    /// and queue a FAILED re-push if the session's limiter grants one. Never
+    /// routing input. A report from a participant no longer on the roster is
+    /// ignored.
+    fn handle_client_handler_reports(
+        &mut self,
+        participant_id: &str,
+        reports: &[crate::media_dial::status::ClientHandlerReport],
+    ) {
+        use crate::media_dial::status::Repush;
+        if !self.participants.contains_key(participant_id) {
+            return;
+        }
+        let handlers = self.media.handlers();
+        let intake = self.client_statuses.intake(
+            participant_id,
+            reports,
+            |r| handlers.is_active_ref(r),
+            Instant::now().into_std(),
+        );
+        match intake.repush {
+            Repush::Granted => self.dial_refresh.mark(
+                participant_id,
+                crate::media_dial::HandlerSetPushReason::FailedReport,
+            ),
+            Repush::RateLimited => {
+                if self.client_statuses.first_rate_limit(participant_id) {
+                    debug!(
+                        target: "mc.actor.meeting",
+                        meeting_id = %self.meeting_id,
+                        participant_id = %participant_id,
+                        "FAILED re-push rate-limited for this session; further reports are recorded only"
+                    );
+                }
+            }
+            Repush::NotRequested => {}
         }
     }
 
@@ -2848,7 +3152,7 @@ impl MeetingActor {
     /// on its outbound queue, which its connection forwards only AFTER writing
     /// this reply, so it is redundant or newer, never older. A parked joiner no
     /// longer on the roster is answered `Draining`, never handed the KEK.
-    fn release_parked_joins(&mut self, reason: ReleaseReason) {
+    async fn release_parked_joins(&mut self, reason: ReleaseReason) {
         let parked = self.join_park.take_parked();
         if parked.is_empty() {
             return;
@@ -2906,7 +3210,40 @@ impl MeetingActor {
             }
             result.meeting_kek = Arc::clone(self.admission.keys().kek());
             result.kek_generation = self.admission.keys().generation();
-            result.handler_set = snapshot.clone();
+            // Re-minted at release, over the current Active set. A mint
+            // failure refuses the join AND undoes its admission through the
+            // ONE removal path a leave takes (roster, binding, connection,
+            // fan-out, dial state, slots), so the roster stays consistent with
+            // the reply: never a half-admitted participant.
+            match self.mint_handler_set(&result.participant_id) {
+                Ok(set) => result.handler_set = set,
+                Err(e) => {
+                    error!(
+                        target: "mc.actor.meeting",
+                        meeting_id = %self.meeting_id,
+                        error = %e,
+                        "Parked join handler set not minted at release; join refused and admission undone"
+                    );
+                    if respond_to
+                        .send(Err(McError::Internal(format!(
+                            "Failed to issue media credentials: {e}"
+                        ))))
+                        .is_err()
+                    {
+                        debug!(
+                            target: "mc.actor.meeting",
+                            meeting_id = %self.meeting_id,
+                            reason = "connection_gone",
+                            "Parked join refusal not delivered: the joining connection stopped waiting"
+                        );
+                    }
+                    // `Removed`: MC removed it (no client leave happened).
+                    self.remove_and_broadcast_left(&result.participant_id, LeaveReason::Removed)
+                        .await;
+                    continue;
+                }
+            }
+            let participant_id = result.participant_id.clone();
             if respond_to.send(Ok(result)).is_err() {
                 debug!(
                     target: "mc.actor.meeting",
@@ -2914,6 +3251,8 @@ impl MeetingActor {
                     reason = "connection_gone",
                     "Parked join reply not delivered: the joining connection stopped waiting"
                 );
+            } else {
+                self.schedule_dial_refresh(&participant_id);
             }
         }
     }

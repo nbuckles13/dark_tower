@@ -4007,7 +4007,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Rate of per-MH status entries dropped because the participant already tracks the per-participant cap of distinct MH URLs (R-60). Nonzero means a client flooded distinct MH URLs. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero \u2014 it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
+      "description": "Client-reported per-MH status (MediaConnectionUpdate) refused on the client->MC path, by reason. cap: per ENTRY, the participant already tracks the per-participant cap of distinct MH urls (updates to tracked urls always land). over_limit: per UPDATE, one MediaConnectionUpdate carried more statuses than one update may (the excess is refused before any per-entry work). rate_limited (story 4 MC-D): per UPDATE, its handler_ref-keyed reports were not forwarded into the shared meeting-actor mailbox because the connection's status-forward limiter was empty; the legacy url-keyed recording still happens. Counted once per update, never per status, and never together with over_limit for one update. All three are abuse or client-bug signals; no client-supplied string is logged on any reject path, so this counter is the only record. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero \u2014 it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4092,7 +4092,7 @@
           "refId": "A"
         }
       ],
-      "title": "Dropped Client MH Status (cap)",
+      "title": "Dropped Client MH Status",
       "type": "timeseries"
     },
     {

@@ -899,6 +899,24 @@ async fn eligibility_predicate_matches_sql(pool: PgPool) {
         seed(&pool, &r.id, r.region, r.status.as_db_str(), ms(r.age)).await;
         set_load(&pool, &r.id, r.current, r.max).await;
     }
+    // Re-stamp EVERY row's heartbeat age in ONE statement, right before the
+    // query, so all ages share one NOW(). Seeding row by row lets NOW()
+    // advance across the loop, and under load the first "fresh" row (1 s
+    // inside the bound) aged past it before the query ran — a time-dependent
+    // flake, not a predicate disagreement.
+    let (ids, ages): (Vec<String>, Vec<i64>) =
+        rows.iter().map(|r| (r.id.clone(), ms(r.age))).unzip();
+    sqlx::query(
+        "UPDATE media_handlers AS m \
+         SET last_heartbeat_at = NOW() - v.age_ms * INTERVAL '1 millisecond' \
+         FROM UNNEST($1::text[], $2::bigint[]) AS v(handler_id, age_ms) \
+         WHERE m.handler_id = v.handler_id",
+    )
+    .bind(&ids)
+    .bind(&ages)
+    .execute(&pool)
+    .await
+    .expect("re-stamp heartbeat ages");
     let exclude: Vec<String> = rows
         .iter()
         .filter(|r| r.excluded)

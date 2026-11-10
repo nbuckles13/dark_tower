@@ -50,11 +50,13 @@ pub(crate) const OUTBOUND_PAYLOAD_SIGNALING_RAW: &str = "signaling_raw";
 /// rotation that did not reach a member.
 pub(crate) const OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE: &str = "meeting_kek_update";
 
-/// `payload_kind` label for a `MediaHandlerSet` (ADR-0039 §4) dropped on the
-/// outbound channel. Its own value by DEMONSTRATED CONSUMER NEED: a dropped
-/// set has no re-sync path until the next membership change, so the client
-/// keeps dialling the old membership (no media from a new handler, or a dial
-/// to a removed one) — a consequence distinct from every other kind.
+/// `payload_kind` label for a `MediaHandlerSet` (ADR-0039 §4, §5) dropped on
+/// the outbound channel — for EVERY push reason (join re-push, membership
+/// change, token refresh, FAILED re-push). Its own value by DEMONSTRATED
+/// CONSUMER NEED: a dropped set leaves the client on the old membership or the
+/// old tokens until the next push. The next TTL/3 refresh heals a drop; an
+/// in-set client holds only expired `media_dial` tokens only after about three
+/// consecutive drops — a consequence distinct from every other kind.
 pub(crate) const OUTBOUND_PAYLOAD_MEDIA_HANDLER_SET: &str = "media_handler_set";
 
 /// Maximum distinct MH statuses recorded per participant (R-60 security cap).
@@ -149,10 +151,11 @@ impl ParticipantActorHandle {
     /// `McError::Internal` if the mailbox is closed.
     pub async fn send_handler_set(
         &self,
-        set: crate::media_routing::ClientHandlerSet,
+        set: proto_gen::dark_tower::signaling::v1::MediaHandlerSet,
+        reason: crate::media_dial::HandlerSetPushReason,
     ) -> Result<(), McError> {
         self.sender
-            .send(ParticipantMessage::HandlerSet { set })
+            .send(ParticipantMessage::HandlerSet { set, reason })
             .await
             .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
     }
@@ -504,8 +507,8 @@ impl ParticipantActor {
                 false
             }
 
-            ParticipantMessage::HandlerSet { set } => {
-                self.handle_handler_set(&set);
+            ParticipantMessage::HandlerSet { set, reason } => {
+                self.handle_handler_set(set, reason);
                 false
             }
 
@@ -664,9 +667,17 @@ impl ParticipantActor {
         }
     }
 
-    /// Encode the meeting's handler set onto the wire, through the ONE
-    /// projection (`webtransport::handler::media_handler_set`).
-    fn handle_handler_set(&mut self, set: &crate::media_routing::ClientHandlerSet) {
+    /// Encode this participant's (already minted) handler set onto the wire,
+    /// the `handle_kek_update` analogue: the token-bearing set is encoded HERE,
+    /// never carried through the mailbox as raw bytes.
+    ///
+    /// Counted on `mc_media_handler_set_pushes_total{reason}` at successful
+    /// enqueue; a full channel is a `media_handler_set` drop instead.
+    fn handle_handler_set(
+        &mut self,
+        set: proto_gen::dark_tower::signaling::v1::MediaHandlerSet,
+        reason: crate::media_dial::HandlerSetPushReason,
+    ) {
         use prost::Message;
         use proto_gen::dark_tower::signaling::v1::{server_message, ServerMessage};
 
@@ -678,16 +689,16 @@ impl ParticipantActor {
         };
         let (trace_parent, trace_state) = crate::webtransport::trace::inject_current_context();
         let message = ServerMessage {
-            message: Some(server_message::Message::MediaHandlerSet(
-                crate::webtransport::handler::media_handler_set(set),
-            )),
+            message: Some(server_message::Message::MediaHandlerSet(set)),
             trace_parent,
             trace_state,
         };
         if tx
             .try_send(bytes::Bytes::from(message.encode_to_vec()))
-            .is_err()
+            .is_ok()
         {
+            crate::observability::metrics::record_handler_set_push(reason);
+        } else {
             self.record_outbound_drop(OUTBOUND_PAYLOAD_MEDIA_HANDLER_SET);
         }
     }
@@ -734,7 +745,9 @@ impl ParticipantActor {
         for (mh_url, status) in statuses {
             let known = self.mh_statuses.contains_key(&mh_url);
             if !known && self.mh_statuses.len() >= MAX_MH_STATUSES_PER_PARTICIPANT {
-                crate::observability::metrics::record_participant_mh_status_dropped("cap");
+                crate::observability::metrics::record_participant_mh_status_dropped(
+                    crate::observability::metrics::MH_STATUS_DROP_CAP,
+                );
                 continue;
             }
             crate::observability::metrics::record_participant_mh_status(status.state.label());
@@ -905,28 +918,48 @@ mod tests {
         use prost::Message;
         use proto_gen::dark_tower::signaling::v1::{server_message, ServerMessage};
 
+        use crate::media_dial::HandlerSetPushReason;
+        use proto_gen::dark_tower::signaling::v1::{MediaHandlerSet, MediaServerInfo};
+
         let snap = MetricAssertion::snapshot();
         let (mut actor, mut rx) = bare_actor_with_stream(1);
-        let set = crate::media_routing::ClientHandlerSet {
-            version: 2,
-            handlers: vec![crate::media_routing::ClientHandlerEntry {
+        let set = MediaHandlerSet {
+            handler_set_version: 2,
+            handlers: vec![MediaServerInfo {
                 media_handler_url: "https://mh-0.test:4434".to_string(),
-                handler_ref: std::num::NonZeroU32::MIN,
+                handler_ref: 1,
+                media_dial_token: "hdr.claims.sig-test-token".to_string(),
             }],
         };
-        actor.handle_handler_set(&set);
+        let refresh_cell = || {
+            snap.counter("mc_media_handler_set_pushes_total")
+                .with_labels(&[("reason", "token_refresh"), ("key_custody", "operator")])
+        };
+        // The typed mailbox message never renders the token (S9).
+        let message = ParticipantMessage::HandlerSet {
+            set: set.clone(),
+            reason: HandlerSetPushReason::TokenRefresh,
+        };
+        assert!(!format!("{message:?}").contains("sig-test-token"));
+
+        actor.handle_handler_set(set.clone(), HandlerSetPushReason::TokenRefresh);
         let delivered = ServerMessage::decode(rx.try_recv().expect("delivered").as_ref()).unwrap();
         match delivered.message {
             Some(server_message::Message::MediaHandlerSet(wire)) => {
                 assert_eq!(wire.handler_set_version, 2);
                 assert_eq!(wire.handlers.len(), 1);
                 assert_eq!(wire.handlers[0].handler_ref, 1);
+                assert_eq!(
+                    wire.handlers[0].media_dial_token,
+                    "hdr.claims.sig-test-token"
+                );
             }
             other => panic!("expected MediaHandlerSet, got {other:?}"),
         }
         snap.counter("mc_participant_outbound_messages_dropped_total")
             .with_labels(&[("payload_kind", "media_handler_set")])
             .assert_delta(0);
+        refresh_cell().assert_delta(1);
 
         // Fill the one slot with something else, then the set is dropped.
         actor
@@ -935,10 +968,12 @@ mod tests {
                 data: vec![0],
             })
             .await;
-        actor.handle_handler_set(&set);
+        actor.handle_handler_set(set, HandlerSetPushReason::TokenRefresh);
         snap.counter("mc_participant_outbound_messages_dropped_total")
             .with_labels(&[("payload_kind", "media_handler_set")])
             .assert_delta(1);
+        // A drop is not a push: pushes + drops = attempts.
+        refresh_cell().assert_delta(1);
     }
 
     /// A closing connection is benign `participant_gone`, not a failure: a
