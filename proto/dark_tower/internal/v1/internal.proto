@@ -1188,12 +1188,78 @@ message AssignMeetingWithMhResponse {
 // ADR-0010 Section 4a: MH Registration and Load Reports
 // ============================================================================
 
-// Request to register a media handler with the global controller
+// Request to register a media handler with the global controller.
+//
+// REGISTERMH ENDPOINT RULE (GC; ADR-0039 §7). Stated ONCE here; the endpoint
+// fields below point at it. Arms 0-3 are carried verbatim from
+// docs/debates/2026-10-28-mh-replacement-and-migration/gc-register-rule.txt:
+//
+// 0. Allowlist first (config keys injected by deploy render, values derived):
+//    webtransport_endpoint: scheme https, GC_MH_WT_ALLOWED_HOSTS (exact hosts
+//    or ".suffix"), GC_MH_WT_ALLOWED_PORTS; grpc_endpoint:
+//    GC_MH_GRPC_ALLOWED_SCHEMES (grpc today = cleartext h2c, unauthenticated;
+//    flips by config only to a TLS scheme when S6 mTLS lands, spelling decided
+//    at S6), GC_MH_GRPC_ALLOWED_CIDRS, GC_MH_GRPC_ALLOWED_PORTS. Failure =
+//    INVALID_ARGUMENT, outcome=invalid_endpoint.
+// 1. An incarnation's endpoints are FIXED FOR ITS LIFE: an existing handler_id
+//    re-registering with either endpoint changed = FAILED_PRECONDITION,
+//    outcome=endpoint_changed.
+// 2. No two LIVE incarnations share an endpoint; SEQUENTIAL reuse after an
+//    incarnation is gone is permitted (fixed address pools: Kind hostPort
+//    slots, prod hostPort 443 per node; the platform lock guarantees no live
+//    overlap). Against any other handler_id's row matching either endpoint:
+//    a. both endpoints match -> SUPERSEDE (in-place container restart): the
+//       other row is deleted in the same upsert transaction;
+//       outcome=superseded, match=both.
+//    b. exactly one matches and that row is draining, unhealthy, or stale
+//       (heartbeat older than the MH staleness bound) -> SUPERSEDE;
+//       outcome=superseded, match=one_sided.
+//    c. exactly one matches and that row is fresh and pending/healthy/degraded
+//       -> REJECT FAILED_PRECONDITION with a distinct message
+//       ("address_conflict"); outcome=address_conflict. A live serving MH is
+//       never displaced by a one-sided match.
+// 3. Superseded rows affect only new selection; MC never reacts to GC registry
+//    rows. A superseded id is never re-granted (per-meeting tombstone +
+//    deleted row).
+//
+// Notes on the rule (GC-2 enforcement; not part of the debate text):
+// - "cleartext h2c, unauthenticated" describes the MC->MH channel MC dials at
+//   grpc_endpoint: no TLS, no peer authentication of the MH server, and MC's
+//   bearer crosses it in cleartext (S6). The allowlist bounds where MC will
+//   send its credential. It is NOT peer authentication and does not close S6.
+// - RegisterMH itself stays an authenticated call (service token, routing
+//   unchanged). handler_id and both endpoints remain MH-ASSERTED: any caller
+//   GC's auth layer admits to this service (a media-handler service token) may
+//   assert any handler_id and any endpoints inside the allowlist. Supersede is
+//   a liveness/address rule over authenticated but self-asserted
+//   registrations, not an authorization decision.
+// - Kind allowlist values are derived from the MH slot table and the kind
+//   podSubnet, never retyped. The grpc_endpoint host must be an IP literal
+//   inside a CIDR. Both endpoints must be in canonical form (lowercase host,
+//   canonical IP text, explicit port, no userinfo/path/query/fragment, no
+//   trailing "/"): GC compares endpoints as exact strings.
+// - The MH staleness bound is GC_MH_STALENESS_MULTIPLIER x
+//   GC_MH_LOAD_REPORT_INTERVAL_MS. On address_conflict MH retries until the
+//   conflicting row goes stale (after the bound, case c becomes case b). An
+//   endpoint_changed reject leaves the stored row unchanged; re-registering
+//   with identical endpoints is accepted and resets the row to pending.
+// - Outcome vocabulary (GC telemetry and log labels on
+//   gc_mh_registrations_total, NOT wire fields): ok |
+//   superseded{match=both|one_sided} | address_conflict | endpoint_changed |
+//   invalid_endpoint. On the wire, ok and superseded both return
+//   RegisterMHResponse{accepted=true}; every reject is a gRPC Status
+//   (INVALID_ARGUMENT / FAILED_PRECONDITION), never accepted=false. Status
+//   message strings (including "address_conflict") are for operators only:
+//   callers MUST NOT branch on them.
 message RegisterMHRequest {
   string handler_id = 1; // Unique handler identifier
   string region = 2; // Deployment region (e.g., "us-east-1")
-  string webtransport_endpoint = 3; // WebTransport endpoint for client connections
-  string grpc_endpoint = 4; // gRPC endpoint for MC→MH communication
+  // WebTransport endpoint for client connections.
+  // Endpoint rule: see the block above RegisterMHRequest.
+  string webtransport_endpoint = 3;
+  // gRPC endpoint for MC→MH communication.
+  // Endpoint rule: see the block above RegisterMHRequest.
+  string grpc_endpoint = 4;
   uint32 max_streams = 5; // Maximum concurrent streams
 }
 

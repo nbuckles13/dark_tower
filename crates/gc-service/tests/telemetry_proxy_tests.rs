@@ -154,7 +154,7 @@ impl TestTelemetryServer {
                 opts.rate_limit_per_minute.to_string(),
             ),
         ]);
-        vars.extend(gc_test_utils::reference_mh_registry_vars());
+        vars.extend(gc_test_utils::mh_config_vars());
         let config = Config::from_vars(&vars)?;
 
         let (_tx, rx) = watch::channel(SecretString::from("test-token"));
@@ -586,7 +586,7 @@ async fn telemetry_collector_timeout_returns_502(pool: PgPool) -> Result<()> {
         ("GC_CLIENT_ID".to_string(), "c".to_string()),
         ("GC_CLIENT_SECRET".to_string(), "s".to_string()),
     ]);
-    vars.extend(gc_test_utils::reference_mh_registry_vars());
+    vars.extend(gc_test_utils::mh_config_vars());
     let config = Config::from_vars(&vars)?;
     let (_tx, rx) = watch::channel(SecretString::from("test-token"));
     let telemetry = TelemetryState {
@@ -695,7 +695,7 @@ async fn telemetry_drops_pii_but_forwards_filtered_bytes(pool: PgPool) -> Result
         ("GC_CLIENT_ID".to_string(), "c".to_string()),
         ("GC_CLIENT_SECRET".to_string(), "s".to_string()),
     ]);
-    vars.extend(gc_test_utils::reference_mh_registry_vars());
+    vars.extend(gc_test_utils::mh_config_vars());
     let config = Config::from_vars(&vars)?;
     let (_tx, rx) = watch::channel(SecretString::from("test-token"));
     let telemetry = TelemetryState {

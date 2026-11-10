@@ -7,7 +7,7 @@
 //!
 //! - All queries use parameterized statements (SQL injection safe)
 //! - Sensitive data is not logged
-//! - Uses UPSERT pattern for registration
+//! - Registration runs the RegisterMH rule in one advisory-locked transaction
 
 use crate::errors::GcError;
 use crate::observability::metrics;
@@ -85,39 +85,315 @@ pub struct MhCandidate {
     pub load_ratio: f64,
 }
 
+/// The advisory-lock key serialising every RegisterMH transaction
+/// (`pg_advisory_xact_lock(hashtext(..))`, the idiom of
+/// `crates/ac-service/src/handlers/admin_handler.rs`). One registry-wide key.
+pub const MH_REGISTRY_LOCK_KEY: &str = "gc_mh_registry";
+
+/// One RegisterMH request after arm 0 (allowlists) has passed.
+#[derive(Debug, Clone, Copy)]
+pub struct NewMhRegistration<'a> {
+    /// MH-asserted incarnation id.
+    pub handler_id: &'a str,
+    /// MH-asserted region.
+    pub region: &'a str,
+    /// Canonical client-facing endpoint.
+    pub webtransport_endpoint: &'a str,
+    /// Canonical internal endpoint.
+    pub grpc_endpoint: &'a str,
+    /// Maximum concurrent streams (already range-checked).
+    pub max_streams: i32,
+}
+
+/// The repository's RegisterMH decision (arms 1-3). The handler maps it to
+/// the wire answer and the `gc_mh_registrations_total` outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MhRegistrationDecision {
+    /// Registered; no other row matched.
+    Registered,
+    /// Registered; `ids` were deleted (arm 2a/2b).
+    Superseded {
+        /// Which endpoints matched (`Both` if any deleted row matched both).
+        matched: metrics::MhSupersedeMatch,
+        /// The superseded handler ids (for the log line, never a label).
+        ids: Vec<String>,
+    },
+    /// Rejected, no writes: a one-sided match with a fresh serving row (2c).
+    AddressConflict {
+        /// The matched ids (for the log line, never the Status).
+        conflicting_ids: Vec<String>,
+    },
+    /// Rejected, row unchanged: the id's endpoints differ from its row (1).
+    /// Which endpoint(s) changed (for the log line; never the stored values).
+    EndpointChanged {
+        /// `webtransport_endpoint` differs from the stored row.
+        webtransport: bool,
+        /// `grpc_endpoint` differs from the stored row.
+        grpc: bool,
+    },
+}
+
+/// One other-id row sharing an endpoint, as decided on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConflictRow {
+    handler_id: String,
+    health_status: HealthStatus,
+    wt_match: bool,
+    grpc_match: bool,
+    stale: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct ConflictRowDb {
+    handler_id: String,
+    health_status: String,
+    wt_match: bool,
+    grpc_match: bool,
+    stale: bool,
+}
+
+impl TryFrom<ConflictRowDb> for ConflictRow {
+    type Error = GcError;
+
+    /// Fail CLOSED on a status outside the schema's set: the lenient
+    /// `from_db_str` would read it as `unhealthy`, which is supersedable.
+    fn try_from(r: ConflictRowDb) -> Result<Self, GcError> {
+        let health_status = HealthStatus::try_from_db_str(&r.health_status).ok_or_else(|| {
+            GcError::Internal(format!(
+                "media_handlers row has health_status outside the schema set: {:?}",
+                r.health_status
+            ))
+        })?;
+        Ok(ConflictRow {
+            handler_id: r.handler_id,
+            health_status,
+            wt_match: r.wt_match,
+            grpc_match: r.grpc_match,
+            stale: r.stale,
+        })
+    }
+}
+
+/// Roll back on a registry-invariant breach WITHOUT losing the breach: if the
+/// rollback itself fails, both contexts go into the returned error (a `?` on
+/// the rollback would replace the breach with a generic database error, on
+/// exactly the path meant to be loud).
+async fn rollback_keeping(tx: sqlx::Transaction<'_, sqlx::Postgres>, breach: String) -> GcError {
+    match tx.rollback().await {
+        Ok(()) => GcError::Internal(breach),
+        Err(rb) => GcError::Internal(format!("{breach}; rollback also failed: {rb}")),
+    }
+}
+
+/// Outcome of [`decide`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// Accept; `Some(match)` = every matched row is superseded.
+    Accept(Option<metrics::MhSupersedeMatch>),
+    /// Reject (arm 2c), no writes.
+    Reject,
+}
+
+/// Arm 2 over the other ids' matched rows (pure; ADR-0039 §7):
+/// a. both endpoints match -> supersede (match=both);
+/// b. exactly one matches and the row is draining, unhealthy or stale ->
+///    supersede (match=one_sided);
+/// c. exactly one matches and the row is fresh and pending/healthy/degraded
+///    -> reject the WHOLE request, whatever the other rows are. A live
+///    serving MH is never displaced by a one-sided match. (A both-match row
+///    plus a fresh one-sided row is legacy/mixed-version state: it rejects,
+///    failing closed.)
+fn decide(rows: &[ConflictRow]) -> Decision {
+    let mut any_both = false;
+    for row in rows {
+        if row.wt_match && row.grpc_match {
+            any_both = true;
+            continue;
+        }
+        // Exhaustive, no `_` arm: a new status must be classified explicitly.
+        let supersedable = row.stale
+            || match row.health_status {
+                HealthStatus::Draining | HealthStatus::Unhealthy => true,
+                HealthStatus::Pending | HealthStatus::Healthy | HealthStatus::Degraded => false,
+            };
+        if !supersedable {
+            return Decision::Reject;
+        }
+    }
+    Decision::Accept(match (rows.is_empty(), any_both) {
+        (true, _) => None,
+        (false, true) => Some(metrics::MhSupersedeMatch::Both),
+        (false, false) => Some(metrics::MhSupersedeMatch::OneSided),
+    })
+}
+
 /// Repository for media handler operations.
 pub struct MediaHandlersRepository;
 
 impl MediaHandlersRepository {
-    /// Register or update a media handler (UPSERT).
+    /// Register a media handler under the RegisterMH rule, arms 1-3
+    /// (ADR-0039 §7; the rule is stated once above `RegisterMHRequest` in
+    /// `internal.proto`). Arm 0 (the endpoint allowlists) is the caller's and
+    /// has already passed; endpoints are canonical, so the exact string
+    /// equality below is address equality.
     ///
-    /// If a handler with the same ID exists, updates its registration.
-    /// New registrations start with 'pending' health status.
+    /// ONE transaction, serialised registry-wide by
+    /// `pg_advisory_xact_lock(hashtext(MH_REGISTRY_LOCK_KEY))` as its first
+    /// statement (registration is rare; per-endpoint keys would need ordered
+    /// double-locking and still miss a new row overlapping two existing rows):
     ///
-    /// # Arguments
+    /// 1. The id's own row (`FOR UPDATE`): either endpoint changed ->
+    ///    rollback, [`MhRegistrationDecision::EndpointChanged`], row unchanged.
+    /// 2. Other ids' rows sharing either endpoint (`FOR UPDATE`), staleness
+    ///    computed in SQL against `staleness_bound` (GC-1's one bound) on the
+    ///    DB clock; [`decide`] applies arms 2a/2b/2c.
+    /// 3. DELETE the superseded ids, then the upsert, which never SETs an
+    ///    endpoint (re-registering the same id with identical endpoints only
+    ///    resets it to `pending` + `NOW()`).
+    /// 4. COMMIT.
     ///
-    /// * `pool` - Database connection pool
-    /// * `handler_id` - Unique handler identifier
-    /// * `region` - Deployment region (e.g., "us-east-1")
-    /// * `webtransport_endpoint` - WebTransport endpoint for client connections
-    /// * `grpc_endpoint` - gRPC endpoint for MC→MH communication
-    /// * `max_streams` - Maximum concurrent streams
+    /// One `gc_db_queries_total{operation="register_mh_txn"}` sample covers
+    /// the whole transaction: `success` for every completed decision,
+    /// INCLUDING the reject arms (the queries ran; the rule refused), and
+    /// `error` for a database failure OR a registry-invariant breach observed
+    /// under the lock (short supersede DELETE, upsert not affecting one row:
+    /// a GC bug); the GC error log distinguishes them.
     ///
     /// # Errors
     ///
-    /// Returns `GcError::Database` on database failures.
-    #[instrument(skip_all, fields(handler_id = %handler_id, region = %region))]
+    /// `GcError::Database` on a database failure; `GcError::Internal` when the
+    /// registry invariant is observed broken inside the lock (a status outside
+    /// the schema's set, a short DELETE, or an upsert not affecting one row).
+    #[instrument(skip_all, fields(handler_id = %reg.handler_id, region = %reg.region))]
     pub async fn register_mh(
         pool: &PgPool,
-        handler_id: &str,
-        region: &str,
-        webtransport_endpoint: &str,
-        grpc_endpoint: &str,
-        max_streams: i32,
-    ) -> Result<(), GcError> {
+        reg: &NewMhRegistration<'_>,
+        staleness_bound: Duration,
+    ) -> Result<MhRegistrationDecision, GcError> {
+        let bound_ms = bind_ms(staleness_bound)?;
         let start = Instant::now();
+        let result = Self::register_mh_txn(pool, reg, bound_ms).await;
+        // A rule reject is Ok(decision) here: `success`. Only Err is `error`.
+        let status = if result.is_ok() { "success" } else { "error" };
+        metrics::record_db_query("register_mh_txn", status, start.elapsed());
+        result
+    }
 
-        let query_result = sqlx::query(
+    /// The transaction body of [`Self::register_mh`]. Every exit (including
+    /// the explicit rollbacks) returns here, so the caller records exactly
+    /// one DB-query sample. Only DB statements run inside the transaction.
+    async fn register_mh_txn(
+        pool: &PgPool,
+        reg: &NewMhRegistration<'_>,
+        bound_ms: i64,
+    ) -> Result<MhRegistrationDecision, GcError> {
+        let mut tx = pool.begin().await?;
+
+        // FIRST statement, on this transaction's connection: every read below
+        // happens under the registry-wide lock.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(MH_REGISTRY_LOCK_KEY)
+            .execute(&mut *tx)
+            .await?;
+
+        // Arm 1: an incarnation's endpoints are fixed for its life.
+        let own: Option<(String, String)> = sqlx::query_as(
+            r#"
+            SELECT webtransport_endpoint, grpc_endpoint
+            FROM media_handlers
+            WHERE handler_id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(reg.handler_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((wt, grpc)) = own {
+            let webtransport = wt != reg.webtransport_endpoint;
+            let grpc = grpc != reg.grpc_endpoint;
+            if webtransport || grpc {
+                tx.rollback().await?;
+                return Ok(MhRegistrationDecision::EndpointChanged { webtransport, grpc });
+            }
+        }
+
+        // Arm 2: other ids' rows sharing either endpoint. `stale` uses the DB
+        // clock and GC-1's bound (the same predicate as selection and the
+        // sweep). NOW() is the transaction's START time, so a wait on the lock
+        // makes rows look slightly fresher: that errs toward reject, the safe
+        // direction. FOR UPDATE: a concurrent load report / sweep / retention
+        // DELETE on a matched row waits for COMMIT, so the decision is made on
+        // rows nothing else can change underneath it.
+        let rows: Vec<ConflictRowDb> = sqlx::query_as(
+            r#"
+            SELECT
+                handler_id,
+                health_status,
+                webtransport_endpoint = $2 AS wt_match,
+                grpc_endpoint = $3 AS grpc_match,
+                last_heartbeat_at < NOW() - $4 * INTERVAL '1 millisecond' AS stale
+            FROM media_handlers
+            WHERE handler_id <> $1
+              AND (webtransport_endpoint = $2 OR grpc_endpoint = $3)
+            FOR UPDATE
+            "#,
+        )
+        .bind(reg.handler_id)
+        .bind(reg.webtransport_endpoint)
+        .bind(reg.grpc_endpoint)
+        .bind(bound_ms)
+        .fetch_all(&mut *tx)
+        .await?;
+        let rows = rows
+            .into_iter()
+            .map(ConflictRow::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let superseded = match decide(&rows) {
+            Decision::Reject => {
+                tx.rollback().await?;
+                return Ok(MhRegistrationDecision::AddressConflict {
+                    conflicting_ids: rows.into_iter().map(|r| r.handler_id).collect(),
+                });
+            }
+            Decision::Accept(m) => m.map(|m| {
+                (
+                    m,
+                    rows.into_iter().map(|r| r.handler_id).collect::<Vec<_>>(),
+                )
+            }),
+        };
+
+        if let Some((_, ids)) = &superseded {
+            let deleted = sqlx::query("DELETE FROM media_handlers WHERE handler_id = ANY($1)")
+                .bind(ids)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            // Every decided id is a row this transaction holds FOR UPDATE, and
+            // row locks block EVERY writer (old-version replicas, load reports,
+            // the sweep, retention, a manual DELETE): a retention DELETE that
+            // was already running made our SELECT wait and, under READ
+            // COMMITTED, dropped that row from the result, so it never became a
+            // decided id. A short count is therefore unreachable while row
+            // locks hold: it means a bug in this function. Fail loud.
+            if deleted != ids.len() as u64 {
+                return Err(rollback_keeping(
+                    tx,
+                    format!(
+                        "register_mh: deleted {deleted} of {} superseded rows under the registry lock",
+                        ids.len()
+                    ),
+                )
+                .await);
+            }
+        }
+
+        // The ON CONFLICT path only re-registers the same id with identical
+        // endpoints (arm 1 returned above otherwise). Endpoints are never SET;
+        // the WHERE makes a future regression in arm 1 fail loudly here
+        // instead of silently rewriting them.
+        let upserted = sqlx::query(
             r#"
             INSERT INTO media_handlers (
                 handler_id, region, webtransport_endpoint, grpc_endpoint,
@@ -126,40 +402,36 @@ impl MediaHandlersRepository {
             VALUES ($1, $2, $3, $4, $5, 'pending', NOW())
             ON CONFLICT (handler_id) DO UPDATE SET
                 region = EXCLUDED.region,
-                webtransport_endpoint = EXCLUDED.webtransport_endpoint,
-                grpc_endpoint = EXCLUDED.grpc_endpoint,
                 max_streams = EXCLUDED.max_streams,
                 health_status = 'pending',
                 last_heartbeat_at = NOW(),
                 updated_at = NOW()
+            WHERE media_handlers.webtransport_endpoint = EXCLUDED.webtransport_endpoint
+              AND media_handlers.grpc_endpoint = EXCLUDED.grpc_endpoint
             "#,
         )
-        .bind(handler_id)
-        .bind(region)
-        .bind(webtransport_endpoint)
-        .bind(grpc_endpoint)
-        .bind(max_streams)
-        .execute(pool)
-        .await;
+        .bind(reg.handler_id)
+        .bind(reg.region)
+        .bind(reg.webtransport_endpoint)
+        .bind(reg.grpc_endpoint)
+        .bind(reg.max_streams)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if upserted != 1 {
+            return Err(rollback_keeping(
+                tx,
+                format!("register_mh: upsert affected {upserted} rows (expected 1)"),
+            )
+            .await);
+        }
 
-        // Record DB query metrics (ADR-0011)
-        let status = if query_result.is_ok() {
-            "success"
-        } else {
-            "error"
-        };
-        metrics::record_db_query("register_mh", status, start.elapsed());
+        tx.commit().await?;
 
-        query_result?;
-
-        tracing::info!(
-            target: "gc.repository.mh",
-            handler_id = %handler_id,
-            region = %region,
-            "Media handler registered/updated"
-        );
-
-        Ok(())
+        Ok(match superseded {
+            None => MhRegistrationDecision::Registered,
+            Some((matched, ids)) => MhRegistrationDecision::Superseded { matched, ids },
+        })
     }
 
     /// Update load report (heartbeat with capacity info) for a handler.
@@ -570,6 +842,115 @@ struct MediaHandlerRow {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn row(status: HealthStatus, wt: bool, grpc: bool, stale: bool) -> ConflictRow {
+        ConflictRow {
+            handler_id: "other".to_string(),
+            health_status: status,
+            wt_match: wt,
+            grpc_match: grpc,
+            stale,
+        }
+    }
+
+    #[test]
+    fn decide_table() {
+        use crate::observability::metrics::MhSupersedeMatch::{Both, OneSided};
+        use HealthStatus::{Degraded, Draining, Healthy, Pending, Unhealthy};
+        let cases: Vec<(&str, Vec<ConflictRow>, Decision)> = vec![
+            ("no match", vec![], Decision::Accept(None)),
+            (
+                "2a fresh healthy both",
+                vec![row(Healthy, true, true, false)],
+                Decision::Accept(Some(Both)),
+            ),
+            (
+                "2b draining wt-only",
+                vec![row(Draining, true, false, false)],
+                Decision::Accept(Some(OneSided)),
+            ),
+            (
+                "2b unhealthy grpc-only",
+                vec![row(Unhealthy, false, true, false)],
+                Decision::Accept(Some(OneSided)),
+            ),
+            (
+                "2b stale healthy",
+                vec![row(Healthy, true, false, true)],
+                Decision::Accept(Some(OneSided)),
+            ),
+            (
+                "2c fresh pending",
+                vec![row(Pending, true, false, false)],
+                Decision::Reject,
+            ),
+            (
+                "2c fresh healthy",
+                vec![row(Healthy, false, true, false)],
+                Decision::Reject,
+            ),
+            (
+                "2c fresh degraded",
+                vec![row(Degraded, true, false, false)],
+                Decision::Reject,
+            ),
+            (
+                "two one-sided rows, both supersedable",
+                vec![
+                    row(Healthy, true, false, true),
+                    row(Draining, false, true, false),
+                ],
+                Decision::Accept(Some(OneSided)),
+            ),
+            (
+                "two one-sided rows, one fresh serving",
+                vec![
+                    row(Healthy, true, false, true),
+                    row(Healthy, false, true, false),
+                ],
+                Decision::Reject,
+            ),
+            (
+                "both-match plus fresh one-sided (legacy state) fails closed",
+                vec![
+                    row(Healthy, true, true, false),
+                    row(Healthy, true, false, false),
+                ],
+                Decision::Reject,
+            ),
+            (
+                "both-match plus stale one-sided",
+                vec![
+                    row(Healthy, true, true, false),
+                    row(Pending, false, true, true),
+                ],
+                Decision::Accept(Some(Both)),
+            ),
+        ];
+        for (why, rows, want) in cases {
+            assert_eq!(decide(&rows), want, "{why}");
+        }
+    }
+
+    #[test]
+    fn conflict_row_unknown_status_fails_closed() {
+        let r = ConflictRow::try_from(ConflictRowDb {
+            handler_id: "x".to_string(),
+            health_status: "zombie".to_string(),
+            wt_match: true,
+            grpc_match: false,
+            stale: false,
+        });
+        assert!(matches!(r, Err(GcError::Internal(_))), "{r:?}");
+        let ok = ConflictRow::try_from(ConflictRowDb {
+            handler_id: "x".to_string(),
+            health_status: "draining".to_string(),
+            wt_match: true,
+            grpc_match: false,
+            stale: false,
+        });
+        assert!(ok.is_ok(), "positive twin");
+    }
 
     #[test]
     fn test_mh_candidate_fields() {

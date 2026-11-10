@@ -139,10 +139,14 @@ fn unset_message(state: &str) -> String {
 
 /// Read and validate [`ORG_SUBDOMAIN_VAR`] from the process environment.
 ///
+/// Also the Layer 7 per-run MH pool owner token (`mh_pool::RunOwner::for_run`):
+/// mh.sh's `MH_OWNER_RE` is guarded byte-identical to [`SUBDOMAIN_PATTERN`]
+/// (`validate-subdomain-regex-sync.sh`), so every valid subdomain is a valid owner.
+///
 /// Thin wrapper over the pure [`resolve_org_subdomain`]. Emits the same
 /// `[env-tests] VAR = … (from env)` provenance line `cluster.rs` emits for each URL, once
 /// per process so a suite of ~4 registrations does not repeat it.
-fn org_subdomain() -> Result<String, OrgSubdomainError> {
+pub fn org_subdomain() -> Result<String, OrgSubdomainError> {
     // NOT `.ok()`, deliberately (@semantic-guard). `.ok()` collapses `VarError::NotUnicode` into
     // `None`, so a variable that IS set to non-UTF-8 bytes would report "required but unset" and
     // send the operator hunting a Phase-1h export that demonstrably happened. That is the

@@ -9,8 +9,12 @@
 //! - Handler IDs are validated for format
 //! - Sensitive fields are not logged
 
-use crate::observability::metrics;
-use crate::repositories::{HealthStatus, MediaHandlersRepository};
+use crate::config::MhRegistryConfig;
+use crate::mh_endpoint_policy::{EndpointField, MhEndpointAllowlist, RejectedComponent};
+use crate::observability::metrics::{self, MhRegistrationOutcome};
+use crate::repositories::{
+    HealthStatus, MediaHandlersRepository, MhRegistrationDecision, NewMhRegistration,
+};
 use chrono::Utc;
 use proto_gen::dark_tower::internal::v1::{
     media_handler_registry_service_server::MediaHandlerRegistryService, RegisterMhRequest,
@@ -18,6 +22,7 @@ use proto_gen::dark_tower::internal::v1::{
 };
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
@@ -27,9 +32,6 @@ const MAX_HANDLER_ID_LENGTH: usize = 255;
 /// Maximum allowed region length.
 const MAX_REGION_LENGTH: usize = 50;
 
-/// Maximum allowed endpoint length.
-const MAX_ENDPOINT_LENGTH: usize = 255;
-
 /// gRPC service for MH registration and load reports.
 pub struct MhService {
     pool: Arc<PgPool>,
@@ -37,15 +39,25 @@ pub struct MhService {
     /// GC is its single source (`GC_MH_LOAD_REPORT_INTERVAL_MS`); it is the
     /// same value the staleness bound derives from.
     load_report_interval_ms: u64,
+    /// The ONE MH staleness bound (`MhRegistryConfig::staleness_bound`),
+    /// used by the registration rule's "stale" check (arm 2b).
+    staleness_bound: Duration,
+    /// RegisterMH endpoint allowlists (arm 0).
+    endpoint_allowlist: MhEndpointAllowlist,
 }
 
 impl MhService {
-    /// Create a new MH service. `load_report_interval_ms` is
-    /// `MhRegistryConfig::load_report_interval_ms` (validated at config load).
-    pub fn new(pool: Arc<PgPool>, load_report_interval_ms: u64) -> Self {
+    /// Create a new MH service from GC's validated MH config.
+    pub fn new(
+        pool: Arc<PgPool>,
+        registry: &MhRegistryConfig,
+        endpoint_allowlist: MhEndpointAllowlist,
+    ) -> Self {
         Self {
             pool,
-            load_report_interval_ms,
+            load_report_interval_ms: registry.load_report_interval_ms(),
+            staleness_bound: registry.staleness_bound(),
+            endpoint_allowlist,
         }
     }
 
@@ -83,48 +95,59 @@ impl MhService {
         Ok(())
     }
 
-    /// Validate an endpoint URL.
-    ///
-    /// Endpoints must be non-empty, at most 255 characters, and start with
-    /// http:// or https://.
-    fn validate_endpoint(endpoint: &str, field_name: &str) -> Result<(), Status> {
-        if endpoint.is_empty() {
-            return Err(Status::invalid_argument(format!(
-                "{} is required",
-                field_name
-            )));
+    /// Arm 0 of the RegisterMH rule: shape bounds, then the per-zone
+    /// allowlists. A failure is counted (`invalid_endpoint`) and logged here;
+    /// the Status names the field and component, never the allowlist.
+    fn check_endpoints(&self, req: &RegisterMhRequest) -> Result<(), Status> {
+        for (field, endpoint) in [
+            (EndpointField::WebTransport, &req.webtransport_endpoint),
+            (EndpointField::Grpc, &req.grpc_endpoint),
+        ] {
+            if let Err(status) = super::validate_endpoint_bounds(endpoint, field.field_name()) {
+                metrics::record_mh_registration(MhRegistrationOutcome::InvalidEndpoint);
+                tracing::warn!(
+                    target: "gc.grpc.mh_service",
+                    handler_id = %req.handler_id,
+                    field = field.field_name(),
+                    component = RejectedComponent::Syntax.as_str(),
+                    reason = %status.message(),
+                    "MH registration rejected: invalid endpoint"
+                );
+                return Err(status);
+            }
         }
-        if endpoint.len() > MAX_ENDPOINT_LENGTH {
-            return Err(Status::invalid_argument(format!(
-                "{} is too long",
-                field_name
-            )));
-        }
-        // Basic URL format validation - allow http, https, and grpc schemes
-        if !endpoint.starts_with("http://")
-            && !endpoint.starts_with("https://")
-            && !endpoint.starts_with("grpc://")
-        {
-            return Err(Status::invalid_argument(format!(
-                "{} must be a valid URL with http, https, or grpc scheme",
-                field_name
-            )));
-        }
-        Ok(())
+        self.endpoint_allowlist
+            .check(&req.webtransport_endpoint, &req.grpc_endpoint)
+            .map_err(|rejection| {
+                metrics::record_mh_registration(MhRegistrationOutcome::InvalidEndpoint);
+                // Endpoints are bounded by MAX_ENDPOINT_LENGTH and logged with
+                // Debug (`?`) so control characters cannot forge log lines.
+                tracing::warn!(
+                    target: "gc.grpc.mh_service",
+                    handler_id = %req.handler_id,
+                    field = rejection.field.field_name(),
+                    component = rejection.component.as_str(),
+                    webtransport_endpoint = ?req.webtransport_endpoint,
+                    grpc_endpoint = ?req.grpc_endpoint,
+                    "MH registration rejected: endpoint outside its zone allowlist"
+                );
+                Status::invalid_argument(rejection.to_string())
+            })
     }
 }
 
 #[tonic::async_trait]
 impl MediaHandlerRegistryService for MhService {
-    /// Register a new media handler.
+    /// Register a media handler under the RegisterMH endpoint rule (stated
+    /// once above `RegisterMHRequest` in internal.proto; ADR-0039 §7).
     ///
-    /// # Arguments
-    ///
-    /// * `request` - Registration request with handler details
-    ///
-    /// # Returns
-    ///
-    /// Registration response with load report interval.
+    /// Every call past the pre-rule field checks records exactly ONE
+    /// `gc_mh_registrations_total` outcome, except a failed registration (a
+    /// database failure, or a registry-invariant breach observed under the
+    /// lock — a GC bug), which is
+    /// `gc_db_queries_total{operation="register_mh_txn",status="error"}` plus
+    /// the error log line, and answers INTERNAL. `ok` and `superseded` both answer
+    /// `accepted=true`; every reject is a gRPC Status, never `accepted=false`.
     #[instrument(skip_all, fields(handler_id = %request.get_ref().handler_id, region = %request.get_ref().region))]
     async fn register_mh(
         &self,
@@ -132,12 +155,9 @@ impl MediaHandlerRegistryService for MhService {
     ) -> Result<Response<RegisterMhResponse>, Status> {
         let req = request.into_inner();
 
-        // Validate required fields with format checks
+        // Pre-rule field checks (not counted as a registration outcome).
         Self::validate_handler_id(&req.handler_id)?;
         Self::validate_region(&req.region)?;
-        Self::validate_endpoint(&req.webtransport_endpoint, "webtransport_endpoint")?;
-        Self::validate_endpoint(&req.grpc_endpoint, "grpc_endpoint")?;
-
         if req.max_streams == 0 {
             return Err(Status::invalid_argument(
                 "max_streams must be greater than 0",
@@ -152,14 +172,20 @@ impl MediaHandlerRegistryService for MhService {
         let max_streams = i32::try_from(req.max_streams)
             .map_err(|_| Status::invalid_argument("max_streams exceeds the supported maximum"))?;
 
-        // Register the handler
-        MediaHandlersRepository::register_mh(
+        // Arm 0: allowlists, before any transaction opens.
+        self.check_endpoints(&req)?;
+
+        // Arms 1-3: one advisory-locked transaction.
+        let decision = MediaHandlersRepository::register_mh(
             &self.pool,
-            &req.handler_id,
-            &req.region,
-            &req.webtransport_endpoint,
-            &req.grpc_endpoint,
-            max_streams,
+            &NewMhRegistration {
+                handler_id: &req.handler_id,
+                region: &req.region,
+                webtransport_endpoint: &req.webtransport_endpoint,
+                grpc_endpoint: &req.grpc_endpoint,
+                max_streams,
+            },
+            self.staleness_bound,
         )
         .await
         .map_err(|e| {
@@ -167,12 +193,65 @@ impl MediaHandlerRegistryService for MhService {
             Status::internal("Registration failed")
         })?;
 
-        tracing::info!(
-            target: "gc.grpc.mh_service",
-            handler_id = %req.handler_id,
-            region = %req.region,
-            "MH registered successfully"
-        );
+        // The single recording + wire-mapping site.
+        match decision {
+            MhRegistrationDecision::Registered => {
+                metrics::record_mh_registration(MhRegistrationOutcome::Ok);
+                tracing::info!(
+                    target: "gc.grpc.mh_service",
+                    handler_id = %req.handler_id,
+                    region = %req.region,
+                    "MH registered successfully"
+                );
+            }
+            MhRegistrationDecision::Superseded { matched, ids } => {
+                metrics::record_mh_registration(MhRegistrationOutcome::Superseded(matched));
+                // Forensic trail for the ping-pong residual: handler identity
+                // is self-asserted, so every eviction names both sides.
+                tracing::info!(
+                    target: "gc.grpc.mh_service",
+                    handler_id = %req.handler_id,
+                    region = %req.region,
+                    superseded_handler_ids = ?ids,
+                    r#match = matched.label(),
+                    "MH registered, superseding prior registry row(s)"
+                );
+            }
+            MhRegistrationDecision::AddressConflict { conflicting_ids } => {
+                metrics::record_mh_registration(MhRegistrationOutcome::AddressConflict);
+                tracing::warn!(
+                    target: "gc.grpc.mh_service",
+                    handler_id = %req.handler_id,
+                    conflicting_handler_ids = ?conflicting_ids,
+                    webtransport_endpoint = ?req.webtransport_endpoint,
+                    grpc_endpoint = ?req.grpc_endpoint,
+                    "MH registration rejected: an endpoint is held by a fresh serving MH"
+                );
+                // Only the literal: never the other row's id or endpoints.
+                return Err(Status::failed_precondition("address_conflict"));
+            }
+            MhRegistrationDecision::EndpointChanged { webtransport, grpc } => {
+                metrics::record_mh_registration(MhRegistrationOutcome::EndpointChanged);
+                let changed = match (webtransport, grpc) {
+                    (true, true) => "both",
+                    (true, false) => "webtransport",
+                    (false, true) => "grpc",
+                    // Unreachable: the repository only returns EndpointChanged
+                    // when at least one differs; named, not panicked on.
+                    (false, false) => "none",
+                };
+                tracing::warn!(
+                    target: "gc.grpc.mh_service",
+                    handler_id = %req.handler_id,
+                    changed,
+                    webtransport_endpoint = ?req.webtransport_endpoint,
+                    grpc_endpoint = ?req.grpc_endpoint,
+                    "MH registration rejected: endpoints are fixed for an incarnation's life"
+                );
+                // Never echoes the stored endpoints.
+                return Err(Status::failed_precondition("endpoint_changed"));
+            }
+        }
 
         Ok(Response::new(RegisterMhResponse {
             accepted: true,
@@ -349,44 +428,19 @@ mod tests {
         );
     }
 
-    // === Endpoint Validation Tests ===
+    // === Endpoint shape bounds (shared with MC; zone rules are in
+    // mh_endpoint_policy.rs) ===
 
     #[test]
-    fn test_validate_endpoint_valid() {
-        assert!(MhService::validate_endpoint("http://localhost:443", "test").is_ok());
-        assert!(MhService::validate_endpoint("https://mh.example.com:443", "test").is_ok());
-        assert!(MhService::validate_endpoint("grpc://mh:50051", "test").is_ok());
-    }
-
-    #[test]
-    fn test_validate_endpoint_empty() {
-        let err = MhService::validate_endpoint("", "webtransport_endpoint").unwrap_err();
+    fn test_endpoint_bounds() {
+        let err = super::super::validate_endpoint_bounds("", "webtransport_endpoint").unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("webtransport_endpoint is required"));
-    }
-
-    #[test]
-    fn test_validate_endpoint_invalid_scheme() {
-        let err = MhService::validate_endpoint("ftp://example.com", "test").unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("valid URL"));
-    }
-
-    #[test]
-    fn test_validate_endpoint_too_long() {
-        let long_endpoint = format!("https://{}", "a".repeat(248));
-        let err = MhService::validate_endpoint(&long_endpoint, "test").unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let at_255 = format!("https://{}", "a".repeat(247));
+        assert!(super::super::validate_endpoint_bounds(&at_255, "f").is_ok());
+        let at_256 = format!("https://{}", "a".repeat(248));
+        let err = super::super::validate_endpoint_bounds(&at_256, "f").unwrap_err();
         assert!(err.message().contains("too long"));
-    }
-
-    #[test]
-    fn test_validate_endpoint_at_255_chars() {
-        let endpoint_255 = format!("https://{}", "a".repeat(247));
-        assert!(
-            MhService::validate_endpoint(&endpoint_255, "test").is_ok(),
-            "Endpoint at 255 chars should pass"
-        );
     }
 }
 
@@ -403,8 +457,42 @@ mod integration_tests {
             .expect("valid test registry config")
     }
 
+    /// Test-local allowlist (unit tests here cannot use gc-test-utils, which
+    /// links a second copy of this crate). Arm behaviour is tested in
+    /// `tests/mh_registration_tests.rs` with the gc-test-utils fixture.
+    fn allowlist() -> MhEndpointAllowlist {
+        use crate::mh_endpoint_policy as p;
+        MhEndpointAllowlist::new(
+            p::parse_wt_hosts(".mh.test").unwrap(),
+            p::parse_port_set("4440").unwrap(),
+            p::parse_scheme_set("grpc").unwrap(),
+            p::parse_cidr_set("10.244.0.0/16").unwrap(),
+            p::parse_port_set("50053").unwrap(),
+        )
+    }
+
+    const WT: &str = "https://mh.mh.test:4440";
+    const GRPC: &str = "grpc://10.244.0.1:50053";
+
     fn service(pool: PgPool) -> MhService {
-        MhService::new(Arc::new(pool), registry(2500).load_report_interval_ms())
+        MhService::new(Arc::new(pool), &registry(2500), allowlist())
+    }
+
+    /// Seed a row directly through the repository.
+    async fn seed(pool: &PgPool, id: &str) {
+        MediaHandlersRepository::register_mh(
+            pool,
+            &NewMhRegistration {
+                handler_id: id,
+                region: "us-east-1",
+                webtransport_endpoint: WT,
+                grpc_endpoint: GRPC,
+                max_streams: 1000,
+            },
+            registry(2500).staleness_bound(),
+        )
+        .await
+        .unwrap();
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -414,8 +502,8 @@ mod integration_tests {
         let request = Request::new(RegisterMhRequest {
             handler_id: "test-mh-001".to_string(),
             region: "us-east-1".to_string(),
-            webtransport_endpoint: "https://mh:443".to_string(),
-            grpc_endpoint: "grpc://mh:50051".to_string(),
+            webtransport_endpoint: WT.to_string(),
+            grpc_endpoint: GRPC.to_string(),
             max_streams: 1000,
         });
 
@@ -444,8 +532,8 @@ mod integration_tests {
         let request = Request::new(RegisterMhRequest {
             handler_id: "".to_string(),
             region: "us-east-1".to_string(),
-            webtransport_endpoint: "https://mh:443".to_string(),
-            grpc_endpoint: "grpc://mh:50051".to_string(),
+            webtransport_endpoint: WT.to_string(),
+            grpc_endpoint: GRPC.to_string(),
             max_streams: 1000,
         });
         let result = service.register_mh(request).await;
@@ -456,8 +544,8 @@ mod integration_tests {
         let request = Request::new(RegisterMhRequest {
             handler_id: "test-mh".to_string(),
             region: "".to_string(),
-            webtransport_endpoint: "https://mh:443".to_string(),
-            grpc_endpoint: "grpc://mh:50051".to_string(),
+            webtransport_endpoint: WT.to_string(),
+            grpc_endpoint: GRPC.to_string(),
             max_streams: 1000,
         });
         let result = service.register_mh(request).await;
@@ -467,8 +555,8 @@ mod integration_tests {
         let request = Request::new(RegisterMhRequest {
             handler_id: "test-mh".to_string(),
             region: "us-east-1".to_string(),
-            webtransport_endpoint: "https://mh:443".to_string(),
-            grpc_endpoint: "grpc://mh:50051".to_string(),
+            webtransport_endpoint: WT.to_string(),
+            grpc_endpoint: GRPC.to_string(),
             max_streams: 0,
         });
         let result = service.register_mh(request).await;
@@ -479,8 +567,8 @@ mod integration_tests {
         let request = Request::new(RegisterMhRequest {
             handler_id: "test-mh".to_string(),
             region: "us-east-1".to_string(),
-            webtransport_endpoint: "https://mh:443".to_string(),
-            grpc_endpoint: "grpc://mh:50051".to_string(),
+            webtransport_endpoint: WT.to_string(),
+            grpc_endpoint: GRPC.to_string(),
             max_streams: u32::try_from(i32::MAX).unwrap() + 1,
         });
         let result = service.register_mh(request).await;
@@ -492,16 +580,7 @@ mod integration_tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_send_load_report_rejects_current_streams_above_i32(pool: PgPool) {
         let service = service(pool.clone());
-        MediaHandlersRepository::register_mh(
-            &pool,
-            "overflow-mh",
-            "us-east-1",
-            "https://mh:443",
-            "grpc://mh:50051",
-            1000,
-        )
-        .await
-        .unwrap();
+        seed(&pool, "overflow-mh").await;
 
         let request = Request::new(SendLoadReportRequest {
             handler_id: "overflow-mh".to_string(),
@@ -520,16 +599,7 @@ mod integration_tests {
         let service = service(pool.clone());
 
         // First register the handler
-        MediaHandlersRepository::register_mh(
-            &pool,
-            "load-report-mh",
-            "us-east-1",
-            "https://mh:443",
-            "grpc://mh:50051",
-            1000,
-        )
-        .await
-        .unwrap();
+        seed(&pool, "load-report-mh").await;
 
         // Send load report
         let request = Request::new(SendLoadReportRequest {

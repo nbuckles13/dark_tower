@@ -57,6 +57,9 @@ governor = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 
+# RegisterMH endpoint allowlist: CIDR parsing (mh_endpoint_policy.rs).
+ipnet = { workspace = true }
+
 # Local dependencies
 # `db`: the shared Postgres connect path (`common::db`); only AC and GC enable it.
 common = { path = "../common", features = ["db"] }

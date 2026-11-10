@@ -6,7 +6,7 @@
 
 use ::common::observability::testing::MetricAssertion;
 use gc_service::repositories::{
-    HealthStatus, MediaHandlersRepository, MeetingControllersRepository,
+    HealthStatus, MediaHandlersRepository, MeetingControllersRepository, NewMhRegistration,
 };
 use gc_service::services::mc_client::mock::MockMcClient;
 use gc_service::services::mc_client::{McAssignmentResult, McRejectionReason};
@@ -46,11 +46,14 @@ async fn setup_mhs(pool: &PgPool, count: usize, region: &str) {
     for i in 1..=count {
         MediaHandlersRepository::register_mh(
             pool,
-            &format!("mh-{}-{}", region, i),
-            region,
-            &format!("https://mh-{}:443", i),
-            &format!("grpc://mh-{}:50051", i),
-            1000,
+            &NewMhRegistration {
+                handler_id: &format!("mh-{}-{}", region, i),
+                region,
+                webtransport_endpoint: &format!("https://mh-{}-{}:443", region, i),
+                grpc_endpoint: &format!("grpc://mh-{}-{}:50051", region, i),
+                max_streams: 1000,
+            },
+            gc_test_utils::reference_mh_registry().staleness_bound(),
         )
         .await
         .expect("MH registration should succeed");
@@ -185,11 +188,14 @@ async fn test_assign_meeting_with_mh_invalid_request_fails_fast(pool: PgPool) {
     // a GC bug could, and that is the only case where GC genuinely sent bad data.
     MediaHandlersRepository::register_mh(
         &pool,
-        "mh-bad-1",
-        "us-east-1",
-        "https://mh-bad:443",
-        "", // malformed: empty grpc_endpoint
-        1000,
+        &NewMhRegistration {
+            handler_id: "mh-bad-1",
+            region: "us-east-1",
+            webtransport_endpoint: "https://mh-bad:443",
+            grpc_endpoint: "", // malformed: empty grpc_endpoint
+            max_streams: 1000,
+        },
+        gc_test_utils::reference_mh_registry().staleness_bound(),
     )
     .await
     .expect("MH registration should succeed");

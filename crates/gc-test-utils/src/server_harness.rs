@@ -97,7 +97,7 @@ impl TestGcServer {
             ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
         ]);
 
-        vars.extend(crate::reference_config::reference_mh_registry_vars());
+        vars.extend(crate::mh_endpoint_allowlist::mh_config_vars());
         let config = Config::from_vars(&vars)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 

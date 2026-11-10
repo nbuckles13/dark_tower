@@ -1572,12 +1572,51 @@ if [[ -n "$REAL_KUBECTL" ]]; then
     assert_status "wrapper-mh-slot-${k}-labelled" "dark-tower.io/mh-slot: \"${k}\"" "$wrapped"
     assert_rc "wrapper-mh-slot-${k}-address-on-gateway" 0 "$([[ "$addr" == "https://10.1.2.3:${port}" ]] && echo 0 || echo "1 (${addr})")"
   done <<< "$gw_slots"
-  # Exactly the two MC per-instance ConfigMaps change (their hash) and the K slot ConfigMaps
-  # are added; every other ConfigMap name, e.g. ac-service-config's, is unchanged, which is
-  # "rolls exactly those pods".
+  # GC's RegisterMH endpoint allowlists (GC-2) land in the RENDERED gc-service-config, and the
+  # GC Deployment references that merged generation. Every expectation is read from the
+  # artifact that owns it in THIS run, never typed: hosts = the fixture gateway this case
+  # built GW_KIND_CONFIG for; ports = the slot table's; CIDR = the kind config's podSubnet
+  # (kind_pod_subnet, itself pinned to the file in D2d); gRPC port = the MH template's
+  # MH_GRPC_ADVERTISE_ADDRESS read from the plain root render's mh-template (not via
+  # gc_mh_allowlist_literals; MC's grpc://$(POD_IP):<port> must not leak in).
+  # gc_allow_case <label> <render-dir> <gateway> <slot-rows> <kind-config>
+  gc_allow_case() {
+    local label="$1" rdir="$2" gw="$3" rows="$4" kcfg="$5" json cm data dep_refs want_ports want_cidr want_grpc key want got
+    json="$(src_run "$DEPLOY" 'yaml_docs_to_json' < "${rdir}.yaml")"
+    cm="$(jq -r 'select(.kind == "ConfigMap" and (.metadata.name | startswith("gc-service-config-"))) | .metadata.name' <<< "$json")"
+    assert_rc "${label}-gc-config-exactly-one" 0 "$([[ "$(grep -c . <<< "$cm")" -eq 1 ]] && echo 0 || echo "1 (${cm})")"
+    data="$(jq -c --arg n "$cm" 'select(.kind == "ConfigMap" and .metadata.name == $n) | .data' <<< "$json")"
+    want_ports="$(awk '{print $2}' <<< "$rows" | sort -n -u | paste -sd, -)"
+    want_cidr="$(awk '/^[[:space:]]*podSubnet:/ { gsub(/"/, "", $2); print $2; exit }' "$kcfg")"
+    want_grpc="$(src_run "$DEPLOY" 'yaml_docs_to_json' < "${RWORK}/root.yaml" \
+      | jq -r 'select(.kind == "Deployment" and .metadata.name == "mh-template") | .spec.template.spec.containers[].env[]? | select(.name == "MH_GRPC_ADVERTISE_ADDRESS") | .value' \
+      | sed -nE 's#^[a-z][a-z0-9+]*://\$\(POD_IP\):([0-9]+)$#\1#p')"
+    # Input controls: each expectation was actually read (non-empty, well-formed).
+    assert_rc "${label}-gc-allow-expectations-read" 0 \
+      "$([[ "$want_ports" =~ ^[0-9]+(,[0-9]+)+$ && "$want_cidr" =~ ^[0-9.]+/[0-9]+$ && "$want_grpc" =~ ^[0-9]+$ ]] && echo 0 || echo "1 (ports='${want_ports}' cidr='${want_cidr}' grpc='${want_grpc}')")"
+    for key in GC_MH_WT_ALLOWED_HOSTS GC_MH_WT_ALLOWED_PORTS GC_MH_GRPC_ALLOWED_CIDRS GC_MH_GRPC_ALLOWED_PORTS; do
+      case "$key" in
+        GC_MH_WT_ALLOWED_HOSTS) want="$gw" ;;
+        GC_MH_WT_ALLOWED_PORTS) want="$want_ports" ;;
+        GC_MH_GRPC_ALLOWED_CIDRS) want="$want_cidr" ;;
+        GC_MH_GRPC_ALLOWED_PORTS) want="$want_grpc" ;;
+      esac
+      got="$(jq -r --arg k "$key" '.[$k] // "<absent>"' <<< "$data")"
+      assert_rc "${label}-gc-${key}" 0 "$([[ -n "$want" && "$got" == "$want" ]] && echo 0 || echo "1 (got '${got}', want '${want}')")"
+    done
+    # A merge, not a replace: a base key survives (positive control on the base data).
+    assert_rc "${label}-gc-config-base-keys-kept" 0 "$(jq -e '.BIND_ADDRESS // empty | length > 0' <<< "$data" >/dev/null && echo 0 || echo 1)"
+    # The GC Deployment's configMapKeyRefs all name THIS generation (the merge rolls GC).
+    dep_refs="$(jq -r 'select(.kind == "Deployment" and .metadata.name == "gc-service") | .spec.template.spec.containers[].env[]?.valueFrom.configMapKeyRef.name // empty' <<< "$json" | sort -u)"
+    assert_rc "${label}-gc-deployment-refs-merged-config" 0 "$([[ -n "$cm" && "$dep_refs" == "$cm" ]] && echo 0 || echo "1 (refs='${dep_refs}' cm='${cm}')")"
+  }
+  gc_allow_case "wrapper" "${RWORK}/wrapped" "10.1.2.3" "$gw_slots" "$GW_KIND_CONFIG"
+  # Exactly the two MC per-instance ConfigMaps and gc-service-config (the allowlist merge)
+  # change (their hash) and the K slot ConfigMaps are added; every other ConfigMap name, e.g.
+  # ac-service-config's, is unchanged, which is "rolls exactly those pods".
   changed="$(comm -3 <(cm_names "${RWORK}/root") <(cm_names "${RWORK}/wrapped") | tr -d '\t' \
     | sed -E 's/-[^-]+$//' | sort -u | tr '\n' ' ')"
-  want_changed="$( { printf 'mc-0-config\nmc-1-config\n'; while IFS=' ' read -r k _ _; do printf 'mh-slot-%s-config\n' "$k"; done <<< "$gw_slots"; } | sort -u | tr '\n' ' ')"
+  want_changed="$( { printf 'gc-service-config\nmc-0-config\nmc-1-config\n'; while IFS=' ' read -r k _ _; do printf 'mh-slot-%s-config\n' "$k"; done <<< "$gw_slots"; } | sort -u | tr '\n' ' ')"
   assert_rc "wrapper-changes-exactly-the-mc-instance-and-slot-configmaps" 0 \
     "$([[ "$changed" == "$want_changed" ]] && echo 0 || echo "1 (changed: ${changed}; want: ${want_changed})")"
   ac_root="$(cm_names "${RWORK}/root" | grep '^ac-service-config-')"
@@ -1619,8 +1658,32 @@ if [[ -n "$REAL_KUBECTL" ]]; then
   assert_absent "wrapper-no-placeholder-survives" ":render-required" "$static_r"
   assert_rc "wrapper-no-latest-survives-gateway" 0 "$(grep -q 'localhost/[a-z-]*:latest' <<< "$wrapped" && echo 1 || echo 0)"
   assert_absent "wrapper-no-placeholder-survives-gateway" ":render-required" "$wrapped"
-  # Advertise merges only with a gateway: the static render carries none of them.
-  assert_absent "wrapper-advertise-only-with-gateway" "behavior: merge" "$(cat "${STATIC}/kustomization.yaml")"
+  # MC advertise merges only with a gateway: the static render carries none of them. Its ONE
+  # merge is GC's allowlist (always rendered — the base ships those keys empty).
+  static_k="$(cat "${STATIC}/kustomization.yaml")"
+  assert_absent "wrapper-advertise-only-with-gateway" "MC_WEBTRANSPORT_ADVERTISE_ADDRESS" "$static_k"
+  assert_rc "static-wrapper-only-merge-is-gc-allowlist" 0 \
+    "$([[ "$(grep -c 'behavior: merge' <<< "$static_k")" -eq 1 ]] && grep -B2 'behavior: merge' <<< "$static_k" | grep -q 'name: gc-service-config$' && echo 0 || echo 1)"
+  static_rows="$(src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" 'mh_slot_table')"
+  static_host="$(awk '/listenAddress:/ { gsub(/"/, "", $2); print $2 }' "$STATIC_KIND_CONFIG" | sort -u)"
+  assert_rc "static-gc-allow-host-read" 0 "$([[ "$(grep -c . <<< "$static_host")" -eq 1 ]] && echo 0 || echo "1 (${static_host})")"
+  gc_allow_case "static" "${RWORK}/static-r" "$static_host" "$static_rows" "$STATIC_KIND_CONFIG"
+  # The gRPC port is DERIVED from the MH template: a malformed or missing
+  # MH_GRPC_ADVERTISE_ADDRESS fails the render loudly, naming the function (never a default).
+  for c in \
+    "no-port|s#value: \"grpc://\$(POD_IP):[0-9]*\"#value: \"grpc://\$(POD_IP)\"#" \
+    "hostname|s#value: \"grpc://\$(POD_IP):#value: \"grpc://mh.local:#" \
+    "missing|/name: MH_GRPC_ADVERTISE_ADDRESS/,+1d"; do
+    IFS='|' read -r cname cexpr <<< "$c"
+    GCP="${RWORK}/gcadv-${cname}"; deploy_tree_copy "$GCP"
+    sed -i -e "$cexpr" "$GCP/infra/services/mh-service/deployment.yaml"
+    # Control: the mutation actually changed the file (else the case is vacuous).
+    assert_rc "gc-allow-bad-grpc-advertise-${cname}-mutated" 1 "$(cmp -s "$GCP/infra/services/mh-service/deployment.yaml" "${REPO_ROOT}/infra/services/mh-service/deployment.yaml" && echo 0 || echo 1)"
+    GCW="${RWORK}/gcadv-${cname}-wrap"; mkdir -p "$GCW"
+    out="$(src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$GCP/infra/kind/scripts/deploy.sh" "$RUN_RENDER" "$GCW" 2>&1)"
+    assert_rc "gc-allow-bad-grpc-advertise-${cname}-rejected" 1 "$?"
+    assert_status "gc-allow-bad-grpc-advertise-${cname}-named" "gc_mh_allowlist_literals: the mh-template Deployment must carry exactly one MH_GRPC_ADVERTISE_ADDRESS" "$out"
+  done
   # S4a: a Kind-loaded first-party image is never pulled.
   pull_policies="$(grep -A1 'image: localhost/' <<< "$static_r" | grep -o 'imagePullPolicy: [A-Za-z]*' | sort -u)"
   assert_rc "wrapper-pullpolicy-never" 0 "$([[ "$pull_policies" == "imagePullPolicy: Never" ]] && echo 0 || echo "1 (${pull_policies})")"
@@ -1778,6 +1841,17 @@ fi
 #   STUB_KIND_LIST_FAIL=1    `kind get clusters` fails
 #   STUB_READYZ_FAIL=1       the apiserver's `/readyz` does not answer (main's EXIT-trap probe)
 #   STUB_KUSTOMIZE_FAIL=<dir>  `kubectl kustomize <dir>` fails (every other render is REAL)
+#   STUB_GC_HEALTHY_SEQ[_A|_B]  `gc_mh_available{state="healthy"}` per GC /metrics read of
+#                            pod gc-service-a / -b (proxy): that pod's k-th read returns the k-th
+#                            value, the last repeats (default 2; the _A/_B form is per pod)
+#   STUB_GC_SUCCESS_SEQ[_A|_B]  count_available_mh success counter per read, same indexing
+#                            (default 10 x the read number: advances on every read)
+#   STUB_GC_SUCCESS_ABSENT=1 no gc_db_queries_total series;  STUB_GC_ERRORS  its error counter
+#   STUB_GC_PENDING          `gc_mh_available{state="pending"}` (default 0; draining is always
+#                            9 and unhealthy 7, which the settle predicate must ignore)
+#   STUB_GC_STALENESS        gc_mh_staleness_threshold_seconds every GC pod publishes (default 30)
+#   STUB_GC_METRICS_ABSENT=1 GC /metrics carries no gc_mh_available series
+#   STUB_GC_METRICS_FAIL=1   the GC /metrics proxy read fails
 D4_BIN="${WORK}/d4bin"; mkdir -p "$D4_BIN"
 cat > "${D4_BIN}/kubectl" <<STUB
 #!/usr/bin/env bash
@@ -1837,6 +1911,39 @@ case "\${args[0]:-}" in
   logs) printf 'Applied 20260322000001/migrate add participant tracking (postgres://darktower:hunter2@postgres:5432/x)\n'; exit 0 ;;
   exec) : > "${MARK}/ran.kubectl-exec"; exit 0 ;;
   get)
+    if [[ "\${args[1]:-}" == "--raw" && "\${args[2]:-}" == */proxy/metrics ]]; then
+      printf '%s\n' "\${args[2]}" >> "${MARK}/gc-metrics.calls"
+      [[ -z "\${STUB_GC_METRICS_FAIL:-}" ]] || { echo "kubectl stub: proxy read failed" >&2; exit 1; }
+      pod="\${args[2]#*/pods/}"; pod="\${pod%%:*}"
+      printf '.\n' >> "${MARK}/gc-metrics.\${pod}.calls"
+      n="\$(grep -c . "${MARK}/gc-metrics.\${pod}.calls")"
+      sfx="\${pod##*-}"; sfx="\${sfx^^}"
+      hv="STUB_GC_HEALTHY_SEQ_\${sfx}"; sv="STUB_GC_SUCCESS_SEQ_\${sfx}"
+      read -ra seq <<< "\${!hv:-\${STUB_GC_HEALTHY_SEQ:-2}}"
+      i=\$(( n <= \${#seq[@]} ? n - 1 : \${#seq[@]} - 1 ))
+      if [[ -n "\${!sv:-\${STUB_GC_SUCCESS_SEQ:-}}" ]]; then
+        read -ra sseq <<< "\${!sv:-\${STUB_GC_SUCCESS_SEQ:-}}"
+        j=\$(( n <= \${#sseq[@]} ? n - 1 : \${#sseq[@]} - 1 )); succ="\${sseq[\$j]}"
+      else
+        succ=\$(( n * 10 ))
+      fi
+      echo "# TYPE gc_mh_staleness_threshold_seconds gauge"
+      echo "gc_mh_staleness_threshold_seconds \${STUB_GC_STALENESS:-30}"
+      if [[ -z "\${STUB_GC_SUCCESS_ABSENT:-}" ]]; then
+        echo "gc_db_queries_total{operation=\"count_available_mh\",status=\"error\"} \${STUB_GC_ERRORS:-0}"
+        echo "gc_db_queries_total{operation=\"count_available_mh\",status=\"success\"} \${succ}"
+        echo "gc_db_queries_total{operation=\"register_mh_txn\",status=\"success\"} 999"
+      fi
+      if [[ -z "\${STUB_GC_METRICS_ABSENT:-}" ]]; then
+        echo "gc_mh_available{region=\"local\",state=\"healthy\"} \${seq[\$i]}"
+        echo "gc_mh_available{region=\"other\",state=\"healthy\"} 0"
+        echo "gc_mh_available{region=\"local\",state=\"unhealthy\"} 7"
+        echo "gc_mh_available{region=\"local\",state=\"draining\"} 9"
+        echo "gc_mh_available{region=\"local\",state=\"pending\"} \${STUB_GC_PENDING:-0}"
+        echo "gc_mh_available{region=\"local\",state=\"degraded\"} 0"
+      fi
+      exit 0
+    fi
     if [[ "\${args[1]:-}" == "--raw" ]]; then
       : > "${MARK}/ran.readyz"
       [[ -z "\${STUB_READYZ_FAIL:-}" ]] || { echo "kubectl stub: readyz timed out" >&2; exit 1; }
@@ -1856,6 +1963,17 @@ case "\${args[0]:-}" in
         if [[ "\$*" == *"app=mh-service"* ]]; then
           [[ -z "\${STUB_MH_PODS_FAIL:-}" ]] || { echo "kubectl stub: pods read failed" >&2; exit 1; }
           printf '%b' "\${STUB_MH_POD_IMAGES:-}"; exit 0
+        fi
+        if [[ "\$*" == *"app=gc-service"* ]]; then
+          # Two live Ready pods with an \`http\` port, one Terminating (must be ignored).
+          jq -cn '{items: [
+            {metadata: {name: "gc-service-a"}, spec: {containers: [{ports: [{name: "http", containerPort: 8080}, {name: "grpc", containerPort: 50051}]}]},
+             status: {conditions: [{type: "Ready", status: "True"}]}},
+            {metadata: {name: "gc-service-b"}, spec: {containers: [{ports: [{name: "grpc", containerPort: 50051}, {name: "http", containerPort: 8080}]}]},
+             status: {conditions: [{type: "Ready", status: "True"}]}},
+            {metadata: {name: "gc-service-old", deletionTimestamp: "2026-01-01T00:00:00Z"}, spec: {containers: [{ports: [{name: "http", containerPort: 8080}]}]},
+             status: {conditions: [{type: "Ready", status: "True"}]}}]}'
+          exit 0
         fi
         printf 'calico-node-x 1/1 Running\n'; exit 0 ;;
       replicasets) [[ -z "\${STUB_RS_FAIL:-}" ]] || { echo "kubectl stub: rs read failed" >&2; exit 1; }; printf '%b' "\${STUB_RS_ROWS:-}"; exit 0 ;;
@@ -1933,6 +2051,8 @@ chmod +x "${D4_BIN}/kubectl" "${D4_BIN}/docker" "${D4_BIN}/podman" "${D4_BIN}/ki
 #   STUB_MH_INITIAL=<n>        baseline MHs before this deploy (default 0)
 #   STUB_MH_FAIL=<verb>:<tok>  that verb fails with mh.sh token <tok> (slot 3)
 #   STUB_MH_BASELINE / STUB_MH_K  override B / K in `list`
+#   STUB_MH_REPLACED=<json>    upgrade's `replaced` value (default [] = a no-op upgrade)
+#   STUB_MH_EXTRA="<state>..." extra `manual`-owned slots after the baseline ones, in those states
 D4_MH="${D4_BIN}/mh.sh"
 cat > "$D4_MH" <<STUB
 #!/usr/bin/env bash
@@ -1947,11 +2067,15 @@ fi
 case "\$verb" in
   list)
     jq -cn --argjson c "\$cnt" --argjson b "\${STUB_MH_BASELINE:-2}" --argjson k "\${STUB_MH_K:-6}" \
-      '{ok:true, schema_version:1, template_revision:"r1", baseline:\$b,
-        slots:[range(0;\$k) as \$i | {slot:\$i, state:(if \$i < \$c then "serving" else "free" end),
-               owner:(if \$i < \$c then "baseline" else null end), stale:false}]}' ;;
+      --arg x "\${STUB_MH_EXTRA:-}" \
+      '(\$x | split(" ") | map(select(. != ""))) as \$ex |
+       {ok:true, schema_version:1, template_revision:"r1", baseline:\$b,
+        slots:[range(0;\$k) as \$i | {slot:\$i,
+               state:(if \$i < \$c then "serving" elif \$i - \$c < (\$ex | length) then \$ex[\$i - \$c] else "free" end),
+               owner:(if \$i < \$c then "baseline" elif \$i - \$c < (\$ex | length) then "manual" else null end), stale:false}]}' ;;
   up) echo \$((cnt + 1)) > "${MARK}/mh.count"; echo '{"ok":true,"created":true}' ;;
   drain) echo \$((cnt - 1)) > "${MARK}/mh.count"; echo '{"ok":true,"drained":true}' ;;
+  upgrade) printf '{"ok":true,"replaced":%s}\n' "\${STUB_MH_REPLACED:-[]}" ;;
   *) echo '{"ok":true}' ;;
 esac
 STUB
@@ -2167,7 +2291,7 @@ builds() { grep '^build ' "${MARK}/podman.calls" 2>/dev/null | grep -o 'infra/do
 RUN_DEPLOY='check_blueprint() { : > "'"${MARK}"'/ran.blueprint-check"; }; main'
 dep() {
   PATH="${D4_BIN}:${PATH}" TMPDIR="$RWORK" DT_CLUSTER_NAME=d4cluster DEVLOOP_MIN_DISK_GB=0 DT_JOB_POLL_SECONDS=0 \
-    DT_MH_SH="$D4_MH" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_DEPLOY" 2>&1
+    DT_MH_SETTLE_POLL_SECONDS=0 DT_MH_SETTLE_FRESH_SECONDS=0 DT_MH_SH="$D4_MH" src_run -u DT_HOST_GATEWAY_IP -u DT_KIND_CONFIG "$DEPLOY" "$RUN_DEPLOY" 2>&1
 }
 ALL_DOCKERFILES="infra/docker/ac-service/Dockerfile infra/docker/db-migrate/Dockerfile infra/docker/gc-service/Dockerfile infra/docker/mc-service/Dockerfile infra/docker/mh-service/Dockerfile "
 reset_marks
@@ -2236,19 +2360,134 @@ assert_rc "prune-history-unreadable-deploy-still-ok" 0 "$rc"
 assert_status "prune-history-unreadable-warns" "PRUNE_WARN REASON=image-prune-failed REF=- WHERE=history" "$out"
 assert_absent "prune-history-unreadable-evicts-nothing-of-gc" "localhost/gc-service" "$(cat "${MARK}/node-rmi" 2>/dev/null)"
 
+# The relay regex Layer 7 uses, EXTRACTED from scripts/layer7.sh (never a copy).
+L7_RE="$(sed -nE 's/^ *grep -m1 -oE "\$\{prefix\} (.*)" <<<"\$DC_WRITE_OUT".*/\1/p' "${REPO_ROOT}/scripts/layer7.sh")"
+L7_REASON_SED="$(sed -nE "s/^ *reason=\"\\\$\(sed -E '(.*)' <<<\"\\\$line\"\)\"$/\1/p" "${REPO_ROOT}/scripts/layer7.sh")"
+assert_rc "mh-pool-layer7-relay-regex-extracted" 0 "$([[ -n "$L7_RE" && -n "$L7_REASON_SED" ]] && echo 0 || echo "1 (re='${L7_RE}' sed='${L7_REASON_SED}')")"
 # --- (D8b) The MH pool converge: B baseline MHs, every mh.sh failure mapped by the ONE table ----
 reset_marks
 out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=2 dep)"; rc=$?
 assert_rc "mh-pool-already-at-baseline-rc" 0 "$rc"
 assert_absent "mh-pool-already-at-baseline-no-up" "up --owner" "$(cat "${MARK}/mh.calls" 2>/dev/null)"
+# Positive control for the no-wait assertion below: upgrade WAS issued (and replaced nothing).
+assert_status "mh-pool-already-at-baseline-upgrade-issued" "upgrade --json" "$(cat "${MARK}/mh.calls" 2>/dev/null)"
+# A converge that removed NO MH never waits on GC (no /metrics read at all).
+assert_no_marker "mh-pool-noop-converge-no-gc-wait" "$MARK" "gc-metrics.calls"
 reset_marks
-out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 dep)"; rc=$?
+# Shrink (drain one); both GC pods count the drained MH healthy for two polls, then forget it.
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_HEALTHY_SEQ="3 3 3 2" dep)"; rc=$?
 assert_rc "mh-pool-above-baseline-rc" 0 "$rc"
 assert_status "mh-pool-above-baseline-drains-highest" "drain 2 --owner baseline --json" "$(cat "${MARK}/mh.calls" 2>/dev/null)"
-# The relay regex Layer 7 uses, EXTRACTED from scripts/layer7.sh (never a copy).
-L7_RE="$(sed -nE 's/^ *grep -m1 -oE "\$\{prefix\} (.*)" <<<"\$DC_WRITE_OUT".*/\1/p' "${REPO_ROOT}/scripts/layer7.sh")"
-L7_REASON_SED="$(sed -nE "s/^ *reason=\"\\\$\(sed -E '(.*)' <<<\"\\\$line\"\)\"$/\1/p" "${REPO_ROOT}/scripts/layer7.sh")"
-assert_rc "mh-pool-layer7-relay-regex-extracted" 0 "$([[ -n "$L7_RE" && -n "$L7_REASON_SED" ]] && echo 0 || echo "1 (re='${L7_RE}' sed='${L7_REASON_SED}')")"
+# --- (D8c) A REMOVED MH must be unselectable in GC before deploy returns (until MH-3) ----------
+# reads <pod>: how many /metrics reads the wait made of that pod.
+reads() { grep -c . "${MARK}/gc-metrics.$1.calls" 2>/dev/null || echo 0; }
+# Bound = the stub pods' gauge (30) rounded up; default margin = 2 x GC's tick, read from its source.
+d8c_tick="$(grep -oE 'DEFAULT_CHECK_INTERVAL_SECONDS: u64 = [0-9]+;' "${REPO_ROOT}/crates/gc-service/src/tasks/generic_health_checker.rs" | grep -oE '= [0-9]+' | tr -d '= ')"
+assert_status "mh-removed-shrink-waits" "Waiting for GC to stop selecting the 1 removed MH(s) (registered live MHs: 2; at most 31s + $((2 * ${d8c_tick:-0}))s)" "$out"
+assert_status "mh-removed-shrink-settles" "GC no longer selects the removed MH(s)." "$out"
+assert_rc "mh-removed-shrink-polled-until-settled" 0 "$([[ "$(reads gc-service-a)" -eq 4 && "$(reads gc-service-b)" -eq 4 ]] && echo 0 || echo "1 (a=$(reads gc-service-a) b=$(reads gc-service-b))")"
+# Read through the apiserver proxy in the DERIVED namespace, live pods only (never the Terminating one).
+assert_status "mh-removed-reads-live-pod-via-proxy" "/api/v1/namespaces/dark-tower/pods/gc-service-b:8080/proxy/metrics" "$(cat "${MARK}/gc-metrics.calls" 2>/dev/null)"
+assert_absent "mh-removed-skips-terminating-pod" "gc-service-old" "$(cat "${MARK}/gc-metrics.calls" 2>/dev/null)"
+# T1 — per pod, NEVER summed: A settles at once, B still counts the dead row for two polls.
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_HEALTHY_SEQ_A="2" STUB_GC_HEALTHY_SEQ_B="3 3 3 2" dep)"; rc=$?
+assert_rc "mh-removed-per-pod-rc" 0 "$rc"
+assert_rc "mh-removed-per-pod-waits-for-the-slow-pod" 0 "$([[ "$(reads gc-service-b)" -eq 4 ]] && echo 0 || echo "1 (b=$(reads gc-service-b))")"
+# Both pods exactly AT live (2 each) settle at the first eligible poll; a cross-pod sum (4 > 2) would not.
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_HEALTHY_SEQ="2" dep)"; rc=$?
+assert_rc "mh-removed-at-live-not-summed-rc" 0 "$rc"
+# (2 reads per pod: the first-read baseline, then one poll whose counter is already +10.)
+assert_rc "mh-removed-at-live-not-summed-one-poll" 0 "$([[ "$(reads gc-service-a)" -eq 2 && "$(reads gc-service-b)" -eq 2 ]] && echo 0 || echo "1 (a=$(reads gc-service-a) b=$(reads gc-service-b))")"
+# T2 — the live set is `serving` ONLY: a starting and a draining slot are not registered live MHs.
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_MH_EXTRA="starting draining" dep)"; rc=$?
+assert_status "mh-removed-live-is-serving-only" "(registered live MHs: 2;" "$out"
+# A dead `healthy` row must not hide behind a just-registered `pending` replacement: healthy 2
+# + pending 1 > 2 registered live MHs keeps waiting until the dead row leaves (healthy 1).
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_PENDING=1 STUB_GC_HEALTHY_SEQ="2 2 2 1" dep)"; rc=$?
+assert_rc "mh-removed-pending-counted-rc" 0 "$rc"
+assert_rc "mh-removed-pending-counted-waited" 0 "$([[ "$(reads gc-service-a)" -eq 4 ]] && echo 0 || echo "1 (a=$(reads gc-service-a))")"
+# Upgrade that replaced an MH also waits (its old MH is the removed one).
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=2 STUB_MH_REPLACED='[{"old":0,"new":2}]' dep)"; rc=$?
+assert_rc "mh-removed-upgrade-rc" 0 "$rc"
+assert_status "mh-removed-upgrade-waits" "Waiting for GC to stop selecting the 1 removed MH(s)" "$out"
+assert_marker "mh-removed-upgrade-read-gc" "$MARK" "gc-metrics.calls"
+# T3 — the recompute control: a count that is <= live proves nothing until the pod's
+# count_available_mh success counter has advanced >= 2 past its first-read baseline. Positive
+# twin: advancing +2 settles (at the read that reaches it).
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_SUCCESS_SEQ="5 6 7" dep)"; rc=$?
+assert_rc "mh-removed-recompute-plus2-settles-rc" 0 "$rc"
+assert_rc "mh-removed-recompute-plus2-settles-at-plus2" 0 "$([[ "$(reads gc-service-a)" -eq 3 ]] && echo 0 || echo "1 (a=$(reads gc-service-a))")"
+# A GC container restart mid-wait (the per-process counter drops BELOW its baseline) re-baselines
+# at 0: the new process recomputing twice settles it (never a false red until the deadline), and
+# not before — at success=1 it is still unrecomputed.
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_SUCCESS_SEQ="500 1 2" dep)"; rc=$?
+assert_rc "mh-removed-gc-restart-rebaselined-rc" 0 "$rc"
+assert_rc "mh-removed-gc-restart-needs-two-recomputes" 0 "$([[ "$(reads gc-service-a)" -eq 3 ]] && echo 0 || echo "1 (a=$(reads gc-service-a))")"
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_SUCCESS_SEQ="500 1" STUB_GC_STALENESS=0 DT_MH_SETTLE_MARGIN_SECONDS=0 dep)"; rc=$?
+assert_status "mh-removed-gc-restart-one-recompute-not-enough" "gc-service-a=unrecomputed(success=1,baseline=0" "$out"
+# Timeout: past B (from the GC pod's OWN gauge) + margin, a loud failure with its own token.
+# Every vacuous-pass shape is one: still counted; gauge absent; recompute never succeeded
+# (success 0, gauge 0 <= live); counter frozen; counter advanced only +1; dead healthy + pending.
+for c in 'still-counted|STUB_GC_HEALTHY_SEQ=3|gc-service-a=3(error=0)' \
+         'gauge-absent|STUB_GC_METRICS_ABSENT=1|gc-service-a=ABSENT' \
+         'never-recomputed|STUB_GC_SUCCESS_SEQ=0 STUB_GC_HEALTHY_SEQ=0|gc-service-a=unrecomputed(success=0' \
+         'counter-absent|STUB_GC_SUCCESS_ABSENT=1|gc-service-a=unrecomputed(success=ABSENT' \
+         'counter-frozen|STUB_GC_SUCCESS_SEQ=5 STUB_GC_ERRORS=4|gc-service-a=unrecomputed(success=5,baseline=5,error=4)' \
+         'counter-plus-one|STUB_GC_SUCCESS_SEQ="5 6"|gc-service-a=unrecomputed(success=6,baseline=5' \
+         'dead-healthy-plus-pending|STUB_GC_HEALTHY_SEQ=2 STUB_GC_PENDING=1|gc-service-a=3(error=0)'; do
+  IFS='|' read -r cname cenv cwant <<< "$c"
+  reset_marks
+  # cenv: the case's own stub knobs, as shell assignments (a value may hold spaces).
+  out="$(eval "export ${cenv}"; STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_STALENESS=0 \
+    DT_MH_SETTLE_MARGIN_SECONDS=0 dep)"; rc=$?
+  line="DEPLOY_FAILED REASON=mh-removed-still-selectable MH_TOKEN=- SLOT=- WORKLOADS=deployment/gc-service"
+  assert_rc "mh-removed-${cname}-rc" 1 "$([[ "$rc" -ne 0 ]] && echo 1 || echo 0)"
+  assert_status "mh-removed-${cname}-token" "$line" "$out"
+  assert_rc "mh-removed-${cname}-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
+  assert_status "mh-removed-${cname}-bound-from-gauge" "After B (1s, rounded up) + 0s" "$out"
+  assert_status "mh-removed-${cname}-named" "$cwant" "$out"
+  relayed="$(grep -m1 -oE "DEPLOY_FAILED ${L7_RE}" <<< "$out" || true)"
+  assert_rc "mh-removed-${cname}-layer7-relays-whole-line" 0 "$([[ "$relayed" == "$line" ]] && echo 0 || echo "1 (relayed='${relayed}')")"
+done
+# F5: the timeout line names the frozen-gauge series to check.
+assert_status "mh-removed-timeout-names-error-series" 'gc_db_queries_total{operation="count_available_mh",status="error"}' "$out"
+# An apiserver that dies mid-wait is the ENVIRONMENT (operator lane), never the settle token:
+# the metrics read fails AND the readyz probe fails.
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_METRICS_FAIL=1 STUB_READYZ_FAIL=1 dep)"; rc=$?
+assert_status "mh-removed-env-down-classified" "DEPLOY_FAILED REASON=apiserver-unreachable MH_TOKEN=- SLOT=- WORKLOADS=deployment/gc-service" "$out"
+assert_rc "mh-removed-env-down-one-line" 1 "$(grep -c '^DEPLOY_FAILED' <<< "$out")"
+assert_absent "mh-removed-env-down-not-the-settle-token" "REASON=mh-removed-still-selectable" "$out"
+assert_marker "mh-removed-env-down-probed" "$MARK" "ran.readyz"
+# The same unreadable /metrics with the apiserver UP is the settle token, at once (no wait).
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=3 STUB_GC_METRICS_FAIL=1 dep)"; rc=$?
+assert_status "mh-removed-metrics-unreadable-token" "DEPLOY_FAILED REASON=mh-removed-still-selectable MH_TOKEN=- SLOT=- WORKLOADS=deployment/gc-service" "$out"
+assert_status "mh-removed-metrics-unreadable-named" "Could not read /metrics of GC pod dark-tower/gc-service-a" "$out"
+assert_absent "mh-removed-metrics-unreadable-no-wait" "Waiting for GC to stop selecting" "$out"
+# upgrade OK without its contract `replaced` array: cannot tell whether it removed an MH.
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_MH_INITIAL=2 STUB_MH_REPLACED=null dep)"; rc=$?
+assert_status "mh-removed-upgrade-no-replaced-array" "DEPLOY_FAILED REASON=mh-pool-failed MH_TOKEN=- SLOT=- WORKLOADS=-" "$out"
+assert_status "mh-removed-upgrade-no-replaced-array-says-so" "without a 'replaced' array" "$out"
+# The tick margin is read from GC's source constant (its one home), never retyped: an
+# independent extraction agrees, and a missing declaration fails loudly.
+tick_src="${REPO_ROOT}/crates/gc-service/src/tasks/generic_health_checker.rs"
+tick_ref="$(grep -oE 'DEFAULT_CHECK_INTERVAL_SECONDS: u64 = [0-9]+;' "$tick_src" | grep -oE '= [0-9]+' | tr -d '= ')"
+tick_sh="$(src_run "$DEPLOY" 'gc_health_tick_seconds')"
+assert_rc "gc-health-tick-from-source" 0 "$([[ -n "$tick_ref" && "$tick_sh" == "$tick_ref" ]] && echo 0 || echo "1 (sh='${tick_sh}' src='${tick_ref}')")"
+sed 's/DEFAULT_CHECK_INTERVAL_SECONDS/RENAMED_INTERVAL/' "$tick_src" > "${WORK}/tick-renamed.rs"
+out="$(src_run "$DEPLOY" 'GC_HEALTH_TICK_SRC="${ARGS[0]}"; gc_health_tick_seconds' "${WORK}/tick-renamed.rs" 2>&1)"; rc=$?
+assert_rc "gc-health-tick-missing-fails" 1 "$rc"
+assert_status "gc-health-tick-missing-named" "no 'pub const DEFAULT_CHECK_INTERVAL_SECONDS" "$out"
 for c in "upgrade:mh-rollout-failed|mh-rollout-failed|3" "up:not-available-timeout|mh-rollout-failed|3" \
          "up:mh-no-free-slot|mh-no-free-slot|3" "upgrade:mh-pool-busy|mh-pool-failed|3" \
          "upgrade:kubectl-failed|mh-pool-failed|3" "list:no-template|mh-pool-failed|3" \

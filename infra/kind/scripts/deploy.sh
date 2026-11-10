@@ -31,13 +31,16 @@
 # Failure lines (setup-level tokens, relayed by Layer 7 under
 # REASON=cluster-deploy-failed; docs/runbooks/devloop-validation.md §6.7):
 #   DEPLOY_FAILED REASON=<blueprint-changed|blueprint-missing|blueprint-unreadable|collector-rollout-failed|rollout-failed> WORKLOADS=...
-#   DEPLOY_FAILED REASON=<mh-no-free-slot|mh-rollout-failed|mh-pool-failed> MH_TOKEN=<mh.sh REASON|-> SLOT=<k|-> WORKLOADS=<mh-s<k>|->
+#   DEPLOY_FAILED REASON=<mh-no-free-slot|mh-rollout-failed|mh-pool-failed|mh-removed-still-selectable> MH_TOKEN=<mh.sh REASON|-> SLOT=<k|-> WORKLOADS=<mh-s<k>|deployment/gc-service|->
 #     — the MH pool step (converge_mh_pool), mapped from mh.sh's result token by the ONE table
 #     MH_DEPLOY_REASONS: mh-no-free-slot (no slot for an upgrade or top-up; also deploy's own
 #     B + 1 > K headroom check, MH_TOKEN=-), mh-rollout-failed (mh.sh mh-rollout-failed |
 #     not-available-timeout: a new MH never went Available; the old MH keeps serving), and
 #     mh-pool-failed (EVERY other mh.sh token — kubectl-failed, mh-pool-busy, no-template,
 #     drain-timeout, stuck-terminating, ...: a pool/tool fault, never folded into a rollout).
+#     mh-removed-still-selectable is deploy's own (not an mh.sh token): after a converge that
+#     removed an MH, a live GC pod still counted more healthy MHs than are live past B + margin
+#     (wait_removed_mh_unselectable), MH_TOKEN=-, WORKLOADS=deployment/gc-service.
 #     mh.sh prerequisite-missing maps to prerequisite-missing, and every UNMAPPED token is first
 #     run through classify_env_failure: a dead apiserver/runtime is apiserver-unreachable /
 #     runtime-unreachable (operator lane), MH_TOKEN/SLOT kept on the line.
@@ -750,6 +753,57 @@ kind_pod_subnet() {
     printf '%s\n' "${v}"
 }
 
+# The ONE source of GC's RegisterMH endpoint allowlist values (ADR-0039 §7 "GC
+# registration rule"; GC-2), host-mode and devloop alike. Prints exactly four
+# `KEY=VALUE` lines in this fixed order (values comma-joined, sorted, de-duplicated):
+#   GC_MH_WT_ALLOWED_HOSTS    the distinct slot hosts        (mh_slot_table)
+#   GC_MH_WT_ALLOWED_PORTS    the slot host ports            (mh_slot_table)
+#   GC_MH_GRPC_ALLOWED_CIDRS  the cluster pod subnet         (kind_pod_subnet)
+#   GC_MH_GRPC_ALLOWED_PORTS  the MH gRPC advertise port     (the rendered MH
+#                             template's MH_GRPC_ADVERTISE_ADDRESS, `cached_render root`)
+# Nothing is retyped: a slot, gateway, subnet or MH gRPC port change flows here.
+# GC_MH_GRPC_ALLOWED_SCHEMES is NOT rendered: it is policy (base config.env), so an
+# MH-only scheme flip fails registration closed until GC's config flips too.
+# The base config.env carries the four keys EMPTY (GC refuses to start on them),
+# so this render is what makes GC startable. Fails loudly (non-zero, a
+# `gc_mh_allowlist_literals:` line) on any input it cannot derive. Requires
+# cache_renders. I-3's drift guard reads THIS function's output.
+gc_mh_allowlist_literals() {
+    local slots k port addr host hosts="" ports="" subnet adv n grpc_port
+    slots="$(mh_slot_table)" || return 1
+    while read -r k port addr; do
+        host="${addr#https://}"
+        host="${host%:"${port}"}"
+        # Round-trip: the host recovered from the URL must re-format to that URL
+        # through THE formatter, or the slot table and this reader disagree.
+        if [[ -z "${host}" || "$(advertise_url "${host}" "${port}")" != "${addr}" ]]; then
+            log_error "gc_mh_allowlist_literals: slot ${k}: cannot recover the host of advertise address '${addr}' (port ${port}) through advertise_url"
+            return 1
+        fi
+        hosts+="${host}"$'\n'
+        ports+="${port}"$'\n'
+    done <<< "${slots}"
+    subnet="$(kind_pod_subnet)" || return 1
+    adv="$(cached_render root | yaml_docs_to_json \
+        | jq -r --arg n "${MH_TEMPLATE_DEPLOYMENT}" \
+            'select(.kind == "Deployment" and .metadata.name == $n)
+             | .spec.template.spec.containers[].env[]?
+             | select(.name == "MH_GRPC_ADVERTISE_ADDRESS") | .value // ""')" || {
+        log_error "gc_mh_allowlist_literals: could not read MH_GRPC_ADVERTISE_ADDRESS from the ${MH_TEMPLATE_DEPLOYMENT} Deployment in the ${ENV_ROOT_REL} render"
+        return 1
+    }
+    n="$(grep -c . <<< "${adv}" || true)"
+    if (( n != 1 )) || [[ ! "${adv}" =~ ^[a-z][a-z0-9+]*://\$\(POD_IP\):([1-9][0-9]{0,4})$ ]] || (( BASH_REMATCH[1] > 65535 )); then
+        log_error "gc_mh_allowlist_literals: the ${MH_TEMPLATE_DEPLOYMENT} Deployment must carry exactly one MH_GRPC_ADVERTISE_ADDRESS of the form '<scheme>://\$(POD_IP):<port>' (got ${n}: '${adv//$'\n'/ | }')"
+        return 1
+    fi
+    grpc_port="${BASH_REMATCH[1]}"
+    printf 'GC_MH_WT_ALLOWED_HOSTS=%s\n' "$(printf '%s' "${hosts}" | sort -u | paste -sd, -)"
+    printf 'GC_MH_WT_ALLOWED_PORTS=%s\n' "$(printf '%s' "${ports}" | sort -n -u | paste -sd, -)"
+    printf 'GC_MH_GRPC_ALLOWED_CIDRS=%s\n' "${subnet}"
+    printf 'GC_MH_GRPC_ALLOWED_PORTS=%s\n' "${grpc_port}"
+}
+
 # The first-party repos (`localhost/<name>`, tag stripped) the cached render $1
 # (root|migrate-base) names — DERIVED from the render, not a hand-kept service
 # list. One per line, sorted; empty when it names none; non-zero when the render
@@ -857,6 +911,9 @@ resolve_image_refs() {
 # generator; deploy never deletes an old generation (a live MH pod may reference
 # it), it only un-labels it (retire_stale_slot_configmaps).
 #
+# It ALWAYS carries GC's RegisterMH endpoint allowlists (gc_mh_allowlist_literals)
+# as a `behavior: merge` over gc-service-config — the base ships them empty.
+#
 # With DT_HOST_GATEWAY_IP set (a devloop cluster) it also carries the advertise
 # address of each MC pod (host-gateway IP + the helper's per-slug port). That
 # used to be `kubectl patch`ed onto the live ConfigMap after apply, which (a)
@@ -870,7 +927,7 @@ resolve_image_refs() {
 # not fall back to the plain root (that would run placeholder images, or
 # silently advertise localhost).
 render_env_overlay() {
-    local dir="$1" rel inst svc idx svc_uc port_var port instances repos repo ref slots k addr
+    local dir="$1" rel inst svc idx svc_uc port_var port instances repos repo ref slots k addr allow line
     repos="$(root_repos)" || return 1
     if [[ -z "${repos}" ]]; then
         log_error "render_env_overlay: no first-party (localhost/) images in ${ENV_ROOT_REL}"
@@ -915,6 +972,20 @@ render_env_overlay() {
             echo "        ${MH_SLOT_LABEL}: \"${k}\""
         } >> "${dir}/kustomization.yaml"
     done <<< "${slots}"
+
+    # GC's RegisterMH endpoint allowlists (GC-2), ALWAYS: the base carries them
+    # empty and GC refuses to start on that. A merge over the root's own
+    # generator, so the values enter gc-service-config's hash and roll GC.
+    allow="$(gc_mh_allowlist_literals)" || return 1
+    {
+        echo "  - name: gc-service-config"
+        echo "    namespace: dark-tower"
+        echo "    behavior: merge"
+        echo "    literals:"
+        while IFS= read -r line; do
+            echo "      - \"${line}\""
+        done <<< "${allow}"
+    } >> "${dir}/kustomization.yaml"
 
     [[ -n "${DT_HOST_GATEWAY_IP:-}" ]] || return 0
     if [[ ! "${DT_HOST_GATEWAY_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "${DT_HOST_GATEWAY_IP}" == "0.0.0.0" ]]; then
@@ -1221,7 +1292,7 @@ mh_template_repo() {
 # names the cause (mh_run).
 converge_mh_pool() {
     log_step "Converging the MH pool (mh.sh upgrade, then baseline top-up)..."
-    local list k_slots b have k i
+    local list k_slots b have k i removed live
     mh_run list || return 1; list="${MH_OUT}"
     k_slots="$(jq -r '.slots | length' <<< "${list}")"
     b="$(jq -r '.baseline' <<< "${list}")"
@@ -1236,6 +1307,13 @@ converge_mh_pool() {
         return 1
     fi
     mh_run upgrade || return 1
+    # The old MHs upgrade deleted (contract: `{ok, replaced: [{old, new}...]}`).
+    removed="$(jq -r 'if (.replaced | type) == "array" then .replaced | length else "invalid" end' <<< "${MH_OUT}")"
+    if [[ ! "${removed}" =~ ^[0-9]+$ ]]; then
+        log_error "mh.sh upgrade returned OK without a 'replaced' array (${MH_OUT}); cannot tell whether it removed an MH."
+        deploy_failed mh-pool-failed - "MH_TOKEN=- SLOT=-"
+        return 1
+    fi
     mh_run list || return 1; list="${MH_OUT}"
     have="$(jq -r --arg o "${MH_BASELINE_OWNER}" "${MH_BASELINE_SLOTS_JQ}"' | length' <<< "${list}")"
     for (( i = have; i < b; i++ )); do
@@ -1244,6 +1322,7 @@ converge_mh_pool() {
     for (( i = have; i > b; i-- )); do
         k="$(jq -r --arg o "${MH_BASELINE_OWNER}" "${MH_BASELINE_SLOTS_JQ}"' | max' <<< "${list}")"
         mh_run drain "${k}" --owner "${MH_BASELINE_OWNER}" || return 1
+        removed=$((removed + 1))
         mh_run list || return 1; list="${MH_OUT}"
     done
     mh_run list || return 1; list="${MH_OUT}"
@@ -1254,6 +1333,214 @@ converge_mh_pool() {
         return 1
     fi
     log_info "MH pool: ${have} baseline MHs serving (B=${b}, K=${k_slots})."
+    (( removed > 0 )) || return 0
+    # Every live, REGISTERED MH (any owner): serving = Ready = RegisterMH accepted
+    # (MH sets /ready only after register() returns Ok). A starting MH may hold no
+    # row yet, so counting it would let a dead row hide behind it.
+    live="$(jq -r --arg st "${MH_SETTLE_LIVE_STATE}" '[.slots[] | select(.state == $st)] | length' <<< "${list}")"
+    wait_removed_mh_unselectable "${removed}" "${live}"
+}
+
+# --- A removed MH must stop being selectable before deploy returns ---------------
+#
+# Until story 4 MH-3, an MH sends GC no DRAINING report on SIGTERM, so GC keeps a
+# removed MH's row `healthy` (and selectable for new meetings) until its heartbeat
+# ages past the staleness bound B. A converge that removed an MH (upgrade's old-MH
+# delete, or a baseline-shrink drain) would otherwise hand on a cluster where the
+# next meeting may be placed on a dead handler. After MH-3 a DRAINING report
+# excludes the row at once and this wait shrinks to about two health-checker ticks
+# (the recompute control below).
+#
+# ANCHOR (DRY): the bash twin of
+# crates/env-tests/src/fixtures/gc_fleet.rs::wait_removed_mh_unselectable (Rust
+# cannot share code with bash). The shared tokens are kept LITERAL here, and an
+# env-tests hermetic guard reads this file and pins them against the Rust side:
+# the series gc_mh_available, the state set MH_SETTLE_STATES, the live-MH state
+# MH_SETTLE_LIVE_STATE, the recompute count MH_SETTLE_RECOMPUTES, the recompute control series
+# gc_db_queries_total{operation="count_available_mh",status="success"}, and the
+# tick source crates/gc-service/src/tasks/generic_health_checker.rs. Guard:
+# crates/env-tests (hermetic) settle_predicate_matches_deploy_sh. Deliberate
+# difference: an ABSENT baseline is a failure here (a direct /metrics read of a
+# zero-initialised counter, so absent = a broken pod) but is adopted at first
+# appearance in Rust (a Prometheus scrape gap).
+#
+# Evidence is GC's OWN view (never a re-derivation of its selection rule), per
+# live GC pod, never summed across pods:
+#   (a) predicate: the FRESH rows that are or can become selectable,
+#       sum(gc_mh_available{state=~"pending|healthy|degraded"}), number at most the
+#       registered live MHs (`mh.sh list` slots in state serving: MH is Ready only
+#       after RegisterMH succeeded, so a starting MH may hold no row and must not
+#       be counted, or a dead row could hide behind it). `healthy` alone is NOT
+#       enough: a just-registered replacement is `pending` until its first load
+#       report, so a dead `healthy` row would hide behind it. `draining` is never
+#       selectable (and after MH-3 a removed MH reports it); a row past B counts
+#       `unhealthy`.
+#   (b) positive control: the gauge was RECOMPUTED after the removal. The pod's
+#       gc_db_queries_total{operation="count_available_mh",status="success"} must
+#       be >= its value at the wait's first read + MH_SETTLE_RECOMPUTES (the counter is recorded
+#       before the gauge is set, and one recompute may be in flight at that read,
+#       so +2 guarantees a whole recompute that started after it). Absent or 0 is
+#       a pod that never recomputed: its zero-initialised gauge proves nothing. A
+#       counter that drops below its baseline is a restarted GC container: it is
+#       re-baselined at 0, so the new process must recompute twice itself.
+# Read straight from each pod's /metrics through the apiserver proxy: no
+# Prometheus, no port-forward, and mh.sh never reads GC (its contract).
+# Residual (shared with the fixture): an unhealthy live MH could hide the removed
+# row; env-test 03's healthy >= live check covers that state.
+#
+# The ceiling is FAILURE-ONLY: B = the largest gc_mh_staleness_threshold_seconds
+# the RUNNING GC pods publish (the process truth, which env-test 03 pins equal to
+# the live ConfigMap's k x I), plus MH_SETTLE_MARGIN_SECONDS (default: two GC
+# health-checker ticks, read from the source constant the GC image is built from;
+# the env-test fixture adds its scrape ceiling instead, since it reads through
+# Prometheus).
+# Poll interval for the wait (a knob so the self-test runs instantly).
+MH_SETTLE_POLL_SECONDS="${DT_MH_SETTLE_POLL_SECONDS:-2}"
+# The gc_mh_available states that are or can become selectable (predicate (a)).
+readonly MH_SETTLE_STATES='pending|healthy|degraded'
+# Whole count_available_mh recomputes required since the first read (predicate
+# (b)); +2 because one recompute may be in flight at the baseline read.
+readonly MH_SETTLE_RECOMPUTES=2
+# The `mh.sh list` slot state that counts as a registered live MH.
+readonly MH_SETTLE_LIVE_STATE="serving"
+# The GC health-checker tick's ONE home (the GC image is built from this tree).
+GC_HEALTH_TICK_SRC="${PROJECT_ROOT}/crates/gc-service/src/tasks/generic_health_checker.rs"
+
+# The GC health-checker tick in seconds, read from its source constant. Fails
+# loudly when the declaration is absent or malformed.
+gc_health_tick_seconds() {
+    local v
+    v="$(sed -nE 's/^pub const DEFAULT_CHECK_INTERVAL_SECONDS: u64 = ([1-9][0-9]*);$/\1/p' "${GC_HEALTH_TICK_SRC}" 2>/dev/null)"
+    if [[ ! "${v}" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "gc_health_tick_seconds: no 'pub const DEFAULT_CHECK_INTERVAL_SECONDS: u64 = <n>;' in ${GC_HEALTH_TICK_SRC#"${PROJECT_ROOT}"/}"
+        return 1
+    fi
+    printf '%s\n' "${v}"
+}
+
+# The live (not terminating, Ready) GC pods as `<ns> <name> <http-port>` lines.
+# The Deployment AND its namespace are DERIVED from the render (the workload
+# running the gc-service image); its selector and each pod's `http` port are read
+# from the cluster.
+live_gc_pods() {
+    local workloads ns res sel
+    workloads="$(env_root_workloads localhost/gc-service | awk '$2 ~ /^deployment\//')" || return 1
+    if [[ "$(grep -c . <<< "${workloads}")" -ne 1 ]]; then
+        log_error "live_gc_pods: expected exactly one gc-service Deployment in the root render, got: ${workloads//$'\n'/; }"
+        return 1
+    fi
+    read -r ns res <<< "${workloads}"
+    sel="$(${KUBECTL} get "${res}" -n "${ns}" \
+        -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}')" || return 1
+    [[ -n "${sel%,}" ]] || { log_error "live_gc_pods: ${ns}/${res} has no selector"; return 1; }
+    ${KUBECTL} get pods -n "${ns}" -l "${sel%,}" -o json | jq -r --arg ns "${ns}" '
+        .items[]
+        | select(.metadata.deletionTimestamp == null)
+        | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))
+        | "\($ns) \(.metadata.name) \([.spec.containers[].ports[]? | select(.name == "http") | .containerPort][0] // "-")"'
+}
+
+# One GC pod's /metrics through the apiserver proxy. Args: <ns> <pod> <port>.
+gc_pod_metrics() {
+    ${KUBECTL} get --raw "/api/v1/namespaces/$1/pods/$2:$3/proxy/metrics"
+}
+
+# PURE: from one /metrics body on stdin, print `<selectable> <success> <error>`:
+# the sum of gc_mh_available over MH_SETTLE_STATES (ABSENT when no such series),
+# and gc_db_queries_total{operation="count_available_mh"} for status success /
+# error (ABSENT when missing). Label order is not assumed.
+gc_settle_reading() {
+    awk -v states="${MH_SETTLE_STATES}" '
+        /^gc_mh_available\{/ {
+            if (match($0, /state="[a-z]+"/)) {
+                st = substr($0, RSTART + 7, RLENGTH - 8)
+                if (st ~ ("^(" states ")$")) { sel += $NF; nsel++ }
+            }
+        }
+        /^gc_db_queries_total\{/ && /operation="count_available_mh"/ {
+            if (/status="success"/) { ok = $NF; nok = 1 }
+            if (/status="error"/) { err = $NF; nerr = 1 }
+        }
+        END {
+            printf "%s %s %s\n", (nsel ? sprintf("%d", sel) : "ABSENT"), (nok ? sprintf("%d", ok) : "ABSENT"), (nerr ? sprintf("%d", err) : "ABSENT")
+        }'
+}
+
+# The ONE failure emitter of the settle wait: the ENVIRONMENT is classified first
+# (exactly as mh_run and main's EXIT trap do), so an apiserver that dies mid-wait
+# lands in the operator lane, never as mh-removed-still-selectable.
+mh_settle_failed() {
+    local reason
+    reason="$(classify_env_failure apiserver)"
+    deploy_failed "${reason:-mh-removed-still-selectable}" "deployment/gc-service" "MH_TOKEN=- SLOT=-"
+}
+
+# Wait until, on every live GC pod, a post-removal recompute shows no more
+# selectable rows than registered live MHs. Args: <removed count> <live count>.
+#   DEPLOY_FAILED REASON=mh-removed-still-selectable MH_TOKEN=- SLOT=- WORKLOADS=deployment/gc-service
+# (or an environment reason, via mh_settle_failed). It fails AT ONCE, before any
+# wait, when there is no Ready GC pod, no `http` port, /metrics is unreadable or
+# the staleness gauge is absent; the log_error line above names which.
+wait_removed_mh_unselectable() {
+    local removed="$1" live="$2" pods ns name port m b bound=0 tick margin deadline over last="" sel ok err
+    local -A base=()
+    tick="$(gc_health_tick_seconds)" || return 1
+    margin="${DT_MH_SETTLE_MARGIN_SECONDS:-$((2 * tick))}"
+    # A failed cluster read is left to main's EXIT trap (environment probe first).
+    pods="$(live_gc_pods)" || return 1
+    if [[ -z "${pods}" ]]; then
+        log_error "No live, Ready GC pod to read; cannot prove the removed MH is unselectable."
+        mh_settle_failed
+        return 1
+    fi
+    # First read: the bound, and each pod's recompute baseline (control (b)).
+    while read -r ns name port; do
+        if [[ ! "${port}" =~ ^[0-9]+$ ]]; then
+            log_error "GC pod ${ns}/${name} has no container port named 'http' to read /metrics from."
+            mh_settle_failed
+            return 1
+        fi
+        m="$(gc_pod_metrics "${ns}" "${name}" "${port}")" || { log_error "Could not read /metrics of GC pod ${ns}/${name}."; mh_settle_failed; return 1; }
+        b="$(awk '$1 == "gc_mh_staleness_threshold_seconds" { print $2; exit }' <<< "${m}")"
+        if [[ ! "${b}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            log_error "GC pod ${ns}/${name} publishes no gc_mh_staleness_threshold_seconds (got '${b}')."
+            mh_settle_failed
+            return 1
+        fi
+        b="${b%%.*}"; (( b + 1 > bound )) && bound=$((b + 1))
+        read -r _ ok _ <<< "$(gc_settle_reading <<< "${m}")"
+        base["${name}"]="${ok}"
+    done <<< "${pods}"
+    log_step "Waiting for GC to stop selecting the ${removed} removed MH(s) (registered live MHs: ${live}; at most ${bound}s + ${margin}s)..."
+    deadline=$(( $(date +%s) + bound + margin ))
+    while :; do
+        over=""
+        while read -r ns name port; do
+            m="$(gc_pod_metrics "${ns}" "${name}" "${port}")" || m=""
+            read -r sel ok err <<< "$(gc_settle_reading <<< "${m}")"
+            # A counter BELOW its baseline is a restarted GC container (the counter
+            # is per process): re-baseline at 0, so the new process must itself
+            # recompute twice — never a false red until the deadline.
+            if [[ "${ok}" =~ ^[0-9]+$ && "${base[${name}]}" =~ ^[0-9]+$ ]] && (( ok < base[${name}] )); then
+                base["${name}"]=0
+            fi
+            # Control (b): a pod whose recompute never succeeded, or has not run
+            # twice since the baseline, has proven nothing yet.
+            if [[ "${ok}" == "ABSENT" || "${ok}" == "0" || "${base[${name}]}" == "ABSENT" ]] \
+                || (( ok < base[${name}] + MH_SETTLE_RECOMPUTES )); then
+                over+="${name}=unrecomputed(success=${ok},baseline=${base[${name}]},error=${err}) "
+            elif [[ "${sel}" == "ABSENT" ]] || (( sel > live )); then
+                over+="${name}=${sel}(error=${err}) "
+            fi
+        done <<< "${pods}"
+        last="${over}"
+        [[ -n "${over}" ]] || { log_info "GC no longer selects the removed MH(s)."; return 0; }
+        (( $(date +%s) < deadline )) || break
+        sleep "${MH_SETTLE_POLL_SECONDS}"
+    done
+    log_error "After B (${bound}s, rounded up) + ${margin}s, GC pod(s) still count more fresh ${MH_SETTLE_STATES} MH rows than the ${live} registered live one(s), or have not recomputed the count since the removal: ${last% }. Either a removed MH is still selectable (until story 4 MH-3 a removed MH sends no DRAINING report), so the next meeting may be placed on a dead handler, or the count is FROZEN: check gc_db_queries_total{operation=\"count_available_mh\",status=\"error\"} (the error= figure above) and the GC health-checker's 'MH registry tick step failed' lines (kubectl logs -n ${ns} deploy/gc-service); ./infra/kind/scripts/mh.sh list."
+    mh_settle_failed
+    return 1
 }
 
 # --- Migrations as an in-cluster Job (ADR-0038 §2 step 3) -----------------

@@ -219,7 +219,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mc_service = McService::new(state.clone());
     let mh_service = MhService::new(
         Arc::new(db_pool.clone()),
-        state.config.mh_registry.load_report_interval_ms(),
+        &state.config.mh_registry,
+        state.config.mh_endpoint_allowlist.clone(),
     );
     let grpc_auth_layer = GrpcAuthLayer::new(jwt_validator);
 

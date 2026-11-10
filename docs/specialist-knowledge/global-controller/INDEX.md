@@ -23,7 +23,7 @@
 - Join/settings (user-auth, status allowlist, `home_org_id`, metrics) -> `crates/gc-service/src/handlers/meetings.rs:join_meeting()`, `update_meeting_settings()`
 - Join response construction (shared by join + guest-token; McAssignment -> McAssignmentInfo) -> `crates/gc-service/src/handlers/meetings.rs:JoinMeetingResponse::new()`, `From<McAssignment>`
 - MC gRPC service (register, heartbeat) -> `crates/gc-service/src/grpc/mc_service.rs:McService`
-- MH gRPC service (register, load report) -> `crates/gc-service/src/grpc/mh_service.rs:MhService`
+- MH gRPC service (register: arm 0 + single outcome site; load report) -> `crates/gc-service/src/grpc/mh_service.rs:MhService`; RegisterMH allowlists (canonical grammar, zones, parsers) -> `crates/gc-service/src/mh_endpoint_policy.rs:MhEndpointAllowlist`, keys `config.rs:mh_endpoint_allowlist_from_vars()`, Kind render `infra/kind/scripts/deploy.sh:gc_mh_allowlist_literals()`; arms 1-3 (locked txn, `decide()`) -> `crates/gc-service/src/repositories/media_handlers.rs:MediaHandlersRepository::register_mh()`
 - MC assignment + load balancing; join stickiness (reuse returns existing MC, no MH selection, `mh_selection: None`, R-6) -> `crates/gc-service/src/services/mc_assignment.rs:assign_meeting_with_mh()`, `AssignmentWithMh`
 - MH selection (active/active `handlers: Vec<MhAssignmentInfo>`; `grpc_endpoint` propagated DB→info→proto) -> `crates/gc-service/src/services/mh_selection.rs:MhSelectionService`
 - MC gRPC client (`assign_meeting` RPC carrying per-handler `webtransport_endpoint` + `grpc_endpoint`) -> `crates/gc-service/src/services/mc_client.rs:McClientTrait`
@@ -70,6 +70,6 @@
 - Per-metric-cluster integration tests (ADR-0032) -> `crates/gc-service/tests/*_metrics_integration.rs`
 - `error_type` label coverage -> `crates/gc-service/tests/meeting_creation_metrics_integration.rs`, `crates/gc-service/tests/errors_metric_integration.rs`
 - Telemetry proxy tests -> `crates/gc-service/tests/telemetry_proxy_tests.rs`, `crates/gc-service/tests/telemetry_metrics_integration.rs`
-- MH registry: gates -> `crates/gc-service/tests/mh_registry_tests.rs`, `crates/gc-service/tests/mh_health_checker_tests.rs` (fixtures `tests/common/mh_registry.rs`); series -> `crates/gc-service/tests/mh_registry_metrics_integration.rs`; shipped config for tests -> `crates/gc-test-utils/src/reference_config.rs:reference_mh_registry()`; env-test -> `crates/env-tests/tests/03_gc_deployment_config.rs`
+- MH registry: gates -> `crates/gc-service/tests/mh_registry_tests.rs`, `crates/gc-service/tests/mh_health_checker_tests.rs` (fixtures `tests/common/mh_registry.rs`); series -> `crates/gc-service/tests/mh_registry_metrics_integration.rs`; shipped config for tests -> `crates/gc-test-utils/src/reference_config.rs:reference_mh_registry()`; env-test -> `crates/env-tests/tests/03_gc_deployment_config.rs`; RegisterMH rule -> `tests/mh_registration_tests.rs` (arms, concurrency), `tests/mh_registration_metrics_integration.rs` (label shape), test allowlist `crates/gc-test-utils/src/mh_endpoint_allowlist.rs`, env-test `crates/env-tests/tests/44_gc_mh_registration.rs`
 - Test harness -> `crates/gc-test-utils/src/server_harness.rs`; per-crate JWT fixtures -> `crates/gc-service/tests/common/jwt_fixtures.rs`
 - Metrics catalog (creation + join, `error_type` value list) -> `docs/observability/metrics/gc-service.md`

@@ -625,18 +625,56 @@ psql $DATABASE_URL
 | `GC_MH_STALENESS_MULTIPLIER` | **Yes** | k in B = k × `GC_MH_LOAD_REPORT_INTERVAL_MS`, the ONE MH freshness bound (selection, stale sweep incl. draining, `gc_mh_available`); range [2, 10]. Published as `gc_mh_staleness_threshold_seconds`. Takes effect when GC rolls. Raising k is always safe; lowering k shrinks B immediately and follows the same cadence-below-every-replica's-B rule as the interval. | Reference `3` | `3` |
 | `GC_MH_REGISTRY_RETENTION_SECONDS` | **Yes** | Registry rows with no load report for this long are deleted on the MH health-checker tick (rows are per MH incarnation). Must exceed B (compared in ms) and be at most `2592000` (30 d); otherwise startup fails. | Reference `3600` | `3600` |
 | `GC_MH_INITIAL_HANDLERS_PER_MEETING` | **Yes** | MHs selected for a NEW meeting (fewer if fewer are selectable); range [1, 4]. Existing meetings are unaffected. | Reference `2` | `2` |
+| `GC_MH_WT_ALLOWED_HOSTS` | **Yes** | RegisterMH arm 0, client-facing zone: hosts an MH may advertise in `webtransport_endpoint` (scheme is `https`, fixed in code). Comma-separated exact hosts (DNS name or IP literal) or `.suffix` entries (label boundary, never the apex, never an IP host). Empty, `*`, `.` or a malformed entry fails startup naming the key. Narrowing it does NOT evict registered MHs (existing rows are not re-validated); it affects new registrations only. To change Kind's value change the kind-config / helper port table and redeploy; never edit `config.env`. | **Rendered per environment** (base `config.env` is EMPTY: GC refuses to start without the render). Kind: `deploy.sh` (`gc_mh_allowlist_literals`), from the MH slot table's advertised hosts | host-mode `127.0.0.1` (devloop: the cluster's `DT_HOST_GATEWAY_IP`). Live values: see the command under this table. |
+| `GC_MH_WT_ALLOWED_PORTS` | **Yes** | RegisterMH arm 0, client-facing ports (1–65535; explicit port required in the endpoint). Same change and re-validation rules as the hosts key. | **Rendered per environment** (base `config.env` is EMPTY: GC refuses to start without the render). Kind: `deploy.sh` (`gc_mh_allowlist_literals`), from the slot table's host ports | host-mode `4440`–`4445` (devloop: the helper's per-slug slot ports) |
+| `GC_MH_GRPC_ALLOWED_SCHEMES` | **Yes** | RegisterMH arm 0, internal zone: schemes allowed in `grpc_endpoint` (lowercase URI scheme tokens, whole-token match). **`grpc` = cleartext h2c, unauthenticated**: no TLS and no peer authentication of the MH server, so MC's bearer crosses that channel in cleartext (S6, `docs/TODO.md` §Media Path Obligations). The allowlist bounds where MC sends its credential; it is not peer authentication and does not close S6. Flips by config only to a TLS scheme when S6 mTLS lands. | Base `config.env` value (policy, not topology) | `grpc` |
+| `GC_MH_GRPC_ALLOWED_CIDRS` | **Yes** | RegisterMH arm 0, internal zone: the `grpc_endpoint` host must be an IP literal inside one of these CIDRs (hostnames rejected). A CIDR with host bits set or a `/0` fails startup. **Strength:** Kind renders the WHOLE pod subnet, so there this key bounds the address space only, not MH-pod identity: any pod IP on an allowed port passes. In-cluster, MC's egress NetworkPolicy (port 50053 only to `app=mh-service` pods, `infra/services/mc-service/network-policy.yaml`) is what keeps MC's bearer on MH pods. A non-Kind environment should set the narrowest CIDR(s) containing only MH pods. | **Rendered per environment** (base `config.env` is EMPTY: GC refuses to start without the render). Kind: `deploy.sh` (`gc_mh_allowlist_literals`), from kind-config `networking.podSubnet` | `192.168.0.0/16` |
+| `GC_MH_GRPC_ALLOWED_PORTS` | **Yes** | RegisterMH arm 0, internal zone ports. | **Rendered per environment** (base `config.env` is EMPTY: GC refuses to start without the render). Kind: `deploy.sh` (`gc_mh_allowlist_literals`), from the MH template's `MH_GRPC_ADVERTISE_ADDRESS` | `50053` |
 
-The four `GC_MH_*` keys have no compiled-in default; their reference values live in
-`infra/services/gc-service/config.env`. A bad key fails the new GC pods in one of two ways, and in both the
-old ReplicaSet keeps serving; fix `config.env` and re-apply:
+**Live allowlist values** (the ConfigMap generation the running Deployment references; old hash-named
+generations are never pruned, so a label-selector listing would mix stale and live values):
+
+```bash
+kubectl get cm -n dark-tower "$(kubectl get deploy gc-service -n dark-tower -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="GC_MH_WT_ALLOWED_HOSTS")].valueFrom.configMapKeyRef.name}')" -o yaml | grep GC_MH_
+```
+
+The `GC_MH_*` registry and allowlist keys have no compiled-in default. The four registry keys' reference
+values live in `infra/services/gc-service/config.env`; of the five allowlist keys only
+`GC_MH_GRPC_ALLOWED_SCHEMES` does, and the four topology keys are EMPTY there by design (a converge that skips
+the deploy render leaves the new GC ReplicaSet in `CrashLoopBackOff` naming the key while the old pods keep
+serving; remedy: re-run `./infra/kind/scripts/deploy.sh` / `dev-cluster deploy`, never hand-fill `config.env`).
+
+A bad key fails the new GC pods in one of two ways, and in both the old ReplicaSet keeps serving. Fix the key
+at its source, then re-apply: `config.env` for the registry keys and `GC_MH_GRPC_ALLOWED_SCHEMES`; for the four
+rendered allowlist keys, the render input (kind-config / helper port table / MH template), then re-run
+`./infra/kind/scripts/deploy.sh`:
 
 | Cause | Signal | Where the answer is |
 |---|---|---|
 | Key absent from the `gc-service-config` ConfigMap (the Deployment's `configMapKeyRef` is hard) | `CreateContainerConfigError`: no container ever runs | `kubectl describe pod -n dark-tower -l app=gc-service` names the missing key. `kubectl logs` is **empty** |
-| Key present but out of range, non-numeric, or retention ≤ the staleness bound | `CrashLoopBackOff` | `kubectl logs --previous -n dark-tower -l app=gc-service`: the `ConfigError` names the key |
+| Key present but out of range, non-numeric, or retention ≤ the staleness bound; or an allowlist key EMPTY (render skipped) or malformed | `CrashLoopBackOff` | `kubectl logs --previous -n dark-tower -l app=gc-service`: the `ConfigError` names the key |
 
 The shared explanation of why the `kubectl logs` reflex misleads here is `mc-deployment.md`
 [§Config-failure triage](mc-deployment.md#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three).
+
+**RegisterMH rejects (`gc_mh_registrations_total{outcome="invalid_endpoint"|"address_conflict"|"endpoint_changed"}`).**
+A rejected MH keeps running and retries `RegisterMH` with backoff forever; it is never selectable (it reports
+not-ready, so `mh.sh up` fails `not-available-timeout`). Triage: the GC `warn` line (`MH registration rejected:
+...`) names the `handler_id`, the field (`webtransport_endpoint`/`grpc_endpoint`) and the failed component
+(`scheme`/`host`/`port`/`syntax`), with the endpoint. `invalid_endpoint` on a fresh Kind cluster = the rendered
+allowlist does not match the slot addresses (render drift; re-run deploy). `address_conflict` = a fresh serving
+row holds one of the endpoints: it resolves by itself once that row goes stale (after the staleness bound), so
+persistence beyond the bound means two live holders of one address — check `mh.sh list` and drain the
+conflicting slot. A single `superseded{match="both"}` is a routine in-place crash restart.
+
+**Rolling update window.** During a GC roll, old replicas still run the pre-rule registration (silent endpoint
+rewrite, no lock); the rule is guaranteed only once every replica runs the new code. Until the roll completes,
+an old replica can INSERT a new row whose endpoint overlaps a live one, or rewrite its own row's endpoints,
+outside both the registry lock and the new rule (a new replica's row locks cannot cover a row that does not
+exist yet). A failed registration (database failure, or a registry-invariant breach observed under the lock — a GC bug,
+report it) answers INTERNAL `Registration failed`, shows as
+`gc_db_queries_total{operation="register_mh_txn",status="error"}`, and the MH retries; the GC error log line
+says which. Rollback = converge from the previous checkout (no schema change; an old GC ignores the extra keys).
 
 **Expected recovery after a GC or database outage longer than `GC_MH_REGISTRY_RETENTION_SECONDS`:** the
 first MH health-checker tick after recovery deletes every MH row (all are older than retention). Each MH's

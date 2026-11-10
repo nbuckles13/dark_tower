@@ -98,7 +98,7 @@ impl TestServer {
             ("GC_CLIENT_ID".to_string(), "test-gc-client".to_string()),
             ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
         ]);
-        vars.extend(gc_test_utils::reference_mh_registry_vars());
+        vars.extend(gc_test_utils::mh_config_vars());
         let config = Config::from_vars(&vars)?;
 
         let (_tx, rx) = watch::channel(SecretString::from("test-token"));
