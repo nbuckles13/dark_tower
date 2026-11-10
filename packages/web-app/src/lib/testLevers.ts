@@ -13,11 +13,13 @@
 //   * `blockHandlers` — S10a partial connectivity. Exact-match media-handler URLs
 //     this context REFUSES to dial. It can only NARROW: it wraps the injected
 //     WebTransport `connect`, and every dial target still comes from MC's
-//     `JoinResponse.media_servers` through the SDK's one dial site. A lever string
-//     is never passed to `connect`, so it cannot become a dial target (and the MH
-//     join token is only written after a connect succeeds). A refused dial reports
-//     `failed`, exactly as an unreachable handler does — MC derives visibility
-//     from connections the handlers OBSERVE, so this is the real-world cause.
+//     `MediaHandlerSet` through the SDK's one dial site. A lever string is never
+//     passed to `connect`, so it cannot become a dial target (and no credential
+//     is written until a connect succeeds). A refused dial reports `failed`,
+//     exactly as an unreachable handler does — MC derives visibility from
+//     connections the handlers OBSERVE, so this is the real-world cause. The
+//     SDK redials a failed in-set handler with backoff (ADR-0039 §4); every
+//     redial meets the same lever and fails the same way.
 //   * `audioReceiveSlots` / `videoReceiveSlots` — S2's per-context N and M (the
 //     `VITE_DT_AUDIO_RECEIVE_SLOTS` / `VITE_DT_VIDEO_RECEIVE_SLOTS` form), parsed by
 //     the SDK's own strict `parseReceiveSlots`. They do not bypass MC's caps: MC

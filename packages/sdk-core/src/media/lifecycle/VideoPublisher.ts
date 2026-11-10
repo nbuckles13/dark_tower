@@ -52,6 +52,7 @@ import type { LocalSendStreamStats } from './localStats.js';
 import type { MuteSnapshot, MuteState } from './muteState.js';
 import type { MediaKindToken } from '../mediaKind.js';
 import type { TransmitKeyManager } from './transmitKeys.js';
+import type { HandlerRef } from '../handlerSet.js';
 
 /** MC's validated instruction for this client's video stream. */
 export interface VideoSendDirective {
@@ -60,7 +61,7 @@ export interface VideoSendDirective {
   /** Validated; every field present (`session/mediaWiring.ts:validateVideoEncoding`). */
   readonly encoding: DirectedVideoEncoding;
   /** EMPTY MEANS SEND NOTHING: unwatched, or server-muted (both withdraw). */
-  readonly targets: readonly string[];
+  readonly targets: readonly HandlerRef[];
   /** MC's meeting-wide header version. */
   readonly headerVersion: number;
 }
@@ -272,7 +273,7 @@ export class VideoPublisher {
     if (!current) return;
 
     const streamId = uplinkRelayStreamId(current);
-    const targets = streamId === undefined ? [] : current.targets.filter((u) => u !== '');
+    const targets = streamId === undefined ? [] : [...current.targets];
     if (streamId === undefined && current.targets.length > 0) {
       this.#fault(MediaFaultStage.Config, FAULT_UNSTAMPABLE, false);
     }
@@ -293,9 +294,7 @@ export class VideoPublisher {
     if (!this.#egress && nonEmpty && streamId !== undefined) {
       this.#egress = this.#buildEgress(current.streamNumber, streamId);
     }
-    const before = new Set(
-      previous && this.#egress ? previous.targets.filter((u) => u !== '') : [],
-    );
+    const before = new Set(previous && this.#egress ? previous.targets : []);
     const egress = this.#egress;
     egress?.setTargets({ targets, headerVersion: current.headerVersion });
     this.#gate.setDirective(targets, current.encoding.minKeyframeIntervalMs);
@@ -336,9 +335,14 @@ export class VideoPublisher {
     if (!muted) this.#gate.selfKey(MEDIA_KEYFRAME_SOURCES.DirectiveStart);
   }
 
-  /** An MH `KeyframeRequest` for the directed video stream, read on `url`'s connection. */
-  keyframeRequest(url: string, gopCounter: number): MediaKeyframePerKindOutcome {
-    return this.#gate.request(url, gopCounter);
+  /** The handler `ref` LEFT THE SET (ADR-0039 §4 removal cleanup): delete its egress lane. */
+  forgetHandler(ref: HandlerRef): void {
+    this.#egress?.forget(ref);
+  }
+
+  /** An MH `KeyframeRequest` for the directed video stream, read on `ref`'s connection. */
+  keyframeRequest(ref: HandlerRef, gopCounter: number): MediaKeyframePerKindOutcome {
+    return this.#gate.request(ref, gopCounter);
   }
 
   /**

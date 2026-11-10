@@ -7,6 +7,7 @@ import { MeetingSessionState, SdkError, SdkErrorCode } from '@darktower/sdk-core
 import type { JoinedEvent, RosterParticipant } from '@darktower/sdk-core';
 import { MeetingStore } from '../stores/MeetingStore.svelte.js';
 import { mediaStates } from './helpers/mediaStates.js';
+import type { HandlerRef } from '@darktower/sdk-core';
 
 function roster(id: string, name: string): RosterParticipant {
   return { participantId: id, name, mediaStates: mediaStates() };
@@ -18,7 +19,7 @@ function joined(existing: readonly RosterParticipant[]): JoinedEvent {
     senderId: 42,
     existingParticipants: existing,
     receiveSlotCaps: { audio: 8, video: 8 },
-    mediaServers: [],
+    handlerSet: { version: '0', handlers: [] },
     correlationId: 'corr',
     bindingToken: 'binding-secret',
   };
@@ -61,12 +62,16 @@ test('applyParticipantLeft removes by participantId', () => {
   expect(store.participants.map((p) => p.participantId)).toEqual(['b']);
 });
 
-test('applyMediaConnected appends unique MH URLs (dedup)', () => {
+test('applyMediaConnected appends unique handlers, dedup BY REF (a new ref at a reused url is new)', () => {
   const store = new MeetingStore();
-  store.applyMediaConnected('https://mh-0:4433');
-  store.applyMediaConnected('https://mh-1:4433');
-  store.applyMediaConnected('https://mh-0:4433');
-  expect(store.mediaConnections).toEqual(['https://mh-0:4433', 'https://mh-1:4433']);
+  const h = (ref: number, url: string) => ({ ref: ref as HandlerRef, url });
+  store.applyMediaConnected(h(1, 'https://mh-0:4433'));
+  store.applyMediaConnected(h(2, 'https://mh-1:4433'));
+  // A redial of ref 1: not a new entry.
+  store.applyMediaConnected(h(1, 'https://mh-0:4433'));
+  // A NEW ref at the same url as ref 1: a different handler.
+  store.applyMediaConnected(h(3, 'https://mh-0:4433'));
+  expect(store.mediaConnections.map((c) => c.ref)).toEqual([1, 2, 3]);
 });
 
 test('applyError stores the typed SdkError (code preserved)', () => {

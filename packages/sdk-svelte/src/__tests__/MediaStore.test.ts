@@ -23,13 +23,14 @@ import GranularityHarness from './helpers/GranularityHarness.svelte';
 import CellGranularityHarness from './helpers/CellGranularityHarness.svelte';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
 import { mediaStates } from './helpers/mediaStates.js';
+import type { HandlerRef } from '@darktower/sdk-core';
 
 function slot(overrides: Partial<StreamAssignmentEvent> = {}): StreamAssignmentEvent {
   return {
     slotId: 0,
     mediaKind: 'audio',
     senderId: 258,
-    mediaHandlerUrl: 'https://mh-0:4433',
+    handlerRef: 1 as HandlerRef,
     slotState: 'active',
     ...overrides,
   };
@@ -344,7 +345,7 @@ test('per-kind state of others (R-15): roster seeds every kind, updates move it,
       },
       { participantId: 'f', name: 'F', mediaStates: mediaStates() },
     ],
-    mediaServers: [],
+    handlerSet: { version: '0', handlers: [] },
     correlationId: '',
     bindingToken: '',
   });
@@ -389,7 +390,7 @@ test('the roster is seeded BEFORE it lists anyone: no listed participant is ever
     participantId: 'self',
     receiveSlotCaps: { audio: 8, video: 8 },
     existingParticipants: [{ participantId: 'a', name: 'A', mediaStates: mediaStates() }],
-    mediaServers: [],
+    handlerSet: { version: '0', handlers: [] },
     correlationId: '',
     bindingToken: '',
   });

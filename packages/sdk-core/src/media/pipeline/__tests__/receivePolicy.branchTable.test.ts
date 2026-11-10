@@ -30,6 +30,7 @@ import {
 import { VideoSlotPipeline } from '../videoSlotPipeline.js';
 import { buildTestFrame, makeIdentity, type TestIdentity } from './frameFixtures.js';
 import { KEK, manualClock, videoFrame, videoMetrics } from './videoFixtures.js';
+import { handlerRef } from '../../handlerSet.js';
 
 const SINK_ERR = (): void => {};
 const A = 301;
@@ -123,7 +124,7 @@ function renderOutcome(
     gopCounter: 1,
     isKeyframe: true,
     data: new Uint8Array([0, 0, 0, 0x9d, 1, 0x2a, 0x80, 2, 0x68, 1]),
-    url: 'u',
+    ref: handlerRef(1),
   });
   decoders.last!.emitOutput();
   if (mutedAfterDecode) isMuted = true;

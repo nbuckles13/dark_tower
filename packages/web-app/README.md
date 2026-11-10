@@ -94,6 +94,31 @@ runtime, plain env for the proxy upstreams):
 > unreachable, whose message says "is the Kind cluster up?" — the wrong diagnosis when the real
 > cause is that a `hostPort` moved and these defaults no longer point at it.
 
+### Media-handler set reconcile (SDK `MediaConfig.handlers`)
+
+How the SDK follows MC's media-handler set (ADR-0039 §4): redials a lost handler,
+waits on an empty join-time set, and waits after a `HANDLER_RELEASED` close.
+These are **SDK code-config** (bundle constants in
+`packages/sdk-core/src/config/clientConfig.ts`, the single source of the
+defaults — `tests/handlerSetConfigDocs.test.ts` fails if this table drifts from
+it), not `VITE_*` env: changing one means rebuilding the bundle. Ranges are
+inclusive; an out-of-range value throws `ClientConfigError` at session build
+(never clamped). The effective values are logged once per session as
+`[dt-media-handlers-config]`.
+
+<!-- handler-set-config:begin -->
+| Key | Default (ms) | Range (ms) | Purpose |
+|-----|--------------|------------|---------|
+| `redialBaseMs` | 1000 | 100–60000 | Full-jitter base: redial n waits U[0, min(cap, base·2ⁿ)] |
+| `redialCapMs` | 30000 | 1000–300000 | Cap on the jitter window; must be ≥ `redialBaseMs` |
+| `emptySetNoticeMs` | 15000 | 1000–300000 | Empty join-time set: one `mediaHandlersOverdue` event if no handler arrives within this bound |
+| `releasedGraceMs` | 2000 | 0–30000 | After `HANDLER_RELEASED` for an in-set handler: wait for a set update before reporting DISCONNECTED and redialling |
+<!-- handler-set-config:end -->
+
+The **first** redial also waits `MH_KEEPALIVE_FLOOR_MS` (10000, compiled; must
+equal MH's `MH_KEEPALIVE_INTERVAL_MS`, pinned by
+`scripts/guards/simple/validate-keyframe-floor-sync.sh`) before its jitter.
+
 ## Things that go wrong (first-run)
 
 **Owned by `docs/runbooks/client-dev-local.md` §5** — ten failure modes, each with
@@ -119,12 +144,15 @@ The demo exposes a stable surface the test-owned Playwright specs consume:
 - **`window.__darktower_test__`** — a replay-buffered event bus, gated behind the
   `__E2E_HOOKS__` build define (absent from prod bundles). It carries only
   bounded, non-PII events (`stateChange`, `joined`, `participantJoined`,
-  `participantLeft`, `mediaConnected`, `error`). The `joined` event is a
-  whitelist projection — it **omits** `bindingToken` and `correlationId`; errors
-  cross via `SdkError.toJSON()` (no tokens). Read it as:
+  `participantLeft`, `mediaConnected` — `{handlerRef, url}`, `handlerSet`,
+  `error`). The `joined` event is a whitelist projection — it **omits**
+  `bindingToken` and `correlationId`; errors cross via `SdkError.toJSON()` (no
+  tokens). `handlerSets` is the ordered history of every media-handler set
+  (`{version, handlers:[{ref, url}]}`, **never** a dial token). Read it as:
 
   ```js
   window.__darktower_test__.events            // replay buffer of all events so far
+  window.__darktower_test__.handlerSets       // every handler set, in wire order
   window.__darktower_test__.on('joined', cb)  // subscribe to future events
   ```
 

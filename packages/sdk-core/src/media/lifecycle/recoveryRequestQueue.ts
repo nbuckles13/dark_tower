@@ -21,11 +21,12 @@
 
 import type { MhRecoveryRequest } from '../events.js';
 import type { MediaRecoverySource } from '../setup/mediaMetrics.js';
+import type { HandlerRef } from '../handlerSet.js';
 
 /** What the queue needs from its owner. */
 export interface RecoveryRequestQueueOptions {
   /** The per-handler control send. Rejects on any failure. */
-  readonly send: (mediaHandlerUrl: string, request: MhRecoveryRequest) => Promise<void>;
+  readonly send: (handlerRef: HandlerRef, request: MhRecoveryRequest) => Promise<void>;
   /** A request was written. Counted by cause (`source`). */
   readonly sent: (reason: MediaRecoverySource) => void;
   /** A write failed. Surfaced event-once by the owner; never re-sent. */
@@ -46,30 +47,42 @@ interface HandlerQueue {
 /** See the module header. */
 export class RecoveryRequestQueue {
   readonly #options: RecoveryRequestQueueOptions;
-  readonly #handlers = new Map<string, HandlerQueue>();
+  readonly #handlers = new Map<HandlerRef, HandlerQueue>();
   #stopped = false;
 
   constructor(options: RecoveryRequestQueueOptions) {
     this.#options = options;
   }
 
-  /** Queue one request for `slotId` on `mediaHandlerUrl`, replacing any unsent one. */
-  request(mediaHandlerUrl: string, request: MhRecoveryRequest, reason: MediaRecoverySource): void {
+  /** Queue one request for `slotId` on `handlerRef`, replacing any unsent one. */
+  request(handlerRef: HandlerRef, request: MhRecoveryRequest, reason: MediaRecoverySource): void {
     if (this.#stopped) return;
-    let queue = this.#handlers.get(mediaHandlerUrl);
+    let queue = this.#handlers.get(handlerRef);
     if (!queue) {
       queue = { pending: new Map(), inFlight: false };
-      this.#handlers.set(mediaHandlerUrl, queue);
+      this.#handlers.set(handlerRef, queue);
     }
     // Replace: delete first so the slot moves to the back of the send order.
     queue.pending.delete(request.slotId);
     queue.pending.set(request.slotId, { request, reason });
-    this.#pump(mediaHandlerUrl, queue);
+    this.#pump(handlerRef, queue);
   }
 
   /** Requests queued and not yet handed to the transport. For assertion. */
-  pendingFor(mediaHandlerUrl: string): number {
-    return this.#handlers.get(mediaHandlerUrl)?.pending.size ?? 0;
+  pendingFor(handlerRef: HandlerRef): number {
+    return this.#handlers.get(handlerRef)?.pending.size ?? 0;
+  }
+
+  /**
+   * The handler `ref` left the set (ADR-0039 §4 removal cleanup): drop its
+   * queue. An in-flight send settles against a closed transport and is not
+   * re-pumped (the queue is gone).
+   */
+  drop(ref: HandlerRef): void {
+    const queue = this.#handlers.get(ref);
+    if (!queue) return;
+    queue.pending.clear();
+    this.#handlers.delete(ref);
   }
 
   /** Drop everything queued; nothing more is sent. Idempotent. */
@@ -78,23 +91,25 @@ export class RecoveryRequestQueue {
     for (const queue of this.#handlers.values()) queue.pending.clear();
   }
 
-  #pump(url: string, queue: HandlerQueue): void {
+  #pump(ref: HandlerRef, queue: HandlerQueue): void {
     if (queue.inFlight || this.#stopped) return;
     const next = queue.pending.entries().next();
     if (next.done) return;
     const [slotId, pending] = next.value;
     queue.pending.delete(slotId);
     queue.inFlight = true;
-    this.#options.send(url, pending.request).then(
+    this.#options.send(ref, pending.request).then(
       () => {
         queue.inFlight = false;
         if (!this.#stopped) this.#options.sent(pending.reason);
-        this.#pump(url, queue);
+        this.#pump(ref, queue);
       },
       () => {
         queue.inFlight = false;
-        if (!this.#stopped) this.#options.failed();
-        this.#pump(url, queue);
+        // A send to a handler that was REMOVED meanwhile failing is the removal,
+        // not a fault (`drop`).
+        if (!this.#stopped && this.#handlers.get(ref) === queue) this.#options.failed();
+        this.#pump(ref, queue);
       },
     );
   }

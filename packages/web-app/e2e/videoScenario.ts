@@ -29,7 +29,7 @@ import {
 } from './cohortContexts.js';
 import type { CohortMemberPlan } from './cohort.js';
 import { readMcReceiveCaps, serviceConfigEnvPath, type McReceiveCaps } from './configEnv.js';
-import { bootstrapMeeting, waitForVideoSlotState } from './fixtures.js';
+import { bootstrapMeeting, handlerUrls, waitForVideoSlotState } from './fixtures.js';
 import type { InstanceCounters } from './instanceCounters.js';
 import { mhAdmissionRejectionsByInstance } from './mcMetrics.js';
 import {
@@ -124,7 +124,7 @@ export class VideoScenario {
     this.oracle.join(member.label, {
       publish: plan.publish,
       slots: { audio: plan.audioReceiveSlots, video: plan.videoReceiveSlots },
-      handlers: handlers ?? joined.joined.mediaServers,
+      handlers: handlers ?? handlerUrls(joined.joined.handlerSet),
     });
     return joined;
   }

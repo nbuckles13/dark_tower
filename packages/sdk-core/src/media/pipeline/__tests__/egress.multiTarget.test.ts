@@ -38,12 +38,13 @@ import { decodeFrame } from '../../frame/frameCodec.js';
 import { parseSframe } from '../../frame/sframe.js';
 import { TransmitKeyManager } from '../../lifecycle/transmitKeys.js';
 import { EgressPipeline, type DatagramSender } from '../egress.js';
+import { handlerRef, type HandlerRef } from '../../handlerSet.js';
 
 const KEK = new Uint8Array(AES_256_KEY_BYTES).fill(0x11);
 const SENDER_ID = 258;
-const FIRST = 'https://mh-0.example:4433';
-const SECOND = 'https://mh-1.example:4433';
-const THIRD = 'https://mh-2.example:4433';
+const FIRST = handlerRef(1);
+const SECOND = handlerRef(2);
+const THIRD = handlerRef(3);
 
 async function settle(): Promise<void> {
   for (let i = 0; i < 25; i += 1) {
@@ -78,7 +79,7 @@ class RecordingSender implements DatagramSender {
 
 interface Rig {
   readonly egress: EgressPipeline;
-  readonly senders: Map<string, RecordingSender>;
+  readonly senders: Map<HandlerRef, RecordingSender>;
   readonly transmitKeys: TransmitKeyManager;
   readonly sink: InMemoryMetricsSink;
   submit(byte: number): Promise<void>;
@@ -87,14 +88,14 @@ interface Rig {
 }
 
 async function makeRig(
-  urls: readonly string[],
+  urls: readonly HandlerRef[],
   transmitKeys: TransmitKeyManager = new TransmitKeyManager(SENDER_ID),
 ): Promise<Rig> {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaKindMetrics({ clientVersion: 'v', orgId: 'o' }, MediaKind.AUDIO, sink);
   const kekSource = kekHolderWith(KEK, 0);
   const identity = await MeetingIdentity.create();
-  const senders = new Map<string, RecordingSender>();
+  const senders = new Map<HandlerRef, RecordingSender>();
   for (const url of urls) senders.set(url, new RecordingSender());
   let notConnected = 0;
 
@@ -157,6 +158,29 @@ describe('multi-target send', () => {
       .flatMap((url) => rig.senders.get(url)!.sent)
       .reduce((n, datagram) => n + datagram.length, 0);
     expect(rig.egress.bytesSent).toBe(bytes);
+  });
+
+  it('forget(ref) — a ref that LEFT THE SET — deletes its lane; the other lanes keep sending', async () => {
+    const rig = await makeRig([FIRST, SECOND]);
+    rig.egress.setTargets({ targets: [FIRST, SECOND], headerVersion: HEADER_VERSION });
+    await rig.submit(1);
+    await settle();
+    rig.egress.forget(SECOND);
+    await rig.submit(2);
+    await settle();
+    // Positive arm: the remaining lane got both frames...
+    expect(rig.senders.get(FIRST)!.sent).toHaveLength(2);
+    // ...the forgotten one only the frame before its removal, and nothing is
+    // counted as not_connected for it (it is not a target any more).
+    expect(rig.senders.get(SECOND)!.sent).toHaveLength(1);
+    expect(rig.notConnectedFaults()).toBe(0);
+    expect(rig.reasons()).toEqual([]);
+    // A NEW ref later directed starts a fresh lane at hop 0.
+    rig.senders.set(THIRD, new RecordingSender());
+    rig.egress.setTargets({ targets: [FIRST, THIRD], headerVersion: HEADER_VERSION });
+    await rig.submit(3);
+    await settle();
+    expect(hopSequenceOf(rig.senders.get(THIRD)!.sent[0]!)).toBe(0);
   });
 
   it('seals ONCE: the bytes on each target differ only in the hop sequence', async () => {
@@ -417,7 +441,7 @@ describe('gop_counter: one value per frame, above the fan-out (ADR-0036 §2)', (
       const gops = rig.senders.get(url)!.sent.map((f) => decodeFrame(f).gopCounter);
       // Every Opus frame is independently decodable, so every frame starts a
       // group: 0, 1, 2 on EVERY lane — never 0..8 across three lanes.
-      expect(gops, url).toEqual([0, 1, 2]);
+      expect(gops, String(url)).toEqual([0, 1, 2]);
       for (const f of rig.senders.get(url)!.sent) {
         expect(decodeFrame(f).flags.independentlyDecodable).toBe(true);
       }

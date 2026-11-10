@@ -25,9 +25,10 @@ import { MediaKind } from '../../../proto/dark_tower/signaling/v1/signaling_pb.j
 import { TransmitKeyManager } from '../../lifecycle/transmitKeys.js';
 import { EgressPipeline, type DatagramSender } from '../egress.js';
 import { VideoEgress } from '../videoEgress.js';
+import { handlerRef } from '../../handlerSet.js';
 
 const SEEDS = [1, 7, 42, 1337, 0xc0ffee, 20261022];
-const MH = 'https://mh-0.example:4433';
+const MH = handlerRef(1);
 
 /** mulberry32: a tiny deterministic PRNG. */
 function prng(seed: number): () => number {

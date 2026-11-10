@@ -40,6 +40,16 @@ declare const __DEV_CERT_SHA256_HASHES__: readonly string[];
 interface DarktowerTestBus {
   /** Replay buffer of every bounded event fired so far (late subscribers included). */
   readonly events: ReadonlyArray<Readonly<Record<string, unknown>>>;
+  /**
+   * Every media-handler set the session held, in wire order (ADR-0039 §4):
+   * `{version, handlers:[{ref, url}]}` — NEVER a dial token. The browser
+   * suite's source of handler urls (`JoinResponse.media_servers` is superseded).
+   */
+  // An `import()` type keeps this file AMBIENT (a top-level import would make it
+  // a module and drop every global above); the ONE `BusHandlerSet` lives with
+  // the projection in `lib/e2eBus.ts`.
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+  readonly handlerSets: ReadonlyArray<import('./lib/e2eBus.js').BusHandlerSet>;
   /** Subscribe to a bounded event type; returns an unsubscribe closure. */
   on(type: string, listener: (event: Readonly<Record<string, unknown>>) => void): () => void;
   /**

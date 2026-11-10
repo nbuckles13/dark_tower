@@ -38,6 +38,7 @@ import {
   type MediaSessionMetrics,
 } from '../media/setup/mediaMetrics.js';
 import type { TransmitKeyInvalidationListener } from '../media/setup/rosterKeys.js';
+import type { HandlerRef } from '../media/handlerSet.js';
 
 /**
  * Route the KEK holder's reports to the media metric handles and the console.
@@ -392,7 +393,7 @@ export interface MhControlWiring {
 /** The video publisher operation a keyframe request drives. */
 export interface VideoKeyframeTarget {
   /** Classify, count (the gate counts) and key if honoured. */
-  keyframeRequest(url: string, gopCounter: number): MediaKeyframePerKindOutcome;
+  keyframeRequest(ref: HandlerRef, gopCounter: number): MediaKeyframePerKindOutcome;
 }
 
 /**
@@ -400,7 +401,7 @@ export interface VideoKeyframeTarget {
  *
  * A `KeyframeRequest` is UNTRUSTED input. Only a request naming the directed
  * `stream_number` of the PUBLISHED video stream reaches the keyframe gate
- * (`lifecycle/keyframePolicy.ts`), with `url` = the handler connection the
+ * (`lifecycle/keyframePolicy.ts`), with `ref` = the handler connection the
  * request was READ on (bound by `MediaTransport`'s per-connection read loop,
  * never taken from the payload); the gate classifies and counts it. Every
  * other request is refused BEFORE any gate state is touched: one naming the
@@ -411,7 +412,7 @@ export interface VideoKeyframeTarget {
  */
 export function mhControlSink(wiring: MhControlWiring): MhControlSink {
   return {
-    keyframeRequest: (url, request) => {
+    keyframeRequest: (ref, request) => {
       const stream = wiring
         .latestDirective()
         ?.streams.find((s) => s.streamNumber === request.streamNumber);
@@ -424,7 +425,7 @@ export function mhControlSink(wiring: MhControlWiring): MhControlSink {
           ? kindMetrics(wiring.metrics, kind)
           : undefined;
       const video = kind === 'video' && handle ? wiring.video() : undefined;
-      if (video) video.keyframeRequest(url, request.gopCounter);
+      if (video) video.keyframeRequest(ref, request.gopCounter);
       else if (handle) handle.keyframeRequestReceived(MEDIA_KEYFRAME_REQUEST_OUTCOMES.NotSending);
       else
         wiring.metrics.session.keyframeRequestUnattributed(
@@ -434,7 +435,7 @@ export function mhControlSink(wiring: MhControlWiring): MhControlSink {
     malformed: () => {
       wiring.metrics.session.keyframeRequestUnattributed(MEDIA_KEYFRAME_REQUEST_OUTCOMES.Malformed);
     },
-    ended: (_url, cause) => {
+    ended: (_ref, cause) => {
       wiring.metrics.session.mhControlChannelEnded(cause);
     },
   };
@@ -490,7 +491,7 @@ export function pipelineListeners(
           .map((a) => ({
             slotId: a.slotId,
             senderId: a.senderId,
-            mediaHandlerUrl: a.mediaHandlerUrl,
+            handlerRef: a.handlerRef,
             active: a.slotState === 'active',
           })),
       );
@@ -501,7 +502,7 @@ export function pipelineListeners(
             slotId: a.slotId,
             slotState: a.slotState,
             senderId: a.senderId,
-            mediaHandlerUrl: a.mediaHandlerUrl,
+            handlerRef: a.handlerRef,
           })),
       );
     },

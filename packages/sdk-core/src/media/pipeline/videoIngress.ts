@@ -50,6 +50,7 @@ import {
   type StreamFrameHeader,
 } from './streamReader.js';
 import type { VideoSlotPipeline } from './videoSlotPipeline.js';
+import type { HandlerRef } from '../handlerSet.js';
 
 const { VerifyFailed, DecryptFailed } = MEDIA_RECOVERY_SOURCES;
 
@@ -119,7 +120,7 @@ type ReaderEvent =
   | { readonly kind: 'reject'; readonly reason: RejectReason };
 
 interface StreamState {
-  readonly url: string;
+  readonly ref: HandlerRef;
   slot: VideoSlotPipeline | undefined;
   slotId: number | undefined;
   abort: boolean;
@@ -167,8 +168,8 @@ export class VideoIngress {
    * condition or a stream reset: every frame is a counted outcome. A defect
    * (anything not a `FrameRejectedError`) propagates to the caller.
    */
-  readStream(readable: ReadableStream<Uint8Array>, url: string): Promise<void> {
-    const read = this.#read(readable, url);
+  readStream(readable: ReadableStream<Uint8Array>, ref: HandlerRef): Promise<void> {
+    const read = this.#read(readable, ref);
     this.#reads.add(read);
     const forget = (): void => {
       this.#reads.delete(read);
@@ -177,10 +178,10 @@ export class VideoIngress {
     return read;
   }
 
-  async #read(readable: ReadableStream<Uint8Array>, url: string): Promise<void> {
+  async #read(readable: ReadableStream<Uint8Array>, ref: HandlerRef): Promise<void> {
     const reader = readable.getReader();
     this.#readers.add(reader);
-    const state: StreamState = { url, slot: undefined, slotId: undefined, abort: false };
+    const state: StreamState = { ref, slot: undefined, slotId: undefined, abort: false };
     // The reader's outcomes, IN STREAM ORDER: whole frames and a prefix reject.
     const events: ReaderEvent[] = [];
     const frameReader = new UniStreamFrameReader(
@@ -316,7 +317,7 @@ export class VideoIngress {
         gopCounter: decoded.gopCounter,
         isKeyframe: decoded.flags.independentlyDecodable,
         data: opened.plaintext,
-        url: state.url,
+        ref: state.ref,
       });
     } catch (err) {
       if (!(err instanceof FrameRejectedError)) throw err;
@@ -324,11 +325,11 @@ export class VideoIngress {
       this.#o.accounting.dropped(reason, slotId, senderId);
       if (reason === 'sender_server_muted') {
         // Verified header: repaired once the unmute arrives (`server_mute_lifted`).
-        slot.recordMutedDrop(senderId, decoded.gopCounter, state.url);
+        slot.recordMutedDrop(senderId, decoded.gopCounter, state.ref);
         return;
       }
       const recovery = RECOVERY_REASON_FOR[reason];
-      if (recovery) slot.loss(senderId, decoded.gopCounter, recovery, state.url);
+      if (recovery) slot.loss(senderId, decoded.gopCounter, recovery, state.ref);
     }
   }
 
@@ -350,7 +351,7 @@ export class VideoIngress {
     const recovery = RECOVERY_REASON_FOR[reason];
     if (!recovery || !header) return;
     const slot = state.slot ?? this.#o.slotFor(header.relayStreamId);
-    slot?.loss(header.senderId, header.gopCounter, recovery, state.url);
+    slot?.loss(header.senderId, header.gopCounter, recovery, state.ref);
   }
 
   /** MH reset the group's stream (R-12): a loss iff a header was parsed on it. */
@@ -361,7 +362,7 @@ export class VideoIngress {
       header.senderId,
       header.gopCounter,
       MEDIA_RECOVERY_SOURCES.GroupAbandoned,
-      state.url,
+      state.ref,
     );
   }
 }

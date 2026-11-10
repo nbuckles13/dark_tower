@@ -19,6 +19,7 @@
 import { flushMetrics, getMetricsSink } from '@darktower/sdk-core';
 import type {
   CaptureSourceInfo,
+  HandlerSetView,
   VideoCaptureSourceInfo,
   KindSlotsDiagnostics,
   MediaFrameCounts,
@@ -93,8 +94,26 @@ export const E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS = 250;
 
 type BusEvent = Readonly<Record<string, unknown>> & { readonly type: string };
 
+/**
+ * One media-handler set as the bus records it (ADR-0039 §4). An ALLOWLIST
+ * projection built field by field — `version` (the uint64 as its decimal string)
+ * and each member's `{ref, url}` — NEVER a dial token, never a spread of the
+ * SDK object.
+ */
+export interface BusHandlerSet {
+  readonly version: string;
+  readonly handlers: readonly { readonly ref: number; readonly url: string }[];
+}
+
 interface InternalBus {
   events: BusEvent[];
+  /**
+   * Every handler set this session held, in wire order: the join-time set
+   * first, then every pushed set (both via `mediaHandlerSet`). THE source of
+   * handler urls for the browser suite (`JoinResponse.media_servers` is
+   * superseded and never read).
+   */
+  handlerSets: BusHandlerSet[];
   /**
    * Force a metric export NOW (the SDK's `flushMetrics`), for the browser suite's
    * telemetry credential-scan positive control and the R-27 read-back. REJECTS
@@ -140,6 +159,7 @@ export function installE2EHooks(
     const existing = window.__darktower_test__ as InternalBus | undefined;
     const bus: InternalBus = existing ?? {
       events: [],
+      handlerSets: [],
       async flushMetrics() {
         // The SDK's ACTUAL state, not the config's intent: sdk-core's
         // `flushMetrics()` resolves having flushed nothing when no provider is
@@ -173,13 +193,23 @@ export function installE2EHooks(
     window.__darktower_test__ = bus;
 
     session.on('stateChange', (state) => bus.emit({ type: 'stateChange', state }));
+    // The handler-set history (ADR-0039 §4): field-by-field, never tokens.
+    const recordHandlerSet = (view: HandlerSetView): void => {
+      const projected: BusHandlerSet = {
+        version: view.version,
+        handlers: view.handlers.map((h) => ({ ref: h.ref, url: h.url })),
+      };
+      bus.handlerSets.push(projected);
+      bus.emit({ type: 'handlerSet', version: projected.version, handlers: projected.handlers });
+    };
+    // Every set in wire order, the join-time one included.
+    session.on('mediaHandlerSet', recordHandlerSet);
     session.on('joined', (event) =>
       bus.emit({
         type: 'joined',
         participantId: event.participantId,
         senderId: event.senderId?.toString(),
         participants: event.existingParticipants.map(roster),
-        mediaServers: [...event.mediaServers],
         // NOTE: bindingToken + correlationId are intentionally NOT projected (R-23).
       }),
     );
@@ -193,7 +223,9 @@ export function installE2EHooks(
         reason: event.reason,
       }),
     );
-    session.on('mediaConnected', (url) => bus.emit({ type: 'mediaConnected', mhUrl: url }));
+    session.on('mediaConnected', (handler) =>
+      bus.emit({ type: 'mediaConnected', handlerRef: handler.ref, url: handler.url }),
+    );
 
     // ------------------------------------------------------------------
     // STORY 2 R-1 / R-7 / R-23 / R-30 — N, the capture source, the expected

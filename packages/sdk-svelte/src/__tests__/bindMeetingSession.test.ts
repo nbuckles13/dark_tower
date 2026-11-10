@@ -10,6 +10,7 @@ import type { MeetingStore } from '../stores/MeetingStore.svelte.js';
 import BoundHarness from './helpers/BoundHarness.svelte';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
 import { mediaStates } from './helpers/mediaStates.js';
+import type { HandlerRef } from '@darktower/sdk-core';
 
 test('component renders reactive store state and live roster', async () => {
   const session = new MockMeetingSession();
@@ -59,7 +60,7 @@ test('unmount tears down the subscription — no leak (post-unmount events ignor
     session.fire('participantJoined', {
       participant: { participantId: 'z', name: 'Zed', mediaStates: mediaStates() },
     });
-    session.fire('mediaConnected', 'https://mh-0:4433');
+    session.fire('mediaConnected', { ref: 1 as HandlerRef, url: 'https://mh-0:4433' });
   }).not.toThrow();
 
   expect(store?.meetingState).toBe(MeetingSessionState.Joining);

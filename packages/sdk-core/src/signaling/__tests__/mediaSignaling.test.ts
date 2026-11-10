@@ -184,9 +184,7 @@ describe('send directive', () => {
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     const seen: SendDirectiveEvent[] = [];
     rig.client.on('sendDirective', (e) => seen.push(e));
-    rig.deliver(
-      framedSendDirective({ streamNumber: 3, maxBitrateBps: 40_000, targets: ['https://mh'] }),
-    );
+    rig.deliver(framedSendDirective({ streamNumber: 3, maxBitrateBps: 40_000, targets: [1] }));
     await waitFor(() => seen.length > 0);
     expect(seen[0]).toEqual({
       headerVersion: HEADER_VERSION,
@@ -203,7 +201,7 @@ describe('send directive', () => {
             maxBitrateBps: 40_000,
             minKeyframeIntervalMs: undefined,
           },
-          targets: ['https://mh'],
+          targets: [1],
         },
       ],
     });
@@ -215,7 +213,7 @@ describe('send directive', () => {
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     const seen: SendDirectiveEvent[] = [];
     rig.client.on('sendDirective', (e) => seen.push(e));
-    rig.deliver(framedSendDirective({ targets: ['https://mh'] }));
+    rig.deliver(framedSendDirective({ targets: [1] }));
     await waitFor(() => seen.length > 0);
     expect(seen[0]?.streams[0]?.maxBitrateBps).toBeUndefined();
   });
@@ -248,7 +246,7 @@ describe('stream assignments', () => {
       framedStreamAssignments({
         slotId: 0,
         senderId: 258,
-        mediaHandlerUrl: 'https://mh',
+        handlerRef: 1,
         slotState: SlotState.WITHHELD_BY_CONGESTION,
       }),
     );
@@ -272,7 +270,7 @@ describe('stream assignments', () => {
       framedStreamAssignments({
         slotId: 0,
         senderId: 258,
-        mediaHandlerUrl: 'https://mh-0',
+        handlerRef: 1,
         unreachableSenderIds: [259, 260],
       }),
     );
@@ -289,7 +287,7 @@ describe('stream assignments', () => {
   it('reads each slot on the handler that OWNS it, across several handlers', async () => {
     // The canonical case seen from A: B's edge on one handler, C's on the other.
     // Nothing here depends on which handler MC chose for which edge — only that
-    // each slot's own `media_handler_url` is carried through verbatim.
+    // each slot's own `handler_ref` is carried through verbatim.
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     const seen: StreamAssignmentsEvent[] = [];
     rig.client.on('streamAssignments', (e) => seen.push(e));
@@ -297,15 +295,12 @@ describe('stream assignments', () => {
       framedStreamAssignments({
         slotId: 0,
         senderId: 259,
-        mediaHandlerUrl: 'https://mh-0:4433',
-        extraSlots: [{ slotId: 1, senderId: 260, mediaHandlerUrl: 'https://mh-1:4433' }],
+        handlerRef: 1,
+        extraSlots: [{ slotId: 1, senderId: 260, handlerRef: 2 }],
       }),
     );
     await waitFor(() => seen.length > 0);
-    expect(seen[0]?.assignments.map((a) => a.mediaHandlerUrl)).toEqual([
-      'https://mh-0:4433',
-      'https://mh-1:4433',
-    ]);
+    expect(seen[0]?.assignments.map((a) => a.handlerRef)).toEqual([1, 2]);
   });
 
   it('passes an ABSENT sender id through rather than coercing it to 0', async () => {
@@ -351,12 +346,12 @@ describe('stream assignments', () => {
       framedStreamAssignments({
         slotId: 0,
         senderId: 259,
-        mediaHandlerUrl: 'https://mh',
+        handlerRef: 1,
         extraSlots: [
-          { slotId: 1, mediaHandlerUrl: 'https://mh', mediaKind: MediaKind.VIDEO_CAMERA },
+          { slotId: 1, handlerRef: 1, mediaKind: MediaKind.VIDEO_CAMERA },
           {
             slotId: 2,
-            mediaHandlerUrl: '',
+            handlerRef: 1,
             mediaKind: MediaKind.VIDEO_SCREEN,
             slotState: SlotState.ACTIVE,
           },
@@ -755,9 +750,7 @@ describe('story 3 C-A1: join contract and per-kind mute requests', () => {
     const rig = await joinedRig(framedJoinResponse({ senderId: 258 }));
     const seen: SendDirectiveEvent[] = [];
     rig.client.on('sendDirective', (e) => seen.push(e));
-    rig.deliver(
-      framedSendDirective({ mediaKind: MediaKind.VIDEO_SCREEN, targets: ['https://mh'] }),
-    );
+    rig.deliver(framedSendDirective({ mediaKind: MediaKind.VIDEO_SCREEN, targets: [1] }));
     await waitFor(() => seen.length > 0);
     expect(seen[0]?.streams[0]?.mediaKind).toBe('unknown');
   });

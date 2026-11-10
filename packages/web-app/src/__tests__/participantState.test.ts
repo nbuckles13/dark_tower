@@ -24,6 +24,7 @@ import {
   type MediaFacts,
 } from '../lib/participantState.js';
 import { mediaStates } from './helpers/mediaStates.js';
+import type { HandlerRef } from '@darktower/sdk-core';
 
 const roster: RosterParticipant[] = [
   { participantId: 'b', name: 'Bea', senderId: 258, mediaStates: mediaStates() },
@@ -180,14 +181,14 @@ test('NO slot fallback: a slot saying avatar_client_muted does not override the 
           slotId: 0,
           mediaKind: 'audio',
           senderId: 258,
-          mediaHandlerUrl: 'https://mh',
+          handlerRef: 1 as HandlerRef,
           slotState: 'avatar_client_muted',
         },
         {
           slotId: 1,
           mediaKind: 'video',
           senderId: 258,
-          mediaHandlerUrl: 'https://mh',
+          handlerRef: 1 as HandlerRef,
           slotState: 'avatar_client_muted',
         },
       ],

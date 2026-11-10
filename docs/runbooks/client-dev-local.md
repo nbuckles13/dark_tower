@@ -1858,6 +1858,67 @@ self-check never re-opens a device without a fresh click. So the panel cannot be
 another participant's media, and it is not evidence an operator can collect from a user. Ask the
 user to read the numbers out, or to screenshot the panel.
 
+### F28 — Media handler set: a `[dt-signaling-contract]` WARN about a handler set, a `handler_ref` or a close code
+
+**Symptom.** The browser console shows one `[dt-signaling-contract]` WARN naming a media handler
+set ("…carried handler_ref 0", "…named one url more than once", "…moved a known handler_ref…"), a
+`handler_ref outside the current handler set`, or "a media handler closed with an unknown or zero
+close code". Each reason is printed **once per session**, with no ref, url or token in it.
+
+**What it means.** The client follows MC's `MediaHandlerSet` (ADR-0039 §4) and checks every input
+against it. A malformed set entry is dropped (that handler is then not dialed, or is removed if it
+was connected — never redirected). A send target or slot naming a ref outside the current set is
+ignored. A close code MH should never send is handled as a lost connection and redialed. None of
+these ends the session. They are contract faults on the server side, not client bugs.
+
+**First triage step.** Check that MC and MH are the same build as the web app (a stale MC or MH
+against a story-4 SDK, or the reverse). Then open
+[`mc-incident-response.md`](mc-incident-response.md) for MC's handler-set state.
+
+### F29 — Joined, but "media connecting" never ends: `mediaHandlersOverdue`
+
+**Symptom.** The join succeeds, no media handler is dialed, and after
+`MediaConfig.handlers.emptySetNoticeMs` (default in the README table linked below) the session emits **one**
+`mediaHandlersOverdue` event. The session is kept and connects as soon as a set naming a handler
+arrives.
+
+**What it means.** MC lists a handler only after it confirms the handler's `RegisterMeeting`, so a
+join-time set is empty only when the meeting's initial handler never acknowledged it. Past the
+bound, the meeting has no handler at all.
+
+**First triage step.** This is a server-side placement problem, not a client one. Check that an
+MH is GC-selectable (`infra/kind/scripts/mh.sh list --json`), then MC's handler-set state for the
+meeting ([`mc-incident-response.md`](mc-incident-response.md)).
+
+### F30 — A handler stays dark after DECLINED (parked)
+
+**Symptom.** One handler's media never resumes. MC's `mc_media_handler_set_pushes_total{reason="failed_report"}`
+rises, and MH closes this client's dials with `DECLINED`.
+
+**What it means.** `DECLINED` means "dial credential refused", not "handler dead". The client parks
+that handler, reports `FAILED` for it (which makes MC re-push the set with a fresh token), and dials
+**exactly once** when a set with a different token arrives. It never retries on its own. If MC
+never re-pushes, the handler stays parked and dark.
+
+**Expected until story 4 MH-1.** Today MH still validates the join-time `join_token`, which the SDK
+deliberately does not retain (ADR-0039 §5). So every dial **after** the join — a newly added
+handler, a redial after a loss, a post-park dial — is DECLINED by design, and the
+`failed_report` re-pushes rise, bounded by MC's FAILED re-push rate limit. That is not a bug in this
+window. Do not "fix" it by retaining the JWT.
+
+**First triage step.** After MH-1: a sustained `failed_report` rate means MC's TTL/3 refresh push
+is broken or MH's dial-token validation disagrees with MC's key. Check MH's JWT-validation failure
+reasons for `media_dial` tokens (ADR-0039 §8: a sustained `expired` means the refresh push is
+broken).
+
+### Media-handler set reconcile knobs
+
+The four `MediaConfig.handlers` keys (redial base and cap, the empty-set notice bound, the
+`HANDLER_RELEASED` grace) and the compiled first-redial floor are SDK code-config, logged once per
+session as `[dt-media-handlers-config]`. Their defaults and inclusive ranges live in ONE place,
+pinned to the SDK by a test:
+[`packages/web-app/README.md` §Media-handler set reconcile](../../packages/web-app/README.md#media-handler-set-reconcile-sdk-mediaconfighandlers).
+
 ---
 
 ## 6. Teardown

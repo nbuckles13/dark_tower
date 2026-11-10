@@ -19,11 +19,12 @@ import { MediaKind } from '../../../proto/dark_tower/signaling/v1/signaling_pb.j
 import { TransmitKeyManager } from '../../lifecycle/transmitKeys.js';
 import { uplinkRelayStreamId } from '../sendId.js';
 import { VideoEgress, type GroupStreamOpener } from '../videoEgress.js';
+import { handlerRef, type HandlerRef } from '../../handlerSet.js';
 
 const KEK = new Uint8Array(AES_256_KEY_BYTES).fill(0x22);
 const SENDER_ID = 258;
-const A = 'https://mh-0.example:4433';
-const B = 'https://mh-1.example:4433';
+const A = handlerRef(1);
+const B = handlerRef(2);
 const VIDEO_STREAM = 1;
 
 async function settle(): Promise<void> {
@@ -35,11 +36,11 @@ async function settle(): Promise<void> {
 }
 
 interface RigOptions {
-  readonly urls?: readonly string[];
+  readonly urls?: readonly HandlerRef[];
   readonly maxBacklogFrames?: number;
   readonly maxBacklogBytes?: number;
   readonly keyBearingFrames?: number;
-  readonly opener?: (mocks: Map<string, MockWebTransport>) => GroupStreamOpener;
+  readonly opener?: (mocks: Map<HandlerRef, MockWebTransport>) => GroupStreamOpener;
   readonly transmitKeys?: TransmitKeyManager;
 }
 
@@ -51,7 +52,7 @@ async function makeRig(options: RigOptions = {}) {
     MediaKind.VIDEO_CAMERA,
     sink,
   );
-  const mocks = new Map<string, MockWebTransport>();
+  const mocks = new Map<HandlerRef, MockWebTransport>();
   for (const url of urls) mocks.set(url, new MockWebTransport());
   const transmitKeys = options.transmitKeys ?? new TransmitKeyManager(SENDER_ID);
   let selfAbandoned = 0;
@@ -97,7 +98,7 @@ async function makeRig(options: RigOptions = {}) {
       .filter((m) => m.name === name && Object.entries(labels).every(([k, v]) => m.labels[k] === v))
       .reduce((n, m) => n + m.value, 0);
   /** Frames written on handler `url`'s outbound uni streams, per stream. */
-  const streamsOf = (url: string) => mocks.get(url)!.getOutboundUniStreams();
+  const streamsOf = (url: HandlerRef) => mocks.get(url)!.getOutboundUniStreams();
   return {
     egress,
     identity,
@@ -569,10 +570,25 @@ describe('VideoEgress — edges', () => {
     expect(r.egress.targetsAwaitingGroup()).toBe(0);
   });
 
-  it('an empty-url target is ignored', async () => {
-    const r = await makeRig({ urls: [A] });
-    r.egress.setTargets({ targets: ['', A], headerVersion: HEADER_VERSION });
+  it('forget(ref) — a ref that LEFT THE SET — deletes its lane, the others keep sending', async () => {
+    const r = await makeRig({ urls: [A, B] });
+    r.egress.setTargets({ targets: [A, B], headerVersion: HEADER_VERSION });
+    expect(r.egress.targetsAwaitingGroup()).toBe(2);
+    r.egress.forget(B);
+    expect(r.egress.laneState(B)).toBeUndefined();
+    // Positive arm: the remaining target is untouched.
+    expect(r.egress.laneState(A)).toBe('awaiting_group');
     expect(r.egress.targetsAwaitingGroup()).toBe(1);
+    await r.send(true);
+    await settle();
+    expect(r.streamsOf(A)).toHaveLength(1);
+    expect(r.streamsOf(B)).toHaveLength(0);
+    // Forgetting an unknown ref is a no-op.
+    r.egress.forget(handlerRef(99));
+    // A NEW ref directed later starts fresh, awaiting a group (keyed forward).
+    const C = handlerRef(3);
+    r.egress.setTargets({ targets: [A, C], headerVersion: HEADER_VERSION });
+    expect(r.egress.laneState(C)).toBe('awaiting_group');
   });
 });
 

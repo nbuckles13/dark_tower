@@ -176,7 +176,11 @@ export type {
   MhKeyframeRequest,
   MhRecoveryRequest,
   RunInContext,
+  TransportScheduler,
 } from './media/events.js';
+// Token-free handler-set views (ADR-0039 §4). `HandlerSetIntake` (carries dial
+// tokens) and `MediaTransport.diagnostics()`'s type are deliberately NOT exported.
+export type { HandlerRef, HandlerSetView, MediaHandlerView } from './media/handlerSet.js';
 
 // --- MeetingSession facade (R-22) — the public SDK entry point ---
 
@@ -285,9 +289,13 @@ export {
   validateMediaConfig,
   VIDEO_STREAM_CAP_HEADROOM,
   videoReceiveConfigLogLine,
+  HANDLER_SET_CONFIG_RANGES,
+  MH_KEEPALIVE_FLOOR_MS,
+  handlerSetConfigLogLine,
 } from './config/clientConfig.js';
 export type {
   AudioConfig,
+  HandlerSetConfig,
   ClientConfig,
   EgressConfig,
   IngressConfig,

@@ -20,7 +20,7 @@
 import { afterEach, expect, test, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import { MeetingSessionState } from '@darktower/sdk-core';
-import type { MeetingSession, StreamAssignmentEvent } from '@darktower/sdk-core';
+import type { HandlerRef, MeetingSession, StreamAssignmentEvent } from '@darktower/sdk-core';
 import { MeetingStore, subscribeSession } from '@darktower/sdk-svelte';
 import InMeeting from '../views/InMeeting.svelte';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
@@ -31,7 +31,7 @@ function slot(overrides: Partial<StreamAssignmentEvent> = {}): StreamAssignmentE
     slotId: 0,
     mediaKind: 'audio',
     senderId: 258,
-    mediaHandlerUrl: 'https://mh-0:4433',
+    handlerRef: 1 as HandlerRef,
     slotState: 'active',
     ...overrides,
   };
@@ -370,7 +370,7 @@ test('each filled slot names the roster participant MC placed there; an unfilled
     existingParticipants: [
       { participantId: 'b', name: 'Bea', senderId: 258, mediaStates: mediaStates() },
     ],
-    mediaServers: [],
+    handlerSet: { version: '0', handlers: [] },
     correlationId: 'c',
     bindingToken: 't',
   });
@@ -485,7 +485,7 @@ const ROSTER_JOIN = {
     { participantId: 'b', name: 'Bea', senderId: 258, mediaStates: mediaStates() },
     { participantId: 'c', name: 'Cid', senderId: 259, mediaStates: mediaStates() },
   ],
-  mediaServers: [],
+  handlerSet: { version: '0', handlers: [] },
   correlationId: 'c',
   bindingToken: 't',
 };

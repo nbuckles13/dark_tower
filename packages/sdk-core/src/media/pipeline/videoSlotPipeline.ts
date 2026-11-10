@@ -70,6 +70,7 @@ import {
   type RenderRule,
   type VideoRenderState,
 } from './renderDecision.js';
+import type { HandlerRef } from '../handlerSet.js';
 
 /** One accepted (verified, decrypted) frame for this slot. */
 export interface SlotFrame {
@@ -82,12 +83,12 @@ export interface SlotFrame {
   /** Decrypted VP8 bytes. */
   readonly data: Uint8Array;
   /** The handler whose transport delivered it (a recovery request's target). */
-  readonly url: string;
+  readonly ref: HandlerRef;
 }
 
 /** One loss event: the request's three fields, its target and its cause. */
 export interface SlotLossEvent {
-  readonly url: string;
+  readonly ref: HandlerRef;
   readonly slotId: number;
   readonly senderId: number;
   readonly gopCounter: number;
@@ -137,14 +138,14 @@ interface Queued {
   readonly data: Uint8Array;
   readonly timelineUs: number;
   readonly arrivalMs: number;
-  readonly url: string;
+  readonly ref: HandlerRef;
 }
 
 interface InFlight {
   readonly senderId: number;
   readonly gopCounter: number;
   readonly timelineUs: number;
-  readonly url: string;
+  readonly ref: HandlerRef;
 }
 
 interface Held {
@@ -202,7 +203,7 @@ export class VideoSlotPipeline {
   /** The LAST reported loss pair (R2/S1). */
   #lastReported: Group | undefined;
   /** The last frame dropped `sender_server_muted` at arrival, for the unmute-edge repair. */
-  #mutedDrop: (Group & { readonly url: string }) | undefined;
+  #mutedDrop: (Group & { readonly ref: HandlerRef }) | undefined;
 
   #sink: VideoSink | undefined;
   #stopped = false;
@@ -348,7 +349,7 @@ export class VideoSlotPipeline {
       // Local overflow: this frame is lost, so its group is no longer decodable.
       this.#localDrop();
       this.#awaitingKeyframe = true;
-      this.loss(frame.senderId, frame.gopCounter, 'local_drop', frame.url);
+      this.loss(frame.senderId, frame.gopCounter, 'local_drop', frame.ref);
       return;
     }
 
@@ -360,7 +361,7 @@ export class VideoSlotPipeline {
       data: frame.data,
       timelineUs: this.#timeline(frame.senderId, arrivalMs, frame.isKeyframe),
       arrivalMs,
-      url: frame.url,
+      ref: frame.ref,
     });
     this.#queuedBytes += frame.data.length;
     this.#pump();
@@ -371,7 +372,7 @@ export class VideoSlotPipeline {
    * values (possibly unverified: they feed only the request, security R1).
    * Raises one loss event per pair; repeats at the same pair send nothing.
    */
-  loss(senderId: number, gopCounter: number, reason: MediaRecoverySource, url: string): void {
+  loss(senderId: number, gopCounter: number, reason: MediaRecoverySource, ref: HandlerRef): void {
     if (this.#stopped) return;
     const last = this.#lastReported;
     if (last && last.senderId === senderId && last.gopCounter === gopCounter) return;
@@ -379,14 +380,14 @@ export class VideoSlotPipeline {
     if (this.#group && this.#group.senderId === senderId && this.#group.gopCounter === gopCounter) {
       this.#awaitingKeyframe = true;
     }
-    this.#o.onLoss({ url, slotId: this.slotId, senderId, gopCounter, reason });
+    this.#o.onLoss({ ref, slotId: this.slotId, senderId, gopCounter, reason });
     if (this.#rule() === 'live') this.#o.unfulfilled.enter(this.slotId);
   }
 
   /** A frame on this slot was dropped `sender_server_muted` at arrival (verified header). */
-  recordMutedDrop(senderId: number, gopCounter: number, url: string): void {
+  recordMutedDrop(senderId: number, gopCounter: number, ref: HandlerRef): void {
     if (this.#stopped) return;
-    this.#mutedDrop = { senderId, gopCounter, url };
+    this.#mutedDrop = { senderId, gopCounter, ref };
   }
 
   /**
@@ -400,7 +401,7 @@ export class VideoSlotPipeline {
     this.#mutedDrop = undefined;
     const group = this.#group;
     if (group && group.senderId === senderId && group.gopCounter > dropped.gopCounter) return;
-    this.loss(senderId, dropped.gopCounter, 'server_mute_lifted', dropped.url);
+    this.loss(senderId, dropped.gopCounter, 'server_mute_lifted', dropped.ref);
   }
 
   /** Release everything. Idempotent. */
@@ -505,7 +506,7 @@ export class VideoSlotPipeline {
         senderId: head.senderId,
         gopCounter: head.gopCounter,
         timelineUs: head.timelineUs,
-        url: head.url,
+        ref: head.ref,
       });
       try {
         decoder.decode({
@@ -550,7 +551,7 @@ export class VideoSlotPipeline {
         this.#localDrop();
       }
     }
-    this.loss(head.senderId, head.gopCounter, 'local_drop', head.url);
+    this.loss(head.senderId, head.gopCounter, 'local_drop', head.ref);
   }
 
   #createDecoder(): void {
@@ -584,7 +585,7 @@ export class VideoSlotPipeline {
     }
     if (this.#queue.length === 0) this.#awaitingKeyframe = true;
     this.#o.onDecoderFault();
-    if (failing) this.loss(failing.senderId, failing.gopCounter, 'decoder_error', failing.url);
+    if (failing) this.loss(failing.senderId, failing.gopCounter, 'decoder_error', failing.ref);
     this.#pump();
   }
 

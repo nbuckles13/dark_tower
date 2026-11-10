@@ -66,6 +66,15 @@ const SUBJECTS = [
   'rosterKeys',
   'identity',
   'signingKey',
+  // Story 4 C1: the `media_dial` dial credential (ADR-0039 §5, a scoped R-23
+  // amendment). On the wire on every `MediaHandlerSet` (blanked at intake,
+  // `signaling/handlerSetIntake.ts`), and RESIDENT in `MediaTransport`'s one
+  // private holder for the set's life.
+  'mediaHandlerSet',
+  'mediaDialToken',
+  'dialTokens',
+  'intake',
+  'handlerSetSink',
 ];
 
 /** Serialising, cross-context and persisting exits. */
@@ -198,6 +207,9 @@ describe('no key-bearing value reaches a serialising or persisting sink', () => 
       'worker.postMessage(structuredClone(identity));',
       'localStorage.setItem("k", signingKey);',
       'throw new Error(`roster ${rosterKeys}`);',
+      'console.warn(`token ${mediaDialToken}`);',
+      'logger.debug(JSON.stringify(this.#dialTokens));',
+      'throw new Error(`set ${intake}`);',
     ].join('\n');
     const hits = scan('synthetic.ts', offending);
     // Assert every LINE was caught, not the hit count: several lines match more
@@ -205,7 +217,7 @@ describe('no key-bearing value reaches a serialising or persisting sink', () => 
     // count would be a brittle assertion about the sink list's shape rather than
     // about the property.
     const linesCaught = new Set(hits.map((h) => h.split(':')[1]));
-    expect(linesCaught.size).toBe(5);
+    expect(linesCaught.size).toBe(8);
     expect(hits.some((h) => h.includes('template-interpolation'))).toBe(true);
     expect(hits.some((h) => h.includes('JSON.stringify'))).toBe(true);
     expect(hits.some((h) => h.includes('localStorage'))).toBe(true);

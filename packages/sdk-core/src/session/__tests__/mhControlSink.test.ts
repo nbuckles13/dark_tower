@@ -11,13 +11,14 @@ import { InMemoryMetricsSink } from '@darktower/test-utils';
 import { mhControlSink } from '../mediaWiring.js';
 import { MediaMetrics } from '../../media/setup/mediaMetrics.js';
 import type { PublishKind, SendDirectiveEvent } from '../../signaling/events.js';
+import { handlerRef, type HandlerRef } from '../../media/handlerSet.js';
 
-const MH = 'https://mh-a';
+const MH = handlerRef(1);
 
 function rig(publish: PublishKind[], withVideo = true) {
   const sink = new InMemoryMetricsSink();
   const metrics = new MediaMetrics({ clientVersion: 't', orgId: 'o' }, sink);
-  const routed: [string, number][] = [];
+  const routed: [HandlerRef, number][] = [];
   const directive: SendDirectiveEvent = {
     headerVersion: 3,
     streams: [
@@ -44,7 +45,7 @@ function rig(publish: PublishKind[], withVideo = true) {
     video: () =>
       withVideo
         ? {
-            keyframeRequest: (url: string, gop: number) => {
+            keyframeRequest: (url: HandlerRef, gop: number) => {
               routed.push([url, gop]);
               return 'honoured' as const;
             },

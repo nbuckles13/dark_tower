@@ -1301,6 +1301,10 @@ which MC records on the participant actor.
 - **Usage**: Observe client-perceived MH reachability; a rising `failed` share
   is an early signal of MH-edge connectivity problems the client sees before MC
   does
+- **Since story 4 C1**: the client sends a status on every per-ref state
+  TRANSITION (connected, failed, disconnected; ADR-0039 §4), not once per MH at
+  join; a repeated failure while already failed/disconnected sends nothing, and
+  only DECLINED repeats `failed` (it is the re-push trigger).
 - **Recorded in**: `actors/participant.rs::handle_record_mh_statuses`, driven
   from `webtransport/connection.rs` `handle_media_connection_update`
 - **Dashboard**: MC Overview - Client-Reported MH Status by State

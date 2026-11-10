@@ -11,7 +11,7 @@ function slot(
   senderId: number | undefined,
   slotState: StreamAssignmentEvent['slotState'],
 ): StreamAssignmentEvent {
-  return { slotId, mediaKind, senderId, mediaHandlerUrl: '', slotState };
+  return { slotId, mediaKind, senderId, handlerRef: undefined, slotState };
 }
 
 describe('pairSlotsBySender', () => {

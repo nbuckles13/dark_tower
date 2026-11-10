@@ -31,10 +31,12 @@ import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import type { DatagramSender } from '../../pipeline/egress.js';
 import { buildTestFrame, makeIdentity } from '../../pipeline/__tests__/frameFixtures.js';
 import { AudioPipeline, type AudioPipelineOptions } from '../AudioPipeline.js';
+import { handlerRef, type HandlerRef } from '../../handlerSet.js';
 
 const KEK = new Uint8Array(AES_256_KEY_BYTES).fill(0x11);
 const SENDER_ID = 258;
-const MH_URL = 'https://mh.example/media';
+const MH_URL = handlerRef(1);
+const OTHER_REF = handlerRef(5);
 
 async function settle(): Promise<void> {
   for (let i = 0; i < 25; i += 1) {
@@ -54,14 +56,14 @@ interface Options {
    * hands one stream to two urls does not model it — and a `ReadableStream`
    * takes one reader, so it would model a fault instead.
    */
-  readables?: Record<string, ReadableStream<Uint8Array>>;
+  readables?: Record<number, ReadableStream<Uint8Array>>;
   /** Per-URL senders, for multi-target send. */
-  senders?: Record<string, DatagramSender>;
-  targets?: string[];
+  senders?: Record<number, DatagramSender>;
+  targets?: HandlerRef[];
   /** Handler URLs from `StreamAssignments`; `null` means none were delivered. */
-  receiveUrls?: string[] | null;
+  receiveUrls?: (HandlerRef | undefined)[] | null;
   /** Handler URLs delivered BEFORE `start()` — MC can answer the declaration first. */
-  receiveUrlsBeforeStart?: string[];
+  receiveUrlsBeforeStart?: HandlerRef[];
   config?: MediaConfig;
   kekProvisioned?: boolean;
 }
@@ -281,7 +283,7 @@ describe('receive-side degradation', () => {
     transport.simulateReady();
     const rig = await makePipeline({ readable: transport.datagrams.readable });
     rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
-    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL, ''], SENDER_ID));
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL, undefined], SENDER_ID));
     // Directives no longer touch the read loop at all.
     rig.pipeline.setSendDirective({
       streamNumber: 1,
@@ -323,7 +325,7 @@ describe('receive-side degradation', () => {
     const rig = await makePipeline({
       readable: transport.datagrams.readable,
       targets: [],
-      receiveUrls: [''],
+      receiveUrls: [undefined],
     });
     transport.simulateIncomingDatagram(PROBE);
     await settle();
@@ -372,7 +374,7 @@ describe('receive-side degradation', () => {
     // The snapshot empties. The loop must still be READING — probed now, while
     // empty, not after the refill (a loop torn down on empty and reopened on
     // refill would pass that version of this test).
-    rig.pipeline.setReceiveAssignments(assignmentsOn([''], SENDER_ID));
+    rig.pipeline.setReceiveAssignments(assignmentsOn([undefined], SENDER_ID));
     transport.simulateIncomingDatagram(PROBE);
     await settle();
     expect(transport.datagrams.readable.locked).toBe(true);
@@ -397,7 +399,7 @@ describe('receive-side degradation', () => {
     const second = new MockWebTransport();
     first.simulateReady();
     second.simulateReady();
-    const OTHER = 'https://mh-other.example:4433';
+    const OTHER = handlerRef(2);
     const rig = await makePipeline({
       readables: { [MH_URL]: first.datagrams.readable, [OTHER]: second.datagrams.readable },
       receiveUrls: [MH_URL, OTHER],
@@ -423,7 +425,7 @@ describe('receive-side degradation', () => {
     const second = new MockWebTransport();
     first.simulateReady();
     second.simulateReady();
-    const OTHER = 'https://mh-other.example:4433';
+    const OTHER = handlerRef(3);
     const rig = await makePipeline({
       readables: { [MH_URL]: first.datagrams.readable, [OTHER]: second.datagrams.readable },
       receiveUrls: [MH_URL],
@@ -449,7 +451,7 @@ describe('receive-side degradation', () => {
     const second = new MockWebTransport();
     first.simulateReady();
     second.simulateReady();
-    const OTHER = 'https://mh-other.example:4433';
+    const OTHER = handlerRef(4);
     const rig = await makePipeline({
       readables: { [MH_URL]: first.datagrams.readable, [OTHER]: second.datagrams.readable },
       receiveUrls: [MH_URL, OTHER],
@@ -474,8 +476,8 @@ describe('receive-side degradation', () => {
     const third = new MockWebTransport();
     shared.simulateReady();
     third.simulateReady();
-    const OTHER = 'https://mh-other.example:4433';
-    const THIRD = 'https://mh-third.example:4433';
+    const OTHER = handlerRef(5);
+    const THIRD = handlerRef(6);
     const rig = await makePipeline({
       readables: {
         [MH_URL]: shared.datagrams.readable,
@@ -493,41 +495,76 @@ describe('receive-side degradation', () => {
     expect(rig.count(RECEIVED)).toBe(2);
   });
 
-  it('faults when assignments name a handler this client is not connected to', async () => {
+  it('an assigned in-set handler not yet connected is skipped SILENTLY, then read once it connects', async () => {
     // `readableFor` is a selector over connected transports; it cannot dial.
-    // A url with no connected transport is surfaced, never silently skipped.
-    const rig = await makePipeline({ readable: undefined, receiveUrls: [MH_URL] });
+    // Every assigned ref is a set member (non-members are dropped at decode), so
+    // "not connected" is a dial or redial in flight (ADR-0039 §4) — not a fault.
+    const readables: Record<number, ReadableStream<Uint8Array>> = {};
+    const rig = await makePipeline({ readables, receiveUrls: [MH_URL] });
+    await settle();
+    expect(rig.faults).toEqual([]);
+    // The ref connects: the owner re-applies, and the loop starts on it.
+    const transport = new MockWebTransport();
+    transport.simulateReady();
+    readables[MH_URL] = transport.datagrams.readable;
+    rig.pipeline.handlerConnected(MH_URL);
+    expect(transport.datagrams.readable.locked).toBe(true);
+    // Positive control: a ref NOT assigned is not read when it connects.
+    const other = new MockWebTransport();
+    readables[OTHER_REF] = other.datagrams.readable;
+    rig.pipeline.handlerConnected(OTHER_REF);
+    expect(other.datagrams.readable.locked).toBe(false);
+  });
+
+  it('forgetHandler(ref) ends that read loop QUIETLY; an un-forgotten loop ending still faults', async () => {
+    const first = new MockWebTransport();
+    const second = new MockWebTransport();
+    first.simulateReady();
+    second.simulateReady();
+    const rig = await makePipeline({
+      readables: { [MH_URL]: first.datagrams.readable, [OTHER_REF]: second.datagrams.readable },
+      receiveUrls: [MH_URL, OTHER_REF],
+    });
+    await settle();
+    // The quiet stop cancels the reader, which ENDS the loop (`done`) — no fault.
+    rig.pipeline.forgetHandler(OTHER_REF);
+    await settle();
+    expect(rig.faults).toEqual([]);
+    // Positive arm: the SAME end on a handler still in the set is surfaced.
+    first.simulateDatagramReadableEnd();
     await settle();
     expect(rig.faults).toEqual(['transport']);
   });
 
   it('a second, DIFFERENT transport fault is not silenced by the first; a repeat is', async () => {
-    // Faults dedupe on (stage, message). A stage-only key let "not connected"
-    // hide a later "moved mid-session" — the one that names an MC placement
-    // defect — for the rest of the session.
-    const transport = new MockWebTransport();
-    transport.simulateReady();
+    // Faults dedupe on (stage, message). A stage-only key would let the first
+    // condition hide a later, different one for the rest of the session.
+    const shared = new MockWebTransport();
+    shared.simulateReady();
     const messages: string[] = [];
-    const rig = await makePipeline({ readable: transport.datagrams.readable });
+    const rig = await makePipeline({
+      // Two DISTINCT refs resolving to one readable: a named transport fault.
+      readables: { [MH_URL]: shared.datagrams.readable, [OTHER_REF]: shared.datagrams.readable },
+      receiveUrls: null,
+    });
     rig.pipeline.on('fault', (f) => messages.push(f.message));
 
-    // A receive url with no transport, then a SEND target with no transport —
-    // two live transport conditions with different remedies. (The pair used to be
-    // the two task-6 placement faults, which no longer exist.)
-    rig.pipeline.setReceiveAssignments(
-      assignmentsOn(['https://mh-unconnected.example:4433'], SENDER_ID),
-    );
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL, OTHER_REF], SENDER_ID));
+    // ...and a SEND target with no transport — a different remedy.
     rig.pipeline.setSendDirective({
       streamNumber: 1,
       bitrateBps: 32_000,
-      targets: ['https://mh-unconnected.example:4433'],
+      targets: [handlerRef(9)],
       headerVersion: HEADER_VERSION,
     });
     rig.emit();
     // The same conditions again: bounded, so NOT reported twice.
-    rig.pipeline.setReceiveAssignments(
-      assignmentsOn(['https://mh-unconnected.example:4433'], SENDER_ID),
-    );
+    rig.pipeline.setSendDirective({
+      streamNumber: 1,
+      bitrateBps: 32_000,
+      targets: [handlerRef(9)],
+      headerVersion: HEADER_VERSION,
+    });
     rig.emit();
     await settle();
 

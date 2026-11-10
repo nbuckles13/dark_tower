@@ -13,7 +13,7 @@
 //
 // REDACTION (R-23): `toJSON` extends the base allowlist with ONLY `mediaCode`
 // (bounded SDK enum) and the capped, non-secret `mhUrl` (the server-designated MH
-// URL from `JoinResponse.media_servers`, ≤256 bytes). The underlying cause (a
+// URL from the `MediaHandlerSet`, ≤256 bytes). The underlying cause (a
 // transport reject / connect timeout) is preserved ONLY on the non-enumerable
 // standard `Error.cause` for local debugging — NEVER emitted by `toJSON`, and the
 // raw cause text is NEVER stringified into the message or any field (so a transport
@@ -33,8 +33,14 @@ export const MediaConnectionErrorCode = {
   Transport: 'TRANSPORT',
   /** A single MH did not become ready within the connect deadline. */
   ConnectTimeout: 'CONNECT_TIMEOUT',
-  /** EVERY MH failed — the aggregate `connectAll` rejection. */
+  /** EVERY member of a non-empty join-time set failed its first dial (`MediaTransport.arm`). */
   AllFailed: 'ALL_FAILED',
+  /**
+   * MH closed the session with `MhCloseCode.DECLINED` (ADR-0039 §5): the dial
+   * credential was refused — "token dead", not "handler dead". Reported as the
+   * `failureCode` of the FAILED status that triggers MC's credential re-push.
+   */
+  Declined: 'DECLINED',
 } as const;
 
 export type MediaConnectionErrorCode =
@@ -43,7 +49,7 @@ export type MediaConnectionErrorCode =
 /** Construction options for {@link MediaConnectionError}. */
 export interface MediaConnectionErrorOptions {
   /**
-   * The failing MH URL (server-designated, from `JoinResponse.media_servers`).
+   * The failing MH URL (server-designated, from the `MediaHandlerSet`).
    * Capped to ≤256 bytes by the caller. Omitted for the `ALL_FAILED` aggregate.
    */
   readonly mhUrl?: string;

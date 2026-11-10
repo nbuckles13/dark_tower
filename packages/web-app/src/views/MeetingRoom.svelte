@@ -113,7 +113,10 @@
           credentials: credentials(),
         });
         // The S10a non-vacuity guard (test-levers builds only).
-        const violation = leverViolationAfterJoin(levers, joined.mediaServers);
+        const violation = leverViolationAfterJoin(
+          levers,
+          joined.handlerSet.handlers.map((h) => h.url),
+        );
         if (violation !== undefined) {
           s.disconnect();
           joinError = violation;

@@ -463,7 +463,16 @@ Filed by @dry-reviewer at Gate 3 of `docs/devloop-outputs/2026-11-07-gc-mh-regis
   - `crates/gc-test-utils/src/reference_config.rs:parse_env_file()`, strict; it allows empty values, because GC ships `CORS_ALLOWED_ORIGINS=`.
   - `crates/mh-service/src/config.rs` tests `env_file()`, lenient (`filter_map`); it silently drops a malformed line.
 
+  **A fifth instance, in bash (noted 2026-11-10 by @dry-reviewer, story 4 C1):** `scripts/guards/simple/validate-keyframe-floor-sync.sh:env_key()` is a strict single-key, whole-line, digits-only `sed` read of `infra/services/mh-service/config.env` (`MH_KEEPALIVE_INTERVAL_MS`). It cannot import any of the Rust homes (Reachability). It folds in for free if that guard is ever ported to `dt-guard` (ADR-0034), where it would call `common::kustomize_generators::read_env_file()`. That is the natural trigger for this entry's dt-guard leg.
   The crates cannot all reach one another: env-tests and the service test-utils are separate ADR-0028 layers, and dt-guard is tooling. So the home would be a small dependency-free crate or module that all four import, with ONE policy on empty values. Until then, the MH copy is the one to fix first: it is the only one that masks a malformed line.
+
+### From DRY Reviewer — story 4 C1 (2026-11-10)
+
+Filed by @dry-reviewer at Gate 3 of `docs/devloop-outputs/2026-11-10-sdk-reconcile-handler-set/` as an ADR-0019 extraction opportunity. Did not enter fix-or-defer.
+
+- [ ] **Hand-driven timer fakes: `packages/test-utils/src/FakeScheduler.ts` is now the shared home, but `packages/sdk-core/src/media/setup/__tests__/kekSource.test.ts:fakeScheduler()` keeps a private copy** (owner: `client` + `test`; TRIGGER: the next sdk-core test needing a manual timer queue, or the next edit to `kekSource.test.ts`). The copy is not a drop-in: its `advance()` moves the clock first and fires a SNAPSHOT of due timers, so a timer scheduled by a callback during the advance does NOT fire, while `FakeScheduler.advance()` fires in due order including those. It also has `advanceWithoutTimers()` (a throttled background tab) and starts its clock at 1000. To migrate, add `advanceWithoutTimers()` and an initial-clock option to `FakeScheduler`, then check that every kekSource expiry test still means what it says under the in-order firing rule. Don't change those semantics silently.
+
+- [ ] **Five timer seams use two type shapes** (owner: `client`; TRIGGER: a sixth seam, or the next edit to `kekSource.ts`). `packages/sdk-core/src/media/events.ts:TransportScheduler` (`setTimeout(cb, ms): unknown; clearTimeout(handle: unknown)`) is new and named. The four older seams spell `(fn, ms) => ReturnType<typeof setTimeout>` / `(handle: ReturnType<typeof setTimeout>) => void` inline: `media/setup/kekSource.ts:MeetingKekHolderOptions`, `media/lifecycle/VideoPublisher.ts`, `media/lifecycle/keyframePolicy.ts`, `session/events.ts`. Pick ONE named type, export it beside `TransportScheduler`, and have every seam reference it, so `FakeScheduler` satisfies all five without casts.
 
 ## Port Constant Scattering (Kind / K8s / Env-Tests)
 

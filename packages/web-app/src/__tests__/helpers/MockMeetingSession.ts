@@ -111,7 +111,7 @@ export class MockMeetingSession extends TypedEventEmitter<MeetingSessionEventMap
       senderId: 1,
       receiveSlotCaps: { audio: 8, video: 8 },
       existingParticipants: [],
-      mediaServers: [],
+      handlerSet: { version: '0', handlers: [] },
       correlationId: 'c',
       bindingToken: 'b',
     };

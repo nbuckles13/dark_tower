@@ -45,10 +45,11 @@ import {
 } from '../../pipeline/egress.js';
 import { TransmitKeyManager } from '../transmitKeys.js';
 import { AudioPipeline, type AudioPipelineOptions } from '../AudioPipeline.js';
+import { handlerRef, type HandlerRef } from '../../handlerSet.js';
 
 const KEK = new Uint8Array(AES_256_KEY_BYTES).fill(0x11);
 const SENDER_ID = 258;
-const MH_URL = 'https://mh.example/media';
+const MH_URL = handlerRef(1);
 
 interface Rig {
   readonly pipeline: AudioPipeline;
@@ -477,7 +478,7 @@ describe('degradation is loud', () => {
 });
 
 describe('the directed header version (ADR-0036 §2: meeting-wide, MC-directed)', () => {
-  const directive = (headerVersion: number, targets: readonly string[] = [MH_URL]) => ({
+  const directive = (headerVersion: number, targets: readonly HandlerRef[] = [MH_URL]) => ({
     streamNumber: 1,
     bitrateBps: 32_000,
     targets,

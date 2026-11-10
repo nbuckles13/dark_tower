@@ -1,53 +1,47 @@
 // File: packages/sdk-core/src/media/MediaTransport.ts
 //
-// R-20/R-21/R-58/R-60 (SDK side): the active/active MH media-transport layer.
-// `connectAll(urls, jwt)` opens a WebTransport connection to EVERY MH URL from
-// `JoinResponse.media_servers` IN PARALLEL and performs ONLY the auth handshake on
-// each: open the first bidi stream, write a single length-prefixed
-// `MhClientMessage{connectRequest{joinToken}}` envelope (trace-injected via the SAME
-// shared `sendFramedMessage` path as the MC send), and treat the MH as CONNECTED iff
-// `ready` resolved AND that envelope wrote without error. This layer does no
-// SFrame and no WebCodecs; datagrams and the control channel (below) are
-// exposed to the layers above.
+// The active/active MH media-transport layer, RECONCILED TO THE HANDLER SET
+// (ADR-0039 §4; story 4 C1). Every `MediaHandlerSet` the client receives — the
+// join-time one included — goes through ONE path, `applyHandlerSet`, which
+// diffs on `handler_ref` ONLY (`handlerSet.ts`):
+//   * a ref not yet held is DIALED (join and migration share one dial path,
+//     `#dial`, with no join special case in dialling);
+//   * a ref that left the set goes through THE ONE removal function,
+//     `#removeRef` — a directed removal: no fault, no loss report;
+//   * identical refs with new tokens are a token-only refresh: no dial, no close;
+//   * a new ref at a previously used URL is a removal plus an add, i.e. a real
+//     close and a fresh WebTransport session (`allowPooling` stays false),
+//     never deduplicated by URL.
+// It never dials anything outside the latest set.
 //
-// STORY 3 ADDS THE MH CONTROL CHANNEL (C-A1). The connect bidi stream is no
-// longer write-once: after the connect envelope it carries, in BOTH directions,
-// the same 4-byte big-endian length prefix and size bound as `MhClientMessage`:
-//   * MH -> client: `MhServerMessage` (a `keyframe_request`), read by a per-handler
-//     loop (`#runControlReadLoop`) through the shared `FrameDecoder`, which
-//     refuses an oversized length from the PREFIX ALONE, before the body is
-//     buffered. Malformed input is COUNTED (via the injected `controlSink`) and
-//     never throws: a decode failure skips the message, a framing failure stops
-//     that handler's loop (the stream is desynchronised; media is unaffected).
-//   * client -> MH: `MhClientMessage.recovery_request`, via `sendRecoveryRequest`
-//     (story 3 task 14, C-B, is its first caller), framed by the same
-//     `sendFramedMessage` as the connect envelope and serialised per handler.
-// The loop and the control send hold the STREAM only — never the meeting JWT or
-// the connect envelope that carried it.
+// Each dial opens a WebTransport session, writes ONE length-prefixed
+// `MhClientMessage{connectRequest{joinToken, mediaDialToken}}` on the first bidi
+// stream (trace-injected through the same `sendFramedMessage` as the MC send),
+// and is CONNECTED iff `ready` resolved and that envelope wrote. The bidi stream
+// then carries the MH control channel in both directions (story 3): MH ->
+// client `MhServerMessage`s through the shared `FrameDecoder` (malformed input
+// counted through the injected `controlSink`, never thrown), client -> MH
+// `recovery_request`s via `sendRecoveryRequest`, serialised per ref.
 //
-// R-21 resolver: `connectAll` resolves (with the per-MH reports) when ≥1 MH connects
-// and rejects with `MediaConnectionError(ALL_FAILED)` only when EVERY MH fails. Each
-// `#connectOne` NEVER rejects — it captures its outcome into per-URL state — so one
-// slow/hung MH can't delay the others (`Promise.allSettled`).
+// LIFECYCLE per ref: `connecting` -> `connected` -> (`lost` | `parked`) ->
+// `connecting` ...; removal deletes the record. A session end is classified by
+// `closeCode.ts` (ADR-0039 §7) and drives the redial / park / report decisions;
+// redials use full-jitter backoff (`redialBackoff.ts`) with the first retry no
+// earlier than one MH keepalive and stop the moment the ref leaves the set.
 //
-// @operations: a bounded per-MH connect deadline (mirrors SignalingClient's join
-// timer) guarantees `connectAll` settles even against a half-open QUIC handshake
-// whose `ready` never resolves; the timed-out MH is reported FAILED. Transports are
-// registered for teardown BEFORE awaiting `ready`, so `disconnect()` always reaches
-// an in-flight connection. Teardown is a single idempotent path.
+// SELECTORS STAY SELECTORS: `getDatagramChannel`, `openUniStream`,
+// `incomingUniStreamsFor` and `sendRecoveryRequest` look up the CONNECTED
+// transport of a ref and can never create one. The only dial site is `#dial`,
+// reached only from the reconcile, a redial timer of an in-set ref, or a parked
+// ref's release by a newer token.
 //
-// TASK 19 ADDS DATAGRAM I/O. `getDatagramChannel(url)` exposes a send/receive
-// channel over an already-connected MH, and the three
-// `WebTransportDatagramDuplexStream` queue knobs are SET from configuration at
-// connect time (ADR-0036 §1: "the default being adequate is not the same as the
-// default being chosen"). The application egress queue lives one layer up, in
-// `pipeline/egressQueue.ts`, and must trip BEFORE the transport ceiling so the
-// drop decision — and the count — happen in our code rather than silently inside
-// the user agent, where neither this client nor the media handler could see it.
+// @operations: every dial has a bounded connect deadline, so a half-open QUIC
+// handshake whose `ready` never resolves still settles. Every timer runs on the
+// injected scheduler and is cancelled on removal and at `disconnect()`.
 //
-// R-23: the meeting JWT is threaded only as the `connectAll` parameter into each
-// `#connectOne`; it is never stored on the instance. `failureReason`/`failureCode`
-// are SDK-authored bounded classifications (never a raw transport-error message).
+// R-23 / ADR-0039 §5 credential rules: see `#dialTokens` (the scoped dial-token
+// retention) and `arm` (the meeting JWT is a call-scoped parameter, never
+// stored). `failureReason`/`failureCode` are SDK-authored bounded strings.
 
 import { create, fromBinary } from '@bufbuild/protobuf';
 
@@ -68,6 +62,12 @@ import {
 } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
 import type { MhConnectionStatusReport } from '../signaling/events.js';
+import {
+  DEFAULT_CLIENT_CONFIG,
+  MH_KEEPALIVE_FLOOR_MS,
+  type HandlerSetConfig,
+} from '../config/clientConfig.js';
+import { FaultOnce } from './lifecycle/faultOnce.js';
 
 import {
   DEFAULT_MH_CONNECT_TIMEOUT_MS,
@@ -79,12 +79,25 @@ import {
   type MhControlSink,
   type MhRecoveryRequest,
   type RunInContext,
+  type TransportScheduler,
 } from './events.js';
+import {
+  diffHandlerSet,
+  type HandlerRef,
+  type HandlerSetIntake,
+  type HandlerSetView,
+} from './handlerSet.js';
+import { classifyClose } from './closeCode.js';
+import { redialDelayMs } from './redialBackoff.js';
 
 /** Static, bounded failure reasons (never a raw cause string — R-23/security). */
 const REASON_TRANSPORT = 'media handler connection failed';
 const REASON_TIMEOUT = 'media handler connect deadline exceeded';
 const REASON_NO_CONTROL_CHANNEL = 'no control channel is open to that media handler';
+const REASON_DECLINED = 'media handler declined the dial credential';
+
+/** The bounded event-once contract WARN for a 0/unknown MH close code. */
+const CLOSE_CODE_FAULT = 'a media handler closed with an unknown or zero close code';
 
 /** Bucket a raw MH index into the bounded `mh_index_bucket` label set (`0|1|2+`). */
 function mhIndexBucket(index: number): string {
@@ -93,15 +106,76 @@ function mhIndexBucket(index: number): string {
 
 const identityRunInContext: RunInContext = (fn) => fn();
 
-interface FailureInfo {
-  readonly failureCode: string;
-  readonly failureReason: string;
+const defaultScheduler: TransportScheduler = {
+  setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+/** The last state reported to MC for a ref (report on CHANGE only). */
+type ReportedState = MhConnectionStatusReport['state'];
+
+/**
+ * ONE record per in-set ref (never parallel maps): everything removal must
+ * release lives here, so `#removeRef` cannot miss a piece. A removed ref has NO
+ * record; stale async work detects removal by identity (`#refs.get(ref) !== rec`)
+ * and a superseded transport by `rec.transport !== transport`.
+ *
+ * Holds NO credential (tokens live only in `#dialTokens`).
+ */
+interface RefRecord {
+  readonly ref: HandlerRef;
+  readonly url: string;
+  /** Position in the latest set — the `mh_index_bucket` of the next dial. */
+  index: number;
+  state: MediaConnectionState;
+  /** The current (dialing or connected) transport. */
+  transport: IWebTransport | undefined;
+  /** Consecutive failed attempts since the last connect (backoff exponent). */
+  attempt: number;
+  /**
+   * `attempt` as it was when the current session's handshake completed. A
+   * session MH then closes with a RETRY-class or contract-fault code was never a
+   * healthy connect, so the exponent is restored from here rather than reset —
+   * otherwise a persistent MC_UNAVAILABLE / BINDING_CONFLICT redials at the
+   * floor forever, fleet-synchronised, and the cap never comes into play.
+   */
+  attemptBeforeConnect: number;
+  /**
+   * TOKEN GENERATION: bumped whenever a set brings a DIFFERENT token string for
+   * this ref (opaque inequality — the token itself is never copied here).
+   */
+  tokenGen: number;
+  /** The `tokenGen` the current/last dial read its token at. */
+  dialTokenGen: number;
+  redialTimer: unknown;
+  graceTimer: unknown;
+  /** Ends an in-flight dial's handshake wait at once (removal / teardown). */
+  abortDial: (() => void) | undefined;
+  /** The control stream (connect bidi stream after its envelope) + send chain. */
+  control: { readonly stream: WebTransportBidirectionalStream; tail: Promise<void> } | undefined;
+  controlReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  datagram:
+    | {
+        readonly channel: MediaDatagramChannel;
+        readonly writer: WritableStreamDefaultWriter<Uint8Array>;
+      }
+    | undefined;
+  lastReported: ReportedState | undefined;
+}
+
+/** Counts of how sessions ended, by disposition (numbers only). */
+export interface MediaTransportDiagnostics {
+  readonly retryCloses: number;
+  readonly releasedCloses: number;
+  readonly declinedCloses: number;
+  readonly lossCloses: number;
+  readonly contractFaultCloses: number;
 }
 
 /**
- * Active/active MH media-transport. Single-use: one `connectAll()` per instance
- * (mirrors `SignalingClient`'s single-join); `MeetingSession` constructs a fresh
- * instance per join.
+ * Active/active MH media transport, reconciled to the handler set. One instance
+ * per session (`MeetingSession` builds it before the signalling join so the
+ * join-time set has a home).
  */
 export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
   readonly #connectFn: WebTransportConnectFn;
@@ -110,31 +184,53 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
   readonly #metricsSink: MetricsSink | undefined;
   readonly #metricLabels: MetricLabels;
   readonly #runInContext: RunInContext;
-
-  readonly #order: string[] = [];
-  readonly #states = new Map<string, MediaConnectionState>();
-  readonly #observedAt = new Map<string, number>();
-  readonly #failures = new Map<string, FailureInfo>();
-  readonly #transports: IWebTransport[] = [];
-  readonly #timers = new Set<ReturnType<typeof setTimeout>>();
-  /** Per-URL datagram channels, created lazily on first use after connect. */
-  readonly #datagramChannels = new Map<string, MediaDatagramChannel>();
-  readonly #datagramWriters = new Map<string, WritableStreamDefaultWriter<Uint8Array>>();
-  /** Connected transports by URL, so a datagram channel can find its transport. */
-  readonly #connectedTransports = new Map<string, IWebTransport>();
   readonly #datagramQueue: DatagramQueueSettings | undefined;
   readonly #controlSink: MhControlSink | undefined;
-  /**
-   * Per-URL control stream (the connect bidi stream after its envelope) and the
-   * tail of its serialised send chain. Holds the STREAM only — never the JWT.
-   */
-  readonly #controlChannels = new Map<
-    string,
-    { readonly stream: WebTransportBidirectionalStream; tail: Promise<void> }
-  >();
-  readonly #controlReaders = new Set<ReadableStreamDefaultReader<Uint8Array>>();
+  readonly #handlers: HandlerSetConfig;
+  readonly #scheduler: TransportScheduler;
+  readonly #random: () => number;
+  readonly #faults = new FaultOnce();
 
+  /** The latest set (token-free). Empty until the first set arrives. */
+  #set: HandlerSetView = { version: '0', handlers: [] };
+  /** The latest set's wire `handler_set_version`, echoed on every report. */
+  #version = 0n;
+  /** One record per in-set ref that has been dialed. */
+  readonly #refs = new Map<HandlerRef, RefRecord>();
+  /**
+   * CREDENTIAL — SCOPED RETENTION (ADR-0039 §5 "Client retention"; the scoped
+   * R-23 amendment; `scripts/guards/semantic/checks.md` §Client Credential
+   * Lifetime, "Scoped exception: the media_dial dial credential").
+   *
+   * The latest opaque `media_dial` token per IN-SET ref, and NOWHERE ELSE in
+   * the SDK. It is:
+   *   - REPLACED WHOLESALE by every set (a new Map is built and assigned —
+   *     never merged, never gated on `handler_set_version`; a token-only
+   *     refresh replaces it too);
+   *   - DELETED for a ref in `#removeRef`, and CLEARED in `disconnect()`
+   *     (reached on every session end path, join failure included);
+   *   - read only at the moment a dial builds its `MhConnectRequest`: timers and
+   *     dial closures capture the REF and read this map when they fire (an
+   *     absent ref means no dial);
+   *   - never parsed (opaque: no split, no base64 decode, no `exp` read), never
+   *     logged, stringified, put on an error or `cause`, a metric, a span, an
+   *     event, a return value or the DOM. No getter exists.
+   * A token is reusable across dials within its lifetime (MH keeps no jti
+   * cache), so every dial — join, add, redial, retry, post-park — sends it.
+   */
+  #dialTokens = new Map<HandlerRef, string>();
+  /** `arm()` was called: the join completed and dialling may start. */
+  #armed = false;
+  #emptySetTimer: unknown;
+  #overdueEmitted = false;
   #terminated = false;
+  readonly #diagnostics = {
+    retryCloses: 0,
+    releasedCloses: 0,
+    declinedCloses: 0,
+    lossCloses: 0,
+    contractFaultCloses: 0,
+  };
 
   constructor(options: MediaTransportOptions = {}) {
     super();
@@ -146,120 +242,138 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     this.#runInContext = options.runInContext ?? identityRunInContext;
     this.#datagramQueue = options.datagramQueue;
     this.#controlSink = options.controlSink;
+    this.#handlers = options.handlers ?? DEFAULT_CLIENT_CONFIG.media.handlers;
+    this.#scheduler = options.scheduler ?? defaultScheduler;
+    this.#random = options.random ?? Math.random;
+  }
+
+  // ----------------------------------------------------------------------------
+  // The set
+  // ----------------------------------------------------------------------------
+
+  /**
+   * Apply a validated set (`signaling/handlerSetIntake.ts` -> the signalling
+   * sink). The ONE entry point for every set, join-time included. Before
+   * {@link arm} the set is only held; after it, added refs are dialed at once.
+   */
+  applyHandlerSet(intake: HandlerSetIntake): void {
+    if (this.#terminated) return;
+    const previousTokens = this.#dialTokens;
+    const nextRefs = intake.view.handlers.map((h) => h.ref);
+    const diff = diffHandlerSet(
+      this.#set.handlers.map((h) => h.ref),
+      nextRefs,
+    );
+    this.#set = intake.view;
+    this.#version = intake.version;
+    for (const ref of diff.removed) this.#removeRef(ref);
+    // Wholesale replacement: a NEW map, never a merge (see the field).
+    this.#dialTokens = new Map(intake.dialTokens);
+    intake.view.handlers.forEach((h, index) => {
+      const rec = this.#refs.get(h.ref);
+      if (rec) rec.index = index;
+    });
+    if (intake.view.handlers.length > 0) this.#cancelEmptySetNotice();
+    for (const ref of diff.retained) {
+      const rec = this.#refs.get(ref);
+      if (!rec) continue;
+      // Opaque string inequality only; no copy of any token is kept.
+      if (previousTokens.get(ref) !== this.#dialTokens.get(ref)) rec.tokenGen++;
+      if (rec.state === 'parked') {
+        // Released ONLY by a token newer than the one the declined dial used; a
+        // set repeating it keeps the park. Then exactly one dial.
+        if (rec.tokenGen > rec.dialTokenGen) {
+          rec.attempt = 0;
+          void this.#dial(rec, '');
+        }
+      } else if (rec.graceTimer !== undefined) {
+        // A set update inside the HANDLER_RELEASED grace that keeps the ref:
+        // no loss report; back to the normal redial.
+        this.#clearTimer(rec, 'graceTimer');
+        this.#scheduleRedial(rec);
+      }
+    }
+    if (this.#armed) this.#reconcile('');
   }
 
   /**
-   * Connect to every URL in `urls` in parallel using `jwt` as the MH connect token.
-   * Resolves with one {@link MhConnectionStatusReport} per URL (index-ordered) when
-   * ≥1 connects; rejects with {@link MediaConnectionError} (`ALL_FAILED`) when every
-   * URL fails. An empty `urls` resolves with `[]`.
+   * Start dialling: called ONCE by `MeetingSession` after the signalling join
+   * resolved. Dials every member of the latest set with `joinToken` and resolves
+   * when those dials settle.
+   *
+   * THE MEETING JWT IS A CALL-SCOPED PARAMETER, NEVER STORED (R-23; ADR-0039 §5:
+   * the join JWT is "deliberately not retained by the SDK"; checks.md: "a JWT
+   * held for redial is a Gate 1 finding"). Only the dials started here carry it
+   * as `join_token`, exactly as before this change. EVERY LATER DIAL (added
+   * ref, redial, retry, post-park, the first non-empty set after an empty join
+   * set) sends `join_token = ""` plus `media_dial_token`. INTERIM, until story 4
+   * MH-1 makes MH accept `media_dial_token`: MH DECLINES those later dials, so
+   * the ref parks, FAILED goes to MC, MC re-pushes the set (rate-limited), and
+   * exactly one dial follows per newer token — never a client-driven loop. Do
+   * NOT "fix" that by retaining the JWT; MH-1 is the cut-over.
+   *
+   * @throws {MediaConnectionError} `ALL_FAILED` when the join-time set is
+   *   NON-EMPTY and none of its dials connected (the join gate, unchanged). An
+   *   empty set resolves at once ("media connecting").
    */
-  async connectAll(urls: readonly string[], jwt: string): Promise<MhConnectionStatusReport[]> {
-    // Seed per-URL state in INPUT ORDER before any await so report order is stable
-    // regardless of which MH settles first.
-    for (const url of urls) {
-      this.#order.push(url);
-      this.#states.set(url, 'connecting');
-    }
-    await Promise.allSettled(urls.map((url, index) => this.#connectOne(url, index, jwt)));
-    const reports = this.getStatusReports();
-    const anyConnected = this.#order.some((url) => this.#states.get(url) === 'connected');
-    if (this.#order.length > 0 && !anyConnected) {
+  async arm(joinToken: string): Promise<void> {
+    if (this.#armed || this.#terminated) return;
+    this.#armed = true;
+    if (this.#set.handlers.length === 0) this.#startEmptySetNotice();
+    await Promise.allSettled(this.#reconcile(joinToken));
+    if (this.#terminated) return;
+    const anyConnected = [...this.#refs.values()].some((r) => r.state === 'connected');
+    if (this.#set.handlers.length > 0 && !anyConnected) {
       throw new MediaConnectionError(
         MediaConnectionErrorCode.AllFailed,
         'all media servers failed to connect',
       );
     }
-    return reports;
   }
 
-  /** The current observable state of `url`, or `undefined` if not a known MH. */
-  getState(url: string): MediaConnectionState | undefined {
-    return this.#states.get(url);
+  /** The current lifecycle state of `ref`, or `undefined` if it has no record. */
+  getState(ref: HandlerRef): MediaConnectionState | undefined {
+    return this.#refs.get(ref)?.state;
   }
 
   /**
-   * Per-URL terminal reports in INPUT ORDER — the input to
-   * `SignalingClient.sendMediaConnectionUpdate`. Available even on the all-fail
-   * rejection so the caller can still report every MH's state.
+   * How sessions ended, by disposition — numbers only. The C2 hook for the
+   * R-42 series; NOT exported from the package.
    */
-  getStatusReports(): MhConnectionStatusReport[] {
-    return this.#order.map((url) => {
-      const observedAtMs = this.#observedAt.get(url) ?? this.#clock();
-      const connected = this.#states.get(url) === 'connected';
-      if (connected) {
-        return { mhUrl: url, state: 'connected', observedAtMs };
-      }
-      const failure = this.#failures.get(url);
-      if (failure !== undefined) {
-        return {
-          mhUrl: url,
-          state: 'failed',
-          failureReason: failure.failureReason,
-          failureCode: failure.failureCode,
-          observedAtMs,
-        };
-      }
-      return { mhUrl: url, state: 'failed', observedAtMs };
-    });
+  diagnostics(): MediaTransportDiagnostics {
+    return { ...this.#diagnostics };
   }
 
-  /** Tear down every transport + timer. Idempotent (R-23 / @operations). */
+  /**
+   * Tear down every ref (through `#removeRef`), every timer and every token.
+   * Idempotent (R-23 / @operations).
+   */
   disconnect(): void {
     if (this.#terminated) return;
     this.#terminated = true;
-    for (const timer of this.#timers) {
-      clearTimeout(timer);
-    }
-    this.#timers.clear();
-    for (const writer of this.#datagramWriters.values()) {
-      try {
-        void writer.close().catch(() => {
-          // A writer on an already-errored stream rejects on close. The
-          // transport close below is what actually releases the connection.
-        });
-      } catch {
-        // Already released — ignore.
-      }
-    }
-    this.#datagramWriters.clear();
-    this.#datagramChannels.clear();
-    for (const reader of this.#controlReaders) {
-      void reader.cancel().catch(() => {
-        // Already released or errored — the transport close below ends it.
-      });
-    }
-    this.#controlReaders.clear();
-    this.#controlChannels.clear();
-    this.#connectedTransports.clear();
-    for (const transport of this.#transports) {
-      this.#safeClose(transport);
-    }
+    this.#cancelEmptySetNotice();
+    for (const ref of [...this.#refs.keys()]) this.#removeRef(ref);
+    this.#dialTokens.clear();
   }
 
-  /**
-   * A datagram send/receive channel over a CONNECTED media handler.
-   *
-   * Returns `undefined` for a URL that is not connected — the caller counts that
-   * as `not_connected` rather than being handed a channel that cannot send.
-   *
-   * The channel holds ONE cached writer: `send` awaits `writer.ready` before
-   * every write, so at most one write is in flight in the transport and queue
-   * depth accumulates in the application queue where it can be bounded and
-   * counted.
-   */
-  getDatagramChannel(url: string): MediaDatagramChannel | undefined {
-    const existing = this.#datagramChannels.get(url);
-    if (existing) return existing;
-    const transport = this.#connectedTransports.get(url);
-    if (!transport || this.#terminated) return undefined;
+  // ----------------------------------------------------------------------------
+  // Selectors over CONNECTED transports — never dialers
+  // ----------------------------------------------------------------------------
 
+  /**
+   * A datagram send/receive channel over the CONNECTED handler `ref`, or
+   * `undefined` (the caller counts that as `not_connected`). One cached writer:
+   * `send` awaits `writer.ready` before every write, so queue depth accumulates
+   * in the application queue where it is bounded and counted.
+   */
+  getDatagramChannel(ref: HandlerRef): MediaDatagramChannel | undefined {
+    const rec = this.#connected(ref);
+    if (!rec || !rec.transport) return undefined;
+    if (rec.datagram) return rec.datagram.channel;
+    const transport = rec.transport;
     const writer = transport.datagrams.writable.getWriter();
-    this.#datagramWriters.set(url, writer);
     let open = true;
-    // `closed` resolving or rejecting both mean the same thing to a sender:
-    // there is no transport left. Distinguishing them would produce two drop
-    // reasons for one condition.
+    // `closed` resolving or rejecting both mean: no transport left.
     void transport.closed.then(
       () => {
         open = false;
@@ -268,71 +382,53 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
         open = false;
       },
     );
-
     const channel: MediaDatagramChannel = {
       readable: transport.datagrams.readable,
       get isOpen(): boolean {
         return open;
       },
-      // The platform reports this on the duplex stream; it is absent under a
-      // test double and under a UA that does not expose it, in which case the
-      // sender skips the oversize check rather than inventing a bound.
+      // Absent under a test double or a UA that does not expose it.
       maxDatagramSize: transport.datagrams.maxDatagramSize,
       async send(bytes: Uint8Array): Promise<void> {
         await writer.ready;
         await writer.write(bytes);
       },
     };
-    this.#datagramChannels.set(url, channel);
+    rec.datagram = { channel, writer };
     return channel;
   }
 
   /**
-   * Open one OUTGOING unidirectional stream to the CONNECTED handler at `url`
-   * (story 3: one stream per video group per handler), or `undefined` when no
-   * transport to `url` is connected.
-   *
-   * A SELECTOR, NEVER A DIALER — the same rule as `getDatagramChannel`: it
-   * looks up transports `connectAll` already opened and can never create one,
-   * so a directed target can pick among those transports only.
+   * Open one OUTGOING unidirectional stream to the CONNECTED handler `ref`
+   * (one per video group per handler), or `undefined`. A selector, never a dialer.
    */
-  openUniStream(url: string): Promise<WritableStream<Uint8Array>> | undefined {
-    const transport = this.#connectedTransports.get(url);
-    if (!transport || this.#terminated) return undefined;
-    return transport.createUnidirectionalStream();
+  openUniStream(ref: HandlerRef): Promise<WritableStream<Uint8Array>> | undefined {
+    return this.#connected(ref)?.transport?.createUnidirectionalStream();
   }
 
   /**
-   * The INCOMING unidirectional streams of the CONNECTED handler at `url`
-   * (story 3 C-B: one stream per forwarded video group), or `undefined` when no
-   * transport to `url` is connected.
-   *
-   * A SELECTOR, NEVER A DIALER — the same rule as `getDatagramChannel`.
+   * The INCOMING unidirectional streams of the CONNECTED handler `ref`, or
+   * `undefined`. A selector, never a dialer.
    */
-  incomingUniStreamsFor(url: string): ReadableStream<ReadableStream<Uint8Array>> | undefined {
-    const transport = this.#connectedTransports.get(url);
-    if (!transport || this.#terminated) return undefined;
-    return transport.incomingUnidirectionalStreams;
+  incomingUniStreamsFor(ref: HandlerRef): ReadableStream<ReadableStream<Uint8Array>> | undefined {
+    return this.#connected(ref)?.transport?.incomingUnidirectionalStreams;
   }
 
   /**
-   * Send a receiver's recovery request for one of its slots to the handler at
-   * `url` (story 3 R-13), as `MhClientMessage.recovery_request` on that
-   * handler's control stream. Framed by the same pipeline as the connect
-   * envelope; sends to one handler are serialised (one writer at a time).
+   * Send a receiver's recovery request to the handler `ref` on its control
+   * stream (story 3 R-13), serialised per ref.
    *
    * @throws {MediaConnectionError} `Transport` when no control channel is open
-   * to `url`, or the write fails. Bounded messages only.
+   * to `ref`, or the write fails. Bounded messages only.
    */
-  async sendRecoveryRequest(url: string, request: MhRecoveryRequest): Promise<void> {
-    const channel = this.#controlChannels.get(url);
-    if (!channel || this.#terminated) {
+  async sendRecoveryRequest(ref: HandlerRef, request: MhRecoveryRequest): Promise<void> {
+    const rec = this.#refs.get(ref);
+    const channel = this.#terminated ? undefined : rec?.control;
+    if (!rec || !channel) {
       throw new MediaConnectionError(
         MediaConnectionErrorCode.Transport,
         REASON_NO_CONTROL_CHANNEL,
-        {
-          mhUrl: capMhUrl(url),
-        },
+        rec ? { mhUrl: capMhUrl(rec.url) } : {},
       );
     }
     const message = create(MhClientMessageSchema, {
@@ -356,172 +452,108 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
     } catch {
       // Never the platform error: it is not ours to forward (R-23).
       throw new MediaConnectionError(MediaConnectionErrorCode.Transport, REASON_TRANSPORT, {
-        mhUrl: capMhUrl(url),
+        mhUrl: capMhUrl(rec.url),
       });
     }
   }
 
-  /**
-   * Open the MH control channel on `stream` — the connect bidi stream AFTER its
-   * envelope. Takes the URL, the transport and the stream ONLY: nothing that
-   * carried the meeting JWT is captured by the loop or the control send.
-   */
-  #startControlChannel(
-    url: string,
-    transport: IWebTransport,
-    stream: WebTransportBidirectionalStream,
-  ): void {
-    this.#controlChannels.set(url, { stream, tail: Promise.resolve() });
-    // The transport ending ends the channel, whatever the read loop is doing:
-    // a later send then reports "no control channel", not a write failure.
-    const drop = (): void => this.#dropControlChannel(url, stream);
-    void transport.closed.then(drop, drop);
-    void this.#runControlReadLoop(url, stream);
-  }
-
-  /** Forget `url`'s control channel if it is still this stream. */
-  #dropControlChannel(url: string, stream: WebTransportBidirectionalStream): void {
-    if (this.#controlChannels.get(url)?.stream === stream) this.#controlChannels.delete(url);
-  }
-
-  /**
-   * Read `MhServerMessage`s off a handler's control stream until it ends.
-   * NEVER throws: every failure is bounded, counted through the control sink,
-   * and ends or continues the loop.
-   */
-  async #runControlReadLoop(url: string, stream: WebTransportBidirectionalStream): Promise<void> {
-    let reader: ReadableStreamDefaultReader<Uint8Array>;
-    try {
-      reader = stream.readable.getReader();
-    } catch {
-      return;
-    }
-    this.#controlReaders.add(reader);
-    // The SAME decoder as MC signalling: the 64 KiB per-message bound is checked
-    // on the length prefix, before the body is buffered.
-    const decoder = new FrameDecoder();
-    let desynchronised = false;
-    try {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (this.#terminated) return;
-        if (done) {
-          // MH finished its send half: no keyframe request can arrive again.
-          this.#controlSink?.ended(url, 'finished');
-          return;
-        }
-        let frames: Uint8Array[];
-        try {
-          frames = decoder.push(value);
-        } catch {
-          // Oversized or empty length: the INBOUND half is desynchronised and no
-          // later boundary can be trusted. Count it and stop reading; its
-          // datagrams are unaffected. The channel entry is KEPT deliberately: the
-          // OUTBOUND half is independent of an inbound desync, so recovery
-          // requests can still be sent on it.
-          this.#controlSink?.malformed(url);
-          desynchronised = true;
-          return;
-        }
-        for (const frame of frames) this.#dispatchControl(url, frame);
-      }
-    } catch {
-      // The stream was reset or the transport ended. Teardown is ours and is not
-      // counted; anything else silently ends this handler's keyframe requests,
-      // so it is made visible.
-      if (!this.#terminated) this.#controlSink?.ended(url, 'reset');
-    } finally {
-      this.#controlReaders.delete(reader);
-      // The stream ENDED (MH finished or reset it, or the transport went): the
-      // channel is gone, so a later send reports "no control channel" — not a
-      // generic write failure an operator cannot tell from a transient.
-      if (!desynchronised) this.#dropControlChannel(url, stream);
-      try {
-        reader.releaseLock();
-      } catch {
-        // Already released during teardown.
-      }
-    }
-  }
-
-  /** Decode one control message and hand it to the sink. Never throws. */
-  #dispatchControl(url: string, frame: Uint8Array): void {
-    let message;
-    try {
-      message = fromBinary(MhServerMessageSchema, frame);
-    } catch {
-      this.#controlSink?.malformed(url);
-      return;
-    }
-    switch (message.message.case) {
-      case 'keyframeRequest':
-        this.#controlSink?.keyframeRequest(url, {
-          streamNumber: message.message.value.streamNumber,
-          gopCounter: message.message.value.gopCounter,
-        });
-        return;
-      default:
-        // An unset or unknown variant carries nothing this client can act on.
-        this.#controlSink?.malformed(url);
-        return;
-    }
-  }
-
-  #applyDatagramQueueSettings(transport: IWebTransport): void {
-    const settings = this.#datagramQueue;
-    if (!settings) return;
-    const datagrams = transport.datagrams;
-    datagrams.outgoingHighWaterMark = settings.outgoingHighWaterMark;
-    datagrams.outgoingMaxAge = settings.outgoingMaxAgeMs;
-    datagrams.incomingHighWaterMark = settings.incomingHighWaterMark;
-  }
-
   // ----------------------------------------------------------------------------
-  // Internal
+  // Reconcile, dial, end, remove
   // ----------------------------------------------------------------------------
 
-  async #connectOne(url: string, index: number, jwt: string): Promise<void> {
+  /**
+   * Dial every member of the latest set that has no record. A ref with a record
+   * is connecting, connected, awaiting a redial, or parked — none is redialed
+   * here. Returns the dials started (so `arm` can await the join-time ones).
+   */
+  #reconcile(joinToken: string): Promise<void>[] {
+    const dials: Promise<void>[] = [];
+    this.#set.handlers.forEach((h, index) => {
+      if (this.#refs.has(h.ref)) return;
+      const rec: RefRecord = {
+        ref: h.ref,
+        url: h.url,
+        index,
+        state: 'connecting',
+        transport: undefined,
+        attempt: 0,
+        attemptBeforeConnect: 0,
+        tokenGen: 0,
+        dialTokenGen: 0,
+        redialTimer: undefined,
+        graceTimer: undefined,
+        abortDial: undefined,
+        control: undefined,
+        controlReader: undefined,
+        datagram: undefined,
+        lastReported: undefined,
+      };
+      this.#refs.set(h.ref, rec);
+      dials.push(this.#dial(rec, joinToken));
+    });
+    return dials;
+  }
+
+  /** Whether `rec` is still the live record of its ref (not removed). */
+  #isCurrent(rec: RefRecord): boolean {
+    return !this.#terminated && this.#refs.get(rec.ref) === rec;
+  }
+
+  #connected(ref: HandlerRef): RefRecord | undefined {
+    if (this.#terminated) return undefined;
+    const rec = this.#refs.get(ref);
+    return rec?.state === 'connected' ? rec : undefined;
+  }
+
+  /**
+   * THE ONE DIAL PATH (join, add, redial, retry, post-park). Never rejects: the
+   * outcome lands on the record. `joinToken` is non-empty only for the dials
+   * `arm` starts; the dial token is read from `#dialTokens` when the request is
+   * built. A dial whose ref was removed meanwhile is closed when it resolves and
+   * emits NOTHING (no metric, no report, no event).
+   */
+  async #dial(rec: RefRecord, joinToken: string): Promise<void> {
+    rec.state = 'connecting';
     let transport: IWebTransport;
     try {
-      transport = this.#connectFn(url);
+      transport = this.#connectFn(rec.url);
     } catch (err) {
-      // A SYNCHRONOUS connect failure (an unavailable WebTransport constructor, a
-      // URL the constructor rejects, a refused dial) is a failed MH like any
-      // other: recorded with the bounded transport reason — never the raw
-      // message (R-23) — rather than escaping this async function, where
-      // `allSettled` would swallow it and leave the URL `connecting` forever.
-      this.#failOne(url, index, MediaConnectionErrorCode.Transport, REASON_TRANSPORT, err);
+      // A SYNCHRONOUS connect failure is a failed dial like any other.
+      this.#dialFailed(rec, MediaConnectionErrorCode.Transport, REASON_TRANSPORT, err);
       return;
     }
-    // Register for teardown IMMEDIATELY — BEFORE awaiting ready — so disconnect()
-    // can always reach an in-flight / never-ready transport (no leak).
-    this.#transports.push(transport);
-    // The handshake never observes `closed` (the datagram channel and the
-    // control channel each observe their own end; no reconnect this story).
-    // Attach a no-op catch so a transport that rejects `closed` (e.g. a connect
-    // failure) doesn't surface as an unhandled rejection; the connect outcome is
-    // driven entirely off `ready` + the write below.
-    void transport.closed.catch(() => {});
+    rec.transport = transport;
+    // The end of THIS session, whenever it comes. A rejected `closed` is a
+    // session lost without a clean close (no code).
+    void transport.closed.then(
+      (info) => this.#ended(rec, transport, info.closeCode),
+      () => this.#ended(rec, transport, undefined),
+    );
+    const live = (): boolean => this.#isCurrent(rec) && rec.transport === transport;
 
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<'timeout'>((resolve) => {
-      timer = setTimeout(() => resolve('timeout'), this.#connectTimeoutMs);
-      this.#timers.add(timer);
-    });
+    let timer: unknown;
+    let timerArmed = true;
     const clearDeadline = (): void => {
-      if (timer !== undefined) {
-        clearTimeout(timer);
-        this.#timers.delete(timer);
-      }
+      if (!timerArmed) return;
+      timerArmed = false;
+      this.#scheduler.clearTimeout(timer);
     };
+    const deadline = new Promise<'timeout' | 'aborted'>((resolve) => {
+      timer = this.#scheduler.setTimeout(() => {
+        timerArmed = false;
+        resolve('timeout');
+      }, this.#connectTimeoutMs);
+      // Removal mid-handshake ends the wait at once: no orphaned deadline timer.
+      rec.abortDial = () => {
+        clearDeadline();
+        resolve('aborted');
+      };
+    });
 
     try {
-      // Map ready's reject → 'error' so the loser of the race never produces an
-      // unhandled rejection if the deadline wins. Capture the rejection reason so it
-      // can be preserved on the failure's `Error.cause` (symmetric with the
-      // write-path catch below). This cause is leak-free: the `ready` rejection
-      // fires BEFORE the joinToken envelope is ever written, so it cannot echo token
-      // bytes — and it lives only on the non-enumerable `Error.cause` regardless.
+      // `ready`'s rejection reason is preserved on the error's non-enumerable
+      // `cause`: it fires before any envelope is written, so it cannot echo a
+      // credential.
       let readyError: unknown;
       const readyOutcome = transport.ready.then(
         () => 'ready' as const,
@@ -532,87 +564,280 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
       );
       const outcome = await Promise.race([readyOutcome, deadline]);
       clearDeadline();
-      if (this.#terminated) return;
-      if (outcome === 'timeout') {
-        this.#failOne(
-          url,
-          index,
-          MediaConnectionErrorCode.ConnectTimeout,
-          REASON_TIMEOUT,
-          undefined,
-        );
+      if (rec.transport === transport) rec.abortDial = undefined;
+      if (!live() || outcome === 'aborted') {
         this.#safeClose(transport);
+        return;
+      }
+      if (outcome === 'timeout') {
+        this.#safeClose(transport);
+        this.#dialFailed(rec, MediaConnectionErrorCode.ConnectTimeout, REASON_TIMEOUT, undefined);
         return;
       }
       if (outcome === 'error') {
-        this.#failOne(url, index, MediaConnectionErrorCode.Transport, REASON_TRANSPORT, readyError);
         this.#safeClose(transport);
+        this.#dialFailed(rec, MediaConnectionErrorCode.Transport, REASON_TRANSPORT, readyError);
         return;
       }
-      // CHOOSE the datagram queue depths rather than inheriting the user
-      // agent's. A drop inside the UA's outgoing queue is uncountable by us AND
-      // structurally invisible to MH — the one drop class ADR-0036 §11 says
-      // matters most — so the transport queue is kept shallow and the bounded
-      // application queue above it makes the decision. `outgoingMaxAge` is a
-      // BACKSTOP set clear of what both queues can legitimately hold; at a value
-      // close to that sum it would become a routine uncountable competitor
-      // instead. `validateMediaConfig` asserts both relationships at setup.
+      // CHOOSE the datagram queue depths rather than inheriting the UA's
+      // (ADR-0036 §1/§11; `validateMediaConfig` asserts the relationships).
       this.#applyDatagramQueueSettings(transport);
 
       const stream = await transport.createBidirectionalStream();
+      if (!live()) {
+        this.#safeClose(transport);
+        return;
+      }
+      // Read the credential NOW, at request build — never captured earlier.
+      rec.dialTokenGen = rec.tokenGen;
       const envelope = create(MhClientMessageSchema, {
         message: {
           case: 'connectRequest',
-          value: create(MhConnectRequestSchema, { joinToken: jwt }),
+          value: create(MhConnectRequestSchema, {
+            joinToken,
+            mediaDialToken: this.#dialTokens.get(rec.ref) ?? '',
+          }),
         },
       });
-      // R-58: inject under the active dt_client.join span. The wrap is SYNCHRONOUS
-      // around the inject (the first step of `sendFramedMessage`); the async write
-      // tail runs after. (A coarse wrap around `connectAll` would lose context at
-      // the first await under the StackContextManager.)
+      // R-58: inject under the active dt_client.join span; the wrap is
+      // synchronous around the inject (the first step of `sendFramedMessage`).
       await this.#runInContext(() => sendFramedMessage(stream, MhClientMessageSchema, envelope));
-      // A disconnect mid-handshake closes the transport, so createBidi/write would
-      // throw into the catch (whose #terminated guard handles it); no intermediate
-      // checks needed here.
-      this.#succeedOne(url, index, transport);
-      this.#startControlChannel(url, transport, stream);
+      if (!live()) {
+        this.#safeClose(transport);
+        return;
+      }
+      this.#dialSucceeded(rec, transport, stream);
     } catch (err) {
       clearDeadline();
-      if (this.#terminated) return;
-      this.#failOne(url, index, MediaConnectionErrorCode.Transport, REASON_TRANSPORT, err);
       this.#safeClose(transport);
+      if (!live()) return;
+      this.#dialFailed(rec, MediaConnectionErrorCode.Transport, REASON_TRANSPORT, err);
     }
   }
 
-  #succeedOne(url: string, index: number, transport: IWebTransport): void {
-    this.#connectedTransports.set(url, transport);
-    this.#states.set(url, 'connected');
-    this.#observedAt.set(url, this.#clock());
-    this.#emitMetric('success', index);
-    this.emit('connected', url);
+  #dialSucceeded(
+    rec: RefRecord,
+    transport: IWebTransport,
+    stream: WebTransportBidirectionalStream,
+  ): void {
+    rec.state = 'connected';
+    rec.attemptBeforeConnect = rec.attempt;
+    rec.attempt = 0;
+    this.#emitMetric('success', rec.index);
+    this.#startControlChannel(rec, transport, stream);
+    this.#report(rec, 'connected');
+    this.emit('connected', { ref: rec.ref, url: rec.url });
   }
 
-  #failOne(
-    url: string,
-    index: number,
+  #dialFailed(
+    rec: RefRecord,
     code: MediaConnectionErrorCode,
     reason: string,
     cause: unknown,
   ): void {
-    this.#states.set(url, 'failed');
-    this.#observedAt.set(url, this.#clock());
-    this.#failures.set(url, { failureCode: code, failureReason: reason });
-    this.#emitMetric('failure', index);
+    rec.transport = undefined;
+    rec.state = 'lost';
+    this.#emitMetric('failure', rec.index);
+    this.#report(rec, 'failed', { failureCode: code, failureReason: reason });
     this.emit(
       'failed',
-      // Use the COMPUTED `reason` (not a hardcoded one) so the error's `.message`
-      // always matches its `.mediaCode` — e.g. a CONNECT_TIMEOUT carries the timeout
-      // reason, a TRANSPORT carries the transport reason (@code-reviewer F1).
       new MediaConnectionError(code, reason, {
-        mhUrl: capMhUrl(url),
+        mhUrl: capMhUrl(rec.url),
         ...(cause !== undefined ? { cause } : {}),
       }),
     );
+    this.#scheduleRedial(rec);
+  }
+
+  /**
+   * A CONNECTED session ended. Classified by `closeCode.ts`; a session that
+   * ends while still dialing is the dial path's failure, and anything stale
+   * (removed ref, superseded transport, teardown) is ignored — so a server
+   * close that follows a directed removal produces nothing.
+   */
+  #ended(rec: RefRecord, transport: IWebTransport, closeCode: number | undefined): void {
+    if (!this.#isCurrent(rec) || rec.transport !== transport || rec.state !== 'connected') return;
+    this.#releaseConnection(rec);
+    rec.transport = undefined;
+    rec.state = 'lost';
+    const disposition = classifyClose(closeCode);
+    switch (disposition) {
+      case 'retry':
+        this.#diagnostics.retryCloses++;
+        rec.attempt = rec.attemptBeforeConnect;
+        this.#scheduleRedial(rec);
+        return;
+      case 'released':
+        this.#diagnostics.releasedCloses++;
+        // Still in the set (a removal would have deleted the record): wait a
+        // short grace for a set update, then treat as loss.
+        rec.graceTimer = this.#scheduler.setTimeout(() => {
+          rec.graceTimer = undefined;
+          if (!this.#isCurrent(rec)) return;
+          this.#report(rec, 'disconnected');
+          this.#scheduleRedial(rec);
+        }, this.#handlers.releasedGraceMs);
+        return;
+      case 'declined':
+        this.#diagnostics.declinedCloses++;
+        rec.state = 'parked';
+        // FAILED EVERY TIME (not change-gated): it is MC's re-push trigger.
+        this.#report(
+          rec,
+          'failed',
+          { failureCode: MediaConnectionErrorCode.Declined, failureReason: REASON_DECLINED },
+          true,
+        );
+        // A refresh that landed while the declined dial was in flight already
+        // brought a NEWER token: dial once with it now instead of parking under
+        // it (which would stall until MC's next TTL/3 push).
+        if (rec.tokenGen > rec.dialTokenGen) {
+          rec.attempt = 0;
+          void this.#dial(rec, '');
+        }
+        return;
+      case 'contract_fault':
+        this.#diagnostics.contractFaultCloses++;
+        rec.attempt = rec.attemptBeforeConnect;
+        if (this.#faults.report('mh-close', CLOSE_CODE_FAULT)) {
+          console.warn('[dt-signaling-contract]', CLOSE_CODE_FAULT);
+        }
+        this.#report(rec, 'disconnected');
+        this.#scheduleRedial(rec);
+        return;
+      case 'loss':
+        this.#diagnostics.lossCloses++;
+        this.#report(rec, 'disconnected');
+        this.#scheduleRedial(rec);
+        return;
+      default: {
+        const unhandled: never = disposition;
+        return unhandled;
+      }
+    }
+  }
+
+  /** Arm a full-jitter redial for an in-set ref. Captures the RECORD, never a token. */
+  #scheduleRedial(rec: RefRecord): void {
+    if (!this.#isCurrent(rec)) return;
+    rec.state = 'lost';
+    const delay = redialDelayMs(rec.attempt, {
+      baseMs: this.#handlers.redialBaseMs,
+      capMs: this.#handlers.redialCapMs,
+      floorMs: MH_KEEPALIVE_FLOOR_MS,
+      random: this.#random,
+    });
+    rec.attempt++;
+    this.#clearTimer(rec, 'redialTimer');
+    rec.redialTimer = this.#scheduler.setTimeout(() => {
+      rec.redialTimer = undefined;
+      // Never dial outside the latest set: a removed ref has no live record.
+      if (!this.#isCurrent(rec)) return;
+      void this.#dial(rec, '');
+    }, delay);
+  }
+
+  /**
+   * THE ONE REMOVAL CLEANUP for a ref that left the set — and, from
+   * `disconnect()`, for every ref at session end. A DIRECTED removal: no fault,
+   * no loss report, no metric.
+   *   - drop its token and its record (stale async work then sees it gone);
+   *   - cancel its redial timer, HANDLER_RELEASED grace and park;
+   *   - tell per-ref consumers FIRST (`handlerRemoved`, synchronous): egress
+   *     lanes, read loops (quietly), hop monitors, recovery queues;
+   *   - end its control loop quietly and release its datagram writer;
+   *   - close its transport — including one the server left OPEN (the
+   *     data-plane fence) and an in-flight dial (aborted; the dial path sees the
+   *     record gone and closes whatever resolves).
+   */
+  #removeRef(ref: HandlerRef): void {
+    this.#dialTokens.delete(ref);
+    const rec = this.#refs.get(ref);
+    if (!rec) return;
+    this.#refs.delete(ref);
+    this.#clearTimer(rec, 'redialTimer');
+    this.#clearTimer(rec, 'graceTimer');
+    const abort = rec.abortDial;
+    rec.abortDial = undefined;
+    abort?.();
+    this.emit('handlerRemoved', ref);
+    this.#releaseConnection(rec);
+    const transport = rec.transport;
+    rec.transport = undefined;
+    if (transport) this.#safeClose(transport);
+  }
+
+  /** Release a connection's control loop and datagram writer (not the transport). */
+  #releaseConnection(rec: RefRecord): void {
+    rec.control = undefined;
+    const reader = rec.controlReader;
+    rec.controlReader = undefined;
+    if (reader) {
+      void reader.cancel().catch(() => {
+        // Already released or errored — the transport close ends it.
+      });
+    }
+    const datagram = rec.datagram;
+    rec.datagram = undefined;
+    if (datagram) {
+      try {
+        void datagram.writer.close().catch(() => {
+          // A writer on an errored stream rejects on close; the transport
+          // close is what releases the connection.
+        });
+      } catch {
+        // Already released.
+      }
+    }
+  }
+
+  #clearTimer(rec: RefRecord, which: 'redialTimer' | 'graceTimer'): void {
+    if (rec[which] !== undefined) {
+      this.#scheduler.clearTimeout(rec[which]);
+      rec[which] = undefined;
+    }
+  }
+
+  // ----------------------------------------------------------------------------
+  // Reports, empty-set notice, metrics
+  // ----------------------------------------------------------------------------
+
+  /**
+   * Emit a per-ref transition for `MediaConnectionUpdate`: ONLY when the
+   * reported state changes (a retry loop must not skew MC's failed/connected
+   * ratio), unless `always` (DECLINED).
+   */
+  #report(
+    rec: RefRecord,
+    state: ReportedState,
+    failure?: { readonly failureCode: string; readonly failureReason: string },
+    always = false,
+  ): void {
+    if (!always && rec.lastReported === state) return;
+    rec.lastReported = state;
+    this.emit('status', {
+      handlerRef: rec.ref,
+      handlerSetVersion: this.#version,
+      state,
+      ...(failure ?? {}),
+      observedAtMs: this.#clock(),
+    });
+  }
+
+  #startEmptySetNotice(): void {
+    if (this.#overdueEmitted || this.#emptySetTimer !== undefined) return;
+    this.#emptySetTimer = this.#scheduler.setTimeout(() => {
+      this.#emptySetTimer = undefined;
+      if (this.#terminated || this.#overdueEmitted) return;
+      this.#overdueEmitted = true;
+      this.emit('handlersOverdue', undefined);
+    }, this.#handlers.emptySetNoticeMs);
+  }
+
+  #cancelEmptySetNotice(): void {
+    if (this.#emptySetTimer === undefined) return;
+    this.#scheduler.clearTimeout(this.#emptySetTimer);
+    this.#emptySetTimer = undefined;
   }
 
   /**
@@ -654,6 +879,120 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
       status,
       mh_index_bucket: mhIndexBucket(index),
     });
+  }
+
+  // ----------------------------------------------------------------------------
+  // The MH control channel (story 3)
+  // ----------------------------------------------------------------------------
+
+  /**
+   * Open the MH control channel on `stream` — the connect bidi stream AFTER its
+   * envelope. Holds the STREAM only: nothing that carried a credential is
+   * captured by the loop or the control send.
+   */
+  #startControlChannel(
+    rec: RefRecord,
+    transport: IWebTransport,
+    stream: WebTransportBidirectionalStream,
+  ): void {
+    rec.control = { stream, tail: Promise.resolve() };
+    // The transport ending ends the channel: a later send then reports "no
+    // control channel", not a write failure.
+    const drop = (): void => {
+      if (rec.control?.stream === stream) rec.control = undefined;
+    };
+    void transport.closed.then(drop, drop);
+    void this.#runControlReadLoop(rec, stream);
+  }
+
+  /**
+   * Read `MhServerMessage`s off a ref's control stream until it ends. NEVER
+   * throws. A loop on a removed ref or a torn-down session ends QUIETLY.
+   */
+  async #runControlReadLoop(
+    rec: RefRecord,
+    stream: WebTransportBidirectionalStream,
+  ): Promise<void> {
+    let reader: ReadableStreamDefaultReader<Uint8Array>;
+    try {
+      reader = stream.readable.getReader();
+    } catch {
+      return;
+    }
+    rec.controlReader = reader;
+    const live = (): boolean => this.#isCurrent(rec) && rec.controlReader === reader;
+    // The SAME decoder as MC signalling: the per-message bound is checked on the
+    // length prefix, before the body is buffered.
+    const decoder = new FrameDecoder();
+    let desynchronised = false;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (!live()) return;
+        if (done) {
+          // MH finished its send half: no keyframe request can arrive again.
+          this.#controlSink?.ended(rec.ref, 'finished');
+          return;
+        }
+        let frames: Uint8Array[];
+        try {
+          frames = decoder.push(value);
+        } catch {
+          // Oversized or empty length: the INBOUND half is desynchronised. Count
+          // it and stop reading. The channel entry is KEPT: the OUTBOUND half
+          // is independent, so recovery requests can still be sent on it.
+          this.#controlSink?.malformed(rec.ref);
+          desynchronised = true;
+          return;
+        }
+        for (const frame of frames) this.#dispatchControl(rec.ref, frame);
+      }
+    } catch {
+      // Reset, or the transport ended. Removal and teardown are ours and are
+      // not counted; anything else silently ends keyframe requests, so it is
+      // made visible.
+      if (live()) this.#controlSink?.ended(rec.ref, 'reset');
+    } finally {
+      if (rec.controlReader === reader) rec.controlReader = undefined;
+      if (!desynchronised && rec.control?.stream === stream) rec.control = undefined;
+      try {
+        reader.releaseLock();
+      } catch {
+        // Already released during teardown.
+      }
+    }
+  }
+
+  /** Decode one control message and hand it to the sink. Never throws. */
+  #dispatchControl(ref: HandlerRef, frame: Uint8Array): void {
+    let message;
+    try {
+      message = fromBinary(MhServerMessageSchema, frame);
+    } catch {
+      this.#controlSink?.malformed(ref);
+      return;
+    }
+    switch (message.message.case) {
+      case 'keyframeRequest':
+        this.#controlSink?.keyframeRequest(ref, {
+          streamNumber: message.message.value.streamNumber,
+          gopCounter: message.message.value.gopCounter,
+        });
+        return;
+      default:
+        // An unset or unknown variant carries nothing this client can act on.
+        this.#controlSink?.malformed(ref);
+        return;
+    }
+  }
+
+  #applyDatagramQueueSettings(transport: IWebTransport): void {
+    const settings = this.#datagramQueue;
+    if (!settings) return;
+    const datagrams = transport.datagrams;
+    datagrams.outgoingHighWaterMark = settings.outgoingHighWaterMark;
+    datagrams.outgoingMaxAge = settings.outgoingMaxAgeMs;
+    datagrams.incomingHighWaterMark = settings.incomingHighWaterMark;
   }
 
   #safeClose(transport: IWebTransport): void {

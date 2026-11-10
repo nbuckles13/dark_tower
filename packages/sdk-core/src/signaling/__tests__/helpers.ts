@@ -22,6 +22,7 @@ import {
   EncodingParametersSchema,
   MediaKind,
   type MediaKindStateSchema,
+  MediaHandlerSetSchema,
   MediaServerInfoSchema,
   MeetingKekUpdateSchema,
   ParticipantMuteUpdateSchema,
@@ -57,6 +58,7 @@ function buildServerMessage(
     | { case: 'error'; value: ReturnType<typeof buildErrorMessage> }
     | { case: 'streamPublished'; value: ReturnType<typeof buildStreamPublished> }
     | { case: 'sendDirective'; value: ReturnType<typeof buildSendDirective> }
+    | { case: 'mediaHandlerSet'; value: ReturnType<typeof buildMediaHandlerSet> }
     | { case: 'streamAssignments'; value: ReturnType<typeof buildStreamAssignments> }
     | { case: 'meetingKekUpdate'; value: ReturnType<typeof buildMeetingKekUpdate> }
     | { case: 'participantMuteUpdate'; value: ReturnType<typeof buildParticipantMuteUpdate> }
@@ -79,7 +81,16 @@ export interface JoinResponseInit {
     /** The wire list VERBATIM (malformed-list tests); overrides `mediaStates`. */
     rawMediaStates?: RawMediaKindState[];
   }[];
-  mediaServers?: string[];
+  /**
+   * `JoinResponse.media_handler_set` (ADR-0039 §4). Default
+   * {@link DEFAULT_TEST_HANDLER_SET}; `null` omits the field entirely.
+   */
+  handlerSet?: HandlerSetInit | null;
+  /**
+   * The SUPERSEDED `JoinResponse.media_servers` (P3 deletes it). Only for the
+   * never-read tests: the SDK must ignore it.
+   */
+  legacyMediaServers?: string[];
   correlationId?: string;
   bindingToken?: string;
   // Present so a test can construct the leak scenario: the meeting KEK is on the
@@ -89,6 +100,52 @@ export interface JoinResponseInit {
   receiveSlotCaps?: { audio?: number; video?: number; screen?: number };
   /** The wire caps list VERBATIM (old-MC / malformed tests); overrides `receiveSlotCaps`. */
   rawReceiveSlotCaps?: RawReceiveSlotCap[];
+}
+
+/** One member of a fixture handler set. `token` defaults to `tok-<ref>`. */
+export interface HandlerInit {
+  readonly ref: number;
+  readonly url: string;
+  readonly token?: string;
+}
+
+/** A fixture `MediaHandlerSet`. */
+export interface HandlerSetInit {
+  readonly version?: bigint;
+  readonly handlers: readonly HandlerInit[];
+}
+
+/**
+ * The default join-time set of the signalling fixtures: refs 1..3, so a
+ * directive or assignment naming refs 1..3 is a member. Tokens are OPAQUE,
+ * non-JWT strings, so an accidental parse would fail.
+ */
+export const DEFAULT_TEST_HANDLER_SET: HandlerSetInit = {
+  version: 1n,
+  handlers: [
+    { ref: 1, url: 'https://mh-1.example:4433' },
+    { ref: 2, url: 'https://mh-2.example:4433' },
+    { ref: 3, url: 'https://mh-3.example:4433' },
+  ],
+};
+
+/** Build a `MediaHandlerSet`. */
+export function buildMediaHandlerSet(init: HandlerSetInit) {
+  return create(MediaHandlerSetSchema, {
+    handlerSetVersion: init.version ?? 1n,
+    handlers: init.handlers.map((h) =>
+      create(MediaServerInfoSchema, {
+        mediaHandlerUrl: h.url,
+        handlerRef: h.ref,
+        mediaDialToken: h.token ?? `tok-${h.ref}`,
+      }),
+    ),
+  });
+}
+
+/** A framed `ServerMessage.media_handler_set` push. */
+export function framedMediaHandlerSet(init: HandlerSetInit): Uint8Array {
+  return frameServerMessage({ case: 'mediaHandlerSet', value: buildMediaHandlerSet(init) });
 }
 
 /** One raw wire `MediaKindState` (any numbers, for malformed-list tests). */
@@ -166,9 +223,12 @@ export function buildJoinResponse(init: JoinResponseInit = {}) {
       }),
     ),
     kekGeneration: init.kekGeneration ?? 0,
-    mediaServers: (init.mediaServers ?? []).map((url) =>
+    mediaServers: (init.legacyMediaServers ?? []).map((url) =>
       create(MediaServerInfoSchema, { mediaHandlerUrl: url }),
     ),
+    ...(init.handlerSet === null
+      ? {}
+      : { mediaHandlerSet: buildMediaHandlerSet(init.handlerSet ?? DEFAULT_TEST_HANDLER_SET) }),
     correlationId: init.correlationId ?? '',
     bindingToken: init.bindingToken ?? '',
     meetingKek: init.meetingKek ?? new Uint8Array(),
@@ -307,7 +367,10 @@ export async function waitFor(predicate: () => boolean, tries = 100): Promise<vo
 export interface SendStreamInit {
   streamNumber?: number;
   maxBitrateBps?: number;
-  targets?: string[];
+  /** Target refs (`SendTarget.handler_ref`). */
+  targets?: number[];
+  /** The SUPERSEDED `SendTarget.media_handler_url` per target (never-read tests only). */
+  legacyTargetUrls?: string[];
   mediaKind?: MediaKind;
   /** Video encoding fields (story 3 C-A2); absent = unset on the wire. */
   video?: {
@@ -337,7 +400,12 @@ function buildSendStream(init: SendStreamInit) {
           }
         : {}),
     }),
-    targets: (init.targets ?? []).map((url) => create(SendTargetSchema, { mediaHandlerUrl: url })),
+    targets: (init.targets ?? []).map((ref, i) =>
+      create(SendTargetSchema, {
+        handlerRef: ref,
+        mediaHandlerUrl: init.legacyTargetUrls?.[i] ?? '',
+      }),
+    ),
   });
 }
 
@@ -370,7 +438,10 @@ export function framedSendDirectiveWithoutStreams(): Uint8Array {
 export function buildStreamAssignments(init: {
   slotId?: number;
   senderId?: number;
-  mediaHandlerUrl?: string;
+  /** `StreamAssignment.handler_ref` (0 / absent = no edge). */
+  handlerRef?: number;
+  /** The SUPERSEDED `StreamAssignment.media_handler_url` (never-read tests only). */
+  legacyUrl?: string;
   slotState?: SlotState;
   /** The slot's kind; default audio. */
   mediaKind?: MediaKind;
@@ -378,7 +449,7 @@ export function buildStreamAssignments(init: {
   extraSlots?: {
     slotId: number;
     senderId?: number;
-    mediaHandlerUrl: string;
+    handlerRef: number;
     mediaKind?: MediaKind;
     slotState?: SlotState;
   }[];
@@ -391,7 +462,8 @@ export function buildStreamAssignments(init: {
         slotId: init.slotId ?? 0,
         ...(init.senderId !== undefined ? { senderId: init.senderId } : {}),
         mediaKind: init.mediaKind ?? MediaKind.AUDIO,
-        mediaHandlerUrl: init.mediaHandlerUrl ?? '',
+        handlerRef: init.handlerRef ?? 0,
+        mediaHandlerUrl: init.legacyUrl ?? '',
         slotState: init.slotState ?? SlotState.ACTIVE,
       }),
       ...(init.extraSlots ?? []).map((slot) =>
@@ -399,7 +471,7 @@ export function buildStreamAssignments(init: {
           slotId: slot.slotId,
           ...(slot.senderId !== undefined ? { senderId: slot.senderId } : {}),
           mediaKind: slot.mediaKind ?? MediaKind.AUDIO,
-          mediaHandlerUrl: slot.mediaHandlerUrl,
+          handlerRef: slot.handlerRef,
           slotState: slot.slotState ?? SlotState.ACTIVE,
         }),
       ),

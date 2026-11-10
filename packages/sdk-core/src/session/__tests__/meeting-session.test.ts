@@ -14,7 +14,8 @@ import {
   InMemoryMetricsSink,
   RecordingPlaybackSink,
   FakeVideoDecoders,
-  type MockWebTransport,
+  FakeScheduler,
+  MockWebTransport,
 } from '@darktower/test-utils';
 
 import { create, toBinary } from '@bufbuild/protobuf';
@@ -72,17 +73,22 @@ import {
   framedUnmuteRequestRelay,
   framedMeetingKekUpdate,
   framedParticipantLeft,
+  framedMediaHandlerSet,
 } from '../../signaling/__tests__/helpers.js';
 import { VideoReceiver } from '../../media/lifecycle/VideoReceiver.js';
+import { VideoPublisher } from '../../media/lifecycle/VideoPublisher.js';
 import { AudioPipeline } from '../../media/lifecycle/AudioPipeline.js';
 import type { VideoSlotRenderChangedEvent } from '../events.js';
 import { LeaveReason } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import {
   decodeClientMessages,
   decodeMhClientMessages,
+  flushMicrotasks,
   makeConnect,
+  makeDialRecorder,
   waitFor,
 } from '../../media/__tests__/helpers.js';
+import type { HandlerSetView, MediaHandlerView } from '../../media/handlerSet.js';
 
 const AC_TEMPLATE = 'https://{subdomain}.localhost:8443';
 const GC_BASE = 'https://gc.localhost:8444';
@@ -90,6 +96,11 @@ const MEETING_CODE = 'abc123ABC456'; // 12 base62
 const MC_ENDPOINT = 'https://mc.localhost:4433';
 const MEETING_ID = 'mtg-uuid-00000000';
 const MEDIA_SERVERS = ['https://mh-a.example:4433', 'https://mh-b.example:4433'];
+/** The join-time handler set naming MEDIA_SERVERS as refs 1, 2 (ADR-0039 §4). */
+const MEDIA_SET = {
+  version: 1n,
+  handlers: MEDIA_SERVERS.map((url, i) => ({ ref: i + 1, url })),
+};
 
 const JSON_HEADERS = { 'content-type': 'application/json' };
 
@@ -211,7 +222,7 @@ async function driveJoin(
   const mc = mocks.get(MC_ENDPOINT)!;
   mc.simulateReady();
   await waitFor(() => mc.getOpenedBidiStreams().length > 0);
-  mc.simulateServerMessage(0, framedJoinResponse({ mediaServers: MEDIA_SERVERS, ...joinInit }));
+  mc.simulateServerMessage(0, framedJoinResponse({ handlerSet: MEDIA_SET, ...joinInit }));
 
   // 2) MH: drive each per the requested outcome.
   await waitFor(() => MEDIA_SERVERS.every((u) => mocks.has(u)));
@@ -221,6 +232,13 @@ async function driveJoin(
     if (ok) mh.simulateReady();
     else mh.simulateError(new Error('mh refused'));
   });
+}
+
+/** Every `MhConnectionStatus` sent on the MC stream, across all updates, in order. */
+function mediaConnectionStatuses(mc: MockWebTransport) {
+  return decodeClientMessages(mc.getOutboundBidiWrites(0)).flatMap((m) =>
+    m.message.case === 'mediaConnectionUpdate' ? m.message.value.statuses : [],
+  );
 }
 
 afterEach(async () => {
@@ -236,7 +254,7 @@ describe('MeetingSession.join — state machine (R-22)', () => {
     const mediaConnected: string[] = [];
     let joinedFired = false;
     session.on('stateChange', (s) => states.push(s));
-    session.on('mediaConnected', (u) => mediaConnected.push(u));
+    session.on('mediaConnected', (v) => mediaConnected.push(v.url));
     session.on('joined', () => {
       joinedFired = true;
     });
@@ -259,7 +277,7 @@ describe('MeetingSession.join — state machine (R-22)', () => {
     expect(session.state).toBe(MeetingSessionState.Joined);
     expect(joinedFired).toBe(true);
     expect(mediaConnected.sort()).toEqual([...MEDIA_SERVERS].sort());
-    expect(joined.mediaServers).toEqual(MEDIA_SERVERS);
+    expect(joined.handlerSet.handlers.map((h) => h.url)).toEqual(MEDIA_SERVERS);
   });
 
   it('bridges participantJoined from the signaling layer', async () => {
@@ -282,7 +300,7 @@ describe('MeetingSession.join — state machine (R-22)', () => {
     session.disconnect();
   });
 
-  it('all-MH-fail → still sends the MediaConnectionUpdate, rejects, and ends in disconnecting', async () => {
+  it('all-MH-fail → reports FAILED for every ref (one update per transition), rejects, and ends in disconnecting', async () => {
     const mocks = new Map<string, MockWebTransport>();
     const session = makeSession(mocks);
     const states: string[] = [];
@@ -296,18 +314,14 @@ describe('MeetingSession.join — state machine (R-22)', () => {
     await driveJoin(mocks, 'none');
     await expect(joinP).rejects.toBeInstanceOf(MediaConnectionError);
 
-    // R-21 / @operations: the MediaConnectionUpdate IS sent on the MC stream on the
-    // all-fail REJECT branch (the "ALWAYS send afterwards" behavior), so MC learns
-    // every MH failed and is not left waiting. Pin it by CONTENT, not just frame count:
-    // decode the MC stream and assert the update is present with ALL statuses FAILED.
-    const mcMsgs = decodeClientMessages(mocks.get(MC_ENDPOINT)!.getOutboundBidiWrites(0));
-    const update = mcMsgs.find((m) => m.message.case === 'mediaConnectionUpdate');
-    expect(update).toBeDefined();
-    if (update?.message.case !== 'mediaConnectionUpdate') throw new Error('unreachable');
-    expect(update.message.value.statuses).toHaveLength(MEDIA_SERVERS.length);
-    expect(update.message.value.statuses.every((s) => s.state === ConnectionState.FAILED)).toBe(
-      true,
-    );
+    // ADR-0039 §4 (replaces the R-21 once-only send): a MediaConnectionUpdate per
+    // per-ref TRANSITION, sent even on the all-fail REJECT branch, so MC learns
+    // every handler failed. Pin it by CONTENT: one update per ref, each FAILED,
+    // each echoing handler_ref + handler_set_version and never mh_url.
+    const statuses = mediaConnectionStatuses(mocks.get(MC_ENDPOINT)!);
+    expect(statuses.map((s) => s.handlerRef).sort()).toEqual([1, 2]);
+    expect(statuses.every((s) => s.state === ConnectionState.FAILED)).toBe(true);
+    expect(statuses.every((s) => s.handlerSetVersion === 1n && s.mhUrl === '')).toBe(true);
     expect(states).toContain(MeetingSessionState.Disconnecting);
     expect(session.state).toBe(MeetingSessionState.Disconnecting);
   });
@@ -328,7 +342,7 @@ describe('MeetingSession.join — state machine (R-22)', () => {
     const mc = mocks.get(MC_ENDPOINT)!;
     mc.simulateReady();
     await waitFor(() => mc.getOpenedBidiStreams().length > 0);
-    mc.simulateServerMessage(0, framedJoinResponse({ mediaServers: MEDIA_SERVERS }));
+    mc.simulateServerMessage(0, framedJoinResponse({ handlerSet: MEDIA_SET }));
     await waitFor(() => MEDIA_SERVERS.every((u) => mocks.has(u)));
     for (const url of MEDIA_SERVERS) {
       const mh = mocks.get(url)!;
@@ -339,21 +353,21 @@ describe('MeetingSession.join — state machine (R-22)', () => {
     }
     await joinP.catch(() => {});
 
-    // Decode the ACTUAL outbound MediaConnectionUpdate proto off the MC wire.
-    const mcMsgs = decodeClientMessages(mc.getOutboundBidiWrites(0));
-    const update = mcMsgs.find((m) => m.message.case === 'mediaConnectionUpdate');
-    expect(update).toBeDefined();
-    if (update?.message.case !== 'mediaConnectionUpdate') throw new Error('unreachable');
-    expect(update.message.value.statuses).toHaveLength(MEDIA_SERVERS.length);
+    // Decode the ACTUAL outbound MediaConnectionUpdate protos off the MC wire.
+    const updates = decodeClientMessages(mc.getOutboundBidiWrites(0)).filter(
+      (m) => m.message.case === 'mediaConnectionUpdate',
+    );
+    const statuses = mediaConnectionStatuses(mc);
+    expect(statuses).toHaveLength(MEDIA_SERVERS.length);
     // F-T1: the proto-flagged client-controlled leak surface is JWT-clean on the wire
     // (failureReason/failureCode are SDK-static; the cause never reaches them).
-    for (const s of update.message.value.statuses) {
+    for (const s of statuses) {
       expect(s.failureReason).not.toContain('meeting-jwt');
       expect(s.failureCode).not.toContain('meeting-jwt');
     }
     // Belt-and-suspenders: the whole decoded update is JWT-free (BigInt-safe
     // serialize — the proto `observedAt` timestamp is a bigint).
-    const serialized = JSON.stringify(update, (_k, v) =>
+    const serialized = JSON.stringify(updates, (_k, v) =>
       typeof v === 'bigint' ? v.toString() : v,
     );
     expect(serialized).not.toContain('meeting-jwt');
@@ -1105,7 +1119,7 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     mc.simulateServerMessage(
       0,
       framedJoinResponse({
-        mediaServers: MEDIA_SERVERS,
+        handlerSet: MEDIA_SET,
         ...(senderId !== null ? { senderId } : {}),
         meetingKek: KEK,
         kekGeneration: 0,
@@ -1208,7 +1222,7 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     await waitFor(() => mc.getOpenedBidiStreams().length > 0);
     mc.simulateServerMessage(
       0,
-      framedJoinResponse({ mediaServers: MEDIA_SERVERS, senderId: 258, meetingKek: KEK }),
+      framedJoinResponse({ handlerSet: MEDIA_SET, senderId: 258, meetingKek: KEK }),
     );
     await waitFor(() => MEDIA_SERVERS.every((u) => mocks.has(u)));
     for (const url of MEDIA_SERVERS) mocks.get(url)!.simulateReady();
@@ -1226,7 +1240,7 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     const rig = await joinedWithMedia();
     await rig.session.startMedia();
     const mc = rig.mocks.get(MC_ENDPOINT)!;
-    mc.simulateServerMessage(0, framedSendDirective({ targets: [MEDIA_SERVERS[0]!] }));
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [1] }));
     await waitFor(() => rig.capture.started);
     expect(rig.capture.started).toBe(true);
     rig.session.disconnect();
@@ -1265,12 +1279,12 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     const mc = rig.mocks.get(MC_ENDPOINT)!;
     const start = pipeline.transmitGeneration;
 
-    mc.simulateServerMessage(0, framedSendDirective({ targets: [MEDIA_SERVERS[0]!] }));
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [1] }));
     await waitFor(() => pipeline.transmitGeneration === start + 1n);
 
     // The last holder leaves: no audio stream at all. Then a new holder arrives.
     mc.simulateServerMessage(0, framedSendDirectiveWithoutStreams());
-    mc.simulateServerMessage(0, framedSendDirective({ targets: [MEDIA_SERVERS[0]!] }));
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [1] }));
     await waitFor(() => pipeline.transmitGeneration === start + 2n);
     expect(pipeline.transmitGeneration).toBe(start + 2n);
     rig.session.disconnect();
@@ -1283,10 +1297,7 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     const mc = rig.mocks.get(MC_ENDPOINT)!;
     // 4 is unsendable: the listener must hand it over as-is, so the pipeline's
     // fail-closed refusal (not a silent coercion here) decides.
-    mc.simulateServerMessage(
-      0,
-      framedSendDirective({ targets: [MEDIA_SERVERS[0]!], headerVersion: 4 }),
-    );
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [1], headerVersion: 4 }));
     await waitFor(() => applied.mock.calls.length === 1);
     expect(applied.mock.calls[0]![0].headerVersion).toBe(4);
     rig.session.disconnect();
@@ -1325,7 +1336,7 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
       framedStreamAssignments({
         slotId: 0,
         senderId: 300,
-        mediaHandlerUrl: MEDIA_SERVERS[0]!,
+        handlerRef: 1,
         slotState: SlotState.ACTIVE,
       }),
     );
@@ -1357,8 +1368,8 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
       framedStreamAssignments({
         slotId: 0,
         senderId: 300,
-        mediaHandlerUrl: MEDIA_SERVERS[0]!,
-        extraSlots: [{ slotId: 1, senderId: 301, mediaHandlerUrl: MEDIA_SERVERS[1]! }],
+        handlerRef: 1,
+        extraSlots: [{ slotId: 1, senderId: 301, handlerRef: 2 }],
       }),
     );
 
@@ -1391,10 +1402,7 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     const rig = await joinedWithMedia();
     const pipeline = await rig.session.startMedia();
     const mc = rig.mocks.get(MC_ENDPOINT)!;
-    mc.simulateServerMessage(
-      0,
-      framedSendDirective({ targets: [MEDIA_SERVERS[0]!, MEDIA_SERVERS[1]!] }),
-    );
+    mc.simulateServerMessage(0, framedSendDirective({ targets: [1, 2] }));
 
     const first = rig.mocks.get(MEDIA_SERVERS[0]!)!;
     const second = rig.mocks.get(MEDIA_SERVERS[1]!)!;
@@ -1431,7 +1439,7 @@ describe('MeetingSession.startMedia (ADR-0036 §5/§6)', () => {
     // left in flight to wait for.
     await waitFor(() => applied.mock.calls.length === 1);
     expect(applied.mock.calls[0]?.[0]).toEqual([
-      { slotId: 0, senderId: undefined, mediaHandlerUrl: '', active: false },
+      { slotId: 0, senderId: undefined, handlerRef: undefined, active: false },
     ]);
     expect(pipeline.assignedSenders).toEqual([]);
 
@@ -1992,7 +2000,7 @@ describe('MeetingSession — publish set, per-kind receive slots and caps (story
               frameRate: 15,
               minKeyframeIntervalMs: 500,
             },
-            targets: [MEDIA_SERVERS[0]!],
+            targets: [1],
           },
         ],
       }),
@@ -2453,6 +2461,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
   const KEK = new Uint8Array(32).fill(0x22);
   const SELF = 'participant-self';
   const MH = MEDIA_SERVERS[0]!;
+  const MH_REF = 1;
 
   async function joinedRig(): Promise<{
     session: MeetingSession;
@@ -2512,9 +2521,9 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     const rig = await joinedRig();
     rig.mc.simulateServerMessage(
       0,
-      framedStreamAssignments({ slotId: 0, senderId: 259, mediaHandlerUrl: MH }),
+      framedStreamAssignments({ slotId: 0, senderId: 259, handlerRef: MH_REF }),
     );
-    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH_REF] }));
     await settle();
     const pipeline = await rig.session.startMedia();
     expect(pipeline.assignedSenders).toEqual([259]);
@@ -2525,7 +2534,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     // A LIVE update after the replay goes straight through (no double-apply race).
     rig.mc.simulateServerMessage(
       0,
-      framedStreamAssignments({ slotId: 0, senderId: 260, mediaHandlerUrl: MH }),
+      framedStreamAssignments({ slotId: 0, senderId: 260, handlerRef: MH_REF }),
     );
     await waitFor(() => pipeline.assignedSenders[0] === 260);
     expect(pipeline.assignedSenders).toEqual([260]);
@@ -2711,7 +2720,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
   async function startedSending(): Promise<Awaited<ReturnType<typeof joinedRig>>> {
     const rig = await joinedRig();
     await rig.session.startMedia();
-    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH_REF] }));
     await settle();
     return rig;
   }
@@ -2724,7 +2733,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     rig.mc.simulateServerMessage(0, muteSelf(true));
     rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
     rig.mc.simulateServerMessage(0, muteSelf(false));
-    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH_REF] }));
     await settle();
     expect(rig.resumed).toEqual(['audio']);
     rig.session.disconnect();
@@ -2734,7 +2743,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     const rig = await startedSending();
     rig.mc.simulateServerMessage(0, muteSelf(true));
     rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
-    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH_REF] }));
     rig.mc.simulateServerMessage(0, muteSelf(false));
     await settle();
     expect(rig.resumed).toEqual(['audio']);
@@ -2775,7 +2784,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     await settle();
     expect(rig.resumed).toEqual([]);
     rig.mc.simulateServerMessage(0, muteSelf(false));
-    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH_REF] }));
     await settle();
     expect(rig.resumed).toEqual(['audio']);
     rig.session.disconnect();
@@ -2785,7 +2794,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     const rig = await startedSending();
     rig.mc.simulateServerMessage(0, muteSelf(true));
     rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
-    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH_REF] }));
     await settle();
     expect(rig.resumed).toEqual(['audio']);
     rig.session.disconnect();
@@ -2797,7 +2806,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     const rig = await joinedRig();
     rig.mc.simulateServerMessage(0, muteSelf(true));
     rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
-    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH_REF] }));
     await settle();
     // Positive control: nothing is sent before media starts, so no event yet.
     expect(rig.resumed).toEqual([]);
@@ -2809,7 +2818,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
 
   it('R-18 S2, false-positive side: with no mute recorded, a pre-media directive raises nothing at startMedia', async () => {
     const rig = await joinedRig();
-    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH_REF] }));
     await settle();
     await rig.session.startMedia();
     await settle();
@@ -2822,7 +2831,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
     rig.session.setAudioMuted(true);
     rig.mc.simulateServerMessage(0, muteSelf(true));
     rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
-    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH_REF] }));
     await settle();
     expect(rig.resumed).toEqual([]);
     rig.session.disconnect();
@@ -2838,7 +2847,7 @@ describe('MeetingSession — story 3 C-A1 session wiring', () => {
       }),
     );
     rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [] }));
-    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH] }));
+    rig.mc.simulateServerMessage(0, framedSendDirective({ streamNumber: 0, targets: [MH_REF] }));
     await settle();
     expect(rig.resumed).toEqual([]);
     rig.session.disconnect();
@@ -2965,7 +2974,7 @@ describe('MeetingSession — video receive wiring (story 3 C-B)', () => {
       framedStreamAssignments({
         slotId: 1,
         senderId: 300,
-        mediaHandlerUrl: MEDIA_SERVERS[0]!,
+        handlerRef: 1,
         slotState: SlotState.AVATAR_NO_VIDEO,
         mediaKind: MediaKind.VIDEO_CAMERA,
       }),
@@ -2990,7 +2999,7 @@ describe('MeetingSession — video receive wiring (story 3 C-B)', () => {
       0,
       framedStreamAssignments({
         slotId: 1,
-        mediaHandlerUrl: MEDIA_SERVERS[0]!,
+        handlerRef: 1,
         slotState: SlotState.ACTIVE,
         mediaKind: MediaKind.VIDEO_CAMERA,
       }),
@@ -3091,5 +3100,202 @@ describe('MeetingSession — malformed kind-keyed snapshot', () => {
         'malformed kind-keyed snapshot from MC: receive_slot_caps_malformed',
       ],
     ]);
+  });
+});
+
+// ===========================================================================
+// Story 4 C1: the handler-set reconcile, seen through the session (ADR-0039 §4)
+// ===========================================================================
+
+describe('MeetingSession — handler-set reconcile (story 4 C1)', () => {
+  /**
+   * A session whose MH dials each get a FRESH mock (redials at a reused url are
+   * real), on a hand-driven scheduler.
+   */
+  async function reconcileRig(
+    joinSet: { version: bigint; handlers: { ref: number; url: string; token?: string }[] },
+    extra: Partial<MeetingSessionOptions> = {},
+  ) {
+    const mc = new MockWebTransport();
+    const dials = makeDialRecorder();
+    const sched = new FakeScheduler();
+    const sink = new InMemoryMetricsSink();
+    const session = makeSession(new Map(), {
+      connect: (url: string) => (url === MC_ENDPOINT ? mc : dials.connect(url)),
+      transportScheduler: sched,
+      transportRandom: () => 0,
+      metricsSink: sink,
+      ...extra,
+    });
+    const connected: MediaHandlerView[] = [];
+    const sets: HandlerSetView[] = [];
+    let overdue = 0;
+    session.on('mediaConnected', (v) => connected.push(v));
+    session.on('mediaHandlerSet', (v) => sets.push(v));
+    session.on('mediaHandlersOverdue', () => {
+      overdue += 1;
+    });
+    const joinP = session.join({
+      orgSubdomain: 'demo',
+      meetingCode: MEETING_CODE,
+      credentials: LOGIN,
+    });
+    await waitFor(() => mc.getOpenedBidiStreams().length > 0 || (mc.simulateReady(), false));
+    mc.simulateServerMessage(0, framedJoinResponse({ handlerSet: joinSet, senderId: 258 }));
+    await waitFor(() => dials.dials.length >= joinSet.handlers.length);
+    for (const h of joinSet.handlers) dials.latest(h.url).simulateReady();
+    const joined = await joinP;
+    return { session, mc, dials, sched, sink, connected, sets, joined, overdue: () => overdue };
+  }
+
+  it('time_to_first_mh_connected is recorded ONCE per session — not on redial, not on migration', async () => {
+    const A = 'https://mh-a.example:4433';
+    const B = 'https://mh-b.example:4433';
+    const rig = await reconcileRig({ version: 1n, handlers: [{ ref: 1, url: A }] });
+    const count = () =>
+      rig.sink
+        .getRecordedMetrics()
+        .filter((m) => m.name === 'dt_client_time_to_first_mh_connected_ms').length;
+    expect(count()).toBe(1);
+
+    // Lose → redial → connect.
+    rig.dials.latest(A).simulateError(new Error('lost'));
+    await flushMicrotasks(50);
+    rig.sched.fireNext();
+    await flushMicrotasks(50);
+    rig.dials.latest(A).simulateReady();
+    await waitFor(() => rig.connected.length === 2);
+    // Migration to a NEW ref.
+    rig.mc.simulateServerMessage(
+      0,
+      framedMediaHandlerSet({ version: 2n, handlers: [{ ref: 2, url: B }] }),
+    );
+    await waitFor(() => rig.dials.count(B) === 1);
+    rig.dials.latest(B).simulateReady();
+    await waitFor(() => rig.connected.length === 3);
+    // A token-only refresh.
+    rig.mc.simulateServerMessage(
+      0,
+      framedMediaHandlerSet({ version: 2n, handlers: [{ ref: 2, url: B, token: 'x' }] }),
+    );
+    await waitFor(() => rig.sets.length === 3);
+
+    // Positive arm: the session DID connect three times...
+    expect(rig.connected.map((c) => c.ref)).toEqual([1, 1, 2]);
+    // ...and the histogram stayed at one.
+    expect(count()).toBe(1);
+    rig.session.disconnect();
+  });
+
+  it('every per-ref transition reaches MC as its own update, echoing ref + version (no mh_url)', async () => {
+    const A = 'https://mh-a.example:4433';
+    const rig = await reconcileRig({ version: 3n, handlers: [{ ref: 7, url: A }] });
+    rig.dials.latest(A).simulateError(new Error('lost'));
+    await waitFor(() => mediaConnectionStatuses(rig.mc).length === 2);
+    const statuses = mediaConnectionStatuses(rig.mc);
+    expect(statuses.map((s) => [s.handlerRef, s.handlerSetVersion, s.state, s.mhUrl])).toEqual([
+      [7, 3n, ConnectionState.CONNECTED, ''],
+      [7, 3n, ConnectionState.DISCONNECTED, ''],
+    ]);
+    rig.session.disconnect();
+  });
+
+  it('an EMPTY join set: join SUCCEEDS ("media connecting"); exactly one overdue notice; a later set connects', async () => {
+    const sink = new InMemoryMetricsSink();
+    const rig = await reconcileRig({ version: 1n, handlers: [] }, { metricsSink: sink });
+    expect(rig.session.state).toBe(MeetingSessionState.Joined);
+    expect(rig.joined.handlerSet).toEqual({ version: '1', handlers: [] });
+    sink.assertCounter(
+      'dt_client_join_attempts_total',
+      { status: 'success', failure_stage: 'none' },
+      1,
+    );
+    expect(rig.dials.dials).toHaveLength(0);
+
+    const bound = DEFAULT_CLIENT_CONFIG.media.handlers.emptySetNoticeMs;
+    rig.sched.advance(bound - 1);
+    expect(rig.overdue()).toBe(0);
+    rig.sched.advance(1);
+    expect(rig.overdue()).toBe(1);
+    rig.sched.advance(bound * 5);
+    expect(rig.overdue()).toBe(1);
+    expect(rig.session.state).toBe(MeetingSessionState.Joined);
+
+    const A = 'https://mh-a.example:4433';
+    rig.mc.simulateServerMessage(
+      0,
+      framedMediaHandlerSet({ version: 2n, handlers: [{ ref: 1, url: A }] }),
+    );
+    await waitFor(() => rig.dials.count(A) === 1);
+    rig.dials.latest(A).simulateReady();
+    await waitFor(() => rig.connected.length === 1);
+    rig.session.disconnect();
+  });
+
+  it('logs the [dt-media-handlers-config] line once per session', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const rig = await reconcileRig({
+      version: 1n,
+      handlers: [{ ref: 1, url: 'https://mh-a.example:4433' }],
+    });
+    const lines = info.mock.calls.filter((c) => c[0] === '[dt-media-handlers-config]');
+    expect(lines).toHaveLength(1);
+    expect(String(lines[0]![1])).toMatch(
+      /^media handler-set config \(default\): redialBaseMs=\d+;/,
+    );
+    rig.session.disconnect();
+  });
+
+  it('a set REMOVING a ref reaches every per-ref consumer (the one forget fan-out); SessionMedia is not rebuilt', async () => {
+    const A = 'https://mh-a.example:4433';
+    const B = 'https://mh-b.example:4433';
+    const codecs = new FakeAudioCodecs();
+    const rig = await reconcileRig(
+      {
+        version: 1n,
+        handlers: [
+          { ref: 1, url: A },
+          { ref: 2, url: B },
+        ],
+      },
+      {
+        captureFactory: async () => new FakeCaptureSource() as never,
+        encoderFactory: codecs.encoderFactory as never,
+        decoderFactory: codecs.decoderFactory as never,
+        playbackFactory: new RecordingPlaybackSink().factory as never,
+        // Video published AND received, so all three per-ref consumers exist.
+        publish: ['audio', 'video'],
+        videoReceiveSlots: { count: 1, source: 'configured' },
+        videoDecoderFactory: new FakeVideoDecoders().factory as never,
+        videoEncoderFactory: async () => ({
+          encode: () => undefined,
+          encodeQueueSize: 0,
+          close: () => undefined,
+        }),
+        videoCaptureFactory: async () => ({
+          start: async () => undefined,
+          stop: () => undefined,
+          grantedDeviceId: undefined,
+          track: undefined,
+        }),
+      },
+    );
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    const forgetAudio = vi.spyOn(AudioPipeline.prototype, 'forgetHandler');
+    const forgetVideoOut = vi.spyOn(VideoPublisher.prototype, 'forgetHandler');
+    const forgetVideoIn = vi.spyOn(VideoReceiver.prototype, 'forgetHandler');
+    const pipeline = await rig.session.startMedia();
+    expect(rig.session.video).toBeDefined();
+    rig.mc.simulateServerMessage(
+      0,
+      framedMediaHandlerSet({ version: 2n, handlers: [{ ref: 1, url: A }] }),
+    );
+    await waitFor(() => forgetAudio.mock.calls.length > 0);
+    for (const spy of [forgetAudio, forgetVideoOut, forgetVideoIn]) {
+      expect(spy.mock.calls.map((c) => c[0])).toEqual([2]);
+    }
+    // Same pipeline object: no rebuild on a set change.
+    expect(await rig.session.startMedia()).toBe(pipeline);
+    rig.session.disconnect();
   });
 });

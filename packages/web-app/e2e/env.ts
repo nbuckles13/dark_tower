@@ -14,9 +14,9 @@
 //   - crates/env-tests/src/cluster.rs — the Rust env-test counterpart
 //     (ENV_TEST_AC_URL / ENV_TEST_GC_URL over port-forward defaults)
 //
-// MC/MH endpoints are deliberately ABSENT: the SDK learns them exclusively from
-// the GC join response's `media_servers` (ADR-0030 — topology never computed
-// client-side).
+// MC/MH endpoints are deliberately ABSENT: the SDK learns MC's from the GC join
+// response and MH's exclusively from MC's `MediaHandlerSet` (ADR-0030, ADR-0039
+// §4 — topology never computed client-side).
 //
 // The Vite dev server's listen address is NOT owned here: it lives in
 // vite/devServer.ts (shared with vite.config.ts), and this module derives the

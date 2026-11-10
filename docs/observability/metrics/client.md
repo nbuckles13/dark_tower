@@ -370,6 +370,10 @@ then, deliberately; do not widen `keep_keys` to make the finding go away.
     (the raw index is bucketed so cardinality stays bounded as the MH fan-out
     grows).
 - **Cardinality**: Low (2 statuses × 3 buckets = 6, before implicit labels).
+- **Since story 4 C1**: one outcome per DIAL — the join-time dials, a newly added
+  handler, a redial after a loss, and the one dial after a DECLINED park — with
+  `mh_index_bucket` = the handler's position in the set that triggered that dial.
+  A dial aborted because its handler left the set emits nothing.
 
 ---
 

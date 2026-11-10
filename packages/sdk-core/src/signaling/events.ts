@@ -14,6 +14,7 @@ import { LeaveReason } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 
 import type { SignalingCodec } from './codecMap.js';
 import type { MediaKindToken, OpenMediaKindToken } from '../media/mediaKind.js';
+import type { HandlerRef, HandlerSetView } from '../media/handlerSet.js';
 
 export { SignalingCodec } from './codecMap.js';
 
@@ -133,9 +134,11 @@ export interface UnmuteRequestedEvent {
  * hardcoded-zero `uint64` durable user id; a per-meeting id is deliberate,
  * because a durable one would make participants linkable across meetings.
  *
- * `mediaServers` are the MH WebTransport URLs taken from each
- * `MediaServerInfo.mediaHandlerUrl`. `correlationId`/`bindingToken` are stored for
- * future reconnection (storage only this story).
+ * `handlerSet` is the joiner's first media-handler set
+ * (`JoinResponse.media_handler_set`, ADR-0039 §4), TOKEN-FREE: refs and urls
+ * only. It may be empty ("media connecting"). The superseded
+ * `JoinResponse.media_servers` is never read. `correlationId`/`bindingToken` are
+ * stored for future reconnection (storage only this story).
  *
  * Deliberately carries NO key material: the meeting KEK is on the wire
  * (`JoinResponse.meetingKek`) but is not projected here, because this object's
@@ -154,7 +157,7 @@ export interface JoinedEvent {
    */
   readonly receiveSlotCaps: ReceiveSlotCaps;
   readonly existingParticipants: readonly RosterParticipant[];
-  readonly mediaServers: readonly string[];
+  readonly handlerSet: HandlerSetView;
   readonly correlationId: string;
   readonly bindingToken: string;
 }
@@ -323,12 +326,14 @@ export interface SendStreamDirective {
    */
   readonly encoding: SendStreamEncoding | undefined;
   /**
-   * Media-handler URLs to send to.
+   * Media handlers to send to, by `SendTarget.handler_ref` (ADR-0039 §4). Only
+   * members of the CURRENT handler set: a non-member ref (0 included) is
+   * dropped at decode and surfaced once as a contract fault, never here.
    *
    * EMPTY MEANS SEND NOTHING (ADR-0036 §5). Resuming from empty rotates the
    * transmit key.
    */
-  readonly targets: readonly string[];
+  readonly targets: readonly HandlerRef[];
 }
 
 /** What MC directs this client to produce, and where. */
@@ -392,8 +397,14 @@ export interface StreamAssignmentEvent {
    * path must not care. This is presentation state, not identity.
    */
   readonly senderId: number | undefined;
-  /** Which handler to receive this slot's media from. Empty when unassigned. */
-  readonly mediaHandlerUrl: string;
+  /**
+   * Which handler to receive this slot's media from (`StreamAssignment.handler_ref`),
+   * or `undefined` when there is none: a no-edge slot (ref 0 on an
+   * unavailable / fewer-sources / avatar-no-video slot), or a ref that is not a
+   * member of the current handler set (a contract fault, surfaced once at
+   * decode). A selector over connected transports, never a dial target.
+   */
+  readonly handlerRef: HandlerRef | undefined;
   /**
    * Why the slot looks the way it does — see {@link SlotStateToken}.
    *
@@ -481,27 +492,30 @@ export interface SignalingJoinParams {
 }
 
 /**
- * Plain, per-MH connection-outcome report — the boundary INPUT to
+ * Plain, per-REF connection-transition report — the boundary INPUT to
  * {@link SignalingClient.sendMediaConnectionUpdate}. PRODUCED by `MediaTransport`
- * (media layer) and CONSUMED by `SignalingClient` (signaling layer); sited HERE in
- * the foundational signaling layer (beside {@link SignalingJoinParams}) so the
- * dependency edge runs media→signaling, never the inversion (@dry-reviewer #4 /
- * @code-reviewer D). SignalingClient maps it onto the generated proto
- * `MhConnectionStatus` internally — no `*_pb` type crosses this boundary.
+ * (media layer) on every per-ref transition and CONSUMED by `SignalingClient`
+ * (signaling layer); sited HERE so the dependency edge runs media→signaling.
+ * SignalingClient maps it onto the generated `MhConnectionStatus` internally.
+ *
+ * Carries `handler_ref` + `handler_set_version` (ADR-0039 §4) and NEVER a URL:
+ * the superseded `MhConnectionStatus.mh_url` is left empty.
  *
  * `failureReason`/`failureCode` are SDK-AUTHORED bounded classifications (never a
- * raw transport-error message), present only when `state === 'failed'` (R-23).
- * `mhUrl`/`failureReason`/`failureCode` are capped ≤256 UTF-8 bytes by SignalingClient.
+ * raw transport-error message), present only when `state === 'failed'` (R-23);
+ * capped ≤256 UTF-8 bytes by SignalingClient. DIAGNOSTIC ONLY on MC.
  */
 export interface MhConnectionStatusReport {
-  /** The MH URL this status pertains to (server-designated). */
-  readonly mhUrl: string;
-  /** Terminal per-MH outcome. */
-  readonly state: 'connected' | 'failed';
+  /** The ref this transition pertains to. */
+  readonly handlerRef: HandlerRef;
+  /** The version of the set the client held when it happened (uint64; echoed as is). */
+  readonly handlerSetVersion: bigint;
+  /** The new state. */
+  readonly state: 'connected' | 'failed' | 'disconnected';
   /** Bounded SDK failure reason (static string); set only when `state === 'failed'`. */
   readonly failureReason?: string;
   /** Bounded SDK failure code (enum-as-string); set only when `state === 'failed'`. */
   readonly failureCode?: string;
-  /** Epoch ms the outcome was observed (injectable clock for deterministic tests). */
+  /** Epoch ms the transition was observed (injectable clock for deterministic tests). */
   readonly observedAtMs: number;
 }

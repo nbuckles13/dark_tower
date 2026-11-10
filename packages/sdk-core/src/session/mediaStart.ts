@@ -30,6 +30,7 @@ import type { MediaKindToken } from '../media/mediaKind.js';
 import { TransmitKeyManager, rotateOnKekChange } from '../media/lifecycle/transmitKeys.js';
 import { VideoPublisher } from '../media/lifecycle/VideoPublisher.js';
 import type { MediaTransport } from '../media/MediaTransport.js';
+import type { HandlerRef } from '../media/handlerSet.js';
 import type { ReceiveVerificationRecorder } from '../media/pipeline/receiveVerification.js';
 import type { MeetingIdentity } from '../media/setup/identity.js';
 import type { MediaMetrics } from '../media/setup/mediaMetrics.js';
@@ -177,8 +178,8 @@ export function buildSessionMedia(deps: SessionMediaDeps): SessionMedia {
     identity: deps.identity,
     // Receive side only: the audio ids of the ONE declaration.
     declaredSlotIds: declaredSlotIds(deps.declaration, 'audio'),
-    senderFor: (url) => media?.getDatagramChannel(url),
-    readableFor: (url) => media?.getDatagramChannel(url)?.readable,
+    senderFor: (ref) => media?.getDatagramChannel(ref),
+    readableFor: (ref) => media?.getDatagramChannel(ref)?.readable,
     mute: deps.mute,
     reportMute: deps.reportMute,
     captureFactory: capture.factory,
@@ -213,7 +214,7 @@ export function buildSessionMedia(deps: SessionMediaDeps): SessionMedia {
       onMuteChanged: deps.emit.muteChanged,
       captureFactory: videoCapture.factory,
       encoderFactory: seams.videoEncoderFactory,
-      openStream: (url) => media?.openUniStream(url),
+      openStream: (ref) => media?.openUniStream(ref),
       fault: deps.emit.mediaFault,
       onCameraHealthChanged: (failure) => deps.emit.cameraHealthChanged({ failure }),
       clock: deps.clock,
@@ -234,9 +235,9 @@ export function buildSessionMedia(deps: SessionMediaDeps): SessionMedia {
       selfSenderId: deps.senderId,
       videoMuteState: (senderId) => deps.mediaState.videoMuteState(senderId),
       declaredSlotIds: videoSlotIds,
-      incomingStreamsFor: (url) => media?.incomingUniStreamsFor(url),
-      sendRecoveryRequest: (url, request) =>
-        media ? media.sendRecoveryRequest(url, request) : Promise.reject(new Error('no media')),
+      incomingStreamsFor: (ref) => media?.incomingUniStreamsFor(ref),
+      sendRecoveryRequest: (ref, request) =>
+        media ? media.sendRecoveryRequest(ref, request) : Promise.reject(new Error('no media')),
       decoderFactory: seams.videoDecoderFactory,
       metricExportIntervalMs: getMetricExportIntervalMs(),
       fault: deps.emit.mediaFault,
@@ -267,10 +268,28 @@ export function buildSessionMedia(deps: SessionMediaDeps): SessionMedia {
       }
       unsubscribe?.();
       unsubscribe = undefined;
+      offRemoved?.();
+      offConnected?.();
       transmitKeys.clear();
     })();
     return released;
   };
+
+  // ADR-0039 §4: the ONE per-ref fan-out of a removal (`MediaTransport.#removeRef`
+  // emits `handlerRemoved` BEFORE it closes the transport, so every consumer
+  // stops quietly first), and the re-read of a ref that (re)connected. A set
+  // change never rebuilds this media or the transmit-key manager.
+  const forgetHandler = (ref: HandlerRef): void => {
+    pipeline.forgetHandler(ref);
+    video?.forgetHandler(ref);
+    videoReceiver?.forgetHandler(ref);
+  };
+  const handlerConnected = ({ ref }: { readonly ref: HandlerRef }): void => {
+    pipeline.handlerConnected(ref);
+    videoReceiver?.handlerConnected(ref);
+  };
+  const offRemoved = media?.on('handlerRemoved', forgetHandler);
+  const offConnected = media?.on('connected', handlerConnected);
 
   // The remaining absence-signals (§5/§10), forwarded verbatim (see
   // `session/events.ts`) — subscribed before `start()`, so nothing the pipeline

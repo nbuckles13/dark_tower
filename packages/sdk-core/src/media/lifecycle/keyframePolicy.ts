@@ -51,6 +51,7 @@ import {
   type MediaKeyframeSource,
   type MediaKindMetrics,
 } from '../setup/mediaMetrics.js';
+import type { HandlerRef } from '../handlerSet.js';
 
 /** Why a self-key is owed: a target with no group in progress. */
 export type SelfKeyCause =
@@ -58,7 +59,7 @@ export type SelfKeyCause =
 
 /** One reason the held deferral exists. */
 type DeferredCause =
-  | { readonly kind: 'request'; readonly url: string; readonly gop: number }
+  | { readonly kind: 'request'; readonly ref: HandlerRef; readonly gop: number }
   | { readonly kind: 'self'; readonly source: SelfKeyCause };
 
 interface Deferral {
@@ -86,7 +87,7 @@ export interface KeyframeGateOptions {
 /** See the module header. */
 export class KeyframeGate {
   readonly #o: KeyframeGateOptions;
-  #targets: ReadonlySet<string> = new Set();
+  #targets: ReadonlySet<HandlerRef> = new Set();
   #muted = false;
   #effectiveIntervalMs = KEYFRAME_MIN_INTERVAL_FLOOR_MS;
   #lastKeyAt: number | undefined;
@@ -125,7 +126,7 @@ export class KeyframeGate {
    * Apply a validated directive's video targets and directed minimum interval.
    * A target-set change re-checks the held deferral; an empty set discards it.
    */
-  setDirective(targets: readonly string[], directedMinIntervalMs: number): void {
+  setDirective(targets: readonly HandlerRef[], directedMinIntervalMs: number): void {
     if (directedMinIntervalMs < KEYFRAME_MIN_INTERVAL_FLOOR_MS) {
       this.#o.metrics.keyframeMinIntervalClamped();
       if (!this.#clampWarned) {
@@ -142,14 +143,14 @@ export class KeyframeGate {
       Math.max(directedMinIntervalMs, KEYFRAME_MIN_INTERVAL_FLOOR_MS),
       KEYFRAME_MIN_INTERVAL_CEILING_MS,
     );
-    this.#targets = new Set(targets.filter((url) => url !== ''));
+    this.#targets = new Set(targets);
     if (this.#targets.size === 0) {
       this.#discardDeferral();
       return;
     }
     const held = this.#deferral;
     if (held) {
-      held.causes = held.causes.filter((c) => c.kind !== 'request' || this.#targets.has(c.url));
+      held.causes = held.causes.filter((c) => c.kind !== 'request' || this.#targets.has(c.ref));
       if (held.causes.length === 0) this.#discardDeferral();
     }
   }
@@ -165,9 +166,9 @@ export class KeyframeGate {
     this.#lastKeyAt = this.#o.clock();
   }
 
-  /** An MH `KeyframeRequest` for THIS stream, read on handler `url`'s connection. */
-  request(url: string, gopCounter: number): MediaKeyframePerKindOutcome {
-    const outcome = this.#classifyRequest(url, gopCounter);
+  /** An MH `KeyframeRequest` for THIS stream, read on handler `ref`'s connection. */
+  request(ref: HandlerRef, gopCounter: number): MediaKeyframePerKindOutcome {
+    const outcome = this.#classifyRequest(ref, gopCounter);
     this.#o.metrics.keyframeRequestReceived(outcome);
     return outcome;
   }
@@ -193,19 +194,19 @@ export class KeyframeGate {
     this.#discardDeferral();
   }
 
-  #classifyRequest(url: string, gop: number): MediaKeyframePerKindOutcome {
-    if (this.#closed || !this.#sending() || !this.#targets.has(url)) {
+  #classifyRequest(ref: HandlerRef, gop: number): MediaKeyframePerKindOutcome {
+    if (this.#closed || !this.#sending() || !this.#targets.has(ref)) {
       return MEDIA_KEYFRAME_REQUEST_OUTCOMES.NotSending;
     }
     const current = this.#o.currentGop();
     if (current !== undefined && gop < current) return MEDIA_KEYFRAME_REQUEST_OUTCOMES.StaleCounter;
     const ahead = current === undefined || gop > current;
     if (this.#deferral) {
-      this.#merge({ kind: 'request', url, gop });
+      this.#merge({ kind: 'request', ref, gop });
       return MEDIA_KEYFRAME_REQUEST_OUTCOMES.MinInterval;
     }
     if (this.#tooSoon()) {
-      this.#defer({ kind: 'request', url, gop });
+      this.#defer({ kind: 'request', ref, gop });
       return MEDIA_KEYFRAME_REQUEST_OUTCOMES.MinInterval;
     }
     this.#produce(MEDIA_KEYFRAME_SOURCES.Request);
@@ -236,7 +237,7 @@ export class KeyframeGate {
 
   /**
    * Merge a cause into the held deferral, BOUNDED whatever the input rate
-   * (requests are untrusted): at most one request member per handler url
+   * (requests are untrusted): at most one request member per handler ref
    * (holding the highest counter — the one most likely to survive the
    * `>= current` re-check) and one self member per source. Creator and
    * counting semantics are unchanged.
@@ -246,7 +247,7 @@ export class KeyframeGate {
     if (!held) return;
     const same = held.causes.findIndex((c) =>
       c.kind === 'request' && cause.kind === 'request'
-        ? c.url === cause.url
+        ? c.ref === cause.ref
         : c.kind === 'self' && cause.kind === 'self' && c.source === cause.source,
     );
     if (same < 0) {
@@ -292,7 +293,7 @@ export class KeyframeGate {
     const awaiting = this.#o.targetsAwaitingGroup();
     const survives = (c: DeferredCause): boolean =>
       c.kind === 'request'
-        ? this.#targets.has(c.url) && (current === undefined || c.gop >= current)
+        ? this.#targets.has(c.ref) && (current === undefined || c.gop >= current)
         : awaiting > 0;
     const creator = deferral.causes[0];
     const survivor =

@@ -102,7 +102,7 @@ function sameAssignment(
     a.slotId === b.slotId &&
     a.mediaKind === b.mediaKind &&
     a.senderId === b.senderId &&
-    a.mediaHandlerUrl === b.mediaHandlerUrl &&
+    a.handlerRef === b.handlerRef &&
     a.slotState === b.slotState
   );
 }

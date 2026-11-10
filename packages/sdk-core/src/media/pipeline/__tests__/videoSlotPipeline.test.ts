@@ -26,11 +26,12 @@ import {
   vp8Delta,
   vp8Key,
 } from './videoFixtures.js';
+import { handlerRef } from '../../handlerSet.js';
 
 const A = 101;
 const B = 202;
 const SELF = 7;
-const URL = 'https://mh-0.example';
+const URL = handlerRef(1);
 const SLOT = 3;
 
 let registry: FakeVideoFrameRegistry;
@@ -139,7 +140,7 @@ function frame(
     gopCounter: gop,
     isKeyframe: key,
     data: key ? vp8Key() : vp8Delta(),
-    url: URL,
+    ref: URL,
     ...extra,
   };
 }
@@ -468,7 +469,7 @@ describe('fault isolation (R-6)', () => {
     expect(first.closed).toBe(true);
     expect(h.faults).toHaveLength(1);
     expect(h.losses).toEqual([
-      { url: URL, slotId: SLOT, senderId: A, gopCounter: 1, reason: 'decoder_error' },
+      { ref: URL, slotId: SLOT, senderId: A, gopCounter: 1, reason: 'decoder_error' },
     ]);
     // A keyframe INSIDE the backoff does not recreate.
     h.clock.advance(999);
@@ -546,7 +547,7 @@ describe('recovery requests (R-13)', () => {
     h.slot.loss(A, 4, 'verify_failed', URL);
     h.slot.loss(A, 4, 'decrypt_failed', URL);
     expect(h.losses).toEqual([
-      { url: URL, slotId: SLOT, senderId: A, gopCounter: 4, reason: 'verify_failed' },
+      { ref: URL, slotId: SLOT, senderId: A, gopCounter: 4, reason: 'verify_failed' },
     ]);
     h.stop();
   });
@@ -581,7 +582,7 @@ describe('recovery requests (R-13)', () => {
     h.slot.push(frame(A, 1, false)); // overflow
     h.slot.push(frame(A, 1, false)); // awaiting keyframe: discarded, no second request
     expect(h.losses).toEqual([
-      { url: URL, slotId: SLOT, senderId: A, gopCounter: 1, reason: 'local_drop' },
+      { ref: URL, slotId: SLOT, senderId: A, gopCounter: 1, reason: 'local_drop' },
     ]);
     dec.queueSizeOverride = undefined;
     h.slot.push(frame(A, 2, true));
@@ -606,7 +607,7 @@ describe('recovery requests (R-13)', () => {
     dec.queueSizeOverride = undefined;
     h.slot.push(frame(A, 1, false)); // awaiting after the expiry
     expect(h.losses).toEqual([
-      { url: URL, slotId: SLOT, senderId: A, gopCounter: 1, reason: 'local_drop' },
+      { ref: URL, slotId: SLOT, senderId: A, gopCounter: 1, reason: 'local_drop' },
     ]);
     // The expired frame was never fed late, and nothing after it was either.
     expect(dec.decoded).toHaveLength(2);
@@ -657,7 +658,7 @@ describe('server_mute_lifted repair (observability O2, security conditions)', ()
     h.slot.serverMuteLifted(A);
     h.slot.serverMuteLifted(A); // repeated edge: nothing
     expect(h.losses).toEqual([
-      { url: URL, slotId: SLOT, senderId: A, gopCounter: 6, reason: 'server_mute_lifted' },
+      { ref: URL, slotId: SLOT, senderId: A, gopCounter: 6, reason: 'server_mute_lifted' },
     ]);
     h.stop();
   });
