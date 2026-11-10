@@ -544,6 +544,107 @@ pub async fn live_mh_addresses_by_pod() -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The NetworkPolicy that must govern every pool pod (security S1).
+pub const MH_POLICY: &str = "mh-service";
+
+/// R-28 on the live cluster: every live MH pod's client-facing address is
+/// UNIQUE and is ITS SLOT's. THE one live gather for [`check_address_invariant`]
+/// (hoisted from `tests/42_mh_address_invariant.rs`, its first caller; every
+/// resilience leg calls it after the leg, so the invariant is re-proved across
+/// drain / crash restart / freeze). It reads:
+///
+/// - every non-terminating `app=mh-service` pod (kubectl), after the pool has
+///   settled (every MH pod Ready, none Terminating) — a steady-state claim;
+/// - the pool, `mh.sh list --json` (enumeration only, never the evidence);
+/// - the slot ConfigMaps, by label (kubectl, not mh.sh);
+/// - each pod's current-container log, for the address the PROCESS advertises;
+/// - `networkpolicy/mh-service`'s podSelector.
+///
+/// Returns `(pods checked, slot ConfigMaps)` for the caller's PASS line.
+///
+/// # Panics
+/// PRECONDITION on an unreadable input or a vacuous pool (baseline 0, fewer
+/// pods than the baseline, an unserving pod); `R28 <token>:` violations from
+/// [`check_address_invariant`]; and if any pod skipped a per-pod check.
+pub async fn assert_addresses_unique() -> (usize, usize) {
+    use crate::fixtures::kube::{
+        container_log, kubectl_get_json, settled_serving_pods, MH_POD_SETTLE, MH_SELECTOR,
+    };
+    // Settle first, then read the pool: the invariant is a steady-state claim.
+    let (doc, serving) =
+        settled_serving_pods(MH_SELECTOR, MH_POD_SETTLE.timeout(), "mh-pods-unserving").await;
+    let pool = tokio::task::spawn_blocking(crate::fixtures::mh_pool::list)
+        .await
+        .expect("mh.sh list task");
+
+    let pods: Vec<Value> = doc
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    // Positive controls: a pool exists, and at least the baseline is running.
+    assert!(
+        pool.baseline >= 1,
+        "PRECONDITION: mh.sh list reports baseline {} — nothing would be checked",
+        pool.baseline
+    );
+    assert!(
+        pods.len() >= pool.baseline as usize && serving.len() == pods.len(),
+        "PRECONDITION: {} MH pod(s) ({} serving) for baseline {}: deploy.sh tops the pool up \
+         to the baseline; inspect `$DT_MH_SH list`",
+        pods.len(),
+        serving.len(),
+        pool.baseline
+    );
+
+    let cms = slot_configmaps(
+        &kubectl_get_json(&["configmaps", "-n", crate::NAMESPACE, "-l", SLOT_LABEL])
+            .unwrap_or_else(|e| panic!("PRECONDITION: {e}")),
+    )
+    .unwrap_or_else(|e| panic!("PRECONDITION (slot-configmaps): {e}"));
+    let policy_labels = policy_match_labels(
+        &kubectl_get_json(&["networkpolicy", MH_POLICY, "-n", crate::NAMESPACE])
+            .unwrap_or_else(|e| panic!("PRECONDITION: {e}")),
+    )
+    .unwrap_or_else(|e| panic!("PRECONDITION (policy-selector): {e}"));
+
+    let observed: Vec<ObservedPod> = pods
+        .into_iter()
+        .map(|pod| {
+            let name = pod
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .expect("settled pods are named")
+                .to_string();
+            let log = container_log(&name, MH_CONTAINER)
+                .unwrap_or_else(|e| panic!("PRECONDITION (mh-log): {e}"));
+            let logged_address =
+                advertised_in_log(&log).unwrap_or_else(|e| panic!("R28 {e} (pod {name})"));
+            ObservedPod {
+                pod,
+                logged_address,
+            }
+        })
+        .collect();
+
+    let (violations, checked) = check_address_invariant(&pool, &observed, &cms, &policy_labels);
+    assert!(
+        violations.is_empty(),
+        "R-28 address invariant violated ({} slot ConfigMaps, {} MH pods):\n  {}",
+        cms.len(),
+        observed.len(),
+        violations.join("\n  ")
+    );
+    // Positive control: every pod went through every per-pod check.
+    assert_eq!(
+        checked,
+        observed.len(),
+        "only {checked} of {} MH pods were fully checked",
+        observed.len()
+    );
+    (observed.len(), cms.len())
+}
+
 /// The pod names serving the handler urls in `set` (a participant's
 /// `JoinResponse.media_handler_set`): per-entity evidence of which MHs hold
 /// that participant's meeting, never "all MH pods".
@@ -841,7 +942,7 @@ mod tests {
     /// every line was found.
     #[test]
     fn shared_names_match_mh_sh_readonly_constants() {
-        let text = include_str!("../../../../infra/kind/scripts/mh.sh");
+        let text = crate::fixtures::mh_pool::committed_mh_sh_source();
         for (var, ours) in [
             ("MH_WT_PORT_NAME", WT_PORT_NAME),
             ("MH_ADDRESS_KEY", ADDRESS_KEY),

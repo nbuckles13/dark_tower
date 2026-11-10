@@ -542,14 +542,23 @@ pub async fn mc_join_with(
         "{label}: MC JoinResponse carried no sender_id — the join did not really happen \
          (positive control: a wholesale-empty setup must not read as a pass)"
     );
+    // The handler set, never the legacy `media_servers` (P3 deletes it). Only
+    // counts and indices are printed: entries carry dial tokens.
+    let handlers = join
+        .media_handler_set
+        .as_ref()
+        .map(|s| s.handlers.as_slice())
+        .unwrap_or_default();
     assert!(
-        !join.media_servers.is_empty(),
-        "{label}: MC JoinResponse carried no media_servers — no handler was assigned"
+        !handlers.is_empty(),
+        "{label}: MC JoinResponse carried an empty media_handler_set — no handler was assigned \
+         (or none acked RegisterMeeting before the join was released)"
     );
-    for (idx, server) in join.media_servers.iter().enumerate() {
+    for (idx, server) in handlers.iter().enumerate() {
         assert!(
             !server.media_handler_url.is_empty(),
-            "{label}: MC JoinResponse media_servers[{idx}] has an empty media_handler_url"
+            "{label}: MC JoinResponse media_handler_set.handlers[{idx}] has an empty \
+             media_handler_url"
         );
     }
     join

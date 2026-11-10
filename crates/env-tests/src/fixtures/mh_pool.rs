@@ -1,10 +1,11 @@
 //! The MH pool as `infra/kind/scripts/mh.sh list --json` reports it (ADR-0039
 //! §7; machine contract
 //! `docs/debates/2026-10-28-mh-replacement-and-migration/mh-sh-contract.txt`
-//! §4). Story 4 I-2 landed the READ half ([`list`]). GC-2 adds the minimal
-//! mutation surface ([`RunOwner::up`], owner-scoped [`RunOwner::teardown`]).
-//! T-1 extends this module with `MhSlot::drain()` / `assert_baseline()`
-//! (contract §8).
+//! §4). Story 4 I-2 landed the READ half ([`list`]); GC-2 the first mutations;
+//! T-1 the full fixture of contract §8: [`MhPool`] (`snapshot`, `up`,
+//! `assert_baseline`, owner teardown), [`MhSlot`] (`drain`, `drain_no_wait`,
+//! `kill`, `freeze`) and [`FreezeGuard`], over ONE mh.sh runner with the BUSY
+//! retry and a strict `MH_RESULT` parse.
 //!
 //! # The mh.sh path has ONE home
 //!
@@ -155,13 +156,7 @@ pub fn mh_sh_path_from(value: Option<PathBuf>) -> Result<PathBuf, String> {
 pub fn list() -> PoolSnapshot {
     // The ONE mh.sh reader: the strict MH_RESULT + stdout-`ok` agreement of
     // [`parse_mh_sh_result`] applies to `list` exactly as to `up`/`drain`.
-    let result = run_mh_sh(&["list"]);
-    assert!(
-        result.is_ok(),
-        "PRECONDITION (mh-sh-list): `mh.sh list --json` failed: {result}"
-    );
-    parse_list_value(&result.json)
-        .unwrap_or_else(|e| panic!("PRECONDITION (mh-sh-list): {e} ({result})"))
+    snapshot_at(&mh_sh_path())
 }
 
 /// PURE: parse a `list --json` stdout document.
@@ -305,10 +300,18 @@ pub fn template_as_pod(dep: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Mutations: `up` and owner-scoped teardown (contract §5, §6, §8(b)).
+// Mutations (contract §3, §5, §6, §8): the ONE Rust home for driving the pool.
 //
-// Story 4 GC-2 lands the minimal surface its env-test needs. T-1 extends it
-// here (`MhSlot::drain()`, `assert_baseline()`); it is not copied elsewhere.
+// `MhPool` is the run-scoped handle (owner = the Layer 7 per-run token),
+// `MhSlot` one run-owned MH, `FreezeGuard` a SIGSTOPped one. Every pub fn that
+// changes the pool or an MH process carries the doc marker "Pool-mutating."; the
+// `#[serial]` hygiene scan (`crate::resilience_hygiene`) derives its API set from
+// that marker, so a new mutating verb cannot escape serialization.
+//
+// The kill / freeze / resume RECIPE (debug container, uid, pid lookup, never
+// PID 1, shareProcessNamespace preflight, liveness budget) lives in ONE place,
+// `mh.sh signal` (contract §5 amendment). This module keeps only the outcome
+// assertions. Its TypeScript twin is `packages/web-app/e2e/mhPool.ts`.
 // ---------------------------------------------------------------------------
 
 /// The REASON every `STATUS=OK` carries (contract §3, I-5 amendment).
@@ -322,24 +325,93 @@ pub const REASON_NO_FREE_SLOT: &str = "mh-no-free-slot";
 /// (contract §6).
 pub const REASON_BUSY: &str = "mh-pool-busy";
 
-/// Failure-only ceiling for retrying [`REASON_BUSY`]. The Lease covers only a
-/// decision plus one create/delete call (contract §6, "seconds"), so a holder
-/// beyond this is a stuck or foreign run, and the test fails loudly.
-pub const BUSY_RETRY_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
-const BUSY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// mh.sh's token table, `token -> exit code` (contract §3). Pinned in BOTH
+/// directions, codes included, against mh.sh's `MH_TOKENS` array (its one
+/// home) by `mh_tokens_match_mh_sh_both_directions`. A REASON outside this
+/// table, or an exit code outside its token's group, is a contract break.
+pub const MH_TOKENS: &[(&str, i32)] = &[
+    ("ok", 0),
+    ("mh-rollout-failed", 1),
+    ("drain-timeout", 1),
+    ("not-available-timeout", 1),
+    ("kubectl-failed", 1),
+    ("internal-error", 1),
+    ("signal-failed", 1),
+    ("debug-container-timeout", 1),
+    ("usage", 2),
+    ("no-kubeconfig", 2),
+    ("no-template", 2),
+    ("prerequisite-missing", 2),
+    ("mh-no-share-process-namespace", 2),
+    ("mh-no-free-slot", 3),
+    ("last-serving-mh", 4),
+    ("stuck-terminating", 4),
+    ("foreign-owner", 4),
+    ("mh-not-serving", 4),
+    ("mh-pool-busy", 5),
+];
 
-/// One mh.sh invocation's machine result: the final `MH_RESULT` line (contract
-/// §2) and the `--json` stdout object.
+/// The exit code mh.sh pairs with `token`, if it is a known token.
+#[must_use]
+pub fn token_exit_code(token: &str) -> Option<i32> {
+    MH_TOKENS
+        .iter()
+        .find(|(t, _)| *t == token)
+        .map(|(_, code)| *code)
+}
+
+// Fixture-side failure tokens (NOT mh.sh's; each has this one home, and
+// `packages/web-app/tests/mhPool.test.ts` pins its TS copies to these lines).
+/// A foreign owner or a non-baseline pool (contract §7).
+pub const FOREIGN_MH_ACTIVITY: &str = "foreign-mh-activity";
+/// Something is still owned by this run after teardown.
+pub const MH_RUN_LEAK: &str = "mh-run-leak";
+/// A freeze outlived the liveness-probe budget: kubelet may have restarted
+/// the MH, so the leg would observe a restart, not a zombie.
+pub const FREEZE_BUDGET_EXCEEDED: &str = "freeze-budget-exceeded";
+/// A freeze/resume cycle changed restart_count or pod_uid (a kubelet restart
+/// or a different incarnation passed off as a zombie).
+pub const RESTART_COUNT_CHANGED: &str = "restart-count-changed";
+/// A KILL never produced an in-place restart (restart_count + 1, same pod_uid).
+pub const RESTART_NOT_OBSERVED: &str = "restart-not-observed";
+/// Prometheus never scraped the MH (`up == 1` by pod IP).
+pub const MH_SCRAPE_UP_TIMEOUT: &str = "mh-scrape-up-timeout";
+/// Every fixture-side token, for the Rust disjointness check against
+/// [`MH_TOKENS`] (the TS drift pin reads the individual consts above).
+pub const FIXTURE_TOKENS: &[&str] = &[
+    FOREIGN_MH_ACTIVITY,
+    MH_RUN_LEAK,
+    FREEZE_BUDGET_EXCEEDED,
+    RESTART_COUNT_CHANGED,
+    RESTART_NOT_OBSERVED,
+    MH_SCRAPE_UP_TIMEOUT,
+];
+
+/// Failure-only ceiling for retrying [`REASON_BUSY`]. The Lease covers only a
+/// decision plus one create/delete call (contract §6, "seconds"); a crashed
+/// holder's Lease is reclaimable after `MH_LEASE_S` + `MH_LEASE_FUTURE_SKEW_S`.
+/// This bound must outlast that plus one interval (pinned against mh.sh by
+/// `busy_bound_outlasts_a_crashed_holders_lease`), so exhaustion means a LIVE
+/// concurrent mutator, never a stale Lease.
+pub const BUSY_RETRY_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+/// Sleep between BUSY attempts.
+pub const BUSY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One mh.sh invocation's machine result: the `MH_RESULT` line (contract §2),
+/// the exit code, and the `--json` stdout object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MhShResult {
     /// The `STATUS=` field: `OK` or `FAIL`.
     pub status: String,
-    /// The `REASON=` token.
+    /// The `REASON=` token (a [`MH_TOKENS`] member).
     pub reason: String,
     /// The `SLOT=` field, if any.
     pub slot: Option<u32>,
-    /// The `DETAIL=` field, if any (always last; may contain spaces).
+    /// The `DETAIL=` field, if any (always last; may contain spaces). mh.sh
+    /// builds it from validated fields only (contract §2 amendment).
     pub detail: Option<String>,
+    /// The process exit code.
+    pub exit_code: i32,
     /// The stdout JSON object (`{"ok": ...}` on every path with `--json`).
     pub json: Value,
 }
@@ -353,7 +425,11 @@ impl MhShResult {
 
 impl std::fmt::Display for MhShResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "STATUS={} REASON={}", self.status, self.reason)?;
+        write!(
+            f,
+            "STATUS={} REASON={} EXIT={}",
+            self.status, self.reason, self.exit_code
+        )?;
         if let Some(s) = self.slot {
             write!(f, " SLOT={s}")?;
         }
@@ -364,21 +440,43 @@ impl std::fmt::Display for MhShResult {
     }
 }
 
-/// PURE: parse mh.sh's stderr and `--json` stdout into an [`MhShResult`].
+/// PURE: parse one mh.sh run (stderr, `--json` stdout, exit code) into an
+/// [`MhShResult`]. The rejection cases, by name (the TS twin in
+/// `packages/web-app/e2e/mhPool.ts` carries the SAME names):
+///
+/// - `one-line`: exactly ONE `MH_RESULT` line, and it is the last non-empty
+///   stderr line (contract §2);
+/// - `fields`: STATUS is OK|FAIL, REASON non-empty, SLOT a number;
+/// - `known-token`: REASON is in [`MH_TOKENS`];
+/// - `exit-group`: the exit code is the token's group (contract §3);
+/// - `ok-reason`: STATUS=OK iff REASON=ok;
+/// - `json-ok-agrees`: stdout is one JSON object whose `ok` equals STATUS=OK.
 ///
 /// # Errors
-/// No final `MH_RESULT` line; a malformed STATUS/REASON/SLOT; stdout not one
-/// JSON object; or the stdout `ok` disagreeing with STATUS (two channels of
-/// one verdict must agree, or neither is trusted).
-pub fn parse_mh_sh_result(stderr: &str, stdout: &str) -> Result<MhShResult, String> {
+/// The failed case's name and the reason. Never raw stdout/stderr beyond the
+/// `MH_RESULT` line itself.
+pub fn parse_mh_sh_result(
+    stderr: &str,
+    stdout: &str,
+    exit_code: Option<i32>,
+) -> Result<MhShResult, String> {
+    let result_lines = stderr
+        .lines()
+        .filter(|l| l.starts_with("MH_RESULT "))
+        .count();
+    if result_lines > 1 {
+        return Err(format!(
+            "one-line: mh.sh printed {result_lines} MH_RESULT lines (contract §2: exactly one)"
+        ));
+    }
     let line = stderr
         .lines()
         .rev()
         .find(|l| !l.trim().is_empty())
-        .ok_or("mh.sh printed nothing on stderr (no MH_RESULT line)")?;
+        .ok_or("one-line: mh.sh printed nothing on stderr (no MH_RESULT line)")?;
     let rest = line
         .strip_prefix("MH_RESULT ")
-        .ok_or_else(|| format!("mh.sh's last stderr line is not MH_RESULT: {line:?}"))?;
+        .ok_or("one-line: mh.sh's last stderr line is not its MH_RESULT line")?;
     // DETAIL is last and runs to end of line, so split it off first.
     let (fields, detail) = match rest.split_once(" DETAIL=") {
         Some((f, d)) => (f, Some(d.to_string())),
@@ -392,26 +490,37 @@ pub fn parse_mh_sh_result(stderr: &str, stdout: &str) -> Result<MhShResult, Stri
             Some(("STATUS", v)) if v == "OK" || v == "FAIL" => status = Some(v.to_string()),
             Some(("REASON", v)) if !v.is_empty() => reason = Some(v.to_string()),
             Some(("SLOT", v)) => {
-                slot = Some(
-                    v.parse::<u32>()
-                        .map_err(|_| format!("MH_RESULT SLOT={v:?} is not a slot number"))?,
-                );
+                slot =
+                    Some(v.parse::<u32>().map_err(|_| {
+                        format!("fields: MH_RESULT SLOT={v:?} is not a slot number")
+                    })?);
             }
-            _ => {
-                return Err(format!(
-                    "MH_RESULT has a malformed field {field:?}: {line:?}"
-                ))
-            }
+            _ => return Err(format!("fields: MH_RESULT has a malformed field {field:?}")),
         }
     }
-    let status = status.ok_or_else(|| format!("MH_RESULT has no valid STATUS: {line:?}"))?;
-    let reason = reason.ok_or_else(|| format!("MH_RESULT has no REASON: {line:?}"))?;
-    let json: Value = serde_json::from_str(stdout.trim())
-        .map_err(|e| format!("mh.sh --json stdout is not one JSON object ({e}); {line}"))?;
+    let status = status.ok_or("fields: MH_RESULT has no valid STATUS")?;
+    let reason = reason.ok_or("fields: MH_RESULT has no REASON")?;
+    let group = token_exit_code(&reason).ok_or_else(|| {
+        format!("known-token: REASON={reason} is not in mh.sh's token table (MH_TOKENS)")
+    })?;
+    let exit_code = exit_code.ok_or("exit-group: mh.sh was killed by a signal (no exit code)")?;
+    if exit_code != group {
+        return Err(format!(
+            "exit-group: REASON={reason} belongs to exit {group}, mh.sh exited {exit_code}"
+        ));
+    }
+    if (status == "OK") != (reason == REASON_OK) {
+        return Err(format!(
+            "ok-reason: STATUS={status} with REASON={reason} (OK iff REASON=ok)"
+        ));
+    }
+    let json: Value = serde_json::from_str(stdout.trim()).map_err(|e| {
+        format!("json-ok-agrees: mh.sh --json stdout is not one JSON object ({e}); {line}")
+    })?;
     let ok = json.get("ok").and_then(Value::as_bool);
     if ok != Some(status == "OK") {
         return Err(format!(
-            "mh.sh's stdout ok={ok:?} disagrees with its MH_RESULT STATUS={status}"
+            "json-ok-agrees: mh.sh's stdout ok={ok:?} disagrees with its MH_RESULT STATUS={status}"
         ));
     }
     Ok(MhShResult {
@@ -419,79 +528,501 @@ pub fn parse_mh_sh_result(stderr: &str, stdout: &str) -> Result<MhShResult, Stri
         reason,
         slot,
         detail,
+        exit_code,
         json,
     })
 }
 
-/// Run mh.sh with `args` (`--json` appended), retrying [`REASON_BUSY`] within
-/// [`BUSY_RETRY_BOUND`]. Blocking: call it from `spawn_blocking`.
+/// One raw mh.sh run, before parsing (the runner seam).
+#[derive(Clone, Debug)]
+pub struct RawRun {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// PURE (given its seams): run `runner` until it is not [`REASON_BUSY`],
+/// sleeping `interval` between attempts, for at most `bound` of sleeping
+/// (attempts = bound / interval + 1). Count-based, so the sleeping total is
+/// never less than `bound` whatever each run costs.
 ///
-/// # Panics
-/// PRECONDITION: mh.sh cannot be spawned, or its output breaks the machine
-/// contract ([`parse_mh_sh_result`]). A contract-conforming FAIL is returned,
-/// not panicked, so the caller can name its own reason token.
-#[must_use]
-pub fn run_mh_sh(args: &[&str]) -> MhShResult {
-    let path = mh_sh_path();
-    let deadline = std::time::Instant::now() + BUSY_RETRY_BOUND;
-    loop {
-        let out = Command::new(&path)
-            .args(args)
-            .arg("--json")
-            .output()
-            .unwrap_or_else(|e| {
-                panic!(
-                    "PRECONDITION (mh-sh-run): cannot run {}: {e}",
-                    path.display()
-                )
-            });
-        let result = parse_mh_sh_result(
-            &String::from_utf8_lossy(&out.stderr),
-            &String::from_utf8_lossy(&out.stdout),
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "PRECONDITION (mh-sh-contract): `{} {}` (exit {}): {e}",
-                path.display(),
-                args.join(" "),
-                out.status
-            )
-        });
-        if result.reason != REASON_BUSY || std::time::Instant::now() > deadline {
-            return result;
+/// Only BUSY is retried; every other result (OK or a contract-conforming
+/// FAIL) is returned on the attempt that produced it.
+///
+/// # Errors
+/// A contract break ([`parse_mh_sh_result`]), or BUSY exhaustion naming the
+/// attempts, the holder (`DETAIL=holder=<owner>`) and the Lease TTL relation.
+pub fn run_with_busy_retry(
+    what: &str,
+    mut runner: impl FnMut() -> RawRun,
+    bound: std::time::Duration,
+    interval: std::time::Duration,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<MhShResult, String> {
+    let attempts = bound.as_millis() / interval.as_millis().max(1) + 1;
+    for attempt in 1..=attempts {
+        let raw = runner();
+        let result = parse_mh_sh_result(&raw.stderr, &raw.stdout, raw.exit_code)
+            .map_err(|e| format!("PRECONDITION (mh-sh-contract): `mh.sh {what}`: {e}"))?;
+        if result.reason != REASON_BUSY {
+            return Ok(result);
         }
-        std::thread::sleep(BUSY_RETRY_INTERVAL);
+        if attempt == attempts {
+            return Err(format!(
+                "BUSY ({REASON_BUSY}): `mh.sh {what}` still busy after {attempts} attempts over \
+                 {bound:?} (> a crashed holder's lease MH_LEASE_S + MH_LEASE_FUTURE_SKEW_S): \
+                 {} is renewing, so this is a LIVE concurrent mutator, not a stale Lease. \
+                 Layer 7 assumes one suite per cluster; inspect `$DT_MH_SH list`",
+                result.detail.as_deref().unwrap_or("holder=<unknown>")
+            ));
+        }
+        sleep(interval);
+    }
+    unreachable!("the loop returns on its last attempt")
+}
+
+/// Run `path args --json` once.
+fn raw_run(path: &std::path::Path, cluster: Option<&str>, args: &[&str]) -> RawRun {
+    let mut cmd = Command::new(path);
+    // The validated cluster goes INTO the child, so the cluster mh.sh mutates
+    // is by construction the one every printed command names.
+    if let Some(c) = cluster {
+        cmd.env(DT_CLUSTER_NAME_ENV, c);
+    }
+    let out = cmd.args(args).arg("--json").output().unwrap_or_else(|e| {
+        panic!(
+            "PRECONDITION (mh-sh-run): cannot run {}: {e}",
+            path.display()
+        )
+    });
+    RawRun {
+        exit_code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
 }
 
-/// The per-run MH owner (contract §6: the `dark-tower.io/mh-owner` label =
-/// "the Layer 7 per-run token for fixtures"). Every MH this run creates carries
-/// it, so teardown is owner-scoped (`drain --owner <token> --all`) and needs no
-/// slot number from any output. This matters because `up`'s
-/// not-available-timeout leaves its pod in place.
+/// Run mh.sh at `path` with `args` (`--json` appended), retrying BUSY within
+/// [`BUSY_RETRY_BOUND`]. Blocking: call it from `spawn_blocking`.
 ///
-/// [`RunOwner::teardown`] is the explicit, asserted cleanup. `Drop` is only a
-/// backstop that PRINTS the reclaim command (contract §8(b)); it never cleans
-/// up silently.
-pub struct RunOwner {
+/// # Panics
+/// PRECONDITION: mh.sh cannot be spawned, or breaks the machine contract; or
+/// BUSY exhausted. A contract-conforming FAIL is RETURNED, so the caller can
+/// name its own reason.
+#[must_use]
+pub fn run_mh_sh_at(path: &std::path::Path, args: &[&str]) -> MhShResult {
+    run_mh_sh_in(path, None, args)
+}
+
+/// [`run_mh_sh_at`] with `DT_CLUSTER_NAME` set to `cluster` in the child (every
+/// pool-handle call: the cluster mutated is the cluster printed).
+///
+/// # Panics
+/// As [`run_mh_sh_at`].
+#[must_use]
+pub fn run_mh_sh_in(path: &std::path::Path, cluster: Option<&str>, args: &[&str]) -> MhShResult {
+    run_with_busy_retry(
+        &args.join(" "),
+        || raw_run(path, cluster, args),
+        BUSY_RETRY_BOUND,
+        BUSY_RETRY_INTERVAL,
+        std::thread::sleep,
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`run_mh_sh_at`] with the path from [`DT_MH_SH_ENV`].
+///
+/// # Panics
+/// As [`run_mh_sh_at`], or PRECONDITION when the variable is unset.
+#[must_use]
+pub fn run_mh_sh(args: &[&str]) -> MhShResult {
+    run_mh_sh_at(&mh_sh_path(), args)
+}
+
+/// The committed mh.sh, repo-relative: the ONE home of the contract
+/// constants the hermetic pins read (`MH_TOKENS`, `MH_JQ_PUBLIC`,
+/// `MH_SCHEMA_VERSION`, the Lease constants, `MH_DEBUG_IMAGE`). Distinct from
+/// [`DT_MH_SH_ENV`], the RUNNABLE seam Layer 7 exports.
+pub const MH_SH_REPO_PATH: &str = "infra/kind/scripts/mh.sh";
+
+/// The committed mh.sh source ([`MH_SH_REPO_PATH`]).
+///
+/// # Panics
+/// The file is unreadable.
+#[must_use]
+pub fn committed_mh_sh_source() -> String {
+    let path = crate::repo_root().join(MH_SH_REPO_PATH);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("PRECONDITION: read {}: {e}", path.display()))
+}
+
+/// The argv of owner teardown: the ONE spelling, both executed
+/// ([`MhPool::teardown`]) and printed ([`reclaim_command`]).
+#[must_use]
+pub fn teardown_args(owner: &str) -> Vec<String> {
+    ["drain", "--all", "--owner", owner]
+        .map(str::to_string)
+        .to_vec()
+}
+
+/// The argv of `mh.sh signal`: the ONE spelling, executed by
+/// [`MhSlot::freeze`] / [`MhSlot::kill`] / [`FreezeGuard::resume`] and the
+/// Drop backstop, and printed by [`signal_command`].
+#[must_use]
+pub fn signal_args(slot: u32, signal: Signal, owner: &str) -> Vec<String> {
+    vec![
+        "signal".to_string(),
+        slot.to_string(),
+        signal.as_str().to_string(),
+        "--owner".to_string(),
+        owner.to_string(),
+    ]
+}
+
+fn as_strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+/// PURE: the paste-ready command line for `args` (mh.sh selects its cluster
+/// from `DT_CLUSTER_NAME`, so it is part of the line).
+fn command_line(path: &std::path::Path, cluster: &str, args: &[String]) -> String {
+    format!(
+        "DT_CLUSTER_NAME={cluster} {} {}",
+        path.display(),
+        args.join(" ")
+    )
+}
+
+/// PURE: the ONE manual reclaim command (teardown errors, the Drop backstop,
+/// the foreign-activity hint): byte-for-byte the teardown the fixture runs.
+#[must_use]
+pub fn reclaim_command(path: &std::path::Path, cluster: &str, owner: &str) -> String {
+    command_line(path, cluster, &teardown_args(owner))
+}
+
+/// PURE: the manual `mh.sh signal` command for `slot`.
+#[must_use]
+pub fn signal_command(
+    path: &std::path::Path,
+    cluster: &str,
+    slot: u32,
+    signal: Signal,
+    owner: &str,
+) -> String {
+    command_line(path, cluster, &signal_args(slot, signal, owner))
+}
+
+/// PURE core of the `DT_CLUSTER_NAME` read: mh.sh would otherwise fall back to
+/// its default cluster and mutate a pool the fixture's kubectl/Prometheus
+/// reads never see.
+///
+/// # Errors
+/// Unset or empty.
+pub fn dt_cluster_name_from(value: Option<String>) -> Result<String, String> {
+    value.filter(|c| !c.trim().is_empty()).ok_or_else(|| {
+        format!(
+            "{DT_CLUSTER_NAME_ENV} is unset or empty; scripts/layer7.sh exports it (the devloop \
+             cluster mh.sh targets as kind-<name>). Outside Layer 7 set it yourself; there is no \
+             default, because mh.sh's own default could be another cluster"
+        )
+    })
+}
+
+/// The env var mh.sh selects its cluster from (`kind-<name>`).
+pub const DT_CLUSTER_NAME_ENV: &str = "DT_CLUSTER_NAME";
+
+/// The signals `mh.sh signal` accepts (a closed set; mh.sh validates it again).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    Kill,
+    Stop,
+    Cont,
+}
+
+impl Signal {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Signal::Kill => "KILL",
+            Signal::Stop => "STOP",
+            Signal::Cont => "CONT",
+        }
+    }
+}
+
+/// `process_state` after KILL: the process is gone (restart evidence comes
+/// from restart_count and pod_uid, never from a state letter).
+pub const PROCESS_GONE: &str = "gone";
+/// `process_state` of a SIGSTOPped process (`/proc/<pid>/stat`).
+pub const PROCESS_STOPPED: &str = "T";
+
+/// `mh.sh signal --json`'s OK object (contract §5 amendment).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalOutcome {
+    pub entry: SlotEntry,
+    pub process_state: String,
+    /// STOP only: `(failureThreshold - 1) x periodSeconds + timeoutSeconds` of
+    /// the LIVE pod's mh-service livenessProbe, derived by mh.sh.
+    pub liveness_budget: Option<std::time::Duration>,
+    /// KILL only: mh.sh's own derived `up` bound (probe window + margin), the
+    /// failure-only ceiling for the in-place restart to serve again.
+    pub restart_budget: Option<std::time::Duration>,
+}
+
+/// PURE: validate `mh.sh signal`'s OK object for `signal`.
+///
+/// # Errors
+/// Not a slot entry; no `process_state`; a state that contradicts the signal
+/// (KILL -> `gone`; STOP -> `T`; CONT -> neither); STOP without a positive
+/// `liveness_budget_seconds`; KILL without a positive `restart_budget_seconds`.
+pub fn parse_signal(json: &Value, signal: Signal) -> Result<SignalOutcome, String> {
+    let entry: SlotEntry = serde_json::from_value(json.clone())
+        .map_err(|e| format!("mh.sh signal's OK object is not a slot entry: {e}"))?;
+    let process_state = json
+        .get("process_state")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("mh.sh signal's OK object has no process_state")?
+        .to_string();
+    let consistent = match signal {
+        Signal::Kill => process_state == PROCESS_GONE,
+        Signal::Stop => process_state == PROCESS_STOPPED,
+        Signal::Cont => process_state != PROCESS_STOPPED && process_state != PROCESS_GONE,
+    };
+    if !consistent {
+        return Err(format!(
+            "mh.sh signal {} reported OK with process_state={process_state}",
+            signal.as_str()
+        ));
+    }
+    let seconds = |key: &str| -> Result<Option<std::time::Duration>, String> {
+        match json.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_u64()
+                .filter(|s| *s > 0)
+                .map(|s| Some(std::time::Duration::from_secs(s)))
+                .ok_or_else(|| format!("{key} is not a positive integer")),
+        }
+    };
+    let liveness_budget = seconds("liveness_budget_seconds")?;
+    let restart_budget = seconds("restart_budget_seconds")?;
+    if signal == Signal::Stop && liveness_budget.is_none() {
+        return Err("mh.sh signal STOP reported no liveness_budget_seconds".to_string());
+    }
+    if signal == Signal::Kill && restart_budget.is_none() {
+        return Err("mh.sh signal KILL reported no restart_budget_seconds".to_string());
+    }
+    Ok(SignalOutcome {
+        entry,
+        process_state,
+        liveness_budget,
+        restart_budget,
+    })
+}
+
+/// PURE: the freeze-budget verdict. `elapsed` runs from BEFORE the STOP call
+/// to AFTER the CONT call returned: the process is stopped somewhere inside
+/// the first call and resumed somewhere inside the second, so this bounds the
+/// real frozen time from above (never under-counts). The caller checks it
+/// before the incarnation check, so an overrun reports as this, not as the
+/// kubelet restart it caused.
+///
+/// # Errors
+/// [`FREEZE_BUDGET_EXCEEDED`] when `elapsed >= budget`.
+pub fn freeze_overrun(
+    elapsed: std::time::Duration,
+    budget: std::time::Duration,
+) -> Result<(), String> {
+    if elapsed >= budget {
+        return Err(format!(
+            "{FREEZE_BUDGET_EXCEEDED}: the MH was frozen for {elapsed:?}, at or past the live \
+             liveness-probe budget {budget:?} ((failureThreshold-1) x periodSeconds + \
+             timeoutSeconds): kubelet may already have restarted it, so a zombie leg would \
+             observe a restart. Resume sooner (CONT right after MC declares the handler dead)"
+        ));
+    }
+    Ok(())
+}
+
+/// PURE: `after` is the same incarnation as `before` with an unchanged
+/// restart count (a freeze/resume never restarts the container).
+///
+/// # Errors
+/// [`RESTART_COUNT_CHANGED`], naming both.
+pub fn assert_same_incarnation(before: &SlotEntry, after: &SlotEntry) -> Result<(), String> {
+    if before.pod_uid != after.pod_uid || before.restart_count != after.restart_count {
+        return Err(format!(
+            "{RESTART_COUNT_CHANGED}: slot {} went pod_uid {:?} restart_count {:?} -> pod_uid {:?} \
+             restart_count {:?} across freeze/resume: a kubelet restart or another incarnation, \
+             not a zombie",
+            before.slot, before.pod_uid, before.restart_count, after.pod_uid, after.restart_count
+        ));
+    }
+    Ok(())
+}
+
+/// PURE: `after` is `before` restarted IN PLACE (same pod_uid,
+/// restart_count + 1) and serving again.
+#[must_use]
+pub fn restarted_in_place(before: &SlotEntry, after: &SlotEntry) -> bool {
+    after.pod_uid == before.pod_uid
+        && after.pod_uid.is_some()
+        && before.restart_count.map(|c| c + 1) == after.restart_count
+        && after.state == SlotState::Serving
+}
+
+/// PURE: the baseline predicate (contract §7, §8(c)). Every occupied slot's
+/// owner is `baseline` or `run`, and the baseline-owned SERVING count is B
+/// (`snapshot.baseline`, never a constant). `stale` still counts: an
+/// upgrade-pending MH still serves. A baseline MH that is starting, draining
+/// or terminating does not count.
+///
+/// # Errors
+/// [`FOREIGN_MH_ACTIVITY`], naming each foreign owner and slot, B vs observed,
+/// and how to reclaim.
+pub fn baseline_verdict(
+    snapshot: &PoolSnapshot,
+    run: &str,
+    reclaim: impl Fn(&str) -> String,
+) -> Result<(), String> {
+    let mut problems = Vec::new();
+    let mut foreign_owners = std::collections::BTreeSet::new();
+    for s in snapshot.occupied() {
+        match s.owner.as_deref() {
+            Some(BASELINE_OWNER) => {}
+            Some(o) if o == run => {}
+            other => {
+                problems.push(format!(
+                    "slot {} ({:?}) owned by {other:?}",
+                    s.slot, s.state
+                ));
+                if let Some(o) = other {
+                    foreign_owners.insert(o.to_string());
+                }
+            }
+        }
+    }
+    let serving = snapshot
+        .slots
+        .iter()
+        .filter(|s| s.state == SlotState::Serving && s.owner.as_deref() == Some(BASELINE_OWNER))
+        .count();
+    if serving != snapshot.baseline as usize {
+        problems.push(format!(
+            "baseline-owned serving MHs: {serving}, B = {} (mh.sh list `baseline`)",
+            snapshot.baseline
+        ));
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    let hints: Vec<String> = foreign_owners.iter().map(|o| reclaim(o)).collect();
+    Err(format!(
+        "{FOREIGN_MH_ACTIVITY}: the MH pool is not {{baseline B, this run {run}}}: {}. Layer 7 \
+         supports one suite per cluster; a concurrent run, a leaked earlier run or a manual MH \
+         is mutating the pool. Inspect `$DT_MH_SH list`{}",
+        problems.join("; "),
+        if hints.is_empty() {
+            String::new()
+        } else {
+            format!("; reclaim a leaked run with: {}", hints.join(" ; "))
+        }
+    ))
+}
+
+/// The owner deploy.sh labels its MHs with (contract §6).
+pub const BASELINE_OWNER: &str = "baseline";
+
+/// PURE: nothing is left owned by `run` and nothing is stuck past its grace.
+///
+/// # Errors
+/// [`MH_RUN_LEAK`], naming the slots.
+pub fn run_leak_verdict(snapshot: &PoolSnapshot, run: &str) -> Result<(), String> {
+    let leaked: Vec<String> = snapshot
+        .occupied()
+        .into_iter()
+        .filter(|s| s.owner.as_deref() == Some(run) || s.terminating_past_grace)
+        .map(|s| format!("slot {} ({:?}, owner {:?})", s.slot, s.state, s.owner))
+        .collect();
+    if leaked.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{MH_RUN_LEAK}: after teardown the pool still holds {}",
+            leaked.join(", ")
+        ))
+    }
+}
+
+/// PURE: the ONE slot whose `address` is `url`. Exact match, because the two
+/// are byte-identical by construction: the set url is MC's projection of the
+/// WebTransport endpoint MH registered with GC, which is MH's
+/// `MH_WEBTRANSPORT_ADVERTISE_ADDRESS` from its slot ConfigMap (R-28,
+/// `mh_address::check_address_invariant`, proves the process advertises
+/// exactly that value), and mh.sh copies `address` from the same ConfigMap.
+///
+/// # Errors
+/// No slot, or more than one, has that address.
+pub fn slot_for_address<'a>(
+    snapshot: &'a PoolSnapshot,
+    url: &str,
+) -> Result<&'a SlotEntry, String> {
+    let hits: Vec<&SlotEntry> = snapshot.slots.iter().filter(|s| s.address == url).collect();
+    match hits.as_slice() {
+        [one] => Ok(one),
+        [] => Err(format!("no mh.sh slot has address {url}")),
+        many => Err(format!(
+            "{} mh.sh slots share address {url} (slots {:?}): R-28 violated",
+            many.len(),
+            many.iter().map(|s| s.slot).collect::<Vec<_>>()
+        )),
+    }
+}
+
+/// The run-scoped MH pool handle (contract §6, §8): every MH this run creates
+/// carries `dark-tower.io/mh-owner=<run token>`, so teardown is owner-scoped
+/// (`drain --owner <token> --all`) and needs no slot numbers. That matters
+/// because `up`'s not-available-timeout leaves its pod in place.
+///
+/// The mh.sh path, cluster and owner are resolved ONCE here, so neither
+/// [`MhPool::teardown`] nor the `Drop` backstop can panic on a missing env
+/// var. `Drop` only PRINTS the reclaim command (contract §8(b)); it never
+/// cleans up silently, and never panics (a panic in Drop during unwind aborts
+/// the process and loses the message).
+pub struct MhPool {
+    mh_sh: PathBuf,
+    cluster: String,
     token: String,
     torn_down: bool,
 }
 
-impl RunOwner {
-    /// The run's owner: the per-run org subdomain
+impl MhPool {
+    /// The run's pool handle. The owner is the per-run org subdomain
     /// (`auth_client::org_subdomain`, `ENV_TEST_ORG_SUBDOMAIN`, exported by
-    /// `scripts/layer7.sh`). It is already validated against the subdomain rule,
-    /// which `validate-subdomain-regex-sync.sh` keeps byte-identical to mh.sh's
-    /// `MH_OWNER_RE`. There is no second, hand-rolled owner predicate here.
+    /// `scripts/layer7.sh`), already validated against the subdomain rule that
+    /// `validate-subdomain-regex-sync.sh` keeps byte-identical to mh.sh's
+    /// `MH_OWNER_RE`. There is no second owner predicate here.
     ///
     /// # Panics
-    /// PRECONDITION: the variable is unset or invalid (no default, same as AC).
+    /// PRECONDITION: `DT_MH_SH`, `DT_CLUSTER_NAME` or the owner variable is
+    /// unset or invalid.
     #[must_use]
     pub fn for_run() -> Self {
         let token = crate::fixtures::auth_client::org_subdomain()
             .unwrap_or_else(|e| panic!("PRECONDITION (run-owner): {e}"));
+        let cluster = dt_cluster_name_from(std::env::var(DT_CLUSTER_NAME_ENV).ok())
+            .unwrap_or_else(|e| panic!("PRECONDITION (cluster-unset): {e}"));
+        Self::with(mh_sh_path(), cluster, token)
+    }
+
+    /// A handle with explicit parts (hermetic tests).
+    #[must_use]
+    pub fn with(mh_sh: PathBuf, cluster: String, token: String) -> Self {
         Self {
+            mh_sh,
+            cluster,
             token,
             torn_down: false,
         }
@@ -502,87 +1033,582 @@ impl RunOwner {
         &self.token
     }
 
-    /// The manual reclaim command, printed on every teardown failure and by
-    /// the Drop backstop.
+    /// The manual reclaim command ([`reclaim_command`]).
     #[must_use]
     pub fn reclaim_command(&self) -> String {
-        format!(
-            "{} drain --all --owner {}",
-            mh_sh_path().display(),
-            self.token
-        )
+        reclaim_command(&self.mh_sh, &self.cluster, &self.token)
     }
 
-    /// `mh.sh up --owner <token>`: the next-fit slot, returned once the MH is
-    /// Available (= MH `/ready` = RegisterMH accepted, contract §5). Blocking.
-    /// The bound is mh.sh's own derived one; no test-side timeout is added.
+    /// `mh.sh list --json`, parsed ([`parse_list_value`]). Blocking.
+    ///
+    /// # Panics
+    /// PRECONDITION: mh.sh fails or prints a document the reader refuses.
+    #[must_use]
+    pub fn snapshot(&self) -> PoolSnapshot {
+        snapshot_at(&self.mh_sh)
+    }
+
+    /// Pool-mutating. `mh.sh up --owner <token>`: the next-fit slot, returned
+    /// once the MH is Available (= MH `/ready` = RegisterMH accepted, contract
+    /// §5). Blocking. The bound is mh.sh's own derived one.
     ///
     /// # Errors
     /// The contract-conforming FAIL result, for the caller to classify.
-    pub fn up(&self) -> Result<SlotEntry, MhShResult> {
-        let result = run_mh_sh(&["up", "--owner", &self.token]);
-        if !result.is_ok() {
-            return Err(result);
-        }
-        let entry: SlotEntry = serde_json::from_value(result.json.clone()).unwrap_or_else(|e| {
-            panic!("PRECONDITION (mh-sh-contract): up's OK object is not a slot entry: {e}")
-        });
-        assert_eq!(
-            entry.owner.as_deref(),
-            Some(self.token.as_str()),
-            "PRECONDITION (mh-sh-contract): up returned a slot not owned by this run"
-        );
-        Ok(entry)
+    pub fn up(&self) -> Result<MhSlot, MhShResult> {
+        up_with(&self.mh_sh, &self.cluster, &self.token)
     }
 
-    /// `mh.sh drain --all --owner <token>`: the explicit run teardown. Blocking.
+    /// Pool-mutating. [`MhPool::up`] (in `spawn_blocking`), panicking on any
+    /// FAIL with its REASON, then [`MhSlot::wait_scraped`].
+    ///
+    /// # Panics
+    /// `up` failed (`mh-no-free-slot` as a PRECONDITION), or the scrape wait.
+    pub async fn up_scraped(&self, prom: &crate::fixtures::metrics::PrometheusClient) -> MhSlot {
+        let (path, cluster, token) = (self.mh_sh.clone(), self.cluster.clone(), self.token.clone());
+        let slot = tokio::task::spawn_blocking(move || up_with(&path, &cluster, &token))
+            .await
+            .expect("up task")
+            .unwrap_or_else(|r| {
+                let lane = if r.reason == REASON_NO_FREE_SLOT {
+                    "PRECONDITION"
+                } else {
+                    "FAIL"
+                };
+                panic!(
+                    "{lane} (mh-up): `mh.sh up --owner {}` failed: {r}. Reclaim with: {}",
+                    self.token,
+                    self.reclaim_command()
+                )
+            });
+        slot.wait_scraped(prom).await;
+        slot
+    }
+
+    /// Pool-mutating. `mh.sh drain --all --owner <token>`: the explicit,
+    /// asserted run teardown (exit 0 + STATUS=OK), then [`run_leak_verdict`]
+    /// on a fresh `list` (nothing left owned by this run, nothing stuck past
+    /// its grace). Blocking. The handle stays usable (for the after-leg
+    /// [`MhPool::assert_baseline`]); Drop no longer prints.
     ///
     /// # Errors
-    /// A non-OK result. The message names the REASON and the reclaim command.
-    pub fn teardown(mut self) -> Result<(), String> {
+    /// A non-OK drain or a leak, naming the REASON and the reclaim command.
+    pub fn teardown(&mut self) -> Result<(), String> {
         self.torn_down = true;
-        let result = run_mh_sh(&["drain", "--all", "--owner", &self.token]);
-        if result.is_ok() {
-            Ok(())
-        } else {
-            Err(format!(
-                "TEARDOWN (mh-teardown-failed): owner {} not drained: {result}. Reclaim manually: \
-                 {}",
-                self.token,
-                self.reclaim_command()
-            ))
-        }
+        teardown_at(&self.mh_sh, &self.cluster, &self.token)
     }
-}
 
-impl RunOwner {
-    /// [`RunOwner::teardown`], then, only if it drained,
+    /// Pool-mutating. [`MhPool::teardown`] (in `spawn_blocking`), then, only
+    /// if it drained,
     /// [`gc_fleet::wait_removed_mh_unselectable`](crate::fixtures::gc_fleet::wait_removed_mh_unselectable):
     /// the run's removed MHs are no longer selectable by any GC replica before
-    /// this returns. Every leg that removes an MH ends with this (44 now,
-    /// T-1's legs next), so a later suite is never handed a dead handler.
+    /// this returns, so a later suite is never handed a dead handler.
     ///
     /// # Errors
     /// The teardown's error, or the settle wait's (`removed-mh-still-selectable`).
     pub async fn teardown_and_settle(
-        self,
+        &mut self,
         prom: &crate::fixtures::metrics::PrometheusClient,
     ) -> Result<(), String> {
-        tokio::task::spawn_blocking(move || self.teardown())
+        self.torn_down = true;
+        let (path, cluster, token) = (self.mh_sh.clone(), self.cluster.clone(), self.token.clone());
+        tokio::task::spawn_blocking(move || teardown_at(&path, &cluster, &token))
             .await
             .map_err(|e| format!("TEARDOWN (mh-teardown-failed): teardown task: {e}"))??;
         crate::fixtures::gc_fleet::wait_removed_mh_unselectable(prom).await
     }
+
+    /// Pool-mutating. THE leg scaffold (40's legs, 44): a run-owned pool with
+    /// [`MhPool::assert_baseline`] before, `body` in its own task (so its
+    /// panic is caught), then on EVERY exit path the asserted owner teardown +
+    /// GC settle ([`MhPool::teardown_and_settle`]), then the baseline again.
+    /// `body` gets the pool and the Prometheus base url. The body's panic is
+    /// re-raised unchanged after teardown; a teardown failure alongside it is
+    /// printed first.
+    ///
+    /// # Panics
+    /// The body's panic; the teardown's error; a baseline violation.
+    pub async fn run_leg<F, Fut>(body: F)
+    where
+        F: FnOnce(std::sync::Arc<MhPool>, String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let cluster = crate::cluster::ClusterConnection::new()
+            .await
+            .expect("Failed to connect to cluster - ensure port-forwards are running");
+        let prom_url = cluster.prometheus_base_url.clone();
+        let prom = crate::fixtures::metrics::PrometheusClient::new(&prom_url);
+        let pool = std::sync::Arc::new(MhPool::for_run());
+        pool.assert_baseline(&prom).await;
+
+        let outcome = tokio::spawn(body(std::sync::Arc::clone(&pool), prom_url)).await;
+
+        let mut pool = std::sync::Arc::try_unwrap(pool)
+            .unwrap_or_else(|_| panic!("the leg still holds the MhPool after it finished"));
+        let teardown = pool.teardown_and_settle(&prom).await;
+        match (outcome, teardown) {
+            (Ok(()), Ok(())) => {}
+            (Ok(()), Err(t)) => panic!("{t}"),
+            (Err(e), t) => {
+                if let Err(t) = t {
+                    eprintln!("ALSO: {t}");
+                }
+                if e.is_panic() {
+                    std::panic::resume_unwind(e.into_panic());
+                }
+                panic!("leg task did not complete: {e}");
+            }
+        }
+        pool.assert_baseline(&prom).await;
+    }
+
+    /// [`baseline_verdict`] as an eventual poll, before AND after every
+    /// destructive leg. The ceiling is GC's removal-settle budget
+    /// ([`gc_fleet::removal_settle_budget`](crate::fixtures::gc_fleet::removal_settle_budget):
+    /// the live staleness bound + health ticks + scrape), because a pool that
+    /// just changed takes that long to look settled end to end; a single read
+    /// flakes.
+    ///
+    /// # Panics
+    /// [`FOREIGN_MH_ACTIVITY`] at the ceiling, with the last verdict.
+    pub async fn assert_baseline(&self, prom: &crate::fixtures::metrics::PrometheusClient) {
+        let ceiling = crate::fixtures::gc_fleet::removal_settle_budget(prom)
+            .await
+            .unwrap_or_else(|e| panic!("PRECONDITION (baseline-ceiling): {e}"));
+        let path = self.mh_sh.clone();
+        let cluster = self.cluster.clone();
+        let run = self.token.clone();
+        let verdict = crate::eventual::poll_within(ceiling, move || {
+            let (path, cluster, run) = (path.clone(), cluster.clone(), run.clone());
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let snap = snapshot_at(&path);
+                    baseline_verdict(&snap, &run, |o| reclaim_command(&path, &cluster, o))
+                })
+                .await
+                .expect("baseline task")
+            }
+        })
+        .await;
+        if let Err(e) = verdict {
+            panic!("{e} (polled for {ceiling:?})");
+        }
+    }
+
+    /// PURE (writer seam): the Drop backstop's notice.
+    pub fn drop_notice(&self, w: &mut dyn std::io::Write) {
+        let _ = writeln!(
+            w,
+            "MhPool {} dropped without teardown; reclaim its MHs with: {}",
+            self.token,
+            self.reclaim_command()
+        );
+    }
 }
 
-impl Drop for RunOwner {
+impl Drop for MhPool {
     fn drop(&mut self) {
         if !self.torn_down {
-            eprintln!(
-                "RunOwner {} dropped without teardown; reclaim its MHs with: {}",
-                self.token,
-                self.reclaim_command()
-            );
+            self.drop_notice(&mut std::io::stderr());
+        }
+    }
+}
+
+/// Owner teardown at `path` ([`MhPool::teardown`]). Blocking.
+fn teardown_at(path: &std::path::Path, cluster: &str, token: &str) -> Result<(), String> {
+    let reclaim = reclaim_command(path, cluster, token);
+    let result = run_mh_sh_in(path, Some(cluster), &as_strs(&teardown_args(token)));
+    if !result.is_ok() {
+        return Err(format!(
+            "TEARDOWN (mh-teardown-failed): owner {token} not drained: {result}. Reclaim \
+             manually: {reclaim}"
+        ));
+    }
+    run_leak_verdict(&snapshot_at(path), token)
+        .map_err(|e| format!("TEARDOWN ({e}). Reclaim manually: {reclaim}"))
+}
+
+/// `mh.sh list --json` at `path`. Blocking.
+fn snapshot_at(path: &std::path::Path) -> PoolSnapshot {
+    let result = run_mh_sh_at(path, &["list"]);
+    assert!(
+        result.is_ok(),
+        "PRECONDITION (mh-sh-list): `mh.sh list --json` failed: {result}"
+    );
+    parse_list_value(&result.json)
+        .unwrap_or_else(|e| panic!("PRECONDITION (mh-sh-list): {e} ({result})"))
+}
+
+/// `mh.sh up --owner <token>` at `path` ([`MhPool::up`]). Blocking.
+fn up_with(path: &std::path::Path, cluster: &str, token: &str) -> Result<MhSlot, MhShResult> {
+    let result = run_mh_sh_in(path, Some(cluster), &["up", "--owner", token]);
+    if !result.is_ok() {
+        return Err(result);
+    }
+    let entry: SlotEntry = serde_json::from_value(result.json.clone()).unwrap_or_else(|e| {
+        panic!("PRECONDITION (mh-sh-contract): up's OK object is not a slot entry: {e}")
+    });
+    assert_eq!(
+        entry.owner.as_deref(),
+        Some(token),
+        "PRECONDITION (mh-sh-contract): up returned a slot not owned by this run"
+    );
+    Ok(MhSlot::from_entry(path, cluster, token, entry))
+}
+
+/// One run-owned MH (`mh.sh up`'s answer). Carries what a leg needs: the
+/// slot, its incarnation (`pod_uid`, `restart_count`), its `pod_ip` (the
+/// Prometheus pin) and its client-facing `address`.
+#[derive(Clone, Debug)]
+pub struct MhSlot {
+    pub slot: u32,
+    pub deployment: String,
+    pub pod: String,
+    pub pod_uid: String,
+    pub pod_ip: String,
+    pub address: String,
+    pub restart_count: u32,
+    mh_sh: PathBuf,
+    cluster: String,
+    owner: String,
+}
+
+impl MhSlot {
+    fn from_entry(path: &std::path::Path, cluster: &str, owner: &str, e: SlotEntry) -> Self {
+        fn missing(slot: u32, key: &str) -> ! {
+            panic!(
+                "PRECONDITION (mh-sh-contract): up's slot {slot} entry has no {key} at Available"
+            )
+        }
+        let slot = e.slot;
+        Self {
+            slot,
+            deployment: e.deployment.unwrap_or_else(|| missing(slot, "deployment")),
+            pod: e.pod.unwrap_or_else(|| missing(slot, "pod")),
+            pod_uid: e.pod_uid.unwrap_or_else(|| missing(slot, "pod_uid")),
+            pod_ip: e.pod_ip.unwrap_or_else(|| missing(slot, "pod_ip")),
+            address: e.address,
+            restart_count: e
+                .restart_count
+                .unwrap_or_else(|| missing(slot, "restart_count")),
+            mh_sh: path.to_path_buf(),
+            cluster: cluster.to_string(),
+            owner: owner.to_string(),
+        }
+    }
+
+    /// This slot's current `list` entry. Blocking.
+    ///
+    /// # Panics
+    /// The slot is absent from `list`.
+    #[must_use]
+    pub fn entry(&self) -> SlotEntry {
+        snapshot_at(&self.mh_sh)
+            .slots
+            .into_iter()
+            .find(|s| s.slot == self.slot)
+            .unwrap_or_else(|| panic!("PRECONDITION (mh-sh-list): slot {} not listed", self.slot))
+    }
+
+    /// Wait until Prometheus scrapes this MH: `up{job="mh-service"} == 1`
+    /// pinned by POD IP (`instance_for_pod_ip`; the job sets no `pod` label).
+    /// Call it before taking ANY MH metric baseline, and again after
+    /// [`MhSlot::kill`] / [`FreezeGuard::resume`]: a restarted process starts
+    /// its counters at zero, and a frozen one fails its scrapes (`up` 0 while
+    /// frozen is expected, never asserted). The ceiling is two
+    /// [`service_job_scrape_settle`](crate::fixtures::metrics::service_job_scrape_settle)s
+    /// of the live scrape config (a failure-only bound).
+    ///
+    /// # Panics
+    /// [`MH_SCRAPE_UP_TIMEOUT`] at the ceiling.
+    pub async fn wait_scraped(&self, prom: &crate::fixtures::metrics::PrometheusClient) {
+        let ceiling = 2 * crate::fixtures::metrics::service_job_scrape_settle(prom).await;
+        crate::fixtures::metrics::poll_until_pinned_instance(
+            prom,
+            MH_UP_PROMQL,
+            &self.pod_ip,
+            ceiling,
+            std::time::Duration::from_secs(1),
+            MH_SCRAPE_UP_TIMEOUT,
+            "== 1",
+            |v| (v - 1.0).abs() < f64::EPSILON,
+        )
+        .await;
+    }
+
+    fn drain_with(self, no_wait: bool) {
+        let slot = self.slot.to_string();
+        let mut args = vec!["drain", slot.as_str(), "--owner", self.owner.as_str()];
+        if no_wait {
+            args.push("--no-wait");
+        }
+        let result = run_mh_sh_in(&self.mh_sh, Some(&self.cluster), &args);
+        assert!(
+            result.is_ok(),
+            "FAIL (mh-drain): `mh.sh {}` failed: {result}. Reclaim with: {}",
+            args.join(" "),
+            reclaim_command(&self.mh_sh, &self.cluster, &self.owner)
+        );
+    }
+
+    /// Pool-mutating. `mh.sh drain <k> --owner <run>`: returns once the pod
+    /// and Deployment are gone; asserted. Success is mh.sh's verdict alone,
+    /// never the exiting MH's metrics (read drain outcomes from MC). Blocking.
+    ///
+    /// # Panics
+    /// A non-OK result, naming the REASON.
+    pub fn drain(self) {
+        self.drain_with(false);
+    }
+
+    /// Pool-mutating. `mh.sh drain <k> --owner <run> --no-wait`: returns once
+    /// SIGTERM is delivered, for mid-drain observation; asserted. Blocking.
+    ///
+    /// # Panics
+    /// A non-OK result, naming the REASON.
+    pub fn drain_no_wait(self) {
+        self.drain_with(true);
+    }
+
+    fn signal(&self, signal: Signal) -> SignalOutcome {
+        let args = signal_args(self.slot, signal, &self.owner);
+        let result = run_mh_sh_in(&self.mh_sh, Some(&self.cluster), &as_strs(&args));
+        assert!(
+            result.is_ok(),
+            "FAIL (mh-signal): `mh.sh {}` failed: {result}",
+            args.join(" ")
+        );
+        parse_signal(&result.json, signal)
+            .unwrap_or_else(|e| panic!("PRECONDITION (mh-sh-contract): {e}"))
+    }
+
+    /// Pool-mutating. SIGKILL the mh-service process (`mh.sh signal KILL`,
+    /// never a pod delete), then wait for the IN-PLACE restart: same pod_uid,
+    /// restart_count + 1, serving (ceiling: mh.sh's own derived `up` bound,
+    /// `restart_budget_seconds` on the KILL answer). Then
+    /// re-wait the scrape: the new process's counters start at zero, so
+    /// callers re-baseline any MH metric after this.
+    ///
+    /// # Panics
+    /// The signal failed, or [`RESTART_NOT_OBSERVED`] at the ceiling.
+    pub async fn kill(&mut self, prom: &crate::fixtures::metrics::PrometheusClient) {
+        let me = self.clone();
+        let (before, ceiling) = tokio::task::spawn_blocking(move || {
+            let before = me.entry();
+            let outcome = me.signal(Signal::Kill);
+            (
+                before,
+                outcome
+                    .restart_budget
+                    .expect("parse_signal requires a KILL restart budget"),
+            )
+        })
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+        let me = self.clone();
+        let after = crate::eventual::poll_within(ceiling, move || {
+            let (me, before) = (me.clone(), before.clone());
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let now = me.entry();
+                    if restarted_in_place(&before, &now) {
+                        Ok(now)
+                    } else {
+                        Err(format!(
+                            "{RESTART_NOT_OBSERVED}: slot {} after KILL: pod_uid {:?} -> {:?}, \
+                             restart_count {:?} -> {:?}, state {:?} (want same pod_uid, +1, \
+                             serving)",
+                            me.slot,
+                            before.pod_uid,
+                            now.pod_uid,
+                            before.restart_count,
+                            now.restart_count,
+                            now.state
+                        ))
+                    }
+                })
+                .await
+                .expect("kill poll task")
+            }
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{e} (polled for {ceiling:?})"));
+        self.refresh(&after);
+        self.wait_scraped(prom).await;
+    }
+
+    /// Pool-mutating. SIGSTOP the mh-service process (`mh.sh signal STOP`).
+    /// mh.sh polls `/proc/<pid>/stat` until the state is `T` (the freeze TOOK
+    /// EFFECT) and derives the budget from the live liveness probe. The
+    /// guard's clock starts BEFORE the call. A STOP call that fails (the
+    /// signal may already have landed) sends a best-effort CONT and prints the
+    /// resume command before re-raising, so nothing is left frozen without a
+    /// guard. A fresh post-STOP `list` must show the same incarnation.
+    /// Blocking.
+    ///
+    /// # Panics
+    /// The signal failed, or [`RESTART_COUNT_CHANGED`] after the STOP.
+    #[must_use]
+    pub fn freeze(&self) -> FreezeGuard {
+        let started = std::time::Instant::now();
+        let before = self.entry();
+        let outcome =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.signal(Signal::Stop)
+            })) {
+                Ok(o) => o,
+                Err(panic) => {
+                    best_effort_cont(self);
+                    eprintln!(
+                    "the STOP call for MH slot {} failed; sent a best-effort CONT. If it is still \
+                     stopped, resume it with: {}",
+                    self.slot,
+                    signal_command(&self.mh_sh, &self.cluster, self.slot, Signal::Cont, &self.owner)
+                );
+                    std::panic::resume_unwind(panic);
+                }
+            };
+        let stop_call = started.elapsed();
+        let mut guard = FreezeGuard {
+            slot: self.clone(),
+            before,
+            started,
+            stop_call,
+            budget: outcome
+                .liveness_budget
+                .expect("parse_signal requires a STOP budget"),
+            resumed: false,
+        };
+        let after_stop = guard.slot.entry();
+        if let Err(e) = assert_same_incarnation(&guard.before, &after_stop) {
+            guard.resume_best_effort();
+            panic!("{e}");
+        }
+        guard
+    }
+
+    /// Adopt `entry`'s incarnation fields (after a restart or a resume), so
+    /// callers read live state, never the `up`-time copy.
+    fn refresh(&mut self, entry: &SlotEntry) {
+        if let Some(uid) = &entry.pod_uid {
+            self.pod_uid.clone_from(uid);
+        }
+        if let Some(rc) = entry.restart_count {
+            self.restart_count = rc;
+        }
+    }
+}
+
+/// Send `mh.sh signal <k> CONT` without parsing or panicking (the backstops).
+fn best_effort_cont(slot: &MhSlot) {
+    let _ = Command::new(&slot.mh_sh)
+        .env(DT_CLUSTER_NAME_ENV, &slot.cluster)
+        .args(signal_args(slot.slot, Signal::Cont, &slot.owner))
+        .arg("--json")
+        .output();
+}
+
+/// `up` of the mh-service job, the scrape-liveness series.
+pub const MH_UP_PROMQL: &str = r#"up{job="mh-service"}"#;
+
+/// A SIGSTOPped run-owned MH. [`FreezeGuard::resume`] is the explicit,
+/// asserted end. Dropped while still frozen (a panicking leg), it sends a
+/// best-effort CONT and prints the exact resume command; it never panics.
+pub struct FreezeGuard {
+    slot: MhSlot,
+    before: SlotEntry,
+    started: std::time::Instant,
+    stop_call: std::time::Duration,
+    budget: std::time::Duration,
+    resumed: bool,
+}
+
+impl FreezeGuard {
+    /// The live liveness-probe budget this freeze must stay inside.
+    #[must_use]
+    pub fn budget(&self) -> std::time::Duration {
+        self.budget
+    }
+
+    /// Time since BEFORE the STOP call.
+    #[must_use]
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    /// How long the STOP call took: the best available estimate of the CONT
+    /// call's latency too (same mechanism), so a leg needs
+    /// `2 x stop_call < budget` to be able to resume in time at all.
+    #[must_use]
+    pub fn stop_call(&self) -> std::time::Duration {
+        self.stop_call
+    }
+
+    /// The manual resume command.
+    #[must_use]
+    pub fn resume_command(&self) -> String {
+        signal_command(
+            &self.slot.mh_sh,
+            &self.slot.cluster,
+            self.slot.slot,
+            Signal::Cont,
+            &self.slot.owner,
+        )
+    }
+
+    fn resume_best_effort(&mut self) {
+        self.resumed = true;
+        best_effort_cont(&self.slot);
+    }
+
+    /// Pool-mutating. SIGCONT (`mh.sh signal CONT`), sent unconditionally.
+    /// Only once it returned OK is the guard marked resumed: a failed CONT
+    /// panics with the guard still armed, so Drop retries and prints the
+    /// resume command. Then, in this order: the budget over the whole frozen
+    /// span ([`freeze_overrun`], so an overrun is reported as itself, not as
+    /// the kubelet restart it caused), the process left state `T`, and the
+    /// same incarnation (restart_count, pod_uid). Returns the slot refreshed
+    /// from the post-resume `list`, after re-waiting the scrape.
+    ///
+    /// # Panics
+    /// [`FREEZE_BUDGET_EXCEEDED`], [`RESTART_COUNT_CHANGED`], or the signal.
+    pub async fn resume(mut self, prom: &crate::fixtures::metrics::PrometheusClient) -> MhSlot {
+        let slot = self.slot.clone();
+        let after = tokio::task::spawn_blocking(move || {
+            slot.signal(Signal::Cont);
+            slot.entry()
+        })
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+        self.resumed = true;
+        if let Err(e) = freeze_overrun(self.elapsed(), self.budget) {
+            panic!("{e}");
+        }
+        if let Err(e) = assert_same_incarnation(&self.before, &after) {
+            panic!("{e}");
+        }
+        let mut slot = self.slot.clone();
+        slot.refresh(&after);
+        slot.wait_scraped(prom).await;
+        slot
+    }
+
+    /// PURE (writer seam): the Drop backstop's notice.
+    pub fn drop_notice(&self, w: &mut dyn std::io::Write) {
+        let _ = writeln!(
+            w,
+            "FreezeGuard for MH slot {} dropped while frozen; sent a best-effort CONT. If it is \
+             still stopped, resume it with: {}",
+            self.slot.slot,
+            self.resume_command()
+        );
+    }
+}
+
+impl Drop for FreezeGuard {
+    fn drop(&mut self) {
+        if !self.resumed {
+            self.resume_best_effort();
+            self.drop_notice(&mut std::io::stderr());
         }
     }
 }
@@ -592,11 +1618,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn mh_sh_text() -> String {
+        committed_mh_sh_source()
+    }
+
     #[test]
     fn mh_result_parses_ok_and_fail_with_detail_to_end_of_line() {
         let ok = parse_mh_sh_result(
             "human text\nMH_RESULT STATUS=OK REASON=ok SLOT=3 DETAIL=created timeout=90s\n",
             r#"{"ok":true,"slot":3}"#,
+            Some(0),
         )
         .unwrap();
         assert!(ok.is_ok());
@@ -607,6 +1638,7 @@ mod tests {
         let fail = parse_mh_sh_result(
             "MH_RESULT STATUS=FAIL REASON=not-available-timeout SLOT=2 DETAIL=timeout=90s; mh-s2 left in place\n",
             r#"{"ok":false,"reason":"not-available-timeout","slot":2,"detail":"x"}"#,
+            Some(1),
         )
         .unwrap();
         assert!(!fail.is_ok());
@@ -614,86 +1646,567 @@ mod tests {
         assert_eq!(fail.slot, Some(2));
         assert_eq!(
             fail.to_string(),
-            "STATUS=FAIL REASON=not-available-timeout SLOT=2 DETAIL=timeout=90s; mh-s2 left in place"
+            "STATUS=FAIL REASON=not-available-timeout EXIT=1 SLOT=2 DETAIL=timeout=90s; mh-s2 left in place"
         );
 
         let no_slot = parse_mh_sh_result(
             "MH_RESULT STATUS=FAIL REASON=mh-no-free-slot\n",
             r#"{"ok":false,"reason":"mh-no-free-slot","slot":null,"detail":null}"#,
+            Some(3),
         )
         .unwrap();
         assert_eq!(no_slot.slot, None);
         assert_eq!(no_slot.detail, None);
     }
 
+    /// Every named rejection case (the TS twin carries the same names).
     #[test]
     fn mh_result_refusals_are_each_named() {
-        assert!(parse_mh_sh_result("", "{}")
-            .unwrap_err()
-            .contains("nothing on stderr"));
-        assert!(parse_mh_sh_result("oops\n", "{}")
-            .unwrap_err()
-            .contains("not MH_RESULT"));
+        let err = |stderr: &str, stdout: &str, code: Option<i32>| {
+            parse_mh_sh_result(stderr, stdout, code).unwrap_err()
+        };
+        assert!(err("", "{}", Some(0)).starts_with("one-line: mh.sh printed nothing"));
+        assert!(err("oops\n", "{}", Some(0)).starts_with("one-line: mh.sh's last stderr line"));
+        assert!(err(
+            "MH_RESULT STATUS=OK REASON=ok\nMH_RESULT STATUS=OK REASON=ok\n",
+            r#"{"ok":true}"#,
+            Some(0)
+        )
+        .starts_with("one-line: mh.sh printed 2 MH_RESULT lines"));
+        assert!(err(
+            "MH_RESULT STATUS=MAYBE REASON=ok\n",
+            r#"{"ok":true}"#,
+            Some(0)
+        )
+        .starts_with("fields: MH_RESULT has a malformed field"));
+        assert!(err("MH_RESULT STATUS=OK\n", r#"{"ok":true}"#, Some(0))
+            .starts_with("fields: MH_RESULT has no REASON"));
+        assert!(err(
+            "MH_RESULT STATUS=OK REASON=ok SLOT=x\n",
+            r#"{"ok":true}"#,
+            Some(0)
+        )
+        .starts_with("fields: MH_RESULT SLOT"));
+        assert!(err(
+            "MH_RESULT STATUS=FAIL REASON=made-up\n",
+            r#"{"ok":false}"#,
+            Some(1)
+        )
+        .starts_with("known-token: REASON=made-up"));
+        // exit 0 with a FAIL token, and a FAIL token on the wrong group.
+        assert!(err(
+            "MH_RESULT STATUS=FAIL REASON=drain-timeout\n",
+            r#"{"ok":false}"#,
+            Some(0)
+        )
+        .starts_with("exit-group: REASON=drain-timeout belongs to exit 1, mh.sh exited 0"));
+        assert!(err(
+            "MH_RESULT STATUS=FAIL REASON=mh-pool-busy\n",
+            r#"{"ok":false}"#,
+            Some(1)
+        )
+        .starts_with("exit-group:"));
         assert!(
-            parse_mh_sh_result("MH_RESULT STATUS=MAYBE REASON=ok\n", r#"{"ok":true}"#)
-                .unwrap_err()
-                .contains("malformed field")
+            err("MH_RESULT STATUS=OK REASON=ok\n", r#"{"ok":true}"#, None)
+                .starts_with("exit-group: mh.sh was killed")
         );
-        assert!(
-            parse_mh_sh_result("MH_RESULT STATUS=OK\n", r#"{"ok":true}"#)
-                .unwrap_err()
-                .contains("no REASON")
-        );
-        assert!(
-            parse_mh_sh_result("MH_RESULT STATUS=OK REASON=ok SLOT=x\n", r#"{"ok":true}"#)
-                .unwrap_err()
-                .contains("not a slot number")
-        );
-        assert!(
-            parse_mh_sh_result("MH_RESULT STATUS=OK REASON=ok\n", "not json")
-                .unwrap_err()
-                .contains("not one JSON")
-        );
-        assert!(
-            parse_mh_sh_result("MH_RESULT STATUS=OK REASON=ok\n", r#"{"ok":false}"#)
-                .unwrap_err()
-                .contains("disagrees")
-        );
+        assert!(err(
+            "MH_RESULT STATUS=FAIL REASON=ok\n",
+            r#"{"ok":false}"#,
+            Some(0)
+        )
+        .starts_with("ok-reason:"));
+        assert!(err("MH_RESULT STATUS=OK REASON=ok\n", "not json", Some(0))
+            .starts_with("json-ok-agrees: mh.sh --json stdout is not one JSON object"));
+        assert!(err(
+            "MH_RESULT STATUS=OK REASON=ok\n",
+            r#"{"ok":false}"#,
+            Some(0)
+        )
+        .starts_with("json-ok-agrees: mh.sh's stdout ok="));
     }
 
-    /// The REASON tokens this fixture branches on exist in mh.sh's token
-    /// array (its ONE home), so a renamed token fails here, not as a silent
-    /// misclassification at run time.
-    #[test]
-    fn branched_reasons_are_in_mh_sh_tokens() {
-        let text = std::fs::read_to_string(crate::repo_root().join("infra/kind/scripts/mh.sh"))
-            .expect("read mh.sh");
-        let tokens: Vec<&str> = text
-            .split_once("readonly -a MH_TOKENS=(")
+    /// PURE: mh.sh's `MH_TOKENS=( "tok:code" ... )` entries.
+    fn mh_sh_tokens(text: &str) -> Vec<(String, i32)> {
+        text.split_once("readonly -a MH_TOKENS=(")
             .and_then(|(_, rest)| rest.split_once("\n)"))
             .map(|(body, _)| body)
             .expect("mh.sh defines `readonly -a MH_TOKENS=( ... )`")
             .lines()
-            .filter_map(|l| l.trim().strip_prefix('"')?.split_once(':'))
-            .map(|(token, _)| token)
-            .collect();
-        // Vacuity control: the contract lists 17 tokens; a broken extraction
-        // yields few or none.
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix('"')?
+                    .strip_suffix('"')?
+                    .split_once(':')
+            })
+            .map(|(t, c)| (t.to_string(), c.parse().expect("token code is an integer")))
+            .collect()
+    }
+
+    /// [`MH_TOKENS`] == mh.sh's token array, BOTH directions, codes included
+    /// (one home: mh.sh). A renamed or regrouped token fails here, not as a
+    /// misclassification at run time.
+    #[test]
+    fn mh_tokens_match_mh_sh_both_directions() {
+        let theirs = mh_sh_tokens(&mh_sh_text());
+        // Vacuity control: mh.sh has well over ten tokens.
         assert!(
-            tokens.len() > 10,
-            "extraction produced too few tokens: {tokens:?}"
+            theirs.len() > 10,
+            "extraction produced too few tokens: {theirs:?}"
         );
-        for token in [
+        let theirs: std::collections::BTreeSet<(String, i32)> = theirs.into_iter().collect();
+        let ours: std::collections::BTreeSet<(String, i32)> = MH_TOKENS
+            .iter()
+            .map(|(t, c)| ((*t).to_string(), *c))
+            .collect();
+        let missing: Vec<_> = theirs.difference(&ours).collect();
+        let extra: Vec<_> = ours.difference(&theirs).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "MH_TOKENS drifted from mh.sh: in mh.sh only {missing:?}; in Rust only {extra:?}"
+        );
+        for t in [
             REASON_OK,
             REASON_NOT_AVAILABLE,
             REASON_NO_FREE_SLOT,
             REASON_BUSY,
         ] {
             assert!(
-                tokens.contains(&token),
-                "mh.sh's MH_TOKENS has no entry for {token:?}: {tokens:?}"
+                token_exit_code(t).is_some(),
+                "{t} is branched on but unknown"
             );
         }
+        // The fixture tokens are never mh.sh tokens.
+        for t in FIXTURE_TOKENS {
+            assert!(
+                token_exit_code(t).is_none(),
+                "{t} collides with an mh.sh token"
+            );
+        }
+    }
+
+    /// PURE: an integer `readonly NAME=<int>` from mh.sh.
+    fn mh_sh_int(text: &str, name: &str) -> u64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("readonly {name}=")))
+            .unwrap_or_else(|| panic!("mh.sh has no `readonly {name}=`"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("mh.sh {name} is not an integer: {e}"))
+    }
+
+    /// The BUSY bound outlasts a crashed holder's Lease (reclaimable after
+    /// `MH_LEASE_S + MH_LEASE_FUTURE_SKEW_S`) plus one interval, so exhaustion
+    /// always means a LIVE concurrent mutator.
+    #[test]
+    fn busy_bound_outlasts_a_crashed_holders_lease() {
+        let text = mh_sh_text();
+        let lease = mh_sh_int(&text, "MH_LEASE_S");
+        let skew = mh_sh_int(&text, "MH_LEASE_FUTURE_SKEW_S");
+        assert!(
+            lease > 0,
+            "positive control: MH_LEASE_S extracted as {lease}"
+        );
+        let floor = std::time::Duration::from_secs(lease + skew) + BUSY_RETRY_INTERVAL;
+        assert!(
+            BUSY_RETRY_BOUND > floor,
+            "BUSY_RETRY_BOUND {BUSY_RETRY_BOUND:?} must exceed lease {lease}s + skew {skew}s + \
+             one interval"
+        );
+    }
+
+    fn run(stderr: &str, stdout: &str, code: i32) -> RawRun {
+        RawRun {
+            exit_code: Some(code),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        }
+    }
+
+    fn busy() -> RawRun {
+        run(
+            "MH_RESULT STATUS=FAIL REASON=mh-pool-busy DETAIL=holder=e2e-aa@host:1\n",
+            r#"{"ok":false}"#,
+            5,
+        )
+    }
+
+    #[test]
+    fn busy_is_retried_until_ok_within_the_bound() {
+        let mut calls = 0;
+        let mut slept = std::time::Duration::ZERO;
+        let r = run_with_busy_retry(
+            "up",
+            || {
+                calls += 1;
+                if calls < 4 {
+                    busy()
+                } else {
+                    run("MH_RESULT STATUS=OK REASON=ok\n", r#"{"ok":true}"#, 0)
+                }
+            },
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(2),
+            |d| slept += d,
+        )
+        .unwrap();
+        assert!(r.is_ok());
+        assert_eq!(calls, 4, "positive control: OK on attempt 4");
+        assert_eq!(slept, std::time::Duration::from_secs(6));
+    }
+
+    #[test]
+    fn busy_exhaustion_is_loud_and_names_the_holder() {
+        let mut calls = 0;
+        let mut slept = std::time::Duration::ZERO;
+        let e = run_with_busy_retry(
+            "drain 3",
+            || {
+                calls += 1;
+                busy()
+            },
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(2),
+            |d| slept += d,
+        )
+        .unwrap_err();
+        assert_eq!(calls, 6, "bound/interval + 1 attempts");
+        assert_eq!(
+            slept,
+            std::time::Duration::from_secs(10),
+            "slept the whole bound"
+        );
+        assert!(e.starts_with("BUSY (mh-pool-busy): `mh.sh drain 3` still busy after 6 attempts"));
+        assert!(e.contains("holder=e2e-aa@host:1"), "{e}");
+        assert!(e.contains("MH_LEASE_S"), "{e}");
+    }
+
+    #[test]
+    fn only_busy_is_retried() {
+        for (stderr, code) in [
+            ("MH_RESULT STATUS=FAIL REASON=mh-no-free-slot\n", 3),
+            ("MH_RESULT STATUS=FAIL REASON=foreign-owner\n", 4),
+            ("MH_RESULT STATUS=FAIL REASON=drain-timeout\n", 1),
+        ] {
+            let mut calls = 0;
+            let r = run_with_busy_retry(
+                "x",
+                || {
+                    calls += 1;
+                    run(stderr, r#"{"ok":false}"#, code)
+                },
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(2),
+                |_| panic!("must not sleep"),
+            )
+            .unwrap();
+            assert_eq!(calls, 1, "{stderr}");
+            assert!(!r.is_ok());
+        }
+        // A contract break is an error, not a retry.
+        let e = run_with_busy_retry(
+            "x",
+            || run("MH_RESULT STATUS=FAIL REASON=nope\n", r#"{"ok":false}"#, 1),
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(2),
+            |_| panic!("must not sleep"),
+        )
+        .unwrap_err();
+        assert!(e.contains("known-token"), "{e}");
+    }
+
+    fn slot_entry(slot: u32, state: &str, owner: Option<&str>) -> SlotEntry {
+        let pod = owner.map(|_| format!("mh-s{slot}-x"));
+        serde_json::from_value(entry_owned(slot, state, pod.as_deref(), owner)).unwrap()
+    }
+
+    fn entry_owned(slot: u32, state: &str, pod: Option<&str>, owner: Option<&str>) -> Value {
+        let mut e = entry(slot, state, pod);
+        e["owner"] = json!(owner);
+        e
+    }
+
+    fn snap(baseline: u32, slots: Vec<SlotEntry>) -> PoolSnapshot {
+        PoolSnapshot {
+            template_revision: "r1".into(),
+            baseline,
+            slots,
+        }
+    }
+
+    fn hint(o: &str) -> String {
+        format!("reclaim {o}")
+    }
+
+    #[test]
+    fn baseline_verdict_cases() {
+        let run = "e2e-0123456789abcdef";
+        let clean = snap(
+            2,
+            vec![
+                slot_entry(0, "serving", Some("baseline")),
+                slot_entry(1, "serving", Some("baseline")),
+                slot_entry(2, "serving", Some(run)),
+                slot_entry(3, "free", None),
+            ],
+        );
+        assert_eq!(baseline_verdict(&clean, run, hint), Ok(()));
+
+        let mut foreign = clean.clone();
+        foreign.slots[3] = slot_entry(3, "serving", Some("e2e-ffffffffffffffff"));
+        let e = baseline_verdict(&foreign, run, hint).unwrap_err();
+        assert!(e.starts_with(FOREIGN_MH_ACTIVITY), "{e}");
+        assert!(
+            e.contains("slot 3") && e.contains("e2e-ffffffffffffffff"),
+            "{e}"
+        );
+        assert!(e.contains("reclaim e2e-ffffffffffffffff"), "{e}");
+
+        let mut manual = clean.clone();
+        manual.slots[3] = slot_entry(3, "starting", Some("manual"));
+        assert!(baseline_verdict(&manual, run, hint)
+            .unwrap_err()
+            .contains("\"manual\""));
+
+        let mut short = clean.clone();
+        short.slots[1] = slot_entry(1, "terminating", Some("baseline"));
+        let e = baseline_verdict(&short, run, hint).unwrap_err();
+        assert!(e.contains("baseline-owned serving MHs: 1, B = 2"), "{e}");
+
+        let mut over = clean.clone();
+        over.slots[3] = slot_entry(3, "serving", Some("baseline"));
+        assert!(baseline_verdict(&over, run, hint)
+            .unwrap_err()
+            .contains("serving MHs: 3, B = 2"));
+
+        let mut starting = clean.clone();
+        starting.slots[1] = slot_entry(1, "starting", Some("baseline"));
+        assert!(baseline_verdict(&starting, run, hint).is_err());
+
+        // A stale (upgrade-pending) baseline MH still serves and still counts.
+        let mut stale = clean.clone();
+        stale.slots[0].stale = true;
+        assert_eq!(baseline_verdict(&stale, run, hint), Ok(()));
+    }
+
+    #[test]
+    fn run_leak_verdict_cases() {
+        let run = "e2e-0123456789abcdef";
+        let clean = snap(
+            1,
+            vec![
+                slot_entry(0, "serving", Some("baseline")),
+                slot_entry(1, "free", None),
+            ],
+        );
+        assert_eq!(run_leak_verdict(&clean, run), Ok(()));
+        let mut leaked = clean.clone();
+        leaked.slots[1] = slot_entry(1, "draining", Some(run));
+        assert!(run_leak_verdict(&leaked, run)
+            .unwrap_err()
+            .starts_with(MH_RUN_LEAK));
+        let mut stuck = clean.clone();
+        stuck.slots[0].terminating_past_grace = true;
+        assert!(run_leak_verdict(&stuck, run).is_err());
+    }
+
+    #[test]
+    fn slot_for_address_is_exact_and_unique() {
+        let s = snap(
+            1,
+            vec![
+                slot_entry(0, "serving", Some("baseline")),
+                slot_entry(1, "free", None),
+            ],
+        );
+        assert_eq!(
+            slot_for_address(&s, "https://127.0.0.1:4441").unwrap().slot,
+            1
+        );
+        assert!(slot_for_address(&s, "https://127.0.0.1:9")
+            .unwrap_err()
+            .contains("no mh.sh slot"));
+        let mut dup = s.clone();
+        dup.slots[1].address = dup.slots[0].address.clone();
+        assert!(slot_for_address(&dup, &dup.slots[0].address.clone())
+            .unwrap_err()
+            .contains("2 mh.sh slots share"));
+    }
+
+    fn signal_json(state: &str, budget: Option<u64>) -> Value {
+        signal_json_with(state, budget, Some(75))
+    }
+
+    fn signal_json_with(state: &str, budget: Option<u64>, restart: Option<u64>) -> Value {
+        let mut e = entry_owned(2, "serving", Some("mh-s2-x"), Some("e2e-0123456789abcdef"));
+        e["ok"] = json!(true);
+        e["pid"] = json!(7);
+        e["process_state"] = json!(state);
+        e["liveness_budget_seconds"] = json!(budget);
+        e["restart_budget_seconds"] = json!(restart);
+        e
+    }
+
+    #[test]
+    fn signal_outcomes_must_match_the_signal() {
+        let stop = parse_signal(&signal_json("T", Some(25)), Signal::Stop).unwrap();
+        assert_eq!(
+            stop.liveness_budget,
+            Some(std::time::Duration::from_secs(25))
+        );
+        assert!(parse_signal(&signal_json("T", None), Signal::Stop)
+            .unwrap_err()
+            .contains("no liveness_budget_seconds"));
+        assert!(parse_signal(&signal_json("S", Some(25)), Signal::Stop).is_err());
+        assert!(parse_signal(&signal_json("T", Some(0)), Signal::Stop).is_err());
+        let kill = parse_signal(&signal_json("gone", None), Signal::Kill).unwrap();
+        assert_eq!(
+            kill.restart_budget,
+            Some(std::time::Duration::from_secs(75))
+        );
+        assert!(
+            parse_signal(&signal_json_with("gone", None, None), Signal::Kill)
+                .unwrap_err()
+                .contains("no restart_budget_seconds")
+        );
+        // A KILL must never be read as a state letter.
+        assert!(parse_signal(&signal_json("S", None), Signal::Kill).is_err());
+        assert!(parse_signal(&signal_json("S", None), Signal::Cont).is_ok());
+        assert!(parse_signal(&signal_json("T", None), Signal::Cont).is_err());
+        assert!(parse_signal(&signal_json("gone", None), Signal::Cont).is_err());
+        let mut no_state = signal_json("T", Some(25));
+        no_state.as_object_mut().unwrap().remove("process_state");
+        assert!(parse_signal(&no_state, Signal::Stop)
+            .unwrap_err()
+            .contains("no process_state"));
+    }
+
+    #[test]
+    fn freeze_overrun_is_failure_only_at_the_budget() {
+        let b = std::time::Duration::from_secs(25);
+        assert_eq!(
+            freeze_overrun(std::time::Duration::from_secs(24), b),
+            Ok(())
+        );
+        assert!(freeze_overrun(b, b)
+            .unwrap_err()
+            .starts_with(FREEZE_BUDGET_EXCEEDED));
+        assert!(freeze_overrun(std::time::Duration::from_secs(40), b).is_err());
+    }
+
+    #[test]
+    fn incarnation_checks_both_ways() {
+        let run = "e2e-0123456789abcdef";
+        let before = slot_entry(2, "serving", Some(run));
+        assert_eq!(assert_same_incarnation(&before, &before.clone()), Ok(()));
+        let mut restarted = before.clone();
+        restarted.restart_count = Some(1);
+        assert!(assert_same_incarnation(&before, &restarted)
+            .unwrap_err()
+            .starts_with(RESTART_COUNT_CHANGED));
+        let mut other = before.clone();
+        other.pod_uid = Some("v".into());
+        assert!(assert_same_incarnation(&before, &other).is_err());
+
+        assert!(restarted_in_place(&before, &restarted));
+        assert!(
+            !restarted_in_place(&before, &before),
+            "no restart is not a restart"
+        );
+        assert!(!restarted_in_place(&before, &other));
+        let mut not_serving = restarted.clone();
+        not_serving.state = SlotState::Starting;
+        assert!(!restarted_in_place(&before, &not_serving));
+    }
+
+    #[test]
+    fn commands_are_built_in_one_place() {
+        let path = PathBuf::from("/repo/infra/kind/scripts/mh.sh");
+        assert_eq!(
+            reclaim_command(&path, "devloop-x", "e2e-0123456789abcdef"),
+            "DT_CLUSTER_NAME=devloop-x /repo/infra/kind/scripts/mh.sh drain --all --owner \
+             e2e-0123456789abcdef"
+        );
+        assert_eq!(
+            teardown_args("o"),
+            ["drain", "--all", "--owner", "o"],
+            "the executed argv is the printed one"
+        );
+        assert_eq!(
+            signal_args(4, Signal::Cont, "o"),
+            ["signal", "4", "CONT", "--owner", "o"]
+        );
+        assert!(dt_cluster_name_from(None)
+            .unwrap_err()
+            .contains("unset or empty"));
+        assert!(dt_cluster_name_from(Some(" ".into())).is_err());
+        assert_eq!(dt_cluster_name_from(Some("c".into())).unwrap(), "c");
+        assert_eq!(
+            signal_command(&path, "c", 4, Signal::Cont, "o"),
+            "DT_CLUSTER_NAME=c /repo/infra/kind/scripts/mh.sh signal 4 CONT --owner o"
+        );
+    }
+
+    /// The Drop backstop prints exactly the reclaim command, and a drop while
+    /// already panicking does not abort (no double panic): the path is
+    /// resolved at construction, so Drop reads no environment.
+    #[test]
+    fn drop_prints_the_reclaim_command_and_never_panics() {
+        let pool = MhPool::with(
+            PathBuf::from("/nonexistent/mh.sh"),
+            "c".into(),
+            "e2e-0123456789abcdef".into(),
+        );
+        let mut out = Vec::new();
+        pool.drop_notice(&mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "MhPool e2e-0123456789abcdef dropped without teardown; reclaim its MHs with: \
+             DT_CLUSTER_NAME=c /nonexistent/mh.sh drain --all --owner e2e-0123456789abcdef\n"
+        );
+        let unwound = std::panic::catch_unwind(move || {
+            let _held = pool;
+            panic!("leg failed");
+        });
+        assert!(
+            unwound.is_err(),
+            "the leg's panic propagates; Drop did not abort"
+        );
+    }
+
+    #[test]
+    fn freeze_guard_drop_resumes_best_effort_and_never_panics() {
+        let slot = MhSlot {
+            slot: 4,
+            deployment: "mh-s4".into(),
+            pod: "mh-s4-x".into(),
+            pod_uid: "u".into(),
+            pod_ip: "10.0.0.4".into(),
+            address: "https://127.0.0.1:4444".into(),
+            restart_count: 0,
+            mh_sh: PathBuf::from("/nonexistent/mh.sh"),
+            cluster: "c".into(),
+            owner: "o".into(),
+        };
+        let guard = FreezeGuard {
+            before: slot_entry(4, "serving", Some("o")),
+            slot,
+            started: std::time::Instant::now(),
+            stop_call: std::time::Duration::from_secs(1),
+            budget: std::time::Duration::from_secs(25),
+            resumed: false,
+        };
+        let mut out = Vec::new();
+        guard.drop_notice(&mut out);
+        assert!(String::from_utf8(out).unwrap().contains(
+            "resume it with: DT_CLUSTER_NAME=c /nonexistent/mh.sh signal 4 CONT --owner o"
+        ));
+        // The best-effort CONT fails to spawn here; Drop must swallow that.
+        let unwound = std::panic::catch_unwind(move || {
+            let _held = guard;
+            panic!("leg failed");
+        });
+        assert!(unwound.is_err());
     }
 
     fn entry(slot: u32, state: &str, pod: Option<&str>) -> Value {
@@ -742,11 +2255,38 @@ mod tests {
             .unwrap_err()
             .contains("zero slots"));
 
-        let mut dropped = entry(0, "free", None);
-        dropped.as_object_mut().unwrap().remove("pod");
-        assert!(parse_list(&doc(vec![dropped]).to_string())
-            .unwrap_err()
-            .contains("no `pod` key"));
+        for key in [
+            "ok",
+            "schema_version",
+            "template_revision",
+            "baseline",
+            "slots",
+        ] {
+            let mut d = doc(vec![entry(0, "free", None)]);
+            d.as_object_mut().unwrap().remove(key);
+            assert!(
+                parse_list(&d.to_string()).is_err(),
+                "a document without top-level `{key}` must be refused"
+            );
+        }
+
+        for key in SLOT_KEYS {
+            let mut dropped = entry(0, "free", None);
+            dropped.as_object_mut().unwrap().remove(*key);
+            assert!(
+                parse_list(&doc(vec![dropped]).to_string())
+                    .unwrap_err()
+                    .contains(&format!("no `{key}` key")),
+                "dropping {key} must be refused"
+            );
+        }
+
+        // Additive-only contract: an extra key (top level and per slot) passes.
+        let mut extra = entry(0, "free", None);
+        extra["future_field"] = json!("x");
+        let mut d = doc(vec![extra]);
+        d["future_top"] = json!(1);
+        assert!(parse_list(&d.to_string()).is_ok());
 
         let dup = doc(vec![entry(1, "free", None), entry(1, "free", None)]);
         assert!(parse_list(&dup.to_string())
@@ -799,7 +2339,7 @@ mod tests {
         assert!(mh_sh_path_from(Some("/nonexistent/mh.sh".into()))
             .unwrap_err()
             .contains("not an existing file"));
-        let real = crate::repo_root().join("infra/kind/scripts/mh.sh");
+        let real = crate::repo_root().join(MH_SH_REPO_PATH);
         assert_eq!(mh_sh_path_from(Some(real.clone())).unwrap(), real);
     }
 
@@ -807,8 +2347,7 @@ mod tests {
     /// of the v1 slot schema), read from the committed script.
     #[test]
     fn slot_keys_match_mh_sh_public_schema() {
-        let text = std::fs::read_to_string(crate::repo_root().join("infra/kind/scripts/mh.sh"))
-            .expect("read mh.sh");
+        let text = mh_sh_text();
         let line = text
             .lines()
             .find(|l| l.starts_with("readonly MH_JQ_PUBLIC="))
@@ -823,6 +2362,30 @@ mod tests {
         assert_eq!(
             keys, SLOT_KEYS,
             "mh.sh's list --json slot key set drifted from SLOT_KEYS"
+        );
+    }
+
+    /// The re-encoded contract values have one home each: `SCHEMA_VERSION`
+    /// is mh.sh's `MH_SCHEMA_VERSION`, `BASELINE_OWNER` is deploy.sh's
+    /// `MH_BASELINE_OWNER` (the label it stamps on the baseline MHs).
+    #[test]
+    fn schema_version_and_baseline_owner_match_their_homes() {
+        assert_eq!(
+            mh_sh_int(&mh_sh_text(), "MH_SCHEMA_VERSION"),
+            SCHEMA_VERSION,
+            "SCHEMA_VERSION drifted from mh.sh"
+        );
+        let deploy =
+            std::fs::read_to_string(crate::repo_root().join("infra/kind/scripts/deploy.sh"))
+                .expect("read deploy.sh");
+        let owner = deploy
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("MH_BASELINE_OWNER=\""))
+            .and_then(|r| r.strip_suffix('"'))
+            .expect("positive control: deploy.sh defines MH_BASELINE_OWNER=\"...\"");
+        assert_eq!(
+            owner, BASELINE_OWNER,
+            "BASELINE_OWNER drifted from deploy.sh"
         );
     }
 }

@@ -7,7 +7,7 @@
 //! churn) became its second consumer. The two triage literals moved with it
 //! unchanged; `docs/runbooks/devloop-validation.md` §8 catalogues them.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use crate::cluster::ClusterConnection;
@@ -17,9 +17,132 @@ use crate::fixtures::mc_session::{self, JoinDeclaration, McSession};
 use crate::fixtures::metrics::{gauge_by_instance_present, PrometheusClient};
 use crate::fixtures::{AuthClient, GcClient};
 use proto_gen::dark_tower::signaling::v1::{
-    client_message, server_message, ClientMessage, JoinResponse, MediaKind, SendDirective,
-    StreamAssignment, StreamAssignments,
+    client_message, server_message, ClientMessage, JoinResponse, MediaHandlerSet, MediaKind,
+    SendDirective, StreamAssignment, StreamAssignments,
 };
+
+/// A `media_dial_token` (ADR-0039 §5): a BEARER CREDENTIAL. Its `Debug` is
+/// redacted, it has no `Display` and no `Serialize`, and [`DialToken::expose`]
+/// is for building the MH connect request only — never for a log line, a
+/// panic, or an assertion message.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DialToken(String);
+
+impl DialToken {
+    /// The token text, for the MH connect request ONLY.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for DialToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DialToken(<redacted, {} bytes>)", self.0.len())
+    }
+}
+
+/// One `MediaHandlerSet` as membership only: version and `(handler_ref, url)`
+/// entries, sorted by ref. Never a token (history holds no credentials).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandlerSetView {
+    pub version: u64,
+    pub entries: Vec<(u32, String)>,
+}
+
+impl HandlerSetView {
+    /// The urls, sorted.
+    #[must_use]
+    pub fn urls(&self) -> Vec<String> {
+        let mut urls: Vec<String> = self.entries.iter().map(|(_, u)| u.clone()).collect();
+        urls.sort();
+        urls
+    }
+
+    /// The refs, sorted.
+    #[must_use]
+    pub fn refs(&self) -> Vec<u32> {
+        self.entries.iter().map(|(r, _)| *r).collect()
+    }
+}
+
+/// The MediaHandlerSets one participant has seen (ADR-0039 §4): the join's,
+/// then every `ServerMessage.media_handler_set` (full snapshot, replace
+/// semantics). The join-time set MAY be empty (MC releases a parked join with
+/// the Active-only snapshot), so the CURRENT set is the latest one, not the
+/// join's.
+///
+/// Tokens: the latest per IN-SET ref. A ref that leaves the set has its token
+/// DROPPED (not hidden); an empty token (MC not minting yet) is absent.
+#[derive(Clone, Debug, Default)]
+pub struct HandlerSets {
+    current: Option<HandlerSetView>,
+    history: Vec<HandlerSetView>,
+    tokens: BTreeMap<u32, DialToken>,
+}
+
+impl HandlerSets {
+    /// Apply one received set (replace semantics).
+    pub fn apply(&mut self, set: &MediaHandlerSet) {
+        let mut entries: Vec<(u32, String)> = set
+            .handlers
+            .iter()
+            .map(|h| (h.handler_ref, h.media_handler_url.clone()))
+            .collect();
+        entries.sort();
+        self.tokens = set
+            .handlers
+            .iter()
+            .filter(|h| !h.media_dial_token.is_empty())
+            .map(|h| (h.handler_ref, DialToken(h.media_dial_token.clone())))
+            .collect();
+        let view = HandlerSetView {
+            version: set.handler_set_version,
+            entries,
+        };
+        self.history.push(view.clone());
+        self.current = Some(view);
+    }
+
+    /// The latest set, if any was received.
+    #[must_use]
+    pub fn current(&self) -> Option<&HandlerSetView> {
+        self.current.as_ref()
+    }
+
+    /// Every set received, in order (membership only).
+    #[must_use]
+    pub fn history(&self) -> &[HandlerSetView] {
+        &self.history
+    }
+
+    /// The latest dial token for `handler_ref`, if it is in the current set
+    /// and MC minted one.
+    #[must_use]
+    pub fn dial_token(&self, handler_ref: u32) -> Option<&DialToken> {
+        self.tokens.get(&handler_ref)
+    }
+
+    /// The current set's urls, sorted (empty before any set).
+    #[must_use]
+    pub fn urls(&self) -> Vec<String> {
+        self.current
+            .as_ref()
+            .map(HandlerSetView::urls)
+            .unwrap_or_default()
+    }
+
+    /// The current entry for `url`, if any.
+    #[must_use]
+    pub fn ref_for_url(&self, url: &str) -> Option<u32> {
+        self.current
+            .as_ref()?
+            .entries
+            .iter()
+            .find(|(_, u)| u == url)
+            .map(|(r, _)| *r)
+    }
+}
 
 /// The audio slot kind, for the kind-taking helpers below. Every helper that
 /// reads a view takes a kind: a video slot showing an avatar NAMES its
@@ -68,6 +191,9 @@ pub struct Participant {
     /// assignment (`mc_id`, gRPC endpoint), which a test that programs MH
     /// directly must present so MH's notifications still reach the real MC.
     pub gc: JoinMeetingResponse,
+    /// Every MediaHandlerSet this participant has seen ([`HandlerSets`]), fed
+    /// from the JoinResponse and from every set message the fixture reads.
+    pub sets: HandlerSets,
 }
 
 impl Participant {
@@ -90,16 +216,62 @@ impl Participant {
         })
     }
 
-    /// The handler urls this participant was OFFERED, sorted.
+    /// The handler urls this participant was OFFERED: its CURRENT
+    /// MediaHandlerSet's urls, sorted (never the legacy `media_servers`).
     pub fn offered(&self) -> Vec<String> {
-        let mut urls: Vec<String> = self
-            .join
-            .media_servers
-            .iter()
-            .map(|m| m.media_handler_url.clone())
-            .collect();
-        urls.sort();
-        urls
+        self.sets.urls()
+    }
+
+    /// Apply one signalling message to this participant's state (latest view,
+    /// directive, handler set).
+    fn absorb(&mut self, phase: &str, m: server_message::Message) {
+        match m {
+            server_message::Message::StreamAssignments(a) => self.view = Some(a),
+            server_message::Message::SendDirective(d) => self.directive = Some(d),
+            server_message::Message::MediaHandlerSet(set) => self.sets.apply(&set),
+            server_message::Message::Error(e) => {
+                panic!(
+                    "{phase}: MC rejected {}'s request: {}",
+                    self.label, e.message
+                )
+            }
+            // Roster traffic. Nothing is logged about it: it carries names.
+            _ => {}
+        }
+    }
+
+    /// Read signalling until `done` holds on this participant's handler sets,
+    /// within `bound` (the view and directive are kept current meanwhile).
+    /// Messages name only versions, refs and urls — never a token.
+    ///
+    /// # Panics
+    /// At `bound`, naming the last set's version and refs.
+    pub async fn await_handler_set(
+        &mut self,
+        phase: &str,
+        bound: Duration,
+        done: impl Fn(&HandlerSets) -> bool,
+    ) {
+        let deadline = Instant::now() + bound;
+        while !done(&self.sets) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "{phase}: {}'s MediaHandlerSet did not reach the expected state within {bound:?}; \
+                 last set {:?} ({} received)",
+                self.label,
+                self.sets.current().map(|v| (v.version, v.refs(), v.urls())),
+                self.sets.history().len()
+            );
+            if let Some(m) = self
+                .session
+                .try_read(remaining)
+                .await
+                .and_then(|m| m.message)
+            {
+                self.absorb(phase, m);
+            }
+        }
     }
 
     /// Redeclare this participant's receive slots (post-join
@@ -148,22 +320,13 @@ impl Participant {
                 )),
                 self.directive.as_ref().map(targets_of)
             );
-            match self
+            if let Some(m) = self
                 .session
                 .try_read(remaining)
                 .await
                 .and_then(|m| m.message)
             {
-                Some(server_message::Message::StreamAssignments(a)) => self.view = Some(a),
-                Some(server_message::Message::SendDirective(d)) => self.directive = Some(d),
-                Some(server_message::Message::Error(e)) => {
-                    panic!(
-                        "{phase}: MC rejected {}'s declaration: {}",
-                        self.label, e.message
-                    )
-                }
-                // Roster traffic. Nothing is logged about it: it carries names.
-                _ => {}
+                self.absorb(phase, m);
             }
         }
     }
@@ -298,6 +461,10 @@ pub async fn mc_join_with(
         label,
     )
     .await;
+    let mut sets = HandlerSets::default();
+    if let Some(set) = &join.media_handler_set {
+        sets.apply(set);
+    }
     Participant {
         label,
         session,
@@ -306,6 +473,7 @@ pub async fn mc_join_with(
         directive: None,
         view: None,
         gc: gc.clone(),
+        sets,
     }
 }
 
@@ -426,4 +594,79 @@ pub fn two_offered_handlers(phase: &str, ps: &[Participant]) -> (String, String)
         );
     }
     (offered[0].clone(), offered[1].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proto_gen::dark_tower::signaling::v1::MediaServerInfo;
+
+    const SECRET_A: &str = "eyJhbGciOiJFZERTQSJ9.dGVzdC1h.c2lnLWE";
+    const SECRET_A2: &str = "eyJhbGciOiJFZERTQSJ9.dGVzdC1hMg.c2lnLWEy";
+    const SECRET_B: &str = "eyJhbGciOiJFZERTQSJ9.dGVzdC1i.c2lnLWI";
+
+    fn set(version: u64, entries: &[(u32, &str, &str)]) -> MediaHandlerSet {
+        MediaHandlerSet {
+            handler_set_version: version,
+            handlers: entries
+                .iter()
+                .map(|(r, url, token)| MediaServerInfo {
+                    media_handler_url: (*url).to_string(),
+                    handler_ref: *r,
+                    media_dial_token: (*token).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn empty_token_is_absent_not_an_error() {
+        let mut s = HandlerSets::default();
+        s.apply(&set(1, &[(1, "https://h:1", "")]));
+        assert_eq!(s.dial_token(1), None);
+        assert_eq!(s.urls(), vec!["https://h:1".to_string()]);
+    }
+
+    #[test]
+    fn latest_token_per_in_set_ref_and_removed_refs_drop_theirs() {
+        let mut s = HandlerSets::default();
+        s.apply(&set(
+            1,
+            &[(1, "https://h:1", SECRET_A), (2, "https://h:2", SECRET_B)],
+        ));
+        assert_eq!(s.dial_token(1).map(DialToken::expose), Some(SECRET_A));
+        // Token-only refresh: same version and refs, new token.
+        s.apply(&set(
+            1,
+            &[(1, "https://h:1", SECRET_A2), (2, "https://h:2", SECRET_B)],
+        ));
+        assert_eq!(s.dial_token(1).map(DialToken::expose), Some(SECRET_A2));
+        // Ref 2 leaves the set: its token is gone, not hidden.
+        s.apply(&set(2, &[(1, "https://h:1", SECRET_A2)]));
+        assert_eq!(s.dial_token(2), None);
+        assert_eq!(s.dial_token(9), None, "a ref never in the set");
+        assert_eq!(s.current().unwrap().refs(), vec![1]);
+        assert_eq!(s.history().len(), 3);
+        assert_eq!(s.ref_for_url("https://h:1"), Some(1));
+        assert_eq!(s.ref_for_url("https://h:2"), None);
+    }
+
+    #[test]
+    fn no_debug_output_carries_a_token() {
+        let mut s = HandlerSets::default();
+        s.apply(&set(
+            1,
+            &[(1, "https://h:1", SECRET_A), (2, "https://h:2", SECRET_B)],
+        ));
+        let printed = format!("{s:?} {:?} {:?}", s.dial_token(1), s.history());
+        // Positive control: the Debug output is not vacuous.
+        assert!(
+            printed.contains("https://h:2") && printed.contains("redacted"),
+            "{printed}"
+        );
+        for secret in [SECRET_A, SECRET_B, "dGVzdC1h", "c2lnLWI"] {
+            assert!(!printed.contains(secret), "Debug leaked token material");
+        }
+        assert!(!format!("{:?}", DialToken(SECRET_A.into())).contains(SECRET_A));
+    }
 }

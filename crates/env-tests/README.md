@@ -67,23 +67,44 @@ crates/env-tests/
 │   ├── fixtures/
 │   │   ├── auth_client.rs  # Token issuance, JWKS operations
 │   │   ├── gc_fleet.rs     # live GC replica set, GC config-key mirrors (drift-tested)
-│   │   ├── mh_pool.rs      # `mh.sh` list reader, run-owned `up` + owner teardown (DT_MH_SH), mh-template read
-│   │   ├── mh_address.rs   # R-28 pure address-invariant verdict
+│   │   ├── mh_pool.rs      # THE MH pool fixture (T-1): MhPool/MhSlot/FreezeGuard over `mh.sh` (up, drain, signal KILL/STOP/CONT, baseline, owner teardown)
+│   │   ├── mh_address.rs   # R-28 address invariant: pure verdict + `assert_addresses_unique()` live gather
 │   │   └── metrics.rs      # Prometheus queries
-│   └── canary.rs           # NetworkPolicy test pods (placeholder)
+│   ├── canary.rs           # NetworkPolicy test pods (image = mh.sh MH_DEBUG_IMAGE)
+│   └── resilience_hygiene.rs # Layer-4 checks: every test in a pool-mutating binary is #[serial]; no MH pod-delete/force path
 └── tests/
     ├── 00_cluster_health.rs   # P0 smoke tests
     ├── 10_auth_smoke.rs       # P0 auth smoke tests
     ├── 20_auth_flows.rs       # P1 auth flow tests
     ├── 25_auth_security.rs    # P1 security tests
     ├── 30_observability.rs    # P1 observability tests
-    ├── 40_resilience.rs       # P2 resilience tests (stubs)
+    ├── 40_resilience.rs       # Resilience: NetworkPolicy canaries + MH pool/injector legs (EVERY test #[serial])
     ├── 41_gate_zero_hostport_policy.rs # Gate zero: MH policy on the UDP hostPort DNAT path (own binary)
     ├── 42_mh_address_invariant.rs # R-28: every live MH pod advertises its own unique slot address (needs DT_MH_SH)
     ├── 43_mh_slot_publish_udp.rs  # R-27: host-published UDP reaches each serving slot's own MH (own binary)
-    ├── 44_gc_mh_registration.rs   # R-25: a run-owned MH on a real slot registers ok|superseded, zero GC rejects (own binary, needs DT_MH_SH)
+    ├── 44_gc_mh_registration.rs   # R-25: a run-owned MH on a real slot registers ok|superseded, zero GC rejects (own binary, #[serial], needs DT_MH_SH)
     └── 90_runbook.rs          # P2 runbook validation (stubs)
 ```
+
+## MH pool environment (Layer 7 exports; no defaults)
+
+The MH pool fixture (`src/fixtures/mh_pool.rs`) and the browser twin
+(`packages/web-app/e2e/mhPool.ts`) read these. `scripts/layer7.sh` exports all
+three (Phase 1h and the per-run org provisioning); outside Layer 7, set them
+yourself. None has a fallback: unset is a loud PRECONDITION naming layer7.sh.
+
+| Variable | Meaning | Unset |
+|----------|---------|-------|
+| `DT_MH_SH` | ABSOLUTE path of `infra/kind/scripts/mh.sh` in this tree | `PRECONDITION (mh-sh-unset)`; relative or missing also refused |
+| `DT_CLUSTER_NAME` | the devloop cluster; mh.sh targets `kind-<name>` (never the current context), and every printed reclaim/resume command carries it | `PRECONDITION (cluster-unset)`: mh.sh's own default could be another cluster |
+| `ENV_TEST_ORG_SUBDOMAIN` (`E2E_ORG_SUBDOMAIN` in the browser) | the per-run org subdomain, which is ALSO the MH owner token (`dark-tower.io/mh-owner`) for every MH a run creates | `PRECONDITION (run-owner)` |
+
+Isolation: new destructive legs go in `tests/40_resilience.rs` (through
+`MhPool::run_leg`). Every test in ANY pool-mutating binary (40, and e.g. 44,
+which `up`s an MH) carries a bare `#[serial]`; `resilience_hygiene` checks this
+at Layer 4, deriving the pool-mutating API from mh_pool.rs.
+Concurrent runs on one cluster fail with `foreign-mh-activity`. A leaked run's
+MHs are reclaimed with `DT_CLUSTER_NAME=<c> $DT_MH_SH drain --all --owner <run>`.
 
 ## Pre-Seeded Test Credentials
 

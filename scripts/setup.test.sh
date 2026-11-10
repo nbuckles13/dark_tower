@@ -1835,6 +1835,8 @@ fi
 #   STUB_ROLLOUT_FAIL        a `<kind>/<name>` whose `rollout status` fails
 #   STUB_NODE_HAS            space-separated refs the Kind node already holds (crictl inspecti)
 #   STUB_NODE_IMAGES         `crictl images` output in the node (IMAGE TAG ID lines)
+#   STUB_NODE_PULL_FAIL=1    `crictl pull` in the node fails; STUB_NODE_PULL_INVISIBLE=1 it
+#                            "succeeds" but the image is still not there (inspecti misses it)
 #   STUB_RS_ROWS / STUB_CR_ROWS  `<revision> <owner> <image…>` rows for `get replicasets` /
 #                            `get controllerrevisions` (the rollout history the prune keeps by)
 #   STUB_APPLY_FAIL=root     the environment-root `apply -k` is rejected by the apiserver
@@ -2022,7 +2024,12 @@ case "\$1" in
   exec)
     # exec <node> crictl <verb> ...
     case "\$4" in
-      inspecti) for r in \${STUB_NODE_HAS:-}; do [[ "\$r" == "\${@: -1}" ]] && exit 0; done; exit 1 ;;
+      inspecti) for r in \${STUB_NODE_HAS:-} \$(cat "${MARK}/node-pull" 2>/dev/null); do [[ "\$r" == "\${@: -1}" ]] && exit 0; done; exit 1 ;;
+      pull)
+        printf '%s\n' "\$5" >> "${MARK}/node-pull.calls"
+        [[ -z "\${STUB_NODE_PULL_FAIL:-}" ]] || { echo "crictl stub: pull failed" >&2; exit 1; }
+        [[ -n "\${STUB_NODE_PULL_INVISIBLE:-}" ]] || printf '%s\n' "\$5" >> "${MARK}/node-pull"
+        exit 0 ;;
       images) printf '%b' "\${STUB_NODE_IMAGES:-}"; exit 0 ;;
       rmi) printf '%s\n' "\$5" >> "${MARK}/node-rmi"; exit 0 ;;
     esac ;;
@@ -2661,6 +2668,26 @@ out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_HAS="localhost/gc-service:${BUILT_TAG}" de
 assert_rc "deploy-node-has-ref-rc" 0 "$rc"
 assert_absent "deploy-node-has-ref-not-reloaded" "save localhost/gc-service:${BUILT_TAG}" "$(cat "${MARK}/podman.calls" 2>/dev/null)"
 assert_status "deploy-node-has-ref-others-still-loaded" "save localhost/mc-service:${BUILT_TAG}" "$(cat "${MARK}/podman.calls" 2>/dev/null)"
+
+# The mh.sh signal debug image (preload_debug_image): ONE home (mh.sh MH_DEBUG_IMAGE), pulled BY
+# THE NODE when absent, skipped when present, and FATAL at a named step when it cannot be had.
+DEBUG_IMG="$(bash -c 'source "$1" >/dev/null 2>&1; printf %s "$MH_DEBUG_IMAGE"' _ "${REPO_ROOT}/infra/kind/scripts/mh.sh")"
+assert_rc "deploy-debug-image-read-non-vacuous" 0 "$([[ "$DEBUG_IMG" =~ @sha256:[0-9a-f]{64}$ ]] && echo 0 || echo "1 (${DEBUG_IMG})")"
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" dep)"; rc=$?
+assert_rc "deploy-debug-image-cold-rc" 0 "$rc"
+assert_rc "deploy-debug-image-cold-node-pulls-the-pinned-ref" "$DEBUG_IMG" "$(cat "${MARK}/node-pull.calls" 2>/dev/null)"
+reset_marks
+out="$(STUB_JOBS="$JOBS_OK" STUB_NODE_HAS="$DEBUG_IMG" dep)"; rc=$?
+assert_rc "deploy-debug-image-warm-rc" 0 "$rc"
+assert_no_marker "deploy-debug-image-warm-no-pull" "$MARK" "node-pull.calls"
+for knob in STUB_NODE_PULL_FAIL STUB_NODE_PULL_INVISIBLE; do
+  reset_marks
+  out="$(export "${knob}=1"; STUB_JOBS="$JOBS_OK" dep)"; rc=$?
+  assert_rc "deploy-debug-image-${knob}-fatal" 1 "$([[ "$rc" -ne 0 ]] && echo 1 || echo 0)"
+  assert_status "deploy-debug-image-${knob}-named-step" "DEPLOY_FAILED REASON=step-failed STEP=preload_debug_image" "$out"
+  assert_rc "deploy-debug-image-${knob}-stops-before-build" "" "$(builds)"
+done
 
 # A collector that does not roll out STOPS deploy before the root, naming the collector.
 reset_marks

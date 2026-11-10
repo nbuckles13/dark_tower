@@ -1026,6 +1026,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "serial_test",
+ "syn 2.0.111",
  "thiserror 1.0.69",
  "tokio",
  "tonic",

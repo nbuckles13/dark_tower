@@ -359,6 +359,13 @@ the superseded `JoinResponse.media_servers` is never read).
 
 Building blocks for the N+1 specs; each module header carries the detail.
 
+- **MH pool** (`mhPool.ts`, story 4 T-1): `createMhPool()` drives the Kind MH
+  pool through `mh.sh --json` (`DT_MH_SH`; execFile, no shell): `list`, `up`,
+  `drain`, `teardown`, `assertBaseline`, and the injector `kill` / `freeze` ->
+  `resume` (`mh.sh signal`, run-owned MHs only). The twin of the Rust
+  `mh_pool.rs`; `tests/mhPool.test.ts` pins every shared value. A spec that
+  calls `up` sets `test.setTimeout` above mh.sh's derived bound, and wraps a
+  freeze in `try/finally { await frozen.dispose() }`.
 - **Cohort** (`cohort.ts`, `fixtures.ts` `authAsCohortMember`): N+1 distinct
   accounts at the suite's one audio N (`SUITE_AUDIO_RECEIVE_SLOTS`), registered
   once per run by `global-setup.ts` — see §Budgets. `playwright.config.ts`

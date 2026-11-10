@@ -139,7 +139,7 @@ fn unset_message(state: &str) -> String {
 
 /// Read and validate [`ORG_SUBDOMAIN_VAR`] from the process environment.
 ///
-/// Also the Layer 7 per-run MH pool owner token (`mh_pool::RunOwner::for_run`):
+/// Also the Layer 7 per-run MH pool owner token (`mh_pool::MhPool::for_run`):
 /// mh.sh's `MH_OWNER_RE` is guarded byte-identical to [`SUBDOMAIN_PATTERN`]
 /// (`validate-subdomain-regex-sync.sh`), so every valid subdomain is a valid owner.
 ///

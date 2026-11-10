@@ -42,7 +42,7 @@
 //! Teardown is `mh.sh drain --all --owner <run token>` on EVERY exit path
 //! (the body runs in its own task, so a panic is caught). It needs no slot
 //! number from any output (the run token is the per-run org subdomain,
-//! `RunOwner::for_run`), because `up`'s not-available-timeout deliberately
+//! `MhPool::for_run`), because `up`'s not-available-timeout deliberately
 //! leaves its pod in place. A failed teardown fails the test even when the body
 //! passed, naming the REASON and the reclaim command. After a successful
 //! drain, teardown also waits until no GC replica still counts the removed MH
@@ -68,7 +68,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use env_tests::cluster::ClusterConnection;
 use env_tests::eventual::ConsistencyCategory;
 use env_tests::fixtures::deployment_config::LivePod;
 use env_tests::fixtures::gc_fleet::live_gc_pods;
@@ -76,8 +75,9 @@ use env_tests::fixtures::metrics::{
     format_instance_map, instance_for_pod_ip, poll_until_pinned_instance, settled_baseline,
     BASELINE_SETTLE_BOUND, PINNED_METRIC_BOUND,
 };
-use env_tests::fixtures::mh_pool::{RunOwner, REASON_NOT_AVAILABLE, REASON_NO_FREE_SLOT};
+use env_tests::fixtures::mh_pool::{MhPool, REASON_NOT_AVAILABLE, REASON_NO_FREE_SLOT};
 use env_tests::fixtures::PrometheusClient;
+use serial_test::serial;
 
 const ACCEPTED_PROMQL: &str =
     r#"sum by (instance) (gc_mh_registrations_total{outcome=~"ok|superseded"})"#;
@@ -88,45 +88,18 @@ const CONFLICT_PROMQL: &str =
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// `#[serial]`: this binary mutates the MH pool (`crate::resilience_hygiene`
+/// requires every test in a pool-mutating binary to be serialized).
 #[tokio::test]
+#[serial]
 async fn test_new_mh_on_a_real_slot_registers_with_no_gc_reject() {
-    let cluster = ClusterConnection::new()
-        .await
-        .expect("Failed to connect to cluster - ensure port-forwards are running");
-    let prom_url = cluster.prometheus_base_url.clone();
-    let owner = Arc::new(RunOwner::for_run());
-
-    let body_owner = Arc::clone(&owner);
-    let body = tokio::spawn(async move { body(&prom_url, body_owner).await }).await;
-
-    // Teardown on EVERY path: the task above has finished (its clone is gone),
-    // whether it returned or panicked.
-    let owner = Arc::try_unwrap(owner)
-        .unwrap_or_else(|_| panic!("the body task still holds the RunOwner after it finished"));
-    // Drain, then wait until no GC replica still counts the removed MH as
-    // selectable (it would otherwise be handed to the next suite's meetings).
-    let teardown = owner
-        .teardown_and_settle(&PrometheusClient::new(&cluster.prometheus_base_url))
-        .await;
-
-    match (body, teardown) {
-        (Ok(()), Ok(())) => {}
-        (Ok(()), Err(t)) => panic!("{t}"),
-        (Err(e), t) => {
-            if let Err(t) = t {
-                // Both failed: report the teardown first, then re-raise the
-                // body's own panic unchanged.
-                eprintln!("ALSO: {t}");
-            }
-            if e.is_panic() {
-                std::panic::resume_unwind(e.into_panic());
-            }
-            panic!("test body task did not complete: {e}");
-        }
-    }
+    // The shared leg scaffold: baseline before, the body in its own task, the
+    // asserted owner teardown + GC settle on EVERY path (so a removed MH is
+    // never handed to the next suite's meetings), baseline after.
+    MhPool::run_leg(|owner, prom_url| async move { body(&prom_url, owner).await }).await;
 }
 
-async fn body(prom_url: &str, owner: Arc<RunOwner>) {
+async fn body(prom_url: &str, owner: Arc<MhPool>) {
     let prom = PrometheusClient::new(prom_url);
 
     let gc = live_gc_pods().await;

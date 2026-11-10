@@ -59,7 +59,11 @@ def advance:
   | .deploys |= map(select(.metadata.deletionTimestamp == null or ._hold
                            or (lbl(LS) as $k | any($st.pods[]; lbl(LS) == $k))));
 def podview: .tick as $t | .pods | map(.status.conditions = [{type: "Ready",
-    status: (if ._ready_at >= 0 and $t >= ._ready_at then "True" else "False" end)}]);
+    status: (if ._ready_at >= 0 and $t >= ._ready_at then "True" else "False" end)}]
+  | .status.ephemeralContainerStatuses = [(._injects // [])[] | {name, state:
+      (if .waiting != null then {waiting: {reason: .waiting}}
+       elif .done_at >= 0 and $t >= .done_at then {terminated: {exitCode: .exit}}
+       else {running: {}} end)}]);
 def depview: podview as $pv | .deploys | map(lbl(LS) as $k
     | ([$pv[] | select(lbl(LS) == $k and .metadata.deletionTimestamp == null and .status.conditions[0].status == "True")] | length) as $a
     | .metadata.generation = 1
@@ -101,6 +105,20 @@ def delete_deploy($n):
           else . end)
       | ok("deployment.apps \"\($n)\" deleted")
     end;
+# signal's calls: `kubectl debug` adds an ephemeral container whose outcome is knobs.inject.
+def debug_pod($a):
+  ($a[1]) as $pn
+  | ([$a[] | select(startswith("--container=")) | ltrimstr("--container=")] | .[0]) as $cn
+  | if any(.pods[]; .metadata.name == $pn) | not then bad("Error from server (NotFound): pods \"\($pn)\" not found")
+    else (.knobs.inject // {}) as $i | .tick as $t
+      | .debugs += [{pod: $pn, container: $cn, argv: $a}]
+      | .pods |= map(if .metadata.name == $pn then
+            .spec.ephemeralContainers = ((.spec.ephemeralContainers // []) + [{name: $cn}])
+            | ._injects = ((._injects // []) + [{name: $cn, exit: ($i.exit // 0), logs: ($i.logs // ""), waiting: ($i.waiting // null),
+                                                 done_at: (if ($i.after // 1) < 0 then -1 else $t + ($i.after // 1) end)}])
+          else . end)
+      | ok("")
+    end;
 def lease_get:
   if .lease == null then bad("Error from server (NotFound): leases.coordination.k8s.io \"mh-pool\" not found")
   else (if .knobs.lease_steal and (.lease.spec.holderIdentity // "") != "thief@stub:1" then
@@ -128,6 +146,15 @@ def dispatch($a):
     elif ($a | length) == 5 and $a[0] == "get" and $a[1] == "deployment" and $a[3:] == ["-o", "json"] then
       (.polled += [$a[2]] | (first(depview[] | select(.metadata.name == $a[2])) // null) as $d
        | if $d == null then bad("Error from server (NotFound): deployments.apps \"\($a[2])\" not found") else ok($d | tojson) end)
+    elif ($a | length) == 5 and $a[0] == "get" and $a[1] == "pod" and $a[3:] == ["-o", "json"] then
+      ((first(podview[] | select(.metadata.name == $a[2])) // null) as $p
+       | if $p == null then bad("Error from server (NotFound): pods \"\($a[2])\" not found")
+         else ok($p | del(._injects, ._ready_at, ._gone_at, ._sigterm_at) | tojson) end)
+    elif $a[0] == "debug" and ($a | length) > 2 then debug_pod($a)
+    elif ($a | length) == 4 and $a[0] == "logs" and $a[2] == "-c" then
+      ((first(.pods[] | select(.metadata.name == $a[1])) // null) as $p
+       | (first(($p._injects // [])[] | select(.name == $a[3])) // null) as $c
+       | if $c == null then bad("Error from server (BadRequest): container \($a[3]) is not valid") else ok($c.logs) end)
     elif $s == "get lease mh-pool -o json" then lease_get
     elif ($a[0] == "create" or $a[0] == "replace") and $a[1] == "-f" and ($a[3:] == [] or $a[3:] == ["-o", "json"]) then
       (if $a[0] == "create" and $body.kind == "Deployment" then create_deploy($body)
@@ -152,8 +179,11 @@ cat >"${STUB_BIN}/kubectl" <<'STUB'
 #!/usr/bin/env bash
 # Stateful kubectl stub for mh.test.sh. Never permissive: see the suite header.
 S="${STUB_STATE:?STUB_STATE unset}"
-printf '%s\n' "$*" >>"$S/calls.log"
+line="$*"; printf '%s\n' "${line//$'\n'/\\n}" >>"$S/calls.log"
 for a in "$@"; do
+  case "$a" in
+    --custom=*) cat "${a#--custom=}" >>"$S/debug-custom.json"; echo >>"$S/debug-custom.json" ;;
+  esac
   case "$a" in
     --force|--force=*|--grace-period|--grace-period=*|--now)
       printf '%s\n' "$*" >>"$S/violation.force"; echo "stub kubectl: forbidden flag ${a}" >&2; exit 96 ;;
@@ -179,8 +209,14 @@ if [[ -f "$S/slow" ]]; then
   IFS='|' read -r slow_match slow_secs <"$S/slow"
   [[ "${args[*]}" == "${slow_match}"* ]] && sleep "$slow_secs"
 fi
-if [[ "${args[0]:-}" == "delete" && "${args[1]:-}" == pod* ]]; then
-  printf '%s\n' "${args[*]}" >>"$S/violation.force"; echo "stub kubectl: pod delete forbidden" >&2; exit 96
+# A pod delete in ANY resource position after `delete` (po|pod|pods, bare or /<name>; after
+# flags; in a multi-resource delete). Applies to every verb's calls; a Deployment delete passes.
+if [[ "${args[0]:-}" == "delete" ]]; then
+  for a in "${args[@]:1}"; do
+    if [[ "$a" =~ ^(po|pod|pods)(/.*)?$ || "$a" =~ ,(po|pod|pods)(,|$) || "$a" =~ ^(po|pod|pods), ]]; then
+      printf '%s\n' "${args[*]}" >>"$S/violation.force"; echo "stub kubectl: pod delete forbidden" >&2; exit 96
+    fi
+  done
 fi
 body="null"
 for (( i = 0; i < ${#args[@]}; i++ )); do
@@ -188,7 +224,7 @@ for (( i = 0; i < ${#args[@]}; i++ )); do
 done
 # argv as a JSON array, built in bash (jq 1.6's --args would parse a later `-o` as its own option).
 argv="["; sep=""
-for a in "${args[@]}"; do a="${a//\\/\\\\}"; a="${a//\"/\\\"}"; argv+="${sep}\"${a}\""; sep=","; done
+for a in "${args[@]}"; do a="${a//\\/\\\\}"; a="${a//\"/\\\"}"; a="${a//$'\n'/\\n}"; a="${a//$'\t'/\\t}"; argv+="${sep}\"${a}\""; sep=","; done
 argv+="]"
 mapfile -t res < <(jq -r --argjson body "$body" --argjson argv "$argv" --argjson now "$(date -u +%s)" \
   --arg contexts "${STUB_CONTEXTS:-${STUB_EXPECT_CONTEXT}}" -f "$STUB_JQ" "$S/state.json")
@@ -276,7 +312,10 @@ seed_mh() {
       .pods += [{metadata: ({name: "\($n)-seed", uid: "uid-seed-\($k)", labels: $lab, creationTimestamp: (($now - 60) | todate)}
                   + (if $st == "stuck" then {deletionTimestamp: (($now - 100) | todate)}
                      elif $del then {deletionTimestamp: (($now + 300) | todate)} else {} end)),
-                 spec: {terminationGracePeriodSeconds: (if $st == "draining" then 10 else 1 end)},
+                 spec: {terminationGracePeriodSeconds: (if $st == "draining" then 10 else 1 end),
+                        shareProcessNamespace: true,
+                        containers: [{name: "mh-service", livenessProbe: {httpGet: {path: "/health", port: 8083},
+                          initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 5, successThreshold: 1, failureThreshold: 3}}]},
                  status: {podIP: "10.244.1.\($k)", containerStatuses: [{name: "mh-service", restartCount: 2}]},
                  _ready_at: (if $st == "serving" then 0 else -1 end),
                  _gone_at: (if $st == "draining" then .tick + 10 else -1 end)}] end'
@@ -923,7 +962,10 @@ group_usage() {
 # --- preconditions -------------------------------------------------------------------------
 
 for bad in "frobnicate" "" "up --slot x" "up --timeout soon" "up --timeout 0" "drain" "drain --all" \
-           "up --owner E2E-X" "up --owner trailing-" "up --owner $(printf 'a%.0s' {1..64})" "up --bogus" "list extra"; do
+           "up --owner E2E-X" "up --owner trailing-" "up --owner $(printf 'a%.0s' {1..64})" "up --bogus" "list extra" \
+           "signal" "signal 0" "signal 0 KILL" "signal 0 HUP --owner run" "signal 0 kill --owner run" \
+           "signal 0 KILL --owner run --force" "signal 0 KILL STOP --owner run" "signal x KILL --owner run" \
+           "signal 0 KILL --owner run --bogus"; do
   new_case "usage: '${bad}'"
   IFS=' ' read -r -a argv <<<"$bad"
   run_mh "${argv[@]}" --json
@@ -1045,6 +1087,227 @@ done
 
 }
 
+group_signal() {
+# --- signal (TEST-ONLY injector) ---------------------------------------------------------------
+RUN="e2e-0123456789abcdef"
+# The pod a seeded slot k runs (seed_mh's naming).
+debug_argv() { jq -r '.debugs[-1].argv | join(" ")' "$CASE/state.json"; }
+
+new_case "signal STOP: ok, budget, entry + injector keys"
+seed_mh 0 "$RUN" "$REV" serving; seed_mh 1 baseline "$REV" serving
+knob inject '{"logs":"DT_INJECT pid=42 state=T"}'
+run_mh signal 0 STOP --owner "$RUN" --json
+expect ok 0
+assert_rc "$CASE_LABEL: key set = list entry + injector keys (exact)" \
+  "$(jq -c '. + ["debug_container","liveness_budget_seconds","ok","pid","process_state","restart_budget_seconds","signal"] | sort' <<<"$GOLDEN_SLOT")" "$(jout -c 'keys')"
+assert_rc "$CASE_LABEL: pid / state / signal" "42 T STOP" "$(jout '"\(.pid) \(.process_state) \(.signal)"')"
+assert_rc "$CASE_LABEL: liveness budget = (3-1)x10 + 5" 25 "$(jout '.liveness_budget_seconds')"
+assert_rc "$CASE_LABEL: no restart budget on STOP (key present, null)" "true null" "$(jout '"\(has("restart_budget_seconds")) \(.restart_budget_seconds)"')"
+assert_rc "$CASE_LABEL: entry read BEFORE the signal" "uid-seed-0 2 $RUN" "$(jout '"\(.pod_uid) \(.restart_count) \(.owner)"')"
+assert_rc "$CASE_LABEL: debug container name" "dt-inject-stop-0" "$(jout '.debug_container')"
+assert_status "$CASE_LABEL: SLOT" "MH_RESULT STATUS=OK REASON=ok SLOT=0" "$LAST"
+assert_rc "$CASE_LABEL: signal takes NO Lease" 0 "$(count_calls lease)"
+assert_rc "$CASE_LABEL: no create/delete" 0 "$(count_calls '(^| )(create|delete|replace) ')"
+A="$(debug_argv)"
+for want in "debug mh-s0-seed " " --attach=false " " --target=mh-service " " --container=dt-inject-stop-0 " \
+            " --image=$("$BASH_BIN" -c 'source "$1"; printf %s "$MH_DEBUG_IMAGE"' _ "$MH") " \
+            " --image-pull-policy=IfNotPresent " " --profile=restricted " " --custom=" " -- sh -c " " dt-inject-stop-0 STOP mh-service"; do
+  assert_status "$CASE_LABEL: debug argv has '${want}'" "$want" "$A "
+done
+assert_absent "$CASE_LABEL: never --profile=general (SYS_PTRACE)" "--profile=general" "$A"
+C="$(tail -n 1 "$CASE/debug-custom.json" 2>/dev/null)"
+assert_rc "$CASE_LABEL: --custom securityContext pinned" \
+  '{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"privileged":false,"runAsGroup":65532,"runAsNonRoot":true,"runAsUser":65532}' \
+  "$(jq -cS '.securityContext' <<<"$C" 2>/dev/null)"
+assert_rc "$CASE_LABEL: --custom adds no capability, nothing beyond securityContext" '[] ["securityContext"]' \
+  "$(jq -c '[.securityContext.capabilities.add // empty | .[]]' <<<"$C" 2>/dev/null) $(jq -c 'keys' <<<"$C" 2>/dev/null)"
+
+new_case "signal STOP then CONT: names increment, CONT reaches a not-Ready (frozen) MH"
+seed_mh 0 "$RUN" "$REV" starting; seed_mh 1 baseline "$REV" serving
+knob inject '{"logs":"DT_INJECT pid=42 state=T"}'
+run_mh signal 0 STOP --owner "$RUN" --json
+expect ok 0
+knob inject '{"logs":"DT_INJECT pid=42 state=S"}'
+run_mh signal 0 CONT --owner "$RUN" --json
+expect ok 0
+assert_rc "$CASE_LABEL: second container" "dt-inject-cont-1 S null null" "$(jout '"\(.debug_container) \(.process_state) \(.liveness_budget_seconds) \(.restart_budget_seconds)"')"
+
+new_case "signal KILL: process gone, no budget"
+seed_mh 0 "$RUN" "$REV" serving
+knob inject '{"logs":"some sh noise\nDT_INJECT pid=42 state=gone"}'
+run_mh signal 0 KILL --owner "$RUN" --json
+expect ok 0
+assert_rc "$CASE_LABEL: gone + null budget" "gone null dt-inject-kill-0" "$(jout '"\(.process_state) \(.liveness_budget_seconds) \(.debug_container)"')"
+assert_rc "$CASE_LABEL: restart budget = up's derived bound (probe window 2 + margin 30)" 32 "$(jout '.restart_budget_seconds')"
+new_case "signal KILL: restart budget follows MH_UP_MARGIN_S and the template probes"
+seed_mh 0 "$RUN" "$REV" serving
+knob inject '{"logs":"DT_INJECT pid=42 state=gone"}'
+run_mh MH_UP_MARGIN_S=0 signal 0 KILL --owner "$RUN" --json
+expect ok 0
+assert_rc "$CASE_LABEL: margin 0 -> the probe window alone" 2 "$(jout '.restart_budget_seconds')"
+
+budget_case() { # budget_case <label> <probe-jq-edit> <want>
+  new_case "signal STOP budget: $1"
+  seed_mh 0 "$RUN" "$REV" serving
+  state_edit ".pods[0].spec.containers[0].livenessProbe |= ($2)"
+  knob inject '{"logs":"DT_INJECT pid=42 state=T"}'
+  run_mh signal 0 STOP --owner "$RUN" --json
+  expect ok 0
+  assert_rc "$CASE_LABEL: budget" "$3" "$(jout '.liveness_budget_seconds')"
+}
+budget_case "(5-1)x7 + 2" '.periodSeconds = 7 | .failureThreshold = 5 | .timeoutSeconds = 2' 30
+budget_case "failureThreshold 1 -> timeout only" '.failureThreshold = 1' 5
+budget_case "initialDelaySeconds does not count" '.initialDelaySeconds = 999' 25
+
+for f in periodSeconds failureThreshold timeoutSeconds; do
+  new_case "signal STOP: absent livenessProbe.${f} fails (no k8s default)"
+  seed_mh 0 "$RUN" "$REV" serving
+  state_edit ".pods[0].spec.containers[0].livenessProbe |= del(.${f})"
+  run_mh signal 0 STOP --owner "$RUN" --json
+  expect kubectl-failed 1
+  assert_status "$CASE_LABEL: names the field" "livenessProbe.${f}" "$DETAIL"
+  assert_rc "$CASE_LABEL: nothing injected" 0 "$(count_calls '^.* debug ')"
+done
+new_case "signal STOP: no livenessProbe at all fails"
+seed_mh 0 "$RUN" "$REV" serving
+state_edit '.pods[0].spec.containers[0] |= del(.livenessProbe)'
+run_mh signal 0 STOP --owner "$RUN" --json
+expect kubectl-failed 1
+assert_rc "$CASE_LABEL: nothing injected" 0 "$(count_calls ' debug ')"
+new_case "signal KILL: needs no livenessProbe"
+seed_mh 0 "$RUN" "$REV" serving
+state_edit '.pods[0].spec.containers[0] |= del(.livenessProbe)'
+knob inject '{"logs":"DT_INJECT pid=42 state=gone"}'
+run_mh signal 0 KILL --owner "$RUN" --json
+expect ok 0
+
+# --- refusals: no injection, ever ---
+refuse_case() { # refuse_case <label> <reason> <rc> <setup-fn> <argv...>
+  local label="$1" reason="$2" rc="$3" setup="$4"; shift 4
+  new_case "signal refused: $label"
+  "$setup"
+  run_mh "$@" --json
+  expect "$reason" "$rc"
+  assert_rc "$CASE_LABEL: no debug call" 0 "$(count_calls ' debug ')"
+  assert_rc "$CASE_LABEL: no Lease" 0 "$(count_calls lease)"
+}
+s_baseline() { seed_mh 0 baseline "$REV" serving; seed_mh 1 baseline "$REV" serving; }
+s_manual() { seed_mh 0 manual "$REV" serving; }
+s_free() { :; }
+s_draining() { seed_mh 0 "$RUN" "$REV" draining-forever; }
+s_stuck() { seed_mh 0 "$RUN" "$REV" stuck; }
+s_finalizing() { seed_mh 0 "$RUN" "$REV" finalizing; }
+s_nospn() { seed_mh 0 "$RUN" "$REV" serving; state_edit '.pods[0].spec |= del(.shareProcessNamespace)'; }
+s_spnfalse() { seed_mh 0 "$RUN" "$REV" serving; state_edit '.pods[0].spec.shareProcessNamespace = false'; }
+refuse_case "baseline MH (foreign-owner, unforceable)" foreign-owner 4 s_baseline signal 0 KILL --owner "$RUN"
+refuse_case "manual MH (foreign-owner)" foreign-owner 4 s_manual signal 0 STOP --owner "$RUN"
+refuse_case "free slot" mh-not-serving 4 s_free signal 0 KILL --owner "$RUN"
+refuse_case "draining MH" mh-not-serving 4 s_draining signal 0 STOP --owner "$RUN"
+refuse_case "stuck MH" mh-not-serving 4 s_stuck signal 0 CONT --owner "$RUN"
+refuse_case "finalizing (no pod)" mh-not-serving 4 s_finalizing signal 0 KILL --owner "$RUN"
+refuse_case "pod without shareProcessNamespace" mh-no-share-process-namespace 2 s_nospn signal 0 STOP --owner "$RUN"
+assert_rc "$CASE_LABEL: the exact operator message" \
+  "pod mh-s0-seed lacks shareProcessNamespace: mh-template is stale or not Kind-rendered; re-run deploy (infra/kind/scripts/deploy.sh)" "$DETAIL"
+refuse_case "shareProcessNamespace=false" mh-no-share-process-namespace 2 s_spnfalse signal 0 KILL --owner "$RUN"
+
+# --- injector failures (validated DETAIL only) ---
+fail_case() { # fail_case <label> <reason> <inject-knob-json> <signal> [timeout]
+  new_case "signal fails: $1"
+  seed_mh 0 "$RUN" "$REV" serving
+  knob inject "$3"
+  if [[ -n "${5:-}" ]]; then run_mh signal 0 "$4" --owner "$RUN" --timeout "$5" --json
+  else run_mh signal 0 "$4" --owner "$RUN" --json; fi
+  expect "$2" 1
+}
+fail_case "pid not unique (container exit 11)" signal-failed '{"exit":11,"logs":"DT_INJECT error=pid-count count=2"}' KILL
+assert_status "$CASE_LABEL: DETAIL carries the validated result" "exit=11 error=pid-count count=2" "$DETAIL"
+fail_case "raw container output never reaches DETAIL" signal-failed '{"exit":12,"logs":"Error from server: SECRET-abc /proc/1/environ MH_CLIENT_SECRET=x\nDT_INJECT error=pid-one"}' STOP
+assert_status "$CASE_LABEL: the validated line" "error=pid-one" "$DETAIL"
+assert_absent "$CASE_LABEL: no raw text in DETAIL" "SECRET" "$DETAIL"
+assert_absent "$CASE_LABEL: no raw text anywhere on stderr" "SECRET" "$ERR"
+assert_absent "$CASE_LABEL: no raw text in the JSON" "SECRET" "$OUT"
+fail_case "non-zero exit, unrecognised output" signal-failed '{"exit":1,"logs":"sh: kill: Operation not permitted"}' KILL
+assert_status "$CASE_LABEL: says so" "exit=1 no result line" "$DETAIL"
+assert_absent "$CASE_LABEL: raw text not relayed" "Operation not permitted" "$ERR"
+fail_case "exit 0 without a result line" signal-failed '{"logs":"hello"}' KILL
+fail_case "STOP did not take effect" signal-failed '{"logs":"DT_INJECT pid=42 state=S"}' STOP
+fail_case "STOP reported tracing-stop t, not T" signal-failed '{"logs":"DT_INJECT pid=42 state=t"}' STOP
+fail_case "CONT left it stopped" signal-failed '{"logs":"DT_INJECT pid=42 state=T"}' CONT
+fail_case "KILL left it running" signal-failed '{"logs":"DT_INJECT pid=42 state=R"}' KILL
+fail_case "reported pid 1" signal-failed '{"logs":"DT_INJECT pid=1 state=T"}' STOP
+fail_case "never terminates (bounded)" debug-container-timeout '{"after":-1}' STOP 1
+assert_status "$CASE_LABEL: names the container" "container=dt-inject-stop-0 not terminated within 1s" "$DETAIL"
+fail_case "image pull fails fast" debug-container-timeout '{"after":-1,"waiting":"ImagePullBackOff"}' KILL
+assert_status "$CASE_LABEL: names the waiting reason" "waiting=ImagePullBackOff" "$DETAIL"
+
+# --- the ONE in-container script, run for real against a local process ---
+# A uniquely named copy of sleep stands in for mh-service (the comm is the script's $2).
+COMM="dtinj$$x"; COMM="${COMM:0:15}"
+new_case "in-container script: STOP / CONT / KILL on a real process"
+cp "$(command -v sleep)" "$CASE/$COMM"
+SCRIPT="$("$BASH_BIN" -c 'source "$1"; printf %s "$MH_INJECT_SCRIPT"' _ "$MH")"
+pstate() { sed -n 's/^[0-9]* (.*) \([A-Za-z]\) .*/\1/p' "/proc/$1/stat" 2>/dev/null; }
+# wait_comm <pid>: bounded poll (5 s, 0.05 s steps) until the process IS $COMM; loud at the bound.
+wait_comm() {
+  local i
+  for (( i = 0; i < 100; i++ )); do
+    [[ "$(cat "/proc/$1/comm" 2>/dev/null)" == "$COMM" ]] && return 0
+    sleep 0.05
+  done
+  assert_rc "$CASE_LABEL: process $1 never showed comm $COMM within 5s" "$COMM" "$(cat "/proc/$1/comm" 2>/dev/null)"
+  return 1
+}
+# Every stand-in is SIGKILLed at case end (assertions never abort, so this always runs); KILL
+# also ends a STOPped one, so nothing is left behind.
+TPIDS=()
+reap_standins() { local p; for p in "${TPIDS[@]}"; do kill -KILL "$p" 2>/dev/null; wait "$p" 2>/dev/null; done; TPIDS=(); }
+"$CASE/$COMM" 300 & tpid=$!; TPIDS+=("$tpid")
+wait_comm "$tpid"
+o="$(sh -c "$SCRIPT" dt-inject STOP "$COMM")"; r=$?
+assert_rc "$CASE_LABEL: STOP rc" 0 "$r"; assert_rc "$CASE_LABEL: STOP line" "DT_INJECT pid=${tpid} state=T" "$o"
+assert_rc "$CASE_LABEL: really stopped" T "$(pstate "$tpid")"
+o="$(sh -c "$SCRIPT" dt-inject CONT "$COMM")"; r=$?
+assert_rc "$CASE_LABEL: CONT rc" 0 "$r"; assert_rc "$CASE_LABEL: really running" S "$(pstate "$tpid")"
+o="$(sh -c "$SCRIPT" dt-inject HUP "$COMM")"; r=$?
+assert_rc "$CASE_LABEL: closed set re-checked in-container" "10 DT_INJECT error=bad-signal" "$r $o"
+assert_rc "$CASE_LABEL: HUP never sent" S "$(pstate "$tpid")"
+"$CASE/$COMM" 300 & tpid2=$!; TPIDS+=("$tpid2")
+wait_comm "$tpid2"
+o="$(sh -c "$SCRIPT" dt-inject KILL "$COMM")"; r=$?
+assert_rc "$CASE_LABEL: two matches refused" "11 DT_INJECT error=pid-count count=2" "$r $o"
+kill "$tpid2" 2>/dev/null; wait "$tpid2" 2>/dev/null
+o="$(sh -c "$SCRIPT" dt-inject KILL "$COMM")"; r=$?
+assert_rc "$CASE_LABEL: KILL" "0 DT_INJECT pid=${tpid} state=gone" "$r $o"
+wait "$tpid" 2>/dev/null
+o="$(sh -c "$SCRIPT" dt-inject KILL "$COMM")"; r=$?
+assert_rc "$CASE_LABEL: no match refused" "11 DT_INJECT error=pid-count count=0" "$r $o"
+assert_rc "$CASE_LABEL: exactly one kill, of \$p by name (never -1/0/a group)" 1 "$(grep -c 'kill -s "\$1" "\$p"' <<<"$SCRIPT")"
+assert_rc "$CASE_LABEL: no other kill in the script" 1 "$(grep -c 'kill ' <<<"$SCRIPT")"
+assert_status "$CASE_LABEL: pid > 1 checked before kill" '[ "$p" -gt 1 ]' "$SCRIPT"
+reap_standins
+
+# --- constants ---
+new_case "MH_DEBUG_IMAGE is digest-pinned"
+IMG="$("$BASH_BIN" -c 'source "$1"; printf %s "$MH_DEBUG_IMAGE"' _ "$MH")"
+assert_rc "$CASE_LABEL: @sha256:<64 hex> at the end" true "$([[ "$IMG" =~ @sha256:[0-9a-f]{64}$ ]] && echo true || echo false)"
+
+# --- the widened pod-delete matcher: negative controls (the stub must flag each) ---
+for bad in "delete deployment x pod/y" "delete po y" "delete -l a=b pods" "delete pods,deployments -l a=b"; do
+  new_case "stub flags a pod delete (control): ${bad}"
+  IFS=' ' read -r -a argv <<<"$bad"
+  PATH="${STUB_BIN}:${PATH}" STUB_STATE="$CASE" STUB_EXPECT_CONTEXT="kind-x" \
+    kubectl --context kind-x --request-timeout=5s -n dark-tower "${argv[@]}" >/dev/null 2>&1
+  assert_rc "$CASE_LABEL: rc 96" 96 "$?"
+  assert_marker "$CASE_LABEL: violation recorded" "$CASE" "violation.force"
+  rm -f "$CASE/violation.force"   # the control's own violation, not mh.sh's
+  : >"$CASE/calls.log"            # ... and its own argv (the global argv checks are about mh.sh)
+done
+new_case "stub passes drain's Deployment delete (control)"
+PATH="${STUB_BIN}:${PATH}" STUB_STATE="$CASE" STUB_EXPECT_CONTEXT="kind-x" \
+  kubectl --context kind-x --request-timeout=5s -n dark-tower delete deployment mh-s0 --cascade=foreground --wait=false >/dev/null 2>&1
+assert_no_marker "$CASE_LABEL: not flagged" "$CASE" "violation.*"
+}
+
 group_failures() {
 # --- kubectl-failed / internal-error ---------------------------------------------------------
 
@@ -1109,7 +1372,7 @@ expect internal-error 1
 # Each group is independent (its own case dirs under $WORK, its own collector file), so the
 # suite's wall time is its longest group, not the sum (the timeout cases wait real seconds).
 # A group's counters come back through a result file; a group that dies without one is a FAIL.
-MH_TEST_GROUPS=(group_list group_nextfit group_up_object group_up_capacity group_up_idempotent group_up_derived group_up_margin group_lease group_drain_basic group_drain_timeouts group_drain_refusals group_drain_all group_upgrade_a group_upgrade_b group_usage group_preconditions group_failures)
+MH_TEST_GROUPS=(group_list group_nextfit group_up_object group_up_capacity group_up_idempotent group_up_derived group_up_margin group_lease group_drain_basic group_drain_timeouts group_drain_refusals group_drain_all group_upgrade_a group_upgrade_b group_usage group_preconditions group_failures group_signal)
 for g in "${MH_TEST_GROUPS[@]}"; do
   (
     GROUP_ID="${g#group_}"; PASS=0; FAIL=0; FAILURES=()
@@ -1157,6 +1420,8 @@ assert_absent "global: no --force ever" "--force" "$ALL_CALLS"
 assert_rc "global: no pod delete ever" 0 "$(grep -cE '(^| )delete pods?( |$)' <<<"$ALL_CALLS")"
 assert_rc "global: control: foreground Deployment deletes were issued" true \
   "$(grep -q 'delete deployment mh-s[0-9]* --cascade=foreground --wait=false' <<<"$ALL_CALLS" && echo true || echo false)"
+assert_rc "global: control: signal's restricted debug calls were issued (and recorded)" true \
+  "$(grep -qE '(^| )debug mh-s[0-9]+-seed .*--profile=restricted' <<<"$ALL_CALLS" && echo true || echo false)"
 assert_no_marker "global: no stub violation in any case" "$WORK" "case-*/violation.*"
 
 # Static checks on the script body (comments excluded), each with a positive control.

@@ -290,6 +290,52 @@ pub fn replica_settled(r: ReplicaSettle, live: f64) -> bool {
     recomputed && r.selectable.is_some_and(|n| n <= live)
 }
 
+/// The FAILURE-ONLY budget for a pool change to settle end to end, as GC
+/// sees it: B (the largest `gc_mh_staleness_threshold_seconds` the live GC
+/// replicas publish) + two GC health-checker ticks (read from
+/// [`GC_HEALTH_TICK_SRC`]) + the MetricsScrape ceiling. ONE home: the
+/// removal-settle wait below and `mh_pool::MhPool::assert_baseline` both use
+/// it, so neither re-derives GC's staleness.
+///
+/// # Errors
+/// The tick source is unreadable, or a GC replica publishes no staleness
+/// bound.
+pub async fn removal_settle_budget(prom: &PrometheusClient) -> Result<Duration, String> {
+    removal_settle_budget_for(prom, &live_gc_pods().await).await
+}
+
+async fn removal_settle_budget_for(
+    prom: &PrometheusClient,
+    gc: &GcPods,
+) -> Result<Duration, String> {
+    let tick_path = crate::repo_root().join(GC_HEALTH_TICK_SRC);
+    let tick = std::fs::read_to_string(&tick_path)
+        .map_err(|e| {
+            format!(
+                "SETTLE (removed-mh-still-selectable): read {}: {e}",
+                tick_path.display()
+            )
+        })
+        .and_then(|src| gc_health_tick(&src))?;
+
+    let staleness = prom
+        .instance_counter_map(STALENESS_PER_REPLICA_PROMQL)
+        .await;
+    let mut bound_s = 0.0_f64;
+    for p in &gc.serving {
+        let (_, b) = instance_for_pod_ip(&staleness, &p.ip).ok_or_else(|| {
+            format!(
+                "SETTLE (removed-mh-still-selectable): GC pod {} publishes no \
+                 gc_mh_staleness_threshold_seconds; instances {}",
+                p.name,
+                format_instance_map(&staleness)
+            )
+        })?;
+        bound_s = bound_s.max(b);
+    }
+    Ok(Duration::from_secs_f64(bound_s) + 2 * tick + ConsistencyCategory::MetricsScrape.timeout())
+}
+
 /// After a test REMOVED an MH (owner teardown), wait until no GC replica still
 /// counts it as selectable, so a later suite is never handed a dead handler.
 ///
@@ -326,33 +372,7 @@ pub fn replica_settled(r: ReplicaSettle, live: f64) -> bool {
 /// `removed-mh-still-selectable`, naming each replica's state.
 pub async fn wait_removed_mh_unselectable(prom: &PrometheusClient) -> Result<(), String> {
     let gc = live_gc_pods().await;
-    let tick_path = crate::repo_root().join(GC_HEALTH_TICK_SRC);
-    let tick = std::fs::read_to_string(&tick_path)
-        .map_err(|e| {
-            format!(
-                "SETTLE (removed-mh-still-selectable): read {}: {e}",
-                tick_path.display()
-            )
-        })
-        .and_then(|src| gc_health_tick(&src))?;
-
-    let staleness = prom
-        .instance_counter_map(STALENESS_PER_REPLICA_PROMQL)
-        .await;
-    let mut bound_s = 0.0_f64;
-    for p in &gc.serving {
-        let (_, b) = instance_for_pod_ip(&staleness, &p.ip).ok_or_else(|| {
-            format!(
-                "SETTLE (removed-mh-still-selectable): GC pod {} publishes no \
-                 gc_mh_staleness_threshold_seconds; instances {}",
-                p.name,
-                format_instance_map(&staleness)
-            )
-        })?;
-        bound_s = bound_s.max(b);
-    }
-    let budget =
-        Duration::from_secs_f64(bound_s) + 2 * tick + ConsistencyCategory::MetricsScrape.timeout();
+    let budget = removal_settle_budget_for(prom, &gc).await?;
 
     let live_slots = tokio::task::spawn_blocking(crate::fixtures::mh_pool::list)
         .await
@@ -429,7 +449,7 @@ pub async fn wait_removed_mh_unselectable(prom: &PrometheusClient) -> Result<(),
         if std::time::Instant::now() > deadline {
             return Err(format!(
                 "SETTLE (removed-mh-still-selectable): after the owner teardown, within \
-                 B={bound_s}s + 2 x {tick:?} tick + the scrape ceiling, GC replica(s) either \
+                 {budget:?} (removal_settle_budget: B + 2 GC health ticks + the scrape ceiling), GC replica(s) either \
                  still count more {SETTLE_STATES} rows than the {live} {SETTLE_LIVE_STATE} MH \
                  slot(s), or never completed a gc_mh_available recompute: [{}]. A removed MH may still be \
                  selectable, so the next meeting may land on a dead handler. A recompute counter \
