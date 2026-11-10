@@ -51,15 +51,24 @@ impl HealthStatus {
         }
     }
 
-    /// Parse from database string representation.
+    /// Parse from database string representation (an unknown string reads
+    /// as `Unhealthy`; see [`Self::try_from_db_str`] for the strict form).
     pub fn from_db_str(s: &str) -> Self {
+        Self::try_from_db_str(s).unwrap_or(HealthStatus::Unhealthy)
+    }
+
+    /// Strict parse: `None` for a string outside the schema's CHECK set.
+    /// Used where defaulting to `Unhealthy` would fail OPEN (the RegisterMH
+    /// supersede decision treats `unhealthy` as supersedable).
+    #[must_use]
+    pub fn try_from_db_str(s: &str) -> Option<Self> {
         match s {
-            "pending" => HealthStatus::Pending,
-            "healthy" => HealthStatus::Healthy,
-            "degraded" => HealthStatus::Degraded,
-            "unhealthy" => HealthStatus::Unhealthy,
-            "draining" => HealthStatus::Draining,
-            _ => HealthStatus::Unhealthy,
+            "pending" => Some(HealthStatus::Pending),
+            "healthy" => Some(HealthStatus::Healthy),
+            "degraded" => Some(HealthStatus::Degraded),
+            "unhealthy" => Some(HealthStatus::Unhealthy),
+            "draining" => Some(HealthStatus::Draining),
+            _ => None,
         }
     }
 }

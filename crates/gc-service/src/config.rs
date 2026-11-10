@@ -3,6 +3,7 @@
 //! Configuration is loaded from environment variables. All sensitive
 //! fields are redacted in Debug output.
 
+use crate::mh_endpoint_policy::MhEndpointAllowlist;
 use common::jwt::{DEFAULT_CLOCK_SKEW, MAX_CLOCK_SKEW};
 use common::secret::SecretString;
 use std::collections::HashMap;
@@ -80,6 +81,76 @@ pub const MH_REGISTRY_KEYS: [&str; 4] = [
     "GC_MH_REGISTRY_RETENTION_SECONDS",
     "GC_MH_INITIAL_HANDLERS_PER_MEETING",
 ];
+
+// =============================================================================
+// RegisterMH endpoint allowlists (ADR-0039 §7, arm 0 of the registration rule;
+// typed parse in `crate::mh_endpoint_policy`)
+//
+// All five keys are REQUIRED, with no Rust default: missing = `MissingEnvVar`,
+// malformed or EMPTY = `InvalidMhEndpointAllowlist` naming the key (an empty
+// allowlist would reject every MH while GC reports healthy, so it fails at
+// startup instead). The base `infra/services/gc-service/config.env` carries
+// the four topology keys EMPTY; every deploy path renders them (Kind:
+// `infra/kind/scripts/deploy.sh:render_env_overlay`, derived from the MH slot
+// table and the kind podSubnet). `GC_MH_GRPC_ALLOWED_SCHEMES` is `grpc` in
+// the base, which means CLEARTEXT h2c, UNAUTHENTICATED: no TLS and no peer
+// authentication of the MH server, so MC's bearer crosses that channel in
+// cleartext (S6). It flips by config only to a TLS scheme when S6 mTLS lands.
+// =============================================================================
+
+/// The five REQUIRED RegisterMH endpoint allowlist keys. (Presence checks are
+/// spelled out per key in [`mh_endpoint_allowlist_from_vars`] for `dt-guard
+/// env-config`; this list is for consumers that enumerate them, e.g. tests.)
+pub const MH_ENDPOINT_ALLOWLIST_KEYS: [&str; 5] = [
+    "GC_MH_WT_ALLOWED_HOSTS",
+    "GC_MH_WT_ALLOWED_PORTS",
+    "GC_MH_GRPC_ALLOWED_SCHEMES",
+    "GC_MH_GRPC_ALLOWED_CIDRS",
+    "GC_MH_GRPC_ALLOWED_PORTS",
+];
+
+/// The ONE format site for allowlist config errors: every message starts with
+/// the key.
+fn allowlist_err(key: &str, detail: String) -> ConfigError {
+    ConfigError::InvalidMhEndpointAllowlist(format!("{key}: {detail}"))
+}
+
+/// Parse the five REQUIRED RegisterMH endpoint allowlist keys.
+///
+/// # Errors
+///
+/// `MissingEnvVar` naming an absent key; `InvalidMhEndpointAllowlist`
+/// (message starts with the key, then the offending entry) for an empty or
+/// malformed one.
+pub fn mh_endpoint_allowlist_from_vars(
+    vars: &HashMap<String, String>,
+) -> Result<MhEndpointAllowlist, ConfigError> {
+    use crate::mh_endpoint_policy as p;
+    // One-line `MissingEnvVar(` + literal per key for `dt-guard env-config`.
+    let wt_hosts = vars
+        .get("GC_MH_WT_ALLOWED_HOSTS")
+        .ok_or_else(|| ConfigError::MissingEnvVar("GC_MH_WT_ALLOWED_HOSTS".to_string()))?;
+    let wt_ports = vars
+        .get("GC_MH_WT_ALLOWED_PORTS")
+        .ok_or_else(|| ConfigError::MissingEnvVar("GC_MH_WT_ALLOWED_PORTS".to_string()))?;
+    let grpc_schemes = vars
+        .get("GC_MH_GRPC_ALLOWED_SCHEMES")
+        .ok_or_else(|| ConfigError::MissingEnvVar("GC_MH_GRPC_ALLOWED_SCHEMES".to_string()))?;
+    let grpc_cidrs = vars
+        .get("GC_MH_GRPC_ALLOWED_CIDRS")
+        .ok_or_else(|| ConfigError::MissingEnvVar("GC_MH_GRPC_ALLOWED_CIDRS".to_string()))?;
+    let grpc_ports = vars
+        .get("GC_MH_GRPC_ALLOWED_PORTS")
+        .ok_or_else(|| ConfigError::MissingEnvVar("GC_MH_GRPC_ALLOWED_PORTS".to_string()))?;
+    Ok(MhEndpointAllowlist::new(
+        p::parse_wt_hosts(wt_hosts).map_err(|d| allowlist_err("GC_MH_WT_ALLOWED_HOSTS", d))?,
+        p::parse_port_set(wt_ports).map_err(|d| allowlist_err("GC_MH_WT_ALLOWED_PORTS", d))?,
+        p::parse_scheme_set(grpc_schemes)
+            .map_err(|d| allowlist_err("GC_MH_GRPC_ALLOWED_SCHEMES", d))?,
+        p::parse_cidr_set(grpc_cidrs).map_err(|d| allowlist_err("GC_MH_GRPC_ALLOWED_CIDRS", d))?,
+        p::parse_port_set(grpc_ports).map_err(|d| allowlist_err("GC_MH_GRPC_ALLOWED_PORTS", d))?,
+    ))
+}
 
 /// Bounds of `GC_MH_LOAD_REPORT_INTERVAL_MS`, milliseconds.
 const MIN_MH_LOAD_REPORT_INTERVAL_MS: u64 = 1_000;
@@ -377,6 +448,9 @@ pub struct Config {
 
     /// MH registry timing and sizing (ADR-0039 §10). Not secret.
     pub mh_registry: MhRegistryConfig,
+
+    /// RegisterMH endpoint allowlists (ADR-0039 §7, arm 0). Not secret.
+    pub mh_endpoint_allowlist: MhEndpointAllowlist,
 }
 
 /// Custom Debug implementation that redacts sensitive fields.
@@ -410,6 +484,7 @@ impl fmt::Debug for Config {
             .field("environment", &self.environment)
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("mh_registry", &self.mh_registry)
+            .field("mh_endpoint_allowlist", &self.mh_endpoint_allowlist)
             .finish()
     }
 }
@@ -439,6 +514,9 @@ pub enum ConfigError {
 
     #[error("Invalid MH registry configuration: {0}")]
     InvalidMhRegistryConfig(String),
+
+    #[error("Invalid MH endpoint allowlist configuration: {0}")]
+    InvalidMhEndpointAllowlist(String),
 }
 
 impl Config {
@@ -688,6 +766,7 @@ impl Config {
             .unwrap_or_default();
 
         let mh_registry = MhRegistryConfig::from_vars(vars)?;
+        let mh_endpoint_allowlist = mh_endpoint_allowlist_from_vars(vars)?;
 
         // When OTel is enabled the endpoint is required: fail fast with a clear
         // message rather than letting init_otel reject an empty/unparseable URL.
@@ -719,6 +798,7 @@ impl Config {
             environment,
             cors_allowed_origins,
             mh_registry,
+            mh_endpoint_allowlist,
         })
     }
 
@@ -767,7 +847,87 @@ mod tests {
                 "GC_MH_INITIAL_HANDLERS_PER_MEETING".to_string(),
                 "3".to_string(),
             ),
+            // Test-local RegisterMH allowlist values (these tests exercise the
+            // parse; arm behaviour is tested in mh_endpoint_policy.rs).
+            (
+                "GC_MH_WT_ALLOWED_HOSTS".to_string(),
+                "127.0.0.1,.mh.test".to_string(),
+            ),
+            (
+                "GC_MH_WT_ALLOWED_PORTS".to_string(),
+                "4440,4441".to_string(),
+            ),
+            ("GC_MH_GRPC_ALLOWED_SCHEMES".to_string(), "grpc".to_string()),
+            (
+                "GC_MH_GRPC_ALLOWED_CIDRS".to_string(),
+                "10.244.0.0/16".to_string(),
+            ),
+            ("GC_MH_GRPC_ALLOWED_PORTS".to_string(), "50053".to_string()),
         ])
+    }
+
+    #[test]
+    fn test_mh_endpoint_allowlist_each_key_missing_fails_naming_key() {
+        assert!(Config::from_vars(&base_vars()).is_ok(), "positive control");
+        for key in MH_ENDPOINT_ALLOWLIST_KEYS {
+            let mut vars = base_vars();
+            vars.remove(key);
+            let err = Config::from_vars(&vars).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::MissingEnvVar(k) if k == key),
+                "{key}: expected MissingEnvVar naming the key, got {err:?}"
+            );
+        }
+    }
+
+    /// Reverse direction of the missing-key test: a map holding ONLY the
+    /// listed keys parses, so every key the reader requires is in
+    /// `MH_ENDPOINT_ALLOWLIST_KEYS` (which env-tests mirror and drift-check).
+    #[test]
+    fn test_mh_endpoint_allowlist_keys_list_is_complete() {
+        let all = base_vars();
+        let only_listed: HashMap<String, String> = MH_ENDPOINT_ALLOWLIST_KEYS
+            .iter()
+            .map(|k| ((*k).to_string(), all[*k].clone()))
+            .collect();
+        assert!(mh_endpoint_allowlist_from_vars(&only_listed).is_ok());
+    }
+
+    /// Malformed or empty values fail, naming the key first; each key's
+    /// valid value is in `base_vars` (the positive arm).
+    #[test]
+    fn test_mh_endpoint_allowlist_malformed_table() {
+        let cases: &[(&str, &str)] = &[
+            ("GC_MH_WT_ALLOWED_HOSTS", ""),
+            ("GC_MH_WT_ALLOWED_HOSTS", "127.0.0.1,"),
+            ("GC_MH_WT_ALLOWED_HOSTS", "*"),
+            ("GC_MH_WT_ALLOWED_HOSTS", "."),
+            ("GC_MH_WT_ALLOWED_HOSTS", ".1"),
+            ("GC_MH_WT_ALLOWED_HOSTS", "https://mh.test"),
+            ("GC_MH_WT_ALLOWED_PORTS", ""),
+            ("GC_MH_WT_ALLOWED_PORTS", "0"),
+            ("GC_MH_WT_ALLOWED_PORTS", "70000"),
+            ("GC_MH_GRPC_ALLOWED_SCHEMES", ""),
+            ("GC_MH_GRPC_ALLOWED_SCHEMES", "*"),
+            ("GC_MH_GRPC_ALLOWED_SCHEMES", "grpc,"),
+            ("GC_MH_GRPC_ALLOWED_CIDRS", ""),
+            ("GC_MH_GRPC_ALLOWED_CIDRS", "0.0.0.0/0"),
+            ("GC_MH_GRPC_ALLOWED_CIDRS", "::/0"),
+            ("GC_MH_GRPC_ALLOWED_CIDRS", "10.244.1.0/16"),
+            ("GC_MH_GRPC_ALLOWED_CIDRS", "10.244.0.0"),
+            ("GC_MH_GRPC_ALLOWED_PORTS", ""),
+            ("GC_MH_GRPC_ALLOWED_PORTS", "-1"),
+        ];
+        for (key, value) in cases {
+            let mut vars = base_vars();
+            vars.insert((*key).to_string(), (*value).to_string());
+            let err = Config::from_vars(&vars).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::InvalidMhEndpointAllowlist(msg)
+                    if msg.starts_with(&format!("{key}: "))),
+                "{key}={value:?}: expected InvalidMhEndpointAllowlist starting with the key, got {err:?}"
+            );
+        }
     }
 
     #[test]

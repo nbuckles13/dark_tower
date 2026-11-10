@@ -1287,6 +1287,7 @@ dependencies = [
  "governor",
  "hex",
  "http-body-util",
+ "ipnet",
  "jsonwebtoken",
  "metrics",
  "metrics-exporter-prometheus",

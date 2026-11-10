@@ -11,7 +11,8 @@ pub use gc_service::config::MH_REGISTRY_KEYS;
 use std::collections::HashMap;
 
 /// The shipped GC ConfigMap source, compiled in.
-const GC_CONFIG_ENV: &str = include_str!("../../../infra/services/gc-service/config.env");
+pub(crate) const GC_CONFIG_ENV: &str =
+    include_str!("../../../infra/services/gc-service/config.env");
 
 /// Strictly parse a KEY=VALUE env file.
 ///

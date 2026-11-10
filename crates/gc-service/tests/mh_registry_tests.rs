@@ -7,7 +7,9 @@
 #[path = "common/mod.rs"]
 mod test_common;
 
-use gc_service::repositories::{HealthStatus, MediaHandlersRepository};
+use gc_service::repositories::{
+    HealthStatus, MediaHandlersRepository, MhRegistrationDecision, NewMhRegistration,
+};
 use gc_service::services::MhSelectionService;
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -25,11 +27,14 @@ fn shipped_bound() -> Duration {
 async fn test_mh_registration_creates_handler(pool: PgPool) {
     MediaHandlersRepository::register_mh(
         &pool,
-        "test-mh-001",
-        "us-east-1",
-        "https://mh:443",
-        "grpc://mh:50051",
-        1000,
+        &NewMhRegistration {
+            handler_id: "test-mh-001",
+            region: "us-east-1",
+            webtransport_endpoint: "https://mh:443",
+            grpc_endpoint: "grpc://mh:50051",
+            max_streams: 1000,
+        },
+        shipped_bound(),
     )
     .await
     .expect("Registration should succeed");
@@ -48,20 +53,33 @@ async fn test_mh_registration_creates_handler(pool: PgPool) {
     assert_eq!(handler.health_status, HealthStatus::Pending);
 }
 
-/// Test MH re-registration updates existing handler.
+/// Re-registration of an existing id. Previously this test asserted the
+/// silent endpoint rewrite (`ON CONFLICT DO UPDATE SET ..._endpoint`), which
+/// ADR-0039 §7 arm 1 removes: an incarnation's endpoints are FIXED FOR ITS
+/// LIFE. Converted, not deleted: identical endpoints update region/capacity
+/// and reset to pending; changed endpoints are refused with the row unchanged.
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_mh_reregistration_updates_handler(pool: PgPool) {
-    // Initial registration
-    MediaHandlersRepository::register_mh(
+    let reg = |region, wt, grpc, max_streams| NewMhRegistration {
+        handler_id: "test-mh-002",
+        region,
+        webtransport_endpoint: wt,
+        grpc_endpoint: grpc,
+        max_streams,
+    };
+    let initial = MediaHandlersRepository::register_mh(
         &pool,
-        "test-mh-002",
-        "us-east-1",
-        "https://mh-old:443",
-        "grpc://mh-old:50051",
-        500,
+        &reg(
+            "us-east-1",
+            "https://mh-old:443",
+            "grpc://mh-old:50051",
+            500,
+        ),
+        shipped_bound(),
     )
     .await
     .expect("Initial registration should succeed");
+    assert_eq!(initial, MhRegistrationDecision::Registered);
 
     // Update heartbeat to healthy
     MediaHandlersRepository::update_load_report(
@@ -76,29 +94,57 @@ async fn test_mh_reregistration_updates_handler(pool: PgPool) {
     .await
     .expect("Update should succeed");
 
-    // Re-registration with new endpoints
-    MediaHandlersRepository::register_mh(
+    // Changed endpoints: refused, row unchanged (still healthy, old endpoints).
+    let changed = MediaHandlersRepository::register_mh(
         &pool,
-        "test-mh-002",
-        "us-west-2", // Different region
-        "https://mh-new:443",
-        "grpc://mh-new:50051",
-        1000, // Different capacity
+        &reg(
+            "us-west-2",
+            "https://mh-new:443",
+            "grpc://mh-new:50051",
+            1000,
+        ),
+        shipped_bound(),
     )
     .await
-    .expect("Re-registration should succeed");
-
+    .expect("Re-registration query should succeed");
+    assert_eq!(
+        changed,
+        MhRegistrationDecision::EndpointChanged {
+            webtransport: true,
+            grpc: true
+        }
+    );
     let handler = MediaHandlersRepository::get_handler(&pool, "test-mh-002")
         .await
         .expect("Query should succeed")
         .expect("Handler should exist");
+    assert_eq!(handler.region, "us-east-1");
+    assert_eq!(handler.webtransport_endpoint, "https://mh-old:443");
+    assert_eq!(handler.grpc_endpoint, "grpc://mh-old:50051");
+    assert_eq!(handler.max_streams, 500);
+    assert_eq!(handler.health_status, HealthStatus::Healthy);
 
-    // Verify updated values
+    // Identical endpoints: accepted; region/capacity updated, reset to pending.
+    let same = MediaHandlersRepository::register_mh(
+        &pool,
+        &reg(
+            "us-west-2",
+            "https://mh-old:443",
+            "grpc://mh-old:50051",
+            1000,
+        ),
+        shipped_bound(),
+    )
+    .await
+    .expect("Re-registration should succeed");
+    assert_eq!(same, MhRegistrationDecision::Registered);
+    let handler = MediaHandlersRepository::get_handler(&pool, "test-mh-002")
+        .await
+        .expect("Query should succeed")
+        .expect("Handler should exist");
     assert_eq!(handler.region, "us-west-2");
-    assert_eq!(handler.webtransport_endpoint, "https://mh-new:443");
-    assert_eq!(handler.grpc_endpoint, "grpc://mh-new:50051");
+    assert_eq!(handler.webtransport_endpoint, "https://mh-old:443");
     assert_eq!(handler.max_streams, 1000);
-    // Re-registration should reset health to pending
     assert_eq!(handler.health_status, HealthStatus::Pending);
 }
 
@@ -108,11 +154,14 @@ async fn test_load_report_updates_metrics(pool: PgPool) {
     // Register handler first
     MediaHandlersRepository::register_mh(
         &pool,
-        "test-mh-003",
-        "us-east-1",
-        "https://mh:443",
-        "grpc://mh:50051",
-        1000,
+        &NewMhRegistration {
+            handler_id: "test-mh-003",
+            region: "us-east-1",
+            webtransport_endpoint: "https://mh:443",
+            grpc_endpoint: "grpc://mh:50051",
+            max_streams: 1000,
+        },
+        shipped_bound(),
     )
     .await
     .expect("Registration should succeed");
@@ -386,11 +435,14 @@ async fn test_get_candidate_mhs(pool: PgPool) {
     for i in 1..=5 {
         MediaHandlersRepository::register_mh(
             &pool,
-            &format!("candidate-mh-{}", i),
-            "us-east-1",
-            &format!("https://mh{}:443", i),
-            &format!("grpc://mh{}:50051", i),
-            100,
+            &NewMhRegistration {
+                handler_id: &format!("candidate-mh-{}", i),
+                region: "us-east-1",
+                webtransport_endpoint: &format!("https://mh{}:443", i),
+                grpc_endpoint: &format!("grpc://mh{}:50051", i),
+                max_streams: 100,
+            },
+            shipped_bound(),
         )
         .await
         .expect("Registration should succeed");
@@ -412,11 +464,14 @@ async fn test_get_candidate_mhs(pool: PgPool) {
     // Add an unhealthy handler (should not be returned)
     MediaHandlersRepository::register_mh(
         &pool,
-        "unhealthy-mh",
-        "us-east-1",
-        "https://unhealthy:443",
-        "grpc://unhealthy:50051",
-        100,
+        &NewMhRegistration {
+            handler_id: "unhealthy-mh",
+            region: "us-east-1",
+            webtransport_endpoint: "https://unhealthy:443",
+            grpc_endpoint: "grpc://unhealthy:50051",
+            max_streams: 100,
+        },
+        shipped_bound(),
     )
     .await
     .expect("Registration should succeed");
@@ -424,11 +479,14 @@ async fn test_get_candidate_mhs(pool: PgPool) {
     // Add a handler at capacity (should not be returned)
     MediaHandlersRepository::register_mh(
         &pool,
-        "full-mh",
-        "us-east-1",
-        "https://full:443",
-        "grpc://full:50051",
-        50,
+        &NewMhRegistration {
+            handler_id: "full-mh",
+            region: "us-east-1",
+            webtransport_endpoint: "https://full:443",
+            grpc_endpoint: "grpc://full:50051",
+            max_streams: 50,
+        },
+        shipped_bound(),
     )
     .await
     .expect("Registration should succeed");
@@ -482,11 +540,14 @@ async fn test_get_candidate_mhs_filters_by_region(pool: PgPool) {
     // Register handlers in different regions
     MediaHandlersRepository::register_mh(
         &pool,
-        "us-east-mh",
-        "us-east-1",
-        "https://us-east:443",
-        "grpc://us-east:50051",
-        100,
+        &NewMhRegistration {
+            handler_id: "us-east-mh",
+            region: "us-east-1",
+            webtransport_endpoint: "https://us-east:443",
+            grpc_endpoint: "grpc://us-east:50051",
+            max_streams: 100,
+        },
+        shipped_bound(),
     )
     .await
     .expect("Registration should succeed");
@@ -505,11 +566,14 @@ async fn test_get_candidate_mhs_filters_by_region(pool: PgPool) {
 
     MediaHandlersRepository::register_mh(
         &pool,
-        "eu-west-mh",
-        "eu-west-1",
-        "https://eu-west:443",
-        "grpc://eu-west:50051",
-        100,
+        &NewMhRegistration {
+            handler_id: "eu-west-mh",
+            region: "eu-west-1",
+            webtransport_endpoint: "https://eu-west:443",
+            grpc_endpoint: "grpc://eu-west:50051",
+            max_streams: 100,
+        },
+        shipped_bound(),
     )
     .await
     .expect("Registration should succeed");
@@ -563,11 +627,14 @@ async fn test_load_report_with_degraded_health_status(pool: PgPool) {
     // Register handler first
     MediaHandlersRepository::register_mh(
         &pool,
-        "degraded-mh",
-        "us-east-1",
-        "https://mh:443",
-        "grpc://mh:50051",
-        1000,
+        &NewMhRegistration {
+            handler_id: "degraded-mh",
+            region: "us-east-1",
+            webtransport_endpoint: "https://mh:443",
+            grpc_endpoint: "grpc://mh:50051",
+            max_streams: 1000,
+        },
+        shipped_bound(),
     )
     .await
     .expect("Registration should succeed");
@@ -623,11 +690,14 @@ async fn test_get_candidate_mhs_all_at_max_capacity(pool: PgPool) {
     for i in 1..=3 {
         MediaHandlersRepository::register_mh(
             &pool,
-            &format!("full-mh-{}", i),
-            "us-east-1",
-            &format!("https://mh{}:443", i),
-            &format!("grpc://mh{}:50051", i),
-            100, // max_streams = 100
+            &NewMhRegistration {
+                handler_id: &format!("full-mh-{}", i),
+                region: "us-east-1",
+                webtransport_endpoint: &format!("https://mh{}:443", i),
+                grpc_endpoint: &format!("grpc://mh{}:50051", i),
+                max_streams: 100, // max_streams = 100
+            },
+            shipped_bound(),
         )
         .await
         .expect("Registration should succeed");
@@ -668,11 +738,14 @@ async fn test_candidate_selection_load_ratio_boundary(pool: PgPool) {
     // Handler at exactly max capacity (should NOT be candidate)
     MediaHandlersRepository::register_mh(
         &pool,
-        "exactly-full-mh",
-        "us-east-1",
-        "https://full:443",
-        "grpc://full:50051",
-        100,
+        &NewMhRegistration {
+            handler_id: "exactly-full-mh",
+            region: "us-east-1",
+            webtransport_endpoint: "https://full:443",
+            grpc_endpoint: "grpc://full:50051",
+            max_streams: 100,
+        },
+        shipped_bound(),
     )
     .await
     .expect("Registration should succeed");
@@ -692,11 +765,14 @@ async fn test_candidate_selection_load_ratio_boundary(pool: PgPool) {
     // Handler at max - 1 (SHOULD be candidate)
     MediaHandlersRepository::register_mh(
         &pool,
-        "almost-full-mh",
-        "us-east-1",
-        "https://almost:443",
-        "grpc://almost:50051",
-        100,
+        &NewMhRegistration {
+            handler_id: "almost-full-mh",
+            region: "us-east-1",
+            webtransport_endpoint: "https://almost:443",
+            grpc_endpoint: "grpc://almost:50051",
+            max_streams: 100,
+        },
+        shipped_bound(),
     )
     .await
     .expect("Registration should succeed");

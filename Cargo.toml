@@ -86,6 +86,10 @@ tower-http = { version = "0.7", features = ["trace", "cors", "timeout", "set-hea
 # Direct dep for `common::observability::otel_http` (R-56 HTTP propagation);
 # previously only transitive.
 http = "1"
+# CIDR parsing for GC's RegisterMH gRPC endpoint allowlist (GC_MH_GRPC_ALLOWED_CIDRS).
+# Already in the lock graph transitively (reqwest/hyper-util); declared here so the
+# version has one home.
+ipnet = "2"
 
 # QUIC/WebTransport
 quinn = "0.11"

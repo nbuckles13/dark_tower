@@ -1,15 +1,17 @@
-//! P0 Smoke Tests: GC Deployment Configuration (story 4 GC-1: R-24, R-26)
+//! P0 Smoke Tests: GC Deployment Configuration (story 4 GC-1: R-24, R-26; GC-2: R-25 wiring)
 //!
 //! The GC counterpart of `02_mc_deployment_config.rs`, run against the LIVE
 //! cluster, never a local render. GC has one Deployment with N replicas and no
-//! `instance` label, so pods are found by [`GC_SELECTOR`] and EVERY serving
+//! `instance` label, so pods are found by `gc_fleet::GC_SELECTOR` and EVERY serving
 //! replica is checked (per pod, never one pod standing in for all):
 //!
 //! - **Wiring.** Each key in [`MH_REGISTRY_KEYS`] is a HARD
 //!   `configMapKeyRef`, with `key` == env name, to the ONE live generation of
 //!   `gc-service-config` that every GC pod resolves, and its value parses. For
 //!   retention and the initial handler count this is the only in-cluster
-//!   evidence (they have no gauge).
+//!   evidence (they have no gauge). The GC-2 endpoint-allowlist keys
+//!   (`gc_fleet::MH_ENDPOINT_ALLOWLIST_KEYS`) are hard refs with non-empty
+//!   values; `44_gc_mh_registration.rs` proves the values admit real slots.
 //! - **Config gauges.** What the RUNNING process loaded equals that
 //!   generation: `gc_mh_load_report_interval_seconds` equals
 //!   `GC_MH_LOAD_REPORT_INTERVAL_MS`, and `gc_mh_staleness_threshold_seconds`
@@ -41,8 +43,9 @@
 //! The availability wait is a FAILURE-ONLY ceiling derived from deployed
 //! config: the staleness bound `B = k × I` (a reporting MH is counted healthy
 //! within B of its first report) plus the `MetricsScrape` ceiling. The scrape
-//! ceiling also absorbs GC's health-checker tick, which is a code constant
-//! (`DEFAULT_CHECK_INTERVAL_SECONDS`), not config, so this test can't read it.
+//! ceiling (30 s) also absorbs GC's health-checker tick, a source constant
+//! (`DEFAULT_CHECK_INTERVAL_SECONDS`; `gc_fleet::gc_health_tick` reads it for the
+//! settle wait, which adds it explicitly).
 //! On a green run the poll returns at the first sample that holds.
 //!
 //! # Diagnostic output policy (PII)
@@ -61,27 +64,16 @@ use std::time::Duration;
 use env_tests::cluster::ClusterConnection;
 use env_tests::eventual::ConsistencyCategory;
 use env_tests::fixtures::deployment_config::{
-    check_key_ref, check_shape, cm_value, fetch_configmap, parse_positive, LivePod, RefKind,
-    ValueShape,
+    check_key_ref, check_shape, cm_value, fetch_configmap, RefKind, ValueShape,
 };
-use env_tests::fixtures::kube::{
-    is_terminating, live_mh_pods, max_termination_grace, pods_json, resolve_generation,
-    settled_serving_pods, REDEPLOY_HINT,
+use env_tests::fixtures::gc_fleet::{
+    deployed_bound_and_interval_ms, live_gc_pods, GC_CONFIGMAP, GC_CONTAINER as CONTAINER,
+    HEALTHY_PER_REPLICA_PROMQL, INTERVAL_KEY, MH_ENDPOINT_ALLOWLIST_KEYS, MULTIPLIER_KEY,
 };
+use env_tests::fixtures::kube::{live_mh_pods, REDEPLOY_HINT};
 use env_tests::fixtures::metrics::poll_until_pinned_instance;
 use env_tests::fixtures::mh_config::{gauge_verdict, Conversion, GaugeVerdict};
 use env_tests::fixtures::PrometheusClient;
-use serde_json::Value;
-
-/// The label every GC pod carries (`infra/services/gc-service/deployment.yaml`).
-const GC_SELECTOR: &str = "app=gc-service";
-const CONTAINER: &str = "gc-service";
-/// Generator base name; the live name is hash-suffixed (ADR-0038 §2) and
-/// resolved from the pod specs.
-const GC_CONFIGMAP: &str = "gc-service-config";
-
-const INTERVAL_KEY: &str = "GC_MH_LOAD_REPORT_INTERVAL_MS";
-const MULTIPLIER_KEY: &str = "GC_MH_STALENESS_MULTIPLIER";
 
 /// Every GC-1 key, wired into the GC container as a HARD ref. All four are
 /// REQUIRED reads with a lower bound of at least 1, so the shape is
@@ -97,81 +89,6 @@ const MH_REGISTRY_KEYS: &[&str] = &[
 const GAUGE_PRESENT_BOUND: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Margin over the deployed termination grace: after SIGKILL at the end of the
-/// grace, the kubelet still has to report the container gone and the API
-/// server remove the pod object. A failure-only ceiling, spent only when a pod
-/// is genuinely slow to go.
-const POD_REMOVAL_MARGIN: Duration = Duration::from_secs(15);
-
-/// A settled GC pod set: the live (non-terminating) pod documents, their
-/// serving view, and the ONE `gc-service-config` generation they all
-/// reference — all from ONE listing, so the specs checked, the IPs pinned and
-/// the ConfigMap read are the same pods.
-struct GcPods {
-    items: Vec<Value>,
-    serving: Vec<LivePod>,
-    configmap: String,
-}
-
-/// Wait out a GC rollout's tail, then read the pod set. `rollout status`
-/// returns while an old ReplicaSet's pod is still inside its termination
-/// grace, so the first run after every GC deploy can see one Terminating. The
-/// wait is bounded by the largest `terminationGracePeriodSeconds` on the live
-/// pods (the Terminating one included), read from the API server, never
-/// retyped, plus [`POD_REMOVAL_MARGIN`]. Past the bound, a pod still
-/// Terminating or not Ready is a loud PRECONDITION (`gc-pods-unserving`), never
-/// dropped.
-///
-/// `resolve_generation` then refuses a bare name, zero generations, or more
-/// than one: the serving replicas must run ONE config generation.
-async fn live_gc_pods() -> GcPods {
-    let first = tokio::task::spawn_blocking(|| pods_json(GC_SELECTOR))
-        .await
-        .expect("kubectl listing task");
-    let grace = max_termination_grace(&first, GC_SELECTOR)
-        .unwrap_or_else(|e| panic!("PRECONDITION (gc-pods-unserving): {e}. {REDEPLOY_HINT}."));
-    let (doc, serving) =
-        settled_serving_pods(GC_SELECTOR, grace + POD_REMOVAL_MARGIN, "gc-pods-unserving").await;
-    let items: Vec<Value> = doc
-        .get("items")
-        .and_then(Value::as_array)
-        .expect("partition_serving accepted the document, so it has `items`")
-        .iter()
-        .filter(|p| !is_terminating(p))
-        .cloned()
-        .collect();
-    assert_eq!(
-        items.len(),
-        serving.len(),
-        "PRECONDITION: the settled GC listing holds a pod that is neither serving nor \
-         terminating"
-    );
-    let configmap = resolve_generation(&doc, GC_SELECTOR, GC_CONFIGMAP)
-        .unwrap_or_else(|e| panic!("PRECONDITION: {e}"));
-    GcPods {
-        items,
-        serving,
-        configmap,
-    }
-}
-
-/// A deployed GC-1 value, strictly positive, read from the live generation.
-fn deployed(cm: &Value, key: &str) -> u64 {
-    parse_positive(key, &cm_value(cm, GC_CONFIGMAP, key), GC_CONFIGMAP)
-        .unwrap_or_else(|e| panic!("{e}"))
-}
-
-/// `(B in ms, I in ms, k)` from the live generation: `B = k × I`, the expression
-/// `MhRegistryConfig::new` uses. Overflow is a loud failure, not a wrap.
-fn deployed_bound_and_interval_ms(cm: &Value) -> (u64, u64, u64) {
-    let interval_ms = deployed(cm, INTERVAL_KEY);
-    let k = deployed(cm, MULTIPLIER_KEY);
-    let bound_ms = interval_ms.checked_mul(k).unwrap_or_else(|| {
-        panic!("{MULTIPLIER_KEY}={k} × {INTERVAL_KEY}={interval_ms} overflows u64")
-    });
-    (bound_ms, interval_ms, k)
-}
-
 #[tokio::test]
 async fn test_gc_mh_registry_keys_wired_into_every_gc_pod() {
     assert!(!MH_REGISTRY_KEYS.is_empty());
@@ -185,6 +102,31 @@ async fn test_gc_mh_registry_keys_wired_into_every_gc_pod() {
                 key,
                 &cm_value(&cm, GC_CONFIGMAP, key),
                 ValueShape::PositiveInteger,
+                GC_CONFIGMAP,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+}
+
+/// The GC-2 RegisterMH endpoint-allowlist keys (R-25, ADR-0039 §7 arm 0) are HARD
+/// refs into the live generation, each a non-empty token. GC refuses to start
+/// on a missing, empty or malformed value. A hard ref plus a non-empty value is
+/// the wiring evidence; GC's own parser owns the grammar. Whether the RENDERED
+/// values admit the real slot addresses is proven by GC deciding, in
+/// `44_gc_mh_registration.rs`. It is not re-derived here.
+#[tokio::test]
+async fn test_gc_mh_endpoint_allowlist_keys_wired_into_every_gc_pod() {
+    let gc = live_gc_pods().await;
+    let cm = fetch_configmap(&gc.configmap);
+    for pod in &gc.items {
+        for key in MH_ENDPOINT_ALLOWLIST_KEYS {
+            check_key_ref(pod, CONTAINER, key, &gc.configmap, RefKind::Hard)
+                .unwrap_or_else(|e| panic!("{e}"));
+            check_shape(
+                key,
+                &cm_value(&cm, GC_CONFIGMAP, key),
+                ValueShape::Token,
                 GC_CONFIGMAP,
             )
             .unwrap_or_else(|e| panic!("{e}"));
@@ -285,7 +227,7 @@ async fn test_every_gc_replica_counts_every_live_mh_healthy() {
     let floor = live_mhs as f64;
     // Summed over `region` (own region + "other") WITHIN one replica; the pin
     // then selects that replica. Never summed across replicas.
-    let promql = "sum by (instance) (gc_mh_available{state=\"healthy\"})";
+    let promql = HEALTHY_PER_REPLICA_PROMQL;
     for pod in &gc.serving {
         poll_until_pinned_instance(
             &prom,

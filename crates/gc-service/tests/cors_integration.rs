@@ -52,7 +52,7 @@ fn build_test_router(allowed_origins: &str) -> Router {
             allowed_origins.to_string(),
         ),
     ]);
-    vars.extend(gc_test_utils::reference_mh_registry_vars());
+    vars.extend(gc_test_utils::mh_config_vars());
     let config = Config::from_vars(&vars).expect("config should load");
 
     // Lazy pool: `build_routes`/`AppState` need a `PgPool` value, but no test

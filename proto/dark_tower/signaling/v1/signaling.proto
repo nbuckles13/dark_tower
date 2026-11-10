@@ -382,10 +382,9 @@ message MediaServerInfo {
   // Server-to-client. Same spelling as `SendTarget.media_handler_url` and
   // `StreamAssignment.media_handler_url` — one name for one concept.
   //
-  // Belongs to ONE MH incarnation. The rule's authority today is ADR-0039 §7;
-  // its contract home lands above `dark_tower.internal.v1.RegisterMHRequest`
-  // in story 4 GC-2, which retargets this pointer (`docs/TODO.md` §Media Path
-  // Obligations).
+  // Belongs to ONE MH incarnation: the per-incarnation address rule is the
+  // RegisterMH endpoint rule stated once above
+  // `dark_tower.internal.v1.RegisterMHRequest` (ADR-0039 §7).
   string media_handler_url = 1;
 
   // `connection_token` is not reused, so both halves are reserved (CONVENTIONS

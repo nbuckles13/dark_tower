@@ -175,6 +175,12 @@ All GC service metrics follow ADR-0011 naming conventions with the `gc_` prefix.
   or fail), so this is a full enumeration, not a sparse pair-set; a domain check may treat it as the product
   of the two closed lists. Zero-initialized (present-at-zero) — the rare error series (e.g. a failing
   `atomic_assign`) are low-volume and were previously masked. `GC_DB_QUERY_OPERATIONS` is the source of truth.
+- **`register_mh_txn`** (replaces `register_mh`): ONE sample over the whole RegisterMH transaction (advisory
+  lock, selects, supersede DELETE, upsert, commit). `success` for every completed decision INCLUDING the rule's
+  reject arms (`address_conflict`, `endpoint_changed`: the queries ran and the rule refused); `error` for a
+  database failure OR a registry-invariant breach observed under the lock (short supersede DELETE, upsert not
+  affecting one row: a GC bug). This is the ONLY signal for a registration that failed internally (it records
+  no `gc_mh_registrations_total` outcome); the GC error log line distinguishes the two causes.
 - **Usage**: Track database query rates and failures by operation
 - **Example**:
   ```promql
@@ -552,6 +558,41 @@ logs (`gc.grpc.mh_service` "Load report for unknown handler" carries `handler_id
 - **Example**:
   ```promql
   sum by(outcome) (increase(gc_mh_load_reports_total[5m]))
+  ```
+
+### `gc_mh_registrations_total`
+- **Type**: Counter
+- **Description**: RegisterMH outcomes under the GC registration rule (ADR-0039 §7; the rule is stated once above
+  `RegisterMHRequest` in `proto/dark_tower/internal/v1/internal.proto`), counted at ONE site in
+  `MhService::register_mh`. ONE increment per registration call, never per superseded row.
+- **Labels**:
+  - `outcome`: `ok` (registered; no other row matched — a new id, or the same id with identical endpoints) |
+    `superseded` (registered; other row(s) holding an endpoint deleted) | `address_conflict` (rejected
+    FAILED_PRECONDITION: a one-sided match with a fresh pending/healthy/degraded row) | `endpoint_changed`
+    (rejected FAILED_PRECONDITION: an existing id re-registered with a changed endpoint) | `invalid_endpoint`
+    (rejected INVALID_ARGUMENT: an endpoint outside its zone's allowlist).
+  - `match`: ONLY on `superseded` (by construction: the recorder takes a closed enum): `both` (both endpoints
+    matched: an in-place container restart) | `one_sided` (one endpoint matched a draining/unhealthy/stale
+    row). When one registration supersedes several rows, `match="both"` if any of them matched both.
+- **Not counted**: pre-rule field validation (handler_id, region, max_streams), and a failed registration —
+  database failure or registry-invariant breach under the lock
+  (`gc_db_queries_total{operation="register_mh_txn",status="error"}` + the GC error log).
+- **Cardinality**: exactly 6 series. Zero-initialized. No `handler_id` or endpoint labels: ids are per
+  incarnation and churn (ADR-0039 §8); the GC log lines carry them, per outcome: `superseded` — info with
+  `handler_id`, `superseded_handler_ids`, `match`; `address_conflict` — warn with `handler_id`,
+  `conflicting_handler_ids` and the requested endpoints; `endpoint_changed` — warn with `handler_id`, `changed`
+  (`webtransport` | `grpc` | `both`) and the requested endpoints (never the stored ones); `invalid_endpoint` —
+  warn with `handler_id`, `field`, `component` (`syntax` | `scheme` | `host` | `port`) and, for allowlist
+  rejects, the requested endpoints (shape-bounds rejects carry the `reason` instead).
+- **Semantics**: a single `superseded{match="both"}` is a routine in-place crash restart. `address_conflict`
+  resolves by itself once the conflicting row passes the MH staleness bound (case c becomes case b), so
+  persistence beyond the bound means two configured holders of one address. Any `invalid_endpoint` on a
+  managed cluster means the rendered allowlist and the advertised addresses disagree. A sustained `superseded`
+  rate together with `gc_mh_load_reports_total{outcome="unknown_handler"}` is the ping-pong signature (alert
+  rules are OBS-ALERTS').
+- **Example**:
+  ```promql
+  sum by(outcome, match) (increase(gc_mh_registrations_total[5m]))
   ```
 
 ### `gc_mh_available`

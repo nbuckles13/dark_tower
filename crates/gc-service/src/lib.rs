@@ -33,6 +33,7 @@ pub mod config;
 pub mod errors;
 pub mod grpc;
 pub mod handlers;
+pub mod mh_endpoint_policy;
 pub mod middleware;
 pub mod models;
 pub mod observability;

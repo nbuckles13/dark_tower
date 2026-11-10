@@ -3,7 +3,9 @@
 //! `mh_registry_metrics_integration.rs`). The canonical home: do not copy.
 
 use gc_service::config::MhRegistryConfig;
-use gc_service::repositories::{HealthStatus, MediaHandlersRepository};
+use gc_service::repositories::{
+    HealthStatus, MediaHandlersRepository, MhRegistrationDecision, NewMhRegistration,
+};
 use sqlx::PgPool;
 use std::time::Duration;
 
@@ -24,16 +26,48 @@ pub fn ms(d: Duration) -> i64 {
 /// Rows only age after this runs (NOW() is not frozen), so callers seed a
 /// near-the-bound fresh row immediately before the query under test.
 pub async fn seed(pool: &PgPool, id: &str, region: &str, status: &str, age_ms: i64) {
-    MediaHandlersRepository::register_mh(
+    seed_with_endpoints(
         pool,
         id,
         region,
         &format!("https://{id}:443"),
         &format!("grpc://{id}:50051"),
-        1000,
+        status,
+        age_ms,
+    )
+    .await;
+}
+
+/// [`seed`] with explicit endpoints (the RegisterMH rule tests). The
+/// registration must be a plain `Registered` (no other row matched), so a
+/// fixture can never silently supersede another fixture.
+pub async fn seed_with_endpoints(
+    pool: &PgPool,
+    id: &str,
+    region: &str,
+    webtransport_endpoint: &str,
+    grpc_endpoint: &str,
+    status: &str,
+    age_ms: i64,
+) {
+    let decision = MediaHandlersRepository::register_mh(
+        pool,
+        &NewMhRegistration {
+            handler_id: id,
+            region,
+            webtransport_endpoint,
+            grpc_endpoint,
+            max_streams: 1000,
+        },
+        gc_test_utils::reference_mh_registry().staleness_bound(),
     )
     .await
     .expect("register");
+    assert_eq!(
+        decision,
+        MhRegistrationDecision::Registered,
+        "fixture {id} must not match another row"
+    );
     sqlx::query(
         "UPDATE media_handlers SET health_status = $2, \
          last_heartbeat_at = NOW() - $3 * INTERVAL '1 millisecond' WHERE handler_id = $1",
@@ -44,6 +78,30 @@ pub async fn seed(pool: &PgPool, id: &str, region: &str, status: &str, age_ms: i
     .execute(pool)
     .await
     .expect("seed");
+}
+
+/// A row exactly as stored: (wt, grpc, status, last_heartbeat_at), or `None`.
+pub async fn stored_row(
+    pool: &PgPool,
+    id: &str,
+) -> Option<(String, String, String, chrono::DateTime<chrono::Utc>)> {
+    sqlx::query_as(
+        "SELECT webtransport_endpoint, grpc_endpoint, health_status, last_heartbeat_at \
+         FROM media_handlers WHERE handler_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .expect("stored_row")
+}
+
+/// Total registry rows.
+pub async fn row_count(pool: &PgPool) -> i64 {
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_handlers")
+        .fetch_one(pool)
+        .await
+        .expect("row_count");
+    n
 }
 
 /// The row's stored status, or `None` if the row does not exist.

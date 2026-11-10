@@ -66,7 +66,8 @@ crates/env-tests/
 │   ├── eventual.rs         # Retry helpers for eventual consistency
 │   ├── fixtures/
 │   │   ├── auth_client.rs  # Token issuance, JWKS operations
-│   │   ├── mh_pool.rs      # `mh.sh list --json` reader (DT_MH_SH), mh-template read
+│   │   ├── gc_fleet.rs     # live GC replica set, GC config-key mirrors (drift-tested)
+│   │   ├── mh_pool.rs      # `mh.sh` list reader, run-owned `up` + owner teardown (DT_MH_SH), mh-template read
 │   │   ├── mh_address.rs   # R-28 pure address-invariant verdict
 │   │   └── metrics.rs      # Prometheus queries
 │   └── canary.rs           # NetworkPolicy test pods (placeholder)
@@ -80,6 +81,7 @@ crates/env-tests/
     ├── 41_gate_zero_hostport_policy.rs # Gate zero: MH policy on the UDP hostPort DNAT path (own binary)
     ├── 42_mh_address_invariant.rs # R-28: every live MH pod advertises its own unique slot address (needs DT_MH_SH)
     ├── 43_mh_slot_publish_udp.rs  # R-27: host-published UDP reaches each serving slot's own MH (own binary)
+    ├── 44_gc_mh_registration.rs   # R-25: a run-owned MH on a real slot registers ok|superseded, zero GC rejects (own binary, needs DT_MH_SH)
     └── 90_runbook.rs          # P2 runbook validation (stubs)
 ```
 

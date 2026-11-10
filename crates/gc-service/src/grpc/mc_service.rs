@@ -37,9 +37,6 @@ const MAX_MEETING_ID_LENGTH: usize = 255;
 /// Maximum allowed region length.
 const MAX_REGION_LENGTH: usize = 50;
 
-/// Maximum allowed endpoint length.
-const MAX_ENDPOINT_LENGTH: usize = 255;
-
 /// Meeting Controller gRPC service.
 ///
 /// Handles registration and heartbeat requests from Meeting Controllers.
@@ -130,19 +127,15 @@ impl McService {
     }
 
     /// Validate an endpoint URL.
+    ///
+    /// SCOPE: only a shape + http/https prefix check. The RegisterMH endpoint
+    /// rule (per-zone allowlists, ADR-0039 §7) is deliberately MH-scoped and
+    /// does NOT apply here; MC registration carries the same credential-
+    /// harvest class (GC dials this `grpc_endpoint` with its bearer) and is
+    /// tracked as its own task in docs/TODO.md §Media Path Obligations
+    /// ("RegisterMC endpoint allowlist").
     fn validate_endpoint(endpoint: &str, field_name: &str) -> Result<(), Status> {
-        if endpoint.is_empty() {
-            return Err(Status::invalid_argument(format!(
-                "{} is required",
-                field_name
-            )));
-        }
-        if endpoint.len() > MAX_ENDPOINT_LENGTH {
-            return Err(Status::invalid_argument(format!(
-                "{} is too long",
-                field_name
-            )));
-        }
+        super::validate_endpoint_bounds(endpoint, field_name)?;
         // Basic URL format validation
         if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
             return Err(Status::invalid_argument(format!(

@@ -26,9 +26,11 @@
 //! }
 //! ```
 
+pub mod mh_endpoint_allowlist;
 pub mod reference_config;
 pub mod server_harness;
 
 // Re-export commonly used items
+pub use mh_endpoint_allowlist::*;
 pub use reference_config::*;
 pub use server_harness::*;

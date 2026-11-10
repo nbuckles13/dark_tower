@@ -20,14 +20,14 @@
 //! | `create_meeting`            | driven error | unique-collision: insert duplicate meeting_code |
 //! | `log_audit_event`           | driven error | FK violation: insert against non-existent org_id |
 //! | `activate_meeting`          | wrapper-Cat-C error (no business-error branch) | UPDATE no-match returns Ok(None) |
-//! | `register_mh`               | wrapper-Cat-C error (no business-error branch) | Idempotent UPSERT |
+//! | `register_mh_txn`           | wrapper-Cat-C error (rule rejects are `success`, not a DB error) | one advisory-locked transaction; reject arms commit nothing and record success |
 //! | `update_load_report`        | wrapper-Cat-C error (no business-error branch) | UPDATE no-match returns Ok(rows_affected=0) |
 //! | `mark_stale_mh_unhealthy`   | wrapper-Cat-C error (no business-error branch) | UPDATE no-match returns Ok(rows_affected=0) |
 //! | `delete_expired_mh`         | wrapper-Cat-C error (no business-error branch) | DELETE no-match returns Ok(rows_affected=0) |
 //! | `count_available_mh`        | wrapper-Cat-C error (no business-error branch) | aggregate over empty table returns Ok([]) |
 //!
 //! Two wrapper-Cat-C variants in this file:
-//!   1. **No-business-error-branch** (4 ops: `activate_meeting`, `register_mh`,
+//!   1. **No-business-error-branch** (4 ops: `activate_meeting`, `register_mh_txn`,
 //!      `update_load_report`, `mark_stale_mh_unhealthy`): error path only
 //!      reachable via `?`-propagated sqlx errors against in-process Postgres;
 //!      not drivable without a fault-injection harness. Standard canonical
@@ -55,7 +55,7 @@ use ::common::observability::testing::MetricAssertion;
 use gc_service::observability::metrics::record_db_query;
 use gc_service::repositories::{
     CreateMeetingOutcome, HealthStatus, MediaHandlersRepository, MeetingsRepository,
-    ParticipantsRepository,
+    NewMhRegistration, ParticipantsRepository,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -322,25 +322,28 @@ async fn db_query_remove_participant_success_wrapper_cat_c_orphan(pool: PgPool) 
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn db_query_register_mh_success_emits_operation_register_mh(pool: PgPool) {
+async fn db_query_register_mh_success_emits_operation_register_mh_txn(pool: PgPool) {
     let snap = MetricAssertion::snapshot();
     MediaHandlersRepository::register_mh(
         &pool,
-        "test-mh-001",
-        "us-east-1",
-        "https://wt.example.com",
-        "https://grpc.example.com",
-        100,
+        &NewMhRegistration {
+            handler_id: "test-mh-001",
+            region: "us-east-1",
+            webtransport_endpoint: "https://wt.example.com:443",
+            grpc_endpoint: "grpc://10.244.0.1:50053",
+            max_streams: 100,
+        },
+        gc_test_utils::reference_mh_registry().staleness_bound(),
     )
     .await
     .unwrap();
 
     snap.counter("gc_db_queries_total")
-        .with_labels(&[("operation", "register_mh"), ("status", "success")])
+        .with_labels(&[("operation", "register_mh_txn"), ("status", "success")])
         .assert_delta(1);
     // Adjacency: error sibling silent on this drive.
     snap.counter("gc_db_queries_total")
-        .with_labels(&[("operation", "register_mh"), ("status", "error")])
+        .with_labels(&[("operation", "register_mh_txn"), ("status", "error")])
         .assert_delta(0);
 }
 
@@ -348,11 +351,14 @@ async fn db_query_register_mh_success_emits_operation_register_mh(pool: PgPool) 
 async fn db_query_update_load_report_success_emits_op_update_load_report(pool: PgPool) {
     MediaHandlersRepository::register_mh(
         &pool,
-        "test-mh-load",
-        "us-east-1",
-        "https://wt.example.com",
-        "https://grpc.example.com",
-        100,
+        &NewMhRegistration {
+            handler_id: "test-mh-load",
+            region: "us-east-1",
+            webtransport_endpoint: "https://wt.example.com:443",
+            grpc_endpoint: "grpc://10.244.0.1:50053",
+            max_streams: 100,
+        },
+        gc_test_utils::reference_mh_registry().staleness_bound(),
     )
     .await
     .unwrap();
@@ -558,11 +564,11 @@ fn db_query_activate_meeting_error_wrapper_cat_c() {
 // real fault — that requires the fault-injection harness in TODO §Observability
 // Debt.
 #[test]
-fn db_query_register_mh_error_wrapper_cat_c() {
+fn db_query_register_mh_txn_error_wrapper_cat_c() {
     let snap = MetricAssertion::snapshot();
-    record_db_query("register_mh", "error", Duration::from_millis(8));
+    record_db_query("register_mh_txn", "error", Duration::from_millis(8));
     snap.counter("gc_db_queries_total")
-        .with_labels(&[("operation", "register_mh"), ("status", "error")])
+        .with_labels(&[("operation", "register_mh_txn"), ("status", "error")])
         .assert_delta(1);
 }
 

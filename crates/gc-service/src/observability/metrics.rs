@@ -523,6 +523,111 @@ pub fn record_mh_load_report(outcome: &'static str) {
     counter!("gc_mh_load_reports_total", "outcome" => outcome).increment(1);
 }
 
+/// `gc_mh_registrations_total{match}` on `superseded`: which endpoints of the
+/// superseded row(s) matched the registering incarnation's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MhSupersedeMatch {
+    /// Both endpoints matched (arm 2a: in-place container restart).
+    Both,
+    /// Exactly one matched and the row was draining/unhealthy/stale (arm 2b).
+    OneSided,
+}
+
+impl MhSupersedeMatch {
+    /// Every variant (zero-init enumerates this).
+    pub const ALL: [MhSupersedeMatch; 2] = [MhSupersedeMatch::Both, MhSupersedeMatch::OneSided];
+
+    /// The `match` label value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            MhSupersedeMatch::Both => "both",
+            MhSupersedeMatch::OneSided => "one_sided",
+        }
+    }
+}
+
+/// `gc_mh_registrations_total` outcome: the label vocabulary of the
+/// RegisterMH rule (ADR-0039 §7; stated above `RegisterMHRequest`). `match`
+/// exists ONLY on `Superseded`, by construction.
+///
+/// NOT counted here: pre-rule validation failures (handler_id, region,
+/// max_streams), and a failed registration (database failure, or a
+/// registry-invariant breach observed under the lock — a GC bug), which is
+/// `gc_db_queries_total{operation="register_mh_txn",status="error"}`; the GC
+/// error log distinguishes the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MhRegistrationOutcome {
+    /// Accepted with no other row matched (new id, or the same id with
+    /// identical endpoints).
+    Ok,
+    /// Accepted; other row(s) deleted (arm 2a/2b).
+    Superseded(MhSupersedeMatch),
+    /// Rejected: one-sided match with a fresh pending/healthy/degraded row (2c).
+    AddressConflict,
+    /// Rejected: an existing id re-registered with a changed endpoint (arm 1).
+    EndpointChanged,
+    /// Rejected: an endpoint failed its zone's allowlist (arm 0).
+    InvalidEndpoint,
+}
+
+impl MhRegistrationOutcome {
+    /// Every label combination: exactly 6 series (zero-init enumerates this).
+    pub const ALL: [MhRegistrationOutcome; 6] = [
+        MhRegistrationOutcome::Ok,
+        MhRegistrationOutcome::Superseded(MhSupersedeMatch::Both),
+        MhRegistrationOutcome::Superseded(MhSupersedeMatch::OneSided),
+        MhRegistrationOutcome::AddressConflict,
+        MhRegistrationOutcome::EndpointChanged,
+        MhRegistrationOutcome::InvalidEndpoint,
+    ];
+
+    /// The `outcome` label value.
+    #[must_use]
+    pub const fn outcome_label(self) -> &'static str {
+        match self {
+            MhRegistrationOutcome::Ok => "ok",
+            MhRegistrationOutcome::Superseded(_) => "superseded",
+            MhRegistrationOutcome::AddressConflict => "address_conflict",
+            MhRegistrationOutcome::EndpointChanged => "endpoint_changed",
+            MhRegistrationOutcome::InvalidEndpoint => "invalid_endpoint",
+        }
+    }
+}
+
+// LABEL SHAPE, spelled at exactly two sites (this recorder and the
+// zero-init loop): `outcome`, plus `match` only on `Superseded`. It cannot be
+// factored into one helper: `dt-guard metric-labels` requires literal
+// `"key" => value` labels at every `counter!` site, and `dt-guard
+// counter-zero-init` requires a literal `counter!("gc_mh_registrations_total"`
+// inside the main-called zero-init entrypoint. Drift between the two sites is
+// caught by `zero_init_renders_counters_present_at_zero` (exact 6 series,
+// `match` exactly on superseded) and `tests/mh_registration_metrics_integration.rs`
+// (exact rendered series through the real recording sites).
+/// Record one RegisterMH outcome: ONE increment per registration call (not
+/// per superseded row).
+///
+/// Metric: `gc_mh_registrations_total`
+/// Labels: `outcome`; `match` only when `outcome="superseded"`. No handler id
+/// or endpoint labels (ids churn per incarnation; logs carry them).
+pub fn record_mh_registration(outcome: MhRegistrationOutcome) {
+    match outcome {
+        MhRegistrationOutcome::Superseded(m) => counter!(
+            "gc_mh_registrations_total",
+            "outcome" => outcome.outcome_label(),
+            "match" => m.label()
+        )
+        .increment(1),
+        MhRegistrationOutcome::Ok
+        | MhRegistrationOutcome::AddressConflict
+        | MhRegistrationOutcome::EndpointChanged
+        | MhRegistrationOutcome::InvalidEndpoint => {
+            counter!("gc_mh_registrations_total", "outcome" => outcome.outcome_label())
+                .increment(1);
+        }
+    }
+}
+
 /// `gc_mh_available` region label for rows outside GC's own region.
 ///
 /// The MH-asserted region string is never a label value: rows are bucketed
@@ -1058,7 +1163,7 @@ const GC_DB_QUERY_OPERATIONS: &[&str] = &[
     "create_meeting",
     "log_audit_event",
     "activate_meeting",
-    "register_mh",
+    "register_mh_txn",
     "update_load_report",
     "mark_stale_mh_unhealthy",
     "delete_expired_mh",
@@ -1166,6 +1271,25 @@ pub fn zero_initialize_counters() {
             counter!("gc_cors_preflight_total", "origin_class" => *oc, "status" => *s).increment(0);
         }
     }
+    // gc_mh_registrations_total{outcome[, match]} — exactly 6 series; the
+    // second of the two label-shape sites (see the note above
+    // `record_mh_registration` for why it is not factored).
+    for o in MhRegistrationOutcome::ALL {
+        match o {
+            MhRegistrationOutcome::Superseded(m) => counter!(
+                "gc_mh_registrations_total",
+                "outcome" => o.outcome_label(),
+                "match" => m.label()
+            )
+            .increment(0),
+            MhRegistrationOutcome::Ok
+            | MhRegistrationOutcome::AddressConflict
+            | MhRegistrationOutcome::EndpointChanged
+            | MhRegistrationOutcome::InvalidEndpoint => {
+                counter!("gc_mh_registrations_total", "outcome" => o.outcome_label()).increment(0);
+            }
+        }
+    }
     // gc_mh_load_reports_total{outcome}
     for o in MH_LOAD_REPORT_OUTCOMES {
         counter!("gc_mh_load_reports_total", "outcome" => *o).increment(0);
@@ -1235,6 +1359,32 @@ mod tests {
         present_at_zero(r#"gc_db_queries_total{operation="atomic_assign",status="error"}"#);
         present_at_zero(r#"gc_mh_load_reports_total{outcome="accepted"}"#);
         present_at_zero(r#"gc_mh_load_reports_total{outcome="unknown_handler"}"#);
+        // gc_mh_registrations_total: exactly the 6 series, `match` only on
+        // superseded.
+        present_at_zero(r#"gc_mh_registrations_total{outcome="ok"}"#);
+        present_at_zero(r#"gc_mh_registrations_total{outcome="superseded",match="both"}"#);
+        present_at_zero(r#"gc_mh_registrations_total{outcome="superseded",match="one_sided"}"#);
+        present_at_zero(r#"gc_mh_registrations_total{outcome="address_conflict"}"#);
+        present_at_zero(r#"gc_mh_registrations_total{outcome="endpoint_changed"}"#);
+        present_at_zero(r#"gc_mh_registrations_total{outcome="invalid_endpoint"}"#);
+        let registration_series: Vec<&str> = rendered
+            .lines()
+            .filter(|l| l.starts_with("gc_mh_registrations_total{"))
+            .collect();
+        assert_eq!(registration_series.len(), 6, "{registration_series:?}");
+        for line in &registration_series {
+            let superseded = line.contains(r#"outcome="superseded""#);
+            assert_eq!(
+                superseded,
+                line.contains("match="),
+                "`match` must appear exactly on superseded series: {line}"
+            );
+        }
+        present_at_zero(r#"gc_db_queries_total{operation="register_mh_txn",status="error"}"#);
+        assert!(
+            !rendered.contains(r#"operation="register_mh""#),
+            "the retired `register_mh` db-query label must not be emitted"
+        );
         present_at_zero(r#"gc_db_queries_total{operation="delete_expired_mh",status="success"}"#);
         present_at_zero(r#"gc_db_queries_total{operation="delete_expired_mh",status="error"}"#);
         present_at_zero(r#"gc_db_queries_total{operation="count_available_mh",status="success"}"#);

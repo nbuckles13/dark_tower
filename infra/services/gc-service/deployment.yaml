@@ -133,6 +133,34 @@ spec:
             configMapKeyRef:
               name: gc-service-config
               key: GC_MH_INITIAL_HANDLERS_PER_MEETING
+        # RegisterMH endpoint allowlists (ADR-0039 §7). REQUIRED; hard refs. The
+        # base ConfigMap carries the topology keys EMPTY (GC fails startup naming
+        # the key) until the deploy render supplies them (deploy.sh).
+        - name: GC_MH_WT_ALLOWED_HOSTS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_MH_WT_ALLOWED_HOSTS
+        - name: GC_MH_WT_ALLOWED_PORTS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_MH_WT_ALLOWED_PORTS
+        - name: GC_MH_GRPC_ALLOWED_SCHEMES
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_MH_GRPC_ALLOWED_SCHEMES
+        - name: GC_MH_GRPC_ALLOWED_CIDRS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_MH_GRPC_ALLOWED_CIDRS
+        - name: GC_MH_GRPC_ALLOWED_PORTS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_MH_GRPC_ALLOWED_PORTS
         # DATABASE_URL is COMPOSED from the credential's one owner, postgres-secret
         # (infra/services/postgres/secret.yaml) — never a second literal copy. Kubernetes
         # dependent env vars: PG_* MUST be declared before DATABASE_URL, or `$(PG_*)`

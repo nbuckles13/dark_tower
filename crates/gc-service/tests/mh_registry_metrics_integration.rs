@@ -60,7 +60,8 @@ fn assert_available(snap: &MetricSnapshot, region: &str, expected: [f64; 5]) {
 async fn load_report_for_registered_handler_counts_accepted(pool: PgPool) {
     let service = MhService::new(
         Arc::new(pool.clone()),
-        freshness_registry(2).load_report_interval_ms(),
+        &freshness_registry(2),
+        gc_test_utils::test_mh_endpoint_allowlist(),
     );
     seed(&pool, "live-mh", OWN_REGION, "healthy", 0).await;
 
@@ -83,7 +84,11 @@ async fn load_report_for_registered_handler_counts_accepted(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn load_report_after_retention_delete_counts_unknown_handler(pool: PgPool) {
     let reg = freshness_registry(2);
-    let service = MhService::new(Arc::new(pool.clone()), reg.load_report_interval_ms());
+    let service = MhService::new(
+        Arc::new(pool.clone()),
+        &reg,
+        gc_test_utils::test_mh_endpoint_allowlist(),
+    );
     seed(
         &pool,
         "gone-mh",
@@ -125,7 +130,8 @@ async fn load_report_after_retention_delete_counts_unknown_handler(pool: PgPool)
 async fn invalid_load_report_counts_neither_outcome(pool: PgPool) {
     let service = MhService::new(
         Arc::new(pool),
-        freshness_registry(2).load_report_interval_ms(),
+        &freshness_registry(2),
+        gc_test_utils::test_mh_endpoint_allowlist(),
     );
 
     let snap = MetricAssertion::snapshot();

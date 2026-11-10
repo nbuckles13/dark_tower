@@ -137,7 +137,7 @@ impl TestMeetingServer {
             ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
         ]);
 
-        vars.extend(gc_test_utils::reference_mh_registry_vars());
+        vars.extend(gc_test_utils::mh_config_vars());
         let config = Config::from_vars(&vars)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 
@@ -234,7 +234,7 @@ impl TestMeetingServer {
             ("GC_CLIENT_SECRET".to_string(), "test-gc-secret".to_string()),
         ]);
 
-        vars.extend(gc_test_utils::reference_mh_registry_vars());
+        vars.extend(gc_test_utils::mh_config_vars());
         let config = Config::from_vars(&vars)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 

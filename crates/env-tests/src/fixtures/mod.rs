@@ -7,6 +7,7 @@ pub mod deployment_config;
 pub mod egress_admission;
 pub mod gate_zero;
 pub mod gc_client;
+pub mod gc_fleet;
 pub mod injection;
 pub mod kube;
 pub mod mc_session;
