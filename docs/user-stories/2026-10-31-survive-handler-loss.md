@@ -1528,7 +1528,7 @@ tasks:
   slug: 2026-11-09-gc-mh-registration-rule
   tag: story-2026-10-31-survive-handler-loss-task-GC-2
 - id: 11
-  status: pending
+  status: completed
   specialist: global-controller
   deps:
   - 5
@@ -1584,6 +1584,7 @@ tasks:
 
     Same commit: proto slice + rpc impl + cap population + config + runbook row; series with panels, catalog entries and tests; DRY anchor rewrite; TODO entry.
     Cross-task obligations: (a) config row; (b) the DRY anchor text updated; (c) panel + catalog + zero-init + ADR-0032 test; (d) GC AcquireMediaHandler and token gates of test-gates.md, paired with test; (e) no id labels.
+  slug: 2026-11-10-gc-acquire-media-handler
   tag: story-2026-10-31-survive-handler-loss-task-GC-3
 - id: 12
   status: pending
