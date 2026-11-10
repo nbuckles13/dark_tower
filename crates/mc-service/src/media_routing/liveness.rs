@@ -30,7 +30,7 @@
 //! the same call. So a heartbeat can never add a handler, and a removed
 //! handler's later heartbeat finds no entry to refresh.
 
-use super::placement::RemovalTrigger;
+use super::placement::{ReleaseCauseExt, RemovalTrigger};
 use proto_gen::dark_tower::internal::v1::{
     ApplyRefusal, HeartbeatVerdict as WireVerdict, ReleaseCause, ServingState,
 };

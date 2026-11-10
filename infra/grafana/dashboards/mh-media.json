@@ -1185,7 +1185,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "EndMeeting decisions (story 2 R-20): released (the registering MC ended the meeting; its registration, routes and edges are reclaimed), unknown_meeting (an acknowledged no-op - MC calls every handler in the assigned set, so this is normal; climbing well above released is an MC-side signal), rejected_ownership (a different mc_id asked to end it; FAILED_PRECONDITION, nothing released - a misrouted or stale MC, or a scope holder acting on a meeting it does not own; see the ownership-reject arm in docs/runbooks/mh-incident-response.md). increase(), NOT rate(): teardowns are low-rate. All three outcomes are pre-registered at zero, so the healthy reading is flat-zero rejects, NOT 'No data'. key_custody=operator.",
+      "description": "Meeting releases that are NOT handler removals, plus EndMeeting refusals (story 2 R-20; story 4 MH-2): released (MEETING_ENDED by EndMeeting or a RELEASED(MEETING_ENDED) heartbeat verdict - the lost-EndMeeting retry - or a misroute; its registration, routes and edges are reclaimed), unknown_meeting (an acknowledged no-op - MC calls every handler in the assigned set, so this is normal; climbing well above released is an MC-side signal), rejected_ownership (a different mc_id asked to end it; FAILED_PRECONDITION, nothing released - a misrouted or stale MC, or a scope holder acting on a meeting it does not own; see the ownership-reject arm in docs/runbooks/mh-incident-response.md), rejected_invalid_cause (an EndMeeting with no valid cause, refused INVALID_ARGUMENT at the gRPC boundary: NON-ZERO MEANS AN MC BELOW STORY 4 MC-B1 IS IN THE FLEET, see docs/runbooks/mh-deployment.md Rollback, MH-2 coupling). Handler REMOVALS are on Handler Releases, not here. increase(), NOT rate(): teardowns are low-rate. All four outcomes are pre-registered at zero, so the healthy reading is flat-zero rejects, NOT 'No data'. key_custody=operator.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3098,6 +3098,322 @@
         }
       ],
       "title": "Pending Exits by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_mc_heartbeats_total (story 4 MH-2; ADR-0039 §1): one per per-meeting heartbeat the session actor built. success = MC answered (any verdict); error = gRPC status (incl. FAILED_PRECONDITION, UNIMPLEMENTED from an MC predating the rpc), transport error, undialable endpoint, or no service token (nothing sent); timeout = the per-attempt deadline (3/4 of the meeting's interval), not retried; skipped_in_flight = the previous beat for the meeting still in flight; dropped_queue_full = the actor's hand-off queue was full. MH takes NO action on error/timeout (it never ends a meeting because MC is unreachable). Rates (ADR-0029); all five pre-registered at zero. No key_custody (mh_gc_heartbeats_total convention). ABSENT series = an image predating MH-2. Runbook: docs/runbooks/mh-incident-response.md. Deploy skew / bad deploy: docs/runbooks/mh-deployment.md Rollback, 'MH-2 heartbeat / EndMeeting cause coupling'; incident scenarios land with story 4 OPS.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "axisLabel": "Beats/s"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 140
+      },
+      "id": 214,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(mh_mc_heartbeats_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "MC Heartbeats by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Share of MC heartbeats answered: sum(rate(success)) / sum(rate(all outcomes)). Both sides summed so the ratio is not dropped by label matching. A sustained dip is MC unreachable or an MC predating MeetingHeartbeat (error = UNIMPLEMENTED); MH takes no action either way. Runbook: docs/runbooks/mh-incident-response.md. Deploy skew / bad deploy: docs/runbooks/mh-deployment.md Rollback, 'MH-2 heartbeat / EndMeeting cause coupling'; incident scenarios land with story 4 OPS.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "axisLabel": "Ratio"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 140
+      },
+      "id": 215,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(mh_mc_heartbeats_total{outcome=\"success\"}[$__rate_interval])) / sum(rate(mh_mc_heartbeats_total[$__rate_interval]))",
+          "legendFormat": "success ratio",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "MC Heartbeat Success Ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_mc_heartbeat_latency_seconds p50/p95/p99, calls that completed ON THE WIRE only (success, and an error carrying a gRPC status; a timeout, skip, drop, undialable endpoint or missing token is not observed). Buckets reach 10 s, the largest interval (N/3 at MC's max N of 30 s); the largest per-attempt deadline is 7.5 s. Runbook: docs/runbooks/mh-incident-response.md.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "axisLabel": "Seconds"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 140
+      },
+      "id": 216,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(mh_mc_heartbeat_latency_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(mh_mc_heartbeat_latency_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(mh_mc_heartbeat_latency_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "MC Heartbeat Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_mc_heartbeat_verdicts_total: owned (nothing done); released (RELEASED with a removal trigger or MEETING_ENDED, acted on); released_stale (RELEASED for a registration superseded while the beat was in flight - dropped); misroute (RELEASED with no cause - STILL ends the meeting); owner_mismatch (FAILED_PRECONDITION - another MC answered; nothing done); unspecified_verdict (malformed verdict; nothing done). misroute, owner_mismatch and released_stale are expected near zero. No unknown value. increase(): low-rate apart from owned. Runbook: docs/runbooks/mh-incident-response.md. Deploy skew / bad deploy: docs/runbooks/mh-deployment.md Rollback, 'MH-2 heartbeat / EndMeeting cause coupling'; incident scenarios land with story 4 OPS.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Verdicts"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 148
+      },
+      "id": 217,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (increase(mh_mc_heartbeat_verdicts_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "MC Heartbeat Verdicts",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_handler_releases_total: meetings released because MC REMOVED this handler (removal-cause EndMeeting or RELEASED verdict). trigger = heartbeat_timeout | apply_lag | planned_transfer (shared RemovalTrigger vocabulary); clients = present (at least one active connection at release) | none. trigger=heartbeat_timeout, clients=present is the FALSE-DECLARATION ground truth: MC declared this handler dead while it served people. apply_lag+present is a correct removal of a slow handler; planned_transfer+present is expected on drain. Flat outside planned transfers. MEETING_ENDED is on Meeting Teardowns, not here. increase(); all six pre-registered at zero. key_custody=operator. Runbook: docs/runbooks/mh-incident-response.md. Deploy skew / bad deploy: docs/runbooks/mh-deployment.md Rollback, 'MH-2 heartbeat / EndMeeting cause coupling'; incident scenarios land with story 4 OPS.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Releases"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 148
+      },
+      "id": 218,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (trigger, clients) (increase(mh_media_handler_releases_total[$__rate_interval]))",
+          "legendFormat": "{{trigger}} / {{clients}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Handler Releases by Trigger and Clients",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_meetings_without_clients: registered meetings with zero active connections, recomputed and set on the session actor's 10 s tick. Briefly non-zero is routine (before the first join, after the last leave); sustained it is a registration nothing uses that was never released (the zombie/leak arm). Compare with mh_media_registered_meetings. key_custody=operator. Runbook: docs/runbooks/mh-incident-response.md.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "axisLabel": "Meetings"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 148
+      },
+      "id": 219,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (instance) (mh_media_meetings_without_clients)",
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Meetings Without Clients",
       "type": "timeseries"
     }
   ],

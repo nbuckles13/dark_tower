@@ -429,7 +429,6 @@ impl MhClient {
                 key_custody = KEY_CUSTODY_OPERATOR,
                 handler_id = %response.handler_id,
                 applied_generation = response.applied_generation,
-                process_start_epoch_ms = response.process_start_epoch_ms,
                 "MH confirmed the forwarding policy is live"
             );
             return Ok(());
@@ -441,9 +440,6 @@ impl MhClient {
         // responder needs both. Generation numbers ride in the LOG LINE, never
         // in a metric label — as labels they would be unbounded, one new series
         // per policy change. No meeting identifier appears on either metric.
-        //
-        // `process_start_epoch_ms` is carried for the responder only; nothing
-        // decides on it (MH-2 deletes the field).
         if restart_floor {
             info!(
                 target: "mc.grpc.mh_client",
@@ -451,7 +447,6 @@ impl MhClient {
                 meeting_id = %programming.meeting_id,
                 sent_generation = programming.policy_generation.get(),
                 applied_generation = response.applied_generation,
-                process_start_epoch_ms = response.process_start_epoch_ms,
                 "Handler holds a higher policy generation on this MC's first push (MC restart \
                  under a live meeting); handing to the pusher to adopt it as a floor"
             );
@@ -476,7 +471,6 @@ impl MhClient {
             echo_arm = echo.map_or("none", |(arm, _)| arm.label()),
             echo_stream_number = echo.map_or(-1, |(_, n)| i32::from(n)),
             declared_source_streams = programming.assignment.source_streams.len(),
-            process_start_epoch_ms = response.process_start_epoch_ms,
             accepted = response.accepted,
             "MH did not confirm the forwarding policy"
         );

@@ -1305,8 +1305,8 @@ async fn server_mute_s4() {
     .await;
     assert_relayed_on_slot("S4 PRE", &pre[&MARK_A], b_slot, MARK_A, "A");
 
-    // INJECT on every live MH pod: the same A <-> B edges MC would program, plus A muted.
-    let handlers = injectable_handlers(&prom, BASELINE_SETTLE_BOUND).await;
+    // INJECT on every handler-set MH pod: the same A <-> B edges MC would program, plus A muted.
+    let handlers = injectable_handlers(&prom, BASELINE_SETTLE_BOUND, &ps[0]).await;
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;
     let cleanup = ReleaseOnDrop::new(token.clone());
     let edges = || {
@@ -1317,7 +1317,7 @@ async fn server_mute_s4() {
     };
     let mut injections = Vec::new();
     for handler in &handlers {
-        injections.push(Injection::open(handler, &token, &cleanup, &ps[0]).await);
+        injections.push(Injection::open(handler, &token, &cleanup, &ps[0], &prom).await);
     }
     assert_mc_programmed_a_carrying_pod(&injections);
     let baselines = settled_baseline(
@@ -1564,7 +1564,7 @@ async fn test_two_concurrent_senders_into_one_receiver_are_never_misattributed()
 /// Injected directly (see [`Injection`]) because only a direct registration
 /// can change ONE edge while leaving every participant's connectivity — and
 /// so MC's own view — unchanged. Everyone connects to ONE handler, so all of
-/// MC's edges are there and the injection targets every live MH pod identically.
+/// MC's edges are there and the injection targets every handler-set MH pod identically.
 #[tokio::test]
 #[serial_test::serial(mh_notifications)]
 async fn test_edge_churn_at_a_new_generation_does_not_stall_unrelated_egress() {
@@ -1593,12 +1593,12 @@ async fn edge_churn() {
         .await;
 
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
-    let handlers = injectable_handlers(&prom, BASELINE_SETTLE_BOUND).await;
+    let handlers = injectable_handlers(&prom, BASELINE_SETTLE_BOUND, &ps[0]).await;
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;
     let cleanup = ReleaseOnDrop::new(token.clone());
     let mut injections = Vec::new();
     for handler in &handlers {
-        injections.push(Injection::open(handler, &token, &cleanup, &ps[0]).await);
+        injections.push(Injection::open(handler, &token, &cleanup, &ps[0], &prom).await);
     }
     assert_mc_programmed_a_carrying_pod(&injections);
     let a_to_b = || mc_shaped_edge(b, 0, b_slot_0, a);

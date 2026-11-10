@@ -61,6 +61,54 @@ pub const MEDIA_KIND_LABEL: &str = "media_kind";
 /// (single source of truth, projection homes, MH-never) applies here unchanged.
 pub const CONTENT_KIND_LABEL: &str = "content_kind";
 
+/// Label KEY for why a handler was removed from a meeting (ADR-0039 §8).
+pub const TRIGGER_LABEL: &str = "trigger";
+
+/// The handler-REMOVAL triggers (ADR-0039 §2/§6): the shared `trigger` label
+/// vocabulary every service projects from the wire `ReleaseCause`
+/// (`docs/debates/2026-10-28-mh-replacement-and-migration/telemetry-contract.md`:
+/// "Used identically by MC, GC and MH. No service keeps its own list").
+///
+/// It is also MC's domain enum for a removal (re-exported as
+/// `mc_service::media_routing::RemovalTrigger`). `MEETING_ENDED` and
+/// `UNSPECIFIED` are NOT removal triggers and are unrepresentable here; each
+/// service's projection from `ReleaseCause` routes them to its own home.
+/// Service-local label values extend this set by WRAPPING it, never by adding
+/// a variant here (GC's `invalid`; MH's MH-local `owner_silence`, which never
+/// crosses the wire).
+///
+/// `crates/common` has no proto-gen dependency, so the projections to and from
+/// `ReleaseCause` live in the services.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RemovalTrigger {
+    /// Declared Dead: no accepted heartbeat within N.
+    HeartbeatTimeout,
+    /// Declared Impaired: applied generation lagging too long, or a
+    /// load-dependent apply refusal.
+    ApplyLag,
+    /// A deliberate move off a DRAINING handler.
+    PlannedTransfer,
+}
+
+impl RemovalTrigger {
+    /// Every variant, for zero-initialisation.
+    pub const ALL: [Self; 3] = [
+        Self::HeartbeatTimeout,
+        Self::ApplyLag,
+        Self::PlannedTransfer,
+    ];
+
+    /// The `trigger` label value: the lowercase `ReleaseCause` value suffix.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::HeartbeatTimeout => "heartbeat_timeout",
+            Self::ApplyLag => "apply_lag",
+            Self::PlannedTransfer => "planned_transfer",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +128,17 @@ mod tests {
     fn media_kind_literal_is_stable() {
         assert_eq!(MEDIA_KIND_LABEL, "media_kind");
         assert_eq!(CONTENT_KIND_LABEL, "content_kind");
+    }
+
+    /// Same reason: `trigger` and its three removal values are selected on by
+    /// MH, MC and GC dashboards and alerts.
+    #[test]
+    fn removal_trigger_literals_are_stable() {
+        assert_eq!(TRIGGER_LABEL, "trigger");
+        let labels: Vec<&str> = RemovalTrigger::ALL.iter().map(|t| t.label()).collect();
+        assert_eq!(
+            labels,
+            ["heartbeat_timeout", "apply_lag", "planned_transfer"]
+        );
     }
 }

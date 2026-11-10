@@ -39,6 +39,15 @@ pub const TEST_MC_ID: &str = "mc-1";
 /// The MC gRPC endpoint every fixture registration claims.
 pub const TEST_MC_ENDPOINT: &str = "http://mc:50052";
 
+/// The heartbeat interval every fixture registration carries (story 4 MH-2:
+/// 0 is a record reject). A realistic value — the deployed N/3 at MC's default
+/// N — not 1 ms, which would wake a paused-time actor continually.
+pub const TEST_HEARTBEAT_INTERVAL_MS: u32 = 2_000;
+
+/// [`TEST_HEARTBEAT_INTERVAL_MS`] as the `MeetingRegistration` field type.
+pub const TEST_HEARTBEAT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(TEST_HEARTBEAT_INTERVAL_MS as u64);
+
 /// One egress stream: `subscriber` receives `candidate`'s stream 0. Its
 /// transport is the candidate's declared one (DATAGRAM via
 /// [`register_request`]); an `EgressStream` carries none of its own.
@@ -121,7 +130,7 @@ pub fn register_request(
         selection_rules: None,
         policy_generation,
         source_streams,
-        heartbeat_interval_ms: 0,
+        heartbeat_interval_ms: TEST_HEARTBEAT_INTERVAL_MS,
         media_dial_public_key: Vec::new(),
     }
 }

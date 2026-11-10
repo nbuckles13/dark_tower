@@ -3,7 +3,7 @@
 //!
 //! One meeting of five real participants (A, E and F publish video, B and C
 //! receive), each joined through GC -> MC and connected to BOTH of the meeting's MH handlers.
-//! The forwarding policy is INJECTED on every live MH pod through
+//! The forwarding policy is INJECTED on every MH pod in the meeting's handler set through
 //! `env_tests::fixtures::injection` acting as MC, at a generation above MC's.
 //! Video comes from T-A's keyless `VideoPublisher` with
 //! `GroupStartSource::OnKeyframeRequest`, reading MH's `KeyframeRequest`s off
@@ -328,13 +328,17 @@ async fn test_on_demand_keyframes_and_recovery() {
             .await;
     }
 
-    let handlers =
-        injectable_handlers(&prom, env_tests::fixtures::metrics::BASELINE_SETTLE_BOUND).await;
+    let handlers = injectable_handlers(
+        &prom,
+        env_tests::fixtures::metrics::BASELINE_SETTLE_BOUND,
+        &ps[0],
+    )
+    .await;
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;
     let cleanup = ReleaseOnDrop::new(token.clone());
     let mut injections = Vec::new();
     for handler in &handlers {
-        injections.push(Injection::open(handler, &token, &cleanup, &ps[0]).await);
+        injections.push(Injection::open(handler, &token, &cleanup, &ps[0], &prom).await);
     }
     assert_mc_programmed_a_carrying_pod(&injections);
 

@@ -126,8 +126,10 @@ async fn accept_loop_emits_accepted_status_and_handshake_observation_on_happy_pa
             MeetingRegistration {
                 mc_id: "mc-accept-ok".to_string(),
                 mc_grpc_endpoint: "http://localhost:1".to_string(),
+                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
             },
+            None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
         .await
@@ -174,8 +176,10 @@ async fn accept_loop_emits_rejected_status_when_at_capacity() {
             MeetingRegistration {
                 mc_id: "mc-rejected".to_string(),
                 mc_grpc_endpoint: "http://localhost:1".to_string(),
+                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
             },
+            None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
         .await

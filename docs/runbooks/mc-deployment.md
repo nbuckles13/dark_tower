@@ -211,9 +211,13 @@ Complete ALL items before deploying to production:
   - **MC-B1 is the floor MH-2 requires (story 4).** Rolling this MC forward
     before MH-2 is safe: an older MH ignores `RegisterMeetingRequest.heartbeat_interval_ms`
     (an unknown proto3 field) and never calls `MeetingHeartbeat`. Once MH-2 is
-    live, rolling MC back below MC-B1 is UNSAFE: MH-2 rejects a 0 interval and
-    gets UNIMPLEMENTED on every heartbeat, so its owner-silence release ends
-    meetings. Roll MH back first (the `internal.proto` ORDERING rule).
+    live, rolling MC back below MC-B1 is UNSAFE: MH-2 refuses every
+    `RegisterMeeting` carrying the old MC's 0 interval (a total media outage for
+    new and re-pushed meetings) and every cause-less `EndMeeting` (released
+    meetings keep their streams); its heartbeats get UNIMPLEMENTED, counted with
+    no action. (MH-3 later adds the owner-silence release, which would then also
+    end those meetings.) Roll MH back first (the `internal.proto` ORDERING rule;
+    `mh-deployment.md` §Rollback, MH-2 coupling).
   - **A new REQUIRED key rides this release** (`MC_MEDIA_CONNECT_SETTLE_MS`;
     from story 2 task 9, `MC_KEK_ROTATION_DEBOUNCE_SECONDS`; and from story 4
     MC-B1, `MC_MH_HEARTBEAT_TIMEOUT_MS`).
@@ -827,9 +831,11 @@ kill %1
 > that no operator can see.
 >
 > **Rolling MC back below story 4 MC-B1 (heartbeat intake).** Safe while MH is
-> below MH-2. Once MH-2 is live it is UNSAFE: roll MH back first (MH-2 rejects
-> the old MC's zero heartbeat interval and gets UNIMPLEMENTED heartbeats, so its
-> owner-silence release ends meetings). Two companions: (1) **the alert rule** —
+> below MH-2. Once MH-2 is live it is UNSAFE: roll MH back first (MH-2 refuses
+> every `RegisterMeeting` carrying the old MC's zero heartbeat interval and every
+> cause-less `EndMeeting`, and gets UNIMPLEMENTED heartbeats, counted with no
+> action; the owner-silence release that would also end those meetings is
+> MH-3's). Two companions: (1) **the alert rule** —
 > `MCMediaGenerationDivergence` now reads `outcome!="match"`, and a pre-MC-B1
 > image emits `handler_id_mismatch` on every MH restart, which PAGES under it:
 > roll `mc-alerts.yaml` back with the image, or expect and silence that page;

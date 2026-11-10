@@ -483,11 +483,23 @@ pub async fn connect(handler: &Handler) -> MediaHandlerServiceClient<Channel> {
     MediaHandlerServiceClient::new(channel)
 }
 
-/// An MC gRPC endpoint that is never dialled. Syntactically valid so it passes
+/// An MC gRPC endpoint that never ANSWERS. Syntactically valid so it passes
 /// MH's scheme check; `.invalid` is reserved, so it cannot resolve by accident.
-/// A probe registration names it because MH only calls MC back for a
-/// participant's connection, and a probe has no participants.
+/// A probe registration names it so no real MC is ever told about the probe:
+/// a probe has no participants, so MH never notifies about connections there.
+/// MH DOES heartbeat it once per [`PROBE_HEARTBEAT_INTERVAL_MS`] (story 4
+/// MH-2: every registered meeting heartbeats its registered MC); each beat
+/// fails and is counted `mh_mc_heartbeats_total{outcome="error"}` (or
+/// `timeout`), and MH takes NO action on it — MH never ends a meeting because
+/// MC is unreachable. So a probe stays held until its own `EndMeeting`.
 pub const NEVER_DIALLED_MC_ENDPOINT: &str = "http://env-test-mc.invalid:50052";
+
+/// The `heartbeat_interval_ms` a PROBE registration carries (story 4 MH-2: 0
+/// is a record reject). Probes name [`NEVER_DIALLED_MC_ENDPOINT`], so nothing
+/// couples this to MC's N: it only paces the failing beats. An injection on a
+/// REAL MC's meeting must use MC's own interval instead
+/// ([`crate::fixtures::metrics::mc_heartbeat_interval`]). Never 1 ms.
+pub const PROBE_HEARTBEAT_INTERVAL_MS: u32 = 2_000;
 
 /// A PROBE registration: `meeting_id` at `generation` as `mc_id`, with NO
 /// edges and NO declared source streams.
@@ -525,7 +537,7 @@ pub fn probe_registration(
         selection_rules: None,
         policy_generation: generation,
         source_streams: Vec::new(),
-        heartbeat_interval_ms: 0,
+        heartbeat_interval_ms: PROBE_HEARTBEAT_INTERVAL_MS,
         media_dial_public_key: Vec::new(),
     }
 }

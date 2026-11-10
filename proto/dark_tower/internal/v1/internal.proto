@@ -590,10 +590,12 @@ service MediaHandlerService {
 //     all-or-none rule is stated once, at
 //     `RegisterMeetingResponse.applied_generation`.
 // Record rejects are NOT apply refusals and never appear in `ApplyRefusal`.
-// INTERIM (enforcement owner: MH-2, which starts heartbeats at the upsert and
-// so must upsert before policy validation): until then, MH validates the whole
-// request, policy included, BEFORE the upsert, so ANY validation reject records
-// nothing and does not rebind `mc_id`. The interim is the stricter direction.
+// A POLICY validation reject (INVALID, TRANSPORT_INCONSISTENT, per-meeting
+// bounds) is answered `INVALID_ARGUMENT`, but the record HAS been upserted
+// (`mc_id` rebound, heartbeats running with `apply_refusal` set). A
+// `RegisterMeeting` error status therefore does not mean nothing was
+// recorded; only a record reject means that. MC tells the two apart through
+// the heartbeat, never through the status code.
 //
 // NO KEY MATERIAL CROSSES THIS CONTRACT (ADR-0036 §4, Appendix). No KEK, no
 // transmit key, no key id, no wrapped material, ever. MH is keyless, and that is
@@ -903,35 +905,12 @@ message RegisterMeetingResponse {
   // from the MH pod's own series. Log lines only.
   string handler_id = 3;
 
-  // Unix epoch milliseconds at which THIS MH PROCESS started, so MC can detect a
-  // restart (ADR-0036 §8).
-  //
-  // PER-PROCESS, NOT PER-POD-NAME AND NOT PER-CONFIG. MH MUST sample this ONCE
-  // at process start and return the same value for the process's whole life. A
-  // crash-restart into the same pod identity must change it, or the restart
-  // detector never fires for the case it exists to catch.
-  //
-  // COMPARED FOR INEQUALITY ONLY -- it is a process-incarnation token, not a
-  // clock reading MC does arithmetic on. Wall-clock skew between handlers is
-  // therefore irrelevant.
-  //
-  // ZERO MEANS "NOT REPORTED", NOT "EPOCH ZERO". A pre-reshape MH's absent field
-  // decodes to 0 on EVERY response, and 0 is STABLE, so without this rule it
-  // would read as "same process, never restarted", permanently. MC MUST treat 0
-  // as "restart undetectable" and never as a stable incarnation. A restart
-  // detector pinned to a constant is worse than an absent one, because it is
-  // load-bearing and green.
-  //
-  // The PRODUCER obligation is not testable in one story and is split in
-  // docs/TODO.md §Media Path Obligations: within-process stability is pinned at
-  // story task 5 (two calls in one process return the same value, which kills a
-  // per-call clock read); changes-on-restart is pinned at the handler-restart
-  // story, because distinguishing a correct per-process sample from a
-  // per-pod-name or per-config value requires a SECOND PROCESS INCARNATION
-  // SHARING A POD IDENTITY, which does not exist until then.
-  //
-  // OBSERVABILITY: not label material -- unbounded, one new series per restart.
-  uint64 process_start_epoch_ms = 4;
+  // Was: `uint64 process_start_epoch_ms = 4`, a per-process restart token.
+  // Deleted by story 4 MH-2 (ADR-0039 §1 drops restart detection with the
+  // re-assert cadence; each process is its own handler, so a restart is a new
+  // `handler_id`).
+  reserved 4;
+  reserved "process_start_epoch_ms";
 
   // Was: `TransportMode transport_mode = 5`, the single-mode echo of every
   // egress stream's applied transport. Deleted by MC-B; replaced by the
@@ -1056,10 +1035,9 @@ message RegisterMeetingResponse {
 // registration's generation outcome, or a failover MC re-registering at a
 // generation <= the applied one would leave the old `mc_id` in place and be
 // unable to release, stranding the meeting and leaking its budget. A
-// registration whose RECORD is rejected does not rebind it; until MH-2 moves
-// policy validation after the upsert, ANY validation reject (policy included)
-// does not rebind it (`RegisterMeetingRequest` header, INTERIM). The check
-// guards against a misrouted or stale MC.
+// registration whose RECORD is rejected does not rebind it; a policy reject
+// does (`RegisterMeetingRequest` header). The check guards against a
+// misrouted or stale MC.
 // Nothing binds the caller's identity to `mc_id`; see the docs/TODO.md entry
 // "MH does not verify meeting ownership".
 //

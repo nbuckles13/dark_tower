@@ -395,6 +395,7 @@ assert_not_generated "dark_tower/internal/v1/internal_pb.ts" MutedSource
 assert_message_field_absent "dark_tower/internal/v1/internal_pb.ts" EgressStream transportMode supersedeOnIndependentFrame
 assert_message_field_absent "dark_tower/internal/v1/internal_pb.ts" RegisterMeetingRequest serverMutedSources sourceStreams
 assert_message_field_absent "dark_tower/internal/v1/internal_pb.ts" RegisterMeetingResponse transportMode appliedSourceStreams
+assert_message_field_absent "dark_tower/internal/v1/internal_pb.ts" RegisterMeetingResponse processStartEpochMs appliedGeneration
 assert_message_field_absent "dark_tower/signaling/v1/signaling_pb.ts" JoinResponse maxReceiveSlots receiveSlotCaps
 # The surviving `transportMode` declarations are still matched by the same
 # helper, so the absences above cannot be a matcher that never matches.

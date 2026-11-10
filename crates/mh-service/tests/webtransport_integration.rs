@@ -173,8 +173,10 @@ async fn valid_meeting_jwt_connection_accepted_and_tracked() {
             mh_service::session::MeetingRegistration {
                 mc_id: "mc-wt-test".to_string(),
                 mc_grpc_endpoint: "http://localhost:1".to_string(),
+                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
             },
+            None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
         .await
@@ -459,8 +461,10 @@ async fn wrong_token_type_guest_rejected_on_wt_accept_path() {
             mh_service::session::MeetingRegistration {
                 mc_id: "mc-wt-guest".to_string(),
                 mc_grpc_endpoint: "http://localhost:1".to_string(),
+                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
             },
+            None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
         .await
@@ -566,8 +570,10 @@ async fn provisional_connection_survives_when_register_meeting_arrives_within_wi
             mh_service::session::MeetingRegistration {
                 mc_id: "mc-wt-survive".to_string(),
                 mc_grpc_endpoint: "http://localhost:1".to_string(),
+                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
             },
+            None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
         .await
@@ -621,8 +627,10 @@ async fn mc_notify_connected_fires_on_join_and_disconnected_fires_on_client_drop
             mh_service::session::MeetingRegistration {
                 mc_id: "mc-wt-notify".to_string(),
                 mc_grpc_endpoint: format!("http://{}", mc.addr),
+                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
             },
+            None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
         .await

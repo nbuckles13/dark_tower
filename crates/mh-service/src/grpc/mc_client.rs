@@ -21,7 +21,6 @@
 use crate::errors::MhError;
 use crate::observability::metrics;
 use common::observability::otel_grpc::client_interceptor;
-use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_client::MediaCoordinationServiceClient;
 use proto_gen::dark_tower::internal::v1::{
@@ -38,10 +37,10 @@ use tracing::{debug, error, instrument, warn};
 const MC_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default connect timeout for MC.
-const MC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const MC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum number of retry attempts for notification delivery.
-const MAX_RETRY_ATTEMPTS: u32 = 3;
+pub const MAX_RETRY_ATTEMPTS: u32 = 3;
 
 /// Base delay for exponential backoff between retries.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
@@ -70,6 +69,10 @@ pub fn retry_budget_ceiling() -> Duration {
 pub struct McClient {
     /// Token receiver for dynamically refreshed OAuth tokens.
     token_rx: TokenReceiver,
+    /// First backoff delay between notification retries. Production is
+    /// always [`RETRY_BASE_DELAY`]; only [`McClient::with_retry_base_delay`]
+    /// (tests) changes it. The attempt count is never configurable.
+    retry_base_delay: Duration,
 }
 
 impl McClient {
@@ -80,7 +83,21 @@ impl McClient {
     /// * `token_rx` - Token receiver for dynamically refreshed OAuth tokens
     #[must_use]
     pub fn new(token_rx: TokenReceiver) -> Self {
-        Self { token_rx }
+        Self {
+            token_rx,
+            retry_base_delay: RETRY_BASE_DELAY,
+        }
+    }
+
+    /// FOR TESTS: [`Self::new`] with a shorter first backoff, so a test can
+    /// drive the real retry path to `MAX_RETRY_ATTEMPTS` without seconds of
+    /// wall-clock backoff. Production never calls this.
+    #[must_use]
+    pub fn with_retry_base_delay(token_rx: TokenReceiver, retry_base_delay: Duration) -> Self {
+        Self {
+            token_rx,
+            retry_base_delay,
+        }
     }
 
     /// Notify MC that a participant has connected to this MH.
@@ -241,7 +258,7 @@ impl McClient {
             Box<dyn std::future::Future<Output = Result<tonic::Response<R>, tonic::Status>> + Send>,
         >,
     {
-        let mut delay = RETRY_BASE_DELAY;
+        let mut delay = self.retry_base_delay;
 
         for attempt in 1..=MAX_RETRY_ATTEMPTS {
             match self
@@ -371,26 +388,17 @@ impl McClient {
         Ok(response.into_inner())
     }
 
-    /// Add authorization header to a request.
+    /// Add authorization header to a request, through the crate's one
+    /// header builder ([`super::authorized_request`]).
     fn add_auth<T>(&self, request: T) -> Result<Request<T>, MhError> {
-        let mut grpc_request = Request::new(request);
-        let current_token = self.token_rx.token();
-        grpc_request.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {}", current_token.expose_secret())
-                .parse()
-                .map_err(|e| {
-                    error!(
-                        target: "mh.grpc.mc_client",
-                        error = %e,
-                        "Authorization header parse failed"
-                    );
-                    MhError::OutboundAuthUnavailable(format!(
-                        "Authorization header parse failed: {e}"
-                    ))
-                })?,
-        );
-        Ok(grpc_request)
+        super::authorized_request(&self.token_rx, request).map_err(|e| {
+            error!(
+                target: "mh.grpc.mc_client",
+                error = %e,
+                "Authorization header parse failed"
+            );
+            e
+        })
     }
 }
 

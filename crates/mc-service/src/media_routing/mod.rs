@@ -65,7 +65,7 @@ pub use liveness::{
 };
 pub use placement::{
     ClientHandler, ClientHandlerEntry, ClientHandlerSet, ConnectedHandlers, HandlerEndpoint,
-    HandlerSetError, MeetingHandlers, RemovalTrigger, SetChange,
+    HandlerSetError, MeetingHandlers, ReleaseCauseExt, RemovalTrigger, SetChange,
 };
 pub use pusher::{FloorAdoption, HandlerPusher, PushJob, PushTarget};
 pub use slots::{

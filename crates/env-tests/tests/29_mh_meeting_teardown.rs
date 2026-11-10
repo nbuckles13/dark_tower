@@ -99,8 +99,10 @@
 //! cluster's lifetime. Cleanup is STRUCTURAL —
 //! a `Drop` guard releases everything this test registered, so a mid-test panic
 //! cannot leak a registration into every later suite on the
-//! cluster. `mc_grpc_endpoint` is a never-dialled placeholder: MH dials it only
-//! for WebTransport clients of the meeting, and none joins a test meeting.
+//! cluster. `mc_grpc_endpoint` is a never-answering placeholder: MH notifies it
+//! about no connection (none joins a test meeting), and its per-meeting
+//! heartbeats to it (story 4 MH-2) fail and are counted with no action — MH
+//! never ends a meeting because its MC is unreachable.
 //!
 //! # Reading metrics: pinned, relative, no wall clock
 //!

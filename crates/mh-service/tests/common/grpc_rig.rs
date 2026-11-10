@@ -63,7 +63,6 @@ impl GrpcRig {
         let mh_media_service = MhMediaService::new(
             session_manager.clone(),
             "mh-test-handler".to_string(),
-            mh_service::process::sample_process_start_epoch_ms(),
             policy_limits,
         );
 

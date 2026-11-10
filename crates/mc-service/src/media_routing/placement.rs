@@ -111,25 +111,25 @@ pub struct HandlerEndpoint {
 }
 
 /// Why MC removed a handler from a meeting (ADR-0039 §2/§6). MC's domain
-/// enum: the wire `ReleaseCause` is reached ONLY through
-/// [`Self::release_cause`], and `MEETING_ENDED`/`UNSPECIFIED` are not removal
-/// triggers, so they are unrepresentable here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemovalTrigger {
-    /// Declared Dead: no accepted heartbeat within N.
-    HeartbeatTimeout,
-    /// Declared Impaired: applied generation lagging too long, or a
-    /// load-dependent apply refusal.
-    ApplyLag,
-    /// A deliberate move off a DRAINING handler.
-    PlannedTransfer,
-}
+/// enum, which is also the fleet-wide `trigger` label vocabulary: its single
+/// home is `common::observability::labels::RemovalTrigger`, re-exported here so
+/// MC call sites read `media_routing::RemovalTrigger`. The wire `ReleaseCause`
+/// is reached ONLY through [`ReleaseCauseExt::release_cause`], and
+/// `MEETING_ENDED`/`UNSPECIFIED` are not removal triggers, so they are
+/// unrepresentable here.
+pub use common::observability::labels::RemovalTrigger;
 
-impl RemovalTrigger {
+/// MC's projection of a [`RemovalTrigger`] onto the wire. An extension trait
+/// because the enum lives in `crates/common`, which has no proto-gen
+/// dependency.
+pub trait ReleaseCauseExt {
     /// The ONE projection onto the wire `ReleaseCause` (RELEASED verdicts,
     /// `EndMeetingRequest.cause`, `AcquireMediaHandlerRequest.trigger`).
-    #[must_use]
-    pub fn release_cause(self) -> proto_gen::dark_tower::internal::v1::ReleaseCause {
+    fn release_cause(self) -> proto_gen::dark_tower::internal::v1::ReleaseCause;
+}
+
+impl ReleaseCauseExt for RemovalTrigger {
+    fn release_cause(self) -> proto_gen::dark_tower::internal::v1::ReleaseCause {
         use proto_gen::dark_tower::internal::v1::ReleaseCause;
         match self {
             Self::HeartbeatTimeout => ReleaseCause::HeartbeatTimeout,

@@ -19,7 +19,6 @@ use crate::errors::MhError;
 use crate::observability::metrics;
 use crate::routing::RoutingTable;
 use common::observability::otel_grpc::client_interceptor;
-use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::media_handler_registry_service_client::MediaHandlerRegistryServiceClient;
 use proto_gen::dark_tower::internal::v1::{RegisterMhRequest, SendLoadReportRequest};
@@ -140,26 +139,17 @@ impl GcClient {
         })
     }
 
-    /// Add authorization header to a request.
+    /// Add authorization header to a request, through the crate's one
+    /// header builder ([`super::authorized_request`]).
     fn add_auth<T>(&self, request: T) -> Result<Request<T>, MhError> {
-        let mut grpc_request = Request::new(request);
-        let current_token = self.token_rx.token();
-        grpc_request.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {}", current_token.expose_secret())
-                .parse()
-                .map_err(|e| {
-                    error!(target: "mh.grpc.gc_client", error = %e, "Authorization header parse failed");
-                    // Same fault and same reasoning as `mc_client`'s: `Config`
-                    // means MH's STARTUP configuration, and a per-call
-                    // credential failure behind a name that says
-                    // "misconfigured at boot" is a false triage pointer.
-                    MhError::OutboundAuthUnavailable(format!(
-                        "Authorization header parse failed: {e}"
-                    ))
-                })?,
-        );
-        Ok(grpc_request)
+        super::authorized_request(&self.token_rx, request).map_err(|e| {
+            // `OutboundAuthUnavailable`, not `Config`: `Config` means MH's
+            // STARTUP configuration, and a per-call credential failure behind
+            // a name that says "misconfigured at boot" is a false triage
+            // pointer. The message never carries the token.
+            error!(target: "mh.grpc.gc_client", error = %e, "Authorization header parse failed");
+            e
+        })
     }
 
     /// The value advertised to GC as `max_streams`: the derived egress STREAM

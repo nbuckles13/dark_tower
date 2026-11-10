@@ -146,8 +146,10 @@ async fn assert_valid_traceparent_reparents(capture: SpanCapture) {
             mh_service::session::MeetingRegistration {
                 mc_id: "otel-wt-mc".to_string(),
                 mc_grpc_endpoint: suite.mc_endpoint(),
+                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
             },
+            None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
         .await
@@ -209,8 +211,10 @@ async fn test_wt_empty_trace_fields_stays_parentless_root_span() {
             mh_service::session::MeetingRegistration {
                 mc_id: "otel-wt-mc-noop".to_string(),
                 mc_grpc_endpoint: suite.mc_endpoint(),
+                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
             },
+            None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
         .await

@@ -12,14 +12,16 @@
 //!
 //! # What this handler does
 //!
-//! 1. validates the request, rejecting the **whole** registration on any
-//!    structural fault — never last-write-wins, never partial application;
-//! 2. upserts the meeting and drains/promotes pending WebTransport connections
-//!    (unchanged; a re-assert actively rescues clients in the provisional
-//!    window, which is what §8 relies on for restart recovery);
-//! 3. hands the validated policy to the session actor over the **config-apply**
-//!    mailbox, separate from the bounded connection-lifecycle mailbox;
-//! 4. answers with what MH's live forward path **actually reflects**.
+//! 1. validates the registration RECORD (ids, endpoint, a non-zero heartbeat
+//!    interval), rejecting the whole request before any upsert on a fault;
+//! 2. validates the forwarding POLICY (pure: nothing touched yet);
+//! 3. upserts the record — even when the policy was refused, which then
+//!    becomes the meeting's `apply_refusal` (ADR-0039 §1: heartbeats start at
+//!    the upsert, so a first-apply refusal still reports 0 plus its refusal) —
+//!    and drains/promotes pending WebTransport connections;
+//! 4. on a valid policy, hands it to the session actor over the
+//!    **config-apply** mailbox, separate from the bounded lifecycle mailbox;
+//! 5. answers with what MH's live forward path **actually reflects**.
 //!
 //! # The response is read from the live snapshot, never from the request
 //!
@@ -53,6 +55,7 @@ use std::time::{Duration, Instant};
 use crate::config::PolicyLimits;
 use crate::observability::metrics::{self, GrpcMethod, MeetingTeardownOutcome, PolicyApplyOutcome};
 use crate::routing::MeetingPolicy;
+use crate::session::release::ReleaseKind;
 use crate::session::{
     ApplyFailure, ApplyOutcome, EndMeetingFailure, MeetingRegistration, RegisterRefusal,
     SessionManagerHandle,
@@ -73,6 +76,10 @@ const MAX_ID_LENGTH: usize = 256;
 /// 2048 bytes is generous for any legitimate gRPC endpoint URL.
 const MAX_ENDPOINT_LENGTH: usize = 2048;
 
+/// The generic `INVALID_ARGUMENT` text for an `EndMeeting` with no valid
+/// cause (no id echoed).
+const INVALID_CAUSE_MESSAGE: &str = "cause is required and must be a known ReleaseCause";
+
 /// Media Handler gRPC service.
 pub struct MhMediaService {
     session_manager: SessionManagerHandle,
@@ -82,39 +89,28 @@ pub struct MhMediaService {
     /// against the `MhAssignment.mh_id` it dialed and fail loud on a mismatch.
     /// Never derived from a pod name or any other infrastructure topology.
     handler_id: String,
-    /// Sampled once at process start and carried unchanged for the process's
-    /// life, so MC can detect a restart by inequality.
-    process_start_epoch_ms: u64,
     /// Bounds applied to the request before any routing table is built.
     policy_limits: PolicyLimits,
 }
 
 impl MhMediaService {
     /// Create a new media handler service.
-    ///
-    /// `process_start_epoch_ms` must come from **one** call to
-    /// `process::sample_process_start_epoch_ms` made at process start. Sampling
-    /// it per request makes MC's restart detector fire on every call; deriving
-    /// it from pod name or config makes it never fire at all.
     #[must_use]
     pub fn new(
         session_manager: SessionManagerHandle,
         handler_id: String,
-        process_start_epoch_ms: u64,
         policy_limits: PolicyLimits,
     ) -> Self {
         Self {
             session_manager,
             handler_id,
-            process_start_epoch_ms,
             policy_limits,
         }
     }
 
-    // There is deliberately no `Default` impl. A handler with no identity and
-    // no process-start epoch cannot answer `RegisterMeeting` truthfully, and a
-    // default would have to invent both — inventing exactly the two values MC
-    // uses to detect a misrouted handler and a restart.
+    // There is deliberately no `Default` impl. A handler with no identity
+    // cannot answer `RegisterMeeting` truthfully, and a default would have to
+    // invent the value MC uses to detect a misrouted handler.
 
     /// Build the response from MH's own live state.
     ///
@@ -130,7 +126,6 @@ impl MhMediaService {
             accepted: true,
             applied_generation: snapshot.generation_for(meeting),
             handler_id: self.handler_id.clone(),
-            process_start_epoch_ms: self.process_start_epoch_ms,
             // The per-stream echo, from the APPLIED snapshot, never the
             // received request.
             applied_source_streams: snapshot.applied_source_streams_for(meeting),
@@ -183,46 +178,51 @@ impl MediaHandlerService for MhMediaService {
                 "mc_grpc_endpoint must use http://, https://, or grpc:// scheme",
             ));
         }
+        // A RECORD reject (`RegisterMeetingRequest.heartbeat_interval_ms`): MH
+        // has no cadence of its own, so a 0 interval cannot be heartbeated.
+        // Logged on EVERY refusal with a stable `reason`: this is the
+        // deploy-skew signal for an MC below story 4 MC-B1, which sends 0
+        // (docs/runbooks/mh-deployment.md §Rollback). Counted on
+        // `mh_grpc_requests_total{method="register_meeting",status="error"}`.
+        if req.heartbeat_interval_ms == 0 {
+            metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "error");
+            tracing::warn!(
+                target: "mh.grpc.service",
+                key_custody = KEY_CUSTODY_OPERATOR,
+                reason = "zero_heartbeat_interval",
+                meeting_id = %req.meeting_id,
+                mc_id = %req.mc_id,
+                "Rejecting registration: heartbeat_interval_ms is 0 (an MC below story 4 \
+                 MC-B1?); nothing recorded"
+            );
+            return Err(Status::invalid_argument(
+                "heartbeat_interval_ms must be non-zero",
+            ));
+        }
 
         // -------------------------------------------------------------------
         // Policy boundary. Everything below reads policy-bearing fields, so
         // every terminal path from here records exactly one outcome.
         //
-        // Validation runs BEFORE any state is touched: no upsert, no promotion,
-        // no apply, no snapshot swap. A rejected registration therefore never
-        // regresses live state — an already-registered meeting keeps its
-        // registration, its installed snapshot and its active connections.
+        // Validation is PURE and runs before any state is touched, but its
+        // verdict no longer gates the record upsert (ADR-0039 §1; the
+        // `RegisterMeetingRequest` header in `internal.proto`): the RECORD is
+        // upserted even when the policy is refused, so the meeting's
+        // heartbeats start and report `applied_generation` (the prior
+        // installed one, or 0) plus the refusal. The installed snapshot is
+        // untouched by a refusal — a refused registration never regresses
+        // live forwarding.
         // -------------------------------------------------------------------
-        let policy = match MeetingPolicy::from_request(&req, &self.policy_limits) {
-            Ok(policy) => policy,
-            Err(rejection) => {
-                metrics::record_media_policy_apply(rejection.outcome());
-                metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "error");
-                tracing::warn!(
-                    target: "mh.grpc.service",
-                    key_custody = KEY_CUSTODY_OPERATOR,
-                    reason = rejection.reason(),
-                    policy_apply_outcome = rejection.outcome().as_label(),
-                    egress_stream_count = req.egress_streams.len(),
-                    source_stream_count = req.source_streams.len(),
-                    "Rejecting whole registration; live policy unchanged"
-                );
-                return Err(Status::invalid_argument(rejection.reason()));
-            }
-        };
+        let validated = MeetingPolicy::from_request(&req, &self.policy_limits);
+        let policy_rejection = validated.as_ref().err().copied();
 
-        // The registration itself is accepted even when the policy will not be
-        // installed: MH's handler upserts and drains/promotes pending
-        // connections, and §8 relies on that to rescue clients sitting in the
-        // provisional window after a restart.
-        //
-        // ORDER IS LOAD-BEARING for `EndMeeting`: this upsert runs after
-        // validation and BEFORE the apply, so ANY validation-passing
-        // registration rebinds the meeting's `mc_id` whatever its generation
-        // outcome. A failover MC re-registering below the applied generation
-        // (refused as stale) must still take over ownership, or it could never
-        // release the meeting (`internal.proto`, `EndMeetingRequest`). Do not
-        // move this behind `apply_policy`.
+        // ORDER IS LOAD-BEARING for `EndMeeting`: this upsert runs BEFORE the
+        // apply, so every record-valid registration rebinds the meeting's
+        // `mc_id` whatever its policy or generation outcome. A failover MC
+        // re-registering below the applied generation (refused as stale) must
+        // still take over ownership, or it could never release the meeting
+        // (`internal.proto`, `EndMeetingRequest`). Do not move this behind
+        // `apply_policy`.
         let promoted = match self
             .session_manager
             .register_meeting(
@@ -230,8 +230,10 @@ impl MediaHandlerService for MhMediaService {
                 MeetingRegistration {
                     mc_id: req.mc_id.clone(),
                     mc_grpc_endpoint: req.mc_grpc_endpoint.clone(),
+                    heartbeat_interval: Duration::from_millis(u64::from(req.heartbeat_interval_ms)),
                     registered_at: Instant::now(),
                 },
+                policy_rejection,
                 self.policy_limits.max_registered_meetings,
             )
             .await
@@ -248,6 +250,29 @@ impl MediaHandlerService for MhMediaService {
                     "media handler holds its maximum of {cap} registered meetings \
                      ({held} held); new meeting refused"
                 )));
+            }
+        };
+
+        let policy = match validated {
+            Ok(policy) => policy,
+            Err(rejection) => {
+                // Still INVALID_ARGUMENT on the wire, but the record WAS
+                // upserted: an error status here does not mean "nothing
+                // recorded" (`internal.proto`, `RegisterMeetingRequest`).
+                metrics::record_media_policy_apply(rejection.outcome());
+                metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "error");
+                tracing::warn!(
+                    target: "mh.grpc.service",
+                    key_custody = KEY_CUSTODY_OPERATOR,
+                    reason = rejection.reason(),
+                    policy_apply_outcome = rejection.outcome().as_label(),
+                    egress_stream_count = req.egress_streams.len(),
+                    source_stream_count = req.source_streams.len(),
+                    promoted_pending_count = promoted.len(),
+                    "Rejecting registration policy; record upserted, live policy unchanged, \
+                     heartbeats report the refusal"
+                );
+                return Err(Status::invalid_argument(rejection.reason()));
             }
         };
 
@@ -408,11 +433,34 @@ impl MediaHandlerService for MhMediaService {
             return Err(Status::invalid_argument(reason));
         }
 
+        // The cause (story 4 MH-2; `EndMeetingRequest.cause`): UNSPECIFIED and
+        // any number outside `ReleaseCause` are refused BEFORE any state
+        // change and before the ownership check, so a malformed request is
+        // INVALID_ARGUMENT, never FAILED_PRECONDITION. Generic status: no id
+        // is echoed. The cause decides only the fate of pending connections
+        // and where the release is counted, never WHETHER MH releases.
+        let kind = ReleaseKind::of(req.cause);
+        if kind == ReleaseKind::NoCause {
+            metrics::record_meeting_teardown(MeetingTeardownOutcome::RejectedInvalidCause);
+            metrics::record_grpc_request(GrpcMethod::EndMeeting, "error");
+            tracing::warn!(
+                target: "mh.grpc.service",
+                key_custody = KEY_CUSTODY_OPERATOR,
+                meeting_id = %req.meeting_id,
+                mc_id = %req.mc_id,
+                cause = req.cause,
+                "Refusing EndMeeting with no valid cause (an MC below story 4 MC-B1?); \
+                 nothing released"
+            );
+            return Err(Status::invalid_argument(INVALID_CAUSE_MESSAGE));
+        }
+
         let decided = self
             .session_manager
             .end_meeting(
                 req.meeting_id,
                 req.mc_id,
+                kind,
                 Duration::from_millis(self.policy_limits.policy_apply_timeout_ms),
             )
             .await;
@@ -421,6 +469,12 @@ impl MediaHandlerService for MhMediaService {
             Ok(MeetingTeardownOutcome::Released | MeetingTeardownOutcome::UnknownMeeting) => {
                 metrics::record_grpc_request(GrpcMethod::EndMeeting, "success");
                 Ok(Response::new(EndMeetingResponse { acknowledged: true }))
+            }
+            // The actor never decides this (the cause is checked above);
+            // answered as the invalid argument it is.
+            Ok(MeetingTeardownOutcome::RejectedInvalidCause) => {
+                metrics::record_grpc_request(GrpcMethod::EndMeeting, "error");
+                Err(Status::invalid_argument(INVALID_CAUSE_MESSAGE))
             }
             Ok(MeetingTeardownOutcome::RejectedOwnership) => {
                 metrics::record_grpc_request(GrpcMethod::EndMeeting, "error");
@@ -529,7 +583,6 @@ mod tests {
     use std::sync::Arc;
 
     const TEST_HANDLER_ID: &str = "mh-test-handler";
-    const TEST_EPOCH_MS: u64 = 1_700_000_000_000;
 
     fn make_service() -> (MhMediaService, SessionManagerHandle) {
         make_service_with_limits(PolicyLimits::for_tests())
@@ -537,12 +590,7 @@ mod tests {
 
     fn make_service_with_limits(limits: PolicyLimits) -> (MhMediaService, SessionManagerHandle) {
         let sm = SessionManagerHandle::new_for_tests(crate::session::admission::test_admission());
-        let svc = MhMediaService::new(
-            sm.clone(),
-            TEST_HANDLER_ID.to_string(),
-            TEST_EPOCH_MS,
-            limits,
-        );
+        let svc = MhMediaService::new(sm.clone(), TEST_HANDLER_ID.to_string(), limits);
         (svc, sm)
     }
 
@@ -558,12 +606,7 @@ mod tests {
         let (sm, actor) = SessionManagerHandle::new_with_parts_for_tests(
             crate::session::admission::test_admission(),
         );
-        let svc = MhMediaService::new(
-            sm.clone(),
-            TEST_HANDLER_ID.to_string(),
-            TEST_EPOCH_MS,
-            limits,
-        );
+        let svc = MhMediaService::new(sm.clone(), TEST_HANDLER_ID.to_string(), limits);
         (svc, sm, actor)
     }
 
@@ -588,7 +631,7 @@ mod tests {
             selection_rules: None,
             policy_generation: 0,
             source_streams: Vec::new(),
-            heartbeat_interval_ms: 0,
+            heartbeat_interval_ms: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL_MS,
             media_dial_public_key: Vec::new(),
         })
     }
@@ -1397,7 +1440,6 @@ mod tests {
         let svc = MhMediaService::new(
             sm.clone(),
             TEST_HANDLER_ID.to_string(),
-            TEST_EPOCH_MS,
             PolicyLimits::for_tests(),
         );
         (svc, sm)
@@ -1556,35 +1598,65 @@ mod tests {
     // Structural rejects — whole registration, no state mutation
     // =======================================================================
 
+    /// A POLICY reject (story 4 MH-2 reorder, `internal.proto`
+    /// `RegisterMeetingRequest` header): `INVALID_ARGUMENT`, the live snapshot
+    /// untouched — but the RECORD is upserted (`mc_id` and endpoint rebound),
+    /// so its heartbeats report the refusal. Distinguishing arm: a RECORD
+    /// reject (heartbeat interval 0) from the same new MC upserts nothing.
     #[tokio::test]
-    async fn structural_reject_mutates_no_state_and_regresses_nothing() {
+    async fn a_policy_reject_upserts_the_record_and_a_record_reject_does_not() {
         let (svc, sm) = make_service();
 
         svc.register_meeting(make_policy_request("m-1", 2, vec![egress(1, 5, 0, 5)]))
             .await
             .unwrap();
         let snapshot_before = sm.routing_snapshot();
-        let endpoint_before = sm.get_mc_endpoint("m-1").await.unwrap();
 
-        // Duplicate egress_stream_id.
+        // RECORD reject from a new MC: nothing recorded.
+        let mut record_bad = make_register_request("m-1", "mc-new", "http://mc-new:50052");
+        record_bad.get_mut().heartbeat_interval_ms = 0;
+        let err = svc.register_meeting(record_bad).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            sm.get_mc_endpoint("m-1").await.unwrap(),
+            mh_test_utils::media_policy::TEST_MC_ENDPOINT,
+            "a record reject must not upsert"
+        );
+
+        // POLICY reject (duplicate egress_stream_id) from the new MC.
+        let mut policy_bad =
+            register_request("m-1", 3, vec![egress(1, 5, 0, 5), egress(1, 6, 1, 6)]);
+        policy_bad.mc_id = "mc-new".to_string();
+        policy_bad.mc_grpc_endpoint = "http://mc-new:50052".to_string();
         let err = svc
-            .register_meeting(make_policy_request(
-                "m-1",
-                3,
-                vec![egress(1, 5, 0, 5), egress(1, 6, 1, 6)],
-            ))
+            .register_meeting(Request::new(policy_bad))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
         assert!(
             Arc::ptr_eq(&snapshot_before, &sm.routing_snapshot()),
-            "a rejected registration must not touch the live snapshot"
+            "a policy reject must not touch the live snapshot"
         );
         assert_eq!(
             sm.get_mc_endpoint("m-1").await.unwrap(),
-            endpoint_before,
-            "a rejected registration must not upsert"
+            "http://mc-new:50052",
+            "a policy reject still upserts the record"
+        );
+        // `mc_id` was rebound: the OLD owner can no longer release; the new can.
+        assert_eq!(
+            svc.end_meeting(end_request("m-1", mh_test_utils::media_policy::TEST_MC_ID))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(
+            svc.end_meeting(end_request("m-1", "mc-new"))
+                .await
+                .unwrap()
+                .into_inner()
+                .acknowledged
         );
     }
 
@@ -1926,36 +1998,6 @@ mod tests {
     // =======================================================================
     // Response identity fields
     // =======================================================================
-
-    /// Within-process stability of `process_start_epoch_ms`.
-    ///
-    /// This alone kills the per-call `now()` implementation. The
-    /// changes-on-restart half is not constructible until a second process
-    /// incarnation shares a pod identity (the handler-restart story).
-    #[tokio::test]
-    async fn process_start_epoch_is_identical_across_two_calls_in_one_process() {
-        let (svc, _sm) = make_service();
-
-        let first = svc
-            .register_meeting(make_policy_request("m-1", 1, vec![egress(1, 5, 0, 5)]))
-            .await
-            .unwrap()
-            .into_inner();
-        let second = svc
-            .register_meeting(make_policy_request("m-2", 1, vec![egress(1, 5, 0, 5)]))
-            .await
-            .unwrap()
-            .into_inner();
-
-        assert_eq!(
-            first.process_start_epoch_ms, second.process_start_epoch_ms,
-            "two calls in one process must report one incarnation"
-        );
-        assert_ne!(
-            first.process_start_epoch_ms, 0,
-            "0 means 'not reported'; a live handler must report its incarnation"
-        );
-    }
 
     #[tokio::test]
     async fn handler_id_is_reported_and_is_not_invented() {

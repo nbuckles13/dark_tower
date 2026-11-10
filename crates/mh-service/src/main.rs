@@ -413,12 +413,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.egress_admission.stream_ceiling,
         ),
     };
+    // Per-meeting MH -> MC heartbeat (story 4 MH-2; ADR-0039 §1): the actor
+    // builds beats into a bounded queue; the sender task (spawned below) sends
+    // them. The jitter RNG is entropy-seeded here, and only here.
+    let (heartbeat_tx, heartbeat_rx) =
+        tokio::sync::mpsc::channel(mh_service::session::heartbeat::HEARTBEAT_QUEUE_CAPACITY);
     let session_manager = SessionManagerHandle::with_edge_context(
         StreamAdmission::from(&config.egress_admission),
         mh_service::media::edge_runtime::EdgeContext::new(
             config.stream_path.egress_stream_backlog_bytes,
             Arc::clone(&media_setup.handles),
         ),
+        mh_service::session::heartbeat::HeartbeatSetup {
+            handler_id: config.handler_id.clone(),
+            commands: heartbeat_tx,
+            rng: rand::make_rng(),
+        },
+    );
+    // The sender holds only a WEAK handle to the actor's mailbox, so it never
+    // keeps the actor alive; it stops on shutdown (aborting in-flight beats,
+    // so SIGTERM never waits on MC) or when the actor goes away.
+    tokio::spawn(
+        mh_service::grpc::heartbeat_sender::HeartbeatSender::new(
+            Arc::new(
+                mh_service::grpc::heartbeat_sender::TonicHeartbeatTransport::new(
+                    token_rx.clone(),
+                    config.policy_limits.max_registered_meetings,
+                ),
+            ),
+            heartbeat_rx,
+            session_manager.verdict_sink(),
+            config.policy_limits.max_registered_meetings,
+        )
+        .run(shutdown_token.child_token()),
     );
     // GC's `current_streams` reads the same live table admission counts
     // against (see `GcClient::current_streams`).
@@ -478,17 +505,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("Invalid gRPC bind address: {e}")
     })?;
 
-    // Sampled ONCE, here, and carried unchanged for the process's life
-    // (ADR-0036 §8 restart detection). Deliberately at the call site rather
-    // than behind a lazily-initialised static, so "once per process" is
-    // visible where the value is passed in: a per-call `now()` makes MC's
-    // restart detector fire constantly, and a pod-name or config derivation
-    // makes it never fire for the crash-restart it exists to catch.
-    let process_start_epoch_ms = mh_service::process::sample_process_start_epoch_ms();
     let mh_media_service = MhMediaService::new(
         session_manager.clone(),
         config.handler_id.clone(),
-        process_start_epoch_ms,
         config.policy_limits,
     );
     let auth_layer = MhAuthLayer::new(Arc::clone(&jwks_client), 300);
