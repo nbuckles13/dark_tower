@@ -1475,7 +1475,7 @@ tasks:
   slug: 2026-11-07-mh-hostport-slot-pool
   tag: story-2026-10-31-survive-handler-loss-task-I-2
 - id: 10
-  status: pending
+  status: completed
   specialist: global-controller
   deps:
   - 7
@@ -1525,6 +1525,7 @@ tasks:
 
     Same commit: config keys + render + runbook rows; enforcement + proto comment block; the series with panel, catalog entry and test; the S6 TODO line.
     Cross-task obligations: (a) config rows; (b) the old silent endpoint rewrite removed; (c) panel + catalog + zero-init + ADR-0032 test; (d) GC registration gates of test-gates.md, paired with test; (e) no id labels.
+  slug: 2026-11-09-gc-mh-registration-rule
   tag: story-2026-10-31-survive-handler-loss-task-GC-2
 - id: 11
   status: pending
