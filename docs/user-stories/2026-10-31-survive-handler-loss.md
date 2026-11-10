@@ -2005,7 +2005,7 @@ tasks:
   slug: 2026-11-10-sdk-reconcile-handler-set
   tag: story-2026-10-31-survive-handler-loss-task-C1
 - id: 18
-  status: pending
+  status: completed
   specialist: test
   deps:
   - 8
@@ -2059,6 +2059,7 @@ tasks:
 
     PAIRING AND DEPENDENCIES
     Depends on I-5 (mh.sh and its contract), I-2 (slots, Kind overlay, DT_MH_SH, inline address check) and MC-A (MediaHandlerSet). MC-B2, MC-C, MC-F and C3 depend on this task; MH-1 (left-participant leg) and P3 (deletes JoinResponse.media_servers, which this task moves env-tests off) consume its participant-set exposure. Pair with infrastructure (mh.sh contract from I-5, overlay from I-2) and client (mhPool.ts). Security reviews the injector (debug container, uid, no PID-1 signalling). Tier: full (cluster mutation, shared env-test seam, privileged-ish injector).
+  slug: 2026-11-10-mh-pool-fixture
   tag: story-2026-10-31-survive-handler-loss-task-T-1
 - id: 19
   status: pending
