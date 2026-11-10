@@ -164,10 +164,10 @@ async function recordedJoin<T>(
     await join(member.page);
     const joined = await waitForJoined(member.page);
     expect(
-      joined.mediaServers.length,
-      `${member.label}: media_servers must not be empty`,
+      joined.handlerSet.handlers.length,
+      `${member.label}: the join-time handler set must not be empty`,
     ).toBeGreaterThan(0);
-    if (expectAllHandlers) await waitForAllMediaConnected(member.page, joined.mediaServers);
+    if (expectAllHandlers) await waitForAllMediaConnected(member.page);
     await startMedia(member.page);
     const result = await inside(joined);
     // The positive control's forced export, INSIDE the window.

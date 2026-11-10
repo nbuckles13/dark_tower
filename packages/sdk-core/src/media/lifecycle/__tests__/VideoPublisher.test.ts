@@ -26,9 +26,10 @@ import { MuteState } from '../muteState.js';
 import { TransmitKeyManager } from '../transmitKeys.js';
 import { VideoPublisher, type VideoSendDirective } from '../VideoPublisher.js';
 import { uplinkRelayStreamId } from '../../pipeline/sendId.js';
+import { handlerRef, type HandlerRef } from '../../handlerSet.js';
 
-const A = 'https://mh-0.example:4433';
-const B = 'https://mh-1.example:4433';
+const A = handlerRef(1);
+const B = handlerRef(2);
 const ENCODING: DirectedVideoEncoding = {
   codec: 'vp8',
   width: 320,
@@ -171,7 +172,7 @@ async function makeRig(opts: RigOptions = {}) {
     info: () => undefined,
   });
   let ts = 0;
-  const directive = (targets: string[], encoding = ENCODING): VideoSendDirective => ({
+  const directive = (targets: HandlerRef[], encoding = ENCODING): VideoSendDirective => ({
     streamNumber: 1,
     encoding,
     targets,
@@ -346,6 +347,34 @@ describe('VideoPublisher — the camera follows the directive and mute (R-16, R-
       'dt_client_media_send_groups_stopped_total:open_stalled',
       'dt_client_media_send_groups_stopped_total:peer_stopped',
     ]);
+  });
+});
+
+describe('VideoPublisher — a handler that LEFT THE SET (ADR-0039 §4)', () => {
+  it('forgetHandler deletes that lane; the other target keeps receiving frames', async () => {
+    const r = await makeRig();
+    r.publisher.start();
+    r.publisher.setDirective(r.directive([A, B]));
+    await settle();
+    r.capture();
+    r.flush();
+    await settle();
+    const streamsOn = (ref: typeof A) => r.mocks.get(ref)!.getOutboundUniStreams().length;
+    const bBefore = streamsOn(B);
+    expect(bBefore).toBeGreaterThan(0);
+    r.publisher.forgetHandler(B);
+    r.capture();
+    r.capture();
+    r.flush();
+    await settle();
+    // Positive arm: A keeps its group stream and gets the later frames...
+    const writtenOnA = r.mocks
+      .get(A)!
+      .getOutboundUniStreams()
+      .flatMap((st) => st.chunks).length;
+    expect(writtenOnA).toBeGreaterThanOrEqual(3);
+    // ...B gets no new stream and no new chunk after its removal.
+    expect(streamsOn(B)).toBe(bBefore);
   });
 });
 
@@ -682,7 +711,7 @@ describe('VideoPublisher — edges', () => {
       warn: () => undefined,
       info: () => undefined,
     });
-    const d = (targets: string[]) => ({
+    const d = (targets: HandlerRef[]) => ({
       streamNumber: 1,
       encoding: ENCODING,
       targets,

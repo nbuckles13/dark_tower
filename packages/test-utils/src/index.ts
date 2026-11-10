@@ -39,6 +39,7 @@ export {
 } from './MockOTLPExporter.js';
 
 export { MockWebTransport } from './MockWebTransport.js';
+export { FakeScheduler, type PendingTimer } from './FakeScheduler.js';
 export {
   streamError,
   type InboundUniStreamHandle,

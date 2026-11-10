@@ -27,6 +27,27 @@ export const MAX_PASSWORD_LENGTH = 128;
  */
 export const MAX_USER_TOKEN_LENGTH = 8192;
 
+/**
+ * Max `media_dial` token length the client will hold or send (ADR-0039 §5).
+ * It exists so an untrusted set cannot park arbitrary bytes in the client's
+ * credential holder or on an MH dial; an entry over it is a contract fault and
+ * is never dialed (`signaling/handlerSetIntake.ts`).
+ *
+ * ANCHOR (DRY): mirrors `common::jwt::MAX_JWT_SIZE_BYTES`, the
+ * server-side JWT bound — the SAME bound {@link MAX_USER_TOKEN_LENGTH} mirrors —
+ * so the client never drops a token the server would accept (the dial token's
+ * `sub` is bounded only by that envelope).
+ */
+export const MAX_MEDIA_DIAL_TOKEN_LENGTH = MAX_USER_TOKEN_LENGTH;
+
+/**
+ * Max members of one `MediaHandlerSet` the client will act on (ADR-0039 §4).
+ * Untrusted-input bound: a buggy or hostile MC must not fan this client out to
+ * N dials. Far above any real meeting's handler count; entries past it are a
+ * contract fault and are dropped.
+ */
+export const MAX_HANDLER_SET_SIZE = 16;
+
 // ============================================================================
 // Non-throwing truncators (cap-and-return; NEVER throw).
 // Distinct from the validate-or-throw guards below: these silently bound a

@@ -26,10 +26,11 @@ import { HEADER_VERSION } from '../../media/frame/wireConstants.js';
 import type { AudioSendDirective, MediaFault } from '../../media/lifecycle/AudioPipeline.js';
 import type { SendDirectiveEvent, SendStreamDirective } from '../../signaling/events.js';
 import { ServerMuteResumeTracker } from '../serverMuteResume.js';
+import { handlerRef, type HandlerRef } from '../../media/handlerSet.js';
 
-const MH = 'https://mh-a';
+const MH = handlerRef(1);
 
-function audio(targets: string[], streamNumber = 0): SendStreamDirective {
+function audio(targets: HandlerRef[], streamNumber = 0): SendStreamDirective {
   return {
     streamNumber,
     mediaKind: 'audio',
@@ -56,7 +57,7 @@ const VP8_ENCODING: SendStreamEncoding = {
 };
 
 function video(
-  targets: string[],
+  targets: HandlerRef[],
   encoding: SendStreamEncoding | undefined = VP8_ENCODING,
 ): SendStreamDirective {
   return { streamNumber: 1, mediaKind: 'video', maxBitrateBps: 800_000, encoding, targets };

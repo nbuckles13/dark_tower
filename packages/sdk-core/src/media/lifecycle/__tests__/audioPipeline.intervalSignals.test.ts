@@ -20,9 +20,10 @@ import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import { AudioPipeline, type ReceiveAssignment } from '../AudioPipeline.js';
 import { TransmitKeyManager } from '../transmitKeys.js';
+import { handlerRef } from '../../handlerSet.js';
 
 const INTERVAL_MS = 7_000;
-const MH_URL = 'https://mh.example:4433';
+const MH_URL = handlerRef(1);
 
 async function rig(opts: { declaredSlotIds?: number[] } = {}) {
   const sink = new InMemoryMetricsSink();
@@ -82,7 +83,7 @@ const slot = (
 ): ReceiveAssignment => ({
   slotId,
   senderId,
-  mediaHandlerUrl: senderId === undefined ? '' : MH_URL,
+  handlerRef: senderId === undefined ? undefined : MH_URL,
   active,
 });
 

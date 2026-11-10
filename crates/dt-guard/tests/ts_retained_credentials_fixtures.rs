@@ -261,7 +261,7 @@ fn lens_fixtures_are_silent_for_the_mechanical_guard() {
     let lens = lens_set();
     assert_eq!(
         lens.len(),
-        3,
+        8,
         "lens fixture set changed — update this assertion"
     );
 

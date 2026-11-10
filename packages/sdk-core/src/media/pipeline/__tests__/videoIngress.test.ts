@@ -36,13 +36,14 @@ import {
   videoFrame,
   videoMetrics,
 } from './videoFixtures.js';
+import { handlerRef } from '../../handlerSet.js';
 
 const SINK_ERR = (): void => {};
 const A = 401;
 const B = 402;
 const SELF = 9;
 const MUTED = 403;
-const URL = 'https://mh-0.example';
+const URL = handlerRef(1);
 const AUDIO_SLOT = 0;
 const VIDEO_SLOTS = [2, 3];
 
@@ -290,7 +291,7 @@ describe('video ingress — recovery requests from the FAILING frame header', ()
     ]);
     expect(dropsByReason(h.sink).get('signature_invalid')).toBe(1);
     expect(h.losses).toEqual([
-      { url: URL, slotId: 2, senderId: A, gopCounter: 3, reason: 'verify_failed' },
+      { ref: URL, slotId: 2, senderId: A, gopCounter: 3, reason: 'verify_failed' },
     ]);
     done(h);
   });
@@ -305,7 +306,7 @@ describe('video ingress — recovery requests from the FAILING frame header', ()
       await videoFrame({ sender: B, signer: mallory, slot: 2, gop: 11, seq: 1, key: true }),
     ]);
     expect(h.losses).toEqual([
-      { url: URL, slotId: 2, senderId: B, gopCounter: 11, reason: 'verify_failed' },
+      { ref: URL, slotId: 2, senderId: B, gopCounter: 11, reason: 'verify_failed' },
     ]);
     done(h);
   });
@@ -317,7 +318,7 @@ describe('video ingress — recovery requests from the FAILING frame header', ()
     ]);
     expect(dropsByReason(h.sink).get('no_roster_entry')).toBe(1);
     expect(h.losses).toEqual([
-      { url: URL, slotId: 3, senderId: 499, gopCounter: 2, reason: 'verify_failed' },
+      { ref: URL, slotId: 3, senderId: 499, gopCounter: 2, reason: 'verify_failed' },
     ]);
     done(h);
   });
@@ -357,7 +358,7 @@ describe('video ingress — recovery requests from the FAILING frame header', ()
     expect(h.losses).toHaveLength(0);
     h.slots.get(3)?.serverMuteLifted(MUTED);
     expect(h.losses).toEqual([
-      { url: URL, slotId: 3, senderId: MUTED, gopCounter: 4, reason: 'server_mute_lifted' },
+      { ref: URL, slotId: 3, senderId: MUTED, gopCounter: 4, reason: 'server_mute_lifted' },
     ]);
     done(h);
   });
@@ -377,7 +378,7 @@ describe('video ingress — recovery requests from the FAILING frame header', ()
     await stream(h, [key, next.subarray(0, next.length - 10)], 'reset');
     expect(dropsByReason(h.sink).get('stream_partial_reset')).toBe(1);
     expect(h.losses).toEqual([
-      { url: URL, slotId: 2, senderId: A, gopCounter: 8, reason: 'group_abandoned' },
+      { ref: URL, slotId: 2, senderId: A, gopCounter: 8, reason: 'group_abandoned' },
     ]);
     done(h);
   });
@@ -424,7 +425,7 @@ describe('video ingress — whole-frame rejects, key-id failures, teardown', () 
     expect(dropsByReason(h.sink).get('extensions_malformed')).toBe(1);
     expect(h.losses).toEqual([
       {
-        url: URL,
+        ref: URL,
         slotId: 2,
         senderId: row?.decoded.key_id_decomposed.sender_id,
         gopCounter: row?.decoded.gop_counter,

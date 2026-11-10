@@ -67,6 +67,7 @@ vi.mock('@darktower/sdk-core', async (importOriginal) => {
 import JoinMeeting from '../views/JoinMeeting.svelte';
 import { mediaStates } from './helpers/mediaStates.js';
 import { INDICATOR_TEXT } from '../lib/participantState.js';
+import type { HandlerRef } from '@darktower/sdk-core';
 
 const config: DemoConfig = {
   acOriginTemplate: 'http://{subdomain}.localhost:5173',
@@ -197,7 +198,7 @@ async function joinedRig(opts: { isHost?: boolean } = {}) {
       { participantId: 'c', name: 'Cid', senderId: 259, mediaStates: mediaStates() },
       { participantId: 'h', name: 'Hal', senderId: 260, mediaStates: mediaStates() },
     ],
-    mediaServers: [],
+    handlerSet: { version: '0', handlers: [] },
     correlationId: 'x',
     bindingToken: 'y',
   });
@@ -213,7 +214,7 @@ const assignment = (
   slotId,
   mediaKind: 'audio' as const,
   senderId,
-  mediaHandlerUrl: 'https://mh-0:4433',
+  handlerRef: 1 as HandlerRef,
   slotState,
 });
 

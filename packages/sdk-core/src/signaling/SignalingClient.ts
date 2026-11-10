@@ -73,6 +73,15 @@ import type {
 import { closesConnection, mapErrorCode, staticMessageFor } from './errorCodeMap.js';
 import { mapLeaveReason } from './events.js';
 import { takeMeetingKek, type MeetingKekSink } from './kekIntake.js';
+import { takeHandlerSet, type HandlerSetFault } from './handlerSetIntake.js';
+import { FaultOnce } from '../media/lifecycle/faultOnce.js';
+import {
+  diffHandlerSet,
+  handlerRef,
+  type HandlerRef,
+  type HandlerSetIntake,
+  type HandlerSetView,
+} from '../media/handlerSet.js';
 import { MEDIA_KEK_SOURCES } from '../media/setup/mediaMetrics.js';
 import { SUPPORTED_HEADER_VERSIONS } from '../media/frame/frameCodec.js';
 import { RosterKeyFeed } from './rosterKeyFeed.js';
@@ -102,7 +111,8 @@ import type {
   StreamAssignmentsEvent,
 } from './events.js';
 import { fromWireCodec, toWireCodec } from './codecMap.js';
-import type { Codec, SlotState } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
+import { SlotState } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
+import type { Codec } from '../proto/dark_tower/signaling/v1/signaling_pb.js';
 import type {
   JoinedEvent,
   MhConnectionStatusReport,
@@ -172,6 +182,13 @@ export interface SignalingClientOptions {
    * projection.
    */
   readonly rosterKeys?: RosterKeySink;
+  /**
+   * Where every validated `MediaHandlerSet` goes WITH its dial tokens
+   * (`MediaTransport.applyHandlerSet`). A sink rather than an event for the same
+   * reason as `kekSink`: the tokens are credentials and MUST NOT ride any event
+   * payload. Events carry only the token-free {@link HandlerSetView}.
+   */
+  readonly handlerSetSink?: (intake: HandlerSetIntake) => void;
 }
 
 /** The typed events SignalingClient emits. */
@@ -184,6 +201,12 @@ export interface SignalingEventMap {
   participantLeft: ParticipantLeftEvent;
   /** Emitted on a signaling error that occurs AFTER join has settled. */
   error: SignalingError;
+  /**
+   * Every `MediaHandlerSet` (ADR-0039 §4) in wire order — the join-time one
+   * (also on `joined.handlerSet`, emitted just before `joined`) and every push.
+   * TOKEN-FREE view (refs + urls); the tokens went to `handlerSetSink`.
+   */
+  mediaHandlerSet: HandlerSetView;
   /**
    * MC directed what to produce and where (ADR-0036 §5).
    *
@@ -249,14 +272,38 @@ function defer<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
+/** Report state -> wire `ConnectionState`. */
+const CONNECTION_STATE_OF: Readonly<Record<MhConnectionStatusReport['state'], ConnectionState>> = {
+  connected: ConnectionState.CONNECTED,
+  failed: ConnectionState.FAILED,
+  disconnected: ConnectionState.DISCONNECTED,
+};
+
 /** A decoded `StreamAssignment`, copied out of the protobuf graph. */
 interface WireAssignment {
   readonly slotState: SlotState;
   readonly senderId: number | undefined;
   readonly mediaKind: SlotMediaKind;
   readonly slotId: number;
-  readonly mediaHandlerUrl: string;
+  /** The raw wire `handler_ref` (membership is checked at emit, against the current set). */
+  readonly handlerRef: number;
 }
+
+/**
+ * The slot states that carry NO edge: there, `StreamAssignment.handler_ref` 0
+ * is "no edge" and not a membership fault (proto rule at that field).
+ */
+const NO_EDGE_SLOT_STATES: ReadonlySet<SlotState> = new Set([
+  SlotState.UNAVAILABLE,
+  SlotState.FEWER_SOURCES_THAN_SLOTS,
+  SlotState.AVATAR_NO_VIDEO,
+]);
+
+/** Bounded, event-once contract texts for non-member refs (no ref in the text). */
+const NON_MEMBER_TARGET =
+  'a send directive named a handler_ref outside the current handler set' as const;
+const NON_MEMBER_ASSIGNMENT =
+  'a stream assignment named a handler_ref outside the current handler set' as const;
 
 /**
  * The ONE builder of a `ReceiveCapability` message — used by the join-carried
@@ -312,6 +359,15 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   #correlationId: string | undefined;
   #bindingToken: string | undefined;
   readonly #kekSink: MeetingKekSink | undefined;
+  readonly #handlerSetSink: ((intake: HandlerSetIntake) => void) | undefined;
+  /**
+   * The CURRENT handler set's members, ref -> url (no tokens): the membership
+   * every `SendTarget`/`StreamAssignment` ref is checked against. Updated from
+   * the SAME validated intake the transport sink receives, BEFORE the sink runs.
+   */
+  #handlerUrls: ReadonlyMap<HandlerRef, string> = new Map();
+  /** Event-once dedupe for the NON-FATAL contract notices (handler set, refs). */
+  readonly #notices = new FaultOnce();
   /** Roster messages -> identity-key resolver operations. See `rosterKeyFeed.ts`. */
   readonly #rosterKeys: RosterKeyFeed;
   /** The KEK generation MC issued. Never a metric label, never a span attribute. */
@@ -335,6 +391,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     this.#logger = options.logger ?? defaultLogger;
     this.#joinTimeoutMs = options.joinTimeoutMs ?? DEFAULT_JOIN_TIMEOUT_MS;
     this.#kekSink = options.kekSink;
+    this.#handlerSetSink = options.handlerSetSink;
     this.#rosterKeys = new RosterKeyFeed(options.rosterKeys);
   }
 
@@ -546,7 +603,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
 
   /**
    * Run `fn` SYNCHRONOUSLY inside the active `dt_client.join` span context (R-58).
-   * Lets a caller (e.g. `MediaTransport.connectAll`) inject W3C trace context onto
+   * Lets a caller (e.g. `MediaTransport`'s dial) inject W3C trace context onto
    * an outbound MH envelope from the SAME join trace this client owns — WITHOUT
    * relocating span ownership. The wrap MUST be synchronous around the inject call
    * (the global StackContextManager does not survive an `await`). No-op (`fn()`
@@ -559,10 +616,11 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   }
 
   /**
-   * Send ONE post-join `MediaConnectionUpdate` over the existing MC stream (R-60/R-21),
-   * reporting per-MH terminal state. Maps the plain {@link MhConnectionStatusReport}s
+   * Send one `MediaConnectionUpdate` over the existing MC stream, reporting
+   * per-REF transitions (ADR-0039 §4: every transition, `handler_ref` +
+   * `handler_set_version`; `mh_url` left empty). Maps the plain {@link MhConnectionStatusReport}s
    * to proto `MhConnectionStatus` internally (no generated type crosses the public
-   * boundary). `mhUrl`/`failureReason`/`failureCode` are capped ≤256 UTF-8 bytes;
+   * boundary). `failureReason`/`failureCode` are capped ≤256 UTF-8 bytes;
    * `observedAtMs` → proto `Timestamp`. Trace context is injected on the SAME single
    * path `join()` uses (inside `context.with(#span)`).
    *
@@ -578,8 +636,10 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     }
     const statuses = reports.map((r) =>
       create(MhConnectionStatusSchema, {
-        mhUrl: capMhUrl(r.mhUrl),
-        state: r.state === 'connected' ? ConnectionState.CONNECTED : ConnectionState.FAILED,
+        // `mh_url` is superseded (story 4 P3 deletes it): left EMPTY.
+        handlerRef: r.handlerRef,
+        handlerSetVersion: r.handlerSetVersion,
+        state: CONNECTION_STATE_OF[r.state],
         ...(r.failureReason !== undefined ? { failureReason: capMhUrl(r.failureReason) } : {}),
         ...(r.failureCode !== undefined ? { failureCode: capMhUrl(r.failureCode) } : {}),
         observedAt: timestampFromDate(new Date(r.observedAtMs)),
@@ -662,6 +722,10 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         // clone, or interpolation of this `ServerMessage` can print it. It is
         // never placed on `JoinedEvent`, which is a public payload.
         if (this.#kekSink) takeMeetingKek(jr, this.#kekSink, MEDIA_KEK_SOURCES.JoinResponse);
+        // THE TOKENS LEAVE THE DECODED MESSAGE HERE (blanked by the intake);
+        // the public event carries the token-free view only. The superseded
+        // `jr.media_servers` is never read.
+        const handlerSet = this.#takeHandlerSet(jr.mediaHandlerSet);
         this.#rosterKeys.joined(jr.existingParticipants);
         const event: JoinedEvent = {
           participantId: jr.participantId,
@@ -672,10 +736,12 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           // video-off lever).
           receiveSlotCaps: caps,
           existingParticipants,
-          mediaServers: jr.mediaServers.map((m) => m.mediaHandlerUrl),
+          handlerSet,
           correlationId: jr.correlationId,
           bindingToken: jr.bindingToken,
         };
+        // Every set, the join-time one included, is announced in wire order.
+        this.emit('mediaHandlerSet', handlerSet);
         this.emit('joined', event);
         this.#settleJoinSuccess(event);
         return;
@@ -728,7 +794,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
                 minKeyframeIntervalMs: s.encoding.minKeyframeIntervalMs,
               }
             : undefined,
-          targets: s.targets.map((target) => target.mediaHandlerUrl),
+          targets: this.#memberTargets(s.targets.map((target) => target.handlerRef)),
         }));
         this.emit('sendDirective', { streams, headerVersion: directive.headerVersion });
         return;
@@ -742,13 +808,28 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
           // and NEVER coerced to 0: 0 is a reserved-invalid sender id.
           senderId: a.senderId,
           mediaKind: mediaKindToken(a.mediaKind),
-          mediaHandlerUrl: a.mediaHandlerUrl,
+          handlerRef: a.handlerRef,
           slotState: a.slotState,
         }));
         // The client MARKS these roster entries distinctly (`signaling.proto`) —
         // never a spinner, never an empty slot, never inferred from silence.
         this.#lastUnreachable = [...message.value.unreachableSenderIds];
-        this.#emitAssignments();
+        this.#emitAssignments(true);
+        return;
+      }
+      case 'mediaHandlerSet': {
+        // ADR-0039 §4: a full-snapshot replacement — every membership change
+        // and every token refresh. Validated, projected and blanked once.
+        const before = [...this.#handlerUrls.keys()];
+        const view = this.#takeHandlerSet(message.value);
+        this.emit('mediaHandlerSet', view);
+        // Membership moved: the held assignments are re-checked against it.
+        // A RE-CHECK, not a receipt: assignments naming a ref the set just
+        // removed are legitimately stale (MC sends the set BEFORE re-routing),
+        // so they resolve to `undefined` SILENTLY. Membership faults are judged
+        // only on an assignment's arrival.
+        const moved = diffHandlerSet(before, [...this.#handlerUrls.keys()]);
+        if (moved.added.length > 0 || moved.removed.length > 0) this.#emitAssignments(false);
         return;
       }
       case 'meetingKekUpdate': {
@@ -935,12 +1016,12 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
    * flat tokens come from `slotStateMap.ts`; any wire value it does not name
    * maps to `unspecified`, never to `active`.
    */
-  #emitAssignments(): void {
+  #emitAssignments(fresh: boolean): void {
     const assignments: StreamAssignmentEvent[] = this.#lastWireAssignments.map((a) => ({
       slotId: a.slotId,
       mediaKind: a.mediaKind,
       senderId: a.senderId,
-      mediaHandlerUrl: a.mediaHandlerUrl,
+      handlerRef: this.#assignmentRef(a, fresh),
       slotState: slotStateToken(a.slotState),
     }));
     const event: StreamAssignmentsEvent = {
@@ -948,6 +1029,58 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
       unreachableSenderIds: [...this.#lastUnreachable],
     };
     this.emit('streamAssignments', event);
+  }
+
+  /**
+   * Validate, project and blank one decoded handler set (the ONE intake,
+   * `handlerSetIntake.ts`), update the membership copy FROM THAT SAME intake,
+   * THEN hand it to the transport sink. Returns the token-free view.
+   */
+  #takeHandlerSet(wire: Parameters<typeof takeHandlerSet>[0]): HandlerSetView {
+    const intake = takeHandlerSet(wire, this.#handlerUrls, (reason) =>
+      this.#contractNotice(reason),
+    );
+    this.#handlerUrls = new Map(intake.view.handlers.map((h) => [h.ref, h.url]));
+    this.#handlerSetSink?.(intake);
+    return intake.view;
+  }
+
+  /** Keep only refs that are members of the current set; a non-member is noticed once. */
+  #memberTargets(refs: readonly number[]): HandlerRef[] {
+    const members: HandlerRef[] = [];
+    for (const wire of refs) {
+      const ref = handlerRef(wire);
+      if (this.#handlerUrls.has(ref)) members.push(ref);
+      else this.#contractNotice(NON_MEMBER_TARGET);
+    }
+    return members;
+  }
+
+  /**
+   * An assignment's handler: a member ref, or `undefined`. A 0 on a no-edge
+   * state is silent; a 0 or non-member anywhere else is noticed once — but only
+   * when the assignment is `fresh` (just received). On a re-check after a set
+   * change, a ref the set removed is stale, not a fault, and resolves silently.
+   */
+  #assignmentRef(a: WireAssignment, fresh: boolean): HandlerRef | undefined {
+    if (a.handlerRef === 0 && NO_EDGE_SLOT_STATES.has(a.slotState)) return undefined;
+    const ref = handlerRef(a.handlerRef);
+    if (this.#handlerUrls.has(ref)) return ref;
+    if (fresh) this.#contractNotice(NON_MEMBER_ASSIGNMENT);
+    return undefined;
+  }
+
+  /**
+   * A NON-FATAL contract fault: counted-and-ignored input (ADR-0039 §4). One
+   * bounded `[dt-signaling-contract]` WARN per distinct reason per session (a
+   * fixed literal; never a ref, url or token). The session continues.
+   */
+  #contractNotice(
+    reason: HandlerSetFault | typeof NON_MEMBER_TARGET | typeof NON_MEMBER_ASSIGNMENT,
+  ): void {
+    if (this.#notices.report('handler-set', reason)) {
+      console.warn('[dt-signaling-contract]', reason);
+    }
   }
 
   /**

@@ -29,6 +29,8 @@ import type {
 import type { VideoRenderState } from '../media/pipeline/renderDecision.js';
 import type { Vp8Profile } from '../media/setup/vp8.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
+import type { HandlerSetView, MediaHandlerView } from '../media/handlerSet.js';
+import type { TransportScheduler } from '../media/events.js';
 import type { MediaFault } from '../media/lifecycle/AudioPipeline.js';
 import type { MuteSnapshot } from '../media/lifecycle/muteState.js';
 import type {
@@ -130,8 +132,24 @@ export interface MeetingSessionEventMap {
   participantJoined: ParticipantJoinedEvent;
   /** Emitted on each `ParticipantLeft` (bridged from SignalingClient). */
   participantLeft: ParticipantLeftEvent;
-  /** Emitted per MH whose handshake succeeded (payload: the MH URL). */
-  mediaConnected: string;
+  /**
+   * Emitted each time a handler's handshake succeeds — at join, and again on
+   * every add or redial (payload: the token-free `{ref, url}`).
+   */
+  mediaConnected: MediaHandlerView;
+  /**
+   * Every media-handler set this session receives, in wire order (ADR-0039 §4):
+   * the join-time set (also on `joined.handlerSet`), then every membership
+   * change and token refresh. TOKEN-FREE: refs and urls only.
+   */
+  mediaHandlerSet: HandlerSetView;
+  /**
+   * The join-time set was EMPTY ("media connecting") and no set naming a
+   * handler arrived within `MediaConfig.handlers.emptySetNoticeMs`. Emitted at
+   * most ONCE per session; NON-FATAL — the session is kept and connects when a
+   * set arrives. No payload. Rendering it is the embedder's choice.
+   */
+  mediaHandlersOverdue: undefined;
   /** Emitted on any terminal/post-join error (signaling error or all-MH-failed). */
   error: SdkError;
   /** Emitted on every state-machine transition (the new state). */
@@ -333,6 +351,14 @@ export interface MeetingSessionOptions {
   readonly clock?: () => number;
   /** Per-MH connect deadline in ms. */
   readonly connectTimeoutMs?: number;
+  /**
+   * Timer seam for the media transport's connect deadline, redial backoff,
+   * HANDLER_RELEASED grace and empty-set notice (default: the global timers).
+   * Injected for deterministic tests.
+   */
+  readonly transportScheduler?: TransportScheduler;
+  /** Uniform [0, 1) source for redial jitter (default `Math.random`). Injected for tests. */
+  readonly transportRandom?: () => number;
   /** MC join deadline in ms (forwarded to SignalingClient). */
   readonly joinTimeoutMs?: number;
   /** Metrics sink (default `getMetricsSink()`; no-op when telemetry unconfigured). */

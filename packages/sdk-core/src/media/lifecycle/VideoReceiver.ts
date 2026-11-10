@@ -47,6 +47,7 @@ import { PerHandlerReadLoops } from './receiveTransports.js';
 import { bindReceiverState, type GenerationDroppedSource } from './receiverState.js';
 import type { LocalReceiveSlotStats } from './localStats.js';
 import { UnfulfilledSlots, type UnfulfilledSlotState } from './unfulfilledSlots.js';
+import type { HandlerRef } from '../handlerSet.js';
 
 /** Fixed fault texts (event-once dedupe keys; never a platform string). */
 const FAULT_DECODER = "one participant's video decoder failed; it is being replaced";
@@ -60,7 +61,7 @@ export interface VideoSlotAssignment {
   readonly slotState: SlotStateToken;
   /** The avatar's participant (sender id); `undefined` for live and sourceless slots. */
   readonly senderId: number | undefined;
-  readonly mediaHandlerUrl: string;
+  readonly handlerRef: HandlerRef | undefined;
 }
 
 /**
@@ -110,11 +111,11 @@ export interface VideoReceiverOptions {
   readonly declaredSlotIds: readonly number[];
   /** Incoming group streams of an ALREADY-CONNECTED handler, or `undefined`. A selector, never a dialer. */
   readonly incomingStreamsFor: (
-    mediaHandlerUrl: string,
+    handlerRef: HandlerRef,
   ) => ReadableStream<ReadableStream<Uint8Array>> | undefined;
   /** The per-handler control send (`MediaTransport.sendRecoveryRequest`). */
   readonly sendRecoveryRequest: (
-    mediaHandlerUrl: string,
+    handlerRef: HandlerRef,
     request: MhRecoveryRequest,
   ) => Promise<void>;
   readonly decoderFactory: VideoDecoderFactory;
@@ -145,7 +146,7 @@ export class VideoReceiver {
   readonly #firstMedia: FirstMediaObserver;
   readonly #recovery: RecoveryRequestQueue;
   #ingress: VideoIngress | undefined;
-  #loops: PerHandlerReadLoops<ReadableStream<Uint8Array>, string> | undefined;
+  #loops: PerHandlerReadLoops<ReadableStream<Uint8Array>, HandlerRef> | undefined;
   /** Verified senders that DECODED at least one frame this export interval. */
   readonly #decodedThisInterval = new Set<number>();
   #mediaStartedAtMs: number | undefined;
@@ -167,7 +168,7 @@ export class VideoReceiver {
     this.#unfulfilled = new UnfulfilledSlots(metrics, this.#clock);
     this.#firstMedia = new FirstMediaObserver(metrics, this.#clock);
     this.#recovery = new RecoveryRequestQueue({
-      send: (url, request) => options.sendRecoveryRequest(url, request),
+      send: (ref, request) => options.sendRecoveryRequest(ref, request),
       sent: (reason) => metrics.recoveryRequestSent(reason),
       failed: () => this.#fault(MediaFaultStage.Transport, FAULT_RECOVERY_SEND),
     });
@@ -228,7 +229,7 @@ export class VideoReceiver {
           onRenderChanged: (id, state) => o.onRenderChanged(id, state),
           onLoss: (event) =>
             this.#recovery.request(
-              event.url,
+              event.ref,
               { slotId: event.slotId, senderId: event.senderId, gopCounter: event.gopCounter },
               event.reason,
             ),
@@ -258,10 +259,10 @@ export class VideoReceiver {
     this.#teardown.register('video-streams', () => ingress.cancelAll());
 
     const cap = o.config.videoReceive.maxIncomingStreams;
-    this.#loops = new PerHandlerReadLoops<ReadableStream<Uint8Array>, string>({
-      readableFor: (url) => o.incomingStreamsFor(url),
-      contextFor: (url) => url,
-      onItem: (stream, url) => {
+    this.#loops = new PerHandlerReadLoops<ReadableStream<Uint8Array>, HandlerRef>({
+      readableFor: (ref) => o.incomingStreamsFor(ref),
+      contextFor: (ref) => ref,
+      onItem: (stream, ref) => {
         if (ingress.openStreams >= cap) {
           // REFUSED, never queued: a refusal costs nothing but the cancel.
           metrics.incomingStreamRefused();
@@ -269,7 +270,7 @@ export class VideoReceiver {
           return;
         }
         // NOT awaited: streams are read concurrently; the acceptor keeps accepting.
-        void ingress.readStream(stream, url).catch(() => {
+        void ingress.readStream(stream, ref).catch(() => {
           this.#fault(MediaFaultStage.Crypto, 'a video frame could not be processed');
         });
       },
@@ -315,15 +316,31 @@ export class VideoReceiver {
       const a = assignments.find((x) => x.slotId === slotId);
       slot.setMcState(a?.slotState, a?.senderId);
     }
-    const urls = [
+    const refs = [
       ...new Set(
         assignments
           .filter((a) => this.#slots.has(a.slotId))
-          .map((a) => a.mediaHandlerUrl)
-          .filter((url) => url !== ''),
+          .map((a) => a.handlerRef)
+          .filter((ref): ref is HandlerRef => ref !== undefined),
       ),
     ];
-    if (urls.length > 0) this.#loops?.open(urls);
+    if (refs.length > 0) this.#loops?.open(refs);
+  }
+
+  /**
+   * The handler `ref` LEFT THE SET (ADR-0039 §4 removal cleanup): end its
+   * group-stream acceptor QUIETLY (no transportFault) and drop its recovery
+   * queue. Slot state is untouched (the client-local reconnecting overlay is C2).
+   */
+  forgetHandler(ref: HandlerRef): void {
+    this.#loops?.stop(ref);
+    this.#recovery.drop(ref);
+  }
+
+  /** The handler `ref` (re)connected: start reading it if an assignment names it. */
+  handlerConnected(ref: HandlerRef): void {
+    if (!this.#pendingAssignments.some((a) => a.handlerRef === ref)) return;
+    this.setAssignments(this.#pendingAssignments);
   }
 
   /** `senderId`'s video server mute was lifted: the unmute-edge repair (`server_mute_lifted`). */

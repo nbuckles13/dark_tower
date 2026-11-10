@@ -73,11 +73,14 @@ test.describe('join happy path (R-40/R-44/R-46)', () => {
     // (a) MC JoinResponse observed via the __darktower_test__ bus.
     expect(joined.participantId, 'JoinResponse must carry a participant_id').not.toBe('');
 
-    // (b) At least one MH handshake succeeded for EVERY media_servers URL
-    // (active/active). The list itself must be non-empty; the exact count is
+    // (b) At least one MH handshake succeeded for EVERY handler of the set
+    // (active/active). The set itself must be non-empty; the exact count is
     // cluster topology and deliberately not hardcoded here.
-    expect(joined.mediaServers.length, 'media_servers must not be empty').toBeGreaterThan(0);
-    await waitForAllMediaConnected(page, joined.mediaServers);
+    expect(
+      joined.handlerSet.handlers.length,
+      'the join-time handler set must not be empty',
+    ).toBeGreaterThan(0);
+    await waitForAllMediaConnected(page);
 
     // (d) The SDK's one post-join MediaConnectionUpdate (R-21) reached MC's R-60
     // handler (task #6) with state=CONNECTED — observed MC-side via Prometheus.

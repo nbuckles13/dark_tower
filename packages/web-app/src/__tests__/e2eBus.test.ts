@@ -11,6 +11,7 @@ import { createE2EInstrumentation, type E2EInstrumentation } from '../lib/e2eAna
 import { parseSendCounts, parseVideoSlots } from '../../e2e/videoBusShape.js';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
 import { mediaStates } from './helpers/mediaStates.js';
+import type { HandlerRef, HandlerSetView } from '@darktower/sdk-core';
 
 /** Build a `MediaFrameCounts` from a partial, so a test states only what it varies. */
 function counts(over: Partial<MediaFrameCounts>): MediaFrameCounts {
@@ -50,7 +51,7 @@ test('installs the bus and records bounded events in the replay buffer', () => {
   expect(window.__darktower_test__).toBeDefined();
 
   session.fire('stateChange', MeetingSessionState.Joining);
-  session.fire('mediaConnected', 'https://mh-0:4433');
+  session.fire('mediaConnected', { ref: 1 as HandlerRef, url: 'https://mh-0:4433' });
 
   const types = events().map((e) => e['type']);
   expect(types).toContain('stateChange');
@@ -58,6 +59,50 @@ test('installs the bus and records bounded events in the replay buffer', () => {
   expect(events().find((e) => e['type'] === 'stateChange')?.['state']).toBe(
     MeetingSessionState.Joining,
   );
+});
+
+test('mediaConnected carries the handler REF and url (ADR-0039 §4), never a token', () => {
+  const session = new MockMeetingSession();
+  install(session);
+  session.fire('mediaConnected', { ref: 4 as HandlerRef, url: 'https://mh-4:4433' });
+  expect(events().find((e) => e['type'] === 'mediaConnected')).toEqual({
+    type: 'mediaConnected',
+    handlerRef: 4,
+    url: 'https://mh-4:4433',
+  });
+});
+
+test('handlerSets: an ordered, ALLOWLISTED history — refs and urls, never a dial token', () => {
+  const session = new MockMeetingSession();
+  install(session);
+  const SENTINEL = 'DIAL-TOKEN-SENTINEL';
+  // A view smuggling credential-shaped extras: a spread would carry them.
+  const withExtras = (version: string, refs: number[]) =>
+    ({
+      version,
+      handlers: refs.map((ref) => ({ ref, url: `https://mh-${ref}`, mediaDialToken: SENTINEL })),
+      dialTokens: new Map([[1, SENTINEL]]),
+      token: SENTINEL,
+    }) as unknown as HandlerSetView;
+  session.fire('mediaHandlerSet', withExtras('1', [1]));
+  session.fire('mediaHandlerSet', withExtras('2', [1, 2]));
+
+  const sets = window.__darktower_test__?.handlerSets;
+  // Positive control: the projection DID produce the refs and urls...
+  expect(sets).toEqual([
+    { version: '1', handlers: [{ ref: 1, url: 'https://mh-1' }] },
+    {
+      version: '2',
+      handlers: [
+        { ref: 1, url: 'https://mh-1' },
+        { ref: 2, url: 'https://mh-2' },
+      ],
+    },
+  ]);
+  // ...and nothing on the bus — history or event buffer — carries the sentinel.
+  const serialized = JSON.stringify({ sets, events: events() });
+  expect(serialized).toContain('https://mh-2');
+  expect(serialized).not.toContain(SENTINEL);
 });
 
 test('late subscribers still observe an already-fired event (replay buffer)', () => {
@@ -77,7 +122,7 @@ test('joined projection drops bindingToken and correlationId (whitelist)', () =>
     senderId: 123,
     receiveSlotCaps: { audio: 8, video: 8 },
     existingParticipants: [{ participantId: 'a', name: 'Ann', mediaStates: mediaStates() }],
-    mediaServers: ['https://mh-0:4433'],
+    handlerSet: { version: '3', handlers: [{ ref: 1 as HandlerRef, url: 'https://mh-0:4433' }] },
     correlationId: 'CORR_SECRET',
     bindingToken: 'BINDING_SECRET',
   });
@@ -239,7 +284,7 @@ test('receiveSlots: publish set, N, M, sources and per-kind caps are projected o
     senderId: 7,
     receiveSlotCaps: { audio: 8, video: 8 },
     existingParticipants: [],
-    mediaServers: [],
+    handlerSet: { version: '0', handlers: [] },
     correlationId: 'corr',
     bindingToken: 'bind',
   });
@@ -262,14 +307,14 @@ test('slotAssignments: the EXPECTED sender per slot, stringified, whitelist-only
         slotId: 0,
         mediaKind: 'audio',
         senderId: 7,
-        mediaHandlerUrl: 'https://mh:1',
+        handlerRef: 1 as HandlerRef,
         slotState: 'active',
       },
       {
         slotId: 1,
         mediaKind: 'audio',
         senderId: undefined,
-        mediaHandlerUrl: '',
+        handlerRef: undefined,
         slotState: 'fewer_sources_than_slots',
       },
     ],

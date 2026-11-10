@@ -9,17 +9,17 @@
 
 ## SDK Core: Session & Signaling (`packages/sdk-core/src/`)
 - Media-kind token SSoT (`MEDIA_KIND_TOKENS`, `perMediaKind`) + the ONE wire↔token mapping → `media/mediaKind.ts`, `signaling/slotStateMap.ts:mediaKindToken()`, `wireMediaKind()`
-- Signaling client / meeting session (single-use per join) → `signaling/SignalingClient.ts`, `session/MeetingSession.ts`
-- Session event surface (mute / first-media / slot / fault) → `session/events.ts:MeetingSessionEventMap`; `StreamAssignments` + unreachable senders → `signaling/events.ts:StreamAssignmentsEvent`
+- Signaling client / meeting session (single-use per join) → `signaling/SignalingClient.ts`, `session/MeetingSession.ts`; session event surface (mute / first-media / slot / fault) → `session/events.ts:MeetingSessionEventMap`; `StreamAssignments` + unreachable senders → `signaling/events.ts:StreamAssignmentsEvent`
 - Session↔media wiring (rebind purge, KEK observer, per-kind send directives, video encoding validation, MH control sink → keyframe gate, publish-set-gated mute report) → `session/mediaWiring.ts:sendDirectiveListener`, `validateVideoEncoding`, `mhControlSink`, `bestEffortMuteReport`
 - Signalling media state (E3 cache, mute, server mute seeded from roster) + R-18 tracker (S1); publish set + slot plan + declaration + capture source (audio + video/test pattern) → `session/{signalingMediaState,serverMuteResume,slotPlan,mediaSelection}.ts`; session-owned transmit keys + KEK subscription + VP8 join probe → `MeetingSession.ts:startMedia`; join publish declaration + join-window mute catch-up → `MeetingSession.ts:#declarePublish`, `#catchUpClientMuteAfterJoin`
 - Flat slot-state map (exhaustive `Record<SlotState, …>`) + pairing view + single-kind `MuteChange` builder + THE kind-keyed snapshot decoder (CONVENTIONS §6: one entry per known kind, else session-fatal `ContractFault` + bounded `[dt-signaling-contract]` WARN) → `signaling/{slotStateMap,pairing,muteRequest,mediaKindStates}.ts`
 - Host role hint → `session/meetingRole.ts`; base64url → `encoding/base64url.ts`; error codes (closing vs refusal) → `signaling/errorCodeMap.ts:closesConnection()`, `errors/`
 - WebTransport length-prefix framing → `framing/{length-prefix,sendFramed}.ts`; connection mgmt, datagrams, uni streams, MH control channel → `transport/`, `media/MediaTransport.ts:sendRecoveryRequest`
+- Handler-set reconcile (ADR-0039 §4/§5/§7): ONE dial path + ONE removal cleanup + scoped dial-token holder → `media/MediaTransport.ts:applyHandlerSet`, `arm`, `#dial`, `#removeRef`, `#dialTokens`; `HandlerRef` brand + ref-only diff → `media/handlerSet.ts`; full-jitter redial → `media/redialBackoff.ts`; `MhCloseCode` disposition → `media/closeCode.ts`; set decode/validate/blank + membership → `signaling/handlerSetIntake.ts`, `SignalingClient.ts:#takeHandlerSet`; per-ref forget fan-out → `session/mediaStart.ts:forgetHandler`; gates → `media/__tests__/reconcile.test.ts`, `signaling/__tests__/handlerSetIntake.test.ts`
 - HTTP/3 meeting API; generated protobuf-es types (gitignored); wire→public codec oracle; validation SSoT → `http/`, `proto/dark_tower/`, `signaling/codecMap.ts`, `validation/limits.ts`
 
 ## SDK Core: Config
-- Client config SSoT → `config/clientConfig.ts` (`parseReceiveSlots()`, `deriveKekRetention()`, video knobs + `videoConfigLogLine()`, video receive bounds `videoReceive` + `videoReceiveConfigLogLine()`, keyframe floor `KEYFRAME_MIN_INTERVAL_FLOOR_MS`); export interval → `telemetry/telemetryConfig.ts:getMetricExportIntervalMs()`; MC↔SDK floor guard → `scripts/guards/simple/validate-keyframe-floor-sync.sh`
+- Client config SSoT → `config/clientConfig.ts` (handler-set knobs `MediaConfig.handlers` + `HANDLER_SET_CONFIG_RANGES` + `handlerSetConfigLogLine()` + `MH_KEEPALIVE_FLOOR_MS`, pinned by `scripts/guards/simple/validate-keyframe-floor-sync.sh`; README table pinned by `web-app/tests/handlerSetConfigDocs.test.ts`; `parseReceiveSlots()`, `deriveKekRetention()`, video knobs + `videoConfigLogLine()`, video receive bounds `videoReceive` + `videoReceiveConfigLogLine()`, keyframe floor `KEYFRAME_MIN_INTERVAL_FLOOR_MS`); export interval → `telemetry/telemetryConfig.ts:getMetricExportIntervalMs()`; MC↔SDK floor guard → `scripts/guards/simple/validate-keyframe-floor-sync.sh`
 
 ## SDK Core: Media Pipeline (`packages/sdk-core/src/media/`)
 - Frame codec + signing + reject reasons → `frame/{frameCodec,ed25519,wireConstants,rejectReason}.ts`; header v3 + sendable/supported versions → `frameCodec.ts:HEADER_VERSION_V3`, `__tests__/frameCodec.v3.test.ts`; hot-path layout rule → `__tests__/hotPathLayout.test.ts`
@@ -47,7 +47,7 @@
 - Local-only debug panel (R-7 loopback, R-35 overlay) → `views/DebugPanel.svelte`, `lib/{selfCheck,debugStats,debugToggle}.ts`, scan `tests/debugNeverExported.test.ts`; SDK → `session/localDebugSurface.ts`, `media/lifecycle/localStats.ts`, `media/setup/localPreview.ts`
 - Slot-state copy (ONE exhaustive table) → `lib/slotState.ts`; participant copy + per-kind client state (`not_published`/`live`/`client_muted`, no "unknown") from roster cells (never slots), bounded names, self camera → `lib/participantState.ts`; auth/meeting views → `views/{SignIn,SignUp,CreateMeeting}.svelte`
 - Session wiring, config, error text → `lib/{session,config,errorText}.ts`; test-only build defines (one predicate) → `vite/testDefines.ts`; test levers → `lib/testLevers.ts`
-- E2E bus (incl. `videoSlots`, `sendCounts`) + per-lane analysis + render-surface lumas (under `__E2E_HOOKS__`) → `lib/{e2eBus,e2eAnalysis}.ts`; contract round-trip → `__tests__/e2eBus.test.ts`
+- E2E bus (incl. `handlerSets` history — refs+urls, never tokens; `videoSlots`, `sendCounts`) + per-lane analysis + render-surface lumas (under `__E2E_HOOKS__`) → `lib/{e2eBus,e2eAnalysis}.ts`; contract round-trip → `__tests__/e2eBus.test.ts`
 - Vite proxy / cert fingerprints → `vite.config.ts`, `vite/fingerprints.ts`; prod-absence bundle scan → `tests/bundle-content.test.ts`
 
 ## Browser E2E Harness (`packages/web-app/e2e/`)
@@ -60,7 +60,7 @@
 - Subdomain-pattern drift guard → `scripts/guards/simple/validate-subdomain-regex-sync.sh`
 
 ## Client Test Utilities (`packages/test-utils/src/`)
-- Mock transport (uni streams, STOP_SENDING/reset, write gates → `mockUniStreams.ts`); audio seam doubles; video decoder + VideoFrame close-registry doubles → `media/video.ts`; tokens, metrics sink contract + mocks, ids → `MockWebTransport.ts`, `media/index.ts`, `TestTokenBuilder.ts`, `token-claims.ts`, `contracts/MetricsSink.ts`, `InMemoryMetricsSink.ts`, `MockOTLPExporter.ts`, `deterministic-ids.ts`
+- Hand-driven timer double → `FakeScheduler.ts`; per-dial (never URL-deduped) connect recorder → `sdk-core/src/media/__tests__/helpers.ts:makeDialRecorder`; mock transport (uni streams, STOP_SENDING/reset, write gates → `mockUniStreams.ts`); audio seam doubles; video decoder + VideoFrame close-registry doubles → `media/video.ts`; tokens, metrics sink contract + mocks, ids → `MockWebTransport.ts`, `media/index.ts`, `TestTokenBuilder.ts`, `token-claims.ts`, `contracts/MetricsSink.ts`, `InMemoryMetricsSink.ts`, `MockOTLPExporter.ts`, `deterministic-ids.ts`
 
 ## Protocol Integration
 - Signaling proto (incl. per-kind `max_{audio,video}_receive_slots`, `kek_rotation_debounce_seconds`) → `proto/dark_tower/signaling/v1/signaling.proto`

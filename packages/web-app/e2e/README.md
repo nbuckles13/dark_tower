@@ -37,8 +37,9 @@ only). Four focused tests (each its own fresh 120s budget):
 **Test 1 — token-based join with active/active media (a/b/d/e):**
 
 - **(a)** MC `JoinResponse` received with a `participant_id`
-- **(b)** ≥1 successful MH WebTransport handshake for **every** URL in
-  `media_servers` (active/active; MH count is cluster topology, not hardcoded)
+- **(b)** ≥1 successful MH WebTransport handshake for **every** handler in the
+  latest bus `handlerSets` entry (ADR-0039 §4; active/active; MH count is cluster
+  topology, not hardcoded)
 - **(d)** the SDK's post-join `MediaConnectionUpdate` (state=CONNECTED) reached
   MC's handler — `mc_participant_mh_status_total{state="connected"}` rises above
   a baseline captured immediately before the join
@@ -128,7 +129,7 @@ exclusively through `serverCertificateHashes` pinning.
 
 | #   | Assertion                                                                                        | Why it is shaped this way                                                                                                                                                                                                                                         |
 | --- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| s1  | `joined.mediaServers` is non-empty and every entry connects                                      | R-33: every participant is offered the meeting's whole handler set and dials all of it. No handler COUNT is asserted — `env.ts` keeps topology out of this tier.                                                                                                  |
+| s1  | `joined.handlerSet` is non-empty and every handler connects                                      | R-33: every participant is offered the meeting's whole handler set and dials all of it. No handler COUNT is asserted — `env.ts` keeps topology out of this tier.                                                                                                  |
 | s2  | Slot 0 polls to exactly **`fewer_sources_than_slots`**                                           | **The positive control.** A specific, non-default wire token proves MC's assignment arrived and says "nobody to hear" — not merely "not awaiting-assignment", which is vacuous under R-3. `active` here would mean MC routed the client to itself.                |
 | s3  | `framesSent` and `framesAccepted` are both **flat** over a window after s2                       | Egress is flat because MC directs no audio stream to a publisher nobody holds (a `SendDirective` listing audio with empty targets, §5), so no send instruction is ever applied — not because of mute. Ingress is flat because MC pushed no edge into this client. |
 | s4  | The window contains **≥ 4 samples**, asserted separately (shared `expectCountersFlatOverWindow`) | Flatness over zero samples is vacuously true, so a stalled sampler must be reported as a harness failure.                                                                                                                                                         |
@@ -350,8 +351,9 @@ timeout.
 
 Defaults trace to `infra/kind/kind-config.yaml` (SSoT), mirrored by
 `vite.config.ts` (dev proxy) and `crates/env-tests/src/cluster.rs` (Rust
-counterpart). MC/MH endpoints come exclusively from the join response's
-`media_servers`.
+counterpart). The MC endpoint comes from the GC join response; MH endpoints come
+exclusively from the MC `MediaHandlerSet` (recorded on the bus as `handlerSets`;
+the superseded `JoinResponse.media_servers` is never read).
 
 ## Multi-party harness (story 2, R-30)
 

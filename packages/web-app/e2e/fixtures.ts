@@ -38,7 +38,7 @@ import {
   SUITE_AUDIO_RECEIVE_SLOTS,
   SUITE_VIDEO_RECEIVE_SLOTS,
 } from './cohort.js';
-import { E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS } from '../src/lib/e2eBus.js';
+import { E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS, type BusHandlerSet } from '../src/lib/e2eBus.js';
 import { scanRecordedRequests, type RecordedRequest, type ScanReport } from './credentialScan.js';
 import { windowStep } from './windowSampling.js';
 import { parseVideoSlots, withoutLumas, type VideoSlotSample } from './videoBusShape.js';
@@ -364,13 +364,30 @@ export async function bootstrapMeeting(adminToken: string, title: string): Promi
 // Join + bus observation
 // ============================================================================
 
-/** The bus projection of the MC JoinResponse (see src/lib/e2eBus.ts `joined`). */
+/** One bus handler set — THE type lives with the projection (`src/lib/e2eBus.ts`). */
+export type { BusHandlerSet };
+
+/** The urls of a handler set, in set order. */
+export function handlerUrls(set: BusHandlerSet): string[] {
+  return set.handlers.map((h) => h.url);
+}
+
+/** The bus's handler-set history, in wire order (empty when the bus is absent). */
+export async function handlerSets(page: Page): Promise<readonly BusHandlerSet[]> {
+  return page.evaluate(() => window.__darktower_test__?.handlerSets ?? []);
+}
+
+/**
+ * The bus projection of the MC JoinResponse (see src/lib/e2eBus.ts `joined`),
+ * plus the JOIN-TIME handler set (the first entry of the bus `handlerSets`
+ * history). `JoinResponse.media_servers` is superseded and never read.
+ */
 export interface JoinedBusEvent {
   readonly type: 'joined';
   readonly participantId: string;
   readonly userId: string;
   readonly participants: ReadonlyArray<{ participantId: string; name: string }>;
-  readonly mediaServers: readonly string[];
+  readonly handlerSet: BusHandlerSet;
   /**
    * The meeting-scoped sender id (`JoinResponse.sender_id`), STRINGIFIED, as the
    * bus emits it. Optional in the type only: the video evidence helpers
@@ -479,49 +496,62 @@ export async function waitForJoined(page: Page, timeoutMs = 30_000): Promise<Joi
     );
   }
   const events = await busEvents(page);
-  const joined = events.find((e) => e['type'] === 'joined') as JoinedBusEvent | undefined;
+  const joined = events.find((e) => e['type'] === 'joined') as
+    Omit<JoinedBusEvent, 'handlerSet'> | undefined;
+  // The join-time set is announced (and recorded) BEFORE `joined`.
+  const joinSet = (await handlerSets(page))[0];
   if (
     joined === undefined ||
     typeof joined.participantId !== 'string' ||
-    !Array.isArray(joined.mediaServers)
+    joinSet === undefined ||
+    !Array.isArray(joinSet.handlers)
   ) {
-    throw new Error(`malformed 'joined' bus event: ${JSON.stringify(joined)}`);
+    throw new Error(
+      `malformed 'joined' bus event or no join-time handler set: ` +
+        `${JSON.stringify({ joined, joinSet })}`,
+    );
   }
-  return joined;
+  return { ...joined, handlerSet: joinSet };
 }
 
 /**
- * Assertion (b): wait until a `mediaConnected` bus event exists for EVERY URL in
- * `media_servers` (active/active — all MHs, not just one). Failure names the
- * missing URLs, m-of-n.
+ * Assertion (b): wait until a `mediaConnected` bus event exists for EVERY ref of
+ * the LATEST handler set (active/active — all handlers, not just one). The set
+ * must be non-empty: an empty one would pass vacuously. Failure names the
+ * missing handlers, m-of-n.
  */
-export async function waitForAllMediaConnected(
-  page: Page,
-  mediaServers: readonly string[],
-  timeoutMs = 30_000,
-): Promise<void> {
+export async function waitForAllMediaConnected(page: Page, timeoutMs = 30_000): Promise<void> {
+  const latest = (await handlerSets(page)).at(-1);
+  if (latest === undefined || latest.handlers.length === 0) {
+    throw new Error(
+      `no non-empty handler set on the bus to wait on (the set must not be empty). ` +
+        `${await busFailureContext(page)}`,
+    );
+  }
   try {
     await page.waitForFunction(
-      (urls) => {
+      () => {
         const bus = window.__darktower_test__;
-        if (bus === undefined) return false;
+        const set = bus?.handlerSets.at(-1);
+        if (bus === undefined || set === undefined) return false;
         const connected = new Set(
-          bus.events.filter((e) => e['type'] === 'mediaConnected').map((e) => e['mhUrl']),
+          bus.events.filter((e) => e['type'] === 'mediaConnected').map((e) => e['handlerRef']),
         );
-        return urls.every((url) => connected.has(url));
+        return set.handlers.every((h) => connected.has(h.ref));
       },
-      [...mediaServers],
+      undefined,
       { timeout: timeoutMs },
     );
   } catch {
     const events = await busEvents(page);
+    const set = (await handlerSets(page)).at(-1) ?? latest;
     const connected = events
       .filter((e) => e['type'] === 'mediaConnected')
-      .map((e) => e['mhUrl'] as string);
-    const missing = mediaServers.filter((url) => !connected.includes(url));
+      .map((e) => e['handlerRef'] as number);
+    const missing = set.handlers.filter((h) => !connected.includes(h.ref));
     throw new Error(
       `MH WebTransport handshakes incomplete within ${timeoutMs}ms: ` +
-        `${connected.length} of ${mediaServers.length} media_servers connected; ` +
+        `${set.handlers.length - missing.length} of ${set.handlers.length} handlers connected; ` +
         `missing: ${JSON.stringify(missing)}. ${await busFailureContext(page)}`,
     );
   }

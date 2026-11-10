@@ -49,11 +49,12 @@ import { MeetingKekHolder } from '../../setup/kekSource.js';
 import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import { AudioPipeline, type ReceiveAssignment } from '../AudioPipeline.js';
+import { handlerRef, type HandlerRef } from '../../handlerSet.js';
 
 const T = transmitRewrapLatencyMs(DEFAULT_CLIENT_CONFIG.media);
 const RETENTION_MS = deriveKekRetention(NOMINAL_DEBOUNCE_SECONDS, T).retentionMs;
-const HANDLER_A = 'https://mh-a.example:4433';
-const HANDLER_B = 'https://mh-b.example:4433';
+const HANDLER_A = handlerRef(1);
+const HANDLER_B = handlerRef(2);
 const RECEIVER_SENDER_ID = 900;
 
 const kekOf = (fill: number) => new Uint8Array(MEETING_KEK_BYTES).fill(fill);
@@ -66,11 +67,16 @@ interface Peer {
   /** Every byte of this peer's audio. Identifies it at the decoder. */
   readonly byte: number;
   readonly slot: number;
-  readonly handler: string;
+  readonly handler: HandlerRef;
   seq: number;
 }
 
-async function makePeer(id: number, byte: number, slot: number, handler: string): Promise<Peer> {
+async function makePeer(
+  id: number,
+  byte: number,
+  slot: number,
+  handler: HandlerRef,
+): Promise<Peer> {
   return { id, identity: await makeIdentity(byte), byte, slot, handler, seq: 0 };
 }
 
@@ -115,7 +121,7 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
   const roster = new RosterIdentityKeys(32);
   const codecs = new FakeAudioCodecs();
   const playback = new RecordingPlaybackSink();
-  const transports = new Map<string, MockWebTransport>();
+  const transports = new Map<HandlerRef, MockWebTransport>();
   for (const url of [HANDLER_A, HANDLER_B]) {
     const t = new MockWebTransport();
     t.simulateReady();
@@ -164,7 +170,7 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
   await pipeline.start();
 
   let delivered = 0;
-  const hops = new Map<string, number>();
+  const hops = new Map<HandlerRef, number>();
   const metric = (name: string, match: Record<string, string> = {}) =>
     sink
       .getRecordedMetrics()
@@ -200,7 +206,7 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
       const assignments: ReceiveAssignment[] = peers.map((p) => ({
         slotId: p.slot,
         senderId: p.id,
-        mediaHandlerUrl: p.handler,
+        handlerRef: p.handler,
         active: true,
       }));
       pipeline.setReceiveAssignments(assignments);
@@ -210,7 +216,7 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
       );
     },
     /** Deliver raw bytes on `handler`, as MH forwarding would. */
-    deliver(handler: string, bytes: Uint8Array) {
+    deliver(handler: HandlerRef, bytes: Uint8Array) {
       delivered += 1;
       transports.get(handler)!.simulateIncomingDatagram(bytes);
     },
@@ -248,7 +254,7 @@ async function makeReceiver(opts: { declared?: number[] } = {}) {
       for (const t of intervals) if (t.ms === 10_000) t.fn();
     },
     deficit: () => metric('dt_client_media_receive_source_deficit_total'),
-    nextHop(handler: string): number {
+    nextHop(handler: HandlerRef): number {
       const h = (hops.get(handler) ?? 0) + 1;
       hops.set(handler, h);
       return h;
@@ -1109,7 +1115,7 @@ describe('receive-source deficit against REAL decode activity (story 2 R-28)', (
     const { r, a } = await threeSenderMeeting();
     // Only A remains assigned (and active) from here on.
     r.pipeline.setReceiveAssignments([
-      { slotId: a.slot, senderId: a.id, mediaHandlerUrl: a.handler, active: true },
+      { slotId: a.slot, senderId: a.id, handlerRef: a.handler, active: true },
     ]);
     r.tickExport(); // grace: A's assignment is new relative to the start sample
     for (let tick = 0; tick < 3; tick += 1) {

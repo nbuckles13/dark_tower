@@ -33,10 +33,11 @@ import { MediaMetrics } from '../../setup/mediaMetrics.js';
 import { RosterIdentityKeys } from '../../setup/rosterKeys.js';
 import type { DatagramSender } from '../../pipeline/egress.js';
 import { AudioPipeline, type AudioPipelineOptions } from '../AudioPipeline.js';
+import { handlerRef } from '../../handlerSet.js';
 
 const KEK = new Uint8Array(AES_256_KEY_BYTES).fill(0x11);
 const SENDER_ID = 258;
-const MH_URL = 'https://mh.example/media';
+const MH_URL = handlerRef(1);
 
 /** Every capture the factory handed out, in order, with the id it was asked for. */
 interface CaptureRecord {
@@ -152,7 +153,7 @@ async function makeRig(
           {
             slotId: options.loopbackSlot,
             senderId: SENDER_ID,
-            mediaHandlerUrl: MH_URL,
+            handlerRef: MH_URL,
             active: true,
           },
         ],

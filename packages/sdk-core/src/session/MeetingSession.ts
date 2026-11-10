@@ -6,8 +6,9 @@
 //   idle → fetching-token → connecting-mc → joining → joined  (+ disconnecting)
 //
 // `join()` orchestrates: auth (login/register) → GC meeting token → MC signaling
-// join → active/active MH handshake (`MediaTransport.connectAll`) → send ONE
-// `MediaConnectionUpdate` (R-21: ALWAYS, once connectAll settles). It emits the
+// join → dial the join-time handler set (`MediaTransport.arm`; every later set
+// reconciles through the same transport, ADR-0039 §4), reporting each per-ref
+// transition as a `MediaConnectionUpdate`. It emits the
 // high-level events `onJoined`/`onParticipantJoined`/`onParticipantLeft`/
 // `onMediaConnected`/`onError` (+ `stateChange`) and resolves with the join result.
 //
@@ -22,7 +23,11 @@
 // metric/log label. `meeting_id_hash` is a SHA-256 digest of the meeting id (R-32:
 // `crypto.subtle.digest`, never `Math.random`).
 
-import { transmitRewrapLatencyMs, type MediaConfig } from '../config/clientConfig.js';
+import {
+  handlerSetConfigLogLine,
+  transmitRewrapLatencyMs,
+  type MediaConfig,
+} from '../config/clientConfig.js';
 import { SignalingMediaState } from './signalingMediaState.js';
 import { SlotPlan } from './slotPlan.js';
 import type { SlotPair } from '../signaling/pairing.js';
@@ -35,7 +40,7 @@ import { SignalingCodec } from '../signaling/codecMap.js';
 import type { SignalingClientOptions } from '../signaling/SignalingClient.js';
 import type { JoinedEvent } from '../signaling/events.js';
 import { MediaTransport } from '../media/MediaTransport.js';
-import type { MediaTransportOptions } from '../media/events.js';
+import type { MediaTransportOptions, TransportScheduler } from '../media/events.js';
 import { MeetingIdentity } from '../media/setup/identity.js';
 import type { AudioPipeline } from '../media/lifecycle/AudioPipeline.js';
 import { MeetingKekHolder } from '../media/setup/kekSource.js';
@@ -271,12 +276,16 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
   readonly #connectFn: WebTransportConnectFn | undefined;
   readonly #clock: () => number;
   readonly #connectTimeoutMs: number | undefined;
+  readonly #transportScheduler: TransportScheduler | undefined;
+  readonly #transportRandom: (() => number) | undefined;
   readonly #joinTimeoutMs: number | undefined;
   readonly #metricsSink: MetricsSink | undefined;
 
   #state: MeetingSessionState = MeetingSessionState.Idle;
   #signaling: SignalingClient | undefined;
   #media: MediaTransport | undefined;
+  /** Status reports still being written to MC (flushed before a join rejection). */
+  readonly #statusReports = new Set<Promise<void>>();
   #joinStartMs = 0;
   #metricLabels: MetricLabels = {};
   #torn = false;
@@ -352,6 +361,8 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     this.#connectFn = options.connect;
     this.#clock = options.clock ?? Date.now;
     this.#connectTimeoutMs = options.connectTimeoutMs;
+    this.#transportScheduler = options.transportScheduler;
+    this.#transportRandom = options.transportRandom;
     this.#joinTimeoutMs = options.joinTimeoutMs;
     this.#metricsSink = options.metricsSink ?? getMetricsSink();
     // At the boundary, BEFORE N and M are used: every refusal throws typed, here.
@@ -459,6 +470,12 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       stage = FailureStage.McSignalingConnect;
       const signaling = this.#createSignaling();
       this.#signaling = signaling;
+      // The media transport exists BEFORE the join so the join-time handler set
+      // (and any set pushed right behind it) has a home: sets are held, not
+      // dialed, until `arm` below (ADR-0039 §4).
+      const media = this.#createMedia(signaling, mediaMetrics);
+      this.#media = media;
+      this.#wireMedia(signaling, media);
       let joined: JoinedEvent;
       try {
         joined = await this.#joinSignaling(signaling, joinResp, options);
@@ -469,29 +486,23 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         throw err;
       }
 
-      // --- joining: active/active MH handshake + MediaConnectionUpdate ---
+      // --- joining: dial the join-time handler set ---
       this.#setState(MeetingSessionState.Joining);
       stage = FailureStage.MhConnect;
-      const media = this.#createMedia(signaling, mediaMetrics);
-      this.#media = media;
-      let firstMh = true;
-      media.on('connected', (url) => {
-        if (firstMh) {
-          firstMh = false;
-          this.#histogram('dt_client_time_to_first_mh_connected_ms');
-        }
-        this.emit('mediaConnected', url);
-      });
-      let connectErr: unknown;
+      console.info(
+        '[dt-media-handlers-config]',
+        handlerSetConfigLogLine(this.#mediaConfig, this.#slots.mediaConfigSource),
+      );
+      // The meeting JWT is passed CALL-SCOPED to the join-time dials only and is
+      // never stored (`MediaTransport.arm`). Rejects ALL_FAILED when a non-empty
+      // join set connected nowhere (the join gate, unchanged); every transition
+      // was already reported to MC, per ref, as it happened.
       try {
-        await media.connectAll(joined.mediaServers, joinResp.token);
-      } catch (err) {
-        connectErr = err;
-      }
-      // R-21: ALWAYS send ONE MediaConnectionUpdate once connectAll settles.
-      await signaling.sendMediaConnectionUpdate(media.getStatusReports());
-      if (connectErr !== undefined) {
-        throw connectErr;
+        await media.arm(joinResp.token);
+      } finally {
+        // The join-time transitions reach MC BEFORE a rejection tears the
+        // signalling stream down (the R-21 "always report" guarantee).
+        await this.#flushStatusReports();
       }
 
       // --- joined ---
@@ -992,6 +1003,9 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
       // decoded field is scrubbed — it never rides an event payload.
       kekSink: this.#kekSource,
       rosterKeys: this.#rosterKeys,
+      // Every handler set — WITH its dial tokens — goes from the decode boundary
+      // straight into the transport; events carry the token-free view only.
+      handlerSetSink: (intake) => this.#media?.applyHandlerSet(intake),
     };
     const signaling = new SignalingClient(opts);
     // Signalling-derived media state first, so the pipeline sees an update no
@@ -1040,10 +1054,46 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
     }
   }
 
+  /**
+   * Bridge the transport's events (ADR-0039 §4). `time_to_first_mh_connected` is
+   * latched ONCE PER SESSION here — never reset by a set change, migration,
+   * redial or token refresh. Every per-ref transition goes to MC as one
+   * `MediaConnectionUpdate` (diagnostic only), best-effort.
+   */
+  #wireMedia(signaling: SignalingClient, media: MediaTransport): void {
+    let firstMh = true;
+    media.on('connected', (view) => {
+      if (firstMh) {
+        firstMh = false;
+        this.#histogram('dt_client_time_to_first_mh_connected_ms');
+      }
+      this.emit('mediaConnected', view);
+    });
+    media.on('status', (report) => {
+      const sent = signaling.sendMediaConnectionUpdate([report]).catch(() => {
+        // Diagnostic only: a report that cannot be sent (the signalling stream
+        // is gone) changes nothing on this client. Bounded, no identifiers.
+        console.warn('[dt-media-transport]', 'a media connection status could not be reported');
+      });
+      this.#statusReports.add(sent);
+      void sent.finally(() => this.#statusReports.delete(sent));
+    });
+    media.on('handlersOverdue', () => this.emit('mediaHandlersOverdue', undefined));
+    signaling.on('mediaHandlerSet', (view) => this.emit('mediaHandlerSet', view));
+  }
+
+  /** Wait for every status report in flight. Never rejects. */
+  async #flushStatusReports(): Promise<void> {
+    await Promise.allSettled([...this.#statusReports]);
+  }
+
   #createMedia(signaling: SignalingClient, metrics: MediaMetrics): MediaTransport {
     const egress = this.#mediaConfig.egress;
     const opts: MediaTransportOptions = {
       clock: this.#clock,
+      handlers: this.#mediaConfig.handlers,
+      ...(this.#transportScheduler ? { scheduler: this.#transportScheduler } : {}),
+      ...(this.#transportRandom ? { random: this.#transportRandom } : {}),
       metricLabels: this.#metricLabels,
       // CHOSEN, not inherited (ADR-0036 §1). The transport queue is kept shallow
       // so the bounded application queue above it makes — and counts — the drop

@@ -543,6 +543,64 @@ export interface TelemetryCadenceConfig {
   readonly metricExportIntervalMs: number;
 }
 
+/**
+ * The media-handler SET reconcile (ADR-0039 §4; story 4 C1): how this client
+ * redials a lost in-set handler, how long it waits on an empty join-time set
+ * before saying so, and how long it waits for a set update after a
+ * HANDLER_RELEASED close. Defaults: {@link DEFAULT_CLIENT_CONFIG}; inclusive
+ * ranges: {@link HANDLER_SET_CONFIG_RANGES} (the ONE home of each — not restated
+ * per key here). Out-of-range values THROW (`validateMediaConfig`), never clamp. Documented with default and range in
+ * `packages/web-app/README.md` §Configuration and
+ * `docs/runbooks/client-dev-local.md`; the defaults' single source is
+ * {@link DEFAULT_CLIENT_CONFIG} (a node-tier test pins the README table to it).
+ *
+ * Logged once per session by {@link handlerSetConfigLogLine}.
+ */
+export interface HandlerSetConfig {
+  /**
+   * Full-jitter exponential base for a redial: attempt n waits
+   * U[0, min(redialCapMs, redialBaseMs * 2^n)], plus {@link MH_KEEPALIVE_FLOOR_MS}
+   * on the first retry (`media/redialBackoff.ts`).
+   */
+  readonly redialBaseMs: number;
+  /** Cap on the jitter window; must be >= redialBaseMs. */
+  readonly redialCapMs: number;
+  /**
+   * An EMPTY join-time set means "media connecting" (ADR-0039 §4). If no set
+   * naming a handler arrives within this bound, the session emits ONE
+   * non-fatal `mediaHandlersOverdue` event and is kept.
+   */
+  readonly emptySetNoticeMs: number;
+  /**
+   * After a HANDLER_RELEASED close for a ref still in the set (drain shed,
+   * owner silence), wait this long for a set update before reporting
+   * DISCONNECTED and redialling.
+   */
+  readonly releasedGraceMs: number;
+}
+
+/** Inclusive ranges of {@link HandlerSetConfig}; the ONE home of the bounds. */
+export const HANDLER_SET_CONFIG_RANGES: Readonly<
+  Record<keyof HandlerSetConfig, readonly [number, number]>
+> = {
+  redialBaseMs: [100, 60_000],
+  redialCapMs: [1_000, 300_000],
+  emptySetNoticeMs: [1_000, 300_000],
+  releasedGraceMs: [0, 30_000],
+};
+
+/**
+ * ANCHOR (DRY): the client's FIRST-redial floor, in milliseconds — one MH
+ * keepalive interval (ADR-0039 §4: "first retry no earlier than one keepalive
+ * interval"; a redial before MH idles out the old session meets
+ * BINDING_CONFLICT). MUST EQUAL `MH_KEEPALIVE_INTERVAL_MS` in
+ * `infra/services/mh-service/config.env`, which the browser cannot read. Pinned
+ * by scripts/guards/simple/validate-keyframe-floor-sync.sh against config.env
+ * `MH_KEEPALIVE_INTERVAL_MS` — keep it a single literal. Compiled, not a
+ * setting: an operator tuning MH keepalive moves this with it.
+ */
+export const MH_KEEPALIVE_FLOOR_MS = 10_000;
+
 /** Media-path configuration. */
 export interface MediaConfig {
   readonly audio: AudioConfig;
@@ -553,6 +611,7 @@ export interface MediaConfig {
   readonly ingress: IngressConfig;
   readonly receiverState: ReceiverStateConfig;
   readonly receive: ReceiveConfig;
+  readonly handlers: HandlerSetConfig;
 }
 
 /** The SDK's configurable surface. */
@@ -821,6 +880,12 @@ export const DEFAULT_CLIENT_CONFIG: ClientConfig = {
       audioSlots: DEFAULT_RECEIVE_AUDIO_SLOTS,
       videoSlots: DEFAULT_RECEIVE_VIDEO_SLOTS,
     },
+    handlers: {
+      redialBaseMs: 1_000,
+      redialCapMs: 30_000,
+      emptySetNoticeMs: 15_000,
+      releasedGraceMs: 2_000,
+    },
   },
   telemetry: {
     metricExportIntervalMs: DEFAULT_METRIC_EXPORT_INTERVAL_MS,
@@ -852,6 +917,50 @@ function positiveInteger(value: number, key: string): void {
 }
 
 /**
+ * Validate {@link HandlerSetConfig}: each key an integer inside its inclusive
+ * {@link HANDLER_SET_CONFIG_RANGES} entry, and `redialBaseMs <= redialCapMs`.
+ * THROWS a {@link ClientConfigError} naming the key; never clamps.
+ */
+export function validateHandlerSetConfig(handlers: HandlerSetConfig): void {
+  for (const key of Object.keys(HANDLER_SET_CONFIG_RANGES) as (keyof HandlerSetConfig)[]) {
+    const [min, max] = HANDLER_SET_CONFIG_RANGES[key];
+    const value = handlers[key];
+    const path = `media.handlers.${key}`;
+    if (!Number.isInteger(value) || value < min || value > max) {
+      throw new ClientConfigError(
+        path,
+        `${path} must be an integer in [${min}, ${max}], got ${String(value)}`,
+      );
+    }
+  }
+  if (handlers.redialBaseMs > handlers.redialCapMs) {
+    throw new ClientConfigError(
+      'media.handlers.redialBaseMs',
+      `media.handlers.redialBaseMs (${handlers.redialBaseMs}) must not exceed ` +
+        `media.handlers.redialCapMs (${handlers.redialCapMs})`,
+    );
+  }
+}
+
+/**
+ * The handler-set reconcile knobs, as ONE log line (story 4 C1), emitted once
+ * per session when media connects (`MeetingSession`, `[dt-media-handlers-config]`).
+ * Same provenance rule and tuning/rollback note as {@link videoConfigLogLine}:
+ * numbers and fixed tokens only; the first-retry floor is `compiled`.
+ */
+export function handlerSetConfigLogLine(media: MediaConfig, source: ConfigValueSource): string {
+  const h = media.handlers;
+  return (
+    `media handler-set config (${source}): ` +
+    `redialBaseMs=${h.redialBaseMs}; ` +
+    `redialCapMs=${h.redialCapMs}; ` +
+    `emptySetNoticeMs=${h.emptySetNoticeMs}; ` +
+    `releasedGraceMs=${h.releasedGraceMs}; ` +
+    `firstRedialFloorMs=${MH_KEEPALIVE_FLOOR_MS} (compiled)`
+  );
+}
+
+/**
  * Validate a media configuration. THROWS; never clamps and never warns.
  *
  * Call this at pipeline setup, before any device is opened. Two of the checks
@@ -867,6 +976,8 @@ function positiveInteger(value: number, key: string): void {
  */
 export function validateMediaConfig(media: MediaConfig): void {
   const { audio, keys, egress, ingress, receiverState, receive } = media;
+
+  validateHandlerSetConfig(media.handlers);
 
   positiveInteger(audio.sampleRateHz, 'media.audio.sampleRateHz');
   positiveInteger(audio.channels, 'media.audio.channels');

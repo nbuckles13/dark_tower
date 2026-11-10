@@ -12,7 +12,8 @@
 // reach some handlers — by the dev-only `blockHandlers` test lever
 // (`src/lib/testLevers.ts`, `DT_TEST_LEVERS=1`, bundle-absence-proven). The lever
 // only REFUSES dials to URLs MC offered; the URLs are taken from A's own
-// `joined.mediaServers` and chosen by EXACT MATCH, never by position (MC: "order
+// join-time handler set (the bus `handlerSets`; `JoinResponse.media_servers` is
+// superseded) and chosen by EXACT MATCH, never by position (MC: "order
 // carries no meaning") and never by pod ordinal, so no infra topology appears
 // here. The Kind MC image carries no placement lever and needs none.
 //
@@ -35,7 +36,7 @@ import {
   type Member,
 } from './cohortContexts.js';
 import type { CohortMemberPlan } from './cohort.js';
-import { bootstrapMeeting, busEvents, latestBusEventsOf } from './fixtures.js';
+import { bootstrapMeeting, busEvents, handlerUrls, latestBusEventsOf } from './fixtures.js';
 import { mhAdmissionRejectionsByInstance } from './mcMetrics.js';
 import {
   acceptedProbe,
@@ -52,12 +53,15 @@ import { parseVideoSlots } from './videoBusShape.js';
 import { judgeUnreachable } from './videoEvidence.js';
 import { VideoScenario } from './videoScenario.js';
 
-/** The handler URLs this context's own bus reports connected. */
+/**
+ * The handler URLs this context's own bus reports connected (deduped: a redial
+ * of the same handler is not a second connection).
+ */
 async function connectedSet(member: Pick<JoinedMember, 'page'>): Promise<string[]> {
-  return (await busEvents(member.page))
+  const urls = (await busEvents(member.page))
     .filter((e) => e['type'] === 'mediaConnected')
-    .map((e) => e['mhUrl'] as string)
-    .sort();
+    .map((e) => e['url'] as string);
+  return [...new Set(urls)].sort();
 }
 
 /** How many handlers `member`'s own bus reports connected — must stay flat. */
@@ -97,7 +101,7 @@ test.describe('story 2 S10a: partial connectivity (client handler lever)', () =>
       const meetingCode = await bootstrapMeeting(aMember.token, 'E2E S10a partial connectivity');
       const admissionBaseline = await mhAdmissionRejectionsByInstance();
       const a = await joinMember(aMember, meetingCode);
-      const offered = [...a.joined.mediaServers].sort();
+      const offered = handlerUrls(a.joined.handlerSet).sort();
       expect(
         offered.length,
         'S10a needs at least two handlers in the meeting set (the Kind environment runs two)',
@@ -114,9 +118,10 @@ test.describe('story 2 S10a: partial connectivity (client handler lever)', () =>
       // The lever's premise, proven BEFORE any hearing assertion (@test G3):
       // everyone was offered the same set, and each connected where intended.
       for (const m of [b, c]) {
-        expect([...m.joined.mediaServers].sort(), `${m.label} was offered A's handler set`).toEqual(
-          offered,
-        );
+        expect(
+          handlerUrls(m.joined.handlerSet).sort(),
+          `${m.label} was offered A's handler set`,
+        ).toEqual(offered);
       }
       await expect
         .poll(() => connectedSet(a), { message: 'A connects to every handler' })
@@ -218,7 +223,7 @@ test.describe('story 3 R-33: partial connectivity with video slots', () => {
     const { scenario, host } = await VideoScenario.create(browser, 'E2E S10a video', plan);
     try {
       const a = await scenario.join(host, plan);
-      const offered = [...a.joined.mediaServers].sort();
+      const offered = handlerUrls(a.joined.handlerSet).sort();
       expect(offered.length, 'the Kind environment runs two handlers').toBeGreaterThanOrEqual(2);
       const [u0, u1] = offered as [string, string];
       const b = await scenario.join(await scenario.open(1, plan, { blockHandlers: [u1] }), plan, {

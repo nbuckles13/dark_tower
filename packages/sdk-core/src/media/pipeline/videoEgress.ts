@@ -68,10 +68,11 @@ import {
 import type { EncodedVideoFrame } from '../setup/seams.js';
 import type { EgressSendPlan } from './egress.js';
 import { sealAndSignFrame } from './frameSeal.js';
+import type { HandlerRef } from '../handlerSet.js';
 
 /** Opens a group stream to a connected handler, or `undefined` (a selector, never a dialer). */
 export type GroupStreamOpener = (
-  mediaHandlerUrl: string,
+  handlerRef: HandlerRef,
 ) => Promise<WritableStream<Uint8Array>> | undefined;
 
 /** Where one target stands with respect to the current group. */
@@ -136,7 +137,7 @@ export interface VideoEgressOptions {
 /** Builds and sends one video stream. See the module header. */
 export class VideoEgress {
   readonly #o: VideoEgressOptions;
-  readonly #lanes = new Map<string, Lane>();
+  readonly #lanes = new Map<HandlerRef, Lane>();
   #tail: Promise<void> = Promise.resolve();
   #headerVersion: number | undefined;
   #stopped = false;
@@ -195,9 +196,9 @@ export class VideoEgress {
     return n;
   }
 
-  /** The lane state of `url`, for assertion. */
-  laneState(url: string): VideoLaneState | undefined {
-    const lane = this.#lanes.get(url);
+  /** The lane state of `ref`, for assertion. */
+  laneState(ref: HandlerRef): VideoLaneState | undefined {
+    const lane = this.#lanes.get(ref);
     return lane?.active ? lane.state : undefined;
   }
 
@@ -216,20 +217,20 @@ export class VideoEgress {
    */
   setTargets(plan: EgressSendPlan): void {
     if (this.#stopped) return;
-    const wanted = new Set(plan.targets.filter((url) => url !== ''));
+    const wanted = new Set(plan.targets);
     if (wanted.size > 0) {
       if (!isSupportedHeaderVersion(plan.headerVersion)) {
         throw new RangeError('VideoEgress: the directed frame header version is not sendable');
       }
       this.#headerVersion = plan.headerVersion;
     }
-    for (const [url, lane] of this.#lanes) {
-      if (wanted.has(url) || !lane.active) continue;
+    for (const [ref, lane] of this.#lanes) {
+      if (wanted.has(ref) || !lane.active) continue;
       lane.active = false;
       this.#finishGroup(lane);
     }
-    for (const url of wanted) {
-      const lane = this.#lanes.get(url);
+    for (const ref of wanted) {
+      const lane = this.#lanes.get(ref);
       if (lane) {
         if (!lane.active) {
           lane.active = true;
@@ -237,7 +238,7 @@ export class VideoEgress {
         }
         continue;
       }
-      this.#lanes.set(url, {
+      this.#lanes.set(ref, {
         active: true,
         state: 'awaiting_group',
         hopSequence: 0,
@@ -257,6 +258,22 @@ export class VideoEgress {
       this.#finishGroup(lane);
       if (lane.active) lane.state = 'awaiting_group';
     }
+  }
+
+  /**
+   * The handler `ref` LEFT THE SET (ADR-0039 §4 removal cleanup): end its group
+   * and DELETE its lane. Unlike a target dropped from a directive (lane retained
+   * so its per-connection hop count persists), a removed ref is never a target
+   * again — refs are never reused — so its lane would only leak. A later
+   * directive naming a NEW ref starts a fresh lane `awaiting_group` and keys a
+   * group forward through the one owner (`VideoPublisher`).
+   */
+  forget(ref: HandlerRef): void {
+    const lane = this.#lanes.get(ref);
+    if (!lane) return;
+    lane.active = false;
+    this.#finishGroup(lane);
+    this.#lanes.delete(ref);
   }
 
   /** Stop for good: nothing more is built or written. */
@@ -364,10 +381,10 @@ export class VideoEgress {
 
   #fanOut(bytes: Bytes, relayRegionOffset: number, key: boolean): void {
     let originalTaken = false;
-    for (const [url, lane] of this.#lanes) {
+    for (const [ref, lane] of this.#lanes) {
       if (!lane.active) continue;
       if (key) {
-        if (!this.#startGroup(url, lane)) continue;
+        if (!this.#startGroup(ref, lane)) continue;
       } else if (lane.state !== 'in_group') {
         continue;
       }
@@ -378,9 +395,9 @@ export class VideoEgress {
   }
 
   /** Finish the lane's previous group and open a new one. False if no transport. */
-  #startGroup(url: string, lane: Lane): boolean {
+  #startGroup(ref: HandlerRef, lane: Lane): boolean {
     this.#finishGroup(lane);
-    const opened = this.#o.openStream(url);
+    const opened = this.#o.openStream(ref);
     if (opened === undefined) {
       // Directed at a handler we hold no transport to. MC directs only handlers
       // MH reported this client connected on, so this is a placement race or a

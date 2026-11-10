@@ -61,8 +61,11 @@ test.describe('solo participant: loopback removed (ADR-0036 story 2 R-3)', () =>
     // satisfied by hard-coding 2 or importing Kind topology. Registered-set
     // equality is asserted where the set is knowable — MC's own tests and
     // `crates/env-tests/tests/27_mc_slot_placement.rs`.
-    expect(joined.mediaServers.length, 'media_servers must not be empty').toBeGreaterThan(0);
-    await waitForAllMediaConnected(page, joined.mediaServers);
+    expect(
+      joined.handlerSet.handlers.length,
+      'the join-time handler set must not be empty',
+    ).toBeGreaterThan(0);
+    await waitForAllMediaConnected(page);
     await startMedia(page);
 
     // PRIMARY — the positive control. A specific, non-default wire token: MC's
@@ -108,8 +111,11 @@ test.describe('solo participant: loopback removed (ADR-0036 story 2 R-3)', () =>
     const joined = await waitForJoined(page);
     // Non-empty plus connect-to-all; see the first test for why there is no
     // handler-count assertion at this tier.
-    expect(joined.mediaServers.length, 'media_servers must not be empty').toBeGreaterThan(0);
-    await waitForAllMediaConnected(page, joined.mediaServers);
+    expect(
+      joined.handlerSet.handlers.length,
+      'the join-time handler set must not be empty',
+    ).toBeGreaterThan(0);
+    await waitForAllMediaConnected(page);
     await startMedia(page);
 
     const slot = page.getByTestId('slot-0');

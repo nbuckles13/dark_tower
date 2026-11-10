@@ -84,11 +84,12 @@
 //     after `u32::MAX`, and `egress.ts::submit` takes it before the sequence,
 //     so for audio the GoP stop also halts the stream before its sequence
 //     could wrap. That is a consequence, not a sequence ceiling.
-//   * **Reconnect** — UNREACHABLE THIS STORY. `MediaTransport` performs no
-//     reconnect, `MeetingSession` is single-use per join, and no path restarts
-//     the pipeline against a new transport while this object survives. It
-//     becomes live with the handler-restart story, and when it does it is a
-//     generation bump like any other.
+//   * **Handler redial / set change** — NOT a trigger. Since story 4 C1
+//     `MediaTransport` reconciles to the handler set and redials lost handlers,
+//     but that never restarts the pipeline or rebuilds this object (ADR-0039
+//     §4 Keys: a rebuild would reuse wrap nonces); the egress lanes simply gain
+//     or lose a target, and a new video target keys a group forward. A
+//     `MeetingSession` is still single-use per join.
 //   * **MC migration / MH failover** — MC migration issues a fresh KEK, which
 //     changes what we wrap under, not our generation. MH failover is explicitly
 //     not a trigger: MH never held keys.

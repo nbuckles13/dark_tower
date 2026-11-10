@@ -48,6 +48,7 @@ import { MEDIA_SEND_DROP_REASONS, type MediaKindMetrics } from '../setup/mediaMe
 import type { EncodedAudioFrame } from '../setup/seams.js';
 import { BoundedDropOldestQueue } from './egressQueue.js';
 import { EgressIdentityReleasedError, sealAndSignFrame } from './frameSeal.js';
+import type { HandlerRef } from '../handlerSet.js';
 
 // Re-exported from its one home: the shared seal sequence throws it.
 export { EgressIdentityReleasedError };
@@ -130,8 +131,8 @@ export interface DatagramSender {
  * version they were directed with cannot come apart.
  */
 export interface EgressSendPlan {
-  /** Media-handler URLs. EMPTY MEANS SEND NOTHING (ADR-0036 §5). */
-  readonly targets: readonly string[];
+  /** Media-handler refs (current-set members). EMPTY MEANS SEND NOTHING (ADR-0036 §5). */
+  readonly targets: readonly HandlerRef[];
   /**
    * `SendDirective.header_version` — the only runtime source of the version
    * (ADR-0036 §2). Must satisfy `isSupportedHeaderVersion`; the lifecycle layer
@@ -174,14 +175,14 @@ export interface EgressPipelineOptions {
    */
   readonly streamId: number;
   /**
-   * Resolves the datagram channel for a media-handler URL, or `undefined`.
+   * Resolves the datagram channel for a media-handler ref, or `undefined`.
    *
    * A SELECTOR, NEVER A DIALER: it resolves through
-   * `MediaTransport.getDatagramChannel`, which only looks up transports
-   * `connectAll` already opened. A directed target can pick among those
+   * `MediaTransport.getDatagramChannel`, which only looks up CONNECTED
+   * transports of in-set refs. A directed target can pick among those
    * transports; it can never create one.
    */
-  readonly senderFor: (mediaHandlerUrl: string) => DatagramSender | undefined;
+  readonly senderFor: (handlerRef: HandlerRef) => DatagramSender | undefined;
   /**
    * Called when MC directs this client at a target it has no transport for.
    *
@@ -209,7 +210,7 @@ export class EgressPipeline {
   readonly #maxQueueFrames: number;
   readonly #streamNumber: number;
   readonly #streamId: number;
-  readonly #senderFor: (mediaHandlerUrl: string) => DatagramSender | undefined;
+  readonly #senderFor: (handlerRef: HandlerRef) => DatagramSender | undefined;
   readonly #onTargetNotConnected: () => void;
 
   /**
@@ -219,9 +220,9 @@ export class EgressPipeline {
    * because `hop_sequence` is per CONNECTION: a target dropped and later
    * re-directed onto the same transport must not restart its count, which any
    * receiver tracking that hop would read as a publisher restart. Bounded by the
-   * meeting's registered handler set, which MC froze at the first join.
+   * current handler set: a ref that LEAVES the set is deleted by `forget`.
    */
-  readonly #lanes = new Map<string, Lane>();
+  readonly #lanes = new Map<HandlerRef, Lane>();
   /**
    * Datagrams actually put on a transport, summed over lanes (monotone).
    *
@@ -311,7 +312,7 @@ export class EgressPipeline {
    */
   setTargets(plan: EgressSendPlan): void {
     if (this.#stopped) return;
-    const wanted = new Set(plan.targets.filter((url) => url !== ''));
+    const wanted = new Set(plan.targets);
     if (wanted.size > 0) {
       // Only a plan that can SEND is held to the version. An empty plan sends
       // nothing in any version, and the lifecycle layer's fail-closed refusal
@@ -321,16 +322,16 @@ export class EgressPipeline {
       }
       this.#headerVersion = plan.headerVersion;
     }
-    for (const [url, lane] of this.#lanes) {
-      if (wanted.has(url)) continue;
+    for (const [ref, lane] of this.#lanes) {
+      if (wanted.has(ref)) continue;
       lane.active = false;
       lane.queue.drain();
     }
-    for (const url of wanted) {
-      const existing = this.#lanes.get(url);
+    for (const ref of wanted) {
+      const existing = this.#lanes.get(ref);
       if (existing) {
         existing.active = true;
-        void this.#drain(url, existing);
+        void this.#drain(ref, existing);
         continue;
       }
       const lane: Lane = {
@@ -339,8 +340,23 @@ export class EgressPipeline {
         hopSequence: 0,
         draining: false,
       };
-      this.#lanes.set(url, lane);
+      this.#lanes.set(ref, lane);
     }
+    this.#reportQueueDepth();
+  }
+
+  /**
+   * The handler `ref` LEFT THE SET (ADR-0039 §4 removal cleanup): discard its
+   * queue and DELETE its lane. Refs are never reused, so — unlike a target
+   * merely dropped from a directive, whose lane is retained for its hop count —
+   * a removed ref's lane would only leak.
+   */
+  forget(ref: HandlerRef): void {
+    const lane = this.#lanes.get(ref);
+    if (!lane) return;
+    lane.active = false;
+    lane.queue.drain();
+    this.#lanes.delete(ref);
     this.#reportQueueDepth();
   }
 
@@ -466,9 +482,9 @@ export class EgressPipeline {
    */
   #fanOut(bytes: Bytes, relayRegionOffset: number): void {
     let originalTaken = false;
-    for (const [url, lane] of this.#lanes) {
+    for (const [ref, lane] of this.#lanes) {
       if (!lane.active) continue;
-      if (!this.#senderFor(url)) {
+      if (!this.#senderFor(ref)) {
         // MC directed us at a handler we hold no transport to. Counted with the
         // token whose documented fleet contract is "reads zero forever", and
         // reported ONCE through the caller's bounded fault path. Deliberately
@@ -486,7 +502,7 @@ export class EgressPipeline {
         // The drop MH structurally cannot see, counted where the decision is made.
         this.#metrics.sendDropped(MEDIA_SEND_DROP_REASONS.EgressQueueOverflow);
       }
-      void this.#drain(url, lane);
+      void this.#drain(ref, lane);
     }
     this.#reportQueueDepth();
   }
@@ -516,12 +532,12 @@ export class EgressPipeline {
    * what makes a partial send partial: a stalled, closed or missing transport on
    * one lane neither blocks nor fails the others.
    */
-  async #drain(url: string, lane: Lane): Promise<void> {
+  async #drain(ref: HandlerRef, lane: Lane): Promise<void> {
     if (lane.draining) return;
     lane.draining = true;
     try {
       for (;;) {
-        const sender = this.#senderFor(url);
+        const sender = this.#senderFor(ref);
         if (!sender) {
           // Nothing to send on. Frames stay queued and age out through the
           // drop-oldest policy rather than being counted as failures here: a

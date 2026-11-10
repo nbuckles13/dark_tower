@@ -17,6 +17,7 @@
 // roster — it only emits events), not a duplication of any sdk-core surface.
 
 import type {
+  MediaHandlerView,
   JoinedEvent,
   ParticipantJoinedEvent,
   ParticipantLeftEvent,
@@ -36,8 +37,12 @@ export class MeetingStore {
   #meetingState = $state<MeetingSessionState>(MeetingSessionState.Idle);
   /** `$participants` — live roster (seeded from `joined`, mutated on join/left). */
   #participants = $state<readonly RosterParticipant[]>([]);
-  /** `$mediaConnections` — MH URLs whose handshake has succeeded (dedup'd). */
-  #mediaConnections = $state<readonly string[]>([]);
+  /**
+   * `$mediaConnections` — media handlers whose handshake has succeeded, keyed by
+   * `handler_ref` (ADR-0039 §4: the ref is the identity; a new ref at a reused
+   * url is a different handler). Token-free `{ref, url}`; dedup'd by ref.
+   */
+  #mediaConnections = $state<readonly MediaHandlerView[]>([]);
   /** `$lastError` — the most recent terminal/post-join error (typed, redactable). */
   #lastError = $state<SdkError | undefined>(undefined);
 
@@ -66,8 +71,8 @@ export class MeetingStore {
     return this.#participants;
   }
 
-  /** Reactive getter for `$mediaConnections` (connected MH URLs, readonly view). */
-  get mediaConnections(): readonly string[] {
+  /** Reactive getter for `$mediaConnections` (connected handlers, readonly view). */
+  get mediaConnections(): readonly MediaHandlerView[] {
     return this.#mediaConnections;
   }
 
@@ -103,10 +108,10 @@ export class MeetingStore {
     this.#participants = this.#participants.filter((p) => p.participantId !== event.participantId);
   }
 
-  /** Record a connected MH URL (`mediaConnected`); dedup'd. */
-  applyMediaConnected(url: string): void {
-    if (this.#mediaConnections.includes(url)) return;
-    this.#mediaConnections = [...this.#mediaConnections, url];
+  /** Record a connected handler (`mediaConnected`); dedup'd by ref (a redial is not a new entry). */
+  applyMediaConnected(handler: MediaHandlerView): void {
+    if (this.#mediaConnections.some((h) => h.ref === handler.ref)) return;
+    this.#mediaConnections = [...this.#mediaConnections, { ref: handler.ref, url: handler.url }];
   }
 
   /** Store the latest error (`error`). Held as the typed {@link SdkError}. */

@@ -8,6 +8,7 @@ import { MeetingStore } from '../stores/MeetingStore.svelte.js';
 import { subscribeSession } from '../stores/bindMeetingSession.js';
 import { MockMeetingSession } from './helpers/MockMeetingSession.js';
 import { mediaStates } from './helpers/mediaStates.js';
+import type { HandlerRef } from '@darktower/sdk-core';
 
 test('seeds store from session.state at subscribe time', () => {
   const session = new MockMeetingSession();
@@ -30,7 +31,7 @@ test('reacts to each SDK event', () => {
     senderId: 7,
     existingParticipants: [{ participantId: 'a', name: 'Ann', mediaStates: mediaStates() }],
     receiveSlotCaps: { audio: 8, video: 8 },
-    mediaServers: [],
+    handlerSet: { version: '0', handlers: [] },
     correlationId: 'c',
     bindingToken: 'b',
   });
@@ -44,8 +45,8 @@ test('reacts to each SDK event', () => {
   session.fire('participantLeft', { participantId: 'a', reason: 'voluntary' });
   expect(store.participants.map((p) => p.participantId)).toEqual(['b']);
 
-  session.fire('mediaConnected', 'https://mh-0:4433');
-  expect(store.mediaConnections).toEqual(['https://mh-0:4433']);
+  session.fire('mediaConnected', { ref: 1 as HandlerRef, url: 'https://mh-0:4433' });
+  expect(store.mediaConnections).toEqual([{ ref: 1, url: 'https://mh-0:4433' }]);
 
   session.fire('error', new SdkError(SdkErrorCode.Signaling, 'nope'));
   expect(store.lastError?.code).toBe(SdkErrorCode.Signaling);
@@ -79,7 +80,7 @@ test("the roster carries each participant's sender id through, never coerced", (
       { participantId: 'a', name: 'Ann', senderId: 9, mediaStates: mediaStates() },
     ],
     receiveSlotCaps: { audio: 8, video: 8 },
-    mediaServers: [],
+    handlerSet: { version: '0', handlers: [] },
     correlationId: 'c',
     bindingToken: 'b',
   });
@@ -104,7 +105,7 @@ test('aggregate unsubscribe stops all further updates', () => {
   session.fire('participantJoined', {
     participant: { participantId: 'x', name: 'X', mediaStates: mediaStates() },
   });
-  session.fire('mediaConnected', 'https://mh-9:4433');
+  session.fire('mediaConnected', { ref: 9 as HandlerRef, url: 'https://mh-9:4433' });
   session.fire('participantMuteChanged', {
     participantId: 'x',
     mediaStates: mediaStates({ audio: { serverMuted: true } }),

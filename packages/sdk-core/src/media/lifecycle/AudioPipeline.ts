@@ -78,6 +78,7 @@ import type { TransmitKeyManager } from './transmitKeys.js';
 import { FaultOnce } from './faultOnce.js';
 import { ReceiveTransports } from './receiveTransports.js';
 import { bindReceiverState } from './receiverState.js';
+import type { HandlerRef } from '../handlerSet.js';
 
 /** Why the pipeline reported a fault. Bounded; never a raw platform message. */
 export const MediaFaultStage = {
@@ -161,8 +162,8 @@ export interface PipelineKekSource extends MeetingKekSource, KekWrapSource {
  * input from which BOTH the receive transports and the slot-edge gate derive.
  */
 export interface ReceiveAssignment extends SlotAssignment {
-  /** The handler owning this edge. Empty when no source is assigned. */
-  readonly mediaHandlerUrl: string;
+  /** The handler owning this edge; `undefined` when there is none (no edge, or a non-member ref). */
+  readonly handlerRef: HandlerRef | undefined;
   /**
    * MC states this slot is ACTIVE: a sender is assigned and not source-muted
    * (`slot_state = active`). The input the receive-source deficit compares
@@ -182,7 +183,7 @@ export interface AudioSendDirective {
    * Where to send. EMPTY MEANS SEND NOTHING (ADR-0036 §5), and resuming from
    * empty rotates the transmit key.
    */
-  readonly targets: readonly string[];
+  readonly targets: readonly HandlerRef[];
   /**
    * MC's meeting-wide `SendDirective.header_version` (ADR-0036 §2). The ONLY
    * runtime input that selects a header version; required, with no default. A
@@ -243,13 +244,13 @@ export interface AudioPipelineOptions {
    */
   readonly declaredSlotIds: readonly number[];
   /** Resolves a datagram channel for a media-handler URL, or `undefined`. */
-  readonly senderFor: (mediaHandlerUrl: string) => DatagramSender | undefined;
+  readonly senderFor: (handlerRef: HandlerRef) => DatagramSender | undefined;
   /**
    * Inbound datagrams for an ALREADY-CONNECTED media handler, or `undefined`.
    *
    * A selector, never a dialer: see {@link AudioPipeline.setReceiveAssignments}.
    */
-  readonly readableFor: (mediaHandlerUrl: string) => ReadableStream<Uint8Array> | undefined;
+  readonly readableFor: (handlerRef: HandlerRef) => ReadableStream<Uint8Array> | undefined;
   /**
    * The session's client-mute state, shared with every pipeline and the mute
    * report (both kinds, `muteState.ts`). Omitted: a pipeline-private one.
@@ -335,7 +336,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    */
   #transports: ReceiveTransports | undefined;
   /** Every handler the latest `StreamAssignments` names. May be several (§9). */
-  #receiveUrls: readonly string[] = [];
+  #receiveRefs: readonly HandlerRef[] = [];
   #directive: AudioSendDirective | undefined;
   #started = false;
   #stopped = false;
@@ -649,7 +650,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     });
     const ingress = this.#ingress;
     this.#transports = new ReceiveTransports({
-      readableFor: (url) => this.#options.readableFor(url),
+      readableFor: (ref) => this.#options.readableFor(ref),
       declaredSlotIds: this.#options.declaredSlotIds,
       hopRestartBackwardJumpFrames: this.#config.ingress.hopRestartBackwardJumpFrames,
       accept: (datagram, monitor) => ingress.accept(datagram, monitor),
@@ -764,12 +765,11 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    * ---------------------------------------------------------------------------
    *
    * `readableFor` resolves through `MediaTransport.getDatagramChannel`, which
-   * only looks up transports `connectAll` already connected and returns
-   * `undefined` for anything else. `connectAll(joined.mediaServers)` is the SOLE
-   * dial site in the SDK (`#connectedTransports.set` is reached only from its
-   * fan-out), so an assignment URL can pick among the transports this client
-   * already opened; it can never create one. Any future write to
-   * `#connectedTransports` outside the `connectAll` path breaks that property.
+   * only looks up the CONNECTED transport of an in-set ref and returns
+   * `undefined` for anything else. `MediaTransport.#dial` is the SOLE dial site
+   * in the SDK, reached only from the handler-set reconcile (ADR-0039 §4), so an
+   * assignment ref can pick among the transports this client already opened; it
+   * can never create one. Any dial outside the reconcile breaks that property.
    *
    * ---------------------------------------------------------------------------
    * SEVERAL HANDLERS AT ONCE IS NORMAL (ADR-0036 §9)
@@ -790,22 +790,40 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    */
   setReceiveAssignments(assignments: readonly ReceiveAssignment[]): void {
     if (this.#stopped) return;
-    this.#assignments = assignments.map(({ slotId, senderId, mediaHandlerUrl, active }) => ({
+    this.#assignments = assignments.map(({ slotId, senderId, handlerRef, active }) => ({
       slotId,
       senderId,
-      mediaHandlerUrl,
+      handlerRef,
       active,
     }));
     this.#lanes?.setAssignments(this.#assignments);
-    // Empty strings are the proto's "no source assigned" for a slot, not a
     // handler. A message may legitimately carry nothing but those.
-    this.#receiveUrls = [
-      ...new Set(this.#assignments.map((a) => a.mediaHandlerUrl).filter((url) => url !== '')),
+    this.#receiveRefs = [
+      ...new Set(
+        this.#assignments
+          .map((a) => a.handlerRef)
+          .filter((ref): ref is HandlerRef => ref !== undefined),
+      ),
     ];
     // No source in any slot: nothing to receive yet. Running loops stay up, so a
     // later refill needs no reconnect.
-    if (this.#receiveUrls.length === 0) return;
+    if (this.#receiveRefs.length === 0) return;
     this.#applyReceive();
+  }
+
+  /**
+   * The handler `ref` LEFT THE SET (ADR-0039 §4 removal cleanup): delete its
+   * egress lane, end its datagram read loop QUIETLY (no transportFault) and
+   * clear its hop monitor. Decoders, keys and replay state are untouched.
+   */
+  forgetHandler(ref: HandlerRef): void {
+    this.#egress?.forget(ref);
+    this.#transports?.stop(ref);
+  }
+
+  /** The handler `ref` (re)connected: start reading it if an assignment names it. */
+  handlerConnected(ref: HandlerRef): void {
+    if (this.#receiveRefs.includes(ref)) this.#applyReceive();
   }
 
   /**
@@ -1010,7 +1028,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
         maxQueueFrames: this.#config.egress.maxQueueFrames,
         streamNumber: directive.streamNumber,
         streamId,
-        senderFor: (url) => this.#options.senderFor(url),
+        senderFor: (ref) => this.#options.senderFor(ref),
         onTargetNotConnected: () => {
           // Event-once by (stage, message) — see `#fault`. Under §9 MC only
           // targets handlers owning this sender's edges, and an edge requires
@@ -1039,7 +1057,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
     // Before `start()` there is no ingress to hand frames to; `start()` calls
     // this again. Never read and discard.
     if (this.#stopped) return;
-    this.#transports?.open(this.#receiveUrls);
+    this.#transports?.open(this.#receiveRefs);
   }
 
   /**

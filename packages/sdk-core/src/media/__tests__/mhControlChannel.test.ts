@@ -20,15 +20,17 @@ import {
 } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { fromBinary } from '@bufbuild/protobuf';
 import type { MhControlChannelEnding, MhControlSink, MhKeyframeRequest } from '../events.js';
-import { makeConnect, waitFor } from './helpers.js';
+import { handlerRef, type HandlerRef } from '../handlerSet.js';
+import { intakeOf, makeConnect, waitFor } from './helpers.js';
 
 const URL_A = 'https://mh-a.example:4433';
+const REF_A = handlerRef(1);
 const JWT = 'meeting-jwt-value';
 
 interface Recorded {
   readonly requests: MhKeyframeRequest[];
-  /** The handler URL each request was bound to (the connection it was READ on). */
-  readonly urls: string[];
+  /** The handler ref each request was bound to (the connection it was READ on). */
+  readonly urls: HandlerRef[];
   malformed: number;
   readonly ended: MhControlChannelEnding[];
 }
@@ -58,7 +60,8 @@ async function connected(): Promise<{
   const mocks = new Map<string, MockWebTransport>();
   const { sink, seen } = recordingSink();
   const mt = new MediaTransport({ connect: makeConnect(mocks), controlSink: sink });
-  const p = mt.connectAll([URL_A], JWT);
+  mt.applyHandlerSet(intakeOf(1n, [{ ref: 1, url: URL_A }]));
+  const p = mt.arm(JWT);
   mocks.get(URL_A)!.simulateReady();
   await p;
   return { mt, mh: mocks.get(URL_A)!, seen };
@@ -98,7 +101,7 @@ describe('MhServerMessage read loop', () => {
     await waitFor(() => seen.requests.length === 1);
     expect(seen.requests).toEqual([{ streamNumber: 1, gopCounter: 7 }]);
     // H is the connection the request was read on (security S6), never payload.
-    expect(seen.urls).toEqual([URL_A]);
+    expect(seen.urls).toEqual([REF_A]);
     expect(seen.malformed).toBe(0);
   });
 
@@ -181,7 +184,7 @@ describe('MhServerMessage read loop', () => {
 describe('recovery_request control send', () => {
   it('frames MhClientMessage.recovery_request on the connect stream, after the connect envelope', async () => {
     const { mt, mh } = await connected();
-    await mt.sendRecoveryRequest(URL_A, { slotId: 2, senderId: 300, gopCounter: 11 });
+    await mt.sendRecoveryRequest(REF_A, { slotId: 2, senderId: 300, gopCounter: 11 });
     const frames = mh.getOutboundBidiFrames(0);
     expect(frames).toHaveLength(2);
     const first = fromBinary(MhClientMessageSchema, frames[0]!);
@@ -194,8 +197,8 @@ describe('recovery_request control send', () => {
   it('serialises concurrent sends to one handler, in call order', async () => {
     const { mt, mh } = await connected();
     await Promise.all([
-      mt.sendRecoveryRequest(URL_A, { slotId: 1, senderId: 300, gopCounter: 1 }),
-      mt.sendRecoveryRequest(URL_A, { slotId: 1, senderId: 300, gopCounter: 2 }),
+      mt.sendRecoveryRequest(REF_A, { slotId: 1, senderId: 300, gopCounter: 1 }),
+      mt.sendRecoveryRequest(REF_A, { slotId: 1, senderId: 300, gopCounter: 2 }),
     ]);
     const counters = mh
       .getOutboundBidiFrames(0)
@@ -212,7 +215,7 @@ describe('recovery_request control send', () => {
     mh.simulateClose();
     await settle();
     const err = await mt
-      .sendRecoveryRequest(URL_A, { slotId: 0, senderId: 1, gopCounter: 0 })
+      .sendRecoveryRequest(REF_A, { slotId: 0, senderId: 1, gopCounter: 0 })
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(MediaConnectionError);
     expect((err as Error).message).toBe('no control channel is open to that media handler');
@@ -222,14 +225,14 @@ describe('recovery_request control send', () => {
     const { mt, mh } = await connected();
     mh.simulateServerMessage(0, prefixOnly(MAX_MESSAGE_SIZE + 1));
     await settle();
-    await mt.sendRecoveryRequest(URL_A, { slotId: 1, senderId: 2, gopCounter: 3 });
+    await mt.sendRecoveryRequest(REF_A, { slotId: 1, senderId: 2, gopCounter: 3 });
     expect(mh.getOutboundBidiFrames(0)).toHaveLength(2);
   });
 
   it('refuses a send to a handler with no control channel, typed and bounded', async () => {
     const { mt } = await connected();
     const err = await mt
-      .sendRecoveryRequest('https://unknown.example', { slotId: 0, senderId: 1, gopCounter: 0 })
+      .sendRecoveryRequest(handlerRef(99), { slotId: 0, senderId: 1, gopCounter: 0 })
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(MediaConnectionError);
     expect((err as Error).message).not.toContain(JWT);

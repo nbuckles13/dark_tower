@@ -4,47 +4,16 @@
 // clock and timer only — no wall time anywhere.
 
 import { describe, expect, it } from 'vitest';
-import { InMemoryMetricsSink } from '@darktower/test-utils';
+import { FakeScheduler, InMemoryMetricsSink } from '@darktower/test-utils';
 
 import { KEYFRAME_MIN_INTERVAL_FLOOR_MS } from '../../../config/clientConfig.js';
 import { MediaKindMetrics } from '../../setup/mediaMetrics.js';
 import { MediaKind } from '../../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { KeyframeGate } from '../keyframePolicy.js';
+import { handlerRef } from '../../handlerSet.js';
 
-const A = 'https://mh-a';
-const B = 'https://mh-b';
-
-/** A manual timer queue driven by an injected clock. */
-function manualTime() {
-  let now = 0;
-  let nextId = 1;
-  const timers = new Map<number, { at: number; fn: () => void }>();
-  return {
-    now: () => now,
-    setTimeout: (fn: () => void, ms: number) => {
-      const id = nextId++;
-      timers.set(id, { at: now + ms, fn });
-      return id as unknown as ReturnType<typeof setTimeout>;
-    },
-    clearTimeout: (h: ReturnType<typeof setTimeout>) => {
-      timers.delete(h as unknown as number);
-    },
-    pending: () => timers.size,
-    advance(ms: number) {
-      const until = now + ms;
-      for (;;) {
-        const due = [...timers.entries()]
-          .filter(([, t]) => t.at <= until)
-          .sort((x, y) => x[1].at - y[1].at)[0];
-        if (!due) break;
-        timers.delete(due[0]);
-        now = due[1].at;
-        due[1].fn();
-      }
-      now = until;
-    },
-  };
-}
+const A = handlerRef(1);
+const B = handlerRef(2);
 
 function rig(opts: { awaiting?: number } = {}) {
   const sink = new InMemoryMetricsSink();
@@ -53,16 +22,18 @@ function rig(opts: { awaiting?: number } = {}) {
     MediaKind.VIDEO_CAMERA,
     sink,
   );
-  const time = manualTime();
+  // The shared hand-driven timer double (fires due timers in due order,
+  // including ones scheduled during an advance).
+  const time = new FakeScheduler();
   let gop: number | undefined;
   let awaiting = opts.awaiting ?? 0;
   let produced = 0;
   const warnings: string[] = [];
   const gate = new KeyframeGate({
     metrics,
-    clock: time.now,
-    setTimeout: time.setTimeout,
-    clearTimeout: time.clearTimeout,
+    clock: time.clock,
+    setTimeout: time.setTimeout as unknown as typeof setTimeout,
+    clearTimeout: time.clearTimeout as unknown as typeof clearTimeout,
     currentGop: () => gop,
     targetsAwaitingGroup: () => awaiting,
     produceKeyframe: () => {
@@ -213,7 +184,7 @@ describe('KeyframeGate — ONE deferral per stream', () => {
     r.emitKey();
     expect(r.gate.request(A, 1)).toBe('min_interval');
     expect(r.gate.hasDeferral).toBe(true);
-    expect(r.time.pending()).toBe(1);
+    expect(r.time.size).toBe(1);
     r.time.advance(500);
     expect(r.produced()).toBe(2);
     expect(r.count(PRODUCED, { source: 'request' })).toBe(2);
@@ -228,7 +199,7 @@ describe('KeyframeGate — ONE deferral per stream', () => {
     r.gate.request(A, 1); // creates the deferral
     r.gate.selfKey('abandonment'); // merges
     r.gate.selfKey('directive_start'); // merges
-    expect(r.time.pending()).toBe(1);
+    expect(r.time.size).toBe(1);
     r.time.advance(500);
     expect(r.produced()).toBe(2);
     expect(r.count(PRODUCED, { source: 'request' })).toBe(2);
@@ -285,7 +256,7 @@ describe('KeyframeGate — ONE deferral per stream', () => {
     r.gate.request(A, 1);
     edge(r);
     expect(r.gate.hasDeferral).toBe(false);
-    expect(r.time.pending()).toBe(0);
+    expect(r.time.size).toBe(0);
     r.gate.setMuted(false);
     r.gate.setDirective([A], 500);
     r.time.advance(10_000);
@@ -358,7 +329,7 @@ describe('KeyframeGate — self-keying (a target with no group in progress)', ()
     r.gate.selfKey('directive_start');
     r.gate.selfKey('abandonment');
     r.gate.close();
-    expect(r.time.pending()).toBe(0);
+    expect(r.time.size).toBe(0);
     expect(r.gate.request(A, 0)).toBe('not_sending');
   });
 });

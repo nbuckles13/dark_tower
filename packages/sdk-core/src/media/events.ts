@@ -11,17 +11,51 @@
 
 import type { MetricLabels, MetricsSink } from '../telemetry/MetricsSink.js';
 import type { WebTransportConnectFn } from '../signaling/SignalingClient.js';
+import type { MhConnectionStatusReport } from '../signaling/events.js';
 import type { MediaConnectionError } from '../errors/MediaConnectionError.js';
+import type { HandlerSetConfig } from '../config/clientConfig.js';
+import type { HandlerRef, MediaHandlerView } from './handlerSet.js';
 
-/** Observable per-MH connection state (R-20: "per-MH state must be observable"). */
-export type MediaConnectionState = 'connecting' | 'connected' | 'failed';
+/**
+ * Observable per-ref lifecycle (ADR-0039 §4). `removed` is not a state: a
+ * removed ref has no record at all.
+ *
+ * - `connecting`: a dial is in flight.
+ * - `connected`: the handshake completed on the ref's current transport.
+ * - `lost`: no transport; a redial (or the HANDLER_RELEASED grace) is pending.
+ * - `parked`: DECLINED — no dial until a set carries a different token for it.
+ */
+export type MediaConnectionState = 'connecting' | 'connected' | 'lost' | 'parked';
 
 /** The typed events {@link MediaTransport} emits. */
 export interface MediaTransportEventMap {
-  /** Fired per MH whose handshake succeeded (payload: the MH URL). */
-  connected: string;
-  /** Fired per MH whose handshake failed (payload: the typed error). */
+  /** A ref's handshake succeeded (token-free view: ref + url). */
+  connected: MediaHandlerView;
+  /** A dial failed (payload: the typed, bounded error — never a token). */
   failed: MediaConnectionError;
+  /**
+   * A per-ref status TRANSITION to report to MC (`MediaConnectionUpdate`).
+   * Emitted only when the reported state changes, except DECLINED, which
+   * reports FAILED every time (it is MC's credential re-push trigger).
+   */
+  status: MhConnectionStatusReport;
+  /**
+   * A ref left the set (or the session ended). Emitted SYNCHRONOUSLY BEFORE its
+   * transport is closed, so per-ref consumers stop quietly first.
+   */
+  handlerRemoved: HandlerRef;
+  /** No set naming a handler arrived within `emptySetNoticeMs` (once per session). */
+  handlersOverdue: undefined;
+}
+
+/**
+ * A timer seam, hand-driven in tests (`@darktower/test-utils` `FakeScheduler`).
+ * A deliberately NEW shape: the handle is `unknown` (opaque to the transport),
+ * unlike `MeetingKekHolderOptions`' `ReturnType<typeof setTimeout>`.
+ */
+export interface TransportScheduler {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
 }
 
 /**
@@ -69,6 +103,15 @@ export interface MediaTransportOptions {
    * (still bounded, never thrown).
    */
   readonly controlSink?: MhControlSink;
+  /**
+   * The handler-set reconcile knobs (`MediaConfig.handlers`). Default
+   * `DEFAULT_CLIENT_CONFIG.media.handlers`.
+   */
+  readonly handlers?: HandlerSetConfig;
+  /** Timer seam for the connect deadline, redials, grace and the empty-set notice. */
+  readonly scheduler?: TransportScheduler;
+  /** Uniform [0, 1) source for redial jitter (default `Math.random`). */
+  readonly random?: () => number;
 }
 
 /**
@@ -81,23 +124,23 @@ export interface MhKeyframeRequest {
   readonly gopCounter: number;
 }
 
-/** Receiver of a handler's MH control-channel input. Per handler URL. */
+/** Receiver of a handler's MH control-channel input. Per handler ref. */
 export interface MhControlSink {
-  /** A well-formed `keyframe_request` arrived from the handler at `url`. */
-  keyframeRequest(url: string, request: MhKeyframeRequest): void;
+  /** A well-formed `keyframe_request` arrived from the handler `ref`. */
+  keyframeRequest(ref: HandlerRef, request: MhKeyframeRequest): void;
   /**
    * An undecodable, oversized, empty or unknown-variant message arrived. After a
    * FRAMING failure the stream is desynchronised and that handler's loop stops
    * (media is unaffected); after a decode failure it continues.
    */
-  malformed(url: string): void;
+  malformed(ref: HandlerRef): void;
   /**
    * The handler's control stream ENDED while the transport was not being torn
    * down: MH reset it (or the connection was lost) — `reset` — or MH finished
    * its send half — `finished`. After either, this handler's keyframe requests
    * are never received again. Not called on this client's own teardown.
    */
-  ended(url: string, cause: MhControlChannelEnding): void;
+  ended(ref: HandlerRef, cause: MhControlChannelEnding): void;
 }
 
 /** Why a handler's control stream ended (see {@link MhControlSink.ended}). */

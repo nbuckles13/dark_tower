@@ -51,8 +51,9 @@ import {
   videoFrame,
   videoMetrics,
 } from '../../pipeline/__tests__/videoFixtures.js';
+import { handlerRef, type HandlerRef } from '../../handlerSet.js';
 
-const URL = 'https://mh-0.example';
+const URL = handlerRef(1);
 const SELF = 5;
 const SENDERS = [601, 602, 603, 604];
 const VIDEO_SLOTS = [3, 4];
@@ -92,7 +93,7 @@ async function harness(opts: Options = {}) {
       identityPublicKey: (ids[i] as TestIdentity).publicKey,
     });
   }
-  const recovery: { url: string; request: MhRecoveryRequest }[] = [];
+  const recovery: { url: HandlerRef; request: MhRecoveryRequest }[] = [];
   const renders: { slotId: number; state: VideoRenderState }[] = [];
   const faults: MediaFault[] = [];
   const logs: string[] = [];
@@ -139,7 +140,7 @@ async function harness(opts: Options = {}) {
         slotId: Number(slot),
         slotState,
         senderId: participants[Number(slot)],
-        mediaHandlerUrl: URL,
+        handlerRef: URL,
       })),
     );
   /** Deliver frames on ONE new group stream (FIN), and wait until processed. */
@@ -326,6 +327,30 @@ describe('VideoReceiver — render, sinks and evidence', () => {
       .map((m) => m.value);
     expect(values).toEqual([0, 2]);
     await h.receiver.stop();
+  });
+});
+
+describe('VideoReceiver — a handler that LEFT THE SET (ADR-0039 §4)', () => {
+  it('forgetHandler ends the group-stream acceptor QUIETLY; the same end un-forgotten faults', async () => {
+    const quiet = await harness();
+    quiet.receiver.start();
+    quiet.assign({ 3: 'active' });
+    await flush();
+    quiet.receiver.forgetHandler(URL);
+    quiet.mock.close();
+    await flush();
+    expect(quiet.faults).toEqual([]);
+    await quiet.receiver.stop();
+
+    // Positive arm: the handler still in the set ending IS surfaced.
+    const loud = await harness();
+    loud.receiver.start();
+    loud.assign({ 3: 'active' });
+    await flush();
+    loud.mock.close();
+    await flush();
+    expect(loud.faults.map((f) => f.stage)).toEqual(['transport']);
+    await loud.receiver.stop();
   });
 });
 

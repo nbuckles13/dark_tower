@@ -52,6 +52,10 @@ import {
   type JoinResponseInit,
   LIVE_STATES,
 } from './helpers.js';
+import { handlerRef } from '../../media/handlerSet.js';
+
+const R1 = handlerRef(1);
+const R2 = handlerRef(2);
 
 function startJoin(
   wt: IWebTransport,
@@ -189,7 +193,13 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
           { participantId: 'p1', name: 'Bob' },
           { participantId: 'p2', name: 'Carol' },
         ],
-        mediaServers: ['https://mh1.example', 'https://mh2.example'],
+        handlerSet: {
+          version: 7n,
+          handlers: [
+            { ref: 11, url: 'https://mh1.example', token: 'tok-SECRET-11' },
+            { ref: 12, url: 'https://mh2.example', token: 'tok-SECRET-12' },
+          ],
+        },
         correlationId: 'corr-1',
         bindingToken: 'bind-1',
       }),
@@ -203,7 +213,15 @@ describe('SignalingClient — JoinResponse + typed events (R-17)', () => {
       { participantId: 'p1', name: 'Bob', mediaStates: LIVE_STATES },
       { participantId: 'p2', name: 'Carol', mediaStates: LIVE_STATES },
     ]);
-    expect(joined.mediaServers).toEqual(['https://mh1.example', 'https://mh2.example']);
+    // The join-time set, TOKEN-FREE: refs + urls only.
+    expect(joined.handlerSet).toEqual({
+      version: '7',
+      handlers: [
+        { ref: 11, url: 'https://mh1.example' },
+        { ref: 12, url: 'https://mh2.example' },
+      ],
+    });
+    expect(JSON.stringify(joined)).not.toContain('tok-SECRET');
     expect(onJoined).toHaveBeenCalledTimes(1);
 
     client.close();
@@ -839,12 +857,10 @@ describe('SignalingClient — lifecycle & teardown', () => {
 });
 
 describe('SignalingClient — sendMediaConnectionUpdate (R-60/R-21)', () => {
-  async function joinedClient(
-    mediaServers: string[] = [],
-  ): Promise<{ client: SignalingClient; wt: MockWebTransport }> {
+  async function joinedClient(): Promise<{ client: SignalingClient; wt: MockWebTransport }> {
     const wt = new MockWebTransport();
     const { client, joinPromise } = startJoin(wt);
-    await reachJoined(wt, { mediaServers });
+    await reachJoined(wt, {});
     await joinPromise;
     wt.clearInspector(); // drop the JoinRequest write so we inspect only the update
     return { client, wt };
@@ -859,19 +875,22 @@ describe('SignalingClient — sendMediaConnectionUpdate (R-60/R-21)', () => {
     return m.value;
   }
 
-  it('all-connected: one CONNECTED MhConnectionStatus per URL, observedAt set, in order', async () => {
+  it('echoes handler_ref + handler_set_version per status, leaves mh_url EMPTY, in order', async () => {
     const { client, wt } = await joinedClient();
     const reports: MhConnectionStatusReport[] = [
-      { mhUrl: 'https://mh-a', state: 'connected', observedAtMs: 1000 },
-      { mhUrl: 'https://mh-b', state: 'connected', observedAtMs: 2000 },
+      { handlerRef: R1, handlerSetVersion: 9n, state: 'connected', observedAtMs: 1000 },
+      { handlerRef: R2, handlerSetVersion: 2n ** 63n, state: 'disconnected', observedAtMs: 2000 },
     ];
     await client.sendMediaConnectionUpdate(reports);
 
     const update = decodeUpdate(wt);
-    expect(update.statuses.map((s) => [s.mhUrl, s.state])).toEqual([
-      ['https://mh-a', ConnectionState.CONNECTED],
-      ['https://mh-b', ConnectionState.CONNECTED],
+    expect(update.statuses.map((s) => [s.handlerRef, s.handlerSetVersion, s.state])).toEqual([
+      [1, 9n, ConnectionState.CONNECTED],
+      // uint64 echoed as bigint with no Number() round-trip.
+      [2, 2n ** 63n, ConnectionState.DISCONNECTED],
     ]);
+    // The superseded field is never populated (P3 deletes it).
+    expect(update.statuses.every((s) => s.mhUrl === '')).toBe(true);
     expect(update.statuses[0]!.observedAt).toBeDefined();
     expect(update.statuses[0]!.failureReason).toBeUndefined();
     client.close();
@@ -880,9 +899,10 @@ describe('SignalingClient — sendMediaConnectionUpdate (R-60/R-21)', () => {
   it('partial: FAILED carries failureReason/failureCode', async () => {
     const { client, wt } = await joinedClient();
     await client.sendMediaConnectionUpdate([
-      { mhUrl: 'https://mh-a', state: 'connected', observedAtMs: 1000 },
+      { handlerRef: R1, handlerSetVersion: 1n, state: 'connected', observedAtMs: 1000 },
       {
-        mhUrl: 'https://mh-b',
+        handlerRef: R2,
+        handlerSetVersion: 1n,
         state: 'failed',
         failureReason: 'media handler connection failed',
         failureCode: 'TRANSPORT',
@@ -899,27 +919,34 @@ describe('SignalingClient — sendMediaConnectionUpdate (R-60/R-21)', () => {
   it('all-failed: every MhConnectionStatus is FAILED', async () => {
     const { client, wt } = await joinedClient();
     await client.sendMediaConnectionUpdate([
-      { mhUrl: 'https://mh-a', state: 'failed', failureCode: 'CONNECT_TIMEOUT', observedAtMs: 1 },
+      {
+        handlerRef: R1,
+        handlerSetVersion: 1n,
+        state: 'failed',
+        failureCode: 'CONNECT_TIMEOUT',
+        observedAtMs: 1,
+      },
     ]);
     const update = decodeUpdate(wt);
     expect(update.statuses.every((s) => s.state === ConnectionState.FAILED)).toBe(true);
     client.close();
   });
 
-  it('caps mhUrl AND failureReason at 256 UTF-8 bytes (G2)', async () => {
+  it('caps failureReason AND failureCode at 256 UTF-8 bytes (G2)', async () => {
     const { client, wt } = await joinedClient();
     await client.sendMediaConnectionUpdate([
       {
-        mhUrl: 'h'.repeat(1000),
+        handlerRef: R1,
+        handlerSetVersion: 1n,
         state: 'failed',
         failureReason: 'x'.repeat(1000),
-        failureCode: 'TRANSPORT',
+        failureCode: 'y'.repeat(1000),
         observedAtMs: 1,
       },
     ]);
     const status = decodeUpdate(wt).statuses[0]!;
-    expect(new TextEncoder().encode(status.mhUrl).length).toBe(256);
     expect(new TextEncoder().encode(status.failureReason ?? '').length).toBe(256);
+    expect(new TextEncoder().encode(status.failureCode ?? '').length).toBe(256);
     client.close();
   });
 
@@ -927,7 +954,7 @@ describe('SignalingClient — sendMediaConnectionUpdate (R-60/R-21)', () => {
     configureTelemetry({ telemetryEndpoint: 'https://gc.example/api/v1/telemetry', env: 'test' });
     const { client, wt } = await joinedClient();
     await client.sendMediaConnectionUpdate([
-      { mhUrl: 'https://mh-a', state: 'connected', observedAtMs: 1 },
+      { handlerRef: R1, handlerSetVersion: 1n, state: 'connected', observedAtMs: 1 },
     ]);
     const msgs = decodeOutboundClientMessages(wt.getOutboundBidiWrites(0));
     expect(msgs[0]!.traceParent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/);
@@ -937,13 +964,17 @@ describe('SignalingClient — sendMediaConnectionUpdate (R-60/R-21)', () => {
   it('throws SignalingError(Transport) when called before join settles / after teardown', async () => {
     const before = new SignalingClient({ connect: () => new MockWebTransport() });
     await expect(
-      before.sendMediaConnectionUpdate([{ mhUrl: 'x', state: 'connected', observedAtMs: 1 }]),
+      before.sendMediaConnectionUpdate([
+        { handlerRef: R1, handlerSetVersion: 1n, state: 'connected', observedAtMs: 1 },
+      ]),
     ).rejects.toMatchObject({ signalingCode: SignalingErrorCode.Transport });
 
     const { client } = await joinedClient();
     client.close();
     await expect(
-      client.sendMediaConnectionUpdate([{ mhUrl: 'x', state: 'connected', observedAtMs: 1 }]),
+      client.sendMediaConnectionUpdate([
+        { handlerRef: R1, handlerSetVersion: 1n, state: 'connected', observedAtMs: 1 },
+      ]),
     ).rejects.toBeInstanceOf(SignalingError);
   });
 });

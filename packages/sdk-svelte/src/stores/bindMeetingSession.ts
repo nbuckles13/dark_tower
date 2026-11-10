@@ -39,7 +39,7 @@ export function subscribeSession(store: MeetingStore, session: BoundMeetingSessi
     session.on('joined', (event) => store.applyJoined(event)),
     session.on('participantJoined', (event) => store.applyParticipantJoined(event)),
     session.on('participantLeft', (event) => store.applyParticipantLeft(event)),
-    session.on('mediaConnected', (url) => store.applyMediaConnected(url)),
+    session.on('mediaConnected', (handler) => store.applyMediaConnected(handler)),
     session.on('error', (error) => store.applyError(error)),
     // The four media absence-signals (ADR-0036 §5/§6/§10), into the SAME
     // subscription and the SAME aggregate unsubscribe as the roster events.
