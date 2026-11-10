@@ -459,10 +459,14 @@ assert_oneof_case_absent "${SIG}" unmuteResponse unmuteRequest
 
 # Story 4 P1 (ADR-0039 §1, §5, §6) — the internal release vocabulary, the
 # per-(meeting, handler) heartbeat and the registration's new fields. Presence
-# only: P1 is additive (no field deleted, no rpc added; `meetingHeartbeat` lands
-# with MC-B1). Declaration-anchored, so a name surviving only in a comment
-# cannot satisfy it.
+# only. Declaration-anchored, so a name surviving only in a comment cannot
+# satisfy it.
 INT="dark_tower/internal/v1/internal_pb.ts"
+# Story 4 MC-B1: the heartbeat rpc is served on MediaCoordinationService.
+# `meetingHeartbeat: {` is the service descriptor's method entry (casing read
+# from a regenerated output, the same pattern as `endMeeting: {` above), so the
+# message names cannot satisfy it.
+assert_generated "${INT}" "meetingHeartbeat: {"
 for symbol in ReleaseCause ServingState HeartbeatVerdict ApplyRefusal \
   MeetingHeartbeatRequest MeetingHeartbeatResponse; do
   assert_exported "${INT}" "${symbol}"

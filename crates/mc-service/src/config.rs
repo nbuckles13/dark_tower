@@ -86,6 +86,21 @@ pub const MIN_MEDIA_CONNECT_SETTLE_MS: u64 = 100;
 /// healthy connect gap and still a bounded wait.
 pub const MAX_MEDIA_CONNECT_SETTLE_MS: u64 = 10_000;
 
+/// Smallest legal `MC_MH_HEARTBEAT_TIMEOUT_MS` (N, ADR-0039 §1).
+///
+/// The Lead's range is (0, 30000] ms. The interval MC sends MH is derived from
+/// N by [`crate::media_routing::HeartbeatTiming::interval`] as
+/// `max(1, floor(N/3))`, so it is never 0 (which MH rejects) for any legal N.
+/// Small N is legal but expensive: every (meeting, handler) pair sends one
+/// heartbeat per interval into its meeting actor (runbook: do not set below
+/// ~1500 ms without load testing).
+pub const MIN_MH_HEARTBEAT_TIMEOUT_MS: u32 = 1;
+
+/// Largest legal `MC_MH_HEARTBEAT_TIMEOUT_MS` (N). Far below MH's
+/// owner-silence release (`MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS`,
+/// [300, 3600] s), so a live MC always answers long before MH gives up on it.
+pub const MAX_MH_HEARTBEAT_TIMEOUT_MS: u32 = 30_000;
+
 /// Smallest legal `MC_KEK_ROTATION_DEBOUNCE_SECONDS` (W).
 ///
 /// The floor is set by the CLIENT, not by MC: the client derives its
@@ -362,6 +377,16 @@ pub struct Config {
     /// one handler under staggered connects (`media_routing/connectivity.rs`).
     pub media_connect_settle_ms: u64,
 
+    /// N, the media-handler heartbeat timeout in milliseconds
+    /// (`MC_MH_HEARTBEAT_TIMEOUT_MS`, ADR-0039 §1). MC's ONE liveness value:
+    /// the send interval MH uses is derived from it and pushed per meeting, so
+    /// MH has no cadence config and the two ends cannot drift.
+    ///
+    /// Required, no Rust default, bounded
+    /// [`MIN_MH_HEARTBEAT_TIMEOUT_MS`]`..=`[`MAX_MH_HEARTBEAT_TIMEOUT_MS`] at
+    /// load. Projected once through [`Config::mh_heartbeat`].
+    pub mh_heartbeat_timeout_ms: u32,
+
     /// W, the KEK rotation debounce window in seconds
     /// (`MC_KEK_ROTATION_DEBOUNCE_SECONDS`, ADR-0036 §4 Rotation).
     ///
@@ -445,6 +470,7 @@ impl fmt::Debug for Config {
             .field("environment", &self.environment)
             .field("receive_slot_caps", &self.receive_slot_caps)
             .field("media_connect_settle_ms", &self.media_connect_settle_ms)
+            .field("mh_heartbeat_timeout_ms", &self.mh_heartbeat_timeout_ms)
             .field(
                 "kek_rotation_debounce_seconds",
                 &self.kek_rotation_debounce_seconds,
@@ -739,6 +765,18 @@ impl Config {
             MAX_MEDIA_CONNECT_SETTLE_MS,
         )?;
 
+        // ADR-0039 §1 heartbeat timeout, N. Required and bounded on both sides
+        // (Lead ruling: (0, 30000] ms). `MissingEnvVar(` and the key literal
+        // stay on ONE line for `dt-guard env-config`.
+        let mh_heartbeat_timeout_ms = bounded(
+            "MC_MH_HEARTBEAT_TIMEOUT_MS",
+            vars.get("MC_MH_HEARTBEAT_TIMEOUT_MS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MC_MH_HEARTBEAT_TIMEOUT_MS".to_string())
+            })?,
+            MIN_MH_HEARTBEAT_TIMEOUT_MS,
+            MAX_MH_HEARTBEAT_TIMEOUT_MS,
+        )?;
+
         // ADR-0036 §4 KEK rotation debounce, W. Required and bounded on both
         // sides: W is the exposure bound on a departed participant, so an
         // unbounded W is a security defect, and a too-small W starves the
@@ -943,6 +981,7 @@ impl Config {
             environment,
             receive_slot_caps,
             media_connect_settle_ms,
+            mh_heartbeat_timeout_ms,
             kek_rotation_debounce_seconds,
             max_receive_capability_declarations,
             audio_encoding,
@@ -964,6 +1003,17 @@ impl Config {
             video_encoding: self.video_encoding,
             connect_settle_window: std::time::Duration::from_millis(self.media_connect_settle_ms),
         }
+    }
+
+    /// The heartbeat timing, built from N as validated at load (ADR-0039 §1).
+    ///
+    /// The ONE place N becomes timing. The interval pushed to MH in
+    /// `RegisterMeetingRequest.heartbeat_interval_ms`, the heartbeat intake's
+    /// actor-send budget, the interval histogram's buckets and the published
+    /// deadline gauge all read it from the value returned here.
+    #[must_use]
+    pub fn mh_heartbeat(&self) -> crate::media_routing::HeartbeatTiming {
+        crate::media_routing::HeartbeatTiming::from_timeout_ms(self.mh_heartbeat_timeout_ms)
     }
 
     /// The KEK rotation lifecycle, built from W as validated at load.
@@ -1069,6 +1119,8 @@ mod tests {
             ),
             // ADR-0036 §9 connect settle window.
             ("MC_MEDIA_CONNECT_SETTLE_MS".to_string(), "1500".to_string()),
+            // ADR-0039 §1 heartbeat timeout (N).
+            ("MC_MH_HEARTBEAT_TIMEOUT_MS".to_string(), "6000".to_string()),
             // ADR-0036 §4 KEK rotation debounce (W).
             (
                 "MC_KEK_ROTATION_DEBOUNCE_SECONDS".to_string(),
@@ -1101,6 +1153,7 @@ mod tests {
             "MEDIA_VIDEO_MAX_BITRATE_BPS",
             "MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
             "MC_MEDIA_CONNECT_SETTLE_MS",
+            "MC_MH_HEARTBEAT_TIMEOUT_MS",
             "MC_KEK_ROTATION_DEBOUNCE_SECONDS",
         ] {
             let mut vars = base_vars();
@@ -1133,6 +1186,7 @@ mod tests {
             ("MEDIA_VIDEO_MAX_BITRATE_BPS", "99999", "4000001"),
             ("MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS", "99", "10001"),
             ("MC_MEDIA_CONNECT_SETTLE_MS", "99", "10001"),
+            ("MC_MH_HEARTBEAT_TIMEOUT_MS", "0", "30001"),
             ("MC_KEK_ROTATION_DEBOUNCE_SECONDS", "29", "301"),
         ] {
             for value in [low, high] {
@@ -1979,5 +2033,22 @@ mod tests {
         assert!(debug_output.contains("otel_enabled"));
         assert!(debug_output.contains("otel-collector.dark-tower:4317"));
         assert!(debug_output.contains("environment"));
+    }
+
+    /// ADR-0039 §1: N's boundaries are accepted, and the interval derived from
+    /// N is the one `HeartbeatTiming` computes (floor(N/3), minimum 1).
+    #[test]
+    fn mh_heartbeat_timeout_boundaries_and_derived_interval() {
+        for (raw, interval_ms) in [
+            ("1", 1),
+            ("30000", 10_000),
+            ("6000", 2_000),
+            ("7000", 2_333),
+        ] {
+            let mut vars = base_vars();
+            vars.insert("MC_MH_HEARTBEAT_TIMEOUT_MS".to_string(), raw.to_string());
+            let config = Config::from_vars(&vars).expect(raw);
+            assert_eq!(config.mh_heartbeat().interval_ms(), interval_ms, "N={raw}");
+        }
     }
 }

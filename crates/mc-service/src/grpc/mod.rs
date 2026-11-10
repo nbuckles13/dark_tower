@@ -29,7 +29,7 @@ pub mod mh_client;
 pub use auth_interceptor::McAuthLayer;
 pub use gc_client::GcClient;
 pub use mc_service::McAssignmentService;
-pub use media_coordination::McMediaCoordinationService;
+pub use media_coordination::{HeartbeatIntake, McMediaCoordinationService};
 pub use mh_client::{MeetingProgramming, MhClient, MhRegistrationClient};
 
 /// MC's inbound gRPC layer stack: request span → trace-context extraction →

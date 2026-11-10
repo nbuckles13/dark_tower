@@ -834,6 +834,7 @@ mod tests {
             environment: "development".to_string(),
             receive_slot_caps: [8, 4],
             media_connect_settle_ms: 1500,
+            mh_heartbeat_timeout_ms: 6000,
             kek_rotation_debounce_seconds: 60,
             max_receive_capability_declarations: 64,
             audio_encoding: crate::media_signaling::AudioEncoding::new(
@@ -902,6 +903,7 @@ mod tests {
             environment: "development".to_string(),
             receive_slot_caps: [8, 4],
             media_connect_settle_ms: 1500,
+            mh_heartbeat_timeout_ms: 6000,
             kek_rotation_debounce_seconds: 60,
             max_receive_capability_declarations: 64,
             audio_encoding: crate::media_signaling::AudioEncoding::new(

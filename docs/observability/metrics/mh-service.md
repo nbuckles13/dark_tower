@@ -1144,7 +1144,7 @@ never "nobody is muted".
    so it is a CANDIDATE disagreement only after item 2's causes are excluded —
    above all that one (MC: `mc_media_send_directive_withdrawals_total{reason="server_muted"}`
    rose). The comparison now detects only a sender that ignored its empty targets. It is
-   the same class as `mc_media_generation_divergence` and the env-tests README
+   the same class as any pod-level last-write-wins value and the env-tests README
    rule against reading shared pod-level values as per-entity evidence — a
    known shape, not a quirk of this metric. The pod-level gauge answers "is any
    mute in force on this MC pod", never "in THIS meeting" (ADR-0036 §11 bars

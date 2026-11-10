@@ -50,8 +50,8 @@ use mc_service::config::Config;
 use mc_service::errors::McError;
 use mc_service::grpc::gc_client::{MeetingEndedQueue, MEETING_ENDED_QUEUE_CAPACITY};
 use mc_service::grpc::{
-    GcClient, McAssignmentService, McAuthLayer, McMediaCoordinationService, MhClient,
-    MhRegistrationClient,
+    GcClient, HeartbeatIntake, McAssignmentService, McAuthLayer, McMediaCoordinationService,
+    MhClient, MhRegistrationClient,
 };
 use mc_service::observability::{health_router, HealthState};
 use mc_service::redis::FencedRedisClient;
@@ -200,11 +200,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Prometheus metrics recorder (ADR-0011)
     // This must happen before any metrics are recorded
     info!("Initializing Prometheus metrics recorder...");
-    let prometheus_handle =
-        mc_service::observability::metrics::init_metrics_recorder().map_err(|e| {
-            error!(error = %e, "Failed to install Prometheus metrics recorder");
-            e
-        })?;
+    let prometheus_handle = mc_service::observability::metrics::init_metrics_recorder(
+        config.mh_heartbeat(),
+    )
+    .map_err(|e| {
+        error!(error = %e, "Failed to install Prometheus metrics recorder");
+        e
+    })?;
     // Zero-initialize discrete-event counters so each series is present at 0 from
     // process start (counter-visibility fix — a lazily-created counter has no
     // 0→1 edge and `increase()` reads 0 forever). Infallible; must run right
@@ -435,7 +437,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create MediaCoordinationService for MH→MC notifications (R-15)
     // Participant connectivity is recorded by the meeting actors (one home);
     // this service only validates and routes notifications to them.
-    let media_coord_service = McMediaCoordinationService::new(Arc::clone(&controller_handle));
+    // ADR-0039 §1/§2: the heartbeat intake runs on the SAME `HeartbeatTiming`
+    // the RegisterMeeting interval and the published deadline gauge use.
+    let heartbeat_intake = HeartbeatIntake::new(
+        config.mc_id.clone(),
+        config.mh_heartbeat(),
+        config.max_participants,
+    )
+    .map_err(|e| {
+        error!(error = %e, "Invalid heartbeat intake configuration");
+        Box::<dyn std::error::Error>::from(e.to_string())
+    })?;
+    mc_service::observability::metrics::set_heartbeat_deadline(config.mh_heartbeat());
+    let media_coord_service =
+        McMediaCoordinationService::new(Arc::clone(&controller_handle), heartbeat_intake);
 
     // Create JWKS-based auth layer for gRPC service token validation (R-22)
     // Applied at the server level: validates JWT signature + expiry for ALL
@@ -542,6 +557,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.mc_id.clone(),
         config.grpc_advertise_address.clone(),
         config.client_media_config(),
+        config.mh_heartbeat(),
         config.max_participants as usize,
         std::time::Duration::from_secs(config.quic_max_idle_timeout_seconds),
         shutdown_token.child_token(),

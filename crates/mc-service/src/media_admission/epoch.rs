@@ -58,13 +58,23 @@ use std::collections::{HashMap, HashSet};
 ///
 /// MH clears its binding BEFORE it sends Disconnected, so a Disconnected seen
 /// here reliably means MH has freed the id, and releasing on it is correctly
-/// ordered. But that Disconnected is best-effort (fire-and-forget at MH). A lost
-/// one leaves its id here, excluded from every later epoch of this meeting: one
-/// namespace slot leaked, a reset pulled slightly earlier. The opposite default —
-/// reclaim unless proven held — would reintroduce the refused-joiner defect on
-/// every dropped notification, trading a bounded leak for a silent media loss.
-/// Reconciling against MH's authoritative connection state would close the leak
-/// and needs a contract change (`docs/TODO.md` §Media Path Obligations).
+/// ordered. But that Disconnected is best-effort (fire-and-forget at MH). The
+/// opposite default — reclaim unless proven held — would reintroduce the
+/// refused-joiner defect on every dropped notification, trading a bounded leak
+/// for a silent media loss.
+///
+/// # A lost Disconnected is healed by the handler's heartbeat (ADR-0039 §6)
+///
+/// Each entry records WHEN MC answered it. A handler's accepted heartbeat
+/// releases that handler's entries absent from its `connection_ids` and
+/// recorded strictly before the previous accepted heartbeat
+/// ([`HandedOutBindings::release_absent`], the SAME predicate as the
+/// connectivity reconcile, `media_routing::liveness::retirable`). MH lists a
+/// connection from the moment it BEGINS its Connected until it SENDS its
+/// Disconnected, and unbinds before that, so an absent, old entry is one MH no
+/// longer binds. A release only shrinks the exclusion snapshot of a FUTURE
+/// epoch reset: the current allocator's cursor never moves back, so no id is
+/// reissued within its generation (R-35).
 ///
 /// The OTHER direction — a `Disconnected` from a path that never unbound,
 /// which would release an id MH still holds — does not arise. MH unbinds on
@@ -75,45 +85,95 @@ use std::collections::{HashMap, HashSet};
 /// nothing (`mh-service/src/session/mod.rs` `SenderBindings::bind`;
 /// traced by @dry-reviewer at Gate 3).
 ///
-/// A connection with no id (a pre-`connection_id` MH, the degraded rollout
-/// state) cannot be matched to a release, so its id is recorded as never
-/// releasable — the same fail-toward-exclusion direction.
+/// `connection_id` is REQUIRED: the meeting actor refuses an empty id before
+/// anything is recorded, so every entry here is releasable.
 ///
 /// Bounded by the MH connections MC has bound in this meeting's life, less
 /// those it has seen close. MH's own connection cap bounds the live part.
 #[derive(Debug, Default)]
 pub struct HandedOutBindings {
-    by_connection: HashMap<(String, String), SenderId>,
-    unreleasable: HashSet<SenderId>,
+    /// `(handler, connection_id) -> (sender, when MC answered it)`.
+    by_connection: HashMap<(String, String), (SenderId, tokio::time::Instant)>,
 }
 
 impl HandedOutBindings {
-    /// MC answered `(handler, connection_id)` with `sender`.
-    pub fn record(&mut self, handler: &str, connection_id: &str, sender: SenderId) {
-        if connection_id.is_empty() {
-            self.unreleasable.insert(sender);
-        } else {
-            self.by_connection
-                .insert((handler.to_string(), connection_id.to_string()), sender);
-        }
+    /// MC answered `(handler, connection_id)` with `sender` at `recorded_at`
+    /// (the SAME instant the connectivity key records). `connection_id` is
+    /// non-empty: the binding gate refuses an empty one before this.
+    pub fn record(
+        &mut self,
+        handler: &str,
+        connection_id: &str,
+        sender: SenderId,
+        recorded_at: tokio::time::Instant,
+    ) {
+        self.by_connection.insert(
+            (handler.to_string(), connection_id.to_string()),
+            (sender, recorded_at),
+        );
     }
 
     /// MH reported `(handler, connection_id)` closed. Returns whether it named a
-    /// binding MC had handed out. A connection with no id releases nothing.
+    /// binding MC had handed out.
     pub fn release(&mut self, handler: &str, connection_id: &str) -> bool {
-        !connection_id.is_empty()
-            && self
-                .by_connection
-                .remove(&(handler.to_string(), connection_id.to_string()))
-                .is_some()
+        self.by_connection
+            .remove(&(handler.to_string(), connection_id.to_string()))
+            .is_some()
+    }
+
+    /// The remove-only heartbeat reconcile for ONE handler (ADR-0039 §6):
+    /// release `handler`'s entries absent from `present` and recorded strictly
+    /// before `before`, by the shared predicate. Returns the released
+    /// connection ids. Walks MC's own entries; never adds.
+    pub fn release_absent(
+        &mut self,
+        handler: &str,
+        present: &HashSet<&str>,
+        before: tokio::time::Instant,
+    ) -> Vec<String> {
+        let doomed: Vec<(String, String)> = self
+            .by_connection
+            .iter()
+            .filter(|((h, conn), (_, recorded_at))| {
+                h == handler
+                    && crate::media_routing::retirable(
+                        *recorded_at,
+                        before,
+                        present.contains(conn.as_str()),
+                    )
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &doomed {
+            self.by_connection.remove(k);
+        }
+        doomed.into_iter().map(|(_, conn)| conn).collect()
+    }
+
+    /// Whether `(handler, connection_id)` is held (test and diagnostics view).
+    #[must_use]
+    pub fn holds(&self, handler: &str, connection_id: &str) -> bool {
+        self.by_connection
+            .contains_key(&(handler.to_string(), connection_id.to_string()))
+    }
+
+    /// The connection ids held for `handler`, sorted (test and diagnostics
+    /// view).
+    #[must_use]
+    pub fn connections_of(&self, handler: &str) -> Vec<String> {
+        let mut conns: Vec<String> = self
+            .by_connection
+            .keys()
+            .filter(|(h, _)| h == handler)
+            .map(|(_, c)| c.clone())
+            .collect();
+        conns.sort();
+        conns
     }
 
     /// Every id an MH may still hold.
     pub fn held(&self) -> impl Iterator<Item = SenderId> + '_ {
-        self.by_connection
-            .values()
-            .copied()
-            .chain(self.unreleasable.iter().copied())
+        self.by_connection.values().map(|(sender, _)| *sender)
     }
 }
 
@@ -414,7 +474,7 @@ mod tests {
     #[test]
     fn a_handed_out_binding_is_held_until_its_connection_is_reported_closed() {
         let mut ledger = HandedOutBindings::default();
-        ledger.record("mh-1", "conn-a", id(7));
+        ledger.record("mh-1", "conn-a", id(7), tokio::time::Instant::now());
         assert_eq!(ledger.held().collect::<Vec<_>>(), vec![id(7)]);
         assert!(
             !ledger.release("mh-2", "conn-a"),
@@ -428,14 +488,63 @@ mod tests {
         );
     }
 
-    /// A connection with no id cannot be matched to a release, so it fails
-    /// TOWARD exclusion: never released.
+    /// Replaces the deleted legacy test. The heartbeat reconcile releases
+    /// only ITS handler's absent, strictly-earlier entries (equal kept).
     #[test]
-    fn a_binding_without_a_connection_id_is_never_released() {
+    fn release_absent_is_per_handler_strict_and_remove_only() {
+        let t0 = tokio::time::Instant::now();
+        let prev = t0 + std::time::Duration::from_millis(5);
         let mut ledger = HandedOutBindings::default();
-        ledger.record("mh-1", "", id(9));
-        assert!(!ledger.release("mh-1", ""));
-        assert_eq!(ledger.held().collect::<Vec<_>>(), vec![id(9)]);
+        ledger.record("mh-1", "old", id(1), t0);
+        ledger.record("mh-1", "listed", id(2), t0);
+        ledger.record("mh-1", "at-prev", id(3), prev);
+        ledger.record("mh-2", "old", id(4), t0);
+        let present: HashSet<&str> = ["listed", "unknown"].into();
+        assert_eq!(ledger.release_absent("mh-1", &present, prev), vec!["old"]);
+        assert!(!ledger.holds("mh-1", "old"));
+        assert!(ledger.holds("mh-1", "listed") && ledger.holds("mh-1", "at-prev"));
+        assert!(
+            ledger.holds("mh-2", "old"),
+            "another handler's entry is untouched"
+        );
+        assert!(!ledger.holds("mh-1", "unknown"), "a heartbeat never adds");
+    }
+
+    /// Security S-4 / R-35: a binding released by the reconcile shrinks only a
+    /// FUTURE reset's exclusion snapshot. Within the current generation the
+    /// allocator never reissues the released id.
+    #[test]
+    fn released_binding_never_reissued_within_the_generation() {
+        let rng = SystemRandom::new();
+        let mut epoch = AdmissionEpoch::generate(&rng).unwrap();
+        let first = epoch
+            .admit(&rng, HashSet::new)
+            .unwrap()
+            .allocation
+            .sender_id;
+        let generation = epoch.keys().generation();
+        let t0 = tokio::time::Instant::now();
+        let mut ledger = HandedOutBindings::default();
+        ledger.record("mh-1", "c", first, t0);
+        assert_eq!(
+            ledger
+                .release_absent(
+                    "mh-1",
+                    &HashSet::new(),
+                    t0 + std::time::Duration::from_millis(1)
+                )
+                .len(),
+            1
+        );
+        for _ in 0..64 {
+            let next = epoch
+                .admit(&rng, || ledger.held().collect())
+                .unwrap()
+                .allocation
+                .sender_id;
+            assert_ne!(next, first, "released id reissued within its generation");
+            assert_eq!(epoch.keys().generation(), generation);
+        }
     }
 
     /// Leave rotation keeps the namespace: the cursor continues, so no id is

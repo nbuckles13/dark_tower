@@ -26,10 +26,10 @@ pub fn sample_identity_public_key() -> Vec<u8> {
 
 /// The handler id MC test fixtures dial and expect echoed back.
 ///
-/// One value for both halves of the §8 `handler_id` comparison, so a test
-/// asserting `match` cannot pass because two independent literals happened to
-/// agree, and a test asserting `handler_id_mismatch` has to differ from it
-/// deliberately.
+/// One value for both halves of the `handler_id` comparison
+/// (`media_routing::handler_replaced`), so a test asserting a credited reply
+/// cannot pass because two independent literals happened to agree, and a test
+/// asserting `handler_replaced` has to differ from it deliberately.
 pub const TEST_HANDLER_ID: &str = "mh-test-0";
 
 /// The two-party policy for one handler: two participants who hear each

@@ -96,6 +96,12 @@ pub enum SenderBindingOutcome {
     /// cross-participant misattribution inside one user's own identity. Right
     /// half the time, undetectable when wrong.
     UserAmbiguous,
+    /// The binding gate refused the notification before any roster lookup
+    /// (ADR-0039 §6). Answered `0`, and NOTHING recorded. Three causes: the
+    /// handler was never in the meeting's set, it was removed from it, or the
+    /// `connection_id` was empty (REQUIRED). The split is
+    /// `mc_mh_notifications_unapplied_total{reason=handler_not_in_set|connection_id_missing}`.
+    Refused,
 }
 
 impl SenderBindingOutcome {
@@ -111,11 +117,12 @@ impl SenderBindingOutcome {
     /// that was given no spelling — which is the prompt to add the variant here
     /// too. The written-out length is a secondary check that `ALL` and `label`
     /// agree, not a proof that `ALL` names every variant.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Resolved,
         Self::MeetingUnknown,
         Self::ParticipantUnknown,
         Self::UserAmbiguous,
+        Self::Refused,
     ];
 
     /// Bounded `outcome` metric-label value.
@@ -133,6 +140,7 @@ impl SenderBindingOutcome {
             Self::MeetingUnknown => "meeting_unknown",
             Self::ParticipantUnknown => "participant_unknown",
             Self::UserAmbiguous => "user_ambiguous",
+            Self::Refused => "refused",
         }
     }
 
@@ -176,7 +184,8 @@ mod tests {
                 SenderBindingOutcome::Resolved
                 | SenderBindingOutcome::MeetingUnknown
                 | SenderBindingOutcome::ParticipantUnknown
-                | SenderBindingOutcome::UserAmbiguous => {}
+                | SenderBindingOutcome::UserAmbiguous
+                | SenderBindingOutcome::Refused => {}
             }
         }
     }

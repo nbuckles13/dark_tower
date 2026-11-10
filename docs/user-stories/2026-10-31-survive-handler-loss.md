@@ -467,7 +467,8 @@ Add:
 - `mc_media_handler_heartbeat_interval_seconds`, buckets around N/3, N/2 and N;
 - `mc_media_handler_applied_sequence_lag`;
 - `mc_media_handler_connected_set_corrections_total`;
-- config gauge `mc_media_handler_heartbeat_deadline_seconds`, from `MC_MH_HEARTBEAT_TIMEOUT_MS`.
+- config gauge `mc_media_handler_heartbeat_deadline_seconds`, from `MC_MH_HEARTBEAT_TIMEOUT_MS`;
+- `mc_media_handler_heartbeat_anomalies_total{reason=connection_ids_over_cap|connection_id_malformed|applied_ahead_of_sent}` (added at MC-B1 Gate 1, observability-approved; expected zero, a WARNING candidate for OBS-ALERTS).
 
 Retire:
 - the `mc_media_generation_divergence` gauge, including its step in the `docs/observability/alerts.md` ladder and in mc-incident-response Scenario 15;

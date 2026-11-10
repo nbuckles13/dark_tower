@@ -26,11 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ::common::observability::testing::MetricAssertion;
-use ::common::secret::SecretBox;
 use bytes::{BufMut, BytesMut};
-use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use mc_service::grpc::MhRegistrationClient;
-use mc_service::media_routing::PolicyGenerations;
 use mc_test_utils::jwt_test::{make_expired_meeting_claims, make_meeting_claims, TestKeypair};
 use prost::Message;
 use proto_gen::dark_tower::signaling::v1::{
@@ -553,17 +550,7 @@ async fn test_join_wrong_signing_key_returns_unauthorized() {
 
 #[tokio::test]
 async fn test_actor_level_join_success() {
-    let master_secret = SecretBox::new(Box::new(vec![0u8; 32]));
-    let metrics = ActorMetrics::new();
-    let controller_metrics = ControllerMetrics::new();
-    let controller = MeetingControllerActorHandle::new(
-        "mc-actor-test".to_string(),
-        metrics,
-        controller_metrics,
-        master_secret,
-        Arc::new(PolicyGenerations::new()),
-        mc_test_utils::kek::kek_lifecycle(),
-    );
+    let controller = test_common::make_controller("mc-actor-test");
 
     controller
         .create_meeting(
@@ -609,17 +596,7 @@ async fn test_actor_level_join_success() {
 
 #[tokio::test]
 async fn test_actor_level_join_meeting_not_found() {
-    let master_secret = SecretBox::new(Box::new(vec![0u8; 32]));
-    let metrics = ActorMetrics::new();
-    let controller_metrics = ControllerMetrics::new();
-    let controller = MeetingControllerActorHandle::new(
-        "mc-actor-test-2".to_string(),
-        metrics,
-        controller_metrics,
-        master_secret,
-        Arc::new(PolicyGenerations::new()),
-        mc_test_utils::kek::kek_lifecycle(),
-    );
+    let controller = test_common::make_controller("mc-actor-test-2");
 
     let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(100);
 
@@ -660,17 +637,7 @@ async fn test_actor_level_join_meeting_not_found() {
 
 #[tokio::test]
 async fn test_actor_level_second_joiner_sees_first_in_roster() {
-    let master_secret = SecretBox::new(Box::new(vec![0u8; 32]));
-    let metrics = ActorMetrics::new();
-    let controller_metrics = ControllerMetrics::new();
-    let controller = MeetingControllerActorHandle::new(
-        "mc-actor-test-3".to_string(),
-        metrics,
-        controller_metrics,
-        master_secret,
-        Arc::new(PolicyGenerations::new()),
-        mc_test_utils::kek::kek_lifecycle(),
-    );
+    let controller = test_common::make_controller("mc-actor-test-3");
 
     controller
         .create_meeting(
@@ -751,17 +718,7 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
 /// catch a present/fallback label-swap.
 #[tokio::test]
 async fn test_join_records_display_name_resolution_outcome_metric() {
-    let master_secret = SecretBox::new(Box::new(vec![0u8; 32]));
-    let metrics = ActorMetrics::new();
-    let controller_metrics = ControllerMetrics::new();
-    let controller = MeetingControllerActorHandle::new(
-        "mc-actor-dn-metric".to_string(),
-        metrics,
-        controller_metrics,
-        master_secret,
-        Arc::new(PolicyGenerations::new()),
-        mc_test_utils::kek::kek_lifecycle(),
-    );
+    let controller = test_common::make_controller("mc-actor-dn-metric");
     controller
         .create_meeting(
             "meeting-dn-metric".to_string(),

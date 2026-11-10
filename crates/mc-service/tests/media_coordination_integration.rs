@@ -16,36 +16,29 @@ mod test_common;
 use std::sync::Arc;
 
 use ::common::observability::testing::MetricAssertion;
-use ::common::secret::SecretBox;
-use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
+use mc_service::actors::MeetingControllerActorHandle;
 use mc_service::grpc::McMediaCoordinationService;
 use mc_service::media_admission::SenderBindingOutcome;
-use mc_service::media_routing::PolicyGenerations;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_server::MediaCoordinationService;
 use proto_gen::dark_tower::internal::v1::{
     NotifyParticipantConnectedRequest, NotifyParticipantDisconnectedRequest,
 };
 use tonic::Request;
 
+const MC_ID: &str = "mc-media-coord-test";
+
 fn make_controller() -> Arc<MeetingControllerActorHandle> {
-    Arc::new(MeetingControllerActorHandle::new(
-        "mc-media-coord-test".to_string(),
-        ActorMetrics::new(),
-        ControllerMetrics::new(),
-        SecretBox::new(Box::new(vec![0u8; 32])),
-        Arc::new(PolicyGenerations::new()),
-        mc_test_utils::kek::kek_lifecycle(),
-    ))
+    Arc::new(test_common::make_controller(MC_ID))
 }
 
 fn make_service() -> McMediaCoordinationService {
-    McMediaCoordinationService::new(make_controller())
+    McMediaCoordinationService::new(make_controller(), test_common::heartbeat_intake(MC_ID))
 }
 
 /// A service sharing one controller with the caller, so the test can seed
 /// meetings and participants the handler will then resolve against.
 fn make_service_with(controller: &Arc<MeetingControllerActorHandle>) -> McMediaCoordinationService {
-    McMediaCoordinationService::new(Arc::clone(controller))
+    McMediaCoordinationService::new(Arc::clone(controller), test_common::heartbeat_intake(MC_ID))
 }
 
 // ---------------------------------------------------------------------------
@@ -562,8 +555,9 @@ async fn one_user_with_two_participants_is_ambiguous_and_fails_closed() {
 
 // ---------------------------------------------------------------------------
 // Connectivity dispositions (story 2 task 20): every way a notification does
-// not become connectivity is counted, the binding is answered independently,
-// and the legacy empty-id path is counted.
+// not become connectivity is counted; the binding gate (ADR-0039 §6) refuses
+// out-of-set handlers and empty connection ids with sender 0 and records
+// nothing.
 // ---------------------------------------------------------------------------
 
 fn request_on(
@@ -595,11 +589,13 @@ fn disconnect_on(
     })
 }
 
-/// S1a / S4 pin (b): an MH-asserted `handler_id` outside the meeting's frozen
-/// set is never recorded as connectivity and is counted — while the sender
-/// binding is still answered, so MH's binding contract is unchanged.
+/// The BINDING GATE (ADR-0039 §6, S1a/S4): an MH-asserted `handler_id`
+/// outside the meeting's set is answered `sender_id` 0 and NOTHING is
+/// recorded — counted on BOTH the binding outcome (`refused`) and the
+/// unapplied reason (`handler_not_in_set`). Positive arm: the in-set handler
+/// binds and is recorded.
 #[tokio::test(flavor = "current_thread")]
-async fn an_out_of_set_handler_answers_the_binding_but_records_no_connectivity() {
+async fn an_out_of_set_handler_is_refused_by_the_binding_gate() {
     let controller = make_controller();
     let allocated = seed_participant(&controller, "meeting-oos", "part-oos").await;
     let svc = make_service_with(&controller);
@@ -615,7 +611,10 @@ async fn an_out_of_set_handler_answers_the_binding_but_records_no_connectivity()
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(response.sender_id, allocated, "binding answered regardless");
+        assert_eq!(
+            response.sender_id, 0,
+            "the gate answers 0 for {near_miss:?}"
+        );
     }
     snap.counter("mc_mh_notifications_unapplied_total")
         .with_labels(&[
@@ -623,6 +622,39 @@ async fn an_out_of_set_handler_answers_the_binding_but_records_no_connectivity()
             ("key_custody", "operator"),
         ])
         .assert_delta(3);
+    snap.counter("mc_media_sender_binding_responses_total")
+        .with_labels(&[
+            ("outcome", SenderBindingOutcome::Refused.label()),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(3);
+    let meeting = controller
+        .get_meeting_handle("meeting-oos".to_string())
+        .await
+        .unwrap();
+    for near_miss in ["mh-not-registered", "MH-TEST-1", "mh-test-1 "] {
+        let probe = meeting.probe_handler_for_test(near_miss).await.unwrap();
+        assert!(probe.bindings.is_empty(), "the ledger is unchanged");
+        assert!(probe.connectivity.is_empty());
+    }
+
+    // Positive arm: the in-set handler binds and is recorded.
+    let response = svc
+        .notify_participant_connected(request_on(
+            "meeting-oos",
+            &token_sub_for("part-oos"),
+            STANDALONE_HANDLER,
+            "conn-in",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.sender_id, allocated);
+    let probe = meeting
+        .probe_handler_for_test(STANDALONE_HANDLER)
+        .await
+        .unwrap();
+    assert_eq!(probe.bindings, vec!["conn-in".to_string()]);
     controller.cancel();
 }
 
@@ -669,35 +701,85 @@ async fn a_disconnect_for_an_unheld_key_is_a_counted_no_op() {
     controller.cancel();
 }
 
-/// S11: the legacy empty-id path is accepted and counted, on both events.
+/// `connection_id` is REQUIRED (ADR-0039 §6; replaces the deleted legacy
+/// test): empty is refused on both events — sender 0, nothing recorded, counted
+/// as `connection_id_missing` (and `refused` on the binding). Positive arm: a
+/// non-empty id binds.
 #[tokio::test(flavor = "current_thread")]
-async fn an_empty_connection_id_is_counted_as_legacy() {
+async fn an_empty_connection_id_is_refused_on_both_events() {
     let controller = make_controller();
-    seed_participant(&controller, "meeting-legacy", "part-legacy").await;
+    let allocated = seed_participant(&controller, "meeting-empty-id", "part-empty-id").await;
     let svc = make_service_with(&controller);
-    let snap = MetricAssertion::snapshot();
-    let sub = token_sub_for("part-legacy");
-    svc.notify_participant_connected(request_on("meeting-legacy", &sub, STANDALONE_HANDLER, ""))
+    let sub = token_sub_for("part-empty-id");
+    // A live binding the empty-id Disconnected must NOT touch (paired-test F2:
+    // under legacy set semantics it would have cleared it).
+    let bound = svc
+        .notify_participant_connected(request_on(
+            "meeting-empty-id",
+            &sub,
+            STANDALONE_HANDLER,
+            "c0",
+        ))
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner();
+    assert_eq!(bound.sender_id, allocated);
+    let snap = MetricAssertion::snapshot();
+    let response = svc
+        .notify_participant_connected(request_on("meeting-empty-id", &sub, STANDALONE_HANDLER, ""))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.sender_id, 0);
     svc.notify_participant_disconnected(disconnect_on(
-        "meeting-legacy",
+        "meeting-empty-id",
         &sub,
         STANDALONE_HANDLER,
         "",
     ))
     .await
     .unwrap();
-    snap.counter("mc_mh_notifications_without_connection_id_total")
-        .with_labels(&[("key_custody", "operator")])
-        .assert_delta(2);
-    // The legacy disconnect cleared the legacy key: not an unknown connection.
     snap.counter("mc_mh_notifications_unapplied_total")
         .with_labels(&[
-            ("reason", "unknown_connection"),
+            ("reason", "connection_id_missing"),
             ("key_custody", "operator"),
         ])
-        .assert_delta(0);
+        .assert_delta(2);
+    snap.counter("mc_media_sender_binding_responses_total")
+        .with_labels(&[
+            ("outcome", SenderBindingOutcome::Refused.label()),
+            ("key_custody", "operator"),
+        ])
+        .assert_delta(1);
+    let meeting = controller
+        .get_meeting_handle("meeting-empty-id".to_string())
+        .await
+        .unwrap();
+    let probe = meeting
+        .probe_handler_for_test(STANDALONE_HANDLER)
+        .await
+        .unwrap();
+    assert_eq!(
+        probe.bindings,
+        vec!["c0".to_string()],
+        "nothing recorded, nothing released"
+    );
+    assert_eq!(probe.connectivity.len(), 1, "c0 still live");
+
+    let response = svc
+        .notify_participant_connected(request_on(
+            "meeting-empty-id",
+            &sub,
+            STANDALONE_HANDLER,
+            "c1",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.sender_id, allocated,
+        "positive arm: a non-empty id binds"
+    );
     controller.cancel();
 }
 

@@ -8,12 +8,10 @@
 //
 //! Component tests for the ADR-0036 §8 policy push and its confirm.
 //!
-//! The subject is the pair of media-path metrics MC emits on **every** push
-//! outcome:
-//!
-//! * `mc_media_policy_pushes_total{outcome, key_custody}`
-//! * `mc_media_generation_divergence{key_custody}`
-//!
+//! The subject is the media-path metric MC emits on **every** classified push
+//! outcome, `mc_media_policy_pushes_total{outcome, key_custody}` (the
+//! `mc_media_generation_divergence` gauge was retired in story 4 MC-B1; live
+//! lag is `mc_media_handler_applied_sequence_lag`, observed per heartbeat),
 //! and the fail-loud behaviour they accompany. A real `MhClient` dials a real
 //! `mc_test_utils::MediaHandlerStub` over a real gRPC channel, so what is under
 //! test is the wire round trip and the classification of the reply — not a
@@ -21,8 +19,8 @@
 //! exhaustive per-outcome coverage is a unit concern and lives in
 //! `src/media_routing/confirm.rs`.
 //!
-//! **`key_custody=operator` is asserted on the metrics, not just in logs**
-//! (ADR-0036 §4, §11), and **no meeting identifier appears on either series** —
+//! **`key_custody=operator` is asserted on the metric, not just in logs**
+//! (ADR-0036 §4, §11), and **no meeting identifier appears on the series** —
 //! `MetricAssertion` matches on the full label set, so a stray label would fail
 //! these assertions rather than pass unnoticed.
 
@@ -71,6 +69,7 @@ async fn push_with(
             mc_grpc_endpoint: "http://mc-test:50052",
             assignment: &assignment,
             policy_generation: NonZeroU64::new(generation).unwrap(),
+            heartbeat_interval_ms: 2_000,
             restart_floor_adoptable,
         })
         .await
@@ -95,7 +94,7 @@ fn assert_only_outcome(snap: &MetricSnapshot, expected: PolicyPushOutcome) {
 
 /// The task's named integration case: **inject an apply failure at the mocked
 /// handler and assert the echoed applied generation does not advance and the
-/// divergence gauge goes non-zero.**
+/// push is counted as a mismatch.**
 ///
 /// The stub stalls at generation 3 — it received 7 and could not install it, so
 /// it correctly keeps reporting the generation its live forward path still
@@ -103,7 +102,7 @@ fn assert_only_outcome(snap: &MetricSnapshot, expected: PolicyPushOutcome) {
 /// made observable: a handler echoing the *received* value would report 7 and
 /// this test would go green on a blackhole.
 #[tokio::test(flavor = "current_thread")]
-async fn injected_apply_failure_does_not_advance_the_echo_and_drives_the_gauge() {
+async fn injected_apply_failure_does_not_advance_the_echo_and_is_counted() {
     const STALLED_AT: u64 = 3;
     const SENT: u64 = 7;
 
@@ -134,21 +133,13 @@ async fn injected_apply_failure_does_not_advance_the_echo_and_drives_the_gauge()
     );
 
     assert_only_outcome(&snap, PolicyPushOutcome::GenerationMismatch);
-
-    // Non-zero, and specifically the MAGNITUDE |sent - applied| = 4.
-    snap.gauge("mc_media_generation_divergence")
-        .with_labels(&[KEY_CUSTODY])
-        .assert_value((SENT - STALLED_AT) as f64);
 }
 
-/// The arm a suite written only against the too-low case never reaches, and the
-/// one a naive `sent - applied` underflows on: MH holds a HIGHER generation than
-/// MC sent (an MC restart re-deriving from 1, or the `u64::MAX` ratchet wedge).
-///
-/// `saturating_sub` would report **0** here — a healthy-looking gauge on the one
-/// response shape that proves MC and MH disagree about which policy is live.
+/// The arm a suite written only against the too-low case never reaches: MH
+/// holds a HIGHER generation than MC sent (an MC restart re-deriving from 1, or
+/// the `u64::MAX` ratchet wedge). It is a mismatch, never a match.
 #[tokio::test(flavor = "current_thread")]
-async fn applied_above_sent_reports_a_positive_magnitude_not_zero_and_not_a_wrap() {
+async fn applied_above_sent_is_a_mismatch() {
     const STALLED_AT: u64 = 9;
     const SENT: u64 = 1;
 
@@ -164,9 +155,6 @@ async fn applied_above_sent_reports_a_positive_magnitude_not_zero_and_not_a_wrap
     assert!(result.is_err(), "got {result:?}");
 
     assert_only_outcome(&snap, PolicyPushOutcome::GenerationMismatch);
-    snap.gauge("mc_media_generation_divergence")
-        .with_labels(&[KEY_CUSTODY])
-        .assert_value((STALLED_AT - SENT) as f64);
 }
 
 /// The MC-restart floor: on the FIRST confirm of a (meeting, handler), a higher
@@ -232,7 +220,7 @@ async fn a_lower_echo_on_first_confirm_is_still_a_recorded_mismatch() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "current_thread")]
-async fn confirmed_push_reports_match_and_a_zero_gauge() {
+async fn confirmed_push_reports_match() {
     let stub = MediaHandlerStub::builder()
         .programs_successfully(TEST_HANDLER_ID)
         .spawn()
@@ -243,9 +231,6 @@ async fn confirmed_push_reports_match_and_a_zero_gauge() {
     assert!(result.is_ok(), "expected Ok, got {result:?}");
 
     assert_only_outcome(&snap, PolicyPushOutcome::Match);
-    snap.gauge("mc_media_generation_divergence")
-        .with_labels(&[KEY_CUSTODY])
-        .assert_value(0.0);
 }
 
 /// `accepted == true` is not success (ADR-0036 §8). A handler that parsed the
@@ -274,9 +259,6 @@ async fn accepted_but_nothing_installed_is_no_applied_generation() {
     );
 
     assert_only_outcome(&snap, PolicyPushOutcome::NoAppliedGeneration);
-    snap.gauge("mc_media_generation_divergence")
-        .with_labels(&[KEY_CUSTODY])
-        .assert_value(2.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -309,25 +291,16 @@ async fn unspecified_transport_echo_is_a_mismatch_over_the_wire() {
     );
 
     assert_only_outcome(&snap, PolicyPushOutcome::TransportModeMismatch);
-    // The generation matched, so the magnitude is 0 even though the push
-    // failed — which is exactly why the COUNTER is the detection signal and
-    // the gauge is only the magnitude a responder reads next.
-    snap.gauge("mc_media_generation_divergence")
-        .with_labels(&[KEY_CUSTODY])
-        .assert_value(0.0);
 }
 
 /// The `handler_id` twin of the case above: proto3 decodes an absent string to
-/// `""`, so the comparison must be unconditional there too.
-///
-/// It is also the OPS-18 decision end to end: the outcome is observed on the
-/// counter, and the call still returns **`Ok`** — an ordinary MH pod restart
-/// changes the per-incarnation `handler_id`, and failing the push would kick
-/// every meeting whose assignment predates the restart. Reaching this outcome
-/// at all proves the meeting IS programmed, because the demoted precedence puts
-/// it below both generation and transport.
+/// `""`, so the comparison is unconditional there too. Since story 4 MC-B1
+/// (ADR-0039 §7) a reply from any other incarnation — empty id included — is
+/// `HandlerReplaced`: the registration FAILS for the dialed handler and the
+/// reply is never classified (no outcome sample, no credit), even though its
+/// generation and echo are perfect.
 #[tokio::test(flavor = "current_thread")]
-async fn empty_handler_id_echo_is_observed_but_non_fatal() {
+async fn empty_handler_id_echo_is_handler_replaced_and_unclassified() {
     let stub = MediaHandlerStub::builder()
         .applied_generation(AppliedGenerationBehaviour::EchoSent)
         .handler_id("")
@@ -338,19 +311,21 @@ async fn empty_handler_id_echo_is_observed_but_non_fatal() {
     let snap = MetricAssertion::snapshot();
     let result = push(&stub, "meeting-empty-handler-id", 6).await;
     assert!(
-        result.is_ok(),
-        "handler_id_mismatch is non-fatal for the interim (2026-09-02-mh-stable-handler-id); \
-         got {result:?}"
+        matches!(result, Err(McError::HandlerReplaced)),
+        "got {result:?}"
     );
-
-    assert_only_outcome(&snap, PolicyPushOutcome::HandlerIdMismatch);
+    for outcome in PolicyPushOutcome::ALL {
+        snap.counter("mc_media_policy_pushes_total")
+            .with_labels(&[("outcome", outcome.label()), KEY_CUSTODY])
+            .assert_delta(0);
+    }
 }
 
-/// A restarted handler asserting a different per-incarnation id, with the policy
-/// genuinely applied. Same posture as the empty-string case, driven by the input
-/// that actually occurs in production.
+/// A restarted handler (a later incarnation at the reused address) asserting a
+/// different per-incarnation id, with the policy genuinely applied: the input
+/// that actually occurs in production. Same posture as the empty-string case.
 #[tokio::test(flavor = "current_thread")]
-async fn restarted_handler_id_is_observed_but_non_fatal() {
+async fn restarted_handler_id_is_handler_replaced_and_unclassified() {
     let stub = MediaHandlerStub::builder()
         .applied_generation(AppliedGenerationBehaviour::EchoSent)
         .handler_id("mh-test-0-a1b2c3d4")
@@ -360,12 +335,15 @@ async fn restarted_handler_id_is_observed_but_non_fatal() {
 
     let snap = MetricAssertion::snapshot();
     let result = push(&stub, "meeting-restarted-handler", 8).await;
-    assert!(result.is_ok(), "got {result:?}");
-
-    assert_only_outcome(&snap, PolicyPushOutcome::HandlerIdMismatch);
-    snap.gauge("mc_media_generation_divergence")
-        .with_labels(&[KEY_CUSTODY])
-        .assert_value(0.0);
+    assert!(
+        matches!(result, Err(McError::HandlerReplaced)),
+        "got {result:?}"
+    );
+    for outcome in PolicyPushOutcome::ALL {
+        snap.counter("mc_media_policy_pushes_total")
+            .with_labels(&[("outcome", outcome.label()), KEY_CUSTODY])
+            .assert_delta(0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +449,7 @@ async fn an_empty_snapshot_at_a_non_zero_generation_confirms_match() {
             mc_grpc_endpoint: "http://mc:50052",
             assignment: &empty,
             policy_generation: NonZeroU64::new(3).unwrap(),
+            heartbeat_interval_ms: 2_000,
             restart_floor_adoptable: false,
         })
         .await;

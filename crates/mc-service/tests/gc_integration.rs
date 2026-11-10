@@ -13,14 +13,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
+use mc_service::actors::ControllerMetrics;
 use mc_service::config::Config;
 use mc_service::errors::McError;
 use mc_service::grpc::GcClient;
-use mc_service::media_routing::PolicyGenerations;
 use mc_test_utils::test_token_receiver;
 
-use common::secret::{SecretBox, SecretString};
+use common::secret::SecretString;
 use proto_gen::dark_tower::internal::v1::global_controller_service_server::{
     GlobalControllerService, GlobalControllerServiceServer,
 };
@@ -325,6 +324,7 @@ fn test_config(gc_url: &str) -> Config {
         environment: "development".to_string(),
         receive_slot_caps: media.receive_slot_caps,
         media_connect_settle_ms: 1500,
+        mh_heartbeat_timeout_ms: 6000,
         kek_rotation_debounce_seconds: 60,
         max_receive_capability_declarations: media.max_receive_capability_declarations,
         audio_encoding: media.audio_encoding,
@@ -614,17 +614,7 @@ async fn test_controller_metrics_concurrent_updates() {
 
 #[tokio::test]
 async fn test_actor_handle_creation() {
-    let actor_metrics = ActorMetrics::new();
-    let controller_metrics = ControllerMetrics::new();
-    let master_secret = SecretBox::new(Box::new(vec![0u8; 32]));
-    let _controller_handle = Arc::new(MeetingControllerActorHandle::new(
-        "mc-test".to_string(),
-        Arc::clone(&actor_metrics),
-        Arc::clone(&controller_metrics),
-        master_secret,
-        Arc::new(PolicyGenerations::new()),
-        mc_test_utils::kek::kek_lifecycle(),
-    ));
+    let _controller_handle = Arc::new(test_common::make_controller("mc-test"));
 
     // Controller should be created without error
     // Actual operation tests are in unit tests

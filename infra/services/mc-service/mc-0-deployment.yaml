@@ -309,6 +309,15 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: MC_MEDIA_CONNECT_SETTLE_MS
+        # ADR-0039 §1 heartbeat timeout N (story 4 MC-B1). Required by MC with
+        # no Rust default, deliberately NOT `optional:`: missing or out of
+        # (0, 30000] refuses boot. Keep in lockstep with the other
+        # mc-N-deployment.yaml. See the key's comment in config.env.
+        - name: MC_MH_HEARTBEAT_TIMEOUT_MS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_MH_HEARTBEAT_TIMEOUT_MS
         # ---- Capacity caps (R-37; story 4 MC-A) ----
         # Required by MC with no Rust default, deliberately NOT `optional:`:
         # missing, unparseable or 0 refuses boot. Keep in lockstep with the

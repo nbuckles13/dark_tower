@@ -19,8 +19,9 @@ use proto_gen::dark_tower::internal::v1::media_coordination_service_server::{
     MediaCoordinationService, MediaCoordinationServiceServer,
 };
 use proto_gen::dark_tower::internal::v1::{
-    NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
-    NotifyParticipantDisconnectedRequest, NotifyParticipantDisconnectedResponse,
+    MeetingHeartbeatRequest, MeetingHeartbeatResponse, NotifyParticipantConnectedRequest,
+    NotifyParticipantConnectedResponse, NotifyParticipantDisconnectedRequest,
+    NotifyParticipantDisconnectedResponse,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -219,6 +220,16 @@ impl MediaCoordinationService for MockMcServer {
         Ok(Response::new(NotifyParticipantDisconnectedResponse {
             acknowledged: true,
         }))
+    }
+
+    /// Not served by this mock (MH sends no heartbeat until MH-2). Tonic server
+    /// traits have no default methods, so the rpc needs an impl; UNIMPLEMENTED
+    /// is the honest pre-MH-2 answer (`internal.proto` ORDERING note).
+    async fn meeting_heartbeat(
+        &self,
+        _request: Request<MeetingHeartbeatRequest>,
+    ) -> Result<Response<MeetingHeartbeatResponse>, Status> {
+        Err(Status::unimplemented("MeetingHeartbeat is not mocked"))
     }
 }
 

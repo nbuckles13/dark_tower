@@ -40,7 +40,7 @@ pub mod session;
 
 // Re-export primary types
 pub use controller::{MeetingControllerActor, MeetingControllerActorHandle};
-pub use meeting::{MeetingActor, MeetingActorHandle};
+pub use meeting::{HeartbeatRouteError, MeetingActor, MeetingActorHandle};
 #[cfg(feature = "test-seams")]
 pub use meeting_media::MeetingSeams;
 pub use meeting_media::{JoinMedia, MediaRoutingDeps, SLOT_VIEW_FLUSH_BATCH};

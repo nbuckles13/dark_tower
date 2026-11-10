@@ -78,11 +78,11 @@ struct Programmed {
 ///
 /// # Why this shape
 ///
-/// This is exactly the state a re-assert cadence needs (ADR-0036 §8's
-/// deferred half): a cadence task walks this map and re-pushes each entry at
-/// its existing generation, which MH treats as an idempotent no-op. Building
-/// the one-shot push against a *registry* rather than against a join event is
-/// what makes that later story purely additive.
+/// Keyed per (meeting, handler) so an identical recomputation keeps its number
+/// (MH treats an equal generation as a no-op) and so the heartbeat intake can
+/// read the generation MC last SENT a handler ([`Self::current`]) to measure
+/// applied-sequence lag (ADR-0039 §1). There is no re-assert cadence walking
+/// it (ADR-0039 supersedes ADR-0036 §8's).
 ///
 /// `tokio::sync::RwLock`, matching `redis/client.rs` — the in-tree idiom for a shared map read on an async
 /// path. A `std::sync::Mutex` would need poison handling that cannot use
@@ -108,7 +108,7 @@ impl PolicyGenerations {
     ///   `policy_generation: 1`-with-empty-policy workaround `internal.proto`
     ///   warns against.
     /// - Structurally identical to what was last pushed -> the **same** number,
-    ///   so a re-assert is MH's no-op (§8).
+    ///   so an identical re-push is MH's no-op.
     /// - Different -> previous + 1.
     ///
     /// Independent per (meeting, handler): two handlers of one meeting advance

@@ -212,12 +212,13 @@ pub enum MeetingMessage {
         /// The MH-asserted handler id; resolved by exact match against the
         /// meeting's handler set, never trusted as a string.
         handler_id: String,
-        /// MH's opaque per-session connection id (empty = legacy MH).
+        /// MH's opaque per-session connection id (REQUIRED: empty is refused).
         connection_id: String,
         /// The binding answer and, separately, why connectivity was not
-        /// recorded (if it was not). The binding is answered even when
-        /// connectivity is not (e.g. `handler_not_in_set`), so MH's binding
-        /// contract is unchanged.
+        /// recorded (if it was not). The binding gate runs FIRST: an
+        /// out-of-set or removed handler gets [`SenderLookup::Refused`] and
+        /// nothing is recorded (ADR-0039 §6). (An empty `connection_id` never
+        /// arrives: the gRPC boundary refuses it.)
         respond_to: oneshot::Sender<(SenderLookup, Option<crate::media_routing::Unapplied>)>,
     },
 
@@ -229,7 +230,7 @@ pub enum MeetingMessage {
         user_id: String,
         /// The MH-asserted handler id (exact-match resolved).
         handler_id: String,
-        /// MH's opaque per-session connection id (empty = legacy MH).
+        /// MH's opaque per-session connection id (REQUIRED: empty is a no-op).
         connection_id: String,
         /// `None` if applied, else why not.
         respond_to: oneshot::Sender<Option<crate::media_routing::Unapplied>>,
@@ -321,6 +322,67 @@ pub enum MeetingMessage {
     /// STRUCTURALLY. Responds `true` iff a rotation was pending and performed.
     #[cfg(feature = "test-seams")]
     ForceKekRotation { respond_to: oneshot::Sender<bool> },
+
+    /// One per-(meeting, handler) heartbeat, routed here by the controller
+    /// (ADR-0039 §2). The actor answers the verdict from its own state and,
+    /// only on OWNED, records liveness and runs the remove-only reconcile.
+    MediaHandlerHeartbeat {
+        /// The validated heartbeat.
+        heartbeat: crate::media_routing::HandlerHeartbeat,
+        /// Stamped at gRPC ARRIVAL, so mailbox delay cannot age the entry.
+        receipt: tokio::time::Instant,
+        /// The verdict.
+        respond_to: oneshot::Sender<crate::media_routing::HeartbeatVerdict>,
+    },
+
+    /// Remove a handler from the meeting's set through the actor's ONE
+    /// removal helper (set-only: MC-B2 owns the full removal sequence).
+    /// **Test builds only.** Responds whether the handler was a member.
+    #[cfg(feature = "test-seams")]
+    RemoveHandlerForTest {
+        /// The handler to remove.
+        handler_id: String,
+        /// Why (the RELEASED verdict's cause).
+        trigger: crate::media_routing::RemovalTrigger,
+        /// Was it a member?
+        respond_to: oneshot::Sender<bool>,
+    },
+
+    /// Park the actor until `release` resolves (or is dropped), so a test can
+    /// fill its mailbox deterministically. **Test builds only.**
+    #[cfg(feature = "test-seams")]
+    ParkForTest {
+        /// Signalled once the actor is parked.
+        parked: oneshot::Sender<()>,
+        /// The actor resumes when this resolves.
+        release: oneshot::Receiver<()>,
+    },
+
+    /// Read one handler's heartbeat-related state. **Test builds only.**
+    #[cfg(feature = "test-seams")]
+    ProbeHandlerForTest {
+        /// The handler.
+        handler_id: String,
+        /// Its state.
+        respond_to: oneshot::Sender<HandlerProbe>,
+    },
+}
+
+/// One handler's heartbeat-related state, as a test reads it. **Test builds
+/// only.**
+#[cfg(feature = "test-seams")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlerProbe {
+    /// Whether a non-OWNED verdict for this handler was already WARNed (the
+    /// once-per-(meeting, handler) dedupe).
+    pub release_noticed: bool,
+    /// The liveness record, if the handler is in the set and has heartbeated.
+    pub liveness: Option<crate::media_routing::HandlerLiveness>,
+    /// Connection ids the binding ledger holds for this handler (sorted).
+    pub bindings: Vec<String>,
+    /// `(participant_id, connection_id)` live connectivity keys on this
+    /// handler (sorted).
+    pub connectivity: Vec<(String, String)>,
 }
 
 /// Messages sent to `ParticipantActor`.
@@ -484,6 +546,15 @@ pub enum SenderLookup {
     /// MC joins. The remedy has one home: `docs/TODO.md` §Media Path
     /// Obligations, "`user_ambiguous` has no operator remedy".
     Ambiguous,
+
+    /// The binding gate refused the notification BEFORE any roster lookup
+    /// (ADR-0039 §6): the caller answers `0` and NOTHING was recorded. Two
+    /// causes, both `Unapplied::HandlerNotInSet`: the handler was never in the
+    /// meeting's set, or it was removed from it. (The third wire refusal, an
+    /// empty `connection_id`, is decided at the gRPC boundary and never
+    /// produces a `SenderLookup`; it is `SenderBindingOutcome::Refused` with
+    /// `connection_id_missing`.)
+    Refused,
 }
 
 /// Result of a successful join.

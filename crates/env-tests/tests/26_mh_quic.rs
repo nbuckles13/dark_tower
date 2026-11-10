@@ -954,7 +954,7 @@ async fn test_mc_trace_continuity_end_to_end() {
 /// the query.
 ///
 /// `outcome_selector` is spliced in as a full label matcher (e.g.
-/// `outcome="match"` or `outcome!~"match|handler_id_mismatch"`) rather than a
+/// `outcome="match"` or `outcome!="match"`) rather than a
 /// bare value, because the positive and negative halves of this test need
 /// different matcher OPERATORS over one metric.
 fn policy_push_promql(outcome_selector: &str) -> String {
@@ -1032,12 +1032,9 @@ async fn wait_for_policy_push_counter_stable(prom: &PrometheusClient) -> Instanc
 /// `outcome="match"` is reachable **only** when the handler echoed an
 /// `applied_generation` equal to what MC sent, with the transport mode agreeing
 /// — so a delta >= 1 on that series cannot be produced by an unprogrammed
-/// handler, which makes it non-vacuous. `mc_media_generation_divergence` is
-/// deliberately NOT asserted here: a gauge that has materialised no series makes
-/// absent-versus-zero ambiguous, and an instant read can be masked by an
-/// intervening scrape — a vacuous pass or a flake. Its assertion lives in
-/// `crates/mc-service/tests/media_policy_push_integration.rs`, where
-/// `MetricAssertion` gives deterministic absent-versus-zero.
+/// handler, which makes it non-vacuous. (The pod-level divergence gauge was
+/// retired in story 4 MC-B1; per-(meeting, handler) lag is
+/// `mc_media_handler_applied_sequence_lag`, observed per heartbeat.)
 ///
 /// # Why the negative guard uses the negated increase-predicate
 ///
@@ -1047,25 +1044,11 @@ async fn wait_for_policy_push_counter_stable(prom: &PrometheusClient) -> Instanc
 /// false FAIL; the negated increase-predicate tolerates disappearing series by
 /// construction, and an absent series correctly reads as an empty map, i.e. 0.
 ///
-/// `handler_id_mismatch` is NOT excluded from the negative guard here, unlike in
-/// the post-deploy checklist and the alert rule: this test drives a *fresh* join
-/// against a handler MC has just been assigned, so the ids agree and the outcome
-/// must not occur.
-///
-/// **Why they agree here, when OPS-17 says `handler_id` is per-incarnation.**
-/// Both are true and they are not in tension. The id MC compares against is
-/// captured into its Redis snapshot at assignment time, from the same MH
-/// incarnation that answers this push — no restart intervenes inside a single
-/// controlled join, so expected == echoed by construction. OPS-17's staleness
-/// bites only *post-restart*, when a frozen snapshot is compared against a new
-/// incarnation's fresh id. Fresh-join-agrees and post-restart-diverges are
-/// different situations. **Do not "align" this guard with the operational
-/// `outcome!~"match|handler_id_mismatch"` expression** — that exclusion exists
-/// for the rollout window, which this test does not exercise, and adopting it
-/// here would make the test tolerate an outcome that would be a genuine fault
-/// (an MH crashloop mid-test). If it does, something is genuinely wrong with this path — the
-/// rollout-window reasoning that justifies excluding it operationally does not
-/// apply to a single controlled join.
+/// The negative guard reads every non-`match` outcome, exactly as the alert
+/// rule does (`outcome!="match"`). A reply from another handler incarnation is
+/// never classified into this vocabulary (it is
+/// `mc_register_meeting_total{status="handler_replaced"}`, story 4 MC-B1), so
+/// nothing benign is excluded from either.
 ///
 /// On-call: if this fails with `no_applied_generation`, MH received the policy
 /// and installed nothing — check MH's `mh_media_policy_applies_total{outcome}`

@@ -82,24 +82,18 @@ groups:
       # MCMediaGenerationDivergence - ADR-0036 §8's partial blackhole
       # ====================================================================
       #
-      # WHY THIS FIRES ON THE COUNTER AND NOT ON THE GAUGE. There is a gauge,
-      # `mc_media_generation_divergence`, and it is the obvious thing to page
-      # on. Its own catalog entry (docs/observability/metrics/mc-service.md)
-      # says NEVER PAGE ON IT, for two independent reasons: it is
-      # last-write-wins at POD level, so a healthy push for an unrelated
-      # meeting erases a diverged reading; and it is written once per
-      # registration push, which is coarse relative to the scrape interval, so
-      # a real divergence can be overwritten before it is ever scraped. The
-      # gauge is the MAGNITUDE a responder reads next -- it belongs in the
-      # runbook ladder, not in an expr. A reading of 0 there is not evidence
-      # that nothing diverged.
+      # WHY THIS FIRES ON THE COUNTER. Each sample is one push reply MC could
+      # not confirm. (The pod-level last-write-wins divergence gauge was
+      # retired in story 4 MC-B1; the per-(meeting, handler) magnitude is now
+      # mc_media_handler_applied_sequence_lag, observed on every heartbeat --
+      # a runbook-ladder read, never this expr.)
       #
-      # THE SELECTOR IS NEGATED (`outcome!~`), NOT POSITIVE, AND THAT IS THE
-      # WHOLE DESIGN. It reads "everything that is not a confirmed match and
-      # not the known-noisy diagnostic", never "these two named failures".
+      # THE SELECTOR IS NEGATED (`outcome!=`), NOT POSITIVE, AND THAT IS THE
+      # WHOLE DESIGN. It reads "everything that is not a confirmed match",
+      # never "these named failures".
       #
       # WHY NEGATED -- THE DECISIVE REASON IS VOCABULARY GROWTH.
-      # `PolicyPushOutcome::ALL` is compile-checked in Rust, so a sixth outcome
+      # `PolicyPushOutcome::ALL` is compile-checked in Rust, so a fifth outcome
       # is a compile error there -- but THAT COMPILE ERROR DOES NOT REACH
       # PROMQL. Under the negated form a new outcome is covered automatically:
       # it pages, someone investigates, and the classification gets made
@@ -110,23 +104,18 @@ groups:
       #
       # An earlier draft of this rule shipped the positive form and was caught
       # at review. Do not "simplify" it back: the two forms differ only when a
-      # sixth value exists, which is exactly when it matters.
+      # fifth value exists, which is exactly when it matters.
       #
-      # THE ONE EXCLUSION BEYOND `match` IS LOAD-BEARING, NOT TIDYING.
-      # `handler_id_mismatch` is excluded because MH_HANDLER_ID is
-      # per-incarnation today (MH derives it from HOSTNAME plus a fresh UUID at
-      # process start, and MH_HANDLER_ID is unset in all three manifests), so an
-      # ordinary MH pod restart produces that outcome BY CONSTRUCTION. A bare
-      # `outcome != "match"` rule would page on every MH rollout, and a page
-      # that cries wolf stops being read -- including for the real
-      # `no_applied_generation` it exists to catch.
-      #   REVERT TRIGGER: `2026-09-02-mh-stable-handler-id`. When the handler id
-      #   becomes stable per deployment, REMOVE THE EXCLUSION IN ALL THREE
-      #   PLACES TOGETHER. THIS EXPRESSION IS HELD AT THREE SITES -- here,
-      #   `docs/observability/metrics/mc-service.md`'s catalog entry, and
-      #   `docs/runbooks/mc-deployment.md`'s post-deploy checklist. One decision,
-      #   one trigger; whoever stabilises the handler id must find all three, and
-      #   the other two assert that this site holds the same string.
+      # NO EXCLUSION BEYOND `match` (story 4 MC-B1, ADR-0039 §7). A reply from a
+      # different handler incarnation -- what an ordinary in-place MH restart
+      # produces -- is never classified into this outcome set: it fails the
+      # registration for the dialed handler and is counted on
+      # mc_register_meeting_total{status="handler_replaced"}. So the retired
+      # `handler_id_mismatch` carve-out is gone from this expr, the catalog
+      # entry and mc-deployment.md's checklist together. ROLLBACK HAZARD: an MC
+      # image older than MC-B1 still emits `handler_id_mismatch` on every MH
+      # restart, and under this negated selector it PAGES -- roll this rule
+      # back with the image (mc-deployment.md "How to Rollback").
       #
       # `transport_mode_mismatch` IS COVERED, and this is a change from an
       # earlier draft. It is a different FAILURE from generation divergence --
@@ -162,10 +151,9 @@ groups:
       #
       # `for: 0m` WITH A 15m increase() WINDOW: the occurrence IS the signal.
       # Since story 2 any structural change re-pushes, so a meeting WITH churn
-      # may clear by itself -- but there is still no periodic re-assert
-      # (story 4), so a QUIESCENT diverged meeting stays blackholed until
-      # something changes, and a `for:` delay would only add media-dark time
-      # for exactly the meetings nobody is touching. The one EXPECTED
+      # may clear by itself, while a QUIESCENT diverged meeting stays
+      # blackholed until something changes, and a `for:` delay would only add
+      # media-dark time for exactly the meetings nobody is touching. The one EXPECTED
       # non-match, an MC restart under a live meeting (the handler still holds
       # the pre-restart MC's generation), never reaches this counter: it is
       # recorded on mc_media_policy_generation_adoptions_total INSTEAD, at one
@@ -176,7 +164,7 @@ groups:
       # increase() WINDOW or the rule is unsatisfiable by construction.
       - alert: MCMediaGenerationDivergence
         expr: |
-          sum(increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[15m])) > 0
+          sum(increase(mc_media_policy_pushes_total{outcome!="match"}[15m])) > 0
         for: 0m
         labels:
           severity: page
@@ -184,7 +172,7 @@ groups:
           component: media-control-plane
         annotations:
           summary: "MC and MH disagree about the applied media policy generation ({{ $value }} in 15m)"
-          description: "MC could not confirm its forwarding policy is live on MH. ADR-0036 §8 calls this shape a partial blackhole reporting healthy: MH forwards under stale or absent policy while up, readiness, the gRPC result and the channel all read green. SPLIT ON THE OUTCOME LABEL FIRST - the values have different first moves. generation_mismatch = MH applied an older generation (its apply path failed); no_applied_generation = MH echoed nothing (an MH build predating the echo, i.e. a rollout skew, or the apply never ran - confirm the image before treating it as an apply failure); transport_mode_mismatch = the separate two-ends-must-agree echo failing, a different remedy, routed from the same runbook; since story 3 it is PER STREAM: a stream MC sent is absent from MH's applied_source_streams, echoed with no transport mode, or echoed with a different mode. The arm and the FIRST mismatching stream are on MC's ERROR line \"MH did not confirm the forwarding policy\" (target mc.grpc.mh_client) as fields echo_arm (absent_from_echo, echoed_unspecified, mode_differs) and echo_stream_number; echo_arm=none with echo_stream_number=-1 are the no-echo-mismatch sentinels, never a stream. Its usual cause is a cutover applied out of the required order (config -> MH -> MC -> SDK) or an MH build that predates per-stream echo; check which component rolled last. SINCE STORY 2, ANY STRUCTURAL CHANGE RE-PUSHES: a join, leave, capability declaration or mute re-publishes to every handler and an unconfirmed push is re-sent, so a meeting with churn often clears on the next roster event - check whether the counter stopped moving before acting, and force a structural change only if the meeting is quiescent (there is still no periodic re-assert; story 4). An MC restart against a live handler is NOT counted here: MC adopts MH's generation as a floor and re-pushes above it, and records that on mc_media_policy_generation_adoptions_total instead - deliberately under no outcome label, so read that counter (and the adoption WARN at mc.register_meeting.trigger) alongside the split. A generation_mismatch with applied > sent that DOES reach this alert is a FAILED adoption or a higher echo after a confirm (e.g. the u64::MAX ratchet wedge) - not rollout noise. The selector is negated, so an outcome added later fires here rather than falling silently outside the alert."
+          description: "MC could not confirm its forwarding policy is live on MH. ADR-0036 §8 calls this shape a partial blackhole reporting healthy: MH forwards under stale or absent policy while up, readiness, the gRPC result and the channel all read green. SPLIT ON THE OUTCOME LABEL FIRST - the values have different first moves. generation_mismatch = MH applied an older generation (its apply path failed); no_applied_generation = MH echoed nothing (an MH build predating the echo, i.e. a rollout skew, or the apply never ran - confirm the image before treating it as an apply failure); transport_mode_mismatch = the separate two-ends-must-agree echo failing, a different remedy, routed from the same runbook; since story 3 it is PER STREAM: a stream MC sent is absent from MH's applied_source_streams, echoed with no transport mode, or echoed with a different mode. The arm and the FIRST mismatching stream are on MC's ERROR line \"MH did not confirm the forwarding policy\" (target mc.grpc.mh_client) as fields echo_arm (absent_from_echo, echoed_unspecified, mode_differs) and echo_stream_number; echo_arm=none with echo_stream_number=-1 are the no-echo-mismatch sentinels, never a stream. Its usual cause is a cutover applied out of the required order (config -> MH -> MC -> SDK) or an MH build that predates per-stream echo; check which component rolled last. SINCE STORY 2, ANY STRUCTURAL CHANGE RE-PUSHES: a join, leave, capability declaration or mute re-publishes to every handler and an unconfirmed push is re-sent, so a meeting with churn often clears on the next roster event - check whether the counter stopped moving before acting, and force a structural change only if the meeting is quiescent. A sustained per-(meeting, handler) lag shows on mc_media_handler_applied_sequence_lag. An MC restart against a live handler is NOT counted here: MC adopts MH's generation as a floor and re-pushes above it, and records that on mc_media_policy_generation_adoptions_total instead - deliberately under no outcome label, so read that counter (and the adoption WARN at mc.register_meeting.trigger) alongside the split. A generation_mismatch with applied > sent that DOES reach this alert is a FAILED adoption or a higher echo after a confirm (e.g. the u64::MAX ratchet wedge) - not rollout noise. The selector is negated, so an outcome added later fires here rather than falling silently outside the alert."
           impact: "Participants in the affected meeting get no audio and/or video while the client stays connected and the UI reads healthy. Blast radius is per (meeting, handler), not fleet-wide. DO NOT RESTART MH as a remedy: it sheds every media session on the pod, recovers none of the already-dark ones, and destroys the evidence."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-15-media-generation-divergence"
 

@@ -740,8 +740,8 @@ message RegisterMeetingRequest {
   repeated SourceStream source_streams = 8;
 
   // The interval at which MH sends `MeetingHeartbeatRequest` for THIS meeting
-  // (ADR-0039 §1). DERIVED BY MC as one third of its single value
-  // `MC_MH_HEARTBEAT_TIMEOUT_MS` (mc-service config; default and range:
+  // (ADR-0039 §1). DERIVED BY MC as floor(N/3), minimum 1, from its single
+  // value N = `MC_MH_HEARTBEAT_TIMEOUT_MS` (mc-service config; default and range:
   // ADR-0039 §1, held by MC's config and runbook, not restated here). MH HAS NO
   // CADENCE CONFIG, so the two ends cannot drift: MH uses exactly this value.
   //
@@ -845,29 +845,34 @@ message RegisterMeetingResponse {
   // that has never successfully applied any policy for this meeting reports 0.
   // It is therefore ALSO what a pre-reshape MH's absent field decodes to, and
   // the two readings agree -- in both cases MC's correct action is identical (do
-  // not believe policy is live; re-register). Valid applied values start at 1,
+  // not believe policy is live; it reads as applied-generation lag, an
+  // ADR-0039 §6 APPLY_LAG input). Valid applied values start at 1,
   // matching `RegisterMeetingRequest.policy_generation`.
   //
   // OBSERVABILITY (ADR-0036 §11): not label material -- see
-  // `RegisterMeetingRequest.policy_generation`. MC feeds its divergence gauge
-  // from THIS value, never from the sent value.
+  // `RegisterMeetingRequest.policy_generation`. The heartbeat's
+  // `applied_generation` references this field; MC's applied-sequence lag
+  // (`mc_media_handler_applied_sequence_lag`, sent minus applied) is fed from
+  // the heartbeat, never from the sent value alone.
   //
   // CANONICAL ENUMERATION of MC's bounded `outcome` label, defined here and
   // deliberately not restated elsewhere:
   //
   //   match | generation_mismatch | no_applied_generation |
-  //   transport_mode_mismatch | handler_id_mismatch
+  //   transport_mode_mismatch
   //
   // From story 3, `transport_mode_mismatch` also carries every per-stream
   // disagreement in `applied_source_streams` (no new value).
   //
-  // The set is FIVE, and each value exists because some field on this response
+  // The set is FOUR, and each value exists because some field on this response
   // can fail in a way MC must act on. `no_applied_generation` is the
   // pre-contract-handler case, and its CONSTRUCTIBILITY is the entire reason
   // zero is reserved above: if 0 were legal the state would have no name and
-  // would silently fold into `match`. `handler_id_mismatch` covers the
-  // `handler_id` comparison below. Every fail-loud path in this response has a
-  // bounded label to land in; a comparison specified with no observable is the
+  // would silently fold into `match`. Every path that can fail on this response
+  // has a bounded label: the `handler_id` comparison below lands on
+  // `mc_register_meeting_total{status="handler_replaced"}` instead (a reply
+  // from another incarnation is never classified into this outcome set). A
+  // comparison specified with no observable is the
   // "declared in one place, assumed in another, verified nowhere" precedent §8
   // itself cites.
   uint64 applied_generation = 2;
@@ -881,9 +886,16 @@ message RegisterMeetingResponse {
   //
   // MH-ASSERTED, NOT MH-PROVEN. It carries no trust beyond the existing
   // authenticated-service trust on this channel. MC MUST compare it against the
-  // `MhAssignment.mh_id` of the handler it dialed and FAIL LOUD on mismatch --
-  // the same two-ends-must-agree treatment §8 gives transport mode. That catches
-  // a misrouted or misconfigured handler registering as another.
+  // `MhAssignment.mh_id` it dialed. A mismatch means the incarnation MC dialed
+  // is not the one answering. The EXPECTED cause is a later incarnation at a
+  // reused address (ADR-0039 §7); a misrouted or misconfigured handler looks
+  // identical at MC. Either way the registration FAILS for the dialed handler:
+  // MC records nothing from this response, does not advance that handler's
+  // state, and NEVER adopts the answering id into its set (a new incarnation
+  // enters only through GC's normal acquire path, ADR-0039 §3). The dialed
+  // handler's liveness is then judged by heartbeats alone. Counted as
+  // `mc_register_meeting_total{status="handler_replaced"}`, ids in a WARN log
+  // only.
   //
   // OBSERVABILITY: NEVER a metric label on MC or GC series (ADR-0039 §8):
   // handler ids are per incarnation and replacement mints new ones, so the
@@ -1384,6 +1396,13 @@ service MediaCoordinationService {
   // are open, are under `docs/TODO.md` §Media Path Obligations.
   rpc NotifyParticipantConnected(NotifyParticipantConnectedRequest) returns (NotifyParticipantConnectedResponse);
   rpc NotifyParticipantDisconnected(NotifyParticipantDisconnectedRequest) returns (NotifyParticipantDisconnectedResponse);
+
+  // One heartbeat per (meeting, handler) per interval, answered by the
+  // meeting's MC meeting actor (ADR-0039 §1, §2, §6). Every rule -- delivery,
+  // the owner check, the remove-only reconcile, size and validation -- is
+  // stated ONCE at `MeetingHeartbeatRequest`'s header and not restated here.
+  // NOT an authorization control: see that header.
+  rpc MeetingHeartbeat(MeetingHeartbeatRequest) returns (MeetingHeartbeatResponse);
 }
 
 // Notification that a participant has connected to a media handler
@@ -1483,15 +1502,12 @@ message NotifyParticipantConnectedRequest {
   // receive-order reordering is why it is NECESSARY. Do not delete it on the
   // strength of reading "terminal".
   //
-  // EMPTY MEANS LEGACY, NOT "UNSET BY CHOICE". A pre-field MH omits it, so it
-  // decodes to "". MC MUST treat "" as one implicit key per
-  // (participant, handler) -- exactly the pre-field set semantics, INCLUDING
-  // their stale-disconnect hazard. That mode is DEGRADED, not an error, and MC
-  // COUNTS it.
-  //   RETIREMENT CONDITION, so this reads as a rollout affordance with an end
-  //   date rather than as an optional field: the empty branch is retired once
-  //   every MH in the fleet sends the field, which the degraded-mode counter
-  //   makes OBSERVABLE rather than assumed. An old MC simply ignores the field.
+  // REQUIRED. Empty (which is also what an omitted field decodes to; the two
+  // cannot be told apart) is REFUSED: on Connected, MC answers `sender_id` 0,
+  // records nothing, and counts it; on Disconnected, it is a counted no-op that
+  // removes nothing. There is no per-(participant, handler) fallback key
+  // (ADR-0039 §6). The count is
+  // `mc_mh_notifications_unapplied_total{reason="connection_id_missing"}`.
   //
   // OBSERVABILITY (ADR-0036 §11): per-session identity, UNBOUNDED cardinality.
   // Never a metric label, never a span attribute, never a per-frame log
@@ -1627,8 +1643,8 @@ message NotifyParticipantDisconnectedRequest {
   //
   // The full contract -- opacity, `(handler_id, connection_id)` keying, the
   // remove-only-its-own-id and unknown-id-no-op rules, no reuse, terminal as a
-  // SEND-order guarantee, MC's REQUIRED receive-order defence, empty-means-
-  // legacy with its retirement condition, and the observability and secrecy
+  // SEND-order guarantee, MC's REQUIRED receive-order defence, REQUIRED (empty
+  // refused), and the observability and secrecy
   // boundaries -- is stated ONCE at
   // `NotifyParticipantConnectedRequest.connection_id` and is deliberately NOT
   // restated here. Two copies of a rule are two things that drift.
@@ -1648,9 +1664,8 @@ message NotifyParticipantDisconnectedResponse {
 
 // ============================================================================
 // MH replacement contract (ADR-0039 §1, §2, §6): release vocabulary and the
-// per-(meeting, handler) heartbeat. The `rpc MeetingHeartbeat` line lands on
-// `MediaCoordinationService` with MC's server implementation (story 4 MC-B1);
-// a tonic server trait has no default methods, so the rpc cannot precede it.
+// per-(meeting, handler) heartbeat, served by MC as `rpc MeetingHeartbeat` on
+// `MediaCoordinationService` (MC-B1).
 // ============================================================================
 
 // Why a handler stops serving a meeting (ADR-0039 §6, "One enum"). THE single
@@ -1776,7 +1791,14 @@ enum ApplyRefusal {
 // pod can forge heartbeats for a dead handler and suppress failover (ADR-0039
 // S1b-extended residual, detected by
 // `mc_media_handler_client_loss_disagreements_total`). The owner check above
-// is anti-misroute, not authentication.
+// is anti-misroute, not authentication. The same forgery reaches the
+// reconcile: a forged heartbeat with an EMPTY `connection_ids` retires every
+// connectivity key and handed-out binding that (meeting, handler) pair
+// recorded before its previous heartbeat, without knowing any connection id.
+// Impact is denial of service only (lost routing, and a binding-conflict
+// refusal after the next sender-id epoch reset); it never adds anything, never
+// crosses meetings, and exposes no key (the sender-id allocator never reissues
+// within a KEK generation).
 //
 // OWNER-SILENCE RELEASE. MH never self-fences on short MC silence. MH ends a
 // meeting (sessions closed with `HANDLER_RELEASED`) after
@@ -1792,9 +1814,20 @@ enum ApplyRefusal {
 // facing a deploy-order fault, not owner silence (whether MH exempts it is
 // MH-3's decision).
 //
-// SIZE AND VALIDATION. Size is bounded by the per-meeting caps MC already
-// enforces. Ids and counts are validated with the `validate_id_field` pattern
-// (crates/mc-service/src/grpc/media_coordination.rs).
+// SIZE AND VALIDATION. `meeting_id`, `mc_id` and `handler_id` are validated
+// with the `validate_id_field` pattern
+// (crates/mc-service/src/grpc/media_coordination.rs); a malformed one, an
+// UNSPECIFIED or unknown `serving_state`, an unknown `apply_refusal`, or a
+// non-zero `drain_remaining_ms` while SERVING is INVALID_ARGUMENT. The
+// `connection_ids` list is bounded by `MC_MAX_PARTICIPANTS` (MC-wide total,
+// crates/mc-service/src/config.rs) x `MAX_LIVE_MEDIA_CONNECTIONS_PER_HANDLER`
+// (crates/mc-service/src/media_routing/connectivity.rs); MC has no per-meeting
+// participant cap, so this is the tightest bound MC holds. A list over it, or
+// with any entry failing the same id rule, SKIPS the WHOLE reconcile for that
+// heartbeat (never just the bad entry, which could retire a key MH still
+// holds) and is counted (`mc_media_handler_heartbeat_anomalies_total`); the
+// verdict and liveness still apply, under the same applied_generation-not-lower
+// rule as any other heartbeat.
 //
 // OBSERVABILITY: `meeting_id`, `mc_id`, `handler_id`, `connection_ids`,
 // `applied_generation` and `drain_remaining_ms` values are NEVER metric labels.
@@ -1810,7 +1843,9 @@ message MeetingHeartbeatRequest {
   ServingState serving_state = 4;
   // Set IFF `serving_state` is DRAINING: milliseconds of drain grace left,
   // RELATIVE (so no clock skew). MH's grace period is the only copy of the
-  // value; this is a report of it, never a second configuration.
+  // value; this is a report of it, never a second configuration. Receiver
+  // rule: non-zero while SERVING is INVALID_ARGUMENT; DRAINING with 0 is
+  // accepted and means the drain deadline is reached.
   uint32 drain_remaining_ms = 5;
   // REFERENCES `RegisterMeetingResponse.applied_generation` (what it means,
   // all-or-none, 0 = nothing installed) and does not restate it.

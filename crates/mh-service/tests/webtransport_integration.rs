@@ -642,8 +642,8 @@ async fn mc_notify_connected_fires_on_join_and_disconnected_fires_on_client_drop
     assert_eq!(connected.handler_id, "mh-test-001");
     assert!(
         !connected.connection_id.is_empty(),
-        "MH must send a connection_id: an empty one puts MC in its degraded legacy mode, where a \
-         stale disconnect from a superseded session removes the live one"
+        "MH must send a connection_id: MC refuses an empty one (sender_id 0, ADR-0039 §6), so \
+         the session would never bind"
     );
 
     // Clean close: finish the send stream so the server's `recv_stream.read()`

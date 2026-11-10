@@ -1414,11 +1414,10 @@ entry: the same deficit signal with some sources arriving.)
    a perfectly healthy connection.** This single observation does the discrimination the counters
    cannot.
 2. **If the connection is healthy**, check for generation divergence:
-   `sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))`. Anything other than `match` (and
-   the `handler_id_mismatch` diagnostic, which fires on every ordinary MH restart) sends you to
+   `sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))`. Anything other than `match` sends you to
    [`mc-incident-response.md` Scenario 15](mc-incident-response.md#scenario-15-media-generation-divergence).
    Since story 2 any structural change (join, leave, declaration, mute) re-pushes, so a meeting with
-   churn may clear by itself; a QUIESCENT meeting does not (no periodic re-assert yet) — force a
+   churn may clear by itself; a QUIESCENT meeting does not — force a
    structural change there. **After an MC restart the split can read clean by design**: the
    restart arm is recorded on `mc_media_policy_generation_adoptions_total` (and a WARN "adopting it
    as a floor" at `mc.register_meeting.trigger`), never under an `outcome` label — read that counter

@@ -192,6 +192,7 @@ fn test_config(gc_url: &str) -> Config {
         // asserts that silently and drifts the moment the ConfigMap moves.
         receive_slot_caps: media.receive_slot_caps,
         media_connect_settle_ms: 1500,
+        mh_heartbeat_timeout_ms: 6000,
         kek_rotation_debounce_seconds: 60,
         max_receive_capability_declarations: media.max_receive_capability_declarations,
         audio_encoding: media.audio_encoding,
@@ -276,6 +277,7 @@ async fn mh_client_register_meeting_injects_active_span_traceparent() {
             mc_grpc_endpoint: "http://mc:50052",
             assignment: &assignment,
             policy_generation: std::num::NonZeroU64::MIN,
+            heartbeat_interval_ms: 2_000,
             restart_floor_adoptable: false,
         })
         .instrument(span)

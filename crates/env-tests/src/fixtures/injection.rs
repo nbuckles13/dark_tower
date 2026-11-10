@@ -91,8 +91,8 @@ pub const INJECTION_MARGIN: u64 = 16;
 /// MC's floor adoption is closed after its first confirmed push
 /// (`crates/mc-service/src/grpc/mh_client.rs`, the comment on the higher-echo
 /// case), so if MC pushed for this meeting mid-window it would record
-/// `mc_media_policy_pushes_total{outcome="generation_mismatch"}`, write
-/// `mc_media_generation_divergence`, and fire `MCMediaGenerationDivergence`
+/// `mc_media_policy_pushes_total{outcome="generation_mismatch"}` and fire
+/// `MCMediaGenerationDivergence`
 /// (`for: 0m`). The tests keep the window free of structural changes (no
 /// joins, leaves or declarations), so MC has nothing to push; and every
 /// injection ends with `EndMeeting` on the pod BEFORE any session closes.

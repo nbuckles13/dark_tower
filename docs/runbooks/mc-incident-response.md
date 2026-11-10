@@ -1830,10 +1830,11 @@ Expected recovery time: 30-60s for horizontal MC scale; 1-2 minutes for NetworkP
 **Symptoms** — read `mc_mh_notifications_unapplied_total` PER REASON, never as one rate:
 - `unknown_connection` — **routine**: every connection MC declined to bind sends a Disconnected for a key MC never recorded. Only sustained volume far above the join rate is a signal.
 - `meeting_unknown` — notifications naming a meeting this MC does not hold (both events).
-- `handler_not_in_set` — the MH-asserted `handler_id` is not byte-identical to a handler of the meeting's handler set (MC-owned since story 4 MC-A; no mid-meeting changes until story 4's replacement path). **Sustained**, it means an MH process restarted under a new (per-incarnation) id and story-4 re-registration has not happened: that meeting's connectivity to the dead id is stale and **will not clear on its own** — see Scenario 18 arm (a).
+- `handler_not_in_set` — **the binding gate** (story 4 MC-B1): the MH-asserted `handler_id` is not byte-identical to a member of the meeting's handler set (never in it, or removed). A Connected is answered `sender_id` 0 and nothing is recorded; a Disconnected is a no-op. **Sustained**, it is an MH incarnation the meeting does not know — usually an MH process restarted under a new (per-incarnation) id; the meeting's connectivity to the dead id stays until handler-loss detection removes it (MC-B2) — see Scenario 18 arm (a).
+- `connection_id_missing` — an MH sent no `connection_id` (REQUIRED since story 4 MC-B1): refused, `sender_id` 0. Non-zero means an MH older than the story 2 task 20 image is in the fleet — a deploy-ordering violation (`mc-deployment.md` §Coordination); roll that MH forward.
 - `connection_bound_refused` — **expected-empty**: one participant exceeded the per-handler live-connection bound (a reconnect storm or leaked sessions).
 - `retired_connection` — a Connected delivered after its own Disconnected (MH abandoned the RPC); MC's tombstone refused it. Non-zero means MH→MC RPCs are slow enough to be abandoned — check MH Scenario 10.
-- `mc_mh_notifications_without_connection_id_total` non-zero — an MH image predating `connection_id` is still in the fleet: that MH gets the degraded legacy semantics (a stale disconnect can remove a live connection).
+- `mc_media_handler_connected_set_corrections_total` rising — lost Disconnecteds being healed by the handlers' heartbeats (remove-only reconcile, story 4 MC-B1). Sustained, the MH→MC notification path is lossy: check MH Scenario 10.
 
 **Impact**: operational drift in the unknown-meeting shapes; **silence** in the `handler_not_in_set` and `connection_bound_refused` shapes (a participant MC believes is not on a handler gets no edges there). The security reading is unchanged: MC authorizes MH on scope alone and every MH pod shares one service identity, so a compromised MH can assert connections for handlers of a meeting's own set (blast radius: misrouting inside that meeting's registered handlers — never cross-meeting; `docs/TODO.md` §Media Path Obligations).
 
@@ -1847,8 +1848,8 @@ sum by (reason) (rate(mc_mh_notifications_unapplied_total[5m]))
 sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
 sum(mc_connections_active)
 
-# 3. Is an old MH still sending without connection_id?
-sum(rate(mc_mh_notifications_without_connection_id_total[5m]))
+# 3. Lost Disconnecteds healed by heartbeats (lossy notification path?)
+sum(rate(mc_media_handler_connected_set_corrections_total[5m]))
 
 # 4. SHAPE the signal — diffuse vs concentrated. Per-notification INFO lines at
 #    mc.grpc.media_coordination carry meeting_id, participant_id, handler_id,
@@ -1868,7 +1869,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 
 1. **Diffuse, many-MH, many-meeting `meeting_unknown` → Operational drift.** GC reassigned meetings but an old MH notified briefly; or MC restarted and lost its meeting actors, so in-flight notifications name meetings the new instance never held. Self-heals as participants reconnect (a fresh join re-dials every MH).
 2. **Concentrated, single-MH source identity, many unknown meetings → Authenticated-MH misbehavior.** Compromised MH credentials probing the MediaCoordinationService, or a misconfigured MH notifying the wrong MC. **Treat as a security incident**: preserve logs, snapshot the metrics, do **NOT** restart MC, escalate to Security Team.
-3. **Sustained `handler_not_in_set` on one meeting → an MH restarted.** Its new process registered under a new id outside the meeting's handler set. Pre-existing gap (story 4 handler-restart detection); see Scenario 18 arm (a) for the remedy participants have today.
+3. **Sustained `handler_not_in_set` on one meeting → an MH restarted.** Its new process registered under a new id outside the meeting's handler set; the binding gate refuses it (`sender_id` 0). Until handler-loss detection (story 4 MC-B2) removes the dead id, see Scenario 18 arm (a) for the remedy participants have today.
 4. **`connection_bound_refused` → reconnect storm / leaked sessions from one participant.** Self-scoped (only that participant is affected). Correlate with the client's reconnect behaviour.
 
 **Remediation**:
@@ -2011,7 +2012,7 @@ further metrics appear below as companions or escalation pointers, so the
 headings are **not** a complete list of the metrics named here. **Scope
 boundary**: this section covers the client-facing signalling path only. The
 MC->MH control plane (`mc_media_policy_pushes_total`,
-`mc_media_generation_divergence`) is cited below only to route you, and is
+`mc_media_handler_applied_sequence_lag`) is cited below only to route you, and is
 triaged in Scenarios 12 and 13, not here. All primary counters are on the standard MC metrics
 endpoint (`deployment/mc-0`, port 8081 — see §MC Topology), and none carries any
 meeting, participant or stream identity.
@@ -2441,9 +2442,8 @@ generation 7; MH runs generation 4.** The call succeeded. Echoing on *receipt* r
 
 > **ANY STRUCTURAL CHANGE RE-PUSHES; FORCE ONE ONLY IF THE MEETING IS QUIESCENT.**
 >
-> ADR-0036 §8 says divergence "is self-correcting — a lost response is re-asserted on the next
-> tick." **That describes a cadence that does not exist yet** (story 4). What does exist since
-> story 2: **every** structural change — a join, a leave, a capability declaration, a mute —
+> There is no periodic re-assert (ADR-0039 superseded ADR-0036 §8's recovery model). What exists
+> since story 2: **every** structural change — a join, a leave, a capability declaration, a mute —
 > re-renders the meeting and re-publishes to every handler, and a push that failed stays
 > UNCONFIRMED, so the next structural change of any kind re-sends it even when that handler's
 > snapshot did not change. In a multi-party meeting with any churn, a divergence therefore often
@@ -2489,8 +2489,8 @@ sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
 | `generation_mismatch` | MH echoed an **older** generation than MC sent. The apply path ran and did not take effect — a full session-actor mailbox, or an apply error. | Open **MH**. Read `mh_media_policy_applies_total{outcome}`; `apply_failed` is the one that produces this. *(Corrected 2026-10-21, story 3 OPS-A: this said `rejected_invalid` produces it too. It does not. MH answers `rejected_invalid` with a gRPC `invalid_argument`, so MC records `mc_register_meeting_total{status="error"}` and the WARN "RegisterMeeting RPC failed" (target `mc.grpc.mh_client`), and no push outcome at all. For that, see [Scenario 12](#scenario-12-registermeeting-coordination-failures).)* |
 | `no_applied_generation` | MH echoed **nothing**. Either an MH build that predates the applied-generation echo (a rollout skew), or the apply never ran at all. | Confirm the MH image first — `kubectl get pods -n dark-tower -l app=mh-service -o jsonpath='{.items[*].spec.containers[*].image}'`. A skew is the cheap explanation and it clears itself on rollout completion. |
 | `transport_mode_mismatch` | **A DIFFERENT FAILURE, BUT IT PAGES HERE AND THIS IS YOUR RUNBOOK.** §8's separate "any two-ends-must-agree configuration is echoed back with a loud mismatch" check. It is not generation divergence, and the remedy below is not the rejoin. It is routed here because nothing else pages on it, and a page with no runbook is worse than a page in an imperfect one. **Meaning (since story 3 MC-A):** any per-stream disagreement between MC's declared `SourceStream`s and MH's `applied_source_streams`, compared unconditionally for every stream. A declared stream is absent from the echo, is echoed UNSPECIFIED, or is echoed with a different mode. All three arms land on this one token at the same precedence. The arm and the stream are log fields `echo_arm` (`absent_from_echo`, `echoed_unspecified`, `mode_differs`) and `echo_stream_number` on MC's confirm-failure ERROR line ("MH did not confirm the forwarding policy", target `mc.grpc.mh_client`), never labels, and no sender id. *(Before MC-A it compared the single superseded `RegisterMeetingResponse.transport_mode`.)* | **Fork on that log line's arm.** The per-arm actions have one home, the arm table in [`mh-deployment.md` §Mixed-Transport Rollback Hazard](mh-deployment.md#mixed-transport-rollback-hazard), which links back to this row. **The resolution steps below do not apply**, because a rejoin re-sends the same disagreeing declaration. Whatever the arm, the trap is the same as in [Scenario 12: RegisterMeeting Coordination Failures](#scenario-12-registermeeting-coordination-failures): **roll MH FORWARD; do NOT roll MC back.** Rolling MC back is the intuitive move when two ends disagree about a version-skewed value, and it is never the fix. Before story 3 it returns MC to `policy_generation: 0` registrations, which MH installs nothing for. Across the story-3 cutover it is a partial rollback that silences audio (`mh-deployment.md` §Story 3 cutover). The MH-side counterparts are in the hazard section. |
-| *anything else* | **A NEW OUTCOME VALUE.** The selector is negated (`outcome!~"match\|handler_id_mismatch"`), so an outcome added after this runbook was written pages here rather than falling silently outside the alert — deliberately. | You are the first responder to see it. Read `PolicyPushOutcome` in `crates/mc-service/src/media_routing/confirm.rs` for what the emitting site means by it, then **add a row to this table**. Do not narrow the selector to make the page stop. |
-| `handler_id_mismatch` | **Diagnostic, not an incident.** `MH_HANDLER_ID` is per-incarnation today, so an ordinary MH pod restart produces this outcome by construction. | Ignore unless it persists with no MH restart. The alert deliberately excludes it for this reason. |
+| *anything else* | **A NEW OUTCOME VALUE.** The selector is negated (`outcome!="match"`), so an outcome added after this runbook was written pages here rather than falling silently outside the alert — deliberately. | You are the first responder to see it. Read `PolicyPushOutcome` in `crates/mc-service/src/media_routing/confirm.rs` for what the emitting site means by it, then **add a row to this table**. Do not narrow the selector to make the page stop. |
+| `handler_id_mismatch` *(RETIRED, story 4 MC-B1)* | **Only from an MC image older than MC-B1** (a rollback that left this rule in place). Current MC never emits it: a reply from another handler incarnation is `mc_register_meeting_total{status="handler_replaced"}`, not a push outcome. | Roll the alert rule back with the image (`mc-deployment.md` §How to Rollback), or roll MC forward. |
 
 > **Do not "fix" `no_applied_generation` by making MH stricter.** MH deliberately does **not** reject
 > `policy_generation: 0`, because MC and MH roll independently: MH-first rejection would register no
@@ -2499,18 +2499,16 @@ sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
 > failure the applied-generation echo exists to prevent. A responder who reads "rollout skew" and
 > reaches for stricter MH validation is reaching for the exact change the design forbids.
 
-Step 2 — **read the magnitude, second, not first.**
+Step 2 — **read how far behind handlers are, second, not first.**
 
 ```promql
-max(mc_media_generation_divergence)
+histogram_quantile(0.95, sum by(le) (rate(mc_media_handler_applied_sequence_lag_bucket[15m])))
 ```
 
-This gauge is `|sent − applied|`. **It is a triage aid and must never be the primary evidence**, for
-two reasons its catalog entry records: it is **last-write-wins at pod level**, so a healthy push for
-an unrelated meeting overwrites a diverged reading; and it is written once per registration push,
-which is coarse relative to the scrape interval, so a real divergence can be overwritten before it is
-ever scraped. A reading of `0` here is **not** evidence that nothing diverged. The counter in Step 1
-is the durable record.
+Sent minus applied `policy_generation`, observed on every heartbeat per (meeting, handler) (story 4
+MC-B1; it replaced the retired pod-level divergence gauge). **A triage aid, never the primary
+evidence**: the counter in Step 1 is the detection signal. A sustained non-zero lag is a handler
+not keeping up with MC's pushes.
 
 Step 3 — **confirm MH's side of the story.**
 
@@ -2548,8 +2546,9 @@ in the response path, not the apply path.
 > **DO NOT RESTART MH AS A REMEDY.** It clears the symptom and destroys the evidence, and — because
 > MH sheds media sessions on restart with no drain (ADR-0036 §11, and `mh-deployment.md`
 > §Rollout With Media Flowing) — it takes down every *working* media session on that pod while
-> recovering none of the ones that were already dark. There is no periodic re-assert in this build to
-> rescue them (story 4). A restart makes the blast radius strictly larger and the diagnosis impossible.
+> recovering none of the ones that were already dark. A restarted MH is a new incarnation that MC
+> replaces, never re-programs in place (ADR-0039). A restart makes the blast radius strictly larger
+> and the diagnosis impossible.
 
 **Escalation**:
 - `meeting-controller` owns the push side; `media-handler` owns the apply side. The label in Step 1
@@ -2562,7 +2561,7 @@ in the response path, not the apply path.
   — stale or absent MH policy is one of the two causes of "client sending, nothing coming back", and
   this scenario is the other half of that fork.
 - `docs/observability/metrics/mc-service.md` — canonical definitions for
-  `mc_media_policy_pushes_total` and `mc_media_generation_divergence`.
+  `mc_media_policy_pushes_total` and `mc_media_handler_applied_sequence_lag`.
 
 ---
 
@@ -3336,8 +3335,9 @@ shows the reporter and the silent peer with **disjoint** connected sets, or one 
   Go to MH Scenario 1 and the network-policy/NodePort checks. `window_elapsed` rising is this arm.
 - **MH reported a handler MC ignored**: `mc_mh_notifications_unapplied_total{reason="handler_not_in_set"}`
   is non-zero. **Sustained, it means an MH process restarted under a new id** (the id is
-  per-incarnation) **and story-4 re-registration has not happened; the meeting's connectivity to
-  the dead id is stale and will NOT clear on its own** — MC keeps routing edges to a handler that
+  per-incarnation) and the binding gate refuses its sessions; **the meeting's connectivity to the
+  dead id is stale and will NOT clear on its own until handler-loss detection removes it
+  (story 4 MC-B2)** — MC keeps routing edges to a handler that
   no longer holds them, so the slots still read `ACTIVE`. Remedy today: the affected participants
   rejoin (a fresh join re-dials every handler of the meeting's set); the durable fix is story 4.
 - **A client's single MH transport dropped mid-session** (Step 0 shows a handler leaving the set

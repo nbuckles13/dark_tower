@@ -392,7 +392,7 @@ Queries name both labels (label-taxonomy.md §query rule).
 | `mc_media_slot_view_emissions_total`, `mc_media_receive_capability_declarations_total`, `mc_media_refusal_replies_suppressed_total` | Per participant / per declaration / per reply, not per kind. |
 | `mc_media_client_mute_fanouts_total` | One fan-out carries a participant's FULL mute snapshot, all four controls at once; it is counted per subject, not per kind. |
 | `mc_media_mute_requests_rejected_total` | A request refused WHOLE for its kind list (empty, malformed, or naming a kind the subject does not publish) applied no kind, so there is no honest kind to label (story 3 MC-B; widened 2026-10-25). |
-| Policy, binding, edge, settle, divergence, teardown and KEK families: `mc_media_policy_pushes_total`, `mc_media_policy_generation_adoptions_total`, `mc_media_generation_divergence`, `mc_media_sender_binding_responses_total`, `mc_media_edge_moves_total`, `mc_media_connect_settles_total`, `mc_media_connect_settle_window_seconds`, `mc_media_end_meeting_total`, `mc_media_push_quiesce_total`, `mc_media_teardown_fence_backstop_total`, `mc_meeting_kek_*`, `mc_meeting_sender_ids_issued_max` | No media-kind subject: they describe a meeting, handler, edge or key generation. |
+| Policy, binding, edge, settle, divergence, teardown and KEK families: `mc_media_policy_pushes_total`, `mc_media_policy_generation_adoptions_total`, `mc_media_sender_binding_responses_total`, `mc_media_handler_*` (heartbeat intake), `mc_media_edge_moves_total`, `mc_media_connect_settles_total`, `mc_media_connect_settle_window_seconds`, `mc_media_end_meeting_total`, `mc_media_push_quiesce_total`, `mc_media_teardown_fence_backstop_total`, `mc_meeting_kek_*`, `mc_meeting_sender_ids_issued_max` | No media-kind subject: they describe a meeting, handler, edge or key generation. |
 
 ### Declared, not yet carried: `content_kind`
 
@@ -576,10 +576,11 @@ zero-trust measure: MC generates and holds every KEK it issues.
 - **Type**: Counter
 - **Description**: Total RegisterMeeting RPC attempts by outcome
 - **Labels**:
-  - `status`: RPC outcome (`success`, `error`)
-- **Cardinality**: Low (2 status values)
+  - `status`: RPC outcome (`success`, `error`, `handler_replaced`)
+- **Cardinality**: Low (3 status values; zero-initialised)
+- **`handler_replaced` is NOT a coordination failure** (story 4 MC-B1, ADR-0039 §7): the endpoint MC dialed answered as a DIFFERENT handler incarnation — expected on an ordinary in-place MH restart at a reused address. The registration fails for the dialed handler (nothing credited, the answering id never adopted; the push worker stops), its liveness is judged by heartbeats alone, and the expected/answering ids are on a WARN at `mc.grpc.mh_client`. `MCRegisterMeetingFailureRate` reads `status="error"` only. **Interim (this commit):** Until story 4 MC-B2 (detection) and MC-C (replacement) land, such a handler stays Registering — client-invisible — for that meeting, and every later push to it (each structural change re-tries) gets the same answer; the meeting runs on its other handlers, and a meeting whose ONLY handler hit this has no media until it is re-created or rejoined after replacement lands. A non-zero rate on new meetings outside an MH restart window is worth checking.
 - **Usage**: Monitor MC→MH meeting registration reliability, detect MH connectivity issues
-- **Recorded in**: `mh_client.rs` after RegisterMeeting RPC completes
+- **Recorded in**: `mh_client.rs` after RegisterMeeting RPC completes (constants `REGISTER_MEETING_STATUSES`)
 - **Dashboard**: MC Overview - RegisterMeeting RPC Rate by Status (MH Coordination row)
 
 ### `mc_register_meeting_duration_seconds`
@@ -594,28 +595,28 @@ zero-trust measure: MC generates and holds every KEK it issues.
 
 ## Media-Routing Control Plane Metrics (ADR-0036 §8, §11)
 
-Both metrics are emitted together, on **every** push outcome including `match`,
-by `MhClient::register_meeting`'s confirm step. Neither carries a meeting
-identifier, a `sender_id`, an `egress_stream_id` or a generation number as a
-label (ADR-0036 §11). Neither carries `handler_id`: it is a per-incarnation
+The push metric is emitted on **every** classified push outcome including
+`match`, by `MhClient::register_meeting`'s confirm step. It carries no meeting
+identifier, `sender_id`, `egress_stream_id` or generation number as a label
+(ADR-0036 §11), and no `handler_id`: it is a per-incarnation
 token (`mh-service` derives it from `HOSTNAME` plus a fresh UUID at process
 start, and `MH_HANDLER_ID` is unset in all three MH manifests), so as a label it
 would be one permanently-retained series per MH incarnation MC has ever pushed
 to — worst under a crashloop, which is exactly when the metric must work. The
 one-handler-versus-all-handlers triage query is answered from the `error!` line,
-which does carry `handler_id`. The label may return once
-`2026-09-02-mh-stable-handler-id` makes the id stable.
+which does carry `handler_id`. Under ADR-0039 handler ids are per incarnation
+by design, so the label never returns (ADR-0039 §8).
 
 ### `mc_media_policy_pushes_total`
 - **Type**: Counter
 - **Description**: Forwarding-policy pushes to an MH, classified by what the handler's reply proved (ADR-0036 §8)
 - **Labels**:
-  - `outcome`: `match`, `no_applied_generation`, `generation_mismatch`, `transport_mode_mismatch`, `handler_id_mismatch`
+  - `outcome`: `match`, `no_applied_generation`, `generation_mismatch`, `transport_mode_mismatch` (`handler_id_mismatch` RETIRED, story 4 MC-B1 — see below)
   - `key_custody`: single value `operator` (ADR-0036 §4 — MC can read media keys; that is accepted operator custody, never described as end-to-end)
-- **Cardinality**: 5 (bounded at the type level by `PolicyPushOutcome::ALL`; a sixth value is a compile error)
+- **Cardinality**: 4 (bounded at the type level by `PolicyPushOutcome::ALL`; a fifth value is a compile error)
 - **Counts response evaluations, NOT meetings — with ONE exception.** A retried push contributes one sample per attempt; a terminal outcome exactly one. A divergence *ratio* over this denominator is therefore per-attempt, not per-meeting. The exception: an MC-restart floor on the FIRST confirm of a (meeting, handler) in an MC process is recorded on `mc_media_policy_generation_adoptions_total` INSTEAD (or here as `generation_mismatch` if adoption fails). **Total evaluated replies = `sum(mc_media_policy_pushes_total) + sum(mc_media_policy_generation_adoptions_total)`.**
-- **This is the detection signal.** `mc_media_generation_divergence` is the magnitude a responder reads next — see that entry for why the gauge cannot carry detection.
-- **`handler_id_mismatch` is a DIAGNOSTIC, not an alerting signal**, until `MH_HANDLER_ID` is stable per deployment: the id is per-incarnation, so an ordinary MH pod restart produces that outcome by construction and an `outcome!="match"` page would fire on every MH rollout. Alert expressions must read `outcome!~"match|handler_id_mismatch"`. **Three sites hold that one expression** — the alert rule (story task 21), this entry, and `docs/runbooks/mc-deployment.md`'s post-deploy checklist — and they are **one decision with one revert trigger**, `2026-09-02-mh-stable-handler-id`.
+- **This is the detection signal**; alert expressions read `outcome!="match"` (`MCMediaGenerationDivergence`). The live per-(meeting, handler) magnitude is `mc_media_handler_applied_sequence_lag`, observed on every heartbeat.
+- **`handler_id_mismatch` — RETIRED (story 4 MC-B1). Version-skew only.** A reply from a different handler incarnation is no longer classified here: it fails the registration and is `mc_register_meeting_total{status="handler_replaced"}`. Its former carve-out (`outcome!~"match|handler_id_mismatch"`) is removed from all three sites together — the alert rule, this entry and `docs/runbooks/mc-deployment.md`'s post-deploy checklist. A non-zero value can only come from an MC image predating MC-B1, and under the negated selector it PAGES (roll the rule back with such an image).
 - **`transport_mode_mismatch` is a PER-STREAM echo check** (story 3 MC-A). MC compares MH's `applied_source_streams` against every `source_streams` entry it sent (one per (sender, stream) in every participant's publish set), unconditionally (`media_routing/confirm.rs::first_echo_mismatch`). Three arms all map to this ONE existing outcome, at the same precedence, and still page via `MCMediaGenerationDivergence`: `absent_from_echo` (a sent stream MH did not echo), `echoed_unspecified` (echoed with no transport mode) and `mode_differs` (echoed with a different mode). Which arm and which stream are on the confirm-failure ERROR line ("MH did not confirm the forwarding policy") as fields `echo_arm` and `echo_stream_number` — **log fields only, never labels**, and no sender id. (`EgressStream.transport_mode` is no longer written; the edge's mode is derived from its source stream.)
 - **Label key is `outcome`, not `status`**, matching MH's `mh_media_policy_applies_total{outcome,key_custody}` so both ends of one handshake sit side by side in a query.
 - **Usage**: Detect a meeting whose forwarding policy MC could not confirm as live
@@ -643,7 +644,7 @@ which does carry `handler_id`. The label may return once
 - **Type**: Counter
 - **Description**: Whether MC could resolve a participant's `sender_id` for the Media Handler that asked, and if not, why (ADR-0036 §2, §4; R-15)
 - **Labels**:
-  - `outcome`: `resolved`, `meeting_unknown`, `participant_unknown`, `user_ambiguous` (`registry_full` RETIRED, story 2 task 20 — see below)
+  - `outcome`: `resolved`, `meeting_unknown`, `participant_unknown`, `user_ambiguous`, `refused` (`registry_full` RETIRED, story 2 task 20 — see below)
   - `key_custody`: single value `operator` (ADR-0036 §4 — MC can read media keys; that is accepted operator custody, never described as end-to-end)
 - **Cardinality**: bounded at the type level by `SenderBindingOutcome::ALL`. **Deliberately no restated integer** — the list above is the operator-facing artifact and a second encoding of its length only rots. (This number drifted four times during the devloop that added the metric; the compile-checked length in `ALL: [Self; N]` is the guard, a prose count is an unchecked copy.)
 - **Increment boundary**: once per `NotifyParticipantConnected` **response MC emits**, on every path that produces a response. If the RPC fails before a response is formed, nothing increments here — that population is MH's `mh_media_session_starts_total{outcome="declined_mc_unavailable"}` plus MC's transport-level metrics.
@@ -652,6 +653,7 @@ which does carry `handler_id`. The label may return once
 - **The discriminator for this whole vocabulary is REMEDY, not cause.** Two of the four values exist as separate series because acting on a neighbour's remedy would be wrong or harmful, not because their causes differ. When adding a value, the question is "does a responder do something different?", not "is this a distinct cause?".
 - **`user_ambiguous`: the folded label would have been actively harmful, which is why it is separate.** MC mints a fresh `participant_id` per join and does not bar a second join, so **a user who reconnects produces a second roster entry for the same `sub`**. If this were folded into `participant_unknown`, the union's documented remedy is "benign race — reconnect", and following that instruction on this cause **converts a transient failure into a permanent one**. This is not merely two remedies in one series; it is a series whose documented remedy is *harmful* for one of its members.
 - **`user_ambiguous` is NOT resolved by `connection_id`** (story 2 task 20). `connection_id` distinguishes MH CONNECTIONS; this ambiguity is between two MC roster ENTRIES (joins) behind one token `sub`, and MC cannot map an MH connection to one of its own joins. The remedy has one home: `docs/TODO.md` §Media Path Obligations, "`user_ambiguous` has no operator remedy". Since task 20 the same fail-closed rule also governs connectivity: an ambiguous `sub` records connectivity for NO entry (counted `mc_mh_notifications_unapplied_total{reason="user_ambiguous"}`).
+- **`refused` — the binding gate** (story 4 MC-B1, ADR-0039 §6): answered `0` BEFORE any roster lookup, and nothing recorded. Three causes — a handler never in the meeting's set, a removed handler, or an empty `connection_id`; the split is `mc_mh_notifications_unapplied_total{reason=handler_not_in_set|connection_id_missing}`. Not a join race: a removed handler's sessions are refused for the meeting's life.
 - **`registry_full` — RETIRED (story 2 task 20). Version-skew only.** It counted the per-meeting `MhConnectionRegistry` cap declining a binding. The registry and its cap are gone: participant connectivity now lives in the meeting actor, bounded structurally (roster × the meeting's handler set × a small per-handler key bound), and MC never declines a binding for capacity. A non-zero value can only come from an MC image predating the retirement during a rolling deploy — **not a capacity signal; there is no cap to raise.** The actor's own bound refuses a surplus *connection key* without touching the binding, on `mc_mh_notifications_unapplied_total{reason="connection_bound_refused"}`.
 - **Shared denominator, recorded so it is not alerted on twice.** This increments on the same path as `record_mh_notification("connected")`, after the same validation gate, so `sum(mc_media_sender_binding_responses_total)` equals `mc_mh_notifications_received_total{event_type="connected"}` **by construction**. Not duplication — this one carries the resolution dimension the other lacks — but two series encoding one count invite either a double alert or the deletion of the wrong one.
 - **Label key is `outcome`, not `status`**, matching the sibling `mc_media_policy_pushes_total` and MH's counterpart so both ends of one handshake sit side by side in a query.
@@ -660,18 +662,7 @@ which does carry `handler_id`. The label may return once
 - **Dashboard**: MC Media - Sender Binding Responses by Outcome (Media Routing row)
 
 ### `mc_media_generation_divergence`
-- **Type**: Gauge
-- **Description**: Last-observed magnitude by which a handler's live forwarding policy differed from the one MC pushed
-- **Labels**:
-  - `key_custody`: single value `operator`
-- **Cardinality**: 1
-- **Value is an unsigned MAGNITUDE, not a difference**: `|sent - applied|`, computed from the **applied** value in the response. Feeding it from the sent value yields a constant 0 — the silent regression ADR-0036 §8 names. `saturating_sub` is equally wrong: `applied > sent` is reachable (an MC restart re-deriving from 1 against a handler holding a higher generation, or the `policy_generation: u64::MAX` ratchet wedge) and would render as a healthy 0 on the one response shape that proves the two ends disagree. Direction is not lost — the `error!` line carries both numbers.
-- **Last-write-wins, pod-level.** Its clearing path is the next push of any (meeting, handler) on this pod, so it is overwritten rather than latched and cannot wedge above zero for a pod's lifetime. The price: a healthy push can erase a diverged reading. MC also inherits the global `scrape_interval`, which is coarse relative to a one-shot-per-registration write, so a divergence can be overwritten before it is ever scraped. **Both are independent reasons this gauge is not the detection signal** — that is `mc_media_policy_pushes_total`.
-- **Written on every registration push, which since story 2 means every structural change.** Joins, leaves, capability declarations and mutes each re-render the meeting and re-push any handler whose snapshot changed, so this gauge is written far more often than the story-1 once-per-meeting — and the last-write-wins caveat above gets WORSE, not better: a diverged reading is overwritten by the next healthy push of ANY (meeting, handler) on the pod. With the ADR-0036 §8 re-assert cadence still deferred (story 4), **this gauge does not observe a handler restart**: a handler can lose all forwarding policy while this value holds its last healthy reading.
-- **An MC restart against a live handler is now self-correcting.** A restarted MC re-derives generations from 1 while MH still holds K; the push worker adopts MH's truthfully echoed K as a floor and re-pushes at K+1 (`PolicyGenerations::adopt_floor`), and it is recorded on `mc_media_policy_generation_adoptions_total`, NOT here: a successful adoption never writes this gauge. Only a FAILED adoption (recorded as `generation_mismatch`) writes a magnitude.
-- **Usage**: Read the magnitude after `mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}` has fired; never page on it
-- **Recorded in**: `grpc/mh_client.rs::confirm` via `observability/metrics.rs::record_media_policy_push` (and `media_routing/pusher.rs` for a FAILED restart-floor adoption, as `generation_mismatch`)
-- **Dashboard**: MC Media - Media Generation Divergence (magnitude) (Media Routing row)
+- **RETIRED (story 4 MC-B1). Version-skew only.** The pod-level last-write-wins gauge is deleted; its job (how far behind is a handler) is now `mc_media_handler_applied_sequence_lag`, per (meeting, handler) per heartbeat. A series seen during a rollout comes from an MC image predating MC-B1.
 
 ## Client-Facing Media Signalling Metrics (ADR-0036 §5, §6, §11)
 
@@ -737,7 +728,7 @@ span would record as attributes, on a surface no guard covers.
   - **No `media_kind` — deliberately** (§`media_kind` above: composed per participant before any stream exists).
 - **Cardinality**: bounded at the type level by `DirectiveOutcome::ALL`. Deliberately no restated integer — the list above is the operator-facing artifact and a second encoding of its length only rots.
 - **THE SUCCESS SET IS `{emitted, emitted_empty_targets}`, NOT `{emitted}`.** ADR-0036 §5 makes an empty target set a *specified success* — "A target set may be empty. That means send nothing." A failure predicate must read `outcome!~"emitted|emitted_empty_targets"`; `outcome!="emitted"` would page on a legal state. **`emitted_empty_targets` is ROUTINE**: a solo participant, a participant nobody holds in a slot, a participant server-muted on every kind it publishes (story 3 MC-B: a server mute withdraws that kind's directive; per-kind withdrawals by cause are on `mc_media_send_directive_withdrawals_total{reason}`), and a participant not yet connected to any handler (or still inside its connect settle window) is directed to send nothing — and is re-sent a non-empty directive the moment someone starts holding it. **"Holds" means shares a CONNECTED handler with** (story 2 task 20, ADR-0036 §9) — not "was placed on the same handler", which was task 6's meaning and is retired. **Frequency shift:** under task 6's round-robin placement this was routine in every split two-person meeting; under the edge model an all-connected meeting co-locates, so it collapses back to solo participants, unheld participants and the settle window. It stays a success either way; only the expected magnitude dropped. A target set now names EVERY handler owning one of the sender's edges, so a single directive may carry several targets (`mc_media_send_targets_total`).
-- **PERMANENT — no revert trigger.** This alternation is a correct, permanent classification grounded in ADR-0036 §5, not a workaround. `mc_media_policy_pushes_total`'s superficially identical `outcome!~"match|handler_id_mismatch"` is a *temporary* carve-out with a recorded revert trigger; **the two share a shape and nothing else.** Do not fold this entry into that decision, and do not strip this alternation as part of any cleanup: doing so starts paging on a routine success while appearing to complete a documented task.
+- **PERMANENT — no revert trigger.** This alternation is a correct, permanent classification grounded in ADR-0036 §5, not a workaround. (`mc_media_policy_pushes_total` once carried a superficially identical *temporary* carve-out, retired in story 4 MC-B1; **the two shared a shape and nothing else.**) Do not strip this alternation as part of any cleanup: doing so starts paging on a routine success while appearing to complete a documented task.
 - **MC defects vs environmental — the alert classes live in ONE home: `DirectiveOutcome::alert_class()` (`crates/mc-service/src/media_signaling/outcome.rs`, test module; an exhaustive, wildcard-free match, pinned to the rules by a unit test). Rules: `MCMediaSendDirectiveDefect` (page, the defect class) and `MCMediaSendDirectiveFailures` (warning, negated: the environmental class and any token nobody classified) in `infra/docker/prometheus/rules/mc-alerts.yaml`.** The partition is deliberately not restated here. Per-token meaning: `unknown_stream_number` (a forwarding plan named a stream number MC has no policy entry for, or named this publisher on a kind its publish set does not contain), `transport_mode_unspecified` (a plan carried no transport mode; MC fails closed rather than defaulting to datagram), `handler_url_unresolved` (every handler url and `handler_ref` a client sees comes from one Active-only lookup of the meeting's `MeetingHandlers` — the edge's owning handler is only ever an Active member, because routing admits only Active members — so a miss cannot happen by construction; it fails CLOSED — nothing is emitted for that participant, never an `ACTIVE` slot or a send target with an empty url) and `assignment_failed` (**an MC defect, not environmental — reclassified at story 3 OBS-B**: reachable only after the slot render fails, whose only error is unreachable from valid input, and then MEETING-WIDE until the membership changes) all indicate a bug when non-zero. `meeting_state_unavailable` is the only environmental value: a post-join capability re-declaration the meeting actor did not register (actor gone, usually a meeting ending, or the participant already left; recorded only in `webtransport/connection.rs::handle_receive_capability`). The previous declaration and view stay in force; the shipped SDK never re-declares, so with it this is near-unreachable. (`no_planned_egress_slot`, story 1's join-time "MC planned no slot for you", is retired: declared slots are now the assignment's input.)
 - **Recorded by the MEETING ACTOR — failures on every composition, successes only on CHANGE.** Compositions are triggered by the participant's own actions and by a PEER's join, leave, declaration or mute (which the participant's own connection never sees); plus the connection's own record of a post-join re-declaration the actor did not register (`meeting_state_unavailable`). There is no join-time recording site. A composition FAILURE records its stage unconditionally, so every reason MC did not **compose** a directive lands on this one series. A SUCCESSFUL composition records `emitted`/`emitted_empty_targets` only when the directive CHANGED (see below); an unchanged recomposition records nothing. Under the story-2 model a roster change recomposes everyone but changes only some directives, so the `emitted` rate is well below the composition rate.
 - **A failure RATIO over this series overstates the failure rate.** Its denominator excludes successful-but-unchanged compositions (never recorded) while failures are recorded every time. No alert divides by it (both rules are `increase(...[15m]) > 0` occurrence rules); if one is added, it must not treat `sum()` as "compositions".
@@ -909,7 +900,7 @@ span would record as attributes, on a surface no guard covers.
 - **A STATE level, not an event rate.** Counting unit: server-muted (participant, kind) SOURCES in force on this MC pod — NOT mute events, and NOT participants: a participant server-muted on both kinds reads 1 on each kind. `sum without (media_kind, content_kind)` is muted sources; `{media_kind="audio", content_kind="main"}` is muted audio sources. Recomputed per (meeting, kind) by the census. A mute applied yesterday is still counted here; `mc_media_server_mute_requests_total` stays flat for it.
 - **Present at zero from process start**, so ABSENT means "not up or not scraped", never "nobody is muted".
 - **Recomputed and `set` from live state, never delta-maintained.** Each meeting actor writes its ABSOLUTE count into a census; the controller's health walk prunes meetings that no longer exist and re-sets the pod total (the load-bearing publish), and every mute change also publishes (freshness only). So an actor that dies without running its exit path cannot leave a phantom count behind.
-- **Read it against MH's enforcement — at FLEET level, and directionally.** `sum(mc_media_server_muted_sources)` across MC instances AND kinds — since story 3 MC-A each kind's server mute reaches MH as that stream's `DROP_AT_INGRESS` disposition in `source_streams` (`media_routing/assignment.rs`), so a video server mute drops video at ingress just as an audio one drops audio (story 2 was audio only, and summing across kinds then manufactured a false disagreement) — against `sum(rate(mh_media_frames_dropped_total{reason="server_muted"}[5m]))` across MH instances. Per instance the comparison means nothing: MC and MH meeting sets do not nest (a meeting on mc-0 has edges on any one or more MH handlers, and each handler serves both MCs). A level and a counter are NEVER divided. **Since MC-B (2026-10-23) gauge > 0 with fleet drops near zero is the NORMAL shape**: a server mute withdraws the kind's send directive, so a compliant client stops sending and MH has nothing to drop; the comparison now detects only a sender that ignored its empty targets. The primary MC-side evidence that a mute took is `mc_media_send_directive_withdrawals_total{reason="server_muted"}`. Gauge > 0 with flat drops is a CANDIDATE disagreement only after excluding, first, a compliant client that honoured the withdrawal (the dominant cause), then a muted participant who is silent, disconnected, in grace or not yet on a handler (and a server mute of a kind the participant does not publish has no stream to drop). Same class of caveat as `mc_media_generation_divergence`.
+- **Read it against MH's enforcement — at FLEET level, and directionally.** `sum(mc_media_server_muted_sources)` across MC instances AND kinds — since story 3 MC-A each kind's server mute reaches MH as that stream's `DROP_AT_INGRESS` disposition in `source_streams` (`media_routing/assignment.rs`), so a video server mute drops video at ingress just as an audio one drops audio (story 2 was audio only, and summing across kinds then manufactured a false disagreement) — against `sum(rate(mh_media_frames_dropped_total{reason="server_muted"}[5m]))` across MH instances. Per instance the comparison means nothing: MC and MH meeting sets do not nest (a meeting on mc-0 has edges on any one or more MH handlers, and each handler serves both MCs). A level and a counter are NEVER divided. **Since MC-B (2026-10-23) gauge > 0 with fleet drops near zero is the NORMAL shape**: a server mute withdraws the kind's send directive, so a compliant client stops sending and MH has nothing to drop; the comparison now detects only a sender that ignored its empty targets. The primary MC-side evidence that a mute took is `mc_media_send_directive_withdrawals_total{reason="server_muted"}`. Gauge > 0 with flat drops is a CANDIDATE disagreement only after excluding, first, a compliant client that honoured the withdrawal (the dominant cause), then a muted participant who is silent, disconnected, in grace or not yet on a handler (and a server mute of a kind the participant does not publish has no stream to drop). A level read against a rate: same class of caveat as any gauge-versus-counter comparison.
 - **What it does NOT answer**: whether a mute is in force in ONE meeting. ADR-0036 §11 bars a per-meeting dimension; the meeting-scoped question is MC's state and the `mc.webtransport.connection` "Server mute decision" log.
 - **Recorded in**: `actors/meeting_media.rs::MutedSourceCensus::publish` via `observability/metrics.rs::set_server_muted_sources`; boot zero in `webtransport/server.rs`
 - **Dashboard**: MC Media - Server-Muted Sources (Client Media Signalling row)
@@ -1015,6 +1006,73 @@ span would record as attributes, on a surface no guard covers.
 - **Recorded in**: `webtransport/server.rs::WebTransportServer::new` via `observability/metrics.rs::set_connect_settle_window`
 - **Dashboard**: MC Media - Connect Settle Window (Media Connectivity row, stat panel)
 
+## Handler Heartbeat Metrics (ADR-0039 §1, §2, §6; story 4 MC-B1)
+
+Per-(meeting, handler) heartbeats from MH, answered by the meeting's actor.
+Every series carries `key_custody="operator"` and NO meeting, participant,
+connection, `handler_id`, `handler_ref`, slot, revision or generation label.
+Heartbeats are logged on transitions only, never per heartbeat.
+
+### `mc_media_handler_heartbeats_total`
+- **Type**: Counter
+- **Description**: Verdicts MC returned for heartbeats
+- **Labels**:
+  - `outcome`: `owned`, `released_removed`, `released_ended`, `released_unassigned`, `owner_mismatch`
+  - `key_custody`: single value `operator`
+- **Cardinality**: bounded by `HeartbeatOutcome::ALL`; zero-initialised
+- **Values**: `owned` — the handler is in the set (Registering included). `released_removed` — RELEASED(its removal trigger): a zombie or a lost EndMeeting being fenced. `released_ended` — no meeting actor, RELEASED(MEETING_ENDED), answered by the router: the lost-EndMeeting retry rate. `released_unassigned` — a live meeting whose set never held the handler, RELEASED(UNSPECIFIED): misroute, **expected zero**. `owner_mismatch` — the heartbeat's `mc_id` is not this MC: FAILED_PRECONDITION (checked first, before any lookup), **expected zero**. There is no UNKNOWN verdict.
+- **Not counted here**: a heartbeat MC could not route to its actor in time (UNAVAILABLE) — that is `mc_messages_dropped_total{actor_type="meeting"|"controller"}`; and a malformed request (INVALID_ARGUMENT).
+- **Usage**: Any increase of `released_unassigned` or `owner_mismatch` is a contract or routing defect (WARNING, OBS-ALERTS)
+- **Recorded in**: `grpc/media_coordination.rs` (`owner_mismatch`, `released_ended`) and `actors/meeting.rs::handle_handler_heartbeat` (the rest) via `observability/metrics.rs::record_handler_heartbeat`
+- **Dashboard**: MC Media - Handler Heartbeat Verdicts by Outcome (Handler Heartbeats row)
+
+### `mc_media_handler_heartbeat_interval_seconds`
+- **Type**: Histogram
+- **Description**: Inter-arrival of accepted heartbeats per (meeting, handler)
+- **Labels**: `key_custody` (1)
+- **Buckets**: DERIVED from N (`MC_MH_HEARTBEAT_TIMEOUT_MS`): N/6, N/3, N/2, 2N/3, N, 1.5N, 2N
+- **Observed**: on ACCEPTED heartbeats with a previous accepted receipt only; the first heartbeat of a pair and stale or replayed arrivals (applied generation lower than the last accepted) are excluded — those appear on `mc_media_handler_applied_sequence_lag`. This is the liveness clock MC-B2 judges against N.
+- **Recorded in**: `actors/meeting.rs::handle_handler_heartbeat` via `observability/metrics.rs::observe_heartbeat_interval`
+- **Dashboard**: MC Media - Handler Heartbeat Inter-Arrival vs Deadline (Handler Heartbeats row)
+
+### `mc_media_handler_applied_sequence_lag`
+- **Type**: Histogram
+- **Description**: Sent minus applied `policy_generation` per (meeting, handler), per heartbeat. **Replaces the retired `mc_media_generation_divergence` gauge.**
+- **Labels**: `key_custody` (1)
+- **Buckets**: integer counts 0, 1, 2, 3, 5, 10, 25, 100
+- **Observed**: on EVERY OWNED heartbeat, stale ones included. NOT observed while MC has never pushed to the pair (no "sent"), nor when MH reports a generation ahead of what MC sent (counted on `mc_media_handler_heartbeat_anomalies_total{reason="applied_ahead_of_sent"}`) — never a fake 0.
+- **Recorded in**: `actors/meeting.rs::handle_handler_heartbeat` via `observability/metrics.rs::observe_applied_sequence_lag`
+- **Dashboard**: MC Media - Handler Applied-Sequence Lag (Handler Heartbeats row)
+
+### `mc_media_handler_connected_set_corrections_total`
+- **Type**: Counter
+- **Description**: Connections a heartbeat retired from MC's state (remove-only reconcile)
+- **Labels**: `key_custody` (1)
+- **Unit**: one per DISTINCT `(handler, connection_id)` a heartbeat retired, across connectivity keys and binding-ledger entries; a departed participant's leaked binding counts. Each increment is a lost `NotifyParticipantDisconnected` the heartbeat healed (closes O-11). A key is retired only if absent from the heartbeat AND bound strictly before that handler's previous accepted heartbeat; a heartbeat never adds.
+- **Usage**: Sustained non-zero = a lossy MH→MC notification path (WARNING candidate)
+- **Recorded in**: `actors/meeting.rs::reconcile_connected_set` via `observability/metrics.rs::record_connected_set_corrections`; zero-initialised
+- **Dashboard**: MC Media - Connected-Set Corrections (Handler Heartbeats row)
+
+### `mc_media_handler_heartbeat_anomalies_total`
+- **Type**: Counter
+- **Description**: Heartbeats MC answered but could not fully use
+- **Labels**:
+  - `reason`: `connection_ids_over_cap`, `connection_id_malformed`, `applied_ahead_of_sent`
+  - `key_custody`: single value `operator`
+- **Cardinality**: bounded by `HeartbeatAnomaly::ALL`; zero-initialised
+- **Expected ZERO**: non-zero is an MH contract or version-skew fault. For the two list reasons the verdict and liveness still applied and only that heartbeat's reconcile was skipped (skipping only keeps connections; the bound is `MC_MAX_PARTICIPANTS` x `MAX_LIVE_MEDIA_CONNECTIONS_PER_HANDLER` (`media_routing/connectivity.rs`), the tightest MC holds). For `applied_ahead_of_sent` no lag reading was taken. The WARN is per (meeting, handler) on transition only, ids but never connection ids.
+- **Usage**: WARNING candidate for OBS-ALERTS
+- **Recorded in**: `actors/meeting.rs::handle_handler_heartbeat` via `observability/metrics.rs::record_heartbeat_anomaly`
+- **Dashboard**: MC Media - Handler Heartbeat Anomalies by Reason (Handler Heartbeats row)
+
+### `mc_media_handler_heartbeat_deadline_seconds`
+- **Type**: Gauge
+- **Description**: N, the heartbeat timeout this pod enforces (`MC_MH_HEARTBEAT_TIMEOUT_MS`), in seconds
+- **Labels**: `key_custody` (1)
+- **A CONFIG ECHO**, set once at boot from the same `HeartbeatTiming` that derives the interval MC sends MH (`max(1, floor(N/3))` ms) and the intake's send budget. Env-tests derive their waits from it; read beside MH's QUIC idle timeout.
+- **Recorded in**: `main.rs` via `observability/metrics.rs::set_heartbeat_deadline`
+- **Dashboard**: MC Media - Handler Heartbeat Deadline (N) (Handler Heartbeats row, stat panel)
+
 ### `mc_media_receive_slot_cap`
 - **Type**: Gauge
 - **Description**: The configured maximum receive slots per declaration, per kind (`MC_MAX_AUDIO_RECEIVE_SLOTS` for `audio`, `MC_MAX_VIDEO_RECEIVE_SLOTS` for `video`)
@@ -1105,7 +1163,7 @@ Retired rather than left as a permanent zero. It counted egress plans for a slot
 - **Type**: Counter
 - **Description**: MH notifications that did not become (or change) participant connectivity, by reason
 - **Labels**:
-  - `reason`: `meeting_unknown`, `participant_unknown`, `user_ambiguous`, `handler_not_in_set`, `unknown_connection`, `connection_bound_refused`, `retired_connection`
+  - `reason`: `meeting_unknown`, `participant_unknown`, `user_ambiguous`, `handler_not_in_set`, `connection_id_missing`, `unknown_connection`, `connection_bound_refused`, `retired_connection`
   - `key_custody`: single value `operator`
 - **Cardinality**: bounded by `Unapplied::ALL`. Shares its first three spellings with `mc_media_sender_binding_responses_total` deliberately (connect path).
 - **Per-value expectations — read per value, never as one rate**:
@@ -1113,7 +1171,8 @@ Retired rather than left as a permanent zero. It counted egress plans for a slot
   - `participant_unknown` — low-rate race (connect overtaking join). The connect is then forgotten for connectivity too; MH declines the session and the client's reconnect brings a fresh notification.
   - `user_ambiguous` — one user with two roster entries: connectivity recorded for NEITHER (fail closed). Never self-clears.
   - `meeting_unknown` — MH notifying about a meeting MC does not hold (both events).
-  - `handler_not_in_set` — the `handler_id` is not byte-identical to a handler of the meeting's handler set. **Sustained, it means an MH process restarted under a new id and story-4 re-registration has not happened**; the meeting's stale connectivity to the dead id does not clear on its own (Scenario 18).
+  - `handler_not_in_set` — **the binding gate** (story 4 MC-B1, ADR-0039 §6): the `handler_id` is not byte-identical to a member of the meeting's handler set (never in it, or REMOVED). A Connected is answered `sender_id` 0 (`mc_media_sender_binding_responses_total{outcome="refused"}`) and NOTHING is recorded, ledger included; a Disconnected is a no-op that touches no other handler's state (a removed handler's bindings are released by the removal path). Sustained, it is an MH incarnation the meeting does not know — a restarted MH, or a zombie of a removed one (Scenario 18).
+  - `connection_id_missing` — an empty `connection_id` (REQUIRED since story 4 MC-B1): refused at the gRPC boundary (Connected: `sender_id` 0 and `refused`; Disconnected: no-op), nothing recorded. Non-zero means an MH older than the connection_id image is in the fleet — an ordering violation (`docs/runbooks/mc-deployment.md`).
   - `connection_bound_refused` — **expected-empty, alertable at `> 0`**: a participant exceeded the live-connection bound on one handler (a reconnect storm or leaked sessions).
   - `retired_connection` — a Connected delivered after its own Disconnected (MH abandoned the Connected, then sent the decline Disconnected); refused by MC's tombstone. Rare; non-zero means MH→MC RPCs are slow enough to be abandoned.
 - **No meeting, participant, handler or connection identity.** `connection_id` is unbounded (one per MH session) and appears in the INFO line at `mc.grpc.media_coordination` as a correlation field only.
@@ -1122,15 +1181,7 @@ Retired rather than left as a permanent zero. It counted egress plans for a slot
 - **Dashboard**: MC Media - MH Notifications Unapplied by Reason (Media Connectivity row; per-reason colours)
 
 ### `mc_mh_notifications_without_connection_id_total`
-- **Type**: Counter
-- **Description**: MH notifications carrying an EMPTY `connection_id` (an MH image that predates the field)
-- **Labels**:
-  - `key_custody`: single value `operator`
-- **Cardinality**: 1
-- **The degraded legacy path, counted so it is not silent.** An empty id maps to one implicit key per (participant, handler) — exactly the pre-field semantics, including the stale-disconnect hazard `connection_id` exists to close. Non-zero means an old MH is still in the fleet (a rolling deploy, or a stuck pod). **Retirement condition**: once this has been flat for a full MH rollout, the legacy branch in `media_routing/connectivity.rs` is deleted.
-- **Usage**: Is any MH still running without `connection_id`?
-- **Recorded in**: `grpc/media_coordination.rs` via `observability/metrics.rs::record_notification_without_connection_id`
-- **Dashboard**: MC Media - Notifications Without Connection Id (Media Connectivity row)
+- **RETIRED (story 4 MC-B1). Version-skew only.** `connection_id` is REQUIRED: an empty one is refused and counted on `mc_mh_notifications_unapplied_total{reason="connection_id_missing"}`. The legacy per-(participant, handler) key and the never-releasable binding set are deleted. A series seen during a rollout comes from an MC image predating MC-B1.
 
 ---
 
