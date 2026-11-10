@@ -1847,7 +1847,7 @@ tasks:
   slug: 2026-11-10-mh-heartbeat-verdicts
   tag: story-2026-10-31-survive-handler-loss-task-MH-2
 - id: 16
-  status: pending
+  status: completed
   specialist: meeting-controller
   deps:
   - 3
@@ -1897,6 +1897,7 @@ tasks:
     SAME-COMMIT OBLIGATIONS: (a) MC_MEDIA_DIAL_TOKEN_TTL_SECONDS row (default, range, TTL/3 refresh) in docs/runbooks/mc-deployment.md §Configuration Reference; (b) n/a retirements; (c) each series with panel + catalog + zero-init + ADR-0032 test; (d) test-gates items; (e) no id labels, tokens and keys never logged.
 
     Tier: full (crypto, credentials, wire).
+  slug: 2026-11-10-mc-media-dial-credential
   tag: story-2026-10-31-survive-handler-loss-task-MC-D
 - id: 17
   status: pending
