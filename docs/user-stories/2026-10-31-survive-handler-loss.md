@@ -1587,7 +1587,7 @@ tasks:
   slug: 2026-11-10-gc-acquire-media-handler
   tag: story-2026-10-31-survive-handler-loss-task-GC-3
 - id: 12
-  status: pending
+  status: completed
   specialist: meeting-controller
   deps:
   - 6
@@ -1641,6 +1641,7 @@ tasks:
     Update docs/specialist-knowledge/meeting-controller/INDEX.md pointers for anything moved.
 
     Tier: full (wire consumer, architectural seam).
+  slug: 2026-11-10-mc-versioned-handler-set
   tag: story-2026-10-31-survive-handler-loss-task-MC-A
 - id: 13
   status: pending
