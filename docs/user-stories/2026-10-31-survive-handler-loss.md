@@ -1645,7 +1645,7 @@ tasks:
   slug: 2026-11-10-mc-versioned-handler-set
   tag: story-2026-10-31-survive-handler-loss-task-MC-A
 - id: 13
-  status: pending
+  status: completed
   specialist: meeting-controller
   deps:
   - 5
@@ -1702,6 +1702,7 @@ tasks:
     SAME-COMMIT OBLIGATIONS: (a) MC_MH_HEARTBEAT_TIMEOUT_MS row in docs/runbooks/mc-deployment.md §Configuration Reference with default, range and its relationship to MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS ([300, 3600]); (b) retirements remove catalog/panel/alert/runbook refs here; (c) each series with panel (infra/grafana/dashboards/mc-media.json) + catalog + zero-init + ADR-0032 test; (d) test-gates items above; (e) no meeting/participant/handler/connection id labels.
 
     Tier: full (proto GSA, architectural seam).
+  slug: 2026-11-10-mc-heartbeat-intake
   tag: story-2026-10-31-survive-handler-loss-task-MC-B1
 - id: 14
   status: pending
