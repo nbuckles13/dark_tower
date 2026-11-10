@@ -1900,7 +1900,7 @@ tasks:
   slug: 2026-11-10-mc-media-dial-credential
   tag: story-2026-10-31-survive-handler-loss-task-MC-D
 - id: 17
-  status: pending
+  status: completed
   specialist: client
   deps:
   - 6
@@ -2002,6 +2002,7 @@ tasks:
     SAME COMMIT: the SDK, web-app and e2e changes, and the clientConfig keys with their config log line and documentation.
 
     Cross-task obligations: (a) each new config key (the redial base and cap, the empty-set notice bound, the HANDLER_RELEASED grace) is documented with default and range in the client config docs and the web-app config reference; (b) no retirements here (P3 deletes the superseded fields); (c) no new or reshaped series here (all of that is C2); (d) implement test-gates.md section "Client", paired with test; (e) R4 label hygiene, with no meeting, participant, handler, ref, URL or slot labels.
+  slug: 2026-11-10-sdk-reconcile-handler-set
   tag: story-2026-10-31-survive-handler-loss-task-C1
 - id: 18
   status: pending
