@@ -7,7 +7,10 @@
 
 #[path = "common/mod.rs"]
 mod test_common;
-use test_common::jwt_fixtures::{TestKeypair, TestServiceClaims};
+use test_common::jwt_fixtures::{
+    sign_hs256, TestKeypair, TestMediaDialClaims, TestMediaDialUserShapedClaims, TestServiceClaims,
+    TestUserClaims,
+};
 
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -628,5 +631,188 @@ async fn test_only_eddsa_algorithm_accepted(pool: PgPool) -> Result<()> {
         "Token with alg:EdDSA should be accepted"
     );
 
+    Ok(())
+}
+
+// =============================================================================
+// R-15 (story 4 GC-3): GC USER auth refuses MC-minted `media_dial` tokens
+// =============================================================================
+//
+// ADR-0039 §5 "cross-meeting KEK guard, by construction": GC verifies only
+// AC-signed tokens (AC JWKS, EdDSA pinned), so an MC-signed `media_dial`
+// token fails here. Every arm is pinned at the VALIDATOR (the exact
+// `JwtError`: over HTTP, KeyNotFound / InvalidSignature / the alg pin all
+// collapse to one 401) AND on a `require_user_auth` route (the join route, not
+// `/api/v1/me`, which is service auth). Arms 2 and 3 use a payload that would
+// deserialize as `UserClaims`, with a positive control signed by the live AC
+// key, so the key / alg is the ONLY possible reason for the rejection.
+
+use common::jwt::{JwksClient, JwtError, UserClaims};
+use gc_service::auth::jwt::CommonJwtValidator;
+
+/// The live AC kid served by the mock JWKS (`TestAuthServer::spawn`).
+const LIVE_KID: &str = "test-key-01";
+/// A `require_user_auth` route. No meeting is seeded, so a token that passes
+/// auth gets 404 NOT_FOUND, and one that fails gets 401.
+const USER_ROUTE: &str = "/api/v1/meetings/NOSUCH1";
+
+impl TestAuthServer {
+    /// GC's validator over the same mocked AC JWKS the router uses.
+    fn validator(&self) -> CommonJwtValidator {
+        let jwks = JwksClient::new(format!("{}/.well-known/jwks.json", self.mock_server.uri()))
+            .expect("jwks client");
+        CommonJwtValidator::new(Arc::new(jwks), 60)
+    }
+
+    /// JWKS fetches the mock has served so far.
+    async fn jwks_fetches(&self) -> usize {
+        self.mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == "/.well-known/jwks.json")
+            .count()
+    }
+
+    async fn user_route_status(&self, token: &str) -> (u16, serde_json::Value) {
+        let response = reqwest::Client::new()
+            .get(format!("{}{USER_ROUTE}", self.url()))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .expect("request");
+        let status = response.status().as_u16();
+        let body = response.json().await.unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+}
+
+/// Positive arm: an AC-signed user token passes GC user auth on the route the
+/// negative arms use (404 meeting-not-found, NOT 401).
+#[sqlx::test(migrations = "../../migrations")]
+async fn r15_ac_signed_user_token_is_accepted(pool: PgPool) -> Result<()> {
+    let server = TestAuthServer::spawn(pool).await?;
+    let now = Utc::now().timestamp();
+    let token = server.keypair.sign_user_token(&TestUserClaims {
+        sub: "user-1".to_string(),
+        org_id: "org-1".to_string(),
+        email: "u1@example.test".to_string(),
+        roles: vec!["user".to_string()],
+        iat: now,
+        exp: now + 300,
+        jti: "jti-ok".to_string(),
+    });
+    let (status, body) = server.user_route_status(&token).await;
+    assert_eq!(
+        status, 404,
+        "auth passed; the meeting does not exist: {body}"
+    );
+    assert_eq!(body["error"]["code"], "NOT_FOUND");
+    Ok(())
+}
+
+/// Arm 1: an MC-minted token carries NO kid (`{"alg":"EdDSA","typ":"JWT"}`).
+/// Rejected at kid extraction, before any JWKS lookup.
+#[sqlx::test(migrations = "../../migrations")]
+async fn r15_media_dial_without_kid_is_rejected_at_kid_extraction(pool: PgPool) -> Result<()> {
+    let server = TestAuthServer::spawn(pool).await?;
+    let mc_key = TestKeypair::new(7, "unused");
+    let token = mc_key.sign_claims(&TestMediaDialClaims::live(Utc::now().timestamp()), None);
+
+    let validator = server.validator();
+    let before = server.jwks_fetches().await;
+    let result = validator.validate::<UserClaims>(&token).await;
+    assert!(
+        matches!(result, Err(JwtError::MissingKid)),
+        "expected MissingKid, got {:?}",
+        result.err()
+    );
+    assert_eq!(
+        server.jwks_fetches().await,
+        before,
+        "rejected before any JWKS lookup"
+    );
+    assert_eq!(server.user_route_status(&token).await.0, 401);
+    Ok(())
+}
+
+/// Arm 2: the LIVE AC kid, signed by a different Ed25519 key → signature
+/// failure (not KeyNotFound: the JWKS is consulted and the key found).
+#[sqlx::test(migrations = "../../migrations")]
+async fn r15_media_dial_with_live_kid_and_foreign_key_fails_signature(pool: PgPool) -> Result<()> {
+    let server = TestAuthServer::spawn(pool).await?;
+    let now = Utc::now().timestamp();
+    let claims = TestMediaDialUserShapedClaims::live(now);
+    let validator = server.validator();
+
+    // Control: the SAME payload signed by the live AC key validates, so the
+    // key is the only thing the negative arm changes.
+    let control = server.keypair.sign_claims(&claims, Some(LIVE_KID));
+    assert!(validator.validate::<UserClaims>(&control).await.is_ok());
+
+    let foreign = TestKeypair::new(2, LIVE_KID);
+    let forged = foreign.sign_claims(&claims, Some(LIVE_KID));
+    let before = server.jwks_fetches().await;
+    let fresh_validator = server.validator();
+    let result = fresh_validator.validate::<UserClaims>(&forged).await;
+    assert!(
+        matches!(result, Err(JwtError::InvalidSignature)),
+        "expected InvalidSignature, got {:?}",
+        result.err()
+    );
+    assert!(
+        server.jwks_fetches().await > before,
+        "the JWKS was consulted: the token reached signature verification"
+    );
+    assert_eq!(server.user_route_status(&forged).await.0, 401);
+
+    // The literal media_dial claim set, foreign-signed: rejected too. A
+    // catch-all (key, claim shape AND `aud` would each reject it); the `aud`
+    // defense is pinned alone in `r15_aud_claim_alone_is_rejected`.
+    let literal = foreign.sign_claims(&TestMediaDialClaims::live(now), Some(LIVE_KID));
+    assert!(validator.validate::<UserClaims>(&literal).await.is_err());
+    assert_eq!(server.user_route_status(&literal).await.0, 401);
+    Ok(())
+}
+
+/// Arm 3: HS256 with the live kid, a REAL HMAC keyed with the AC public key's
+/// raw bytes (the algorithm-confusion attack) → rejected by the EdDSA pin.
+#[sqlx::test(migrations = "../../migrations")]
+async fn r15_media_dial_hs256_is_rejected_by_the_eddsa_pin(pool: PgPool) -> Result<()> {
+    let server = TestAuthServer::spawn(pool).await?;
+    let claims = TestMediaDialUserShapedClaims::live(Utc::now().timestamp());
+    let token = sign_hs256(&server.keypair.public_key_bytes, LIVE_KID, &claims);
+
+    let result = server.validator().validate::<UserClaims>(&token).await;
+    assert!(
+        matches!(result, Err(JwtError::InvalidSignature)),
+        "expected InvalidSignature from the alg pin, got {:?}",
+        result.err()
+    );
+    assert_eq!(server.user_route_status(&token).await.0, 401);
+    Ok(())
+}
+
+/// The `aud` defense, pinned on its own: a COMPLETE user-claim set plus the
+/// media_dial `aud`, signed by the LIVE AC key, is rejected. Only `aud`
+/// differs from the positive control (`r15_media_dial_with_live_kid_*`), so
+/// this pins jsonwebtoken's `validate_aud` default (no expected audience
+/// configured → any `aud` is refused) against a silent dependency change.
+#[sqlx::test(migrations = "../../migrations")]
+async fn r15_aud_claim_alone_is_rejected(pool: PgPool) -> Result<()> {
+    let server = TestAuthServer::spawn(pool).await?;
+    let mut claims =
+        serde_json::to_value(TestMediaDialUserShapedClaims::live(Utc::now().timestamp()))?;
+    claims["aud"] = serde_json::json!("mh-1");
+    let token = server.keypair.sign_claims(&claims, Some(LIVE_KID));
+
+    let result = server.validator().validate::<UserClaims>(&token).await;
+    assert!(
+        matches!(result, Err(JwtError::InvalidSignature)),
+        "a live-key token carrying `aud` must be refused, got {:?}",
+        result.err()
+    );
+    assert_eq!(server.user_route_status(&token).await.0, 401);
     Ok(())
 }

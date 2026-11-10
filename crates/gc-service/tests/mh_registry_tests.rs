@@ -10,6 +10,7 @@ mod test_common;
 use gc_service::repositories::{
     HealthStatus, MediaHandlersRepository, MhRegistrationDecision, NewMhRegistration,
 };
+use gc_service::services::weighted_pick::SystemSelectionRng;
 use gc_service::services::MhSelectionService;
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -294,7 +295,7 @@ async fn test_candidate_set_excludes_draining_stale_and_non_healthy(pool: PgPool
     seed(&pool, "fresh-degraded", "us-east-1", "degraded", fresh).await;
 
     let ids: BTreeSet<String> =
-        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", bound)
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", bound, &[])
             .await
             .unwrap()
             .into_iter()
@@ -316,7 +317,7 @@ async fn test_candidate_bound_is_milliseconds(pool: PgPool) {
     seed(&pool, "ms-fresh", "us-east-1", "healthy", 3200).await;
 
     let ids: BTreeSet<String> =
-        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", bound)
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", bound, &[])
             .await
             .unwrap()
             .into_iter()
@@ -335,25 +336,19 @@ async fn test_selection_size_follows_initial_handlers_config(pool: PgPool) {
     }
     for n in [1_u64, 3] {
         let reg = freshness_registry(n);
-        let selection = MhSelectionService::select_mhs_for_meeting(
+        let selection = MhSelectionService::select(
             &pool,
             "us-east-1",
             reg.staleness_bound(),
             reg.initial_handlers_per_meeting(),
+            &[],
+            &SystemSelectionRng,
         )
         .await
         .expect("selection");
-        let ids: BTreeSet<&str> = selection
-            .handlers
-            .iter()
-            .map(|h| h.mh_id.as_str())
-            .collect();
-        assert_eq!(selection.handlers.len(), reg.initial_handlers_per_meeting());
-        assert_eq!(
-            ids.len(),
-            selection.handlers.len(),
-            "selected handlers are distinct"
-        );
+        let ids: BTreeSet<&str> = selection.iter().map(|h| h.mh_id.as_str()).collect();
+        assert_eq!(selection.len(), reg.initial_handlers_per_meeting());
+        assert_eq!(ids.len(), selection.len(), "selected handlers are distinct");
     }
     // Fewer candidates than N: all of them, never an error.
     let reg = freshness_registry(4);
@@ -361,15 +356,17 @@ async fn test_selection_size_follows_initial_handlers_config(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let selection = MhSelectionService::select_mhs_for_meeting(
+    let selection = MhSelectionService::select(
         &pool,
         "us-east-1",
         reg.staleness_bound(),
         reg.initial_handlers_per_meeting(),
+        &[],
+        &SystemSelectionRng,
     )
     .await
     .expect("selection");
-    assert_eq!(selection.handlers.len(), 2);
+    assert_eq!(selection.len(), 2);
 }
 
 /// Retention: a row older than retention is deleted; a stale-but-younger row
@@ -505,7 +502,7 @@ async fn test_get_candidate_mhs(pool: PgPool) {
 
     // Get candidates
     let candidates =
-        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound())
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound(), &[])
             .await
             .expect("Query should succeed");
 
@@ -592,7 +589,7 @@ async fn test_get_candidate_mhs_filters_by_region(pool: PgPool) {
 
     // Get candidates for us-east-1
     let us_east_candidates =
-        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound())
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound(), &[])
             .await
             .expect("Query should succeed");
 
@@ -601,7 +598,7 @@ async fn test_get_candidate_mhs_filters_by_region(pool: PgPool) {
 
     // Get candidates for eu-west-1
     let eu_west_candidates =
-        MediaHandlersRepository::get_candidate_mhs(&pool, "eu-west-1", shipped_bound())
+        MediaHandlersRepository::get_candidate_mhs(&pool, "eu-west-1", shipped_bound(), &[])
             .await
             .expect("Query should succeed");
 
@@ -610,7 +607,7 @@ async fn test_get_candidate_mhs_filters_by_region(pool: PgPool) {
 
     // Get candidates for non-existent region
     let empty_candidates =
-        MediaHandlersRepository::get_candidate_mhs(&pool, "ap-south-1", shipped_bound())
+        MediaHandlersRepository::get_candidate_mhs(&pool, "ap-south-1", shipped_bound(), &[])
             .await
             .expect("Query should succeed");
 
@@ -670,7 +667,7 @@ async fn test_load_report_with_degraded_health_status(pool: PgPool) {
 
     // Degraded handler should NOT be returned as candidate for new meetings
     let candidates =
-        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound())
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound(), &[])
             .await
             .expect("Query should succeed");
 
@@ -718,7 +715,7 @@ async fn test_get_candidate_mhs_all_at_max_capacity(pool: PgPool) {
 
     // Get candidates - should return empty since all are at capacity
     let candidates =
-        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound())
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound(), &[])
             .await
             .expect("Query should succeed");
 
@@ -790,7 +787,7 @@ async fn test_candidate_selection_load_ratio_boundary(pool: PgPool) {
     .expect("Load report should succeed");
 
     let candidates =
-        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound())
+        MediaHandlersRepository::get_candidate_mhs(&pool, "us-east-1", shipped_bound(), &[])
             .await
             .expect("Query should succeed");
 

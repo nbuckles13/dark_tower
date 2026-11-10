@@ -8,14 +8,18 @@
 //! - `ac_client` - HTTP client for Auth Controller internal endpoints
 //! - `mc_assignment` - Meeting Controller assignment with load balancing
 //! - `mc_client` - gRPC client for GC→MC communication
-//! - `mh_selection` - Media Handler selection for meetings
+//! - `mh_selection` - Media Handler selection (initial allocation and replacement)
+//! - `mh_replacement` - `AcquireMediaHandler` (MC→GC replacement grant, ADR-0039 §3)
+//! - `weighted_pick` - the one weighted-random load-balancing kernel
 
 pub mod ac_client;
 pub mod mc_assignment;
 pub mod mc_client;
+pub mod mh_replacement;
 pub mod mh_selection;
 pub mod telemetry_filter;
 pub mod telemetry_forwarder;
+pub mod weighted_pick;
 
 /// Build the W3C trace-context headers for the active span (R-56 outbound
 /// HTTP surfaces: GC→AC in [`ac_client`] and the telemetry-proxy forward in

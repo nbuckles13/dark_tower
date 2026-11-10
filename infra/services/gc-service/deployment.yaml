@@ -133,6 +133,11 @@ spec:
             configMapKeyRef:
               name: gc-service-config
               key: GC_MH_INITIAL_HANDLERS_PER_MEETING
+        - name: GC_MH_MAX_EXCLUDE_HANDLER_IDS
+          valueFrom:
+            configMapKeyRef:
+              name: gc-service-config
+              key: GC_MH_MAX_EXCLUDE_HANDLER_IDS
         # RegisterMH endpoint allowlists (ADR-0039 §7). REQUIRED; hard refs. The
         # base ConfigMap carries the topology keys EMPTY (GC fails startup naming
         # the key) until the deploy render supplies them (deploy.sh).

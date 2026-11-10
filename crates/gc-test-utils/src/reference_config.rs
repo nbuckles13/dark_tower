@@ -50,11 +50,11 @@ pub fn parse_env_file(text: &str) -> HashMap<String, String> {
     vars
 }
 
-/// The shipped values of the four `GC_MH_*` keys.
+/// The shipped values of the five `GC_MH_*` registry keys.
 ///
 /// # Panics
 ///
-/// If config.env lacks any of the four keys (never returns a partial map), or
+/// If config.env lacks any of the five keys (never returns a partial map), or
 /// the file is malformed.
 #[must_use]
 pub fn reference_mh_registry_vars() -> HashMap<String, String> {

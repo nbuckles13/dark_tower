@@ -21,6 +21,7 @@
 //! per-site rules.
 
 use crate::common::ident::{is_ident_byte, names_identifier};
+use crate::common::promql::LABEL_LIST_MODIFIERS;
 use crate::common::rust_consts::rust_str_consts;
 use std::collections::HashMap;
 
@@ -140,16 +141,6 @@ pub const KIND_LABEL_CO_OCCURRENCE_RULE_ID: &str = "kind_label_co_occurrence";
 /// rewriting history there is wrong. Membership is observability's.
 pub const DOC_PROMQL_SCOPE: &[&str] = &["docs/observability/", "docs/runbooks/"];
 
-/// The clause keywords whose parenthesised label list is a co-occurrence unit.
-const CLAUSE_KEYWORDS: [&str; 6] = [
-    "by",
-    "without",
-    "on",
-    "ignoring",
-    "group_left",
-    "group_right",
-];
-
 /// The byte offset of the bracket closing the one at `open` (same bracket
 /// kind, nesting-aware), or the end of `text`.
 fn closing(text: &str, open: usize, open_b: u8, close_b: u8) -> usize {
@@ -193,7 +184,9 @@ fn groups(expr: &str) -> Groups<'_> {
         }
         i += 1;
     }
-    for kw in CLAUSE_KEYWORDS {
+    // The clause keywords whose parenthesised label list is a co-occurrence
+    // unit: the one shared PromQL label-list modifier list.
+    for kw in LABEL_LIST_MODIFIERS {
         for (at, _) in expr.match_indices(kw) {
             let before = at.checked_sub(1).and_then(|j| bytes.get(j)).copied();
             let after = at + kw.len();

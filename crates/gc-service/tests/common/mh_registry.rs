@@ -11,8 +11,10 @@ use std::time::Duration;
 
 /// Test-local registry for tests ABOUT freshness: 1250 ms × k 3 = a 3750 ms
 /// bound (deliberately not a whole number of seconds), 60 s retention.
+/// The exclude cap is not what these tests are about: 16 (the [4, 64] range
+/// and the > initial-count rule hold for every N in [1, 4]).
 pub fn freshness_registry(initial_handlers_per_meeting: u64) -> MhRegistryConfig {
-    MhRegistryConfig::new(1250, 3, 60, initial_handlers_per_meeting)
+    MhRegistryConfig::new(1250, 3, 60, initial_handlers_per_meeting, 16)
         .expect("valid test registry config")
 }
 

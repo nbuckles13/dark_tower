@@ -43,6 +43,21 @@ pub const MH_ENDPOINT_ALLOWLIST_KEYS: [&str; 5] = [
     "GC_MH_GRPC_ALLOWED_PORTS",
 ];
 
+/// The REQUIRED MH registry keys (story 4 GC-1 R-24/R-26, plus GC-3's
+/// `GC_MH_MAX_EXCLUDE_HANDLER_IDS`, R-23). Each is a positive integer.
+///
+/// This is a MIRROR of `gc_service::config::MH_REGISTRY_KEYS` (the suite links
+/// no service crate, ADR-0028). The hermetic test
+/// `tests::registry_keys_match_gc_config` reads the reader's source and fails
+/// on drift in either direction.
+pub const MH_REGISTRY_KEYS: [&str; 5] = [
+    "GC_MH_LOAD_REPORT_INTERVAL_MS",
+    "GC_MH_STALENESS_MULTIPLIER",
+    "GC_MH_REGISTRY_RETENTION_SECONDS",
+    "GC_MH_INITIAL_HANDLERS_PER_MEETING",
+    "GC_MH_MAX_EXCLUDE_HANDLER_IDS",
+];
+
 /// GC-1's load-report interval key (ms).
 pub const INTERVAL_KEY: &str = "GC_MH_LOAD_REPORT_INTERVAL_MS";
 /// GC-1's staleness multiplier key: `B = k × I`.
@@ -518,6 +533,52 @@ mod tests {
             keys, MH_ENDPOINT_ALLOWLIST_KEYS,
             "GC's MH_ENDPOINT_ALLOWLIST_KEYS drifted from this mirror"
         );
+    }
+
+    /// [`MH_REGISTRY_KEYS`] == the reader's list in
+    /// `crates/gc-service/src/config.rs`, read from the tree; the named
+    /// interval/multiplier constants are members of it.
+    #[test]
+    fn registry_keys_match_gc_config() {
+        let path = crate::repo_root().join("crates/gc-service/src/config.rs");
+        let text = std::fs::read_to_string(&path).expect("read gc-service config.rs");
+        let keys = const_str_array(&text, "MH_REGISTRY_KEYS")
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert_eq!(
+            keys.len(),
+            MH_REGISTRY_KEYS.len(),
+            "extraction produced {keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .all(|k| k.starts_with("GC_MH_") && !k.contains(['"', ' '])),
+            "malformed extraction: {keys:?}"
+        );
+        assert_eq!(
+            keys, MH_REGISTRY_KEYS,
+            "GC's MH_REGISTRY_KEYS drifted from this mirror"
+        );
+        assert!(MH_REGISTRY_KEYS.contains(&INTERVAL_KEY));
+        assert!(MH_REGISTRY_KEYS.contains(&MULTIPLIER_KEY));
+    }
+
+    /// Adverse input for the drift check: a reader source missing one key (or
+    /// carrying an extra one) does NOT compare equal to the mirror.
+    #[test]
+    fn registry_key_drift_is_detected() {
+        let path = crate::repo_root().join("crates/gc-service/src/config.rs");
+        let text = std::fs::read_to_string(&path).expect("read gc-service config.rs");
+        let missing = text.replacen("    \"GC_MH_MAX_EXCLUDE_HANDLER_IDS\",\n", "", 1);
+        assert_ne!(missing, text, "fixture edit must apply");
+        let keys = const_str_array(&missing, "MH_REGISTRY_KEYS").unwrap();
+        assert_ne!(keys, MH_REGISTRY_KEYS, "a missing key must be detected");
+        let extra = text.replacen(
+            "    \"GC_MH_MAX_EXCLUDE_HANDLER_IDS\",\n",
+            "    \"GC_MH_MAX_EXCLUDE_HANDLER_IDS\",\n    \"GC_MH_NEW_KEY\",\n",
+            1,
+        );
+        let keys = const_str_array(&extra, "MH_REGISTRY_KEYS").unwrap();
+        assert_ne!(keys, MH_REGISTRY_KEYS, "an extra key must be detected");
     }
 
     #[test]

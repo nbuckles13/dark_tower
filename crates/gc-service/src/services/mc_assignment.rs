@@ -26,9 +26,10 @@
 use crate::config::MhRegistryConfig;
 use crate::errors::GcError;
 use crate::observability::metrics;
-use crate::repositories::{weighted_random_select, McAssignment, MeetingAssignmentsRepository};
+use crate::repositories::{McAssignment, MeetingAssignmentsRepository};
 use crate::services::mc_client::{McAssignmentResult, McClientTrait, McRejectionReason};
 use crate::services::mh_selection::{MhAssignmentInfo, MhSelection, MhSelectionService};
+use crate::services::weighted_pick::{weighted_random_select, SystemSelectionRng};
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Instant;
@@ -43,7 +44,7 @@ const MAX_MC_ASSIGNMENT_RETRIES: usize = 3;
 /// trusting the peer (see the `Rejected` arm of `assign_meeting_with_mh`).
 ///
 /// For a correct GC over clean data this is always `false`:
-/// `select_mhs_for_meeting` guarantees a non-empty selection and MH registration
+/// the new-assignment path never builds an empty `MhSelection` and MH registration
 /// validates `grpc_endpoint` non-empty. So a `true` result is a genuine GC-side /
 /// data-integrity fault — the only case in which failing fast (rather than retrying
 /// the pool) is the right call.
@@ -76,7 +77,7 @@ pub struct AssignmentWithMh {
     /// incarnation, and takes the new-assignment path again.
     ///
     /// `None` is the only spelling of "no selection": a `Some` is never empty
-    /// (`select_mhs_for_meeting` guarantees at least one handler), which is the
+    /// (the new-assignment path returns `ServiceUnavailable` on an empty selection), which is the
     /// premise `selection_is_malformed` relies on.
     ///
     /// No production code reads this field: the join response carries only
@@ -238,18 +239,42 @@ impl McAssignmentService {
         // an absent selection is structurally unable to reach `assign_meeting`;
         // it is wrapped in `Some` only at `AssignmentWithMh` construction.
         //
-        // ANCHOR (DRY): this is the ONLY `select_mhs_for_meeting` callsite, which
-        // makes `gc_mh_selections_total` 1:1 with new assignments. The stickiness
-        // (assignment reuse) rate in docs/observability/metrics/gc-service.md
-        // (under `gc_mc_assignments_total`) depends on that; a second callsite
-        // must update that expression.
-        let mh_selection = MhSelectionService::select_mhs_for_meeting(
+        // ANCHOR (DRY): `MhSelectionService::select` has exactly TWO callers --
+        // this new-assignment path (count = GC_MH_INITIAL_HANDLERS_PER_MEETING,
+        // empty exclude) and `AcquireMediaHandler`
+        // (`services/mh_replacement.rs`, count = 1, the MC's exclude list).
+        // `select` records no metrics; each caller records its own series.
+        // `gc_mh_selections_total` is recorded HERE ONLY, so it stays 1:1 with
+        // NEW assignments (selection attempts on this path); replacements are
+        // counted by `gc_mh_replacement_requests_total`. The stickiness (assignment
+        // reuse) rate in docs/observability/metrics/gc-service.md (under
+        // `gc_mc_assignments_total`) depends on that; recording selections at a
+        // third site, or inside `select`, must update that expression.
+        let selection_start = Instant::now();
+        // A DB error propagates unrecorded here (as before the refactor);
+        // `gc_db_queries_total{operation="get_candidate_mhs"}` counts it.
+        let handlers = MhSelectionService::select(
             pool,
             region,
             mh_registry.staleness_bound(),
             mh_registry.initial_handlers_per_meeting(),
+            &[],
+            &SystemSelectionRng,
         )
         .await?;
+        if handlers.is_empty() {
+            tracing::warn!(
+                target: "gc.service.mh_selection",
+                region = %region,
+                "No healthy MHs available for selection"
+            );
+            metrics::record_mh_selection("error", false, selection_start.elapsed());
+            return Err(GcError::ServiceUnavailable(
+                "No media handlers available in this region".to_string(),
+            ));
+        }
+        metrics::record_mh_selection("success", handlers.len() > 1, selection_start.elapsed());
+        let mh_selection = MhSelection { handlers };
 
         let mh_ids: Vec<&str> = mh_selection
             .handlers
@@ -292,10 +317,11 @@ impl McAssignmentService {
             }
 
             // Select MC using weighted random
-            let selected_mc = match weighted_random_select(&candidates) {
-                Some(mc) => mc,
-                None => break,
-            };
+            let selected_mc =
+                match weighted_random_select(&candidates, |c| c.load_ratio, &SystemSelectionRng) {
+                    Some(mc) => mc,
+                    None => break,
+                };
 
             let mc_endpoint = selected_mc.grpc_endpoint.clone();
             let mc_id = selected_mc.controller_id.clone();

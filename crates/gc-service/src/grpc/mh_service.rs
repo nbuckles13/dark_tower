@@ -26,12 +26,6 @@ use std::time::Duration;
 use tonic::{Request, Response, Status};
 use tracing::instrument;
 
-/// Maximum allowed handler ID length.
-const MAX_HANDLER_ID_LENGTH: usize = 255;
-
-/// Maximum allowed region length.
-const MAX_REGION_LENGTH: usize = 50;
-
 /// gRPC service for MH registration and load reports.
 pub struct MhService {
     pool: Arc<PgPool>,
@@ -59,40 +53,6 @@ impl MhService {
             staleness_bound: registry.staleness_bound(),
             endpoint_allowlist,
         }
-    }
-
-    /// Validate a handler ID.
-    ///
-    /// Handler IDs must be non-empty, at most 255 characters, and contain
-    /// only alphanumeric characters, hyphens, and underscores.
-    fn validate_handler_id(id: &str) -> Result<(), Status> {
-        if id.is_empty() {
-            return Err(Status::invalid_argument("handler_id is required"));
-        }
-        if id.len() > MAX_HANDLER_ID_LENGTH {
-            return Err(Status::invalid_argument("handler_id is too long"));
-        }
-        // Allow alphanumeric, hyphens, and underscores
-        if !id
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(Status::invalid_argument(
-                "handler_id contains invalid characters",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Validate a region.
-    fn validate_region(region: &str) -> Result<(), Status> {
-        if region.is_empty() {
-            return Err(Status::invalid_argument("region is required"));
-        }
-        if region.len() > MAX_REGION_LENGTH {
-            return Err(Status::invalid_argument("region is too long"));
-        }
-        Ok(())
     }
 
     /// Arm 0 of the RegisterMH rule: shape bounds, then the per-zone
@@ -156,8 +116,8 @@ impl MediaHandlerRegistryService for MhService {
         let req = request.into_inner();
 
         // Pre-rule field checks (not counted as a registration outcome).
-        Self::validate_handler_id(&req.handler_id)?;
-        Self::validate_region(&req.region)?;
+        super::validate_handler_id(&req.handler_id, "handler_id")?;
+        super::validate_region(&req.region)?;
         if req.max_streams == 0 {
             return Err(Status::invalid_argument(
                 "max_streams must be greater than 0",
@@ -277,7 +237,7 @@ impl MediaHandlerRegistryService for MhService {
         let req = request.into_inner();
 
         // Validate handler_id with format checks
-        Self::validate_handler_id(&req.handler_id)?;
+        super::validate_handler_id(&req.handler_id, "handler_id")?;
 
         // Same INTEGER column shape as `max_streams`, and it FAILS OPEN if
         // wrapped: a negative `current_streams` makes `current_streams <
@@ -352,81 +312,10 @@ impl MediaHandlerRegistryService for MhService {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::*;
 
     // === Handler ID Validation Tests ===
 
-    #[test]
-    fn test_validate_handler_id_valid() {
-        assert!(MhService::validate_handler_id("mh-us-east-1-001").is_ok());
-        assert!(MhService::validate_handler_id("mh_123").is_ok());
-        assert!(MhService::validate_handler_id("MH123").is_ok());
-    }
-
-    #[test]
-    fn test_validate_handler_id_empty() {
-        let err = MhService::validate_handler_id("").unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("required"));
-    }
-
-    #[test]
-    fn test_validate_handler_id_too_long() {
-        let long_id = "a".repeat(256);
-        let err = MhService::validate_handler_id(&long_id).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("too long"));
-    }
-
-    #[test]
-    fn test_validate_handler_id_at_255_chars() {
-        let id_255 = "a".repeat(255);
-        assert!(
-            MhService::validate_handler_id(&id_255).is_ok(),
-            "Handler ID at 255 chars should pass"
-        );
-    }
-
-    #[test]
-    fn test_validate_handler_id_invalid_chars() {
-        let err = MhService::validate_handler_id("mh/invalid").unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("invalid characters"));
-
-        let err = MhService::validate_handler_id("mh with space").unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    }
-
     // === Region Validation Tests ===
-
-    #[test]
-    fn test_validate_region_valid() {
-        assert!(MhService::validate_region("us-east-1").is_ok());
-        assert!(MhService::validate_region("eu-west-1").is_ok());
-    }
-
-    #[test]
-    fn test_validate_region_empty() {
-        let err = MhService::validate_region("").unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[test]
-    fn test_validate_region_too_long() {
-        let long_region = "r".repeat(51);
-        let err = MhService::validate_region(&long_region).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("too long"));
-    }
-
-    #[test]
-    fn test_validate_region_at_50_chars() {
-        let region_50 = "r".repeat(50);
-        assert!(
-            MhService::validate_region(&region_50).is_ok(),
-            "Region at 50 chars should pass"
-        );
-    }
 
     // === Endpoint shape bounds (shared with MC; zone rules are in
     // mh_endpoint_policy.rs) ===
@@ -453,7 +342,7 @@ mod integration_tests {
     /// Test-local registry config. 2500 ms is deliberately NOT the shipped
     /// interval, so the push test cannot pass against a hardcoded constant.
     fn registry(interval_ms: u64) -> crate::config::MhRegistryConfig {
-        crate::config::MhRegistryConfig::new(interval_ms, 3, 3600, 2)
+        crate::config::MhRegistryConfig::new(interval_ms, 3, 3600, 2, 16)
             .expect("valid test registry config")
     }
 

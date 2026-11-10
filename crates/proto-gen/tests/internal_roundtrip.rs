@@ -68,6 +68,15 @@
 //! - **`media_dial_public_key` of any length but 32 rejects the registration**
 //!   (31 and 33 bytes are representable on the wire; see
 //!   `media_dial_public_key_survives_byte_exact_and_any_length_is_representable`).
+//!
+//! Story 4 GC-3 (`AcquireMediaHandler`, ADR-0039 §3) adds, under the same
+//! receiver-only reasoning: the exclude-list cap, an invalid `trigger`
+//! (UNSPECIFIED / MEETING_ENDED / unknown number), not-owner and no-capacity are
+//! all gRPC statuses decided by GC, and a zero `max_exclude_handler_ids` failing
+//! registration is MC's (MC-C). Their tests live with GC
+//! (`crates/gc-service/tests/mh_replacement_tests.rs`) and MC. What this file
+//! pins is that each distinguishing value survives the wire, in the GC-3
+//! section at the end.
 
 // Test code: a failed decode IS the failure signal here, so panicking is the
 // assertion mechanism rather than a defect.
@@ -89,12 +98,13 @@
 )]
 
 use proto_gen::dark_tower::internal::v1::{
-    ApplyRefusal, CandidateSource, DisconnectReason, EgressStream, EndMeetingRequest,
-    EndMeetingResponse, HeartbeatVerdict, MeetingHeartbeatRequest, MeetingHeartbeatResponse,
+    AcquireMediaHandlerRequest, AcquireMediaHandlerResponse, ApplyRefusal, CandidateSource,
+    DisconnectReason, EgressStream, EndMeetingRequest, EndMeetingResponse, HeartbeatVerdict,
+    MeetingHeartbeatRequest, MeetingHeartbeatResponse, MhAssignment,
     NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
-    NotifyParticipantDisconnectedRequest, RegisterMeetingRequest, RegisterMeetingResponse,
-    ReleaseCause, SelectionRules, ServingState, SourceDisposition, SourceStream, SourceStreamEcho,
-    SubscriberSlot,
+    NotifyParticipantDisconnectedRequest, RegisterMcResponse, RegisterMeetingRequest,
+    RegisterMeetingResponse, ReleaseCause, SelectionRules, ServingState, SourceDisposition,
+    SourceStream, SourceStreamEcho, SubscriberSlot,
 };
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 use proto_gen::Message;
@@ -1140,4 +1150,140 @@ fn empty_media_dial_public_key_emits_no_field_and_a_populated_one_does() {
         ..populated_request()
     };
     assert!(top_level_field_numbers(&populated.encode_to_vec()).contains(&tag));
+}
+
+// ============================================================================
+// Story 4 GC-3 (ADR-0039 §3): the MC→GC replacement grant and its cap.
+// ============================================================================
+
+fn acquire_request() -> AcquireMediaHandlerRequest {
+    AcquireMediaHandlerRequest {
+        meeting_id: "meeting-1".to_string(),
+        controller_id: "mc-7".to_string(),
+        exclude_handler_ids: vec!["mh-a".to_string(), "mh-b".to_string(), "mh-a".to_string()],
+        trigger: ReleaseCause::HeartbeatTimeout as i32,
+        replaced_handler_id: Some("mh-a".to_string()),
+    }
+}
+
+/// Every field survives, and the exclude list keeps order AND duplicates: the
+/// cap is checked on the raw length, so the wire must not collapse a repeated
+/// id (a set-collapsing transport would make cap+1 look like cap).
+#[test]
+fn acquire_media_handler_request_roundtrips_with_duplicates_preserved() {
+    let out = roundtrip(&acquire_request());
+    assert_eq!(out, acquire_request());
+    assert_eq!(out.exclude_handler_ids.len(), 3);
+}
+
+/// `replaced_handler_id` has explicit presence: absent (no replaced handler,
+/// `gc_view=unregistered`) and present-but-empty (malformed, INVALID_ARGUMENT)
+/// must decode as different values, and a populated one as itself.
+#[test]
+fn replaced_handler_id_absent_empty_and_populated_are_distinct() {
+    let absent = roundtrip(&AcquireMediaHandlerRequest {
+        replaced_handler_id: None,
+        ..acquire_request()
+    });
+    let empty = roundtrip(&AcquireMediaHandlerRequest {
+        replaced_handler_id: Some(String::new()),
+        ..acquire_request()
+    });
+    assert_eq!(absent.replaced_handler_id, None);
+    assert_eq!(empty.replaced_handler_id, Some(String::new()));
+    assert_ne!(absent, empty);
+    assert_eq!(
+        roundtrip(&acquire_request()).replaced_handler_id.as_deref(),
+        Some("mh-a")
+    );
+}
+
+/// Every `trigger` value GC must REJECT reaches it as itself: UNSPECIFIED (the
+/// default), MEETING_ENDED, and an unknown number (proto3 enums are open, so it
+/// decodes rather than failing). Positive control: a removal value survives.
+#[test]
+fn every_invalid_trigger_survives_the_wire_for_gc_to_reject() {
+    for t in [
+        ReleaseCause::Unspecified as i32,
+        ReleaseCause::MeetingEnded as i32,
+        UNKNOWN_ENUM_VALUE,
+    ] {
+        let out = roundtrip(&AcquireMediaHandlerRequest {
+            trigger: t,
+            ..acquire_request()
+        });
+        assert_eq!(out.trigger, t);
+    }
+    let unspecified = AcquireMediaHandlerRequest::decode(&[][..]).expect("empty decodes");
+    assert_eq!(unspecified.trigger, ReleaseCause::Unspecified as i32);
+    assert_eq!(
+        roundtrip(&acquire_request()).trigger,
+        ReleaseCause::HeartbeatTimeout as i32
+    );
+}
+
+/// The default response carries NO assignment: an OK with an empty body is not
+/// a grant (the receiver fails closed). Positive control: a populated grant
+/// survives with every endpoint.
+#[test]
+fn default_acquire_response_carries_no_assignment() {
+    let empty = AcquireMediaHandlerResponse::decode(&[][..]).expect("empty decodes");
+    assert_eq!(empty.assignment, None);
+
+    let granted = MhAssignment {
+        mh_id: "mh-c".to_string(),
+        webtransport_endpoint: "https://mh-c.example:443".to_string(),
+        grpc_endpoint: "grpc://10.0.0.3:50053".to_string(),
+    };
+    let out = roundtrip(&AcquireMediaHandlerResponse {
+        assignment: Some(granted.clone()),
+    });
+    assert_eq!(out.assignment, Some(granted));
+}
+
+const RMC_MAX_EXCLUDE_HANDLER_IDS: u64 = 5;
+
+/// A GC predating the cap sends no field 5, which decodes as 0 -- the value MC
+/// must refuse (MC-C). A populated cap emits tag 5 and survives.
+#[test]
+fn absent_max_exclude_handler_ids_decodes_as_zero_and_a_populated_cap_survives() {
+    let old_gc = RegisterMcResponse {
+        accepted: true,
+        message: String::new(),
+        fast_heartbeat_interval_ms: 10_000,
+        comprehensive_heartbeat_interval_ms: 30_000,
+        max_exclude_handler_ids: 0,
+    };
+    let fields = top_level_field_numbers(&old_gc.encode_to_vec());
+    assert!(!fields.contains(&RMC_MAX_EXCLUDE_HANDLER_IDS), "{fields:?}");
+    assert_eq!(roundtrip(&old_gc).max_exclude_handler_ids, 0);
+
+    let new_gc = RegisterMcResponse {
+        max_exclude_handler_ids: 16,
+        ..old_gc
+    };
+    let fields = top_level_field_numbers(&new_gc.encode_to_vec());
+    assert!(fields.contains(&RMC_MAX_EXCLUDE_HANDLER_IDS), "{fields:?}");
+    assert_eq!(roundtrip(&new_gc).max_exclude_handler_ids, 16);
+}
+
+/// The GC-3 tags are frozen: request 1..=5 in order (a repeated string emits
+/// one tag-3 record per entry), response assignment at 1.
+#[test]
+fn gc3_frozen_tags_are_on_the_wire() {
+    let one_exclude = AcquireMediaHandlerRequest {
+        exclude_handler_ids: vec!["mh-a".to_string()],
+        ..acquire_request()
+    };
+    assert_eq!(
+        top_level_field_numbers(&one_exclude.encode_to_vec()),
+        vec![1, 2, 3, 4, 5]
+    );
+    let response = AcquireMediaHandlerResponse {
+        assignment: Some(MhAssignment {
+            mh_id: "mh-c".to_string(),
+            ..MhAssignment::default()
+        }),
+    };
+    assert_eq!(top_level_field_numbers(&response.encode_to_vec()), vec![1]);
 }

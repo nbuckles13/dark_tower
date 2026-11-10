@@ -1,23 +1,31 @@
 //! Media Handler Selection Service.
 //!
-//! Provides MH selection logic for meeting assignments per ADR-0010 Section 4a.
-//! Uses weighted random selection based on load ratio.
+//! ONE selection function for initial allocation AND replacement (ADR-0039 §3,
+//! user ruling R-23): [`MhSelectionService::select`]`(region, count, exclude)`.
+//! Initial assignment calls it with `count = GC_MH_INITIAL_HANDLERS_PER_MEETING`
+//! and an empty exclude list; `AcquireMediaHandler` with `count = 1` and the
+//! request's exclude list. The pick is weighted-random by load ratio through
+//! the shared kernel (`services::weighted_pick`).
+//!
+//! `select` records NO metrics: each caller owns its series
+//! (`gc_mh_selection_*` for new assignments, `gc_mh_replacement_*` for
+//! replacements), so neither counts the other's work.
 //!
 //! # Security
 //!
-//! - Uses CSPRNG for weighted random selection
+//! - Uses CSPRNG for weighted random selection (injectable for tests only)
 //! - All database operations use parameterized queries
 //! - Error messages are generic to prevent information leakage
 
 use crate::errors::GcError;
-use crate::observability::metrics;
 use crate::repositories::{MediaHandlersRepository, MhCandidate};
-use ring::rand::{SecureRandom, SystemRandom};
+use crate::services::weighted_pick::{weighted_random_select, SelectionRng};
+use proto_gen::dark_tower::internal::v1::MhAssignment;
 use sqlx::PgPool;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::instrument;
 
-/// Result of MH selection for a meeting.
+/// Result of MH selection for a NEW meeting assignment.
 ///
 /// Contains one or more MH peers selected by load/AZ.
 /// All handlers are active/active -- there is no primary/backup distinction.
@@ -39,56 +47,67 @@ pub struct MhAssignmentInfo {
     pub grpc_endpoint: String,
 }
 
+impl From<MhAssignmentInfo> for MhAssignment {
+    fn from(h: MhAssignmentInfo) -> Self {
+        Self {
+            mh_id: h.mh_id,
+            webtransport_endpoint: h.webtransport_endpoint,
+            grpc_endpoint: h.grpc_endpoint,
+        }
+    }
+}
+
+impl From<&MhAssignmentInfo> for MhAssignment {
+    fn from(h: &MhAssignmentInfo) -> Self {
+        h.clone().into()
+    }
+}
+
+/// The ONE MH freshness rule in Rust: fresh iff the last load report is
+/// younger than the staleness bound (the SQL's `last_heartbeat_at > NOW() -
+/// bound`, see `MediaHandlersRepository::get_candidate_mhs`). Used by
+/// `mh_replacement::classify` for `gc_view`, and by the eligibility oracle in
+/// `tests/mh_replacement_tests.rs` that proves the SQL predicate.
+#[must_use]
+pub fn is_fresh(heartbeat_age: Duration, staleness_bound: Duration) -> bool {
+    heartbeat_age < staleness_bound
+}
+
 /// Service for MH selection operations.
 pub struct MhSelectionService;
 
 impl MhSelectionService {
-    /// Select MHs for a meeting in a region.
+    /// Select up to `count` distinct MHs in `region`, never any id in
+    /// `exclude`.
     ///
-    /// Selects up to `initial_handlers_per_meeting` (`GC_MH_INITIAL_HANDLERS_PER_MEETING`)
-    /// distinct MH peers using weighted random selection based on load ratio,
-    /// each pick drawn from the candidates not yet picked. All selected
-    /// handlers are active/active -- there is no primary/backup distinction.
+    /// Each pick is weighted-random by load ratio among the candidates not yet
+    /// picked. `exclude` is applied inside the candidate query, before its
+    /// least-loaded cut. Unknown ids in `exclude` are ignored.
     ///
-    /// # Arguments
-    ///
-    /// * `pool` - Database connection pool
-    /// * `region` - Region to select MHs from
-    /// * `staleness_bound` - The MH staleness bound (`MhRegistryConfig::staleness_bound`)
-    /// * `initial_handlers_per_meeting` - Upper bound on handlers selected
+    /// Deliberately takes nothing about WHY the selection happens (no
+    /// trigger, no replaced handler, no GC health view): selection is
+    /// identical with and without replacement evidence (ADR-0039 §9).
     ///
     /// # Returns
     ///
-    /// Returns `MhSelection` with one or more MH handlers.
+    /// The picked handlers, possibly EMPTY (no eligible candidate). An empty
+    /// result is not an error: each caller maps it to its own answer.
     ///
     /// # Errors
     ///
-    /// - `GcError::ServiceUnavailable` - No healthy MHs available
-    /// - `GcError::Database` - Database operation failed
-    #[instrument(skip_all, fields(region = %region))]
-    pub async fn select_mhs_for_meeting(
+    /// `GcError::Database` (or `Internal`) on a query failure.
+    #[instrument(skip_all, fields(region = %region, count = count, exclude_count = exclude.len()))]
+    pub async fn select(
         pool: &PgPool,
         region: &str,
         staleness_bound: Duration,
-        initial_handlers_per_meeting: usize,
-    ) -> Result<MhSelection, GcError> {
-        let start = Instant::now();
-
-        // Get candidate MHs
+        count: usize,
+        exclude: &[String],
+        rng: &dyn SelectionRng,
+    ) -> Result<Vec<MhAssignmentInfo>, GcError> {
         let candidates =
-            MediaHandlersRepository::get_candidate_mhs(pool, region, staleness_bound).await?;
-
-        if candidates.is_empty() {
-            tracing::warn!(
-                target: "gc.service.mh_selection",
-                region = %region,
-                "No healthy MHs available for selection"
-            );
-            metrics::record_mh_selection("error", false, start.elapsed());
-            return Err(GcError::ServiceUnavailable(
-                "No media handlers available in this region".to_string(),
-            ));
-        }
+            MediaHandlersRepository::get_candidate_mhs(pool, region, staleness_bound, exclude)
+                .await?;
 
         tracing::debug!(
             target: "gc.service.mh_selection",
@@ -97,98 +116,37 @@ impl MhSelectionService {
             "Found candidate MHs for selection"
         );
 
-        let mut handlers = Vec::with_capacity(initial_handlers_per_meeting);
-        let mut remaining = candidates;
-
-        while handlers.len() < initial_handlers_per_meeting {
-            let Some(picked) = weighted_random_select(&remaining).cloned() else {
-                break;
-            };
-            tracing::debug!(
-                target: "gc.service.mh_selection",
-                mh_id = %picked.handler_id,
-                load_ratio = picked.load_ratio,
-                mh_index = handlers.len(),
-                "Selected MH"
-            );
-            remaining.retain(|c| c.handler_id != picked.handler_id);
-            handlers.push(MhAssignmentInfo {
-                mh_id: picked.handler_id,
-                webtransport_endpoint: picked.webtransport_endpoint,
-                grpc_endpoint: picked.grpc_endpoint,
-            });
-        }
-
-        if handlers.is_empty() {
-            // Unreachable with a non-empty candidate list and N >= 1 (config
-            // floor), but never return an empty selection.
-            metrics::record_mh_selection("error", false, start.elapsed());
-            return Err(GcError::ServiceUnavailable(
-                "No media handlers available in this region".to_string(),
-            ));
-        }
-
-        let has_multiple = handlers.len() > 1;
-        metrics::record_mh_selection("success", has_multiple, start.elapsed());
-
-        Ok(MhSelection { handlers })
+        Ok(pick(candidates, count, rng))
     }
 }
 
-/// Select an MH from candidates using weighted random selection.
-///
-/// Weight is inversely proportional to load ratio:
-/// - 0% loaded = weight 1.0
-/// - 90% loaded = weight 0.1
-///
-/// This prevents thundering herd to a single MH while preferring less-loaded instances.
-fn weighted_random_select(candidates: &[MhCandidate]) -> Option<&MhCandidate> {
-    if candidates.is_empty() {
-        return None;
-    }
-
-    if candidates.len() == 1 {
-        return candidates.first();
-    }
-
-    // Calculate weights: weight = 1.0 - load_ratio (capped at 0.99 to ensure minimum weight)
-    let weights: Vec<f64> = candidates
-        .iter()
-        .map(|mh| 1.0 - mh.load_ratio.min(0.99))
-        .collect();
-
-    let total: f64 = weights.iter().sum();
-    if total <= 0.0 {
-        return candidates.first();
-    }
-
-    // Generate random value using CSPRNG
-    let rng = SystemRandom::new();
-    let mut random_bytes = [0u8; 8];
-    if rng.fill(&mut random_bytes).is_err() {
-        // Fallback to first candidate if CSPRNG fails
-        tracing::warn!(
+/// Up to `count` weighted-random picks without replacement.
+fn pick(
+    mut remaining: Vec<MhCandidate>,
+    count: usize,
+    rng: &dyn SelectionRng,
+) -> Vec<MhAssignmentInfo> {
+    let mut handlers = Vec::with_capacity(count);
+    while handlers.len() < count {
+        let Some(picked) = weighted_random_select(&remaining, |c| c.load_ratio, rng).cloned()
+        else {
+            break;
+        };
+        tracing::debug!(
             target: "gc.service.mh_selection",
-            "CSPRNG failed, falling back to first candidate"
+            mh_id = %picked.handler_id,
+            load_ratio = picked.load_ratio,
+            mh_index = handlers.len(),
+            "Selected MH"
         );
-        return candidates.first();
+        remaining.retain(|c| c.handler_id != picked.handler_id);
+        handlers.push(MhAssignmentInfo {
+            mh_id: picked.handler_id,
+            webtransport_endpoint: picked.webtransport_endpoint,
+            grpc_endpoint: picked.grpc_endpoint,
+        });
     }
-
-    // Convert bytes to f64 in range [0, 1)
-    let random_u64 = u64::from_le_bytes(random_bytes);
-    let random_f64 = (random_u64 as f64) / (u64::MAX as f64);
-    let mut choice = random_f64 * total;
-
-    // Select based on weight
-    for (i, weight) in weights.iter().enumerate() {
-        choice -= weight;
-        if choice <= 0.0 {
-            return candidates.get(i);
-        }
-    }
-
-    // Fallback to last candidate (floating point edge case)
-    candidates.last()
+    handlers
 }
 
 #[cfg(test)]
@@ -196,90 +154,55 @@ fn weighted_random_select(candidates: &[MhCandidate]) -> Option<&MhCandidate> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_weighted_random_select_empty() {
-        let candidates: Vec<MhCandidate> = vec![];
-        assert!(weighted_random_select(&candidates).is_none());
-    }
+    use crate::services::weighted_pick::SystemSelectionRng;
 
-    #[test]
-    fn test_weighted_random_select_single() {
-        let candidates = vec![MhCandidate {
-            handler_id: "mh-1".to_string(),
-            webtransport_endpoint: "https://mh1:443".to_string(),
-            grpc_endpoint: "https://mh1:50051".to_string(),
-            load_ratio: 0.5,
-        }];
-
-        let selected = weighted_random_select(&candidates);
-        assert!(selected.is_some());
-        assert_eq!(selected.unwrap().handler_id, "mh-1");
-    }
-
-    #[test]
-    fn test_weighted_random_select_multiple_returns_valid() {
-        let candidates = vec![
-            MhCandidate {
-                handler_id: "mh-1".to_string(),
-                webtransport_endpoint: "https://mh1:443".to_string(),
-                grpc_endpoint: "https://mh1:50051".to_string(),
-                load_ratio: 0.1,
-            },
-            MhCandidate {
-                handler_id: "mh-2".to_string(),
-                webtransport_endpoint: "https://mh2:443".to_string(),
-                grpc_endpoint: "https://mh2:50051".to_string(),
-                load_ratio: 0.9,
-            },
-        ];
-
-        // Run multiple times to verify it always returns a valid candidate
-        for _ in 0..100 {
-            let selected = weighted_random_select(&candidates);
-            assert!(selected.is_some());
-            let mh_id = &selected.unwrap().handler_id;
-            assert!(mh_id == "mh-1" || mh_id == "mh-2");
+    fn cand(id: &str, load: f64) -> MhCandidate {
+        MhCandidate {
+            handler_id: id.to_string(),
+            webtransport_endpoint: format!("https://{id}:443"),
+            grpc_endpoint: format!("grpc://{id}:50051"),
+            load_ratio: load,
         }
     }
 
     #[test]
-    fn test_weighted_random_select_prefers_lower_load() {
-        let candidates = vec![
-            MhCandidate {
-                handler_id: "mh-light".to_string(),
-                webtransport_endpoint: "https://mh1:443".to_string(),
-                grpc_endpoint: "https://mh1:50051".to_string(),
-                load_ratio: 0.0, // Empty, weight = 1.0
-            },
-            MhCandidate {
-                handler_id: "mh-heavy".to_string(),
-                webtransport_endpoint: "https://mh2:443".to_string(),
-                grpc_endpoint: "https://mh2:50051".to_string(),
-                load_ratio: 0.99, // Almost full, weight = 0.01
-            },
-        ];
-
-        // Run many times and count selections
-        let mut light_count = 0;
-        let mut heavy_count = 0;
-
-        for _ in 0..1000 {
-            let selected = weighted_random_select(&candidates);
-            assert!(selected.is_some());
-            match selected.unwrap().handler_id.as_str() {
-                "mh-light" => light_count += 1,
-                "mh-heavy" => heavy_count += 1,
-                _ => unreachable!(),
-            }
-        }
-
-        // Light should be selected much more often
-        assert!(
-            light_count > heavy_count * 10,
-            "Expected light ({}) to be selected much more than heavy ({})",
-            light_count,
-            heavy_count
+    fn pick_returns_distinct_handlers_up_to_count() {
+        let picked = pick(
+            vec![cand("a", 0.1), cand("b", 0.2), cand("c", 0.3)],
+            2,
+            &SystemSelectionRng,
         );
+        assert_eq!(picked.len(), 2);
+        assert_ne!(picked[0].mh_id, picked[1].mh_id);
+    }
+
+    #[test]
+    fn pick_returns_all_when_fewer_than_count_and_empty_for_none() {
+        assert_eq!(pick(vec![cand("a", 0.1)], 3, &SystemSelectionRng).len(), 1);
+        assert!(pick(vec![], 1, &SystemSelectionRng).is_empty());
+    }
+
+    #[test]
+    fn is_fresh_boundary() {
+        let bound = Duration::from_millis(3750);
+        assert!(is_fresh(Duration::ZERO, bound));
+        assert!(is_fresh(Duration::from_millis(3749), bound));
+        assert!(!is_fresh(Duration::from_millis(3750), bound));
+    }
+
+    #[test]
+    fn assignment_info_maps_to_proto() {
+        let info = MhAssignmentInfo {
+            mh_id: "mh-1".to_string(),
+            webtransport_endpoint: "https://mh-1:443".to_string(),
+            grpc_endpoint: "grpc://mh-1:50051".to_string(),
+        };
+        let by_ref = MhAssignment::from(&info);
+        let by_value = MhAssignment::from(info);
+        assert_eq!(by_ref, by_value);
+        assert_eq!(by_value.mh_id, "mh-1");
+        assert_eq!(by_value.webtransport_endpoint, "https://mh-1:443");
+        assert_eq!(by_value.grpc_endpoint, "grpc://mh-1:50051");
     }
 
     #[test]
