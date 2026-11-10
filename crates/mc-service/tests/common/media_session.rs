@@ -436,7 +436,10 @@ pub fn connection_id_for(user: &str, handler_id: &str) -> String {
 /// A `McMediaCoordinationService` over the stack's controller — the real MH→MC
 /// ingestion path.
 fn coordination(stack: &TestStackHandles) -> McMediaCoordinationService {
-    McMediaCoordinationService::new(Arc::clone(&stack.controller_handle))
+    McMediaCoordinationService::new(
+        Arc::clone(&stack.controller_handle),
+        super::heartbeat_intake("mc-test"),
+    )
 }
 
 /// Send one `NotifyParticipantConnected` exactly as MH would. Returns the

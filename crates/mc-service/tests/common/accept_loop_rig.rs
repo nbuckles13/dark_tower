@@ -148,6 +148,7 @@ impl AcceptLoopRig {
             mc_id,
             mc_grpc_endpoint,
             client_media_config,
+            super::heartbeat_timing(),
             max_connections,
             std::time::Duration::from_secs(10),
             cancel_token.clone(),

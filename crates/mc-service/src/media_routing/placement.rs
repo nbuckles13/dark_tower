@@ -25,7 +25,8 @@
 //!   binding gate admits it) until its push worker's first `RegisterMeeting`
 //!   is acked, then `Active`. **Register before token** (L4-2): only Active
 //!   handlers are ever client-visible.
-//! - **removed record**: ids removed for the meeting's life. One-way: a removed
+//! - **removed record**: ids removed for the meeting's life, each with its
+//!   [`RemovalTrigger`] (the RELEASED verdict's cause). One-way: a removed
 //!   id is never re-added.
 //!
 //! # `handler_set_version` and when a set is emitted
@@ -94,7 +95,7 @@
 //! This is §9 edge placement, not §7 selection.
 
 use super::assignment::HandlerId;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
 /// One assigned media handler, as GC's assignment describes it.
@@ -107,6 +108,35 @@ pub struct HandlerEndpoint {
     pub webtransport_url: String,
     /// The gRPC endpoint MC programs the handler through.
     pub grpc_endpoint: String,
+}
+
+/// Why MC removed a handler from a meeting (ADR-0039 §2/§6). MC's domain
+/// enum: the wire `ReleaseCause` is reached ONLY through
+/// [`Self::release_cause`], and `MEETING_ENDED`/`UNSPECIFIED` are not removal
+/// triggers, so they are unrepresentable here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalTrigger {
+    /// Declared Dead: no accepted heartbeat within N.
+    HeartbeatTimeout,
+    /// Declared Impaired: applied generation lagging too long, or a
+    /// load-dependent apply refusal.
+    ApplyLag,
+    /// A deliberate move off a DRAINING handler.
+    PlannedTransfer,
+}
+
+impl RemovalTrigger {
+    /// The ONE projection onto the wire `ReleaseCause` (RELEASED verdicts,
+    /// `EndMeetingRequest.cause`, `AcquireMediaHandlerRequest.trigger`).
+    #[must_use]
+    pub fn release_cause(self) -> proto_gen::dark_tower::internal::v1::ReleaseCause {
+        use proto_gen::dark_tower::internal::v1::ReleaseCause;
+        match self {
+            Self::HeartbeatTimeout => ReleaseCause::HeartbeatTimeout,
+            Self::ApplyLag => ReleaseCause::ApplyLag,
+            Self::PlannedTransfer => ReleaseCause::PlannedTransfer,
+        }
+    }
 }
 
 /// A handler-set mutation was refused. Every refusal leaves the set (and its
@@ -213,8 +243,9 @@ pub struct ClientHandlerSet {
 pub struct MeetingHandlers {
     /// Sorted by id; ids and client urls unique.
     members: Vec<Member>,
-    /// Ids removed for the meeting's life (one-way).
-    removed: BTreeSet<HandlerId>,
+    /// Ids removed for the meeting's life (one-way), each with WHY — the
+    /// RELEASED verdict's cause (ADR-0039 §6).
+    removed: BTreeMap<HandlerId, RemovalTrigger>,
     version: u64,
     /// The next `handler_ref` to allocate; `None` once exhausted.
     next_ref: Option<NonZeroU32>,
@@ -232,7 +263,7 @@ impl MeetingHandlers {
     pub fn empty() -> Self {
         Self {
             members: Vec::new(),
-            removed: BTreeSet::new(),
+            removed: BTreeMap::new(),
             version: 0,
             next_ref: Some(NonZeroU32::MIN),
         }
@@ -299,7 +330,7 @@ impl MeetingHandlers {
         &mut self,
         endpoint: HandlerEndpoint,
     ) -> Result<(NonZeroU32, SetChange), HandlerSetError> {
-        if self.removed.contains(&endpoint.id) {
+        if self.removed.contains_key(&endpoint.id) {
             return Err(HandlerSetError::PreviouslyRemoved);
         }
         if self.members.iter().any(|m| m.endpoint.id == endpoint.id) {
@@ -370,25 +401,66 @@ impl MeetingHandlers {
         }))
     }
 
-    /// Remove a handler for the rest of the meeting (one-way). `Ok(None)` (no
-    /// bump) if it is not a member. `active_changed` is whether it was Active.
+    /// Remove a handler for the rest of the meeting (one-way), recording why.
+    /// `Ok(None)` (no bump) if it is not a member. `active_changed` is whether
+    /// it was Active.
+    ///
+    /// Production callers go through the meeting actor's ONE removal helper
+    /// (`remove_handler`), which also drops the handler's liveness record —
+    /// never call this directly from actor code.
     ///
     /// # Errors
     ///
     /// [`HandlerSetError::VersionExhausted`]; nothing changes.
-    pub fn remove(&mut self, id: &HandlerId) -> Result<Option<SetChange>, HandlerSetError> {
+    pub fn remove(
+        &mut self,
+        id: &HandlerId,
+        trigger: RemovalTrigger,
+    ) -> Result<Option<SetChange>, HandlerSetError> {
         let Some(at) = self.members.iter().position(|m| &m.endpoint.id == id) else {
             return Ok(None);
         };
         let next = self.next_version()?;
         let member = self.members.remove(at);
         let was_active = member.is_active();
-        self.removed.insert(member.endpoint.id);
+        self.removed.insert(member.endpoint.id, trigger);
         self.version = next;
         Ok(Some(SetChange {
             version: next,
             active_changed: was_active,
         }))
+    }
+
+    /// The verdict a heartbeat from `wire_handler_id` gets (ADR-0039 §6), by
+    /// exact match: a member (Registering included — the race gate) is OWNED;
+    /// a removed id is RELEASED with its trigger; anything else on this live
+    /// meeting is a misroute. Never mutates; never adds.
+    #[must_use]
+    pub fn heartbeat_verdict(&self, wire_handler_id: &str) -> super::HeartbeatVerdict {
+        self.heartbeat_member(wire_handler_id)
+            .map_or_else(|released| released, |_| super::HeartbeatVerdict::Owned)
+    }
+
+    /// [`Self::heartbeat_verdict`] carrying the resolved member on OWNED, so
+    /// the caller's liveness write is keyed by a handler the set already
+    /// proved a member (no second, fallible lookup). `Err` is the RELEASED
+    /// verdict.
+    ///
+    /// # Errors
+    ///
+    /// The non-OWNED verdict: [`super::HeartbeatVerdict::Removed`] or
+    /// [`super::HeartbeatVerdict::Unassigned`].
+    pub fn heartbeat_member(
+        &self,
+        wire_handler_id: &str,
+    ) -> Result<HandlerId, super::HeartbeatVerdict> {
+        if let Some(endpoint) = self.resolve(wire_handler_id) {
+            return Ok(endpoint.id.clone());
+        }
+        Err(match self.removed.get(&HandlerId::new(wire_handler_id)) {
+            Some(trigger) => super::HeartbeatVerdict::Removed(*trigger),
+            None => super::HeartbeatVerdict::Unassigned,
+        })
     }
 
     /// The current `handler_set_version`.
@@ -672,7 +744,9 @@ mod tests {
         let r1 = set.handler_ref_of(&hid("mh-1")).unwrap();
         assert_ne!(r0, r1);
         // Remove mh-0, then a NEW incarnation at the SAME address.
-        set.remove(&hid("mh-0")).unwrap().unwrap();
+        set.remove(&hid("mh-0"), RemovalTrigger::HeartbeatTimeout)
+            .unwrap()
+            .unwrap();
         let (r2, _) = set
             .add(endpoint_at("mh-0b", "https://mh-0.example:4434"))
             .unwrap();
@@ -682,10 +756,53 @@ mod tests {
         );
     }
 
+    /// ADR-0039 §6 verdict arms from the set's own state; each removed id
+    /// keeps ITS OWN trigger (two removals, two triggers, so a hard-coded
+    /// trigger cannot pass).
+    #[test]
+    fn heartbeat_verdict_reads_membership_and_the_removed_record() {
+        use crate::media_routing::HeartbeatVerdict;
+        let mut set = MeetingHandlers::from_handoff(vec![
+            endpoint("mh-0"),
+            endpoint("mh-1"),
+            endpoint("mh-2"),
+        ])
+        .unwrap();
+        let r = set.handler_ref_of(&hid("mh-2")).unwrap();
+        set.mark_active(&hid("mh-2"), r).unwrap();
+        set.remove(&hid("mh-0"), RemovalTrigger::HeartbeatTimeout)
+            .unwrap()
+            .unwrap();
+        set.remove(&hid("mh-1"), RemovalTrigger::PlannedTransfer)
+            .unwrap()
+            .unwrap();
+        let before = set.clone();
+        assert_eq!(
+            set.heartbeat_verdict("mh-0"),
+            HeartbeatVerdict::Removed(RemovalTrigger::HeartbeatTimeout)
+        );
+        assert_eq!(
+            set.heartbeat_verdict("mh-1"),
+            HeartbeatVerdict::Removed(RemovalTrigger::PlannedTransfer)
+        );
+        assert_eq!(set.heartbeat_verdict("mh-2"), HeartbeatVerdict::Owned);
+        assert_eq!(set.heartbeat_verdict("mh-9"), HeartbeatVerdict::Unassigned);
+        assert_eq!(set, before, "verdicts never mutate the set");
+        let (_, _) = set.add(endpoint("mh-3")).unwrap();
+        assert_eq!(
+            set.heartbeat_verdict("mh-3"),
+            HeartbeatVerdict::Owned,
+            "Registering is OWNED (the race gate)"
+        );
+    }
+
     #[test]
     fn removal_is_one_way_and_a_removed_id_is_never_re_added() {
         let mut set = MeetingHandlers::from_handoff(vec![endpoint("mh-0")]).unwrap();
-        let removed = set.remove(&hid("mh-0")).unwrap().unwrap();
+        let removed = set
+            .remove(&hid("mh-0"), RemovalTrigger::HeartbeatTimeout)
+            .unwrap()
+            .unwrap();
         let before = set.clone();
         assert_eq!(
             set.add(endpoint("mh-0")),
@@ -694,8 +811,14 @@ mod tests {
         assert_eq!(set, before, "refused re-add does not bump");
         assert_eq!(set.version(), removed.version);
         // Removing an unknown (or already removed) id is a no-op.
-        assert_eq!(set.remove(&hid("mh-0")).unwrap(), None);
-        assert_eq!(set.remove(&hid("mh-9")).unwrap(), None);
+        assert_eq!(
+            set.remove(&hid("mh-0"), RemovalTrigger::ApplyLag).unwrap(),
+            None
+        );
+        assert_eq!(
+            set.remove(&hid("mh-9"), RemovalTrigger::ApplyLag).unwrap(),
+            None
+        );
         assert_eq!(set, before);
     }
 
@@ -718,7 +841,9 @@ mod tests {
         assert_eq!(set.mark_active(&hid("mh-0"), r0).unwrap(), None);
         assert_eq!(set.version(), 3);
         // A late ack for a removed incarnation is a no-op.
-        set.remove(&hid("mh-1")).unwrap().unwrap();
+        set.remove(&hid("mh-1"), RemovalTrigger::PlannedTransfer)
+            .unwrap()
+            .unwrap();
         let v = set.version();
         assert_eq!(set.mark_active(&hid("mh-1"), r1).unwrap(), None);
         assert_eq!(set.version(), v);
@@ -730,9 +855,15 @@ mod tests {
             MeetingHandlers::from_handoff(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
         let r0 = set.handler_ref_of(&hid("mh-0")).unwrap();
         set.mark_active(&hid("mh-0"), r0).unwrap();
-        let registering = set.remove(&hid("mh-1")).unwrap().unwrap();
+        let registering = set
+            .remove(&hid("mh-1"), RemovalTrigger::PlannedTransfer)
+            .unwrap()
+            .unwrap();
         assert!(!registering.active_changed);
-        let active = set.remove(&hid("mh-0")).unwrap().unwrap();
+        let active = set
+            .remove(&hid("mh-0"), RemovalTrigger::HeartbeatTimeout)
+            .unwrap()
+            .unwrap();
         assert!(active.active_changed);
         assert_eq!(active.version, registering.version + 1);
     }
@@ -794,12 +925,15 @@ mod tests {
             Err(HandlerSetError::VersionExhausted)
         );
         assert_eq!(
-            set.remove(&hid("mh-0")),
+            set.remove(&hid("mh-0"), RemovalTrigger::PlannedTransfer),
             Err(HandlerSetError::VersionExhausted)
         );
         assert_eq!(set, before);
         // A NO-OP at exhaustion is still the documented Ok(None).
-        assert_eq!(set.remove(&hid("mh-9")), Ok(None));
+        assert_eq!(
+            set.remove(&hid("mh-9"), RemovalTrigger::PlannedTransfer),
+            Ok(None)
+        );
         assert_eq!(set.mark_active(&hid("mh-9"), r0), Ok(None));
     }
 

@@ -59,6 +59,10 @@ MH**, and MH must be spin-up-able on demand in Kind. Existing deploy shortcuts a
   connection ids are those for which MH has begun `NotifyParticipantConnected` and not
   yet sent `Disconnected`. That is a superset including in-flight binds, which is safe for remove-only
   reconcile. Size is bounded by the per-meeting caps MC already enforces.
+  (Amended 2026-11-10, story 4 MC-B1: MC's caps do not bound MH's begun-not-Disconnected superset,
+  and MC has no per-meeting participant cap; the receiver bound is MC-wide. An over-cap or
+  malformed `connection_ids` skips that heartbeat's reconcile and is counted, while the verdict and
+  liveness still apply. Rule home: `MeetingHeartbeatRequest` header in `internal.proto`.)
 - **`applied_generation` is the existing per-(meeting, handler) `policy_generation`**, reported
   from what MH has *applied*, never received (ADR-0036 §8 "Why the acknowledgement exists" still
   holds). No new counter.

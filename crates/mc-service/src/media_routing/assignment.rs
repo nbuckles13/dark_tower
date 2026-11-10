@@ -283,7 +283,7 @@ pub struct HandlerAssignment {
     /// client-muted one PAUSED (never DROP_AT_INGRESS -- client mute alone
     /// never drops ingress). Living on this struct gives a mute every property
     /// the edges have, with no second mechanism: it rides EVERY full
-    /// registration (so it survives a re-assert and an MH restart), it is
+    /// registration (so every re-push carries it), it is
     /// swapped atomically with the edges, and a disposition change is a change
     /// to this struct -- so `PolicyGenerations::next_generation` advances the
     /// generation exactly when it changes. A set, so a duplicate (an MH hard

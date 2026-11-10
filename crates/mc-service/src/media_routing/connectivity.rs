@@ -27,12 +27,20 @@
 //! MC never parses `connection_id` or infers structure from it: it is an opaque
 //! bounded byte string.
 //!
-//! **Legacy (empty `connection_id`, an MH that predates the field):** one
-//! implicit key per (participant, handler) — exactly the pre-field set
-//! semantics, INCLUDING the stale-disconnect hazard. Counted
-//! (`mc_mh_notifications_without_connection_id_total`) so the degraded window is
-//! observable. **Retirement condition: delete the legacy branch once every MH
-//! in the fleet sends the field.**
+//! **`connection_id` is REQUIRED (ADR-0039 §6).** An empty id never reaches
+//! this module: the gRPC boundary refuses it first
+//! (`grpc/media_coordination.rs` `refuse_missing_connection_id`; sender 0,
+//! counted as `connection_id_missing`). There is no per-(participant, handler) fallback
+//! key.
+//!
+//! # Lost Disconnecteds: the remove-only heartbeat reconcile (ADR-0039 §6)
+//!
+//! Each live key records WHEN MC recorded its bind. A handler's accepted
+//! heartbeat retires a key of that handler absent from its `connection_ids`
+//! iff the bind was recorded strictly before the PREVIOUS accepted heartbeat's
+//! receipt ([`ParticipantConnectivity::retire_absent`], predicate
+//! `liveness::retirable`). A heartbeat never ADDS a key: the sender-id bind is
+//! the only add path.
 //!
 //! # The tombstone is REQUIRED (the receive-order defence)
 //!
@@ -118,7 +126,7 @@
 
 use super::assignment::HandlerId;
 use super::placement::{ConnectedHandlers, HandlerEndpoint, MeetingHandlers};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -138,7 +146,9 @@ pub const MAX_LIVE_MEDIA_CONNECTIONS_PER_HANDLER: usize = 4;
 /// doc for why this is required and what the residual is).
 pub const RETIRED_CONNECTION_TOMBSTONES: usize = 16;
 
-/// MH's opaque per-session connection id. Empty = legacy (pre-field) MH.
+/// MH's opaque per-session connection id. Never empty: the gRPC boundary
+/// (`refuse_missing_connection_id`) refuses an empty id before anything is
+/// recorded.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConnectionKey(String);
 
@@ -149,10 +159,10 @@ impl ConnectionKey {
         Self(wire.into())
     }
 
-    /// An MH that predates `connection_id` (degraded, counted).
+    /// The wire value (for exact-match membership in a heartbeat's list).
     #[must_use]
-    pub fn is_legacy(&self) -> bool {
-        self.0.is_empty()
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -178,10 +188,14 @@ pub enum Unapplied {
     /// NEITHER (security S2). Not resolved by `connection_id`: see
     /// `SenderLookup::Ambiguous`.
     UserAmbiguous,
-    /// The `handler_id` is not byte-identical to a handler of the meeting's
-    /// handler set. Sustained, it means an MH process restarted under a new id
-    /// and story-4 re-registration has not happened.
+    /// The `handler_id` is not byte-identical to a member of the meeting's
+    /// handler set (never in it, or removed). The binding gate (ADR-0039 §6):
+    /// a Connected is answered `sender_id` 0 and NOTHING is recorded; a
+    /// Disconnected is a no-op that touches no other handler's state.
     HandlerNotInSet,
+    /// An empty `connection_id` (REQUIRED, ADR-0039 §6): refused on Connected
+    /// (sender 0, nothing recorded) and a no-op on Disconnected.
+    ConnectionIdMissing,
     /// A Disconnected for a key this participant does not hold. Routine.
     UnknownConnection,
     /// A Connected beyond [`MAX_LIVE_MEDIA_CONNECTIONS_PER_HANDLER`].
@@ -193,11 +207,12 @@ pub enum Unapplied {
 
 impl Unapplied {
     /// Every value, for zero-initialisation.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::MeetingUnknown,
         Self::ParticipantUnknown,
         Self::UserAmbiguous,
         Self::HandlerNotInSet,
+        Self::ConnectionIdMissing,
         Self::UnknownConnection,
         Self::ConnectionBoundRefused,
         Self::RetiredConnection,
@@ -211,6 +226,7 @@ impl Unapplied {
             Self::ParticipantUnknown => "participant_unknown",
             Self::UserAmbiguous => "user_ambiguous",
             Self::HandlerNotInSet => "handler_not_in_set",
+            Self::ConnectionIdMissing => "connection_id_missing",
             Self::UnknownConnection => "unknown_connection",
             Self::ConnectionBoundRefused => "connection_bound_refused",
             Self::RetiredConnection => "retired_connection",
@@ -273,7 +289,9 @@ impl Phase {
 /// One participant's observed connectivity.
 #[derive(Debug, Clone)]
 pub struct ParticipantConnectivity {
-    live: BTreeMap<HandlerId, BTreeSet<ConnectionKey>>,
+    /// Live keys per handler, each with the instant MC recorded its bind (the
+    /// reconcile's input; the same instant the binding ledger records).
+    live: BTreeMap<HandlerId, BTreeMap<ConnectionKey, Instant>>,
     retired: VecDeque<(HandlerId, ConnectionKey)>,
     phase: Phase,
     last_settled_at: Option<Instant>,
@@ -304,22 +322,21 @@ impl ParticipantConnectivity {
         now: Instant,
         window: Duration,
     ) -> Result<(), Unapplied> {
-        if !key.is_legacy()
-            && self
-                .retired
-                .iter()
-                .any(|(h, k)| h == &endpoint.id && k == &key)
+        if self
+            .retired
+            .iter()
+            .any(|(h, k)| h == &endpoint.id && k == &key)
         {
             return Err(Unapplied::RetiredConnection);
         }
         let keys = self.live.entry(endpoint.id.clone()).or_default();
-        if keys.contains(&key) {
+        if keys.contains_key(&key) {
             return Ok(());
         }
         if keys.len() >= MAX_LIVE_MEDIA_CONNECTIONS_PER_HANDLER {
             return Err(Unapplied::ConnectionBoundRefused);
         }
-        keys.insert(key);
+        keys.insert(key, now);
         if self.phase == Phase::NotConnected {
             let not_before = self
                 .last_settled_at
@@ -349,22 +366,61 @@ impl ParticipantConnectivity {
         let Some(keys) = self.live.get_mut(handler) else {
             return Err(Unapplied::UnknownConnection);
         };
-        if !keys.remove(key) {
+        if keys.remove(key).is_none() {
             return Err(Unapplied::UnknownConnection);
         }
         if keys.is_empty() {
             self.live.remove(handler);
         }
-        if !key.is_legacy() {
-            if self.retired.len() >= RETIRED_CONNECTION_TOMBSTONES {
-                self.retired.pop_front();
-            }
-            self.retired.push_back((handler.clone(), key.clone()));
+        if self.retired.len() >= RETIRED_CONNECTION_TOMBSTONES {
+            self.retired.pop_front();
         }
+        self.retired.push_back((handler.clone(), key.clone()));
         if self.live.is_empty() {
             self.phase = Phase::NotConnected;
         }
         Ok(())
+    }
+
+    /// The remove-only heartbeat reconcile for ONE handler (ADR-0039 §6).
+    ///
+    /// Walks THIS participant's own live keys on `handler` — never looks
+    /// anything up by an incoming id — and retires each key that
+    /// `liveness::retirable` says to: absent from `present` and recorded
+    /// STRICTLY before `before` (the previous accepted heartbeat's receipt; a
+    /// bind recorded at exactly that instant is KEPT). Retirement goes through
+    /// [`Self::disconnect`], so the key is tombstoned exactly as a delivered
+    /// Disconnected would. Clock skew errs toward keeping: see
+    /// `liveness::retirable`. Never adds a key.
+    pub fn retire_absent(
+        &mut self,
+        handler: &HandlerId,
+        present: &std::collections::HashSet<&str>,
+        before: Instant,
+    ) -> Vec<ConnectionKey> {
+        let doomed: Vec<ConnectionKey> = self
+            .live
+            .get(handler)
+            .into_iter()
+            .flatten()
+            .filter(|(key, recorded_at)| {
+                super::liveness::retirable(**recorded_at, before, present.contains(key.as_str()))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        // Report only keys actually retired: a key that was not (an invariant
+        // breach — it was just read from `live`) is neither claimed nor
+        // counted as a correction.
+        doomed
+            .into_iter()
+            .filter(|key| self.disconnect(handler, key).is_ok())
+            .collect()
+    }
+
+    /// The live keys on `handler`, with their bind instants (test and
+    /// diagnostics view).
+    pub fn keys_on(&self, handler: &HandlerId) -> impl Iterator<Item = (&ConnectionKey, &Instant)> {
+        self.live.get(handler).into_iter().flatten()
     }
 
     /// Settle if due. Returns how, the one time it happens.
@@ -442,6 +498,7 @@ impl ParticipantConnectivity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     /// The ANCHOR (DRY) on [`Unapplied`]: the shared tokens cannot drift.
     #[test]
@@ -628,22 +685,41 @@ mod tests {
         );
     }
 
+    /// Replaces the deleted legacy-mode test: the reconcile retires only the
+    /// absent, strictly-earlier keys of ITS handler, tombstones them like a
+    /// Disconnected, and never adds.
     #[test]
-    fn legacy_empty_id_has_set_semantics_and_no_tombstone() {
+    fn retire_absent_is_remove_only_per_handler_and_tombstones() {
         let set = handlers();
         let t0 = Instant::now();
+        let prev = t0 + Duration::from_millis(100);
         let mut c = ParticipantConnectivity::default();
-        c.connect(&ep(&set, "mh-0"), key(""), t0, W).unwrap();
-        c.connect(&ep(&set, "mh-0"), key(""), t0, W).unwrap();
-        c.disconnect(&HandlerId::new("mh-0"), &key("")).unwrap();
+        c.connect(&ep(&set, "mh-0"), key("early"), t0, W).unwrap();
+        c.connect(&ep(&set, "mh-0"), key("listed"), t0, W).unwrap();
+        c.connect(&ep(&set, "mh-0"), key("at-prev"), prev, W)
+            .unwrap();
+        c.connect(&ep(&set, "mh-1"), key("other"), t0, W).unwrap();
+        let present: std::collections::HashSet<&str> = ["listed", "unknown"].into();
+        let retired = c.retire_absent(&HandlerId::new("mh-0"), &present, prev);
+        assert_eq!(retired, vec![key("early")]);
+        let left: Vec<_> = c
+            .keys_on(&HandlerId::new("mh-0"))
+            .map(|(k, _)| k.as_str().to_string())
+            .collect();
         assert_eq!(
-            c.phase(),
-            Phase::NotConnected,
-            "one legacy disconnect clears it"
+            left,
+            vec!["at-prev", "listed"],
+            "equal instant kept; nothing added"
         );
-        assert!(
-            c.connect(&ep(&set, "mh-0"), key(""), t0, W).is_ok(),
-            "a legacy key is never tombstoned"
+        assert_eq!(
+            c.keys_on(&HandlerId::new("mh-1")).count(),
+            1,
+            "other handler untouched"
+        );
+        assert_eq!(
+            c.connect(&ep(&set, "mh-0"), key("early"), prev, W),
+            Err(Unapplied::RetiredConnection),
+            "a reconciled key is tombstoned like a Disconnected"
         );
     }
 

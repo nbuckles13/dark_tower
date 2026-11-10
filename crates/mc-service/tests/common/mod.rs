@@ -105,6 +105,8 @@ pub struct RegisterMeetingCall {
     pub egress_stream_count: usize,
     /// The pushed policy itself, for per-handler edge assertions.
     pub assignment: mc_service::media_routing::HandlerAssignment,
+    /// `RegisterMeetingRequest.heartbeat_interval_ms` (ADR-0039 §1).
+    pub heartbeat_interval_ms: u32,
 }
 
 /// One MC→MH call, in ARRIVAL order across both RPCs — so "no
@@ -313,6 +315,7 @@ impl MhRegistrationClient for MockMhRegistrationClient {
                 policy_generation: programming.policy_generation.get(),
                 egress_stream_count: programming.assignment.egress_streams.len(),
                 assignment: programming.assignment.clone(),
+                heartbeat_interval_ms: programming.heartbeat_interval_ms,
             });
         self.events
             .lock()
@@ -515,7 +518,59 @@ pub fn join_media_on(mh_client: Arc<MockMhRegistrationClient>) -> mc_service::ac
     join_media_with(mh_client as Arc<dyn MhRegistrationClient>)
 }
 
+/// The heartbeat intake for a test controller whose MC id is `mc_id`, at the
+/// fixtures' N and with the deployed `MC_MAX_PARTICIPANTS` (10000) — the ONE
+/// home of that cap in the test tree.
+#[must_use]
+pub fn heartbeat_intake(mc_id: &str) -> mc_service::grpc::HeartbeatIntake {
+    heartbeat_intake_with_cap(mc_id, 10_000)
+}
+
+/// [`heartbeat_intake`] with an explicit `MC_MAX_PARTICIPANTS` (the
+/// `connection_ids` bound is that x 4).
+#[must_use]
+pub fn heartbeat_intake_with_cap(
+    mc_id: &str,
+    max_participants: u32,
+) -> mc_service::grpc::HeartbeatIntake {
+    mc_service::grpc::HeartbeatIntake::new(mc_id.to_string(), heartbeat_timing(), max_participants)
+        .expect("intake bound fits usize")
+}
+
+/// A bare meeting controller with the fixtures' defaults (fresh metrics, a
+/// zero 32-byte master secret, a fresh `PolicyGenerations`, the test KEK
+/// lifecycle). Only the instance id varies between callers, so this is the
+/// ONE home of the other four arguments (docs/TODO.md entry, closed by story 4
+/// MC-B1). `build_test_stack` uses the notifier-bearing constructor instead.
+#[must_use]
+pub fn make_controller(instance_id: &str) -> MeetingControllerActorHandle {
+    MeetingControllerActorHandle::new(
+        instance_id.to_string(),
+        mc_service::actors::ActorMetrics::new(),
+        mc_service::actors::ControllerMetrics::new(),
+        SecretBox::new(Box::new(vec![0u8; 32])),
+        Arc::new(PolicyGenerations::new()),
+        mc_test_utils::kek::kek_lifecycle(),
+    )
+}
+
+/// The heartbeat timing (N) the shared fixtures run with: the deployed
+/// default, 6000 ms.
+#[must_use]
+pub fn heartbeat_timing() -> mc_service::media_routing::HeartbeatTiming {
+    mc_service::media_routing::HeartbeatTiming::from_timeout_ms(6_000)
+}
+
 fn join_media_with(mh_client: Arc<dyn MhRegistrationClient>) -> mc_service::actors::JoinMedia {
+    join_media_with_heartbeat(mh_client, heartbeat_timing())
+}
+
+/// [`join_media_on`] with an explicit N (a test pinning the derived interval
+/// MC sends MH).
+pub fn join_media_with_heartbeat(
+    mh_client: Arc<dyn MhRegistrationClient>,
+    heartbeat: mc_service::media_routing::HeartbeatTiming,
+) -> mc_service::actors::JoinMedia {
     mc_service::actors::JoinMedia {
         deps: Arc::new(mc_service::actors::MediaRoutingDeps {
             mh_client,
@@ -527,6 +582,7 @@ fn join_media_with(mh_client: Arc<dyn MhRegistrationClient>) -> mc_service::acto
                 client_media_config().video_encoding,
             ),
             connect_settle_window: client_media_config().connect_settle_window,
+            heartbeat,
         }),
         // The actor-driven suite joins as an audio publisher with no
         // join-carried declaration (it declares post-join), story 2's shape.

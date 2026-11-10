@@ -34,8 +34,9 @@
 //! push that failed (and is therefore unconfirmed) is re-sent by the next
 //! structural change of any kind even when this handler's snapshot did not
 //! change. Recovery from a failed push is therefore "the next structural
-//! change", or — after an MH restart with no change following — the story-4
-//! periodic re-assert. A participant reconnect is not a structural change and
+//! change"; a push still unapplied shows up as applied-sequence lag on the
+//! handler's heartbeat (ADR-0039 §1/§2), and a restarted MH is a new
+//! incarnation that MC replaces rather than re-programs. A participant reconnect is not a structural change and
 //! does not re-push.
 //!
 //! # After an MC restart: adopt MH's number
@@ -47,9 +48,9 @@
 //! strictly above, because MH treats an equal generation as a no-op even when
 //! the content differs. The re-push also replaces MH's pre-restart table
 //! wholesale, so the window in which MH forwards under a stale topology is one
-//! round trip after the first post-restart structural change. This is the
-//! MC-restarted direction; story 4's restart detector (keyed on the echoed
-//! `process_start_epoch_ms`) is the MH-restarted one, and cannot cover this.
+//! round trip after the first post-restart structural change. A lost or
+//! restarted MH is a different case with a different remedy: it is a new
+//! incarnation, so MC replaces the handler (ADR-0039 §3), never re-programs it.
 //!
 //! What no push can correct: a client→MH connection that OUTLIVES an MC
 //! restart keeps the sender binding MH made when it connected, so if the
@@ -132,6 +133,8 @@ pub struct PushTarget {
     pub mc_grpc_endpoint: String,
     /// The handler this worker programs.
     pub handler: HandlerEndpoint,
+    /// `RegisterMeetingRequest.heartbeat_interval_ms` (MC's derived interval).
+    pub heartbeat_interval_ms: u32,
     /// Where this worker reports its handler's registration verdict.
     pub registration: RegistrationReporter,
 }
@@ -429,6 +432,7 @@ async fn push_until_settled(
             mc_grpc_endpoint: &target.mc_grpc_endpoint,
             assignment: &job.assignment,
             policy_generation: job.generation,
+            heartbeat_interval_ms: target.heartbeat_interval_ms,
             restart_floor_adoptable: first_confirm && !*floor_adopted,
         };
         match target.mh_client.register_meeting(&programming).await {
@@ -499,11 +503,7 @@ async fn push_until_settled(
                     Err(e) => {
                         // A FAILED adoption pages: `confirm` did not record this
                         // reply, so record it now as what it is.
-                        metrics::record_media_policy_push(
-                            PolicyPushOutcome::GenerationMismatch,
-                            job.generation,
-                            applied_generation,
-                        );
+                        metrics::record_media_policy_push(PolicyPushOutcome::GenerationMismatch);
                         error!(
                             target: "mc.register_meeting.trigger",
                             mh_grpc_endpoint = %grpc_endpoint,
@@ -516,11 +516,12 @@ async fn push_until_settled(
             }
             Err(e) => {
                 // A terminal divergence does not become correct after backoff.
-                let terminal = matches!(
-                    &e,
-                    McError::MediaPolicyDivergence { outcome, .. }
-                        if outcome.disposition() == PushDisposition::Terminal
-                );
+                let terminal = matches!(&e, McError::HandlerReplaced)
+                    || matches!(
+                        &e,
+                        McError::MediaPolicyDivergence { outcome, .. }
+                            if outcome.disposition() == PushDisposition::Terminal
+                    );
                 warn!(
                     target: "mc.register_meeting.trigger",
                     attempt = attempt,
@@ -714,6 +715,7 @@ mod tests {
                 webtransport_url: "https://mh-0:4434".to_string(),
                 grpc_endpoint: "http://mh-0:50053".to_string(),
             },
+            heartbeat_interval_ms: 2_000,
             registration: RegistrationReporter::new(tx, HandlerId::new("mh-0"), REF),
         };
         (target, rx)
@@ -878,6 +880,33 @@ mod tests {
             vec![1, 1, 1, 1],
             "exactly one re-send at the same generation"
         );
+    }
+
+    /// ADR-0039 §7 (protocol condition (a)): a reply from another handler
+    /// incarnation gives NO credit — the worker stops at once (no retry can
+    /// reach a gone incarnation) and reports the initial registration FAILED,
+    /// so the dialed handler stays Registering. Positive arm: an ack is
+    /// `Registered`.
+    #[tokio::test(start_paused = true)]
+    async fn a_replaced_handler_is_terminal_and_never_credited() {
+        let mh = ScriptedMh::new(vec![Err(McError::HandlerReplaced)]);
+        let (target, mut rx) = reporting_target(Arc::clone(&mh), Arc::default());
+        let pusher = HandlerPusher::spawn(target, CancellationToken::new());
+        pusher.publish(job(1));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(mh.sent(), vec![1], "not retried");
+        assert_eq!(
+            reports(&mut rx),
+            vec![RegistrationOutcome::InitialRegistrationFailed],
+            "the dialed handler is not advanced"
+        );
+
+        let ok = ScriptedMh::new(vec![Ok(())]);
+        let (target, mut rx) = reporting_target(Arc::clone(&ok), Arc::default());
+        let pusher = HandlerPusher::spawn(target, CancellationToken::new());
+        pusher.publish(job(1));
+        settle().await;
+        assert_eq!(reports(&mut rx), vec![RegistrationOutcome::Registered]);
     }
 
     #[tokio::test(start_paused = true)]

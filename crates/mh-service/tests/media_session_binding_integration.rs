@@ -1348,7 +1348,7 @@ async fn a_superseded_sessions_late_disconnect_names_only_its_own_connection_id(
 
     assert!(
         !first.connection_id.is_empty() && !second.connection_id.is_empty(),
-        "MH must send a connection_id on every Connected; empty is MC's degraded legacy mode"
+        "MH must send a connection_id on every Connected; MC refuses an empty one (sender 0)"
     );
     assert_ne!(
         first.connection_id, second.connection_id,

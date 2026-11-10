@@ -17,14 +17,12 @@
 //! structural change like a join or leave: same recompute, generation advance,
 //! re-push and applied-echo machinery.
 //!
-//! **Hazard, out of scope here (Lead ruling R3):** connectivity is edge-
-//! triggered and nothing re-asserts it. An MH that crashes sends no
-//! Disconnected, and its restarted process registers under a new `handler_id`
-//! outside the meeting's set, so MC keeps routing edges to the dead id —
-//! sticky silence that presents as healthy — until story 4's handler-loss
-//! detection and replacement (MC-B2/MC-C) call the set's `remove`/`add`.
-//! `mc_mh_notifications_unapplied_total{reason="handler_not_in_set"}` is the
-//! discriminator (`docs/TODO.md` §Media Path Obligations).
+//! **Lost Disconnecteds (ADR-0039 §6).** A Disconnected a LIVE handler never
+//! delivered is healed by that handler's heartbeat: the remove-only reconcile
+//! ([`MeetingMedia::retire_absent`]) retires keys absent from its
+//! `connection_ids` that were bound before its previous heartbeat, through
+//! the same routing sync. A CRASHED handler sends no heartbeat either: its
+//! keys stay until handler-loss detection removes it from the set (MC-B2).
 //!
 //! # The actor is the single writer AND the single composer
 //!
@@ -102,9 +100,10 @@ use crate::media_routing::pusher::{
     HandlerRegistration, RegistrationOutcome, RegistrationReporter,
 };
 use crate::media_routing::{
-    ClientHandlerSet, ConnectionKey, HandlerId, HandlerPusher, MeetingAssignment, MeetingHandlers,
-    ParticipantConnectivity, PolicyGenerations, PushJob, PushTarget, SlotTable, SourceMute,
-    Unapplied,
+    Acceptance, ClientHandlerSet, ConnectionKey, HandlerHeartbeat, HandlerId, HandlerLiveness,
+    HandlerPusher, HeartbeatAnomaly, MeetingAssignment, MeetingHandlers, Observed,
+    ParticipantConnectivity, PolicyGenerations, PushJob, PushTarget, RemovalTrigger, SlotTable,
+    SourceMute, Unapplied,
 };
 use crate::media_signaling::{
     build_send_directive, build_stream_assignments, DirectiveOutcome, MediaKindLabel,
@@ -114,7 +113,8 @@ use crate::observability::metrics;
 use proto_gen::dark_tower::signaling::v1::{
     server_message, SendDirective, ServerMessage, StreamAssignments,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -133,6 +133,11 @@ use tracing::{error, info, warn};
 /// shared meeting actor".
 pub const SLOT_VIEW_FLUSH_BATCH: usize = 64;
 
+/// Non-member handler ids per meeting whose RELEASED verdict is WARNed once.
+/// A log-volume bound, not a correctness one: past it a new id is counted on
+/// `mc_media_handler_heartbeats_total` but not logged.
+pub const RELEASE_NOTICE_DEDUPE_CAP: usize = 64;
+
 /// The server-level dependencies media routing needs, built once by the
 /// WebTransport server and shared by every meeting.
 pub struct MediaRoutingDeps {
@@ -149,6 +154,9 @@ pub struct MediaRoutingDeps {
     /// The connect settle window (`MC_MEDIA_CONNECT_SETTLE_MS`), see
     /// `media_routing/connectivity.rs` for why it exists.
     pub connect_settle_window: Duration,
+    /// N and its derivations (`MC_MH_HEARTBEAT_TIMEOUT_MS`, ADR-0039 §1): the
+    /// interval every push worker sends MH.
+    pub heartbeat: crate::media_routing::HeartbeatTiming,
 }
 
 impl std::fmt::Debug for MediaRoutingDeps {
@@ -341,6 +349,7 @@ pub(crate) fn test_join_media() -> JoinMedia {
                 VideoEncoding::new(Codec::Vp8, 640, 360, 30, 800_000, 500).unwrap(),
             ),
             connect_settle_window: std::time::Duration::from_millis(1500),
+            heartbeat: crate::media_routing::HeartbeatTiming::from_timeout_ms(6_000),
         }),
         declared: crate::media_kind::ClientMediaStates::live(PublishSet::of(&[
             MediaKindLabel::Audio,
@@ -421,6 +430,14 @@ pub(super) struct MeetingMedia {
     flush_batch: usize,
     /// The latest render, shared by the push and the flush of one change.
     assignment: Option<MeetingAssignment>,
+    /// Per-handler heartbeat liveness (ADR-0039 §2), beside — never inside —
+    /// the handler set so a liveness write never moves `handler_set_version`.
+    /// An entry exists only for a member, and [`Self::remove_handler`] (the
+    /// ONE removal path) drops it with the member.
+    liveness: BTreeMap<HandlerId, HandlerLiveness>,
+    /// Non-member handler ids whose RELEASED verdict was already WARNed
+    /// (bounded; dropped with the meeting).
+    release_noticed: BTreeSet<String>,
 }
 
 impl MeetingMedia {
@@ -439,6 +456,8 @@ impl MeetingMedia {
             dirty: BTreeSet::new(),
             flush_batch: SLOT_VIEW_FLUSH_BATCH,
             assignment: None,
+            liveness: BTreeMap::new(),
+            release_noticed: BTreeSet::new(),
         }
     }
 
@@ -702,6 +721,154 @@ impl MeetingMedia {
         true
     }
 
+    /// Record a heartbeat from a MEMBER as liveness (ADR-0039 §2): the first
+    /// one creates the pair's record; later ones are accepted iff not stale.
+    /// `member` was resolved by `MeetingHandlers::heartbeat_member`, so this
+    /// cannot miss. Also notes this heartbeat's anomalies and returns the ones
+    /// that are NEW for the pair (the only ones logged).
+    pub(super) fn observe_heartbeat(
+        &mut self,
+        member: &HandlerId,
+        heartbeat: &HandlerHeartbeat,
+        receipt: Instant,
+        anomalies: &[HeartbeatAnomaly],
+    ) -> (Observed, Vec<HeartbeatAnomaly>) {
+        let (observed, record) = match self.liveness.entry(member.clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                let record = entry.into_mut();
+                (record.observe(heartbeat, receipt), record)
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => (
+                Observed {
+                    acceptance: Acceptance::Accepted { previous: None },
+                    transition: true,
+                },
+                entry.insert(HandlerLiveness::first(heartbeat, receipt)),
+            ),
+        };
+        let fresh = record.note_anomalies(anomalies);
+        (observed, fresh)
+    }
+
+    /// Whether this is the FIRST non-OWNED verdict for `wire_handler_id` in
+    /// this meeting (the once-per-(meeting, handler) WARN dedupe). Bounded by
+    /// [`RELEASE_NOTICE_DEDUPE_CAP`]: past it, new ids are not remembered and
+    /// not logged (the counter still carries the rate).
+    pub(super) fn first_release_notice(&mut self, wire_handler_id: &str) -> bool {
+        if self.release_noticed.contains(wire_handler_id)
+            || self.release_noticed.len() >= RELEASE_NOTICE_DEDUPE_CAP
+        {
+            return false;
+        }
+        self.release_noticed.insert(wire_handler_id.to_string())
+    }
+
+    /// Whether `wire_handler_id`'s RELEASED WARN was already emitted.
+    #[cfg(feature = "test-seams")]
+    pub(super) fn release_noticed(&self, wire_handler_id: &str) -> bool {
+        self.release_noticed.contains(wire_handler_id)
+    }
+
+    /// The liveness record of a member, for MC-B2's `assess()`.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        expect(dead_code, reason = "read by MC-B2's assess(); test-seams probe today")
+    )]
+    pub(super) fn liveness(&self, wire_handler_id: &str) -> Option<&HandlerLiveness> {
+        let id = &self.handlers.resolve(wire_handler_id)?.id;
+        self.liveness.get(id)
+    }
+
+    /// The generation MC last SENT this handler (the lag's minuend), or
+    /// `None` if MC has never pushed to it.
+    pub(super) async fn sent_generation(&self, member: &HandlerId) -> Option<NonZeroU64> {
+        let deps = self.deps.as_ref()?;
+        deps.policy_generations
+            .current(&self.meeting_id, member)
+            .await
+    }
+
+    /// The remove-only reconcile over every participant's connectivity keys on
+    /// ONE handler (ADR-0039 §6; predicate `liveness::retirable`). Returns the
+    /// retired connection ids and whether any participant's routing changed
+    /// (the caller then recomputes through the normal path).
+    pub(super) fn retire_absent(
+        &mut self,
+        wire_handler_id: &str,
+        present: &HashSet<&str>,
+        before: Instant,
+        now: Instant,
+    ) -> (Vec<String>, bool) {
+        let Some(handler) = self.handlers.resolve(wire_handler_id).map(|h| h.id.clone()) else {
+            return (Vec::new(), false);
+        };
+        let mut retired = Vec::new();
+        let mut touched = Vec::new();
+        for (participant_id, view) in &mut self.views {
+            let keys = view.connectivity.retire_absent(&handler, present, before);
+            if !keys.is_empty() {
+                touched.push(participant_id.clone());
+                retired.extend(keys.into_iter().map(|k| k.as_str().to_string()));
+            }
+        }
+        let mut changed = false;
+        for participant_id in touched {
+            changed |= self.sync_routing(&participant_id, now);
+        }
+        (retired, changed)
+    }
+
+    /// THE one removal path for a handler (ADR-0039 §6): drops it from the set
+    /// — recorded as removed with its trigger — AND drops its liveness record
+    /// in the same call, so the two cannot drift. Returns whether it was a
+    /// member. Set-only today: the full sequence (push the set, release
+    /// bindings, `EndMeeting`) is MC-B2's, which calls this.
+    #[cfg_attr(
+        not(feature = "test-seams"),
+        expect(dead_code, reason = "MC-B2 removal path; test-seams caller today")
+    )]
+    pub(super) fn remove_handler(
+        &mut self,
+        wire_handler_id: &str,
+        trigger: RemovalTrigger,
+    ) -> bool {
+        let id = HandlerId::new(wire_handler_id);
+        match self.handlers.remove(&id, trigger) {
+            Ok(Some(_)) => {
+                self.liveness.remove(&id);
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                error!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    handler_id = %wire_handler_id,
+                    error = %e,
+                    "Handler removal refused; the set is unchanged"
+                );
+                false
+            }
+        }
+    }
+
+    /// `(participant_id, connection_id)` live keys on one handler (sorted).
+    #[cfg(feature = "test-seams")]
+    pub(super) fn connectivity_on(&self, wire_handler_id: &str) -> Vec<(String, String)> {
+        let handler = HandlerId::new(wire_handler_id);
+        let mut keys: Vec<(String, String)> = self
+            .views
+            .iter()
+            .flat_map(|(p, v)| {
+                v.connectivity
+                    .keys_on(&handler)
+                    .map(move |(k, _)| (p.clone(), k.as_str().to_string()))
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// Remove a participant from slot state and view tracking.
     pub(super) fn remove(&mut self, participant_id: &str) {
         if let Some(view) = self.views.remove(participant_id) {
@@ -878,6 +1045,7 @@ impl MeetingMedia {
                         mc_id: deps.mc_id.clone(),
                         mc_grpc_endpoint: deps.mc_grpc_endpoint.clone(),
                         handler: endpoint.clone(),
+                        heartbeat_interval_ms: deps.heartbeat.interval_ms(),
                         registration: RegistrationReporter::new(
                             registrations.clone(),
                             endpoint.id.clone(),

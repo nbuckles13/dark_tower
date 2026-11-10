@@ -31,9 +31,7 @@ mod test_common;
 
 use std::sync::Arc;
 
-use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use mc_service::grpc::McMediaCoordinationService;
-use mc_service::media_routing::PolicyGenerations;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_client::MediaCoordinationServiceClient;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_server::MediaCoordinationServiceServer;
 use proto_gen::dark_tower::internal::v1::NotifyParticipantConnectedRequest;
@@ -105,15 +103,9 @@ async fn start_test_grpc_server() -> TestGrpcServer {
     // resolution. The handler resolves `0`/`meeting_unknown` throughout, which
     // is the correct answer for a controller holding no meetings and does not
     // affect the span assertions.
-    let controller = Arc::new(MeetingControllerActorHandle::new(
-        "mc-otel-test".to_string(),
-        ActorMetrics::new(),
-        ControllerMetrics::new(),
-        common::secret::SecretBox::new(Box::new(vec![0u8; 32])),
-        Arc::new(PolicyGenerations::new()),
-        mc_test_utils::kek::kek_lifecycle(),
-    ));
-    let svc = McMediaCoordinationService::new(controller);
+    let controller = Arc::new(test_common::make_controller("mc-otel-test"));
+    let svc =
+        McMediaCoordinationService::new(controller, test_common::heartbeat_intake("mc-otel-test"));
 
     let jwks = wiremock::MockServer::start().await;
     let keypair = TestKeypair::new(42, "mc-otel-rig-key-01");

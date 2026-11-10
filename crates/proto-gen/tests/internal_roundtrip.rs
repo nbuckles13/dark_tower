@@ -506,7 +506,8 @@ fn default_end_meeting_response_is_not_an_acknowledgement() {
 //   guarantee is pinned MH-side by a test that one session's Connected and
 //   Disconnected carry byte-identical ids, including on the MC-unavailable
 //   decline arm.
-// - **The empty branch is DEGRADED and counted.** Counting is MC's.
+// - **An empty connection_id is REFUSED (sender_id 0, nothing recorded) and
+//   counted.** That is MC behaviour, pinned in mc-service tests.
 
 /// `connection_id` survives the wire on both requests, and the same session's
 /// value is byte-identical across the two message types.
@@ -567,13 +568,12 @@ fn two_connections_of_one_participant_on_one_handler_are_distinguishable() {
 /// An OMITTED `connection_id` and an EMPTY one are ONE observable, on both
 /// requests.
 ///
-/// This is what makes "empty means legacy" implementable rather than aspirational:
-/// a pre-field MH omits the field, a proto3 non-optional string decodes it to
-/// `""`, and an empty value emits no bytes. MC therefore cannot — and must not
-/// try to — distinguish "old MH" from "new MH that sent empty"; both take the
-/// degraded per-handler path. A future edit making this field `optional` would
-/// split these two into different readings and break that equivalence, which is
-/// precisely why the field is a bare `string`.
+/// This is what makes REQUIRED enforceable: a peer that omits the field and one
+/// that sends `""` are indistinguishable (a proto3 non-optional string decodes
+/// an absent field to `""`, and an empty value emits no bytes), so MC refuses
+/// both. A future edit making this field `optional` would split these two into
+/// different readings and break that equivalence, which is precisely why the
+/// field is a bare `string`.
 #[test]
 fn absent_and_empty_connection_id_are_one_observable() {
     let empty_connected = NotifyParticipantConnectedRequest {
@@ -624,7 +624,7 @@ fn absent_and_empty_connection_id_are_one_observable() {
     assert_eq!(
         roundtrip(&empty_disconnected).connection_id,
         "",
-        "the legacy reading must be reachable on the disconnect path too"
+        "the empty reading must be reachable on the disconnect path too (refused there as well)"
     );
 
     // A default-decoded request is the pre-field peer's message exactly.

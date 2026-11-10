@@ -199,21 +199,35 @@ Complete ALL items before deploying to production:
     reassuring half: an **all-connected** meeting co-locates on one handler (one
     target per sender, one url per subscriber), which an old SDK handles
     correctly — the skew bites only under genuinely partial connectivity.
-  - **MH joins the coupled set for `connection_id` (task 20), but with no hard
-    ordering.** A new MC against an old MH sees an empty `connection_id` and
-    falls back to the pre-field per-handler semantics (degraded: a stale
-    disconnect can remove a live connection), counted on
-    `mc_mh_notifications_without_connection_id_total`. An old MC ignores the new
-    field. Degraded, bounded, and signalled — roll either side first.
+  - **`connection_id` is REQUIRED from story 4 MC-B1 — a HARD ordering.** This
+    MC refuses an empty `connection_id` (`sender_id` 0, nothing recorded,
+    counted `mc_mh_notifications_unapplied_total{reason="connection_id_missing"}`),
+    so an MH older than the story 2 task 20 (`connection_id`) image gets every
+    Connected refused: **a total media outage for that handler**. Every MH must
+    be at or above the task-20 image BEFORE this MC rolls, and while this MC is
+    live no MH may be rolled back below it. The pre-MC-B1 detector
+    (`mc_mh_notifications_without_connection_id_total`) is retired by the same
+    release: read it on the OLD MC before rolling (§Pre-Deployment Verification).
+  - **MC-B1 is the floor MH-2 requires (story 4).** Rolling this MC forward
+    before MH-2 is safe: an older MH ignores `RegisterMeetingRequest.heartbeat_interval_ms`
+    (an unknown proto3 field) and never calls `MeetingHeartbeat`. Once MH-2 is
+    live, rolling MC back below MC-B1 is UNSAFE: MH-2 rejects a 0 interval and
+    gets UNIMPLEMENTED on every heartbeat, so its owner-silence release ends
+    meetings. Roll MH back first (the `internal.proto` ORDERING rule).
   - **A new REQUIRED key rides this release** (`MC_MEDIA_CONNECT_SETTLE_MS`;
-    and, from story 2 task 9, `MC_KEK_ROTATION_DEBOUNCE_SECONDS`).
+    from story 2 task 9, `MC_KEK_ROTATION_DEBOUNCE_SECONDS`; and from story 4
+    MC-B1, `MC_MH_HEARTBEAT_TIMEOUT_MS`).
     Apply the ConfigMap and both Deployments with or before the image: a new
     image against a stale in-cluster ConfigMap crash-loops on
     `MissingEnvVar("MC_MEDIA_CONNECT_SETTLE_MS")` (or
-    `MissingEnvVar("MC_KEK_ROTATION_DEBOUNCE_SECONDS")`) — and the last time this
+    `MissingEnvVar("MC_KEK_ROTATION_DEBOUNCE_SECONDS")`, or
+    `MissingEnvVar("MC_MH_HEARTBEAT_TIMEOUT_MS")`) — and the last time this
     happened (`MC_MAX_RECEIVE_SLOTS`, story 2, recorded in `docs/TODO.md`) the presenting
-    symptom was a *port-allocation* error, not the missing key. There is no MC
-    deployment-config env-test, so nothing catches it before the roll.
+    symptom was a *port-allocation* error, not the missing key. Env-test
+    `02_mc_deployment_config.rs` (Layer 7) catches a key missing from mc-0's or
+    mc-1's wiring or from the live ConfigMap, per workload; it does NOT catch an
+    image applied against a stale in-cluster ConfigMap, which still crash-loops
+    on `MissingEnvVar` — apply the ConfigMap first.
   - **The browser SDK must roll BEFORE this MC image (story 2 task 9, R-16) —
     and nothing on the wire can tell you it hasn't.** This MC reissues a
     `sender_id` after a meeting exhausts its namespace (a KEK-epoch reset). A
@@ -224,10 +238,8 @@ Complete ALL items before deploying to production:
     benign — the finer scope is simply never exercised. **This fix needed no
     wire change, which is exactly why there is no detector**: no field, no
     negotiation, no counter; MC cannot tell an old client from a new one.
-    Do not read "no protocol change" as "nothing to coordinate". Unlike the
-    `connection_id` skew above (detectable on
-    `mc_mh_notifications_without_connection_id_total`, roll either side),
-    this one is one-directional. And it is **not** the task-20 tail's kind:
+    Do not read "no protocol change" as "nothing to coordinate". This one is
+    one-directional and has no detector. And it is **not** the task-20 tail's kind:
     that degradation is transient and self-correcting, this one is permanent
     for the affected sender until the page is reloaded and invisible to both
     parties — the distinction that matters when deciding whether to force a
@@ -414,6 +426,17 @@ kill %1
 # Verify readiness of current pods
 kubectl get pods -n dark-tower -l app=mc-service -o json | jq '.items[].status.conditions[] | select(.type=="Ready")'
 ```
+
+**Story 4 MC-B1 (connection_id REQUIRED): read the retiring detector on the OLD MC — the last
+moment it exists.** Before rolling an MC image that contains MC-B1, confirm no MH still sends
+an empty `connection_id`:
+
+```promql
+sum(increase(mc_mh_notifications_without_connection_id_total[24h])) == 0
+```
+
+Non-zero means an MH below the story 2 task 20 image is in the fleet; roll that MH forward
+first. The new MC refuses its Connecteds outright (§Coordination).
 
 **Expected output:**
 - Deployment shows desired replicas (2+)
@@ -802,6 +825,17 @@ kill %1
 > counter reads zero outside such a rollback. It is the only cluster-visible
 > evidence, because the client's accompanying warning goes to a browser console
 > that no operator can see.
+>
+> **Rolling MC back below story 4 MC-B1 (heartbeat intake).** Safe while MH is
+> below MH-2. Once MH-2 is live it is UNSAFE: roll MH back first (MH-2 rejects
+> the old MC's zero heartbeat interval and gets UNIMPLEMENTED heartbeats, so its
+> owner-silence release ends meetings). Two companions: (1) **the alert rule** —
+> `MCMediaGenerationDivergence` now reads `outcome!="match"`, and a pre-MC-B1
+> image emits `handler_id_mismatch` on every MH restart, which PAGES under it:
+> roll `mc-alerts.yaml` back with the image, or expect and silence that page;
+> (2) the old image accepts an empty `connection_id` again, so the
+> connection_id hard ordering relaxes. The `MC_MH_HEARTBEAT_TIMEOUT_MS`
+> ConfigMap key is harmlessly unused by the old image.
 
 **Step 1: Identify previous version**
 
@@ -910,6 +944,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 | `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS` *(story 3, amendment 4)* | **Yes** (hard ref, `mc-service-config`) | The minimum interval between keyframes MC directs (request-driven, and a publisher keying a target with no group in progress); there is no keyframe interval (R-9). Home: MC's own ConfigMap (`infra/services/mc-service/config.env`), so **changing it rolls mc-0/mc-1 only**. MC carries it on the video directive as `min_keyframe_interval_ms` and publishes it as `mc_media_video_keyframe_min_interval_seconds`. It is server-configured and never client-reported; the client honours max(directed, its compiled floor). Bounds `MIN_KEYFRAME_INTERVAL_MS_FLOOR..=MIN_KEYFRAME_INTERVAL_MS_CEILING` (100..=10000) in `directive.rs`; out of range refuses boot. MH does not read it. (It was the profile key `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS` until MC-A; that one-time move out of `media-codec-profile` changed the profile hash, so the MC-A deploy also rolled every MH once.) **Rollback:** roll MC back with `kubectl rollout undo` (or `deploy.sh` from the earlier commit), which returns to the retained previous profile generation that still holds the old key. **Never apply a pre-MC-A `mc-N-deployment.yaml` against the current profile**: its hard ref to `MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS` gives `CreateContainerConfigError` on both MC pods. | `500` (in ConfigMap) | `500` |
 | `MEDIA_AUDIO_CODEC`, `MEDIA_AUDIO_MAX_BITRATE_BPS`, `MEDIA_AUDIO_FRAME_RATE_HZ` *(story 3)* | **Yes** (hard ref to `media-codec-profile`) | The audio send directive. MC keeps its existing `AUDIO_*` bounds (`directive.rs`). MH-A1 also reads the bitrate and frame rate and **refuses to boot** on a bitrate outside its supported band or a frame rate other than the one its frame duration implies, so the deployable value is the intersection (header of `profile.env`). | `profile.env` | — |
 | `MC_MEDIA_CONNECT_SETTLE_MS` | **Yes** | Connect settle window (ADR-0036 §9, story 2 task 20): how long after a participant's FIRST MH-reported connection MC waits before routing on whatever it observed. Ends early once the participant reaches every handler of its meeting. **Not a debounce** — without it an all-connected meeting loses co-location permanently. Validated `100..=10000` at load. Published as `mc_media_connect_settle_window_seconds`. | `1500` (in ConfigMap) | `1500` |
+| `MC_MH_HEARTBEAT_TIMEOUT_MS` *(story 4 MC-B1)* | **Yes** (hard ref, `mc-service-config`) | N, MC's ONE handler-liveness value (ADR-0039 §1), in milliseconds. MC sends each MH the heartbeat interval `max(1, floor(N/3))` ms per meeting in `RegisterMeetingRequest.heartbeat_interval_ms` (MH has no cadence config, so the ends cannot drift) and judges liveness against N (detection lands in MC-B2). Range `(0, 30000]` (`MIN_MH_HEARTBEAT_TIMEOUT_MS..=MAX_MH_HEARTBEAT_TIMEOUT_MS` in `crates/mc-service/src/config.rs`); out of range or missing refuses boot. **Relationship to MH:** always far below MH's owner-silence release `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS` (`[300, 3600]` s), so MH ends a meeting only on prolonged MC silence, never on a heartbeat hiccup. **Trade:** lower N detects a dead handler faster but raises false declarations (MC-B2) and load — every (meeting, handler) pair sends one heartbeat per interval into its meeting actor, i.e. meetings x handlers / (N/3) messages per second; legal but expensive below ~1500 ms, so do not lower it without load testing. Published as `mc_media_handler_heartbeat_deadline_seconds`; a value edit rolls mc-0 and mc-1. | `6000` (in ConfigMap) | `6000` |
 | `MC_KEK_ROTATION_DEBOUNCE_SECONDS` | **Yes** | W, the meeting KEK rotation debounce window (ADR-0036 §4 Rotation, story 2 task 9). Every roster removal schedules a KEK rotation, debounced to at most once per W measured from the OLDEST un-rotated removal. **W is the exposure bound on a departed participant**, so the value is a security setting, not a tuning one. Carried to clients as `kek_rotation_debounce_seconds`; they derive their previous-KEK retention from it, so changing W moves client key hygiene too. Validated both sides at load; the bounds and their derivation live in `crates/mc-service/src/config.rs` (`MIN_`/`MAX_KEK_ROTATION_DEBOUNCE_SECONDS`). Published as `mc_meeting_kek_rotation_window_seconds`. | `60` (in ConfigMap) | `60` |
 | `MC_REGION` | No | Geographic region for this MC. | `us-east-1` | `local` |
 | `GC_GRPC_URL` | No | Global Controller gRPC endpoint. | `http://localhost:50051` | `http://gc-service.dark-tower:50051` |
@@ -1787,19 +1822,21 @@ sum by(event_type) (rate(mc_mh_notifications_received_total[5m]))
 - [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (run the canonical query)
 - [ ] `mc_mh_notifications_received_total` rate non-zero (events arriving means MH is reaching MC). **Since story 2 task 20 this is load-bearing, not a sanity check**: these notifications ARE who-hears-whom. A flat `connected` rate while joins continue is "nobody hears anybody".
 - [ ] `mc_mh_notifications_unapplied_total{reason="connection_bound_refused"}` flat (expected-empty); `handler_not_in_set` flat unless an MH pod restarted in the window (then it is expected — `mc-incident-response.md` Scenario 18 arm (a))
-- [ ] `mc_mh_notifications_without_connection_id_total` flat once MH has rolled (non-zero = an MH predating `connection_id` still in the fleet)
+- [ ] `mc_mh_notifications_unapplied_total{reason="connection_id_missing"}` flat (non-zero = an MH predating `connection_id` is in the fleet: an ordering violation, its sessions are refused — roll that MH forward)
+- [ ] `mc_media_handler_heartbeat_deadline_seconds` equals the ConfigMap's `MC_MH_HEARTBEAT_TIMEOUT_MS` / 1000 on every MC pod (a config echo)
+- [ ] `mc_register_meeting_total{status="handler_replaced"}` read as expected around MH restarts (a later incarnation at a reused address), never as a coordination failure; `status="error"` is the failure signal. Until story 4 MC-B2 (detection) and MC-C (replacement) land, such a handler stays Registering — client-invisible — for that meeting, and every later push to it (each structural change re-tries) gets the same answer; the meeting runs on its other handlers, and a meeting whose ONLY handler hit this has no media until it is re-created or rejoined after replacement lands. A non-zero rate on new meetings outside an MH restart window is worth checking.
 - [ ] `mc_media_connect_settle_window_seconds` equals the ConfigMap's `MC_MEDIA_CONNECT_SETTLE_MS` / 1000 on every MC pod (a config echo; a mismatch is a stale ConfigMap or a pod that did not roll)
 - [ ] `mc_meeting_kek_rotation_window_seconds` equals the ConfigMap's `MC_KEK_ROTATION_DEBOUNCE_SECONDS` on every MC pod. Same config-echo reading as above, but for W a mismatch is a **security** fact: W is the exposure bound on a departed participant, and two pods with different W give meetings different bounds depending on which pod owns them
 - [ ] `mc_participant_mh_status_total` **failed-share < 0.20** over 30m (R-60; canonical ratio query in MH runbook 30-min check). This is a *ratio*, NOT a `{state="failed"}` increase == 0 check — the counter increments on any single per-MH client hiccup, so a bare `== 0` false-fails every deploy. Any breach → investigate the client→MH media plane per `mc-incident-response.md` §"Scenario 11: Media Connection Failures".
 - [ ] No new `MCMediaConnectionAllFailed` alerts firing (`infra/docker/prometheus/rules/mc-alerts.yaml`)
 - [ ] No mc-service pod restarts since deploy completed
 - [ ] **Forwarding policy confirmed live** (ADR-0036 §8): `increase(mc_media_policy_pushes_total{outcome="match"}[30m]) > 0`. **If this is zero the gate is NOT green — it is unrun**: no meeting was programmed in the window, which is also what a broken deploy looks like. Run §Smoke Tests → [Test 5: Join Flow](#test-5-join-flow-webtransport--signaling) to drive one, then re-check. **Do not tick this on an absent series.**
-- [ ] **No unconfirmed pushes**: `increase(mc_media_policy_pushes_total{outcome!~"match|handler_id_mismatch"}[30m]) == 0`. **`handler_id_mismatch` is excluded deliberately**: `handler_id` is a per-incarnation token (MH derives it from `HOSTNAME` plus a fresh UUID at process start, and `MH_HANDLER_ID` is unset in all three manifests), so any deploy that rolls — or merely restarts — an MH pod produces that outcome **by construction**. A gate written "no non-`match` outcomes" false-fails every such deploy, and a gate that cries wolf stops being read, including for the real `no_applied_generation` it exists to catch. **Three sites hold this one expression** — this checklist, the metrics catalog entry, and story task 21's alert rule — and they are **one decision with one revert trigger**: remove the exclusion when `2026-09-02-mh-stable-handler-id` lands, in all three places together.
-- [ ] Read `mc_media_generation_divergence` **only after** the gate above has fired. It is the magnitude, never the detection signal, and it is written **only on a recorded registration push** — which since story 2 is every structural change, not once per meeting, so it is last-write-wins across many pushes and a healthy push for any meeting overwrites a diverged reading; a successful MC-restart floor adoption does not write it at all. With the ADR-0036 §8 re-assert cadence deferred, it does not observe a handler restart.
+- [ ] **No unconfirmed pushes**: `increase(mc_media_policy_pushes_total{outcome!="match"}[30m]) == 0`. Since story 4 MC-B1 a reply from another handler incarnation (an MH restart) is never classified into this outcome set — it is `mc_register_meeting_total{status="handler_replaced"}` — so there is no exclusion; the same expression is held by the alert rule and the metrics catalog entry.
+- [ ] Read `mc_media_handler_applied_sequence_lag` (p95) **only after** the gate above has fired, for how far behind handlers are. It is per (meeting, handler) per heartbeat, never the detection signal.
 
 > **Why these two PromQL expressions are inline here, against the section preamble.** That preamble says not to duplicate queries, and the rule is about two divergent copies of one query drifting apart. These two series are **MC-only with no MH-side counterpart**, so there is no second copy and nothing to diverge from — unlike the gates above, they are canonically owned here. Do not move or delete them to satisfy the preamble.
 >
-> **Scope of a green `match`**: it covers **only meetings programmed in the window**. Since story 2, meetings already live when an MC pod rolled are re-programmed by the new process on their next structural change (join, leave, declaration, mute) — via a generation-floor adoption when the handler still holds the old process's number — but a QUIESCENT meeting is not re-proven until something changes: there is still no periodic re-assert cadence (story 4). Do not read `match > 0` as "forwarding is healthy fleet-wide".
+> **Scope of a green `match`**: it covers **only meetings programmed in the window**. Since story 2, meetings already live when an MC pod rolled are re-programmed by the new process on their next structural change (join, leave, declaration, mute) — via a generation-floor adoption when the handler still holds the old process's number — but a QUIESCENT meeting is not re-proven until something changes; its handlers' liveness and applied generation arrive on their heartbeats instead (`mc_media_handler_applied_sequence_lag`). Do not read `match > 0` as "forwarding is healthy fleet-wide".
 >
 > **MC-restart floor adoptions do NOT appear in the "No unconfirmed pushes" gate, by design.** A rolled MC pod's first push to a live handler is answered with the pre-restart generation; MC records that on `mc_media_policy_generation_adoptions_total` INSTEAD of `generation_mismatch`, so the gate stays green on a healthy rollout. Expect `increase(mc_media_policy_generation_adoptions_total{outcome="adopted"}[30m])` to be non-zero after an MC roll with live meetings — **at most one per live (meeting, handler)**, which is the value with that bound. The sibling `{outcome="superseded"}` counts restart-floor replies discarded for a newer render (routine churn) and has NO such bound, so do not read the unlabelled total as a meeting count. A FAILED adoption is recorded as `generation_mismatch` and fails the gate, correctly. See the metrics catalog entry for why this is a sibling counter and not a sixth `outcome` value.
 - [ ] Cross-check the MH-side checklist (link above) for the full set of MH-side checks (handshake, JWT, timeout, MH→MC delivery success rate, active connections)

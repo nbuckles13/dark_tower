@@ -45,7 +45,10 @@ use crate::media_routing::{
     self, EgressStreamPlan, HandlerAssignment, PolicyPushOutcome, PushDisposition, PushExpectation,
     SourceDispositionPlan,
 };
-use crate::observability::metrics::{record_media_policy_push, record_register_meeting};
+use crate::observability::metrics::{
+    record_media_policy_push, record_register_meeting, REGISTER_MEETING_ERROR,
+    REGISTER_MEETING_HANDLER_REPLACED, REGISTER_MEETING_SUCCESS,
+};
 use common::observability::labels::KEY_CUSTODY_OPERATOR;
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
@@ -101,6 +104,9 @@ pub struct MeetingProgramming<'a> {
     /// generation recomputed per retry attempt would break ADR-0036 §8's
     /// "an unchanged policy carries the same number".
     pub policy_generation: NonZeroU64,
+    /// `RegisterMeetingRequest.heartbeat_interval_ms`: MC's derived interval
+    /// (`HeartbeatTiming::interval_ms`, `max(1, floor(N/3))`), never 0.
+    pub heartbeat_interval_ms: u32,
     /// Set by the pusher iff this `(meeting, handler)` has had NO confirmed
     /// push and NO adopted floor in this process lifetime — the "first confirm
     /// after an MC restart" discriminator.
@@ -323,9 +329,9 @@ impl MhClient {
             // an MH reject. A disposition change is an assignment change, so
             // the generation above advanced for it.
             source_streams: build_source_streams(programming.assignment),
-            // Story 4: MC does not emit a heartbeat cadence until MC-B1, and MH
-            // does not enforce non-zero until MH-2 (the field's ORDERING rule).
-            heartbeat_interval_ms: 0,
+            // ADR-0039 §1: derived once from MC's N (`HeartbeatTiming`), never
+            // 0, so MH-2's zero rejection can land after this (ORDERING rule).
+            heartbeat_interval_ms: programming.heartbeat_interval_ms,
             // Story 4: the public half of the meeting's dial keypair is
             // populated by MC-D; MH does not verify against it until MH-1.
             media_dial_public_key: Vec::new(),
@@ -342,7 +348,7 @@ impl MhClient {
             }
             Err(e) => {
                 let duration = start.elapsed();
-                record_register_meeting("error", duration);
+                record_register_meeting(REGISTER_MEETING_ERROR, duration);
 
                 warn!(
                     target: "mc.grpc.mh_client",
@@ -375,6 +381,25 @@ impl MhClient {
             policy_generation: programming.policy_generation,
             source_streams: &programming.assignment.source_streams,
         };
+        // Identity FIRST (ADR-0039 §7): a reply from another incarnation gives
+        // NO credit — its generation and echo are never read, the dialed
+        // handler is not advanced, and the answering id is never adopted. An
+        // ordinary in-place MH restart produces exactly this, so it is its own
+        // status (not `error`, which feeds the coordination-failure alert) and
+        // a WARN, and the worker stops (terminal: no retry reaches a gone
+        // incarnation). The dialed handler's liveness is the heartbeat's call.
+        if media_routing::handler_replaced(&expectation, response) {
+            record_register_meeting(REGISTER_MEETING_HANDLER_REPLACED, duration);
+            warn!(
+                target: "mc.grpc.mh_client",
+                meeting_id = %programming.meeting_id,
+                expected_handler_id = %programming.expected_handler_id,
+                answering_handler_id = %response.handler_id,
+                "RegisterMeeting answered by a different handler incarnation; registration \
+                 failed for the dialed handler (nothing credited, id not adopted)"
+            );
+            return Err(McError::HandlerReplaced);
+        }
         let (outcome, echo) = media_routing::evaluate_with_echo(&expectation, response);
         let restart_floor = programming.is_restart_floor(outcome, response.applied_generation);
 
@@ -383,27 +408,16 @@ impl MhClient {
         // one place, so no scrape can see a mismatch that an adoption then
         // explains. See `MeetingProgramming::restart_floor_adoptable`.
         if !restart_floor {
-            record_media_policy_push(
-                outcome,
-                programming.policy_generation,
-                response.applied_generation,
-            );
+            record_media_policy_push(outcome);
         }
-        // Keyed on the DISPOSITION, not on `== Match`. `status="success"` on this
-        // metric means "the meeting is programmed", which is exactly what
-        // `PushDisposition::Programmed` asserts — and `handler_id_mismatch` is
-        // `Programmed` (see `confirm::PolicyPushOutcome::disposition`). Comparing
-        // against `Match` here would record a failure on every ordinary MH pod
-        // restart for a push that succeeded and returned `Ok`, reintroducing on
-        // this pre-existing binary series the exact false positive OPS-17/OPS-18
-        // disarmed on `mc_media_policy_pushes_total` — and here with no yellow,
-        // no caveat and no `outcome!~` escape available, because the series has
-        // only success/error. One expression, so the two cannot drift.
+        // Keyed on the DISPOSITION: `status="success"` means "the meeting is
+        // programmed", exactly what `PushDisposition::Programmed` asserts. One
+        // expression, so the two cannot drift.
         record_register_meeting(
             if outcome.disposition() == PushDisposition::Programmed {
-                "success"
+                REGISTER_MEETING_SUCCESS
             } else {
-                "error"
+                REGISTER_MEETING_ERROR
             },
             duration,
         );
@@ -428,9 +442,8 @@ impl MhClient {
         // in a metric label — as labels they would be unbounded, one new series
         // per policy change. No meeting identifier appears on either metric.
         //
-        // `process_start_epoch_ms` is carried for the responder only: restart
-        // DETECTION is the deferred handler-restart story, so no outcome and no
-        // metric hangs off it here, and `0` reads as "restart undetectable".
+        // `process_start_epoch_ms` is carried for the responder only; nothing
+        // decides on it (MH-2 deletes the field).
         if restart_floor {
             info!(
                 target: "mc.grpc.mh_client",
@@ -450,14 +463,6 @@ impl MhClient {
 
         // The per-stream echo arm and its stream number are LOG FIELDS, never
         // labels; no sender id is logged.
-        let interim_marker = if outcome == PolicyPushOutcome::HandlerIdMismatch {
-            // Read this as the expected stable-id-not-yet-deployed case at a
-            // glance; see `media_routing::confirm::evaluate`'s precedence note
-            // and `2026-09-02-mh-stable-handler-id`.
-            " (interim)"
-        } else {
-            ""
-        };
         error!(
             target: "mc.grpc.mh_client",
             key_custody = KEY_CUSTODY_OPERATOR,
@@ -473,15 +478,10 @@ impl MhClient {
             declared_source_streams = programming.assignment.source_streams.len(),
             process_start_epoch_ms = response.process_start_epoch_ms,
             accepted = response.accepted,
-            "MH did not confirm the forwarding policy{}",
-            interim_marker
+            "MH did not confirm the forwarding policy"
         );
 
         match outcome.disposition() {
-            // `handler_id_mismatch` lands here: fully observed above, and the
-            // meeting IS programmed (the demoted precedence means this arm is
-            // only reachable with `applied == sent` and the mode agreeing), so
-            // only the abort is suppressed — never the report.
             media_routing::PushDisposition::Programmed => Ok(()),
             media_routing::PushDisposition::Retryable
             | media_routing::PushDisposition::Terminal => Err(McError::MediaPolicyDivergence {
@@ -659,6 +659,7 @@ mod tests {
             mc_grpc_endpoint: "http://mc:50052",
             assignment,
             policy_generation: NonZeroU64::MIN,
+            heartbeat_interval_ms: 2_000,
             restart_floor_adoptable: false,
         }
     }

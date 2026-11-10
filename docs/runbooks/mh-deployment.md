@@ -319,10 +319,10 @@ sum(rate(mh_mc_notifications_total{status="success"}[5m]))
 /
 sum(rate(mh_mc_notifications_total[5m]))
 
-# Every MH pod rolled to the `connection_id` image (story 2 task 20; target: 0).
-# MC counts each MH notification that arrives WITHOUT a connection_id; any
-# non-zero rate after the roll means an MH predating the field is still serving.
-sum(rate(mc_mh_notifications_without_connection_id_total[5m]))
+# Every MH pod sends a connection_id (REQUIRED since story 4 MC-B1; target: 0).
+# MC refuses each notification WITHOUT one; any non-zero rate means an MH
+# predating the story 2 task 20 image is serving and its sessions never bind.
+sum(rate(mc_mh_notifications_unapplied_total{reason="connection_id_missing"}[5m]))
 
 # Media sessions that actually STARTED in the bake window (target: >0 once
 # test traffic flows). THIS IS THE POSITIVE CONTROL FOR THE BINDING CONTRACT
@@ -377,7 +377,7 @@ clamp_min(sum(increase(mc_participant_mh_status_total{state=~"connected|failed"}
 - [ ] `mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}` increase over 30m = 0 (forwarding policy actually took effect — **receipt is not application**; the `mc_register_meeting_total` gate below cannot see this). `no_generation` is excluded and is the expected value until story task 13.
 - [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (MC RegisterMeeting RPC SLO; emitter labels are `success|error`, see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
 - [ ] `mh_mc_notifications_total{status="success"}` rate / total >95% (MH→MC delivery SLO)
-- [ ] `sum(rate(mc_mh_notifications_without_connection_id_total[5m])) == 0` — every MH pod rolled to the `connection_id` image (story 2 task 20). Non-zero means an MH predating the field is still in the fleet and MC is on the degraded legacy-key path for it; see §Rollback "`connection_id` coupling".
+- [ ] `sum(rate(mc_mh_notifications_unapplied_total{reason="connection_id_missing"}[5m])) == 0` — every MH pod sends `connection_id` (story 2 task 20 image or later). Non-zero means an MH predating the field is in the fleet and, since story 4 MC-B1, MC REFUSES its Connecteds (`sender_id` 0): its sessions never bind; see §Rollback "`connection_id` coupling".
 - [ ] `mh_media_session_starts_total{outcome="started"}` increase over 30m **> 0** once test traffic is flowing (**the binding contract works end to end on this build**). This is the only gate in this checklist a MC/MH version skew can fail — every other one is green throughout a total media blackout. If it is zero while connections are being accepted, **stop and read the decline-share gate below before proceeding**; do not sign the deploy off on the other nine.
 - [ ] `mh_media_session_starts_total` **decline share < 0.20** over 30m (run the query above). Breach ⇒ break down by `outcome` and follow `mh-incident-response.md` §Scenario 15, which partitions on *which service to open* before the label is read. **`mh_mc_notifications_total{status="success"}` above cannot cover this**: an MC image predating the `sender_id` field answers `acknowledged: true, sender_id: 0`, so delivery succeeds at 100% while every session declines.
 - [ ] `sum(mh_active_connections) > 0` once test traffic is flowing (proof clients are connecting)
@@ -1393,18 +1393,19 @@ sum by(reason) (rate(mh_media_frames_dropped_total{direction="egress"}[5m]))
 # 3. Policy is applying, not merely arriving.
 sum by(outcome) (increase(mh_media_policy_applies_total[15m]))
 
-# 4. MC agrees about what MH applied. Anything but `match` (and the
-#    `handler_id_mismatch` diagnostic, which fires on every ordinary MH restart
-#    because MH_HANDLER_ID is per-incarnation) means read MC Scenario 15.
+# 4. MC agrees about what MH applied. Anything but `match` means read MC
+#    Scenario 15. (A reply from a restarted MH incarnation is not a push
+#    outcome: it is mc_register_meeting_total{status="handler_replaced"},
+#    expected on every MH rollout; story 4 MC-B1.)
 #    OUT OF THIS GATE'S SCOPE: an MC-restart floor adoption appears under NO
 #    outcome label (it is recorded on mc_media_policy_generation_adoptions_total);
 #    it is an MC-rollout event, covered by mc-deployment.md's checklist.
 sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
 ```
 
-**Expect `handler_id_mismatch` on every MH rollout.** It is a diagnostic, not a fault, for exactly
-the reason above. `MCMediaGenerationDivergence` excludes it deliberately; do not read it as a
-regression.
+**Expect `mc_register_meeting_total{status="handler_replaced"}` on every MH rollout.** It is a
+later incarnation answering at a reused address, not a fault; `MCRegisterMeetingFailureRate` reads
+`status="error"` only, and `MCMediaGenerationDivergence` never sees it.
 
 **Related**:
 - [`mh-incident-response.md` Scenario 17: Media Datagram Drop](mh-incident-response.md#scenario-17-media-datagram-drop)
@@ -1418,7 +1419,7 @@ For the MH-WebTransport / MC↔MH-coordination deploy path, see [Rollback criter
 
 **`EndMeeting` rollout order (story 2 R-20, R-24; holds within an era, never across the story-3 cutover, where everything rolls back together — corrected 2026-10-21).** MH gains the `EndMeeting` RPC before any MC calls it; **roll MH first, and roll back in reverse — MC first**. Rolling MH back alone is safe: the tree revert + `deploy.sh` (`mh.sh upgrade`) starts each MH on the previous hash-suffixed ConfigMap generation, which still exists because nothing prunes generations ([Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)), and an MC talking to a one-version-older MH gets `UNIMPLEMENTED` for `EndMeeting`, which MC counts and does not retry — that older MH simply keeps the meeting's state and edges until it restarts, today's pre-teardown behaviour. After an MH deploy, `mh_grpc_requests_total{method="end_meeting"}` and every `mh_media_meeting_teardowns_total{outcome}` series are present at 0; an ABSENT series means the new image is not running.
 
-**`connection_id` coupling (story 2 task 20).** MH now threads its per-session `connection_id` into `NotifyParticipantConnected`/`Disconnected`; MC keys connectivity on it. There is **no hard ordering either way**, but rolling MH back alone (or an MH pod left on the old image) **degrades** MC to the legacy per-(participant, handler) key: a stale disconnect can then remove a live connection, silencing that participant for the peers routed through that handler until it rejoins. Signalled by `mc_mh_notifications_without_connection_id_total` rising (see the 30-minute check). The MC-side view of the same coupling is `mc-deployment.md` §Coordination.
+**`connection_id` coupling (story 2 task 20).** MH now threads its per-session `connection_id` into `NotifyParticipantConnected`/`Disconnected`; MC keys connectivity on it. **Since story 4 MC-B1 this is a HARD ordering:** MC refuses an empty `connection_id`, so rolling MH back below the task-20 image (or an MH pod left on an older image) gets every Connected on that MH **refused** (`sender_id` 0) — its sessions never bind, a total media outage for that handler. With the current fleet every MH sends the field; never roll an MH back below task 20 while an MC-B1 MC is live. Signalled by `mc_mh_notifications_unapplied_total{reason="connection_id_missing"}` rising (see the 30-minute check). The MC-side view of the same coupling is `mc-deployment.md` §Coordination.
 
 ---
 

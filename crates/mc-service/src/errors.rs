@@ -163,7 +163,7 @@ pub enum McError {
     /// unbounded string.
     #[error("Media policy push diverged: {}", .outcome.label())]
     MediaPolicyDivergence {
-        /// Which of the five bounded outcomes the response classified as.
+        /// Which of the four bounded outcomes the response classified as.
         outcome: crate::media_routing::PolicyPushOutcome,
         /// The generation the handler truthfully reports it has APPLIED, read
         /// off the reply the confirm step classified.
@@ -175,6 +175,14 @@ pub enum McError {
         /// generation is never a metric label.
         applied_generation: u64,
     },
+
+    /// The handler answering a `RegisterMeeting` is not the incarnation MC
+    /// dialed (`media_routing::handler_replaced`, ADR-0039 §7). TERMINAL for
+    /// the dialed handler's push worker: no retry can reach an incarnation
+    /// that is gone, nothing from the reply is credited, and the answering id
+    /// is never adopted. Ids are logged, never carried here.
+    #[error("RegisterMeeting answered by a different handler incarnation")]
+    HandlerReplaced,
 
     /// Internal error with context.
     #[error("Internal error: {0}")]
@@ -228,7 +236,8 @@ impl McError {
             | McError::NotRegistered
             | McError::TokenAcquisition(_)
             | McError::TokenAcquisitionTimeout
-            | McError::MediaPolicyDivergence { .. } => {
+            | McError::MediaPolicyDivergence { .. }
+            | McError::HandlerReplaced => {
                 6 // INTERNAL_ERROR
             }
             McError::SessionBinding(_) | McError::JwtValidation(_) => 2, // UNAUTHORIZED
@@ -296,6 +305,7 @@ impl McError {
             McError::PublishesAndReceivesNothing => "publishes_and_receives_nothing",
             McError::ReconnectPublishSetMismatch => "reconnect_publish_set_mismatch",
             McError::MediaPolicyDivergence { .. } => "media_policy_divergence",
+            McError::HandlerReplaced => "handler_replaced",
         }
     }
 
@@ -311,7 +321,8 @@ impl McError {
             | McError::NotRegistered
             | McError::TokenAcquisition(_)
             | McError::TokenAcquisitionTimeout
-            | McError::MediaPolicyDivergence { .. } => "An internal error occurred".to_string(),
+            | McError::MediaPolicyDivergence { .. }
+            | McError::HandlerReplaced => "An internal error occurred".to_string(),
             McError::SessionBinding(e) => e.to_string(),
             McError::MeetingNotFound(_) => "Meeting not found".to_string(),
             McError::ParticipantNotFound(_) => "Participant not found".to_string(),

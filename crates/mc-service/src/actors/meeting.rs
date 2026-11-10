@@ -40,7 +40,10 @@ use crate::media_kind::{
 };
 use crate::media_routing::pusher::HandlerRegistration;
 use crate::media_routing::SourceMute;
-use crate::media_routing::{ConnectionKey, MeetingHandlers, Unapplied};
+use crate::media_routing::{
+    applied_lag, Acceptance, ConnectionKey, HandlerHeartbeat, HeartbeatAnomaly, HeartbeatOutcome,
+    HeartbeatVerdict, LagReading, MeetingHandlers, Unapplied,
+};
 use crate::media_signaling::{MediaKindLabel, SlotDemand, SourceMuteView};
 
 use common::secret::SecretBox;
@@ -58,6 +61,19 @@ const MEETING_CHANNEL_BUFFER: usize = 500;
 
 /// Grace period for participant reconnection (ADR-0023: 30 seconds).
 const DISCONNECT_GRACE_PERIOD: Duration = Duration::from_secs(30);
+
+/// Why a heartbeat got no verdict from the meeting actor. Every arm is an
+/// error status to MH — NEVER a RELEASED (security S-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatRouteError {
+    /// The mailbox stayed full for the whole send budget: dropped, counted.
+    Dropped,
+    /// The actor is closed or shutting down.
+    ActorGone,
+    /// The actor accepted the heartbeat but did not answer within the reply
+    /// budget.
+    ReplyTimedOut,
+}
 
 /// Handle to a `MeetingActor`.
 #[derive(Clone, Debug)]
@@ -268,6 +284,135 @@ impl MeetingActorHandle {
                 user_id,
                 handler_id,
                 connection_id,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
+    }
+
+    /// Route one heartbeat into this meeting actor and await its verdict
+    /// (ADR-0039 §2).
+    ///
+    /// The mailbox send waits at most `send_budget` (less than one interval):
+    /// a full mailbox is [`HeartbeatRouteError::Dropped`] — the caller counts
+    /// it and answers an error status, NEVER a RELEASED (only a definite "no
+    /// actor" may become MEETING_ENDED). The reply wait is bounded by
+    /// `reply_budget`.
+    ///
+    /// # Errors
+    ///
+    /// [`HeartbeatRouteError`].
+    pub async fn handler_heartbeat(
+        &self,
+        heartbeat: crate::media_routing::HandlerHeartbeat,
+        receipt: Instant,
+        send_budget: Duration,
+        reply_budget: Duration,
+    ) -> Result<crate::media_routing::HeartbeatVerdict, HeartbeatRouteError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send_timeout(
+                MeetingMessage::MediaHandlerHeartbeat {
+                    heartbeat,
+                    receipt,
+                    respond_to: tx,
+                },
+                send_budget,
+            )
+            .await
+            .map_err(|e| match e {
+                mpsc::error::SendTimeoutError::Timeout(_) => HeartbeatRouteError::Dropped,
+                mpsc::error::SendTimeoutError::Closed(_) => HeartbeatRouteError::ActorGone,
+            })?;
+        match tokio::time::timeout(reply_budget, rx).await {
+            Ok(Ok(verdict)) => Ok(verdict),
+            Ok(Err(_)) => Err(HeartbeatRouteError::ActorGone),
+            Err(_) => Err(HeartbeatRouteError::ReplyTimedOut),
+        }
+    }
+
+    /// Remove a handler through the actor's ONE removal helper. **Test builds
+    /// only** — see `MeetingMessage::RemoveHandlerForTest`.
+    ///
+    /// # Errors
+    ///
+    /// `McError::Internal` if the actor is gone.
+    #[cfg(feature = "test-seams")]
+    pub async fn remove_handler_for_test(
+        &self,
+        handler_id: &str,
+        trigger: crate::media_routing::RemovalTrigger,
+    ) -> Result<bool, McError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(MeetingMessage::RemoveHandlerForTest {
+                handler_id: handler_id.to_string(),
+                trigger,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+        rx.await
+            .map_err(|e| McError::Internal(format!("response receive failed: {e}")))
+    }
+
+    /// Park the actor; it resumes when the returned sender fires or drops.
+    /// **Test builds only.**
+    ///
+    /// # Errors
+    ///
+    /// `McError::Internal` if the actor is gone.
+    #[cfg(feature = "test-seams")]
+    pub async fn park_for_test(&self) -> Result<tokio::sync::oneshot::Sender<()>, McError> {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(MeetingMessage::ParkForTest {
+                parked: parked_tx,
+                release: release_rx,
+            })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
+        parked_rx
+            .await
+            .map_err(|e| McError::Internal(format!("park not acknowledged: {e}")))?;
+        Ok(release_tx)
+    }
+
+    /// Fill the (parked) actor's mailbox to capacity with inert messages;
+    /// returns how many were queued. **Test builds only.**
+    #[cfg(feature = "test-seams")]
+    pub fn fill_mailbox_for_test(&self) -> usize {
+        let mut queued = 0;
+        loop {
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            if self
+                .sender
+                .try_send(MeetingMessage::GetState { respond_to: tx })
+                .is_err()
+            {
+                return queued;
+            }
+            queued += 1;
+        }
+    }
+
+    /// Read one handler's heartbeat-related state. **Test builds only.**
+    ///
+    /// # Errors
+    ///
+    /// `McError::Internal` if the actor is gone.
+    #[cfg(feature = "test-seams")]
+    pub async fn probe_handler_for_test(
+        &self,
+        handler_id: &str,
+    ) -> Result<super::messages::HandlerProbe, McError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(MeetingMessage::ProbeHandlerForTest {
+                handler_id: handler_id.to_string(),
                 respond_to: tx,
             })
             .await
@@ -1253,6 +1398,45 @@ impl MeetingActor {
             MeetingMessage::CloseMeeting { reason, respond_to } => {
                 let result = self.handle_close_meeting(&reason).await;
                 let _ = respond_to.send(result);
+            }
+
+            MeetingMessage::MediaHandlerHeartbeat {
+                heartbeat,
+                receipt,
+                respond_to,
+            } => {
+                let verdict = self.handle_handler_heartbeat(heartbeat, receipt).await;
+                let _ = respond_to.send(verdict);
+            }
+
+            #[cfg(feature = "test-seams")]
+            MeetingMessage::RemoveHandlerForTest {
+                handler_id,
+                trigger,
+                respond_to,
+            } => {
+                let removed = self.media.remove_handler(&handler_id, trigger);
+                let _ = respond_to.send(removed);
+            }
+
+            #[cfg(feature = "test-seams")]
+            MeetingMessage::ParkForTest { parked, release } => {
+                let _ = parked.send(());
+                let _ = release.await;
+            }
+
+            #[cfg(feature = "test-seams")]
+            MeetingMessage::ProbeHandlerForTest {
+                handler_id,
+                respond_to,
+            } => {
+                let probe = super::messages::HandlerProbe {
+                    release_noticed: self.media.release_noticed(&handler_id),
+                    liveness: self.media.liveness(&handler_id).cloned(),
+                    bindings: self.mh_bindings.connections_of(&handler_id),
+                    connectivity: self.media.connectivity_on(&handler_id),
+                };
+                let _ = respond_to.send(probe);
             }
 
             #[cfg(feature = "test-seams")]
@@ -2375,6 +2559,15 @@ impl MeetingActor {
         handler_id: &str,
         connection_id: String,
     ) -> (SenderLookup, Option<Unapplied>) {
+        // THE BINDING GATE (ADR-0039 §6), before ANY record: a handler that is
+        // not a member of the set — never in it, or removed — is answered 0
+        // and nothing is recorded, ledger included. Registering members pass
+        // (heartbeats are OWNED and binds admitted while a registration is in
+        // flight). An empty `connection_id` never reaches here: the gRPC
+        // boundary refuses it.
+        if self.media.handlers().resolve(handler_id).is_none() {
+            return (SenderLookup::Refused, Some(Unapplied::HandlerNotInSet));
+        }
         let (participant_id, sender_id) = match self.resolve_user(user_id) {
             Ok(found) => found,
             // S2: an ambiguous or unknown `sub` applies connectivity to NO
@@ -2384,11 +2577,13 @@ impl MeetingActor {
             }
             Err(lookup) => return (lookup, Some(Unapplied::ParticipantUnknown)),
         };
+        // ONE bind instant for both stores, so they can never fall on
+        // different sides of a heartbeat's reconcile cut-off.
+        let now = tokio::time::Instant::now();
         // MH binds on THIS answer, whatever happens to connectivity below, so
         // the binding is recorded here and not from connectivity state (F-1).
         self.mh_bindings
-            .record(handler_id, &connection_id, sender_id);
-        let now = tokio::time::Instant::now();
+            .record(handler_id, &connection_id, sender_id, now);
         let applied = self.media.media_connected(
             &participant_id,
             handler_id,
@@ -2414,6 +2609,14 @@ impl MeetingActor {
         handler_id: &str,
         connection_id: String,
     ) -> Option<Unapplied> {
+        // A Disconnected from a non-member (never in the set, or REMOVED — a
+        // zombie) is a counted no-op: it releases no ledger entry (a removed
+        // handler's bindings are released in bulk by the removal path, after
+        // the set without it was pushed) and touches no other handler's
+        // connectivity. An empty `connection_id` is refused at the boundary.
+        if self.media.handlers().resolve(handler_id).is_none() {
+            return Some(Unapplied::HandlerNotInSet);
+        }
         // Release the handed-out binding FIRST, before the roster lookup: the
         // holder may already be off the roster, and its connection closing is
         // exactly what frees its id for a later epoch (F-1). MH clears its own
@@ -2440,6 +2643,149 @@ impl MeetingActor {
             }
             Ok(false) => None,
             Err(reason) => Some(reason),
+        }
+    }
+
+    /// One heartbeat (ADR-0039 §1/§2/§6). The verdict comes from the set; only
+    /// an OWNED heartbeat touches state — liveness, the lag reading and the
+    /// remove-only reconcile. Logged on transitions only, never per heartbeat.
+    async fn handle_handler_heartbeat(
+        &mut self,
+        heartbeat: HandlerHeartbeat,
+        receipt: Instant,
+    ) -> HeartbeatVerdict {
+        let member = match self
+            .media
+            .handlers()
+            .heartbeat_member(&heartbeat.handler_id)
+        {
+            Ok(member) => member,
+            Err(verdict) => {
+                self.note_released_heartbeat(&heartbeat.handler_id, verdict);
+                return verdict;
+            }
+        };
+        crate::observability::metrics::record_handler_heartbeat(HeartbeatOutcome::Owned);
+        let sent = self.media.sent_generation(&member).await;
+        let mut anomalies: Vec<HeartbeatAnomaly> = heartbeat.reconcile_skip.into_iter().collect();
+        anomalies.extend(Self::observe_lag(sent, heartbeat.applied_generation));
+        let (observed, fresh) = self
+            .media
+            .observe_heartbeat(&member, &heartbeat, receipt, &anomalies);
+        self.log_heartbeat_transitions(&heartbeat, observed.transition, &anomalies, &fresh);
+        if let Acceptance::Accepted {
+            previous: Some(previous),
+        } = observed.acceptance
+        {
+            crate::observability::metrics::observe_heartbeat_interval(
+                receipt.saturating_duration_since(previous),
+            );
+            if heartbeat.reconcile_skip.is_none() {
+                self.reconcile_connected_set(&heartbeat, previous).await;
+            }
+        }
+        HeartbeatVerdict::Owned
+    }
+
+    /// A non-OWNED verdict: always counted; WARNed once per (meeting, handler)
+    /// — deduped here, never trusting the peer to stop after RELEASED (a
+    /// buggy, pre-MH-2, misrouted or forged caller keeps sending).
+    fn note_released_heartbeat(&mut self, wire_handler_id: &str, verdict: HeartbeatVerdict) {
+        crate::observability::metrics::record_handler_heartbeat(verdict.outcome());
+        if self.media.first_release_notice(wire_handler_id) {
+            warn!(
+                target: "mc.actor.meeting",
+                meeting_id = %self.meeting_id,
+                handler_id = %wire_handler_id,
+                outcome = verdict.outcome().label(),
+                "Heartbeat from a handler outside the meeting's set answered RELEASED \
+                 (logged once per handler; the counter carries the rate)"
+            );
+        }
+    }
+
+    /// Count every anomaly this heartbeat had, WARN on the fresh ones (per
+    /// (meeting, handler) transition, never per heartbeat; connection ids are
+    /// never logged), and INFO a serving-state / apply-refusal transition.
+    fn log_heartbeat_transitions(
+        &self,
+        heartbeat: &HandlerHeartbeat,
+        transition: bool,
+        anomalies: &[HeartbeatAnomaly],
+        fresh: &[HeartbeatAnomaly],
+    ) {
+        for anomaly in anomalies {
+            crate::observability::metrics::record_heartbeat_anomaly(*anomaly);
+        }
+        for anomaly in fresh {
+            warn!(
+                target: "mc.actor.meeting",
+                meeting_id = %self.meeting_id,
+                handler_id = %heartbeat.handler_id,
+                anomaly = anomaly.label(),
+                connection_ids = heartbeat.connection_ids.len(),
+                "Handler heartbeat anomaly (MH contract or version skew); verdict and liveness \
+                 still applied"
+            );
+        }
+        if transition {
+            info!(
+                target: "mc.actor.meeting",
+                meeting_id = %self.meeting_id,
+                handler_id = %heartbeat.handler_id,
+                serving_state = heartbeat.serving_state.as_str_name(),
+                apply_refusal = heartbeat.apply_refusal.as_str_name(),
+                applied_generation = heartbeat.applied_generation,
+                "Handler heartbeat state changed"
+            );
+        }
+    }
+
+    /// The lag reading for one OWNED heartbeat (stale included): observed, or
+    /// the `applied_ahead_of_sent` anomaly. Never a fake 0.
+    fn observe_lag(sent: Option<std::num::NonZeroU64>, applied: u64) -> Option<HeartbeatAnomaly> {
+        match applied_lag(sent, applied) {
+            LagReading::Lag(lag) => {
+                crate::observability::metrics::observe_applied_sequence_lag(lag);
+                None
+            }
+            LagReading::AheadOfSent => Some(HeartbeatAnomaly::AppliedAheadOfSent),
+            LagReading::Unobserved => None,
+        }
+    }
+
+    /// The remove-only reconcile for one handler, over BOTH stores with the
+    /// one predicate (ADR-0039 §6): connectivity keys and handed-out bindings
+    /// absent from the heartbeat and bound before `previous`. Never adds.
+    async fn reconcile_connected_set(&mut self, heartbeat: &HandlerHeartbeat, previous: Instant) {
+        let present: std::collections::HashSet<&str> = heartbeat
+            .connection_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut retired: std::collections::BTreeSet<String> = self
+            .mh_bindings
+            .release_absent(&heartbeat.handler_id, &present, previous)
+            .into_iter()
+            .collect();
+        let (keys, routing_changed) =
+            self.media
+                .retire_absent(&heartbeat.handler_id, &present, previous, Instant::now());
+        retired.extend(keys);
+        if retired.is_empty() {
+            return;
+        }
+        crate::observability::metrics::record_connected_set_corrections(retired.len());
+        info!(
+            target: "mc.actor.meeting",
+            meeting_id = %self.meeting_id,
+            handler_id = %heartbeat.handler_id,
+            corrections = retired.len(),
+            "Heartbeat retired connections whose Disconnected was lost"
+        );
+        if routing_changed {
+            self.reconcile_media(Affected::All).await;
+            self.flush_views().await;
         }
     }
 

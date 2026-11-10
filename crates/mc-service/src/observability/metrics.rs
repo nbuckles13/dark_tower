@@ -18,7 +18,8 @@ use crate::media_admission::SenderBindingOutcome;
 use crate::media_kind::KindLabels;
 use crate::media_routing::teardown::{EndMeetingOutcome, QuiesceOutcome};
 use crate::media_routing::{
-    divergence_magnitude, FloorAdoption, PolicyPushOutcome, SettleOutcome, Unapplied,
+    FloorAdoption, HeartbeatAnomaly, HeartbeatOutcome, HeartbeatTiming, PolicyPushOutcome,
+    SettleOutcome, Unapplied, APPLIED_SEQUENCE_LAG_BUCKETS,
 };
 use crate::media_signaling::{
     slot_state_label, CapabilityOutcome, ClientMuteFanoutOutcome, DirectiveOutcome, MuteOutcome,
@@ -27,7 +28,6 @@ use crate::media_signaling::{
 };
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
-use std::num::NonZeroU64;
 use std::time::Duration;
 
 /// Initialize Prometheus metrics recorder and return the handle
@@ -41,8 +41,10 @@ use std::time::Duration;
 /// # Errors
 ///
 /// Returns error if Prometheus recorder fails to install (e.g., already installed).
-pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
-    configured_prometheus_builder()?
+/// `heartbeat` is the validated N: the heartbeat interval histogram's buckets
+/// are derived from it (ADR-0039 §1), so they follow config, never a literal.
+pub fn init_metrics_recorder(heartbeat: HeartbeatTiming) -> Result<PrometheusHandle, String> {
+    configured_prometheus_builder(heartbeat)?
         .install_recorder()
         .map_err(|e| format!("Failed to install Prometheus metrics recorder: {e}"))
 }
@@ -56,8 +58,21 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
 /// minutes-scale `idle_timeout` would reap idle 0-series — so idle_timeout-
 /// absence is a CONFIG-REVIEW checkpoint here, not a test-enforced invariant
 /// (neither this test nor the Layer-7 env-test reliably backstops it).
-fn configured_prometheus_builder() -> Result<PrometheusBuilder, String> {
+fn configured_prometheus_builder(heartbeat: HeartbeatTiming) -> Result<PrometheusBuilder, String> {
     PrometheusBuilder::new()
+        // Heartbeat inter-arrival per (meeting, handler): buckets DERIVED from
+        // N (N/6 .. 2N), around the healthy cadence N/3, N/2 and the deadline.
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_media_handler_heartbeat_interval_seconds".to_string()),
+            &heartbeat.interval_histogram_buckets(),
+        )
+        .map_err(|e| format!("Failed to set heartbeat interval buckets: {e}"))?
+        // Sent minus applied generation: integer counts, not seconds.
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_media_handler_applied_sequence_lag".to_string()),
+            &APPLIED_SEQUENCE_LAG_BUCKETS,
+        )
+        .map_err(|e| format!("Failed to set applied-sequence lag buckets: {e}"))?
         // GC heartbeat latency buckets - internal service call (p95 < 100ms)
         .set_buckets_for_metric(
             Matcher::Prefix("mc_gc_heartbeat".to_string()),
@@ -416,9 +431,13 @@ pub fn record_join_refusal(error_type: &'static str) {
 ///
 /// # Arguments
 ///
-/// * `status` - "success" or "error"
+/// * `status` - one of [`REGISTER_MEETING_STATUSES`]
 /// * `duration` - Duration of the RegisterMeeting RPC call
-pub fn record_register_meeting(status: &str, duration: Duration) {
+///
+/// `handler_replaced` is NOT a coordination failure: the endpoint answered as
+/// a different incarnation (expected on an in-place MH restart; ADR-0039 §7).
+/// `MCRegisterMeetingFailureRate` reads `status="error"` only.
+pub fn record_register_meeting(status: &'static str, duration: Duration) {
     histogram!("mc_register_meeting_duration_seconds").record(duration.as_secs_f64());
 
     counter!("mc_register_meeting_total",
@@ -433,83 +452,32 @@ pub fn record_register_meeting(status: &str, duration: Duration) {
 
 /// Record the outcome of one media-policy push to a handler (ADR-0036 §8).
 ///
-/// Emits **both** media-path metrics, on **every** outcome including `match`:
+/// Metric: `mc_media_policy_pushes_total` — counter, labels `outcome` +
+/// `key_custody`, on **every** outcome including `match`.
 ///
-/// * `mc_media_policy_pushes_total` — counter, labels `outcome` + `key_custody`.
-/// * `mc_media_generation_divergence` — gauge, label `key_custody`.
-///
-/// # `mc_media_policy_pushes_total`
-///
-/// `outcome` is `internal.proto`'s canonical five-value vocabulary, bounded by
-/// [`PolicyPushOutcome::ALL`] so a sixth value is a compile error rather than a
+/// `outcome` is `internal.proto`'s canonical four-value vocabulary, bounded by
+/// [`PolicyPushOutcome::ALL`] so a fifth value is a compile error rather than a
 /// time series discovered in production. The label **key** is `outcome`, not
 /// `status`, matching MH's `mh_media_policy_applies_total{outcome,key_custody}`
 /// so both ends of one handshake sit side by side in a query.
 ///
 /// **Counts response evaluations, not meetings.** A retried push contributes one
-/// sample per attempt; a terminal outcome exactly one. A divergence *ratio*
-/// computed over this denominator is therefore per-attempt, not per-meeting.
+/// sample per attempt; a terminal outcome exactly one.
 ///
-/// **`handler_id_mismatch` is a diagnostic, not an alerting signal**, until
-/// `MH_HANDLER_ID` is stable per deployment: the id is a per-incarnation token,
-/// so every ordinary MH restart produces that outcome by construction. Alert
-/// expressions must read `outcome!~"match|handler_id_mismatch"`. Three sites
-/// hold that one expression — the alert rule, this catalog entry, and
-/// `mc-deployment.md`'s post-deploy checklist — and they are **one decision with
-/// one revert trigger**, `2026-09-02-mh-stable-handler-id`.
-///
-/// # `mc_media_generation_divergence`
-///
-/// Value is [`divergence_magnitude`]: an unsigned **magnitude**, not a
-/// difference, computed from the **applied** value in the response. Feeding it
-/// from the sent value yields a constant 0, which is precisely the silent
-/// regression ADR-0036 §8 names.
-///
-/// Semantics are *last-observed divergence magnitude*. Its clearing path is the
-/// next push of any (meeting, handler) on this pod — a value that is
-/// overwritten, never a latch, so it cannot wedge above zero for a pod's
-/// lifetime the way a count with no decrement would. The stated price: it is
-/// pod-level last-write-wins, so a healthy push can erase a diverged reading,
-/// and MC's scrape interval (the global `scrape_interval` config key, never a
-/// number here) is coarse relative to a one-shot-per-registration write, so a
-/// divergence can be overwritten before it is ever scraped.
-///
-/// **Therefore the detection signal is the counter; the gauge is the magnitude a
-/// responder reads next.**
-///
-/// **Written on every RECORDED registration push**, which since story 2 means
-/// every structural change (join, leave, declaration, mute), not once per
-/// meeting — so the last-write-wins caveat above gets WORSE: a healthy push of
-/// ANY (meeting, handler) on the pod overwrites a diverged reading. With no
-/// re-assert cadence yet (story 4) it still **does not observe a handler
-/// restart**: a handler can lose all policy while this gauge holds its last
-/// healthy value. A successful MC-restart floor adoption never reaches this
-/// function at all (it is recorded on `mc_media_policy_generation_adoptions_total`),
-/// so neither the counter nor the gauge is written for it; a FAILED adoption is
-/// recorded here as `generation_mismatch`.
-pub fn record_media_policy_push(outcome: PolicyPushOutcome, sent: NonZeroU64, applied: u64) {
+/// A reply from a different handler incarnation is never classified here (it
+/// is `mc_register_meeting_total{status="handler_replaced"}`), so every
+/// non-`match` outcome is a real divergence: alert expressions read
+/// `outcome!="match"`. The magnitude of a live lag is
+/// `mc_media_handler_applied_sequence_lag`, observed per heartbeat (the
+/// retired `mc_media_generation_divergence` gauge was pod-level
+/// last-write-wins). Generation numbers ride the `error!` line, never a label.
+pub fn record_media_policy_push(outcome: PolicyPushOutcome) {
     counter!(
         "mc_media_policy_pushes_total",
         "outcome" => outcome.label(),
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(1);
-
-    // u64 -> f64 for the gauge. Lossy only above 2^53, which a generation
-    // magnitude reaches solely under the `u64::MAX` ratchet wedge — where the
-    // value is already "enormous, investigate" rather than a quantity anyone
-    // reads precisely.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "generation magnitude exceeds 2^53 only under the u64::MAX ratchet wedge, \
-                  where the value is 'enormous, investigate' not a precise quantity"
-    )]
-    let magnitude = divergence_magnitude(sent, applied) as f64;
-    gauge!(
-        "mc_media_generation_divergence",
-        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
-    )
-    .set(magnitude);
 }
 
 /// # `mc_media_sender_binding_responses_total`
@@ -934,31 +902,15 @@ pub fn record_edge_move(reason: EdgeMove) {
 /// Connectivity decides who hears whom, so every way a notification fails to
 /// become connectivity is counted. Per-value expectations differ:
 /// `unknown_connection` is routine (every declined connection's Disconnected);
-/// `connection_bound_refused` is expected-empty; a sustained
-/// `handler_not_in_set` means an MH restarted under a new id. No meeting,
-/// participant, handler or connection identity.
+/// `connection_bound_refused` is expected-empty; `handler_not_in_set` is the
+/// binding gate refusing an out-of-set or removed handler (ADR-0039 §6);
+/// `connection_id_missing` is an MH that sent no `connection_id` (REQUIRED;
+/// non-zero = an MH below the connection_id image). No meeting, participant,
+/// handler or connection identity.
 pub fn record_notification_unapplied(reason: Unapplied) {
     counter!(
         "mc_mh_notifications_unapplied_total",
         "reason" => reason.label(),
-        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
-    )
-    .increment(1);
-}
-
-/// Record a handler notification with an EMPTY `connection_id` (a pre-field MH).
-///
-/// Metric: `mc_mh_notifications_without_connection_id_total`
-/// Labels: `key_custody` (1)
-/// Cardinality: 1
-///
-/// The degraded legacy path: one implicit key per (participant, handler), i.e.
-/// the stale-disconnect hazard `connection_id` exists to close. Non-zero means
-/// an old MH is still in the fleet; the legacy branch is deleted once this has
-/// been flat for a full rollout.
-pub fn record_notification_without_connection_id() {
-    counter!(
-        "mc_mh_notifications_without_connection_id_total",
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(1);
@@ -996,6 +948,117 @@ pub fn set_connect_settle_window(window: Duration) {
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .set(window.as_secs_f64());
+}
+
+/// Record the verdict MC returned for one heartbeat (ADR-0039 §6).
+///
+/// Metric: `mc_media_handler_heartbeats_total`
+/// Labels: `outcome` x `key_custody`
+/// Cardinality: bounded by [`HeartbeatOutcome::ALL`]
+///
+/// `released_ended` is the lost-EndMeeting retry rate; `released_unassigned`
+/// and `owner_mismatch` are expected zero (WARNING on any increase). No
+/// meeting, handler or connection identity.
+pub fn record_handler_heartbeat(outcome: HeartbeatOutcome) {
+    counter!(
+        "mc_media_handler_heartbeats_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record connections a heartbeat retired from MC's state (remove-only
+/// reconcile, ADR-0039 §6).
+///
+/// Metric: `mc_media_handler_connected_set_corrections_total`
+/// Labels: `key_custody` (1)
+///
+/// Unit: one per DISTINCT `(handler, connection_id)` a heartbeat retired,
+/// across connectivity keys and binding-ledger entries (a departed
+/// participant's leaked binding counts). Each increment is a lost
+/// Disconnected the heartbeat healed.
+pub fn record_connected_set_corrections(retired: usize) {
+    counter!(
+        "mc_media_handler_connected_set_corrections_total",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    // usize -> u64 is lossless on every supported target; saturate rather
+    // than `as` (a count this large is not reachable).
+    .increment(u64::try_from(retired).unwrap_or(u64::MAX));
+}
+
+/// Record one heartbeat MC answered but could not fully use.
+///
+/// Metric: `mc_media_handler_heartbeat_anomalies_total`
+/// Labels: `reason` x `key_custody`
+/// Cardinality: bounded by [`HeartbeatAnomaly::ALL`]
+///
+/// Expected zero: non-zero is an MH contract or version-skew fault. The
+/// verdict and liveness still applied; only the reconcile (over-cap,
+/// malformed) or the lag reading (applied ahead of sent) was skipped.
+pub fn record_heartbeat_anomaly(reason: HeartbeatAnomaly) {
+    counter!(
+        "mc_media_handler_heartbeat_anomalies_total",
+        "reason" => reason.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Observe one heartbeat inter-arrival per (meeting, handler).
+///
+/// Metric: `mc_media_handler_heartbeat_interval_seconds` (histogram, buckets
+/// derived from N)
+/// Labels: `key_custody` (1)
+///
+/// ACCEPTED heartbeats with a previous accepted receipt only: stale or
+/// replayed arrivals are excluded (they appear on
+/// `mc_media_handler_applied_sequence_lag`). This is the liveness clock MC-B2's
+/// `assess()` judges against N.
+pub fn observe_heartbeat_interval(inter_arrival: Duration) {
+    histogram!(
+        "mc_media_handler_heartbeat_interval_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .record(inter_arrival.as_secs_f64());
+}
+
+/// Observe sent minus applied `policy_generation` for one OWNED heartbeat
+/// (stale ones included). Not observed while MC has never pushed to the pair,
+/// nor when MH reports a generation ahead of what MC sent (counted as an
+/// anomaly instead) — never a fake 0.
+///
+/// Metric: `mc_media_handler_applied_sequence_lag` (histogram, integer buckets)
+/// Labels: `key_custody` (1)
+pub fn observe_applied_sequence_lag(lag: u64) {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a generation lag above 2^53 is 'enormous, investigate', not a precise quantity"
+    )]
+    let value = lag as f64;
+    histogram!(
+        "mc_media_handler_applied_sequence_lag",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .record(value);
+}
+
+/// Publish N, the configured heartbeat deadline.
+///
+/// Metric: `mc_media_handler_heartbeat_deadline_seconds`
+/// Labels: `key_custody` (1)
+///
+/// A CONFIG ECHO set once at boot from the SAME `HeartbeatTiming` the intake
+/// and the RegisterMeeting interval derive from (`MC_MH_HEARTBEAT_TIMEOUT_MS`).
+/// Env-tests derive their waits from it; the dashboard shows it beside MH's
+/// QUIC idle timeout.
+pub fn set_heartbeat_deadline(heartbeat: HeartbeatTiming) {
+    gauge!(
+        "mc_media_handler_heartbeat_deadline_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(heartbeat.timeout().as_secs_f64());
 }
 
 /// Record one MC-restart generation-floor reply.
@@ -2095,6 +2158,18 @@ const _: () = {
 
 /// `status` on the `success`/`error`-shaped counters. Emit sites: fixed literals.
 const STATUS_SUCCESS_ERROR: &[&str] = &["success", "error"];
+/// `mc_register_meeting_total{status}`: the meeting is programmed.
+pub const REGISTER_MEETING_SUCCESS: &str = "success";
+/// `mc_register_meeting_total{status}`: a coordination failure.
+pub const REGISTER_MEETING_ERROR: &str = "error";
+/// `mc_register_meeting_total{status}`: answered by a different incarnation.
+pub const REGISTER_MEETING_HANDLER_REPLACED: &str = "handler_replaced";
+/// `mc_register_meeting_total{status}`: the whole vocabulary.
+const REGISTER_MEETING_STATUSES: &[&str] = &[
+    REGISTER_MEETING_SUCCESS,
+    REGISTER_MEETING_ERROR,
+    REGISTER_MEETING_HANDLER_REPLACED,
+];
 /// `status` on `mc_session_joins_total`. Emit sites: `connection.rs` literals.
 const JOIN_STATUSES: &[&str] = &["success", "failure"];
 /// `mc_webtransport_connections_total{status}`. Emit sites: `server.rs` literals.
@@ -2310,14 +2385,19 @@ pub fn zero_initialize_counters() {
         .increment(0);
     counter!("mc_media_not_yet_connected_senders_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
         .increment(0);
-    counter!("mc_mh_notifications_without_connection_id_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
-        .increment(0);
     for r in EdgeMove::ALL {
         counter!("mc_media_edge_moves_total", "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
     for r in Unapplied::ALL {
         counter!("mc_mh_notifications_unapplied_total", "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
+    for o in HeartbeatOutcome::ALL {
+        counter!("mc_media_handler_heartbeats_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for r in HeartbeatAnomaly::ALL {
+        counter!("mc_media_handler_heartbeat_anomalies_total", "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    counter!("mc_media_handler_connected_set_corrections_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     for o in SettleOutcome::ALL {
         counter!("mc_media_connect_settles_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
@@ -2346,6 +2426,8 @@ pub fn zero_initialize_counters() {
     // --- enum-less string vocabularies ---
     for s in STATUS_SUCCESS_ERROR {
         counter!("mc_token_refresh_total", "status" => *s).increment(0);
+    }
+    for s in REGISTER_MEETING_STATUSES {
         counter!("mc_register_meeting_total", "status" => *s).increment(0);
     }
     for s in JOIN_STATUSES {
@@ -2425,7 +2507,7 @@ mod tests {
     /// recorder/scrape failure, NOT a present-at-0 violation.
     #[test]
     fn zero_init_renders_counters_present_at_zero() {
-        let recorder = configured_prometheus_builder()
+        let recorder = configured_prometheus_builder(HeartbeatTiming::from_timeout_ms(6_000))
             .expect("prometheus builder config")
             .build_recorder();
         let handle = recorder.handle();
@@ -2526,6 +2608,44 @@ mod tests {
             "the retired slot_count_over_cap outcome must not be zero-initialised"
         );
 
+        // Story 4 MC-B1 (ADR-0039 §1/§6): every new heartbeat series, and the
+        // new values on existing ones, present at 0 for EVERY label value.
+        for o in HeartbeatOutcome::ALL {
+            present_at_zero(&format!(
+                r#"mc_media_handler_heartbeats_total{{outcome="{}",key_custody="operator"}}"#,
+                o.label()
+            ));
+        }
+        for r in HeartbeatAnomaly::ALL {
+            present_at_zero(&format!(
+                r#"mc_media_handler_heartbeat_anomalies_total{{reason="{}",key_custody="operator"}}"#,
+                r.label()
+            ));
+        }
+        present_at_zero(
+            r#"mc_media_handler_connected_set_corrections_total{key_custody="operator"}"#,
+        );
+        for s in REGISTER_MEETING_STATUSES {
+            present_at_zero(&format!(r#"mc_register_meeting_total{{status="{s}"}}"#));
+        }
+        present_at_zero(
+            r#"mc_mh_notifications_unapplied_total{reason="connection_id_missing",key_custody="operator"}"#,
+        );
+        present_at_zero(
+            r#"mc_media_sender_binding_responses_total{outcome="refused",key_custody="operator"}"#,
+        );
+        // Retired in MC-B1: never emitted again.
+        for retired in [
+            "mc_media_generation_divergence",
+            "mc_mh_notifications_without_connection_id_total",
+            "handler_id_mismatch",
+        ] {
+            assert!(
+                !rendered.contains(retired),
+                "retired series/value rendered: {retired}"
+            );
+        }
+
         // Series-count ceiling (security): a future enum variant can't silently
         // multiply the cross-product unnoticed. Count zero-init'd `_total` lines.
         let total_series = rendered
@@ -2552,7 +2672,7 @@ mod tests {
     /// Layer-7 env-test reliably backstops it (the builder exposes no readback).
     #[test]
     fn production_builder_has_no_idle_timeout() {
-        let recorder = configured_prometheus_builder()
+        let recorder = configured_prometheus_builder(HeartbeatTiming::from_timeout_ms(6_000))
             .expect("prometheus builder config")
             .build_recorder();
         let handle = recorder.handle();
@@ -2637,13 +2757,14 @@ mod tests {
                 outcome: PolicyPushOutcome::ALL[0],
                 applied_generation: 0,
             },
+            McError::HandlerReplaced,
         ];
 
         // WILDCARD-FREE: adding an `McError` variant breaks compilation here until
         // it is classified. Do NOT add a `_ =>` arm — that reopens the drift gap.
         // When you classify a new variant here, ALSO list it in `all` above and
         // bump this count; `all` is otherwise invisible to the assertion below.
-        const MCERROR_VARIANT_COUNT: usize = 27;
+        const MCERROR_VARIANT_COUNT: usize = 28;
         assert_eq!(
             all.len(),
             MCERROR_VARIANT_COUNT,
@@ -2684,7 +2805,8 @@ mod tests {
                 | McError::PermissionDenied(_)
                 | McError::TokenAcquisition(_)
                 | McError::TokenAcquisitionTimeout
-                | McError::MediaPolicyDivergence { .. } => false,
+                | McError::MediaPolicyDivergence { .. }
+                | McError::HandlerReplaced => false,
             }
         }
 
@@ -3732,5 +3854,60 @@ mod tests {
         record_fenced_out("test_reason");
 
         // If we get here without panicking, all metric functions are callable
+    }
+
+    /// The heartbeat interval histogram's buckets follow N (config, never a
+    /// literal): rendered for N = 7000 they are N/6 .. 2N, and not the 6000 set.
+    /// The lag histogram's buckets are integer counts.
+    #[test]
+    fn heartbeat_histogram_buckets_are_derived_from_n() {
+        let timing = HeartbeatTiming::from_timeout_ms(7_000);
+        let recorder = configured_prometheus_builder(timing)
+            .expect("prometheus builder config")
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            observe_heartbeat_interval(Duration::from_millis(2_333));
+            observe_applied_sequence_lag(3);
+        });
+        let rendered = handle.render();
+        let les = |name: &str| -> Vec<String> {
+            rendered
+                .lines()
+                .filter(|l| l.starts_with(&format!("{name}_bucket{{")))
+                .filter_map(|l| l.split("le=\"").nth(1))
+                .filter_map(|r| r.split('"').next())
+                .map(str::to_string)
+                .collect()
+        };
+        let expected: Vec<String> = timing
+            .interval_histogram_buckets()
+            .iter()
+            .map(|b| b.to_string())
+            .chain(["+Inf".to_string()])
+            .collect();
+        assert_eq!(les("mc_media_handler_heartbeat_interval_seconds"), expected);
+        assert_ne!(
+            timing.interval_histogram_buckets(),
+            HeartbeatTiming::from_timeout_ms(6_000).interval_histogram_buckets()
+        );
+        assert_eq!(
+            les("mc_media_handler_applied_sequence_lag"),
+            ["0", "1", "2", "3", "5", "10", "25", "100", "+Inf"]
+        );
+    }
+
+    #[test]
+    fn heartbeat_deadline_gauge_echoes_n() {
+        let recorder = configured_prometheus_builder(HeartbeatTiming::from_timeout_ms(6_000))
+            .expect("prometheus builder config")
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            set_heartbeat_deadline(HeartbeatTiming::from_timeout_ms(7_500));
+        });
+        assert!(handle.render().contains(
+            r#"mc_media_handler_heartbeat_deadline_seconds{key_custody="operator"} 7.5"#
+        ));
     }
 }

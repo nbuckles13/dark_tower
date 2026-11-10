@@ -23,19 +23,12 @@
 //! [`end_meeting_plan`] will not build a plan without one. So "after the last
 //! push returned" is a type obligation, not a comment a later edit can skip.
 //!
-//! # Story-2 assumption, and the story-4 fence
+//! # Why draining the workers is sufficient ordering
 //!
-//! STORY-2 ASSUMPTION: no periodic §8 re-assert exists yet, so the only
-//! `RegisterMeeting` pushes are the structural ones this meeting's own push
-//! workers make, and draining those workers is sufficient ordering.
-//!
-//! STORY-4 NOTE: once the periodic re-assert lands, a re-assert racing this
-//! release RESURRECTS the ended meeting's routes and edge budget on a timer.
-//! Draining the workers does not cover a timer-driven push. That needs a real
-//! fence — `docs/TODO.md`, "`EndMeeting` has no fence against a late
-//! `RegisterMeeting`". MH's apply-time registration check (story 2 task 12) is
-//! ORTHOGONAL to that fence: it refuses APPLIES for an UNREGISTERED meeting,
-//! and a re-assert re-registers the meeting, so it passes by design.
+//! There is no periodic re-assert (ADR-0039 supersedes ADR-0036 §8's), so the
+//! only `RegisterMeeting` pushes are the structural ones this meeting's own
+//! push workers make, and draining those workers orders every one of them
+//! before the release. Heartbeats never push: they are MH -> MC.
 //!
 //! # What an unclean end does NOT do
 //!

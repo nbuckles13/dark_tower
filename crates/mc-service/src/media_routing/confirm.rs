@@ -96,7 +96,7 @@ pub fn first_echo_mismatch(
 
 /// What a handler's reply to a policy push was.
 ///
-/// The five values are `internal.proto`'s canonical `outcome` vocabulary, which
+/// The four values are `internal.proto`'s canonical `outcome` vocabulary, which
 /// claims sole definition of the set ("defined here and deliberately not
 /// restated elsewhere"). These arms restate it, so:
 ///
@@ -112,8 +112,10 @@ pub fn first_echo_mismatch(
 /// the response prove". Shared idiom, different value sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyPushOutcome {
-    /// MH's live forward path reflects the generation MC sent, the transport
-    /// mode agrees, and the handler identified itself as the one MC dialed.
+    /// MH's live forward path reflects the generation MC sent and the
+    /// transport mode agrees. (The handler's identity is checked BEFORE this
+    /// classifier, by [`handler_replaced`]: a different incarnation's reply is
+    /// never classified at all.)
     Match,
     /// `applied_generation` was 0: MH's forward path reflects no generation at
     /// all for this meeting. Distinct from [`Self::GenerationMismatch`] because
@@ -130,11 +132,6 @@ pub enum PolicyPushOutcome {
     /// mode ([`EchoArm`], logged; story 3 R-20). §8's two-ends-must-agree
     /// check.
     TransportModeMismatch,
-    /// The handler identified itself as someone other than the one MC dialed.
-    ///
-    /// **Non-fatal and lowest-precedence for the interim** — see [`evaluate`]
-    /// for why, and for the single condition that reverts both.
-    HandlerIdMismatch,
 }
 
 impl PolicyPushOutcome {
@@ -145,14 +142,13 @@ impl PolicyPushOutcome {
     /// iterates this rather than re-enumerating, because an enumeration
     /// written out elsewhere compiles clean while staying silently short. The
     /// length is written out rather than inferred: it is the catalogued
-    /// cardinality of the `outcome` label, so a sixth variant fails to compile
+    /// cardinality of the `outcome` label, so a fifth variant fails to compile
     /// here first, before the catalog and dashboard go stale.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 4] = [
         Self::Match,
         Self::NoAppliedGeneration,
         Self::GenerationMismatch,
         Self::TransportModeMismatch,
-        Self::HandlerIdMismatch,
     ];
 
     /// Bounded `outcome` metric-label value.
@@ -163,7 +159,6 @@ impl PolicyPushOutcome {
             Self::NoAppliedGeneration => "no_applied_generation",
             Self::GenerationMismatch => "generation_mismatch",
             Self::TransportModeMismatch => "transport_mode_mismatch",
-            Self::HandlerIdMismatch => "handler_id_mismatch",
         }
     }
 
@@ -173,24 +168,6 @@ impl PolicyPushOutcome {
         match self {
             // The meeting is programmed.
             Self::Match => PushDisposition::Programmed,
-
-            // INTERIM: NON-FATAL. See `evaluate`'s precedence comment — this and
-            // the demotion to lowest precedence are ONE decision with ONE cause
-            // and they revert together, tracked in `2026-09-02-mh-stable-handler-id`.
-            //
-            // This is NOT a swallowed error, and the distinction is the whole
-            // of it: the failure is fully observable — an `error!` line, a
-            // `mc_media_policy_pushes_total{outcome="handler_id_mismatch"}`
-            // increment, and its own named bounded outcome. ONLY the abort is
-            // suppressed. Masking would be not reporting it, which this does
-            // not do.
-            //
-            // Reaching this arm at all already proves the meeting IS programmed:
-            // under the demoted order, `handler_id_mismatch` is returned only
-            // when `applied_generation == sent` and the transport mode agreed.
-            // So a correct handler that merely restarted is never turned into a
-            // kicked meeting.
-            Self::HandlerIdMismatch => PushDisposition::Programmed,
 
             // A genuine two-ends version skew. Backoff cannot make a handler
             // running a different transport mode agree, so failing three times
@@ -208,9 +185,8 @@ impl PolicyPushOutcome {
 /// What the caller does with a [`PolicyPushOutcome`].
 ///
 /// Separated from the outcome itself because the observable vocabulary
-/// (`internal.proto`'s five values) and the control decision are different
-/// things that changed independently once already: `handler_id_mismatch` moved
-/// from terminal to non-fatal without the enum changing at all.
+/// (`internal.proto`'s four values) and the control decision are different
+/// things that can change independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushDisposition {
     /// The meeting is programmed. The call returns `Ok`.
@@ -223,46 +199,17 @@ pub enum PushDisposition {
 
 /// Classify a handler's reply against what MC declared.
 ///
-/// # Precedence (INTERIM)
+/// # Precedence
 ///
 /// `no_applied_generation > generation_mismatch > transport_mode_mismatch >
-/// handler_id_mismatch > match`
-///
-/// **(a) This ordering is interim and reverts only when `handler_id` is stable
-/// per deployment.** Restore handler-first, and make it fatal, at that point —
-/// not before. The two changes are one decision: `handler_id_mismatch` being
-/// non-fatal (see [`PolicyPushOutcome::disposition`]) and its being ranked last
-/// have one cause and revert together. A later reader restoring one must
-/// restore the other.
-///
-/// **(b) Why.** `handler_id` is a **per-incarnation token**, not a handler
-/// identity: `mh-service`'s config derives it from `HOSTNAME` plus a fresh
-/// `Uuid::new_v4()` sampled at process start whenever `MH_HANDLER_ID` is unset,
-/// and it is unset in all three MH manifests. MC compares against the id in the
-/// meeting's handler set (GC's hand-off, which has no TTL), so **every ordinary MH
-/// pod restart makes the mismatch expected by construction**. At the top of the
-/// chain that benign, expected outcome would suppress a real
-/// `generation_mismatch` underneath it for the whole post-restart window — a
-/// false positive masking the exact control this task exists to build, and
-/// masking it silently, which is worse than the loud outage it replaced. Ranked
-/// last, the outcome instead means "policy applied correctly, identity differs"
-/// — precisely the benign restart case — and it can never hide a generation
-/// fault. A genuine misroute still surfaces: a wrong handler holds no state for
-/// this meeting, so it reports `no_applied_generation` or
-/// `generation_mismatch`, which outrank this and are retried.
-///
-/// **(c) Tracked in `2026-09-02-mh-stable-handler-id`.** Its definition of done
-/// spans two halves — a stable `MH_HANDLER_ID` (MH config + three manifests)
-/// AND GC's assignment-refresh path, because `assign_meeting_with_mh` returns
-/// early on an existing assignment, so a stable id alone still leaves MC's
-/// snapshot stale against a genuinely reassigned handler, producing a check
-/// that looks trustworthy and is not.
+/// match`
 ///
 /// # Two fail-open shapes, both inoculated
 ///
-/// Every sent stream's echoed transport and `handler_id` are compared
-/// **unconditionally**. There is no `if echoed != UNSPECIFIED { compare }` and
-/// no `if !echoed.is_empty() { compare }` anywhere in this function. Both would fail open against exactly
+/// Every sent stream's echoed transport (here) and `handler_id` (in
+/// [`handler_replaced`]) are compared **unconditionally**. There is no
+/// `if echoed != UNSPECIFIED { compare }` and no
+/// `if !echoed.is_empty() { compare }` anywhere in this function. Both would fail open against exactly
 /// the peer population the checks exist to police — a pre-reshape MH decodes
 /// both fields to their proto3 defaults — and both survive review as
 /// defensiveness while their skip-branch stays unreachable in any test written
@@ -305,44 +252,28 @@ pub fn evaluate_with_echo(
         return (PolicyPushOutcome::TransportModeMismatch, echo);
     }
 
-    // Unconditional, empty string included.
-    if expected.handler_id != response.handler_id {
-        return (PolicyPushOutcome::HandlerIdMismatch, None);
-    }
-
     (PolicyPushOutcome::Match, None)
 }
 
-/// The magnitude by which the live policy differs from the one MC pushed.
+/// Is the handler answering NOT the incarnation MC dialed? THE one
+/// `handler_id` comparison (`internal.proto` `RegisterMeetingResponse.handler_id`;
+/// ADR-0039 §7). Unconditional — an empty echo is a mismatch, never a skip.
 ///
-/// **An unsigned magnitude, not a difference**, and the word matters: it is what
-/// stops the sign being reintroduced.
-///
-/// `sent - applied` on `u64` underflows on a *reachable, documented* input. MH
-/// ignores a generation lower than the one it holds and echoes the installed
-/// one, so an MC restart (registry lost, re-derives from 1) against a handler
-/// holding 5 yields `applied > sent`; the `policy_generation: u64::MAX` ratchet
-/// wedge is the same input adversarially. In a debug build that panics
-/// (ADR-0002); in release it wraps to ~1.8e19, a garbage spike that blows out
-/// any shared panel axis.
-///
-/// Two other fixes were considered and are rejected **here**, so neither is
-/// reintroduced later as a "fix":
-///
-/// * `saturating_sub` maps `applied > sent` to **0** — a healthy-looking zero on
-///   the one response shape that proves MC and MH disagree about which policy is
-///   live. Same class of silent regression as feeding the gauge from the sent
-///   value, by a different route.
-/// * A signed value is meaningful, but any stat threshold written `> 0` renders
-///   the negative arm green, and `> 0` is what anyone will reach for.
-///
-/// So: unsigned magnitude. It cannot underflow, it cannot panic, and every
-/// non-zero value means "the live policy is not the one MC pushed", regardless
-/// of direction. Direction is not lost — the `error!` line carries both numbers,
-/// so a responder reads *which way* off the log and *how far* off the gauge.
+/// Checked BEFORE [`evaluate`]: a replaced incarnation's reply gives NO credit
+/// — nothing in it is read as an echo, the dialed handler is not advanced
+/// (stays Registering), and the answering id is NEVER adopted into the set (a
+/// new incarnation enters only through GC's acquire path, ADR-0039 §3). The
+/// dialed handler's liveness is then judged by heartbeats alone. The expected
+/// cause is a later incarnation at a reused address (an ordinary in-place MH
+/// restart), so it is counted as
+/// `mc_register_meeting_total{status="handler_replaced"}` with a WARN, not as a
+/// coordination failure.
 #[must_use]
-pub fn divergence_magnitude(sent: NonZeroU64, applied: u64) -> u64 {
-    sent.get().abs_diff(applied)
+pub fn handler_replaced(
+    expected: &PushExpectation<'_>,
+    response: &RegisterMeetingResponse,
+) -> bool {
+    expected.handler_id != response.handler_id
 }
 
 #[cfg(test)]
@@ -438,11 +369,10 @@ mod tests {
     }
 
     #[test]
-    fn applied_above_sent_is_generation_mismatch_and_yields_a_positive_magnitude() {
+    fn applied_above_sent_is_generation_mismatch() {
         let expected = expectation(1);
         let outcome = evaluate(&expected, &response(5, EXPECTED_HANDLER, agreeing()));
         assert_eq!(outcome, PolicyPushOutcome::GenerationMismatch);
-        assert_eq!(divergence_magnitude(expected.policy_generation, 5), 4);
     }
 
     // ---- the three echo arms, each on its own -----------------------------
@@ -529,59 +459,43 @@ mod tests {
         assert_eq!(labels.len(), 3);
     }
 
+    /// The ONE handler-identity comparison: unconditional (empty included),
+    /// and independent of the classifier — a replaced incarnation's otherwise
+    /// perfect reply is still replaced, and a matching id is not.
     #[test]
-    fn wrong_handler_id_is_a_mismatch() {
-        let outcome = evaluate(&expectation(4), &response(4, "mh-9", agreeing()));
-        assert_eq!(outcome, PolicyPushOutcome::HandlerIdMismatch);
-    }
-
-    #[test]
-    fn empty_handler_id_echo_is_a_mismatch_not_a_skip() {
-        let outcome = evaluate(&expectation(4), &response(4, "", agreeing()));
-        assert_eq!(outcome, PolicyPushOutcome::HandlerIdMismatch);
+    fn handler_replaced_is_unconditional_and_separate_from_the_classifier() {
+        let perfect = response(4, "mh-9", agreeing());
+        assert!(handler_replaced(&expectation(4), &perfect));
+        assert!(handler_replaced(
+            &expectation(4),
+            &response(4, "", agreeing())
+        ));
+        assert!(!handler_replaced(
+            &expectation(4),
+            &response(4, EXPECTED_HANDLER, agreeing())
+        ));
+        assert_eq!(
+            evaluate(&expectation(4), &perfect),
+            PolicyPushOutcome::Match,
+            "identity is not the classifier's concern"
+        );
     }
 
     // ---- precedence collision cases --------------------------------------
     // no_applied_generation > generation_mismatch > transport_mode_mismatch
-    // > handler_id_mismatch > match — unchanged by the per-stream echo.
+    // > match. Every stream absent from the echo, so the transport arm WOULD
+    // fire if the generation arms did not outrank it.
 
     #[test]
-    fn no_applied_generation_pins_precedence_above_handler_id_and_transport() {
-        let outcome = evaluate(&expectation(4), &response(0, "mh-9", Vec::new()));
+    fn no_applied_generation_pins_precedence_above_transport() {
+        let outcome = evaluate(&expectation(4), &response(0, EXPECTED_HANDLER, Vec::new()));
         assert_eq!(outcome, PolicyPushOutcome::NoAppliedGeneration);
     }
 
     #[test]
-    fn generation_mismatch_pins_precedence_above_transport_and_handler_id() {
-        let outcome = evaluate(&expectation(4), &response(3, "mh-9", Vec::new()));
+    fn generation_mismatch_pins_precedence_above_transport() {
+        let outcome = evaluate(&expectation(4), &response(3, EXPECTED_HANDLER, Vec::new()));
         assert_eq!(outcome, PolicyPushOutcome::GenerationMismatch);
-    }
-
-    /// Every echo arm sits above `handler_id_mismatch`, with the generation
-    /// matched so neither higher arm can claim it.
-    #[test]
-    fn every_echo_arm_pins_precedence_above_handler_id() {
-        for streams in [
-            Vec::new(),
-            echo(
-                Some(TransportMode::Unspecified),
-                Some(TransportMode::StreamPerGroup),
-            ),
-            echo(
-                Some(TransportMode::StreamPerGroup),
-                Some(TransportMode::StreamPerGroup),
-            ),
-        ] {
-            let outcome = evaluate(&expectation(4), &response(4, "mh-9", streams));
-            assert_eq!(outcome, PolicyPushOutcome::TransportModeMismatch);
-        }
-    }
-
-    #[test]
-    fn handler_id_mismatch_pins_precedence_at_bottom_and_is_non_fatal() {
-        let outcome = evaluate(&expectation(4), &response(4, "mh-9", agreeing()));
-        assert_eq!(outcome, PolicyPushOutcome::HandlerIdMismatch);
-        assert_eq!(outcome.disposition(), PushDisposition::Programmed);
     }
 
     #[test]
@@ -590,17 +504,5 @@ mod tests {
             PolicyPushOutcome::ALL.iter().map(|o| o.label()).collect();
         assert_eq!(labels.len(), PolicyPushOutcome::ALL.len());
         assert!(labels.contains("transport_mode_mismatch"));
-    }
-
-    #[test]
-    fn divergence_magnitude_is_symmetric_and_zero_only_on_agreement() {
-        let sent = NonZeroU64::new(5).unwrap();
-        assert_eq!(divergence_magnitude(sent, 5), 0);
-        assert_eq!(divergence_magnitude(sent, 3), 2);
-        assert_eq!(divergence_magnitude(sent, 7), 2);
-        assert_eq!(
-            divergence_magnitude(NonZeroU64::MIN, u64::MAX),
-            u64::MAX - 1
-        );
     }
 }
