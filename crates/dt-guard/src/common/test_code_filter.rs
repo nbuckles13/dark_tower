@@ -78,7 +78,7 @@ pub fn is_test_path(path: &Path) -> bool {
         // Non-UTF-8 paths can't be matched — conservatively NOT a test path.
         return false;
     };
-    if s.starts_with("vendor/") {
+    if crate::common::git_changes::is_vendored(s) {
         return true;
     }
     const PATH_SUBSTRINGS: &[&str] = &[

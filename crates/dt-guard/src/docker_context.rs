@@ -38,7 +38,32 @@
 //!
 //! A symlink in the context is itself a violation: it can point outside the
 //! allowlist. An unreadable file is a violation, never a skip.
+//!
+//! # `[patch.*]` path targets must be in the context
+//!
+//! Every image resolves the workspace lock, so a root `[patch.<registry>]`
+//! entry with a `path` (a vendored crate) must sit under an admitted `!` path,
+//! or the planner/cook stage of EVERY image fails — at a host image build,
+//! long after this guard could have said so. Paths come from the ONE
+//! derivation, `common::cargo_manifest::patch_path_targets`. Reason token:
+//! `patch-path-not-admitted`; an unreadable or unparseable root manifest is
+//! `patch-manifest-unreadable`, never a pass.
+//!
+//! Admitted is not enough: cargo-chef's recipe skeletonizes workspace MEMBERS
+//! only, so in every Dockerfile stage under `infra/docker/` that runs
+//! `cargo chef cook`, each `[patch.*]` path must be COPYed into that stage
+//! (from the context, not `--from=`) BEFORE the cook line, or the cook fails
+//! to resolve the graph — at a host image build (a Layer-7 deploy failure
+//! once, 2026-11-10). Reason token: `patch-path-not-in-cook-stage`. Anti-vacuity:
+//! with any `[patch.*]` path, an unreadable `infra/docker` is
+//! `cook-stage-scan-unreadable` and finding NO cook stage at all is
+//! `patch-path-no-cook-stage-found` (a renamed or relocated cook would otherwise
+//! check nothing). A cook line is any line containing `chef cook` (`cargo chef
+//! cook` and `cargo-chef cook`). Known false red, failing closed: a stage that
+//! inherits `vendor/` from its `FROM` parent stage is not credited — copies are
+//! counted per stage; no first-party Dockerfile does that today.
 
+use crate::common::cargo_manifest::{patch_path_targets, read_root_manifest};
 use crate::common::status::emit_ok;
 use crate::secret_patterns::source_scan_patterns;
 use anyhow::{Context, Result};
@@ -268,6 +293,151 @@ fn scan(repo_root: &Path, allow: &Allowlist, out: &mut Vec<Violation>) -> usize 
     files
 }
 
+/// Every root `[patch.*]` path target must be admitted by an include. Returns
+/// the targets (empty when unreadable — already a violation).
+fn check_patch_paths(repo_root: &Path, allow: &Allowlist, out: &mut Vec<Violation>) -> Vec<String> {
+    let targets = read_root_manifest::<toml::Value>(repo_root)
+        .map_err(|e| e.to_string())
+        .and_then(|m| patch_path_targets(&m));
+    let targets = match targets {
+        Ok(t) => t,
+        Err(e) => {
+            out.push(Violation {
+                path: "Cargo.toml".into(),
+                rule: format!("patch-manifest-unreadable:{e}"),
+            });
+            return Vec::new();
+        }
+    };
+    let paths = targets.iter().map(|t| t.path.clone()).collect();
+    for t in targets {
+        let admitted = allow
+            .includes
+            .iter()
+            .any(|inc| t.path == *inc || t.path.starts_with(&format!("{inc}/")));
+        if !admitted {
+            out.push(Violation {
+                path: t.path,
+                rule: "patch-path-not-admitted".into(),
+            });
+        }
+    }
+    paths
+}
+
+/// The context paths a `COPY`/`ADD` brings into its stage (never `--from=`).
+fn copy_sources(line: &str) -> Option<Vec<String>> {
+    let mut words = line.split_whitespace();
+    let op = words.next()?.to_ascii_uppercase();
+    if op != "COPY" && op != "ADD" {
+        return None;
+    }
+    let args: Vec<&str> = words.collect();
+    if args.iter().any(|a| a.starts_with("--from")) {
+        return None;
+    }
+    let operands: Vec<&str> = args.into_iter().filter(|a| !a.starts_with("--")).collect();
+    let (_, sources) = operands.split_last()?;
+    Some(
+        sources
+            .iter()
+            .map(|s| s.trim_start_matches("./").trim_end_matches('/').to_string())
+            .collect(),
+    )
+}
+
+/// True iff a COPY source brings `path` (repo-relative) into the stage.
+fn covers(source: &str, path: &str) -> bool {
+    source.is_empty() || source == "." || path == source || path.starts_with(&format!("{source}/"))
+}
+
+/// In `dockerfile`'s text, every stage running `cargo chef cook` must COPY each
+/// of `patch_paths` before its cook line.
+/// (uncovered paths, number of cook lines seen).
+fn scan_cook_stages(dockerfile: &str, patch_paths: &[String]) -> (Vec<String>, usize) {
+    let mut cooks = 0;
+    let mut missing = Vec::new();
+    let mut copied: Vec<String> = Vec::new();
+    for line in dockerfile.lines().map(str::trim) {
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.to_ascii_uppercase().starts_with("FROM ") {
+            copied.clear();
+            continue;
+        }
+        if let Some(sources) = copy_sources(line) {
+            copied.extend(sources);
+            continue;
+        }
+        if line.contains("chef cook") {
+            cooks += 1;
+            for p in patch_paths {
+                if !copied.iter().any(|s| covers(s, p)) && !missing.contains(p) {
+                    missing.push(p.clone());
+                }
+            }
+        }
+    }
+    (missing, cooks)
+}
+
+/// Every first-party Dockerfile that cooks must bring the `[patch.*]` paths in
+/// before the cook.
+fn check_cook_stages(repo_root: &Path, patch_paths: &[String], out: &mut Vec<Violation>) {
+    if patch_paths.is_empty() {
+        return;
+    }
+    let entries = match std::fs::read_dir(repo_root.join("infra/docker")) {
+        Ok(entries) => entries,
+        Err(e) => {
+            out.push(Violation {
+                path: "infra/docker".into(),
+                rule: format!("cook-stage-scan-unreadable:{e}"),
+            });
+            return;
+        }
+    };
+    let mut cooks = 0;
+    let mut dockerfiles: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path().join("Dockerfile"))
+        .filter(|p| p.is_file())
+        .collect();
+    dockerfiles.sort();
+    for df in dockerfiles {
+        let rel = df
+            .strip_prefix(repo_root)
+            .unwrap_or(&df)
+            .to_string_lossy()
+            .into_owned();
+        let text = match std::fs::read_to_string(&df) {
+            Ok(t) => t,
+            Err(e) => {
+                out.push(Violation {
+                    path: rel,
+                    rule: format!("unreadable:{e}"),
+                });
+                continue;
+            }
+        };
+        let (missing, found) = scan_cook_stages(&text, patch_paths);
+        cooks += found;
+        for p in missing {
+            out.push(Violation {
+                path: rel.clone(),
+                rule: format!("patch-path-not-in-cook-stage:{p}"),
+            });
+        }
+    }
+    if cooks == 0 {
+        out.push(Violation {
+            path: "infra/docker".into(),
+            rule: "patch-path-no-cook-stage-found".into(),
+        });
+    }
+}
+
 pub fn run(repo_root: &Path, _explain: bool) -> Result<()> {
     let ignore_path = repo_root.join(DOCKERIGNORE);
     let content = std::fs::read_to_string(&ignore_path).with_context(|| {
@@ -277,6 +447,8 @@ pub fn run(repo_root: &Path, _explain: bool) -> Result<()> {
         )
     })?;
     let (allow, mut violations) = parse_dockerignore(&content);
+    let patch_paths = check_patch_paths(repo_root, &allow, &mut violations);
+    check_cook_stages(repo_root, &patch_paths, &mut violations);
     let files = scan(repo_root, &allow, &mut violations);
     if violations.is_empty() {
         emit_ok(format!(
@@ -396,6 +568,10 @@ mod tests {
         );
 
         std::fs::write(dir.join(DOCKERIGNORE), "*\n!ctx/\n").unwrap();
+        // The root manifest is read too: unreadable is a violation, not a pass.
+        let no_manifest = run(&dir, false).unwrap_err().to_string();
+        assert_eq!(no_manifest, "docker-context-violations-1");
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
         assert!(run(&dir, false).is_ok());
 
         std::fs::write(dir.join("ctx").join("id_ed25519"), "x").unwrap();
@@ -425,6 +601,121 @@ mod tests {
             rules(&out),
             vec!["ctx/settings.toml content:AWS access key"]
         );
+    }
+
+    #[test]
+    fn patch_path_targets_must_be_admitted() {
+        let dir = scratch("patch-paths");
+        std::fs::create_dir_all(dir.join("vendor").join("w")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\n[patch.crates-io]\nw = { path = \"vendor/w\" }\n",
+        )
+        .unwrap();
+        // Negative: the vendored crate is outside every include.
+        let allow = Allowlist {
+            includes: vec!["crates".into()],
+            excluded_dir_names: vec![],
+        };
+        let mut out = Vec::new();
+        check_patch_paths(&dir, &allow, &mut out);
+        assert_eq!(rules(&out), vec!["vendor/w patch-path-not-admitted"]);
+        // Positive: admitted by the crate's own include, or by a parent one.
+        for inc in ["vendor/w", "vendor"] {
+            let allow = Allowlist {
+                includes: vec![inc.into()],
+                excluded_dir_names: vec![],
+            };
+            let mut out = Vec::new();
+            check_patch_paths(&dir, &allow, &mut out);
+            assert!(out.is_empty(), "{inc}: {:?}", rules(&out));
+        }
+        // A sibling prefix is not a parent (`vendor/wx` does not admit `vendor/w`).
+        let allow = Allowlist {
+            includes: vec!["vendor/wx".into()],
+            excluded_dir_names: vec![],
+        };
+        let mut out = Vec::new();
+        check_patch_paths(&dir, &allow, &mut out);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(rules(&out), vec!["vendor/w patch-path-not-admitted"]);
+    }
+
+    #[test]
+    fn a_cook_stage_must_copy_every_patch_path_before_cooking() {
+        let paths = vec!["vendor/w".to_string()];
+        let base = "FROM chef AS planner\nCOPY . .\nRUN cargo chef prepare\n\
+                    FROM chef AS builder\nCOPY --from=planner /build/recipe.json recipe.json\n";
+        // Negative: the planner's `COPY . .` and a `--from=` copy do not count
+        // for the builder stage; the cook there cannot see vendor/w.
+        let bad = format!("{base}RUN cargo chef cook --recipe-path recipe.json\nCOPY . .\n");
+        assert_eq!(
+            scan_cook_stages(&bad, &paths).0,
+            vec!["vendor/w".to_string()]
+        );
+        // A COPY AFTER the cook is too late.
+        let late = format!("{base}RUN cargo chef cook\nCOPY vendor/ vendor/\n");
+        assert_eq!(
+            scan_cook_stages(&late, &paths).0,
+            vec!["vendor/w".to_string()]
+        );
+        // Positive: the parent dir, the exact dir, or the whole context, before the cook.
+        for copy in [
+            "COPY vendor/ vendor/",
+            "COPY vendor/w/ vendor/w/",
+            "COPY . .",
+        ] {
+            let ok = format!("{base}{copy}\nRUN cargo chef cook\n");
+            assert!(scan_cook_stages(&ok, &paths).0.is_empty(), "{copy}");
+        }
+        // A sibling prefix is not a parent.
+        let sib = format!("{base}COPY vendor/wx/ vendor/wx/\nRUN cargo chef cook\n");
+        assert_eq!(
+            scan_cook_stages(&sib, &paths).0,
+            vec!["vendor/w".to_string()]
+        );
+        // No patch paths, nothing to require.
+        assert!(scan_cook_stages(&bad, &[]).0.is_empty());
+        // `cargo-chef cook` is a cook line too.
+        let hyphen = format!("{base}RUN cargo-chef cook\n");
+        assert_eq!(
+            scan_cook_stages(&hyphen, &paths),
+            (vec!["vendor/w".to_string()], 1)
+        );
+    }
+
+    #[test]
+    fn the_cook_stage_rule_cannot_pass_vacuously() {
+        let paths = vec!["vendor/w".to_string()];
+        // No infra/docker at all: a violation, not a pass.
+        let dir = scratch("cook-none");
+        let mut out = Vec::new();
+        check_cook_stages(&dir, &paths, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].rule.starts_with("cook-stage-scan-unreadable:"),
+            "{}",
+            out[0].rule
+        );
+        // Dockerfiles exist but none cooks (renamed/moved cook): a violation.
+        std::fs::create_dir_all(dir.join("infra/docker/x")).unwrap();
+        std::fs::write(dir.join("infra/docker/x/Dockerfile"), "FROM a\nRUN make\n").unwrap();
+        let mut out = Vec::new();
+        check_cook_stages(&dir, &paths, &mut out);
+        assert_eq!(
+            rules(&out),
+            vec!["infra/docker patch-path-no-cook-stage-found"]
+        );
+        // Positive control: a covered cook stage passes.
+        std::fs::write(
+            dir.join("infra/docker/x/Dockerfile"),
+            "FROM a\nCOPY vendor/ vendor/\nRUN cargo chef cook\n",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        check_cook_stages(&dir, &paths, &mut out);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(out.is_empty(), "{:?}", rules(&out));
     }
 
     #[cfg(unix)]

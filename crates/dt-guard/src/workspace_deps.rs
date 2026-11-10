@@ -18,6 +18,17 @@
 //! `path` and `git` dependencies are exempt everywhere: they carry no registry
 //! version requirement to drift.
 //!
+//! **Vendored crates are their own partition.** A root-`exclude` crate that is
+//! also a root `[patch.*]` path target (derived ONCE, by
+//! `common::cargo_manifest::patch_path_targets`) is an upstream crate kept
+//! byte-identical to its published source plus an additive patch
+//! (`vendor/patches/<crate>/PATCH.md`, enforced by
+//! `validate-vendor-patches`). Its manifest is upstream's and cannot be edited
+//! to inherit, so R2 and R3 are NOT evaluated for it: they would demand edits
+//! the drift guard forbids. It still counts for R6 (no Dependabot cargo block
+//! may name it) and its manifest must still exist. An unreadable `[patch.*]`
+//! table is the precondition `workspace-deps-patch-paths-unreadable`.
+//!
 //! PRECONDITION classes (the guard could not check what it is responsible
 //! for — an operator problem, never a PASS): workspace manifest unreadable,
 //! no/empty `[workspace] members`, glob members, no/empty
@@ -30,8 +41,8 @@
 //! `release_build_profile` uses.
 
 use crate::common::cargo_manifest::{
-    classify_dep, member_dependencies, members_contain_glob, read_root_manifest, DepDecl, DepSpec,
-    ManifestError, WorkspaceTable,
+    classify_dep, member_dependencies, members_contain_glob, patch_path_targets, read_lock,
+    read_root_manifest, DepDecl, DepSpec, LockPackage, ManifestError, WorkspaceTable,
 };
 use crate::common::explain::{print_finding, Finding};
 use crate::common::status::{emit_ok, emit_scope};
@@ -67,6 +78,9 @@ pub const DEPENDABOT_CONFIG_UNREADABLE: &str = "dependabot_config_unreadable";
 /// A root `[workspace] exclude` entry has no Cargo.toml. R3 and R6 compare
 /// against the exclude list; a moved or renamed crate must not shrink it.
 pub const EXCLUDED_MANIFEST_MISSING: &str = "excluded_manifest_missing";
+/// The root `[patch.*]` tables could not be read into the vendored set, so the
+/// vendored/independent partition of `exclude` is unknown.
+pub const PATCH_PATHS_UNREADABLE: &str = "patch_paths_unreadable";
 /// A [`SINGLE_VERSION_CRATES`] entry is absent from the lock: either the lock
 /// lost its packages or the policy list went stale. R4 cannot have looked at
 /// it, so this is a precondition, never a pass.
@@ -111,6 +125,10 @@ const RULE_ORDER: &[(&str, &str)] = &[
         EXCLUDED_MANIFEST_MISSING,
         "workspace-deps-excluded-manifest-missing",
     ),
+    (
+        PATCH_PATHS_UNREADABLE,
+        "workspace-deps-patch-paths-unreadable",
+    ),
     (WORKSPACE_DEP_REDECLARED, "workspace-dep-redeclared"),
     (
         DEP_PINNED_IN_MULTIPLE_MEMBERS,
@@ -141,6 +159,7 @@ const PRECONDITION_RULES: &[&str] = &[
     FACADE_ABSENT_FROM_LOCK,
     DEPENDABOT_CONFIG_UNREADABLE,
     EXCLUDED_MANIFEST_MISSING,
+    PATCH_PATHS_UNREADABLE,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +174,8 @@ pub struct Hit {
 pub struct Scope {
     pub members: usize,
     pub excluded: usize,
+    /// Root-`exclude` crates in the vendored partition (R2/R3 not evaluated).
+    pub vendored: usize,
     pub workspace_deps: usize,
     pub lock_packages: usize,
 }
@@ -175,9 +196,11 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
     let (hits, scope) = evaluate(repo_root);
 
     emit_scope(format!(
-        "{} members, {} excluded crates, {} workspace deps, {} lock packages, {} hits",
+        "{} members, {} excluded crates ({} vendored: R2/R3 not evaluated), {} workspace deps, \
+         {} lock packages, {} hits",
         scope.members,
         scope.excluded,
+        scope.vendored,
         scope.workspace_deps,
         scope.lock_packages,
         hits.len()
@@ -237,6 +260,19 @@ pub fn evaluate(repo_root: &Path) -> (Vec<Hit>, Scope) {
             return (hits, scope);
         }
     };
+    let vendored: BTreeSet<String> = match patch_path_targets(&manifest) {
+        Ok(targets) => targets.into_iter().map(|t| t.path).collect(),
+        Err(e) => {
+            // Keep going with an empty partition: every excluded crate is then
+            // held to R2/R3, which fails loud rather than skipping one.
+            hits.push(precondition(
+                PATCH_PATHS_UNREADABLE,
+                "Cargo.toml",
+                format!("root `[patch.*]` {e} — the vendored partition is unknown"),
+            ));
+            BTreeSet::new()
+        }
+    };
     let workspace = manifest.workspace.unwrap_or_default();
 
     if workspace.members.is_empty() {
@@ -284,9 +320,10 @@ pub fn evaluate(repo_root: &Path) -> (Vec<Hit>, Scope) {
         &mut literal_pins,
         &mut hits,
     );
-    scope.excluded = check_excluded(
+    (scope.excluded, scope.vendored) = check_excluded(
         repo_root,
         &workspace.exclude,
+        &vendored,
         &ws_deps,
         &mut literal_pins,
         &mut excluded_dirs,
@@ -413,16 +450,19 @@ fn check_members(
 /// Root-`exclude` independent workspaces: R3 per dependency, and R2 input (an
 /// excluded crate cannot inherit, but a version it shares with another crate is
 /// still written twice — R2 moves it into the root table, where R3 binds it),
-/// and every listed directory as R6 input. Returns the excluded crates evaluated.
+/// and every listed directory as R6 input. Returns the excluded crates
+/// evaluated, and how many of them are vendored (R2/R3 skipped, see module doc).
 fn check_excluded(
     repo_root: &Path,
     exclude: &[String],
+    vendored: &BTreeSet<String>,
     ws_deps: &BTreeMap<String, WsDep>,
     literal_pins: &mut BTreeMap<String, BTreeSet<String>>,
     excluded_dirs: &mut BTreeSet<String>,
     hits: &mut Vec<Hit>,
-) -> usize {
+) -> (usize, usize) {
     let mut evaluated = 0;
+    let mut vendored_count = 0;
     for excluded in exclude {
         let rel = format!("{}/Cargo.toml", excluded.trim_end_matches('/'));
         let path = repo_root.join(&rel);
@@ -437,6 +477,14 @@ fn check_excluded(
                  could not evaluate it; fix the exclude list or restore the crate"
                     .to_string(),
             ));
+            continue;
+        }
+        if vendored.contains(excluded.trim_end_matches('/')) {
+            // Upstream's manifest, kept byte-identical by validate-vendor-patches:
+            // R2/R3 would demand edits that guard forbids. Counted, not skipped
+            // silently (the PASS scope line carries the number).
+            evaluated += 1;
+            vendored_count += 1;
             continue;
         }
         let deps = match read_deps(&path) {
@@ -456,7 +504,7 @@ fn check_excluded(
             record_literal_pin(&dep, ws_deps, excluded, literal_pins);
         }
     }
-    evaluated
+    (evaluated, vendored_count)
 }
 
 /// R6: no Dependabot cargo block may name a root-`exclude` crate.
@@ -794,30 +842,15 @@ fn effective_features(
 fn lock_versions(
     repo_root: &Path,
 ) -> std::result::Result<BTreeMap<String, BTreeSet<String>>, ManifestError> {
-    let src =
-        std::fs::read_to_string(repo_root.join("Cargo.lock")).map_err(ManifestError::Unreadable)?;
-    parse_lock(&src).map_err(ManifestError::Unparseable)
+    Ok(versions_by_name(read_lock(repo_root)?))
 }
 
-fn parse_lock(
-    src: &str,
-) -> std::result::Result<BTreeMap<String, BTreeSet<String>>, toml::de::Error> {
-    #[derive(serde::Deserialize)]
-    struct Lock {
-        #[serde(default)]
-        package: Vec<LockPackage>,
-    }
-    #[derive(serde::Deserialize)]
-    struct LockPackage {
-        name: String,
-        version: String,
-    }
-    let lock: Lock = toml::from_str(src)?;
+fn versions_by_name(packages: Vec<LockPackage>) -> BTreeMap<String, BTreeSet<String>> {
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for p in lock.package {
+    for p in packages {
         out.entry(p.name).or_default().insert(p.version);
     }
-    Ok(out)
+    out
 }
 
 fn check_facades(versions: &BTreeMap<String, BTreeSet<String>>) -> Vec<Hit> {

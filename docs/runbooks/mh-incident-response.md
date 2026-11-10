@@ -47,6 +47,7 @@
    - [Scenario 21: Slow Video Subscriber (Stream-Credit Stall)](#scenario-21-slow-video-subscriber-stream-credit-stall)
    - [Scenario 22: Video Slot Stuck Pending](#scenario-22-video-slot-stuck-pending)
    - [Scenario 23: Client Sending While Client-Muted](#scenario-23-client-sending-while-client-muted)
+   - [Close codes: what MH told the client](#close-codes-what-mh-told-the-client)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -1294,11 +1295,13 @@ target: mh.grpc.mc_client   level: ERROR
 
 The ~48s worst case (`MC_CONNECT_TIMEOUT` 5s + `MC_RPC_TIMEOUT` 10s per attempt,
 `MAX_RETRY_ATTEMPTS` 3, 1s/2s backoff — `crates/mh-service/src/grpc/mc_client.rs`) is
-**functioning as a rate limiter on the reconnect herd.** Clients cannot yet distinguish a
-retryable close from a terminal one, so they retry on their own cadence; cutting the
-budget to ~10s would multiply the retry rate roughly 5× against the service that is
-already the bottleneck. **The deadline and the client-side close code are one decision,
-not two** — see `docs/TODO.md`.
+**functioning as a rate limiter on the reconnect herd.** MH now SENDS the distinction —
+the MC-unreachable decline closes with `MC_UNAVAILABLE`, MC's refusals with `DECLINED`
+or `BINDING_CONFLICT` ([§Close codes](#close-codes-what-mh-told-the-client)) — but the
+client only ACTS on it from story 4 task C1. Until then clients retry on their own
+cadence; cutting the budget to ~10s would multiply the retry rate roughly 5× against the
+service that is already the bottleneck. **The deadline and the client-side handling of
+the close code are one decision, not two.** Keep the budget until C1 has shipped.
 
 **Related Alerts**: `MHMediaSessionDeclineRate`, `MHMediaSenderBindingOutOfRange`,
 `MHMediaSenderBindingConflict`, `MHHighWebTransportRejections` (a sustained MC outage
@@ -2529,6 +2532,42 @@ action, not a remedy for this defect.
 
 **Related**: [Scenario 19](#scenario-19-server-mute-not-taking-effect-at-ingress) (server mute; MH
 DOES drop there); `docs/observability/metrics/mh-service.md` (`mh_media_paused_source_frames_total`).
+
+---
+
+### Close codes: what MH told the client
+
+Every session MH ends **on purpose** closes with exactly one numeric `MhCloseCode`
+(ADR-0039 §7), sent as a WebTransport session-close capsule with an EMPTY message
+(`crates/mh-service/src/webtransport/close.rs`). A user report or a client metric that
+names a code maps to MH's cause like this:
+
+| Code (`code` label) | MH cause | Read on MH |
+|---|---|---|
+| `declined` | A credential failure (any kind — the client always sees the one generic DECLINED), a pre-validation exit (unreadable or non-connect first message), the register-meeting timeout, or a decline with no code of its own | `mh_jwt_validations_total{result="failure"}` (the KIND is in the MH log only until story 4 MH-1 splits `failure_reason`), `mh_register_meeting_timeouts_total`, `mh_media_session_starts_total{outcome=~"declined_no_sender_binding\|declined_sender_binding_out_of_range\|declined_mc_auth_rejected\|declined_mc_endpoint_unknown"}` |
+| `binding_conflict` | MH refused the ordinal MC returned (held by another participant) | `mh_media_session_starts_total{outcome="declined_sender_binding_conflict"}` — [Scenario 15](#scenario-15-media-sessions-declining--no-sender-binding) |
+| `mc_unavailable` | MH could not reach MC for a binding (after the ~48s retry budget and the close jitter) | `mh_media_session_starts_total{outcome="declined_mc_unavailable"}`, `mh_mc_notifications_total{status="error"}` |
+| `handler_released` | MH released the meeting (`EndMeeting` today; RELEASED verdicts and owner silence from MH-2; the drain-deadline shed from MH-3) | `mh_media_meeting_teardowns_total{outcome="released"}` (meetings), `mh_webtransport_session_closes_total{code="handler_released"}` (sessions) |
+| `wrong_handler` | Reserved: the dial token's audience is another handler (MH-1) | — |
+| **no code** | Transport loss: MH crashed, the QUIC idle timeout fired, or the client/network ended it. MH also ends client closes, stream failures and (until MH-3) shutdown WITHOUT a code — with a QUIC close, never a capsule | pod restarts, `mh_active_connections`, the client's loss reports |
+
+- `mh_webtransport_session_closes_total{code}` counts closes MH **sent** (capsule written), one per
+  close, recorded before MH waits for the peer. It is NOT added to `mh_media_session_starts_total` —
+  the declines are the same events on both.
+- **Reconcile only the 1:1 pairs**: `code="mc_unavailable"` vs `starts{outcome="declined_mc_unavailable"}`
+  and `code="binding_conflict"` vs `starts{outcome="declined_sender_binding_conflict"}`. A shortfall
+  is closes MH did not send (the connection was already gone — a client race — or the capsule write
+  did not complete within the 1 s bound). Small amounts are expected; a sustained gap is worth a look.
+  `code="declined"` has NO single comparator: it sums credential failures, pre-validation exits,
+  register-meeting timeouts and the uncoded `declined_*` outcomes, so it normally sits ABOVE them.
+- **`code="declined"` is driveable by unauthenticated peers** (anyone can send a malformed
+  first message). Never page on it alone.
+- **A coded close can take up to 1 s (`CLOSE_SESSION_LINGER`) before the QUIC connection
+  ends** — the capsule write AND the wait for the peer share that one bound, so a peer withholding
+  flow-control credit cannot stretch it — holding its `MH_MAX_CONNECTIONS` slot meanwhile. A capsule still unacknowledged at
+  that bound (heavy loss) is lost, and the client then sees transport loss — safe.
+- The client acts on these codes from story 4 task C1. Before C1, every code reads as an
+  ordinary close to it.
 
 ---
 

@@ -1054,6 +1054,32 @@ impl MediaSessionStartOutcome {
     }
 }
 
+/// Record one WebTransport SESSION close MH sent with a code (ADR-0039 §7):
+/// `mh_webtransport_session_closes_total{code}`.
+///
+/// One count = one close capsule MH **wrote**, not one delivered: recorded once
+/// the capsule write completes and before MH waits for the peer, so a close whose
+/// linger expired still counts once. NOT counted (no code sent): a session
+/// already closed, a capsule that could not be written, or a write that did not
+/// complete within the deadline; their declines are still on
+/// `mh_media_session_starts_total`. Reconcile only the 1:1 pairs
+/// (`mc_unavailable` / `binding_conflict` against their `declined_*` outcomes);
+/// `declined` sums several sources and has no single comparator.
+///
+/// `code` is bounded by [`CloseCode::ALL`] (5 values) and spelled exactly as
+/// the client's `dt_client_mh_connection_total{outcome}` tokens, so MH-sent and
+/// client-observed closes join. No meeting, participant, connection or handler
+/// id, and no token-failure kind (those stay on `mh_jwt_validations_total`).
+///
+/// [`CloseCode::ALL`]: crate::webtransport::close::CloseCode::ALL
+pub fn record_session_close(code: crate::webtransport::close::CloseCode) {
+    counter!(
+        "mh_webtransport_session_closes_total",
+        "code" => code.as_label()
+    )
+    .increment(1);
+}
+
 /// Record an error for the global error counter.
 ///
 /// Metric: `mh_errors_total`
@@ -2424,6 +2450,12 @@ pub fn zero_initialize_counters() {
     for s in WEBTRANSPORT_STATUSES {
         counter!("mh_webtransport_connections_total", "status" => *s).increment(0);
     }
+    // Session closes by code: the ONE label source is `CloseCode::ALL`. All five,
+    // `wrong_handler` included (no emitter until MH-1), so "no closes" is a
+    // flat zero rather than an absent series.
+    for code in crate::webtransport::close::CloseCode::ALL {
+        counter!("mh_webtransport_session_closes_total", "code" => code.as_label()).increment(0);
+    }
     // No-label counter (cardinality 1).
     counter!("mh_register_meeting_timeouts_total").increment(0);
     // mc notifications: event_type × status.
@@ -2513,6 +2545,14 @@ mod tests {
             present_at_zero(&format!(
                 r#"mh_media_meeting_teardowns_total{{outcome="{}",key_custody="operator"}}"#,
                 outcome.as_label()
+            ));
+        }
+        // ADR-0039 §7: every close code, `wrong_handler` (no emitter until MH-1)
+        // included, so "no closes" is a flat zero, never an absent series.
+        for code in crate::webtransport::close::CloseCode::ALL {
+            present_at_zero(&format!(
+                r#"mh_webtransport_session_closes_total{{code="{}"}}"#,
+                code.as_label()
             ));
         }
         present_at_zero(

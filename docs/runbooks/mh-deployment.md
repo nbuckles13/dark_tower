@@ -746,12 +746,13 @@ The budget is `MC_CONNECT_TIMEOUT` 5s + `MC_RPC_TIMEOUT` 10s per attempt,
 jitter before the close.
 
 **Do not shorten this to make connects fail faster.** It is functioning as an
-accidental **rate limiter on the reconnect herd**. Clients cannot yet tell a
-retryable close from a terminal one, so they retry on their own cadence against a
-down MC; cutting the budget to ~10s would multiply the retry rate roughly 5×
-against the service that is already the bottleneck. A fast fail is only correct
-once the client can back off, and **the deadline and the client-side close code are
-one decision, not two** — see `docs/TODO.md`. The jitter is the complementary
+accidental **rate limiter on the reconnect herd**. MH now sends the retryable
+`MC_UNAVAILABLE` close code (ADR-0039 §7; `mh-incident-response.md` §Close codes), but
+the client only acts on it from story 4 task C1; until then it retries on its own
+cadence against a down MC, and cutting the budget to ~10s would multiply the retry rate
+roughly 5× against the service that is already the bottleneck. A fast fail is only
+correct once the client backs off on the code, and **the deadline and the client-side
+handling of the close code are one decision, not two** — keep the budget until C1 ships. The jitter is the complementary
 control and acts on a different variable: it spreads the *phase* of each wave, it
 does not bound the *rate*.
 
@@ -1418,6 +1419,21 @@ later incarnation answering at a reused address, not a fault; `MCRegisterMeeting
 For the MH-WebTransport / MC↔MH-coordination deploy path, see [Rollback criteria](#rollback-criteria) above. For other rollback scenarios (general service restore, configuration regression), MH has no rollout history to undo: check out the previous revision and run `deploy.sh` (it re-renders `mh-template` and runs `mh.sh upgrade`; [The MH pool](#the-mh-pool-hostport-slots-mhsh-and-what-deploy-does-adr-0039-7-10)); deeper operational steps will be filled in alongside the deployment-procedure stub.
 
 **`EndMeeting` rollout order (story 2 R-20, R-24; holds within an era, never across the story-3 cutover, where everything rolls back together — corrected 2026-10-21).** MH gains the `EndMeeting` RPC before any MC calls it; **roll MH first, and roll back in reverse — MC first**. Rolling MH back alone is safe: the tree revert + `deploy.sh` (`mh.sh upgrade`) starts each MH on the previous hash-suffixed ConfigMap generation, which still exists because nothing prunes generations ([Config-failure triage](#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three)), and an MC talking to a one-version-older MH gets `UNIMPLEMENTED` for `EndMeeting`, which MC counts and does not retry — that older MH simply keeps the meeting's state and edges until it restarts, today's pre-teardown behaviour. After an MH deploy, `mh_grpc_requests_total{method="end_meeting"}` and every `mh_media_meeting_teardowns_total{outcome}` series are present at 0; an ABSENT series means the new image is not running.
+
+**Close codes (story 4 MH-CLOSE, ADR-0039 §7) — MH stays at or ahead of the client.** MH
+closes every intentional session end with a numeric `MhCloseCode` capsule; the story-4 SDK
+(task C1) reads it. Old clients are unaffected (they treat any close alike), so a mixed MH
+fleet is safe for them. **After C1 has shipped, do not roll MH back below MH-CLOSE** unless
+you accept the consequence: every decline and release then reads to new clients as
+transport loss (loss reports, redials, no back-off on `MC_UNAVAILABLE`). **Safe-revert
+units and direction — emission first, patch second:** (1) the MH emission (`close.rs`, the
+connection wiring) together with its counter, panel and runbook rows reverts as ONE unit, and
+that unit is safe to revert alone (the patch stays, unused); (2) the vendored wtransport patch
+and its machinery (`[patch.crates-io]`, the `.dockerignore` entry, `dt-guard vendor-patches`,
+the audit.sh/_audit_gate vendored plumbing, the dependabot note;
+`vendor/patches/wtransport/PATCH.md`) can be reverted only TOGETHER WITH or AFTER (1), never
+before it — mh-service calls the patch's API, so reverting the patch alone breaks the next build.
+Images: the patch changes `Cargo.lock`, so ALL FOUR service images rebuild.
 
 **`connection_id` coupling (story 2 task 20).** MH now threads its per-session `connection_id` into `NotifyParticipantConnected`/`Disconnected`; MC keys connectivity on it. **Since story 4 MC-B1 this is a HARD ordering:** MC refuses an empty `connection_id`, so rolling MH back below the task-20 image (or an MH pod left on an older image) gets every Connected on that MH **refused** (`sender_id` 0) — its sessions never bind, a total media outage for that handler. With the current fleet every MH sends the field; never roll an MH back below task 20 while an MC-B1 MC is live. Signalled by `mc_mh_notifications_unapplied_total{reason="connection_id_missing"}` rising (see the 30-minute check). The MC-side view of the same coupling is `mc-deployment.md` §Coordination.
 

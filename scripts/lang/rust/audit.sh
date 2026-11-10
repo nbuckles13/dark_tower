@@ -56,6 +56,27 @@
 # Each graph prints `AUDIT_GRAPH=<lock> LOCK=tracked|resolved RESULT=ok|preexisting-advisories|
 # audit-failed|resolve-failed` to stderr, so the failing graph is named. Triage:
 # docs/runbooks/devloop-validation.md §6.6.
+#
+# VENDORED CRATES (root `[patch.*]` path targets, e.g. vendor/wtransport; see
+# vendor/patches/<crate>/PATCH.md). Bash parses neither Cargo.toml nor Cargo.lock: the set,
+# the attributed lock and the pristine digest all come from `dt-guard vendor-patches`.
+#   - discovery SKIPS a vendored crate's own manifest (it is not an independent workspace
+#     MH links: its shipped Cargo.lock is upstream's stale graph). Printed as
+#     `AUDIT_GRAPH=<manifest> SKIPPED=vendored`.
+#   - advisories: a path package has no `source`, so cargo-audit would never match an
+#     advisory against it. The root graph is scanned through a derived copy of Cargo.lock in
+#     which each vendored package carries its crates.io source again (`--attributed-lock`),
+#     through the same scan_lock: suppressions, attribution and fail-closed tokens unchanged.
+#   - provenance anchor (network): each vendored crate's upstream `.crate` is fetched, its
+#     sha256 checked against the crates.io INDEX checksum (the authority; PATCH.md's copy is
+#     checked against it, not trusted), unpacked, and `dt-guard vendor-patches
+#     --pristine-digest` compares its tree digest with the recorded one.
+#   - attribution: a finding on a vendored package (name@version from
+#     `vendor-patches --packages`) is ALWAYS `AUDIT_FINDING=NEW(vendored)` and blocks, on
+#     every base (security ruling): no automated bump can reach a vendored crate. The only
+#     escape hatch is the governed suppression manifest (cargo-audit applies it first).
+#   vendor-patches-unavailable     dt-guard (scripts/lib/tool-bins.sh) is missing or failed
+#   vendor-pristine-anchor-failed  fetch, checksum or digest of an upstream .crate failed
 set -euo pipefail
 IFS=$'\n\t'
 source "$(dirname "${BASH_SOURCE[0]}")/../_audit_gate.sh"
@@ -81,6 +102,13 @@ install_wrapper_exit_trap restore_pending_lock
 __repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"
 # Every scan runs from here: cargo-audit reads .cargo/audit.toml from the cwd.
 cd "$__repo_root"
+# shellcheck source=../../lib/tool-bins.sh
+source "${__repo_root}/scripts/lib/tool-bins.sh"
+# dt-guard ONLY from tool-bins.sh (DT_GUARD_BIN): no ambient override may redirect the
+# binary that derives what gets audited. A missing binary fails loudly below.
+__dt_guard="$DT_GUARD_BIN"
+__crates_index_url="https://index.crates.io"
+__crates_dl_url="https://static.crates.io/crates"
 
 # A config fault is loud even when the gate would skip.
 if ! block_on="$(audit_block_on)"; then
@@ -137,8 +165,10 @@ PY
 # Scan one lock and attribute its findings; sets __scan to ok | preexisting-advisories |
 # audit-failed. <how> is `tracked` (compare with the lock at the base) or `resolved:<manifest>`.
 scan_lock() {
-  local lock="$1" how="$2" json rc=0 rows base_lock="" assume=0 arc=0
-  json="$(cargo audit --json -f "$lock" </dev/null)" || rc=$?
+  # <scan> (optional) is the file cargo-audit reads when it differs from <lock>, the path
+  # attribution compares at the base: the attributed copy of a lock with vendored crates.
+  local lock="$1" how="$2" scan="${3:-$1}" json rc=0 rows base_lock="" assume=0 arc=0
+  json="$(cargo audit --json -f "$scan" </dev/null)" || rc=$?
   if ! rows="$(printf '%s' "$json" | python3 -c "$__cargo_rows_py")"; then
     echo "cargo audit: no usable --json report for ${lock} (rc=${rc}) — the tool failed, not an advisory" >&2
     __scan=audit-failed; return
@@ -158,13 +188,96 @@ scan_lock() {
       assume=1
     fi
   fi
-  printf '%s\n' "$rows" | audit_attribute cargo "$base_lock" "$assume" || arc=$?
+  if [[ -n "$__vendored_pkgs" ]]; then
+    # Vendored packages are always NEW(vendored) and blocking (security ruling): the
+    # list comes from dt-guard, never from a manifest parse here.
+    printf '%s\n' "$rows" | audit_attribute cargo "$base_lock" "$assume" \
+      <(printf '%s\n' "$__vendored_pkgs") || arc=$?
+  else
+    printf '%s\n' "$rows" | audit_attribute cargo "$base_lock" "$assume" || arc=$?
+  fi
   [[ -n "$base_lock" ]] && rm -f "$base_lock"
   case "$arc" in
     0) __scan="preexisting-advisories" ;;
     1) __scan=audit-failed ;;
     *) echo "cargo audit: could not attribute the findings for ${lock} — blocking" >&2; __scan=audit-failed ;;
   esac
+}
+
+# -----------------------------------------------------------------------------
+# Vendored crates: the set comes from dt-guard (one derivation, root [patch.*]); compared
+# on CANONICAL paths, the same way discovery dedups workspace roots.
+# -----------------------------------------------------------------------------
+__vendored_canon=()
+load_vendored() {
+  local listed v canon
+  if [[ ! -x "$__dt_guard" ]]; then
+    echo "AUDIT_VENDORED: ${__dt_guard} is not built — run: ${DT_TOOLS_BUILD_CMD}" >&2
+    return 1
+  fi
+  listed="$("$__dt_guard" vendor-patches --root "$__repo_root" --list </dev/null)" \
+    || { echo "AUDIT_VENDORED: the vendor-patches --list derivation failed" >&2; return 1; }
+  __vendored=()
+  while IFS= read -r v; do
+    [[ -n "$v" ]] || continue
+    canon="$(cd "$v" 2>/dev/null && pwd -P)" \
+      || { echo "AUDIT_VENDORED: vendored crate ${v} is not a directory" >&2; return 1; }
+    __vendored+=("$v")
+    __vendored_canon+=("$canon")
+  done <<<"$listed"
+  echo "AUDIT_VENDORED=${#__vendored[@]} ${__vendored[*]:-}" >&2
+}
+
+# 0 iff <manifest> lies in (or under) a vendored crate directory.
+is_vendored_manifest() {
+  local dir v
+  dir="$(cd "$(dirname "$1")" && pwd -P)" || return 1
+  for v in "${__vendored_canon[@]+"${__vendored_canon[@]}"}"; do
+    [[ "$dir" == "$v" || "$dir" == "$v"/* ]] && return 0
+  done
+  return 1
+}
+
+# The provenance anchor for one vendored crate (network). 0 = anchored.
+anchor_vendored() {
+  local v="$1" meta name ver recorded idx_path index_cksum work
+  meta="$("$__dt_guard" vendor-patches --root "$__repo_root" --upstream-meta --vendored "$v" </dev/null)" \
+    || { echo "AUDIT_ANCHOR: ${v}: no readable PATCH.md record" >&2; return 1; }
+  IFS=' ' read -r name ver recorded <<<"$meta"
+  case "${#name}" in
+    1) idx_path="1/${name}" ;;
+    2) idx_path="2/${name}" ;;
+    3) idx_path="3/${name:0:1}/${name}" ;;
+    *) idx_path="${name:0:2}/${name:2:2}/${name}" ;;
+  esac
+  index_cksum="$(curl -fsSL --max-time 60 "${__crates_index_url}/${idx_path}" </dev/null \
+    | python3 -c 'import json,sys
+want=sys.argv[1]
+for line in sys.stdin:
+    line=line.strip()
+    if line:
+        e=json.loads(line)
+        if e.get("vers")==want: print(e["cksum"]); break' "$ver")" \
+    || { echo "AUDIT_ANCHOR: ${name} ${ver}: crates.io index fetch failed" >&2; return 1; }
+  [[ -n "$index_cksum" ]] \
+    || { echo "AUDIT_ANCHOR: ${name} ${ver}: not in the crates.io index" >&2; return 1; }
+  [[ "$index_cksum" == "$recorded" ]] \
+    || { echo "AUDIT_ANCHOR: ${name} ${ver}: PATCH.md records ${recorded}, crates.io says ${index_cksum}" >&2; return 1; }
+  work="$(mktemp -d)"
+  if ! curl -fsSL --max-time 120 -o "${work}/up.crate" \
+      "${__crates_dl_url}/${name}/${name}-${ver}.crate" </dev/null; then
+    rm -rf "$work"; echo "AUDIT_ANCHOR: ${name} ${ver}: .crate download failed" >&2; return 1
+  fi
+  if [[ "$(sha256sum "${work}/up.crate" | cut -d' ' -f1)" != "$index_cksum" ]]; then
+    rm -rf "$work"; echo "AUDIT_ANCHOR: ${name} ${ver}: downloaded .crate does not match the index checksum" >&2; return 1
+  fi
+  if ! tar -xzf "${work}/up.crate" -C "$work" \
+      || ! "$__dt_guard" vendor-patches --root "$__repo_root" \
+             --pristine-digest "${work}/${name}-${ver}" --vendored "$v" </dev/null >&2; then
+    rm -rf "$work"; echo "AUDIT_ANCHOR: ${name} ${ver}: the upstream tree does not match the recorded pristine digest" >&2; return 1
+  fi
+  rm -rf "$work"
+  echo "AUDIT_ANCHOR=${v} upstream=${name}@${ver} RESULT=anchored" >&2
 }
 
 # -----------------------------------------------------------------------------
@@ -178,6 +291,10 @@ discover_cargo_workspaces() {
     || { echo "AUDIT_DISCOVERY: git ls-files failed" >&2; return 1; }
   [[ -n "$manifests" ]] || { echo "AUDIT_DISCOVERY: no tracked Cargo.toml" >&2; return 1; }
   while IFS= read -r m; do
+    if is_vendored_manifest "$m"; then
+      echo "AUDIT_GRAPH=${m} SKIPPED=vendored (audited in the root graph via the attributed lock)" >&2
+      continue
+    fi
     root="$(cargo locate-project --workspace --manifest-path "$m" --message-format plain --offline </dev/null)" \
       || { echo "AUDIT_DISCOVERY: cargo locate-project failed for ${m}" >&2; return 1; }
     root="$(cd "$(dirname "$root")" && pwd -P)" \
@@ -203,8 +320,22 @@ audit_workspace() {
   if [[ "$ws" == "." ]]; then manifest="Cargo.toml"; lock="Cargo.lock"
   else manifest="${ws}/Cargo.toml"; lock="${ws}/Cargo.lock"; fi
   if git ls-files --error-unmatch -- "$lock" >/dev/null 2>&1; then
-    scan_lock "$lock" tracked; result="$__scan"
-    echo "AUDIT_GRAPH=${lock} LOCK=tracked RESULT=${result}" >&2
+    if [[ "$ws" == "." && ${#__vendored[@]} -gt 0 ]]; then
+      # The root graph links the vendored crates as path packages: scan the attributed copy.
+      local attributed
+      attributed="$(mktemp)"
+      if ! "$__dt_guard" vendor-patches --root "$__repo_root" --attributed-lock "$attributed" </dev/null; then
+        rm -f "$attributed"
+        echo "AUDIT_GRAPH=${lock} LOCK=tracked RESULT=audit-failed (attributed lock could not be produced)" >&2
+        __result=audit-failed; return
+      fi
+      scan_lock "$lock" tracked "$attributed"; result="$__scan"
+      rm -f "$attributed"
+      echo "AUDIT_GRAPH=${lock} LOCK=tracked+attributed RESULT=${result}" >&2
+    else
+      scan_lock "$lock" tracked; result="$__scan"
+      echo "AUDIT_GRAPH=${lock} LOCK=tracked RESULT=${result}" >&2
+    fi
   else
     # Untracked: resolve fresh into place. A developer's lock (e.g. one reproducing a
     # nightly fuzz crash) is saved and restored byte-for-byte; the backup path is
@@ -225,6 +356,25 @@ audit_workspace() {
   fi
   __result="$result"
 }
+
+__vendored=()
+__vendored_pkgs=""
+if ! load_vendored; then
+  emit_status FAIL vendor-patches-unavailable
+  exit 1
+fi
+if [[ ${#__vendored[@]} -gt 0 ]]; then
+  if ! __vendored_pkgs="$("$__dt_guard" vendor-patches --root "$__repo_root" --packages </dev/null)" \
+      || [[ -z "$__vendored_pkgs" ]]; then
+    echo "AUDIT_VENDORED: the vendor-patches --packages derivation failed" >&2
+    emit_status FAIL vendor-patches-unavailable
+    exit 1
+  fi
+fi
+anchor_failed=0
+for __v in "${__vendored[@]+"${__vendored[@]}"}"; do
+  anchor_vendored "$__v" || anchor_failed=1
+done
 
 if ! workspaces="$(discover_cargo_workspaces)"; then
   emit_status FAIL cargo-audit-discovery-failed
@@ -264,6 +414,10 @@ done <<<"$workspaces"
 if [[ "$scanned" -ne "$graphs" ]]; then
   echo "AUDIT_DISCOVERY: scanned ${scanned} of ${graphs} discovered graphs" >&2
   emit_status FAIL cargo-audit-discovery-failed
+  exit 1
+fi
+if [[ "$anchor_failed" -eq 1 ]]; then
+  emit_status FAIL vendor-pristine-anchor-failed
   exit 1
 fi
 if [[ "$resolve_failed" -eq 1 ]]; then

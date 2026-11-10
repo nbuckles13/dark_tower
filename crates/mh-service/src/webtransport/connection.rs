@@ -10,6 +10,9 @@
 //!    - Not registered: provisional accept with configurable timeout
 //! 6. Monitor for disconnect or cancellation
 //! 7. On disconnect: notify MC, clean up session
+//! 8. End the session: every intentional close carries one `MhCloseCode`
+//!    (ADR-0039 §7, `crate::webtransport::close`); every other end closes QUIC
+//!    with no code
 
 use crate::auth::MhJwtValidator;
 use crate::config::{
@@ -34,6 +37,9 @@ use crate::observability::metrics;
 use crate::routing::{IdError, MeetingKey, SenderId};
 use crate::session::{ConnectionEntry, PendingConnection, SessionManagerHandle};
 use crate::transport::framing::{FrameEnd, FramedReader, CONTROL_PARSE_BYTES};
+use crate::webtransport::close::{
+    self, SessionClose, StartDecline, ValidatedClose, ValidatedSession,
+};
 use crate::webtransport::media_transport::{WtRecvStream, WtSendStream};
 use crate::webtransport::WtMediaTransport;
 
@@ -159,10 +165,6 @@ async fn await_meeting_registration(
 /// meeting registration check fails.
 #[tracing::instrument(skip_all, name = "mh.webtransport.connection", fields(connection_id = tracing::field::Empty))]
 #[expect(
-    clippy::too_many_lines,
-    reason = "Connection lifecycle is sequential; splitting would fragment the accept-validate-register-notify-hold flow"
-)]
-#[expect(
     clippy::too_many_arguments,
     reason = "one lifecycle entry point; every argument is a collaborator resolved once at process setup and threaded through the accept loop"
 )]
@@ -217,6 +219,95 @@ pub async fn handle_connection(
     // seam) while this function keeps driving the lifecycle.
     let connection = Arc::new(connection);
 
+    // From here a WebTransport SESSION exists, so every way it ends is decided
+    // here and emitted ONCE (ADR-0039 §7; `crate::webtransport::close`):
+    //
+    // - `Err` from the session body is any exit before the credential validated
+    //   (or the provisional-accept timeout): closed with the single DECLINED,
+    //   and the `MhError` goes to the accept loop unchanged — so a specific
+    //   code is reachable only on the `Ok` path, after validation.
+    // - `Ok(Close)` is a validated session's intentional close.
+    // - `Ok(WithoutCode)` is every end that must carry no code; MH still closes
+    //   QUIC explicitly so the drop cannot FIN the CONNECT stream.
+    let outcome = serve_session(
+        &connection,
+        &connection_id,
+        handshake_start,
+        &jwt_validator,
+        &session_manager,
+        &mc_client,
+        &handler_id,
+        register_meeting_timeout,
+        &media,
+        &cancel_token,
+    )
+    .await;
+    let (end, result) = match outcome {
+        Ok(end) => (end, Ok(())),
+        Err(e) => (SessionEnd::Close(SessionClose::declined()), Err(e)),
+    };
+    match end {
+        SessionEnd::Close(close) => {
+            close::close_session(&connection, close, &connection_id).await;
+            if close.counts_undelivered_datagrams() {
+                // Every datagram a declined connection received is discarded: no
+                // ingress loop is ever spawned on a declined session, so there is
+                // no reader to have taken any of them off the transport. The whole
+                // received count IS the loss.
+                //
+                // Sampled AFTER the close completes — the decline's MC
+                // notification, the MC-unavailable jitter, AND the session close
+                // with its bounded linger — not before: a client that is
+                // publishing sends throughout that window, and sampling first
+                // would under-count by exactly the traffic the decline arms take
+                // longest to shed. The residue is the flight time of the close
+                // itself (bounded by one RTT): the catalog says "exact" about the
+                // no-reader property, not about a race with the wire.
+                metrics::record_media_frames_dropped(
+                    metrics::MediaDropReason::NoMediaSession,
+                    quic_datagram_frames_received(&connection),
+                );
+            }
+        }
+        SessionEnd::WithoutCode => close::end_without_code(&connection),
+    }
+    result
+}
+
+/// How a session that reached [`serve_session`] ends.
+enum SessionEnd {
+    /// An intentional close with a code. Whether its received datagrams count
+    /// as `no_media_session` drops is derived from the close
+    /// ([`SessionClose::counts_undelivered_datagrams`]), never carried beside it.
+    Close(SessionClose),
+    /// An end that carries no code (client close, stream failure, shutdown).
+    WithoutCode,
+}
+
+/// The body of one session, from its control stream to its end.
+///
+/// Returns `Err` only before the credential validated, or on the provisional
+/// accept timeout; the caller closes every `Err` with DECLINED.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Connection lifecycle is sequential; splitting would fragment the accept-validate-register-notify-hold flow"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the session body of one lifecycle entry point; every argument is a collaborator resolved once at process setup"
+)]
+async fn serve_session(
+    connection: &Arc<wtransport::Connection>,
+    connection_id: &str,
+    handshake_start: Instant,
+    jwt_validator: &MhJwtValidator,
+    session_manager: &SessionManagerHandle,
+    mc_client: &Arc<McClient>,
+    handler_id: &str,
+    register_meeting_timeout: Duration,
+    media: &MediaSetup,
+    cancel_token: &CancellationToken,
+) -> Result<SessionEnd, MhError> {
     // Step 2: Accept bidirectional stream. Both halves are kept: the receive
     // half carries the connect envelope, then (story 3 R-13) recovery
     // requests; the send half carries MH's keyframe requests to a publisher.
@@ -307,35 +398,22 @@ pub async fn handle_connection(
         }
     };
 
-    // Step 4: Validate meeting JWT
-    let claims = match jwt_validator.validate_meeting_token(&token).await {
-        Ok(claims) => {
-            metrics::record_jwt_validation("success", "meeting", "none");
-            claims
-        }
-        Err(e) => {
-            warn!(
-                target: "mh.webtransport.connection",
-                connection_id = %connection_id,
-                error = %e,
-                "JWT validation failed"
-            );
-            metrics::record_jwt_validation("failure", "meeting", "validation_failed");
-            return Err(e);
-        }
-    };
+    // Step 4: Validate meeting JWT — through `close::validate`, the only way to
+    // obtain a `ValidatedSession`, which is what unlocks every close code other
+    // than DECLINED (ADR-0039 §7 security condition 1).
+    let session: ValidatedSession = close::validate(jwt_validator, &token, connection_id).await?;
 
-    let meeting_id = &claims.meeting_id;
+    let meeting_id = session.meeting_id();
     // PROVENANCE, load-bearing: `participant_id` is the validated meeting token's
-    // `sub` and nothing else. It is now an authorization query key — the value MC
-    // answers an identity question about (`NotifyParticipantConnected`) and the
+    // `sub` (read once, into `ValidatedSession`) and nothing else. It is now an
+    // authorization query key — the value MC answers an identity question about (`NotifyParticipantConnected`) and the
     // value MH binds to a media route — not a payload field. Sourcing it from the
     // client's connect envelope, or re-deriving it downstream, would make the
     // identity client-assertable, which is the cross-participant injection
     // primitive this whole contract exists to close. `internal.proto`'s
     // `NotifyParticipantConnectedResponse` paragraph points back at this line by
     // name; this is where the hazard would be introduced (@security S1/SEC-4).
-    let participant_id = &claims.sub;
+    let participant_id = session.participant_id();
 
     info!(
         target: "mh.webtransport.connection",
@@ -360,8 +438,8 @@ pub async fn handle_connection(
             .add_connection(
                 meeting_id,
                 ConnectionEntry {
-                    connection_id: connection_id.clone(),
-                    participant_id: participant_id.clone(),
+                    connection_id: connection_id.to_owned(),
+                    participant_id: participant_id.to_owned(),
                     connected_at: Instant::now(),
                     close: connection_close.clone(),
                 },
@@ -386,9 +464,9 @@ pub async fn handle_connection(
         );
 
         let pending = PendingConnection {
-            connection_id: connection_id.clone(),
-            meeting_id: meeting_id.clone(),
-            participant_id: participant_id.clone(),
+            connection_id: connection_id.to_owned(),
+            meeting_id: meeting_id.to_owned(),
+            participant_id: participant_id.to_owned(),
             connected_at: Instant::now(),
             close: connection_close.clone(),
         };
@@ -397,12 +475,12 @@ pub async fn handle_connection(
 
         // Wait for either: RegisterMeeting notification, timeout, or cancellation
         match await_meeting_registration(
-            &session_manager,
+            session_manager,
             meeting_id,
-            &connection_id,
+            connection_id,
             &notify,
             register_meeting_timeout,
-            &cancel_token,
+            cancel_token,
         )
         .await
         {
@@ -412,10 +490,12 @@ pub async fn handle_connection(
             }
             RegistrationOutcome::Timeout => {
                 // No MC disconnect notification — connection was never established with MC
-                return Err(MhError::MeetingNotRegistered(meeting_id.clone()));
+                return Err(MhError::MeetingNotRegistered(meeting_id.to_owned()));
             }
             RegistrationOutcome::Cancelled => {
-                return Ok(());
+                // Server shutdown while pending: no code (MH-3's drain shed is
+                // the coded shutdown path).
+                return Ok(SessionEnd::WithoutCode);
             }
         }
     }
@@ -435,28 +515,28 @@ pub async fn handle_connection(
     //
     // This is the SIBLING half of the layout constraint: spawning, logging and
     // teardown live here, and `crate::media` holds only the loops.
-    let meeting_key = MeetingKey::new(meeting_id);
+    let meeting_key = session.meeting().clone();
     let media_cancel = connection_close.child_token();
     let media_session = match resolve_sender_binding(
-        &mc_client,
-        &session_manager,
+        mc_client,
+        session_manager,
         &meeting_key,
         meeting_id,
         participant_id,
-        &connection_id,
-        &handler_id,
+        connection_id,
+        handler_id,
     )
     .await
     {
         SenderBindingOutcome::Bound(sender) => {
-            let session = start_media_session(
-                &session_manager,
-                &media,
-                &connection,
+            let media_session = start_media_session(
+                session_manager,
+                media,
+                connection,
                 control_send,
                 &meeting_key,
                 sender,
-                &connection_id,
+                connection_id,
                 &media_cancel,
             );
             metrics::record_media_session_start(metrics::MediaSessionStartOutcome::Started);
@@ -466,47 +546,26 @@ pub async fn handle_connection(
                 meeting_id = %meeting_id,
                 "Media forward path started"
             );
-            session
+            media_session
         }
-        SenderBindingOutcome::Declined(outcome) => {
-            metrics::record_media_session_start(outcome);
+        SenderBindingOutcome::Declined(decline) => {
+            metrics::record_media_session_start(decline.outcome());
             close_declined_connection(
-                &mc_client,
-                &session_manager,
+                mc_client,
+                session_manager,
                 meeting_id,
                 participant_id,
-                &connection_id,
-                &handler_id,
-                outcome,
+                connection_id,
+                handler_id,
+                decline,
             )
             .await;
-            // Every datagram this connection received is discarded: no ingress
-            // loop is ever spawned on a declined session, so there is no reader
-            // to have taken any of them off the transport. No difference is
-            // needed here, and none is available — the whole received count IS
-            // the loss.
-            //
-            // Sampled AFTER the close, not before, and the ordering is the
-            // honest half of the claim. `close_declined_connection` awaits a
-            // gRPC notification, and on the MC-unavailable arm it also sleeps a
-            // jittered interval before closing — a client that is publishing
-            // sends throughout that window. Sampling first would have silently
-            // under-counted by exactly the traffic the decline arms take
-            // longest to shed, which is the case this token exists for.
-            //
-            // The residue that remains is the flight time of the QUIC close
-            // itself: a datagram already in the air when the close frame goes
-            // out is discarded and not counted here. Bounded by one RTT and
-            // stated rather than papered over — the catalog says "exact" about
-            // the no-reader property, not about a race with the wire.
-            metrics::record_media_frames_dropped(
-                metrics::MediaDropReason::NoMediaSession,
-                quic_datagram_frames_received(&connection),
-            );
-            // Counted, closed, and NOT an error: returning `Ok` keeps the
-            // decline off `mh_webtransport_connections_total{status="error"}`
-            // (F9). The connection drops with this frame.
-            return Ok(());
+            // Counted, closed with its code by the caller, and NOT an error:
+            // returning `Ok` keeps the decline off
+            // `mh_webtransport_connections_total{status="error"}` (F9).
+            return Ok(SessionEnd::Close(
+                session.closing(ValidatedClose::StartDeclined(decline)),
+            ));
         }
     };
 
@@ -613,11 +672,10 @@ pub async fn handle_connection(
     // binding below: a connection superseded by a same-participant reconnect
     // holds the same ordinal and must not clear the live successor's egress queue
     // (SEC-2).
-    let left = session_manager.subscribers().unregister(
-        &meeting_key,
-        media_session.sender,
-        &connection_id,
-    );
+    let left =
+        session_manager
+            .subscribers()
+            .unregister(&meeting_key, media_session.sender, connection_id);
     if left {
         // This subscriber left the handler: its stream edges stop counting
         // as pending (`edge_removed`) and stop requesting.
@@ -632,14 +690,14 @@ pub async fn handle_connection(
     session_manager.routing_table().keyframes().unregister(
         &meeting_key,
         media_session.sender,
-        &connection_id,
+        connection_id,
     );
     // Release the ordinal for the uniqueness check. Compare-and-remove keyed on
     // this connection id: a connection superseded by a reconnect no longer holds
     // the entry and must not clear the live one's.
     session_manager
         .sender_bindings()
-        .unbind(&meeting_key, media_session.sender, &connection_id);
+        .unbind(&meeting_key, media_session.sender, connection_id);
     // The ingress arm is awaited SEPARATELY from the other two, and only
     // because it carries the frame tally the delta below needs.
     //
@@ -701,7 +759,7 @@ pub async fn handle_connection(
     if let Some(frames_read) = frames_read {
         metrics::record_media_frames_dropped(
             metrics::MediaDropReason::TransportReceiveDropped,
-            frames_read.unread_since(quic_datagram_frames_received(&connection)),
+            frames_read.unread_since(quic_datagram_frames_received(connection)),
         );
     }
 
@@ -760,7 +818,7 @@ pub async fn handle_connection(
 
     // Step 7: Cleanup — remove connection from session manager and notify MC
     session_manager
-        .remove_connection(meeting_id, &connection_id)
+        .remove_connection(meeting_id, connection_id)
         .await;
 
     // Notify MC of disconnection (best-effort, fire-and-forget) — unless the
@@ -774,14 +832,14 @@ pub async fn handle_connection(
         None => None,
     };
     if let Some((mc_endpoint, reason)) = mc_endpoint {
-        let mc_client = Arc::clone(&mc_client);
-        let meeting_id = meeting_id.clone();
-        let participant_id = participant_id.clone();
-        let handler_id = handler_id.clone();
+        let mc_client = Arc::clone(mc_client);
+        let meeting_id = meeting_id.to_owned();
+        let participant_id = participant_id.to_owned();
+        let handler_id = handler_id.to_string();
         // The SAME id this session's `NotifyParticipantConnected` carried: MC
         // retires only this session's connectivity entry, so a disconnect from
         // a session superseded by a reconnect cannot remove the live one.
-        let connection_id = connection_id.clone();
+        let connection_id = connection_id.to_owned();
         let reason = reason as i32;
         tokio::spawn(async move {
             if let Err(e) = mc_client
@@ -813,7 +871,12 @@ pub async fn handle_connection(
         "Connection closed and cleaned up"
     );
 
-    Ok(())
+    // Whether this end carries a code is the cause's, decided wildcard-free in
+    // `ConnectionEnd::session_close`; the caller emits it.
+    Ok(match connection_end.session_close(&session) {
+        Some(close) => SessionEnd::Close(close),
+        None => SessionEnd::WithoutCode,
+    })
 }
 
 /// DATAGRAM frames this QUIC connection has received, from quinn's own frame
@@ -882,6 +945,21 @@ impl ConnectionEnd {
             Self::Error => Some(DisconnectReason::Error),
             Self::Shutdown => Some(DisconnectReason::Unspecified),
             Self::MeetingReleased => None,
+        }
+    }
+
+    /// The close code this end carries, or `None` for an end that must carry
+    /// none (ADR-0039 §7). Wildcard-free: a new end has to be classified here.
+    ///
+    /// - `MeetingReleased` is `HANDLER_RELEASED`, about this session's own
+    ///   validated meeting.
+    /// - `ClientClosed` / `Error`: the client ended it, or the transport failed.
+    /// - `Shutdown`: server shutdown cancellation stays code-less until MH-3's
+    ///   drain lands its drain-deadline shed.
+    const fn session_close(self, session: &ValidatedSession) -> Option<SessionClose> {
+        match self {
+            Self::MeetingReleased => Some(session.closing(ValidatedClose::MeetingReleased)),
+            Self::ClientClosed | Self::Error | Self::Shutdown => None,
         }
     }
 }
@@ -1052,14 +1130,13 @@ fn start_media_session(
 /// by nothing but a log line. Closing is what makes the failure countable and
 /// lets the client reconnect into a handler that can serve it.
 ///
-/// **No close reason crosses to the client.** MH closes by dropping the
-/// connection; it calls `wtransport::Connection::close()` nowhere, so no reason
-/// string is emitted at all. That is deliberate and is stronger than a bounded
-/// static: a reject arm is the natural place to "helpfully" include the
-/// offending value, and that value is the identity this whole contract exists to
-/// protect. If a close **code** is ever added for the retryable/terminal
-/// distinction (`docs/TODO.md`), it stays a bounded code, never a string, and
-/// never carries an identifier.
+/// **A numeric code, and no close reason, crosses to the client** (ADR-0039 §7).
+/// The caller closes the session through `crate::webtransport::close` with the
+/// decline's `MhCloseCode` — `BINDING_CONFLICT`, `MC_UNAVAILABLE`, or the generic
+/// `DECLINED` — and an EMPTY message. A reject arm is the natural place to
+/// "helpfully" include the offending value, and that value is the identity this
+/// whole contract exists to protect, so the close carries only the bounded code,
+/// never a string and never an identifier.
 ///
 /// # A decline is NOT a handler error — it must not reach `status="error"`
 ///
@@ -1072,8 +1149,8 @@ fn start_media_session(
 /// Rolling MH back restores the pre-contract silent-no-media behaviour, so
 /// declines stop and the ratio recovers: a control that *inverts* under the
 /// exact fault it exists to catch (@operations / @observability F9). The
-/// connection still closes — MH drops it when `handle_connection` returns — so
-/// nothing about the close weakens; only the error-series pollution is removed.
+/// session still closes, with its code, when this returns — so nothing about
+/// the close weakens; only the error-series pollution is removed.
 ///
 /// # The disconnect notification is conditional, and the jitter is one-armed
 ///
@@ -1084,9 +1161,10 @@ fn start_media_session(
 /// receive a disconnection for something it never knew about — a state
 /// divergence, not a courtesy.
 ///
-/// The jitter applies to the MC-unreachable arm ONLY; see
-/// [`MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS`]. The other arms are MC's *answer*,
-/// where retrying is pointless and an immediate terminal close is correct.
+/// The jitter applies to the MC-unreachable arm ONLY, and it runs here — after
+/// the notification and BEFORE the coded close — so the client's retry wave is
+/// spread exactly as before; see [`MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS`]. The
+/// other arms are MC's *answer*, where an immediate close is correct.
 async fn close_declined_connection(
     mc_client: &Arc<McClient>,
     session_manager: &SessionManagerHandle,
@@ -1094,13 +1172,13 @@ async fn close_declined_connection(
     participant_id: &str,
     connection_id: &str,
     handler_id: &str,
-    outcome: metrics::MediaSessionStartOutcome,
+    decline: StartDecline,
 ) {
     session_manager
         .remove_connection(meeting_id, connection_id)
         .await;
 
-    if mc_may_hold_a_registration(outcome) {
+    if mc_may_hold_a_registration(decline) {
         if let Some(mc_endpoint) = session_manager.get_mc_endpoint(meeting_id).await {
             if let Err(e) = mc_client
                 .notify_participant_disconnected(
@@ -1126,15 +1204,30 @@ async fn close_declined_connection(
         }
     }
 
-    if outcome == metrics::MediaSessionStartOutcome::DeclinedMcUnavailable {
-        let jitter = rand::rng().random_range(0..=MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS);
+    let jitter_max = close_jitter_max_ms(decline);
+    if jitter_max > 0 {
+        let jitter = rand::rng().random_range(0..=jitter_max);
         tokio::time::sleep(Duration::from_millis(jitter)).await;
     }
 
-    // No return value: the decline is fully handled and counted. The connection
-    // closes when `handle_connection` returns and drops it (§S8 — close by drop,
-    // no reason string). Returning `Err` here would double-count the decline as
-    // a connection error (F9).
+    // No return value: the decline is fully handled and counted. The caller
+    // closes the session with the decline's code (ADR-0039 §7). Returning `Err`
+    // here would double-count the decline as a connection error (F9).
+}
+
+/// The bound on the random delay before a declined session's close, per
+/// decline: [`MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS`] on the MC-unreachable arm
+/// ONLY (a herd control), zero on every arm that is MC's answer. Wildcard-free,
+/// so a new decline is classified here deliberately.
+const fn close_jitter_max_ms(decline: StartDecline) -> u64 {
+    match decline {
+        StartDecline::McUnavailable => MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS,
+        StartDecline::NoSenderBinding
+        | StartDecline::SenderBindingOutOfRange
+        | StartDecline::SenderBindingConflict
+        | StartDecline::McAuthRejected
+        | StartDecline::McEndpointUnknown => 0,
+    }
 }
 
 /// The outcome of one connection's media-session start sequence.
@@ -1150,7 +1243,7 @@ enum SenderBindingOutcome {
     /// The connection must be closed. Carries the counted outcome, which is
     /// also what decides whether a disconnect notification is owed on the way
     /// out — see [`mc_may_hold_a_registration`].
-    Declined(metrics::MediaSessionStartOutcome),
+    Declined(StartDecline),
 }
 
 /// Whether MC may hold a registration for this connection that MH now owes a
@@ -1196,32 +1289,21 @@ enum SenderBindingOutcome {
 ///   notifying would tell MC about a connection it never saw, a state
 ///   divergence rather than a courtesy.
 ///
-/// The `match` is wildcard-free on purpose: a seventh outcome has to be
+/// The `match` is wildcard-free on purpose: a seventh decline has to be
 /// classified here deliberately rather than defaulted into whichever answer the
-/// wildcard happened to give.
-const fn mc_may_hold_a_registration(outcome: metrics::MediaSessionStartOutcome) -> bool {
-    match outcome {
-        metrics::MediaSessionStartOutcome::DeclinedNoSenderBinding
-        | metrics::MediaSessionStartOutcome::DeclinedSenderBindingOutOfRange
-        | metrics::MediaSessionStartOutcome::DeclinedSenderBindingConflict
+/// wildcard happened to give. It takes [`StartDecline`], which cannot express
+/// "started", so no arm has to answer for a non-decline.
+const fn mc_may_hold_a_registration(decline: StartDecline) -> bool {
+    match decline {
+        StartDecline::NoSenderBinding
+        | StartDecline::SenderBindingOutOfRange
+        | StartDecline::SenderBindingConflict
         // Uncertain, so notify: MC may have recorded the connection and then
         // missed MH's deadline, and a disconnect for an entry MC does not hold
         // is a no-op, so the safe default is to clear what might exist.
-        | metrics::MediaSessionStartOutcome::DeclinedMcUnavailable => true,
-        metrics::MediaSessionStartOutcome::DeclinedMcAuthRejected
-        | metrics::MediaSessionStartOutcome::DeclinedMcEndpointUnknown => false,
-        // Not a decline; never reaches the close path. Kept as its own arm
-        // rather than folded into the never-registered arm because it answers a
-        // different question with the same value: those are "MC never registered
-        // this connection", whereas `Started` is "not a decline at all" and
-        // never reaches this predicate's caller on the close path. Collapsing
-        // them would erase that split.
-        #[expect(
-            clippy::match_same_arms,
-            reason = "`Started` is not a decline and never reaches the close path; \
-                      its `false` is a distinct fact from the never-registered declines above"
-        )]
-        metrics::MediaSessionStartOutcome::Started => false,
+        | StartDecline::McUnavailable => true,
+        StartDecline::McAuthRejected
+        | StartDecline::McEndpointUnknown => false,
     }
 }
 
@@ -1278,9 +1360,7 @@ async fn resolve_sender_binding(
         // `RegisterMeeting` carried". The shutdown route is a rare co-tenant
         // whose remedy is *nothing*, because it is shutdown; it is not what the
         // runbook entry describes and must not be claimed as such.
-        return SenderBindingOutcome::Declined(
-            metrics::MediaSessionStartOutcome::DeclinedMcEndpointUnknown,
-        );
+        return SenderBindingOutcome::Declined(StartDecline::McEndpointUnknown);
     };
 
     let response = match mc_client
@@ -1308,7 +1388,7 @@ async fn resolve_sender_binding(
                 // does not reach it.
                 mc_grpc_endpoint = %mc_endpoint,
                 error = %e,
-                outcome = outcome.as_label(),
+                outcome = outcome.outcome().as_label(),
                 "Media session declined: MH could not obtain a sender_id from MC. Closing rather \
                  than holding a connection that cannot carry media."
             );
@@ -1341,9 +1421,7 @@ async fn resolve_sender_binding(
                  distinct causes — read MC's mc_media_sender_binding_responses_total, which \
                  separates them; MH sees only the refusal."
             );
-            return SenderBindingOutcome::Declined(
-                metrics::MediaSessionStartOutcome::DeclinedNoSenderBinding,
-            );
+            return SenderBindingOutcome::Declined(StartDecline::NoSenderBinding);
         }
         Err(_) => {
             // ADR-0036 §11: the offending value is NOT named here. A reject arm
@@ -1359,9 +1437,7 @@ async fn resolve_sender_binding(
                  range. MC's allocator cannot produce this, so the candidates are field \
                  corruption in transit or a peer that is not MC."
             );
-            return SenderBindingOutcome::Declined(
-                metrics::MediaSessionStartOutcome::DeclinedSenderBindingOutOfRange,
-            );
+            return SenderBindingOutcome::Declined(StartDecline::SenderBindingOutOfRange);
         }
     };
 
@@ -1387,9 +1463,7 @@ async fn resolve_sender_binding(
              have crossed media between participants. Check MH's unbind path for this meeting \
              before MC's allocator."
         );
-        return SenderBindingOutcome::Declined(
-            metrics::MediaSessionStartOutcome::DeclinedSenderBindingConflict,
-        );
+        return SenderBindingOutcome::Declined(StartDecline::SenderBindingConflict);
     }
 
     SenderBindingOutcome::Bound(sender)
@@ -1409,11 +1483,9 @@ async fn resolve_sender_binding(
 /// dialled fine and refused MH's token, so MC is healthy and the remedy is MH's
 /// outbound auth. An expired service token fires it for every connection on the
 /// handler at once.
-fn decline_for_notify_error(error: &MhError) -> metrics::MediaSessionStartOutcome {
+fn decline_for_notify_error(error: &MhError) -> StartDecline {
     match error {
-        MhError::McEndpointInvalid(_) => {
-            metrics::MediaSessionStartOutcome::DeclinedMcEndpointUnknown
-        }
+        MhError::McEndpointInvalid(_) => StartDecline::McEndpointUnknown,
         // Two routes, one remedy: MC refused MH's credential, or MH could not
         // build one. Both are MH's outbound auth and both start at
         // `mh_token_refresh_total{status="error"}`; neither is a reason to open
@@ -1421,9 +1493,9 @@ fn decline_for_notify_error(error: &MhError) -> metrics::MediaSessionStartOutcom
         // build failure is retried because a refresh landing mid-budget can fix
         // it.
         MhError::JwtValidation(_) | MhError::OutboundAuthUnavailable(_) => {
-            metrics::MediaSessionStartOutcome::DeclinedMcAuthRejected
+            StartDecline::McAuthRejected
         }
-        _ => metrics::MediaSessionStartOutcome::DeclinedMcUnavailable,
+        _ => StartDecline::McUnavailable,
     }
 }
 
@@ -1595,6 +1667,24 @@ mod tests {
         );
         // Registered arm must not record the timeout counter.
         snap.counter(METRIC_NAME).assert_unobserved();
+    }
+
+    /// The close jitter applies to the MC-unreachable decline and to NO other.
+    #[test]
+    fn close_jitter_is_on_the_mc_unavailable_arm_only() {
+        for decline in StartDecline::ALL {
+            let expected = if decline == StartDecline::McUnavailable {
+                MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS
+            } else {
+                0
+            };
+            assert_eq!(close_jitter_max_ms(decline), expected, "{decline:?}");
+        }
+        assert_ne!(
+            close_jitter_max_ms(StartDecline::McUnavailable),
+            0,
+            "the herd control must exist"
+        );
     }
 
     /// A connection closed by `EndMeeting` release never notifies MC, whatever

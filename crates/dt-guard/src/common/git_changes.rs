@@ -218,7 +218,7 @@ pub fn get_active_edit_paths(repo_root: &Path) -> Result<Vec<PathBuf>> {
             .output()
             .with_context(|| format!("git diff HEAD in {}", repo_root.display()))?;
         if diff.status.success() {
-            out.extend(filter_lines(&diff.stdout, &[]));
+            out.extend(filter_lines_keep_vendored(&diff.stdout));
         }
         let untracked = Command::new("git")
             .current_dir(repo_root)
@@ -226,7 +226,7 @@ pub fn get_active_edit_paths(repo_root: &Path) -> Result<Vec<PathBuf>> {
             .output()
             .with_context(|| format!("git ls-files --others in {}", repo_root.display()))?;
         if untracked.status.success() {
-            out.extend(filter_lines(&untracked.stdout, &[]));
+            out.extend(filter_lines_keep_vendored(&untracked.stdout));
         }
     } else {
         // Clean tree — diff HEAD^..HEAD (or HEAD^2..HEAD if HEAD is a merge).
@@ -281,7 +281,7 @@ pub fn get_active_edit_paths(repo_root: &Path) -> Result<Vec<PathBuf>> {
                     )
                 })?;
             if diff.status.success() {
-                out.extend(filter_lines(&diff.stdout, &[]));
+                out.extend(filter_lines_keep_vendored(&diff.stdout));
             }
         }
     }
@@ -333,15 +333,38 @@ fn git_diff_name_only(
     Ok(filter_lines(&output.stdout, extensions))
 }
 
-/// Split git output on `\n`, drop empties + `vendor/` paths, apply literal-suffix
+/// The vendored-code prefix — the ONE Rust home of the predicate (its Bash
+/// twin is `common.sh`'s `get_untracked_files` filter). Vendored code is
+/// upstream's, kept byte-identical to its published source plus a recorded
+/// patch (`dt-guard vendor-patches`), so CONTENT scans skip it.
+pub const VENDORED_PREFIX: &str = "vendor/";
+
+/// True iff `path` (repo-relative, `/`-separated) is vendored code.
+pub fn is_vendored(path: &str) -> bool {
+    path.starts_with(VENDORED_PREFIX)
+}
+
+/// Split git output on `\n`, drop empties + vendored paths, apply literal-suffix
 /// filter. Empty `extensions` skips suffix filtering.
 fn filter_lines(stdout: &[u8], extensions: &[&str]) -> Vec<PathBuf> {
     let raw = String::from_utf8_lossy(stdout);
     raw.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .filter(|line| !line.starts_with("vendor/"))
+        .filter(|line| !is_vendored(line))
         .filter(|line| extensions.is_empty() || extensions.iter().any(|ext| line.ends_with(ext)))
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// As [`filter_lines`] with no suffix filter, but KEEPING vendored paths: the
+/// active-edit scope (`cross-boundary-scope`) must see an edit to `vendor/`, a
+/// Guarded Shared Area by criterion, or such an edit would go undeclared.
+fn filter_lines_keep_vendored(stdout: &[u8]) -> Vec<PathBuf> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
         .map(PathBuf::from)
         .collect()
 }
@@ -349,6 +372,17 @@ fn filter_lines(stdout: &[u8], extensions: &[&str]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_edit_scope_keeps_vendored_paths_content_scans_drop_them() {
+        let stdout = b"vendor/wtransport/src/lib.rs\nsrc/main.rs\n";
+        assert_eq!(
+            filter_lines(stdout, &[]),
+            vec![PathBuf::from("src/main.rs")]
+        );
+        assert_eq!(filter_lines_keep_vendored(stdout).len(), 2);
+        assert!(is_vendored("vendor/x") && !is_vendored("src/vendor/x"));
+    }
 
     #[test]
     fn filter_lines_empty_extensions_passes_through() {

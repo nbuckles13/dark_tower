@@ -224,6 +224,67 @@ fn preconditions_fail_and_print_first() {
     assert_fails_with(dir.path(), "workspace-deps-workspace-dependencies-empty");
 }
 
+/// The vendored partition: a root-`exclude` crate that is also a root
+/// `[patch.*]` path target carries upstream's manifest (a literal, drifting
+/// pin here), which R3 would flag — the guard must skip R2/R3 for it, count it
+/// on the scope line, and still fail R3 for an ordinary excluded crate in the
+/// SAME tree (positive control: the partition is by derivation, not by blanket).
+#[test]
+fn vendored_patch_target_is_exempt_from_r2_r3_and_counted() {
+    let dir = fixture(A_CLEAN, "", FUZZ_CLEAN, LOCK_OK);
+    write(
+        dir.path(),
+        "Cargo.toml",
+        &format!(
+            "{}\n[patch.crates-io]\nupstream = {{ path = \"vendor/upstream\" }}\n",
+            ROOT.replace(
+                "exclude = [\"fuzz\"]",
+                "exclude = [\"fuzz\", \"vendor/upstream\"]"
+            )
+        ),
+    );
+    write(
+        dir.path(),
+        "vendor/upstream/Cargo.toml",
+        &pkg(
+            "upstream",
+            "[dependencies]\nbase64 = \"0.22\"\ntokio = \"1.28\"\n",
+        ),
+    );
+    let (ok, stdout) = run_guard(dir.path());
+    assert!(ok, "vendored crate must not trip R2/R3:\n{stdout}");
+    assert!(
+        stdout.contains("(1 vendored: R2/R3 not evaluated)"),
+        "the skip must be counted on the scope line:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.lines().last().unwrap(),
+        "STATUS=OK REASON=workspace-deps-clean-members-2-excluded-2"
+    );
+
+    // Same tree, but the crate is NOT a patch target: R3 fires on it.
+    write(
+        dir.path(),
+        "Cargo.toml",
+        &ROOT.replace(
+            "exclude = [\"fuzz\"]",
+            "exclude = [\"fuzz\", \"vendor/upstream\"]",
+        ),
+    );
+    assert_fails_with(dir.path(), "excluded-workspace-version-drift");
+}
+
+#[test]
+fn unreadable_patch_table_is_a_precondition() {
+    let dir = fixture(A_CLEAN, "", FUZZ_CLEAN, LOCK_OK);
+    write(
+        dir.path(),
+        "Cargo.toml",
+        &format!("{ROOT}\n[patch.crates-io]\nupstream = {{ path = 7 }}\n"),
+    );
+    assert_fails_with(dir.path(), "workspace-deps-patch-paths-unreadable");
+}
+
 /// The real repository: clean, and the guard reached a verdict over EVERY
 /// member. The expected count is read from the real root manifest here, never
 /// hardcoded; the root is resolved from this crate's manifest dir, never cwd.

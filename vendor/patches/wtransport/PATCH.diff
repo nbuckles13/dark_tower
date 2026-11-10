@@ -1,0 +1,391 @@
+--- a/src/connection.rs
++++ b/src/connection.rs
+@@ -95,6 +95,8 @@
+ use crate::datagram::Datagram;
+ use crate::driver::utils::varint_w2q;
+ use crate::driver::Driver;
++use crate::driver::DriverError;
++use crate::error::ApplicationClose;
+ use crate::error::ConnectionError;
+ use crate::error::ExportKeyingMaterialError;
+ use crate::error::SendDatagramError;
+@@ -306,6 +308,34 @@
+         self.quic_connection.close(varint_w2q(error_code), reason);
+     }
+ 
++    /// PATCH(dark-tower ADR-0039 §7): closes the WebTransport SESSION with `code`: one
++    /// CLOSE_WEBTRANSPORT_SESSION capsule (empty message) on the CONNECT stream,
++    /// then FIN. QUIC is closed with H3_NO_ERROR once the peer reacts; the
++    /// caller bounds the wait and closes QUIC itself if the peer does not.
++    ///
++    /// Resolves once the capsule was written; the CALLER must bound the wait
++    /// (a peer can withhold flow-control credit). At most once per connection.
++    ///
++    /// # Errors
++    ///
++    /// [`SessionCloseError`](crate::error::SessionCloseError): already closing,
++    /// the driver is gone, the CONNECT stream is already gone, or the write failed.
++    pub async fn close_session(&self, code: u32) -> Result<(), crate::error::SessionCloseError> {
++        self.driver
++            .close_session(encode_close_session_capsule(code))
++            .await
++    }
++
++    /// PATCH(dark-tower ADR-0039 §7): once the driver has ended, the session close the PEER sent: a
++    /// capsule's code and message, or code 0 and an empty message for a bare
++    /// CONNECT-stream FIN (RFC-equivalent). `None` for any other end.
++    pub async fn session_close_received(&self) -> Option<ApplicationClose> {
++        match self.driver.session_end().await {
++            Some(DriverError::ApplicationClosed(close)) => Some(close),
++            _ => None,
++        }
++    }
++
+     /// Waits for the connection to be closed for any reason.
+     pub async fn closed(&self) -> ConnectionError {
+         self.quic_connection.closed().await.into()
+@@ -424,3 +454,35 @@
+         &mut self.quic_connection
+     }
+ }
++
++/// PATCH(dark-tower ADR-0039 §7): the EXACT bytes written on the CONNECT stream to close a session
++/// with `code`: one HTTP/3 DATA frame carrying one CLOSE_WEBTRANSPORT_SESSION
++/// capsule (type 0x2843, length 4, `code` as u32 big-endian, empty message).
++/// Varints are minimal (RFC 9000 §16), via wtransport-proto's own writer.
++#[doc(hidden)]
++pub fn encode_close_session_capsule(code: u32) -> Vec<u8> {
++    use wtransport_proto::bytes::BytesWriter;
++    use wtransport_proto::frame::Frame;
++
++    // Upstream's `CAPSULE_TYPE_CLOSE_WEBTRANSPORT_SESSION` is private; this
++    // copy is tied to it by the encode-then-parse test in the consumer.
++    const CLOSE_WEBTRANSPORT_SESSION: VarInt = VarInt::from_u32(0x2843);
++    const CODE_LEN: u32 = 4;
++
++    let mut capsule = Vec::with_capacity(8);
++    capsule
++        .put_varint(CLOSE_WEBTRANSPORT_SESSION)
++        .expect("Vec writer is unbounded");
++    capsule
++        .put_varint(VarInt::from_u32(CODE_LEN))
++        .expect("Vec writer is unbounded");
++    capsule
++        .put_bytes(&code.to_be_bytes())
++        .expect("Vec writer is unbounded");
++
++    let mut bytes = Vec::with_capacity(capsule.len() + 2);
++    Frame::new_data(std::borrow::Cow::Owned(capsule))
++        .write(&mut bytes)
++        .expect("Vec writer is unbounded");
++    bytes
++}
+--- a/src/driver/mod.rs
++++ b/src/driver/mod.rs
+@@ -32,6 +32,9 @@
+     Proto(ErrorCode),
+     ApplicationClosed(ApplicationClose),
+     NotConnected,
++    /// PATCH(dark-tower ADR-0039 §7): this side sent CLOSE_WEBTRANSPORT_SESSION and the peer reacted on
++    /// the CONNECT stream (or the connection ended). QUIC closes with H3_NO_ERROR.
++    SessionCloseSent,
+ }
+ 
+ #[derive(Debug)]
+@@ -43,6 +46,13 @@
+     ready_bi_wt_streams: Mutex<mpsc::Receiver<StreamBiRemoteWT>>,
+     ready_datagrams: Mutex<mpsc::Receiver<Datagram>>,
+     driver_result: SharedResultGet<DriverError>,
++    /// PATCH(dark-tower ADR-0039 §7): a second, dedicated subscriber to the driver result, so reading
++    /// how the session ended never contends with the upstream `result()` waiters.
++    session_end: SharedResultGet<DriverError>,
++    /// PATCH(dark-tower ADR-0039 §7): hands an encoded CLOSE_WEBTRANSPORT_SESSION to the worker.
++    close_session: mpsc::Sender<(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), crate::error::SessionCloseError>>)>,
++    /// PATCH(dark-tower ADR-0039 §7): the session close is sent at most once.
++    close_session_started: std::sync::atomic::AtomicBool,
+ }
+ 
+ impl Driver {
+@@ -53,6 +63,9 @@
+         let ready_bi_wt_streams = mpsc::channel(1);
+         let ready_datagrams = mpsc::channel(1);
+         let driver_result = shared_result();
++        // PATCH(dark-tower ADR-0039 §7)
++        let session_end = driver_result.0.subscribe();
++        let close_session = mpsc::channel(1);
+ 
+         tokio::spawn(
+             worker::Worker::new(
+@@ -63,6 +76,7 @@
+                 ready_bi_wt_streams.0,
+                 ready_datagrams.0,
+                 driver_result.0,
++                close_session.1,
+             )
+             .run()
+             .instrument(debug_span!("Driver", quic_id = quic_connection.stable_id())),
+@@ -76,6 +90,9 @@
+             ready_bi_wt_streams: Mutex::new(ready_bi_wt_streams.1),
+             ready_datagrams: Mutex::new(ready_datagrams.1),
+             driver_result: driver_result.1,
++            session_end,
++            close_session: close_session.0,
++            close_session_started: std::sync::atomic::AtomicBool::new(false),
+         }
+     }
+ 
+@@ -225,6 +242,38 @@
+                 Err(SendDatagramError::NotConnected)
+             }
+         }
++    }
++
++    /// PATCH(dark-tower ADR-0039 §7): queues `capsule` (the exact bytes for the CONNECT stream) for the
++    /// worker, which writes it verbatim and FINs the CONNECT stream's send half.
++    ///
++    /// Resolves once the bytes were written (the worker never blocks its loop
++    /// on the peer's flow-control credit: the write is its own select arm). The
++    /// CALLER bounds this wait. At most once per connection: every later call
++    /// is `Err(AlreadyClosing)` and sends nothing.
++    pub async fn close_session(
++        &self,
++        capsule: Vec<u8>,
++    ) -> Result<(), crate::error::SessionCloseError> {
++        use crate::error::SessionCloseError;
++        if self
++            .close_session_started
++            .swap(true, std::sync::atomic::Ordering::SeqCst)
++        {
++            return Err(SessionCloseError::AlreadyClosing);
++        }
++        let (ack, acked) = tokio::sync::oneshot::channel();
++        self.close_session
++            .send((capsule, ack))
++            .await
++            .map_err(|_| SessionCloseError::DriverGone)?;
++        acked.await.map_err(|_| SessionCloseError::DriverGone)?
++    }
++
++    /// PATCH(dark-tower ADR-0039 §7): how the driver ended, once it has ended (`None` if the worker
++    /// vanished without a result).
++    pub async fn session_end(&self) -> Option<DriverError> {
++        self.session_end.result().await
+     }
+ 
+     async fn result(&self) -> DriverError {
+@@ -248,6 +297,14 @@
+     use streams::connect::ConnectStream;
+     use utils::varint_w2q;
+     use wtransport_proto::frame::FrameKind;
++
++    /// PATCH(dark-tower ADR-0039 §7): this side's session close in progress.
++    pub struct Closing {
++        stream: StreamSession,
++        capsule: Vec<u8>,
++        written: usize,
++        ack: Option<tokio::sync::oneshot::Sender<Result<(), crate::error::SessionCloseError>>>,
++    }
+     use wtransport_proto::headers::Headers;
+     use wtransport_proto::session::HeadersParseError;
+     use wtransport_proto::stream_header::StreamHeader;
+@@ -266,6 +323,11 @@
+         remote_qpack_enc_stream: RemoteQPackEncStream,
+         remote_qpack_dec_stream: RemoteQPackDecStream,
+         connect_stream: ConnectStream,
++        /// PATCH(dark-tower ADR-0039 §7): session-close requests from the `Driver`.
++        close_session: mpsc::Receiver<(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), crate::error::SessionCloseError>>)>,
++        /// PATCH(dark-tower ADR-0039 §7): this side's session close in progress (capsule write, then
++        /// waiting for the peer's reaction).
++        closing: Option<Closing>,
+     }
+ 
+     impl Worker {
+@@ -277,6 +339,7 @@
+             ready_bi_wt_streams: mpsc::Sender<StreamBiRemoteWT>,
+             ready_datagrams: mpsc::Sender<Datagram>,
+             driver_result: SharedResultSet<DriverError>,
++            close_session: mpsc::Receiver<(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), crate::error::SessionCloseError>>)>,
+         ) -> Self {
+             Self {
+                 quic_connection,
+@@ -291,6 +354,8 @@
+                 remote_qpack_enc_stream: RemoteQPackEncStream::empty(),
+                 remote_qpack_dec_stream: RemoteQPackDecStream::empty(),
+                 connect_stream: ConnectStream::empty(),
++                close_session,
++                closing: None,
+             }
+         }
+ 
+@@ -316,6 +381,11 @@
+                         .close(varint_w2q(error_code.to_code()), b"");
+                 }
+                 DriverError::NotConnected => (),
++                // PATCH(dark-tower ADR-0039 §7): the session close completed; never the app code on QUIC.
++                DriverError::SessionCloseSent => {
++                    self.quic_connection
++                        .close(varint_w2q(ErrorCode::NoError.to_code()), b"");
++                }
+             }
+ 
+             self.driver_result.set(error);
+@@ -382,11 +452,80 @@
+                         return Err(error);
+                     }
+ 
++                    // PATCH(dark-tower ADR-0039 §7): send this side's session close (once).
++                    request = self.close_session.recv(), if self.closing.is_none() => {
++                        match request {
++                            Some((capsule, ack)) => self.start_session_close(capsule, ack),
++                            None => return Err(DriverError::NotConnected),
++                        }
++                    }
++
++                    // PATCH(dark-tower ADR-0039 §7): write the capsule (cancel-safe, its own arm, so a
++                    // peer withholding flow-control credit never stalls this
++                    // loop), FIN, then ANY peer read-side outcome on the CONNECT
++                    // stream (FIN, reset, a frame, connection loss) completes
++                    // the close with H3_NO_ERROR, never ClosedCriticalStream.
++                    error = Self::drive_session_close(&mut self.closing), if self.closing.is_some() => {
++                        return Err(error);
++                    }
++
+                     () = self.driver_result.closed() => {
+                         return Err(DriverError::NotConnected);
+                     }
+                 }
+             }
++        }
++
++        /// PATCH(dark-tower ADR-0039 §7): takes the CONNECT stream for this side's session close. The
++        /// stream leaves the upstream `ConnectStream`, so its capsule parser
++        /// (and its reset → ClosedCriticalStream mapping) never runs on this
++        /// side again. No await: nothing here waits on the peer.
++        fn start_session_close(
++            &mut self,
++            capsule: Vec<u8>,
++            ack: tokio::sync::oneshot::Sender<Result<(), crate::error::SessionCloseError>>,
++        ) {
++            match self.connect_stream.take_stream() {
++                Some(stream) => {
++                    self.closing = Some(Closing {
++                        stream,
++                        capsule,
++                        written: 0,
++                        ack: Some(ack),
++                    });
++                }
++                None => {
++                    let _ = ack.send(Err(crate::error::SessionCloseError::NoConnectStream));
++                }
++            }
++        }
++
++        /// PATCH(dark-tower ADR-0039 §7): drives this side's session close. Cancel-safe: progress lives
++        /// in `Closing` (`written`, `ack`), and a single quinn `write` either
++        /// completes or writes nothing when cancelled. Writes the capsule
++        /// verbatim, FINs and acks the caller (once), then resolves on the
++        /// peer's first read-side outcome. A write error is reported to the
++        /// caller and also completes the close.
++        async fn drive_session_close(closing: &mut Option<Closing>) -> DriverError {
++            let Some(c) = closing.as_mut() else {
++                return std::future::pending().await;
++            };
++            while c.ack.is_some() && c.written < c.capsule.len() {
++                match c.stream.write_raw(&c.capsule[c.written..]).await {
++                    Ok(n) => c.written += n,
++                    Err(e) => {
++                        if let Some(ack) = c.ack.take() {
++                            let _ = ack.send(Err(crate::error::SessionCloseError::Write(e)));
++                        }
++                    }
++                }
++            }
++            if let Some(ack) = c.ack.take() {
++                c.stream.finish_nowait();
++                let _ = ack.send(Ok(()));
++            }
++            let _ = c.stream.read_frame().await;
++            DriverError::SessionCloseSent
+         }
+ 
+         async fn open_and_send_settings(&mut self) -> Result<(), DriverError> {
+--- a/src/driver/streams/connect.rs
++++ b/src/driver/streams/connect.rs
+@@ -28,6 +28,11 @@
+ 
+     pub fn set_stream(&mut self, stream: StreamSession) {
+         self.stream = Some(stream);
++    }
++
++    /// PATCH(dark-tower ADR-0039 §7): hands the CONNECT stream to the session-close path.
++    pub fn take_stream(&mut self) -> Option<StreamSession> {
++        self.stream.take()
+     }
+ 
+     pub async fn run(&mut self) -> DriverError {
+--- a/src/driver/streams/mod.rs
++++ b/src/driver/streams/mod.rs
+@@ -58,6 +58,12 @@
+         let _ = self.0.set_priority(priority);
+     }
+ 
++    /// PATCH(dark-tower ADR-0039 §7): FIN without awaiting the peer's acknowledgement.
++    #[inline(always)]
++    pub fn finish_nowait(&mut self) {
++        let _ = self.0.finish();
++    }
++
+     #[inline(always)]
+     /// # Panics
+     ///
+@@ -555,6 +561,17 @@
+         pub fn reset(&mut self, error_code: VarInt) {
+             let _ = self.stream.0.reset(error_code);
+         }
++
++        /// PATCH(dark-tower ADR-0039 §7): one write of raw bytes (an encoded capsule) on the send half:
++        /// returns how many were written. Cancel-safe (quinn `write`).
++        pub async fn write_raw(&mut self, buf: &[u8]) -> Result<usize, StreamWriteError> {
++            self.stream.0.write(buf).await
++        }
++
++        /// PATCH(dark-tower ADR-0039 §7): FIN the send half without awaiting acknowledgement.
++        pub fn finish_nowait(&mut self) {
++            self.stream.0.finish_nowait();
++        }
+     }
+ }
+ 
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -49,6 +49,8 @@
+             DriverError::Proto(error_code) => Self::local_h3_error(error_code),
+             DriverError::ApplicationClosed(close) => Self::ApplicationClosed(close),
+             DriverError::NotConnected => Self::no_connect(quic_connection),
++            // PATCH(dark-tower ADR-0039 §7): this side closed the session.
++            DriverError::SessionCloseSent => ConnectionError::LocallyClosed,
+         }
+     }
+ 
+@@ -350,3 +352,20 @@
+ #[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]
+ #[error("cannot derive keying material as requested output length is too large")]
+ pub struct ExportKeyingMaterialError;
++
++/// PATCH(dark-tower ADR-0039 §7): why this side's WebTransport session close could not be sent.
++#[derive(thiserror::Error, Debug, Clone, Eq, PartialEq)]
++pub enum SessionCloseError {
++    /// A session close was already started on this connection.
++    #[error("a session close was already started")]
++    AlreadyClosing,
++    /// The connection's driver task is gone.
++    #[error("the connection driver is gone")]
++    DriverGone,
++    /// The CONNECT stream was already reset, finished or never established.
++    #[error("no CONNECT stream to close")]
++    NoConnectStream,
++    /// Writing the capsule failed.
++    #[error("writing the session-close capsule failed: {0}")]
++    Write(StreamWriteError),
++}

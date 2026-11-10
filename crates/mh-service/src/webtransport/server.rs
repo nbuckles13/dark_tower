@@ -99,6 +99,16 @@ impl WebTransportServer {
         }
     }
 
+    /// The live count of connections this server is holding — the same counter
+    /// the `MH_MAX_CONNECTIONS` gate reads. A handler's slot is released (and
+    /// its `status` outcome recorded, in the same synchronous block) only when
+    /// `handle_connection` returns, which is AFTER its session close and
+    /// linger. Read-only; exposed so a test can wait for a handler to finish.
+    #[must_use]
+    pub fn active_connection_count(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.active_connections)
+    }
+
     /// Load TLS identity and bind the QUIC/HTTP3 endpoint.
     ///
     /// Call this **before** spawning the accept loop so that TLS or bind

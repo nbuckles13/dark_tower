@@ -65,12 +65,18 @@ pub fn mint_no_service_type_token(keypair: &TestKeypair) -> String {
     keypair.sign_token(&claims)
 }
 
-/// Mint a standard meeting token for a participant joining `meeting_id`.
-pub fn mint_meeting_token(keypair: &TestKeypair, meeting_id: &str, participant_id: &str) -> String {
+/// The ONE meeting-token claim set for these tests: valid for an hour from
+/// now, for `participant_id` in `meeting_id`, with the given `token_type`.
+/// Callers that need something else (expiry, a different type) adjust fields.
+pub fn meeting_claims(
+    meeting_id: &str,
+    participant_id: &str,
+    token_type: &str,
+) -> MeetingTokenClaims {
     let now = Utc::now().timestamp();
-    let claims = MeetingTokenClaims {
+    MeetingTokenClaims {
         sub: participant_id.to_string(),
-        token_type: "meeting".to_string(),
+        token_type: token_type.to_string(),
         meeting_id: meeting_id.to_string(),
         home_org_id: None,
         meeting_org_id: "org-test".to_string(),
@@ -81,27 +87,20 @@ pub fn mint_meeting_token(keypair: &TestKeypair, meeting_id: &str, participant_i
         iat: now,
         exp: now + 3600,
         jti: format!("jti-{}", uuid::Uuid::new_v4()),
-    };
-    keypair.sign_token(&claims)
+    }
+}
+
+/// Mint a standard meeting token for a participant joining `meeting_id`.
+pub fn mint_meeting_token(keypair: &TestKeypair, meeting_id: &str, participant_id: &str) -> String {
+    keypair.sign_token(&meeting_claims(meeting_id, participant_id, "meeting"))
 }
 
 /// Mint an expired meeting token.
 pub fn mint_expired_meeting_token(keypair: &TestKeypair, meeting_id: &str) -> String {
     let past = Utc::now().timestamp() - 7200;
-    let claims = MeetingTokenClaims {
-        sub: "user-expired".to_string(),
-        token_type: "meeting".to_string(),
-        meeting_id: meeting_id.to_string(),
-        home_org_id: None,
-        meeting_org_id: "org-test".to_string(),
-        participant_type: ParticipantType::Member,
-        role: MeetingRole::Participant,
-        capabilities: vec!["video".to_string()],
-        display_name: "Test Participant".to_string(),
-        iat: past,
-        exp: past + 3600,
-        jti: format!("jti-{}", uuid::Uuid::new_v4()),
-    };
+    let mut claims = meeting_claims(meeting_id, "user-expired", "meeting");
+    claims.iat = past;
+    claims.exp = past + 3600;
     keypair.sign_token(&claims)
 }
 
@@ -110,22 +109,7 @@ pub fn mint_expired_meeting_token(keypair: &TestKeypair, meeting_id: &str) -> St
 /// Used to prove the WT accept-path calls `validate_meeting_token` (which
 /// enforces the discriminator) rather than `inner.validate`.
 pub fn mint_wrong_token_type_token(keypair: &TestKeypair, meeting_id: &str) -> String {
-    let now = Utc::now().timestamp();
-    let claims = MeetingTokenClaims {
-        sub: "user-guest".to_string(),
-        token_type: "guest".to_string(),
-        meeting_id: meeting_id.to_string(),
-        home_org_id: None,
-        meeting_org_id: "org-test".to_string(),
-        participant_type: ParticipantType::Member,
-        role: MeetingRole::Participant,
-        capabilities: vec!["video".to_string()],
-        display_name: "Test Participant".to_string(),
-        iat: now,
-        exp: now + 3600,
-        jti: format!("jti-{}", uuid::Uuid::new_v4()),
-    };
-    keypair.sign_token(&claims)
+    keypair.sign_token(&meeting_claims(meeting_id, "user-guest", "guest"))
 }
 
 /// Hand-craft an `alg: none` unsigned JWT for the given claims payload.

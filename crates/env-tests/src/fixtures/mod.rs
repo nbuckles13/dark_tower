@@ -15,6 +15,7 @@ pub mod media;
 pub mod metric_hygiene;
 pub mod metrics;
 pub mod mh_address;
+pub mod mh_close;
 pub mod mh_config;
 pub mod mh_grpc;
 pub mod mh_pool;

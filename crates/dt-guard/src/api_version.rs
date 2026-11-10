@@ -24,7 +24,11 @@ pub const OPS_VERSIONED_RULE_ID: &str = "ops_route_versioned";
 
 const EXTENSIONS: &[&str] = &[".rs"];
 
-const EXCLUDED_PATH_PATTERNS: &[&str] = &["/tests/", "/test_utils/", "vendor/"];
+const EXCLUDED_PATH_PATTERNS: &[&str] = &[
+    "/tests/",
+    "/test_utils/",
+    crate::common::git_changes::VENDORED_PREFIX,
+];
 const EXCLUDED_FILE_SUFFIXES: &[&str] = &["_test.rs"];
 
 /// `.route("/...")` opener — captures the path literal in group 1.

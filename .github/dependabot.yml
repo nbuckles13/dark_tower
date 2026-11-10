@@ -86,6 +86,11 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    # VENDORED: wtransport resolves to vendor/wtransport (upstream 0.7.2 + an additive
+    # session-close patch, root `[patch.crates-io]`; vendor/patches/wtransport/PATCH.md).
+    # Deliberately NO `ignore:` here (the header forbids one; audit-suppressions guard). A bump
+    # PR for wtransport instead goes RED on `dt-guard vendor-patches` (vendor-patch-not-in-lock:
+    # the bumped requirement silently unpatches it) and must follow PATCH.md's drop procedure.
 
   - package-ecosystem: "npm"   # Dependabot's "npm" ecosystem handles pnpm lockfiles
     directory: "/"

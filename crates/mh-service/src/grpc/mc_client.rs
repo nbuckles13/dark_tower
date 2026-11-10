@@ -46,6 +46,23 @@ const MAX_RETRY_ATTEMPTS: u32 = 3;
 /// Base delay for exponential backoff between retries.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
+/// The time one notification call spends in backoff sleeps when EVERY attempt
+/// fails at once (an unreachable endpoint): the floor of its retry budget.
+/// Derived from the retry constants, never restated by callers.
+#[must_use]
+pub fn retry_backoff_floor() -> Duration {
+    (0..MAX_RETRY_ATTEMPTS.saturating_sub(1))
+        .map(|i| RETRY_BASE_DELAY.saturating_mul(1 << i))
+        .sum()
+}
+
+/// The worst case one notification call can take: every attempt times out on
+/// connect and RPC, plus the backoff sleeps between them.
+#[must_use]
+pub fn retry_budget_ceiling() -> Duration {
+    (MC_CONNECT_TIMEOUT + MC_RPC_TIMEOUT).saturating_mul(MAX_RETRY_ATTEMPTS) + retry_backoff_floor()
+}
+
 /// MC client for MH→MC notification RPCs.
 ///
 /// Holds a `TokenReceiver` for Bearer auth. Creates a new gRPC channel

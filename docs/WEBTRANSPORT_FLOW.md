@@ -459,6 +459,45 @@ message ErrorMessage {
   - `0x03`: Quota exceeded
   - `0x04`: Internal server error
 
+### MH session close (ADR-0039 §7)
+
+MH ends every client session it closes **on purpose** — a declined credential or
+media session, a released meeting, and (from MH-3) the drain-deadline shed — with
+exactly one numeric `MhCloseCode`. The numbers are defined ONCE, in
+`proto/dark_tower/signaling/v1/signaling.proto` (`enum MhCloseCode`); nothing else
+restates them.
+
+**On the wire** (MH side, `crates/mh-service/src/webtransport/close.rs`, through the
+vendored wtransport patch, `vendor/patches/wtransport/PATCH.md`):
+
+1. ONE HTTP/3 DATA frame on the session's CONNECT stream carrying ONE
+   `CLOSE_WEBTRANSPORT_SESSION` capsule (draft-ietf-webtrans-http3; RFC 9297 capsule
+   format): type `0x2843`, length 4, the code as a 32-bit big-endian integer, and an
+   **empty** message. Minimal varints (RFC 9000 §16): for code 4 the bytes are
+   `00 07 68 43 04 00 00 00 04`.
+2. FIN on the CONNECT stream.
+3. MH waits for the peer to react (its FIN, reset, or connection close), then the
+   transport closes QUIC with `H3_NO_ERROR` (0x100) and an empty reason. The capsule
+   WRITE (which waits on the peer's flow-control credit) and this wait share ONE
+   bound, 1 s (`CLOSE_SESSION_LINGER`); past it MH closes QUIC with `H3_NO_ERROR`
+   itself. Never a QUIC close carrying the code.
+
+A browser reads that as `WebTransport.closed` RESOLVING with
+`WebTransportCloseInfo.closeCode`.
+
+**No code means transport loss.** Every other end — crash, QUIC idle timeout, a
+client close, a stream failure, and server shutdown until MH-3 — carries no capsule
+and no CONNECT FIN: MH closes QUIC explicitly (`H3_NO_ERROR`) before dropping the
+connection, because a dropped connection can FIN the CONNECT stream, which a browser
+would read as a clean close with code 0 (a contract fault). Expected browser reading
+of a capsule-less QUIC close: `closed` rejects (loss); story 4 task C1 verifies it in
+a browser.
+
+**Security**: a code other than `DECLINED` is sent only after the credential fully
+validated; every credential failure and pre-validation exit is the one generic
+`DECLINED`; every code concerns only the caller's own validated meeting; no reason
+strings.
+
 ### Connection Loss Handling
 
 ```

@@ -91,6 +91,7 @@ use env_tests::fixtures::metrics::{
     poll_until_any_instance_above, poll_until_pinned_instance, reason_promql, settled_baseline,
     PrometheusClient, PINNED_METRIC_BOUND,
 };
+use env_tests::fixtures::mh_close::expect_session_close;
 use env_tests::fixtures::mh_grpc::{self, authed, probe_registration, ReleaseOnDrop};
 use env_tests::fixtures::participant::{
     self, filled_senders, meeting_of, open_sessions, slots_of, two_offered_handlers, Invited,
@@ -103,6 +104,7 @@ use env_tests::fixtures::video::{
 };
 use env_tests::fixtures::AuthClient;
 use proto_gen::dark_tower::internal::v1::{EndMeetingRequest, ReleaseCause};
+use proto_gen::dark_tower::signaling::v1::MhCloseCode;
 use proto_gen::dark_tower::signaling::v1::{
     client_message, server_message, ClientMessage, MediaKind, MuteRequest, ParticipantMuteUpdate,
     SendDirective, SendStream, ServerMuteRequest, SlotState, StreamAssignment, StreamAssignments,
@@ -615,32 +617,29 @@ async fn test_meeting_end_releases_every_handler_even_with_a_straggler() {
     let straggler = ps.pop().expect("S");
     drop(straggler);
 
-    // (a) MH closes the straggler's connection on EACH handler. With the
-    // keep-alive, the only way these end inside the bound is the PEER closing
-    // them; MH closes a released meeting's connections by dropping them, with
-    // no reason string, so the close is classified by KIND, never by text.
+    // (a) MH closes the straggler's connection on EACH handler — with the
+    // HANDLER_RELEASED session close (ADR-0039 §7): one CLOSE_WEBTRANSPORT_SESSION
+    // capsule, empty message, observed on the capsule itself (a QUIC close
+    // carrying the number would be transport loss to a browser). With the
+    // keep-alive, the only way these end inside the bound is MH closing them.
     let mut closed = HashMap::new();
     for (name, session) in [("x", &s_x), ("y", &s_y)] {
+        expect_session_close(
+            session.connection(),
+            MhCloseCode::HandlerReleased,
+            CLOSE_BOUND,
+            &format!(
+                "TEARDOWN (a): the straggler on handler {name} (if it timed out, check \
+                 mc_media_end_meeting_total{{outcome}} and mc_media_push_quiesce_total on MC and \
+                 mh_media_meeting_teardowns_total{{outcome}} on the MHs)"
+            ),
+        )
+        .await;
         let why = tokio::time::timeout(CLOSE_BOUND, session.connection().closed())
             .await
             .unwrap_or_else(|_| {
-                panic!(
-                    "TEARDOWN (a): MH did not close the straggler's connection on handler {name} \
-                     within {CLOSE_BOUND:?} of the last participant leaving MC. Check \
-                     mc_media_end_meeting_total{{outcome}} and mc_media_push_quiesce_total on MC \
-                     and mh_media_meeting_teardowns_total{{outcome}} on the MHs"
-                )
+                panic!("TEARDOWN (a): QUIC on {name} did not end after the capsule")
             });
-        assert!(
-            matches!(
-                why,
-                wtransport::error::ConnectionError::ApplicationClosed(_)
-                    | wtransport::error::ConnectionError::ConnectionClosed(_)
-            ),
-            "TEARDOWN (a): the straggler's connection on {name} ended by {why:?}, not by the PEER \
-             closing it — with a {STRAGGLER_KEEP_ALIVE:?} keep-alive an idle timeout cannot be \
-             the teardown"
-        );
         closed.insert(name, why);
     }
 
