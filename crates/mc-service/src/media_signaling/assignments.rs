@@ -100,9 +100,11 @@ pub fn slot_state_label(state: SlotState) -> &'static str {
 ///
 /// # Errors
 ///
-/// [`DirectiveOutcome::HandlerUrlUnresolved`] if an edge's handler has no url
-/// in `handlers`. Unreachable by construction (one frozen handler set feeds
-/// both), and it fails CLOSED: the caller emits nothing for this subscriber.
+/// [`DirectiveOutcome::HandlerUrlUnresolved`] if an edge's handler is not an
+/// ACTIVE member of `handlers`. Unreachable by construction (edges are routed
+/// over Active members only, from the same set), and it fails CLOSED: the
+/// caller emits nothing for this subscriber — never an empty url or a ref the
+/// client's set does not hold.
 pub fn build_stream_assignments(
     subscriber: SenderId,
     demand: &SlotDemand,
@@ -124,11 +126,11 @@ pub fn build_stream_assignments(
                 .cloned()
                 .flatten()
         });
-        let (sender_id, media_handler_url, slot_state) = match (ordinal, edge) {
+        let (sender_id, target, slot_state) = match (ordinal, edge) {
             // Truncated by the per-kind cap: permanent for this declaration.
-            (None, _) => (None, String::new(), SlotState::Unavailable),
+            (None, _) => (None, None, SlotState::Unavailable),
             // Kept, but nobody eligible fills it.
-            (Some(_), None) => (None, String::new(), SlotState::FewerSourcesThanSlots),
+            (Some(_), None) => (None, None, SlotState::FewerSourcesThanSlots),
             (Some(_), Some(edge)) => {
                 let named = Some(u32::from(edge.source.get().get()));
                 let publishes_video = table
@@ -136,30 +138,34 @@ pub fn build_stream_assignments(
                     .is_some_and(|p| p.publishes(MediaKindLabel::Video));
                 if kind == MediaKindLabel::Video && !publishes_video {
                     // No-video precedence: no edge, so no url.
-                    (named, String::new(), SlotState::AvatarNoVideo)
+                    (named, None, SlotState::AvatarNoVideo)
                 } else {
-                    let url = handlers
-                        .url_of(&edge.handler)
-                        .ok_or(DirectiveOutcome::HandlerUrlUnresolved)?
-                        .to_string();
+                    // The ONE client-view lookup (Active members only): url
+                    // and ref from the same entry.
+                    let on = handlers
+                        .client_handler(&edge.handler)
+                        .ok_or(DirectiveOutcome::HandlerUrlUnresolved)?;
+                    let target = Some((on.url.to_string(), on.handler_ref.get()));
                     let flags = mute.flags(edge.source);
                     let (server, client) =
                         (flags.server.is_muted(kind), flags.client.is_muted(kind));
                     if server {
-                        (named, url, SlotState::AvatarServerMuted)
+                        (named, target, SlotState::AvatarServerMuted)
                     } else if client {
-                        (named, url, SlotState::AvatarClientMuted)
+                        (named, target, SlotState::AvatarClientMuted)
                     } else if kind == MediaKindLabel::Video {
                         // R-5: MC never names a live video source; the
                         // verified key-id sender does.
-                        (None, url, SlotState::Active)
+                        (None, target, SlotState::Active)
                     } else {
-                        (named, url, SlotState::Active)
+                        (named, target, SlotState::Active)
                     }
                 }
             }
         };
 
+        // No edge: empty url and ref 0. Otherwise both from the one lookup.
+        let (media_handler_url, handler_ref) = target.unwrap_or_default();
         slot_states.push((kind, slot_state));
         assignments.push(StreamAssignment {
             slot_id: u32::from(slot.slot_id.get()),
@@ -169,8 +175,9 @@ pub fn build_stream_assignments(
             slot_state: slot_state as i32,
             // §7 switching is not in this story.
             switch_command_id: None,
-            // Story 4 additive contract: MC populates the ref in MC-A.
-            handler_ref: 0,
+            // 0 = no handler (a slot with no edge); otherwise a member of the
+            // client's current set (ADR-0039 §4).
+            handler_ref,
         });
     }
 
@@ -192,7 +199,6 @@ mod tests {
     use super::*;
     use crate::media_kind::{ClientMutedKinds, PublishSet};
     use crate::media_routing::SourceMute;
-    use crate::media_routing::{HandlerEndpoint, HandlerId};
     use crate::media_signaling::ReceiveCapabilityDeclaration;
     use proto_gen::dark_tower::signaling::v1::{MediaKind, ReceiveCapability, ReceiveSlot};
     use std::collections::HashMap;
@@ -206,12 +212,7 @@ mod tests {
     }
 
     fn handler_set(handlers: &[&str]) -> MeetingHandlers {
-        MeetingHandlers::new(handlers.iter().map(|h| HandlerEndpoint {
-            id: HandlerId::new(*h),
-            webtransport_url: format!("https://{h}.example:4434"),
-            grpc_endpoint: format!("http://{h}.example:50053"),
-        }))
-        .unwrap()
+        MeetingHandlers::active_test_ids(handlers)
     }
 
     fn demand(slots: &[(u32, MediaKind)], caps: [u8; 2]) -> SlotDemand {

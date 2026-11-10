@@ -13,6 +13,13 @@
 //! | `JoinResponse.kek_generation` | `media_admission/kek.rs` | KEK rotation — leave-debounced, or an immediate epoch reset on `sender_id` exhaustion |
 //! | **`policy_generation`** | this module | the forwarding assignment's output actually changing |
 //!
+//! Two more per-meeting counters live beside these, in `placement.rs`, and are
+//! not generations of anything here: `handler_set_version` (the membership
+//! epoch of the meeting's handler set — advances on add / mark-active / remove
+//! only, never on a policy change, a fencing write or a token refresh) and
+//! `handler_ref` (per handler incarnation, never reused). Neither may be
+//! sourced from `policy_generation` or the Redis fencing counter.
+//!
 //! The one that matters is the first. `internal.proto` names the field
 //! `policy_generation` rather than `generation` specifically to stop an
 //! implementer sourcing it from the fencing counter — a fencing counter

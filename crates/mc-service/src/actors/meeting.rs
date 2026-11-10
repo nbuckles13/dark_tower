@@ -23,6 +23,7 @@ use crate::media_admission::{
 };
 
 use super::client_mute_fanout::ClientMuteFanout;
+use super::join_park::{JoinPark, ParkedJoin, ReleaseReason};
 use super::meeting_media::{Affected, JoinMedia, MeetingMedia, MutedSourceCensus, RosterEntry};
 use super::messages::{
     DisconnectCause, JoinResult, KekPush, LeaveReason, MeetingEndCause, MeetingLifecycleEvent,
@@ -37,8 +38,9 @@ use crate::media_kind::{
     ClientKindState, ClientMediaStates, KindDecision, MediaStates, MuteChange, NotPublished,
     PublishSet, PublishedMuteChange, RequestedKinds, ServerMuteAttribution,
 };
+use crate::media_routing::pusher::HandlerRegistration;
 use crate::media_routing::SourceMute;
-use crate::media_routing::{ConnectionKey, Unapplied};
+use crate::media_routing::{ConnectionKey, MeetingHandlers, Unapplied};
 use crate::media_signaling::{MediaKindLabel, SlotDemand, SourceMuteView};
 
 use common::secret::SecretBox;
@@ -247,7 +249,7 @@ impl MeetingActorHandle {
     /// rejects — **never a licence to invent, default to, or reuse an id**.
     /// Alongside it, the reason connectivity was NOT recorded, if it was not:
     /// connectivity is recorded only for a `Found` participant on a handler of
-    /// the meeting's frozen set (see [`MeetingMessage::MediaConnected`]).
+    /// the meeting's handler set (see [`MeetingMessage::MediaConnected`]).
     ///
     /// # Errors
     ///
@@ -412,7 +414,7 @@ impl MeetingActorHandle {
     }
 
     /// Close the MC-side meeting. Runs the MH-side release (`EndMeeting` on
-    /// every handler of the frozen set, after its pushes drain) as the actor
+    /// every handler of the meeting's handler set, after its pushes drain) as the actor
     /// exits. NOT the MH `EndMeeting` RPC itself.
     pub async fn close_meeting(&self, reason: String) -> Result<(), McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -596,6 +598,10 @@ pub struct MeetingActor {
     /// views (ADR-0036 §5/§6/§8/§9). Its push workers are HANDED OFF to the
     /// teardown on a clean exit and aborted with it on an unclean one.
     media: MeetingMedia,
+    /// Register before token at the first join (ADR-0039 §3): replies parked
+    /// until the initial handlers' verdict or the park deadline. See
+    /// `actors/join_park.rs`.
+    join_park: JoinPark,
     /// Set when the meeting has ended and the actor should leave its loop
     /// through the clean exit path (which releases the handlers).
     end_cause: Option<MeetingEndCause>,
@@ -654,6 +660,8 @@ impl MeetingActor {
     ///   SecretBox to ensure secure memory handling (zeroization on drop, redacted Debug).
     /// * `kek_lifecycle` - W, the overdue threshold and the fleet-gauge registry
     ///   (ADR-0036 §4 Rotation). This meeting reports its rotation state into it.
+    /// * `handlers` - The meeting's handler set, built from GC's hand-off
+    ///   (ADR-0039 §3). Installed here, at creation, and never re-read.
     /// # Errors
     ///
     /// [`McError::Internal`] if the system CSPRNG cannot produce the meeting
@@ -667,6 +675,7 @@ impl MeetingActor {
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
         kek_lifecycle: Arc<KekLifecycle>,
+        handlers: MeetingHandlers,
     ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
         Self::spawn_inner(
             meeting_id,
@@ -675,6 +684,7 @@ impl MeetingActor {
             controller_metrics,
             master_secret,
             kek_lifecycle,
+            handlers,
             AdmissionEpoch::generate,
             |_| {},
         )
@@ -686,6 +696,10 @@ impl MeetingActor {
     /// # Errors
     ///
     /// As [`Self::spawn`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "spawn's tuple plus the controller wiring; one body keeps the managed path identical to spawn"
+    )]
     pub(crate) fn spawn_managed(
         meeting_id: String,
         cancel_token: CancellationToken,
@@ -693,6 +707,7 @@ impl MeetingActor {
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
         kek_lifecycle: Arc<KekLifecycle>,
+        handlers: MeetingHandlers,
         wiring: MeetingWiring,
     ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
         Self::spawn_inner(
@@ -702,6 +717,7 @@ impl MeetingActor {
             controller_metrics,
             master_secret,
             kek_lifecycle,
+            handlers,
             AdmissionEpoch::generate,
             move |actor| actor.wiring = Some(wiring),
         )
@@ -725,6 +741,7 @@ impl MeetingActor {
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
         kek_lifecycle: Arc<KekLifecycle>,
+        handlers: MeetingHandlers,
         build_admission: impl FnOnce(
             &ring::rand::SystemRandom,
         ) -> Result<
@@ -765,7 +782,8 @@ impl MeetingActor {
             "Meeting key material provisioned"
         );
 
-        let media = MeetingMedia::new(meeting_id.clone());
+        let join_park = JoinPark::new(handlers.ids().cloned());
+        let media = MeetingMedia::new(meeting_id.clone(), handlers);
         let kek_debounce = KekRotationDebounce::new(kek_lifecycle.window());
 
         let mut actor = Self {
@@ -793,6 +811,7 @@ impl MeetingActor {
             kek_debounce_manual: false,
             client_mute_fanout: ClientMuteFanout::new(Instant::now()),
             media,
+            join_park,
             end_cause: None,
             wiring: None,
         };
@@ -822,6 +841,10 @@ impl MeetingActor {
     ///
     /// As [`MeetingActor::spawn`].
     #[cfg(feature = "test-seams")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "spawn's tuple plus the seams; one body keeps the seam path identical to production"
+    )]
     pub fn spawn_with_seams(
         meeting_id: String,
         cancel_token: CancellationToken,
@@ -829,6 +852,7 @@ impl MeetingActor {
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
         kek_lifecycle: Arc<KekLifecycle>,
+        handlers: MeetingHandlers,
         seams: &super::meeting_media::MeetingSeams,
     ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
         Self::spawn_with_seams_wired(
@@ -838,6 +862,7 @@ impl MeetingActor {
             controller_metrics,
             master_secret,
             kek_lifecycle,
+            handlers,
             seams,
             None,
         )
@@ -857,6 +882,7 @@ impl MeetingActor {
         controller_metrics: Arc<ControllerMetrics>,
         master_secret: SecretBox<Vec<u8>>,
         kek_lifecycle: Arc<KekLifecycle>,
+        handlers: MeetingHandlers,
         seams: &super::meeting_media::MeetingSeams,
         wiring: Option<MeetingWiring>,
     ) -> Result<(MeetingActorHandle, JoinHandle<()>), McError> {
@@ -876,6 +902,7 @@ impl MeetingActor {
             controller_metrics,
             master_secret,
             kek_lifecycle,
+            handlers,
             |rng| AdmissionEpoch::with_seams(rng, sender_ids, reset_cursor),
             |actor| {
                 actor.media.apply_seams(seams);
@@ -911,6 +938,7 @@ impl MeetingActor {
             let settle_wake = self.media.next_settle_wake();
             let kek_wake = self.kek_wake();
             let fanout_wake = self.client_mute_fanout.next_wake(Instant::now());
+            let park_deadline = self.join_park.deadline();
 
             tokio::select! {
                 // Handle cancellation
@@ -973,6 +1001,25 @@ impl MeetingActor {
                     self.flush_client_mute().await;
                 }
 
+                // A push worker reported a handler's registration verdict
+                // (ADR-0039 §3). A channel the actor drains in its own turn:
+                // the actor never awaits MH.
+                Some(report) = self.media.registrations().recv() => {
+                    self.handle_registration(report).await;
+                }
+
+                // The first-join park deadline. Armed only while a reply is
+                // parked, so it never fires on a stale instant.
+                () = async {
+                    match park_deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.join_park.expire();
+                    self.release_parked_joins(ReleaseReason::Deadline);
+                }
+
                 // Deferred slot-view work from an earlier turn (the per-turn
                 // flush bound). Interleaves with mailbox traffic rather than
                 // starving it; never drops a view.
@@ -1001,6 +1048,11 @@ impl MeetingActor {
                 }
             }
         }
+
+        // No reply sender outlives the actor: every parked join is answered
+        // `Draining` (counted by the connection as a join failure, the same
+        // outcome as a join that reaches a draining meeting).
+        self.answer_parked_joins_draining();
 
         // A meeting that ended by emptying or closing has not yet drained its
         // connection actors (the shutdown path above already did).
@@ -1063,7 +1115,25 @@ impl MeetingActor {
                         media,
                     )
                     .await;
-                let _ = respond_to.send(result);
+                match result {
+                    // Register before token (ADR-0039 §3): while the meeting's
+                    // initial handlers have no verdict, an admitted join's
+                    // reply is PARKED and this turn returns; see `join_park`.
+                    Ok(result) if self.join_park.is_pending() => {
+                        self.join_park
+                            .park(ParkedJoin { respond_to, result }, Instant::now());
+                    }
+                    result => {
+                        if respond_to.send(result).is_err() {
+                            debug!(
+                                target: "mc.actor.meeting",
+                                meeting_id = %self.meeting_id,
+                                reason = "connection_gone",
+                                "Join reply not delivered: the joining connection stopped waiting"
+                            );
+                        }
+                    }
+                }
             }
 
             MeetingMessage::ConnectionDisconnected {
@@ -1318,23 +1388,20 @@ impl MeetingActor {
 
         // Media admission, BEFORE any other admission state is built, so a
         // failure leaves nothing to unwind (the allocated sender id is simply
-        // never used). The first join freezes the meeting's handler set. The
-        // joiner is bound to no handler: it is offered the whole set, and
+        // never used). The meeting's handler set is its own, installed at
+        // creation; the join brings only the server-level deps. The joiner is
+        // bound to no handler: it is offered the client-visible set, and
         // becomes routable only when the handlers report its connections
         // (ADR-0036 §9).
+        self.media.install(&media);
         let declared = media.declared;
         let publishes = declared.publish_set();
-        let demand = media.demand.clone();
-        self.media.install(media);
+        let demand = media.demand;
         self.media.admit(&participant_id, sender_id, publishes)?;
         // The join carries the initial declaration (story 3 R-2): registered
         // in THIS turn, before the reconcile below, so the joiner's first
         // directive and assignments are queued behind its JoinResponse.
         self.media.declare(&participant_id, demand)?;
-        let media_handlers =
-            self.media.frozen_handlers().cloned().ok_or_else(|| {
-                McError::MhAssignmentMissing("no handler set installed".to_string())
-            })?;
 
         // `high_watermark_crossed` is the allocator's own one-shot latch (true on
         // exactly the crossing allocation and never again per allocator), so
@@ -1493,7 +1560,8 @@ impl MeetingActor {
             kek_generation: self.admission.keys().generation(),
             kek_rotation_debounce_seconds: self.kek_lifecycle.window_seconds(),
             participant_handle: conn_handle_for_result,
-            media_handlers,
+            // Active handlers only. A parked reply is refreshed at release.
+            handler_set: self.media.client_snapshot(),
         })
     }
 
@@ -2375,6 +2443,149 @@ impl MeetingActor {
         }
     }
 
+    /// A push worker's registration verdict (ADR-0039 §3, register before
+    /// token).
+    ///
+    /// Order, and why: (1) mark the handler Active; (2) if the client-visible
+    /// set changed, send the new snapshot to every connected participant that
+    /// is not parked (a parked joiner gets it in its own JoinResponse); (3)
+    /// release the parked joins if this was the last initial verdict; (4) only
+    /// then re-route and flush — so on every participant's ordered queue the
+    /// set precedes any directive or assignment naming the new ref.
+    async fn handle_registration(&mut self, report: HandlerRegistration) {
+        let active_changed = self.media.on_registration(&report);
+        if active_changed {
+            self.broadcast_handler_set().await;
+        }
+        if self.join_park.record_verdict(&report.handler_id) {
+            self.release_parked_joins(ReleaseReason::Verdicts);
+        }
+        if active_changed && self.media.reroute_all(Instant::now()) {
+            self.reconcile_media(Affected::All).await;
+            self.flush_views().await;
+        }
+    }
+
+    /// Send the client-facing snapshot to every connected, non-parked
+    /// participant: one full snapshot each, never a diff.
+    async fn broadcast_handler_set(&self) {
+        let set = self.media.client_snapshot();
+        let parked: std::collections::HashSet<&str> =
+            self.join_park.parked_participants().collect();
+        for participant in self.participants.values() {
+            if parked.contains(participant.participant_id.as_str()) {
+                continue;
+            }
+            let Some(connection) = &participant.connection else {
+                continue;
+            };
+            if connection.send_handler_set(set.clone()).await.is_err() {
+                // The participant actor is gone (its own exit path reports
+                // the disconnect); a dropped set on a LIVE outbound channel is
+                // counted by the participant actor.
+                debug!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    participant_id = %participant.participant_id,
+                    "Handler set not delivered: participant actor mailbox closed"
+                );
+            }
+        }
+    }
+
+    /// Release every parked join reply (see `join_park`). Each reply carries
+    /// the meeting-wide state AT RELEASE — the current KEK and generation (a
+    /// rotation during the park must never hand the joiner a key a departed
+    /// member holds; security S-9) and the current client snapshot — and keeps
+    /// only its participant-specific fields from admission. Anything queued
+    /// for the joiner meanwhile (roster deltas, KEK updates, views, sets) sits
+    /// on its outbound queue, which its connection forwards only AFTER writing
+    /// this reply, so it is redundant or newer, never older. A parked joiner no
+    /// longer on the roster is answered `Draining`, never handed the KEK.
+    fn release_parked_joins(&mut self, reason: ReleaseReason) {
+        let parked = self.join_park.take_parked();
+        if parked.is_empty() {
+            return;
+        }
+        let snapshot = self.media.client_snapshot();
+        let unacked: Vec<String> = self
+            .media
+            .handlers()
+            .registering()
+            .map(|(id, _)| id.to_string())
+            .collect();
+        if unacked.is_empty() {
+            info!(
+                target: "mc.actor.meeting",
+                meeting_id = %self.meeting_id,
+                release_reason = reason.label(),
+                parked_joins = parked.len(),
+                active_handlers = snapshot.handlers.len(),
+                "Parked joins released: every initial media handler is registered"
+            );
+        } else {
+            // The join still succeeds (ADR-0039 §3: never fails because the
+            // initial MH is dead); the unacked handlers stay Registering for
+            // the replacement path. Ids as LOG fields, never labels.
+            warn!(
+                target: "mc.actor.meeting",
+                meeting_id = %self.meeting_id,
+                release_reason = reason.label(),
+                parked_joins = parked.len(),
+                active_handlers = snapshot.handlers.len(),
+                unacked_handler_ids = %unacked.join(","),
+                "Parked joins released without every initial media handler registered; \
+                 the handler set they carry is partial or empty"
+            );
+        }
+        for ParkedJoin {
+            respond_to,
+            mut result,
+        } in parked
+        {
+            // A participant removed from the roster while parked (security
+            // SEC-1) is NOT released with the current KEK: a rotation that
+            // fired on its removal exists precisely to exclude it. Answered
+            // with the generic `Draining` refusal, carrying no key.
+            if !self.participants.contains_key(&result.participant_id) {
+                if respond_to.send(Err(McError::Draining)).is_err() {
+                    debug!(
+                        target: "mc.actor.meeting",
+                        meeting_id = %self.meeting_id,
+                        reason = "connection_gone",
+                        "Parked join refusal not delivered: the joining connection stopped waiting"
+                    );
+                }
+                continue;
+            }
+            result.meeting_kek = Arc::clone(self.admission.keys().kek());
+            result.kek_generation = self.admission.keys().generation();
+            result.handler_set = snapshot.clone();
+            if respond_to.send(Ok(result)).is_err() {
+                debug!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    reason = "connection_gone",
+                    "Parked join reply not delivered: the joining connection stopped waiting"
+                );
+            }
+        }
+    }
+
+    /// The actor is exiting: answer every parked join `Draining`.
+    fn answer_parked_joins_draining(&mut self) {
+        for ParkedJoin { respond_to, .. } in self.join_park.take_parked() {
+            if respond_to.send(Err(McError::Draining)).is_err() {
+                debug!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    reason = "connection_gone",
+                    "Parked join reply not delivered at exit: the joining connection stopped waiting"
+                );
+            }
+        }
+    }
+
     /// Settle every establishing participant whose window is due.
     async fn settle_due(&mut self) {
         if self.media.settle_due(tokio::time::Instant::now()) {
@@ -2703,7 +2914,7 @@ impl MeetingActor {
     /// **Concurrency, in numbers, for the correlated case** (every meeting
     /// ending at once against an unreachable handler — in practice a graceful
     /// shutdown). One teardown holds at most one outbound MH connection per
-    /// handler of its frozen set (≤ 2, GC's selection), opened AFTER its push
+    /// handler of its handler set (≤ 2, GC's selection), opened AFTER its push
     /// workers — one per handler, each able to be mid-connect — have drained,
     /// or, on the quiesce-timeout path, after one further bound during which a
     /// still-running worker may overlap its release. So the peak is the
@@ -3014,6 +3225,7 @@ mod tests {
             controller_metrics,
             master_secret,
             crate::media_admission::fixtures::kek_lifecycle(),
+            crate::actors::meeting_media::test_handlers(),
         )
         .expect("system CSPRNG must be available in tests")
     }

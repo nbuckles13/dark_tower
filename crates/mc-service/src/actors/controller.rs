@@ -166,14 +166,21 @@ impl MeetingControllerActorHandle {
         Arc::clone(&self.teardowns)
     }
 
-    /// Create a new meeting.
+    /// Create a new meeting with its handler set — GC's hand-off, built by
+    /// the caller from the assignment it received (ADR-0039 §3). The set is
+    /// installed in the actor at creation and never re-read.
     ///
     /// Returns `Ok(())` if the meeting was created, or an error if creation failed.
-    pub async fn create_meeting(&self, meeting_id: String) -> Result<(), McError> {
+    pub async fn create_meeting(
+        &self,
+        meeting_id: String,
+        handlers: crate::media_routing::MeetingHandlers,
+    ) -> Result<(), McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
             .send(ControllerMessage::CreateMeeting {
                 meeting_id,
+                handlers,
                 respond_to: tx,
             })
             .await
@@ -195,12 +202,14 @@ impl MeetingControllerActorHandle {
     pub async fn create_meeting_with_seams(
         &self,
         meeting_id: String,
+        handlers: crate::media_routing::MeetingHandlers,
         seams: super::meeting_media::MeetingSeams,
     ) -> Result<(), McError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
             .send(ControllerMessage::CreateMeetingWithSeams {
                 meeting_id,
+                handlers,
                 seams,
                 respond_to: tx,
             })
@@ -444,9 +453,13 @@ struct TeardownFence {
 
 /// A create parked behind a teardown fence.
 enum ParkedCreate {
-    Plain(tokio::sync::oneshot::Sender<Result<(), McError>>),
+    Plain(
+        crate::media_routing::MeetingHandlers,
+        tokio::sync::oneshot::Sender<Result<(), McError>>,
+    ),
     #[cfg(feature = "test-seams")]
     WithSeams(
+        crate::media_routing::MeetingHandlers,
         super::meeting_media::MeetingSeams,
         tokio::sync::oneshot::Sender<Result<(), McError>>,
     ),
@@ -455,11 +468,11 @@ enum ParkedCreate {
 impl ParkedCreate {
     fn respond(self, result: Result<(), McError>) {
         match self {
-            Self::Plain(respond_to) => {
+            Self::Plain(_, respond_to) => {
                 let _ = respond_to.send(result);
             }
             #[cfg(feature = "test-seams")]
-            Self::WithSeams(_, respond_to) => {
+            Self::WithSeams(_, _, respond_to) => {
                 let _ = respond_to.send(result);
             }
         }
@@ -610,13 +623,14 @@ impl MeetingControllerActor {
         match message {
             ControllerMessage::CreateMeeting {
                 meeting_id,
+                handlers,
                 respond_to,
             } => {
                 // Park, never await: see `TeardownFence`.
                 if self.tearing_down.contains_key(&meeting_id) {
-                    self.park_create(&meeting_id, ParkedCreate::Plain(respond_to));
+                    self.park_create(&meeting_id, ParkedCreate::Plain(handlers, respond_to));
                 } else {
-                    let result = self.create_meeting(meeting_id).await;
+                    let result = self.create_meeting(meeting_id, handlers).await;
                     let _ = respond_to.send(result);
                 }
             }
@@ -624,13 +638,19 @@ impl MeetingControllerActor {
             #[cfg(feature = "test-seams")]
             ControllerMessage::CreateMeetingWithSeams {
                 meeting_id,
+                handlers,
                 seams,
                 respond_to,
             } => {
                 if self.tearing_down.contains_key(&meeting_id) {
-                    self.park_create(&meeting_id, ParkedCreate::WithSeams(seams, respond_to));
+                    self.park_create(
+                        &meeting_id,
+                        ParkedCreate::WithSeams(handlers, seams, respond_to),
+                    );
                 } else {
-                    let result = self.create_meeting_with_seams(meeting_id, seams).await;
+                    let result = self
+                        .create_meeting_with_seams(meeting_id, handlers, seams)
+                        .await;
                     let _ = respond_to.send(result);
                 }
             }
@@ -717,8 +737,12 @@ impl MeetingControllerActor {
     }
 
     /// Create a new meeting actor.
-    async fn create_meeting(&mut self, meeting_id: String) -> Result<(), McError> {
-        self.create_meeting_inner(meeting_id, None).await
+    async fn create_meeting(
+        &mut self,
+        meeting_id: String,
+        handlers: crate::media_routing::MeetingHandlers,
+    ) -> Result<(), McError> {
+        self.create_meeting_inner(meeting_id, handlers, None).await
     }
 
     /// Test-only entry point threading construction overrides.
@@ -726,9 +750,11 @@ impl MeetingControllerActor {
     async fn create_meeting_with_seams(
         &mut self,
         meeting_id: String,
+        handlers: crate::media_routing::MeetingHandlers,
         seams: super::meeting_media::MeetingSeams,
     ) -> Result<(), McError> {
-        self.create_meeting_inner(meeting_id, Some(seams)).await
+        self.create_meeting_inner(meeting_id, handlers, Some(seams))
+            .await
     }
 
     /// Shared body. `seams` is `None` in production; the test seam supplies
@@ -740,6 +766,7 @@ impl MeetingControllerActor {
     async fn create_meeting_inner(
         &mut self,
         meeting_id: String,
+        handlers: crate::media_routing::MeetingHandlers,
         #[cfg(feature = "test-seams")] seams: Option<super::meeting_media::MeetingSeams>,
         #[cfg(not(feature = "test-seams"))] seams: Option<std::convert::Infallible>,
     ) -> Result<(), McError> {
@@ -783,6 +810,7 @@ impl MeetingControllerActor {
                 Arc::clone(&self.controller_metrics),
                 meeting_secret,
                 Arc::clone(&self.kek_lifecycle),
+                handlers,
                 &seams,
                 Some(wiring),
             )?,
@@ -793,6 +821,7 @@ impl MeetingControllerActor {
                 Arc::clone(&self.controller_metrics),
                 meeting_secret,
                 Arc::clone(&self.kek_lifecycle),
+                handlers,
                 wiring,
             )?,
         };
@@ -806,6 +835,7 @@ impl MeetingControllerActor {
             Arc::clone(&self.controller_metrics),
             meeting_secret,
             Arc::clone(&self.kek_lifecycle),
+            handlers,
             wiring,
         )?;
 
@@ -1247,14 +1277,14 @@ impl MeetingControllerActor {
         }
         for create in fence.waiting {
             match create {
-                ParkedCreate::Plain(respond_to) => {
-                    let result = self.create_meeting(meeting_id.to_string()).await;
+                ParkedCreate::Plain(handlers, respond_to) => {
+                    let result = self.create_meeting(meeting_id.to_string(), handlers).await;
                     let _ = respond_to.send(result);
                 }
                 #[cfg(feature = "test-seams")]
-                ParkedCreate::WithSeams(seams, respond_to) => {
+                ParkedCreate::WithSeams(handlers, seams, respond_to) => {
                     let result = self
-                        .create_meeting_with_seams(meeting_id.to_string(), seams)
+                        .create_meeting_with_seams(meeting_id.to_string(), handlers, seams)
                         .await;
                     let _ = respond_to.send(result);
                 }
@@ -1349,7 +1379,10 @@ mod tests {
         );
 
         actor
-            .create_meeting("meeting-reaped".to_string())
+            .create_meeting(
+                "meeting-reaped".to_string(),
+                crate::actors::meeting_media::test_handlers(),
+            )
             .await
             .expect("create");
 
@@ -1424,7 +1457,12 @@ mod tests {
         );
 
         // Create a meeting
-        let result = handle.create_meeting("meeting-123".to_string()).await;
+        let result = handle
+            .create_meeting(
+                "meeting-123".to_string(),
+                crate::actors::meeting_media::test_handlers(),
+            )
+            .await;
         assert!(result.is_ok());
 
         // Get the meeting
@@ -1451,11 +1489,21 @@ mod tests {
         );
 
         // Create first meeting
-        let result = handle.create_meeting("meeting-456".to_string()).await;
+        let result = handle
+            .create_meeting(
+                "meeting-456".to_string(),
+                crate::actors::meeting_media::test_handlers(),
+            )
+            .await;
         assert!(result.is_ok());
 
         // Try to create duplicate
-        let result = handle.create_meeting("meeting-456".to_string()).await;
+        let result = handle
+            .create_meeting(
+                "meeting-456".to_string(),
+                crate::actors::meeting_media::test_handlers(),
+            )
+            .await;
         assert!(matches!(result, Err(McError::Conflict(_))));
 
         // Cleanup
@@ -1496,7 +1544,12 @@ mod tests {
         );
 
         // Create a meeting
-        let result = handle.create_meeting("meeting-789".to_string()).await;
+        let result = handle
+            .create_meeting(
+                "meeting-789".to_string(),
+                crate::actors::meeting_media::test_handlers(),
+            )
+            .await;
         assert!(result.is_ok());
 
         // Remove it
@@ -1532,8 +1585,18 @@ mod tests {
         assert!(!status.is_draining);
 
         // Create some meetings
-        let _ = handle.create_meeting("m1".to_string()).await;
-        let _ = handle.create_meeting("m2".to_string()).await;
+        let _ = handle
+            .create_meeting(
+                "m1".to_string(),
+                crate::actors::meeting_media::test_handlers(),
+            )
+            .await;
+        let _ = handle
+            .create_meeting(
+                "m2".to_string(),
+                crate::actors::meeting_media::test_handlers(),
+            )
+            .await;
 
         let status = handle.get_status().await.unwrap();
         assert_eq!(status.meeting_count, 2);
@@ -1556,7 +1619,12 @@ mod tests {
         );
 
         // Create a meeting
-        let _ = handle.create_meeting("meeting-shutdown".to_string()).await;
+        let _ = handle
+            .create_meeting(
+                "meeting-shutdown".to_string(),
+                crate::actors::meeting_media::test_handlers(),
+            )
+            .await;
 
         // Initiate shutdown - this triggers cancellation
         let result = handle.shutdown(Duration::from_secs(30)).await;

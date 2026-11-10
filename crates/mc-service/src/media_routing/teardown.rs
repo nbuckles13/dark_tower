@@ -362,7 +362,7 @@ pub struct EndMeetingCall {
 
 /// The pure teardown decision: which calls, to whom, carrying what.
 ///
-/// - EVERY handler in the meeting's frozen set, not only those this MC pushed
+/// - EVERY handler in the meeting's handler set, not only those this MC pushed
 ///   to — a handler that never received a registration acknowledges the
 ///   unknown meeting as a no-op, and skipping it would rest on MC's bookkeeping
 ///   of which pushes landed, which is exactly the state a teardown cannot trust.
@@ -606,7 +606,7 @@ pub struct MediaTeardown {
     pub meeting_id: String,
     /// This MC's registering `mc_id`.
     pub mc_id: String,
-    /// The meeting's frozen handler set.
+    /// The meeting's handler set (Registering and Active members).
     pub handlers: MeetingHandlers,
     /// The push workers' token (moved out of the actor, never cancelled by it).
     pub pushers_cancel: CancellationToken,
@@ -699,16 +699,9 @@ pub async fn run(teardown: MediaTeardown) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::media_routing::placement::HandlerEndpoint;
-    use crate::media_routing::HandlerId;
 
     fn handlers(ids: &[&str]) -> MeetingHandlers {
-        MeetingHandlers::new(ids.iter().map(|id| HandlerEndpoint {
-            id: HandlerId::new(*id),
-            webtransport_url: format!("https://{id}.example:4434"),
-            grpc_endpoint: format!("http://{id}.example:50053"),
-        }))
-        .unwrap()
+        MeetingHandlers::active_test_ids(ids)
     }
 
     #[tokio::test]
@@ -738,7 +731,7 @@ mod tests {
                     cause: ReleaseCause::MeetingEnded,
                 },
             ],
-            "EVERY handler in the frozen set, none extra, none missing, each carrying this \
+            "EVERY handler in the meeting's handler set, none extra, none missing, each carrying this \
              MC's own id, the meeting being released, and MEETING_ENDED (never UNSPECIFIED, \
              which MH rejects)"
         );

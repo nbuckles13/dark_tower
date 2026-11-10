@@ -442,7 +442,8 @@ message MediaServerInfo {
 // outside the latest set. Every `handler_ref` elsewhere
 // (`SendTarget.handler_ref`, `StreamAssignment.handler_ref`) MUST be a member
 // of the client's CURRENT set; the client counts and ignores a non-member ref
-// (0 is never a member).
+// (0 is never a member; the one non-fault 0 is a no-edge `StreamAssignment`,
+// rule at that field).
 //
 // The client connects to EVERY handler in the set it can reach — the transport
 // is active/active. What it actually reaches becomes its connected set (as the
@@ -1467,8 +1468,14 @@ message StreamAssignment {
   optional uint64 switch_command_id = 11;
 
   // The handler owning this edge, as a ref into the client's current
-  // `MediaHandlerSet` (membership rule there: a non-member, including 0, is
-  // counted and ignored). Per slot, as for `media_handler_url` above.
+  // `MediaHandlerSet`. Per slot, as for `media_handler_url` above.
+  //
+  // 0 MEANS "NO EDGE": MC sends 0 exactly on the states that carry no edge —
+  // `SLOT_STATE_UNAVAILABLE`, `SLOT_STATE_FEWER_SOURCES_THAN_SLOTS`,
+  // `SLOT_STATE_AVATAR_NO_VIDEO` (the slots whose `media_handler_url` is
+  // empty) — and there it is not a membership fault. On every other state a
+  // ref that is not a member, including 0, is counted and ignored (rule at
+  // `MediaHandlerSet`).
   //
   // OBSERVABILITY (ADR-0039 §8): per-incarnation identifier; never a metric
   // label, span attribute, or per-frame log field.

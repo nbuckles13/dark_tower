@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
 use mc_service::grpc::MhRegistrationClient;
-use mc_service::redis::MhAssignmentStore;
 use mc_test_utils::jwt_test::make_meeting_claims;
 use opentelemetry::trace::SpanId;
 use prost::Message;
@@ -46,7 +45,6 @@ async fn start_stack(label: &str) -> (TestStackHandles, AcceptLoopRig) {
     let rig = AcceptLoopRig::start_with(
         Arc::clone(&stack.controller_handle),
         Arc::clone(&stack.jwt_validator),
-        Arc::clone(&stack.mh_store) as Arc<dyn MhAssignmentStore>,
         Arc::clone(&stack.mh_reg_client) as Arc<dyn MhRegistrationClient>,
         "mc-test".to_string(),
         "http://mc-test:50052".to_string(),

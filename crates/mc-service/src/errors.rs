@@ -96,10 +96,6 @@ pub enum McError {
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
 
-    /// MH assignment data missing from Redis during join flow.
-    #[error("MH assignment missing: {0}")]
-    MhAssignmentMissing(String),
-
     /// A joiner presented an identity public key of a length that was neither
     /// 0 nor exactly 32 bytes.
     ///
@@ -230,7 +226,6 @@ impl McError {
             | McError::Internal(_)
             | McError::FencedOut(_)
             | McError::NotRegistered
-            | McError::MhAssignmentMissing(_)
             | McError::TokenAcquisition(_)
             | McError::TokenAcquisitionTimeout
             | McError::MediaPolicyDivergence { .. } => {
@@ -291,7 +286,6 @@ impl McError {
             McError::MeetingTeardownInProgress => "teardown_in_progress",
             McError::JwtValidation(_) => "jwt_validation",
             McError::PermissionDenied(_) => "permission_denied",
-            McError::MhAssignmentMissing(_) => "mh_assignment_missing",
             McError::Internal(_) => "internal",
             McError::TokenAcquisition(_) => "token_acquisition",
             McError::TokenAcquisitionTimeout => "token_acquisition_timeout",
@@ -315,7 +309,6 @@ impl McError {
             | McError::InvalidArgument(_)
             | McError::Internal(_)
             | McError::NotRegistered
-            | McError::MhAssignmentMissing(_)
             | McError::TokenAcquisition(_)
             | McError::TokenAcquisitionTimeout
             | McError::MediaPolicyDivergence { .. } => "An internal error occurred".to_string(),
@@ -385,12 +378,6 @@ mod tests {
         assert_eq!(McError::Internal("test".to_string()).error_code(), 6);
         assert_eq!(McError::FencedOut("stale".to_string()).error_code(), 6);
         assert_eq!(McError::NotRegistered.error_code(), 6);
-
-        // MH assignment missing -> 6 (INTERNAL_ERROR)
-        assert_eq!(
-            McError::MhAssignmentMissing("no data".to_string()).error_code(),
-            6
-        );
 
         // Token acquisition errors -> 6 (INTERNAL_ERROR)
         assert_eq!(
@@ -473,10 +460,6 @@ mod tests {
 
         let timeout_err = McError::TokenAcquisitionTimeout;
         assert_eq!(timeout_err.client_message(), "An internal error occurred");
-
-        // MH assignment missing should hide details
-        let mh_err = McError::MhAssignmentMissing("meeting-123".to_string());
-        assert_eq!(mh_err.client_message(), "An internal error occurred");
     }
 
     #[test]
@@ -504,10 +487,6 @@ mod tests {
         assert_eq!(McError::Internal("test".to_string()).status_code(), 6);
         assert_eq!(McError::FencedOut("test".to_string()).status_code(), 6);
         assert_eq!(McError::NotRegistered.status_code(), 6);
-        assert_eq!(
-            McError::MhAssignmentMissing("test".to_string()).status_code(),
-            6
-        );
         assert_eq!(
             McError::TokenAcquisition("test".to_string()).status_code(),
             6
@@ -618,10 +597,6 @@ mod tests {
             "permission_denied"
         );
         assert_eq!(
-            McError::MhAssignmentMissing("test".to_string()).error_type_label(),
-            "mh_assignment_missing"
-        );
-        assert_eq!(
             McError::Internal("test".to_string()).error_type_label(),
             "internal"
         );
@@ -658,15 +633,6 @@ mod tests {
                 }
             ),
             "Meeting is migrating: mc2.example.com:4433"
-        );
-
-        // MH assignment missing display formatting
-        assert_eq!(
-            format!(
-                "{}",
-                McError::MhAssignmentMissing("meeting-123".to_string())
-            ),
-            "MH assignment missing: meeting-123"
         );
 
         // Token error display formatting

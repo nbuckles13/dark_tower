@@ -19,14 +19,12 @@ use crate::media_kind::{
     ClientKindState, ClientMediaStates, MuteChange, NotPublished, RequestListRefusal,
     RequestedKinds,
 };
-use crate::media_routing::{HandlerEndpoint, HandlerId, MeetingHandlers};
 use crate::media_signaling::{
     CapabilityOutcome, ClientMediaConfig, DirectiveOutcome, MuteOutcome, MuteRejection,
     MuteSurface, PublishSet, ReceiveCapabilityDeclaration, RefusalReplySurface, ServerMuteAction,
     ServerMuteOutcome, SlotDemand, UnmuteRequestOutcome,
 };
 use crate::observability::metrics;
-use crate::redis::{MhAssignmentData, MhAssignmentStore};
 
 use super::trace::{inject_current_context, reparent_current_span};
 
@@ -35,8 +33,7 @@ use bytes::{BufMut, BytesMut};
 use common::jwt::MeetingRole;
 use prost::Message;
 use proto_gen::dark_tower::signaling::v1::{
-    self, client_message, server_message, ClientMessage, ErrorMessage, JoinResponse,
-    MediaServerInfo, ServerMessage,
+    self, client_message, server_message, ClientMessage, ErrorMessage, JoinResponse, ServerMessage,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -184,7 +181,6 @@ pub async fn handle_connection(
     incoming: IncomingSession,
     controller_handle: Arc<MeetingControllerActorHandle>,
     jwt_validator: Arc<McJwtValidator>,
-    redis_client: Arc<dyn MhAssignmentStore>,
     media_deps: Arc<MediaRoutingDeps>,
     client_media_config: ClientMediaConfig,
     cancel_token: CancellationToken,
@@ -511,9 +507,11 @@ pub async fn handle_connection(
         }
     };
 
-    // Step 6c: resolve the live meeting BEFORE reading its handler assignment,
-    // so a join into a meeting this MC does not host reports NOT_FOUND rather
-    // than a missing assignment. The handle is kept for post-join signalling.
+    // Step 6c: resolve the live meeting, so a join into a meeting this MC does
+    // not host reports NOT_FOUND. The handle is kept for post-join signalling.
+    // No handler assignment is read here: the meeting's handler set is the
+    // actor's own, installed at creation from GC's hand-off (ADR-0039 §3), and
+    // no join can read, carry or alter it.
     let meeting_handle = match controller_handle
         .get_meeting_handle(meeting_id.clone())
         .await
@@ -526,34 +524,6 @@ pub async fn handle_connection(
                 meeting_id = %meeting_id,
                 error = %e,
                 "Meeting not hosted on this MC"
-            );
-            let _ = send_error(&mut send_stream, e.error_code(), &e.client_message()).await;
-            metrics::record_session_join(
-                "failure",
-                Some(e.error_type_label()),
-                join_start.elapsed(),
-            );
-            return Err(e);
-        }
-    };
-
-    // Step 6d: read the meeting's handler assignment BEFORE admission (R-6).
-    //
-    // A meeting without media handlers is not useful, and the actor freezes the
-    // meeting's handler set in its first join turn (ADR-0036 §9) and offers
-    // every joiner that whole set, so it must be in hand before the join rather
-    // than read afterwards. A missing or
-    // malformed assignment now fails the join before any admission state
-    // exists — nothing to unwind.
-    let handlers = match read_meeting_handlers(redis_client.as_ref(), &meeting_id).await {
-        Ok(handlers) => handlers,
-        Err(e) => {
-            warn!(
-                target: "mc.webtransport.connection",
-                connection_id = %connection_id,
-                meeting_id = %meeting_id,
-                error = %e,
-                "No usable MH assignment for this meeting — cannot join without media handlers"
             );
             let _ = send_error(&mut send_stream, e.error_code(), &e.client_message()).await;
             metrics::record_session_join(
@@ -590,7 +560,6 @@ pub async fn handle_connection(
             outbound_tx,
             JoinMedia {
                 deps: Arc::clone(&media_deps),
-                handlers,
                 declared: join_media.declared,
                 demand: join_media.demand,
             },
@@ -2303,27 +2272,6 @@ async fn send_error(
     result
 }
 
-/// Read the meeting's handler assignment from Redis and freeze it into a
-/// validated, sorted [`MeetingHandlers`] (R-6: no handlers, no join).
-///
-/// Every url is server-derived — read from the registration GC wrote — never
-/// client-supplied and never computed from a pod ordinal.
-async fn read_meeting_handlers(
-    redis_client: &dyn MhAssignmentStore,
-    meeting_id: &str,
-) -> Result<MeetingHandlers, McError> {
-    let mh_data: MhAssignmentData = redis_client
-        .get_mh_assignment(meeting_id)
-        .await?
-        .ok_or_else(|| McError::MhAssignmentMissing(meeting_id.to_string()))?;
-    MeetingHandlers::new(mh_data.handlers.into_iter().map(|h| HandlerEndpoint {
-        id: HandlerId::new(h.mh_id),
-        webtransport_url: h.webtransport_endpoint,
-        grpc_endpoint: h.grpc_endpoint,
-    }))
-    .map_err(|e| McError::MhAssignmentMissing(format!("{meeting_id}: {e}")))
-}
-
 /// A join's validated media declaration (story 3 R-2).
 #[derive(Debug)]
 struct ValidatedJoinMedia {
@@ -2404,25 +2352,15 @@ fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinRe
         .map(crate::webtransport::handler::roster_entry)
         .collect();
 
-    // The meeting's FULL frozen handler set (ADR-0036 §9, R-33): every
-    // participant is offered every handler and connects to all it can; MC then
-    // routes each pair through a handler both are observed on. Read from the
-    // actor's frozen `MeetingHandlers` — the same value that supplies every
-    // `StreamAssignment.media_handler_url` and `SendTarget.media_handler_url` —
-    // so all three are byte-identical strings (the client looks transports up by
-    // exact url). Never the Redis list this join happened to read. Order carries
-    // no meaning.
-    let media_servers = result
-        .media_handlers
-        .iter()
-        .map(|h| MediaServerInfo {
-            media_handler_url: h.webtransport_url.clone(),
-            // Story 4 additive contract: MC populates the ref and dial token
-            // in MC-A / MC-D.
-            handler_ref: 0,
-            media_dial_token: String::new(),
-        })
-        .collect();
+    // The meeting's client-facing handler snapshot (ADR-0039 §4): ACTIVE
+    // handlers only (register before token), taken by the actor when the reply
+    // was sent. ONE projection feeds both the new set and the legacy
+    // `media_servers` (double-populated until C1/P3), so an old SDK never sees
+    // a handler the new set does not list. Every url is the same string every
+    // `SendTarget` / `StreamAssignment` carries (`MeetingHandlers::client_handler`).
+    // Never a Redis read. Order carries no meaning.
+    let media_handler_set = crate::webtransport::handler::media_handler_set(&result.handler_set);
+    let media_servers = media_handler_set.handlers.clone();
 
     JoinResponse {
         participant_id: result.participant_id.clone(),
@@ -2469,8 +2407,9 @@ fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinRe
         receive_slot_caps: crate::webtransport::handler::receive_slot_caps(|kind| {
             u32::from(kind.of(media.receive_slot_caps))
         }),
-        // Story 4 additive contract: MC sends the handler set in MC-A / MC-D.
-        media_handler_set: None,
+        // ALWAYS present, empty included (a join whose initial handler never
+        // acked): the client treats it as "media connecting".
+        media_handler_set: Some(media_handler_set),
     }
 }
 
@@ -2681,6 +2620,7 @@ mod tests {
             ControllerMetrics::new(),
             common::secret::SecretBox::new(Box::new(vec![0u8; 32])),
             crate::media_admission::fixtures::kek_lifecycle(),
+            crate::actors::meeting_media::test_handlers(),
         )
         .expect("system CSPRNG must be available in tests");
         let config = test_client_media_config();
@@ -2949,6 +2889,76 @@ mod tests {
         );
     }
 
+    /// An Active-only snapshot with one handler, as the actor would hand it.
+    fn test_handler_set() -> crate::media_routing::ClientHandlerSet {
+        use crate::media_routing::{HandlerEndpoint, HandlerId, MeetingHandlers};
+        let mut set = MeetingHandlers::from_handoff([
+            HandlerEndpoint {
+                id: HandlerId::new("mh-0"),
+                webtransport_url: "https://mh-0.test:4434".to_string(),
+                grpc_endpoint: "http://mh-0.test:50053".to_string(),
+            },
+            HandlerEndpoint {
+                id: HandlerId::new("mh-1"),
+                webtransport_url: "https://mh-1.test:4434".to_string(),
+                grpc_endpoint: "http://mh-1.test:50053".to_string(),
+            },
+        ])
+        .unwrap();
+        let r0 = set.handler_ref_of(&HandlerId::new("mh-0")).unwrap();
+        set.mark_active(&HandlerId::new("mh-0"), r0).unwrap();
+        set.client_snapshot()
+    }
+
+    /// ADR-0039 §4: the new set and the legacy `media_servers` are ONE
+    /// projection (Active only — mh-1 is still Registering and appears in
+    /// neither), the set is always present, refs are non-zero, and
+    /// `media_dial_token` stays empty until MC-D mints it.
+    #[tokio::test]
+    async fn the_join_response_double_populates_one_active_only_projection() {
+        let (handle, _task) = test_participant_handle();
+        let handler_set = test_handler_set();
+        let result = JoinResult {
+            participant_id: "p".to_string(),
+            correlation_id: String::new(),
+            binding_token: String::new(),
+            participants: Vec::new(),
+            fencing_generation: 0,
+            sender_id: crate::media_admission::SenderId::from_nonzero(
+                std::num::NonZeroU16::new(1).unwrap(),
+            ),
+            meeting_kek: std::sync::Arc::new(
+                crate::media_admission::MeetingKek::generate(&ring::rand::SystemRandom::new())
+                    .unwrap(),
+            ),
+            kek_generation: 0,
+            kek_rotation_debounce_seconds: 60,
+            participant_handle: handle,
+            handler_set: handler_set.clone(),
+        };
+        let response = build_join_response(&result, &test_client_media_config());
+        let set = response.media_handler_set.expect("always present");
+        assert_eq!(set.handler_set_version, handler_set.version);
+        assert_eq!(set.handlers.len(), 1, "the Registering mh-1 is not listed");
+        assert_eq!(set.handlers[0].media_handler_url, "https://mh-0.test:4434");
+        assert_ne!(set.handlers[0].handler_ref, 0);
+        assert!(set.handlers[0].media_dial_token.is_empty(), "MC-D fills it");
+        assert_eq!(response.media_servers, set.handlers, "one projection");
+
+        // An empty snapshot still yields a present, empty set.
+        let empty = JoinResult {
+            handler_set: crate::media_routing::ClientHandlerSet::default(),
+            ..result
+        };
+        let response = build_join_response(&empty, &test_client_media_config());
+        assert!(response
+            .media_handler_set
+            .expect("present")
+            .handlers
+            .is_empty());
+        assert!(response.media_servers.is_empty());
+    }
+
     /// Both per-kind caps are written (the single total, tag 12, was deleted
     /// by MC-B), from the same config values the gauge reads.
     #[tokio::test]
@@ -2974,12 +2984,7 @@ mod tests {
             kek_generation: 0,
             kek_rotation_debounce_seconds: 60,
             participant_handle: handle,
-            media_handlers: MeetingHandlers::new([HandlerEndpoint {
-                id: HandlerId::new("mh-0"),
-                webtransport_url: "https://mh-0.test:4434".to_string(),
-                grpc_endpoint: "http://mh-0.test:50053".to_string(),
-            }])
-            .unwrap(),
+            handler_set: test_handler_set(),
         };
         let response = build_join_response(&result, &config);
         assert_eq!(

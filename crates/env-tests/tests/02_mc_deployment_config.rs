@@ -8,7 +8,9 @@
 //!   is wired to — `mc-service-config` for MC-only knobs (the per-kind slot
 //!   caps, including the R-26 video-off lever, and the minimum keyframe
 //!   interval `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`, MC-only since story 3
-//!   amendment 4), `media-codec-profile` for the eight shared encoding keys.
+//!   amendment 4, and the story 4 MC-A capacity caps `MC_MAX_MEETINGS` /
+//!   `MC_MAX_PARTICIPANTS`, REQUIRED since R-37), `media-codec-profile` for
+//!   the eight shared encoding keys.
 //!   Per workload, never union: a key on mc-0 missing from mc-1 crash-loops
 //!   mc-1 alone, because MC-A reads every one as REQUIRED.
 //! - **Retirement step 1.** Every key in [`RETIRING_KEYS`] is an
@@ -92,6 +94,14 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
     // MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS); carried on every video directive.
     (
         "MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
+        MC_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    // Capacity caps (R-37, story 4 MC-A): REQUIRED, and 0 is refused (a cap
+    // of 0 is a silent total outage), so both are PositiveInteger.
+    ("MC_MAX_MEETINGS", MC_CONFIGMAP, ValueShape::PositiveInteger),
+    (
+        "MC_MAX_PARTICIPANTS",
         MC_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),

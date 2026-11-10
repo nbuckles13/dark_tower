@@ -11,9 +11,11 @@
 //! These tests now drive the real `WebTransportServer::bind() → accept_loop()`
 //! via `tests/common/accept_loop_rig.rs`. The previous in-file
 //! `TestServer::accept_loop` fork was deleted per ADR-0032 §Decision (which
-//! retires accept-loop bypasses). `MockMhAssignmentStore` and
-//! `MockMhRegistrationClient` now live in `tests/common/mod.rs` and are
-//! shared with the rig and other integration tests.
+//! retires accept-loop bypasses). `MockMhRegistrationClient` lives in
+//! `tests/common/mod.rs` and is shared with the rig and other integration
+//! tests. (The former T5b "MH assignment missing" join failure no longer
+//! exists: a meeting's handler set is installed at actor creation, ADR-0039
+//! §3, so no join can find it missing.)
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -29,7 +31,6 @@ use bytes::{BufMut, BytesMut};
 use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
 use mc_service::grpc::MhRegistrationClient;
 use mc_service::media_routing::PolicyGenerations;
-use mc_service::redis::MhAssignmentStore;
 use mc_test_utils::jwt_test::{make_expired_meeting_claims, make_meeting_claims, TestKeypair};
 use prost::Message;
 use proto_gen::dark_tower::signaling::v1::{
@@ -69,7 +70,6 @@ impl TestServer {
         let rig = AcceptLoopRig::start_with(
             Arc::clone(&stack.controller_handle),
             Arc::clone(&stack.jwt_validator),
-            Arc::clone(&stack.mh_store) as Arc<dyn MhAssignmentStore>,
             Arc::clone(&stack.mh_reg_client) as Arc<dyn MhRegistrationClient>,
             "mc-test".to_string(),
             "http://mc-test:50052".to_string(),
@@ -78,11 +78,6 @@ impl TestServer {
         .await;
 
         Self { rig, stack }
-    }
-
-    /// Forwards to the rig's controller handle.
-    fn controller_handle(&self) -> &Arc<MeetingControllerActorHandle> {
-        &self.rig.controller_handle
     }
 
     /// Create a meeting on the controller and seed MH assignment data with
@@ -453,32 +448,6 @@ async fn test_join_meeting_not_found_returns_not_found() {
 }
 
 // ============================================================================
-// T5b: Meeting Exists But MH Assignment Missing
-// ============================================================================
-
-#[tokio::test]
-async fn test_join_missing_mh_assignment_returns_internal_error() {
-    let server = TestServer::start().await;
-    // Create meeting via controller but DON'T seed MH data in mh_store
-    server
-        .controller_handle()
-        .create_meeting("meeting-no-mh".to_string())
-        .await
-        .expect("create meeting");
-
-    let claims = make_meeting_claims("meeting-no-mh");
-    let token = server.sign_token(&claims);
-
-    let response = join_and_read_response(&server.url(), "meeting-no-mh", &token, "NoMedia").await;
-
-    let (code, _message) = extract_error(&response);
-    assert_eq!(
-        code, 6,
-        "MhAssignmentMissing should map to INTERNAL_ERROR (6)"
-    );
-}
-
-// ============================================================================
 // T6: Invalid Protobuf Rejected
 // ============================================================================
 
@@ -597,7 +566,10 @@ async fn test_actor_level_join_success() {
     );
 
     controller
-        .create_meeting("meeting-actor".to_string())
+        .create_meeting(
+            "meeting-actor".to_string(),
+            test_common::default_handler_set(),
+        )
         .await
         .unwrap();
 
@@ -701,7 +673,10 @@ async fn test_actor_level_second_joiner_sees_first_in_roster() {
     );
 
     controller
-        .create_meeting("meeting-roster".to_string())
+        .create_meeting(
+            "meeting-roster".to_string(),
+            test_common::default_handler_set(),
+        )
         .await
         .unwrap();
 
@@ -788,7 +763,10 @@ async fn test_join_records_display_name_resolution_outcome_metric() {
         mc_test_utils::kek::kek_lifecycle(),
     );
     controller
-        .create_meeting("meeting-dn-metric".to_string())
+        .create_meeting(
+            "meeting-dn-metric".to_string(),
+            test_common::default_handler_set(),
+        )
         .await
         .unwrap();
 

@@ -945,7 +945,7 @@ impl SlotTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media_routing::placement::{HandlerEndpoint, MeetingHandlers};
+    use crate::media_routing::placement::MeetingHandlers;
     use proto_gen::dark_tower::signaling::v1::SlotState;
     use std::collections::{HashSet, VecDeque};
     use std::num::NonZeroU16;
@@ -956,17 +956,8 @@ mod tests {
         SenderId::from_nonzero(NonZeroU16::new(n).unwrap())
     }
 
-    fn h(name: &str) -> HandlerId {
-        HandlerId::new(name)
-    }
-
     fn handler_set() -> MeetingHandlers {
-        MeetingHandlers::new(H.iter().map(|id| HandlerEndpoint {
-            id: h(id),
-            webtransport_url: format!("https://{id}.example:4434"),
-            grpc_endpoint: format!("http://{id}.example:50053"),
-        }))
-        .unwrap()
+        MeetingHandlers::active_test_ids(&H)
     }
 
     /// A connected set built the only way production can build one: from
@@ -2231,8 +2222,13 @@ mod tests {
                         | SlotState::Unavailable
                         | SlotState::FewerSourcesThanSlots => {
                             assert!(a.media_handler_url.is_empty(), "{state:?} carries no url");
+                            // ADR-0039 §4: 0 means "no edge" on exactly these.
+                            assert_eq!(a.handler_ref, 0, "{state:?} carries no ref");
                         }
-                        _ => assert!(!a.media_handler_url.is_empty(), "{state:?} names its edge"),
+                        _ => {
+                            assert!(!a.media_handler_url.is_empty(), "{state:?} names its edge");
+                            assert_ne!(a.handler_ref, 0, "{state:?} names its edge's ref");
+                        }
                     }
                     if state == SlotState::Active
                         && a.media_kind

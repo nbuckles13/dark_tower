@@ -20,10 +20,11 @@
 //! **Hazard, out of scope here (Lead ruling R3):** connectivity is edge-
 //! triggered and nothing re-asserts it. An MH that crashes sends no
 //! Disconnected, and its restarted process registers under a new `handler_id`
-//! outside the frozen set, so MC keeps routing edges to the dead id — sticky
-//! silence that presents as healthy — until story 4's handler-restart
-//! detection lands. `mc_mh_notifications_unapplied_total{reason="handler_not_in_set"}`
-//! is the discriminator (`docs/TODO.md` §Media Path Obligations).
+//! outside the meeting's set, so MC keeps routing edges to the dead id —
+//! sticky silence that presents as healthy — until story 4's handler-loss
+//! detection and replacement (MC-B2/MC-C) call the set's `remove`/`add`.
+//! `mc_mh_notifications_unapplied_total{reason="handler_not_in_set"}` is the
+//! discriminator (`docs/TODO.md` §Media Path Obligations).
 //!
 //! # The actor is the single writer AND the single composer
 //!
@@ -68,15 +69,23 @@
 //! declaration is the client's precondition for publishing, and an empty list
 //! would read as "declared zero slots".
 //!
-//! # The frozen handler set is the meeting's authority
+//! # The meeting's handler set is MC's own (ADR-0039 §3)
 //!
-//! The handler set — ids AND urls, as ONE [`MeetingHandlers`] value — is
-//! frozen at the first join. No later join, and no changed or tampered Redis
-//! entry, can add a handler to a live meeting or move an already-placed
-//! participant: a join carrying a different set is logged at ERROR, counted on
-//! `mc_media_handler_set_divergence_total`, and otherwise ignored. That is what
-//! stops a Redis-state change from redirecting existing participants' media to
-//! a handler MC never vetted.
+//! The handler set — ids, urls, refs and states, as ONE [`MeetingHandlers`]
+//! value — is installed when the actor is CREATED, from GC's hand-off, and
+//! never re-read: no join carries a handler set, so no join and no changed or
+//! tampered Redis entry can add a handler to a live meeting or move an
+//! already-placed participant. It changes only through its own mutators.
+//!
+//! # Register before token
+//!
+//! A handler is client-visible only once its push worker reports the first
+//! acked `RegisterMeeting` ([`HandlerRegistration`], drained by the actor in
+//! its own `select!` arm — the actor never awaits MH). Then
+//! [`MeetingMedia::on_registration`] marks it Active, the actor sends the new
+//! client snapshot to every connected participant, and only THEN re-routes,
+//! so on each participant's ordered queue the set precedes any directive or
+//! assignment that names the new ref.
 //!
 //! # No key material
 //!
@@ -89,8 +98,11 @@ use crate::errors::McError;
 use crate::grpc::MhRegistrationClient;
 use crate::media_admission::SenderId;
 use crate::media_kind::PublishSet;
+use crate::media_routing::pusher::{
+    HandlerRegistration, RegistrationOutcome, RegistrationReporter,
+};
 use crate::media_routing::{
-    ConnectionKey, HandlerId, HandlerPusher, MeetingAssignment, MeetingHandlers,
+    ClientHandlerSet, ConnectionKey, HandlerId, HandlerPusher, MeetingAssignment, MeetingHandlers,
     ParticipantConnectivity, PolicyGenerations, PushJob, PushTarget, SlotTable, SourceMute,
     Unapplied,
 };
@@ -105,6 +117,7 @@ use proto_gen::dark_tower::signaling::v1::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -228,16 +241,13 @@ impl MutedSourceCensus {
     }
 }
 
-/// What a join carries for media: the server-level dependencies, the
-/// meeting's handler set as the registration (Redis) describes it at this
-/// join, and the joiner's validated media declaration. The actor freezes the
-/// handler set at the first join.
+/// What a join carries for media: the server-level dependencies and the
+/// joiner's validated media declaration. NOT a handler set: the meeting's set
+/// is installed at actor creation (ADR-0039 §3) and no join can alter it.
 #[derive(Debug, Clone)]
 pub struct JoinMedia {
     /// Server-level dependencies.
     pub deps: Arc<MediaRoutingDeps>,
-    /// The meeting's handler set, as read for this join.
-    pub handlers: MeetingHandlers,
     /// What the joiner publishes (fixed for its membership, story 3 R-2) and
     /// each published kind's initial client mute: the parsed join
     /// `published_kinds`.
@@ -271,14 +281,27 @@ pub struct MeetingSeams {
     pub kek_debounce_manual: bool,
 }
 
-/// Media-routing inputs for in-crate actor tests: one handler and an MH
-/// client that confirms every push. Routing behaviour itself is covered by
+/// The handler set in-crate actor tests create a meeting with: one handler,
+/// as GC's hand-off would describe it (Registering until its push is acked).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn test_handlers() -> MeetingHandlers {
+    MeetingHandlers::from_handoff([crate::media_routing::HandlerEndpoint {
+        id: crate::media_routing::HandlerId::new("mh-0"),
+        webtransport_url: "https://mh-0.test:4434".to_string(),
+        grpc_endpoint: "http://mh-0.test:50053".to_string(),
+    }])
+    .unwrap()
+}
+
+/// Media-routing inputs for in-crate actor tests: an MH client that confirms
+/// every push. Routing behaviour itself is covered by
 /// `media_routing` unit tests and the integration suite.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub(crate) fn test_join_media() -> JoinMedia {
     use crate::grpc::{MeetingProgramming, MhRegistrationClient};
-    use crate::media_routing::{HandlerEndpoint, MeetingHandlers, PolicyGenerations};
+    use crate::media_routing::PolicyGenerations;
     use crate::media_signaling::{AudioEncoding, MediaStreamPolicy, VideoEncoding};
     use proto_gen::dark_tower::signaling::v1::Codec;
 
@@ -319,12 +342,6 @@ pub(crate) fn test_join_media() -> JoinMedia {
             ),
             connect_settle_window: std::time::Duration::from_millis(1500),
         }),
-        handlers: MeetingHandlers::new([HandlerEndpoint {
-            id: crate::media_routing::HandlerId::new("mh-0"),
-            webtransport_url: "https://mh-0.test:4434".to_string(),
-            grpc_endpoint: "http://mh-0.test:50053".to_string(),
-        }])
-        .unwrap(),
         declared: crate::media_kind::ClientMediaStates::live(PublishSet::of(&[
             MediaKindLabel::Audio,
         ])),
@@ -390,8 +407,13 @@ pub(super) struct MeetingMedia {
     /// `Drop` aborts — correct there, because nothing will call `EndMeeting`.
     pushers_cancel: CancellationToken,
     deps: Option<Arc<MediaRoutingDeps>>,
-    /// Frozen at the first join.
-    handlers: Option<MeetingHandlers>,
+    /// The meeting's MC-owned set, installed at actor creation.
+    handlers: MeetingHandlers,
+    /// Push workers report registration verdicts here (each holds a clone of
+    /// the sender in its `RegistrationReporter`).
+    registrations_tx: mpsc::UnboundedSender<HandlerRegistration>,
+    /// Drained by the actor's own `select!` arm.
+    registrations_rx: mpsc::UnboundedReceiver<HandlerRegistration>,
     slots: SlotTable,
     pushers: BTreeMap<HandlerId, HandlerPusher>,
     views: HashMap<String, View>,
@@ -402,13 +424,16 @@ pub(super) struct MeetingMedia {
 }
 
 impl MeetingMedia {
-    pub(super) fn new(meeting_id: String) -> Self {
+    pub(super) fn new(meeting_id: String, handlers: MeetingHandlers) -> Self {
+        let (registrations_tx, registrations_rx) = mpsc::unbounded_channel();
         Self {
             slots: SlotTable::for_meeting(&meeting_id),
             meeting_id,
             pushers_cancel: CancellationToken::new(),
             deps: None,
-            handlers: None,
+            handlers,
+            registrations_tx,
+            registrations_rx,
             pushers: BTreeMap::new(),
             views: HashMap::new(),
             dirty: BTreeSet::new(),
@@ -424,26 +449,11 @@ impl MeetingMedia {
         }
     }
 
-    /// Install the join's routing inputs. The first join freezes the handler
-    /// set; a later join carrying a different one is loud and ignored.
-    pub(super) fn install(&mut self, media: JoinMedia) {
+    /// Install the join's server-level routing dependencies (the first join's
+    /// are kept; every join carries the same server-wide value).
+    pub(super) fn install(&mut self, media: &JoinMedia) {
         if self.deps.is_none() {
-            self.deps = Some(media.deps);
-        }
-        match &self.handlers {
-            None => self.handlers = Some(media.handlers),
-            Some(frozen) if *frozen == media.handlers => {}
-            Some(_) => {
-                metrics::record_handler_set_divergence();
-                error!(
-                    target: "mc.actor.meeting",
-                    meeting_id = %self.meeting_id,
-                    "A join carried a handler assignment that differs from this meeting's frozen \
-                     handler set; keeping the frozen set. No join can widen a live meeting's set \
-                     or move an edge. This is an MC-internal invariant violation: \
-                     capture and escalate."
-                );
-            }
+            self.deps = Some(Arc::clone(&media.deps));
         }
     }
 
@@ -452,7 +462,6 @@ impl MeetingMedia {
     ///
     /// # Errors
     ///
-    /// [`McError::MhAssignmentMissing`] if no handler set is installed;
     /// [`McError::Internal`] if the slot table refuses the admission.
     pub(super) fn admit(
         &mut self,
@@ -460,11 +469,6 @@ impl MeetingMedia {
         sender: SenderId,
         publishes: PublishSet,
     ) -> Result<(), McError> {
-        if self.handlers.is_none() {
-            return Err(McError::MhAssignmentMissing(
-                "no handler set installed for this meeting".to_string(),
-            ));
-        }
         self.slots
             .admit(sender, publishes)
             .map_err(|e| McError::Internal(format!("slot admission failed: {e}")))?;
@@ -481,10 +485,72 @@ impl MeetingMedia {
         Ok(())
     }
 
-    /// The meeting's frozen handler set — the ONLY source of the full
-    /// `JoinResponse.media_servers` list.
-    pub(super) fn frozen_handlers(&self) -> Option<&MeetingHandlers> {
-        self.handlers.as_ref()
+    /// The meeting's handler set (internal view).
+    pub(super) fn handlers(&self) -> &MeetingHandlers {
+        &self.handlers
+    }
+
+    /// The client-facing snapshot (Active only) — the ONLY source of every
+    /// `MediaHandlerSet` and of `JoinResponse.media_servers`.
+    pub(super) fn client_snapshot(&self) -> ClientHandlerSet {
+        self.handlers.client_snapshot()
+    }
+
+    /// The registration-report receiver, for the actor's `select!` arm.
+    pub(super) fn registrations(&mut self) -> &mut mpsc::UnboundedReceiver<HandlerRegistration> {
+        &mut self.registrations_rx
+    }
+
+    /// Apply one push worker's registration report. Returns whether the
+    /// client-visible (Active) set changed — the emission rule: the caller
+    /// then sends the new snapshot to every connected participant BEFORE it
+    /// re-routes ([`Self::reroute_all`]).
+    ///
+    /// A late or stale report (a removed incarnation, an already-Active
+    /// handler) changes nothing.
+    pub(super) fn on_registration(&mut self, report: &HandlerRegistration) -> bool {
+        if report.outcome != RegistrationOutcome::Registered {
+            return false;
+        }
+        match self
+            .handlers
+            .mark_active(&report.handler_id, report.handler_ref)
+        {
+            Ok(Some(change)) => {
+                info!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    handler_id = %report.handler_id,
+                    handler_ref = report.handler_ref.get(),
+                    handler_set_version = change.version,
+                    "Media handler registered; handler set membership changed"
+                );
+                change.active_changed
+            }
+            Ok(None) => false,
+            Err(e) => {
+                error!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    handler_id = %report.handler_id,
+                    error = %e,
+                    "Could not mark a registered media handler Active; it stays \
+                     client-invisible. MC-internal invariant violation: capture and escalate."
+                );
+                false
+            }
+        }
+    }
+
+    /// Re-evaluate every participant's routable set after a membership change
+    /// (routing is over Active members only). Returns whether any changed.
+    pub(super) fn reroute_all(&mut self, now: Instant) -> bool {
+        let ids: Vec<String> = self.views.keys().cloned().collect();
+        let mut changed = false;
+        for participant_id in ids {
+            changed |= self.sync_routing(&participant_id, now);
+        }
+        changed
     }
 
     /// Record an MH-reported connection for a resolved roster participant.
@@ -500,11 +566,11 @@ impl MeetingMedia {
         key: ConnectionKey,
         now: Instant,
     ) -> Result<bool, Unapplied> {
-        let (Some(handlers), Some(deps)) = (&self.handlers, &self.deps) else {
-            return Err(self.invariant_violation("connect", "no frozen handler set"));
+        let Some(deps) = &self.deps else {
+            return Err(self.invariant_violation("connect", "no routing deps"));
         };
-        // S1a: exact-match membership in the frozen set, or nothing.
-        let Some(endpoint) = handlers.resolve(wire_handler_id).cloned() else {
+        // S1a: exact-match membership in the meeting's set, or nothing.
+        let Some(endpoint) = self.handlers.resolve(wire_handler_id).cloned() else {
             return Err(Unapplied::HandlerNotInSet);
         };
         let window = deps.connect_settle_window;
@@ -531,10 +597,7 @@ impl MeetingMedia {
         key: &ConnectionKey,
         now: Instant,
     ) -> Result<bool, Unapplied> {
-        let Some(handlers) = &self.handlers else {
-            return Err(self.invariant_violation("disconnect", "no frozen handler set"));
-        };
-        let Some(handler) = handlers.resolve(wire_handler_id).map(|h| h.id.clone()) else {
+        let Some(handler) = self.handlers.resolve(wire_handler_id).map(|h| h.id.clone()) else {
             return Err(Unapplied::HandlerNotInSet);
         };
         let Some(view) = self.views.get_mut(participant_id) else {
@@ -546,7 +609,8 @@ impl MeetingMedia {
 
     /// The ONE home for a handler notification that reached this actor for a
     /// roster-resolved participant but found state MC cannot legitimately be
-    /// in: `admit()` refuses without a handler set, and a view exists exactly
+    /// in: a participant is admitted only by a join that installed the routing
+    /// deps, and a view exists exactly
     /// while the participant is on the roster (both change in the same actor
     /// turn). The genuine join race is caught upstream (`resolve_user` →
     /// `NotFound`), so these are NOT the routine `participant_unknown` race —
@@ -595,17 +659,17 @@ impl MeetingMedia {
             .min()
     }
 
+    /// The handlers a participant can be routed over: the Active members
+    /// (settle completes early once a participant reaches all of them).
     fn handler_count(&self) -> usize {
-        self.handlers.as_ref().map_or(0, MeetingHandlers::len)
+        self.handlers.active_len()
     }
 
     /// Settle this participant if due, and push its routable set into the slot
     /// table if it differs from what the table holds. Returns whether it did.
     fn sync_routing(&mut self, participant_id: &str, now: Instant) -> bool {
         let count = self.handler_count();
-        let Some(handlers) = &self.handlers else {
-            return false;
-        };
+        let handlers = &self.handlers;
         let Some(view) = self.views.get_mut(participant_id) else {
             return false;
         };
@@ -693,14 +757,15 @@ impl MeetingMedia {
     ///
     /// Moves the push workers OUT — with their own token — so that nothing left
     /// in this struct can abort them, and returns everything the teardown needs
-    /// to drain them and then release every handler of the frozen set.
-    /// `None` if no join ever installed a handler set: no handler was ever
+    /// to drain them and then release every handler of the meeting's set
+    /// (Registering included: its `RegisterMeeting` may have landed).
+    /// `None` if no join ever installed the routing deps: no handler was ever
     /// programmed, so there is nothing to release.
     pub(super) fn take_teardown(
         &mut self,
         reason: crate::media_routing::teardown::TeardownReason,
     ) -> Option<crate::media_routing::teardown::MediaTeardown> {
-        let (deps, handlers) = (self.deps.as_ref()?, self.handlers.as_ref()?);
+        let (deps, handlers) = (self.deps.as_ref()?, &self.handlers);
         let pusher_tasks = std::mem::take(&mut self.pushers)
             .into_values()
             .filter_map(HandlerPusher::into_task)
@@ -760,9 +825,10 @@ impl MeetingMedia {
     /// [`SlotTable::render`]. Synchronous in the actor; the push itself is
     /// the handler's push worker's.
     async fn render_and_publish(&mut self, mute: &SourceMuteView) {
-        let (Some(deps), Some(handlers)) = (&self.deps, &self.handlers) else {
+        let Some(deps) = &self.deps else {
             return;
         };
+        let handlers = &self.handlers;
         let assignment = match self.slots.render(handlers.ids(), mute) {
             Ok(assignment) => assignment,
             Err(e) => {
@@ -781,7 +847,7 @@ impl MeetingMedia {
             }
         };
 
-        for endpoint in handlers.iter() {
+        for (endpoint, handler_ref) in handlers.iter_with_ref() {
             let Some(policy) = assignment.for_handler(&endpoint.id) else {
                 continue;
             };
@@ -802,6 +868,7 @@ impl MeetingMedia {
                     continue;
                 }
             };
+            let registrations = &self.registrations_tx;
             let pusher = self.pushers.entry(endpoint.id.clone()).or_insert_with(|| {
                 HandlerPusher::spawn(
                     PushTarget {
@@ -811,6 +878,11 @@ impl MeetingMedia {
                         mc_id: deps.mc_id.clone(),
                         mc_grpc_endpoint: deps.mc_grpc_endpoint.clone(),
                         handler: endpoint.clone(),
+                        registration: RegistrationReporter::new(
+                            registrations.clone(),
+                            endpoint.id.clone(),
+                            handler_ref,
+                        ),
                     },
                     self.pushers_cancel.child_token(),
                 )
@@ -939,9 +1011,9 @@ impl MeetingMedia {
     }
 
     /// A dirty participant that cannot be flushed because MC's own state
-    /// sets disagree. Logged, not counted (the invariant-violation register is
-    /// `mc_media_handler_set_divergence_total`'s; three more series would be
-    /// noise).
+    /// sets disagree. Logged, not counted: an MC-internal invariant violation
+    /// whose WARN line carries the meeting and participant ids, and a series
+    /// per can't-happen branch would be noise.
     fn warn_unflushable(&self, participant_id: &str, reason: &'static str) {
         warn!(
             target: "mc.actor.meeting",
@@ -973,10 +1045,11 @@ impl MeetingMedia {
         let Some(connection) = entry.connection else {
             return;
         };
-        let (Some(deps), Some(handlers)) = (&self.deps, &self.handlers) else {
+        let Some(deps) = &self.deps else {
             self.warn_unflushable(participant_id, "no_routing_deps");
             return;
         };
+        let handlers = &self.handlers;
         let Some(view) = self.views.get(participant_id) else {
             self.warn_unflushable(participant_id, "no_view");
             return;

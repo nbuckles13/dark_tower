@@ -75,6 +75,21 @@ impl Participant {
         self.join.sender_id.expect("MC allocates a sender id")
     }
 
+    /// The `JoinResponse.media_handler_set` (ADR-0039 §4). MC always sends
+    /// it (empty included), so its absence is an MC defect, not an
+    /// environment fact.
+    ///
+    /// # Panics
+    /// If the JoinResponse carries no set.
+    pub fn handler_set(&self) -> &proto_gen::dark_tower::signaling::v1::MediaHandlerSet {
+        self.join.media_handler_set.as_ref().unwrap_or_else(|| {
+            panic!(
+                "{}: JoinResponse carries no media_handler_set — MC always sends one (MC defect)",
+                self.label
+            )
+        })
+    }
+
     /// The handler urls this participant was OFFERED, sorted.
     pub fn offered(&self) -> Vec<String> {
         let mut urls: Vec<String> = self

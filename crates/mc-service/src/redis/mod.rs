@@ -24,5 +24,4 @@ pub mod lua_scripts;
 
 pub use client::FencedRedisClient;
 pub use client::MhAssignmentData;
-pub use client::MhAssignmentStore;
 pub use client::MhEndpointInfo;

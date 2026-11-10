@@ -24,7 +24,6 @@ use std::time::Duration;
 use ::common::observability::testing::MetricAssertion;
 use mc_service::grpc::MhRegistrationClient;
 use mc_service::media_admission::MEETING_KEK_BYTES;
-use mc_service::redis::MhAssignmentStore;
 use mc_test_utils::jwt_test::make_meeting_claims;
 use proto_gen::dark_tower::signaling::v1::{
     self, client_message, server_message, ClientMessage, JoinRequest, JoinResponse, ServerMessage,
@@ -53,7 +52,6 @@ impl Server {
         let rig = AcceptLoopRig::start_with(
             Arc::clone(&stack.controller_handle),
             Arc::clone(&stack.jwt_validator),
-            Arc::clone(&stack.mh_store) as Arc<dyn MhAssignmentStore>,
             Arc::clone(&stack.mh_reg_client) as Arc<dyn MhRegistrationClient>,
             "mc-test".to_string(),
             "http://mc-test:50052".to_string(),
@@ -71,6 +69,7 @@ impl Server {
     /// the NEXT admission is the one that resets the KEK epoch.
     #[cfg(feature = "test-seams")]
     async fn create_meeting_with_exhausted_sender_ids(&self, meeting_id: &str) {
+        let handlers = test_common::seed_default_handoff(&self.stack, meeting_id);
         self.stack
             .controller_handle
             // `None` cursor == the space is ALREADY exhausted, so the very
@@ -79,6 +78,7 @@ impl Server {
             // already covers.
             .create_meeting_with_seams(
                 meeting_id.to_string(),
+                handlers,
                 mc_service::actors::MeetingSeams {
                     sender_id_cursor: Some(None),
                     ..Default::default()
@@ -86,10 +86,6 @@ impl Server {
             )
             .await
             .expect("create meeting");
-        // Handler data only — the meeting itself was just created above with
-        // the seeded cursor, and `seed_meeting_with_mh` would try to create it
-        // a second time.
-        test_common::seed_mh_assignment_only(&self.stack, meeting_id);
     }
 
     fn token(&self, meeting_id: &str) -> String {

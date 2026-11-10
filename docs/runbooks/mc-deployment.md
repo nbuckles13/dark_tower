@@ -917,12 +917,12 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 | `MC_GRPC_BIND_ADDRESS` | No | gRPC bind address for GC communication. | `0.0.0.0:50052` | `0.0.0.0:50052` |
 | `MC_HEALTH_BIND_ADDRESS` | No | Health/metrics bind address. | `0.0.0.0:8081` | `0.0.0.0:8081` |
 | `MC_ID` | No | Instance identifier. **MUST be unique per process incarnation — leave it unset.** See the warning below. | `mc-$HOSTNAME-<uuid8>` | *(unset — use the default)* |
-| `MC_MAX_MEETINGS` | No | Maximum concurrent meetings. | `1000` | `1000` |
-| `MC_MAX_PARTICIPANTS` | No | Maximum participants across all meetings. | `10000` | `10000` |
-| `MC_BINDING_TOKEN_TTL_SECONDS` | No | Binding token TTL (ADR-0023). | `30` | `30` |
-| `MC_CLOCK_SKEW_SECONDS` | No | Clock skew allowance (ADR-0023). | `5` | `5` |
-| `MC_NONCE_GRACE_WINDOW_SECONDS` | No | Nonce grace window (ADR-0023). | `5` | `5` |
-| `MC_DISCONNECT_GRACE_PERIOD_SECONDS` | No | Participant disconnect grace period (ADR-0023). | `30` | `30` |
+| `MC_MAX_MEETINGS` *(required since story 4 MC-A)* | **Yes** (hard ref, `mc-service-config`) | Maximum concurrent meetings; GC's assignment is refused `at_capacity` beyond it. **This is the admission load-shed lever the incident runbooks name. Missing or invalid refuses boot** (R-37): absent, unparseable or `0` is a startup error naming the key. Before story 4 MC-A an unparseable value silently fell back to `1000`, so a typo in this lever was invisible. **A malformed value now CrashLoops the pod: check the value before rolling** (under RollingUpdate the old pod keeps serving). `0` is refused because a cap of 0 refuses every meeting, a silent total outage that reads as valid config. Bounds `MIN_CAPACITY_CAP..=u32::MAX` in `crates/mc-service/src/config.rs`. | none (required) | `1000` (in ConfigMap) |
+| `MC_MAX_PARTICIPANTS` *(required since story 4 MC-A)* | **Yes** (hard ref, `mc-service-config`) | Maximum participants across all meetings; the connection-side load-shed lever. Same rules as `MC_MAX_MEETINGS`: **missing or invalid (unparseable or `0`) refuses boot**; before story 4 MC-A a typo silently fell back to `10000`. **Check the value before rolling.** | none (required) | `10000` (in ConfigMap) |
+| `MC_BINDING_TOKEN_TTL_SECONDS` | No | Binding token TTL (ADR-0023). **Parsed and validated at boot, not yet consumed**: the TTL in use is hardcoded (`BINDING_TOKEN_TTL` in `crates/mc-service/src/actors/session.rs`), so changing this key changes nothing (`docs/TODO.md`). An unparseable value refuses boot (since story 4 MC-A; before, it silently fell back to the default). | `30` | `30` |
+| `MC_CLOCK_SKEW_SECONDS` | No | Clock skew allowance (ADR-0023). Bounded `0..=common::jwt::MAX_CLOCK_SKEW` (600 s, the shared JWT ceiling AC also enforces): an unparseable value or one above 600 refuses boot (since story 4 MC-A; before, a typo silently fell back to the default and an over-ceiling value was silently clamped by the validator). | `5` | `5` |
+| `MC_NONCE_GRACE_WINDOW_SECONDS` | No | Nonce grace window (ADR-0023). **Parsed and validated at boot, not yet consumed**: nothing reads it, so changing it changes nothing (`docs/TODO.md`). An unparseable value refuses boot (since story 4 MC-A). | `5` | `5` |
+| `MC_DISCONNECT_GRACE_PERIOD_SECONDS` | No | Participant disconnect grace period (ADR-0023). **Parsed and validated at boot, not yet consumed**: the grace in use is hardcoded (`DISCONNECT_GRACE_PERIOD` in `crates/mc-service/src/actors/meeting.rs`), so changing this key changes nothing (`docs/TODO.md`). An unparseable value refuses boot (since story 4 MC-A). | `30` | `30` |
 | `MC_QUIC_MAX_IDLE_TIMEOUT_SECONDS` | No | QUIC max-idle-timeout. **Fail-loud parse**: non-numeric or `0` is rejected at load rather than falling back to the library default (`0` = infinite idle timeout, which leaves crash/network-loss departures undetected). | `10` | `10` |
 | `OTEL_ENABLED` | No | Enable MC's OTel SDK span export (R-55). Gated by this explicit flag, NOT by presence of `OTLP_ENDPOINT`. Unrecognised values fail at load. | `false` | `true` |
 | `OTLP_ENDPOINT` | No | OTLP-gRPC collector endpoint for MC's own span export. `http://` scheme required. Only consumed when `OTEL_ENABLED=true`. | None | `http://otel-collector.dark-tower:4317` |
@@ -1201,7 +1201,19 @@ data:
   MC_MEDIA_CONNECT_SETTLE_MS: "1500"           # validated 100..=10000 at load; see config.env
   # ---- ADR-0036 §4 KEK rotation (REQUIRED; absent = CrashLoop) ----
   MC_KEK_ROTATION_DEBOUNCE_SECONDS: "60"       # W; bounds in config.rs; see config.env
+  # ---- Capacity caps (R-37, story 4 MC-A; REQUIRED; absent/unparseable/0 = CrashLoop) ----
+  MC_MAX_MEETINGS: "1000"
+  MC_MAX_PARTICIPANTS: "10000"
 ```
+
+**Rolling out and back the two required caps (story 4 MC-A).** `mc-service-config` is a
+hash-suffixed `configMapGenerator`, so the ConfigMap carrying `MC_MAX_MEETINGS` /
+`MC_MAX_PARTICIPANTS` and the Deployments that hard-reference them land in the same kustomize apply
+(`deploy.sh`). `kubectl rollout undo` returns to the previous ReplicaSet and its retained ConfigMap
+generation, and the pre-MC-A image ignores both keys, so they need no "keep until the rollback
+window closes" note. The one bad path is changing the image WITHOUT the manifest (a bare
+`kubectl set image`): the new pod refuses boot on the missing key and CrashLoops, while
+RollingUpdate keeps the old pod serving. Loud and contained.
 
 **Shared with MH: `media-codec-profile`** (story 3), generated from
 `infra/services/media-codec-profile/profile.env`, a generator-only base. It holds the eight `MEDIA_*`

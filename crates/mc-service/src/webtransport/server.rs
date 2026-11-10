@@ -15,7 +15,6 @@ use crate::grpc::MhRegistrationClient;
 use crate::media_routing::PolicyGenerations;
 use crate::media_signaling::MediaKindLabel;
 use crate::observability::metrics;
-use crate::redis::MhAssignmentStore;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -53,8 +52,6 @@ pub struct WebTransportServer {
     controller_handle: Arc<MeetingControllerActorHandle>,
     /// JWT validator for meeting tokens.
     jwt_validator: Arc<McJwtValidator>,
-    /// Redis client for reading MH assignment data during join.
-    redis_client: Arc<dyn MhAssignmentStore>,
     /// Media-routing dependencies every meeting actor is handed at join: the
     /// MH registration client, the `policy_generation` registry (shared with
     /// the controller actor, which evicts a meeting's entries on teardown),
@@ -88,7 +85,6 @@ impl WebTransportServer {
         tls_key_path: String,
         controller_handle: Arc<MeetingControllerActorHandle>,
         jwt_validator: Arc<McJwtValidator>,
-        redis_client: Arc<dyn MhAssignmentStore>,
         mh_client: Arc<dyn MhRegistrationClient>,
         policy_generations: Arc<PolicyGenerations>,
         mc_id: String,
@@ -131,7 +127,6 @@ impl WebTransportServer {
             tls_key_path,
             controller_handle,
             jwt_validator,
-            redis_client,
             media_deps: Arc::new(MediaRoutingDeps {
                 mh_client,
                 policy_generations,
@@ -277,7 +272,6 @@ impl WebTransportServer {
                     let active_connections = Arc::clone(&self.active_connections);
                     let controller_handle = Arc::clone(&self.controller_handle);
                     let jwt_validator = Arc::clone(&self.jwt_validator);
-                    let redis_client = Arc::clone(&self.redis_client);
                     let media_deps = Arc::clone(&self.media_deps);
                     let client_media_config = self.client_media_config;
                     let connection_token = self.cancel_token.child_token();
@@ -287,7 +281,6 @@ impl WebTransportServer {
                             incoming_session,
                             controller_handle,
                             jwt_validator,
-                            redis_client,
                             media_deps,
                             client_media_config,
                             connection_token,

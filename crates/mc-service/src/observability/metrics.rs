@@ -998,25 +998,6 @@ pub fn set_connect_settle_window(window: Duration) {
     .set(window.as_secs_f64());
 }
 
-/// Record a join whose handler assignment disagreed with the meeting's frozen
-/// handler set.
-///
-/// Metric: `mc_media_handler_set_divergence_total`
-/// Labels: `key_custody` (1)
-/// Cardinality: 1
-///
-/// An MC-internal invariant violation: GC freezes a meeting's handler set at
-/// first join, and the actor keeps the frozen set (so no later join or changed
-/// Redis entry can widen it or move anyone's edges). Any non-zero value is
-/// a defect to capture and escalate; restarting nothing fixes it.
-pub fn record_handler_set_divergence() {
-    counter!(
-        "mc_media_handler_set_divergence_total",
-        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
-    )
-    .increment(1);
-}
-
 /// Record one MC-restart generation-floor reply.
 ///
 /// Metric: `mc_media_policy_generation_adoptions_total`
@@ -2198,6 +2179,7 @@ const OUTBOUND_PAYLOAD_KINDS: &[&str] = &[
     crate::webtransport::handler::PAYLOAD_KIND_PARTICIPANT_UPDATE_LEFT,
     crate::webtransport::handler::PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED,
     crate::actors::participant::OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE,
+    crate::actors::participant::OUTBOUND_PAYLOAD_MEDIA_HANDLER_SET,
 ];
 /// `mc_caller_type_rejected_total{grpc_service, expected_type, actual_type}` —
 /// the Layer-2 (ADR-0003) rejection combinations. `grpc_service`/`expected_type`
@@ -2325,8 +2307,6 @@ pub fn zero_initialize_counters() {
     }
     // key_custody-only media counters (cardinality 1)
     counter!("mc_media_unreachable_senders_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
-        .increment(0);
-    counter!("mc_media_handler_set_divergence_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
         .increment(0);
     counter!("mc_media_not_yet_connected_senders_total", KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR)
         .increment(0);
@@ -2644,7 +2624,6 @@ mod tests {
             McError::MeetingTeardownInProgress,
             McError::JwtValidation(String::new()),
             McError::PermissionDenied(String::new()),
-            McError::MhAssignmentMissing(String::new()),
             McError::Internal(String::new()),
             McError::TokenAcquisition(String::new()),
             McError::TokenAcquisitionTimeout,
@@ -2664,7 +2643,7 @@ mod tests {
         // it is classified. Do NOT add a `_ =>` arm — that reopens the drift gap.
         // When you classify a new variant here, ALSO list it in `all` above and
         // bump this count; `all` is otherwise invisible to the assertion below.
-        const MCERROR_VARIANT_COUNT: usize = 28;
+        const MCERROR_VARIANT_COUNT: usize = 27;
         assert_eq!(
             all.len(),
             MCERROR_VARIANT_COUNT,
@@ -2703,7 +2682,6 @@ mod tests {
                 | McError::Migrating { .. }
                 | McError::FencedOut(_)
                 | McError::PermissionDenied(_)
-                | McError::MhAssignmentMissing(_)
                 | McError::TokenAcquisition(_)
                 | McError::TokenAcquisitionTimeout
                 | McError::MediaPolicyDivergence { .. } => false,

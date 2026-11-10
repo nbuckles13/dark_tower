@@ -6,12 +6,12 @@
 //! This rig is structurally a port of MH's canonical rig, with three principled
 //! divergences driven by MC's stack genuinely differing from MH's:
 //!
-//! 1. **Mock injection at `redis_client` and `mh_client` seams.** MC's
-//!    `WebTransportServer::new` takes an `Arc<dyn MhAssignmentStore>` and an
-//!    `Arc<dyn MhRegistrationClient>` — the Redis seam isn't in MH at all.
-//!    The rig accepts pre-built `Arc`s of these traits so callers can inject
-//!    `MockMhAssignmentStore` / `MockMhRegistrationClient` from
-//!    `tests/common/mod.rs`.
+//! 1. **Mock injection at the `mh_client` seam.** MC's
+//!    `WebTransportServer::new` takes an `Arc<dyn MhRegistrationClient>`; the
+//!    rig accepts a pre-built `Arc` so callers can inject
+//!    `MockMhRegistrationClient` from `tests/common/mod.rs`. (There is no
+//!    Redis seam: since story 4 MC-A no join reads the MH assignment — the
+//!    meeting's handler set is installed at actor creation.)
 //!
 //! 2. **No `SessionManagerHandle`.** MC has no equivalent type; sessions live
 //!    inside the `MeetingControllerActorHandle` actor hierarchy. The rig
@@ -49,7 +49,6 @@ use mc_service::actors::MeetingControllerActorHandle;
 use mc_service::auth::McJwtValidator;
 use mc_service::grpc::MhRegistrationClient;
 use mc_service::media_routing::PolicyGenerations;
-use mc_service::redis::MhAssignmentStore;
 use mc_service::webtransport::WebTransportServer;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
@@ -80,13 +79,11 @@ impl AcceptLoopRig {
     pub async fn start(
         controller_handle: Arc<MeetingControllerActorHandle>,
         jwt_validator: Arc<McJwtValidator>,
-        mh_store: Arc<dyn MhAssignmentStore>,
         mh_reg_client: Arc<dyn MhRegistrationClient>,
     ) -> Self {
         Self::start_with(
             controller_handle,
             jwt_validator,
-            mh_store,
             mh_reg_client,
             "mc-test".to_string(),
             "http://mc-test:50052".to_string(),
@@ -103,7 +100,6 @@ impl AcceptLoopRig {
     pub async fn start_with(
         controller_handle: Arc<MeetingControllerActorHandle>,
         jwt_validator: Arc<McJwtValidator>,
-        mh_store: Arc<dyn MhAssignmentStore>,
         mh_reg_client: Arc<dyn MhRegistrationClient>,
         mc_id: String,
         mc_grpc_endpoint: String,
@@ -112,7 +108,6 @@ impl AcceptLoopRig {
         Self::start_with_media_config(
             controller_handle,
             jwt_validator,
-            mh_store,
             mh_reg_client,
             mc_id,
             mc_grpc_endpoint,
@@ -132,7 +127,6 @@ impl AcceptLoopRig {
     pub async fn start_with_media_config(
         controller_handle: Arc<MeetingControllerActorHandle>,
         jwt_validator: Arc<McJwtValidator>,
-        mh_store: Arc<dyn MhAssignmentStore>,
         mh_reg_client: Arc<dyn MhRegistrationClient>,
         mc_id: String,
         mc_grpc_endpoint: String,
@@ -149,7 +143,6 @@ impl AcceptLoopRig {
             key_path,
             Arc::clone(&controller_handle),
             jwt_validator,
-            mh_store,
             mh_reg_client,
             Arc::clone(&policy_generations),
             mc_id,

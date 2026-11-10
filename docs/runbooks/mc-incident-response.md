@@ -1751,7 +1751,7 @@ kubectl describe networkpolicy mc-service -n dark-tower
 3. **MH JWKS unable to validate MC's service token** — MC presents a token that MH rejects at Layer 1 auth. Cross-check `mh_jwt_validations_total{token_type="service",result="failure"}`. See [MH Sc 2: JWT Validation Failures](mh-incident-response.md#scenario-2-jwt-validation-failures).
 4. **MH overloaded** — RPC succeeds but slowly; p95 climbs into the timeout budget. Scale MH.
 5. **MC overloaded / mailbox backpressure** — first-participant trigger task is queued behind other work; the 1+2s retry budget elapses before the network path even matters. See [Scenario 1: High Mailbox Depth](#scenario-1-high-mailbox-depth).
-6. **Stale Redis MH assignment data** — assignment points at MH endpoints that no longer exist (drained / scaled-down). MC will exhaust retries against ghost endpoints. Check `MhAssignmentStore` freshness vs current MH pod IPs.
+6. **A meeting's handler set names an MH that no longer exists** (drained / restarted after the meeting was created). Since story 4 MC-A a meeting's handler set is fixed when GC assigns it and is never re-read (no join reads Redis), so MC will exhaust retries against that endpoint for the meeting's life. Compare the failing `mh_grpc_endpoint` in MC's "RegisterMeeting retries exhausted" line with the live MH pods.
 
 **Remediation**:
 
@@ -1789,16 +1789,17 @@ kubectl rollout undo deployment/mc-0 -n dark-tower
 # Shed load instead by capping admission -- see MC_MAX_MEETINGS /
 # MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
-# Step 6: If stale Redis MH assignment data — escalate to MC Team to investigate
-#         MhAssignmentStore TTL / refresh logic. Affected meetings will recover
-#         on next first-participant join after the assignment is refreshed.
+# Step 6: If a meeting's handler set names a gone MH — no Redis refresh fixes a
+#         LIVE meeting (its set is MC's own since story 4 MC-A). Until story 4's
+#         replacement path (MC-C), end the affected meeting; the new meeting
+#         gets a fresh assignment from GC. See Scenario 18 arm (f).
 
 # Verify recovery
 sum by(status) (rate(mc_register_meeting_total[5m]))
 # status="success" should dominate; status="error" rate should drop to baseline.
 ```
 
-Expected recovery time: 30-60s for horizontal MC scale; 1-2 minutes for NetworkPolicy revert; 2-3 minutes for AC service-token rotation + MC restart. Stale Redis assignment data: bounded by Redis TTL refresh (consult MhAssignmentStore config) — affected meetings recover on next first-participant-join after refresh.
+Expected recovery time: 30-60s for horizontal MC scale; 1-2 minutes for NetworkPolicy revert; 2-3 minutes for AC service-token rotation + MC restart. A meeting whose handler set names a gone MH: does not recover on its own until story 4's replacement path (MC-C); ending the meeting and rejoining recovers it.
 
 **Rollback nuance**: `RegisterMeeting` is a new RPC. If MH is rolled back to a pre-RegisterMeeting build, MC will keep sending the RPC, exhaust retries, and log `"RegisterMeeting retries exhausted"` for each affected meeting. **Clients are NOT stranded by this** — they still establish WebTransport sessions to the rolled-back MH via JWT, and the active/active topology covers any meeting where some assigned MHs are on the new build. If you must roll MH back during a coordinated incident, expect sustained `mc_register_meeting_total{status="error"}` for the duration of the rollback window; suppress alerts for that period rather than blocking the rollback.
 
@@ -1829,7 +1830,7 @@ Expected recovery time: 30-60s for horizontal MC scale; 1-2 minutes for NetworkP
 **Symptoms** — read `mc_mh_notifications_unapplied_total` PER REASON, never as one rate:
 - `unknown_connection` — **routine**: every connection MC declined to bind sends a Disconnected for a key MC never recorded. Only sustained volume far above the join rate is a signal.
 - `meeting_unknown` — notifications naming a meeting this MC does not hold (both events).
-- `handler_not_in_set` — the MH-asserted `handler_id` is not byte-identical to a handler of the meeting's frozen set. **Sustained**, it means an MH process restarted under a new (per-incarnation) id and story-4 re-registration has not happened: that meeting's connectivity to the dead id is stale and **will not clear on its own** — see Scenario 18 arm (a).
+- `handler_not_in_set` — the MH-asserted `handler_id` is not byte-identical to a handler of the meeting's handler set (MC-owned since story 4 MC-A; no mid-meeting changes until story 4's replacement path). **Sustained**, it means an MH process restarted under a new (per-incarnation) id and story-4 re-registration has not happened: that meeting's connectivity to the dead id is stale and **will not clear on its own** — see Scenario 18 arm (a).
 - `connection_bound_refused` — **expected-empty**: one participant exceeded the per-handler live-connection bound (a reconnect storm or leaked sessions).
 - `retired_connection` — a Connected delivered after its own Disconnected (MH abandoned the RPC); MC's tombstone refused it. Non-zero means MH→MC RPCs are slow enough to be abandoned — check MH Scenario 10.
 - `mc_mh_notifications_without_connection_id_total` non-zero — an MH image predating `connection_id` is still in the fleet: that MH gets the degraded legacy semantics (a stale disconnect can remove a live connection).
@@ -1867,7 +1868,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 
 1. **Diffuse, many-MH, many-meeting `meeting_unknown` → Operational drift.** GC reassigned meetings but an old MH notified briefly; or MC restarted and lost its meeting actors, so in-flight notifications name meetings the new instance never held. Self-heals as participants reconnect (a fresh join re-dials every MH).
 2. **Concentrated, single-MH source identity, many unknown meetings → Authenticated-MH misbehavior.** Compromised MH credentials probing the MediaCoordinationService, or a misconfigured MH notifying the wrong MC. **Treat as a security incident**: preserve logs, snapshot the metrics, do **NOT** restart MC, escalate to Security Team.
-3. **Sustained `handler_not_in_set` on one meeting → an MH restarted.** Its new process registered under a new id outside the meeting's frozen set. Pre-existing gap (story 4 handler-restart detection); see Scenario 18 arm (a) for the remedy participants have today.
+3. **Sustained `handler_not_in_set` on one meeting → an MH restarted.** Its new process registered under a new id outside the meeting's handler set. Pre-existing gap (story 4 handler-restart detection); see Scenario 18 arm (a) for the remedy participants have today.
 4. **`connection_bound_refused` → reconnect storm / leaked sessions from one participant.** Self-scoped (only that participant is affected). Correlate with the client's reconnect behaviour.
 
 **Remediation**:
@@ -2098,7 +2099,7 @@ sum by (outcome) (rate(mc_media_send_directives_total{outcome!~"emitted|emitted_
 | `emitted_empty_targets` | **normal** | Composed with no target on any kind: send nothing. Routine for a solo participant, a participant nobody watches, and a participant whose every published kind is withdrawn. | — |
 | `meeting_state_unavailable` | **fault** (environmental) — **warning** (`MCMediaSendDirectiveFailures`) | Its only producer is a POST-JOIN capability re-declaration the meeting actor did not register (`connection.rs`, the redeclare path): the actor is gone, usually because the meeting is ending or the participant already left. The participant is **not** darkened: its previous declaration and view stay in force. The shipped SDK never re-declares (`SignalingClient.sendReceiveCapability` has no production caller), so today this is near-unreachable; an isolated occurrence at a meeting's end is benign, and recurring occurrences in live meetings are actor health. | Actor health: Scenario 1 (mailbox depth) and Scenario 2 (actor panics). |
 | `assignment_failed` | **fault** (MC defect) — **PAGE** (`MCMediaSendDirectiveDefect`) | MC could not render the meeting's slot table into a forwarding assignment. *(Reclassified from "environmental" by OBS-B: its only producer is the render's egress-ordinal overflow, which the startup-validated per-kind slot caps make unreachable, so a hit is an MC invariant violation.)* It is **meeting-wide**: every participant of that meeting fails composition and MH is not programmed for it. | [Paged response](#send-directive-defect-page) below. Read the `Forwarding assignment could not be rendered` ERROR at `mc.register_meeting.trigger`. |
-| `handler_url_unresolved` | **fault** (MC defect) — **PAGE** (`MCMediaSendDirectiveDefect`) | **MC-internal defect since story 2.** Every url comes from one frozen handler set, so a miss cannot happen by construction. It fails closed: nothing is sent to that participant. | [Paged response](#send-directive-defect-page) below. |
+| `handler_url_unresolved` | **fault** (MC defect) — **PAGE** (`MCMediaSendDirectiveDefect`) | **MC-internal defect since story 2.** Every url and handler_ref comes from one lookup of the meeting's handler set (Active members only), and edges are routed over Active members only, so a miss cannot happen by construction. It fails closed: nothing is sent to that participant. | [Paged response](#send-directive-defect-page) below. |
 | `unknown_stream_number`, `transport_mode_unspecified` | **fault** (MC defect) — **PAGE** (`MCMediaSendDirectiveDefect`) | **MC-internal defects**, fail-closed. | [Paged response](#send-directive-defect-page) below. |
 | *any token not listed above* | **unclassified** — **warning** (`MCMediaSendDirectiveFailures`, negated selector) | A `DirectiveOutcome` variant added without classifying it. Build-time, `DirectiveOutcome::alert_class()` (no wildcard) and its rule-pinning test should have stopped this; reaching runtime means the rule file and the enum drifted. | File against `meeting-controller` + `observability`: classify the token in `alert_class()` and in both rule selectors. |
 
@@ -2106,7 +2107,7 @@ sum by (outcome) (rate(mc_media_send_directives_total{outcome!~"emitted|emitted_
 
 **Paged: `MCMediaSendDirectiveDefect`.** These tokens read zero on a healthy fleet (zero-initialised
 across `DirectiveOutcome::ALL`), so one increment is a real defect. Each failure is a deterministic
-function of meeting-lifetime state (the stream policy, the frozen handler set, the rendered slot
+function of meeting-lifetime state (the stream policy, the meeting's handler set, the rendered slot
 table) and composition fails **closed with no retry**: the affected participant (for
 `assignment_failed`, the whole meeting) receives neither a `SendDirective` nor `StreamAssignments`.
 It neither sends nor receives for the rest of the meeting, while join, roster and every other signal
@@ -3466,15 +3467,37 @@ crossing.
 - **Do not restart MH to clear it.** It sheds every session on the pod, recovers no affected
   meeting, and destroys the evidence.
 
-**(f) `mc_media_handler_set_divergence_total` is non-zero.** A join carried a handler set that
-differs from the meeting's frozen set (Redis and the actor disagree). MC kept the frozen set, so no
-edge moved. This is an MC-internal invariant violation: **capture and escalate** to
-`meeting-controller`; restarting nothing fixes it.
+**(f) The join succeeded but its handler set is empty or partial, so nobody has media (story 4
+MC-A, register before token).** A handler enters a meeting's client-facing set only once its
+`RegisterMeeting` is acked. The first joins of a meeting wait for that ack (at most 8 s), then
+succeed with whatever registered — possibly nothing. Until story 4's replacement path (MC-C) lands,
+an initial handler that never acks stays out of the set for the meeting's life: the meeting is
+up, everyone is on the roster, and nobody can dial a handler.
+- **Confirm**: there is NO client-side error (an empty handler list does not throw in the SDK;
+  slots may still read ACTIVE). Look for a WARN at `mc.actor.meeting` "Parked joins released
+  without every initial media handler registered" for the meeting, with `release_reason` (`verdicts` = the MH answered but
+  refused or errored; `deadline` = it never answered) and `unacked_handler_ids`. The same handler
+  shows the pusher's ERROR "RegisterMeeting retries exhausted" or "RegisterMeeting failed
+  terminally" at `mc.register_meeting.trigger`, and non-`match` outcomes on
+  `mc_media_policy_pushes_total`. `mc_session_join_duration_seconds` shows the parked joins in its
+  upper buckets.
+- **Remedy**: fix the named handler (Scenario 12 for flaky coordination; roll MH forward for a
+  terminal `transport_mode_mismatch`). **Until the SDK consumes the set update (story 4 C1),
+  participants released with an empty or partial set do NOT pick up a handler that registers
+  later**: today's SDK reads only `JoinResponse.media_servers` and dials once. So once the named
+  handler is fixed and registered, every participant who joined during the empty/partial window
+  RELOADS (scope it to the meeting; the affected ones are not identifiable from the client).
+  Participants who join after the registration get it in their JoinResponse. After C1, the set
+  update reaches them with no rejoin. If the handler cannot be fixed, end the meeting and let
+  participants rejoin: the new meeting gets a new assignment from GC.
+- (The former arm (f), the handler-set divergence counter, is retired: the handler set is MC's
+  own from meeting creation and no join reads Redis, so there is nothing left to diverge.)
 
 **Escalation**: none for (b); for (a) per its fork (MH/network for an unreached handler; rejoin for
 `handler_not_in_set`; MH Scenario 10 for a broken notification path); `media-handler` + operations
 for (c); client team or `meeting-controller` for (c2) per its fork; per Scenario 15 for (d);
-`meeting-controller` for (e) if it does not self-clear, and for (f).
+`meeting-controller` for (e) if it does not self-clear; for (f) the owner of the named handler
+(`media-handler`), and `meeting-controller` if the handler registered but the set never updated.
 
 ### Scenario 19: KEK Rotation Stalled
 

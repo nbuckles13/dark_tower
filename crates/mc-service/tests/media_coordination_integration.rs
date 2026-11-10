@@ -119,7 +119,7 @@ async fn seed_participant(
     participant_id: &str,
 ) -> u32 {
     controller
-        .create_meeting(meeting_id.to_string())
+        .create_meeting(meeting_id.to_string(), test_common::default_handler_set())
         .await
         .expect("create_meeting should succeed");
 
@@ -479,7 +479,10 @@ async fn one_user_with_two_participants_is_ambiguous_and_fails_closed() {
     // wrong.
     let controller = make_controller();
     controller
-        .create_meeting("meeting-dual".to_string())
+        .create_meeting(
+            "meeting-dual".to_string(),
+            test_common::default_handler_set(),
+        )
         .await
         .expect("create_meeting");
 

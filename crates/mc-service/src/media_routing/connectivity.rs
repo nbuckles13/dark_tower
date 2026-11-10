@@ -7,7 +7,7 @@
 //! `NotifyParticipantDisconnected` (`grpc/media_coordination.rs`), whose
 //! participant identity is the validated meeting token's `sub` (resolved to ONE
 //! roster entry by the meeting actor, or to none) and whose `handler_id` is
-//! resolved against the meeting's frozen set by exact match. The client-reported
+//! resolved against the meeting's handler set by exact match. The client-reported
 //! `ParticipantActor::mh_statuses` map is a diagnostic and is never read here.
 //!
 //! # Keyed by connection, never by (participant, handler)
@@ -51,7 +51,7 @@
 //! Residual, by its trigger: more than [`RETIRED_CONNECTION_TOMBSTONES`]
 //! retirements for one participant between an abandoned Connected and its
 //! delayed arrival. The consequence is misrouting inside the meeting's own
-//! frozen handler set (security S1b's class), never cross-meeting.
+//! handler set (security S1b's class), never cross-meeting.
 //!
 //! # The settle rule — why the window exists (Lead ruling R2)
 //!
@@ -179,7 +179,7 @@ pub enum Unapplied {
     /// `SenderLookup::Ambiguous`.
     UserAmbiguous,
     /// The `handler_id` is not byte-identical to a handler of the meeting's
-    /// frozen set. Sustained, it means an MH process restarted under a new id
+    /// handler set. Sustained, it means an MH process restarted under a new id
     /// and story-4 re-registration has not happened.
     HandlerNotInSet,
     /// A Disconnected for a key this participant does not hold. Routine.
@@ -420,7 +420,10 @@ impl ParticipantConnectivity {
     }
 
     /// The set routing should use: the live handlers once settled, else `None`.
-    /// Built only from endpoints the meeting's frozen set resolves.
+    /// Built only from ACTIVE members of the meeting's set (ADR-0039 §3: a
+    /// handler whose registration is not yet acked is never client-visible,
+    /// so no edge — and therefore no `SendTarget` or `StreamAssignment` — may
+    /// name it).
     #[must_use]
     pub fn routable(&self, handlers: &MeetingHandlers) -> Option<ConnectedHandlers> {
         if self.phase != Phase::Settled || self.live.is_empty() {
@@ -428,7 +431,7 @@ impl ParticipantConnectivity {
         }
         let mut set = ConnectedHandlers::new();
         for id in self.live.keys() {
-            if let Some(endpoint) = handlers.get(id) {
+            if let Some(endpoint) = handlers.active_endpoint(id) {
                 set.insert(endpoint);
             }
         }
@@ -465,12 +468,7 @@ mod tests {
     const W: Duration = Duration::from_millis(1500);
 
     fn handlers() -> MeetingHandlers {
-        MeetingHandlers::new(["mh-0", "mh-1"].iter().map(|id| HandlerEndpoint {
-            id: HandlerId::new(*id),
-            webtransport_url: format!("https://{id}.example:4434"),
-            grpc_endpoint: format!("http://{id}.example:50053"),
-        }))
-        .unwrap()
+        MeetingHandlers::active_test_ids(&["mh-0", "mh-1"])
     }
 
     fn ep(set: &MeetingHandlers, id: &str) -> HandlerEndpoint {
@@ -484,6 +482,23 @@ mod tests {
     fn ids(c: &ParticipantConnectivity, set: &MeetingHandlers) -> Option<Vec<String>> {
         c.routable(set)
             .map(|r| r.iter().map(ToString::to_string).collect())
+    }
+
+    /// Register before token: a connection observed on a handler whose
+    /// registration is not yet acked is never routable; once it is Active the
+    /// same observation is.
+    #[test]
+    fn a_registering_handler_is_never_routable() {
+        let mut set =
+            MeetingHandlers::from_handoff([MeetingHandlers::test_endpoint("mh-0")]).unwrap();
+        let t0 = Instant::now();
+        let mut c = ParticipantConnectivity::default();
+        c.connect(&ep(&set, "mh-0"), key("a"), t0, W).unwrap();
+        assert_eq!(c.poll(t0, 1), Some(SettleOutcome::Complete));
+        assert_eq!(ids(&c, &set), None, "Registering: not routable");
+        let r = set.handler_ref_of(&HandlerId::new("mh-0")).unwrap();
+        set.mark_active(&HandlerId::new("mh-0"), r).unwrap();
+        assert_eq!(ids(&c, &set), Some(vec!["mh-0".into()]), "Active: routable");
     }
 
     #[test]

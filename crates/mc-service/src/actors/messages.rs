@@ -17,6 +17,8 @@ pub enum ControllerMessage {
     /// Create a new meeting actor for the given meeting ID.
     CreateMeeting {
         meeting_id: String,
+        /// The meeting's handler set, from GC's hand-off (ADR-0039 §3).
+        handlers: crate::media_routing::MeetingHandlers,
         /// Response channel for the meeting actor handle or error.
         respond_to: oneshot::Sender<Result<(), McError>>,
     },
@@ -56,6 +58,7 @@ pub enum ControllerMessage {
     #[cfg(feature = "test-seams")]
     CreateMeetingWithSeams {
         meeting_id: String,
+        handlers: crate::media_routing::MeetingHandlers,
         seams: super::meeting_media::MeetingSeams,
         respond_to: oneshot::Sender<Result<(), McError>>,
     },
@@ -89,8 +92,9 @@ pub enum ControllerMessage {
         is_host: bool,
         /// Sender for writing framed protobuf bytes to the WebTransport stream.
         stream_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
-        /// Media-routing inputs: server dependencies and the meeting's handler
-        /// set as read for this join (frozen by the actor at the first join).
+        /// Media-routing inputs: server dependencies and the joiner's media
+        /// declaration. (The handler set is the meeting's own, installed at
+        /// actor creation.)
         media: super::meeting_media::JoinMedia,
         /// Response channel sent back to the WebTransport connection actor.
         respond_to: oneshot::Sender<Result<JoinResult, McError>>,
@@ -206,7 +210,7 @@ pub enum MeetingMessage {
         /// The token `sub` MH reported.
         user_id: String,
         /// The MH-asserted handler id; resolved by exact match against the
-        /// meeting's frozen set, never trusted as a string.
+        /// meeting's handler set, never trusted as a string.
         handler_id: String,
         /// MH's opaque per-session connection id (empty = legacy MH).
         connection_id: String,
@@ -299,7 +303,7 @@ pub enum MeetingMessage {
     /// handler (`media_routing::teardown`). This was named `EndMeeting` before
     /// story 2 task 12; it was renamed so the two concepts stop sharing a name.
     /// Closing a meeting RUNS that release, on every handler of the meeting's
-    /// frozen set, after its push workers drain.
+    /// handler set, after its push workers drain.
     CloseMeeting {
         reason: String,
         /// Response channel for confirmation.
@@ -352,6 +356,17 @@ pub enum ParticipantMessage {
         /// Exactly one outcome per recipient; see `KekPushOutcome`. A dropped
         /// sender is read by the collector as `actor_unavailable`.
         respond_to: oneshot::Sender<crate::media_admission::KekPushOutcome>,
+    },
+
+    /// Deliver the meeting's client-facing handler set (`MediaHandlerSet`,
+    /// ADR-0039 §4) after a membership change.
+    ///
+    /// A dedicated variant rather than a `Send { SignalingPayload::Raw }`: the
+    /// set is encoded at the participant actor, so when MC-D adds a per-member
+    /// `media_dial_token` the credential never travels the mailbox as raw
+    /// bytes, and a dropped set is counted under its own `payload_kind`.
+    HandlerSet {
+        set: crate::media_routing::ClientHandlerSet,
     },
 
     /// Close the participant actor gracefully.
@@ -505,21 +520,22 @@ pub struct JoinResult {
     pub kek_rotation_debounce_seconds: u32,
     /// Handle to the spawned ParticipantActor.
     pub participant_handle: ParticipantActorHandle,
-    /// The meeting's FROZEN handler set (ADR-0036 §9). `JoinResponse.media_servers`
-    /// carries every handler in it: every participant is offered the whole set
-    /// and connects to all it can. The frozen value, never the Redis read this
-    /// join happened to make, so a divergent registration cannot widen it.
-    pub media_handlers: crate::media_routing::MeetingHandlers,
+    /// The meeting's client-facing handler snapshot (ADR-0039 §4): Active
+    /// handlers only, with the version. The ONE source of both
+    /// `JoinResponse.media_handler_set` and the legacy `media_servers`. Taken
+    /// when the reply is SENT — for a parked join, at release, not at
+    /// admission.
+    pub handler_set: crate::media_routing::ClientHandlerSet,
 }
 
 /// Result of a successful reconnection.
 ///
 /// **No handler field yet, and that is deliberate** (reconnect is not wired
 /// into the WebTransport path; `handle_reconnect` has no caller). When it is:
-/// the proto's reconnect response is `JoinResponse`-shaped, and its
-/// `media_servers` MUST carry the meeting's FULL frozen `MeetingHandlers` set
-/// (ADR-0036 §9) — never the registration's (Redis) handler list, which could
-/// have diverged. Mirror `JoinResult::media_handlers`.
+/// the proto's reconnect response is `JoinResponse`-shaped, and its handler
+/// set MUST be the meeting's current client snapshot
+/// (`MeetingHandlers::client_snapshot`, Active only). Mirror
+/// `JoinResult::handler_set`.
 #[derive(Debug, Clone)]
 pub struct ReconnectResult {
     /// Confirmed participant ID.

@@ -652,6 +652,9 @@ export AC_JWKS_URL="http://localhost:8082/.well-known/jwks.json"
 export MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS="64"
 export MC_KEK_ROTATION_DEBOUNCE_SECONDS="60"
 export MC_MEDIA_CONNECT_SETTLE_MS="1500"
+# Capacity caps (required since story 4 MC-A, R-37): missing, unparseable or 0 refuses boot.
+export MC_MAX_MEETINGS="1000"
+export MC_MAX_PARTICIPANTS="10000"
 # Story 3 per-kind receive-slot caps (required). Video 0 is the video-off lever.
 export MC_MAX_AUDIO_RECEIVE_SLOTS="8"
 export MC_MAX_VIDEO_RECEIVE_SLOTS="4"

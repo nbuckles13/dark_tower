@@ -2,8 +2,9 @@
 //! tasks 6 and 20; R-2, R-3, R-4, R-33; ADR-0036 §6, §9), extended to two slot
 //! kinds by story 3 MC-A (R-1, R-2, R-3, R-4, R-8, R-22, R-26).
 //!
-//! Every participant is OFFERED every handler of its meeting
-//! (`JoinResponse.media_servers` = the full registered set) and MC routes each
+//! Every participant is OFFERED every REGISTERED handler of its meeting
+//! (`JoinResponse.media_handler_set`, and the legacy `media_servers` as the
+//! same projection — story 4 MC-A) and MC routes each
 //! pair through a handler BOTH are connected to — where "connected" is what MH
 //! observes and reports, never what a client claims. So these mock clients
 //! produce partial connectivity the only way a real client can: by which
@@ -132,6 +133,72 @@ async fn cluster() -> ClusterConnection {
 
 const MARK: [u8; 3] = [0xA0, 0xB0, 0xC0];
 
+/// Story 4 MC-A (ADR-0039 §4): a real join's `MediaHandlerSet` carries
+/// non-zero, distinct refs at a non-zero version; its urls are exactly the
+/// legacy `media_servers` (double-population consistency) and each belongs to
+/// a live MH discovered by label (never a literal); and every joiner of the
+/// meeting — the parked first joins and the later ones — holds the SAME
+/// version and refs (later joins never change membership).
+///
+/// "Names only REGISTERED handlers" is not provable here directly while MH
+/// still accepts a dial before `RegisterMeeting` (its pending path; deleted by
+/// MH-1): the ordering proof is Tier 1b
+/// (`crates/mc-service/tests/handler_set_integration.rs`,
+/// `no_set_names_a_handler_before_its_registermeeting_ack`). MH-1 / T-1's
+/// bus-based check (a fresh `mh up` handler receives no dial before MC
+/// registers it) closes that residual at Layer 7. What IS asserted live: the
+/// set is complete on a healthy cluster, which needs every initial
+/// `RegisterMeeting` acked (an unacked handler is never listed).
+async fn assert_handler_sets_are_ref_addressed_and_registered(phase: &str, ps: &[Participant]) {
+    let live = env_tests::fixtures::mh_address::live_mh_addresses().await;
+    let first = ps[0].handler_set().clone();
+    assert!(
+        !first.handlers.is_empty(),
+        "{}: {phase} the JoinResponse handler set is EMPTY on a healthy cluster: no initial \
+         handler acked RegisterMeeting (check MC's 'Parked joins released' WARN)",
+        participant::TRIAGE_HANDLER_SET
+    );
+    assert_ne!(first.handler_set_version, 0, "{phase}: version is non-zero");
+    let refs: BTreeSet<u32> = first.handlers.iter().map(|h| h.handler_ref).collect();
+    assert_eq!(
+        refs.len(),
+        first.handlers.len(),
+        "{phase}: refs are distinct"
+    );
+    assert!(!refs.contains(&0), "{phase}: no ref is 0");
+    for p in ps {
+        let set = p.handler_set();
+        let mut urls: Vec<String> = set
+            .handlers
+            .iter()
+            .map(|h| h.media_handler_url.clone())
+            .collect();
+        urls.sort();
+        assert_eq!(
+            urls,
+            p.offered(),
+            "{phase}/{}: the set and the legacy media_servers are one projection",
+            p.label
+        );
+        for url in &urls {
+            assert!(
+                live.contains(url),
+                "{phase}/{}: {url} is not the address of any live MH ({live:?})",
+                p.label
+            );
+        }
+        assert_eq!(
+            set, &first,
+            "{phase}/{}: every joiner holds the same version and refs",
+            p.label
+        );
+        assert!(
+            set.handlers.iter().all(|h| h.media_dial_token.is_empty()),
+            "{phase}: media_dial_token is empty until MC-D"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_canonical_partial_connectivity_across_two_handlers() {
     let cluster = cluster().await;
@@ -142,6 +209,10 @@ async fn test_canonical_partial_connectivity_across_two_handlers() {
 
     // 1. PRECONDITION. `x` and `y` are an ARBITRARY labelling of the two.
     let (x, y) = two_offered_handlers("CANONICAL", &ps);
+    // 1b. Story 4 MC-A: the set every joiner was given (only AFTER the
+    // completeness precondition, so a late second ack cannot read as a
+    // stability failure).
+    assert_handler_sets_are_ref_addressed_and_registered("CANONICAL", &ps).await;
     let ids: Vec<u32> = ps.iter().map(Participant::sender_id).collect();
 
     // 2. REACH: A opens both; B only x; C only y.

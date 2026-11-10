@@ -633,9 +633,11 @@ fn header_version() -> u32 {
 /// restores within the same structural change.
 ///
 /// One target per handler, never per edge: the client encrypts each frame
-/// once and transmits it to every target. Target urls come from the meeting's
-/// frozen [`MeetingHandlers`], the same value `JoinResponse.media_servers` and
-/// `StreamAssignment.media_handler_url` are read from. Each target's transport
+/// once and transmits it to every target. Target urls and `handler_ref`s come
+/// from the meeting's [`MeetingHandlers`] client view
+/// ([`MeetingHandlers::client_handler`], Active members only), the same
+/// lookup `MediaHandlerSet`, `JoinResponse.media_servers` and every
+/// `StreamAssignment` are read from. Each target's transport
 /// is its stream's kind's ([`transport_of`]): datagrams for audio,
 /// stream-per-group for video.
 ///
@@ -694,15 +696,19 @@ pub fn build_send_directive(
         let handlers = kind.of_ref(&owners);
         let mut targets = Vec::with_capacity(handlers.len());
         for handler in handlers.iter().filter(|_| !withdrawn) {
-            let Some(url) = meeting_handlers.url_of(handler) else {
-                // Fail loud rather than emit a target with an empty url.
+            // The ONE client-view lookup (Active members only): the url and
+            // the ref come from the same entry, so they cannot disagree.
+            let Some(client) = meeting_handlers.client_handler(handler) else {
+                // Fail loud rather than emit a target with an empty url or a
+                // ref the client's set does not hold (routing admits Active
+                // handlers only, so this is an MC invariant violation).
                 return Err(DirectiveOutcome::HandlerUrlUnresolved);
             };
             targets.push(SendTarget {
-                media_handler_url: url.to_string(),
+                // Legacy url, double-populated until C1/P3 (ADR-0039 §4).
+                media_handler_url: client.url.to_string(),
                 transport_mode: transport_mode as i32,
-                // Story 4 additive contract: MC populates the ref in MC-A.
-                handler_ref: 0,
+                handler_ref: client.handler_ref.get(),
             });
         }
         any_target |= !targets.is_empty();
@@ -746,9 +752,7 @@ pub fn build_send_directive(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::media_routing::{
-        HandlerEndpoint, SlotTable, MAIN_AUDIO_STREAM_NUMBER, MAIN_VIDEO_STREAM_NUMBER,
-    };
+    use crate::media_routing::{SlotTable, MAIN_AUDIO_STREAM_NUMBER, MAIN_VIDEO_STREAM_NUMBER};
     use proto_gen::dark_tower::signaling::v1::MediaKind;
     use std::collections::BTreeMap;
     use std::num::NonZeroU16;
@@ -773,12 +777,7 @@ mod tests {
     }
 
     fn handler_set(handlers: &[&str]) -> MeetingHandlers {
-        MeetingHandlers::new(handlers.iter().map(|h| HandlerEndpoint {
-            id: HandlerId::new(*h),
-            webtransport_url: format!("https://{h}.example:4434"),
-            grpc_endpoint: format!("http://{h}.example:50053"),
-        }))
-        .unwrap()
+        MeetingHandlers::active_test_ids(handlers)
     }
 
     fn av() -> PublishSet {
