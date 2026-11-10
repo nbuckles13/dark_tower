@@ -1759,7 +1759,7 @@ tasks:
   slug: 2026-11-10-mh-close-codes
   tag: story-2026-10-31-survive-handler-loss-task-MH-CLOSE
 - id: 15
-  status: pending
+  status: completed
   specialist: media-handler
   deps:
   - 13
@@ -1844,6 +1844,7 @@ tasks:
 
     CROSS-TASK OBLIGATIONS
     (a) no new config key; (b) retirements carry their catalog/panel/alert/runbook references; (c) series hygiene as above; (d) test-gates MH section implemented here, paired with test; (e) R4 label hygiene (no id labels; transitions-only logs). Tier: full.
+  slug: 2026-11-10-mh-heartbeat-verdicts
   tag: story-2026-10-31-survive-handler-loss-task-MH-2
 - id: 16
   status: pending
