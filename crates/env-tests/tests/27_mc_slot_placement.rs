@@ -3,8 +3,8 @@
 //! kinds by story 3 MC-A (R-1, R-2, R-3, R-4, R-8, R-22, R-26).
 //!
 //! Every participant is OFFERED every REGISTERED handler of its meeting
-//! (`JoinResponse.media_handler_set`, and the legacy `media_servers` as the
-//! same projection — story 4 MC-A) and MC routes each
+//! (`JoinResponse.media_handler_set`, then each set `ServerMessage` — story 4
+//! MC-A) and MC routes each
 //! pair through a handler BOTH are connected to — where "connected" is what MH
 //! observes and reports, never what a client claims. So these mock clients
 //! produce partial connectivity the only way a real client can: by which
@@ -134,9 +134,8 @@ async fn cluster() -> ClusterConnection {
 const MARK: [u8; 3] = [0xA0, 0xB0, 0xC0];
 
 /// Story 4 MC-A (ADR-0039 §4): a real join's `MediaHandlerSet` carries
-/// non-zero, distinct refs at a non-zero version; its urls are exactly the
-/// legacy `media_servers` (double-population consistency) and each belongs to
-/// a live MH discovered by label (never a literal); and every joiner of the
+/// non-zero, distinct refs at a non-zero version; each url belongs to a live
+/// MH discovered by label (never a literal); and every joiner of the
 /// meeting — the parked first joins and the later ones — holds the SAME
 /// version and refs (later joins never change membership).
 ///
@@ -171,20 +170,12 @@ async fn assert_handler_sets_are_ref_addressed_and_registered(
     );
     assert!(!refs.contains(&0), "{phase}: no ref is 0");
     for p in ps {
+        // (T-1: the "set == legacy media_servers" arm is gone. `offered()` now
+        // reads the set, so it would compare the set with itself; the
+        // double-population property is MC's, unit-tested in
+        // `mc-service/src/webtransport/connection.rs`, and P3 deletes the field.)
         let set = p.handler_set();
-        let mut urls: Vec<String> = set
-            .handlers
-            .iter()
-            .map(|h| h.media_handler_url.clone())
-            .collect();
-        urls.sort();
-        assert_eq!(
-            urls,
-            p.offered(),
-            "{phase}/{}: the set and the legacy media_servers are one projection",
-            p.label
-        );
-        for url in &urls {
+        for url in &p.offered() {
             assert!(
                 live.contains(url),
                 "{phase}/{}: {url} is not the address of any live MH ({live:?})",

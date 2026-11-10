@@ -61,3 +61,5 @@ pub mod canary;
 pub mod cluster;
 pub mod eventual;
 pub mod fixtures;
+#[cfg(test)]
+mod resilience_hygiene;

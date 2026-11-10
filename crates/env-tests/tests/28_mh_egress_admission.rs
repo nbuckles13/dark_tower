@@ -397,7 +397,12 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
         )
         .await;
         let mut media = Vec::new();
-        for server in &join.media_servers {
+        for server in &join
+            .media_handler_set
+            .as_ref()
+            .expect("MC always sends a media_handler_set")
+            .handlers
+        {
             media.push(mc_session::mh_connect(&server.media_handler_url, &gc_join.token).await);
         }
         ps.push(Participant {

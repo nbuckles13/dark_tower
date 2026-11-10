@@ -10,10 +10,10 @@ O-4 MERGED CONTRACT (infrastructure + test; incorporates the GC and ops asks): i
 
 3. EXIT CODES + TOKENS. The token list has ONE home, an array in mh.sh. mh.test.sh asserts both directions (every token emitted by some case, every emitted token listed).
    0 OK           ok
-   1 FAIL         mh-rollout-failed, drain-timeout, not-available-timeout, kubectl-failed, internal-error
-   2 PRECONDITION usage, no-kubeconfig, no-template, prerequisite-missing
+   1 FAIL         mh-rollout-failed, drain-timeout, not-available-timeout, kubectl-failed, internal-error, signal-failed, debug-container-timeout
+   2 PRECONDITION usage, no-kubeconfig, no-template, prerequisite-missing, mh-no-share-process-namespace
    3 CAPACITY     mh-no-free-slot
-   4 REFUSED      last-serving-mh, stuck-terminating, foreign-owner
+   4 REFUSED      last-serving-mh, stuck-terminating, foreign-owner, mh-not-serving
    5 BUSY         mh-pool-busy (DETAIL=holder=<owner>)
    Ops' runbook branches on last-serving-mh / stuck-terminating / drain-timeout; each is a distinct token.
    On not-available-timeout, `up` leaves the pod in place for diagnosis and prints the drain command (fail loudly, no silent self-clean).
@@ -40,6 +40,12 @@ O-4 MERGED CONTRACT (infrastructure + test; incorporates the GC and ops asks): i
      Idempotent: an empty slot exits 0 with "drained": false.
    - drain --owner ID --all is run teardown.
    - upgrade is as agreed in ADR-0039 (serial, resumable via replaces=).
+   - [T-1 amendment, Lead-approved 2026-11-10; additive, exit groups unchanged] signal <k> KILL|STOP|CONT --owner ID [--timeout S] --json is the TEST-ONLY process injector (ADR-0039 §9), the ONE home of the recipe both the env-test fixture and the browser harness call.
+     Owner-gated: --owner is required and must equal the slot's owner, else foreign-owner. There is NO --force, so baseline and manual MHs cannot be signalled.
+     It takes NO mh-pool Lease: it creates and deletes nothing, so it changes no pool membership (the Lease cases in §9 need no signal row). The only other actor on a run-owned slot is that run; a pod gone mid-signal is mh-not-serving or debug-container-timeout, never a false OK.
+     Preflight: a live, non-deleting pod in the slot (serving or starting; a frozen MH fails readiness) else mh-not-serving (4); spec.shareProcessNamespace=true on that live pod else mh-no-share-process-namespace (2), DETAIL "pod <name> lacks shareProcessNamespace: mh-template is stale or not Kind-rendered; re-run deploy (infra/kind/scripts/deploy.sh)".
+     Mechanism: one never-attached `kubectl debug` ephemeral container per call (--profile=restricted plus a securityContext of uid/gid 65532, runAsNonRoot, not privileged, no privilege escalation, capabilities drop ALL; the digest-pinned MH_DEBUG_IMAGE that deploy.sh preloads). It runs a constant script that re-checks the signal against the closed set, signals the ONE process whose comm is mh-service with a decimal pid > 1 (never PID 1), and waits for the effect in /proc/<pid>/stat. A non-zero script exit or an unchanged state is signal-failed (1); a container that never terminates within the bound, or cannot start (image pull, config), is debug-container-timeout (1). DETAIL carries validated fields only, never raw container output.
+     Output: the slot's list entry as read before the signal, plus signal, pid, process_state ("T" after STOP, a non-T letter after CONT, "gone" after KILL), debug_container, and liveness_budget_seconds (STOP only, else null) = (failureThreshold - 1) x periodSeconds + timeoutSeconds of the live pod's livenessProbe (the earliest kubelet restart of a frozen MH; absent fields are kubectl-failed, since the apiserver defaults them), and restart_budget_seconds (KILL only, else null) = up's derived bound (§5 up, "The timeout is derived"), the caller's ceiling for the in-place restart to serve again. Restart evidence is the caller's: pod_uid and restart_count from list.
 
 6. OWNERSHIP + LOCK.
    - Label dark-tower.io/mh-owner: `baseline` for deploy.sh's MHs, `manual` by default, and the Layer 7 per-run token for fixtures.
@@ -54,7 +60,7 @@ O-4 MERGED CONTRACT (infrastructure + test; incorporates the GC and ops asks): i
    - The leak check is per-owner: nothing left with owner=<run>, and the baseline count == B as an eventual poll.
 
 8. FIXTURE (test owns it): crates/env-tests/src/fixtures/mh_pool.rs, with snapshot(), up() -> MhSlot, MhSlot::drain() (explicit, asserted), assert_baseline(), and the shareProcessNamespace injector preflight. The mh.sh path has one home: layer7.sh exports it, and the fixture fails loudly when it is unset.
-   (a) After up(), the fixture waits for Prometheus `up{job="mh-service",pod="<pod>"}==1` (the pod name comes from list/up JSON) before taking any MH metric baseline. mh.sh itself stays Prometheus-free. Drain outcomes are read from MC, never from the exiting MH.
+   (a) After up(), the fixture waits for Prometheus `up{job="mh-service",instance="<pod_ip>:8083"}==1` (pod_ip comes from list/up JSON; the mh-service scrape job sets no `pod` label, so a pod= matcher matches nothing) before taking any MH metric baseline. mh.sh itself stays Prometheus-free. Drain outcomes are read from MC, never from the exiting MH.
    (b) Explicit test teardown runs `mh.sh drain --owner <run> --all`. That also reclaims a pod left behind by not-available-timeout. The Drop backstop only prints that same `--all` command.
    (c) Before each destructive leg, assert_baseline() requires that no MH has an owner outside {baseline, <run>} and that the baseline count == B. Otherwise it fails with REASON=foreign-mh-activity.
    Incarnation identity in tests comes from pod_uid/restart_count (mh.sh) and handler_ref (client). There is NO GC lookup of handler_id; the earlier round-3 "handler_id from GC by address" is withdrawn.
@@ -67,6 +73,7 @@ O-4 MERGED CONTRACT (infrastructure + test; incorporates the GC and ops asks): i
    - the Lease busy path and expired-Lease reclaim;
    - stuck-terminating;
    - the --no-wait return point;
-   - the list key set.
+   - the list key set;
+   - signal: every refusal and failure token, the liveness-budget derivation, the emitted securityContext and image pin, the in-container script against a real process, and (suite-wide, every verb) no pod delete and no --force/--grace-period in any kubectl argv.
 
 Out of scope: CI runs no Kind or Layer 7 (an existing gap, recorded).

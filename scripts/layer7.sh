@@ -199,17 +199,20 @@ readonly VP8_PROBE_SUBCHECKS=(webcodecs_unavailable encoder_config_unsupported d
 # Wall-clock budgets, one PER SUITE (the browser suite must never eat the Rust suite's
 # budget, or vice versa); Phase-1 bring-up is unbounded here (the helper enforces its own
 # setup timeout). The env-test default carries real headroom over the measured Rust
-# suite envelope: ~605s on 2026-10-21 (story 3 task 10: ~525s through env-test 38, compile
-# included, + ~80s for 39), which broke the former 600s, and later story tasks add more
-# env-tests. Re-measure from layer-7-env-test.log's per-binary "finished in" lines before
-# changing it. The browser default covers the Vite dev-server start (60s webServer
+# suite envelope: ~605s on 2026-10-21 (story 3 task 10), which broke the former 600s; then
+# ~812s at story 4 task 17 (sum of per-binary "finished in", + compile) and ~945s at story 4
+# task 18 on 2026-11-10 (866s through env-test 43, which timed out the former 900s inside 44,
+# + 44/45 measured live at 41s/24s, + compile). 1800s keeps that envelope near half the
+# budget while story 4's remaining resilience legs (MC-B2, MC-C, MC-F, MH-1: kills, freezes
+# and drains, each a minute or more) land; re-measure after them. Re-measure from
+# layer-7-env-test.log's per-binary "finished in" lines before changing it. The browser default covers the Vite dev-server start (60s webServer
 # ceiling) + the specs' own 120s/test ceilings; the suite measured ~556s on 2026-10-24
 # (story 3 task 17 added eight video specs + a video partial-connectivity case to the
 # former ~4 min), which left the former 600s no headroom, so 1500s keeps the measured
 # suite under 40% of the budget. Re-measure from layer-7-browser-e2e.log's final
 # "N passed (Xm)" line before changing it. Both defaults are restated in
 # docs/runbooks/devloop-validation.md §6.7, pinned by scripts/layer7.test.sh.
-ENV_TEST_TIMEOUT="${DEVLOOP_ENV_TEST_TIMEOUT:-900}"
+ENV_TEST_TIMEOUT="${DEVLOOP_ENV_TEST_TIMEOUT:-1800}"
 BROWSER_E2E_TIMEOUT="${DEVLOOP_BROWSER_E2E_TIMEOUT:-1500}"
 
 # -----------------------------------------------------------------------------

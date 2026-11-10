@@ -61,7 +61,7 @@
       "dependsOn": [{ "projects": ["proto-gen"], "target": "codegen" }],
       "options": {
         "cwd": "packages/web-app",
-        "command": "svelte-check --tsconfig ./tsconfig.json && eslint src/"
+        "command": "svelte-check --tsconfig ./tsconfig.json && eslint src/ e2e/"
       }
     },
     "format": {

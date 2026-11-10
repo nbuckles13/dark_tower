@@ -486,6 +486,45 @@ preload_third_party_images() {
     log_info "Third-party images pre-loaded."
 }
 
+# The mh.sh `signal` injector's debug image (TEST-ONLY instrumentation, ADR-0039 §9). Its ONE
+# home is mh.sh's MH_DEBUG_IMAGE, read by sourcing the REAL mh.sh in a subshell (definitions
+# only; not ${MH_SH}, which is the runnable seam a test may stub). It is digest-pinned, so the
+# NODE pulls it (`crictl pull`): that keeps the registry digest the kubelet's IfNotPresent lookup
+# matches, which a host save + kind load would rewrite. A warm node (image present) makes no
+# network call. FATAL, never skipped: any failure here fails deploy at STEP=preload_debug_image
+# (main's EXIT trap -> DEPLOY_FAILED REASON=step-failed, or the environment reasons).
+mh_debug_image() {
+    ( source "${SCRIPT_DIR}/mh.sh" >/dev/null 2>&1 && printf '%s' "${MH_DEBUG_IMAGE:-}" )
+}
+preload_debug_image() {
+    log_step "Pre-loading the MH injector debug image (mh.sh signal; test-only) into the Kind node..."
+    local ref node
+    ref="$(mh_debug_image)" || ref=""
+    if [[ ! "$ref" =~ @sha256:[0-9a-f]{64}$ ]]; then
+        log_error "could not read a digest-pinned MH_DEBUG_IMAGE from ${SCRIPT_DIR}/mh.sh (got '${ref}')."
+        return 1
+    fi
+    if node_has_image "$ref"; then
+        log_info "In node: ${ref}"
+        return 0
+    fi
+    node="$(kind_node)"
+    if [[ -z "$node" ]]; then
+        log_error "kind lists no node for cluster '${CLUSTER_NAME}'; cannot pre-load ${ref}."
+        return 1
+    fi
+    log_info "Pulling into ${node}: ${ref}"
+    if ! "$(container_cmd)" exec "$node" crictl pull "$ref" >&2; then
+        log_error "the Kind node could not pull ${ref} (registry unreachable from the node?). mh.sh signal (the resilience env-tests' injector) needs it; re-run deploy once the node can reach the registry."
+        return 1
+    fi
+    if ! node_has_image "$ref"; then
+        log_error "${ref} is still not visible in ${node} after the pull (crictl inspecti)."
+        return 1
+    fi
+    log_info "Pre-loaded: ${ref}"
+}
+
 # Deploy PostgreSQL
 deploy_postgres() {
     log_step "Deploying PostgreSQL..."
@@ -2042,6 +2081,7 @@ main() {
     step deploy_check_prerequisites
     step cache_renders
     step preload_third_party_images
+    step preload_debug_image
     step build_first_party_images
     step resolve_image_refs
     # Pre-applied ahead of the root for ORDERING only (each is a byte-identical

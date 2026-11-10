@@ -49,10 +49,36 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-/// The ONE canary image. Already preloaded/pulled by the existing NetworkPolicy
-/// canaries; adding another image means checking `preload_third_party_images`
-/// in `infra/kind/scripts/deploy.sh` first.
-pub const BUSYBOX_IMAGE: &str = "busybox:1.36";
+/// The ONE busybox in the cluster: mh.sh's digest-pinned `MH_DEBUG_IMAGE`,
+/// which `deploy.sh` preloads onto the node (step `preload_debug_image`), read
+/// from the committed script (its one home) so the canaries and the MH
+/// injector share one pinned, preloaded image. A digest-pinned ref defaults
+/// to `imagePullPolicy: IfNotPresent`, so a warm node makes no network call.
+///
+/// # Panics
+/// mh.sh is unreadable or defines no `readonly MH_DEBUG_IMAGE="..."`.
+#[must_use]
+pub fn busybox_image() -> String {
+    use crate::fixtures::mh_pool::{committed_mh_sh_source, MH_SH_REPO_PATH};
+    debug_image_from_mh_sh(&committed_mh_sh_source())
+        .unwrap_or_else(|e| panic!("PRECONDITION: {MH_SH_REPO_PATH}: {e}"))
+}
+
+/// PURE core of [`busybox_image`].
+///
+/// # Errors
+/// No `readonly MH_DEBUG_IMAGE="<ref>"` line, or a ref not pinned by digest.
+pub fn debug_image_from_mh_sh(text: &str) -> Result<String, String> {
+    let image = text
+        .lines()
+        .find_map(|l| l.strip_prefix("readonly MH_DEBUG_IMAGE=\""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .ok_or("no `readonly MH_DEBUG_IMAGE=\"...\"` line")?;
+    if !image.contains("@sha256:") {
+        return Err(format!("MH_DEBUG_IMAGE {image} is not pinned by digest"));
+    }
+    Ok(image.to_string())
+}
 
 /// `terminationGracePeriodSeconds` for every canary. `sh`/`sleep` as PID 1
 /// ignores SIGTERM, so the default 30s grace would make each graceful delete
@@ -146,7 +172,7 @@ pub fn is_canary_name(prefix: &str, name: &str) -> bool {
 
 /// The ONE canary Pod skeleton: owns the invariants every canary carries
 /// (`restartPolicy: Never`, [`CANARY_TERMINATION_GRACE_SECONDS`], an
-/// `activeDeadlineSeconds` backstop, [`BUSYBOX_IMAGE`]). `container` supplies
+/// `activeDeadlineSeconds` backstop, [`busybox_image`]). `container` supplies
 /// name/command/ports/probes; its `image` is filled in here.
 #[must_use]
 pub fn canary_pod_manifest(
@@ -156,7 +182,7 @@ pub fn canary_pod_manifest(
     mut container: Value,
     active_deadline_seconds: u64,
 ) -> Value {
-    container["image"] = Value::String(BUSYBOX_IMAGE.to_string());
+    container["image"] = Value::String(busybox_image());
     json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -626,7 +652,16 @@ mod tests {
     #[test]
     fn every_canary_carries_the_skeleton_invariants() {
         let m = canary_pod_manifest("n", "ns", &json!({"a": "b"}), json!({"name": "c"}), 7);
-        assert_eq!(m["spec"]["containers"][0]["image"], BUSYBOX_IMAGE);
+        assert_eq!(
+            m["spec"]["containers"][0]["image"],
+            busybox_image().as_str()
+        );
+        assert!(
+            debug_image_from_mh_sh("readonly MH_DEBUG_IMAGE=\"busybox:1.36\"\n")
+                .unwrap_err()
+                .contains("not pinned by digest")
+        );
+        assert!(debug_image_from_mh_sh("nothing").is_err());
         assert_eq!(
             m["spec"]["terminationGracePeriodSeconds"],
             CANARY_TERMINATION_GRACE_SECONDS

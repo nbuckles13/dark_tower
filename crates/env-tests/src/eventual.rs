@@ -82,32 +82,69 @@ where
     Fut: Future<Output = bool>,
 {
     let timeout = category.timeout();
-    let mut delay = category.initial_delay();
-    let start = std::time::Instant::now();
-
-    loop {
-        if condition().await {
-            return Ok(());
+    poll_kernel(timeout, category.initial_delay(), None, || {
+        let fut = condition();
+        async move {
+            if fut.await {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Condition not met within {timeout:?} (category: {category:?})"
+                ))
+            }
         }
+    })
+    .await
+}
 
+/// Poll `attempt` until it returns `Ok`, within a caller-DERIVED `timeout`
+/// (for ceilings computed from live config, which a [`ConsistencyCategory`]
+/// cannot express). The same loop as [`assert_eventually`] (500 ms, x2),
+/// capped at 5 s so a long ceiling still polls often.
+///
+/// # Errors
+/// The LAST attempt's error, so the failure names what was still wrong.
+pub async fn poll_within<T, F, Fut>(timeout: Duration, attempt: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    poll_kernel(
+        timeout,
+        Duration::from_millis(500),
+        Some(Duration::from_secs(5)),
+        attempt,
+    )
+    .await
+}
+
+/// THE backoff loop (both helpers above): try, then sleep `delay` (x2, capped
+/// at `cap` and at the time left) until `timeout`; return the last error.
+async fn poll_kernel<T, F, Fut>(
+    timeout: Duration,
+    initial_delay: Duration,
+    cap: Option<Duration>,
+    mut attempt: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, String>>,
+{
+    let start = std::time::Instant::now();
+    let mut delay = initial_delay;
+    loop {
+        let last = match attempt().await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
         let elapsed = start.elapsed();
         if elapsed >= timeout {
-            return Err(format!(
-                "Condition not met within {:?} (category: {:?})",
-                timeout, category
-            ));
+            return Err(last);
         }
-
-        // Sleep for current delay
-        sleep(delay).await;
-
-        // Exponential backoff with 2x multiplier
+        sleep(delay.min(timeout.saturating_sub(elapsed))).await;
         delay *= 2;
-
-        // Cap delay at remaining time
-        let remaining = timeout.saturating_sub(elapsed);
-        if delay > remaining {
-            delay = remaining;
+        if let Some(cap) = cap {
+            delay = delay.min(cap);
         }
     }
 }

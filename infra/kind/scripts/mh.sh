@@ -5,6 +5,7 @@
 #   mh.sh up      [--slot K] [--owner ID] [--timeout S] [--json]
 #   mh.sh drain   K | --all --owner ID  [--owner ID] [--no-wait] [--timeout S] [--force] [--json]
 #   mh.sh upgrade [--timeout S] [--json]
+#   mh.sh signal  K KILL|STOP|CONT --owner ID [--timeout S] [--json]    TEST-ONLY injector
 #
 # One script, used by humans, env-tests (crates/env-tests/src/fixtures/mh_pool.rs) and
 # deploy.sh, to provision, drain, upgrade and list MH incarnations on hostPort slots.
@@ -39,6 +40,8 @@
 #   mh-no-free-slot        capacity (exit 3).
 #   last-serving-mh / stuck-terminating / foreign-owner          refusals (exit 4).
 #   mh-pool-busy           the mh-pool Lease is held (exit 5), DETAIL=holder=<identity>.
+#   signal-only: mh-no-share-process-namespace (exit 2), mh-not-serving (exit 4),
+#                signal-failed / debug-container-timeout (exit 1) — see SIGNAL below.
 #
 # CLUSTER-SIDE INTERFACE (produced by deploy.sh, story 4 task I-2; mh.sh only consumes it):
 #   - ConfigMap `mh-template` in namespace dark-tower, data keys:
@@ -110,6 +113,40 @@
 # MH_UP_MARGIN_S. Scheduling and image pull are NOT in the derivation: on Kind the image is
 # preloaded (imagePullPolicy Never) and scheduling is immediate; MH_UP_MARGIN_S is their slack. --timeout S (1..MH_TIMEOUT_MAX_S) overrides.
 #
+# SIGNAL (TEST-ONLY; ADR-0039 §9, contract §5 amendment). The ONE home of the process injector
+# the resilience env-tests (crates/env-tests/src/fixtures/mh_pool.rs) and the browser harness
+# (packages/web-app/e2e/mhPool.ts) use to SIGKILL / SIGSTOP / SIGCONT an MH process. It is an
+# injector, NOT an operator lever: it is owner-gated (the slot's owner must equal --owner, which
+# is REQUIRED), and it has NO --force — baseline and manual MHs are structurally untouchable by a
+# test run. It takes NO mh-pool Lease: it changes no pool membership (no create, no delete); the
+# only other actor on a run-owned slot is that same run (a foreign drain is refused without
+# --force), and a pod that vanishes mid-signal is mh-not-serving / debug-container-timeout, never
+# a false OK.
+#   Preflight: the slot must hold a live, non-deleting pod (serving or starting — a frozen MH
+#   fails readiness and reads `starting`, and CONT must still reach it), else mh-not-serving; the
+#   live pod must carry spec.shareProcessNamespace=true (the Kind overlay's
+#   share-process-namespace-patch.yaml), else mh-no-share-process-namespace.
+#   Mechanism: ONE ephemeral container per call, `kubectl debug` (never attached) with
+#   --profile=restricted plus MH_INJECT_SECURITY_CONTEXT (uid/gid MH_INJECT_UID, runAsNonRoot,
+#   no privilege, no capability), image MH_DEBUG_IMAGE (digest-pinned; deploy.sh preloads it),
+#   running the CONSTANT script MH_INJECT_SCRIPT with the signal (closed set MH_SIGNALS, checked
+#   here AND in the container) and the process name as arguments. The script finds the ONE
+#   process whose /proc/<pid>/comm is MH_PROCESS_COMM (0 or >1 matches fail), requires a decimal
+#   pid > 1 (never pause/PID 1, never 0/-1/a group), signals it, and waits until /proc/<pid>/stat
+#   shows the effect (T after STOP, not T after CONT, gone after KILL). mh.sh polls the ephemeral
+#   container to `terminated` (bounded: --timeout, default MH_SIGNAL_WAIT_DEFAULT_S; an image
+#   pull / config error fails at once) and reads its one result line. Ephemeral containers can
+#   never be removed from a pod; only run-owned pods get them, and run teardown drains those.
+#   Output (--json): the slot's list entry as read BEFORE the signal, plus signal, pid,
+#   process_state ("T"/"S"/"R"/... or "gone" after KILL), debug_container, and
+#   liveness_budget_seconds (STOP only, else null) = (failureThreshold - 1) x periodSeconds +
+#   timeoutSeconds of the live pod's livenessProbe: a STOP landing just after a probe tick sees
+#   its first failure at +timeout and the kubelet restart after failureThreshold failures, so
+#   this is the earliest restart, not period x failureThreshold. Absent probe fields fail
+#   (kubectl-failed): the apiserver defaults them on a live pod, so absence is a bad read.
+#   restart_budget_seconds (KILL only, else null) = the derived `up` bound (up_timeout): the
+#   ceiling for the caller's wait until the in-place restart is serving again.
+#
 # SOURCEABLE: sourcing this file defines constants and functions only (no trap, no cluster
 # call, no temp file); main runs only when executed. mh.test.sh and T-1 read MH_TOKENS and
 # MH_OWNER_RE from it.
@@ -135,6 +172,46 @@ readonly MH_LEASE_S=30
 readonly MH_LEASE_FUTURE_SKEW_S=5
 readonly MH_TIMEOUT_MAX_S=3600
 readonly MH_KUBECTL_TIMEOUT_DEFAULT_S=5
+readonly MH_SIGNAL_WAIT_DEFAULT_S=60
+
+# --- signal (TEST-ONLY injector; see SIGNAL in the header) ---
+# The debug image: tag AND digest (the digest is what is pinned; mh.test.sh pins the shape).
+# deploy.sh:preload_debug_image reads it from here (its ONE home) and pulls it INTO the Kind node.
+readonly MH_DEBUG_IMAGE="docker.io/library/busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec"
+readonly MH_INJECT_UID=65532   # the MH pod's own uid (distroless nonroot): same uid, so kill(2) needs no capability
+readonly -a MH_SIGNALS=(KILL STOP CONT)
+readonly MH_PROCESS_COMM="mh-service"   # /proc/<pid>/comm of the MH binary (Dockerfile ENTRYPOINT)
+readonly MH_INJECT_PREFIX="dt-inject-"
+# The partial container spec passed as --custom (merged over --profile=restricted).
+readonly MH_INJECT_SECURITY_CONTEXT="{\"securityContext\":{\"runAsUser\":${MH_INJECT_UID},\"runAsGroup\":${MH_INJECT_UID},\"runAsNonRoot\":true,\"privileged\":false,\"allowPrivilegeEscalation\":false,\"capabilities\":{\"drop\":[\"ALL\"]}}}"
+# THE in-container script (POSIX sh; busybox). CONSTANT: nothing is spliced into it; the signal
+# is $1 (re-checked against the closed set here) and the process name $2. Its status is f's
+# return; its ONE result line is `DT_INJECT pid=<n> state=<s>` or `DT_INJECT error=<token> ...`.
+readonly MH_INJECT_SCRIPT='f() {
+  case "$1" in KILL|STOP|CONT) ;; *) echo "DT_INJECT error=bad-signal"; return 10 ;; esac
+  n=0; p=""
+  for d in /proc/[0-9]*; do
+    [ "$(cat "$d/comm" 2>/dev/null)" = "$2" ] || continue
+    n=$((n + 1)); p="${d#/proc/}"
+  done
+  [ "$n" -eq 1 ] || { echo "DT_INJECT error=pid-count count=$n"; return 11; }
+  case "$p" in ""|*[!0-9]*) echo "DT_INJECT error=pid-not-decimal"; return 12 ;; esac
+  [ "$p" -gt 1 ] || { echo "DT_INJECT error=pid-one"; return 12; }
+  kill -s "$1" "$p" || { echo "DT_INJECT error=kill-failed"; return 13; }
+  i=0; s=""
+  while [ "$i" -lt 10 ]; do
+    s="$(sed -n "s/^[0-9]* (.*) \([A-Za-z]\) .*/\1/p" "/proc/$p/stat" 2>/dev/null)"
+    case "$1:$s" in
+      KILL:|KILL:Z|KILL:X) echo "DT_INJECT pid=$p state=gone"; return 0 ;;
+      STOP:T) echo "DT_INJECT pid=$p state=$s"; return 0 ;;
+      CONT:T|CONT:) ;;
+      CONT:?) echo "DT_INJECT pid=$p state=$s"; return 0 ;;
+    esac
+    i=$((i + 1)); sleep 1
+  done
+  echo "DT_INJECT error=state-unchanged pid=$p"; return 14
+}
+f "$@"'
 
 # THE one definition of a valid owner (a subset of the K8s label-value rule). It is also a
 # selector-injection control: an owner is compared, never spliced into a `-l` selector.
@@ -170,6 +247,10 @@ readonly -a MH_TOKENS=(
     "stuck-terminating:4"
     "foreign-owner:4"
     "mh-pool-busy:5"
+    "mh-no-share-process-namespace:2"
+    "signal-failed:1"
+    "debug-container-timeout:1"
+    "mh-not-serving:4"
 )
 
 # --- Run state (set by main) ---------------------------------------------------
@@ -192,6 +273,8 @@ ARG_TIMEOUT=""
 ARG_ALL=0
 ARG_NOWAIT=0
 ARG_FORCE=0
+ARG_SIGNAL=""
+MH_LIVENESS_BUDGET=""
 UPGRADE_NEW=""
 UPGRADE_OWNER=""
 
@@ -273,7 +356,7 @@ mh_fallback() {
 }
 
 usage_text() {
-    sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
 }
 
 # --- kubectl -----------------------------------------------------------------------
@@ -1005,6 +1088,141 @@ upgrade_drain_old() {
     drain_await "$old" 0 ""
 }
 
+# --- signal (TEST-ONLY injector) ------------------------------------------------------------
+
+parse_signal() {
+    local owner_set=0 a
+    while (( $# )); do
+        case "$1" in
+            --owner) (( $# >= 2 )) || mh_finish usage "" "--owner needs a value"; validate_owner "$2"; MH_OWNER="$2"; owner_set=1; shift 2 ;;
+            --timeout) (( $# >= 2 )) || mh_finish usage "" "--timeout needs a value"; validate_timeout "$2"; ARG_TIMEOUT="$2"; shift 2 ;;
+            --force) mh_finish usage "" "signal takes no --force (a test-only injector; owner-gated)" ;;
+            -*) mh_finish usage "" "signal: unknown flag" ;;
+            *)
+                if [[ -z "$ARG_SLOT" ]]; then validate_slot_arg "$1"; ARG_SLOT="$1"
+                elif [[ -z "$ARG_SIGNAL" ]]; then
+                    for a in "${MH_SIGNALS[@]}"; do [[ "$1" == "$a" ]] && ARG_SIGNAL="$1"; done
+                    [[ -n "$ARG_SIGNAL" ]] || mh_finish usage "" "signal must be one of ${MH_SIGNALS[*]}"
+                else mh_finish usage "" "signal takes one slot and one signal"; fi
+                shift ;;
+        esac
+    done
+    [[ -n "$ARG_SLOT" && -n "$ARG_SIGNAL" ]] || mh_finish usage "" "signal needs a slot and one of ${MH_SIGNALS[*]}"
+    (( owner_set )) || mh_finish usage "" "signal requires --owner (no default owner: a test run signals only its own MHs)"
+}
+
+# inject_wait <pod> <container>: rc 0 terminated (exit code in $MH_TMP/inject-exit), 1 not yet,
+# 2 the pod is gone, 3 the container can never run (waiting reason in $MH_TMP/inject-waiting).
+inject_wait() {
+    if ! kc_call get-pod get pod "$1" -o json; then
+        err_has "(NotFound)" && return 2
+        kc_fail "$ARG_SLOT"
+    fi
+    local v
+    v="$(jq -r --arg n "$2" '([(.status.ephemeralContainerStatuses // [])[] | select(.name == $n)] | .[0].state // {}) as $s
+        | if $s.terminated != null then "terminated \($s.terminated.exitCode)"
+          elif $s.waiting != null then "waiting \($s.waiting.reason // "")"
+          else "pending" end' "$MH_TMP/out" 2>/dev/null)"
+    case "$v" in
+        "terminated "*)
+            [[ "${v#terminated }" =~ ^[0-9]{1,3}$ ]] || mh_finish kubectl-failed "$ARG_SLOT" "malformed cluster value(s): exitCode@${2}"
+            printf '%s' "${v#terminated }" >"$MH_TMP/inject-exit"; return 0 ;;
+        "waiting ErrImagePull"|"waiting ImagePullBackOff"|"waiting ErrImageNeverPull"|"waiting InvalidImageName"|"waiting CreateContainerConfigError"|"waiting CreateContainerError")
+            printf '%s' "${v#waiting }" >"$MH_TMP/inject-waiting"; return 3 ;;
+        *) return 1 ;;
+    esac
+}
+
+# liveness_budget <pod-json-file> <container>: sets MH_LIVENESS_BUDGET to (failureThreshold - 1)
+# x periodSeconds + timeoutSeconds of the live container's livenessProbe; an absent/non-integer
+# field fails. Not called in a command substitution: mh_finish must run in THIS shell.
+liveness_budget() {
+    local v
+    v="$(jq -r --arg c "$2" '([.spec.containers[]? | select(.name == $c)] | .[0].livenessProbe) as $p
+        | if $p == null then "missing livenessProbe"
+          else ([("periodSeconds", "failureThreshold", "timeoutSeconds") as $f
+                 | select(($p[$f] | type) != "number" or $p[$f] < 1 or ($p[$f] | floor) != $p[$f]) | $f] ) as $bad
+            | if ($bad | length) > 0 then "missing livenessProbe." + ($bad | join(",livenessProbe."))
+              else (($p.failureThreshold - 1) * $p.periodSeconds + $p.timeoutSeconds | tostring) end
+          end' "$1" 2>/dev/null)"
+    [[ "$v" =~ ^[0-9]{1,6}$ ]] || mh_finish kubectl-failed "$ARG_SLOT" "malformed cluster value(s): ${v:-livenessProbe}@slot${ARG_SLOT} (the apiserver defaults probe fields on a live pod; absence is a bad read)"
+    MH_LIVENESS_BUDGET="$v"
+}
+
+run_signal() {
+    local k="$ARG_SLOT" sig="$ARG_SIGNAL" timeout="${ARG_TIMEOUT:-$MH_SIGNAL_WAIT_DEFAULT_S}"
+    require_known_slot "$k"
+    # NO Lease (see SIGNAL in the header): this changes no pool membership.
+    mh_snapshot
+    local st pod uid owner pre cname
+    st="$(entry_field "$k" state)"; pod="$(entry_field "$k" pod)"; uid="$(entry_field "$k" pod_uid)"
+    if [[ -z "$pod" || ( "$st" != "serving" && "$st" != "starting" ) ]]; then
+        mh_finish mh-not-serving "$k" "slot ${k} is ${st}; signal needs a live, non-deleting MH pod"
+    fi
+    owner="$(entry_field "$k" owner)"
+    [[ "$owner" == "$MH_OWNER" ]] \
+        || mh_finish foreign-owner "$k" "slot ${k} is owned by ${owner:-nobody}, not ${MH_OWNER}; signal has no --force (a test run signals only its own MHs)"
+    pre="$(public_entry "$k")"
+    cname="$(jq -r '.cname' "$MH_TMP/tpl.json")"
+
+    kc_must get-pod get pod "$pod" -o json
+    mv "$MH_TMP/out" "$MH_TMP/pod.json"
+    [[ "$(jq -r '.metadata.uid // ""' "$MH_TMP/pod.json")" == "$uid" ]] \
+        || mh_finish mh-not-serving "$k" "pod ${pod} was replaced between reads; re-read mh.sh list"
+    [[ "$(jq -r '.spec.shareProcessNamespace // false' "$MH_TMP/pod.json")" == "true" ]] \
+        || mh_finish mh-no-share-process-namespace "$k" "pod ${pod} lacks shareProcessNamespace: mh-template is stale or not Kind-rendered; re-run deploy (infra/kind/scripts/deploy.sh)"
+    local budget="null" restart_budget="null"
+    if [[ "$sig" == "STOP" ]]; then liveness_budget "$MH_TMP/pod.json" "$cname"; budget="$MH_LIVENESS_BUDGET"; fi
+    # KILL: the in-place restart must go Ready again; bounded by the SAME derivation as `up`.
+    [[ "$sig" == "KILL" ]] && restart_budget="$(up_timeout)"
+
+    local n name
+    n="$(jq -r '(.spec.ephemeralContainers // []) | length' "$MH_TMP/pod.json")"
+    [[ "$n" =~ ^[0-9]{1,4}$ ]] || mh_finish kubectl-failed "$k" "malformed cluster value(s): ephemeralContainers@slot${k}"
+    name="${MH_INJECT_PREFIX}${sig,,}-${n}"
+    printf '%s' "$MH_INJECT_SECURITY_CONTEXT" >"$MH_TMP/inject-custom.json"
+    mh_log "slot ${k}: ${sig} -> ${MH_PROCESS_COMM} in pod ${pod} via ephemeral container ${name} (TEST-ONLY injector)"
+    kc_must debug-pod debug "$pod" --attach=false --target="$cname" --container="$name" \
+        --image="$MH_DEBUG_IMAGE" --image-pull-policy=IfNotPresent \
+        --profile=restricted --custom="$MH_TMP/inject-custom.json" \
+        -- sh -c "$MH_INJECT_SCRIPT" "$name" "$sig" "$MH_PROCESS_COMM"
+
+    local rc
+    wait_until "$timeout" inject_wait "$pod" "$name"; rc=$?
+    case "$rc" in
+        0) ;;
+        2) mh_finish mh-not-serving "$k" "pod ${pod} disappeared during the signal; mh.sh list" ;;
+        3) mh_finish debug-container-timeout "$k" "container=${name} waiting=$(cat "$MH_TMP/inject-waiting") (image ${MH_DEBUG_IMAGE} must be in the Kind node: re-run deploy (infra/kind/scripts/deploy.sh))" ;;
+        *) mh_finish debug-container-timeout "$k" "container=${name} not terminated within ${timeout}s; inspect: kubectl --context ${KUBE_CONTEXT} -n ${MH_NAMESPACE} describe pod ${pod}" ;;
+    esac
+
+    kc_must get-inject-logs logs "$pod" -c "$name"
+    # Only a line of the script's own validated shape is read; raw output is never relayed.
+    local line exitc pid pstate
+    line="$(grep -E '^DT_INJECT (pid=[0-9]{1,10} state=([A-Za-z]|gone)|error=[a-z-]{1,32}( [a-z]{1,8}=[0-9]{1,10})?)$' "$MH_TMP/out" | tail -n 1)"
+    exitc="$(cat "$MH_TMP/inject-exit")"
+    if [[ "$exitc" != "0" ]]; then
+        local why="no result line"
+        [[ "$line" == "DT_INJECT error="* ]] && why="${line#DT_INJECT }"
+        mh_finish signal-failed "$k" "${sig} not delivered: container=${name} exit=${exitc} ${why}"
+    fi
+    [[ "$line" =~ ^DT_INJECT\ pid=([0-9]{1,10})\ state=([A-Za-z]|gone)$ ]] \
+        || mh_finish signal-failed "$k" "${sig}: container=${name} exited 0 without a result line"
+    pid="${BASH_REMATCH[1]}"; pstate="${BASH_REMATCH[2]}"
+    (( pid > 1 )) || mh_finish signal-failed "$k" "${sig}: container=${name} reported pid ${pid}"
+    case "${sig}:${pstate}" in
+        KILL:gone|STOP:T) ;;
+        CONT:T|CONT:gone|KILL:*|STOP:*) mh_finish signal-failed "$k" "${sig}: pid ${pid} state=${pstate} after the signal" ;;
+    esac
+    MH_OUT_JSON="$(jq -c --arg sig "$sig" --argjson pid "$pid" --arg ps "$pstate" --argjson b "$budget" --arg dc "$name" \
+        --argjson rb "$restart_budget" \
+        '. + {ok: true, signal: $sig, pid: $pid, process_state: $ps, liveness_budget_seconds: $b,
+              restart_budget_seconds: $rb, debug_container: $dc}' <<<"$pre")"
+    local extra=""
+    [[ "$budget" != "null" ]] && extra=" liveness_budget=${budget}s"
+    mh_finish ok "$k" "signal=${sig} pid=${pid} state=${pstate}${extra}"
+}
+
 # --- main ---------------------------------------------------------------------------
 
 main() {
@@ -1028,7 +1246,7 @@ main() {
     (( ${#args[@]} )) && args=("${args[@]:1}")
     case "$verb" in
         -h|--help|help) usage_text; mh_finish ok "" "help" ;;
-        list|up|drain|upgrade) ;;
+        list|up|drain|upgrade|signal) ;;
         "") usage_text; mh_finish usage "" "no verb given" ;;
         *) usage_text; mh_finish usage "" "unknown verb" ;;
     esac

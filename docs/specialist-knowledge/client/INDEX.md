@@ -57,7 +57,7 @@
 - Specs → `*.spec.ts` (story 2: multi-party-hear, partial-connectivity, server-mute, kek-rotation, over-subscription, solo-participant; story 3: multi-party-see, publish-mixes, video-over-subscription, client-mute-video, client-mute-roster, server-mute-video, late-joiner-video, kek-rotation-video, watched-only-video, video-codec-unavailable); video harness → `{videoScenario,videoPlan,videoBusShape,videoEvidence,failureDiagnostics}.ts`, `cohortContexts.ts:joinPlanMember`, `configEnv.ts:readMcReceiveCaps`
 - Env contract + catalog → `env.ts`, `README.md`; Playwright config → `packages/web-app/playwright.config.ts`; node-tier specs → `packages/web-app/tests/`
 - Layer 7 lane + per-run org provisioning → `scripts/layer7.sh`, `infra/kind/scripts/setup.sh:provision_run_org()`
-- Subdomain-pattern drift guard → `scripts/guards/simple/validate-subdomain-regex-sync.sh`
+- Subdomain-pattern drift guard → `scripts/guards/simple/validate-subdomain-regex-sync.sh`; MH pool driver + injector (mh.sh --json/signal twin of env-tests `mh_pool.rs`) → `mhPool.ts`, node-tier self-test + drift pins → `packages/web-app/tests/mhPool.test.ts`
 
 ## Client Test Utilities (`packages/test-utils/src/`)
 - Hand-driven timer double → `FakeScheduler.ts`; per-dial (never URL-deduped) connect recorder → `sdk-core/src/media/__tests__/helpers.ts:makeDialRecorder`; mock transport (uni streams, STOP_SENDING/reset, write gates → `mockUniStreams.ts`); audio seam doubles; video decoder + VideoFrame close-registry doubles → `media/video.ts`; tokens, metrics sink contract + mocks, ids → `MockWebTransport.ts`, `media/index.ts`, `TestTokenBuilder.ts`, `token-claims.ts`, `contracts/MetricsSink.ts`, `InMemoryMetricsSink.ts`, `MockOTLPExporter.ts`, `deterministic-ids.ts`

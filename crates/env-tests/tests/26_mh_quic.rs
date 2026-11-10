@@ -5,7 +5,7 @@
 //!
 //! # Scenarios (R-33)
 //!
-//! 1. `test_mh_url_present_in_join_response` — `JoinResponse.media_servers`
+//! 1. `test_mh_url_present_in_join_response` — `JoinResponse.media_handler_set`
 //!    populated with non-empty WebTransport URLs.
 //! 2. `test_mh_accepts_valid_meeting_jwt` — valid JWT → connection held open.
 //! 3. `test_mh_rejects_forged_jwt` / `test_mh_rejects_oversized_jwt` —
@@ -163,7 +163,7 @@ async fn register_test_user(auth_client: &AuthClient, display_name: &str) -> (St
 /// contains the meeting JWT and the assigned MC's WebTransport URL).
 ///
 /// The caller is responsible for choosing what to do next: open the MC
-/// WebTransport (so `media_servers` is populated and `RegisterMeeting` fires
+/// WebTransport (so the handler set is populated and `RegisterMeeting` fires
 /// to all assigned MHs) or skip directly to MH.
 async fn gc_create_and_join(
     cluster: &ClusterConnection,
@@ -375,16 +375,16 @@ async fn assert_notification_counter_increases_past(
 }
 
 // ============================================================================
-// Scenario 1: media_servers populated in JoinResponse
+// Scenario 1: the handler set is populated in JoinResponse
 // ============================================================================
 
 /// Test: GC's join response includes a non-empty `mc_assignment` and, after
 /// the client connects to MC and sends a `JoinRequest`, MC's `JoinResponse`
-/// includes `media_servers` populated from Redis with non-empty
+/// includes a `media_handler_set` with non-empty
 /// `media_handler_url` values pointing at MH WebTransport endpoints.
 ///
-/// Ground truth: `crates/mc-service/src/webtransport/connection.rs:712-718`
-/// populates `media_servers` from `MhAssignmentData.handlers`. In Kind,
+/// Ground truth: `crates/mc-service/src/webtransport/connection.rs`
+/// (`build_join_response`) projects the set from the meeting's Active handlers. In Kind,
 /// `infra/kind/scripts/deploy.sh:render_env_overlay` renders the MH advertise
 /// addresses as host-reachable URLs, so the URLs returned here are reachable from the test.
 ///
@@ -412,20 +412,25 @@ async fn test_mh_url_present_in_join_response() {
     )
     .await;
 
+    let handlers = &join_response
+        .media_handler_set
+        .as_ref()
+        .expect("MC always sends a media_handler_set")
+        .handlers;
     assert!(
-        !join_response.media_servers.is_empty(),
-        "JoinResponse.media_servers must be non-empty (MC populates from MhAssignmentData in Redis)",
+        !handlers.is_empty(),
+        "JoinResponse.media_handler_set must be non-empty (MC lists every acked initial handler)",
     );
 
-    for (idx, server) in join_response.media_servers.iter().enumerate() {
+    for (idx, server) in handlers.iter().enumerate() {
         assert!(
             !server.media_handler_url.is_empty(),
-            "media_servers[{}].media_handler_url must be non-empty",
+            "media_handler_set.handlers[{}].media_handler_url must be non-empty",
             idx
         );
         assert!(
             server.media_handler_url.starts_with("https://"),
-            "media_servers[{}].media_handler_url must use https:// scheme (got: {})",
+            "media_handler_set.handlers[{}].media_handler_url must use https:// scheme (got: {})",
             idx,
             server.media_handler_url,
         );
@@ -455,7 +460,7 @@ async fn mc_join(
     participant_name: &str,
 ) -> proto_gen::dark_tower::signaling::v1::JoinResponse {
     // Connection, framing, the `JoinRequest` field list, and the join
-    // positive-control (sender_id / media_servers / handler-url present) all
+    // positive-control (sender_id / handler set / handler-url present) all
     // live in the shared `mc_session` fixture.
     let mut session = McSession::connect(mc_url).await;
     mc_session::mc_join(
@@ -469,7 +474,7 @@ async fn mc_join(
 }
 
 /// Pick ANY assigned handler, taken in ARBITRARY Redis enumeration order — NOT
-/// the steered one. `media_servers` is connection bootstrap data and is
+/// the steered one. The handler set is connection bootstrap data and is
 /// deliberately unsorted, so its head carries no relationship to placement.
 ///
 /// Legitimate for this suite's callers: they need "some handler on which this
@@ -487,8 +492,9 @@ fn any_registered_mh_url(
     join_response: &proto_gen::dark_tower::signaling::v1::JoinResponse,
 ) -> String {
     join_response
-        .media_servers
-        .first()
+        .media_handler_set
+        .as_ref()
+        .and_then(|s| s.handlers.first())
         .map(|m| m.media_handler_url.clone())
         .filter(|u| !u.is_empty())
         .expect("MC JoinResponse must include at least one non-empty MH URL")
