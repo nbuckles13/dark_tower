@@ -852,6 +852,10 @@ async fn rejects_declarations_past_the_per_connection_budget() {
 // Security: the two url-keyed maps must not cross
 // ============================================================================
 
+/// A client-reported url (and, since story 4 MC-A, a client-reported
+/// `handler_ref` / `handler_set_version`) never reaches a `SendTarget`, a
+/// `StreamAssignment` or the `MediaHandlerSet`: every ref they carry is a
+/// member of the server-derived set the client was given.
 #[tokio::test]
 async fn a_client_supplied_handler_url_never_reaches_a_send_target() {
     let snap = MetricAssertion::snapshot();
@@ -871,8 +875,10 @@ async fn a_client_supplied_handler_url_never_reaches_a_send_target() {
                     failure_reason: None,
                     failure_code: None,
                     observed_at: None,
-                    handler_ref: 0,
-                    handler_set_version: 0,
+                    // A forged ref and version: client-originated, diagnostic
+                    // only, never a routing or target input (ADR-0039 §4).
+                    handler_ref: FORGED_HANDLER_REF,
+                    handler_set_version: u64::from(FORGED_HANDLER_REF),
                 }],
             },
         )),
@@ -899,14 +905,50 @@ async fn a_client_supplied_handler_url_never_reaches_a_send_target() {
         assignments.assignments[0].media_handler_url,
         SEEDED_HANDLER_URL
     );
+    // Refs (ADR-0039 §4): every target and assignment names a member of the
+    // receiver's set, and the set itself is server-derived.
+    let set = a
+        .media_handler_set
+        .clone()
+        .expect("JoinResponse carries the set");
+    let members: Vec<u32> = set.handlers.iter().map(|h| h.handler_ref).collect();
+    assert_eq!(
+        set.handlers
+            .iter()
+            .map(|h| h.media_handler_url.as_str())
+            .collect::<Vec<_>>(),
+        vec![SEEDED_HANDLER_URL]
+    );
+    let target_ref = directive.streams[0].targets[0].handler_ref;
+    let slot_ref = assignments.assignments[0].handler_ref;
+    assert!(
+        members.contains(&target_ref),
+        "target ref {target_ref} is a set member"
+    );
+    assert!(
+        members.contains(&slot_ref),
+        "assignment ref {slot_ref} is a set member"
+    );
+    assert!(!members.contains(&FORGED_HANDLER_REF));
+    assert_ne!(target_ref, FORGED_HANDLER_REF);
+    assert_ne!(slot_ref, FORGED_HANDLER_REF);
+
     let needle = ATTACKER_URL.as_bytes();
-    for bytes in [directive.encode_to_vec(), assignments.encode_to_vec()] {
+    for bytes in [
+        directive.encode_to_vec(),
+        assignments.encode_to_vec(),
+        set.encode_to_vec(),
+    ] {
         assert!(
             !bytes.windows(needle.len()).any(|w| w == needle),
             "attacker url reached a media message"
         );
     }
 }
+
+/// A handler_ref no MC-issued set ever holds in these tests (refs are
+/// allocated from 1 per meeting).
+const FORGED_HANDLER_REF: u32 = 999;
 
 /// S4 pin (a) + S3, in the per-EDGE shape: in a two-handler meeting where the
 /// pair's edge sits on one handler, a client reporting (a) an attacker url as

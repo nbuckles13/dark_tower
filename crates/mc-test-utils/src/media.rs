@@ -78,7 +78,7 @@ pub fn meeting_assignment_for(
     };
 
     let handler = HandlerId::new(handler_id);
-    let handlers = MeetingHandlers::new([HandlerEndpoint {
+    let handlers = MeetingHandlers::from_handoff([HandlerEndpoint {
         id: handler.clone(),
         webtransport_url: format!("https://{handler_id}.fixture:4434"),
         grpc_endpoint: format!("http://{handler_id}.fixture:50053"),

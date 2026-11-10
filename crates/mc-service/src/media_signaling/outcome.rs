@@ -195,13 +195,16 @@ pub enum DirectiveOutcome {
     /// A plan carried no transport mode. **MC defect** — never defaulted to
     /// datagram; the enum's zero is a rejection, not a convenience.
     TransportModeUnspecified,
-    /// A plan's handler had no client-facing url in the meeting's handler set.
+    /// A plan's handler is not a client-visible (Active) member of the
+    /// meeting's handler set.
     ///
-    /// **MC defect since story 2**: every url MC hands out — `media_servers`,
-    /// `StreamAssignment.media_handler_url`, `SendTarget.media_handler_url` —
-    /// comes from one frozen `MeetingHandlers` value, so a miss cannot happen
-    /// by construction. Fails closed: the participant's view is not emitted at
-    /// all, never an ACTIVE slot or a send target with an empty url.
+    /// **MC defect**: every url and `handler_ref` MC hands out —
+    /// `MediaHandlerSet`, `media_servers`, `StreamAssignment`, `SendTarget` —
+    /// comes from one `MeetingHandlers::client_handler` lookup, and edges are
+    /// routed over Active members only, so a miss cannot happen by
+    /// construction. Fails closed: the participant's view is not emitted at
+    /// all, never an ACTIVE slot or a send target with an empty url or a
+    /// non-member ref.
     HandlerUrlUnresolved,
     /// A post-join capability re-declaration the meeting actor did not
     /// register. Environmental — the only environmental token: the actor is

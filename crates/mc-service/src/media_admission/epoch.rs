@@ -51,7 +51,7 @@ use std::collections::{HashMap, HashSet};
 ///
 /// An entry is written whenever MC answers a binding with a sender id — even if
 /// the connectivity update in the same turn is refused (e.g. a handler outside
-/// the frozen set), because MH binds on the ANSWER. Reconstructing the set from
+/// the meeting's handler set), because MH binds on the ANSWER. Reconstructing the set from
 /// connectivity state at removal time would miss exactly those.
 ///
 /// # Fails TOWARD exclusion — deliberately

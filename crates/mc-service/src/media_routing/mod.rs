@@ -5,12 +5,12 @@
 //! | [`slots`] | per-meeting **join-order slot state and shared-handler edges** (held by the meeting actor): an edge exists iff the pair shares a connected handler, and its pure render into a per-handler forwarding snapshot |
 //! | [`connectivity`] | one participant's OBSERVED connectivity keyed by MH connection, the tombstone, and the settle rule |
 //! | [`edges`] | which shared handler carries one edge — policy only (co-locate), correct for ANY choice |
-//! | [`placement`] | the meeting's frozen handler set (the one home for client-facing handler urls) and [`ConnectedHandlers`], the observed connectivity that can only hold resolved handlers |
+//! | [`placement`] | the meeting's MC-owned, versioned, ref-addressed handler set (the one home for client-facing handler urls and refs) and [`ConnectedHandlers`], the observed connectivity that can only hold resolved handlers |
 //! | [`assignment`] | the snapshot's **output types** and the id-packing rules every producer shares |
 //! | [`generation`] | a **change-detector** that numbers those snapshots, plus floor adoption after an MC restart |
 //! | [`confirm`] | a **total classifier** of the handler's reply into one bounded outcome |
 //! | [`pusher`] | one **push worker per (meeting, handler)**: serialized, latest-wins, meeting-scoped |
-//! | [`teardown`] | releasing an ended meeting on EVERY handler of its frozen set, only after its push workers have DRAINED (the `Quiesced` witness) |
+//! | [`teardown`] | releasing an ended meeting on EVERY handler of its handler set, only after its push workers have DRAINED (the `Quiesced` witness) |
 //! | (`grpc::mh_client`) | the programming call that carries a snapshot and confirms the echo |
 //!
 //! Loopback is gone (story 2 R-3): visibility is non-reflexive, so a solo
@@ -58,7 +58,10 @@ pub use confirm::{
 };
 pub use connectivity::{ConnectionKey, ParticipantConnectivity, Phase, SettleOutcome, Unapplied};
 pub use generation::{GenerationSpaceExhausted, PolicyGenerations};
-pub use placement::{ConnectedHandlers, HandlerEndpoint, HandlerSetError, MeetingHandlers};
+pub use placement::{
+    ClientHandler, ClientHandlerEntry, ClientHandlerSet, ConnectedHandlers, HandlerEndpoint,
+    HandlerSetError, MeetingHandlers, SetChange,
+};
 pub use pusher::{FloorAdoption, HandlerPusher, PushJob, PushTarget};
 pub use slots::{
     Edge, JoinRank, SlotTable, SlotTableError, SourceMute, SourceMuteView, KIND_FILL_ORDER,

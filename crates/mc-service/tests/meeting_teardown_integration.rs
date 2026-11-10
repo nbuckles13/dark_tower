@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use common::observability::testing::MetricAssertion;
 use mc_service::grpc::{MhClient, MhRegistrationClient};
-use mc_service::redis::{MhAssignmentStore, MhEndpointInfo};
+use mc_service::redis::MhEndpointInfo;
 use mc_test_utils::mock_mh::{MediaHandlerStub, MediaHandlerStubHandle, StubEvent};
 use proto_gen::dark_tower::internal::v1::ReleaseCause;
 use test_common::accept_loop_rig::AcceptLoopRig;
@@ -38,7 +38,6 @@ async fn stack(label: &str) -> (TestStackHandles, AcceptLoopRig, Arc<RecordingMe
     let rig = AcceptLoopRig::start_with_media_config(
         Arc::clone(&stack.controller_handle),
         Arc::clone(&stack.jwt_validator),
-        Arc::clone(&stack.mh_store) as Arc<dyn MhAssignmentStore>,
         Arc::new(MhClient::new(mc_test_utils::test_token_receiver()))
             as Arc<dyn MhRegistrationClient>,
         "mc-test".to_string(),
@@ -478,7 +477,7 @@ async fn a_create_during_teardown_waits_for_the_release_then_succeeds() {
     }
     stack
         .controller_handle
-        .create_meeting("td-fence".to_string())
+        .create_meeting("td-fence".to_string(), test_common::default_handler_set())
         .await
         .expect("the parked create succeeds once the release is out");
     assert!(

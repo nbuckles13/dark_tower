@@ -1,8 +1,8 @@
 //! Shared test infrastructure for `mc-service` integration tests.
 //!
-//! - [`MockMhAssignmentStore`] / [`MockMhRegistrationClient`]: in-memory
-//!   trait-impl mocks used by both the accept-loop rig and the legacy
-//!   join-flow tests. Per @dry-reviewer, these live next to their consumers
+//! - [`SeededHandoffs`] / [`MockMhRegistrationClient`]: the GC hand-offs a
+//!   test created meetings with, and an in-memory MH registration mock, used
+//!   by both the accept-loop rig and the legacy join-flow tests. Per @dry-reviewer, these live next to their consumers
 //!   (in `tests/common/`) rather than in `mc-test-utils`, mirroring MH's
 //!   `tests/common/mock_mc.rs` pattern.
 //!
@@ -28,58 +28,62 @@ use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActor
 use mc_service::auth::McJwtValidator;
 use mc_service::errors::McError;
 use mc_service::grpc::{MeetingProgramming, MhRegistrationClient};
+use mc_service::media_routing::MeetingHandlers;
 use mc_service::media_routing::PolicyGenerations;
-use mc_service::redis::{MhAssignmentData, MhAssignmentStore, MhEndpointInfo};
+use mc_service::redis::MhEndpointInfo;
 use mc_test_utils::jwt_test::{mount_jwks_mock, TestKeypair};
 use tokio::sync::Notify;
 use wiremock::MockServer;
 
 // =============================================================================
-// MockMhAssignmentStore — in-memory `get_mh_assignment`, no Redis.
+// SeededHandoffs — the GC hand-off each test meeting was created with.
+//
+// NOT a store MC reads: a meeting's handler set is installed at actor creation
+// (ADR-0039 §3) and no join reads anything. This is the test's own record, so
+// helpers like `media_session::registered_handlers` can name what was seeded.
 // =============================================================================
 
-pub struct MockMhAssignmentStore {
-    data: Mutex<std::collections::HashMap<String, MhAssignmentData>>,
+#[derive(Default)]
+pub struct SeededHandoffs {
+    data: Mutex<std::collections::HashMap<String, Vec<MhEndpointInfo>>>,
 }
 
-impl MockMhAssignmentStore {
+impl SeededHandoffs {
     pub fn new() -> Self {
-        Self {
-            data: Mutex::new(std::collections::HashMap::new()),
-        }
+        Self::default()
     }
 
-    pub fn insert(&self, meeting_id: &str, data: MhAssignmentData) {
+    pub fn insert(&self, meeting_id: &str, handlers: Vec<MhEndpointInfo>) {
         self.data
             .lock()
-            .expect("MockMhAssignmentStore mutex poisoned")
-            .insert(meeting_id.to_string(), data);
+            .expect("SeededHandoffs mutex poisoned")
+            .insert(meeting_id.to_string(), handlers);
     }
-}
 
-impl Default for MockMhAssignmentStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MhAssignmentStore for MockMhAssignmentStore {
-    fn get_mh_assignment<'a>(
-        &'a self,
-        meeting_id: &'a str,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Option<MhAssignmentData>, McError>> + Send + 'a,
-        >,
-    > {
-        let result = self
-            .data
+    pub fn get(&self, meeting_id: &str) -> Option<Vec<MhEndpointInfo>> {
+        self.data
             .lock()
-            .expect("MockMhAssignmentStore mutex poisoned")
+            .expect("SeededHandoffs mutex poisoned")
             .get(meeting_id)
-            .cloned();
-        Box::pin(async move { Ok(result) })
+            .cloned()
     }
+}
+
+/// THE one way the suite builds a meeting's handler set: through the
+/// production hand-off mapping (`handler_set_from_handoff`), never a copy.
+///
+/// # Panics
+///
+/// On an empty or duplicate list — a fixture defect.
+pub fn handler_set(handlers: &[MhEndpointInfo]) -> MeetingHandlers {
+    mc_service::grpc::mc_service::handler_set_from_handoff(handlers)
+        .expect("fixture hand-off is non-empty and duplicate-free")
+}
+
+/// The single default handler (`mh-test-1`) as a handler set — the set
+/// [`standalone_join_media`] tests create their meetings with.
+pub fn default_handler_set() -> MeetingHandlers {
+    handler_set(&[mh_handler("mh-test-1")])
 }
 
 // =============================================================================
@@ -132,6 +136,11 @@ pub struct MockMhRegistrationClient {
     /// genuinely IN FLIGHT, so a test can count what the push worker issues
     /// while one is outstanding (the client-mute churn bound).
     hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Per-handler holds (keyed by `expected_handler_id`): a push to a held
+    /// handler is recorded and then held until [`Self::release_handler`].
+    handler_holds: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Handlers whose pushes FAIL (keyed by `expected_handler_id`).
+    failing_handlers: Mutex<std::collections::HashSet<String>>,
 }
 
 impl MockMhRegistrationClient {
@@ -150,7 +159,41 @@ impl MockMhRegistrationClient {
             result,
             call_notify: Arc::new(Notify::new()),
             hold: Mutex::new(None),
+            handler_holds: Mutex::new(std::collections::HashMap::new()),
+            failing_handlers: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Hold every push to `handler_id` (recorded, not answered) until
+    /// [`Self::release_handler`] — a per-handler delayed ack.
+    pub fn hold_handler(&self, handler_id: &str) {
+        self.handler_holds
+            .lock()
+            .expect("handler_holds mutex poisoned")
+            .insert(
+                handler_id.to_string(),
+                Arc::new(tokio::sync::Semaphore::new(0)),
+            );
+    }
+
+    /// Answer every held push to `handler_id` and stop holding it.
+    pub fn release_handler(&self, handler_id: &str) {
+        if let Some(gate) = self
+            .handler_holds
+            .lock()
+            .expect("handler_holds mutex poisoned")
+            .remove(handler_id)
+        {
+            gate.close();
+        }
+    }
+
+    /// Make every push to `handler_id` fail (a handler that never acks).
+    pub fn fail_handler(&self, handler_id: &str) {
+        self.failing_handlers
+            .lock()
+            .expect("failing_handlers mutex poisoned")
+            .insert(handler_id.to_string());
     }
 
     /// Hold every `register_meeting()` from now on (recorded, not answered)
@@ -280,15 +323,28 @@ impl MhRegistrationClient for MockMhRegistrationClient {
                 policy_generation: programming.policy_generation.get(),
             });
         self.call_notify.notify_one();
+        let failing = self
+            .failing_handlers
+            .lock()
+            .expect("failing_handlers mutex poisoned")
+            .contains(programming.expected_handler_id);
         let result = match &self.result {
+            Ok(()) if failing => Err(McError::Grpc("handler down (fixture)".to_string())),
             Ok(()) => Ok(()),
             Err(e) => Err(McError::Grpc(e.to_string())),
         };
         let gate = self.hold.lock().expect("hold mutex poisoned").clone();
+        let handler_gate = self
+            .handler_holds
+            .lock()
+            .expect("handler_holds mutex poisoned")
+            .get(programming.expected_handler_id)
+            .cloned();
         Box::pin(async move {
-            if let Some(gate) = gate {
-                // Closed by `release_pushes`: `acquire` then fails, which is
-                // the release signal; no permit is ever granted while held.
+            for gate in [gate, handler_gate].into_iter().flatten() {
+                // Closed by `release_pushes` / `release_handler`: `acquire`
+                // then fails, which is the release signal; no permit is ever
+                // granted while held.
                 let _ = gate.acquire().await;
             }
             result
@@ -329,7 +385,8 @@ impl MhRegistrationClient for MockMhRegistrationClient {
 pub struct TestStackHandles {
     pub controller_handle: Arc<MeetingControllerActorHandle>,
     pub jwt_validator: Arc<McJwtValidator>,
-    pub mh_store: Arc<MockMhAssignmentStore>,
+    /// The GC hand-off each seeded meeting was created with.
+    pub handoffs: Arc<SeededHandoffs>,
     pub mh_reg_client: Arc<MockMhRegistrationClient>,
     pub mock_server: MockServer,
     pub keypair: TestKeypair,
@@ -377,13 +434,13 @@ pub async fn build_test_stack_with_notifier(
         meeting_ended,
     ));
 
-    let mh_store: Arc<MockMhAssignmentStore> = Arc::new(MockMhAssignmentStore::new());
+    let handoffs = Arc::new(SeededHandoffs::new());
     let mh_reg_client: Arc<MockMhRegistrationClient> = Arc::new(MockMhRegistrationClient::new());
 
     TestStackHandles {
         controller_handle,
         jwt_validator,
-        mh_store,
+        handoffs,
         mh_reg_client,
         mock_server,
         keypair,
@@ -403,49 +460,35 @@ pub fn mh_handler(mh_id: &str) -> MhEndpointInfo {
     }
 }
 
-/// Seed an MH assignment for `meeting_id` with the supplied handlers and
-/// create the meeting on the controller actor.
+/// Create `meeting_id` on the controller actor with `handlers` as GC's
+/// hand-off (ADR-0039 §3: the set is installed at creation), and record it.
 ///
-/// Used by tests that need both the MC controller and an MH assignment in
-/// place before issuing a JoinRequest. For single-handler scenarios prefer
-/// the [`seed_meeting_with_mh`] convenience wrapper.
+/// For single-handler scenarios prefer [`seed_meeting_with_mh`].
 pub async fn seed_meeting_with_handlers(
     handles: &TestStackHandles,
     meeting_id: &str,
     handlers: Vec<MhEndpointInfo>,
 ) {
-    handles.mh_store.insert(
-        meeting_id,
-        MhAssignmentData {
-            handlers,
-            assigned_at: "2026-04-25T00:00:00Z".to_string(),
-        },
-    );
+    let set = handler_set(&handlers);
+    handles.handoffs.insert(meeting_id, handlers);
     handles
         .controller_handle
-        .create_meeting(meeting_id.to_string())
+        .create_meeting(meeting_id.to_string(), set)
         .await
         .expect("create_meeting");
 }
 
-/// Seed ONLY the MH assignment, without creating the meeting on the controller.
-///
-/// For callers that create the meeting themselves through a different entry
-/// point (e.g. the `test-seams` pre-seeded-cursor constructor) but still need
-/// the join path to find handler data — a join with no MH assignment fails at
-/// `build_join_response` (R-6) before reaching what such a test is exercising.
-pub fn seed_mh_assignment_only(handles: &TestStackHandles, meeting_id: &str) {
-    handles.mh_store.insert(
-        meeting_id,
-        MhAssignmentData {
-            handlers: vec![mh_handler("mh-test-1")],
-            assigned_at: "2026-04-25T00:00:00Z".to_string(),
-        },
-    );
+/// The default hand-off (`mh-test-1`) for a meeting the caller creates itself
+/// through a different entry point (e.g. the `test-seams` constructor):
+/// records it and returns the set to create the meeting with.
+pub fn seed_default_handoff(handles: &TestStackHandles, meeting_id: &str) -> MeetingHandlers {
+    let handlers = vec![mh_handler("mh-test-1")];
+    let set = handler_set(&handlers);
+    handles.handoffs.insert(meeting_id, handlers);
+    set
 }
 
-/// Seed an MH assignment for `meeting_id` with a single default handler
-/// (`mh-test-1`) and create the meeting on the controller actor.
+/// Create `meeting_id` with a single default handler (`mh-test-1`).
 ///
 /// Thin wrapper over [`seed_meeting_with_handlers`] for the common case.
 pub async fn seed_meeting_with_mh(handles: &TestStackHandles, meeting_id: &str) {
@@ -453,36 +496,26 @@ pub async fn seed_meeting_with_mh(handles: &TestStackHandles, meeting_id: &str) 
 }
 
 /// Media-routing inputs for actor-level joins in the integration suite: the
-/// stack's recording MH client and a meeting handler set of `handlers`.
-///
-/// # Panics
-///
-/// Panics on an empty or duplicate handler list — a fixture defect.
-pub fn test_join_media(
-    handles: &TestStackHandles,
-    handlers: &[MhEndpointInfo],
-) -> mc_service::actors::JoinMedia {
-    join_media_with(
-        Arc::clone(&handles.mh_reg_client) as Arc<dyn MhRegistrationClient>,
-        handlers,
-    )
+/// stack's recording MH client. (The meeting's handler set was installed at
+/// creation; a join carries none.)
+pub fn test_join_media(handles: &TestStackHandles) -> mc_service::actors::JoinMedia {
+    join_media_with(Arc::clone(&handles.mh_reg_client) as Arc<dyn MhRegistrationClient>)
 }
 
 /// [`test_join_media`] for tests that drive the actor without a
-/// [`TestStackHandles`]: a fresh recording MH client and the single default
-/// handler `mh-test-1`.
+/// [`TestStackHandles`]: a fresh recording MH client (that acks every push).
+/// Create the meeting with [`default_handler_set`].
 pub fn standalone_join_media() -> mc_service::actors::JoinMedia {
-    join_media_with(
-        Arc::new(MockMhRegistrationClient::new()),
-        &[mh_handler("mh-test-1")],
-    )
+    join_media_with(Arc::new(MockMhRegistrationClient::new()))
 }
 
-fn join_media_with(
-    mh_client: Arc<dyn MhRegistrationClient>,
-    handlers: &[MhEndpointInfo],
-) -> mc_service::actors::JoinMedia {
-    use mc_service::media_routing::{HandlerEndpoint, HandlerId, MeetingHandlers};
+/// [`standalone_join_media`] with a caller-held MH client (per-handler holds
+/// and failures).
+pub fn join_media_on(mh_client: Arc<MockMhRegistrationClient>) -> mc_service::actors::JoinMedia {
+    join_media_with(mh_client as Arc<dyn MhRegistrationClient>)
+}
+
+fn join_media_with(mh_client: Arc<dyn MhRegistrationClient>) -> mc_service::actors::JoinMedia {
     mc_service::actors::JoinMedia {
         deps: Arc::new(mc_service::actors::MediaRoutingDeps {
             mh_client,
@@ -495,12 +528,6 @@ fn join_media_with(
             ),
             connect_settle_window: client_media_config().connect_settle_window,
         }),
-        handlers: MeetingHandlers::new(handlers.iter().map(|h| HandlerEndpoint {
-            id: HandlerId::new(&h.mh_id),
-            webtransport_url: h.webtransport_endpoint.clone(),
-            grpc_endpoint: h.grpc_endpoint.clone(),
-        }))
-        .expect("fixture handler set is non-empty and duplicate-free"),
         // The actor-driven suite joins as an audio publisher with no
         // join-carried declaration (it declares post-join), story 2's shape.
         declared: mc_service::media_kind::ClientMediaStates::live(
@@ -511,6 +538,26 @@ fn join_media_with(
         demand: mc_service::media_signaling::ReceiveCapabilityDeclaration::empty()
             .truncate(client_media_config().receive_slot_caps),
     }
+}
+
+/// Every frame queued so far on a wired participant's outbound channel,
+/// decoded, in order — the actor-level suites' one reader of what a client
+/// would receive after its `JoinResponse`.
+pub fn drain_frames(
+    rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
+) -> Vec<proto_gen::dark_tower::signaling::v1::server_message::Message> {
+    use prost::Message as _;
+    let mut out = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        if let Some(msg) =
+            proto_gen::dark_tower::signaling::v1::ServerMessage::decode(bytes.as_ref())
+                .expect("MC writes decodable ServerMessages")
+                .message
+        {
+            out.push(msg);
+        }
+    }
+    out
 }
 
 /// A syntactically valid Ed25519 identity public key for join-path tests.

@@ -192,6 +192,24 @@ where
     Ok(parsed)
 }
 
+/// An OPTIONAL seconds value: absent = `default`; present but unparseable or
+/// above `max` refuses boot (never a silent fallback).
+fn optional_seconds(
+    vars: &HashMap<String, String>,
+    name: &str,
+    max: u64,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    vars.get(name)
+        .map(|raw| bounded(name, raw, 0, max))
+        .transpose()
+        .map(|v| v.unwrap_or(default))
+}
+
+/// Floor for `MC_MAX_MEETINGS` / `MC_MAX_PARTICIPANTS`: a cap of 0 is a silent
+/// total outage, so it is not a valid value.
+pub const MIN_CAPACITY_CAP: u32 = 1;
+
 /// Meeting Controller configuration.
 ///
 /// Loaded from environment variables with sensible defaults.
@@ -561,41 +579,61 @@ impl Config {
             .cloned()
             .unwrap_or_else(|| "http://localhost:50051".to_string());
 
-        // Parse capacity limits
-        let max_meetings = vars
-            .get("MC_MAX_MEETINGS")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000);
+        // Capacity limits (R-37): REQUIRED. A missing key, an unparseable value
+        // or 0 refuses boot. Before story 4 MC-A both silently fell back to a
+        // default on a typo, which masked a mistyped load-shed lever. 0 is
+        // rejected because a cap of 0 refuses every meeting / connection — a
+        // silent total outage that would read as valid config.
+        // `MissingEnvVar(` and the key literal stay on ONE line for
+        // `dt-guard env-config`, which builds the required set from them.
+        let max_meetings = bounded(
+            "MC_MAX_MEETINGS",
+            vars.get("MC_MAX_MEETINGS")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MC_MAX_MEETINGS".to_string()))?,
+            MIN_CAPACITY_CAP,
+            u32::MAX,
+        )?;
+        let max_participants = bounded(
+            "MC_MAX_PARTICIPANTS",
+            vars.get("MC_MAX_PARTICIPANTS")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MC_MAX_PARTICIPANTS".to_string()))?,
+            MIN_CAPACITY_CAP,
+            u32::MAX,
+        )?;
 
-        let max_participants = vars
-            .get("MC_MAX_PARTICIPANTS")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10000);
-
-        // Parse ADR-0023 session binding parameters
-        let binding_token_ttl_seconds = vars
-            .get("MC_BINDING_TOKEN_TTL_SECONDS")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_BINDING_TOKEN_TTL_SECONDS);
-
-        let clock_skew_seconds = vars
-            .get("MC_CLOCK_SKEW_SECONDS")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_CLOCK_SKEW_SECONDS);
-
-        let nonce_grace_window_seconds = vars
-            .get("MC_NONCE_GRACE_WINDOW_SECONDS")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_NONCE_GRACE_WINDOW_SECONDS);
-
-        let disconnect_grace_period_seconds = vars
-            .get("MC_DISCONNECT_GRACE_PERIOD_SECONDS")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS);
+        // ADR-0023 session-binding parameters: OPTIONAL (absent = default),
+        // but an unparseable value refuses boot — never a silent default.
+        // MC_CLOCK_SKEW_SECONDS is also bounded by the shared JWT ceiling
+        // (`common::jwt::MAX_CLOCK_SKEW`, as AC enforces), which is what makes
+        // `main.rs`'s "bounded to <= MAX_CLOCK_SKEW" cast justifications true.
+        let binding_token_ttl_seconds = optional_seconds(
+            vars,
+            "MC_BINDING_TOKEN_TTL_SECONDS",
+            u64::MAX,
+            DEFAULT_BINDING_TOKEN_TTL_SECONDS,
+        )?;
+        let clock_skew_seconds = optional_seconds(
+            vars,
+            "MC_CLOCK_SKEW_SECONDS",
+            common::jwt::MAX_CLOCK_SKEW.as_secs(),
+            DEFAULT_CLOCK_SKEW_SECONDS,
+        )?;
+        let nonce_grace_window_seconds = optional_seconds(
+            vars,
+            "MC_NONCE_GRACE_WINDOW_SECONDS",
+            u64::MAX,
+            DEFAULT_NONCE_GRACE_WINDOW_SECONDS,
+        )?;
+        let disconnect_grace_period_seconds = optional_seconds(
+            vars,
+            "MC_DISCONNECT_GRACE_PERIOD_SECONDS",
+            u64::MAX,
+            DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS,
+        )?;
 
         // QUIC max-idle-timeout: FAIL-LOUD parse (mirrors the OTEL_SAMPLE_RATE
-        // pattern, NOT the lenient `.parse().ok().unwrap_or(DEFAULT)` used by the
-        // other `_SECONDS` vars). A non-numeric value, or `0` (which maps to an
+        // pattern; every numeric MC key is fail-loud since story 4 MC-A). A
+        // non-numeric value, or `0` (which maps to an
         // infinite idle timeout — the wtransport docs warn this can hang
         // futures, and it re-introduces the unbounded crash-detection bug),
         // must crash the process at load rather than silently reverting to a
@@ -987,6 +1025,9 @@ mod tests {
             ),
             ("MC_TLS_CERT_PATH".to_string(), "/dev/null".to_string()),
             ("MC_TLS_KEY_PATH".to_string(), "/dev/null".to_string()),
+            // R-37: REQUIRED caps (today's deployed values).
+            ("MC_MAX_MEETINGS".to_string(), "1000".to_string()),
+            ("MC_MAX_PARTICIPANTS".to_string(), "10000".to_string()),
             (
                 "MC_GRPC_ADVERTISE_ADDRESS".to_string(),
                 "http://localhost:50052".to_string(),
@@ -1332,6 +1373,93 @@ mod tests {
         let mut vars = base_vars();
         vars.insert("MEDIA_VIDEO_CODEC".to_string(), " VP8 ".to_string());
         assert!(Config::from_vars(&vars).is_ok());
+    }
+
+    /// R-37: the caps are REQUIRED. Missing, unparseable (including negative,
+    /// fractional, empty and u32-overflowing) or 0 refuses boot with an error
+    /// naming the key; a valid value is taken verbatim.
+    #[test]
+    fn capacity_caps_are_required_and_fail_loudly() {
+        for key in ["MC_MAX_MEETINGS", "MC_MAX_PARTICIPANTS"] {
+            let mut vars = base_vars();
+            vars.remove(key);
+            assert!(
+                matches!(Config::from_vars(&vars), Err(ConfigError::MissingEnvVar(ref k)) if k == key),
+                "{key} missing must refuse boot"
+            );
+            for bad in ["abc", "-1", "1.5", "", "4294967296", "0"] {
+                let mut vars = base_vars();
+                vars.insert(key.to_string(), bad.to_string());
+                match Config::from_vars(&vars) {
+                    Err(ConfigError::InvalidValue(msg)) => {
+                        assert!(
+                            msg.contains(key),
+                            "{key}={bad:?}: error names the key: {msg}"
+                        );
+                    }
+                    other => panic!("{key}={bad:?} must refuse boot, got {other:?}"),
+                }
+            }
+            // Positive arm: valid values, the floor included.
+            for (good, expected) in [("1", 1u32), ("250", 250), ("4294967295", u32::MAX)] {
+                let mut vars = base_vars();
+                vars.insert(key.to_string(), good.to_string());
+                let config = Config::from_vars(&vars).expect("valid cap loads");
+                let got = if key == "MC_MAX_MEETINGS" {
+                    config.max_meetings
+                } else {
+                    config.max_participants
+                };
+                assert_eq!(got, expected, "{key}={good}");
+            }
+        }
+    }
+
+    /// The four ADR-0023 seconds keys: absent = default; unparseable refuses
+    /// boot naming the key; MC_CLOCK_SKEW_SECONDS is bounded by the shared
+    /// JWT ceiling (MAX passes, MAX+1 refuses).
+    #[test]
+    fn session_seconds_keys_fail_loudly_on_a_bad_value() {
+        let keys = [
+            "MC_BINDING_TOKEN_TTL_SECONDS",
+            "MC_CLOCK_SKEW_SECONDS",
+            "MC_NONCE_GRACE_WINDOW_SECONDS",
+            "MC_DISCONNECT_GRACE_PERIOD_SECONDS",
+        ];
+        for key in keys {
+            for bad in ["abc", "-1", "1.5", "", "18446744073709551616"] {
+                let mut vars = base_vars();
+                vars.insert(key.to_string(), bad.to_string());
+                match Config::from_vars(&vars) {
+                    Err(ConfigError::InvalidValue(msg)) => {
+                        assert!(
+                            msg.contains(key),
+                            "{key}={bad:?}: error names the key: {msg}"
+                        );
+                    }
+                    other => panic!("{key}={bad:?} must refuse boot, got {other:?}"),
+                }
+            }
+            let mut vars = base_vars();
+            vars.insert(key.to_string(), "7".to_string());
+            let config = Config::from_vars(&vars).expect("valid value loads");
+            let got = match key {
+                "MC_BINDING_TOKEN_TTL_SECONDS" => config.binding_token_ttl_seconds,
+                "MC_CLOCK_SKEW_SECONDS" => config.clock_skew_seconds,
+                "MC_NONCE_GRACE_WINDOW_SECONDS" => config.nonce_grace_window_seconds,
+                _ => config.disconnect_grace_period_seconds,
+            };
+            assert_eq!(got, 7, "{key}");
+        }
+        let max = common::jwt::MAX_CLOCK_SKEW.as_secs();
+        let mut vars = base_vars();
+        vars.insert("MC_CLOCK_SKEW_SECONDS".to_string(), max.to_string());
+        assert_eq!(Config::from_vars(&vars).unwrap().clock_skew_seconds, max);
+        vars.insert("MC_CLOCK_SKEW_SECONDS".to_string(), (max + 1).to_string());
+        assert!(matches!(
+            Config::from_vars(&vars),
+            Err(ConfigError::InvalidValue(ref m)) if m.contains("MC_CLOCK_SKEW_SECONDS")
+        ));
     }
 
     /// The retired keys are NOT read: their absence changes nothing, and a

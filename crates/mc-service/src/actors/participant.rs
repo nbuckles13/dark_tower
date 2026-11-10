@@ -50,6 +50,13 @@ pub(crate) const OUTBOUND_PAYLOAD_SIGNALING_RAW: &str = "signaling_raw";
 /// rotation that did not reach a member.
 pub(crate) const OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE: &str = "meeting_kek_update";
 
+/// `payload_kind` label for a `MediaHandlerSet` (ADR-0039 §4) dropped on the
+/// outbound channel. Its own value by DEMONSTRATED CONSUMER NEED: a dropped
+/// set has no re-sync path until the next membership change, so the client
+/// keeps dialling the old membership (no media from a new handler, or a dial
+/// to a removed one) — a consequence distinct from every other kind.
+pub(crate) const OUTBOUND_PAYLOAD_MEDIA_HANDLER_SET: &str = "media_handler_set";
+
 /// Maximum distinct MH statuses recorded per participant (R-60 security cap).
 ///
 /// Bounds per-participant map growth from a hostile client flooding distinct
@@ -131,6 +138,23 @@ impl ParticipantActorHandle {
             .await
             .map_err(|e| McError::Internal(format!("channel send failed: {e}")))?;
         Ok(rx)
+    }
+
+    /// Deliver the meeting's client-facing handler set (ADR-0039 §4).
+    ///
+    /// Awaits the mailbox like [`Self::send_update`].
+    ///
+    /// # Errors
+    ///
+    /// `McError::Internal` if the mailbox is closed.
+    pub async fn send_handler_set(
+        &self,
+        set: crate::media_routing::ClientHandlerSet,
+    ) -> Result<(), McError> {
+        self.sender
+            .send(ParticipantMessage::HandlerSet { set })
+            .await
+            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
     }
 
     /// Record per-MH connection statuses reported by the client (R-60).
@@ -480,6 +504,11 @@ impl ParticipantActor {
                 false
             }
 
+            ParticipantMessage::HandlerSet { set } => {
+                self.handle_handler_set(&set);
+                false
+            }
+
             ParticipantMessage::Close { reason } => {
                 self.graceful_close(&reason).await;
                 true
@@ -632,6 +661,34 @@ impl ParticipantActor {
         } else {
             self.record_outbound_drop(OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE);
             KekPushOutcome::DroppedOutbound
+        }
+    }
+
+    /// Encode the meeting's handler set onto the wire, through the ONE
+    /// projection (`webtransport::handler::media_handler_set`).
+    fn handle_handler_set(&mut self, set: &crate::media_routing::ClientHandlerSet) {
+        use prost::Message;
+        use proto_gen::dark_tower::signaling::v1::{server_message, ServerMessage};
+
+        if self.is_closing {
+            return;
+        }
+        let Some(tx) = &self.stream_tx else {
+            return;
+        };
+        let (trace_parent, trace_state) = crate::webtransport::trace::inject_current_context();
+        let message = ServerMessage {
+            message: Some(server_message::Message::MediaHandlerSet(
+                crate::webtransport::handler::media_handler_set(set),
+            )),
+            trace_parent,
+            trace_state,
+        };
+        if tx
+            .try_send(bytes::Bytes::from(message.encode_to_vec()))
+            .is_err()
+        {
+            self.record_outbound_drop(OUTBOUND_PAYLOAD_MEDIA_HANDLER_SET);
         }
     }
 
@@ -836,6 +893,51 @@ mod tests {
         );
         snap.counter("mc_participant_outbound_messages_dropped_total")
             .with_labels(&[("payload_kind", "meeting_kek_update")])
+            .assert_delta(1);
+    }
+
+    /// ADR-0032: the `media_handler_set` drop is driven behaviourally. Positive
+    /// arm first: a set on a channel with room is DELIVERED (decoded off the
+    /// wire) and records no drop; then, with the one slot full, the next set
+    /// is dropped and counted under its own `payload_kind`.
+    #[tokio::test]
+    async fn a_full_outbound_channel_drops_the_handler_set_and_counts_it() {
+        use prost::Message;
+        use proto_gen::dark_tower::signaling::v1::{server_message, ServerMessage};
+
+        let snap = MetricAssertion::snapshot();
+        let (mut actor, mut rx) = bare_actor_with_stream(1);
+        let set = crate::media_routing::ClientHandlerSet {
+            version: 2,
+            handlers: vec![crate::media_routing::ClientHandlerEntry {
+                media_handler_url: "https://mh-0.test:4434".to_string(),
+                handler_ref: std::num::NonZeroU32::MIN,
+            }],
+        };
+        actor.handle_handler_set(&set);
+        let delivered = ServerMessage::decode(rx.try_recv().expect("delivered").as_ref()).unwrap();
+        match delivered.message {
+            Some(server_message::Message::MediaHandlerSet(wire)) => {
+                assert_eq!(wire.handler_set_version, 2);
+                assert_eq!(wire.handlers.len(), 1);
+                assert_eq!(wire.handlers[0].handler_ref, 1);
+            }
+            other => panic!("expected MediaHandlerSet, got {other:?}"),
+        }
+        snap.counter("mc_participant_outbound_messages_dropped_total")
+            .with_labels(&[("payload_kind", "media_handler_set")])
+            .assert_delta(0);
+
+        // Fill the one slot with something else, then the set is dropped.
+        actor
+            .handle_send(SignalingPayload::Raw {
+                message_type: crate::actors::messages::RAW_SERVER_MESSAGE_TYPE,
+                data: vec![0],
+            })
+            .await;
+        actor.handle_handler_set(&set);
+        snap.counter("mc_participant_outbound_messages_dropped_total")
+            .with_labels(&[("payload_kind", "media_handler_set")])
             .assert_delta(1);
     }
 

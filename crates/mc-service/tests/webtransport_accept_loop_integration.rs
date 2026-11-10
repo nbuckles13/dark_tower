@@ -34,7 +34,6 @@ use std::time::Duration;
 use ::common::observability::testing::MetricAssertion;
 use bytes::{BufMut, BytesMut};
 use mc_service::grpc::MhRegistrationClient;
-use mc_service::redis::{MhAssignmentData, MhAssignmentStore, MhEndpointInfo};
 use mc_test_utils::jwt_test::{make_expired_meeting_claims, make_meeting_claims, TestKeypair};
 use prost::Message;
 use proto_gen::dark_tower::signaling::v1::{client_message, ClientMessage, JoinRequest};
@@ -61,7 +60,6 @@ async fn start_rig(max_connections: usize) -> RigBundle {
     let rig = AcceptLoopRig::start_with(
         Arc::clone(&stack.controller_handle),
         Arc::clone(&stack.jwt_validator),
-        Arc::clone(&stack.mh_store) as Arc<dyn MhAssignmentStore>,
         Arc::clone(&stack.mh_reg_client) as Arc<dyn MhRegistrationClient>,
         "mc-test".to_string(),
         "http://mc-test:50052".to_string(),
@@ -299,18 +297,7 @@ async fn accept_loop_records_session_join_failure_meeting_not_found() {
     // returns `McError::MeetingNotFound`, which `error_type_label()` maps to
     // `"meeting_not_found"`.
     let bundle = start_rig(8).await;
-    // Insert MH assignment but DO NOT create_meeting on the controller.
-    bundle.stack.mh_store.insert(
-        "meeting-not-found",
-        MhAssignmentData {
-            handlers: vec![MhEndpointInfo {
-                mh_id: "mh-test-1".to_string(),
-                webtransport_endpoint: "wt://mh-test-1:4433".to_string(),
-                grpc_endpoint: "http://mh-test-1:50053".to_string(),
-            }],
-            assigned_at: "2026-04-25T00:00:00Z".to_string(),
-        },
-    );
+    // DO NOT create_meeting on the controller.
 
     let snap = MetricAssertion::snapshot();
     let claims = make_meeting_claims("meeting-not-found");
@@ -328,40 +315,7 @@ async fn accept_loop_records_session_join_failure_meeting_not_found() {
         .with_labels(&[("error_type", "meeting_not_found")])
         .assert_delta(1);
     // Adjacency on the other rig-reachable error_types.
-    for sibling in &["jwt_validation", "mh_assignment_missing", "internal"] {
-        snap.counter("mc_session_join_failures_total")
-            .with_labels(&[("error_type", *sibling)])
-            .assert_delta(0);
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn accept_loop_records_session_join_failure_mh_assignment_missing() {
-    // Meeting created on controller but mh_store is empty for that meeting →
-    // `build_join_response` fails with `McError::MhAssignmentMissing`.
-    let bundle = start_rig(8).await;
-    bundle
-        .rig
-        .controller_handle
-        .create_meeting("meeting-no-mh".to_string())
-        .await
-        .expect("create_meeting");
-
-    let snap = MetricAssertion::snapshot();
-    let claims = make_meeting_claims("meeting-no-mh");
-    let token = bundle.stack.keypair.sign_token(&claims);
-    let (_conn, _send, _recv) = open_bi_send_join(&bundle.rig.url, "meeting-no-mh", &token).await;
-
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    snap.histogram("mc_session_join_duration_seconds")
-        .with_labels(&[("status", "failure")])
-        .assert_observation_count_at_least(1);
-
-    snap.counter("mc_session_join_failures_total")
-        .with_labels(&[("error_type", "mh_assignment_missing")])
-        .assert_delta(1);
-    for sibling in &["jwt_validation", "meeting_not_found", "internal"] {
+    for sibling in &["jwt_validation", "internal"] {
         snap.counter("mc_session_join_failures_total")
             .with_labels(&[("error_type", *sibling)])
             .assert_delta(0);
@@ -393,7 +347,7 @@ async fn accept_loop_records_session_join_failure_jwt_validation() {
     snap.counter("mc_session_join_failures_total")
         .with_labels(&[("error_type", "jwt_validation")])
         .assert_delta(1);
-    for sibling in &["meeting_not_found", "mh_assignment_missing", "internal"] {
+    for sibling in &["meeting_not_found", "internal"] {
         snap.counter("mc_session_join_failures_total")
             .with_labels(&[("error_type", *sibling)])
             .assert_delta(0);
@@ -448,11 +402,7 @@ async fn accept_loop_records_session_join_failure_internal_for_wrong_first_messa
     snap.counter("mc_session_join_failures_total")
         .with_labels(&[("error_type", "internal")])
         .assert_delta(1);
-    for sibling in &[
-        "jwt_validation",
-        "meeting_not_found",
-        "mh_assignment_missing",
-    ] {
+    for sibling in &["jwt_validation", "meeting_not_found"] {
         snap.counter("mc_session_join_failures_total")
             .with_labels(&[("error_type", *sibling)])
             .assert_delta(0);

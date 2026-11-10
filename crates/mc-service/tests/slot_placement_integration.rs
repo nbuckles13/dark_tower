@@ -45,7 +45,6 @@ use common::observability::testing::MetricAssertion;
 use mc_service::actors::{DisconnectCause, MeetingSeams};
 use mc_service::grpc::{MhClient, MhRegistrationClient};
 use mc_service::media_routing::{HandlerId, PolicyPushOutcome};
-use mc_service::redis::MhAssignmentStore;
 use mc_test_utils::mock_mh::{AppliedGenerationBehaviour, MediaHandlerStub};
 use proto_gen::dark_tower::signaling::v1::{SlotState, TransportMode};
 
@@ -629,18 +628,13 @@ async fn seamed_meeting(
     handlers: Vec<mc_service::redis::MhEndpointInfo>,
     seams: MeetingSeams,
 ) {
+    let set = test_common::handler_set(&handlers);
+    stack.handoffs.insert(meeting_id, handlers);
     stack
         .controller_handle
-        .create_meeting_with_seams(meeting_id.to_string(), seams)
+        .create_meeting_with_seams(meeting_id.to_string(), set, seams)
         .await
         .expect("create meeting with seams");
-    stack.mh_store.insert(
-        meeting_id,
-        mc_service::redis::MhAssignmentData {
-            handlers,
-            assigned_at: "2026-09-24T00:00:00Z".to_string(),
-        },
-    );
 }
 
 #[tokio::test]
@@ -807,7 +801,7 @@ async fn grace_expiry_drives_the_same_re_push_as_a_clean_leave() {
                 false,
                 test_identity_key(),
                 Some(tx),
-                test_join_media(&stack, &handlers),
+                test_join_media(&stack),
             )
             .await
             .unwrap();
@@ -905,7 +899,7 @@ async fn a_reconnect_in_grace_keeps_slots_and_re_sends_only_the_reconnectors_vie
                     false,
                     test_identity_key(),
                     Some(tx),
-                    test_join_media(&stack, &handlers),
+                    test_join_media(&stack),
                 )
                 .await
                 .unwrap(),
@@ -947,7 +941,7 @@ async fn a_reconnect_in_grace_keeps_slots_and_re_sends_only_the_reconnectors_vie
             false,
             test_identity_key(),
             Some(tx_c),
-            test_join_media(&stack, &handlers),
+            test_join_media(&stack),
         )
         .await
         .unwrap();
@@ -997,61 +991,6 @@ async fn a_reconnect_in_grace_keeps_slots_and_re_sends_only_the_reconnectors_vie
     );
 }
 
-/// S-C: the handler set frozen at the first join is the meeting's authority. A
-/// later join carrying a DIFFERENT set (Redis changed, or was tampered with)
-/// is counted and logged, and cannot widen the set: the joiner is offered the
-/// FROZEN set, never the injected handler.
-#[tokio::test]
-async fn a_later_join_cannot_widen_the_frozen_handler_set() {
-    let stack = build_test_stack("slot-frozen").await;
-    let frozen = vec![mh_handler("mh-0")];
-    seed_meeting_with_handlers(&stack, "slot-frozen", frozen.clone()).await;
-    let meeting = stack
-        .controller_handle
-        .get_meeting_handle("slot-frozen".to_string())
-        .await
-        .unwrap();
-
-    let mut results = Vec::new();
-    for (p, handlers) in [
-        ("a", frozen.clone()),
-        ("b", vec![mh_handler("mh-evil"), mh_handler("mh-0")]),
-    ] {
-        let snap = MetricAssertion::snapshot();
-        let (tx, _rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
-        let joined = meeting
-            .connection_join(
-                format!("conn-{p}"),
-                format!("user-{p}"),
-                format!("part-{p}"),
-                String::new(),
-                false,
-                test_identity_key(),
-                Some(tx),
-                test_join_media(&stack, &handlers),
-            )
-            .await
-            .unwrap();
-        let divergences = snap
-            .counter("mc_media_handler_set_divergence_total")
-            .with_labels(&[("key_custody", "operator")])
-            .delta();
-        let offered: Vec<HandlerId> = joined.media_handlers.ids().cloned().collect();
-        results.push((offered, divergences));
-    }
-    assert_eq!(
-        results[0],
-        (vec![HandlerId::new("mh-0")], 0),
-        "the first join freezes the set"
-    );
-    assert_eq!(
-        results[1],
-        (vec![HandlerId::new("mh-0")], 1),
-        "a divergent later join is counted and offered the FROZEN one-handler set, never \
-         the injected handler"
-    );
-}
-
 // ============================================================================
 // Re-push confirm: a mismatch on a RE-push fails loudly, like the first
 // ============================================================================
@@ -1071,7 +1010,6 @@ async fn an_applied_echo_mismatch_on_a_re_push_is_loud() {
     let rig = AcceptLoopRig::start_with_media_config(
         Arc::clone(&stack.controller_handle),
         Arc::clone(&stack.jwt_validator),
-        Arc::clone(&stack.mh_store) as Arc<dyn MhAssignmentStore>,
         Arc::new(MhClient::new(mc_test_utils::test_token_receiver()))
             as Arc<dyn MhRegistrationClient>,
         "mc-test".to_string(),
@@ -1198,7 +1136,7 @@ async fn actor_meeting(
                 false,
                 test_identity_key(),
                 Some(tx),
-                test_join_media(&stack, &endpoints),
+                test_join_media(&stack),
             )
             .await
             .unwrap();

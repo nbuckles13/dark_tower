@@ -67,22 +67,37 @@
 //! become correct after backoff. A newer published snapshot abandons the retry
 //! loop in favour of the newer snapshot.
 //!
+//! # Reporting registration back to the meeting actor (ADR-0039 §3)
+//!
+//! A handler enters the client-facing set only once its `RegisterMeeting` is
+//! acked (register before token). The worker reports that, and the initial
+//! failure the actor must not wait past, through its [`RegistrationReporter`]:
+//! a non-blocking send on an unbounded channel the meeting actor drains in its
+//! own `select!` arm — the actor never awaits MH inside a turn, and the worker
+//! never holds anything that reaches back into a turn. At most two reports per
+//! worker (one initial failure, then one `Registered`), so the channel is
+//! bounded in practice. The reporter's `Drop` sends the initial failure if no
+//! verdict was ever sent (a panicked, aborted or cancelled worker), so a parked
+//! first join always gets a terminal event.
+//!
 //! # No key material
 //!
 //! A job carries a generation and a [`HandlerAssignment`] — sender ids, slot
-//! ids, behaviours. No KEK, no transmit key, no identity key.
+//! ids, behaviours. No KEK, no transmit key, no identity key. A registration
+//! report carries a handler id and ref only.
 
 use super::assignment::HandlerAssignment;
+use super::assignment::HandlerId;
 use super::confirm::{PolicyPushOutcome, PushDisposition};
 use super::generation::PolicyGenerations;
 use super::placement::HandlerEndpoint;
 use crate::errors::McError;
 use crate::grpc::mh_client::{MeetingProgramming, MhRegistrationClient};
 use crate::observability::metrics;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Instrument};
@@ -117,6 +132,99 @@ pub struct PushTarget {
     pub mc_grpc_endpoint: String,
     /// The handler this worker programs.
     pub handler: HandlerEndpoint,
+    /// Where this worker reports its handler's registration verdict.
+    pub registration: RegistrationReporter,
+}
+
+/// A handler's registration verdict, as its push worker reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationOutcome {
+    /// The worker's first `RegisterMeeting` for this handler was acked: the
+    /// handler may become Active.
+    Registered,
+    /// The worker's first snapshot settled without an ack (retries exhausted,
+    /// a terminal refusal, or the worker ended) before any ack. Releases a
+    /// parked first join; the handler stays Registering.
+    InitialRegistrationFailed,
+}
+
+/// One registration report: ids only — never a `MeetingProgramming`, never key
+/// material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlerRegistration {
+    /// The handler.
+    pub handler_id: HandlerId,
+    /// Its incarnation's ref, so a late report for a removed incarnation is
+    /// a no-op at the actor.
+    pub handler_ref: NonZeroU32,
+    /// The verdict.
+    pub outcome: RegistrationOutcome,
+}
+
+/// A push worker's one-way line back to its meeting actor (module doc).
+///
+/// Holds only the sender and ids. Every send is non-blocking.
+#[derive(Debug)]
+pub struct RegistrationReporter {
+    tx: mpsc::UnboundedSender<HandlerRegistration>,
+    handler_id: HandlerId,
+    handler_ref: NonZeroU32,
+    has_registered: bool,
+    has_sent_verdict: bool,
+}
+
+impl RegistrationReporter {
+    /// A reporter for one handler incarnation.
+    #[must_use]
+    pub fn new(
+        tx: mpsc::UnboundedSender<HandlerRegistration>,
+        handler_id: HandlerId,
+        handler_ref: NonZeroU32,
+    ) -> Self {
+        Self {
+            tx,
+            handler_id,
+            handler_ref,
+            has_registered: false,
+            has_sent_verdict: false,
+        }
+    }
+
+    fn send(&self, outcome: RegistrationOutcome) {
+        // A closed receiver means the meeting actor is gone: nothing to tell.
+        let _ = self.tx.send(HandlerRegistration {
+            handler_id: self.handler_id.clone(),
+            handler_ref: self.handler_ref,
+            outcome,
+        });
+    }
+
+    /// A push was confirmed. Reports `Registered` on the FIRST confirm only
+    /// (including a first confirm after an initial failure).
+    fn confirmed(&mut self) {
+        if !self.has_registered {
+            self.has_registered = true;
+            self.has_sent_verdict = true;
+            self.send(RegistrationOutcome::Registered);
+        }
+    }
+
+    /// A snapshot settled without an ack. Reports the initial failure once,
+    /// and only if no verdict was sent yet.
+    fn failed(&mut self) {
+        if !self.has_sent_verdict {
+            self.has_sent_verdict = true;
+            self.send(RegistrationOutcome::InitialRegistrationFailed);
+        }
+    }
+}
+
+impl Drop for RegistrationReporter {
+    /// A worker that ends with no verdict (panic, abort, cancel) still
+    /// releases whoever waits on it.
+    fn drop(&mut self) {
+        self.failed();
+    }
 }
 
 /// Handle to one (meeting, handler) push worker.
@@ -235,7 +343,7 @@ impl FloorAdoption {
 }
 
 async fn run(
-    target: PushTarget,
+    mut target: PushTarget,
     mut jobs: watch::Receiver<Option<PushJob>>,
     cancel: CancellationToken,
 ) {
@@ -276,8 +384,11 @@ async fn run(
         )
         .await
         {
-            Settled::Confirmed(generation) => confirmed = Some(generation),
-            Settled::Failed => {}
+            Settled::Confirmed(generation) => {
+                confirmed = Some(generation);
+                target.registration.confirmed();
+            }
+            Settled::Failed => target.registration.failed(),
             Settled::Superseded => pending = true,
             Settled::Cancelled => return,
         }
@@ -584,7 +695,15 @@ mod tests {
     }
 
     fn target(mh: Arc<ScriptedMh>, generations: Arc<PolicyGenerations>) -> PushTarget {
-        PushTarget {
+        reporting_target(mh, generations).0
+    }
+
+    fn reporting_target(
+        mh: Arc<ScriptedMh>,
+        generations: Arc<PolicyGenerations>,
+    ) -> (PushTarget, mpsc::UnboundedReceiver<HandlerRegistration>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let target = PushTarget {
             mh_client: mh,
             policy_generations: generations,
             meeting_id: "m".to_string(),
@@ -595,7 +714,104 @@ mod tests {
                 webtransport_url: "https://mh-0:4434".to_string(),
                 grpc_endpoint: "http://mh-0:50053".to_string(),
             },
+            registration: RegistrationReporter::new(tx, HandlerId::new("mh-0"), REF),
+        };
+        (target, rx)
+    }
+
+    const REF: NonZeroU32 = NonZeroU32::MIN;
+
+    fn reports(rx: &mut mpsc::UnboundedReceiver<HandlerRegistration>) -> Vec<RegistrationOutcome> {
+        let mut out = Vec::new();
+        while let Ok(report) = rx.try_recv() {
+            assert_eq!(report.handler_id, HandlerId::new("mh-0"));
+            assert_eq!(report.handler_ref, REF);
+            out.push(report.outcome);
         }
+        out
+    }
+
+    /// Registered on the first confirm only; nothing on later confirms, and
+    /// nothing when a registered worker is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_confirm_reports_registered_once() {
+        let mh = ScriptedMh::new(vec![]);
+        let (target, mut rx) = reporting_target(Arc::clone(&mh), Arc::default());
+        let pusher = HandlerPusher::spawn(target, CancellationToken::new());
+        assert!(reports(&mut rx).is_empty(), "no verdict before a push");
+        pusher.publish(job(1));
+        settle().await;
+        pusher.publish(job(2));
+        settle().await;
+        assert_eq!(reports(&mut rx), vec![RegistrationOutcome::Registered]);
+        drop(pusher);
+        settle().await;
+        assert!(
+            reports(&mut rx).is_empty(),
+            "a registered worker's drop sends nothing"
+        );
+    }
+
+    /// Retries exhausted and a terminal refusal both report the initial
+    /// failure exactly once; a later confirm still reports Registered (the
+    /// two-report bound).
+    #[tokio::test(start_paused = true)]
+    async fn an_initial_failure_is_reported_once_and_a_later_confirm_still_registers() {
+        let down = || Err(McError::Grpc("down".into()));
+        let mh = ScriptedMh::new(vec![down(), down(), down(), down(), down(), down(), Ok(())]);
+        let (target, mut rx) = reporting_target(Arc::clone(&mh), Arc::default());
+        let pusher = HandlerPusher::spawn(target, CancellationToken::new());
+        pusher.publish(job(1));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            reports(&mut rx),
+            vec![RegistrationOutcome::InitialRegistrationFailed],
+            "retries exhausted"
+        );
+        pusher.publish(job(1));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(
+            reports(&mut rx).is_empty(),
+            "a second failure reports nothing"
+        );
+        pusher.publish(job(1));
+        settle().await;
+        assert_eq!(reports(&mut rx), vec![RegistrationOutcome::Registered]);
+
+        let terminal = ScriptedMh::new(vec![Err(McError::MediaPolicyDivergence {
+            outcome: PolicyPushOutcome::TransportModeMismatch,
+            applied_generation: 1,
+        })]);
+        let (target, mut rx) = reporting_target(Arc::clone(&terminal), Arc::default());
+        let pusher = HandlerPusher::spawn(target, CancellationToken::new());
+        pusher.publish(job(1));
+        settle().await;
+        assert_eq!(
+            reports(&mut rx),
+            vec![RegistrationOutcome::InitialRegistrationFailed],
+            "terminal"
+        );
+    }
+
+    /// A worker cancelled (or dropped) before any verdict reports the initial
+    /// failure exactly once, so a parked join is never stranded.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_ending_without_a_verdict_reports_failure_once() {
+        let mh = ScriptedMh::new(vec![]);
+        let (target, mut rx) = reporting_target(Arc::clone(&mh), Arc::default());
+        let cancel = CancellationToken::new();
+        let pusher = HandlerPusher::spawn(target, cancel.clone());
+        settle().await;
+        assert!(reports(&mut rx).is_empty());
+        cancel.cancel();
+        settle().await;
+        assert_eq!(
+            reports(&mut rx),
+            vec![RegistrationOutcome::InitialRegistrationFailed]
+        );
+        drop(pusher);
+        settle().await;
+        assert!(reports(&mut rx).is_empty(), "exactly once");
     }
 
     fn job(generation: u64) -> PushJob {

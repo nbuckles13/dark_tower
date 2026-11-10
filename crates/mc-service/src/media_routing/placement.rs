@@ -1,24 +1,67 @@
-//! The meeting's handler set, and which of its handlers a participant is
-//! observed to be connected to (ADR-0036 §9; story 2 R-33).
+//! The meeting's handler set — MC-owned, versioned, ref-addressed — and which
+//! of its handlers a participant is observed to be connected to (ADR-0036 §9;
+//! ADR-0039 §3/§4, superseding §9's frozen set; story 2 R-33, story 4 R-12/R-17).
 //!
-//! # One home for every client-facing handler url
+//! # MC is the authority; GC's hand-off is read once
 //!
-//! A meeting's handler SET is programmed once by GC (`assign_meeting`, frozen at
-//! first join). Every participant is offered the WHOLE set and connects to all
-//! of it it can. Every client-facing handler address — `JoinResponse.media_servers`
-//! (the full set), each `StreamAssignment.media_handler_url` (the handler owning
-//! that edge) and each `SendTarget.media_handler_url` (a handler owning one of
-//! the sender's edges) — is read out of the same [`MeetingHandlers`] value via
-//! [`MeetingHandlers::url_of`], so they are byte-identical strings by
-//! construction. The client looks transports up by exact url, so a mismatch
-//! among them is a silent no-send or no-receive.
+//! A meeting's [`MeetingHandlers`] is built ONCE, when the meeting actor is
+//! created, from GC's assignment (`AssignMeetingWithMh`, the same value MC
+//! stores as Redis `MhAssignmentData`) via [`MeetingHandlers::from_handoff`].
+//! Nothing re-reads it: no join, and no later change to the Redis record, can
+//! alter a live meeting's set. From then on the set changes only through its
+//! own mutators — [`MeetingHandlers::add`], [`MeetingHandlers::mark_active`],
+//! [`MeetingHandlers::remove`] — whose triggers (detection, replacement,
+//! planned transfer) are story-4 tasks MC-B2/MC-C/MC-F. The set MAY be empty
+//! (a meeting awaiting a handler).
+//!
+//! # Per handler: a ref and a state
+//!
+//! - **`handler_ref`**: MC-assigned, non-zero, allocated per INCARNATION from
+//!   one per-meeting counter that only moves forward and refuses (never wraps)
+//!   on exhaustion. It is never derived from the handler id, the url or a hash,
+//!   and never reused within the meeting — a new handler at a previously used
+//!   address gets a new ref.
+//! - **state**: `Registering` (in MC's set: heartbeats are OWNED and the
+//!   binding gate admits it) until its push worker's first `RegisterMeeting`
+//!   is acked, then `Active`. **Register before token** (L4-2): only Active
+//!   handlers are ever client-visible.
+//! - **removed record**: ids removed for the meeting's life. One-way: a removed
+//!   id is never re-added.
+//!
+//! # `handler_set_version` and when a set is emitted
+//!
+//! The version is the epoch of MC's INTERNAL set. It advances by exactly one on
+//! every successful `add`, `mark_active` and `remove`, and on nothing else —
+//! never on a token refresh, a join, a push, a slot or mute change. It starts at
+//! 0, is never reset, and is `u64` (an overflow refuses, never wraps). Clients
+//! see gaps; it correlates loss reports and is never an ordering key.
+//!
+//! **Emission rule** (for every caller, MC-B2/MC-C included): a client-facing
+//! `MediaHandlerSet` is emitted iff the ACTIVE projection changed —
+//! [`SetChange::active_changed`]. Removing a still-Registering handler bumps
+//! the version but emits nothing, so no emitted set ever repeats the previous
+//! Active list under a new version.
+//!
+//! # Two views, and one home for every client-facing handler fact
+//!
+//! - The INTERNAL view (Registering + Active): [`MeetingHandlers::resolve`],
+//!   [`MeetingHandlers::iter`] — push workers, teardown, MH notifications.
+//! - The CLIENT view (Active only): [`MeetingHandlers::client_handler`] and
+//!   [`MeetingHandlers::client_snapshot`]. Every client-facing url and ref —
+//!   `MediaHandlerSet`, the legacy `JoinResponse.media_servers` (the same
+//!   projection, so an old SDK never sees a Registering handler either), each
+//!   `SendTarget` and each `StreamAssignment` — comes from that one lookup, so
+//!   a url and its ref can never disagree, and nothing names a handler before
+//!   its registration was acked.
+//!
+//! Edges never land on a non-Active handler: observed connectivity is routable
+//! only over Active members (`connectivity.rs` `routable`).
 //!
 //! # Sorted by construction, not by a parameter name
 //!
-//! [`MeetingHandlers`] sorts once, at construction, and has no constructor that
-//! accepts an unsorted list, so the order in which Redis enumerates
-//! `MhAssignmentData.handlers` can never change anything MC computes. Nothing
-//! here or downstream may depend on WHICH handler is first: the edge chooser
+//! Members are kept sorted by id, so the order in which GC/Redis enumerates
+//! the assignment can never change anything MC computes. Nothing here or
+//! downstream may depend on WHICH handler is first: the edge chooser
 //! (`edges.rs`) is correct for any choice.
 //!
 //! # Connectivity is observed, and structurally cannot carry a wire string
@@ -29,21 +72,19 @@
 //! that set, and its only insert takes a `&HandlerEndpoint` — which can only be
 //! obtained from [`MeetingHandlers`] (via [`MeetingHandlers::resolve`], an
 //! exact byte comparison with no normalisation). An MH-asserted `handler_id`
-//! outside the meeting's frozen set therefore cannot become routing state: it
-//! is unconstructible here, not merely checked for.
+//! outside the meeting's set therefore cannot become routing state: it is
+//! unconstructible here, not merely checked for.
 //!
 //! **Residual (security S1b)**: every MH pod shares one service identity, so
 //! handler identity is self-asserted among authenticated handlers. Exact-match
-//! membership against the frozen set bounds the blast radius to misrouting
-//! INSIDE the meeting's own registered handlers; it is never a cross-meeting
-//! lever. Closing it needs per-instance service identity (`docs/TODO.md`
-//! §Media Path Obligations).
+//! membership bounds the blast radius to misrouting INSIDE the meeting's own
+//! handlers; it is never a cross-meeting lever. Closing it needs per-instance
+//! service identity (`docs/TODO.md` §Media Path Obligations).
 //!
 //! # Server-derived only
 //!
-//! Every url here comes from the meeting's registration (`MhAssignmentData`,
-//! read from Redis, written from GC's assignment) — never from a pod ordinal
-//! and never from a client. MC holds a similar-looking client-supplied url map,
+//! Every url here comes from GC's assignment — never from a pod ordinal and
+//! never from a client. MC holds a similar-looking client-supplied url map,
 //! `ParticipantActor::mh_statuses`, keyed by the truncated `mh_url` a client
 //! reports in `MediaConnectionUpdate`. **That map must never be a source for
 //! this one, nor for [`ConnectedHandlers`]**: a client-controlled url reaching
@@ -54,61 +95,158 @@
 
 use super::assignment::HandlerId;
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 
-/// One assigned media handler, as the meeting's registration describes it.
+/// One assigned media handler, as GC's assignment describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandlerEndpoint {
     /// The handler's identity (`MhEndpointInfo::mh_id`).
     pub id: HandlerId,
-    /// The client-facing WebTransport url, exactly as the registration
+    /// The client-facing WebTransport url, exactly as the assignment
     /// advertises it.
     pub webtransport_url: String,
     /// The gRPC endpoint MC programs the handler through.
     pub grpc_endpoint: String,
 }
 
-/// The registration could not be turned into a usable handler set.
+/// A handler-set mutation was refused. Every refusal leaves the set (and its
+/// version) unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandlerSetError {
-    /// No handler is assigned. There is nothing to place anyone on, and
-    /// silently accepting that would make an unroutable meeting look healthy.
+    /// GC's hand-off names no handler. Only [`MeetingHandlers::from_handoff`]
+    /// returns this: an assignment with nothing to place anyone on stays a
+    /// loud contract violation. A LIVE set may be empty.
     Empty,
-    /// Two entries name the same handler. Placement and edge ownership are
-    /// keyed by id, so a duplicate has no single meaning.
+    /// The id is already a member. Placement and edge ownership are keyed by
+    /// id, so a duplicate has no single meaning.
     DuplicateHandlerId,
+    /// Another member already advertises this client url. The client looks
+    /// transports up by url, so two members sharing one is ambiguous.
+    DuplicateUrl,
+    /// The id was removed from this meeting; removal is one-way.
+    PreviouslyRemoved,
+    /// The meeting's `handler_ref` space is exhausted. Refused, never wrapped:
+    /// a reused ref would let a client confuse two incarnations.
+    RefSpaceExhausted,
+    /// `handler_set_version` would overflow. Refused, never wrapped.
+    VersionExhausted,
 }
 
 impl std::fmt::Display for HandlerSetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => f.write_str("no media handler is assigned to the meeting"),
-            Self::DuplicateHandlerId => {
-                f.write_str("the meeting's handler assignment names one handler twice")
-            }
-        }
+        f.write_str(match self {
+            Self::Empty => "no media handler is assigned to the meeting",
+            Self::DuplicateHandlerId => "the handler is already in the meeting's set",
+            Self::DuplicateUrl => "another handler in the meeting's set has the same url",
+            Self::PreviouslyRemoved => "the handler was removed from this meeting",
+            Self::RefSpaceExhausted => "the meeting's handler_ref space is exhausted",
+            Self::VersionExhausted => "the meeting's handler_set_version is exhausted",
+        })
     }
 }
 
 impl std::error::Error for HandlerSetError {}
 
-/// A meeting's assigned handler set: non-empty, duplicate-free, sorted by id.
-///
-/// Holding one of these is proof of all three. The meeting actor freezes it at
-/// the first join, together with its urls, as ONE value, so a participant's
-/// placed handler id and the url it is handed can never come from two different
-/// versions of the registration.
+/// A handler's registration state within the meeting (ADR-0039 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandlerState {
+    /// In MC's set; its `RegisterMeeting` is not yet acked. Never client-visible.
+    Registering,
+    /// Its push worker's first `RegisterMeeting` was acked.
+    Active,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Member {
+    endpoint: HandlerEndpoint,
+    handler_ref: NonZeroU32,
+    state: HandlerState,
+}
+
+impl Member {
+    fn is_active(&self) -> bool {
+        self.state == HandlerState::Active
+    }
+}
+
+/// The outcome of a successful mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetChange {
+    /// The version after the change.
+    pub version: u64,
+    /// Did the Active (client-visible) projection change? The emission rule:
+    /// a `MediaHandlerSet` goes out iff this is true.
+    pub active_changed: bool,
+}
+
+/// One client-visible (Active) handler, as a directive or assignment names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientHandler<'a> {
+    /// The client-facing url, verbatim from the assignment.
+    pub url: &'a str,
+    /// The handler's per-incarnation ref.
+    pub handler_ref: NonZeroU32,
+}
+
+/// One entry of a client-facing snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientHandlerEntry {
+    /// The client-facing url.
+    pub media_handler_url: String,
+    /// The handler's per-incarnation ref.
+    pub handler_ref: NonZeroU32,
+}
+
+/// The client-facing snapshot: Active handlers only, in id order, and the
+/// version it was taken at. The ONE source of `MediaHandlerSet` and of the
+/// legacy `JoinResponse.media_servers`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClientHandlerSet {
+    /// `handler_set_version` at the time of the snapshot.
+    pub version: u64,
+    /// The Active handlers.
+    pub handlers: Vec<ClientHandlerEntry>,
+}
+
+/// A meeting's MC-owned handler set (see the module doc).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeetingHandlers {
-    sorted: Vec<HandlerEndpoint>,
+    /// Sorted by id; ids and client urls unique.
+    members: Vec<Member>,
+    /// Ids removed for the meeting's life (one-way).
+    removed: BTreeSet<HandlerId>,
+    version: u64,
+    /// The next `handler_ref` to allocate; `None` once exhausted.
+    next_ref: Option<NonZeroU32>,
+}
+
+impl Default for MeetingHandlers {
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 impl MeetingHandlers {
-    /// Validate and sort a registration's handler entries.
+    /// An empty set at version 0.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            members: Vec::new(),
+            removed: BTreeSet::new(),
+            version: 0,
+            next_ref: Some(NonZeroU32::MIN),
+        }
+    }
+
+    /// Build a meeting's initial set from GC's hand-off: every handler enters
+    /// as Registering, in id order (so the enumeration order of the hand-off
+    /// never matters).
     ///
     /// # Errors
     ///
-    /// [`HandlerSetError`] if the set is empty or names one handler twice.
-    pub fn new(
+    /// [`HandlerSetError::Empty`] if the hand-off names no handler, or the
+    /// first refusal [`Self::add`] returns.
+    pub fn from_handoff(
         endpoints: impl IntoIterator<Item = HandlerEndpoint>,
     ) -> Result<Self, HandlerSetError> {
         let mut sorted: Vec<HandlerEndpoint> = endpoints.into_iter().collect();
@@ -116,58 +254,287 @@ impl MeetingHandlers {
             return Err(HandlerSetError::Empty);
         }
         sorted.sort_by(|a, b| a.id.cmp(&b.id));
-        if sorted.windows(2).any(|w| match w {
-            [a, b] => a.id == b.id,
-            _ => false,
-        }) {
+        let mut set = Self::empty();
+        for endpoint in sorted {
+            set.add(endpoint)?;
+        }
+        Ok(set)
+    }
+
+    /// Test fixture: a set whose every member is already Active.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_handoff`].
+    #[cfg(test)]
+    pub(crate) fn active_for_test(
+        endpoints: impl IntoIterator<Item = HandlerEndpoint>,
+    ) -> Result<Self, HandlerSetError> {
+        let mut set = Self::from_handoff(endpoints)?;
+        let refs: Vec<(HandlerId, NonZeroU32)> = set
+            .members
+            .iter()
+            .map(|m| (m.endpoint.id.clone(), m.handler_ref))
+            .collect();
+        for (id, handler_ref) in refs {
+            set.mark_active(&id, handler_ref)?;
+        }
+        Ok(set)
+    }
+
+    /// The ONE place the version advances. Refuses rather than wraps.
+    fn next_version(&self) -> Result<u64, HandlerSetError> {
+        self.version
+            .checked_add(1)
+            .ok_or(HandlerSetError::VersionExhausted)
+    }
+
+    /// Add a handler as Registering, allocating its `handler_ref`.
+    ///
+    /// # Errors
+    ///
+    /// A duplicate id, a previously removed id, a duplicate client url, an
+    /// exhausted ref space or version. Nothing changes on error.
+    pub fn add(
+        &mut self,
+        endpoint: HandlerEndpoint,
+    ) -> Result<(NonZeroU32, SetChange), HandlerSetError> {
+        if self.removed.contains(&endpoint.id) {
+            return Err(HandlerSetError::PreviouslyRemoved);
+        }
+        if self.members.iter().any(|m| m.endpoint.id == endpoint.id) {
             return Err(HandlerSetError::DuplicateHandlerId);
         }
-        Ok(Self { sorted })
+        if self
+            .members
+            .iter()
+            .any(|m| m.endpoint.webtransport_url == endpoint.webtransport_url)
+        {
+            return Err(HandlerSetError::DuplicateUrl);
+        }
+        let handler_ref = self.next_ref.ok_or(HandlerSetError::RefSpaceExhausted)?;
+        let version = self.next_version()?;
+        // Commit only after every fallible step.
+        self.next_ref = handler_ref.checked_add(1);
+        self.version = version;
+        let at = self
+            .members
+            .partition_point(|m| m.endpoint.id < endpoint.id);
+        self.members.insert(
+            at,
+            Member {
+                endpoint,
+                handler_ref,
+                state: HandlerState::Registering,
+            },
+        );
+        Ok((
+            handler_ref,
+            SetChange {
+                version,
+                active_changed: false,
+            },
+        ))
     }
 
-    /// Every handler, in id order.
+    /// Mark a Registering handler Active (its first `RegisterMeeting` was
+    /// acked). Keyed by id AND ref, so a late ack for a removed or replaced
+    /// incarnation is a no-op. `Ok(None)` (no change, no bump) for an unknown
+    /// id, a stale ref, or an already-Active handler.
+    ///
+    /// # Errors
+    ///
+    /// [`HandlerSetError::VersionExhausted`]; nothing changes.
+    pub fn mark_active(
+        &mut self,
+        id: &HandlerId,
+        handler_ref: NonZeroU32,
+    ) -> Result<Option<SetChange>, HandlerSetError> {
+        let Some(at) = self
+            .members
+            .iter()
+            .position(|m| &m.endpoint.id == id && m.handler_ref == handler_ref && !m.is_active())
+        else {
+            return Ok(None);
+        };
+        // Commit only after every fallible step: a no-op never reports
+        // exhaustion.
+        let next = self.next_version()?;
+        if let Some(member) = self.members.get_mut(at) {
+            member.state = HandlerState::Active;
+        }
+        self.version = next;
+        Ok(Some(SetChange {
+            version: next,
+            active_changed: true,
+        }))
+    }
+
+    /// Remove a handler for the rest of the meeting (one-way). `Ok(None)` (no
+    /// bump) if it is not a member. `active_changed` is whether it was Active.
+    ///
+    /// # Errors
+    ///
+    /// [`HandlerSetError::VersionExhausted`]; nothing changes.
+    pub fn remove(&mut self, id: &HandlerId) -> Result<Option<SetChange>, HandlerSetError> {
+        let Some(at) = self.members.iter().position(|m| &m.endpoint.id == id) else {
+            return Ok(None);
+        };
+        let next = self.next_version()?;
+        let member = self.members.remove(at);
+        let was_active = member.is_active();
+        self.removed.insert(member.endpoint.id);
+        self.version = next;
+        Ok(Some(SetChange {
+            version: next,
+            active_changed: was_active,
+        }))
+    }
+
+    /// The current `handler_set_version`.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Every member (Registering and Active), in id order.
     pub fn iter(&self) -> impl Iterator<Item = &HandlerEndpoint> {
-        self.sorted.iter()
+        self.members.iter().map(|m| &m.endpoint)
     }
 
-    /// Every handler id, in id order.
+    /// Every member (any state) with its ref, in id order — for callers that
+    /// need both, so no second lookup can miss.
+    pub fn iter_with_ref(&self) -> impl Iterator<Item = (&HandlerEndpoint, NonZeroU32)> {
+        self.members.iter().map(|m| (&m.endpoint, m.handler_ref))
+    }
+
+    /// Every member id, in id order.
     pub fn ids(&self) -> impl Iterator<Item = &HandlerId> {
-        self.sorted.iter().map(|h| &h.id)
+        self.members.iter().map(|m| &m.endpoint.id)
     }
 
-    /// Look a handler up by id.
+    /// Every member still Registering, with its ref, in id order.
+    pub fn registering(&self) -> impl Iterator<Item = (&HandlerId, NonZeroU32)> {
+        self.members
+            .iter()
+            .filter(|m| !m.is_active())
+            .map(|m| (&m.endpoint.id, m.handler_ref))
+    }
+
+    /// The one member lookup every accessor below is built on.
+    fn member(&self, id: &HandlerId) -> Option<&Member> {
+        self.members.iter().find(|m| &m.endpoint.id == id)
+    }
+
+    /// Look a member up by id (any state).
     #[must_use]
     pub fn get(&self, id: &HandlerId) -> Option<&HandlerEndpoint> {
-        self.sorted.iter().find(|h| &h.id == id)
+        self.member(id).map(|m| &m.endpoint)
     }
 
-    /// The client-facing url of a handler in this set.
+    /// The `handler_ref` of a member (any state).
     #[must_use]
-    pub fn url_of(&self, id: &HandlerId) -> Option<&str> {
-        self.get(id).map(|h| h.webtransport_url.as_str())
+    pub fn handler_ref_of(&self, id: &HandlerId) -> Option<NonZeroU32> {
+        self.member(id).map(|m| m.handler_ref)
     }
 
-    /// Resolve an MH-asserted handler id against this set by EXACT byte
-    /// comparison. No trimming, no case folding, no prefix match: an id that is
-    /// not byte-identical to a registered handler is not in the set.
+    /// Look an ACTIVE member up by id — the routable subset.
+    #[must_use]
+    pub fn active_endpoint(&self, id: &HandlerId) -> Option<&HandlerEndpoint> {
+        self.member(id)
+            .filter(|m| m.is_active())
+            .map(|m| &m.endpoint)
+    }
+
+    /// The client-visible url and ref of an ACTIVE member — the ONE lookup
+    /// every `SendTarget` and `StreamAssignment` uses. `None` for a
+    /// Registering, removed or unknown handler.
+    #[must_use]
+    pub fn client_handler(&self, id: &HandlerId) -> Option<ClientHandler<'_>> {
+        self.member(id)
+            .filter(|m| m.is_active())
+            .map(|m| ClientHandler {
+                url: m.endpoint.webtransport_url.as_str(),
+                handler_ref: m.handler_ref,
+            })
+    }
+
+    /// The client-facing snapshot: Active members only, with the version.
+    #[must_use]
+    pub fn client_snapshot(&self) -> ClientHandlerSet {
+        ClientHandlerSet {
+            version: self.version,
+            handlers: self
+                .members
+                .iter()
+                .filter(|m| m.is_active())
+                .map(|m| ClientHandlerEntry {
+                    media_handler_url: m.endpoint.webtransport_url.clone(),
+                    handler_ref: m.handler_ref,
+                })
+                .collect(),
+        }
+    }
+
+    /// Resolve an MH-asserted handler id against this set (any state) by
+    /// EXACT byte comparison. No trimming, no case folding, no prefix match.
     #[must_use]
     pub fn resolve(&self, wire_handler_id: &str) -> Option<&HandlerEndpoint> {
-        self.sorted
+        self.members
             .iter()
-            .find(|h| h.id.as_str() == wire_handler_id)
+            .find(|m| m.endpoint.id.as_str() == wire_handler_id)
+            .map(|m| &m.endpoint)
     }
 
-    /// How many handlers the meeting is registered on.
+    /// How many members (any state).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.sorted.len()
+        self.members.len()
     }
 
-    /// Never true: [`Self::new`] rejects an empty set. Present for the
-    /// `len`/`is_empty` pairing.
+    /// How many Active members.
+    #[must_use]
+    pub fn active_len(&self) -> usize {
+        self.members.iter().filter(|m| m.is_active()).count()
+    }
+
+    /// Does the set have no member? True for a meeting awaiting a handler.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.sorted.is_empty()
+        self.members.is_empty()
+    }
+
+    /// Test fixture: an endpoint named `id`, the suite's one url convention
+    /// (`https://{id}.example:4434`, gRPC `http://{id}.example:50053`).
+    #[cfg(test)]
+    pub(crate) fn test_endpoint(id: &str) -> HandlerEndpoint {
+        HandlerEndpoint {
+            id: HandlerId::new(id),
+            webtransport_url: format!("https://{id}.example:4434"),
+            grpc_endpoint: format!("http://{id}.example:50053"),
+        }
+    }
+
+    /// Test fixture: a set of `ids` (via [`Self::test_endpoint`]), every
+    /// member already Active.
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    pub(crate) fn active_test_ids(ids: &[&str]) -> Self {
+        Self::active_for_test(ids.iter().map(|id| Self::test_endpoint(id))).unwrap()
+    }
+
+    /// Test fixture: start the ref counter at `next` (exhaustion tests).
+    #[cfg(test)]
+    fn with_next_ref(mut self, next: Option<NonZeroU32>) -> Self {
+        self.next_ref = next;
+        self
+    }
+
+    /// Test fixture: start the version at `version` (exhaustion tests).
+    #[cfg(test)]
+    fn with_version(mut self, version: u64) -> Self {
+        self.version = version;
+        self
     }
 }
 
@@ -233,43 +600,214 @@ mod tests {
     use super::*;
 
     fn endpoint(id: &str) -> HandlerEndpoint {
+        MeetingHandlers::test_endpoint(id)
+    }
+
+    fn endpoint_at(id: &str, url: &str) -> HandlerEndpoint {
         HandlerEndpoint {
             id: HandlerId::new(id),
-            webtransport_url: format!("https://{id}.example:4434"),
+            webtransport_url: url.to_string(),
             grpc_endpoint: format!("http://{id}.example:50053"),
         }
     }
 
+    fn hid(id: &str) -> HandlerId {
+        HandlerId::new(id)
+    }
+
     #[test]
-    fn an_empty_set_is_rejected() {
+    fn an_empty_handoff_is_rejected_but_an_empty_live_set_is_legal() {
         assert_eq!(
-            MeetingHandlers::new(Vec::new()),
+            MeetingHandlers::from_handoff(Vec::new()),
             Err(HandlerSetError::Empty)
         );
+        let empty = MeetingHandlers::empty();
+        assert!(empty.is_empty());
+        assert_eq!(empty.version(), 0);
+        assert!(empty.client_snapshot().handlers.is_empty());
     }
 
     #[test]
-    fn a_duplicate_handler_id_is_rejected() {
+    fn a_duplicate_handler_id_or_url_is_rejected_without_a_bump() {
         assert_eq!(
-            MeetingHandlers::new(vec![endpoint("mh-0"), endpoint("mh-0")]),
+            MeetingHandlers::from_handoff(vec![endpoint("mh-0"), endpoint("mh-0")]),
             Err(HandlerSetError::DuplicateHandlerId)
+        );
+        let mut set = MeetingHandlers::from_handoff(vec![endpoint("mh-0")]).unwrap();
+        let before = set.clone();
+        assert_eq!(
+            set.add(endpoint("mh-0")),
+            Err(HandlerSetError::DuplicateHandlerId)
+        );
+        assert_eq!(
+            set.add(endpoint_at("mh-1", "https://mh-0.example:4434")),
+            Err(HandlerSetError::DuplicateUrl)
+        );
+        assert_eq!(set, before, "a refusal changes nothing, version included");
+        // Positive arm: a distinct id and url is accepted and bumps by one.
+        let (_, change) = set.add(endpoint("mh-1")).unwrap();
+        assert_eq!(change.version, before.version() + 1);
+        assert!(
+            !change.active_changed,
+            "a Registering add is not client-visible"
         );
     }
 
-    /// The Redis enumeration order is the one input whose order genuinely
+    /// The hand-off enumeration order is the one input whose order genuinely
     /// varies; sorting at construction is what makes it irrelevant.
     #[test]
-    fn registration_order_does_not_change_the_set() {
-        let forward = MeetingHandlers::new(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
-        let reversed = MeetingHandlers::new(vec![endpoint("mh-1"), endpoint("mh-0")]).unwrap();
+    fn handoff_order_does_not_change_the_set() {
+        let forward =
+            MeetingHandlers::from_handoff(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
+        let reversed =
+            MeetingHandlers::from_handoff(vec![endpoint("mh-1"), endpoint("mh-0")]).unwrap();
         assert_eq!(forward, reversed);
+    }
+
+    #[test]
+    fn refs_are_non_zero_distinct_and_never_reused_even_at_a_reused_address() {
+        let mut set =
+            MeetingHandlers::from_handoff(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
+        let r0 = set.handler_ref_of(&hid("mh-0")).unwrap();
+        let r1 = set.handler_ref_of(&hid("mh-1")).unwrap();
+        assert_ne!(r0, r1);
+        // Remove mh-0, then a NEW incarnation at the SAME address.
+        set.remove(&hid("mh-0")).unwrap().unwrap();
+        let (r2, _) = set
+            .add(endpoint_at("mh-0b", "https://mh-0.example:4434"))
+            .unwrap();
+        assert!(
+            r2 > r0 && r2 > r1,
+            "a new incarnation gets a new, larger ref"
+        );
+    }
+
+    #[test]
+    fn removal_is_one_way_and_a_removed_id_is_never_re_added() {
+        let mut set = MeetingHandlers::from_handoff(vec![endpoint("mh-0")]).unwrap();
+        let removed = set.remove(&hid("mh-0")).unwrap().unwrap();
+        let before = set.clone();
+        assert_eq!(
+            set.add(endpoint("mh-0")),
+            Err(HandlerSetError::PreviouslyRemoved)
+        );
+        assert_eq!(set, before, "refused re-add does not bump");
+        assert_eq!(set.version(), removed.version);
+        // Removing an unknown (or already removed) id is a no-op.
+        assert_eq!(set.remove(&hid("mh-0")).unwrap(), None);
+        assert_eq!(set.remove(&hid("mh-9")).unwrap(), None);
+        assert_eq!(set, before);
+    }
+
+    #[test]
+    fn mark_active_is_keyed_by_id_and_ref_and_bumps_once() {
+        let mut set =
+            MeetingHandlers::from_handoff(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
+        assert_eq!(set.version(), 2, "two adds");
+        let r0 = set.handler_ref_of(&hid("mh-0")).unwrap();
+        let r1 = set.handler_ref_of(&hid("mh-1")).unwrap();
+        // Stale ref (another incarnation's) and unknown id: no-op, no bump.
+        assert_eq!(set.mark_active(&hid("mh-0"), r1).unwrap(), None);
+        assert_eq!(set.mark_active(&hid("mh-9"), r0).unwrap(), None);
+        assert_eq!(set.version(), 2);
+        // Positive arm.
+        let change = set.mark_active(&hid("mh-0"), r0).unwrap().unwrap();
+        assert_eq!(change.version, 3);
+        assert!(change.active_changed);
+        // Already Active: no-op, no bump.
+        assert_eq!(set.mark_active(&hid("mh-0"), r0).unwrap(), None);
+        assert_eq!(set.version(), 3);
+        // A late ack for a removed incarnation is a no-op.
+        set.remove(&hid("mh-1")).unwrap().unwrap();
+        let v = set.version();
+        assert_eq!(set.mark_active(&hid("mh-1"), r1).unwrap(), None);
+        assert_eq!(set.version(), v);
+    }
+
+    #[test]
+    fn removing_a_registering_handler_bumps_but_is_not_client_visible() {
+        let mut set =
+            MeetingHandlers::from_handoff(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
+        let r0 = set.handler_ref_of(&hid("mh-0")).unwrap();
+        set.mark_active(&hid("mh-0"), r0).unwrap();
+        let registering = set.remove(&hid("mh-1")).unwrap().unwrap();
+        assert!(!registering.active_changed);
+        let active = set.remove(&hid("mh-0")).unwrap().unwrap();
+        assert!(active.active_changed);
+        assert_eq!(active.version, registering.version + 1);
+    }
+
+    #[test]
+    fn the_client_view_lists_active_members_only() {
+        let mut set =
+            MeetingHandlers::from_handoff(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
+        assert!(set.client_snapshot().handlers.is_empty());
+        assert!(set.client_handler(&hid("mh-0")).is_none());
+        assert!(set.active_endpoint(&hid("mh-0")).is_none());
+        // Internal view still resolves a Registering member.
+        assert!(set.resolve("mh-0").is_some());
+        let r1 = set.handler_ref_of(&hid("mh-1")).unwrap();
+        set.mark_active(&hid("mh-1"), r1).unwrap();
+        let snap = set.client_snapshot();
+        assert_eq!(snap.version, set.version());
+        assert_eq!(
+            snap.handlers,
+            vec![ClientHandlerEntry {
+                media_handler_url: "https://mh-1.example:4434".to_string(),
+                handler_ref: r1,
+            }]
+        );
+        assert_eq!(
+            set.client_handler(&hid("mh-1")),
+            Some(ClientHandler {
+                url: "https://mh-1.example:4434",
+                handler_ref: r1
+            })
+        );
+        assert!(set.client_handler(&hid("mh-0")).is_none());
+        assert!(set.client_handler(&hid("mh-9")).is_none());
+    }
+
+    #[test]
+    fn ref_and_version_exhaustion_refuse_and_never_wrap() {
+        let mut set = MeetingHandlers::empty().with_next_ref(NonZeroU32::new(u32::MAX));
+        let (last, _) = set.add(endpoint("mh-0")).unwrap();
+        assert_eq!(last.get(), u32::MAX);
+        let before = set.clone();
+        assert_eq!(
+            set.add(endpoint("mh-1")),
+            Err(HandlerSetError::RefSpaceExhausted)
+        );
+        assert_eq!(set, before);
+
+        let mut set = MeetingHandlers::from_handoff(vec![endpoint("mh-0")])
+            .unwrap()
+            .with_version(u64::MAX);
+        let before = set.clone();
+        let r0 = set.handler_ref_of(&hid("mh-0")).unwrap();
+        assert_eq!(
+            set.add(endpoint("mh-1")),
+            Err(HandlerSetError::VersionExhausted)
+        );
+        assert_eq!(
+            set.mark_active(&hid("mh-0"), r0),
+            Err(HandlerSetError::VersionExhausted)
+        );
+        assert_eq!(
+            set.remove(&hid("mh-0")),
+            Err(HandlerSetError::VersionExhausted)
+        );
+        assert_eq!(set, before);
+        // A NO-OP at exhaustion is still the documented Ok(None).
+        assert_eq!(set.remove(&hid("mh-9")), Ok(None));
+        assert_eq!(set.mark_active(&hid("mh-9"), r0), Ok(None));
     }
 
     /// S1a: resolution is exact byte equality. Near-misses an MH could assert
     /// — case, whitespace, a prefix, a suffix — resolve to nothing.
     #[test]
     fn resolve_is_exact_match_only() {
-        let set = MeetingHandlers::new(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
+        let set = MeetingHandlers::from_handoff(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
         assert_eq!(set.resolve("mh-1").map(|h| h.id.as_str()), Some("mh-1"));
         for near_miss in ["MH-1", " mh-1", "mh-1 ", "mh-", "mh-10", "", "mh-1\0"] {
             assert!(
@@ -281,7 +819,7 @@ mod tests {
 
     #[test]
     fn connected_handlers_only_admit_resolved_endpoints_and_intersect() {
-        let set = MeetingHandlers::new(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
+        let set = MeetingHandlers::from_handoff(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
         let mut a = ConnectedHandlers::new();
         let mut b = ConnectedHandlers::new();
         assert!(a.insert(set.resolve("mh-0").unwrap()));
@@ -291,15 +829,5 @@ mod tests {
         assert_eq!(a.shared_with(&b), vec![HandlerId::new("mh-1")]);
         assert!(b.remove(&HandlerId::new("mh-1")));
         assert!(a.shared_with(&b).is_empty());
-    }
-
-    #[test]
-    fn url_lookup_reads_the_registration_verbatim() {
-        let set = MeetingHandlers::new(vec![endpoint("mh-1")]).unwrap();
-        assert_eq!(
-            set.url_of(&HandlerId::new("mh-1")),
-            Some("https://mh-1.example:4434")
-        );
-        assert_eq!(set.url_of(&HandlerId::new("mh-9")), None);
     }
 }

@@ -30,6 +30,7 @@
 
 pub(crate) mod client_mute_fanout;
 pub mod controller;
+pub mod join_park;
 pub mod meeting;
 pub mod meeting_media;
 pub mod messages;

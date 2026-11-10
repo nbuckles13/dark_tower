@@ -53,30 +53,18 @@ pub struct MhEndpointInfo {
     pub grpc_endpoint: String,
 }
 
-/// MH assignment data stored in Redis.
+/// MH assignment data stored in Redis: GC's hand-off record.
+///
+/// Written by `AssignMeetingWithMh`, which builds the meeting actor's handler
+/// set from the SAME value at creation (ADR-0039 §3). MC never reads it back:
+/// the live meeting's set is the actor's own, so no change to this record can
+/// alter it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MhAssignmentData {
     /// Active MH handlers for this meeting.
     pub handlers: Vec<MhEndpointInfo>,
     /// Assignment timestamp (ISO 8601).
     pub assigned_at: String,
-}
-
-/// Trait for reading MH assignment data.
-///
-/// Abstraction over the Redis lookup used during the join flow to populate
-/// `media_servers` in `JoinResponse`. Production code uses `FencedRedisClient`;
-/// tests can inject an in-memory mock.
-pub trait MhAssignmentStore: Send + Sync {
-    /// Read MH assignment data for a meeting.
-    fn get_mh_assignment<'a>(
-        &'a self,
-        meeting_id: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Option<MhAssignmentData>, McError>> + Send + 'a,
-        >,
-    >;
 }
 
 /// Fenced Redis client for Meeting Controller.
@@ -331,45 +319,6 @@ impl FencedRedisClient {
         }
     }
 
-    /// Get MH assignment for a meeting.
-    #[instrument(skip_all, fields(meeting_id = %meeting_id))]
-    pub async fn get_mh_assignment(
-        &self,
-        meeting_id: &str,
-    ) -> Result<Option<MhAssignmentData>, McError> {
-        let mut conn = self.connection.clone();
-        let key = format!("meeting:{meeting_id}:mh");
-
-        let start = Instant::now();
-        let result: Option<String> = conn.get(&key).await.map_err(|e| {
-            record_redis_latency("get", start.elapsed());
-            warn!(
-                target: "mc.redis.client",
-                error = %e,
-                meeting_id = %meeting_id,
-                "Failed to get MH assignment"
-            );
-            McError::Redis(format!("Failed to get MH assignment: {e}"))
-        })?;
-        record_redis_latency("get", start.elapsed());
-
-        match result {
-            Some(json) => {
-                let data: MhAssignmentData = serde_json::from_str(&json).map_err(|e| {
-                    error!(
-                        target: "mc.redis.client",
-                        error = %e,
-                        meeting_id = %meeting_id,
-                        "Failed to deserialize MH assignment"
-                    );
-                    McError::Redis(format!("Failed to deserialize MH assignment: {e}"))
-                })?;
-                Ok(Some(data))
-            }
-            None => Ok(None),
-        }
-    }
-
     /// Delete MH assignment for a meeting.
     #[instrument(skip_all, fields(meeting_id = %meeting_id))]
     pub async fn delete_mh_assignment(&self, meeting_id: &str) -> Result<(), McError> {
@@ -574,19 +523,6 @@ impl FencedRedisClient {
         );
 
         Ok(())
-    }
-}
-
-impl MhAssignmentStore for FencedRedisClient {
-    fn get_mh_assignment<'a>(
-        &'a self,
-        meeting_id: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Option<MhAssignmentData>, McError>> + Send + 'a,
-        >,
-    > {
-        Box::pin(self.get_mh_assignment(meeting_id))
     }
 }
 

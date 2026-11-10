@@ -238,8 +238,8 @@ pub enum PushDisposition {
 /// **(b) Why.** `handler_id` is a **per-incarnation token**, not a handler
 /// identity: `mh-service`'s config derives it from `HOSTNAME` plus a fresh
 /// `Uuid::new_v4()` sampled at process start whenever `MH_HANDLER_ID` is unset,
-/// and it is unset in all three MH manifests. MC compares against the id frozen
-/// in its Redis assignment snapshot, which has no TTL, so **every ordinary MH
+/// and it is unset in all three MH manifests. MC compares against the id in the
+/// meeting's handler set (GC's hand-off, which has no TTL), so **every ordinary MH
 /// pod restart makes the mismatch expected by construction**. At the top of the
 /// chain that benign, expected outcome would suppress a real
 /// `generation_mismatch` underneath it for the whole post-restart window — a

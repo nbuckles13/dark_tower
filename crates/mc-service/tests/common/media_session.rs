@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mc_service::grpc::{McMediaCoordinationService, MhRegistrationClient};
-use mc_service::redis::MhAssignmentStore;
 use mc_test_utils::jwt_test::make_meeting_claims;
 use proto_gen::dark_tower::internal::v1::media_coordination_service_server::MediaCoordinationService;
 use proto_gen::dark_tower::internal::v1::{
@@ -62,7 +61,6 @@ pub async fn start_stack_with(
     let rig = AcceptLoopRig::start_with_media_config(
         Arc::clone(&stack.controller_handle),
         Arc::clone(&stack.jwt_validator),
-        Arc::clone(&stack.mh_store) as Arc<dyn MhAssignmentStore>,
         Arc::clone(&stack.mh_reg_client) as Arc<dyn MhRegistrationClient>,
         "mc-test".to_string(),
         "http://mc-test:50052".to_string(),
@@ -163,6 +161,8 @@ pub struct Session {
     pub sender_id: u32,
     /// `JoinResponse.media_servers`, as MC sent it.
     pub media_servers: Vec<String>,
+    /// `JoinResponse.media_handler_set`, as MC sent it (ADR-0039 §4).
+    pub media_handler_set: Option<proto_gen::dark_tower::signaling::v1::MediaHandlerSet>,
     /// `JoinResponse.receive_slot_caps`, as MC sent it.
     pub receive_slot_caps: Vec<proto_gen::dark_tower::signaling::v1::ReceiveSlotCap>,
     /// The `SendDirective` MC emitted in the join turn.
@@ -483,15 +483,12 @@ pub async fn notify_disconnected(
         .expect("notify disconnected");
 }
 
-/// Every handler id the meeting is registered on, as seeded.
+/// Every handler id the meeting was created with (GC's hand-off, as seeded).
 pub async fn registered_handlers(stack: &TestStackHandles, meeting_id: &str) -> Vec<String> {
     stack
-        .mh_store
-        .get_mh_assignment(meeting_id)
-        .await
-        .expect("store read")
+        .handoffs
+        .get(meeting_id)
         .expect("meeting seeded")
-        .handlers
         .into_iter()
         .map(|h| h.mh_id)
         .collect()
@@ -738,20 +735,27 @@ async fn try_join_full(
     let resp = tokio::time::timeout(Duration::from_secs(5), read_server_message(&mut recv))
         .await
         .expect("join response timeout");
-    let (participant_id, sender_id, media_servers, receive_slot_caps, existing_participants) =
-        match resp.message {
-            Some(server_message::Message::JoinResponse(r)) => (
-                r.participant_id.clone(),
-                r.sender_id.expect("MC allocates a sender id at join"),
-                r.media_servers
-                    .into_iter()
-                    .map(|m| m.media_handler_url)
-                    .collect::<Vec<String>>(),
-                r.receive_slot_caps,
-                r.existing_participants,
-            ),
-            other => return Err(format!("{other:?}")),
-        };
+    let (
+        participant_id,
+        sender_id,
+        media_servers,
+        media_handler_set,
+        receive_slot_caps,
+        existing_participants,
+    ) = match resp.message {
+        Some(server_message::Message::JoinResponse(r)) => (
+            r.participant_id.clone(),
+            r.sender_id.expect("MC allocates a sender id at join"),
+            r.media_servers
+                .into_iter()
+                .map(|m| m.media_handler_url)
+                .collect::<Vec<String>>(),
+            r.media_handler_set,
+            r.receive_slot_caps,
+            r.existing_participants,
+        ),
+        other => return Err(format!("{other:?}")),
+    };
 
     let mut session = Session {
         conn,
@@ -759,6 +763,7 @@ async fn try_join_full(
         recv,
         sender_id,
         media_servers,
+        media_handler_set,
         receive_slot_caps,
         join_directive: None,
         join_assignments: None,

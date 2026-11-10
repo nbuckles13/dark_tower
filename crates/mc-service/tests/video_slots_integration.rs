@@ -576,13 +576,7 @@ async fn a_reconnect_presenting_a_different_publish_set_is_refused_and_never_ado
         .get_meeting_handle("vs-reconnect".to_string())
         .await
         .unwrap();
-    let (joined, _rx_a) = actor_join(
-        &stack,
-        &meeting,
-        "a",
-        test_join_media(&stack, &[mh_handler(HANDLER)]),
-    )
-    .await;
+    let (joined, _rx_a) = actor_join(&stack, &meeting, "a", test_join_media(&stack)).await;
     meeting
         .connection_disconnected(
             "conn-a".to_string(),
@@ -635,13 +629,7 @@ async fn a_reconnect_presenting_a_different_publish_set_is_refused_and_never_ado
     // ... and a push FORCED after the refusal (B's join changes the snapshot)
     // declares A's audio only. No push after the refusal ever carries A's
     // stream 1.
-    let (b, _rx_b) = actor_join(
-        &stack,
-        &meeting,
-        "b",
-        test_join_media(&stack, &[mh_handler(HANDLER)]),
-    )
-    .await;
+    let (b, _rx_b) = actor_join(&stack, &meeting, "b", test_join_media(&stack)).await;
     // B's roster shows A's audio still LIVE: the refused declaration's client
     // mute was never adopted either.
     let a_on_roster = b
@@ -767,14 +755,8 @@ async fn a_reconnect_redeclaring_to_nothing_is_counted_and_keeps_the_previous_de
         .get_meeting_handle(M.to_string())
         .await
         .unwrap();
-    let (p, _rx_p) = actor_join(
-        &stack,
-        &meeting,
-        "p",
-        test_join_media(&stack, &[mh_handler(HANDLER)]),
-    )
-    .await;
-    let mut media = test_join_media(&stack, &[mh_handler(HANDLER)]);
+    let (p, _rx_p) = actor_join(&stack, &meeting, "p", test_join_media(&stack)).await;
+    let mut media = test_join_media(&stack);
     media.declared = ClientMediaStates::NOT_PUBLISHING;
     media.demand = ReceiveCapabilityDeclaration::parse(
         &ReceiveCapability {
@@ -835,13 +817,7 @@ async fn a_reconnect_redeclaring_to_nothing_is_counted_and_keeps_the_previous_de
     // A push FORCED after the refusal (a third participant joins) still has R
     // holding P: the previous declaration, and its occupant, were kept.
     let before = stack.mh_reg_client.calls().len();
-    let (_q, _rx_q) = actor_join(
-        &stack,
-        &meeting,
-        "q",
-        test_join_media(&stack, &[mh_handler(HANDLER)]),
-    )
-    .await;
+    let (_q, _rx_q) = actor_join(&stack, &meeting, "q", test_join_media(&stack)).await;
     let calls = pushes_beyond(&stack, before).await;
     assert!(
         r_holds_p(calls.last().unwrap()),

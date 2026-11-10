@@ -4,9 +4,11 @@ use crate::actors::messages::{LeaveReason, ParticipantInfo, ParticipantStateUpda
 use crate::media_kind::{served_kind, KindRefusal, MediaKindLabel, MediaStates, KNOWN_WIRE_KINDS};
 use crate::webtransport::trace::inject_current_context;
 
+use crate::media_routing::ClientHandlerSet;
 use proto_gen::dark_tower::signaling::v1::{
-    self, server_message, ClientMediaState, MediaKindState, Participant, ParticipantJoined,
-    ParticipantLeft, ParticipantMuteUpdate, ReceiveSlotCap, ServerMessage,
+    self, server_message, ClientMediaState, MediaHandlerSet, MediaKindState, MediaServerInfo,
+    Participant, ParticipantJoined, ParticipantLeft, ParticipantMuteUpdate, ReceiveSlotCap,
+    ServerMessage,
 };
 use tracing::debug;
 
@@ -53,6 +55,30 @@ pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_LEFT: &str = "participant_update_left"
 /// matching `_joined` / `_left`, so `participant_update.*` still recovers the
 /// merged series.
 pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED: &str = "participant_update_muted";
+
+/// THE one projection of the meeting's client-facing handler snapshot onto the
+/// wire (ADR-0039 §4), for every carrier: `JoinResponse.media_handler_set`,
+/// the legacy `JoinResponse.media_servers` (its `handlers`, double-populated
+/// until P3) and the membership-change `ServerMessage`. One projection of one
+/// snapshot, so the legacy field can never list a handler the new set does
+/// not, and nothing lists a handler that is not Active.
+///
+/// `media_dial_token` is empty until MC-D mints it.
+#[must_use]
+pub fn media_handler_set(set: &ClientHandlerSet) -> MediaHandlerSet {
+    MediaHandlerSet {
+        handler_set_version: set.version,
+        handlers: set
+            .handlers
+            .iter()
+            .map(|h| MediaServerInfo {
+                media_handler_url: h.media_handler_url.clone(),
+                handler_ref: h.handler_ref.get(),
+                media_dial_token: String::new(),
+            })
+            .collect(),
+    }
+}
 
 /// THE one builder of a roster entry (`Participant`), for both carriers: the
 /// join response's `existing_participants` (`connection.rs`) and the

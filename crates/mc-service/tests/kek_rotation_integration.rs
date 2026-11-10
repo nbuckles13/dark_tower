@@ -50,8 +50,8 @@ use mc_service::actors::{
 };
 use mc_service::media_admission::rotation::KEK_PUSH_OUTCOME_TIMEOUT;
 use mc_service::media_admission::KekLifecycle;
-use prost::Message;
-use proto_gen::dark_tower::signaling::v1::{server_message, MeetingKekUpdate, ServerMessage};
+
+use proto_gen::dark_tower::signaling::v1::{server_message, MeetingKekUpdate};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -68,6 +68,7 @@ fn spawn_meeting(meeting_id: &str, seams: MeetingSeams) -> (MeetingActorHandle, 
         ControllerMetrics::new(),
         SecretBox::new(Box::new(vec![0u8; 32])),
         Arc::clone(&lifecycle),
+        test_common::default_handler_set(),
         &MeetingSeams {
             kek_debounce_manual: true,
             ..seams
@@ -124,13 +125,7 @@ async fn settle_outcomes() {
 
 /// Every frame a member has received so far, decoded, in order.
 fn frames(m: &mut Member) -> Vec<server_message::Message> {
-    let mut out = Vec::new();
-    while let Ok(bytes) = m.rx.try_recv() {
-        if let Some(msg) = ServerMessage::decode(bytes.as_ref()).unwrap().message {
-            out.push(msg);
-        }
-    }
-    out
+    test_common::drain_frames(&mut m.rx)
 }
 
 fn kek_updates(frames: &[server_message::Message]) -> Vec<MeetingKekUpdate> {

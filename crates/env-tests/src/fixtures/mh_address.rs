@@ -488,6 +488,50 @@ pub fn policy_match_labels(policy: &Value) -> Result<BTreeMap<String, String>, S
     Ok(labels)
 }
 
+/// The client-facing address of EVERY live MH pod, discovered by label
+/// (`kube::live_mh_pods_with_specs`) and resolved through each pod's slot
+/// ConfigMap (the address MH advertises and GC hands out). For env-tests that
+/// must prove an MC-issued url names a live handler without a literal.
+///
+/// # Panics
+/// PRECONDITION if the pods or slot ConfigMaps cannot be read, a live pod
+/// carries no slot label, or its slot has no ConfigMap.
+pub async fn live_mh_addresses() -> BTreeSet<String> {
+    let pods = crate::fixtures::kube::live_mh_pods_with_specs().await;
+    let cms = slot_configmaps(
+        &crate::fixtures::kube::kubectl_get_json(&[
+            "configmaps",
+            "-n",
+            crate::NAMESPACE,
+            "-l",
+            SLOT_LABEL,
+        ])
+        .unwrap_or_else(|e| panic!("PRECONDITION (slot-configmaps): {e}")),
+    )
+    .unwrap_or_else(|e| panic!("PRECONDITION (slot-configmaps): {e}"));
+    pods.iter()
+        .map(|(pod, obj)| {
+            let slot: u32 = label(obj, SLOT_LABEL)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "PRECONDITION: live MH pod {} carries no {SLOT_LABEL} label",
+                        pod.name
+                    )
+                });
+            cms.get(&slot)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "PRECONDITION: live MH pod {} is on slot {slot} with no slot ConfigMap",
+                        pod.name
+                    )
+                })
+                .address
+                .clone()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,7 +8,7 @@
 //! Since story 2 task 20 a participant hears a sender if and only if the two
 //! share a connected handler, and "connected" means exactly what these RPCs
 //! report — server-observed, identity from the validated token `sub`, handler
-//! resolved by exact match against the meeting's frozen set. They are recorded
+//! resolved by exact match against the meeting's handler set. They are recorded
 //! in ONE place, the meeting actor, in the same turn that answers the sender
 //! binding (`MeetingActorHandle::media_connected`). There is no registry beside
 //! it. The client-reported `MediaConnectionUpdate` map is never consulted.
