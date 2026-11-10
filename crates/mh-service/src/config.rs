@@ -710,11 +710,32 @@ pub const DEFAULT_MEDIA_LATENCY_SAMPLE_RATIO: f64 = 0.01;
 /// *phase*; what bounds its *rate* is (a) the MC client's existing ~48 s retry
 /// budget, which functions as an accidental rate limiter and is deliberately NOT
 /// shortened (`docs/runbooks/mh-deployment.md`), and (b) a client that can tell
-/// a retryable close from a terminal one and back off — which does not exist yet
-/// and is tracked in `docs/TODO.md`. Shortening the retry budget before that
-/// client half lands converts a contained outage into a herd; the two are one
-/// decision.
+/// a retryable close from a terminal one and back off. MH now sends that
+/// distinction (`MC_UNAVAILABLE`, ADR-0039 §7); the client acts on it from story
+/// task C1. Shortening the retry budget before that client half lands converts
+/// a contained outage into a herd; the two are one decision.
 pub const MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS: u64 = 2_000;
+
+/// How long MH waits, after sending a WebTransport session close with a code
+/// (ADR-0039 §7), for the peer to react before it closes QUIC itself.
+///
+/// # Why one second
+///
+/// The capsule is a single small frame; a peer that received it reacts within
+/// about one round trip, and the wait ends as soon as it does. The bound only
+/// matters for a peer that never reacts (or a capsule lost under heavy loss),
+/// and for that peer it is pure cost: the session keeps its `MH_MAX_CONNECTIONS`
+/// slot until the wait ends, on every coded close — across an `EndMeeting`
+/// fan-out, and on top of the ~48 s MC-unavailable hold during an MC outage. One
+/// second is several generous RTTs and still small against those. A capsule
+/// still unacknowledged at the bound is discarded by the QUIC close and the
+/// client sees transport loss, which it handles safely.
+///
+/// Compile-time, not config (no new key): it is a protocol-mechanics bound, and
+/// it must stay strictly below [`SHUTDOWN_MARGIN_SECONDS`] so the first coded
+/// close under SIGTERM (MH-3's drain-deadline shed) cannot push past grace —
+/// asserted below.
+pub const CLOSE_SESSION_LINGER: Duration = Duration::from_secs(1);
 
 /// Maximum queued-audio latency the datagram send buffer may be configured to
 /// hold, in milliseconds. Sole input to
@@ -1173,6 +1194,10 @@ pub const SHUTDOWN_SETTLE_TARGET_SECONDS: u64 = 2;
 /// end of `main`. If an OTLP flush blocks, this margin is the only thing
 /// between it and the kill.
 pub const SHUTDOWN_MARGIN_SECONDS: u64 = 5;
+
+// A coded close's linger must fit inside the shutdown margin (see
+// `CLOSE_SESSION_LINGER`).
+const _: () = assert!(CLOSE_SESSION_LINGER.as_secs() < SHUTDOWN_MARGIN_SECONDS);
 
 // =============================================================================
 // OpenTelemetry Configuration Defaults (R-55)

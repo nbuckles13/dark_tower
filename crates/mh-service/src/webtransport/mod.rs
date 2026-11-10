@@ -5,10 +5,13 @@
 //!   explicit ADR-0036 §1 QUIC transport configuration the endpoint is built with
 //! - [`connection`] - Per-connection handler: accept session, read meeting JWT,
 //!   validate, check registration status, provisional accept with timeout
+//! - [`close`] - How MH ends a client session: the ADR-0039 §7 close-code
+//!   mapping and its one emission site
 //! - [`media_transport`] - The REAL implementation of the [`crate::transport`]
 //!   seam, wrapping `wtransport` per-connection I/O (ADR-0036 §10). Plumbing
 //!   only: the forward path that consumes it lands with story task 16.
 
+pub mod close;
 pub mod connection;
 pub mod media_transport;
 pub mod server;

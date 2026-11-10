@@ -2,7 +2,9 @@
 //! `Cargo.toml`, plus a typed walk of a crate manifest's dependency tables.
 //!
 //! Consumers: `release_build_profile` (profiles + the `*-service` roster
-//! floor) and `workspace_deps` (members / exclude / `[workspace.dependencies]`).
+//! floor), `workspace_deps` (members / exclude / `[workspace.dependencies]`,
+//! and the vendored partition), and `docker_context` (`[patch.*]` path targets
+//! must be in the image build context).
 //! Each consumer maps [`ManifestError`] onto its OWN precondition token; this
 //! module owns parsing, never policy.
 //!
@@ -33,6 +35,58 @@ pub struct RootManifest<P = toml::Value> {
     /// and "there is an empty one" are different facts.
     #[serde(default)]
     pub workspace: Option<WorkspaceTable>,
+    /// `[patch.<registry>]` tables: registry -> package -> spec. Read as raw
+    /// values; [`patch_path_targets`] is the ONE derivation over them.
+    #[serde(default = "BTreeMap::new")]
+    pub patch: BTreeMap<String, BTreeMap<String, toml::Value>>,
+}
+
+/// One `[patch.<registry>]` entry that points at a local path: a VENDORED
+/// crate. The vendored set is derived from these, never listed a second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchPath {
+    pub registry: String,
+    pub package: String,
+    /// Repo-relative, normalised (no leading `./`, no trailing `/`).
+    pub path: String,
+}
+
+/// Every `[patch.*]` entry with a `path`, in manifest order (sorted by registry,
+/// then package). FAIL-CLOSED: a `path` that is not a string, or that escapes
+/// the repository (absolute or containing `..`), is an error, never a skip —
+/// a consumer partitioning on this set would otherwise silently miss a crate.
+/// `git` patches are not vendored and are not returned.
+pub fn patch_path_targets<P>(manifest: &RootManifest<P>) -> Result<Vec<PatchPath>, String> {
+    let mut out = Vec::new();
+    for (registry, entries) in &manifest.patch {
+        for (package, spec) in entries {
+            let Some(table) = spec.as_table() else {
+                return Err(format!(
+                    "[patch.{registry}] `{package}` is not a table ({spec})"
+                ));
+            };
+            let Some(path) = table.get("path") else {
+                continue;
+            };
+            let Some(path) = path.as_str() else {
+                return Err(format!(
+                    "[patch.{registry}] `{package}` path is not a string ({path})"
+                ));
+            };
+            let norm = path.trim_start_matches("./").trim_end_matches('/');
+            if norm.is_empty() || norm.starts_with('/') || norm.split('/').any(|s| s == "..") {
+                return Err(format!(
+                    "[patch.{registry}] `{package}` path `{path}` is not a repo-relative path"
+                ));
+            }
+            out.push(PatchPath {
+                registry: registry.clone(),
+                package: package.clone(),
+                path: norm.to_string(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -72,6 +126,34 @@ pub fn read_root_manifest<P: DeserializeOwned>(
     let src =
         std::fs::read_to_string(repo_root.join("Cargo.toml")).map_err(ManifestError::Unreadable)?;
     toml::from_str::<RootManifest<P>>(&src).map_err(ManifestError::Unparseable)
+}
+
+/// One `[[package]]` of a `Cargo.lock` — the ONE typed lock reader.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct LockPackage {
+    pub name: String,
+    pub version: String,
+    /// `None` for a path (workspace or `[patch]`) package.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Parse a `Cargo.lock` body.
+pub fn parse_lock(src: &str) -> Result<Vec<LockPackage>, toml::de::Error> {
+    #[derive(serde::Deserialize)]
+    struct Lock {
+        #[serde(default)]
+        package: Vec<LockPackage>,
+    }
+    Ok(toml::from_str::<Lock>(src)?.package)
+}
+
+/// Read and parse `<repo_root>/Cargo.lock`. Unreadable and unparseable stay
+/// distinct, as for the manifest.
+pub fn read_lock(repo_root: &Path) -> Result<Vec<LockPackage>, ManifestError> {
+    let src =
+        std::fs::read_to_string(repo_root.join("Cargo.lock")).map_err(ManifestError::Unreadable)?;
+    parse_lock(&src).map_err(ManifestError::Unparseable)
 }
 
 /// Does any `[workspace] members` entry use glob syntax?
@@ -391,6 +473,42 @@ d = "1"
         assert_eq!(ws.members, vec!["a".to_string()]);
         assert_eq!(ws.exclude, vec!["b".to_string()]);
         assert!(ws.dependencies.unwrap().contains_key("x"));
+    }
+
+    #[test]
+    fn patch_path_targets_derive_the_vendored_set() {
+        let m: RootManifest = toml::from_str(
+            r#"
+[patch.crates-io]
+wtransport = { path = "./vendor/wtransport/" }
+other = { git = "https://example.org/other" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            patch_path_targets(&m).unwrap(),
+            vec![PatchPath {
+                registry: "crates-io".into(),
+                package: "wtransport".into(),
+                path: "vendor/wtransport".into(),
+            }]
+        );
+        let none: RootManifest = toml::from_str("[workspace]\n").unwrap();
+        assert!(patch_path_targets(&none).unwrap().is_empty());
+    }
+
+    #[test]
+    fn patch_path_targets_fail_closed() {
+        for (body, needle) in [
+            ("x = \"1\"", "not a table"),
+            ("x = { path = 1 }", "not a string"),
+            ("x = { path = \"../out\" }", "not a repo-relative path"),
+            ("x = { path = \"/abs\" }", "not a repo-relative path"),
+        ] {
+            let m: RootManifest = toml::from_str(&format!("[patch.crates-io]\n{body}\n")).unwrap();
+            let err = patch_path_targets(&m).unwrap_err();
+            assert!(err.contains(needle), "{body}: {err}");
+        }
     }
 
     #[test]

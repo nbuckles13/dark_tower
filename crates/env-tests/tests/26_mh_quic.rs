@@ -101,11 +101,12 @@ use env_tests::fixtures::metrics::{
     any_instance_exceeds_baseline, format_instance_map, instance_for_pod_ip,
     poll_until_any_instance_above, settled_baseline, InstanceCounters,
 };
+use env_tests::fixtures::mh_close::expect_session_close;
 use env_tests::fixtures::mh_grpc::{self, ReleaseOnDrop};
 use env_tests::fixtures::participant::{self, open_sessions};
 use env_tests::fixtures::{AuthClient, PrometheusClient};
 use proto_gen::dark_tower::internal::v1::EgressStream;
-use proto_gen::dark_tower::signaling::v1::TransportMode;
+use proto_gen::dark_tower::signaling::v1::{MhCloseCode, TransportMode};
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 
@@ -225,29 +226,41 @@ fn jwt_preview(jwt: &[u8]) -> String {
     }
 }
 
-/// Connect to MH and send a bad JWT, then assert the SESSION closes within
-/// a bounded window. Mirrors `test_mh_accepts_valid_meeting_jwt`'s held-open
-/// assertion inverted: success here = `conn.closed()` resolves observably.
+/// Connect to MH and send a bad credential, then assert MH closes the SESSION
+/// with `MH_CLOSE_CODE_DECLINED` (ADR-0039 §7): one `CLOSE_WEBTRANSPORT_SESSION`
+/// capsule, empty message. Every credential failure is the same generic
+/// DECLINED at the peer — the failure KIND stays on `mh_jwt_validations_total`.
+///
+/// POSITIVE CONTROL, same handler, same test: the VALID token from the real
+/// join is admitted and held open. That is what proves the DECLINED came from
+/// credential validation, not from an unreachable or misconfigured pod.
 ///
 /// **Why session-level, not stream-level**: per the warning on
-/// `send_jwt_on_bi_stream`, MH's `accept_bi()` binds the SendStream half to
-/// `_` and drops it immediately — so the bidi recv stream sees `Ok(None)`
-/// on EVERY connection path (accept, forged reject, oversized reject, …).
-/// Stream-level end-of-stream is invariant across outcomes and would silently
-/// pass even if MH started accepting bad JWTs. Only `conn.closed()`
-/// distinguishes rejection (session terminated by MH) from acceptance
-/// (session held open for media frames).
-async fn assert_mh_rejects(mh_url: &str, jwt: &str) {
+/// `send_jwt_on_bi_stream`, the bidi recv stream sees `Ok(None)` on EVERY
+/// connection path, so only the session end distinguishes rejection from
+/// acceptance — and only the capsule distinguishes a CODED rejection from
+/// transport loss.
+async fn assert_mh_rejects(mh_url: &str, jwt: &str, valid_jwt: &str) {
     let conn = connect_wt(mh_url).await;
     let (_send, _recv) = send_jwt_on_bi_stream(&conn, jwt).await;
+    expect_session_close(
+        &conn,
+        MhCloseCode::Declined,
+        Duration::from_secs(5),
+        &format!(
+            "bad credential (jwt prefix: {})",
+            jwt_preview(jwt.as_bytes())
+        ),
+    )
+    .await;
 
-    let close_outcome = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
-
+    let valid = connect_wt(mh_url).await;
+    let (_vsend, _vrecv) = send_jwt_on_bi_stream(&valid, valid_jwt).await;
+    let held = tokio::time::timeout(Duration::from_millis(2500), valid.closed()).await;
     assert!(
-        close_outcome.is_ok(),
-        "MH did not close the WebTransport session within 5s — JWT was \
-         not rejected (jwt prefix: {})",
-        jwt_preview(jwt.as_bytes()),
+        held.is_err(),
+        "POSITIVE CONTROL: the valid token was not held open on the same handler ({held:?}) — \
+         the DECLINED above cannot be attributed to credential validation"
     );
 }
 
@@ -609,7 +622,10 @@ async fn test_mh_accepts_valid_meeting_jwt() {
 // `mc_media_policy_pushes_total{outcome="match"}` — the counter
 // `test_mc_programs_live_handler_with_confirmed_forwarding_policy` attributes
 // to its OWN join. Run concurrently, this test would hand that one an unearned
-// rise (a false pass).
+// rise (a false pass). SECOND reason (story 4 MH-CLOSE): `assert_mh_rejects`
+// now also makes a VALID positive-control dial, and that dial DOES produce
+// MH -> MC Connected/Disconnected notifications, which the notification-counter
+// tests in this binary attribute to their own connections.
 #[serial_test::serial(mh_notifications)]
 #[tokio::test]
 async fn test_mh_rejects_forged_jwt() {
@@ -634,7 +650,7 @@ async fn test_mh_rejects_forged_jwt() {
         eyJzdWIiOiJhdHRhY2tlciIsIm1lZXRpbmdfaWQiOiJmYWtlIiwiZXhwIjo5OTk5OTk5OTk5fQ.\
         invalid_signature_that_will_not_verify";
 
-    assert_mh_rejects(&mh_url, forged).await;
+    assert_mh_rejects(&mh_url, forged, &meeting.jwt).await;
 }
 
 /// Test: MH rejects an oversized JWT (> `MAX_JWT_SIZE_BYTES` = 8192 in
@@ -658,7 +674,10 @@ async fn test_mh_rejects_forged_jwt() {
 // `mc_media_policy_pushes_total{outcome="match"}` — the counter
 // `test_mc_programs_live_handler_with_confirmed_forwarding_policy` attributes
 // to its OWN join. Run concurrently, this test would hand that one an unearned
-// rise (a false pass).
+// rise (a false pass). SECOND reason (story 4 MH-CLOSE): `assert_mh_rejects`
+// now also makes a VALID positive-control dial, and that dial DOES produce
+// MH -> MC Connected/Disconnected notifications, which the notification-counter
+// tests in this binary attribute to their own connections.
 #[serial_test::serial(mh_notifications)]
 #[tokio::test]
 async fn test_mh_rejects_oversized_jwt() {
@@ -680,7 +699,7 @@ async fn test_mh_rejects_oversized_jwt() {
     // Benign filler — explicitly NOT shaped like a real JWT (no dots, no
     // base64 header) so we don't normalize logging realistic-looking tokens.
     let oversized = "A".repeat(9000);
-    assert_mh_rejects(&mh_url, &oversized).await;
+    assert_mh_rejects(&mh_url, &oversized, &meeting.jwt).await;
 }
 
 // ============================================================================

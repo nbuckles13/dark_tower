@@ -74,6 +74,14 @@ COPY .cargo/ .cargo/
 # Copy recipe from planner stage
 COPY --from=planner /build/recipe.json recipe.json
 
+# Vendored `[patch.*]` path crates (vendor/patches/<crate>/PATCH.md). cargo-chef's
+# recipe skeletonizes workspace MEMBERS only, and a patch target is not one (root
+# `exclude`), so it must be present, in full, before the cook resolves the graph.
+# The cook never rewrites it (it has no skeleton), and `COPY . .` below lays the
+# identical files over it. .dockerignore admits only the patch targets under
+# vendor/; dt-guard docker-context requires this COPY in every cooking stage.
+COPY vendor/ vendor/
+
 # Build dependencies only - this layer is cached unless Cargo.toml/Cargo.lock change
 # ONE builder for every service image (CI image-caching): this chef/planner/builder
 # block is byte-identical in infra/docker/{ac,gc,mc,mh}-service/Dockerfile, so

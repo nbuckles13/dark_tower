@@ -2951,7 +2951,10 @@ assert_rc "cargo-chef-no-unpinned-install" 0 "$(grep -hE 'cargo install cargo-ch
 # MSRV (`rust-version`) is deliberately NOT declared: this is an application workspace, so the
 # minimum Rust IS the pinned toolchain and a `rust-version` would be a second copy of it with no
 # consumer (resolver 2 — not MSRV-aware). See docs/devloop-outputs/2026-10-05-rust-latest-stable/.
-msrv="$(find "${REPO_ROOT}" -name Cargo.toml -not -path '*/target/*' -not -path '*/node_modules/*' -exec grep -lE '^[[:space:]]*rust-version[[:space:]]*=' {} + 2>/dev/null)"
+# vendor/ is excluded: a vendored crate's manifest is upstream's, kept byte-identical by
+# `dt-guard vendor-patches` (vendor/patches/<crate>/PATCH.md), so its `rust-version` is not a
+# copy of OUR toolchain pin and cannot be edited away.
+msrv="$(find "${REPO_ROOT}" -name Cargo.toml -not -path '*/target/*' -not -path '*/node_modules/*' -not -path "${REPO_ROOT}/vendor/*" -exec grep -lE '^[[:space:]]*rust-version[[:space:]]*=' {} + 2>/dev/null)"
 assert_rc "no-rust-version-msrv-declared" 0 "$([[ -z "$msrv" ]] && echo 0 || echo "1 (${msrv//$'\n'/ })")"
 # Negative controls: each literal kind trips the scan.
 RVROOT="${WORK}/rvroot"; mkdir -p "$RVROOT/infra/docker/x" "$RVROOT/infra/devloop" "$RVROOT/.github/workflows"

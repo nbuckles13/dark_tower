@@ -15,7 +15,10 @@
 //!   to `main.rs:258-260` for ADR-0032 component-tier tests. Replaces the
 //!   former `wt_rig.rs` bypass (which called `handle_connection` directly).
 //! - [`tokens`] — MC service-token and meeting-token minting helpers
-//! - [`wt_client`] — Thin WebTransport client wrapper
+//! - [`wt_client`] — Thin WebTransport client wrapper, plus the session-close
+//!   observers (`expect_session_close` / `expect_no_session_close`, ADR-0039 §7)
+//! - [`close_metrics`] — `mh_webtransport_session_closes_total` delta assertions
+//! - [`udp_proxy`] — loopback UDP relay with a blackhole switch (close linger)
 //! - [`otel_capture`] — In-memory OTel span capture + global-propagator
 //!   installation for R-55/R-56/R-58 trace-propagation assertions
 //!
@@ -43,6 +46,7 @@
 )]
 
 pub mod accept_loop_rig;
+pub mod close_metrics;
 pub mod grpc_rig;
 pub mod jwks_rig;
 pub mod media_frame;
@@ -51,6 +55,7 @@ pub mod mock_mc;
 pub mod otel_capture;
 pub mod stream_rig;
 pub mod tokens;
+pub mod udp_proxy;
 pub mod wt_client;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};

@@ -28,6 +28,11 @@ members = [
 exclude = [
     "crates/ac-service/fuzz",
     "crates/media-protocol/fuzz",
+    # VENDORED, PATCHED upstream crate (ADR-0039 §7 session close). Explicitly
+    # excluded: a path dependency under the workspace root would otherwise become
+    # a member, and its upstream code would be swept by fmt/clippy/lints. Wired
+    # in by `[patch.crates-io]` below. See vendor/patches/wtransport/PATCH.md.
+    "vendor/wtransport",
 ]
 
 [workspace.package]
@@ -99,6 +104,11 @@ quinn = "0.11"
 # gates no dependency; wtransport already depends on the same quinn 0.11 we do).
 # Declared at the workspace (not only in mh-service) so MC and MH resolve one
 # wtransport — see the feature-unification note above `tower`.
+#
+# PATCHED: resolved to `vendor/wtransport` (upstream 0.7.2 plus an additive
+# session-close patch) by the `[patch.crates-io]` entry at the end of this file.
+# Bumping this requirement past 0.7.2 silently unpatches it; follow the drop
+# procedure in vendor/patches/wtransport/PATCH.md instead.
 wtransport = { version = "0.7", features = ["quinn"] }
 
 # Lock-free snapshot publication. Readers take an `Arc` with no guard lifetime
@@ -269,3 +279,11 @@ opt-level = 3
 
 [profile.dev.package.blowfish]
 opt-level = 3
+
+# wtransport 0.7.2 can RECEIVE a CLOSE_WEBTRANSPORT_SESSION capsule but cannot
+# SEND one, and browsers read a close code only from that capsule (ADR-0039 §7).
+# Upstream 0.7.2 plus an additive-only patch; provenance, the drift guard and
+# the drop procedure: vendor/patches/wtransport/PATCH.md. Applies to every
+# crate linking wtransport (MH, MC, env-tests); MC runs only upstream lines.
+[patch.crates-io]
+wtransport = { path = "vendor/wtransport" }

@@ -54,6 +54,8 @@ pub struct AcceptLoopRig {
     pub session_manager: SessionManagerHandle,
     /// Cancellation token wired into the accept loop.
     cancel_token: CancellationToken,
+    /// The server's held-connection counter (`MH_MAX_CONNECTIONS` gate).
+    active: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Handle for the spawned accept-loop task.
     accept_loop_handle: Option<JoinHandle<()>>,
     /// TempDir for the PEM files — kept alive for the rig's lifetime so
@@ -135,6 +137,7 @@ impl AcceptLoopRig {
             .local_addr()
             .expect("endpoint local_addr() must be available after bind()");
         let url = format!("https://127.0.0.1:{}", addr.port());
+        let active = server.active_connection_count();
 
         let accept_loop_handle = tokio::spawn(async move {
             server.accept_loop(endpoint).await;
@@ -148,6 +151,7 @@ impl AcceptLoopRig {
             addr,
             session_manager,
             cancel_token,
+            active,
             accept_loop_handle: Some(accept_loop_handle),
             _tempdir: tempdir,
         }
@@ -186,6 +190,39 @@ impl AcceptLoopRig {
             .to_string();
 
         (tempdir, cert_path_s, key_path_s)
+    }
+}
+
+impl AcceptLoopRig {
+    /// Wait (bounded poll, never a sleep-and-hope) until the server holds no
+    /// connection: every `handle_connection` has RETURNED. The accept loop
+    /// releases the slot and records the connection's `status` outcome in one
+    /// synchronous block, so once this returns on `current_thread`, a
+    /// `mh_webtransport_connections_total{status="error"}` that WOULD be
+    /// recorded already has been — the sync point the F9 (decline is not an
+    /// error) delta-0 assertions need.
+    pub async fn wait_idle(&self, within: Duration) {
+        self.wait_held(0, within).await;
+    }
+
+    /// As [`Self::wait_idle`], but until exactly `held` connections remain
+    /// (e.g. an incumbent that stays connected).
+    pub async fn wait_held(&self, held: usize, within: Duration) {
+        let stop = std::time::Instant::now() + within;
+        while self.active.load(std::sync::atomic::Ordering::SeqCst) != held {
+            assert!(
+                std::time::Instant::now() < stop,
+                "a connection handler did not return within {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Server shutdown: cancel the accept loop's token (every connection's
+    /// parent) WITHOUT aborting the loop task, exactly as `main` does on
+    /// SIGTERM — so the connection tasks run their shutdown arms.
+    pub fn shutdown(&self) {
+        self.cancel_token.cancel();
     }
 }
 

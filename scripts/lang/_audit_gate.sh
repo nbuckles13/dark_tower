@@ -99,13 +99,19 @@ audit_gate() {
 # member outside crates/* would open a false-SKIP hole: the SSoT-drift guard in
 # _audit_gate.test.sh asserts every git-tracked manifest stays covered.
 #
+# vendor/* (any content, not only vendor/*/Cargo.toml): a vendored crate is dependency
+# SOURCE the registry no longer vouches for, so any edit there re-runs Layer 6's provenance
+# anchor (scripts/lang/rust/audit.sh: crates.io checksum + pristine digest), and its
+# manifest's own deps move the graph (vendor/patches/<crate>/PATCH.md).
+#
 # Safe, not masking: a diff touching no dep manifest provably cannot move the resolved
 # dependency graph. Residual: a dep-changing devloop still full-tree scans and may hit
 # an unrelated ambient advisory — suppression (ADR-0033 §11) is the escape hatch; the
 # weekly scheduled scan (audit-scheduled.yml) remains the diff-less-vector net.
 audit_dep_changed_rust() {
   diff_touches_root_files "Cargo.toml" "Cargo.lock" \
-    || diff_touches_glob "crates/*/Cargo.toml"
+    || diff_touches_glob "crates/*/Cargo.toml" \
+    || diff_touches_glob "vendor/*"
 }
 
 # ts dep-manifest predicate — matches ONLY true dependency manifests (task narrowing,

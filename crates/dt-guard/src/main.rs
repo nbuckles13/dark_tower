@@ -53,6 +53,7 @@ use dt_guard::ts_pii;
 use dt_guard::ts_retained_credentials;
 use dt_guard::ts_secrets;
 use dt_guard::ts_test_removal;
+use dt_guard::vendor_patches;
 use dt_guard::workspace_deps;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -211,6 +212,40 @@ enum Command {
         /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
         #[arg(long)]
         explain: bool,
+    },
+    /// Vendored crates: each `[patch.*]` path target is EXACTLY its upstream
+    /// source plus a recorded additive patch, excluded from the workspace and
+    /// resolved by Cargo.lock (ADR-0039 §7; `vendor/patches/<crate>/PATCH.md`).
+    /// The extra modes serve the Layer-6 audit; none parses in bash.
+    VendorPatches {
+        /// Repository root for path resolution.
+        #[arg(long)]
+        root: PathBuf,
+        /// Emit single-line `EXPLAIN:` records per finding (ADR §7).
+        #[arg(long)]
+        explain: bool,
+        /// Print the derived vendored paths, one per line, and exit.
+        #[arg(long, group = "vendor_mode")]
+        list: bool,
+        /// Print `<crate> <version> <crate-sha256>` for `--vendored` and exit.
+        #[arg(long, groups = ["vendor_mode", "vendor_input_mode"], requires = "vendored")]
+        upstream_meta: bool,
+        /// Digest this unpacked upstream tree and compare it to `--vendored`'s
+        /// recorded pristine digest.
+        #[arg(long, groups = ["vendor_mode", "vendor_input_mode"], requires = "vendored")]
+        pristine_digest: Option<PathBuf>,
+        /// The vendored crate path (as in `[patch.*]`) for `--upstream-meta` /
+        /// `--pristine-digest` only.
+        #[arg(long, requires = "vendor_input_mode")]
+        vendored: Option<String>,
+        /// Write a copy of Cargo.lock with vendored packages attributed to
+        /// their upstream registry source.
+        #[arg(long, group = "vendor_mode")]
+        attributed_lock: Option<PathBuf>,
+        /// Print the vendored packages as `<name> <version>` lines (for the
+        /// audit's always-NEW classification) and exit.
+        #[arg(long, group = "vendor_mode")]
+        packages: bool,
     },
     /// Rust dependency-version SSoT: members inherit `[workspace.dependencies]`,
     /// shared deps are hoisted, excluded workspaces match the root, and global
@@ -563,6 +598,32 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::ResolvedFeatures { root, explain } => resolved_features::run(&root, explain),
         Command::WorkspaceDeps { root, explain } => workspace_deps::run(&root, explain),
+        Command::VendorPatches {
+            root,
+            explain,
+            list,
+            upstream_meta,
+            pristine_digest,
+            vendored,
+            attributed_lock,
+            packages,
+        } => {
+            // clap enforces at most one mode (group `vendor_mode`) and that
+            // `--vendored` only accompanies the modes that take it.
+            if list {
+                vendor_patches::run_list(&root)
+            } else if packages {
+                vendor_patches::run_packages(&root)
+            } else if let (true, Some(v)) = (upstream_meta, vendored.as_deref()) {
+                vendor_patches::run_upstream_meta(&root, v)
+            } else if let (Some(dir), Some(v)) = (pristine_digest, vendored.as_deref()) {
+                vendor_patches::run_pristine_digest(&root, &vendor_patches::resolve(&root, &dir), v)
+            } else if let Some(out) = attributed_lock {
+                vendor_patches::run_attributed_lock(&root, &out)
+            } else {
+                vendor_patches::run(&root, explain)
+            }
+        }
         Command::MediaTelemetryDeny { root, explain } => media_telemetry_deny::run(&root, explain),
         Command::MetricLabels { root, explain } => metric_labels::run(&root, explain),
         Command::ApplicationMetrics { root, explain } => application_metrics::run(&root, explain),

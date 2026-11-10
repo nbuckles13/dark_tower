@@ -92,7 +92,10 @@ use mh_service::observability::metrics::{
 use mh_service::routing::{MeetingKey, SenderId};
 use mh_service::session::{MeetingRegistration, SessionManagerHandle};
 
+use mh_service::webtransport::close::CloseCode;
+use proto_gen::dark_tower::signaling::v1::MhCloseCode;
 use test_common::accept_loop_rig::AcceptLoopRig;
+use test_common::close_metrics::assert_closed_only;
 use test_common::jwks_rig::JwksRig;
 use test_common::media_frame::audio_datagram;
 use test_common::mock_mc::{
@@ -100,7 +103,9 @@ use test_common::mock_mc::{
 };
 use test_common::test_token_receiver;
 use test_common::tokens::mint_meeting_token;
-use test_common::wt_client::{connect_and_open_bi, write_mh_connect};
+use test_common::wt_client::{
+    connect_and_open_bi, expect_session_close, expect_still_open, write_mh_connect,
+};
 
 const HANDLER_ID: &str = "mh-binding-test-001";
 
@@ -127,11 +132,11 @@ impl BindingSuite {
 
     /// As [`Self::start`], but capturing each inbound `NotifyParticipantDisconnected`.
     ///
-    /// The disconnect notification is the reject-and-close observable for the
-    /// decline arms: `close_declined_connection` sends it (for outcomes where
-    /// [`mc_may_hold_a_registration`] is true) immediately before
-    /// `handle_connection` returns and drops the connection, so its arrival
-    /// proves the teardown ran. It survives the F9 fix, which removed the
+    /// The disconnect notification is part of the decline arms' teardown:
+    /// `close_declined_connection` sends it (for outcomes where
+    /// [`mc_may_hold_a_registration`] is true) before the coded session close
+    /// (ADR-0039 §7) and its bounded linger, so its arrival proves the teardown
+    /// ran; the close itself is observed on the capsule. It survives the F9 fix, which removed the
     /// `status="error"` increment the arms previously used as the close proxy.
     async fn start_capturing_disconnects(
         behavior: MockBehavior,
@@ -529,21 +534,17 @@ async fn mc_answering_zero_declines_the_session_and_closes() {
     let meeting = MeetingKey::new("meeting-zero");
 
     let snap = MetricAssertion::snapshot();
-    let _conn = suite.connect("meeting-zero", "participant-unknown").await;
+    let (conn, _send, _recv) = suite.connect("meeting-zero", "participant-unknown").await;
 
     // REJECT-AND-CLOSE: the disconnect notification is sent as the connection is
-    // torn down, so its arrival is the close signal (and the sync point for the
-    // metric assertions below). See `BindingSuite::start_capturing_disconnects`.
+    // torn down; the session then closes with its code (ADR-0039 §7), which is
+    // the sync point for the metric assertions below.
     expect_reject_and_close(&mut disconnect_rx, "participant-unknown").await;
+    expect_session_close(&conn, MhCloseCode::Declined, Duration::from_secs(5), "zero").await;
+    assert_closed_only(&snap, CloseCode::Declined, 1);
+    assert_decline_is_not_an_error(&suite, &snap, 0).await;
 
     assert_started_only(&snap, MediaSessionStartOutcome::DeclinedNoSenderBinding);
-    // F9: a counted decline must NOT also land on the connection error series —
-    // that series drives an immediate-rollback gate whose rollback restores the
-    // pre-contract silent-no-media behaviour. The decline's home is
-    // `mh_media_session_starts_total{outcome}`, asserted above.
-    snap.counter("mh_webtransport_connections_total")
-        .with_labels(&[("status", "error")])
-        .assert_delta(0);
     assert!(
         !any_binding_exists(&suite.session_manager, &meeting),
         "a refused sender_id must leave no binding behind"
@@ -564,7 +565,7 @@ async fn mc_answering_out_of_range_declines_on_its_own_outcome() {
     let meeting = MeetingKey::new("meeting-out-of-range");
 
     let snap = MetricAssertion::snapshot();
-    let _conn = suite
+    let (conn, _send, _recv) = suite
         .connect("meeting-out-of-range", "participant-huge")
         .await;
 
@@ -573,14 +574,20 @@ async fn mc_answering_out_of_range_declines_on_its_own_outcome() {
     // binding left and no error-series pollution (F9). Close: the disconnect
     // notification.
     expect_reject_and_close(&mut disconnect_rx, "participant-huge").await;
+    expect_session_close(
+        &conn,
+        MhCloseCode::Declined,
+        Duration::from_secs(5),
+        "out-of-range",
+    )
+    .await;
+    assert_closed_only(&snap, CloseCode::Declined, 1);
+    assert_decline_is_not_an_error(&suite, &snap, 0).await;
 
     assert_started_only(
         &snap,
         MediaSessionStartOutcome::DeclinedSenderBindingOutOfRange,
     );
-    snap.counter("mh_webtransport_connections_total")
-        .with_labels(&[("status", "error")])
-        .assert_delta(0);
     assert!(
         !any_binding_exists(&suite.session_manager, &meeting),
         "an out-of-range sender_id must leave no binding behind"
@@ -625,7 +632,7 @@ async fn a_colliding_ordinal_is_refused_and_the_incumbent_keeps_it() {
     let meeting = MeetingKey::new("meeting-collision");
     let sender = suite.allocated("participant-incumbent");
 
-    let _incumbent = suite
+    let (incumbent, _incumbent_send, _incumbent_recv) = suite
         .connect("meeting-collision", "participant-incumbent")
         .await;
     assert_eq!(
@@ -642,10 +649,26 @@ async fn a_colliding_ordinal_is_refused_and_the_incumbent_keeps_it() {
     );
 
     let snap = MetricAssertion::snapshot();
-    let _newcomer = suite
+    let (newcomer, _newcomer_send, _newcomer_recv) = suite
         .connect("meeting-collision", "participant-newcomer")
         .await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // The refused newcomer is told BINDING_CONFLICT (it retries once its old
+    // session ages out); the incumbent is untouched and receives no code.
+    expect_session_close(
+        &newcomer,
+        MhCloseCode::BindingConflict,
+        Duration::from_secs(5),
+        "collision newcomer",
+    )
+    .await;
+    expect_still_open(
+        &incumbent,
+        Duration::from_millis(300),
+        "collision incumbent",
+    )
+    .await;
+    assert_closed_only(&snap, CloseCode::BindingConflict, 1);
+    assert_decline_is_not_an_error(&suite, &snap, 1).await;
 
     assert_started_only(
         &snap,
@@ -674,13 +697,42 @@ async fn an_unreachable_mc_declines_on_the_reachability_outcome() {
         .await;
 
     let snap = MetricAssertion::snapshot();
-    let _conn = suite
+    let (conn, _send, _recv) = suite
         .connect("meeting-mc-unreachable", "participant-any")
         .await;
-    // The MC client's full retry budget plus the close jitter. Long by design:
-    // the budget is deliberately NOT shortened (it rate-limits the reconnect
-    // herd), so a test that waits less would be asserting on a race.
-    tokio::time::sleep(Duration::from_secs(55)).await;
+    // The MC client's full retry budget, then the disconnect notice's own
+    // retries, then the close jitter — and only THEN the coded close. Long by
+    // design: the budget is deliberately NOT shortened (it rate-limits the
+    // reconnect herd). A bounded wait on the observation, not a sleep.
+    let took = expect_session_close(
+        &conn,
+        MhCloseCode::McUnavailable,
+        Duration::from_secs(55),
+        "mc unreachable",
+    )
+    .await;
+    // Latency bounds, derived from the MC client's own constants (never
+    // retyped): the Connected call AND the decline's Disconnected notice each
+    // run the retry budget against the unreachable endpoint, then the jitter.
+    // The FLOOR catches a fast-fail regression; the CEILING includes the full
+    // jitter bound. Which arm gets jitter is pinned by
+    // `close_jitter_is_on_the_mc_unavailable_arm_only` (connection.rs), not by
+    // timing one sample.
+    let floor = mh_service::grpc::mc_client::retry_backoff_floor() * 2;
+    let ceiling = mh_service::grpc::mc_client::retry_budget_ceiling() * 2
+        + Duration::from_millis(mh_service::config::MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS)
+        + Duration::from_secs(2);
+    assert!(
+        took >= floor,
+        "MC_UNAVAILABLE closed after {took:?}, below the retry-budget floor {floor:?} — \
+         the budget is the herd's rate limiter and must not be shortened"
+    );
+    assert!(
+        took <= ceiling,
+        "MC_UNAVAILABLE took {took:?}, above {ceiling:?}"
+    );
+    assert_closed_only(&snap, CloseCode::McUnavailable, 1);
+    assert_decline_is_not_an_error(&suite, &snap, 0).await;
 
     assert_started_only(&snap, MediaSessionStartOutcome::DeclinedMcUnavailable);
 }
@@ -761,13 +813,22 @@ async fn mc_refusing_mhs_credential_declines_on_the_auth_outcome() {
     suite.register("meeting-auth-rejected").await;
 
     let snap = MetricAssertion::snapshot();
-    let _conn = suite
+    let (conn, _send, _recv) = suite
         .connect("meeting-auth-rejected", "participant-any")
         .await;
     // Terminal on the first attempt, so this needs no retry budget — which is
-    // itself part of what the assertion pins: a value that took the full budget
-    // would not have been recorded inside this window.
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // itself part of what the assertion pins: a close that took the full retry
+    // budget would not arrive inside this window. (Which decline gets the close
+    // jitter is pinned by `close_jitter_is_on_the_mc_unavailable_arm_only`.)
+    expect_session_close(
+        &conn,
+        MhCloseCode::Declined,
+        Duration::from_secs(5),
+        "auth rejected",
+    )
+    .await;
+    assert_closed_only(&snap, CloseCode::Declined, 1);
+    assert_decline_is_not_an_error(&suite, &snap, 0).await;
 
     assert_started_only(&snap, MediaSessionStartOutcome::DeclinedMcAuthRejected);
 }
@@ -823,10 +884,18 @@ async fn an_undialable_mc_endpoint_declines_on_the_registration_outcome() {
         .expect("a test registration is below the registration cap");
 
     let snap = MetricAssertion::snapshot();
-    let _conn = suite
+    let (conn, _send, _recv) = suite
         .connect("meeting-bad-endpoint", "participant-any")
         .await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    expect_session_close(
+        &conn,
+        MhCloseCode::Declined,
+        Duration::from_secs(5),
+        "bad endpoint",
+    )
+    .await;
+    assert_closed_only(&snap, CloseCode::Declined, 1);
+    assert_decline_is_not_an_error(&suite, &snap, 0).await;
 
     assert_started_only(&snap, MediaSessionStartOutcome::DeclinedMcEndpointUnknown);
 }
@@ -861,11 +930,11 @@ async fn every_media_session_start_outcome_emits_under_the_catalogued_labels() {
 /// Await the `NotifyParticipantDisconnected` a declined connection sends as it
 /// closes, and assert it names `participant`.
 ///
-/// This is the positive close observable for the decline arms after F9 removed
-/// the `status="error"` increment they used to key on. It doubles as the sync
-/// point: MH records the decline outcome before `close_declined_connection`
-/// sends this, so a caller that has received it can assert the metric without a
-/// sleep.
+/// It is the teardown's MC-side observable, and a sync point for the decline
+/// OUTCOME metric: MH records `mh_media_session_starts_total` before
+/// `close_declined_connection` sends this. It is NOT a sync point for the
+/// connection's `status` (recorded only once `handle_connection` returns, after
+/// the coded close) — `assert_decline_is_not_an_error` waits for that.
 async fn expect_reject_and_close(
     disconnect_rx: &mut tokio::sync::mpsc::Receiver<
         proto_gen::dark_tower::internal::v1::NotifyParticipantDisconnectedRequest,
@@ -883,6 +952,25 @@ async fn expect_reject_and_close(
         req.participant_id, participant,
         "the disconnect must name the declined participant, not some other connection"
     );
+}
+
+/// F9: a counted decline must NOT also land on
+/// `mh_webtransport_connections_total{status="error"}` — that series drives an
+/// immediate-rollback gate whose rollback restores the pre-contract
+/// silent-no-media behaviour. The accept loop records `status` only when
+/// `handle_connection` RETURNS, which is after the coded close and its linger,
+/// i.e. after the client already saw the capsule. So wait for the handler to
+/// return (`held` connections left) BEFORE asserting delta 0; asserting earlier
+/// is vacuous.
+async fn assert_decline_is_not_an_error(
+    suite: &BindingSuite,
+    snap: &common::observability::testing::MetricSnapshot,
+    held: usize,
+) {
+    suite.wt.wait_held(held, Duration::from_secs(5)).await;
+    snap.counter("mh_webtransport_connections_total")
+        .with_labels(&[("status", "error")])
+        .assert_delta(0);
 }
 
 /// Assert that `expected` incremented by exactly 1 and every other outcome by 0.

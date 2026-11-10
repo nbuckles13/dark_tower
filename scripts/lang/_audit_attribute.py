@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Attribute audit findings to the change under test (ADR-0033 §11, 2026-10-26 amendment).
 
-Usage: _audit_attribute.py <cargo|pnpm> <base-lock-path-or-empty> <assume-preexisting:0|1>
+Usage: _audit_attribute.py <cargo|pnpm> <base-lock-path-or-empty> <assume-preexisting:0|1> [<vendored-file>]
 stdin: one finding per line, TAB-separated: <advisory id> <package> <version> [<title> [<source>]]
 
 A finding is PREEXISTING when the same package at the same version is already in the
@@ -13,7 +13,16 @@ no base lock (empty path) means every finding is NEW, and a base lock that parse
 nothing matches nothing. assume-preexisting=1 is for a graph with no base to compare
 (a freshly resolved, untracked lock whose manifest the change did not touch).
 
-Prints `AUDIT_FINDING=<NEW|PREEXISTING> <id> <package>@<version> <title>` per finding.
+VENDORED packages (cargo; <vendored-file> holds `<name> <version>` lines, produced by
+`dt-guard vendor-patches --packages`, never parsed from a manifest here) are ALWAYS NEW,
+printed `NEW(vendored)`, and block whatever the base holds: Dependabot cannot bump a
+vendored crate (a bump goes red on `vendor-patches`), so a PREEXISTING verdict would let a
+known advisory sit with no automated remedy, and the base's registry-vs-path source would
+otherwise flip the verdict across the merge (security ruling, MH-CLOSE review). The only
+escape hatch is the governed suppression manifest, which cargo-audit applies before a
+finding ever reaches this script.
+
+Prints `AUDIT_FINDING=<NEW|NEW(vendored)|PREEXISTING> <id> <package>@<version> <title>`.
 Exit: 0 no NEW finding, 1 at least one NEW, 2 bad input.
 """
 import re
@@ -57,10 +66,23 @@ PARSERS = {"cargo": cargo_packages, "pnpm": pnpm_packages}
 
 
 def main(argv):
-    if len(argv) != 4 or argv[1] not in PARSERS or argv[3] not in ("0", "1"):
-        print("usage: _audit_attribute.py <cargo|pnpm> <base-lock-or-empty> <0|1>", file=sys.stderr)
+    if len(argv) not in (4, 5) or argv[1] not in PARSERS or argv[3] not in ("0", "1"):
+        print("usage: _audit_attribute.py <cargo|pnpm> <base-lock-or-empty> <0|1> [<vendored-file>]", file=sys.stderr)
         return 2
     eco, base_path, assume = argv[1], argv[2], argv[3] == "1"
+    vendored = set()
+    if len(argv) == 5 and argv[4]:
+        try:
+            with open(argv[4], encoding="utf-8") as f:
+                for row in f.read().splitlines():
+                    parts = row.split()
+                    if len(parts) != 2:
+                        print(f"AUDIT_ATTRIBUTION: malformed vendored row: {row!r}")
+                        return 2
+                    vendored.add((parts[0], parts[1]))
+        except OSError as e:
+            print(f"AUDIT_ATTRIBUTION: cannot read the vendored list {argv[4]}: {e}")
+            return 2
     base = set()
     if base_path:
         try:
@@ -80,6 +102,10 @@ def main(argv):
         adv, name, version = fields[:3]
         title = fields[3] if len(fields) > 3 else ""
         ident = (name, version, fields[4] if len(fields) > 4 else "") if eco == "cargo" else (name, version)
+        if (name, version) in vendored:
+            new += 1
+            print(f"AUDIT_FINDING=NEW(vendored) {adv} {name}@{version} {title}".rstrip())
+            continue
         pre = assume or ident in base
         new += not pre
         print(f"AUDIT_FINDING={'PREEXISTING' if pre else 'NEW'} {adv} {name}@{version} {title}".rstrip())

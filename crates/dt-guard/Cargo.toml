@@ -41,6 +41,10 @@ serde_norway = { workspace = true }
 # applies.
 toml = "0.8"
 walkdir = "2"
+# vendor-patches: the pristine-tree digest (SHA-256) — the ONE digest
+# implementation, shared by the Layer-3 guard and the Layer-6 crates.io anchor.
+ring = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

@@ -51,6 +51,10 @@ assert_rc "rust: nested/excluded fuzz Cargo.toml -> run (* crosses /)" 0 "$(pred
 assert_rc "rust: crate source only -> skip (narrowed)"   1 "$(pred_rc rust 'crates/ac-service/src/lib.rs')"
 # negative glob: shares crates/ prefix but suffix differs -> skip.
 assert_rc "rust: crates/ suffix-differing sibling (.bak) -> skip" 1 "$(pred_rc rust 'crates/ac-service/Cargo.toml.bak')"
+# vendored crates: ANY content under vendor/ is dependency source -> run (anchor re-checks).
+assert_rc "rust: vendored crate manifest -> run"   0 "$(pred_rc rust 'vendor/wtransport/Cargo.toml')"
+assert_rc "rust: vendored crate source -> run"     0 "$(pred_rc rust 'vendor/wtransport/src/connection.rs')"
+assert_rc "rust: vendored patch record -> run"     0 "$(pred_rc rust 'vendor/patches/wtransport/PATCH.diff')"
 # rust no dep -> 1 (skip)
 assert_rc "rust: docs only -> skip"           1 "$(pred_rc rust 'docs/x.md')"
 assert_rc "rust: scripts only -> skip"        1 "$(pred_rc rust 'scripts/foo.sh')"
@@ -161,7 +165,11 @@ make_wrapper_repo() {
   (
     cd "$dir"
     git init -q; git config user.email t@t; git config user.name t
-    mkdir -p scripts/lang/rust stubbin tmp m c fz fd
+    mkdir -p scripts/lang/rust scripts/lib stubbin tmp m c fz fd
+    cp "${REPO_ROOT}/scripts/lib/tool-bins.sh" scripts/lib/tool-bins.sh
+    # The stub's path is the one the copied tool-bins.sh resolves, never retyped.
+    local dtg; dtg="$(. scripts/lib/tool-bins.sh && printf '%s' "$DT_GUARD_BIN")"
+    mkdir -p "$(dirname "$dtg")"
     cp "${REPO_ROOT}/scripts/lang/_common.sh" scripts/lang/_common.sh
     cp "${REPO_ROOT}/scripts/lang/_changed_helpers.sh" scripts/lang/_changed_helpers.sh
     cp "${REPO_ROOT}/scripts/lang/_get_base_ref.sh" scripts/lang/_get_base_ref.sh
@@ -179,7 +187,43 @@ make_wrapper_repo() {
       fz/Cargo.toml "${dir}/fz/Cargo.toml" \
       fd/Cargo.toml "${dir}/fd/Cargo.toml" > stub_locate
     echo "seed" > Cargo.lock
-    printf 'stub_*\ncargo_calls\nstubbin/\ntmp/\n' > .git/info/exclude
+    printf 'stub_*\ncargo_calls\ndtguard_calls\nstubbin/\ntmp/\ntarget/\n' > .git/info/exclude
+    # dt-guard stub at the path tool-bins.sh resolves (DT_GUARD_BIN) — no env seam. It
+    # answers the vendor-patches modes audit.sh uses from <dir>/stub_vendored (the derived
+    # set, empty by default), <dir>/stub_vendor_meta and <dir>/stub_digest_fail.
+    cat > "$dtg" <<STUB
+#!/usr/bin/env bash
+d=$(printf '%q' "$dir")
+printf '%s\\n' "\$*" >> "\$d/dtguard_calls"
+[[ "\$1" == vendor-patches ]] || { echo "stub: unexpected dt-guard \$*" >&2; exit 97; }
+case " \$* " in
+  *" --list "*) cat "\$d/stub_vendored" 2>/dev/null; exit 0 ;;
+  *" --packages "*) cat "\$d/stub_vendor_packages" 2>/dev/null; exit 0 ;;
+  *" --upstream-meta "*) cat "\$d/stub_vendor_meta"; exit 0 ;;
+  *" --attributed-lock "*) out="\${@: -1}"; { cat Cargo.lock; echo "# attributed"; } > "\$out"; exit 0 ;;
+  *" --pristine-digest "*)
+    [[ -e "\$d/stub_digest_fail" ]] && { echo "STATUS=FAIL REASON=vendor-pristine-digest-mismatch"; exit 1; }
+    echo "STATUS=OK REASON=vendor-pristine-anchored"; exit 0 ;;
+esac
+echo "stub: unexpected dt-guard \$*" >&2; exit 97
+STUB
+    chmod +x "$dtg"
+    # curl stub (Layer-6 anchor): the index answer from <dir>/stub_index, the .crate from
+    # <dir>/stub_crate; <dir>/stub_curl_fail fails every fetch.
+    cat > stubbin/curl <<STUB
+#!/usr/bin/env bash
+d=$(printf '%q' "$dir")
+[[ -e "\$d/stub_curl_fail" ]] && { echo "curl: (6) Could not resolve host" >&2; exit 6; }
+out=""; url=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in -o) out="\$2"; shift 2 ;; --max-time) shift 2 ;; -*) shift ;; *) url="\$1"; shift ;; esac
+done
+case "\$url" in
+  *.crate) cp "\$d/stub_crate" "\$out" ;;
+  *) cat "\$d/stub_index" ;;
+esac
+STUB
+    chmod +x stubbin/curl
     cat > stubbin/cargo <<STUB
 #!/usr/bin/env bash
 d=$(printf '%q' "$dir")
@@ -203,6 +247,13 @@ case "\$1" in
     [[ \$# -eq 4 && "\$2 \$3" == "--json -f" ]] || { echo "stub: unexpected: \$*" >&2; exit 97; }
     grep -qxF -- "\$4" "\$d/stub_audit_toolfail" 2>/dev/null && { echo "stub: advisory-db fetch failed" >&2; exit 1; }
     row="\$(awk -F'\\t' -v l="\$4" '\$1 == l { print; exit }' "\$d/stub_audit_fail" 2>/dev/null)"
+    # <dir>/stub_audit_fail_all holds CRATE TAB VERSION: the finding is in EVERY scanned lock
+    # (the attributed root copy has a random path). Like cargo-audit, a governed ignore of
+    # its id in .cargo/audit.toml drops it before it is reported.
+    if [[ -z "\$row" && -s "\$d/stub_audit_fail_all" ]] \\
+       && ! grep -q 'RUSTSEC-2099-0001' .cargo/audit.toml 2>/dev/null; then
+      row="any\$(printf '\\t')\$(cat "\$d/stub_audit_fail_all")"
+    fi
     if [[ -n "\$row" ]]; then
       crate="\$(cut -sf2 <<<"\$row")"; ver="\$(cut -sf3 <<<"\$row")"
       printf '{"vulnerabilities":{"found":true,"count":1,"list":[{"advisory":{"id":"RUSTSEC-2099-0001","title":"stub advisory"},"package":{"name":"%s","version":"%s","source":"registry+https://github.com/rust-lang/crates.io-index"}}]}}\\n' "\${crate:-stubcrate}" "\${ver:-0.0.1}"
@@ -668,5 +719,113 @@ assert_status "attribute: pnpm unknown version" "AUDIT_FINDING=NEW G5 left-pad@?
 assert_status "attribute: pnpm patchedDependencies key does not count" "AUDIT_FINDING=NEW G6 left-pad@1.3.0" "$out"
 assert_status "attribute: pnpm toolchain document does not count" "AUDIT_FINDING=NEW G7 pnpm@12.8.1" "$out"
 rm -rf "$attr_t"
+
+# -----------------------------------------------------------------------------
+# Part 7 — vendored crates (root [patch.*] path targets; vendor/patches/<crate>/PATCH.md).
+# The set comes from dt-guard (stubbed at DT_GUARD_BIN); bash parses neither manifest.
+# -----------------------------------------------------------------------------
+# A real .crate fixture whose sha256 the stub index and the PATCH.md record agree on.
+vendored_files() {
+  mkdir -p vd up/vd-1.0.0
+  printf '# vendored fixture manifest\n' > vd/Cargo.toml
+  printf 'upstream\n' > up/vd-1.0.0/lib.rs
+  tar -czf stub_crate -C up vd-1.0.0
+  local sum; sum="$(sha256sum stub_crate | cut -d' ' -f1)"
+  printf 'vd\n' > stub_vendored
+  printf 'vd 1.0.0\n' > stub_vendor_packages
+  printf 'vd 1.0.0 %s\n' "$sum" > stub_vendor_meta
+  printf '{"name":"vd","vers":"0.9.0","cksum":"00"}\n{"name":"vd","vers":"1.0.0","cksum":"%s"}\n' "$sum" > stub_index
+}
+vendored_setup() {
+  vendored_files
+  git add vd/Cargo.toml; git commit -qm vendored
+  echo "bumped again" > Cargo.lock
+}
+case_vendored() { vendored_setup; }
+scan_case case_vendored
+assert_rc "vendored: clean -> exit 0" 0 "$WRAP_RC"
+assert_status "vendored: clean -> OK" "STATUS=OK REASON=cargo-audit-passed" "$WRAP_OUT"
+# Discovery skipped the vendored manifest (its locate has no stub mapping: had discovery
+# not skipped it, the stub would exit 97 and discovery would fail).
+assert_status "vendored: discovery skips the vendored manifest" "AUDIT_GRAPH=vd/Cargo.toml SKIPPED=vendored" "$WRAP_OUT"
+# The root graph was scanned through the ATTRIBUTED copy, not the raw lock.
+assert_status "vendored: root scanned attributed" "AUDIT_GRAPH=Cargo.lock LOCK=tracked+attributed RESULT=ok" "$WRAP_OUT"
+assert_rc "vendored: raw root lock NOT scanned" 0 "$(called_with "$CASE_DIR" "audit --json -f Cargo.lock")"
+# The provenance anchor ran and passed.
+assert_status "vendored: anchored" "AUDIT_ANCHOR=vd upstream=vd@1.0.0 RESULT=anchored" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# PATCH.md's recorded checksum disagrees with the crates.io index: the record is checked,
+# never trusted.
+case_vendored_bad_record() { vendored_setup; printf 'vd 1.0.0 deadbeef\n' > stub_vendor_meta; }
+scan_case case_vendored_bad_record
+assert_rc "vendored: record != index -> exit 1" 1 "$WRAP_RC"
+assert_status "vendored: record != index -> anchor failure" "STATUS=FAIL REASON=vendor-pristine-anchor-failed" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# The unpacked upstream tree does not match the recorded pristine digest.
+case_vendored_digest() { vendored_setup; : > stub_digest_fail; }
+scan_case case_vendored_digest
+assert_status "vendored: digest mismatch -> anchor failure" "STATUS=FAIL REASON=vendor-pristine-anchor-failed" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# The network is down: fail loudly, never skip the anchor.
+case_vendored_offline() { vendored_setup; : > stub_curl_fail; }
+scan_case case_vendored_offline
+assert_status "vendored: fetch failure -> anchor failure" "STATUS=FAIL REASON=vendor-pristine-anchor-failed" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+
+# dt-guard missing: its own token, distinct from an advisory hit; nothing is scanned.
+case_no_dt_guard() { rm -f "$(. scripts/lib/tool-bins.sh && printf '%s' "$DT_GUARD_BIN")"; }
+scan_case case_no_dt_guard
+assert_rc "no dt-guard -> exit 1" 1 "$WRAP_RC"
+assert_status "no dt-guard -> its own token" "STATUS=FAIL REASON=vendor-patches-unavailable" "$WRAP_OUT"
+assert_rc "no dt-guard -> scanner NOT invoked" 0 "$(called_with "$CASE_DIR" "audit --json -f Cargo.lock")"
+rm -rf "$CASE_DIR"
+
+# Attribution of a finding on a VENDORED package (security ruling): ALWAYS NEW(vendored) and
+# blocking, whatever the base holds — a registry copy (pre-merge) or the path copy
+# (post-merge) — while a non-vendored finding keeps the normal PREEXISTING semantics, and a
+# governed suppression still suppresses. <base> <head> <ignore-list> <fail_all row>.
+LOCK_VD_REGISTRY=$'[[package]]\nname = "vd"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n'
+LOCK_VD_PATH=$'[[package]]\nname = "vd"\nversion = "1.0.0"\n'
+LOCK_OTHER_PRE=$'[[package]]\nname = "othercrate"\nversion = "2.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n'
+vendored_attr_case() {
+  local base="$1" head="$2" ignore="$3" fail_all="$4"
+  CASE_DIR="$(mktemp -d)"
+  make_wrapper_repo "$CASE_DIR"
+  (
+    cd "$CASE_DIR"
+    mkdir -p .cargo; printf '[advisories]\nignore = [%s]\n' "$ignore" > .cargo/audit.toml
+    vendored_files
+    printf '%s' "$base" > Cargo.lock
+    git add -A; git commit -qm seed
+    git update-ref refs/remotes/origin/main HEAD   # a trusted base: local-mergebase
+    printf '%s' "$head" > Cargo.lock
+    printf '%s\n' "$fail_all" > stub_audit_fail_all
+  )
+  rerun_wrapper
+}
+VD_FINDING=$'vd\t1.0.0'
+vendored_attr_case "$LOCK_VD_REGISTRY" "${LOCK_VD_PATH}${LOCK_OTHER_PRE}" "" "$VD_FINDING"
+assert_rc "vendored finding, registry base -> blocks" 1 "$WRAP_RC"
+assert_status "vendored finding, registry base -> NEW(vendored)" "AUDIT_FINDING=NEW(vendored) RUSTSEC-2099-0001 vd@1.0.0" "$WRAP_OUT"
+assert_status "vendored finding, registry base -> FAIL" "STATUS=FAIL REASON=cargo-audit-failed" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+vendored_attr_case "$LOCK_VD_PATH" "${LOCK_VD_PATH}${LOCK_OTHER_PRE}" "" "$VD_FINDING"
+assert_rc "vendored finding, path base -> blocks" 1 "$WRAP_RC"
+assert_status "vendored finding, path base -> NEW(vendored)" "AUDIT_FINDING=NEW(vendored) RUSTSEC-2099-0001 vd@1.0.0" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+# Control: a NON-vendored finding already on the base stays PREEXISTING (not blocking).
+vendored_attr_case "${LOCK_VD_PATH}${LOCK_OTHER_PRE}" "${LOCK_VD_PATH}${LOCK_OTHER_PRE}"$'\n' "" $'othercrate\t2.0.0'
+assert_rc "non-vendored preexisting -> exit 0" 0 "$WRAP_RC"
+assert_status "non-vendored preexisting -> PREEXISTING" "AUDIT_FINDING=PREEXISTING RUSTSEC-2099-0001 othercrate@2.0.0" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
+# A governed suppression still suppresses a vendored finding, surfaced as SUPPRESSED=.
+vendored_attr_case "$LOCK_VD_PATH" "${LOCK_VD_PATH}${LOCK_OTHER_PRE}" '"RUSTSEC-2099-0001"' "$VD_FINDING"
+assert_rc "vendored finding, suppressed -> exit 0" 0 "$WRAP_RC"
+assert_status "vendored finding, suppressed -> SUPPRESSED surfaced" "SUPPRESSED=RUSTSEC-2099-0001" "$WRAP_OUT"
+assert_absent "vendored finding, suppressed -> not reported" "NEW(vendored)" "$WRAP_OUT"
+rm -rf "$CASE_DIR"
 
 report_results "scripts/lang/_audit_gate.test.sh"

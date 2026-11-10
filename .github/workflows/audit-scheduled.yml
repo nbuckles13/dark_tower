@@ -109,6 +109,13 @@ jobs:
       # and the tracked derived files still filter suppressed advisories. We capture the
       # outcome rather than letting a red scan fail the step, so the output is always
       # uploaded for the report job; the last step below turns the job red.
+      # scripts/lang/rust/audit.sh derives the vendored-crate set, the attributed lock and
+      # the pristine-digest anchor from dt-guard (vendor/patches/<crate>/PATCH.md) and fails
+      # loudly (vendor-patches-unavailable) without it, so build it the ONE way
+      # (scripts/lib/tool-bins.sh). The PR lane builds it in Layer 1 of the same shard.
+      - name: Build dt-guard
+        run: bash -c 'source scripts/lib/tool-bins.sh && dt_build_tool dt-guard --locked --quiet'
+
       - name: Run full audit (force-run, suppressions still applied)
         id: scan
         env:
