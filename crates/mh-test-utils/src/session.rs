@@ -23,7 +23,7 @@ use mh_service::routing::MeetingPolicy;
 use mh_service::session::{ApplyOutcome, MeetingRegistration, SessionManagerHandle};
 
 use crate::admission::fixture_policy_limits;
-use crate::media_policy::{TEST_MC_ENDPOINT, TEST_MC_ID};
+use crate::media_policy::{TEST_HEARTBEAT_INTERVAL_MS, TEST_MC_ENDPOINT, TEST_MC_ID};
 
 /// Register `policy`'s meeting on `sm` as the fixture MC, then apply `policy`
 /// with the fixture limits, in the order the `RegisterMeeting` handler uses.
@@ -43,8 +43,10 @@ pub async fn apply_registered(sm: &SessionManagerHandle, policy: MeetingPolicy) 
         MeetingRegistration {
             mc_id: TEST_MC_ID.to_string(),
             mc_grpc_endpoint: TEST_MC_ENDPOINT.to_string(),
+            heartbeat_interval: Duration::from_millis(u64::from(TEST_HEARTBEAT_INTERVAL_MS)),
             registered_at: Instant::now(),
         },
+        None,
         limits.max_registered_meetings,
     )
     .await

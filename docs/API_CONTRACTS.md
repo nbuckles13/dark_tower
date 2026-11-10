@@ -749,7 +749,8 @@ assignment-output change, and the meeting-level `server_muted_sources` set
 read nor authenticate a publisher's stream number, and it is bounded per meeting.
 The response carries `accepted` (received-and-parsed
 only — **not** evidence of application), the **applied** generation, `handler_id`,
-`process_start_epoch_ms`, and the echoed `transport_mode`.
+and the echoed `transport_mode`. (`process_start_epoch_ms` was deleted by story 4
+MH-2: ADR-0039 §1 drops restart detection; tag and name reserved.)
 
 > **Superseded in part 2026-10-13 (story 3, R-16/R-17/R-20).** The request gains
 > `source_streams`: every source stream MH may receive, as (sender, stream,
@@ -814,7 +815,8 @@ meeting ends. The call carries no generation and no reason. It is **not**
   one-version-older Media Handler answers `UNIMPLEMENTED`. That is expected: MC
   counts it and does not retry.
 
-The normative text, including the story-4 re-assert fence, the accepted
+The normative text, including the late-registration fence (a RELEASED heartbeat
+verdict, ADR-0039 §6), the `cause` rules, the accepted
 meeting-existence oracle and the operator-visible symptom, is on
 `EndMeetingRequest` in `internal.proto`.
 

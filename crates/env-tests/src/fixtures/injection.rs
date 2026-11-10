@@ -136,6 +136,11 @@ pub struct Injection<'a> {
     mc_grpc_endpoint: String,
     /// The generation the probe in [`Injection::open`] read back on this pod.
     mc_generation: u64,
+    /// MC's own heartbeat interval (`metrics::mc_heartbeat_interval`): the
+    /// injection carries the REAL MC's endpoint and `mc_id`, so this pod
+    /// heartbeats that MC for the meeting and must do so at MC's N/3, or a
+    /// detecting MC would declare it dead mid-test.
+    heartbeat_interval_ms: u32,
 }
 
 impl<'a> Injection<'a> {
@@ -160,7 +165,14 @@ impl<'a> Injection<'a> {
         token: &'a str,
         cleanup: &ReleaseOnDrop,
         owner: &Participant,
+        prom: &PrometheusClient,
     ) -> Injection<'a> {
+        let heartbeat_interval_ms = u32::try_from(
+            crate::fixtures::metrics::mc_heartbeat_interval(prom)
+                .await
+                .as_millis(),
+        )
+        .unwrap_or(u32::MAX);
         let meeting_id = owner.gc.meeting_id.to_string();
         let mc_id = owner.gc.mc_assignment.mc_id.clone();
         let mc_grpc_endpoint = owner.gc.mc_assignment.grpc_endpoint.clone();
@@ -173,6 +185,7 @@ impl<'a> Injection<'a> {
             mc_id,
             mc_grpc_endpoint,
             mc_generation: 0,
+            heartbeat_interval_ms,
         };
         injection.mc_generation = injection.register(1, Vec::new(), Vec::new()).await;
         injection
@@ -215,7 +228,7 @@ impl<'a> Injection<'a> {
             selection_rules: None,
             policy_generation: generation,
             source_streams: sources,
-            heartbeat_interval_ms: 0,
+            heartbeat_interval_ms: self.heartbeat_interval_ms,
             media_dial_public_key: Vec::new(),
         };
         self.client
@@ -249,7 +262,7 @@ impl<'a> Injection<'a> {
             selection_rules: None,
             policy_generation: generation,
             source_streams: sources,
-            heartbeat_interval_ms: 0,
+            heartbeat_interval_ms: self.heartbeat_interval_ms,
             media_dial_public_key: Vec::new(),
         };
         match self
@@ -346,18 +359,43 @@ pub fn assert_mc_programmed_a_carrying_pod(injections: &[Injection<'_>]) {
     );
 }
 
-/// EVERY live MH pod ([`mh_grpc::handlers`]: found by label, at least one,
-/// none Terminating or not Ready), after a PRECONDITION that each pod can
-/// register one more meeting: an injection registers a NEW meeting id on EVERY
-/// pod, with the same policy, so no test needs to know which pod serves which
-/// WebTransport URL. Pods persist
+/// Every live MH pod IN `owner`'s HANDLER SET ([`mh_grpc::handlers`]: found by
+/// label, at least one, none Terminating or not Ready; filtered to the pods
+/// serving `owner`'s `media_handler_set` urls, through
+/// [`crate::fixtures::mh_address::pods_serving`]), after a PRECONDITION that
+/// each pod can register one more meeting: an injection registers the meeting
+/// on EVERY set pod, with the same policy, so no test needs to know which pod
+/// serves which WebTransport URL.
+///
+/// ONLY SET MEMBERS (story 4 MH-2): an injection carries the REAL MC's
+/// endpoint and `mc_id`, so the pod HEARTBEATS that MC for the meeting. A set
+/// member is answered OWNED; a pod outside MC's set would be answered
+/// RELEASED (a misroute) within one interval and release the injected meeting
+/// mid-test, racing any per-pod assertion. Pods persist
 /// across runs (ADR-0038: nothing restarts an unchanged MH), so a pod can hold
 /// registrations a killed harness never released (see [`Injection`]'s "If
 /// cleanup is skipped"). At the cap, the injection would be refused as
 /// `rejected_meeting_cap` — a confusing registration refusal rather than the
 /// named leak it is. Read from the published gauges, per pinned pod.
-pub async fn injectable_handlers(prom: &PrometheusClient, settle_bound: Duration) -> Vec<Handler> {
-    let handlers = mh_grpc::handlers().await;
+pub async fn injectable_handlers(
+    prom: &PrometheusClient,
+    settle_bound: Duration,
+    owner: &Participant,
+) -> Vec<Handler> {
+    let set_pods = crate::fixtures::mh_address::pods_serving(
+        owner.handler_set(),
+        &crate::fixtures::mh_address::live_mh_addresses_by_pod().await,
+    );
+    let handlers: Vec<Handler> = mh_grpc::handlers()
+        .await
+        .into_iter()
+        .filter(|h| set_pods.contains(&h.name))
+        .collect();
+    assert!(
+        !handlers.is_empty(),
+        "PRECONDITION: {}'s handler set names no live MH pod ({set_pods:?}); nothing to inject on",
+        owner.label
+    );
     let registered = gauge_by_instance_present(
         prom,
         "mh_media_registered_meetings",

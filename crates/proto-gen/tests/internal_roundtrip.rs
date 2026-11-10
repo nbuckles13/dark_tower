@@ -27,10 +27,6 @@
 //!   (`RegisterMeetingResponse.applied_source_streams`; first stated on the
 //!   single-mode field 5 that MC-B deleted). The fail-open form's skip branch
 //!   is unreachable against a same-version peer. Pinned at story task 6.
-//! - **`process_start_epoch_ms` is sampled once per process**. A per-call clock
-//!   read is indistinguishable from a correct sample until a SECOND PROCESS
-//!   INCARNATION SHARING A POD IDENTITY exists. Split: within-process stability
-//!   at story task 5, changes-on-restart at the handler-restart story.
 //!
 //! Story 2 adds three more, owned by the MH tasks that implement them and
 //! expressible only against a running handler (a fourth, the
@@ -256,7 +252,6 @@ fn applied_generation_is_independent_of_the_requested_generation() {
         accepted: true,
         applied_generation: 4,
         handler_id: "mh-1".to_string(),
-        process_start_epoch_ms: 1_756_684_800_000,
         applied_source_streams: Vec::new(),
     });
 
@@ -267,14 +262,13 @@ fn applied_generation_is_independent_of_the_requested_generation() {
         "the divergent state ADR-0036 §8 exists to detect must be representable"
     );
     assert_eq!(echoed.handler_id, "mh-1");
-    assert_eq!(echoed.process_start_epoch_ms, 1_756_684_800_000);
 }
 
 /// The all-zero response — what a PRE-RESHAPE media handler's absent fields
 /// decode to — must be a representable, decodable value.
 ///
 /// This is the wire half of the reshape's zero-value contract: `accepted: true`
-/// with `applied_generation: 0`, `handler_id: ""`, `process_start_epoch_ms: 0`
+/// with `applied_generation: 0`, `handler_id: ""`
 /// and no `applied_source_streams` is exactly what MC sees from an old handler,
 /// and every one of those readings is documented as "not reported" rather than
 /// as a legitimate value. The rules constraining MC's *reaction* are runtime and
@@ -286,14 +280,12 @@ fn all_zero_response_is_representable_and_distinct_from_a_populated_one() {
         accepted: true,
         applied_generation: 0,
         handler_id: String::new(),
-        process_start_epoch_ms: 0,
         applied_source_streams: Vec::new(),
     });
 
     assert!(zeroed.accepted, "`accepted` means received-and-parsed only");
     assert_eq!(zeroed.applied_generation, 0, "0 = nothing applied");
     assert!(zeroed.handler_id.is_empty(), "empty = not reported");
-    assert_eq!(zeroed.process_start_epoch_ms, 0, "0 = not reported");
     assert!(
         zeroed.applied_source_streams.is_empty(),
         "no streams echoed = nothing applied; every sent stream is a MISMATCH for MC"
@@ -303,7 +295,6 @@ fn all_zero_response_is_representable_and_distinct_from_a_populated_one() {
         accepted: true,
         applied_generation: 1,
         handler_id: "mh-1".to_string(),
-        process_start_epoch_ms: 1,
         applied_source_streams: Vec::new(),
     });
     assert_ne!(zeroed, populated);
@@ -795,7 +786,6 @@ fn response_with(echoes: Vec<SourceStreamEcho>) -> RegisterMeetingResponse {
         accepted: true,
         applied_generation: 4,
         handler_id: "mh-1".to_string(),
-        process_start_epoch_ms: 1,
         applied_source_streams: echoes,
     }
 }

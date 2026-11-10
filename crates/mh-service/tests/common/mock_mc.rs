@@ -13,15 +13,16 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use proto_gen::dark_tower::internal::v1::media_coordination_service_server::{
     MediaCoordinationService, MediaCoordinationServiceServer,
 };
 use proto_gen::dark_tower::internal::v1::{
-    MeetingHeartbeatRequest, MeetingHeartbeatResponse, NotifyParticipantConnectedRequest,
-    NotifyParticipantConnectedResponse, NotifyParticipantDisconnectedRequest,
-    NotifyParticipantDisconnectedResponse,
+    HeartbeatVerdict, MeetingHeartbeatRequest, MeetingHeartbeatResponse,
+    NotifyParticipantConnectedRequest, NotifyParticipantConnectedResponse,
+    NotifyParticipantDisconnectedRequest, NotifyParticipantDisconnectedResponse,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -40,6 +41,10 @@ pub enum MockBehavior {
     Unauthenticated,
     /// Return `PERMISSION_DENIED` (non-retryable).
     PermissionDenied,
+    /// Accept `NotifyParticipantConnected`; answer every
+    /// `NotifyParticipantDisconnected` UNAVAILABLE (retryable), so MH's
+    /// disconnect notify exhausts its retries.
+    FailDisconnects,
 }
 
 /// How the mock answers `NotifyParticipantConnected`'s `sender_id`.
@@ -90,6 +95,7 @@ pub struct MockMcServer {
     connected_tx: Option<mpsc::Sender<NotifyParticipantConnectedRequest>>,
     disconnected_tx: Option<mpsc::Sender<NotifyParticipantDisconnectedRequest>>,
     traceparent_tx: Option<mpsc::Sender<Option<String>>>,
+    heartbeat_tx: Option<mpsc::Sender<MeetingHeartbeatRequest>>,
 }
 
 impl MockMcServer {
@@ -102,7 +108,15 @@ impl MockMcServer {
             connected_tx: None,
             disconnected_tx: None,
             traceparent_tx: None,
+            heartbeat_tx: None,
         }
+    }
+
+    /// Serve `MeetingHeartbeat` (story 4 MH-2): answer OWNED and push each
+    /// request on `tx`. Without this the rpc answers UNIMPLEMENTED.
+    pub fn with_heartbeat_tx(mut self, tx: mpsc::Sender<MeetingHeartbeatRequest>) -> Self {
+        self.heartbeat_tx = Some(tx);
+        self
     }
 
     /// Answer `NotifyParticipantConnected` from `replies` instead of the
@@ -142,7 +156,7 @@ impl MockMcServer {
 
     fn should_fail(&self) -> Option<Status> {
         match self.behavior {
-            MockBehavior::Accept => None,
+            MockBehavior::Accept | MockBehavior::FailDisconnects => None,
             MockBehavior::FailThenAccept { fail_count } => {
                 if self.total_calls() <= fail_count {
                     Some(Status::unavailable("MC temporarily unavailable"))
@@ -213,6 +227,9 @@ impl MediaCoordinationService for MockMcServer {
             let _ = tx.send(traceparent).await;
         }
 
+        if matches!(self.behavior, MockBehavior::FailDisconnects) {
+            return Err(Status::unavailable("MC temporarily unavailable"));
+        }
         if let Some(status) = self.should_fail() {
             return Err(status);
         }
@@ -222,14 +239,21 @@ impl MediaCoordinationService for MockMcServer {
         }))
     }
 
-    /// Not served by this mock (MH sends no heartbeat until MH-2). Tonic server
-    /// traits have no default methods, so the rpc needs an impl; UNIMPLEMENTED
-    /// is the honest pre-MH-2 answer (`internal.proto` ORDERING note).
+    /// OWNED, capturing the request, when built [`MockMcServer::with_heartbeat_tx`];
+    /// otherwise UNIMPLEMENTED (an MC predating the rpc: MH counts `error`
+    /// and takes no action).
     async fn meeting_heartbeat(
         &self,
-        _request: Request<MeetingHeartbeatRequest>,
+        request: Request<MeetingHeartbeatRequest>,
     ) -> Result<Response<MeetingHeartbeatResponse>, Status> {
-        Err(Status::unimplemented("MeetingHeartbeat is not mocked"))
+        let Some(tx) = &self.heartbeat_tx else {
+            return Err(Status::unimplemented("MeetingHeartbeat is not mocked"));
+        };
+        let _ = tx.send(request.into_inner()).await;
+        Ok(Response::new(MeetingHeartbeatResponse {
+            verdict: HeartbeatVerdict::Owned as i32,
+            cause: 0,
+        }))
     }
 }
 
@@ -240,6 +264,8 @@ impl MediaCoordinationService for MockMcServer {
 /// even if an assertion fires early.
 pub struct MockMcHandle {
     pub addr: SocketAddr,
+    /// TCP connections the server accepted (channel-reuse assertions).
+    pub accepts: Arc<AtomicU32>,
     cancel: CancellationToken,
     handle: Option<JoinHandle<()>>,
 }
@@ -275,7 +301,15 @@ pub async fn start_mock_mc_server(mock_mc: MockMcServer) -> MockMcHandle {
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
 
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let accepts = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&accepts);
+    let incoming = tokio_stream::StreamExt::map(
+        tokio_stream::wrappers::TcpListenerStream::new(listener),
+        move |conn| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            conn
+        },
+    );
 
     let server = Server::builder()
         .add_service(MediaCoordinationServiceServer::new(mock_mc))
@@ -292,6 +326,7 @@ pub async fn start_mock_mc_server(mock_mc: MockMcServer) -> MockMcHandle {
 
     MockMcHandle {
         addr,
+        accepts,
         cancel,
         handle: Some(handle),
     }

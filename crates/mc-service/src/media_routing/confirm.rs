@@ -342,7 +342,6 @@ mod tests {
             accepted: true,
             applied_generation,
             handler_id: handler_id.to_string(),
-            process_start_epoch_ms: 0,
             applied_source_streams,
         }
     }

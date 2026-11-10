@@ -1172,6 +1172,39 @@ pub async fn poll_until_pinned_instance(
     }
 }
 
+/// THE env-test derivation of the MH -> MC heartbeat interval MC sends in
+/// `RegisterMeetingRequest.heartbeat_interval_ms`: N/3 from MC's own published
+/// N (`mc_media_handler_heartbeat_deadline_seconds`), read per live MC pod
+/// ([`gauge_by_pods`]), never a literal or a config file. The `/3` restates
+/// MC's one rule (`crates/mc-service/src/config.rs`, `HeartbeatTiming`:
+/// floor(N/3), minimum 1 ms); env-tests cannot import mc-service (ADR-0028).
+///
+/// # Panics
+/// PRECONDITION if no MC pod serves or the gauge is absent or not positive.
+pub async fn mc_heartbeat_interval(prom: &PrometheusClient) -> Duration {
+    let (_, mc_pods) = crate::fixtures::kube::settled_serving_pods(
+        "app=mc-service",
+        Duration::from_secs(60),
+        "mc-pods-unserving",
+    )
+    .await;
+    let n_seconds = gauge_by_pods(
+        prom,
+        "mc_media_handler_heartbeat_deadline_seconds",
+        &mc_pods,
+        PINNED_METRIC_BOUND,
+    )
+    .await
+    .into_values()
+    .fold(0.0_f64, f64::max);
+    assert!(
+        n_seconds > 0.0,
+        "PRECONDITION: MC publishes mc_media_handler_heartbeat_deadline_seconds > 0 (got {n_seconds})"
+    );
+    let n_ms = (n_seconds * 1000.0).round();
+    Duration::from_millis(((n_ms / 3.0).floor()).max(1.0) as u64)
+}
+
 /// Failure bound for a settled per-pod baseline ([`settled_baseline`]): two
 /// reads a scrape apart agreeing. A PRECONDITION bound, never a pass
 /// condition; under cluster load the notification and push chains converge in

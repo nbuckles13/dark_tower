@@ -44,17 +44,28 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 
 pub mod admission;
+pub mod heartbeat;
+pub mod release;
 
 use crate::media::downlink::DownlinkSender;
 use crate::media::edge_runtime::EdgeContext;
 use crate::media::forward::EgressQueue;
 use crate::observability::metrics::{
-    resolve_session_handles, MeetingTeardownOutcome, SessionMetricHandles, StreamAdmissionOutcome,
+    self as mh_metrics, resolve_session_handles, McHeartbeatOutcome, McHeartbeatVerdict,
+    MeetingTeardownOutcome, ReleaseClients, SessionMetricHandles, StreamAdmissionOutcome,
 };
-use crate::routing::{MeetingKey, MeetingPolicy, RoutingSnapshot, RoutingTable, SenderId};
+use crate::routing::{
+    apply_refusal_of, ApplyAttempt, MeetingKey, MeetingPolicy, PolicyRejection, RoutingSnapshot,
+    RoutingTable, SenderId,
+};
 pub use admission::StreamAdmission;
 use admission::{AdmissionWindow, ThresholdCrossing, ThresholdLatch, ADMISSION_WINDOW_BUCKET};
 use arc_swap::ArcSwap;
+use heartbeat::{
+    HeartbeatSchedule, HeartbeatSetup, OutboundBeat, SenderCommand, MAX_BEATS_PER_WAKE,
+};
+use proto_gen::dark_tower::internal::v1::{MeetingHeartbeatRequest, ServingState};
+use release::ReleaseKind;
 
 /// Channel buffer size for the session manager actor mailbox.
 ///
@@ -66,12 +77,11 @@ pub(crate) const SESSION_CHANNEL_BUFFER: usize = 256;
 ///
 /// Deliberately NOT shared with [`SESSION_CHANNEL_BUFFER`], which was
 /// calibrated for one-shot-per-meeting registration. This mailbox carries a
-/// different workload: one full-policy snapshot per meeting per re-assert
-/// cadence tick, where §8 bounds the cadence at <=10 s. At that rate the
-/// steady-state depth is one message per meeting per tick against a drain that
-/// is a `HashMap` rebuild, so this is sized to absorb a synchronised burst —
-/// every meeting re-asserting on one tick, the shape §8's dispatch jitter
-/// exists to spread — rather than to buffer sustained overload.
+/// different workload: one full-policy snapshot per meeting per assignment
+/// change (ADR-0039 §1 dropped the periodic re-assert cadence), against a
+/// drain that is a `HashMap` rebuild, so this is sized to absorb a
+/// synchronised burst — a migration registering many meetings at once —
+/// rather than to buffer sustained overload.
 ///
 /// Bounded on purpose. Unbounded would trade a visible `apply_failed` for
 /// invisible memory growth, and the whole point of the §8 acknowledgement is
@@ -87,8 +97,13 @@ pub(crate) const CONFIG_APPLY_CHANNEL_BUFFER: usize = 64;
 pub struct MeetingRegistration {
     /// MC instance ID that registered this meeting.
     pub mc_id: String,
-    /// MC gRPC endpoint for callbacks (`NotifyParticipant*`).
+    /// MC gRPC endpoint for callbacks (`NotifyParticipant*`) and this
+    /// meeting's heartbeats.
     pub mc_grpc_endpoint: String,
+    /// This meeting's heartbeat interval, from
+    /// `RegisterMeetingRequest.heartbeat_interval_ms` (never zero: a record
+    /// reject). MH has no cadence config of its own.
+    pub heartbeat_interval: Duration,
     /// When the meeting was registered.
     pub registered_at: Instant,
 }
@@ -121,11 +136,13 @@ pub struct PendingConnection {
     /// When the connection was established.
     pub connected_at: Instant,
     /// Carried into the [`ConnectionEntry`] this becomes on promotion, so a
-    /// promoted connection is closable by release like any other. Release
-    /// itself never fires it while the connection is still PENDING: pending
-    /// connections are left to the registration timeout (`internal.proto`,
-    /// `EndMeetingRequest`) because one may be a re-join racing the teardown,
-    /// and the next registration rescues it.
+    /// promoted connection is closable by release like any other. While the
+    /// connection is still PENDING, release fires it only for a cause under
+    /// which the handler is LEAVING the meeting ([`ReleaseKind::closes_pending`]:
+    /// the connection is then closed with `HANDLER_RELEASED`). On
+    /// `MEETING_ENDED` it is left to the registration timeout
+    /// (`internal.proto`, `EndMeetingRequest`) because one may be a re-join
+    /// racing the teardown, and the next registration rescues it.
     pub close: CancellationToken,
 }
 
@@ -212,6 +229,9 @@ enum SessionMessage {
     RegisterMeeting {
         meeting_id: String,
         registration: MeetingRegistration,
+        /// The policy's validation reject, if any: the RECORD is upserted
+        /// regardless, and this becomes the meeting's `apply_refusal`.
+        policy_rejection: Option<PolicyRejection>,
         max_registered_meetings: usize,
         respond_to: oneshot::Sender<Result<Vec<PendingConnection>, RegisterRefusal>>,
     },
@@ -221,7 +241,16 @@ enum SessionMessage {
     EndMeeting {
         meeting_id: String,
         mc_id: String,
+        kind: ReleaseKind,
         respond_to: oneshot::Sender<MeetingTeardownOutcome>,
+    },
+    /// MC answered one of this meeting's heartbeats RELEASED (ADR-0039 §6),
+    /// relayed by the sender task. The ids are the BEAT's, never the
+    /// response's; `fence` is the registration the beat was built for.
+    HeartbeatReleased {
+        meeting_id: String,
+        fence: u64,
+        cause: i32,
     },
     /// Check if a meeting is registered.
     IsMeetingRegistered {
@@ -369,6 +398,21 @@ pub struct SessionManagerActor {
     /// Admission, occupancy and teardown handles, resolved once at
     /// construction.
     metrics: SessionMetricHandles,
+    /// The per-meeting MH -> MC heartbeat (story 4 MH-2). `None` only for
+    /// test actors built without a sink: then no beat is ever built.
+    heartbeat: Option<HeartbeatRuntime>,
+}
+
+/// The actor's heartbeat half: the schedule and where beats go.
+#[derive(Debug)]
+struct HeartbeatRuntime {
+    handler_id: String,
+    commands: mpsc::Sender<SenderCommand>,
+    schedule: HeartbeatSchedule,
+    /// Consecutive `dropped_queue_full` beats, for transition-only logging.
+    queue_full_streak: u64,
+    /// The sender task's queue was found closed (logged once, loudly).
+    sender_gone_logged: bool,
 }
 
 impl SessionManagerActor {
@@ -377,6 +421,7 @@ impl SessionManagerActor {
         config_receiver: mpsc::Receiver<ConfigApplyMessage>,
         routing: Arc<RoutingTable>,
         admission: StreamAdmission,
+        heartbeat: Option<HeartbeatSetup>,
     ) -> Self {
         let metrics = resolve_session_handles();
         // Both gauges exist from construction — never lazily on first
@@ -389,6 +434,7 @@ impl SessionManagerActor {
         // The state is empty at construction; published anyway so the series
         // is present-at-0 from boot rather than appearing on first register.
         metrics.publish_registered_meetings(0);
+        metrics.publish_meetings_without_clients(0);
         Self {
             receiver,
             config_receiver,
@@ -398,6 +444,13 @@ impl SessionManagerActor {
             admission_window: AdmissionWindow::new(),
             threshold_latch: ThresholdLatch::default(),
             metrics,
+            heartbeat: heartbeat.map(|setup| HeartbeatRuntime {
+                handler_id: setup.handler_id,
+                commands: setup.commands,
+                schedule: HeartbeatSchedule::new(setup.rng),
+                queue_full_streak: 0,
+                sender_gone_logged: false,
+            }),
         }
     }
 
@@ -427,6 +480,13 @@ impl SessionManagerActor {
         // catching up is cheap (`rotate` clears one small struct; the latch is
         // edge-triggered, so a burst logs at most one line).
         while lifecycle_open || config_open {
+            // The heartbeat arm's deadline: the earliest per-meeting due
+            // instant. Disabled (never polled) when nothing is scheduled or
+            // there is no sink, so an empty schedule is not a busy loop.
+            let next_beat = self
+                .heartbeat
+                .as_ref()
+                .and_then(|hb| hb.schedule.earliest());
             tokio::select! {
                 msg = self.receiver.recv(), if lifecycle_open => match msg {
                     Some(msg) => self.handle_message(msg),
@@ -442,6 +502,10 @@ impl SessionManagerActor {
                     // The pending-edge gauges (story 3 R-4): tick-sampled
                     // here, the single writer, never per frame.
                     self.routing.publish_pending(tokio::time::Instant::now());
+                    self.publish_meetings_without_clients();
+                }
+                () = sleep_until_or_never(next_beat), if next_beat.is_some() => {
+                    self.emit_due_beats(tokio::time::Instant::now());
                 }
             }
         }
@@ -468,9 +532,9 @@ impl SessionManagerActor {
     ///
     /// **The equal case performs no swap.** §8 derives the generation from the
     /// assignment computation's *output change*, so unchanged policy carries the
-    /// same number and MH no-ops. Without that, an identical re-assert every
-    /// cadence tick would churn the snapshot — periodic media glitches wearing a
-    /// configuration disguise.
+    /// same number and MH no-ops. Without that, every identical re-send (a
+    /// retried push, MC re-publishing to a lagging handler) would churn the
+    /// snapshot — media glitches wearing a configuration disguise.
     fn handle_config_apply(&mut self, msg: ConfigApplyMessage) {
         let ConfigApplyMessage::ApplyPolicy {
             policy,
@@ -505,7 +569,7 @@ impl SessionManagerActor {
             // enforce that on MC, so a divergence is worth a loud line. The
             // no-op stands either way: honouring the generation is what makes
             // the steady state silent, and applying here would churn the data
-            // plane at exactly the cadence interval.
+            // plane on every identical re-send.
             //
             // Counts only. Logging WHICH edges differ would put sender ids,
             // slot ids and egress stream ids in the log — the per-stream
@@ -657,6 +721,14 @@ impl SessionManagerActor {
             ApplyOutcome::Applied
         };
 
+        // The heartbeat's `apply_refusal` reflects this, the latest apply
+        // attempt (ADR-0039 §1), through the one projection.
+        if let Some(hb) = self.heartbeat.as_mut() {
+            hb.schedule.apply_refusal_effect(
+                policy.meeting.as_str(),
+                apply_refusal_of(ApplyAttempt::Decided(outcome)),
+            );
+        }
         let _ = respond_to.send(outcome);
     }
 
@@ -695,10 +767,9 @@ impl SessionManagerActor {
     /// waits one further attempt window on a quiesce timeout before sending
     /// `EndMeeting`). That ordering relies on tonic cancelling this handler's
     /// server task when the client drops the request, a foreign property with
-    /// no in-tree control. So Race B is ORDERED, not closed. Nor does this reach
-    /// story 4's periodic re-assert, which is a fresh registration:
-    /// `docs/TODO.md` "`EndMeeting` has no fence against a late
-    /// `RegisterMeeting`".
+    /// no in-tree control. So Race B is ORDERED, not closed; a late registration
+    /// that does land is fenced by MC's RELEASED answer to its first heartbeat
+    /// (ADR-0039 §6; there is no periodic re-assert any more).
     ///
     /// # Observability
     ///
@@ -803,26 +874,37 @@ impl SessionManagerActor {
             SessionMessage::RegisterMeeting {
                 meeting_id,
                 registration,
+                policy_rejection,
                 max_registered_meetings,
                 respond_to,
             } => {
                 // Every gauge publish happens INSIDE the handler, i.e. before
                 // this send. A caller reading the gauge after the reply must see
                 // the moved value; do not move a publish after the send.
-                let result =
-                    self.handle_register_meeting(meeting_id, registration, max_registered_meetings);
+                let result = self.handle_register_meeting(
+                    meeting_id,
+                    registration,
+                    policy_rejection,
+                    max_registered_meetings,
+                );
                 let _ = respond_to.send(result);
             }
             SessionMessage::EndMeeting {
                 meeting_id,
                 mc_id,
+                kind,
                 respond_to,
             } => {
                 // Same ordering rule: the release republishes the gauges before
                 // this reply is sent.
-                let outcome = self.handle_end_meeting(&meeting_id, &mc_id);
+                let outcome = self.handle_end_meeting(&meeting_id, &mc_id, kind);
                 let _ = respond_to.send(outcome);
             }
+            SessionMessage::HeartbeatReleased {
+                meeting_id,
+                fence,
+                cause,
+            } => self.handle_heartbeat_released(&meeting_id, fence, cause),
             SessionMessage::IsMeetingRegistered {
                 meeting_id,
                 respond_to,
@@ -894,6 +976,7 @@ impl SessionManagerActor {
         &mut self,
         meeting_id: String,
         registration: MeetingRegistration,
+        policy_rejection: Option<PolicyRejection>,
         max_registered_meetings: usize,
     ) -> Result<Vec<PendingConnection>, RegisterRefusal> {
         // An ordinary re-assert and a change of OWNING MC are the same insert,
@@ -965,9 +1048,16 @@ impl SessionManagerActor {
             None => {}
         }
 
-        self.state
+        // The heartbeat schedule starts HERE, at the record upsert — not at
+        // the first successful apply (ADR-0039 §1).
+        self.schedule_heartbeats(&meeting_id, &registration, policy_rejection);
+        let previous = self
+            .state
             .registered_meetings
             .insert(meeting_id.clone(), registration);
+        if let Some(previous) = previous {
+            self.evict_endpoint_if_unreferenced(previous.mc_grpc_endpoint);
+        }
         self.metrics
             .publish_registered_meetings(self.state.registered_meetings.len());
 
@@ -1010,10 +1100,13 @@ impl SessionManagerActor {
         Ok(pending)
     }
 
-    /// Release a meeting (story 2 R-20; semantics normative on
+    /// Release a meeting (story 2 R-20; story 4 MH-2; semantics normative on
     /// `EndMeetingRequest` in `proto/dark_tower/internal/v1/internal.proto`).
     ///
-    /// Unconditional BY MEETING ID, with no generation, by contract.
+    /// THE one release path: `EndMeeting(cause)` and a RELEASED heartbeat
+    /// verdict both land here (the verdict with the REGISTERED `mc_id`, so the
+    /// ownership check below holds trivially and is kept). Unconditional BY
+    /// MEETING ID, with no generation, by contract.
     ///
     /// STORY-2 ASSUMPTION this rests on: MC stops every `RegisterMeeting` push
     /// for the meeting before calling `EndMeeting` (the quiesce rule stated on
@@ -1027,16 +1120,20 @@ impl SessionManagerActor {
     /// here: a registration whose upsert lands AFTER this release
     /// re-registers the meeting, and its apply is then indistinguishable from
     /// a live meeting's. MC orders that one (its teardown waits one further
-    /// attempt window on a quiesce timeout), relying on tonic cancelling the
-    /// handler's server task on client drop. That is a foreign property with
-    /// no in-tree control, so it is ordered, not closed.
+    /// attempt window on a quiesce timeout); and a late registration MC has
+    /// released is answered RELEASED by the next heartbeat (ADR-0039 §6).
     ///
-    /// STORY-4 NOTE: once the periodic §8 re-assert exists, a re-assert racing
-    /// this release RESURRECTS the ended meeting's routes and edge budget on a
-    /// timer. That needs a fence (a teardown tombstone here, or MC-side
-    /// cancellation that happens-before the call) — `docs/TODO.md`
-    /// "`EndMeeting` has no fence against a late `RegisterMeeting`".
-    fn handle_end_meeting(&mut self, meeting_id: &str, mc_id: &str) -> MeetingTeardownOutcome {
+    /// `kind` decides two things only — never WHETHER to release: where the
+    /// release is counted (one home per event: a removal on
+    /// `mh_media_handler_releases_total`, everything else on the teardown
+    /// series), and whether connections still awaiting their bind are closed
+    /// ([`ReleaseKind::closes_pending`]).
+    fn handle_end_meeting(
+        &mut self,
+        meeting_id: &str,
+        mc_id: &str,
+        kind: ReleaseKind,
+    ) -> MeetingTeardownOutcome {
         let Some(registered) = self.state.registered_meetings.get(meeting_id) else {
             // Nothing held. Routes cannot exist without a registration — every
             // apply follows its registration's upsert, and release removes both.
@@ -1077,25 +1174,19 @@ impl SessionManagerActor {
             return MeetingTeardownOutcome::RejectedOwnership;
         }
 
-        self.state.registered_meetings.remove(meeting_id);
+        // Read BEFORE the connections go: `clients` describes the meeting at
+        // release, from the same predicate as `mh_media_meetings_without_clients`.
+        let clients = ReleaseClients::from_present(self.has_clients(meeting_id));
+        let Some(registration) = self.state.registered_meetings.remove(meeting_id) else {
+            return MeetingTeardownOutcome::UnknownMeeting;
+        };
         let meeting = MeetingKey::new(meeting_id);
         // Removing the routes entry is also what FORGETS the applied
         // generation, so a same-id re-create installs fresh from generation 1.
         let routes_removed = self.routing.remove(&meeting);
-
-        // Close every ACTIVE connection. Pending ones are left alone (see
-        // `PendingConnection::close`), and so is this meeting's notifier while
-        // any pending connection still waits on it.
-        let mut closed_connections = 0_usize;
-        if let Some(meeting_conns) = self.state.active_connections.remove(meeting_id) {
-            for entry in meeting_conns.values().flatten() {
-                entry.close.cancel();
-                closed_connections += 1;
-            }
-        }
-        if !self.state.pending_connections.contains_key(meeting_id) {
-            self.state.meeting_notifiers.remove(meeting_id);
-        }
+        let closed_connections = self.close_active_connections(meeting_id);
+        let closed_pending = self.release_pending_connections(meeting_id, kind);
+        self.unschedule_heartbeats(meeting_id, registration.mc_grpc_endpoint);
 
         let snapshot = self.routing.load();
         self.metrics.publish_egress_edges(snapshot.total_edges());
@@ -1103,21 +1194,293 @@ impl SessionManagerActor {
             .publish_stream_sources_declared(self.routing.stream_sources_declared());
         self.metrics
             .publish_registered_meetings(self.state.registered_meetings.len());
-        self.metrics
-            .record_teardown(MeetingTeardownOutcome::Released);
+        match kind {
+            ReleaseKind::Removal(trigger) => self.metrics.record_handler_release(trigger, clients),
+            ReleaseKind::MeetingEnded | ReleaseKind::NoCause => self
+                .metrics
+                .record_teardown(MeetingTeardownOutcome::Released),
+        }
 
         tracing::info!(
             target: "mh.session",
             key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
             meeting_id = %meeting_id,
             mc_id = %mc_id,
+            release_kind = ?kind,
+            clients = clients.as_label(),
             routes_removed,
             closed_connections,
+            closed_pending,
             installed_total_streams = snapshot.total_edges(),
             registered_meetings = self.state.registered_meetings.len(),
-            "Meeting released by EndMeeting"
+            "Meeting released"
         );
         MeetingTeardownOutcome::Released
+    }
+
+    /// Close every ACTIVE connection of a released meeting. Each closes with
+    /// `HANDLER_RELEASED` and sends no `NotifyParticipantDisconnected`
+    /// (`webtransport::connection`'s `ConnectionEnd::MeetingReleased`).
+    fn close_active_connections(&mut self, meeting_id: &str) -> usize {
+        let mut closed = 0_usize;
+        if let Some(meeting_conns) = self.state.active_connections.remove(meeting_id) {
+            for entry in meeting_conns.values().flatten() {
+                entry.close.cancel();
+                closed += 1;
+            }
+        }
+        closed
+    }
+
+    /// The fate of connections still awaiting their bind (PENDING), by
+    /// cause: closed (`HANDLER_RELEASED`) when the handler is leaving, left
+    /// alone — with the notifier they wait on — when the meeting ended.
+    fn release_pending_connections(&mut self, meeting_id: &str, kind: ReleaseKind) -> usize {
+        let mut closed = 0_usize;
+        if kind.closes_pending() {
+            if let Some(pending) = self.state.pending_connections.remove(meeting_id) {
+                for conn in &pending {
+                    conn.close.cancel();
+                    closed += 1;
+                }
+            }
+        }
+        if !self.state.pending_connections.contains_key(meeting_id) {
+            self.state.meeting_notifiers.remove(meeting_id);
+        }
+        closed
+    }
+
+    /// Whether the meeting has at least one ACTIVE connection: THE "has
+    /// clients" predicate behind both `clients=present|none` at release and
+    /// `mh_media_meetings_without_clients`. A session that has begun its bind
+    /// is active; a pending (pre-registration) one is not.
+    fn has_clients(&self, meeting_id: &str) -> bool {
+        self.state
+            .active_connections
+            .get(meeting_id)
+            .is_some_and(|participants| participants.values().any(|conns| !conns.is_empty()))
+    }
+
+    /// Recompute-and-set `mh_media_meetings_without_clients` (actor tick).
+    fn publish_meetings_without_clients(&self) {
+        let without = self
+            .state
+            .registered_meetings
+            .keys()
+            .filter(|meeting_id| !self.has_clients(meeting_id))
+            .count();
+        self.metrics.publish_meetings_without_clients(without);
+    }
+
+    // -----------------------------------------------------------------------
+    // Heartbeat (story 4 MH-2; ADR-0039 §1, §6)
+    // -----------------------------------------------------------------------
+
+    /// Upsert the meeting's heartbeat schedule at the registration upsert,
+    /// and record a policy validation reject as its `apply_refusal`.
+    fn schedule_heartbeats(
+        &mut self,
+        meeting_id: &str,
+        registration: &MeetingRegistration,
+        policy_rejection: Option<PolicyRejection>,
+    ) {
+        let identity_changed =
+            self.state
+                .registered_meetings
+                .get(meeting_id)
+                .is_some_and(|existing| {
+                    existing.mc_id != registration.mc_id
+                        || existing.mc_grpc_endpoint != registration.mc_grpc_endpoint
+                });
+        let Some(hb) = self.heartbeat.as_mut() else {
+            return;
+        };
+        hb.schedule.upsert(
+            meeting_id,
+            registration.heartbeat_interval,
+            tokio::time::Instant::now(),
+            identity_changed,
+        );
+        if let Some(rejection) = policy_rejection {
+            hb.schedule.apply_refusal_effect(
+                meeting_id,
+                apply_refusal_of(ApplyAttempt::Rejected(rejection)),
+            );
+        }
+    }
+
+    /// Release removes the schedule; tell the sender task to forget the
+    /// meeting and, if nothing references it any more, the endpoint.
+    fn unschedule_heartbeats(&mut self, meeting_id: &str, endpoint: String) {
+        if let Some(hb) = self.heartbeat.as_mut() {
+            hb.schedule.remove(meeting_id);
+            // Best-effort: the sender's caps are the backstop.
+            let _ = hb.commands.try_send(SenderCommand::Forget {
+                meeting_id: meeting_id.to_owned(),
+            });
+        }
+        self.evict_endpoint_if_unreferenced(endpoint);
+    }
+
+    /// Drop the sender's cached channel for `endpoint` once no registration
+    /// references it (a release, or a re-registration to a new endpoint).
+    fn evict_endpoint_if_unreferenced(&self, endpoint: String) {
+        let Some(hb) = self.heartbeat.as_ref() else {
+            return;
+        };
+        let referenced = self
+            .state
+            .registered_meetings
+            .values()
+            .any(|r| r.mc_grpc_endpoint == endpoint);
+        if !referenced {
+            let _ = hb.commands.try_send(SenderCommand::Evict { endpoint });
+        }
+    }
+
+    /// The timer arm: build and hand off up to [`MAX_BEATS_PER_WAKE`] due
+    /// beats. Each is built HERE, from the actor's own state, so a sent beat
+    /// implies a live actor. Never awaits: a full queue drops the beat and
+    /// counts it.
+    fn emit_due_beats(&mut self, now: tokio::time::Instant) {
+        let due = match self.heartbeat.as_mut() {
+            Some(hb) => hb.schedule.take_due(now, MAX_BEATS_PER_WAKE),
+            None => return,
+        };
+        for meeting_id in due {
+            let Some(beat) = self.build_beat(&meeting_id) else {
+                continue;
+            };
+            let Some(hb) = self.heartbeat.as_mut() else {
+                return;
+            };
+            match hb.commands.try_send(SenderCommand::Beat(beat)) {
+                Ok(()) => {
+                    if hb.queue_full_streak > 0 {
+                        tracing::info!(
+                            target: "mh.session.heartbeat",
+                            dropped = hb.queue_full_streak,
+                            "MC heartbeat queue accepting beats again"
+                        );
+                        hb.queue_full_streak = 0;
+                    }
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    mh_metrics::record_mc_heartbeat(McHeartbeatOutcome::DroppedQueueFull);
+                    if hb.queue_full_streak == 0 {
+                        tracing::warn!(
+                            target: "mh.session.heartbeat",
+                            queue_capacity = heartbeat::HEARTBEAT_QUEUE_CAPACITY,
+                            "MC heartbeat queue full; dropping beats (the sender task is not \
+                             keeping up). Logged once per streak"
+                        );
+                    }
+                    hb.queue_full_streak = hb.queue_full_streak.saturating_add(1);
+                }
+                // The sender task is gone: shutdown, or it died. Either way NO
+                // meeting is heartbeating any more, which a live MC will read
+                // as this handler being dead — so never silent. Logged once.
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    if !hb.sender_gone_logged {
+                        hb.sender_gone_logged = true;
+                        tracing::error!(
+                            target: "mh.session.heartbeat",
+                            "MC heartbeat sender is gone; no heartbeats will be sent for any \
+                             meeting (expected only during shutdown)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// One meeting's beat, from the actor's state (`MeetingHeartbeatRequest`):
+    /// the REGISTERED `mc_id`; `applied_generation` read from the live routing
+    /// snapshot, never from any received request; the latest deterministic
+    /// `apply_refusal`; and THIS meeting's begun-not-Disconnected connection
+    /// set (`active_connections` gains an entry before
+    /// `NotifyParticipantConnected` begins and loses it before
+    /// `NotifyParticipantDisconnected` is sent).
+    fn build_beat(&self, meeting_id: &str) -> Option<OutboundBeat> {
+        let hb = self.heartbeat.as_ref()?;
+        let registration = self.state.registered_meetings.get(meeting_id)?;
+        let fence = hb.schedule.fence_of(meeting_id)?;
+        let connection_ids = self
+            .state
+            .active_connections
+            .get(meeting_id)
+            .map(|participants| {
+                participants
+                    .values()
+                    .flatten()
+                    .map(|c| c.connection_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(OutboundBeat {
+            request: MeetingHeartbeatRequest {
+                meeting_id: meeting_id.to_owned(),
+                mc_id: registration.mc_id.clone(),
+                handler_id: hb.handler_id.clone(),
+                // DRAINING (with `drain_remaining_ms`) is MH-3's.
+                serving_state: ServingState::Serving as i32,
+                drain_remaining_ms: 0,
+                applied_generation: self
+                    .routing
+                    .load()
+                    .generation_for(&MeetingKey::new(meeting_id)),
+                apply_refusal: hb.schedule.refusal_of(meeting_id) as i32,
+                connection_ids,
+            },
+            endpoint: registration.mc_grpc_endpoint.clone(),
+            fence,
+            interval: registration.heartbeat_interval,
+        })
+    }
+
+    /// A RELEASED verdict (ADR-0039 §6): end the meeting through THE release
+    /// path with the REGISTERED `mc_id` — but only if the beat was built for
+    /// the registration that still holds it. A verdict whose fence no longer
+    /// matches (released since, or re-registered to a different MC or
+    /// endpoint while the beat was in flight) is dropped and counted: it must
+    /// never end the newer registration.
+    fn handle_heartbeat_released(&mut self, meeting_id: &str, fence: u64, cause: i32) {
+        let current = self
+            .heartbeat
+            .as_ref()
+            .and_then(|hb| hb.schedule.fence_of(meeting_id));
+        let registered_mc_id = self
+            .state
+            .registered_meetings
+            .get(meeting_id)
+            .map(|r| r.mc_id.clone());
+        let Some(mc_id) = registered_mc_id.filter(|_| current == Some(fence)) else {
+            mh_metrics::record_mc_heartbeat_verdict(McHeartbeatVerdict::ReleasedStale);
+            tracing::info!(
+                target: "mh.session.heartbeat",
+                key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
+                meeting_id = %meeting_id,
+                "RELEASED verdict for a registration that no longer holds this meeting; ignored"
+            );
+            return;
+        };
+        let kind = ReleaseKind::of(cause);
+        mh_metrics::record_mc_heartbeat_verdict(match kind {
+            ReleaseKind::NoCause => McHeartbeatVerdict::Misroute,
+            ReleaseKind::Removal(_) | ReleaseKind::MeetingEnded => McHeartbeatVerdict::Released,
+        });
+        if kind == ReleaseKind::NoCause {
+            tracing::warn!(
+                target: "mh.session.heartbeat",
+                key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
+                meeting_id = %meeting_id,
+                mc_id = %mc_id,
+                "MC answered RELEASED with no cause (misroute: a live meeting whose set never \
+                 held this handler); releasing the meeting"
+            );
+        }
+        self.handle_end_meeting(meeting_id, &mc_id, kind);
     }
 
     fn handle_add_connection(&mut self, meeting_id: String, entry: ConnectionEntry) {
@@ -1209,6 +1572,44 @@ impl SessionManagerActor {
             }
         }
         false
+    }
+}
+
+/// Sleep until `deadline`, or forever when there is none. The heartbeat arm
+/// is also guarded by `if next_beat.is_some()`, so the `None` branch is never
+/// polled; it exists so the arm's future has one type.
+async fn sleep_until_or_never(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Where the heartbeat sender task relays a RELEASED verdict: the actor's
+/// LIFECYCLE mailbox, held WEAKLY so the sender task can never keep the actor
+/// alive (no shutdown cycle: the actor holds the sender's queue, the sender
+/// holds only this).
+#[derive(Debug, Clone)]
+pub struct VerdictSink {
+    sender: mpsc::WeakSender<SessionMessage>,
+}
+
+impl VerdictSink {
+    /// Relay a RELEASED verdict for the beat built for `(meeting_id, fence)`.
+    /// Awaits mailbox space (it runs on the beat's own task, so it delays no
+    /// other meeting). Returns `false` when the actor is gone.
+    pub async fn released(&self, meeting_id: String, fence: u64, cause: i32) -> bool {
+        let Some(sender) = self.sender.upgrade() else {
+            return false;
+        };
+        sender
+            .send(SessionMessage::HeartbeatReleased {
+                meeting_id,
+                fence,
+                cause,
+            })
+            .await
+            .is_ok()
     }
 }
 
@@ -1726,14 +2127,32 @@ impl SessionManagerHandle {
         handle
     }
 
+    /// [`Self::new_with_parts_for_tests`] with a heartbeat sink (story 4
+    /// MH-2): the actor builds beats into `setup.commands`. Not spawned.
+    #[must_use]
+    pub fn new_with_heartbeat_for_tests(
+        admission: StreamAdmission,
+        setup: HeartbeatSetup,
+    ) -> (Self, SessionManagerActor) {
+        Self::new_with_parts_and_table(admission, RoutingTable::unbounded_for_tests(), Some(setup))
+    }
+
     /// [`Self::new_for_tests`] with the PRODUCTION routing table's stream-edge context (story 3
     /// MH-A2): the per-destination backlog cap and the handles downlinks count
     /// through. Production's constructor.
+    ///
+    /// `heartbeat` is the per-meeting MH -> MC heartbeat's sink (story 4
+    /// MH-2); production always passes one.
     #[must_use]
-    pub fn with_edge_context(admission: StreamAdmission, edge_context: EdgeContext) -> Self {
+    pub fn with_edge_context(
+        admission: StreamAdmission,
+        edge_context: EdgeContext,
+        heartbeat: HeartbeatSetup,
+    ) -> Self {
         let (handle, actor) = Self::new_with_parts_and_table(
             admission,
             RoutingTable::with_edge_context(edge_context),
+            Some(heartbeat),
         );
         tokio::spawn(actor.run());
         handle
@@ -1753,18 +2172,24 @@ impl SessionManagerHandle {
     /// reply never arrives because no task holds the sending half.
     #[must_use]
     pub fn new_with_parts_for_tests(admission: StreamAdmission) -> (Self, SessionManagerActor) {
-        Self::new_with_parts_and_table(admission, RoutingTable::unbounded_for_tests())
+        Self::new_with_parts_and_table(admission, RoutingTable::unbounded_for_tests(), None)
     }
 
     fn new_with_parts_and_table(
         admission: StreamAdmission,
         routing: RoutingTable,
+        heartbeat: Option<HeartbeatSetup>,
     ) -> (Self, SessionManagerActor) {
         let (sender, receiver) = mpsc::channel(SESSION_CHANNEL_BUFFER);
         let (config_sender, config_receiver) = mpsc::channel(CONFIG_APPLY_CHANNEL_BUFFER);
         let routing = Arc::new(routing);
-        let actor =
-            SessionManagerActor::new(receiver, config_receiver, Arc::clone(&routing), admission);
+        let actor = SessionManagerActor::new(
+            receiver,
+            config_receiver,
+            Arc::clone(&routing),
+            admission,
+            heartbeat,
+        );
         (
             Self {
                 sender,
@@ -1798,6 +2223,15 @@ impl SessionManagerHandle {
     #[must_use]
     pub fn sender_bindings(&self) -> &Arc<SenderBindings> {
         &self.sender_bindings
+    }
+
+    /// The weak handle the heartbeat sender task relays RELEASED verdicts
+    /// through (see [`VerdictSink`]).
+    #[must_use]
+    pub fn verdict_sink(&self) -> VerdictSink {
+        VerdictSink {
+            sender: self.sender.downgrade(),
+        }
     }
 
     /// Remaining headroom in the **connection-lifecycle** mailbox.
@@ -1936,6 +2370,7 @@ impl SessionManagerHandle {
         &self,
         meeting_id: String,
         registration: MeetingRegistration,
+        policy_rejection: Option<PolicyRejection>,
         max_registered_meetings: usize,
     ) -> Result<Vec<PendingConnection>, RegisterRefusal> {
         let (tx, rx) = oneshot::channel();
@@ -1944,6 +2379,7 @@ impl SessionManagerHandle {
             .send(SessionMessage::RegisterMeeting {
                 meeting_id,
                 registration,
+                policy_rejection,
                 max_registered_meetings,
                 respond_to: tx,
             })
@@ -1975,6 +2411,7 @@ impl SessionManagerHandle {
         &self,
         meeting_id: String,
         mc_id: String,
+        kind: ReleaseKind,
         timeout: Duration,
     ) -> Result<MeetingTeardownOutcome, EndMeetingFailure> {
         let (tx, rx) = oneshot::channel();
@@ -1983,6 +2420,7 @@ impl SessionManagerHandle {
                 .send(SessionMessage::EndMeeting {
                     meeting_id,
                     mc_id,
+                    kind,
                     respond_to: tx,
                 })
                 .await
@@ -2142,6 +2580,7 @@ mod tests {
         MeetingRegistration {
             mc_id: mc_id.to_string(),
             mc_grpc_endpoint: endpoint.to_string(),
+            heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
             registered_at: Instant::now(),
         }
     }
@@ -2174,6 +2613,7 @@ mod tests {
             .register_meeting(
                 "meeting-1".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
+                None,
                 TEST_CAP,
             )
             .await
@@ -2194,6 +2634,7 @@ mod tests {
             .register_meeting(
                 "meeting-1".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
+                None,
                 TEST_CAP,
             )
             .await
@@ -2232,6 +2673,7 @@ mod tests {
             .register_meeting(
                 "meeting-1".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
+                None,
                 TEST_CAP,
             )
             .await
@@ -2259,6 +2701,7 @@ mod tests {
             .register_meeting(
                 "meeting-2".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
+                None,
                 TEST_CAP,
             )
             .await
@@ -2312,6 +2755,7 @@ mod tests {
             .register_meeting(
                 "meeting-1".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
+                None,
                 TEST_CAP,
             )
             .await
@@ -2330,6 +2774,7 @@ mod tests {
             .register_meeting(
                 "meeting-1".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
+                None,
                 TEST_CAP,
             )
             .await
@@ -2645,17 +3090,32 @@ mod tests {
     fn the_cap_refuses_only_a_new_meeting_id() {
         let mut actor = unspawned_actor();
         actor
-            .handle_register_meeting("m-1".into(), make_registration("mc-1", "http://mc"), 1)
+            .handle_register_meeting(
+                "m-1".into(),
+                make_registration("mc-1", "http://mc"),
+                None,
+                1,
+            )
             .unwrap();
 
         // The held meeting re-registers at the cap: admitted.
         assert!(actor
-            .handle_register_meeting("m-1".into(), make_registration("mc-1", "http://mc"), 1)
+            .handle_register_meeting(
+                "m-1".into(),
+                make_registration("mc-1", "http://mc"),
+                None,
+                1
+            )
             .is_ok());
         // A new one: refused, with the counts, and nothing inserted.
         assert_eq!(
             actor
-                .handle_register_meeting("m-2".into(), make_registration("mc-1", "http://mc"), 1)
+                .handle_register_meeting(
+                    "m-2".into(),
+                    make_registration("mc-1", "http://mc"),
+                    None,
+                    1
+                )
                 .unwrap_err(),
             RegisterRefusal::MeetingCapReached { held: 1, cap: 1 }
         );
@@ -2676,6 +3136,7 @@ mod tests {
             .handle_register_meeting(
                 "m-1".into(),
                 make_registration("mc-1", "http://mc"),
+                None,
                 TEST_CAP,
             )
             .unwrap();
@@ -2689,7 +3150,7 @@ mod tests {
         actor.handle_add_pending_connection(late);
 
         assert_eq!(
-            actor.handle_end_meeting("m-1", "mc-1"),
+            actor.handle_end_meeting("m-1", "mc-1", ReleaseKind::MeetingEnded),
             MeetingTeardownOutcome::Released
         );
         assert!(
@@ -2719,6 +3180,7 @@ mod tests {
             .handle_register_meeting(
                 "m-1".into(),
                 make_registration("mc-1", "http://mc"),
+                None,
                 TEST_CAP,
             )
             .unwrap();
@@ -2727,14 +3189,14 @@ mod tests {
         actor.handle_add_connection("m-1".into(), conn);
 
         assert_eq!(
-            actor.handle_end_meeting("m-1", "mc-2"),
+            actor.handle_end_meeting("m-1", "mc-2", ReleaseKind::MeetingEnded),
             MeetingTeardownOutcome::RejectedOwnership
         );
         assert!(actor.state.registered_meetings.contains_key("m-1"));
         assert!(!close.is_cancelled());
 
         assert_eq!(
-            actor.handle_end_meeting("nope", "mc-1"),
+            actor.handle_end_meeting("nope", "mc-1", ReleaseKind::MeetingEnded),
             MeetingTeardownOutcome::UnknownMeeting
         );
     }
@@ -2796,6 +3258,7 @@ mod tests {
             .handle_register_meeting(
                 "m-1".into(),
                 make_registration("mc-1", "http://mc"),
+                None,
                 TEST_CAP,
             )
             .unwrap();
@@ -2814,7 +3277,7 @@ mod tests {
 
         // The release (the registering MC, so it releases).
         assert_eq!(
-            actor.handle_end_meeting("m-1", "mc-1"),
+            actor.handle_end_meeting("m-1", "mc-1", ReleaseKind::MeetingEnded),
             MeetingTeardownOutcome::Released
         );
         let decisions_before = actor.admission_window.decisions();
@@ -2874,6 +3337,7 @@ mod tests {
             .handle_register_meeting(
                 "m-1".into(),
                 make_registration("mc-1", "http://mc"),
+                None,
                 TEST_CAP,
             )
             .unwrap();
@@ -2894,12 +3358,299 @@ mod tests {
             .handle_register_meeting(
                 "m-3".into(),
                 make_registration("mc-1", "http://mc"),
+                None,
                 TEST_CAP,
             )
             .unwrap();
         assert!(
             !actor.state.meeting_notifiers.contains_key("m-3"),
             "promotion empties the pending list, so the notifier goes with it"
+        );
+    }
+
+    // =======================================================================
+    // Story 4 MH-2: the heartbeat as the ACTOR builds it.
+    // Driven on an UNSPAWNED actor: what the actor would put in a beat is read
+    // through `build_beat` / `emit_due_beats` directly, deterministically.
+    // =======================================================================
+
+    fn heartbeat_actor() -> (
+        SessionManagerHandle,
+        SessionManagerActor,
+        mpsc::Receiver<SenderCommand>,
+    ) {
+        use rand::SeedableRng;
+        let (tx, rx) = mpsc::channel(heartbeat::HEARTBEAT_QUEUE_CAPACITY);
+        let (handle, actor) = SessionManagerHandle::new_with_heartbeat_for_tests(
+            test_admission(),
+            HeartbeatSetup {
+                handler_id: "mh-unit".to_string(),
+                commands: tx,
+                rng: rand::rngs::SmallRng::seed_from_u64(1),
+            },
+        );
+        (handle, actor, rx)
+    }
+
+    fn beats(rx: &mut mpsc::Receiver<SenderCommand>) -> Vec<OutboundBeat> {
+        let mut out = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            if let SenderCommand::Beat(beat) = command {
+                out.push(beat);
+            }
+        }
+        out
+    }
+
+    /// A wedged actor sends NO heartbeat: the beat is built inside the actor,
+    /// so an actor that is not running (here: never spawned, with a meeting
+    /// registered) produces nothing however long time runs. Positive arm:
+    /// the same actor, once running, beats.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_actor_sends_no_heartbeat_and_a_running_one_does() {
+        let (_handle, mut actor, mut rx) = heartbeat_actor();
+        actor
+            .handle_register_meeting(
+                "m-1".into(),
+                make_registration("mc-1", "http://mc"),
+                None,
+                TEST_CAP,
+            )
+            .unwrap();
+        tokio::time::advance(mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL * 5).await;
+        assert!(beats(&mut rx).is_empty(), "no live actor, no beat");
+
+        tokio::spawn(actor.run());
+        tokio::time::advance(mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let sent = beats(&mut rx);
+        assert!(!sent.is_empty(), "positive arm: a running actor beats");
+        assert_eq!(sent[0].request.mc_id, "mc-1");
+    }
+
+    /// A full config-apply mailbox is TRANSIENT: the beat keeps reporting the
+    /// installed generation (lag) and NO `apply_refusal`. Positive arm: once
+    /// the queued applies run, the beat reports the advanced generation.
+    #[tokio::test]
+    async fn a_full_config_mailbox_shows_as_lag_never_as_a_refusal() {
+        let (handle, mut actor, _rx) = heartbeat_actor();
+        actor
+            .handle_register_meeting(
+                "m-1".into(),
+                make_registration("mc-1", "http://mc"),
+                None,
+                TEST_CAP,
+            )
+            .unwrap();
+        let (tx, _) = oneshot::channel();
+        actor.handle_config_apply(queued_apply("m-1", 4, tx));
+        assert_eq!(
+            actor.build_beat("m-1").unwrap().request.applied_generation,
+            4
+        );
+
+        // Fill the mailbox: nothing drains it (the actor is not running).
+        let limits = crate::config::PolicyLimits::for_tests();
+        let policy = |g| {
+            MeetingPolicy::from_request(
+                &mh_test_utils::media_policy::register_request(
+                    "m-1",
+                    g,
+                    vec![mh_test_utils::media_policy::egress(1, 5, 0, 6)],
+                ),
+                &limits,
+            )
+            .unwrap()
+        };
+        let mut queued = 0_u64;
+        loop {
+            // A zero reply bound: an apply that was ENQUEUED returns
+            // `Timeout` at once (nothing drains it); the first that does not
+            // fit returns `MailboxFull`. Anything else is a broken rig.
+            let outcome = handle
+                .apply_policy(
+                    policy(5 + queued),
+                    limits.max_total_egress_edges,
+                    Duration::ZERO,
+                )
+                .await;
+            if outcome == ApplyOutcome::Failed(ApplyFailure::MailboxFull) {
+                break;
+            }
+            assert_eq!(
+                outcome,
+                ApplyOutcome::Failed(ApplyFailure::Timeout),
+                "an enqueued apply times out; anything else is a broken rig"
+            );
+            queued += 1;
+            assert!(
+                queued <= CONFIG_APPLY_CHANNEL_BUFFER as u64,
+                "the mailbox must fill"
+            );
+        }
+        let beat = actor.build_beat("m-1").unwrap().request;
+        assert_eq!(beat.applied_generation, 4, "lag: the installed generation");
+        assert_eq!(
+            beat.apply_refusal,
+            proto_gen::dark_tower::internal::v1::ApplyRefusal::Unspecified as i32,
+            "a transient failure is never a refusal"
+        );
+
+        // Drain: the queued applies run, and the beat advances.
+        while let Ok(message) = actor.config_receiver.try_recv() {
+            actor.handle_config_apply(message);
+        }
+        assert_eq!(
+            actor.build_beat("m-1").unwrap().request.applied_generation,
+            4 + queued,
+            "every queued apply ran, in order"
+        );
+    }
+
+    /// The connection set is THIS meeting's begun-not-Disconnected set:
+    /// present for an active connection (including one still awaiting its
+    /// `sender_id`), absent for a pending pre-registration one, absent once
+    /// removed — `connection.rs` removes it BEFORE sending
+    /// `NotifyParticipantDisconnected`, so a disconnect whose notify exhausted
+    /// its retries is already out of the set — and never another meeting's.
+    #[test]
+    fn the_connection_set_is_this_meetings_active_connections_only() {
+        let (_handle, mut actor, _rx) = heartbeat_actor();
+        for m in ["m-1", "m-2"] {
+            actor
+                .handle_register_meeting(
+                    m.into(),
+                    make_registration("mc-1", "http://mc"),
+                    None,
+                    TEST_CAP,
+                )
+                .unwrap();
+        }
+        actor.handle_add_connection("m-1".into(), make_connection("c-active", "u-1"));
+        actor.handle_add_connection("m-1".into(), make_connection("c-leaving", "u-2"));
+        actor.handle_add_connection("m-2".into(), make_connection("c-other", "u-3"));
+        actor.handle_add_pending_connection(make_pending("c-pending", "m-1", "u-4"));
+
+        let mut set = actor.build_beat("m-1").unwrap().request.connection_ids;
+        set.sort();
+        assert_eq!(
+            set,
+            ["c-active", "c-leaving"],
+            "active only, this meeting only"
+        );
+
+        assert!(actor.handle_remove_connection("m-1", "c-leaving"));
+        assert_eq!(
+            actor.build_beat("m-1").unwrap().request.connection_ids,
+            ["c-active"],
+            "a removed connection is gone whatever its Disconnected notify does"
+        );
+        assert_eq!(
+            actor.build_beat("m-2").unwrap().request.connection_ids,
+            ["c-other"]
+        );
+    }
+
+    /// The source-order half of the connection-set rule: EVERY site in
+    /// `connection.rs` that sends `NotifyParticipantDisconnected` first
+    /// removes the connection from the actor (within the same fn), so a
+    /// notify exhausting `MAX_RETRY_ATTEMPTS` can never keep it in a
+    /// heartbeat. The site count is pinned so a new site fails here loudly.
+    #[test]
+    fn every_disconnected_site_removes_the_connection_first() {
+        let source = include_str!("../webtransport/connection.rs");
+        let production = &source[..source.find("#[cfg(test)]").expect("the test module")];
+        let mut sites = 0;
+        for (at, _) in production.match_indices(".notify_participant_disconnected(") {
+            let fn_start = production[..at].rfind("fn ").expect("inside a fn");
+            let body = &production[fn_start..at];
+            assert!(
+                body.contains(".remove_connection(meeting_id, connection_id)"),
+                "a NotifyParticipantDisconnected site whose fn does not remove the connection \
+                 first: {}",
+                &production[fn_start..(fn_start + 80).min(at)]
+            );
+            sites += 1;
+        }
+        assert_eq!(
+            sites, 2,
+            "the Disconnected sites are serve_session and close_declined_connection"
+        );
+    }
+
+    /// `mh_media_meetings_without_clients` exists at 0 from construction,
+    /// before any tick (an absent series must not read as "no zombies").
+    #[test]
+    fn meetings_without_clients_is_published_at_zero_on_construction() {
+        use common::observability::testing::MetricAssertion;
+        let snap = MetricAssertion::snapshot();
+        let _actor = unspawned_actor();
+        snap.gauge("mh_media_meetings_without_clients")
+            .with_labels(&[("key_custody", "operator")])
+            .assert_value(0.0);
+    }
+
+    fn evictions(rx: &mut mpsc::Receiver<SenderCommand>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            if let SenderCommand::Evict { endpoint } = command {
+                out.push(endpoint);
+            }
+        }
+        out
+    }
+
+    /// The sender's channel for an MC endpoint is evicted exactly when NO
+    /// registration references it any more: not while another meeting still
+    /// uses it (distinguishing arm), yes once the last one is released, and
+    /// yes for an endpoint a re-registration moved off.
+    #[test]
+    fn an_endpoint_is_evicted_only_when_no_registration_references_it() {
+        let (_handle, mut actor, mut rx) = heartbeat_actor();
+        for m in ["m-1", "m-2"] {
+            actor
+                .handle_register_meeting(
+                    m.into(),
+                    make_registration("mc-1", "http://e"),
+                    None,
+                    TEST_CAP,
+                )
+                .unwrap();
+        }
+        actor.handle_end_meeting("m-1", "mc-1", ReleaseKind::MeetingEnded);
+        assert!(
+            evictions(&mut rx).is_empty(),
+            "m-2 still references the endpoint"
+        );
+        actor.handle_end_meeting("m-2", "mc-1", ReleaseKind::MeetingEnded);
+        assert_eq!(
+            evictions(&mut rx),
+            ["http://e"],
+            "the last reference is gone"
+        );
+
+        actor
+            .handle_register_meeting(
+                "m-3".into(),
+                make_registration("mc-1", "http://f"),
+                None,
+                TEST_CAP,
+            )
+            .unwrap();
+        actor
+            .handle_register_meeting(
+                "m-3".into(),
+                make_registration("mc-1", "http://g"),
+                None,
+                TEST_CAP,
+            )
+            .unwrap();
+        assert_eq!(
+            evictions(&mut rx),
+            ["http://f"],
+            "moved off by re-registration"
         );
     }
 }

@@ -67,7 +67,7 @@ fn req_with_bearer(token: Option<&str>) -> Request<RegisterMeetingRequest> {
         selection_rules: None,
         policy_generation: 0,
         source_streams: Vec::new(),
-        heartbeat_interval_ms: 0,
+        heartbeat_interval_ms: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL_MS,
         media_dial_public_key: Vec::new(),
     });
     if let Some(t) = token {

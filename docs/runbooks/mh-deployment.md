@@ -324,6 +324,20 @@ sum(rate(mh_mc_notifications_total[5m]))
 # predating the story 2 task 20 image is serving and its sessions never bind.
 sum(rate(mc_mh_notifications_unapplied_total{reason="connection_id_missing"}[5m]))
 
+# MH -> MC per-meeting heartbeat success ratio (story 4 MH-2; target: ~1).
+# A dip is MC unreachable or an MC predating MeetingHeartbeat (UNIMPLEMENTED,
+# counted `error`); MH takes NO action on either.
+sum(rate(mh_mc_heartbeats_total{outcome="success"}[5m]))
+/
+sum(rate(mh_mc_heartbeats_total[5m]))
+
+# Handler removals (story 4 MH-2): flat outside planned transfers.
+sum by (trigger, clients) (increase(mh_media_handler_releases_total[30m]))
+
+# EndMeeting refused for no cause (target: 0). Non-zero = an MC below story 4
+# MC-B1 is in the fleet (§Rollback, MH-2 coupling).
+sum(increase(mh_media_meeting_teardowns_total{outcome="rejected_invalid_cause"}[30m]))
+
 # Media sessions that actually STARTED in the bake window (target: >0 once
 # test traffic flows). THIS IS THE POSITIVE CONTROL FOR THE BINDING CONTRACT
 # AND IT IS THE ONLY GATE IN THIS FILE A VERSION SKEW CAN FAIL.
@@ -378,6 +392,9 @@ clamp_min(sum(increase(mc_participant_mh_status_total{state=~"connected|failed"}
 - [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (MC RegisterMeeting RPC SLO; emitter labels are `success|error`, see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
 - [ ] `mh_mc_notifications_total{status="success"}` rate / total >95% (MH→MC delivery SLO)
 - [ ] `sum(rate(mc_mh_notifications_unapplied_total{reason="connection_id_missing"}[5m])) == 0` — every MH pod sends `connection_id` (story 2 task 20 image or later). Non-zero means an MH predating the field is in the fleet and, since story 4 MC-B1, MC REFUSES its Connecteds (`sender_id` 0): its sessions never bind; see §Rollback "`connection_id` coupling".
+- [ ] `mh_mc_heartbeats_total{outcome="success"}` rate / total ≈ 1 (story 4 MH-2: every held meeting heartbeats its MC). An ABSENT `mh_mc_heartbeats_total` series means the new image is not running (every outcome is present at 0 from boot).
+- [ ] `mh_media_handler_releases_total` flat over 30m outside planned transfers (`trigger="planned_transfer"` is expected during a drain). `trigger="heartbeat_timeout", clients="present"` is a false declaration: MC declared this handler dead while it served people.
+- [ ] `mh_media_meeting_teardowns_total{outcome="rejected_invalid_cause"}` increase over 30m = 0, AND no `reason="zero_heartbeat_interval"` WARN (target `mh.grpc.service`, message "Rejecting registration: heartbeat_interval_ms is 0") while `mh_grpc_requests_total{method="register_meeting",status="error"}` is non-zero. Either one means an MC below story 4 MC-B1 is in the fleet: see §Rollback, MH-2 coupling. The 0-interval refusal has NO dedicated series (the telemetry contract defines none; the generic `register_meeting` error series also carries every other registration error), so the WARN's `reason` field is the discriminator: search the logs for `reason="zero_heartbeat_interval"`.
 - [ ] `mh_media_session_starts_total{outcome="started"}` increase over 30m **> 0** once test traffic is flowing (**the binding contract works end to end on this build**). This is the only gate in this checklist a MC/MH version skew can fail — every other one is green throughout a total media blackout. If it is zero while connections are being accepted, **stop and read the decline-share gate below before proceeding**; do not sign the deploy off on the other nine.
 - [ ] `mh_media_session_starts_total` **decline share < 0.20** over 30m (run the query above). Breach ⇒ break down by `outcome` and follow `mh-incident-response.md` §Scenario 15, which partitions on *which service to open* before the label is read. **`mh_mc_notifications_total{status="success"}` above cannot cover this**: an MC image predating the `sender_id` field answers `acknowledged: true, sender_id: 0`, so delivery succeeds at 100% while every session declines.
 - [ ] `sum(mh_active_connections) > 0` once test traffic is flowing (proof clients are connecting)
@@ -1434,6 +1451,12 @@ the audit.sh/_audit_gate vendored plumbing, the dependabot note;
 `vendor/patches/wtransport/PATCH.md`) can be reverted only TOGETHER WITH or AFTER (1), never
 before it — mh-service calls the patch's API, so reverting the patch alone breaks the next build.
 Images: the patch changes `Cargo.lock`, so ALL FOUR service images rebuild.
+
+**MH-2 heartbeat / `EndMeeting` cause coupling (story 4 MH-2; ADR-0039 §1, §6).** MH now refuses a `RegisterMeeting` whose `heartbeat_interval_ms` is 0 and an `EndMeeting` whose `cause` is `UNSPECIFIED`, and heartbeats every held meeting to its MC. **Roll MC (MC-B1) first, then MH (MH-2); roll back in reverse — MH first.**
+- **Rolling MC back below MC-B1 while MH-2 is live is UNSAFE.** That MC sends `heartbeat_interval_ms` 0, so MH refuses EVERY `RegisterMeeting` it sends (`INVALID_ARGUMENT`): a total media outage for new and re-pushed meetings. Its `EndMeeting` carries no cause and is refused too, so the meetings it ends keep their streams (the ratchet). Its heartbeat answers are `UNIMPLEMENTED`, counted `mh_mc_heartbeats_total{outcome="error"}` with no action. Roll MH back below MH-2 FIRST.
+- **Rolling MH back alone below MH-2 is safe while MC is at MC-B1 and below MC-B2** (verified: MC-B1 never removes a handler on heartbeat silence; only MC-B2's detection does). This MH-only revert is **THE lever for a bad MH-2 deploy** — a jump in `mh_media_handler_releases_total` or in `mh_mc_heartbeat_verdicts_total{outcome="misroute"}` after the roll — because MH-2 has no kill switch. **Once MC-B2 is live, a pre-MH-2 MH sends no heartbeats and is declared dead**: do not roll MH below MH-2 after MC-B2.
+- **Signals**: the 0-interval refusal is `mh_grpc_requests_total{method="register_meeting",status="error"}` plus the WARN with `reason="zero_heartbeat_interval"` (no dedicated series; see the 30-minute check); the cause-less `EndMeeting` is `mh_media_meeting_teardowns_total{outcome="rejected_invalid_cause"}`; an MC predating the heartbeat rpc is `mh_mc_heartbeats_total{outcome="error"}`. After an MH-2 deploy every `mh_mc_heartbeats_total`, `mh_mc_heartbeat_verdicts_total` and `mh_media_handler_releases_total` series is present at 0; ABSENT means the new image is not running.
+- **Safe-revert unit**: the whole MH-2 change — the heartbeat code, the release-cause handling, the `process_start_epoch_ms` proto deletion (wire-safe both ways: MC only logged it), and their series, panels and runbook rows — reverts as one unit.
 
 **`connection_id` coupling (story 2 task 20).** MH now threads its per-session `connection_id` into `NotifyParticipantConnected`/`Disconnected`; MC keys connectivity on it. **Since story 4 MC-B1 this is a HARD ordering:** MC refuses an empty `connection_id`, so rolling MH back below the task-20 image (or an MH pod left on an older image) gets every Connected on that MH **refused** (`sender_id` 0) — its sessions never bind, a total media outage for that handler. With the current fleet every MH sends the field; never roll an MH back below task 20 while an MC-B1 MC is live. Signalled by `mc_mh_notifications_unapplied_total{reason="connection_id_missing"}` rising (see the 30-minute check). The MC-side view of the same coupling is `mc-deployment.md` §Coordination.
 

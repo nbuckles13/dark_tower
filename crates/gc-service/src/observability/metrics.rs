@@ -28,6 +28,7 @@
 //! - MC assignment p95 < 20ms
 //! - DB query p99 < 50ms
 
+use common::observability::labels::RemovalTrigger;
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
@@ -672,9 +673,12 @@ impl ReplacementTrigger {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            ReplacementTrigger::HeartbeatTimeout => "heartbeat_timeout",
-            ReplacementTrigger::ApplyLag => "apply_lag",
-            ReplacementTrigger::PlannedTransfer => "planned_transfer",
+            // The shared removal values have ONE home (`RemovalTrigger`,
+            // telemetry contract: "No service keeps its own list"); only
+            // GC's `invalid` is local.
+            ReplacementTrigger::HeartbeatTimeout => RemovalTrigger::HeartbeatTimeout.label(),
+            ReplacementTrigger::ApplyLag => RemovalTrigger::ApplyLag.label(),
+            ReplacementTrigger::PlannedTransfer => RemovalTrigger::PlannedTransfer.label(),
             ReplacementTrigger::Invalid => "invalid",
         }
     }

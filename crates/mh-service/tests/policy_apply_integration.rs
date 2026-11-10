@@ -95,8 +95,8 @@ fn key_custody_is_present_and_single_valued() {
 
 /// The counter carries no unbounded label.
 ///
-/// ADR-0036 §11 bars generation values (one new series per policy change),
-/// `process_start_epoch_ms` (one per restart) and every stream or meeting
+/// ADR-0036 §11 bars generation values (one new series per policy change)
+/// and every stream or meeting
 /// identity — raw *or hashed* — from metric labels. `RegisterMeetingRequest` is
 /// the obvious new back door for the per-stream identity telemetry that §11
 /// bars, now that `StreamTelemetry` is deleted; generations belong in the log
@@ -144,7 +144,6 @@ mod counting_boundary {
         MhMediaService::new(
             SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding()),
             "mh-boundary-test".to_string(),
-            1_700_000_000_000,
             mh_test_utils::admission::fixture_policy_limits(),
         )
     }

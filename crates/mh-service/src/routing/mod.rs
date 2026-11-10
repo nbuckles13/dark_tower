@@ -77,14 +77,14 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use media_protocol::frame::{KEY_ID_SENDER_ID_BITS, KEY_ID_STREAM_BITS, STREAM_ID_FIELD_BYTES};
-use proto_gen::dark_tower::internal::v1::{RegisterMeetingRequest, SourceStreamEcho};
+use proto_gen::dark_tower::internal::v1::{ApplyRefusal, RegisterMeetingRequest, SourceStreamEcho};
 use proto_gen::dark_tower::signaling::v1::TransportMode;
 
 use crate::config::PolicyLimits;
 use crate::media::edge_runtime::{self, EdgeContext, EdgeRuntime, SourceStatus};
 use crate::media::keyframe::PublisherKeyframesRegistry;
 use crate::observability::metrics::PolicyApplyOutcome;
-use crate::session::LocalSubscribers;
+use crate::session::{ApplyFailure, ApplyOutcome, LocalSubscribers};
 
 mod sources;
 pub use sources::{Declarations, Disposition, SourceDecl};
@@ -523,6 +523,72 @@ impl PolicyRejection {
             | Self::UnspecifiedSourceTransport
             | Self::UnspecifiedDisposition => PolicyApplyOutcome::RejectedInvalid,
         }
+    }
+}
+
+/// How one policy-apply ATTEMPT ended, as `MeetingHeartbeatRequest.apply_refusal`
+/// sees it (story 4 MH-2; ADR-0039 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyAttempt {
+    /// Refused by validation, before the actor (the registration RECORD was
+    /// still upserted).
+    Rejected(PolicyRejection),
+    /// Decided by the session actor.
+    Decided(ApplyOutcome),
+}
+
+/// What an apply attempt does to the meeting's latest `apply_refusal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalEffect {
+    /// A deterministic refusal: report it until the next success.
+    Set(ApplyRefusal),
+    /// Success: the refusal clears.
+    Clear,
+    /// Not a deterministic refusal and not a success (stale, generation 0,
+    /// transient): unchanged. Transient failures surface as
+    /// `applied_generation` lag, never as a refusal.
+    Unchanged,
+}
+
+/// THE projection of MH's apply outcomes onto `ApplyRefusal` — the "one code
+/// home" `internal.proto` names at `ApplyRefusal`. Exhaustive with no
+/// wildcard at every level, so a new refusal variant is a compile error here.
+///
+/// `INVALID` / `TRANSPORT_INCONSISTENT` come from validation
+/// ([`PolicyRejection::outcome`]), `STREAM_CEILING` from
+/// `ApplyFailure::StreamCeilingExceeded` (`rejected_stream_ceiling`), and
+/// `EDGE_CAP` from `ApplyFailure::EdgeCapExceeded` inside `apply_failed`.
+#[must_use]
+pub const fn apply_refusal_of(attempt: ApplyAttempt) -> RefusalEffect {
+    match attempt {
+        ApplyAttempt::Rejected(rejection) => match rejection.outcome() {
+            PolicyApplyOutcome::RejectedTransportInconsistent => {
+                RefusalEffect::Set(ApplyRefusal::TransportInconsistent)
+            }
+            // A validation rejection is never a success, so every outcome
+            // `PolicyRejection::outcome` cannot produce today fails CLOSED to
+            // INVALID — never Clear, never Unchanged.
+            PolicyApplyOutcome::RejectedInvalid
+            | PolicyApplyOutcome::RejectedStreamCeiling
+            | PolicyApplyOutcome::Applied
+            | PolicyApplyOutcome::RejectedStale
+            | PolicyApplyOutcome::NoGeneration
+            | PolicyApplyOutcome::ApplyFailed
+            | PolicyApplyOutcome::RejectedMeetingCap => RefusalEffect::Set(ApplyRefusal::Invalid),
+        },
+        ApplyAttempt::Decided(outcome) => match outcome {
+            ApplyOutcome::Applied => RefusalEffect::Clear,
+            ApplyOutcome::Failed(ApplyFailure::StreamCeilingExceeded) => {
+                RefusalEffect::Set(ApplyRefusal::StreamCeiling)
+            }
+            ApplyOutcome::Failed(ApplyFailure::EdgeCapExceeded) => {
+                RefusalEffect::Set(ApplyRefusal::EdgeCap)
+            }
+            ApplyOutcome::RejectedStale
+            | ApplyOutcome::Failed(
+                ApplyFailure::MailboxFull | ApplyFailure::Timeout | ApplyFailure::ActorUnavailable,
+            ) => RefusalEffect::Unchanged,
+        },
     }
 }
 

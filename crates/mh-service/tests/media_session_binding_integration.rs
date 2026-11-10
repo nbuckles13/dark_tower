@@ -211,8 +211,10 @@ impl BindingSuite {
                 MeetingRegistration {
                     mc_id: "mc-binding-test".to_string(),
                     mc_grpc_endpoint: format!("http://{}", self.mc.addr),
+                    heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                     registered_at: Instant::now(),
                 },
+                None,
                 mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
             )
             .await
@@ -230,8 +232,10 @@ impl BindingSuite {
                 MeetingRegistration {
                     mc_id: "mc-binding-test".to_string(),
                     mc_grpc_endpoint: "http://127.0.0.1:1".to_string(),
+                    heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                     registered_at: Instant::now(),
                 },
+                None,
                 mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
             )
             .await
@@ -876,8 +880,10 @@ async fn an_undialable_mc_endpoint_declines_on_the_registration_outcome() {
             MeetingRegistration {
                 mc_id: "mc-binding-test".to_string(),
                 mc_grpc_endpoint: String::new(),
+                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
             },
+            None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
         )
         .await

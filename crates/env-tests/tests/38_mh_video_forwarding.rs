@@ -3,7 +3,7 @@
 //!
 //! One meeting of three real participants (A publishes, B and C receive),
 //! each joined through GC -> MC and connected to BOTH of the meeting's MH handlers. The
-//! forwarding policy is INJECTED on every live MH pod through
+//! forwarding policy is INJECTED on every MH pod in the meeting's handler set through
 //! `env_tests::fixtures::injection` acting as MC, at a generation above MC's:
 //! A declares audio (send id 0, DATAGRAM) and video (send id 1,
 //! STREAM_PER_GROUP); B and C declare audio. B and C hold MC's own audio
@@ -275,13 +275,17 @@ async fn test_stream_per_group_video_forwarding() {
     }
     let slot = |i: usize, from: u32| ps[i].slot_for(from, AUDIO);
 
-    let handlers =
-        injectable_handlers(&prom, env_tests::fixtures::metrics::BASELINE_SETTLE_BOUND).await;
+    let handlers = injectable_handlers(
+        &prom,
+        env_tests::fixtures::metrics::BASELINE_SETTLE_BOUND,
+        &ps[0],
+    )
+    .await;
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;
     let cleanup = ReleaseOnDrop::new(token.clone());
     let mut injections = Vec::new();
     for handler in &handlers {
-        injections.push(Injection::open(handler, &token, &cleanup, &ps[0]).await);
+        injections.push(Injection::open(handler, &token, &cleanup, &ps[0], &prom).await);
     }
     assert_mc_programmed_a_carrying_pod(&injections);
 

@@ -18,7 +18,9 @@
 //! code emitted. A docstring that *points at* a binding cannot drift; one that
 //! *restates* an enumeration is a copy.
 
-use common::observability::labels::{KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR};
+use common::observability::labels::{
+    RemovalTrigger, KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR, TRIGGER_LABEL,
+};
 use media_protocol::codec::{RejectReason, ALL_REJECT_REASONS};
 use metrics::{counter, gauge, histogram, Counter, Gauge, Histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -57,6 +59,23 @@ fn configured_prometheus_builder() -> Result<PrometheusBuilder, String> {
             ],
         )
         .map_err(|e| format!("Failed to set GC heartbeat buckets: {e}"))?
+        // MH -> MC per-meeting heartbeat latency (story 4 MH-2). Low end copied
+        // from `mh_gc_heartbeat` (in-cluster gRPC); the top is 10 s, the
+        // largest INTERVAL (the largest per-attempt deadline is 3/4 of it,
+        // 7.5 s).
+        //
+        // ANCHOR (DRY): the top bucket rests on MC's heartbeat interval bound:
+        // interval = N/3 with N = `MC_MH_HEARTBEAT_TIMEOUT_MS` <=
+        // `MAX_MH_HEARTBEAT_TIMEOUT_MS` (30000 ms, crates/mc-service/src/config.rs;
+        // N is published as `mc_media_handler_heartbeat_deadline_seconds`).
+        // Widening MC's range past 30 s needs a wider top bucket here.
+        .set_buckets_for_metric(
+            Matcher::Prefix("mh_mc_heartbeat_latency".to_string()),
+            &[
+                0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000, 10.000,
+            ],
+        )
+        .map_err(|e| format!("Failed to set MC heartbeat buckets: {e}"))?
         // GC registration latency buckets - registration can be slower
         .set_buckets_for_metric(
             Matcher::Prefix("mh_gc_registration".to_string()),
@@ -426,15 +445,28 @@ pub enum MeetingTeardownOutcome {
     /// meeting it does not own (the scope-only authorization model; see
     /// `docs/TODO.md` "MH does not verify meeting ownership").
     RejectedOwnership,
+    /// An `EndMeeting` whose `cause` is `UNSPECIFIED` or a number outside
+    /// `ReleaseCause`: refused `INVALID_ARGUMENT` before any state changed
+    /// (story 4 MH-2; `EndMeetingRequest.cause`).
+    ///
+    /// THE ONE OUTCOME RECORDED AT THE gRPC BOUNDARY, not by the session
+    /// actor: the cause is checked before the request reaches the actor, so
+    /// the actor never decides it. Every other value is the actor's decision.
+    ///
+    /// Non-zero means an MC below story 4 MC-B1 (which sends no cause) is in
+    /// the fleet: see `docs/runbooks/mh-deployment.md` §Rollback, the MH-2
+    /// coupling paragraph.
+    RejectedInvalidCause,
 }
 
 impl MeetingTeardownOutcome {
     /// Every value, in catalog order. The one hand-maintained list — same
     /// reasoning as [`PolicyApplyOutcome::ALL`].
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::Released,
         Self::UnknownMeeting,
         Self::RejectedOwnership,
+        Self::RejectedInvalidCause,
     ];
 
     /// The wire label value.
@@ -444,6 +476,189 @@ impl MeetingTeardownOutcome {
             Self::Released => "released",
             Self::UnknownMeeting => "unknown_meeting",
             Self::RejectedOwnership => "rejected_ownership",
+            Self::RejectedInvalidCause => "rejected_invalid_cause",
+        }
+    }
+}
+
+/// Record a teardown outcome decided OUTSIDE the session actor — only
+/// [`MeetingTeardownOutcome::RejectedInvalidCause`] today (the gRPC boundary's
+/// cause check). The actor records its own decisions through
+/// [`SessionMetricHandles::record_teardown`].
+///
+/// Metric: `mh_media_meeting_teardowns_total`
+/// Labels: `outcome`, `key_custody` (single value `operator`)
+pub fn record_meeting_teardown(outcome: MeetingTeardownOutcome) {
+    counter!(
+        "mh_media_meeting_teardowns_total",
+        "outcome" => outcome.as_label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+// =============================================================================
+// MH -> MC per-meeting heartbeat (story 4 MH-2; ADR-0039 §1, §6, §8)
+// =============================================================================
+
+/// Bounded `outcome` values for `mh_mc_heartbeats_total`: exactly ONE per beat
+/// the session actor built, on every exit of the send path.
+///
+/// Matches the `mh_gc_heartbeats_total` convention (no `key_custody`: not an
+/// `mh_media_*` series). Volume is per meeting per interval; cardinality is
+/// fixed at five.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McHeartbeatOutcome {
+    /// MC answered with a response (whatever the verdict).
+    Success,
+    /// The call completed with a gRPC status (incl. `FAILED_PRECONDITION`,
+    /// `UNIMPLEMENTED`), a transport error, an undialable endpoint, or no
+    /// usable service token (nothing sent: fail closed).
+    Error,
+    /// The per-attempt deadline (below the meeting's interval) expired. Not
+    /// retried: the next tick is the retry.
+    Timeout,
+    /// The meeting's previous beat was still in flight, so this one was not
+    /// sent (at most one outstanding beat per meeting).
+    SkippedInFlight,
+    /// The actor's bounded hand-off queue to the sender task was full, so the
+    /// beat was dropped; the actor never blocks on it.
+    DroppedQueueFull,
+}
+
+impl McHeartbeatOutcome {
+    /// Every value, in catalog order.
+    pub const ALL: [Self; 5] = [
+        Self::Success,
+        Self::Error,
+        Self::Timeout,
+        Self::SkippedInFlight,
+        Self::DroppedQueueFull,
+    ];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Error => "error",
+            Self::Timeout => "timeout",
+            Self::SkippedInFlight => "skipped_in_flight",
+            Self::DroppedQueueFull => "dropped_queue_full",
+        }
+    }
+}
+
+/// Record one heartbeat's outcome.
+///
+/// Metric: `mh_mc_heartbeats_total`
+/// Labels: `outcome` ([`McHeartbeatOutcome`])
+/// Cardinality: 5
+pub fn record_mc_heartbeat(outcome: McHeartbeatOutcome) {
+    counter!("mh_mc_heartbeats_total", "outcome" => outcome.as_label()).increment(1);
+}
+
+/// Record one heartbeat RPC's latency, for a call that completed ON THE WIRE
+/// (`success`, or an `error` carrying a gRPC status). A `timeout`, skip, drop,
+/// or an `error` that sent nothing is never observed.
+///
+/// Metric: `mh_mc_heartbeat_latency_seconds`
+/// Labels: none
+pub fn record_mc_heartbeat_latency(duration: Duration) {
+    histogram!("mh_mc_heartbeat_latency_seconds").record(duration.as_secs_f64());
+}
+
+/// Bounded `outcome` values for `mh_mc_heartbeat_verdicts_total`: what MC's
+/// answer to one beat MEANT, separate from whether the call completed
+/// (`mh_mc_heartbeats_total`). There is no `unknown` value (ADR-0039 R4-4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McHeartbeatVerdict {
+    /// OWNED: this handler is in the meeting's set. Nothing done.
+    Owned,
+    /// RELEASED with a removal trigger or `MEETING_ENDED`, acted on: the
+    /// meeting was released.
+    Released,
+    /// RELEASED for a registration that no longer exists or was re-registered
+    /// (different `mc_id`/endpoint) while the beat was in flight: dropped,
+    /// nothing done. Expected near zero.
+    ReleasedStale,
+    /// RELEASED with cause `UNSPECIFIED` (or an unknown cause number): MC's
+    /// documented misroute. It STILL ends the meeting. Expected zero.
+    Misroute,
+    /// `FAILED_PRECONDITION`: the answering MC is not the meeting's registered
+    /// one. Nothing done (ADR-0039 §6 owner check). Expected zero.
+    OwnerMismatch,
+    /// A response whose verdict is `UNSPECIFIED` or an unknown number:
+    /// malformed. Nothing done, never read as OWNED or RELEASED.
+    UnspecifiedVerdict,
+}
+
+impl McHeartbeatVerdict {
+    /// Every value, in catalog order.
+    pub const ALL: [Self; 6] = [
+        Self::Owned,
+        Self::Released,
+        Self::ReleasedStale,
+        Self::Misroute,
+        Self::OwnerMismatch,
+        Self::UnspecifiedVerdict,
+    ];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Owned => "owned",
+            Self::Released => "released",
+            Self::ReleasedStale => "released_stale",
+            Self::Misroute => "misroute",
+            Self::OwnerMismatch => "owner_mismatch",
+            Self::UnspecifiedVerdict => "unspecified_verdict",
+        }
+    }
+}
+
+/// Record one heartbeat verdict.
+///
+/// Metric: `mh_mc_heartbeat_verdicts_total`
+/// Labels: `outcome` ([`McHeartbeatVerdict`])
+/// Cardinality: 6
+pub fn record_mc_heartbeat_verdict(verdict: McHeartbeatVerdict) {
+    counter!("mh_mc_heartbeat_verdicts_total", "outcome" => verdict.as_label()).increment(1);
+}
+
+/// Bounded `clients` values for `mh_media_handler_releases_total`: whether the
+/// released meeting had at least one active connection at release. Read from
+/// the SAME predicate as `mh_media_meetings_without_clients`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseClients {
+    /// At least one active connection (a session that has begun its bind
+    /// counts).
+    Present,
+    /// No active connection.
+    None,
+}
+
+impl ReleaseClients {
+    /// Every value, in catalog order.
+    pub const ALL: [Self; 2] = [Self::Present, Self::None];
+
+    /// The wire label value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::None => "none",
+        }
+    }
+
+    /// From the one "has clients" predicate.
+    #[must_use]
+    pub const fn from_present(present: bool) -> Self {
+        if present {
+            Self::Present
+        } else {
+            Self::None
         }
     }
 }
@@ -622,7 +837,12 @@ pub struct SessionMetricHandles {
     stream_sources_declared: Gauge,
     registered_meetings: Gauge,
     /// Indexed by [`MeetingTeardownOutcome::ALL`] order.
-    teardowns: [Counter; 3],
+    teardowns: [Counter; 4],
+    /// `mh_media_handler_releases_total`, indexed by
+    /// [`RemovalTrigger::ALL`] x [`ReleaseClients::ALL`] order.
+    releases: [[Counter; 2]; 3],
+    /// `mh_media_meetings_without_clients`.
+    meetings_without_clients: Gauge,
     /// `mh_media_released_meeting_apply_refusals_total`: see
     /// [`SessionMetricHandles::record_released_meeting_apply_refusal`].
     released_meeting_apply_refusals: Counter,
@@ -640,12 +860,49 @@ impl SessionMetricHandles {
 
     /// Count one `EndMeeting` decision.
     pub fn record_teardown(&self, outcome: MeetingTeardownOutcome) {
-        let [released, unknown, rejected] = &self.teardowns;
+        let [released, unknown, rejected, invalid_cause] = &self.teardowns;
         match outcome {
             MeetingTeardownOutcome::Released => released.increment(1),
             MeetingTeardownOutcome::UnknownMeeting => unknown.increment(1),
             MeetingTeardownOutcome::RejectedOwnership => rejected.increment(1),
+            MeetingTeardownOutcome::RejectedInvalidCause => invalid_cause.increment(1),
         }
+    }
+
+    /// Count one handler REMOVAL release (ADR-0039 §8): a removal-cause
+    /// `EndMeeting` or a RELEASED verdict carrying a removal trigger.
+    /// `MEETING_ENDED` (and the misroute) stay on
+    /// `mh_media_meeting_teardowns_total{outcome="released"}`: one home per
+    /// event.
+    ///
+    /// Metric: `mh_media_handler_releases_total`
+    /// Labels: `trigger` ([`RemovalTrigger`]; MH-3 adds the MH-local
+    /// `owner_silence`), `clients` ([`ReleaseClients`]), `key_custody`
+    /// Cardinality: 6. `trigger="heartbeat_timeout", clients="present"` is the
+    /// false-declaration ground truth only MH can see.
+    pub fn record_handler_release(&self, trigger: RemovalTrigger, clients: ReleaseClients) {
+        let [heartbeat_timeout, apply_lag, planned_transfer] = &self.releases;
+        let row = match trigger {
+            RemovalTrigger::HeartbeatTimeout => heartbeat_timeout,
+            RemovalTrigger::ApplyLag => apply_lag,
+            RemovalTrigger::PlannedTransfer => planned_transfer,
+        };
+        let [present, none] = row;
+        match clients {
+            ReleaseClients::Present => present.increment(1),
+            ReleaseClients::None => none.increment(1),
+        }
+    }
+
+    /// Publish registered meetings with zero active connections (the zombie
+    /// and leak arm). ALWAYS recomputed from the actor's state on its tick and
+    /// set, never delta-maintained.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "registered meetings are bounded by MH_MAX_REGISTERED_MEETINGS (<= 2^16)"
+    )]
+    pub fn publish_meetings_without_clients(&self, count: usize) {
+        self.meetings_without_clients.set(count as f64);
     }
 
     /// Count one policy the session actor's released-meeting guard refused:
@@ -675,15 +932,15 @@ impl SessionMetricHandles {
     /// guard doing its job on the proto's deadline race (fate A on
     /// `EndMeetingRequest`). No alert.
     ///
-    /// # This counter can NEVER detect story 4's fence failing
+    /// # This counter can NEVER detect a late registration
     ///
-    /// Its meaning does not change when story 4's re-assert fence lands. A
-    /// fence failure is a periodic re-assert resurrecting a released meeting,
-    /// and a re-assert is a fresh `RegisterMeeting` whose upsert RE-REGISTERS
-    /// the meeting, so the guard passes it by construction and this series
-    /// stays flat (the proto's fate A/C orthogonality). The deadline race it
-    /// does count survives story 4 unchanged. Story 4 must bring its own signal
-    /// for its fence; never alert on this series for that purpose.
+    /// A registration that lands AFTER `EndMeeting` re-registers the meeting,
+    /// so the guard passes it by construction and this series stays flat (the
+    /// proto's fate A/C orthogonality). ADR-0039 dropped the periodic
+    /// re-assert; such a late registration is fenced instead by MC's RELEASED
+    /// answer to its first heartbeat (`mh_mc_heartbeat_verdicts_total`,
+    /// `mh_media_meeting_teardowns_total{outcome="released"}`). Never alert on
+    /// this series for that purpose.
     pub fn record_released_meeting_apply_refusal(&self) {
         self.released_meeting_apply_refusals.increment(1);
     }
@@ -765,6 +1022,20 @@ pub fn resolve_session_handles() -> SessionMetricHandles {
                 KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
             )
         }),
+        releases: RemovalTrigger::ALL.map(|trigger| {
+            ReleaseClients::ALL.map(|clients| {
+                counter!(
+                    "mh_media_handler_releases_total",
+                    TRIGGER_LABEL => trigger.label(),
+                    "clients" => clients.as_label(),
+                    KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+                )
+            })
+        }),
+        meetings_without_clients: gauge!(
+            "mh_media_meetings_without_clients",
+            KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+        ),
         // ANCHOR (DRY): `mh_media_released_meeting_apply_refusals_total` — prose
         // consumers that must hold this exact string, none of them guard-covered
         // (no guard reads metric names out of proto comments, Rust doc-comments,
@@ -2422,6 +2693,21 @@ pub fn zero_initialize_counters() {
     for o in MeetingTeardownOutcome::ALL {
         counter!("mh_media_meeting_teardowns_total", "outcome" => o.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
+    // Handler releases (story 4 MH-2): 3 removal triggers x clients. MH-3's
+    // MH-local `owner_silence` is NOT emitted here until MH-3 lands it.
+    for t in RemovalTrigger::ALL {
+        for c in ReleaseClients::ALL {
+            counter!("mh_media_handler_releases_total", TRIGGER_LABEL => t.label(), "clients" => c.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+        }
+    }
+    // MH -> MC heartbeat outcomes and verdicts: misroute / owner_mismatch /
+    // released_stale are expected zero, so they must be PRESENT at zero.
+    for o in McHeartbeatOutcome::ALL {
+        counter!("mh_mc_heartbeats_total", "outcome" => o.as_label()).increment(0);
+    }
+    for v in McHeartbeatVerdict::ALL {
+        counter!("mh_mc_heartbeat_verdicts_total", "outcome" => v.as_label()).increment(0);
+    }
     // Released-meeting guard: expected-empty and rare, which is exactly why it
     // must be present at zero. Absent must mean "not scraped", never "the guard
     // has not fired".
@@ -2563,6 +2849,30 @@ mod tests {
         present_at_zero(
             r#"mh_media_released_meeting_apply_refusals_total{key_custody="operator"}"#,
         );
+
+        // Story 4 MH-2: heartbeat outcomes, verdicts (misroute / owner_mismatch
+        // / released_stale are expected zero) and the 3 x 2 release series.
+        for o in McHeartbeatOutcome::ALL {
+            present_at_zero(&format!(
+                r#"mh_mc_heartbeats_total{{outcome="{}"}}"#,
+                o.as_label()
+            ));
+        }
+        for v in McHeartbeatVerdict::ALL {
+            present_at_zero(&format!(
+                r#"mh_mc_heartbeat_verdicts_total{{outcome="{}"}}"#,
+                v.as_label()
+            ));
+        }
+        for t in RemovalTrigger::ALL {
+            for c in ReleaseClients::ALL {
+                present_at_zero(&format!(
+                    r#"mh_media_handler_releases_total{{trigger="{}",clients="{}",key_custody="operator"}}"#,
+                    t.label(),
+                    c.as_label()
+                ));
+            }
+        }
 
         // Series-count ceiling (security): a future enum variant can't silently
         // multiply the cross-product unnoticed.
@@ -2721,7 +3031,12 @@ mod tests {
             .collect();
         assert_eq!(
             labels,
-            ["released", "unknown_meeting", "rejected_ownership"]
+            [
+                "released",
+                "unknown_meeting",
+                "rejected_ownership",
+                "rejected_invalid_cause"
+            ]
         );
     }
 

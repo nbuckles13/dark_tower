@@ -114,7 +114,6 @@ pub struct MediaHandlerStub {
     applied_generation: AppliedGenerationBehaviour,
     handler_id: String,
     transport_mode: TransportMode,
-    process_start_epoch_ms: u64,
     /// Every `policy_generation` the stub has been sent, in order.
     received_generations: Arc<Mutex<Vec<u64>>>,
     /// Number of `RegisterMeeting` calls served.
@@ -216,7 +215,6 @@ pub struct MediaHandlerStubBuilder {
     applied_generation: AppliedGenerationBehaviour,
     handler_id: String,
     transport_mode: TransportMode,
-    process_start_epoch_ms: u64,
     register_delay: Duration,
     end_meeting_status: Option<tonic::Code>,
 }
@@ -230,7 +228,6 @@ impl Default for MediaHandlerStubBuilder {
             applied_generation: AppliedGenerationBehaviour::default(),
             handler_id: String::new(),
             transport_mode: TransportMode::Unspecified,
-            process_start_epoch_ms: 0,
             register_delay: Duration::ZERO,
             end_meeting_status: None,
         }
@@ -271,13 +268,6 @@ impl MediaHandlerStubBuilder {
     #[must_use]
     pub fn transport_mode(mut self, transport_mode: TransportMode) -> Self {
         self.transport_mode = transport_mode;
-        self
-    }
-
-    /// Set the process-start epoch the stub reports.
-    #[must_use]
-    pub fn process_start_epoch_ms(mut self, epoch_ms: u64) -> Self {
-        self.process_start_epoch_ms = epoch_ms;
         self
     }
 
@@ -323,7 +313,6 @@ impl MediaHandlerStubBuilder {
             applied_generation: self.applied_generation,
             handler_id: self.handler_id,
             transport_mode: self.transport_mode,
-            process_start_epoch_ms: self.process_start_epoch_ms,
             received_generations: Arc::new(Mutex::new(Vec::new())),
             call_count: Arc::new(AtomicU64::new(0)),
             last_request: Arc::new(Mutex::new(None)),
@@ -357,7 +346,6 @@ impl MediaHandlerStubBuilder {
             applied_generation: self.applied_generation,
             handler_id: self.handler_id,
             transport_mode: self.transport_mode,
-            process_start_epoch_ms: self.process_start_epoch_ms,
             received_generations: Arc::clone(&received_generations),
             call_count: Arc::clone(&call_count),
             last_request: Arc::clone(&last_request),
@@ -476,7 +464,6 @@ impl MediaHandlerService for MediaHandlerStub {
             accepted: self.accept,
             applied_generation,
             handler_id: self.handler_id.clone(),
-            process_start_epoch_ms: self.process_start_epoch_ms,
             // Story 3 per-stream echo, from the APPLIED snapshot.
             applied_source_streams,
         }))

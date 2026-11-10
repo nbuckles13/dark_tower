@@ -70,6 +70,11 @@ enum RegistrationOutcome {
     /// The cancellation token fired (server shutdown). The pending
     /// connection has been removed. Caller should return `Ok(())`.
     Cancelled,
+    /// The meeting was released for a cause under which the handler LEAVES it
+    /// (a removal cause, or a RELEASED verdict's misroute; story 4 MH-2): the
+    /// session actor already removed this pending connection and fired its
+    /// close token. The caller closes it with `HANDLER_RELEASED`.
+    Released,
 }
 
 /// Await one of three outcomes for a provisional WebTransport connection:
@@ -91,6 +96,7 @@ async fn await_meeting_registration(
     notify: &Notify,
     register_meeting_timeout: Duration,
     cancel_token: &CancellationToken,
+    connection_close: &CancellationToken,
 ) -> RegistrationOutcome {
     // LOST-WAKEUP GUARD. `notify_waiters` wakes only `Notified` futures that
     // already exist, and this connection's pending entry was added by an
@@ -136,16 +142,28 @@ async fn await_meeting_registration(
                 .await;
             RegistrationOutcome::Timeout
         }
-        () = cancel_token.cancelled() => {
-            debug!(
-                target: "mh.webtransport.connection",
-                connection_id = %connection_id,
-                "Provisional connection cancelled during shutdown"
-            );
-            session_manager
-                .remove_pending_connection(meeting_id, connection_id)
-                .await;
-            RegistrationOutcome::Cancelled
+        // `connection_close` is a CHILD of the server token, so this arm sees
+        // both server shutdown and a release; the parent tells them apart.
+        () = connection_close.cancelled() => {
+            if cancel_token.is_cancelled() {
+                debug!(
+                    target: "mh.webtransport.connection",
+                    connection_id = %connection_id,
+                    "Provisional connection cancelled during shutdown"
+                );
+                session_manager
+                    .remove_pending_connection(meeting_id, connection_id)
+                    .await;
+                RegistrationOutcome::Cancelled
+            } else {
+                info!(
+                    target: "mh.webtransport.connection",
+                    connection_id = %connection_id,
+                    meeting_id = %meeting_id,
+                    "Closing pending connection: its meeting was released for a removal cause"
+                );
+                RegistrationOutcome::Released
+            }
         }
     }
 }
@@ -481,6 +499,7 @@ async fn serve_session(
             &notify,
             register_meeting_timeout,
             cancel_token,
+            &connection_close,
         )
         .await
         {
@@ -496,6 +515,14 @@ async fn serve_session(
                 // Server shutdown while pending: no code (MH-3's drain shed is
                 // the coded shutdown path).
                 return Ok(SessionEnd::WithoutCode);
+            }
+            RegistrationOutcome::Released => {
+                // The handler left the meeting while this connection awaited
+                // its bind: HANDLER_RELEASED (validated session, so the code is
+                // unlocked), and no MC notification (none was ever begun).
+                return Ok(SessionEnd::Close(
+                    session.closing(ValidatedClose::MeetingReleased),
+                ));
             }
         }
     }
@@ -1592,6 +1619,7 @@ mod tests {
             &notify,
             TEST_TIMEOUT,
             &cancel_token,
+            &cancel_token.child_token(),
         )
         .await;
 
@@ -1624,6 +1652,7 @@ mod tests {
             &notify,
             LONG_TIMEOUT,
             &cancel_token,
+            &cancel_token.child_token(),
         )
         .await;
 
@@ -1632,6 +1661,39 @@ mod tests {
             "expected Cancelled, got {outcome:?}"
         );
         // Cancel arm must not record the timeout counter.
+        snap.counter(METRIC_NAME).assert_unobserved();
+    }
+
+    /// A release for a removal cause fires the connection's OWN close token
+    /// (not the server's): the pending connection ends `Released` (closed with
+    /// `HANDLER_RELEASED` by the caller), never `Cancelled`, and records no
+    /// timeout. Positive twin: the server token firing is `Cancelled`
+    /// (`cancel_arm_does_not_record_metric`).
+    #[tokio::test]
+    async fn a_released_pending_connection_ends_released_not_cancelled() {
+        let snap = MetricAssertion::snapshot();
+        let session_manager =
+            SessionManagerHandle::new_for_tests(crate::session::admission::test_admission());
+        let notify = setup_pending(&session_manager, "meeting-4", "conn-4").await;
+        let cancel_token = CancellationToken::new();
+        let connection_close = cancel_token.child_token();
+        connection_close.cancel();
+
+        let outcome = await_meeting_registration(
+            &session_manager,
+            "meeting-4",
+            "conn-4",
+            &notify,
+            LONG_TIMEOUT,
+            &cancel_token,
+            &connection_close,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, RegistrationOutcome::Released),
+            "expected Released, got {outcome:?}"
+        );
         snap.counter(METRIC_NAME).assert_unobserved();
     }
 
@@ -1658,6 +1720,7 @@ mod tests {
             &notify,
             LONG_TIMEOUT,
             &cancel_token,
+            &cancel_token.child_token(),
         )
         .await;
 

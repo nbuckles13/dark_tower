@@ -123,8 +123,10 @@ impl Suite {
                 MeetingRegistration {
                     mc_id: MC_ID.to_string(),
                     mc_grpc_endpoint: format!("http://{}", mc.addr),
+                    heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                     registered_at: Instant::now(),
                 },
+                None,
                 mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
             )
             .await
@@ -187,7 +189,12 @@ impl Suite {
 
     async fn release(&self) {
         self.session_manager
-            .end_meeting(MEETING.to_string(), MC_ID.to_string(), PROMPT)
+            .end_meeting(
+                MEETING.to_string(),
+                MC_ID.to_string(),
+                mh_service::session::release::ReleaseKind::MeetingEnded,
+                PROMPT,
+            )
             .await
             .expect("EndMeeting");
     }

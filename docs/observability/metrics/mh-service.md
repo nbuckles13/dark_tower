@@ -212,6 +212,62 @@ sum(rate(mh_mc_notifications_total[5m]))
 
 ---
 
+## MC Heartbeat Metrics (story 4 MH-2; ADR-0039 §1, §6, §8)
+
+MH sends one `MeetingHeartbeat` per held meeting per MC-declared interval (`RegisterMeetingRequest.heartbeat_interval_ms`), built by the session actor and sent by the heartbeat sender task. Logged on state transitions only (a meeting's beats start failing, change failure kind, or recover; a queue-full streak starts or ends), never per beat. No meeting, MC, handler or connection id is ever a label.
+
+### `mh_mc_heartbeats_total`
+- **Type**: Counter
+- **Description**: One per heartbeat the session actor built, on every exit of the send path. Matches the `mh_gc_heartbeats_total` convention (no `key_custody`).
+- **Labels**:
+  - `outcome`: `success` (MC answered, whatever the verdict) | `error` (a gRPC status — incl. `FAILED_PRECONDITION` and `UNIMPLEMENTED` from an MC predating the rpc — a transport error, an undialable endpoint, or no usable service token, in which case nothing is sent) | `timeout` (the per-attempt deadline, three quarters of the meeting's interval, expired; not retried) | `skipped_in_flight` (the meeting's previous beat was still in flight: at most one outstanding per meeting) | `dropped_queue_full` (the actor's bounded hand-off queue was full; the actor never blocks)
+- **Cardinality**: 5, zero-initialised
+- **Usage**: The heartbeat success ratio `sum(rate(mh_mc_heartbeats_total{outcome="success"}[5m])) / sum(rate(mh_mc_heartbeats_total[5m]))`. MH takes NO action on `error` or `timeout`: it never ends a meeting because MC is unreachable. Sustained `skipped_in_flight` or `dropped_queue_full` means the sender cannot keep up.
+- **Recorded in**: `observability/metrics.rs::record_mc_heartbeat` (sender task; `dropped_queue_full` in the session actor)
+- **Dashboard**: MH Media - MC Heartbeats by Outcome
+
+### `mh_mc_heartbeat_latency_seconds`
+- **Type**: Histogram
+- **Description**: Latency of heartbeat RPCs that completed ON THE WIRE — observed for `success`, and for an `error` that carries a gRPC status. Never for a `timeout`, skip or drop, nor for an `error` that sent nothing (undialable endpoint, no service token), whose ~0 s would flatter the distribution.
+- **Labels**: None
+- **Buckets**: [0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000, 10.000] — the top is the largest INTERVAL (N/3 at MC's `MAX_MH_HEARTBEAT_TIMEOUT_MS` = 30 s; N is published as `mc_media_handler_heartbeat_deadline_seconds`), above the largest per-attempt deadline (3/4 of it, 7.5 s)
+- **Recorded in**: `observability/metrics.rs::record_mc_heartbeat_latency`
+- **Dashboard**: MH Media - MC Heartbeat Latency
+
+### `mh_mc_heartbeat_verdicts_total`
+- **Type**: Counter
+- **Description**: What MC's answer to one heartbeat meant (separate from whether the call completed).
+- **Labels**:
+  - `outcome`: `owned` (nothing done) | `released` (RELEASED with a removal trigger or `MEETING_ENDED`, acted on) | `released_stale` (RELEASED for a registration superseded — different `mc_id`/endpoint, or released — while the beat was in flight: dropped, nothing done) | `misroute` (RELEASED with cause `UNSPECIFIED` or an unknown number: it STILL ends the meeting) | `owner_mismatch` (`FAILED_PRECONDITION`: the answering MC is not the registered one; nothing done) | `unspecified_verdict` (verdict `UNSPECIFIED` or unknown: malformed, nothing done). There is no `unknown` value (ADR-0039 R4-4).
+- **Cardinality**: 6, zero-initialised
+- **Relation to `mh_mc_heartbeats_total` — do not sum across the two**: `owned`, `released`, `released_stale`, `misroute` and `unspecified_verdict` DECOMPOSE `mh_mc_heartbeats_total{outcome="success"}` (a response was received); `owner_mismatch` is a SUBSET of `mh_mc_heartbeats_total{outcome="error"}` (the `FAILED_PRECONDITION` status), counted on both series.
+- **Usage**: `misroute`, `owner_mismatch` and `released_stale` are expected near zero; MC's `mc_media_handler_heartbeats_total{outcome=~"released_unassigned|owner_mismatch"}` is the other end. A sustained `owner_mismatch` after an MC rollout is the restarted MC answering its predecessor's meetings (held until owner-silence release, MH-3).
+- **Recorded in**: `observability/metrics.rs::record_mc_heartbeat_verdict` (sender task; `released` / `released_stale` / `misroute` in the session actor, which fences)
+- **Dashboard**: MH Media - MC Heartbeat Verdicts
+
+### `mh_media_handler_releases_total`
+- **Type**: Counter
+- **Description**: Meetings released because MC REMOVED this handler — by a removal-cause `EndMeeting` or a RELEASED verdict carrying the removal trigger. `MEETING_ENDED` stays on `mh_media_meeting_teardowns_total{outcome="released"}`: one home per event.
+- **Labels**:
+  - `trigger`: `heartbeat_timeout` | `apply_lag` | `planned_transfer` — the shared vocabulary, `common::observability::labels::RemovalTrigger` (projected from `ReleaseCause` by `session::release::ReleaseKind::of`). MH-3 adds the one MH-local value, `owner_silence`.
+  - `clients`: `present` (at least one active connection at release — a session that has begun its bind counts) | `none`. The same predicate as `mh_media_meetings_without_clients`.
+  - `key_custody`: `operator`
+- **Cardinality**: 6, zero-initialised
+- **Usage**: **`trigger="heartbeat_timeout", clients="present"` is the false-declaration ground truth** only MH can see: MC declared this handler dead while it was serving people. `apply_lag, present` is a correct removal of a live-but-slow handler; `planned_transfer, present` is expected on drain. Outside planned transfers this series should be flat.
+- **Recorded in**: `observability/metrics.rs::SessionMetricHandles::record_handler_release`
+- **Dashboard**: MH Media - Handler Releases by Trigger and Clients
+
+### `mh_media_meetings_without_clients`
+- **Type**: Gauge
+- **Description**: Registered meetings with zero active connections — recomputed from the session actor's state and SET on its 10 s rotation tick (never incremented), published as 0 at construction.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: The zombie/leak arm: registrations nothing uses. Non-zero is routine briefly (a meeting before its first join, after its last leave); sustained it is a meeting MC no longer uses that was never released.
+- **Recorded in**: `observability/metrics.rs::SessionMetricHandles::publish_meetings_without_clients`
+- **Dashboard**: MH Media - Meetings Without Clients
+
+---
+
 ## RegisterMeeting Metrics
 
 ### `mh_register_meeting_timeouts_total`
@@ -315,7 +371,7 @@ The idempotent re-assert counts as `applied`, not `rejected_stale`: §8's cadenc
 >
 > `no_generation` is deliberately the same value the *rejection* will land on once that enforcement turns on — two eras, one value, no rename, no dashboard edit.
 
-**Not label material** (ADR-0036 §11): `policy_generation`, `applied_generation` and `process_start_epoch_ms` are unbounded — one new series per policy change or per restart — and go in the log line and in this metric's *value*, never in a label. Neither is any stream or meeting identity: `egress_stream_id`, `sender_id`, `slot_id`, `stream_number`, `participant_id`, or a meeting id **raw or hashed**. A `sender_id` label would be specifically hazardous: it is a per-meeting ordinal, so the same value recurs across every meeting on the handler and emitting it unqualified is a cross-meeting correlation handle. `handler_id` would be *permitted* (pod level is §11's stated aggregation floor) but is deliberately not added — the scrape already carries `instance`/`pod`.
+**Not label material** (ADR-0036 §11): `policy_generation` and `applied_generation` are unbounded — one new series per policy change — and go in the log line and in this metric's *value*, never in a label. Neither is any stream or meeting identity: `egress_stream_id`, `sender_id`, `slot_id`, `stream_number`, `participant_id`, or a meeting id **raw or hashed**. A `sender_id` label would be specifically hazardous: it is a per-meeting ordinal, so the same value recurs across every meeting on the handler and emitting it unqualified is a cross-meeting correlation handle. `handler_id` would be *permitted* (pod level is §11's stated aggregation floor) but is deliberately not added — the scrape already carries `instance`/`pod`.
 
 **`key_custody`** records that ADR-0036 §4 media is encrypted between clients, that MH cannot read it, and that MC can — accepted operator custody, recorded as the user's risk decision. It exists **in place of** an end-to-end or zero-trust boolean, which no metric, log, dashboard or document may carry: the label states a fact, a boolean would state a product claim an operator might repeat to a customer.
 
@@ -460,7 +516,7 @@ MH also logs a WARN on `mh.session.policy` when the windowed ratio crosses above
 - **Description**: Meetings this handler holds registered — the size of the session actor's registration map, set from its length at every mutation (register, release), never incremented or decremented.
 - **Labels**: `key_custody`: `operator`
 - **Cardinality**: 1
-- **Usage**: Occupancy against `mh_media_registered_meetings_limit`. READ IT AS REGISTRATIONS HELD, NOT MEETINGS IN PROGRESS: it falls only when an `EndMeeting` releases a meeting, so a meeting whose MC never COMPLETES `EndMeeting` (an MC crashed or killed before or during teardown; retries exhausted or an MH predating the RPC; a rollback to an MC build without teardown) stays counted until the pod restarts. Rising with pod uptime and uncorrelated with concurrent load is that residual. Many meetings here against a flat `mh_media_egress_edges` is the empty-meeting shape the cap exists for. Published as 0 when the session actor is built.
+- **Usage**: Occupancy against `mh_media_registered_meetings_limit`. Since story 4 MH-2 a registration whose POLICY is refused (`mh_media_policy_applies_total{outcome=~"rejected_invalid|rejected_transport_inconsistent"}`) still upserts its record and holds a slot until `EndMeeting` (or a RELEASED verdict), so a `rejected_meeting_cap` beside `rejected_invalid` can be those refused-but-recorded meetings. READ IT AS REGISTRATIONS HELD, NOT MEETINGS IN PROGRESS: it falls only when an `EndMeeting` releases a meeting, so a meeting whose MC never COMPLETES `EndMeeting` (an MC crashed or killed before or during teardown; retries exhausted or an MH predating the RPC; a rollback to an MC build without teardown) stays counted until the pod restarts. Rising with pod uptime and uncorrelated with concurrent load is that residual. Many meetings here against a flat `mh_media_egress_edges` is the empty-meeting shape the cap exists for. Published as 0 when the session actor is built.
 - **Teardown proof is the PAIR, not either half.** A released meeting shows as `mh_media_meeting_teardowns_total{outcome="released"}` incrementing AND this gauge FALLING in the same window. The counter alone proves MH decided; only the fall proves the registration left the map. This is the ADR-0036 §11 demonstration for teardown: end a meeting and watch this gauge fall.
 - **No alert of its own yet**: the teardown-never-arrives rule is an open obligation (`docs/TODO.md` §Observability Debt, "No leading indicator for registered-meeting exhaustion"; the `mh-alerts.yaml` header). It is the LOAD-side correlator in `MHMediaEgressEdgeHeadroomLow`'s LEAK-vs-LOAD fork.
 - **Recorded in**: `observability/metrics.rs::SessionMetricHandles::publish_registered_meetings` (the map's length, at every register and release)
@@ -528,7 +584,7 @@ Story 2 R-20. `MediaHandlerService.EndMeeting` releases a meeting's handler reso
 
 ### `mh_media_meeting_teardowns_total`
 - **Type**: Counter
-- **Description**: `EndMeeting` requests the session actor decided — one per decision. Requests refused before the actor decided (malformed ids, the actor unreachable or slow) are counted only on `mh_grpc_requests_total{method="end_meeting",status="error"}`.
+- **Description**: Meeting releases that are NOT handler removals, plus the `EndMeeting` refusals — one per decision. The session actor decides every value except `rejected_invalid_cause`, which the gRPC boundary records (the cause is checked before the actor). Requests refused for malformed ids, or because the actor was unreachable or slow, are counted only on `mh_grpc_requests_total{method="end_meeting",status="error"}`. **One home per event (story 4 MH-2):** a release for a REMOVAL cause (`HEARTBEAT_TIMEOUT`, `APPLY_LAG`, `PLANNED_TRANSFER`), by `EndMeeting` or by a RELEASED heartbeat verdict, is counted on `mh_media_handler_releases_total`, NOT here; `released` here is `MEETING_ENDED` (by `EndMeeting` or a RELEASED(`MEETING_ENDED`) verdict — the lost-`EndMeeting` retry) and the misroute (RELEASED with no cause, also on `mh_mc_heartbeat_verdicts_total{outcome="misroute"}`).
 - **Labels**:
   - `outcome`: the `MeetingTeardownOutcome` variants (table below)
   - `key_custody`: `operator`
@@ -536,8 +592,9 @@ Story 2 R-20. `MediaHandlerService.EndMeeting` releases a meeting's handler reso
 
 | `outcome` | Meaning | Remedy |
 |---|---|---|
-| `released` | The registering MC ended the meeting: registration and routes removed (its applied generation forgotten, so a same-id re-create installs fresh), edges returned to the budget, active connections closed. Pending connections are left to the registration timeout. | None — the healthy path. Its rate should track meeting ends. |
+| `released` | The meeting ended (`MEETING_ENDED`) or a misroute RELEASED it: registration and routes removed (its applied generation forgotten, so a same-id re-create installs fresh), edges returned to the budget, active connections closed with `HANDLER_RELEASED`. On `MEETING_ENDED` pending connections are left to the registration timeout. | None — the healthy path. Its rate should track meeting ends. |
 | `unknown_meeting` | No registration held for that meeting id; acknowledged as an idempotent no-op. | Usually none: MC calls every handler in the meeting's assigned set, including ones it never registered with. Climbing well above `released` is an MC-side signal (double sends, or ending meetings this handler never held). |
+| `rejected_invalid_cause` | An `EndMeeting` whose `cause` is `UNSPECIFIED` or not a `ReleaseCause` value: refused `INVALID_ARGUMENT` before any state changed (recorded at the gRPC boundary). | **Non-zero means an MC below story 4 MC-B1 (which sends no cause) is in the fleet**: its released meetings keep their streams (the ratchet). See `docs/runbooks/mh-deployment.md` §Rollback (MH-2 coupling). |
 | `rejected_ownership` | A different `mc_id` than the registering one asked to end the meeting; refused with `FAILED_PRECONDITION`, nothing released. | A misrouted or stale MC, or a `service.write.mh` holder acting on a meeting it does not own. The WARN line carries `registered_mc_id` and `caller_mc_id`. The recovery order when the wrong MC holds a meeting is in `docs/runbooks/mh-incident-response.md` (ownership-reject arm). |
 
 **`rejected_ownership` is a UNION of MC's two rejection values — do not compare the like-named tokens.** MH cannot tell why an MC was tearing down, so this value counts both MC populations: MC's `mc_media_end_meeting_total{outcome="rejected_ownership"}` (a meeting that ENDED — an MC defect) **plus** `{outcome="superseded_by_successor"}` (a graceful-shutdown release refused because a successor already took the meeting over — routine on rolling deploys). Compare this value against the SUM of those two, for COMPARISON only, never a sum or a ratio across the hop: the denominators differ (MH counts per request received, including MC's retries; MC per (meeting, handler) terminal outcome). Comparing token to token shows a gap that grows on every rolling deploy and looks exactly like lost messages between MC and MH. (`docs/observability/metrics/mc-service.md`, `mc_media_end_meeting_total`.)
@@ -546,7 +603,7 @@ Story 2 R-20. `MediaHandlerService.EndMeeting` releases a meeting's handler reso
 
 **Not label material**: `meeting_id` and `mc_id` (raw or hashed) are unbounded and meeting-identifying; both belong in the log line (ADR-0036 §11).
 
-- **Recorded in**: `observability/metrics.rs::SessionMetricHandles::record_teardown`; zero-initialised per outcome by `resolve_session_handles`
+- **Recorded in**: `observability/metrics.rs::SessionMetricHandles::record_teardown` (actor decisions) and `observability/metrics.rs::record_meeting_teardown` (`rejected_invalid_cause`, gRPC boundary); zero-initialised per outcome by `resolve_session_handles` and `zero_initialize_counters`
 - **Alert**: none directly (the teardown-never-arrives rule is an open obligation, `docs/TODO.md` §Observability Debt, "No leading indicator for registered-meeting exhaustion"); read by `MHMediaEgressEdgeHeadroomLow`'s LEAK fork
 
 **PromQL example** (per ADR-0029 — low-rate lifecycle counter, prefer `increase`):

@@ -3,7 +3,7 @@
 //!
 //! One meeting of three real participants (A publishes, B and C receive),
 //! each joined through GC -> MC and connected to BOTH of the meeting's MH handlers. The
-//! forwarding policy is INJECTED on every live MH pod with explicit `source_streams`
+//! forwarding policy is INJECTED on every MH pod in the meeting's handler set with explicit `source_streams`
 //! (so the test controls the mixed declarations and the relabelling, and can
 //! give A a video slot MC would not place in this shape), through the shared
 //! `env_tests::fixtures::injection::Injection` helper, at a generation above
@@ -17,7 +17,7 @@
 //! Phases, run SEQUENTIALLY inside ONE test fn so no two concurrent fns ever
 //! produce the same reason token:
 //!
-//! (a) the mixed DATAGRAM + STREAM_PER_GROUP registration applies on every live MH pod
+//! (a) the mixed DATAGRAM + STREAM_PER_GROUP registration applies on every MH pod in the meeting's handler set
 //!     and its per-stream echo lists every declared source stream;
 //! (b) per-kind server mute: A's AUDIO at DROP_AT_INGRESS drops A's audio at
 //!     every receiver while the stream stays declared (echoed);
@@ -380,14 +380,18 @@ async fn test_per_stream_attribution_on_the_datagram_path() {
     }
     let slot = |i: usize, from: u32| ps[i].slot_for(from, AUDIO);
 
-    // (a) INJECT the mixed registration on every live MH pod.
-    let handlers =
-        injectable_handlers(&prom, env_tests::fixtures::metrics::BASELINE_SETTLE_BOUND).await;
+    // (a) INJECT the mixed registration on every handler-set MH pod.
+    let handlers = injectable_handlers(
+        &prom,
+        env_tests::fixtures::metrics::BASELINE_SETTLE_BOUND,
+        &ps[0],
+    )
+    .await;
     let token = mh_grpc::mc_service_token(&cluster.ac_base_url).await;
     let cleanup = ReleaseOnDrop::new(token.clone());
     let mut injections = Vec::new();
     for handler in &handlers {
-        injections.push(Injection::open(handler, &token, &cleanup, &ps[0]).await);
+        injections.push(Injection::open(handler, &token, &cleanup, &ps[0], &prom).await);
     }
     assert_mc_programmed_a_carrying_pod(&injections);
 

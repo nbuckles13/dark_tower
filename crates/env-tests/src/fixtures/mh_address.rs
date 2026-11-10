@@ -494,9 +494,19 @@ pub fn policy_match_labels(policy: &Value) -> Result<BTreeMap<String, String>, S
 /// must prove an MC-issued url names a live handler without a literal.
 ///
 /// # Panics
+/// As [`live_mh_addresses_by_pod`].
+pub async fn live_mh_addresses() -> BTreeSet<String> {
+    live_mh_addresses_by_pod().await.into_values().collect()
+}
+
+/// [`live_mh_addresses`] keyed by POD NAME: THE one mapping from an MC-issued
+/// handler url (a participant's `media_handler_set`) back to the pod that
+/// serves it (env-tests 45 and `injection::injectable_handlers`).
+///
+/// # Panics
 /// PRECONDITION if the pods or slot ConfigMaps cannot be read, a live pod
 /// carries no slot label, or its slot has no ConfigMap.
-pub async fn live_mh_addresses() -> BTreeSet<String> {
+pub async fn live_mh_addresses_by_pod() -> BTreeMap<String, String> {
     let pods = crate::fixtures::kube::live_mh_pods_with_specs().await;
     let cms = slot_configmaps(
         &crate::fixtures::kube::kubectl_get_json(&[
@@ -519,7 +529,8 @@ pub async fn live_mh_addresses() -> BTreeSet<String> {
                         pod.name
                     )
                 });
-            cms.get(&slot)
+            let address = cms
+                .get(&slot)
                 .unwrap_or_else(|| {
                     panic!(
                         "PRECONDITION: live MH pod {} is on slot {slot} with no slot ConfigMap",
@@ -527,7 +538,37 @@ pub async fn live_mh_addresses() -> BTreeSet<String> {
                     )
                 })
                 .address
-                .clone()
+                .clone();
+            (pod.name.clone(), address)
+        })
+        .collect()
+}
+
+/// The pod names serving the handler urls in `set` (a participant's
+/// `JoinResponse.media_handler_set`): per-entity evidence of which MHs hold
+/// that participant's meeting, never "all MH pods".
+///
+/// # Panics
+/// If a url in the set names no live MH pod (MC issued an address no pod
+/// serves).
+#[must_use]
+pub fn pods_serving(
+    set: &proto_gen::dark_tower::signaling::v1::MediaHandlerSet,
+    by_pod: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    set.handlers
+        .iter()
+        .map(|h| {
+            by_pod
+                .iter()
+                .find(|(_, address)| **address == h.media_handler_url)
+                .map(|(pod, _)| pod.clone())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "handler url {} names no live MH pod ({by_pod:?})",
+                        h.media_handler_url
+                    )
+                })
         })
         .collect()
 }
