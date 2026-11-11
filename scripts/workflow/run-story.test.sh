@@ -379,6 +379,34 @@ REAL_SLEEP="$(command -v sleep)"
 cat > "${STUB_BIN}/claude" <<'STUB'
 #!/usr/bin/env bash
 M="${DEVLOOP_TEST_MARKERS:?claude stub needs DEVLOOP_TEST_MARKERS}"
+# emit_verdict <layer-all-rc> — write a Gate-2 verdict over the CURRENT worktree with the
+# REAL producer (scripts/lang/_gate2_binding.sh emit_gate2_verdict), exactly as a real
+# devloop's Gate-2 layer-all.sh EXIT trap does, into ${DEVLOOP_TMP}/gate2-verdict.
+emit_verdict() {
+  ( # shellcheck disable=SC1091
+    source "__REAL_GATE2_LIB__"
+    declare -a S=() D=()
+    for i in 1 2 3 4 5 6 7; do S[$i]=OK; D[$i]=1; done
+    emit_gate2_verdict "$1" S D ) >/dev/null 2>&1 || : >> "${M}/verdict.emit-failed"
+}
+# FAKE_DEVLOOP_VERDICT (devloop + interactive commits): pass (default) | fail | none |
+# stale (a PASS verdict, then an edit the commit carries but the verdict does not) |
+# skip (Gate 2 skipped: whatever verdict an EARLIER task left on disk stays there).
+# FAKE_DEVLOOP_VERDICTS="pass skip" picks the mode per devloop session (1-based), like
+# FAKE_DEVLOOP_RCS.
+apply_verdict_mode() {
+  local mode="${FAKE_DEVLOOP_VERDICT:-pass}" i=0 v
+  if [ -n "${FAKE_DEVLOOP_VERDICTS:-}" ] && [ -n "${n:-}" ]; then
+    for v in ${FAKE_DEVLOOP_VERDICTS}; do i=$((i+1)); mode="$v"; [ "$i" -eq "$n" ] && break; done
+  fi
+  case "$mode" in
+    skip)  : ;;
+    pass)  emit_verdict 0 ;;
+    fail)  emit_verdict 1 ;;
+    none)  rm -f "${DEVLOOP_TMP:?}/gate2-verdict" ;;
+    stale) emit_verdict 0; printf 'edited after Gate 2\n' >> work.txt ;;
+  esac
+}
 # Record the FULL argv, %q-quoted so an empty-string argument is visible as ''.
 { printf '%q ' "$@"; printf '\n'; } >> "${M}/claude.argv"
 
@@ -471,6 +499,7 @@ for _ in range(600):
     fi
     if [ "${FAKE_DEVLOOP_COMMIT:-1}" = "1" ]; then
       printf 'work %s\n' "$n" >> work.txt
+      apply_verdict_mode
       git add work.txt >/dev/null 2>&1
       # A real devloop COMMITS its own output dir (Step 8 stages
       # docs/devloop-outputs/<slug>/main.md), and the runner derives the task
@@ -480,6 +509,13 @@ for _ in range(600):
       # and the recording path never.
       git add docs/devloop-outputs >/dev/null 2>&1 || true
       git commit --quiet -m "fixture task work ${n}" >/dev/null 2>&1
+      # FAKE_DEVLOOP_LEAVE_DIRTY: bound = an untracked file outside the Gate-2 exclusion
+      # set (the commit is not what the gate would test); excluded = post-commit
+      # bookkeeping inside it (docs/TODO.md), which must be tolerated.
+      case "${FAKE_DEVLOOP_LEAVE_DIRTY:-}" in
+        bound)    printf 'left behind\n' > stray.txt ;;
+        excluded) mkdir -p docs; printf 'todo\n' >> docs/TODO.md ;;
+      esac
     fi
     # FAKE_DEVLOOP_STAGE=1: STAGE the changeset but do NOT commit — reproduces the
     # SKILL producer's real post-Gate-3-crash state (Step 1 `git add -A`, Step 2 write
@@ -511,12 +547,14 @@ for _ in range(600):
       touch -d 'now + 1 minute' "docs/devloop-outputs/${MKOUT_NAME}"; }
     if [ "${FAKE_INTERACTIVE_COMMIT:-0}" = "1" ]; then
       printf 'interactive work\n' >> work.txt
+      apply_verdict_mode
       git add work.txt docs/devloop-outputs >/dev/null 2>&1 || true
       git commit --quiet -m "fixture interactive work" >/dev/null 2>&1
     fi
     exit "${FAKE_INTERACTIVE_RC:-0}" ;;
 esac
 STUB
+sed -i "s|__REAL_GATE2_LIB__|${REAL_REPO_ROOT}/scripts/lang/_gate2_binding.sh|" "${STUB_BIN}/claude"
 chmod +x "${STUB_BIN}/claude"
 
 # --- sleep stub ---------------------------------------------------------------
@@ -902,12 +940,14 @@ assert_status "d1-baseline-seam-announced" "TEST SEAMS ACTIVE" "$OUTPUT"
 assert_marker "d1-baseline-preflight-ran" "$MARK" 'ran.preflight'
 assert_marker "d1-baseline-devloop-ran"   "$MARK" 'ran.claude.devloop'
 assert_marker "d1-baseline-layers-ran"    "$MARK" 'ran.layer1'
-# Layer 7 now runs on EVERY task, not only env_tests-tagged ones. This plain,
-# untagged task must run layer 7 AND complete when it's green — the positive
-# proof of the every-task policy on the happy path (F4 below proves the same
-# on the operator-rc-split/failure path). Without this marker, the whole point
-# of Part 3 (per-task layer 7) is untested on the completes path.
-assert_marker "d1-baseline-layer7-ran"    "$MARK" 'ran.layer7'
+# ADR-0035 §3 (2026-11-10 amendment): the devloop stub's Gate 2 left a PASSING verdict
+# over the tree it committed, so the runner's gate is layers 1-3 on the committed tree —
+# layer 3 ran, layers 4-7 did not, and the bound verdict is announced.
+assert_marker    "d1-baseline-layer3-ran"     "$MARK" 'ran.layer3'
+assert_no_marker "d1-baseline-layer4-not-run" "$MARK" 'ran.layer4'
+assert_no_marker "d1-baseline-layer7-not-run" "$MARK" 'ran.layer7'
+assert_status    "d1-baseline-verdict-bound"  "GATE2-VERDICT-BOUND task=1" "$OUTPUT"
+assert_marker    "d1-baseline-verdict-kept"   "$(RUN_DIR_OF "$DT")" 'task-1.gate2-verdict.*'
 assert_marker "d1-baseline-close-gate-ran" "$MARK" 'ran.layer-all'
 # F1 (belt): the story-close gate must be invoked with DEVLOOP_FAIL_FAST=0 — the explicit,
 # table-independent run-all signal. Composed with _common.test.sh's interactive-off-0 cell
@@ -931,14 +971,7 @@ if [ "$(cat "$MARK/gate.fmt_check_only.layer1" 2>/dev/null)" = "1" ]; then PASS=
 # (run-story.sh:1377). Both gate shapes force CHECK-only; a regression in either alone reds independently.
 if [ "$(cat "$MARK/close-gate.fmt_check_only" 2>/dev/null)" = "1" ]; then PASS=$((PASS + 1)); else
   FAIL=$((FAIL + 1)); FAILURES+=("[d1-close-gate-forces-fmt-check] close gate saw DEVLOOP_FMT_CHECK_ONLY='$(cat "$MARK/close-gate.fmt_check_only" 2>/dev/null)', expected '1'"); fi
-# ADR-0037 §D7 / S-11 PERSIST DIRECTION (@security F2): the knob must NOT persist past the per-invocation
-# prefix. run_gate prefixes DEVLOOP_FMT_CHECK_ONLY=1 onto layers 1-6 but calls layer7.sh WITHOUT it, so the
-# layer7 marker MUST read UNSET. If it read "1", the prefix leaked into the runner's env — which would then
-# strip D7's auto-apply from the spawned devloop session for the rest of the run. Regression guard against a
-# future `set -o posix` / refactor that flips bash's prefix-scoping (fail-closed today, but invisible).
-__l7knob="$(cat "$MARK/gate.fmt_check_only.layer7" 2>/dev/null || true)"
-if [ "$__l7knob" = "UNSET" ]; then PASS=$((PASS + 1)); else
-  FAIL=$((FAIL + 1)); FAILURES+=("[d1-fmt-knob-does-not-persist] layer7 (called by run_gate WITHOUT the prefix) saw DEVLOOP_FMT_CHECK_ONLY='${__l7knob}', expected 'UNSET' — the per-invocation prefix on layers 1-6 leaked into the runner env (persist regression)"); fi
+
 
 # F1 (companion — the actual threat, @security): an ambient DEVLOOP_FAIL_FAST=1 leaked into the
 # runner (a developer who exports it for fast interactive loops, then runs a story) must NOT
@@ -1104,18 +1137,15 @@ run_story FAKE_LAYER3_RC=127 -- fixture
 assert_exit   "f3-rc127-exit2" 2 "$RC"
 assert_status "f3-rc127-token" "PIPELINE-PRECONDITION" "$OUTPUT"
 
-# F4: the operator/implementer rc-split applies to layer 7 exactly as to layers
-# 1-6, and — post-change — on EVERY task, not only env_tests-tagged ones. That
-# the split reaches layer 7 on an ORDINARY untagged task IS the property, so no
-# special fixture: DEFAULT_TASKS is already loaded (F1-F3 don't swap; E5 restored
-# it). Layers 1-6 pass (default rc 0) so layer 7 is reached; FAKE_LAYER7_RC=2 is
-# operator-class → exit 2 / PIPELINE-PRECONDITION / layer=7. (D1 above proves the
-# green-completes half; this proves the red-splits half.)
-run_story FAKE_LAYER7_RC=2 -- fixture
-assert_exit   "f4-layer7-rc2-exit2" 2 "$RC"
-assert_status "f4-layer7-rc2-token" "PIPELINE-PRECONDITION" "$OUTPUT"
-assert_status "f4-layer7-names-layer" "layer=7" "$OUTPUT"
-assert_marker "f4-layer7-ran" "$MARK" 'ran.layer7'
+# F4: (ADR-0035 §3, 2026-11-10 amendment) with a bound Gate-2 verdict the normal-path
+# gate is layers 1-3 ONLY: a layer 7 that would fail (operator-class rc 2) is never
+# reached, because the devloop's own Gate 2 already ran it on this exact tree. The
+# operator/implementer split itself is pinned on layers 1-3 by F1-F3 above.
+run_story FAKE_LAYER7_RC=2 FAKE_LAYER4_RC=1 -- fixture
+assert_exit      "f4-bound-skips-4-7-exit0" 0 "$RC"
+assert_status    "f4-bound-completes" "ALL TASKS COMPLETE" "$OUTPUT"
+assert_no_marker "f4-layer7-not-run" "$MARK" 'ran.layer7'
+assert_no_marker "f4-layer4-not-run" "$MARK" 'ran.layer4'
 
 # =============================================================================
 # (G) CANARY CLASSIFICATION — R-2 defects 1 & 2, R-3
@@ -1744,7 +1774,9 @@ assert_status    "n7-revalidate-announced" "REVALIDATE task=1" "$OUTPUT"
 assert_status    "n7-revalidate-completes" "ALL TASKS COMPLETE" "$OUTPUT"
 assert_status    "n7-revalidate-slug-recovered" "slug=2026-08-17-revalidate-devloop src=commit-range" "$OUTPUT"
 assert_no_marker "n7-revalidate-no-devloop" "$MARK" 'ran.claude.devloop'
-assert_marker    "n7-revalidate-gate-ran" "$MARK" 'ran.layer7'
+assert_marker    "n7-revalidate-gate-ran" "$MARK" 'ran.layer3'
+assert_no_marker "n7-revalidate-bound-no-layer7" "$MARK" 'ran.layer7'
+assert_status    "n7-revalidate-verdict-bound" "GATE2-VERDICT-BOUND task=1" "$OUTPUT"
 if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[n7-revalidate-manifest-completed] task 1 status is '$(manifest_status "$FIX" 1)', expected completed"); fi
 n7_manifest="$(cat "${FIX}/docs/user-stories/2026-08-13-fixture.md" 2>/dev/null || true)"
@@ -1768,6 +1800,18 @@ n7c_sha="$(git -C "$FIX" rev-parse HEAD)"
 REUSE_FIXTURE=1 run_story FAKE_LAYER3_RC=0 -- fixture --revalidate
 unset REUSE_FIXTURE
 assert_exit   "n7c-revalidate-green-exit0" 0 "$RC"
+# The operator's commit is covered by no layer-all run, so the verdict does not bind HEAD
+# and --revalidate runs the FULL gate (layers 1-7).
+assert_status "n7c-unbound-full-gate" "GATE2-VERDICT-UNBOUND task=1 (verdict-signature-mismatch" "$OUTPUT"
+assert_marker "n7c-full-gate-layer7-ran" "$MARK" 'ran.layer7'
+# ADR-0037 §D7 / S-11 PERSIST DIRECTION (@security F2): the knob must NOT persist past the per-invocation
+# prefix. run_gate prefixes DEVLOOP_FMT_CHECK_ONLY=1 onto layers 1-6 but calls layer7.sh WITHOUT it, so the
+# layer7 marker MUST read UNSET. If it read "1", the prefix leaked into the runner's env — which would then
+# strip D7's auto-apply from the spawned devloop session for the rest of the run. Regression guard against a
+# future `set -o posix` / refactor that flips bash's prefix-scoping (fail-closed today, but invisible).
+__l7knob="$(cat "$MARK/gate.fmt_check_only.layer7" 2>/dev/null || true)"
+if [ "$__l7knob" = "UNSET" ]; then PASS=$((PASS + 1)); else
+  FAIL=$((FAIL + 1)); FAILURES+=("[n7c-fmt-knob-does-not-persist] layer7 (called by run_gate WITHOUT the prefix) saw DEVLOOP_FMT_CHECK_ONLY='${__l7knob}', expected 'UNSET' — the per-invocation prefix on layers 1-6 leaked into the runner env (persist regression)"); fi
 if [ "$(git -C "$FIX" rev-parse HEAD~1 2>/dev/null)" = "$n7c_sha" ]; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[n7c-operator-commit-untouched] the operator's commit ${n7c_sha} is no longer HEAD~1 — completion rewrote it"); fi
 assert_status "n7c-manifest-own-commit" "chore(story): task #1 complete" "$(git -C "$FIX" log -1 --format=%s 2>/dev/null || true)"
@@ -1808,7 +1852,7 @@ unset REUSE_FIXTURE
 assert_exit      "n8-reval-stop-exit0" 0 "$RC"
 assert_status    "n8-reval-stop-message" "STOPPED after task 1" "$OUTPUT"
 assert_status    "n8-reval-stop-announced" "REVALIDATE task=1" "$OUTPUT"
-assert_marker    "n8-reval-stop-gate-ran" "$MARK" 'ran.layer7'
+assert_marker    "n8-reval-stop-gate-ran" "$MARK" 'ran.layer3'
 assert_no_marker "n8-reval-stop-close-gate-skipped" "$MARK" 'ran.layer-all'
 assert_no_marker "n8-reval-stop-no-devloop" "$MARK" 'ran.claude.devloop'
 if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
@@ -1852,9 +1896,61 @@ unset REUSE_FIXTURE
 assert_exit   "n10-second-revalidate-green-exit0" 0 "$RC"
 assert_absent "n10-second-not-no-commit-refused" "NO-COMMIT-REFUSED" "$OUTPUT"
 assert_status "n10-second-completes" "ALL TASKS COMPLETE" "$OUTPUT"
-assert_marker "n10-second-gate-ran" "$MARK" 'ran.layer7'
+assert_marker "n10-second-gate-ran" "$MARK" 'ran.layer3'
+assert_status "n10-second-verdict-bound" "GATE2-VERDICT-BOUND task=1" "$OUTPUT"
 if [ "$(manifest_status "$FIX" 1)" = "completed" ]; then PASS=$((PASS+1)); else
   FAIL=$((FAIL+1)); FAILURES+=("[n10-second-manifest-completed] task 1 status is '$(manifest_status "$FIX" 1)', expected completed"); fi
+
+# N10v: GATE-2 VERDICT BINDING (ADR-0035 §3, 2026-11-10 amendment). The normal-path
+# gate trusts the devloop's Gate 2 only when its PASSING verdict binds HEAD's committed
+# tree; anything else escalates gate2-verdict-unbound with NO layer run, and
+# --revalidate then runs the full gate. The stub writes verdicts with the REAL producer.
+# (a) no verdict at all — Gate 2 never ran.
+run_story FAKE_DEVLOOP_VERDICT=none -- fixture
+assert_exit      "n10v-none-exit1" 1 "$RC"
+assert_status    "n10v-none-reason" "reason=gate2-verdict-unbound" "$OUTPUT"
+assert_status    "n10v-none-token" "verdict-missing" "$OUTPUT"
+assert_status    "n10v-none-guidance" "--revalidate then runs the FULL gate" "$OUTPUT"
+assert_no_marker "n10v-none-no-layer-ran" "$MARK" 'ran.layer1'
+assert_status    "n10v-none-escalated" "escalated" "$(manifest_status "$FIX" 1)"
+assert_status    "n10v-none-gatelog-names-why" "verdict-missing" "$(cat "$(RUN_DIR_OF "$DT")/task-1.gate.log" 2>/dev/null || true)"
+# ...and --revalidate recovers it through the FULL gate (layers 1-7), then completes.
+REUSE_FIXTURE=1 run_story -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit      "n10v-none-revalidate-exit0" 0 "$RC"
+assert_status    "n10v-none-revalidate-unbound" "GATE2-VERDICT-UNBOUND task=1 (verdict-missing" "$OUTPUT"
+assert_marker    "n10v-none-revalidate-layer7" "$MARK" 'ran.layer7'
+assert_status    "n10v-none-revalidate-completed" "completed" "$(manifest_status "$FIX" 1)"
+# (b) a FAILING verdict — Gate 2 ran red and the devloop committed anyway.
+run_story FAKE_DEVLOOP_VERDICT=fail -- fixture
+assert_exit      "n10v-fail-exit1" 1 "$RC"
+assert_status    "n10v-fail-token" "verdict-not-pass" "$OUTPUT"
+assert_no_marker "n10v-fail-no-layer-ran" "$MARK" 'ran.layer1'
+# (c) a PASSING verdict, then an edit the commit carries but no layer-all covered.
+run_story FAKE_DEVLOOP_VERDICT=stale -- fixture
+assert_exit      "n10v-stale-exit1" 1 "$RC"
+assert_status    "n10v-stale-token" "verdict-signature-mismatch" "$OUTPUT"
+assert_no_marker "n10v-stale-no-layer-ran" "$MARK" 'ran.layer1'
+assert_no_marker "n10v-stale-producer-ok" "$MARK" 'verdict.emit-failed'
+# (d) the devloop committed but left a BOUND file uncommitted: layers 1-3 would test a
+# tree that is not the commit → escalate uncommitted-after-task, no layer run.
+run_story FAKE_DEVLOOP_LEAVE_DIRTY=bound -- fixture
+assert_exit      "n10v-dirty-exit1" 1 "$RC"
+assert_status    "n10v-dirty-reason" "reason=uncommitted-after-task" "$OUTPUT"
+assert_status    "n10v-dirty-names-file" "stray.txt" "$OUTPUT"
+assert_no_marker "n10v-dirty-no-layer-ran" "$MARK" 'ran.layer1'
+# ...while EXCLUDED post-commit bookkeeping (docs/TODO.md) is tolerated.
+run_story FAKE_DEVLOOP_LEAVE_DIRTY=excluded -- fixture
+assert_exit      "n10v-excluded-dirt-exit0" 0 "$RC"
+assert_status    "n10v-excluded-dirt-bound" "GATE2-VERDICT-BOUND task=1" "$OUTPUT"
+# (e) --revalidate's FULL gate still splits a red layer 7 like any other layer.
+run_story FAKE_DEVLOOP_VERDICT=none -- fixture
+assert_exit "n10v-l7-setup-exit1" 1 "$RC"
+REUSE_FIXTURE=1 run_story FAKE_LAYER7_RC=1 -- fixture --revalidate
+unset REUSE_FIXTURE
+assert_exit   "n10v-l7-red-exit1" 1 "$RC"
+assert_status "n10v-l7-red-reason" "reason=revalidate-pipeline-red-layer7" "$OUTPUT"
+assert_marker "n10v-l7-ran" "$MARK" 'ran.layer7'
 
 # N11: restart-injects-paragraph. --restart spawns a FRESH devloop whose prompt
 # FILE carries the operator paragraph: the required text, the prior commit SHA,
@@ -2246,11 +2342,22 @@ assert_no_marker "o10b-argv-no-dash-p" "$MARK" 'interactive.saw.-p'
 assert_no_marker "o10b-argv-no-output-format" "$MARK" 'interactive.saw.output-format'
 assert_no_marker "o10b-argv-headless-unset" "$MARK" 'interactive.saw.headless'
 assert_no_marker "o10b-argv-no-skip-perms" "$MARK" 'interactive.saw.skip-perms'
-assert_marker    "o10b-fell-through-to-gate" "$MARK" 'ran.layer7'   # unchanged gate machinery ran
+assert_marker    "o10b-fell-through-to-gate" "$MARK" 'ran.layer3'   # unchanged gate machinery ran
+assert_status    "o10b-verdict-bound" "GATE2-VERDICT-BOUND task=1" "$OUTPUT"
 assert_status    "o10b-completes" "ALL TASKS COMPLETE" "$OUTPUT"
 o10b_ledger="$(cat "$(RUN_DIR_OF "$DT")/cost-ledger.jsonl" 2>/dev/null || echo MISSING)"
 assert_status    "o10b-ledger-kind-interactive" '"kind":"interactive"' "$o10b_ledger"
 assert_status    "o10b-ledger-unmeasured" '"measured":false' "$o10b_ledger"
+
+# O10d: --interactive with NO binding verdict (a human committed a hand fix without
+# re-running layer-all) gets the FULL gate, not a gate2-verdict-unbound escalation.
+run_story FAKE_DEVLOOP_COMMIT=0 -- fixture
+assert_exit "o10d-setup-escalated-exit1" 1 "$RC"
+REUSE_FIXTURE=1 PTY=1 run_story FAKE_INTERACTIVE_COMMIT=1 FAKE_DEVLOOP_VERDICT=none -- fixture --interactive
+unset REUSE_FIXTURE PTY
+assert_exit      "o10d-interactive-unbound-exit0" 0 "$RC"
+assert_status    "o10d-unbound-full-gate" "GATE2-VERDICT-UNBOUND task=1 (verdict-missing" "$OUTPUT"
+assert_marker    "o10d-full-gate-layer7" "$MARK" 'ran.layer7'
 
 # O10c: --interactive, human commits NOTHING → HEAD unmoved → the UNCHANGED
 # devloop-no-commit escalation (not a special interactive verdict).
@@ -2611,7 +2718,7 @@ if [ "$(manifest_status "$FIX" 1)" = "completed" ] && [ "$(manifest_status "$FIX
 # =============================================================================
 # The runner is started in the background in its own session (BG=1) and the
 # test delivers SIGINT to that whole process GROUP, exactly as a terminal
-# Ctrl-C does. A held stub (FAKE_DEVLOOP_HOLD / FAKE_LAYER7_HOLD) keeps a devloop
+# Ctrl-C does. A held stub (FAKE_DEVLOOP_HOLD / FAKE_LAYER3_HOLD) keeps a devloop
 # or gate layer genuinely in flight while the keypress lands, so these cases
 # prove the in-flight work is NOT hit by the keypress — the property the
 # runner's setsid isolation exists for.
@@ -2654,6 +2761,15 @@ mk_story "${TEMPLATE}/docs/user-stories/2026-08-13-fixture.md" "$SIGSTORY"
 git -C "$TEMPLATE" commit --quiet -am "two-task fixture for the stop cases" >/dev/null
 STOP_FILE_OF() { printf '%s/story-runner/.stop-requested' "$1"; }
 
+# V-STALE: the realistic stale-verdict path. Task 1's devloop ran Gate 2 (PASS) and
+# completed; task 2's devloop SKIPPED Gate 2, so task 1's verdict is still on disk. It
+# must not bind task 2's commit: escalate verdict-signature-mismatch, no layer run.
+run_story FAKE_DEVLOOP_VERDICTS="pass skip" -- fixture
+assert_exit      "vstale-exit1" 1 "$RC"
+assert_status    "vstale-task1-completed" "completed" "$(manifest_status "$FIX" 1)"
+assert_status    "vstale-task2-escalated" "escalated" "$(manifest_status "$FIX" 2)"
+assert_status    "vstale-token" "GATE2-VERDICT-UNBOUND task=2 — verdict-signature-mismatch" "$OUTPUT"
+
 # SI1: Ctrl-C ONCE during the devloop — acknowledged at once, the session is NOT
 # killed, it finishes, its gate runs, it is recorded, then the run stops before
 # task 2 (and before the story-close gate).
@@ -2668,7 +2784,7 @@ wait_runner
 assert_exit      "si1-exit0" 0 "$RC"
 assert_status    "si1-stopped" "STOPPED at operator request" "$OUTPUT"
 assert_marker    "si1-session-ran-to-completion" "$MARK" 'devloop.released'
-assert_marker    "si1-gate-ran" "$MARK" 'ran.layer7'
+assert_marker    "si1-gate-ran" "$MARK" 'ran.layer3'
 assert_no_marker "si1-close-gate-skipped" "$MARK" 'ran.layer-all'
 if [ "$(manifest_status "$FIX" 1)" = "completed" ] && [ "$(manifest_status "$FIX" 2)" = "pending" ] \
    && [ "$(cat "$MARK/devloop.count" 2>/dev/null)" = "1" ]; then PASS=$((PASS+1)); else
@@ -2702,15 +2818,15 @@ reap_bg
 # SI3: Ctrl-C ONCE during the GATE — the gate layer is NOT killed (it would
 # otherwise be recorded as a gate failure); the task completes, then the run stops.
 REL="${WORK}/release.si3"
-BG=1 run_story REAL_SLEEP_BIN="$REAL_SLEEP" FAKE_LAYER7_HOLD="$REL" -- fixture
-await si3-held test -e "$MARK/layer7.held"
+BG=1 run_story REAL_SLEEP_BIN="$REAL_SLEEP" FAKE_LAYER3_HOLD="$REL" -- fixture
+await si3-held test -e "$MARK/layer3.held"
 kill -INT -- "-${RUNNER_PID}"
 await si3-ack grep -q "STOP-REQUESTED (Ctrl-C)" "$ERR"
 touch "$REL"
 wait_runner
 assert_exit   "si3-exit0" 0 "$RC"
 assert_status "si3-stopped" "STOPPED at operator request" "$OUTPUT"
-assert_marker "si3-gate-survived" "$MARK" 'layer7.released'
+assert_marker "si3-gate-survived" "$MARK" 'layer3.released'
 assert_status "si3-task1-completed" "completed" "$(manifest_status "$FIX" 1)"
 assert_status "si3-task2-pending" "pending" "$(manifest_status "$FIX" 2)"
 reap_bg
@@ -2719,8 +2835,8 @@ reap_bg
 # ESCALATED reason operator-abort (the attempt is committed, so --revalidate
 # accepts it). Exit 1, the escalation lane's code.
 REL="${WORK}/release.si4"
-BG=1 run_story REAL_SLEEP_BIN="$REAL_SLEEP" FAKE_LAYER7_HOLD="$REL" -- fixture
-await si4-held test -e "$MARK/layer7.held"
+BG=1 run_story REAL_SLEEP_BIN="$REAL_SLEEP" FAKE_LAYER3_HOLD="$REL" -- fixture
+await si4-held test -e "$MARK/layer3.held"
 kill -INT -- "-${RUNNER_PID}"
 await si4-ack grep -q "STOP-REQUESTED (Ctrl-C)" "$ERR"
 kill -INT -- "-${RUNNER_PID}"
@@ -2730,7 +2846,7 @@ assert_status "si4-escalated" "escalated" "$(manifest_status "$FIX" 1)"
 assert_status "si4-reason" "operator-abort" "$(jq -r '.reason // "MISSING"' "$(RUN_DIR_OF "$DT")/escalation.json" 2>/dev/null || echo NO-RECORD)"
 assert_status "si4-revalidate-guidance" "--revalidate" "$OUTPUT"
 touch "$REL"; "$REAL_SLEEP" 1
-assert_no_marker "si4-gate-terminated" "$MARK" 'layer7.released'
+assert_no_marker "si4-gate-terminated" "$MARK" 'layer3.released'
 reap_bg
 
 # SI5: --request-stop from ANOTHER process while a devloop is in flight. A

@@ -32,9 +32,11 @@
 #   --revalidate    operator-intervention retry for the escalated task the run
 #                   reaches: re-run ONLY the authoritative gate against the tree
 #                   as committed by the prior attempt (no devloop is spawned).
-#                   For a failure judged environmental, not diff-caused (e.g. a
-#                   since-fixed flaky Layer-7 test). Green -> complete; red ->
-#                   re-escalate. Composable with --stop-after.
+#                   For a failure judged environmental, not diff-caused, or after
+#                   committing a fix on top. Depth follows the Gate-2 verdict
+#                   (ADR-0035 §3, 2026-11-10 amendment): layers 1-3 if a PASSING
+#                   layer-all verdict covers HEAD's tree, else the FULL gate (1-7).
+#                   Green -> complete; red -> re-escalate. Composable with --stop-after.
 #   --restart <text>  operator-intervention retry for the escalated task the run
 #                   reaches: spawn a FRESH devloop seeded with <text> (the
 #                   operator's diagnosis), the prior attempt's commit and its
@@ -399,6 +401,13 @@ if [ -n "$__seam_dt_story" ]; then DT_STORY="$__seam_dt_story"; fi
 # (6) Enter the (possibly redirected) root. Nothing above this line touches the
 # working tree.
 cd "$REPO_ROOT"
+
+# Gate-2 binding library (run_gate's verdict check, ADR-0035 §3 2026-11-10 amendment).
+# Sourced from the RUNNER's own tree (REAL_REPO_ROOT), like the runner itself — it is
+# runner code, not something a redirected fixture root supplies. Its git calls run in
+# CWD, i.e. against REPO_ROOT. Source-safe by design (no file-scope option changes).
+# shellcheck source=../lang/_gate2_binding.sh
+source "${REAL_REPO_ROOT}/scripts/lang/_gate2_binding.sh"
 
 # Seam-active announcement, beside the substrate-bound line below: a seam-active
 # artifact tree must never be readable as production evidence. Deliberately
@@ -1050,6 +1059,9 @@ escalate() {
   else
     slogerr "STORY_RUN: recover after diagnosing: rerun with --revalidate (re-run the gate ONLY, for an environmental failure) OR --restart 'what to fix' (fresh devloop from THIS commit). A plain rerun re-implements from scratch."
   fi
+  if [ "$reason" = "gate2-verdict-unbound" ]; then
+    slogerr "STORY_RUN: gate2-verdict-unbound: the devloop committed a tree no PASSING layer-all.sh run covers (its Gate 2 was skipped or failed, or the tree changed afterwards). Read the commit and the devloop's main.md; --revalidate then runs the FULL gate (layers 1-7) on HEAD."
+  fi
   # Auto-suggest the interactive lane after the 2nd+ escalation of THIS task (count
   # the per-attempt records this escalate() writes). A SUGGESTION only — never an
   # auto-switch into a lane that needs a human who may not be present (that is the
@@ -1490,42 +1502,70 @@ latest_escalation_record() {
   ls -1 "$RUN_DIR"/task-"${id}".runner-escalation.*.json 2>/dev/null | sort | tail -n 1 || true
 }
 
-# run_gate <id> — the AUTHORITATIVE per-task gate: layers 1-6 then layer 7,
-# appended to $gatelog. Factored so the normal completion path and --revalidate
-# run the IDENTICAL invocation (ADR-0035 §3 — pass/fail authority is this gate,
-# never the devloop's verdict). Sets the globals gate_rc / gate_layer /
-# gate_layers that the caller's operator-vs-implementer split reads.
+# run_gate <id> <on-unbound> — the AUTHORITATIVE per-task gate, appended to $gatelog.
+# Factored so the normal completion path and --revalidate share one invocation. Sets
+# the globals gate_rc / gate_layer / gate_layers that the caller's operator-vs-
+# implementer split reads, and gate_unbound (below).
+#
+# DEPTH (ADR-0035 §3, 2026-11-10 amendment). The devloop's own Gate 2 already ran the
+# full layer-all (incl. the ~25 min layer 7) on the tree it committed, and the
+# pre-commit hook bound that verdict to the staged tree. So:
+#   - verdict binds HEAD's committed tree (gate2_verdict_binds_commit) → layers 1-3
+#     only: re-runs the cheap layers on the COMMITTED tree, which is where a guard that
+#     answers differently before vs after the commit shows up (story 4: tasks 8, 9);
+#   - no binding verdict, <on-unbound>=full (--revalidate: operator present, e.g. fix
+#     commits on top that no layer-all run covered) → the full gate, layers 1-7;
+#   - no binding verdict, <on-unbound>=escalate (normal path) → run nothing, set
+#     gate_unbound="<token>: <detail>"; the caller escalates (a devloop commit with no
+#     PASS layer-all over its tree means Gate 2 was skipped or bypassed).
+# Threat model is anti-laziness (see _gate2_binding.sh header), not anti-forgery; CI and
+# the story-close full layer-all remain the independent backstops.
 run_gate() {
-  local id="$1" n rc gate_start
-  # EVERY task runs layers 1-6 then layer 7 (2026-08-20 — layer 7 is now
-  # UNCONDITIONAL, no longer gated on an env_tests tag; that manifest field was
-  # removed). The `1-6+7` label is kept deliberately: layer 7 is a separate
-  # ~10-15min cost envelope, so the `+7` preserves that distinction — it no
-  # longer signals conditionality.
-  gate_layers="1-6+7"
-  slog "STORY_RUN: GATE task=${id} layers=${gate_layers} running (log=${gatelog})"
-  gate_start="$(date +%s)"
+  local id="$1" on_unbound="$2" n rc gate_start why
+  local -a layers=()
   gate_rc=0
   gate_layer=0
+  gate_unbound=""
+  # Evidence: keep this attempt's verdict (GATE2_VERDICT_FILE is one path every run
+  # overwrites). Timestamped so a later --revalidate never replaces the attempt's copy.
+  cp -f "$GATE2_VERDICT_FILE" "$RUN_DIR/task-${id}.gate2-verdict.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
+  if why="$(gate2_verdict_binds_commit "$GATE2_VERDICT_FILE" HEAD)"; then
+    gate_layers="1-3"
+    layers=(1 2 3)
+    slog "STORY_RUN: GATE2-VERDICT-BOUND task=${id} — the devloop's PASSING layer-all (HEAD=$(gate2_verdict_get HEAD "$GATE2_VERDICT_FILE" | cut -c1-12), RUN_AT=$(gate2_verdict_get RUN_AT "$GATE2_VERDICT_FILE")) covers HEAD's tree; re-running layers 1-3 on the committed tree."
+  elif [ "$on_unbound" = full ]; then
+    gate_layers="1-7"
+    layers=(1 2 3 4 5 6 7)
+    slog "STORY_RUN: GATE2-VERDICT-UNBOUND task=${id} (${why}) — running the full gate."
+  else
+    gate_unbound="$why"
+    gate_layers="none"
+    # Fail closed for any caller that reads only gate_rc: non-zero, operator class
+    # (rc 2), so a missed gate_unbound check can never fall through to complete_task.
+    gate_rc=2
+    printf 'STORY_RUN: GATE2-VERDICT-UNBOUND task=%s: %s\n' "$id" "$why" >> "$gatelog"
+    slogerr "STORY_RUN: GATE2-VERDICT-UNBOUND task=${id} — ${why}"
+    return 0
+  fi
+  slog "STORY_RUN: GATE task=${id} layers=${gate_layers} running (log=${gatelog})"
+  gate_start="$(date +%s)"
   # ADR-0037 §D7: this is the ADR-0035 §3 per-task AUTHORITY gate (also the --revalidate gate). It must
   # NEVER auto-format the tree it attests, so force the fmt lane CHECK-only via DEVLOOP_FMT_CHECK_ONLY —
   # which out-ranks any ambient DEVLOOP_FMT_APPLY in fmt_mode's precedence (defense-in-depth: a gate
   # invoked from a devloop session that opted into apply still checks). Per-invocation prefix, NOT
   # exported (an export would strip auto-apply from the spawned devloop session, defeating D7 there).
-  for n in 1 2 3 4 5 6; do
+  # Layer 7 is invoked without it, as before (it has no fmt lane).
+  for n in "${layers[@]}"; do
     set +e
-    run_isolated gate "$gatelog" env DEVLOOP_FMT_CHECK_ONLY=1 "scripts/layer${n}.sh"
+    if [ "$n" -eq 7 ]; then
+      run_isolated gate "$gatelog" scripts/layer7.sh
+    else
+      run_isolated gate "$gatelog" env DEVLOOP_FMT_CHECK_ONLY=1 "scripts/layer${n}.sh"
+    fi
     rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then gate_rc=$rc; gate_layer=$n; break; fi
   done
-  if [ "$gate_rc" -eq 0 ]; then
-    set +e
-    run_isolated gate "$gatelog" scripts/layer7.sh
-    gate_rc=$?
-    set -e
-    [ "$gate_rc" -ne 0 ] && gate_layer=7
-  fi
   slog "STORY_RUN: GATE task=${id} layers=${gate_layers} rc=${gate_rc} elapsed=$(( $(date +%s) - gate_start ))s"
 }
 
@@ -2152,7 +2192,7 @@ while :; do
         slogerr "STORY_RUN: REVALIDATE-DIRTY-TREE task=${id} — the work tree has uncommitted changes beyond the manifest reopen, so the gate would validate work this completion (which stages only ${STORY_FILE}) will NOT record — a green not reproducible from the commit. Commit or clean the tree, then rerun. Offending: $(printf '%s' "$reval_status" | head -n 5 | tr '\n' ';')"
         exit 2
       fi
-      run_gate "$id"
+      run_gate "$id" full
       if [ "$gate_rc" -eq 0 ]; then
         # RE-ATTEST THE TREE (S-8, ADR-0037 §D7). The pre-gate check above proved the
         # tree clean; the gate is forced CHECK-only (run_gate prefixes
@@ -2490,11 +2530,40 @@ while :; do
   fi
   [ "$head_after" = "$head_before" ] && escalate "$id" devloop-no-commit "$tasklog"
 
-  # Gate: EVERY task runs layers 1-6 then layer 7 (the authoritative pass/fail
-  # run, ADR-0035 §3). Factored into run_gate so --revalidate uses the IDENTICAL
-  # invocation; run_gate sets gate_rc / gate_layer, read by the split below. Full
-  # pipeline incl. layer 7 also runs once at story close.
-  run_gate "$id"
+  # Gate (ADR-0035 §3, 2026-11-10 amendment): layers 1-3 on the committed tree when
+  # the devloop's PASSING Gate-2 verdict binds HEAD's tree; otherwise escalate — a
+  # devloop commit with no layer-all over its tree skipped or bypassed Gate 2, and
+  # --revalidate (which runs the full gate when unbound) is the operator's recovery.
+  # run_gate sets gate_rc / gate_layer, read by the split below. The full pipeline
+  # incl. layer 7 still runs once at story close.
+  #
+  # COMMITTED-TREE ATTESTATION: layers 1-3 run on the work tree, so it must BE the
+  # committed tree, or the post-commit re-run proves nothing about the commit (and
+  # complete_task stages only $STORY_FILE). Paths the Gate-2 binding excludes
+  # (devloop outputs, TODO.md, specialist INDEX.md, story files) are legitimate
+  # post-commit bookkeeping and are tolerated, matching the binding's own universe.
+  post_status="$(working_tree_status "$id" "$giterr" "checking the task left a committed tree")"
+  post_left="$(printf '%s\n' "$post_status" | while IFS= read -r __l; do
+      [ -n "$__l" ] || continue
+      __p="${__l:3}"; __p="${__p##* -> }"
+      gate2_is_excluded "$__p" || printf '%s\n' "$__l"
+    done)"
+  if [ -n "$post_left" ]; then
+    printf 'STORY_RUN: UNCOMMITTED-AFTER-TASK task=%s:\n%s\n' "$id" "$post_left" >> "$gatelog"
+    slogerr "STORY_RUN: UNCOMMITTED-AFTER-TASK task=${id} — the devloop committed but left changes outside the Gate-2 exclusion set, so the gate cannot attest the commit. Offending: $(printf '%s' "$post_left" | head -n 5 | tr '\n' ';')"
+    escalate "$id" uncommitted-after-task "$gatelog"
+  fi
+  # --interactive: a human is present, as under --revalidate, so an unbound verdict
+  # (a hand fix committed without re-running layer-all) gets the full gate, not an
+  # escalation that would only ask the same human to rerun with --revalidate.
+  if [ "${INTERACTIVE_SPAWN:-0}" -eq 1 ]; then
+    run_gate "$id" full
+  else
+    run_gate "$id" escalate
+  fi
+  if [ -n "$gate_unbound" ]; then
+    escalate "$id" gate2-verdict-unbound "$gatelog"
+  fi
   # OPERATOR vs IMPLEMENTER (R-4). The pipeline already draws and names this
   # line: lang/_common.sh status_to_exit_code maps FAIL -> 1 (implementer) and
   # PRECONDITION_FAILURE | FAIL-MISSING-VERB | UNKNOWN -> 2 (operator), with a

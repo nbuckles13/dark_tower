@@ -240,12 +240,22 @@ gate2_changeset_staged() {
 # NOT switch the producer to index blobs — that would break the emit-at-worktree-
 # time model (the producer runs before `git add`). Documented assumption.
 #
-# Symlinks: git hash-object / the index blob hash the LINK TARGET STRING, not the
-# pointed-to file. No traversal — intended. Do not "fix" this to follow the link.
+# Symlinks: git stores a symlink as a blob of its LINK TARGET STRING (what the index,
+# `rev-parse :path` and `rev-parse <tip>:path` return). `git hash-object <path>`,
+# however, FOLLOWS the link and hashes the pointed-to file's contents — so the producer
+# hashes the target string itself (readlink | hash-object --stdin) to stay symmetric.
+# No traversal — intended. (Before 2026-11-10 the producer followed the link, so any
+# changed symlink made the hook and the runner refuse; fail-closed, but wrong.)
 # -----------------------------------------------------------------------------
 
 # gate2_blob_worktree <path> → blob OID of the working-tree file (producer).
 gate2_blob_worktree() {
+  if [[ -L "$1" ]]; then
+    local target
+    target="$(readlink -n -- "$1")" || return 1
+    printf '%s' "$target" | git hash-object --stdin
+    return
+  fi
   git hash-object -- "$1"
 }
 
@@ -392,6 +402,116 @@ gate2_records_staged() {
     blob="$(gate2_blob_staged "$path")" || return 1   # explicit; see gate2_records_worktree
     printf '%s %s\0' "$blob" "$path"
   done
+}
+
+# -----------------------------------------------------------------------------
+# COMMITTED variant — the story runner's post-commit check (ADR-0035 §3, 2026-11-10
+# amendment). The third plumbing variant beside worktree (producer) and staged (hook):
+#   - committed (runner): diff <base>..<tip>, blobs via git rev-parse <tip>:path
+# <base> is the verdict's own HEAD, so this stream is byte-identical to what the
+# producer emitted iff <tip>'s tree (minus exclusions) is the tree layer-all ran on.
+# That is what makes it immune to the trap ADR-0035 §3 records: recomputing the
+# WORKTREE stream after a commit diffs against the NEW HEAD, which is empty for any
+# clean tree and so "matches" any verdict computed over an empty change. Here the
+# base comes from the verdict, never from the current HEAD.
+# Same exclusions, --no-renames, deletion sentinel and fail-closed contract as the
+# other two variants (SYMMETRY CONSTRAINT above).
+# -----------------------------------------------------------------------------
+gate2_changeset_commit() {
+  local -; set -euo pipefail
+  git diff -z --no-renames --name-only "$1" "$2" -- | __gate2_filter_excluded | LC_ALL=C sort -z -u
+}
+gate2_deletions_commit() {
+  local -; set -euo pipefail
+  git diff --diff-filter=D -z --no-renames --name-only "$1" "$2" -- | __gate2_filter_excluded | LC_ALL=C sort -z -u
+}
+# gate2_blob_commit <tip> <path> — blob OID of <path> in <tip>'s tree. Equal to the
+# producer's `git hash-object` for equal content (OID-EQUALITY ASSUMPTION above).
+gate2_blob_commit() {
+  git rev-parse --verify --quiet "$1:$2"
+}
+
+# gate2_records_commit <base> <tip> → NUL-delimited "<token> <path>" records for the
+# change <base>..<tip>. Same classification and fail-closed contract as
+# gate2_records_worktree.
+gate2_records_commit() {
+  local -; set -euo pipefail
+  local base="$1" tip="$2" path blob d
+  local -A deleted=()
+  local -a dels=() paths=()
+  __gate2_capture_nul dels gate2_deletions_commit "$base" "$tip" || return 1
+  __gate2_capture_nul paths gate2_changeset_commit "$base" "$tip" || return 1
+  for d in "${dels[@]+"${dels[@]}"}"; do deleted["$d"]=1; done
+  for path in "${paths[@]+"${paths[@]}"}"; do
+    if [[ -n "${deleted[$path]:-}" ]]; then
+      printf '%s %s\0' "$GATE2_DELETED_OID" "$path"
+      continue
+    fi
+    blob="$(gate2_blob_commit "$tip" "$path")" || return 1   # explicit; see gate2_records_worktree
+    printf '%s %s\0' "$blob" "$path"
+  done
+}
+
+# gate2_verdict_binds_commit <verdict-file> [tip] — does a PASSING layer-all verdict
+# attest <tip>'s committed tree (default HEAD)? Returns 0 iff ALL hold:
+#   1. the verdict exists and carries this SCHEMA;
+#   2. GATE2=PASS (layer-all exited 0, i.e. every layer ran and passed);
+#   3. its HEAD is a full commit OID that is an ancestor of (or equal to) <tip>;
+#   4. its SIGNATURE equals gate2_records_commit <verdict HEAD> <tip> | gate2_signature.
+# Holding 3+4 means the tree layer-all validated IS <tip>'s tree outside the exclusion
+# set, however many commits (task, manifest bump, operator fixes) lie in between.
+# Otherwise returns 1 and prints ONE line "<token>: <detail>" on stdout, token from the
+# closed set: verdict-missing | verdict-schema | verdict-not-pass | verdict-head-invalid
+# | verdict-head-not-ancestor | verdict-signature-mismatch | verdict-recompute-failed.
+# FAIL-CLOSED: every git error is a non-match (return 1), never a match.
+# THREAT MODEL: anti-laziness, as for the hook (header) — a hand-written verdict passes.
+gate2_verdict_binds_commit() {
+  local file="$1" tip_ref="${2:-HEAD}"
+  local schema gate2 vhead vsig tip sig anc_rc=0
+  gate2_require_bash4 >/dev/null 2>&1 || { printf 'verdict-recompute-failed: bash >= 4.4 required\n'; return 1; }
+  if [[ ! -f "$file" ]]; then
+    printf 'verdict-missing: no Gate-2 verdict at %s (layer-all.sh has not run in this container)\n' "$file"
+    return 1
+  fi
+  schema="$(gate2_verdict_get SCHEMA "$file")"
+  gate2="$(gate2_verdict_get GATE2 "$file")"
+  vhead="$(gate2_verdict_get HEAD "$file")"
+  vsig="$(gate2_verdict_get SIGNATURE "$file")"
+  if [[ "$schema" != "$GATE2_SCHEMA" ]]; then
+    printf 'verdict-schema: SCHEMA=%s, expected %s\n' "$(__gate2_printable "$schema")" "$GATE2_SCHEMA"
+    return 1
+  fi
+  if [[ "$gate2" != "PASS" ]]; then
+    printf 'verdict-not-pass: GATE2=%s LAYER_ALL_EXIT=%s\n' "$(__gate2_printable "$gate2")" \
+      "$(__gate2_printable "$(gate2_verdict_get LAYER_ALL_EXIT "$file")")"
+    return 1
+  fi
+  if ! [[ "$vhead" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || ! git cat-file -e "${vhead}^{commit}" 2>/dev/null; then
+    printf 'verdict-head-invalid: HEAD=%s is not a commit in this repository\n' "$(__gate2_printable "$vhead")"
+    return 1
+  fi
+  if ! tip="$(git rev-parse --verify --quiet "${tip_ref}^{commit}")"; then
+    printf 'verdict-recompute-failed: cannot resolve %s to a commit\n' "$(__gate2_printable "$tip_ref")"
+    return 1
+  fi
+  git merge-base --is-ancestor "$vhead" "$tip" 2>/dev/null || anc_rc=$?
+  if [[ "$anc_rc" -eq 1 ]]; then
+    printf 'verdict-head-not-ancestor: verdict HEAD %s is not an ancestor of %s (the verdict is for another line of history)\n' "${vhead:0:12}" "${tip:0:12}"
+    return 1
+  elif [[ "$anc_rc" -ne 0 ]]; then
+    printf 'verdict-recompute-failed: git merge-base --is-ancestor exited %s\n' "$anc_rc"
+    return 1
+  fi
+  if ! sig="$(set -o pipefail; gate2_records_commit "$vhead" "$tip" | gate2_signature)"; then
+    printf 'verdict-recompute-failed: computing the committed-tree signature over %s..%s failed\n' "${vhead:0:12}" "${tip:0:12}"
+    return 1
+  fi
+  if [[ "$sig" != "$vsig" ]]; then
+    printf 'verdict-signature-mismatch: the tree at %s differs from the tree layer-all validated (verdict HEAD %s, RUN_AT %s) — something changed after the last layer-all run\n' \
+      "${tip:0:12}" "${vhead:0:12}" "$(__gate2_printable "$(gate2_verdict_get RUN_AT "$file")")"
+    return 1
+  fi
+  return 0
 }
 
 # -----------------------------------------------------------------------------
