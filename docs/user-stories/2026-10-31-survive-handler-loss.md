@@ -2062,7 +2062,7 @@ tasks:
   slug: 2026-11-10-mh-pool-fixture
   tag: story-2026-10-31-survive-handler-loss-task-T-1
 - id: 19
-  status: pending
+  status: completed
   specialist: media-handler
   deps:
   - 3
@@ -2150,6 +2150,7 @@ tasks:
 
     CROSS-TASK OBLIGATIONS
     (a)–(e) as listed in the story plan. Tier: full (auth/crypto, client-facing wire, GSA).
+  slug: 2026-11-10-mh-media-dial-admission
   tag: story-2026-10-31-survive-handler-loss-task-MH-1
 - id: 20
   status: pending
