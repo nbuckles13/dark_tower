@@ -1494,12 +1494,109 @@ case_r17() {
   fi
 }
 
-printf 'gate2 isolation self-test (matrix a–f + Phase≠complete refusal f2/f2b/s1–s13 + slug/extra-file/exclusion/ambiguity/deletion/adversarial-ordering/remediation-ordering/source-safety guards + replay skip q1–q9/r1–r24):\n'
+# ---------------------------------------------------------------------------
+# (v1–v9) COMMITTED binding — gate2_verdict_binds_commit, the story runner's
+# post-commit check (ADR-0035 §3, 2026-11-10 amendment). The verdict is emitted over
+# the WORKTREE (as layer-all's EXIT trap does) BEFORE the commit; the check runs AFTER.
+# ---------------------------------------------------------------------------
+# vb — run the check against HEAD; sets out/rc in the caller's scope.
+vb() { out="$(gate2_verdict_binds_commit "$GATE2_VERDICT_FILE" HEAD)" && rc=0 || rc=$?; }
+# shellcheck disable=SC2034  # ls/ld are read by emit_gate2_verdict through namerefs
+v_emit() { declare -A ls=( [1]=OK [7]=OK ) ld=( [1]=1 [7]=2 ); emit_gate2_verdict "${1:-0}" ls ld; }
+# A devloop-shaped change: a modified, an untracked-new, and a deleted bound file, plus
+# an excluded main.md — then the commit.
+v_task_commit() {
+  echo keep > keep.rs; echo old > gone.rs; git add -A; git commit -qm base
+  mk_main_md "story-v" "complete"
+  echo changed > keep.rs; echo new > new.rs; rm gone.rs
+  v_emit "${1:-0}"
+  git add -A; git commit -qm task
+}
+case_v1() {
+  seed_commit; v_task_commit; local out rc; vb
+  if [[ "$rc" -eq 0 ]]; then ok "(v1) PASS verdict over modified+untracked+deleted files binds the commit"; else bad "(v1) should bind (rc=$rc): $out"; fi
+}
+case_v2() {
+  seed_commit; v_task_commit
+  mkdir -p docs/user-stories; echo bump > docs/user-stories/2026-01-01-s.md
+  git add -A; git commit -qm "manifest bump"
+  local out rc; vb
+  if [[ "$rc" -eq 0 ]]; then ok "(v2) an excluded-path commit on top (manifest bump) still binds"; else bad "(v2) should bind (rc=$rc): $out"; fi
+}
+case_v3() {
+  seed_commit; v_task_commit
+  echo fix > operator-fix.rs; git add -A; git commit -qm "operator fix"
+  local out rc; vb
+  if [[ "$rc" -eq 1 ]] && [[ "$out" == verdict-signature-mismatch:* ]]; then ok "(v3) a bound-path commit on top → verdict-signature-mismatch"; else bad "(v3) should mismatch (rc=$rc): $out"; fi
+}
+case_v4() {
+  seed_commit; v_task_commit 1; local out rc; vb
+  if [[ "$rc" -eq 1 ]] && [[ "$out" == verdict-not-pass:* ]]; then ok "(v4) FAIL verdict → verdict-not-pass"; else bad "(v4) should refuse (rc=$rc): $out"; fi
+}
+case_v5() {
+  seed_commit; local out rc; vb
+  if [[ "$rc" -eq 1 ]] && [[ "$out" == verdict-missing:* ]]; then ok "(v5) no verdict → verdict-missing"; else bad "(v5) should refuse (rc=$rc): $out"; fi
+}
+case_v6() {
+  # A PASS verdict made on a sibling branch, after that branch's own commit (so its HEAD
+  # is the side commit, which main does not contain).
+  seed_commit; git checkout -qb side; echo side > side.rs; git add -A; git commit -qm side; v_emit 0
+  git checkout -q main; echo main > main.rs; git add -A; git commit -qm main
+  local out rc; vb
+  if [[ "$rc" -eq 1 ]] && [[ "$out" == verdict-head-not-ancestor:* ]]; then ok "(v6) verdict from another line of history → verdict-head-not-ancestor"; else bad "(v6) should be not-ancestor (rc=$rc): $out"; fi
+}
+# (v7) THE RECORDED TRAP (ADR-0035 §3): a verdict emitted over a CLEAN tree (empty record
+# stream) must not bind a later commit. Recomputing the WORKTREE stream post-commit is
+# empty too and would "match"; the committed variant diffs from the verdict's own HEAD.
+case_v7() {
+  seed_commit; v_emit 0
+  local out rc; vb
+  if [[ "$rc" -ne 0 ]]; then bad "(v7) clean-tree verdict should bind its own HEAD (rc=$rc): $out"; return; fi
+  echo later > later.rs; git add -A; git commit -qm later
+  vb
+  if [[ "$rc" -eq 1 ]] && [[ "$out" == verdict-signature-mismatch:* ]]; then ok "(v7) clean-tree verdict binds its own HEAD but NOT a later commit (empty-stream trap closed)"; else bad "(v7) stale clean-tree verdict must not bind a later commit (rc=$rc): $out"; fi
+}
+case_v8() {
+  seed_commit; echo body > a.rs; git add -A; git commit -qm a
+  git mv a.rs b.rs; v_emit 0; git commit -qm rename
+  local out rc; vb
+  if [[ "$rc" -eq 0 ]]; then ok "(v8) a rename (--no-renames on both sides) binds"; else bad "(v8) rename should bind (rc=$rc): $out"; fi
+}
+case_v9() {
+  seed_commit; v_emit 0; sed -i 's/^HEAD=.*/HEAD=not-a-sha/' "$GATE2_VERDICT_FILE"
+  local out rc; vb
+  if [[ "$rc" -eq 1 ]] && [[ "$out" == verdict-head-invalid:* ]]; then ok "(v9) garbage HEAD → verdict-head-invalid"; else bad "(v9) should refuse (rc=$rc): $out"; fi
+}
+
+# (v10) a symlink is stored as its target STRING; the producer must hash that, not
+# follow the link to the target file (else hook + runner refuse every symlink change).
+case_v10() {
+  seed_commit; echo t > target.txt; git add -A; git commit -qm target
+  # A complete devloop main.md makes this a devloop commit, so the hook really enforces.
+  mk_main_md "story-v10" "complete"; ln -s target.txt link; v_emit 0
+  git add -A
+  local hout
+  if ! hout="$(gate2_validate_commit 2>&1)"; then bad "(v10) hook should accept a symlink validated by layer-all: $hout"; return; fi
+  git commit -qm link
+  local out rc; vb
+  if [[ "$rc" -eq 0 ]]; then ok "(v10) a new symlink binds (hook staged + runner committed)"; else bad "(v10) symlink should bind (rc=$rc): $out"; fi
+}
+# (v11) a file untracked at verdict time but never committed: the commit is not the
+# validated tree → mismatch.
+case_v11() {
+  seed_commit; echo a > a.rs; echo b > b.rs; v_emit 0
+  git add a.rs; git commit -qm "a only"
+  local out rc; vb
+  if [[ "$rc" -eq 1 ]] && [[ "$out" == verdict-signature-mismatch:* ]]; then ok "(v11) validated-but-uncommitted file → verdict-signature-mismatch"; else bad "(v11) should mismatch (rc=$rc): $out"; fi
+}
+
+printf 'gate2 isolation self-test (matrix a–f + Phase≠complete refusal f2/f2b/s1–s13 + slug/extra-file/exclusion/ambiguity/deletion/adversarial-ordering/remediation-ordering/source-safety guards + replay skip q1–q9/r1–r24 + committed binding v1–v11):\n'
 for c in case_a case_b case_c case_d case_e case_f case_f2b case_s1 case_s2 case_s3a case_s3b case_s4 case_s5 \
          case_s6 case_s7 case_s8 case_s9 case_s10 case_s11 case_s12 case_s12b case_s12c case_s13 case_g case_h case_i case_j case_k case_l case_m case_n case_o case_p \
          case_q1 case_q2 case_q3 case_q4 case_q5 case_q7 case_q8 case_q9 \
          case_r1 case_r2 case_r5 case_r6 case_r6b case_r6c case_r7 case_r8 case_r9 \
-         case_r10 case_r10b case_r11 case_r12 case_r12c case_r13 case_r19 case_r20 case_r21 case_r22 case_r15 case_r16 case_r17 case_r23 case_r24; do
+         case_r10 case_r10b case_r11 case_r12 case_r12c case_r13 case_r19 case_r20 case_r21 case_r22 case_r15 case_r16 case_r17 case_r23 case_r24 \
+         case_v1 case_v2 case_v3 case_v4 case_v5 case_v6 case_v7 case_v8 case_v9 case_v10 case_v11; do
   with_temp_repo "$c" || true
 done
 
