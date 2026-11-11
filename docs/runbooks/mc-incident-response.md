@@ -1635,11 +1635,11 @@ kubectl get pods -n dark-tower -l app=mh-service
 
 The client reports a media failure; the cause is almost always on the **client→MH media path**, upstream of MC. MC signaling is healthy by definition here (the report arrived). Triage by corroborating evidence.
 
-> **Strong-signal short-circuit**: if the elevated `failed` share correlates with elevated `mh_register_meeting_timeouts_total` (MH Sc 13) AND/OR `mc_register_meeting_total{status="error"}` (MC Sc 12) in the same window, treat the RegisterMeeting coordination break as the upstream root cause — clients reach MH, get JWT-validated, then provisional-kicked because the meeting was never registered, which surfaces to clients as failed media. Fix the coordination and the failed share decays. Skip to root cause #3.
+> **Strong-signal short-circuit**: if the elevated `failed` share correlates with elevated `mh_jwt_validations_total{token_type="media_dial",failure_reason="no_meeting_key"}` (MH Sc 24) AND/OR `mc_register_meeting_total{status="error"}` (MC Sc 12) in the same window, treat the RegisterMeeting coordination break as the upstream root cause — clients reach MH with a dial token for a meeting that handler never registered and are DECLINED at accept, which surfaces to clients as failed media. Fix the coordination and the failed share decays. Skip to root cause #3.
 
 1. **MH WebTransport rejections fleet-wide** — clients reach MH but are rejected during handshake. Check `mh_webtransport_connections_total{status="rejected"}`. See [MH Sc 5: WebTransport Rejections](mh-incident-response.md#scenario-5-webtransport-rejections).
-2. **MH JWT validation failures** — valid JWTs at MC, rejected at MH (JWKS skew, key rotation). See [MH Sc 2: JWT Validation Failures](mh-incident-response.md#scenario-2-jwt-validation-failures).
-3. **MH RegisterMeeting timeouts** — clients arriving before MC registered the meeting; MH provisional-kicks them. See [MH Sc 13](mh-incident-response.md#scenario-13-registermeeting-timeout--clients-kicked) and [MC Sc 12](#scenario-12-registermeeting-coordination-failures).
+2. **MH `media_dial` credential rejections** — MC-minted dial tokens rejected at MH (`expired` = refresh push or clock drift; `signature_invalid` = key/registration drift; `aud_mismatch` = stale handler set). See [MH Sc 24: Media-Dial Credential Rejections](mh-incident-response.md#scenario-24-media-dial-credential-rejections).
+3. **Dials for a meeting MH does not hold** — a token reached a client before (or without) the handler's `RegisterMeeting` ack, or for a released/restarted handler; MH DECLINES at accept (`mh_jwt_validations_total{token_type="media_dial",failure_reason="no_meeting_key"}`). See [MH Sc 24](mh-incident-response.md#scenario-24-media-dial-credential-rejections) and [MC Sc 12](#scenario-12-registermeeting-coordination-failures).
 4. **MH down or unreachable** — full MH outage or NetworkPolicy regression between client and MH (UDP/4434). Check MH pod health per MH Sc 1.
 5. **TLS / certificate issues at MH** — clients fail the QUIC handshake. **Do not conclude this from `failure_reason="tls"` alone** — verify with `openssl x509` against the actual MH cert and MH-side handshake metrics.
 6. **Network path / cloud firewall** — UDP egress from client → MH blocked. A diffuse pattern across many `mh_url` values from many clients points here.
@@ -1690,7 +1690,7 @@ Expected recovery time: bounded by the upstream MH/network fix; once resolved, i
 
 ### Scenario 12: RegisterMeeting Coordination Failures
 
-**Alert**: No alert today; surfaces in `mc_register_meeting_total{status="error"}` rate, `mc_register_meeting_duration_seconds` p95, and `RegisterMeeting retries exhausted` error logs at target `mc.register_meeting.trigger`. A second, distinct string — `RegisterMeeting failed terminally; not retried` — is a **different fault with the opposite remedy**; see Symptoms. May also co-fire MH-side [Scenario 13: RegisterMeeting Timeout — Clients Kicked](mh-incident-response.md#scenario-13-registermeeting-timeout--clients-kicked).
+**Alert**: No alert today; surfaces in `mc_register_meeting_total{status="error"}` rate, `mc_register_meeting_duration_seconds` p95, and `RegisterMeeting retries exhausted` error logs at target `mc.register_meeting.trigger`. A second, distinct string — `RegisterMeeting failed terminally; not retried` — is a **different fault with the opposite remedy**; see Symptoms. May also co-fire MH-side [Scenario 24: Media-Dial Credential Rejections](mh-incident-response.md#scenario-24-media-dial-credential-rejections) (`no_meeting_key`) if a dial token ever reaches a client for an unregistered handler — which register-before-token (ADR-0039 §3) should make impossible.
 **Severity**: warning
 **Runbook Section**: `#scenario-12-registermeeting-coordination-failures`
 
@@ -1700,15 +1700,15 @@ Expected recovery time: bounded by the upstream MH/network fix; once resolved, i
 
 **Symptoms**:
 - `mc_register_meeting_total{status="error"}` non-zero or rising vs baseline. MC retries each MH up to 3 attempts with 1s/2s backoffs (see the per-(meeting, handler) push worker in `crates/mc-service/src/media_routing/pusher.rs`); a steady error rate means retries are being exhausted. Since story 2 a failed push stays unconfirmed and is re-sent by the meeting's next structural change of any kind.
-- `mc_register_meeting_duration_seconds` p95 climbing — RegisterMeeting RPCs are succeeding but slowly, eating into the MH-side 15s timeout budget.
+- `mc_register_meeting_duration_seconds` p95 climbing — RegisterMeeting RPCs are succeeding but slowly; under register-before-token (ADR-0039 §3) this delays the first join's reply (tokens are issued only after the ack).
 - MC error log: `"RegisterMeeting retries exhausted"` (target `mc.register_meeting.trigger`) with `mh_grpc_endpoint`, `attempts_made` and the underlying error. This is the **retryable** class — flaky MC→MH coordination; the symptoms and remedies in this scenario are written for it.
 - MC error log: `"RegisterMeeting failed terminally; not retried"` (same target, `terminal = true`; `attempts_made` is whichever attempt hit the terminal outcome, so it is **not** always 1 — a transport error on attempt 1 followed by a terminal divergence on attempt 2 reports 2. `terminal = true` is the discriminator, never the attempt count) — **a DIFFERENT fault with the OPPOSITE remedy; do not treat it as this scenario.** MC deliberately does not retry it, because a `transport_mode_mismatch` is a genuine two-ends version skew between MC and MH and backoff cannot make a skewed handler agree. **Roll MH FORWARD; do NOT roll MC back** — rolling MC back returns it to `policy_generation: 0` registrations, which MH installs nothing for, i.e. the pre-change media blackhole rather than a fix. See `mc-deployment.md` §"Post-Deploy Monitoring Checklist: MC↔MH Coordination" → Rollback (MC half). The two strings are deliberately distinct so a `grep` for one cannot silently match the other.
-- Concurrent MH-side `mh_register_meeting_timeouts_total` rising — same incident from the receiver's vantage.
-- New meetings fail to ever produce media; clients connect to MH, get JWT-validated, then disconnected ~15s later. From a user perspective: "I joined the meeting but media never came up."
+- Concurrent MH-side `mh_jwt_validations_total{token_type="media_dial",failure_reason="no_meeting_key"}` rising — a register-before-token ordering bug, seen from the receiver's vantage (it should stay at zero even while registrations fail, because MC issues no token for an unacked handler).
+- New meetings fail to ever produce media: the first join's reply waits for the handler's ack, and a handler that never acks is left out of the handler set (possibly leaving none). From a user perspective: "I joined the meeting but media never came up."
 
-**Impact**: New meetings on this MC do not get registered with their assigned MHs, so first-participant clients are kicked by the MH provisional-accept timeout. **Existing already-registered meetings are unaffected** — RegisterMeeting fires only on first-participant join (R-12). Subset of new meetings affected; severity is warning because clients still have signaling to MC and the active/active topology means a single MH coordination failure does not block the meeting if other assigned MHs registered successfully.
+**Impact**: New meetings on this MC do not get registered with their assigned MHs, so MC issues no dial token for those handlers and first-participant clients get no media on them (the handler takes the replacement path). **Existing already-registered meetings are unaffected** — RegisterMeeting fires only on first-participant join (R-12). Subset of new meetings affected; severity is warning because clients still have signaling to MC and the active/active topology means a single MH coordination failure does not block the meeting if other assigned MHs registered successfully.
 
-> **Rollback awareness**: During a deliberate rollback to a pre-RegisterMeeting MH version, MC will see exactly these symptoms — old MH does not implement the RPC, so MC retries then exhausts. **This is expected during the rollback window**; clients still establish via the JWT path. Confirm by checking `./infra/kind/scripts/mh.sh list` (slots on different revisions / `stale`) for an in-progress rollback before treating as an incident. Coordinate with the deployer.
+> **Rollback awareness**: During a deliberate rollback to a pre-RegisterMeeting MH version, MC will see exactly these symptoms — old MH does not implement the RPC, so MC retries then exhausts. **This is expected during the rollback window**; join-time dials still establish via the `join_token` path that a pre-MH-1 MH reads, but later dials (added ref, redial, migration) are declined (only until story 4 P3; see `mh-deployment.md` §Rollback). Confirm by checking `./infra/kind/scripts/mh.sh list` (slots on different revisions / `stale`) for an in-progress rollback before treating as an incident. Coordinate with the deployer.
 
 **Diagnosis**:
 
@@ -1730,8 +1730,8 @@ clamp_min(sum(rate(mc_register_meeting_total[1h])), 0.001)
 kubectl logs -n dark-tower -l app=mc-service --tail=500 \
   | grep -iE "RegisterMeeting retries exhausted|RegisterMeeting attempt failed"
 
-# 5. MH-side correlate (timeouts on the receiving MH)
-sum(rate(mh_register_meeting_timeouts_total[5m]))
+# 5. MH-side correlate (dials for a meeting the receiving MH does not hold)
+sum(rate(mh_jwt_validations_total{token_type="media_dial",failure_reason="no_meeting_key"}[5m]))
 
 # 6. MC→MH gRPC reachability for the failing endpoint(s) from a fresh shell
 kubectl exec -it deployment/mc-0 -n dark-tower -- \
@@ -1801,18 +1801,18 @@ sum by(status) (rate(mc_register_meeting_total[5m]))
 
 Expected recovery time: 30-60s for horizontal MC scale; 1-2 minutes for NetworkPolicy revert; 2-3 minutes for AC service-token rotation + MC restart. A meeting whose handler set names a gone MH: does not recover on its own until story 4's replacement path (MC-C); ending the meeting and rejoining recovers it.
 
-**Rollback nuance**: `RegisterMeeting` is a new RPC. If MH is rolled back to a pre-RegisterMeeting build, MC will keep sending the RPC, exhaust retries, and log `"RegisterMeeting retries exhausted"` for each affected meeting. **Clients are NOT stranded by this** — they still establish WebTransport sessions to the rolled-back MH via JWT, and the active/active topology covers any meeting where some assigned MHs are on the new build. If you must roll MH back during a coordinated incident, expect sustained `mc_register_meeting_total{status="error"}` for the duration of the rollback window; suppress alerts for that period rather than blocking the rollback.
+**Rollback nuance**: `RegisterMeeting` is a new RPC. If MH is rolled back to a pre-RegisterMeeting build, MC will keep sending the RPC, exhaust retries, and log `"RegisterMeeting retries exhausted"` for each affected meeting. **Clients are NOT stranded by this while the SDK still sends `join_token` (until story 4 P3)** — a pre-MH-1 MH admits join-time dials on that AC token (but declines later dials, which carry it empty; `mh-deployment.md` §Rollback), and the active/active topology covers any meeting where some assigned MHs are on the new build. If you must roll MH back during a coordinated incident, expect sustained `mc_register_meeting_total{status="error"}` for the duration of the rollback window; suppress alerts for that period rather than blocking the rollback.
 
 **Alert candidate** (breadcrumb for future observability work; out of scope here): a candidate threshold for an `MCRegisterMeetingFailureRate` alert would be `(sum(rate(mc_register_meeting_total{status="error"}[5m])) / sum(rate(mc_register_meeting_total[5m]))) > 0.10 and sum(rate(mc_register_meeting_total[5m])) > 0` for 5m at `severity: warning`, with `runbook_url` pointing at this scenario. This mirrors the shape of `MCHighJoinFailureRate`. See `<!-- TODO: alert ... -->` comment near the top of this scenario.
 
-**Do NOT recommend tuning `MH_REGISTER_MEETING_TIMEOUT_SECONDS` (default 15s) as a mitigation.** That timeout is the security boundary that bounds stolen-JWT-against-unregistered-meeting exposure on the MH side. Sustained timeouts mean the coordination path is broken — fix the path, do not widen the window. If you believe the timeout itself is wrong, escalate to Security Team for review.
+**There is no MH-side window to tune.** Since story 4 MH-1, MH holds nothing for an unregistered meeting (ADR-0039 §3): a dial for it is DECLINED at accept. Sustained failures mean the coordination path is broken — fix the path.
 
 **Escalation**:
 - If error rate >10% for >15 minutes, upgrade to P2 — new meetings are losing media.
 - If MH is healthy by every MH-side metric but MC still cannot reach it, escalate to Infrastructure Team.
 - If retries-exhausted logs span many distinct `mh_grpc_endpoint` values in a short window, this is fleet-wide MH coordination failure — page MH Team and consider whether GC has stale capacity records.
 
-**Related Alerts**: MH-side `mh_register_meeting_timeouts_total` (downstream effect on receiving MH), `MCHighMailboxDepthWarning` (upstream cause when trigger task is queued).
+**Related Alerts**: MH-side `mh_jwt_validations_total{token_type="media_dial",failure_reason="no_meeting_key"}` (an ordering bug if it moves; MH Sc 24), `MCHighMailboxDepthWarning` (upstream cause when trigger task is queued).
 
 **Dashboards**: MC Overview → "RegisterMeeting RPC Rate by Status" + "RegisterMeeting RPC Latency (P50/P95/P99)" (the headline panels for this scenario, both in the MH Coordination row); MH Overview → "RegisterMeeting Receipts by Status" + "RegisterMeeting Timeouts (R-26)" (receiver-side correlates).
 

@@ -648,8 +648,10 @@ message StreamQualityUpdate {
 
 1. Client receives `media_handler_url` from the Meeting Controller
 2. Client establishes a WebTransport connection to the Media Handler and
-   authenticates with its **meeting JWT** (ADR-0020) — validated by
-   `MhJwtValidator::validate_meeting_token`
+   authenticates with the MC-minted **`media_dial` token** for that handler
+   (`MhConnectRequest.media_dial_token`, ADR-0039 §5) — verified against the
+   meeting's registered public key by `crates/mh-service/src/webtransport/close.rs:admit`
+   (`join_token` is ignored by MH and deleted by story 4 P3)
 3. Client opens streams for each media stream
 
 **The client↔MH bidirectional control stream.** The client opens one bidi stream

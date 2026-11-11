@@ -92,7 +92,8 @@ pub async fn write_framed(
     send.write_all(&frame).await
 }
 
-/// Encode `MhClientMessage{ConnectRequest{join_token: jwt}}` and frame-write it.
+/// Encode `MhClientMessage{ConnectRequest{media_dial_token}}` (with
+/// `join_token` empty, the SDK's later-dial shape) and frame-write it.
 ///
 /// This is the production wire format on MH's bidi accept path. Use this
 /// helper for positive-path tests; use [`write_framed`] directly for negative
@@ -103,9 +104,19 @@ pub async fn write_framed(
 /// [`write_mh_connect_with_trace`] for the trace-carrying variant.
 pub async fn write_mh_connect(
     send: &mut wtransport::stream::SendStream,
-    jwt: &str,
+    media_dial_token: &str,
 ) -> Result<(), wtransport::error::StreamWriteError> {
-    write_mh_connect_with_trace(send, jwt, "", "").await
+    write_mh_connect_with_trace(send, media_dial_token, "", "").await
+}
+
+/// The connect envelope with BOTH fields set — the SDK's join-time shape
+/// until story 4 P3 (`join_token` = the AC meeting JWT, which MH never reads).
+pub async fn write_mh_connect_both(
+    send: &mut wtransport::stream::SendStream,
+    join_token: &str,
+    media_dial_token: &str,
+) -> Result<(), wtransport::error::StreamWriteError> {
+    write_envelope(send, join_token, media_dial_token, "", "").await
 }
 
 /// Like [`write_mh_connect`], but sets the envelope's W3C `trace_parent`/
@@ -114,17 +125,25 @@ pub async fn write_mh_connect(
 /// extraction path in `webtransport/connection.rs::handle_connection`.
 pub async fn write_mh_connect_with_trace(
     send: &mut wtransport::stream::SendStream,
-    jwt: &str,
+    media_dial_token: &str,
+    trace_parent: &str,
+    trace_state: &str,
+) -> Result<(), wtransport::error::StreamWriteError> {
+    write_envelope(send, "", media_dial_token, trace_parent, trace_state).await
+}
+
+async fn write_envelope(
+    send: &mut wtransport::stream::SendStream,
+    join_token: &str,
+    media_dial_token: &str,
     trace_parent: &str,
     trace_state: &str,
 ) -> Result<(), wtransport::error::StreamWriteError> {
     let envelope = MhClientMessage {
         message: Some(mh_client_message::Message::ConnectRequest(
             MhConnectRequest {
-                join_token: jwt.to_string(),
-                // Story 4 additive contract: populated once MH accepts the
-                // dial token only (MH-1).
-                media_dial_token: String::new(),
+                join_token: join_token.to_string(),
+                media_dial_token: media_dial_token.to_string(),
             },
         )),
         trace_parent: trace_parent.to_string(),

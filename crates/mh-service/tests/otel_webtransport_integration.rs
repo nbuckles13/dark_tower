@@ -16,13 +16,11 @@ mod test_common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mh_service::auth::MhJwtValidator;
 use mh_service::grpc::McClient;
 use mh_service::session::SessionManagerHandle;
 use opentelemetry::trace::SpanId;
 
 use test_common::accept_loop_rig::AcceptLoopRig;
-use test_common::jwks_rig::JwksRig;
 use test_common::mock_mc::{
     start_mock_mc_server, MockBehavior, MockMcHandle, MockMcServer, SenderReplies,
 };
@@ -31,7 +29,7 @@ use test_common::otel_capture::{
     KNOWN_TRACE_ID_U128,
 };
 use test_common::test_token_receiver;
-use test_common::tokens::mint_meeting_token;
+use test_common::tokens::mint_dial_token;
 use test_common::wt_client::{connect_and_open_bi, write_mh_connect_with_trace};
 
 /// The participant these tests connect as — the `sub` of the minted token, and
@@ -53,8 +51,10 @@ const OTEL_WT_PARTICIPANT_2: &str = "otel-wt-user-2";
 /// time. The span assertions are unchanged; only the fixture's MC is real now.
 const OTEL_WT_SENDER_ID: u32 = 4_242;
 
+/// This rig's handler id — the `aud` its dial tokens carry.
+const OTEL_WT_HANDLER: &str = "mh-otel-wt-test-001";
+
 struct WtSuite {
-    jwks: JwksRig,
     session_manager: SessionManagerHandle,
     wt: AcceptLoopRig,
     /// Held for the test's lifetime: dropping it stops the mock MC.
@@ -63,19 +63,14 @@ struct WtSuite {
 
 impl WtSuite {
     async fn start() -> Self {
-        let jwks = JwksRig::start(44, "mh-otel-wt-integ-01").await;
         let session_manager =
             SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding());
-        let jwt_validator = Arc::new(MhJwtValidator::new(jwks.jwks_client(), 300));
         let mc_client = Arc::new(McClient::new(test_token_receiver()));
 
-        let wt = AcceptLoopRig::start_with(
-            jwt_validator,
+        let wt = AcceptLoopRig::start(
             session_manager.clone(),
             mc_client,
-            "mh-otel-wt-test-001".to_string(),
-            32,
-            Duration::from_secs(30),
+            OTEL_WT_HANDLER.to_string(),
         )
         .await;
 
@@ -89,7 +84,6 @@ impl WtSuite {
         .await;
 
         Self {
-            jwks,
             session_manager,
             wt,
             mc,
@@ -148,6 +142,7 @@ async fn assert_valid_traceparent_reparents(capture: SpanCapture) {
                 mc_grpc_endpoint: suite.mc_endpoint(),
                 heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
+                media_dial_key: mh_test_utils::media_dial::meeting_dial_key(),
             },
             None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
@@ -155,7 +150,7 @@ async fn assert_valid_traceparent_reparents(capture: SpanCapture) {
         .await
         .expect("a test registration is below the registration cap");
 
-    let token = mint_meeting_token(&suite.jwks.keypair, "otel-wt-meeting", OTEL_WT_PARTICIPANT);
+    let token = mint_dial_token("otel-wt-meeting", OTEL_WT_PARTICIPANT, OTEL_WT_HANDLER);
     let (conn, mut send, recv) = connect_and_open_bi(&suite.wt.url).await;
     write_mh_connect_with_trace(&mut send, &token, &known_traceparent(), "")
         .await
@@ -213,6 +208,7 @@ async fn test_wt_empty_trace_fields_stays_parentless_root_span() {
                 mc_grpc_endpoint: suite.mc_endpoint(),
                 heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
+                media_dial_key: mh_test_utils::media_dial::meeting_dial_key(),
             },
             None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
@@ -220,10 +216,10 @@ async fn test_wt_empty_trace_fields_stays_parentless_root_span() {
         .await
         .expect("a test registration is below the registration cap");
 
-    let token = mint_meeting_token(
-        &suite.jwks.keypair,
+    let token = mint_dial_token(
         "otel-wt-meeting-noop",
         OTEL_WT_PARTICIPANT_2,
+        OTEL_WT_HANDLER,
     );
     let (conn, mut send, recv) = connect_and_open_bi(&suite.wt.url).await;
     // Empty trace_parent/trace_state (proto3 default) — same helper every

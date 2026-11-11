@@ -194,6 +194,11 @@ pub struct Participant {
     /// Every MediaHandlerSet this participant has seen ([`HandlerSets`]), fed
     /// from the JoinResponse and from every set message the fixture reads.
     pub sets: HandlerSets,
+    /// Participant ids MC announced as LEFT (`ServerMessage.participant_left`)
+    /// while this fixture read signalling — the roster-removal signal (MC
+    /// removes a cleanly-closed participant at once, an abruptly lost one
+    /// only after its disconnect grace). Ids only; never logged.
+    pub left: BTreeSet<String>,
 }
 
 impl Participant {
@@ -229,6 +234,9 @@ impl Participant {
             server_message::Message::StreamAssignments(a) => self.view = Some(a),
             server_message::Message::SendDirective(d) => self.directive = Some(d),
             server_message::Message::MediaHandlerSet(set) => self.sets.apply(&set),
+            server_message::Message::ParticipantLeft(left) => {
+                self.left.insert(left.participant_id);
+            }
             server_message::Message::Error(e) => {
                 panic!(
                     "{phase}: MC rejected {}'s request: {}",
@@ -262,6 +270,33 @@ impl Participant {
                 self.label,
                 self.sets.current().map(|v| (v.version, v.refs(), v.urls())),
                 self.sets.history().len()
+            );
+            if let Some(m) = self
+                .session
+                .try_read(remaining)
+                .await
+                .and_then(|m| m.message)
+            {
+                self.absorb(phase, m);
+            }
+        }
+    }
+
+    /// Read signalling until MC announced `participant_id` LEFT, within
+    /// `bound` (the view, directive and sets are kept current meanwhile).
+    ///
+    /// # Panics
+    /// At `bound` (the id is not printed).
+    pub async fn await_left(&mut self, phase: &str, bound: Duration, participant_id: &str) {
+        let deadline = Instant::now() + bound;
+        while !self.left.contains(participant_id) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "{phase}: {} saw no ParticipantLeft for the departing participant within \
+                 {bound:?} — MC did not remove it from the roster (a clean close removes at once; \
+                 check mc_participant_leaves_total{{reason}})",
+                self.label
             );
             if let Some(m) = self
                 .session
@@ -383,8 +418,16 @@ pub fn targets_of(d: &SendDirective) -> BTreeSet<String> {
 }
 
 /// Open a media session to `url`, or fail as an ENVIRONMENT fact.
-pub async fn reach(phase: &str, who: &str, url: &str, token: &str) -> mc_session::MhSession {
-    mc_session::try_mh_connect(url, token)
+///
+/// The credential is the participant's `media_dial` token for THAT handler
+/// (ADR-0039 §5; MH admits on nothing else since story 4 MH-1), resolved from
+/// its CURRENT `MediaHandlerSet` by url -> `handler_ref` -> token. A handler the
+/// participant was told to use that has no token in its set is an MC defect
+/// (MC mints one per member), reported as such — never as reachability.
+pub async fn reach(phase: &str, p: &Participant, url: &str) -> mc_session::MhSession {
+    let token = dial_token_for(phase, p, url);
+    let who = p.label;
+    mc_session::try_mh_connect(url, token.expose())
         .await
         .unwrap_or_else(|e| {
             panic!(
@@ -394,6 +437,30 @@ pub async fn reach(phase: &str, who: &str, url: &str, token: &str) -> mc_session
                  app=mh-service)."
             )
         })
+}
+
+/// `p`'s current `media_dial` token for the handler at `url`.
+///
+/// # Panics
+/// If `url` is not in `p`'s current set, or its entry carries no token — both
+/// MC defects (MC mints a token for EVERY member of every set). The token is
+/// never named in the message.
+#[must_use]
+pub fn dial_token_for(phase: &str, p: &Participant, url: &str) -> DialToken {
+    let who = p.label;
+    let handler_ref = p.sets.ref_for_url(url).unwrap_or_else(|| {
+        panic!(
+            "{phase}: {who} was asked to dial {url}, which is not in its current \
+             MediaHandlerSet {:?} (MC defect or a stale test view)",
+            p.sets.urls()
+        )
+    });
+    p.sets.dial_token(handler_ref).cloned().unwrap_or_else(|| {
+        panic!(
+            "{phase}: {who}'s MediaHandlerSet entry for {url} (handler_ref {handler_ref}) \
+             carries no media_dial token — MC mints one for every member (MC defect)"
+        )
+    })
 }
 
 /// Open one media session per participant per url (`result[i][url]`), each
@@ -410,7 +477,7 @@ pub async fn open_sessions(
     for p in ps {
         let mut mine = std::collections::HashMap::new();
         for url in urls {
-            mine.insert((*url).clone(), reach(phase, p.label, url, &p.token).await);
+            mine.insert((*url).clone(), reach(phase, p, url).await);
         }
         all.push(mine);
     }
@@ -474,6 +541,7 @@ pub async fn mc_join_with(
         view: None,
         gc: gc.clone(),
         sets,
+        left: BTreeSet::new(),
     }
 }
 

@@ -1707,7 +1707,8 @@ message MhConnectionStatus {
 // every edge MC places -- is what MC has been TOLD BY HANDLERS, over
 // `dark_tower.internal.v1.NotifyParticipantConnected` /
 // `NotifyParticipantDisconnected`, whose participant identity is derived from a
-// validated meeting token and whose handler identity is the handler's own. That
+// signature-verified `media_dial` token and whose handler identity is the
+// handler's own. That
 // is SERVER-OBSERVED truth. Everything in this message is CLIENT-ASSERTED: a
 // client can claim to be connected to a handler it never dialed, or claim a
 // failure on a handler it is happily using.
@@ -1797,9 +1798,8 @@ message ClientMessage {
 
 // MH client→server connect envelope; first framed message on a new bidi stream.
 message MhConnectRequest {
-  // Meeting JWT; same semantics as JoinRequest.join_token. Kept alongside
-  // `media_dial_token` until story 4 P3 deletes it. MH-1 makes MH accept
-  // `media_dial_token` ONLY; this field is not an alternative credential.
+  // IGNORED by MH since MH-1; retained only until story 4 P3 deletes it. Not a
+  // credential, not an alternative to `media_dial_token`; MH never reads it.
   string join_token = 1;
 
   // CREDENTIAL: the dialed ref's latest `MediaServerInfo.media_dial_token`

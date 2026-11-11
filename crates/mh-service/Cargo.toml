@@ -66,6 +66,11 @@ rand = { workspace = true }
 # Time utilities
 chrono = { workspace = true }
 
+# `media_dial` admission (story 4 MH-1, ADR-0039 §5): the JWS header parser,
+# the unverified `meeting_id` read for the key lookup, and EdDSA verification
+# against the meeting's registered key. The same backend `common::jwt` uses.
+jsonwebtoken = { workspace = true }
+
 # Local dependencies
 common = { path = "../common" }
 proto-gen = { path = "../proto-gen" }
@@ -103,7 +108,6 @@ tokio = { workspace = true, features = ["test-util"] }
 common = { path = "../common", features = ["test-utils"] }
 # JWT validation testing (Ed25519 signing, JWKS mocking)
 wiremock = { workspace = true }
-jsonwebtoken = { workspace = true }
 ring = { workspace = true }
 base64 = { workspace = true }
 serde_json = { workspace = true }

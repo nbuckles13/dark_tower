@@ -443,10 +443,10 @@ async fn test_canonical_partial_connectivity_across_two_handlers() {
     let ids: Vec<u32> = ps.iter().map(Participant::sender_id).collect();
 
     // 2. REACH: A opens both; B only x; C only y.
-    let a_x = reach("CANONICAL", "A", &x, &ps[0].token).await;
-    let a_y = reach("CANONICAL", "A", &y, &ps[0].token).await;
-    let b_x = reach("CANONICAL", "B", &x, &ps[1].token).await;
-    let c_y = reach("CANONICAL", "C", &y, &ps[2].token).await;
+    let a_x = reach("CANONICAL", &ps[0], &x).await;
+    let a_y = reach("CANONICAL", &ps[0], &y).await;
+    let b_x = reach("CANONICAL", &ps[1], &x).await;
+    let c_y = reach("CANONICAL", &ps[2], &y).await;
 
     // Non-ordinal ids, several > 255.
     ps[0].declare(&[7, 300], &[]).await;
@@ -620,10 +620,7 @@ async fn test_all_connected_everyone_hears_everyone_with_one_target_each() {
     for p in &ps {
         let mut mine = HashMap::new();
         for url in [&x, &y] {
-            mine.insert(
-                url.clone(),
-                reach("ALL-CONNECTED", p.label, url, &p.token).await,
-            );
+            mine.insert(url.clone(), reach("ALL-CONNECTED", p, url).await);
         }
         sessions.push(mine);
     }
@@ -920,7 +917,7 @@ async fn assert_refused(phase: &str, invited: &Invited<'_>, i: usize, d: &JoinDe
 async fn reach_both(phase: &str, p: &Participant) -> HashMap<String, mc_session::MhSession> {
     let mut out = HashMap::new();
     for url in p.offered() {
-        out.insert(url.clone(), reach(phase, p.label, &url, &p.token).await);
+        out.insert(url.clone(), reach(phase, p, &url).await);
     }
     out
 }
@@ -1369,10 +1366,10 @@ async fn test_two_handler_video_visibility() {
         [a, b, c] = trio;
         xy
     };
-    let a_x = reach(PHASE, "A", &x, &a.token).await;
-    let a_y = reach(PHASE, "A", &y, &a.token).await;
-    let b_x = reach(PHASE, "B", &x, &b.token).await;
-    let c_y = reach(PHASE, "C", &y, &c.token).await;
+    let a_x = reach(PHASE, &a, &x).await;
+    let a_y = reach(PHASE, &a, &y).await;
+    let b_x = reach(PHASE, &b, &x).await;
+    let c_y = reach(PHASE, &c, &y).await;
     let (a_id, b_id, c_id) = (a.sender_id(), b.sender_id(), c.sender_id());
 
     // B and C are each routed only after MC's settle window (neither reaches

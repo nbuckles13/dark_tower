@@ -9,7 +9,6 @@
 //! 1. Stop accepting new connections
 //! 2. Child tokens propagate cancellation to active connection handlers
 
-use crate::auth::MhJwtValidator;
 use crate::config::{
     QuicTransportParams, CONNECTION_RECEIVE_WINDOW_BYTES, CONNECTION_SEND_WINDOW_BYTES,
     DATAGRAM_RECEIVE_BUFFER_BYTES, MAX_IDLE_TIMEOUT_SECONDS, STREAM_RECEIVE_WINDOW_BYTES,
@@ -27,7 +26,7 @@ use tracing::{error, info, warn};
 use wtransport::endpoint::endpoint_side::Server;
 use wtransport::{Endpoint, Identity, ServerConfig};
 
-use super::connection;
+use super::connection::{self, ClientAdmission};
 
 /// WebTransport server that accepts client connections.
 pub struct WebTransportServer {
@@ -37,16 +36,14 @@ pub struct WebTransportServer {
     tls_cert_path: String,
     /// Path to TLS private key (PEM).
     tls_key_path: String,
-    /// JWT validator for meeting tokens.
-    jwt_validator: Arc<MhJwtValidator>,
+    /// Client `media_dial` admission settings (story 4 MH-1).
+    admission: ClientAdmission,
     /// Session manager handle for meeting registration and connection tracking.
     session_manager: SessionManagerHandle,
     /// MC notification client for MH→MC participant notifications.
     mc_client: Arc<McClient>,
-    /// This MH instance's handler ID.
+    /// This MH incarnation's handler ID — the `media_dial` `aud` it admits.
     handler_id: String,
-    /// `RegisterMeeting` timeout duration.
-    register_meeting_timeout: Duration,
     /// Accept-time resource-exhaustion guard, never a capacity figure
     /// (`MH_MAX_CONNECTIONS`). Enforcement below is unchanged by ADR-0036 §1.
     max_connections: usize,
@@ -72,11 +69,10 @@ impl WebTransportServer {
         bind_address: String,
         tls_cert_path: String,
         tls_key_path: String,
-        jwt_validator: Arc<MhJwtValidator>,
+        admission: ClientAdmission,
         session_manager: SessionManagerHandle,
         mc_client: Arc<McClient>,
         handler_id: String,
-        register_meeting_timeout: Duration,
         max_connections: usize,
         quic_transport: QuicTransportParams,
         media: MediaSetup,
@@ -86,11 +82,10 @@ impl WebTransportServer {
             bind_address,
             tls_cert_path,
             tls_key_path,
-            jwt_validator,
+            admission,
             session_manager,
             mc_client,
             handler_id,
-            register_meeting_timeout,
             max_connections,
             quic_transport,
             media,
@@ -203,22 +198,20 @@ impl WebTransportServer {
                     self.active_connections.fetch_add(1, Ordering::Relaxed);
                     metrics::record_webtransport_connection("accepted");
                     let active_connections = Arc::clone(&self.active_connections);
-                    let jwt_validator = Arc::clone(&self.jwt_validator);
+                    let admission = self.admission;
                     let session_manager = self.session_manager.clone();
                     let mc_client = Arc::clone(&self.mc_client);
                     let handler_id = self.handler_id.clone();
-                    let register_meeting_timeout = self.register_meeting_timeout;
                     let media = self.media.clone();
                     let connection_token = self.cancel_token.child_token();
 
                     tokio::spawn(async move {
                         let result = connection::handle_connection(
                             incoming_session,
-                            jwt_validator,
+                            admission,
                             session_manager,
                             mc_client,
                             handler_id,
-                            register_meeting_timeout,
                             media,
                             connection_token,
                         )

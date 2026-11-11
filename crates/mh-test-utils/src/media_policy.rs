@@ -131,7 +131,7 @@ pub fn register_request(
         policy_generation,
         source_streams,
         heartbeat_interval_ms: TEST_HEARTBEAT_INTERVAL_MS,
-        media_dial_public_key: Vec::new(),
+        media_dial_public_key: crate::media_dial::meeting_public_key(),
     }
 }
 

@@ -359,7 +359,7 @@ async fn a_leave_with_video_flowing_rotates_the_kek_without_touching_video_direc
             .await;
         let mut sessions = HashMap::new();
         for url in p.offered() {
-            sessions.insert(url.clone(), reach(PHASE, label, &url, &p.token).await);
+            sessions.insert(url.clone(), reach(PHASE, &p, &url).await);
         }
         ps.push(p);
         mh.push(sessions);

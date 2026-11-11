@@ -7,22 +7,21 @@
 //!
 //! 1. `test_mh_url_present_in_join_response` — `JoinResponse.media_handler_set`
 //!    populated with non-empty WebTransport URLs.
-//! 2. `test_mh_accepts_valid_meeting_jwt` — valid JWT → connection held open.
-//! 3. `test_mh_rejects_forged_jwt` / `test_mh_rejects_oversized_jwt` —
-//!    rejection observable as peer-close on the recv stream.
+//! 2. `test_mh_accepts_valid_media_dial_token` — the MC-minted `media_dial`
+//!    token (ADR-0039 §5) → connection held open.
+//! 3. `test_mh_rejects_forged_media_dial_token` /
+//!    `test_mh_rejects_oversized_media_dial_token` — DECLINED session close,
+//!    each with a valid-dial positive control on the same handler.
 //! 4. `test_mh_connect_increments_mc_notification_metric_connected` —
 //!    Prometheus `mc_mh_notifications_received_total{event_type="connected"}`
 //!    delta ≥ 1 after a successful MH connect.
 //! 5. `test_mh_disconnect_increments_mc_notification_metric_disconnected` —
 //!    same counter with `event_type="disconnected"` after clean close.
-//! 6. `test_mh_disconnects_unregistered_meeting_after_timeout` — `#[ignore]`d
-//!    stub. Authoritative coverage at component tier:
-//!    `crates/mh-service/tests/webtransport_integration.rs::provisional_connection_kicked_after_register_meeting_timeout`.
-//!    Cannot run from env-tests because (a) AC's signing key is not exposed, so
-//!    we cannot mint a JWT for an unregistered `meeting_id`; (b) MC fires
-//!    `RegisterMeeting` to all assigned MHs after first join, so no MH stays
-//!    unregistered for a real meeting; (c) shortening the timeout requires
-//!    infra changes that would create a dev-vs-prod behavioral gap.
+//! 6. (Retired at story 4 MH-1.) The provisional-accept / RegisterMeeting
+//!    timeout path it described is deleted (ADR-0039 §3): a dial for a meeting
+//!    MH holds no key for is DECLINED at accept, covered live by
+//!    `46_mh_media_dial_admission.rs` and at the component tier by
+//!    `crates/mh-service/tests/media_dial_admission_integration.rs`.
 //! 7. (Retired at story 2 task 6.) The single-participant loopback
 //!    forward test is superseded: loopback is removed (R-3), so a lone sender
 //!    now gets nothing back by design. The R-15 composition proof — real MC
@@ -71,7 +70,8 @@
 //! # Wire format
 //!
 //! MH expects the FIRST framed message on a bidi stream to be a typed
-//! `MhClientMessage{ConnectRequest{join_token: <JWT>}}` protobuf envelope,
+//! `MhClientMessage{ConnectRequest{media_dial_token: <token>}}` protobuf
+//! envelope (`join_token` empty: MH never reads it since story 4 MH-1),
 //! 4-byte big-endian length prefix + encoded bytes. Mirrors MC's
 //! `ClientMessage{JoinRequest{...}}` discipline. Source of truth:
 //! `crates/mh-service/src/webtransport/connection.rs` Step 3 region.
@@ -200,13 +200,13 @@ async fn gc_create_and_join(
 /// session causes the recv to error/finish, which is observable here.
 async fn send_jwt_on_bi_stream(
     conn: &wtransport::Connection,
-    jwt: &str,
+    media_dial_token: &str,
 ) -> (wtransport::SendStream, wtransport::RecvStream) {
     // The open-bi + MH connect-envelope framing lives in the shared fixture
     // (`mc_session::mh_open_connect`); this wrapper survives only to carry the
     // held-open warning above, which is specific to how THIS suite reads the
     // returned recv stream.
-    mc_session::mh_open_connect(conn, jwt).await
+    mc_session::mh_open_connect(conn, media_dial_token).await
 }
 
 // ----------------------------------------------------------------------------
@@ -491,13 +491,29 @@ async fn mc_join(
 fn any_registered_mh_url(
     join_response: &proto_gen::dark_tower::signaling::v1::JoinResponse,
 ) -> String {
-    join_response
+    any_registered_mh(join_response).0
+}
+
+/// [`any_registered_mh_url`] plus THIS member's `media_dial` token for that
+/// handler (ADR-0039 §5) — the credential MH admits on.
+fn any_registered_mh(
+    join_response: &proto_gen::dark_tower::signaling::v1::JoinResponse,
+) -> (String, String) {
+    let entry = join_response
         .media_handler_set
         .as_ref()
         .and_then(|s| s.handlers.first())
-        .map(|m| m.media_handler_url.clone())
-        .filter(|u| !u.is_empty())
-        .expect("MC JoinResponse must include at least one non-empty MH URL")
+        .filter(|m| !m.media_handler_url.is_empty())
+        .expect("MC JoinResponse must include at least one non-empty MH URL");
+    assert!(
+        !entry.media_dial_token.is_empty(),
+        "MC JoinResponse handler entry carries no media_dial token — MC mints one for \
+         every member (MC defect)"
+    );
+    (
+        entry.media_handler_url.clone(),
+        entry.media_dial_token.clone(),
+    )
 }
 
 /// A meeting registered on MH by a real GC→MC join, WITH that join's MC
@@ -514,8 +530,9 @@ fn any_registered_mh_url(
 /// hold `jwt`/`mh_url` without holding the session. (`#[must_use]` would not
 /// do it: `let _ = …` both drops immediately AND silences the warning.)
 struct RegisteredMeeting {
-    /// The meeting JWT (what MH authenticates with).
-    jwt: String,
+    /// This member's `media_dial` token for `mh_url` (what MH admits on,
+    /// ADR-0039 §5). A bearer credential: never in a panic or assert message.
+    dial_token: String,
     /// One MH WebTransport URL on which the meeting is registered.
     mh_url: String,
     /// The MC session keeping the meeting alive. Never read; held.
@@ -548,14 +565,15 @@ async fn join_with_registered_mh(
     )
     .await;
 
+    let (mh_url, dial_token) = any_registered_mh(&join_response);
     RegisteredMeeting {
-        jwt: gc_join.token,
-        mh_url: any_registered_mh_url(&join_response),
+        dial_token,
+        mh_url,
         _mc_session: session,
     }
 }
 
-/// Test: MH accepts a connection authenticated by a valid meeting JWT for a
+/// Test: MH accepts a connection authenticated by a valid MC-minted `media_dial` token for a
 /// registered meeting, and holds the WebTransport session open (no immediate
 /// disconnect, no session-level close).
 ///
@@ -566,16 +584,18 @@ async fn join_with_registered_mh(
 /// session is still alive. The `conn.closed()` future only resolves when the
 /// WT session itself closes.
 ///
-/// On-call: if this fails, suspect AC JWKS misconfig on MH (`AC_JWKS_URL`),
-/// MH↔AC network policy, or MC→MH `RegisterMeeting` failure (the meeting may
-/// be in MH's provisional pool and time out before this test finishes).
+/// On-call: if this fails, read `mh_jwt_validations_total{token_type="media_dial"}`
+/// by `failure_reason` (Scenario 24 of `docs/runbooks/mh-incident-response.md`):
+/// `no_meeting_key` = MC's RegisterMeeting did not land before the token was
+/// issued; `signature_invalid` = the registered key and MC's signing key
+/// disagree.
 // This `#[serial]` key is LOAD-BEARING, not tidiness. This test opens a
 // WebTransport connection to MH, and the notification-counter tests in this
 // binary attribute a per-instance counter delta to their OWN connection. A
 // concurrent MH connection would put an unearned increment in their window.
 #[serial_test::serial(mh_notifications)]
 #[tokio::test]
-async fn test_mh_accepts_valid_meeting_jwt() {
+async fn test_mh_accepts_valid_media_dial_token() {
     let cluster = cluster().await;
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let (user_token, display_name) = register_test_user(&auth_client, "MH Valid JWT User").await;
@@ -588,7 +608,7 @@ async fn test_mh_accepts_valid_meeting_jwt() {
     )
     .await;
     // Held for the whole test: `meeting` owns the MC session keeping it alive.
-    let (jwt, mh_url) = (meeting.jwt.clone(), meeting.mh_url.clone());
+    let (jwt, mh_url) = (meeting.dial_token.clone(), meeting.mh_url.clone());
 
     let conn = connect_wt(&mh_url).await;
     let (_send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
@@ -603,15 +623,16 @@ async fn test_mh_accepts_valid_meeting_jwt() {
         close_outcome.is_err(),
         "MH closed the WebTransport session within 2.5s of a valid JWT — \
          expected the session to be held open. Likely cause: MC→MH \
-         RegisterMeeting missing for this meeting, AC_JWKS misconfig on MH, \
-         or TLS/WT framing mismatch. Close reason: {close_outcome:?}",
+         RegisterMeeting missing for this meeting (no_meeting_key), a key \
+         mismatch (signature_invalid), or TLS/WT framing mismatch. Close reason: {close_outcome:?}",
     );
 }
 
-/// Test: MH rejects a structurally-valid JWT with a forged signature.
+/// Test: MH rejects the real `media_dial` token with a tampered signature.
 ///
 /// Mirrors `test_mc_rejects_invalid_meeting_token` in `24_join_flow.rs`.
-/// Exercises MH's signature-verification path (EdDSA via JWKS).
+/// Exercises MH's signature-verification path (EdDSA against the meeting's
+/// registered `media_dial` key, ADR-0039 §5 step d).
 ///
 /// On-call: if this passes when MH accepts the token (i.e., this test FAILS
 /// because we never observed a peer-close), suspect that MH's JWT validator
@@ -620,7 +641,7 @@ async fn test_mh_accepts_valid_meeting_jwt() {
 // the valid-JWT test above gives. Investigated at story 2 task 10: a rejected
 // JWT produces NO MH -> MC notification. Evidence from the code path, not an
 // observed zero: the oversized envelope is refused in `read_framed_message`
-// (Step 3) and a forged token at `validate_meeting_token` (Step 4) of
+// (Step 3) and a forged token at the `media_dial` verification (Step 4) of
 // `crates/mh-service/src/webtransport/connection.rs::handle_connection`, both
 // returning before Step 5; every `notify_participant_*` call site sits at Step 5
 // or later. What keeps this test serialized is its GC -> MC JOIN
@@ -634,7 +655,7 @@ async fn test_mh_accepts_valid_meeting_jwt() {
 // tests in this binary attribute to their own connections.
 #[serial_test::serial(mh_notifications)]
 #[tokio::test]
-async fn test_mh_rejects_forged_jwt() {
+async fn test_mh_rejects_forged_media_dial_token() {
     let cluster = cluster().await;
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let (user_token, display_name) = register_test_user(&auth_client, "MH Forged JWT User").await;
@@ -649,22 +670,20 @@ async fn test_mh_rejects_forged_jwt() {
     // Held for the whole test: `meeting` owns the MC session keeping it alive.
     let mh_url = meeting.mh_url.clone();
 
-    // Structurally-valid JWT with garbage signature. Same constant as
-    // `fake_token` in `24_join_flow.rs::test_mc_rejects_invalid_meeting_token`
-    // — exercises MH's signature verification path.
-    let forged = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.\
-        eyJzdWIiOiJhdHRhY2tlciIsIm1lZXRpbmdfaWQiOiJmYWtlIiwiZXhwIjo5OTk5OTk5OTk5fQ.\
-        invalid_signature_that_will_not_verify";
+    // The REAL dial token with one signature character flipped: structurally
+    // valid, registered meeting, correct aud — only the signature is wrong, so
+    // the DECLINED is attributable to signature verification (step d).
+    let forged = mc_session::tamper_jws_signature(&meeting.dial_token);
 
-    assert_mh_rejects(&mh_url, forged, &meeting.jwt).await;
+    assert_mh_rejects(&mh_url, &forged, &meeting.dial_token).await;
 }
 
-/// Test: MH rejects an oversized JWT (> `MAX_JWT_SIZE_BYTES` = 8192 in
+/// Test: MH rejects an oversized `media_dial` token (> `MAX_JWT_SIZE_BYTES` = 8192 in
 /// `crates/common/src/jwt.rs:73`).
 ///
 /// 9000 bytes of benign filler ('A' repeats) — well over the 8KB validator
 /// cap, well under the 64KB framing cap. Exercises the size check at
-/// `MhJwtValidator::validate_meeting_token` before any signature work.
+/// the `media_dial` verifier's size cap (step a) before any parse or signature work.
 ///
 /// On-call: if this fails (i.e., MH does NOT close the connection), MH may
 /// be allocating per-byte memory before enforcing the size cap — DoS risk.
@@ -672,7 +691,7 @@ async fn test_mh_rejects_forged_jwt() {
 // the valid-JWT test above gives. Investigated at story 2 task 10: a rejected
 // JWT produces NO MH -> MC notification. Evidence from the code path, not an
 // observed zero: the oversized envelope is refused in `read_framed_message`
-// (Step 3) and a forged token at `validate_meeting_token` (Step 4) of
+// (Step 3) and a forged token at the `media_dial` verification (Step 4) of
 // `crates/mh-service/src/webtransport/connection.rs::handle_connection`, both
 // returning before Step 5; every `notify_participant_*` call site sits at Step 5
 // or later. What keeps this test serialized is its GC -> MC JOIN
@@ -686,7 +705,7 @@ async fn test_mh_rejects_forged_jwt() {
 // tests in this binary attribute to their own connections.
 #[serial_test::serial(mh_notifications)]
 #[tokio::test]
-async fn test_mh_rejects_oversized_jwt() {
+async fn test_mh_rejects_oversized_media_dial_token() {
     let cluster = cluster().await;
     let auth_client = AuthClient::new(&cluster.ac_base_url);
     let (user_token, display_name) =
@@ -705,7 +724,7 @@ async fn test_mh_rejects_oversized_jwt() {
     // Benign filler — explicitly NOT shaped like a real JWT (no dots, no
     // base64 header) so we don't normalize logging realistic-looking tokens.
     let oversized = "A".repeat(9000);
-    assert_mh_rejects(&mh_url, &oversized, &meeting.jwt).await;
+    assert_mh_rejects(&mh_url, &oversized, &meeting.dial_token).await;
 }
 
 // ============================================================================
@@ -749,7 +768,7 @@ async fn test_mh_connect_increments_mc_notification_metric_connected() {
     )
     .await;
     // Held for the whole test: `meeting` owns the MC session keeping it alive.
-    let (jwt, mh_url) = (meeting.jwt.clone(), meeting.mh_url.clone());
+    let (jwt, mh_url) = (meeting.dial_token.clone(), meeting.mh_url.clone());
 
     let conn = connect_wt(&mh_url).await;
     let (_send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
@@ -796,7 +815,7 @@ async fn test_mh_disconnect_increments_mc_notification_metric_disconnected() {
     )
     .await;
     // Held for the whole test: `meeting` owns the MC session keeping it alive.
-    let (jwt, mh_url) = (meeting.jwt.clone(), meeting.mh_url.clone());
+    let (jwt, mh_url) = (meeting.dial_token.clone(), meeting.mh_url.clone());
 
     let conn = connect_wt(&mh_url).await;
     let (mut send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
@@ -1112,7 +1131,7 @@ async fn test_mc_programs_live_handler_with_confirmed_forwarding_policy() {
     )
     .await;
     // Held for the whole test: `meeting` owns the MC session keeping it alive.
-    let (jwt, mh_url) = (meeting.jwt.clone(), meeting.mh_url.clone());
+    let (jwt, mh_url) = (meeting.dial_token.clone(), meeting.mh_url.clone());
     let conn = connect_wt(&mh_url).await;
     let (_send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
 
@@ -1680,35 +1699,4 @@ async fn edge_churn() {
         injection.release_and_prove(&cleanup).await;
     }
     drop(sessions);
-}
-
-// ============================================================================
-// Scenario 6 (R-33 #6): unregistered-meeting timeout — STUB
-// ============================================================================
-
-/// R-33 #6 stub — see authoritative coverage at component tier:
-/// `crates/mh-service/tests/webtransport_integration.rs::provisional_connection_kicked_after_register_meeting_timeout`.
-///
-/// That component test runs the real MH `accept_loop` with virtual-time
-/// control, asserts the lower-bound (counter still 0 at 800ms) AND
-/// upper-bound (counter reaches 1 by 3000ms) on
-/// `mh_webtransport_connections_total{status="error"}` and
-/// `mh_register_meeting_timeouts_total`, and verifies
-/// `active_connection_count == 0` after timeout.
-///
-/// We cannot run this scenario from env-tests because:
-/// 1. AC's signing key is not exposed to env-tests (security boundary —
-///    see plan §Q1), so we cannot mint a JWT for an unregistered meeting_id.
-/// 2. After first MC join, MC fires `RegisterMeeting` to all assigned MHs
-///    (R-12), so for any meeting created via the real GC→MC flow, no MH
-///    stays "unregistered".
-/// 3. Lowering `MH_REGISTER_MEETING_TIMEOUT_SECONDS` in Kind ConfigMaps
-///    would create a dev-vs-prod behavioral gap — rejected by ops at plan
-///    review.
-///
-/// Tracked as Tech Debt in `docs/devloop-outputs/2026-04-30-mh-quic-env-tests/main.md`.
-#[tokio::test]
-#[ignore = "covered at component tier — see crates/mh-service/tests/webtransport_integration.rs::provisional_connection_kicked_after_register_meeting_timeout"]
-async fn test_mh_disconnects_unregistered_meeting_after_timeout() {
-    // Intentionally unimplemented. See doc-comment above.
 }

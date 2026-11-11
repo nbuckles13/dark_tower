@@ -28,10 +28,11 @@
 //! 4. Authorization: `service.write.mh` scope check
 //! 5. Routing: `service_type` must match target gRPC service (fail closed)
 
-use crate::auth::CommonJwtValidator;
 use crate::observability::metrics;
 use axum::http;
-use common::jwt::{JwksClient, JwtError, ServiceClaims, MAX_JWT_SIZE_BYTES};
+use common::jwt::{
+    JwksClient, JwtError, JwtValidator as CommonJwtValidator, ServiceClaims, MAX_JWT_SIZE_BYTES,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

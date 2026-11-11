@@ -39,9 +39,7 @@ use mh_service::media::queue::SharedQueue;
 use mh_service::observability::metrics::resolve_media_handles;
 use mh_service::routing::{MeetingKey, SenderId};
 use mh_service::session::heartbeat::{HeartbeatSetup, SenderCommand};
-use mh_service::session::{
-    ConnectionEntry, PendingConnection, SessionManagerHandle, StreamAdmission,
-};
+use mh_service::session::{AdmitOutcome, ConnectionEntry, SessionManagerHandle, StreamAdmission};
 use mh_test_utils::media_policy::{
     egress, register_request, TEST_HEARTBEAT_INTERVAL, TEST_MC_ENDPOINT, TEST_MC_ID,
 };
@@ -269,17 +267,23 @@ fn connection(id: &str, participant: &str) -> ConnectionEntry {
         participant_id: participant.to_string(),
         connected_at: std::time::Instant::now(),
         close: CancellationToken::new(),
+        is_bound: false,
     }
 }
 
-fn pending(id: &str, meeting: &str) -> PendingConnection {
-    PendingConnection {
-        connection_id: id.to_string(),
-        meeting_id: meeting.to_string(),
-        participant_id: format!("p-{id}"),
-        connected_at: std::time::Instant::now(),
-        close: CancellationToken::new(),
-    }
+/// Admit `entry` into `meeting` (awaiting its bind), asserting it was admitted.
+async fn admit(sm: &SessionManagerHandle, meeting: &str, entry: ConnectionEntry) {
+    assert_eq!(
+        sm.admit_connection(
+            meeting,
+            entry,
+            mh_test_utils::media_dial::meeting_dial_key(),
+            8
+        )
+        .await,
+        AdmitOutcome::Admitted,
+        "{meeting}: fixture admission"
+    );
 }
 
 const HEARTBEATS: &str = "mh_mc_heartbeats_total";
@@ -442,18 +446,14 @@ async fn meetings_without_clients_is_set_on_the_actor_tick() {
     let rig = rig();
     register(&rig, plain("m-empty")).await.unwrap();
     register(&rig, plain("m-busy")).await.unwrap();
-    rig.sm
-        .add_connection("m-busy", connection("c-1", "p-1"))
-        .await;
+    admit(&rig.sm, "m-busy", connection("c-1", "p-1")).await;
     run_for(Duration::from_secs(10)).await;
     snap.gauge("mh_media_meetings_without_clients")
         .with_labels(&[KC])
         .assert_value(1.0);
 
     // Positive arm: the empty meeting gains a client; the next tick reads 0.
-    rig.sm
-        .add_connection("m-empty", connection("c-2", "p-2"))
-        .await;
+    admit(&rig.sm, "m-empty", connection("c-2", "p-2")).await;
     run_for(Duration::from_secs(10)).await;
     snap.gauge("mh_media_meetings_without_clients")
         .with_labels(&[KC])
@@ -589,20 +589,22 @@ async fn every_verdict_arm_in_one_test() {
         register(&rig, plain(m)).await.unwrap();
     }
     // Clients: rel-hb has a bound connection; rel-pt one awaiting its
-    // sender_id (added, Notify not answered) plus a pending one; rel-ended a
-    // pending one; rel-lag none.
+    // sender_id (admitted, Notify not answered); rel-ended one awaiting its
+    // sender_id; rel-lag none. (There is no pending-before-registration state:
+    // ADR-0039 §3.)
     let bound = connection("c-bound", "p-1");
     let bound_close = bound.close.clone();
-    rig.sm.add_connection("rel-hb", bound).await;
+    admit(&rig.sm, "rel-hb", bound).await;
+    assert_eq!(
+        rig.sm.bind_connection("rel-hb", "c-bound", sender(7)).await,
+        mh_service::session::BindOutcome::Bound
+    );
     let awaiting = connection("c-awaiting", "p-2");
     let awaiting_close = awaiting.close.clone();
-    rig.sm.add_connection("rel-pt", awaiting).await;
-    let pt_pending = pending("c-pt-pending", "rel-pt");
-    let pt_pending_close = pt_pending.close.clone();
-    let _ = rig.sm.add_pending_connection(pt_pending).await;
-    let ended_pending = pending("c-ended-pending", "rel-ended");
-    let ended_pending_close = ended_pending.close.clone();
-    let _ = rig.sm.add_pending_connection(ended_pending).await;
+    admit(&rig.sm, "rel-pt", awaiting).await;
+    let ended_awaiting = connection("c-ended-awaiting", "p-3");
+    let ended_awaiting_close = ended_awaiting.close.clone();
+    admit(&rig.sm, "rel-ended", ended_awaiting).await;
 
     // The stale-fence arm: its RELEASED is held until the meeting has been
     // re-registered to a DIFFERENT MC.
@@ -636,15 +638,11 @@ async fn every_verdict_arm_in_one_test() {
     );
     assert!(
         awaiting_close.is_cancelled(),
-        "rel-pt: the session awaiting its sender_id is closed"
+        "rel-pt: a removal closes the session awaiting its sender_id"
     );
     assert!(
-        pt_pending_close.is_cancelled(),
-        "rel-pt: a removal closes pending connections"
-    );
-    assert!(
-        !ended_pending_close.is_cancelled(),
-        "rel-ended: MEETING_ENDED leaves pending connections to the bind outcome"
+        !ended_awaiting_close.is_cancelled(),
+        "rel-ended: MEETING_ENDED leaves a session awaiting its sender_id to the bind outcome"
     );
     for (trigger, clients, expected) in [
         ("heartbeat_timeout", "present", 1),
@@ -715,10 +713,10 @@ async fn a_zero_heartbeat_interval_is_refused_and_schedules_nothing() {
 
 /// `EndMeeting.cause`: UNSPECIFIED and an unknown number are refused
 /// INVALID_ARGUMENT, counted, and release nothing; MEETING_ENDED releases.
-/// A removal cause closes pending connections (HANDLER_RELEASED) and counts
-/// on the release series; MEETING_ENDED leaves them.
+/// A removal cause closes connections awaiting their bind (HANDLER_RELEASED) and counts
+/// on the release series; MEETING_ENDED leaves them to the bind outcome.
 #[tokio::test(start_paused = true)]
-async fn end_meeting_requires_a_cause_and_the_cause_decides_pending_connections() {
+async fn end_meeting_requires_a_cause_and_the_cause_decides_awaiting_bind_connections() {
     let snap = MetricAssertion::snapshot();
     let rig = rig();
     register(&rig, plain("m-end")).await.unwrap();
@@ -738,14 +736,14 @@ async fn end_meeting_requires_a_cause_and_the_cause_decides_pending_connections(
         .with_labels(&[("outcome", "rejected_invalid_cause"), KC])
         .assert_delta(2);
 
-    // Removal cause vs MEETING_ENDED, on pending connections.
+    // Removal cause vs MEETING_ENDED, on connections awaiting their bind.
     register(&rig, plain("m-removed")).await.unwrap();
-    let removed_pending = pending("c-r", "m-removed");
-    let removed_close = removed_pending.close.clone();
-    let _ = rig.sm.add_pending_connection(removed_pending).await;
-    let kept_pending = pending("c-k", "m-end");
-    let kept_close = kept_pending.close.clone();
-    let _ = rig.sm.add_pending_connection(kept_pending).await;
+    let removed_awaiting = connection("c-r", "p-r");
+    let removed_close = removed_awaiting.close.clone();
+    admit(&rig.sm, "m-removed", removed_awaiting).await;
+    let kept_awaiting = connection("c-k", "p-k");
+    let kept_close = kept_awaiting.close.clone();
+    admit(&rig.sm, "m-end", kept_awaiting).await;
 
     rig.svc
         .end_meeting(end(
@@ -763,11 +761,16 @@ async fn end_meeting_requires_a_cause_and_the_cause_decides_pending_connections(
     assert!(!rig.sm.is_meeting_registered("m-removed").await);
     assert!(
         removed_close.is_cancelled(),
-        "a removal closes the pending connection"
+        "a removal closes the connection awaiting its bind"
     );
-    assert!(!kept_close.is_cancelled(), "MEETING_ENDED leaves it");
+    assert!(
+        !kept_close.is_cancelled(),
+        "MEETING_ENDED leaves it to the bind outcome"
+    );
+    // An admitted connection awaiting its bind is a client (the same "has
+    // clients" predicate as the gauge), so this release is `clients=present`.
     snap.counter(RELEASES)
-        .with_labels(&[("trigger", "planned_transfer"), ("clients", "none"), KC])
+        .with_labels(&[("trigger", "planned_transfer"), ("clients", "present"), KC])
         .assert_delta(1);
     snap.counter(TEARDOWNS)
         .with_labels(&[("outcome", "released"), KC])
@@ -1094,15 +1097,13 @@ async fn a_real_channel_is_reused_per_mc_endpoint() {
 #[tokio::test]
 async fn a_disconnect_whose_notify_exhausted_its_retries_leaves_the_set() {
     use common::accept_loop_rig::AcceptLoopRig;
-    use common::jwks_rig::JwksRig;
     use common::mock_mc::{start_mock_mc_server, MockBehavior, MockMcServer, SenderReplies};
-    use common::tokens::mint_meeting_token;
+    use common::tokens::mint_dial_token;
     use common::wt_client::{connect_and_open_bi, write_mh_connect};
     use mh_service::grpc::mc_client::MAX_RETRY_ATTEMPTS;
     use mh_service::grpc::McClient;
 
     const MEETING: &str = "m-retry-exhausted";
-    let jwks = JwksRig::start(47, "mh-heartbeat-integ-01").await;
     let (tx, mut beats) = mpsc::channel(4096);
     let (sm, actor) = SessionManagerHandle::new_with_heartbeat_for_tests(
         mh_test_utils::admission::never_binding(),
@@ -1124,19 +1125,13 @@ async fn a_disconnect_whose_notify_exhausted_its_retries_leaves_the_set() {
             .with_disconnected_tx(disc_tx),
     )
     .await;
-    let wt = AcceptLoopRig::start_with(
-        Arc::new(mh_service::auth::MhJwtValidator::new(
-            jwks.jwks_client(),
-            300,
-        )),
+    let wt = AcceptLoopRig::start(
         sm.clone(),
         Arc::new(McClient::with_retry_base_delay(
             common::test_token_receiver(),
             Duration::from_millis(1),
         )),
         HANDLER_ID.to_string(),
-        32,
-        Duration::from_secs(30),
     )
     .await;
     sm.register_meeting(
@@ -1146,6 +1141,7 @@ async fn a_disconnect_whose_notify_exhausted_its_retries_leaves_the_set() {
             mc_grpc_endpoint: format!("http://{}", mc.addr),
             heartbeat_interval: Duration::from_millis(50),
             registered_at: std::time::Instant::now(),
+            media_dial_key: mh_test_utils::media_dial::meeting_dial_key(),
         },
         None,
         mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
@@ -1155,7 +1151,7 @@ async fn a_disconnect_whose_notify_exhausted_its_retries_leaves_the_set() {
 
     let mut sessions = Vec::new();
     for participant in ["p-leave", "p-stay"] {
-        let token = mint_meeting_token(&jwks.keypair, MEETING, participant);
+        let token = mint_dial_token(MEETING, participant, HANDLER_ID);
         let (conn, mut send, recv) = connect_and_open_bi(&wt.url).await;
         write_mh_connect(&mut send, &token).await.unwrap();
         sessions.push((conn, send, recv));

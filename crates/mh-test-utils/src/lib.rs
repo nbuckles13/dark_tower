@@ -70,6 +70,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod media_dial;
 pub mod media_policy;
 pub mod session;
 pub mod stream_shim;

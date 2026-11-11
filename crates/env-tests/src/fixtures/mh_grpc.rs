@@ -501,6 +501,33 @@ pub const NEVER_DIALLED_MC_ENDPOINT: &str = "http://env-test-mc.invalid:50052";
 /// ([`crate::fixtures::metrics::mc_heartbeat_interval`]). Never 1 ms.
 pub const PROBE_HEARTBEAT_INTERVAL_MS: u32 = 2_000;
 
+/// Seed of the fixture `media_dial` keypair (test-only key material).
+const FIXTURE_DIAL_SEED: [u8; 32] = [0x5d; 32];
+
+/// The ONE `media_dial` PUBLIC key every registration this suite injects
+/// directly into MH carries (`RegisterMeetingRequest.media_dial_public_key`,
+/// exactly 32 raw Ed25519 bytes, else MH refuses the registration —
+/// ADR-0039 §5). A real Ed25519 public key from a fixed test seed.
+///
+/// **A direct registration REPLACES the meeting's dial key on that handler**
+/// (the last record-valid registration's key wins). For a probe meeting no
+/// client ever dials, that is moot. For an injection on a REAL MC's meeting
+/// ([`crate::fixtures::injection`]) it means: sessions opened BEFORE the
+/// injection are unaffected (admission already happened), but a NEW dial to
+/// that handler with an MC-minted token is DECLINED (`signature_invalid`)
+/// until MC re-registers. Every current suite opens its sessions before
+/// injecting; a suite that must dial after an injection needs a token signed
+/// by this fixture key.
+#[must_use]
+pub fn fixture_dial_public_key() -> Vec<u8> {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    Ed25519KeyPair::from_seed_unchecked(&FIXTURE_DIAL_SEED)
+        .unwrap_or_else(|e| panic!("fixture Ed25519 seed rejected: {e}"))
+        .public_key()
+        .as_ref()
+        .to_vec()
+}
+
 /// A PROBE registration: `meeting_id` at `generation` as `mc_id`, with NO
 /// edges and NO declared source streams.
 ///
@@ -538,7 +565,7 @@ pub fn probe_registration(
         policy_generation: generation,
         source_streams: Vec::new(),
         heartbeat_interval_ms: PROBE_HEARTBEAT_INTERVAL_MS,
-        media_dial_public_key: Vec::new(),
+        media_dial_public_key: fixture_dial_public_key(),
     }
 }
 
@@ -651,6 +678,21 @@ impl Drop for ReleaseOnDrop {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    /// Every direct registration carries a real, deterministic 32-byte
+    /// Ed25519 public key (MH refuses any other length, story 4 MH-1).
+    #[test]
+    fn every_probe_carries_the_fixture_dial_key() {
+        let key = fixture_dial_public_key();
+        assert_eq!(key.len(), 32);
+        assert_eq!(key, fixture_dial_public_key(), "deterministic");
+        assert_ne!(
+            key,
+            FIXTURE_DIAL_SEED.to_vec(),
+            "the public half, never the seed"
+        );
+        assert_eq!(probe_registration("m", "mc", 1).media_dial_public_key, key);
+    }
 
     #[test]
     fn the_ipv4_forwarding_line_yields_its_local_port() {

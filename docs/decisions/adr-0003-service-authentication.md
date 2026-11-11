@@ -110,6 +110,16 @@ IMPLEMENTED.** Clients authenticate to the Media Handler with the **meeting JWT*
 (ADR-0020), validated by `MhJwtValidator::validate_meeting_token`. There is no
 second, MH-scoped client credential.
 
+> **Updated 2026-11-10 (story 4 MH-1).** Since ADR-0039 §5, clients authenticate
+> to the Media Handler with the MC-minted **`media_dial` token** (compact JWS,
+> EdDSA, signed by a per-meeting Ed25519 key whose PUBLIC half reaches MH in
+> `RegisterMeetingRequest.media_dial_public_key`; `aud` = the handler's
+> `handler_id`), verified by `crates/mh-service/src/webtransport/close.rs:admit`.
+> MH no longer accepts the meeting JWT. This is NOT the superseded HMAC
+> connection token below: it is asymmetric (MH can verify but never mint), it is
+> reusable within its TTL (no jti cache), and MC holds the signing key per
+> meeting.
+
 The superseded specification is retained below rather than deleted, because a
 reader who trusted it would have *built* the credential — and this ADR is the
 decision of record that three narrative documents derive from, so a silent edit

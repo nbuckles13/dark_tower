@@ -87,6 +87,12 @@ media-protocol = { path = "../media-protocol" }
 # never part of a service image's build graph (see the wtransport note above).
 tonic = { workspace = true }
 
+# Ed25519 for the ONE fixture `media_dial` verification key every direct
+# (test-injected) `RegisterMeeting` carries (`src/fixtures/mh_grpc.rs`
+# `fixture_dial_public_key`, story 4 MH-1: MH refuses a registration whose
+# `media_dial_public_key` is not exactly 32 bytes). Same crate MC mints with.
+ring = { workspace = true }
+
 [dev-dependencies]
 # Paused tokio time for the hermetic video-fixture self-tests (`src/fixtures/video`):
 # no wall-clock sleeps anywhere (ADR-0036 §10). Same feature the service crates use.

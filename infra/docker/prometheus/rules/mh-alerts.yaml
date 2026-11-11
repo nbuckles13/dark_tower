@@ -113,8 +113,8 @@ groups:
           component: webtransport
         annotations:
           summary: "MH JWT validation failure rate high ({{ $value | humanizePercentage }})"
-          description: "JWT validation failure rate is {{ $value | humanizePercentage }} for 5 minutes. A failure-rate spike can mean legitimate rejections of invalid tokens (probing, client bugs) OR a system issue (AC JWKS down, key rotation misconfig, clock skew). Break down by failure_reason and token_type to triage."
-          impact: "Subset of users unable to establish media sessions. Check AC service health, JWKS endpoint, and failure_reason label. signature_invalid concentrates suggest key-rotation or tampering; expired concentrates suggest clock-skew."
+          description: "Credential validation failure rate is {{ $value | humanizePercentage }} for 5 minutes. This ratio includes ATTACKER-DRIVABLE reasons (no_meeting_key, malformed, signature_invalid are decided before or at the signature check, so an unauthenticated peer moves them with forged tokens): split by token_type and failure_reason BEFORE acting. On the client path (token_type=media_dial, MC-minted dial tokens verified against the meeting's registered key; no AC or JWKS involvement) a spike is either legitimate rejections (probing, stale clients) or a system issue: expired = MC's token refresh push broken or clock drift; no_meeting_key = probing, a restarted/released handler, or (only if it correlates with mc_register_meeting_total{status=\"error\"}) a register-before-token ordering bug; signature_invalid = MC key/registration drift or forged tokens; wrong_type = token confusion; aud_mismatch = stale handler sets (closed WRONG_HANDLER). token_type=service is MC->MH gRPC auth (AC JWKS)."
+          impact: "Clients refused at MH admission cannot carry media on that handler (DECLINED parks the handler until MC re-pushes a token). Triage per failure_reason in mh-incident-response.md Scenario 24 (media_dial) or Scenario 2 (service tokens)."
           runbook_url: "docs/runbooks/mh-incident-response.md#scenario-2-jwt-validation-failures"
 
       - alert: MHGCHeartbeatFailureRate
@@ -222,7 +222,7 @@ groups:
           component: media-binding
         annotations:
           summary: "MH media sessions declining to start ({{ $value | humanizePercentage }})"
-          description: "More than 20% of media-session start attempts are declining for 10 minutes. This is the positive signal for 'MH healthy but forwarding nothing' — before this counter existed, the entire mh_media_* family read present-and-flat-at-zero, byte-identical to a healthy idle handler. Break down by outcome and follow mh-incident-response.md Scenario 15, which partitions on WHICH SERVICE to open: three of the seven outcome values mean DO NOT page MC."
+          description: "More than 20% of media-session start attempts are declining for 10 minutes. This is the positive signal for 'MH healthy but forwarding nothing' — before this counter existed, the entire mh_media_* family read present-and-flat-at-zero, byte-identical to a healthy idle handler. Break down by outcome and follow mh-incident-response.md Scenario 15, which partitions on WHICH SERVICE to open: four of the eight outcome values (incl. declined_pending_cap, a client redial storm MC is never asked about) mean DO NOT page MC."
           impact: "Users connect to MH and get no audio. MH readiness, handshake latency and connection-accept rate all read healthy throughout - do not clear MH on those panels."
           runbook_url: "docs/runbooks/mh-incident-response.md#scenario-15-media-sessions-declining--no-sender-binding"
 

@@ -1039,7 +1039,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Total JWT validations in the selected time range.",
+      "description": "Total credential validations (media_dial client admissions + MC->MH service tokens) in the selected time range.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1310,7 +1310,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "JWT validation count by result (success/failure) and token type over time.",
+      "description": "Credential validation count by result, token type and failure reason. token_type=media_dial is the client admission path (ADR-0039 §5/§8): failure_reason expired | signature_invalid | aud_mismatch | wrong_type | no_meeting_key | malformed; only aud_mismatch closes WRONG_HANDLER, every other reason DECLINED. Sustained expired = MC's token refresh push broken (or clock drift); any wrong_type = token confusion (expired and wrong_type need a meeting-key signature, so only they are gate material); no_meeting_key, malformed and signature_invalid are ATTACKER-DRIVABLE (decided before or at the signature check; an MH restart also moves no_meeting_key) - investigate only, never page or roll back on them alone; a sustained no_meeting_key is a register-before-token ordering bug only when it correlates with mc_register_meeting_total{status=\"error\"}; sustained aud_mismatch = stale handler sets. An AC meeting token shows as no_meeting_key or signature_invalid, never wrong_type. token_type=service is MC->MH gRPC auth. Triage: mh-incident-response.md Scenario 24.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1500,7 +1500,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "WebTransport SESSION closes MH initiated with an MhCloseCode (ADR-0039 §7), per second, by code. One count per close capsule MH initiated (not delivered). declined = credential/pre-validation failures (unauthenticated peers can drive it — never page on it alone) + declines without their own code; binding_conflict / mc_unavailable map 1:1 to their mh_media_session_starts_total outcomes — do not add the two series. Code-less ends (client close, crash, idle timeout, shutdown) are not here. Triage: docs/runbooks/mh-incident-response.md §Close codes.",
+      "description": "WebTransport SESSION closes MH initiated with an MhCloseCode (ADR-0039 §7), per second, by code. One count per close capsule MH initiated (not delivered). declined = credential/pre-validation failures (unauthenticated peers can drive it — never page on it alone) + declines without their own code; binding_conflict / mc_unavailable map 1:1 to their mh_media_session_starts_total outcomes — do not add the two series. wrong_handler = a fully valid media_dial token whose aud is another handler (a stale handler set); equals mh_jwt_validations_total{failure_reason=\"aud_mismatch\"} less skipped closes. Code-less ends (client close, crash, idle timeout, shutdown) are not here. Triage: docs/runbooks/mh-incident-response.md §Close codes.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1593,7 +1593,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Count of provisional WebTransport connections disconnected because RegisterMeeting did not arrive within the configured timeout (R-26). Non-zero values indicate MC->MH RegisterMeeting latency or client-side sequencing bugs. No Prometheus alert fires on it; the MH deployment runbook (docs/runbooks/mh-deployment.md) uses its increase as a deploy bake check and a rollback trigger. Zero is healthy: a flat line at zero means no such events occurred. An ABSENT series is NOT a zero — it means the metrics pipeline is broken (recorder not installed, scrape failing, pod down, or wrong job label), not that no events occurred. This panel is not a liveness signal (read the service's traffic/overview panels for liveness), and any non-zero value warrants investigation via the service runbook.",
+      "description": "mh_media_dial_clock_skew_seconds: MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS, the skew MH allows on a media_dial token's exp/iat at admission (ADR-0039 §5; bounds 0..=60, default 30). Gauge; config reflection, set at startup. Read beside the JWT Validations panel's media_dial expired series: raising this to hide expired failures masks clock drift (fix NTP instead). An ABSENT series means the metrics pipeline is broken, not a zero.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1606,14 +1606,10 @@
               {
                 "color": "green",
                 "value": null
-              },
-              {
-                "color": "red",
-                "value": 1
               }
             ]
           },
-          "unit": "short"
+          "unit": "s"
         },
         "overrides": []
       },
@@ -1623,15 +1619,15 @@
         "x": 0,
         "y": 61
       },
-      "id": 25,
+      "id": 40,
       "options": {
         "colorMode": "value",
-        "graphMode": "area",
+        "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
           "calcs": [
-            "sum"
+            "lastNotNull"
           ],
           "fields": "",
           "values": false
@@ -1646,13 +1642,13 @@
             "uid": "$datasource"
           },
           "editorMode": "code",
-          "expr": "increase(mh_register_meeting_timeouts_total[$__range])",
-          "legendFormat": "RegisterMeeting Timeouts",
+          "expr": "max(mh_media_dial_clock_skew_seconds)",
+          "legendFormat": "Clock skew",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "RegisterMeeting Timeouts (R-26)",
+      "title": "Media-Dial Clock Skew",
       "type": "stat"
     },
     {
@@ -2151,7 +2147,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "ADR-0036 §8 control plane: what MH did with each forwarding policy MC sent. Counts every RegisterMeeting whose policy MH considered, exactly once, so the sum is a usable denominator. `applied` is health (fresh install, or an idempotent re-assert that correctly performed no swap). `rejected_stale` means reordered or retried delivery on the MC->MH path, or (rare; MC's quiesce prevents it) an EndMeeting released the meeting inside a still-live RPC - no remedy on MH, cross-check mc_media_push_quiesce_total{outcome=\"timed_out\"} on MC. `rejected_invalid` means MC sent structurally bad policy - the remedy is upstream in MC's assignment computation. `rejected_transport_inconsistent` (story 3) means every field parsed but MC's egress set contradicts its declared source_streams (an undeclared candidate, or one egress's candidates on different transports); refused whole, the prior generation stays live, and the remedy is upstream in MC. `apply_failed` means MH could not install it (config-apply mailbox full, apply timeout, actor gone, or the aggregate egress-edge bound) and THE PRIOR GENERATION STAYS LIVE; read the `reason` field on the mh.session.policy WARN log to tell those causes apart. `rejected_stream_ceiling` is a CAPACITY refusal (the derived egress stream ceiling; see mh-media's admission panels), not an MH fault, and is expected under an unsized placeholder budget. `rejected_meeting_cap` is a RESOURCE-GUARD refusal of a NEW meeting past MH_MAX_REGISTERED_MEETINGS (nothing upserted; the RPC answers RESOURCE_EXHAUSTED) - compare registered meetings with the limit on mh-media and tell leaked registrations (an EndMeeting that never arrived) from an empty-meeting flood. `no_generation` IS A ROLLOUT SIGNAL, NOT A STEADY STATE: MC emits policy_generation >= 1 as of story task 13, so the healthy shape is `applied` carrying the traffic and `no_generation` at zero. `no_generation` counting up is expected ONLY while an MC rollout is in progress - a not-yet-upgraded MC pod legitimately still sends 0, so the two series coexist and the mix shifts as pods cycle. That is not an outage. SUSTAINED `no_generation` AFTER THE ROLLOUT COMPLETES means MC failed to compute a generation; the remedy is upstream in MC (check mc_media_policy_pushes_total and MC's mc.register_meeting.trigger logs), not here. A counter is present-at-zero from process start (mh_media_policy_applies_total is zero-init'd over PolicyApplyOutcome), so a healthy idle panel reads a flat 0, not empty; an ABSENT series is a scrape/registration fault. Note that mh_grpc_requests_total covers RECEIPT; only this panel covers APPLICATION. See docs/observability/metrics/mh-service.md, and docs/runbooks/mh-incident-response.md Scenario 13 for triage.",
+      "description": "ADR-0036 §8 control plane: what MH did with each forwarding policy MC sent. Counts every RegisterMeeting whose policy MH considered, exactly once, so the sum is a usable denominator. `applied` is health (fresh install, or an idempotent re-assert that correctly performed no swap). `rejected_stale` means reordered or retried delivery on the MC->MH path, or (rare; MC's quiesce prevents it) an EndMeeting released the meeting inside a still-live RPC - no remedy on MH, cross-check mc_media_push_quiesce_total{outcome=\"timed_out\"} on MC. `rejected_invalid` means MC sent structurally bad policy - the remedy is upstream in MC's assignment computation. `rejected_transport_inconsistent` (story 3) means every field parsed but MC's egress set contradicts its declared source_streams (an undeclared candidate, or one egress's candidates on different transports); refused whole, the prior generation stays live, and the remedy is upstream in MC. `apply_failed` means MH could not install it (config-apply mailbox full, apply timeout, actor gone, or the aggregate egress-edge bound) and THE PRIOR GENERATION STAYS LIVE; read the `reason` field on the mh.session.policy WARN log to tell those causes apart. `rejected_stream_ceiling` is a CAPACITY refusal (the derived egress stream ceiling; see mh-media's admission panels), not an MH fault, and is expected under an unsized placeholder budget. `rejected_meeting_cap` is a RESOURCE-GUARD refusal of a NEW meeting past MH_MAX_REGISTERED_MEETINGS (nothing upserted; the RPC answers RESOURCE_EXHAUSTED) - compare registered meetings with the limit on mh-media and tell leaked registrations (an EndMeeting that never arrived) from an empty-meeting flood. `no_generation` IS A ROLLOUT SIGNAL, NOT A STEADY STATE: MC emits policy_generation >= 1 as of story task 13, so the healthy shape is `applied` carrying the traffic and `no_generation` at zero. `no_generation` counting up is expected ONLY while an MC rollout is in progress - a not-yet-upgraded MC pod legitimately still sends 0, so the two series coexist and the mix shifts as pods cycle. That is not an outage. SUSTAINED `no_generation` AFTER THE ROLLOUT COMPLETES means MC failed to compute a generation; the remedy is upstream in MC (check mc_media_policy_pushes_total and MC's mc.register_meeting.trigger logs), not here. A counter is present-at-zero from process start (mh_media_policy_applies_total is zero-init'd over PolicyApplyOutcome), so a healthy idle panel reads a flat 0, not empty; an ABSENT series is a scrape/registration fault. Note that mh_grpc_requests_total covers RECEIPT; only this panel covers APPLICATION. See docs/observability/metrics/mh-service.md, and docs/runbooks/mh-incident-response.md Scenario 27 for triage.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2257,7 +2253,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "READ THIS PANEL FIRST WHEN TRIAGING NO AUDIO. Connections that attempted to start a media session, one increment each, by terminal outcome. It is the precondition for every other panel in this row: a handler with no started sessions cannot produce a single frame, forwarded or dropped, so this row reading flat-at-zero is ambiguous until you read this panel. started = bound and the three media loops spawned - NOT that media flowed, and NOT a client-side verdict. started climbing while Media Frames Forwarded (ingress) stays flat LOCALISES the fault to at-or-after the spawn and says nothing about which side; this description previously called it a client-side uplink problem and that instruction misdirected three consecutive triage sessions in 2026-09, when the real cause was that nothing in the fleet was sending a datagram at all. Ask the prior question first: if mh_media_frames_dropped_total{reason=\"transport_receive_dropped\"} and {reason=\"no_media_session\"} are ALSO flat, no datagram reached this handler and neither service is implicated yet. declined_no_sender_binding = MC answered with no usable ordinal; the union of MC's 0-answering outcomes, which MH structurally cannot split - meeting_unknown (routing fault), participant_unknown (join race, self-clearing), user_ambiguous (one user with two roster entries; never self-clears, and reconnecting CAUSES it, so the join-race remedy is actively harmful). Read MC's mc_media_sender_binding_responses_total to split them. Discriminate on the RATIO, not the label: a decaying fraction is a join race, flat-and-total is a systematic identity mismatch between what MH names and what MC keys on. declined_sender_binding_out_of_range = MC's allocator RANGE; should read zero forever. declined_sender_binding_conflict = the ordinal is already held by a DIFFERENT participant and MH refused rather than overwrote; should read zero forever, and it is the only decline whose refused binding could have crossed media between participants — CHECK MH's UNBIND PATH FOR THAT MEETING BEFORE PAGING MC. declined_mc_unavailable = MH reached MC or the network and got no usable answer; MH->MC reachability, and it declines only after the whole retry budget. declined_mc_auth_rejected = MH's outbound credential failed - MC refused it, or MH could not build one; MH's OUTBOUND AUTH, NOT MC's health, so do not open MC. Discriminate on the log line \"Authorization header parse failed\" ON TARGET mh.grpc.mc_client - the target qualifier is load-bearing, because the same message is emitted on mh.grpc.gc_client from the same pod off the same service token, so an unqualified grep fails open. Present on that target = build failure (stay in MH, escalate to auth-controller); absent on that target = refusal (read MC's mc_caller_type_rejected_total). mh_token_refresh_total{status=\"error\"} - what MHTokenRefreshFailures fires on - then mh_token_refresh_failures_total by error_type for why, are context for both routes and separate neither. NO TIMING TELL on this value - the refusal declines immediately and the build failure only after the retry budget, so unlike declined_mc_endpoint_unknown vs declined_mc_unavailable, timing does not identify it. declined_mc_endpoint_unknown = MH had no usable MC endpoint and never reached the network; a REGISTRATION fault, not a reachability one — check what mc_grpc_endpoint the RegisterMeeting for that meeting carried, not MC's health. Every outcome flat while accepted WebTransport connections climb means connections never reach the binding boundary at all — the only pre-boundary terminus left is the JWT gate. NOT a frame drop and never folded into mh_media_frames_dropped_total: this row defines forwarded + dropped = attempts, and a decline is not a frame. Do not build a ratio against accepted connections — see docs/observability/metrics/mh-service.md §mh_media_session_starts_total.",
+      "description": "READ THIS PANEL FIRST WHEN TRIAGING NO AUDIO. Connections that attempted to start a media session, one increment each, by terminal outcome. It is the precondition for every other panel in this row: a handler with no started sessions cannot produce a single frame, forwarded or dropped, so this row reading flat-at-zero is ambiguous until you read this panel. started = bound and the three media loops spawned - NOT that media flowed, and NOT a client-side verdict. started climbing while Media Frames Forwarded (ingress) stays flat LOCALISES the fault to at-or-after the spawn and says nothing about which side; this description previously called it a client-side uplink problem and that instruction misdirected three consecutive triage sessions in 2026-09, when the real cause was that nothing in the fleet was sending a datagram at all. Ask the prior question first: if mh_media_frames_dropped_total{reason=\"transport_receive_dropped\"} and {reason=\"no_media_session\"} are ALSO flat, no datagram reached this handler and neither service is implicated yet. declined_no_sender_binding = MC answered with no usable ordinal; the union of MC's 0-answering outcomes, which MH structurally cannot split - meeting_unknown (routing fault), participant_unknown (join race, self-clearing), user_ambiguous (one user with two roster entries; never self-clears, and reconnecting CAUSES it, so the join-race remedy is actively harmful). Read MC's mc_media_sender_binding_responses_total to split them. Discriminate on the RATIO, not the label: a decaying fraction is a join race, flat-and-total is a systematic identity mismatch between what MH names and what MC keys on. declined_sender_binding_out_of_range = MC's allocator RANGE; should read zero forever. declined_sender_binding_conflict = the ordinal is already held by a DIFFERENT participant and MH refused rather than overwrote; should read zero forever, and it is the only decline whose refused binding could have crossed media between participants — CHECK MH's UNBIND PATH FOR THAT MEETING BEFORE PAGING MC. declined_mc_unavailable = MH reached MC or the network and got no usable answer; MH->MC reachability, and it declines only after the whole retry budget. declined_mc_auth_rejected = MH's outbound credential failed - MC refused it, or MH could not build one; MH's OUTBOUND AUTH, NOT MC's health, so do not open MC. Discriminate on the log line \"Authorization header parse failed\" ON TARGET mh.grpc.mc_client - the target qualifier is load-bearing, because the same message is emitted on mh.grpc.gc_client from the same pod off the same service token, so an unqualified grep fails open. Present on that target = build failure (stay in MH, escalate to auth-controller); absent on that target = refusal (read MC's mc_caller_type_rejected_total). mh_token_refresh_total{status=\"error\"} - what MHTokenRefreshFailures fires on - then mh_token_refresh_failures_total by error_type for why, are context for both routes and separate neither. NO TIMING TELL on this value - the refusal declines immediately and the build failure only after the retry budget, so unlike declined_mc_endpoint_unknown vs declined_mc_unavailable, timing does not identify it. declined_mc_endpoint_unknown = MH had no usable MC endpoint and never reached the network; a REGISTRATION fault, not a reachability one — check what mc_grpc_endpoint the RegisterMeeting for that meeting carried, not MC's health. declined_pending_cap = this (meeting, participant) already had MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT connections awaiting MC's bind answer, so MH declined it WITHOUT asking MC; expected near-zero, sustained = a client redial storm. A release while a bind is in flight is not counted on this panel (see Session Closes by Code). Every outcome flat while accepted WebTransport connections climb means connections never reach the binding boundary at all — the only pre-boundary terminus left is the media_dial admission gate. NOT a frame drop and never folded into mh_media_frames_dropped_total: this row defines forwarded + dropped = attempts, and a decline is not a frame. Do not build a ratio against accepted connections — see docs/observability/metrics/mh-service.md §mh_media_session_starts_total.",
       "fieldConfig": {
         "defaults": {
           "color": {

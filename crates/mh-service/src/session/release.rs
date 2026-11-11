@@ -30,7 +30,7 @@ pub enum ReleaseKind {
     /// No valid cause: `UNSPECIFIED`, or a number outside `ReleaseCause`
     /// (proto3 enums are open, so an unknown number decodes). Refused on
     /// `EndMeeting`; on a RELEASED verdict it is the misroute and is treated
-    /// as a removal for pending connections (the handler is leaving), but is
+    /// as a removal for connections awaiting their bind (the handler is leaving), but is
     /// counted on the teardown series, never with a `trigger`.
     NoCause,
 }
@@ -53,12 +53,14 @@ impl ReleaseKind {
         }
     }
 
-    /// Whether connections still awaiting their bind are closed with
-    /// `HANDLER_RELEASED` (`EndMeetingRequest` SEMANTICS): yes when the
-    /// handler is leaving the meeting, no when the meeting ended (one may be a
-    /// re-join racing the teardown, which the next registration rescues).
+    /// Whether connections still awaiting their bind (`NotifyParticipantConnected`
+    /// in flight) are closed with `HANDLER_RELEASED` at the release
+    /// (ADR-0039 §6; `EndMeetingRequest` SEMANTICS): yes when the handler is
+    /// leaving the meeting; no when the meeting ended — they are left to the
+    /// bind outcome, and an answer for a meeting MH no longer holds binds
+    /// nothing and closes `DECLINED`.
     #[must_use]
-    pub const fn closes_pending(self) -> bool {
+    pub const fn closes_awaiting_bind(self) -> bool {
         match self {
             Self::Removal(_) | Self::NoCause => true,
             Self::MeetingEnded => false,
@@ -99,11 +101,11 @@ mod tests {
     }
 
     #[test]
-    fn only_meeting_ended_leaves_pending_connections() {
-        assert!(!ReleaseKind::MeetingEnded.closes_pending());
-        assert!(ReleaseKind::NoCause.closes_pending());
+    fn only_meeting_ended_leaves_awaiting_bind_connections_to_the_bind() {
+        assert!(!ReleaseKind::MeetingEnded.closes_awaiting_bind());
+        assert!(ReleaseKind::NoCause.closes_awaiting_bind());
         for trigger in RemovalTrigger::ALL {
-            assert!(ReleaseKind::Removal(trigger).closes_pending());
+            assert!(ReleaseKind::Removal(trigger).closes_awaiting_bind());
         }
     }
 }

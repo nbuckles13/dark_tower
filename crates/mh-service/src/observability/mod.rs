@@ -16,8 +16,8 @@
 //! There used to be a table here. It drifted seven metrics behind the code
 //! (`mh_active_connections`, `mh_webtransport_connections_total`,
 //! `mh_webtransport_handshake_duration_seconds`, `mh_jwt_validations_total`,
-//! `mh_caller_type_rejected_total`, `mh_mc_notifications_total` and
-//! `mh_register_meeting_timeouts_total` were all absent), and the label-bounds
+//! `mh_caller_type_rejected_total`, `mh_mc_notifications_total` and a since
+//! retired registration-timeout counter were all absent), and the label-bounds
 //! list above it disagreed with `metrics.rs`'s own docstring about how many
 //! values `method` had — neither of them correctly. A pointer cannot drift; an
 //! enumeration copied into four files always does.

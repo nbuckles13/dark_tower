@@ -258,6 +258,17 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_STREAM_MID_FRAME_STALL_MS
+        # media_dial admission (story 4 MH-1, ADR-0039 §5): both REQUIRED.
+        - name: MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS
+        - name: MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT
         # Shared media codec profile (story 3 R-23, R-24): the four values MH
         # reads from the SHARED `media-codec-profile` generator in the sibling
         # base infra/services/media-codec-profile/ — their single home, also

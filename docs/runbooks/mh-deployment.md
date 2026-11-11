@@ -8,7 +8,7 @@
 
 ## Overview
 
-This runbook covers the post-deploy monitoring procedure for the Media Handler service, with particular focus on deployments that touch the WebTransport server or MC↔MH coordination paths (e.g. the MH QUIC connection user story: client WebTransport handshake, JWT validation, `RegisterMeeting` provisional-accept, MH→MC participant notifications).
+This runbook covers the post-deploy monitoring procedure for the Media Handler service, with particular focus on deployments that touch the WebTransport server or MC↔MH coordination paths (e.g. the MH QUIC connection user story and story 4 MH-1: client WebTransport handshake, `media_dial` admission and the pending cap, `RegisterMeeting` (dial-key intake), MH→MC participant notifications).
 
 A deeper deployment-procedure section (manifest layout, rolling-update steps, smoke tests) lives alongside the existing service runbooks (`gc-deployment.md`, `mc-deployment.md`) and is tracked as a follow-up. The post-deploy monitoring checklist below is the primary deliverable for the MH QUIC story (R-36) and is what an on-call engineer follows after deploying mh-service to verify the WebTransport + coordination paths are healthy.
 
@@ -250,7 +250,7 @@ re-scoped in [Rollback for the media path](#rollback-for-the-media-path).
 
 ## Post-Deploy Monitoring Checklist: MH WebTransport + MC↔MH Coordination
 
-Use this checklist after any deployment that touches MH WebTransport server code (handshake, JWT validation, `await_meeting_registration` timeout) or MC↔MH coordination wiring (`RegisterMeeting`, MH→MC notifications). For routine deployments that do not touch these paths, the general MH monitoring section is sufficient.
+Use this checklist after any deployment that touches MH WebTransport server code (handshake, `media_dial` admission, the pending cap) or MC↔MH coordination wiring (`RegisterMeeting`, MH→MC notifications). For routine deployments that do not touch these paths, the general MH monitoring section is sufficient.
 
 This checklist implements the post-deploy verification required by user story `docs/user-stories/2026-04-12-mh-quic-connection.md` §operations (R-36). Required windows: 30-min, 2-hour, 4-hour, 24-hour.
 
@@ -276,8 +276,19 @@ sum(rate(mh_jwt_validations_total{result="success"}[5m]))
 /
 sum(rate(mh_jwt_validations_total[5m]))
 
-# RegisterMeeting timeouts in the bake window (target: 0)
-sum(increase(mh_register_meeting_timeouts_total[30m]))
+# media_dial admission rejections in the bake window, by reason (story 4 MH-1).
+# GATE only on the reasons that need a token SIGNED WITH THE MEETING KEY:
+# `expired` (incl. a future iat; MC's TTL/3 refresh push or clock drift) and
+# `wrong_type` (token confusion), at 0 once sustained. `no_meeting_key`,
+# `malformed` and `signature_invalid` are ATTACKER-DRIVABLE (an unauthenticated
+# peer moves them with a forged token: they are decided before or at the
+# signature check) and an MH restart moves `no_meeting_key` too, so they are
+# INVESTIGATE-ONLY, never a gate. A sustained `no_meeting_key` means an MC
+# ordering bug (token before RegisterMeeting acked) only once probing is
+# excluded: it must correlate with mc_register_meeting_total{status="error"}.
+# The pending-cap decline (redial storm) is read beside it.
+sum by(failure_reason) (increase(mh_jwt_validations_total{token_type="media_dial",result="failure"}[30m]))
+sum(increase(mh_media_session_starts_total{outcome="declined_pending_cap"}[30m]))
 
 # Forwarding-policy apply failures in the bake window (target: 0).
 #
@@ -286,9 +297,9 @@ sum(increase(mh_register_meeting_timeouts_total[30m]))
 # apply_failed, rejected_stale and rejected_invalid alike — correct RPC
 # semantics, but it means every other RegisterMeeting gate in this file is
 # blind to a build that refuses all policy. See mh-incident-response.md
-# Scenario 13.
+# Scenario 27.
 #
-# Cumulative-zero, same shape and justification as the timeout counter above:
+# Cumulative-zero, same shape and justification as the admission reasons above:
 # no rate threshold is invented here (a useful rate depends on MC's re-assert
 # cadence, which lands at story task 13, and alerting is task 21's scope), and
 # zero is unambiguously correct for all three values in either era.
@@ -387,7 +398,7 @@ clamp_min(sum(increase(mc_participant_mh_status_total{state=~"connected|failed"}
 
 - [ ] `mh_webtransport_connections_total{status="accepted"}` rate / total >95% (handshake success SLO from R-36)
 - [ ] `mh_jwt_validations_total{result="success"}` rate / total >99% (JWT success SLO from R-36)
-- [ ] `mh_register_meeting_timeouts_total` increase over 30m = 0 (healthy MC→MH coordination)
+- [ ] `mh_jwt_validations_total{token_type="media_dial",result="failure",failure_reason=~"expired|wrong_type"}` increase over 30m = 0, evaluated from T+10m after the rollout completes (healthy token refresh and no token confusion; story 4 MH-1 — only these two reasons need a meeting-key signature, so no unauthenticated peer can move them). Investigate-only, never a gate: `no_meeting_key`, `malformed`, `signature_invalid` (attacker-drivable; `no_meeting_key` also moves on every MH restart with live meetings — read it against `mc_register_meeting_total{status="error"}`). And `mh_media_session_starts_total{outcome="declined_pending_cap"}` near zero (no client redial storm). Triage: `mh-incident-response.md` Scenario 24.
 - [ ] `mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}` increase over 30m = 0 (forwarding policy actually took effect — **receipt is not application**; the `mc_register_meeting_total` gate below cannot see this). `no_generation` is excluded and is the expected value until story task 13.
 - [ ] `mc_register_meeting_total{status="success"}` rate / total >95% (MC RegisterMeeting RPC SLO; emitter labels are `success|error`, see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
 - [ ] `mh_mc_notifications_total{status="success"}` rate / total >95% (MH→MC delivery SLO)
@@ -406,7 +417,7 @@ clamp_min(sum(increase(mc_participant_mh_status_total{state=~"connected|failed"}
 
 - [ ] WebTransport handshake success rate trend stable (no downward drift toward 95%)
 - [ ] JWT validation success rate trend stable (no downward drift toward 99%)
-- [ ] `mh_register_meeting_timeouts_total` increase over the last 2 hours = 0
+- [ ] `mh_jwt_validations_total{token_type="media_dial",result="failure",failure_reason=~"expired|wrong_type"}` increase over the last 2 hours = 0 (the attacker-drivable `no_meeting_key|malformed|signature_invalid` are investigate-only, not gates)
 - [ ] `mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}` increase over the last 2 hours = 0
 - [ ] `mc_participant_mh_status_total` failed-share still < 0.20 over 2h (no upward drift toward the 0.80 `MCMediaConnectionAllFailed` paging line)
 - [ ] No mh-service or mc-service pod restarts since deploy completed (`kubectl get pods -n dark-tower -l app=mh-service` — `RESTARTS` column should match pre-deploy baseline)
@@ -426,7 +437,7 @@ sum(rate(mh_jwt_validations_total{result="success"}[5m]))
 sum(rate(mh_jwt_validations_total[5m]))
 
 # Cumulative-zero counters use the per-window increase
-sum(increase(mh_register_meeting_timeouts_total[2h]))
+sum by(failure_reason) (increase(mh_jwt_validations_total{token_type="media_dial",result="failure"}[2h]))
 sum(increase(mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}[2h]))
 
 # Client-reported media-connection failed share over 2h (R-60; gate < 0.20).
@@ -455,15 +466,16 @@ histogram_quantile(0.95,
 
 ### 24-hour check
 
-This is the long-tail window where slow leaks show up — JWKS cache eviction interacting with token rotation, MC↔MH connection-pool drift, gradual handshake-latency creep under sustained load. The 24-hour cadence is required by R-36 (the join-flow post-deploy precedent goes 15-min/1-hour/4-hour; this checklist extends to 24-hour because QUIC connection state is more long-lived than the join handshake).
+This is the long-tail window where slow leaks show up — `media_dial` token-refresh breakage (`expired` rising), service-token JWKS eviction interacting with token rotation, MC↔MH connection-pool drift, gradual handshake-latency creep under sustained load. The 24-hour cadence is required by R-36 (the join-flow post-deploy precedent goes 15-min/1-hour/4-hour; this checklist extends to 24-hour because QUIC connection state is more long-lived than the join handshake).
 
 ```promql
 # Cumulative coordination-failure counts since deploy (target: 0).
 # The policy-apply arm matters most at this tier: the aggregate egress-edge
 # bound is consumed by finished meetings over uptime, so `apply_failed` from
 # that cause surfaces at the 24-hour window rather than at 30 minutes
-# (mh-incident-response.md Scenario 13).
-sum(increase(mh_register_meeting_timeouts_total[24h]))
+# (mh-incident-response.md Scenario 27).
+sum by(failure_reason) (increase(mh_jwt_validations_total{token_type="media_dial",result="failure"}[24h]))
+sum(increase(mh_media_session_starts_total{outcome="declined_pending_cap"}[24h]))
 sum(increase(mh_media_policy_applies_total{outcome=~"apply_failed|rejected_invalid|rejected_stale"}[24h]))
 
 # Client-reported media-connection failed share over 24h (R-60; gate < 0.20).
@@ -481,9 +493,10 @@ sum(rate(mh_jwt_validations_total{result="success"}[24h]))
 sum(rate(mh_jwt_validations_total[24h]))
 
 # Latency-trend slow-leak checks — additional (beyond R-36).
-# Catches gradual P95 drift before the timeout/rejection counters fire:
-# JWKS cache eviction, QUIC connection-pool fragmentation, or MC→MH
-# RegisterMeeting RPC slowdown that hasn't yet crossed the 15s timeout.
+# Catches gradual P95 drift before the rejection counters fire:
+# session-actor lag on the admission key lookup, QUIC connection-pool
+# fragmentation, or MC→MH RegisterMeeting RPC slowdown (which delays MC's
+# register-before-token release of dial tokens).
 # Trailing `[1h]` rate means this reads "P95 over the last hour, evaluated
 # at the 24h mark".
 histogram_quantile(0.95,
@@ -494,15 +507,15 @@ histogram_quantile(0.95,
 )
 ```
 
-- [ ] `mh_register_meeting_timeouts_total` increase over 24h = 0
+- [ ] `mh_jwt_validations_total{token_type="media_dial",result="failure",failure_reason=~"expired|wrong_type"}` increase over 24h = 0 (a sustained `expired` is the only sign MC's token refresh push is broken; `no_meeting_key|malformed|signature_invalid` are attacker-drivable and investigate-only)
 - [ ] `mc_participant_mh_status_total` failed-share still < 0.20 over 24h (catches a slow media-plane regression — MH-edge reachability or TLS drift — that stays under the paging line but degrades a growing share of clients)
 - [ ] 24-hour averaged WebTransport handshake success rate still >95%
-- [ ] 24-hour averaged JWT validation success rate still >99% (catches slow JWKS-cache or token-rotation regressions that don't show up at 30-min)
+- [ ] 24-hour averaged JWT validation success rate still >99% (catches slow token-refresh, clock-drift or service-token JWKS regressions that don't show up at 30-min)
 - [ ] No upward trend in WebTransport rejection rate over the past 24h
 - [ ] No new `MHHighJwtValidationFailures` flapping pattern across the day-long window
 - [ ] `mh_active_connections` follows expected diurnal/load pattern (no clamping at 0, no unexplained spikes)
-- [ ] *Additional (beyond R-36)*: WebTransport handshake P95 trailing-1h trend is flat (slow-leak detection — JWKS or connection-pool drift)
-- [ ] *Additional (beyond R-36)*: `mc_register_meeting_duration_seconds` P95 trailing-1h trend is flat (leading indicator for the timeout counter; see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
+- [ ] *Additional (beyond R-36)*: WebTransport handshake P95 trailing-1h trend is flat (slow-leak detection — admission key-lookup lag or connection-pool drift)
+- [ ] *Additional (beyond R-36)*: `mc_register_meeting_duration_seconds` P95 trailing-1h trend is flat (leading indicator for `no_meeting_key` and slow first joins; see `crates/mc-service/src/observability/metrics.rs::record_register_meeting`)
 
 #### Story 3 video: the 24-hour watch list, in the order things rise first
 
@@ -658,10 +671,10 @@ Trigger an immediate rollback if any of the following hold (verbatim from user s
   sum(rate(mh_media_session_starts_total[10m])) > 0
   ```
 
-- Any `mh_register_meeting_timeouts_total` increment, sustained for 10 minutes (i.e. timeouts are continuing to fire — not a single transient blip). `sum(increase(...))` aggregates across pods so a per-pod label split in the future doesn't change behavior:
+- A `media_dial` admission rejection for `expired` or `wrong_type` that is genuinely SUSTAINED for 10 minutes (non-zero in every minute of the window, so a single blip right after the rollout does not trigger it). Only these two reasons need a token signed with the meeting's key, so an unauthenticated peer cannot pull this trigger: `expired` is a skew/refresh defect, `wrong_type` a token-confusion defect, and either means clients holding valid MC credentials cannot get media on this build. **Never roll back on `no_meeting_key`, `malformed` or `signature_invalid`**: an unauthenticated peer drives them with forged tokens (they are decided before or at the signature check), and an MH restart moves `no_meeting_key` on its own — investigate them (Scenario 24; correlate `no_meeting_key` with `mc_register_meeting_total{status="error"}`), do not roll back on them:
 
   ```promql
-  sum(increase(mh_register_meeting_timeouts_total[10m])) > 0
+  min_over_time(sum(rate(mh_jwt_validations_total{token_type="media_dial",result="failure",failure_reason=~"expired|wrong_type"}[1m]))[10m:1m]) > 0
   ```
 
 The 20%/5m JWT floor is intentionally looser than the existing `MHHighJwtValidationFailures` warning alert (which fires at >10%/5m, see `infra/docker/prometheus/rules/mh-alerts.yaml`). The alert is for "investigate"; this rollback floor is for "abort the deploy regardless of cause". Do not tighten the rollback floor to alert thresholds — that conflates investigation with rollback.
@@ -890,6 +903,8 @@ what this story's configuration task found false.)
 | `MH_EGRESS_STREAM_BACKLOG_BYTES` *(story 3)* | ConfigMap `mh-service-config` | `config.env` | Backlog cap per subscriber egress (group) stream (R-12, R-21). Past it MH **resets** that subscriber's group stream, never finishes it, and counts the reset. Recovery comes from the next keyframe request. Per DESTINATION (shared by an edge's at most two live streams), bounds 16384..=4194304; counted `mh_media_group_resets_total{reason="subscriber_backlog"}`, published as `mh_media_egress_stream_backlog_limit_bytes`. It enters MH's boot-time memory check (next row). |
 | `MH_STREAM_MID_FRAME_STALL_MS` *(story 3)* | ConfigMap `mh-service-config` | `config.env` | A publisher stalled mid-frame (no progress) for longer than this is reset downstream and its stream stopped (R-21), counted `mh_media_group_resets_total{reason="publisher_stall"}`. Bounds 100..=10000; published as `mh_media_stream_mid_frame_stall_seconds`. |
 | `MH_POD_MEMORY_LIMIT_BYTES` *(story 3)* | **Not a ConfigMap key**: a downward-API `resourceFieldRef` to this container's `resources.limits.memory` (`divisor: "1"`) in `deployment.yaml` (the MH template) | the container's memory limit (never restated) | The input to MH's boot-time memory check, from **MH-A2**: the formula has ONE executable home, `check_pod_memory` / `per_connection_memory_bound_bytes` in `crates/mh-service/src/config.rs` (see there for the terms; the passing boot's INFO line logs each one), so that exhaustion is a counted reset and never an OOM kill. Absent, empty, unparseable or 0 refuses to boot (no default, no cgroup fallback). A refusal is one ERROR line on stderr, target `mh.config`, message "Pod memory check failed: refusing to start", naming every term, its key and the levers (the pod shows CrashLoopBackOff); a passing boot logs the figures and headroom at INFO on target `mh.config.memory`. With the send window, `MH_MAX_CONNECTIONS` has roughly 1.3x headroom at 1 GiB — the binding constraint on raising it. **The limit must stay declared.** If it were absent, Kubernetes would resolve the variable to the node's allocatable memory and the check would pass vacuously. `dt-guard kustomize` (`crates/dt-guard/src/kustomize_resource_field_refs.rs`) fails any `resourceFieldRef` whose container does not declare the resource, over the base and the rendered Kind root. |
+| `MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS` *(story 4 MH-1)* | ConfigMap `mh-service-config` (REQUIRED ref) | `config.env` (`30`) | Clock skew MH allows on a client `media_dial` token's `exp` and `iat` at admission (ADR-0039 §5). **Enforced by mh-service** (`crates/mh-service/src/auth/mod.rs`); bounds `0..=60` inclusive; unset or above 60 refuses to start (REQUIRED: there is no code default). Published as `mh_media_dial_clock_skew_seconds`; a too-small value shows as `mh_jwt_validations_total{token_type="media_dial",failure_reason="expired"}`. **Do NOT raise skew to mask clock drift; fix NTP.** |
+| `MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT` *(story 4 MH-1)* | ConfigMap `mh-service-config` (REQUIRED ref) | `config.env` (`2`) | Connections still awaiting MC's bind answer (`NotifyParticipantConnected` in flight) allowed per (meeting, participant); the excess is closed `DECLINED` without asking MC (ADR-0039 §5). **Enforced by mh-service's session actor**; bounds `1..=16` (`0` would decline every dial and refuses to start; the 16 ceiling is our own choice, ADR-0039 says only "small"; unset refuses to start — REQUIRED, no code default). Counted `mh_media_session_starts_total{outcome="declined_pending_cap"}`: near zero is healthy, sustained means a client redial storm — raising the cap does not fix a redial storm. |
 | `MEDIA_VIDEO_MAX_BITRATE_BPS`, `MEDIA_VIDEO_FRAME_RATE_HZ`, `MEDIA_AUDIO_MAX_BITRATE_BPS`, `MEDIA_AUDIO_FRAME_RATE_HZ` *(story 3)* | ConfigMap **`media-codec-profile`** (`infra/services/media-codec-profile/profile.env`), shared with MC | `profile.env` | MH derives **both** per-stream egress costs from these (required reads): bitrate plus code-derived per-frame overhead × frame rate, with no headroom knob. Raising either video value **lowers every MH's stream ceiling**. MH also refuses to boot on an audio bitrate outside its supported band or an audio frame rate other than the one its frame duration implies (constants in `crates/mh-service/src/config.rs`). Read the result on `mh_media_egress_stream_ceiling`. **Editing the profile rolls MC and MH together** ([Operator levers](#operator-levers-for-media-video-off-and-nothing-else)). |
 
 The ConfigMap comments in `infra/services/mh-service/config.env` carry each key's value, derivation
@@ -897,6 +912,8 @@ and remedy; the value column above cites that file rather than restating numbers
 Each key is also reflected as a gauge MH publishes from the value it loaded
 (`docs/observability/metrics/mh-service.md` §Egress Admission Metrics), which
 `crates/env-tests/tests/01_mh_deployment_config.rs` compares against the deployed ConfigMap.
+
+**The RegisterMeeting-timeout key `MH_REGISTER_MEETING_TIMEOUT_*` (RETIRED by story 4 MH-1, ADR-0039 §3)** was never in `config.env` or the template (a code default only) and has no ref to retire. MH no longer reads it: the pending-before-registration path it bounded is deleted, and a dial for a meeting MH holds no key for is DECLINED at accept. It is in `RETIRED_KEYS` (`crates/mh-service/src/config.rs`), so a stale override still set on a pod is reported at startup as ignored. Do not set it.
 
 **Retired keys** are listed **for contrast only**. Each still has a key and an `optional: true` ref
 (step 1 of the two-deploy retirement). Deleting a key and its refs together is step 2, scheduled in
@@ -1457,6 +1474,13 @@ Images: the patch changes `Cargo.lock`, so ALL FOUR service images rebuild.
 - **Rolling MH back alone below MH-2 is safe while MC is at MC-B1 and below MC-B2** (verified: MC-B1 never removes a handler on heartbeat silence; only MC-B2's detection does). This MH-only revert is **THE lever for a bad MH-2 deploy** — a jump in `mh_media_handler_releases_total` or in `mh_mc_heartbeat_verdicts_total{outcome="misroute"}` after the roll — because MH-2 has no kill switch. **Once MC-B2 is live, a pre-MH-2 MH sends no heartbeats and is declared dead**: do not roll MH below MH-2 after MC-B2.
 - **Signals**: the 0-interval refusal is `mh_grpc_requests_total{method="register_meeting",status="error"}` plus the WARN with `reason="zero_heartbeat_interval"` (no dedicated series; see the 30-minute check); the cause-less `EndMeeting` is `mh_media_meeting_teardowns_total{outcome="rejected_invalid_cause"}`; an MC predating the heartbeat rpc is `mh_mc_heartbeats_total{outcome="error"}`. After an MH-2 deploy every `mh_mc_heartbeats_total`, `mh_mc_heartbeat_verdicts_total` and `mh_media_handler_releases_total` series is present at 0; ABSENT means the new image is not running.
 - **Safe-revert unit**: the whole MH-2 change — the heartbeat code, the release-cause handling, the `process_start_epoch_ms` proto deletion (wire-safe both ways: MC only logged it), and their series, panels and runbook rows — reverts as one unit.
+
+**`media_dial` admission coupling (story 4 MH-1; ADR-0039 §3, §5).** MH admits a client ONLY on an MC-minted `media_dial` token verified against the key in the meeting's `RegisterMeetingRequest.media_dial_public_key`, refuses a registration whose key is not exactly 32 bytes (`INVALID_ARGUMENT`, nothing recorded), and never reads `MhConnectRequest.join_token`. **Deploy order: MC (MC-D) → SDK (C1) → MH (MH-1); roll back in reverse — MH first.**
+- **Rolling MC back below MC-D while MH-1 is live is UNSAFE.** That MC sends no key, so MH refuses every `RegisterMeeting` it sends: **new meetings get no media** (and an MC below MC-D mints no dial tokens either). Signal: `mh_grpc_requests_total{method="register_meeting",status="error"}` with the WARN `reason="media_dial_key_length"`.
+- **An SDK below C1 sends no `media_dial_token`**: every dial is DECLINED (`failure_reason="malformed"`).
+- **Rolling MH back alone below MH-1 DEGRADES to the pre-MH-1 interim until story 4 P3 lands**: join-time dials still admit on `join_token`, but every later dial (added ref, redial, migration, replacement) is DECLINED, so handler-loss recovery onto a rolled-back MH does not work. After P3 it is a full admission outage — **P3 raises the MH rollback floor to MH-1.**
+- **Signals**: `mh_jwt_validations_total{token_type="media_dial",result="failure"}` by `failure_reason` and `mh_media_session_starts_total{outcome="declined_pending_cap"}` (`mh-incident-response.md` Scenario 24).
+- **Safe-revert unit**: the single MH-1 commit — the admission switch, the pending-path deletion, the env-test fixture switch to `media_dial_token`, and the config/metric retirement with their panels and runbook rows. Reverting it can never produce an image that accepts both credential types.
 
 **`connection_id` coupling (story 2 task 20).** MH now threads its per-session `connection_id` into `NotifyParticipantConnected`/`Disconnected`; MC keys connectivity on it. **Since story 4 MC-B1 this is a HARD ordering:** MC refuses an empty `connection_id`, so rolling MH back below the task-20 image (or an MH pod left on an older image) gets every Connected on that MH **refused** (`sender_id` 0) — its sessions never bind, a total media outage for that handler. With the current fleet every MH sends the field; never roll an MH back below task 20 while an MC-B1 MC is live. Signalled by `mc_mh_notifications_unapplied_total{reason="connection_id_missing"}` rising (see the 30-minute check). The MC-side view of the same coupling is `mc-deployment.md` §Coordination.
 

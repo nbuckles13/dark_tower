@@ -497,8 +497,9 @@ async fn test_non_host_server_mute_is_refused_and_counted() {
 
 /// Open a media session to `url` that cannot idle out (see
 /// [`STRAGGLER_KEEP_ALIVE`]), failing as an ENVIRONMENT fact.
-async fn reach_kept_alive(phase: &str, url: &str, token: &str) -> MhSession {
-    mc_session::try_mh_connect_with(url, token, Some(STRAGGLER_KEEP_ALIVE))
+async fn reach_kept_alive(phase: &str, p: &Participant, url: &str) -> MhSession {
+    let token = participant::dial_token_for(phase, p, url);
+    mc_session::try_mh_connect_with(url, token.expose(), Some(STRAGGLER_KEEP_ALIVE))
         .await
         .unwrap_or_else(|e| {
             panic!(
@@ -552,10 +553,10 @@ async fn test_meeting_end_releases_every_handler_even_with_a_straggler() {
     gauge_by_instance_present(&prom, "mh_media_registered_meetings", 2, COUNTER_BUDGET).await;
 
     // S keeps its sessions alive; B and C use ordinary ones.
-    let s_x = reach_kept_alive("TEARDOWN", &x, &ps[0].token).await;
-    let s_y = reach_kept_alive("TEARDOWN", &y, &ps[0].token).await;
-    let b_x = participant::reach("TEARDOWN", "B", &x, &ps[1].token).await;
-    let c_y = participant::reach("TEARDOWN", "C", &y, &ps[2].token).await;
+    let s_x = reach_kept_alive("TEARDOWN", &ps[0], &x).await;
+    let s_y = reach_kept_alive("TEARDOWN", &ps[0], &y).await;
+    let b_x = participant::reach("TEARDOWN", &ps[1], &x).await;
+    let c_y = participant::reach("TEARDOWN", &ps[2], &y).await;
     ps[0].declare(&[4, 5], &[]).await;
     ps[1].declare(&[6], &[]).await;
     ps[2].declare(&[7], &[]).await;
@@ -807,10 +808,7 @@ fn named_state(view: &StreamAssignments, kind: MediaKind, sender: u32) -> Option
 async fn reach_both(phase: &str, p: &Participant) -> HashMap<String, MhSession> {
     let mut out = HashMap::new();
     for url in p.offered() {
-        out.insert(
-            url.clone(),
-            participant::reach(phase, p.label, &url, &p.token).await,
-        );
+        out.insert(url.clone(), participant::reach(phase, p, &url).await);
     }
     out
 }

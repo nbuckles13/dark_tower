@@ -3,18 +3,20 @@
 //! Handles the connection lifecycle:
 //! 1. Accept WebTransport session
 //! 2. Accept bidirectional stream
-//! 3. Read meeting JWT from first length-prefixed message
-//! 4. Validate JWT via `MhJwtValidator`
-//! 5. Check meeting registration status:
-//!    - Registered: add connection, notify MC, hold open
-//!    - Not registered: provisional accept with configurable timeout
+//! 3. Read the `media_dial` token from the first length-prefixed message
+//!    (`MhConnectRequest.media_dial_token`; `join_token` is never read)
+//! 4. Admit it (`crate::webtransport::close::admit`, ADR-0039 §5): verified
+//!    against the meeting's REGISTERED key — a meeting this handler does not
+//!    hold is declined at once; nothing is ever parked waiting for a
+//!    registration (§3)
+//! 5. Admit the connection under the per-`(meeting, sub)` pending cap, ask MC
+//!    for its `sender_id`, bind, start media, hold open
 //! 6. Monitor for disconnect or cancellation
 //! 7. On disconnect: notify MC, clean up session
 //! 8. End the session: every intentional close carries one `MhCloseCode`
 //!    (ADR-0039 §7, `crate::webtransport::close`); every other end closes QUIC
 //!    with no code
 
-use crate::auth::MhJwtValidator;
 use crate::config::{
     EGRESS_QUEUE_FRAMES, INGRESS_QUEUE_FRAMES, MC_UNAVAILABLE_CLOSE_JITTER_MAX_MS,
     NOMINAL_AUDIO_FRAME_BYTES,
@@ -35,10 +37,10 @@ use crate::media::stream_ingress::{run_stream_ingress, StreamIngressContext};
 use crate::media::{MediaSetup, MediaTaskContext};
 use crate::observability::metrics;
 use crate::routing::{IdError, MeetingKey, SenderId};
-use crate::session::{ConnectionEntry, PendingConnection, SessionManagerHandle};
+use crate::session::{AdmitOutcome, BindOutcome, ConnectionEntry, SessionManagerHandle};
 use crate::transport::framing::{FrameEnd, FramedReader, CONTROL_PARSE_BYTES};
 use crate::webtransport::close::{
-    self, SessionClose, StartDecline, ValidatedClose, ValidatedSession,
+    self, Refusal, SessionClose, StartDecline, ValidatedClose, ValidatedSession,
 };
 use crate::webtransport::media_transport::{WtRecvStream, WtSendStream};
 use crate::webtransport::WtMediaTransport;
@@ -50,149 +52,42 @@ use rand::RngExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use wtransport::endpoint::IncomingSession;
 
-/// Outcome of awaiting a `RegisterMeeting` notification for a provisional
-/// connection. Drives the caller's dispatch in [`handle_connection`].
-#[derive(Debug)]
-enum RegistrationOutcome {
-    /// `RegisterMeeting` arrived before the timeout; the pending connection
-    /// was promoted by `SessionManager`. Caller should notify MC.
-    Registered,
-    /// The provisional-accept timeout expired before `RegisterMeeting`
-    /// arrived. `mh_register_meeting_timeouts_total` has been recorded and
-    /// the pending connection has been removed. Caller should return
-    /// `MhError::MeetingNotRegistered`.
-    Timeout,
-    /// The cancellation token fired (server shutdown). The pending
-    /// connection has been removed. Caller should return `Ok(())`.
-    Cancelled,
-    /// The meeting was released for a cause under which the handler LEAVES it
-    /// (a removal cause, or a RELEASED verdict's misroute; story 4 MH-2): the
-    /// session actor already removed this pending connection and fired its
-    /// close token. The caller closes it with `HANDLER_RELEASED`.
-    Released,
-}
-
-/// Await one of three outcomes for a provisional WebTransport connection:
-/// `RegisterMeeting` arrives, the timeout expires, or the server shuts down.
-///
-/// On `Timeout`, records `mh_register_meeting_timeouts_total` and removes
-/// the pending connection from `SessionManager`. On `Cancelled`, removes
-/// the pending connection. On `Registered`, leaves MC notification to the
-/// caller so MC-client I/O stays out of this helper (keeps the helper
-/// unit-testable with only `SessionManagerHandle` + `CancellationToken`).
-///
-/// The metric fires ONLY on the timeout arm — this is the invariant the
-/// unit tests in this module enforce.
-#[must_use]
-async fn await_meeting_registration(
-    session_manager: &SessionManagerHandle,
-    meeting_id: &str,
-    connection_id: &str,
-    notify: &Notify,
-    register_meeting_timeout: Duration,
-    cancel_token: &CancellationToken,
-    connection_close: &CancellationToken,
-) -> RegistrationOutcome {
-    // LOST-WAKEUP GUARD. `notify_waiters` wakes only `Notified` futures that
-    // already exist, and this connection's pending entry was added by an
-    // earlier message: if `RegisterMeeting` was processed between that reply and
-    // this point, its wake-up went to nobody and a plain `select!` would sit out
-    // the whole timeout for a meeting that is already registered — then kick
-    // the client. So create (and enable) the future FIRST, then re-check: a
-    // registration from here on is caught by the future, one before it by the
-    // check. A registration that ran first also promoted this connection, so
-    // `Registered` is the truthful answer.
-    let notified = notify.notified();
-    tokio::pin!(notified);
-    notified.as_mut().enable();
-    if session_manager.is_meeting_registered(meeting_id).await {
-        info!(
-            target: "mh.webtransport.connection",
-            connection_id = %connection_id,
-            meeting_id = %meeting_id,
-            "Pending connection promoted by a RegisterMeeting that landed before it began waiting"
-        );
-        return RegistrationOutcome::Registered;
-    }
-    tokio::select! {
-        () = notified => {
-            info!(
-                target: "mh.webtransport.connection",
-                connection_id = %connection_id,
-                meeting_id = %meeting_id,
-                "Pending connection promoted after RegisterMeeting"
-            );
-            RegistrationOutcome::Registered
-        }
-        () = tokio::time::sleep(register_meeting_timeout) => {
-            warn!(
-                target: "mh.webtransport.connection",
-                connection_id = %connection_id,
-                meeting_id = %meeting_id,
-                "RegisterMeeting timeout expired, disconnecting client"
-            );
-            metrics::record_register_meeting_timeout();
-            session_manager
-                .remove_pending_connection(meeting_id, connection_id)
-                .await;
-            RegistrationOutcome::Timeout
-        }
-        // `connection_close` is a CHILD of the server token, so this arm sees
-        // both server shutdown and a release; the parent tells them apart.
-        () = connection_close.cancelled() => {
-            if cancel_token.is_cancelled() {
-                debug!(
-                    target: "mh.webtransport.connection",
-                    connection_id = %connection_id,
-                    "Provisional connection cancelled during shutdown"
-                );
-                session_manager
-                    .remove_pending_connection(meeting_id, connection_id)
-                    .await;
-                RegistrationOutcome::Cancelled
-            } else {
-                info!(
-                    target: "mh.webtransport.connection",
-                    connection_id = %connection_id,
-                    meeting_id = %meeting_id,
-                    "Closing pending connection: its meeting was released for a removal cause"
-                );
-                RegistrationOutcome::Released
-            }
-        }
-    }
+/// Client-admission settings, resolved once at process setup (story 4 MH-1;
+/// ADR-0039 §5).
+#[derive(Debug, Clone, Copy)]
+pub struct ClientAdmission {
+    /// `exp`/`iat` tolerance for `media_dial` tokens
+    /// (`MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS`).
+    pub clock_skew: Duration,
+    /// Connections awaiting MC's bind answer allowed per `(meeting, sub)`
+    /// (`MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT`).
+    pub max_pending_per_participant: usize,
 }
 
 /// Handle an incoming WebTransport connection.
 ///
 /// This is the entry point for each client connection: accept session,
-/// read JWT, validate, check registration, notify MC, then hold the
-/// connection open. On disconnect, notifies MC and cleans up.
+/// read the `media_dial` token, admit it, ask MC for the binding, then hold
+/// the connection open. On disconnect, notifies MC and cleans up.
 ///
 /// MC notifications are best-effort (fire-and-forget via `tokio::spawn`).
 /// Notification failure does NOT affect the client connection.
 ///
 /// # Errors
 ///
-/// Returns `MhError` if session acceptance, JWT validation, or
-/// meeting registration check fails.
+/// Returns `MhError` if session acceptance or `media_dial` admission (steps
+/// a–e) fails.
 #[tracing::instrument(skip_all, name = "mh.webtransport.connection", fields(connection_id = tracing::field::Empty))]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one lifecycle entry point; every argument is a collaborator resolved once at process setup and threaded through the accept loop"
-)]
 pub async fn handle_connection(
     incoming: IncomingSession,
-    jwt_validator: Arc<MhJwtValidator>,
+    admission: ClientAdmission,
     session_manager: SessionManagerHandle,
     mc_client: Arc<McClient>,
     handler_id: String,
-    register_meeting_timeout: Duration,
     media: MediaSetup,
     cancel_token: CancellationToken,
 ) -> Result<(), MhError> {
@@ -241,7 +136,7 @@ pub async fn handle_connection(
     // here and emitted ONCE (ADR-0039 §7; `crate::webtransport::close`):
     //
     // - `Err` from the session body is any exit before the credential validated
-    //   (or the provisional-accept timeout): closed with the single DECLINED,
+    //   (ADR-0039 §5 steps a–e): closed with the single DECLINED,
     //   and the `MhError` goes to the accept loop unchanged — so a specific
     //   code is reachable only on the `Ok` path, after validation.
     // - `Ok(Close)` is a validated session's intentional close.
@@ -251,11 +146,10 @@ pub async fn handle_connection(
         &connection,
         &connection_id,
         handshake_start,
-        &jwt_validator,
+        admission,
         &session_manager,
         &mc_client,
         &handler_id,
-        register_meeting_timeout,
         &media,
         &cancel_token,
     )
@@ -304,8 +198,8 @@ enum SessionEnd {
 
 /// The body of one session, from its control stream to its end.
 ///
-/// Returns `Err` only before the credential validated, or on the provisional
-/// accept timeout; the caller closes every `Err` with DECLINED.
+/// Returns `Err` only before the credential validated (ADR-0039 §5 steps
+/// a–e); the caller closes every `Err` with DECLINED.
 #[expect(
     clippy::too_many_lines,
     reason = "Connection lifecycle is sequential; splitting would fragment the accept-validate-register-notify-hold flow"
@@ -318,11 +212,10 @@ async fn serve_session(
     connection: &Arc<wtransport::Connection>,
     connection_id: &str,
     handshake_start: Instant,
-    jwt_validator: &MhJwtValidator,
+    admission: ClientAdmission,
     session_manager: &SessionManagerHandle,
     mc_client: &Arc<McClient>,
     handler_id: &str,
-    register_meeting_timeout: Duration,
     media: &MediaSetup,
     cancel_token: &CancellationToken,
 ) -> Result<SessionEnd, MhError> {
@@ -386,11 +279,16 @@ async fn serve_session(
 
     // Decode failure, empty oneof, a non-connect variant first, and unknown
     // variant all collapse to a single generic client-facing error: in all four
-    // the JWT was never extracted, so validation never ran — splitting labels
+    // the token was never extracted, so admission never ran — splitting labels
     // here would be a distinction without a difference for the accept_loop's
     // status=error observable.
+    //
+    // ONLY `media_dial_token` is read (ADR-0039 §5). `join_token` is never read:
+    // a non-empty one is ignored, and an empty dial token is a malformed
+    // credential — there is no fallback, so MH never accepts both credential
+    // types. (The field itself is deleted by story 4 P3.)
     let token = match envelope.message {
-        Some(mh_client_message::Message::ConnectRequest(req)) => req.join_token,
+        Some(mh_client_message::Message::ConnectRequest(req)) => req.media_dial_token,
         // A post-connect variant as the FIRST message is not a connect: the
         // same generic invalid-connect reject. `RecoveryRequest` is read only
         // after a connect (Step 6).
@@ -416,145 +314,158 @@ async fn serve_session(
         }
     };
 
-    // Step 4: Validate meeting JWT — through `close::validate`, the only way to
-    // obtain a `ValidatedSession`, which is what unlocks every close code other
-    // than DECLINED (ADR-0039 §7 security condition 1).
-    let session: ValidatedSession = close::validate(jwt_validator, &token, connection_id).await?;
+    // Step 4: admit the `media_dial` token — through `close::admit`, the only
+    // way to obtain a `ValidatedSession`, which is what unlocks every close
+    // code other than DECLINED (ADR-0039 §7 security condition 1). BEFORE
+    // anything is held: a refused dial was never admitted, never parked, and
+    // MC is never asked about it.
+    let session: ValidatedSession = match close::admit(
+        &token,
+        handler_id,
+        admission.clock_skew,
+        session_manager,
+        connection_id,
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(refusal) => return refusal_exit(refusal),
+    };
 
     let meeting_id = session.meeting_id();
-    // PROVENANCE, load-bearing: `participant_id` is the validated meeting token's
-    // `sub` (read once, into `ValidatedSession`) and nothing else. It is now an
-    // authorization query key — the value MC answers an identity question about (`NotifyParticipantConnected`) and the
-    // value MH binds to a media route — not a payload field. Sourcing it from the
-    // client's connect envelope, or re-deriving it downstream, would make the
-    // identity client-assertable, which is the cross-participant injection
-    // primitive this whole contract exists to close. `internal.proto`'s
-    // `NotifyParticipantConnectedResponse` paragraph points back at this line by
-    // name; this is where the hazard would be introduced (@security S1/SEC-4).
+    // PROVENANCE, load-bearing: `participant_id` is the verified `media_dial`
+    // token's `sub` (read once, into `ValidatedSession`) and nothing else. It is
+    // an authorization query key — the value MC answers an identity question
+    // about (`NotifyParticipantConnected`) and the value MH binds to a media
+    // route — not a payload field. Sourcing it from the client's connect
+    // envelope, or re-deriving it downstream, would make the identity
+    // client-assertable, which is the cross-participant injection primitive
+    // this whole contract exists to close. `internal.proto`'s
+    // `NotifyParticipantConnectedRequest.participant_id` points back at
+    // `close::admit`; this is where the hazard would be introduced
+    // (@security S1/SEC-4).
     let participant_id = session.participant_id();
 
     info!(
         target: "mh.webtransport.connection",
         connection_id = %connection_id,
         meeting_id = %meeting_id,
-        "JWT validation succeeded"
+        "media_dial admission succeeded"
     );
 
-    // Record handshake duration (session accept through JWT validation)
+    // Record handshake duration (session accept through admission)
     metrics::record_webtransport_handshake_duration(handshake_start.elapsed());
 
-    // This connection's own close signal. `EndMeeting` release fires it for
-    // every ACTIVE connection of the released meeting (story 2 R-20); a child of
-    // the server shutdown token, so shutdown still reaches everything that
-    // watches it. The media loops watch a child of THIS token, not the server's.
+    // This connection's own close signal. A release fires it (story 2 R-20;
+    // ADR-0039 §6 decides which connections); a child of the server shutdown
+    // token, so shutdown still reaches everything that watches it. The media
+    // loops watch a child of THIS token, not the server's.
     let connection_close = cancel_token.child_token();
 
-    // Step 5: Check meeting registration status and notify MC
-    if session_manager.is_meeting_registered(meeting_id).await {
-        // Meeting already registered — add as active connection
-        session_manager
-            .add_connection(
-                meeting_id,
-                ConnectionEntry {
-                    connection_id: connection_id.to_owned(),
-                    participant_id: participant_id.to_owned(),
-                    connected_at: Instant::now(),
-                    close: connection_close.clone(),
-                },
-            )
-            .await;
-
-        info!(
-            target: "mh.webtransport.connection",
-            connection_id = %connection_id,
-            meeting_id = %meeting_id,
-            participant_id = %participant_id,
-            "Connection established for registered meeting"
-        );
-    } else {
-        // Meeting not yet registered — provisional accept with timeout
-        debug!(
-            target: "mh.webtransport.connection",
-            connection_id = %connection_id,
-            meeting_id = %meeting_id,
-            timeout_secs = register_meeting_timeout.as_secs(),
-            "Meeting not registered, entering provisional accept"
-        );
-
-        let pending = PendingConnection {
-            connection_id: connection_id.to_owned(),
-            meeting_id: meeting_id.to_owned(),
-            participant_id: participant_id.to_owned(),
-            connected_at: Instant::now(),
-            close: connection_close.clone(),
-        };
-
-        let notify = session_manager.add_pending_connection(pending).await;
-
-        // Wait for either: RegisterMeeting notification, timeout, or cancellation
-        match await_meeting_registration(
-            session_manager,
+    // Step 5: admit the connection — one actor turn that re-checks the meeting
+    // is still held and enforces the per-(meeting, sub) cap on connections
+    // awaiting MC's bind answer (ADR-0039 §5), so one client cannot amplify
+    // MH→MC binding RPCs.
+    match session_manager
+        .admit_connection(
             meeting_id,
-            connection_id,
-            &notify,
-            register_meeting_timeout,
-            cancel_token,
-            &connection_close,
+            ConnectionEntry {
+                connection_id: connection_id.to_owned(),
+                participant_id: participant_id.to_owned(),
+                connected_at: Instant::now(),
+                close: connection_close.clone(),
+                is_bound: false,
+            },
+            session.media_dial_key(),
+            admission.max_pending_per_participant,
         )
         .await
-        {
-            RegistrationOutcome::Registered => {
-                // Falls through to the shared media-session start sequence
-                // below. Deliberately NOT its own copy of the ordering.
-            }
-            RegistrationOutcome::Timeout => {
-                // No MC disconnect notification — connection was never established with MC
-                return Err(MhError::MeetingNotRegistered(meeting_id.to_owned()));
-            }
-            RegistrationOutcome::Cancelled => {
-                // Server shutdown while pending: no code (MH-3's drain shed is
-                // the coded shutdown path).
-                return Ok(SessionEnd::WithoutCode);
-            }
-            RegistrationOutcome::Released => {
-                // The handler left the meeting while this connection awaited
-                // its bind: HANDLER_RELEASED (validated session, so the code is
-                // unlocked), and no MC notification (none was ever begun).
-                return Ok(SessionEnd::Close(
-                    session.closing(ValidatedClose::MeetingReleased),
-                ));
-            }
+    {
+        AdmitOutcome::Admitted => {}
+        AdmitOutcome::MeetingNotHeld => {
+            // Released between the key lookup and here: the same answer as a
+            // dial for a meeting MH does not hold. Nothing was inserted and MC
+            // was never asked.
+            info!(
+                target: "mh.webtransport.connection",
+                connection_id = %connection_id,
+                meeting_id = %meeting_id,
+                "Declining connection: its meeting was released during admission"
+            );
+            return Ok(SessionEnd::Close(SessionClose::declined()));
+        }
+        AdmitOutcome::PendingCapReached => {
+            let decline = StartDecline::PendingCap;
+            metrics::record_media_session_start(decline.outcome());
+            warn!(
+                target: "mh.webtransport.connection",
+                connection_id = %connection_id,
+                meeting_id = %meeting_id,
+                max_pending = admission.max_pending_per_participant,
+                "Declining connection: this participant already has the maximum number of \
+                 connections awaiting their bind (a client redial storm?)"
+            );
+            return Ok(SessionEnd::Close(
+                session.closing(ValidatedClose::StartDeclined(decline)),
+            ));
         }
     }
 
+    info!(
+        target: "mh.webtransport.connection",
+        connection_id = %connection_id,
+        meeting_id = %meeting_id,
+        participant_id = %participant_id,
+        "Connection admitted; asking MC for its binding"
+    );
+
     // Step 5b: the media-session start sequence (ADR-0036 §2/§7/§11).
     //
-    // AFTER the JWT gate, never before: the sender identity every forwarding
-    // decision is made against comes from the validated token's meeting, and
-    // starting media I/O on an accepted-but-unvalidated session would forward
-    // frames for a participant nobody authenticated.
+    // AFTER admission, never before: the sender identity every forwarding
+    // decision is made against comes from the verified token's meeting, and
+    // starting media I/O on an unverified session would forward frames for a
+    // participant nobody authenticated. Until the bind lands this connection is
+    // in no subscriber set, so no frame reaches it while it waits.
     //
-    // `participant_id` is threaded from ONE read of the validated token's `sub`
-    // — it is the value MC answers an identity question about and the value MH
-    // binds to a media route, and those must be the same binding rather than two
-    // derivations that happen to agree. Two reads would be two places for a
-    // later edit to substitute a client-supplied hint into one of them.
+    // `participant_id` is threaded from ONE read of the verified token's `sub`.
     //
-    // This is the SIBLING half of the layout constraint: spawning, logging and
-    // teardown live here, and `crate::media` holds only the loops.
+    // The bind RPC races this connection's close token: a release for a cause
+    // under which the handler LEAVES the meeting closes an awaiting-bind
+    // connection `HANDLER_RELEASED` at the release (ADR-0039 §6), and the
+    // abandoned answer is then a no-op — no second close, never re-coded.
+    // On `MEETING_ENDED` the token is not fired for it: it is left to the bind
+    // outcome (`resolve_sender_binding` binds nothing for a meeting no longer
+    // held).
     let meeting_key = session.meeting().clone();
     let media_cancel = connection_close.child_token();
-    let media_session = match resolve_sender_binding(
-        mc_client,
-        session_manager,
-        &meeting_key,
-        meeting_id,
-        participant_id,
-        connection_id,
-        handler_id,
-    )
-    .await
-    {
+    let binding = tokio::select! {
+        biased;
+        () = connection_close.cancelled() => {
+            if cancel_token.is_cancelled() {
+                // Server shutdown while awaiting the bind: no code (MH-3's drain
+                // shed is the coded shutdown path).
+                return Ok(SessionEnd::WithoutCode);
+            }
+            info!(
+                target: "mh.webtransport.connection",
+                connection_id = %connection_id,
+                meeting_id = %meeting_id,
+                "Closing connection awaiting its bind: the handler left the meeting"
+            );
+            // No MC notification: the handler is leaving the meeting, and a
+            // removal is never answered with a Disconnected (ADR-0039 §6).
+            return Ok(SessionEnd::Close(session.closing(ValidatedClose::MeetingReleased)));
+        }
+        binding = resolve_sender_binding(
+            mc_client,
+            session_manager,
+            meeting_id,
+            participant_id,
+            connection_id,
+            handler_id,
+        ) => binding,
+    };
+    let media_session = match binding {
         SenderBindingOutcome::Bound(sender) => {
             let media_session = start_media_session(
                 session_manager,
@@ -574,6 +485,21 @@ async fn serve_session(
                 "Media forward path started"
             );
             media_session
+        }
+        SenderBindingOutcome::NotHeld => {
+            // MC answered for a meeting this handler released while the answer
+            // was in flight (`MEETING_ENDED` leaves awaiting-bind connections to
+            // the bind outcome, ADR-0039 §6): nothing was bound and the entry is
+            // already gone. Not a media-session start attempt that MH declined
+            // on MC's answer, so no start outcome; DECLINED like any dial for a
+            // meeting MH does not hold.
+            info!(
+                target: "mh.webtransport.connection",
+                connection_id = %connection_id,
+                meeting_id = %meeting_id,
+                "Declining connection: its meeting was released while the bind was in flight"
+            );
+            return Ok(SessionEnd::Close(SessionClose::declined()));
         }
         SenderBindingOutcome::Declined(decline) => {
             metrics::record_media_session_start(decline.outcome());
@@ -1253,7 +1179,8 @@ const fn close_jitter_max_ms(decline: StartDecline) -> u64 {
         | StartDecline::SenderBindingOutOfRange
         | StartDecline::SenderBindingConflict
         | StartDecline::McAuthRejected
-        | StartDecline::McEndpointUnknown => 0,
+        | StartDecline::McEndpointUnknown
+        | StartDecline::PendingCap => 0,
     }
 }
 
@@ -1271,6 +1198,9 @@ enum SenderBindingOutcome {
     /// also what decides whether a disconnect notification is owed on the way
     /// out — see [`mc_may_hold_a_registration`].
     Declined(StartDecline),
+    /// MC named an ordinal, but the meeting was released while the answer was
+    /// in flight: nothing was bound ([`BindOutcome::NotHeld`]).
+    NotHeld,
 }
 
 /// Whether MC may hold a registration for this connection that MH now owes a
@@ -1330,7 +1260,9 @@ const fn mc_may_hold_a_registration(decline: StartDecline) -> bool {
         // is a no-op, so the safe default is to clear what might exist.
         | StartDecline::McUnavailable => true,
         StartDecline::McAuthRejected
-        | StartDecline::McEndpointUnknown => false,
+        | StartDecline::McEndpointUnknown
+        // Refused at admission, before MC was ever asked.
+        | StartDecline::PendingCap => false,
     }
 }
 
@@ -1347,10 +1279,9 @@ const fn mc_may_hold_a_registration(decline: StartDecline) -> bool {
 /// a *media* handler structurally incapable of carrying media, reported by
 /// nothing but a log line.
 ///
-/// The ordering is `JWT gate → MC endpoint → NotifyParticipantConnected →
-/// validate → bind → start_media_session`, and it exists **once**: both the
-/// already-registered and the promoted-after-provisional-accept paths call this
-/// one helper rather than carrying two copies that can drift apart.
+/// The ordering is `media_dial admission → connection admission → MC endpoint →
+/// NotifyParticipantConnected → validate → bind → start_media_session`, and it
+/// exists **once**.
 ///
 /// `acknowledged` is deliberately not read. It answers a different question —
 /// received-and-parsed, not bound — and the two diverge: MC answers
@@ -1364,7 +1295,6 @@ const fn mc_may_hold_a_registration(decline: StartDecline) -> bool {
 async fn resolve_sender_binding(
     mc_client: &Arc<McClient>,
     session_manager: &SessionManagerHandle,
-    meeting: &MeetingKey,
     meeting_id: &str,
     participant_id: &str,
     connection_id: &str,
@@ -1468,32 +1398,52 @@ async fn resolve_sender_binding(
         }
     };
 
-    // The last-hop uniqueness check. MH is the component that would ACT on a
-    // collision — forwarding one participant's frames onto another's edges — so
-    // MH is where it is refused. Incumbent wins.
-    if let Err(conflict) = session_manager.sender_bindings().bind(
-        meeting.clone(),
-        participant_id,
-        connection_id,
-        sender,
-    ) {
-        // Again no ordinal in the line (§11). Two candidate causes and MH cannot
-        // tell them apart: MC allocated one live ordinal to two participants, or
-        // MH failed to unbind a previous holder. Hence the MH-side first move.
-        warn!(
-            target: "mh.webtransport.connection",
-            connection_id = %connection_id,
-            meeting_id = %meeting_id,
-            conflict = ?conflict,
-            "Media session declined: the sender_id MC returned is already held by a different \
-             participant in this meeting. MH refused rather than overwrite — accepting would \
-             have crossed media between participants. Check MH's unbind path for this meeting \
-             before MC's allocator."
-        );
-        return SenderBindingOutcome::Declined(StartDecline::SenderBindingConflict);
+    // The last-hop uniqueness check, in ONE actor turn with the re-check that
+    // the meeting is still held and this connection still admitted (a release
+    // while the answer was in flight binds nothing). MH is the component that
+    // would ACT on a collision — forwarding one participant's frames onto
+    // another's edges — so MH is where it is refused. Incumbent wins.
+    match session_manager
+        .bind_connection(meeting_id, connection_id, sender)
+        .await
+    {
+        BindOutcome::Bound => SenderBindingOutcome::Bound(sender),
+        BindOutcome::NotHeld => SenderBindingOutcome::NotHeld,
+        BindOutcome::Conflict(conflict) => {
+            // Again no ordinal in the line (§11). Two candidate causes and MH
+            // cannot tell them apart: MC allocated one live ordinal to two
+            // participants, or MH failed to unbind a previous holder. Hence the
+            // MH-side first move.
+            warn!(
+                target: "mh.webtransport.connection",
+                connection_id = %connection_id,
+                meeting_id = %meeting_id,
+                conflict = ?conflict,
+                "Media session declined: the sender_id MC returned is already held by a \
+                 different participant in this meeting. MH refused rather than overwrite — \
+                 accepting would have crossed media between participants. Check MH's unbind \
+                 path for this meeting before MC's allocator."
+            );
+            SenderBindingOutcome::Declined(StartDecline::SenderBindingConflict)
+        }
     }
+}
 
-    SenderBindingOutcome::Bound(sender)
+/// The ONE mapping from an admission [`Refusal`] to how the session ends.
+///
+/// A credential failure (ADR-0039 §5 steps a–e) is an `Err`: the caller closes
+/// it with the single DECLINED and the accept loop counts it
+/// `mh_webtransport_connections_total{status="error"}`, as every pre-validation
+/// exit is. `WRONG_HANDLER` (step f) is NOT a credential error — the token fully
+/// validated and names another handler — so it is a validated session's
+/// intentional close (`Ok`), like every other post-validation close.
+fn refusal_exit(refusal: Refusal) -> Result<SessionEnd, MhError> {
+    match refusal {
+        Refusal::WrongHandler(close) => Ok(SessionEnd::Close(close)),
+        Refusal::Declined(rejection) => Err(MhError::JwtValidation(format!(
+            "media_dial credential refused: {rejection}"
+        ))),
+    }
 }
 
 /// The decline outcome for a `NotifyParticipantConnected` that returned no
@@ -1555,181 +1505,31 @@ async fn read_connect_message(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    //! Behavioral tests for [`await_meeting_registration`].
-    //!
-    //! Each test isolates metric recording via
-    //! `common::observability::testing::MetricAssertion::snapshot()`, a
-    //! thread-local recorder. `#[tokio::test]` uses the current-thread
-    //! runtime, so the helper runs on the same thread that holds the
-    //! snapshot, and recorder calls made across `.await` points are captured.
-    //!
-    //! These tests enforce the invariant documented on
-    //! `::metrics::record_register_meeting_timeout`: the counter fires
-    //! ONLY on the timeout arm of `await_meeting_registration`, never on
-    //! the cancellation or registered arms.
-    //!
-    //! The timeout test uses `#[tokio::test(start_paused = true)]` for
-    //! virtual-time control: with a paused clock on a current-thread
-    //! runtime, `tokio::time::sleep` inside the helper's timeout arm is
-    //! resolved by auto-advance when all other arms (notify, cancel) are
-    //! idle, so `.await` on the helper completes in virtual — not real —
-    //! time.
     use super::*;
-    use crate::session::PendingConnection;
-    use common::observability::testing::MetricAssertion;
-    use std::time::Instant;
+    use crate::auth::MediaDialRejection;
 
-    const METRIC_NAME: &str = "mh_register_meeting_timeouts_total";
-    const TEST_TIMEOUT: Duration = Duration::from_secs(15);
-    const LONG_TIMEOUT: Duration = Duration::from_secs(30);
-
-    async fn setup_pending(
-        session_manager: &SessionManagerHandle,
-        meeting_id: &str,
-        connection_id: &str,
-    ) -> Arc<Notify> {
-        session_manager
-            .add_pending_connection(PendingConnection {
-                connection_id: connection_id.to_string(),
-                meeting_id: meeting_id.to_string(),
-                participant_id: "user-1".to_string(),
-                connected_at: Instant::now(),
-                close: tokio_util::sync::CancellationToken::new(),
-            })
-            .await
+    /// The ONE refusal mapping: only an `aud` mismatch (step f) leaves as a
+    /// validated session's close; every other rejection is the DECLINED error
+    /// exit. Iterates every rejection, so a new one is classified here.
+    #[test]
+    fn only_wrong_handler_is_a_non_error_admission_exit() {
+        for rejection in MediaDialRejection::ALL {
+            let refusal = Refusal::Declined(rejection);
+            assert_eq!(refusal.close(), SessionClose::declined());
+            let exit = refusal_exit(refusal);
+            assert!(
+                matches!(&exit, Err(MhError::JwtValidation(msg))
+                    if *msg == format!("media_dial credential refused: {}", rejection.as_label())),
+                "{rejection:?}"
+            );
+        }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn timeout_arm_records_metric_once() {
-        let snap = MetricAssertion::snapshot();
-
-        let session_manager =
-            SessionManagerHandle::new_for_tests(crate::session::admission::test_admission());
-        let meeting_id = "meeting-1";
-        let connection_id = "conn-1";
-        let notify = setup_pending(&session_manager, meeting_id, connection_id).await;
-        let cancel_token = CancellationToken::new();
-
-        // Virtual time: notify and cancel_token stay idle, so tokio's
-        // auto-advance fires the sleep arm; no real wall-clock wait.
-        let outcome = await_meeting_registration(
-            &session_manager,
-            meeting_id,
-            connection_id,
-            &notify,
-            TEST_TIMEOUT,
-            &cancel_token,
-            &cancel_token.child_token(),
-        )
-        .await;
-
-        assert!(
-            matches!(outcome, RegistrationOutcome::Timeout),
-            "expected Timeout, got {outcome:?}"
-        );
-        // Timeout arm records the counter exactly once.
-        snap.counter(METRIC_NAME).assert_delta(1);
-    }
-
-    #[tokio::test]
-    async fn cancel_arm_does_not_record_metric() {
-        let snap = MetricAssertion::snapshot();
-
-        let session_manager =
-            SessionManagerHandle::new_for_tests(crate::session::admission::test_admission());
-        let meeting_id = "meeting-2";
-        let connection_id = "conn-2";
-        let notify = setup_pending(&session_manager, meeting_id, connection_id).await;
-        let cancel_token = CancellationToken::new();
-        // Pre-cancel: the cancelled() future resolves immediately on poll,
-        // so the cancel arm wins the select! before LONG_TIMEOUT elapses.
-        cancel_token.cancel();
-
-        let outcome = await_meeting_registration(
-            &session_manager,
-            meeting_id,
-            connection_id,
-            &notify,
-            LONG_TIMEOUT,
-            &cancel_token,
-            &cancel_token.child_token(),
-        )
-        .await;
-
-        assert!(
-            matches!(outcome, RegistrationOutcome::Cancelled),
-            "expected Cancelled, got {outcome:?}"
-        );
-        // Cancel arm must not record the timeout counter.
-        snap.counter(METRIC_NAME).assert_unobserved();
-    }
-
-    /// A release for a removal cause fires the connection's OWN close token
-    /// (not the server's): the pending connection ends `Released` (closed with
-    /// `HANDLER_RELEASED` by the caller), never `Cancelled`, and records no
-    /// timeout. Positive twin: the server token firing is `Cancelled`
-    /// (`cancel_arm_does_not_record_metric`).
-    #[tokio::test]
-    async fn a_released_pending_connection_ends_released_not_cancelled() {
-        let snap = MetricAssertion::snapshot();
-        let session_manager =
-            SessionManagerHandle::new_for_tests(crate::session::admission::test_admission());
-        let notify = setup_pending(&session_manager, "meeting-4", "conn-4").await;
-        let cancel_token = CancellationToken::new();
-        let connection_close = cancel_token.child_token();
-        connection_close.cancel();
-
-        let outcome = await_meeting_registration(
-            &session_manager,
-            "meeting-4",
-            "conn-4",
-            &notify,
-            LONG_TIMEOUT,
-            &cancel_token,
-            &connection_close,
-        )
-        .await;
-
-        assert!(
-            matches!(outcome, RegistrationOutcome::Released),
-            "expected Released, got {outcome:?}"
-        );
-        snap.counter(METRIC_NAME).assert_unobserved();
-    }
-
-    #[tokio::test]
-    async fn registered_arm_does_not_record_metric() {
-        let snap = MetricAssertion::snapshot();
-
-        let session_manager =
-            SessionManagerHandle::new_for_tests(crate::session::admission::test_admission());
-        let meeting_id = "meeting-3";
-        let connection_id = "conn-3";
-        let notify = setup_pending(&session_manager, meeting_id, connection_id).await;
-        let cancel_token = CancellationToken::new();
-
-        // Pre-fire the Notify: its permit is held until the first
-        // `.notified()` consumes it, so the notified() future inside
-        // await_meeting_registration completes immediately on poll.
-        notify.notify_one();
-
-        let outcome = await_meeting_registration(
-            &session_manager,
-            meeting_id,
-            connection_id,
-            &notify,
-            LONG_TIMEOUT,
-            &cancel_token,
-            &cancel_token.child_token(),
-        )
-        .await;
-
-        assert!(
-            matches!(outcome, RegistrationOutcome::Registered),
-            "expected Registered, got {outcome:?}"
-        );
-        // Registered arm must not record the timeout counter.
-        snap.counter(METRIC_NAME).assert_unobserved();
+    /// The pending-cap decline never asks MC and is never jittered.
+    #[test]
+    fn a_pending_cap_decline_owes_mc_nothing() {
+        assert!(!mc_may_hold_a_registration(StartDecline::PendingCap));
+        assert_eq!(close_jitter_max_ms(StartDecline::PendingCap), 0);
     }
 
     /// The close jitter applies to the MC-unreachable decline and to NO other.
