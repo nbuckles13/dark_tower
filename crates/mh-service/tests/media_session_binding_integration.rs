@@ -83,7 +83,6 @@ use std::time::{Duration, Instant};
 
 use common::observability::testing::MetricAssertion;
 use media_protocol::codec::ALL_REJECT_REASONS;
-use mh_service::auth::MhJwtValidator;
 use mh_service::config::DATAGRAM_RECEIVE_BUFFER_BYTES;
 use mh_service::grpc::McClient;
 use mh_service::observability::metrics::{
@@ -96,13 +95,12 @@ use mh_service::webtransport::close::CloseCode;
 use proto_gen::dark_tower::signaling::v1::MhCloseCode;
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::close_metrics::assert_closed_only;
-use test_common::jwks_rig::JwksRig;
 use test_common::media_frame::audio_datagram;
 use test_common::mock_mc::{
     start_mock_mc_server, MockBehavior, MockMcHandle, MockMcServer, SenderReplies,
 };
 use test_common::test_token_receiver;
-use test_common::tokens::mint_meeting_token;
+use test_common::tokens::mint_dial_token;
 use test_common::wt_client::{
     connect_and_open_bi, expect_session_close, expect_still_open, write_mh_connect,
 };
@@ -117,7 +115,6 @@ const SENDER_SECOND_TO_CONNECT: u32 = 12;
 
 /// One MH accept path plus one mock MC, wired together.
 struct BindingSuite {
-    jwks: JwksRig,
     session_manager: SessionManagerHandle,
     wt: AcceptLoopRig,
     replies: SenderReplies,
@@ -169,21 +166,12 @@ impl BindingSuite {
             >,
         >,
     ) -> Self {
-        let jwks = JwksRig::start(46, "mh-binding-integ-01").await;
         let session_manager =
             SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding());
-        let jwt_validator = Arc::new(MhJwtValidator::new(jwks.jwks_client(), 300));
         let mc_client = Arc::new(McClient::new(test_token_receiver()));
 
-        let wt = AcceptLoopRig::start_with(
-            jwt_validator,
-            session_manager.clone(),
-            mc_client,
-            HANDLER_ID.to_string(),
-            32,
-            Duration::from_secs(30),
-        )
-        .await;
+        let wt =
+            AcceptLoopRig::start(session_manager.clone(), mc_client, HANDLER_ID.to_string()).await;
 
         let mut mock = MockMcServer::new(behavior).with_sender_replies(replies.clone());
         if let Some(tx) = connected_tx {
@@ -195,7 +183,6 @@ impl BindingSuite {
         let mc = start_mock_mc_server(mock).await;
 
         Self {
-            jwks,
             session_manager,
             wt,
             replies,
@@ -213,6 +200,7 @@ impl BindingSuite {
                     mc_grpc_endpoint: format!("http://{}", self.mc.addr),
                     heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                     registered_at: Instant::now(),
+                    media_dial_key: mh_test_utils::media_dial::meeting_dial_key(),
                 },
                 None,
                 mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
@@ -234,6 +222,7 @@ impl BindingSuite {
                     mc_grpc_endpoint: "http://127.0.0.1:1".to_string(),
                     heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                     registered_at: Instant::now(),
+                    media_dial_key: mh_test_utils::media_dial::meeting_dial_key(),
                 },
                 None,
                 mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
@@ -252,7 +241,7 @@ impl BindingSuite {
         wtransport::stream::SendStream,
         wtransport::stream::RecvStream,
     ) {
-        let token = mint_meeting_token(&self.jwks.keypair, meeting_id, participant_id);
+        let token = mint_dial_token(meeting_id, participant_id, HANDLER_ID);
         let (conn, mut send, recv) = connect_and_open_bi(&self.wt.url).await;
         write_mh_connect(&mut send, &token)
             .await
@@ -283,7 +272,7 @@ impl BindingSuite {
         wtransport::stream::RecvStream,
         u64,
     ) {
-        let token = mint_meeting_token(&self.jwks.keypair, meeting_id, participant_id);
+        let token = mint_dial_token(meeting_id, participant_id, HANDLER_ID);
         let (conn, mut send, recv) = connect_and_open_bi(&self.wt.url).await;
 
         let mut sent = 0_u64;
@@ -472,54 +461,6 @@ async fn a_bound_connection_counts_started() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     assert_started_only(&snap, MediaSessionStartOutcome::Started);
-}
-
-/// The PROVISIONAL-accept path binds too: a connection promoted by a late
-/// `RegisterMeeting` runs the same sequence as one whose meeting was already
-/// registered.
-///
-/// Two call sites reach the binding sequence — the already-registered branch and
-/// the `RegistrationOutcome::Registered` branch after provisional accept. They go
-/// through ONE helper precisely so they cannot drift, and this is the arm that
-/// proves the second one is wired: before task 24 it had its own copy of the MC
-/// notification, and a refactor that fixed only the first path would leave every
-/// provisionally-accepted connection permanently unable to forward.
-#[tokio::test]
-async fn a_connection_promoted_after_provisional_accept_also_binds() {
-    let replies = SenderReplies::default().with("participant-late", SENDER_SECOND_TO_CONNECT);
-    let suite = BindingSuite::start(MockBehavior::Accept, replies).await;
-    let meeting = MeetingKey::new("meeting-provisional");
-
-    // Deliberately NOT registered yet: the connection enters provisional accept.
-    let _conn = suite
-        .connect("meeting-provisional", "participant-late")
-        .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        suite
-            .session_manager
-            .sender_bindings()
-            .holder_of(&meeting, suite.allocated("participant-late")),
-        None,
-        "fixture precondition: nothing may bind while the meeting is unregistered — a binding \
-         here would mean the JWT gate is not the only thing standing before the media path"
-    );
-
-    // RegisterMeeting arrives; the pending connection is promoted.
-    suite.register("meeting-provisional").await;
-
-    assert_eq!(
-        holder_within(
-            &suite.session_manager,
-            &meeting,
-            suite.allocated("participant-late"),
-            Duration::from_secs(5)
-        )
-        .await
-        .as_deref(),
-        Some("participant-late"),
-        "a promoted connection must run the same bind sequence as a directly-accepted one"
-    );
 }
 
 /// `sender_id = 0` — MC has no answer. Declined, counted, connection closed.
@@ -871,7 +812,7 @@ async fn mc_refusing_mhs_credential_declines_on_the_auth_outcome() {
 #[tokio::test(flavor = "current_thread")]
 async fn an_undialable_mc_endpoint_declines_on_the_registration_outcome() {
     let suite = BindingSuite::start(MockBehavior::Accept, SenderReplies::default()).await;
-    // Registered — so the connection is not held in provisional accept — but
+    // Registered — so the connection is admitted — but
     // carrying an endpoint tonic will not parse.
     suite
         .session_manager
@@ -882,6 +823,7 @@ async fn an_undialable_mc_endpoint_declines_on_the_registration_outcome() {
                 mc_grpc_endpoint: String::new(),
                 heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
+                media_dial_key: mh_test_utils::media_dial::meeting_dial_key(),
             },
             None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,

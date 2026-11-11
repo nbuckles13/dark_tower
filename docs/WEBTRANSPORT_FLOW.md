@@ -250,11 +250,22 @@ If no heartbeat received for 30 seconds, the participant is marked as disconnect
     │                                                │
 ```
 
-> **Corrected 2026-10-13.** Steps 5–7 are schematic. The client authenticates by
-> opening a **bidirectional stream** and sending `MhClientMessage{connect_request:
-> MhConnectRequest{join_token}}` as its first length-framed message; MH validates
-> the meeting JWT (ADR-0020) locally against AC's JWKS. Tokens are not looked up
-> in Redis.
+> **Corrected 2026-10-13; updated 2026-11-10 (story 4 MH-1).** Steps 5–7 are
+> schematic. The client authenticates by opening a **bidirectional stream** and
+> sending `MhClientMessage{connect_request: MhConnectRequest{media_dial_token}}` as
+> its first length-framed message. The `media_dial` token is minted by the
+> meeting's MC (ADR-0039 §5) and delivered per handler in every
+> `MediaHandlerSet`; `MhConnectRequest.join_token` is IGNORED by MH (retained only
+> until story 4 P3 deletes it). MH verifies the token locally, before holding
+> anything, in a fixed order: size cap; header `alg` must be `EdDSA` (`kid`/`jwk`
+> headers never select a key, and MH never fetches one); the `meeting_id` claim
+> selects that meeting's Ed25519 public key from its `RegisterMeeting` (no
+> registration = `DECLINED` at once, nothing parked); the signature; the claims
+> (`meeting_id`, `token_type = media_dial`, `exp`/`iat` within a configured skew,
+> non-empty `sub`); then `aud` must equal this MH's `handler_id`, else
+> `WRONG_HANDLER`. Every earlier failure is `DECLINED`. A token is reusable for any
+> number of dials within its TTL. AC's JWKS is not involved, and tokens are not
+> looked up in Redis.
 
 #### 2.1.1 The client↔MH control stream (story 3)
 
@@ -494,7 +505,8 @@ of a capsule-less QUIC close: `closed` rejects (loss); story 4 task C1 verifies 
 a browser.
 
 **Security**: a code other than `DECLINED` is sent only after the credential fully
-validated; every credential failure and pre-validation exit is the one generic
+validated (`WRONG_HANDLER` = a fully valid `media_dial` token whose `aud` is another
+handler); every credential failure and pre-validation exit is the one generic
 `DECLINED`; every code concerns only the caller's own validated meeting; no reason
 strings.
 
@@ -667,9 +679,11 @@ All WebTransport connections use TLS 1.3:
 
 ### 2. Token-Based Authentication
 
-- Short-lived tokens (5 min TTL)
-- Single-use for media connections
-- Cryptographically signed (HMAC-SHA256)
+- Signaling (MC): the AC-issued meeting JWT (EdDSA, verified against AC's JWKS).
+- Media (MH): the MC-minted `media_dial` token (EdDSA with a per-meeting Ed25519
+  key, `MC_MEDIA_DIAL_TOKEN_TTL_SECONDS`, default 300 s), reusable within its TTL,
+  verified against the key in the meeting's `RegisterMeeting` (ADR-0039 §5; see
+  §2.1).
 
 ### 3. Media Encryption
 

@@ -106,21 +106,14 @@ import "dark_tower/signaling/v1/signaling.proto";
 //   - MALFORMED -> REJECT THE REGISTRATION. `sender_id` 0, or a value outside
 //     1..=65535. These can never become valid, so accepting them is accepting a
 //     policy that can never be honoured.
-//   - IN-MEETING BUT NOT YET CONNECTED -> HOLD, DO NOT REJECT. ADR-0036 §8 has
-//     the handler "drain and promote pending connections" on registration: a
-//     `sender_id` pending promotion WITHIN THE REGISTERED MEETING is exactly the
-//     case the handler exists to rescue, and a blanket reject would make
-//     registration hostile to the mechanism §8 relies on for restart recovery.
-//     The egress stream stays in the applied policy and forwards nothing until
-//     the source connects; the subscriber's slot reports its §6 state.
-//     (Concretely, and not as the reason: under static fill a joiner's own
-//     connection is provisionally accepted and promoted BY THE REGISTRATION
-//     THAT FIRST NAMES IT -- as a subscriber of its own slots and as a
-//     candidate in every other subscriber's -- so at the instant that
-//     registration is processed the referenced connection is mid-promotion,
-//     and other sources it references may not have attached yet. Rejecting on
-//     non-resolution would make the CONTROL PLANE HOSTAGE TO DATA-PLANE
-//     CONNECTION TIMING.)
+//   - IN-MEETING BUT NOT YET CONNECTED -> HOLD, DO NOT REJECT. ADR-0039 §3
+//     has MC register a handler BEFORE issuing any dial token for it, so every
+//     registration that names a joiner's `sender_id` necessarily precedes that
+//     joiner's connection; a reject on non-resolution would refuse every first
+//     registration. The egress stream stays in the applied policy and forwards
+//     nothing until the source connects; the subscriber's slot reports its §6
+//     state. Rejecting on non-resolution would make the CONTROL PLANE HOSTAGE
+//     TO DATA-PLANE CONNECTION TIMING.
 //
 //     A PENDING SOURCE DOES NOT HOLD BACK `applied_generation`, AND MUST NOT.
 //     The two are different instruments: `applied_generation` is PER-SNAPSHOT
@@ -762,8 +755,8 @@ message RegisterMeetingRequest {
   //
   // The single entry in `dt-guard internal-proto-no-key-material`'s
   // `ALLOWED_BYTES_FIELDS`. Never string-encoded to dodge that guard, and never
-  // in any JWKS. Populated by MC-D; verified against by MH-1. The length reject
-  // is a record reject (see the message header): the prior key stays in force.
+  // in any JWKS. The length reject is a record reject (see the message
+  // header): the prior key stays in force.
   //
   // KEY SELECTION IS EXCLUSIVE (ADR-0039 §5). MH selects the verification key
   // for a `media_dial` token ONLY by the token's `meeting_id` claim, from that
@@ -772,15 +765,24 @@ message RegisterMeetingRequest {
   // DECLINED. An AC-signed token never verifies against this key, and a
   // `media_dial` token never verifies against AC's keys.
   //
-  // NOT AN OWNERSHIP OR AUTHORIZATION CONTROL. Each accepted registration
-  // replaces the meeting's key. MC never rotates it within a meeting actor, so
-  // a changed key means a new MC meeting actor. MH does not verify that the
-  // registrant owns the meeting, so a `service.write.mh` holder can replace the
-  // key (ADR-0039 residual; ciphertext-only impact; docs/TODO.md "MH does not
-  // verify meeting ownership").
+  // NOT AN OWNERSHIP OR AUTHORIZATION CONTROL. THE LAST RECORD-VALIDATION-PASSING
+  // REGISTRATION'S KEY WINS. The key is installed by the registration-record
+  // upsert (message header), not by the policy apply. So every registration
+  // whose record passes validation replaces the meeting's key, including one
+  // whose apply is then refused, and a record reject leaves the prior key in
+  // force. This is the same rebinding rule as `mc_id` (`EndMeetingRequest`).
+  // Every release drops the key with the record, so a later dial for that
+  // meeting is DECLINED at accept. MC
+  // never rotates the key within a meeting actor, so a changed key under the
+  // same `mc_id` is anomalous by construction (MH logs a WARN). MH does not
+  // verify that the registrant owns the meeting, so a `service.write.mh`
+  // holder can replace the key and with it dial admission for that meeting on
+  // that MH (ADR-0039 residual; ciphertext-only impact; docs/TODO.md "MH does
+  // not verify meeting ownership").
   //
-  // ORDERING: MH-1's length rejection lands WITH or AFTER MC-D populating this
-  // field fleet-wide, NEVER BEFORE; rollback reverses (MH first).
+  // ORDERING: MH's length rejection requires MC to populate this field; an MC
+  // that does not is refused every registration. Roll out MC before MH; roll
+  // back MH before MC.
   //
   // OBSERVABILITY: never a metric label, span attribute or log field; only the
   // key's presence or length may be logged.
@@ -1010,14 +1012,17 @@ message RegisterMeetingResponse {
 //     Forgetting the generation is required, not tidy: MC drops its own
 //     per-(meeting, handler) generations at teardown, so a meeting later
 //     re-created under the same id pushes from 1 again, and that must be a
-//     FRESH INSTALL, never "stale". Pending (provisional) connections -- those
-//     still awaiting their bind -- follow `cause`: on `MEETING_ENDED` they are
-//     left to the bind outcome and the existing registration timeout (one may
-//     be a re-join racing the teardown, and the next registration rescues it);
-//     on a removal cause they are closed with `HANDLER_RELEASED` (ADR-0039
-//     §6), because the handler is leaving the meeting. MH closing a connection
-//     is NOT the client's meeting-ended signal; MC's signalling is. A client
-//     reconnecting afterwards is held pending like any other.
+//     FRESH INSTALL, never "stale". Connections still awaiting their bind
+//     (`NotifyParticipantConnected` in flight; there is no
+//     pending-before-registration state, ADR-0039 §3) follow `cause`: on
+//     `MEETING_ENDED` they are left to the bind outcome (a refused bind,
+//     `sender_id` 0, closes `DECLINED`; a nonzero answer for the released
+//     meeting binds nothing and also closes `DECLINED`); on a removal cause
+//     they are closed with `HANDLER_RELEASED` (ADR-0039 §6), because the
+//     handler is leaving the meeting. MH closing a connection is NOT the
+//     client's meeting-ended signal; MC's signalling is. The release drops the
+//     meeting's dial key, so a client dialing afterwards is DECLINED at accept
+//     and never parked.
 //   - `mc_id` MISMATCH -> REJECTED with gRPC `FAILED_PRECONDITION`, counted by
 //     MH under a bounded outcome value. NEVER idempotent-accept and NEVER
 //     `acknowledged: false` (ambiguous with the no-op): a different MC must
@@ -1362,7 +1367,7 @@ enum DisconnectReason {
 service MediaCoordinationService {
   // NOT A FIRE-AND-FORGET ACK. MH AWAITS this response and the connection
   // depends on it: a response that does not arrive, or that carries no
-  // bindable ordinal, CLOSES the connection. Ordering is `JWT gate ->
+  // bindable ordinal, CLOSES the connection. Ordering is `media_dial gate ->
   // NotifyParticipantConnected -> bind(sender_id) -> start_media_session`;
   // nothing forwards before the bind.
   //
@@ -1387,8 +1392,10 @@ service MediaCoordinationService {
 message NotifyParticipantConnectedRequest {
   string meeting_id = 1;
 
-  // MUST be derived from the validated meeting token's `sub` -- NEVER from a
-  // client-supplied field, and never from anything a client can influence.
+  // MUST be the `sub` of a `media_dial` token MH has signature-verified against
+  // the meeting's registered key (`RegisterMeetingRequest.media_dial_public_key`)
+  // -- NEVER from a client-supplied field, and never from anything a client can
+  // influence. `meeting_id` above is the meeting whose key verified it.
   //
   // This is the precondition that makes the response trustworthy, and it is
   // enforced in a DIFFERENT SERVICE'S FILE, which is why it is stated here.
@@ -1398,12 +1405,12 @@ message NotifyParticipantConnectedRequest {
   // will bind it, and NOTHING GOES RED -- the entire design is bypassed with
   // every check passing.
   //
-  // Today: `crates/mh-service/src/webtransport/connection.rs`, `claims.sub`
-  // after `validate_meeting_token`.
+  // Today: `crates/mh-service/src/webtransport/close.rs`, `close::admit`
+  // (the verified claims' `sub`).
   //
-  // THE TOKEN IS READ ONCE, AT CONNECTION ESTABLISHMENT. If a consumer adopts
-  // ADR-0007 Phase 8 out-of-band refresh, a re-minted token MUST NOT change an
-  // established connection's participant identity: a differing `sub` is a
+  // THE TOKEN IS READ ONCE, AT CONNECTION ESTABLISHMENT. A re-pushed
+  // `media_dial` token (ADR-0039 §5) serves only NEW dials; if an
+  // in-connection refresh is ever added, a token with a differing `sub` is a
   // REJECT AND CLOSE, never a re-key, and an existing binding is never
   // re-derived from it. Refresh extends a connection's lifetime; it does not
   // re-authorize who the connection is. This rule is stated here because its

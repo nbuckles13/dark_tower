@@ -29,12 +29,12 @@ use std::time::Duration;
 use axum::Router;
 use common::jwt::JwksClient;
 use common::token_manager::{spawn_token_manager, TokenManagerConfig};
-use mh_service::auth::MhJwtValidator;
 use mh_service::config::Config;
 use mh_service::errors::MhError;
 use mh_service::grpc::{GcClient, McClient, MhAuthLayer, MhMediaService};
 use mh_service::observability::{health_router, HealthState};
 use mh_service::session::{SessionManagerHandle, StreamAdmission};
+use mh_service::webtransport::connection::ClientAdmission;
 use mh_service::webtransport::WebTransportServer;
 use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerServiceServer;
 use tokio::signal;
@@ -132,7 +132,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         grpc_advertise_address = %config.grpc_advertise_address,
         webtransport_advertise_address = %config.webtransport_advertise_address,
         max_connections = config.max_connections,
-        register_meeting_timeout_seconds = config.register_meeting_timeout_seconds,
+        media_dial_clock_skew_seconds = config.media_dial_clock_skew_seconds,
+        max_pending_connections_per_participant = config.max_pending_connections_per_participant,
         // ADR-0036 §1 QUIC transport parameters and the derived drain window.
         //
         // Layer-qualified `transport_` prefix on purpose: without it this line
@@ -266,9 +267,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !config.retired_keys_present.is_empty() {
         info!(
             retired_keys = ?config.retired_keys_present,
-            "Retired configuration keys are set and IGNORED by this image (kept only so a \
-             rollback to the previous image still boots); see docs/TODO.md 'Delete the story-3 \
-             retired config keys'"
+            "Retired configuration keys are set and IGNORED by this image (see RETIRED_KEYS in \
+             crates/mh-service/src/config.rs for why each is still listed)"
         );
     }
 
@@ -381,7 +381,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("TokenManager spawned successfully, initial token acquired");
 
-    // Initialize JWKS client for JWT validation (meeting tokens + service tokens)
+    // Initialize the AC JWKS client — for MhAuthLayer's SERVICE tokens only.
+    // Client admission never touches it: a `media_dial` token is verified
+    // against its meeting's registered key (ADR-0039 §5), and MH never fetches
+    // a key for it.
     info!(
         ac_jwks_url = %config.ac_jwks_url,
         "Initializing JWKS client..."
@@ -391,9 +394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         MhError::Config(format!("JWKS client creation failed: {e}"))
     })?);
 
-    // Create MH JWT validator for meeting tokens (WebTransport connections)
-    let jwt_validator = Arc::new(MhJwtValidator::new(Arc::clone(&jwks_client), 300));
-    info!("JWKS client and JWT validator initialized");
+    info!("JWKS client initialized");
 
     // Create session manager actor for meeting registration and connection tracking
     // The actor enforces the derived stream ceiling from the ONE
@@ -586,6 +587,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .publish_sample_ratio(media_setup.latency_sample_ratio);
     // The stream-path bounds MH enforces, from the same fields enforcement
     // reads (ADR-0036 §11 "derive rather than guard").
+    mh_service::observability::metrics::publish_media_dial_clock_skew(
+        config.media_dial_clock_skew_seconds,
+    );
     mh_service::observability::metrics::publish_stream_limits(
         config.quic_transport.max_concurrent_uni_streams,
         config.stream_path.egress_stream_backlog_bytes,
@@ -598,11 +602,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.webtransport_bind_address.clone(),
         config.tls_cert_path.clone(),
         config.tls_key_path.clone(),
-        Arc::clone(&jwt_validator),
+        ClientAdmission {
+            clock_skew: Duration::from_secs(config.media_dial_clock_skew_seconds),
+            max_pending_per_participant: config.max_pending_connections_per_participant,
+        },
         session_manager,
         Arc::clone(&mc_client),
         config.handler_id.clone(),
-        Duration::from_secs(config.register_meeting_timeout_seconds),
         config.max_connections,
         config.quic_transport,
         media_setup,

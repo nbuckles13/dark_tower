@@ -229,7 +229,9 @@ impl<'a> Injection<'a> {
             policy_generation: generation,
             source_streams: sources,
             heartbeat_interval_ms: self.heartbeat_interval_ms,
-            media_dial_public_key: Vec::new(),
+            // Replaces the meeting's dial key on this handler (see
+            // `mh_grpc::fixture_dial_public_key`): inject only AFTER sessions open.
+            media_dial_public_key: mh_grpc::fixture_dial_public_key(),
         };
         self.client
             .register_meeting(mh_grpc::authed(self.token, request))
@@ -263,7 +265,9 @@ impl<'a> Injection<'a> {
             policy_generation: generation,
             source_streams: sources,
             heartbeat_interval_ms: self.heartbeat_interval_ms,
-            media_dial_public_key: Vec::new(),
+            // Replaces the meeting's dial key on this handler (see
+            // `mh_grpc::fixture_dial_public_key`): inject only AFTER sessions open.
+            media_dial_public_key: mh_grpc::fixture_dial_public_key(),
         };
         match self
             .client

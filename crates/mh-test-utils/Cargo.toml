@@ -38,3 +38,13 @@ mh-service = { path = "../mh-service" }
 # Proto message types for the `media_policy` fixture builders. Fixtures only —
 # nothing in this crate implements a proto service or touches the wire.
 proto-gen = { path = "../proto-gen" }
+
+# The ONE `media_dial` test forge (`src/media_dial.rs`, story 4 MH-1): a
+# compact-JWS signer with a seeded Ed25519 key and an arbitrary header, so
+# tests can build every admission input (alg none/HS256, kid/jwk, attacker
+# key) that MC's real minter never produces. Claims serialize through
+# `common::jwt::MediaDialClaims` (the shared shape), never a local copy.
+common = { path = "../common" }
+ring = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }

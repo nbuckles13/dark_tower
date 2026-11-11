@@ -36,13 +36,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mh_service::auth::MhJwtValidator;
 use mh_service::grpc::McClient;
 use mh_service::session::SessionManagerHandle;
+use mh_service::webtransport::connection::ClientAdmission;
 use mh_service::webtransport::WebTransportServer;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+/// The deployed admission values (`infra/services/mh-service/config.env`):
+/// skew 30 s, two connections awaiting their bind per `(meeting, sub)`.
+pub const DEPLOYED_ADMISSION: ClientAdmission = ClientAdmission {
+    clock_skew: Duration::from_secs(30),
+    max_pending_per_participant: 2,
+};
 
 /// Component-test rig for the real `WebTransportServer::accept_loop`.
 pub struct AcceptLoopRig {
@@ -64,32 +71,30 @@ pub struct AcceptLoopRig {
 }
 
 impl AcceptLoopRig {
-    /// Start with `max_connections = 32` and `register_meeting_timeout = 30s`.
+    /// Start with `max_connections = 32` and [`DEPLOYED_ADMISSION`].
     pub async fn start(
-        jwt_validator: Arc<MhJwtValidator>,
         session_manager: SessionManagerHandle,
         mc_client: Arc<McClient>,
         handler_id: String,
     ) -> Self {
         Self::start_with(
-            jwt_validator,
             session_manager,
             mc_client,
             handler_id,
             32,
-            Duration::from_secs(30),
+            DEPLOYED_ADMISSION,
         )
         .await
     }
 
-    /// Start with an explicit `max_connections` — useful for capacity-rejection tests.
+    /// Start with an explicit `max_connections` and admission settings —
+    /// capacity-rejection, skew and pending-cap tests.
     pub async fn start_with(
-        jwt_validator: Arc<MhJwtValidator>,
         session_manager: SessionManagerHandle,
         mc_client: Arc<McClient>,
         handler_id: String,
         max_connections: usize,
-        register_meeting_timeout: Duration,
+        admission: ClientAdmission,
     ) -> Self {
         let (tempdir, cert_path, key_path) = Self::write_self_signed_pems();
 
@@ -98,11 +103,10 @@ impl AcceptLoopRig {
             "127.0.0.1:0".to_string(),
             cert_path,
             key_path,
-            jwt_validator,
+            admission,
             session_manager.clone(),
             mc_client,
             handler_id,
-            register_meeting_timeout,
             max_connections,
             // Deployed values (infra/services/mh-service/config.env). The
             // rig drives the REAL `bind()`, so these are the transport

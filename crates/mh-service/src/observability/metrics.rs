@@ -1282,6 +1282,12 @@ pub enum MediaSessionStartOutcome {
     /// because there MH knew where MC was and got no usable answer, and here it
     /// never knew.
     DeclinedMcEndpointUnknown,
+    /// The participant (`(meeting, sub)`) already had
+    /// `MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT` connections awaiting MC's
+    /// bind answer (ADR-0039 §5), so this one was closed `DECLINED` without
+    /// asking MC. **Expected near-zero; a sustained rate means a client redial
+    /// storm.**
+    DeclinedPendingCap,
 }
 
 impl MediaSessionStartOutcome {
@@ -1297,7 +1303,7 @@ impl MediaSessionStartOutcome {
     /// The length is written out rather than inferred: it is the catalogued
     /// cardinality of the `outcome` label, so a variant added here without the
     /// catalog and the dashboard being revisited fails to compile first.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Started,
         Self::DeclinedNoSenderBinding,
         Self::DeclinedSenderBindingOutOfRange,
@@ -1305,6 +1311,7 @@ impl MediaSessionStartOutcome {
         Self::DeclinedMcUnavailable,
         Self::DeclinedMcAuthRejected,
         Self::DeclinedMcEndpointUnknown,
+        Self::DeclinedPendingCap,
     ];
 
     /// The wire label value.
@@ -1321,6 +1328,7 @@ impl MediaSessionStartOutcome {
             Self::DeclinedMcUnavailable => "declined_mc_unavailable",
             Self::DeclinedMcAuthRejected => "declined_mc_auth_rejected",
             Self::DeclinedMcEndpointUnknown => "declined_mc_endpoint_unknown",
+            Self::DeclinedPendingCap => "declined_pending_cap",
         }
     }
 }
@@ -1392,29 +1400,6 @@ pub fn set_active_connections(count: f64) {
     gauge!("mh_active_connections").set(count);
 }
 
-/// Record a `RegisterMeeting` provisional-accept timeout (R-26).
-///
-/// Metric: `mh_register_meeting_timeouts_total`
-/// Labels: none
-/// Cardinality: 1
-///
-/// Fires from the timeout arm of
-/// `webtransport::connection::await_meeting_registration` when a
-/// WebTransport client was accepted before MC finished assigning the
-/// meeting to this MH, and `MC::RegisterMeeting` did not arrive within
-/// the configured `register_meeting_timeout`. The connection is then
-/// disconnected.
-///
-/// Does NOT fire on shutdown-driven cancellation or successful
-/// registration (separate arms). This invariant is enforced by behavioral
-/// tests co-located with the helper.
-///
-/// A non-zero rate signals MC → MH `RegisterMeeting` latency issues or a
-/// client-side sequencing bug (client connected before MC finished assignment).
-pub fn record_register_meeting_timeout() {
-    counter!("mh_register_meeting_timeouts_total").increment(1);
-}
-
 /// Record the terminal outcome of one logical MC notification (R-16/R-17) —
 /// called once per notification by `send_with_retry`, NOT once per retry attempt.
 ///
@@ -1430,16 +1415,14 @@ pub fn record_mc_notification(event_type: &str, status: &str) {
     .increment(1);
 }
 
-/// Record a JWT validation attempt (R-27).
+/// Record a SERVICE-token validation attempt on the gRPC path (R-27).
 ///
 /// Metric: `mh_jwt_validations_total`
-/// Labels: `result`, `token_type`, `failure_reason`
+/// Labels: `result`, `token_type="service"`, `failure_reason`
 ///
-/// Result values: "success", "failure"
-/// Token type values: "meeting", "service"
-/// Failure reason values: `none` (success), `signature_invalid`, `expired`,
-///   `scope_mismatch`, `malformed`, `validation_failed`
-/// Cardinality: bounded (2 x 2 x 6 = 24 max, but most combos are sparse in practice)
+/// Failure reason values on this path: `none` (success), `signature_invalid`,
+/// `expired`, `scope_mismatch`, `malformed` ([`JWT_SERVICE_FAILURE_REASONS`]).
+/// The client path is [`record_media_dial_validation`].
 pub fn record_jwt_validation(result: &str, token_type: &str, failure_reason: &str) {
     counter!("mh_jwt_validations_total",
         "result" => result.to_string(),
@@ -1447,6 +1430,43 @@ pub fn record_jwt_validation(result: &str, token_type: &str, failure_reason: &st
         "failure_reason" => failure_reason.to_string()
     )
     .increment(1);
+}
+
+/// Record one client `media_dial` admission check (story 4 MH-1; ADR-0039 §8):
+/// `mh_jwt_validations_total{token_type="media_dial"}` with `result="success",
+/// failure_reason="none"` on `None`, else `result="failure"` and the
+/// rejection's label. Exactly once per dial, from `webtransport::close::admit`.
+/// The reasons are metric-only; the client sees `DECLINED` or `WRONG_HANDLER`.
+pub fn record_media_dial_validation(rejection: Option<crate::auth::MediaDialRejection>) {
+    let (result, reason) = match rejection {
+        None => ("success", "none"),
+        Some(r) => ("failure", r.as_label()),
+    };
+    counter!("mh_jwt_validations_total",
+        "result" => result,
+        "token_type" => MEDIA_DIAL_TOKEN_TYPE_LABEL,
+        "failure_reason" => reason
+    )
+    .increment(1);
+}
+
+/// The `token_type` label of the client path: the `media_dial` credential's
+/// own `token_type` value (`common::jwt::MEDIA_DIAL_TOKEN_TYPE`).
+const MEDIA_DIAL_TOKEN_TYPE_LABEL: &str = common::jwt::MEDIA_DIAL_TOKEN_TYPE;
+
+/// Publish `mh_media_dial_clock_skew_seconds` (config gauge, telemetry
+/// contract "`media_dial` exp skew"): the configured
+/// `MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS`, from the same field admission reads.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a bounded config integer (<= 60)"
+)]
+pub fn publish_media_dial_clock_skew(skew_seconds: u64) {
+    gauge!(
+        "mh_media_dial_clock_skew_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(skew_seconds as f64);
 }
 
 // ============================================================================
@@ -2649,15 +2669,15 @@ const TOKEN_ERROR_CATEGORIES: &[&str] = &[
 const WEBTRANSPORT_STATUSES: &[&str] = &["accepted", "rejected", "error"];
 /// `mh_mc_notifications_total{event_type}`. Emit sites pass literals.
 const MC_EVENT_TYPES: &[&str] = &["connected", "disconnected"];
-/// `mh_jwt_validations_total{token_type}`. Emit sites pass literals.
-const JWT_TOKEN_TYPES: &[&str] = &["meeting", "service"];
-/// JWT failure reasons (result="failure"). `classify_jwt_error` + call-site literals.
-const JWT_FAILURE_REASONS: &[&str] = &[
+/// `mh_jwt_validations_total{token_type="service", failure_reason}` — the
+/// service-token path's reasons (`classify_jwt_error` + the scope literal).
+/// The `media_dial` path's reasons are `MediaDialRejection::ALL`, so each token
+/// type zero-inits exactly the set it can emit (no cartesian product).
+pub(crate) const JWT_SERVICE_FAILURE_REASONS: &[&str] = &[
     "signature_invalid",
     "expired",
     "scope_mismatch",
     "malformed",
-    "validation_failed",
 ];
 /// `mh_caller_type_rejected_total{actual_type}` — the peer JWT's `service_type`
 /// claim CLAMPED at the single emit site (`grpc/auth_interceptor.rs`) by
@@ -2737,13 +2757,10 @@ pub fn zero_initialize_counters() {
         counter!("mh_webtransport_connections_total", "status" => *s).increment(0);
     }
     // Session closes by code: the ONE label source is `CloseCode::ALL`. All five,
-    // `wrong_handler` included (no emitter until MH-1), so "no closes" is a
-    // flat zero rather than an absent series.
+    // so "no closes" is a flat zero rather than an absent series.
     for code in crate::webtransport::close::CloseCode::ALL {
         counter!("mh_webtransport_session_closes_total", "code" => code.as_label()).increment(0);
     }
-    // No-label counter (cardinality 1).
-    counter!("mh_register_meeting_timeouts_total").increment(0);
     // mc notifications: event_type × status.
     for ev in MC_EVENT_TYPES {
         for st in STATUS_SUCCESS_ERROR {
@@ -2751,12 +2768,16 @@ pub fn zero_initialize_counters() {
                 .increment(0);
         }
     }
-    // JWT: success→none per token_type; failure→each reason per token_type.
-    for tt in JWT_TOKEN_TYPES {
-        counter!("mh_jwt_validations_total", "result" => "success", "token_type" => *tt, "failure_reason" => "none").increment(0);
-        for fr in JWT_FAILURE_REASONS {
-            counter!("mh_jwt_validations_total", "result" => "failure", "token_type" => *tt, "failure_reason" => *fr).increment(0);
-        }
+    // JWT: success→none per token type; failure→exactly the reasons THAT path
+    // emits (service: `JWT_SERVICE_FAILURE_REASONS`; media_dial:
+    // `MediaDialRejection::ALL`, the same vocabulary the recorder takes).
+    counter!("mh_jwt_validations_total", "result" => "success", "token_type" => "service", "failure_reason" => "none").increment(0);
+    for fr in JWT_SERVICE_FAILURE_REASONS {
+        counter!("mh_jwt_validations_total", "result" => "failure", "token_type" => "service", "failure_reason" => *fr).increment(0);
+    }
+    counter!("mh_jwt_validations_total", "result" => "success", "token_type" => MEDIA_DIAL_TOKEN_TYPE_LABEL, "failure_reason" => "none").increment(0);
+    for r in crate::auth::MediaDialRejection::ALL {
+        counter!("mh_jwt_validations_total", "result" => "failure", "token_type" => MEDIA_DIAL_TOKEN_TYPE_LABEL, "failure_reason" => r.as_label()).increment(0);
     }
     // caller type rejections: fixed grpc_service/expected_type × actual_types.
     for at in CALLER_ACTUAL_TYPES {
@@ -2810,7 +2831,18 @@ mod tests {
 
         present_at_zero(r#"mh_gc_heartbeats_total{status="success"}"#);
         present_at_zero(r#"mh_webtransport_connections_total{status="rejected"}"#);
-        present_at_zero("mh_register_meeting_timeouts_total");
+        present_at_zero(
+            r#"mh_jwt_validations_total{result="failure",token_type="media_dial",failure_reason="no_meeting_key"}"#,
+        );
+        assert!(
+            !rendered.contains("mh_register_meeting_timeouts_total"),
+            "the retired registration-timeout counter must not render (story 4 MH-1)"
+        );
+        assert!(
+            !rendered.contains(r#"token_type="meeting""#)
+                && !rendered.contains("validation_failed"),
+            "the retired meeting-token vocabulary must not render (story 4 MH-1)"
+        );
         present_at_zero(
             r#"mh_caller_type_rejected_total{grpc_service="MediaHandlerService",expected_type="meeting-controller",actual_type="unknown"}"#,
         );
@@ -2887,6 +2919,56 @@ mod tests {
         );
     }
 
+    /// The zero-initialised `mh_jwt_validations_total` series are EXACTLY the
+    /// emittable set, per token type — never a cartesian product (a
+    /// `media_dial`×`scope_mismatch` series could never move).
+    #[test]
+    fn jwt_validation_zero_init_is_exactly_the_emit_vocabulary() {
+        let recorder = configured_prometheus_builder()
+            .expect("prometheus builder config")
+            .build_recorder();
+        let handle = recorder.handle();
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            zero_initialize_counters();
+        }
+        let rendered = handle.render();
+        let mut series: Vec<String> = rendered
+            .lines()
+            .filter(|l| l.starts_with("mh_jwt_validations_total{"))
+            .map(|l| l.split(' ').next().unwrap_or_default().to_string())
+            .collect();
+        series.sort();
+        let mut expected = vec![
+            r#"mh_jwt_validations_total{result="success",token_type="service",failure_reason="none"}"#.to_string(),
+            r#"mh_jwt_validations_total{result="success",token_type="media_dial",failure_reason="none"}"#.to_string(),
+        ];
+        for fr in [
+            "signature_invalid",
+            "expired",
+            "scope_mismatch",
+            "malformed",
+        ] {
+            expected.push(format!(
+                r#"mh_jwt_validations_total{{result="failure",token_type="service",failure_reason="{fr}"}}"#
+            ));
+        }
+        for fr in [
+            "malformed",
+            "no_meeting_key",
+            "signature_invalid",
+            "expired",
+            "wrong_type",
+            "aud_mismatch",
+        ] {
+            expected.push(format!(
+                r#"mh_jwt_validations_total{{result="failure",token_type="media_dial",failure_reason="{fr}"}}"#
+            ));
+        }
+        expected.sort();
+        assert_eq!(series, expected);
+    }
+
     /// `server_muted` is present AT ZERO from the moment the media handles are
     /// resolved (story 2 R-9) — before any mute and before any frame.
     ///
@@ -2943,12 +3025,12 @@ mod tests {
         let handle = recorder.handle();
         {
             let _guard = metrics::set_default_local_recorder(&recorder);
-            counter!("mh_register_meeting_timeouts_total").increment(0);
+            counter!("mh_webtransport_session_closes_total", "code" => "declined").increment(0);
         }
         assert!(
             handle
                 .render()
-                .contains("mh_register_meeting_timeouts_total"),
+                .contains("mh_webtransport_session_closes_total"),
             "a registered-at-0 counter did NOT render through configured_prometheus_builder() \
              — present-at-0 broke under the prod exporter config (a recorder/scrape/config \
              regression). This does not by itself prove an idle_timeout was added; that stays \
@@ -3072,7 +3154,8 @@ mod tests {
                 "declined_sender_binding_conflict",
                 "declined_mc_unavailable",
                 "declined_mc_auth_rejected",
-                "declined_mc_endpoint_unknown"
+                "declined_mc_endpoint_unknown",
+                "declined_pending_cap"
             ],
             "outcome label values are wire-visible; a rename silently breaks every dashboard and alert selecting on them"
         );
@@ -3184,8 +3267,10 @@ mod tests {
 
     #[test]
     fn test_record_jwt_validation() {
-        record_jwt_validation("success", "meeting", "none");
-        record_jwt_validation("failure", "meeting", "validation_failed");
+        record_media_dial_validation(None);
+        for r in crate::auth::MediaDialRejection::ALL {
+            record_media_dial_validation(Some(r));
+        }
         record_jwt_validation("success", "service", "none");
         record_jwt_validation("failure", "service", "signature_invalid");
         record_jwt_validation("failure", "service", "expired");
@@ -3513,6 +3598,19 @@ mod tests {
         snapshot
             .gauge("mh_media_stream_sources_declared")
             .assert_value(3.0);
+    }
+
+    /// The `media_dial` skew config gauge publishes the configured value
+    /// (telemetry contract "`media_dial` exp skew"), in seconds.
+    #[test]
+    fn media_dial_clock_skew_is_published_in_seconds() {
+        use common::observability::testing::MetricAssertion;
+        let snapshot = MetricAssertion::snapshot();
+        publish_media_dial_clock_skew(7);
+        snapshot
+            .gauge("mh_media_dial_clock_skew_seconds")
+            .with_labels(&[("key_custody", "operator")])
+            .assert_value(7.0);
     }
 
     #[test]

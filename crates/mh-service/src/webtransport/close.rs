@@ -17,17 +17,21 @@
 //!
 //! 1. **A code other than DECLINED only after the credential fully validated.**
 //!    The only constructor of a non-DECLINED [`SessionClose`] is
-//!    [`ValidatedSession::close`], and the only constructor of a
-//!    [`ValidatedSession`] is [`validate`], which runs the token validation
-//!    itself. A pre-validation site can only name [`SessionClose::declined`].
+//!    [`ValidatedSession::closing`], and the only constructor of a
+//!    [`ValidatedSession`] is [`admit`], which runs the `media_dial`
+//!    verification itself (ADR-0039 §5 steps a–e). A pre-validation site can
+//!    only name [`SessionClose::declined`]. `WRONG_HANDLER` (step f, the
+//!    token's `aud` names another handler) is built from the
+//!    [`ValidatedSession`] AFTER a–e passed, so it is unreachable for a token
+//!    that failed any earlier step.
 //! 2. **Only about the caller's own meeting.** A [`ValidatedSession`] carries the
 //!    validated token's meeting; nothing here takes a meeting from anywhere else.
 //! 3. **Nothing distinguishes token-failure kinds to the peer.** Every
 //!    validation failure is the single DECLINED, with no reason bytes, and no
-//!    kind-dependent delay is added here. The kind is in the server log only;
-//!    on the meeting-token path `mh_jwt_validations_total` carries
-//!    `failure_reason="validation_failed"` for every kind (story 4 MH-1 splits it
-//!    for `media_dial`, per the ADR-0039 telemetry contract).
+//!    kind-dependent delay is added here. The kind is metric-only:
+//!    `mh_jwt_validations_total{token_type="media_dial", failure_reason}`
+//!    ([`MediaDialRejection::as_label`]), and the `failure_reason` field of the
+//!    server-side WARN.
 //!
 //! # The one numeric conversion
 //!
@@ -37,12 +41,13 @@
 //! [`CloseCode`] has no zero variant, so "never send `UNSPECIFIED`" is a property
 //! of the type, not of a test.
 
-use crate::auth::MhJwtValidator;
+use crate::auth::{verify_media_dial, DialRefusal, MediaDialKey, MediaDialRejection, Verified};
 use crate::config::CLOSE_SESSION_LINGER;
-use crate::errors::MhError;
 use crate::observability::metrics::{self, MediaSessionStartOutcome};
 use crate::routing::MeetingKey;
+use crate::session::SessionManagerHandle;
 use proto_gen::dark_tower::signaling::v1::MhCloseCode;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 use wtransport::proto::error::ErrorCode;
 use wtransport::{Connection, VarInt};
@@ -51,7 +56,8 @@ use wtransport::{Connection, VarInt};
 /// unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseCode {
-    /// The token's audience is another handler (MH-1; no emitter yet).
+    /// The token fully validated but its audience is another handler
+    /// (ADR-0039 §5 step f). The client redials the same token with backoff.
     WrongHandler,
     /// MH refused the sender binding MC returned: it is held by another
     /// participant. The client retries once its old session ages out.
@@ -141,18 +147,22 @@ pub enum StartDecline {
     McUnavailable,
     McAuthRejected,
     McEndpointUnknown,
+    /// This `(meeting, sub)` already had the configured number of connections
+    /// awaiting their bind (ADR-0039 §5 pending cap). MC was never asked.
+    PendingCap,
 }
 
 impl StartDecline {
     /// Every decline. A test proves this is exactly the non-`Started` image of
     /// [`MediaSessionStartOutcome::ALL`] through [`Self::from_outcome`].
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::NoSenderBinding,
         Self::SenderBindingOutOfRange,
         Self::SenderBindingConflict,
         Self::McUnavailable,
         Self::McAuthRejected,
         Self::McEndpointUnknown,
+        Self::PendingCap,
     ];
 
     /// The counted outcome on `mh_media_session_starts_total`.
@@ -167,6 +177,7 @@ impl StartDecline {
             Self::McUnavailable => MediaSessionStartOutcome::DeclinedMcUnavailable,
             Self::McAuthRejected => MediaSessionStartOutcome::DeclinedMcAuthRejected,
             Self::McEndpointUnknown => MediaSessionStartOutcome::DeclinedMcEndpointUnknown,
+            Self::PendingCap => MediaSessionStartOutcome::DeclinedPendingCap,
         }
     }
 
@@ -187,18 +198,25 @@ impl StartDecline {
             MediaSessionStartOutcome::DeclinedMcUnavailable => Some(Self::McUnavailable),
             MediaSessionStartOutcome::DeclinedMcAuthRejected => Some(Self::McAuthRejected),
             MediaSessionStartOutcome::DeclinedMcEndpointUnknown => Some(Self::McEndpointUnknown),
+            MediaSessionStartOutcome::DeclinedPendingCap => Some(Self::PendingCap),
         }
     }
 }
 
-/// A session whose credential fully validated. Obtainable ONLY from
-/// [`validate`]; it is what unlocks every code other than DECLINED.
+/// A session whose credential fully validated (ADR-0039 §5 steps a–e).
+/// Obtainable ONLY from [`admit`]; it is what unlocks every code other than
+/// DECLINED.
 ///
-/// Holds the token's meeting and subject and nothing else — never the claims
-/// or the token, so nothing claim-shaped can reach a log through it.
+/// Holds the token's meeting, its subject and the (public) key that verified
+/// it, and nothing else — never the claims or the token, so nothing
+/// claim-shaped can reach a log through it.
 pub struct ValidatedSession {
     meeting: MeetingKey,
     participant_id: String,
+    /// The registered key that verified the token: admission requires it to be
+    /// still the meeting's (a re-key between lookup and admission admits
+    /// nothing). Public key; its `Debug` renders no bytes.
+    media_dial_key: MediaDialKey,
 }
 
 impl ValidatedSession {
@@ -214,12 +232,18 @@ impl ValidatedSession {
         self.meeting.as_str()
     }
 
-    /// The validated token's `sub` — the ONE read of it (see `handle_connection`'s
+    /// The verified `media_dial` token's `sub` — the ONE read of it (see `handle_connection`'s
     /// provenance note): the value MC answers an identity question about and the
     /// value MH binds to a media route.
     #[must_use]
     pub fn participant_id(&self) -> &str {
         &self.participant_id
+    }
+
+    /// The registered key that verified this session's token.
+    #[must_use]
+    pub const fn media_dial_key(&self) -> MediaDialKey {
+        self.media_dial_key
     }
 
     /// Builds (does not send) a close for THIS session's meeting, after
@@ -238,9 +262,8 @@ pub enum ValidatedClose {
     /// MH released the meeting (`EndMeeting` today; MH-2 adds RELEASED verdicts
     /// and owner silence, MH-3 the drain-deadline shed).
     MeetingReleased,
-    /// The token's audience is another handler. Reserved for MH-1's
-    /// post-validation `aud` check: present so the mapping is total today, with
-    /// no emitter yet.
+    /// The token's audience is another handler: [`admit`]'s step (f), after
+    /// every other check passed.
     WrongHandler,
 }
 
@@ -285,45 +308,101 @@ impl SessionClose {
                 StartDecline::NoSenderBinding
                 | StartDecline::SenderBindingOutOfRange
                 | StartDecline::McAuthRejected
-                | StartDecline::McEndpointUnknown => CloseCode::Declined,
+                | StartDecline::McEndpointUnknown
+                | StartDecline::PendingCap => CloseCode::Declined,
             },
         }
     }
 }
 
-/// Validate the connect credential — the ONLY way to obtain a
-/// [`ValidatedSession`].
+/// A refused admission. The variant IS the peer-visible code, so a reason and
+/// a code that disagree are unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Steps (a)–(e): the one generic `DECLINED`, with the counted reason.
+    Declined(MediaDialRejection),
+    /// Step (f): a validated session's `WRONG_HANDLER` close.
+    WrongHandler(SessionClose),
+}
+
+impl Refusal {
+    /// The counted `failure_reason`.
+    #[must_use]
+    pub const fn rejection(self) -> MediaDialRejection {
+        match self {
+            Self::Declined(rejection) => rejection,
+            Self::WrongHandler(_) => MediaDialRejection::AudMismatch,
+        }
+    }
+
+    /// The close this refusal sends.
+    #[must_use]
+    pub const fn close(self) -> SessionClose {
+        match self {
+            Self::Declined(_) => SessionClose::declined(),
+            Self::WrongHandler(close) => close,
+        }
+    }
+}
+
+/// Admit a client on its `media_dial` token — the ONLY way to obtain a
+/// [`ValidatedSession`]. The ADR-0039 §5 (a)–(f) order has one home,
+/// [`verify_media_dial`]; this injects the session actor's read-only key
+/// lookup, and a `WRONG_HANDLER` close is built from the [`ValidatedSession`]
+/// of a token that passed (a)–(e).
 ///
-/// Records `mh_jwt_validations_total` on both arms and is the single log sink
-/// for the failure's detail (`error = %e`, server-side only). The caller closes
-/// any `Err` with DECLINED and hands the `MhError` to the accept loop unchanged.
+/// Records `mh_jwt_validations_total{token_type="media_dial"}` exactly once on
+/// every exit and is the single log sink for the refusal (its reason label and
+/// the connection id only — never the token, a claim or the key). Nothing is
+/// held for a refused dial: admission into the session actor happens after.
 ///
 /// # Errors
 ///
-/// The validator's `MhError` for any credential failure.
-pub async fn validate(
-    validator: &MhJwtValidator,
+/// The [`Refusal`] for the first failing step.
+#[tracing::instrument(skip_all)]
+pub async fn admit(
     token: &str,
+    handler_id: &str,
+    clock_skew: Duration,
+    session_manager: &SessionManagerHandle,
     connection_id: &str,
-) -> Result<ValidatedSession, MhError> {
-    match validator.validate_meeting_token(token).await {
-        Ok(claims) => {
-            metrics::record_jwt_validation("success", "meeting", "none");
-            Ok(ValidatedSession {
-                meeting: MeetingKey::new(&claims.meeting_id),
-                participant_id: claims.sub,
-            })
-        }
-        Err(e) => {
+) -> Result<ValidatedSession, Refusal> {
+    let outcome = admit_inner(token, handler_id, clock_skew, session_manager).await;
+    match &outcome {
+        Ok(_) => metrics::record_media_dial_validation(None),
+        Err(refusal) => {
+            metrics::record_media_dial_validation(Some(refusal.rejection()));
             warn!(
                 target: "mh.webtransport.connection",
                 connection_id = %connection_id,
-                error = %e,
-                "JWT validation failed"
+                failure_reason = refusal.rejection().as_label(),
+                code = refusal.close().code().as_label(),
+                "media_dial admission refused"
             );
-            metrics::record_jwt_validation("failure", "meeting", "validation_failed");
-            Err(e)
         }
+    }
+    outcome
+}
+
+async fn admit_inner(
+    token: &str,
+    handler_id: &str,
+    clock_skew: Duration,
+    session_manager: &SessionManagerHandle,
+) -> Result<ValidatedSession, Refusal> {
+    let lookup =
+        |meeting_id: String| async move { session_manager.media_dial_key(&meeting_id).await };
+    let session_of = |verified: Verified| ValidatedSession {
+        meeting: MeetingKey::new(&verified.claims.meeting_id),
+        participant_id: verified.claims.sub,
+        media_dial_key: verified.key,
+    };
+    match verify_media_dial(token, handler_id, clock_skew, lookup).await {
+        Ok(verified) => Ok(session_of(verified)),
+        Err(DialRefusal::Declined(rejection)) => Err(Refusal::Declined(rejection)),
+        Err(DialRefusal::WrongHandler(verified)) => Err(Refusal::WrongHandler(
+            session_of(*verified).closing(ValidatedClose::WrongHandler),
+        )),
     }
 }
 
@@ -521,6 +600,7 @@ mod tests {
             (StartDecline::McUnavailable, CloseCode::McUnavailable),
             (StartDecline::McAuthRejected, CloseCode::Declined),
             (StartDecline::McEndpointUnknown, CloseCode::Declined),
+            (StartDecline::PendingCap, CloseCode::Declined),
         ];
         assert_eq!(
             table.map(|(d, _)| d),

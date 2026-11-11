@@ -1900,16 +1900,16 @@ that handler, reports `FAILED` for it (which makes MC re-push the set with a fre
 **exactly once** when a set with a different token arrives. It never retries on its own. If MC
 never re-pushes, the handler stays parked and dark.
 
-**Expected until story 4 MH-1.** Today MH still validates the join-time `join_token`, which the SDK
-deliberately does not retain (ADR-0039 §5). So every dial **after** the join — a newly added
-handler, a redial after a loss, a post-park dial — is DECLINED by design, and the
-`failed_report` re-pushes rise, bounded by MC's FAILED re-push rate limit. That is not a bug in this
-window. Do not "fix" it by retaining the JWT.
+`DECLINED` also covers, without any token fault: a dial over MH's per-participant pending cap
+(`MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT` connections already awaiting MC's bind — a redial
+storm; MH counts `mh_media_session_starts_total{outcome="declined_pending_cap"}`), and a participant
+who has left the meeting redialling with a still-valid token (MC answers `sender_id` 0).
 
-**First triage step.** After MH-1: a sustained `failed_report` rate means MC's TTL/3 refresh push
-is broken or MH's dial-token validation disagrees with MC's key. Check MH's JWT-validation failure
-reasons for `media_dial` tokens (ADR-0039 §8: a sustained `expired` means the refresh push is
-broken).
+**First triage step.** A sustained `failed_report` rate means MC's TTL/3 refresh push
+is broken or MH's dial-token validation disagrees with MC's key. Check MH's validation failure
+reasons for `media_dial` tokens, `mh_jwt_validations_total{token_type="media_dial",result="failure"}`
+by `failure_reason` (ADR-0039 §8: a sustained `expired` means the refresh push is broken;
+`docs/runbooks/mh-incident-response.md` Scenario 24).
 
 ### Media-handler set reconcile knobs
 

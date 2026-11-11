@@ -50,7 +50,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::observability::testing::MetricAssertion;
-use mh_service::auth::MhJwtValidator;
 use mh_service::config::CLOSE_SESSION_LINGER;
 use mh_service::grpc::McClient;
 use mh_service::routing::{MeetingKey, SenderId};
@@ -63,15 +62,11 @@ use proto_gen::dark_tower::signaling::v1::{
 
 use test_common::accept_loop_rig::AcceptLoopRig;
 use test_common::close_metrics::{assert_closed_only, assert_no_close_counted};
-use test_common::jwks_rig::JwksRig;
 use test_common::mock_mc::{
     start_mock_mc_server, MockBehavior, MockMcHandle, MockMcServer, SenderReplies,
 };
 use test_common::test_token_receiver;
-use test_common::tokens::{
-    craft_alg_none_token, craft_hs256_key_confusion_token, meeting_claims,
-    mint_expired_meeting_token, mint_meeting_token, mint_wrong_token_type_token,
-};
+use test_common::tokens::{meeting_claims, mint_aged_dial_token, mint_dial_token, DIAL_TTL_SECS};
 use test_common::udp_proxy::UdpProxy;
 use test_common::wt_client::{
     build_client, build_client_with_stream_window, connect_and_open_bi, connect_and_open_bi_with,
@@ -90,26 +85,22 @@ const MC_ID: &str = "mc-close-test";
 const PROMPT: Duration = Duration::from_secs(5);
 
 struct Suite {
-    jwks: JwksRig,
     session_manager: SessionManagerHandle,
     wt: AcceptLoopRig,
     _mc: MockMcHandle,
 }
 
 impl Suite {
-    async fn start(max_connections: usize, register_meeting_timeout: Duration) -> Self {
-        let jwks = JwksRig::start(61, "mh-close-integ-01").await;
+    async fn start(max_connections: usize) -> Self {
         let session_manager =
             SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding());
-        let jwt_validator = Arc::new(MhJwtValidator::new(jwks.jwks_client(), 300));
         let mc_client = Arc::new(McClient::new(test_token_receiver()));
         let wt = AcceptLoopRig::start_with(
-            jwt_validator,
             session_manager.clone(),
             mc_client,
             HANDLER_ID.to_string(),
             max_connections,
-            register_meeting_timeout,
+            test_common::accept_loop_rig::DEPLOYED_ADMISSION,
         )
         .await;
         let mc = start_mock_mc_server(
@@ -125,6 +116,7 @@ impl Suite {
                     mc_grpc_endpoint: format!("http://{}", mc.addr),
                     heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                     registered_at: Instant::now(),
+                    media_dial_key: mh_test_utils::media_dial::meeting_dial_key(),
                 },
                 None,
                 mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
@@ -132,7 +124,6 @@ impl Suite {
             .await
             .expect("a test registration is below the registration cap");
         Self {
-            jwks,
             session_manager,
             wt,
             _mc: mc,
@@ -140,7 +131,7 @@ impl Suite {
     }
 
     fn valid_token(&self) -> String {
-        mint_meeting_token(&self.jwks.keypair, MEETING, PARTICIPANT)
+        mint_dial_token(MEETING, PARTICIPANT, HANDLER_ID)
     }
 
     /// Connect with a valid token to `url` and wait until the session is BOUND
@@ -211,18 +202,31 @@ enum PreValidation {
 }
 
 /// Security's "no oracle" condition as a test: every pre-validation exit and
-/// every credential-failure kind is the SAME close at the peer — DECLINED, an
-/// empty message — with no other code on any of them, and no kind-dependent
-/// delay MH adds (the only residual, a JWKS refetch on an unknown `kid`, is
-/// inside the validator and pre-existing). Positive control on the same rig: a
-/// valid token is NOT closed.
+/// every `media_dial` credential-failure kind (ADR-0039 §5 steps a–e) is the
+/// SAME close at the peer — DECLINED, an empty message — with no other code on
+/// any of them, and no kind-dependent delay MH adds (MH never fetches a key on
+/// this path). Nothing is held for any of them. Positive control on the same
+/// rig: a valid token is NOT closed.
 #[tokio::test(flavor = "current_thread")]
 async fn every_pre_validation_and_credential_failure_is_one_identical_declined() {
-    let suite = Suite::start(32, Duration::from_secs(30)).await;
-    let kid = suite.jwks.keypair.kid.clone();
-    // Same kid, different key: signature invalid. Unpublished kid: no key.
-    let foreign_key = TestKeypair::new(99, &kid);
-    let unknown_kid = TestKeypair::new(61, "kid-not-in-jwks");
+    use mh_test_utils::media_dial::{DialForge, ATTACKER_SEED, MEETING_SEED};
+
+    let suite = Suite::start(32).await;
+    let meeting_key = DialForge::new(MEETING_SEED);
+    let attacker = DialForge::new(ATTACKER_SEED);
+    let claims = || {
+        DialForge::claims_json(
+            MEETING,
+            HANDLER_ID,
+            PARTICIPANT,
+            chrono::Utc::now().timestamp(),
+            DIAL_TTL_SECS,
+        )
+    };
+    let mut wrong_type = claims();
+    wrong_type["token_type"] = serde_json::json!("meeting");
+    // An AC-signed meeting token (another key entirely, with a `kid`).
+    let ac_key = TestKeypair::new(61, "ac-kid");
 
     let empty_oneof = MhClientMessage {
         message: None,
@@ -246,30 +250,32 @@ async fn every_pre_validation_and_credential_failure_is_one_identical_declined()
     let token_cases: Vec<(&str, String)> = vec![
         (
             "expired",
-            mint_expired_meeting_token(&suite.jwks.keypair, MEETING),
+            mint_aged_dial_token(MEETING, PARTICIPANT, HANDLER_ID, DIAL_TTL_SECS + 100),
         ),
+        ("another-meeting-key", attacker.sign(&claims())),
         (
-            "bad-signature",
-            foreign_key.sign_token(&meeting_claims(MEETING, PARTICIPANT, "meeting")),
-        ),
-        (
-            "unknown-kid",
-            unknown_kid.sign_token(&meeting_claims(MEETING, PARTICIPANT, "meeting")),
-        ),
-        (
-            "alg-none",
-            craft_alg_none_token(&kid, &meeting_claims(MEETING, PARTICIPANT, "meeting")),
-        ),
-        (
-            "hs256-confusion",
-            craft_hs256_key_confusion_token(
-                &suite.jwks.keypair,
-                &meeting_claims(MEETING, PARTICIPANT, "meeting"),
+            "attacker-key-announced-in-header",
+            attacker.sign_with_header(
+                &serde_json::json!({"alg": "EdDSA", "kid": "k", "jwk": attacker.jwk()}),
+                &claims(),
             ),
         ),
         (
-            "wrong-token-type",
-            mint_wrong_token_type_token(&suite.jwks.keypair, MEETING),
+            "alg-none",
+            meeting_key.sign_with_header(&serde_json::json!({"alg": "none"}), &claims()),
+        ),
+        (
+            "alg-hs256",
+            meeting_key.sign_with_header(&serde_json::json!({"alg": "HS256"}), &claims()),
+        ),
+        ("wrong-token-type", meeting_key.sign(&wrong_type)),
+        (
+            "ac-meeting-token",
+            ac_key.sign_token(&meeting_claims(MEETING, PARTICIPANT, "meeting")),
+        ),
+        (
+            "unheld-meeting",
+            mint_dial_token("meeting-never-registered", PARTICIPANT, HANDLER_ID),
         ),
         ("malformed", "not-a-jwt".to_string()),
         ("oversized", "a".repeat(9000)),
@@ -310,10 +316,33 @@ async fn every_pre_validation_and_credential_failure_is_one_identical_declined()
     }
     // NEGATIVE arm: no other code was counted on any of them; all DECLINED.
     assert_closed_only(&snap, CloseCode::Declined, cases.len() as u64);
-    // The kinds stay metric-only: every token case is a validation failure.
-    snap.counter("mh_jwt_validations_total")
-        .with_labels(&[("result", "failure")])
-        .assert_delta(token_cases.len() as u64);
+    // The kinds stay metric-only: every token case is a validation failure,
+    // counted under its own reason (a partial-label delta would read only the
+    // first matching series, so each reason is asserted exactly).
+    let by_reason = [
+        ("expired", 1_u64),
+        ("signature_invalid", 3), // another meeting's key, attacker key, AC token
+        ("malformed", 4),         // alg none, alg HS256, not-a-jwt, oversized
+        ("wrong_type", 1),
+        ("no_meeting_key", 1),
+        ("aud_mismatch", 0),
+    ];
+    assert_eq!(
+        by_reason.iter().map(|(_, n)| n).sum::<u64>(),
+        token_cases.len() as u64,
+        "every token case is classified exactly once"
+    );
+    for (reason, expected) in by_reason {
+        snap.counter("mh_jwt_validations_total")
+            .with_labels(&[
+                ("result", "failure"),
+                ("token_type", "media_dial"),
+                ("failure_reason", reason),
+            ])
+            .assert_delta(expected);
+    }
+    // Nothing was held for any of them.
+    assert_eq!(suite.session_manager.active_connection_count().await, 0);
     // F9 / unchanged accounting: pre-validation exits still report as errors.
     // The accept loop counts when `handle_connection` returns, which is AFTER
     // the close completes (the peer's reaction, or the linger) — a bounded poll
@@ -329,20 +358,149 @@ async fn every_pre_validation_and_credential_failure_is_one_identical_declined()
     expect_still_open(&valid, Duration::from_millis(500), "valid token").await;
 }
 
-/// The provisional-accept timeout (a meeting that never registers) closes with
-/// DECLINED. Real clock with a small timeout: paused time would also advance
-/// quinn's own timers on the real sockets.
+/// A dial for a meeting this handler does not hold — never registered, or
+/// released — is DECLINED AT ONCE with nothing parked (ADR-0039 §3: the
+/// pending-before-registration path is deleted). Positive control: the same
+/// rig admits a dial for a meeting it does hold.
 #[tokio::test(flavor = "current_thread")]
-async fn a_registration_timeout_closes_with_declined() {
-    let suite = Suite::start(32, Duration::from_millis(300)).await;
+async fn a_dial_for_an_unheld_meeting_is_declined_at_once_with_nothing_parked() {
+    let suite = Suite::start(32).await;
+    let snap = MetricAssertion::snapshot();
+    for (name, meeting) in [("never registered", "meeting-never-registered")] {
+        let (conn, mut send, _recv) = connect_and_open_bi(&suite.wt.url).await;
+        let token = mint_dial_token(meeting, PARTICIPANT, HANDLER_ID);
+        write_mh_connect(&mut send, &token).await.unwrap();
+        let elapsed = expect_session_close(&conn, MhCloseCode::Declined, PROMPT, name).await;
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "{name}: parked for {elapsed:?}"
+        );
+    }
+    // Released: held, then EndMeeting drops its key.
+    suite.release().await;
+    let (conn, mut send, _recv) = connect_and_open_bi(&suite.wt.url).await;
+    write_mh_connect(&mut send, &suite.valid_token())
+        .await
+        .unwrap();
+    let elapsed = expect_session_close(&conn, MhCloseCode::Declined, PROMPT, "released").await;
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "released: parked for {elapsed:?}"
+    );
+
+    assert_closed_only(&snap, CloseCode::Declined, 2);
+    snap.counter("mh_jwt_validations_total")
+        .with_labels(&[
+            ("result", "failure"),
+            ("token_type", "media_dial"),
+            ("failure_reason", "no_meeting_key"),
+        ])
+        .assert_delta(2);
+    assert_eq!(suite.session_manager.active_connection_count().await, 0);
+
+    // POSITIVE CONTROL: re-registered, the same token is admitted.
+    suite
+        .session_manager
+        .register_meeting(
+            MEETING.to_string(),
+            MeetingRegistration {
+                mc_id: MC_ID.to_string(),
+                mc_grpc_endpoint: format!("http://{}", suite._mc.addr),
+                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
+                registered_at: Instant::now(),
+                media_dial_key: mh_test_utils::media_dial::meeting_dial_key(),
+            },
+            None,
+            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
+        )
+        .await
+        .unwrap();
+    let (valid, _s, _r) = suite.connect_bound(&suite.wt.url).await;
+    expect_still_open(&valid, Duration::from_millis(300), "re-registered").await;
+}
+
+/// A connection still AWAITING its bind (MC's answer held) is closed
+/// HANDLER_RELEASED at a REMOVAL-cause release (ADR-0039 §6: the handler is
+/// leaving the meeting), and the abandoned answer is a no-op — exactly one
+/// close counted, never re-coded DECLINED.
+#[tokio::test(flavor = "current_thread")]
+async fn a_removal_closes_a_connection_awaiting_its_bind_with_handler_released() {
+    use common::observability::labels::RemovalTrigger;
+    use mh_service::session::release::ReleaseKind;
+
+    let suite = Suite::start(32).await;
+    // A mock MC whose `NotifyParticipantConnected` is held: its capture channel
+    // is pre-filled, so the handler's send waits until the test drains it.
+    let (held_tx, mut held_rx) = tokio::sync::mpsc::channel(1);
+    held_tx
+        .send(proto_gen::dark_tower::internal::v1::NotifyParticipantConnectedRequest::default())
+        .await
+        .unwrap();
+    let holding_mc = start_mock_mc_server(
+        MockMcServer::new(MockBehavior::Accept)
+            .with_sender_replies(SenderReplies::default().with(PARTICIPANT, SENDER))
+            .with_connected_tx(held_tx),
+    )
+    .await;
+    const AWAITING: &str = "meeting-awaiting-bind";
+    suite
+        .session_manager
+        .register_meeting(
+            AWAITING.to_string(),
+            MeetingRegistration {
+                mc_id: MC_ID.to_string(),
+                mc_grpc_endpoint: format!("http://{}", holding_mc.addr),
+                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
+                registered_at: Instant::now(),
+                media_dial_key: mh_test_utils::media_dial::meeting_dial_key(),
+            },
+            None,
+            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
+        )
+        .await
+        .unwrap();
+
     let snap = MetricAssertion::snapshot();
     let (conn, mut send, _recv) = connect_and_open_bi(&suite.wt.url).await;
-    let token = mint_meeting_token(&suite.jwks.keypair, "meeting-never-registered", PARTICIPANT);
-    write_mh_connect(&mut send, &token).await.unwrap();
-    expect_session_close(&conn, MhCloseCode::Declined, PROMPT, "register timeout").await;
-    assert_closed_only(&snap, CloseCode::Declined, 1);
-    snap.counter("mh_register_meeting_timeouts_total")
-        .assert_delta(1);
+    write_mh_connect(
+        &mut send,
+        &mint_dial_token(AWAITING, PARTICIPANT, HANDLER_ID),
+    )
+    .await
+    .unwrap();
+    // Admitted and awaiting its bind (positive control: it is held, not closed).
+    let stop = Instant::now() + PROMPT;
+    while suite.session_manager.active_connection_count().await != 1 {
+        assert!(Instant::now() < stop, "the connection was never admitted");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    expect_still_open(&conn, Duration::from_millis(200), "awaiting its bind").await;
+
+    suite
+        .session_manager
+        .end_meeting(
+            AWAITING.to_string(),
+            MC_ID.to_string(),
+            ReleaseKind::Removal(RemovalTrigger::HeartbeatTimeout),
+            PROMPT,
+        )
+        .await
+        .unwrap();
+    expect_session_close(&conn, MhCloseCode::HandlerReleased, PROMPT, "removal").await;
+
+    // Let MC's held answer go: it must change nothing.
+    while held_rx.try_recv().is_ok() {}
+    drop(held_rx);
+    suite.wt.wait_idle(PROMPT).await;
+    assert_closed_only(&snap, CloseCode::HandlerReleased, 1);
+    assert!(suite
+        .session_manager
+        .sender_bindings()
+        .holder_of(
+            &MeetingKey::new(AWAITING),
+            SenderId::from_wire(SENDER).unwrap()
+        )
+        .is_none());
 }
 
 /// `EndMeeting` releasing a meeting closes its ACTIVE (bound, media-started)
@@ -350,7 +508,7 @@ async fn a_registration_timeout_closes_with_declined() {
 /// open before the release.
 #[tokio::test(flavor = "current_thread")]
 async fn an_end_meeting_release_closes_an_active_session_with_handler_released() {
-    let suite = Suite::start(32, Duration::from_secs(30)).await;
+    let suite = Suite::start(32).await;
     let (conn, _send, _recv) = suite.connect_bound(&suite.wt.url).await;
     expect_still_open(&conn, Duration::from_millis(200), "bound before release").await;
 
@@ -364,7 +522,7 @@ async fn an_end_meeting_release_closes_an_active_session_with_handler_released()
 /// capsule, counts nothing.
 #[tokio::test(flavor = "current_thread")]
 async fn a_client_initiated_close_carries_no_code() {
-    let suite = Suite::start(32, Duration::from_secs(30)).await;
+    let suite = Suite::start(32).await;
     let (conn, _send, _recv) = suite.connect_bound(&suite.wt.url).await;
     let snap = MetricAssertion::snapshot();
     conn.close(wtransport::VarInt::from_u32(0), b"leave");
@@ -387,7 +545,7 @@ async fn a_client_initiated_close_carries_no_code() {
 /// half on `current_thread`.
 #[tokio::test(flavor = "current_thread")]
 async fn a_shutdown_cancellation_carries_no_code_and_counts_nothing() {
-    let suite = Suite::start(32, Duration::from_secs(30)).await;
+    let suite = Suite::start(32).await;
     let (conn, _send, _recv) = suite.connect_bound(&suite.wt.url).await;
     let snap = MetricAssertion::snapshot();
     suite.wt.shutdown();
@@ -407,7 +565,7 @@ async fn a_shutdown_cancellation_carries_no_code_and_counts_nothing() {
 /// QUIC close, which a browser reads as a clean close with code 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shutdown_cancellation_sends_no_capsule_and_no_fin_multi_thread() {
-    let suite = Suite::start(32, Duration::from_secs(30)).await;
+    let suite = Suite::start(32).await;
     let (conn, _send, _recv) = suite.connect_bound(&suite.wt.url).await;
     suite.wt.shutdown();
     let end = expect_no_session_close(&conn, PROMPT, "shutdown (multi_thread)").await;
@@ -424,7 +582,7 @@ async fn a_shutdown_cancellation_sends_no_capsule_and_no_fin_multi_thread() {
 /// a FIN.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_initiated_close_sends_nothing_back_multi_thread() {
-    let suite = Suite::start(32, Duration::from_secs(30)).await;
+    let suite = Suite::start(32).await;
     let (conn, _send, _recv) = suite.connect_bound(&suite.wt.url).await;
     conn.close(wtransport::VarInt::from_u32(0), b"leave");
     expect_no_session_close(&conn, PROMPT, "client close (multi_thread)").await;
@@ -445,7 +603,7 @@ async fn a_client_initiated_close_sends_nothing_back_multi_thread() {
 async fn assert_slot_held_for_the_linger_bound_only(
     client: &wtransport::Endpoint<wtransport::endpoint::endpoint_side::Client>,
 ) {
-    let suite = Suite::start(32, Duration::from_secs(30)).await;
+    let suite = Suite::start(32).await;
     let relay = UdpProxy::start(suite.wt.addr).await;
     let (_silent, _s, _r) = suite.connect_bound_with(client, &relay.url()).await;
 
@@ -497,7 +655,7 @@ async fn a_peer_withholding_credit_cannot_hold_its_slot_past_the_linger_bound() 
 /// nothing and is NOT counted; the connection is still accounted as an error.
 #[tokio::test(flavor = "current_thread")]
 async fn a_session_already_gone_is_skipped_and_not_counted() {
-    let suite = Suite::start(32, Duration::from_secs(30)).await;
+    let suite = Suite::start(32).await;
     let snap = MetricAssertion::snapshot();
     let client = build_client();
     let conn = client.connect(&suite.wt.url).await.expect("connect");

@@ -208,7 +208,8 @@ fn test_config(gc_url: &str) -> Config {
         grpc_advertise_address: "grpc://localhost:50053".to_string(),
         webtransport_advertise_address: "https://localhost:4434".to_string(),
         ac_jwks_url: "http://localhost:8082/.well-known/jwks.json".to_string(),
-        register_meeting_timeout_seconds: 15,
+        media_dial_clock_skew_seconds: 30,
+        max_pending_connections_per_participant: 2,
         max_connections: 500,
         quic_transport: mh_service::config::QuicTransportParams {
             max_concurrent_uni_streams: 64,

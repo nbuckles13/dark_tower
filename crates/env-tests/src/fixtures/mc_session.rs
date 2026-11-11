@@ -564,20 +564,32 @@ pub async fn mc_join_with(
     join
 }
 
-/// Encode `jwt` as the typed `MhClientMessage{ConnectRequest{join_token}}`
-/// envelope and frame it. MH's wire format on the first message of a bidi
-/// stream is this envelope, mirroring MC's `ClientMessage{JoinRequest{…}}`.
-/// Negative tests pass malformed/oversized `jwt` strings through unchanged so
-/// the validator observes the intended failure mode.
+/// Encode `media_dial_token` as the typed
+/// `MhClientMessage{ConnectRequest{media_dial_token}}` envelope and frame it.
+/// MH's wire format on the first message of a bidi stream is this envelope,
+/// mirroring MC's `ClientMessage{JoinRequest{…}}`.
+///
+/// MH admits ONLY on `media_dial_token` (ADR-0039 §5, story 4 MH-1): the
+/// MC-minted credential from the participant's `MediaHandlerSet` entry for
+/// that handler. `join_token` is left EMPTY — MH never reads it (P3 deletes the
+/// field). Negative tests pass malformed/oversized/foreign strings through
+/// unchanged so the verifier observes the intended failure mode.
 #[must_use]
-pub fn mh_connect_frame(jwt: &str) -> Vec<u8> {
+pub fn mh_connect_frame(media_dial_token: &str) -> Vec<u8> {
+    mh_connect_frame_with("", media_dial_token)
+}
+
+/// [`mh_connect_frame`] with an explicit `join_token` beside the dial token —
+/// the SDK's join-time shape (C1 sends both until P3). Only for tests that
+/// prove MH IGNORES `join_token` (a present, invalid one must not change the
+/// outcome).
+#[must_use]
+pub fn mh_connect_frame_with(join_token: &str, media_dial_token: &str) -> Vec<u8> {
     let envelope = MhClientMessage {
         message: Some(mh_client_message::Message::ConnectRequest(
             MhConnectRequest {
-                join_token: jwt.to_string(),
-                // Story 4 additive contract: populated once MH accepts the
-                // dial token only (MH-1).
-                media_dial_token: String::new(),
+                join_token: join_token.to_string(),
+                media_dial_token: media_dial_token.to_string(),
             },
         )),
         trace_parent: String::new(),
@@ -586,13 +598,33 @@ pub fn mh_connect_frame(jwt: &str) -> Vec<u8> {
     frame(&envelope.encode_to_vec())
 }
 
+/// `token` with one character INSIDE its signature segment changed: a compact
+/// JWS that stays structurally valid and fails only signature verification.
+/// Not the last character — in base64url the final character of a 64-byte
+/// signature carries padding bits, so changing it may decode to the same bytes.
+/// The result is a bearer-shaped string: never put it in a panic or assert.
+///
+/// # Panics
+/// If `token` is 10 characters or shorter (not a compact JWS).
+#[must_use]
+pub fn tamper_jws_signature(token: &str) -> String {
+    let mut chars: Vec<char> = token.chars().collect();
+    let idx = chars
+        .len()
+        .checked_sub(10)
+        .expect("a compact JWS is longer than 10 characters");
+    let c = chars.get_mut(idx).expect("index checked above");
+    *c = if *c == 'A' { 'B' } else { 'A' };
+    chars.into_iter().collect()
+}
+
 /// Open a bidi stream on `conn`, write the MH connect frame, and return the live
 /// streams so the caller controls read timing and disconnect.
 pub async fn mh_open_connect(
     conn: &wtransport::Connection,
-    jwt: &str,
+    media_dial_token: &str,
 ) -> (wtransport::SendStream, wtransport::RecvStream) {
-    try_mh_open_connect(conn, jwt)
+    try_mh_open_connect(conn, media_dial_token)
         .await
         .unwrap_or_else(|e| panic!("{e}"))
 }
@@ -606,7 +638,20 @@ pub async fn mh_open_connect(
 /// A description of the stream-open or connect-frame write failure.
 pub async fn try_mh_open_connect(
     conn: &wtransport::Connection,
-    jwt: &str,
+    media_dial_token: &str,
+) -> Result<(wtransport::SendStream, wtransport::RecvStream), String> {
+    try_mh_open_connect_frame(conn, &mh_connect_frame(media_dial_token)).await
+}
+
+/// Open MH's carrier bi-stream and write an already-encoded connect `frame`
+/// (from [`mh_connect_frame`] / [`mh_connect_frame_with`]).
+///
+/// # Errors
+///
+/// A description of the stream-open or connect-frame write failure.
+pub async fn try_mh_open_connect_frame(
+    conn: &wtransport::Connection,
+    frame: &[u8],
 ) -> Result<(wtransport::SendStream, wtransport::RecvStream), String> {
     let (mut send, recv) = conn
         .open_bi()
@@ -614,7 +659,7 @@ pub async fn try_mh_open_connect(
         .map_err(|e| format!("open bi stream to MH: {e}"))?
         .await
         .map_err(|e| format!("MH bi stream not ready: {e}"))?;
-    send.write_all(&mh_connect_frame(jwt))
+    send.write_all(frame)
         .await
         .map_err(|e| format!("write MH connect request: {e}"))?;
     Ok((send, recv))
@@ -662,10 +707,11 @@ impl MhSession {
     }
 }
 
-/// Connect to an MH URL, send the connect request, and return the live media
-/// session — connection plus the held carrier stream (see [`MhSession`]).
-pub async fn mh_connect(url: &str, jwt: &str) -> MhSession {
-    try_mh_connect(url, jwt)
+/// Connect to an MH URL, send the connect request carrying `media_dial_token`,
+/// and return the live media session — connection plus the held carrier stream
+/// (see [`MhSession`]).
+pub async fn mh_connect(url: &str, media_dial_token: &str) -> MhSession {
+    try_mh_connect(url, media_dial_token)
         .await
         .unwrap_or_else(|e| panic!("{e}"))
 }
@@ -677,8 +723,8 @@ pub async fn mh_connect(url: &str, jwt: &str) -> MhSession {
 /// # Errors
 ///
 /// A description of the connect, stream-open or connect-frame write failure.
-pub async fn try_mh_connect(url: &str, jwt: &str) -> Result<MhSession, String> {
-    try_mh_connect_with(url, jwt, None).await
+pub async fn try_mh_connect(url: &str, media_dial_token: &str) -> Result<MhSession, String> {
+    try_mh_connect_with(url, media_dial_token, None).await
 }
 
 /// [`try_mh_connect`] with a QUIC keep-alive (see [`try_connect_wt_with`]).
@@ -688,11 +734,25 @@ pub async fn try_mh_connect(url: &str, jwt: &str) -> Result<MhSession, String> {
 /// As [`try_mh_connect`].
 pub async fn try_mh_connect_with(
     url: &str,
-    jwt: &str,
+    media_dial_token: &str,
+    keep_alive: Option<Duration>,
+) -> Result<MhSession, String> {
+    try_mh_connect_frame(url, &mh_connect_frame(media_dial_token), keep_alive).await
+}
+
+/// Connect to `url` and send an already-encoded connect `frame` (e.g.
+/// [`mh_connect_frame_with`], for the join-token-ignored arms).
+///
+/// # Errors
+///
+/// As [`try_mh_connect`].
+pub async fn try_mh_connect_frame(
+    url: &str,
+    frame: &[u8],
     keep_alive: Option<Duration>,
 ) -> Result<MhSession, String> {
     let conn = try_connect_wt_with(url, keep_alive).await?;
-    let (send, recv) = try_mh_open_connect(&conn, jwt)
+    let (send, recv) = try_mh_open_connect_frame(&conn, frame)
         .await
         .map_err(|e| format!("{e} (MH at {url})"))?;
     Ok(MhSession { conn, send, recv })

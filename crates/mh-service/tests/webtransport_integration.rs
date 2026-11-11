@@ -1,5 +1,5 @@
 //! Integration tests for the mh-service WebTransport accept path,
-//! provisional-timeout enforcement, and MC notification lifecycle.
+//! `media_dial` admission on it, and MC notification lifecycle.
 //!
 //! # Migration note — ADR-0032 Step 2
 //!
@@ -18,30 +18,21 @@
 //!
 //! # Integration value over unit tests
 //!
-//! - `auth/mod.rs::tests` covers the `MhJwtValidator` rejection matrix
-//!   (expired / wrong-key / malformed / oversized / token-type confusion)
-//!   against the validator directly. That unit matrix is the authoritative
-//!   refactor guard for `validate_meeting_token`'s contract.
-//!   `wrong_token_type_guest_rejected_on_wt_accept_path` is retained at
-//!   component tier because it adds a distinguishing signal the unit tier
-//!   cannot provide: `session_manager.active_connection_count()` remaining
-//!   at 0 catches call-site refactors that would bypass validation (e.g.,
-//!   a future permissive-method swap at `connection.rs:110`). See the test's
-//!   own body comment for the full invariant.
+//! - `auth/mod.rs::tests` covers the `media_dial` verifier's rejection matrix
+//!   (ADR-0039 §5 steps a–f) against the pure functions directly, and
+//!   `tests/media_dial_admission_integration.rs` covers the full admission
+//!   matrix end to end. `wrong_token_type_rejected_on_wt_accept_path` is
+//!   retained here because it adds a distinguishing signal:
+//!   `session_manager.active_connection_count()` remaining at 0 catches a
+//!   call-site refactor that would bypass admission.
 //! - `session/mod.rs::tests` covers `SessionManagerHandle` state transitions
-//!   (pending → active promotion, removal, active counts). The provisional
-//!   timer itself lives in `connection.rs` via `tokio::time::sleep(...)`
-//!   and is asserted at component tier only. The component test
-//!   `provisional_connection_kicked_after_register_meeting_timeout` below
-//!   covers both bounds via the two-fixed-point pattern: lower-bound
-//!   (counter still 0 at 800ms, timer did not fire early) and upper-bound
-//!   (counter reaches 1 within 3000ms, timer did fire in bounded time).
+//!   (admission, the pending cap, bind, removal, active counts). There is no
+//!   pending-before-registration path (ADR-0039 §3).
 //! - `mc_client_integration.rs` covers `McClient` retry semantics.
 //!
-//! This file proves the *accept path* actually wires the validator, the
-//! session manager, the provisional timer, and the MC client together, and
-//! that the real `accept_loop` emits the correct metric labels on each
-//! per-connection outcome.
+//! This file proves the *accept path* actually wires admission, the session
+//! manager and the MC client together, and that the real `accept_loop` emits
+//! the correct metric labels on each per-connection outcome.
 //!
 //! # Tokio flavor pinning — do not "simplify"
 //!
@@ -64,53 +55,58 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::observability::testing::MetricAssertion;
-use mh_service::auth::MhJwtValidator;
 use mh_service::grpc::McClient;
 use mh_service::session::SessionManagerHandle;
 use proto_gen::dark_tower::internal::v1::DisconnectReason;
 use tokio::sync::mpsc;
 
 use test_common::accept_loop_rig::AcceptLoopRig;
-use test_common::jwks_rig::JwksRig;
 use test_common::mock_mc::{start_mock_mc_server, MockBehavior, MockMcServer, SenderReplies};
 use test_common::test_token_receiver;
-use test_common::tokens::{
-    mint_expired_meeting_token, mint_meeting_token, mint_wrong_token_type_token,
-};
+use test_common::tokens::{mint_aged_dial_token, mint_dial_token, DIAL_TTL_SECS};
 use test_common::wt_client::{connect_and_open_bi, write_framed, write_mh_connect};
 
 // ---------------------------------------------------------------------------
 // Rig builder
 // ---------------------------------------------------------------------------
 
+/// This rig's handler id — the `aud` its dial tokens carry.
+const HANDLER_ID: &str = "mh-test-001";
+
 struct WtSuite {
-    jwks: JwksRig,
     session_manager: SessionManagerHandle,
     wt: AcceptLoopRig,
 }
 
 impl WtSuite {
-    async fn start(register_meeting_timeout: Duration, mc_client: Arc<McClient>) -> Self {
-        let jwks = JwksRig::start(42, "mh-wt-integ-01").await;
+    async fn start(mc_client: Arc<McClient>) -> Self {
         let session_manager =
             SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding());
-        let jwt_validator = Arc::new(MhJwtValidator::new(jwks.jwks_client(), 300));
-
-        let wt = AcceptLoopRig::start_with(
-            jwt_validator,
-            session_manager.clone(),
-            mc_client,
-            "mh-test-001".to_string(),
-            32,
-            register_meeting_timeout,
-        )
-        .await;
-
+        let wt =
+            AcceptLoopRig::start(session_manager.clone(), mc_client, HANDLER_ID.to_string()).await;
         Self {
-            jwks,
             session_manager,
             wt,
         }
+    }
+
+    /// Register `meeting_id` with the forge's key, pointed at `mc_endpoint`.
+    async fn register(&self, meeting_id: &str, mc_id: &str, mc_endpoint: &str) {
+        self.session_manager
+            .register_meeting(
+                meeting_id.to_string(),
+                mh_service::session::MeetingRegistration {
+                    mc_id: mc_id.to_string(),
+                    mc_grpc_endpoint: mc_endpoint.to_string(),
+                    heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
+                    registered_at: Instant::now(),
+                    media_dial_key: mh_test_utils::media_dial::meeting_dial_key(),
+                },
+                None,
+                mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
+            )
+            .await
+            .expect("a test registration is below the registration cap");
     }
 }
 
@@ -121,7 +117,7 @@ fn make_mc_client() -> Arc<McClient> {
 }
 
 /// Open a WT bi-stream and write the supplied token wrapped in the typed
-/// `MhClientMessage{ConnectRequest{join_token}}` envelope. Returns the live
+/// `MhClientMessage{ConnectRequest{media_dial_token}}` envelope. Returns the live
 /// connection + streams so the caller can control its own disconnect.
 async fn connect_and_send_jwt(
     wt_url: &str,
@@ -157,33 +153,21 @@ async fn wait_for_active_count(
 }
 
 // ---------------------------------------------------------------------------
-// JWT enforcement on the accept path
+// media_dial admission on the accept path
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "current_thread")]
 async fn valid_meeting_jwt_connection_accepted_and_tracked() {
     let mc_client = make_mc_client();
-    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+    let suite = WtSuite::start(mc_client).await;
 
-    // Pre-register the meeting so the connection is promoted immediately.
+    // Register the meeting: admission needs its key.
     suite
-        .session_manager
-        .register_meeting(
-            "meeting-wt-valid".to_string(),
-            mh_service::session::MeetingRegistration {
-                mc_id: "mc-wt-test".to_string(),
-                mc_grpc_endpoint: "http://localhost:1".to_string(),
-                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
-                registered_at: Instant::now(),
-            },
-            None,
-            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
-        )
-        .await
-        .expect("a test registration is below the registration cap");
+        .register("meeting-wt-valid", "mc-wt-test", "http://localhost:1")
+        .await;
 
     let snap = MetricAssertion::snapshot();
-    let token = mint_meeting_token(&suite.jwks.keypair, "meeting-wt-valid", "user-valid");
+    let token = mint_dial_token("meeting-wt-valid", "user-valid", HANDLER_ID);
     let (_conn, _send, _recv) = connect_and_send_jwt(&suite.wt.url, &token).await;
 
     // Side-effect observation: the real accept_loop + handler must register
@@ -204,7 +188,7 @@ async fn valid_meeting_jwt_connection_accepted_and_tracked() {
     snap.counter("mh_jwt_validations_total")
         .with_labels(&[
             ("result", "success"),
-            ("token_type", "meeting"),
+            ("token_type", "media_dial"),
             ("failure_reason", "none"),
         ])
         .assert_delta(1);
@@ -214,7 +198,7 @@ async fn valid_meeting_jwt_connection_accepted_and_tracked() {
 async fn missing_jwt_stream_closed_before_write_rejects_connection() {
     // The client opens the bi-stream and closes it without sending any bytes.
     // The server's `read_framed_message` fails and the handler returns an
-    // error before JWT validation runs. Observation shape:
+    // error before admission runs. Observation shape:
     //   - `mh_webtransport_connections_total{status=error}` increments (accept_loop
     //     emits on any handler `Err(_)`).
     //   - `mh_jwt_validations_total` does NOT fire with `result=failure` or
@@ -226,7 +210,7 @@ async fn missing_jwt_stream_closed_before_write_rejects_connection() {
     // Do NOT use partial-label filters with `assert_delta(N>0)` — ambiguous
     // when multiple matching entries exist.
     let mc_client = make_mc_client();
-    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+    let suite = WtSuite::start(mc_client).await;
 
     let snap = MetricAssertion::snapshot();
     let (conn, mut send, _recv) = connect_and_open_bi(&suite.wt.url).await;
@@ -262,7 +246,7 @@ async fn malformed_envelope_bytes_rejected_on_wt_accept_path() {
     // refactor that folds decode failure into the validation metric path will
     // fail this test loudly.
     let mc_client = make_mc_client();
-    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+    let suite = WtSuite::start(mc_client).await;
 
     let snap = MetricAssertion::snapshot();
     let (_conn, mut send, _recv) = connect_and_open_bi(&suite.wt.url).await;
@@ -297,7 +281,7 @@ async fn empty_envelope_oneof_rejected_on_wt_accept_path() {
     use proto_gen::dark_tower::signaling::v1::MhClientMessage;
 
     let mc_client = make_mc_client();
-    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+    let suite = WtSuite::start(mc_client).await;
 
     let snap = MetricAssertion::snapshot();
     let envelope = MhClientMessage {
@@ -337,7 +321,7 @@ async fn recovery_request_as_first_message_rejected_on_wt_accept_path() {
     };
 
     let mc_client = make_mc_client();
-    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+    let suite = WtSuite::start(mc_client).await;
 
     let snap = MetricAssertion::snapshot();
     let envelope = MhClientMessage {
@@ -372,23 +356,34 @@ async fn recovery_request_as_first_message_rejected_on_wt_accept_path() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn expired_meeting_jwt_rejected_on_wt_accept_path() {
+async fn expired_dial_token_rejected_on_wt_accept_path() {
     let mc_client = make_mc_client();
-    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+    let suite = WtSuite::start(mc_client).await;
+    // Registered, so the token fails on its expiry (step e), not on a missing
+    // key (step c).
+    suite
+        .register("meeting-wt-expired", "mc-wt-expired", "http://localhost:1")
+        .await;
 
     let snap = MetricAssertion::snapshot();
-    let token = mint_expired_meeting_token(&suite.jwks.keypair, "meeting-wt-expired");
+    // Expired 100 s ago: well beyond the deployed 30 s skew.
+    let token = mint_aged_dial_token(
+        "meeting-wt-expired",
+        "user-expired",
+        HANDLER_ID,
+        DIAL_TTL_SECS + 100,
+    );
     let (_conn, _send, _recv) = connect_and_send_jwt(&suite.wt.url, &token).await;
 
-    // Wait for the handler to reach step 4, fail validation, and the
+    // Wait for the handler to reach step 4, fail admission, and the
     // accept_loop to emit on spawn exit.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     snap.counter("mh_jwt_validations_total")
         .with_labels(&[
             ("result", "failure"),
-            ("token_type", "meeting"),
-            ("failure_reason", "validation_failed"),
+            ("token_type", "media_dial"),
+            ("failure_reason", "expired"),
         ])
         .assert_delta(1);
     snap.counter("mh_webtransport_connections_total")
@@ -402,12 +397,12 @@ async fn expired_meeting_jwt_rejected_on_wt_accept_path() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn oversized_jwt_rejected_on_wt_accept_path() {
-    // JWT payload fits under the 64KB framing cap but exceeds
-    // `MAX_JWT_SIZE_BYTES` (8KB) enforced by `MhJwtValidator`. Confirms the
-    // validator's size check fires end-to-end through the accept path.
+async fn oversized_dial_token_rejected_on_wt_accept_path() {
+    // Token payload fits under the 64KB framing cap but exceeds
+    // `MAX_JWT_SIZE_BYTES` (8KB), admission's step (a). Confirms the size
+    // check fires end-to-end through the accept path.
     let mc_client = make_mc_client();
-    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+    let suite = WtSuite::start(mc_client).await;
 
     let snap = MetricAssertion::snapshot();
     // 9000 > MAX_JWT_SIZE_BYTES (8192, defined in `common::jwt`).
@@ -419,8 +414,8 @@ async fn oversized_jwt_rejected_on_wt_accept_path() {
     snap.counter("mh_jwt_validations_total")
         .with_labels(&[
             ("result", "failure"),
-            ("token_type", "meeting"),
-            ("failure_reason", "validation_failed"),
+            ("token_type", "media_dial"),
+            ("failure_reason", "malformed"),
         ])
         .assert_delta(1);
     snap.counter("mh_webtransport_connections_total")
@@ -429,60 +424,49 @@ async fn oversized_jwt_rejected_on_wt_accept_path() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn wrong_token_type_guest_rejected_on_wt_accept_path() {
-    // SECURITY INVARIANT: the WT accept path must call `validate_meeting_token`
-    // (which enforces `token_type == "meeting"`), NOT `inner.validate` or any
-    // hypothetical permissive variant. A correctly-signed guest-typed token
-    // must NOT admit the bearer — not at validation, not at session
-    // registration.
+async fn wrong_token_type_rejected_on_wt_accept_path() {
+    // SECURITY INVARIANT: a token signed with the meeting's own registered key
+    // whose `token_type` is not `media_dial` must NOT admit the bearer — not at
+    // validation, not at session admission (ADR-0039 §5 step e).
     //
-    // Authoritative unit-tier guard on `validate_meeting_token`'s contract:
-    // `crates/mh-service/src/auth/mod.rs::tests::test_validate_meeting_token_rejects_guest_token`.
-    // This component-tier test adds the DISTINGUISHING signal: if a future
-    // refactor edits `connection.rs:110` to call a permissive method (or
-    // makes `MhJwtValidator::inner` crate-visible and calls it directly), the
-    // guest token would promote to the session manager and
-    // `active_connection_count` would transition from 0 to 1. Neither the
-    // metric-label assertion (labels at `connection.rs:112,122` are
-    // string-literal and don't depend on which validator method was called)
-    // nor the unit-tier matrix catch that class of call-site refactor. The
-    // session-manager state assertion below does.
-    let mc_client = make_mc_client();
-    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+    // The authoritative unit-tier guard is `auth/mod.rs::tests`. This
+    // component-tier test adds the DISTINGUISHING signal: if a future refactor
+    // bypassed admission at the call site, the token would reach the session
+    // manager and `active_connection_count` would transition from 0 to 1. The
+    // session-manager state assertion below catches that class of refactor.
+    use mh_test_utils::media_dial::{DialForge, MEETING_SEED};
 
-    // Pre-register the meeting so that IF validation were bypassed, the
-    // handler would proceed straight to `add_connection` (state transition
-    // 0 → 1), not `add_pending_connection`. Makes the negative signal
-    // unambiguous.
+    let mc_client = make_mc_client();
+    let suite = WtSuite::start(mc_client).await;
+
+    // Registered, so IF admission were bypassed the handler would proceed
+    // straight to admitting the connection (state transition 0 → 1). Makes
+    // the negative signal unambiguous.
     suite
-        .session_manager
-        .register_meeting(
-            "meeting-wt-guest".to_string(),
-            mh_service::session::MeetingRegistration {
-                mc_id: "mc-wt-guest".to_string(),
-                mc_grpc_endpoint: "http://localhost:1".to_string(),
-                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
-                registered_at: Instant::now(),
-            },
-            None,
-            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
-        )
-        .await
-        .expect("a test registration is below the registration cap");
+        .register("meeting-wt-guest", "mc-wt-guest", "http://localhost:1")
+        .await;
 
     let snap = MetricAssertion::snapshot();
-    let token = mint_wrong_token_type_token(&suite.jwks.keypair, "meeting-wt-guest");
+    let mut claims = DialForge::claims_json(
+        "meeting-wt-guest",
+        HANDLER_ID,
+        "user-guest",
+        chrono::Utc::now().timestamp(),
+        DIAL_TTL_SECS,
+    );
+    claims["token_type"] = serde_json::json!("guest");
+    let token = DialForge::new(MEETING_SEED).sign(&claims);
     let (_conn, _send, _recv) = connect_and_send_jwt(&suite.wt.url, &token).await;
 
-    // Give the handler time to run through validation and the accept_loop
+    // Give the handler time to run through admission and the accept_loop
     // to observe the spawned task's Err exit.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     snap.counter("mh_jwt_validations_total")
         .with_labels(&[
             ("result", "failure"),
-            ("token_type", "meeting"),
-            ("failure_reason", "validation_failed"),
+            ("token_type", "media_dial"),
+            ("failure_reason", "wrong_type"),
         ])
         .assert_delta(1);
     snap.counter("mh_webtransport_connections_total")
@@ -494,104 +478,7 @@ async fn wrong_token_type_guest_rejected_on_wt_accept_path() {
     assert_eq!(
         suite.session_manager.active_connection_count().await,
         0,
-        "guest token reached session manager — validate_meeting_token was bypassed or a permissive variant was called",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Provisional-timeout enforcement
-// ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "current_thread")]
-async fn provisional_connection_kicked_after_register_meeting_timeout() {
-    // Provisional timeout = 1s. Asserts end-to-end wiring AND the original
-    // lower-bound guarantee ("timer does not fire BEFORE ~900ms"):
-    //
-    //   1. At 800ms (production timer = 1000ms, 200ms safety margin), the
-    //      counter is still 0 — the handler hasn't exited yet.
-    //   2. At ~3000ms (2200ms after the lower-bound check), the timer has
-    //      fired, handler has returned Err, and accept_loop emitted
-    //      `mh_webtransport_connections_total{status=error}` → counter = 1.
-    //
-    // Both reads hit the SAME `MetricAssertion` snapshot — counters are
-    // idempotent under repeat reads per common::observability::testing
-    // §"Delta semantics". Do NOT take a fresh snapshot between the two
-    // reads; per-snapshot recorder binding is fresh, so a new snapshot
-    // would see counter=0 regardless of the production emission.
-    let mc_client = make_mc_client();
-    let suite = WtSuite::start(Duration::from_secs(1), mc_client).await;
-
-    let snap = MetricAssertion::snapshot();
-    let token = mint_meeting_token(&suite.jwks.keypair, "meeting-wt-timeout", "user-timeout");
-    let (_conn, _send, _recv) = connect_and_send_jwt(&suite.wt.url, &token).await;
-
-    // Lower-bound check: 200ms before the 1s production timer would fire,
-    // the error counter must still be 0. This guards against a refactor
-    // that accidentally drops the provisional window entirely.
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    snap.counter("mh_webtransport_connections_total")
-        .with_labels(&[("status", "error")])
-        .assert_delta(0);
-
-    // Upper-bound check: 2200ms later (3000ms total wall-clock from
-    // snapshot, well past the 1s production timer), the counter MUST have
-    // incremented. 2000ms+ headroom covers any reasonable scheduling delay
-    // under CI load.
-    tokio::time::sleep(Duration::from_millis(2200)).await;
-    snap.counter("mh_webtransport_connections_total")
-        .with_labels(&[("status", "error")])
-        .assert_delta(1);
-    snap.counter("mh_register_meeting_timeouts_total")
-        .assert_delta(1);
-    assert_eq!(
-        suite.session_manager.active_connection_count().await,
-        0,
-        "provisional connection should not have been promoted after timeout",
-    );
-}
-
-#[tokio::test]
-async fn provisional_connection_survives_when_register_meeting_arrives_within_window() {
-    // Positive case: client connects with a valid JWT for an unregistered
-    // meeting; ~200ms later, RegisterMeeting arrives; the connection must
-    // NOT be kicked at the 1s timeout — the timer must gate on state.
-    let mc_client = make_mc_client();
-    let suite = WtSuite::start(Duration::from_secs(1), mc_client).await;
-
-    let token = mint_meeting_token(&suite.jwks.keypair, "meeting-wt-survive", "user-survive");
-    let (_conn, _send, _recv) = connect_and_send_jwt(&suite.wt.url, &token).await;
-
-    // Simulate RegisterMeeting arriving ~200ms into the 1s window.
-    let sm = suite.session_manager.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        sm.register_meeting(
-            "meeting-wt-survive".to_string(),
-            mh_service::session::MeetingRegistration {
-                mc_id: "mc-wt-survive".to_string(),
-                mc_grpc_endpoint: "http://localhost:1".to_string(),
-                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
-                registered_at: Instant::now(),
-            },
-            None,
-            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
-        )
-        .await
-        .expect("a test registration is below the registration cap");
-    });
-
-    // Wait well past the provisional timeout. The handler must still be
-    // running (holding the connection open), so the active count stays at 1.
-    assert!(
-        wait_for_active_count(&suite.session_manager, 1, Duration::from_millis(1500)).await,
-        "pending connection was not promoted after RegisterMeeting arrival",
-    );
-    // Remain at 1 past the provisional timeout — confirms the timer gated on state.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        suite.session_manager.active_connection_count().await,
-        1,
-        "promoted connection was kicked; timer did not gate on state",
+        "a wrong-type token reached the session manager — admission was bypassed",
     );
 }
 
@@ -617,26 +504,18 @@ async fn mc_notify_connected_fires_on_join_and_disconnected_fires_on_client_drop
     let mc = start_mock_mc_server(mock_mc).await;
 
     let mc_client = make_mc_client();
-    let suite = WtSuite::start(Duration::from_secs(30), mc_client).await;
+    let suite = WtSuite::start(mc_client).await;
 
-    // Pre-register the meeting pointing at the mock MC endpoint.
+    // Register the meeting pointing at the mock MC endpoint.
     suite
-        .session_manager
-        .register_meeting(
-            "meeting-wt-notify".to_string(),
-            mh_service::session::MeetingRegistration {
-                mc_id: "mc-wt-notify".to_string(),
-                mc_grpc_endpoint: format!("http://{}", mc.addr),
-                heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
-                registered_at: Instant::now(),
-            },
-            None,
-            mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
+        .register(
+            "meeting-wt-notify",
+            "mc-wt-notify",
+            &format!("http://{}", mc.addr),
         )
-        .await
-        .expect("a test registration is below the registration cap");
+        .await;
 
-    let token = mint_meeting_token(&suite.jwks.keypair, "meeting-wt-notify", "user-notify");
+    let token = mint_dial_token("meeting-wt-notify", "user-notify", HANDLER_ID);
     let (conn, mut send, _recv) = connect_and_send_jwt(&suite.wt.url, &token).await;
 
     // Assert connect notification — bounded, strict equality on all fields.
@@ -647,7 +526,7 @@ async fn mc_notify_connected_fires_on_join_and_disconnected_fires_on_client_drop
 
     assert_eq!(connected.meeting_id, "meeting-wt-notify");
     assert_eq!(connected.participant_id, "user-notify");
-    assert_eq!(connected.handler_id, "mh-test-001");
+    assert_eq!(connected.handler_id, HANDLER_ID);
     assert!(
         !connected.connection_id.is_empty(),
         "MH must send a connection_id: MC refuses an empty one (sender_id 0, ADR-0039 §6), so \
@@ -668,7 +547,7 @@ async fn mc_notify_connected_fires_on_join_and_disconnected_fires_on_client_drop
 
     assert_eq!(disconnected.meeting_id, "meeting-wt-notify");
     assert_eq!(disconnected.participant_id, "user-notify");
-    assert_eq!(disconnected.handler_id, "mh-test-001");
+    assert_eq!(disconnected.handler_id, HANDLER_ID);
     // Read off the Connected MH actually sent, never a literal: MC retires the
     // entry keyed on this id, so a disconnect naming any other value leaves the
     // closed session's connectivity live (phantom connectivity) at MC.

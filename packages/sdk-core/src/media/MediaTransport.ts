@@ -306,11 +306,11 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
    * held for redial is a Gate 1 finding"). Only the dials started here carry it
    * as `join_token`, exactly as before this change. EVERY LATER DIAL (added
    * ref, redial, retry, post-park, the first non-empty set after an empty join
-   * set) sends `join_token = ""` plus `media_dial_token`. INTERIM, until story 4
-   * MH-1 makes MH accept `media_dial_token`: MH DECLINES those later dials, so
-   * the ref parks, FAILED goes to MC, MC re-pushes the set (rate-limited), and
-   * exactly one dial follows per newer token — never a client-driven loop. Do
-   * NOT "fix" that by retaining the JWT; MH-1 is the cut-over.
+   * set) sends `join_token = ""` plus `media_dial_token`, and MH admits it on
+   * `media_dial_token` alone (story 4 MH-1: MH never reads `join_token`). The
+   * join-time dials still carry `join_token` until story 4 P3 deletes the
+   * field; MH ignores it. Do NOT retain the JWT for redial: the media_dial
+   * token is the only credential a dial needs.
    *
    * @throws {MediaConnectionError} `ALL_FAILED` when the join-time set is
    *   NON-EMPTY and none of its dials connected (the join gate, unchanged). An

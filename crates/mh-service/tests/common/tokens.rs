@@ -1,4 +1,6 @@
-//! Helpers for minting test JWTs (service tokens + meeting tokens).
+//! Helpers for minting test JWTs: service tokens, AC meeting tokens (which MH
+//! client admission must DECLINE), and `media_dial` tokens through the ONE
+//! forge (`mh_test_utils::media_dial`).
 
 use chrono::Utc;
 use common::jwt::{MeetingRole, MeetingTokenClaims, ParticipantType, ServiceClaims};
@@ -106,8 +108,7 @@ pub fn mint_expired_meeting_token(keypair: &TestKeypair, meeting_id: &str) -> St
 
 /// Mint a meeting-shaped token whose `token_type` is NOT `"meeting"`.
 ///
-/// Used to prove the WT accept-path calls `validate_meeting_token` (which
-/// enforces the discriminator) rather than `inner.validate`.
+/// An AC-signed token of another type: still never a `media_dial` credential.
 pub fn mint_wrong_token_type_token(keypair: &TestKeypair, meeting_id: &str) -> String {
     keypair.sign_token(&meeting_claims(meeting_id, "user-guest", "guest"))
 }
@@ -143,4 +144,32 @@ pub fn craft_hs256_key_confusion_token(
     header.kid = Some(keypair.kid.clone());
     let key = EncodingKey::from_secret(&keypair.public_key_bytes);
     encode(&header, claims, &key).expect("failed to sign HS256 confusion token")
+}
+
+/// TTL of the `media_dial` tokens these tests mint (MC's default).
+pub const DIAL_TTL_SECS: i64 = 300;
+
+/// A `media_dial` token for `participant_id` in `meeting_id`, addressed to
+/// `handler_id`, signed by the key every test registration carries by default
+/// (`mh_test_utils::media_dial::MEETING_SEED`).
+pub fn mint_dial_token(meeting_id: &str, participant_id: &str, handler_id: &str) -> String {
+    mint_aged_dial_token(meeting_id, participant_id, handler_id, 0)
+}
+
+/// [`mint_dial_token`] issued `age_secs` ago (so it expired `age_secs -
+/// DIAL_TTL_SECS` seconds ago when that is positive).
+pub fn mint_aged_dial_token(
+    meeting_id: &str,
+    participant_id: &str,
+    handler_id: &str,
+    age_secs: i64,
+) -> String {
+    use mh_test_utils::media_dial::{DialForge, MEETING_SEED};
+    DialForge::new(MEETING_SEED).sign(&DialForge::claims_json(
+        meeting_id,
+        handler_id,
+        participant_id,
+        Utc::now().timestamp() - age_secs,
+        DIAL_TTL_SECS,
+    ))
 }

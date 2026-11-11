@@ -130,9 +130,9 @@ sum(rate(mh_webtransport_connections_total[5m]))
 - **Description**: WebTransport SESSION closes MH initiated with an `MhCloseCode` (ADR-0039 §7) — one per intentional close: a declined session, a released meeting's session (`EndMeeting`; RELEASED verdicts and owner silence from MH-2), and from MH-3 a drain-deadline shed. The code travels as a `CLOSE_WEBTRANSPORT_SESSION` capsule (empty message), the only close a browser reads as `WebTransportCloseInfo.closeCode`.
 - **Counting semantics**: one count = one close capsule MH **wrote** (not one delivered). It is recorded once, in the single emitter (`webtransport/close.rs::close_session`), right after the capsule write completes and BEFORE MH waits for the peer's reaction, all under ONE `CLOSE_SESSION_LINGER` (1 s) deadline — so a close whose wait expired (the capsule may still be lost under heavy loss) counts. NOT counted, and no code sent: a session already closed when MH went to close it (a client race), a capsule that could not be written, and a write that did not complete within the deadline (a peer withholding flow-control credit). Those sessions' declines are still on `mh_media_session_starts_total`.
 - **Labels**:
-  - `code`: `wrong_handler` | `binding_conflict` | `mc_unavailable` | `handler_released` | `declined` — the SAME tokens the client uses on `dt_client_mh_connection_total{outcome}`, so MH-sent and client-observed closes join. One home: `CloseCode::as_label` (the proto name, lowercased, prefix stripped; pinned by test). All five are zero-initialised; `wrong_handler` has no emitter until MH-1.
+  - `code`: `wrong_handler` | `binding_conflict` | `mc_unavailable` | `handler_released` | `declined` — the SAME tokens the client uses on `dt_client_mh_connection_total{outcome}`, so MH-sent and client-observed closes join. One home: `CloseCode::as_label` (the proto name, lowercased, prefix stripped; pinned by test). All five are zero-initialised. `wrong_handler` is emitted only by admission step (f): a `media_dial` token that passed EVERY earlier check (signature, claims, skew) but whose `aud` names another handler (story 4 MH-1); its count equals `mh_jwt_validations_total{token_type="media_dial",failure_reason="aud_mismatch"}` less skipped closes.
 - **Relationships — do not double count**:
-  - `code="declined"` is the union of (a) every credential failure — the peer always sees one generic DECLINED, and the failure KIND is in the server log only (on the meeting-token path `mh_jwt_validations_total` records `failure_reason="validation_failed"` for every kind; story 4 MH-1 splits it for `media_dial` per the ADR-0039 telemetry contract); (b) every pre-validation exit (unreadable, undecodable or non-connect first message), which **unauthenticated peers can drive at will** — so `code="declined"` must never page on its own; (c) the register-meeting timeout; and (d) the `declined_*` outcomes of `mh_media_session_starts_total` other than `declined_sender_binding_conflict` and `declined_mc_unavailable`, which map 1:1 to `binding_conflict` and `mc_unavailable`.
+  - `code="declined"` is the union of (a) every `media_dial` credential failure at admission steps (a)–(e) — the peer always sees one generic DECLINED, and the failure KIND is on `mh_jwt_validations_total{token_type="media_dial",failure_reason}` and the server log only; (b) every pre-validation exit (unreadable, undecodable or non-connect first message), which **unauthenticated peers can drive at will** — so `code="declined"` must never page on its own; (c) a verified dial whose meeting MH released or re-keyed between verification and admission, or whose MC bind answer was a nonzero ordinal arriving after a `MEETING_ENDED` release (nothing bound) — neither is counted on `mh_media_session_starts_total`, and both have `mh_jwt_validations_total` `result="success"`; and (d) the `declined_*` outcomes of `mh_media_session_starts_total` other than `declined_sender_binding_conflict` and `declined_mc_unavailable`, which map 1:1 to `binding_conflict` and `mc_unavailable`.
   - Panels must not add this series to `mh_media_session_starts_total`: (d) is the same event on both.
   - **Reconciliation (skipped closes)** holds only on the 1:1 pairs: `code="mc_unavailable"` vs `starts{outcome="declined_mc_unavailable"}` and `code="binding_conflict"` vs `starts{outcome="declined_sender_binding_conflict"}`; the shortfall is closes MH did not send (connection already gone, or the write did not complete). `code="declined"` has NO single comparator — it sums (a)–(d) above, most of which are not on `mh_media_session_starts_total`, so it normally sits ABOVE those declines.
   - `handler_released` is separate from `mh_media_meeting_teardowns_total{outcome="released"}`: that counts meetings, this counts the sessions they closed.
@@ -148,13 +148,22 @@ sum(rate(mh_webtransport_connections_total[5m]))
 
 ### `mh_jwt_validations_total`
 - **Type**: Counter
-- **Description**: Total JWT validation attempts by result, token type, and failure reason
+- **Description**: Credential validation attempts by result, token type, and failure reason. Two paths, each with its OWN reason set (zero-initialised per path, never as a cartesian product):
+  - **Client path** (`token_type="media_dial"`; story 4 MH-1, ADR-0039 §5/§8): one count per WebTransport dial whose connect envelope carried a credential, recorded once in `webtransport/close.rs::admit`. MH verifies the MC-minted `media_dial` token against the meeting's registered Ed25519 key, in a fixed order. Step → `failure_reason`:
+    - (a) over the size cap, (b) header alg not `EdDSA` or a header member that is not a valid JOSE type, an unparseable token, an empty `media_dial_token`, an empty `sub`, or a verified `meeting_id` differing from the looked-up meeting → `malformed`;
+    - (c) no registered key for the token's meeting (never registered, or released) → `no_meeting_key`;
+    - (d) signature does not verify against that meeting's key → `signature_invalid`;
+    - (e) `token_type` not `media_dial` → `wrong_type`; `exp` past, or `iat` in the future, beyond `MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS` → `expired`;
+    - (f) `aud` is another handler's `handler_id` → `aud_mismatch` (the only reason closed `WRONG_HANDLER`; every other reason closes `DECLINED`).
+    These reasons are metric- and log-only; the client sees only the close code. **An AC meeting token presented to MH lands on `no_meeting_key` or `signature_invalid`, never on `wrong_type`**: `wrong_type` fires only for a token signed with the meeting's MC key whose type is not `media_dial` (token-type confusion).
+  - **Service path** (`token_type="service"`, `MhAuthLayer` on MC→MH gRPC): `signature_invalid` | `expired` | `scope_mismatch` | `malformed`.
 - **Labels**:
-  - `result`: Validation outcome (`success`, `failure`)
-  - `token_type`: Token type (`meeting`, `service`)
-  - `failure_reason`: Reason for failure (`none`, `signature_invalid`, `expired`, `scope_mismatch`, `malformed`, `validation_failed`)
-- **Cardinality**: Low (2 x 2 x 6 = 24 max, sparse in practice)
-- **Usage**: Monitor authentication health, detect token validation failures, diagnose failure causes
+  - `result`: `success` | `failure`
+  - `token_type`: `media_dial` | `service` (`meeting` and `validation_failed` were retired by MH-1)
+  - `failure_reason`: `none` on success; otherwise the per-path set above
+- **Cardinality**: 2 success series + 6 `media_dial` failure series + 4 `service` failure series = 12. No meeting, participant or handler id.
+- **`result="success"` means "credential verified", not "admitted"**: a verified dial can still be refused afterwards — by the pending cap (`mh_media_session_starts_total{outcome="declined_pending_cap"}`) or because its meeting was released or re-keyed between verification and admission (`mh_webtransport_session_closes_total{code="declined"}` case (c)). Do not read this series as an admission count.
+- **Usage**: sustained `media_dial` `expired` = MC's TTL/3 refresh push is broken (or clock drift); any `wrong_type` = token confusion — these two need a token signed with the meeting's key, so only they are gate/rollback material. **`no_meeting_key`, `malformed` and `signature_invalid` are attacker-drivable** (decided before or at the signature check, so an unauthenticated peer moves them with a forged token; an MH restart also moves `no_meeting_key`): investigate-only, never a page or rollback on their own. A sustained `no_meeting_key` reads as a register-before-token ordering bug only once probing is excluded — it must correlate with MC-side registration failures (`mc_register_meeting_total{status="error"}`). Sustained `aud_mismatch` = clients holding a stale handler set. Triage: `docs/runbooks/mh-incident-response.md` Scenario 24.
 - **Dashboard**: MH Overview - JWT Validations by Result
 
 **PromQL example** - JWT failure rate:
@@ -167,6 +176,14 @@ sum(rate(mh_jwt_validations_total[5m]))
 ```promql
 sum by(failure_reason) (rate(mh_jwt_validations_total{result="failure"}[5m]))
 ```
+
+### `mh_media_dial_clock_skew_seconds`
+- **Type**: Gauge (config reflection, set once at startup)
+- **Description**: `MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS` — the skew MH allows on a `media_dial` token's `exp`/`iat` (ADR-0039 §5; bounds 0..=60).
+- **Labels**: `key_custody`: `operator` (single value) — an `mh_media_*` series, so it carries the media-path `key_custody=operator` label like every sibling (`docs/observability/label-taxonomy.md` §R4), e.g. `mh_media_stream_mid_frame_stall_seconds`
+- **Cardinality**: 1
+- **Usage**: read beside `failure_reason="expired"`; a value near 60 masking drift is a config smell (fix NTP).
+- **Dashboard**: MH Overview - Media-Dial Clock Skew
 
 ---
 
@@ -270,20 +287,6 @@ MH sends one `MeetingHeartbeat` per held meeting per MC-declared interval (`Regi
 
 ## RegisterMeeting Metrics
 
-### `mh_register_meeting_timeouts_total`
-- **Expected-empty**: yes — a RegisterMeeting timeout is exceptional, zero when MC↔MH is healthy
-- **Type**: Counter
-- **Description**: Count of provisional WebTransport connections disconnected because `RegisterMeeting` did not arrive within the configured timeout (R-26). Fires only from the provisional-accept timeout arm in `webtransport::connection::handle_connection`; shutdown-driven cancellation does not increment this counter.
-- **Labels**: None
-- **Cardinality**: 1
-- **Usage**: Detect MC → MH `RegisterMeeting` latency issues or client-side sequencing bugs (client connected before MC finished assignment). A non-zero value is actionable.
-
-**PromQL example** (per ADR-0029 — low-rate lifecycle counter, prefer `increase`):
-```promql
-# Count panel — how many timeouts in the window? (ADR-0029 Category A)
-increase(mh_register_meeting_timeouts_total[$__rate_interval])
-```
-
 > **R-26 RegisterMeeting receipt signal**: the user story mentions an `mh_register_meeting_total` metric. That signal is served by the transport-level `mh_grpc_requests_total{method="register_meeting"}` counter (see below) — no separate business-level counter was added, since it would duplicate call-site recordings with identical totals. Note that receipt is *not* application: `mh_media_policy_applies_total` is the signal for whether forwarding policy took effect.
 
 ---
@@ -367,7 +370,7 @@ The idempotent re-assert counts as `applied`, not `rejected_stale`: §8's cadenc
 >
 > **Sustained `no_generation` after the rollout completes means MC failed to compute a generation** for those meetings — an MC-side fault, not an MH one. The remedy is upstream: check MC's `mc_media_policy_pushes_total` and MC's `mc.register_meeting.trigger` logs for an assignment that could not be computed.
 >
-> MH still deliberately does **not** reject `policy_generation` 0. `internal.proto::RegisterMeetingRequest.policy_generation` carries the ordering constraint in full, and MC and MH roll independently: flipping the rejection in the same change would let whichever side rolls first decide, and MH-first rejects every registration from a not-yet-upgraded MC pod — no meeting registered, every client provisionally accepted and kicked at the registration timeout, which is ADR-0036 §8's opening paragraph almost verbatim, "a permanent media blackhole for that meeting until it emptied, reached through an ordinary rolling deploy". Enforcement is a separate change whose precondition — all MC pods emitting >= 1 — task 13 supplies but does not itself verify.
+> MH still deliberately does **not** reject `policy_generation` 0. `internal.proto::RegisterMeetingRequest.policy_generation` carries the ordering constraint in full, and MC and MH roll independently: flipping the rejection in the same change would let whichever side rolls first decide, and MH-first rejects every registration from a not-yet-upgraded MC pod — no meeting registered, every client dial DECLINED at accept for want of a registered key, which is ADR-0036 §8's opening paragraph almost verbatim, "a permanent media blackhole for that meeting until it emptied, reached through an ordinary rolling deploy". Enforcement is a separate change whose precondition — all MC pods emitting >= 1 — task 13 supplies but does not itself verify.
 >
 > `no_generation` is deliberately the same value the *rejection* will land on once that enforcement turns on — two eras, one value, no rename, no dashboard edit.
 
@@ -766,7 +769,7 @@ and this change did not create one.
 > | `declined_mc_unavailable` climbing | MH→MC **reachability**. Cross-check `mh_mc_notifications_total{event_type="connected",status="error"}` for the attempt-level view. Declines after the full retry budget. |
 > | `declined_mc_auth_rejected` climbing | MH's outbound credential failed: MC **refused** it, or MH could not **build** one. **MH's outbound auth — do not open MC's health.** Discriminate on the log: `"Authorization header parse failed"` present **on target `mh.grpc.mc_client`** ⇒ build failure, stay in MH; absent on that target ⇒ refusal, read MC's `mc_caller_type_rejected_total`. **The target qualifier is load-bearing** — the same message is emitted on `mh.grpc.gc_client` from the same pod, off the same service token, so an unqualified grep fails open. `mh_token_refresh_total{status="error"}` (what `MHTokenRefreshFailures` fires on), then `mh_token_refresh_failures_total` by `error_type`, are context for both and separate neither. **No timing tell** — see the entry below. |
 > | `declined_mc_endpoint_unknown` climbing | MH has no usable MC endpoint for the meeting and never reached the network. A **registration** fault, not a reachability one — check `mc_grpc_endpoint` on the `RegisterMeeting` that programmed this handler, then `mh_grpc_requests_total{method="register_meeting"}` and MC's `mc_media_policy_pushes_total`. |
-> | **Every outcome flat** while `mh_webtransport_connections_total{status="accepted"}` climbs | Connections never reach the binding boundary at all. The only remaining pre-boundary terminus is the **JWT gate** — read `mh_jwt_validations_total{result="failure"}`. |
+> | **Every outcome flat** while `mh_webtransport_connections_total{status="accepted"}` climbs | Connections never reach the binding boundary at all. The only remaining pre-boundary terminus is the **`media_dial` admission gate** — read `mh_jwt_validations_total{token_type="media_dial",result="failure"}` by `failure_reason`. |
 >
 > **A corroborating read, one row up rather than a hunt.** On the MH overview
 > dashboard, `mh_media_policy_applies_total{outcome="applied"}` sits **one row
@@ -781,7 +784,7 @@ and this change did not create one.
 
 ### `mh_media_session_starts_total`
 - **Type**: Counter
-- **Description**: Connections that attempted to start a media session, by terminal outcome — one increment per connection.
+- **Description**: Connections that attempted to start a media session, by terminal outcome — one increment per connection that reached a terminal bind decision (including the pending-cap refusal, which is decided before MC is asked). **A release while the bind is in flight is not counted here**: a removal-cause release closes the connection `handler_released`, and a `MEETING_ENDED` release whose late nonzero answer binds nothing closes it `declined` (see `mh_webtransport_session_closes_total` `code="declined"` case (c)).
 - **Labels**:
   - `outcome`: the values in the table below
   - `key_custody`: `operator` (single value)
@@ -796,6 +799,7 @@ and this change did not create one.
 | `declined_sender_binding_conflict` | The ordinal is already held by a **different** participant in that meeting; MH refused rather than overwrote. | **Should read zero forever.** Two candidate causes MH cannot separate: MC's allocator **uniqueness / non-recycling**, or MH failing to unbind a previous holder. **Check MH's unbind path for that meeting first.** |
 | `declined_mc_unavailable` | The RPC reached MC (or the network) and yielded no usable response — timeout, transport failure, or a non-auth error status. | **MC availability / network.** Declines only after the whole retry budget, unlike the two fast reachability outcomes below. |
 | `declined_mc_auth_rejected` | MH's outbound credential failed, by **either** of two routes: MC was reachable and **refused** it (`UNAUTHENTICATED` / `PERMISSION_DENIED`), **or** MH could not **build** one from the token it holds — in which case MC's reachability is unknown, MH never sent a request, and MC refused nothing. | **MH's outbound auth, not MC's health**, on both routes. Discriminate on the log line `"Authorization header parse failed"` **emitted on target `mh.grpc.mc_client`** — the qualifier is load-bearing, because MH emits the same message on `mh.grpc.gc_client` from the same pod off the same service token, so an unqualified grep is right for the wrong reason under this very fault and simply wrong when a GC-path parse failure coincides with a genuine refusal. Present on that target ⇒ build failure, stay in MH and escalate to auth-controller, because AC issued a token containing bytes illegal in an HTTP header value; absent ⇒ refusal, read MC's `mc_caller_type_rejected_total`. `mh_token_refresh_total{status="error"}` — the expression `MHTokenRefreshFailures` fires on, so a responder arriving from that alert sees the same query — then `mh_token_refresh_failures_total` broken down by `error_type` for *why*. Both are context on both routes and **separate neither** — a refresh can succeed and return a token MH cannot put on the wire, and a refresh can fail while the previously cached token still builds. An expired service token or a JWKS rotation fires the refusal route for every connection on the handler at once. |
+| `declined_pending_cap` | The dial's verified (meeting, participant) already had `MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT` connections awaiting MC's bind answer; MH closed it DECLINED without asking MC (story 4 MH-1, ADR-0039 §5). | **Expected near-zero; sustained = a client redial storm.** Read the client's redial behaviour and `dt_client_mh_connection_total`; MC is not involved. |
 | `declined_mc_endpoint_unknown` | MH has no *usable* MC endpoint for the meeting — none recorded, or one that will not parse as an endpoint — so it never reached the network. | **Registration**, not reachability. Read what the `RegisterMeeting` that programmed this handler carried in `mc_grpc_endpoint`; MH never dialled, so MC's health is not the question. Not retried: every attempt re-parses the same string. |
 
 **`started` means the loops were spawned, not that media flowed.** It is measured
@@ -864,10 +868,10 @@ event in the drop-rate numerator and corrupts the denominator identity. The two
 counters have disjoint units — sessions here, frames there.
 
 **Increment boundary, and why it is not one step later.** A connection counts here
-once it has passed the JWT gate and **entered the media-session start sequence**,
+once it has passed the `media_dial` admission gate and **entered the media-session start sequence**,
 whose first action is the MC-endpoint lookup — the same "first read of the thing
 this metric is about" boundary `mh_media_policy_applies_total` uses. Pre-boundary
-rejects (JWT failure, handshake failure, framing errors) stay on
+rejects (credential failure, handshake failure, framing errors) stay on
 `mh_jwt_validations_total` / `mh_webtransport_connections_total` alone: "this
 caller's token is bad" and "MC could not name this participant's sender" have
 different owners. Putting the boundary one step later, at "MH issued the RPC",
@@ -880,9 +884,10 @@ counter exists to close, reproduced one condition earlier.
 **Do not build a ratio against accepted connections.**
 `sum(mh_media_session_starts_total)` is **not** equal to
 `mh_webtransport_connections_total{status="accepted"}`. Connections that hang up
-during the binding await, and connections kicked by the provisional-accept
-timeout (`mh_register_meeting_timeouts_total`), pass the JWT gate and never reach
-the decision. Those two counters are that gap's home.
+during the binding await, and verified dials whose meeting was released before
+admission (closed `declined`, see `mh_webtransport_session_closes_total`), pass
+the credential gate and never reach the decision. Those counters are that gap's
+home.
 
 Cancellation during shutdown does **not** increment: this counter records
 decisions reached, and a cancelled await is not a decision.
@@ -1240,7 +1245,7 @@ egresses and no `source_streams` is rejected (`rejected_transport_inconsistent`)
 > `SourceStream` (moved from the deleted `MutedSource` by MC-B).
 
 **Who can set it.** A patched CLIENT changes nothing observable: the sender is
-bound at spawn after the JWT gate and the frame carries no sender id, so no
+bound at spawn after the `media_dial` admission gate and the frame carries no sender id, so no
 client input reaches the decision. A holder of the `service.write.mh`
 credential (granted only to MC by AC's default scopes) can set or clear a mute
 through the registration contract, which authorizes on scope alone — that

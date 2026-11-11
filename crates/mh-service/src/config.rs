@@ -45,15 +45,27 @@ pub const DEFAULT_WEBTRANSPORT_BIND_ADDRESS: &str = "0.0.0.0:4434";
 /// Default MH instance ID prefix.
 pub const DEFAULT_MH_ID_PREFIX: &str = "mh";
 
-/// Default `RegisterMeeting` timeout in seconds.
-/// Clients connecting to unregistered meetings are provisionally accepted
-/// for this window; if `RegisterMeeting` does not arrive, they are disconnected.
-pub const DEFAULT_REGISTER_MEETING_TIMEOUT_SECONDS: u64 = 15;
+/// The largest `MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS` MH boots with (ADR-0039 §5:
+/// the skew is "small, about 30 s"; the story bounds it at 60). Inclusive. The
+/// one home of the bound: the parse and its message both read it.
+pub const MAX_MEDIA_DIAL_CLOCK_SKEW_SECONDS: u64 = 60;
 
-/// Maximum allowed `RegisterMeeting` timeout in seconds (5 minutes).
-/// Capped to prevent misconfiguration from effectively disabling the
-/// provisional timeout security control (R-14).
-pub const MAX_REGISTER_MEETING_TIMEOUT_SECONDS: u64 = 300;
+/// `MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS` range, inclusive. 0 is allowed (exact
+/// clocks); above the ceiling refuses to boot. Skew is never the fix for clock
+/// drift — NTP is.
+pub const MEDIA_DIAL_CLOCK_SKEW_SECONDS_RANGE: (u64, u64) = (0, MAX_MEDIA_DIAL_CLOCK_SKEW_SECONDS);
+
+/// The largest `MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT` MH boots with.
+/// OUR choice: ADR-0039 §5 says only "a small configured value". 16 still
+/// bounds the MH→MC binding-RPC amplification one `(meeting, sub)` can cause,
+/// and sits far above the SDK's one live dial per handler ref plus one
+/// overlapping redial (the shipped value is 2).
+pub const MAX_PENDING_CONNECTIONS_PER_PARTICIPANT_CEILING: u64 = 16;
+
+/// `MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT` range, inclusive. 0 refuses to
+/// boot: it would decline every dial.
+pub const PENDING_CONNECTIONS_PER_PARTICIPANT_RANGE: (u64, u64) =
+    (1, MAX_PENDING_CONNECTIONS_PER_PARTICIPANT_CEILING);
 
 // =============================================================================
 // Forwarding-policy bounds (ADR-0036 §8 control plane)
@@ -182,7 +194,7 @@ pub const MAX_CANDIDATE_SOURCES_PER_EGRESS_CEILING: usize = 256;
 /// Meanwhile `RegisterMeeting` still answers `accepted: true` and GC keeps
 /// placing meetings here, because these bounds are resource guards and are
 /// deliberately not advertised. Symptom, discriminator and remedy are in
-/// `docs/runbooks/mh-incident-response.md` Scenario 13; the never-called
+/// `docs/runbooks/mh-incident-response.md` Scenario 27; the never-called
 /// residual is tracked in `docs/TODO.md` §Media Path Obligations.
 ///
 /// **Raising the configured value is not the remedy.** It buys time proportional to the
@@ -1739,10 +1751,14 @@ pub struct Config {
     /// Required environment variable: `AC_JWKS_URL`.
     pub ac_jwks_url: String,
 
-    /// `RegisterMeeting` arrival timeout in seconds (default: 15).
-    /// Clients connecting to unregistered meetings are provisionally accepted
-    /// for this duration; if `RegisterMeeting` does not arrive, they are disconnected.
-    pub register_meeting_timeout_seconds: u64,
+    /// `media_dial` `exp`/`iat` clock-skew tolerance (env
+    /// `MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS`, REQUIRED, 0..=60; ADR-0039 §5).
+    pub media_dial_clock_skew_seconds: u64,
+
+    /// Connections awaiting MC's bind answer allowed per `(meeting, sub)` (env
+    /// `MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT`, REQUIRED, 1..=16;
+    /// ADR-0039 §5). The excess is closed `DECLINED`.
+    pub max_pending_connections_per_participant: usize,
 
     /// Accept-time resource-exhaustion guard: the maximum number of concurrent
     /// WebTransport connections MH will accept (env `MH_MAX_CONNECTIONS`,
@@ -1889,8 +1905,12 @@ impl fmt::Debug for Config {
             )
             .field("ac_jwks_url", &self.ac_jwks_url)
             .field(
-                "register_meeting_timeout_seconds",
-                &self.register_meeting_timeout_seconds,
+                "media_dial_clock_skew_seconds",
+                &self.media_dial_clock_skew_seconds,
+            )
+            .field(
+                "max_pending_connections_per_participant",
+                &self.max_pending_connections_per_participant,
             )
             .field("max_connections", &self.max_connections)
             .field("quic_transport", &self.quic_transport)
@@ -2146,15 +2166,24 @@ pub enum ConfigError {
     },
 }
 
-/// Keys this image no longer reads, kept in the `ConfigMap` (with `optional:
-/// true` refs) for the two-deploy retirement: the previous image reads them as
-/// REQUIRED, so deleting them before the rollback floor passes this image
-/// would crash-loop a rollback. Scheduled removal: `docs/TODO.md` §Media Path
-/// Obligations, "Delete the story-3 retired config keys".
-pub const RETIRED_KEYS: [&str; 3] = [
+/// Keys this image no longer reads. Setting one is IGNORED and logged at
+/// startup, so a stale override is visible rather than silently inert.
+///
+/// Two kinds share the list:
+/// - the story-3 keys, kept in the `ConfigMap` (with `optional: true` refs) for
+///   the two-deploy retirement — the previous image reads them as REQUIRED, so
+///   deleting them before the rollback floor passes this image would
+///   crash-loop a rollback (scheduled removal: `docs/TODO.md` §Media Path
+///   Obligations, "Delete the story-3 retired config keys");
+/// - `MH_REGISTER_MEETING_TIMEOUT_SECONDS` (story 4 MH-1, deleted with the
+///   pending-before-registration path, ADR-0039 §3): it was optional with a
+///   code default and never in the `ConfigMap`, so there is nothing to keep for
+///   a rollback; it is listed only to flag an operator override.
+pub const RETIRED_KEYS: [&str; 4] = [
     "MH_STREAM_COST_AUDIO_BPS",
     "MH_STREAM_COST_VIDEO_BPS",
     "MH_MAX_MUTED_SOURCES_PER_MEETING",
+    "MH_REGISTER_MEETING_TIMEOUT_SECONDS",
 ];
 
 /// Read and validate the shared `media-codec-profile` (story 3 R-23).
@@ -2333,11 +2362,39 @@ impl Config {
             ));
         }
 
-        let register_meeting_timeout_seconds = vars
-            .get("MH_REGISTER_MEETING_TIMEOUT_SECONDS")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_REGISTER_MEETING_TIMEOUT_SECONDS)
-            .min(MAX_REGISTER_MEETING_TIMEOUT_SECONDS);
+        // ---------------------------------------------------------------------
+        // `media_dial` admission (story 4 MH-1, ADR-0039 §5). REQUIRED; out of
+        // range refuses, never clamps.
+        // ---------------------------------------------------------------------
+        let media_dial_clock_skew_seconds = parse_in_range(
+            "MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS",
+            vars.get("MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS".to_string())
+                })?,
+            MEDIA_DIAL_CLOCK_SKEW_SECONDS_RANGE,
+            "unreachable (the floor is 0)",
+            "media_dial tokens would stay usable that long past expiry; fix clock drift with \
+             NTP, never by raising the skew (set it in infra/services/mh-service/config.env)",
+        )?;
+        let max_pending_connections_per_participant = parse_in_range(
+            "MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT",
+            vars.get("MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar(
+                        "MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT".to_string(),
+                    )
+                })?,
+            PENDING_CONNECTIONS_PER_PARTICIPANT_RANGE,
+            "every client dial would be declined (set it in \
+             infra/services/mh-service/config.env)",
+            "one participant could amplify MH->MC binding RPCs that far (ADR-0039 §5 asks for a \
+             small value; set it in infra/services/mh-service/config.env)",
+        )?;
+        let max_pending_connections_per_participant = bound_to_usize(
+            "MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT",
+            max_pending_connections_per_participant,
+        )?;
 
         // ---------------------------------------------------------------------
         // ADR-0036 §1 explicit QUIC transport parameters, plus the termination
@@ -2821,7 +2878,8 @@ impl Config {
             grpc_advertise_address,
             webtransport_advertise_address,
             ac_jwks_url,
-            register_meeting_timeout_seconds,
+            media_dial_clock_skew_seconds,
+            max_pending_connections_per_participant,
             max_connections,
             quic_transport,
             stream_path,
@@ -2973,6 +3031,14 @@ mod tests {
             (
                 "MH_STREAM_MID_FRAME_STALL_MS".to_string(),
                 "1000".to_string(),
+            ),
+            (
+                "MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS".to_string(),
+                "30".to_string(),
+            ),
+            (
+                "MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT".to_string(),
+                "2".to_string(),
             ),
             (
                 "MH_POD_MEMORY_LIMIT_BYTES".to_string(),
@@ -3578,10 +3644,8 @@ mod tests {
             config.ac_jwks_url,
             "http://localhost:8082/.well-known/jwks.json"
         );
-        assert_eq!(
-            config.register_meeting_timeout_seconds,
-            DEFAULT_REGISTER_MEETING_TIMEOUT_SECONDS
-        );
+        assert_eq!(config.media_dial_clock_skew_seconds, 30);
+        assert_eq!(config.max_pending_connections_per_participant, 2);
         // `max_connections` is REQUIRED and has no default to assert; its
         // required-ness is covered by `missing_max_connections_is_a_loud_refusal`.
         assert_eq!(config.max_connections, 500);
@@ -3787,31 +3851,77 @@ mod tests {
         );
     }
 
+    // -- story 4 MH-1: media_dial admission keys ----------------------------
+
+    /// Both keys are REQUIRED (a missing one names itself), refuse out of
+    /// range naming the key, refuse non-numeric, and accept the inclusive
+    /// bounds. Boundaries come from the one-home consts.
     #[test]
-    fn test_register_meeting_timeout_custom_value() {
+    fn media_dial_admission_keys_are_required_and_bounded() {
+        // ADR-0039 §5 / story 4: the skew is startup-validated to <= 60. A
+        // literal, so raising the const cannot keep this green.
+        assert_eq!(MAX_MEDIA_DIAL_CLOCK_SKEW_SECONDS, 60);
+        assert_required("MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS");
+        assert_required("MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT");
+
+        let load = |key: &str, value: &str| {
+            let mut vars = base_vars();
+            vars.insert(key.to_string(), value.to_string());
+            Config::from_vars(&vars)
+        };
+        let skew = "MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS";
+        for ok in ["0", "7", &MAX_MEDIA_DIAL_CLOCK_SKEW_SECONDS.to_string()] {
+            let config = load(skew, ok).expect("in range");
+            assert_eq!(config.media_dial_clock_skew_seconds.to_string(), ok);
+        }
+        let cap = "MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT";
+        for ok in [
+            "1",
+            "3",
+            &MAX_PENDING_CONNECTIONS_PER_PARTICIPANT_CEILING.to_string(),
+        ] {
+            let config = load(cap, ok).expect("in range");
+            assert_eq!(
+                config.max_pending_connections_per_participant.to_string(),
+                ok
+            );
+        }
+        let refusals = [
+            (skew, (MAX_MEDIA_DIAL_CLOCK_SKEW_SECONDS + 1).to_string()),
+            (skew, "thirty".to_string()),
+            (skew, "-1".to_string()),
+            (cap, "0".to_string()),
+            (
+                cap,
+                (MAX_PENDING_CONNECTIONS_PER_PARTICIPANT_CEILING + 1).to_string(),
+            ),
+            (cap, "two".to_string()),
+        ];
+        for (key, value) in refusals {
+            match load(key, &value) {
+                Err(ConfigError::InvalidValue(msg)) => {
+                    assert!(
+                        msg.contains(key),
+                        "{key}={value}: message names the key: {msg}"
+                    );
+                }
+                other => panic!("{key}={value}: expected InvalidValue, got {other:?}"),
+            }
+        }
+    }
+
+    /// The retired registration timeout is ignored and reported, never read.
+    #[test]
+    fn register_meeting_timeout_is_retired() {
         let mut vars = base_vars();
         vars.insert(
             "MH_REGISTER_MEETING_TIMEOUT_SECONDS".to_string(),
             "30".to_string(),
         );
-
-        let config = Config::from_vars(&vars).expect("Config should load successfully");
-        assert_eq!(config.register_meeting_timeout_seconds, 30);
-    }
-
-    #[test]
-    fn test_register_meeting_timeout_clamped_to_max() {
-        let mut vars = base_vars();
-        vars.insert(
-            "MH_REGISTER_MEETING_TIMEOUT_SECONDS".to_string(),
-            "999999".to_string(),
-        );
-
-        let config = Config::from_vars(&vars).expect("Config should load successfully");
-        assert_eq!(
-            config.register_meeting_timeout_seconds,
-            MAX_REGISTER_MEETING_TIMEOUT_SECONDS,
-        );
+        let config = Config::from_vars(&vars).expect("a retired key never refuses boot");
+        assert!(config
+            .retired_keys_present
+            .contains(&"MH_REGISTER_MEETING_TIMEOUT_SECONDS"));
     }
 
     // -- ADR-0036 §8 policy bounds ------------------------------------------

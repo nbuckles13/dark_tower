@@ -420,6 +420,18 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
         SHARED_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
+    // Story 4 MH-1 media_dial admission (ADR-0039 §5): the exp/iat skew
+    // (0 is legal: exact clocks) and the per-(meeting, sub) pending cap.
+    (
+        "MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS",
+        SHARED_CONFIGMAP,
+        ValueShape::NonNegativeInteger,
+    ),
+    (
+        "MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
     // Story 3 shared media codec profile: the four keys MH reads.
     (
         "MEDIA_VIDEO_MAX_BITRATE_BPS",
@@ -649,7 +661,12 @@ const REMOVED_KEYS: &[&str] = &[
     "MEDIA_VIDEO_MIN_KEYFRAME_INTERVAL_MS",
 ];
 
-/// None of [`REMOVED_KEYS`] is an env entry of THIS pod's MH container, and
+/// Keys story 4 MH-1 retired with the pending-before-registration path
+/// (ADR-0039 §3): the RegisterMeeting provisional-accept timeout. MH lists it
+/// in `RETIRED_KEYS` (ignored if set); the manifests must not carry it.
+const RETIRED_BY_MH_1: &[&str] = &["MH_REGISTER_MEETING_TIMEOUT_SECONDS"];
+
+/// None of [`REMOVED_KEYS`] (nor [`RETIRED_BY_MH_1`]) is an env entry of THIS pod's MH container, and
 /// the three MH keys are absent from its live `mh-service-config` generation.
 /// The minimum interval's absence from the shared profile generation (it
 /// moved to MC's own ConfigMap as `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`, story 3
@@ -684,6 +701,19 @@ fn assert_removed_keys_absent(pod: &Value, mh_cm: &Value) {
             "pod {pod_name}: env {key} is present, but story 3 amendment 4 removed it from MH \
              (R-23). Remove the ref from the MH template infra/services/mh-service/deployment.yaml \
              (and the key from config.env, if it is an MH key)."
+        );
+    }
+    for key in RETIRED_BY_MH_1 {
+        assert!(
+            !env.contains(key),
+            "pod {pod_name}: env {key} is present, but story 4 MH-1 deleted the \
+             pending-before-registration path it configured (ADR-0039 §3). Remove the ref from \
+             infra/services/mh-service/deployment.yaml."
+        );
+        assert!(
+            mh_cm.pointer("/data").and_then(|d| d.get(*key)).is_none(),
+            "live ConfigMap {SHARED_CONFIGMAP} still holds {key}, retired by story 4 MH-1. \
+             Remove it from infra/services/mh-service/config.env."
         );
     }
     for key in REMOVED_KEYS.iter().filter(|key| key.starts_with("MH_")) {

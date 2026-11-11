@@ -13,12 +13,14 @@
 //! # What this handler does
 //!
 //! 1. validates the registration RECORD (ids, endpoint, a non-zero heartbeat
-//!    interval), rejecting the whole request before any upsert on a fault;
+//!    interval, a 32-byte `media_dial` public key), rejecting the whole
+//!    request before any upsert on a fault;
 //! 2. validates the forwarding POLICY (pure: nothing touched yet);
 //! 3. upserts the record — even when the policy was refused, which then
 //!    becomes the meeting's `apply_refusal` (ADR-0039 §1: heartbeats start at
-//!    the upsert, so a first-apply refusal still reports 0 plus its refusal) —
-//!    and drains/promotes pending WebTransport connections;
+//!    the upsert, so a first-apply refusal still reports 0 plus its refusal)
+//!    — installing the meeting's `media_dial` key with it (ADR-0039 §5; the
+//!    pending-before-registration path is deleted, §3);
 //! 4. on a valid policy, hands it to the session actor over the
 //!    **config-apply** mailbox, separate from the bounded lifecycle mailbox;
 //! 5. answers with what MH's live forward path **actually reflects**.
@@ -52,6 +54,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::auth::MediaDialKey;
 use crate::config::PolicyLimits;
 use crate::observability::metrics::{self, GrpcMethod, MeetingTeardownOutcome, PolicyApplyOutcome};
 use crate::routing::MeetingPolicy;
@@ -199,6 +202,26 @@ impl MediaHandlerService for MhMediaService {
                 "heartbeat_interval_ms must be non-zero",
             ));
         }
+        // A RECORD reject (`RegisterMeetingRequest.media_dial_public_key`,
+        // ADR-0039 §5): the meeting's PUBLIC dial-verification key is exactly
+        // 32 bytes or the whole request is refused before the upsert, so the
+        // prior key (if any) stays in force. No bytes and no length reach the
+        // log or the status.
+        let Some(media_dial_key) = MediaDialKey::from_wire(&req.media_dial_public_key) else {
+            metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "error");
+            tracing::warn!(
+                target: "mh.grpc.service",
+                key_custody = KEY_CUSTODY_OPERATOR,
+                reason = "media_dial_key_length",
+                meeting_id = %req.meeting_id,
+                mc_id = %req.mc_id,
+                "Rejecting registration: media_dial_public_key is not exactly 32 bytes (an MC \
+                 below story 4 MC-D sends none); nothing recorded"
+            );
+            return Err(Status::invalid_argument(
+                "media_dial_public_key must be exactly 32 bytes",
+            ));
+        };
 
         // -------------------------------------------------------------------
         // Policy boundary. Everything below reads policy-bearing fields, so
@@ -223,7 +246,7 @@ impl MediaHandlerService for MhMediaService {
         // still take over ownership, or it could never release the meeting
         // (`internal.proto`, `EndMeetingRequest`). Do not move this behind
         // `apply_policy`.
-        let promoted = match self
+        match self
             .session_manager
             .register_meeting(
                 req.meeting_id.clone(),
@@ -232,14 +255,15 @@ impl MediaHandlerService for MhMediaService {
                     mc_grpc_endpoint: req.mc_grpc_endpoint.clone(),
                     heartbeat_interval: Duration::from_millis(u64::from(req.heartbeat_interval_ms)),
                     registered_at: Instant::now(),
+                    media_dial_key,
                 },
                 policy_rejection,
                 self.policy_limits.max_registered_meetings,
             )
             .await
         {
-            Ok(promoted) => promoted,
-            // Refused whole: nothing upserted, promoted or applied, so this is
+            Ok(()) => {}
+            // Refused whole: nothing upserted or applied, so this is
             // the ONLY policy outcome this registration records — never also
             // `no_generation` or an apply outcome — and the request is an error,
             // not a success. The actor logged the WARN with the counts.
@@ -251,7 +275,23 @@ impl MediaHandlerService for MhMediaService {
                      ({held} held); new meeting refused"
                 )));
             }
-        };
+            // The session actor is gone: nothing recorded (no dial key). An
+            // error MC's push retries, never a silent "registered". Not a
+            // policy outcome: the policy was never considered.
+            Err(RegisterRefusal::ActorUnavailable) => {
+                metrics::record_grpc_request(GrpcMethod::RegisterMeeting, "error");
+                tracing::warn!(
+                    target: "mh.grpc.service",
+                    key_custody = KEY_CUSTODY_OPERATOR,
+                    reason = "session_actor_unavailable",
+                    meeting_id = %req.meeting_id,
+                    "Rejecting registration: the session actor is unavailable; nothing recorded"
+                );
+                return Err(Status::unavailable(
+                    "media handler session state unavailable",
+                ));
+            }
+        }
 
         let policy = match validated {
             Ok(policy) => policy,
@@ -268,7 +308,6 @@ impl MediaHandlerService for MhMediaService {
                     policy_apply_outcome = rejection.outcome().as_label(),
                     egress_stream_count = req.egress_streams.len(),
                     source_stream_count = req.source_streams.len(),
-                    promoted_pending_count = promoted.len(),
                     "Rejecting registration policy; record upserted, live policy unchanged, \
                      heartbeats report the refusal"
                 );
@@ -290,8 +329,8 @@ impl MediaHandlerService for MhMediaService {
             // but its precondition is MC emitting >= 1, which lands at **story
             // task 13**. Enforcing the rejection before that rejects EVERY
             // registration MC sends for the whole window: no meeting is ever
-            // registered, every client is provisionally accepted and kicked at
-            // the registration timeout — ADR-0036 §8's opening paragraph almost
+            // registered and no client can ever be admitted (no meeting holds a
+            // dial key) — ADR-0036 §8's opening paragraph almost
             // verbatim, "a permanent media blackhole for that meeting until it
             // emptied, reached through an ordinary rolling deploy". Enforcing
             // this MUST out of order reintroduces the exact failure §8 exists
@@ -304,9 +343,8 @@ impl MediaHandlerService for MhMediaService {
             // loud outage for a silent one.
             //
             // So: install nothing, advance nothing, reject nothing. The
-            // registration still upserts and still promotes pending
-            // connections. `applied_generation` stays at whatever is genuinely
-            // installed — which for an already-programmed meeting is its prior
+            // registration still upserts the record (key included).
+            // `applied_generation` stays at whatever is genuinely installed — which for an already-programmed meeting is its prior
             // generation, NOT 0.
             if !policy.edges.is_empty() {
                 tracing::warn!(
@@ -388,7 +426,6 @@ impl MediaHandlerService for MhMediaService {
             key_custody = KEY_CUSTODY_OPERATOR,
             meeting_id = %req.meeting_id,
             mc_id = %req.mc_id,
-            promoted_pending_count = promoted.len(),
             policy_apply_outcome = outcome.as_label(),
             received_generation,
             applied_generation = response.applied_generation,
@@ -437,8 +474,8 @@ impl MediaHandlerService for MhMediaService {
         // any number outside `ReleaseCause` are refused BEFORE any state
         // change and before the ownership check, so a malformed request is
         // INVALID_ARGUMENT, never FAILED_PRECONDITION. Generic status: no id
-        // is echoed. The cause decides only the fate of pending connections
-        // and where the release is counted, never WHETHER MH releases.
+        // is echoed. The cause decides only the fate of connections awaiting
+        // their bind and where the release is counted, never WHETHER MH releases.
         let kind = ReleaseKind::of(req.cause);
         if kind == ReleaseKind::NoCause {
             metrics::record_meeting_teardown(MeetingTeardownOutcome::RejectedInvalidCause);
@@ -572,8 +609,9 @@ impl From<ApplyOutcome> for PolicyApplyOutcome {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::auth::MediaDialKey;
     use crate::routing::MeetingKey;
-    use crate::session::{PendingConnection, SessionManagerActor};
+    use crate::session::{AdmitOutcome, ConnectionEntry, SessionManagerActor};
     // One fixture home for all three test sites that build these messages —
     // see `mh_test_utils::media_policy` for why.
     use mh_test_utils::media_policy::{egress, register_request};
@@ -632,7 +670,7 @@ mod tests {
             policy_generation: 0,
             source_streams: Vec::new(),
             heartbeat_interval_ms: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL_MS,
-            media_dial_public_key: Vec::new(),
+            media_dial_public_key: mh_test_utils::media_dial::meeting_public_key(),
         })
     }
 
@@ -700,16 +738,29 @@ mod tests {
 
         // An ACTIVE connection on the meeting, whose close token we keep.
         let close = tokio_util::sync::CancellationToken::new();
-        sm.add_connection(
+        sm.admit_connection(
             "m-1",
             crate::session::ConnectionEntry {
                 connection_id: "conn-1".to_string(),
                 participant_id: "user-1".to_string(),
                 connected_at: Instant::now(),
                 close: close.clone(),
+                is_bound: false,
             },
+            MediaDialKey::from_wire(&mh_test_utils::media_dial::meeting_public_key()).unwrap(),
+            2,
         )
         .await;
+        // Bound, so the release closes it whatever the cause (ADR-0039 §6).
+        assert_eq!(
+            sm.bind_connection(
+                "m-1",
+                "conn-1",
+                crate::routing::SenderId::from_wire(9).unwrap()
+            )
+            .await,
+            crate::session::BindOutcome::Bound
+        );
 
         // PRECONDITIONS: everything the release must remove is present.
         let before = sm.routing_snapshot();
@@ -1267,19 +1318,26 @@ mod tests {
     async fn identical_reassert_is_a_true_data_plane_no_op() {
         let (svc, sm) = make_service();
 
-        sm.add_pending_connection(PendingConnection {
-            connection_id: "conn-1".to_string(),
-            meeting_id: "m-1".to_string(),
-            participant_id: "user-1".to_string(),
-            connected_at: Instant::now(),
-            close: tokio_util::sync::CancellationToken::new(),
-        })
-        .await;
-
         let streams = vec![egress(1, 5, 0, 5)];
         svc.register_meeting(make_policy_request("m-1", 3, streams.clone()))
             .await
             .unwrap();
+        assert_eq!(
+            sm.admit_connection(
+                "m-1",
+                ConnectionEntry {
+                    connection_id: "conn-1".to_string(),
+                    participant_id: "user-1".to_string(),
+                    connected_at: Instant::now(),
+                    close: tokio_util::sync::CancellationToken::new(),
+                    is_bound: false,
+                },
+                MediaDialKey::from_wire(&mh_test_utils::media_dial::meeting_public_key()).unwrap(),
+                2,
+            )
+            .await,
+            AdmitOutcome::Admitted
+        );
 
         let snapshot_before = sm.routing_snapshot();
         let connections_before = sm.active_connection_count().await;
@@ -1554,7 +1612,7 @@ mod tests {
         );
         assert!(
             sm.is_meeting_registered("m-1").await,
-            "the registration itself is still accepted, so pending connections are promoted"
+            "the registration itself is still accepted (record and key upserted)"
         );
     }
 
@@ -2134,33 +2192,61 @@ mod tests {
         assert!(err.message().contains("mc_grpc_endpoint"));
     }
 
+    /// `media_dial_public_key` is a RECORD field: exactly 32 bytes or the whole
+    /// request is refused `INVALID_ARGUMENT` before the upsert (nothing
+    /// recorded, the prior key stays); 32 is accepted and installed.
     #[tokio::test]
-    async fn test_register_meeting_promotes_pending_connections() {
+    async fn the_media_dial_key_is_exactly_32_bytes_or_nothing_is_recorded() {
         let (svc, sm) = make_service();
-
-        for (conn, user) in [("conn-1", "user-1"), ("conn-2", "user-2")] {
-            sm.add_pending_connection(PendingConnection {
-                connection_id: conn.to_string(),
-                meeting_id: "meeting-1".to_string(),
-                participant_id: user.to_string(),
-                connected_at: Instant::now(),
-                close: tokio_util::sync::CancellationToken::new(),
-            })
-            .await;
+        for len in [0_usize, 31, 33] {
+            let mut req =
+                make_register_request("meeting-1", "mc-1", "http://mc:50052").into_inner();
+            req.media_dial_public_key = vec![7; len];
+            let err = svc.register_meeting(Request::new(req)).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{len} bytes");
+            assert!(
+                err.message().contains("media_dial_public_key"),
+                "{len} bytes"
+            );
+            assert!(
+                !sm.is_meeting_registered("meeting-1").await,
+                "{len} bytes: nothing recorded"
+            );
         }
-        assert_eq!(sm.active_connection_count().await, 0);
+        let mut req = make_register_request("meeting-1", "mc-1", "http://mc:50052").into_inner();
+        req.media_dial_public_key = vec![7; 32];
+        svc.register_meeting(Request::new(req)).await.unwrap();
+        assert_eq!(
+            sm.media_dial_key("meeting-1").await,
+            MediaDialKey::from_wire(&[7; 32])
+        );
 
-        let resp = svc
-            .register_meeting(make_register_request(
-                "meeting-1",
-                "mc-1",
-                "http://mc:50052",
-            ))
-            .await
-            .unwrap();
+        // A later record reject leaves the installed key in force.
+        let mut bad = make_register_request("meeting-1", "mc-1", "http://mc:50052").into_inner();
+        bad.media_dial_public_key = vec![8; 31];
+        svc.register_meeting(Request::new(bad)).await.unwrap_err();
+        assert_eq!(
+            sm.media_dial_key("meeting-1").await,
+            MediaDialKey::from_wire(&[7; 32])
+        );
+    }
 
-        assert!(resp.into_inner().accepted);
-        assert_eq!(sm.active_connection_count().await, 2);
+    /// The key is installed by the registration UPSERT, not the policy apply: a
+    /// registration whose POLICY is refused still installs its key, and the
+    /// refusal never rolls it back.
+    #[tokio::test]
+    async fn a_refused_policy_apply_still_installs_the_key() {
+        let (svc, sm) = make_service();
+        let mut req = mixed_request("m-1", 2);
+        req.source_streams[0].disposition =
+            proto_gen::dark_tower::internal::v1::SourceDisposition::Unspecified as i32;
+        req.media_dial_public_key = vec![5; 32];
+        let err = svc.register_meeting(Request::new(req)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            sm.media_dial_key("m-1").await,
+            MediaDialKey::from_wire(&[5; 32])
+        );
     }
 
     #[tokio::test]

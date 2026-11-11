@@ -19,8 +19,8 @@
 //! # Why a separate file from `webtransport_integration.rs`
 //!
 //! These 3 cases exercise the accept-loop *itself* (capacity check, status
-//! label emission on spawn exit) — distinct from the JWT-enforcement /
-//! provisional-timer / MC-notification cases that live in
+//! label emission on spawn exit) — distinct from the media_dial admission /
+//! MC-notification cases that live in
 //! `webtransport_integration.rs`. The two files share `AcceptLoopRig`
 //! infrastructure but have orthogonal test surfaces.
 
@@ -36,14 +36,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::observability::testing::MetricAssertion;
-use mh_service::auth::MhJwtValidator;
 use mh_service::grpc::McClient;
 use mh_service::session::{MeetingRegistration, SessionManagerHandle};
 
 use test_common::accept_loop_rig::AcceptLoopRig;
-use test_common::jwks_rig::JwksRig;
 use test_common::test_token_receiver;
-use test_common::tokens::{mint_expired_meeting_token, mint_meeting_token};
+use test_common::tokens::mint_dial_token;
 use test_common::wt_client::{connect_and_open_bi, write_mh_connect};
 
 // ---------------------------------------------------------------------------
@@ -54,19 +52,16 @@ fn make_mc_client() -> Arc<McClient> {
     Arc::new(McClient::new(test_token_receiver()))
 }
 
-async fn start_rig(
-    session_manager: SessionManagerHandle,
-    jwks: &JwksRig,
-    max_connections: usize,
-) -> AcceptLoopRig {
-    let jwt_validator = Arc::new(MhJwtValidator::new(jwks.jwks_client(), 300));
+/// This rig's handler id — the `aud` its dial tokens carry.
+const HANDLER_ID: &str = "mh-accept-loop-test";
+
+async fn start_rig(session_manager: SessionManagerHandle, max_connections: usize) -> AcceptLoopRig {
     AcceptLoopRig::start_with(
-        jwt_validator,
         session_manager,
         make_mc_client(),
-        "mh-accept-loop-test".to_string(),
+        HANDLER_ID.to_string(),
         max_connections,
-        Duration::from_secs(30),
+        test_common::accept_loop_rig::DEPLOYED_ADMISSION,
     )
     .await
 }
@@ -115,10 +110,9 @@ async fn accept_loop_emits_accepted_status_and_handshake_observation_on_happy_pa
     //     between the accept-path set at server.rs:217 and the spawned
     //     handler's fetch_sub+set at server.rs:200-202 on handler exit)
     //   - `mh_webtransport_handshake_duration_seconds` at-least-one observation
-    let jwks = JwksRig::start(1, "mh-accept-loop-ok").await;
     let session_manager =
         SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding());
-    let rig = start_rig(session_manager.clone(), &jwks, 2).await;
+    let rig = start_rig(session_manager.clone(), 2).await;
 
     session_manager
         .register_meeting(
@@ -128,6 +122,7 @@ async fn accept_loop_emits_accepted_status_and_handshake_observation_on_happy_pa
                 mc_grpc_endpoint: "http://localhost:1".to_string(),
                 heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
+                media_dial_key: mh_test_utils::media_dial::meeting_dial_key(),
             },
             None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
@@ -136,7 +131,7 @@ async fn accept_loop_emits_accepted_status_and_handshake_observation_on_happy_pa
         .expect("a test registration is below the registration cap");
 
     let snap = MetricAssertion::snapshot();
-    let token = mint_meeting_token(&jwks.keypair, "meeting-accept-ok", "user-accept-ok");
+    let token = mint_dial_token("meeting-accept-ok", "user-accept-ok", HANDLER_ID);
     let (_conn, _send, _recv) = connect_and_send_jwt(&rig.url, &token).await;
 
     // Hold the connection live until after the gauge assertion.
@@ -165,10 +160,9 @@ async fn accept_loop_emits_rejected_status_when_at_capacity() {
     // and hold it live. Open conn #2 — accept_loop sees `active_connections
     // >= max_connections` at server.rs:166, emits `status=rejected`, and
     // drops `incoming_session` without accepting.
-    let jwks = JwksRig::start(2, "mh-accept-loop-rejected").await;
     let session_manager =
         SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding());
-    let rig = start_rig(session_manager.clone(), &jwks, 1).await;
+    let rig = start_rig(session_manager.clone(), 1).await;
 
     session_manager
         .register_meeting(
@@ -178,6 +172,7 @@ async fn accept_loop_emits_rejected_status_when_at_capacity() {
                 mc_grpc_endpoint: "http://localhost:1".to_string(),
                 heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
                 registered_at: Instant::now(),
+                media_dial_key: mh_test_utils::media_dial::meeting_dial_key(),
             },
             None,
             mh_test_utils::admission::fixture_policy_limits().max_registered_meetings,
@@ -186,7 +181,7 @@ async fn accept_loop_emits_rejected_status_when_at_capacity() {
         .expect("a test registration is below the registration cap");
 
     let snap = MetricAssertion::snapshot();
-    let token1 = mint_meeting_token(&jwks.keypair, "meeting-rejected", "user-1");
+    let token1 = mint_dial_token("meeting-rejected", "user-1", HANDLER_ID);
 
     // Conn #1 — this one must land. Hold it live for the rest of the test.
     let (_conn1, _send1, _recv1) = connect_and_send_jwt(&rig.url, &token1).await;
@@ -216,16 +211,16 @@ async fn accept_loop_emits_rejected_status_when_at_capacity() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn accept_loop_emits_error_status_when_handler_returns_err() {
-    // Valid handshake to the WT layer but invalid JWT — handler reaches step
-    // 4 and returns `Err(MhError::JwtValidation(_))`. accept_loop emits
-    // `status=error` when the spawned task exits with Err at server.rs:205.
-    let jwks = JwksRig::start(3, "mh-accept-loop-error").await;
+    // Valid handshake to the WT layer but a refused credential — a correctly
+    // signed dial token for a meeting this handler does not hold (admission
+    // step c) — so the handler returns `Err(MhError::JwtValidation(_))`.
+    // accept_loop emits `status=error` when the spawned task exits with Err.
     let session_manager =
         SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding());
-    let rig = start_rig(session_manager.clone(), &jwks, 8).await;
+    let rig = start_rig(session_manager.clone(), 8).await;
 
     let snap = MetricAssertion::snapshot();
-    let token = mint_expired_meeting_token(&jwks.keypair, "meeting-error");
+    let token = mint_dial_token("meeting-error", "user-error", HANDLER_ID);
     let (_conn, _send, _recv) = connect_and_send_jwt(&rig.url, &token).await;
 
     // Wait for the spawned handler to complete.
@@ -234,14 +229,12 @@ async fn accept_loop_emits_error_status_when_handler_returns_err() {
     snap.counter("mh_webtransport_connections_total")
         .with_labels(&[("status", "error")])
         .assert_delta(1);
-    // JWT was well-formed enough to be parsed; validation fails with
-    // `failure_reason=validation_failed` for meeting tokens (only label
-    // emitted on the meeting-path failure branch per connection.rs:122).
+    // The token parsed; admission refuses it at the key lookup.
     snap.counter("mh_jwt_validations_total")
         .with_labels(&[
             ("result", "failure"),
-            ("token_type", "meeting"),
-            ("failure_reason", "validation_failed"),
+            ("token_type", "media_dial"),
+            ("failure_reason", "no_meeting_key"),
         ])
         .assert_delta(1);
     assert_eq!(

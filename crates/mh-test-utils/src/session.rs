@@ -45,6 +45,7 @@ pub async fn apply_registered(sm: &SessionManagerHandle, policy: MeetingPolicy) 
             mc_grpc_endpoint: TEST_MC_ENDPOINT.to_string(),
             heartbeat_interval: Duration::from_millis(u64::from(TEST_HEARTBEAT_INTERVAL_MS)),
             registered_at: Instant::now(),
+            media_dial_key: crate::media_dial::meeting_dial_key(),
         },
         None,
         limits.max_registered_meetings,

@@ -403,7 +403,17 @@ async fn test_mh_refuses_admission_past_the_deployed_stream_ceiling() {
             .expect("MC always sends a media_handler_set")
             .handlers
         {
-            media.push(mc_session::mh_connect(&server.media_handler_url, &gc_join.token).await);
+            // The credential is this member's MC-minted `media_dial` token from
+            // the same set entry (ADR-0039 §5; MH admits on nothing else).
+            assert!(
+                !server.media_dial_token.is_empty(),
+                "JOIN-FANOUT: participant {i}'s MediaHandlerSet entry for {} carries no \
+                 media_dial token — MC mints one for every member (MC defect)",
+                server.media_handler_url
+            );
+            media.push(
+                mc_session::mh_connect(&server.media_handler_url, &server.media_dial_token).await,
+            );
         }
         ps.push(Participant {
             session,

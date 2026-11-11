@@ -31,22 +31,28 @@
 //! two workloads beyond the sequencing the single `select!` loop already
 //! provides.
 //!
-//! # Notification
+//! # Client admission (story 4 MH-1, ADR-0039 §3/§5)
 //!
-//! Uses `tokio::sync::Notify` per meeting to wake pending connections
-//! when `RegisterMeeting` arrives. The actor owns the Notify; callers
-//! receive an `Arc<Notify>` clone for awaiting.
+//! There is no pending-before-registration state. A meeting's `media_dial`
+//! verification key arrives with its registration ([`MeetingRegistration`]);
+//! a dial for a meeting MH holds no key for is declined at accept, so nothing
+//! is ever parked waiting for a `RegisterMeeting`. An admitted connection is
+//! an entry in `active_connections` from [`SessionManagerHandle::admit_connection`]
+//! (which enforces the per-`(meeting, sub)` cap on connections still awaiting
+//! their bind) until it is removed; [`SessionManagerHandle::bind_connection`]
+//! binds it in ONE actor turn that also re-checks the meeting is still held.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 pub mod admission;
 pub mod heartbeat;
 pub mod release;
 
+use crate::auth::MediaDialKey;
 use crate::media::downlink::DownlinkSender;
 use crate::media::edge_runtime::EdgeContext;
 use crate::media::forward::EgressQueue;
@@ -106,44 +112,64 @@ pub struct MeetingRegistration {
     pub heartbeat_interval: Duration,
     /// When the meeting was registered.
     pub registered_at: Instant,
+    /// The meeting's PUBLIC `media_dial` verification key
+    /// (`RegisterMeetingRequest.media_dial_public_key`, ADR-0039 §5). Installed
+    /// by the registration UPSERT, never by the policy apply, so a refused
+    /// apply neither blocks nor rolls it back; the last record-valid
+    /// registration's key wins (the "MH does not verify meeting ownership"
+    /// residual). Its `Debug` renders no bytes.
+    pub media_dial_key: MediaDialKey,
 }
 
-/// An active participant connection.
+/// An admitted participant connection: from admission (credential verified)
+/// until removal. Awaiting its bind while `is_bound` is false.
 #[derive(Debug, Clone)]
 pub struct ConnectionEntry {
     /// Unique connection identifier.
     pub connection_id: String,
-    /// Participant ID (from JWT `sub` claim).
+    /// Participant ID (the verified `media_dial` token's `sub`).
     pub participant_id: String,
     /// When the connection was established.
     pub connected_at: Instant,
-    /// Cancelling this closes the connection. `EndMeeting` release fires it for
-    /// every ACTIVE connection of the released meeting (story 2 R-20); the
-    /// connection task owns the other end and tears itself down. A child of the
-    /// server shutdown token, so shutdown still reaches it.
+    /// Cancelling this closes the connection with `HANDLER_RELEASED`. A
+    /// release fires it for every BOUND connection of the released meeting
+    /// (story 2 R-20), and for connections still awaiting their bind only when
+    /// the handler is leaving ([`ReleaseKind::closes_awaiting_bind`]). The
+    /// connection task owns the other end and tears itself down. A child of
+    /// the server shutdown token, so shutdown still reaches it.
     pub close: CancellationToken,
+    /// Whether MC's bind answer has been applied. `false` from admission until
+    /// [`SessionManagerHandle::bind_connection`] binds it: the entries with
+    /// `false` ARE the connections counted against the per-`(meeting, sub)`
+    /// pending cap, so the count cannot leak — every exit removes the entry.
+    pub is_bound: bool,
 }
 
-/// A pending connection awaiting `RegisterMeeting`.
-#[derive(Debug, Clone)]
-pub struct PendingConnection {
-    /// Unique connection identifier.
-    pub connection_id: String,
-    /// Meeting ID from the JWT.
-    pub meeting_id: String,
-    /// Participant ID (from JWT `sub` claim).
-    pub participant_id: String,
-    /// When the connection was established.
-    pub connected_at: Instant,
-    /// Carried into the [`ConnectionEntry`] this becomes on promotion, so a
-    /// promoted connection is closable by release like any other. While the
-    /// connection is still PENDING, release fires it only for a cause under
-    /// which the handler is LEAVING the meeting ([`ReleaseKind::closes_pending`]:
-    /// the connection is then closed with `HANDLER_RELEASED`). On
-    /// `MEETING_ENDED` it is left to the registration timeout
-    /// (`internal.proto`, `EndMeetingRequest`) because one may be a re-join
-    /// racing the teardown, and the next registration rescues it.
-    pub close: CancellationToken,
+/// The answer to [`SessionManagerHandle::admit_connection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitOutcome {
+    /// Inserted, awaiting its bind.
+    Admitted,
+    /// The meeting was released, or re-keyed, between the credential check and
+    /// admission (the key that verified the token is no longer the meeting's):
+    /// nothing inserted. The caller closes `DECLINED`.
+    MeetingNotHeld,
+    /// This `(meeting, sub)` already has the configured number of connections
+    /// awaiting their bind: nothing inserted. The caller closes `DECLINED`
+    /// and counts `declined_pending_cap`.
+    PendingCapReached,
+}
+
+/// The answer to [`SessionManagerHandle::bind_connection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindOutcome {
+    /// Bound and marked; the caller starts the media session.
+    Bound,
+    /// The meeting is no longer held, or this connection's entry is gone (the
+    /// release removed it): nothing bound. The caller closes `DECLINED`.
+    NotHeld,
+    /// The ordinal is held by another participant ([`BindConflict`]).
+    Conflict(BindConflict),
 }
 
 /// Whether the MC asking about a meeting is the one that registered it.
@@ -191,6 +217,11 @@ pub enum RegisterRefusal {
         /// The configured cap.
         cap: usize,
     },
+    /// The session actor is gone (shutdown, or a panicked task): NOTHING was
+    /// recorded — in particular no `media_dial` key, so every dial for the
+    /// meeting would be declined. Answered `UNAVAILABLE` so MC's RPC-failure
+    /// path retries, never as a registration that silently did not happen.
+    ActorUnavailable,
 }
 
 /// Why an `EndMeeting` could not be decided by the session actor. Neither
@@ -224,8 +255,8 @@ impl EndMeetingFailure {
 /// Request-reply variants carry a `oneshot::Sender` for the response.
 #[derive(Debug)]
 enum SessionMessage {
-    /// Register a meeting. Returns any pending connections that were promoted,
-    /// or the refusal if a NEW meeting would exceed the registration cap.
+    /// Register a meeting, or refuse it if a NEW meeting would exceed the
+    /// registration cap.
     RegisterMeeting {
         meeting_id: String,
         registration: MeetingRegistration,
@@ -233,7 +264,7 @@ enum SessionMessage {
         /// regardless, and this becomes the meeting's `apply_refusal`.
         policy_rejection: Option<PolicyRejection>,
         max_registered_meetings: usize,
-        respond_to: oneshot::Sender<Result<Vec<PendingConnection>, RegisterRefusal>>,
+        respond_to: oneshot::Sender<Result<(), RegisterRefusal>>,
     },
     /// Release a meeting (story 2 R-20). On the LIFECYCLE mailbox, not the
     /// config-apply one: teardown is lifecycle, and sharing a FIFO with
@@ -262,24 +293,30 @@ enum SessionMessage {
         meeting_id: String,
         respond_to: oneshot::Sender<Option<String>>,
     },
-    /// Add an active connection (fire-and-forget).
-    AddConnection {
+    /// The meeting's registered `media_dial` key, if it is held. Read-only:
+    /// an unknown meeting creates nothing.
+    MediaDialKey {
+        meeting_id: String,
+        respond_to: oneshot::Sender<Option<MediaDialKey>>,
+    },
+    /// Admit a verified connection under the per-`(meeting, sub)` cap.
+    AdmitConnection {
         meeting_id: String,
         entry: ConnectionEntry,
+        /// The registered key that verified the token.
+        verified_key: MediaDialKey,
+        max_awaiting_bind: usize,
+        respond_to: oneshot::Sender<AdmitOutcome>,
+    },
+    /// Apply MC's bind answer: held-check, bind and mark in one turn.
+    BindConnection {
+        meeting_id: String,
+        connection_id: String,
+        sender: SenderId,
+        respond_to: oneshot::Sender<BindOutcome>,
     },
     /// Remove an active connection by ID. Returns true if found.
     RemoveConnection {
-        meeting_id: String,
-        connection_id: String,
-        respond_to: oneshot::Sender<bool>,
-    },
-    /// Add a pending connection. Returns an `Arc<Notify>` for awaiting registration.
-    AddPendingConnection {
-        pending: PendingConnection,
-        respond_to: oneshot::Sender<Arc<Notify>>,
-    },
-    /// Remove a pending connection by ID. Returns true if found.
-    RemovePendingConnection {
         meeting_id: String,
         connection_id: String,
         respond_to: oneshot::Sender<bool>,
@@ -372,12 +409,8 @@ pub enum ApplyOutcome {
 struct SessionState {
     /// Registered meetings: `meeting_id` -> registration data.
     registered_meetings: HashMap<String, MeetingRegistration>,
-    /// Active connections: `meeting_id` -> (`participant_id` -> connections).
+    /// Admitted connections: `meeting_id` -> (`participant_id` -> connections).
     active_connections: HashMap<String, HashMap<String, Vec<ConnectionEntry>>>,
-    /// Pending connections awaiting `RegisterMeeting`: `meeting_id` -> pending list.
-    pending_connections: HashMap<String, Vec<PendingConnection>>,
-    /// Notify handles for pending connections: `meeting_id` -> `Notify`.
-    meeting_notifiers: HashMap<String, Arc<Notify>>,
 }
 
 /// Actor that owns session state and processes messages sequentially.
@@ -388,6 +421,9 @@ pub struct SessionManagerActor {
     receiver: mpsc::Receiver<SessionMessage>,
     config_receiver: mpsc::Receiver<ConfigApplyMessage>,
     state: SessionState,
+    /// The same registry the handle exposes: the actor claims ordinals in
+    /// [`Self::handle_bind_connection`], atomically with the held-check.
+    sender_bindings: Arc<SenderBindings>,
     routing: Arc<RoutingTable>,
     /// The derived stream ceiling and the ratio threshold (story 2 R-19).
     admission: StreamAdmission,
@@ -420,6 +456,7 @@ impl SessionManagerActor {
         receiver: mpsc::Receiver<SessionMessage>,
         config_receiver: mpsc::Receiver<ConfigApplyMessage>,
         routing: Arc<RoutingTable>,
+        sender_bindings: Arc<SenderBindings>,
         admission: StreamAdmission,
         heartbeat: Option<HeartbeatSetup>,
     ) -> Self {
@@ -439,6 +476,7 @@ impl SessionManagerActor {
             receiver,
             config_receiver,
             state: SessionState::default(),
+            sender_bindings,
             routing,
             admission,
             admission_window: AdmissionWindow::new(),
@@ -869,6 +907,10 @@ impl SessionManagerActor {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "a pure dispatch: one arm per SessionMessage variant"
+    )]
     fn handle_message(&mut self, msg: SessionMessage) {
         match msg {
             SessionMessage::RegisterMeeting {
@@ -923,8 +965,40 @@ impl SessionManagerActor {
                     .map(|r| r.mc_grpc_endpoint.clone());
                 let _ = respond_to.send(result);
             }
-            SessionMessage::AddConnection { meeting_id, entry } => {
-                self.handle_add_connection(meeting_id, entry);
+            SessionMessage::MediaDialKey {
+                meeting_id,
+                respond_to,
+            } => {
+                let key = self
+                    .state
+                    .registered_meetings
+                    .get(&meeting_id)
+                    .map(|r| r.media_dial_key);
+                let _ = respond_to.send(key);
+            }
+            SessionMessage::AdmitConnection {
+                meeting_id,
+                entry,
+                verified_key,
+                max_awaiting_bind,
+                respond_to,
+            } => {
+                let outcome = self.handle_admit_connection(
+                    meeting_id,
+                    entry,
+                    verified_key,
+                    max_awaiting_bind,
+                );
+                let _ = respond_to.send(outcome);
+            }
+            SessionMessage::BindConnection {
+                meeting_id,
+                connection_id,
+                sender,
+                respond_to,
+            } => {
+                let outcome = self.handle_bind_connection(&meeting_id, &connection_id, sender);
+                let _ = respond_to.send(outcome);
             }
             SessionMessage::RemoveConnection {
                 meeting_id,
@@ -932,21 +1006,6 @@ impl SessionManagerActor {
                 respond_to,
             } => {
                 let result = self.handle_remove_connection(&meeting_id, &connection_id);
-                let _ = respond_to.send(result);
-            }
-            SessionMessage::AddPendingConnection {
-                pending,
-                respond_to,
-            } => {
-                let result = self.handle_add_pending_connection(pending);
-                let _ = respond_to.send(result);
-            }
-            SessionMessage::RemovePendingConnection {
-                meeting_id,
-                connection_id,
-                respond_to,
-            } => {
-                let result = self.handle_remove_pending_connection(&meeting_id, &connection_id);
                 let _ = respond_to.send(result);
             }
             SessionMessage::ActiveConnectionCount { respond_to } => {
@@ -962,7 +1021,7 @@ impl SessionManagerActor {
         }
     }
 
-    /// Register a meeting and promote any pending connections.
+    /// Register (upsert) a meeting's record.
     ///
     /// This runs sequentially inside the actor, eliminating the TOCTOU race
     /// that existed with `Arc<RwLock<SessionState>>` — and it is why the
@@ -978,7 +1037,7 @@ impl SessionManagerActor {
         registration: MeetingRegistration,
         policy_rejection: Option<PolicyRejection>,
         max_registered_meetings: usize,
-    ) -> Result<Vec<PendingConnection>, RegisterRefusal> {
+    ) -> Result<(), RegisterRefusal> {
         // An ordinary re-assert and a change of OWNING MC are the same insert,
         // and before this they were also the same INFO line. They are not the
         // same event, and the generation ratchet is why: `handle_config_apply`
@@ -1017,12 +1076,31 @@ impl SessionManagerActor {
                      never moves back down"
                 );
             }
-            Some(_) => {
+            Some(existing) => {
                 tracing::info!(
                     target: "mh.session",
                     meeting_id = %meeting_id,
                     "Overwriting existing meeting registration"
                 );
+                // DETECTION ONLY (ADR-0039 §5; docs/TODO.md "MH does not verify
+                // meeting ownership"): MC never rotates a meeting's dial key
+                // within its meeting actor, so the SAME MC re-registering with
+                // a DIFFERENT key is anomalous by construction. The upsert
+                // proceeds regardless — the last record-valid registration's
+                // key wins. No key bytes, fingerprint or prefix is logged.
+                if existing.media_dial_key != registration.media_dial_key {
+                    tracing::warn!(
+                        target: "mh.session",
+                        key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
+                        meeting_id = %meeting_id,
+                        registered_mc_id = %existing.mc_id,
+                        caller_mc_id = %registration.mc_id,
+                        media_dial_key_changed = true,
+                        "Meeting re-registered by the SAME MC with a DIFFERENT media_dial key; \
+                         MC never rotates it within a meeting, and MH does not verify meeting \
+                         ownership. The new key is installed"
+                    );
+                }
             }
             // A NEW meeting id: the only case the registration cap applies to.
             // A re-registration of a held meeting is never refused — refusing
@@ -1060,44 +1138,7 @@ impl SessionManagerActor {
         }
         self.metrics
             .publish_registered_meetings(self.state.registered_meetings.len());
-
-        // Drain pending connections for this meeting
-        let pending = self
-            .state
-            .pending_connections
-            .remove(&meeting_id)
-            .unwrap_or_default();
-
-        // Promote pending connections to active, carrying each one's close
-        // token so a later release can close it.
-        for conn in &pending {
-            let meeting_conns = self
-                .state
-                .active_connections
-                .entry(meeting_id.clone())
-                .or_default();
-            let participant_conns = meeting_conns
-                .entry(conn.participant_id.clone())
-                .or_default();
-            participant_conns.push(ConnectionEntry {
-                connection_id: conn.connection_id.clone(),
-                participant_id: conn.participant_id.clone(),
-                connected_at: conn.connected_at,
-                close: conn.close.clone(),
-            });
-        }
-
-        // Notify any waiters that the meeting is now registered, then drop the
-        // notifier: its only purpose is waking PENDING connections and this
-        // meeting now has none. Waiters hold their own `Arc` clone, so dropping
-        // the map's copy strands nobody, and a later pending connection creates
-        // a fresh one. Without this the map is insert-only — one entry per
-        // meeting that ever had a pending connection, forever.
-        if let Some(notifier) = self.state.meeting_notifiers.remove(&meeting_id) {
-            notifier.notify_waiters();
-        }
-
-        Ok(pending)
+        Ok(())
     }
 
     /// Release a meeting (story 2 R-20; story 4 MH-2; semantics normative on
@@ -1127,7 +1168,7 @@ impl SessionManagerActor {
     /// release is counted (one home per event: a removal on
     /// `mh_media_handler_releases_total`, everything else on the teardown
     /// series), and whether connections still awaiting their bind are closed
-    /// ([`ReleaseKind::closes_pending`]).
+    /// ([`ReleaseKind::closes_awaiting_bind`]).
     fn handle_end_meeting(
         &mut self,
         meeting_id: &str,
@@ -1184,8 +1225,7 @@ impl SessionManagerActor {
         // Removing the routes entry is also what FORGETS the applied
         // generation, so a same-id re-create installs fresh from generation 1.
         let routes_removed = self.routing.remove(&meeting);
-        let closed_connections = self.close_active_connections(meeting_id);
-        let closed_pending = self.release_pending_connections(meeting_id, kind);
+        let (closed_connections, left_to_bind) = self.close_active_connections(meeting_id, kind);
         self.unschedule_heartbeats(meeting_id, registration.mc_grpc_endpoint);
 
         let snapshot = self.routing.load();
@@ -1210,7 +1250,7 @@ impl SessionManagerActor {
             clients = clients.as_label(),
             routes_removed,
             closed_connections,
-            closed_pending,
+            left_to_bind,
             installed_total_streams = snapshot.total_edges(),
             registered_meetings = self.state.registered_meetings.len(),
             "Meeting released"
@@ -1218,43 +1258,35 @@ impl SessionManagerActor {
         MeetingTeardownOutcome::Released
     }
 
-    /// Close every ACTIVE connection of a released meeting. Each closes with
-    /// `HANDLER_RELEASED` and sends no `NotifyParticipantDisconnected`
-    /// (`webtransport::connection`'s `ConnectionEnd::MeetingReleased`).
-    fn close_active_connections(&mut self, meeting_id: &str) -> usize {
+    /// Close a released meeting's connections and drop its entries. Every
+    /// BOUND connection closes with `HANDLER_RELEASED` and sends no
+    /// `NotifyParticipantDisconnected` (`webtransport::connection`'s
+    /// `ConnectionEnd::MeetingReleased`). One still awaiting its bind is closed
+    /// the same way only when the handler is leaving
+    /// ([`ReleaseKind::closes_awaiting_bind`]); on `MEETING_ENDED` it is left to
+    /// the bind outcome (ADR-0039 §6) — its entry is gone, so a nonzero answer
+    /// binds nothing ([`Self::handle_bind_connection`]). Returns (closed, left
+    /// to the bind outcome).
+    fn close_active_connections(&mut self, meeting_id: &str, kind: ReleaseKind) -> (usize, usize) {
         let mut closed = 0_usize;
+        let mut left_to_bind = 0_usize;
         if let Some(meeting_conns) = self.state.active_connections.remove(meeting_id) {
             for entry in meeting_conns.values().flatten() {
-                entry.close.cancel();
-                closed += 1;
-            }
-        }
-        closed
-    }
-
-    /// The fate of connections still awaiting their bind (PENDING), by
-    /// cause: closed (`HANDLER_RELEASED`) when the handler is leaving, left
-    /// alone — with the notifier they wait on — when the meeting ended.
-    fn release_pending_connections(&mut self, meeting_id: &str, kind: ReleaseKind) -> usize {
-        let mut closed = 0_usize;
-        if kind.closes_pending() {
-            if let Some(pending) = self.state.pending_connections.remove(meeting_id) {
-                for conn in &pending {
-                    conn.close.cancel();
+                if entry.is_bound || kind.closes_awaiting_bind() {
+                    entry.close.cancel();
                     closed += 1;
+                } else {
+                    left_to_bind += 1;
                 }
             }
         }
-        if !self.state.pending_connections.contains_key(meeting_id) {
-            self.state.meeting_notifiers.remove(meeting_id);
-        }
-        closed
+        (closed, left_to_bind)
     }
 
     /// Whether the meeting has at least one ACTIVE connection: THE "has
     /// clients" predicate behind both `clients=present|none` at release and
     /// `mh_media_meetings_without_clients`. A session that has begun its bind
-    /// is active; a pending (pre-registration) one is not.
+    /// (admitted) counts.
     fn has_clients(&self, meeting_id: &str) -> bool {
         self.state
             .active_connections
@@ -1483,26 +1515,84 @@ impl SessionManagerActor {
         self.handle_end_meeting(meeting_id, &mc_id, kind);
     }
 
-    fn handle_add_connection(&mut self, meeting_id: String, entry: ConnectionEntry) {
-        // The connection task checked registration, THEN sent this — two
-        // messages, so an `EndMeeting` can land between them. Inserting anyway
-        // would leave an entry for a released meeting that nothing will ever
-        // close. Close it instead; the connection tears itself down.
-        if !self.state.registered_meetings.contains_key(&meeting_id) {
-            tracing::info!(
-                target: "mh.session",
-                meeting_id = %meeting_id,
-                connection_id = %entry.connection_id,
-                "Connection arrived for a meeting released since it checked; closing it"
-            );
-            entry.close.cancel();
-            return;
+    /// Admit a credential-verified connection — ONE turn: the meeting is
+    /// still held, this `(meeting, sub)` has fewer than `max_awaiting_bind`
+    /// connections awaiting their bind, then insert. The checks and the insert
+    /// cannot be split by a release or a racing dial.
+    fn handle_admit_connection(
+        &mut self,
+        meeting_id: String,
+        mut entry: ConnectionEntry,
+        verified_key: MediaDialKey,
+        max_awaiting_bind: usize,
+    ) -> AdmitOutcome {
+        // The SAME key that verified the token must still be the meeting's: a
+        // re-registration with another key (or a release then re-register)
+        // between the lookup and here admits nothing, so `meeting_id` is
+        // always the meeting whose CURRENT key verified this connection.
+        let held_under_that_key = self
+            .state
+            .registered_meetings
+            .get(&meeting_id)
+            .is_some_and(|r| r.media_dial_key == verified_key);
+        if !held_under_that_key {
+            return AdmitOutcome::MeetingNotHeld;
         }
-        let meeting_conns = self.state.active_connections.entry(meeting_id).or_default();
-        let participant_conns = meeting_conns
+        let awaiting = self
+            .state
+            .active_connections
+            .get(&meeting_id)
+            .and_then(|m| m.get(&entry.participant_id))
+            .map_or(0, |conns| conns.iter().filter(|c| !c.is_bound).count());
+        if awaiting >= max_awaiting_bind {
+            return AdmitOutcome::PendingCapReached;
+        }
+        entry.is_bound = false;
+        self.state
+            .active_connections
+            .entry(meeting_id)
+            .or_default()
             .entry(entry.participant_id.clone())
-            .or_default();
-        participant_conns.push(entry);
+            .or_default()
+            .push(entry);
+        AdmitOutcome::Admitted
+    }
+
+    /// Apply MC's nonzero bind answer — ONE turn: the meeting is still held
+    /// AND this connection's entry still exists (a release removes it), then
+    /// claim the ordinal and mark the entry bound. A release that landed while
+    /// the answer was in flight therefore binds nothing.
+    fn handle_bind_connection(
+        &mut self,
+        meeting_id: &str,
+        connection_id: &str,
+        sender: SenderId,
+    ) -> BindOutcome {
+        if !self.state.registered_meetings.contains_key(meeting_id) {
+            return BindOutcome::NotHeld;
+        }
+        let Some(entry) = self
+            .state
+            .active_connections
+            .get_mut(meeting_id)
+            .and_then(|m| {
+                m.values_mut()
+                    .flatten()
+                    .find(|c| c.connection_id == connection_id)
+            })
+        else {
+            return BindOutcome::NotHeld;
+        };
+        if let Err(conflict) = self.sender_bindings.bind(
+            MeetingKey::new(meeting_id),
+            &entry.participant_id,
+            connection_id,
+            sender,
+        ) {
+            return BindOutcome::Conflict(conflict);
+        }
+        entry.is_bound = true;
+        BindOutcome::Bound
     }
 
     fn handle_remove_connection(&mut self, meeting_id: &str, connection_id: &str) -> bool {
@@ -1534,44 +1624,6 @@ impl SessionManagerActor {
             self.state.active_connections.remove(meeting_id);
         }
         found
-    }
-
-    fn handle_add_pending_connection(&mut self, pending: PendingConnection) -> Arc<Notify> {
-        let meeting_id = pending.meeting_id.clone();
-
-        self.state
-            .pending_connections
-            .entry(meeting_id.clone())
-            .or_default()
-            .push(pending);
-
-        // Get or create notifier for this meeting
-        self.state
-            .meeting_notifiers
-            .entry(meeting_id)
-            .or_insert_with(|| Arc::new(Notify::new()))
-            .clone()
-    }
-
-    fn handle_remove_pending_connection(&mut self, meeting_id: &str, connection_id: &str) -> bool {
-        if let Some(pending_list) = self.state.pending_connections.get_mut(meeting_id) {
-            if let Some(pos) = pending_list
-                .iter()
-                .position(|c| c.connection_id == connection_id)
-            {
-                pending_list.remove(pos);
-                // Clean up empty entries — and the notifier with the last
-                // pending connection, since waking pending connections is its
-                // only purpose. The waiter holds its own `Arc`; a later pending
-                // connection creates a fresh notifier.
-                if pending_list.is_empty() {
-                    self.state.pending_connections.remove(meeting_id);
-                    self.state.meeting_notifiers.remove(meeting_id);
-                }
-                return true;
-            }
-        }
-        false
     }
 }
 
@@ -2183,10 +2235,12 @@ impl SessionManagerHandle {
         let (sender, receiver) = mpsc::channel(SESSION_CHANNEL_BUFFER);
         let (config_sender, config_receiver) = mpsc::channel(CONFIG_APPLY_CHANNEL_BUFFER);
         let routing = Arc::new(routing);
+        let sender_bindings = Arc::new(SenderBindings::new());
         let actor = SessionManagerActor::new(
             receiver,
             config_receiver,
             Arc::clone(&routing),
+            Arc::clone(&sender_bindings),
             admission,
             heartbeat,
         );
@@ -2196,7 +2250,7 @@ impl SessionManagerHandle {
                 config_sender,
                 subscribers: Arc::clone(routing.subscribers()),
                 routing,
-                sender_bindings: Arc::new(SenderBindings::new()),
+                sender_bindings,
             },
             actor,
         )
@@ -2357,22 +2411,21 @@ impl SessionManagerHandle {
 
     /// Register a meeting on this MH instance.
     ///
-    /// Called when MC sends `RegisterMeeting` RPC. Returns any pending
-    /// connections that were waiting for this meeting's registration, so the
-    /// caller can dispatch notifications.
+    /// Called when MC sends `RegisterMeeting` RPC: upserts the record,
+    /// including the meeting's `media_dial` key.
     ///
     /// # Errors
     ///
     /// [`RegisterRefusal::MeetingCapReached`] when this is a NEW meeting id and
     /// the handler already holds `max_registered_meetings` registrations.
-    /// Nothing was upserted or promoted.
+    /// Nothing was upserted.
     pub async fn register_meeting(
         &self,
         meeting_id: String,
         registration: MeetingRegistration,
         policy_rejection: Option<PolicyRejection>,
         max_registered_meetings: usize,
-    ) -> Result<Vec<PendingConnection>, RegisterRefusal> {
+    ) -> Result<(), RegisterRefusal> {
         let (tx, rx) = oneshot::channel();
         if self
             .sender
@@ -2387,9 +2440,9 @@ impl SessionManagerHandle {
             .is_err()
         {
             tracing::warn!(target: "mh.session", "SessionManagerActor channel closed on register_meeting");
-            return Ok(Vec::new());
+            return Err(RegisterRefusal::ActorUnavailable);
         }
-        rx.await.unwrap_or_else(|_| Ok(Vec::new()))
+        rx.await.unwrap_or(Err(RegisterRefusal::ActorUnavailable))
     }
 
     /// Release a meeting (story 2 R-20): the actor decides released / unknown
@@ -2469,21 +2522,82 @@ impl SessionManagerHandle {
         rx.await.unwrap_or(None)
     }
 
-    /// Add an active connection for a registered meeting.
-    ///
-    /// Fire-and-forget: the caller does not need confirmation.
-    pub async fn add_connection(&self, meeting_id: &str, entry: ConnectionEntry) {
+    /// The meeting's registered `media_dial` verification key, or `None` when
+    /// this handler does not hold the meeting (story 4 MH-1, step c).
+    /// Read-only: an unknown meeting creates no state.
+    pub async fn media_dial_key(&self, meeting_id: &str) -> Option<MediaDialKey> {
+        let (tx, rx) = oneshot::channel();
         if self
             .sender
-            .send(SessionMessage::AddConnection {
+            .send(SessionMessage::MediaDialKey {
                 meeting_id: meeting_id.to_string(),
-                entry,
+                respond_to: tx,
             })
             .await
             .is_err()
         {
-            tracing::warn!(target: "mh.session", "SessionManagerActor channel closed on add_connection");
+            tracing::warn!(target: "mh.session", "SessionManagerActor channel closed on media_dial_key");
+            return None;
         }
+        rx.await.ok().flatten()
+    }
+
+    /// Admit a credential-verified connection for `meeting_id` — only while
+    /// `verified_key` is still the meeting's registered key — under the cap of
+    /// `max_awaiting_bind` connections awaiting their bind per `(meeting, sub)`
+    /// (ADR-0039 §5). One actor turn; see [`AdmitOutcome`]. A gone actor
+    /// answers `MeetingNotHeld` (fail closed).
+    pub async fn admit_connection(
+        &self,
+        meeting_id: &str,
+        entry: ConnectionEntry,
+        verified_key: MediaDialKey,
+        max_awaiting_bind: usize,
+    ) -> AdmitOutcome {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(SessionMessage::AdmitConnection {
+                meeting_id: meeting_id.to_string(),
+                entry,
+                verified_key,
+                max_awaiting_bind,
+                respond_to: tx,
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!(target: "mh.session", "SessionManagerActor channel closed on admit_connection");
+            return AdmitOutcome::MeetingNotHeld;
+        }
+        rx.await.unwrap_or(AdmitOutcome::MeetingNotHeld)
+    }
+
+    /// Apply MC's nonzero bind answer for `connection_id`: held-check, ordinal
+    /// claim and mark, in one actor turn. See [`BindOutcome`]. A gone actor
+    /// answers `NotHeld` (fail closed).
+    pub async fn bind_connection(
+        &self,
+        meeting_id: &str,
+        connection_id: &str,
+        sender: SenderId,
+    ) -> BindOutcome {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .sender
+            .send(SessionMessage::BindConnection {
+                meeting_id: meeting_id.to_string(),
+                connection_id: connection_id.to_string(),
+                sender,
+                respond_to: tx,
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!(target: "mh.session", "SessionManagerActor channel closed on bind_connection");
+            return BindOutcome::NotHeld;
+        }
+        rx.await.unwrap_or(BindOutcome::NotHeld)
     }
 
     /// Remove a connection by `connection_id`. Returns true if found and removed.
@@ -2500,47 +2614,6 @@ impl SessionManagerHandle {
             .is_err()
         {
             tracing::warn!(target: "mh.session", "SessionManagerActor channel closed on remove_connection");
-            return false;
-        }
-        rx.await.unwrap_or(false)
-    }
-
-    /// Add a pending connection for an unregistered meeting.
-    ///
-    /// Returns a `Notify` handle that will be triggered when
-    /// `RegisterMeeting` arrives for this `meeting_id`.
-    pub async fn add_pending_connection(&self, pending: PendingConnection) -> Arc<Notify> {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .sender
-            .send(SessionMessage::AddPendingConnection {
-                pending,
-                respond_to: tx,
-            })
-            .await
-            .is_err()
-        {
-            tracing::warn!(target: "mh.session", "SessionManagerActor channel closed on add_pending_connection");
-            return Arc::new(Notify::new());
-        }
-        rx.await.unwrap_or_else(|_| Arc::new(Notify::new()))
-    }
-
-    /// Remove a pending connection by `connection_id`.
-    /// Called when the provisional timeout expires.
-    pub async fn remove_pending_connection(&self, meeting_id: &str, connection_id: &str) -> bool {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .sender
-            .send(SessionMessage::RemovePendingConnection {
-                meeting_id: meeting_id.to_string(),
-                connection_id: connection_id.to_string(),
-                respond_to: tx,
-            })
-            .await
-            .is_err()
-        {
-            tracing::warn!(target: "mh.session", "SessionManagerActor channel closed on remove_pending_connection");
             return false;
         }
         rx.await.unwrap_or(false)
@@ -2576,12 +2649,20 @@ mod tests {
     /// fixture's value, so there is one source.
     const TEST_CAP: usize = crate::config::PolicyLimits::for_tests().max_registered_meetings;
 
+    /// The forge's meeting key as THIS crate's type (`mh_test_utils` links a
+    /// second copy of `mh_service`, so its `meeting_dial_key` is a different
+    /// type here).
+    fn test_dial_key() -> MediaDialKey {
+        MediaDialKey::from_wire(&mh_test_utils::media_dial::meeting_public_key()).unwrap()
+    }
+
     fn make_registration(mc_id: &str, endpoint: &str) -> MeetingRegistration {
         MeetingRegistration {
             mc_id: mc_id.to_string(),
             mc_grpc_endpoint: endpoint.to_string(),
             heartbeat_interval: mh_test_utils::media_policy::TEST_HEARTBEAT_INTERVAL,
             registered_at: Instant::now(),
+            media_dial_key: test_dial_key(),
         }
     }
 
@@ -2591,25 +2672,31 @@ mod tests {
             participant_id: participant_id.to_string(),
             connected_at: Instant::now(),
             close: CancellationToken::new(),
+            is_bound: false,
         }
     }
 
-    fn make_pending(conn_id: &str, meeting_id: &str, participant_id: &str) -> PendingConnection {
-        PendingConnection {
-            connection_id: conn_id.to_string(),
-            meeting_id: meeting_id.to_string(),
-            participant_id: participant_id.to_string(),
-            connected_at: Instant::now(),
-            close: CancellationToken::new(),
-        }
+    async fn registered(meeting_id: &str) -> SessionManagerHandle {
+        let handle = SessionManagerHandle::new_for_tests(test_admission());
+        handle
+            .register_meeting(
+                meeting_id.to_string(),
+                make_registration("mc-1", "http://mc:50052"),
+                None,
+                TEST_CAP,
+            )
+            .await
+            .unwrap();
+        handle
     }
 
     #[tokio::test]
     async fn test_register_meeting() {
         let handle = SessionManagerHandle::new_for_tests(test_admission());
         assert!(!handle.is_meeting_registered("meeting-1").await);
+        assert!(handle.media_dial_key("meeting-1").await.is_none());
 
-        let pending = handle
+        handle
             .register_meeting(
                 "meeting-1".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
@@ -2620,33 +2707,64 @@ mod tests {
             .unwrap();
 
         assert!(handle.is_meeting_registered("meeting-1").await);
-        assert!(pending.is_empty());
+        assert_eq!(
+            handle.media_dial_key("meeting-1").await,
+            Some(test_dial_key()),
+            "the registration upsert installs the key"
+        );
         assert_eq!(
             handle.get_mc_endpoint("meeting-1").await.unwrap(),
             "http://mc:50052"
         );
     }
 
+    /// A key lookup for a meeting MH does not hold creates nothing: the
+    /// meeting stays unregistered and no connection state appears.
     #[tokio::test]
-    async fn test_add_and_remove_connection() {
+    async fn an_unknown_meeting_key_lookup_creates_nothing() {
         let handle = SessionManagerHandle::new_for_tests(test_admission());
+        assert!(handle.media_dial_key("never").await.is_none());
+        assert!(!handle.is_meeting_registered("never").await);
+        assert_eq!(handle.active_connection_count().await, 0);
+    }
+
+    /// The last registration's key wins, and a release drops it.
+    #[tokio::test]
+    async fn the_last_registration_key_wins_and_release_drops_it() {
+        let handle = registered("meeting-1").await;
+        let mut second = make_registration("mc-1", "http://mc:50052");
+        second.media_dial_key = MediaDialKey::from_wire(&[9; 32]).unwrap();
         handle
-            .register_meeting(
+            .register_meeting("meeting-1".to_string(), second, None, TEST_CAP)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.media_dial_key("meeting-1").await,
+            MediaDialKey::from_wire(&[9; 32])
+        );
+        handle
+            .end_meeting(
                 "meeting-1".to_string(),
-                make_registration("mc-1", "http://mc:50052"),
-                None,
-                TEST_CAP,
+                "mc-1".to_string(),
+                ReleaseKind::MeetingEnded,
+                Duration::from_secs(5),
             )
             .await
             .unwrap();
+        assert!(handle.media_dial_key("meeting-1").await.is_none());
+    }
 
-        handle
-            .add_connection("meeting-1", make_connection("conn-1", "user-1"))
-            .await;
-        handle
-            .add_connection("meeting-1", make_connection("conn-2", "user-2"))
-            .await;
-
+    #[tokio::test]
+    async fn test_admit_and_remove_connection() {
+        let handle = registered("meeting-1").await;
+        for (conn, user) in [("conn-1", "user-1"), ("conn-2", "user-2")] {
+            assert_eq!(
+                handle
+                    .admit_connection("meeting-1", make_connection(conn, user), test_dial_key(), 2)
+                    .await,
+                AdmitOutcome::Admitted
+            );
+        }
         assert_eq!(handle.active_connection_count().await, 2);
 
         assert!(handle.remove_connection("meeting-1", "conn-1").await);
@@ -2656,48 +2774,33 @@ mod tests {
         assert!(!handle.remove_connection("meeting-1", "conn-999").await);
     }
 
+    /// Admission to a meeting MH does not hold inserts nothing.
     #[tokio::test]
-    async fn test_pending_connection_promoted_on_register() {
+    async fn admission_to_an_unheld_meeting_inserts_nothing() {
         let handle = SessionManagerHandle::new_for_tests(test_admission());
-
-        // Add pending connection before RegisterMeeting
-        let _notify = handle
-            .add_pending_connection(make_pending("conn-1", "meeting-1", "user-1"))
-            .await;
-        let _notify2 = handle
-            .add_pending_connection(make_pending("conn-2", "meeting-1", "user-2"))
-            .await;
-
-        // RegisterMeeting arrives — returns pending connections
-        let promoted = handle
-            .register_meeting(
-                "meeting-1".to_string(),
-                make_registration("mc-1", "http://mc:50052"),
-                None,
-                TEST_CAP,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(promoted.len(), 2);
-        assert_eq!(promoted[0].connection_id, "conn-1");
-        assert_eq!(promoted[1].connection_id, "conn-2");
-
-        // Promoted connections should now be active
-        assert_eq!(handle.active_connection_count().await, 2);
+        assert_eq!(
+            handle
+                .admit_connection(
+                    "meeting-1",
+                    make_connection("conn-1", "user-1"),
+                    test_dial_key(),
+                    2
+                )
+                .await,
+            AdmitOutcome::MeetingNotHeld
+        );
+        assert_eq!(handle.active_connection_count().await, 0);
     }
 
+    /// The pending cap is per (meeting, sub) and counts only connections
+    /// awaiting their bind: the cap-th is admitted, cap+1 refused; another
+    /// sub and another meeting are unaffected; a bind or a removal frees a
+    /// slot.
     #[tokio::test]
-    async fn test_pending_connection_for_different_meeting_not_promoted() {
-        let handle = SessionManagerHandle::new_for_tests(test_admission());
-
-        // Add pending for meeting-1
-        let _notify = handle
-            .add_pending_connection(make_pending("conn-1", "meeting-1", "user-1"))
-            .await;
-
-        // Register meeting-2 — should NOT promote meeting-1's pending
-        let promoted = handle
+    async fn the_pending_cap_is_per_meeting_and_sub_and_frees_on_every_exit() {
+        const CAP: usize = 3;
+        let handle = registered("meeting-1").await;
+        handle
             .register_meeting(
                 "meeting-2".to_string(),
                 make_registration("mc-1", "http://mc:50052"),
@@ -2706,51 +2809,173 @@ mod tests {
             )
             .await
             .unwrap();
+        let admit = |meeting: &'static str, conn: &'static str, user: &'static str| {
+            let handle = handle.clone();
+            async move {
+                handle
+                    .admit_connection(meeting, make_connection(conn, user), test_dial_key(), CAP)
+                    .await
+            }
+        };
+        for conn in ["c1", "c2", "c3"] {
+            assert_eq!(admit("meeting-1", conn, "u").await, AdmitOutcome::Admitted);
+        }
+        assert_eq!(
+            admit("meeting-1", "c4", "u").await,
+            AdmitOutcome::PendingCapReached
+        );
+        assert_eq!(
+            admit("meeting-1", "o1", "other").await,
+            AdmitOutcome::Admitted
+        );
+        assert_eq!(admit("meeting-2", "m1", "u").await, AdmitOutcome::Admitted);
+        assert_eq!(
+            handle.active_connection_count().await,
+            5,
+            "the refusal inserted nothing"
+        );
 
-        assert!(promoted.is_empty());
-        assert_eq!(handle.active_connection_count().await, 0);
+        // Exit 1: a bind frees the slot (the entry stays, bound).
+        assert_eq!(
+            handle.bind_connection("meeting-1", "c1", key(7)).await,
+            BindOutcome::Bound
+        );
+        assert_eq!(admit("meeting-1", "c5", "u").await, AdmitOutcome::Admitted);
+        // Exit 2: a removal (decline, disconnect) frees the slot.
+        assert!(handle.remove_connection("meeting-1", "c2").await);
+        assert_eq!(admit("meeting-1", "c6", "u").await, AdmitOutcome::Admitted);
+        assert_eq!(
+            admit("meeting-1", "c7", "u").await,
+            AdmitOutcome::PendingCapReached
+        );
+        // Exit 3: a release removes every entry, so a re-registered meeting
+        // starts with a full allowance.
+        handle
+            .end_meeting(
+                "meeting-1".to_string(),
+                "mc-1".to_string(),
+                ReleaseKind::MeetingEnded,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        handle
+            .register_meeting(
+                "meeting-1".to_string(),
+                make_registration("mc-1", "http://mc:50052"),
+                None,
+                TEST_CAP,
+            )
+            .await
+            .unwrap();
+        for conn in ["d1", "d2", "d3"] {
+            assert_eq!(admit("meeting-1", conn, "u").await, AdmitOutcome::Admitted);
+        }
     }
 
+    /// ADR-0039 §6, both arms: a release while the bind is in flight leaves
+    /// nothing to bind (the answer is `NotHeld`); with no release the same
+    /// answer binds. On a REMOVAL the awaiting connection's close token fires
+    /// at the release; on `MEETING_ENDED` it does not (left to the bind
+    /// outcome). A bound connection is closed on both.
     #[tokio::test]
-    async fn test_remove_pending_connection() {
-        let handle = SessionManagerHandle::new_for_tests(test_admission());
-
-        let _notify = handle
-            .add_pending_connection(make_pending("conn-1", "meeting-1", "user-1"))
-            .await;
-
-        assert!(
+    async fn a_release_during_the_bind_binds_nothing_and_closes_by_cause() {
+        for kind in [
+            ReleaseKind::MeetingEnded,
+            ReleaseKind::Removal(common::observability::labels::RemovalTrigger::HeartbeatTimeout),
+        ] {
+            let handle = registered("meeting-1").await;
+            let awaiting = make_connection("awaiting", "user-1");
+            let awaiting_close = awaiting.close.clone();
+            let bound = make_connection("bound", "user-2");
+            let bound_close = bound.close.clone();
             handle
-                .remove_pending_connection("meeting-1", "conn-1")
+                .admit_connection("meeting-1", awaiting, test_dial_key(), 2)
+                .await;
+            handle
+                .admit_connection("meeting-1", bound, test_dial_key(), 2)
+                .await;
+            assert_eq!(
+                handle.bind_connection("meeting-1", "bound", key(2)).await,
+                BindOutcome::Bound
+            );
+            handle
+                .end_meeting(
+                    "meeting-1".to_string(),
+                    "mc-1".to_string(),
+                    kind,
+                    Duration::from_secs(5),
+                )
                 .await
-        );
-        // Should not find it again
-        assert!(
-            !handle
-                .remove_pending_connection("meeting-1", "conn-1")
-                .await
+                .unwrap();
+            assert!(
+                bound_close.is_cancelled(),
+                "{kind:?}: a bound connection closes"
+            );
+            assert_eq!(
+                awaiting_close.is_cancelled(),
+                kind.closes_awaiting_bind(),
+                "{kind:?}: an awaiting connection closes only when the handler leaves"
+            );
+            assert_eq!(
+                handle
+                    .bind_connection("meeting-1", "awaiting", key(1))
+                    .await,
+                BindOutcome::NotHeld,
+                "{kind:?}: a late answer binds nothing"
+            );
+            assert!(handle
+                .sender_bindings()
+                .holder_of(&MeetingKey::new("meeting-1"), key(1))
+                .is_none());
+        }
+        // Control: the same answer with no release binds.
+        let handle = registered("meeting-1").await;
+        handle
+            .admit_connection(
+                "meeting-1",
+                make_connection("awaiting", "user-1"),
+                test_dial_key(),
+                2,
+            )
+            .await;
+        assert_eq!(
+            handle
+                .bind_connection("meeting-1", "awaiting", key(1))
+                .await,
+            BindOutcome::Bound
         );
     }
 
-    #[tokio::test]
-    async fn test_notify_wakes_pending_on_register() {
-        let handle = SessionManagerHandle::new_for_tests(test_admission());
-
-        let notify = handle
-            .add_pending_connection(make_pending("conn-1", "meeting-1", "user-1"))
-            .await;
-
-        // Spawn a task that waits on the notify
-        let handle_clone = handle.clone();
-        let join_handle = tokio::spawn(async move {
-            notify.notified().await;
-            handle_clone.is_meeting_registered("meeting-1").await
-        });
-
-        // Small yield to let the spawned task start waiting
-        tokio::task::yield_now().await;
-
-        // Register meeting — should trigger notify
+    /// The `SameMc` key-change WARN fires on a changed key and not on a
+    /// same-key re-registration; neither blocks the upsert.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_same_mc_key_change_warns_and_a_same_key_reregistration_does_not() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Capture {
+            fn contains(&self, needle: &str) -> bool {
+                String::from_utf8_lossy(&self.0.lock().unwrap()).contains(needle)
+            }
+        }
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || sink.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let handle = registered("meeting-1").await;
         handle
             .register_meeting(
                 "meeting-1".to_string(),
@@ -2760,40 +2985,23 @@ mod tests {
             )
             .await
             .unwrap();
-
-        let result = join_handle.await.unwrap();
-        assert!(result, "Meeting should be registered after notify");
-    }
-
-    #[tokio::test]
-    async fn test_registered_connection_not_affected_by_timeout() {
-        let handle = SessionManagerHandle::new_for_tests(test_admission());
-
-        // Register meeting first
+        assert!(
+            capture.contains("Overwriting existing meeting registration"),
+            "capture works"
+        );
+        assert!(!capture.contains("media_dial_key_changed"));
+        let mut changed = make_registration("mc-1", "http://mc:50052");
+        changed.media_dial_key = MediaDialKey::from_wire(&[9; 32]).unwrap();
         handle
-            .register_meeting(
-                "meeting-1".to_string(),
-                make_registration("mc-1", "http://mc:50052"),
-                None,
-                TEST_CAP,
-            )
+            .register_meeting("meeting-1".to_string(), changed, None, TEST_CAP)
             .await
             .unwrap();
-
-        // Add active connection (not pending — meeting is already registered)
-        handle
-            .add_connection("meeting-1", make_connection("conn-1", "user-1"))
-            .await;
-
-        // Trying to remove as pending should return false
-        assert!(
-            !handle
-                .remove_pending_connection("meeting-1", "conn-1")
-                .await
+        assert!(capture.contains("media_dial_key_changed"));
+        assert_eq!(
+            handle.media_dial_key("meeting-1").await,
+            MediaDialKey::from_wire(&[9; 32]),
+            "detection only: the upsert still installs the new key"
         );
-
-        // Active connection should still be there
-        assert_eq!(handle.active_connection_count().await, 1);
     }
 
     #[tokio::test]
@@ -3122,55 +3330,46 @@ mod tests {
         assert!(!actor.state.registered_meetings.contains_key("m-2"));
     }
 
-    /// Release closes every ACTIVE connection, leaves PENDING ones (and the
-    /// notifier they wait on) for the registration timeout, and reclaims the
-    /// registration and the active-connection entry.
+    /// Release closes every BOUND connection on every cause, an awaiting-bind
+    /// one only when the handler is leaving (ADR-0039 §6), and reclaims the
+    /// registration and the connection entries either way.
     #[test]
-    fn release_closes_active_connections_and_leaves_pending_ones() {
-        let mut actor = unspawned_actor();
-        let promoted_close = CancellationToken::new();
-        let mut early = make_pending("conn-early", "m-1", "user-1");
-        early.close = promoted_close.clone();
-        actor.handle_add_pending_connection(early);
-        actor
-            .handle_register_meeting(
-                "m-1".into(),
-                make_registration("mc-1", "http://mc"),
-                None,
-                TEST_CAP,
-            )
-            .unwrap();
-        let direct = make_connection("conn-direct", "user-2");
-        let direct_close = direct.close.clone();
-        actor.handle_add_connection("m-1".into(), direct);
+    fn release_closes_bound_connections_and_awaiting_ones_only_on_removal() {
+        for kind in [
+            ReleaseKind::MeetingEnded,
+            ReleaseKind::Removal(common::observability::labels::RemovalTrigger::ApplyLag),
+            ReleaseKind::NoCause,
+        ] {
+            let mut actor = unspawned_actor();
+            actor
+                .handle_register_meeting(
+                    "m-1".into(),
+                    make_registration("mc-1", "http://mc"),
+                    None,
+                    TEST_CAP,
+                )
+                .unwrap();
+            let bound = make_connection("conn-bound", "user-1");
+            let bound_close = bound.close.clone();
+            let awaiting = make_connection("conn-awaiting", "user-2");
+            let awaiting_close = awaiting.close.clone();
+            actor.handle_admit_connection("m-1".into(), bound, test_dial_key(), TEST_CAP);
+            actor.handle_admit_connection("m-1".into(), awaiting, test_dial_key(), TEST_CAP);
+            assert_eq!(
+                actor.handle_bind_connection("m-1", "conn-bound", SenderId::from_wire(3).unwrap()),
+                BindOutcome::Bound
+            );
 
-        // A re-join racing the teardown: pending, NOT to be closed.
-        let late = make_pending("conn-late", "m-1", "user-3");
-        let late_close = late.close.clone();
-        actor.handle_add_pending_connection(late);
-
-        assert_eq!(
-            actor.handle_end_meeting("m-1", "mc-1", ReleaseKind::MeetingEnded),
-            MeetingTeardownOutcome::Released
-        );
-        assert!(
-            promoted_close.is_cancelled(),
-            "a promoted connection is closed"
-        );
-        assert!(
-            direct_close.is_cancelled(),
-            "a directly-added connection is closed"
-        );
-        assert!(
-            !late_close.is_cancelled(),
-            "a pending connection is left alone"
-        );
-        assert!(!actor.state.registered_meetings.contains_key("m-1"));
-        assert!(!actor.state.active_connections.contains_key("m-1"));
-        assert!(
-            actor.state.meeting_notifiers.contains_key("m-1"),
-            "the pending connection still waits on this meeting's notifier"
-        );
+            actor.handle_end_meeting("m-1", "mc-1", kind);
+            assert!(bound_close.is_cancelled(), "{kind:?}");
+            assert_eq!(
+                awaiting_close.is_cancelled(),
+                kind.closes_awaiting_bind(),
+                "{kind:?}"
+            );
+            assert!(!actor.state.registered_meetings.contains_key("m-1"));
+            assert!(!actor.state.active_connections.contains_key("m-1"));
+        }
     }
 
     #[test]
@@ -3186,7 +3385,7 @@ mod tests {
             .unwrap();
         let conn = make_connection("conn-1", "user-1");
         let close = conn.close.clone();
-        actor.handle_add_connection("m-1".into(), conn);
+        actor.handle_admit_connection("m-1".into(), conn, test_dial_key(), TEST_CAP);
 
         assert_eq!(
             actor.handle_end_meeting("m-1", "mc-2", ReleaseKind::MeetingEnded),
@@ -3201,17 +3400,74 @@ mod tests {
         );
     }
 
-    /// An `AddConnection` that lands after the meeting was released (the
-    /// connection checked registration, then `EndMeeting` ran) is closed, not
-    /// inserted into a map nothing will ever release again.
+    /// An admission that lands after the meeting was released (the key lookup
+    /// passed, then `EndMeeting` ran) inserts nothing into a map nothing will
+    /// ever release again; the caller closes it DECLINED.
     #[test]
-    fn a_connection_arriving_for_a_released_meeting_is_closed_not_inserted() {
+    fn an_admission_for_a_released_meeting_inserts_nothing() {
         let mut actor = unspawned_actor();
         let conn = make_connection("conn-1", "user-1");
-        let close = conn.close.clone();
-        actor.handle_add_connection("released".into(), conn);
-        assert!(close.is_cancelled());
+        assert_eq!(
+            actor.handle_admit_connection("released".into(), conn, test_dial_key(), TEST_CAP),
+            AdmitOutcome::MeetingNotHeld
+        );
         assert!(!actor.state.active_connections.contains_key("released"));
+    }
+
+    /// Check-to-use (security F-SEC-1): a token verified against K1 is NOT
+    /// admitted once the meeting was re-registered with K2 between the key
+    /// lookup and admission; a token verified against K2 is.
+    #[test]
+    fn an_admission_verified_under_a_replaced_key_inserts_nothing() {
+        let mut actor = unspawned_actor();
+        actor
+            .handle_register_meeting(
+                "m-1".into(),
+                make_registration("mc-1", "http://mc"),
+                None,
+                TEST_CAP,
+            )
+            .unwrap();
+        let k1 = test_dial_key();
+        let k2 = MediaDialKey::from_wire(&[9; 32]).unwrap();
+        let mut rekeyed = make_registration("mc-1", "http://mc");
+        rekeyed.media_dial_key = k2;
+        actor
+            .handle_register_meeting("m-1".into(), rekeyed, None, TEST_CAP)
+            .unwrap();
+        assert_eq!(
+            actor.handle_admit_connection("m-1".into(), make_connection("c1", "u"), k1, TEST_CAP),
+            AdmitOutcome::MeetingNotHeld
+        );
+        assert!(!actor.state.active_connections.contains_key("m-1"));
+        assert_eq!(
+            actor.handle_admit_connection("m-1".into(), make_connection("c2", "u"), k2, TEST_CAP),
+            AdmitOutcome::Admitted
+        );
+    }
+
+    /// A pending-cap refusal leaves no husk entry behind.
+    #[test]
+    fn a_pending_cap_refusal_leaves_no_husk() {
+        let mut actor = unspawned_actor();
+        actor
+            .handle_register_meeting(
+                "m-1".into(),
+                make_registration("mc-1", "http://mc"),
+                None,
+                TEST_CAP,
+            )
+            .unwrap();
+        assert_eq!(
+            actor.handle_admit_connection(
+                "m-1".into(),
+                make_connection("c", "u"),
+                test_dial_key(),
+                0
+            ),
+            AdmitOutcome::PendingCapReached
+        );
+        assert!(!actor.state.active_connections.contains_key("m-1"));
     }
 
     /// An apply message as the gRPC handler would queue it, carrying one
@@ -3328,8 +3584,7 @@ mod tests {
     }
 
     /// Every meeting-keyed map reclaims its entry: emptied connection entries
-    /// are dropped, and the notifier goes with the last pending connection and
-    /// on promotion. Before this, both maps only grew.
+    /// are dropped.
     #[test]
     fn meeting_keyed_maps_do_not_keep_husks() {
         let mut actor = unspawned_actor();
@@ -3341,30 +3596,16 @@ mod tests {
                 TEST_CAP,
             )
             .unwrap();
-        actor.handle_add_connection("m-1".into(), make_connection("conn-1", "user-1"));
+        actor.handle_admit_connection(
+            "m-1".into(),
+            make_connection("conn-1", "user-1"),
+            test_dial_key(),
+            TEST_CAP,
+        );
         assert!(actor.handle_remove_connection("m-1", "conn-1"));
         assert!(
             !actor.state.active_connections.contains_key("m-1"),
             "an emptied meeting entry is dropped"
-        );
-
-        actor.handle_add_pending_connection(make_pending("conn-2", "m-2", "user-2"));
-        assert!(actor.state.meeting_notifiers.contains_key("m-2"));
-        assert!(actor.handle_remove_pending_connection("m-2", "conn-2"));
-        assert!(!actor.state.meeting_notifiers.contains_key("m-2"));
-
-        actor.handle_add_pending_connection(make_pending("conn-3", "m-3", "user-3"));
-        actor
-            .handle_register_meeting(
-                "m-3".into(),
-                make_registration("mc-1", "http://mc"),
-                None,
-                TEST_CAP,
-            )
-            .unwrap();
-        assert!(
-            !actor.state.meeting_notifiers.contains_key("m-3"),
-            "promotion empties the pending list, so the notifier goes with it"
         );
     }
 
@@ -3510,8 +3751,8 @@ mod tests {
     }
 
     /// The connection set is THIS meeting's begun-not-Disconnected set:
-    /// present for an active connection (including one still awaiting its
-    /// `sender_id`), absent for a pending pre-registration one, absent once
+    /// present for an admitted connection (including one still awaiting its
+    /// `sender_id`), absent once
     /// removed — `connection.rs` removes it BEFORE sending
     /// `NotifyParticipantDisconnected`, so a disconnect whose notify exhausted
     /// its retries is already out of the set — and never another meeting's.
@@ -3528,10 +3769,24 @@ mod tests {
                 )
                 .unwrap();
         }
-        actor.handle_add_connection("m-1".into(), make_connection("c-active", "u-1"));
-        actor.handle_add_connection("m-1".into(), make_connection("c-leaving", "u-2"));
-        actor.handle_add_connection("m-2".into(), make_connection("c-other", "u-3"));
-        actor.handle_add_pending_connection(make_pending("c-pending", "m-1", "u-4"));
+        actor.handle_admit_connection(
+            "m-1".into(),
+            make_connection("c-active", "u-1"),
+            test_dial_key(),
+            TEST_CAP,
+        );
+        actor.handle_admit_connection(
+            "m-1".into(),
+            make_connection("c-leaving", "u-2"),
+            test_dial_key(),
+            TEST_CAP,
+        );
+        actor.handle_admit_connection(
+            "m-2".into(),
+            make_connection("c-other", "u-3"),
+            test_dial_key(),
+            TEST_CAP,
+        );
 
         let mut set = actor.build_beat("m-1").unwrap().request.connection_ids;
         set.sort();
