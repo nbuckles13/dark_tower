@@ -2232,7 +2232,7 @@ tasks:
   slug: 2026-11-11-mh-drain-owner-silence
   tag: story-2026-10-31-survive-handler-loss-task-MH-3
 - id: 21
-  status: pending
+  status: completed
   specialist: meeting-controller
   deps:
   - 13
@@ -2291,6 +2291,7 @@ tasks:
     SAME-COMMIT OBLIGATIONS: (a) no new config key (L derived); document L = 2N beside N in docs/runbooks/mc-deployment.md; (b) n/a; (c) each series with panel + catalog + zero-init + ADR-0032 test; (d) test-gates items; (e) no id labels; transitions logged once with meeting_id, handler id and cause in the log line only.
 
     Tier: full (architectural seam, cross-service behaviour).
+  slug: 2026-11-12-mc-handler-detection-removal
   tag: story-2026-10-31-survive-handler-loss-task-MC-B2
 - id: 22
   status: pending
