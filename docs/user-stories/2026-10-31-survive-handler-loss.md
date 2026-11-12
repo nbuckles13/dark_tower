@@ -2153,7 +2153,7 @@ tasks:
   slug: 2026-11-10-mh-media-dial-admission
   tag: story-2026-10-31-survive-handler-loss-task-MH-1
 - id: 20
-  status: pending
+  status: completed
   specialist: media-handler
   deps:
   - 15
@@ -2229,6 +2229,7 @@ tasks:
 
     CROSS-TASK OBLIGATIONS
     (a)–(e) as listed in the story plan. Tier: full (ADR-decided shutdown semantics, the GC seam).
+  slug: 2026-11-11-mh-drain-owner-silence
   tag: story-2026-10-31-survive-handler-loss-task-MH-3
 - id: 21
   status: pending
