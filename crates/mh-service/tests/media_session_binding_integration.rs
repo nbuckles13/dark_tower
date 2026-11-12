@@ -1327,7 +1327,7 @@ async fn datagrams_arriving_on_a_declined_connection_are_counted_not_silently_di
 ///
 /// A client reconnects to the same handler (network change, transport retry)
 /// while its first session is still open; the first session ends later — in
-/// production up to `MAX_IDLE_TIMEOUT_SECONDS` later. Before `connection_id`,
+/// production up to `MH_MAX_IDLE_TIMEOUT_MS` later. Before `connection_id`,
 /// that late disconnect named only (meeting, participant, handler), so MC
 /// removed the handler from the participant's connected set while the second
 /// session was live, and nothing ever repaired it.

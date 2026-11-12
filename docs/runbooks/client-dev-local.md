@@ -1430,10 +1430,12 @@ entry: the same deficit signal with some sources arriving.)
 > meeting JWT. Do not attach one to a ticket, an issue, or a chat message. Named access, encrypted
 > at rest, deleted on a deadline with an owner.
 
-**Also possible and cheaper to rule out**: MH was rolled underneath you. MH sheds media sessions on
-restart by design and, in this build, they do not recover on their own — see
-[`mh-deployment.md` §Rollout With Media Flowing](mh-deployment.md#rollout-with-media-flowing). A
-rejoin fixes it; that is the expected behaviour, not a bug.
+**Also possible and cheaper to rule out**: MH was rolled underneath you. MH drains on SIGTERM, but
+until planned transfer (story 4 MC-F) lands, MC does not move meetings off a draining MH, so a roll
+still sheds every meeting held on that MH at the drain deadline (about 30 s after SIGTERM). The client
+sees a `HANDLER_RELEASED` close for that handler, not a transport fault — see
+[`mh-deployment.md` §MH drains on SIGTERM](mh-deployment.md#mh-drains-on-sigterm). A rejoin fixes it;
+that is the expected behaviour, not a bug.
 
 Full triage: [`mh-incident-response.md` Scenario 17](mh-incident-response.md#scenario-17-media-datagram-drop).
 

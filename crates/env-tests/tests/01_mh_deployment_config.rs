@@ -432,6 +432,18 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
         SHARED_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
+    // Story 4 MH-3 (ADR-0039 §6, §7): the QUIC idle timeout, which REPLACES
+    // the retired compile-time 30 s constant, and the owner-silence release.
+    (
+        "MH_MAX_IDLE_TIMEOUT_MS",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS",
+        SHARED_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
     // Story 3 shared media codec profile: the four keys MH reads.
     (
         "MEDIA_VIDEO_MAX_BITRATE_BPS",
@@ -525,7 +537,27 @@ const CONFIG_GAUGES: &[(&str, &str, Conversion)] = &[
         "mh_media_egress_budget_bytes_per_second",
         Conversion::BitsToBytesFloor,
     ),
+    // Story 4 MH-3. The idle-timeout gauge equalling the ConfigMap's ~N value
+    // is also the evidence that the retired 30 s constant is gone: an image
+    // still on it would publish nothing here (or 30).
+    (
+        "MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS",
+        "mh_media_meeting_owner_silence_timeout_seconds",
+        Conversion::Identity,
+    ),
+    (
+        "MH_MAX_IDLE_TIMEOUT_MS",
+        "mh_media_transport_idle_timeout_seconds",
+        Conversion::MsToSeconds,
+    ),
 ];
+
+/// MH's `MIN_KEEPALIVE_TO_IDLE_RATIO` and `MEETING_OWNER_SILENCE_TIMEOUT_SECONDS_RANGE`
+/// (`crates/mh-service/src/config.rs`), restated because env-tests cannot
+/// import service crates (ADR-0028). Drift-guarded by
+/// `env_test_restates_the_mh3_bounds_exactly` in that file.
+pub const MH_MIN_KEEPALIVE_TO_IDLE_RATIO: u64 = 3;
+pub const MH_OWNER_SILENCE_RANGE_SECONDS: (u64, u64) = (300, 3600);
 
 // The demo requirement (`DEMO_P/N/M`, `required_edges`) and every other
 // constant of the Kind window live in ONE place,
@@ -731,6 +763,34 @@ fn assert_removed_keys_absent(pod: &Value, mh_cm: &Value) {
 /// and their homes.
 fn assert_deployed_relationships(mh_cm: &Value) {
     let mh = |k| positive(mh_cm, SHARED_CONFIGMAP, k);
+    // Story 4 MH-3 (ADR-0039 §7, §8): the QUIC idle timeout is EQUAL to MC's N
+    // (the deployed relationship, stated once here and in mh-service's
+    // config tests), and carries three keepalives.
+    let idle = mh("MH_MAX_IDLE_TIMEOUT_MS");
+    let keepalive = mh("MH_KEEPALIVE_INTERVAL_MS");
+    let n = env_tests::fixtures::kube::configmap_u64(
+        &configmap_name_for_all(MC_INSTANCES, "mc-service-config"),
+        "MC_MH_HEARTBEAT_TIMEOUT_MS",
+    );
+    assert_eq!(
+        idle, n,
+        "MH_MAX_IDLE_TIMEOUT_MS={idle} ({SHARED_CONFIGMAP}) must equal MC_MH_HEARTBEAT_TIMEOUT_MS={n} \
+         (mc-service-config): MC's client-loss evidence is interpretable only when a client's \
+         loss detection (MH's QUIC idle timeout) matches N. Retune both together."
+    );
+    assert!(
+        keepalive * MH_MIN_KEEPALIVE_TO_IDLE_RATIO <= idle,
+        "MH_KEEPALIVE_INTERVAL_MS={keepalive} x {MH_MIN_KEEPALIVE_TO_IDLE_RATIO} exceeds \
+         MH_MAX_IDLE_TIMEOUT_MS={idle} (both {SHARED_CONFIGMAP}): MH refuses to boot. Lower the \
+         keepalive (and the client's MH_KEEPALIVE_FLOOR_MS) in the same change."
+    );
+    let silence = mh("MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS");
+    let (lo, hi) = MH_OWNER_SILENCE_RANGE_SECONDS;
+    assert!(
+        (lo..=hi).contains(&silence),
+        "MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS={silence} ({SHARED_CONFIGMAP}) is outside \
+         [{lo}, {hi}]: MH refuses to boot."
+    );
     let egress = mh("MH_MAX_EGRESS_STREAMS_PER_MEETING");
     let sources = mh("MH_MAX_SOURCE_STREAMS_PER_MEETING");
     assert!(

@@ -33,6 +33,19 @@ pub enum ReleaseKind {
     /// as a removal for connections awaiting their bind (the handler is leaving), but is
     /// counted on the teardown series, never with a `trigger`.
     NoCause,
+    /// **MH-local, outside the `ReleaseCause` projection** ([`Self::of`] never
+    /// produces it): the owning MC has not communicated for
+    /// `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS` (ADR-0039 §6;
+    /// `super::owner_silence`). Released exactly like a RELEASED verdict
+    /// (`HANDLER_RELEASED`, no Disconnected) and counted on
+    /// `mh_media_handler_releases_total{trigger="owner_silence"}`.
+    OwnerSilence,
+    /// **MH-local, outside the `ReleaseCause` projection**: the meeting was
+    /// still held at the planned-drain deadline (ADR-0039 §7; `crate::drain`).
+    /// Its sessions close `HANDLER_RELEASED`. Counted ONLY on
+    /// `mh_drain_meetings_shed_total`, in bulk by the drain coordinator —
+    /// never on the release or teardown series (one home per event).
+    DrainShed,
 }
 
 impl ReleaseKind {
@@ -62,7 +75,7 @@ impl ReleaseKind {
     #[must_use]
     pub const fn closes_awaiting_bind(self) -> bool {
         match self {
-            Self::Removal(_) | Self::NoCause => true,
+            Self::Removal(_) | Self::NoCause | Self::OwnerSilence | Self::DrainShed => true,
             Self::MeetingEnded => false,
         }
     }
@@ -104,6 +117,9 @@ mod tests {
     fn only_meeting_ended_leaves_awaiting_bind_connections_to_the_bind() {
         assert!(!ReleaseKind::MeetingEnded.closes_awaiting_bind());
         assert!(ReleaseKind::NoCause.closes_awaiting_bind());
+        // The MH-local kinds: the handler is leaving the meeting.
+        assert!(ReleaseKind::OwnerSilence.closes_awaiting_bind());
+        assert!(ReleaseKind::DrainShed.closes_awaiting_bind());
         for trigger in RemovalTrigger::ALL {
             assert!(ReleaseKind::Removal(trigger).closes_awaiting_bind());
         }

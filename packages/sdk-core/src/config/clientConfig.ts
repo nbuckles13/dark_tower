@@ -599,7 +599,7 @@ export const HANDLER_SET_CONFIG_RANGES: Readonly<
  * `MH_KEEPALIVE_INTERVAL_MS` — keep it a single literal. Compiled, not a
  * setting: an operator tuning MH keepalive moves this with it.
  */
-export const MH_KEEPALIVE_FLOOR_MS = 10_000;
+export const MH_KEEPALIVE_FLOOR_MS = 2_000;
 
 /** Media-path configuration. */
 export interface MediaConfig {

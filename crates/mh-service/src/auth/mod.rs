@@ -415,7 +415,11 @@ mod tests {
         for (name, token, want) in cases {
             assert_eq!(run(&token, &forge).err(), Some(want), "{name}");
         }
-        // Positive twins at the boundaries.
+        // Positive twins at the boundaries. `now` is RE-SAMPLED here: the twin
+        // has only 4 s of slack (exp = now - 3 against a 7 s skew), and under
+        // Layer-4 load the table above can take longer than that, which made
+        // this arm flaky against the first sample.
+        let now = Utc::now().timestamp();
         let within = DialForge::claims_json(MEETING, HANDLER, "user-1", now - 303, 300);
         assert!(
             run(&forge.sign(&within), &forge).is_ok(),

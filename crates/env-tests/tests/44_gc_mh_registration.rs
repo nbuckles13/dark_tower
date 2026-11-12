@@ -17,7 +17,7 @@
 //! # Evidence
 //!
 //! - **Per-MH.** MH sets `/ready` only after `register()` returns Ok
-//!   (`crates/mh-service/src/main.rs`, `run_gc_task`), and `up` returns only
+//!   (`crates/mh-service/src/grpc/gc_task.rs`, `run`), and `up` returns only
 //!   when the Deployment is Available (contract §5). So a returned `up` means
 //!   a current-generation GC ACCEPTED that MH's endpoints. A rejected MH retries
 //!   forever and never goes Ready. `up` then fails with

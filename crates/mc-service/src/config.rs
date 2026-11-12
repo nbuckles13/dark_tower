@@ -99,7 +99,9 @@ pub const MIN_MH_HEARTBEAT_TIMEOUT_MS: u32 = 1;
 /// Largest legal `MC_MH_HEARTBEAT_TIMEOUT_MS` (N). Far below MH's
 /// owner-silence release (`MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS`,
 /// [300, 3600] s), so a live MC always answers long before MH gives up on it.
-pub const MAX_MH_HEARTBEAT_TIMEOUT_MS: u32 = 30_000;
+/// The value has ONE home, [`common::config::MH_HEARTBEAT_TIMEOUT_CEILING_MS`],
+/// because MH's bounds rest on it too (const-asserted there).
+pub const MAX_MH_HEARTBEAT_TIMEOUT_MS: u32 = common::config::MH_HEARTBEAT_TIMEOUT_CEILING_MS;
 
 /// Smallest legal `MC_MEDIA_DIAL_TOKEN_TTL_SECONDS` (ADR-0039 §5).
 ///

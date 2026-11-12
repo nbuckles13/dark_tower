@@ -21,276 +21,37 @@
 
 mod common;
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use common::heartbeat_rig::*;
+use common::paused_time::{run_for, settle, STEP};
+
+use std::sync::Arc;
 use std::time::Duration;
 
 use ::common::observability::testing::MetricAssertion;
 use bytes::Bytes;
 use common::media_frame::audio_datagram;
 use mh_service::config::{PolicyLimits, EGRESS_QUEUE_FRAMES, NOMINAL_AUDIO_FRAME_BYTES};
-use mh_service::grpc::heartbeat_sender::{
-    HeartbeatError, HeartbeatSender, HeartbeatTransport, TonicHeartbeatTransport,
-};
+use mh_service::grpc::heartbeat_sender::{HeartbeatSender, TonicHeartbeatTransport};
 use mh_service::grpc::MhMediaService;
 use mh_service::media::forward::{forward_one, EgressQueue, IngressFrame};
 use mh_service::media::forwarder::ConnectionForwarder;
 use mh_service::media::queue::SharedQueue;
 use mh_service::observability::metrics::resolve_media_handles;
 use mh_service::routing::{MeetingKey, SenderId};
-use mh_service::session::heartbeat::{HeartbeatSetup, SenderCommand};
-use mh_service::session::{AdmitOutcome, ConnectionEntry, SessionManagerHandle, StreamAdmission};
+use mh_service::session::heartbeat::SenderCommand;
+use mh_service::session::{SessionManagerHandle, StreamAdmission};
 use mh_test_utils::media_policy::{
     egress, register_request, TEST_HEARTBEAT_INTERVAL, TEST_MC_ENDPOINT, TEST_MC_ID,
 };
 use proto_gen::dark_tower::internal::v1::media_handler_service_server::MediaHandlerService;
 use proto_gen::dark_tower::internal::v1::{
-    ApplyRefusal, CandidateSource, EgressStream, EndMeetingRequest, HeartbeatVerdict,
-    MeetingHeartbeatRequest, MeetingHeartbeatResponse, RegisterMeetingRequest, ReleaseCause,
-    ServingState,
+    ApplyRefusal, CandidateSource, EgressStream, HeartbeatVerdict, RegisterMeetingRequest,
+    ReleaseCause, ServingState,
 };
-use rand::rngs::SmallRng;
-use rand::SeedableRng;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tonic::Request;
-
-const HANDLER_ID: &str = "mh-heartbeat-test";
-const SEED: u64 = 0x4D48_2D32;
-/// Time step: fine enough that every due instant is visited on its own.
-const STEP: Duration = Duration::from_millis(10);
-
-// ---------------------------------------------------------------------------
-// Fake MC transport
-// ---------------------------------------------------------------------------
-
-/// How the fake MC answers one meeting's beats.
-#[derive(Clone)]
-enum Reply {
-    Owned,
-    Released(i32),
-    /// A raw verdict number (UNSPECIFIED / unknown).
-    Verdict(i32),
-    Status(tonic::Code),
-    /// Never answers.
-    Hang,
-    /// Wait for the notify, then answer with the inner reply.
-    HoldThen(Arc<Notify>, Box<Reply>),
-}
-
-#[derive(Default)]
-struct FakeMc {
-    replies: Mutex<HashMap<String, Reply>>,
-    calls: Mutex<Vec<(Instant, String, MeetingHeartbeatRequest)>>,
-}
-
-impl FakeMc {
-    fn reply(&self, meeting: &str, reply: Reply) {
-        self.replies
-            .lock()
-            .unwrap()
-            .insert(meeting.to_string(), reply);
-    }
-
-    fn calls_for(&self, meeting: &str) -> Vec<(Instant, MeetingHeartbeatRequest)> {
-        self.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, _, r)| r.meeting_id == meeting)
-            .map(|(t, _, r)| (*t, r.clone()))
-            .collect()
-    }
-
-    fn count(&self, meeting: &str) -> usize {
-        self.calls_for(meeting).len()
-    }
-
-    fn last(&self, meeting: &str) -> MeetingHeartbeatRequest {
-        self.calls_for(meeting)
-            .pop()
-            .unwrap_or_else(|| panic!("{meeting}: no heartbeat was sent"))
-            .1
-    }
-
-    fn endpoint_of_last(&self, meeting: &str) -> String {
-        self.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .rev()
-            .find(|(_, _, r)| r.meeting_id == meeting)
-            .map(|(_, e, _)| e.clone())
-            .unwrap()
-    }
-}
-
-fn answer(reply: &Reply) -> Result<MeetingHeartbeatResponse, HeartbeatError> {
-    match reply {
-        Reply::Owned => Ok(MeetingHeartbeatResponse {
-            verdict: HeartbeatVerdict::Owned as i32,
-            cause: 0,
-        }),
-        Reply::Released(cause) => Ok(MeetingHeartbeatResponse {
-            verdict: HeartbeatVerdict::Released as i32,
-            cause: *cause,
-        }),
-        Reply::Verdict(raw) => Ok(MeetingHeartbeatResponse {
-            verdict: *raw,
-            cause: 0,
-        }),
-        Reply::Status(code) => Err(HeartbeatError::Status(*code)),
-        Reply::Hang | Reply::HoldThen(..) => unreachable!("resolved by the caller"),
-    }
-}
-
-impl HeartbeatTransport for FakeMc {
-    async fn send(
-        &self,
-        endpoint: &str,
-        request: MeetingHeartbeatRequest,
-    ) -> Result<MeetingHeartbeatResponse, HeartbeatError> {
-        let reply = self
-            .replies
-            .lock()
-            .unwrap()
-            .get(&request.meeting_id)
-            .cloned()
-            .unwrap_or(Reply::Owned);
-        self.calls
-            .lock()
-            .unwrap()
-            .push((Instant::now(), endpoint.to_string(), request));
-        match reply {
-            Reply::Hang => std::future::pending().await,
-            Reply::HoldThen(notify, inner) => {
-                notify.notified().await;
-                answer(&inner)
-            }
-            other => answer(&other),
-        }
-    }
-
-    fn evict(&self, _endpoint: &str) {}
-}
-
-// ---------------------------------------------------------------------------
-// Rig
-// ---------------------------------------------------------------------------
-
-struct Rig {
-    sm: SessionManagerHandle,
-    svc: MhMediaService,
-    mc: Arc<FakeMc>,
-    shutdown: CancellationToken,
-}
-
-impl Drop for Rig {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-    }
-}
-
-fn rig_with(admission: StreamAdmission, limits: PolicyLimits) -> Rig {
-    let (tx, rx) = mpsc::channel(mh_service::session::heartbeat::HEARTBEAT_QUEUE_CAPACITY);
-    let (sm, actor) = SessionManagerHandle::new_with_heartbeat_for_tests(
-        admission,
-        HeartbeatSetup {
-            handler_id: HANDLER_ID.to_string(),
-            commands: tx,
-            rng: SmallRng::seed_from_u64(SEED),
-        },
-    );
-    tokio::spawn(actor.run());
-    let mc = Arc::new(FakeMc::default());
-    let shutdown = CancellationToken::new();
-    tokio::spawn(
-        HeartbeatSender::new(Arc::clone(&mc), rx, sm.verdict_sink(), 64).run(shutdown.clone()),
-    );
-    let svc = MhMediaService::new(sm.clone(), HANDLER_ID.to_string(), limits);
-    Rig {
-        sm,
-        svc,
-        mc,
-        shutdown,
-    }
-}
-
-fn rig() -> Rig {
-    rig_with(
-        mh_test_utils::admission::never_binding(),
-        mh_test_utils::admission::fixture_policy_limits(),
-    )
-}
-
-/// Let every runnable task run to quiescence (no time passes).
-async fn settle() {
-    for _ in 0..50 {
-        tokio::task::yield_now().await;
-    }
-}
-
-/// Advance paused time by `total` in [`STEP`]s, settling after each.
-async fn run_for(total: Duration) {
-    let mut elapsed = Duration::ZERO;
-    while elapsed < total {
-        tokio::time::advance(STEP).await;
-        settle().await;
-        elapsed += STEP;
-    }
-}
-
-async fn register(rig: &Rig, request: RegisterMeetingRequest) -> Result<(), tonic::Status> {
-    rig.svc
-        .register_meeting(Request::new(request))
-        .await
-        .map(|_| ())
-}
-
-/// A valid, edge-free registration.
-fn plain(meeting: &str) -> RegisterMeetingRequest {
-    register_request(meeting, 1, Vec::new())
-}
-
-fn end(meeting: &str, mc_id: &str, cause: i32) -> Request<EndMeetingRequest> {
-    Request::new(EndMeetingRequest {
-        meeting_id: meeting.to_string(),
-        mc_id: mc_id.to_string(),
-        cause,
-    })
-}
-
-fn connection(id: &str, participant: &str) -> ConnectionEntry {
-    ConnectionEntry {
-        connection_id: id.to_string(),
-        participant_id: participant.to_string(),
-        connected_at: std::time::Instant::now(),
-        close: CancellationToken::new(),
-        is_bound: false,
-    }
-}
-
-/// Admit `entry` into `meeting` (awaiting its bind), asserting it was admitted.
-async fn admit(sm: &SessionManagerHandle, meeting: &str, entry: ConnectionEntry) {
-    assert_eq!(
-        sm.admit_connection(
-            meeting,
-            entry,
-            mh_test_utils::media_dial::meeting_dial_key(),
-            8
-        )
-        .await,
-        AdmitOutcome::Admitted,
-        "{meeting}: fixture admission"
-    );
-}
-
-const HEARTBEATS: &str = "mh_mc_heartbeats_total";
-const VERDICTS: &str = "mh_mc_heartbeat_verdicts_total";
-const RELEASES: &str = "mh_media_handler_releases_total";
-const TEARDOWNS: &str = "mh_media_meeting_teardowns_total";
-const KC: (&str, &str) = ("key_custody", "operator");
 
 // ---------------------------------------------------------------------------
 // Schedule
@@ -507,11 +268,7 @@ async fn a_full_queue_drops_beats_and_never_blocks_the_actor() {
     let (tx, mut rx) = mpsc::channel(1);
     let (sm, actor) = SessionManagerHandle::new_with_heartbeat_for_tests(
         mh_test_utils::admission::never_binding(),
-        HeartbeatSetup {
-            handler_id: HANDLER_ID.to_string(),
-            commands: tx,
-            rng: SmallRng::seed_from_u64(SEED),
-        },
+        heartbeat_setup(tx).0,
     );
     tokio::spawn(actor.run());
     let svc = MhMediaService::new(
@@ -1016,11 +773,7 @@ async fn a_real_channel_is_reused_per_mc_endpoint() {
     let (tx, rx) = mpsc::channel(16);
     let (sm, actor) = SessionManagerHandle::new_with_heartbeat_for_tests(
         mh_test_utils::admission::never_binding(),
-        HeartbeatSetup {
-            handler_id: HANDLER_ID.to_string(),
-            commands: tx,
-            rng: SmallRng::seed_from_u64(SEED),
-        },
+        heartbeat_setup(tx).0,
     );
     tokio::spawn(actor.run());
     let shutdown = CancellationToken::new();
@@ -1107,11 +860,7 @@ async fn a_disconnect_whose_notify_exhausted_its_retries_leaves_the_set() {
     let (tx, mut beats) = mpsc::channel(4096);
     let (sm, actor) = SessionManagerHandle::new_with_heartbeat_for_tests(
         mh_test_utils::admission::never_binding(),
-        HeartbeatSetup {
-            handler_id: HANDLER_ID.to_string(),
-            commands: tx,
-            rng: SmallRng::seed_from_u64(SEED),
-        },
+        heartbeat_setup(tx).0,
     );
     tokio::spawn(actor.run());
     let (disc_tx, mut disconnects) = mpsc::channel(16);

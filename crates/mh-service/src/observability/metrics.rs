@@ -41,6 +41,34 @@ pub fn init_metrics_recorder() -> Result<PrometheusHandle, String> {
         .map_err(|e| format!("Failed to install Prometheus recorder: {e}"))
 }
 
+/// `mh_mc_heartbeat_latency_seconds` buckets (story 4 MH-2). Low end copied
+/// from `mh_gc_heartbeat` (in-cluster gRPC); the top is 10 s, the largest
+/// heartbeat INTERVAL (the largest per-attempt deadline is 3/4 of it, 7.5 s).
+pub const MC_HEARTBEAT_LATENCY_BUCKETS: [f64; 12] = [
+    0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000, 10.000,
+];
+
+// The top latency bucket must cover MC's largest heartbeat interval (N/3 at the
+// shared ceiling). Raising the ceiling fails here until the bucket is widened.
+const MC_HEARTBEAT_LATENCY_TOP_BUCKET: f64 = {
+    let [.., top] = MC_HEARTBEAT_LATENCY_BUCKETS;
+    top
+};
+const _: () = assert!(
+    MC_HEARTBEAT_LATENCY_TOP_BUCKET * 1_000.0
+        >= (common::config::MH_HEARTBEAT_TIMEOUT_CEILING_MS / 3) as f64,
+    "mh_mc_heartbeat_latency's top bucket is below MC's largest heartbeat interval"
+);
+
+/// `mh_drain_duration_seconds` buckets (story 4 MH-3): signal receipt to the
+/// exit decision. A drain ends empty (as soon as MC has moved every meeting
+/// off, typically seconds) or at the deadline, `grace − 5 s` (30 s at the
+/// deployed 35 s grace). The top bucket MUST stay above the deployed drain
+/// window, or every deadline exit lands in `+Inf`; a unit test derives the
+/// window from the deployed grace and checks this.
+pub const DRAIN_DURATION_BUCKETS: [f64; 11] =
+    [0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 45.0, 60.0];
+
 /// Build the `PrometheusBuilder` with MH's production bucket configuration,
 /// WITHOUT installing it globally. Single source of the exporter config so the
 /// present-at-zero render test exercises the SAME builder production installs.
@@ -64,18 +92,20 @@ fn configured_prometheus_builder() -> Result<PrometheusBuilder, String> {
         // largest INTERVAL (the largest per-attempt deadline is 3/4 of it,
         // 7.5 s).
         //
-        // ANCHOR (DRY): the top bucket rests on MC's heartbeat interval bound:
-        // interval = N/3 with N = `MC_MH_HEARTBEAT_TIMEOUT_MS` <=
-        // `MAX_MH_HEARTBEAT_TIMEOUT_MS` (30000 ms, crates/mc-service/src/config.rs;
-        // N is published as `mc_media_handler_heartbeat_deadline_seconds`).
-        // Widening MC's range past 30 s needs a wider top bucket here.
+        // The top bucket rests on MC's heartbeat interval bound (interval =
+        // N/3, N <= `common::config::MH_HEARTBEAT_TIMEOUT_CEILING_MS`), and is
+        // const-asserted against it at [`MC_HEARTBEAT_LATENCY_BUCKETS`].
         .set_buckets_for_metric(
             Matcher::Prefix("mh_mc_heartbeat_latency".to_string()),
-            &[
-                0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000, 10.000,
-            ],
+            &MC_HEARTBEAT_LATENCY_BUCKETS,
         )
         .map_err(|e| format!("Failed to set MC heartbeat buckets: {e}"))?
+        // Planned drain duration (story 4 MH-3); see [`DRAIN_DURATION_BUCKETS`].
+        .set_buckets_for_metric(
+            Matcher::Prefix("mh_drain_duration".to_string()),
+            &DRAIN_DURATION_BUCKETS,
+        )
+        .map_err(|e| format!("Failed to set drain duration buckets: {e}"))?
         // GC registration latency buckets - registration can be slower
         .set_buckets_for_metric(
             Matcher::Prefix("mh_gc_registration".to_string()),
@@ -627,6 +657,53 @@ pub fn record_mc_heartbeat_verdict(verdict: McHeartbeatVerdict) {
     counter!("mh_mc_heartbeat_verdicts_total", "outcome" => verdict.as_label()).increment(1);
 }
 
+/// The `trigger` label of `mh_media_handler_releases_total`: MH's OWN
+/// vocabulary, which WRAPS the fleet-wide [`RemovalTrigger`] (never extends it;
+/// see its doc in `crates/common`).
+///
+/// - [`Self::Removal`]: MC removed this handler (a removal-cause `EndMeeting`
+///   or RELEASED verdict), projected from the wire `ReleaseCause`.
+/// - [`Self::OwnerSilence`]: **MH-local, outside the `ReleaseCause`
+///   projection** — it never crosses the wire. MH released the meeting
+///   because its owning MC had not communicated for
+///   `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS` (ADR-0039 §6). `clients="none"`
+///   is routine cleanup after an MC rollout; `clients="present"` means people
+///   stayed attached to a meeting no MC owned for the whole window.
+///
+/// The drain-deadline shed is NOT here: it is counted only on
+/// `mh_drain_meetings_shed_total` (one home per event).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseTrigger {
+    /// A removal by MC, with its fleet-wide trigger.
+    Removal(RemovalTrigger),
+    /// MH-local owner-silence release.
+    OwnerSilence,
+}
+
+// The zero-init list must carry every fleet-wide removal trigger plus the
+// one MH-local value: a new `RemovalTrigger` fails here until it is added.
+const _: () = assert!(ReleaseTrigger::ALL.len() == RemovalTrigger::ALL.len() + 1);
+
+impl ReleaseTrigger {
+    /// Every value, in catalog order: the three removal triggers, then
+    /// `owner_silence`.
+    pub const ALL: [Self; 4] = [
+        Self::Removal(RemovalTrigger::HeartbeatTimeout),
+        Self::Removal(RemovalTrigger::ApplyLag),
+        Self::Removal(RemovalTrigger::PlannedTransfer),
+        Self::OwnerSilence,
+    ];
+
+    /// The `trigger` label value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Removal(trigger) => trigger.label(),
+            Self::OwnerSilence => "owner_silence",
+        }
+    }
+}
+
 /// Bounded `clients` values for `mh_media_handler_releases_total`: whether the
 /// released meeting had at least one active connection at release. Read from
 /// the SAME predicate as `mh_media_meetings_without_clients`.
@@ -839,8 +916,8 @@ pub struct SessionMetricHandles {
     /// Indexed by [`MeetingTeardownOutcome::ALL`] order.
     teardowns: [Counter; 4],
     /// `mh_media_handler_releases_total`, indexed by
-    /// [`RemovalTrigger::ALL`] x [`ReleaseClients::ALL`] order.
-    releases: [[Counter; 2]; 3],
+    /// [`ReleaseTrigger::ALL`] x [`ReleaseClients::ALL`] order.
+    releases: [[Counter; 2]; 4],
     /// `mh_media_meetings_without_clients`.
     meetings_without_clients: Gauge,
     /// `mh_media_released_meeting_apply_refusals_total`: see
@@ -869,25 +946,26 @@ impl SessionMetricHandles {
         }
     }
 
-    /// Count one handler REMOVAL release (ADR-0039 §8): a removal-cause
-    /// `EndMeeting` or a RELEASED verdict carrying a removal trigger.
-    /// `MEETING_ENDED` (and the misroute) stay on
-    /// `mh_media_meeting_teardowns_total{outcome="released"}`: one home per
+    /// Count one handler release (ADR-0039 §6, §8): a removal-cause
+    /// `EndMeeting`, a RELEASED verdict carrying a removal trigger, or the
+    /// MH-local owner-silence release. `MEETING_ENDED` (and the misroute) stay
+    /// on `mh_media_meeting_teardowns_total{outcome="released"}`, and a
+    /// drain-deadline shed only on `mh_drain_meetings_shed_total`: one home per
     /// event.
     ///
     /// Metric: `mh_media_handler_releases_total`
-    /// Labels: `trigger` ([`RemovalTrigger`]; MH-3 adds the MH-local
-    /// `owner_silence`), `clients` ([`ReleaseClients`]), `key_custody`
-    /// Cardinality: 6. `trigger="heartbeat_timeout", clients="present"` is the
+    /// Labels: `trigger` ([`ReleaseTrigger`]), `clients` ([`ReleaseClients`]),
+    /// `key_custody`
+    /// Cardinality: 8. `trigger="heartbeat_timeout", clients="present"` is the
     /// false-declaration ground truth only MH can see.
-    pub fn record_handler_release(&self, trigger: RemovalTrigger, clients: ReleaseClients) {
-        let [heartbeat_timeout, apply_lag, planned_transfer] = &self.releases;
-        let row = match trigger {
-            RemovalTrigger::HeartbeatTimeout => heartbeat_timeout,
-            RemovalTrigger::ApplyLag => apply_lag,
-            RemovalTrigger::PlannedTransfer => planned_transfer,
+    pub fn record_handler_release(&self, trigger: ReleaseTrigger, clients: ReleaseClients) {
+        let [heartbeat_timeout, apply_lag, planned_transfer, owner_silence] = &self.releases;
+        let [present, none] = match trigger {
+            ReleaseTrigger::Removal(RemovalTrigger::HeartbeatTimeout) => heartbeat_timeout,
+            ReleaseTrigger::Removal(RemovalTrigger::ApplyLag) => apply_lag,
+            ReleaseTrigger::Removal(RemovalTrigger::PlannedTransfer) => planned_transfer,
+            ReleaseTrigger::OwnerSilence => owner_silence,
         };
-        let [present, none] = row;
         match clients {
             ReleaseClients::Present => present.increment(1),
             ReleaseClients::None => none.increment(1),
@@ -1022,7 +1100,7 @@ pub fn resolve_session_handles() -> SessionMetricHandles {
                 KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
             )
         }),
-        releases: RemovalTrigger::ALL.map(|trigger| {
+        releases: ReleaseTrigger::ALL.map(|trigger| {
             ReleaseClients::ALL.map(|clients| {
                 counter!(
                     "mh_media_handler_releases_total",
@@ -1467,6 +1545,67 @@ pub fn publish_media_dial_clock_skew(skew_seconds: u64) {
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .set(skew_seconds as f64);
+}
+
+/// Publish the two MH-3 config gauges (ADR-0039 §6, §7, §8), from the SAME
+/// config fields the owner-silence timer and `build_transport_config` read:
+///
+/// - `mh_media_meeting_owner_silence_timeout_seconds`
+///   (`MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS`);
+/// - `mh_media_transport_idle_timeout_seconds` (`MH_MAX_IDLE_TIMEOUT_MS` / 1000):
+///   the QUIC idle timeout a client's loss detection runs on, published
+///   beside MC's `mc_media_handler_heartbeat_deadline_seconds` (N); the
+///   client-loss evidence is interpretable only when the two are about equal.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "bounded config integers (<= 3600 s, <= 30000 ms)"
+)]
+pub fn publish_liveness_config(owner_silence_timeout: Duration, max_idle_timeout_ms: u64) {
+    gauge!(
+        "mh_media_meeting_owner_silence_timeout_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(owner_silence_timeout.as_secs_f64());
+    gauge!(
+        "mh_media_transport_idle_timeout_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(max_idle_timeout_ms as f64 / 1_000.0);
+}
+
+// ============================================================================
+// Planned drain (story 4 MH-3; ADR-0039 §7, §8). BEST-EFFORT: exit-time
+// values may never be scraped. The authoritative drain outcome is MC's
+// `mc_media_handler_migrations_total{trigger="planned_transfer"}`, and MH's
+// final exit log line carries the outcome, duration and shed count.
+// ============================================================================
+
+/// Set the meetings this handler still holds during a drain (0 when not
+/// draining). Recompute-and-set from the session actor's held count.
+///
+/// Metric: `mh_drain_meetings_remaining` (gauge, no labels)
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "bounded by MH_MAX_REGISTERED_MEETINGS (<= 2^16)"
+)]
+pub fn set_drain_meetings_remaining(meetings: usize) {
+    gauge!("mh_drain_meetings_remaining").set(meetings as f64);
+}
+
+/// Count the meetings still held at the drain deadline (shed with
+/// `HANDLER_RELEASED`).
+///
+/// Metric: `mh_drain_meetings_shed_total` (counter, no labels)
+pub fn record_drain_meetings_shed(meetings: usize) {
+    counter!("mh_drain_meetings_shed_total").increment(u64::try_from(meetings).unwrap_or(u64::MAX));
+}
+
+/// Observe one drain, signal receipt to the exit decision.
+///
+/// Metric: `mh_drain_duration_seconds` (histogram, no labels;
+/// [`DRAIN_DURATION_BUCKETS`])
+pub fn record_drain_duration(duration: Duration) {
+    histogram!("mh_drain_duration_seconds").record(duration.as_secs_f64());
 }
 
 // ============================================================================
@@ -2713,9 +2852,9 @@ pub fn zero_initialize_counters() {
     for o in MeetingTeardownOutcome::ALL {
         counter!("mh_media_meeting_teardowns_total", "outcome" => o.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
-    // Handler releases (story 4 MH-2): 3 removal triggers x clients. MH-3's
-    // MH-local `owner_silence` is NOT emitted here until MH-3 lands it.
-    for t in RemovalTrigger::ALL {
+    // Handler releases (story 4 MH-2, MH-3): 3 removal triggers plus the
+    // MH-local `owner_silence`, x clients.
+    for t in ReleaseTrigger::ALL {
         for c in ReleaseClients::ALL {
             counter!("mh_media_handler_releases_total", TRIGGER_LABEL => t.label(), "clients" => c.as_label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
         }
@@ -2728,6 +2867,16 @@ pub fn zero_initialize_counters() {
     for v in McHeartbeatVerdict::ALL {
         counter!("mh_mc_heartbeat_verdicts_total", "outcome" => v.as_label()).increment(0);
     }
+    // Planned drain (story 4 MH-3): present from boot, so a pod that goes away
+    // before its drain is scraped still had the series. The remaining-meetings
+    // gauge reads 0 when not draining.
+    counter!("mh_drain_meetings_shed_total").increment(0);
+    gauge!("mh_drain_meetings_remaining").set(0.0);
+    // The drain histogram too: each pod observes it at most once, inside its
+    // exit linger, so without a boot-time zero there is never a prior sample
+    // for `increase()` to diff against (the panel reads `increase(_sum) /
+    // increase(_count)` from the 0 -> 1 transition).
+    let _ = histogram!("mh_drain_duration_seconds");
     // Released-meeting guard: expected-empty and rare, which is exactly why it
     // must be present at zero. Absent must mean "not scraped", never "the guard
     // has not fired".
@@ -2896,7 +3045,7 @@ mod tests {
                 v.as_label()
             ));
         }
-        for t in RemovalTrigger::ALL {
+        for t in ReleaseTrigger::ALL {
             for c in ReleaseClients::ALL {
                 present_at_zero(&format!(
                     r#"mh_media_handler_releases_total{{trigger="{}",clients="{}",key_custody="operator"}}"#,
@@ -2905,6 +3054,13 @@ mod tests {
                 ));
             }
         }
+
+        // Story 4 MH-3: the planned-drain series, present from boot (a pod that
+        // goes away before its drain is scraped still had them).
+        present_at_zero("mh_drain_meetings_shed_total ");
+        present_at_zero("mh_drain_meetings_remaining ");
+        present_at_zero("mh_drain_duration_seconds_count ");
+        present_at_zero("mh_drain_duration_seconds_sum ");
 
         // Series-count ceiling (security): a future enum variant can't silently
         // multiply the cross-product unnoticed.
@@ -3611,6 +3767,72 @@ mod tests {
             .gauge("mh_media_dial_clock_skew_seconds")
             .with_labels(&[("key_custody", "operator")])
             .assert_value(7.0);
+    }
+
+    /// The drain recorders (ADR-0032): shed by the count, the remaining gauge
+    /// recompute-and-set, one duration observation.
+    #[test]
+    fn the_drain_series_record_what_they_are_given() {
+        use common::observability::testing::MetricAssertion;
+        let snapshot = MetricAssertion::snapshot();
+        record_drain_duration(Duration::from_secs(12));
+        record_drain_meetings_shed(3);
+        set_drain_meetings_remaining(5);
+        set_drain_meetings_remaining(2);
+        // Histograms first: a snapshot read drains histogram observations.
+        snapshot
+            .histogram("mh_drain_duration_seconds")
+            .assert_observation_count(1);
+        snapshot
+            .counter("mh_drain_meetings_shed_total")
+            .assert_delta(3);
+        snapshot
+            .gauge("mh_drain_meetings_remaining")
+            .assert_value(2.0);
+    }
+
+    /// `owner_silence` is the MH-local fourth trigger, distinct from every
+    /// fleet-wide removal value; the label set is exactly the catalog's.
+    #[test]
+    fn release_triggers_are_the_three_removals_plus_owner_silence() {
+        let labels: Vec<&str> = ReleaseTrigger::ALL.iter().map(|t| t.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "heartbeat_timeout",
+                "apply_lag",
+                "planned_transfer",
+                "owner_silence"
+            ]
+        );
+    }
+
+    /// The drain-duration top bucket stays above the DEPLOYED drain window
+    /// (grace − margin, the grace read from the MH template), so a deadline
+    /// exit never lands only in `+Inf`.
+    #[test]
+    fn the_drain_duration_top_bucket_covers_the_deployed_drain_window() {
+        let template = include_str!("../../../../infra/services/mh-service/deployment.yaml");
+        let grace: Vec<u64> = template
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("terminationGracePeriodSeconds:"))
+            .map(|v| v.trim().parse().expect("numeric grace"))
+            .collect();
+        assert_eq!(
+            grace.len(),
+            1,
+            "one terminationGracePeriodSeconds in the template"
+        );
+        let window = crate::config::drain_window_for(grace[0]).as_secs_f64();
+        let top = *DRAIN_DURATION_BUCKETS.last().expect("buckets");
+        assert!(
+            top > window,
+            "top bucket {top}s must exceed the deployed drain window {window}s"
+        );
+        assert!(
+            DRAIN_DURATION_BUCKETS.contains(&window),
+            "the deployed deadline is itself an edge, so deadline exits are legible"
+        );
     }
 
     #[test]

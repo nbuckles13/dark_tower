@@ -93,8 +93,9 @@ pub enum SenderCommand {
     },
 }
 
-/// What the actor needs to heartbeat: who it is, where beats go, and the
-/// jitter RNG.
+/// What the actor needs to heartbeat: who it is, where beats go, the jitter
+/// RNG, and the two MC-liveness inputs story 4 MH-3 adds (the drain state the
+/// beats report, and the owner-silence timeout OWNED verdicts reset).
 #[derive(Debug)]
 pub struct HeartbeatSetup {
     /// This handler's id, as it registers with GC.
@@ -104,6 +105,12 @@ pub struct HeartbeatSetup {
     /// Jitter source. Production: `rand::make_rng()` (entropy-seeded). Tests:
     /// `SmallRng::seed_from_u64`.
     pub rng: SmallRng,
+    /// The process drain state (`crate::drain`): beats carry DRAINING and
+    /// `drain_remaining_ms` while it holds a deadline.
+    pub drain: crate::drain::DrainWatch,
+    /// `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS` (`Config` validates it to
+    /// [300, 3600] s; tests use a real in-range value under paused time).
+    pub owner_silence_timeout: Duration,
 }
 
 /// One meeting's schedule entry.
@@ -225,6 +232,30 @@ impl HeartbeatSchedule {
         );
     }
 
+    /// Make the meeting's next beat due at `now` (a meeting registered while
+    /// draining: its MC learns at once, unjittered). No-op for an unknown
+    /// meeting; never pushes a due instant LATER.
+    pub fn due_now(&mut self, meeting_id: &str, now: Instant) {
+        let seq = self.next_seq();
+        if let Some(entry) = self.entries.get_mut(meeting_id) {
+            if now < entry.due.0 {
+                self.by_due.remove(&entry.due);
+                entry.due = (now, seq);
+                self.by_due.insert(entry.due, meeting_id.to_owned());
+            }
+        }
+    }
+
+    /// Make every meeting's next beat due at `now` (ADR-0039 §1: "DRAINING
+    /// resets every meeting's deadline to now"). The cadence then resumes one
+    /// interval after `now` (`take_due`).
+    pub fn due_all_now(&mut self, now: Instant) {
+        let meetings: Vec<String> = self.entries.keys().cloned().collect();
+        for meeting_id in meetings {
+            self.due_now(&meeting_id, now);
+        }
+    }
+
     /// Remove the meeting's schedule (release).
     pub fn remove(&mut self, meeting_id: &str) -> bool {
         match self.entries.remove(meeting_id) {
@@ -284,8 +315,12 @@ impl HeartbeatSchedule {
     }
 }
 
-/// `now + by`, saturating to a far-future instant instead of panicking.
-fn checked_after(now: Instant, by: Duration) -> Instant {
+/// `now + by`, saturating to a far-future instant instead of panicking. The
+/// ONE saturating deadline add of the session actor's timers (the heartbeat
+/// schedule and the owner-silence timers): on overflow a deadline moves FAR
+/// out (a year), so no timer fails open. Only if `now` is itself within a
+/// year of the clock's maximum does the last arm fall back to `now`.
+pub(super) fn checked_after(now: Instant, by: Duration) -> Instant {
     now.checked_add(by)
         .or_else(|| now.checked_add(FAR_FUTURE))
         .unwrap_or(now)
@@ -400,6 +435,26 @@ mod tests {
         s.upsert("m", short, t, false);
         assert_eq!(s.earliest(), Some(t + short));
         assert_eq!(s.interval_of("m"), Some(short));
+    }
+
+    #[test]
+    fn due_all_now_pulls_every_meeting_in_and_never_pushes_one_later() {
+        let now = Instant::now();
+        let mut s = schedule();
+        for i in 0..5 {
+            s.upsert(&format!("m-{i}"), Duration::from_secs(10), now, false);
+        }
+        let t = now + Duration::from_millis(1);
+        s.due_all_now(t);
+        let mut due = s.take_due(t, MAX_BEATS_PER_WAKE);
+        due.sort();
+        assert_eq!(due.len(), 5, "every meeting is due at once");
+        // After the burst the cadence resumes one interval later.
+        assert_eq!(s.earliest(), Some(t + Duration::from_secs(10)));
+        // An instant LATER than a meeting's due never delays it.
+        s.due_now("m-0", t + Duration::from_secs(60));
+        assert_eq!(s.earliest(), Some(t + Duration::from_secs(10)));
+        s.due_now("unknown", t);
     }
 
     #[test]

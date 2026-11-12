@@ -715,10 +715,15 @@ export AC_JWKS_URL="http://localhost:8082/.well-known/jwks.json"
 # QUIC transport parameters (required; ADR-0036 §1).
 export MH_MAX_CONCURRENT_UNI_STREAMS="64"
 export MH_DATAGRAM_BUFFER_AUDIO_FRAMES="32"
-export MH_KEEPALIVE_INTERVAL_MS="10000"
+export MH_KEEPALIVE_INTERVAL_MS="2000"
+# QUIC idle timeout (required; >= 3 x keepalive, sized to MC's MC_MH_HEARTBEAT_TIMEOUT_MS).
+export MH_MAX_IDLE_TIMEOUT_MS="6000"
 export MH_MAX_CONNECTIONS="500"
-# Drain window (required). In-cluster this is derived from the pod's grace period; locally, set it.
+# Drain budget (required): MH drains for grace - 5 s on SIGTERM. In-cluster this is derived from the
+# pod's grace period; locally, set it.
 export MH_TERMINATION_GRACE_SECONDS="35"
+# Owner-silence release (required, 300..=3600).
+export MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS="900"
 # Egress-budget chain (required).
 export MH_EGRESS_BUDGET_BPS="82640000"
 export MH_EGRESS_REJECTION_RATIO_THRESHOLD="0.05"

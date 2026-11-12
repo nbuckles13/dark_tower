@@ -907,8 +907,11 @@ impl ConnectionEnd {
     /// - `MeetingReleased` is `HANDLER_RELEASED`, about this session's own
     ///   validated meeting.
     /// - `ClientClosed` / `Error`: the client ended it, or the transport failed.
-    /// - `Shutdown`: server shutdown cancellation stays code-less until MH-3's
-    ///   drain lands its drain-deadline shed.
+    /// - `Shutdown`: code-less. Under the planned drain (ADR-0039 §7,
+    ///   `crate::drain`) every session of a still-held meeting is closed
+    ///   `HANDLER_RELEASED` by the deadline shed (`MeetingReleased`) BEFORE the
+    ///   shutdown token is cancelled, so this arm only ends sessions no held
+    ///   meeting owns (e.g. still pending admission).
     const fn session_close(self, session: &ValidatedSession) -> Option<SessionClose> {
         match self {
             Self::MeetingReleased => Some(session.closing(ValidatedClose::MeetingReleased)),

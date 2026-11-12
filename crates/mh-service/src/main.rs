@@ -17,7 +17,7 @@
 //! 4. Start health HTTP server (liveness, readiness, metrics)
 //! 5. Start gRPC server for MC→MH communication
 //! 6. Create `GcClient` and spawn GC task (registration + load reports)
-//! 7. Wait for shutdown signal
+//! 7. Wait for shutdown signal, then DRAIN (ADR-0039 §7; `mh_service::drain`)
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::too_many_lines)]
@@ -31,7 +31,7 @@ use common::jwt::JwksClient;
 use common::token_manager::{spawn_token_manager, TokenManagerConfig};
 use mh_service::config::Config;
 use mh_service::errors::MhError;
-use mh_service::grpc::{GcClient, McClient, MhAuthLayer, MhMediaService};
+use mh_service::grpc::{gc_task, GcClient, McClient, MhAuthLayer, MhMediaService};
 use mh_service::observability::{health_router, HealthState};
 use mh_service::session::{SessionManagerHandle, StreamAdmission};
 use mh_service::webtransport::connection::ClientAdmission;
@@ -167,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         transport_receive_window_bytes = mh_service::config::CONNECTION_RECEIVE_WINDOW_BYTES,
         transport_stream_receive_window_bytes = mh_service::config::STREAM_RECEIVE_WINDOW_BYTES,
         transport_keepalive_interval_ms = config.quic_transport.keepalive_interval_ms,
-        transport_max_idle_timeout_ms = mh_service::config::MAX_IDLE_TIMEOUT_SECONDS * 1_000,
+        transport_max_idle_timeout_ms = config.quic_transport.max_idle_timeout_ms,
         // BOTH conversion factors, so `frames x bytes_factor = bytes` AND
         // `frames x ms_factor = ms` are each checkable from this one line
         // rather than from source. The ms link matters at least as much as the
@@ -177,15 +177,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         nominal_audio_frame_bytes = mh_service::config::NOMINAL_AUDIO_FRAME_BYTES,
         audio_frame_duration_ms = mh_service::config::AUDIO_FRAME_DURATION_MS,
         egress_queue_frames = mh_service::config::EGRESS_QUEUE_FRAMES,
-        // Drain chain: seconds end to end, so nothing here is a unit conversion.
-        // `drain_window_source` names which arm of the min() won — the only way
-        // to tell "2s because that is the settle target" from "1s because the
-        // grace was set to 6" without reading source.
+        // Drain chain (ADR-0039 §7): seconds end to end, so nothing here is a
+        // unit conversion. drain = grace − margin, no cap.
         termination_grace_seconds = config.termination_grace_seconds,
-        shutdown_settle_target_seconds = mh_service::config::SHUTDOWN_SETTLE_TARGET_SECONDS,
         shutdown_margin_seconds = mh_service::config::SHUTDOWN_MARGIN_SECONDS,
         drain_window_seconds = config.drain_window.as_secs(),
-        drain_window_source = config.drain_window_source.as_str(),
+        // Owner-silence release (ADR-0039 §6).
+        meeting_owner_silence_timeout_seconds = config.meeting_owner_silence_timeout.as_secs(),
         // ADR-0036 §8 policy bounds (REQUIRED since story 2 R-22). Logged for
         // two reasons: this line is where an operator reads the effective
         // value of every bound without reading the ConfigMap AND the pod start
@@ -336,13 +334,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.egress_admission,
         &config.policy_limits,
     );
+    // Story 4 MH-3 config gauges, from the same fields the owner-silence timer
+    // and `build_transport_config` read.
+    mh_service::observability::metrics::publish_liveness_config(
+        config.meeting_owner_silence_timeout,
+        config.quic_transport.max_idle_timeout_ms,
+    );
     info!("Prometheus metrics recorder initialized");
 
     // Initialize health state
     let health_state = Arc::new(HealthState::new());
 
-    // Create shutdown token
+    // Create shutdown token. Cancelled ONLY by the drain coordinator, after
+    // the drain (`mh_service::drain::run`).
     let shutdown_token = CancellationToken::new();
+    // The process drain state (story 4 MH-3): read by the GC task (load-report
+    // health) and the session actor (heartbeat ServingState).
+    let (drain_tx, drain_rx) = mh_service::drain::channel();
 
     // Spawn TokenManager for OAuth token acquisition (ADR-0003)
     info!(
@@ -429,6 +437,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             handler_id: config.handler_id.clone(),
             commands: heartbeat_tx,
             rng: rand::make_rng(),
+            drain: drain_rx.clone(),
+            owner_silence_timeout: config.meeting_owner_silence_timeout,
         },
     );
     // The sender holds only a WEAK handle to the actor's mailbox, so it never
@@ -451,6 +461,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // GC's `current_streams` reads the same live table admission counts
     // against (see `GcClient::current_streams`).
     let routing_table_for_gc = session_manager.routing_table();
+    // The drain coordinator's handle (held count, deadline shed).
+    let session_for_drain = session_manager.clone();
     info!("Session manager actor spawned");
 
     // Create MC notification client for MH→MC participant notifications (R-16/R-17)
@@ -651,8 +663,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn GC task (registration + load report heartbeats)
     let gc_task_token = shutdown_token.child_token();
     let gc_task_health = Arc::clone(&health_state);
+    let gc_task_drain = drain_rx.clone();
     tokio::spawn(async move {
-        run_gc_task(gc_client, gc_task_health, gc_task_token).await;
+        gc_task::run(&gc_client, &gc_task_health, gc_task_drain, gc_task_token).await;
     });
     info!("GC task started");
 
@@ -661,31 +674,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for shutdown signal
     shutdown_signal().await;
 
-    // Trigger graceful shutdown
-    info!("Shutdown signal received, initiating graceful shutdown...");
-
-    // Mark as not ready immediately so k8s stops sending traffic
-    health_state.set_not_ready();
-
-    shutdown_token.cancel();
-
-    // Settle window, DERIVED at config load as
-    // `min(SHUTDOWN_SETTLE_TARGET, MH_TERMINATION_GRACE_SECONDS - SHUTDOWN_MARGIN)`
-    // and validated there (ADR-0036 §11: "derive rather than guard wherever two
-    // values encode one relationship" — a derived value cannot drift, a guard
-    // only catches drift after someone introduces it).
-    //
-    // No seconds literal lives here on purpose. The previous hardcoded 2s was a
-    // number with no stated relationship to the 35s `terminationGracePeriodSeconds`
-    // it had to fit inside; the two could be edited independently and neither
-    // site mentioned the other.
-    //
-    // This is NOT a drain phase. ADR-0036 §11 decides that MH SHEDS media
-    // sessions on restart rather than draining them, and v1 keeps it that way —
-    // recovery is §8's re-assert. This window only lets in-flight teardown
-    // settle. The effective value and the arm that produced it are on the
-    // startup log line above.
-    tokio::time::sleep(config.drain_window).await;
+    // Planned drain (ADR-0039 §7, reversing ADR-0036 §11's shed-on-restart).
+    // Not ready at once (latched: a GC registration completing mid-drain
+    // cannot flip it back); /health stays 200. `drain::run` publishes the
+    // deadline (DRAINING to GC and every meeting's MC), keeps everything
+    // serving, waits for "holds nothing" or `grace − margin`, sheds the rest
+    // with HANDLER_RELEASED, lingers for those coded closes, and only THEN
+    // cancels `shutdown_token`. It writes the final log line itself.
+    info!("Shutdown signal received: draining");
+    health_state.begin_drain();
+    tokio::select! {
+        biased;
+        _ = mh_service::drain::run(
+            &session_for_drain,
+            &drain_tx,
+            config.drain_window,
+            &shutdown_token,
+        ) => {}
+        () = ignore_further_signals() => {}
+    }
 
     // Abort TokenManager background task
     info!("Stopping TokenManager...");
@@ -695,78 +702,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Unified GC task: registration + load report heartbeat loop.
-///
-/// Never exits on GC connectivity issues - keeps retrying.
-async fn run_gc_task(
-    gc_client: GcClient,
-    health_state: Arc<HealthState>,
-    cancel_token: CancellationToken,
-) {
-    info!("GC task: Starting initial registration");
-
-    // Initial registration (retry forever, never exit)
+/// A second SIGTERM/SIGINT during the drain is IGNORED (logged once each):
+/// Kubernetes' SIGKILL at the grace period is the backstop. Never completes.
+async fn ignore_further_signals() {
     loop {
-        tokio::select! {
-            () = cancel_token.cancelled() => {
-                info!("GC task: Cancelled before registration completed");
-                return;
-            }
-            result = gc_client.register() => {
-                match result {
-                    Ok(()) => {
-                        info!("GC task: Initial registration successful");
-                        health_state.set_ready();
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "GC task: Initial registration failed, will retry");
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                    }
-                }
-            }
-        }
+        shutdown_signal().await;
+        info!("Further shutdown signal during the drain: ignored (the drain deadline stands)");
     }
-
-    // Load report heartbeat loop
-    let interval_ms = gc_client.load_report_interval_ms();
-    let interval = Duration::from_millis(interval_ms);
-
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    info!(
-        interval_ms = interval_ms,
-        "GC task: Entering load report heartbeat loop"
-    );
-
-    loop {
-        tokio::select! {
-            () = cancel_token.cancelled() => {
-                info!("GC task: Shutting down");
-                break;
-            }
-            _ = ticker.tick() => {
-                if let Err(e) = gc_client.send_load_report().await {
-                    match e {
-                        MhError::NotRegistered => {
-                            warn!("Load report failed: MH not registered with GC, attempting re-registration");
-                            if let Err(re) = gc_client.attempt_reregistration().await {
-                                warn!(error = %re, "Re-registration failed, will retry on next heartbeat");
-                            } else {
-                                info!("Re-registration successful");
-                            }
-                        }
-                        other => {
-                            warn!(error = %other, "Load report failed");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    info!("GC task: Stopped");
 }
 
 /// Wait for shutdown signal (Ctrl+C or SIGTERM).
