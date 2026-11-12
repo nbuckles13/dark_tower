@@ -7,8 +7,9 @@
 //!   budget and the interval histogram's buckets. One derivation, so the two
 //!   ends and MC's own telemetry cannot drift.
 //! - [`HandlerLiveness`]: the record the meeting actor keeps per handler of its
-//!   set, and the acceptance rule ([`HandlerLiveness::observe`]). MC-B2's
-//!   `assess()` reads it; nothing here declares anything.
+//!   set, and the acceptance rule ([`HandlerLiveness::observe`]). The pure
+//!   health decision (`handler_health::assess`) reads it; nothing here
+//!   declares anything.
 //! - [`retirable`]: THE remove-only retire predicate, called by BOTH stores a
 //!   heartbeat reconciles (connectivity keys and the `HandedOutBindings`
 //!   ledger), so the strict boundary cannot fork between them.
@@ -37,6 +38,13 @@ use proto_gen::dark_tower::internal::v1::{
 use std::num::NonZeroU64;
 use std::time::Duration;
 use tokio::time::Instant;
+
+/// L = `APPLY_LAG_FACTOR` x N: how long a pair's applied generation may stay
+/// behind before the handler is declared Impaired (ADR-0039 §2, "default 2N").
+/// Derived, never configured: N (`MC_MH_HEARTBEAT_TIMEOUT_MS`) is MC's ONE
+/// heartbeat value, and the runbook (`mc-deployment.md`) cites this constant by
+/// name beside N.
+pub const APPLY_LAG_FACTOR: u32 = 2;
 
 /// N and everything MC derives from it (ADR-0039 §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +91,25 @@ impl HeartbeatTiming {
     #[must_use]
     pub fn send_budget(self) -> Duration {
         (self.interval() / 2).max(Duration::from_millis(1))
+    }
+
+    /// L: the apply-lag limit, [`APPLY_LAG_FACTOR`] x N (ADR-0039 §2).
+    #[must_use]
+    pub fn apply_lag_limit(self) -> Duration {
+        self.timeout() * APPLY_LAG_FACTOR
+    }
+
+    /// `mc_media_handler_detection_seconds` bucket bounds, derived from N:
+    /// N/2, N, 1.25N, 1.5N, 2N, 2.5N, 3N, 4N (seconds). Dead lands just past N
+    /// (plus up to one interval), lag-held Impaired just past L = 2N, so both
+    /// sit inside the buckets rather than in +Inf.
+    #[must_use]
+    pub fn detection_histogram_buckets(self) -> Vec<f64> {
+        let n = self.timeout().as_secs_f64();
+        [0.5, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0]
+            .iter()
+            .map(|f| n * f)
+            .collect()
     }
 
     /// `mc_media_handler_heartbeat_interval_seconds` bucket bounds, derived
@@ -168,7 +195,11 @@ pub struct HandlerLiveness {
     pub last_accepted: Instant,
     /// Receipt of the accepted heartbeat before that.
     pub previous_accepted: Option<Instant>,
-    /// `applied_generation` of the last accepted heartbeat.
+    /// The accepted watermark: the last accepted heartbeat's
+    /// `applied_generation`, CLAMPED to what MC had sent the pair
+    /// ([`clamp_to_sent`]). Never above MC's sent generation, so one heartbeat
+    /// claiming a generation MC never sent cannot make every honest heartbeat
+    /// after it read stale (security S-2).
     pub applied_generation: u64,
     /// Latest `apply_refusal`.
     pub apply_refusal: ApplyRefusal,
@@ -176,22 +207,35 @@ pub struct HandlerLiveness {
     pub serving_state: ServingState,
     /// Latest drain grace left (0 unless DRAINING).
     pub drain_remaining_ms: u32,
+    /// The generation MC had SENT this pair when the last accepted heartbeat
+    /// arrived (`None` if nothing was sent yet). Becomes the next heartbeat's
+    /// [`Self::owed_generation`].
+    sent_at_last_accept: Option<u64>,
+    /// The generation MH OWES: what MC had sent by the PREVIOUS accepted
+    /// heartbeat, so MH has had at least one full interval to apply it. Lag is
+    /// judged against this, never against the latest send — the same
+    /// "previous heartbeat" rule as [`retirable`], so a push racing one
+    /// heartbeat never reads as lag (and never flaps the suspicion counter).
+    pub owed_generation: Option<u64>,
     /// The previous heartbeat's anomalies, so each WARN fires on transition
     /// only (never per heartbeat).
     last_anomalies: Vec<HeartbeatAnomaly>,
 }
 
 impl HandlerLiveness {
-    /// The record a pair's first heartbeat creates (always accepted).
+    /// The record a pair's first heartbeat creates (always accepted). `sent`
+    /// is what MC has sent this pair now.
     #[must_use]
-    pub fn first(heartbeat: &HandlerHeartbeat, receipt: Instant) -> Self {
+    pub fn first(heartbeat: &HandlerHeartbeat, receipt: Instant, sent: Option<NonZeroU64>) -> Self {
         Self {
             last_accepted: receipt,
             previous_accepted: None,
-            applied_generation: heartbeat.applied_generation,
+            applied_generation: clamp_to_sent(sent, heartbeat.applied_generation),
             apply_refusal: heartbeat.apply_refusal,
             serving_state: heartbeat.serving_state,
             drain_remaining_ms: heartbeat.drain_remaining_ms,
+            sent_at_last_accept: sent.map(NonZeroU64::get),
+            owed_generation: None,
             last_anomalies: Vec::new(),
         }
     }
@@ -210,10 +254,21 @@ impl HandlerLiveness {
     }
 
     /// Apply a later heartbeat. Accepted iff its `applied_generation` is NOT
-    /// LOWER than the last accepted one (equal is accepted: "not lower"); a
-    /// stale one mutates nothing. This is NOT replay protection — an equal
-    /// replay reads as live (ADR-0039 §2, S1b residual).
-    pub fn observe(&mut self, heartbeat: &HandlerHeartbeat, receipt: Instant) -> Observed {
+    /// LOWER than the accepted watermark (equal is accepted: "not lower"); a
+    /// stale one mutates nothing. A heartbeat AHEAD of what MC sent is
+    /// accepted as liveness (it is a live MH) but its generation is clamped to
+    /// `sent` ([`clamp_to_sent`]) and counted as `applied_ahead_of_sent` by the
+    /// caller: evidence about a generation MC never sent — an out-of-band
+    /// writer, a forgery, a version skew — is not evidence about MC's policy.
+    /// Treating it as NOT liveness instead would declare a live handler Dead
+    /// at N. This is NOT replay protection — an equal (or ahead) replay reads
+    /// as live (ADR-0039 §2, S1b residual).
+    pub fn observe(
+        &mut self,
+        heartbeat: &HandlerHeartbeat,
+        receipt: Instant,
+        sent: Option<NonZeroU64>,
+    ) -> Observed {
         if heartbeat.applied_generation < self.applied_generation {
             return Observed {
                 acceptance: Acceptance::Stale,
@@ -225,16 +280,34 @@ impl HandlerLiveness {
         let previous = self.last_accepted;
         self.previous_accepted = Some(previous);
         self.last_accepted = receipt;
-        self.applied_generation = heartbeat.applied_generation;
+        self.applied_generation = clamp_to_sent(sent, heartbeat.applied_generation);
         self.apply_refusal = heartbeat.apply_refusal;
         self.serving_state = heartbeat.serving_state;
         self.drain_remaining_ms = heartbeat.drain_remaining_ms;
+        self.owed_generation = self.sent_at_last_accept;
+        self.sent_at_last_accept = sent.map(NonZeroU64::get);
         Observed {
             acceptance: Acceptance::Accepted {
                 previous: Some(previous),
             },
             transition,
         }
+    }
+}
+
+/// Whether `applied` is above what MC has sent (with nothing sent, anything
+/// above 0). The ONE ahead test, shared by the watermark clamp and the lag
+/// reading (which counts it as `applied_ahead_of_sent`).
+fn ahead_of_sent(sent: Option<NonZeroU64>, applied: u64) -> bool {
+    applied > sent.map_or(0, NonZeroU64::get)
+}
+
+/// `applied`, never above what MC has sent the pair: the accepted watermark.
+fn clamp_to_sent(sent: Option<NonZeroU64>, applied: u64) -> u64 {
+    if ahead_of_sent(sent, applied) {
+        sent.map_or(0, NonZeroU64::get)
+    } else {
+        applied
     }
 }
 
@@ -351,16 +424,25 @@ pub enum HeartbeatAnomaly {
     /// A `connection_ids` entry empty or over-long: reconcile skipped.
     ConnectionIdMalformed,
     /// `applied_generation` above the generation MC last sent this pair (MH
-    /// cannot apply what MC never sent): no lag observation.
+    /// cannot apply what MC never sent — an out-of-band writer, a forgery or
+    /// a version skew): no lag observation; liveness applies but the
+    /// watermark is clamped to what MC sent.
     AppliedAheadOfSent,
+    /// `apply_refusal = INVALID`: MH rejected MC's policy as malformed. An MC
+    /// CONTRACT FAULT (ADR-0039 §1): logged at ERROR, never a declaration.
+    ApplyRefusedInvalid,
+    /// `apply_refusal = TRANSPORT_INCONSISTENT`: likewise an MC contract fault.
+    ApplyRefusedTransportInconsistent,
 }
 
 impl HeartbeatAnomaly {
     /// Every value, for zero-initialisation.
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 5] = [
         Self::ConnectionIdsOverCap,
         Self::ConnectionIdMalformed,
         Self::AppliedAheadOfSent,
+        Self::ApplyRefusedInvalid,
+        Self::ApplyRefusedTransportInconsistent,
     ];
 
     /// The metric label value.
@@ -370,6 +452,29 @@ impl HeartbeatAnomaly {
             Self::ConnectionIdsOverCap => "connection_ids_over_cap",
             Self::ConnectionIdMalformed => "connection_id_malformed",
             Self::AppliedAheadOfSent => "applied_ahead_of_sent",
+            Self::ApplyRefusedInvalid => "apply_refused_invalid",
+            Self::ApplyRefusedTransportInconsistent => "apply_refused_transport_inconsistent",
+        }
+    }
+
+    /// An MC contract fault: logged at ERROR rather than WARN.
+    #[must_use]
+    pub const fn is_contract_fault(self) -> bool {
+        matches!(
+            self,
+            Self::ApplyRefusedInvalid | Self::ApplyRefusedTransportInconsistent
+        )
+    }
+}
+
+impl From<super::handler_health::ContractFault> for HeartbeatAnomaly {
+    /// The ONE projection of a contract-fault refusal onto the anomaly
+    /// vocabulary (counted on every heartbeat carrying it).
+    fn from(fault: super::handler_health::ContractFault) -> Self {
+        use super::handler_health::ContractFault;
+        match fault {
+            ContractFault::Invalid => Self::ApplyRefusedInvalid,
+            ContractFault::TransportInconsistent => Self::ApplyRefusedTransportInconsistent,
         }
     }
 }
@@ -389,13 +494,13 @@ pub enum LagReading {
 /// Sent minus applied `policy_generation` for one heartbeat.
 #[must_use]
 pub fn applied_lag(sent: Option<NonZeroU64>, applied: u64) -> LagReading {
-    match sent {
-        None => LagReading::Unobserved,
-        Some(sent) => sent
-            .get()
-            .checked_sub(applied)
-            .map_or(LagReading::AheadOfSent, LagReading::Lag),
+    if ahead_of_sent(sent, applied) {
+        return LagReading::AheadOfSent;
     }
+    // Ahead was excluded above, so `applied <= sent` here.
+    sent.map_or(LagReading::Unobserved, |sent| {
+        LagReading::Lag(sent.get().saturating_sub(applied))
+    })
 }
 
 #[cfg(test)]
@@ -470,16 +575,20 @@ mod tests {
         assert!(!retirable(t, before, true), "present: kept");
     }
 
+    fn sent(g: u64) -> Option<NonZeroU64> {
+        NonZeroU64::new(g)
+    }
+
     #[test]
     fn a_lower_generation_is_stale_and_changes_nothing() {
         let t0 = Instant::now();
-        let mut l = HandlerLiveness::first(&hb(5), t0);
+        let mut l = HandlerLiveness::first(&hb(5), t0, sent(9));
         let snapshot = l.clone();
-        let o = l.observe(&hb(4), t0 + Duration::from_secs(1));
+        let o = l.observe(&hb(4), t0 + Duration::from_secs(1), sent(9));
         assert_eq!(o.acceptance, Acceptance::Stale);
         assert_eq!(l, snapshot, "a stale heartbeat mutates nothing");
         let t2 = t0 + Duration::from_secs(2);
-        let o = l.observe(&hb(5), t2);
+        let o = l.observe(&hb(5), t2, sent(9));
         assert_eq!(
             o.acceptance,
             Acceptance::Accepted { previous: Some(t0) },
@@ -490,13 +599,80 @@ mod tests {
         assert!(!o.transition);
         let mut draining = hb(6);
         draining.serving_state = ServingState::Draining;
-        assert!(l.observe(&draining, t2 + Duration::from_secs(1)).transition);
+        assert!(
+            l.observe(&draining, t2 + Duration::from_secs(1), sent(9))
+                .transition
+        );
+    }
+
+    /// Security S-2, revised at MC-B2 Layer 7: an ahead heartbeat IS liveness
+    /// (a live MH whose generation MC never sent — e.g. an out-of-band writer)
+    /// but its generation is clamped to what MC sent, so it cannot poison the
+    /// watermark: the honest heartbeat after it is still accepted.
+    #[test]
+    fn an_ahead_heartbeat_is_liveness_but_the_watermark_is_clamped_to_sent() {
+        let t0 = Instant::now();
+        assert_eq!(
+            HandlerLiveness::first(&hb(3), t0, sent(2)).applied_generation,
+            2
+        );
+        assert_eq!(
+            HandlerLiveness::first(&hb(1), t0, None).applied_generation,
+            0,
+            "nothing sent: clamped to 0"
+        );
+        let mut l = HandlerLiveness::first(&hb(2), t0, sent(2));
+        let t1 = t0 + Duration::from_secs(1);
+        let o = l.observe(&hb(1_000), t1, sent(2));
+        assert_eq!(o.acceptance, Acceptance::Accepted { previous: Some(t0) });
+        assert_eq!(l.last_accepted, t1, "liveness");
+        assert_eq!(l.applied_generation, 2, "the watermark never exceeds sent");
+        let t2 = t0 + Duration::from_secs(2);
+        let o = l.observe(&hb(2), t2, sent(2));
+        assert_eq!(
+            o.acceptance,
+            Acceptance::Accepted { previous: Some(t1) },
+            "the honest heartbeat after it is still liveness (not stale)"
+        );
+    }
+
+    /// The owed generation is what was sent by the PREVIOUS accepted
+    /// heartbeat: a push racing one heartbeat is not owed yet.
+    #[test]
+    fn owed_is_what_was_sent_by_the_previous_accepted_heartbeat() {
+        let t0 = Instant::now();
+        let mut l = HandlerLiveness::first(&hb(1), t0, sent(1));
+        assert_eq!(l.owed_generation, None, "nothing owed before a second beat");
+        l.observe(&hb(1), t0 + Duration::from_secs(1), sent(2));
+        assert_eq!(l.owed_generation, Some(1), "gen 2 was sent after beat 1");
+        l.observe(&hb(1), t0 + Duration::from_secs(2), sent(2));
+        assert_eq!(
+            l.owed_generation,
+            Some(2),
+            "a full interval later, 2 is owed"
+        );
+        // A stale or ahead heartbeat does not advance the owed clock.
+        l.observe(&hb(0), t0 + Duration::from_secs(3), sent(3));
+        assert_eq!(l.owed_generation, Some(2));
+    }
+
+    #[test]
+    fn the_apply_lag_limit_and_detection_buckets_are_derived_from_n() {
+        let t = HeartbeatTiming::from_timeout_ms(6000);
+        assert_eq!(t.apply_lag_limit(), t.timeout() * APPLY_LAG_FACTOR);
+        assert_eq!(t.apply_lag_limit(), Duration::from_secs(12));
+        let b = t.detection_histogram_buckets();
+        assert_eq!(b, vec![3.0, 6.0, 7.5, 9.0, 12.0, 15.0, 18.0, 24.0]);
+        assert!(
+            b.iter().any(|x| *x > t.apply_lag_limit().as_secs_f64()),
+            "coverage above L"
+        );
     }
 
     #[test]
     fn anomalies_are_logged_on_transition_only_and_never_masked() {
         use HeartbeatAnomaly::{AppliedAheadOfSent as Ahead, ConnectionIdsOverCap as OverCap};
-        let mut l = HandlerLiveness::first(&hb(1), Instant::now());
+        let mut l = HandlerLiveness::first(&hb(1), Instant::now(), sent(1));
         assert_eq!(
             l.note_anomalies(&[OverCap, Ahead]),
             vec![OverCap, Ahead],
@@ -521,6 +697,11 @@ mod tests {
         assert_eq!(applied_lag(NonZeroU64::new(7), 4), LagReading::Lag(3));
         assert_eq!(applied_lag(NonZeroU64::new(7), 7), LagReading::Lag(0));
         assert_eq!(applied_lag(NonZeroU64::new(7), 8), LagReading::AheadOfSent);
+        assert_eq!(
+            applied_lag(None, 1),
+            LagReading::AheadOfSent,
+            "nothing sent yet MH reports an applied generation: the same ahead fault"
+        );
     }
 
     #[test]

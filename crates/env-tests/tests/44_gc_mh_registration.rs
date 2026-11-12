@@ -72,8 +72,8 @@ use env_tests::eventual::ConsistencyCategory;
 use env_tests::fixtures::deployment_config::LivePod;
 use env_tests::fixtures::gc_fleet::live_gc_pods;
 use env_tests::fixtures::metrics::{
-    format_instance_map, instance_for_pod_ip, poll_until_pinned_instance, settled_baseline,
-    BASELINE_SETTLE_BOUND, PINNED_METRIC_BOUND,
+    format_instance_map, poll_until_pinned_instance, settled_baseline, BASELINE_SETTLE_BOUND,
+    PINNED_METRIC_BOUND,
 };
 use env_tests::fixtures::mh_pool::{MhPool, REASON_NOT_AVAILABLE, REASON_NO_FREE_SLOT};
 use env_tests::fixtures::PrometheusClient;
@@ -267,26 +267,13 @@ fn assert_no_rejects(value: f64, pod: &LivePod, outcome: &str, when: &str) {
     );
 }
 
-/// Σ over the LIVE GC pods of each one's pinned value. A live pod with no
-/// series is a presence failure (already checked), never a zero.
+/// Σ over the LIVE GC pods of each one's pinned value (the hoisted
+/// [`env_tests::fixtures::metrics::sum_over_pods`]). A live pod with no series
+/// is a presence failure (already checked), never a zero.
 fn sum_over(
     map: &env_tests::fixtures::metrics::InstanceCounters,
     pods: &[LivePod],
     promql: &str,
 ) -> f64 {
-    pods.iter()
-        .map(|p| {
-            instance_for_pod_ip(map, &p.ip)
-                .map(|(_, v)| v)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "R25 (gc-registration-presence): `{promql}` has no series for GC pod {} \
-                         ({}); instances {}",
-                        p.name,
-                        p.ip,
-                        format_instance_map(map)
-                    )
-                })
-        })
-        .sum()
+    env_tests::fixtures::metrics::sum_over_pods(map, pods, promql, "R25 (gc-registration-presence)")
 }

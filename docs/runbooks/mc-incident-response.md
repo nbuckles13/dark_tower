@@ -3624,7 +3624,7 @@ is wedged".
 
 ```promql
 sum by (outcome) (increase(mc_media_end_meeting_total[15m]))       # one per (meeting, handler)
-sum by (outcome) (increase(mc_media_push_quiesce_total[15m]))      # one per meeting teardown
+sum by (outcome) (increase(mc_media_push_quiesce_total[15m]))      # one per meeting teardown or handler removal
 sum(increase(mc_media_teardown_fence_backstop_total[30m]))
 sum by (status) (increase(mc_gc_notify_meeting_ended_total[15m]))
 sum(increase(mc_gc_meeting_ended_notifications_dropped_total[15m]))

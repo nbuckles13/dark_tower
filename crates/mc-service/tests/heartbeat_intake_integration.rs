@@ -24,18 +24,18 @@ use mc_service::actors::{JoinMedia, MeetingActorHandle, MeetingControllerActorHa
 use mc_service::grpc::McMediaCoordinationService;
 use mc_service::media_routing::{HeartbeatTiming, RemovalTrigger};
 use mc_service::media_signaling::ReceiveCapabilityDeclaration;
-use proto_gen::dark_tower::internal::v1::media_coordination_service_server::MediaCoordinationService;
 use proto_gen::dark_tower::internal::v1::{
-    ApplyRefusal, HeartbeatVerdict, MeetingHeartbeatRequest, NotifyParticipantConnectedRequest,
-    NotifyParticipantDisconnectedRequest, ReleaseCause, ServingState,
+    ApplyRefusal, HeartbeatVerdict, MeetingHeartbeatRequest, ReleaseCause,
 };
 use proto_gen::dark_tower::signaling::v1::{MediaKind, ReceiveCapability};
+use test_common::coordination::{beat, connect, disconnect, heartbeat_request};
 use test_common::media_session::slot;
+use test_common::run_ready;
 use test_common::{
     client_media_config, handler_set, heartbeat_timing, join_media_on, join_media_with_heartbeat,
     mh_handler, MockMhRegistrationClient,
 };
-use tonic::{Code, Request};
+use tonic::Code;
 
 const MC: &str = "mc-heartbeat-test";
 const KC: (&str, &str) = ("key_custody", "operator");
@@ -121,71 +121,14 @@ fn receiving_one_audio_slot(mut media: JoinMedia) -> JoinMedia {
 }
 
 fn heartbeat(meeting: &str, handler: &str, applied: u64, ids: &[&str]) -> MeetingHeartbeatRequest {
-    MeetingHeartbeatRequest {
-        meeting_id: meeting.to_string(),
-        mc_id: MC.to_string(),
-        handler_id: handler.to_string(),
-        serving_state: ServingState::Serving as i32,
-        drain_remaining_ms: 0,
-        applied_generation: applied,
-        apply_refusal: ApplyRefusal::Unspecified as i32,
-        connection_ids: ids.iter().map(ToString::to_string).collect(),
-    }
-}
-
-/// Send one heartbeat; `Ok((verdict, cause))` or the gRPC code.
-async fn beat(
-    svc: &McMediaCoordinationService,
-    req: MeetingHeartbeatRequest,
-) -> Result<(HeartbeatVerdict, ReleaseCause), Code> {
-    svc.meeting_heartbeat(Request::new(req))
-        .await
-        .map(|r| {
-            let r = r.into_inner();
-            (
-                HeartbeatVerdict::try_from(r.verdict).unwrap(),
-                ReleaseCause::try_from(r.cause).unwrap(),
-            )
-        })
-        .map_err(|s| s.code())
-}
-
-async fn connect(
-    svc: &McMediaCoordinationService,
-    meeting: &str,
-    p: &str,
-    h: &str,
-    conn: &str,
-) -> u32 {
-    svc.notify_participant_connected(Request::new(NotifyParticipantConnectedRequest {
-        meeting_id: meeting.to_string(),
-        participant_id: format!("user-{p}"),
-        handler_id: h.to_string(),
-        connection_id: conn.to_string(),
-    }))
-    .await
-    .unwrap()
-    .into_inner()
-    .sender_id
-}
-
-async fn disconnect(svc: &McMediaCoordinationService, meeting: &str, p: &str, h: &str, conn: &str) {
-    svc.notify_participant_disconnected(Request::new(NotifyParticipantDisconnectedRequest {
-        meeting_id: meeting.to_string(),
-        participant_id: format!("user-{p}"),
-        handler_id: h.to_string(),
-        reason: 1,
-        connection_id: conn.to_string(),
-    }))
-    .await
-    .unwrap();
-}
-
-/// Run every ready task without advancing paused time.
-async fn run_ready() {
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    heartbeat_request(
+        MC,
+        meeting,
+        handler,
+        applied,
+        ApplyRefusal::Unspecified,
+        ids,
+    )
 }
 
 fn owned() -> (HeartbeatVerdict, ReleaseCause) {
@@ -686,10 +629,27 @@ async fn stale_heartbeat_is_not_liveness_and_lag_is_read_against_what_mc_sent() 
         .liveness
         .unwrap();
     assert_eq!(
-        ahead.applied_generation,
-        sent + 1,
-        "not lower: accepted as liveness"
+        ahead.last_accepted,
+        tokio::time::Instant::now(),
+        "ahead of sent: liveness (a live MH)"
     );
+    assert_eq!(
+        ahead.applied_generation, sent,
+        "but the watermark is clamped to what MC sent (security S-2): it never \
+         takes the ahead value"
+    );
+    // The poisoning twin: the honest heartbeat after it, at a generation
+    // BELOW the old raw ahead value, is still liveness (not stale).
+    tokio::time::advance(Duration::from_secs(2)).await;
+    beat(&svc, heartbeat("m", H_A, sent, &[])).await.unwrap();
+    let honest = meeting
+        .probe_handler_for_test(H_A)
+        .await
+        .unwrap()
+        .liveness
+        .unwrap();
+    assert_eq!(honest.last_accepted, tokio::time::Instant::now());
+    assert_eq!(honest.previous_accepted, Some(ahead.last_accepted));
     c.cancel();
 }
 
@@ -698,10 +658,10 @@ async fn stale_heartbeat_is_not_liveness_and_lag_is_read_against_what_mc_sent() 
 // ----------------------------------------------------------------------------
 
 /// A Connected from a REMOVED handler gets sender 0 and changes nothing (ledger,
-/// connectivity), counted `handler_not_in_set` + `refused`. A zombie's
-/// Disconnected after removal is a counted no-op: it does NOT release its own
-/// binding (the removal path's bulk release owns it) and leaves the
-/// replacement's connectivity untouched. A RELEASED heartbeat with an empty
+/// connectivity), counted `handler_not_in_set` + `refused`. The removal itself
+/// purged the handler's connectivity and bulk-released its bindings (MC-B2), so
+/// a zombie's Disconnected after removal is a counted no-op that finds nothing
+/// and leaves the replacement's connectivity untouched. A RELEASED heartbeat with an empty
 /// list mutates nothing and corrects nothing. Positive arm: the in-set handler
 /// binds.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -760,7 +720,15 @@ async fn the_binding_gate_refuses_a_removed_handler_and_released_mutates_nothing
         before_b,
         "replacement untouched"
     );
-    assert_eq!(before_a.bindings, vec!["Ka"], "held for the bulk release");
+    assert!(
+        before_a.bindings.is_empty() && before_a.connectivity.is_empty(),
+        "the removal purged the handler's keys and bulk-released its binding"
+    );
+    assert_eq!(
+        before_b.bindings,
+        vec!["Kb"],
+        "the survivor's binding is kept"
+    );
     c.cancel();
 }
 

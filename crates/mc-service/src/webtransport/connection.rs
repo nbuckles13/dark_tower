@@ -3012,7 +3012,8 @@ mod tests {
         ])
         .unwrap();
         let r0 = set.handler_ref_of(&HandlerId::new("mh-0")).unwrap();
-        set.mark_active(&HandlerId::new("mh-0"), r0).unwrap();
+        set.mark_active(&HandlerId::new("mh-0"), r0, tokio::time::Instant::now())
+            .unwrap();
         set.client_snapshot()
     }
 

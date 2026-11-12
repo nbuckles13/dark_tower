@@ -1068,8 +1068,8 @@ groups:
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
 
       - alert: MCPushQuiesceTimeouts
-        # The leading indicator of the same ratchet: a teardown released
-        # without confirming its pushes had drained. Clean denominator (both
+        # The leading indicator of the same ratchet: a meeting teardown or a
+        # handler removal released without confirming its pushes had drained. Clean denominator (both
         # outcomes are server-driven); `> 0` on the timeout cell, which is
         # zero-initialised so the rule is never silently inert.
         expr: |
@@ -1080,8 +1080,8 @@ groups:
           service: mc-service
           component: meeting-teardown
         annotations:
-          summary: "A meeting teardown released without its policy pushes draining"
-          description: "mc_media_push_quiesce_total{outcome=\"timed_out\"} rose: a push worker was still mid-RegisterMeeting past push_quiesce_bound_seconds (MC's startup line), MC waited one more attempt window, then released anyway. A queued late apply is refused MH-side (mh_media_released_meeting_apply_refusals_total); a registration still in flight is only ORDERED by that wait, which fails open - confirm against the handler's mh_media_registered_meetings rather than assuming either outcome."
+          summary: "A meeting teardown or a handler removal released without its policy pushes draining"
+          description: "mc_media_push_quiesce_total{outcome=\"timed_out\"} rose (a meeting teardown, or the removal of one handler from a live meeting): a push worker was still mid-RegisterMeeting past push_quiesce_bound_seconds (MC's startup line), MC waited one more attempt window, then released anyway. A queued late apply is refused MH-side (mh_media_released_meeting_apply_refusals_total); a registration still in flight is only ORDERED by that wait, which fails open - confirm against the handler's mh_media_registered_meetings rather than assuming either outcome."
           impact: "Possibly one meeting's registration and edge budget re-created on a handler after its release, held until that handler restarts."
           runbook_url: "docs/runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet"
 

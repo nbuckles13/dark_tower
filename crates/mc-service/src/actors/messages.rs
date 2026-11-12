@@ -363,10 +363,10 @@ pub enum MeetingMessage {
         >,
     },
 
-    /// Remove a handler from the meeting's set through the actor's ONE
-    /// removal helper, and push the changed Active set to clients (MC-B2 owns
-    /// the rest of the removal sequence: bindings, `EndMeeting`).
-    /// **Test builds only.** Responds whether the handler was a member.
+    /// Remove a handler through the actor's FULL removal transaction (set,
+    /// connectivity purge and render, client set push, bulk binding release,
+    /// drain + `EndMeeting(trigger)`), without a declaration. **Test builds
+    /// only.** Responds whether the handler was a member.
     #[cfg(feature = "test-seams")]
     RemoveHandlerForTest {
         /// The handler to remove.
@@ -402,6 +402,9 @@ pub enum MeetingMessage {
 #[cfg(feature = "test-seams")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandlerProbe {
+    /// The health state label (`healthy`, `lagging`, `contract_fault`,
+    /// `draining`); `None` if the handler is not a member.
+    pub health: Option<&'static str>,
     /// Whether a non-OWNED verdict for this handler was already WARNed (the
     /// once-per-(meeting, handler) dedupe).
     pub release_noticed: bool,

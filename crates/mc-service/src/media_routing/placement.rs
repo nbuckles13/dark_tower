@@ -191,6 +191,10 @@ struct Member {
     endpoint: HandlerEndpoint,
     handler_ref: NonZeroU32,
     state: HandlerState,
+    /// When the first `RegisterMeeting` was confirmed (Registering → Active):
+    /// the origin of the health function's silence clock (ADR-0039 §2). The
+    /// ONE home of that instant.
+    confirmed_at: Option<tokio::time::Instant>,
 }
 
 impl Member {
@@ -311,8 +315,9 @@ impl MeetingHandlers {
             .iter()
             .map(|m| (m.endpoint.id.clone(), m.handler_ref))
             .collect();
+        let now = tokio::time::Instant::now();
         for (id, handler_ref) in refs {
-            set.mark_active(&id, handler_ref)?;
+            set.mark_active(&id, handler_ref, now)?;
         }
         Ok(set)
     }
@@ -361,6 +366,7 @@ impl MeetingHandlers {
                 endpoint,
                 handler_ref,
                 state: HandlerState::Registering,
+                confirmed_at: None,
             },
         );
         Ok((
@@ -373,9 +379,9 @@ impl MeetingHandlers {
     }
 
     /// Mark a Registering handler Active (its first `RegisterMeeting` was
-    /// acked). Keyed by id AND ref, so a late ack for a removed or replaced
-    /// incarnation is a no-op. `Ok(None)` (no change, no bump) for an unknown
-    /// id, a stale ref, or an already-Active handler.
+    /// acked at `confirmed_at`). Keyed by id AND ref, so a late ack for a
+    /// removed or replaced incarnation is a no-op. `Ok(None)` (no change, no
+    /// bump) for an unknown id, a stale ref, or an already-Active handler.
     ///
     /// # Errors
     ///
@@ -384,6 +390,7 @@ impl MeetingHandlers {
         &mut self,
         id: &HandlerId,
         handler_ref: NonZeroU32,
+        confirmed_at: tokio::time::Instant,
     ) -> Result<Option<SetChange>, HandlerSetError> {
         let Some(at) = self
             .members
@@ -397,6 +404,7 @@ impl MeetingHandlers {
         let next = self.next_version()?;
         if let Some(member) = self.members.get_mut(at) {
             member.state = HandlerState::Active;
+            member.confirmed_at = Some(confirmed_at);
         }
         self.version = next;
         Ok(Some(SetChange {
@@ -506,6 +514,13 @@ impl MeetingHandlers {
     #[must_use]
     pub fn get(&self, id: &HandlerId) -> Option<&HandlerEndpoint> {
         self.member(id).map(|m| &m.endpoint)
+    }
+
+    /// When a member's first `RegisterMeeting` was confirmed; `None` while it
+    /// is Registering (or not a member).
+    #[must_use]
+    pub fn confirmed_at(&self, id: &HandlerId) -> Option<tokio::time::Instant> {
+        self.member(id).and_then(|m| m.confirmed_at)
     }
 
     /// The `handler_ref` of a member (any state).
@@ -705,6 +720,25 @@ mod tests {
     }
 
     #[test]
+    fn the_first_confirmation_is_recorded_once_on_the_member() {
+        let mut set =
+            MeetingHandlers::from_handoff([MeetingHandlers::test_endpoint("mh-0")]).unwrap();
+        let r = set.handler_ref_of(&hid("mh-0")).unwrap();
+        assert_eq!(
+            set.confirmed_at(&hid("mh-0")),
+            None,
+            "Registering: unconfirmed"
+        );
+        let t = tokio::time::Instant::now();
+        set.mark_active(&hid("mh-0"), r, t).unwrap();
+        assert_eq!(set.confirmed_at(&hid("mh-0")), Some(t));
+        let later = t + std::time::Duration::from_secs(5);
+        assert_eq!(set.mark_active(&hid("mh-0"), r, later).unwrap(), None);
+        assert_eq!(set.confirmed_at(&hid("mh-0")), Some(t), "never moved");
+        assert_eq!(set.confirmed_at(&hid("mh-9")), None);
+    }
+
+    #[test]
     fn an_empty_handoff_is_rejected_but_an_empty_live_set_is_legal() {
         assert_eq!(
             MeetingHandlers::from_handoff(Vec::new()),
@@ -786,7 +820,8 @@ mod tests {
         ])
         .unwrap();
         let r = set.handler_ref_of(&hid("mh-2")).unwrap();
-        set.mark_active(&hid("mh-2"), r).unwrap();
+        set.mark_active(&hid("mh-2"), r, tokio::time::Instant::now())
+            .unwrap();
         set.remove(&hid("mh-0"), RemovalTrigger::HeartbeatTimeout)
             .unwrap()
             .unwrap();
@@ -847,22 +882,41 @@ mod tests {
         let r0 = set.handler_ref_of(&hid("mh-0")).unwrap();
         let r1 = set.handler_ref_of(&hid("mh-1")).unwrap();
         // Stale ref (another incarnation's) and unknown id: no-op, no bump.
-        assert_eq!(set.mark_active(&hid("mh-0"), r1).unwrap(), None);
-        assert_eq!(set.mark_active(&hid("mh-9"), r0).unwrap(), None);
+        assert_eq!(
+            set.mark_active(&hid("mh-0"), r1, tokio::time::Instant::now())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            set.mark_active(&hid("mh-9"), r0, tokio::time::Instant::now())
+                .unwrap(),
+            None
+        );
         assert_eq!(set.version(), 2);
         // Positive arm.
-        let change = set.mark_active(&hid("mh-0"), r0).unwrap().unwrap();
+        let change = set
+            .mark_active(&hid("mh-0"), r0, tokio::time::Instant::now())
+            .unwrap()
+            .unwrap();
         assert_eq!(change.version, 3);
         assert!(change.active_changed);
         // Already Active: no-op, no bump.
-        assert_eq!(set.mark_active(&hid("mh-0"), r0).unwrap(), None);
+        assert_eq!(
+            set.mark_active(&hid("mh-0"), r0, tokio::time::Instant::now())
+                .unwrap(),
+            None
+        );
         assert_eq!(set.version(), 3);
         // A late ack for a removed incarnation is a no-op.
         set.remove(&hid("mh-1"), RemovalTrigger::PlannedTransfer)
             .unwrap()
             .unwrap();
         let v = set.version();
-        assert_eq!(set.mark_active(&hid("mh-1"), r1).unwrap(), None);
+        assert_eq!(
+            set.mark_active(&hid("mh-1"), r1, tokio::time::Instant::now())
+                .unwrap(),
+            None
+        );
         assert_eq!(set.version(), v);
     }
 
@@ -871,7 +925,8 @@ mod tests {
         let mut set =
             MeetingHandlers::from_handoff(vec![endpoint("mh-0"), endpoint("mh-1")]).unwrap();
         let r0 = set.handler_ref_of(&hid("mh-0")).unwrap();
-        set.mark_active(&hid("mh-0"), r0).unwrap();
+        set.mark_active(&hid("mh-0"), r0, tokio::time::Instant::now())
+            .unwrap();
         let registering = set
             .remove(&hid("mh-1"), RemovalTrigger::PlannedTransfer)
             .unwrap()
@@ -895,7 +950,8 @@ mod tests {
         // Internal view still resolves a Registering member.
         assert!(set.resolve("mh-0").is_some());
         let r1 = set.handler_ref_of(&hid("mh-1")).unwrap();
-        set.mark_active(&hid("mh-1"), r1).unwrap();
+        set.mark_active(&hid("mh-1"), r1, tokio::time::Instant::now())
+            .unwrap();
         let snap = set.client_snapshot();
         assert_eq!(snap.version, set.version());
         assert_eq!(
@@ -939,7 +995,7 @@ mod tests {
             Err(HandlerSetError::VersionExhausted)
         );
         assert_eq!(
-            set.mark_active(&hid("mh-0"), r0),
+            set.mark_active(&hid("mh-0"), r0, tokio::time::Instant::now()),
             Err(HandlerSetError::VersionExhausted)
         );
         assert_eq!(
@@ -952,7 +1008,10 @@ mod tests {
             set.remove(&hid("mh-9"), RemovalTrigger::PlannedTransfer),
             Ok(None)
         );
-        assert_eq!(set.mark_active(&hid("mh-9"), r0), Ok(None));
+        assert_eq!(
+            set.mark_active(&hid("mh-9"), r0, tokio::time::Instant::now()),
+            Ok(None)
+        );
     }
 
     /// S1a: resolution is exact byte equality. Near-misses an MH could assert

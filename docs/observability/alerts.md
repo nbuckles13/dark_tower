@@ -968,8 +968,8 @@ sum(rate(mc_media_end_meeting_total{outcome=~"released|rejected_ownership|unimpl
 #### MCPushQuiesceTimeouts
 
 **Severity**: Warning
-**Condition**: Any `mc_media_push_quiesce_total{outcome="timed_out"}` in 30 minutes: a teardown released without its policy pushes draining.
-**Impact**: Possibly one meeting's registration and edge budget re-created on a handler after its release, held until that handler restarts.
+**Condition**: Any `mc_media_push_quiesce_total{outcome="timed_out"}` in 30 minutes: a meeting teardown or a handler removal released without its policy pushes draining.
+**Impact**: Possibly one meeting's registration and edge budget re-created on a handler after its release, held until that handler restarts. For a removal this matters most for an Impaired handler that is still live; a crashed handler's single in-flight attempt ends inside the bound.
 **Runbook**: [Scenario 20: Meeting Teardown Failing / MH Budget Ratchet](../runbooks/mc-incident-response.md#scenario-20-meeting-teardown-failing--mh-budget-ratchet)
 
 **PromQL**:

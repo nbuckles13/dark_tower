@@ -19,7 +19,7 @@ use crate::media_kind::KindLabels;
 use crate::media_routing::teardown::{EndMeetingOutcome, QuiesceOutcome};
 use crate::media_routing::{
     FloorAdoption, HeartbeatAnomaly, HeartbeatOutcome, HeartbeatTiming, PolicyPushOutcome,
-    SettleOutcome, Unapplied, APPLIED_SEQUENCE_LAG_BUCKETS,
+    RemovalTrigger, SettleOutcome, SuspicionOutcome, Unapplied, APPLIED_SEQUENCE_LAG_BUCKETS,
 };
 use crate::media_signaling::{
     slot_state_label, CapabilityOutcome, ClientMuteFanoutOutcome, DirectiveOutcome, MuteOutcome,
@@ -67,6 +67,15 @@ fn configured_prometheus_builder(heartbeat: HeartbeatTiming) -> Result<Prometheu
             &heartbeat.interval_histogram_buckets(),
         )
         .map_err(|e| format!("Failed to set heartbeat interval buckets: {e}"))?
+        // Detection (evidence -> declaration) per (meeting, handler): buckets
+        // DERIVED from N (N/2 .. 4N), covering Dead just past N and lag-held
+        // Impaired just past L = 2N. Prefix of the FULL name (the form the
+        // histogram-buckets guard reads); no other series shares it.
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_media_handler_detection_seconds".to_string()),
+            &heartbeat.detection_histogram_buckets(),
+        )
+        .map_err(|e| format!("Failed to set detection buckets: {e}"))?
         // Sent minus applied generation: integer counts, not seconds.
         .set_buckets_for_metric(
             Matcher::Prefix("mc_media_handler_applied_sequence_lag".to_string()),
@@ -994,9 +1003,17 @@ pub fn record_connected_set_corrections(retired: usize) {
 /// Labels: `reason` x `key_custody`
 /// Cardinality: bounded by [`HeartbeatAnomaly::ALL`]
 ///
-/// Expected zero: non-zero is an MH contract or version-skew fault. The
-/// verdict and liveness still applied; only the reconcile (over-cap,
-/// malformed) or the lag reading (applied ahead of sent) was skipped.
+/// Expected zero in PRODUCTION (in the dev cluster the env-test `Injection`
+/// fixture produces `applied_ahead_of_sent` by design). Counted on EVERY
+/// heartbeat carrying the anomaly; `apply_refused_*` only while MC's policy
+/// is pending (the refusal gate `Observations::effective_refusal`). The
+/// verdict (OWNED) and liveness always applied. An over-cap or malformed list
+/// only skips the reconcile; `applied_ahead_of_sent` takes no lag reading and
+/// its generation is clamped to what MC sent (it never moves the watermark
+/// above `sent`). `apply_refused_invalid` /
+/// `apply_refused_transport_inconsistent` are MC CONTRACT faults (MH refused
+/// MC's policy as malformed; logged at ERROR, never a declaration); the other
+/// reasons are MH contract or version-skew faults.
 pub fn record_heartbeat_anomaly(reason: HeartbeatAnomaly) {
     counter!(
         "mc_media_handler_heartbeat_anomalies_total",
@@ -1004,6 +1021,108 @@ pub fn record_heartbeat_anomaly(reason: HeartbeatAnomaly) {
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .increment(1);
+}
+
+/// The `trigger` values a Dead/Impaired declaration emits (zero-initialised).
+/// `planned_transfer` is added by MC-F with its own recording site.
+pub const DETECTION_TRIGGERS: [RemovalTrigger; 2] =
+    [RemovalTrigger::HeartbeatTimeout, RemovalTrigger::ApplyLag];
+
+/// Record one Dead/Impaired declaration of a (meeting, handler), and how long
+/// detection took (ADR-0039 §2/§8).
+///
+/// Metrics: `mc_media_handler_declarations_total` (counter) and
+/// `mc_media_handler_detection_seconds` (histogram, buckets derived from N)
+/// Labels: `trigger` x `key_custody`; `trigger` from the ONE shared
+/// vocabulary (`RemovalTrigger::label`). This task emits `heartbeat_timeout`
+/// and `apply_lag`; `planned_transfer` is MC-F's.
+///
+/// Detection starts at the declaration's EVIDENCE, per trigger:
+/// `heartbeat_timeout` from the last accepted heartbeat's receipt (or the
+/// first confirmed `RegisterMeeting` if none arrived); `apply_lag` from the lag
+/// onset (lag held past L) or from the refusing heartbeat's receipt
+/// (`STREAM_CEILING` / `EDGE_CAP`). Per (meeting, handler): one MH death is one
+/// declaration per affected meeting. Recorded at the ONE transition site,
+/// whichever path (heartbeat, deadline arm) produced it. No identity labels.
+pub fn record_handler_declaration(trigger: RemovalTrigger, detection: Duration) {
+    counter!(
+        "mc_media_handler_declarations_total",
+        TRIGGER_LABEL => trigger.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+    histogram!(
+        "mc_media_handler_detection_seconds",
+        TRIGGER_LABEL => trigger.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .record(detection.as_secs_f64());
+}
+
+/// Record the outcome of the ONE `EndMeeting` a handler REMOVAL sends
+/// (ADR-0039 §6), per (meeting, handler).
+///
+/// Metric: `mc_media_handler_removal_releases_total`
+/// Labels: `trigger` (`heartbeat_timeout`, `apply_lag`) x `outcome`
+/// (`EndMeetingOutcome::REMOVAL`) x `key_custody`
+///
+/// Separate from `mc_media_end_meeting_total` on purpose: that series and its
+/// failure alert mean "an ENDED meeting was released", whereas a removal's
+/// release targets a handler MC just declared dead or impaired, so
+/// `unavailable_exhausted` is its EXPECTED outcome after a crash. Single
+/// attempt, never retried: the retry is the handler's next heartbeat,
+/// answered RELEASED (`mc_media_handler_heartbeats_total{outcome=
+/// "released_removed"}`). No alert.
+pub fn record_removal_release(trigger: RemovalTrigger, outcome: EndMeetingOutcome) {
+    counter!(
+        "mc_media_handler_removal_releases_total",
+        TRIGGER_LABEL => trigger.label(),
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Record how a LAG suspicion ended (ADR-0039 §8 near-miss signal).
+///
+/// Metric: `mc_media_handler_suspicions_total`
+/// Labels: `outcome` (`declared` = Lagging -> Impaired, `cleared` = Lagging
+/// -> caught up) x `key_custody`
+///
+/// Lagging -> Dead and a refusal-direct Healthy -> Impaired are NOT
+/// suspicion outcomes (`SuspicionOutcome::of`). Lag is judged against the
+/// generation owed since the PREVIOUS heartbeat, so a push racing one
+/// heartbeat never counts as a `cleared` near-miss.
+pub fn record_handler_suspicion(outcome: SuspicionOutcome) {
+    counter!(
+        "mc_media_handler_suspicions_total",
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Publish how many meetings have NO handler in their set ("awaiting
+/// handler", ADR-0039 §3).
+///
+/// Metric: `mc_media_meetings_without_handlers` (gauge)
+/// Labels: `key_custody` (1)
+///
+/// RECOMPUTE-AND-SET from `HandlerlessCensus` (never inc/dec): the
+/// controller's health walk prunes and re-sets it (load-bearing), each
+/// membership change re-sets it for freshness, and boot sets 0. A meeting whose
+/// only members are still Registering does not count.
+pub fn set_meetings_without_handlers(count: u64) {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a meeting count above 2^53 is unreachable"
+    )]
+    let value = count as f64;
+    gauge!(
+        "mc_media_meetings_without_handlers",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(value);
 }
 
 /// Observe one heartbeat inter-arrival per (meeting, handler).
@@ -1780,6 +1899,9 @@ pub fn record_display_name_resolution(outcome: &str) {
 // definitions moved rather than being copied. Re-exported so MC's existing
 // call sites — qualified (`actors/meeting.rs`) and unqualified (below) — keep
 // resolving through this module unchanged.
+/// The removal-trigger label KEY, shared by MC, GC and MH (one constant; MC's
+/// KEK `trigger` label is a different vocabulary and keeps its literal).
+use common::observability::labels::TRIGGER_LABEL;
 pub use common::observability::labels::{
     CONTENT_KIND_LABEL, KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR, MEDIA_KIND_LABEL,
 };
@@ -2458,6 +2580,20 @@ pub fn zero_initialize_counters() {
     for r in HeartbeatAnomaly::ALL {
         counter!("mc_media_handler_heartbeat_anomalies_total", "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
+    // Story 4 MC-B2: the triggers THIS task emits (planned_transfer is MC-F's).
+    for t in DETECTION_TRIGGERS {
+        counter!("mc_media_handler_declarations_total", TRIGGER_LABEL => t.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for o in SuspicionOutcome::ALL {
+        counter!("mc_media_handler_suspicions_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+    }
+    for t in DETECTION_TRIGGERS {
+        for o in EndMeetingOutcome::REMOVAL {
+            counter!("mc_media_handler_removal_releases_total", TRIGGER_LABEL => t.label(), "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+        }
+    }
+    // Boot value of the recompute-and-set gauge (the health walk re-sets it).
+    set_meetings_without_handlers(0);
     for r in crate::media_dial::HandlerSetPushReason::ALL {
         counter!("mc_media_handler_set_pushes_total", "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
@@ -2688,6 +2824,33 @@ mod tests {
         }
         present_at_zero(
             r#"mc_media_handler_connected_set_corrections_total{key_custody="operator"}"#,
+        );
+        // Story 4 MC-B2: detection series.
+        for t in DETECTION_TRIGGERS {
+            present_at_zero(&format!(
+                r#"mc_media_handler_declarations_total{{trigger="{}",key_custody="operator"}}"#,
+                t.label()
+            ));
+        }
+        for o in SuspicionOutcome::ALL {
+            present_at_zero(&format!(
+                r#"mc_media_handler_suspicions_total{{outcome="{}",key_custody="operator"}}"#,
+                o.label()
+            ));
+        }
+        present_at_zero(r#"mc_media_meetings_without_handlers{key_custody="operator"}"#);
+        for t in DETECTION_TRIGGERS {
+            for o in EndMeetingOutcome::REMOVAL {
+                present_at_zero(&format!(
+                    r#"mc_media_handler_removal_releases_total{{trigger="{}",outcome="{}",key_custody="operator"}}"#,
+                    t.label(),
+                    o.label()
+                ));
+            }
+        }
+        assert!(
+            !rendered.contains(r#"trigger="planned_transfer""#),
+            "planned_transfer is MC-F's to zero-initialise"
         );
         // Story 4 MC-D (ADR-0039 §5): every push reason, and the new status
         // drop reason.

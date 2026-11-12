@@ -245,14 +245,31 @@ impl PolicyGenerations {
     /// retains a whole `HandlerAssignment` per ended meeting for the pod's
     /// lifetime.
     ///
-    /// **Keyed on meeting teardown, never on handler removal.** A meeting whose
-    /// handler set changes must keep its generations: dropping them would
-    /// restart that pair at 1 *inside a live meeting*, which MH correctly
-    /// ignores as lower than what it has applied — the restart-at-1 problem,
-    /// reintroduced without even a process restart to explain it.
+    /// **Keyed on meeting teardown.** A meeting whose handler set changes keeps
+    /// its SURVIVING pairs' generations: dropping them would restart that pair
+    /// at 1 *inside a live meeting*, which MH correctly ignores as lower than
+    /// what it has applied — the restart-at-1 problem, reintroduced without
+    /// even a process restart to explain it. The one per-pair eviction is
+    /// [`Self::remove_pair`], for a REMOVED handler only.
     pub async fn remove_meeting(&self, meeting_id: &str) {
+        self.evict(|meeting, _| meeting == meeting_id).await;
+    }
+
+    /// Drop ONE pair: a handler REMOVED from a live meeting (ADR-0039 §6).
+    /// Safe where dropping a survivor's pair is not (see
+    /// [`Self::remove_meeting`]) because removal is one-way — the pair is
+    /// never programmed again, so no restart at 1 can follow. Called by the
+    /// removal release AFTER its push worker drained (a still-running worker
+    /// could re-create the entry).
+    pub async fn remove_pair(&self, meeting_id: &str, handler: &HandlerId) {
+        self.evict(|meeting, h| meeting == meeting_id && h == handler)
+            .await;
+    }
+
+    /// The one eviction kernel both removals share.
+    async fn evict(&self, doomed: impl Fn(&str, &HandlerId) -> bool) {
         let mut programmed = self.programmed.write().await;
-        programmed.retain(|(meeting, _handler), _| meeting != meeting_id);
+        programmed.retain(|(meeting, handler), _| !doomed(meeting, handler));
     }
 
     /// Number of tracked (meeting, handler) pairs. Test and diagnostics only.
@@ -454,6 +471,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(m2_again.get(), 1, "the surviving meeting kept its state");
+    }
+
+    #[tokio::test]
+    async fn remove_pair_evicts_one_removed_handler_and_keeps_its_survivor() {
+        let registry = PolicyGenerations::new();
+        for (m, h) in [("m1", "mh-0"), ("m1", "mh-1"), ("m2", "mh-0")] {
+            registry
+                .next_generation(m, &handler(h), &assignment(1))
+                .await
+                .unwrap();
+        }
+        registry
+            .next_generation("m1", &handler("mh-1"), &assignment(2))
+            .await
+            .unwrap();
+        registry.remove_pair("m1", &handler("mh-0")).await;
+        assert_eq!(registry.len().await, 2);
+        assert_eq!(
+            registry
+                .current("m1", &handler("mh-1"))
+                .await
+                .map(NonZeroU64::get),
+            Some(2),
+            "the survivor keeps its number (no restart at 1 in a live meeting)"
+        );
+        assert!(registry.current("m2", &handler("mh-0")).await.is_some());
+        assert!(registry.current("m1", &handler("mh-0")).await.is_none());
     }
 
     #[tokio::test]

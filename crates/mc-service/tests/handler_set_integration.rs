@@ -50,6 +50,7 @@ use proto_gen::dark_tower::signaling::v1::{
     server_message, MediaKind, ReceiveCapability, SlotState,
 };
 use test_common::media_session::slot;
+use test_common::run_ready;
 use test_common::{
     build_test_stack, client_media_config, handler_set, join_media_on, mh_handler,
     seed_meeting_with_handlers, test_join_media, MockMhRegistrationClient,
@@ -123,13 +124,6 @@ fn start_join(handle: &MeetingActorHandle, id: &str, media: JoinMedia) -> Joinin
             .await
     });
     Joining { reply, rx }
-}
-
-/// Let every runnable task run WITHOUT advancing paused time.
-async fn run_ready() {
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
 }
 
 /// Is this join's reply still parked? A poll, never an await.
@@ -348,6 +342,9 @@ async fn no_set_names_a_handler_before_its_registermeeting_ack() {
     let mh = Arc::new(MockMhRegistrationClient::new());
     mh.hold_handler(H_B);
     let meeting = spawn_meeting("t2", &[mh_handler(H_A), mh_handler(H_B)]);
+    // mh-a is a live (MH-2+) handler: it heartbeats once acked, so the park
+    // deadline (longer than N) does not read as its death.
+    mh.heartbeat_to_meeting(&meeting);
     let t0 = Instant::now();
 
     // A receives one audio slot; C publishes audio.
@@ -364,7 +361,7 @@ async fn no_set_names_a_handler_before_its_registermeeting_ack() {
     );
 
     // Release by the deadline, exactly at it.
-    tokio::time::advance(FIRST_JOIN_PARK_DEADLINE - Duration::from_millis(1)).await;
+    test_common::advance_live(FIRST_JOIN_PARK_DEADLINE - Duration::from_millis(1)).await;
     assert!(is_parked(&a).await, "not one tick early");
     tokio::time::advance(Duration::from_millis(1)).await;
     let a_join = (&mut a.reply).await.unwrap().expect("A joins");
@@ -497,7 +494,7 @@ async fn an_initial_handler_that_never_acks_yields_a_successful_join_with_an_emp
     let t0 = Instant::now();
     let mut a = start_join(&meeting, "a", join_media_on(Arc::clone(&hanging)));
     assert!(is_parked(&a).await, "parked (the deadline is armed now)");
-    tokio::time::advance(FIRST_JOIN_PARK_DEADLINE - Duration::from_millis(1)).await;
+    test_common::advance_live(FIRST_JOIN_PARK_DEADLINE - Duration::from_millis(1)).await;
     assert!(is_parked(&a).await, "not one tick early");
     tokio::time::advance(Duration::from_millis(1)).await;
     let joined = (&mut a.reply)

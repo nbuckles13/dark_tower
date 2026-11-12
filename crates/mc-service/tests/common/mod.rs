@@ -15,6 +15,7 @@
 #![allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 
 pub mod accept_loop_rig;
+pub mod coordination;
 pub mod media_dial;
 pub mod media_session;
 pub mod otel_capture;
@@ -25,7 +26,9 @@ use std::time::Duration;
 
 use ::common::jwt::JwksClient;
 use ::common::secret::SecretBox;
-use mc_service::actors::{ActorMetrics, ControllerMetrics, MeetingControllerActorHandle};
+use mc_service::actors::{
+    ActorMetrics, ControllerMetrics, MeetingActorHandle, MeetingControllerActorHandle,
+};
 use mc_service::auth::McJwtValidator;
 use mc_service::errors::McError;
 use mc_service::grpc::{MeetingProgramming, MhRegistrationClient};
@@ -147,6 +150,121 @@ pub struct MockMhRegistrationClient {
     handler_holds: Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
     /// Handlers whose pushes FAIL (keyed by `expected_handler_id`).
     failing_handlers: Mutex<std::collections::HashSet<String>>,
+    /// The LIVE-MH mirror ([`Self::heartbeat_via`]): `None` = this fake never
+    /// heartbeats (a suite that drives heartbeats itself).
+    live: Mutex<Option<LiveMh>>,
+    /// While set, every `end_meeting()` fails with this (recorded first).
+    end_failure: Mutex<Option<mc_service::media_routing::teardown::EndMeetingFailure>>,
+    /// While `Some`, every `end_meeting()` is recorded on arrival, then held
+    /// until [`Self::release_ends`] — so a test can inspect MC's state AT the
+    /// moment the release is issued.
+    end_hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// The actor-level meetings [`Self::heartbeat_to_meeting`] registered.
+    actor_meetings: Arc<Mutex<std::collections::HashMap<String, MeetingActorHandle>>>,
+}
+
+/// How a heartbeating fake MH reaches a meeting's actor (`None` once the
+/// meeting is gone, which stops that meeting's heartbeats).
+pub type MeetingResolver = Arc<
+    dyn Fn(String) -> Pin<Box<dyn std::future::Future<Output = Option<MeetingActorHandle>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The live-MH mirror's state: where heartbeats go, the generation this fake
+/// ACKED per (meeting, handler), and which pairs already have a heartbeat
+/// task.
+#[derive(Clone)]
+struct LiveMh {
+    resolver: MeetingResolver,
+    acked: Arc<Mutex<std::collections::HashMap<(String, String), u64>>>,
+    running: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
+    /// Handler ids that send NOTHING (a crashed or frozen MH) until resumed.
+    silenced: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Handler ids that report DRAINING.
+    draining: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Handler ids whose heartbeats carry this `apply_refusal`.
+    refusals: Arc<
+        Mutex<std::collections::HashMap<String, proto_gen::dark_tower::internal::v1::ApplyRefusal>>,
+    >,
+}
+
+/// One live-MH heartbeat loop for (meeting, handler), as an MH-2 MH runs it
+/// (ADR-0039 §1): every interval, one heartbeat carrying the generation this
+/// fake actually ACKED and — mirroring a live MH that still holds every
+/// connection — the connection ids MC holds for it (probe), so the remove-only
+/// reconcile never retires a key the fake considers live. Stops at RELEASED
+/// or when the meeting is gone.
+async fn live_heartbeats(live: LiveMh, meeting_id: String, handler_id: String, interval: Duration) {
+    let key = (meeting_id.clone(), handler_id.clone());
+    loop {
+        tokio::time::sleep(interval).await;
+        if live
+            .silenced
+            .lock()
+            .expect("silenced mutex poisoned")
+            .contains(&handler_id)
+        {
+            continue;
+        }
+        let draining = live
+            .draining
+            .lock()
+            .expect("draining mutex poisoned")
+            .contains(&handler_id);
+        let refusal = live
+            .refusals
+            .lock()
+            .expect("refusals mutex poisoned")
+            .get(&handler_id)
+            .copied()
+            .unwrap_or(proto_gen::dark_tower::internal::v1::ApplyRefusal::Unspecified);
+        let Some(meeting) = (live.resolver)(meeting_id.clone()).await else {
+            break;
+        };
+        let Ok(probe) = meeting.probe_handler_for_test(&handler_id).await else {
+            break;
+        };
+        let mut connection_ids: Vec<String> = probe
+            .connectivity
+            .into_iter()
+            .map(|(_, conn)| conn)
+            .collect();
+        connection_ids.extend(probe.bindings);
+        connection_ids.sort();
+        connection_ids.dedup();
+        let applied = live
+            .acked
+            .lock()
+            .expect("acked mutex poisoned")
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        let heartbeat = mc_service::media_routing::HandlerHeartbeat {
+            handler_id: handler_id.clone(),
+            serving_state: if draining {
+                proto_gen::dark_tower::internal::v1::ServingState::Draining
+            } else {
+                proto_gen::dark_tower::internal::v1::ServingState::Serving
+            },
+            drain_remaining_ms: if draining { 30_000 } else { 0 },
+            applied_generation: applied,
+            apply_refusal: refusal,
+            connection_ids,
+            reconcile_skip: None,
+        };
+        match meeting
+            .handler_heartbeat(heartbeat, tokio::time::Instant::now(), interval, interval)
+            .await
+        {
+            Ok(mc_service::media_routing::HeartbeatVerdict::Owned) | Err(_) => {}
+            Ok(_) => break,
+        }
+    }
+    live.running
+        .lock()
+        .expect("running mutex poisoned")
+        .remove(&key);
 }
 
 impl MockMhRegistrationClient {
@@ -167,6 +285,175 @@ impl MockMhRegistrationClient {
             hold: Mutex::new(None),
             handler_holds: Mutex::new(std::collections::HashMap::new()),
             failing_handlers: Mutex::new(std::collections::HashSet::new()),
+            live: Mutex::new(None),
+            actor_meetings: Arc::default(),
+            end_failure: Mutex::new(None),
+            end_hold: Mutex::new(None),
+        }
+    }
+
+    /// Make every `end_meeting()` fail as UNAVAILABLE (retryable), recorded.
+    pub fn fail_ends(&self) {
+        *self.end_failure.lock().expect("end_failure mutex poisoned") =
+            Some(mc_service::media_routing::teardown::EndMeetingFailure {
+                kind: mc_service::media_routing::teardown::EndMeetingFailureKind::Retryable,
+                detail: "unavailable (fixture)".to_string(),
+            });
+    }
+
+    /// Hold every `end_meeting()` (recorded, not answered) until
+    /// [`Self::release_ends`].
+    pub fn hold_ends(&self) {
+        *self.end_hold.lock().expect("end_hold mutex poisoned") =
+            Some(Arc::new(tokio::sync::Semaphore::new(0)));
+    }
+
+    /// Answer every held `end_meeting()` and stop holding.
+    pub fn release_ends(&self) {
+        if let Some(gate) = self
+            .end_hold
+            .lock()
+            .expect("end_hold mutex poisoned")
+            .take()
+        {
+            gate.close();
+        }
+    }
+
+    /// Make this fake a LIVE MH-2 handler: once it has acked a meeting's
+    /// `RegisterMeeting`, it heartbeats that (meeting, handler) every
+    /// interval MC sent, through `resolver` (see [`live_heartbeats`]). A suite
+    /// that is not about detection uses this so its fake MH is not — correctly
+    /// — declared Dead at N.
+    pub fn heartbeat_via(&self, resolver: MeetingResolver) {
+        *self.live.lock().expect("live mutex poisoned") = Some(LiveMh {
+            resolver,
+            acked: Arc::default(),
+            running: Arc::default(),
+            silenced: Arc::default(),
+            draining: Arc::default(),
+            refusals: Arc::default(),
+        });
+    }
+
+    fn with_live(&self, f: impl FnOnce(&LiveMh)) {
+        let live = self.live.lock().expect("live mutex poisoned");
+        f(live
+            .as_ref()
+            .expect("the fake is not live: call heartbeat_via first"));
+    }
+
+    /// Stop `handler_id`'s heartbeats (a crashed or SIGSTOPped MH).
+    pub fn silence(&self, handler_id: &str) {
+        self.with_live(|l| {
+            l.silenced
+                .lock()
+                .expect("silenced mutex poisoned")
+                .insert(handler_id.to_string());
+        });
+    }
+
+    /// Resume `handler_id`'s heartbeats (a SIGCONTed zombie).
+    pub fn resume(&self, handler_id: &str) {
+        self.with_live(|l| {
+            l.silenced
+                .lock()
+                .expect("silenced mutex poisoned")
+                .remove(handler_id);
+        });
+    }
+
+    /// Make `handler_id` report DRAINING from its next heartbeat.
+    pub fn drain(&self, handler_id: &str) {
+        self.with_live(|l| {
+            l.draining
+                .lock()
+                .expect("draining mutex poisoned")
+                .insert(handler_id.to_string());
+        });
+    }
+
+    /// Make `handler_id` REFUSE MC's pushes from now on with `refusal`, as MH
+    /// does on a capacity or validation refusal: every push fails (the applied
+    /// generation stays where it was) and every heartbeat reports the refusal.
+    pub fn refuse(
+        &self,
+        handler_id: &str,
+        refusal: proto_gen::dark_tower::internal::v1::ApplyRefusal,
+    ) {
+        self.fail_handler(handler_id);
+        self.with_live(|l| {
+            l.refusals
+                .lock()
+                .expect("refusals mutex poisoned")
+                .insert(handler_id.to_string(), refusal);
+        });
+    }
+
+    /// The generation this fake last ACKED for (meeting, handler), if any.
+    pub fn acked_generation(&self, meeting_id: &str, handler_id: &str) -> Option<u64> {
+        let live = self.live.lock().expect("live mutex poisoned");
+        live.as_ref().and_then(|l| {
+            l.acked
+                .lock()
+                .expect("acked mutex poisoned")
+                .get(&(meeting_id.to_string(), handler_id.to_string()))
+                .copied()
+        })
+    }
+
+    /// [`Self::heartbeat_via`] for meetings created on `controller`.
+    pub fn heartbeat_to_controller(&self, controller: Arc<MeetingControllerActorHandle>) {
+        self.heartbeat_via(Arc::new(move |meeting_id| {
+            let controller = Arc::clone(&controller);
+            Box::pin(async move { controller.get_meeting_handle(meeting_id).await.ok() })
+        }));
+    }
+
+    /// [`Self::heartbeat_via`] for actor-level meetings: adds `meeting` to
+    /// the meetings this fake heartbeats (idempotent; call it BEFORE the join
+    /// whose push it must see acked).
+    pub fn heartbeat_to_meeting(&self, meeting: &MeetingActorHandle) {
+        let registry = Arc::clone(&self.actor_meetings);
+        registry
+            .lock()
+            .expect("actor_meetings mutex poisoned")
+            .insert(meeting.meeting_id().to_string(), meeting.clone());
+        if self.live.lock().expect("live mutex poisoned").is_some() {
+            return;
+        }
+        self.heartbeat_via(Arc::new(move |meeting_id| {
+            let found = registry
+                .lock()
+                .expect("actor_meetings mutex poisoned")
+                .get(&meeting_id)
+                .cloned();
+            Box::pin(async move { found })
+        }));
+    }
+
+    /// Record an ack and start the pair's heartbeat loop if this fake is live.
+    fn on_acked(&self, meeting_id: &str, handler_id: &str, generation: u64, interval_ms: u32) {
+        let Some(live) = self.live.lock().expect("live mutex poisoned").clone() else {
+            return;
+        };
+        let key = (meeting_id.to_string(), handler_id.to_string());
+        live.acked
+            .lock()
+            .expect("acked mutex poisoned")
+            .insert(key.clone(), generation);
+        if live
+            .running
+            .lock()
+            .expect("running mutex poisoned")
+            .insert(key)
+        {
+            tokio::spawn(live_heartbeats(
+                live,
+                meeting_id.to_string(),
+                handler_id.to_string(),
+                Duration::from_millis(u64::from(interval_ms.max(1))),
+            ));
         }
     }
 
@@ -200,6 +487,14 @@ impl MockMhRegistrationClient {
             .lock()
             .expect("failing_handlers mutex poisoned")
             .insert(handler_id.to_string());
+    }
+
+    /// Let pushes to `handler_id` succeed again (an MH that recovered).
+    pub fn unfail_handler(&self, handler_id: &str) {
+        self.failing_handlers
+            .lock()
+            .expect("failing_handlers mutex poisoned")
+            .remove(handler_id);
     }
 
     /// Hold every `register_meeting()` from now on (recorded, not answered)
@@ -348,12 +643,23 @@ impl MhRegistrationClient for MockMhRegistrationClient {
             .expect("handler_holds mutex poisoned")
             .get(programming.expected_handler_id)
             .cloned();
+        let (meeting_id, handler_id) = (
+            programming.meeting_id.to_string(),
+            programming.expected_handler_id.to_string(),
+        );
+        let (generation, interval_ms) = (
+            programming.policy_generation.get(),
+            programming.heartbeat_interval_ms,
+        );
         Box::pin(async move {
             for gate in [gate, handler_gate].into_iter().flatten() {
                 // Closed by `release_pushes` / `release_handler`: `acquire`
                 // then fails, which is the release signal; no permit is ever
                 // granted while held.
                 let _ = gate.acquire().await;
+            }
+            if result.is_ok() {
+                self.on_acked(&meeting_id, &handler_id, generation, interval_ms);
             }
             result
         })
@@ -375,7 +681,22 @@ impl MhRegistrationClient for MockMhRegistrationClient {
             .expect("MockMhRegistrationClient mutex poisoned")
             .push(MhEvent::End(call.clone()));
         self.call_notify.notify_one();
-        Box::pin(async { Ok(()) })
+        let failure = self
+            .end_failure
+            .lock()
+            .expect("end_failure mutex poisoned")
+            .clone();
+        let gate = self
+            .end_hold
+            .lock()
+            .expect("end_hold mutex poisoned")
+            .clone();
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                let _ = gate.acquire().await;
+            }
+            failure.map_or(Ok(()), Err)
+        })
     }
 }
 
@@ -444,6 +765,10 @@ pub async fn build_test_stack_with_notifier(
 
     let handoffs = Arc::new(SeededHandoffs::new());
     let mh_reg_client: Arc<MockMhRegistrationClient> = Arc::new(MockMhRegistrationClient::new());
+    // The stack's fake MH behaves like a deployed (MH-2+) handler: it
+    // heartbeats every meeting it acked, so nothing the stack suites do is
+    // mistaken for a dead handler (ADR-0039 §2 detection is live).
+    mh_reg_client.heartbeat_to_controller(Arc::clone(&controller_handle));
 
     TestStackHandles {
         controller_handle,
@@ -557,6 +882,31 @@ pub fn make_controller(instance_id: &str) -> MeetingControllerActorHandle {
         Arc::new(PolicyGenerations::new()),
         mc_test_utils::kek::kek_lifecycle(),
     )
+}
+
+/// Let every runnable task run WITHOUT advancing paused time — the suite's
+/// ONE settle (actor turns, push workers, a live fake MH's heartbeat).
+pub async fn run_ready() {
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Advance paused time by `d` the way time passes for a LIVE handler: in
+/// steps of half a heartbeat interval, yielding between steps so every task
+/// (a live fake MH's heartbeat loop included) runs. One big
+/// `tokio::time::advance` jump fires every timer at the same instant — a
+/// stalled runtime, in which the health deadline can fire before a live fake
+/// MH's overdue heartbeats land.
+pub async fn advance_live(d: Duration) {
+    let step = heartbeat_timing().interval() / 2;
+    let mut left = d;
+    while !left.is_zero() {
+        let now = left.min(step);
+        tokio::time::advance(now).await;
+        run_ready().await;
+        left -= now;
+    }
 }
 
 /// The heartbeat timing (N) the shared fixtures run with: the deployed

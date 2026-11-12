@@ -4297,7 +4297,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "Heartbeats MC answered but could not fully use. Expected ZERO: non-zero is an MH contract or version-skew fault. connection_ids_over_cap / connection_id_malformed: the verdict and liveness still applied, only that heartbeat's reconcile was skipped (skipping only keeps connections). applied_ahead_of_sent: MH reported a generation MC never sent; no lag reading was taken. WARNING candidate (OBS-ALERTS).",
+      "description": "Heartbeats MC answered but could not fully use, counted on every heartbeat carrying the anomaly. Expected zero in production; in the dev cluster the env-test Injection fixture produces applied_ahead_of_sent by design. connection_ids_over_cap / connection_id_malformed: an MH contract or version-skew fault; the verdict and liveness still applied, only that heartbeat's reconcile was skipped (skipping only keeps connections). applied_ahead_of_sent: MH reported a generation MC never sent (an out-of-band writer, a forgery or a version skew) - liveness still applies but the watermark is clamped to what MC sent (story 4 MC-B2), no lag reading. apply_refused_invalid / apply_refused_transport_inconsistent: MH refused MC's PENDING policy as malformed - an MC CONTRACT FAULT (ERROR log), never a declaration or replacement; a refusal while MC's policy is installed is not counted. WARNING candidate (OBS-ALERTS).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4456,6 +4456,478 @@
         "x": 0,
         "y": 195
       },
+      "id": 207,
+      "panels": [],
+      "title": "Handler Detection (ADR-0039 \u00a72, \u00a76)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "(meeting, handler) pairs declared Dead (heartbeat_timeout: no accepted heartbeat for longer than N after the first confirmed RegisterMeeting) or Impaired (apply_lag: applied generation behind what MH owes for longer than L = 2N, or a STREAM_CEILING / EDGE_CAP refusal) and REMOVED from the meeting (story 4 MC-B2). Per (meeting, handler): one MH death is one declaration per affected meeting. No meeting, handler or connection label. key_custody=operator.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 196
+      },
+      "id": 208,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (trigger) (increase(mc_media_handler_declarations_total[$__rate_interval]))",
+          "legendFormat": "{{trigger}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Handler Declarations by Trigger",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Evidence start -> declaration, p50/p95 per trigger over the SELECTED dashboard range (rate(...[$__range]); a quantile is scale-free, so this is the quantile of every declaration in the range) - declarations are rare, so a per-interval timeseries would be empty when it is read after an incident; set the range to cover the incident. heartbeat_timeout starts at the last accepted heartbeat (or the first confirmed RegisterMeeting); apply_lag starts at the lag onset (or the refusing heartbeat for a capacity refusal). Buckets derived from N (N/2 .. 4N): expect heartbeat_timeout just past N and lag-held apply_lag just past L = 2N. Shown beside N. Durations are observed, never gated. Absent until the first declaration (a histogram cannot be zero-initialised).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 196
+      },
+      "id": 209,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le, trigger) (rate(mc_media_handler_detection_seconds_bucket[$__range])))",
+          "legendFormat": "p50 {{trigger}}",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, trigger) (rate(mc_media_handler_detection_seconds_bucket[$__range])))",
+          "legendFormat": "p95 {{trigger}}",
+          "range": false,
+          "refId": "B",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max(mc_media_handler_heartbeat_deadline_seconds)",
+          "legendFormat": "N",
+          "range": false,
+          "refId": "C",
+          "instant": true
+        }
+      ],
+      "title": "Handler Detection Time by Trigger vs N (selected range)",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "How a lag suspicion ended: declared (Lagging -> Impaired) vs cleared (Lagging -> caught up). Lag is judged against the generation owed since the PREVIOUS heartbeat, so a push racing one heartbeat is not a suspicion. A high cleared rate is the near-miss / N-tuning signal. Lagging -> Dead and refusal-driven Impaired are not counted here.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 204
+      },
+      "id": 210,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (increase(mc_media_handler_suspicions_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Lag Suspicions by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "Meetings on each MC whose handler set is EMPTY after a removal ('awaiting handler', ADR-0039 \u00a73). A meeting whose only handler is still Registering does not count. Recompute-and-set from the census on the controller's health walk. Until MC-C (replacement) lands such a meeting stays dark until it ends. Alert: OBS-ALERTS' MCMediaMeetingsAwaitingHandler (not in this release).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 204
+      },
+      "id": 211,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (instance) (mc_media_meetings_without_handlers)",
+          "legendFormat": "{{instance}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Meetings Without Handlers",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "The ONE EndMeeting(cause) a removal sends the removed handler, after draining its push worker; never retried - the retry is its next heartbeat, answered RELEASED (Handler Heartbeat Verdicts, released_removed). unavailable_exhausted is the EXPECTED outcome after a crash, which is why this is not mc_media_end_meeting_total (whose failure alert means an ended meeting leaked). No alert.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 212
+      },
+      "id": 212,
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (trigger, outcome) (increase(mc_media_handler_removal_releases_total[$__rate_interval]))",
+          "legendFormat": "{{trigger}} {{outcome}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Removal Releases by Trigger and Outcome",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 220
+      },
       "id": 204,
       "panels": [],
       "title": "Handler Set & Dial Credential (ADR-0039 \u00a75)",
@@ -4520,7 +4992,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 196
+        "y": 221
       },
       "id": 205,
       "options": {
@@ -4583,7 +5055,7 @@
         "h": 4,
         "w": 12,
         "x": 12,
-        "y": 196
+        "y": 221
       },
       "id": 206,
       "options": {

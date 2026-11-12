@@ -24,7 +24,9 @@ use crate::media_admission::{
 
 use super::client_mute_fanout::ClientMuteFanout;
 use super::join_park::{JoinPark, ParkedJoin, ReleaseReason};
-use super::meeting_media::{Affected, JoinMedia, MeetingMedia, MutedSourceCensus, RosterEntry};
+use super::meeting_media::{
+    Affected, HandlerlessCensus, JoinMedia, MeetingMedia, MutedSourceCensus, RosterEntry,
+};
 use super::messages::{
     DisconnectCause, JoinResult, KekPush, LeaveReason, MeetingEndCause, MeetingLifecycleEvent,
     MeetingLifecycleSink, MeetingMessage, MeetingState, ParticipantInfo, ParticipantStateUpdate,
@@ -55,6 +57,9 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
+
+/// The health decision's driver and the removal transaction (ADR-0039 §2/§6).
+mod health;
 
 /// Default channel buffer size for the meeting mailbox.
 const MEETING_CHANNEL_BUFFER: usize = 500;
@@ -821,6 +826,8 @@ pub struct MeetingWiring {
     pub lifecycle: MeetingLifecycleSink,
     /// The pod's server-mute census.
     pub muted_census: Arc<MutedSourceCensus>,
+    /// The pod's awaiting-handler census (`mc_media_meetings_without_handlers`).
+    pub handlerless_census: Arc<HandlerlessCensus>,
     /// The process's in-flight teardown count, which a graceful shutdown
     /// waits on so a handed-off release is not dropped with the runtime.
     pub teardowns: Arc<crate::media_routing::teardown::TeardownTracker>,
@@ -1165,6 +1172,7 @@ impl MeetingActor {
             let fanout_wake = self.client_mute_fanout.next_wake(Instant::now());
             let park_deadline = self.join_park.deadline();
             let dial_wake = self.dial_refresh.next_wake();
+            let health_wake = self.media.next_health_wake();
 
             tokio::select! {
                 // Handle cancellation
@@ -1257,6 +1265,22 @@ impl MeetingActor {
                     self.dial_refresh.collect_due(Instant::now());
                 }
 
+                // A handler's health deadline (silence past N, lag past L) is
+                // due (ADR-0039 §2). Recomputed every iteration from the
+                // health state, so it stays ARMED until the assessment that
+                // consumes it runs, and every value is strictly after the
+                // assessment that produced it (no spin on an elapsed instant).
+                // The arm applies the already-queued mailbox backlog first —
+                // see `health::on_health_deadline`.
+                () = async {
+                    match health_wake {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.on_health_deadline().await;
+                }
+
                 // Queued handler-set pushes (refresh, FAILED re-push), under
                 // the same per-turn bound as the slot views.
                 () = std::future::ready(()), if self.dial_refresh.has_pending() => {
@@ -1273,12 +1297,7 @@ impl MeetingActor {
                 // Handle messages
                 msg = self.receiver.recv() => {
                     match msg {
-                        Some(message) => {
-                            self.mailbox.record_enqueue();
-                            self.handle_message(message).await;
-                            self.mailbox.record_dequeue();
-                            self.metrics.record_message_processed();
-                        }
+                        Some(message) => self.dispatch(message).await,
                         None => {
                             info!(
                                 target: "mc.actor.meeting",
@@ -1330,6 +1349,15 @@ impl MeetingActor {
             return None;
         }
         self.kek_debounce.next_wake()
+    }
+
+    /// Process one mailbox message with its accounting. The ONE dispatch path:
+    /// the mailbox arm and the health arm's backlog drain both use it.
+    async fn dispatch(&mut self, message: MeetingMessage) {
+        self.mailbox.record_enqueue();
+        self.handle_message(message).await;
+        self.mailbox.record_dequeue();
+        self.metrics.record_message_processed();
     }
 
     /// Handle a single message.
@@ -1533,14 +1561,9 @@ impl MeetingActor {
                 trigger,
                 respond_to,
             } => {
-                let before = self.media.client_snapshot();
-                let removed = self.media.remove_handler(&handler_id, trigger);
-                // The client-facing half of MC-B2's removal sequence: a change
-                // to the Active set goes to every client (with fresh tokens),
-                // and client reports for the removed ref stop counting.
-                if self.media.client_snapshot().handlers != before.handlers {
-                    self.broadcast_handler_set().await;
-                }
+                // The FULL removal transaction, without a declaration (no
+                // detection metrics): the same path a Dead/Impaired takes.
+                let removed = self.remove_handler_completely(&handler_id, trigger).await;
                 let _ = respond_to.send(removed);
             }
 
@@ -1556,6 +1579,7 @@ impl MeetingActor {
                 respond_to,
             } => {
                 let probe = super::messages::HandlerProbe {
+                    health: self.media.health_label(&handler_id),
                     release_noticed: self.media.release_noticed(&handler_id),
                     liveness: self.media.liveness(&handler_id).cloned(),
                     bindings: self.mh_bindings.connections_of(&handler_id),
@@ -2824,10 +2848,21 @@ impl MeetingActor {
         let sent = self.media.sent_generation(&member).await;
         let mut anomalies: Vec<HeartbeatAnomaly> = heartbeat.reconcile_skip.into_iter().collect();
         anomalies.extend(Self::observe_lag(sent, heartbeat.applied_generation));
-        let (observed, fresh) = self
+        let observed = self
             .media
-            .observe_heartbeat(&member, &heartbeat, receipt, &anomalies);
+            .observe_heartbeat(&member, &heartbeat, receipt, sent);
+        // A contract-fault refusal is counted on EVERY heartbeat while the
+        // recorded evidence carries one — through the SAME gate `assess` uses,
+        // so a refusal of a policy MC never sent is neither a declaration
+        // input nor an "MC contract fault" ERROR.
+        anomalies.extend(
+            self.media
+                .contract_fault_now(&member)
+                .map(HeartbeatAnomaly::from),
+        );
+        let fresh = self.media.note_anomalies(&member, &anomalies);
         self.log_heartbeat_transitions(&heartbeat, observed.transition, &anomalies, &fresh);
+        let accepted = matches!(observed.acceptance, Acceptance::Accepted { .. });
         if let Acceptance::Accepted {
             previous: Some(previous),
         } = observed.acceptance
@@ -2839,6 +2874,13 @@ impl MeetingActor {
                 self.reconcile_connected_set(&heartbeat, previous).await;
             }
         }
+        // The health decision runs on EVERY owned heartbeat (a stale one
+        // included: it is evidence of lag, never of liveness; an ahead one is
+        // liveness with its generation clamped to what MC sent). A
+        // declaration here removes the handler; the verdict for THIS heartbeat
+        // stays OWNED (it was a member when it arrived), and the next one is
+        // RELEASED.
+        self.assess_after_heartbeat(&member, accepted).await;
         HeartbeatVerdict::Owned
     }
 
@@ -2873,18 +2915,33 @@ impl MeetingActor {
             crate::observability::metrics::record_heartbeat_anomaly(*anomaly);
         }
         for anomaly in fresh {
+            if anomaly.is_contract_fault() {
+                error!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    handler_id = %heartbeat.handler_id,
+                    anomaly = anomaly.label(),
+                    applied_generation = heartbeat.applied_generation,
+                    "Handler refused MC's policy as malformed: an MC CONTRACT FAULT. Never a \
+                     replacement (another handler would refuse it too); the previous policy keeps \
+                     forwarding. Capture and escalate."
+                );
+                continue;
+            }
             warn!(
                 target: "mc.actor.meeting",
                 meeting_id = %self.meeting_id,
                 handler_id = %heartbeat.handler_id,
                 anomaly = anomaly.label(),
                 connection_ids = heartbeat.connection_ids.len(),
-                "Handler heartbeat anomaly (MH contract or version skew); verdict and liveness \
-                 still applied"
+                "Handler heartbeat anomaly (MH contract or version skew); verdict still applied"
             );
         }
+        // DEBUG, not INFO: every serving-state / refusal change is also a
+        // health transition, logged ONCE at INFO by `health::act_on_health`
+        // (with the wire names) — one INFO per transition.
         if transition {
-            info!(
+            debug!(
                 target: "mc.actor.meeting",
                 meeting_id = %self.meeting_id,
                 handler_id = %heartbeat.handler_id,
@@ -3626,6 +3683,8 @@ impl MeetingActor {
         if let Some(wiring) = &self.wiring {
             wiring.muted_census.set(&self.meeting_id, [0; 2]);
             wiring.muted_census.publish();
+            wiring.handlerless_census.set(&self.meeting_id, false);
+            wiring.handlerless_census.publish();
             let _ = wiring.lifecycle.send(MeetingLifecycleEvent::Ended {
                 meeting_id: self.meeting_id.clone(),
                 cause,
