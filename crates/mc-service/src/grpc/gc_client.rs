@@ -21,15 +21,22 @@
 
 use crate::config::Config;
 use crate::errors::McError;
+use crate::media_routing::{
+    AssignmentRejected, HandlerEndpoint, HandlerId, ReleaseCauseExt, RemovalTrigger,
+};
 use crate::observability::{record_gc_heartbeat, record_gc_heartbeat_latency};
 use common::secret::ExposeSecret;
 use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::global_controller_service_client::GlobalControllerServiceClient;
 use proto_gen::dark_tower::internal::v1::{
-    ComprehensiveHeartbeatRequest, ControllerCapacity, FastHeartbeatRequest, HealthStatus,
-    NotifyMeetingEndedRequest, RegisterMcRequest,
+    AcquireMediaHandlerRequest, AcquireMediaHandlerResponse, ComprehensiveHeartbeatRequest,
+    ControllerCapacity, FastHeartbeatRequest, HealthStatus, NotifyMeetingEndedRequest,
+    RegisterMcRequest, RegisterMcResponse,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::BTreeSet;
+use std::num::NonZeroU32;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
@@ -122,6 +129,12 @@ pub struct GcClient {
     fast_heartbeat_interval_ms: AtomicU64,
     /// Comprehensive heartbeat interval from GC (or default).
     comprehensive_heartbeat_interval_ms: AtomicU64,
+    /// GC's cap on `AcquireMediaHandlerRequest.exclude_handler_ids`
+    /// (`RegisterMCResponse.max_exclude_handler_ids`, ADR-0039 §3). 0 until the
+    /// first accepted registration; refreshed by every re-registration (a GC
+    /// config change reaches MC only then). Never 0 after an accepted
+    /// registration: [`Self::accept_registration`] refuses 0.
+    max_exclude_handler_ids: AtomicU32,
 }
 
 impl GcClient {
@@ -199,7 +212,58 @@ impl GcClient {
             comprehensive_heartbeat_interval_ms: AtomicU64::new(
                 DEFAULT_COMPREHENSIVE_HEARTBEAT_INTERVAL.as_millis() as u64,
             ),
+            max_exclude_handler_ids: AtomicU32::new(0),
         }
+    }
+
+    /// Apply an ACCEPTED registration response — the ONE path shared by
+    /// [`Self::register`] and [`Self::attempt_reregistration`], so a
+    /// re-registration refreshes exactly what the first registration set.
+    ///
+    /// # Errors
+    ///
+    /// [`McError::Config`] if GC sent `max_exclude_handler_ids = 0` (absent):
+    /// MC derives its per-meeting replacement attempt bound from it (ADR-0039
+    /// §3), so it fails registration rather than run with no bound. Not
+    /// retried by `register` (the same arm as a GC rejection): a GC that
+    /// predates the field sends 0 on every attempt.
+    fn accept_registration(&self, response: &RegisterMcResponse) -> Result<(), McError> {
+        let Some(cap) = NonZeroU32::new(response.max_exclude_handler_ids) else {
+            error!(
+                target: "mc.grpc.gc_client",
+                field = "max_exclude_handler_ids",
+                "GC sent max_exclude_handler_ids=0 (absent): GC predates story 4 GC-3. Roll GC \
+                 forward (or this MC back) - see docs/runbooks/mc-deployment.md \
+                 \"Pre-Deployment Coordination\" and the GC-3 rollback floor in \
+                 docs/runbooks/gc-deployment.md"
+            );
+            return Err(McError::Config(
+                "GC sent max_exclude_handler_ids=0 (absent); GC predates story 4 GC-3 - roll GC \
+                 forward or MC back"
+                    .to_string(),
+            ));
+        };
+        // Store intervals from GC (0 keeps the default, as before).
+        if response.fast_heartbeat_interval_ms > 0 {
+            self.fast_heartbeat_interval_ms
+                .store(response.fast_heartbeat_interval_ms, Ordering::SeqCst);
+        }
+        if response.comprehensive_heartbeat_interval_ms > 0 {
+            self.comprehensive_heartbeat_interval_ms.store(
+                response.comprehensive_heartbeat_interval_ms,
+                Ordering::SeqCst,
+            );
+        }
+        self.max_exclude_handler_ids
+            .store(cap.get(), Ordering::SeqCst);
+        self.is_registered.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// GC's exclude-list cap, once an accepted registration delivered it.
+    #[must_use]
+    pub fn max_exclude_handler_ids(&self) -> Option<NonZeroU32> {
+        NonZeroU32::new(self.max_exclude_handler_ids.load(Ordering::SeqCst))
     }
 
     /// Add authorization header to a request.
@@ -369,28 +433,16 @@ impl GcClient {
             match self.try_register(&request).await {
                 Ok(response) => {
                     if response.accepted {
+                        self.accept_registration(&response)?;
                         info!(
                             target: "mc.grpc.gc_client",
                             message = %response.message,
                             fast_heartbeat_ms = response.fast_heartbeat_interval_ms,
                             comprehensive_heartbeat_ms = response.comprehensive_heartbeat_interval_ms,
+                            max_exclude_handler_ids = response.max_exclude_handler_ids,
                             retries = retry_count,
                             "Successfully registered with GC"
                         );
-
-                        // Store intervals from GC
-                        if response.fast_heartbeat_interval_ms > 0 {
-                            self.fast_heartbeat_interval_ms
-                                .store(response.fast_heartbeat_interval_ms, Ordering::SeqCst);
-                        }
-                        if response.comprehensive_heartbeat_interval_ms > 0 {
-                            self.comprehensive_heartbeat_interval_ms.store(
-                                response.comprehensive_heartbeat_interval_ms,
-                                Ordering::SeqCst,
-                            );
-                        }
-
-                        self.is_registered.store(true, Ordering::SeqCst);
                         return Ok(());
                     } else {
                         error!(
@@ -437,7 +489,7 @@ impl GcClient {
     async fn try_register(
         &self,
         request: &RegisterMcRequest,
-    ) -> Result<proto_gen::dark_tower::internal::v1::RegisterMcResponse, McError> {
+    ) -> Result<RegisterMcResponse, McError> {
         // Clone the channel (cheap operation) for this request
         // R-56: inject the active W3C trace context into outbound GC metadata.
         let mut client = GlobalControllerServiceClient::with_interceptor(
@@ -671,25 +723,13 @@ impl GcClient {
         match self.try_register(&request).await {
             Ok(response) => {
                 if response.accepted {
+                    self.accept_registration(&response)?;
                     info!(
                         target: "mc.grpc.gc_client",
                         message = %response.message,
+                        max_exclude_handler_ids = response.max_exclude_handler_ids,
                         "Successfully re-registered with GC"
                     );
-
-                    // Store intervals from GC
-                    if response.fast_heartbeat_interval_ms > 0 {
-                        self.fast_heartbeat_interval_ms
-                            .store(response.fast_heartbeat_interval_ms, Ordering::SeqCst);
-                    }
-                    if response.comprehensive_heartbeat_interval_ms > 0 {
-                        self.comprehensive_heartbeat_interval_ms.store(
-                            response.comprehensive_heartbeat_interval_ms,
-                            Ordering::SeqCst,
-                        );
-                    }
-
-                    self.is_registered.store(true, Ordering::SeqCst);
                     Ok(())
                 } else {
                     warn!(
@@ -727,6 +767,237 @@ impl GcClient {
     pub fn comprehensive_heartbeat_interval_ms(&self) -> u64 {
         self.comprehensive_heartbeat_interval_ms
             .load(Ordering::SeqCst)
+    }
+}
+
+// =============================================================================
+// ADR-0039 §3: AcquireMediaHandler (MC -> GC replacement grant)
+// =============================================================================
+
+/// One replacement request, as the meeting actor builds it. Ids and the
+/// trigger only: no key material, no token, no request metadata (the bearer
+/// is added by [`GcClient`] at send time and never stored here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquireCall {
+    /// The meeting needing a handler.
+    pub meeting_id: String,
+    /// `exclude_handler_ids`: current ∪ removed (refused-at-admission grants
+    /// are removed, so they are in it). A set, so the wire list is deduplicated
+    /// by construction (GC counts duplicates toward its cap).
+    pub exclude: BTreeSet<HandlerId>,
+    /// Why the replaced handler left (projected through
+    /// [`ReleaseCauseExt::release_cause`], the ONE projection).
+    pub trigger: RemovalTrigger,
+    /// The handler being replaced, when there is exactly one: label/log
+    /// context for GC only (`gc_view`), never a swap target. `None` omits the
+    /// field.
+    pub replaced: Option<HandlerId>,
+}
+
+/// Why GC's answer is refused outright (never retried, ERROR).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireRejection {
+    /// `FAILED_PRECONDITION`: GC holds no active ownership row for (meeting,
+    /// this MC). Anti-misroute only.
+    NotOwner,
+    /// `INVALID_ARGUMENT`: an MC bug (over-cap list, malformed id, bad
+    /// trigger).
+    InvalidRequest,
+    /// An `OK` that is not a grant (fail closed): which field was missing.
+    Malformed(MalformedGrant),
+}
+
+impl AcquireRejection {
+    /// Bounded log value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotOwner => "not_owner",
+            Self::InvalidRequest => "invalid_request",
+            Self::Malformed(m) => m.label(),
+        }
+    }
+}
+
+/// The missing piece of an `OK` that is not a grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedGrant {
+    /// `assignment` absent.
+    NoAssignment,
+    /// The assignment failed THE intake predicate shared with the hand-off.
+    Assignment(AssignmentRejected),
+}
+
+impl MalformedGrant {
+    /// Bounded log value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoAssignment => "no_assignment",
+            Self::Assignment(r) => r.label(),
+        }
+    }
+}
+
+/// GC's answer to one [`AcquireCall`], classified by status CODE (never the
+/// message). The code and GC's message are KEPT on every failure arm, so the
+/// caller's log and any error built from it carry them (the message goes to
+/// logs only, never to a client).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcquireResult {
+    /// `OK` with a well-formed assignment.
+    Granted(HandlerEndpoint),
+    /// `RESOURCE_EXHAUSTED`: nothing eligible after exclusion. Retried.
+    NoCapacity {
+        /// GC's status message (logs only).
+        message: String,
+    },
+    /// GC could not answer: transport errors, `UNAVAILABLE`,
+    /// `DEADLINE_EXCEEDED`, `INTERNAL`, `UNIMPLEMENTED` (rollout window),
+    /// `UNAUTHENTICATED` / `PERMISSION_DENIED` (token expiry; TokenManager
+    /// refreshes) and every other code. Retried with backoff.
+    Unavailable {
+        /// The status code.
+        code: tonic::Code,
+        /// GC's status message (logs only).
+        message: String,
+    },
+    /// Refused outright: never retried, logged at ERROR.
+    Rejected {
+        /// Why.
+        reason: AcquireRejection,
+        /// The status code (`Ok` for a malformed grant).
+        code: tonic::Code,
+        /// GC's status message (logs only).
+        message: String,
+    },
+}
+
+/// Classify one `AcquireMediaHandler` reply. One explicit arm per code GC is
+/// documented to return (`internal.proto` `AcquireMediaHandlerRequest`
+/// STATUSES), so no code reaches a bucket by accident.
+#[must_use]
+pub fn classify_acquire(
+    reply: Result<AcquireMediaHandlerResponse, tonic::Status>,
+) -> AcquireResult {
+    let status = match reply {
+        Ok(response) => {
+            let Some(assignment) = response.assignment else {
+                return AcquireResult::Rejected {
+                    reason: AcquireRejection::Malformed(MalformedGrant::NoAssignment),
+                    code: tonic::Code::Ok,
+                    message: String::new(),
+                };
+            };
+            return match HandlerEndpoint::try_from(&assignment) {
+                Ok(endpoint) => AcquireResult::Granted(endpoint),
+                Err(rejected) => AcquireResult::Rejected {
+                    reason: AcquireRejection::Malformed(MalformedGrant::Assignment(rejected)),
+                    code: tonic::Code::Ok,
+                    message: String::new(),
+                },
+            };
+        }
+        Err(status) => status,
+    };
+    let code = status.code();
+    let message = status.message().to_string();
+    match code {
+        tonic::Code::ResourceExhausted => AcquireResult::NoCapacity { message },
+        tonic::Code::FailedPrecondition => AcquireResult::Rejected {
+            reason: AcquireRejection::NotOwner,
+            code,
+            message,
+        },
+        tonic::Code::InvalidArgument => AcquireResult::Rejected {
+            reason: AcquireRejection::InvalidRequest,
+            code,
+            message,
+        },
+        // Transient by contract: GC really emits INTERNAL on a DB error.
+        tonic::Code::Unavailable
+        | tonic::Code::DeadlineExceeded
+        | tonic::Code::Internal
+        // Only from a GC predating the rpc (rollout window).
+        | tonic::Code::Unimplemented
+        // GC's auth layer (token expiry): TokenManager refreshes; the caller
+        // WARNs on these two every attempt so a lasting credential fault is
+        // never silent.
+        | tonic::Code::Unauthenticated
+        | tonic::Code::PermissionDenied
+        // Every other code: retried with backoff (fail toward survivors).
+        | tonic::Code::Ok
+        | tonic::Code::Cancelled
+        | tonic::Code::Unknown
+        | tonic::Code::NotFound
+        | tonic::Code::AlreadyExists
+        | tonic::Code::Aborted
+        | tonic::Code::OutOfRange
+        | tonic::Code::DataLoss => AcquireResult::Unavailable { code, message },
+    }
+}
+
+/// MC→GC replacement grants (ADR-0039 §3). Abstraction over the gRPC call so
+/// the meeting actor's migration path is testable with a scripted GC.
+/// Production: [`GcClient`].
+pub trait HandlerAcquirer: Send + Sync {
+    /// Ask GC for ONE replacement handler. Never panics; every failure is an
+    /// [`AcquireResult`] arm.
+    fn acquire<'a>(
+        &'a self,
+        call: &'a AcquireCall,
+    ) -> Pin<Box<dyn std::future::Future<Output = AcquireResult> + Send + 'a>>;
+
+    /// GC's exclude-list cap from the latest accepted registration (`None`
+    /// before one).
+    fn max_exclude_handler_ids(&self) -> Option<NonZeroU32>;
+}
+
+impl HandlerAcquirer for GcClient {
+    fn acquire<'a>(
+        &'a self,
+        call: &'a AcquireCall,
+    ) -> Pin<Box<dyn std::future::Future<Output = AcquireResult> + Send + 'a>> {
+        Box::pin(async move {
+            let request = AcquireMediaHandlerRequest {
+                meeting_id: call.meeting_id.clone(),
+                controller_id: self.config.mc_id.clone(),
+                exclude_handler_ids: call
+                    .exclude
+                    .iter()
+                    .map(|id| id.as_str().to_string())
+                    .collect(),
+                trigger: call.trigger.release_cause().into(),
+                replaced_handler_id: call.replaced.as_ref().map(|id| id.as_str().to_string()),
+            };
+            let grpc_request = match self.add_auth(request) {
+                Ok(r) => r,
+                Err(e) => {
+                    return AcquireResult::Unavailable {
+                        code: tonic::Code::Unauthenticated,
+                        message: format!("could not build the request: {e}"),
+                    }
+                }
+            };
+            // The SAME channel as registration: `.timeout(GC_RPC_TIMEOUT)` and
+            // `connect_timeout(GC_CONNECT_TIMEOUT)` bound every call, so a hung
+            // GC resolves as DEADLINE_EXCEEDED and never wedges the meeting's
+            // one in-flight acquisition.
+            let mut client = GlobalControllerServiceClient::with_interceptor(
+                self.channel.clone(),
+                common::observability::otel_grpc::client_interceptor(),
+            );
+            classify_acquire(
+                client
+                    .acquire_media_handler(grpc_request)
+                    .await
+                    .map(tonic::Response::into_inner),
+            )
+        })
+    }
+
+    fn max_exclude_handler_ids(&self) -> Option<NonZeroU32> {
+        GcClient::max_exclude_handler_ids(self)
     }
 }
 
@@ -837,6 +1108,8 @@ mod tests {
             mh_heartbeat_timeout_ms: 6000,
             kek_rotation_debounce_seconds: 60,
             media_dial_token_ttl_seconds: 300,
+            mh_replacement_min_interval_ms: 1000,
+            mh_replacement_backoff_max_ms: 30000,
             max_receive_capability_declarations: 64,
             audio_encoding: crate::media_signaling::AudioEncoding::new(
                 proto_gen::dark_tower::signaling::v1::Codec::Opus,
@@ -907,6 +1180,8 @@ mod tests {
             mh_heartbeat_timeout_ms: 6000,
             kek_rotation_debounce_seconds: 60,
             media_dial_token_ttl_seconds: 300,
+            mh_replacement_min_interval_ms: 1000,
+            mh_replacement_backoff_max_ms: 30000,
             max_receive_capability_declarations: 64,
             audio_encoding: crate::media_signaling::AudioEncoding::new(
                 proto_gen::dark_tower::signaling::v1::Codec::Opus,

@@ -110,6 +110,20 @@ const MAX_REGISTER_ATTEMPTS: u32 = 3;
 pub(crate) const REGISTER_BACKOFF_DELAYS: [Duration; 2] =
     [Duration::from_secs(1), Duration::from_secs(2)];
 
+/// The longest a worker's FIRST snapshot can take to settle without an ack:
+/// every attempt hits its connect + RPC timeout, plus the backoffs between
+/// them. THE one derivation of "how long registration may take" (story 4
+/// MC-C): folded into the published replacement retry budget
+/// (`media_routing::replacement::ReplacementTiming::retry_budget`), so the
+/// awaiting-handler page and the env-test ceilings move with these constants.
+#[must_use]
+pub fn initial_registration_bound() -> Duration {
+    let per_attempt =
+        crate::grpc::mh_client::MH_RPC_TIMEOUT + crate::grpc::mh_client::MH_CONNECT_TIMEOUT;
+    let backoffs: Duration = REGISTER_BACKOFF_DELAYS.iter().sum();
+    per_attempt * MAX_REGISTER_ATTEMPTS + backoffs
+}
+
 /// One snapshot for one handler, and the generation the actor took for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushJob {

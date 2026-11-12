@@ -92,6 +92,8 @@ impl WebTransportServer {
         client_media_config: crate::media_signaling::ClientMediaConfig,
         heartbeat: crate::media_routing::HeartbeatTiming,
         media_dial: crate::media_dial::MediaDialTiming,
+        acquirer: Arc<dyn crate::grpc::gc_client::HandlerAcquirer>,
+        replacement: crate::media_routing::ReplacementTiming,
         max_connections: usize,
         quic_max_idle_timeout: Duration,
         cancel_token: CancellationToken,
@@ -125,6 +127,10 @@ impl WebTransportServer {
         // Same discipline: the published media_dial TTL and TTL/3 are the very
         // timing every meeting mints and refreshes with (ADR-0039 §5).
         media_dial.publish_config_gauges();
+        // Same discipline: the published replacement pacing (and the derived
+        // retry budget the awaiting-handler page reads) is the very timing
+        // every meeting's scheduler uses (story 4 MC-C).
+        metrics::set_replacement_timing(replacement);
 
         Self {
             bind_address,
@@ -144,6 +150,8 @@ impl WebTransportServer {
                 connect_settle_window: client_media_config.connect_settle_window,
                 heartbeat,
                 media_dial,
+                acquirer,
+                replacement,
             }),
             client_media_config,
             max_connections,

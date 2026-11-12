@@ -3,7 +3,7 @@
 //! Tests the registration, heartbeat, and assignment flows between
 //! Meeting Controller and Global Controller.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[path = "common/mod.rs"]
 mod test_common;
@@ -22,6 +22,9 @@ use mc_test_utils::test_token_receiver;
 use common::secret::SecretString;
 use proto_gen::dark_tower::internal::v1::global_controller_service_server::{
     GlobalControllerService, GlobalControllerServiceServer,
+};
+use proto_gen::dark_tower::internal::v1::{
+    AcquireMediaHandlerRequest, AcquireMediaHandlerResponse, MhAssignment, ReleaseCause,
 };
 use proto_gen::dark_tower::internal::v1::{
     ComprehensiveHeartbeatRequest, ComprehensiveHeartbeatResponse, FastHeartbeatRequest,
@@ -78,6 +81,24 @@ struct MockGcServer {
     /// When set, `NotifyMeetingEnded` sleeps this long before answering, so a
     /// caller's own deadline can be made to expire deterministically.
     notify_meeting_ended_delay: Option<Duration>,
+    /// `RegisterMCResponse.max_exclude_handler_ids` (shared so a test can change
+    /// it between a registration and a re-registration).
+    max_exclude_handler_ids: Arc<AtomicU32>,
+    /// How `AcquireMediaHandler` answers.
+    acquire_reply: Arc<std::sync::Mutex<AcquireReply>>,
+    /// Every `AcquireMediaHandler` request received.
+    acquire_requests: Arc<std::sync::Mutex<Vec<AcquireMediaHandlerRequest>>>,
+}
+
+/// How the mock answers `AcquireMediaHandler`.
+#[derive(Debug, Clone)]
+enum AcquireReply {
+    /// OK with this response.
+    Ok(AcquireMediaHandlerResponse),
+    /// This status code.
+    Status(tonic::Code),
+    /// Never answer (a hung GC).
+    Hang,
 }
 
 impl MockGcServer {
@@ -95,6 +116,12 @@ impl MockGcServer {
             notify_meeting_ended_calls: Arc::new(AtomicU32::new(0)),
             notify_meeting_ended_failure: None,
             notify_meeting_ended_delay: None,
+            // GC's shipped default (GC_MH_MAX_EXCLUDE_HANDLER_IDS).
+            max_exclude_handler_ids: Arc::new(AtomicU32::new(16)),
+            acquire_reply: Arc::new(std::sync::Mutex::new(AcquireReply::Status(
+                tonic::Code::Unimplemented,
+            ))),
+            acquire_requests: Arc::default(),
         }
     }
 
@@ -168,8 +195,7 @@ impl GlobalControllerService for MockGcServer {
                     message: "Registration accepted".to_string(),
                     fast_heartbeat_interval_ms: self.fast_heartbeat_interval_ms,
                     comprehensive_heartbeat_interval_ms: self.comprehensive_heartbeat_interval_ms,
-                    // GC's shipped default (GC_MH_MAX_EXCLUDE_HANDLER_IDS).
-                    max_exclude_handler_ids: 16,
+                    max_exclude_handler_ids: self.max_exclude_handler_ids.load(Ordering::SeqCst),
                 }))
             }
             MockBehavior::Reject => Ok(Response::new(RegisterMcResponse {
@@ -275,11 +301,18 @@ impl GlobalControllerService for MockGcServer {
 
     async fn acquire_media_handler(
         &self,
-        _request: Request<proto_gen::dark_tower::internal::v1::AcquireMediaHandlerRequest>,
-    ) -> Result<Response<proto_gen::dark_tower::internal::v1::AcquireMediaHandlerResponse>, Status>
-    {
-        // Not exercised by these tests (MC's replacement client lands in MC-C).
-        Err(Status::unimplemented("not used"))
+        request: Request<AcquireMediaHandlerRequest>,
+    ) -> Result<Response<AcquireMediaHandlerResponse>, Status> {
+        self.acquire_requests
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
+        let reply = self.acquire_reply.lock().unwrap().clone();
+        match reply {
+            AcquireReply::Ok(response) => Ok(Response::new(response)),
+            AcquireReply::Status(code) => Err(Status::new(code, "mock AcquireMediaHandler")),
+            AcquireReply::Hang => std::future::pending().await,
+        }
     }
 }
 
@@ -327,6 +360,8 @@ fn test_config(gc_url: &str) -> Config {
         mh_heartbeat_timeout_ms: 6000,
         kek_rotation_debounce_seconds: 60,
         media_dial_token_ttl_seconds: test_common::media_dial_timing().ttl_seconds(),
+        mh_replacement_min_interval_ms: 1000,
+        mh_replacement_backoff_max_ms: 30000,
         max_receive_capability_declarations: media.max_receive_capability_declarations,
         audio_encoding: media.audio_encoding,
         video_encoding: media.video_encoding,
@@ -427,6 +462,248 @@ async fn test_gc_client_registration_content() {
         config.webtransport_advertise_address
     );
 
+    cancel_token.cancel();
+}
+
+/// Story 4 MC-C: `RegisterMCResponse.max_exclude_handler_ids` 0 FAILS MC
+/// registration and is not retried (a GC predating GC-3 sends 0 on every
+/// attempt). "Absent" and 0 are the same proto3 wire value, so the 0 arm IS
+/// the absent arm. Positive arm: 16 registers and is stored; a
+/// re-registration refreshes it (7).
+#[tokio::test]
+async fn registration_requires_a_positive_max_exclude_cap_and_reregistration_refreshes_it() {
+    use mc_service::grpc::gc_client::HandlerAcquirer;
+
+    // 0 (= absent): refused, once, loudly.
+    let mock_gc = MockGcServer::accepting();
+    let cap = Arc::clone(&mock_gc.max_exclude_handler_ids);
+    cap.store(0, Ordering::SeqCst);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{addr}");
+    let gc_client = GcClient::new(gc_url.clone(), test_token_receiver(), test_config(&gc_url))
+        .await
+        .unwrap();
+    match gc_client.register().await {
+        Err(McError::Config(msg)) => assert!(
+            msg.contains("max_exclude_handler_ids"),
+            "names the field: {msg}"
+        ),
+        other => panic!("expected a Config refusal, got {other:?}"),
+    }
+    assert!(!gc_client.is_registered());
+    assert_eq!(gc_client.max_exclude_handler_ids(), None);
+    assert!(gc_client.attempt_reregistration().await.is_err());
+    assert!(!gc_client.is_registered());
+
+    // 16: registered, stored; a re-registration with 7 refreshes it.
+    cap.store(16, Ordering::SeqCst);
+    gc_client.register().await.unwrap();
+    assert!(gc_client.is_registered());
+    assert_eq!(
+        HandlerAcquirer::max_exclude_handler_ids(&gc_client).map(|c| c.get()),
+        Some(16)
+    );
+    cap.store(7, Ordering::SeqCst);
+    gc_client.attempt_reregistration().await.unwrap();
+    assert_eq!(
+        gc_client.max_exclude_handler_ids().map(|c| c.get()),
+        Some(7)
+    );
+    cancel_token.cancel();
+}
+
+/// Story 4 MC-C: the AcquireMediaHandler request carries the deduplicated
+/// exclude list, the projected trigger, the optional replaced id and this
+/// MC's id; each documented status lands in its class with code and message
+/// kept.
+#[tokio::test]
+async fn acquire_media_handler_request_and_status_classes() {
+    use mc_service::grpc::gc_client::{
+        AcquireCall, AcquireRejection, AcquireResult, HandlerAcquirer, MalformedGrant,
+    };
+    use mc_service::media_routing::AssignmentRejected;
+    use mc_service::media_routing::{HandlerId, RemovalTrigger};
+
+    let mock_gc = MockGcServer::accepting();
+    let reply = Arc::clone(&mock_gc.acquire_reply);
+    let requests = Arc::clone(&mock_gc.acquire_requests);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{addr}");
+    let config = test_config(&gc_url);
+    let gc_client = GcClient::new(gc_url, test_token_receiver(), config.clone())
+        .await
+        .unwrap();
+
+    let assignment = MhAssignment {
+        mh_id: "mh-new".to_string(),
+        webtransport_endpoint: "https://mh-new:4434".to_string(),
+        grpc_endpoint: "http://mh-new:50053".to_string(),
+    };
+    *reply.lock().unwrap() = AcquireReply::Ok(AcquireMediaHandlerResponse {
+        assignment: Some(assignment.clone()),
+    });
+    let call = AcquireCall {
+        meeting_id: "m-1".to_string(),
+        exclude: [
+            HandlerId::new("mh-b"),
+            HandlerId::new("mh-a"),
+            HandlerId::new("mh-a"),
+        ]
+        .into_iter()
+        .collect(),
+        trigger: RemovalTrigger::ApplyLag,
+        replaced: Some(HandlerId::new("mh-a")),
+    };
+    match gc_client.acquire(&call).await {
+        AcquireResult::Granted(endpoint) => {
+            assert_eq!(endpoint.id.as_str(), "mh-new");
+            assert_eq!(endpoint.webtransport_url, "https://mh-new:4434");
+            assert_eq!(endpoint.grpc_endpoint, "http://mh-new:50053");
+        }
+        other => panic!("expected a grant, got {other:?}"),
+    }
+    let sent = requests.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(sent.meeting_id, "m-1");
+    assert_eq!(sent.controller_id, config.mc_id);
+    assert_eq!(
+        sent.exclude_handler_ids,
+        vec!["mh-a", "mh-b"],
+        "deduplicated"
+    );
+    assert_eq!(sent.trigger, ReleaseCause::ApplyLag as i32);
+    assert_eq!(sent.replaced_handler_id.as_deref(), Some("mh-a"));
+
+    // Absent replaced id is OMITTED, not empty.
+    let no_replaced = AcquireCall {
+        replaced: None,
+        ..call.clone()
+    };
+    let _ = gc_client.acquire(&no_replaced).await;
+    assert_eq!(
+        requests.lock().unwrap().last().unwrap().replaced_handler_id,
+        None
+    );
+
+    // A malformed OK fails closed, one arm per missing field.
+    for (broken, want) in [
+        (None, MalformedGrant::NoAssignment),
+        (
+            Some(MhAssignment {
+                mh_id: String::new(),
+                ..assignment.clone()
+            }),
+            MalformedGrant::Assignment(AssignmentRejected::EmptyHandlerId),
+        ),
+        (
+            Some(MhAssignment {
+                webtransport_endpoint: String::new(),
+                ..assignment.clone()
+            }),
+            MalformedGrant::Assignment(AssignmentRejected::EmptyWebtransportEndpoint),
+        ),
+        (
+            Some(MhAssignment {
+                grpc_endpoint: String::new(),
+                ..assignment.clone()
+            }),
+            MalformedGrant::Assignment(AssignmentRejected::EmptyGrpcEndpoint),
+        ),
+    ] {
+        *reply.lock().unwrap() =
+            AcquireReply::Ok(AcquireMediaHandlerResponse { assignment: broken });
+        match gc_client.acquire(&call).await {
+            AcquireResult::Rejected {
+                reason: AcquireRejection::Malformed(m),
+                ..
+            } => assert_eq!(m, want),
+            other => panic!("{want:?}: expected a malformed rejection, got {other:?}"),
+        }
+    }
+
+    // Status classes, code and message kept.
+    for code in [
+        tonic::Code::ResourceExhausted,
+        tonic::Code::FailedPrecondition,
+        tonic::Code::InvalidArgument,
+        tonic::Code::Unavailable,
+        tonic::Code::Internal,
+        tonic::Code::Unimplemented,
+        tonic::Code::Unauthenticated,
+        tonic::Code::PermissionDenied,
+    ] {
+        *reply.lock().unwrap() = AcquireReply::Status(code);
+        let result = gc_client.acquire(&call).await;
+        match (code, result) {
+            (tonic::Code::ResourceExhausted, AcquireResult::NoCapacity { message }) => {
+                assert!(message.contains("mock"));
+            }
+            (
+                tonic::Code::FailedPrecondition,
+                AcquireResult::Rejected {
+                    reason: AcquireRejection::NotOwner,
+                    code: got,
+                    message,
+                },
+            )
+            | (
+                tonic::Code::InvalidArgument,
+                AcquireResult::Rejected {
+                    reason: AcquireRejection::InvalidRequest,
+                    code: got,
+                    message,
+                },
+            ) => {
+                assert_eq!(got, code);
+                assert!(message.contains("mock"));
+            }
+            (_, AcquireResult::Unavailable { code: got, message }) => {
+                assert_eq!(got, code, "retryable class keeps its code");
+                assert!(message.contains("mock"));
+            }
+            (code, other) => panic!("{code:?}: unexpected class {other:?}"),
+        }
+    }
+    cancel_token.cancel();
+}
+
+/// Story 4 MC-C (operations): a GC that accepts the call but never answers
+/// resolves through the channel's RPC timeout as a RETRYABLE failure — the
+/// meeting's one in-flight acquisition can never wedge. Paused time after the
+/// connection is up, so the 10 s timeout costs nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_hung_gc_times_out_into_a_retryable_failure() {
+    use mc_service::grpc::gc_client::{AcquireCall, AcquireResult, HandlerAcquirer};
+    use mc_service::media_routing::RemovalTrigger;
+
+    let mock_gc = MockGcServer::accepting();
+    let reply = Arc::clone(&mock_gc.acquire_reply);
+    let requests = Arc::clone(&mock_gc.acquire_requests);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{addr}");
+    let gc_client = GcClient::new(gc_url.clone(), test_token_receiver(), test_config(&gc_url))
+        .await
+        .unwrap();
+    gc_client.register().await.unwrap(); // the connection is up
+    *reply.lock().unwrap() = AcquireReply::Hang;
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let result = gc_client
+        .acquire(&AcquireCall {
+            meeting_id: "m-hung".to_string(),
+            exclude: Default::default(),
+            trigger: RemovalTrigger::HeartbeatTimeout,
+            replaced: None,
+        })
+        .await;
+    assert!(
+        matches!(result, AcquireResult::Unavailable { .. }),
+        "a timeout is retryable: {result:?}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(10),
+        "bounded by the RPC timeout"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1, "the request reached GC");
     cancel_token.cancel();
 }
 

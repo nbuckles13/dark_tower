@@ -108,6 +108,61 @@ pub struct HandlerEndpoint {
     pub grpc_endpoint: String,
 }
 
+/// Why one GC-supplied `MhAssignment` is not a usable handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentRejected {
+    /// `mh_id` is empty.
+    EmptyHandlerId,
+    /// `webtransport_endpoint` (the url clients receive) is empty.
+    EmptyWebtransportEndpoint,
+    /// `grpc_endpoint` (where MC sends its bearer in `RegisterMeeting`) is
+    /// empty.
+    EmptyGrpcEndpoint,
+}
+
+impl AssignmentRejected {
+    /// Bounded log value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::EmptyHandlerId => "empty_mh_id",
+            Self::EmptyWebtransportEndpoint => "empty_webtransport_endpoint",
+            Self::EmptyGrpcEndpoint => "empty_grpc_endpoint",
+        }
+    }
+}
+
+/// THE one intake predicate for a GC-supplied handler (security S2, story 4
+/// MC-C): BOTH sources — the meeting's hand-off (`AssignMeetingWithMh`, in
+/// `grpc/mc_service.rs`) and a replacement grant (`AcquireMediaHandler`, in
+/// `grpc/gc_client.rs`) — go through it, so neither can be stricter or looser
+/// than the other. The endpoint receives MC's bearer (`RegisterMeeting`) and
+/// its url goes to clients. GC mirrors it producer-side
+/// (`selection_is_malformed`, gc-service `services/mc_assignment.rs`; ANCHOR).
+impl TryFrom<&proto_gen::dark_tower::internal::v1::MhAssignment> for HandlerEndpoint {
+    type Error = AssignmentRejected;
+
+    /// The first empty field, in id -> url -> grpc order.
+    fn try_from(
+        assignment: &proto_gen::dark_tower::internal::v1::MhAssignment,
+    ) -> Result<Self, Self::Error> {
+        if assignment.mh_id.is_empty() {
+            return Err(AssignmentRejected::EmptyHandlerId);
+        }
+        if assignment.webtransport_endpoint.is_empty() {
+            return Err(AssignmentRejected::EmptyWebtransportEndpoint);
+        }
+        if assignment.grpc_endpoint.is_empty() {
+            return Err(AssignmentRejected::EmptyGrpcEndpoint);
+        }
+        Ok(Self {
+            id: HandlerId::new(assignment.mh_id.clone()),
+            webtransport_url: assignment.webtransport_endpoint.clone(),
+            grpc_endpoint: assignment.grpc_endpoint.clone(),
+        })
+    }
+}
+
 /// Why MC removed a handler from a meeting (ADR-0039 §2/§6). MC's domain
 /// enum, which is also the fleet-wide `trigger` label vocabulary: its single
 /// home is `common::observability::labels::RemovalTrigger`, re-exported here so
@@ -461,6 +516,26 @@ impl MeetingHandlers {
             Some(trigger) => super::HeartbeatVerdict::Removed(*trigger),
             None => super::HeartbeatVerdict::Unassigned,
         })
+    }
+
+    /// Every id a replacement request must exclude (ADR-0039 §3): current
+    /// members ∪ removed. A grant refused at admission is removed, so it is
+    /// here too. A set: deduplicated by construction.
+    #[must_use]
+    pub fn excluded_ids(&self) -> BTreeSet<HandlerId> {
+        self.members
+            .iter()
+            .map(|m| m.endpoint.id.clone())
+            .chain(self.removed.keys().cloned())
+            .collect()
+    }
+
+    /// Whether `id` is a member at incarnation `handler_ref` that is still
+    /// Registering (its first `RegisterMeeting` not yet acked).
+    #[must_use]
+    pub fn is_registering(&self, id: &HandlerId, handler_ref: NonZeroU32) -> bool {
+        self.member(id)
+            .is_some_and(|m| !m.is_active() && m.handler_ref == handler_ref)
     }
 
     /// The current `handler_set_version`.
@@ -913,6 +988,61 @@ mod tests {
             None
         );
         assert_eq!(set.version(), v);
+    }
+
+    #[test]
+    fn is_registering_is_keyed_by_id_and_ref_and_false_once_active() {
+        let mut set = MeetingHandlers::from_handoff([endpoint("h1")]).unwrap();
+        let r = set.handler_ref_of(&hid("h1")).unwrap();
+        assert!(set.is_registering(&hid("h1"), r));
+        assert!(
+            !set.is_registering(&hid("h1"), r.checked_add(1).unwrap()),
+            "stale ref"
+        );
+        assert!(!set.is_registering(&hid("nope"), r));
+        set.mark_active(&hid("h1"), r, tokio::time::Instant::now())
+            .unwrap();
+        assert!(!set.is_registering(&hid("h1"), r), "Active");
+    }
+
+    #[test]
+    fn an_assignment_is_a_handler_only_with_id_url_and_grpc() {
+        use proto_gen::dark_tower::internal::v1::MhAssignment;
+        let ok = MhAssignment {
+            mh_id: "h".into(),
+            webtransport_endpoint: "https://h:4434".into(),
+            grpc_endpoint: "http://h:50053".into(),
+        };
+        let e = HandlerEndpoint::try_from(&ok).unwrap();
+        assert_eq!(
+            (e.id.as_str(), e.webtransport_url.as_str()),
+            ("h", "https://h:4434")
+        );
+        for (broken, want) in [
+            (
+                MhAssignment {
+                    mh_id: String::new(),
+                    ..ok.clone()
+                },
+                AssignmentRejected::EmptyHandlerId,
+            ),
+            (
+                MhAssignment {
+                    webtransport_endpoint: String::new(),
+                    ..ok.clone()
+                },
+                AssignmentRejected::EmptyWebtransportEndpoint,
+            ),
+            (
+                MhAssignment {
+                    grpc_endpoint: String::new(),
+                    ..ok.clone()
+                },
+                AssignmentRejected::EmptyGrpcEndpoint,
+            ),
+        ] {
+            assert_eq!(HandlerEndpoint::try_from(&broken), Err(want));
+        }
     }
 
     #[test]

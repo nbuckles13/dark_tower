@@ -150,6 +150,8 @@ impl AcceptLoopRig {
             client_media_config,
             super::heartbeat_timing(),
             super::media_dial_timing(),
+            Arc::new(mc_test_utils::ScriptedGc::with_cap(16)),
+            super::replacement_timing(),
             max_connections,
             std::time::Duration::from_secs(10),
             cancel_token.clone(),

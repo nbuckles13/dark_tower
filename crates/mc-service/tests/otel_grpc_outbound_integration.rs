@@ -195,6 +195,8 @@ fn test_config(gc_url: &str) -> Config {
         mh_heartbeat_timeout_ms: 6000,
         kek_rotation_debounce_seconds: 60,
         media_dial_token_ttl_seconds: test_common::media_dial_timing().ttl_seconds(),
+        mh_replacement_min_interval_ms: 1000,
+        mh_replacement_backoff_max_ms: 30000,
         max_receive_capability_declarations: media.max_receive_capability_declarations,
         audio_encoding: media.audio_encoding,
         video_encoding: media.video_encoding,

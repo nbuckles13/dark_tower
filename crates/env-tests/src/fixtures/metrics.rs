@@ -1219,35 +1219,50 @@ pub fn heartbeat_interval_of(n: Duration) -> Duration {
     Duration::from_millis(u64::try_from(n_ms / 3).unwrap_or(u64::MAX).max(1))
 }
 
-/// THE env-test read of MC's heartbeat deadline N
-/// (`mc_media_handler_heartbeat_deadline_seconds`), the ONE input every
-/// detection wait derives from: the largest value across the live MC pods
-/// (so a bound built on it covers the slowest). Never a literal or a config
-/// file read.
+/// THE env-test read of one MC CONFIG-ECHO gauge, in seconds: the largest
+/// value across the live MC pods (so a bound built on it covers the slowest).
+/// Never a literal or a config file read. One home for every MC config gauge
+/// a wait derives from.
 ///
 /// # Panics
 /// PRECONDITION if no MC pod serves or the gauge is absent or not positive.
-pub async fn mc_heartbeat_deadline(prom: &PrometheusClient) -> Duration {
+pub async fn mc_config_gauge_max(prom: &PrometheusClient, metric: &str) -> Duration {
     let (_, mc_pods) = crate::fixtures::kube::settled_serving_pods(
         "app=mc-service",
         Duration::from_secs(60),
         "mc-pods-unserving",
     )
     .await;
-    let n_seconds = gauge_by_pods(
-        prom,
-        "mc_media_handler_heartbeat_deadline_seconds",
-        &mc_pods,
-        PINNED_METRIC_BOUND,
-    )
-    .await
-    .into_values()
-    .fold(0.0_f64, f64::max);
+    let seconds = gauge_by_pods(prom, metric, &mc_pods, PINNED_METRIC_BOUND)
+        .await
+        .into_values()
+        .fold(0.0_f64, f64::max);
     assert!(
-        n_seconds > 0.0,
-        "PRECONDITION: MC publishes mc_media_handler_heartbeat_deadline_seconds > 0 (got {n_seconds})"
+        seconds > 0.0,
+        "PRECONDITION: MC publishes {metric} > 0 (got {seconds})"
     );
-    Duration::from_millis((n_seconds * 1000.0).round() as u64)
+    Duration::from_millis((seconds * 1000.0).round() as u64)
+}
+
+/// THE env-test read of MC's heartbeat deadline N
+/// (`mc_media_handler_heartbeat_deadline_seconds`), the ONE input every
+/// detection wait derives from.
+///
+/// # Panics
+/// As [`mc_config_gauge_max`].
+pub async fn mc_heartbeat_deadline(prom: &PrometheusClient) -> Duration {
+    mc_config_gauge_max(prom, "mc_media_handler_heartbeat_deadline_seconds").await
+}
+
+/// THE env-test read of MC's replacement retry budget
+/// (`mc_media_handler_replacement_retry_budget_seconds`, story 4 MC-C): the
+/// ceiling every replacement wait adds (the ladder to its cap + one cap + the
+/// initial-registration bound, derived by MC).
+///
+/// # Panics
+/// As [`mc_config_gauge_max`].
+pub async fn mc_replacement_retry_budget(prom: &PrometheusClient) -> Duration {
+    mc_config_gauge_max(prom, "mc_media_handler_replacement_retry_budget_seconds").await
 }
 
 /// Failure bound for a settled per-pod baseline ([`settled_baseline`]): two

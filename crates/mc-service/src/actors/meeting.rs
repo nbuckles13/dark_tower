@@ -60,6 +60,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 /// The health decision's driver and the removal transaction (ADR-0039 §2/§6).
 mod health;
+mod replacement;
 
 /// Default channel buffer size for the meeting mailbox.
 const MEETING_CHANNEL_BUFFER: usize = 500;
@@ -811,6 +812,10 @@ pub struct MeetingActor {
     /// until the initial handlers' verdict or the park deadline. See
     /// `actors/join_park.rs`.
     join_park: JoinPark,
+    /// Replacement after removal (ADR-0039 §3; story 4 MC-C): the owed
+    /// replacements, the ONE in-flight `AcquireMediaHandler` and the grants
+    /// still Registering. See `meeting/replacement.rs`.
+    replacement: replacement::Replacement,
     /// Set when the meeting has ended and the actor should leave its loop
     /// through the clean exit path (which releases the handlers).
     end_cause: Option<MeetingEndCause>,
@@ -1002,6 +1007,8 @@ impl MeetingActor {
         );
 
         let join_park = JoinPark::new(handlers.ids().cloned());
+        // The hand-off size is the size the meeting is kept at.
+        let replacement = replacement::Replacement::new(handlers.len(), None);
         let media = MeetingMedia::new(meeting_id.clone(), handlers, dial_signing_key.public_key());
         let kek_debounce = KekRotationDebounce::new(kek_lifecycle.window());
 
@@ -1035,6 +1042,7 @@ impl MeetingActor {
             client_mute_fanout: ClientMuteFanout::new(Instant::now()),
             media,
             join_park,
+            replacement,
             end_cause: None,
             wiring: None,
         };
@@ -1120,6 +1128,7 @@ impl MeetingActor {
         let manual = seams.kek_debounce_manual;
         let dial_refresh_seed = seams.dial_refresh_seed;
         let dial_clock_base_unix = seams.dial_clock_base_unix;
+        let replacement_seed = seams.replacement_seed;
         Self::spawn_inner(
             meeting_id,
             cancel_token,
@@ -1139,6 +1148,12 @@ impl MeetingActor {
                 }
                 if let Some(base_unix) = dial_clock_base_unix {
                     actor.dial_clock = crate::media_dial::DialClock::anchored(base_unix);
+                }
+                if replacement_seed.is_some() {
+                    actor.replacement = replacement::Replacement::new(
+                        actor.media.handlers().len(),
+                        replacement_seed,
+                    );
                 }
             },
         )
@@ -1173,6 +1188,7 @@ impl MeetingActor {
             let park_deadline = self.join_park.deadline();
             let dial_wake = self.dial_refresh.next_wake();
             let health_wake = self.media.next_health_wake();
+            let replacement_wake = self.replacement.next_wake();
 
             tokio::select! {
                 // Handle cancellation
@@ -1281,6 +1297,24 @@ impl MeetingActor {
                     self.on_health_deadline().await;
                 }
 
+                // A replacement attempt is due (ADR-0039 §3): the backoff /
+                // minimum-interval timer. A tokio timer, so paused test time
+                // drives it.
+                () = async {
+                    match replacement_wake {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.on_replacement_due();
+                }
+
+                // The ONE in-flight AcquireMediaHandler answered (a oneshot
+                // held only while the call is open: never awaited in a turn).
+                result = self.replacement.result() => {
+                    self.on_acquire_result(result).await;
+                }
+
                 // Queued handler-set pushes (refresh, FAILED re-push), under
                 // the same per-turn bound as the slot views.
                 () = std::future::ready(()), if self.dial_refresh.has_pending() => {
@@ -1315,6 +1349,10 @@ impl MeetingActor {
         // `Draining` (counted by the connection as a join failure, the same
         // outcome as a join that reaches a draining meeting).
         self.answer_parked_joins_draining();
+
+        // Every open replacement attempt (in flight, or a grant still
+        // Registering) ends `abandoned`; the in-flight call is aborted.
+        self.end_replacement();
 
         // A meeting that ended by emptying or closing has not yet drained its
         // connection actors (the shutdown path above already did).
@@ -1356,6 +1394,8 @@ impl MeetingActor {
     async fn dispatch(&mut self, message: MeetingMessage) {
         self.mailbox.record_enqueue();
         self.handle_message(message).await;
+        // A connect or a leave may close a migration's reconnect phase.
+        self.check_reconnects();
         self.mailbox.record_dequeue();
         self.metrics.record_message_processed();
     }
@@ -3022,6 +3062,10 @@ impl MeetingActor {
             self.reconcile_media(Affected::All).await;
             self.flush_views().await;
         }
+        // The migration side (story 4 MC-C): a grant's ack completes its
+        // attempt; a first RegisterMeeting that never acked removes the
+        // handler and replaces it.
+        self.after_registration(&report, active_changed).await;
     }
 
     /// Send every connected, non-parked participant its set after a

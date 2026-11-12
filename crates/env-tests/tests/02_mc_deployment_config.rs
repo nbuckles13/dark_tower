@@ -10,7 +10,9 @@
 //!   interval `MC_VIDEO_MIN_KEYFRAME_INTERVAL_MS`, MC-only since story 3
 //!   amendment 4, and the story 4 MC-A capacity caps `MC_MAX_MEETINGS` /
 //!   `MC_MAX_PARTICIPANTS`, REQUIRED since R-37, and the story 4 MC-B1
-//!   heartbeat timeout `MC_MH_HEARTBEAT_TIMEOUT_MS`), `media-codec-profile` for
+//!   heartbeat timeout `MC_MH_HEARTBEAT_TIMEOUT_MS`, and the story 4 MC-C
+//!   replacement pacing `MC_MH_REPLACEMENT_MIN_INTERVAL_MS` /
+//!   `MC_MH_REPLACEMENT_BACKOFF_MAX_MS`), `media-codec-profile` for
 //!   the eight shared encoding keys.
 //!   Per workload, never union: a key on mc-0 missing from mc-1 crash-loops
 //!   mc-1 alone, because MC-A reads every one as REQUIRED.
@@ -118,6 +120,19 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
     // MC's reader).
     (
         "MC_MEDIA_DIAL_TOKEN_TTL_SECONDS",
+        MC_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    // Replacement pacing (ADR-0039 §3, story 4 MC-C): REQUIRED, refused at
+    // boot out of range (and the cap below the minimum), so PositiveInteger
+    // (bounds stay with MC's reader).
+    (
+        "MC_MH_REPLACEMENT_MIN_INTERVAL_MS",
+        MC_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    (
+        "MC_MH_REPLACEMENT_BACKOFF_MAX_MS",
         MC_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),

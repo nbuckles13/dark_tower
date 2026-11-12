@@ -49,15 +49,20 @@ const MAX_MC_ASSIGNMENT_RETRIES: usize = 3;
 /// data-integrity fault — the only case in which failing fast (rather than retrying
 /// the pool) is the right call.
 ///
-/// ANCHOR (DRY): these two conditions are the *producer-side mirror* of MC's
+/// ANCHOR (DRY): these conditions are the *producer-side mirror* of MC's
 /// validator-side contract check in `store_mh_assignments`
-/// (`crates/mc-service/src/grpc/mc_service.rs` — empty `mh_assignments`, empty
-/// `grpc_endpoint` → `McError::InvalidArgument`). They are the same wire contract
-/// (`AssignMeetingWithMhRequest` validity) on the two sides of the RPC; if MC's
-/// definition of "malformed" changes, this predicate must change in lockstep, or GC
-/// will retry-vs-fail-fast on the wrong criterion.
+/// (`crates/mc-service/src/grpc/mc_service.rs` — empty `mh_assignments`, or any
+/// assignment failing `HandlerEndpoint::try_from(&MhAssignment)` in
+/// `crates/mc-service/src/media_routing/placement.rs`: empty `mh_id`,
+/// `webtransport_endpoint` or `grpc_endpoint` → `McError::InvalidArgument`).
+/// They are the same wire contract (`AssignMeetingWithMhRequest` validity) on the
+/// two sides of the RPC; if MC's definition of "malformed" changes, this predicate
+/// must change in lockstep, or GC will retry-vs-fail-fast on the wrong criterion.
 fn selection_is_malformed(handlers: &[MhAssignmentInfo]) -> bool {
-    handlers.is_empty() || handlers.iter().any(|h| h.grpc_endpoint.is_empty())
+    handlers.is_empty()
+        || handlers.iter().any(|h| {
+            h.mh_id.is_empty() || h.webtransport_endpoint.is_empty() || h.grpc_endpoint.is_empty()
+        })
 }
 
 /// Service for MC assignment operations.
@@ -544,6 +549,19 @@ mod tests {
         assert!(selection_is_malformed(&[
             handler("grpc://mh-1:50051"),
             handler(""),
+        ]));
+    }
+
+    #[test]
+    fn selection_is_malformed_flags_empty_id_or_url_in_lockstep_with_mc() {
+        let mut no_id = handler("grpc://mh-1:50051");
+        no_id.mh_id = String::new();
+        assert!(selection_is_malformed(&[no_id]));
+        let mut no_url = handler("grpc://mh-1:50051");
+        no_url.webtransport_endpoint = String::new();
+        assert!(selection_is_malformed(&[
+            handler("grpc://mh-2:50051"),
+            no_url
         ]));
     }
 
