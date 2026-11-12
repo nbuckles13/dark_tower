@@ -2294,7 +2294,7 @@ tasks:
   slug: 2026-11-12-mc-handler-detection-removal
   tag: story-2026-10-31-survive-handler-loss-task-MC-B2
 - id: 22
-  status: pending
+  status: completed
   specialist: protocol
   deps:
   - 12
@@ -2352,6 +2352,7 @@ tasks:
     (c) No series added. If an MC or SDK metric existed only for a deleted field (e.g. an mh_url truncation counter), remove its emission, catalog row, panel and zero-init together.
     (d) Test-gates Protocol absence checks, as above, paired with test.
     (e) No ids become labels.
+  slug: 2026-11-12-retire-superseded-signaling-surfaces
   tag: story-2026-10-31-survive-handler-loss-task-P3
 - id: 23
   status: pending
