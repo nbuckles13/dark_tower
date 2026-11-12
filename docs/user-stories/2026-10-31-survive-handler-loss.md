@@ -2355,7 +2355,7 @@ tasks:
   slug: 2026-11-12-retire-superseded-signaling-surfaces
   tag: story-2026-10-31-survive-handler-loss-task-P3
 - id: 23
-  status: pending
+  status: completed
   specialist: meeting-controller
   deps:
   - 11
@@ -2409,6 +2409,7 @@ tasks:
     SAME-COMMIT OBLIGATIONS: (a) any backoff/interval config key gets its Configuration Reference row; (b) n/a; (c) series with panel + catalog + zero-init + ADR-0032 test; (d) test-gates items; (e) no id labels.
 
     Tier: full (>1 service interplay, architectural seam).
+  slug: 2026-11-12-mc-crash-replacement-via-gc
   tag: story-2026-10-31-survive-handler-loss-task-MC-C
 - id: 24
   status: pending
