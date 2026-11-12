@@ -198,13 +198,14 @@ pub enum DirectiveOutcome {
     /// A plan's handler is not a client-visible (Active) member of the
     /// meeting's handler set.
     ///
-    /// **MC defect**: every url and `handler_ref` MC hands out —
-    /// `MediaHandlerSet`, `media_servers`, `StreamAssignment`, `SendTarget` —
-    /// comes from one `MeetingHandlers::client_handler` lookup, and edges are
-    /// routed over Active members only, so a miss cannot happen by
-    /// construction. Fails closed: the participant's view is not emitted at
-    /// all, never an ACTIVE slot or a send target with an empty url or a
-    /// non-member ref.
+    /// **MC defect**: every `handler_ref` MC hands out — on a
+    /// `StreamAssignment` or `SendTarget` — comes from one
+    /// `MeetingHandlers::client_handler` lookup over the view
+    /// `MediaHandlerSet` is projected from, and edges are routed over Active
+    /// members only, so a miss cannot happen by construction. Fails closed:
+    /// the participant's view is not emitted at all, never an ACTIVE slot or a
+    /// send target with a non-member ref. (The label value keeps its name: a
+    /// rename would add a series.)
     HandlerUrlUnresolved,
     /// A post-join capability re-declaration the meeting actor did not
     /// register. Environmental — the only environmental token: the actor is

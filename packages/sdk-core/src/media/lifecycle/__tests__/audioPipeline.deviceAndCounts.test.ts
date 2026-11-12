@@ -37,7 +37,7 @@ import { handlerRef } from '../../handlerSet.js';
 
 const KEK = new Uint8Array(AES_256_KEY_BYTES).fill(0x11);
 const SENDER_ID = 258;
-const MH_URL = handlerRef(1);
+const MH_REF = handlerRef(1);
 
 /** Every capture the factory handed out, in order, with the id it was asked for. */
 interface CaptureRecord {
@@ -142,18 +142,18 @@ async function makeRig(
   pipeline.setSendDirective({
     streamNumber: 1,
     bitrateBps: 32_000,
-    targets: [MH_URL],
+    targets: [MH_REF],
     headerVersion: HEADER_VERSION,
   });
   // Receiving comes from the slot assignments, not from the send directive.
   pipeline.setReceiveAssignments(
     options.loopbackSlot === undefined
-      ? assignmentsOn([MH_URL], SENDER_ID)
+      ? assignmentsOn([MH_REF], SENDER_ID)
       : [
           {
             slotId: options.loopbackSlot,
             senderId: SENDER_ID,
-            handlerRef: MH_URL,
+            handlerRef: MH_REF,
             active: true,
           },
         ],

@@ -627,7 +627,7 @@ The test, which you can run on signals this runbook never mentions:
 
 **Start with the case where every signal is green and correct, and there is no media path at all.**
 
-If GC returns an empty `media_servers` list, `MediaTransport`'s `connectAll` resolves
+If MC's join hands the client an empty `MediaHandlerSet` (`JoinResponse.media_handler_set.handlers`), `MediaTransport`'s `connectAll` resolves
 **successfully with `[]`**: its all-failed throw is guarded on having at least one URL, so zero
 URLs never enters the throw branch. The client reaches `joined`. MC logs `Join succeeded` — because
 signaling genuinely did succeed. **Nothing lied and nothing malfunctioned, and there are zero media
@@ -661,32 +661,30 @@ curl -s localhost:8081/metrics | grep mc_participant_mh_status_total
 # attempt a join, then re-run the curl and compare
 ```
 
-`mc_participant_mh_status_total{state}` is incremented once per recorded status entry, so the delta
+`mc_participant_mh_status_total{state}` is incremented once per reported status entry (at MC's
+`MediaConnectionUpdate` boundary), so the delta
 across one join is the per-state fan-out count directly. Needs neither Grafana nor Prometheus.
 
 | Delta across one join | Means |
 |---|---|
-| **no increment at all**, *and* `Join succeeded` present | **Empty fan-out.** GC returned no `media_servers`. Zero media connections, everything upstream green. Confirm against the `media_servers` list in the GC join response — see the caveat below. |
+| **no increment at all**, *and* `Join succeeded` present | **Empty fan-out.** MC handed an empty `MediaHandlerSet`. Zero media connections, everything upstream green. Confirm against the set's `handlers` (JoinResponse and any later set push, the debug panel / e2e bus `handlerSets`) — see the caveat below. |
 | `< N` increments | Partial fan-out — the UI renders this identically to a complete join. |
 | `= N`, all `state="connected"` | Full fan-out — **and still only proves each MH accepted a connect envelope.** |
 
-`N` is the number of entries in the `media_servers` the client was handed. Check **both** MC
+`N` is the number of entries in the `MediaHandlerSet` the client was handed. Check **both** MC
 instances, or use the one `--prefix` in §4.1 identified as serving the join — the metrics endpoint
 is per-pod and has no label-selector equivalent.
 
-> **Caveat on the empty row — the counter cannot distinguish three cases.** The increment happens
+> **Caveat on the empty row — the counter cannot distinguish two cases.** The increment happens
 > *inside* the loop over status entries, so an empty report set produces **no increment at all**.
-> What a flat counter actually proves is only *"no MH status entry was ever recorded on the
-> participant actor"*, which has three causes: an empty fan-out, the client never sending an
-> update, or an update that reached MC and then failed on the handoff to the participant actor.
+> What a flat counter actually proves is only *"no MH status entry reached MC's boundary"*, which
+> has two causes: an empty fan-out, or the client never sending an update.
 >
-> **`media_servers` is the discriminator, not just a confirmation.** If the GC join response's
-> `media_servers` list is **empty**, this is a genuine empty fan-out. If it is **non-empty** and the
-> counter is still flat, it is *not* — the update reached MC but never reached the participant actor
-> (`record_mh_statuses` returned `Err`, e.g. the actor was gone). MC logs that at `debug` on target
-> `mc.webtransport.connection`, which the deployed `info,mc_service=debug` filter drops for the
-> reason given in §4.1 — so raise the level for that target if you need to confirm it. Note this is
-> §4.1's own prefix-match trap landing on the one line that would otherwise disambiguate the case.
+> **The handler set is the discriminator, not just a confirmation.** If the set the client was
+> handed is **empty**, this is a genuine empty fan-out. If it is **non-empty** and the counter is
+> still flat, it is *not* — the client never reported. A client on a stale pre-C1 bundle (a cached
+> tab) is the classic case: it reads only the retired `media_servers`, so it dials nothing and
+> reports nothing (story 4 P3). Reload it.
 >
 > Do **not** try to read `statuses_count` from the logs. It is a span field, and MC emits no event
 > on this handler's success path — `fmt::layer().json()` writes one line per *event*, spans appear

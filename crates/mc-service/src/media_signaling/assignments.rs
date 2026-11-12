@@ -103,8 +103,8 @@ pub fn slot_state_label(state: SlotState) -> &'static str {
 /// [`DirectiveOutcome::HandlerUrlUnresolved`] if an edge's handler is not an
 /// ACTIVE member of `handlers`. Unreachable by construction (edges are routed
 /// over Active members only, from the same set), and it fails CLOSED: the
-/// caller emits nothing for this subscriber — never an empty url or a ref the
-/// client's set does not hold.
+/// caller emits nothing for this subscriber — never a ref the client's set
+/// does not hold.
 pub fn build_stream_assignments(
     subscriber: SenderId,
     demand: &SlotDemand,
@@ -137,15 +137,15 @@ pub fn build_stream_assignments(
                     .publishes_of(edge.source)
                     .is_some_and(|p| p.publishes(MediaKindLabel::Video));
                 if kind == MediaKindLabel::Video && !publishes_video {
-                    // No-video precedence: no edge, so no url.
+                    // No-video precedence: no edge, so ref 0.
                     (named, None, SlotState::AvatarNoVideo)
                 } else {
-                    // The ONE client-view lookup (Active members only): url
-                    // and ref from the same entry.
+                    // The ONE client-view lookup (Active members only): the
+                    // ref is always a member of the client's current set.
                     let on = handlers
                         .client_handler(&edge.handler)
                         .ok_or(DirectiveOutcome::HandlerUrlUnresolved)?;
-                    let target = Some((on.url.to_string(), on.handler_ref.get()));
+                    let target = Some(on.get());
                     let flags = mute.flags(edge.source);
                     let (server, client) =
                         (flags.server.is_muted(kind), flags.client.is_muted(kind));
@@ -164,14 +164,13 @@ pub fn build_stream_assignments(
             }
         };
 
-        // No edge: empty url and ref 0. Otherwise both from the one lookup.
-        let (media_handler_url, handler_ref) = target.unwrap_or_default();
+        // No edge: ref 0. Otherwise from the one lookup.
+        let handler_ref = target.unwrap_or_default();
         slot_states.push((kind, slot_state));
         assignments.push(StreamAssignment {
             slot_id: u32::from(slot.slot_id.get()),
             sender_id,
             media_kind: slot.media_kind as i32,
-            media_handler_url,
             slot_state: slot_state as i32,
             // §7 switching is not in this story.
             switch_command_id: None,
@@ -213,6 +212,11 @@ mod tests {
 
     fn handler_set(handlers: &[&str]) -> MeetingHandlers {
         MeetingHandlers::active_test_ids(handlers)
+    }
+
+    /// The ref of `mh-0` in [`compose_with`]'s one-handler set.
+    fn mh0_ref() -> u32 {
+        handler_set(&["mh-0"]).client_ref_for_test("mh-0")
     }
 
     fn demand(slots: &[(u32, MediaKind)], caps: [u8; 2]) -> SlotDemand {
@@ -302,7 +306,7 @@ mod tests {
         assert_eq!(a.slot_id, 0);
         assert_eq!(a.sender_id, Some(2));
         assert_eq!(a.media_kind, MediaKind::Audio as i32);
-        assert_eq!(a.media_handler_url, "https://mh-0.example:4434");
+        assert_eq!(a.handler_ref, mh0_ref());
         assert_eq!(state(a), SlotState::Active);
         assert!(a.switch_command_id.is_none());
     }
@@ -326,12 +330,12 @@ mod tests {
         assert_eq!(video.sender_id, None);
         assert_eq!(video.slot_id, 1, "only the subscriber's own id is echoed");
         assert!(video.switch_command_id.is_none());
-        assert_eq!(video.media_handler_url, "https://mh-0.example:4434");
+        assert_eq!(video.handler_ref, mh0_ref());
         assert_eq!(video.media_kind, MediaKind::VideoCamera as i32);
     }
 
     /// The table, row by row, for both kinds — including server-wins and
-    /// no-video precedence, and which states carry a url.
+    /// no-video precedence, and which states carry a handler ref.
     #[test]
     fn slot_state_mapping_for_both_kinds() {
         let slots = [(0, MediaKind::Audio), (1, MediaKind::VideoCamera)];
@@ -340,7 +344,7 @@ mod tests {
             c.assignments
                 .assignments
                 .iter()
-                .map(|a| (state(a), a.sender_id, !a.media_handler_url.is_empty()))
+                .map(|a| (state(a), a.sender_id, a.handler_ref != 0))
                 .collect::<Vec<_>>()
         };
         use SlotState::*;
@@ -385,7 +389,7 @@ mod tests {
     }
 
     /// R-1: an over-cap slot is UNAVAILABLE — declared id echoed, no sender,
-    /// empty url — and the kept slots fill normally.
+    /// ref 0 — and the kept slots fill normally.
     #[test]
     fn truncated_slots_are_unavailable_with_their_ids_echoed() {
         let c = compose_with(
@@ -402,14 +406,7 @@ mod tests {
             .assignments
             .assignments
             .iter()
-            .map(|a| {
-                (
-                    a.slot_id,
-                    state(a),
-                    a.sender_id,
-                    a.media_handler_url.is_empty(),
-                )
-            })
+            .map(|a| (a.slot_id, state(a), a.sender_id, a.handler_ref == 0))
             .collect();
         assert_eq!(
             got,
@@ -431,7 +428,7 @@ mod tests {
         for a in &c.assignments.assignments {
             assert_eq!(state(a), SlotState::FewerSourcesThanSlots);
             assert!(a.sender_id.is_none());
-            assert!(a.media_handler_url.is_empty());
+            assert_eq!(a.handler_ref, 0);
         }
     }
 
@@ -612,8 +609,8 @@ mod tests {
         }
     }
 
-    /// The slot's handler address IS the handler carrying this pair, in a
-    /// two-handler meeting where everyone sits on mh-0 (written literals).
+    /// The slot's handler ref IS the handler carrying this pair, in a
+    /// two-handler meeting where everyone sits on mh-0.
     #[test]
     fn the_slot_names_the_handler_carrying_this_subscribers_pair_at_n_2() {
         let set = handler_set(&["mh-1", "mh-0"]);
@@ -626,7 +623,7 @@ mod tests {
             .unwrap();
         let a = &c.assignments.assignments[0];
         assert_eq!(state(a), SlotState::Active);
-        assert_eq!(a.media_handler_url, "https://mh-0.example:4434");
-        assert_ne!(a.media_handler_url, "https://mh-1.example:4434");
+        assert_eq!(a.handler_ref, set.client_ref_for_test("mh-0"));
+        assert_ne!(a.handler_ref, set.client_ref_for_test("mh-1"));
     }
 }

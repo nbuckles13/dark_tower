@@ -136,8 +136,7 @@ export interface UnmuteRequestedEvent {
  *
  * `handlerSet` is the joiner's first media-handler set
  * (`JoinResponse.media_handler_set`, ADR-0039 §4), TOKEN-FREE: refs and urls
- * only. It may be empty ("media connecting"). The superseded
- * `JoinResponse.media_servers` is never read. `correlationId`/`bindingToken` are
+ * only. It may be empty ("media connecting"). `correlationId`/`bindingToken` are
  * stored for future reconnection (storage only this story).
  *
  * Deliberately carries NO key material: the meeting KEK is on the wire
@@ -498,8 +497,7 @@ export interface SignalingJoinParams {
  * (signaling layer); sited HERE so the dependency edge runs media→signaling.
  * SignalingClient maps it onto the generated `MhConnectionStatus` internally.
  *
- * Carries `handler_ref` + `handler_set_version` (ADR-0039 §4) and NEVER a URL:
- * the superseded `MhConnectionStatus.mh_url` is left empty.
+ * Carries `handler_ref` + `handler_set_version` (ADR-0039 §4) and NEVER a URL.
  *
  * `failureReason`/`failureCode` are SDK-AUTHORED bounded classifications (never a
  * raw transport-error message), present only when `state === 'failed'` (R-23);

@@ -15,11 +15,10 @@ use crate::errors::McError;
 
 use super::meeting::MeetingActorHandle;
 use super::messages::{
-    BoundedMhStatus, DisconnectCause, ParticipantMessage, ParticipantStateUpdate, SignalingPayload,
+    DisconnectCause, ParticipantMessage, ParticipantStateUpdate, SignalingPayload,
 };
 use super::metrics::{ActorMetrics, ActorType, MailboxMonitor};
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,15 +57,6 @@ pub(crate) const OUTBOUND_PAYLOAD_MEETING_KEK_UPDATE: &str = "meeting_kek_update
 /// in-set client holds only expired `media_dial` tokens only after about three
 /// consecutive drops — a consequence distinct from every other kind.
 pub(crate) const OUTBOUND_PAYLOAD_MEDIA_HANDLER_SET: &str = "media_handler_set";
-
-/// Maximum distinct MH statuses recorded per participant (R-60 security cap).
-///
-/// Bounds per-participant map growth from a hostile client flooding distinct
-/// `mh_url`s. Updates to an already-recorded MH are ALWAYS allowed; only a NEW
-/// distinct key beyond this cap is refused (and counted via the drop metric,
-/// never logged per-entry). Legitimate count is ~1 (a few during failover churn),
-/// so 16 is generous headroom.
-const MAX_MH_STATUSES_PER_PARTICIPANT: usize = 16;
 
 /// Handle to a `ParticipantActor`.
 #[derive(Clone, Debug)]
@@ -160,21 +150,6 @@ impl ParticipantActorHandle {
             .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
     }
 
-    /// Record per-MH connection statuses reported by the client (R-60).
-    ///
-    /// Fire-and-forget delivery of the already-bounded `(truncated mh_url,
-    /// bounded status)` entries to the actor, which upserts them under the
-    /// per-participant cap and emits the per-state metric.
-    pub async fn record_mh_statuses(
-        &self,
-        statuses: Vec<(String, BoundedMhStatus)>,
-    ) -> Result<(), McError> {
-        self.sender
-            .send(ParticipantMessage::RecordMhStatuses { statuses })
-            .await
-            .map_err(|e| McError::Internal(format!("channel send failed: {e}")))
-    }
-
     /// Close the participant actor.
     pub async fn close(&self, reason: String) -> Result<(), McError> {
         self.sender
@@ -243,18 +218,6 @@ pub struct ParticipantActor {
     /// Handle to the parent MeetingActor for disconnect notification.
     /// `None` in tests.
     meeting_handle: Option<MeetingActorHandle>,
-    /// Per-MH connection statuses reported by the client (R-60), keyed by the
-    /// truncated `mh_url`. Bounded to `MAX_MH_STATUSES_PER_PARTICIPANT` distinct
-    /// keys; only ever holds truncated, bounded values.
-    ///
-    /// **DIAGNOSTIC ONLY — NOT the connectivity source, and deliberately NOT one
-    /// map with it.** Who hears whom is decided from what the HANDLERS report
-    /// (`media_routing/connectivity.rs`, held by the meeting actor). This map is
-    /// client-ASSERTED: unifying the two would let a client place its own edges,
-    /// make itself unreachable to peers, churn meeting-wide recomputes, or — if a
-    /// url here ever reached a send target — redirect media. Never read it for
-    /// routing, never narrow connectivity from it, never take a url from it.
-    mh_statuses: HashMap<String, BoundedMhStatus>,
     /// Shared disconnect-cause cell (see [`ParticipantActorHandle::disconnect_cause`]).
     /// Read once on exit to tell the meeting whether to skip or keep the grace
     /// period.
@@ -375,7 +338,6 @@ impl ParticipantActor {
             is_closing: false,
             stream_tx,
             meeting_handle,
-            mh_statuses: HashMap::new(),
             disconnect_cause: Arc::clone(&disconnect_cause),
             outbound_drop_logged: false,
         };
@@ -491,11 +453,6 @@ impl ParticipantActor {
 
             ParticipantMessage::ParticipantUpdate { update } => {
                 self.handle_update(update).await;
-                false
-            }
-
-            ParticipantMessage::RecordMhStatuses { statuses } => {
-                self.handle_record_mh_statuses(statuses);
                 false
             }
 
@@ -732,29 +689,6 @@ impl ParticipantActor {
         );
     }
 
-    /// Record per-MH connection statuses reported by the client (R-60).
-    ///
-    /// Cap semantics (security): updating an already-recorded `mh_url` is ALWAYS
-    /// allowed (status transitions for a known MH must never be dropped); only
-    /// inserting a NEW distinct key when already at
-    /// `MAX_MH_STATUSES_PER_PARTICIPANT` is refused. A refused entry increments
-    /// the bounded drop counter (NOT the main status counter — mutually
-    /// exclusive) and is NOT logged per-entry (log-amplification vector). Every
-    /// recorded entry emits `mc_participant_mh_status_total{state}`.
-    fn handle_record_mh_statuses(&mut self, statuses: Vec<(String, BoundedMhStatus)>) {
-        for (mh_url, status) in statuses {
-            let known = self.mh_statuses.contains_key(&mh_url);
-            if !known && self.mh_statuses.len() >= MAX_MH_STATUSES_PER_PARTICIPANT {
-                crate::observability::metrics::record_participant_mh_status_dropped(
-                    crate::observability::metrics::MH_STATUS_DROP_CAP,
-                );
-                continue;
-            }
-            crate::observability::metrics::record_participant_mh_status(status.state.label());
-            self.mh_statuses.insert(mh_url, status);
-        }
-    }
-
     /// Gracefully close the participant actor.
     ///
     /// Drops the stream sender to signal the WebTransport write task to close.
@@ -784,7 +718,6 @@ impl ParticipantActor {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::actors::messages::MhState;
     use crate::media_kind::{MediaKindLabel, MediaStates, MuteChange};
     use common::observability::testing::MetricAssertion;
 
@@ -988,9 +921,8 @@ mod tests {
         );
     }
 
-    /// Build a bare, un-spawned `ParticipantActor` for directly exercising the
-    /// synchronous `handle_record_mh_statuses` handler and inspecting its
-    /// private `mh_statuses` map (R-60).
+    /// Build a bare, un-spawned `ParticipantActor` for directly exercising its
+    /// synchronous handlers.
     fn bare_actor() -> ParticipantActor {
         let (_sender, receiver) = mpsc::channel(PARTICIPANT_CHANNEL_BUFFER);
         ParticipantActor {
@@ -1004,150 +936,9 @@ mod tests {
             is_closing: false,
             stream_tx: None,
             meeting_handle: None,
-            mh_statuses: HashMap::new(),
             disconnect_cause: Arc::new(AtomicU8::new(0)),
             outbound_drop_logged: false,
         }
-    }
-
-    fn status(state: MhState) -> BoundedMhStatus {
-        BoundedMhStatus {
-            state,
-            failure_reason: None,
-            failure_code: None,
-        }
-    }
-
-    #[test]
-    fn test_record_mh_statuses_all_connected() {
-        let snap = MetricAssertion::snapshot();
-        let mut actor = bare_actor();
-        actor.handle_record_mh_statuses(vec![
-            ("https://mh-a".to_string(), status(MhState::Connected)),
-            ("https://mh-b".to_string(), status(MhState::Connected)),
-        ]);
-        // Map contents.
-        assert_eq!(actor.mh_statuses.len(), 2);
-        assert_eq!(
-            actor.mh_statuses.get("https://mh-a").unwrap().state,
-            MhState::Connected
-        );
-        // Metric: connected += 2, others unobserved (adjacency).
-        snap.counter("mc_participant_mh_status_total")
-            .with_labels(&[("state", "connected")])
-            .assert_delta(2);
-        snap.counter("mc_participant_mh_status_total")
-            .with_labels(&[("state", "failed")])
-            .assert_delta(0);
-        snap.counter("mc_participant_mh_status_total")
-            .with_labels(&[("state", "disconnected")])
-            .assert_delta(0);
-    }
-
-    #[test]
-    fn test_record_mh_statuses_partial_mixed_states() {
-        let snap = MetricAssertion::snapshot();
-        let mut actor = bare_actor();
-        actor.handle_record_mh_statuses(vec![
-            ("https://mh-a".to_string(), status(MhState::Connected)),
-            ("https://mh-b".to_string(), status(MhState::Failed)),
-            ("https://mh-c".to_string(), status(MhState::Disconnected)),
-        ]);
-        assert_eq!(actor.mh_statuses.len(), 3);
-        snap.counter("mc_participant_mh_status_total")
-            .with_labels(&[("state", "connected")])
-            .assert_delta(1);
-        snap.counter("mc_participant_mh_status_total")
-            .with_labels(&[("state", "failed")])
-            .assert_delta(1);
-        snap.counter("mc_participant_mh_status_total")
-            .with_labels(&[("state", "disconnected")])
-            .assert_delta(1);
-        snap.counter("mc_participant_mh_status_total")
-            .with_labels(&[("state", "unspecified")])
-            .assert_delta(0);
-    }
-
-    #[test]
-    fn test_record_mh_statuses_all_failed() {
-        let snap = MetricAssertion::snapshot();
-        let mut actor = bare_actor();
-        actor.handle_record_mh_statuses(vec![
-            ("https://mh-a".to_string(), status(MhState::Failed)),
-            ("https://mh-b".to_string(), status(MhState::Failed)),
-            ("https://mh-c".to_string(), status(MhState::Failed)),
-        ]);
-        assert_eq!(actor.mh_statuses.len(), 3);
-        snap.counter("mc_participant_mh_status_total")
-            .with_labels(&[("state", "failed")])
-            .assert_delta(3);
-        snap.counter("mc_participant_mh_status_total")
-            .with_labels(&[("state", "connected")])
-            .assert_delta(0);
-    }
-
-    #[test]
-    fn test_record_mh_statuses_update_existing_key_always_allowed() {
-        let mut actor = bare_actor();
-        actor.handle_record_mh_statuses(vec![(
-            "https://mh-a".to_string(),
-            status(MhState::Connected),
-        )]);
-        // Same key, new state — overwrites in place, map stays size 1.
-        actor
-            .handle_record_mh_statuses(vec![("https://mh-a".to_string(), status(MhState::Failed))]);
-        assert_eq!(actor.mh_statuses.len(), 1);
-        assert_eq!(
-            actor.mh_statuses.get("https://mh-a").unwrap().state,
-            MhState::Failed
-        );
-    }
-
-    #[test]
-    fn test_record_mh_statuses_cap_refuses_new_keys_but_allows_updates() {
-        let snap = MetricAssertion::snapshot();
-        let mut actor = bare_actor();
-        // Fill to exactly the cap with distinct keys.
-        let filler: Vec<(String, BoundedMhStatus)> = (0..MAX_MH_STATUSES_PER_PARTICIPANT)
-            .map(|i| (format!("https://mh-{i}"), status(MhState::Connected)))
-            .collect();
-        actor.handle_record_mh_statuses(filler);
-        assert_eq!(actor.mh_statuses.len(), MAX_MH_STATUSES_PER_PARTICIPANT);
-
-        // A NEW distinct key beyond the cap is refused (dropped counter += 1),
-        // AND an update to an existing key still lands.
-        actor.handle_record_mh_statuses(vec![
-            ("https://mh-overflow".to_string(), status(MhState::Failed)),
-            ("https://mh-0".to_string(), status(MhState::Disconnected)),
-        ]);
-        // Still at the cap — the overflow key was not inserted.
-        assert_eq!(actor.mh_statuses.len(), MAX_MH_STATUSES_PER_PARTICIPANT);
-        assert!(!actor.mh_statuses.contains_key("https://mh-overflow"));
-        // The existing-key update landed.
-        assert_eq!(
-            actor.mh_statuses.get("https://mh-0").unwrap().state,
-            MhState::Disconnected
-        );
-
-        // Mutual exclusivity: the refused overflow bumped ONLY the drop counter
-        // (reason=cap), never the main `failed` state counter.
-        snap.counter("mc_participant_mh_status_dropped_total")
-            .with_labels(&[("reason", "cap")])
-            .assert_delta(1);
-        snap.counter("mc_participant_mh_status_total")
-            .with_labels(&[("state", "failed")])
-            .assert_delta(0);
-    }
-
-    #[test]
-    fn test_record_mh_statuses_flood_stays_at_cap() {
-        let mut actor = bare_actor();
-        // 100 distinct hostile keys — map is bounded to the cap.
-        let flood: Vec<(String, BoundedMhStatus)> = (0..100)
-            .map(|i| (format!("https://hostile-{i}"), status(MhState::Failed)))
-            .collect();
-        actor.handle_record_mh_statuses(flood);
-        assert_eq!(actor.mh_statuses.len(), MAX_MH_STATUSES_PER_PARTICIPANT);
     }
 
     #[tokio::test]

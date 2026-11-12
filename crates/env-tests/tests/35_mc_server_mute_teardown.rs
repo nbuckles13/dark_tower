@@ -782,12 +782,14 @@ fn stream_of(d: &SendDirective, kind: MediaKind) -> &SendStream {
         .unwrap_or_else(|| panic!("the directive lists no {} stream", kind.as_str_name()))
 }
 
-/// The target urls of `d`'s `kind` stream.
-fn kind_targets(d: &SendDirective, kind: MediaKind) -> BTreeSet<String> {
+/// The target refs of `d`'s `kind` stream. Refs are meeting-scoped (one per
+/// handler incarnation), so they compare directly with a subscriber's slot
+/// refs.
+fn kind_targets(d: &SendDirective, kind: MediaKind) -> BTreeSet<u32> {
     stream_of(d, kind)
         .targets
         .iter()
-        .map(|t| t.media_handler_url.clone())
+        .map(|t| t.handler_ref)
         .collect()
 }
 
@@ -1050,17 +1052,17 @@ async fn test_video_server_mute_withdraws_drops_a_patched_publisher_and_unmute_r
     let s_before = s.view().clone();
     let (p_vslot, c_vslot) = (s_video[0], s_video[1]);
     let p_audio_url = s.slot_url(p_id, AUDIO);
+    let p_audio_ref = s
+        .sets
+        .ref_for_url(&p_audio_url)
+        .expect("the slot's handler is in S's current set");
     let p_audio_slot = s.slot_for(p_id, AUDIO);
-    let s_video_urls: BTreeSet<String> = s
-        .slots(VIDEO)
-        .iter()
-        .map(|a| a.media_handler_url.clone())
-        .collect();
+    let s_video_refs: BTreeSet<u32> = s.slots(VIDEO).iter().map(|a| a.handler_ref).collect();
     p.converge(&format!("{PHASE} P directed"), bound, |_, d| {
         d.is_some_and(|d| {
-            kind_targets(d, AUDIO) == BTreeSet::from([p_audio_url.clone()])
+            kind_targets(d, AUDIO) == BTreeSet::from([p_audio_ref])
                 && !kind_targets(d, VIDEO).is_empty()
-                && kind_targets(d, VIDEO).is_subset(&s_video_urls)
+                && kind_targets(d, VIDEO).is_subset(&s_video_refs)
         })
     })
     .await;
@@ -1550,10 +1552,10 @@ async fn test_client_video_mute_pauses_without_touching_the_directive_and_a_stor
         holders.push((s, mh, a, v));
     }
     // P's directive targets exactly the handlers its holders' edges are on.
-    let want = |kind: MediaKind| -> BTreeSet<String> {
+    let want = |kind: MediaKind| -> BTreeSet<u32> {
         holders
             .iter()
-            .map(|(s, ..)| s.slots(kind)[0].media_handler_url.clone())
+            .map(|(s, ..)| s.slots(kind)[0].handler_ref)
             .collect()
     };
     let (want_audio, want_video) = (want(AUDIO), want(VIDEO));
@@ -1564,9 +1566,9 @@ async fn test_client_video_mute_pauses_without_touching_the_directive_and_a_stor
     })
     .await;
     let d0 = p.directive.clone().expect("P's converged directive");
-    let urls_before: Vec<String> = holders
+    let refs_before: Vec<u32> = holders
         .iter()
-        .map(|(s, ..)| s.slots(VIDEO)[0].media_handler_url.clone())
+        .map(|(s, ..)| s.slots(VIDEO)[0].handler_ref)
         .collect();
 
     let mut p_pubs = video_publishers(
@@ -1612,14 +1614,14 @@ async fn test_client_video_mute_pauses_without_touching_the_directive_and_a_stor
         p.session.write(&mute_request(None, Some(i % 2 == 0))).await;
     }
     p.session.write(&mute_request(Some(true), None)).await;
-    for ((s, ..), url) in holders.iter_mut().zip(&urls_before) {
+    for ((s, ..), edge_ref) in holders.iter_mut().zip(&refs_before) {
         s.converge(&format!("{PHASE} FENCE {}", s.label), bound, |v, _| {
             v.is_some_and(|v| {
                 named_state(v, AUDIO, p_id) == Some(SlotState::AvatarClientMuted as i32)
             })
         })
         .await;
-        let video = s.slots(VIDEO)[0].clone();
+        let video = *s.slots(VIDEO)[0];
         assert_eq!(
             (video.slot_state, video.sender_id),
             (SlotState::AvatarClientMuted as i32, Some(p_id)),
@@ -1628,8 +1630,8 @@ async fn test_client_video_mute_pauses_without_touching_the_directive_and_a_stor
             s.label
         );
         assert_eq!(
-            &video.media_handler_url, url,
-            "{PHASE}: a client-mute avatar keeps its edge's url"
+            &video.handler_ref, edge_ref,
+            "{PHASE}: a client-mute avatar keeps its edge's handler"
         );
     }
 

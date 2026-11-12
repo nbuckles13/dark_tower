@@ -305,10 +305,8 @@ async fn canonical_partial_connectivity_routes_only_through_shared_handlers() {
     let mut b = join_as_on(&rig, &stack, "slot-canon", "user-b", &["mh-0"]).await;
     let mut c = join_as_on(&rig, &stack, "slot-canon", "user-c", &["mh-1"]).await;
     for s in [&a, &b, &c] {
-        let mut offered = s.media_servers.clone();
-        offered.sort();
         assert_eq!(
-            offered,
+            s.handler_urls(),
             vec!["wt://mh-0:4433".to_string(), "wt://mh-1:4433".to_string()],
             "every participant is offered the FULL registered set"
         );
@@ -351,8 +349,14 @@ async fn canonical_partial_connectivity_routes_only_through_shared_handlers() {
 
     // Each slot is read on the handler that owns that edge — one the pair
     // shares, which for B's and C's single handler is forced.
-    assert_eq!(b_view.assignments[0].media_handler_url, "wt://mh-0:4433");
-    assert_eq!(c_view.assignments[0].media_handler_url, "wt://mh-1:4433");
+    assert_eq!(
+        b.url_of(b_view.assignments[0].handler_ref),
+        "wt://mh-0:4433"
+    );
+    assert_eq!(
+        c.url_of(c_view.assignments[0].handler_ref),
+        "wt://mh-1:4433"
+    );
     for slot in &a_view.assignments {
         let from = slot.sender_id.unwrap();
         let expected = if from == b.sender_id {
@@ -361,7 +365,8 @@ async fn canonical_partial_connectivity_routes_only_through_shared_handlers() {
             "wt://mh-1:4433"
         };
         assert_eq!(
-            slot.media_handler_url, expected,
+            a.url_of(slot.handler_ref),
+            expected,
             "A reads each slot where its edge is"
         );
     }
@@ -370,7 +375,7 @@ async fn canonical_partial_connectivity_routes_only_through_shared_handlers() {
     let mut a_targets: Vec<String> = a_directive.streams[0]
         .targets
         .iter()
-        .map(|t| t.media_handler_url.clone())
+        .map(|t| a.url_of(t.handler_ref))
         .collect();
     a_targets.sort();
     assert_eq!(a_targets, vec!["wt://mh-0:4433", "wt://mh-1:4433"]);
@@ -427,7 +432,7 @@ async fn all_connected_everyone_hears_everyone_with_one_target_per_sender() {
     let mut sessions = Vec::new();
     for user in ["user-a", "user-b", "user-c", "user-d"] {
         let mut s = join_as(&rig, &stack, "slot-allconn", user).await;
-        assert_eq!(s.media_servers.len(), 2, "the full set is offered");
+        assert_eq!(s.handler_urls().len(), 2, "the full set is offered");
         s.write(capability_frame(audio_slots(3))).await;
         sessions.push(s);
     }
@@ -554,8 +559,8 @@ async fn an_edge_moves_to_the_remaining_shared_handler_and_keeps_its_slot() {
     let (_, first) = a.settle().await;
     let first = first.unwrap();
     let _ = b.settle().await;
-    let url = first.assignments[0].media_handler_url.clone();
-    let carrying = if url == "wt://mh-0:4433" {
+    let first_ref = first.assignments[0].handler_ref;
+    let carrying = if a.url_of(first_ref) == "wt://mh-0:4433" {
         "mh-0"
     } else {
         "mh-1"
@@ -566,7 +571,7 @@ async fn an_edge_moves_to_the_remaining_shared_handler_and_keeps_its_slot() {
         .await;
     let moved = a
         .assignments_until("A's slot now read on the other handler", |x| {
-            x.assignments[0].media_handler_url != url
+            x.assignments[0].handler_ref != first_ref
         })
         .await;
     assert_eq!(
@@ -575,6 +580,11 @@ async fn an_edge_moves_to_the_remaining_shared_handler_and_keeps_its_slot() {
         "same sender, same slot"
     );
     assert_eq!(moved.assignments[0].slot_id, first.assignments[0].slot_id);
+    assert_ne!(
+        a.url_of(moved.assignments[0].handler_ref),
+        a.url_of(first_ref),
+        "read on the OTHER handler"
+    );
     snap.counter("mc_media_edge_moves_total")
         .with_labels(&[
             ("reason", "connectivity_change"),

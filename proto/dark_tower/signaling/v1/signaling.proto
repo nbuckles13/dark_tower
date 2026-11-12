@@ -67,8 +67,8 @@ message MediaKindState {
   // requester, and an unmute of one kind never touches another kind's.
   //
   // SECURITY: server-to-client, but relayed identity. Truncate before logging
-  // (256-byte bound, as `MhConnectionStatus.mh_url`); never log unbounded;
-  // render as text, never markup.
+  // (the 256-byte bound stated at `MhConnectionStatus.failure_reason`); never
+  // log unbounded; render as text, never markup.
   string server_muted_by = 4;
 }
 
@@ -379,8 +379,8 @@ message PublishedKind {
 // Kept as a message rather than collapsed to a bare URL string: it is the
 // per-handler DESCRIPTOR, and carries the incarnation ref and dial credential.
 message MediaServerInfo {
-  // Server-to-client. Same spelling as `SendTarget.media_handler_url` and
-  // `StreamAssignment.media_handler_url` — one name for one concept.
+  // Server-to-client. THE one place a handler address reaches a client
+  // (`MediaHandlerSet`); everywhere else names the handler by `handler_ref`.
   //
   // Belongs to ONE MH incarnation: the per-incarnation address rule is the
   // RegisterMH endpoint rule stated once above
@@ -608,10 +608,13 @@ message JoinResponse {
   reserved "user_id", "encryption_keys";
 
   repeated Participant existing_participants = 3;
-  // Superseded by `media_handler_set` (whose message states the handler-set
-  // rules, including NON-AUTHORITATIVE for send placement); kept alongside it
-  // until story 4 P3 deletes it.
-  repeated MediaServerInfo media_servers = 4;
+
+  // Was `repeated MediaServerInfo media_servers = 4;`, superseded by
+  // `media_handler_set` and deleted by story 4 P3 (ADR-0039 §4). Number and
+  // name both reserved (CONVENTIONS Rule 5).
+  reserved 4;
+  reserved "media_servers";
+
   // Session recovery fields (ADR-0023)
   string correlation_id = 6; // UUIDv7, client stores for reconnection
   string binding_token = 7; // Client stores for reconnection (30s TTL)
@@ -1039,8 +1042,8 @@ message UnmuteRequest {
   // crosses the trust boundary in BOTH directions (client->MC request, MC->host
   // relay), so participant_id is authoritative in neither direction on the
   // wire; only the MC-stamped relay value is trustworthy. Identity relayed to
-  // the host: truncate before logging (256-byte bound, as
-  // `MhConnectionStatus.mh_url`), never log unbounded (same register as
+  // the host: truncate before logging (the 256-byte bound stated at
+  // `MhConnectionStatus.failure_reason`), never log unbounded (same register as
   // `MediaKindState.server_muted_by`). Receiving this does NOT lift a server
   // mute; only the host's ServerMuteRequest with that kind set false does
   // (R-10).
@@ -1204,9 +1207,11 @@ message ReceiveCapability {
 
 // One destination for a produced stream.
 message SendTarget {
-  // Server-to-client. Same spelling as `MediaServerInfo.media_handler_url`.
-  // Superseded by `handler_ref`; kept alongside it until story 4 P3.
-  string media_handler_url = 1;
+  // Was `string media_handler_url = 1;`, superseded by `handler_ref` and
+  // deleted by story 4 P3 (ADR-0039 §4). Number and name both reserved
+  // (CONVENTIONS Rule 5).
+  reserved 1;
+  reserved "media_handler_url";
 
   // How to carry this stream to this target.
   //
@@ -1398,11 +1403,11 @@ message StreamAssignment {
   // tell the unreserved tags from the ones nobody looked at.
   reserved 1, 2, 3, 4, 5;
 
-  // `media_handler_url` is deliberately ABSENT from the name reservation: the
-  // ADR-0036 shape reuses that name on a fresh tag, and reserving a name you
-  // then use is a protoc error. Second and last instance of this exception in
-  // the file — see `ServerMessage`'s `reserved 5;` for the first.
-  reserved "stream_id", "user_id", "media_type", "slot_index";
+  // The ADR-0036 shape briefly reused the name `media_handler_url` on tag 9;
+  // story 4 P3 deleted that too (superseded by `handler_ref`, ADR-0039 §4), so
+  // tag 9 and the name are now reserved as well (CONVENTIONS Rule 5).
+  reserved 9;
+  reserved "stream_id", "user_id", "media_type", "slot_index", "media_handler_url";
 
   // Which of the subscriber's declared slots this fills. Echoes the
   // `ReceiveSlot.slot_id` the subscriber chose (including on
@@ -1429,23 +1434,6 @@ message StreamAssignment {
 
   MediaKind media_kind = 8;
 
-  // Which handler to receive this slot's media from: the handler OWNING THIS
-  // EDGE. Empty when no source is assigned. Server-to-client. Same spelling as
-  // `MediaServerInfo.media_handler_url`.
-  //
-  // PER SLOT, NOT PER SUBSCRIBER. A subscriber may receive different slots on
-  // DIFFERENT handlers, so a client MUST read each slot on the transport THIS
-  // field names and MUST NOT assume one receive transport for all of its slots.
-  // Collapsing these to a single url — reading every slot off the first
-  // assignment's handler, or off `media_servers[0]` — silently drops the media
-  // of every peer whose edge is on another handler.
-  //
-  // This is a RECEIVE address. It is not a transmit address: see the derivation
-  // warning at `MediaHandlerSet`.
-  //
-  // Superseded by `handler_ref`; kept alongside it until story 4 P3.
-  string media_handler_url = 9;
-
   // Why this slot looks the way it does. Explicit because absence of frames is
   // not a signal (ADR-0036 §6).
   SlotState slot_state = 10;
@@ -1467,15 +1455,24 @@ message StreamAssignment {
   // never a span attribute, never a per-frame log dimension.
   optional uint64 switch_command_id = 11;
 
-  // The handler owning this edge, as a ref into the client's current
-  // `MediaHandlerSet`. Per slot, as for `media_handler_url` above.
+  // Which handler to receive this slot's media from: the handler OWNING THIS
+  // EDGE, as a ref into the client's current `MediaHandlerSet`.
+  //
+  // PER SLOT, NOT PER SUBSCRIBER. A subscriber may receive different slots on
+  // DIFFERENT handlers, so a client MUST read each slot on the transport THIS
+  // field names and MUST NOT assume one receive transport for all of its slots.
+  // Collapsing these to a single handler — reading every slot off the first
+  // assignment's handler, or off the set's first entry — silently drops the
+  // media of every peer whose edge is on another handler.
+  //
+  // This is a RECEIVE handler. It is not a transmit handler: see the derivation
+  // warning at `MediaHandlerSet`.
   //
   // 0 MEANS "NO EDGE": MC sends 0 exactly on the states that carry no edge —
   // `SLOT_STATE_UNAVAILABLE`, `SLOT_STATE_FEWER_SOURCES_THAN_SLOTS`,
-  // `SLOT_STATE_AVATAR_NO_VIDEO` (the slots whose `media_handler_url` is
-  // empty) — and there it is not a membership fault. On every other state a
-  // ref that is not a member, including 0, is counted and ignored (rule at
-  // `MediaHandlerSet`).
+  // `SLOT_STATE_AVATAR_NO_VIDEO` — and there it is not a membership fault. On
+  // every other state a ref that is not a member, including 0, is counted and
+  // ignored (rule at `MediaHandlerSet`).
   //
   // OBSERVABILITY (ADR-0039 §8): per-incarnation identifier; never a metric
   // label, span attribute, or per-frame log field.
@@ -1658,24 +1655,27 @@ enum ConnectionState {
 
 // Per-MH connection status reported by the client.
 message MhConnectionStatus {
-  // URL of the media handler this status pertains to.
-  // SECURITY: client-controlled. Consumers MUST truncate before logging
-  // (current MC handler bound: 256 bytes via floor_char_boundary).
-  // SDK SHOULD cap at <= 256 bytes when populating.
-  // Superseded by `handler_ref` + `handler_set_version`; kept alongside them
-  // until story 4 P3.
-  string mh_url = 1;
+  // Was `string mh_url = 1;`, superseded by `handler_ref` +
+  // `handler_set_version` and deleted by story 4 P3 (ADR-0039 §4). Number and
+  // name both reserved (CONVENTIONS Rule 5).
+  reserved 1;
+  reserved "mh_url";
 
   ConnectionState state = 2;
 
   // Optional human-readable failure reason. Empty when state != FAILED.
-  // SECURITY: client-controlled, untrusted. Same 256-byte truncation
-  // discipline as `mh_url`; never log unbounded.
+  //
+  // SECURITY: client-controlled, untrusted. THE one statement of the 256-byte
+  // client-string bound this file's other relayed strings point at: any
+  // reader MUST truncate to at most 256 bytes on a UTF-8 character boundary
+  // before logging, and never log unbounded; the SDK caps at <= 256 bytes when
+  // populating. MC currently drops this field and `failure_code` unread.
   optional string failure_reason = 3;
 
   // Optional structured failure code (SDK-defined enum-as-string,
   // e.g. "QUIC_TIMEOUT", "TLS_HANDSHAKE_FAIL"). Empty when state != FAILED.
-  // SECURITY: client-controlled; same truncation discipline.
+  // SECURITY: client-controlled; same truncation discipline as
+  // `failure_reason`.
   optional string failure_code = 4;
 
   google.protobuf.Timestamp observed_at = 5;
@@ -1798,9 +1798,12 @@ message ClientMessage {
 
 // MH client→server connect envelope; first framed message on a new bidi stream.
 message MhConnectRequest {
-  // IGNORED by MH since MH-1; retained only until story 4 P3 deletes it. Not a
-  // credential, not an alternative to `media_dial_token`; MH never reads it.
-  string join_token = 1;
+  // Was `string join_token = 1;` (the meeting JWT, ignored by MH since story 4
+  // MH-1), deleted by story 4 P3: `media_dial_token` is the ONLY connect
+  // credential (ADR-0039 §5). Number and name both reserved (CONVENTIONS
+  // Rule 5); an old peer's tag 1 is skipped as unknown.
+  reserved 1;
+  reserved "join_token";
 
   // CREDENTIAL: the dialed ref's latest `MediaServerInfo.media_dial_token`
   // (rules stated there). Never logged; never a metric label, span attribute
@@ -2031,9 +2034,8 @@ message ServerMessage {
   // Was: the layout-form `StreamAssignments`. The NAME is reused by the
   // ADR-0036 shape on a fresh tag, so only the NUMBER is reserved here —
   // deliberately no name reservation, since reserving a name and then using it
-  // is a protoc error. One of exactly two places in this file where the name
-  // half of the reserve-the-vacated-tag rule does not apply; the other is
-  // `StreamAssignment`'s `media_handler_url`.
+  // is a protoc error. The only place in this file where the name half of the
+  // reserve-the-vacated-tag rule does not apply.
   reserved 5;
 
   // Was `UnmuteResponse unmute_response = 10;`, deleted 2026-10-25 (never

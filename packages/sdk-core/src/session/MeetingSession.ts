@@ -493,12 +493,13 @@ export class MeetingSession extends TypedEventEmitter<MeetingSessionEventMap> {
         '[dt-media-handlers-config]',
         handlerSetConfigLogLine(this.#mediaConfig, this.#slots.mediaConfigSource),
       );
-      // The meeting JWT is passed CALL-SCOPED to the join-time dials only and is
-      // never stored (`MediaTransport.arm`). Rejects ALL_FAILED when a non-empty
-      // join set connected nowhere (the join gate, unchanged); every transition
-      // was already reported to MC, per ref, as it happened.
+      // The meeting JWT never reaches the media layer: every MH dial carries
+      // only its ref's media_dial token (`MediaTransport.arm`). Rejects
+      // ALL_FAILED when a non-empty join set connected nowhere (the join gate,
+      // unchanged); every transition was already reported to MC, per ref, as
+      // it happened.
       try {
-        await media.arm(joinResp.token);
+        await media.arm();
       } finally {
         // The join-time transitions reach MC BEFORE a rejection tears the
         // signalling stream down (the R-21 "always report" guarantee).

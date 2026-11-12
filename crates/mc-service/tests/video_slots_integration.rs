@@ -324,15 +324,16 @@ async fn video_slots_show_no_video_avatars_senderless_live_video_and_unavailable
             (12, SlotState::Unavailable as i32, None),
         ]
     );
-    assert!(
-        view.assignments[0].media_handler_url.is_empty(),
-        "no edge, no url"
-    );
-    assert!(
-        !view.assignments[1].media_handler_url.is_empty(),
+    assert_eq!(view.assignments[0].handler_ref, 0, "no edge, ref 0");
+    assert_ne!(
+        view.assignments[1].handler_ref, 0,
         "the live edge's handler"
     );
-    assert!(view.assignments[2].media_handler_url.is_empty());
+    assert_eq!(view.assignments[2].handler_ref, 0);
+    assert!(
+        !s.url_of(view.assignments[1].handler_ref).is_empty(),
+        "the live edge's ref is a member of S's set"
+    );
     let _ = p;
 }
 
@@ -859,8 +860,8 @@ async fn a_video_client_mute_re_emits_to_video_holders_and_pauses_only_stream_on
                 .is_some_and(|x| x.slot_state == SlotState::Active as i32)
         })
         .await;
-    let url = live.assignments[0].media_handler_url.clone();
-    assert!(!url.is_empty());
+    let edge_ref = live.assignments[0].handler_ref;
+    assert_ne!(edge_ref, 0);
     let _ = c
         .assignments_until("C hears A", |v| {
             v.assignments.first().and_then(|x| x.sender_id) == Some(a.sender_id)
@@ -879,8 +880,8 @@ async fn a_video_client_mute_re_emits_to_video_holders_and_pauses_only_stream_on
         .await;
     assert_eq!(muted.assignments[0].sender_id, Some(a.sender_id));
     assert_eq!(
-        muted.assignments[0].media_handler_url, url,
-        "the edge's url is kept"
+        muted.assignments[0].handler_ref, edge_ref,
+        "the edge's handler is kept"
     );
     use mc_service::media_routing::SourceDispositionPlan::{Forward, Paused};
     let disposition = |c: &test_common::RegisterMeetingCall, stream: u8| {

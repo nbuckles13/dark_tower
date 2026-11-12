@@ -86,11 +86,6 @@ export interface JoinResponseInit {
    * {@link DEFAULT_TEST_HANDLER_SET}; `null` omits the field entirely.
    */
   handlerSet?: HandlerSetInit | null;
-  /**
-   * The SUPERSEDED `JoinResponse.media_servers` (P3 deletes it). Only for the
-   * never-read tests: the SDK must ignore it.
-   */
-  legacyMediaServers?: string[];
   correlationId?: string;
   bindingToken?: string;
   // Present so a test can construct the leak scenario: the meeting KEK is on the
@@ -223,9 +218,6 @@ export function buildJoinResponse(init: JoinResponseInit = {}) {
       }),
     ),
     kekGeneration: init.kekGeneration ?? 0,
-    mediaServers: (init.legacyMediaServers ?? []).map((url) =>
-      create(MediaServerInfoSchema, { mediaHandlerUrl: url }),
-    ),
     ...(init.handlerSet === null
       ? {}
       : { mediaHandlerSet: buildMediaHandlerSet(init.handlerSet ?? DEFAULT_TEST_HANDLER_SET) }),
@@ -369,8 +361,6 @@ export interface SendStreamInit {
   maxBitrateBps?: number;
   /** Target refs (`SendTarget.handler_ref`). */
   targets?: number[];
-  /** The SUPERSEDED `SendTarget.media_handler_url` per target (never-read tests only). */
-  legacyTargetUrls?: string[];
   mediaKind?: MediaKind;
   /** Video encoding fields (story 3 C-A2); absent = unset on the wire. */
   video?: {
@@ -400,12 +390,7 @@ function buildSendStream(init: SendStreamInit) {
           }
         : {}),
     }),
-    targets: (init.targets ?? []).map((ref, i) =>
-      create(SendTargetSchema, {
-        handlerRef: ref,
-        mediaHandlerUrl: init.legacyTargetUrls?.[i] ?? '',
-      }),
-    ),
+    targets: (init.targets ?? []).map((ref) => create(SendTargetSchema, { handlerRef: ref })),
   });
 }
 
@@ -440,8 +425,6 @@ export function buildStreamAssignments(init: {
   senderId?: number;
   /** `StreamAssignment.handler_ref` (0 / absent = no edge). */
   handlerRef?: number;
-  /** The SUPERSEDED `StreamAssignment.media_handler_url` (never-read tests only). */
-  legacyUrl?: string;
   slotState?: SlotState;
   /** The slot's kind; default audio. */
   mediaKind?: MediaKind;
@@ -463,7 +446,6 @@ export function buildStreamAssignments(init: {
         ...(init.senderId !== undefined ? { senderId: init.senderId } : {}),
         mediaKind: init.mediaKind ?? MediaKind.AUDIO,
         handlerRef: init.handlerRef ?? 0,
-        mediaHandlerUrl: init.legacyUrl ?? '',
         slotState: init.slotState ?? SlotState.ACTIVE,
       }),
       ...(init.extraSlots ?? []).map((slot) =>

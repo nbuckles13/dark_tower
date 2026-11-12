@@ -86,14 +86,10 @@ export function intakeOf(
 }
 
 /** The `connectRequest` envelopes written on `mock`'s connect stream. */
-export function connectRequestsOn(
-  mock: MockWebTransport,
-): { readonly joinToken: string; readonly mediaDialToken: string }[] {
+export function connectRequestsOn(mock: MockWebTransport): { readonly mediaDialToken: string }[] {
   if (mock.getOpenedBidiStreams().length === 0) return [];
   return decodeMhClientMessages(mock.getOutboundBidiWrites(0)).flatMap((m) =>
-    m.message.case === 'connectRequest'
-      ? [{ joinToken: m.message.value.joinToken, mediaDialToken: m.message.value.mediaDialToken }]
-      : [],
+    m.message.case === 'connectRequest' ? [{ mediaDialToken: m.message.value.mediaDialToken }] : [],
   );
 }
 

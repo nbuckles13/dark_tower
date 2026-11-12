@@ -57,10 +57,8 @@ pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_LEFT: &str = "participant_update_left"
 pub const PAYLOAD_KIND_PARTICIPANT_UPDATE_MUTED: &str = "participant_update_muted";
 
 /// THE one projection of the meeting's client-facing handler snapshot onto the
-/// wire (ADR-0039 §4, §5), for every carrier: `JoinResponse.media_handler_set`,
-/// the legacy `JoinResponse.media_servers` (its `handlers`, double-populated
-/// until P3) and the `ServerMessage` set. One projection of one snapshot, so
-/// the legacy field can never list a handler the new set does not, and nothing
+/// wire (ADR-0039 §4, §5), for every carrier: `JoinResponse.media_handler_set`
+/// and the `ServerMessage` set. One projection of one snapshot, so nothing
 /// lists a handler that is not Active.
 ///
 /// `token` mints the `media_dial` credential for each entry (`aud` = the

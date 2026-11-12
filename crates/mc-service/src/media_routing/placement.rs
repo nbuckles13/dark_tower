@@ -48,11 +48,10 @@
 //! - The INTERNAL view (Registering + Active): [`MeetingHandlers::resolve`],
 //!   [`MeetingHandlers::iter`] — push workers, teardown, MH notifications.
 //! - The CLIENT view (Active only): [`MeetingHandlers::client_handler`] and
-//!   [`MeetingHandlers::client_snapshot`]. Every client-facing url and ref —
-//!   `MediaHandlerSet`, the legacy `JoinResponse.media_servers` (the same
-//!   projection, so an old SDK never sees a Registering handler either), each
-//!   `SendTarget` and each `StreamAssignment` — comes from that one lookup, so
-//!   a url and its ref can never disagree, and nothing names a handler before
+//!   [`MeetingHandlers::client_snapshot`]. Every client-facing handler fact —
+//!   the url and ref in `MediaHandlerSet`, the ref on each `SendTarget` and
+//!   each `StreamAssignment` — comes from that one view, so every ref is a
+//!   member of the set the client holds, and nothing names a handler before
 //!   its registration was acked.
 //!
 //! Edges never land on a non-Active handler: observed connectivity is routable
@@ -85,12 +84,11 @@
 //! # Server-derived only
 //!
 //! Every url here comes from GC's assignment — never from a pod ordinal and
-//! never from a client. MC holds a similar-looking client-supplied url map,
-//! `ParticipantActor::mh_statuses`, keyed by the truncated `mh_url` a client
-//! reports in `MediaConnectionUpdate`. **That map must never be a source for
-//! this one, nor for [`ConnectedHandlers`]**: a client-controlled url reaching
-//! a `SendTarget` is a redirect primitive, and a client-controlled narrowing of
-//! connectivity is a reachability lever over other participants.
+//! never from a client. A client's `MediaConnectionUpdate` reports (by
+//! `handler_ref`) **must never be a source for this set, nor for
+//! [`ConnectedHandlers`]**: a client-chosen handler reaching a `SendTarget` is
+//! a redirect primitive, and a client-controlled narrowing of connectivity is
+//! a reachability lever over other participants.
 //!
 //! This is §9 edge placement, not §7 selection.
 
@@ -213,15 +211,6 @@ pub struct SetChange {
     pub active_changed: bool,
 }
 
-/// One client-visible (Active) handler, as a directive or assignment names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClientHandler<'a> {
-    /// The client-facing url, verbatim from the assignment.
-    pub url: &'a str,
-    /// The handler's per-incarnation ref.
-    pub handler_ref: NonZeroU32,
-}
-
 /// One entry of a client-facing snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHandlerEntry {
@@ -236,8 +225,7 @@ pub struct ClientHandlerEntry {
 }
 
 /// The client-facing snapshot: Active handlers only, in id order, and the
-/// version it was taken at. The ONE source of `MediaHandlerSet` and of the
-/// legacy `JoinResponse.media_servers`.
+/// version it was taken at. The ONE source of `MediaHandlerSet`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClientHandlerSet {
     /// `handler_set_version` at the time of the snapshot.
@@ -537,17 +525,15 @@ impl MeetingHandlers {
             .map(|m| &m.endpoint)
     }
 
-    /// The client-visible url and ref of an ACTIVE member — the ONE lookup
-    /// every `SendTarget` and `StreamAssignment` uses. `None` for a
-    /// Registering, removed or unknown handler.
+    /// The client-visible ref of an ACTIVE member — the ONE lookup every
+    /// `SendTarget` and `StreamAssignment` uses, so every ref they carry is a
+    /// member of the client's set. `None` for a Registering, removed or
+    /// unknown handler.
     #[must_use]
-    pub fn client_handler(&self, id: &HandlerId) -> Option<ClientHandler<'_>> {
+    pub fn client_handler(&self, id: &HandlerId) -> Option<NonZeroU32> {
         self.member(id)
             .filter(|m| m.is_active())
-            .map(|m| ClientHandler {
-                url: m.endpoint.webtransport_url.as_str(),
-                handler_ref: m.handler_ref,
-            })
+            .map(|m| m.handler_ref)
     }
 
     /// Whether `handler_ref` is an ACTIVE member — i.e. in the client-facing
@@ -625,6 +611,15 @@ impl MeetingHandlers {
     #[allow(clippy::unwrap_used)]
     pub(crate) fn active_test_ids(ids: &[&str]) -> Self {
         Self::active_for_test(ids.iter().map(|id| Self::test_endpoint(id))).unwrap()
+    }
+
+    /// Test fixture: `id`'s ref in the client view (the value a send target or
+    /// slot naming it carries). Panics if `id` is not an Active member.
+    #[cfg(test)]
+    pub(crate) fn client_ref_for_test(&self, id: &str) -> u32 {
+        self.client_handler(&HandlerId::new(id))
+            .expect("an Active member")
+            .get()
     }
 
     /// Test fixture: start the ref counter at `next` (exhaustion tests).
@@ -962,13 +957,7 @@ mod tests {
                 handler_ref: r1,
             }]
         );
-        assert_eq!(
-            set.client_handler(&hid("mh-1")),
-            Some(ClientHandler {
-                url: "https://mh-1.example:4434",
-                handler_ref: r1
-            })
-        );
+        assert_eq!(set.client_handler(&hid("mh-1")), Some(r1));
         assert!(set.client_handler(&hid("mh-0")).is_none());
         assert!(set.client_handler(&hid("mh-9")).is_none());
     }

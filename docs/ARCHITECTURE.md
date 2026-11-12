@@ -601,7 +601,7 @@ Not shown: Charlie (excluded), 5 others (no space)
    └─> Returns JoinResponse with:
        - participant_id
        - existing participants
-       - media_handler_url
+       - media_handler_set (handler urls, refs, media_dial tokens; ADR-0039 §4)
        - meeting KEK + generation (ADR-0036 §4)
 
 5. Client → Media Handler (WebTransport)

@@ -392,20 +392,22 @@ async fn a_leave_with_video_flowing_rotates_the_kek_without_touching_video_direc
     let base_generation = a_join.kek_generation.max(b_join.kek_generation);
 
     // FLOWING: A's video on B's first video slot (it holds A: the earliest).
-    let a_target = ps[0]
-        .directive
-        .as_ref()
-        .unwrap()
-        .streams
-        .iter()
-        .find(|s| s.media_kind == VIDEO as i32)
-        .unwrap()
-        .targets[0]
-        .media_handler_url
-        .clone();
-    let b_video_slot = slots_of(ps[1].view(), VIDEO)[0].clone();
+    let a_target = ps[0].url_of(
+        ps[0]
+            .directive
+            .as_ref()
+            .unwrap()
+            .streams
+            .iter()
+            .find(|s| s.media_kind == VIDEO as i32)
+            .unwrap()
+            .targets[0]
+            .handler_ref,
+    );
+    let b_video_slot = *slots_of(ps[1].view(), VIDEO)[0];
     assert_eq!(
-        b_video_slot.media_handler_url, a_target,
+        ps[1].url_of(b_video_slot.handler_ref),
+        a_target,
         "PRECONDITION: B's edge from A is on A's one video target"
     );
     let publisher = BackgroundPublisher::start(mh[0][&a_target].connection().clone(), a_id);

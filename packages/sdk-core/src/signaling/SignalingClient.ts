@@ -618,7 +618,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
   /**
    * Send one `MediaConnectionUpdate` over the existing MC stream, reporting
    * per-REF transitions (ADR-0039 §4: every transition, `handler_ref` +
-   * `handler_set_version`; `mh_url` left empty). Maps the plain {@link MhConnectionStatusReport}s
+   * `handler_set_version`). Maps the plain {@link MhConnectionStatusReport}s
    * to proto `MhConnectionStatus` internally (no generated type crosses the public
    * boundary). `failureReason`/`failureCode` are capped ≤256 UTF-8 bytes;
    * `observedAtMs` → proto `Timestamp`. Trace context is injected on the SAME single
@@ -636,7 +636,6 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
     }
     const statuses = reports.map((r) =>
       create(MhConnectionStatusSchema, {
-        // `mh_url` is superseded (story 4 P3 deletes it): left EMPTY.
         handlerRef: r.handlerRef,
         handlerSetVersion: r.handlerSetVersion,
         state: CONNECTION_STATE_OF[r.state],
@@ -723,8 +722,7 @@ export class SignalingClient extends TypedEventEmitter<SignalingEventMap> {
         // never placed on `JoinedEvent`, which is a public payload.
         if (this.#kekSink) takeMeetingKek(jr, this.#kekSink, MEDIA_KEK_SOURCES.JoinResponse);
         // THE TOKENS LEAVE THE DECODED MESSAGE HERE (blanked by the intake);
-        // the public event carries the token-free view only. The superseded
-        // `jr.media_servers` is never read.
+        // the public event carries the token-free view only.
         const handlerSet = this.#takeHandlerSet(jr.mediaHandlerSet);
         this.#rosterKeys.joined(jr.existingParticipants);
         const event: JoinedEvent = {

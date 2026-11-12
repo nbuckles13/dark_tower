@@ -317,11 +317,11 @@ describe('MeetingSession.join — state machine (R-22)', () => {
     // ADR-0039 §4 (replaces the R-21 once-only send): a MediaConnectionUpdate per
     // per-ref TRANSITION, sent even on the all-fail REJECT branch, so MC learns
     // every handler failed. Pin it by CONTENT: one update per ref, each FAILED,
-    // each echoing handler_ref + handler_set_version and never mh_url.
+    // each echoing handler_ref + handler_set_version.
     const statuses = mediaConnectionStatuses(mocks.get(MC_ENDPOINT)!);
     expect(statuses.map((s) => s.handlerRef).sort()).toEqual([1, 2]);
     expect(statuses.every((s) => s.state === ConnectionState.FAILED)).toBe(true);
-    expect(statuses.every((s) => s.handlerSetVersion === 1n && s.mhUrl === '')).toBe(true);
+    expect(statuses.every((s) => s.handlerSetVersion === 1n)).toBe(true);
     expect(states).toContain(MeetingSessionState.Disconnecting);
     expect(session.state).toBe(MeetingSessionState.Disconnecting);
   });
@@ -3187,15 +3187,50 @@ describe('MeetingSession — handler-set reconcile (story 4 C1)', () => {
     rig.session.disconnect();
   });
 
-  it('every per-ref transition reaches MC as its own update, echoing ref + version (no mh_url)', async () => {
+  it('the meeting JWT never reaches an MH: every MH dial writes only its dial token (story 4 P3)', async () => {
+    const A = 'https://mh-a.example:4433';
+    const B = 'https://mh-b.example:4433';
+    const rig = await reconcileRig({
+      version: 1n,
+      handlers: [
+        { ref: 1, url: A, token: 'dial-sentinel-A' },
+        { ref: 2, url: B, token: 'dial-sentinel-B' },
+      ],
+    });
+    const enc = new TextEncoder();
+    const contains = (chunks: readonly Uint8Array[], needle: string): boolean => {
+      const n = enc.encode(needle);
+      return chunks.some((c) =>
+        c.some((_, i) => i + n.length <= c.length && n.every((b, j) => c[i + j] === b)),
+      );
+    };
+    // The JWT is the GC fixture's `token` (`fakeFetch`).
+    const JWT = 'meeting-jwt';
+    // Positive control: the needle search finds the JWT where it belongs —
+    // the MC JoinRequest...
+    expect(contains(rig.mc.getOutboundBidiWrites(0), JWT)).toBe(true);
+    for (const [url, token] of [
+      [A, 'dial-sentinel-A'],
+      [B, 'dial-sentinel-B'],
+    ] as const) {
+      const mh = rig.dials.latest(url).getOutboundBidiWrites(0);
+      // ...and each MH dial's own token on its connect request...
+      expect(contains(mh, token)).toBe(true);
+      // ...but never the JWT.
+      expect(contains(mh, JWT)).toBe(false);
+    }
+    rig.session.disconnect();
+  });
+
+  it('every per-ref transition reaches MC as its own update, echoing ref + version', async () => {
     const A = 'https://mh-a.example:4433';
     const rig = await reconcileRig({ version: 3n, handlers: [{ ref: 7, url: A }] });
     rig.dials.latest(A).simulateError(new Error('lost'));
     await waitFor(() => mediaConnectionStatuses(rig.mc).length === 2);
     const statuses = mediaConnectionStatuses(rig.mc);
-    expect(statuses.map((s) => [s.handlerRef, s.handlerSetVersion, s.state, s.mhUrl])).toEqual([
-      [7, 3n, ConnectionState.CONNECTED, ''],
-      [7, 3n, ConnectionState.DISCONNECTED, ''],
+    expect(statuses.map((s) => [s.handlerRef, s.handlerSetVersion, s.state])).toEqual([
+      [7, 3n, ConnectionState.CONNECTED],
+      [7, 3n, ConnectionState.DISCONNECTED],
     ]);
     rig.session.disconnect();
   });

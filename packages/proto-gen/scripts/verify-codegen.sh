@@ -497,8 +497,8 @@ done
 assert_message_field "${INT}" EndMeetingRequest cause
 
 # Story 4 P2 (ADR-0039 §4, §5, §7) — the signalling handler set, refs, dial
-# token and close codes. Presence only: P2 is additive (the superseded url
-# fields and `join_token` stay until P3, which adds their absence checks).
+# token and close codes. Presence; the superseded surfaces' absence is the
+# story 4 P3 block below.
 for symbol in MediaHandlerSet MhCloseCode; do
   assert_exported "${SIG}" "${symbol}"
 done
@@ -520,6 +520,19 @@ for field in handlerRef handlerSetVersion; do
   assert_message_field "${SIG}" MhConnectionStatus "${field}"
 done
 assert_oneof_case "${SIG}" mediaHandlerSet
+
+# Story 4 P3 (ADR-0039 §4, §5; R-36, R-17) — the superseded signalling/connect
+# surfaces are gone (tag + name reserved in the proto). THE one list of them:
+# each absence carries a same-message positive control (the replacement).
+assert_message_field_absent "${SIG}" JoinResponse mediaServers mediaHandlerSet
+assert_message_field_absent "${SIG}" SendTarget mediaHandlerUrl handlerRef
+assert_message_field_absent "${SIG}" StreamAssignment mediaHandlerUrl handlerRef
+assert_message_field_absent "${SIG}" MhConnectionStatus mhUrl handlerRef
+assert_message_field_absent "${SIG}" MhConnectRequest joinToken mediaDialToken
+# Same-named survivors a broad sweep could take with them: the client->MC join
+# credential (NOT retired) and the one place an address reaches a client.
+assert_message_field "${SIG}" JoinRequest joinToken
+assert_message_field "${SIG}" MediaServerInfo mediaHandlerUrl
 
 # Story 4 GC-3 (ADR-0039 §3) — the MC→GC replacement grant and the GC-owned
 # exclude-list cap. Presence only: GC-3 is additive. The rpc itself is checked

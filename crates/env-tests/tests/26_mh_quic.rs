@@ -5,7 +5,7 @@
 //!
 //! # Scenarios (R-33)
 //!
-//! 1. `test_mh_url_present_in_join_response` — `JoinResponse.media_handler_set`
+//! 1. `test_handler_set_present_in_join_response` — `JoinResponse.media_handler_set`
 //!    populated with non-empty WebTransport URLs.
 //! 2. `test_mh_accepts_valid_media_dial_token` — the MC-minted `media_dial`
 //!    token (ADR-0039 §5) → connection held open.
@@ -71,7 +71,7 @@
 //!
 //! MH expects the FIRST framed message on a bidi stream to be a typed
 //! `MhClientMessage{ConnectRequest{media_dial_token: <token>}}` protobuf
-//! envelope (`join_token` empty: MH never reads it since story 4 MH-1),
+//! envelope (the dial token is the only connect credential, ADR-0039 §5),
 //! 4-byte big-endian length prefix + encoded bytes. Mirrors MC's
 //! `ClientMessage{JoinRequest{...}}` discipline. Source of truth:
 //! `crates/mh-service/src/webtransport/connection.rs` Step 3 region.
@@ -240,8 +240,8 @@ fn jwt_preview(jwt: &[u8]) -> String {
 /// connection path, so only the session end distinguishes rejection from
 /// acceptance — and only the capsule distinguishes a CODED rejection from
 /// transport loss.
-async fn assert_mh_rejects(mh_url: &str, jwt: &str, valid_jwt: &str) {
-    let conn = connect_wt(mh_url).await;
+async fn assert_mh_rejects(handler_url: &str, jwt: &str, valid_jwt: &str) {
+    let conn = connect_wt(handler_url).await;
     let (_send, _recv) = send_jwt_on_bi_stream(&conn, jwt).await;
     expect_session_close(
         &conn,
@@ -254,7 +254,7 @@ async fn assert_mh_rejects(mh_url: &str, jwt: &str, valid_jwt: &str) {
     )
     .await;
 
-    let valid = connect_wt(mh_url).await;
+    let valid = connect_wt(handler_url).await;
     let (_vsend, _vrecv) = send_jwt_on_bi_stream(&valid, valid_jwt).await;
     let held = tokio::time::timeout(Duration::from_millis(2500), valid.closed()).await;
     assert!(
@@ -392,7 +392,7 @@ async fn assert_notification_counter_increases_past(
 /// address misconfiguration (`MH_WEBTRANSPORT_ADVERTISE_ADDRESS`) or Redis
 /// MH-assignment data missing for the meeting.
 #[tokio::test]
-async fn test_mh_url_present_in_join_response() {
+async fn test_handler_set_present_in_join_response() {
     let cluster = cluster().await;
     let (user_token, display_name) = shared_user(cluster).await.clone();
 
@@ -488,23 +488,31 @@ async fn mc_join(
 /// A caller that needs the handler MC DIRECTED a client to send on must read the
 /// send directive instead (see `27_mc_slot_placement.rs`). Both callers in this
 /// binary share this ONE home so that distinction cannot drift between them.
-fn any_registered_mh_url(
+fn any_registered_entry(
     join_response: &proto_gen::dark_tower::signaling::v1::JoinResponse,
-) -> String {
-    any_registered_mh(join_response).0
-}
-
-/// [`any_registered_mh_url`] plus THIS member's `media_dial` token for that
-/// handler (ADR-0039 §5) — the credential MH admits on.
-fn any_registered_mh(
-    join_response: &proto_gen::dark_tower::signaling::v1::JoinResponse,
-) -> (String, String) {
-    let entry = join_response
+) -> &proto_gen::dark_tower::signaling::v1::MediaServerInfo {
+    join_response
         .media_handler_set
         .as_ref()
         .and_then(|s| s.handlers.first())
         .filter(|m| !m.media_handler_url.is_empty())
-        .expect("MC JoinResponse must include at least one non-empty MH URL");
+        .expect("MC JoinResponse must include at least one non-empty MH URL")
+}
+
+/// [`any_registered_entry`]'s `handler_ref` — how a client names that handler
+/// in a `MediaConnectionUpdate` (ADR-0039 §4).
+fn any_registered_mh_ref(
+    join_response: &proto_gen::dark_tower::signaling::v1::JoinResponse,
+) -> u32 {
+    any_registered_entry(join_response).handler_ref
+}
+
+/// [`any_registered_entry`]'s url plus THIS member's `media_dial` token for
+/// that handler (ADR-0039 §5) — the credential MH admits on.
+fn any_registered_mh(
+    join_response: &proto_gen::dark_tower::signaling::v1::JoinResponse,
+) -> (String, String) {
+    let entry = any_registered_entry(join_response);
     assert!(
         !entry.media_dial_token.is_empty(),
         "MC JoinResponse handler entry carries no media_dial token — MC mints one for \
@@ -527,14 +535,14 @@ fn any_registered_mh(
 /// session would have its meeting torn down underneath the MH half of its test,
 /// and the symptom would be a confusing transport error, not an assertion
 /// failure pointing here. Bundling makes that unrepresentable: a caller cannot
-/// hold `jwt`/`mh_url` without holding the session. (`#[must_use]` would not
+/// hold `jwt`/`handler_url` without holding the session. (`#[must_use]` would not
 /// do it: `let _ = …` both drops immediately AND silences the warning.)
 struct RegisteredMeeting {
-    /// This member's `media_dial` token for `mh_url` (what MH admits on,
+    /// This member's `media_dial` token for `handler_url` (what MH admits on,
     /// ADR-0039 §5). A bearer credential: never in a panic or assert message.
     dial_token: String,
     /// One MH WebTransport URL on which the meeting is registered.
-    mh_url: String,
+    handler_url: String,
     /// The MC session keeping the meeting alive. Never read; held.
     _mc_session: McSession,
 }
@@ -565,10 +573,10 @@ async fn join_with_registered_mh(
     )
     .await;
 
-    let (mh_url, dial_token) = any_registered_mh(&join_response);
+    let (handler_url, dial_token) = any_registered_mh(&join_response);
     RegisteredMeeting {
         dial_token,
-        mh_url,
+        handler_url,
         _mc_session: session,
     }
 }
@@ -608,9 +616,9 @@ async fn test_mh_accepts_valid_media_dial_token() {
     )
     .await;
     // Held for the whole test: `meeting` owns the MC session keeping it alive.
-    let (jwt, mh_url) = (meeting.dial_token.clone(), meeting.mh_url.clone());
+    let (jwt, handler_url) = (meeting.dial_token.clone(), meeting.handler_url.clone());
 
-    let conn = connect_wt(&mh_url).await;
+    let conn = connect_wt(&handler_url).await;
     let (_send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
 
     // Held-open invariant: `conn.closed()` resolves with the close reason
@@ -668,14 +676,14 @@ async fn test_mh_rejects_forged_media_dial_token() {
     )
     .await;
     // Held for the whole test: `meeting` owns the MC session keeping it alive.
-    let mh_url = meeting.mh_url.clone();
+    let handler_url = meeting.handler_url.clone();
 
     // The REAL dial token with one signature character flipped: structurally
     // valid, registered meeting, correct aud — only the signature is wrong, so
     // the DECLINED is attributable to signature verification (step d).
     let forged = mc_session::tamper_jws_signature(&meeting.dial_token);
 
-    assert_mh_rejects(&mh_url, &forged, &meeting.dial_token).await;
+    assert_mh_rejects(&handler_url, &forged, &meeting.dial_token).await;
 }
 
 /// Test: MH rejects an oversized `media_dial` token (> `MAX_JWT_SIZE_BYTES` = 8192 in
@@ -719,12 +727,12 @@ async fn test_mh_rejects_oversized_media_dial_token() {
     )
     .await;
     // Held for the whole test: `meeting` owns the MC session keeping it alive.
-    let mh_url = meeting.mh_url.clone();
+    let handler_url = meeting.handler_url.clone();
 
     // Benign filler — explicitly NOT shaped like a real JWT (no dots, no
     // base64 header) so we don't normalize logging realistic-looking tokens.
     let oversized = "A".repeat(9000);
-    assert_mh_rejects(&mh_url, &oversized, &meeting.dial_token).await;
+    assert_mh_rejects(&handler_url, &oversized, &meeting.dial_token).await;
 }
 
 // ============================================================================
@@ -768,9 +776,9 @@ async fn test_mh_connect_increments_mc_notification_metric_connected() {
     )
     .await;
     // Held for the whole test: `meeting` owns the MC session keeping it alive.
-    let (jwt, mh_url) = (meeting.dial_token.clone(), meeting.mh_url.clone());
+    let (jwt, handler_url) = (meeting.dial_token.clone(), meeting.handler_url.clone());
 
-    let conn = connect_wt(&mh_url).await;
+    let conn = connect_wt(&handler_url).await;
     let (_send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
 
     // The connect notification fires from MH best-effort fire-and-forget after
@@ -815,9 +823,9 @@ async fn test_mh_disconnect_increments_mc_notification_metric_disconnected() {
     )
     .await;
     // Held for the whole test: `meeting` owns the MC session keeping it alive.
-    let (jwt, mh_url) = (meeting.dial_token.clone(), meeting.mh_url.clone());
+    let (jwt, handler_url) = (meeting.dial_token.clone(), meeting.handler_url.clone());
 
-    let conn = connect_wt(&mh_url).await;
+    let conn = connect_wt(&handler_url).await;
     let (mut send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
 
     // Clean close: finish the send stream (produces Ok(None) on the server's
@@ -873,20 +881,23 @@ async fn assert_participant_mh_status_increases_past(
 }
 
 /// Test: after a client joins MC and sends a
-/// `ClientMessage{MediaConnectionUpdate}` reporting a `CONNECTED` MH, MC
-/// records it on the participant actor and
+/// `ClientMessage{MediaConnectionUpdate}` reporting a `CONNECTED` MH (by
+/// `handler_ref`), MC counts it at the boundary and
 /// `mc_participant_mh_status_total{state="connected"}` increments (R-60 MC
-/// half — the post-join client→MC reporting plane).
+/// half — the post-join client→MC reporting plane; the
+/// `MCMediaConnectionAllFailed` alert input).
 ///
 /// This is the cluster-tier companion to the component-tier seam coverage in
 /// `crates/mc-service/tests/media_connection_update_integration.rs` (which
 /// asserts the same metric through the real `handle_client_message` decode
-/// path) and the deterministic actor + cap coverage in
-/// `crates/mc-service/src/actors/participant.rs::tests`.
+/// path) and the deterministic per-state coverage in
+/// `crates/mc-service/src/webtransport/connection.rs` tests
+/// (`every_reported_status_is_counted_by_state_at_the_boundary`).
 ///
 /// On-call: if this fails, suspect MC's post-join `handle_client_message`
-/// dispatch (`crates/mc-service/src/webtransport/connection.rs`), the
-/// `ParticipantActor::record_mh_statuses` path, or Prometheus scrape of MC.
+/// dispatch and its one emit site,
+/// `webtransport/connection.rs::handle_media_connection_update`, or
+/// Prometheus scrape of MC.
 #[tokio::test]
 #[serial_test::serial(mc_participant_mh_status)]
 async fn test_mc_media_connection_update_increments_participant_mh_status_metric() {
@@ -931,7 +942,7 @@ async fn test_mc_media_connection_update_increments_participant_mh_status_metric
     )
     .await;
 
-    let mh_url = any_registered_mh_url(&join_response);
+    let handler_ref = any_registered_mh_ref(&join_response);
 
     // Report that MH as CONNECTED via the post-join plane.
     session
@@ -939,13 +950,15 @@ async fn test_mc_media_connection_update_increments_participant_mh_status_metric
             message: Some(client_message::Message::MediaConnectionUpdate(
                 MediaConnectionUpdate {
                     statuses: vec![MhConnectionStatus {
-                        mh_url,
                         state: ConnectionState::Connected as i32,
                         failure_reason: None,
                         failure_code: None,
                         observed_at: None,
-                        handler_ref: 0,
-                        handler_set_version: 0,
+                        handler_ref,
+                        handler_set_version: join_response
+                            .media_handler_set
+                            .as_ref()
+                            .map_or(0, |s| s.handler_set_version),
                     }],
                 },
             )),
@@ -1131,8 +1144,8 @@ async fn test_mc_programs_live_handler_with_confirmed_forwarding_policy() {
     )
     .await;
     // Held for the whole test: `meeting` owns the MC session keeping it alive.
-    let (jwt, mh_url) = (meeting.dial_token.clone(), meeting.mh_url.clone());
-    let conn = connect_wt(&mh_url).await;
+    let (jwt, handler_url) = (meeting.dial_token.clone(), meeting.handler_url.clone());
+    let conn = connect_wt(&handler_url).await;
     let (_send, _recv) = send_jwt_on_bi_stream(&conn, &jwt).await;
 
     // Positive: the handler confirmed the generation MC sent.

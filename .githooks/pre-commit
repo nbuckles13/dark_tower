@@ -28,10 +28,13 @@ if ! cargo fmt --all -- --check; then
     exit 1
 fi
 
-# Run cargo clippy on changed Rust files
+# Run cargo clippy on changed Rust files.
+# Keep the argv in sync with scripts/lang/rust/lint.sh (Layer 5). Not delegated to it: that wrapper
+# sources _common.sh (bash-4 tripwire), and this hook is deliberately bash-3.2-tolerant (see the fmt
+# note above). Parity guard: docs/TODO.md "clippy-lane argv parity".
 echo "  ➜ Running clippy on changed files..."
 if git diff --cached --name-only | grep -q "\.rs$"; then
-    cargo clippy --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
     if [ $? -ne 0 ]; then
         echo ""
         echo "❌ Clippy warnings/errors detected!"

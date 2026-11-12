@@ -27,7 +27,6 @@ const C = 'https://mh-c.example:4433';
 const R1 = handlerRef(1);
 const R2 = handlerRef(2);
 const R3 = handlerRef(3);
-const JWT = 'JWT-SENTINEL-not.a.jwt';
 
 const HANDLERS: HandlerSetConfig = {
   ...DEFAULT_CLIENT_CONFIG.media.handlers,
@@ -118,13 +117,13 @@ async function joined(
 ): Promise<Rig> {
   const rig = makeRig(random);
   rig.mt.applyHandlerSet(intakeOf(1n, handlers));
-  const armed = rig.mt.arm(JWT);
+  const armed = rig.mt.arm();
   for (const h of handlers) await rig.ready(h.url);
   await armed;
   return rig;
 }
 
-describe('G1 / T1 — join and add share ONE dial path; the JWT rides only the armed dials', () => {
+describe('G1 / T1 — join and add share ONE dial path; the dial token is the only credential', () => {
   it('an add dials exactly like the join (envelope shape, metric, state, report)', async () => {
     const rig = await joined([{ ref: 1, url: A, token: 'tok-A1' }]);
     rig.mt.applyHandlerSet(
@@ -137,14 +136,9 @@ describe('G1 / T1 — join and add share ONE dial path; the JWT rides only the a
     await rig.ready(B);
     expect(rig.mt.getState(R2)).toBe('connected');
 
-    // Same envelope shape: both populate media_dial_token from the held token.
-    expect(connectRequestsOn(rig.dials.latest(A))).toEqual([
-      { joinToken: JWT, mediaDialToken: 'tok-A1' },
-    ]);
-    // The ADD carries join_token "" (the JWT is never retained, ADR-0039 §5).
-    expect(connectRequestsOn(rig.dials.latest(B))).toEqual([
-      { joinToken: '', mediaDialToken: 'tok-B1' },
-    ]);
+    // Same envelope shape: both carry only media_dial_token, from the held token.
+    expect(connectRequestsOn(rig.dials.latest(A))).toEqual([{ mediaDialToken: 'tok-A1' }]);
+    expect(connectRequestsOn(rig.dials.latest(B))).toEqual([{ mediaDialToken: 'tok-B1' }]);
     // Same metric: one success per dial, bucket = position in the triggering set.
     rig.sink.assertCounter(
       'dt_client_mh_connection_total',
@@ -164,7 +158,7 @@ describe('G1 / T1 — join and add share ONE dial path; the JWT rides only the a
     rig.mt.disconnect();
   });
 
-  it('JWT sentinel: in EXACTLY the armed-dial envelopes — never an add, a redial or a post-park dial', async () => {
+  it("every dial — armed, add, redial, post-park — carries exactly its ref's latest dial token", async () => {
     const rig = await joined([{ ref: 1, url: A }]);
     // An add.
     rig.mt.applyHandlerSet(
@@ -191,12 +185,12 @@ describe('G1 / T1 — join and add share ONE dial path; the JWT rides only the a
     await rig.ready(B);
 
     const all = rig.dials.dials.flatMap((d) => connectRequestsOn(d.mock));
-    expect(all).toHaveLength(4);
-    // Positive control: the sentinel IS on the armed dial...
-    expect(all.filter((e) => e.joinToken === JWT)).toHaveLength(1);
-    expect(connectRequestsOn(rig.dials.dials[0]!.mock)[0]!.joinToken).toBe(JWT);
-    // ...and on nothing else.
-    expect(all.slice(1).every((e) => e.joinToken === '')).toBe(true);
+    expect(all).toEqual([
+      { mediaDialToken: 'tok-1' },
+      { mediaDialToken: 'b1' },
+      { mediaDialToken: 'tok-1' },
+      { mediaDialToken: 'b2' },
+    ]);
     rig.mt.disconnect();
   });
 });
@@ -273,7 +267,7 @@ describe('G3 — a new ref at an IDENTICAL url is a real close + open', () => {
     expect(rig.dials.count(A)).toBe(2);
     expect(second).not.toBe(first);
     expect(closeFirst).toHaveBeenCalledTimes(1);
-    expect(connectRequestsOn(second)).toEqual([{ joinToken: '', mediaDialToken: 'tok-2' }]);
+    expect(connectRequestsOn(second)).toEqual([{ mediaDialToken: 'tok-2' }]);
     expect(rig.mt.getState(R1)).toBeUndefined();
     expect(rig.mt.getState(R2)).toBe('connected');
     rig.mt.disconnect();
@@ -298,9 +292,7 @@ describe('G4 — a token-only refresh is no dial and no close; the latest token 
     await rig.fireNext();
     expect(rig.dials.count(A)).toBe(2);
     await rig.ready(A);
-    expect(connectRequestsOn(rig.dials.latest(A))).toEqual([
-      { joinToken: '', mediaDialToken: 'tok-A2' },
-    ]);
+    expect(connectRequestsOn(rig.dials.latest(A))).toEqual([{ mediaDialToken: 'tok-A2' }]);
     rig.mt.disconnect();
   });
 });
@@ -319,9 +311,7 @@ describe('G4b — a token-only refresh never bypasses a pending redial or double
     expect(rig.sched.pending()).toEqual(before);
     await rig.fireNext();
     await rig.ready(A);
-    expect(connectRequestsOn(rig.dials.latest(A))).toEqual([
-      { joinToken: '', mediaDialToken: 'new' },
-    ]);
+    expect(connectRequestsOn(rig.dials.latest(A))).toEqual([{ mediaDialToken: 'new' }]);
     rig.mt.disconnect();
   });
 
@@ -343,9 +333,7 @@ describe('G4b — a token-only refresh never bypasses a pending redial or double
     expect(rig.dials.count(B)).toBe(1);
     await rig.ready(B);
     // The in-flight dial reads the token at request build: the refreshed one.
-    expect(connectRequestsOn(rig.dials.latest(B))).toEqual([
-      { joinToken: '', mediaDialToken: 'b2' },
-    ]);
+    expect(connectRequestsOn(rig.dials.latest(B))).toEqual([{ mediaDialToken: 'b2' }]);
     rig.mt.disconnect();
   });
 });
@@ -400,9 +388,7 @@ describe('G5 / T2 — DECLINED: park, FAILED, no dial until a DIFFERENT token, t
     expect(rig.redialDelays()).toEqual([]);
     await rig.ready(B);
     expect(rig.dials.count(B)).toBe(2);
-    expect(connectRequestsOn(rig.dials.latest(B))).toEqual([
-      { joinToken: '', mediaDialToken: 'b-2' },
-    ]);
+    expect(connectRequestsOn(rig.dials.latest(B))).toEqual([{ mediaDialToken: 'b-2' }]);
     expect(rig.mt.getState(R2)).toBe('connected');
     rig.mt.disconnect();
   });
@@ -417,9 +403,7 @@ describe('G5 / T2 — DECLINED: park, FAILED, no dial until a DIFFERENT token, t
     expect(rig.dials.count(A)).toBe(2);
     expect(rig.reports.at(-1)).toMatchObject({ handlerRef: R1, state: 'failed' });
     await rig.ready(A);
-    expect(connectRequestsOn(rig.dials.latest(A))).toEqual([
-      { joinToken: '', mediaDialToken: 't2' },
-    ]);
+    expect(connectRequestsOn(rig.dials.latest(A))).toEqual([{ mediaDialToken: 't2' }]);
     expect(rig.dials.count(A)).toBe(2);
 
     // Positive arm: with NO refresh since that dial, DECLINED parks and dials nothing.
@@ -465,9 +449,7 @@ describe('G6 — the close-code table (ADR-0039 §7)', () => {
       expect(rig.redialDelays()).toEqual([MH_KEEPALIVE_FLOOR_MS]);
       await rig.fireNext();
       await rig.ready(A);
-      expect(connectRequestsOn(rig.dials.latest(A))).toEqual([
-        { joinToken: '', mediaDialToken: 'held' },
-      ]);
+      expect(connectRequestsOn(rig.dials.latest(A))).toEqual([{ mediaDialToken: 'held' }]);
       rig.mt.disconnect();
     },
   );
@@ -667,7 +649,7 @@ describe('G9 — an empty join set is "media connecting"', () => {
   it('join resolves with no dial, no fault, no report; the first set with a member dials normally', async () => {
     const rig = makeRig();
     rig.mt.applyHandlerSet(intakeOf(1n, []));
-    await expect(rig.mt.arm(JWT)).resolves.toBeUndefined();
+    await expect(rig.mt.arm()).resolves.toBeUndefined();
     expect(rig.dials.dials).toHaveLength(0);
     expect(rig.reports).toEqual([]);
 
@@ -683,7 +665,7 @@ describe('G9 — an empty join set is "media connecting"', () => {
   it('past the bound with no handler: exactly ONE notice, the session kept', async () => {
     const rig = makeRig();
     rig.mt.applyHandlerSet(intakeOf(1n, []));
-    await rig.mt.arm(JWT);
+    await rig.mt.arm();
     rig.sched.advance(HANDLERS.emptySetNoticeMs - 1);
     expect(rig.overdue).toEqual([]);
     rig.sched.advance(1);
@@ -739,7 +721,7 @@ describe('T3 — sets before and during arm', () => {
     rig.mt.applyHandlerSet(intakeOf(1n, [{ ref: 1, url: A, token: 'refreshed' }]));
     expect(rig.dials.dials).toHaveLength(0);
 
-    const armed = rig.mt.arm(JWT);
+    const armed = rig.mt.arm();
     expect(rig.dials.count(A)).toBe(1);
     rig.mt.applyHandlerSet(
       intakeOf(2n, [
@@ -752,12 +734,9 @@ describe('T3 — sets before and during arm', () => {
     await rig.ready(A);
     await rig.ready(B);
     await armed;
-    expect(connectRequestsOn(rig.dials.latest(A))[0]).toEqual({
-      joinToken: JWT,
-      mediaDialToken: 'tok-1',
-    });
-    // The ref added WHILE the armed dials were in flight is NOT an armed dial.
-    expect(connectRequestsOn(rig.dials.latest(B))[0]!.joinToken).toBe('');
+    expect(connectRequestsOn(rig.dials.latest(A))[0]).toEqual({ mediaDialToken: 'tok-1' });
+    // The ref added WHILE the armed dials were in flight dials once, on its token.
+    expect(connectRequestsOn(rig.dials.latest(B))).toEqual([{ mediaDialToken: 'tok-2' }]);
     rig.mt.disconnect();
   });
 });
@@ -788,7 +767,7 @@ describe('T7 / ops — session end leaves nothing behind', () => {
     expect(rig.sched.size).toBe(0);
     const dialsAtEnd = rig.dials.dials.length;
     rig.mt.applyHandlerSet(intakeOf(3n, [{ ref: 4, url: A }]));
-    await rig.mt.arm(JWT);
+    await rig.mt.arm();
     await flushMicrotasks(50);
     expect(rig.dials.dials).toHaveLength(dialsAtEnd);
   });
@@ -797,7 +776,7 @@ describe('T7 / ops — session end leaves nothing behind', () => {
     const rig = makeRig();
     rig.mt.applyHandlerSet(intakeOf(1n, [{ ref: 1, url: A, token: 'never-sent' }]));
     rig.mt.disconnect();
-    await rig.mt.arm(JWT);
+    await rig.mt.arm();
     await flushMicrotasks(50);
     expect(rig.dials.dials).toHaveLength(0);
     expect(rig.sched.size).toBe(0);

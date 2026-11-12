@@ -221,9 +221,9 @@ If no heartbeat received for 30 seconds, the participant is marked as disconnect
 │ Client │                                    │Media Handler │
 └───┬────┘                                    └──────┬───────┘
     │                                                │
-    │ 1. Receive media_handler_url from the         │
+    │ 1. Receive the MediaHandlerSet from the       │
     │    Meeting Controller; authenticate below     │
-    │    with the meeting JWT (ADR-0020)            │
+    │    with the entry's media_dial token          │
     │                                                │
     │ 2. WebTransport Connect                       │
     │    URL: https://mh.region.dark.com:4434       │
@@ -255,9 +255,9 @@ If no heartbeat received for 30 seconds, the participant is marked as disconnect
 > sending `MhClientMessage{connect_request: MhConnectRequest{media_dial_token}}` as
 > its first length-framed message. The `media_dial` token is minted by the
 > meeting's MC (ADR-0039 §5) and delivered per handler in every
-> `MediaHandlerSet`; `MhConnectRequest.join_token` is IGNORED by MH (retained only
-> until story 4 P3 deletes it). MH verifies the token locally, before holding
-> anything, in a fixed order: size cap; header `alg` must be `EdDSA` (`kid`/`jwk`
+> `MediaHandlerSet`; it is the only connect credential (`MhConnectRequest` tag 1,
+> the meeting JWT, was deleted by story 4 P3 and is reserved). MH verifies the
+> token locally, before holding anything, in a fixed order: size cap; header `alg` must be `EdDSA` (`kid`/`jwk`
 > headers never select a key, and MH never fetches one); the `meeting_id` claim
 > selects that meeting's Ed25519 public key from its `RegisterMeeting` (no
 > registration = `DECLINED` at once, nothing parked); the signature; the claims
@@ -575,7 +575,7 @@ Client                                    Server
 ```
 [IDLE]
       │
-      │ Receive media_handler_url
+      │ Receive MediaHandlerSet entry
       ▼
 [CONNECTING]
       │

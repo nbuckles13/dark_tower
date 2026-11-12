@@ -49,7 +49,7 @@ import { handlerRef, type HandlerRef } from '../../handlerSet.js';
 
 const KEK = new Uint8Array(AES_256_KEY_BYTES).fill(0x11);
 const SENDER_ID = 258;
-const MH_URL = handlerRef(1);
+const MH_REF = handlerRef(1);
 
 interface Rig {
   readonly pipeline: AudioPipeline;
@@ -154,11 +154,11 @@ async function makeRig(
   pipeline.setSendDirective({
     streamNumber: shape.streamNumber ?? 1,
     bitrateBps: 32_000,
-    targets: [MH_URL],
+    targets: [MH_REF],
     headerVersion: HEADER_VERSION,
   });
   // Receiving comes from the slot assignments, not from the send directive.
-  pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
+  pipeline.setReceiveAssignments(assignmentsOn([MH_REF], SENDER_ID));
 
   const egress = new EgressPipeline({
     metrics: metrics.audio,
@@ -173,7 +173,7 @@ async function makeRig(
   });
   // A raw-submit rig still needs a directed target: `submit()` builds nothing
   // when MC has directed none, which is §5's "send nothing".
-  egress.setTargets({ targets: [MH_URL], headerVersion: HEADER_VERSION });
+  egress.setTargets({ targets: [MH_REF], headerVersion: HEADER_VERSION });
 
   const rig: Rig = {
     pipeline,
@@ -478,7 +478,7 @@ describe('degradation is loud', () => {
 });
 
 describe('the directed header version (ADR-0036 §2: meeting-wide, MC-directed)', () => {
-  const directive = (headerVersion: number, targets: readonly HandlerRef[] = [MH_URL]) => ({
+  const directive = (headerVersion: number, targets: readonly HandlerRef[] = [MH_REF]) => ({
     streamNumber: 1,
     bitrateBps: 32_000,
     targets,
@@ -565,7 +565,7 @@ describe('the directed header version (ADR-0036 §2: meeting-wide, MC-directed)'
       senderFor: () => undefined,
       onTargetNotConnected: () => {},
     });
-    expect(() => egress.setTargets({ targets: [MH_URL], headerVersion: 2 })).toThrow(RangeError);
+    expect(() => egress.setTargets({ targets: [MH_REF], headerVersion: 2 })).toThrow(RangeError);
     expect(() => egress.setTargets({ targets: [], headerVersion: 4 })).not.toThrow();
   });
 });

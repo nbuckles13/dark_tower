@@ -110,8 +110,7 @@ interface InternalBus {
   /**
    * Every handler set this session held, in wire order: the join-time set
    * first, then every pushed set (both via `mediaHandlerSet`). THE source of
-   * handler urls for the browser suite (`JoinResponse.media_servers` is
-   * superseded and never read).
+   * handler urls for the browser suite.
    */
   handlerSets: BusHandlerSet[];
   /**

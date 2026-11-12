@@ -153,6 +153,14 @@ Complete ALL items before deploying to production:
 
 ### Coordination
 
+- [ ] **Story 4 P3 retired the superseded signalling surfaces** (`JoinResponse.media_servers`,
+  `SendTarget`/`StreamAssignment.media_handler_url`, `MhConnectionStatus.mh_url`,
+  `MhConnectRequest.join_token`). Its deploy order and rollback floors are stated once in
+  `mh-deployment.md` §Rollback ("P3 coupling"). MC-local facts: the
+  `MCMediaConnectionAllFailed` input (`mc_participant_mh_status_total{state}`) keeps its name,
+  labels and expression across the roll (only its emit site moved), and
+  `mc_participant_mh_status_dropped_total` loses its `reason="cap"` series (2 reasons now: no
+  post-deploy check expects `cap`).
 - [ ] **Story 3 ("see each other") is ONE coordinated cutover: config → MH → MC → browser SDK,
   and rolling back across it is all components together** (R-25, confirmed 2026-10-08). The
   authority, with the skew-detection table and the three-layer rollback, is

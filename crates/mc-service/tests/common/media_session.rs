@@ -159,11 +159,10 @@ pub struct Session {
     recv: wtransport::stream::RecvStream,
     /// This participant's own sender id, read off the `JoinResponse`.
     pub sender_id: u32,
-    /// `JoinResponse.media_servers`, as MC sent it (urls).
-    pub media_servers: Vec<String>,
-    /// `JoinResponse.media_servers`, whole entries (url, ref, `media_dial`
-    /// token) — the legacy carrier of the same projection as the set.
-    pub media_server_entries: Vec<proto_gen::dark_tower::signaling::v1::MediaServerInfo>,
+    /// Every `handler_ref -> url` this session has been told, from the join
+    /// set and every later `MediaHandlerSet` read off the wire. Refs are never
+    /// reused within a meeting (ADR-0039 §4), so accumulating is sound.
+    known_handlers: std::collections::BTreeMap<u32, String>,
     /// `JoinResponse.media_handler_set`, as MC sent it (ADR-0039 §4).
     pub media_handler_set: Option<proto_gen::dark_tower::signaling::v1::MediaHandlerSet>,
     /// `JoinResponse.receive_slot_caps`, as MC sent it.
@@ -256,9 +255,49 @@ impl Session {
         if let Some(m) = self.pending.pop_front() {
             return Some(m);
         }
-        tokio::time::timeout(QUIET, read_server_message(&mut self.recv))
+        let m = tokio::time::timeout(QUIET, read_server_message(&mut self.recv))
             .await
-            .ok()
+            .ok()?;
+        self.observe(&m);
+        Some(m)
+    }
+
+    fn learn(&mut self, set: &proto_gen::dark_tower::signaling::v1::MediaHandlerSet) {
+        for h in &set.handlers {
+            self.known_handlers
+                .insert(h.handler_ref, h.media_handler_url.clone());
+        }
+    }
+
+    fn observe(&mut self, m: &ServerMessage) {
+        if let Some(server_message::Message::MediaHandlerSet(set)) = &m.message {
+            self.learn(set);
+        }
+    }
+
+    /// The join-time handler set's urls, sorted (the addresses this session
+    /// was offered at join).
+    #[must_use]
+    pub fn handler_urls(&self) -> Vec<String> {
+        let mut urls: Vec<String> = self
+            .media_handler_set
+            .iter()
+            .flat_map(|s| s.handlers.iter().map(|h| h.media_handler_url.clone()))
+            .collect();
+        urls.sort();
+        urls
+    }
+
+    /// The url of `handler_ref` in a set this session was told. Fails loudly
+    /// on 0 ("no edge") and on a ref never listed — a non-member is a contract
+    /// fault, never silently an empty string.
+    #[must_use]
+    pub fn url_of(&self, handler_ref: u32) -> String {
+        assert_ne!(handler_ref, 0, "{}: ref 0 names no handler", self.user);
+        self.known_handlers
+            .get(&handler_ref)
+            .unwrap_or_else(|| panic!("{}: ref {handler_ref} is in no set it was told", self.user))
+            .clone()
     }
 
     /// Consume the joiner's JOIN-TURN view (story 3: every join carries its
@@ -274,6 +313,7 @@ impl Session {
             else {
                 panic!("{}: the join-turn view never arrived", self.user);
             };
+            self.observe(&m);
             match &m.message {
                 Some(server_message::Message::SendDirective(d)) => {
                     self.join_directive = Some(d.clone());
@@ -741,36 +781,24 @@ async fn try_join_full(
     let resp = tokio::time::timeout(Duration::from_secs(5), read_server_message(&mut recv))
         .await
         .expect("join response timeout");
-    let (
-        participant_id,
-        sender_id,
-        media_server_entries,
-        media_handler_set,
-        receive_slot_caps,
-        existing_participants,
-    ) = match resp.message {
-        Some(server_message::Message::JoinResponse(r)) => (
-            r.participant_id.clone(),
-            r.sender_id.expect("MC allocates a sender id at join"),
-            r.media_servers,
-            r.media_handler_set,
-            r.receive_slot_caps,
-            r.existing_participants,
-        ),
-        other => return Err(format!("{other:?}")),
-    };
+    let (participant_id, sender_id, media_handler_set, receive_slot_caps, existing_participants) =
+        match resp.message {
+            Some(server_message::Message::JoinResponse(r)) => (
+                r.participant_id.clone(),
+                r.sender_id.expect("MC allocates a sender id at join"),
+                r.media_handler_set,
+                r.receive_slot_caps,
+                r.existing_participants,
+            ),
+            other => return Err(format!("{other:?}")),
+        };
 
-    let media_servers = media_server_entries
-        .iter()
-        .map(|m| m.media_handler_url.clone())
-        .collect::<Vec<String>>();
     let mut session = Session {
         conn,
         send,
         recv,
         sender_id,
-        media_servers,
-        media_server_entries,
+        known_handlers: std::collections::BTreeMap::new(),
         media_handler_set,
         receive_slot_caps,
         join_directive: None,
@@ -781,6 +809,9 @@ async fn try_join_full(
         existing_participants,
         meeting_id: meeting_id.to_string(),
     };
+    if let Some(set) = session.media_handler_set.clone() {
+        session.learn(&set);
+    }
     session.take_join_view().await;
     Ok(session)
 }

@@ -875,7 +875,7 @@ describe('SignalingClient — sendMediaConnectionUpdate (R-60/R-21)', () => {
     return m.value;
   }
 
-  it('echoes handler_ref + handler_set_version per status, leaves mh_url EMPTY, in order', async () => {
+  it('echoes handler_ref + handler_set_version per status, in order', async () => {
     const { client, wt } = await joinedClient();
     const reports: MhConnectionStatusReport[] = [
       { handlerRef: R1, handlerSetVersion: 9n, state: 'connected', observedAtMs: 1000 },
@@ -889,8 +889,6 @@ describe('SignalingClient — sendMediaConnectionUpdate (R-60/R-21)', () => {
       // uint64 echoed as bigint with no Number() round-trip.
       [2, 2n ** 63n, ConnectionState.DISCONNECTED],
     ]);
-    // The superseded field is never populated (P3 deletes it).
-    expect(update.statuses.every((s) => s.mhUrl === '')).toBe(true);
     expect(update.statuses[0]!.observedAt).toBeDefined();
     expect(update.statuses[0]!.failureReason).toBeUndefined();
     client.close();

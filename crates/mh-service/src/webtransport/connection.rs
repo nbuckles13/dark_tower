@@ -4,7 +4,7 @@
 //! 1. Accept WebTransport session
 //! 2. Accept bidirectional stream
 //! 3. Read the `media_dial` token from the first length-prefixed message
-//!    (`MhConnectRequest.media_dial_token`; `join_token` is never read)
+//!    (`MhConnectRequest.media_dial_token`, the only connect credential)
 //! 4. Admit it (`crate::webtransport::close::admit`, ADR-0039 §5): verified
 //!    against the meeting's REGISTERED key — a meeting this handler does not
 //!    hold is declined at once; nothing is ever parked waiting for a
@@ -283,10 +283,10 @@ async fn serve_session(
     // here would be a distinction without a difference for the accept_loop's
     // status=error observable.
     //
-    // ONLY `media_dial_token` is read (ADR-0039 §5). `join_token` is never read:
-    // a non-empty one is ignored, and an empty dial token is a malformed
-    // credential — there is no fallback, so MH never accepts both credential
-    // types. (The field itself is deleted by story 4 P3.)
+    // ONLY `media_dial_token` is read (ADR-0039 §5): an empty one is a
+    // malformed credential, with no fallback. An old client's string on the
+    // reserved tag 1 (the deleted `join_token`) decodes as an unknown field,
+    // which prost discards and nothing here reads or logs.
     let token = match envelope.message {
         Some(mh_client_message::Message::ConnectRequest(req)) => req.media_dial_token,
         // A post-connect variant as the FIRST message is not a connect: the

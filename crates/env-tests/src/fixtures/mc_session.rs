@@ -542,8 +542,8 @@ pub async fn mc_join_with(
         "{label}: MC JoinResponse carried no sender_id — the join did not really happen \
          (positive control: a wholesale-empty setup must not read as a pass)"
     );
-    // The handler set, never the legacy `media_servers` (P3 deletes it). Only
-    // counts and indices are printed: entries carry dial tokens.
+    // The handler set. Only counts and indices are printed: entries carry dial
+    // tokens.
     let handlers = join
         .media_handler_set
         .as_ref()
@@ -571,24 +571,14 @@ pub async fn mc_join_with(
 ///
 /// MH admits ONLY on `media_dial_token` (ADR-0039 §5, story 4 MH-1): the
 /// MC-minted credential from the participant's `MediaHandlerSet` entry for
-/// that handler. `join_token` is left EMPTY — MH never reads it (P3 deletes the
-/// field). Negative tests pass malformed/oversized/foreign strings through
-/// unchanged so the verifier observes the intended failure mode.
+/// that handler, the only connect credential. Negative tests pass
+/// malformed/oversized/foreign strings through unchanged so the verifier
+/// observes the intended failure mode.
 #[must_use]
 pub fn mh_connect_frame(media_dial_token: &str) -> Vec<u8> {
-    mh_connect_frame_with("", media_dial_token)
-}
-
-/// [`mh_connect_frame`] with an explicit `join_token` beside the dial token —
-/// the SDK's join-time shape (C1 sends both until P3). Only for tests that
-/// prove MH IGNORES `join_token` (a present, invalid one must not change the
-/// outcome).
-#[must_use]
-pub fn mh_connect_frame_with(join_token: &str, media_dial_token: &str) -> Vec<u8> {
     let envelope = MhClientMessage {
         message: Some(mh_client_message::Message::ConnectRequest(
             MhConnectRequest {
-                join_token: join_token.to_string(),
                 media_dial_token: media_dial_token.to_string(),
             },
         )),
@@ -596,6 +586,39 @@ pub fn mh_connect_frame_with(join_token: &str, media_dial_token: &str) -> Vec<u8
         trace_state: String::new(),
     };
     frame(&envelope.encode_to_vec())
+}
+
+/// [`mh_connect_frame`] as an OLD client would send it: `tag_1_payload` on
+/// `MhConnectRequest` tag 1, the reserved tag of the deleted `join_token`
+/// (story 4 P3), beside the dial token. Hand-encoded, because the generated
+/// type no longer has the field. Only for tests that prove MH decodes tag 1
+/// as unknown and never reads it.
+///
+/// Deliberate twin of `crates/mh-service/tests/common/wt_client.rs`
+/// `write_mh_connect_with_vacated_tag_1` (env-tests cannot reach MH test
+/// support, ADR-0028 layering): a change to the vacated-tag shape changes both.
+#[must_use]
+pub fn mh_connect_frame_with_vacated_tag_1(tag_1_payload: &str, media_dial_token: &str) -> Vec<u8> {
+    fn len_field(tag: u32, payload: &[u8], out: &mut Vec<u8>) {
+        prost::encoding::encode_key(tag, prost::encoding::WireType::LengthDelimited, out);
+        prost::encoding::encode_varint(
+            u64::try_from(payload.len()).expect("payload length fits u64"),
+            out,
+        );
+        out.extend_from_slice(payload);
+    }
+    let mut request = Vec::new();
+    len_field(1, tag_1_payload.as_bytes(), &mut request);
+    request.extend_from_slice(
+        &MhConnectRequest {
+            media_dial_token: media_dial_token.to_string(),
+        }
+        .encode_to_vec(),
+    );
+    // `MhClientMessage.connect_request` is oneof tag 1.
+    let mut envelope = Vec::new();
+    len_field(1, &request, &mut envelope);
+    frame(&envelope)
 }
 
 /// `token` with one character INSIDE its signature segment changed: a compact
@@ -644,7 +667,7 @@ pub async fn try_mh_open_connect(
 }
 
 /// Open MH's carrier bi-stream and write an already-encoded connect `frame`
-/// (from [`mh_connect_frame`] / [`mh_connect_frame_with`]).
+/// (from [`mh_connect_frame`] / [`mh_connect_frame_with_vacated_tag_1`]).
 ///
 /// # Errors
 ///
@@ -741,7 +764,7 @@ pub async fn try_mh_connect_with(
 }
 
 /// Connect to `url` and send an already-encoded connect `frame` (e.g.
-/// [`mh_connect_frame_with`], for the join-token-ignored arms).
+/// [`mh_connect_frame_with_vacated_tag_1`], for the old-client arms).
 ///
 /// # Errors
 ///

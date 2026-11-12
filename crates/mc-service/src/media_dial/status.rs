@@ -3,12 +3,11 @@
 //! The latest `MhConnectionStatus` per (participant, `handler_ref`) received
 //! while that ref was in the set, plus the FAILED fast re-push limiter.
 //!
-//! # Why a THIRD map, not a merge
+//! # Why a second map, not a merge
 //!
-//! MC already holds two connectivity stores, and this is neither:
+//! MC already holds one connectivity store, and this is not it:
 //! `media_routing/connectivity.rs` is SERVER-observed truth (MH-reported, the
-//! input to routing), and `ParticipantActor::mh_statuses` is the legacy
-//! url-keyed client report. This store is client-ASSERTED and DIAGNOSTIC ONLY:
+//! input to routing). This store is client-ASSERTED and DIAGNOSTIC ONLY:
 //! it is NEVER read by routing, edges, slots or placement. Its consumers are
 //! the client-loss evidence (story 4 MC-E) and the credential re-push below.
 //!

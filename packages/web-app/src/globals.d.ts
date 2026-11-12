@@ -43,7 +43,7 @@ interface DarktowerTestBus {
   /**
    * Every media-handler set the session held, in wire order (ADR-0039 §4):
    * `{version, handlers:[{ref, url}]}` — NEVER a dial token. The browser
-   * suite's source of handler urls (`JoinResponse.media_servers` is superseded).
+   * suite's source of handler urls.
    */
   // An `import()` type keeps this file AMBIENT (a top-level import would make it
   // a module and drop every global above); the ONE `BusHandlerSet` lives with

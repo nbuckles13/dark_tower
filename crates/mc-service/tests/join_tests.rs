@@ -327,13 +327,17 @@ async fn test_join_success_returns_join_response() {
                 !join.binding_token.is_empty(),
                 "binding_token should be non-empty"
             );
-            assert!(
-                !join.media_servers.is_empty(),
-                "media_servers should be populated"
-            );
+            let set = join
+                .media_handler_set
+                .as_ref()
+                .expect("the handler set is always present");
             assert_eq!(
-                join.media_servers[0].media_handler_url, "wt://mh-test-1:4433",
-                "media_servers[0] should match first MH endpoint"
+                set.handlers
+                    .iter()
+                    .map(|h| h.media_handler_url.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["wt://mh-test-1:4433"],
+                "the set carries the meeting's handler"
             );
         }
         other => panic!("Expected JoinResponse, got {other:?}"),
@@ -1172,7 +1176,7 @@ async fn test_second_participant_join_re_pushes_its_declared_streams() {
 }
 
 // ============================================================================
-// Multi-MH: media_servers fan-out + RegisterMeeting per handler (R-6, R-12)
+// Multi-MH: handler-set fan-out + RegisterMeeting per handler (R-6, R-12)
 // ============================================================================
 
 #[tokio::test]
@@ -1200,17 +1204,21 @@ async fn test_join_multiple_mh_handlers_offers_the_full_set_and_registers_all() 
     // order carries no meaning.
     match &response.message {
         Some(server_message::Message::JoinResponse(join)) => {
-            let urls: std::collections::BTreeSet<&str> = join
-                .media_servers
+            let handlers = &join
+                .media_handler_set
+                .as_ref()
+                .expect("the handler set is always present")
+                .handlers;
+            let urls: std::collections::BTreeSet<&str> = handlers
                 .iter()
                 .map(|m| m.media_handler_url.as_str())
                 .collect();
             assert_eq!(
                 urls,
                 std::collections::BTreeSet::from(["wt://mh-alpha:4433", "wt://mh-beta:4433"]),
-                "media_servers must carry every registered handler"
+                "the handler set must carry every registered handler"
             );
-            assert_eq!(join.media_servers.len(), 2, "each handler exactly once");
+            assert_eq!(handlers.len(), 2, "each handler exactly once");
         }
         other => panic!("Expected JoinResponse, got {other:?}"),
     }

@@ -46,7 +46,7 @@ use env_tests::fixtures::metrics::{
     PrometheusClient,
 };
 use env_tests::fixtures::participant::{
-    self, filled_senders, meeting_of, open_sessions, targets_of, two_offered_handlers,
+    self, filled_senders, meeting_of, open_sessions, target_refs, two_offered_handlers,
 };
 use env_tests::fixtures::AuthClient;
 
@@ -114,7 +114,7 @@ async fn test_mc_slot_states_and_send_targets_carry_media_kind_audio_after_a_joi
         let other = ids[1 - i];
         p.converge("MEDIA-KIND", bound, move |v, d| {
             v.is_some_and(|v| filled_senders(v, AUDIO) == vec![other])
-                && d.is_some_and(|d| !targets_of(d).is_empty())
+                && d.is_some_and(|d| !target_refs(d).is_empty())
         })
         .await;
     }

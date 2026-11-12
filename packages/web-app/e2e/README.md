@@ -352,8 +352,7 @@ timeout.
 Defaults trace to `infra/kind/kind-config.yaml` (SSoT), mirrored by
 `vite.config.ts` (dev proxy) and `crates/env-tests/src/cluster.rs` (Rust
 counterpart). The MC endpoint comes from the GC join response; MH endpoints come
-exclusively from the MC `MediaHandlerSet` (recorded on the bus as `handlerSets`;
-the superseded `JoinResponse.media_servers` is never read).
+exclusively from the MC `MediaHandlerSet` (recorded on the bus as `handlerSets`).
 
 ## Multi-party harness (story 2, R-30)
 

@@ -212,7 +212,8 @@ message JoinResponse {
   reserved 2, 5;                                // was: user_id, encryption_keys
   reserved "user_id", "encryption_keys";
   repeated Participant existing_participants = 3;
-  repeated MediaServerInfo media_servers = 4;   // Multiple handlers
+  reserved 4;                                   // was: media_servers (deleted by story 4 P3)
+  reserved "media_servers";
   string correlation_id = 6;                    // ADR-0023 session recovery
   string binding_token = 7;                     // ADR-0023 session recovery
   optional uint32 sender_id = 8;                // 16-bit semantics; 1..=65535
@@ -224,6 +225,7 @@ message JoinResponse {
   reserved 13, 14;                              // was: max_audio/video_receive_slots (2026-10-25)
   reserved "max_audio_receive_slots", "max_video_receive_slots";
   repeated ReceiveSlotCap receive_slot_caps = 15; // per-kind cap, informational; one per known kind; 0 = off
+  MediaHandlerSet media_handler_set = 16;       // ADR-0039 §4: THE handler list (addresses only here)
 }
 
 message ReceiveSlotCap {
@@ -257,9 +259,17 @@ enum ClientMediaState {
   CLIENT_MEDIA_STATE_CLIENT_MUTED = 3;
 }
 
+message MediaHandlerSet {                       // full snapshot, replace semantics
+  uint64 handler_set_version = 1;
+  repeated MediaServerInfo handlers = 2;
+}
+
 message MediaServerInfo {
   string media_handler_url = 1;
   reserved 2;                                   // was: connection_token
+  reserved "connection_token";
+  uint32 handler_ref = 3;                       // per-incarnation ref; 0 never a member
+  string media_dial_token = 4;                  // CREDENTIAL (ADR-0039 §5); never logged
 }
 ```
 
@@ -467,9 +477,11 @@ message StreamAssignment {
   uint32 slot_id = 6;
   optional uint32 sender_id = 7;           // absent on a video ACTIVE slot (story 3)
   MediaKind media_kind = 8;
-  string media_handler_url = 9;
+  reserved 9;                              // was: media_handler_url (deleted by story 4 P3)
+  reserved "media_handler_url";
   SlotState slot_state = 10;
   optional uint64 switch_command_id = 11;  // iff slot_state == SWITCH_PENDING
+  uint32 handler_ref = 12;                 // the edge's handler, a ref into the set; 0 = no edge
 }
 ```
 
@@ -523,8 +535,10 @@ message SendStream {
 }
 
 message SendTarget {
-  string media_handler_url = 1;
+  reserved 1;                         // was: media_handler_url (deleted by story 4 P3)
+  reserved "media_handler_url";
   TransportMode transport_mode = 2;   // NOT priority group — see below
+  uint32 handler_ref = 3;             // a ref into the client's current MediaHandlerSet
 }
 
 enum TransportMode {
@@ -646,12 +660,14 @@ message StreamQualityUpdate {
 
 ### 3.1 Connection Establishment
 
-1. Client receives `media_handler_url` from the Meeting Controller
+1. Client receives the `MediaHandlerSet` from the Meeting Controller (each
+   entry's `media_handler_url`, `handler_ref` and `media_dial_token`; every
+   other message names a handler by `handler_ref`)
 2. Client establishes a WebTransport connection to the Media Handler and
    authenticates with the MC-minted **`media_dial` token** for that handler
-   (`MhConnectRequest.media_dial_token`, ADR-0039 §5) — verified against the
-   meeting's registered public key by `crates/mh-service/src/webtransport/close.rs:admit`
-   (`join_token` is ignored by MH and deleted by story 4 P3)
+   (`MhConnectRequest.media_dial_token`, ADR-0039 §5, the only connect
+   credential) — verified against the meeting's registered public key by
+   `crates/mh-service/src/webtransport/close.rs:admit`
 3. Client opens streams for each media stream
 
 **The client↔MH bidirectional control stream.** The client opens one bidi stream

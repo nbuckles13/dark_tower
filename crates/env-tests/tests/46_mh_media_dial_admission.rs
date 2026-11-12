@@ -14,9 +14,9 @@
 //! - an AC meeting token presented as the dial credential closes `DECLINED`;
 //! - a dial after the join JWT's lifetime would have expired: a token from a
 //!   LATER `token_refresh` set (asserted to be a different string) is admitted
-//!   with `join_token` empty AND with a present-but-invalid AC token in
-//!   `join_token` — MH ignores it rather than rejecting it, which is the real
-//!   migration shape (the SDK keeps sending `join_token` until P3);
+//!   alone AND as an OLD client sends it, with a string on the reserved
+//!   `MhConnectRequest` tag 1 (the deleted `join_token`, story 4 P3) — MH
+//!   decodes it as unknown and never reads it;
 //! - a participant who LEFT redials with its still-valid token and is
 //!   `DECLINED` (MC answers `sender_id` 0), receiving no media while a
 //!   still-joined peer DOES receive in the same window;
@@ -163,7 +163,7 @@ async fn valid_dial_tokens_admit_and_foreign_credentials_are_refused() {
 }
 
 #[tokio::test]
-async fn a_refreshed_dial_token_is_admitted_whatever_join_token_carries() {
+async fn a_refreshed_dial_token_is_admitted_whatever_vacated_tag_1_carries() {
     let cluster = cluster().await;
     let prom = PrometheusClient::new(&cluster.prometheus_base_url);
     let auth = AuthClient::new(&cluster.ac_base_url);
@@ -210,23 +210,22 @@ async fn a_refreshed_dial_token_is_admitted_whatever_join_token_carries() {
         "REFRESH (i)",
     )
     .await;
-    assert_held(
-        bare.connection(),
-        "REFRESH (i): refreshed token, join_token empty",
-    )
-    .await;
+    assert_held(bare.connection(), "REFRESH (i): refreshed token alone").await;
     drop(bare);
 
-    // (ii) A PRESENT but INVALID AC token in join_token: ignored, not rejected.
-    let invalid_ac = mc_session::tamper_jws_signature(&ps[0].token);
-    let frame = mc_session::mh_connect_frame_with(&invalid_ac, refreshed.expose());
-    let with_ac = dial(&x, &frame, "REFRESH (ii)").await;
+    // (ii) An old client's string on the vacated tag 1: unknown, ignored, not
+    // rejected. A fixed sentinel, deliberately not credential-shaped.
+    let frame = mc_session::mh_connect_frame_with_vacated_tag_1(
+        "p3-vacated-tag-1-sentinel",
+        refreshed.expose(),
+    );
+    let old_client = dial(&x, &frame, "REFRESH (ii)").await;
     assert_held(
-        with_ac.connection(),
-        "REFRESH (ii): refreshed token beside a tampered AC join_token",
+        old_client.connection(),
+        "REFRESH (ii): refreshed token beside a string on the vacated tag 1",
     )
     .await;
-    drop(with_ac);
+    drop(old_client);
     drop(ps);
 }
 

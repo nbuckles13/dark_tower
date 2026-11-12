@@ -1478,7 +1478,7 @@ message NotifyParticipantConnectedRequest {
   // Connected attempt MH abandoned may still arrive at MC AFTER the
   // Disconnected. Applying it would record live connectivity to a handler the
   // participant is not on, which nothing would ever retire -- MC would then
-  // hand a subscriber a `StreamAssignment.media_handler_url` for a transport
+  // hand a subscriber a `StreamAssignment.handler_ref` for a transport
   // that will never carry that stream. So MC IS REQUIRED to defend against
   // receive-order reordering by retiring such a late Connected (it keeps a
   // bounded set of recently retired `(handler_id, connection_id)` pairs and
