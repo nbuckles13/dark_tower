@@ -131,23 +131,39 @@ impl HandedOutBindings {
         present: &HashSet<&str>,
         before: tokio::time::Instant,
     ) -> Vec<String> {
-        let doomed: Vec<(String, String)> = self
+        self.release_where(handler, |conn, recorded_at| {
+            crate::media_routing::retirable(recorded_at, before, present.contains(conn))
+        })
+    }
+
+    /// Bulk-release EVERY entry of a handler REMOVED from the meeting
+    /// (ADR-0039 §6), called only after the set without it was pushed to the
+    /// clients. Its `Disconnected`s will never be honoured (the binding gate
+    /// refuses a non-member), so without this the entries leak. Like every
+    /// release, it only forgets the entry: the ids are NOT returned to the
+    /// allocator — `SenderIdAllocator` never reissues within a KEK generation
+    /// (R-35); they are reclaimed only by an `AdmissionEpoch` reset. Returns
+    /// the released connection ids.
+    pub fn release_handler(&mut self, handler: &str) -> Vec<String> {
+        self.release_where(handler, |_, _| true)
+    }
+
+    /// The ONE release kernel: forget `handler`'s entries `doomed` selects.
+    fn release_where(
+        &mut self,
+        handler: &str,
+        doomed: impl Fn(&str, tokio::time::Instant) -> bool,
+    ) -> Vec<String> {
+        let keys: Vec<(String, String)> = self
             .by_connection
             .iter()
-            .filter(|((h, conn), (_, recorded_at))| {
-                h == handler
-                    && crate::media_routing::retirable(
-                        *recorded_at,
-                        before,
-                        present.contains(conn.as_str()),
-                    )
-            })
+            .filter(|((h, conn), (_, recorded_at))| h == handler && doomed(conn, *recorded_at))
             .map(|(k, _)| k.clone())
             .collect();
-        for k in &doomed {
+        for k in &keys {
             self.by_connection.remove(k);
         }
-        doomed.into_iter().map(|(_, conn)| conn).collect()
+        keys.into_iter().map(|(_, conn)| conn).collect()
     }
 
     /// Whether `(handler, connection_id)` is held (test and diagnostics view).
@@ -367,6 +383,25 @@ mod tests {
         let mut alloc = SenderIdAllocator::new();
         while alloc.allocate().is_ok() {}
         AdmissionEpoch::with_allocator(MeetingKeyState::generate(rng).unwrap(), alloc)
+    }
+
+    /// The bulk release of a REMOVED handler forgets exactly its entries (a
+    /// colliding connection id under another handler is kept), and like every
+    /// release returns nothing to the allocator.
+    #[test]
+    fn release_handler_forgets_only_that_handlers_entries() {
+        let t = tokio::time::Instant::now();
+        let mut b = HandedOutBindings::default();
+        b.record("mh-0", "K", id(1), t);
+        b.record("mh-0", "K2", id(2), t);
+        b.record("mh-1", "K", id(3), t);
+        let mut released = b.release_handler("mh-0");
+        released.sort();
+        assert_eq!(released, vec!["K", "K2"]);
+        assert!(b.connections_of("mh-0").is_empty());
+        assert_eq!(b.connections_of("mh-1"), vec!["K"]);
+        assert_eq!(b.held().collect::<Vec<_>>(), vec![id(3)]);
+        assert!(b.release_handler("mh-0").is_empty(), "idempotent");
     }
 
     #[test]

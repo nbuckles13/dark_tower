@@ -19,6 +19,7 @@ pub mod mh_close;
 pub mod mh_config;
 pub mod mh_grpc;
 pub mod mh_pool;
+pub mod owned_placement;
 pub mod participant;
 pub mod video;
 

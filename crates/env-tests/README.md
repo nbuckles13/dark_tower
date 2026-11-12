@@ -69,6 +69,7 @@ crates/env-tests/
 │   │   ├── gc_fleet.rs     # live GC replica set, GC config-key mirrors (drift-tested)
 │   │   ├── mh_pool.rs      # THE MH pool fixture (T-1): MhPool/MhSlot/FreezeGuard over `mh.sh` (up, drain, signal KILL/STOP/CONT, baseline, owner teardown)
 │   │   ├── mh_address.rs   # R-28 address invariant: pure verdict + `assert_addresses_unique()` live gather
+│   │   ├── owned_placement.rs # Bounded, derived search placing a meeting on a run-owned MH (`owned-mh-not-placed`)
 │   │   └── metrics.rs      # Prometheus queries
 │   ├── canary.rs           # NetworkPolicy test pods (image = mh.sh MH_DEBUG_IMAGE)
 │   └── resilience_hygiene.rs # Layer-4 checks: every test in a pool-mutating binary is #[serial]; no MH pod-delete/force path
@@ -78,7 +79,7 @@ crates/env-tests/
     ├── 20_auth_flows.rs       # P1 auth flow tests
     ├── 25_auth_security.rs    # P1 security tests
     ├── 30_observability.rs    # P1 observability tests
-    ├── 40_resilience.rs       # Resilience: NetworkPolicy canaries + MH pool/injector legs (EVERY test #[serial])
+    ├── 40_resilience.rs       # Resilience: NetworkPolicy canaries + MH pool/injector legs + MC-B2 crash-to-survivor and zombie legs (EVERY test #[serial])
     ├── 41_gate_zero_hostport_policy.rs # Gate zero: MH policy on the UDP hostPort DNAT path (own binary)
     ├── 42_mh_address_invariant.rs # R-28: every live MH pod advertises its own unique slot address (needs DT_MH_SH)
     ├── 43_mh_slot_publish_udp.rs  # R-27: host-published UDP reaches each serving slot's own MH (own binary)

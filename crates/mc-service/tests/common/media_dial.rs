@@ -93,6 +93,9 @@ pub async fn join(
     id: &str,
     mh: &Arc<MockMhRegistrationClient>,
 ) -> Joined {
+    // A live (MH-2+) fake: it heartbeats what it acks, so the meeting's
+    // handlers are not declared Dead while the suite walks TTLs.
+    mh.heartbeat_to_meeting(handle);
     let (tx, rx) = mpsc::channel::<bytes::Bytes>(512);
     let h = handle.clone();
     let pid = id.to_string();
@@ -115,15 +118,12 @@ pub async fn join(
     Joined { result, rx }
 }
 
-/// Let every runnable task run WITHOUT advancing paused time.
-pub async fn run_ready() {
-    for _ in 0..200 {
-        tokio::task::yield_now().await;
-    }
-}
+pub use super::run_ready;
 
+/// Advance paused time continuously ([`super::advance_live`]), then let
+/// every runnable task run.
 pub async fn advance(d: Duration) {
-    tokio::time::advance(d).await;
+    super::advance_live(d).await;
     run_ready().await;
 }
 

@@ -20,7 +20,7 @@ use crate::errors::McError;
 use crate::media_routing::PolicyGenerations;
 
 use super::meeting::{MeetingActor, MeetingActorHandle, MeetingWiring};
-use super::meeting_media::MutedSourceCensus;
+use super::meeting_media::{HandlerlessCensus, MutedSourceCensus};
 use super::messages::{
     ControllerMessage, ControllerStatus, JoinResult, MeetingEndCause, MeetingInfo,
     MeetingLifecycleEvent, MeetingLifecycleSink,
@@ -414,6 +414,8 @@ pub struct MeetingControllerActor {
     tearing_down: HashMap<String, TeardownFence>,
     /// The pod's server-mute census, recomputed on every health walk.
     muted_census: Arc<MutedSourceCensus>,
+    /// The pod's awaiting-handler census, recomputed on every health walk.
+    handlerless_census: Arc<HandlerlessCensus>,
     /// Told when a meeting has ended and its handlers are released.
     meeting_ended: Arc<dyn MeetingEndedNotifier>,
     /// In-flight teardowns, handed to every meeting actor's wiring.
@@ -529,6 +531,7 @@ impl MeetingControllerActor {
             lifecycle_rx,
             tearing_down: HashMap::new(),
             muted_census: Arc::new(MutedSourceCensus::default()),
+            handlerless_census: Arc::new(HandlerlessCensus::default()),
             meeting_ended: Arc::new(NoMeetingEndedNotifier),
             teardowns: Arc::default(),
             shutdown_waiter: None,
@@ -799,6 +802,7 @@ impl MeetingControllerActor {
         let wiring = MeetingWiring {
             lifecycle: self.lifecycle_tx.clone(),
             muted_census: Arc::clone(&self.muted_census),
+            handlerless_census: Arc::clone(&self.handlerless_census),
             teardowns: Arc::clone(&self.teardowns),
         };
         #[cfg(feature = "test-seams")]
@@ -1171,6 +1175,12 @@ impl MeetingControllerActor {
         let meetings = &self.meetings;
         self.muted_census.retain(|id| meetings.contains_key(id));
         self.muted_census.publish();
+        // The same LOAD-BEARING prune-and-publish for
+        // `mc_media_meetings_without_handlers` (story 4 MC-B2): a meeting left
+        // with no handler whose actor then died must not page forever.
+        self.handlerless_census
+            .retain(|id| meetings.contains_key(id));
+        self.handlerless_census.publish();
     }
 
     /// Park `create` behind `meeting_id`'s teardown fence (the caller has

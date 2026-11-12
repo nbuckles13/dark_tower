@@ -100,10 +100,11 @@ use crate::media_routing::pusher::{
     HandlerRegistration, RegistrationOutcome, RegistrationReporter,
 };
 use crate::media_routing::{
-    Acceptance, ClientHandlerSet, ConnectionKey, HandlerHeartbeat, HandlerId, HandlerLiveness,
-    HandlerPusher, HeartbeatAnomaly, MeetingAssignment, MeetingHandlers, Observed,
-    ParticipantConnectivity, PolicyGenerations, PushJob, PushTarget, RemovalTrigger, SlotTable,
-    SourceMute, Unapplied,
+    assess, next_deadline, Acceptance, ClientHandlerSet, ConnectionKey, HandlerEndpoint,
+    HandlerHealth, HandlerHeartbeat, HandlerId, HandlerLiveness, HandlerPusher, HealthConfig,
+    HeartbeatAnomaly, MeetingAssignment, MeetingHandlers, Observations, Observed,
+    ParticipantConnectivity, PolicyGenerations, PushJob, PushTarget, RefusalClass, RemovalTrigger,
+    SetChange, SlotTable, SourceMute, Unapplied, WorkerDrain,
 };
 use crate::media_signaling::{
     build_send_directive, build_stream_assignments, DirectiveOutcome, MediaKindLabel,
@@ -172,13 +173,12 @@ impl std::fmt::Debug for MediaRoutingDeps {
     }
 }
 
-/// The pod's census of server-muted participants, per meeting — the source
-/// `mc_media_server_muted_sources` is recomputed from (story 2 task 12; closes
-/// the "server mute is never observable as STATE" gap).
+/// A pod census keyed by meeting id: each meeting actor writes its ABSOLUTE
+/// value, and the pod total is recomputed from the census and SET, never
+/// moved by deltas (story 2 task 12's design, generalised for story 4 MC-B2).
 ///
 /// # Recompute-and-set, never delta arithmetic
 ///
-/// Each meeting actor writes its own ABSOLUTE count here on every mute change.
 /// Nothing ever adds or subtracts, so there is no increment that can be
 /// doubled and no exit-path decrement that an aborted actor can skip.
 ///
@@ -187,35 +187,27 @@ impl std::fmt::Debug for MediaRoutingDeps {
 ///   prunes entries for meetings that no longer exist (a panicked actor never
 ///   reaches its own exit path) and re-sets the gauge, so any drift is erased on
 ///   the next pass;
-/// - each mute change also publishes, but that is FRESHNESS ONLY.
+/// - each change in the meeting also publishes, but that is FRESHNESS ONLY.
 ///
 /// Delete the second and the gauge is stale but correct. Delete the first and
-/// the drift class this design exists to prevent comes back — silently, and in
-/// the one gauge whose job is to be read against MH's `server_muted` drops.
+/// the drift class this design exists to prevent comes back — silently.
 ///
-/// # Per (meeting, kind) — story 3 OBS-A
-///
-/// Each meeting holds one count PER KIND, a `[u64; 2]` indexed by
-/// [`MediaKindLabel::index`] (built with [`MediaKindLabel::per_kind`]). The map key is the meeting id ONLY — never a
-/// participant or sender id. [`Self::publish`] sets EVERY kind in
-/// [`MediaKindLabel::ALL`] on every call, zero included: setting only the kinds
-/// present in the map would leave the video gauge stuck at its last non-zero
-/// value after the last video-muted meeting ends — exactly the drift this
-/// recompute design exists to prevent.
+/// The map key is the meeting id ONLY — never a participant, sender or
+/// handler id. A value equal to `V::default()` FORGETS the meeting (so a
+/// meeting at zero holds no entry).
 #[derive(Debug, Default)]
-pub struct MutedSourceCensus {
-    counts: std::sync::Mutex<HashMap<String, [u64; 2]>>,
+pub struct MeetingCensus<V> {
+    entries: std::sync::Mutex<HashMap<String, V>>,
 }
 
-impl MutedSourceCensus {
-    /// Record `meeting_id`'s absolute per-kind server-muted counts, indexed by
-    /// [`MediaKindLabel::index`] (all-zero forgets it).
-    pub fn set(&self, meeting_id: &str, counts_by_kind: [u64; 2]) {
-        let mut counts = self.lock();
-        if counts_by_kind == [0; 2] {
-            counts.remove(meeting_id);
+impl<V: Copy + Default + PartialEq> MeetingCensus<V> {
+    /// Record `meeting_id`'s absolute value (the default forgets it).
+    pub fn set(&self, meeting_id: &str, value: V) {
+        let mut entries = self.lock();
+        if value == V::default() {
+            entries.remove(meeting_id);
         } else {
-            counts.insert(meeting_id.to_string(), counts_by_kind);
+            entries.insert(meeting_id.to_string(), value);
         }
     }
 
@@ -224,6 +216,39 @@ impl MutedSourceCensus {
         self.lock().retain(|id, _| live(id));
     }
 
+    /// Fold every recorded value (the pod total a `publish` sets).
+    fn fold<T>(&self, init: T, f: impl Fn(T, &V) -> T) -> T {
+        self.lock().values().fold(init, f)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, V>> {
+        // A poisoned census still holds valid values (every write is a single
+        // insert or remove), so recover rather than propagate a panic into
+        // every meeting that writes it.
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The pod's census of server-muted participants, per meeting — the source
+/// `mc_media_server_muted_sources` is recomputed from (story 2 task 12; closes
+/// the "server mute is never observable as STATE" gap). Freshness writes come
+/// from every mute change; the gauge is the one read against MH's
+/// `server_muted` drops.
+///
+/// # Per (meeting, kind) — story 3 OBS-A
+///
+/// Each meeting holds one count PER KIND, a `[u64; 2]` indexed by
+/// [`MediaKindLabel::index`] (built with [`MediaKindLabel::per_kind`]).
+/// [`MeetingCensus::publish`] sets EVERY kind in [`MediaKindLabel::ALL`] on
+/// every call, zero included: setting only the kinds present in the map would
+/// leave the video gauge stuck at its last non-zero value after the last
+/// video-muted meeting ends — exactly the drift this recompute design exists
+/// to prevent.
+pub type MutedSourceCensus = MeetingCensus<[u64; 2]>;
+
+impl MeetingCensus<[u64; 2]> {
     /// Recompute the pod total PER KIND from the census and publish every kind.
     pub fn publish(&self) {
         let totals = self.totals();
@@ -234,21 +259,27 @@ impl MutedSourceCensus {
 
     /// The pod totals per kind, indexed by [`MediaKindLabel::index`].
     fn totals(&self) -> [u64; 2] {
-        let census = self.lock();
-        MediaKindLabel::per_kind(|k| {
-            census
-                .values()
-                .fold(0u64, |t, c| t.saturating_add(k.of(*c)))
-        })
+        MediaKindLabel::per_kind(|k| self.fold(0u64, |t, c| t.saturating_add(k.of(*c))))
     }
+}
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, [u64; 2]>> {
-        // A poisoned census still holds valid counts (every write is a single
-        // insert or remove), so recover rather than propagate a panic into
-        // every meeting that mutes.
-        self.counts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// The pod's census of meetings whose handler set has NO member — "awaiting
+/// handler" (ADR-0039 §3) — the source `mc_media_meetings_without_handlers` is
+/// recomputed from. `true` = the meeting's set is empty. A meeting whose only
+/// members are still Registering does NOT count (a handler is on its way).
+/// Freshness writes come from every handler-set membership change.
+pub type HandlerlessCensus = MeetingCensus<bool>;
+
+impl MeetingCensus<bool> {
+    /// Recompute the pod count from the census and publish it.
+    pub fn publish(&self) {
+        metrics::set_meetings_without_handlers(self.fold(0u64, |n, empty| {
+            if *empty {
+                n.saturating_add(1)
+            } else {
+                n
+            }
+        }));
     }
 }
 
@@ -405,6 +436,32 @@ struct View {
     last_assignments: Option<StreamAssignments>,
 }
 
+/// One assessment of one member: the actor acts only when `previous` and
+/// `next` differ.
+pub(super) struct HealthStep {
+    /// The member.
+    pub handler_id: HandlerId,
+    /// Its health before.
+    pub previous: HandlerHealth,
+    /// Its health now.
+    pub next: HandlerHealth,
+    /// What it was judged on (bounded scalars for the transition log).
+    pub observations: Observations,
+}
+
+/// What [`MeetingMedia::remove_handler`] took out of the meeting.
+pub(super) struct RemovedHandler {
+    /// The removed handler (for its `EndMeeting`).
+    pub endpoint: HandlerEndpoint,
+    /// The set change (new version; whether the client-visible set changed).
+    pub set_change: SetChange,
+    /// Its push worker, moved OUT so the release can drain exactly this one.
+    /// Load-bearing for the ordering: no render can publish to it any more.
+    pub pusher: Option<HandlerPusher>,
+    /// Connectivity keys purged across all participants.
+    pub forgotten_keys: usize,
+}
+
 /// The meeting actor's media state.
 pub(super) struct MeetingMedia {
     meeting_id: String,
@@ -445,6 +502,13 @@ pub(super) struct MeetingMedia {
     /// An entry exists only for a member, and [`Self::remove_handler`] (the
     /// ONE removal path) drops it with the member.
     liveness: BTreeMap<HandlerId, HandlerLiveness>,
+    /// Per-handler health (ADR-0039 §2), beside the liveness record and
+    /// dropped with it by [`Self::remove_handler`]. Absent = Live/healthy.
+    health: BTreeMap<HandlerId, HandlerHealth>,
+    /// In-flight handler-removal releases (`teardown::release_removed`),
+    /// handed to the meeting's teardown so its fence covers them. Bounded by
+    /// the meeting's removed set (removal is one-way), so never pruned.
+    removals: Vec<tokio::task::JoinHandle<()>>,
     /// Non-member handler ids whose RELEASED verdict was already WARNed
     /// (bounded; dropped with the meeting).
     release_noticed: BTreeSet<String>,
@@ -475,6 +539,8 @@ impl MeetingMedia {
             flush_batch: SLOT_VIEW_FLUSH_BATCH,
             assignment: None,
             liveness: BTreeMap::new(),
+            health: BTreeMap::new(),
+            removals: Vec::new(),
             release_noticed: BTreeSet::new(),
             media_dial_public_key,
         }
@@ -561,9 +627,12 @@ impl MeetingMedia {
         if report.outcome != RegistrationOutcome::Registered {
             return false;
         }
+        // The first confirmation: the origin of the health function's silence
+        // clock (stamped at the actor — later than the worker's ack, so it
+        // errs toward a later Dead, never an earlier one).
         match self
             .handlers
-            .mark_active(&report.handler_id, report.handler_ref)
+            .mark_active(&report.handler_id, report.handler_ref, Instant::now())
         {
             Ok(Some(change)) => {
                 info!(
@@ -753,31 +822,130 @@ impl MeetingMedia {
 
     /// Record a heartbeat from a MEMBER as liveness (ADR-0039 §2): the first
     /// one creates the pair's record; later ones are accepted iff not stale.
+    /// The watermark is clamped to `sent` (an ahead heartbeat is liveness,
+    /// never a poisoned watermark).
     /// `member` was resolved by `MeetingHandlers::heartbeat_member`, so this
-    /// cannot miss. Also notes this heartbeat's anomalies and returns the ones
-    /// that are NEW for the pair (the only ones logged).
+    /// cannot miss. Anomalies are noted separately ([`Self::note_anomalies`]),
+    /// after the record exists.
     pub(super) fn observe_heartbeat(
         &mut self,
         member: &HandlerId,
         heartbeat: &HandlerHeartbeat,
         receipt: Instant,
-        anomalies: &[HeartbeatAnomaly],
-    ) -> (Observed, Vec<HeartbeatAnomaly>) {
-        let (observed, record) = match self.liveness.entry(member.clone()) {
+        sent: Option<NonZeroU64>,
+    ) -> Observed {
+        match self.liveness.entry(member.clone()) {
             std::collections::btree_map::Entry::Occupied(entry) => {
-                let record = entry.into_mut();
-                (record.observe(heartbeat, receipt), record)
+                entry.into_mut().observe(heartbeat, receipt, sent)
             }
-            std::collections::btree_map::Entry::Vacant(entry) => (
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(HandlerLiveness::first(heartbeat, receipt, sent));
                 Observed {
                     acceptance: Acceptance::Accepted { previous: None },
                     transition: true,
-                },
-                entry.insert(HandlerLiveness::first(heartbeat, receipt)),
-            ),
-        };
-        let fresh = record.note_anomalies(anomalies);
-        (observed, fresh)
+                }
+            }
+        }
+    }
+
+    /// The contract fault a member's RECORDED evidence carries right now,
+    /// through the ONE refusal gate (`Observations::effective_refusal`): a
+    /// refusal with MC's policy installed concerns a policy MC never sent and
+    /// is no contract fault.
+    pub(super) fn contract_fault_now(
+        &self,
+        member: &HandlerId,
+    ) -> Option<crate::media_routing::handler_health::ContractFault> {
+        self.observations(member)
+            .effective_refusal()
+            .contract_fault()
+    }
+
+    /// Note this heartbeat's anomalies on the member's record; returns those
+    /// NEW for the pair (the only ones logged).
+    pub(super) fn note_anomalies(
+        &mut self,
+        member: &HandlerId,
+        anomalies: &[HeartbeatAnomaly],
+    ) -> Vec<HeartbeatAnomaly> {
+        self.liveness
+            .get_mut(member)
+            .map_or_else(Vec::new, |record| record.note_anomalies(anomalies))
+    }
+
+    /// The spans `assess` judges against, once a join installed the deps.
+    fn health_config(&self) -> Option<HealthConfig> {
+        self.deps
+            .as_ref()
+            .map(|d| HealthConfig::from_timing(d.heartbeat))
+    }
+
+    /// What the actor knows about one member, for `assess`.
+    fn observations(&self, id: &HandlerId) -> Observations {
+        let record = self.liveness.get(id);
+        Observations {
+            confirmed_at: self.handlers.confirmed_at(id),
+            last_accepted: record.map(|l| l.last_accepted),
+            applied: record.map(|l| l.applied_generation),
+            owed: record.and_then(|l| l.owed_generation),
+            refusal: record.map_or(RefusalClass::None, |l| {
+                RefusalClass::from_wire(l.apply_refusal)
+            }),
+            draining: record.is_some_and(|l| {
+                crate::media_routing::handler_health::is_draining(l.serving_state)
+            }),
+            // Weight 0 in this story: MC-E wires the client loss census here.
+            client_loss_reports: 0,
+        }
+    }
+
+    /// Assess ONE member at `now` and store the result. `None` for a
+    /// non-member, or before a join installed the deps (nothing confirmed).
+    pub(super) fn assess_handler(&mut self, id: &HandlerId, now: Instant) -> Option<HealthStep> {
+        let cfg = self.health_config()?;
+        self.handlers.get(id)?;
+        let observations = self.observations(id);
+        let previous = self.health.get(id).copied().unwrap_or_default();
+        let next = assess(now, &observations, &previous, &cfg);
+        self.health.insert(id.clone(), next);
+        Some(HealthStep {
+            handler_id: id.clone(),
+            previous,
+            next,
+            observations,
+        })
+    }
+
+    /// Assess every member at `now` (the deadline arm).
+    pub(super) fn assess_all(&mut self, now: Instant) -> Vec<HealthStep> {
+        let ids: Vec<HandlerId> = self.handlers.ids().cloned().collect();
+        ids.iter()
+            .filter_map(|id| self.assess_handler(id, now))
+            .collect()
+    }
+
+    /// The earliest instant any member's health could change without a
+    /// heartbeat — the deadline arm's wake. Every value is strictly after the
+    /// assessment that produced it (`handler_health::expiry`), so a fired
+    /// wake re-arms in the future, never at the instant it fired.
+    pub(super) fn next_health_wake(&self) -> Option<Instant> {
+        let cfg = self.health_config()?;
+        self.handlers
+            .ids()
+            .filter_map(|id| {
+                let health = self.health.get(id).copied().unwrap_or_default();
+                next_deadline(&health, &self.observations(id), &cfg)
+            })
+            .min()
+    }
+
+    /// Re-send a member's CURRENT snapshot to its push worker (the Lagging
+    /// re-publish). A removed handler has no worker here, so this can never
+    /// reach one.
+    pub(super) fn republish(&self, id: &HandlerId) {
+        if let Some(pusher) = self.pushers.get(id) {
+            pusher.republish();
+        }
     }
 
     /// Whether this is the FIRST non-OWNED verdict for `wire_handler_id` in
@@ -799,10 +967,26 @@ impl MeetingMedia {
         self.release_noticed.contains(wire_handler_id)
     }
 
-    /// The liveness record of a member, for MC-B2's `assess()`.
+    /// A member's health state label (test probe). `None` for a non-member.
+    #[cfg(feature = "test-seams")]
+    pub(super) fn health_label(&self, wire_handler_id: &str) -> Option<&'static str> {
+        let id = &self.handlers.resolve(wire_handler_id)?.id;
+        Some(
+            self.health
+                .get(id)
+                .copied()
+                .unwrap_or_default()
+                .state_label(),
+        )
+    }
+
+    /// The liveness record of a member (test probe).
     #[cfg_attr(
         not(feature = "test-seams"),
-        expect(dead_code, reason = "read by MC-B2's assess(); test-seams probe today")
+        expect(
+            dead_code,
+            reason = "test-seams probe only; assess reads the map directly"
+        )
     )]
     pub(super) fn liveness(&self, wire_handler_id: &str) -> Option<&HandlerLiveness> {
         let id = &self.handlers.resolve(wire_handler_id)?.id;
@@ -848,38 +1032,80 @@ impl MeetingMedia {
         (retired, changed)
     }
 
-    /// THE one removal path for a handler (ADR-0039 §6): drops it from the set
-    /// — recorded as removed with its trigger — AND drops its liveness record
-    /// in the same call, so the two cannot drift. Returns whether it was a
-    /// member. Set-only today: the full sequence (push the set, release
-    /// bindings, `EndMeeting`) is MC-B2's, which calls this.
-    #[cfg_attr(
-        not(feature = "test-seams"),
-        expect(dead_code, reason = "MC-B2 removal path; test-seams caller today")
-    )]
+    /// THE one removal path for a handler (ADR-0039 §6, step 1 of the
+    /// removal sequence the meeting actor drives): drops it from the set —
+    /// recorded as removed with its trigger, so the verdict answers RELEASED
+    /// and the binding gate refuses it from this instant — AND in the same
+    /// call drops its liveness and health records, moves its push worker OUT
+    /// (for the caller to drain; never cancelled through the shared token),
+    /// and purges its keys from every participant's connectivity, re-routing
+    /// everyone. `None` if it was not a member (or the set refused).
     pub(super) fn remove_handler(
         &mut self,
         wire_handler_id: &str,
         trigger: RemovalTrigger,
-    ) -> bool {
+        now: Instant,
+    ) -> Option<RemovedHandler> {
         let id = HandlerId::new(wire_handler_id);
-        match self.handlers.remove(&id, trigger) {
-            Ok(Some(_)) => {
-                self.liveness.remove(&id);
-                true
-            }
-            Ok(None) => false,
+        let endpoint = self.handlers.get(&id).cloned()?;
+        let set_change = match self.handlers.remove(&id, trigger) {
+            Ok(Some(change)) => change,
+            Ok(None) => return None,
             Err(e) => {
                 error!(
                     target: "mc.actor.meeting",
                     meeting_id = %self.meeting_id,
                     handler_id = %wire_handler_id,
                     error = %e,
-                    "Handler removal refused; the set is unchanged"
+                    "Handler removal refused; the set is unchanged. MC-internal invariant \
+                     violation: capture and escalate."
                 );
-                false
+                return None;
             }
+        };
+        self.liveness.remove(&id);
+        self.health.remove(&id);
+        let pusher = self.pushers.remove(&id);
+        let mut forgotten = 0usize;
+        for view in self.views.values_mut() {
+            forgotten += view.connectivity.forget_handler(&id).len();
         }
+        // Re-route everyone; the caller re-renders unconditionally (the set
+        // changed even where no participant's routing did).
+        self.reroute_all(now);
+        Some(RemovedHandler {
+            endpoint,
+            set_change,
+            pusher,
+            forgotten_keys: forgotten,
+        })
+    }
+
+    /// Hand a removed handler's release to a task the meeting's teardown will
+    /// await (the fence covers it). `None` before a join installed the deps
+    /// (nothing was ever programmed, so there is nothing to release).
+    pub(super) fn spawn_removal_release(
+        &mut self,
+        endpoint: HandlerEndpoint,
+        trigger: RemovalTrigger,
+        pusher: Option<HandlerPusher>,
+    ) {
+        let Some(deps) = &self.deps else {
+            return;
+        };
+        let pusher = pusher.map_or_else(WorkerDrain::none, HandlerPusher::into_drain);
+        let release = crate::media_routing::teardown::RemovedHandlerRelease {
+            meeting_id: self.meeting_id.clone(),
+            mc_id: deps.mc_id.clone(),
+            removed: endpoint,
+            trigger,
+            pusher,
+            mh_client: Arc::clone(&deps.mh_client),
+            policy_generations: Arc::clone(&deps.policy_generations),
+        };
+        self.removals.push(tokio::spawn(
+            crate::media_routing::teardown::release_removed(release),
+        ));
     }
 
     /// `(participant_id, connection_id)` live keys on one handler (sorted).
@@ -967,7 +1193,9 @@ impl MeetingMedia {
             .into_values()
             .filter_map(HandlerPusher::into_task)
             .collect();
+        let removals = std::mem::take(&mut self.removals);
         Some(crate::media_routing::teardown::MediaTeardown {
+            removals,
             meeting_id: self.meeting_id.clone(),
             mc_id: deps.mc_id.clone(),
             handlers: handlers.clone(),
@@ -1555,6 +1783,35 @@ mod census_tests {
         census.publish();
         snap.gauge("mc_media_server_muted_sources")
             .with_labels(&[(MEDIA_KIND_LABEL, "audio")])
+            .assert_value(0.0);
+    }
+
+    /// The awaiting-handler census: recompute-and-set, `false` forgets, and
+    /// the health walk's prune re-sets it to 0 when the meeting is gone.
+    #[test]
+    fn handlerless_census_counts_meetings_with_an_empty_set_and_prunes() {
+        let census = HandlerlessCensus::default();
+        let snap = MetricAssertion::snapshot();
+        let kc = (
+            common::observability::labels::KEY_CUSTODY_LABEL,
+            common::observability::labels::KEY_CUSTODY_OPERATOR,
+        );
+        census.set("m-1", true);
+        census.set("m-2", true);
+        census.set("m-3", false);
+        census.publish();
+        snap.gauge("mc_media_meetings_without_handlers")
+            .with_labels(&[kc])
+            .assert_value(2.0);
+        census.set("m-2", false);
+        census.publish();
+        snap.gauge("mc_media_meetings_without_handlers")
+            .with_labels(&[kc])
+            .assert_value(1.0);
+        census.retain(|id| id != "m-1"); // the actor died without clearing
+        census.publish();
+        snap.gauge("mc_media_meetings_without_handlers")
+            .with_labels(&[kc])
             .assert_value(0.0);
     }
 }

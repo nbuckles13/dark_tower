@@ -1182,6 +1182,52 @@ pub async fn poll_until_pinned_instance(
 /// # Panics
 /// PRECONDITION if no MC pod serves or the gauge is absent or not positive.
 pub async fn mc_heartbeat_interval(prom: &PrometheusClient) -> Duration {
+    heartbeat_interval_of(mc_heartbeat_deadline(prom).await)
+}
+
+/// PURE: Σ over `pods` of each one's pinned value in `map` (a counter EVENT
+/// summed across replicas: each event lands on exactly one). A pod with no
+/// series is a PRESENCE failure, never a zero, so a missing replica cannot
+/// shrink a delta. Hoisted from `tests/44_gc_mh_registration.rs` when the
+/// MC-B2 crash leg (`tests/40_resilience.rs`) became its second consumer.
+///
+/// # Panics
+/// A pod in `pods` has no series in `map`; `context` leads the message.
+#[must_use]
+pub fn sum_over_pods(map: &InstanceCounters, pods: &[LivePod], promql: &str, context: &str) -> f64 {
+    pods.iter()
+        .map(|p| {
+            instance_for_pod_ip(map, &p.ip)
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{context}: `{promql}` has no series for pod {} ({}); instances {}",
+                        p.name,
+                        p.ip,
+                        format_instance_map(map)
+                    )
+                })
+        })
+        .sum()
+}
+
+/// PURE: MC's heartbeat interval for deadline `n`: floor(N/3) in ms, minimum
+/// 1 ms (`HeartbeatTiming`; restated, see [`mc_heartbeat_interval`]).
+#[must_use]
+pub fn heartbeat_interval_of(n: Duration) -> Duration {
+    let n_ms = n.as_millis();
+    Duration::from_millis(u64::try_from(n_ms / 3).unwrap_or(u64::MAX).max(1))
+}
+
+/// THE env-test read of MC's heartbeat deadline N
+/// (`mc_media_handler_heartbeat_deadline_seconds`), the ONE input every
+/// detection wait derives from: the largest value across the live MC pods
+/// (so a bound built on it covers the slowest). Never a literal or a config
+/// file read.
+///
+/// # Panics
+/// PRECONDITION if no MC pod serves or the gauge is absent or not positive.
+pub async fn mc_heartbeat_deadline(prom: &PrometheusClient) -> Duration {
     let (_, mc_pods) = crate::fixtures::kube::settled_serving_pods(
         "app=mc-service",
         Duration::from_secs(60),
@@ -1201,8 +1247,7 @@ pub async fn mc_heartbeat_interval(prom: &PrometheusClient) -> Duration {
         n_seconds > 0.0,
         "PRECONDITION: MC publishes mc_media_handler_heartbeat_deadline_seconds > 0 (got {n_seconds})"
     );
-    let n_ms = (n_seconds * 1000.0).round();
-    Duration::from_millis(((n_ms / 3.0).floor()).max(1.0) as u64)
+    Duration::from_millis((n_seconds * 1000.0).round() as u64)
 }
 
 /// Failure bound for a settled per-pod baseline ([`settled_baseline`]): two
@@ -1682,6 +1727,22 @@ mod tests {
             distinct_pod_ips(&[pod("mh-a", "10.0.0.1"), pod("mh-b", "10.0.0.1")])
                 .unwrap_err()
                 .contains("only 1 distinct pod IP")
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_is_floor_n_over_three_with_a_one_ms_floor() {
+        assert_eq!(
+            heartbeat_interval_of(Duration::from_millis(6000)),
+            Duration::from_millis(2000)
+        );
+        assert_eq!(
+            heartbeat_interval_of(Duration::from_millis(1000)),
+            Duration::from_millis(333)
+        );
+        assert_eq!(
+            heartbeat_interval_of(Duration::from_millis(2)),
+            Duration::from_millis(1)
         );
     }
 }

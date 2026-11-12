@@ -251,6 +251,11 @@ impl Drop for RegistrationReporter {
 ///   and re-create the ended meeting.
 pub struct HandlerPusher {
     jobs: watch::Sender<Option<PushJob>>,
+    /// THIS worker's own token — a child of the meeting's `pushers_cancel`,
+    /// created at spawn — so ONE handler's worker can be drained on its
+    /// removal (ADR-0039 §6) without touching the survivors', while a meeting
+    /// teardown's cancel of the parent still reaches every worker.
+    cancel: CancellationToken,
     /// `Some` until [`Self::into_task`] takes it; `Drop` aborts only what is
     /// still here, which is what makes a drained worker un-abortable.
     task: Option<JoinHandle<()>>,
@@ -267,9 +272,10 @@ impl HandlerPusher {
             meeting_id = %target.meeting_id,
             mh_grpc_endpoint = %target.handler.grpc_endpoint,
         );
-        let task = tokio::spawn(run(target, rx, cancel).instrument(span));
+        let task = tokio::spawn(run(target, rx, cancel.clone()).instrument(span));
         Self {
             jobs,
+            cancel,
             task: Some(task),
         }
     }
@@ -278,6 +284,17 @@ impl HandlerPusher {
     /// value equals the last one — that is what re-sends an unconfirmed push.
     pub fn publish(&self, job: PushJob) {
         self.jobs.send_replace(Some(job));
+    }
+
+    /// Re-send the CURRENT snapshot (ADR-0039 §2: "while Lagging, MC
+    /// re-publishes the current snapshot to that handler's push worker").
+    /// Wakes the worker through the same watch as [`Self::publish`] with the
+    /// job it already holds — no new render, no new generation — so an
+    /// unconfirmed push is retried. A push already confirmed at that
+    /// generation stays a no-op (the worker's dedupe). Nothing happens before
+    /// the first publish.
+    pub fn republish(&self) {
+        self.jobs.send_if_modified(|job| job.is_some());
     }
 
     /// Has the worker exited?
@@ -298,6 +315,37 @@ impl HandlerPusher {
     #[must_use]
     pub fn into_task(mut self) -> Option<JoinHandle<()>> {
         self.task.take()
+    }
+
+    /// Hand this ONE worker to a drain (handler removal, ADR-0039 §6): its
+    /// own token and its task, for `teardown::quiesce` to cancel and AWAIT.
+    /// Like [`Self::into_task`], the returned task is never aborted.
+    #[must_use]
+    pub fn into_drain(mut self) -> WorkerDrain {
+        WorkerDrain {
+            cancel: self.cancel.clone(),
+            task: self.task.take(),
+        }
+    }
+}
+
+/// One push worker handed to a drain ([`HandlerPusher::into_drain`]).
+#[derive(Debug)]
+pub struct WorkerDrain {
+    /// The worker's own token (a child of the meeting's).
+    pub cancel: CancellationToken,
+    /// Its task; `None` if it had no worker.
+    pub task: Option<JoinHandle<()>>,
+}
+
+impl WorkerDrain {
+    /// A drain with no worker (a removed handler that was never pushed to).
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            task: None,
+        }
     }
 }
 
@@ -737,6 +785,59 @@ mod tests {
             out.push(report.outcome);
         }
         out
+    }
+
+    /// `republish` re-sends the CURRENT job: a push that failed (unconfirmed)
+    /// is retried at the SAME generation with no new publish; a confirmed one
+    /// stays a no-op; nothing happens before the first publish.
+    #[tokio::test(start_paused = true)]
+    async fn republish_retries_an_unconfirmed_push_and_is_a_no_op_once_confirmed() {
+        let down = || Err(McError::Grpc("down".into()));
+        let mh = ScriptedMh::new(vec![down(), down(), down(), Ok(())]);
+        let pusher = HandlerPusher::spawn(
+            target(Arc::clone(&mh), Arc::default()),
+            CancellationToken::new(),
+        );
+        pusher.republish();
+        settle().await;
+        assert!(mh.sent().is_empty(), "nothing to re-send before a publish");
+        pusher.publish(job(1));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(mh.sent(), vec![1, 1, 1], "retries exhausted, unconfirmed");
+        pusher.republish();
+        settle().await;
+        assert_eq!(
+            mh.sent(),
+            vec![1, 1, 1, 1],
+            "re-sent at the same generation"
+        );
+        pusher.republish();
+        settle().await;
+        assert_eq!(mh.sent().len(), 4, "confirmed: a republish is a no-op");
+    }
+
+    /// `into_drain` hands out THIS worker's own token: cancelling it stops
+    /// this worker and no other (the per-handler drain on removal).
+    #[tokio::test(start_paused = true)]
+    async fn a_drained_worker_is_cancelled_alone() {
+        let parent = CancellationToken::new();
+        let mh = ScriptedMh::new(vec![]);
+        let one = HandlerPusher::spawn(
+            target(Arc::clone(&mh), Arc::default()),
+            parent.child_token(),
+        );
+        let other = HandlerPusher::spawn(
+            target(Arc::clone(&mh), Arc::default()),
+            parent.child_token(),
+        );
+        let drain = one.into_drain();
+        drain.cancel.cancel();
+        drain.task.unwrap().await.unwrap();
+        settle().await;
+        assert!(!other.is_finished(), "the survivor's worker runs on");
+        parent.cancel();
+        settle().await;
+        assert!(other.is_finished(), "the meeting's token still reaches it");
     }
 
     /// Registered on the first confirm only; nothing on later confirms, and

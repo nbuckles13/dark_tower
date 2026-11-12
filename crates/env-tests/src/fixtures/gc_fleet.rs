@@ -51,10 +51,10 @@ pub const MH_ENDPOINT_ALLOWLIST_KEYS: [&str; 5] = [
 /// `tests::registry_keys_match_gc_config` reads the reader's source and fails
 /// on drift in either direction.
 pub const MH_REGISTRY_KEYS: [&str; 5] = [
-    "GC_MH_LOAD_REPORT_INTERVAL_MS",
-    "GC_MH_STALENESS_MULTIPLIER",
+    INTERVAL_KEY,
+    MULTIPLIER_KEY,
     "GC_MH_REGISTRY_RETENTION_SECONDS",
-    "GC_MH_INITIAL_HANDLERS_PER_MEETING",
+    INITIAL_HANDLERS_KEY,
     "GC_MH_MAX_EXCLUDE_HANDLER_IDS",
 ];
 
@@ -62,6 +62,8 @@ pub const MH_REGISTRY_KEYS: [&str; 5] = [
 pub const INTERVAL_KEY: &str = "GC_MH_LOAD_REPORT_INTERVAL_MS";
 /// GC-1's staleness multiplier key: `B = k × I`.
 pub const MULTIPLIER_KEY: &str = "GC_MH_STALENESS_MULTIPLIER";
+/// GC's per-meeting initial handler count key (story 4 MC-B2 placement).
+pub const INITIAL_HANDLERS_KEY: &str = "GC_MH_INITIAL_HANDLERS_PER_MEETING";
 
 /// Margin over the deployed termination grace. After SIGKILL at the end of the
 /// grace, the kubelet still has to report the container gone and the API
@@ -580,6 +582,7 @@ mod tests {
         );
         assert!(MH_REGISTRY_KEYS.contains(&INTERVAL_KEY));
         assert!(MH_REGISTRY_KEYS.contains(&MULTIPLIER_KEY));
+        assert!(MH_REGISTRY_KEYS.contains(&INITIAL_HANDLERS_KEY));
     }
 
     /// Adverse input for the drift check: a reader source missing one key (or

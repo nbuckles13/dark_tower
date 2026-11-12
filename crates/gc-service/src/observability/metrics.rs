@@ -28,7 +28,7 @@
 //! - MC assignment p95 < 20ms
 //! - DB query p99 < 50ms
 
-use common::observability::labels::RemovalTrigger;
+use common::observability::labels::{RemovalTrigger, TRIGGER_LABEL};
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::time::Duration;
@@ -818,7 +818,7 @@ pub fn record_mh_replacement(
         "replacement label combination outside the zero-initialised set"
     );
     counter!("gc_mh_replacement_requests_total",
-        "trigger" => trigger.label(),
+        TRIGGER_LABEL => trigger.label(),
         "outcome" => outcome.label(),
         "gc_view" => gc_view.label()
     )
@@ -1498,7 +1498,7 @@ pub fn zero_initialize_counters() {
         for o in ReplacementOutcome::ALL {
             for v in GcView::ALL {
                 if is_emitted_replacement_combination(t, o, v) {
-                    counter!("gc_mh_replacement_requests_total", "trigger" => t.label(), "outcome" => o.label(), "gc_view" => v.label()).increment(0);
+                    counter!("gc_mh_replacement_requests_total", TRIGGER_LABEL => t.label(), "outcome" => o.label(), "gc_view" => v.label()).increment(0);
                 }
             }
         }

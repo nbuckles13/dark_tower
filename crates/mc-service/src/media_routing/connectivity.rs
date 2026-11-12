@@ -417,6 +417,29 @@ impl ParticipantConnectivity {
             .collect()
     }
 
+    /// Forget EVERYTHING this participant holds for a handler REMOVED from the
+    /// meeting (ADR-0039 §6): its live keys AND its tombstones. Returns the
+    /// forgotten live keys.
+    ///
+    /// Deliberately NOT routed through [`Self::disconnect`]: a disconnect
+    /// writes a tombstone so a late re-Connected of the same key is refused,
+    /// but a removed handler can never be re-admitted (removal is one-way and
+    /// the binding gate refuses it upstream), so a tombstone for it would only
+    /// occupy the bounded ring and evict a SURVIVOR's. Scoped to `handler`
+    /// exactly: a colliding connection id under another handler is untouched.
+    pub fn forget_handler(&mut self, handler: &HandlerId) -> Vec<ConnectionKey> {
+        let forgotten: Vec<ConnectionKey> = self
+            .live
+            .remove(handler)
+            .map(|keys| keys.into_keys().collect())
+            .unwrap_or_default();
+        self.retired.retain(|(h, _)| h != handler);
+        if self.live.is_empty() {
+            self.phase = Phase::NotConnected;
+        }
+        forgotten
+    }
+
     /// The live keys on `handler`, with their bind instants (test and
     /// diagnostics view).
     pub fn keys_on(&self, handler: &HandlerId) -> impl Iterator<Item = (&ConnectionKey, &Instant)> {
@@ -541,6 +564,32 @@ mod tests {
             .map(|r| r.iter().map(ToString::to_string).collect())
     }
 
+    /// Forgetting a REMOVED handler drops its live keys AND its tombstones,
+    /// touches another handler's colliding key not at all, and leaves the
+    /// participant routable over what remains.
+    #[test]
+    fn forget_handler_drops_keys_and_tombstones_of_that_handler_only() {
+        let set = handlers();
+        let t0 = Instant::now();
+        let mut c = ParticipantConnectivity::default();
+        c.connect(&ep(&set, "mh-0"), key("K"), t0, W).unwrap();
+        c.connect(&ep(&set, "mh-0"), key("old"), t0, W).unwrap();
+        c.disconnect(&HandlerId::new("mh-0"), &key("old")).unwrap();
+        c.connect(&ep(&set, "mh-1"), key("K"), t0, W).unwrap();
+        c.poll(t0 + W, 2);
+        let forgotten = c.forget_handler(&HandlerId::new("mh-0"));
+        assert_eq!(forgotten, vec![key("K")]);
+        assert_eq!(
+            c.keys_on(&HandlerId::new("mh-1")).count(),
+            1,
+            "the colliding key on mh-1 is untouched"
+        );
+        assert!(c.retired.iter().all(|(h, _)| h.as_str() != "mh-0"));
+        assert_eq!(ids(&c, &set), Some(vec!["mh-1".to_string()]));
+        assert!(c.forget_handler(&HandlerId::new("mh-1")).len() == 1);
+        assert_eq!(c.phase(), Phase::NotConnected, "nothing left");
+    }
+
     /// Register before token: a connection observed on a handler whose
     /// registration is not yet acked is never routable; once it is Active the
     /// same observation is.
@@ -554,7 +603,8 @@ mod tests {
         assert_eq!(c.poll(t0, 1), Some(SettleOutcome::Complete));
         assert_eq!(ids(&c, &set), None, "Registering: not routable");
         let r = set.handler_ref_of(&HandlerId::new("mh-0")).unwrap();
-        set.mark_active(&HandlerId::new("mh-0"), r).unwrap();
+        set.mark_active(&HandlerId::new("mh-0"), r, tokio::time::Instant::now())
+            .unwrap();
         assert_eq!(ids(&c, &set), Some(vec!["mh-0".into()]), "Active: routable");
     }
 

@@ -1,4 +1,5 @@
-//! Releasing an ended meeting on its media handlers (story 2 R-20; ADR-0036 §7).
+//! Releasing an ended meeting on its media handlers (story 2 R-20; ADR-0036 §7),
+//! and releasing ONE handler removed from a live meeting (ADR-0039 §6).
 //!
 //! # Two different "end meeting"s, named apart
 //!
@@ -37,13 +38,26 @@
 //! until its own restart. That residual is tracked in `docs/TODO.md`, "A
 //! meeting whose MC never sends `EndMeeting` is never reclaimed".
 //!
+//! # Removing one handler is the same kernel, narrowed
+//!
+//! [`release_removed`] drains ONLY the removed handler's push worker (its own
+//! child token) through the same [`quiesce`], then sends ONE `EndMeeting`
+//! carrying the removal trigger ([`end_meeting_removal`]) — never retried: a
+//! lost release is retried by that handler's next heartbeat, answered
+//! RELEASED(trigger) — and then evicts that pair's generations. It runs in its
+//! own task (never in the meeting actor), and the meeting's teardown AWAITS it
+//! ([`MediaTeardown::removals`]) before evicting the meeting, so the
+//! controller's teardown fence covers every `EndMeeting` this meeting ever
+//! sends: a same-id meeting re-created after teardown can never receive a late
+//! removal release or eviction.
+//!
 //! # No key material
 //!
 //! A release carries a meeting id, an MC id and a [`ReleaseCause`]. Nothing
 //! else.
 
 use super::generation::PolicyGenerations;
-use super::placement::MeetingHandlers;
+use super::placement::{HandlerEndpoint, MeetingHandlers, ReleaseCauseExt, RemovalTrigger};
 use crate::grpc::mh_client::{MH_CONNECT_TIMEOUT, MH_RPC_TIMEOUT};
 use crate::grpc::MhRegistrationClient;
 use crate::observability::metrics;
@@ -279,8 +293,9 @@ pub struct Quiesced {
     pub timed_out: bool,
 }
 
-/// How a teardown's drain ended. One increment per MEETING teardown — never
-/// per handler (contrast [`EndMeetingOutcome`], which is per (meeting,
+/// How a drain ended. One increment per MEETING teardown, plus one per
+/// handler REMOVAL (whose drain covers that one handler's worker) — never per
+/// handler of a teardown (contrast [`EndMeetingOutcome`], which is per (meeting,
 /// handler)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuiesceOutcome {
@@ -347,9 +362,11 @@ pub struct EndMeetingCall {
     pub meeting_id: String,
     /// The `mc_id` this MC registered the meeting with.
     pub mc_id: String,
-    /// Why this release happens (`EndMeetingRequest.cause`). Set where the plan
-    /// is built, never at the transport: [`end_meeting_plan`] is meeting
-    /// teardown, so it is always [`ReleaseCause::MeetingEnded`].
+    /// Why this release happens (`EndMeetingRequest.cause`, never
+    /// `UNSPECIFIED`, which MH rejects). Set where the call is built, never at
+    /// the transport: [`end_meeting_plan`] (meeting teardown) always sets
+    /// [`ReleaseCause::MeetingEnded`]; [`end_meeting_removal`] sets the removal
+    /// trigger's projection.
     pub cause: ReleaseCause,
 }
 
@@ -382,6 +399,27 @@ pub fn end_meeting_plan(
             cause: ReleaseCause::MeetingEnded,
         })
         .collect()
+}
+
+/// The ONE `EndMeeting` for a handler REMOVED from a live meeting
+/// (ADR-0039 §6): the same call shape as [`end_meeting_plan`], carrying the
+/// removal trigger's wire cause (`HEARTBEAT_TIMEOUT`, `APPLY_LAG` or
+/// `PLANNED_TRANSFER`). Requires the removed handler's own [`Quiesced`].
+#[must_use]
+pub fn end_meeting_removal(
+    meeting_id: &str,
+    mc_id: &str,
+    removed: &HandlerEndpoint,
+    trigger: RemovalTrigger,
+    _quiesced: &Quiesced,
+) -> EndMeetingCall {
+    EndMeetingCall {
+        handler_id: removed.id.to_string(),
+        mh_grpc_endpoint: removed.grpc_endpoint.clone(),
+        meeting_id: meeting_id.to_string(),
+        mc_id: mc_id.to_string(),
+        cause: trigger.release_cause(),
+    }
 }
 
 /// Why one `EndMeeting` attempt did not succeed, as classified from MH's reply.
@@ -452,6 +490,18 @@ pub enum EndMeetingOutcome {
 }
 
 impl EndMeetingOutcome {
+    /// The values a handler REMOVAL's single release can produce
+    /// (`mc_media_handler_removal_releases_total`): every value but
+    /// `superseded_by_successor`, which only a shutdown teardown records.
+    pub const REMOVAL: [Self; 6] = [
+        Self::Released,
+        Self::RejectedOwnership,
+        Self::Unimplemented,
+        Self::UnavailableExhausted,
+        Self::InvalidArgument,
+        Self::Error,
+    ];
+
     /// Every variant, for exhaustive metric-vocabulary tests and zero-init.
     ///
     /// **ADDING A VARIANT IS ALSO AN ALERT EDIT, and nothing in Rust will tell
@@ -495,7 +545,9 @@ impl EndMeetingOutcome {
     fn terminal(kind: EndMeetingFailureKind, reason: TeardownReason) -> Self {
         match kind {
             EndMeetingFailureKind::RejectedOwnership => match reason {
-                TeardownReason::MeetingEnded => Self::RejectedOwnership,
+                TeardownReason::MeetingEnded | TeardownReason::HandlerRemoved => {
+                    Self::RejectedOwnership
+                }
                 TeardownReason::Shutdown => Self::SupersededBySuccessor,
             },
             EndMeetingFailureKind::Unimplemented => Self::Unimplemented,
@@ -515,28 +567,48 @@ pub enum TeardownReason {
     /// MC is shutting down gracefully; a successor MC may already hold the
     /// meeting.
     Shutdown,
+    /// ONE handler was removed from a live meeting (ADR-0039 §6). An ownership
+    /// refusal here is the same MC defect as on [`Self::MeetingEnded`]: the
+    /// meeting is live and this MC owns it.
+    HandlerRemoved,
 }
 
-/// Release one handler, retrying only what the contract says may be retried.
+impl TeardownReason {
+    /// How many `EndMeeting` attempts a release for this reason makes — the
+    /// ONE place that decides it. A removal makes exactly one: it is never
+    /// retried, because the removed handler's next heartbeat is answered
+    /// RELEASED, which is the retry (ADR-0039 §6).
+    #[must_use]
+    pub const fn max_end_meeting_attempts(self) -> u32 {
+        match self {
+            Self::MeetingEnded | Self::Shutdown => MAX_END_MEETING_ATTEMPTS,
+            Self::HandlerRemoved => 1,
+        }
+    }
+}
+
+/// Release one handler, retrying only what the contract says may be retried,
+/// up to [`TeardownReason::max_end_meeting_attempts`].
 async fn release_one(
     mh_client: &dyn MhRegistrationClient,
     call: &EndMeetingCall,
     reason: TeardownReason,
 ) -> EndMeetingOutcome {
+    let max_attempts = reason.max_end_meeting_attempts();
     let mut attempt = 1;
     loop {
         match mh_client.end_meeting(call).await {
             Ok(()) => return EndMeetingOutcome::Released,
             Err(failure) => {
-                let retry = failure.kind == EndMeetingFailureKind::Retryable
-                    && attempt < MAX_END_MEETING_ATTEMPTS;
+                let retry =
+                    failure.kind == EndMeetingFailureKind::Retryable && attempt < max_attempts;
                 if retry {
                     warn!(
                         target: "mc.teardown",
                         meeting_id = %call.meeting_id,
                         mh_id = %call.handler_id,
                         attempt,
-                        max_attempts = MAX_END_MEETING_ATTEMPTS,
+                        max_attempts,
                         detail = %failure.detail,
                         "EndMeeting attempt failed; retrying (a release is idempotent)"
                     );
@@ -545,7 +617,7 @@ async fn release_one(
                     continue;
                 }
                 let outcome = EndMeetingOutcome::terminal(failure.kind, reason);
-                log_release_failure(call, outcome, attempt, &failure.detail);
+                log_release_failure(call, reason, outcome, attempt, &failure.detail);
                 return outcome;
             }
         }
@@ -554,6 +626,7 @@ async fn release_one(
 
 fn log_release_failure(
     call: &EndMeetingCall,
+    reason: TeardownReason,
     outcome: EndMeetingOutcome,
     attempts: u32,
     detail: &str,
@@ -580,6 +653,25 @@ fn log_release_failure(
             "Shutdown release refused: another MC holds this meeting (expected when a successor \
              took it over during a rollout)"
         ),
+        // A removal's release targets a handler MC just declared dead or
+        // impaired: the outcomes a crashed, frozen or old MH produces are
+        // EXPECTED (`removal_failure_is_expected`). Not retried; the handler's
+        // next heartbeat is answered RELEASED(trigger). An ownership refusal or
+        // an invalid argument is NOT a dead-MH symptom — it is an MC defect and
+        // falls through to the ERROR arm.
+        _ if reason == TeardownReason::HandlerRemoved && removal_failure_is_expected(outcome) => {
+            warn!(
+                target: "mc.teardown",
+                meeting_id = %call.meeting_id,
+                mh_id = %call.handler_id,
+                outcome = outcome.label(),
+                cause = call.cause.as_str_name(),
+                attempts,
+                detail = %detail,
+                "EndMeeting for a removed handler failed; not retried (its next heartbeat is answered \
+                 RELEASED, which ends the meeting there)"
+            )
+        }
         _ => error!(
             target: "mc.teardown",
             meeting_id = %call.meeting_id,
@@ -590,6 +682,17 @@ fn log_release_failure(
             "EndMeeting failed; this handler keeps the meeting's routing state and edge budget"
         ),
     }
+}
+
+/// Whether a removal release's failure is what a dead, frozen or old handler
+/// produces (WARN) rather than an MC defect (ERROR).
+const fn removal_failure_is_expected(outcome: EndMeetingOutcome) -> bool {
+    matches!(
+        outcome,
+        EndMeetingOutcome::UnavailableExhausted
+            | EndMeetingOutcome::Error
+            | EndMeetingOutcome::Unimplemented
+    )
 }
 
 /// Everything a meeting's MH-side teardown needs, taken from the meeting actor
@@ -611,6 +714,12 @@ pub struct MediaTeardown {
     pub policy_generations: Arc<PolicyGenerations>,
     /// Why the meeting is being torn down.
     pub reason: TeardownReason,
+    /// In-flight handler-removal releases ([`release_removed`] tasks), AWAITED
+    /// before the meeting's generations are evicted so the teardown fence
+    /// covers them. Bounded by the meeting's removed set (one per removed
+    /// handler); each is bounded by `2 x PUSH_QUIESCE_BOUND` plus one
+    /// `EndMeeting` attempt (`MH_CONNECT_TIMEOUT + MH_RPC_TIMEOUT`).
+    pub removals: Vec<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for MediaTeardown {
@@ -640,6 +749,7 @@ pub async fn run(teardown: MediaTeardown) {
         mh_client,
         policy_generations,
         reason,
+        removals,
     } = teardown;
 
     let quiesced = quiesce(pushers_cancel, pusher_tasks).await;
@@ -675,6 +785,19 @@ pub async fn run(teardown: MediaTeardown) {
         }
     }
 
+    // Removal releases run concurrently with this one (different handlers) but
+    // must END before the meeting's generations go and the fence lifts.
+    for removal in removals {
+        if let Err(join_error) = removal.await {
+            warn!(
+                target: "mc.teardown",
+                meeting_id = %meeting_id,
+                error = %join_error,
+                "A handler-removal release task did not complete; continuing the teardown"
+            );
+        }
+    }
+
     policy_generations.remove_meeting(&meeting_id).await;
 
     info!(
@@ -685,6 +808,71 @@ pub async fn run(teardown: MediaTeardown) {
         failed,
         quiesce_timed_out = quiesced.timed_out,
         "Meeting released on its media handlers"
+    );
+}
+
+/// Everything ONE handler's removal release needs, moved out of the meeting
+/// actor at removal.
+pub struct RemovedHandlerRelease {
+    /// The live meeting.
+    pub meeting_id: String,
+    /// This MC's registering `mc_id`.
+    pub mc_id: String,
+    /// The removed handler.
+    pub removed: HandlerEndpoint,
+    /// Why it was removed (the `EndMeeting` cause).
+    pub trigger: RemovalTrigger,
+    /// Its push worker, handed to the drain (`HandlerPusher::into_drain`).
+    pub pusher: super::pusher::WorkerDrain,
+    /// The registration client.
+    pub mh_client: Arc<dyn MhRegistrationClient>,
+    /// The generation registry (the pair is evicted after the drain).
+    pub policy_generations: Arc<PolicyGenerations>,
+}
+
+impl std::fmt::Debug for RemovedHandlerRelease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemovedHandlerRelease")
+            .field("meeting_id", &self.meeting_id)
+            .field("handler_id", &self.removed.id)
+            .field("trigger", &self.trigger)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Release ONE removed handler (ADR-0039 §6): drain its worker, send one
+/// `EndMeeting(trigger)` (never retried; the outcome counted on
+/// `mc_media_handler_removal_releases_total`, a failure logged), then evict
+/// the pair's generations. Never
+/// blocks removal: the caller has already completed it and spawns this.
+pub async fn release_removed(release: RemovedHandlerRelease) {
+    let RemovedHandlerRelease {
+        meeting_id,
+        mc_id,
+        removed,
+        trigger,
+        pusher: super::pusher::WorkerDrain { cancel, task },
+        mh_client,
+        policy_generations,
+    } = release;
+    let quiesced = quiesce(cancel, task.into_iter().collect()).await;
+    let call = end_meeting_removal(&meeting_id, &mc_id, &removed, trigger, &quiesced);
+    let outcome = release_one(mh_client.as_ref(), &call, TeardownReason::HandlerRemoved).await;
+    // NOT `mc_media_end_meeting_total`: that series (and its failure alert)
+    // means "an ENDED meeting was released"; a removal's release targets a
+    // handler MC just declared dead, so failing is its expected outcome.
+    metrics::record_removal_release(trigger, outcome);
+    policy_generations
+        .remove_pair(&meeting_id, &removed.id)
+        .await;
+    info!(
+        target: "mc.teardown",
+        meeting_id = %meeting_id,
+        handler_id = %removed.id,
+        trigger = trigger.label(),
+        outcome = outcome.label(),
+        quiesce_timed_out = quiesced.timed_out,
+        "Removed handler released"
     );
 }
 
@@ -728,6 +916,30 @@ mod tests {
              MC's own id, the meeting being released, and MEETING_ENDED (never UNSPECIFIED, \
              which MH rejects)"
         );
+    }
+
+    #[tokio::test]
+    async fn a_removal_release_names_one_handler_with_its_trigger_cause() {
+        let quiesced = quiesce(CancellationToken::new(), Vec::new()).await;
+        let removed = MeetingHandlers::test_endpoint("mh-1");
+        for (trigger, cause) in [
+            (
+                RemovalTrigger::HeartbeatTimeout,
+                ReleaseCause::HeartbeatTimeout,
+            ),
+            (RemovalTrigger::ApplyLag, ReleaseCause::ApplyLag),
+        ] {
+            assert_eq!(
+                end_meeting_removal("meeting-7", "mc-self", &removed, trigger, &quiesced),
+                EndMeetingCall {
+                    handler_id: "mh-1".to_string(),
+                    mh_grpc_endpoint: "http://mh-1.example:50053".to_string(),
+                    meeting_id: "meeting-7".to_string(),
+                    mc_id: "mc-self".to_string(),
+                    cause,
+                }
+            );
+        }
     }
 
     #[tokio::test]
@@ -826,6 +1038,11 @@ mod tests {
             EndMeetingOutcome::terminal(K::Other, E),
             EndMeetingOutcome::Error
         );
+        assert_eq!(
+            EndMeetingOutcome::terminal(K::RejectedOwnership, TeardownReason::HandlerRemoved),
+            EndMeetingOutcome::RejectedOwnership,
+            "a live meeting's removal release refused on ownership is the MC defect"
+        );
         // Only an ownership refusal depends on the reason.
         for kind in [K::Unimplemented, K::InvalidArgument, K::Retryable, K::Other] {
             assert_eq!(
@@ -833,6 +1050,49 @@ mod tests {
                 EndMeetingOutcome::terminal(kind, S)
             );
         }
+    }
+
+    /// `REMOVAL` is `ALL` minus exactly `superseded_by_successor` (derived,
+    /// pinned): a new outcome variant must be classified for the removal
+    /// series too, or this fails.
+    #[test]
+    fn the_removal_outcome_domain_is_all_but_superseded() {
+        let derived: Vec<_> = EndMeetingOutcome::ALL
+            .into_iter()
+            .filter(|o| *o != EndMeetingOutcome::SupersededBySuccessor)
+            .collect();
+        assert_eq!(EndMeetingOutcome::REMOVAL.to_vec(), derived);
+    }
+
+    /// A removal makes ONE attempt; teardowns keep their retry. And a
+    /// removal's ownership refusal or invalid argument is an MC defect, never
+    /// the "expected dead-MH" WARN.
+    #[test]
+    fn removal_releases_are_single_attempt_and_defects_stay_loud() {
+        assert_eq!(TeardownReason::HandlerRemoved.max_end_meeting_attempts(), 1);
+        assert_eq!(
+            TeardownReason::MeetingEnded.max_end_meeting_attempts(),
+            MAX_END_MEETING_ATTEMPTS
+        );
+        assert_eq!(
+            TeardownReason::Shutdown.max_end_meeting_attempts(),
+            MAX_END_MEETING_ATTEMPTS
+        );
+        for o in EndMeetingOutcome::REMOVAL {
+            let expected = matches!(
+                o,
+                EndMeetingOutcome::UnavailableExhausted
+                    | EndMeetingOutcome::Error
+                    | EndMeetingOutcome::Unimplemented
+            );
+            assert_eq!(removal_failure_is_expected(o), expected, "{}", o.label());
+        }
+        assert!(!removal_failure_is_expected(
+            EndMeetingOutcome::RejectedOwnership
+        ));
+        assert!(!removal_failure_is_expected(
+            EndMeetingOutcome::InvalidArgument
+        ));
     }
 
     #[test]

@@ -11,7 +11,8 @@
 //! | [`confirm`] | a **total classifier** of the handler's reply into one bounded outcome |
 //! | [`pusher`] | one **push worker per (meeting, handler)**: serialized, latest-wins, meeting-scoped |
 //! | [`liveness`] | per-(meeting, handler) heartbeat timing (N and everything derived from it), the liveness record, the ONE remove-only retire predicate, and the heartbeat metric vocabularies (ADR-0039 §1/§2/§6) |
-//! | [`teardown`] | releasing an ended meeting on EVERY handler of its handler set, only after its push workers have DRAINED (the `Quiesced` witness) |
+//! | [`handler_health`] | THE pure health decision per (meeting, handler) — `assess` and its `next_deadline` (ADR-0039 §2) |
+//! | [`teardown`] | releasing an ended meeting on EVERY handler of its handler set, and ONE removed handler (`release_removed`), only after the push workers concerned have DRAINED (the `Quiesced` witness) |
 //! | (`grpc::mh_client`) | the programming call that carries a snapshot and confirms the echo |
 //!
 //! Loopback is gone (story 2 R-3): visibility is non-reflexive, so a solo
@@ -41,6 +42,7 @@ pub mod confirm;
 pub mod connectivity;
 pub mod edges;
 pub mod generation;
+pub mod handler_health;
 pub mod liveness;
 pub mod placement;
 pub mod pusher;
@@ -58,16 +60,20 @@ pub use confirm::{
 };
 pub use connectivity::{ConnectionKey, ParticipantConnectivity, Phase, SettleOutcome, Unapplied};
 pub use generation::{GenerationSpaceExhausted, PolicyGenerations};
+pub use handler_health::{
+    assess, next_deadline, HandlerHealth, HealthConfig, Observations, RefusalClass,
+    SuspicionOutcome,
+};
 pub use liveness::{
     applied_lag, retirable, Acceptance, HandlerHeartbeat, HandlerLiveness, HeartbeatAnomaly,
     HeartbeatOutcome, HeartbeatTiming, HeartbeatVerdict, LagReading, Observed,
-    APPLIED_SEQUENCE_LAG_BUCKETS,
+    APPLIED_SEQUENCE_LAG_BUCKETS, APPLY_LAG_FACTOR,
 };
 pub use placement::{
     ClientHandler, ClientHandlerEntry, ClientHandlerSet, ConnectedHandlers, HandlerEndpoint,
     HandlerSetError, MeetingHandlers, ReleaseCauseExt, RemovalTrigger, SetChange,
 };
-pub use pusher::{FloorAdoption, HandlerPusher, PushJob, PushTarget};
+pub use pusher::{FloorAdoption, HandlerPusher, PushJob, PushTarget, WorkerDrain};
 pub use slots::{
     Edge, JoinRank, SlotTable, SlotTableError, SourceMute, SourceMuteView, KIND_FILL_ORDER,
 };

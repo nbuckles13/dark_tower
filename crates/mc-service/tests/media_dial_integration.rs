@@ -483,6 +483,7 @@ async fn a_parked_joiner_is_minted_at_release_and_refreshed_from_there() {
     let mh2 = Arc::new(MockMhRegistrationClient::new());
     mh2.hold_handler(H_A);
     let meeting2 = spawn_meeting("dial-park", &[mh_handler(H_A)]);
+    mh2.heartbeat_to_meeting(&meeting2);
     let start = tokio::time::Instant::now();
     let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(64);
     let h = meeting2.clone();
@@ -555,6 +556,10 @@ async fn a_join_whose_set_cannot_be_minted_admits_nothing() {
     );
 
     advance(Duration::from_secs(200)).await;
+    // Time passes continuously, so the refreshes due while the clock was
+    // still mintable (before 100 s) went out; drop them. Every refresh from
+    // here on is past the overflow.
+    let _mintable = sets(&mut a.rx);
     // A's refresh could not be minted: nothing partial was sent.
     for _ in 0..timing().refresh_interval().as_secs() {
         advance(Duration::from_secs(1)).await;
