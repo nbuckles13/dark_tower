@@ -1126,7 +1126,7 @@ The meeting actor's pure health decision (`media_routing/handler_health.rs::asse
 - **Type**: Gauge (recompute-and-set)
 - **Description**: Meetings on this MC whose handler set has NO member — "awaiting handler" (ADR-0039 §3)
 - **Labels**: `key_custody` (1)
-- **Semantics**: a meeting counts iff its set is EMPTY after a removal. A meeting whose only members are still Registering does NOT count (a handler is on its way). In this release nothing replaces a removed handler (MC-C adds acquisition), so such a meeting stays dark until it ends.
+- **Semantics**: a meeting counts iff its set is EMPTY after a removal. A meeting whose only members are still Registering does NOT count (a handler is on its way). Such a meeting keeps acquiring a replacement from GC with bounded, jittered backoff and recovers by itself on a later grant (story 4 MC-C, `mc_media_handler_migrations_total`); the page bound derives from `mc_media_handler_replacement_retry_budget_seconds`.
 - **Recompute-and-set, never inc/dec**: `HandlerlessCensus` (`actors/meeting_media.rs`, the `MeetingCensus` pattern shared with `MutedSourceCensus`), keyed by meeting id only. The controller's `check_meeting_health` walk prunes and re-sets it (LOAD-BEARING: a panicked actor's entry is erased); each membership change re-sets it for freshness; meeting teardown clears its entry; boot sets 0.
 - **Alert**: none in this release (`MCMediaMeetingsAwaitingHandler` is OBS-ALERTS', with a config-derived bound from MC-C)
 - **Recorded in**: `observability/metrics.rs::set_meetings_without_handlers`
@@ -1143,8 +1143,75 @@ The meeting actor's pure health decision (`media_routing/handler_health.rs::asse
 - **An ADDITION to the ADR-0039 telemetry contract**, approved by observability at MC-B2. Kept OFF `mc_media_end_meeting_total` on purpose: that series and its alerts mean "an ENDED meeting was released", whereas a removal's release targets a handler MC just declared dead or impaired, so `unavailable_exhausted` is the EXPECTED outcome after a crash and would page `MCEndMeetingFailureRate` on routine MH deaths.
 - **Single attempt, never retried**, sent from a task the meeting's teardown awaits (never from the actor) after the removed handler's own push worker drained. **The retry is the handler's next heartbeat**, answered RELEASED(trigger): `mc_media_handler_heartbeats_total{outcome="released_removed"}`.
 - **No alert**: a failed removal release is expected (the MH is dead or partitioned). `rejected_ownership` here is still an MC defect worth a look.
+- **`apply_lag` includes a handler whose FIRST `RegisterMeeting` never acked** (story 4 MC-C, ADR-0039 §3: the unacked handler takes the replacement path). That removal is NOT a declaration: it moves this series but never `mc_media_handler_declarations_total` or any detection series.
 - **Recorded in**: `media_routing/teardown.rs::release_removed` via `observability/metrics.rs::record_removal_release`
 - **Dashboard**: MC Media - Removal Releases by Outcome (Handler Detection row)
+
+## Handler Replacement Metrics (ADR-0039 §3, §4, §8; story 4 MC-C)
+
+After a removal leaves a meeting below its hand-off size, the meeting actor asks GC for ONE replacement at a time (`AcquireMediaHandler`; removal never waits on GC). A grant enters the set as Registering and goes through the same Registering → Active path as every hand-off handler, so clients see it (with a `media_dial` token) only after its `RegisterMeeting` was acked. Every series carries `key_custody="operator"` and NO meeting, participant, connection, `handler_id`, `handler_ref`, slot, revision or generation label. Logs (`mc.actor.meeting`) carry the ids: "Media handler migration started" (meeting_id, old_handler_id, trigger, `reason=declared|initial_registration_failed`), "Media handler replacement deferred by the per-meeting minimum interval" (`reason=min_interval`, never counted), and one terminal line per attempt ("Media handler replacement attempt ended", or the WARN/ERROR of a failed one: meeting_id, old/new handler_id, trigger, outcome, `reason`).
+
+### `mc_media_handler_migrations_total`
+- **Type**: Counter
+- **Description**: Replacement acquisition attempts by outcome — **per acquisition attempt; a migration that retries contributes one failure outcome per failed attempt and at most one `completed`; NOT a migration count.**
+- **Counting unit** (observability ruling, MC-C Gate 1; clarifies the telemetry contract's "terminal per meeting migration"): an attempt is ONE `AcquireMediaHandler` call, or ONE owed replacement refused at the per-meeting attempt bound; each records exactly one outcome. A minimum-interval deferral is not an attempt and is never counted. **Per-migration completion is `completed / mc_media_handler_declarations_total{trigger!="planned_transfer"}`**, never `completed / sum(migrations_total)`.
+- **Labels**:
+  - `trigger`: `heartbeat_timeout`, `apply_lag`, `planned_transfer` (the shared `RemovalTrigger` vocabulary; `planned_transfer` is emitted from MC-F). **`apply_lag` includes a handler whose FIRST `RegisterMeeting` never acked** (hand-off or grant, ADR-0039 §3) — so a `completed{trigger="apply_lag"}` with no matching declaration is that path, not a detector fault.
+  - `outcome`:
+    - `completed`: the grant's first `RegisterMeeting` was acked (Active).
+    - `no_capacity`: GC answered RESOURCE_EXHAUSTED.
+    - `gc_unavailable`: GC did not answer (transport, UNAVAILABLE, DEADLINE_EXCEEDED, INTERNAL, UNIMPLEMENTED, UNAUTHENTICATED/PERMISSION_DENIED, other codes).
+    - `admission_refused`: the grant was removed before its first `RegisterMeeting` ack. Either its registration failed after retries, OR it was declared Dead/Impaired while still Registering. It is excluded from now on, and acquisition continues. The terminal log's `reason` (`initial_registration_failed` | `declared`) and the "removed before its first RegisterMeeting ack" line's `removal_trigger` tell the two apart.
+    - `rate_limited`: one owed replacement refused at the per-meeting attempt bound (`|current ∪ removed| ≥ max_exclude_handler_ids`, one stricter than GC's own `>` check). It is recorded once per owed replacement, including a later loss on an already-stopped meeting. There is no per-MC limiter.
+    - `timed_out`: planned-transfer drain deadline (MC-F); never emitted by the crash path.
+    - `abandoned`: refused or unusable. Covers a grant for a superseded `handler_set_version`, FAILED_PRECONDITION, INVALID_ARGUMENT, a malformed OK (no assignment or an empty id/url/grpc endpoint), a grant naming an excluded handler, a grant the set cannot add, and the meeting ending with the attempt open.
+  - `key_custody`: single value `operator`
+- **Cardinality**: 21 (3 x 7); zero-initialised as the full cross product (`planned_transfer` included, so MC-F only starts emitting)
+- **Retried**: `no_capacity`, `gc_unavailable` (bounded, jittered backoff: `mc_media_handler_replacement_*`), and a superseded or unusable grant. **Never retried**: FAILED_PRECONDITION, INVALID_ARGUMENT, a malformed OK (ERROR log with code and missing field).
+- **Recorded in**: `actors/meeting/replacement.rs` via `observability/metrics.rs::record_migration`
+- **Dashboard**: MC Media - Handler Migration Attempts by Trigger and Outcome (Handler Replacement row)
+
+### `mc_media_handler_migration_duration_seconds`
+- **Type**: Histogram
+- **Description**: One migration phase, per (meeting, handler)
+- **Labels**:
+  - `trigger`: as above
+  - `phase`:
+    - `replacement`: the removal that owed it → GC's grant, including every retry.
+    - `registration`: the grant → its first `RegisterMeeting` ack.
+    - `reconnect`: Active → every participant admitted at that moment, and still present, is MH-reported connected to it. Joiners are ignored, leavers stop being waited on, and a later migration or meeting end clears it.
+  - `key_custody`
+- **Buckets**: DERIVED from config (`ReplacementTiming::duration_histogram_buckets`). The values are the connect settle window (/2, x1, x2), the backoff ladder's cumulative waits, the initial-registration bound and the retry budget. The longest legitimate replacement phase lands in a real bucket, never `+Inf`.
+- **Zero-initialised**: every trigger x phase handle is registered at boot (count 0)
+- **Recorded in**: `actors/meeting/replacement.rs` via `observability/metrics.rs::record_migration_phase`
+- **Dashboard**: MC Media - Handler Migration Phase Duration p95 by Phase (Handler Replacement row)
+
+### `mc_media_handler_replacement_retry_budget_seconds`
+- **Type**: Gauge (config echo)
+- **Description**: The DERIVED replacement retry budget. It has three terms:
+  - the backoff ladder from `MC_MH_REPLACEMENT_MIN_INTERVAL_MS`, doubling, up to and including its first step capped at `MC_MH_REPLACEMENT_BACKOFF_MAX_MS`;
+  - one more capped step;
+  - the push worker's initial-registration bound (`pusher::initial_registration_bound`: attempts x (MH RPC + connect timeout) + the backoffs between them).
+
+  The value is 91 s + 48 s = 139 s at the shipped defaults.
+- **Labels**: `key_custody` (1)
+- **Usage**: the awaiting-handler page bound (`MCMediaMeetingsAwaitingHandler`, OBS-ALERTS) and the env-test replacement ceilings derive from it — never a literal. Editing either key moves it.
+- **Recorded in**: `webtransport/server.rs::WebTransportServer::new` via `observability/metrics.rs::set_replacement_timing` (the SAME `ReplacementTiming` every meeting's scheduler reads)
+- **Dashboard**: MC Media - Replacement Pacing and Retry Budget (Handler Replacement row)
+
+### `mc_media_handler_replacement_min_interval_seconds`
+- **Type**: Gauge (config echo)
+- **Description**: `MC_MH_REPLACEMENT_MIN_INTERVAL_MS` / 1000: the per-meeting minimum interval between replacement attempts and the backoff ladder's first step
+- **Labels**: `key_custody` (1)
+- **Recorded in**: as the retry budget (same call)
+- **Dashboard**: MC Media - Replacement Pacing and Retry Budget (Handler Replacement row)
+
+### `mc_media_handler_replacement_backoff_max_seconds`
+- **Type**: Gauge (config echo)
+- **Description**: `MC_MH_REPLACEMENT_BACKOFF_MAX_MS` / 1000: the backoff ladder's cap
+- **Labels**: `key_custody` (1)
+- **Recorded in**: as the retry budget (same call)
+- **Dashboard**: MC Media - Replacement Pacing and Retry Budget (Handler Replacement row)
 
 ### `mc_media_receive_slot_cap`
 - **Type**: Gauge

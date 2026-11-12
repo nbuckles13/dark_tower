@@ -18,8 +18,9 @@ use crate::media_admission::SenderBindingOutcome;
 use crate::media_kind::KindLabels;
 use crate::media_routing::teardown::{EndMeetingOutcome, QuiesceOutcome};
 use crate::media_routing::{
-    FloorAdoption, HeartbeatAnomaly, HeartbeatOutcome, HeartbeatTiming, PolicyPushOutcome,
-    RemovalTrigger, SettleOutcome, SuspicionOutcome, Unapplied, APPLIED_SEQUENCE_LAG_BUCKETS,
+    FloorAdoption, HeartbeatAnomaly, HeartbeatOutcome, HeartbeatTiming, MigrationOutcome,
+    MigrationPhase, PolicyPushOutcome, RemovalTrigger, ReplacementTiming, SettleOutcome,
+    SuspicionOutcome, Unapplied, APPLIED_SEQUENCE_LAG_BUCKETS,
 };
 use crate::media_signaling::{
     slot_state_label, CapabilityOutcome, ClientMuteFanoutOutcome, DirectiveOutcome, MuteOutcome,
@@ -43,8 +44,14 @@ use std::time::Duration;
 /// Returns error if Prometheus recorder fails to install (e.g., already installed).
 /// `heartbeat` is the validated N: the heartbeat interval histogram's buckets
 /// are derived from it (ADR-0039 §1), so they follow config, never a literal.
-pub fn init_metrics_recorder(heartbeat: HeartbeatTiming) -> Result<PrometheusHandle, String> {
-    configured_prometheus_builder(heartbeat)?
+/// `replacement` and `connect_settle` likewise shape the migration duration
+/// histogram (story 4 MC-C).
+pub fn init_metrics_recorder(
+    heartbeat: HeartbeatTiming,
+    replacement: ReplacementTiming,
+    connect_settle: Duration,
+) -> Result<PrometheusHandle, String> {
+    configured_prometheus_builder(heartbeat, replacement, connect_settle)?
         .install_recorder()
         .map_err(|e| format!("Failed to install Prometheus metrics recorder: {e}"))
 }
@@ -58,8 +65,21 @@ pub fn init_metrics_recorder(heartbeat: HeartbeatTiming) -> Result<PrometheusHan
 /// minutes-scale `idle_timeout` would reap idle 0-series — so idle_timeout-
 /// absence is a CONFIG-REVIEW checkpoint here, not a test-enforced invariant
 /// (neither this test nor the Layer-7 env-test reliably backstops it).
-fn configured_prometheus_builder(heartbeat: HeartbeatTiming) -> Result<PrometheusBuilder, String> {
+fn configured_prometheus_builder(
+    heartbeat: HeartbeatTiming,
+    replacement: ReplacementTiming,
+    connect_settle: Duration,
+) -> Result<PrometheusBuilder, String> {
     PrometheusBuilder::new()
+        // Migration phases per (meeting, handler) attempt: buckets DERIVED
+        // from config (settle window, the backoff ladder's cumulative waits,
+        // the registration bound, the retry budget), so the longest legitimate
+        // replacement phase lands in a real bucket, never +Inf.
+        .set_buckets_for_metric(
+            Matcher::Prefix("mc_media_handler_migration_duration_seconds".to_string()),
+            &replacement.duration_histogram_buckets(connect_settle),
+        )
+        .map_err(|e| format!("Failed to set migration duration buckets: {e}"))?
         // Heartbeat inter-arrival per (meeting, handler): buckets DERIVED from
         // N (N/6 .. 2N), around the healthy cadence N/3, N/2 and the deadline.
         .set_buckets_for_metric(
@@ -1057,6 +1077,81 @@ pub fn record_handler_declaration(trigger: RemovalTrigger, detection: Duration) 
         KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
     )
     .record(detection.as_secs_f64());
+}
+
+/// Record ONE replacement acquisition attempt's outcome (ADR-0039 §3/§8;
+/// story 4 MC-C).
+///
+/// Metric: `mc_media_handler_migrations_total`
+/// Labels: `trigger` (`RemovalTrigger::ALL`, 3) x `outcome`
+/// (`MigrationOutcome::ALL`, 7) x `key_custody`
+///
+/// Per ACQUISITION ATTEMPT, NOT per migration: an attempt is one
+/// `AcquireMediaHandler` call, or one owed replacement refused at the
+/// per-meeting attempt bound (`rate_limited`), and each records exactly one
+/// outcome. A migration that retries contributes one failure outcome per
+/// failed attempt and at most one `completed`; a minimum-interval deferral is
+/// never counted. Per-migration completion is
+/// `completed / mc_media_handler_declarations_total{trigger!="planned_transfer"}`.
+/// `apply_lag` here includes a handler whose FIRST `RegisterMeeting` never
+/// acked (`replacement::registration_failure_trigger`). No identity labels.
+pub fn record_migration(trigger: RemovalTrigger, outcome: MigrationOutcome) {
+    counter!(
+        "mc_media_handler_migrations_total",
+        TRIGGER_LABEL => trigger.label(),
+        "outcome" => outcome.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .increment(1);
+}
+
+/// Observe one migration phase (ADR-0039 §8; story 4 MC-C).
+///
+/// Metric: `mc_media_handler_migration_duration_seconds` (histogram, buckets
+/// derived from config: `ReplacementTiming::duration_histogram_buckets`)
+/// Labels: `trigger` x `phase` (`replacement` = removal -> grant,
+/// `registration` = grant -> first ack, `reconnect` = Active -> every
+/// participant admitted at that moment and still present is MH-reported
+/// connected to it) x `key_custody`
+pub fn record_migration_phase(trigger: RemovalTrigger, phase: MigrationPhase, elapsed: Duration) {
+    histogram!(
+        "mc_media_handler_migration_duration_seconds",
+        TRIGGER_LABEL => trigger.label(),
+        "phase" => phase.label(),
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+/// Publish the replacement pacing (story 4 MC-C).
+///
+/// Metrics: `mc_media_handler_replacement_retry_budget_seconds`,
+/// `mc_media_handler_replacement_min_interval_seconds`,
+/// `mc_media_handler_replacement_backoff_max_seconds`
+/// Labels: `key_custody` (1)
+///
+/// CONFIG ECHOES set once at boot from the SAME `ReplacementTiming` every
+/// meeting's scheduler reads (`MC_MH_REPLACEMENT_MIN_INTERVAL_MS`,
+/// `MC_MH_REPLACEMENT_BACKOFF_MAX_MS`). The retry budget is DERIVED (the
+/// backoff ladder to its cap + one capped step + the push worker's
+/// initial-registration bound); the awaiting-handler page bound and the
+/// env-test ceilings read it, never a literal.
+pub fn set_replacement_timing(timing: ReplacementTiming) {
+    gauge!(
+        "mc_media_handler_replacement_retry_budget_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(timing.retry_budget().as_secs_f64());
+    gauge!(
+        "mc_media_handler_replacement_min_interval_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(timing.min_interval().as_secs_f64());
+    gauge!(
+        "mc_media_handler_replacement_backoff_max_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(timing.backoff_max().as_secs_f64());
 }
 
 /// Record the outcome of the ONE `EndMeeting` a handler REMOVAL sends
@@ -2585,6 +2680,17 @@ pub fn zero_initialize_counters() {
             counter!("mc_media_handler_removal_releases_total", TRIGGER_LABEL => t.label(), "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
         }
     }
+    // Story 4 MC-C: the FULL trigger vocabulary (planned_transfer included,
+    // so MC-F only starts emitting) x every outcome, and the phase histogram.
+    for t in RemovalTrigger::ALL {
+        for o in MigrationOutcome::ALL {
+            counter!("mc_media_handler_migrations_total", TRIGGER_LABEL => t.label(), "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
+        }
+        for p in MigrationPhase::ALL {
+            // Registering the handle makes the series present (count 0).
+            let _ = histogram!("mc_media_handler_migration_duration_seconds", TRIGGER_LABEL => t.label(), "phase" => p.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR);
+        }
+    }
     // Boot value of the recompute-and-set gauge (the health walk re-sets it).
     set_meetings_without_handlers(0);
     for r in crate::media_dial::HandlerSetPushReason::ALL {
@@ -2700,9 +2806,13 @@ mod tests {
     /// recorder/scrape failure, NOT a present-at-0 violation.
     #[test]
     fn zero_init_renders_counters_present_at_zero() {
-        let recorder = configured_prometheus_builder(HeartbeatTiming::from_timeout_ms(6_000))
-            .expect("prometheus builder config")
-            .build_recorder();
+        let recorder = configured_prometheus_builder(
+            HeartbeatTiming::from_timeout_ms(6_000),
+            ReplacementTiming::from_config_ms(1_000, 30_000),
+            Duration::from_millis(1_500),
+        )
+        .expect("prometheus builder config")
+        .build_recorder();
         let handle = recorder.handle();
         {
             let _guard = metrics::set_default_local_recorder(&recorder);
@@ -2841,10 +2951,35 @@ mod tests {
                 ));
             }
         }
-        assert!(
-            !rendered.contains(r#"trigger="planned_transfer""#),
-            "planned_transfer is MC-F's to zero-initialise"
-        );
+        for series in [
+            "mc_media_handler_declarations_total",
+            "mc_media_handler_removal_releases_total",
+        ] {
+            assert!(
+                !rendered
+                    .lines()
+                    .any(|l| l.starts_with(series) && l.contains(r#"trigger="planned_transfer""#)),
+                "{series}: planned_transfer is MC-F's to zero-initialise"
+            );
+        }
+        // Story 4 MC-C: the FULL trigger vocabulary x every outcome, and the
+        // phase histogram for every trigger x phase.
+        for t in RemovalTrigger::ALL {
+            for o in MigrationOutcome::ALL {
+                present_at_zero(&format!(
+                    r#"mc_media_handler_migrations_total{{trigger="{}",outcome="{}",key_custody="operator"}}"#,
+                    t.label(),
+                    o.label()
+                ));
+            }
+            for p in MigrationPhase::ALL {
+                present_at_zero(&format!(
+                    r#"mc_media_handler_migration_duration_seconds_count{{trigger="{}",phase="{}",key_custody="operator"}}"#,
+                    t.label(),
+                    p.label()
+                ));
+            }
+        }
         // Story 4 MC-D (ADR-0039 §5): every push reason, and the new status
         // drop reason.
         for r in crate::media_dial::HandlerSetPushReason::ALL {
@@ -2905,9 +3040,13 @@ mod tests {
     /// Layer-7 env-test reliably backstops it (the builder exposes no readback).
     #[test]
     fn production_builder_has_no_idle_timeout() {
-        let recorder = configured_prometheus_builder(HeartbeatTiming::from_timeout_ms(6_000))
-            .expect("prometheus builder config")
-            .build_recorder();
+        let recorder = configured_prometheus_builder(
+            HeartbeatTiming::from_timeout_ms(6_000),
+            ReplacementTiming::from_config_ms(1_000, 30_000),
+            Duration::from_millis(1_500),
+        )
+        .expect("prometheus builder config")
+        .build_recorder();
         let handle = recorder.handle();
         {
             let _guard = metrics::set_default_local_recorder(&recorder);
@@ -4091,9 +4230,13 @@ mod tests {
     #[test]
     fn heartbeat_histogram_buckets_are_derived_from_n() {
         let timing = HeartbeatTiming::from_timeout_ms(7_000);
-        let recorder = configured_prometheus_builder(timing)
-            .expect("prometheus builder config")
-            .build_recorder();
+        let recorder = configured_prometheus_builder(
+            timing,
+            ReplacementTiming::from_config_ms(1_000, 30_000),
+            Duration::from_millis(1_500),
+        )
+        .expect("prometheus builder config")
+        .build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
             observe_heartbeat_interval(Duration::from_millis(2_333));
@@ -4128,9 +4271,13 @@ mod tests {
 
     #[test]
     fn heartbeat_deadline_gauge_echoes_n() {
-        let recorder = configured_prometheus_builder(HeartbeatTiming::from_timeout_ms(6_000))
-            .expect("prometheus builder config")
-            .build_recorder();
+        let recorder = configured_prometheus_builder(
+            HeartbeatTiming::from_timeout_ms(6_000),
+            ReplacementTiming::from_config_ms(1_000, 30_000),
+            Duration::from_millis(1_500),
+        )
+        .expect("prometheus builder config")
+        .build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
             set_heartbeat_deadline(HeartbeatTiming::from_timeout_ms(7_500));
@@ -4138,6 +4285,64 @@ mod tests {
         assert!(handle.render().contains(
             r#"mc_media_handler_heartbeat_deadline_seconds{key_custody="operator"} 7.5"#
         ));
+    }
+
+    /// Story 4 MC-C: the three replacement config echoes publish the SAME
+    /// `ReplacementTiming` the scheduler reads, the budget DERIVED (here a
+    /// non-default 500 ms / 4000 ms: ladder 0.5+1+2+4 + one 4 s cap = 11.5 s,
+    /// + the 48 s registration bound), all with key_custody.
+    #[test]
+    fn replacement_timing_gauges_echo_the_config_and_the_derived_budget() {
+        let timing = ReplacementTiming::from_config_ms(500, 4_000);
+        let snap = MetricAssertion::snapshot();
+        set_replacement_timing(timing);
+        snap.gauge("mc_media_handler_replacement_min_interval_seconds")
+            .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
+            .assert_value(0.5);
+        snap.gauge("mc_media_handler_replacement_backoff_max_seconds")
+            .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
+            .assert_value(4.0);
+        assert_eq!(
+            timing.retry_budget(),
+            Duration::from_millis(11_500 + 48_000)
+        );
+        snap.gauge("mc_media_handler_replacement_retry_budget_seconds")
+            .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
+            .assert_value(59.5);
+    }
+
+    /// Story 4 MC-C: each migration outcome moves only its own (trigger,
+    /// outcome) cell; each phase observation lands on its own phase.
+    #[test]
+    fn record_migration_moves_only_its_cell() {
+        for t in RemovalTrigger::ALL {
+            for o in MigrationOutcome::ALL {
+                let snap = MetricAssertion::snapshot();
+                record_migration(t, o);
+                for t2 in RemovalTrigger::ALL {
+                    for o2 in MigrationOutcome::ALL {
+                        snap.counter("mc_media_handler_migrations_total")
+                            .with_labels(&[
+                                ("trigger", t2.label()),
+                                ("outcome", o2.label()),
+                                (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                            ])
+                            .assert_delta(u64::from(t2 == t && o2 == o));
+                    }
+                }
+            }
+            for p in MigrationPhase::ALL {
+                let snap = MetricAssertion::snapshot();
+                record_migration_phase(t, p, Duration::from_secs(2));
+                snap.histogram("mc_media_handler_migration_duration_seconds")
+                    .with_labels(&[
+                        ("trigger", t.label()),
+                        ("phase", p.label()),
+                        (KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR),
+                    ])
+                    .assert_observation_count(1);
+            }
+        }
     }
 
     /// `mc_media_handler_set_pushes_total{reason}`: each reason moves only its

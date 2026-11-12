@@ -147,10 +147,13 @@ impl McAssignmentService {
         meeting_id: &str,
         mh_assignments: &[MhAssignment],
     ) -> Result<MeetingHandlers, McError> {
-        // ANCHOR (DRY): these two contract checks (empty `mh_assignments`; any empty
-        // `grpc_endpoint`) are the validator-side definition of a malformed
-        // `AssignMeetingWithMhRequest`. GC mirrors them producer-side in
-        // `selection_is_malformed` (crates/gc-service/src/services/mc_assignment.rs).
+        // ANCHOR (DRY): these contract checks (empty `mh_assignments`; any
+        // assignment failing `HandlerEndpoint::try_from(&MhAssignment)`
+        // (`media_routing/placement.rs`) — empty
+        // `mh_id`, `webtransport_endpoint` or `grpc_endpoint`) are the
+        // validator-side definition of a malformed `AssignMeetingWithMhRequest`.
+        // GC mirrors them producer-side in `selection_is_malformed`
+        // (crates/gc-service/src/services/mc_assignment.rs).
         // Adding a condition HERE without updating that predicate does NOT fail loudly:
         // GC adjudicates INVALID_REQUEST against its own request rather than trusting
         // this peer, so it will read the rejection as "MC misreporting", relabel to
@@ -169,29 +172,29 @@ impl McAssignmentService {
             ));
         }
 
+        let mut handlers: Vec<crate::redis::MhEndpointInfo> =
+            Vec::with_capacity(mh_assignments.len());
         for a in mh_assignments {
-            if a.grpc_endpoint.is_empty() {
+            let endpoint = HandlerEndpoint::try_from(a).map_err(|rejected| {
                 error!(
                     target: "mc.grpc.mc_service",
                     meeting_id = %meeting_id,
                     mh_id = %a.mh_id,
-                    "MH assignment has empty grpc_endpoint (GC contract violation)"
+                    reason = rejected.label(),
+                    "MH assignment is malformed (GC contract violation)"
                 );
-                return Err(McError::InvalidArgument(format!(
-                    "MH assignment for {} has empty grpc_endpoint",
-                    a.mh_id
-                )));
-            }
+                McError::InvalidArgument(format!(
+                    "MH assignment for {} is malformed: {}",
+                    a.mh_id,
+                    rejected.label()
+                ))
+            })?;
+            handlers.push(crate::redis::MhEndpointInfo {
+                mh_id: endpoint.id.as_str().to_string(),
+                webtransport_endpoint: endpoint.webtransport_url,
+                grpc_endpoint: endpoint.grpc_endpoint,
+            });
         }
-
-        let handlers: Vec<crate::redis::MhEndpointInfo> = mh_assignments
-            .iter()
-            .map(|a| crate::redis::MhEndpointInfo {
-                mh_id: a.mh_id.clone(),
-                webtransport_endpoint: a.webtransport_endpoint.clone(),
-                grpc_endpoint: a.grpc_endpoint.clone(),
-            })
-            .collect();
 
         // The meeting's handler set, from exactly the value stored below. NOT a
         // new contract condition (see the ANCHOR above): GC selects distinct,

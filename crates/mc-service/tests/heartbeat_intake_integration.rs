@@ -172,9 +172,17 @@ async fn verdicts_all_arms_in_one_test() {
     let c = controller();
     let svc = service(&c);
     let mh = Arc::new(MockMhRegistrationClient::new());
-    mh.fail_handler(H_B); // mh-b never acks: stays Registering
+    // mh-b's push is HELD (in flight, never answered): it stays Registering.
+    // Story 4 MC-C: a push that FAILS (retries exhausted) now removes the
+    // handler and replaces it (ADR-0039 §3), so `fail_handler` no longer
+    // means "Registering forever".
+    mh.hold_handler(H_B);
     create(&c, "m", &[H_A, H_B, "mh-c", "mh-d"]).await;
-    join(&c, "m", "p1", join_media_on(Arc::clone(&mh))).await;
+    // The first join stays PARKED (mh-b gives no verdict); awaiting it would
+    // run paused time to the park deadline, past N, and declare the acked
+    // handlers Dead. The join already installed the deps and the pushes.
+    let _parked = start_join(&c, "m", "p1", join_media_on(Arc::clone(&mh))).await;
+    test_common::run_ready().await;
     let meeting = handle(&c, "m").await;
     assert!(meeting
         .remove_handler_for_test("mh-c", RemovalTrigger::HeartbeatTimeout)

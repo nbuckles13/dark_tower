@@ -202,6 +202,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Initializing Prometheus metrics recorder...");
     let prometheus_handle = mc_service::observability::metrics::init_metrics_recorder(
         config.mh_heartbeat(),
+        config.mh_replacement(),
+        config.client_media_config().connect_settle_window,
     )
     .map_err(|e| {
         error!(error = %e, "Failed to install Prometheus metrics recorder");
@@ -510,9 +512,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     info!("Connected to Global Controller");
 
-    // The GC client is shared by the heartbeat task and the meeting-ended drain.
+    // The GC client is shared by the heartbeat task, the meeting-ended drain
+    // and every meeting actor's replacement requests (ADR-0039 §3).
     let gc_client = Arc::new(gc_client);
     let notify_client = Arc::clone(&gc_client);
+    let acquirer: Arc<dyn mc_service::grpc::gc_client::HandlerAcquirer> =
+        Arc::clone(&gc_client) as _;
     // NOT a child of the shutdown token, deliberately. A meeting whose teardown
     // completes inside the shutdown release window calls `meeting_ended` at that
     // moment, so its notification is produced AFTER the shutdown token fires. A
@@ -559,6 +564,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.client_media_config(),
         config.mh_heartbeat(),
         config.media_dial(),
+        // ADR-0039 §3: the meeting actors' replacement grants come from GC
+        // through the SAME client (and channel timeouts) as registration.
+        Arc::clone(&acquirer),
+        config.mh_replacement(),
         config.max_participants as usize,
         std::time::Duration::from_secs(config.quic_max_idle_timeout_seconds),
         shutdown_token.child_token(),

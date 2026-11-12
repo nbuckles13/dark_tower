@@ -161,6 +161,11 @@ pub struct MediaRoutingDeps {
     /// The `media_dial` credential TTL and its TTL/3 refresh
     /// (`MC_MEDIA_DIAL_TOKEN_TTL_SECONDS`, ADR-0039 §5).
     pub media_dial: crate::media_dial::MediaDialTiming,
+    /// MC→GC replacement grants (`AcquireMediaHandler`, ADR-0039 §3).
+    pub acquirer: Arc<dyn crate::grpc::gc_client::HandlerAcquirer>,
+    /// The replacement pacing (`MC_MH_REPLACEMENT_MIN_INTERVAL_MS`,
+    /// `MC_MH_REPLACEMENT_BACKOFF_MAX_MS`; story 4 MC-C).
+    pub replacement: crate::media_routing::ReplacementTiming,
 }
 
 impl std::fmt::Debug for MediaRoutingDeps {
@@ -327,6 +332,8 @@ pub struct MeetingSeams {
     /// UNIX second, so paused-time tests move `iat` with the refresh arm
     /// (`None`: the wall clock, as production).
     pub dial_clock_base_unix: Option<i64>,
+    /// Seed the replacement backoff jitter (`None`: OS-seeded, as production).
+    pub replacement_seed: Option<u64>,
 }
 
 /// The handler set in-crate actor tests create a meeting with: one handler,
@@ -378,6 +385,29 @@ pub(crate) fn test_join_media() -> JoinMedia {
         }
     }
 
+    /// A GC with no capacity: nothing is ever granted.
+    struct NoCapacityGc;
+    impl crate::grpc::gc_client::HandlerAcquirer for NoCapacityGc {
+        fn acquire<'a>(
+            &'a self,
+            _call: &'a crate::grpc::gc_client::AcquireCall,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = crate::grpc::gc_client::AcquireResult> + Send + 'a,
+            >,
+        > {
+            Box::pin(async {
+                crate::grpc::gc_client::AcquireResult::NoCapacity {
+                    message: "fixture".to_string(),
+                }
+            })
+        }
+
+        fn max_exclude_handler_ids(&self) -> Option<std::num::NonZeroU32> {
+            std::num::NonZeroU32::new(16)
+        }
+    }
+
     JoinMedia {
         deps: Arc::new(MediaRoutingDeps {
             mh_client: Arc::new(ConfirmingMh),
@@ -391,6 +421,8 @@ pub(crate) fn test_join_media() -> JoinMedia {
             connect_settle_window: std::time::Duration::from_millis(1500),
             heartbeat: crate::media_routing::HeartbeatTiming::from_timeout_ms(6_000),
             media_dial: crate::media_dial::MediaDialTiming::from_ttl_seconds(300),
+            acquirer: Arc::new(NoCapacityGc),
+            replacement: crate::media_routing::ReplacementTiming::from_config_ms(1_000, 30_000),
         }),
         declared: crate::media_kind::ClientMediaStates::live(PublishSet::of(&[
             MediaKindLabel::Audio,
@@ -598,6 +630,40 @@ impl MeetingMedia {
             },
         );
         Ok(())
+    }
+
+    /// The routing deps, once a join installed them.
+    pub(super) fn deps(&self) -> Option<&Arc<MediaRoutingDeps>> {
+        self.deps.as_ref()
+    }
+
+    /// Add a GC-granted replacement as Registering (ADR-0039 §3): from here
+    /// its heartbeats are OWNED and the binding gate admits it; it is NOT
+    /// client-visible until its first `RegisterMeeting` is acked. The caller
+    /// re-renders, which spawns its push worker through the ONE
+    /// `PushTarget` builder (`render_and_publish`).
+    ///
+    /// # Errors
+    ///
+    /// Any [`MeetingHandlers::add`] refusal; nothing changes.
+    pub(super) fn add_granted(
+        &mut self,
+        endpoint: HandlerEndpoint,
+    ) -> Result<SetChange, crate::media_routing::HandlerSetError> {
+        self.handlers.add(endpoint).map(|(_, change)| change)
+    }
+
+    /// The participants admitted right now (a reconnect phase waits on these).
+    pub(super) fn admitted(&self) -> std::collections::BTreeSet<String> {
+        self.views.keys().cloned().collect()
+    }
+
+    /// Whether `participant_id` has left, or holds a live connection key on
+    /// `handler` (its reconnect wait is over either way).
+    pub(super) fn reconnected_or_gone(&self, handler: &HandlerId, participant_id: &str) -> bool {
+        self.views
+            .get(participant_id)
+            .is_none_or(|v| v.connectivity.keys_on(handler).next().is_some())
     }
 
     /// The meeting's handler set (internal view).

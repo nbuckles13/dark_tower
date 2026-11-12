@@ -957,6 +957,56 @@ pub fn join_media_with_timing(
     heartbeat: mc_service::media_routing::HeartbeatTiming,
     media_dial: mc_service::media_dial::MediaDialTiming,
 ) -> mc_service::actors::JoinMedia {
+    join_media_full(
+        mh_client,
+        heartbeat,
+        media_dial,
+        Arc::new(mc_test_utils::ScriptedGc::with_cap(16)),
+    )
+}
+
+/// The replacement pacing the shared fixtures run with: THE shipped values,
+/// read from `infra/services/mc-service/config.env` (the only copy — MC has no
+/// in-code default).
+///
+/// # Panics
+///
+/// If `config.env` stops carrying either key as an integer.
+#[must_use]
+pub fn replacement_timing() -> mc_service::media_routing::ReplacementTiming {
+    const CONFIG_ENV: &str = include_str!("../../../../infra/services/mc-service/config.env");
+    let read = |key: &str| -> u32 {
+        CONFIG_ENV
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("config.env carries {key}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{key} in config.env is an integer: {e}"))
+    };
+    mc_service::media_routing::ReplacementTiming::from_config_ms(
+        read("MC_MH_REPLACEMENT_MIN_INTERVAL_MS"),
+        read("MC_MH_REPLACEMENT_BACKOFF_MAX_MS"),
+    )
+}
+
+/// [`join_media_on`] answering replacement requests from `gc` (story 4 MC-C).
+pub fn join_media_with_gc(
+    mh_client: Arc<MockMhRegistrationClient>,
+    gc: Arc<mc_test_utils::ScriptedGc>,
+) -> mc_service::actors::JoinMedia {
+    join_media_full(mh_client, heartbeat_timing(), media_dial_timing(), gc)
+}
+
+/// Every fixture's `JoinMedia` goes through here (one deps literal). The
+/// default GC grants nothing (no capacity), so a removal in a suite that is
+/// not about replacement leaves the meeting on its survivors.
+pub fn join_media_full(
+    mh_client: Arc<dyn MhRegistrationClient>,
+    heartbeat: mc_service::media_routing::HeartbeatTiming,
+    media_dial: mc_service::media_dial::MediaDialTiming,
+    gc: Arc<mc_test_utils::ScriptedGc>,
+) -> mc_service::actors::JoinMedia {
     mc_service::actors::JoinMedia {
         deps: Arc::new(mc_service::actors::MediaRoutingDeps {
             mh_client,
@@ -970,6 +1020,8 @@ pub fn join_media_with_timing(
             connect_settle_window: client_media_config().connect_settle_window,
             heartbeat,
             media_dial,
+            acquirer: gc,
+            replacement: replacement_timing(),
         }),
         // The actor-driven suite joins as an audio publisher with no
         // join-carried declaration (it declares post-join), story 2's shape.

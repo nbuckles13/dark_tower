@@ -1,7 +1,8 @@
 //! Resilience tests: NetworkPolicy enforcement (canary pods), the MH pool /
 //! process-injector smoke legs that prove the story 4 resilience fixture end
-//! to end, and the MC-B2 handler-loss legs (crash-to-survivor, zombie)
-//! (ADR-0039 §2, §6, §9; R-1, R-4, R-10, R-39).
+//! to end, the handler-loss legs — crash with replacement (MC-B2 survivor arm
+//! extended by MC-C), zombie (MC-B2) and the stranded pair (MC-C) — (ADR-0039
+//! §2, §3, §4, §6, §9; R-1, R-2, R-4, R-6, R-10, R-39).
 //!
 //! # Isolation convention (EVERY test in this binary is `#[serial]`)
 //!
@@ -25,7 +26,12 @@
 //! baseline. A
 //! panicking leg's `MhPool` Drop prints the exact reclaim command.
 //!
-//! MC-B2 legs (crash-to-survivor, zombie): see their section below.
+//! Handler-loss legs (crash with replacement, zombie, stranded pair): see
+//! their section below. Since MC-C, MC asks GC for a replacement after EVERY
+//! removal, so each such leg ends its participants INSIDE the leg and waits
+//! for MC's meetings to drain before `run_leg` tears the owned MH down —
+//! otherwise MC would react to the teardown by placing the still-live meeting
+//! on a baseline MH and perturb later baselines.
 //!
 //! Edge-sum (concurrent Σ P×(N+M)): 2
 
@@ -40,7 +46,7 @@ use env_tests::fixtures::gc_fleet::live_gc_pods;
 use env_tests::fixtures::mc_session::JoinDeclaration;
 use env_tests::fixtures::media::{assert_relayed_on_slot, bind_until_received};
 use env_tests::fixtures::metrics::{
-    format_instance_map, heartbeat_interval_of, mc_heartbeat_deadline,
+    format_instance_map, heartbeat_interval_of, mc_heartbeat_deadline, mc_replacement_retry_budget,
     poll_until_any_instance_above, poll_until_pinned_instance, settled_baseline, sum_over_pods,
     InstanceCounters, BASELINE_SETTLE_BOUND, PINNED_METRIC_BOUND,
 };
@@ -180,6 +186,13 @@ const MH_RELEASED_VERDICTS: &str =
     r#"sum by (instance) (mh_mc_heartbeat_verdicts_total{outcome="released"})"#;
 const MH_OWNER_SILENCE_TIMEOUT: &str = "mh_media_meeting_owner_silence_timeout_seconds";
 const MH_REGISTERED_MEETINGS: &str = "sum by (instance) (mh_media_registered_meetings)";
+const MC_MIGRATIONS_COMPLETED_HT: &str = r#"sum by (instance) (mc_media_handler_migrations_total{trigger="heartbeat_timeout",outcome="completed"})"#;
+// Summed over gc_view (never pinned: GC's view of the killed MH is healthy or
+// stale depending on timing) and trigger.
+const GC_REPLACEMENTS_GRANTED: &str =
+    r#"sum by (instance) (gc_mh_replacement_requests_total{outcome="granted"})"#;
+// Per instance (instance_counter_map requires the label); summed by the caller.
+const MC_MEETINGS_ACTIVE: &str = "sum by (instance) (mc_meetings_active)";
 
 async fn connected_cluster() -> ClusterConnection {
     let cluster = ClusterConnection::new()
@@ -221,12 +234,22 @@ async fn rose(prom: &PrometheusClient, promql: &str, baseline: &InstanceCounters
     .await;
 }
 
-/// R-1 (survivor arm), R-4, R-39: kill the run-owned MH carrying a
-/// two-handler meeting's media. MC declares it dead (heartbeat_timeout),
-/// removes it from the set, and re-places the pair's edges onto the
-/// SURVIVOR, where media resumes. GC counts the in-place restart's
-/// registration as superseded{match=both} exactly once, and no load report
-/// from an unknown handler.
+/// R-1 (survivor arm AND replacement), R-4, R-6, R-39: kill the run-owned MH
+/// carrying a two-handler meeting's media. MC declares it dead
+/// (heartbeat_timeout), removes it from the set, and re-places the pair's
+/// edges onto the SURVIVOR, where media resumes — without waiting on GC. GC
+/// counts the in-place restart's registration as superseded{match=both}
+/// exactly once, and no load report from an unknown handler.
+///
+/// REPLACEMENT (story 4 MC-C, crash = break-before-make): MC then asks GC for
+/// a replacement. Per participant, the final set holds a handler_ref NOT in
+/// its pre-kill set, at the pre-kill size; the set without the dead ref came
+/// BEFORE the first set naming the new ref; the new entry carries a
+/// `media_dial` token and MH admits a dial with it (MH admits only a meeting
+/// it holds a key for, so this is register-before-token on the live
+/// cluster). MC counted `completed` and GC counted `granted`. Refs, never
+/// urls: the replacement may be the restarted owned incarnation at the same
+/// address.
 ///
 /// NON-VACUITY (the kill must matter): A and B first reach ONLY the owned MH,
 /// so the pair's edges can land nowhere else. Frames are then proven on the
@@ -237,7 +260,7 @@ async fn rose(prom: &PrometheusClient, promql: &str, baseline: &InstanceCounters
 /// pair is heard on the survivor's transport.
 #[tokio::test]
 #[serial]
-async fn mc_b2_crash_of_a_carrying_handler_moves_media_to_the_survivor() {
+async fn mc_c_crash_moves_media_to_the_survivor_then_gc_replaces_the_handler() {
     MhPool::run_leg(|pool, prom_url| async move { crash_leg(pool, &prom_url).await }).await;
 }
 
@@ -250,10 +273,13 @@ async fn crash_leg(pool: Arc<MhPool>, prom_url: &str) {
     let interval = heartbeat_interval_of(n);
     let view_bound = settle_window(&cluster).await + VIEW_MARGIN;
 
+    let retry_budget = mc_replacement_retry_budget(&prom).await;
+
     let mut slot = pool.up_scraped(&prom).await;
     let owned = slot.address.clone();
     let attempts = live_placement_attempts(&pool).await;
     let owned_heartbeats_before = prom.instance_counter_map(MC_OWNED_HEARTBEATS).await;
+    let meetings_before = settled_meetings_active(&prom).await;
 
     // PLACEMENT: a two-handler meeting holding the owned MH (precondition: a
     // survivor exists by construction).
@@ -378,6 +404,35 @@ async fn crash_leg(pool: Arc<MhPool>, prom_url: &str) {
         "CRASH (gc-presence)",
     );
 
+    // MC-C baselines: the replacement under test (MC's completed migrations,
+    // GC's grants summed over the serving replicas), and each participant's
+    // pre-kill refs and the dead handler's ref.
+    let completed_before = settled_baseline(
+        &prom,
+        MC_MIGRATIONS_COMPLETED_HT,
+        BASELINE_SETTLE_BOUND,
+        "the completed migration under test",
+    )
+    .await;
+    let granted_before = settled_baseline(
+        &prom,
+        GC_REPLACEMENTS_GRANTED,
+        BASELINE_SETTLE_BOUND,
+        "the replacement grant under test",
+    )
+    .await;
+    // Presence on every serving replica (zero-initialised at GC start).
+    let _present_on_every_replica = sum_over_pods(
+        &granted_before,
+        &gc_pods.serving,
+        GC_REPLACEMENTS_GRANTED,
+        "CRASH (gc-presence)",
+    );
+    let pre_kill: Vec<PreKill> = ps
+        .iter()
+        .map(|p| PreKill::of("CRASH pre-kill", p, &owned))
+        .collect();
+
     // KILL (debug container, never a pod delete); `kill` waits for the
     // in-place restart and the re-scrape.
     let (uid, restarts) = (slot.pod_uid.clone(), slot.restart_count);
@@ -389,11 +444,13 @@ async fn crash_leg(pool: Arc<MhPool>, prom_url: &str) {
     );
     assert_eq!(slot.pod_uid, uid, "CRASH: same pod, never a pod delete");
 
-    // REMOVAL, per entity: each participant's set becomes {survivor}. The
-    // restarted incarnation may reuse the owned address, and MC-B2 never adds
-    // a handler, so the set is exactly the survivor. Bound: one detection
-    // (N, armed per heartbeat interval) plus the view margin, from now; the
-    // declaration may already have happened during the restart wait.
+    // REMOVAL, per entity: each participant's set becomes {survivor} FIRST
+    // (break-before-make: the replacement is added only once it registered,
+    // and `await_handler_set` checks after every absorbed set, so the
+    // intermediate {survivor} set is observed even if the replacement's set
+    // is already queued behind it). Bound: one detection (N, armed per
+    // heartbeat interval) plus the view margin, from now; the declaration may
+    // already have happened during the restart wait.
     let removal_bound = n + interval + VIEW_MARGIN;
     for p in ps.iter_mut() {
         let want = vec![survivor.clone()];
@@ -502,8 +559,46 @@ async fn crash_leg(pool: Arc<MhPool>, prom_url: &str) {
          across a crash-in-place: before {unknown_before}, after {unknown_after}"
     );
 
-    // R-28 on the restarted incarnation.
+    // REPLACEMENT (MC-C), per entity: a new ref at the pre-kill size, after
+    // the removal set; its token admits a dial.
+    let replacement_bound = removal_bound + retry_budget + VIEW_MARGIN;
+    for (p, pre) in ps.iter_mut().zip(&pre_kill) {
+        let new_ref = await_replacement("CRASH replacement", p, pre, replacement_bound).await;
+        let url = p.sets.url_of(new_ref);
+        drop(reach("CRASH replacement (token admits a dial)", p, &url).await);
+    }
+    rose(
+        &prom,
+        MC_MIGRATIONS_COMPLETED_HT,
+        &completed_before,
+        "CRASH (migration-completed)",
+    )
+    .await;
+    // GC granted it: some replica's `granted` (summed over gc_view and
+    // trigger) rose, with the serving replica set unchanged (no reset).
+    rose(
+        &prom,
+        GC_REPLACEMENTS_GRANTED,
+        &granted_before,
+        "CRASH (gc-granted)",
+    )
+    .await;
+    assert_eq!(
+        live_gc_pods().await.names(),
+        gc_names_before,
+        "CRASH (gc-replica-set-changed): the serving GC pods changed, so the per-replica \
+         counters may have reset"
+    );
+
+    // R-28 on the restarted incarnation (and whatever the replacement is).
     assert_addresses_unique().await;
+
+    // Hygiene: end the meeting INSIDE the leg (module doc).
+    drop(on_owned);
+    drop(on_survivor);
+    drop(ps);
+    drop(meeting);
+    await_meetings_drained(&prom, meetings_before, "CRASH").await;
 }
 
 /// R-10, R-39: the zombie. Freeze (SIGSTOP via the injector, which proves the
@@ -571,6 +666,7 @@ async fn zombie_leg(pool: Arc<MhPool>, prom_url: &str) {
     .await;
     let attempts = live_placement_attempts(&pool).await;
     let owned_heartbeats_before = prom.instance_counter_map(MC_OWNED_HEARTBEATS).await;
+    let meetings_before = settled_meetings_active(&prom).await;
 
     let (mut z, meeting) =
         place_on_owned(&auth, &gc, "MC-B2 zombie", 1, "Z", &owned, None, attempts).await;
@@ -744,7 +840,344 @@ async fn zombie_leg(pool: Arc<MhPool>, prom_url: &str) {
             "buffered EndMeeting(HEARTBEAT_TIMEOUT)"
         }
     );
+    // MC-C acquires a replacement for the one-handler meeting here too; this
+    // leg pins nothing about set size (only that the zombie left it). End the
+    // meeting INSIDE the leg (module doc).
     drop(z);
+    drop(meeting);
+    await_meetings_drained(&prom, meetings_before, "ZOMBIE").await;
+    assert_addresses_unique().await;
+}
+
+// ============================================================================
+// MC-C: the stranded pair (R-2)
+// ============================================================================
+
+/// R-2: A and B reach ONLY the run-owned MH of a two-handler meeting (never
+/// the survivor), and frames are proven on it both ways. The owned MH is
+/// killed. MC removes it (break-before-make) and GC grants a replacement.
+/// Before the replacement is reached, neither hears the other on the
+/// survivor (neither ever connected to it: the kill stranded the pair).
+/// Recovery is the join path, with no special case: both reach the
+/// replacement with its token, MC places their edges on it, and frames flow
+/// on the replacement's transports both ways; neither is reported
+/// unreachable to the other on the final view.
+#[tokio::test]
+#[serial]
+async fn mc_c_stranded_pair_hears_each_other_on_the_replacement() {
+    MhPool::run_leg(|pool, prom_url| async move { stranded_leg(pool, &prom_url).await }).await;
+}
+
+async fn stranded_leg(pool: Arc<MhPool>, prom_url: &str) {
+    let prom = PrometheusClient::new(prom_url);
+    let cluster = connected_cluster().await;
+    let auth = AuthClient::new(&cluster.ac_base_url);
+    let gc = GcClient::new(&cluster.gc_base_url);
+    let n = mc_heartbeat_deadline(&prom).await;
+    let interval = heartbeat_interval_of(n);
+    let view_bound = settle_window(&cluster).await + VIEW_MARGIN;
+    let retry_budget = mc_replacement_retry_budget(&prom).await;
+
+    let mut slot = pool.up_scraped(&prom).await;
+    let owned = slot.address.clone();
+    let attempts = live_placement_attempts(&pool).await;
+    let meetings_before = settled_meetings_active(&prom).await;
+
+    let (a, meeting) = place_on_owned(
+        &auth,
+        &gc,
+        "MC-C stranded pair",
+        2,
+        "A",
+        &owned,
+        Some(2),
+        attempts,
+    )
+    .await;
+    eprintln!(
+        "40/stranded: meeting placed on run-owned slot {} ({owned}) after {} of {attempts} \
+         attempts",
+        slot.slot, meeting.attempts
+    );
+    let b = meeting.join(1, "B", &JoinDeclaration::default()).await;
+    let mut ps = vec![a, b];
+    let survivor = ps[0]
+        .offered()
+        .into_iter()
+        .find(|u| *u != owned)
+        .expect("placement_hit guarantees exactly one other member");
+    let ids = [ps[0].sender_id(), ps[1].sender_id()];
+
+    // Both reach ONLY the owned MH; prove frames on it both ways.
+    let mut on_owned = Vec::new();
+    for p in &ps {
+        on_owned.push(reach("STRANDED pre-kill", p, &owned).await);
+    }
+    for (i, p) in ps.iter_mut().enumerate() {
+        p.declare(&[SLOT[i]], &[]).await;
+    }
+    for i in 0..2 {
+        let (peer, on) = (
+            ids[1 - i],
+            handler_ref_of("STRANDED pre-kill", &ps[i], &owned),
+        );
+        ps[i]
+            .converge("STRANDED pre-kill", view_bound, move |v, _| {
+                v.is_some_and(|v| heard_on(v, peer, on))
+            })
+            .await;
+    }
+    for (r, s) in [(0_usize, 1_usize), (1, 0)] {
+        let phase = format!("STRANDED pre-kill {}<-{}", ps[r].label, ps[s].label);
+        let got = bind_until_received(
+            &phase,
+            on_owned[r].connection(),
+            &[(on_owned[s].connection(), MARK[s])],
+            &[],
+        )
+        .await;
+        assert_relayed_on_slot(
+            &phase,
+            &got[&MARK[s]],
+            ps[r].slot_for(ids[s], AUDIO),
+            MARK[s],
+            ps[s].label,
+        );
+    }
+    let pre_kill: Vec<PreKill> = ps
+        .iter()
+        .map(|p| PreKill::of("STRANDED pre-kill", p, &owned))
+        .collect();
+    let survivor_ref = handler_ref_of("STRANDED pre-kill", &ps[0], &survivor);
+
+    let (uid, restarts) = (slot.pod_uid.clone(), slot.restart_count);
+    slot.kill(&prom).await;
+    assert_eq!(
+        slot.restart_count,
+        restarts + 1,
+        "STRANDED: KILL restarts in place"
+    );
+    assert_eq!(slot.pod_uid, uid, "STRANDED: same pod, never a pod delete");
+    drop(on_owned); // the dead incarnation's sessions
+
+    let removal_bound = n + interval + VIEW_MARGIN;
+    for p in ps.iter_mut() {
+        let want = vec![survivor.clone()];
+        p.await_handler_set("STRANDED removal", removal_bound, move |sets| {
+            sets.current().is_some_and(|v| v.urls() == want)
+        })
+        .await;
+    }
+    // NON-VACUITY: the pair is stranded — neither hears the other on the
+    // survivor, which neither ever connected to.
+    for i in 0..2 {
+        assert!(
+            !heard_on(ps[i].view(), ids[1 - i], survivor_ref),
+            "STRANDED (non-vacuity): {} must not hear its peer on the survivor before the \
+             replacement is reached",
+            ps[i].label
+        );
+    }
+
+    let replacement_bound = removal_bound + retry_budget + VIEW_MARGIN;
+    let mut new_refs = Vec::new();
+    for (p, pre) in ps.iter_mut().zip(&pre_kill) {
+        new_refs.push(await_replacement("STRANDED replacement", p, pre, replacement_bound).await);
+    }
+    let mut on_new = Vec::new();
+    for (p, new_ref) in ps.iter().zip(&new_refs) {
+        let url = p.sets.url_of(*new_ref);
+        on_new.push(reach("STRANDED replacement", p, &url).await);
+    }
+    for i in 0..2 {
+        let (peer, on) = (ids[1 - i], new_refs[i]);
+        ps[i]
+            .converge("STRANDED recovered", view_bound, move |v, _| {
+                v.is_some_and(|v| heard_on(v, peer, on))
+            })
+            .await;
+    }
+    for (r, s) in [(0_usize, 1_usize), (1, 0)] {
+        let phase = format!("STRANDED replacement {}<-{}", ps[r].label, ps[s].label);
+        let got = bind_until_received(
+            &phase,
+            on_new[r].connection(),
+            &[(on_new[s].connection(), MARK[s])],
+            &[],
+        )
+        .await;
+        assert_relayed_on_slot(
+            &phase,
+            &got[&MARK[s]],
+            ps[r].slot_for(ids[s], AUDIO),
+            MARK[s],
+            ps[s].label,
+        );
+    }
+    for p in &ps {
+        assert!(
+            p.view().unreachable_sender_ids.is_empty(),
+            "STRANDED (reachable): {} is told a peer is unreachable on the final view",
+            p.label
+        );
+    }
+
+    assert_addresses_unique().await;
+    drop(on_new);
+    drop(ps);
+    drop(meeting);
+    await_meetings_drained(&prom, meetings_before, "STRANDED").await;
+}
+
+/// One participant's pre-kill handler set: its refs and the dead handler's.
+struct PreKill {
+    refs: Vec<u32>,
+    dead_ref: u32,
+}
+
+impl PreKill {
+    fn of(phase: &str, p: &Participant, dead_url: &str) -> Self {
+        Self {
+            refs: p
+                .sets
+                .current()
+                .map(|v| v.refs())
+                .unwrap_or_else(|| panic!("{phase}: {} has no handler set", p.label)),
+            dead_ref: handler_ref_of(phase, p, dead_url),
+        }
+    }
+}
+
+/// Wait for `p`'s set to hold a ref NOT in its pre-kill set at the pre-kill
+/// size (the replacement), then assert break-before-make from its history:
+/// the first set without the dead ref precedes the first set naming the new
+/// ref. Returns the new ref.
+async fn await_replacement(
+    phase: &str,
+    p: &mut Participant,
+    pre: &PreKill,
+    bound: Duration,
+) -> u32 {
+    let (pre_refs, want_len) = (pre.refs.clone(), pre.refs.len());
+    p.await_handler_set(phase, bound, move |sets| {
+        sets.current().is_some_and(|v| {
+            v.refs().len() == want_len && v.refs().iter().any(|r| !pre_refs.contains(r))
+        })
+    })
+    .await;
+    let current = p.sets.current().expect("awaited above");
+    let new_ref = current
+        .refs()
+        .into_iter()
+        .find(|r| !pre.refs.contains(r))
+        .expect("awaited above");
+    assert!(
+        p.sets.dial_token(new_ref).is_some(),
+        "{phase}: {}'s entry for the replacement carries no media_dial token",
+        p.label
+    );
+    // A set STRICTLY BETWEEN the last one naming the dead handler and the
+    // first naming the replacement, holding neither: break-before-make. (The
+    // FIRST set without the dead ref would be vacuous: under register-before-
+    // token the join's set may not name it yet.)
+    let history = p.sets.history();
+    let last_with_dead = history
+        .iter()
+        .rposition(|v| v.refs().contains(&pre.dead_ref))
+        .unwrap_or_else(|| {
+            panic!(
+                "{phase}: {} never received a set naming the dead handler",
+                p.label
+            )
+        });
+    let added_at = history
+        .iter()
+        .position(|v| v.refs().contains(&new_ref))
+        .expect("the current set names it");
+    assert!(
+        added_at > last_with_dead + 1,
+        "{phase} (break-before-make): {} got no set between the last naming the dead handler \
+         (#{last_with_dead}) and the first naming the replacement (#{added_at})",
+        p.label
+    );
+    let between = &history[last_with_dead + 1];
+    assert!(
+        !between.refs().contains(&pre.dead_ref) && !between.refs().contains(&new_ref),
+        "{phase} (break-before-make): {}'s set #{} must hold neither the dead handler nor the \
+         replacement: {:?}",
+        p.label,
+        last_with_dead + 1,
+        between.refs()
+    );
+    new_ref
+}
+
+/// MC's active meetings, fleet-wide.
+async fn mc_meetings_active(prom: &PrometheusClient) -> f64 {
+    prom.instance_counter_map(MC_MEETINGS_ACTIVE)
+        .await
+        .values()
+        .sum()
+}
+
+/// The pre-placement value of [`mc_meetings_active`], SETTLED: two reads one
+/// poll apart agreeing (a meeting ending from an earlier leg must not be
+/// mid-flight in the baseline).
+async fn settled_meetings_active(prom: &PrometheusClient) -> f64 {
+    let deadline = std::time::Instant::now() + BASELINE_SETTLE_BOUND;
+    let mut previous = mc_meetings_active(prom).await;
+    loop {
+        tokio::time::sleep(POLL).await;
+        let now = mc_meetings_active(prom).await;
+        #[expect(
+            clippy::float_cmp,
+            reason = "gauge sums of small integers are exact in f64"
+        )]
+        let settled = now == previous;
+        if settled {
+            return now;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "HYGIENE PRECONDITION (meetings-baseline-unsettled): mc_meetings_active did not \
+             settle within {BASELINE_SETTLE_BOUND:?} ({previous} -> {now}) — environment, not \
+             an MC defect"
+        );
+        previous = now;
+    }
+}
+
+/// LEG HYGIENE, NOT EVIDENCE. After a handler-loss leg dropped its
+/// participants, wait until MC's active meetings are back to the settled
+/// pre-placement count, so `run_leg`'s owned-MH teardown cannot make MC
+/// acquire a replacement for a still-live meeting and place it on a
+/// baseline MH (perturbing later legs' baselines).
+///
+/// Why the README §Evidence rule's exception applies: the fixture has no
+/// per-entity leave/end signal (no clean-leave API; dropping a participant is
+/// a disconnect, ended by MC after its disconnect grace period), so the only
+/// observable is the shared fleet gauge. RESIDUAL: a vacuous pass is possible
+/// (another meeting ending can satisfy the comparison while ours is still in
+/// grace), so nothing here proves anything about MC; it only makes the
+/// common case clean. The bound is the shared failure-only
+/// `PINNED_METRIC_BOUND`: MC publishes no gauge for its disconnect grace
+/// period (`MC_DISCONNECT_GRACE_PERIOD_SECONDS`, default 30 s) to derive one
+/// from.
+async fn await_meetings_drained(prom: &PrometheusClient, before: f64, phase: &str) {
+    let deadline = std::time::Instant::now() + PINNED_METRIC_BOUND;
+    loop {
+        let now = mc_meetings_active(prom).await;
+        if now <= before {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{phase} HYGIENE (meetings-not-drained): MC still holds {now} active meetings \
+             (settled before the leg: {before}) {PINNED_METRIC_BOUND:?} after the participants \
+             left — environment hygiene for the next leg, not an MC defect"
+        );
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// `v`'s audio slot naming `peer` is on the handler `handler_ref` names.

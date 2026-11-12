@@ -5,6 +5,7 @@
 //! only feeds it, acts on its transitions, and runs the one removal
 //! transaction a Dead/Impaired declaration triggers.
 
+use super::replacement::StartReason;
 use super::MeetingActor;
 use crate::actors::meeting_media::{Affected, HealthStep};
 use crate::media_routing::{HandlerHealth, HandlerId, RemovalTrigger, SuspicionOutcome};
@@ -144,13 +145,31 @@ impl MeetingActor {
     /// 5. drain its worker and send ONE `EndMeeting(trigger)`, in a task the
     ///    meeting's teardown awaits (never in this actor; never retried — the
     ///    next heartbeat's RELEASED is the retry), which then evicts the
-    ///    pair's generations.
+    ///    pair's generations;
+    /// 6. only then feed the removal to the replacement driver
+    ///    (`meeting/replacement.rs`), which may ask GC for a replacement —
+    ///    removal never waits on GC (ADR-0039 §3).
     ///
     /// Returns whether it was a member.
     pub(super) async fn remove_handler_completely(
         &mut self,
         wire_handler_id: &str,
         trigger: RemovalTrigger,
+    ) -> bool {
+        self.remove_handler_for(wire_handler_id, trigger, StartReason::Declared)
+            .await
+    }
+
+    /// [`Self::remove_handler_completely`] with the replacement's start reason
+    /// (a declaration, or a first `RegisterMeeting` that never acked). Step 6
+    /// of the transaction: the removal is fed to the replacement driver, which
+    /// asks GC for a replacement if the set is now short — AFTER the removal
+    /// completed, so removal never waits on GC (ADR-0039 §3).
+    pub(super) async fn remove_handler_for(
+        &mut self,
+        wire_handler_id: &str,
+        trigger: RemovalTrigger,
+        reason: StartReason,
     ) -> bool {
         let Some(removed) = self
             .media
@@ -167,12 +186,7 @@ impl MeetingActor {
         self.media
             .spawn_removal_release(removed.endpoint, trigger, removed.pusher);
         let survivors = self.media.handlers().len();
-        if let Some(wiring) = &self.wiring {
-            wiring
-                .handlerless_census
-                .set(&self.meeting_id, survivors == 0);
-            wiring.handlerless_census.publish();
-        }
+        self.publish_handlerless();
         info!(
             target: "mc.actor.meeting",
             meeting_id = %self.meeting_id,
@@ -184,6 +198,7 @@ impl MeetingActor {
             bindings_released = released.len(),
             "Media handler removed from the meeting"
         );
+        self.after_handler_removed(&HandlerId::new(wire_handler_id), trigger, reason);
         true
     }
 }

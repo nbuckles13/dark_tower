@@ -114,6 +114,23 @@ pub const MIN_MEDIA_DIAL_TOKEN_TTL_SECONDS: u32 = 60;
 /// token outlives its holder's departure.
 pub const MAX_MEDIA_DIAL_TOKEN_TTL_SECONDS: u32 = 900;
 
+/// Smallest legal `MC_MH_REPLACEMENT_MIN_INTERVAL_MS` (story 4 MC-C).
+///
+/// The per-meeting minimum interval between `AcquireMediaHandler` attempts,
+/// and the backoff ladder's first step. There is no per-MC limiter (user
+/// ruling, 2026-10-31), so this floor is what bounds one meeting's GC request
+/// rate; below 100 ms a flapping detector could hammer GC.
+pub const MIN_MH_REPLACEMENT_MIN_INTERVAL_MS: u32 = 100;
+
+/// Largest legal `MC_MH_REPLACEMENT_MIN_INTERVAL_MS`: above a minute a meeting
+/// that lost a handler waits too long for its first replacement.
+pub const MAX_MH_REPLACEMENT_MIN_INTERVAL_MS: u32 = 60_000;
+
+/// Largest legal `MC_MH_REPLACEMENT_BACKOFF_MAX_MS` (its floor is the
+/// configured minimum interval). Bounds how long an awaiting-handler meeting
+/// waits between attempts once GC is down or out of capacity.
+pub const MAX_MH_REPLACEMENT_BACKOFF_MAX_MS: u32 = 300_000;
+
 /// Smallest legal `MC_KEK_ROTATION_DEBOUNCE_SECONDS` (W).
 ///
 /// The floor is set by the CLIENT, not by MC: the client derives its
@@ -422,6 +439,21 @@ pub struct Config {
     /// [`Config::media_dial`] (TTL and the derived TTL/3 refresh interval).
     pub media_dial_token_ttl_seconds: u32,
 
+    /// The per-meeting minimum interval between replacement attempts in
+    /// milliseconds (`MC_MH_REPLACEMENT_MIN_INTERVAL_MS`, ADR-0039 §3), also
+    /// the backoff ladder's first step.
+    ///
+    /// Required, no Rust default, bounded
+    /// [`MIN_MH_REPLACEMENT_MIN_INTERVAL_MS`]`..=`[`MAX_MH_REPLACEMENT_MIN_INTERVAL_MS`]
+    /// at load. Projected once through [`Config::mh_replacement`].
+    pub mh_replacement_min_interval_ms: u32,
+
+    /// The replacement backoff cap in milliseconds
+    /// (`MC_MH_REPLACEMENT_BACKOFF_MAX_MS`). Required, no Rust default, bounded
+    /// `[MC_MH_REPLACEMENT_MIN_INTERVAL_MS, MAX_MH_REPLACEMENT_BACKOFF_MAX_MS]`
+    /// at load (a cap below the minimum interval refuses boot).
+    pub mh_replacement_backoff_max_ms: u32,
+
     /// Maximum ACCEPTED receive-capability declarations per connection
     /// (`MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`).
     ///
@@ -500,6 +532,14 @@ impl fmt::Debug for Config {
             .field(
                 "media_dial_token_ttl_seconds",
                 &self.media_dial_token_ttl_seconds,
+            )
+            .field(
+                "mh_replacement_min_interval_ms",
+                &self.mh_replacement_min_interval_ms,
+            )
+            .field(
+                "mh_replacement_backoff_max_ms",
+                &self.mh_replacement_backoff_max_ms,
             )
             .field(
                 "max_receive_capability_declarations",
@@ -830,6 +870,29 @@ impl Config {
             MAX_MEDIA_DIAL_TOKEN_TTL_SECONDS,
         )?;
 
+        // ADR-0039 §3 replacement pacing (story 4 MC-C). Required and bounded;
+        // the cap's floor is the minimum interval (a ladder that starts above
+        // its own cap is refused). `MissingEnvVar(` and the key literal stay on
+        // ONE line for `dt-guard env-config`'s single-line discovery regex.
+        let mh_replacement_min_interval_ms = bounded(
+            "MC_MH_REPLACEMENT_MIN_INTERVAL_MS",
+            vars.get("MC_MH_REPLACEMENT_MIN_INTERVAL_MS")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MC_MH_REPLACEMENT_MIN_INTERVAL_MS".to_string())
+                })?,
+            MIN_MH_REPLACEMENT_MIN_INTERVAL_MS,
+            MAX_MH_REPLACEMENT_MIN_INTERVAL_MS,
+        )?;
+        let mh_replacement_backoff_max_ms = bounded(
+            "MC_MH_REPLACEMENT_BACKOFF_MAX_MS",
+            vars.get("MC_MH_REPLACEMENT_BACKOFF_MAX_MS")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar("MC_MH_REPLACEMENT_BACKOFF_MAX_MS".to_string())
+                })?,
+            mh_replacement_min_interval_ms,
+            MAX_MH_REPLACEMENT_BACKOFF_MAX_MS,
+        )?;
+
         // Per-connection budget on ACCEPTED declarations (client-driven
         // meeting-actor work). Bounded on both sides by the same argument.
         let max_receive_capability_declarations = bounded(
@@ -1022,6 +1085,8 @@ impl Config {
             mh_heartbeat_timeout_ms,
             kek_rotation_debounce_seconds,
             media_dial_token_ttl_seconds,
+            mh_replacement_min_interval_ms,
+            mh_replacement_backoff_max_ms,
             max_receive_capability_declarations,
             audio_encoding,
             video_encoding,
@@ -1064,6 +1129,21 @@ impl Config {
     #[must_use]
     pub fn media_dial(&self) -> crate::media_dial::MediaDialTiming {
         crate::media_dial::MediaDialTiming::from_ttl_seconds(self.media_dial_token_ttl_seconds)
+    }
+
+    /// The replacement pacing, built from the two validated keys (ADR-0039
+    /// §3; story 4 MC-C).
+    ///
+    /// The ONE place they become timing: the per-meeting scheduler, the
+    /// published config gauges (incl. the derived retry budget the
+    /// awaiting-handler page reads) and the migration histogram's buckets all
+    /// read the value returned here.
+    #[must_use]
+    pub fn mh_replacement(&self) -> crate::media_routing::ReplacementTiming {
+        crate::media_routing::ReplacementTiming::from_config_ms(
+            self.mh_replacement_min_interval_ms,
+            self.mh_replacement_backoff_max_ms,
+        )
     }
 
     /// The KEK rotation lifecycle, built from W as validated at load.
@@ -1181,6 +1261,15 @@ mod tests {
                 "MC_MEDIA_DIAL_TOKEN_TTL_SECONDS".to_string(),
                 "300".to_string(),
             ),
+            // ADR-0039 §3 replacement pacing (story 4 MC-C).
+            (
+                "MC_MH_REPLACEMENT_MIN_INTERVAL_MS".to_string(),
+                "1000".to_string(),
+            ),
+            (
+                "MC_MH_REPLACEMENT_BACKOFF_MAX_MS".to_string(),
+                "30000".to_string(),
+            ),
         ])
     }
 
@@ -1211,6 +1300,8 @@ mod tests {
             "MC_MH_HEARTBEAT_TIMEOUT_MS",
             "MC_KEK_ROTATION_DEBOUNCE_SECONDS",
             "MC_MEDIA_DIAL_TOKEN_TTL_SECONDS",
+            "MC_MH_REPLACEMENT_MIN_INTERVAL_MS",
+            "MC_MH_REPLACEMENT_BACKOFF_MAX_MS",
         ] {
             let mut vars = base_vars();
             vars.remove(key);
@@ -2144,6 +2235,45 @@ mod tests {
                     "{raw}: the refusal names the key and range: {msg}"
                 ),
                 other => panic!("{raw}: expected InvalidValue, got {other:?}"),
+            }
+        }
+    }
+
+    /// Story 4 MC-C: both replacement keys are accepted at their bounds and
+    /// refused one past either bound (or unparseable) with the key named; a
+    /// backoff cap below the minimum interval refuses boot.
+    #[test]
+    fn mh_replacement_bounds_and_cap_not_below_minimum() {
+        for (min, max) in [("100", "100"), ("60000", "300000"), ("1000", "30000")] {
+            let mut vars = base_vars();
+            vars.insert(
+                "MC_MH_REPLACEMENT_MIN_INTERVAL_MS".to_string(),
+                min.to_string(),
+            );
+            vars.insert(
+                "MC_MH_REPLACEMENT_BACKOFF_MAX_MS".to_string(),
+                max.to_string(),
+            );
+            let config = Config::from_vars(&vars).expect(min);
+            let timing = config.mh_replacement();
+            assert_eq!(timing.min_interval().as_millis().to_string(), min);
+            assert_eq!(timing.backoff_max().as_millis().to_string(), max);
+        }
+        for (key, raw) in [
+            ("MC_MH_REPLACEMENT_MIN_INTERVAL_MS", "99"),
+            ("MC_MH_REPLACEMENT_MIN_INTERVAL_MS", "60001"),
+            ("MC_MH_REPLACEMENT_MIN_INTERVAL_MS", "abc"),
+            ("MC_MH_REPLACEMENT_BACKOFF_MAX_MS", "300001"),
+            ("MC_MH_REPLACEMENT_BACKOFF_MAX_MS", "999"),
+            ("MC_MH_REPLACEMENT_BACKOFF_MAX_MS", ""),
+        ] {
+            let mut vars = base_vars();
+            vars.insert(key.to_string(), raw.to_string());
+            match Config::from_vars(&vars) {
+                Err(ConfigError::InvalidValue(msg)) => {
+                    assert!(msg.contains(key), "{key}={raw}: names the key: {msg}");
+                }
+                other => panic!("{key}={raw}: expected InvalidValue, got {other:?}"),
             }
         }
     }
