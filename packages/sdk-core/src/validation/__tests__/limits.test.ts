@@ -2,7 +2,7 @@
 //
 // R-60/R-23 (G2): the MH-status byte-cap. `capUtf8Bytes`/`capMhUrl` must truncate
 // at a UTF-8 CODEPOINT boundary (never split a multi-byte char) and count BYTES,
-// not `.length` — matching MC's 256-byte `floor_char_boundary` bound.
+// not `.length` — the 256-byte bound stated at `MhConnectionStatus.failure_reason`.
 
 import { describe, expect, it } from 'vitest';
 

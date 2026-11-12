@@ -130,9 +130,6 @@ impl fmt::Debug for dark_tower::signaling::v1::JoinResponse {
                 "existing_participants_count",
                 &self.existing_participants.len(),
             )
-            // Through `MediaServerInfo`'s redacting `Debug`: each entry
-            // carries a `media_dial_token`.
-            .field("media_servers", &self.media_servers)
             // NOT redacted, deliberately: `correlation_id` is an identifier,
             // not a credential — possessing it does not authenticate a
             // reconnect, the HMAC on `binding_token` does — and it is the
@@ -178,15 +175,13 @@ impl fmt::Debug for dark_tower::signaling::v1::MeetingKekUpdate {
 }
 
 /// Redacting `Debug`; see the SAFETY INVARIANT block above `RedactedLen`.
-/// `join_token` is a bearer meeting JWT (same semantics as
-/// `JoinRequest.join_token`) and `media_dial_token` is the MC-minted dial
-/// credential, so this envelope carries the same redaction the join path does
-/// — otherwise a malformed-envelope `?envelope` log in
-/// `crates/mh-service/src/webtransport/connection.rs` prints them.
+/// `media_dial_token` is the MC-minted dial credential (ADR-0039 §5), the ONE
+/// connect credential, so this envelope carries the same redaction the join
+/// path does — otherwise a malformed-envelope `?envelope` log in
+/// `crates/mh-service/src/webtransport/connection.rs` prints it.
 impl fmt::Debug for dark_tower::signaling::v1::MhConnectRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MhConnectRequest")
-            .field("join_token", &RedactedLen(self.join_token.len()))
             .field(
                 "media_dial_token",
                 &RedactedLen(self.media_dial_token.len()),

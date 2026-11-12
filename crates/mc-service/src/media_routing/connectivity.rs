@@ -7,8 +7,9 @@
 //! `NotifyParticipantDisconnected` (`grpc/media_coordination.rs`), whose
 //! participant identity is the validated meeting token's `sub` (resolved to ONE
 //! roster entry by the meeting actor, or to none) and whose `handler_id` is
-//! resolved against the meeting's handler set by exact match. The client-reported
-//! `ParticipantActor::mh_statuses` map is a diagnostic and is never read here.
+//! resolved against the meeting's handler set by exact match. Client-reported
+//! `MediaConnectionUpdate` statuses (`media_dial/status.rs`) are diagnostic and
+//! never read here.
 //!
 //! # Keyed by connection, never by (participant, handler)
 //!

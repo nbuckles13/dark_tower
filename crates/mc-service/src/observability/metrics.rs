@@ -1749,15 +1749,13 @@ pub fn record_mh_notification(event_type: &str) {
     .increment(1);
 }
 
-/// `mc_participant_mh_status_dropped_total{reason="cap"}`: a status for a new
-/// url refused at the participant actor's map cap (per entry).
-pub const MH_STATUS_DROP_CAP: &str = "cap";
-/// `reason="over_limit"`: an update carried more statuses than one update may
-/// (once per update).
+/// `mc_participant_mh_status_dropped_total{reason="over_limit"}`: an update
+/// carried more statuses than one update may (once per update).
 pub const MH_STATUS_DROP_OVER_LIMIT: &str = "over_limit";
 /// `reason="rate_limited"`: a whole update NOT forwarded to the meeting actor
 /// because the connection's status-forward limiter was empty (once per update,
-/// never per status; mutually exclusive with `over_limit` for that update).
+/// never per status; may fire alongside `over_limit` for the same oversized,
+/// over-rate update).
 pub const MH_STATUS_DROP_RATE_LIMITED: &str = "rate_limited";
 
 /// Record one per-MH connection status reported by a client `MediaConnectionUpdate` (R-60).
@@ -1770,10 +1768,12 @@ pub const MH_STATUS_DROP_RATE_LIMITED: &str = "rate_limited";
 /// via a total match with an `unspecified` catch-all, so a malformed/unknown
 /// wire value can never widen the label domain).
 ///
-/// Incremented once per `MhConnectionStatus` entry that is RECORDED on the
-/// participant actor. Mutually exclusive with `record_participant_mh_status_dropped`
-/// (a cap-refused entry does NOT bump this counter). `mh_url` / `failure_reason`
-/// / `failure_code` are client-controlled and are NEVER labels.
+/// Incremented once per `MhConnectionStatus` entry in the first
+/// `MAX_MH_STATUSES_PER_UPDATE` of a `MediaConnectionUpdate`, at the ONE emit
+/// site (`webtransport::connection::handle_media_connection_update`), before
+/// and independent of the `handler_ref` filter and the status-forward rate
+/// limit. `handler_ref`, `handler_set_version` and the client strings
+/// (`failure_reason` / `failure_code`) are NEVER labels.
 pub fn record_participant_mh_status(state: &str) {
     counter!("mc_participant_mh_status_total",
         "state" => state.to_string()
@@ -1782,27 +1782,24 @@ pub fn record_participant_mh_status(state: &str) {
 }
 
 /// Record a dropped client-reported MH status (R-60 security). Two independent
-/// bounds, one per `reason`:
-/// - `"cap"` — a PER-ENTRY drop: the per-participant map already holds
-///   `MAX_MH_STATUSES_PER_PARTICIPANT` distinct `mh_url`s, so a new key is
-///   refused. Mutually exclusive with `record_participant_mh_status` for that
-///   entry (a cap-refused entry never bumps the recorded counter).
-/// - `"over_limit"` — a PER-MESSAGE drop: a single `MediaConnectionUpdate`
-///   carried more than `MAX_MH_STATUSES_PER_UPDATE` statuses, so the excess is
-///   refused before any per-entry work. Fires ONCE per oversized message,
-///   independently of (and possibly alongside) the recorded/`cap` entries from
-///   the truncated prefix — so it is NOT per-entry mutually exclusive.
+/// bounds, one per `reason`, each counted ONCE per update:
+/// - `"over_limit"` — a single `MediaConnectionUpdate` carried more than
+///   `MAX_MH_STATUSES_PER_UPDATE` statuses, so the excess is refused before any
+///   per-entry work. Fires alongside the per-state counts of the truncated
+///   prefix.
+/// - `"rate_limited"` — the update's ref-keyed reports were not forwarded to
+///   the meeting actor (status-forward limiter empty). May fire alongside
+///   `over_limit` for the same oversized, over-rate update.
 ///
 /// Metric: `mc_participant_mh_status_dropped_total`
 /// Labels: `reason`
 ///
-/// Reason values: [`MH_STATUS_DROP_CAP`], [`MH_STATUS_DROP_OVER_LIMIT`],
-/// [`MH_STATUS_DROP_RATE_LIMITED`]
-/// Cardinality: 3.
+/// Reason values: [`MH_STATUS_DROP_OVER_LIMIT`], [`MH_STATUS_DROP_RATE_LIMITED`]
+/// Cardinality: 2.
 ///
 /// A bounded counter is used instead of a per-entry log to avoid the
-/// log-amplification vector a hostile client could drive by flooding distinct
-/// `mh_url`s or packing an oversized batch.
+/// log-amplification vector a hostile client could drive by packing an
+/// oversized batch or flooding updates.
 pub fn record_participant_mh_status_dropped(reason: &'static str) {
     counter!("mc_participant_mh_status_dropped_total",
         "reason" => reason.to_string()
@@ -1823,7 +1820,7 @@ pub fn record_participant_mh_status_dropped(reason: &'static str) {
 /// Cardinality: 4 (bounded — the caller maps the internal `LeaveReason` enum via
 /// an EXHAUSTIVE match, so a new variant is a compile error, never an unbounded
 /// or mislabeled series). The label is a fixed `&'static str`, never a client
-/// string / `mh_url` / participant-id.
+/// string / `handler_ref` / participant-id.
 ///
 /// Emitted at the single roster-removal choke-point in `actors::meeting`:
 /// - `voluntary` — clean transport close (skip-grace) OR explicit leave
@@ -2405,11 +2402,7 @@ const MH_EVENT_TYPES: &[&str] = &["connected", "disconnected"];
 const MH_STATUS_STATES: &[&str] = &["connected", "disconnected", "failed", "unspecified"];
 /// `mc_participant_mh_status_dropped_total{reason}`. Emit sites: the
 /// `MH_STATUS_DROP_*` consts.
-const MH_STATUS_DROP_REASONS: &[&str] = &[
-    MH_STATUS_DROP_CAP,
-    MH_STATUS_DROP_OVER_LIMIT,
-    MH_STATUS_DROP_RATE_LIMITED,
-];
+const MH_STATUS_DROP_REASONS: &[&str] = &[MH_STATUS_DROP_OVER_LIMIT, MH_STATUS_DROP_RATE_LIMITED];
 /// `mc_join_display_name_resolved_total{outcome}`. Emit sites: two literals.
 const DISPLAY_NAME_OUTCOMES: &[&str] = &["present", "fallback"];
 /// `mc_join_identity_key_presence_total{presence}`. Emit sites: two literals.
@@ -3925,15 +3918,14 @@ mod tests {
     fn metrics_module_emits_participant_mh_status_cluster() {
         let snap = MetricAssertion::snapshot();
 
-        // Facade coverage (R-60) — the full match/increment behavior + cap
-        // mutual-exclusivity is exercised end-to-end in
-        // `actors::participant::tests`; this pins the facade → metric-name/label
-        // wiring per ADR-0032 (validate-metric-coverage).
+        // Facade coverage (R-60) — the per-status emission is exercised at
+        // its one site in `webtransport::connection::tests`; this pins the
+        // facade → metric-name/label wiring per ADR-0032
+        // (validate-metric-coverage).
         record_participant_mh_status("connected");
         record_participant_mh_status("failed");
         record_participant_mh_status("disconnected");
         record_participant_mh_status("unspecified");
-        record_participant_mh_status_dropped(MH_STATUS_DROP_CAP);
         record_participant_mh_status_dropped(MH_STATUS_DROP_OVER_LIMIT);
 
         snap.counter("mc_participant_mh_status_total")
@@ -3947,9 +3939,6 @@ mod tests {
             .assert_delta(1);
         snap.counter("mc_participant_mh_status_total")
             .with_labels(&[("state", "unspecified")])
-            .assert_delta(1);
-        snap.counter("mc_participant_mh_status_dropped_total")
-            .with_labels(&[("reason", "cap")])
             .assert_delta(1);
         snap.counter("mc_participant_mh_status_dropped_total")
             .with_labels(&[("reason", "over_limit")])

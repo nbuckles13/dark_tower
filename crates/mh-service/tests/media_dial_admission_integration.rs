@@ -47,7 +47,7 @@ use test_common::tokens::{
 };
 use test_common::wt_client::{
     connect_and_open_bi, expect_session_close, expect_still_open, write_mh_connect,
-    write_mh_connect_both,
+    write_mh_connect_with_vacated_tag_1,
 };
 use test_common::TestKeypair;
 use tokio::sync::mpsc;
@@ -177,13 +177,14 @@ impl Suite {
         (conn, send)
     }
 
-    async fn dial_both(
+    /// Dial as an OLD client: `tag_1` on the vacated `join_token` tag.
+    async fn dial_old_client(
         &self,
-        join_token: &str,
+        tag_1: &str,
         media_dial_token: &str,
     ) -> (wtransport::Connection, wtransport::stream::SendStream) {
         let (conn, mut send, _recv) = connect_and_open_bi(&self.wt.url).await;
-        write_mh_connect_both(&mut send, join_token, media_dial_token)
+        write_mh_connect_with_vacated_tag_1(&mut send, tag_1, media_dial_token)
             .await
             .unwrap();
         (conn, send)
@@ -341,11 +342,11 @@ async fn a_meeting_key_token_is_admitted_and_reusable_within_its_ttl() {
     let _second = expect_admitted(&mut suite, &token, SENDER_PUBLISHER, "second dial").await;
 }
 
-/// The SDK's join-time shape (until P3): a valid dial token PLUS a non-empty
-/// `join_token` — here a genuinely EXPIRED AC token, the migration case — is
-/// admitted: MH never reads `join_token`.
+/// An OLD client's shape: a valid dial token PLUS a string on the vacated
+/// `MhConnectRequest` tag 1 (the deleted `join_token`) — here a genuinely
+/// EXPIRED AC token — is admitted: tag 1 decodes as unknown and is never read.
 #[tokio::test(flavor = "current_thread")]
-async fn a_join_token_beside_a_valid_dial_token_is_ignored_even_when_expired() {
+async fn an_old_clients_tag_1_beside_a_valid_dial_token_is_ignored_even_when_expired() {
     let mut suite = Suite::start(SenderReplies::default().with("user-1", SENDER_PUBLISHER)).await;
     suite.register(MEETING).await;
     let ac = TestKeypair::new(31, "ac-key");
@@ -356,23 +357,23 @@ async fn a_join_token_beside_a_valid_dial_token_is_ignored_even_when_expired() {
 
     let snap = MetricAssertion::snapshot();
     let (conn, _send) = suite
-        .dial_both(&expired_ac, &mint_dial_token(MEETING, "user-1", HANDLER_ID))
+        .dial_old_client(&expired_ac, &mint_dial_token(MEETING, "user-1", HANDLER_ID))
         .await;
     assert!(suite.bound_within(MEETING, SENDER_PUBLISHER).await);
     assert_dial_validation(&snap, None);
     expect_still_open(&conn, Duration::from_millis(200), "join-time shape").await;
 }
 
-/// Never both credentials: a VALID AC meeting token with an EMPTY dial token
-/// is DECLINED (empty is malformed; there is no fallback).
+/// Never both credentials: a VALID AC meeting token on the vacated tag 1 with
+/// an EMPTY dial token is DECLINED (empty is malformed; there is no fallback).
 #[tokio::test(flavor = "current_thread")]
-async fn a_valid_ac_join_token_without_a_dial_token_is_declined() {
+async fn a_valid_ac_token_on_tag_1_without_a_dial_token_is_declined() {
     let mut suite = Suite::start(SenderReplies::default().with("user-1", SENDER_PUBLISHER)).await;
     suite.register(MEETING).await;
     let ac = TestKeypair::new(31, "ac-key");
     let snap = MetricAssertion::snapshot();
     let (conn, _send) = suite
-        .dial_both(&mint_meeting_token(&ac, MEETING, "user-1"), "")
+        .dial_old_client(&mint_meeting_token(&ac, MEETING, "user-1"), "")
         .await;
     expect_session_close(
         &conn,

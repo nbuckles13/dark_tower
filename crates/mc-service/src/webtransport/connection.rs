@@ -7,11 +7,8 @@
 //! 4. Notifies the meeting when the connection drops (via `MeetingActorHandle`)
 
 use crate::actors::messages::{DisconnectCause, JoinResult, ServerMuteRefusal, UnmuteRelay};
-use crate::actors::{
-    BoundedMhStatus, MeetingActorHandle, MeetingControllerActorHandle, MhState,
-    ParticipantActorHandle,
-};
 use crate::actors::{JoinMedia, MediaRoutingDeps};
+use crate::actors::{MeetingActorHandle, MeetingControllerActorHandle, ParticipantActorHandle};
 use crate::auth::McJwtValidator;
 use crate::client_work_limiter::ClientWorkLimiter;
 use crate::errors::McError;
@@ -49,18 +46,17 @@ use wtransport::Connection;
 pub(crate) const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
 /// Maximum bytes for a client-controlled string before it is stored or logged
-/// (R-60 security). Applied to `mh_url` / `failure_reason` / `failure_code`.
+/// (security). Applied to the relayed `UnmuteRequest.participant_id`; the
+/// 256-byte bound is stated at `MhConnectionStatus.failure_reason` in
+/// `signaling.proto`.
 const MAX_CLIENT_STRING_BYTES: usize = 256;
 
 /// Maximum number of per-MH statuses processed from a SINGLE
 /// `MediaConnectionUpdate` message (R-60 security — input-amplification bound).
-/// The persistent per-participant map is capped separately at
-/// `MAX_MH_STATUSES_PER_PARTICIPANT` (16); this bounds the transient work the
-/// handler does per message. A 64 KiB frame can pack tens of thousands of
-/// minimal statuses, but at most 16 can ever land — so we refuse to map+iterate
-/// an unbounded attacker-sized batch. Set to 4× the map cap so a legitimate
-/// client (which sends ≤ its assigned MH count, ≤ the map cap) is never
-/// affected. Over-limit batches bump
+/// A 64 KiB frame can pack tens of thousands of minimal statuses, so we refuse
+/// to iterate an unbounded attacker-sized batch. Far above any legitimate
+/// client, which reports at most one status per handler in its set.
+/// Over-limit batches bump
 /// `mc_participant_mh_status_dropped_total{reason="over_limit"}`.
 const MAX_MH_STATUSES_PER_UPDATE: usize = 64;
 
@@ -154,6 +150,35 @@ async fn resolve_close_cause(connection: &Connection) -> DisconnectCause {
     match tokio::time::timeout(CLOSE_CAUSE_RESOLVE_BOUND, connection.closed()).await {
         Ok(error) => classify_connection_error(&error),
         Err(_) => DisconnectCause::ConnectionLost,
+    }
+}
+
+/// Per-MH connection state reported by the client in a `MediaConnectionUpdate`
+/// (R-60). Bounded, low-cardinality domain enum (decoupled from the wire proto)
+/// — drives the `mc_participant_mh_status_total{state}` label at the
+/// `MediaConnectionUpdate` boundary, and is narrowed to the ref-keyed
+/// `ReportedState` for the meeting actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MhState {
+    /// Client reports the MH media connection is established.
+    Connected,
+    /// Client reports the MH media connection failed.
+    Failed,
+    /// Client reports the MH media connection was disconnected.
+    Disconnected,
+    /// Proto3 default / unknown wire value (allowlist-clamp catch-all).
+    Unspecified,
+}
+
+impl MhState {
+    /// Lowercase, bounded metric-label form (exactly 4 possible values).
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Failed => "failed",
+            Self::Disconnected => "disconnected",
+            Self::Unspecified => "unspecified",
+        }
     }
 }
 
@@ -905,7 +930,6 @@ async fn handle_client_message(
                 &trace_parent,
                 &trace_state,
                 connection_id,
-                participant_handle,
                 media,
             )
             .await;
@@ -947,15 +971,14 @@ async fn handle_client_message(
     }
 }
 
-/// Handle a post-join `MediaConnectionUpdate` (R-60), recording per-MH state on
-/// the participant actor.
+/// Handle a post-join `MediaConnectionUpdate` (R-60): count each status by
+/// state, then forward the ref-keyed reports to the meeting actor.
 ///
 /// Runs in its OWN span reparented onto the message's trace context (R-57 —
 /// a fresh CHILD span, NOT a re-parent of the long-lived connection span, whose
-/// single parent is fixed at the JoinRequest). All client-controlled strings
-/// (`mh_url` / `failure_reason` / `failure_code`) are truncated to
-/// `MAX_CLIENT_STRING_BYTES` on a char boundary at this trust boundary before
-/// being handed to the actor, so no untruncated field is ever stored or logged.
+/// single parent is fixed at the JoinRequest). The client-controlled strings
+/// (`failure_reason` / `failure_code`) are dropped unread: nothing here stores,
+/// logs, labels or forwards them.
 #[instrument(
     target = "mc.webtransport.connection",
     name = "mc.media_connection_update",
@@ -967,7 +990,6 @@ async fn handle_media_connection_update(
     trace_parent: &str,
     trace_state: &str,
     connection_id: &str,
-    participant_handle: &ParticipantActorHandle,
     media: &mut MediaSignalingContext,
 ) {
     // Reparent THIS span onto the client's per-message trace context (empty →
@@ -976,16 +998,16 @@ async fn handle_media_connection_update(
 
     // ADR-0039 §4/§5: the ref-keyed reports go to the meeting actor (latest
     // status per (participant, ref); an in-set FAILED may trigger a credential
-    // re-push to THIS participant). Built before the legacy mapping consumes
-    // the update; string-free; UNSPECIFIED/unknown states and ref 0 dropped.
+    // re-push to THIS participant). String-free; UNSPECIFIED/unknown states and
+    // ref 0 dropped.
     let ref_reports = client_handler_reports(&update);
 
-    // Bound the per-message fan-out BEFORE doing any per-entry work (R-60
-    // security): a hostile client can pack a 64 KiB frame with tens of thousands
-    // of minimal statuses, but at most the map cap can ever land. Refuse to
-    // map+iterate an unbounded attacker-sized batch — `take` the first
-    // `MAX_MH_STATUSES_PER_UPDATE` and record the truncation as an observable
-    // drop (no client strings logged, mirroring the cap-drop discipline).
+    // Bound the per-message fan-out (R-60 security): a hostile client can pack
+    // a 64 KiB frame with tens of thousands of minimal statuses, so refuse to
+    // iterate an unbounded attacker-sized batch — every per-entry pass
+    // (`client_handler_reports`, the per-state count below) takes the first
+    // `MAX_MH_STATUSES_PER_UPDATE`; the truncation is recorded once as an
+    // observable drop (no client strings logged).
     let over_limit = update.statuses.len() > MAX_MH_STATUSES_PER_UPDATE;
     if over_limit {
         crate::observability::metrics::record_participant_mh_status_dropped(
@@ -993,40 +1015,19 @@ async fn handle_media_connection_update(
         );
     }
 
-    // Map + truncate at the trust boundary: the actor only ever receives bounded
-    // domain values keyed by the truncated `mh_url`.
-    let statuses: Vec<(String, BoundedMhStatus)> = update
-        .statuses
-        .into_iter()
-        .take(MAX_MH_STATUSES_PER_UPDATE)
-        .map(|s| {
-            let key = truncate_utf8(&s.mh_url, MAX_CLIENT_STRING_BYTES);
-            let bounded = BoundedMhStatus {
-                state: map_connection_state(s.state),
-                failure_reason: s
-                    .failure_reason
-                    .map(|r| truncate_utf8(&r, MAX_CLIENT_STRING_BYTES)),
-                failure_code: s
-                    .failure_code
-                    .map(|c| truncate_utf8(&c, MAX_CLIENT_STRING_BYTES)),
-            };
-            (key, bounded)
-        })
-        .collect();
-
-    forward_client_handler_reports(ref_reports, connection_id, media).await;
-
-    if let Err(e) = participant_handle.record_mh_statuses(statuses).await {
-        // Actor gone mid-connection (mailbox receiver dropped). Graceful — no
-        // panic; the connection will close on its own. No client-controlled
-        // strings in this log line.
-        debug!(
-            target: "mc.webtransport.connection",
-            connection_id = %connection_id,
-            error = %e,
-            "Failed to deliver MediaConnectionUpdate to participant actor"
+    // THE one emission site of `mc_participant_mh_status_total{state}` (the
+    // `MCMediaConnectionAllFailed` alert input): once per status in the
+    // bounded prefix, through the total `map_connection_state` (an unknown
+    // wire value counts as `unspecified`). Independent of the ref filter and
+    // before the rate-limited forward below, so every status in the prefix is
+    // counted whether or not it is forwarded.
+    for s in update.statuses.iter().take(MAX_MH_STATUSES_PER_UPDATE) {
+        crate::observability::metrics::record_participant_mh_status(
+            map_connection_state(s.state).label(),
         );
     }
+
+    forward_client_handler_reports(ref_reports, connection_id, media).await;
 }
 
 /// Status-forward hops a fresh connection may make immediately (ADR-0039 §4).
@@ -2451,19 +2452,14 @@ fn build_join_response(result: &JoinResult, media: &ClientMediaConfig) -> JoinRe
     // The joiner's handler set (ADR-0039 §4, §5): ACTIVE handlers only
     // (register before token), each with a `media_dial_token` minted for this
     // participant, built by the actor through the ONE projection when the
-    // reply was sent. The same entries feed the legacy `media_servers`
-    // (double-populated until C1/P3), so an old SDK never sees a handler the
-    // new set does not list and both carry the same tokens. Every url is the
-    // same string every `SendTarget` / `StreamAssignment` carries
-    // (`MeetingHandlers::client_handler`). Never a Redis read. Order carries
-    // no meaning.
+    // reply was sent. Every `handler_ref` a `SendTarget` / `StreamAssignment`
+    // carries is a member of this set (`MeetingHandlers::client_handler`).
+    // Never a Redis read. Order carries no meaning.
     let media_handler_set = result.handler_set.clone();
-    let media_servers = media_handler_set.handlers.clone();
 
     JoinResponse {
         participant_id: result.participant_id.clone(),
         existing_participants,
-        media_servers,
         // ADR-0036 §2/§4. `sender_id` is `NonZeroU16` widened into the
         // proto's `uint32` — `u32::from`, never `as`, and never 0.
         sender_id: Some(u32::from(result.sender_id.get().get())),
@@ -3017,12 +3013,11 @@ mod tests {
         set.client_snapshot()
     }
 
-    /// ADR-0039 §4/§5: the new set and the legacy `media_servers` are ONE
-    /// projection (Active only — mh-1 is still Registering and appears in
-    /// neither), the set is always present, refs are non-zero, and both carry
-    /// the SAME per-entry `media_dial_token`.
+    /// ADR-0039 §4/§5: the set is the Active-only projection (mh-1 is still
+    /// Registering and is not listed), always present, with non-zero refs and
+    /// the per-entry `media_dial_token`.
     #[tokio::test]
-    async fn the_join_response_double_populates_one_active_only_projection() {
+    async fn the_join_response_carries_the_active_only_handler_set() {
         let (handle, _task) = test_participant_handle();
         let handler_set = test_handler_set();
         let result = JoinResult {
@@ -3050,10 +3045,6 @@ mod tests {
         assert_eq!(set.handlers[0].media_handler_url, "https://mh-0.test:4434");
         assert_ne!(set.handlers[0].handler_ref, 0);
         assert_eq!(set.handlers[0].media_dial_token, "token-for-mh-0");
-        assert_eq!(
-            response.media_servers, set.handlers,
-            "one projection, same tokens"
-        );
         // Every carrier's Debug redacts the token (S9 / item 13): the result,
         // the response, and a ServerMessage carrying the set.
         let wire_token = set.handlers[0].media_dial_token.clone();
@@ -3077,7 +3068,6 @@ mod tests {
             .expect("present")
             .handlers
             .is_empty());
-        assert!(response.media_servers.is_empty());
     }
 
     /// Both per-kind caps are written (the single total, tag 12, was deleted
@@ -3497,7 +3487,6 @@ mod tests {
                     statuses: statuses
                         .into_iter()
                         .map(|(handler_ref, state)| v1::MhConnectionStatus {
-                            mh_url: "https://mh-0.test:4434".to_string(),
                             state: state as i32,
                             handler_ref,
                             handler_set_version: 3,
@@ -3611,6 +3600,11 @@ mod tests {
         handle_client_message(&failed, "c", &participant, &mut media).await;
         cell(&snap, "rate_limited").assert_delta(1);
         cell(&snap, "over_limit").assert_delta(0);
+        // The per-state count is independent of the forward: the refused
+        // update is still counted (the alert input sees every report).
+        snap.counter("mc_participant_mh_status_total")
+            .with_labels(&[("state", "failed")])
+            .assert_delta(1);
         assert_eq!(
             latest(&media).await,
             Some(ReportedState::Connected),
@@ -3620,8 +3614,8 @@ mod tests {
         assert!(stream_rx.try_recv().is_err(), "and caused no re-push");
 
         // Nothing ref-keyed: no hop, no spend, no count.
-        let legacy_only = status_update(vec![(0, v1::ConnectionState::Connected)]);
-        handle_client_message(&legacy_only, "c", &participant, &mut media).await;
+        let ref_zero = status_update(vec![(0, v1::ConnectionState::Connected)]);
+        handle_client_message(&ref_zero, "c", &participant, &mut media).await;
         cell(&snap, "rate_limited").assert_delta(1);
 
         tokio::time::advance(std::time::Duration::from_millis(
@@ -3636,6 +3630,78 @@ mod tests {
             Some(ReportedState::Disconnected),
             "the refill forwarded exactly one more"
         );
+    }
+
+    fn raw_status_update(states: &[(u32, i32)]) -> Vec<u8> {
+        ClientMessage {
+            message: Some(client_message::Message::MediaConnectionUpdate(
+                v1::MediaConnectionUpdate {
+                    statuses: states
+                        .iter()
+                        .map(|&(handler_ref, state)| v1::MhConnectionStatus {
+                            state,
+                            handler_ref,
+                            ..Default::default()
+                        })
+                        .collect(),
+                },
+            )),
+            trace_parent: String::new(),
+            trace_state: String::new(),
+        }
+        .encode_to_vec()
+    }
+
+    /// `mc_participant_mh_status_total{state}` (the `MCMediaConnectionAllFailed`
+    /// input) counts EVERY status by state at the boundary — including ref 0
+    /// and unspecified/unknown states, which the ref-keyed forward drops — and
+    /// nothing else.
+    #[tokio::test]
+    async fn every_reported_status_is_counted_by_state_at_the_boundary() {
+        let (participant, _task) = test_participant_handle();
+        let (mut media, _meeting) = test_media_context();
+        let snap = common::observability::testing::MetricAssertion::snapshot();
+        let update = raw_status_update(&[
+            (1, v1::ConnectionState::Connected as i32),
+            (2, v1::ConnectionState::Failed as i32),
+            (0, v1::ConnectionState::Failed as i32),
+            (3, v1::ConnectionState::Disconnected as i32),
+            (4, v1::ConnectionState::Unspecified as i32),
+            (5, 99),
+        ]);
+        handle_client_message(&update, "c", &participant, &mut media).await;
+        for (state, n) in [
+            ("connected", 1),
+            ("failed", 2),
+            ("disconnected", 1),
+            ("unspecified", 2),
+        ] {
+            snap.counter("mc_participant_mh_status_total")
+                .with_labels(&[("state", state)])
+                .assert_delta(n);
+        }
+        snap.counter("mc_participant_mh_status_dropped_total")
+            .with_labels(&[("reason", "over_limit")])
+            .assert_delta(0);
+    }
+
+    /// An oversized update counts its bounded prefix by state, and the excess
+    /// once as `over_limit`.
+    #[tokio::test]
+    async fn an_oversized_update_counts_only_its_bounded_prefix() {
+        let (participant, _task) = test_participant_handle();
+        let (mut media, _meeting) = test_media_context();
+        let snap = common::observability::testing::MetricAssertion::snapshot();
+        let states: Vec<(u32, i32)> = (0..MAX_MH_STATUSES_PER_UPDATE + 5)
+            .map(|_| (0, v1::ConnectionState::Failed as i32))
+            .collect();
+        handle_client_message(&raw_status_update(&states), "c", &participant, &mut media).await;
+        snap.counter("mc_participant_mh_status_total")
+            .with_labels(&[("state", "failed")])
+            .assert_delta(u64::try_from(MAX_MH_STATUSES_PER_UPDATE).unwrap());
+        snap.counter("mc_participant_mh_status_dropped_total")
+            .with_labels(&[("reason", "over_limit")])
+            .assert_delta(1);
     }
 
     #[tokio::test]

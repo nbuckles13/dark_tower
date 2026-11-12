@@ -55,13 +55,16 @@ export const MAX_HANDLER_SET_SIZE = 16;
 // (@dry-reviewer / @code-reviewer D1). Keep the two semantics visibly separate.
 // ============================================================================
 
-// ANCHOR (DRY): the MH-status field byte-cap mirrors the MC handler's truncation
-// bound — `MhConnectionStatus.{mh_url,failure_reason,failure_code}` are
-// client-controlled/untrusted, and MC truncates each at 256 BYTES via
-// `floor_char_boundary` before logging (proto/dark_tower/signaling/v1/signaling.proto
-// comment on `mh_url`). The SDK caps them at the SAME 256-byte boundary when
-// populating the outbound `MediaConnectionUpdate`, so nothing unbounded reaches the
-// wire (R-23/R-60). BYTES, not chars — see `capUtf8Bytes`.
+// ANCHOR (DRY): one 256-BYTE value, two SDK uses. (1) The outbound
+// `MhConnectionStatus.{failure_reason,failure_code}` cap: THE rule is stated once
+// at `MhConnectionStatus.failure_reason` in
+// proto/dark_tower/signaling/v1/signaling.proto (untrusted client strings, any
+// reader truncates to 256 bytes, the SDK caps at <= 256 when populating), so
+// nothing unbounded reaches the wire (R-23/R-60). (2) The inbound bound on a
+// `MediaServerInfo.media_handler_url` in a handler set (`handlerSetIntake.ts`):
+// SDK-own — neither the proto nor MC bounds that field — and also the cap on
+// `MediaConnectionError.mhUrl`, which is a set url. BYTES, not chars — see
+// `capUtf8Bytes`.
 export const MAX_MH_URL_BYTES = 256;
 
 /** RFC 7235 `token68`. Anchored, module-level literal — never `new RegExp(userInput)`. */
@@ -98,9 +101,10 @@ export function capUtf8Bytes(value: string, maxBytes: number): string {
 }
 
 /**
- * Cap an MH-status string field at {@link MAX_MH_URL_BYTES} (256) UTF-8 bytes on a
- * codepoint boundary. Applied to `mh_url` / `failure_reason` / `failure_code` when
- * the SDK builds an outbound `MhConnectionStatus` (R-60 / R-23).
+ * Cap a string at {@link MAX_MH_URL_BYTES} (256) UTF-8 bytes on a codepoint
+ * boundary. Applied to `failure_reason` / `failure_code` when the SDK builds an
+ * outbound `MhConnectionStatus` (R-60 / R-23), and to a set url carried on a
+ * `MediaConnectionError`.
  */
 export function capMhUrl(value: string): string {
   return capUtf8Bytes(value, MAX_MH_URL_BYTES);

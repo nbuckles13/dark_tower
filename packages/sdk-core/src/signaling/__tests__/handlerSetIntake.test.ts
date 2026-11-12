@@ -24,7 +24,6 @@ import {
 } from '../../proto/dark_tower/signaling/v1/signaling_pb.js';
 import { MAX_HANDLER_SET_SIZE, MAX_MEDIA_DIAL_TOKEN_LENGTH } from '../../validation/limits.js';
 import {
-  decodeOutboundClientMessages,
   framedJoinResponse,
   framedMediaHandlerSet,
   framedSendDirective,
@@ -366,91 +365,6 @@ describe('membership — a non-member ref is ignored and surfaced ONCE, never di
     );
     await waitFor(() => seen.length === 2);
     expect(seen[1]!.assignments[0]!.handlerRef).toBe(5);
-    rig.client.close();
-  });
-});
-
-describe('the superseded URL fields are NEVER read (story 4 P3 deletes them)', () => {
-  const POISON = 'https://POISON.superseded.invalid';
-
-  it('JoinResponse.media_servers, SendTarget/StreamAssignment.media_handler_url disagree with the set: behaviour follows the refs', async () => {
-    const join = framedJoinResponse({ handlerSet: SET, legacyMediaServers: [POISON] });
-    const directive = framedSendDirective({ targets: [2], legacyTargetUrls: [POISON] });
-    const assignment = framedStreamAssignments({
-      slotId: 0,
-      senderId: 300,
-      handlerRef: 1,
-      legacyUrl: POISON,
-    });
-    // Positive control: the poison IS on the wire in every frame (so a reader
-    // of those fields WOULD see it).
-    const text = (b: Uint8Array) => new TextDecoder('latin1').decode(b);
-    for (const frame of [join, directive, assignment]) expect(text(frame)).toContain(POISON);
-
-    const rig = await joinedRig(join);
-    const events: unknown[] = [rig.joined];
-    rig.client.on('sendDirective', (e) => events.push(e));
-    rig.client.on('streamAssignments', (e) => events.push(e));
-    rig.deliver(directive);
-    rig.deliver(assignment);
-    await waitFor(() => events.length === 3);
-
-    expect(rig.joined.handlerSet.handlers.map((h) => h.url)).toEqual([
-      'https://mh-1',
-      'https://mh-2',
-    ]);
-    expect((events[1] as SendDirectiveEvent).streams[0]!.targets).toEqual([2]);
-    expect((events[2] as StreamAssignmentsEvent).assignments[0]!.handlerRef).toBe(1);
-    expect(rig.intakes.flatMap((i) => i.view.handlers.map((h) => h.url))).not.toContain(POISON);
-    expect(JSON.stringify(events)).not.toContain('POISON');
-    rig.client.close();
-  });
-
-  it('INVALID refs carrying a legacy url never fall back to it: still dropped / undefined', async () => {
-    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const directive = framedSendDirective({ targets: [9, 0], legacyTargetUrls: [POISON, POISON] });
-    const zeroActive = framedStreamAssignments({
-      slotId: 0,
-      senderId: 300,
-      handlerRef: 0,
-      legacyUrl: POISON,
-    });
-    const nonMember = framedStreamAssignments({
-      slotId: 0,
-      senderId: 300,
-      handlerRef: 77,
-      legacyUrl: POISON,
-    });
-    const text = (b: Uint8Array) => new TextDecoder('latin1').decode(b);
-    for (const frame of [directive, zeroActive, nonMember]) expect(text(frame)).toContain(POISON);
-
-    const rig = await joinedRig(framedJoinResponse({ handlerSet: SET }));
-    const events: unknown[] = [];
-    rig.client.on('sendDirective', (e) => events.push(e));
-    rig.client.on('streamAssignments', (e) => events.push(e));
-    rig.deliver(directive);
-    rig.deliver(zeroActive);
-    rig.deliver(nonMember);
-    await waitFor(() => events.length === 3);
-
-    expect((events[0] as SendDirectiveEvent).streams[0]!.targets).toEqual([]);
-    expect((events[1] as StreamAssignmentsEvent).assignments[0]!.handlerRef).toBeUndefined();
-    expect((events[2] as StreamAssignmentsEvent).assignments[0]!.handlerRef).toBeUndefined();
-    expect(JSON.stringify(events)).not.toContain('POISON');
-    expect(rig.intakes.flatMap((i) => i.view.handlers.map((h) => h.url))).not.toContain(POISON);
-    rig.client.close();
-  });
-
-  it('MhConnectionStatus.mh_url is left EMPTY on every report', async () => {
-    const rig = await joinedRig(framedJoinResponse({ handlerSet: SET }));
-    rig.transport.clearInspector();
-    await rig.client.sendMediaConnectionUpdate([
-      { handlerRef: 1 as never, handlerSetVersion: 4n, state: 'disconnected', observedAtMs: 1 },
-    ]);
-    const update = decodeOutboundClientMessages(rig.transport.getOutboundBidiWrites(0))[0]!;
-    if (update.message.case !== 'mediaConnectionUpdate') throw new Error('unreachable');
-    expect(update.message.value.statuses[0]!.mhUrl).toBe('');
-    expect(update.message.value.statuses[0]!.handlerRef).toBe(1);
     rig.client.close();
   });
 });

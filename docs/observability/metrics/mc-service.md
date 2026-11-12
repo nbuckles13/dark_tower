@@ -729,7 +729,7 @@ span would record as attributes, on a surface no guard covers.
 - **Cardinality**: bounded at the type level by `DirectiveOutcome::ALL`. Deliberately no restated integer — the list above is the operator-facing artifact and a second encoding of its length only rots.
 - **THE SUCCESS SET IS `{emitted, emitted_empty_targets}`, NOT `{emitted}`.** ADR-0036 §5 makes an empty target set a *specified success* — "A target set may be empty. That means send nothing." A failure predicate must read `outcome!~"emitted|emitted_empty_targets"`; `outcome!="emitted"` would page on a legal state. **`emitted_empty_targets` is ROUTINE**: a solo participant, a participant nobody holds in a slot, a participant server-muted on every kind it publishes (story 3 MC-B: a server mute withdraws that kind's directive; per-kind withdrawals by cause are on `mc_media_send_directive_withdrawals_total{reason}`), and a participant not yet connected to any handler (or still inside its connect settle window) is directed to send nothing — and is re-sent a non-empty directive the moment someone starts holding it. **"Holds" means shares a CONNECTED handler with** (story 2 task 20, ADR-0036 §9) — not "was placed on the same handler", which was task 6's meaning and is retired. **Frequency shift:** under task 6's round-robin placement this was routine in every split two-person meeting; under the edge model an all-connected meeting co-locates, so it collapses back to solo participants, unheld participants and the settle window. It stays a success either way; only the expected magnitude dropped. A target set now names EVERY handler owning one of the sender's edges, so a single directive may carry several targets (`mc_media_send_targets_total`).
 - **PERMANENT — no revert trigger.** This alternation is a correct, permanent classification grounded in ADR-0036 §5, not a workaround. (`mc_media_policy_pushes_total` once carried a superficially identical *temporary* carve-out, retired in story 4 MC-B1; **the two shared a shape and nothing else.**) Do not strip this alternation as part of any cleanup: doing so starts paging on a routine success while appearing to complete a documented task.
-- **MC defects vs environmental — the alert classes live in ONE home: `DirectiveOutcome::alert_class()` (`crates/mc-service/src/media_signaling/outcome.rs`, test module; an exhaustive, wildcard-free match, pinned to the rules by a unit test). Rules: `MCMediaSendDirectiveDefect` (page, the defect class) and `MCMediaSendDirectiveFailures` (warning, negated: the environmental class and any token nobody classified) in `infra/docker/prometheus/rules/mc-alerts.yaml`.** The partition is deliberately not restated here. Per-token meaning: `unknown_stream_number` (a forwarding plan named a stream number MC has no policy entry for, or named this publisher on a kind its publish set does not contain), `transport_mode_unspecified` (a plan carried no transport mode; MC fails closed rather than defaulting to datagram), `handler_url_unresolved` (every handler url and `handler_ref` a client sees comes from one Active-only lookup of the meeting's `MeetingHandlers` — the edge's owning handler is only ever an Active member, because routing admits only Active members — so a miss cannot happen by construction; it fails CLOSED — nothing is emitted for that participant, never an `ACTIVE` slot or a send target with an empty url) and `assignment_failed` (**an MC defect, not environmental — reclassified at story 3 OBS-B**: reachable only after the slot render fails, whose only error is unreachable from valid input, and then MEETING-WIDE until the membership changes) all indicate a bug when non-zero. `meeting_state_unavailable` is the only environmental value: a post-join capability re-declaration the meeting actor did not register (actor gone, usually a meeting ending, or the participant already left; recorded only in `webtransport/connection.rs::handle_receive_capability`). The previous declaration and view stay in force; the shipped SDK never re-declares, so with it this is near-unreachable. (`no_planned_egress_slot`, story 1's join-time "MC planned no slot for you", is retired: declared slots are now the assignment's input.)
+- **MC defects vs environmental — the alert classes live in ONE home: `DirectiveOutcome::alert_class()` (`crates/mc-service/src/media_signaling/outcome.rs`, test module; an exhaustive, wildcard-free match, pinned to the rules by a unit test). Rules: `MCMediaSendDirectiveDefect` (page, the defect class) and `MCMediaSendDirectiveFailures` (warning, negated: the environmental class and any token nobody classified) in `infra/docker/prometheus/rules/mc-alerts.yaml`.** The partition is deliberately not restated here. Per-token meaning: `unknown_stream_number` (a forwarding plan named a stream number MC has no policy entry for, or named this publisher on a kind its publish set does not contain), `transport_mode_unspecified` (a plan carried no transport mode; MC fails closed rather than defaulting to datagram), `handler_url_unresolved` (every `handler_ref` on a `SendTarget` or `StreamAssignment` comes from one Active-only lookup of the meeting's `MeetingHandlers`, the view `MediaHandlerSet` is projected from — the edge's owning handler is only ever an Active member, because routing admits only Active members — so a miss cannot happen by construction; it fails CLOSED — nothing is emitted for that participant, never an `ACTIVE` slot or a send target with a non-member ref; the label value keeps its name, a rename would add a series) and `assignment_failed` (**an MC defect, not environmental — reclassified at story 3 OBS-B**: reachable only after the slot render fails, whose only error is unreachable from valid input, and then MEETING-WIDE until the membership changes) all indicate a bug when non-zero. `meeting_state_unavailable` is the only environmental value: a post-join capability re-declaration the meeting actor did not register (actor gone, usually a meeting ending, or the participant already left; recorded only in `webtransport/connection.rs::handle_receive_capability`). The previous declaration and view stay in force; the shipped SDK never re-declares, so with it this is near-unreachable. (`no_planned_egress_slot`, story 1's join-time "MC planned no slot for you", is retired: declared slots are now the assignment's input.)
 - **Recorded by the MEETING ACTOR — failures on every composition, successes only on CHANGE.** Compositions are triggered by the participant's own actions and by a PEER's join, leave, declaration or mute (which the participant's own connection never sees); plus the connection's own record of a post-join re-declaration the actor did not register (`meeting_state_unavailable`). There is no join-time recording site. A composition FAILURE records its stage unconditionally, so every reason MC did not **compose** a directive lands on this one series. A SUCCESSFUL composition records `emitted`/`emitted_empty_targets` only when the directive CHANGED (see below); an unchanged recomposition records nothing. Under the story-2 model a roster change recomposes everyone but changes only some directives, so the `emitted` rate is well below the composition rate.
 - **A failure RATIO over this series overstates the failure rate.** Its denominator excludes successful-but-unchanged compositions (never recorded) while failures are recorded every time. No alert divides by it (both rules are `increase(...[15m]) > 0` occurrence rules); if one is added, it must not treat `sum()` as "compositions".
 - **Failure values are DISJOINT BY CONSTRUCTION.** Composition is sequential stages — render the slot table, resolve handler urls, build streams — and the first failing stage returns its own value. An assignment failure can never also be reported as an unresolved handler url, because url resolution is never reached.
@@ -754,7 +754,7 @@ span would record as attributes, on a surface no guard covers.
 - **The label domain MIRRORS THE WIRE ENUM EXHAUSTIVELY** — every named `SlotState` variant, not only the ones MC can reach today. A hand-picked subset needs editing the moment §7 makes `switch_pending` live, and a `SLOT_STATE_UNSPECIFIED` reaching the wire is an MC defect that must be *visible* rather than absent. Keeping the vocabulary identical to the wire's is also what makes this distribution comparable with the client's.
 - **Emitted since story 3 MC-A**: `active`, `avatar_no_video`, `avatar_client_muted`, `avatar_server_muted`, `fewer_sources_than_slots`, `unavailable`. (`source_muted` is gone from the domain: an image that still emits it predates the story-3 cutover.)
   - `unavailable` — the slot was truncated by its kind's cap (`MC_MAX_AUDIO_RECEIVE_SLOTS` / `MC_MAX_VIDEO_RECEIVE_SLOTS`; see `mc_media_receive_slot_cap`). Permanent for that declaration; with `MC_MAX_VIDEO_RECEIVE_SLOTS=0` (the R-26 lever) every `video` slot reads `unavailable`. There is no separate truncation counter: this cell IS the over-cap signal.
-  - `avatar_no_video` — a `video` slot whose occupant publishes no video. **Takes precedence over any mute**; names the occupant, carries an empty url (no edge). Audio never uses it.
+  - `avatar_no_video` — a `video` slot whose occupant publishes no video. **Takes precedence over any mute**; names the occupant, carries `handler_ref` 0 (no edge). Audio never uses it.
   - `avatar_server_muted` / `avatar_client_muted` — the occupant is muted for that slot's kind; **server wins** over client. A mute avatar keeps the edge's handler url (the edge still exists, so a resume needs no reconnect).
   - `active` — audio names the sender; **live video names no sender** (R-5: the verified key-id sender does).
 - **Every declared-but-unfilled (kept) slot is `fewer_sources_than_slots`** — a solo participant (loopback is removed, R-3), a meeting smaller than N, a participant sharing a connected handler with too few peers, and every slot of a participant not yet connected. `source_unreachable` stays **unemitted** under the story-2 edge model: a participant the subscriber shares NO connected handler with consumes no slot and is named in `StreamAssignments.unreachable_sender_ids` instead (see `mc_media_unreachable_senders_total`); the state is reserved for a PINNED source with which the subscriber shares no connected handler, which static fill cannot produce. It stays in the label domain because the domain mirrors the wire. `withheld_by_congestion` is MH-observed (§6) and arrives with the slot-state notification; `switch_pending` arrives with §7 switching. `zero_requested` is **gone from the domain**: the proto reserved `SLOT_STATE_ZERO_REQUESTED` on 2026-10-13 as unemittable (a subscriber declaring zero slots of a kind owns no slot id to echo), closing the `docs/TODO.md` question; its reasoning lives at the `reserved` lines of `SlotState`.
@@ -1353,13 +1353,15 @@ key are never logged, labelled or traced.
 ## Participant MH-Status Metrics (R-60)
 
 Post-join client→MC reporting plane: a browser client sends
-`ClientMessage{MediaConnectionUpdate}` reporting its per-MH connection outcomes,
-which MC records on the participant actor.
+`ClientMessage{MediaConnectionUpdate}` reporting its per-handler connection
+outcomes (by `handler_ref`), which MC counts at the boundary.
 
 ### `mc_participant_mh_status_total`
 - **Type**: Counter
-- **Description**: Total per-MH connection statuses recorded from client
-  `MediaConnectionUpdate` messages (one increment per status entry recorded)
+- **Description**: Total per-MH connection statuses reported in client
+  `MediaConnectionUpdate` messages: one increment per status entry in the
+  first `MAX_MH_STATUSES_PER_UPDATE` (64) of an update, counted before and
+  independent of the `handler_ref` filter and the status-forward rate limit
 - **Labels**:
   - `state`: Reported MH connection state — `connected`, `failed`,
     `disconnected`, `unspecified` (the proto enum is total-matched; an unknown
@@ -1368,8 +1370,8 @@ which MC records on the participant actor.
 - **NOT the connectivity source for visibility.** These statuses are
   CLIENT-ASSERTED and diagnostic only: MC never reads them to decide who hears
   whom, never narrows a participant's connectivity from them, and never takes a
-  url from them (a client-controlled url reaching a send target is a redirect
-  primitive). Connectivity is what the HANDLERS report —
+  handler from them (a client-chosen handler reaching a send target is a
+  redirect primitive). Connectivity is what the HANDLERS report —
   `mc_mh_notifications_received_total`. Since story 2 task 20.
 - **Usage**: Observe client-perceived MH reachability; a rising `failed` share
   is an early signal of MH-edge connectivity problems the client sees before MC
@@ -1378,19 +1380,18 @@ which MC records on the participant actor.
   TRANSITION (connected, failed, disconnected; ADR-0039 §4), not once per MH at
   join; a repeated failure while already failed/disconnected sends nothing, and
   only DECLINED repeats `failed` (it is the re-push trigger).
-- **Recorded in**: `actors/participant.rs::handle_record_mh_statuses`, driven
-  from `webtransport/connection.rs` `handle_media_connection_update`
+- **Labels never carry** `handler_ref`, `handler_set_version`, participant id or
+  the client strings (`failure_reason` / `failure_code`, which MC drops unread).
+- **Recorded in**: `webtransport/connection.rs::handle_media_connection_update`
+  (the one emit site; story 4 P3 moved it there from the deleted url-keyed
+  participant-actor map, same name, label and semantics)
 - **Dashboard**: MC Overview - Client-Reported MH Status by State
 
 ### `mc_participant_mh_status_dropped_total`
-- **Expected-empty**: yes — drops are cap, over-limit or rate-limited refusals of client-reported status, zero on a well-behaved client
+- **Expected-empty**: yes — drops are over-limit or rate-limited refusals of client-reported status, zero on a well-behaved client
 - **Type**: Counter
 - **Description**: Total per-MH status drops on the client→MC reporting path,
-  by reason. Three independent security bounds:
-  - `cap`: a per-entry drop when the participant is already tracking the
-    per-participant cap (`MAX_MH_STATUSES_PER_PARTICIPANT = 16`) distinct MH
-    URLs. Updates to already-tracked MH URLs are always allowed and never
-    counted — recorded and cap-dropped are mutually exclusive per entry.
+  by reason. Two independent security bounds:
   - `over_limit`: a per-MESSAGE drop when a single `MediaConnectionUpdate`
     carries more than `MAX_MH_STATUSES_PER_UPDATE = 64` statuses (input
     amplification bound); the excess is refused before any per-entry work.
@@ -1399,21 +1400,21 @@ which MC records on the participant actor.
     connection's status-forward limiter was empty
     (`MH_STATUS_FORWARD_BURST`, `webtransport/connection.rs`). Counted once
     per update, never per status; an update with no ref-keyed report spends
-    and counts nothing. The legacy url-keyed recording still happens.
+    and counts nothing. Its statuses are still counted in
+    `mc_participant_mh_status_total`.
 - **Labels**:
-  - `reason`: Drop reason — `cap` (per-entry, map full), `over_limit`
-    (per-message, oversized batch) or `rate_limited` (per-message, the hop
+  - `reason`: Drop reason — `over_limit` (per-message, oversized batch) or
+    `rate_limited` (per-message, the hop
     into the shared meeting mailbox over rate). Emitted only through the
     `MH_STATUS_DROP_*` consts; zero-initialised from `MH_STATUS_DROP_REASONS`.
-- **Cardinality**: Low (3 reasons)
-- **Usage**: Detect a client flooding distinct MH URLs (`cap`), packing an
-  oversized batch into one frame (`over_limit`), or sending ref-keyed updates
-  faster than the status-forward limiter allows (`rate_limited`) — all three
-  abuse/bug signals. No
+- **Cardinality**: Low (2 reasons; `cap` was retired by story 4 P3 with the
+  url-keyed per-participant map it bounded)
+- **Usage**: Detect a client packing an oversized batch into one frame
+  (`over_limit`) or sending ref-keyed updates faster than the status-forward
+  limiter allows (`rate_limited`) — both abuse/bug signals. No
   client-supplied strings are logged on either reject path (security control),
   so this counter is the only signal.
-- **Recorded in**: `actors/participant.rs::handle_record_mh_statuses` (`cap`);
-  `webtransport/connection.rs::handle_media_connection_update` (`over_limit`)
+- **Recorded in**: `webtransport/connection.rs::handle_media_connection_update` (`over_limit`)
   and `forward_client_handler_reports` (`rate_limited`)
 - **Dashboard**: MC Overview - Dropped Client MH Status
 
@@ -1425,7 +1426,7 @@ These two counters make the disconnect/leave path observable, and distinguish a
 clean tab-close from a crash/network-loss departure. Both labels are bounded
 `&'static str`s mapped from internal enums via EXHAUSTIVE matches (a new variant is
 a compile error, never an unbounded or mislabeled series); neither is ever a
-client-controlled string, `mh_url`, participant-id, or raw close-reason text.
+client-controlled string, `handler_ref`, participant-id, or raw close-reason text.
 
 ### `mc_participant_disconnects_total`
 - **Type**: Counter
@@ -1744,7 +1745,7 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `operation` | ~10 | Bounded by Redis commands |
 | `state` | 4 | `connected`, `failed`, `disconnected`, `unspecified` (participant MH status) |
 | `reason` (fencing) | 2-3 | `stale_generation`, `concurrent_write` |
-| `reason` (mh-status drop) | 2 | `cap` (per-entry, map full), `over_limit` (per-message, oversized batch) |
+| `reason` (mh-status drop) | 2 | `over_limit` (per-message, oversized batch), `rate_limited` (per-message, status-forward limiter empty) |
 | `status` | 2-3 | `success`, `error`/`failure`, `accepted`/`rejected` |
 | `heartbeat_type` | 2 | `fast`, `comprehensive` |
 | `result` | 2 | `success`, `failure` (JWT validation) |
@@ -1757,7 +1758,7 @@ All MC service metrics follow strict cardinality bounds per ADR-0011:
 | `expected_type` | 3 | `global-controller`, `media-handler`, `meeting-controller` (Layer 2 auth) |
 | `actual_type` | 5 | `global-controller`, `media-handler`, `meeting-controller`, `unknown`, `other` — emit-site clamp (`common::service_type::service_type_metric_label`); `other` = present-but-unrecognized claim |
 
-**Total Estimated Cardinality**: ~115 time series (well within Prometheus limits) — +4 `state` (participant MH status) and +2 `reason` (mh-status drop: `cap`, `over_limit`) over the prior ~105, plus a bounded `actual_type` clamp domain (`other` bucket + `meeting-controller` now zero-init'd) on `mc_caller_type_rejected_total`.
+**Total Estimated Cardinality**: ~115 time series (well within Prometheus limits) — +4 `state` (participant MH status) and +2 `reason` (mh-status drop: `over_limit`, `rate_limited`) over the prior ~105, plus a bounded `actual_type` clamp domain (`other` bucket + `meeting-controller` now zero-init'd) on `mc_caller_type_rejected_total`.
 
 ---
 

@@ -102,7 +102,7 @@ use env_tests::fixtures::media::{
     assert_relayed_on_slot, bind_until_received, AUDIO_SEND_ID, VIDEO_SEND_ID,
 };
 use env_tests::fixtures::participant::{
-    self, filled_senders, meeting_of, reach, settle_window, slots_of, targets_of,
+    self, filled_senders, meeting_of, reach, settle_window, slots_of, target_refs,
     two_offered_handlers, Invited, Participant, AUDIO, VIDEO,
 };
 use env_tests::fixtures::video::{until_video_on_slot, BackgroundPublisher, VideoSubscriber};
@@ -170,10 +170,6 @@ async fn assert_handler_sets_are_ref_addressed_and_registered(
     );
     assert!(!refs.contains(&0), "{phase}: no ref is 0");
     for p in ps {
-        // (T-1: the "set == legacy media_servers" arm is gone. `offered()` now
-        // reads the set, so it would compare the set with itself; the
-        // double-population property is MC's, unit-tested in
-        // `mc-service/src/webtransport/connection.rs`, and P3 deletes the field.)
         let set = p.handler_set();
         for url in &p.offered() {
             assert!(
@@ -465,19 +461,19 @@ async fn test_canonical_partial_connectivity_across_two_handlers() {
                     w.sort_unstable();
                     w
                 }
-            }) && d.is_some_and(|d| targets_of(d).len() == 2)
+            }) && d.is_some_and(|d| target_refs(d).len() == 2)
         })
         .await;
     ps[1]
         .converge("CANONICAL", bound, |v, d| {
             v.is_some_and(|v| filled_senders(v, AUDIO) == vec![a])
-                && d.is_some_and(|d| !targets_of(d).is_empty())
+                && d.is_some_and(|d| !target_refs(d).is_empty())
         })
         .await;
     ps[2]
         .converge("CANONICAL", bound, |v, d| {
             v.is_some_and(|v| filled_senders(v, AUDIO) == vec![a])
-                && d.is_some_and(|d| !targets_of(d).is_empty())
+                && d.is_some_and(|d| !target_refs(d).is_empty())
         })
         .await;
 
@@ -584,24 +580,18 @@ async fn test_canonical_partial_connectivity_across_two_handlers() {
         "CANONICAL: B is unreachable to C"
     );
     assert_eq!(
-        targets_of(ps[0].directive.as_ref().unwrap()),
+        ps[0].targets(),
         BTreeSet::from([x.clone(), y.clone()]),
         "CANONICAL: A sends to both handlers"
     );
-    assert_eq!(
-        targets_of(ps[1].directive.as_ref().unwrap()),
-        BTreeSet::from([x.clone()])
-    );
-    assert_eq!(
-        targets_of(ps[2].directive.as_ref().unwrap()),
-        BTreeSet::from([y.clone()])
-    );
+    assert_eq!(ps[1].targets(), BTreeSet::from([x.clone()]));
+    assert_eq!(ps[2].targets(), BTreeSet::from([y.clone()]));
     // Each unfilled slot names no sender and carries the explicit state.
     for p in &ps[1..] {
         let unfilled = &p.view().assignments[1];
         assert!(unfilled.sender_id.is_none());
         assert_eq!(unfilled.slot_state, SlotState::FewerSourcesThanSlots as i32);
-        assert!(unfilled.media_handler_url.is_empty());
+        assert_eq!(unfilled.handler_ref, 0, "no edge");
     }
 }
 
@@ -638,7 +628,7 @@ async fn test_all_connected_everyone_hears_everyone_with_one_target_each() {
         let want = expect[i].clone();
         p.converge("ALL-CONNECTED", bound, move |v, dir| {
             v.is_some_and(|v| filled_senders(v, AUDIO) == want)
-                && dir.is_some_and(|dir| targets_of(dir).len() == 1)
+                && dir.is_some_and(|dir| target_refs(dir).len() == 1)
         })
         .await;
     }
@@ -655,10 +645,7 @@ async fn test_all_connected_everyone_hears_everyone_with_one_target_each() {
     for (ri, receiver) in ps.iter().enumerate() {
         for sender in filled_senders(receiver.view(), AUDIO) {
             let si = ids.iter().position(|id| *id == sender).unwrap();
-            let target = targets_of(ps[si].directive.as_ref().unwrap())
-                .into_iter()
-                .next()
-                .unwrap();
+            let target = ps[si].targets().into_iter().next().unwrap();
             let phase = format!("ALL-CONNECTED {}<-{}", receiver.label, ps[si].label);
             // Every other sender this receiver holds may still have frames in
             // flight from an earlier pair: tolerated, never counted.
@@ -691,11 +678,7 @@ async fn test_all_connected_everyone_hears_everyone_with_one_target_each() {
             "ALL-CONNECTED: {} reaches all",
             p.label
         );
-        assert_eq!(
-            targets_of(p.directive.as_ref().unwrap()).len(),
-            1,
-            "ALL-CONNECTED: one target"
-        );
+        assert_eq!(p.targets().len(), 1, "ALL-CONNECTED: one target");
     }
     // OVER-SUBSCRIPTION: F is "no slot" for D, never "unreachable"; E's third
     // slot says so explicitly.
@@ -738,28 +721,26 @@ async fn test_all_connected_everyone_hears_everyone_with_one_target_each() {
 enum Want {
     /// Audio ACTIVE, naming the sender.
     Heard(u32),
-    /// Video ACTIVE: no sender, the edge's handler url.
+    /// Video ACTIVE: no sender, the edge's handler ref.
     Live,
-    /// AVATAR_NO_VIDEO naming the participant, empty url.
+    /// AVATAR_NO_VIDEO naming the participant, ref 0 (no edge).
     NoVideo(u32),
-    /// FEWER_SOURCES_THAN_SLOTS: no sender, empty url.
+    /// FEWER_SOURCES_THAN_SLOTS: no sender, ref 0.
     Fewer,
-    /// UNAVAILABLE (over the kind's cap): no sender, empty url.
+    /// UNAVAILABLE (over the kind's cap): no sender, ref 0.
     Unavailable,
 }
 
 impl Want {
     fn matches(self, a: &StreamAssignment) -> bool {
-        let (state, sender, has_url) = match self {
+        let (state, sender, has_edge) = match self {
             Self::Heard(s) => (SlotState::Active, Some(s), true),
             Self::Live => (SlotState::Active, None, true),
             Self::NoVideo(s) => (SlotState::AvatarNoVideo, Some(s), false),
             Self::Fewer => (SlotState::FewerSourcesThanSlots, None, false),
             Self::Unavailable => (SlotState::Unavailable, None, false),
         };
-        a.slot_state == state as i32
-            && a.sender_id == sender
-            && a.media_handler_url.is_empty() != has_url
+        a.slot_state == state as i32 && a.sender_id == sender && (a.handler_ref != 0) == has_edge
     }
 }
 
@@ -788,20 +769,22 @@ fn stream_of(d: &SendDirective, kind: MediaKind) -> Option<&SendStream> {
     d.streams.iter().find(|s| s.media_kind == kind as i32)
 }
 
-/// `(url, transport)` of `kind`'s targets (empty if unlisted).
-fn kind_targets(d: Option<&SendDirective>, kind: MediaKind) -> BTreeSet<(String, i32)> {
+/// `(handler_ref, transport)` of `kind`'s targets (empty if unlisted). Refs
+/// are meeting-scoped (one per handler incarnation), so a publisher's target
+/// ref and a subscriber's slot ref for the same handler are equal.
+fn kind_targets(d: Option<&SendDirective>, kind: MediaKind) -> BTreeSet<(u32, i32)> {
     d.and_then(|d| stream_of(d, kind))
         .map(|s| {
             s.targets
                 .iter()
-                .map(|t| (t.media_handler_url.clone(), t.transport_mode))
+                .map(|t| (t.handler_ref, t.transport_mode))
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn video_target(url: &str) -> (String, i32) {
-    (url.to_string(), TransportMode::StreamPerGroup as i32)
+fn video_target(handler_ref: u32) -> (u32, i32) {
+    (handler_ref, TransportMode::StreamPerGroup as i32)
 }
 
 /// The directive lists EXACTLY the kinds in `publishes` (R-8: every published
@@ -1054,23 +1037,24 @@ async fn test_publish_mixes_render_per_kind_and_refusals_are_twinned() {
 
     // DIRECTIVES (R-8). Each publisher's directive lists exactly its publish
     // set; a stream's targets are the handlers of its watchers' edges.
-    let s_url = |slot: u32| -> String {
+    let s_ref = |slot: u32| -> u32 {
         s.view()
             .assignments
             .iter()
             .find(|a| a.slot_id == slot)
-            .map(|a| a.media_handler_url.clone())
+            .map(|a| a.handler_ref)
             .expect("declared slot")
     };
-    let (pv_url, pav_url) = (s_url(s_video[1]), s_url(s_video[3]));
-    let r_url = r.slots(VIDEO)[0].media_handler_url.clone();
+    let (pv_ref, pav_ref) = (s_ref(s_video[1]), s_ref(s_video[3]));
+    let (pv_url, pav_url) = (s.url_of(pv_ref), s.url_of(pav_ref));
+    let r_ref = r.slots(VIDEO)[0].handler_ref;
     pv.converge("MIXES PV directive", bound, |_, d| {
-        kind_targets(d, VIDEO) == BTreeSet::from([video_target(&pv_url)])
+        kind_targets(d, VIDEO) == BTreeSet::from([video_target(pv_ref)])
     })
     .await;
     assert_directive_shape("MIXES PV", pv.directive.as_ref().unwrap(), &v_only);
     pav.converge("MIXES PAV directive", bound, |_, d| {
-        kind_targets(d, VIDEO) == BTreeSet::from([video_target(&pav_url)])
+        kind_targets(d, VIDEO) == BTreeSet::from([video_target(pav_ref)])
             && !kind_targets(d, AUDIO).is_empty()
     })
     .await;
@@ -1085,7 +1069,7 @@ async fn test_publish_mixes_render_per_kind_and_refusals_are_twinned() {
     s.converge("MIXES S directive", bound, |_, d| {
         d.is_some_and(|d| stream_of(d, AUDIO).is_some())
             && kind_targets(d, AUDIO).is_empty()
-            && kind_targets(d, VIDEO) == BTreeSet::from([video_target(&r_url)])
+            && kind_targets(d, VIDEO) == BTreeSet::from([video_target(r_ref)])
     })
     .await;
     assert_directive_shape("MIXES S", s.directive.as_ref().unwrap(), &av);
@@ -1286,9 +1270,10 @@ async fn test_pairing_stability_and_watched_only_video_directive() {
         .close(wtransport::VarInt::from_u32(0), b"leave");
     drop((r, r_mh));
     converge_slots("PAIRING 3 refill", &mut s, bound, &[Heard(p_id)], &[Live]).await;
-    let s_video_url = s.slots(VIDEO)[0].media_handler_url.clone();
+    let s_video_ref = s.slots(VIDEO)[0].handler_ref;
+    let s_video_url = s.url_of(s_video_ref);
     p.converge("PAIRING 3 P watched", bound, |_, d| {
-        kind_targets(d, VIDEO) == BTreeSet::from([video_target(&s_video_url)])
+        kind_targets(d, VIDEO) == BTreeSet::from([video_target(s_video_ref)])
     })
     .await;
     assert_directive_shape("PAIRING 3", p.directive.as_ref().unwrap(), &both);
@@ -1308,9 +1293,9 @@ async fn test_pairing_stability_and_watched_only_video_directive() {
     // 5.
     s.declare(&[s_a], &[s_v]).await;
     converge_slots("PAIRING 5 S", &mut s, bound, &[Heard(p_id)], &[Live]).await;
-    let restored_url = s.slots(VIDEO)[0].media_handler_url.clone();
+    let restored_ref = s.slots(VIDEO)[0].handler_ref;
     p.converge("PAIRING 5 restored", bound, |_, d| {
-        kind_targets(d, VIDEO) == BTreeSet::from([video_target(&restored_url)])
+        kind_targets(d, VIDEO) == BTreeSet::from([video_target(restored_ref)])
     })
     .await;
 
@@ -1390,10 +1375,22 @@ async fn test_two_handler_video_visibility() {
         })
         .await;
     }
-    assert_eq!(b.slots(VIDEO)[0].media_handler_url, x, "{PHASE}: B<-A on x");
-    assert_eq!(c.slots(VIDEO)[0].media_handler_url, y, "{PHASE}: C<-A on y");
+    assert_eq!(
+        b.url_of(b.slots(VIDEO)[0].handler_ref),
+        x,
+        "{PHASE}: B<-A on x"
+    );
+    assert_eq!(
+        c.url_of(c.slots(VIDEO)[0].handler_ref),
+        y,
+        "{PHASE}: C<-A on y"
+    );
+    let (x_ref, y_ref) = (
+        a.sets.ref_for_url(&x).expect("x is in A's set"),
+        a.sets.ref_for_url(&y).expect("y is in A's set"),
+    );
     a.converge(PHASE, bound, |_, d| {
-        kind_targets(d, VIDEO) == BTreeSet::from([video_target(&x), video_target(&y)])
+        kind_targets(d, VIDEO) == BTreeSet::from([video_target(x_ref), video_target(y_ref)])
     })
     .await;
     assert_directive_shape(PHASE, a.directive.as_ref().unwrap(), &both);

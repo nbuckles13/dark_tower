@@ -47,7 +47,9 @@ use env_tests::fixtures::metrics::{
 use env_tests::fixtures::mh_address::assert_addresses_unique;
 use env_tests::fixtures::mh_pool::MhPool;
 use env_tests::fixtures::owned_placement::{live_placement_attempts, place_on_owned};
-use env_tests::fixtures::participant::{reach, settle_window, slots_of, AUDIO, VIEW_MARGIN};
+use env_tests::fixtures::participant::{
+    reach, settle_window, slots_of, Participant, AUDIO, VIEW_MARGIN,
+};
 use env_tests::fixtures::{AuthClient, GcClient, PrometheusClient};
 use proto_gen::dark_tower::signaling::v1::StreamAssignments;
 use serial_test::serial;
@@ -293,10 +295,10 @@ async fn crash_leg(pool: Arc<MhPool>, prom_url: &str) {
         p.declare(&[SLOT[i]], &[]).await;
     }
     for i in 0..2 {
-        let (peer, url) = (ids[1 - i], owned.clone());
+        let (peer, on) = (ids[1 - i], handler_ref_of("CRASH pre-kill", &ps[i], &owned));
         ps[i]
             .converge("CRASH pre-kill", view_bound, move |v, _| {
-                v.is_some_and(|v| heard_on(v, peer, &url))
+                v.is_some_and(|v| heard_on(v, peer, on))
             })
             .await;
     }
@@ -404,10 +406,13 @@ async fn crash_leg(pool: Arc<MhPool>, prom_url: &str) {
     // RE-PLACEMENT: each receiver's slot for its peer names the survivor, and
     // frames arrive on the survivor's transport, both directions.
     for i in 0..2 {
-        let (peer, url) = (ids[1 - i], survivor.clone());
+        let (peer, on) = (
+            ids[1 - i],
+            handler_ref_of("CRASH re-placed", &ps[i], &survivor),
+        );
         ps[i]
             .converge("CRASH re-placed", view_bound, move |v, _| {
-                v.is_some_and(|v| heard_on(v, peer, &url))
+                v.is_some_and(|v| heard_on(v, peer, on))
             })
             .await;
     }
@@ -742,11 +747,23 @@ async fn zombie_leg(pool: Arc<MhPool>, prom_url: &str) {
     drop(z);
 }
 
-/// `v`'s audio slot naming `peer` is ACTIVE on the handler at `url`.
-fn heard_on(v: &StreamAssignments, peer: u32, url: &str) -> bool {
+/// `v`'s audio slot naming `peer` is on the handler `handler_ref` names.
+fn heard_on(v: &StreamAssignments, peer: u32, handler_ref: u32) -> bool {
     slots_of(v, AUDIO)
         .iter()
-        .any(|a| a.sender_id == Some(peer) && a.media_handler_url == url)
+        .any(|a| a.sender_id == Some(peer) && a.handler_ref == handler_ref)
+}
+
+/// `p`'s current-set ref for the handler at `url` (fails loudly if absent:
+/// the handler is expected in the set at this point).
+fn handler_ref_of(phase: &str, p: &Participant, url: &str) -> u32 {
+    p.sets.ref_for_url(url).unwrap_or_else(|| {
+        panic!(
+            "{phase}: {} has no current-set entry for the expected handler (set urls {:?})",
+            p.label,
+            p.sets.urls()
+        )
+    })
 }
 
 // ============================================================================

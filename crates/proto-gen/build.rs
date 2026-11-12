@@ -30,10 +30,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // carries `join_token` (a bearer meeting JWT) and `binding_token` (the
     // HMAC session-binding credential).
     //
-    // `MhConnectRequest` is here on the identical mechanism: it carries two
-    // bearer credentials, `join_token` (a meeting JWT, "same semantics as
-    // JoinRequest.join_token", until story 4 P3 deletes it) and
-    // `media_dial_token` (the MC-minted dial JWS, ADR-0039 §5). It rides inside
+    // `MhConnectRequest` is here on the identical mechanism: it carries the
+    // one MH connect credential, `media_dial_token` (the MC-minted dial JWS,
+    // ADR-0039 §5; the meeting JWT it once also carried was deleted by story 4
+    // P3, so one bearer field remains and the redaction stays). It rides inside
     // `MhClientMessage`, which derives `Debug` transitively, and
     // `crates/mh-service/src/webtransport/connection.rs`'s malformed-envelope
     // `warn!` arms are one `?envelope` away from logging it. The `\btoken\b`

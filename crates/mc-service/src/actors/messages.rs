@@ -426,16 +426,6 @@ pub enum ParticipantMessage {
     /// Notify participant of a state change.
     ParticipantUpdate { update: ParticipantStateUpdate },
 
-    /// Record per-MH connection statuses reported by the client (R-60).
-    ///
-    /// Each entry is `(truncated mh_url, bounded status)`. Truncation of all
-    /// client-controlled strings (the key and the value's fields) happens ONCE
-    /// at the connection trust boundary before this message is built, so the
-    /// actor can never hold an untruncated field.
-    RecordMhStatuses {
-        statuses: Vec<(String, BoundedMhStatus)>,
-    },
-
     /// Deliver a new meeting KEK to this participant's client
     /// (`MeetingKekUpdate`, ADR-0036 §4 step 6), and report the outcome.
     ///
@@ -473,49 +463,6 @@ pub enum ParticipantMessage {
 
     /// Ping the participant actor to check liveness.
     Ping { respond_to: oneshot::Sender<()> },
-}
-
-/// Per-MH connection state reported by the client in a `MediaConnectionUpdate`
-/// (R-60). Bounded, low-cardinality domain enum (decoupled from the wire proto)
-/// — drives the `mc_participant_mh_status_total{state}` metric label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MhState {
-    /// Client reports the MH media connection is established.
-    Connected,
-    /// Client reports the MH media connection failed.
-    Failed,
-    /// Client reports the MH media connection was disconnected.
-    Disconnected,
-    /// Proto3 default / unknown wire value (allowlist-clamp catch-all).
-    Unspecified,
-}
-
-impl MhState {
-    /// Lowercase, bounded metric-label form (exactly 4 possible values).
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Connected => "connected",
-            Self::Failed => "failed",
-            Self::Disconnected => "disconnected",
-            Self::Unspecified => "unspecified",
-        }
-    }
-}
-
-/// Bounded per-MH status stored on the `ParticipantActor` (R-60).
-///
-/// All client-controlled strings are truncated (≤256 bytes, char boundary) at
-/// the connection boundary before construction — this struct, by design, only
-/// ever holds bounded data, so the actor cannot leak an untruncated field.
-#[derive(Debug, Clone)]
-pub struct BoundedMhStatus {
-    /// Reported connection state (bounded domain enum).
-    pub state: MhState,
-    /// Optional truncated failure reason (client-controlled, ≤256 bytes).
-    pub failure_reason: Option<String>,
-    /// Optional truncated failure code (client-controlled, ≤256 bytes).
-    pub failure_code: Option<String>,
 }
 
 // ----------------------------------------------------------------------------
@@ -630,8 +577,8 @@ pub struct JoinResult {
     pub participant_handle: ParticipantActorHandle,
     /// The joiner's handler set (ADR-0039 §4, §5): the meeting's Active
     /// handlers with the version, each carrying a `media_dial_token` minted
-    /// for THIS participant. The ONE source of both
-    /// `JoinResponse.media_handler_set` and the legacy `media_servers`. Minted
+    /// for THIS participant. The ONE source of
+    /// `JoinResponse.media_handler_set`. Minted
     /// when the reply is SENT — for a parked join, at release, not at
     /// admission. The generated type's `Debug` redacts every token, so this
     /// struct's derived `Debug` cannot print one.

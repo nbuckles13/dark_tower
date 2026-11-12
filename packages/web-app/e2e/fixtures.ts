@@ -380,7 +380,7 @@ export async function handlerSets(page: Page): Promise<readonly BusHandlerSet[]>
 /**
  * The bus projection of the MC JoinResponse (see src/lib/e2eBus.ts `joined`),
  * plus the JOIN-TIME handler set (the first entry of the bus `handlerSets`
- * history). `JoinResponse.media_servers` is superseded and never read.
+ * history).
  */
 export interface JoinedBusEvent {
   readonly type: 'joined';

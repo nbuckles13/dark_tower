@@ -187,11 +187,6 @@ fn assert_refs_are_members(
                         SlotState::AvatarNoVideo,
                     ]
                     .contains(&a.slot_state());
-                    assert_eq!(
-                        a.handler_ref == 0,
-                        a.media_handler_url.is_empty(),
-                        "ref 0 iff no url: {a:?}"
-                    );
                     assert_eq!(a.handler_ref == 0, edgeless, "ref 0 iff edgeless: {a:?}");
                     !edgeless
                 })

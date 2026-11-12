@@ -92,8 +92,8 @@ pub async fn write_framed(
     send.write_all(&frame).await
 }
 
-/// Encode `MhClientMessage{ConnectRequest{media_dial_token}}` (with
-/// `join_token` empty, the SDK's later-dial shape) and frame-write it.
+/// Encode `MhClientMessage{ConnectRequest{media_dial_token}}` and frame-write
+/// it.
 ///
 /// This is the production wire format on MH's bidi accept path. Use this
 /// helper for positive-path tests; use [`write_framed`] directly for negative
@@ -109,14 +109,38 @@ pub async fn write_mh_connect(
     write_mh_connect_with_trace(send, media_dial_token, "", "").await
 }
 
-/// The connect envelope with BOTH fields set — the SDK's join-time shape
-/// until story 4 P3 (`join_token` = the AC meeting JWT, which MH never reads).
-pub async fn write_mh_connect_both(
+/// The connect envelope an OLD client sends: `media_dial_token` plus a string
+/// on `MhConnectRequest` tag 1, the reserved tag of the deleted `join_token`
+/// (story 4 P3). Hand-encoded, because the generated type no longer has the
+/// field; MH must decode tag 1 as an unknown field and never read it.
+///
+/// Deliberate twin of `crates/env-tests/src/fixtures/mc_session.rs`
+/// `mh_connect_frame_with_vacated_tag_1` (env-tests cannot reach MH test
+/// support, ADR-0028 layering): a change to the vacated-tag shape changes both.
+pub async fn write_mh_connect_with_vacated_tag_1(
     send: &mut wtransport::stream::SendStream,
-    join_token: &str,
+    tag_1_payload: &str,
     media_dial_token: &str,
 ) -> Result<(), wtransport::error::StreamWriteError> {
-    write_envelope(send, join_token, media_dial_token, "", "").await
+    fn len_field(tag: u32, payload: &[u8], out: &mut Vec<u8>) {
+        prost::encoding::encode_key(tag, prost::encoding::WireType::LengthDelimited, out);
+        prost::encoding::encode_varint(
+            u64::try_from(payload.len()).expect("payload length fits u64"),
+            out,
+        );
+        out.extend_from_slice(payload);
+    }
+    let mut request = Vec::new();
+    len_field(1, tag_1_payload.as_bytes(), &mut request);
+    MhConnectRequest {
+        media_dial_token: media_dial_token.to_string(),
+    }
+    .encode(&mut request)
+    .expect("Vec has unbounded capacity");
+    // `MhClientMessage.connect_request` is oneof tag 1.
+    let mut envelope = Vec::new();
+    len_field(1, &request, &mut envelope);
+    write_framed(send, &envelope).await
 }
 
 /// Like [`write_mh_connect`], but sets the envelope's W3C `trace_parent`/
@@ -129,20 +153,9 @@ pub async fn write_mh_connect_with_trace(
     trace_parent: &str,
     trace_state: &str,
 ) -> Result<(), wtransport::error::StreamWriteError> {
-    write_envelope(send, "", media_dial_token, trace_parent, trace_state).await
-}
-
-async fn write_envelope(
-    send: &mut wtransport::stream::SendStream,
-    join_token: &str,
-    media_dial_token: &str,
-    trace_parent: &str,
-    trace_state: &str,
-) -> Result<(), wtransport::error::StreamWriteError> {
     let envelope = MhClientMessage {
         message: Some(mh_client_message::Message::ConnectRequest(
             MhConnectRequest {
-                join_token: join_token.to_string(),
                 media_dial_token: media_dial_token.to_string(),
             },
         )),

@@ -12,8 +12,7 @@
 // reach some handlers — by the dev-only `blockHandlers` test lever
 // (`src/lib/testLevers.ts`, `DT_TEST_LEVERS=1`, bundle-absence-proven). The lever
 // only REFUSES dials to URLs MC offered; the URLs are taken from A's own
-// join-time handler set (the bus `handlerSets`; `JoinResponse.media_servers` is
-// superseded) and chosen by EXACT MATCH, never by position (MC: "order
+// join-time handler set (the bus `handlerSets`) and chosen by EXACT MATCH, never by position (MC: "order
 // carries no meaning") and never by pod ordinal, so no infra topology appears
 // here. The Kind MC image carries no placement lever and needs none.
 //

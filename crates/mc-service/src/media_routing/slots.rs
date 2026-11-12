@@ -2221,13 +2221,18 @@ mod tests {
                         SlotState::AvatarNoVideo
                         | SlotState::Unavailable
                         | SlotState::FewerSourcesThanSlots => {
-                            assert!(a.media_handler_url.is_empty(), "{state:?} carries no url");
                             // ADR-0039 §4: 0 means "no edge" on exactly these.
                             assert_eq!(a.handler_ref, 0, "{state:?} carries no ref");
                         }
                         _ => {
-                            assert!(!a.media_handler_url.is_empty(), "{state:?} names its edge");
                             assert_ne!(a.handler_ref, 0, "{state:?} names its edge's ref");
+                            assert!(
+                                set.client_snapshot()
+                                    .handlers
+                                    .iter()
+                                    .any(|h| h.handler_ref.get() == a.handler_ref),
+                                "{state:?}'s ref is a member of the client set"
+                            );
                         }
                     }
                     if state == SlotState::Active

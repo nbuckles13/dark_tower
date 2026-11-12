@@ -10,8 +10,8 @@
 //! (`grpc/media_coordination.rs`), in the same actor turn that resolves the
 //! connection's `sender_id` — so the sender-binding answer and the routing input
 //! cannot drift apart. There is no second store (the former
-//! `MhConnectionRegistry` is gone), and the client-reported
-//! `ParticipantActor::mh_statuses` map is never read. The per-participant state
+//! `MhConnectionRegistry` is gone), and client-reported `MediaConnectionUpdate`
+//! statuses are never routing input. The per-participant state
 //! machine, its keying by MH connection, the tombstone and the settle rule live
 //! in `media_routing/connectivity.rs`. A settled connectivity change is a
 //! structural change like a join or leave: same recompute, generation advance,
@@ -606,7 +606,7 @@ impl MeetingMedia {
     }
 
     /// The client-facing snapshot (Active only) — the ONLY source of every
-    /// `MediaHandlerSet` and of `JoinResponse.media_servers`.
+    /// `MediaHandlerSet`.
     pub(super) fn client_snapshot(&self) -> ClientHandlerSet {
         self.handlers.client_snapshot()
     }
@@ -1518,7 +1518,7 @@ impl MeetingMedia {
             Ok(composed) => composed,
             Err(outcome) => {
                 // Fails CLOSED: nothing is emitted for this participant — never
-                // an ACTIVE slot or a send target with an empty url.
+                // an ACTIVE slot or a send target with a non-member ref.
                 metrics::record_send_directive(outcome);
                 metrics::record_slot_view_emission(SlotViewEmission::CompositionFailed);
                 error!(
@@ -1708,7 +1708,6 @@ mod frame_bound_tests {
                     slot_id: u32::try_from(i).unwrap(),
                     sender_id: None,
                     media_kind: 2,
-                    media_handler_url: String::new(),
                     slot_state: 9,
                     switch_command_id: None,
                     handler_ref: 0,

@@ -35,7 +35,7 @@ import { handlerRef, type HandlerRef } from '../../handlerSet.js';
 
 const KEK = new Uint8Array(AES_256_KEY_BYTES).fill(0x11);
 const SENDER_ID = 258;
-const MH_URL = handlerRef(1);
+const MH_REF = handlerRef(1);
 const OTHER_REF = handlerRef(5);
 
 async function settle(): Promise<void> {
@@ -117,13 +117,13 @@ async function makePipeline(opts: Options = {}): Promise<{
   pipeline.setSendDirective({
     streamNumber: 1,
     bitrateBps: 32_000,
-    targets: opts.targets ?? [MH_URL],
+    targets: opts.targets ?? [MH_REF],
     headerVersion: HEADER_VERSION,
   });
   // By default, assignments name the handler only when the rig supplies a stream
   // for it: naming a handler with no connected transport is itself a fault.
   const receiveUrls =
-    opts.receiveUrls !== undefined ? opts.receiveUrls : opts.readable ? [MH_URL] : null;
+    opts.receiveUrls !== undefined ? opts.receiveUrls : opts.readable ? [MH_REF] : null;
   if (receiveUrls !== null) pipeline.setReceiveAssignments(assignmentsOn(receiveUrls, SENDER_ID));
   return {
     pipeline,
@@ -239,7 +239,7 @@ describe('send-side degradation', () => {
     rig.pipeline.setSendDirective({
       streamNumber: 1,
       bitrateBps: 32_000,
-      targets: [MH_URL],
+      targets: [MH_REF],
       headerVersion: HEADER_VERSION,
     });
     expect(rig.pipeline.transmitGeneration).toBe(before + 1n);
@@ -282,13 +282,13 @@ describe('receive-side degradation', () => {
     const transport = new MockWebTransport();
     transport.simulateReady();
     const rig = await makePipeline({ readable: transport.datagrams.readable });
-    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
-    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL, undefined], SENDER_ID));
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_REF], SENDER_ID));
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_REF, undefined], SENDER_ID));
     // Directives no longer touch the read loop at all.
     rig.pipeline.setSendDirective({
       streamNumber: 1,
       bitrateBps: 32_000,
-      targets: [MH_URL],
+      targets: [MH_REF],
       headerVersion: HEADER_VERSION,
     });
     await settle();
@@ -309,7 +309,7 @@ describe('receive-side degradation', () => {
     const rig = await makePipeline({
       readable: transport.datagrams.readable,
       targets: [],
-      receiveUrls: [MH_URL],
+      receiveUrls: [MH_REF],
     });
     transport.simulateIncomingDatagram(PROBE);
     await settle();
@@ -337,7 +337,7 @@ describe('receive-side degradation', () => {
     expect(rig.faults).toEqual([]);
 
     // Positive control on the same rig: a peer joins and fills the slot.
-    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_REF], SENDER_ID));
     transport.simulateIncomingDatagram(PROBE);
     await settle();
     expect(transport.datagrams.readable.locked).toBe(true);
@@ -354,7 +354,7 @@ describe('receive-side degradation', () => {
     transport.simulateReady();
     const rig = await makePipeline({
       readable: transport.datagrams.readable,
-      receiveUrlsBeforeStart: [MH_URL],
+      receiveUrlsBeforeStart: [MH_REF],
       receiveUrls: null,
     });
     transport.simulateIncomingDatagram(PROBE);
@@ -381,7 +381,7 @@ describe('receive-side degradation', () => {
     expect(rig.count(RECEIVED)).toBe(1);
 
     // And a refill neither reopens nor faults.
-    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL], SENDER_ID));
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_REF], SENDER_ID));
     transport.simulateIncomingDatagram(PROBE);
     await settle();
     expect(rig.count(RECEIVED)).toBe(2);
@@ -401,8 +401,8 @@ describe('receive-side degradation', () => {
     second.simulateReady();
     const OTHER = handlerRef(2);
     const rig = await makePipeline({
-      readables: { [MH_URL]: first.datagrams.readable, [OTHER]: second.datagrams.readable },
-      receiveUrls: [MH_URL, OTHER],
+      readables: { [MH_REF]: first.datagrams.readable, [OTHER]: second.datagrams.readable },
+      receiveUrls: [MH_REF, OTHER],
     });
 
     // A frame on EACH transport is received. Order is deliberately not asserted:
@@ -427,8 +427,8 @@ describe('receive-side degradation', () => {
     second.simulateReady();
     const OTHER = handlerRef(3);
     const rig = await makePipeline({
-      readables: { [MH_URL]: first.datagrams.readable, [OTHER]: second.datagrams.readable },
-      receiveUrls: [MH_URL],
+      readables: { [MH_REF]: first.datagrams.readable, [OTHER]: second.datagrams.readable },
+      receiveUrls: [MH_REF],
     });
 
     rig.pipeline.setReceiveAssignments(assignmentsOn([OTHER], SENDER_ID));
@@ -453,12 +453,12 @@ describe('receive-side degradation', () => {
     second.simulateReady();
     const OTHER = handlerRef(4);
     const rig = await makePipeline({
-      readables: { [MH_URL]: first.datagrams.readable, [OTHER]: second.datagrams.readable },
-      receiveUrls: [MH_URL, OTHER],
+      readables: { [MH_REF]: first.datagrams.readable, [OTHER]: second.datagrams.readable },
+      receiveUrls: [MH_REF, OTHER],
     });
 
-    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL, OTHER], SENDER_ID));
-    rig.pipeline.setReceiveAssignments(assignmentsOn([OTHER, MH_URL], SENDER_ID));
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_REF, OTHER], SENDER_ID));
+    rig.pipeline.setReceiveAssignments(assignmentsOn([OTHER, MH_REF], SENDER_ID));
     await settle();
     expect(rig.faults).toEqual([]);
 
@@ -480,11 +480,11 @@ describe('receive-side degradation', () => {
     const THIRD = handlerRef(6);
     const rig = await makePipeline({
       readables: {
-        [MH_URL]: shared.datagrams.readable,
+        [MH_REF]: shared.datagrams.readable,
         [OTHER]: shared.datagrams.readable,
         [THIRD]: third.datagrams.readable,
       },
-      receiveUrls: [MH_URL, OTHER, THIRD],
+      receiveUrls: [MH_REF, OTHER, THIRD],
     });
     await settle();
     expect(rig.faults).toEqual(['transport']);
@@ -500,14 +500,14 @@ describe('receive-side degradation', () => {
     // Every assigned ref is a set member (non-members are dropped at decode), so
     // "not connected" is a dial or redial in flight (ADR-0039 §4) — not a fault.
     const readables: Record<number, ReadableStream<Uint8Array>> = {};
-    const rig = await makePipeline({ readables, receiveUrls: [MH_URL] });
+    const rig = await makePipeline({ readables, receiveUrls: [MH_REF] });
     await settle();
     expect(rig.faults).toEqual([]);
     // The ref connects: the owner re-applies, and the loop starts on it.
     const transport = new MockWebTransport();
     transport.simulateReady();
-    readables[MH_URL] = transport.datagrams.readable;
-    rig.pipeline.handlerConnected(MH_URL);
+    readables[MH_REF] = transport.datagrams.readable;
+    rig.pipeline.handlerConnected(MH_REF);
     expect(transport.datagrams.readable.locked).toBe(true);
     // Positive control: a ref NOT assigned is not read when it connects.
     const other = new MockWebTransport();
@@ -522,8 +522,8 @@ describe('receive-side degradation', () => {
     first.simulateReady();
     second.simulateReady();
     const rig = await makePipeline({
-      readables: { [MH_URL]: first.datagrams.readable, [OTHER_REF]: second.datagrams.readable },
-      receiveUrls: [MH_URL, OTHER_REF],
+      readables: { [MH_REF]: first.datagrams.readable, [OTHER_REF]: second.datagrams.readable },
+      receiveUrls: [MH_REF, OTHER_REF],
     });
     await settle();
     // The quiet stop cancels the reader, which ENDS the loop (`done`) — no fault.
@@ -544,12 +544,12 @@ describe('receive-side degradation', () => {
     const messages: string[] = [];
     const rig = await makePipeline({
       // Two DISTINCT refs resolving to one readable: a named transport fault.
-      readables: { [MH_URL]: shared.datagrams.readable, [OTHER_REF]: shared.datagrams.readable },
+      readables: { [MH_REF]: shared.datagrams.readable, [OTHER_REF]: shared.datagrams.readable },
       receiveUrls: null,
     });
     rig.pipeline.on('fault', (f) => messages.push(f.message));
 
-    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_URL, OTHER_REF], SENDER_ID));
+    rig.pipeline.setReceiveAssignments(assignmentsOn([MH_REF, OTHER_REF], SENDER_ID));
     // ...and a SEND target with no transport — a different remedy.
     rig.pipeline.setSendDirective({
       streamNumber: 1,

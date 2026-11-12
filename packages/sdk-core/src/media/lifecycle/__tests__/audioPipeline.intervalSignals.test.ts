@@ -23,7 +23,7 @@ import { TransmitKeyManager } from '../transmitKeys.js';
 import { handlerRef } from '../../handlerSet.js';
 
 const INTERVAL_MS = 7_000;
-const MH_URL = handlerRef(1);
+const MH_REF = handlerRef(1);
 
 async function rig(opts: { declaredSlotIds?: number[] } = {}) {
   const sink = new InMemoryMetricsSink();
@@ -83,7 +83,7 @@ const slot = (
 ): ReceiveAssignment => ({
   slotId,
   senderId,
-  handlerRef: senderId === undefined ? undefined : MH_URL,
+  handlerRef: senderId === undefined ? undefined : MH_REF,
   active,
 });
 

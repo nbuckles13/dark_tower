@@ -633,12 +633,11 @@ fn header_version() -> u32 {
 /// restores within the same structural change.
 ///
 /// One target per handler, never per edge: the client encrypts each frame
-/// once and transmits it to every target. Target urls and `handler_ref`s come
-/// from the meeting's [`MeetingHandlers`] client view
-/// ([`MeetingHandlers::client_handler`], Active members only), the same
-/// lookup `MediaHandlerSet`, `JoinResponse.media_servers` and every
-/// `StreamAssignment` are read from. Each target's transport
-/// is its stream's kind's ([`transport_of`]): datagrams for audio,
+/// once and transmits it to every target. Target `handler_ref`s come from the
+/// meeting's [`MeetingHandlers`] client view
+/// ([`MeetingHandlers::client_handler`], Active members only), the same view
+/// `MediaHandlerSet` and every `StreamAssignment` are read from. Each target's
+/// transport is its stream's kind's ([`transport_of`]): datagrams for audio,
 /// stream-per-group for video.
 ///
 /// # A server-muted kind is withdrawn
@@ -657,7 +656,7 @@ fn header_version() -> u32 {
 ///
 /// A [`DirectiveOutcome`] failure variant. Every one fails closed: a plan
 /// naming an unknown stream number is not assumed to be audio, and a target
-/// handler with no url is never emitted as an empty url.
+/// handler outside the client view is never emitted.
 pub fn build_send_directive(
     publisher: SenderId,
     publish_set: PublishSet,
@@ -696,19 +695,16 @@ pub fn build_send_directive(
         let handlers = kind.of_ref(&owners);
         let mut targets = Vec::with_capacity(handlers.len());
         for handler in handlers.iter().filter(|_| !withdrawn) {
-            // The ONE client-view lookup (Active members only): the url and
-            // the ref come from the same entry, so they cannot disagree.
-            let Some(client) = meeting_handlers.client_handler(handler) else {
-                // Fail loud rather than emit a target with an empty url or a
-                // ref the client's set does not hold (routing admits Active
-                // handlers only, so this is an MC invariant violation).
+            // The ONE client-view lookup (Active members only).
+            let Some(handler_ref) = meeting_handlers.client_handler(handler) else {
+                // Fail loud rather than emit a ref the client's set does not
+                // hold (routing admits Active handlers only, so this is an MC
+                // invariant violation).
                 return Err(DirectiveOutcome::HandlerUrlUnresolved);
             };
             targets.push(SendTarget {
-                // Legacy url, double-populated until C1/P3 (ADR-0039 §4).
-                media_handler_url: client.url.to_string(),
                 transport_mode: transport_mode as i32,
-                handler_ref: client.handler_ref.get(),
+                handler_ref: handler_ref.get(),
             });
         }
         any_target |= !targets.is_empty();
@@ -806,12 +802,12 @@ mod tests {
 
     #[test]
     fn a_held_publisher_is_directed_to_one_audio_stream_on_one_datagram_target() {
-        let (assignment, urls) = two_party(&["mh-0"]);
+        let (assignment, handlers) = two_party(&["mh-0"]);
         let (directive, outcome, stream_kinds) = build_send_directive(
             sender(1),
             a(),
             &assignment,
-            &urls,
+            &handlers,
             &policy(),
             ServerMutedKinds::NONE,
         )
@@ -831,8 +827,8 @@ mod tests {
         assert_eq!(params.min_keyframe_interval_ms, None, "absent on audio");
         assert_eq!(stream.targets.len(), 1);
         assert_eq!(
-            stream.targets[0].media_handler_url,
-            "https://mh-0.example:4434"
+            stream.targets[0].handler_ref,
+            handlers.client_ref_for_test("mh-0")
         );
         assert_eq!(
             stream.targets[0].transport_mode,
@@ -844,12 +840,12 @@ mod tests {
     /// targets — a specified success, never an omitted stream.
     #[test]
     fn an_unwatched_publisher_lists_its_stream_with_empty_targets() {
-        let (assignment, urls) = two_party(&["mh-0"]);
+        let (assignment, handlers) = two_party(&["mh-0"]);
         let (directive, outcome, kinds) = build_send_directive(
             sender(9),
             a(),
             &assignment,
-            &urls,
+            &handlers,
             &policy(),
             ServerMutedKinds::NONE,
         )
@@ -865,7 +861,7 @@ mod tests {
     /// kind never is; a receive-only participant gets no streams.
     #[test]
     fn the_directive_lists_exactly_the_publish_set() {
-        let (assignment, urls) = two_party(&["mh-0"]);
+        let (assignment, handlers) = two_party(&["mh-0"]);
         for (set, expected) in [
             (PublishSet::NONE, vec![]),
             (a(), vec![(0u32, MediaKind::Audio as i32)]),
@@ -885,7 +881,7 @@ mod tests {
                 sender(9),
                 set,
                 &assignment,
-                &urls,
+                &handlers,
                 &policy(),
                 ServerMutedKinds::NONE,
             )
@@ -1116,12 +1112,12 @@ mod tests {
 
     #[test]
     fn the_directive_carries_no_priority_group() {
-        let (assignment, urls) = two_party(&["mh-0"]);
+        let (assignment, handlers) = two_party(&["mh-0"]);
         let (directive, _, _) = build_send_directive(
             sender(1),
             a(),
             &assignment,
-            &urls,
+            &handlers,
             &policy(),
             ServerMutedKinds::NONE,
         )
@@ -1294,12 +1290,12 @@ mod tests {
     #[test]
     fn the_directive_is_byte_identical_for_unchanged_input() {
         use prost::Message;
-        let (assignment, urls) = two_party(&["mh-1", "mh-0", "mh-2"]);
+        let (assignment, handlers) = two_party(&["mh-1", "mh-0", "mh-2"]);
         let (x, _, _) = build_send_directive(
             sender(1),
             av(),
             &assignment,
-            &urls,
+            &handlers,
             &policy(),
             ServerMutedKinds::NONE,
         )
@@ -1308,7 +1304,7 @@ mod tests {
             sender(1),
             av(),
             &assignment,
-            &urls,
+            &handlers,
             &policy(),
             ServerMutedKinds::NONE,
         )
@@ -1320,23 +1316,27 @@ mod tests {
     /// a correct-by-design EMPTY edge set (written literals).
     #[test]
     fn the_directive_targets_exactly_the_handlers_carrying_this_publishers_edges() {
-        let (assignment, urls) = two_party(&["mh-0", "mh-1"]);
+        let (assignment, handlers) = two_party(&["mh-0", "mh-1"]);
         let (directive, outcome, _) = build_send_directive(
             sender(1),
             a(),
             &assignment,
-            &urls,
+            &handlers,
             &policy(),
             ServerMutedKinds::NONE,
         )
         .unwrap();
         assert_eq!(outcome, DirectiveOutcome::Emitted);
-        let targets: Vec<&str> = directive.streams[0]
+        let targets: Vec<u32> = directive.streams[0]
             .targets
             .iter()
-            .map(|t| t.media_handler_url.as_str())
+            .map(|t| t.handler_ref)
             .collect();
-        assert_eq!(targets, vec!["https://mh-0.example:4434"]);
+        assert_eq!(targets, vec![handlers.client_ref_for_test("mh-0")]);
+        assert_ne!(
+            handlers.client_ref_for_test("mh-0"),
+            handlers.client_ref_for_test("mh-1")
+        );
     }
 
     /// ADR-0036 §9 multi-handler send: one stream, both owners as targets.
@@ -1360,15 +1360,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(directive.streams.len(), 1);
-        let mut targets: Vec<&str> = directive.streams[0]
+        let mut targets: Vec<u32> = directive.streams[0]
             .targets
             .iter()
-            .map(|t| t.media_handler_url.as_str())
+            .map(|t| t.handler_ref)
             .collect();
         targets.sort_unstable();
-        assert_eq!(
-            targets,
-            vec!["https://mh-0.example:4434", "https://mh-1.example:4434"]
-        );
+        let mut expected = vec![
+            set.client_ref_for_test("mh-0"),
+            set.client_ref_for_test("mh-1"),
+        ];
+        expected.sort_unstable();
+        assert_eq!(targets, expected);
     }
 }

@@ -70,8 +70,8 @@ pub use liveness::{
     APPLIED_SEQUENCE_LAG_BUCKETS, APPLY_LAG_FACTOR,
 };
 pub use placement::{
-    ClientHandler, ClientHandlerEntry, ClientHandlerSet, ConnectedHandlers, HandlerEndpoint,
-    HandlerSetError, MeetingHandlers, ReleaseCauseExt, RemovalTrigger, SetChange,
+    ClientHandlerEntry, ClientHandlerSet, ConnectedHandlers, HandlerEndpoint, HandlerSetError,
+    MeetingHandlers, ReleaseCauseExt, RemovalTrigger, SetChange,
 };
 pub use pusher::{FloorAdoption, HandlerPusher, PushJob, PushTarget, WorkerDrain};
 pub use slots::{

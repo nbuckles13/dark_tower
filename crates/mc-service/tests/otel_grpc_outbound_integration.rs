@@ -263,7 +263,7 @@ async fn mh_client_register_meeting_injects_active_span_traceparent() {
 
     let store: Captured = Arc::new(Mutex::new(Vec::new()));
     let (addr, cancel) = start_mh_server(Arc::clone(&store)).await;
-    let mh_url = format!("http://{addr}");
+    let mh_endpoint = format!("http://{addr}");
     let mh_client = MhClient::new(test_token_receiver());
 
     let span = tracing::info_span!("mc.outbound.mh");
@@ -271,7 +271,7 @@ async fn mh_client_register_meeting_injects_active_span_traceparent() {
     let assignment = two_party_assignment();
     mh_client
         .register_meeting(&MeetingProgramming {
-            mh_grpc_endpoint: &mh_url,
+            mh_grpc_endpoint: &mh_endpoint,
             expected_handler_id: TEST_HANDLER_ID,
             meeting_id: "meeting-otel",
             mc_id: "mc-test-001",

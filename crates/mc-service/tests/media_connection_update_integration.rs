@@ -1,12 +1,13 @@
 //! Integration tests for R-60 (MC half): a real framed
 //! `ClientMessage{MediaConnectionUpdate}` driven through the post-join
-//! `handle_client_message` decode+dispatch seam records per-MH state on the
-//! participant actor and emits `mc_participant_mh_status_total{state}`.
+//! `handle_client_message` decode+dispatch seam emits
+//! `mc_participant_mh_status_total{state}` once per status (the
+//! `MCMediaConnectionAllFailed` alert input).
 //!
 //! Asserts on the metric (the cluster-observable effect) via `MetricAssertion`;
-//! the per-state map contents + cap + mutual-exclusivity are exercised
-//! deterministically in `actors::participant::tests`. Truncation is exercised
-//! here end-to-end (a hostile >256-byte `mh_url` must not panic the seam).
+//! the deterministic per-state emission is exercised in
+//! `webtransport::connection::tests`. Hostile client strings are exercised here
+//! end-to-end (a >256-byte `failure_reason` must not panic the seam).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -97,14 +98,13 @@ fn join_frame(meeting_id: &str, join_token: &str) -> Vec<u8> {
     })
 }
 
-fn status(url: &str, state: ConnectionState) -> MhConnectionStatus {
+fn status(handler_ref: u32, state: ConnectionState) -> MhConnectionStatus {
     MhConnectionStatus {
-        mh_url: url.to_string(),
         state: state as i32,
         failure_reason: None,
         failure_code: None,
         observed_at: None,
-        handler_ref: 0,
+        handler_ref,
         handler_set_version: 0,
     }
 }
@@ -186,8 +186,8 @@ async fn test_media_connection_update_all_connected_records_metric() {
         "mcu-meeting-a",
         &token,
         vec![
-            status("https://mh-1", ConnectionState::Connected),
-            status("https://mh-2", ConnectionState::Connected),
+            status(1, ConnectionState::Connected),
+            status(2, ConnectionState::Connected),
         ],
     )
     .await;
@@ -214,8 +214,8 @@ async fn test_media_connection_update_partial_records_per_state() {
         "mcu-meeting-b",
         &token,
         vec![
-            status("https://mh-1", ConnectionState::Connected),
-            status("https://mh-2", ConnectionState::Failed),
+            status(1, ConnectionState::Connected),
+            status(2, ConnectionState::Failed),
         ],
     )
     .await;
@@ -245,8 +245,8 @@ async fn test_media_connection_update_all_failed_records_metric() {
         "mcu-meeting-c",
         &token,
         vec![
-            status("https://mh-1", ConnectionState::Failed),
-            status("https://mh-2", ConnectionState::Failed),
+            status(1, ConnectionState::Failed),
+            status(2, ConnectionState::Failed),
         ],
     )
     .await;
@@ -259,11 +259,11 @@ async fn test_media_connection_update_all_failed_records_metric() {
         .assert_delta(0);
 }
 
-/// Security (gotcha #6): a hostile >256-byte multi-byte `mh_url` (and
-/// `failure_reason`) must be truncated at the seam without panicking, and the
-/// status is still recorded (metric moves).
+/// Security (gotcha #6): hostile >256-byte multi-byte `failure_reason` /
+/// `failure_code` strings are dropped unread at the seam without panicking,
+/// and the status is still counted (metric moves).
 #[tokio::test]
-async fn test_media_connection_update_oversized_strings_truncated_no_panic() {
+async fn test_media_connection_update_oversized_strings_dropped_no_panic() {
     let snap = MetricAssertion::snapshot();
     let (stack, rig) = start_stack("mcu-truncate").await;
     seed_meeting_with_mh(&stack, "mcu-meeting-d").await;
@@ -271,55 +271,51 @@ async fn test_media_connection_update_oversized_strings_truncated_no_panic() {
         .keypair
         .sign_token(&make_meeting_claims("mcu-meeting-d"));
 
-    // ~3KB multi-byte string (each '€' is 3 bytes) as mh_url + failure_reason.
+    // ~3KB multi-byte string (each '€' is 3 bytes) as both client strings.
     let hostile = "€".repeat(1000);
-    let mut hostile_status = status(&hostile, ConnectionState::Failed);
+    let mut hostile_status = status(1, ConnectionState::Failed);
     hostile_status.failure_reason = Some(hostile.clone());
+    hostile_status.failure_code = Some(hostile.clone());
 
     let _conn = join_and_send_update(&rig.url, "mcu-meeting-d", &token, vec![hostile_status]).await;
 
-    // The seam did not panic and the status was recorded.
+    // The seam did not panic and the status was counted.
     snap.counter("mc_participant_mh_status_total")
         .with_labels(&[("state", "failed")])
         .assert_delta(1);
 }
 
-/// Security (cap): a single `MediaConnectionUpdate` reporting more distinct MH
-/// URLs than the per-participant cap (`MAX_MH_STATUSES_PER_PARTICIPANT = 16`)
-/// records the first 16 and drops the rest, bumping
-/// `mc_participant_mh_status_dropped_total{reason="cap"}` — end-to-end through
-/// the real WT seam (the deterministic unit-level cap semantics are in
-/// `actors::participant::tests`).
+/// Every status in a within-bound update is counted, however many distinct
+/// refs it names: there is no per-participant store to cap (each counts once,
+/// and nothing is dropped).
 #[tokio::test]
-async fn test_media_connection_update_over_cap_drops_and_counts() {
+async fn test_media_connection_update_many_refs_all_counted() {
     let snap = MetricAssertion::snapshot();
-    let (stack, rig) = start_stack("mcu-cap").await;
+    let (stack, rig) = start_stack("mcu-many").await;
     seed_meeting_with_mh(&stack, "mcu-meeting-e").await;
     let token = stack
         .keypair
         .sign_token(&make_meeting_claims("mcu-meeting-e"));
 
-    // 17 distinct MH URLs in one update → 16 recorded, 1 refused by the cap.
-    let statuses: Vec<MhConnectionStatus> = (0..17)
-        .map(|i| status(&format!("https://mh-cap-{i}"), ConnectionState::Connected))
+    let statuses: Vec<MhConnectionStatus> = (1..=17)
+        .map(|r| status(r, ConnectionState::Connected))
         .collect();
 
     let _conn = join_and_send_update(&rig.url, "mcu-meeting-e", &token, statuses).await;
 
     snap.counter("mc_participant_mh_status_total")
         .with_labels(&[("state", "connected")])
-        .assert_delta(16);
+        .assert_delta(17);
     snap.counter("mc_participant_mh_status_dropped_total")
-        .with_labels(&[("reason", "cap")])
-        .assert_delta(1);
+        .with_labels(&[("reason", "over_limit")])
+        .assert_delta(0);
 }
 
 /// Security (over_limit): a single `MediaConnectionUpdate` carrying more than
 /// `MAX_MH_STATUSES_PER_UPDATE = 64` statuses is bounded at the seam BEFORE any
 /// per-entry work — the excess is refused and
-/// `mc_participant_mh_status_dropped_total{reason="over_limit"}` bumps once.
-/// Of the 64 processed, only the map cap (16) land as `connected`; the other
-/// 48 hit the per-entry `cap` drop. Guards against input amplification (a
+/// `mc_participant_mh_status_dropped_total{reason="over_limit"}` bumps once;
+/// the 64 processed are each counted. Guards against input amplification (a
 /// 64 KiB frame can pack tens of thousands of minimal statuses).
 #[tokio::test]
 async fn test_media_connection_update_over_message_limit_drops_and_counts() {
@@ -330,9 +326,9 @@ async fn test_media_connection_update_over_message_limit_drops_and_counts() {
         .keypair
         .sign_token(&make_meeting_claims("mcu-meeting-f"));
 
-    // 70 distinct MH URLs in ONE message (> the 64 per-message bound).
-    let statuses: Vec<MhConnectionStatus> = (0..70)
-        .map(|i| status(&format!("https://mh-ovl-{i}"), ConnectionState::Connected))
+    // 70 statuses in ONE message (> the 64 per-message bound).
+    let statuses: Vec<MhConnectionStatus> = (1..=70)
+        .map(|r| status(r, ConnectionState::Connected))
         .collect();
 
     let _conn = join_and_send_update(&rig.url, "mcu-meeting-f", &token, statuses).await;
@@ -341,11 +337,8 @@ async fn test_media_connection_update_over_message_limit_drops_and_counts() {
     snap.counter("mc_participant_mh_status_dropped_total")
         .with_labels(&[("reason", "over_limit")])
         .assert_delta(1);
-    // Only the map cap lands; the 64 processed minus 16 landed = 48 cap drops.
+    // Exactly the bounded prefix is counted.
     snap.counter("mc_participant_mh_status_total")
         .with_labels(&[("state", "connected")])
-        .assert_delta(16);
-    snap.counter("mc_participant_mh_status_dropped_total")
-        .with_labels(&[("reason", "cap")])
-        .assert_delta(48);
+        .assert_delta(64);
 }

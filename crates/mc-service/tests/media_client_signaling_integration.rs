@@ -33,7 +33,6 @@ use std::time::Duration;
 
 use common::observability::testing::MetricAssertion;
 use mc_service::media_signaling::MediaKindLabel;
-use prost::Message;
 use proto_gen::dark_tower::signaling::v1::{
     client_message, ClientMessage, Codec, MediaConnectionUpdate, MediaKind, MhConnectionStatus,
     ReceiveSlot, SlotState, TransportMode,
@@ -49,13 +48,9 @@ use test_common::{
     seed_meeting_with_mh, TestStackHandles,
 };
 
-/// The handler url `seed_meeting_with_mh` seeds, which is what MC must put on
-/// `media_servers`, the send target and the slot assignment alike.
+/// The handler url `seed_meeting_with_mh` seeds: the one `MediaHandlerSet`
+/// entry, which every send target and slot assignment names by its ref.
 const SEEDED_HANDLER_URL: &str = "wt://mh-test-1:4433";
-
-/// A url no real handler could ever have (RFC 2606 `.invalid` never resolves),
-/// used to poison the client-supplied MH-status map in the redirect test.
-const ATTACKER_URL: &str = "https://attacker.example.invalid/redirect";
 
 /// Let the bridge loop read and dispatch a client message that produces no
 /// reply. A settle bound, NOT a performance assertion. Sibling settle bounds:
@@ -102,8 +97,7 @@ async fn declared_pair(
 
 /// ADR-0039 §5 through a REAL connection: the config gauges echo the TTL and
 /// TTL/3, the JoinResponse's set carries a
-/// `media_dial_token` on every entry, the legacy `media_servers` carries the
-/// byte-identical entries (one projection), and the push is counted
+/// `media_dial_token` on every entry, and the push is counted
 /// `reason=join` exactly once, when the JoinResponse is written.
 #[tokio::test]
 async fn the_join_response_carries_tokens_and_counts_one_join_push() {
@@ -127,11 +121,7 @@ async fn the_join_response_carries_tokens_and_counts_one_join_push() {
         .expect("the set is always present");
     assert_eq!(set.handlers.len(), 1);
     assert!(set.handlers.iter().all(|h| !h.media_dial_token.is_empty()));
-    // `assert!`, never `assert_eq!`: a failure must not print a token.
-    assert!(
-        a.media_server_entries == set.handlers,
-        "one projection, same tokens"
-    );
+    assert!(set.handlers.iter().all(|h| h.handler_ref != 0));
     snap.counter("mc_media_handler_set_pushes_total")
         .with_labels(&[("reason", "join"), ("key_custody", "operator")])
         .assert_delta(1);
@@ -149,7 +139,7 @@ async fn capability_yields_send_directive_and_slot_assignment() {
     seed_meeting_with_mh(&stack, "mcs-meeting-a").await;
     let mut a = join_as(&rig, &stack, "mcs-meeting-a", "user-a").await;
     let mut b = join_as(&rig, &stack, "mcs-meeting-a", "user-b").await;
-    assert_eq!(a.media_servers, vec![SEEDED_HANDLER_URL.to_string()]);
+    assert_eq!(a.handler_urls(), vec![SEEDED_HANDLER_URL.to_string()]);
 
     // Story 3: the JOIN carries the declaration (here none: zero slots), so
     // A was directed in its join turn — its published audio LISTED with EMPTY
@@ -184,7 +174,7 @@ async fn capability_yields_send_directive_and_slot_assignment() {
     );
     assert_ne!(slot_a.sender_id, Some(a.sender_id));
     assert_eq!(slot_a.media_kind, MediaKind::Audio as i32);
-    assert_eq!(slot_a.media_handler_url, SEEDED_HANDLER_URL);
+    assert_eq!(a.url_of(slot_a.handler_ref), SEEDED_HANDLER_URL);
     assert_eq!(slot_a.slot_state, SlotState::Active as i32);
     assert!(slot_a.switch_command_id.is_none());
 
@@ -220,9 +210,10 @@ async fn capability_yields_send_directive_and_slot_assignment() {
         "one target: the one handler A shares with B"
     );
     assert_eq!(
-        stream.targets[0].media_handler_url, a.media_servers[0],
-        "the send target and media_servers are the same string"
+        stream.targets[0].handler_ref, slot_a.handler_ref,
+        "the send target and the slot name the same set member"
     );
+    assert_eq!(a.url_of(stream.targets[0].handler_ref), SEEDED_HANDLER_URL);
     assert_eq!(
         stream.targets[0].transport_mode,
         TransportMode::Datagram as i32
@@ -278,7 +269,7 @@ async fn a_solo_participant_hears_nothing_and_is_told_to_send_nothing() {
     for s in &assignments.assignments {
         assert_eq!(s.slot_state, SlotState::FewerSourcesThanSlots as i32);
         assert!(s.sender_id.is_none());
-        assert!(s.media_handler_url.is_empty());
+        assert_eq!(s.handler_ref, 0, "no edge");
     }
     snap.counter("mc_media_slot_states_total")
         .with_labels(&[
@@ -558,7 +549,7 @@ async fn an_extra_slot_reports_a_source_shortage_with_sender_id_absent() {
         "absent MUST NOT be coerced to 0 — a shared zero is N colliding live ids"
     );
     assert_ne!(extra.sender_id, Some(0));
-    assert!(extra.media_handler_url.is_empty());
+    assert_eq!(extra.handler_ref, 0, "no edge");
 }
 
 #[tokio::test]
@@ -644,7 +635,7 @@ async fn a_zero_slot_declaration_still_directs_the_client_to_send() {
     assert_eq!(directive.streams.len(), 1);
     assert_eq!(directive.streams[0].targets.len(), 1);
     assert_eq!(
-        directive.streams[0].targets[0].media_handler_url,
+        a.url_of(directive.streams[0].targets[0].handler_ref),
         SEEDED_HANDLER_URL
     );
     // An identical (empty) redeclaration is a no-op.
@@ -697,7 +688,7 @@ async fn rejects_duplicate_slot_ids() {
 
 /// Story 3 R-1: over the cap is TRUNCATED, never rejected: the first `cap`
 /// audio slots fill as usual and the excess slot reads UNAVAILABLE with its
-/// declared id echoed, no sender and an empty url. The cap comes from
+/// declared id echoed, no sender and `handler_ref` 0 (no edge). The cap comes from
 /// CONFIGURATION — the same value `WebTransportServer::new` publishes as
 /// `mc_media_receive_slot_cap` and the JoinResponse advertises per kind (the
 /// single total cap, tag 12, was deleted by MC-B).
@@ -740,7 +731,7 @@ async fn an_over_cap_declaration_is_truncated_to_unavailable_and_counted_accepte
     assert_eq!(excess.slot_id, audio_cap, "the declared id is echoed");
     assert_eq!(excess.slot_state, SlotState::Unavailable as i32);
     assert!(excess.sender_id.is_none());
-    assert!(excess.media_handler_url.is_empty());
+    assert_eq!(excess.handler_ref, 0, "no edge");
     snap.counter("mc_media_receive_capability_declarations_total")
         .with_labels(&[("outcome", "accepted"), ("key_custody", "operator")])
         .assert_delta(1);
@@ -891,13 +882,12 @@ async fn rejects_declarations_past_the_per_connection_budget() {
 }
 
 // ============================================================================
-// Security: the two url-keyed maps must not cross
+// Security: client-supplied refs never reach a send target
 // ============================================================================
 
-/// A client-reported url (and, since story 4 MC-A, a client-reported
-/// `handler_ref` / `handler_set_version`) never reaches a `SendTarget`, a
-/// `StreamAssignment` or the `MediaHandlerSet`: every ref they carry is a
-/// member of the server-derived set the client was given.
+/// A client-reported `handler_ref` / `handler_set_version` never reaches a
+/// `SendTarget`, a `StreamAssignment` or the `MediaHandlerSet`: every ref they
+/// carry is a member of the server-derived set the client was given.
 #[tokio::test]
 async fn a_client_supplied_handler_url_never_reaches_a_send_target() {
     let snap = MetricAssertion::snapshot();
@@ -912,7 +902,6 @@ async fn a_client_supplied_handler_url_never_reaches_a_send_target() {
         message: Some(client_message::Message::MediaConnectionUpdate(
             MediaConnectionUpdate {
                 statuses: vec![MhConnectionStatus {
-                    mh_url: ATTACKER_URL.to_string(),
                     state: proto_gen::dark_tower::signaling::v1::ConnectionState::Connected as i32,
                     failure_reason: None,
                     failure_code: None,
@@ -940,11 +929,11 @@ async fn a_client_supplied_handler_url_never_reaches_a_send_target() {
     let assignments = assignments.expect("A's slot view");
 
     assert_eq!(
-        directive.streams[0].targets[0].media_handler_url,
+        a.url_of(directive.streams[0].targets[0].handler_ref),
         SEEDED_HANDLER_URL
     );
     assert_eq!(
-        assignments.assignments[0].media_handler_url,
+        a.url_of(assignments.assignments[0].handler_ref),
         SEEDED_HANDLER_URL
     );
     // Refs (ADR-0039 §4): every target and assignment names a member of the
@@ -974,18 +963,6 @@ async fn a_client_supplied_handler_url_never_reaches_a_send_target() {
     assert!(!members.contains(&FORGED_HANDLER_REF));
     assert_ne!(target_ref, FORGED_HANDLER_REF);
     assert_ne!(slot_ref, FORGED_HANDLER_REF);
-
-    let needle = ATTACKER_URL.as_bytes();
-    for bytes in [
-        directive.encode_to_vec(),
-        assignments.encode_to_vec(),
-        set.encode_to_vec(),
-    ] {
-        assert!(
-            !bytes.windows(needle.len()).any(|w| w == needle),
-            "attacker url reached a media message"
-        );
-    }
 }
 
 /// A handler_ref no MC-issued set ever holds in these tests (refs are
@@ -993,9 +970,9 @@ async fn a_client_supplied_handler_url_never_reaches_a_send_target() {
 const FORGED_HANDLER_REF: u32 = 999;
 
 /// S4 pin (a) + S3, in the per-EDGE shape: in a two-handler meeting where the
-/// pair's edge sits on one handler, a client reporting (a) an attacker url as
-/// connected and (b) the edge's REAL handler as failed changes nothing — the
-/// client-reported map is never a url source and never narrows connectivity.
+/// pair's edge sits on one handler, a client reporting (a) a forged ref as
+/// connected and (b) the edge's REAL handler as failed changes nothing — a
+/// client report is never a handler source and never narrows connectivity.
 /// Connectivity is only what the handlers report.
 #[tokio::test]
 async fn client_reported_status_neither_redirects_nor_narrows_a_per_edge_url() {
@@ -1022,16 +999,17 @@ async fn client_reported_status_neither_redirects_nor_narrows_a_per_edge_url() {
             x.assignments.first().and_then(|a| a.sender_id) == Some(b.sender_id)
         })
         .await;
-    assert_eq!(before.assignments[0].media_handler_url, "wt://mh-1:4433");
+    let edge_ref = before.assignments[0].handler_ref;
+    assert_eq!(a.url_of(edge_ref), "wt://mh-1:4433");
 
-    let status = |url: &str, state: proto_gen::dark_tower::signaling::v1::ConnectionState| {
+    let status = |handler_ref: u32,
+                  state: proto_gen::dark_tower::signaling::v1::ConnectionState| {
         MhConnectionStatus {
-            mh_url: url.to_string(),
             state: state as i32,
             failure_reason: None,
             failure_code: None,
             observed_at: None,
-            handler_ref: 0,
+            handler_ref,
             handler_set_version: 0,
         }
     };
@@ -1043,11 +1021,11 @@ async fn client_reported_status_neither_redirects_nor_narrows_a_per_edge_url() {
                 MediaConnectionUpdate {
                     statuses: vec![
                         status(
-                            ATTACKER_URL,
+                            FORGED_HANDLER_REF,
                             proto_gen::dark_tower::signaling::v1::ConnectionState::Connected,
                         ),
                         status(
-                            "wt://mh-1:4433",
+                            edge_ref,
                             proto_gen::dark_tower::signaling::v1::ConnectionState::Failed,
                         ),
                     ],
@@ -1062,12 +1040,14 @@ async fn client_reported_status_neither_redirects_nor_narrows_a_per_edge_url() {
     b.write(capability_frame(audio_slots(2))).await; // force B a fresh view
     let (_, b_view) = b.settle().await;
     let b_view = b_view.expect("B's view");
-    let needle = ATTACKER_URL.as_bytes();
-    assert!(!b_view
-        .encode_to_vec()
-        .windows(needle.len())
-        .any(|w| w == needle));
-    assert_eq!(b_view.assignments[0].media_handler_url, "wt://mh-1:4433");
+    assert!(b_view
+        .assignments
+        .iter()
+        .all(|x| x.handler_ref != FORGED_HANDLER_REF));
+    assert_eq!(
+        b.url_of(b_view.assignments[0].handler_ref),
+        "wt://mh-1:4433"
+    );
     assert_eq!(b_view.assignments[0].sender_id, Some(a.sender_id));
 }
 
@@ -1101,7 +1081,6 @@ async fn a_client_that_joins_without_a_declaration_is_still_directed_and_stays_h
         message: Some(client_message::Message::MediaConnectionUpdate(
             MediaConnectionUpdate {
                 statuses: vec![MhConnectionStatus {
-                    mh_url: SEEDED_HANDLER_URL.to_string(),
                     state: proto_gen::dark_tower::signaling::v1::ConnectionState::Connected as i32,
                     failure_reason: None,
                     failure_code: None,
@@ -1154,8 +1133,7 @@ async fn every_client_is_offered_the_full_set_and_steered_only_to_owning_handler
         let mut c = join_as(&rig, &stack, &meeting, "user-c").await;
 
         for s in [&a, &b, &c] {
-            let mut offered = s.media_servers.clone();
-            offered.sort();
+            let offered = s.handler_urls();
             assert_eq!(
                 offered, registered,
                 "order {order:?}: the full set, every time"
@@ -1175,12 +1153,13 @@ async fn every_client_is_offered_the_full_set_and_steered_only_to_owning_handler
             .await;
         for slot in &assignments.assignments {
             assert!(
-                registered.contains(&slot.media_handler_url),
-                "order {order:?}: a slot url is a registered url verbatim"
+                registered.contains(&a.url_of(slot.handler_ref)),
+                "order {order:?}: a slot ref names a registered url verbatim"
             );
             if slot.sender_id == Some(b.sender_id) {
                 assert_eq!(
-                    slot.media_handler_url, "wt://mh-0:4433",
+                    a.url_of(slot.handler_ref),
+                    "wt://mh-0:4433",
                     "order {order:?}: the only handler A and B share"
                 );
             }
@@ -1189,8 +1168,8 @@ async fn every_client_is_offered_the_full_set_and_steered_only_to_owning_handler
         let (directive, _) = c.settle().await;
         for target in &directive.expect("C's directive").streams[0].targets {
             assert!(
-                registered.contains(&target.media_handler_url),
-                "order {order:?}: a send target is a registered url verbatim"
+                registered.contains(&c.url_of(target.handler_ref)),
+                "order {order:?}: a send target names a registered url verbatim"
             );
         }
     }

@@ -15,7 +15,7 @@
 // It never dials anything outside the latest set.
 //
 // Each dial opens a WebTransport session, writes ONE length-prefixed
-// `MhClientMessage{connectRequest{joinToken, mediaDialToken}}` on the first bidi
+// `MhClientMessage{connectRequest{mediaDialToken}}` on the first bidi
 // stream (trace-injected through the same `sendFramedMessage` as the MC send),
 // and is CONNECTED iff `ready` resolved and that envelope wrote. The bidi stream
 // then carries the MH control channel in both directions (story 3): MH ->
@@ -40,8 +40,8 @@
 // injected scheduler and is cancelled on removal and at `disconnect()`.
 //
 // R-23 / ADR-0039 §5 credential rules: see `#dialTokens` (the scoped dial-token
-// retention) and `arm` (the meeting JWT is a call-scoped parameter, never
-// stored). `failureReason`/`failureCode` are SDK-authored bounded strings.
+// retention) and `arm` (the meeting JWT never reaches this class).
+// `failureReason`/`failureCode` are SDK-authored bounded strings.
 
 import { create, fromBinary } from '@bufbuild/protobuf';
 
@@ -284,7 +284,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
         // set repeating it keeps the park. Then exactly one dial.
         if (rec.tokenGen > rec.dialTokenGen) {
           rec.attempt = 0;
-          void this.#dial(rec, '');
+          void this.#dial(rec);
         }
       } else if (rec.graceTimer !== undefined) {
         // A set update inside the HANDLER_RELEASED grace that keeps the ref:
@@ -293,34 +293,30 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
         this.#scheduleRedial(rec);
       }
     }
-    if (this.#armed) this.#reconcile('');
+    if (this.#armed) this.#reconcile();
   }
 
   /**
    * Start dialling: called ONCE by `MeetingSession` after the signalling join
-   * resolved. Dials every member of the latest set with `joinToken` and resolves
-   * when those dials settle.
+   * resolved. Dials every member of the latest set and resolves when those
+   * dials settle.
    *
-   * THE MEETING JWT IS A CALL-SCOPED PARAMETER, NEVER STORED (R-23; ADR-0039 §5:
-   * the join JWT is "deliberately not retained by the SDK"; checks.md: "a JWT
-   * held for redial is a Gate 1 finding"). Only the dials started here carry it
-   * as `join_token`, exactly as before this change. EVERY LATER DIAL (added
-   * ref, redial, retry, post-park, the first non-empty set after an empty join
-   * set) sends `join_token = ""` plus `media_dial_token`, and MH admits it on
-   * `media_dial_token` alone (story 4 MH-1: MH never reads `join_token`). The
-   * join-time dials still carry `join_token` until story 4 P3 deletes the
-   * field; MH ignores it. Do NOT retain the JWT for redial: the media_dial
-   * token is the only credential a dial needs.
+   * THE MEETING JWT NEVER REACHES THIS CLASS (R-23; ADR-0039 §5: the join JWT
+   * is "deliberately not retained by the SDK"). Every dial — join, added ref,
+   * redial, retry, post-park — carries exactly one credential, the ref's
+   * latest `media_dial_token`, read from `#dialTokens` when the request is
+   * built. Do NOT thread the JWT in here: it is MC's join credential, never an
+   * MH one.
    *
    * @throws {MediaConnectionError} `ALL_FAILED` when the join-time set is
    *   NON-EMPTY and none of its dials connected (the join gate, unchanged). An
    *   empty set resolves at once ("media connecting").
    */
-  async arm(joinToken: string): Promise<void> {
+  async arm(): Promise<void> {
     if (this.#armed || this.#terminated) return;
     this.#armed = true;
     if (this.#set.handlers.length === 0) this.#startEmptySetNotice();
-    await Promise.allSettled(this.#reconcile(joinToken));
+    await Promise.allSettled(this.#reconcile());
     if (this.#terminated) return;
     const anyConnected = [...this.#refs.values()].some((r) => r.state === 'connected');
     if (this.#set.handlers.length > 0 && !anyConnected) {
@@ -466,7 +462,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
    * is connecting, connected, awaiting a redial, or parked — none is redialed
    * here. Returns the dials started (so `arm` can await the join-time ones).
    */
-  #reconcile(joinToken: string): Promise<void>[] {
+  #reconcile(): Promise<void>[] {
     const dials: Promise<void>[] = [];
     this.#set.handlers.forEach((h, index) => {
       if (this.#refs.has(h.ref)) return;
@@ -489,7 +485,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
         lastReported: undefined,
       };
       this.#refs.set(h.ref, rec);
-      dials.push(this.#dial(rec, joinToken));
+      dials.push(this.#dial(rec));
     });
     return dials;
   }
@@ -507,12 +503,11 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
 
   /**
    * THE ONE DIAL PATH (join, add, redial, retry, post-park). Never rejects: the
-   * outcome lands on the record. `joinToken` is non-empty only for the dials
-   * `arm` starts; the dial token is read from `#dialTokens` when the request is
-   * built. A dial whose ref was removed meanwhile is closed when it resolves and
-   * emits NOTHING (no metric, no report, no event).
+   * outcome lands on the record. The dial token is read from `#dialTokens`
+   * when the request is built. A dial whose ref was removed meanwhile is closed
+   * when it resolves and emits NOTHING (no metric, no report, no event).
    */
-  async #dial(rec: RefRecord, joinToken: string): Promise<void> {
+  async #dial(rec: RefRecord): Promise<void> {
     rec.state = 'connecting';
     let transport: IWebTransport;
     try {
@@ -594,7 +589,6 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
         message: {
           case: 'connectRequest',
           value: create(MhConnectRequestSchema, {
-            joinToken,
             mediaDialToken: this.#dialTokens.get(rec.ref) ?? '',
           }),
         },
@@ -693,7 +687,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
         // it (which would stall until MC's next TTL/3 push).
         if (rec.tokenGen > rec.dialTokenGen) {
           rec.attempt = 0;
-          void this.#dial(rec, '');
+          void this.#dial(rec);
         }
         return;
       case 'contract_fault':
@@ -733,7 +727,7 @@ export class MediaTransport extends TypedEventEmitter<MediaTransportEventMap> {
       rec.redialTimer = undefined;
       // Never dial outside the latest set: a removed ref has no live record.
       if (!this.#isCurrent(rec)) return;
-      void this.#dial(rec, '');
+      void this.#dial(rec);
     }, delay);
   }
 

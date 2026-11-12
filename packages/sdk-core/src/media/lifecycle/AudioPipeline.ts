@@ -779,7 +779,7 @@ export class AudioPipeline extends TypedEventEmitter<AudioPipelineEventMap> {
    * connected to, and different senders' edges may land on different handlers.
    * The canonical case: A is connected to both handlers, B only to the first, C
    * only to the second — so A receives B on one transport and C on the other,
-   * and reads each slot on whichever transport its `media_handler_url` names.
+   * and reads each slot on whichever transport its `handler_ref` names.
    *
    * This previously FAULTED on two URLs and refused to follow a moved edge,
    * because an earlier revision of the model gave each participant exactly one

@@ -3,9 +3,8 @@
 //! A handler becomes client-visible only once its `RegisterMeeting` is acked.
 //! A meeting's initial handlers (GC's hand-off) are programmed by the push
 //! workers the FIRST join's reconcile spawns, so the joins that arrive before
-//! those handlers' verdicts would otherwise be answered with an empty set — and
-//! a pre-C1 SDK, which reads only the legacy `media_servers`, would then have
-//! no media for its session.
+//! those handlers' verdicts would otherwise be answered with an empty set, and
+//! the client would dial nothing until the next set push.
 //!
 //! So the meeting actor PARKS the reply of every join admitted while the
 //! initial verdict is pending, and keeps serving its mailbox: admission

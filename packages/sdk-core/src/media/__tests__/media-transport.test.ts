@@ -35,7 +35,6 @@ const URL_C = 'https://mh-c.example:4433';
 const REF_A = handlerRef(1);
 const REF_B = handlerRef(2);
 const REF_C = handlerRef(3);
-const JWT = 'meeting-jwt-value';
 
 afterEach(async () => {
   await resetTelemetryForTest();
@@ -43,8 +42,8 @@ afterEach(async () => {
 });
 
 /**
- * A transport whose join-time set is `urls` (refs 1..n in order), armed with
- * `JWT` — the reconcile's join path.
+ * A transport whose join-time set is `urls` (refs 1..n in order), armed — the
+ * reconcile's join path.
  */
 function joinTransport(
   urls: readonly string[],
@@ -70,7 +69,7 @@ function joinTransport(
     mt,
     mocks,
     reports,
-    armed: () => (armedPromise ??= mt.arm(JWT)),
+    armed: () => (armedPromise ??= mt.arm()),
   };
 }
 
@@ -140,7 +139,7 @@ describe('MediaTransport.arm — the join-time dials (R-20/R-21)', () => {
       ]),
     );
 
-    const p = mt.arm(JWT);
+    const p = mt.arm();
     mocks.get(URL_A)!.simulateReady();
     await p;
 
@@ -199,7 +198,7 @@ describe('MediaTransport.arm — the join-time dials (R-20/R-21)', () => {
 });
 
 describe('MediaTransport — MhClientMessage envelope (R-20/R-58)', () => {
-  it('writes one connectRequest{joinToken, mediaDialToken} envelope; trace EMPTY when telemetry unconfigured', async () => {
+  it('writes one connectRequest{mediaDialToken} envelope; trace EMPTY when telemetry unconfigured', async () => {
     const { mocks, armed } = joinTransport([URL_A]);
     const p = armed();
     mocks.get(URL_A)!.simulateReady();
@@ -209,7 +208,6 @@ describe('MediaTransport — MhClientMessage envelope (R-20/R-58)', () => {
     expect(envs).toHaveLength(1);
     expect(envs[0]!.message.case).toBe('connectRequest');
     const request = envs[0]!.message.case === 'connectRequest' ? envs[0]!.message.value : undefined;
-    expect(request?.joinToken).toBe(JWT);
     expect(request?.mediaDialToken).toBe('tok-1');
     expect(envs[0]!.traceParent).toBe('');
     expect(envs[0]!.traceState).toBe('');
@@ -238,6 +236,9 @@ describe('MediaTransport — MhClientMessage envelope (R-20/R-58)', () => {
 
 describe('MediaTransport — token redaction (R-23, G3)', () => {
   it('MediaConnectionError from a real failed handshake never exposes the JWT or the dial token', async () => {
+    // A JWT-shaped string the transport error echoes (the class never holds the
+    // meeting JWT; this pins that an echoed credential never reaches the error).
+    const JWT = 'meeting-jwt-value';
     const { mt, mocks, armed } = joinTransport([URL_A]);
     const failures: MediaConnectionError[] = [];
     mt.on('failed', (e) => failures.push(e));

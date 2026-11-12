@@ -132,6 +132,31 @@ impl HandlerSets {
             .unwrap_or_default()
     }
 
+    /// The url of `handler_ref` (ADR-0039 §4: refs name handlers; the set is
+    /// the one place an address reaches a client). Resolved against the
+    /// CURRENT set first, then every earlier set — a ref is never reused
+    /// within a meeting, so its url is unique.
+    ///
+    /// # Panics
+    /// On ref 0 ("no edge") or a ref no received set listed: either is an MC
+    /// contract fault, never silently an empty url.
+    #[must_use]
+    pub fn url_of(&self, handler_ref: u32) -> String {
+        assert_ne!(handler_ref, 0, "ref 0 names no handler (no edge)");
+        self.current
+            .iter()
+            .chain(self.history.iter().rev())
+            .find_map(|v| {
+                v.entries
+                    .iter()
+                    .find(|(r, _)| *r == handler_ref)
+                    .map(|(_, u)| u.clone())
+            })
+            .unwrap_or_else(|| {
+                panic!("handler_ref {handler_ref} is in no MediaHandlerSet received (MC defect)")
+            })
+    }
+
     /// The current entry for `url`, if any.
     #[must_use]
     pub fn ref_for_url(&self, url: &str) -> Option<u32> {
@@ -147,7 +172,7 @@ impl HandlerSets {
 /// The audio slot kind, for the kind-taking helpers below. Every helper that
 /// reads a view takes a kind: a video slot showing an avatar NAMES its
 /// participant, so a kind-blind "which slot holds sender X" would answer with
-/// the video avatar (empty url) as readily as the audio edge.
+/// the video avatar (`handler_ref` 0, no edge) as readily as the audio edge.
 pub const AUDIO: MediaKind = MediaKind::Audio;
 /// The camera-video slot kind (see [`AUDIO`]).
 pub const VIDEO: MediaKind = MediaKind::VideoCamera;
@@ -222,7 +247,7 @@ impl Participant {
     }
 
     /// The handler urls this participant was OFFERED: its CURRENT
-    /// MediaHandlerSet's urls, sorted (never the legacy `media_servers`).
+    /// MediaHandlerSet's urls, sorted.
     pub fn offered(&self) -> Vec<String> {
         self.sets.urls()
     }
@@ -353,7 +378,7 @@ impl Participant {
                     filled_senders(v, VIDEO),
                     &v.unreachable_sender_ids
                 )),
-                self.directive.as_ref().map(targets_of)
+                self.directive.as_ref().map(target_refs)
             );
             if let Some(m) = self
                 .session
@@ -390,9 +415,25 @@ impl Participant {
             })
     }
 
-    /// The handler url on this participant's `kind` slot naming `sender`.
+    /// The url of `handler_ref`, resolved through this participant's handler
+    /// sets (panics on 0 or a non-member: see [`HandlerSets::url_of`]).
+    pub fn url_of(&self, handler_ref: u32) -> String {
+        self.sets.url_of(handler_ref)
+    }
+
+    /// The handler url on this participant's `kind` slot naming `sender`
+    /// (its `handler_ref`, resolved through the handler set).
     pub fn slot_url(&self, sender: u32, kind: MediaKind) -> String {
-        self.slot_naming(sender, kind).media_handler_url.clone()
+        self.url_of(self.slot_naming(sender, kind).handler_ref)
+    }
+
+    /// The urls this participant's latest directive targets (refs resolved
+    /// through the handler set).
+    pub fn targets(&self) -> BTreeSet<String> {
+        self.directive
+            .as_ref()
+            .map(|d| target_refs(d).into_iter().map(|r| self.url_of(r)).collect())
+            .unwrap_or_default()
     }
 
     /// The slot id this participant declared for its `kind` slot naming
@@ -410,10 +451,11 @@ pub fn slots_of(view: &StreamAssignments, kind: MediaKind) -> Vec<&StreamAssignm
         .collect()
 }
 
-pub fn targets_of(d: &SendDirective) -> BTreeSet<String> {
+/// The handler refs `d` targets, across its streams.
+pub fn target_refs(d: &SendDirective) -> BTreeSet<u32> {
     d.streams
         .iter()
-        .flat_map(|s| s.targets.iter().map(|t| t.media_handler_url.clone()))
+        .flat_map(|s| s.targets.iter().map(|t| t.handler_ref))
         .collect()
 }
 

@@ -25,7 +25,6 @@ import { intakeOf, makeConnect, waitFor } from './helpers.js';
 
 const URL_A = 'https://mh-a.example:4433';
 const REF_A = handlerRef(1);
-const JWT = 'meeting-jwt-value';
 
 interface Recorded {
   readonly requests: MhKeyframeRequest[];
@@ -61,7 +60,7 @@ async function connected(): Promise<{
   const { sink, seen } = recordingSink();
   const mt = new MediaTransport({ connect: makeConnect(mocks), controlSink: sink });
   mt.applyHandlerSet(intakeOf(1n, [{ ref: 1, url: URL_A }]));
-  const p = mt.arm(JWT);
+  const p = mt.arm();
   mocks.get(URL_A)!.simulateReady();
   await p;
   return { mt, mh: mocks.get(URL_A)!, seen };
@@ -235,6 +234,7 @@ describe('recovery_request control send', () => {
       .sendRecoveryRequest(handlerRef(99), { slotId: 0, senderId: 1, gopCounter: 0 })
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(MediaConnectionError);
-    expect((err as Error).message).not.toContain(JWT);
+    // The one credential this class holds is the ref's dial token.
+    expect((err as Error).message).not.toContain('tok-1');
   });
 });
