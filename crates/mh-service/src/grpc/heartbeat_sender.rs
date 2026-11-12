@@ -21,7 +21,9 @@
 //!   ids MH acts on are the BEAT's, never the response's.
 //! - MH never ends a meeting because MC is unreachable: an error, a timeout,
 //!   `FAILED_PRECONDITION` (owner mismatch) or an `UNSPECIFIED` verdict is
-//!   counted and nothing else.
+//!   counted and nothing else — in particular none of them resets the
+//!   owner-silence timer; only OWNED (relayed here) and RELEASED reach the
+//!   actor (`crate::session::owner_silence`).
 //!
 //! # Bounded state
 //!
@@ -59,7 +61,7 @@ use tracing::{info, warn};
 use crate::grpc::mc_client::MC_CONNECT_TIMEOUT;
 use crate::observability::metrics::{self, McHeartbeatOutcome, McHeartbeatVerdict};
 use crate::session::heartbeat::{per_attempt_deadline, OutboundBeat, SenderCommand};
-use crate::session::VerdictSink;
+use crate::session::{OwnedRelay, VerdictSink};
 
 /// Why a heartbeat call failed. Bounded: no message text, no metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -442,6 +444,20 @@ async fn send_one<S: HeartbeatTransport>(
             match HeartbeatVerdict::try_from(response.verdict) {
                 Ok(HeartbeatVerdict::Owned) => {
                     metrics::record_mc_heartbeat_verdict(McHeartbeatVerdict::Owned);
+                    // The owner communicated: the owner-silence reset (story 4
+                    // MH-3). The actor applies it only on a fence match.
+                    // Non-blocking; a drop is said, never silent.
+                    match verdicts.owned(meeting_id.clone(), fence) {
+                        OwnedRelay::MailboxFull => warn!(
+                            target: "mh.grpc.heartbeat",
+                            meeting_id = %meeting_id,
+                            mc_id = %mc_id,
+                            "Session mailbox full; OWNED verdict not relayed (owner-silence \
+                             timer not reset by this beat)"
+                        ),
+                        // The actor being gone is shutdown; nothing to reset.
+                        OwnedRelay::Delivered | OwnedRelay::ActorGone => {}
+                    }
                     BeatClass::Ok
                 }
                 Ok(HeartbeatVerdict::Released) => {

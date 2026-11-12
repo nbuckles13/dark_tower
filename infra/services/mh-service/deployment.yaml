@@ -47,13 +47,14 @@ spec:
         app: mh-service
         component: media
     spec:
-      # SINGLE SOURCE OF TRUTH for every MH's shutdown drain window.
+      # SINGLE SOURCE OF TRUTH for every MH's planned drain (ADR-0039 §7).
       # A kustomize replacement (kustomization.yaml) copies this value into the
-      # MH_TERMINATION_GRACE_SECONDS env entry below. Once story task #12 lands,
-      # MH derives its drain as min(SETTLE_TARGET, grace - MARGIN) from that env
-      # var — so changing this number changes MH's drain behaviour, and setting it
-      # at or below MARGIN makes MH refuse to start. Do not retype the value into
-      # the env entry; the replacement is what keeps the two from drifting.
+      # MH_TERMINATION_GRACE_SECONDS env entry below, and MH drains for
+      # grace - SHUTDOWN_MARGIN_SECONDS (5) after SIGTERM: 30 s at 35. Raising
+      # it lengthens every drain, upgrade and node maintenance, and how long a
+      # terminating pod holds its hostPort slot; setting it at or below the
+      # margin makes MH refuse to start. Do not retype the value into the env
+      # entry; the replacement is what keeps the two from drifting.
       terminationGracePeriodSeconds: 35
       securityContext:
         runAsNonRoot: true
@@ -146,6 +147,11 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_KEEPALIVE_INTERVAL_MS
+        - name: MH_MAX_IDLE_TIMEOUT_MS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MAX_IDLE_TIMEOUT_MS
         - name: MH_MAX_CONNECTIONS
           valueFrom:
             configMapKeyRef:
@@ -269,6 +275,11 @@ spec:
             configMapKeyRef:
               name: mh-service-config
               key: MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT
+        - name: MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: mh-service-config
+              key: MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS
         # Shared media codec profile (story 3 R-23, R-24): the four values MH
         # reads from the SHARED `media-codec-profile` generator in the sibling
         # base infra/services/media-codec-profile/ — their single home, also
@@ -373,12 +384,12 @@ spec:
         # pod's grace for its drain bound), and a shared key would be exactly the second, drift-prone
         # literal this derivation exists to remove (R-21).
         #
-        # `"0"` is a sentinel, not a value. It is invalid — task #12 requires
+        # `"0"` is a sentinel, not a value. It is invalid — MH requires
         # grace > MARGIN — so a `0` that reaches a running pod is a loud refusal
         # to start, never a silently-wrong drain. Seeing `"0"` on a live pod
         # means the kustomize replacement did not run.
         #
-        # That loudness is NOT automatic. It holds only if task #12 (a) parses
+        # That loudness is NOT automatic. It holds only because MH (a) parses
         # this var STRICTLY — no `unwrap_or`, or `"0"` parses to 0 and never
         # reaches the check; (b) validates BEFORE computing the drain; and
         # (c) uses `saturating_sub` for `grace - MARGIN`, since on an unsigned
@@ -391,11 +402,11 @@ spec:
         # start: a new-meeting outage plus silent media in every existing
         # meeting (the scale-to-zero shape; R-6 made "a join outage" wrong).
         #
-        # Operational consequence: once task #12 lands, MH's drain window is
-        # min(SETTLE_TARGET, terminationGracePeriodSeconds - MARGIN). Editing
-        # the grace period above therefore CHANGES MH's drain behaviour. That
-        # coupling is the point, but it is not what a reader expects from a
-        # pod-spec field.
+        # Operational consequence: MH's drain window IS
+        # terminationGracePeriodSeconds - MARGIN, with no cap (ADR-0039 §7).
+        # Editing the grace period above therefore CHANGES how long every MH
+        # keeps forwarding for MC to move meetings off. That coupling is the
+        # point, but it is not what a reader expects from a pod-spec field.
         - name: MH_TERMINATION_GRACE_SECONDS
           value: "0"
         - name: AC_ENDPOINT

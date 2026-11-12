@@ -22,6 +22,7 @@
 
 pub mod auth_interceptor;
 pub mod gc_client;
+pub mod gc_task;
 pub mod heartbeat_sender;
 pub mod mc_client;
 pub mod mh_service;

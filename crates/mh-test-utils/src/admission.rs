@@ -82,6 +82,42 @@ pub fn fixture_quic_transport() -> mh_service::config::QuicTransportParams {
         max_concurrent_uni_streams: 64,
         datagram_send_buffer_audio_frames: 32,
         datagram_send_buffer_bytes: 32 * mh_service::config::NOMINAL_AUDIO_FRAME_BYTES,
-        keepalive_interval_ms: 10_000,
+        keepalive_interval_ms: 2_000,
+        max_idle_timeout_ms: 6_000,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    /// The fixture IS the deployed transport configuration: every field is
+    /// compared with `infra/services/mh-service/config.env`, so the copy
+    /// cannot drift from the shipped file.
+    #[test]
+    fn fixture_quic_transport_matches_the_shipped_config_env() {
+        let env = include_str!("../../../infra/services/mh-service/config.env");
+        let key = |name: &str| -> u64 {
+            let values: Vec<&str> = env
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix(&format!("{name}=")))
+                .collect();
+            assert_eq!(values.len(), 1, "{name} defined exactly once");
+            values[0].trim().parse().expect("numeric")
+        };
+        let q = super::fixture_quic_transport();
+        assert_eq!(
+            u64::from(q.max_concurrent_uni_streams),
+            key("MH_MAX_CONCURRENT_UNI_STREAMS")
+        );
+        assert_eq!(
+            q.datagram_send_buffer_audio_frames as u64,
+            key("MH_DATAGRAM_BUFFER_AUDIO_FRAMES")
+        );
+        assert_eq!(
+            q.datagram_send_buffer_bytes,
+            q.datagram_send_buffer_audio_frames * mh_service::config::NOMINAL_AUDIO_FRAME_BYTES
+        );
+        assert_eq!(q.keepalive_interval_ms, key("MH_KEEPALIVE_INTERVAL_MS"));
+        assert_eq!(q.max_idle_timeout_ms, key("MH_MAX_IDLE_TIMEOUT_MS"));
     }
 }

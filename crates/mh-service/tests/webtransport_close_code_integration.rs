@@ -92,6 +92,19 @@ struct Suite {
 
 impl Suite {
     async fn start(max_connections: usize) -> Self {
+        Self::start_with_disconnects(max_connections, None).await
+    }
+
+    /// [`Self::start`], with the mock MC reporting every
+    /// `NotifyParticipantDisconnected` it receives on `disconnects`.
+    async fn start_with_disconnects(
+        max_connections: usize,
+        disconnects: Option<
+            tokio::sync::mpsc::Sender<
+                proto_gen::dark_tower::internal::v1::NotifyParticipantDisconnectedRequest,
+            >,
+        >,
+    ) -> Self {
         let session_manager =
             SessionManagerHandle::new_for_tests(mh_test_utils::admission::never_binding());
         let mc_client = Arc::new(McClient::new(test_token_receiver()));
@@ -103,11 +116,12 @@ impl Suite {
             test_common::accept_loop_rig::DEPLOYED_ADMISSION,
         )
         .await;
-        let mc = start_mock_mc_server(
-            MockMcServer::new(MockBehavior::Accept)
-                .with_sender_replies(SenderReplies::default().with(PARTICIPANT, SENDER)),
-        )
-        .await;
+        let mut server = MockMcServer::new(MockBehavior::Accept)
+            .with_sender_replies(SenderReplies::default().with(PARTICIPANT, SENDER));
+        if let Some(tx) = disconnects {
+            server = server.with_disconnected_tx(tx);
+        }
+        let mc = start_mock_mc_server(server).await;
         session_manager
             .register_meeting(
                 MEETING.to_string(),
@@ -518,6 +532,52 @@ async fn an_end_meeting_release_closes_an_active_session_with_handler_released()
     assert_closed_only(&snap, CloseCode::HandlerReleased, 1);
 }
 
+/// D6 (story 4 MH-3): the planned drain's DEADLINE shed reaches a real client
+/// as HANDLER_RELEASED — the shed closes the session before the drain cancels
+/// the server's shutdown token (which would end it code-less, below). Real
+/// time, a short window; the production `drain::run` with the server's own
+/// token. Positive control: bound and open until the deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn the_drain_deadline_shed_closes_an_active_session_with_handler_released() {
+    let (disc_tx, mut disconnects) = tokio::sync::mpsc::channel(8);
+    let suite = Suite::start_with_disconnects(32, Some(disc_tx)).await;
+    let (conn, _send, _recv) = suite.connect_bound(&suite.wt.url).await;
+    let snap = MetricAssertion::snapshot();
+    let (drain_tx, _drain_rx) = mh_service::drain::channel();
+    let shutdown = suite.wt.shutdown_token();
+    let window = Duration::from_millis(300);
+    let started = Instant::now();
+    let outcome = tokio::join!(
+        mh_service::drain::run(&suite.session_manager, &drain_tx, window, &shutdown),
+        async {
+            // Positive control: bound and OPEN for most of the window.
+            expect_still_open(&conn, Duration::from_millis(150), "open while draining").await;
+            expect_session_close(&conn, MhCloseCode::HandlerReleased, PROMPT, "drain shed").await;
+            assert!(
+                started.elapsed() >= window,
+                "closed by the DEADLINE shed, not earlier"
+            );
+        },
+    )
+    .0;
+    assert_eq!(outcome.exit, mh_service::drain::DrainExit::Deadline);
+    assert_eq!(outcome.shed, 1);
+    assert!(outcome.shed_completed);
+    assert!(shutdown.is_cancelled(), "cancelled only after the shed");
+    assert_closed_only(&snap, CloseCode::HandlerReleased, 1);
+    // No Disconnected: decided by `ConnectionEnd::MeetingReleased`, which is
+    // independent of the `ReleaseKind`, so this also stands for the
+    // owner-silence release (which cannot run unpaused at 300 s).
+    suite.wt.wait_idle(PROMPT).await;
+    assert!(
+        matches!(
+            disconnects.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "a released session sends MC no NotifyParticipantDisconnected"
+    );
+}
+
 /// A client-initiated close carries no code: MH never echoes one, sends no
 /// capsule, counts nothing.
 #[tokio::test(flavor = "current_thread")]
@@ -540,7 +600,8 @@ async fn a_client_initiated_close_carries_no_code() {
     assert_no_close_counted(&snap);
 }
 
-/// Server shutdown cancellation (before MH-3's drain) carries no code: no
+/// Server shutdown cancellation carries no code (under the drain, only for
+/// sessions no held meeting owns — every held one is shed first): no
 /// capsule, no bare CONNECT FIN, and MH's own QUIC close is H3_NO_ERROR. Metric
 /// half on `current_thread`.
 #[tokio::test(flavor = "current_thread")]

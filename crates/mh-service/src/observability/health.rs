@@ -25,6 +25,10 @@ pub struct HealthState {
     /// Whether the service is ready to serve traffic.
     /// True when registered with GC.
     ready: AtomicBool,
+    /// One-way drain latch (story 4 MH-3): once set, readiness never comes
+    /// back, so a GC (re-)registration that completes during the drain cannot
+    /// make a draining MH look ready.
+    draining: AtomicBool,
 }
 
 impl Default for HealthState {
@@ -40,12 +44,26 @@ impl HealthState {
         Self {
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
+            draining: AtomicBool::new(false),
         }
     }
 
-    /// Mark the service as ready to serve traffic.
+    /// Mark the service as ready to serve traffic. A no-op once draining
+    /// ([`Self::begin_drain`]): store-then-recheck, so a `set_ready` racing
+    /// `begin_drain` can never leave the pod ready.
     pub fn set_ready(&self) {
         self.ready.store(true, Ordering::SeqCst);
+        if self.draining.load(Ordering::SeqCst) {
+            self.ready.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// The planned drain started (ADR-0039 §7): not ready, permanently.
+    /// Liveness is untouched — `/health` stays 200 for the whole drain, or the
+    /// kubelet could kill MH mid-drain.
+    pub fn begin_drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+        self.ready.store(false, Ordering::SeqCst);
     }
 
     /// Mark the service as not ready (e.g., during shutdown).
@@ -106,6 +124,19 @@ mod tests {
         let state = HealthState::new();
         assert!(state.is_live(), "Should be live by default");
         assert!(!state.is_ready(), "Should not be ready by default");
+    }
+
+    #[test]
+    fn the_drain_latch_is_one_way_and_leaves_liveness_alone() {
+        let state = HealthState::new();
+        state.set_ready();
+        assert!(state.is_ready(), "positive arm: ready before the drain");
+        state.begin_drain();
+        assert!(!state.is_ready());
+        // A GC registration completing during the drain cannot flip it back.
+        state.set_ready();
+        assert!(!state.is_ready(), "readiness never returns once draining");
+        assert!(state.is_live(), "/health stays 200 for the whole drain");
     }
 
     #[test]

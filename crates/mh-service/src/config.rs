@@ -55,6 +55,30 @@ pub const MAX_MEDIA_DIAL_CLOCK_SKEW_SECONDS: u64 = 60;
 /// drift — NTP is.
 pub const MEDIA_DIAL_CLOCK_SKEW_SECONDS_RANGE: (u64, u64) = (0, MAX_MEDIA_DIAL_CLOCK_SKEW_SECONDS);
 
+/// `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS` range, inclusive (ADR-0039 §6,
+/// user ruling 2026-10-31; story 4 R-11). REQUIRED; outside refuses to boot.
+///
+/// MH releases a meeting whose OWNING MC has not communicated for this long
+/// (`crate::session::owner_silence`). The floor is what makes that safe, and
+/// it is checked by the const-assert below rather than per registration (lead
+/// ruling): MC's N is at most [`common::config::MH_HEARTBEAT_TIMEOUT_CEILING_MS`]
+/// (30 s), so MC's heartbeat interval (N/3) is at most 10 s, and 300 s is at
+/// least 30 such intervals — an MC that cannot reach MH for that long has
+/// long since declared it dead and moved off.
+pub const MEETING_OWNER_SILENCE_TIMEOUT_SECONDS_RANGE: (u64, u64) = (300, 3600);
+
+/// How many of MC's largest heartbeat intervals the owner-silence floor must
+/// span (the relationship above, as a number the const-assert reads).
+pub const OWNER_SILENCE_MIN_HEARTBEAT_INTERVALS: u64 = 30;
+
+const _: () = assert!(
+    MEETING_OWNER_SILENCE_TIMEOUT_SECONDS_RANGE.0 * 1_000
+        >= OWNER_SILENCE_MIN_HEARTBEAT_INTERVALS
+            * (common::config::MH_HEARTBEAT_TIMEOUT_CEILING_MS as u64 / 3),
+    "the owner-silence floor must span >= 30 of MC's largest heartbeat intervals \
+     (common::config::MH_HEARTBEAT_TIMEOUT_CEILING_MS / 3)"
+);
+
 /// The largest `MH_MAX_PENDING_CONNECTIONS_PER_PARTICIPANT` MH boots with.
 /// OUR choice: ADR-0039 §5 says only "a small configured value". 16 still
 /// bounds the MH→MC binding-RPC amplification one `(meeting, sub)` can cause,
@@ -818,42 +842,50 @@ pub const QUINN_DEFAULT_MAX_CONCURRENT_UNI_STREAMS: u32 = 100;
 /// a choice and is allowed; above it is not a tuning decision.
 pub const MAX_CONCURRENT_UNI_STREAMS_CEILING: u32 = QUINN_DEFAULT_MAX_CONCURRENT_UNI_STREAMS;
 
-/// QUIC `max_idle_timeout`, in seconds.
+/// `MH_MAX_IDLE_TIMEOUT_MS` range, inclusive: MH's QUIC `max_idle_timeout`
+/// (ADR-0039 §7, story 4 R-21). REQUIRED; outside refuses to boot.
 ///
-/// Declared rather than inherited: building a custom `TransportConfig` means MH
-/// owns this whether or not it names it, and a keepalive interval is meaningless
-/// without a stated idle timeout to be a fraction of. Paired with
-/// [`MIN_KEEPALIVE_TO_IDLE_RATIO`] this makes `MH_KEEPALIVE_INTERVAL_MS` a
-/// *chosen* ratio rather than an inherited coincidence.
-pub const MAX_IDLE_TIMEOUT_SECONDS: u64 = 30;
+/// The idle timeout is how a client notices a SILENTLY dead MH: with no
+/// app-level keepalive, `WebTransport.closed` fires once nothing has arrived
+/// for this long. It is sized ≈ MC's heartbeat timeout N
+/// (`MC_MH_HEARTBEAT_TIMEOUT_MS`), because the client-loss evidence MC
+/// counts at a Dead declaration is interpretable only when the two are about
+/// equal (ADR-0039 §8; both are published as config gauges).
+///
+/// - **Cap** = the largest legal N
+///   ([`common::config::MH_HEARTBEAT_TIMEOUT_CEILING_MS`]): "≈ N" never needs
+///   more, and an unbounded value would let dead peers hold connection and
+///   egress state indefinitely. It is also the retired compile-time constant
+///   (30 s), so no deployment is pushed past the old behaviour.
+/// - **Floor** = 1 s, our choice (the ADR says only "about 3-6 s"): below it
+///   a single RTT spike would idle out healthy sessions. Zero is out of range
+///   on purpose — in QUIC a zero idle timeout means NONE.
+///
+/// Validated together with `MH_KEEPALIVE_INTERVAL_MS` by
+/// [`MIN_KEEPALIVE_TO_IDLE_RATIO`].
+pub const MAX_IDLE_TIMEOUT_MS_RANGE: (u64, u64) = (
+    1_000,
+    common::config::MH_HEARTBEAT_TIMEOUT_CEILING_MS as u64,
+);
 
-/// Minimum ratio of [`MAX_IDLE_TIMEOUT_SECONDS`] to the configured keepalive
-/// interval — i.e. how many keepalives must fit inside one idle timeout.
+/// Minimum ratio of `MH_MAX_IDLE_TIMEOUT_MS` to `MH_KEEPALIVE_INTERVAL_MS` —
+/// i.e. how many keepalives must fit inside one idle timeout.
 ///
 /// At 3, a single lost keepalive still leaves two more before the peer times
 /// out. At 2 a single loss sits at the edge of the timeout. Enforced at startup
 /// by [`ConfigError::KeepaliveTooLarge`].
 ///
-/// # The deployed value sits EXACTLY on this boundary — there is no margin here
+/// # The deployed pair sits EXACTLY on this boundary — there is no margin here
 ///
-/// `MH_KEEPALIVE_INTERVAL_MS` ships at `10000`, and the bound is
-/// `MAX_IDLE_TIMEOUT_SECONDS * 1000 / MIN_KEEPALIVE_TO_IDLE_RATIO`
-/// = `30000 / 3` = **exactly 10000**. The check is `>`, so the shipped
-/// configuration passes with **zero headroom**. That is correct — a chosen 1:3
-/// ratio is what boundary-exact looks like — but it means this constant and
-/// [`MAX_IDLE_TIMEOUT_SECONDS`] are a **live wall, not a margin**:
-///
-/// - raising this ratio, or
-/// - lowering [`MAX_IDLE_TIMEOUT_SECONDS`],
-///
-/// **sends both pods into `CrashLoopBackOff` immediately**, with no warning band and no
-/// intermediate degraded state, because the deployed keepalive is already at
-/// the limit. Either edit must move `MH_KEEPALIVE_INTERVAL_MS` in
-/// `infra/services/mh-service/config.env` in the same change.
-///
-/// Recorded because the arithmetic is invisible from either constant alone:
-/// nothing here or in `MAX_IDLE_TIMEOUT_SECONDS` hints that a third value,
-/// living in a manifest, is resting exactly on their quotient.
+/// `infra/services/mh-service/config.env` ships `MH_MAX_IDLE_TIMEOUT_MS=6000`
+/// and `MH_KEEPALIVE_INTERVAL_MS=2000`: 6000 / 3 = **exactly 2000**. The check
+/// is `>`, so the shipped pair passes with **zero headroom** — a chosen 1:3
+/// ratio is what boundary-exact looks like — which makes the two KEYS a **live
+/// wall, not a margin**: lowering the idle timeout, or raising this ratio,
+/// without lowering the keepalive in the same change **sends every MH into
+/// `CrashLoopBackOff`**. The keepalive also moves the browser's first-redial
+/// floor (`MH_KEEPALIVE_FLOOR_MS`, guard-pinned equal). A unit test parses the
+/// real `config.env` so a broken pair fails at Layer 4, not at deploy.
 pub const MIN_KEEPALIVE_TO_IDLE_RATIO: u64 = 3;
 
 /// Connection-level receive window, in bytes.
@@ -1183,25 +1215,34 @@ const _: () = assert!(
 );
 
 // =============================================================================
-// Shutdown drain window (ADR-0036 §11)
+// Shutdown drain window (ADR-0039 §7: MH DRAINS on SIGTERM, reversing ADR-0036
+// §11's shed-on-restart; ADR-0036 already carries the reversal note)
 // =============================================================================
 
-/// Target settle time after cancellation before the process exits.
+/// The planned drain for a termination grace (ADR-0039 §7): `grace − margin`,
+/// no cap. THE derivation — `Config::from_vars` and every test that needs the
+/// deployed window call this; nobody re-does the subtraction. Saturating, so a
+/// grace at or below the margin yields zero (and is refused at startup).
+#[must_use]
+pub const fn drain_window_for(grace_seconds: u64) -> Duration {
+    Duration::from_secs(grace_seconds.saturating_sub(SHUTDOWN_MARGIN_SECONDS))
+}
+
+/// The largest `MH_TERMINATION_GRACE_SECONDS` MH boots with (story 4 MH-3).
 ///
-/// # Raising this obliges amending ADR-0036 §11 in the same change
-///
-/// §11 states, as a decision and not merely as current behaviour, that MH
-/// "marks not-ready, cancels, and **sleeps two seconds** inside a thirty-five
-/// second grace period, with no drain phase, and v1 keeps it that way".
-/// Draining media sessions is explicitly out of scope for v1. That sentence is
-/// true today *because this constant is 2* and there is nothing else tying the
-/// two together — so a change here silently falsifies an Accepted ADR. Amend
-/// §11 in the same commit, or do not change this.
-pub const SHUTDOWN_SETTLE_TARGET_SECONDS: u64 = 2;
+/// The grace IS the planned-drain budget (`grace − margin`, no cap), so an
+/// absurd value would hold a draining pod — still serving, still holding its
+/// hostPort slot — for that long, and could overflow the drain deadline's
+/// `Instant` arithmetic. One hour is far beyond any drain MC needs to move a
+/// handler's meetings (MC's N is at most 30 s) and is OUR choice; above it
+/// refuses to start.
+pub const MAX_TERMINATION_GRACE_SECONDS: u64 = 3600;
 
 /// Seconds reserved between the end of the drain and `SIGKILL`.
 ///
-/// Sized against what runs *after* the sleep, not against nothing: the
+/// The drain ([`Config::drain_window`]) is `grace − MARGIN`; this margin is
+/// sized against what runs *after* the drain: the drain-deadline shed's coded
+/// closes (bounded by [`CLOSE_SESSION_LINGER`], asserted below), the
 /// `TokenManager` task abort, and the OpenTelemetry guard's `Drop` flush at the
 /// end of `main`. If an OTLP flush blocks, this margin is the only thing
 /// between it and the kill.
@@ -1510,6 +1551,12 @@ pub struct QuicTransportParams {
     /// by definition sends no media (ADR-0036 §1, §5) — without it an
     /// intermediary can reap the path and unmute is not instantaneous.
     pub keepalive_interval_ms: u64,
+
+    /// QUIC `max_idle_timeout`, in milliseconds (env `MH_MAX_IDLE_TIMEOUT_MS`,
+    /// REQUIRED, [`MAX_IDLE_TIMEOUT_MS_RANGE`]). The ONE field
+    /// `build_transport_config`, the startup log and the
+    /// `mh_media_transport_idle_timeout_seconds` gauge read.
+    pub max_idle_timeout_ms: u64,
 }
 
 impl QuicTransportParams {
@@ -1532,41 +1579,6 @@ impl QuicTransportParams {
             DATAGRAM_RECEIVE_BUFFER_BYTES
         } else {
             u16::MAX as usize
-        }
-    }
-}
-
-/// Which arm of `min(SETTLE_TARGET, grace − MARGIN)` produced the drain window.
-///
-/// # Why a two-variant enum earns its place even though one variant is nearly unreachable
-///
-/// With `SHUTDOWN_SETTLE_TARGET_SECONDS = 2` and `SHUTDOWN_MARGIN_SECONDS = 5`,
-/// the [`Self::GraceMinusMargin`] arm binds **only** at `grace = 6` (yielding
-/// 1 s) — every larger grace resolves to the settle target. A future reader
-/// will see a variant that essentially never occurs and read it as dead weight.
-///
-/// It is not. It is the only thing that lets an operator distinguish "2 s
-/// because that is the settle target" from "1 s because someone set the
-/// termination grace to 6", from `kubectl logs` alone and without reading
-/// source. The near-vacuousness of the `min()` is the point: ADR-0036 §11
-/// mandates deriving the drain rather than validating it, and
-/// [`ConfigError::TerminationGraceTooSmall`] is what actually protects the
-/// invariant. This field reports which happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DrainWindowSource {
-    /// The drain equals the settle target — the normal case.
-    SettleTarget,
-    /// The drain was clamped by a small termination grace.
-    GraceMinusMargin,
-}
-
-impl DrainWindowSource {
-    /// Stable, bounded string form for the structured startup log line.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::SettleTarget => "settle_target",
-            Self::GraceMinusMargin => "grace_minus_margin",
         }
     }
 }
@@ -1808,16 +1820,21 @@ pub struct Config {
     /// start rather than draining for a window nobody chose.
     pub termination_grace_seconds: u64,
 
-    /// Post-cancellation settle window, derived once at load as
-    /// `min(SHUTDOWN_SETTLE_TARGET, grace − SHUTDOWN_MARGIN)`.
+    /// The planned drain on SIGTERM (ADR-0039 §7), derived ONCE at load as
+    /// `grace − SHUTDOWN_MARGIN_SECONDS`. The drain deadline is the signal
+    /// instant plus this (`crate::drain`); nothing recomputes it, and the
+    /// heartbeat's `drain_remaining_ms` is read from that one deadline.
     ///
-    /// Derived rather than validated, per ADR-0036 §11 ("a derived value cannot
-    /// drift; a guard only catches drift after someone introduces it"). `main`
-    /// sleeps for exactly this and holds no seconds literal of its own.
+    /// The grace IS the drain budget: raising `terminationGracePeriodSeconds`
+    /// lengthens every drain (and how long a terminating pod holds its hostPort
+    /// slot).
     pub drain_window: std::time::Duration,
 
-    /// Which arm of the `min()` produced [`Self::drain_window`].
-    pub drain_window_source: DrainWindowSource,
+    /// Owner-silence release timeout (env
+    /// `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS`, REQUIRED,
+    /// [`MEETING_OWNER_SILENCE_TIMEOUT_SECONDS_RANGE`]). The ONE field the
+    /// session actor's timer and the config gauge read.
+    pub meeting_owner_silence_timeout: std::time::Duration,
 
     /// Forwarding-policy bounds for the ADR-0036 §8 control plane.
     pub policy_limits: PolicyLimits,
@@ -1918,7 +1935,10 @@ impl fmt::Debug for Config {
             .field("memory_budget", &self.memory_budget)
             .field("termination_grace_seconds", &self.termination_grace_seconds)
             .field("drain_window", &self.drain_window)
-            .field("drain_window_source", &self.drain_window_source)
+            .field(
+                "meeting_owner_silence_timeout",
+                &self.meeting_owner_silence_timeout,
+            )
             .field("policy_limits", &self.policy_limits)
             .field("egress_admission", &self.egress_admission)
             .field("media_codec_profile", &self.media_codec_profile)
@@ -2149,10 +2169,10 @@ pub enum ConfigError {
     /// excluded by this check passing.
     #[error(
         "MH_KEEPALIVE_INTERVAL_MS={keepalive_ms} is too large: keepalive must be at most \
-         max_idle_timeout / {min_ratio} = {max_allowed_ms}ms (idle timeout {idle_timeout_ms}ms), \
+         MH_MAX_IDLE_TIMEOUT_MS / {min_ratio} = {max_allowed_ms}ms (idle timeout {idle_timeout_ms}ms), \
          so a single lost keepalive still leaves margin before the peer times out. Remediation: \
          lower MH_KEEPALIVE_INTERVAL_MS in infra/services/mh-service/config.env to \
-         {max_allowed_ms} or less"
+         {max_allowed_ms} or less (and MH_KEEPALIVE_FLOOR_MS in clientConfig.ts with it)"
     )]
     KeepaliveTooLarge {
         /// The configured keepalive interval, in milliseconds.
@@ -2460,6 +2480,36 @@ impl Config {
              binding of every muted participant (ADR-0036 §1, §5)",
         )?;
 
+        let max_idle_timeout_ms = parse_in_range(
+            "MH_MAX_IDLE_TIMEOUT_MS",
+            vars.get("MH_MAX_IDLE_TIMEOUT_MS")
+                .ok_or_else(|| ConfigError::MissingEnvVar("MH_MAX_IDLE_TIMEOUT_MS".to_string()))?,
+            MAX_IDLE_TIMEOUT_MS_RANGE,
+            "a healthy client would be idled out by a single RTT spike (and 0 means NO idle \
+             timeout in QUIC); size it near MC_MH_HEARTBEAT_TIMEOUT_MS in \
+             infra/services/mh-service/config.env",
+            "it is sized near MC's heartbeat timeout N, which cannot exceed this; a longer idle \
+             timeout only delays noticing a dead peer (set it in \
+             infra/services/mh-service/config.env)",
+        )?;
+
+        let meeting_owner_silence_timeout_seconds = parse_in_range(
+            "MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS",
+            vars.get("MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS")
+                .ok_or_else(|| {
+                    ConfigError::MissingEnvVar(
+                        "MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS".to_string(),
+                    )
+                })?,
+            MEETING_OWNER_SILENCE_TIMEOUT_SECONDS_RANGE,
+            "a meeting could be released while its MC is merely slow; the floor spans 30 of \
+             MC's largest heartbeat intervals (set it in infra/services/mh-service/config.env)",
+            "capacity held by a meeting no MC owns (e.g. after an MC restart) would be reclaimed \
+             only after this long (set it in infra/services/mh-service/config.env)",
+        )?;
+        let meeting_owner_silence_timeout =
+            std::time::Duration::from_secs(meeting_owner_silence_timeout_seconds);
+
         let termination_grace_seconds: u64 = parse_required_number(
             "MH_TERMINATION_GRACE_SECONDS",
             vars.get("MH_TERMINATION_GRACE_SECONDS").ok_or_else(|| {
@@ -2504,15 +2554,24 @@ impl Config {
                 margin_seconds: SHUTDOWN_MARGIN_SECONDS,
             });
         }
+        // V2b: and it must not be absurd — it is the drain budget.
+        if termination_grace_seconds > MAX_TERMINATION_GRACE_SECONDS {
+            return Err(ConfigError::InvalidValue(format!(
+                "MH_TERMINATION_GRACE_SECONDS must be at most {MAX_TERMINATION_GRACE_SECONDS}, got \
+                 {termination_grace_seconds} — it is the planned-drain budget (grace − \
+                 {SHUTDOWN_MARGIN_SECONDS} s), so a draining MH would keep serving and hold its \
+                 hostPort slot that long. Remediation: lower terminationGracePeriodSeconds in \
+                 infra/services/mh-service/deployment.yaml (the env value is derived from it)"
+            )));
+        }
 
         // V3: a keepalive is only effective if it arrives well before the peer
         // times out. See `ConfigError::KeepaliveTooLarge` for the scope limit.
-        let idle_timeout_ms = MAX_IDLE_TIMEOUT_SECONDS * 1_000;
-        let max_allowed_keepalive_ms = idle_timeout_ms / MIN_KEEPALIVE_TO_IDLE_RATIO;
+        let max_allowed_keepalive_ms = max_idle_timeout_ms / MIN_KEEPALIVE_TO_IDLE_RATIO;
         if keepalive_interval_ms > max_allowed_keepalive_ms {
             return Err(ConfigError::KeepaliveTooLarge {
                 keepalive_ms: keepalive_interval_ms,
-                idle_timeout_ms,
+                idle_timeout_ms: max_idle_timeout_ms,
                 min_ratio: MIN_KEEPALIVE_TO_IDLE_RATIO,
                 max_allowed_ms: max_allowed_keepalive_ms,
             });
@@ -2525,20 +2584,13 @@ impl Config {
             datagram_send_buffer_bytes: datagram_send_buffer_audio_frames
                 * NOMINAL_AUDIO_FRAME_BYTES,
             keepalive_interval_ms,
+            max_idle_timeout_ms,
         };
 
-        // Drain window, derived rather than validated (ADR-0036 §11).
-        let grace_minus_margin = termination_grace_seconds.saturating_sub(SHUTDOWN_MARGIN_SECONDS);
-        let (drain_seconds, drain_window_source) =
-            if SHUTDOWN_SETTLE_TARGET_SECONDS <= grace_minus_margin {
-                (
-                    SHUTDOWN_SETTLE_TARGET_SECONDS,
-                    DrainWindowSource::SettleTarget,
-                )
-            } else {
-                (grace_minus_margin, DrainWindowSource::GraceMinusMargin)
-            };
-        let drain_window = std::time::Duration::from_secs(drain_seconds);
+        // The planned drain (ADR-0039 §7): the whole grace minus the margin,
+        // derived once. V2 above already refused `grace <= margin`; the
+        // `saturating_sub` is belt-and-braces on an unsigned type.
+        let drain_window = drain_window_for(termination_grace_seconds);
 
         // ADR-0036 §8 policy bounds — REQUIRED (story 2 R-22), no code
         // default: the ConfigMap is the single home. `parse_bounded` does the
@@ -2892,7 +2944,7 @@ impl Config {
                 .collect(),
             termination_grace_seconds,
             drain_window,
-            drain_window_source,
+            meeting_owner_silence_timeout,
             policy_limits,
             egress_admission,
             media_latency_sample_ratio,
@@ -2974,7 +3026,12 @@ mod tests {
                 "MH_DATAGRAM_BUFFER_AUDIO_FRAMES".to_string(),
                 "32".to_string(),
             ),
-            ("MH_KEEPALIVE_INTERVAL_MS".to_string(), "10000".to_string()),
+            ("MH_KEEPALIVE_INTERVAL_MS".to_string(), "2000".to_string()),
+            ("MH_MAX_IDLE_TIMEOUT_MS".to_string(), "6000".to_string()),
+            (
+                "MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS".to_string(),
+                "900".to_string(),
+            ),
             ("MH_MAX_CONNECTIONS".to_string(), "500".to_string()),
             // Kustomize-derived from each pod's own
             // `terminationGracePeriodSeconds`; 35 is what both deployments set.
@@ -3110,6 +3167,17 @@ mod tests {
     }
 
     #[test]
+    fn missing_idle_timeout_is_a_loud_refusal() {
+        assert_required("MH_MAX_IDLE_TIMEOUT_MS");
+    }
+
+    #[test]
+    fn missing_owner_silence_timeout_is_a_loud_refusal() {
+        // REQUIRED, no code default: 900 lives in config.env only.
+        assert_required("MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS");
+    }
+
+    #[test]
     fn missing_termination_grace_is_a_loud_refusal() {
         assert_required("MH_TERMINATION_GRACE_SECONDS");
     }
@@ -3131,6 +3199,8 @@ mod tests {
             "MH_MAX_CONCURRENT_UNI_STREAMS",
             "MH_DATAGRAM_BUFFER_AUDIO_FRAMES",
             "MH_KEEPALIVE_INTERVAL_MS",
+            "MH_MAX_IDLE_TIMEOUT_MS",
+            "MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS",
             "MH_TERMINATION_GRACE_SECONDS",
             "MH_MAX_CONNECTIONS",
         ] {
@@ -3448,7 +3518,7 @@ mod tests {
         ));
 
         // One second more is accepted, and NOT the stricter
-        // `grace >= MARGIN + SETTLE`: the invariant is `drain + MARGIN <= grace`,
+        // `grace > MARGIN + 1`: the invariant is `drain + MARGIN <= grace`,
         // which holds here (1 + 5 = 6). Refusing this would reject a safe
         // configuration.
         vars.insert(
@@ -3456,6 +3526,31 @@ mod tests {
             (SHUTDOWN_MARGIN_SECONDS + 1).to_string(),
         );
         assert!(Config::from_vars(&vars).is_ok());
+    }
+
+    #[test]
+    fn termination_grace_has_a_ceiling() {
+        let mut vars = base_vars();
+        vars.insert(
+            "MH_TERMINATION_GRACE_SECONDS".to_string(),
+            MAX_TERMINATION_GRACE_SECONDS.to_string(),
+        );
+        let config = Config::from_vars(&vars).expect("the ceiling itself is accepted");
+        assert_eq!(
+            config.drain_window.as_secs(),
+            MAX_TERMINATION_GRACE_SECONDS - SHUTDOWN_MARGIN_SECONDS
+        );
+        vars.insert(
+            "MH_TERMINATION_GRACE_SECONDS".to_string(),
+            (MAX_TERMINATION_GRACE_SECONDS + 1).to_string(),
+        );
+        match Config::from_vars(&vars) {
+            Err(ConfigError::InvalidValue(msg)) => {
+                assert!(msg.contains("MH_TERMINATION_GRACE_SECONDS"), "{msg}");
+                assert!(msg.contains("3601"), "names the value: {msg}");
+            }
+            other => panic!("ceiling + 1 must be refused; got {other:?}"),
+        }
     }
 
     #[test]
@@ -3474,23 +3569,26 @@ mod tests {
         }
     }
 
+    /// Ratio boundary, at a NON-deployed idle value (7500 ms, never the
+    /// retired 30 s constant), so the check provably reads the configured key.
     #[test]
     fn keepalive_must_leave_room_for_a_lost_packet_before_the_idle_timeout() {
-        let idle_ms = MAX_IDLE_TIMEOUT_SECONDS * 1_000;
+        let idle_ms: u64 = 7_500;
         let mut vars = base_vars();
+        vars.insert("MH_MAX_IDLE_TIMEOUT_MS".to_string(), idle_ms.to_string());
 
-        // 1:3 — three keepalives fit inside one idle timeout, so a single loss
-        // still leaves two.
+        // idle == 3 x keepalive: accepted (three keepalives fit).
         vars.insert(
             "MH_KEEPALIVE_INTERVAL_MS".to_string(),
             (idle_ms / MIN_KEEPALIVE_TO_IDLE_RATIO).to_string(),
         );
         assert!(Config::from_vars(&vars).is_ok(), "1:3 must be accepted");
 
-        // 1:2 — a single lost keepalive sits at the edge of the timeout.
+        // idle == 3 x keepalive - 1 (keepalive one ms too large): refused.
+        let keepalive = idle_ms / MIN_KEEPALIVE_TO_IDLE_RATIO + 1;
         vars.insert(
             "MH_KEEPALIVE_INTERVAL_MS".to_string(),
-            (idle_ms / 2).to_string(),
+            keepalive.to_string(),
         );
         match Config::from_vars(&vars) {
             Err(ConfigError::KeepaliveTooLarge {
@@ -3499,104 +3597,159 @@ mod tests {
                 min_ratio,
                 max_allowed_ms,
             }) => {
-                assert_eq!(keepalive_ms, idle_ms / 2);
+                assert_eq!(keepalive_ms, keepalive);
                 assert_eq!(idle_timeout_ms, idle_ms);
                 assert_eq!(min_ratio, MIN_KEEPALIVE_TO_IDLE_RATIO);
                 // The message must tell the operator the number to type, not
                 // just that the one they typed was wrong.
                 assert_eq!(max_allowed_ms, idle_ms / MIN_KEEPALIVE_TO_IDLE_RATIO);
             }
-            other => panic!("1:2 must be refused; got {other:?}"),
+            other => panic!("one ms past 1:3 must be refused; got {other:?}"),
         }
     }
 
     #[test]
-    fn the_deployed_keepalive_satisfies_the_ratio_the_configmap_asserts() {
-        // `config.env` states 10000 ms is a chosen 1:3 against a 30 s idle
-        // timeout. Pinned here so the ConfigMap's claim is checked rather than
-        // narrated.
-        let config = Config::from_vars(&base_vars()).expect("deployed values must load");
-        assert_eq!(config.quic_transport.keepalive_interval_ms, 10_000);
-        let product = config.quic_transport.keepalive_interval_ms * MIN_KEEPALIVE_TO_IDLE_RATIO;
-        let idle_ms = MAX_IDLE_TIMEOUT_SECONDS * 1_000;
-        assert!(
-            product <= idle_ms,
-            "ZERO-HEADROOM BOUNDARY CROSSED, and this test is the thing that caught it instead of \
-             a production CrashLoop. The deployed MH_KEEPALIVE_INTERVAL_MS ({}ms) sits EXACTLY at \
-             max_idle_timeout / ratio, so this assertion has no slack by design: {}ms x {} = {}ms \
-             against a {}ms idle timeout. A failure means a CONSTANT moved the boundary under the \
-             deployed value — either MIN_KEEPALIVE_TO_IDLE_RATIO went up or MAX_IDLE_TIMEOUT_SECONDS \
-             went down. Both pods would refuse to start. Fix by lowering \
-             MH_KEEPALIVE_INTERVAL_MS in infra/services/mh-service/config.env in the SAME \
-             change; do not relax the ratio to make this pass.",
-            config.quic_transport.keepalive_interval_ms,
-            config.quic_transport.keepalive_interval_ms,
-            MIN_KEEPALIVE_TO_IDLE_RATIO,
-            product,
-            idle_ms,
+    fn the_idle_timeout_is_range_checked_at_both_edges() {
+        let (floor, cap) = MAX_IDLE_TIMEOUT_MS_RANGE;
+        assert_eq!((floor, cap), (1_000, 30_000), "the documented range");
+        for (idle, ok) in [
+            (999_u64, false),
+            (1_000, true),
+            (30_000, true),
+            (30_001, false),
+            (0, false),
+        ] {
+            let mut vars = base_vars();
+            vars.insert("MH_MAX_IDLE_TIMEOUT_MS".to_string(), idle.to_string());
+            // A keepalive that satisfies the ratio at every accepted value, so
+            // only the range decides.
+            vars.insert(
+                "MH_KEEPALIVE_INTERVAL_MS".to_string(),
+                (floor / MIN_KEEPALIVE_TO_IDLE_RATIO).to_string(),
+            );
+            match Config::from_vars(&vars) {
+                Ok(config) => {
+                    assert!(ok, "{idle} must be refused");
+                    assert_eq!(config.quic_transport.max_idle_timeout_ms, idle);
+                }
+                Err(ConfigError::InvalidValue(msg)) => {
+                    assert!(!ok, "{idle} must load: {msg}");
+                    assert!(msg.contains("MH_MAX_IDLE_TIMEOUT_MS"), "{msg}");
+                    assert!(msg.contains(&idle.to_string()), "names the value: {msg}");
+                }
+                Err(other) => panic!("{idle}: unexpected {other:?}"),
+            }
+        }
+        let mut vars = base_vars();
+        vars.insert("MH_MAX_IDLE_TIMEOUT_MS".to_string(), "6s".to_string());
+        assert!(matches!(
+            Config::from_vars(&vars),
+            Err(ConfigError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn the_owner_silence_timeout_is_range_checked_at_both_edges() {
+        assert_eq!(MEETING_OWNER_SILENCE_TIMEOUT_SECONDS_RANGE, (300, 3600));
+        for (secs, ok) in [
+            ("299", false),
+            ("300", true),
+            ("3600", true),
+            ("3601", false),
+            ("", false),
+            ("fifteen", false),
+        ] {
+            let mut vars = base_vars();
+            vars.insert(
+                "MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS".to_string(),
+                secs.to_string(),
+            );
+            match Config::from_vars(&vars) {
+                Ok(config) => {
+                    assert!(ok, "{secs:?} must be refused");
+                    assert_eq!(
+                        config.meeting_owner_silence_timeout.as_secs().to_string(),
+                        secs
+                    );
+                }
+                Err(ConfigError::InvalidValue(msg)) => {
+                    assert!(!ok, "{secs:?} must load: {msg}");
+                    assert!(
+                        msg.contains("MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS"),
+                        "{msg}"
+                    );
+                }
+                Err(other) => panic!("{secs:?}: unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// The real `config.env` files: MH's keepalive/idle pair satisfies the
+    /// ratio, and MH's idle timeout EQUALS MC's N (ADR-0039 §7/§8: the
+    /// client-loss evidence is interpretable only when the two match; the
+    /// deployed relationship is stated once, here and in env-test 01). Reads
+    /// the files, so a manifest edit that breaks either fails at Layer 4
+    /// rather than as a production `CrashLoopBackOff`.
+    #[test]
+    fn the_deployed_idle_keepalive_and_n_are_consistent() {
+        let mh = env_file(include_str!(
+            "../../../infra/services/mh-service/config.env"
+        ));
+        let mc = env_file(include_str!(
+            "../../../infra/services/mc-service/config.env"
+        ));
+        let key = |file: &HashMap<String, String>, name: &str| -> u64 {
+            file.get(name)
+                .unwrap_or_else(|| panic!("{name} is defined"))
+                .parse()
+                .expect("numeric")
+        };
+        let keepalive = key(&mh, "MH_KEEPALIVE_INTERVAL_MS");
+        let idle = key(&mh, "MH_MAX_IDLE_TIMEOUT_MS");
+        let n = key(&mc, "MC_MH_HEARTBEAT_TIMEOUT_MS");
+        assert_eq!(
+            idle, n,
+            "MH_MAX_IDLE_TIMEOUT_MS ({idle}) must equal MC_MH_HEARTBEAT_TIMEOUT_MS ({n}): \
+             retune both together"
         );
+        assert!(
+            keepalive * MIN_KEEPALIVE_TO_IDLE_RATIO <= idle,
+            "ZERO-HEADROOM BOUNDARY CROSSED: MH_KEEPALIVE_INTERVAL_MS ({keepalive}) x \
+             {MIN_KEEPALIVE_TO_IDLE_RATIO} exceeds MH_MAX_IDLE_TIMEOUT_MS ({idle}); every MH \
+             would refuse to start. Lower the keepalive (and MH_KEEPALIVE_FLOOR_MS) in the SAME \
+             change; do not relax the ratio."
+        );
+        let owner = key(&mh, "MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS");
+        let (lo, hi) = MEETING_OWNER_SILENCE_TIMEOUT_SECONDS_RANGE;
+        assert!((lo..=hi).contains(&owner), "owner silence {owner} in range");
+        // The fixture mirrors the deployed values, so the two cannot drift.
+        let base = base_vars();
+        for (name, value) in [
+            ("MH_KEEPALIVE_INTERVAL_MS", keepalive),
+            ("MH_MAX_IDLE_TIMEOUT_MS", idle),
+            ("MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS", owner),
+        ] {
+            assert_eq!(base[name], value.to_string(), "base_vars {name}");
+        }
     }
 
     // ---- derived drain window ------------------------------------------------
 
     #[test]
-    fn the_deployed_grace_yields_the_settle_target() {
-        // grace 35 -> min(2, 30) = 2s. Behaviour is IDENTICAL to the hardcoded
-        // sleep this replaced, which is why ADR-0036 §11's "sleeps two seconds"
-        // remains true and needs no amendment: only the provenance changed.
-        let config = Config::from_vars(&base_vars()).expect("config should load");
-        assert_eq!(config.termination_grace_seconds, 35);
-        assert_eq!(
-            config.drain_window,
-            std::time::Duration::from_secs(SHUTDOWN_SETTLE_TARGET_SECONDS)
-        );
-        assert_eq!(config.drain_window_source, DrainWindowSource::SettleTarget);
-    }
-
-    #[test]
-    fn a_small_grace_clamps_the_drain_and_says_so() {
-        // The ONLY grace at which the `grace - MARGIN` arm binds, given
-        // SETTLE=2 and MARGIN=5. Near-vacuous in practice, which is exactly why
-        // `drain_window_source` exists: it is how an operator tells "2s because
-        // settle target" from "1s because someone set grace to 6".
-        let mut vars = base_vars();
-        vars.insert("MH_TERMINATION_GRACE_SECONDS".to_string(), "6".to_string());
-        let config = Config::from_vars(&vars).expect("grace 6 is valid");
-        assert_eq!(config.drain_window, std::time::Duration::from_secs(1));
-        assert_eq!(
-            config.drain_window_source,
-            DrainWindowSource::GraceMinusMargin
-        );
-    }
-
-    #[test]
-    fn the_drain_always_fits_inside_the_grace_with_the_margin_intact() {
-        // The invariant the validation actually protects, checked across the
-        // whole valid range rather than at the two points above.
-        for grace in (SHUTDOWN_MARGIN_SECONDS + 1)..=120 {
+    fn the_drain_is_the_whole_grace_minus_the_margin_with_no_cap() {
+        // grace 35 -> 30 s (the retired settle cap made this 2 s: this is the
+        // discriminating case), grace 6 -> 1 s.
+        for (grace, drain) in [(35_u64, 30_u64), (6, 1), (120, 115)] {
             let mut vars = base_vars();
             vars.insert(
                 "MH_TERMINATION_GRACE_SECONDS".to_string(),
                 grace.to_string(),
             );
             let config = Config::from_vars(&vars).expect("valid grace must load");
-            assert!(
-                config.drain_window.as_secs() + SHUTDOWN_MARGIN_SECONDS <= grace,
-                "drain {}s + margin {SHUTDOWN_MARGIN_SECONDS}s must fit inside grace {grace}s",
-                config.drain_window.as_secs()
-            );
-            // And it never silently becomes a drain PHASE (ADR-0036 §11).
-            assert!(config.drain_window.as_secs() <= SHUTDOWN_SETTLE_TARGET_SECONDS);
+            assert_eq!(config.termination_grace_seconds, grace);
+            assert_eq!(config.drain_window, std::time::Duration::from_secs(drain));
+            assert_eq!(drain + SHUTDOWN_MARGIN_SECONDS, grace);
         }
-    }
-
-    #[test]
-    fn drain_window_source_renders_a_bounded_vocabulary() {
-        assert_eq!(DrainWindowSource::SettleTarget.as_str(), "settle_target");
-        assert_eq!(
-            DrainWindowSource::GraceMinusMargin.as_str(),
-            "grace_minus_margin"
-        );
     }
 
     // ---- negotiated wire limit ----------------------------------------------
@@ -4900,13 +5053,20 @@ mod tests {
     }
 
     /// Read `KEY=VALUE` lines.
+    /// The ONE `.env` reader of these tests. STRICT: a key defined twice is a
+    /// panic, never last-wins (a duplicate in a shipped file is a defect).
     fn env_file(text: &str) -> HashMap<String, String> {
-        text.lines()
+        let mut vars = HashMap::new();
+        for (k, v) in text
+            .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .filter_map(|line| line.split_once('='))
-            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-            .collect()
+        {
+            let previous = vars.insert(k.trim().to_string(), v.trim().to_string());
+            assert!(previous.is_none(), "{} is defined twice", k.trim());
+        }
+        vars
     }
 
     /// `limits: ... memory: <n>Gi|Mi` from a deployment, in bytes.
@@ -4971,11 +5131,40 @@ mod tests {
             max_concurrent_uni_streams: 64,
             datagram_send_buffer_audio_frames: 32,
             datagram_send_buffer_bytes: 7_680,
-            keepalive_interval_ms: 10_000,
+            keepalive_interval_ms: 2_000,
+            max_idle_timeout_ms: 6_000,
         };
         assert_eq!(
             per_connection_memory_bound_bytes(&quic),
             262_144 + 2_048 + 524_288 + 7_680
+        );
+    }
+
+    /// Drift guard: env-test 01 restates the keepalive ratio and the
+    /// owner-silence range (it cannot import this crate, ADR-0028).
+    #[test]
+    fn env_test_restates_the_mh3_bounds_exactly() {
+        let source = include_str!("../../env-tests/tests/01_mh_deployment_config.rs");
+        let value_of = |decl: &str| -> String {
+            source
+                .lines()
+                .find(|l| l.trim_start().starts_with(decl))
+                .unwrap_or_else(|| panic!("env-test 01 declares `{decl}`"))
+                .split('=')
+                .nth(1)
+                .expect("an initialiser")
+                .trim()
+                .trim_end_matches(';')
+                .replace(['_', ' '], "")
+        };
+        assert_eq!(
+            value_of("pub const MH_MIN_KEEPALIVE_TO_IDLE_RATIO: u64 ="),
+            MIN_KEEPALIVE_TO_IDLE_RATIO.to_string()
+        );
+        let (lo, hi) = MEETING_OWNER_SILENCE_TIMEOUT_SECONDS_RANGE;
+        assert_eq!(
+            value_of("pub const MH_OWNER_SILENCE_RANGE_SECONDS: (u64, u64) ="),
+            format!("({lo},{hi})")
         );
     }
 

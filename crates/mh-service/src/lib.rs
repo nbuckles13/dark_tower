@@ -115,6 +115,7 @@ compile_error!(
 
 pub mod auth;
 pub mod config;
+pub mod drain;
 pub mod errors;
 pub mod grpc;
 pub mod media;

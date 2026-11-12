@@ -25,7 +25,8 @@ use proto_gen::dark_tower::internal::v1::media_handler_registry_service_server::
     MediaHandlerRegistryService, MediaHandlerRegistryServiceServer,
 };
 use proto_gen::dark_tower::internal::v1::{
-    RegisterMhRequest, RegisterMhResponse, SendLoadReportRequest, SendLoadReportResponse,
+    HealthStatus, RegisterMhRequest, RegisterMhResponse, SendLoadReportRequest,
+    SendLoadReportResponse,
 };
 use test_common::otel_capture::{
     install_test_propagator, SpanCapture, KNOWN_SPAN_ID_U64, KNOWN_TRACE_ID_U128,
@@ -192,6 +193,10 @@ impl MediaHandlerRegistryService for MockGcServer {
 // Test Helpers
 // ============================================================================
 
+/// The deployed `terminationGracePeriodSeconds`; the drain window is derived
+/// from it, never restated.
+const TEST_GRACE_SECONDS: u64 = 35;
+
 fn test_config(gc_url: &str) -> Config {
     Config {
         grpc_bind_address: "0.0.0.0:50053".to_string(),
@@ -211,12 +216,7 @@ fn test_config(gc_url: &str) -> Config {
         media_dial_clock_skew_seconds: 30,
         max_pending_connections_per_participant: 2,
         max_connections: 500,
-        quic_transport: mh_service::config::QuicTransportParams {
-            max_concurrent_uni_streams: 64,
-            datagram_send_buffer_audio_frames: 32,
-            datagram_send_buffer_bytes: 32 * mh_service::config::NOMINAL_AUDIO_FRAME_BYTES,
-            keepalive_interval_ms: 10_000,
-        },
+        quic_transport: mh_test_utils::admission::fixture_quic_transport(),
         stream_path: mh_test_utils::admission::fixture_stream_path_limits(),
         // Through the production check against a 1 GiB limit, never assembled.
         memory_budget: mh_service::config::check_pod_memory(
@@ -229,11 +229,9 @@ fn test_config(gc_url: &str) -> Config {
             1 << 30,
         )
         .expect("fixture fits"),
-        termination_grace_seconds: 35,
-        drain_window: std::time::Duration::from_secs(
-            mh_service::config::SHUTDOWN_SETTLE_TARGET_SECONDS,
-        ),
-        drain_window_source: mh_service::config::DrainWindowSource::SettleTarget,
+        termination_grace_seconds: TEST_GRACE_SECONDS,
+        drain_window: mh_service::config::drain_window_for(TEST_GRACE_SECONDS),
+        meeting_owner_silence_timeout: std::time::Duration::from_secs(900),
         policy_limits: mh_test_utils::admission::fixture_policy_limits(),
         // Derived through the production function, never hand-assembled, so the
         // advertised `max_streams` below is a real derivation (Kind-overlay
@@ -425,7 +423,10 @@ async fn test_gc_client_load_report_success() {
     gc_client.register().await.unwrap();
 
     let snap = MetricAssertion::snapshot();
-    gc_client.send_load_report().await.unwrap();
+    gc_client
+        .send_load_report(HealthStatus::Healthy)
+        .await
+        .unwrap();
 
     snap.histogram("mh_gc_heartbeat_latency_seconds")
         .assert_observation_count_at_least(1);
@@ -437,6 +438,38 @@ async fn test_gc_client_load_report_success() {
     assert_eq!(request.handler_id, config.handler_id);
     assert_eq!(request.health, 1); // HEALTHY
 
+    cancel_token.cancel();
+}
+
+/// The health the caller passes is what goes on the wire (story 4 MH-3):
+/// DRAINING is `HealthStatus::DRAINING = 4`, which GC parses and excludes from
+/// selection. Positive arm: HEALTHY is 1. Over the real tonic channel.
+#[tokio::test]
+async fn test_gc_client_load_report_carries_the_given_health_on_the_wire() {
+    let (load_report_tx, mut load_report_rx) = mpsc::channel(2);
+    let mock_gc = MockGcServer::accepting().with_load_report_channel(load_report_tx);
+    let (addr, cancel_token) = start_mock_gc_server(mock_gc).await;
+    let gc_url = format!("http://{addr}");
+    let gc_client = GcClient::new(
+        gc_url.clone(),
+        mock_token_receiver(),
+        test_config(&gc_url),
+        empty_routing(),
+    )
+    .await
+    .unwrap();
+    gc_client.register().await.unwrap();
+
+    gc_client
+        .send_load_report(HealthStatus::Healthy)
+        .await
+        .unwrap();
+    gc_client
+        .send_load_report(HealthStatus::Draining)
+        .await
+        .unwrap();
+    assert_eq!(load_report_rx.recv().await.unwrap().health, 1);
+    assert_eq!(load_report_rx.recv().await.unwrap().health, 4);
     cancel_token.cancel();
 }
 
@@ -492,7 +525,10 @@ async fn test_gc_client_load_report_carries_installed_streams_equal_to_the_gauge
     .await
     .unwrap();
     gc_client.register().await.unwrap();
-    gc_client.send_load_report().await.unwrap();
+    gc_client
+        .send_load_report(HealthStatus::Healthy)
+        .await
+        .unwrap();
 
     let request = load_report_rx.recv().await.unwrap();
     assert_eq!(request.current_streams, 3, "three installed egress streams");
@@ -520,7 +556,10 @@ async fn test_gc_client_load_report_skipped_when_not_registered() {
     assert!(!gc_client.is_registered());
 
     // Should succeed (skipped, not failed)
-    gc_client.send_load_report().await.unwrap();
+    gc_client
+        .send_load_report(HealthStatus::Healthy)
+        .await
+        .unwrap();
 
     cancel_token.cancel();
 }
@@ -546,7 +585,7 @@ async fn test_gc_client_load_report_not_found_clears_registration() {
 
     // Load report should get NOT_FOUND and return NotRegistered
     let snap = MetricAssertion::snapshot();
-    let result = gc_client.send_load_report().await;
+    let result = gc_client.send_load_report(HealthStatus::Healthy).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -657,7 +696,10 @@ async fn test_gc_client_send_load_report_injects_traceparent_matching_ambient_sp
     let span = tracing::info_span!("test_load_report_root");
     assert!(span.set_parent(known_remote_context()).is_ok());
     async {
-        gc_client.send_load_report().await.unwrap();
+        gc_client
+            .send_load_report(HealthStatus::Healthy)
+            .await
+            .unwrap();
     }
     .instrument(span)
     .await;

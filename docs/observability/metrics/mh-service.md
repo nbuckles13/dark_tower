@@ -264,15 +264,33 @@ MH sends one `MeetingHeartbeat` per held meeting per MC-declared interval (`Regi
 
 ### `mh_media_handler_releases_total`
 - **Type**: Counter
-- **Description**: Meetings released because MC REMOVED this handler — by a removal-cause `EndMeeting` or a RELEASED verdict carrying the removal trigger. `MEETING_ENDED` stays on `mh_media_meeting_teardowns_total{outcome="released"}`: one home per event.
+- **Description**: Meetings released because MC REMOVED this handler — by a removal-cause `EndMeeting` or a RELEASED verdict carrying the removal trigger — or by MH's own owner-silence release (story 4 MH-3). `MEETING_ENDED` stays on `mh_media_meeting_teardowns_total{outcome="released"}`, and a drain-deadline shed only on `mh_drain_meetings_shed_total`: one home per event.
 - **Labels**:
-  - `trigger`: `heartbeat_timeout` | `apply_lag` | `planned_transfer` — the shared vocabulary, `common::observability::labels::RemovalTrigger` (projected from `ReleaseCause` by `session::release::ReleaseKind::of`). MH-3 adds the one MH-local value, `owner_silence`.
+  - `trigger`: `heartbeat_timeout` | `apply_lag` | `planned_transfer` — the shared vocabulary, `common::observability::labels::RemovalTrigger` (projected from `ReleaseCause` by `session::release::ReleaseKind::of`) — | `owner_silence`, the one **MH-local** value, **outside the `ReleaseCause` projection** (it never crosses the wire; `observability::metrics::ReleaseTrigger`): MH released the meeting because its owning MC had not communicated for `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS` (ADR-0039 §6).
   - `clients`: `present` (at least one active connection at release — a session that has begun its bind counts) | `none`. The same predicate as `mh_media_meetings_without_clients`.
   - `key_custody`: `operator`
-- **Cardinality**: 6, zero-initialised
-- **Usage**: **`trigger="heartbeat_timeout", clients="present"` is the false-declaration ground truth** only MH can see: MC declared this handler dead while it was serving people. `apply_lag, present` is a correct removal of a live-but-slow handler; `planned_transfer, present` is expected on drain. Outside planned transfers this series should be flat.
+- **Cardinality**: 8 (4 triggers × 2), zero-initialised
+- **Usage**: **`trigger="heartbeat_timeout", clients="present"` is the false-declaration ground truth** only MH can see: MC declared this handler dead while it was serving people. `apply_lag, present` is a correct removal of a live-but-slow handler; `planned_transfer, present` is expected on drain. `owner_silence, none` is **routine** cleanup about 15 min after every MC rollout (dashboard only); `owner_silence, present` is a WARNING candidate (OBS-ALERTS): people stayed attached to a meeting no MC owned for the whole window. Each owner-silence release also logs one INFO on target `mh.session.owner_silence` with `meeting_id`, the owner `mc_id` and `silence_seconds` (ids in logs only). Outside planned transfers and MC rollouts this series should be flat.
 - **Recorded in**: `observability/metrics.rs::SessionMetricHandles::record_handler_release`
 - **Dashboard**: MH Media - Handler Releases by Trigger and Clients
+
+### `mh_media_meeting_owner_silence_timeout_seconds`
+- **Type**: Gauge (config reflection, set once at startup)
+- **Description**: `MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS` (ADR-0039 §6; bounds 300..=3600, default 900) — read from the same `Config` field the session actor's owner-silence timer reads.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: the anchor for `trigger="owner_silence"` releases and for "meetings without clients sustained past the owner-silence timeout" (OBS-ALERTS). Its relationship to MC's N (≥ 30 of MC's largest heartbeat intervals) is compile-time checked.
+- **Recorded in**: `observability/metrics.rs::publish_liveness_config`
+- **Dashboard**: MH Media - Owner-Silence Timeout
+
+### `mh_media_transport_idle_timeout_seconds`
+- **Type**: Gauge (config reflection, set once at startup)
+- **Description**: MH's QUIC `max_idle_timeout`, `MH_MAX_IDLE_TIMEOUT_MS` / 1000 (ADR-0039 §7; bounds 1..=30 s) — read from the same field `build_transport_config` gives quinn. How long a client takes to notice a silently dead MH.
+- **Labels**: `key_custody`: `operator`
+- **Cardinality**: 1
+- **Usage**: read **beside MC's `mc_media_handler_heartbeat_deadline_seconds` (N)**: MC's client-loss evidence at a Dead declaration is interpretable only when the two are about equal (deployed equal; R-33). The cross-service side-by-side panel is OBS-ALERTS'.
+- **Recorded in**: `observability/metrics.rs::publish_liveness_config`
+- **Dashboard**: MH Media - QUIC Idle Timeout
 
 ### `mh_media_meetings_without_clients`
 - **Type**: Gauge
@@ -282,6 +300,44 @@ MH sends one `MeetingHeartbeat` per held meeting per MC-declared interval (`Regi
 - **Usage**: The zombie/leak arm: registrations nothing uses. Non-zero is routine briefly (a meeting before its first join, after its last leave); sustained it is a meeting MC no longer uses that was never released.
 - **Recorded in**: `observability/metrics.rs::SessionMetricHandles::publish_meetings_without_clients`
 - **Dashboard**: MH Media - Meetings Without Clients
+
+---
+
+## Planned Drain Metrics (story 4 MH-3; ADR-0039 §7, §8)
+
+**Best-effort, all three.** A draining MH exits as soon as it holds nothing or at its deadline, and
+does not linger for a scrape, so exit-time values may never be scraped. The **authoritative** drain
+outcome is MC's `mc_media_handler_migrations_total{trigger="planned_transfer"}` (`outcome="timed_out"`
+is the shed-on-rollout alert source), and MH's final log line (target `mh.drain`, "Drain finished":
+`exit_reason=empty|deadline`, `meetings_shed`, `drain_duration_seconds`) is the per-pod evidence. Not
+media-path series: no labels, no `key_custody`.
+
+### `mh_drain_meetings_remaining`
+- **Type**: Gauge
+- **Description**: Meetings this MH still holds during its drain — recompute-and-set from the session actor's held count at every change. **0 when not draining** (zero-initialised at startup).
+- **Labels**: none
+- **Cardinality**: 1
+- **Usage**: a draining pod's line should fall to 0 as MC moves meetings off; one that stays flat until the pod disappears shed at the deadline.
+- **Recorded in**: `observability/metrics.rs::set_drain_meetings_remaining` (`drain::run`)
+- **Dashboard**: MH Media - Drain Meetings Remaining
+
+### `mh_drain_meetings_shed_total`
+- **Type**: Counter
+- **Description**: Meetings still held at the drain deadline and shed (their sessions closed `HANDLER_RELEASED`). The ONLY home of a drain shed: never on `mh_media_handler_releases_total` or `mh_media_meeting_teardowns_total`.
+- **Labels**: none
+- **Cardinality**: 1, zero-initialised
+- **Usage**: best-effort (see above); alert on MC's `planned_transfer`/`timed_out`, never on this.
+- **Recorded in**: `observability/metrics.rs::record_drain_meetings_shed` (`drain::run`)
+- **Dashboard**: MH Media - Drain Meetings Shed
+
+### `mh_drain_duration_seconds`
+- **Type**: Histogram (zero-initialised at boot)
+- **Description**: One observation per drain: SIGTERM receipt to the exit decision (empty, or the deadline).
+- **Labels**: none
+- **Buckets**: `observability::metrics::DRAIN_DURATION_BUCKETS` (0.5 .. 60 s); the top bucket is unit-tested to stay above the deployed drain window (`terminationGracePeriodSeconds − 5 s`), which is itself an edge.
+- **Usage**: each MH incarnation drains at most once, so per pod `increase(_sum) / increase(_count)` IS that pod's single drain duration (the panel's query; a quantile is meaningless for one observation). **Zero-initialised at boot**, so one scrape inside the ~1 s exit linger is enough to see the 0 → 1 step; without such a scrape nothing appears, and the final `mh.drain` "Drain finished" log line (`drain_duration_seconds`) is the reliable record. Values at the deadline edge are sheds; a fast empty exit is the healthy shape once planned transfer (MC-F) moves meetings off.
+- **Recorded in**: `observability/metrics.rs::record_drain_duration` (`drain::run`)
+- **Dashboard**: MH Media - Drain Duration
 
 ---
 

@@ -11,7 +11,7 @@
 
 use crate::config::{
     QuicTransportParams, CONNECTION_RECEIVE_WINDOW_BYTES, CONNECTION_SEND_WINDOW_BYTES,
-    DATAGRAM_RECEIVE_BUFFER_BYTES, MAX_IDLE_TIMEOUT_SECONDS, STREAM_RECEIVE_WINDOW_BYTES,
+    DATAGRAM_RECEIVE_BUFFER_BYTES, STREAM_RECEIVE_WINDOW_BYTES,
 };
 use crate::grpc::McClient;
 use crate::media::MediaSetup;
@@ -258,9 +258,10 @@ impl WebTransportServer {
 /// # Provenance of each setting
 ///
 /// Env-driven (from [`QuicTransportParams`], all required): the uni-stream
-/// bound, the datagram **send** buffer, the keepalive interval. Compile-time
-/// constants (see [`crate::config`]): the idle timeout, both receive windows,
-/// and the datagram **receive** buffer. Everything not set here remains a quinn
+/// bound, the datagram **send** buffer, the keepalive interval and the idle
+/// timeout (`MH_MAX_IDLE_TIMEOUT_MS`, ADR-0039 §7). Compile-time constants
+/// (see [`crate::config`]): both receive windows and the datagram **receive**
+/// buffer. Everything not set here remains a quinn
 /// default, and that set should only ever shrink.
 fn build_transport_config(params: &QuicTransportParams) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
@@ -283,12 +284,29 @@ fn build_transport_config(params: &QuicTransportParams) -> quinn::TransportConfi
     // participant sends no media by definition (ADR-0036 §1, §5). The idle
     // timeout is declared alongside it because a keepalive is only meaningful
     // as a fraction of one; startup validation enforces the ratio.
+    //
+    // The idle timeout is also how a client notices a SILENTLY dead MH
+    // (ADR-0039 §7: sized ≈ MC's N, no app-level keepalive). Startup bounds it
+    // to `MAX_IDLE_TIMEOUT_MS_RANGE` (≤ 30 s), far inside quinn's `VarInt`
+    // range, so the conversion cannot fail; if it ever did, NO idle timeout is
+    // never the fallback — the bounded maximum is.
     transport.keep_alive_interval(Some(Duration::from_millis(params.keepalive_interval_ms)));
     transport.max_idle_timeout(Some(
-        Duration::from_secs(MAX_IDLE_TIMEOUT_SECONDS)
-            .try_into()
+        quinn::IdleTimeout::try_from(Duration::from_millis(params.max_idle_timeout_ms))
             .unwrap_or_else(|_| {
-                unreachable!("MAX_IDLE_TIMEOUT_SECONDS is a small compile-time constant")
+                // Unreachable for a validated config (pinned by a unit test);
+                // never silent if it ever runs: MH would then serve a value
+                // other than the one its startup log and gauge report.
+                error!(
+                    target: "mh.webtransport",
+                    configured_max_idle_timeout_ms = params.max_idle_timeout_ms,
+                    substituted_max_idle_timeout_ms =
+                        common::config::MH_HEARTBEAT_TIMEOUT_CEILING_MS,
+                    "QUIC max_idle_timeout out of quinn's range; substituting the bounded maximum"
+                );
+                quinn::IdleTimeout::from(quinn::VarInt::from_u32(
+                    common::config::MH_HEARTBEAT_TIMEOUT_CEILING_MS,
+                ))
             }),
     ));
 
@@ -328,7 +346,8 @@ mod tests {
             max_concurrent_uni_streams: 64,
             datagram_send_buffer_audio_frames: 32,
             datagram_send_buffer_bytes: 32 * NOMINAL_AUDIO_FRAME_BYTES,
-            keepalive_interval_ms: 10_000,
+            keepalive_interval_ms: 2_000,
+            max_idle_timeout_ms: 6_000,
         }
     }
 
@@ -349,7 +368,7 @@ mod tests {
             "datagram send buffer not applied (or not the converted byte value): {rendered}"
         );
         assert!(
-            rendered.contains("keep_alive_interval: Some(10s)"),
+            rendered.contains("keep_alive_interval: Some(2s)"),
             "keepalive not applied: {rendered}"
         );
     }
@@ -386,10 +405,33 @@ mod tests {
             "connection send window not declared (quinn's 10 MB default would sit under the \
              egress backlog cap): {rendered}"
         );
+    }
+
+    #[test]
+    fn every_legal_idle_timeout_converts_without_the_fallback() {
+        // Pins the "cannot fail" claim: both edges of the validated range fit
+        // quinn's IdleTimeout, so the substitution arm is unreachable.
+        let (floor, cap) = crate::config::MAX_IDLE_TIMEOUT_MS_RANGE;
+        for ms in [floor, cap] {
+            assert!(quinn::IdleTimeout::try_from(std::time::Duration::from_millis(ms)).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_idle_timeout_is_the_configured_value_never_the_retired_constant() {
+        // 4321 ms: neither the deployed 6000 nor the retired 30 s constant, so
+        // only the config field can produce it.
+        let mut p = params();
+        p.max_idle_timeout_ms = 4_321;
+        let rendered = format!("{:?}", build_transport_config(&p));
         assert!(
             // quinn renders the idle timeout in milliseconds, not as a Duration.
-            rendered.contains("max_idle_timeout: Some(30000)"),
-            "idle timeout not declared: {rendered}"
+            rendered.contains("max_idle_timeout: Some(4321)"),
+            "idle timeout not taken from config: {rendered}"
+        );
+        assert!(
+            !rendered.contains("max_idle_timeout: Some(30000)"),
+            "{rendered}"
         );
     }
 

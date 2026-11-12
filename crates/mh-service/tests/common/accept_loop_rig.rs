@@ -108,15 +108,11 @@ impl AcceptLoopRig {
             mc_client,
             handler_id,
             max_connections,
-            // Deployed values (infra/services/mh-service/config.env). The
-            // rig drives the REAL `bind()`, so these are the transport
-            // parameters the test endpoint actually negotiates with.
-            mh_service::config::QuicTransportParams {
-                max_concurrent_uni_streams: 64,
-                datagram_send_buffer_audio_frames: 32,
-                datagram_send_buffer_bytes: 32 * mh_service::config::NOMINAL_AUDIO_FRAME_BYTES,
-                keepalive_interval_ms: 10_000,
-            },
+            // Deployed values (the fixture is pinned to
+            // infra/services/mh-service/config.env). The rig drives the REAL
+            // `bind()`, so these are the transport parameters the test
+            // endpoint actually negotiates with.
+            mh_test_utils::admission::fixture_quic_transport(),
             // Handles resolved once, exactly as `main` does — the rig drives
             // the real accept loop, so a media session started here uses the
             // production setup path.
@@ -227,6 +223,12 @@ impl AcceptLoopRig {
     /// SIGTERM — so the connection tasks run their shutdown arms.
     pub fn shutdown(&self) {
         self.cancel_token.cancel();
+    }
+
+    /// The server's shutdown token itself, for a caller that cancels it as
+    /// `main` does — the planned drain (`mh_service::drain::run`, story 4 MH-3).
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
     }
 }
 

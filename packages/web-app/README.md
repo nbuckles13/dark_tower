@@ -115,7 +115,7 @@ inclusive; an out-of-range value throws `ClientConfigError` at session build
 | `releasedGraceMs` | 2000 | 0–30000 | After `HANDLER_RELEASED` for an in-set handler: wait for a set update before reporting DISCONNECTED and redialling |
 <!-- handler-set-config:end -->
 
-The **first** redial also waits `MH_KEEPALIVE_FLOOR_MS` (10000, compiled; must
+The **first** redial also waits `MH_KEEPALIVE_FLOOR_MS` (2000, compiled; must
 equal MH's `MH_KEEPALIVE_INTERVAL_MS`, pinned by
 `scripts/guards/simple/validate-keyframe-floor-sync.sh`) before its jitter.
 

@@ -3323,7 +3323,7 @@
         "type": "prometheus",
         "uid": "$datasource"
       },
-      "description": "mh_media_handler_releases_total: meetings released because MC REMOVED this handler (removal-cause EndMeeting or RELEASED verdict). trigger = heartbeat_timeout | apply_lag | planned_transfer (shared RemovalTrigger vocabulary); clients = present (at least one active connection at release) | none. trigger=heartbeat_timeout, clients=present is the FALSE-DECLARATION ground truth: MC declared this handler dead while it served people. apply_lag+present is a correct removal of a slow handler; planned_transfer+present is expected on drain. Flat outside planned transfers. MEETING_ENDED is on Meeting Teardowns, not here. increase(); all six pre-registered at zero. key_custody=operator. Runbook: docs/runbooks/mh-incident-response.md. Deploy skew / bad deploy: docs/runbooks/mh-deployment.md Rollback, 'MH-2 heartbeat / EndMeeting cause coupling'; incident scenarios land with story 4 OPS.",
+      "description": "mh_media_handler_releases_total: meetings released because MC REMOVED this handler (removal-cause EndMeeting or RELEASED verdict), or by MH's own owner-silence release. trigger = heartbeat_timeout | apply_lag | planned_transfer (shared RemovalTrigger vocabulary) | owner_silence (MH-LOCAL, outside the ReleaseCause projection: the owning MC was silent for MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS); clients = present (at least one active connection at release) | none. trigger=heartbeat_timeout, clients=present is the FALSE-DECLARATION ground truth: MC declared this handler dead while it served people. apply_lag+present is a correct removal of a slow handler; planned_transfer+present is expected on drain. owner_silence+none is routine cleanup ~15 min after an MC rollout; owner_silence+present means people stayed attached to an ownerless meeting (a warning candidate). MEETING_ENDED is on Meeting Teardowns and a drain-deadline shed on Drain Meetings Shed, not here. increase(); all eight pre-registered at zero. key_custody=operator. Runbook: docs/runbooks/mh-incident-response.md; owner silence: docs/runbooks/mh-deployment.md MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS row. Deploy skew / bad deploy: docs/runbooks/mh-deployment.md Rollback.",
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -3415,6 +3415,255 @@
       ],
       "title": "Meetings Without Clients",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 156
+      },
+      "id": 220,
+      "panels": [],
+      "title": "Planned Drain and Owner Silence (story 4 MH-3)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_drain_meetings_remaining: meetings each MH still holds during its planned drain (SIGTERM; ADR-0039 §7), recompute-and-set from the session actor. 0 when not draining (zero-initialised). A draining pod's line should fall to 0 as MC moves meetings off; one flat until the pod disappears shed at the deadline. max by pod. BEST-EFFORT: a draining MH exits without lingering for a scrape, so exit-time values may never be scraped; the authoritative drain outcome is MC's mc_media_handler_migrations_total{trigger=\"planned_transfer\"} (timed_out = shed), and MH's final log line (target mh.drain, 'Drain finished': exit_reason, meetings_shed, drain_duration_seconds) is the per-pod evidence. Runbook: docs/runbooks/mh-deployment.md 'MH drains on SIGTERM'.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 157
+      },
+      "id": 221,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (pod) (mh_drain_meetings_remaining)",
+          "legendFormat": "{{pod}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Drain Meetings Remaining",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_drain_meetings_shed_total: meetings still held at the drain deadline (terminationGracePeriodSeconds - 5 s) and shed, their sessions closed HANDLER_RELEASED. The ONLY home of a drain shed (never on Handler Releases or Meeting Teardowns). Until planned transfer (MC-F) lands, MC does not move meetings off a draining MH, so a roll sheds every held meeting. increase(); zero-initialised. BEST-EFFORT: a draining MH exits without lingering for a scrape, so exit-time values may never be scraped; the authoritative drain outcome is MC's mc_media_handler_migrations_total{trigger=\"planned_transfer\"} (timed_out = shed), and MH's final log line (target mh.drain, 'Drain finished': exit_reason, meetings_shed, drain_duration_seconds) is the per-pod evidence. Runbook: docs/runbooks/mh-deployment.md 'MH drains on SIGTERM'.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 157
+      },
+      "id": 222,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (pod) (increase(mh_drain_meetings_shed_total[$__rate_interval]))",
+          "legendFormat": "{{pod}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Drain Meetings Shed",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_drain_duration_seconds: SIGTERM to the exit decision (empty, or the deadline). Each MH incarnation drains at most once, so increase(_sum)/increase(_count) per pod IS that pod's single drain duration (the extrapolation factor cancels in the ratio). The histogram is zero-initialised at boot, so ONE scrape landing in the ~1 s exit linger is enough to see the 0 -> 1 step; a quantile is meaningless for one observation. If no scrape lands in that linger the panel shows nothing for that pod: the final 'Drain finished' log line (target mh.drain, drain_duration_seconds) is the reliable record. Values at the deadline edge (30 s at the deployed 35 s grace) are sheds; a fast empty exit is the healthy shape once MC moves meetings off. BEST-EFFORT: the authoritative drain outcome is MC's mc_media_handler_migrations_total{trigger=\"planned_transfer\"} (timed_out = shed). Runbook: docs/runbooks/mh-deployment.md 'MH drains on SIGTERM'.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 157
+      },
+      "id": 223,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "sum by (pod) (increase(mh_drain_duration_seconds_sum[$__rate_interval])) / sum by (pod) (increase(mh_drain_duration_seconds_count[$__rate_interval]))",
+          "legendFormat": "{{pod}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Drain Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_meeting_owner_silence_timeout_seconds: MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS (ADR-0039 §6; 300..=3600, default 900), from the same field the owner-silence timer reads. MH releases a meeting whose owning MC has not communicated for this long (counted Handler Releases trigger=owner_silence). Capacity reclamation, not MC failover. A CONFIG ECHO. key_custody=operator. Runbook: docs/runbooks/mh-deployment.md configuration reference.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 165
+      },
+      "id": 224,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (pod) (mh_media_meeting_owner_silence_timeout_seconds)",
+          "legendFormat": "{{pod}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Owner-Silence Timeout",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_media_transport_idle_timeout_seconds: MH's QUIC max_idle_timeout (MH_MAX_IDLE_TIMEOUT_MS / 1000; ADR-0039 §7), from the same field quinn is given: how long a client takes to notice a silently dead MH. Read it beside MC's N (mc_media_handler_heartbeat_deadline_seconds): the client-loss evidence is interpretable only when the two are about equal (deployed equal). A CONFIG ECHO. key_custody=operator. Runbook: docs/runbooks/mh-deployment.md configuration reference.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 165
+      },
+      "id": 225,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (pod) (mh_media_transport_idle_timeout_seconds)",
+          "legendFormat": "{{pod}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "QUIC Idle Timeout",
+      "type": "stat"
     }
   ],
   "refresh": "1m",

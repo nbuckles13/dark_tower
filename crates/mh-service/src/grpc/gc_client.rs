@@ -21,7 +21,7 @@ use crate::routing::RoutingTable;
 use common::observability::otel_grpc::client_interceptor;
 use common::token_manager::TokenReceiver;
 use proto_gen::dark_tower::internal::v1::media_handler_registry_service_client::MediaHandlerRegistryServiceClient;
-use proto_gen::dark_tower::internal::v1::{RegisterMhRequest, SendLoadReportRequest};
+use proto_gen::dark_tower::internal::v1::{HealthStatus, RegisterMhRequest, SendLoadReportRequest};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -291,14 +291,18 @@ impl GcClient {
         Ok(response.into_inner())
     }
 
-    /// Send a load report (heartbeat) to GC.
+    /// Send a load report (heartbeat) to GC, carrying `health`.
+    ///
+    /// `health` is the caller's, never a literal here: the GC task derives it
+    /// from the ONE drain state (`grpc::gc_task::health_of`), so DRAINING is
+    /// process state that survives every re-registration (ADR-0039 §7).
     ///
     /// # Errors
     ///
     /// Returns `MhError::NotRegistered` if GC returns `NOT_FOUND`.
     /// Returns `MhError::Grpc` for other gRPC errors.
     #[instrument(skip_all, fields(handler_id = %self.config.handler_id))]
-    pub async fn send_load_report(&self) -> Result<(), MhError> {
+    pub async fn send_load_report(&self, health: HealthStatus) -> Result<(), MhError> {
         if !self.is_registered.load(Ordering::SeqCst) {
             debug!(target: "mh.grpc.gc_client", "Skipping heartbeat - not registered");
             return Ok(());
@@ -307,7 +311,7 @@ impl GcClient {
         let request = SendLoadReportRequest {
             handler_id: self.config.handler_id.clone(),
             current_streams: self.current_streams(),
-            health: 1, // HEALTHY
+            health: health as i32,
             cpu_usage_percent: 0.0,
             memory_usage_percent: 0.0,
             bandwidth_usage_percent: 0.0,
@@ -391,6 +395,13 @@ impl GcClient {
     #[must_use]
     pub fn load_report_interval_ms(&self) -> u64 {
         self.load_report_interval_ms.load(Ordering::SeqCst)
+    }
+
+    /// The load-report interval GC pushed in `RegisterMHResponse` (or the
+    /// pre-registration default).
+    #[must_use]
+    pub fn load_report_interval(&self) -> Duration {
+        Duration::from_millis(self.load_report_interval_ms())
     }
 
     /// Check if currently registered with GC.

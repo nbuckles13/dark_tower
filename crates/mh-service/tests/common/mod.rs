@@ -48,11 +48,13 @@
 pub mod accept_loop_rig;
 pub mod close_metrics;
 pub mod grpc_rig;
+pub mod heartbeat_rig;
 pub mod jwks_rig;
 pub mod media_frame;
 pub mod media_rig;
 pub mod mock_mc;
 pub mod otel_capture;
+pub mod paused_time;
 pub mod stream_rig;
 pub mod tokens;
 pub mod udp_proxy;

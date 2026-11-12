@@ -45,20 +45,23 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 pub mod admission;
 pub mod heartbeat;
+pub mod owner_silence;
 pub mod release;
 
 use crate::auth::MediaDialKey;
+use crate::drain::DrainWatch;
 use crate::media::downlink::DownlinkSender;
 use crate::media::edge_runtime::EdgeContext;
 use crate::media::forward::EgressQueue;
 use crate::observability::metrics::{
     self as mh_metrics, resolve_session_handles, McHeartbeatOutcome, McHeartbeatVerdict,
-    MeetingTeardownOutcome, ReleaseClients, SessionMetricHandles, StreamAdmissionOutcome,
+    MeetingTeardownOutcome, ReleaseClients, ReleaseTrigger, SessionMetricHandles,
+    StreamAdmissionOutcome,
 };
 use crate::routing::{
     apply_refusal_of, ApplyAttempt, MeetingKey, MeetingPolicy, PolicyRejection, RoutingSnapshot,
@@ -70,6 +73,7 @@ use arc_swap::ArcSwap;
 use heartbeat::{
     HeartbeatSchedule, HeartbeatSetup, OutboundBeat, SenderCommand, MAX_BEATS_PER_WAKE,
 };
+use owner_silence::{OwnerSilence, MAX_RELEASES_PER_WAKE};
 use proto_gen::dark_tower::internal::v1::{MeetingHeartbeatRequest, ServingState};
 use release::ReleaseKind;
 
@@ -283,6 +287,13 @@ enum SessionMessage {
         fence: u64,
         cause: i32,
     },
+    /// MC answered one of this meeting's heartbeats OWNED: the owner
+    /// communicated (owner-silence reset), but only if the beat was built for
+    /// the registration that still holds the meeting (`fence`).
+    HeartbeatOwned { meeting_id: String, fence: u64 },
+    /// The drain deadline (story 4 MH-3): release every held meeting with
+    /// [`ReleaseKind::DrainShed`] in ONE turn; replies with how many.
+    ShedAll { respond_to: oneshot::Sender<usize> },
     /// Check if a meeting is registered.
     IsMeetingRegistered {
         meeting_id: String,
@@ -437,6 +448,10 @@ pub struct SessionManagerActor {
     /// The per-meeting MH -> MC heartbeat (story 4 MH-2). `None` only for
     /// test actors built without a sink: then no beat is ever built.
     heartbeat: Option<HeartbeatRuntime>,
+    /// How many meetings are held, for the drain coordinator's "holds
+    /// nothing" wait (`crate::drain`). Sent next to every registered-count
+    /// publish ([`Self::publish_held`]).
+    held: watch::Sender<usize>,
 }
 
 /// The actor's heartbeat half: the schedule and where beats go.
@@ -449,6 +464,12 @@ struct HeartbeatRuntime {
     queue_full_streak: u64,
     /// The sender task's queue was found closed (logged once, loudly).
     sender_gone_logged: bool,
+    /// The process drain state (story 4 MH-3): DRAINING beats while `Some`.
+    drain: DrainWatch,
+    /// Per-meeting owner-silence timers (story 4 MH-3, ADR-0039 §6). Part of
+    /// the heartbeat half because OWNED verdicts are what reset it: an actor
+    /// with no heartbeat sink could never be reset, so it has none.
+    owner_silence: OwnerSilence,
 }
 
 impl SessionManagerActor {
@@ -459,6 +480,7 @@ impl SessionManagerActor {
         sender_bindings: Arc<SenderBindings>,
         admission: StreamAdmission,
         heartbeat: Option<HeartbeatSetup>,
+        held: watch::Sender<usize>,
     ) -> Self {
         let metrics = resolve_session_handles();
         // Both gauges exist from construction — never lazily on first
@@ -488,7 +510,10 @@ impl SessionManagerActor {
                 schedule: HeartbeatSchedule::new(setup.rng),
                 queue_full_streak: 0,
                 sender_gone_logged: false,
+                drain: setup.drain,
+                owner_silence: OwnerSilence::new(setup.owner_silence_timeout),
             }),
+            held,
         }
     }
 
@@ -517,6 +542,10 @@ impl SessionManagerActor {
         // under load, which is when the ratio matters. `Burst` catches up, and
         // catching up is cheap (`rotate` clears one small struct; the latch is
         // edge-triggered, so a burst logs at most one line).
+        // The drain state (story 4 MH-3): its own receiver, so `changed()` can
+        // be awaited while `build_beat` reads the runtime's copy. Disabled
+        // once the sender is gone (or when there is no heartbeat sink).
+        let mut drain_rx = self.heartbeat.as_ref().map(|hb| hb.drain.clone());
         while lifecycle_open || config_open {
             // The heartbeat arm's deadline: the earliest per-meeting due
             // instant. Disabled (never polled) when nothing is scheduled or
@@ -525,6 +554,11 @@ impl SessionManagerActor {
                 .heartbeat
                 .as_ref()
                 .and_then(|hb| hb.schedule.earliest());
+            // The owner-silence arm: disabled when no meeting is tracked.
+            let next_silence = self
+                .heartbeat
+                .as_ref()
+                .and_then(|hb| hb.owner_silence.earliest());
             tokio::select! {
                 msg = self.receiver.recv(), if lifecycle_open => match msg {
                     Some(msg) => self.handle_message(msg),
@@ -544,6 +578,16 @@ impl SessionManagerActor {
                 }
                 () = sleep_until_or_never(next_beat), if next_beat.is_some() => {
                     self.emit_due_beats(tokio::time::Instant::now());
+                }
+                () = sleep_until_or_never(next_silence), if next_silence.is_some() => {
+                    self.release_silent_owners(tokio::time::Instant::now());
+                }
+                changed = drain_changed(&mut drain_rx), if drain_rx.is_some() => {
+                    if changed {
+                        self.enter_drain(tokio::time::Instant::now());
+                    } else {
+                        drain_rx = None;
+                    }
                 }
             }
         }
@@ -947,6 +991,13 @@ impl SessionManagerActor {
                 fence,
                 cause,
             } => self.handle_heartbeat_released(&meeting_id, fence, cause),
+            SessionMessage::HeartbeatOwned { meeting_id, fence } => {
+                self.handle_heartbeat_owned(&meeting_id, fence);
+            }
+            SessionMessage::ShedAll { respond_to } => {
+                let shed = self.handle_shed_all();
+                let _ = respond_to.send(shed);
+            }
             SessionMessage::IsMeetingRegistered {
                 meeting_id,
                 respond_to,
@@ -1136,8 +1187,12 @@ impl SessionManagerActor {
         if let Some(previous) = previous {
             self.evict_endpoint_if_unreferenced(previous.mc_grpc_endpoint);
         }
-        self.metrics
-            .publish_registered_meetings(self.state.registered_meetings.len());
+        // Owner-silence reset site 1 of 2 (`owner_silence` allow-list): the
+        // record upsert SUCCEEDED, so the meeting's record now holds this
+        // caller's `mc_id` — the owner (or, on a takeover, the new owner)
+        // communicated. A record-invalid request never reaches the actor.
+        self.note_owner_contact(&meeting_id);
+        self.publish_held();
         Ok(())
     }
 
@@ -1232,13 +1287,20 @@ impl SessionManagerActor {
         self.metrics.publish_egress_edges(snapshot.total_edges());
         self.metrics
             .publish_stream_sources_declared(self.routing.stream_sources_declared());
-        self.metrics
-            .publish_registered_meetings(self.state.registered_meetings.len());
+        self.publish_held();
         match kind {
-            ReleaseKind::Removal(trigger) => self.metrics.record_handler_release(trigger, clients),
+            ReleaseKind::Removal(trigger) => self
+                .metrics
+                .record_handler_release(ReleaseTrigger::Removal(trigger), clients),
+            ReleaseKind::OwnerSilence => self
+                .metrics
+                .record_handler_release(ReleaseTrigger::OwnerSilence, clients),
             ReleaseKind::MeetingEnded | ReleaseKind::NoCause => self
                 .metrics
                 .record_teardown(MeetingTeardownOutcome::Released),
+            // Counted ONLY on `mh_drain_meetings_shed_total`, in bulk by the
+            // drain coordinator from `ShedAll`'s reply: one home per event.
+            ReleaseKind::DrainShed => {}
         }
 
         tracing::info!(
@@ -1328,12 +1390,18 @@ impl SessionManagerActor {
         let Some(hb) = self.heartbeat.as_mut() else {
             return;
         };
+        let now = tokio::time::Instant::now();
         hb.schedule.upsert(
             meeting_id,
             registration.heartbeat_interval,
-            tokio::time::Instant::now(),
+            now,
             identity_changed,
         );
+        // A meeting registered DURING the drain (accepted: MH keeps serving)
+        // tells its MC at once, unjittered, that this handler is draining.
+        if crate::drain::is_draining(&hb.drain) {
+            hb.schedule.due_now(meeting_id, now);
+        }
         if let Some(rejection) = policy_rejection {
             hb.schedule.apply_refusal_effect(
                 meeting_id,
@@ -1347,6 +1415,8 @@ impl SessionManagerActor {
     fn unschedule_heartbeats(&mut self, meeting_id: &str, endpoint: String) {
         if let Some(hb) = self.heartbeat.as_mut() {
             hb.schedule.remove(meeting_id);
+            // The meeting is no longer held: its owner-silence timer goes too.
+            hb.owner_silence.forget(meeting_id);
             // Best-effort: the sender's caps are the backstop.
             let _ = hb.commands.try_send(SenderCommand::Forget {
                 meeting_id: meeting_id.to_owned(),
@@ -1450,14 +1520,22 @@ impl SessionManagerActor {
                     .collect()
             })
             .unwrap_or_default();
+        // DRAINING carries the time left, derived from the ONE deadline at
+        // build time (relative: no clock skew; MH's grace is the only copy).
+        let (serving_state, drain_remaining_ms) = match *hb.drain.borrow() {
+            Some(deadline) => (
+                ServingState::Draining,
+                deadline.remaining_ms(tokio::time::Instant::now()),
+            ),
+            None => (ServingState::Serving, 0),
+        };
         Some(OutboundBeat {
             request: MeetingHeartbeatRequest {
                 meeting_id: meeting_id.to_owned(),
                 mc_id: registration.mc_id.clone(),
                 handler_id: hb.handler_id.clone(),
-                // DRAINING (with `drain_remaining_ms`) is MH-3's.
-                serving_state: ServingState::Serving as i32,
-                drain_remaining_ms: 0,
+                serving_state: serving_state as i32,
+                drain_remaining_ms,
                 applied_generation: self
                     .routing
                     .load()
@@ -1469,6 +1547,111 @@ impl SessionManagerActor {
             fence,
             interval: registration.heartbeat_interval,
         })
+    }
+
+    /// An OWNED verdict: owner-silence reset site 2 of 2 (`owner_silence`
+    /// allow-list) — only when the beat was built for the registration that
+    /// still holds the meeting. A beat in flight across a takeover (or a
+    /// re-registration to another endpoint) carries the OLD fence and never
+    /// refreshes the new owner's timer.
+    fn handle_heartbeat_owned(&mut self, meeting_id: &str, fence: u64) {
+        let current = self
+            .heartbeat
+            .as_ref()
+            .and_then(|hb| hb.schedule.fence_of(meeting_id));
+        if current == Some(fence) {
+            self.note_owner_contact(meeting_id);
+        }
+    }
+
+    /// THE owner-silence reset, called ONLY from the two allow-listed sites
+    /// above (see `owner_silence`'s module docs).
+    fn note_owner_contact(&mut self, meeting_id: &str) {
+        if let Some(hb) = self.heartbeat.as_mut() {
+            hb.owner_silence
+                .note_owner_contact(meeting_id, tokio::time::Instant::now());
+        }
+    }
+
+    /// The owner-silence timer arm (ADR-0039 §6): release every meeting whose
+    /// owning MC has been silent for the whole timeout, through THE release
+    /// path, exactly like a RELEASED verdict (`HANDLER_RELEASED`, no
+    /// Disconnected). Capacity reclamation, not authorization, and not an
+    /// MC-failover mechanism (`owner_silence` module docs).
+    fn release_silent_owners(&mut self, now: tokio::time::Instant) {
+        let expired = match self.heartbeat.as_mut() {
+            Some(hb) => hb.owner_silence.take_expired(now, MAX_RELEASES_PER_WAKE),
+            None => return,
+        };
+        for expired in expired {
+            let Some(mc_id) = self
+                .state
+                .registered_meetings
+                .get(&expired.meeting_id)
+                .map(|r| r.mc_id.clone())
+            else {
+                continue;
+            };
+            // One INFO per release; ids are allowed in logs (never labels).
+            tracing::info!(
+                target: "mh.session.owner_silence",
+                key_custody = common::observability::labels::KEY_CUSTODY_OPERATOR,
+                meeting_id = %expired.meeting_id,
+                mc_id = %mc_id,
+                silence_seconds = expired.silence.as_secs(),
+                "Releasing a meeting whose owning MC has been silent for the owner-silence \
+                 timeout (MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS); capacity reclamation, not \
+                 MC failover"
+            );
+            self.handle_end_meeting(&expired.meeting_id, &mc_id, ReleaseKind::OwnerSilence);
+        }
+    }
+
+    /// The process started draining (story 4 MH-3; ADR-0039 §1 "DRAINING
+    /// resets every meeting's deadline to now"): every held meeting's next beat
+    /// is due immediately and carries DRAINING. Logged once (a transition).
+    fn enter_drain(&mut self, now: tokio::time::Instant) {
+        let Some(hb) = self.heartbeat.as_mut() else {
+            return;
+        };
+        if !crate::drain::is_draining(&hb.drain) {
+            return;
+        }
+        hb.schedule.due_all_now(now);
+        tracing::info!(
+            target: "mh.session.heartbeat",
+            meetings_held = self.state.registered_meetings.len(),
+            "Draining: every held meeting's MC gets an immediate DRAINING heartbeat"
+        );
+    }
+
+    /// The drain deadline: release every held meeting through THE release
+    /// path with [`ReleaseKind::DrainShed`], so each session closes
+    /// `HANDLER_RELEASED` (only about its own meeting). Returns how many.
+    fn handle_shed_all(&mut self) -> usize {
+        let held: Vec<(String, String)> = self
+            .state
+            .registered_meetings
+            .iter()
+            .map(|(meeting_id, r)| (meeting_id.clone(), r.mc_id.clone()))
+            .collect();
+        let mut shed = 0;
+        for (meeting_id, mc_id) in &held {
+            if self.handle_end_meeting(meeting_id, mc_id, ReleaseKind::DrainShed)
+                == MeetingTeardownOutcome::Released
+            {
+                shed += 1;
+            }
+        }
+        shed
+    }
+
+    /// The registered-meeting count, to its gauge AND to the drain
+    /// coordinator's held watch. Every count change goes through here.
+    fn publish_held(&self) {
+        let held = self.state.registered_meetings.len();
+        self.metrics.publish_registered_meetings(held);
+        self.held.send_replace(held);
     }
 
     /// A RELEASED verdict (ADR-0039 §6): end the meeting through THE release
@@ -1500,7 +1683,12 @@ impl SessionManagerActor {
         let kind = ReleaseKind::of(cause);
         mh_metrics::record_mc_heartbeat_verdict(match kind {
             ReleaseKind::NoCause => McHeartbeatVerdict::Misroute,
-            ReleaseKind::Removal(_) | ReleaseKind::MeetingEnded => McHeartbeatVerdict::Released,
+            // The MH-local kinds are listed for exhaustiveness only:
+            // `ReleaseKind::of` never produces them from a wire cause.
+            ReleaseKind::Removal(_)
+            | ReleaseKind::MeetingEnded
+            | ReleaseKind::OwnerSilence
+            | ReleaseKind::DrainShed => McHeartbeatVerdict::Released,
         });
         if kind == ReleaseKind::NoCause {
             tracing::warn!(
@@ -1637,6 +1825,27 @@ async fn sleep_until_or_never(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+/// Wait for the drain state to change. `true` on a change; `false` once the
+/// sender is gone (the arm is then disabled). Only polled while `rx` is
+/// `Some` (the arm's guard).
+async fn drain_changed(rx: &mut Option<DrainWatch>) -> bool {
+    match rx {
+        Some(rx) => rx.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
+/// How an OWNED relay went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedRelay {
+    /// Queued on the actor's lifecycle mailbox.
+    Delivered,
+    /// The mailbox was full; dropped (never blocks the beat task).
+    MailboxFull,
+    /// The actor is gone.
+    ActorGone,
+}
+
 /// Where the heartbeat sender task relays a RELEASED verdict: the actor's
 /// LIFECYCLE mailbox, held WEAKLY so the sender task can never keep the actor
 /// alive (no shutdown cycle: the actor holds the sender's queue, the sender
@@ -1647,6 +1856,24 @@ pub struct VerdictSink {
 }
 
 impl VerdictSink {
+    /// Relay an OWNED verdict for the beat built for `(meeting_id, fence)`:
+    /// the owner-silence reset. NON-blocking (`try_send`): an OWNED arrives on
+    /// every beat, and awaiting mailbox space would hold the beat's in-flight
+    /// slot and skip the meeting's next beat. A dropped relay matters only
+    /// after >= 30 consecutive drops (the owner-silence floor spans 30
+    /// intervals), i.e. a wedged actor, which already shows as missed beats.
+    #[must_use]
+    pub fn owned(&self, meeting_id: String, fence: u64) -> OwnedRelay {
+        let Some(sender) = self.sender.upgrade() else {
+            return OwnedRelay::ActorGone;
+        };
+        match sender.try_send(SessionMessage::HeartbeatOwned { meeting_id, fence }) {
+            Ok(()) => OwnedRelay::Delivered,
+            Err(mpsc::error::TrySendError::Full(_)) => OwnedRelay::MailboxFull,
+            Err(mpsc::error::TrySendError::Closed(_)) => OwnedRelay::ActorGone,
+        }
+    }
+
     /// Relay a RELEASED verdict for the beat built for `(meeting_id, fence)`.
     /// Awaits mailbox space (it runs on the beat's own task, so it delays no
     /// other meeting). Returns `false` when the actor is gone.
@@ -2162,6 +2389,8 @@ pub struct SessionManagerHandle {
     /// connect and cleared at teardown; see [`SenderBindings`] for why the
     /// forward path does not read it.
     sender_bindings: Arc<SenderBindings>,
+    /// The actor's held-meeting count (story 4 MH-3's drain wait).
+    held: watch::Receiver<usize>,
 }
 
 impl SessionManagerHandle {
@@ -2236,6 +2465,7 @@ impl SessionManagerHandle {
         let (config_sender, config_receiver) = mpsc::channel(CONFIG_APPLY_CHANNEL_BUFFER);
         let routing = Arc::new(routing);
         let sender_bindings = Arc::new(SenderBindings::new());
+        let (held_tx, held) = watch::channel(0);
         let actor = SessionManagerActor::new(
             receiver,
             config_receiver,
@@ -2243,6 +2473,7 @@ impl SessionManagerHandle {
             Arc::clone(&sender_bindings),
             admission,
             heartbeat,
+            held_tx,
         );
         (
             Self {
@@ -2251,6 +2482,7 @@ impl SessionManagerHandle {
                 subscribers: Arc::clone(routing.subscribers()),
                 routing,
                 sender_bindings,
+                held,
             },
             actor,
         )
@@ -2286,6 +2518,26 @@ impl SessionManagerHandle {
         VerdictSink {
             sender: self.sender.downgrade(),
         }
+    }
+
+    /// The number of meetings this handler holds, as a watch the drain
+    /// coordinator awaits (story 4 MH-3). Updated by the actor at every
+    /// registration change.
+    #[must_use]
+    pub fn held_meetings(&self) -> watch::Receiver<usize> {
+        self.held.clone()
+    }
+
+    /// The drain deadline (story 4 MH-3): shed every held meeting in one actor
+    /// turn, each session closing `HANDLER_RELEASED`. `None` when the actor
+    /// is gone (nothing could be shed with a code).
+    pub async fn shed_all(&self) -> Option<usize> {
+        let (respond_to, rx) = oneshot::channel();
+        self.sender
+            .send(SessionMessage::ShedAll { respond_to })
+            .await
+            .ok()?;
+        rx.await.ok()
     }
 
     /// Remaining headroom in the **connection-lifecycle** mailbox.
@@ -2947,6 +3199,44 @@ mod tests {
         );
     }
 
+    /// A process-wide default dispatcher that is interested in every callsite
+    /// SOMETIMES and enabled for none. tracing combines callsite interest
+    /// across the global dispatcher and every scoped one, so with this
+    /// installed no callsite can be cached `Interest::never` by a thread that
+    /// had no subscriber — the race that made the log-capturing test below
+    /// lose its capture under parallel load. Each event then re-checks the
+    /// emitting thread's (scoped) subscriber. Installed once per test process;
+    /// no other mh-service unit test sets a global default.
+    struct AlwaysSometimes;
+
+    impl tracing::Subscriber for AlwaysSometimes {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn install_always_sometimes_global_dispatcher() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::subscriber::set_global_default(AlwaysSometimes)
+                .expect("no other mh-service unit test sets a global default");
+        });
+    }
+
     /// The `SameMc` key-change WARN fires on a changed key and not on a
     /// same-key re-registration; neither blocks the upsert.
     #[tokio::test(flavor = "current_thread")]
@@ -2967,6 +3257,7 @@ mod tests {
                 String::from_utf8_lossy(&self.0.lock().unwrap()).contains(needle)
             }
         }
+        install_always_sometimes_global_dispatcher();
         let capture = Capture::default();
         let sink = capture.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -3615,6 +3906,31 @@ mod tests {
     // through `build_beat` / `emit_due_beats` directly, deterministically.
     // =======================================================================
 
+    /// Operations F1: an actor that never answers `ShedAll` (here: built and
+    /// never run, holding one meeting) cannot hold the drain past its budget.
+    /// The coordinator gives up after `SHED_BUDGET`, reports the shed as not
+    /// completed, still lingers and cancels — all inside the shutdown margin.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_shed_cannot_hold_the_drain_past_its_budget() {
+        use crate::config::{CLOSE_SESSION_LINGER, SHUTDOWN_MARGIN_SECONDS};
+        use crate::drain::{self, DrainExit, SHED_BUDGET};
+        let (handle, actor) = SessionManagerHandle::new_with_parts_for_tests(test_admission());
+        actor.held.send_replace(1); // as if one meeting were held
+        let (drain_tx, _rx) = drain::channel();
+        let shutdown = CancellationToken::new();
+        let window = Duration::from_secs(30);
+        let started = tokio::time::Instant::now();
+        let outcome = drain::run(&handle, &drain_tx, window, &shutdown).await;
+        assert_eq!(outcome.exit, DrainExit::Deadline);
+        assert!(!outcome.shed_completed, "said, never silent");
+        assert_eq!(outcome.shed, 0);
+        assert!(shutdown.is_cancelled());
+        let total = tokio::time::Instant::now() - started;
+        assert_eq!(total, window + SHED_BUDGET + CLOSE_SESSION_LINGER);
+        assert!(total < window + Duration::from_secs(SHUTDOWN_MARGIN_SECONDS));
+        drop(actor);
+    }
+
     fn heartbeat_actor() -> (
         SessionManagerHandle,
         SessionManagerActor,
@@ -3628,6 +3944,8 @@ mod tests {
                 handler_id: "mh-unit".to_string(),
                 commands: tx,
                 rng: rand::rngs::SmallRng::seed_from_u64(1),
+                drain: crate::drain::channel().1,
+                owner_silence_timeout: Duration::from_secs(300),
             },
         );
         (handle, actor, rx)
