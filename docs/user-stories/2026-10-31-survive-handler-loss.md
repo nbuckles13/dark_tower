@@ -2518,7 +2518,7 @@ tasks:
   tier: light
   tier_reason: 'MC-only telemetry over existing inputs: no wire or proto change (P3 owns deletions), no auth/crypto, no GSA, one service'
 - id: 26
-  status: pending
+  status: completed
   specialist: client
   deps:
   - 17
@@ -2591,6 +2591,7 @@ tasks:
     SAME COMMIT: SDK events, stores, web-app rendering and copy, the bus events, every R-42 series and resume_ms with the full export path (the media-path prefix block plus the hygiene-kernel const, collector allowlist, GC filter, export guard and fixtures, catalog and roster change, spread-comment and test-pin flip, panels), the replay token, the non-member count, and the new clientConfig keys (the reconnecting cap, the resume abandonment cap, the reconnect abandonment cap) with their config log line and documentation.
 
     Cross-task obligations: (a) the new config keys are documented with default and range; (b) the two existing series' old label sets (meeting_id_hash, status, mh_index_bucket) and their non-exported catalog entries are removed in this commit; (c) every series lands with panel, catalog, zero-init and an ADR-0032 test; (d) implement the matching test-gates.md "Client" items, paired with test; (e) R4 label hygiene, with no meeting, participant, handler, ref, URL or slot labels.
+  slug: 2026-11-13-client-mh-replacement-ux-telemetry
   tag: story-2026-10-31-survive-handler-loss-task-C2
 - id: 27
   status: pending
