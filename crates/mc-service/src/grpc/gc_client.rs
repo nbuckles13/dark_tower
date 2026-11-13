@@ -1109,6 +1109,7 @@ mod tests {
             media_dial_token_ttl_seconds: 300,
             mh_replacement_min_interval_ms: 1000,
             mh_replacement_backoff_max_ms: 30000,
+            planned_transfer_margin_ms: 5000,
             max_receive_capability_declarations: 64,
             audio_encoding: crate::media_signaling::AudioEncoding::new(
                 proto_gen::dark_tower::signaling::v1::Codec::Opus,
@@ -1180,6 +1181,7 @@ mod tests {
             media_dial_token_ttl_seconds: 300,
             mh_replacement_min_interval_ms: 1000,
             mh_replacement_backoff_max_ms: 30000,
+            planned_transfer_margin_ms: 5000,
             max_receive_capability_declarations: 64,
             audio_encoding: crate::media_signaling::AudioEncoding::new(
                 proto_gen::dark_tower::signaling::v1::Codec::Opus,

@@ -1071,7 +1071,7 @@ Heartbeats are logged on transitions only, never per heartbeat.
 - **Not counted here**: a heartbeat MC could not route to its actor in time (UNAVAILABLE) — that is `mc_messages_dropped_total{actor_type="meeting"|"controller"}`; and a malformed request (INVALID_ARGUMENT).
 - **Usage**: Any increase of `released_unassigned` or `owner_mismatch` is a contract or routing defect (WARNING, OBS-ALERTS)
 - **Recorded in**: `grpc/media_coordination.rs` (`owner_mismatch`, `released_ended`) and `actors/meeting.rs::handle_handler_heartbeat` (the rest) via `observability/metrics.rs::record_handler_heartbeat`
-- **Dashboard**: MC Media - Handler Heartbeat Verdicts by Outcome (Handler Heartbeats row)
+- **Dashboard**: MC Media Handlers - Handler Heartbeat Verdicts by Outcome (Handler Heartbeats row)
 
 ### `mc_media_handler_heartbeat_interval_seconds`
 - **Type**: Histogram
@@ -1080,7 +1080,7 @@ Heartbeats are logged on transitions only, never per heartbeat.
 - **Buckets**: DERIVED from N (`MC_MH_HEARTBEAT_TIMEOUT_MS`): N/6, N/3, N/2, 2N/3, N, 1.5N, 2N
 - **Observed**: on ACCEPTED heartbeats with a previous accepted receipt only; the first heartbeat of a pair and stale or replayed arrivals (applied generation lower than the last accepted) are excluded — those appear on `mc_media_handler_applied_sequence_lag`. This is the liveness clock the health decision judges against N.
 - **Recorded in**: `actors/meeting.rs::handle_handler_heartbeat` via `observability/metrics.rs::observe_heartbeat_interval`
-- **Dashboard**: MC Media - Handler Heartbeat Inter-Arrival vs Deadline (Handler Heartbeats row)
+- **Dashboard**: MC Media Handlers - Handler Heartbeat Inter-Arrival vs Deadline (Handler Heartbeats row)
 
 ### `mc_media_handler_applied_sequence_lag`
 - **Type**: Histogram
@@ -1089,7 +1089,7 @@ Heartbeats are logged on transitions only, never per heartbeat.
 - **Buckets**: integer counts 0, 1, 2, 3, 5, 10, 25, 100
 - **Observed**: on EVERY OWNED heartbeat, stale ones included. NOT observed while MC has never pushed to the pair (no "sent"), nor when MH reports a generation ahead of what MC sent (counted on `mc_media_handler_heartbeat_anomalies_total{reason="applied_ahead_of_sent"}`) — never a fake 0.
 - **Recorded in**: `actors/meeting.rs::handle_handler_heartbeat` via `observability/metrics.rs::observe_applied_sequence_lag`
-- **Dashboard**: MC Media - Handler Applied-Sequence Lag (Handler Heartbeats row)
+- **Dashboard**: MC Media Handlers - Handler Applied-Sequence Lag (Handler Heartbeats row)
 
 ### `mc_media_handler_connected_set_corrections_total`
 - **Type**: Counter
@@ -1098,7 +1098,7 @@ Heartbeats are logged on transitions only, never per heartbeat.
 - **Unit**: one per DISTINCT `(handler, connection_id)` a heartbeat retired, across connectivity keys and binding-ledger entries; a departed participant's leaked binding counts. Each increment is a lost `NotifyParticipantDisconnected` the heartbeat healed (closes O-11). A key is retired only if absent from the heartbeat AND bound strictly before that handler's previous accepted heartbeat; a heartbeat never adds.
 - **Usage**: Sustained non-zero = a lossy MH→MC notification path (WARNING candidate)
 - **Recorded in**: `actors/meeting.rs::reconcile_connected_set` via `observability/metrics.rs::record_connected_set_corrections`; zero-initialised
-- **Dashboard**: MC Media - Connected-Set Corrections (Handler Heartbeats row)
+- **Dashboard**: MC Media Handlers - Connected-Set Corrections (Handler Heartbeats row)
 
 ### `mc_media_handler_heartbeat_anomalies_total`
 - **Type**: Counter
@@ -1115,7 +1115,7 @@ Heartbeats are logged on transitions only, never per heartbeat.
 - **Expected zero in PRODUCTION for every reason.** In the dev (Kind) cluster the env-test `Injection` fixture produces `applied_ahead_of_sent` BY DESIGN (it registers policy for MC's meeting directly on MH, above MC's generation) — not a forgery. A contract-fault reason is counted only while MC's policy is pending (the same gate as the health decision).
 - **Usage**: WARNING candidate for OBS-ALERTS
 - **Recorded in**: `actors/meeting.rs::handle_handler_heartbeat` via `observability/metrics.rs::record_heartbeat_anomaly`
-- **Dashboard**: MC Media - Handler Heartbeat Anomalies by Reason (Handler Heartbeats row)
+- **Dashboard**: MC Media Handlers - Handler Heartbeat Anomalies by Reason (Handler Heartbeats row)
 
 ### `mc_media_handler_heartbeat_deadline_seconds`
 - **Type**: Gauge
@@ -1123,7 +1123,7 @@ Heartbeats are logged on transitions only, never per heartbeat.
 - **Labels**: `key_custody` (1)
 - **A CONFIG ECHO**, set once at boot from the same `HeartbeatTiming` that derives the interval MC sends MH (`max(1, floor(N/3))` ms) and the intake's send budget. Env-tests derive their waits from it; read beside MH's QUIC idle timeout.
 - **Recorded in**: `main.rs` via `observability/metrics.rs::set_heartbeat_deadline`
-- **Dashboard**: MC Media - Handler Heartbeat Deadline (N) (Handler Heartbeats row, stat panel)
+- **Dashboard**: MC Media Handlers - Handler Heartbeat Deadline (N) (Handler Heartbeats row, stat panel)
 
 ## Handler Detection Metrics (ADR-0039 §2, §3, §6, §8; story 4 MC-B2)
 
@@ -1131,32 +1131,33 @@ The meeting actor's pure health decision (`media_routing/handler_health.rs::asse
 
 - **Dead** (`heartbeat_timeout`): no ACCEPTED heartbeat for longer than N (`MC_MH_HEARTBEAT_TIMEOUT_MS`), the clock starting at the first confirmed `RegisterMeeting` (an unconfirmed handler is never Dead).
 - **Impaired** (`apply_lag`): the applied generation behind the generation MH OWES (what MC had sent by the PREVIOUS accepted heartbeat, so a push racing one heartbeat is not lag) for longer than L = `APPLY_LAG_FACTOR` x N (2N), or a load-dependent `STREAM_CEILING` / `EDGE_CAP` refusal. **A refusal counts only while the applied generation is behind what MH owes**; a refusal reported while MC's policy is installed concerns a policy MC never sent and is ignored, so a real capacity refusal may be declared up to one heartbeat interval (N/3) after MH refused it. MH reporting `rejected_stream_ceiling` with no MC declaration is therefore not a detection bug if MC's own policy was installed.
-- **Draining** is recorded (for MC-F's planned path) and never removes; contract-fault refusals never declare.
+- **Draining** never removes on the transition and is never a declaration: it starts a planned transfer (story 4 MC-F, below), whose removal is counted here with `trigger="planned_transfer"`; contract-fault refusals never declare.
 
 ### `mc_media_handler_declarations_total`
 - **Type**: Counter
-- **Description**: (meeting, handler) pairs declared Dead or Impaired and removed
+- **Description**: (meeting, handler) pairs declared Dead or Impaired and removed, or removed by a planned transfer's cutover
 - **Labels**:
-  - `trigger`: `heartbeat_timeout`, `apply_lag` (the shared `RemovalTrigger` vocabulary; `planned_transfer` is added by MC-F)
+  - `trigger`: `heartbeat_timeout`, `apply_lag`, `planned_transfer` (the shared `RemovalTrigger` vocabulary; `planned_transfer` since story 4 MC-F)
   - `key_custody`: single value `operator`
-- **Cardinality**: 2; zero-initialised for exactly these two
-- **Recorded**: once per declaration, at the ONE transition site, whichever path produced it (a heartbeat's arrival or the actor's deadline arm). A declared handler leaves the set in the same actor turn, so it cannot be counted twice.
-- **Recorded in**: `actors/meeting/health.rs::act_on_health` via `observability/metrics.rs::record_handler_declaration`
-- **Dashboard**: MC Media - Handler Declarations by Trigger (Handler Detection row)
+- **Cardinality**: 3; zero-initialised for all three
+- **Recorded**: `heartbeat_timeout` / `apply_lag` once per declaration, at the ONE transition site, whichever path produced it (a heartbeat's arrival or the actor's deadline arm); a declared handler leaves the set in the same actor turn, so it cannot be counted twice. `planned_transfer` once per planned CUTOVER (`completed` or `timed_out`), at the planned removal — never through the Dead/Impaired transition site, so a planned transfer never reaches the R-33 loss-metric snapshot. A transfer abandoned because its handler was declared Dead/Impaired first counts only that crash declaration.
+- **Recorded in**: `actors/meeting/health.rs::act_on_health` (crash triggers) and `actors/meeting/planned_transfer.rs::cut_over` (`planned_transfer`) via `observability/metrics.rs::record_handler_declaration`
+- **Dashboard**: MC Media Handlers - Handler Declarations by Trigger (Handler Detection row)
 
 ### `mc_media_handler_detection_seconds`
 - **Type**: Histogram
-- **Description**: Evidence start → declaration, per (meeting, handler)
+- **Description**: Evidence start → declaration, per (meeting, handler); for `planned_transfer` it is the TRANSFER duration (first DRAINING heartbeat's receipt → the planned removal)
 - **Labels**: `trigger` (as above) x `key_custody`
 - **Buckets**: DERIVED from N (`HeartbeatTiming::detection_histogram_buckets`): N/2, N, 1.25N, 1.5N, 2N, 2.5N, 3N, 4N — Dead lands just past N, lag-held Impaired just past L = 2N
 - **START POINT, per trigger** (the contract's "last accepted heartbeat → declaration", refined with observability at MC-B2 planning):
   - `heartbeat_timeout`: the last ACCEPTED heartbeat's receipt (gRPC arrival), or the first confirmed `RegisterMeeting` if none arrived — the same clock `assess` judges.
   - `apply_lag` (lag held): the lag ONSET — when the meeting started being impaired; a server-side bound on the media-dark window.
   - `apply_lag` (`STREAM_CEILING` / `EDGE_CAP`): the receipt of the QUALIFYING refusing heartbeat (the first one with MC's policy pending), so ≈ 0 from that heartbeat.
-- **Observed only at a declaration** — never for a cleared suspicion or a Draining transition.
+  - `planned_transfer` (story 4 MC-F): the receipt of the first DRAINING heartbeat ("drain notice → declaration" in the contract), to the cutover. Bounded by the drain window − margin; the N-derived buckets put a long make phase in the top buckets.
+- **Observed only at a declaration or a planned cutover** — never for a cleared suspicion or the Draining transition itself.
 - **NOT zero-initialised** (the one series of this family that is not): a histogram cannot be zero-initialised without a fake observation. It is ABSENT until the first declaration; env-test and panel baselines read an absent series as 0. The panel is a stat over `rate(...[$__range])` (the selected dashboard range), so a single rare declaration stays visible.
 - **Recorded in**: as `mc_media_handler_declarations_total` (same call)
-- **Dashboard**: MC Media - Handler Detection Time by Trigger vs N (selected range) (Handler Detection row)
+- **Dashboard**: MC Media Handlers - Handler Detection Time by Trigger vs N (selected range) (Handler Detection row)
 
 ### `mc_media_handler_suspicions_total`
 - **Type**: Counter
@@ -1167,7 +1168,7 @@ The meeting actor's pure health decision (`media_routing/handler_health.rs::asse
 - **Cardinality**: 2, bounded by `SuspicionOutcome::ALL`; zero-initialised
 - **NOT counted**: Lagging → Dead (a silence declaration, on `declarations_total{trigger="heartbeat_timeout"}`); Lagging → contract fault (the lag clock is suppressed, not cleared); a refusal-driven Healthy → Impaired (no suspicion preceded it).
 - **Recorded in**: `actors/meeting/health.rs::act_on_health` via `observability/metrics.rs::record_handler_suspicion`
-- **Dashboard**: MC Media - Lag Suspicions by Outcome (Handler Detection row)
+- **Dashboard**: MC Media Handlers - Lag Suspicions by Outcome (Handler Detection row)
 
 ### `mc_media_meetings_without_handlers`
 - **Type**: Gauge (recompute-and-set)
@@ -1177,22 +1178,22 @@ The meeting actor's pure health decision (`media_routing/handler_health.rs::asse
 - **Recompute-and-set, never inc/dec**: `HandlerlessCensus` (`actors/meeting_media.rs`, the `MeetingCensus` pattern shared with `MutedSourceCensus`), keyed by meeting id only. The controller's `check_meeting_health` walk prunes and re-sets it (LOAD-BEARING: a panicked actor's entry is erased); each membership change re-sets it for freshness; meeting teardown clears its entry; boot sets 0.
 - **Alert**: none in this release (`MCMediaMeetingsAwaitingHandler` is OBS-ALERTS', with a config-derived bound from MC-C)
 - **Recorded in**: `observability/metrics.rs::set_meetings_without_handlers`
-- **Dashboard**: MC Media - Meetings Without Handlers (Handler Detection row)
+- **Dashboard**: MC Media Handlers - Meetings Without Handlers (Handler Detection row)
 
 ### `mc_media_handler_removal_releases_total`
 - **Type**: Counter
 - **Description**: Outcome of the ONE `EndMeeting(cause)` a handler removal sends, per (meeting, handler)
 - **Labels**:
-  - `trigger`: `heartbeat_timeout`, `apply_lag` (the cause carried in `EndMeetingRequest.cause`)
+  - `trigger`: `heartbeat_timeout`, `apply_lag`, `planned_transfer` (the cause carried in `EndMeetingRequest.cause`; `planned_transfer` since story 4 MC-F: `EndMeeting(old, PLANNED_TRANSFER)` at a planned cutover, after the set without it was sent and its push worker drained)
   - `outcome`: `EndMeetingOutcome::REMOVAL` — `released`, `rejected_ownership`, `unimplemented`, `unavailable_exhausted`, `invalid_argument`, `error` (the `mc_media_end_meeting_total` vocabulary minus `superseded_by_successor`, derived and test-pinned)
   - `key_custody`: single value `operator`
-- **Cardinality**: 12; zero-initialised
+- **Cardinality**: 18 (3 x 6); zero-initialised
 - **An ADDITION to the ADR-0039 telemetry contract**, approved by observability at MC-B2. Kept OFF `mc_media_end_meeting_total` on purpose: that series and its alerts mean "an ENDED meeting was released", whereas a removal's release targets a handler MC just declared dead or impaired, so `unavailable_exhausted` is the EXPECTED outcome after a crash and would page `MCEndMeetingFailureRate` on routine MH deaths.
 - **Single attempt, never retried**, sent from a task the meeting's teardown awaits (never from the actor) after the removed handler's own push worker drained. **The retry is the handler's next heartbeat**, answered RELEASED(trigger): `mc_media_handler_heartbeats_total{outcome="released_removed"}`.
 - **No alert**: a failed removal release is expected (the MH is dead or partitioned). `rejected_ownership` here is still an MC defect worth a look.
 - **`apply_lag` includes a handler whose FIRST `RegisterMeeting` never acked** (story 4 MC-C, ADR-0039 §3: the unacked handler takes the replacement path). That removal is NOT a declaration: it moves this series but never `mc_media_handler_declarations_total` or any detection series.
 - **Recorded in**: `media_routing/teardown.rs::release_removed` via `observability/metrics.rs::record_removal_release`
-- **Dashboard**: MC Media - Removal Releases by Outcome (Handler Detection row)
+- **Dashboard**: MC Media Handlers - Removal Releases by Trigger and Outcome (Handler Detection row)
 
 ## Handler Replacement Metrics (ADR-0039 §3, §4, §8; story 4 MC-C)
 
@@ -1202,21 +1203,22 @@ After a removal leaves a meeting below its hand-off size, the meeting actor asks
 - **Type**: Counter
 - **Description**: Replacement acquisition attempts by outcome — **per acquisition attempt; a migration that retries contributes one failure outcome per failed attempt and at most one `completed`; NOT a migration count.**
 - **Counting unit** (observability ruling, MC-C Gate 1; clarifies the telemetry contract's "terminal per meeting migration"): an attempt is ONE `AcquireMediaHandler` call, or ONE owed replacement refused at the per-meeting attempt bound; each records exactly one outcome. A minimum-interval deferral is not an attempt and is never counted. **Per-migration completion is `completed / mc_media_handler_declarations_total{trigger!="planned_transfer"}`**, never `completed / sum(migrations_total)`.
+- **`trigger="planned_transfer"` (story 4 MC-F; observability ruling + lead ruling 1)**: failed acquisition attempts count per attempt exactly as above (`no_capacity`, `gc_unavailable`, `admission_refused`, `rate_limited`, and `abandoned` for a superseded/refused/unusable grant). A planned grant reaching Active records **nothing**. Each planned transfer instead records ONE terminal when it ends, decided by the coverage OBSERVED at the removal (never by whether the deadline fired): `completed` (every routable participant was MH-reported Connected to a non-empty target when the old handler was removed, deadline or not), `timed_out` (cut over at `drain_remaining_ms − MC_PLANNED_TRANSFER_MARGIN_MS` with stragglers, or shed because there was neither a survivor nor a grant — the drain-shed signal), or `abandoned` (the meeting ended, or the draining handler was declared Dead/Impaired first). **Exact invariant: `completed + timed_out == mc_media_handler_declarations_total{trigger="planned_transfer"}`**, so planned completion is `completed / declarations_total{trigger="planned_transfer"}`. `abandoned` ALSO carries the attempt-level discards above, so it is never a transfer count. After a shed-at-cutover (`timed_out`) the planned owe keeps acquiring to restore the meeting's size and a later grant records nothing more; that recovery shows on `mc_media_meetings_without_handlers`. Logs: "Planned handler transfer started" (meeting_id, old_handler_id, `drain_remaining_ms`, `margin_ms`, `cutover_in_ms`) and "Planned handler transfer ended" (meeting_id, old_handler_id, `outcome` = this label's token, `elapsed_ms`; on a cutover also `new_handler_id` (only when the target was the grant), `target=grant|survivor|none` (`none` = a shed, and only a shed), `cutover=covered|deadline` (a deadline cutover with everyone on the target is `completed`: the deadline is visible here, never on the outcome), `routable`, `stragglers`; on an abandon a bounded `reason` instead).
 - **Labels**:
   - `trigger`: `heartbeat_timeout`, `apply_lag`, `planned_transfer` (the shared `RemovalTrigger` vocabulary; `planned_transfer` is emitted from MC-F). **`apply_lag` includes a handler whose FIRST `RegisterMeeting` never acked** (hand-off or grant, ADR-0039 §3) — so a `completed{trigger="apply_lag"}` with no matching declaration is that path, not a detector fault.
   - `outcome`:
-    - `completed`: the grant's first `RegisterMeeting` was acked (Active).
+    - `completed`: the grant's first `RegisterMeeting` was acked (Active); for `planned_transfer`, the transfer cut over with everyone on the target (see above).
     - `no_capacity`: GC answered RESOURCE_EXHAUSTED.
     - `gc_unavailable`: GC did not answer (transport, UNAVAILABLE, DEADLINE_EXCEEDED, INTERNAL, UNIMPLEMENTED, UNAUTHENTICATED/PERMISSION_DENIED, other codes).
     - `admission_refused`: the grant was removed before its first `RegisterMeeting` ack. Either its registration failed after retries, OR it was declared Dead/Impaired while still Registering. It is excluded from now on, and acquisition continues. The terminal log's `reason` (`initial_registration_failed` | `declared`) and the "removed before its first RegisterMeeting ack" line's `removal_trigger` tell the two apart.
     - `rate_limited`: one owed replacement refused at the per-meeting attempt bound (`|current ∪ removed| ≥ max_exclude_handler_ids`, one stricter than GC's own `>` check). It is recorded once per owed replacement, including a later loss on an already-stopped meeting. There is no per-MC limiter.
-    - `timed_out`: planned-transfer drain deadline (MC-F); never emitted by the crash path.
+    - `timed_out`: a planned transfer cut over at its drain deadline (stragglers, or a shed); never emitted by the crash path.
     - `abandoned`: refused or unusable. Covers a grant for a superseded `handler_set_version`, FAILED_PRECONDITION, INVALID_ARGUMENT, a malformed OK (no assignment or an empty id/url/grpc endpoint), a grant naming an excluded handler, a grant the set cannot add, and the meeting ending with the attempt open.
   - `key_custody`: single value `operator`
-- **Cardinality**: 21 (3 x 7); zero-initialised as the full cross product (`planned_transfer` included, so MC-F only starts emitting)
+- **Cardinality**: 21 (3 x 7); zero-initialised as the full cross product
 - **Retried**: `no_capacity`, `gc_unavailable` (bounded, jittered backoff: `mc_media_handler_replacement_*`), and a superseded or unusable grant. **Never retried**: FAILED_PRECONDITION, INVALID_ARGUMENT, a malformed OK (ERROR log with code and missing field).
-- **Recorded in**: `actors/meeting/replacement.rs` via `observability/metrics.rs::record_migration`
-- **Dashboard**: MC Media - Handler Migration Attempts by Trigger and Outcome (Handler Replacement row)
+- **Recorded in**: `actors/meeting/replacement.rs` (attempts) and `actors/meeting/planned_transfer.rs::end_transfer` (planned terminals) via `observability/metrics.rs::record_migration`
+- **Dashboard**: MC Media Handlers - Handler Migration Attempts by Trigger and Outcome (Handler Replacement row)
 
 ### `mc_media_handler_migration_duration_seconds`
 - **Type**: Histogram
@@ -1224,14 +1226,15 @@ After a removal leaves a meeting below its hand-off size, the meeting actor asks
 - **Labels**:
   - `trigger`: as above
   - `phase`:
-    - `replacement`: the removal that owed it → GC's grant, including every retry.
+    - `replacement`: the removal that owed it → GC's grant, including every retry (`planned_transfer`: the first DRAINING heartbeat's receipt → the grant).
     - `registration`: the grant → its first `RegisterMeeting` ack.
     - `reconnect`: Active → every participant admitted at that moment, and still present, is MH-reported connected to it. Joiners are ignored, leavers stop being waited on, and a later migration or meeting end clears it.
+    - A planned transfer to SURVIVORS (no grant) observes no phase; a planned grant observes `replacement` and `registration`, and `reconnect` only if it closes before the old handler's removal.
   - `key_custody`
 - **Buckets**: DERIVED from config (`ReplacementTiming::duration_histogram_buckets`). The values are the connect settle window (/2, x1, x2), the backoff ladder's cumulative waits, the initial-registration bound and the retry budget. The longest legitimate replacement phase lands in a real bucket, never `+Inf`.
 - **Zero-initialised**: every trigger x phase handle is registered at boot (count 0)
 - **Recorded in**: `actors/meeting/replacement.rs` via `observability/metrics.rs::record_migration_phase`
-- **Dashboard**: MC Media - Handler Migration Phase Duration p95 by Phase (Handler Replacement row)
+- **Dashboard**: MC Media Handlers - Handler Migration Phase Duration p95 by Phase (Handler Replacement row)
 
 ### `mc_media_handler_replacement_retry_budget_seconds`
 - **Type**: Gauge (config echo)
@@ -1244,21 +1247,29 @@ After a removal leaves a meeting below its hand-off size, the meeting actor asks
 - **Labels**: `key_custody` (1)
 - **Usage**: the awaiting-handler page bound (`MCMediaMeetingsAwaitingHandler`, OBS-ALERTS) and the env-test replacement ceilings derive from it — never a literal. Editing either key moves it.
 - **Recorded in**: `webtransport/server.rs::WebTransportServer::new` via `observability/metrics.rs::set_replacement_timing` (the SAME `ReplacementTiming` every meeting's scheduler reads)
-- **Dashboard**: MC Media - Replacement Pacing and Retry Budget (Handler Replacement row)
+- **Dashboard**: MC Media Handlers - Replacement Pacing and Retry Budget (Handler Replacement row)
 
+
+### `mc_media_handler_planned_transfer_margin_seconds`
+- **Type**: Gauge (config echo)
+- **Description**: `MC_PLANNED_TRANSFER_MARGIN_MS` / 1000 — how far ahead of a draining handler's deadline MC cuts a planned transfer over (cutover = the draining heartbeat's receipt + `drain_remaining_ms` − this, clamped to `mc_media_handler_replacement_retry_budget_seconds`; story 4 MC-F, ADR-0039 §4)
+- **Labels**: `key_custody` (1)
+- **Usage**: read beside MH's `mh_drain_window_seconds` (MH Media): the margin must stay below the drain window minus one heartbeat interval or every planned transfer degrades to an immediate cutover (`timed_out`); env-test 02 (`test_planned_transfer_margin_fits_inside_the_mh_drain_window`) guards it. Env-test cutover ceilings derive from this gauge.
+- **Recorded in**: `webtransport/server.rs::WebTransportServer::new` via `observability/metrics.rs::set_planned_transfer_margin` (the SAME `PlannedTransferTiming` every meeting's cutover reads)
+- **Dashboard**: MC Media Handlers - Planned Transfer Margin (Handler Replacement row)
 ### `mc_media_handler_replacement_min_interval_seconds`
 - **Type**: Gauge (config echo)
 - **Description**: `MC_MH_REPLACEMENT_MIN_INTERVAL_MS` / 1000: the per-meeting minimum interval between replacement attempts and the backoff ladder's first step
 - **Labels**: `key_custody` (1)
 - **Recorded in**: as the retry budget (same call)
-- **Dashboard**: MC Media - Replacement Pacing and Retry Budget (Handler Replacement row)
+- **Dashboard**: MC Media Handlers - Replacement Pacing and Retry Budget (Handler Replacement row)
 
 ### `mc_media_handler_replacement_backoff_max_seconds`
 - **Type**: Gauge (config echo)
 - **Description**: `MC_MH_REPLACEMENT_BACKOFF_MAX_MS` / 1000: the backoff ladder's cap
 - **Labels**: `key_custody` (1)
 - **Recorded in**: as the retry budget (same call)
-- **Dashboard**: MC Media - Replacement Pacing and Retry Budget (Handler Replacement row)
+- **Dashboard**: MC Media Handlers - Replacement Pacing and Retry Budget (Handler Replacement row)
 
 ### `mc_media_receive_slot_cap`
 - **Type**: Gauge
@@ -1328,7 +1339,7 @@ key are never logged, labelled or traced.
 - **Counted at SUCCESSFUL ENQUEUE** onto the participant's outbound stream (`join`: when the `JoinResponse` write succeeds). A full channel is `mc_participant_outbound_messages_dropped_total{payload_kind="media_handler_set"}` instead, so pushes + drops = attempts.
 - **Usage**: `token_refresh` tracks connected participants / (TTL/3); its absence while participants are connected means the refresh is broken (MH's `mh_jwt_validations_total{token_type="media_dial",failure_reason="expired"}` is the consumer-side signal). Sustained `failed_report` means clients are being DECLINED by handlers (dead tokens). Two different limiters, two different records: an update over the connection's status-forward limiter is NOT forwarded and is counted on `mc_participant_mh_status_dropped_total{reason="rate_limited"}`; a FAILED report that IS forwarded but refused by the per-session re-push limiter (`FAILED_REPUSH_BURST`) is recorded with no re-push, has no metric, and is debug-logged once per session. Statuses for refs outside the set are ignored, with no metric. Signing cost rides the meeting actor's turn: a handler `change` mints participants x handlers tokens in one turn; refreshes and FAILED re-pushes go through the per-turn bounded flush (`SLOT_VIEW_FLUSH_BATCH` participants per turn). The actor's mailbox and message-latency series are the turn-cost signal.
 - **Recorded in**: `actors/participant.rs::handle_handler_set` (`change`, `failed_report`, `token_refresh`, reconnect `join`) and `webtransport/connection.rs` after the `JoinResponse` write (`join`), via `observability/metrics.rs::record_handler_set_push`
-- **Dashboard**: MC Media - Handler Set Pushes by Reason (Handler Set & Dial Credential row)
+- **Dashboard**: MC Media Handlers - Handler Set Pushes by Reason (Handler Set & Dial Credential row)
 
 ### `mc_media_dial_token_ttl_seconds`
 - **Type**: Gauge
@@ -1336,7 +1347,7 @@ key are never logged, labelled or traced.
 - **Labels**: `key_custody` (1)
 - **A CONFIG ECHO**, set once at boot from the same `MediaDialTiming` the mint (`exp = iat + TTL`) and the refresh schedule read. Range [60, 900]; env-tests read the live value from here.
 - **Recorded in**: `webtransport/server.rs` (`WebTransportServer::new`) via `observability/metrics.rs::set_media_dial_token_timing`
-- **Dashboard**: MC Media - Dial Credential TTL / Refresh Interval (Handler Set & Dial Credential row, stat panel)
+- **Dashboard**: MC Media Handlers - Dial Credential TTL / Refresh Interval (Handler Set & Dial Credential row, stat panel)
 
 ### `mc_media_dial_token_refresh_interval_seconds`
 - **Type**: Gauge
@@ -1344,7 +1355,7 @@ key are never logged, labelled or traced.
 - **Labels**: `key_custody` (1)
 - **The one derivation** (`MediaDialTiming::refresh_interval`), shared by the scheduler. Each participant's actual gap is jittered EARLIER by up to a tenth of this (seeded per meeting), never later, so the longest gap between two pushes is TTL/3 < TTL: a held token expires only after about three consecutive dropped pushes.
 - **Recorded in**: `webtransport/server.rs` via `observability/metrics.rs::set_media_dial_token_timing`
-- **Dashboard**: MC Media - Dial Credential TTL / Refresh Interval (Handler Set & Dial Credential row, stat panel)
+- **Dashboard**: MC Media Handlers - Dial Credential TTL / Refresh Interval (Handler Set & Dial Credential row, stat panel)
 
 ---
 

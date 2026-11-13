@@ -341,6 +341,15 @@ spec:
             configMapKeyRef:
               name: mc-service-config
               key: MC_MH_REPLACEMENT_BACKOFF_MAX_MS
+        # ---- Planned-transfer cutover margin (ADR-0039 §4; story 4 MC-F) ----
+        # Required by MC with no Rust default, deliberately NOT `optional:`:
+        # missing or out of range refuses boot. Keep in lockstep with the other
+        # mc-N-deployment.yaml. See the key's comment in config.env.
+        - name: MC_PLANNED_TRANSFER_MARGIN_MS
+          valueFrom:
+            configMapKeyRef:
+              name: mc-service-config
+              key: MC_PLANNED_TRANSFER_MARGIN_MS
         # ---- Capacity caps (R-37; story 4 MC-A) ----
         # Required by MC with no Rust default, deliberately NOT `optional:`:
         # missing, unparseable or 0 refuses boot. Keep in lockstep with the

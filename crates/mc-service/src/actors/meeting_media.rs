@@ -166,6 +166,9 @@ pub struct MediaRoutingDeps {
     /// The replacement pacing (`MC_MH_REPLACEMENT_MIN_INTERVAL_MS`,
     /// `MC_MH_REPLACEMENT_BACKOFF_MAX_MS`; story 4 MC-C).
     pub replacement: crate::media_routing::ReplacementTiming,
+    /// The planned-transfer cutover margin (`MC_PLANNED_TRANSFER_MARGIN_MS`;
+    /// story 4 MC-F).
+    pub planned_transfer: crate::media_routing::PlannedTransferTiming,
 }
 
 impl std::fmt::Debug for MediaRoutingDeps {
@@ -423,6 +426,7 @@ pub(crate) fn test_join_media() -> JoinMedia {
             media_dial: crate::media_dial::MediaDialTiming::from_ttl_seconds(300),
             acquirer: Arc::new(NoCapacityGc),
             replacement: crate::media_routing::ReplacementTiming::from_config_ms(1_000, 30_000),
+            planned_transfer: crate::media_routing::PlannedTransferTiming::from_margin_ms(5_000),
         }),
         declared: crate::media_kind::ClientMediaStates::live(PublishSet::of(&[
             MediaKindLabel::Audio,
@@ -479,6 +483,23 @@ pub(super) struct HealthStep {
     pub next: HandlerHealth,
     /// What it was judged on (bounded scalars for the transition log).
     pub observations: Observations,
+}
+
+/// How many routable participants a planned transfer's target covers
+/// ([`MeetingMedia::coverage`]; story 4 MC-F).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Coverage {
+    /// Participants holding a live connection key on any member.
+    pub routable: usize,
+    /// Routable participants on none of the targets.
+    pub stragglers: usize,
+}
+
+impl Coverage {
+    /// Every routable participant is on a target.
+    pub(crate) fn is_complete(self) -> bool {
+        self.stragglers == 0
+    }
 }
 
 /// What [`MeetingMedia::remove_handler`] took out of the meeting.
@@ -661,9 +682,68 @@ impl MeetingMedia {
     /// Whether `participant_id` has left, or holds a live connection key on
     /// `handler` (its reconnect wait is over either way).
     pub(super) fn reconnected_or_gone(&self, handler: &HandlerId, participant_id: &str) -> bool {
-        self.views
-            .get(participant_id)
-            .is_none_or(|v| v.connectivity.keys_on(handler).next().is_some())
+        self.on_any_or_gone(participant_id, std::slice::from_ref(handler))
+    }
+
+    /// THE "is this participant on these handlers" read over the ONE
+    /// connectivity home: whether `participant_id` has left, or holds a live
+    /// MH-reported connection key on at least one of `handlers`. The reconnect
+    /// phase (one handler) and the planned-transfer coverage (a target set)
+    /// both read it.
+    pub(super) fn on_any_or_gone(&self, participant_id: &str, handlers: &[HandlerId]) -> bool {
+        self.views.get(participant_id).is_none_or(|v| {
+            handlers
+                .iter()
+                .any(|h| v.connectivity.keys_on(h).next().is_some())
+        })
+    }
+
+    /// Whether member `id` has reported DRAINING — read ONLY through
+    /// [`crate::media_routing::HandlerHealth::is_draining`] (one reader).
+    fn is_draining(&self, id: &HandlerId) -> bool {
+        self.health.get(id).is_some_and(HandlerHealth::is_draining)
+    }
+
+    /// THE non-draining filter's Active half: the members a planned transfer
+    /// may target (Active, not DRAINING; removed members are not members).
+    /// Registering members are deliberately NOT here — no client holds a token
+    /// for them, so nobody can be on them (register before token).
+    pub(super) fn non_draining_active(&self) -> Vec<HandlerId> {
+        self.handlers
+            .ids()
+            .filter(|id| self.handlers.active_endpoint(id).is_some() && !self.is_draining(id))
+            .cloned()
+            .collect()
+    }
+
+    /// THE non-draining filter's count for the replacement target accounting
+    /// (`ReplacementState::on_removal`): every member that is not DRAINING,
+    /// Registering grants INCLUDED (a grant on its way counts toward the
+    /// target, unlike for eligibility above — deliberate). Every removal path
+    /// passes this.
+    pub(super) fn non_draining_member_count(&self) -> usize {
+        self.handlers
+            .ids()
+            .filter(|id| !self.is_draining(id))
+            .count()
+    }
+
+    /// Planned-transfer coverage against `targets`. A routable participant
+    /// holds at least one live connection key on any member (one that has not
+    /// connected media anywhere is not waited on); a straggler is routable and
+    /// on none of `targets`.
+    pub(super) fn coverage(&self, targets: &[HandlerId]) -> Coverage {
+        let mut coverage = Coverage::default();
+        for (participant_id, view) in &self.views {
+            if view.connectivity.observed().next().is_none() {
+                continue;
+            }
+            coverage.routable += 1;
+            if !self.on_any_or_gone(participant_id, targets) {
+                coverage.stragglers += 1;
+            }
+        }
+        coverage
     }
 
     /// The meeting's handler set (internal view).

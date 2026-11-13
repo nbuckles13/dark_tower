@@ -12,7 +12,8 @@
 //!   `MC_MAX_PARTICIPANTS`, REQUIRED since R-37, and the story 4 MC-B1
 //!   heartbeat timeout `MC_MH_HEARTBEAT_TIMEOUT_MS`, and the story 4 MC-C
 //!   replacement pacing `MC_MH_REPLACEMENT_MIN_INTERVAL_MS` /
-//!   `MC_MH_REPLACEMENT_BACKOFF_MAX_MS`), `media-codec-profile` for
+//!   `MC_MH_REPLACEMENT_BACKOFF_MAX_MS`, and the story 4 MC-F planned-transfer
+//!   margin `MC_PLANNED_TRANSFER_MARGIN_MS`), `media-codec-profile` for
 //!   the eight shared encoding keys.
 //!   Per workload, never union: a key on mc-0 missing from mc-1 crash-loops
 //!   mc-1 alone, because MC-A reads every one as REQUIRED.
@@ -33,7 +34,12 @@
 //!   the live cluster rather than by inspection: MC directs exactly the
 //!   encoding MH costs against.
 //!
-//! Static reads of converged objects: no polling, no sleeps. Layer 7 waits for
+//! - **Planned-transfer margin vs MH drain window** (story 4 MC-F, O9): MC's
+//!   published margin < the min published MH drain window - one heartbeat
+//!   interval (`test_planned_transfer_margin_fits_inside_the_mh_drain_window`).
+//!
+//! Static reads of converged objects: no polling, no sleeps (the O9 test only
+//! waits, bounded, for its gauges to be scraped). Layer 7 waits for
 //! every rollout, and `configmap_name_for` fails loudly on one in flight.
 //!
 //! # Honest limitation
@@ -133,6 +139,13 @@ const WIRED_KEYS: &[(&str, &str, ValueShape)] = &[
     ),
     (
         "MC_MH_REPLACEMENT_BACKOFF_MAX_MS",
+        MC_CONFIGMAP,
+        ValueShape::PositiveInteger,
+    ),
+    // Planned-transfer cutover margin (ADR-0039 §4, story 4 MC-F): REQUIRED,
+    // refused at boot outside [1000, 30000] (bounds stay with MC's reader).
+    (
+        "MC_PLANNED_TRANSFER_MARGIN_MS",
         MC_CONFIGMAP,
         ValueShape::PositiveInteger,
     ),
@@ -319,6 +332,13 @@ const CONFIG_GAUGES: &[(&str, &str, Conversion)] = &[
         "mc_media_video_keyframe_min_interval_seconds",
         Conversion::MsToSeconds,
     ),
+    // Story 4 MC-F: the planned-transfer cutover margin the meeting actors
+    // subtract (the runbook's config-echo checklist row names this test).
+    (
+        "MC_PLANNED_TRANSFER_MARGIN_MS",
+        "mc_media_handler_planned_transfer_margin_seconds",
+        Conversion::MsToSeconds,
+    ),
 ];
 
 /// What the RUNNING MC process loaded equals its OWN ConfigMap generation, per
@@ -384,4 +404,67 @@ async fn test_config_reported_by_running_mc_matches_configmap() {
             }
         }
     }
+}
+
+/// MC-F O9 drift guard (operations): MC's planned-transfer margin leaves MC a
+/// make phase inside MH's drain window, `margin < min(MH drain window) - one
+/// heartbeat interval`. Both sides are the RUNNING processes' published
+/// values, never literals: MC's `mc_media_handler_planned_transfer_margin_seconds`
+/// and heartbeat deadline gauges (interval = deadline / 3), and MH's
+/// `mh_drain_window_seconds` on EVERY serving MH pod (pinned by pod IP;
+/// terminating pods are excluded and counted). An absent series, an empty MH
+/// pool and divergent per-pod windows are their own failure reasons
+/// (`planned_margin_drift_verdict`), never a pass. The runbook's
+/// `MC_PLANNED_TRANSFER_MARGIN_MS` row names this test as its guard.
+#[tokio::test]
+async fn test_planned_transfer_margin_fits_inside_the_mh_drain_window() {
+    use env_tests::cluster::ClusterConnection;
+    use env_tests::fixtures::kube::{blocking, partition_serving, pods_json, MH_SELECTOR};
+    use env_tests::fixtures::metrics::{
+        heartbeat_interval_of, instance_for_pod_ip, mc_heartbeat_deadline,
+        mc_planned_transfer_margin, planned_margin_drift_verdict, MH_DRAIN_WINDOW_SERIES,
+    };
+    use env_tests::fixtures::PrometheusClient;
+
+    let cluster = ClusterConnection::new()
+        .await
+        .expect("Failed to connect to cluster - ensure port-forwards are running");
+    let prom = PrometheusClient::new(&cluster.prometheus_base_url);
+
+    // MC side (each read panics as a PRECONDITION when absent or not positive).
+    let margin = mc_planned_transfer_margin(&prom).await;
+    let interval = heartbeat_interval_of(mc_heartbeat_deadline(&prom).await);
+
+    // MH side: the live pool, by label; terminating pods excluded and counted.
+    let doc = blocking(|| pods_json(MH_SELECTOR)).await;
+    let pods = partition_serving(&doc, MH_SELECTOR)
+        .unwrap_or_else(|e| panic!("PRECONDITION (mh-pod-list): {e}"));
+    assert!(
+        pods.not_ready.is_empty(),
+        "PRECONDITION (mh-pods-not-ready): MH pod(s) {:?} are neither serving nor terminating; \
+         Layer 7 waits for every rollout, so this is an environment fault. {REDEPLOY_HINT}.",
+        pods.not_ready
+    );
+    let promql = format!("max by (instance) ({MH_DRAIN_WINDOW_SERIES})");
+    let deadline = std::time::Instant::now() + GAUGE_PRESENT_BOUND;
+    let windows = loop {
+        let map = prom.instance_counter_map(&promql).await;
+        let windows: Vec<(String, Option<f64>)> = pods
+            .serving
+            .iter()
+            .map(|p| {
+                (
+                    format!("{} ({})", p.display_id(), p.ip),
+                    instance_for_pod_ip(&map, &p.ip).map(|(_, v)| v),
+                )
+            })
+            .collect();
+        // Wait only for presence (scrape lag); the verdict decides the rest.
+        if windows.iter().all(|(_, v)| v.is_some()) || std::time::Instant::now() >= deadline {
+            break windows;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    };
+    planned_margin_drift_verdict(margin, interval, &windows, pods.terminating.len())
+        .unwrap_or_else(|e| panic!("{e}"));
 }

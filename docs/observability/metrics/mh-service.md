@@ -305,12 +305,21 @@ MH sends one `MeetingHeartbeat` per held meeting per MC-declared interval (`Regi
 
 ## Planned Drain Metrics (story 4 MH-3; ADR-0039 §7, §8)
 
-**Best-effort, all three.** A draining MH exits as soon as it holds nothing or at its deadline, and
+**Best-effort, all three drain-time series** (`mh_drain_window_seconds`, a boot-time config echo, is the exception). A draining MH exits as soon as it holds nothing or at its deadline, and
 does not linger for a scrape, so exit-time values may never be scraped. The **authoritative** drain
 outcome is MC's `mc_media_handler_migrations_total{trigger="planned_transfer"}` (`outcome="timed_out"`
 is the shed-on-rollout alert source), and MH's final log line (target `mh.drain`, "Drain finished":
 `exit_reason=empty|deadline`, `meetings_shed`, `drain_duration_seconds`) is the per-pod evidence. Not
 media-path series: no labels, no `key_custody`.
+
+### `mh_drain_window_seconds`
+- **Type**: Gauge (config echo, set once at boot)
+- **Description**: The configured planned-drain window: `MH_TERMINATION_GRACE_SECONDS − 5 s` (`SHUTDOWN_MARGIN_SECONDS`), published from the SAME `Config::drain_window` that `drain::run` waits on (derived once by `config::drain_window_for`, never recomputed). The drain deadline is SIGTERM + this; MC cuts a planned transfer over at that deadline − `MC_PLANNED_TRANSFER_MARGIN_MS` (story 4 MC-F). Unlike the other `mh_drain_*` series it is NOT best-effort: it is set at boot and present for the pod's whole life, drained or not.
+- **Labels**: none
+- **Cardinality**: 1
+- **Usage**: env-test 02 (`test_planned_transfer_margin_fits_inside_the_mh_drain_window`) asserts MC's `mc_media_handler_planned_transfer_margin_seconds` < min over serving pods of this − one heartbeat interval, so a grace lowered (or a margin raised) into the silent-degrade zone fails loudly; operators read each pod's real window here instead of the Rust source.
+- **Recorded in**: `observability/metrics.rs::publish_drain_window` (`main.rs`, at boot)
+- **Dashboard**: MH Media - Planned Drain Window
 
 ### `mh_drain_meetings_remaining`
 - **Type**: Gauge

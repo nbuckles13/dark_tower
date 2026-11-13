@@ -60,7 +60,16 @@ impl MeetingActor {
         if accepted && step.next.is_lagging() {
             self.media.republish(member);
         }
+        let draining = accepted && step.next.is_draining();
         self.act_on_health(step).await;
+        // Story 4 MC-F: an ACCEPTED heartbeat (never a stale one) from a
+        // current member (the caller passed `heartbeat_member`) that reports
+        // DRAINING starts its planned transfer, or only tightens the
+        // deadline of the one already open. `is_draining` is false on a
+        // declaration, so a member just removed above never starts one.
+        if draining {
+            self.start_planned_transfer(member);
+        }
     }
 
     /// Act on ONE assessment: log a transition once, count a suspicion
@@ -183,6 +192,10 @@ impl MeetingActor {
         }
         self.flush_views().await;
         let released = self.mh_bindings.release_handler(wire_handler_id);
+        // An open planned transfer OF this handler (removed by any other
+        // path) ends `abandoned`; none keeps it as its grant. A planned
+        // cutover took its own entry out first, so it is not seen here.
+        self.planned_after_removal(&HandlerId::new(wire_handler_id));
         self.media
             .spawn_removal_release(removed.endpoint, trigger, removed.pusher);
         let survivors = self.media.handlers().len();
@@ -203,6 +216,8 @@ impl MeetingActor {
     }
 }
 
-fn duration_ms(d: std::time::Duration) -> u64 {
+/// Milliseconds of `d`, saturating (log fields; shared with the planned
+/// transfer driver).
+pub(super) fn duration_ms(d: std::time::Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }

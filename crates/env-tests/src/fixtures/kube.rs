@@ -462,6 +462,17 @@ pub(crate) fn join_blocking<T>(joined: Result<T, tokio::task::JoinError>) -> T {
     }
 }
 
+/// Run a blocking fixture call (kubectl, mh.sh) on the blocking pool, never
+/// on the test's runtime thread, and return its value through
+/// [`join_blocking`]: its panic is re-raised AS ITSELF, so a PRECONDITION
+/// text survives. The ONE home of that shape for env-test bodies.
+///
+/// # Panics
+/// As [`join_blocking`].
+pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    join_blocking(tokio::task::spawn_blocking(f).await)
+}
+
 /// PURE core of [`configmap_name_for`]: from a `kubectl get pods -o json`
 /// document, the ONE generation of `base` the live (non-terminating) pods
 /// reference.

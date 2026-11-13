@@ -94,6 +94,7 @@ impl WebTransportServer {
         media_dial: crate::media_dial::MediaDialTiming,
         acquirer: Arc<dyn crate::grpc::gc_client::HandlerAcquirer>,
         replacement: crate::media_routing::ReplacementTiming,
+        planned_transfer: crate::media_routing::PlannedTransferTiming,
         max_connections: usize,
         quic_max_idle_timeout: Duration,
         cancel_token: CancellationToken,
@@ -131,6 +132,9 @@ impl WebTransportServer {
         // retry budget the awaiting-handler page reads) is the very timing
         // every meeting's scheduler uses (story 4 MC-C).
         metrics::set_replacement_timing(replacement);
+        // Same discipline: the published planned-transfer margin is the very
+        // margin every meeting's cutover deadline subtracts (story 4 MC-F).
+        metrics::set_planned_transfer_margin(planned_transfer);
 
         Self {
             bind_address,
@@ -152,6 +156,7 @@ impl WebTransportServer {
                 media_dial,
                 acquirer,
                 replacement,
+                planned_transfer,
             }),
             client_media_config,
             max_connections,

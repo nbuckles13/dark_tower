@@ -252,6 +252,29 @@ dashboard's KEK Lifecycle row.
 not taking effect (including "camera light still on after a server mute": Send Directive Withdrawals
 `reason="server_muted"` is MC's side of it), key rotation stalls.
 
+### MC Media Handlers
+
+**File**: `infra/grafana/dashboards/mc-media-handlers.json`
+**UID**: `mc-media-handlers`
+**Tags**: `mc-service`, `media`
+**ConfigMap**: `grafana-dashboards-mc-media-handlers` (its own)
+
+**Purpose**: MC's side of the story-4 media-HANDLER lifecycle (ADR-0039): per-(meeting, handler)
+heartbeats, detection and removal, the handler set and dial credential, crash replacement via GC
+and planned transfer off a draining handler. Linked both ways with **MC Media Path**.
+
+**Rows**: Handler Heartbeats (ADR-0039 §1, §2, §6), Handler Detection (ADR-0039 §2, §6), Handler
+Set & Dial Credential (ADR-0039 §5), Handler Replacement (ADR-0039 §3, §4; planned transfer split
+by `trigger`, and the Planned Transfer Margin config echo, read beside MH Media's Planned Drain
+Window).
+
+**Why it is a separate file.** Split out of `mc-media.json` at story 4 MC-F, when that board's
+ConfigMap reached `dt-guard kustomize`'s 80% annotation headroom (the same split mc-media itself got
+from mc-overview). Story-4 handler panels land HERE; the ADR-0036 media path stays on MC Media.
+
+**When to Use**: a handler death or impairment, a migration that did not complete, a meeting
+awaiting a handler, a drain that shed meetings (`mc_media_handler_migrations_total{trigger="planned_transfer", outcome="timed_out"}`).
+
 ---
 
 ## Media Handler Dashboards
@@ -492,11 +515,12 @@ Dashboards are **content-addressed ConfigMaps mounted into the Grafana pod** (AD
 
 **How it works:**
 1. `infra/grafana/kustomization.yaml` holds a **static** `configMapGenerator` list
-   (`grafana-dashboards-ac`, `-gc`, `-mc`, `-mc-media`, `-mh`, `-client`, `-errors`).
+   (`grafana-dashboards-ac`, `-gc`, `-mc`, `-mc-media`, `-mc-media-handlers`, `-mh`, `-mh-media`, `-client`, `-errors`).
    Nothing is auto-discovered. **Grouping is size-bounded, not prefix-bound**: dashboards
    are grouped by service prefix only while the group's ConfigMap fits the annotation cap
    (see the comment above the groups in `kustomization.yaml`); `-mc-media` is MC's media
-   path split out of `-mc` for that reason.
+   path split out of `-mc` for that reason, and `-mc-media-handlers` its story-4 handler rows
+   split out of `-mc-media` (story 4 MC-F).
 2. Each generated ConfigMap carries a **content hash in its name**. Kustomize rewrites the
    Grafana Deployment's references, so editing any dashboard changes the pod template:
    **applying the environment root rolls Grafana, with no manual restart step.**

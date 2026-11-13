@@ -573,6 +573,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // through the SAME client (and channel timeouts) as registration.
         Arc::clone(&acquirer),
         config.mh_replacement(),
+        // ADR-0039 §4 planned-transfer cutover margin (story 4 MC-F).
+        config.planned_transfer(),
         config.max_participants as usize,
         std::time::Duration::from_secs(config.quic_max_idle_timeout_seconds),
         shutdown_token.child_token(),

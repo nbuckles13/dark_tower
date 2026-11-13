@@ -701,6 +701,59 @@ pub fn reclaim_command(path: &std::path::Path, cluster: &str, owner: &str) -> St
     command_line(path, cluster, &teardown_args(owner))
 }
 
+/// The argv of the leg-B baseline drain (story 4 MC-F; contract §8 MC-F
+/// amendment): `drain <k> --owner baseline --no-wait`. NEVER `--force`: the
+/// matching owner clears foreign-owner, and `last-serving-mh` stays live, so
+/// the leg can never remove the last serving MH. The ONE spelling.
+#[must_use]
+pub fn baseline_drain_args(slot: u32) -> Vec<String> {
+    vec![
+        "drain".to_string(),
+        slot.to_string(),
+        "--owner".to_string(),
+        BASELINE_OWNER.to_string(),
+        "--no-wait".to_string(),
+    ]
+}
+
+/// The argv of one baseline top-up, the same verb deploy.sh's
+/// `converge_mh_pool` runs: `up --owner baseline`. The ONE spelling, both
+/// executed ([`restore_baseline_at`]) and printed
+/// ([`baseline_restore_command`]).
+#[must_use]
+pub fn baseline_restore_args() -> Vec<String> {
+    ["up", "--owner", BASELINE_OWNER]
+        .map(str::to_string)
+        .to_vec()
+}
+
+/// PURE: the paste-ready baseline restore command (run it once per missing
+/// baseline MH, or re-run deploy.sh, which tops the pool back up to B).
+#[must_use]
+pub fn baseline_restore_command(path: &std::path::Path, cluster: &str) -> String {
+    command_line(path, cluster, &baseline_restore_args())
+}
+
+/// PURE: how many baseline MHs the pool is SHORT of B. Counted from the
+/// pool's state, never from a "did I drain" flag: a leg that failed before
+/// its drain, or whose drain was refused, has deficit 0, so a restore can
+/// never add a B+1-th baseline MH. `serving` and `starting` count (a starting
+/// one is already on its way); `draining`/`terminating` do not (they are
+/// leaving).
+#[must_use]
+pub fn baseline_deficit(snapshot: &PoolSnapshot) -> u32 {
+    let present = snapshot
+        .slots
+        .iter()
+        .filter(|s| {
+            s.owner.as_deref() == Some(BASELINE_OWNER)
+                && matches!(s.state, SlotState::Serving | SlotState::Starting)
+        })
+        .count();
+    let present = u32::try_from(present).unwrap_or(u32::MAX);
+    snapshot.baseline.saturating_sub(present)
+}
+
 /// PURE: the manual `mh.sh signal` command for `slot`.
 #[must_use]
 pub fn signal_command(
@@ -886,6 +939,7 @@ pub fn baseline_verdict(
     snapshot: &PoolSnapshot,
     run: &str,
     reclaim: impl Fn(&str) -> String,
+    restore: &str,
 ) -> Result<(), String> {
     let mut problems = Vec::new();
     let mut foreign_owners = std::collections::BTreeSet::new();
@@ -909,6 +963,7 @@ pub fn baseline_verdict(
         .iter()
         .filter(|s| s.state == SlotState::Serving && s.owner.as_deref() == Some(BASELINE_OWNER))
         .count();
+    let short = serving < snapshot.baseline as usize;
     if serving != snapshot.baseline as usize {
         problems.push(format!(
             "baseline-owned serving MHs: {serving}, B = {} (mh.sh list `baseline`)",
@@ -922,12 +977,20 @@ pub fn baseline_verdict(
     Err(format!(
         "{FOREIGN_MH_ACTIVITY}: the MH pool is not {{baseline B, this run {run}}}: {}. Layer 7 \
          supports one suite per cluster; a concurrent run, a leaked earlier run or a manual MH \
-         is mutating the pool. Inspect `$DT_MH_SH list`{}",
+         is mutating the pool. Inspect `$DT_MH_SH list`{}{}",
         problems.join("; "),
         if hints.is_empty() {
             String::new()
         } else {
             format!("; reclaim a leaked run with: {}", hints.join(" ; "))
+        },
+        if short {
+            format!(
+                "; the baseline is SHORT: restore with `{restore}` once per missing baseline MH, \
+                 or re-run infra/kind/scripts/deploy.sh"
+            )
+        } else {
+            String::new()
         }
     ))
 }
@@ -981,6 +1044,22 @@ pub fn slot_for_address<'a>(
     }
 }
 
+/// The live `spec.terminationGracePeriodSeconds` of the MH pod in `slot`
+/// (selected by [`SLOT_LABEL`](crate::fixtures::mh_address::SLOT_LABEL)),
+/// read from the API server, never retyped: MH's drain window is this grace
+/// minus its own shutdown margin (ADR-0039 §7), so it is an UPPER bound on
+/// every drain-derived event. Read it BEFORE draining. Blocking.
+///
+/// # Panics
+/// PRECONDITION: no pod in that slot, or the field is absent.
+#[must_use]
+pub fn slot_termination_grace(slot: u32) -> std::time::Duration {
+    let selector = format!("{}={slot}", crate::fixtures::mh_address::SLOT_LABEL);
+    let pods = crate::fixtures::kube::pods_json(&selector);
+    crate::fixtures::kube::max_termination_grace(&pods, &selector)
+        .unwrap_or_else(|e| panic!("PRECONDITION (mh-slot-grace): {e}"))
+}
+
 /// The run-scoped MH pool handle (contract §6, §8): every MH this run creates
 /// carries `dark-tower.io/mh-owner=<run token>`, so teardown is owner-scoped
 /// (`drain --owner <token> --all`) and needs no slot numbers. That matters
@@ -996,6 +1075,13 @@ pub struct MhPool {
     cluster: String,
     token: String,
     torn_down: bool,
+    /// This handle runs a leg that may drain a BASELINE MH
+    /// ([`MhPool::run_baseline_drain_leg`]); only then is
+    /// [`MhPool::drain_baseline_no_wait`] allowed.
+    baseline_drain_leg: bool,
+    /// Set once [`MhPool::restore_baseline`] ran clean. Until then the Drop
+    /// backstop of a baseline-drain leg also prints the restore command.
+    baseline_restored: bool,
 }
 
 impl MhPool {
@@ -1025,6 +1111,8 @@ impl MhPool {
             cluster,
             token,
             torn_down: false,
+            baseline_drain_leg: false,
+            baseline_restored: false,
         }
     }
 
@@ -1118,7 +1206,9 @@ impl MhPool {
     }
 
     /// Pool-mutating. THE leg scaffold (40's legs, 44): a run-owned pool with
-    /// [`MhPool::assert_baseline`] before, `body` in its own task (so its
+    /// [`MhPool::assert_baseline`] and no live MC meeting
+    /// ([`await_no_mc_meetings`](crate::fixtures::metrics::await_no_mc_meetings))
+    /// before, `body` in its own task (so its
     /// panic is caught), then on EVERY exit path the asserted owner teardown +
     /// GC settle ([`MhPool::teardown_and_settle`]), then the baseline again.
     /// `body` gets the pool and the Prometheus base url. The body's panic is
@@ -1132,24 +1222,87 @@ impl MhPool {
         F: FnOnce(std::sync::Arc<MhPool>, String) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
+        Self::run_leg_with(false, body).await;
+    }
+
+    /// Pool-mutating. [`MhPool::run_leg`] for the ONE leg that drains a
+    /// BASELINE MH (story 4 MC-F, planned transfer without a target; contract
+    /// §8 MC-F amendment). Same scaffold, plus, on EVERY exit path (body
+    /// panic included) and BEFORE the owner teardown + GC settle: the
+    /// asserted, deficit-driven [`MhPool::restore_baseline`]; then
+    /// [`MhSlot::wait_scraped`] on every restored MH (later legs take MH metric
+    /// baselines), then [`MhPool::assert_baseline`], then the R-28 address
+    /// invariant (`assert_addresses_unique`): the body must NOT call it, since
+    /// the baseline is short until the restore. A restore failure beside
+    /// a body panic is printed first as `ALSO:`.
+    ///
+    /// # Panics
+    /// The body's panic; the restore's or teardown's error; a baseline
+    /// violation.
+    pub async fn run_baseline_drain_leg<F, Fut>(body: F)
+    where
+        F: FnOnce(std::sync::Arc<MhPool>, String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        Self::run_leg_with(true, body).await;
+    }
+
+    async fn run_leg_with<F, Fut>(baseline_drain_leg: bool, body: F)
+    where
+        F: FnOnce(std::sync::Arc<MhPool>, String) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let cluster = crate::cluster::ClusterConnection::new()
             .await
             .expect("Failed to connect to cluster - ensure port-forwards are running");
         let prom_url = cluster.prometheus_base_url.clone();
         let prom = crate::fixtures::metrics::PrometheusClient::new(&prom_url);
-        let pool = std::sync::Arc::new(MhPool::for_run());
+        let mut pool = MhPool::for_run();
+        pool.baseline_drain_leg = baseline_drain_leg;
+        let pool = std::sync::Arc::new(pool);
         pool.assert_baseline(&prom).await;
+        // Foreign activity also covers MC: no meeting from an earlier suite may
+        // be alive, or MC can pull this leg's run-owned MH into it as a
+        // replacement (story 4 MC-C) and the leg would count its releases.
+        crate::fixtures::metrics::await_no_mc_meetings(&prom, std::time::Duration::from_secs(2))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
 
         let outcome = tokio::spawn(body(std::sync::Arc::clone(&pool), prom_url)).await;
 
         let mut pool = std::sync::Arc::try_unwrap(pool)
             .unwrap_or_else(|_| panic!("the leg still holds the MhPool after it finished"));
-        let teardown = pool.teardown_and_settle(&prom).await;
-        match (outcome, teardown) {
-            (Ok(()), Ok(())) => {}
-            (Ok(()), Err(t)) => panic!("{t}"),
-            (Err(e), t) => {
-                if let Err(t) = t {
+        let mut errors = Vec::new();
+        let mut restored = Vec::new();
+        if baseline_drain_leg {
+            match pool.restore_baseline().await {
+                Ok(slots) => restored = slots,
+                Err(e) => errors.push(e),
+            }
+        }
+        if let Err(t) = pool.teardown_and_settle(&prom).await {
+            errors.push(t);
+        }
+        for slot in restored {
+            // wait_scraped panics on its ceiling; catch it so it cannot mask
+            // the body's own panic.
+            let prom =
+                crate::fixtures::metrics::PrometheusClient::new(&cluster.prometheus_base_url);
+            if let Err(e) = tokio::spawn(async move { slot.wait_scraped(&prom).await }).await {
+                errors.push(format!("RESTORE (restored-mh-not-scraped): {e}"));
+            }
+        }
+        match outcome {
+            Ok(()) => {
+                if let Some(first) = errors.first() {
+                    for e in &errors[1..] {
+                        eprintln!("ALSO: {e}");
+                    }
+                    panic!("{first}");
+                }
+            }
+            Err(e) => {
+                for t in &errors {
                     eprintln!("ALSO: {t}");
                 }
                 if e.is_panic() {
@@ -1159,6 +1312,73 @@ impl MhPool {
             }
         }
         pool.assert_baseline(&prom).await;
+        if baseline_drain_leg {
+            // R-28 after the leg, at STEADY STATE: the leg deliberately left
+            // the baseline short, so the address invariant (whose positive
+            // control requires >= B serving MHs) runs here, after the restore,
+            // and also covers the restored MH's address.
+            crate::fixtures::mh_address::assert_addresses_unique().await;
+        }
+    }
+
+    /// Pool-mutating. Drain ONE baseline MH, returning once SIGTERM is
+    /// delivered (`mh.sh drain <k> --owner baseline --no-wait`,
+    /// [`baseline_drain_args`]; never `--force`). Only inside
+    /// [`MhPool::run_baseline_drain_leg`], whose scaffold restores the pool.
+    /// Blocking.
+    ///
+    /// # Panics
+    /// Called outside that scaffold; the slot is not a baseline MH;
+    /// PRECONDITION on `last-serving-mh` (the survivor is not serving, so the
+    /// leg has nothing to move to); FAIL on any other non-OK result.
+    pub fn drain_baseline_no_wait(&self, slot: u32) {
+        assert!(
+            self.baseline_drain_leg,
+            "drain_baseline_no_wait outside MhPool::run_baseline_drain_leg: nothing would \
+             restore the baseline"
+        );
+        let entry = snapshot_at(&self.mh_sh)
+            .slots
+            .into_iter()
+            .find(|s| s.slot == slot)
+            .unwrap_or_else(|| panic!("PRECONDITION (mh-sh-list): slot {slot} not listed"));
+        assert_eq!(
+            entry.owner.as_deref(),
+            Some(BASELINE_OWNER),
+            "drain_baseline_no_wait: slot {slot} is not a baseline MH ({:?})",
+            entry.owner
+        );
+        let args = baseline_drain_args(slot);
+        let result = run_mh_sh_in(&self.mh_sh, Some(&self.cluster), &as_strs(&args));
+        if !result.is_ok() {
+            let lane = if result.reason == "last-serving-mh" {
+                "PRECONDITION"
+            } else {
+                "FAIL"
+            };
+            panic!(
+                "{lane} (mh-baseline-drain): `mh.sh {}` failed: {result}",
+                args.join(" ")
+            );
+        }
+    }
+
+    /// Pool-mutating. Top the pool back up to B baseline MHs: one
+    /// `mh.sh up --owner baseline` per [`baseline_deficit`] on a FRESH
+    /// snapshot (0 = nothing to do), each asserted OK and baseline-owned.
+    /// Returns the restored MHs (for [`MhSlot::wait_scraped`]). On success the
+    /// Drop backstop stops printing the restore command.
+    ///
+    /// # Errors
+    /// `RESTORE (baseline-restore-failed)`, naming mh.sh's REASON and the
+    /// manual restore command.
+    pub async fn restore_baseline(&mut self) -> Result<Vec<MhSlot>, String> {
+        let (path, cluster) = (self.mh_sh.clone(), self.cluster.clone());
+        let restored = tokio::task::spawn_blocking(move || restore_baseline_at(&path, &cluster))
+            .await
+            .map_err(|e| format!("RESTORE (baseline-restore-failed): restore task: {e}"))??;
+        self.baseline_restored = true;
+        Ok(restored)
     }
 
     /// [`baseline_verdict`] as an eventual poll, before AND after every
@@ -1182,7 +1402,12 @@ impl MhPool {
             async move {
                 tokio::task::spawn_blocking(move || {
                     let snap = snapshot_at(&path);
-                    baseline_verdict(&snap, &run, |o| reclaim_command(&path, &cluster, o))
+                    baseline_verdict(
+                        &snap,
+                        &run,
+                        |o| reclaim_command(&path, &cluster, o),
+                        &baseline_restore_command(&path, &cluster),
+                    )
                 })
                 .await
                 .expect("baseline task")
@@ -1192,6 +1417,20 @@ impl MhPool {
         if let Err(e) = verdict {
             panic!("{e} (polled for {ceiling:?})");
         }
+    }
+
+    /// PURE (writer seam): the baseline-drain leg's Drop backstop. It ONLY
+    /// prints (contract §8(b)): running mh.sh from Drop would block inside the
+    /// runtime during unwind.
+    pub fn baseline_drop_notice(&self, w: &mut dyn std::io::Write) {
+        let _ = writeln!(
+            w,
+            "MhPool {} (baseline-drain leg) dropped before its baseline restore; run `mh.sh \
+             list`, then once per missing baseline MH: {} (or re-run infra/kind/scripts/deploy.sh, \
+             which tops the pool back up to B)",
+            self.token,
+            baseline_restore_command(&self.mh_sh, &self.cluster)
+        );
     }
 
     /// PURE (writer seam): the Drop backstop's notice.
@@ -1209,6 +1448,9 @@ impl Drop for MhPool {
     fn drop(&mut self) {
         if !self.torn_down {
             self.drop_notice(&mut std::io::stderr());
+        }
+        if self.baseline_drain_leg && !self.baseline_restored {
+            self.baseline_drop_notice(&mut std::io::stderr());
         }
     }
 }
@@ -1236,6 +1478,36 @@ fn snapshot_at(path: &std::path::Path) -> PoolSnapshot {
     );
     parse_list_value(&result.json)
         .unwrap_or_else(|e| panic!("PRECONDITION (mh-sh-list): {e} ({result})"))
+}
+
+/// [`MhPool::restore_baseline`] at `path`. Blocking. A sibling of
+/// [`up_with`], whose run-owner check stays as it is.
+fn restore_baseline_at(path: &std::path::Path, cluster: &str) -> Result<Vec<MhSlot>, String> {
+    let manual = baseline_restore_command(path, cluster);
+    let deficit = baseline_deficit(&snapshot_at(path));
+    let mut restored = Vec::new();
+    for _ in 0..deficit {
+        let result = run_mh_sh_in(path, Some(cluster), &as_strs(&baseline_restore_args()));
+        if !result.is_ok() {
+            return Err(format!(
+                "RESTORE (baseline-restore-failed): `{manual}` failed: {result}; restored {} of \
+                 {deficit}. Restore manually (once per missing baseline MH): {manual}",
+                restored.len()
+            ));
+        }
+        let entry: SlotEntry = serde_json::from_value(result.json.clone()).map_err(|e| {
+            format!("PRECONDITION (mh-sh-contract): up's OK object is not a slot entry: {e}")
+        })?;
+        if entry.owner.as_deref() != Some(BASELINE_OWNER) {
+            return Err(format!(
+                "RESTORE (baseline-restore-failed): up returned slot {} owned by {:?}, not \
+                 {BASELINE_OWNER}",
+                entry.slot, entry.owner
+            ));
+        }
+        restored.push(MhSlot::from_entry(path, cluster, BASELINE_OWNER, entry));
+    }
+    Ok(restored)
 }
 
 /// `mh.sh up --owner <token>` at `path` ([`MhPool::up`]). Blocking.
@@ -1939,6 +2211,109 @@ mod tests {
     }
 
     #[test]
+    fn baseline_deficit_counts_from_pool_state_not_from_a_drain_flag() {
+        let run = "e2e-0123456789abcdef";
+        // Positive arm: one baseline MH draining (the leg-B drain) -> 1.
+        let drained = snap(
+            2,
+            vec![
+                slot_entry(0, "serving", Some("baseline")),
+                slot_entry(1, "draining", Some("baseline")),
+                slot_entry(2, "free", None),
+            ],
+        );
+        assert_eq!(baseline_deficit(&drained), 1);
+        // A terminating one does not count either; a run-owned one never fills
+        // a baseline hole.
+        let gone = snap(
+            2,
+            vec![
+                slot_entry(0, "terminating", Some("baseline")),
+                slot_entry(1, "serving", Some(run)),
+                slot_entry(2, "free", None),
+            ],
+        );
+        assert_eq!(baseline_deficit(&gone), 2);
+        // No drain happened (leg failed first, or the drain was refused) -> 0,
+        // so the restore can never add a B+1-th baseline MH.
+        let intact = snap(
+            2,
+            vec![
+                slot_entry(0, "serving", Some("baseline")),
+                slot_entry(1, "serving", Some("baseline")),
+            ],
+        );
+        assert_eq!(baseline_deficit(&intact), 0);
+        // A restore already under way (starting) counts as present.
+        let restoring = snap(
+            2,
+            vec![
+                slot_entry(0, "serving", Some("baseline")),
+                slot_entry(1, "draining", Some("baseline")),
+                slot_entry(2, "starting", Some("baseline")),
+            ],
+        );
+        assert_eq!(baseline_deficit(&restoring), 0);
+        // Over B (an extra baseline MH) saturates at 0, never wraps.
+        let over = snap(
+            1,
+            vec![
+                slot_entry(0, "serving", Some("baseline")),
+                slot_entry(1, "serving", Some("baseline")),
+            ],
+        );
+        assert_eq!(baseline_deficit(&over), 0);
+    }
+
+    #[test]
+    fn baseline_drain_and_restore_spellings_never_force() {
+        let drain = baseline_drain_args(4);
+        assert_eq!(
+            drain,
+            ["drain", "4", "--owner", BASELINE_OWNER, "--no-wait"]
+                .map(str::to_string)
+                .to_vec()
+        );
+        assert!(!drain.iter().any(|a| a == "--force"));
+        assert_eq!(
+            baseline_restore_args(),
+            ["up", "--owner", BASELINE_OWNER]
+                .map(str::to_string)
+                .to_vec()
+        );
+        // The printed command is byte-for-byte the executed argv.
+        let cmd = baseline_restore_command(std::path::Path::new("/x/mh.sh"), "dt");
+        assert_eq!(
+            cmd,
+            format!("DT_CLUSTER_NAME=dt /x/mh.sh up --owner {BASELINE_OWNER}")
+        );
+    }
+
+    #[test]
+    fn baseline_drop_notice_prints_the_restore_command() {
+        let mut pool = MhPool::with(
+            std::path::PathBuf::from("/x/mh.sh"),
+            "dt".into(),
+            "e2e-0123456789abcdef".into(),
+        );
+        let mut out = Vec::new();
+        pool.baseline_drop_notice(&mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(&baseline_restore_command(
+                std::path::Path::new("/x/mh.sh"),
+                "dt"
+            )),
+            "{text}"
+        );
+        assert!(text.contains("deploy.sh"), "{text}");
+        // Quiet Drop for this hermetic handle.
+        pool.torn_down = true;
+    }
+
+    const RESTORE: &str = "RESTORE-CMD up --owner baseline";
+
+    #[test]
     fn baseline_verdict_cases() {
         let run = "e2e-0123456789abcdef";
         let clean = snap(
@@ -1950,43 +2325,48 @@ mod tests {
                 slot_entry(3, "free", None),
             ],
         );
-        assert_eq!(baseline_verdict(&clean, run, hint), Ok(()));
+        assert_eq!(baseline_verdict(&clean, run, hint, RESTORE), Ok(()));
 
         let mut foreign = clean.clone();
         foreign.slots[3] = slot_entry(3, "serving", Some("e2e-ffffffffffffffff"));
-        let e = baseline_verdict(&foreign, run, hint).unwrap_err();
+        let e = baseline_verdict(&foreign, run, hint, RESTORE).unwrap_err();
         assert!(e.starts_with(FOREIGN_MH_ACTIVITY), "{e}");
         assert!(
             e.contains("slot 3") && e.contains("e2e-ffffffffffffffff"),
             "{e}"
         );
         assert!(e.contains("reclaim e2e-ffffffffffffffff"), "{e}");
+        assert!(!e.contains(RESTORE), "foreign-only: no restore hint: {e}");
 
         let mut manual = clean.clone();
         manual.slots[3] = slot_entry(3, "starting", Some("manual"));
-        assert!(baseline_verdict(&manual, run, hint)
+        assert!(baseline_verdict(&manual, run, hint, RESTORE)
             .unwrap_err()
             .contains("\"manual\""));
 
         let mut short = clean.clone();
         short.slots[1] = slot_entry(1, "terminating", Some("baseline"));
-        let e = baseline_verdict(&short, run, hint).unwrap_err();
+        let e = baseline_verdict(&short, run, hint, RESTORE).unwrap_err();
         assert!(e.contains("baseline-owned serving MHs: 1, B = 2"), "{e}");
+        assert!(
+            e.contains(RESTORE) && e.contains("deploy.sh"),
+            "short: the restore remedy: {e}"
+        );
 
         let mut over = clean.clone();
         over.slots[3] = slot_entry(3, "serving", Some("baseline"));
-        assert!(baseline_verdict(&over, run, hint)
-            .unwrap_err()
-            .contains("serving MHs: 3, B = 2"));
+        let e = baseline_verdict(&over, run, hint, RESTORE).unwrap_err();
+        assert!(e.contains("serving MHs: 3, B = 2"), "{e}");
+        assert!(!e.contains(RESTORE), "over-B: no restore hint: {e}");
 
         let mut starting = clean.clone();
         starting.slots[1] = slot_entry(1, "starting", Some("baseline"));
-        assert!(baseline_verdict(&starting, run, hint).is_err());
+        assert!(baseline_verdict(&starting, run, hint, RESTORE).is_err());
 
         // A stale (upgrade-pending) baseline MH still serves and still counts.
         let mut stale = clean.clone();
         stale.slots[0].stale = true;
-        assert_eq!(baseline_verdict(&stale, run, hint), Ok(()));
+        assert_eq!(baseline_verdict(&stale, run, hint, RESTORE), Ok(()));
     }
 
     #[test]

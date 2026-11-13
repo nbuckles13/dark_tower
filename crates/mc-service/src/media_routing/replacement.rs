@@ -152,6 +152,17 @@ impl ReplacementTiming {
         self.acquisition_budget() + super::pusher::initial_registration_bound()
     }
 
+    /// The longest a planned transfer may hold a meeting on a draining handler
+    /// (the ceiling on MH's untrusted `drain_remaining_ms`; story 4 MC-F,
+    /// security S-1c). Deliberately [`Self::retry_budget`]: past it the
+    /// acquisition ladder has made every attempt it shapes, so a longer hold
+    /// buys nothing. COUPLING: a change to the budget is also a drain-policy
+    /// change — this accessor is where that is visible.
+    #[must_use]
+    pub fn max_planned_hold(self) -> Duration {
+        self.retry_budget()
+    }
+
     /// `mc_media_handler_migration_duration_seconds` bucket bounds, derived
     /// from config: the settle window around the reconnect phase, the
     /// ladder's cumulative waits for the replacement phase, and the
@@ -286,6 +297,20 @@ pub struct Granted {
     pub granted_at: Instant,
 }
 
+impl Granted {
+    /// Whether this grant's first ack records its attempt's `completed`.
+    ///
+    /// A crash replacement (heartbeat_timeout, apply_lag) completes at Active.
+    /// A planned-transfer grant does NOT: its transfer records exactly one
+    /// terminal outcome at the old handler's removal (or abandon), and after
+    /// that terminal the same owe only restores size, recording nothing more
+    /// (observability ruling, story 4 MC-F; lead ruling 1).
+    #[must_use]
+    pub fn records_on_active(&self) -> bool {
+        self.owed.trigger != RemovalTrigger::PlannedTransfer
+    }
+}
+
 /// A grant that became Active, waiting for its participants to connect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Reconnecting {
@@ -412,8 +437,12 @@ impl ReplacementState {
         earliest > now
     }
 
-    /// A handler left the meeting. `members_after` is the set size after the
-    /// removal (Registering grants included).
+    /// A handler left the meeting. `counted_members_after` is the number of
+    /// members after the removal that count toward the target: Registering
+    /// grants included, DRAINING members excluded (story 4 MC-F — a draining
+    /// member is leaving; counting it would under-owe when, e.g., the grant
+    /// that was to replace it dies). Every caller passes
+    /// `MeetingMedia::non_draining_member_count`.
     ///
     /// A Registering grant that left (its registration failed) re-owes ITS
     /// replacement (same trigger and origin); any other member owes a new one
@@ -423,7 +452,7 @@ impl ReplacementState {
         &mut self,
         id: &HandlerId,
         trigger: RemovalTrigger,
-        members_after: usize,
+        counted_members_after: usize,
         now: Instant,
         timing: ReplacementTiming,
     ) -> RemovalEffect {
@@ -434,7 +463,7 @@ impl ReplacementState {
             Some(granted) => self.owed.push_back(granted.owed.clone()),
             None => {
                 let accounted =
-                    self.owed.len() + usize::from(self.in_flight.is_some()) + members_after;
+                    self.owed.len() + usize::from(self.in_flight.is_some()) + counted_members_after;
                 if accounted < self.target {
                     self.owed.push_back(Owed {
                         trigger,
@@ -451,6 +480,28 @@ impl ReplacementState {
             started,
             deferred,
         }
+    }
+
+    /// `id` started DRAINING (story 4 MC-F): owe its replacement NOW, while it
+    /// is still a member (make-before-break) — an explicit owe-while-present,
+    /// trigger `planned_transfer`, origin `declared_at` (the draining
+    /// heartbeat's receipt). It then takes MC-C's one path: the single
+    /// in-flight call, the minimum interval, the attempt bound, the ladder.
+    /// Called once per transfer (the caller's `PlannedTransfers::start`
+    /// dedupes). Returns whether the attempt was deferred by the interval.
+    pub fn on_draining(
+        &mut self,
+        id: &HandlerId,
+        declared_at: Instant,
+        now: Instant,
+        timing: ReplacementTiming,
+    ) -> bool {
+        self.owed.push_back(Owed {
+            trigger: RemovalTrigger::PlannedTransfer,
+            replaced: Some(id.clone()),
+            declared_at,
+        });
+        self.schedule(now, timing)
     }
 
     /// The attempt timer fired. `exclude_len` is `|current ∪ removed|`.
@@ -881,5 +932,133 @@ mod tests {
         };
         assert_eq!(s.end().len(), 2, "in flight + registering");
         assert_eq!(s.next_attempt_at(), None);
+    }
+
+    // ---- story 4 MC-F: planned transfer (owe-while-present, accounting) ----
+
+    /// Drive one planned owe to a grant id `y`, returning the Owed.
+    fn grant_planned(s: &mut ReplacementState, x: &str, y: &str, now: Instant) -> Owed {
+        let t = timing();
+        s.on_draining(&hid(x), now, now, t);
+        let Due::Attempt(owed) = s.due(now, 1, 1, cap(16), t) else {
+            panic!("the planned owe is attempted at once");
+        };
+        assert_eq!(owed.trigger, RemovalTrigger::PlannedTransfer);
+        assert_eq!(owed.replaced, Some(hid(x)));
+        let f = s.take_in_flight().unwrap();
+        s.granted(hid(y), f.owed.clone(), now, t);
+        f.owed
+    }
+
+    /// The owe is made while X is still a member (the meeting is AT target),
+    /// and a planned grant's Active records nothing (its transfer records the
+    /// terminal); a crash grant's Active records `completed`.
+    #[tokio::test(start_paused = true)]
+    async fn a_draining_member_is_owed_while_present_and_its_grant_defers_completion() {
+        let mut s = ReplacementState::new(1, Some(1));
+        let now = Instant::now();
+        grant_planned(&mut s, "x", "y", now);
+        let g = s.on_active(&hid("y"), now, BTreeSet::new()).unwrap();
+        assert!(
+            !g.records_on_active(),
+            "planned: recorded at the transfer's end"
+        );
+        let crash = Granted {
+            owed: Owed {
+                trigger: RemovalTrigger::HeartbeatTimeout,
+                replaced: None,
+                declared_at: now,
+            },
+            granted_at: now,
+        };
+        assert!(
+            crash.records_on_active(),
+            "positive arm: crash completes at Active"
+        );
+    }
+
+    /// Cutover with a grant: {X(draining), Y} -> remove X; Y brings the set to
+    /// target, so no second owe.
+    #[tokio::test(start_paused = true)]
+    async fn cutover_onto_the_grant_owes_nothing_more() {
+        let mut s = ReplacementState::new(1, Some(1));
+        let now = Instant::now();
+        grant_planned(&mut s, "x", "y", now);
+        s.on_active(&hid("y"), now, BTreeSet::new());
+        let effect = s.on_removal(&hid("x"), RemovalTrigger::PlannedTransfer, 1, now, timing());
+        assert!(!effect.started && effect.refused.is_none());
+        assert_eq!(s.owed_len(), 0);
+        assert!(s.in_flight().is_none());
+    }
+
+    /// Cutover with NO grant (survivor path / shed): the planned owe is still
+    /// owed, so the removal adds no second owe for the same handler.
+    #[tokio::test(start_paused = true)]
+    async fn cutover_without_a_grant_keeps_the_one_planned_owe() {
+        let t = timing();
+        let mut s = ReplacementState::new(2, Some(1));
+        let now = Instant::now();
+        s.on_draining(&hid("x"), now, now, t);
+        let Due::Attempt(owed) = s.due(now, 1, 2, cap(16), t) else {
+            panic!()
+        };
+        s.take_in_flight();
+        // No capacity: the planned owe is owed again.
+        s.retry_after_failure(owed, now, t);
+        // {S, X} -> {S}: one survivor counted.
+        let effect = s.on_removal(&hid("x"), RemovalTrigger::PlannedTransfer, 1, now, t);
+        assert!(!effect.started, "the planned owe already accounts for x");
+        assert_eq!(s.owed_len(), 1);
+    }
+
+    /// Code-review 3 table: draining members never count toward the target,
+    /// on EVERY removal path.
+    #[tokio::test(start_paused = true)]
+    async fn draining_members_do_not_count_toward_the_target() {
+        let t = timing();
+        // (a) crash of A while X drains, target 2, X's planned owe open:
+        // counted after = 0 (X draining) -> A is owed too.
+        let mut s = ReplacementState::new(2, Some(1));
+        let now = Instant::now();
+        s.on_draining(&hid("x"), now, now, t);
+        let effect = s.on_removal(&hid("a"), RemovalTrigger::HeartbeatTimeout, 0, now, t);
+        assert!(effect.started, "A's crash is owed");
+        assert_eq!(
+            s.owed_len() + usize::from(s.in_flight().is_some()),
+            2,
+            "both X and A are being replaced"
+        );
+        // Positive arm of the miscount: had X counted, A would be under-owed.
+        let mut s2 = ReplacementState::new(2, Some(1));
+        s2.on_draining(&hid("x"), now, now, t);
+        assert!(
+            !s2.on_removal(&hid("a"), RemovalTrigger::HeartbeatTimeout, 1, now, t)
+                .started,
+            "counting the draining X would owe nothing for A"
+        );
+
+        // (b) the planned grant Y dies (Active) mid-transfer, target 1:
+        // {X(draining)} counts 0 -> a replacement is owed again.
+        let mut s = ReplacementState::new(1, Some(1));
+        grant_planned(&mut s, "x", "y", now);
+        s.on_active(&hid("y"), now, BTreeSet::new());
+        let effect = s.on_removal(&hid("y"), RemovalTrigger::HeartbeatTimeout, 0, now, t);
+        assert!(effect.started, "X still needs a target");
+
+        // (c) the planned grant Y fails registration (Registering): its owe
+        // returns (admission_refused at the caller), whatever the count.
+        let mut s = ReplacementState::new(1, Some(1));
+        grant_planned(&mut s, "x", "y", now);
+        let effect = s.on_removal(&hid("y"), RemovalTrigger::ApplyLag, 0, now, t);
+        let refused = effect.refused.expect("a Registering grant was refused");
+        assert_eq!(refused.owed.trigger, RemovalTrigger::PlannedTransfer);
+        assert_eq!(s.owed_len(), 1, "re-owed, not doubled");
+    }
+
+    /// The hold ceiling IS the retry budget (named coupling).
+    #[test]
+    fn the_max_planned_hold_is_the_retry_budget() {
+        let t = timing();
+        assert_eq!(t.max_planned_hold(), t.retry_budget());
     }
 }

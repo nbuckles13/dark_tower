@@ -1580,6 +1580,22 @@ pub fn publish_liveness_config(owner_silence_timeout: Duration, max_idle_timeout
 // final exit log line carries the outcome, duration and shed count.
 // ============================================================================
 
+/// Publish the configured planned-drain window (story 4 MC-F, operations O9;
+/// ADR-0039 §7), once at boot, from the SAME `Config::drain_window` that
+/// `drain::run` waits on (`grace − SHUTDOWN_MARGIN_SECONDS`, derived once in
+/// `config::drain_window_for`; never recomputed here).
+///
+/// Metric: `mh_drain_window_seconds` (gauge, no labels — the `mh_drain_*`
+/// family is not a media-path series)
+///
+/// The drain deadline is SIGTERM + this; MC cuts a planned transfer over at
+/// that deadline − `MC_PLANNED_TRANSFER_MARGIN_MS`. Env-test 02 asserts the MC
+/// margin fits inside it (minus one heartbeat interval) across every serving
+/// MH pod.
+pub fn publish_drain_window(window: Duration) {
+    gauge!("mh_drain_window_seconds").set(window.as_secs_f64());
+}
+
 /// Set the meetings this handler still holds during a drain (0 when not
 /// draining). Recompute-and-set from the session actor's held count.
 ///
