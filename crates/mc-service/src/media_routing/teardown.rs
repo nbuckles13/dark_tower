@@ -856,11 +856,20 @@ pub async fn release_removed(release: RemovedHandlerRelease) {
         policy_generations,
     } = release;
     let quiesced = quiesce(cancel, task.into_iter().collect()).await;
+    // On a quiesce timeout an aborted worker's in-flight RegisterMeeting may
+    // land on MH AFTER this EndMeeting and re-create the meeting there. MH
+    // sends an immediate beat for a registration accepted while draining
+    // (mh-service `session/mod.rs` `due_now`), and the removed-for-life
+    // record answers it RELEASED, so MH still releases within one beat
+    // (ADR-0039 §6; agreed with media-handler at story 4 MC-F Gate 1).
     let call = end_meeting_removal(&meeting_id, &mc_id, &removed, trigger, &quiesced);
     let outcome = release_one(mh_client.as_ref(), &call, TeardownReason::HandlerRemoved).await;
     // NOT `mc_media_end_meeting_total`: that series (and its failure alert)
-    // means "an ENDED meeting was released"; a removal's release targets a
-    // handler MC just declared dead, so failing is its expected outcome.
+    // means "an ENDED meeting was released". For heartbeat_timeout/apply_lag
+    // the release targets a handler MC just declared dead or impaired, so
+    // failing is expected; for planned_transfer the handler is ALIVE and
+    // draining, so `released` is expected and a failure means MH shed first
+    // (check the margin against `mh_drain_window_seconds`).
     metrics::record_removal_release(trigger, outcome);
     policy_generations
         .remove_pair(&meeting_id, &removed.id)

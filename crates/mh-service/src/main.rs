@@ -340,6 +340,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.meeting_owner_silence_timeout,
         config.quic_transport.max_idle_timeout_ms,
     );
+    // Story 4 MC-F (O9): the planned-drain window, from the SAME field
+    // `drain::run` waits on — present from process start, drained or not.
+    mh_service::observability::metrics::publish_drain_window(config.drain_window);
     info!("Prometheus metrics recorder initialized");
 
     // Initialize health state

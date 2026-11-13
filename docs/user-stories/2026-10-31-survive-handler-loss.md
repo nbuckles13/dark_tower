@@ -456,7 +456,7 @@ Hygiene for every series: no meeting, participant, connection, handler_id, handl
 
 Alert rules are NOT in these tasks. They all land in OBS-ALERTS. The one exception is noted under MC-B1.
 
-#### MC (board: `infra/grafana/dashboards/mc-media.json`)
+#### MC (board: `infra/grafana/dashboards/mc-media.json`; story-4 handler rows on `mc-media-handlers.json` since MC-F)
 
 #### MC-A
 Retire `mc_media_handler_set_divergence_total`: non-first joins stop reading Redis.

@@ -70,6 +70,8 @@ spec:
               - configMap:
                   name: grafana-dashboards-mc-media
               - configMap:
+                  name: grafana-dashboards-mc-media-handlers
+              - configMap:
                   name: grafana-dashboards-mh
               - configMap:
                   name: grafana-dashboards-mh-media

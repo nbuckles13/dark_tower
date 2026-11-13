@@ -42,7 +42,7 @@
 ## Dashboards & Alerts
 - Dashboards + provisioning + K8s wiring -> `infra/grafana/dashboards/`, `infra/grafana/provisioning/`, `infra/grafana/kustomization.yaml`; one projected volume mounting every dashboard group `infra/grafana/deployment.yaml` (ADR-0038 Implementation step 1); unmounted-group check (R-21) `crates/dt-guard/src/kustomize_content_addressing.rs`
 - Per-service overviews -> `infra/grafana/dashboards/ac-overview.json`, `gc-overview.json`, `mc-overview.json`, `mh-overview.json`; template `_template-service-overview.json`
-- Media + SLO boards -> `infra/grafana/dashboards/mh-media.json`, `mc-media.json`, `client-media.json`, `mh-slos.json`, `mh-logs.json`, `ac-slos.json`, `mc-slos.json`
+- Media + SLO boards -> `infra/grafana/dashboards/mh-media.json`, `mc-media.json`, `mc-media-handlers.json`, `client-media.json`, `mh-slos.json`, `mh-logs.json`, `ac-slos.json`, `mc-slos.json`
 - Alert rules -> `infra/docker/prometheus/rules/gc-alerts.yaml`, `mc-alerts.yaml`, `mh-alerts.yaml`, `client-alerts.yaml`, `otel-alerts.yaml`, template `_template-service-alerts.yaml`
 - Per-service alert-rule authorship (owning specialist; supersedes ADR-0011 §Documentation Ownership row) -> ADR-0031 §Ownership split
 

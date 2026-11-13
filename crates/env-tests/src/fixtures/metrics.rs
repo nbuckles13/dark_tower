@@ -1265,6 +1265,161 @@ pub async fn mc_replacement_retry_budget(prom: &PrometheusClient) -> Duration {
     mc_config_gauge_max(prom, "mc_media_handler_replacement_retry_budget_seconds").await
 }
 
+/// THE env-test read of MC's planned-transfer cutover margin
+/// (`mc_media_handler_planned_transfer_margin_seconds`, story 4 MC-F,
+/// `MC_PLANNED_TRANSFER_MARGIN_MS`).
+///
+/// # Panics
+/// As [`mc_config_gauge_max`].
+pub async fn mc_planned_transfer_margin(prom: &PrometheusClient) -> Duration {
+    mc_config_gauge_max(prom, "mc_media_handler_planned_transfer_margin_seconds").await
+}
+
+/// PURE: the FAILURE-ONLY ceiling, from the drain's SIGTERM, by which MC must
+/// have cut a draining handler over (ADR-0039 §4): MC cuts over at
+/// `drain_remaining_ms - margin`, and `drain_remaining_ms` is at most the
+/// pod's `terminationGracePeriodSeconds` (MH drains for grace minus its own
+/// shutdown margin), so `grace - margin` is an upper bound; `view_margin` covers
+/// the set reaching the client. Never a latency target.
+///
+/// # Errors
+/// `margin >= grace`: MC would cut over at once, so no make phase is
+/// observable (a deployment-config fault, named as such).
+pub fn planned_cutover_ceiling(
+    grace: Duration,
+    margin: Duration,
+    view_margin: Duration,
+) -> Result<Duration, String> {
+    if margin >= grace {
+        return Err(format!(
+            "PRECONDITION (planned-margin-exceeds-grace): MC_PLANNED_TRANSFER_MARGIN_MS {margin:?} \
+             >= the MH pod's terminationGracePeriodSeconds {grace:?}; MC would cut over \
+             immediately"
+        ));
+    }
+    Ok(grace - margin + view_margin)
+}
+
+/// MC's active meetings, summed over the fleet (`mc_meetings_active`, one
+/// series per MC instance). The ONE home of that read.
+pub async fn mc_meetings_active_total(prom: &PrometheusClient) -> f64 {
+    prom.instance_counter_map("sum by (instance) (mc_meetings_active)")
+        .await
+        .values()
+        .sum()
+}
+
+/// Reason token: an MC meeting is still alive when a pool-mutating leg starts.
+pub const FOREIGN_MC_MEETINGS: &str = "foreign-mc-meetings";
+
+/// LEG PRECONDITION (resilience legs): no MC meeting is alive, settled (two
+/// reads one `poll` apart both 0). A meeting left by an earlier suite lives
+/// for MC's disconnect grace, and if its handlers are lost meanwhile (e.g. an
+/// injection suite's `EndMeeting` straight to MH) MC asks GC for a
+/// replacement, and GC may grant the leg's fresh run-owned MH, so the leg's
+/// "only our meeting is on it" evidence would count a foreign meeting. The
+/// bound is FAILURE-ONLY: MC publishes no gauge for its disconnect grace, so
+/// it is the shared [`PINNED_METRIC_BOUND`] plus MC's published replacement
+/// retry budget (an orphan may hold a replacement that long).
+///
+/// # Errors
+/// [`FOREIGN_MC_MEETINGS`] at the bound, with the last count.
+pub async fn await_no_mc_meetings(prom: &PrometheusClient, poll: Duration) -> Result<(), String> {
+    let bound = PINNED_METRIC_BOUND + mc_replacement_retry_budget(prom).await;
+    let deadline = Instant::now() + bound;
+    let mut previous = mc_meetings_active_total(prom).await;
+    loop {
+        tokio::time::sleep(poll).await;
+        let now = mc_meetings_active_total(prom).await;
+        if now == 0.0 && previous == 0.0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{FOREIGN_MC_MEETINGS}: MC still holds {now} active meeting(s) {bound:?} into the \
+                 leg's precondition; an earlier suite left a meeting alive (its participants \
+                 dropped without leaving, or its handlers released behind MC's back). A pool \
+                 leg must start with none, or GC can grant the leg's run-owned MH to it"
+            ));
+        }
+        previous = now;
+    }
+}
+
+/// MH's published drain window (story 4 MH-3/MC-F, no labels): the grace
+/// minus MH's shutdown margin, the time MH keeps forwarding after SIGTERM.
+pub const MH_DRAIN_WINDOW_SERIES: &str = "mh_drain_window_seconds";
+
+/// PURE verdict of the MC-F O9 drift guard: MC's planned-transfer margin must
+/// leave MC a make phase inside MH's drain window, i.e.
+/// `margin < min(window) - one heartbeat interval` (MC learns of the drain
+/// on the next heartbeat). `windows` holds one entry per SERVING MH pod
+/// (`(pod, scraped value in seconds)`, `None` = no series for that pod);
+/// `excluded_terminating` is how many terminating MH pods the caller left
+/// out. Distinct failure reasons, so triage never mistakes an absent series
+/// or an empty pool for a configuration fault:
+/// `no-serving-mh`, `drain-window-absent`, `drain-window-template-drift`,
+/// `planned-margin-exceeds-drain-window`.
+///
+/// # Errors
+/// Any of the above, naming the pods and values.
+pub fn planned_margin_drift_verdict(
+    margin: Duration,
+    interval: Duration,
+    windows: &[(String, Option<f64>)],
+    excluded_terminating: usize,
+) -> Result<(), String> {
+    let excluded = format!("{excluded_terminating} terminating MH pod(s) excluded");
+    if windows.is_empty() {
+        return Err(format!(
+            "no-serving-mh: no serving MH pod to read {MH_DRAIN_WINDOW_SERIES} from ({excluded})"
+        ));
+    }
+    let absent: Vec<&str> = windows
+        .iter()
+        .filter(|(_, v)| v.is_none())
+        .map(|(p, _)| p.as_str())
+        .collect();
+    if !absent.is_empty() {
+        return Err(format!(
+            "drain-window-absent: serving MH pod(s) {absent:?} publish no \
+             {MH_DRAIN_WINDOW_SERIES} series (scraped {} of {} serving; {excluded}). A missing \
+             series is a scrape/startup fault, never a pass",
+            windows.len() - absent.len(),
+            windows.len()
+        ));
+    }
+    let values: Vec<f64> = windows.iter().filter_map(|(_, v)| *v).collect();
+    let (min, max) = values
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(*v), hi.max(*v))
+        });
+    if max - min > f64::EPSILON {
+        return Err(format!(
+            "drain-window-template-drift: serving MH pods disagree on {MH_DRAIN_WINDOW_SERIES}: \
+             {windows:?} ({excluded}); every MH renders from the one mh-template"
+        ));
+    }
+    if !(min.is_finite() && min > 0.0) {
+        return Err(format!(
+            "drain-window-absent: {MH_DRAIN_WINDOW_SERIES} = {min} is not a positive duration \
+             ({excluded})"
+        ));
+    }
+    let window = Duration::from_secs_f64(min);
+    let budget = window.saturating_sub(interval);
+    if margin >= budget {
+        return Err(format!(
+            "planned-margin-exceeds-drain-window: MC_PLANNED_TRANSFER_MARGIN_MS {margin:?} must \
+             be < MH drain window {window:?} - one heartbeat interval {interval:?} = {budget:?}; \
+             otherwise every planned transfer cuts over at once (outcome timed_out). Lower the \
+             margin or raise the MH terminationGracePeriodSeconds ({excluded})"
+        ));
+    }
+    Ok(())
+}
+
 /// Failure bound for a settled per-pod baseline ([`settled_baseline`]): two
 /// reads a scrape apart agreeing. A PRECONDITION bound, never a pass
 /// condition; under cluster load the notification and push chains converge in
@@ -1296,6 +1451,98 @@ pub fn group_reset_promql(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planned_margin_drift_verdict_arms() {
+        let s = Duration::from_secs;
+        let pods = |vs: &[Option<f64>]| -> Vec<(String, Option<f64>)> {
+            vs.iter()
+                .enumerate()
+                .map(|(i, v)| (format!("mh-s{i}"), *v))
+                .collect()
+        };
+        // Positive arm (Kind shape): window 30 s, interval 5 s, margin 5 s.
+        assert_eq!(
+            planned_margin_drift_verdict(s(5), s(5), &pods(&[Some(30.0), Some(30.0)]), 1),
+            Ok(())
+        );
+        // Boundary: margin one ms under window - interval passes; equal fails.
+        assert_eq!(
+            planned_margin_drift_verdict(
+                Duration::from_millis(24_999),
+                s(5),
+                &pods(&[Some(30.0)]),
+                0
+            ),
+            Ok(())
+        );
+        let reason = |r: Result<(), String>| r.unwrap_err();
+        let e = reason(planned_margin_drift_verdict(
+            s(25),
+            s(5),
+            &pods(&[Some(30.0)]),
+            0,
+        ));
+        assert!(e.starts_with("planned-margin-exceeds-drain-window"), "{e}");
+        // Each distinct failure reason, and the excluded count is reported.
+        let e = reason(planned_margin_drift_verdict(s(5), s(5), &[], 2));
+        assert!(
+            e.starts_with("no-serving-mh") && e.contains("2 terminating"),
+            "{e}"
+        );
+        let e = reason(planned_margin_drift_verdict(
+            s(5),
+            s(5),
+            &pods(&[Some(30.0), None]),
+            0,
+        ));
+        assert!(
+            e.starts_with("drain-window-absent") && e.contains("mh-s1") && e.contains("1 of 2"),
+            "{e}"
+        );
+        let e = reason(planned_margin_drift_verdict(
+            s(5),
+            s(5),
+            &pods(&[Some(30.0), Some(40.0)]),
+            0,
+        ));
+        assert!(e.starts_with("drain-window-template-drift"), "{e}");
+        let e = reason(planned_margin_drift_verdict(
+            s(5),
+            s(5),
+            &pods(&[Some(0.0)]),
+            0,
+        ));
+        assert!(e.starts_with("drain-window-absent"), "{e}");
+        // The MIN window decides (no drift tolerance hides a smaller one).
+        let e = reason(planned_margin_drift_verdict(
+            s(5),
+            s(5),
+            &pods(&[Some(9.0)]),
+            0,
+        ));
+        assert!(e.starts_with("planned-margin-exceeds-drain-window"), "{e}");
+    }
+
+    #[test]
+    fn planned_cutover_ceiling_is_grace_minus_margin_plus_view_margin() {
+        let s = Duration::from_secs;
+        // Kind shape: grace 35 s, margin 5 s, view margin 10 s -> 40 s.
+        assert_eq!(planned_cutover_ceiling(s(35), s(5), s(10)), Ok(s(40)));
+        // Boundary: margin one tick under grace is still a (tiny) window.
+        assert_eq!(
+            planned_cutover_ceiling(s(35), Duration::from_millis(34_999), s(0)),
+            Ok(Duration::from_millis(1))
+        );
+        // Negative arms: margin == grace and margin > grace are refused
+        // loudly, never a zero or wrapped ceiling.
+        for margin in [s(35), s(36)] {
+            let e = planned_cutover_ceiling(s(35), margin, s(10)).unwrap_err();
+            assert!(e.contains("planned-margin-exceeds-grace"), "{e}");
+            assert!(e.contains("MC_PLANNED_TRANSFER_MARGIN_MS"), "{e}");
+            assert!(e.contains("MC would cut over immediately"), "{e}");
+        }
+    }
 
     // -- live scrape-interval precondition --------------------------------
 

@@ -55,6 +55,12 @@ configMapGenerator:
   - name: grafana-dashboards-mc-media
     files:
       - mc-media.json=dashboards/mc-media.json
+  # MC's story-4 media-HANDLER lifecycle (ADR-0039: heartbeats, detection,
+  # handler set, replacement, planned transfer), split out of mc-media.json at
+  # story 4 MC-F when that board's ConfigMap reached the 80% headroom above.
+  - name: grafana-dashboards-mc-media-handlers
+    files:
+      - mc-media-handlers.json=dashboards/mc-media-handlers.json
   - name: grafana-dashboards-mh
     files:
       - mh-logs.json=dashboards/mh-logs.json

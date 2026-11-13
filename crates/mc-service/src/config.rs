@@ -128,6 +128,21 @@ pub const MAX_MH_REPLACEMENT_MIN_INTERVAL_MS: u32 = 60_000;
 /// waits between attempts once GC is down or out of capacity.
 pub const MAX_MH_REPLACEMENT_BACKOFF_MAX_MS: u32 = 300_000;
 
+/// Smallest legal `MC_PLANNED_TRANSFER_MARGIN_MS` (story 4 MC-F).
+///
+/// MC cuts a planned transfer over at the draining heartbeat's
+/// `drain_remaining_ms` minus this margin, so the margin must cover the set
+/// push, the old handler's worker drain and the `EndMeeting` round trip (MH
+/// then releases by `EndMeeting`, not by its own deadline shed). Below 1 s it
+/// cannot.
+pub const MIN_PLANNED_TRANSFER_MARGIN_MS: u32 = 1_000;
+
+/// Largest legal `MC_PLANNED_TRANSFER_MARGIN_MS`. At or above MH's drain window
+/// (grace − MH's 5 s shutdown margin; 30 s in base) every planned transfer
+/// degrades to an immediate cutover (`timed_out`); the deployed-config env-test
+/// guards the relation, this bound only stops absurd values.
+pub const MAX_PLANNED_TRANSFER_MARGIN_MS: u32 = 30_000;
+
 /// Smallest legal `MC_KEK_ROTATION_DEBOUNCE_SECONDS` (W).
 ///
 /// The floor is set by the CLIENT, not by MC: the client derives its
@@ -452,6 +467,15 @@ pub struct Config {
     /// at load (a cap below the minimum interval refuses boot).
     pub mh_replacement_backoff_max_ms: u32,
 
+    /// The planned-transfer cutover margin in milliseconds
+    /// (`MC_PLANNED_TRANSFER_MARGIN_MS`, ADR-0039 §4; story 4 MC-F): cutover is
+    /// at the draining heartbeat's receipt + `drain_remaining_ms` − margin.
+    ///
+    /// Required, no Rust default, bounded
+    /// [`MIN_PLANNED_TRANSFER_MARGIN_MS`]`..=`[`MAX_PLANNED_TRANSFER_MARGIN_MS`]
+    /// at load. Projected once through [`Config::planned_transfer`].
+    pub planned_transfer_margin_ms: u32,
+
     /// Maximum ACCEPTED receive-capability declarations per connection
     /// (`MC_MAX_RECEIVE_CAPABILITY_DECLARATIONS`).
     ///
@@ -537,6 +561,10 @@ impl fmt::Debug for Config {
             .field(
                 "mh_replacement_backoff_max_ms",
                 &self.mh_replacement_backoff_max_ms,
+            )
+            .field(
+                "planned_transfer_margin_ms",
+                &self.planned_transfer_margin_ms,
             )
             .field(
                 "max_receive_capability_declarations",
@@ -908,6 +936,17 @@ impl Config {
             MAX_MH_REPLACEMENT_BACKOFF_MAX_MS,
         )?;
 
+        // ADR-0039 §4 planned-transfer cutover margin (story 4 MC-F). Required
+        // and bounded; same single-line `MissingEnvVar(` rule as above.
+        let planned_transfer_margin_ms = bounded(
+            "MC_PLANNED_TRANSFER_MARGIN_MS",
+            vars.get("MC_PLANNED_TRANSFER_MARGIN_MS").ok_or_else(|| {
+                ConfigError::MissingEnvVar("MC_PLANNED_TRANSFER_MARGIN_MS".to_string())
+            })?,
+            MIN_PLANNED_TRANSFER_MARGIN_MS,
+            MAX_PLANNED_TRANSFER_MARGIN_MS,
+        )?;
+
         // Per-connection budget on ACCEPTED declarations (client-driven
         // meeting-actor work). Bounded on both sides by the same argument.
         let max_receive_capability_declarations = bounded(
@@ -1101,6 +1140,7 @@ impl Config {
             media_dial_token_ttl_seconds,
             mh_replacement_min_interval_ms,
             mh_replacement_backoff_max_ms,
+            planned_transfer_margin_ms,
             max_receive_capability_declarations,
             audio_encoding,
             video_encoding,
@@ -1158,6 +1198,17 @@ impl Config {
             self.mh_replacement_min_interval_ms,
             self.mh_replacement_backoff_max_ms,
         )
+    }
+
+    /// The planned-transfer cutover margin (`MC_PLANNED_TRANSFER_MARGIN_MS`,
+    /// ADR-0039 §4; story 4 MC-F) as validated at load.
+    ///
+    /// The ONE place it becomes timing: every meeting's cutover deadline and
+    /// the published `mc_media_handler_planned_transfer_margin_seconds` gauge
+    /// read the value returned here.
+    #[must_use]
+    pub fn planned_transfer(&self) -> crate::media_routing::PlannedTransferTiming {
+        crate::media_routing::PlannedTransferTiming::from_margin_ms(self.planned_transfer_margin_ms)
     }
 
     /// The KEK rotation lifecycle, built from W as validated at load.
@@ -1295,6 +1346,11 @@ mod tests {
                 "MC_MH_REPLACEMENT_BACKOFF_MAX_MS".to_string(),
                 "30000".to_string(),
             ),
+            // ADR-0039 §4 planned-transfer cutover margin (story 4 MC-F).
+            (
+                "MC_PLANNED_TRANSFER_MARGIN_MS".to_string(),
+                "5000".to_string(),
+            ),
         ])
     }
 
@@ -1327,6 +1383,7 @@ mod tests {
             "MC_MEDIA_DIAL_TOKEN_TTL_SECONDS",
             "MC_MH_REPLACEMENT_MIN_INTERVAL_MS",
             "MC_MH_REPLACEMENT_BACKOFF_MAX_MS",
+            "MC_PLANNED_TRANSFER_MARGIN_MS",
         ] {
             let mut vars = base_vars();
             vars.remove(key);
@@ -2371,6 +2428,48 @@ mod tests {
                     assert!(msg.contains(key), "{key}={raw}: names the key: {msg}");
                 }
                 other => panic!("{key}={raw}: expected InvalidValue, got {other:?}"),
+            }
+        }
+    }
+
+    /// Story 4 MC-F: `MC_PLANNED_TRANSFER_MARGIN_MS` is accepted at both
+    /// bounds (the consts AND the literal values the task names) and refused
+    /// one past either, at zero, and unparseable — with the key named. Absent
+    /// is covered by the required-keys test above.
+    #[test]
+    fn planned_transfer_margin_bounds() {
+        assert_eq!(MIN_PLANNED_TRANSFER_MARGIN_MS, 1_000);
+        assert_eq!(MAX_PLANNED_TRANSFER_MARGIN_MS, 30_000);
+        for ms in [
+            MIN_PLANNED_TRANSFER_MARGIN_MS,
+            5_000,
+            MAX_PLANNED_TRANSFER_MARGIN_MS,
+        ] {
+            let mut vars = base_vars();
+            vars.insert("MC_PLANNED_TRANSFER_MARGIN_MS".to_string(), ms.to_string());
+            let config = Config::from_vars(&vars).expect("in range");
+            assert_eq!(
+                config.planned_transfer().margin(),
+                std::time::Duration::from_millis(u64::from(ms))
+            );
+        }
+        for raw in [
+            (MIN_PLANNED_TRANSFER_MARGIN_MS - 1).to_string(),
+            (MAX_PLANNED_TRANSFER_MARGIN_MS + 1).to_string(),
+            "999".to_string(),
+            "30001".to_string(),
+            "0".to_string(),
+            String::new(),
+            "abc".to_string(),
+        ] {
+            let mut vars = base_vars();
+            vars.insert("MC_PLANNED_TRANSFER_MARGIN_MS".to_string(), raw.clone());
+            match Config::from_vars(&vars) {
+                Err(ConfigError::InvalidValue(msg)) => assert!(
+                    msg.contains("MC_PLANNED_TRANSFER_MARGIN_MS"),
+                    "{raw}: names the key: {msg}"
+                ),
+                other => panic!("{raw:?}: expected InvalidValue, got {other:?}"),
             }
         }
     }

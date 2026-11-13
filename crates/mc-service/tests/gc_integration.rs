@@ -361,6 +361,7 @@ fn test_config(gc_url: &str) -> Config {
         media_dial_token_ttl_seconds: test_common::media_dial_timing().ttl_seconds(),
         mh_replacement_min_interval_ms: 1000,
         mh_replacement_backoff_max_ms: 30000,
+        planned_transfer_margin_ms: 5000,
         max_receive_capability_declarations: media.max_receive_capability_declarations,
         audio_encoding: media.audio_encoding,
         video_encoding: media.video_encoding,

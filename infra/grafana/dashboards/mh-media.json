@@ -3664,6 +3664,55 @@
       ],
       "title": "QUIC Idle Timeout",
       "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "description": "mh_drain_window_seconds: the configured planned-drain window (MH_TERMINATION_GRACE_SECONDS − the 5 s shutdown margin; ADR-0039 §7), published once at boot from the same Config::drain_window drain::run waits on. The drain deadline is SIGTERM + this; MC cuts a planned transfer over at that deadline − MC_PLANNED_TRANSFER_MARGIN_MS (mc_media_handler_planned_transfer_margin_seconds on MC Media Handlers). Env-test 02 asserts the MC margin < this − one heartbeat interval on every serving pod. A CONFIG ECHO; no labels (mh_drain_* family). Runbook: docs/runbooks/mc-deployment.md configuration reference (MC_PLANNED_TRANSFER_MARGIN_MS).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 165
+      },
+      "id": 226,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "editorMode": "code",
+          "expr": "max by (pod) (mh_drain_window_seconds)",
+          "legendFormat": "{{pod}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Planned Drain Window",
+      "type": "stat"
     }
   ],
   "refresh": "1m",

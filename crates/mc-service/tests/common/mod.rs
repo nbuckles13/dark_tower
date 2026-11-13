@@ -19,6 +19,8 @@ pub mod coordination;
 pub mod media_dial;
 pub mod media_session;
 pub mod otel_capture;
+#[cfg(feature = "test-seams")]
+pub mod replacement_rig;
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -181,8 +183,10 @@ struct LiveMh {
     running: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
     /// Handler ids that send NOTHING (a crashed or frozen MH) until resumed.
     silenced: Arc<Mutex<std::collections::HashSet<String>>>,
-    /// Handler ids that report DRAINING.
-    draining: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Handler ids that report DRAINING, with their drain deadline: each
+    /// heartbeat carries `drain_remaining_ms` RELATIVE to it, computed when
+    /// the beat is built (as MH-3 does), saturating at 0.
+    draining: Arc<Mutex<std::collections::HashMap<String, tokio::time::Instant>>>,
     /// Handler ids whose heartbeats carry this `apply_refusal`.
     refusals: Arc<
         Mutex<std::collections::HashMap<String, proto_gen::dark_tower::internal::v1::ApplyRefusal>>,
@@ -207,11 +211,13 @@ async fn live_heartbeats(live: LiveMh, meeting_id: String, handler_id: String, i
         {
             continue;
         }
-        let draining = live
+        let drain_deadline = live
             .draining
             .lock()
             .expect("draining mutex poisoned")
-            .contains(&handler_id);
+            .get(&handler_id)
+            .copied();
+        let draining = drain_deadline.is_some();
         let refusal = live
             .refusals
             .lock()
@@ -247,7 +253,14 @@ async fn live_heartbeats(live: LiveMh, meeting_id: String, handler_id: String, i
             } else {
                 proto_gen::dark_tower::internal::v1::ServingState::Serving
             },
-            drain_remaining_ms: if draining { 30_000 } else { 0 },
+            drain_remaining_ms: drain_deadline.map_or(0, |deadline| {
+                u32::try_from(
+                    deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis(),
+                )
+                .unwrap_or(u32::MAX)
+            }),
             applied_generation: applied,
             apply_refusal: refusal,
             connection_ids,
@@ -363,13 +376,37 @@ impl MockMhRegistrationClient {
         });
     }
 
-    /// Make `handler_id` report DRAINING from its next heartbeat.
+    /// The drain window a [`Self::drain`]ed fake reports: MH's base
+    /// `grace − shutdown margin` (35 − 5 s).
+    pub const DEFAULT_DRAIN_WINDOW: Duration = Duration::from_secs(30);
+
+    /// Make `handler_id` report DRAINING from its next heartbeat, with a drain
+    /// deadline [`Self::DEFAULT_DRAIN_WINDOW`] from now.
     pub fn drain(&self, handler_id: &str) {
+        self.drain_for(handler_id, Self::DEFAULT_DRAIN_WINDOW);
+    }
+
+    /// Make `handler_id` report DRAINING from its next heartbeat, with its
+    /// drain deadline `window` from now (`drain_remaining_ms` then counts down
+    /// to it on every beat, saturating at 0).
+    pub fn drain_for(&self, handler_id: &str, window: Duration) {
+        let deadline = tokio::time::Instant::now() + window;
         self.with_live(|l| {
             l.draining
                 .lock()
                 .expect("draining mutex poisoned")
-                .insert(handler_id.to_string());
+                .insert(handler_id.to_string(), deadline);
+        });
+    }
+
+    /// Make `handler_id` report SERVING again (a contract-violating flip-back:
+    /// MH never un-drains; MC must ignore it).
+    pub fn undrain(&self, handler_id: &str) {
+        self.with_live(|l| {
+            l.draining
+                .lock()
+                .expect("draining mutex poisoned")
+                .remove(handler_id);
         });
     }
 
@@ -1007,6 +1044,26 @@ pub fn replacement_timing() -> mc_service::media_routing::ReplacementTiming {
     )
 }
 
+/// The planned-transfer margin AS SHIPPED, read from `config.env` (story 4
+/// MC-F) — the same single source as [`replacement_timing`], never retyped.
+///
+/// # Panics
+///
+/// If `config.env` stops carrying the key as an integer.
+#[must_use]
+pub fn planned_transfer_timing() -> mc_service::media_routing::PlannedTransferTiming {
+    const CONFIG_ENV: &str = include_str!("../../../../infra/services/mc-service/config.env");
+    let key = "MC_PLANNED_TRANSFER_MARGIN_MS";
+    let ms: u32 = CONFIG_ENV
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
+        .unwrap_or_else(|| panic!("config.env carries {key}"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("{key} in config.env is an integer: {e}"));
+    mc_service::media_routing::PlannedTransferTiming::from_margin_ms(ms)
+}
+
 /// [`join_media_on`] answering replacement requests from `gc` (story 4 MC-C).
 pub fn join_media_with_gc(
     mh_client: Arc<MockMhRegistrationClient>,
@@ -1039,6 +1096,7 @@ pub fn join_media_full(
             media_dial,
             acquirer: gc,
             replacement: replacement_timing(),
+            planned_transfer: planned_transfer_timing(),
         }),
         // The actor-driven suite joins as an audio publisher with no
         // join-carried declaration (it declares post-join), story 2's shape.

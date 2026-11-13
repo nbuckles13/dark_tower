@@ -355,6 +355,18 @@ async fn an_owner_end_meeting_releases_by_the_message_not_by_silence() {
         .assert_delta(1);
 }
 
+/// Story 4 MC-F (O9): the drain-window gauge publishes `Config::drain_window`
+/// for a NON-deployed grace (47 s → 42 s, not the deployed 35 → 30), so a
+/// constant cannot pass; the value is the config's own derivation.
+#[test]
+fn the_drain_window_gauge_publishes_the_configured_window() {
+    let window = mh_service::config::drain_window_for(47);
+    assert_eq!(window, Duration::from_secs(42));
+    let snapshot = MetricAssertion::snapshot();
+    mh_service::observability::metrics::publish_drain_window(window);
+    snapshot.gauge("mh_drain_window_seconds").assert_value(42.0);
+}
+
 /// The two story-4 MH-3 config gauges (ADR-0032): each publishes its configured
 /// value in seconds (the idle timeout converted from ms once, at publish), with
 /// `key_custody`. Non-deployed values, so a constant cannot pass.

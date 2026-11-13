@@ -19,8 +19,8 @@ use crate::media_kind::KindLabels;
 use crate::media_routing::teardown::{EndMeetingOutcome, QuiesceOutcome};
 use crate::media_routing::{
     FloorAdoption, HeartbeatAnomaly, HeartbeatOutcome, HeartbeatTiming, MigrationOutcome,
-    MigrationPhase, PolicyPushOutcome, RemovalTrigger, ReplacementTiming, SettleOutcome,
-    SuspicionOutcome, Unapplied, APPLIED_SEQUENCE_LAG_BUCKETS,
+    MigrationPhase, PlannedTransferTiming, PolicyPushOutcome, RemovalTrigger, ReplacementTiming,
+    SettleOutcome, SuspicionOutcome, Unapplied, APPLIED_SEQUENCE_LAG_BUCKETS,
 };
 use crate::media_signaling::{
     slot_state_label, CapabilityOutcome, ClientMuteFanoutOutcome, DirectiveOutcome, MuteOutcome,
@@ -1085,25 +1085,23 @@ pub fn record_heartbeat_anomaly(reason: HeartbeatAnomaly) {
     .increment(1);
 }
 
-/// The `trigger` values a Dead/Impaired declaration emits (zero-initialised).
-/// `planned_transfer` is added by MC-F with its own recording site.
-pub const DETECTION_TRIGGERS: [RemovalTrigger; 2] =
-    [RemovalTrigger::HeartbeatTimeout, RemovalTrigger::ApplyLag];
-
-/// Record one Dead/Impaired declaration of a (meeting, handler), and how long
-/// detection took (ADR-0039 §2/§8).
+/// Record one Dead/Impaired declaration of a (meeting, handler), or one
+/// planned-transfer removal, and how long detection took (ADR-0039 §2/§8).
 ///
 /// Metrics: `mc_media_handler_declarations_total` (counter) and
 /// `mc_media_handler_detection_seconds` (histogram, buckets derived from N)
 /// Labels: `trigger` x `key_custody`; `trigger` from the ONE shared
-/// vocabulary (`RemovalTrigger::label`). This task emits `heartbeat_timeout`
-/// and `apply_lag`; `planned_transfer` is MC-F's.
+/// vocabulary (`RemovalTrigger::label`), every value zero-initialised.
 ///
 /// Detection starts at the declaration's EVIDENCE, per trigger:
 /// `heartbeat_timeout` from the last accepted heartbeat's receipt (or the
 /// first confirmed `RegisterMeeting` if none arrived); `apply_lag` from the lag
 /// onset (lag held past L) or from the refusing heartbeat's receipt
-/// (`STREAM_CEILING` / `EDGE_CAP`). Per (meeting, handler): one MH death is one
+/// (`STREAM_CEILING` / `EDGE_CAP`); `planned_transfer` (story 4 MC-F) from the
+/// first DRAINING heartbeat's receipt to the old handler's removal — for this
+/// trigger it is the TRANSFER duration, recorded at the planned removal only
+/// (never through the Dead/Impaired transition site, so a planned transfer
+/// never reaches the loss-metric snapshot). Per (meeting, handler): one MH death is one
 /// declaration per affected meeting. Recorded at the ONE transition site,
 /// whichever path (heartbeat, deadline arm) produced it. No identity labels.
 pub fn record_handler_declaration(trigger: RemovalTrigger, detection: Duration) {
@@ -1196,12 +1194,29 @@ pub fn set_replacement_timing(timing: ReplacementTiming) {
     .set(timing.backoff_max().as_secs_f64());
 }
 
+/// Publish the planned-transfer cutover margin (story 4 MC-F).
+///
+/// Metric: `mc_media_handler_planned_transfer_margin_seconds`
+/// Labels: `key_custody` (1)
+///
+/// CONFIG ECHO set once at boot from the SAME `PlannedTransferTiming` every
+/// meeting's cutover deadline subtracts (`MC_PLANNED_TRANSFER_MARGIN_MS`). MC
+/// cuts over at the draining heartbeat's `drain_remaining_ms` − this; env-test
+/// 02 compares it with MH's `mh_drain_window_seconds`.
+pub fn set_planned_transfer_margin(timing: PlannedTransferTiming) {
+    gauge!(
+        "mc_media_handler_planned_transfer_margin_seconds",
+        KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR
+    )
+    .set(timing.margin().as_secs_f64());
+}
+
 /// Record the outcome of the ONE `EndMeeting` a handler REMOVAL sends
 /// (ADR-0039 §6), per (meeting, handler).
 ///
 /// Metric: `mc_media_handler_removal_releases_total`
-/// Labels: `trigger` (`heartbeat_timeout`, `apply_lag`) x `outcome`
-/// (`EndMeetingOutcome::REMOVAL`) x `key_custody`
+/// Labels: `trigger` (`RemovalTrigger::ALL`; `planned_transfer` since MC-F) x
+/// `outcome` (`EndMeetingOutcome::REMOVAL`) x `key_custody`
 ///
 /// Separate from `mc_media_end_meeting_total` on purpose: that series and its
 /// failure alert mean "an ENDED meeting was released", whereas a removal's
@@ -2710,20 +2725,20 @@ pub fn zero_initialize_counters() {
     for r in HeartbeatAnomaly::ALL {
         counter!("mc_media_handler_heartbeat_anomalies_total", "reason" => r.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
-    // Story 4 MC-B2: the triggers THIS task emits (planned_transfer is MC-F's).
-    for t in DETECTION_TRIGGERS {
+    // Story 4 MC-B2 + MC-F: every removal trigger (planned_transfer since MC-F).
+    for t in RemovalTrigger::ALL {
         counter!("mc_media_handler_declarations_total", TRIGGER_LABEL => t.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
     for o in SuspicionOutcome::ALL {
         counter!("mc_media_handler_suspicions_total", "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
     }
-    for t in DETECTION_TRIGGERS {
+    for t in RemovalTrigger::ALL {
         for o in EndMeetingOutcome::REMOVAL {
             counter!("mc_media_handler_removal_releases_total", TRIGGER_LABEL => t.label(), "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
         }
     }
-    // Story 4 MC-C: the FULL trigger vocabulary (planned_transfer included,
-    // so MC-F only starts emitting) x every outcome, and the phase histogram.
+    // Story 4 MC-C: the FULL trigger vocabulary (planned_transfer emitted
+    // since MC-F) x every outcome, and the phase histogram.
     for t in RemovalTrigger::ALL {
         for o in MigrationOutcome::ALL {
             counter!("mc_media_handler_migrations_total", TRIGGER_LABEL => t.label(), "outcome" => o.label(), KEY_CUSTODY_LABEL => KEY_CUSTODY_OPERATOR).increment(0);
@@ -2993,8 +3008,8 @@ mod tests {
         present_at_zero(
             r#"mc_media_handler_connected_set_corrections_total{key_custody="operator"}"#,
         );
-        // Story 4 MC-B2: detection series.
-        for t in DETECTION_TRIGGERS {
+        // Story 4 MC-B2: detection series (planned_transfer since MC-F).
+        for t in RemovalTrigger::ALL {
             present_at_zero(&format!(
                 r#"mc_media_handler_declarations_total{{trigger="{}",key_custody="operator"}}"#,
                 t.label()
@@ -3007,7 +3022,7 @@ mod tests {
             ));
         }
         present_at_zero(r#"mc_media_meetings_without_handlers{key_custody="operator"}"#);
-        for t in DETECTION_TRIGGERS {
+        for t in RemovalTrigger::ALL {
             for o in EndMeetingOutcome::REMOVAL {
                 present_at_zero(&format!(
                     r#"mc_media_handler_removal_releases_total{{trigger="{}",outcome="{}",key_custody="operator"}}"#,
@@ -3016,15 +3031,17 @@ mod tests {
                 ));
             }
         }
+        // Story 4 MC-F: planned_transfer is now zero-initialised on both
+        // (flipped from MC-B2's "absent until MC-F" assertion).
         for series in [
             "mc_media_handler_declarations_total",
             "mc_media_handler_removal_releases_total",
         ] {
             assert!(
-                !rendered
+                rendered
                     .lines()
                     .any(|l| l.starts_with(series) && l.contains(r#"trigger="planned_transfer""#)),
-                "{series}: planned_transfer is MC-F's to zero-initialise"
+                "{series}: planned_transfer is zero-initialised (story 4 MC-F)"
             );
         }
         // Story 4 MC-C: the FULL trigger vocabulary x every outcome, and the
@@ -4374,6 +4391,17 @@ mod tests {
         snap.gauge("mc_media_handler_replacement_retry_budget_seconds")
             .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
             .assert_value(59.5);
+    }
+
+    /// Story 4 MC-F: the margin echo publishes the SAME `PlannedTransferTiming`
+    /// the cutover deadline reads (a non-default 2500 ms -> 2.5 s).
+    #[test]
+    fn planned_transfer_margin_gauge_echoes_the_config() {
+        let snap = MetricAssertion::snapshot();
+        set_planned_transfer_margin(PlannedTransferTiming::from_margin_ms(2_500));
+        snap.gauge("mc_media_handler_planned_transfer_margin_seconds")
+            .with_labels(&[(KEY_CUSTODY_LABEL, KEY_CUSTODY_OPERATOR)])
+            .assert_value(2.5);
     }
 
     /// Story 4 MC-C: each migration outcome moves only its own (trigger,

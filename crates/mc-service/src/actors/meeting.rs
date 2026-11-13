@@ -68,6 +68,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 /// The health decision's driver and the removal transaction (ADR-0039 §2/§6).
 mod health;
+mod planned_transfer;
 mod replacement;
 
 /// Default channel buffer size for the meeting mailbox.
@@ -827,6 +828,10 @@ pub struct MeetingActor {
     /// replacements, the ONE in-flight `AcquireMediaHandler` and the grants
     /// still Registering. See `meeting/replacement.rs`.
     replacement: replacement::Replacement,
+    /// Planned transfers off DRAINING handlers (ADR-0039 §4; story 4 MC-F):
+    /// per draining handler, its cutover deadline, grant and target rule. See
+    /// `meeting/planned_transfer.rs`.
+    planned: crate::media_routing::planned_transfer::PlannedTransfers,
     /// Set when the meeting has ended and the actor should leave its loop
     /// through the clean exit path (which releases the handlers).
     end_cause: Option<MeetingEndCause>,
@@ -1065,6 +1070,7 @@ impl MeetingActor {
             media,
             join_park,
             replacement,
+            planned: crate::media_routing::planned_transfer::PlannedTransfers::default(),
             end_cause: None,
             timers: MeetingTimers::default(),
             created: Instant::now(),
@@ -1211,6 +1217,12 @@ impl MeetingActor {
 
             // Check for terminated connection actors
             self.check_connection_health().await;
+            // THE planned-transfer post-turn hook (story 4 MC-F): whatever the
+            // last turn changed (a connect, a leave, a grant going Active, an
+            // Acquire answer, an elapsed deadline), cut over what is now due
+            // or covered — before the wakes below are computed, so an elapsed
+            // deadline is consumed and never re-arms.
+            self.check_planned_transfers().await;
             let settle_wake = self.media.next_settle_wake();
             let kek_wake = self.kek_wake();
             let fanout_wake = self.client_mute_fanout.next_wake(Instant::now());
@@ -1219,6 +1231,7 @@ impl MeetingActor {
             let health_wake = self.media.next_health_wake();
             let replacement_wake = self.replacement.next_wake();
             let join_window_wake = self.join_window_wake();
+            let transfer_wake = self.planned.next_wake();
 
             tokio::select! {
                 // Handle cancellation
@@ -1350,6 +1363,17 @@ impl MeetingActor {
                 } => {
                     self.on_replacement_due();
                 }
+
+                // A planned transfer's cutover deadline (story 4 MC-F). A tokio
+                // timer built per iteration, so paused test time drives it;
+                // the work happens in the post-turn hook at the top of the
+                // loop (the ONE place transfers are cut over).
+                () = async {
+                    match transfer_wake {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
 
                 // The ONE in-flight AcquireMediaHandler answered (a oneshot
                 // held only while the call is open: never awaited in a turn).

@@ -26,6 +26,11 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 
+/// The attempt-end reason of a superseded grant (GC had capacity; re-asked
+/// at once). ONE constant, because `end_attempt` DECIDES on it (a superseded
+/// attempt is not a "no grant" answer), not just logs it.
+const SUPERSEDED: &str = "superseded";
+
 /// Why a migration started (the start log's `reason`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StartReason {
@@ -33,6 +38,8 @@ pub(super) enum StartReason {
     Declared,
     /// The handler's FIRST `RegisterMeeting` never acked (ADR-0039 §3).
     InitialRegistrationFailed,
+    /// A planned transfer cut a DRAINING handler over (story 4 MC-F).
+    PlannedTransfer,
 }
 
 impl StartReason {
@@ -40,6 +47,7 @@ impl StartReason {
         match self {
             Self::Declared => "declared",
             Self::InitialRegistrationFailed => "initial_registration_failed",
+            Self::PlannedTransfer => "planned_transfer",
         }
     }
 }
@@ -64,6 +72,18 @@ impl Replacement {
             state: ReplacementState::new(target, seed),
             pending: None,
         }
+    }
+
+    /// Owe `id`'s replacement while it is still a member (planned transfer;
+    /// MC-C's one acquisition path). Returns whether it was interval-deferred.
+    pub(super) fn on_draining(
+        &mut self,
+        id: &HandlerId,
+        declared_at: Instant,
+        now: Instant,
+        timing: crate::media_routing::ReplacementTiming,
+    ) -> bool {
+        self.state.on_draining(id, declared_at, now, timing)
     }
 
     /// The attempt timer's wake.
@@ -105,7 +125,9 @@ impl MeetingActor {
             return;
         };
         let now = Instant::now();
-        let members_after = self.media.handlers().len();
+        // Draining members do not count toward the target (story 4 MC-F):
+        // the ONE count every removal path passes.
+        let members_after = self.media.non_draining_member_count();
         let RemovalEffect {
             refused,
             started,
@@ -181,12 +203,17 @@ impl MeetingActor {
             .due(now, version, exclude.len(), cap, deps.replacement)
         {
             Due::Idle => {}
-            Due::NoCap => warn!(
-                target: "mc.actor.meeting",
-                meeting_id = %self.meeting_id,
-                "Media handler replacement postponed: no exclude-list cap from GC yet (MC not \
-                 registered with GC); nothing sent"
-            ),
+            Due::NoCap => {
+                warn!(
+                    target: "mc.actor.meeting",
+                    meeting_id = %self.meeting_id,
+                    "Media handler replacement postponed: no exclude-list cap from GC yet (MC \
+                     not registered with GC); nothing sent"
+                );
+                // No grant can come now: a planned transfer's survivors become
+                // eligible (story 4 MC-F).
+                self.planned.no_grant();
+            }
             Due::Refused(refused) => {
                 for owed in refused {
                     self.end_attempt(&owed, None, MigrationOutcome::RateLimited, "attempt_bound");
@@ -260,7 +287,7 @@ impl MeetingActor {
                 &owed,
                 granted.as_ref(),
                 MigrationOutcome::Abandoned,
-                "superseded",
+                SUPERSEDED,
             );
             self.replacement.state.retry_superseded(owed, now, timing);
             return;
@@ -304,6 +331,11 @@ impl MeetingActor {
                             handler_set_version = change.version,
                             "Media handler replacement granted; registering it"
                         );
+                        if owed.trigger == RemovalTrigger::PlannedTransfer {
+                            if let Some(replaced) = &owed.replaced {
+                                self.planned.granted(replaced, &id);
+                            }
+                        }
                         self.replacement.state.granted(id, owed, now, timing);
                         self.publish_handlerless();
                         // Spawns its push worker: RegisterMeeting (with the
@@ -417,12 +449,17 @@ impl MeetingActor {
                         MigrationPhase::Registration,
                         now.saturating_duration_since(granted.granted_at),
                     );
-                    self.end_attempt(
-                        &granted.owed,
-                        Some(&report.handler_id),
-                        MigrationOutcome::Completed,
-                        "registered",
-                    );
+                    // A planned grant's Active records nothing: its
+                    // transfer's terminal is recorded at the old handler's
+                    // removal (story 4 MC-F, lead ruling 1).
+                    if granted.records_on_active() {
+                        self.end_attempt(
+                            &granted.owed,
+                            Some(&report.handler_id),
+                            MigrationOutcome::Completed,
+                            "registered",
+                        );
+                    }
                     self.check_reconnects();
                 }
             }
@@ -459,8 +496,10 @@ impl MeetingActor {
         }
     }
 
-    /// The meeting is ending: every open attempt is `abandoned`.
+    /// The meeting is ending: every open attempt is `abandoned`, and so is
+    /// every open planned transfer.
     pub(super) fn end_replacement(&mut self) {
+        self.end_planned_transfers();
         if let Some(pending) = self.replacement.pending.take() {
             pending.task.abort();
         }
@@ -481,16 +520,27 @@ impl MeetingActor {
 
     /// THE end of one acquisition attempt: counts its ONE outcome and emits
     /// its terminal log line (ids in the log only; bounded fields otherwise).
-    /// The only caller of `record_migration` in the replacement driver, so
-    /// "exactly one outcome per attempt" holds by construction.
+    /// The only recorder of ATTEMPT outcomes (a planned transfer's terminal is
+    /// `end_transfer`'s; the two share the `abandoned` token), so "exactly one
+    /// outcome per attempt" holds by construction.
+    ///
+    /// Also THE one place "the acquisition answered no grant" is derived for
+    /// planned transfers (code-review F3): every attempt that ends without a
+    /// usable grant — any outcome but `completed`, except a `superseded` grant
+    /// (re-asked at once, GC did have capacity) — makes the open transfers'
+    /// survivors eligible. `Due::NoCap` (no attempt was made) is the only
+    /// other site.
     fn end_attempt(
-        &self,
+        &mut self,
         owed: &Owed,
         new_handler: Option<&HandlerId>,
         outcome: MigrationOutcome,
         reason: &'static str,
     ) {
         metrics::record_migration(owed.trigger, outcome);
+        if outcome != MigrationOutcome::Completed && reason != SUPERSEDED {
+            self.planned.no_grant();
+        }
         info!(
             target: "mc.actor.meeting",
             meeting_id = %self.meeting_id,
