@@ -2654,7 +2654,7 @@ tasks:
   tier: light
   tier_reason: 'Guard machinery only: dt-guard rules and fixtures with no runtime behaviour, no wire contract, no secrets'
 - id: 28
-  status: pending
+  status: completed
   specialist: operations
   deps:
   - 9
@@ -2840,6 +2840,7 @@ tasks:
     (b) Remove remaining runbook references to retired surfaces: re-assert, legacy connection_id, and the pending-path timeout if MH-1 left any.
     (c)–(e) Not applicable.
     Tier: light. Documentation only: no proto, no wire, no secrets, no code.
+  slug: 2026-11-13-mh-replacement-runbooks
   tag: story-2026-10-31-survive-handler-loss-task-OPS
   tier: light
   tier_reason: 'Documentation only: runbooks and docs/TODO.md entries, no code, wire, auth or GSA'
