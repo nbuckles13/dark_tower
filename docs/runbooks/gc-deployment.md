@@ -629,7 +629,7 @@ psql $DATABASE_URL
 | `BIND_ADDRESS` | No | TCP bind address for HTTP server | `0.0.0.0:8080` | `0.0.0.0:8080` |
 | `JWT_CLOCK_SKEW_SECONDS` | No | Allowed clock skew for JWT validation | `60` | `60` |
 | `RUST_LOG` | No | Logging level | `info` | `info,gc_service=debug` |
-| `GC_MH_LOAD_REPORT_INTERVAL_MS` | **Yes** | Load-report interval (ms) GC pushes to every MH in `RegisterMHResponse`; range [1000, 60000]. The MH staleness bound is derived from it: B = `GC_MH_STALENESS_MULTIPLIER` × this. Published as `gc_mh_load_report_interval_seconds` (GC's configured value, not the cadence running MHs use). **Not a one-step change**: an MH adopts the interval only when it registers, but a new B applies fleet-wide as soon as GC rolls, and every MH's live cadence must stay well below every GC replica's B. To lower it: roll GC, then roll the MH fleet so every MH re-registers and adopts the new interval (each new pod is a new incarnation): replace each MH with `./infra/kind/scripts/mh.sh up --owner <owner>` then `./infra/kind/scripts/mh.sh drain <k> --owner <owner>` (`<owner>` = the slot's owner in `mh.sh list`, normally `baseline`), one at a time (MH is a per-slot pool; never `rollout restart` an `mh-s<k>`). **Rolling the MH fleet sheds every media session on each pod it restarts**, so schedule it as a media-disrupting event ([`mh-deployment.md` §Rollout With Media Flowing](mh-deployment.md#rollout-with-media-flowing)). Do the lowering in one step only if k × new interval stays comfortably above the old interval; otherwise raise the multiplier first, in a separate rollout. To raise it: keep the new interval well below the current B (k × old interval), or raise the multiplier first. | Reference `10000` (config.env) | `10000` |
+| `GC_MH_LOAD_REPORT_INTERVAL_MS` | **Yes** | Load-report interval (ms) GC pushes to every MH in `RegisterMHResponse`; range [1000, 60000]. The MH staleness bound is derived from it: B = `GC_MH_STALENESS_MULTIPLIER` × this. Published as `gc_mh_load_report_interval_seconds` (GC's configured value, not the cadence running MHs use). **Not a one-step change**: an MH adopts the interval only when it registers, but a new B applies fleet-wide as soon as GC rolls, and every MH's live cadence must stay well below every GC replica's B. To lower it: roll GC, then roll the MH fleet so every MH re-registers and adopts the new interval (each new pod is a new incarnation): replace each MH with `./infra/kind/scripts/mh.sh up --owner <owner>` then `./infra/kind/scripts/mh.sh drain <k> --owner <owner>` (`<owner>` = the slot's owner in `mh.sh list`, normally `baseline`), one at a time (MH is a per-slot pool; never `rollout restart` an `mh-s<k>`). Rolling the MH fleet drains each replaced MH and MC moves its meetings (a small blip per meeting; only what is not moved by the drain deadline is shed), so schedule it like any MH roll ([`mh-deployment.md` §Rollout With Media Flowing](mh-deployment.md#rollout-with-media-flowing)); `./infra/kind/scripts/mh.sh upgrade` does not help here (it replaces only revision-stale MHs). Do the lowering in one step only if k × new interval stays comfortably above the old interval; otherwise raise the multiplier first, in a separate rollout. To raise it: keep the new interval well below the current B (k × old interval), or raise the multiplier first. **Alert derivation that cites it:** `GCMhRegistrationPingPong` (lands with OBS-ALERTS; `gc-incident-response.md` Scenario 14) assumes two live MHs on one address evict each other at this cadence (~2 supersedes per 10 s at the default, ~120 per 10 m against its `superseded >= 20` floor), and the `address_conflict` warning's `for:` is anchored to B; re-derive both if this value or k changes. | Reference `10000` (config.env) | `10000` |
 | `GC_MH_STALENESS_MULTIPLIER` | **Yes** | k in B = k × `GC_MH_LOAD_REPORT_INTERVAL_MS`, the ONE MH freshness bound (selection, stale sweep incl. draining, `gc_mh_available`); range [2, 10]. Published as `gc_mh_staleness_threshold_seconds`. Takes effect when GC rolls. Raising k is always safe; lowering k shrinks B immediately and follows the same cadence-below-every-replica's-B rule as the interval. | Reference `3` | `3` |
 | `GC_MH_REGISTRY_RETENTION_SECONDS` | **Yes** | Registry rows with no load report for this long are deleted on the MH health-checker tick (rows are per MH incarnation). Must exceed B (compared in ms) and be at most `2592000` (30 d); otherwise startup fails. | Reference `3600` | `3600` |
 | `GC_MH_INITIAL_HANDLERS_PER_MEETING` | **Yes** | MHs selected for a NEW meeting (fewer if fewer are selectable); range [1, 4]. Existing meetings are unaffected. | Reference `2` | `2` |
@@ -661,7 +661,7 @@ rendered allowlist keys, the render input (kind-config / helper port table / MH 
 | Cause | Signal | Where the answer is |
 |---|---|---|
 | Key absent from the `gc-service-config` ConfigMap (the Deployment's `configMapKeyRef` is hard) | `CreateContainerConfigError`: no container ever runs | `kubectl describe pod -n dark-tower -l app=gc-service` names the missing key. `kubectl logs` is **empty** |
-| Key present but out of range, non-numeric, or retention ≤ the staleness bound; or an allowlist key EMPTY (render skipped) or malformed | `CrashLoopBackOff` | `kubectl logs --previous -n dark-tower -l app=gc-service`: the `ConfigError` names the key |
+| Key present but out of range, non-numeric, or retention ≤ the staleness bound; or an allowlist key EMPTY (render skipped) or malformed | `CrashLoopBackOff` | `kubectl logs --previous -n dark-tower -l app=gc-service --tail=-1`: the `ConfigError` names the key |
 
 The shared explanation of why the `kubectl logs` reflex misleads here is `mc-deployment.md`
 [§Config-failure triage](mc-deployment.md#config-failure-triage-three-signals-and-kubectl-logs-is-wrong-for-all-three).
@@ -1450,16 +1450,16 @@ kubectl rollout undo deployment/gc-service -n dark-tower
 
 ```bash
 # Errors in last hour
-kubectl logs -n dark-tower -l app=gc-service --since=1h | grep -i "error"
+kubectl logs -n dark-tower -l app=gc-service --tail=-1 --since=1h | grep -i "error"
 
 # Failed meeting joins
-kubectl logs -n dark-tower -l app=gc-service --since=1h | grep "join.*failed"
+kubectl logs -n dark-tower -l app=gc-service --tail=-1 --since=1h | grep "join.*failed"
 
 # Database connection issues
-kubectl logs -n dark-tower -l app=gc-service --since=1h | grep -i "database.*error"
+kubectl logs -n dark-tower -l app=gc-service --tail=-1 --since=1h | grep -i "database.*error"
 
 # MC assignment failures
-kubectl logs -n dark-tower -l app=gc-service --since=1h | grep -i "mc_assignment.*error"
+kubectl logs -n dark-tower -l app=gc-service --tail=-1 --since=1h | grep -i "mc_assignment.*error"
 ```
 
 ---

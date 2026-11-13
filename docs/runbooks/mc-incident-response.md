@@ -86,6 +86,12 @@ container name, so `kubectl ... deployment/mc-service` fails with
    - [Scenario 21: Server Mute Not Enforced](#scenario-21-server-mute-not-enforced)
    - [Scenario 22: Client Video Decode Failures](#scenario-22-client-video-decode-failures)
    - [Scenario 23: Client Video Slot Unfulfilled](#scenario-23-client-video-slot-unfulfilled)
+   - [Scenario 24: Media Handler Declared Dead or Impaired](#scenario-24-media-handler-declared-dead-or-impaired)
+   - [Scenario 25: Meetings Awaiting a Media Handler](#scenario-25-meetings-awaiting-a-media-handler)
+   - [Scenario 26: Media Handler Migration Timed Out](#scenario-26-media-handler-migration-timed-out)
+   - [Scenario 27: Several Media Handlers Declared Dead by One MC](#scenario-27-several-media-handlers-declared-dead-by-one-mc)
+   - [Scenario 28: Clients Report Handler Loss While Heartbeats Look Healthy](#scenario-28-clients-report-handler-loss-while-heartbeats-look-healthy)
+   - [Scenario 29: Heartbeat Misroute or Owner Mismatch](#scenario-29-heartbeat-misroute-or-owner-mismatch)
    - [Scenario 30: Joins Not Reaching MC](#scenario-30-joins-not-reaching-mc)
    - [Scenario 31: Meeting Not Found After a GC Join / Join-Window Ends](#scenario-31-meeting-not-found-after-a-gc-join--join-window-ends)
 4. [Diagnostic Commands](#diagnostic-commands)
@@ -1706,11 +1712,9 @@ Expected recovery time: bounded by the upstream MH/network fix; once resolved, i
 
 ### Scenario 12: RegisterMeeting Coordination Failures
 
-**Alert**: No alert today; surfaces in `mc_register_meeting_total{status="error"}` rate, `mc_register_meeting_duration_seconds` p95, and `RegisterMeeting retries exhausted` error logs at target `mc.register_meeting.trigger`. A second, distinct string — `RegisterMeeting failed terminally; not retried` — is a **different fault with the opposite remedy**; see Symptoms. May also co-fire MH-side [Scenario 24: Media-Dial Credential Rejections](mh-incident-response.md#scenario-24-media-dial-credential-rejections) (`no_meeting_key`) if a dial token ever reaches a client for an unregistered handler — which register-before-token (ADR-0039 §3) should make impossible.
+**Alert**: `MCRegisterMeetingFailureRate` (warning, lands with OBS-ALERTS, which owns the expression): the ratio `status="error"` over `status!="handler_replaced"` (success + error) > 0.10 for 5m. `handler_replaced` is out of the denominator so an in-place MH restart storm cannot dilute real errors (it is a later incarnation answering, not a coordination failure). Also surfaces in `mc_register_meeting_total{status="error"}` rate, `mc_register_meeting_duration_seconds` p95, and `RegisterMeeting retries exhausted` error logs at target `mc.register_meeting.trigger`. A second, distinct string — `RegisterMeeting failed terminally; not retried` — is a **different fault with the opposite remedy**; see Symptoms. May also co-fire MH-side [Scenario 24: Media-Dial Credential Rejections](mh-incident-response.md#scenario-24-media-dial-credential-rejections) (`no_meeting_key`) if a dial token ever reaches a client for an unregistered handler — which register-before-token (ADR-0039 §3) should make impossible.
 **Severity**: warning
 **Runbook Section**: `#scenario-12-registermeeting-coordination-failures`
-
-<!-- TODO: alert MCRegisterMeetingFailureRate — no alert rule exists today; this scenario is metric-driven triage. When observability adds a rule, link it here and remove this TODO. -->
 
 > **Note**: `mc_register_meeting_total{status="error"}` and `mc_register_meeting_duration_seconds` start at zero in production and only emit on the first first-participant join. A brand-new series is not itself an incident; `rate(...{status="error"}[5m]) > 0` against a non-trivial total rate is the actionable signal.
 
@@ -1767,7 +1771,7 @@ kubectl describe networkpolicy mc-service -n dark-tower
 3. **MH JWKS unable to validate MC's service token** — MC presents a token that MH rejects at Layer 1 auth. Cross-check `mh_jwt_validations_total{token_type="service",result="failure"}`. See [MH Sc 2: JWT Validation Failures](mh-incident-response.md#scenario-2-jwt-validation-failures).
 4. **MH overloaded** — RPC succeeds but slowly; p95 climbs into the timeout budget. Scale MH.
 5. **MC overloaded / mailbox backpressure** — first-participant trigger task is queued behind other work; the 1+2s retry budget elapses before the network path even matters. See [Scenario 1: High Mailbox Depth](#scenario-1-high-mailbox-depth).
-6. **A meeting's handler set names an MH that no longer exists** (drained / restarted after the meeting was created). Since story 4 MC-A a meeting's handler set is fixed when GC assigns it and is never re-read (no join reads Redis), so MC will exhaust retries against that endpoint for the meeting's life. Compare the failing `mh_grpc_endpoint` in MC's "RegisterMeeting retries exhausted" line with the live MH pods.
+6. **A meeting's handler set names an MH that no longer exists** (drained / restarted after the meeting was created). Since story 4 MC-C this **self-heals**: a handler whose `RegisterMeeting` never acks (push retries exhausted) leaves the meeting's set, and a `RegisterMeeting` failure against a fresh grant adds that handler to the meeting's exclude list (`mc_media_handler_migrations_total{outcome="admission_refused"}`), after which MC re-acquires from GC ([Scenario 25](#scenario-25-meetings-awaiting-a-media-handler)). A live handler that stops heartbeating is declared dead and replaced ([Scenario 24](#scenario-24-media-handler-declared-dead-or-impaired)). Compare the failing `mh_grpc_endpoint` in MC's "RegisterMeeting retries exhausted" line with `./infra/kind/scripts/mh.sh list --json` (`address`).
 
 **Remediation**:
 
@@ -1805,21 +1809,20 @@ kubectl rollout undo deployment/mc-0 -n dark-tower
 # Shed load instead by capping admission -- see MC_MAX_MEETINGS /
 # MC_MAX_PARTICIPANTS in docs/runbooks/mc-deployment.md.
 
-# Step 6: If a meeting's handler set names a gone MH — no Redis refresh fixes a
-#         LIVE meeting (its set is MC's own since story 4 MC-A). Until story 4's
-#         replacement path (MC-C), end the affected meeting; the new meeting
-#         gets a fresh assignment from GC. See Scenario 18 arm (f).
+# Step 6: If a meeting's handler set names a gone MH — nothing to do by hand:
+#         MC excludes the handler and re-acquires from GC (story 4 MC-C). Watch
+#         mc_media_handler_migrations_total{outcome=~"admission_refused|completed"}
+#         and mc_media_meetings_without_handlers (Scenarios 24, 25). No Redis
+#         refresh applies (the set is MC's own since story 4 MC-A).
 
 # Verify recovery
 sum by(status) (rate(mc_register_meeting_total[5m]))
 # status="success" should dominate; status="error" rate should drop to baseline.
 ```
 
-Expected recovery time: 30-60s for horizontal MC scale; 1-2 minutes for NetworkPolicy revert; 2-3 minutes for AC service-token rotation + MC restart. A meeting whose handler set names a gone MH: does not recover on its own until story 4's replacement path (MC-C); ending the meeting and rejoining recovers it.
+Expected recovery time: 30-60s for horizontal MC scale; 1-2 minutes for NetworkPolicy revert; 2-3 minutes for AC service-token rotation + MC restart. A meeting whose handler set names a gone MH: recovers on its own through exclusion and re-acquisition (story 4 MC-C), within the replacement retry budget (`mc_media_handler_replacement_retry_budget_seconds`).
 
 **Rollback nuance**: `RegisterMeeting` is a new RPC. If MH is rolled back to a pre-RegisterMeeting build, MC will keep sending the RPC, exhaust retries, and log `"RegisterMeeting retries exhausted"` for each affected meeting. **Clients ARE stranded by an MH rolled below MH-1**: since story 4 P3 the SDK sends only the `media_dial` token, which a pre-MH-1 MH cannot verify, so it admits no dial (`mh-deployment.md` §Rollback: the MH rollback floor is MH-1). Only a meeting with some assigned MHs on an MH-1+ build keeps media, via the active/active topology. If you must roll MH back during a coordinated incident, expect sustained `mc_register_meeting_total{status="error"}` for the duration of the rollback window; suppress alerts for that period rather than blocking the rollback.
-
-**Alert candidate** (breadcrumb for future observability work; out of scope here): a candidate threshold for an `MCRegisterMeetingFailureRate` alert would be `(sum(rate(mc_register_meeting_total{status="error"}[5m])) / sum(rate(mc_register_meeting_total[5m]))) > 0.10 and sum(rate(mc_register_meeting_total[5m])) > 0` for 5m at `severity: warning`, with `runbook_url` pointing at this scenario. This mirrors the shape of `MCHighJoinFailureRate`. See `<!-- TODO: alert ... -->` comment near the top of this scenario.
 
 **There is no MH-side window to tune.** Since story 4 MH-1, MH holds nothing for an unregistered meeting (ADR-0039 §3): a dial for it is DECLINED at accept. Sustained failures mean the coordination path is broken — fix the path.
 
@@ -1830,7 +1833,7 @@ Expected recovery time: 30-60s for horizontal MC scale; 1-2 minutes for NetworkP
 
 **Related Alerts**: MH-side `mh_jwt_validations_total{token_type="media_dial",failure_reason="no_meeting_key"}` (an ordering bug if it moves; MH Sc 24), `MCHighMailboxDepthWarning` (upstream cause when trigger task is queued).
 
-**Dashboards**: MC Overview → "RegisterMeeting RPC Rate by Status" + "RegisterMeeting RPC Latency (P50/P95/P99)" (the headline panels for this scenario, both in the MH Coordination row); MH Overview → "RegisterMeeting Receipts by Status" + "RegisterMeeting Timeouts (R-26)" (receiver-side correlates).
+**Dashboards**: MC Overview → "RegisterMeeting RPC Rate by Status" + "RegisterMeeting RPC Latency (P50/P95/P99)" (the headline panels for this scenario, both in the MH Coordination row); MH Overview → "RegisterMeeting Receipts by Status" (receiver-side correlate).
 
 ---
 
@@ -1846,11 +1849,11 @@ Expected recovery time: 30-60s for horizontal MC scale; 1-2 minutes for NetworkP
 **Symptoms** — read `mc_mh_notifications_unapplied_total` PER REASON, never as one rate:
 - `unknown_connection` — **routine**: every connection MC declined to bind sends a Disconnected for a key MC never recorded. Only sustained volume far above the join rate is a signal.
 - `meeting_unknown` — notifications naming a meeting this MC does not hold (both events).
-- `handler_not_in_set` — **the binding gate** (story 4 MC-B1): the MH-asserted `handler_id` is not byte-identical to a member of the meeting's handler set (never in it, or removed). A Connected is answered `sender_id` 0 and nothing is recorded; a Disconnected is a no-op. **Sustained**, it is an MH incarnation the meeting does not know — usually an MH process restarted under a new (per-incarnation) id; the meeting's connectivity to the dead id stays until handler-loss detection removes it (MC-B2) — see Scenario 18 arm (a).
+- `handler_not_in_set` — **the binding gate** (story 4 MC-B1): the MH-asserted `handler_id` is not byte-identical to a member of the meeting's handler set (never in it, or removed). A Connected is answered `sender_id` 0 and nothing is recorded; a Disconnected is a no-op. **Expected after a declaration** (story 4): a Connected from an out-of-set or removed handler — a zombie MH MC already removed, a late notification, or an in-place-restarted MH incarnation (new per-incarnation id) — gets `sender_id` 0 with **no binding recorded**; MC has already removed the dead id and is replacing it ([Scenario 24](#scenario-24-media-handler-declared-dead-or-impaired)). Investigate only when no declaration or removal precedes it.
 - `connection_id_missing` — an MH sent no `connection_id` (REQUIRED since story 4 MC-B1): refused, `sender_id` 0. Non-zero means an MH older than the story 2 task 20 image is in the fleet — a deploy-ordering violation (`mc-deployment.md` §Coordination); roll that MH forward.
 - `connection_bound_refused` — **expected-empty**: one participant exceeded the per-handler live-connection bound (a reconnect storm or leaked sessions).
 - `retired_connection` — a Connected delivered after its own Disconnected (MH abandoned the RPC); MC's tombstone refused it. Non-zero means MH→MC RPCs are slow enough to be abandoned — check MH Scenario 10.
-- `mc_media_handler_connected_set_corrections_total` rising — lost Disconnecteds being healed by the handlers' heartbeats (remove-only reconcile, story 4 MC-B1). Sustained, the MH→MC notification path is lossy: check MH Scenario 10.
+- `mc_media_handler_connected_set_corrections_total` rising — lost Disconnecteds being healed by the handlers' heartbeats (remove-only reconcile, story 4 MC-B1). Sustained, the MH→MC notification path is lossy: check MH Scenario 10. **A single burst about equal to one handler's whole connected set** → [Scenario 28](#scenario-28-clients-report-handler-loss-while-heartbeats-look-healthy) forged branch (the empty-list forgery shape).
 
 **Impact**: operational drift in the unknown-meeting shapes; **silence** in the `handler_not_in_set` and `connection_bound_refused` shapes (a participant MC believes is not on a handler gets no edges there). The security reading is unchanged: MC authorizes MH on scope alone and every MH pod shares one service identity, so a compromised MH can assert connections for handlers of a meeting's own set (blast radius: misrouting inside that meeting's registered handlers — never cross-meeting; `docs/TODO.md` §Media Path Obligations).
 
@@ -1885,7 +1888,7 @@ kubectl exec -it deployment/gc-service -n dark-tower -- \
 
 1. **Diffuse, many-MH, many-meeting `meeting_unknown` → Operational drift.** GC reassigned meetings but an old MH notified briefly; or MC restarted and lost its meeting actors, so in-flight notifications name meetings the new instance never held. Self-heals as participants reconnect (a fresh join re-dials every MH).
 2. **Concentrated, single-MH source identity, many unknown meetings → Authenticated-MH misbehavior.** Compromised MH credentials probing the MediaCoordinationService, or a misconfigured MH notifying the wrong MC. **Treat as a security incident**: preserve logs, snapshot the metrics, do **NOT** restart MC, escalate to Security Team.
-3. **Sustained `handler_not_in_set` on one meeting → an MH restarted.** Its new process registered under a new id outside the meeting's handler set; the binding gate refuses it (`sender_id` 0). Until handler-loss detection (story 4 MC-B2) removes the dead id, see Scenario 18 arm (a) for the remedy participants have today.
+3. **`handler_not_in_set` after a declaration → expected.** A removed handler (zombie, late notification, or an in-place restart's new incarnation) is refused by the binding gate (`sender_id` 0, nothing recorded); MC removes the dead id and migrates the meeting on its own ([Scenario 24](#scenario-24-media-handler-declared-dead-or-impaired)). With no preceding declaration it is an MH contract defect: MC Team.
 4. **`connection_bound_refused` → reconnect storm / leaked sessions from one participant.** Self-scoped (only that participant is affected). Correlate with the client's reconnect behaviour.
 
 **Remediation**:
@@ -1903,7 +1906,7 @@ kill %1
 # Escalate to Security Team via #security-incidents.
 ```
 
-Expected recovery time: branch-dependent. Operational drift self-heals over 5-15m. Authenticated-misbehavior: bounded by Security's investigation (do not auto-recover). `handler_not_in_set`: persists until affected participants rejoin (story 4 closes it).
+Expected recovery time: branch-dependent. Operational drift self-heals over 5-15m. Authenticated-misbehavior: bounded by Security's investigation (do not auto-recover). `handler_not_in_set`: stops once the removed handler's clients have left it (they follow the set without it).
 
 **What this scenario tells you**: a diagnostic-appendix scenario. Use it when you are already investigating a different signal and `mc_mh_notifications_unapplied_total` does not fit the surrounding incident. If you found this scenario via an alert, the alert is wrong — file an issue.
 
@@ -1914,7 +1917,7 @@ Expected recovery time: branch-dependent. Operational drift self-heals over 5-15
 
 **Related Alerts**: `MCActorPanic`, MH-side `MHCallerTypeRejected`; MH-side [Scenario 10: MH→MC Notification Failures](mh-incident-response.md#scenario-10-mhmc-notification-failures) (the sender-side view of the same RPC pair).
 
-**Dashboards**: MC Media Path → Media Connectivity row ("MH Notifications Unapplied by Reason", "Notifications Without Connection Id"), and MC Overview → MH Coordination row ("MH Notifications by Event"). The two are separate dashboards since story 2 task 12; each links to the other.
+**Dashboards**: MC Media Path → Media Connectivity row ("MH Notifications Unapplied by Reason"), and MC Overview → MH Coordination row ("MH Notifications by Event"). The two are separate dashboards since story 2 task 12; each links to the other.
 
 ---
 
@@ -2466,8 +2469,12 @@ generation 7; MH runs generation 4.** The call succeeded. Echoing on *receipt* r
 > **clears on its own** within the next roster event — check whether it already has (Step 1's
 > counter stops moving) before acting.
 >
-> If the meeting is **quiescent** (nobody joining, leaving or toggling), nothing will re-push: force
-> a structural change. **An MC restart against a live handler is a separate arm and self-corrects on
+> If the meeting is **quiescent** (nobody joining, leaving or toggling), nothing will re-push — but
+> since story 4 that no longer strands it. **Generation lag is now the `APPLY_LAG` health input**:
+> every heartbeat reports the handler's applied generation, and a handler that stays behind for
+> longer than L (2N, 12 s at the default) is declared Impaired and the meeting migrated off it
+> ([Scenario 24](#scenario-24-media-handler-declared-dead-or-impaired)). Force a structural change
+> only if that did not happen. **An MC restart against a live handler is a separate arm and self-corrects on
 > the first post-restart structural change**: MC re-derives generations from 1 while MH still holds
 > K, MH echoes K, and MC adopts K as a floor and re-pushes at K+1 — do not force anything for it;
 > see Scenario 18 arm (e) for what participants see meanwhile. **This arm is NOT under any
@@ -2510,7 +2517,7 @@ sum by(outcome) (increase(mc_media_policy_pushes_total[15m]))
 
 > **Do not "fix" `no_applied_generation` by making MH stricter.** MH deliberately does **not** reject
 > `policy_generation: 0`, because MC and MH roll independently: MH-first rejection would register no
-> meeting and kick every client at the registration timeout. That is ADR-0036 §8's opening
+> meeting and leave every client of it without media. That is ADR-0036 §8's opening
 > paragraph almost verbatim — the permanent-media-blackhole-reached-through-an-ordinary-rolling-deploy
 > failure the applied-generation echo exists to prevent. A responder who reads "rollout skew" and
 > reaches for stricter MH validation is reaching for the exact change the design forbids.
@@ -3480,7 +3487,8 @@ crossing.
   unobservable from the client's presentation: the SDK renders no banner (the error is only
   stored), slots still claim `ACTIVE`, and silence looks exactly like arms (a)–(d). Participants may
   report "I can't hear anyone" — or nothing at all.
-- **Do not restart MH to clear it.** It sheds every session on the pod, recovers no affected
+- **Do not restart MH to clear it.** A replacement drains the pod and MC moves every meeting on it (a
+  blip per meeting; only what is not moved by the drain deadline is shed); it recovers no affected
   meeting, and destroys the evidence.
 
 **(f) The join succeeded but its handler set is empty or partial, so nobody has media (story 4
@@ -3595,13 +3603,16 @@ derived from the pod's termination grace — read the effective value off this p
 = grace − pre-drain sleep − margin, drift-tested against both manifests) — but does NOT tell GC (the meeting is not over; a successor MC may take it). A shutdown
 teardown still running at that deadline — in practice an unreachable handler — is cut off by process
 exit and reported on the pod's last ERROR line as `teardowns_cut_off=<n>`; each is one more
-registration the handler keeps until its restart. While a meeting id is being
+registration the handler keeps until MH's owner-silence release
+(`MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS`, default 900) or its restart, whichever is first. While a meeting id is being
 torn down MC holds a **fence** on it: a create for that id is parked and answered when the teardown
 completes (up to `MAX_QUEUED_CREATES` parked, in `crates/mc-service/src/actors/controller.rs`; beyond that the join fails with
 `mc_session_join_failures_total{error_type="teardown_in_progress"}`).
 
 **Why it matters.** A handler that never receives `EndMeeting` keeps the meeting's registration,
-routes and edge budget until it restarts. Since R-21 that consumes the ENFORCED
+routes and edge budget until the heartbeat retries the release (MC answers RELEASED(`MEETING_ENDED`))
+or, if MC is gone, until MH's owner-silence release (default 900 s, during which it still consumes
+`MH_MAX_REGISTERED_MEETINGS`). Since R-21 that consumes the ENFORCED
 `MH_MAX_REGISTERED_MEETINGS`, so the cost is progressive denial of NEW meetings on that handler,
 with no client-visible cause until then. A notify GC never received leaves GC reusing the ended
 meeting's assignment, and joins to that id fail with `meeting_not_found`.
@@ -3618,7 +3629,8 @@ meeting's assignment, and joins to that id fail with `meeting_not_found`.
 - `shutdown_release_budget_seconds` — how long a graceful shutdown lets its meetings' releases
   run before process exit cuts them off, derived from the pod's `terminationGracePeriodSeconds`.
   A teardown still running at that deadline is reported as `teardowns_cut_off=<n>` on the pod's
-  last ERROR line and leaks its registration until that handler restarts.
+  last ERROR line and holds its registration until MH's owner-silence release
+  (`MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS`, default 900) or that handler's restart, whichever is first.
 
 ```bash
 kubectl logs -n dark-tower deployment/mc-0 | grep "Configuration loaded successfully" | tail -1
@@ -3646,7 +3658,7 @@ sum(increase(mc_gc_meeting_ended_notifications_dropped_total[15m]))
 | Moved | Meaning | First move |
 |---|---|---|
 | `mc_media_end_meeting_total{outcome="unimplemented"}` | MH predates the RPC | Rollout order was reversed: MH rolls forward first, MC rolls back first (`mc-deployment.md` §Coordination). Counted once, never retried; the meeting is held by that MH until it restarts |
-| `{outcome="unavailable_exhausted"}` | MH unreachable; the bounded retries ran out | Fix MH reachability. The meetings already lost leak exactly like the crash path |
+| `{outcome="unavailable_exhausted"}` | MH unreachable; the bounded retries ran out | Fix MH reachability. **A lost `EndMeeting` is retried by the heartbeat** (story 4, ADR-0039 §6): MH keeps heartbeating the meeting, MC (no meeting actor any more) answers RELEASED(`MEETING_ENDED`), and MH ends it — counted `mc_media_handler_heartbeats_total{outcome="released_ended"}` (the lost-`EndMeeting` retry rate) and `mh_media_meeting_teardowns_total{outcome="released"}`. If MH cannot reach MC either, the owner-silence release (`MH_MEETING_OWNER_SILENCE_TIMEOUT_SECONDS`, default 900) reclaims it |
 | `{outcome="rejected_ownership"}` | MH says another MC owns a meeting that ENDED (`FAILED_PRECONDITION`) | MC sends only its own `mc_id`, so this is an MC defect or a stale/misrouted MC. Recovery order: `mh-incident-response.md` ownership-reject arm |
 | `{outcome="superseded_by_successor"}` | the same refusal on a graceful-shutdown release | **Expected during a rolling MC deploy**: a successor already took the meeting over, and MH refused a release that would have cut it. Consistent with supersession, not proof of it — rising OUTSIDE a rollout window is worth a look. No alert. MH's `rejected_ownership` is the UNION of this value and the row above: compare against their sum, never token to token |
 | `{outcome="invalid_argument"}` or `{outcome="error"}` | MH refused the request shape, or an unclassified failure | MC defect; the `mc.teardown` ERROR line carries the gRPC code and message. Escalate to `meeting-controller` |
@@ -3665,8 +3677,10 @@ teardown — is an ABSENT event. An edge-holding one reaches `MHMediaEgressEdgeH
 a zero-edge registration has no rule (`docs/TODO.md` §Observability Debt, "No leading indicator for
 registered-meeting exhaustion"), so read `mh_media_registered_meetings` against `mh_media_registered_meetings_limit` on
 each handler: rising with pod uptime while `mh_media_meeting_teardowns_total{outcome="released"}`
-stays flat is that residual (`docs/TODO.md`, "A meeting whose MC never sends `EndMeeting` is never
-reclaimed").
+stays flat is that residual. **Since story 4 it is bounded**: a meeting with no MC actor is released
+by the RELEASED(`MEETING_ENDED`) verdict on MH's next heartbeat, and a meeting whose MC crashed by the
+owner-silence release ([`mh-incident-response.md` Scenario 25](mh-incident-response.md#scenario-25-meetings-held-without-clients));
+the residual is capacity held for up to the silence timeout.
 
 **A mass teardown is a connection burst, not a throughput problem.** MC opens a fresh gRPC channel per MH call, so N meetings ending at once means up to N x 2 concurrent TCP/TLS handshakes (and up to twice that when quiesce times out) against at most two endpoints. Measured `nofile` on the MC pod is 1,048,576, so this is not near exhaustion — **but if a `nofile` limit is ever set low on the MC container, descriptor exhaustion would be process-global and would take the DB pool, Redis and client sessions down for healthy meetings on the same pod.** If a teardown storm coincides with unrelated MC failures, check `ulimit -n` inside the pod first:
 
@@ -3677,8 +3691,9 @@ kubectl exec -n dark-tower deployment/mc-0 -- sh -c 'ulimit -n'   # expect ~1048
 The named remedy is channel REUSE (one channel per endpoint, multiplexed), not a teardown concurrency cap — a cap would lengthen the fence and the rejoin hold without lowering the push-side peak (`docs/TODO.md`, "MC opens a fresh gRPC channel per MH call").
 
 **Do not** restart MC to "clear" a teardown: a crash-like exit is exactly the path that releases
-nothing. **Do not** restart MH unless the registered-meetings check says the handler is at its
-limit — it sheds every live media session on the pod.
+nothing. **Do not** replace an MH unless the registered-meetings check says the handler is at its
+limit — it drains the pod and migrates every live meeting on it (`mh-deployment.md` §Rollout With
+Media Flowing).
 
 **A split meeting.** If participants of one meeting id end up on two MCs, suspect GC failover
 (`atomic_assign`'s unhealthy/stale-MC arm re-pointing the assignment to another MC on a join) racing the old MC's in-flight notify — the notify is not
@@ -3946,6 +3961,411 @@ decode, capture-state and recovery-request faults; Scenario 16 routing for key r
 
 **Related**: [MH Scenario 22](mh-incident-response.md#scenario-22-video-slot-stuck-pending);
 [Scenario 22](#scenario-22-client-video-decode-failures); `client-dev-local.md` F26.
+
+---
+
+### Scenario 24: Media Handler Declared Dead or Impaired
+
+**Alert**: none for a declaration itself (by design: raw declaration volume counts meetings, not
+handlers, and is never alerted on). Related warnings, each a rule name assigned by OBS-ALERTS (lands
+with OBS-ALERTS): MH false declarations, `mh_media_handler_releases_total{trigger="heartbeat_timeout",clients="present"}`
+sustained; MH crash rate, `rate(mc_media_handler_first_declarations_total{trigger="heartbeat_timeout"}[1h])`
+above a rule-owned threshold (per handler); migration failures with a survivor (Scenario 26).
+User impact pages only through `MCMediaMeetingsAwaitingHandler` ([Scenario 25](#scenario-25-meetings-awaiting-a-media-handler)).
+**Severity**: Informational (routine) — Warning when a related warning fires
+**Runbook Section**: `#scenario-24-media-handler-declared-dead-or-impaired`
+
+**What this is.** MC's meeting actor judges every (meeting, handler) pair from MH's per-meeting
+heartbeat (ADR-0039 §1, §2) and removes the handler, then asks GC for a replacement:
+- **Dead** (`trigger="heartbeat_timeout"`): no accepted heartbeat for longer than N
+  (`MC_MH_HEARTBEAT_TIMEOUT_MS`, default 6 s).
+- **Impaired** (`trigger="apply_lag"`): the handler's applied `policy_generation` stayed behind what
+  MC sent for longer than L (2N, 12 s at the default) — this is where a generation lag now lands
+  ([Scenario 15](#scenario-15-media-generation-divergence)) — or it reported a load-dependent
+  `apply_refusal` (`STREAM_CEILING`, `EDGE_CAP`).
+
+**One MH death produces one declaration PER MEETING** on it, all within about N, and all those
+meetings ask GC for a replacement at once (there is no per-MC limiter, user ruling 2026-10-31; GC's
+weighted-random selection spreads them). **That is expected: never act on raw declaration volume.**
+Clients see the dead handler drop out of their set and media resume on the survivors / replacement.
+
+**Symptoms**: `mc_media_handler_declarations_total` steps by the number of meetings on one handler;
+`mc_media_handler_migrations_total{outcome="completed"}` follows; a brief dip in client media.
+
+**Diagnosis**
+
+```promql
+# Declarations and migrations by trigger (per (meeting, handler) — counts MEETINGS)
+sum by (trigger) (increase(mc_media_handler_declarations_total[15m]))
+sum by (trigger, outcome) (increase(mc_media_handler_migrations_total[15m]))
+# How many distinct HANDLERS (the only handler-level count), and how many are in use
+sum by (trigger) (increase(mc_media_handler_first_declarations_total[15m]))
+sum(mc_media_handlers_in_use)
+# Detection and migration time (dashboard; observed, never gated)
+histogram_quantile(0.95, sum by (le, trigger) (rate(mc_media_handler_detection_seconds_bucket[15m])))
+histogram_quantile(0.95, sum by (le, trigger, phase) (rate(mc_media_handler_migration_duration_seconds_bucket[15m])))
+# The required metric: did clients see the loss before MC declared it? (heartbeat_timeout/apply_lag only)
+histogram_quantile(0.5, sum by (le) (rate(mc_media_handler_loss_prior_report_ratio_bucket[1h])))
+sum by (reported) (increase(mc_media_handler_loss_clients_total[1h]))
+histogram_quantile(0.5, sum by (le) (rate(mc_media_handler_loss_client_lead_seconds_bucket[1h])))
+# Interpretability condition (R-33): these two must be about equal
+max(mh_media_transport_idle_timeout_seconds)
+max(mc_media_handler_heartbeat_deadline_seconds)
+```
+
+- **The required metric is interpretable only when MH's QUIC idle timeout ≈ N** (both published,
+  above; deployed equal). If they differ, a low prior-report share means "clients were configured to
+  notice later", not "clients don't notice".
+- **Logs** (target `mc.actor.meeting`, one INFO per transition, never per heartbeat):
+  "Media handler health changed" (`from`/`to` = `healthy|lagging|draining|contract_fault|dead|impaired`,
+  `trigger`, `detection_ms`, `apply_refusal`, `applied_generation`, `owed_generation`), then
+  "Media handler removed from the meeting" (`survivors`, `bindings_released`), then
+  "Media handler migration started" / "Media handler replacement granted; registering it".
+- **Was it real?** A false declaration (MC's path to a live MH broke) is a **safe outcome**: one
+  unnecessary migration, a blip. MH counts it:
+  `sum(increase(mh_media_handler_releases_total{trigger="heartbeat_timeout",clients="present"}[1h]))`.
+  `apply_lag` + `present` is a correct removal of a live-but-slow MH; `planned_transfer` + `present`
+  is a drain.
+- **Several handlers at once from one MC**: [Scenario 27](#scenario-27-several-media-handlers-declared-dead-by-one-mc).
+- **A contract-fault apply refusal** (`apply_refusal` `INVALID` or `TRANSPORT_INCONSISTENT`, health
+  `contract_fault`) is **loud and NOT replaced**: it is an MC/MH contract defect, and moving the
+  meeting would only repeat it. Read MC's confirm-failure line and
+  [Scenario 15](#scenario-15-media-generation-divergence); escalate.
+
+**Resolution**
+1. Nothing to do for a single MH death: the meetings migrate. Confirm
+   `mc_media_meetings_without_handlers` is 0 and `migrations{outcome="completed"}` rose.
+2. **Restore fleet count**: `./infra/kind/scripts/mh.sh list --json` (the dead MH's slot usually
+   shows an in-place restart, `restart_count` up); if the pool is below baseline,
+   `mh.sh up --owner baseline` (or re-run `deploy.sh`).
+3. A crashlooping MH (the crash-rate warning) is replaced every time and hides behind migration:
+   `kubectl logs -n dark-tower -l dark-tower.io/mh-slot=<k> --tail=-1 --previous --prefix`; escalate to
+   `media-handler`.
+4. **A pod restart is a safe fence** for a suspect zombie MH: `mh.sh drain <k> --owner <owner>`
+   after `mh.sh up --owner <owner>` (the slot's owner in `mh.sh list`, normally `baseline`). Never force-delete it ([`mh-deployment.md`](mh-deployment.md#never-force-delete-an-mh-pod)).
+
+**Escalation**: `media-handler` for MH crashes or a sustained false-declaration rate;
+`meeting-controller` for contract-fault refusals or detection that looks wrong against the
+heartbeat interval histogram (`mc_media_handler_heartbeat_interval_seconds`).
+
+---
+
+### Scenario 25: Meetings Awaiting a Media Handler
+
+**Alert**: `MCMediaMeetingsAwaitingHandler` (PAGE; `max(mc_media_meetings_without_handlers) > 0`
+sustained past the replacement retry budget, `mc_media_handler_replacement_retry_budget_seconds`,
+139 s at the shipped defaults; lands with OBS-ALERTS). Related warnings (rule names assigned by
+OBS-ALERTS, lands with OBS-ALERTS): `mc_media_handler_migrations_total{outcome=~"no_capacity|gc_unavailable|admission_refused|timed_out"}`
+while a survivor exists; `gc_mh_replacement_requests_total{outcome="no_capacity"}`;
+`mc_media_handler_migrations_total{outcome="rate_limited"}` sustained.
+**Severity**: Critical (page)
+**Runbook Section**: `#scenario-25-meetings-awaiting-a-media-handler`
+
+**What this is.** A meeting with **zero live handlers** — its last handler was removed and no
+replacement has been granted yet (a granted handler still registering removes the meeting from the
+gauge, though media stays dark until it acks). It is media-dark with no self-repair beyond MC's
+retries. A meeting that still has a survivor is degraded, not dark, and only warns.
+
+**Symptoms**: participants in some meetings hear and see nothing; signalling, roster and joins still
+work.
+
+**Diagnosis**
+
+```promql
+max by (instance) (mc_media_meetings_without_handlers)
+sum by (trigger, outcome) (increase(mc_media_handler_migrations_total[15m]))
+sum by (outcome, gc_view) (increase(gc_mh_replacement_requests_total[15m]))
+max by (region, state) (gc_mh_available)   # max: every GC replica publishes the same gauge
+max(mc_media_handler_replacement_retry_budget_seconds)
+```
+
+Causes, in the order to check:
+1. **GC unavailable** — `migrations{outcome="gc_unavailable"}`, MC WARN "GC did not answer the
+   replacement request; staying on survivors and retrying". Fix GC first (`gc-incident-response.md`).
+2. **GC has no capacity** — `gc_mh_replacement_requests_total{outcome="no_capacity"}`,
+   `migrations{outcome="no_capacity"}`, MC WARN "GC has no replacement capacity; staying on survivors
+   and retrying". Check `gc_mh_available{state="healthy", region!="other"}` and the pool:
+   `./infra/kind/scripts/mh.sh list --json` (free slots?).
+3. **MH admission refusals** — `migrations{outcome="admission_refused"}`: the grant's
+   `RegisterMeeting` failed or it was declared before its first ack (log "Replacement grant removed
+   before its first RegisterMeeting ack", `removal_reason`); the handler joins the meeting's exclude
+   list and MC re-acquires. Read MH's apply outcomes (`mh-incident-response.md` Scenario 18).
+4. **`FAILED_PRECONDITION` from GC** — the caller is not the meeting's MC (GC holds no ownership row
+   for it): `migrations{outcome="abandoned"}` with MC ERROR "GC refused the replacement request; not
+   retried" (`reason=not_owner`). **Never retried; escalate** (anti-misroute check; `controller_id`
+   is self-asserted). `INVALID_ARGUMENT` (an over-long exclude list) is the same lane: an MC bug.
+5. **The attempt budget is spent** — `migrations{outcome="rate_limited"}`. Each meeting's
+   replacements are bounded by GC's exclusion cap (`GC_MH_MAX_EXCLUDE_HANDLER_IDS`, default 16 ≈ 14
+   lifetime replacements per meeting: its exclude list is current ∪ removed ∪ refused handlers).
+   At the bound every owed replacement counts `rate_limited` and the meeting stops acquiring.
+   - **Sustained `rate_limited`** across meetings means something keeps declaring handlers: a
+     flapping detector (check `mc_media_handler_suspicions_total` and the detection histogram) or a
+     forged-heartbeat loop ([Scenario 28](#scenario-28-clients-report-handler-loss-while-heartbeats-look-healthy)).
+   - **The per-meeting minimum interval** (`MC_MH_REPLACEMENT_MIN_INTERVAL_MS`, backoff to
+     `MC_MH_REPLACEMENT_BACKOFF_MAX_MS`) only spaces attempts. A deferral is NOT counted; it is
+     logged "Media handler replacement deferred by the per-meeting minimum interval"
+     (`reason=min_interval`).
+
+**Resolution**
+- It **self-recovers when a grant arrives**: no action on the MC side.
+- Add capacity: `./infra/kind/scripts/mh.sh up --owner manual` (check a free slot first; exit 3
+  `mh-no-free-slot` = pool exhausted, `mh-deployment.md` §Address pool exhausted). Once the
+  incident clears, retire it: `mh.sh drain <k> --owner manual` (`deploy.sh` never removes a `manual`
+  MH, and it holds a slot the next upgrade needs).
+- Fix GC if it is unavailable or refusing.
+- A `rate_limited` meeting stays on its survivors (if any); rejoining after it has ended resets it.
+- Never scale MH to zero to "reset" anything (`mh-deployment.md` §Scaling MH to zero).
+
+**Escalation**: `global-controller` for GC unavailability, `no_capacity` with free MHs, or
+`FAILED_PRECONDITION`; `meeting-controller` for `INVALID_ARGUMENT` and a sustained `rate_limited`;
+`security` if the `rate_limited` driver looks forged (Scenario 28).
+
+---
+
+### Scenario 26: Media Handler Migration Timed Out
+
+**Alert**: migration failures while a survivor exists,
+`mc_media_handler_migrations_total{outcome=~"no_capacity|gc_unavailable|admission_refused|timed_out"}`
+(warning; rule name assigned by OBS-ALERTS, lands with OBS-ALERTS). It also carries the **drain-shed
+reading** `mc_media_handler_migrations_total{trigger="planned_transfer", outcome="timed_out"}`.
+**Severity**: Warning
+**Runbook Section**: `#scenario-26-media-handler-migration-timed-out`
+
+**What this is.** A planned transfer (an MH draining on SIGTERM: `mh.sh drain`, `upgrade`,
+`deploy.sh`) did not complete its make phase by the drain deadline: at
+`drain_remaining_ms − MC_PLANNED_TRANSFER_MARGIN_MS` (5000 ms shipped) MC cut over with stragglers
+not yet connected to the target, or **shed** the meeting because it had neither a grant nor a
+survivor. The drain deadline itself is MH's `terminationGracePeriodSeconds − 5 s`. Stragglers see
+a longer gap; a shed meeting goes [awaiting a handler](#scenario-25-meetings-awaiting-a-media-handler).
+
+**Diagnosis**
+
+```promql
+sum by (trigger, outcome) (increase(mc_media_handler_migrations_total{trigger="planned_transfer"}[1h]))
+# Client dials to the target, by outcome
+sum by (phase, outcome) (increase(dt_client_mh_connection_total{outcome=~"declined|wrong_handler|timeout"}[1h]))
+# MH admission of those dials (media_dial), by reason
+sum by (failure_reason) (increase(mh_jwt_validations_total{token_type="media_dial",result="failure"}[1h]))
+# Token TTL / refresh actually configured, and MH's skew
+max(mc_media_dial_token_ttl_seconds)
+max(mc_media_dial_token_refresh_interval_seconds)
+max(mh_media_dial_clock_skew_seconds)
+# Re-push on client FAILED reports
+sum by (reason) (increase(mc_media_handler_set_pushes_total[1h]))
+```
+
+Logs (target `mc.actor.meeting`): "Planned handler transfer ended" with `outcome=timed_out`,
+`target=grant|survivor|none` (`none` = shed), `cutover`, `routable`, `stragglers`; the old MH's
+final `mh.drain` "Drain finished" line (`exit_reason`, `meetings_shed`, `shed_completed`;
+`shed_completed=false` = sessions ended code-less, an MH defect: escalate to `media-handler`).
+
+Check, in this order:
+1. **Client dial outcomes** — `declined` (token dead or refused: MH Scenario 24),
+   `wrong_handler` (the token's `aud` names another handler: an MC set/routing defect),
+   `timeout` (network path to the target's address).
+2. **`mh_jwt_validations_total{token_type="media_dial"}` by `failure_reason`** — `expired` points
+   at refresh or clock skew; `no_meeting_key` at register-before-token ordering
+   ([MH Scenario 24](mh-incident-response.md#scenario-24-media-dial-credential-rejections)).
+3. **MH exp skew** (`MH_MEDIA_DIAL_CLOCK_SKEW_SECONDS`, 0..=60, shipped 30) against node clock drift
+   — fix NTP, never raise skew to mask it.
+4. **`MC_MEDIA_DIAL_TOKEN_TTL_SECONDS`** (default 300, `[60, 900]`) and the **client FAILED-report
+   re-push** (`mc_media_handler_set_pushes_total{reason="failed_report"}` should rise when clients
+   report a dead token).
+5. **GC reachability** — no grant means the target was the survivors; `target=none` means there
+   were none (Scenario 25 causes).
+6. **The drain deadline** (`terminationGracePeriodSeconds − 5 s`, 30 s at the deployed 35) against
+   the meeting count on the pod: many `timed_out` with healthy dials = the window is too short.
+
+**AC is NOT on this path**: MC signs `media_dial` itself (per-meeting Ed25519 key, ADR-0039 §5).
+Do not look for token issuance at AC.
+
+**Resolution**: fix the cause found above. For a too-short window, raise `terminationGracePeriodSeconds`
+in the MH template — the ONE value the drain deadline derives from (`mh-deployment.md`
+§Meetings shed at the drain deadline). Shed meetings recover through replacement (Scenario 25).
+
+**Escalation**: `meeting-controller` (cutover, re-push, `wrong_handler`), `media-handler`
+(admission, skew), `client` (dials failing with healthy admission), `global-controller` (no grants).
+
+---
+
+### Scenario 27: Several Media Handlers Declared Dead by One MC
+
+**Alert**: MC-own-path signature, by instance
+`increase(mc_media_handler_first_declarations_total{trigger="heartbeat_timeout"}[w]) >= 2` and that
+over `mc_media_handlers_in_use` above a fraction (`w` and the fraction in the rule; warning; rule
+name assigned by OBS-ALERTS, lands with OBS-ALERTS). Also the MH crash-rate warning on
+`rate(mc_media_handler_first_declarations_total{trigger="heartbeat_timeout"}[1h])` (per handler).
+**Severity**: Warning
+**Runbook Section**: `#scenario-27-several-media-handlers-declared-dead-by-one-mc`
+
+**What this is.** One MC declared **two or more distinct handlers** dead within the window, and
+they are a large share of the handlers it uses. `first_declarations` counts each handler once per MC
+(the MC-wide `HandlerCensus`), so one MH death cannot fire it, however many meetings it held.
+
+**Diagnosis — the discriminator is how many MCs show it:**
+
+```promql
+sum by (instance) (increase(mc_media_handler_first_declarations_total{trigger="heartbeat_timeout"}[15m]))
+sum by (instance) (mc_media_handlers_in_use)
+# Did the MHs themselves see a false declaration? (they were alive)
+sum(increase(mh_media_handler_releases_total{trigger="heartbeat_timeout",clients="present"}[15m]))
+```
+
+- **The same signature on SEVERAL MCs** = real multi-MH loss (a node or zone): check
+  `./infra/kind/scripts/mh.sh list --json` (slots not `serving`, `restart_count` up,
+  `terminating_past_grace`) and node state (`kubectl get nodes`, `kubectl describe node`).
+- **Only THIS MC** = its own network path to the MHs (MC egress, the MH→MC path, the pod's node).
+  **Leave the handlers alone**: they are serving other MCs' meetings. A false declaration is a safe
+  outcome (one blip per meeting); `clients="present"` releases on MH confirm the MHs were alive.
+- **`gc_view` at request time is NOT the discriminator.** GC's view lags MC by design (MC declares at
+  about N; GC goes stale only at k × the load-report interval), so a real death is usually
+  requested while GC still says `healthy`.
+- **Crash-rate warning** (per handler): one MH incarnation keeps dying and replacement hides it.
+  Find it by `restart_count` in `mh.sh list --json`, then its `--previous` logs.
+
+**Resolution**: real loss → restore capacity (`mh.sh up --owner baseline`, or re-run `deploy.sh`), fix the node. Own-path → investigate
+that MC pod's network (NetworkPolicy, node, CNI); restarting that MC ends its meetings (MC failure is
+out of scope), so do it only as a last resort.
+
+**Escalation**: `infrastructure` (node, CNI, NetworkPolicy), `meeting-controller` (own-path with a
+healthy network), `media-handler` (crash rate).
+
+---
+
+### Scenario 28: Clients Report Handler Loss While Heartbeats Look Healthy
+
+**Alert**: `mc_media_handler_client_loss_disagreements_total` increase > 0 (warning; rule name
+assigned by OBS-ALERTS, lands with OBS-ALERTS).
+**Severity**: Warning (escalate to security on the forged branch)
+**Runbook Section**: `#scenario-28-clients-report-handler-loss-while-heartbeats-look-healthy`
+
+**What this is.** At least `MC_CLIENT_LOSS_DISAGREEMENT_FRACTION` (0.5) and at least
+`MC_CLIENT_LOSS_DISAGREEMENT_MIN_CLIENTS` (3) of a handler's believed-connected clients report
+losing it for longer than N, while that handler's heartbeats keep it Live. It never removes the
+handler (client connectivity is a second opinion only, ADR-0039 §2). Two explanations:
+1. **A forged heartbeat** (residual risk S1b-extended): another MH pod, or anything holding a
+   harvested `service.write.mc` token (S6), heartbeats for a handler that is dead to its clients,
+   suppressing failover.
+2. **A client-side network path problem**: the handler is alive and reachable from MC, but not from
+   those clients.
+
+**Zero disagreements is NOT evidence of no forgery.** A forged heartbeat with an **empty**
+`connection_ids` list retires MC's believed-connected set through the remove-only reconcile, which
+empties this counter's denominator (story 4 MC-E finding). The counter detects only a forger that
+echoes the live connection ids, so the empty-list shape never routes here: it is caught from the
+correction side (MC [Scenario 13](#scenario-13-unexpected-mh-notifications), MH Scenario 10 point here
+for a correction burst about equal to one handler's whole connected set).
+
+**MC cannot attribute a heartbeat to a sender.** It records no caller address, `handler_id` is
+self-asserted, and every MH shares one client id. The heartbeat RPC accepts any
+`service.write.mc` bearer, and GC's token carries that scope too (AC `default_scopes`), so the
+forger may be another MH pod or anything holding a harvested MH or GC bearer.
+
+**Diagnosis**
+
+```promql
+sum(increase(mc_media_handler_client_loss_disagreements_total[1h]))
+# Lost-handler events as clients see them, and their dial outcomes
+sum by (cause) (increase(dt_client_mh_disconnects_total{cause=~"transport_loss|handler_released"}[1h]))
+sum by (outcome) (increase(dt_client_mh_connection_total[1h]))
+# Heartbeat corrections that emptied a connected set (a forged empty list shows here)
+sum(increase(mc_media_handler_connected_set_corrections_total[1h]))
+```
+
+- Logs (target `mc.actor.meeting`): "Media handler health changed" with `client_disagreement=true`,
+  `clients_connected`, `clients_reporting_loss`, `meeting_id`, `handler_id`.
+- Map the `handler_id` to its MH: the MH's own series (per pod) and `mh.sh list --json` by address.
+  **Is that MH process alive and serving clients?** Its `mh_active_connections` and
+  `mh_media_frames_forwarded_total` on that pod.
+- **Independent discriminator: GC load-report freshness** for that `handler_id` (READ-ONLY):
+  `kubectl exec -n dark-tower -c postgres postgres-0 -- psql -U darktower -d dark_tower -c "SELECT handler_id, webtransport_endpoint, health_status, last_heartbeat_at FROM media_handlers WHERE handler_id = '<handler_id>';"`.
+  Stale or gone at GC (`last_heartbeat_at` older than `gc_mh_staleness_threshold_seconds`) while MC
+  still reads it Live = the forged branch (unless the forger also holds `service.write.gc`).
+  - **MH dead or not serving, heartbeats still arriving** → forged branch. **Capture evidence BEFORE
+    draining anything**: MC "Media handler health changed" and "Heartbeat retired connections whose
+    Disconnected was lost" lines (target `mc.actor.meeting`, field `corrections`) for that
+    `handler_id`; a `mh.sh list --json` snapshot; GC's `media_handlers` row (above);
+    `kubectl get pods -n dark-tower -l 'app in (mh-service,gc-service)' -o wide` at that time (the only
+    pods MC's 50052 NetworkPolicy admits, so the candidate senders). **Escalate to `security` at
+    once; containment is security-led.** Draining the impersonated handler's slot does **not** stop
+    the forger (`handler_id` is self-asserted). Drain only a pod shown to be that handler's own wedged
+    process (alive but not serving), after evidence capture:
+    `mh.sh up --owner <owner>`, then `mh.sh drain <k> --owner <owner>` (never force-delete).
+    Revoking or rotating the MH client credential in AC stops new tokens being minted; an
+    already-harvested bearer stays valid until it expires.
+  - **MH alive and forwarding to other clients** → client path: the affected clients' network,
+    the MH's hostPort/NetworkPolicy path; route to `client` / `infrastructure`.
+- **The empty-list forgery shapes** (a "Heartbeat retired connections whose Disconnected was lost"
+  line with `corrections` about equal to the handler's whole connected set): treat either as the
+  forged branch.
+  - (i) **Dead-handler suppression**: after the burst the handler stays Live while its clients report
+    loss, and GC sees it stale.
+  - (ii) **Live-handler strip**: the same burst while the clients' transports stay up. One forged
+    heartbeat retires every connection bound before the previous real heartbeat and releases their
+    `sender_id` bindings and edges; the reconcile is remove-only, so the strip is **sticky silence
+    until those participants re-dial**, visible only as `mc_media_handler_connected_set_corrections_total`.
+
+**Resolution**: forged → security-led; the bound today is NetworkPolicy on MC's 50052 ingress, the
+fix is mTLS on MC↔MH (`docs/TODO.md` S6). Client path → fix the path; affected clients redial on
+their own.
+
+**Escalation**: `security` (forged heartbeat, always), `meeting-controller`, `client`,
+`infrastructure`.
+
+---
+
+### Scenario 29: Heartbeat Misroute or Owner Mismatch
+
+**Alert**: `mc_media_handler_heartbeats_total{outcome=~"released_unassigned|owner_mismatch"}`
+increase > 0 (warning; rule name assigned by OBS-ALERTS, lands with OBS-ALERTS).
+**Severity**: Warning
+**Runbook Section**: `#scenario-29-heartbeat-misroute-or-owner-mismatch`
+
+**What this is.** A contract or routing defect at MC's heartbeat intake, both expected zero in
+steady state:
+- **`released_unassigned`**: a heartbeat for a live meeting whose handler set never held that
+  handler; MC answers RELEASED(UNSPECIFIED) and MH ends the meeting on itself (MH counts it
+  `mh_mc_heartbeat_verdicts_total{outcome="misroute"}`).
+- **`owner_mismatch`**: the heartbeat names an `mc_id` that is not this MC; MC answers
+  `FAILED_PRECONDITION` (checked first, before any lookup) and MH takes no action.
+
+**Owner mismatch after an MC crash restart is EXPECTED.** A graceful MC shutdown (SIGTERM) sends
+`EndMeeting` for every meeting, so MHs normally hold nothing for it. Meetings whose release did not
+complete (crash/OOM/SIGKILL, including an in-place crash restart, or teardowns cut off at the
+shutdown deadline) stay on MH. MC ids are per process (`MC_ID` unset), so an MC that restarted **in
+place** (same pod IP), or another MC pod that reused the IP, answers its predecessor's leftover
+meetings with `FAILED_PRECONDITION`, on both sides
+(`mh_mc_heartbeat_verdicts_total{outcome="owner_mismatch"}` on MH). MH holds those meetings until the
+owner-silence release (~15 min). See
+[`mh-incident-response.md` Scenario 25](mh-incident-response.md#scenario-25-meetings-held-without-clients)
+and [`mc-deployment.md` §MC rollout and MH meetings](mc-deployment.md#mc-rollout-and-mh-meetings-adr-0039-6).
+
+**Diagnosis**
+
+```promql
+sum by (instance, outcome) (increase(mc_media_handler_heartbeats_total{outcome=~"released_unassigned|owner_mismatch"}[15m]))
+sum by (outcome) (increase(mh_mc_heartbeat_verdicts_total{outcome=~"misroute|owner_mismatch"}[15m]))
+# Did this MC pod restart?
+kube_pod_container_status_restarts_total{namespace="dark-tower", container="mc-service"}
+```
+
+- `owner_mismatch` that starts at an MC container (crash) restart and stops within ~15 min → expected;
+  confirm `mh_media_handler_releases_total{trigger="owner_silence"}` rises about 15 min later.
+- `owner_mismatch` with no MC restart → an MH heartbeating a meeting to the wrong MC endpoint
+  (stale endpoint, IP reuse across MCs): a routing defect.
+- **Any `released_unassigned`** → MC routed a heartbeat to a meeting that never had that handler:
+  a contract defect between MC's handler set and MH's registrations. It ends a meeting on that MH.
+
+- **Logs.** MC does not log per heartbeat (an owner mismatch is counted only). MH logs the
+  transition: target `mh.grpc.heartbeat`, "MC heartbeats for this meeting failing; no action is
+  taken …" with `kind=owner_mismatch`, `meeting_id`, `mc_id`; a misroute is target
+  `mh.session.heartbeat`, "MC answered RELEASED with no cause (misroute …); releasing the meeting".
+
+**Resolution**: none at runtime for the expected case. For the defects, collect those MH lines (the
+`meeting_id`/`mc_id` pairs) and escalate; a misrouting MH can be drained (`mh.sh up --owner <owner>`, then `mh.sh drain <k> --owner <owner>`; `<owner>` = the slot's owner in `mh.sh list`, normally `baseline`).
+
+**Escalation**: `meeting-controller` and `media-handler` together (heartbeat contract);
+`infrastructure` for endpoint/IP reuse.
 
 ---
 

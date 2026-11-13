@@ -25,6 +25,8 @@
    - [Scenario 11: Telemetry Ingest Silent](#scenario-11-telemetry-ingest-silent)
    - [Scenario 12: CORS Misconfiguration Post-Deploy](#scenario-12-cors-misconfiguration-post-deploy)
    - [Scenario 13: Telemetry Proxy Unreachable / Rate-Limit Storm](#scenario-13-telemetry-proxy-unreachable--rate-limit-storm)
+   - [Scenario 14: Two Live Media Handlers on One Address](#scenario-14-two-live-media-handlers-on-one-address)
+   - [Scenario 15: GC Keeps Handing Out a Handler MCs Keep Replacing](#scenario-15-gc-keeps-handing-out-a-handler-mcs-keep-replacing)
 4. [Diagnostic Commands](#diagnostic-commands)
 5. [Recovery Procedures](#recovery-procedures)
 6. [Postmortem Template](#postmortem-template)
@@ -367,7 +369,7 @@ histogram_quantile(0.95, sum by(le) (rate(gc_http_request_duration_seconds_bucke
 - Logs: `MC assignment failed`, `No healthy MCs available`, `MC rejected assignment`
 
 **MH pool empty — new meetings fail, existing meetings keep joining (R-6)**:
-- **Signature**: joins into brand-new meetings fail with 503 `No media handlers available in this region`, while joins into meetings that already have a healthy MC assignment keep succeeding — same region, same moment. This partial pattern is expected, not a stranger fault: a join into an assigned meeting reuses the meeting's MC and performs no MH selection, so only a new meeting depends on the live MH pool. With a single MH per ordinal, "MH pool empty" usually means an MH rollout is in progress (see `docs/runbooks/mh-deployment.md`). **Since story 2 task 8 there is a second cause: every MH in the region is at its egress stream ceiling.** MH now reports its real installed egress streams as `current_streams`, so GC excludes a handler at its advertised `max_streams` even when it is healthy. Compare `mh_media_egress_edges` with `mh_media_egress_stream_ceiling` per MH instance: equal values with no live meetings behind them are the ratchet (streams held by meetings whose MC never completed `EndMeeting` — MC calls it for every meeting it ends as of story 2 task 12, so what remains is an MC crash, a kill mid-teardown, a failed release or a rollback to a build without teardown), and the interim recovery is restarting the pod whose `mh_media_egress_edges` sits at its own ceiling, one pod at a time. The procedure is in [`mh-incident-response.md` Scenario 18](mh-incident-response.md#scenario-18-media-egress-budget-exhaustion) Arm B. Restarting both pods at once maximises this 503 window. The mechanism is in `docs/observability/metrics/mh-service.md` §Egress Admission Metrics ("The ratchet") and is not restated here.
+- **Signature**: joins into brand-new meetings fail with 503 `No media handlers available in this region`, while joins into meetings that already have a healthy MC assignment keep succeeding — same region, same moment. This partial pattern is expected, not a stranger fault: a join into an assigned meeting reuses the meeting's MC and performs no MH selection, so only a new meeting depends on the live MH pool. "MH pool empty" means every MH in the region is draining, dead or at its ceiling; an MH rollout does not cause it (`mh.sh upgrade` starts each new MH before draining the old one), so read it as [`mh-incident-response.md` Scenario 1](mh-incident-response.md#scenario-1-complete-service-outage). **Since story 2 task 8 there is another cause: every MH in the region is at its egress stream ceiling.** MH now reports its real installed egress streams as `current_streams`, so GC excludes a handler at its advertised `max_streams` even when it is healthy. Compare `mh_media_egress_edges` with `mh_media_egress_stream_ceiling` per MH instance: equal values with no live meetings behind them are the ratchet (streams held by meetings whose MC never completed `EndMeeting` — MC calls it for every meeting it ends as of story 2 task 12, so what remains is an MC crash, a kill mid-teardown, a failed release or a rollback to a build without teardown), and the interim recovery is restarting the pod whose `mh_media_egress_edges` sits at its own ceiling, one pod at a time. The procedure is in [`mh-incident-response.md` Scenario 18](mh-incident-response.md#scenario-18-media-egress-budget-exhaustion) Arm B. Replacing every MH at once maximises this 503 window. The mechanism is in `docs/observability/metrics/mh-service.md` §Egress Admission Metrics ("The ratchet") and is not restated here.
 - **Distinguishing query**: `gc_mh_selections_total{status="error"}` rising while `gc_mc_assignments_total{status="success"}` stays healthy. `gc_mh_selections_total{status="error"}` is the empty-pool case and, since R-6, can only come from a new meeting.
 - **Design, not a bug**: the reuse path deliberately waves a sticky join through without re-checking the MH pool or the per-handler stream ceiling (R-19 enforcement at GC is soft and new-meeting-only), because the meeting's handler SET is MC's own, installed when the meeting is created and never re-read on a join, and every joiner is offered its registered members (ADR-0039 §3/§4; MC routes each pair through a handler both are connected to) — a re-check could only fail the join, never change the set. Over-ceiling growth is bounded by MH admission, the hard backstop. A participant who joins a meeting whose handler is gone gets a 200 from GC but no media; the fix is restoring the MH, not anything in GC.
 
@@ -1764,6 +1766,168 @@ Verify with deploy smoke stanza (f): a fresh-`sub` 70-burst still shows the inte
 - Collector infrastructure down or network-path broken beyond a config fix → Infrastructure/SRE
 - Client retry-loop or fleet-wide client bug → Client/Web-App Team
 - Suspected abuse (a single origin storming the limiter or oversize probing) → Security Team
+
+---
+
+### Scenario 14: Two Live Media Handlers on One Address
+
+**Alert**: `GCMhRegistrationPingPong` (PAGE; `sum(increase(gc_mh_registrations_total{outcome="superseded"}[10m])) >= 20 and sum(increase(gc_mh_load_reports_total{outcome="unknown_handler"}[10m])) >= 3`, `for: 10m`; lands with OBS-ALERTS). Related warnings (rule names assigned by OBS-ALERTS, lands with OBS-ALERTS): `gc_mh_registrations_total{outcome="address_conflict"}` still increasing past the MH staleness bound plus one MH registration retry; `gc_mh_load_reports_total{outcome="unknown_handler"}` increase > 0.
+**Severity**: Critical (page) for the ping-pong; Warning for the other two
+**Runbook Section**: `#scenario-14-two-live-media-handlers-on-one-address`
+
+**What this is.** ADR-0039 §7: no two live MH processes may share a client-facing address. GC's
+registration rule enforces it on its side (per address: both endpoints match another row →
+supersede that row; one matches and that row is draining, unhealthy or stale → supersede; one
+matches and that row is fresh and serving → reject `address_conflict`, and the MH retries until the
+row goes stale). **A live serving MH is never displaced by a one-sided match.** A both-endpoint
+match supersedes unconditionally (the in-place restart case), so two live processes on the same
+address evict each other: the ping-pong. These signals mean provisioning broke the
+one-process-per-address rule anyway.
+
+**A superseded registration alone is routine.** Every in-place MH crash restart supersedes its dead
+predecessor's row (`match="both"`): same slot, same pod IP, new `handler_id`. A dead process never
+load-reports, so `unknown_handler` stays at 0 however high `superseded` climbs. **The discriminator is
+`unknown_handler`**: a load report from a process GC has no row for means that process is ALIVE —
+a live duplicate on one address (the evicted side of a ping-pong), or a lost registry.
+
+**Diagnosis**
+
+```promql
+sum by (outcome, match) (increase(gc_mh_registrations_total[10m]))
+sum by (outcome) (increase(gc_mh_load_reports_total[10m]))
+max(gc_mh_staleness_threshold_seconds)          # B = k x load-report interval (30 s shipped)
+max(gc_mh_load_report_interval_seconds)
+```
+
+```bash
+# GC's forensic trail: both sides of every eviction, and the rejected registrations
+kubectl logs -n dark-tower -l app=gc-service --tail=2000 --prefix \
+  | grep -E "superseding prior registry row|endpoint is held by a fresh serving MH|Load report for unknown handler"
+# Fields per line (target gc.grpc.mh_service):
+#   "MH registered, superseding prior registry row(s)"        -> handler_id, region, superseded_handler_ids, match
+#   "...endpoint is held by a fresh serving MH" (address_conflict) -> handler_id, conflicting_handler_ids,
+#                                                                   webtransport_endpoint, grpc_endpoint
+#   "Load report for unknown handler"                          -> handler_id only
+# The ping-pong page gives only the first and last: no address. Map handler_id -> address from the
+# registry (READ-ONLY; at any instant one side of a ping-pong holds the row):
+kubectl exec -n dark-tower -c postgres postgres-0 -- psql -U darktower -d dark_tower -c \
+  "SELECT handler_id, webtransport_endpoint, health_status, last_heartbeat_at FROM media_handlers WHERE handler_id IN ('<id1>','<id2>');"
+
+# Duplicates: mh.sh list shows ONE pod per slot (the oldest), so it can never show two. List pods:
+kubectl get pods -n dark-tower -l app=mh-service -L dark-tower.io/mh-slot,dark-tower.io/mh-owner -o wide
+kubectl get pods -n dark-tower -l app=mh-service \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.ownerReferences[0].name}{"\n"}{end}'   # owning ReplicaSet (-> mh-s<k>?)
+# Slot -> address map and any pod stuck terminating
+./infra/kind/scripts/mh.sh list --json | jq -c '.slots[] | {slot, address, state, pod, pod_uid, restart_count, terminating_past_grace}'
+```
+
+**Cause** is almost always **the hostPort slot lock defeated by a zero-grace force delete**
+(`kubectl delete pod --force --grace-period=0` on an MH pod): the API object went while the process
+kept running, and the scheduler let a new MH take the same slot. Otherwise: the spike's fallback
+topology (StatefulSet-per-slot behind NodePorts) is in use, or two slot ConfigMaps carry one address.
+
+**Resolution**
+1. Map the address to a slot (`address` in `mh.sh list --json`): the `webtransport_endpoint` of an
+   `address_conflict` line, or, for the ping-pong, of the registry row found by `handler_id` above.
+2. **Find the duplicate MH on that address and retire it** (never `mh.sh drain <k>` of the slot by
+   reflex: it deletes Deployment `mh-s<k>`, the LEGITIMATE MH, and leaves the stray one):
+   - **A second API pod on that address not owned by `mh-s<k>`** (a hand-made or applied
+     Deployment): remove it gracefully with `kubectl delete deployment <its owner> -n dark-tower`
+     (no `--force`, no `--grace-period`).
+   - **The duplicate IS an `mh-s<j>` on another slot whose ConfigMap carries the same address** (two
+     slot ConfigMaps, one address): `mh.sh drain <j> --owner <owner>`, then escalate to
+     `infrastructure` for the slot ConfigMaps.
+   - **Only one pod on that address, but GC still sees two handlers**: the other is an **orphaned
+     process of a force-deleted pod** with no API object: escalate to `infrastructure` to stop that
+     container on the node.
+3. **Never touch GC's `media_handlers` rows by hand.** Once only one process holds the address, the
+   survivor's next registration and the loser's staleness settle the registry by themselves.
+4. Find who force-deleted (cluster audit log, shell history) and stop it; `mh-deployment.md`
+   §Never force-delete an MH pod.
+
+**Escalation**: `infrastructure` (orphaned container, slot ConfigMaps, fallback topology),
+`global-controller` (registry behaving against the rule above), `security` (a duplicate that nobody
+provisioned: handler identity is self-asserted).
+
+---
+
+### Scenario 15: GC Keeps Handing Out a Handler MCs Keep Replacing
+
+**Alert**: none — dashboard only, by design (known gap, ADR-0039 §3). Evidence:
+`gc_mh_replacement_requests_total{trigger, outcome, gc_view}` (GC Overview) and the
+`gc.mh.replacement_report` INFO event. Related warning: `gc_mh_replacement_requests_total{outcome="no_capacity"}`
+(rule name assigned by OBS-ALERTS, lands with OBS-ALERTS).
+**Severity**: Warning (manual investigation)
+**Runbook Section**: `#scenario-15-gc-keeps-handing-out-a-handler-mcs-keep-replacing`
+
+**What this is.** A **gray-failed** MH: GC can reach it (its load reports keep it fresh and
+healthy, so it stays selectable), but MCs or clients cannot. Every meeting placed on it heals
+through MC detection and `AcquireMediaHandler`, at the cost of one migration per bad placement.
+There is no automatic quarantine yet (`docs/TODO.md`, the gray-failure quarantine entry), so this
+procedure is the manual form.
+
+**Diagnosis**
+
+```promql
+# Replacement requests by trigger, outcome and GC's view of the replaced handler at request time
+sum by (trigger, outcome, gc_view) (increase(gc_mh_replacement_requests_total[1h]))
+max(gc_mh_staleness_threshold_seconds)
+```
+
+`gc_view` is GC's view **at request time, which lags MC by design** (MC declares at about N; GC goes
+stale only at k × the load-report interval), so a real death is usually requested while GC still
+says `healthy`. **`gc_view` alone is not the gray-failure signal.**
+
+```bash
+# One INFO per replacement request naming a replaced handler (ids are in logs only)
+# GC logs JSON (one object per line; fields under .fields).
+kubectl logs -n dark-tower -l app=gc-service --since=1h --tail=-1 --max-log-requests=10 \
+  | grep '"target":"gc.mh.replacement_report"' \
+  | jq -c '.fields | select(.trigger=="heartbeat_timeout" or .trigger=="apply_lag")
+           | select(.outcome=="granted" or .outcome=="no_capacity" or (.outcome=="error" and .gc_view!="unevaluated"))
+           | {handler_id, webtransport_endpoint, controller_id, trigger, gc_view, outcome}' \
+  | jq -s 'group_by(.handler_id) | map({handler_id: .[0].handler_id, endpoint: .[0].webtransport_endpoint,
+           distinct_controllers: (map(.controller_id) | unique | length), reports: length})'
+# Event fields: handler_id (the REPLACED handler), webtransport_endpoint (only while GC still has
+#   its row), controller_id, caller_sub, trigger, gc_view, outcome. The filters above apply steps 1-2.
+```
+
+**Procedure**
+1. **Keep only events that count as evidence**: `trigger` = `heartbeat_timeout` | `apply_lag`
+   (`planned_transfer` is a drain, never evidence), AND `outcome` = `granted` | `no_capacity`, or
+   `outcome="error"` with `gc_view` ≠ `unevaluated`. Drop `not_owner`, `invalid_request` and
+   `error`+`unevaluated`: any MC-token holder can emit those naming any handler.
+2. **Group by `handler_id` over the window** and count **distinct `controller_id`s**. Never count
+   by `caller_sub`: today it is the shared MC client id, identical for every MC.
+3. **≥ 2 distinct `controller_id`s AND the handler is still load-reporting healthy past the GC
+   staleness bound** = a likely gray failure. "Still load-reporting healthy" is **GC's** freshness,
+   not `mh.sh`'s `stale` (that field means "revision ≠ template", unrelated):
+   ```bash
+   # GC's image is distroless (no psql): query the cluster Postgres directly (identity: lib/cluster-db.sh dt_psql)
+   kubectl exec -n dark-tower -c postgres postgres-0 -- psql -U darktower -d dark_tower -c \
+     "SELECT handler_id, webtransport_endpoint, health_status, last_heartbeat_at FROM media_handlers WHERE handler_id = '<handler_id>';"
+   # healthy, and last_heartbeat_at within gc_mh_staleness_threshold_seconds of now, well AFTER the reports
+   ```
+   READ-ONLY: never update these rows. Then find its slot by address
+   (`./infra/kind/scripts/mh.sh list --json | jq '.slots[] | select(.address=="<webtransport_endpoint>")'`,
+   expect `state="serving"`) and **drain it: `./infra/kind/scripts/mh.sh drain <k> --owner <owner>`**
+   (`mh.sh up --owner <owner>` first if it is the last serving MH). Its meetings migrate; GC stops
+   selecting it at its DRAINING report. **Then restore capacity** (`mh.sh up --owner <owner>`, or
+   re-run `deploy.sh` for a `baseline` slot), or the pool sits at B−1.
+4. **Only one `controller_id`** → suspect **that MC's path** to the handler
+   ([`mc-incident-response.md` Scenario 27](mc-incident-response.md#scenario-27-several-media-handlers-declared-dead-by-one-mc));
+   **leave the handler alone**.
+5. **The handler went stale (or its row is gone)** → it is really dead and already unselectable:
+   nothing to drain.
+
+**Caveats.** `controller_id` is **self-asserted**: fine for a human decision, not yet for automation
+(automatic quarantine needs authenticated per-instance MC identity and state shared across GC
+replicas; `docs/TODO.md`). GC runs 2+ replicas, so read the logs of **every** GC pod (the
+`-l app=gc-service` selector does).
+
+**Escalation**: `media-handler` for the drained handler's root cause (what clients/MCs could not
+reach), `infrastructure` for the network path, `global-controller` if GC keeps selecting a drained
+(DRAINING) handler.
 
 ---
 
