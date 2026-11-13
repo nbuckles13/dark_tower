@@ -76,7 +76,7 @@ use crate::common::kind_labels::KIND_LABEL_KEYS;
 use crate::common::metric_catalog::CATALOG_HEAD_RE;
 use crate::common::rust_consts::rust_str_consts;
 use crate::common::status::emit_ok;
-use crate::common::test_code_filter::{is_test_path, strip_comments};
+use crate::common::test_code_filter::is_test_path;
 use crate::common::ts_lex::skip_ws;
 use crate::common::ts_lex::{lex, Lexed, StrLit};
 use crate::ts_retained_credentials::segments;
@@ -574,26 +574,11 @@ fn read_required(root: &Path, rel: &str, findings: &mut Vec<Finding>) -> Result<
 // the thing this comment exists to stop.
 // -----------------------------------------------------------------------------
 
-/// Drop `//` and `/* */` comments from Rust source, line by line, through the
-/// shared Rust lexer (`common::test_code_filter::strip_comments`), carrying the
-/// block-comment state across lines.
-fn strip_rust_comments(src: &str) -> String {
-    let mut out = String::with_capacity(src.len());
-    let mut in_block = false;
-    for line in src.lines() {
-        let (stripped, still_in_block) = strip_comments(line, in_block);
-        in_block = still_in_block;
-        out.push_str(&stripped);
-        out.push('\n');
-    }
-    out
-}
-
 /// Collect the entries of a `const NAME: [&str; N] = [ ... ];` block, plus the
 /// declared `N`. `N` is compile-checked on the source side, which makes it the
 /// structural positive control for the parse.
 fn rust_str_array(src: &str, const_name: &str) -> (Vec<String>, Option<usize>) {
-    let src = strip_rust_comments(src);
+    let src = crate::common::test_code_filter::strip_comments_file(src);
     let Some(start) = src.find(&format!("{const_name}: [&str;")) else {
         return (Vec::new(), None);
     };

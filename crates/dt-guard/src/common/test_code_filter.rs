@@ -568,6 +568,26 @@ pub(crate) fn strip_comments(line: &str, in_block_comment: bool) -> (String, boo
     lex_line(line, in_block_comment, NonCodeMode::StripComments)
 }
 
+/// [`strip_comments`] across a whole file: `//` and `/* */` comments dropped,
+/// string bodies kept, block-comment state threaded across lines. Splits on
+/// `\n` and rejoins with `\n`, so line numbers in the output equal the
+/// source's. THE whole-file form; consumers: `client_metrics_export`
+/// (const-array reader) and `force_delete_ban` (Rust command units).
+#[must_use]
+pub fn strip_comments_file(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut in_block = false;
+    for (idx, line) in content.split('\n').enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        let (stripped, still) = strip_comments(line, in_block);
+        in_block = still;
+        out.push_str(&stripped);
+    }
+    out
+}
+
 /// Blank comments and string-literal bodies to spaces, preserving byte
 /// offsets so reported columns stay meaningful.
 ///

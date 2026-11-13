@@ -34,6 +34,9 @@ STATEFULSET=""
 BINARY=""
 PORT=""
 TELEPRESENCE_CONNECTED=false
+# Seconds past the workload's terminationGracePeriodSeconds to wait for its pods
+# to be gone after scale-to-0 (kubelet teardown after the grace expires).
+POD_TEARDOWN_MARGIN_SECONDS=30
 
 # Find project root (where Cargo.toml lives)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -209,16 +212,38 @@ main() {
     log_info "Killing any existing processes on port ${PORT}..."
     fuser -k "${PORT}/tcp" 2>/dev/null || true
 
+    # The wait bound is DERIVED from the workload's own grace period (its one
+    # home is the manifest; the apiserver defaults it when unset), plus a margin
+    # for the kubelet to finish teardown after the grace expires.
+    local grace wait_s remaining
+    if ! grace="$(kubectl get statefulset/"${STATEFULSET}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.terminationGracePeriodSeconds}')" \
+        || [[ ! "${grace}" =~ ^[0-9]+$ ]]; then
+        log_error "Cannot read ${STATEFULSET}'s terminationGracePeriodSeconds (got '${grace}'); check the cluster connection."
+        exit 1
+    fi
+    wait_s=$((grace + POD_TEARDOWN_MARGIN_SECONDS))
+
     # Scale down in-cluster service
     log_step "Scaling down ${STATEFULSET} in cluster..."
     kubectl scale statefulset/"${STATEFULSET}" -n "${NAMESPACE}" --replicas=0
 
-    # Force-delete pods immediately (skip graceful termination for dev speed)
-    log_info "Force-deleting pods for faster iteration..."
-    kubectl delete pod -l app="${STATEFULSET}" -n "${NAMESPACE}" --grace-period=0 --force 2>/dev/null || true
-
-    # Brief wait to ensure pods are gone
-    kubectl wait --for=delete pod -l app="${STATEFULSET}" -n "${NAMESPACE}" --timeout=10s 2>/dev/null || true
+    # Scaling to 0 deletes the pods GRACEFULLY; wait until they are gone. Never
+    # force-delete a pod (`--force`, with or without --grace-period=0): it removes
+    # the API object while the process may still run (ADR-0039 §9; enforced for
+    # every script by `dt-guard force-delete-ban`).
+    log_info "Waiting up to ${wait_s}s for ${STATEFULSET} pods to terminate gracefully..."
+    if ! kubectl wait --for=delete pod -l app="${STATEFULSET}" -n "${NAMESPACE}" --timeout="${wait_s}s" 2>/dev/null; then
+        # `wait` also fails when no pod matched (already gone); only a pod that is
+        # still there is a failure — and a listing that FAILS is not "gone".
+        if ! remaining="$(kubectl get pod -l app="${STATEFULSET}" -n "${NAMESPACE}" -o name)"; then
+            log_error "Cannot list ${STATEFULSET} pods after the wait failed; check the cluster connection."
+            exit 1
+        fi
+        if [[ -n "${remaining}" ]]; then
+            log_error "${STATEFULSET} pods did not terminate within ${wait_s}s (grace ${grace}s + ${POD_TEARDOWN_MARGIN_SECONDS}s); investigate (kubectl describe pod -l app=${STATEFULSET} -n ${NAMESPACE}) — do not force-delete."
+            exit 1
+        fi
+    fi
 
     # Connect to cluster via Telepresence
     log_step "Connecting to cluster via Telepresence..."

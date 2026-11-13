@@ -21,6 +21,12 @@
 //! * **R-21** (build-dependent, FAIL-closed) — every pod-consumed ConfigMap is
 //!   content-addressed (ADR-0038 §2); see `kustomize_content_addressing`.
 //!
+//! Plus the **MH template rules** (story 4 task I-3, ADR-0039 §7, R-31): the
+//! ONE MH template keeps its scrape/reachability/policy/TLS/slot-port
+//! properties in the base and the environment root, and `shareProcessNamespace`
+//! is Kind-only — see [`crate::kustomize_mh_template`]. Its inputs (deploy.sh,
+//! mh.sh, prometheus.yml) failing to read is a "could not check" class.
+//!
 //! Plus the **downward-API resource rule** (build-dependent; story 3, policy
 //! content operations): every `resourceFieldRef` names a resource its target
 //! container declares — see [`crate::kustomize_resource_field_refs`]. It runs
@@ -370,7 +376,7 @@ fn build_targets(repo_root: &Path) -> Result<Vec<(PathBuf, String)>> {
     let services_dir = repo_root.join(INFRA_SERVICES_DIR);
     let overlays_dir = repo_root
         .join(crate::common::services::INFRA_OVERLAYS_DIR)
-        .join("kind");
+        .join(crate::common::services::KIND_ENV);
     let obs_base = repo_root.join("infra/kubernetes/observability");
     let obs_overlay = overlays_dir.join("observability");
     for svc in infra_service_bases(repo_root)? {
@@ -428,12 +434,46 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
             }),
     );
 
+    // MH template rules' inputs, read once (fail closed when unreadable), and
+    // rule 2's "every non-Kind render": an environment this policy does not
+    // render is unchecked surface.
+    let mh_ctx = match crate::kustomize_mh_template::load_context(repo_root) {
+        Ok(c) => Some(c),
+        Err(errs) => {
+            for e in errs {
+                all_hits.push(Hit {
+                    rule_id: crate::kustomize_mh_template::MH_TEMPLATE_UNVERIFIABLE_RULE_ID,
+                    detail: format!("the MH template rules cannot run: {e}"),
+                    file: PathBuf::from(crate::kustomize_mh_template::MH_BASE_DIR),
+                });
+            }
+            None
+        }
+    };
+    let overlays_dir = repo_root.join(crate::common::services::INFRA_OVERLAYS_DIR);
+    for env in crate::kustomize_mh_template::unrendered_environments(&overlays_dir)
+        .with_context(|| format!("listing {}", overlays_dir.display()))?
+    {
+        all_hits.push(Hit {
+            rule_id: crate::kustomize_mh_template::MH_TEMPLATE_UNVERIFIABLE_RULE_ID,
+            detail: format!(
+                "environment `{env}` is not rendered by this policy, so shareProcessNamespace absence (Kind-only test instrumentation) is unchecked there — add it to build_targets"
+            ),
+            file: PathBuf::from(crate::common::services::INFRA_OVERLAYS_DIR).join(env),
+        });
+    }
+
     // R-15/R-17/R-18/R-19/R-21 — build-dependent. Gate on `tool`.
     let mut consumed_configmaps = 0;
     let mut root_resource_field_refs = 0;
     if let Some(tool) = tool {
-        (consumed_configmaps, root_resource_field_refs) =
-            run_build_dependent_checks(repo_root, tool, has_kubeconform, &mut all_hits)?;
+        (consumed_configmaps, root_resource_field_refs) = run_build_dependent_checks(
+            repo_root,
+            tool,
+            has_kubeconform,
+            mh_ctx.as_ref(),
+            &mut all_hits,
+        )?;
     } else {
         warn_skip(
             "kustomize tool absent",
@@ -470,10 +510,11 @@ pub fn run(repo_root: &Path, explain: bool) -> Result<()> {
     // "Could not check" lines first, as `ERROR: PRECONDITION`, so they survive
     // head-truncated re-emission (docs/runbooks/devloop-validation.md §6.3
     // vacuity convention).
-    for hit in all_hits
-        .iter()
-        .filter(|h| h.rule_id == UNVERIFIABLE_RULE_ID || h.rule_id == VACUOUS_RULE_ID)
-    {
+    for hit in all_hits.iter().filter(|h| {
+        h.rule_id == UNVERIFIABLE_RULE_ID
+            || h.rule_id == VACUOUS_RULE_ID
+            || h.rule_id == crate::kustomize_mh_template::MH_TEMPLATE_UNVERIFIABLE_RULE_ID
+    }) {
         eprintln!(
             "ERROR: PRECONDITION [{}] {} — {}",
             hit.rule_id,
@@ -570,6 +611,10 @@ fn fail_token(all_hits: &[Hit]) -> String {
             "kustomize-content-addressing-unverifiable",
         ),
         (VACUOUS_RULE_ID, "kustomize-content-addressing-vacuous"),
+        (
+            crate::kustomize_mh_template::MH_TEMPLATE_UNVERIFIABLE_RULE_ID,
+            "kustomize-mh-template-unverifiable",
+        ),
     ] {
         let n = by_kind(id);
         if n > 0 {
@@ -610,6 +655,17 @@ fn fail_token(all_hits: &[Hit]) -> String {
             by_kind(crate::kustomize_configmaps::CONFIGMAP_ANNOTATION_SIZE_RULE_ID),
         ),
         (
+            "kustomize-mh-template",
+            crate::kustomize_mh_template::RULE_IDS
+                .iter()
+                .map(|id| by_kind(id))
+                .sum(),
+        ),
+        (
+            "kustomize-share-process-namespace",
+            by_kind(crate::kustomize_mh_template::SHARE_PROCESS_NAMESPACE_RULE_ID),
+        ),
+        (
             "kustomize-resource-field-ref",
             crate::kustomize_resource_field_refs::RULE_IDS
                 .iter()
@@ -636,8 +692,13 @@ fn run_build_dependent_checks(
     repo_root: &Path,
     tool: KustomizeTool,
     has_kubeconform: bool,
+    mh_ctx: Option<&crate::kustomize_mh_template::MhTemplateContext>,
     all_hits: &mut Vec<Hit>,
 ) -> Result<(usize, usize)> {
+    let kind_overlay = repo_root
+        .join(crate::common::services::INFRA_OVERLAYS_DIR)
+        .join(crate::common::services::KIND_ENV);
+    let mh_base = repo_root.join(crate::kustomize_mh_template::MH_BASE_DIR);
     let targets = build_targets(repo_root)?;
     if targets.is_empty() {
         all_hits.push(Hit {
@@ -703,6 +764,24 @@ fn run_build_dependent_checks(
                     detail: format!(
                         "{label} — rendered with zero pod-template ConfigMap references; the environment root always consumes configuration, so the reference walk saw nothing"
                     ),
+                    file: rel.clone(),
+                });
+            }
+        }
+
+        // MH template rules (rule 1) + Kind-only shareProcessNamespace (rule 2)
+        // — every render. `mh_ctx` is None only when its inputs were
+        // unreadable, which is already a fatal hit.
+        if let Some(ctx) = mh_ctx {
+            let scope = crate::kustomize_mh_template::RenderScope {
+                is_kind: dir.starts_with(&kind_overlay),
+                is_env_root,
+                is_mh_base: dir == mh_base,
+            };
+            for f in crate::kustomize_mh_template::check_rendered(rendered, &label, scope, ctx) {
+                all_hits.push(Hit {
+                    rule_id: f.rule_id,
+                    detail: f.detail,
                     file: rel.clone(),
                 });
             }
@@ -951,7 +1030,7 @@ mod tests {
             tool,
             &root
                 .join(crate::common::services::INFRA_OVERLAYS_DIR)
-                .join("kind"),
+                .join(crate::common::services::KIND_ENV),
         )
         .expect("build root");
         assert!(env_root.success, "{}", env_root.stderr_head);

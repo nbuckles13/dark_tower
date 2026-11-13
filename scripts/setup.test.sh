@@ -1783,7 +1783,8 @@ if [[ -n "$REAL_KUBECTL" ]]; then
   # placeholder generator.
   adv="$(jq -c '.spec.template.spec.containers[] | select(.name == "mh-service") | .env[] | select(.name == "MH_WEBTRANSPORT_ADVERTISE_ADDRESS") | .valueFrom.configMapKeyRef' <<< "$tpl")"
   assert_rc "mh-template-advertise-ref-hard" 0 "$(jq -e '(.optional // false) == false and (.name | startswith("mh-slot-template-config-")) and .key == "MH_WEBTRANSPORT_ADVERTISE_ADDRESS"' <<< "$adv" >/dev/null && echo 0 || echo "1 (${adv})")"
-  applied_set="$(jq -s -c --arg n mh-template --arg l dark-tower.io/mh-template-input "$(src_run "$DEPLOY" 'printf "%s" "$MH_TEMPLATE_PART_JQ"')"' [.[] | select(mh_template_part($n; $l) | not)]' <<< "$docs")"
+  # The apply set through deploy.sh's ONE derivation (env_root_apply_list — what apply_env_root applies).
+  applied_set="$(src_run "$DEPLOY" 'env_root_apply_list' <<< "$docs" | jq -c '.items')"
   assert_rc "mh-template-not-applied" 0 "$(jq -e 'all(.[]; (.kind == "Deployment" and .metadata.name == "mh-template") | not)' <<< "$applied_set" >/dev/null && echo 0 || echo 1)"
   assert_rc "mh-template-placeholder-never-applied" 0 "$(jq -e --arg n "$(jq -r .name <<< "$adv")" 'all(.[]; .metadata.name != $n)' <<< "$applied_set" >/dev/null && echo 0 || echo 1)"
   assert_rc "mh-template-inputs-never-applied" 0 "$(jq -e 'all(.[]; ((.metadata.labels // {})["dark-tower.io/mh-template-input"] // "") != "true")' <<< "$applied_set" >/dev/null && echo 0 || echo 1)"
