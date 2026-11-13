@@ -74,6 +74,13 @@
 
 import { e2eEnv } from './env.js';
 import {
+  GC_SETTLE_HEALTHY_SERIES,
+  GC_SETTLE_RECOMPUTE_OPERATION,
+  GC_SETTLE_RECOMPUTE_SERIES,
+  GC_SETTLE_RECOMPUTE_SUCCESS,
+  GC_SETTLE_STATES,
+} from './mhLegRules.js';
+import {
   anyInstanceExceedsBaseline,
   formatInstanceMap,
   resultsToInstanceMap,
@@ -99,6 +106,8 @@ import {
   MH_ADMISSION_TOTAL,
   MH_EGRESS_EDGES,
   MH_EGRESS_STREAM_CEILING,
+  GC_SCRAPE_JOB,
+  MC_SCRAPE_JOB,
   MH_SCRAPE_JOB,
   type MissingSenderDiagnosis,
 } from './s1Diagnostic.js';
@@ -697,4 +706,121 @@ export async function loadedAlertClientNames(alert: string): Promise<Set<string>
     );
   }
   return clientNamesIn(rule.query);
+}
+
+// ============================================================================
+// Story 4 C3 — the MH-replacement legs' Prometheus reads (`mhLeg.ts`). HYGIENE
+// AND BOUNDS ONLY, never per-participant evidence (that is each page's own bus).
+// ADR-0032 semantics: per-instance maps; a config-echo gauge is read for its
+// value and PRESENCE-checked per instance (absence is a loud failure, never 0);
+// the GC recompute counter is read as a per-replica delta. No new series.
+// ============================================================================
+
+const GC_STALENESS_PROMQL = 'max by (instance) (gc_mh_staleness_threshold_seconds)';
+const GC_SELECTABLE_PROMQL = `sum by (instance) (${GC_SETTLE_HEALTHY_SERIES}{state=~"${GC_SETTLE_STATES}"})`;
+const GC_RECOMPUTE_PROMQL = `sum by (instance) (${GC_SETTLE_RECOMPUTE_SERIES}{operation="${GC_SETTLE_RECOMPUTE_OPERATION}",${GC_SETTLE_RECOMPUTE_SUCCESS}})`;
+const MC_MEETINGS_ACTIVE_PROMQL = 'sum by (instance) (mc_meetings_active)';
+const MC_REPLACEMENT_RETRY_BUDGET_PROMQL =
+  'max by (instance) (mc_media_handler_replacement_retry_budget_seconds)';
+
+const MH_UP_TIMESTAMP_PROMQL = `max by (instance) (timestamp(up{job="${MH_SCRAPE_JOB}"}))`;
+
+/**
+ * When each MH instance's `up` sample was TAKEN (unix seconds; twin of Rust
+ * `mh_pool::MH_UP_TIMESTAMP_PROMQL`): the freshness half of the post-restart
+ * scrape wait — an in-place restart keeps the pod IP, so `up == 1` alone may be
+ * the pre-restart incarnation's sample.
+ */
+export async function mhScrapeTimestampByInstance(): Promise<InstanceCounters> {
+  return promInstantByInstance(MH_UP_TIMESTAMP_PROMQL);
+}
+
+/** `up{job="mh-service"}` per instance (the up_scraped wait). */
+export async function mhScrapeUpByInstance(): Promise<InstanceCounters> {
+  return promInstantByInstance(MH_UP_PROMQL);
+}
+
+/**
+ * The SERVING instances of scrape `job`: `up{job=...} == 1`. The ONE "serving
+ * replicas" rule for the C3 reads. Differs from Rust's kube-based pod lookups
+ * (`gc_fleet::live_gc_pods`, `kube::settled_serving_pods`) because the browser
+ * harness makes no kubectl call (`mhPool.ts`: mh.sh is its only cluster tool).
+ * EMPTY is a loud failure: a 0-replica read would make every derived budget 0.
+ */
+async function servingInstances(job: string): Promise<readonly string[]> {
+  const promql = `max by (instance) (up{job="${job}"})`;
+  const up = await promInstantByInstance(promql);
+  const serving = [...up.entries()].filter(([, v]) => v === 1).map(([i]) => i);
+  if (serving.length === 0) {
+    throw new Error(
+      `PRECONDITION (${job}-replicas-absent): no instance of \`${promql}\` is 1 ` +
+        `(${formatInstanceMap(up)}); a budget derived from its gauges cannot be read`,
+    );
+  }
+  return serving.sort();
+}
+
+/** The SERVING GC replicas (see {@link servingInstances}). */
+export async function servingGcInstances(): Promise<readonly string[]> {
+  return servingInstances(GC_SCRAPE_JOB);
+}
+
+/**
+ * `promql` for EVERY instance in `instances`: absence on any one is a loud
+ * failure (twin of Rust `gc_fleet::gc_replica_values`), never a default.
+ */
+async function valuesForEvery(
+  promql: string,
+  instances: readonly string[],
+): Promise<ReadonlyMap<string, number>> {
+  const map = await promInstantByInstance(promql);
+  const missing = instances.filter((i) => !map.has(i));
+  if (missing.length > 0) {
+    throw new Error(
+      `PRECONDITION: instance(s) ${missing.join(', ')} publish no \`${promql}\` ` +
+        `(${formatInstanceMap(map)}) — a scrape/startup fault, never a zero`,
+    );
+  }
+  return new Map(instances.map((i) => [i, map.get(i)!]));
+}
+
+/** GC's published staleness bound B, per serving replica (presence-checked), in seconds. */
+export async function gcStalenessSecondsByReplica(
+  replicas: readonly string[],
+): Promise<ReadonlyMap<string, number>> {
+  return valuesForEvery(GC_STALENESS_PROMQL, replicas);
+}
+
+/** Per-replica count of rows in {@link GC_SETTLE_STATES} (absent instances omitted). */
+export async function gcSelectableByInstance(): Promise<InstanceCounters> {
+  return promInstantByInstance(GC_SELECTABLE_PROMQL);
+}
+
+/** Per-replica successful `gc_mh_available` recomputes (absent instances omitted). */
+export async function gcRecomputeSuccessByInstance(): Promise<InstanceCounters> {
+  return promInstantByInstance(GC_RECOMPUTE_PROMQL);
+}
+
+/** MC's active meetings, summed over the fleet (twin of Rust `mc_meetings_active_total`). */
+export async function mcMeetingsActiveTotal(): Promise<number> {
+  return [...(await promInstantByInstance(MC_MEETINGS_ACTIVE_PROMQL)).values()].reduce(
+    (a, b) => a + b,
+    0,
+  );
+}
+
+/**
+ * MC's published replacement retry budget (`mc_media_handler_replacement_retry_budget_seconds`,
+ * story 4 MC-C: MC's OWN derivation — ladder to its cap + one cap + the initial
+ * registration bound — read, never re-derived), in ms: the MAX over every
+ * serving MC instance (a ceiling must cover the slowest), each presence-checked.
+ */
+export async function mcReplacementRetryBudgetMs(): Promise<number> {
+  const serving = await servingInstances(MC_SCRAPE_JOB);
+  const values = await valuesForEvery(MC_REPLACEMENT_RETRY_BUDGET_PROMQL, serving);
+  const max = Math.max(...values.values());
+  if (!(max > 0)) {
+    throw new Error(`PRECONDITION: MC publishes a non-positive replacement retry budget (${max})`);
+  }
+  return Math.round(max * 1000);
 }

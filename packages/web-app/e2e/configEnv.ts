@@ -13,7 +13,8 @@
 // the file and the key — defaulting would size the suite against a number the
 // cluster does not run.
 
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { SUPPORTED_PROBE_CODECS, type ProbeCodec } from './vp8Probe.js';
@@ -129,9 +130,20 @@ export const MC_DISCONNECT_GRACE_KEY = 'MC_DISCONNECT_GRACE_PERIOD_SECONDS';
  * never restated here. Throws if the constant cannot be found.
  */
 export function parseMcDefaultGraceSeconds(configRsText: string, source: string): number {
-  const match = /DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS:\s*u64\s*=\s*(\d+)\s*;/.exec(configRsText);
+  return readRustU64Const(configRsText, 'DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS', source);
+}
+
+/**
+ * THE reader of a Rust `pub const NAME: u64 = N;` (or `const`) from a source
+ * file the suite treats as a value's one home. Throws, naming the source and the
+ * constant, when it is not found.
+ */
+export function readRustU64Const(sourceText: string, name: string, source: string): number {
+  const match = new RegExp(`^\\s*(?:pub\\s+)?const ${name}:\\s*u64\\s*=\\s*(\\d+)\\s*;`, 'm').exec(
+    sourceText,
+  );
   if (match?.[1] === undefined) {
-    throw new Error(`${source} no longer declares DEFAULT_DISCONNECT_GRACE_PERIOD_SECONDS`);
+    throw new Error(`${source} no longer declares ${name}`);
   }
   return Number(match[1]);
 }
@@ -288,3 +300,131 @@ export function mcRotationBudget(): McRotationTimings & { readonly budgetMs: num
  * reads it. Shared by both rotation specs so the two cannot drift.
  */
 export const ROTATION_POLL_MARGIN_MS = 30_000;
+
+// ---------------------------------------------------------------------------
+// Story 4 C3: the MH-replacement legs' timings (`mhLeg.ts`, `mh-replacement.spec.ts`)
+// ---------------------------------------------------------------------------
+//
+// FAILS CLOSED BY CONSTRUCTION: `resilienceTimings` scans the Kind overlay and
+// throws if any file there names one of these keys, so the repo base files ARE
+// what Kind runs whenever it returns. Every value feeds a FAILURE-ONLY ceiling
+// (a poll bound, never a sleep and never a latency target).
+
+/** MC's heartbeat deadline N (ADR-0039 §3): MC declares a silent handler Dead after N. */
+export const MC_MH_HEARTBEAT_TIMEOUT_KEY = 'MC_MH_HEARTBEAT_TIMEOUT_MS';
+/** MC's connect settle window: how long MC waits for a fresh connection report before placing. */
+export const MC_MEDIA_CONNECT_SETTLE_KEY = 'MC_MEDIA_CONNECT_SETTLE_MS';
+/** MH's QUIC max idle timeout: how long a client takes to notice a silently dead MH. */
+export const MH_MAX_IDLE_TIMEOUT_KEY = 'MH_MAX_IDLE_TIMEOUT_MS';
+/** GC's handlers per new meeting (the owned-placement search's `s`). */
+export const GC_MH_INITIAL_HANDLERS_KEY = 'GC_MH_INITIAL_HANDLERS_PER_MEETING';
+
+/** The config inputs of the resilience legs. All in ms except `initialHandlers`. */
+export interface ResilienceTimings {
+  readonly heartbeatDeadlineMs: number;
+  readonly connectSettleMs: number;
+  readonly mhIdleTimeoutMs: number;
+  readonly initialHandlers: number;
+  /** GC's health-checker tick (the removal-settle budget's `2 x tick` term). */
+  readonly gcHealthTickMs: number;
+}
+
+/**
+ * GC's health-checker tick from its ONE home, the source constant
+ * (`crates/gc-service/src/tasks/generic_health_checker.rs`
+ * `DEFAULT_CHECK_INTERVAL_SECONDS`; the Rust twin is `gc_fleet::gc_health_tick`
+ * over the same line). Throws if the constant cannot be found.
+ */
+export function parseGcHealthTickSeconds(sourceText: string, source: string): number {
+  const seconds = readRustU64Const(sourceText, 'DEFAULT_CHECK_INTERVAL_SECONDS', source);
+  if (seconds <= 0) {
+    throw new Error(`${source} DEFAULT_CHECK_INTERVAL_SECONDS is not positive (${seconds})`);
+  }
+  return seconds;
+}
+
+/** The keys the resilience legs read from the BASE config.env files. */
+export const RESILIENCE_CONFIG_KEYS = [
+  MC_MH_HEARTBEAT_TIMEOUT_KEY,
+  MC_MEDIA_CONNECT_SETTLE_KEY,
+  MH_MAX_IDLE_TIMEOUT_KEY,
+  GC_MH_INITIAL_HANDLERS_KEY,
+] as const;
+
+/**
+ * PURE: the overlay files (`{path, text}`) that name any of
+ * {@link RESILIENCE_CONFIG_KEYS}. The base files are what Kind runs ONLY while
+ * this is empty, so a non-empty result is a loud PRECONDITION: a future Kind
+ * patch of one of these keys must make the reader read the overlay, never let
+ * the ceilings silently drift from the deployed value.
+ */
+export function overlayFilesPatchingResilienceKeys(
+  files: ReadonlyArray<{ readonly path: string; readonly text: string }>,
+): string[] {
+  return files
+    .filter((f) => RESILIENCE_CONFIG_KEYS.some((k) => new RegExp(`\\b${k}\\b`).test(f.text)))
+    .map((f) => f.path);
+}
+
+/** PURE: the resilience timings from the three config.env texts and GC's tick source. */
+export function readResilienceTimings(inputs: {
+  readonly mc: { readonly text: string; readonly source: string };
+  readonly mh: { readonly text: string; readonly source: string };
+  readonly gc: { readonly text: string; readonly source: string };
+  readonly gcTick: { readonly text: string; readonly source: string };
+}): ResilienceTimings {
+  const mc = parseConfigEnv(inputs.mc.text);
+  const mh = parseConfigEnv(inputs.mh.text);
+  const gc = parseConfigEnv(inputs.gc.text);
+  const why = 'cannot derive the MH-replacement ceilings (story 4 C3)';
+  return {
+    heartbeatDeadlineMs: requirePositiveInt(mc, MC_MH_HEARTBEAT_TIMEOUT_KEY, inputs.mc.source, why),
+    connectSettleMs: requirePositiveInt(mc, MC_MEDIA_CONNECT_SETTLE_KEY, inputs.mc.source, why),
+    mhIdleTimeoutMs: requirePositiveInt(mh, MH_MAX_IDLE_TIMEOUT_KEY, inputs.mh.source, why),
+    initialHandlers: requirePositiveInt(gc, GC_MH_INITIAL_HANDLERS_KEY, inputs.gc.source, why),
+    gcHealthTickMs: parseGcHealthTickSeconds(inputs.gcTick.text, inputs.gcTick.source) * 1000,
+  };
+}
+
+/** GC's health-checker source, as an absolute path (Rust `gc_fleet::GC_HEALTH_TICK_SRC`). */
+export function gcHealthTickSrcPath(): string {
+  return fileURLToPath(
+    new URL('../../../crates/gc-service/src/tasks/generic_health_checker.rs', import.meta.url),
+  );
+}
+
+/** The Kind overlay tree (`infra/kubernetes/overlays/kind`), as an absolute path. */
+export function kindOverlayDir(): string {
+  return fileURLToPath(new URL('../../../infra/kubernetes/overlays/kind/', import.meta.url));
+}
+
+/**
+ * {@link readResilienceTimings} over the repo files — FAIL-CLOSED BY
+ * CONSTRUCTION: first every file under the Kind overlay is scanned, and any one
+ * naming a resilience key throws (the base would no longer be what Kind runs).
+ */
+export function resilienceTimings(): ResilienceTimings {
+  const overlay = kindOverlayDir();
+  const files = (readdirSync(overlay, { recursive: true }) as string[])
+    .map((rel) => join(overlay, rel))
+    .filter((path) => statSync(path).isFile())
+    .map((path) => ({ path, text: readFileSync(path, 'utf8') }));
+  if (files.length === 0) {
+    throw new Error(`PRECONDITION: ${overlay} holds no files — the overlay scan would be vacuous`);
+  }
+  const patching = overlayFilesPatchingResilienceKeys(files);
+  if (patching.length > 0) {
+    throw new Error(
+      `PRECONDITION (resilience-key-patched): the Kind overlay patches a key the MH-replacement ` +
+        `ceilings read from the base config.env (${RESILIENCE_CONFIG_KEYS.join(', ')}): ` +
+        `${patching.join(', ')}. Read the overlay value instead (configEnv.ts:resilienceTimings)`,
+    );
+  }
+  const file = (source: string) => ({ text: readFileSync(source, 'utf8'), source });
+  return readResilienceTimings({
+    mc: file(serviceConfigEnvPath('mc-service')),
+    mh: file(serviceConfigEnvPath('mh-service')),
+    gc: file(serviceConfigEnvPath('gc-service')),
+    gcTick: file(gcHealthTickSrcPath()),
+  });
+}

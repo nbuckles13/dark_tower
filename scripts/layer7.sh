@@ -209,11 +209,15 @@ readonly VP8_PROBE_SUBCHECKS=(webcodecs_unavailable encoder_config_unsupported d
 # ceiling) + the specs' own 120s/test ceilings; the suite measured ~556s on 2026-10-24
 # (story 3 task 17 added eight video specs + a video partial-connectivity case to the
 # former ~4 min), which left the former 600s no headroom, so 1500s keeps the measured
-# suite under 40% of the budget. Re-measure from layer-7-browser-e2e.log's final
+# suite under 40% of the budget. Story 4 C3 (2026-11-13) adds mh-replacement.spec.ts: three
+# MH-pool legs, each projected at ~5-7 min from deployed config (MC disconnect grace,
+# GC removal settle, mh.sh up/kill/drain, the owned-placement search; e2e/README.md
+# §"What the MH-replacement spec asserts"), ~20 min together, so the projected suite is
+# ~30 min and the default rises to 3000s (~60%). Re-measure from layer-7-browser-e2e.log's final
 # "N passed (Xm)" line before changing it. Both defaults are restated in
 # docs/runbooks/devloop-validation.md §6.7, pinned by scripts/layer7.test.sh.
 ENV_TEST_TIMEOUT="${DEVLOOP_ENV_TEST_TIMEOUT:-1800}"
-BROWSER_E2E_TIMEOUT="${DEVLOOP_BROWSER_E2E_TIMEOUT:-1500}"
+BROWSER_E2E_TIMEOUT="${DEVLOOP_BROWSER_E2E_TIMEOUT:-3000}"
 
 # -----------------------------------------------------------------------------
 # Browser-E2E: ALWAYS RUN whenever Layer 7 runs (2026-08-20)

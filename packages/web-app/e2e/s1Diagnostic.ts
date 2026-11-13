@@ -35,6 +35,10 @@ import {
  * would otherwise empty the `up` read and make every diagnosis unobservable.
  */
 export const MH_SCRAPE_JOB = 'mh-service';
+/** The GC scrape job (same file; story 4 C3's GC replica reads). */
+export const GC_SCRAPE_JOB = 'gc-service';
+/** The MC scrape job (same file; story 4 C3's MC replica reads). */
+export const MC_SCRAPE_JOB = 'mc-service';
 
 /** Counter, one series per `outcome`; zero-registered at MH boot. */
 export const MH_ADMISSION_TOTAL = 'mh_media_stream_admission_total';

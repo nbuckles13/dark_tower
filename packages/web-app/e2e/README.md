@@ -248,6 +248,117 @@ test, `server-mute`, `kek-rotation`, `over-subscription`, `solo-participant`)
 ARE the M=0, audio-only reruns: unchanged, publishing the SDK default (audio),
 and each asserting at runtime that it declared M=0 (`expectDeclaredReceiveSlots`).
 
+## What the MH-replacement spec asserts (story 4 C3: survive handler loss)
+
+`mh-replacement.spec.ts` (R-1, R-2, R-3, R-20, R-39; ADR-0039 §4 and §9;
+`docs/debates/2026-10-28-mh-replacement-and-migration/test-gates.md` §Browser). It has
+three legs, each run in the test-scoped `leg` fixture (`mhLeg.ts:legTest`), the
+browser twin of Rust `MhPool::run_leg`. Its AFTER steps run in Playwright's
+fixture-teardown slot, so they also run when the test times out:
+
+- **Before each leg:** the pool is `{baseline B, nothing foreign}`
+  (`assertBaseline`, which fails loudly with `foreign-mh-activity`), nothing
+  owned by this run is still live (`mh-run-leak`, left by an earlier leg that
+  was killed), and MC holds no meeting on two reads one scrape apart
+  (`foreign-mc-meetings`).
+- **After each leg, on every exit path:** each of these steps is explicit and
+  asserted:
+  1. every context leaves and closes;
+  2. MC's meetings drain;
+  3. `mh.sh drain --all --owner <run>` runs, with the leak check;
+  4. no GC replica still counts a removed MH as selectable (the
+     `gc_fleet::wait_removed_mh_unselectable` twin);
+  5. the baseline is asserted again.
+
+  A teardown failure is the fixture's own error. Playwright reports it beside
+  the test's error, so neither hides the other.
+
+- **Which MHs a leg touches:** it kills or drains ONLY an MH it brought up
+  itself. `placeOnOwned` creates meetings, using an unblocked probe member,
+  until a meeting's join-time set names that MH. The attempt count is
+  derived as in `owned_placement.rs`, and running out fails with
+  `owned-mh-not-placed`, listing every observed set.
+- **Metric baselines:** a leg takes them only after Prometheus has scraped
+  the new MH. After an in-place restart the pod IP is unchanged, so the leg
+  waits for a sample taken after the restart was observed
+  (`timestamp(up)`).
+
+| Leg      | What is asserted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| CRASH    | Setup: A (probe) is unblocked. B joins with `blockHandlers` = the survivor(s), so it can reach only the owned MH; this is proven from B's bus before the kill. C is unblocked. Then the injector runs `kill -KILL` (`mhPool.kill`: a debug container, in-place restart asserted, never a forced, zero-grace pod delete). Asserted: (1) the reconnecting overlay was observed on the slot carrying B's stream at A and at C, and on one of B's slots (the positive control, keyed to slots that are on the owned MH by construction); (2) every participant's final `handlerSets` entry holds a `handler_ref` absent from its pre-kill history; (3) A↔C tone resumes within the survivor ceiling and every pair involving B within the replacement ceiling, followed by advancing verified frames. The URL may equal the dead one (the in-place restart reuses the slot), so nothing compares URLs across the kill. |
+| PLANNED  | Same placement and pinning as CRASH. The negative window opens BEFORE `mhPool.up()` for the target. The leg then runs a blocking `mhPool.drain` of the carrying MH. Asserted, per member: its set history is add-then-remove (`mhLegRules.makeBeforeBreak`: a set holding the old ref and the grant comes strictly before the first set without the old ref); the final set is the pre-drain set with the draining ref swapped for the grant; every member got the same grant, which is never the draining MH's address. Every pair's tone continues within the ceiling. After that, there are ZERO new reconnecting-overlay transitions and ZERO transport faults on every member's bus; both bus arrays must exist.                                                                                                                                                                                              |
+| STRANDED | C (probe) is unblocked. A and B are blocked from the survivor(s) and proven connected only to the owned MH. Then the kill runs. Asserted: A and B each observed the overlay, A's and B's final sets hold a new `handler_ref`, and A↔B tone resumes within the replacement ceiling, followed by advancing verified frames. This is the same path as a fresh join, with no special case.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+
+**Ceilings.** Every ceiling is failure-only and derived
+(`mhLegRules.resilienceCeilings`): never a sleep, never a literal. The inputs
+are:
+
+- `max(MC_MH_HEARTBEAT_TIMEOUT_MS, MH_MAX_IDLE_TIMEOUT_MS)`;
+- `MC_MEDIA_CONNECT_SETTLE_MS`;
+- the hearing liveness `fixtures.HEAR_SENDER_TIMEOUT_MS`;
+- for the replacement ceiling only, MC's published
+  `mc_media_handler_replacement_retry_budget_seconds`. This is the max over
+  the serving MC instances, each presence-checked.
+
+The config keys are read via `configEnv.ts:resilienceTimings`, which fails
+closed by construction: it first scans `infra/kubernetes/overlays/kind/**` and
+throws (`resilience-key-patched`) if any file there names one of the keys.
+
+The pool budgets follow the Rust twins:
+
+- the removal-settle budget is the max GC `gc_mh_staleness_threshold_seconds`
+  over the serving GC replicas, plus 2 × the GC health tick (read from
+  `generic_health_checker.rs`), plus the scrape ceiling;
+- the meetings-drain bound is MC's disconnect grace, plus the retry budget,
+  plus the scrape ceiling.
+
+The GC replica set comes from Prometheus `up{job="gc-service"} == 1`, because
+this harness makes no kubectl call. An empty replica set fails loudly.
+
+**Test timeout.** The Playwright test timeout is the sum of those derived
+bounds plus `mhLeg.LEG_BACKSTOP_MS`. The backstop never gates anything. It
+only absorbs mh.sh's internally derived `up`, `drain` and restart bounds and
+its BUSY retry, which the caller cannot see before the call. Once the
+placement attempt count is known, the timeout grows by that many times the
+join's named liveness bounds (`2 × JOIN_LIVENESS_MS + HEAR_SENDER_TIMEOUT_MS`).
+
+**Recorded, never gated:** these annotations are written for the run's record
+and nothing compares them against a threshold (ADR-0036 §10):
+
+- `observed-resume-ms`, an upper bound on the media-dark window per pair;
+- `observed-overlay-transitions`;
+- `observed-grant`;
+- `observed-placement-attempts`;
+- `resilience-ceilings-ms`.
+
+**Env.** The spec needs `DT_MH_SH` (the absolute path of `mh.sh`) and
+`DT_CLUSTER_NAME`, which `scripts/layer7.sh` exports. If either is unset, it
+fails as a `PRECONDITION` (`mhPool.ts`). No new config key and no new metric
+series is introduced. The bus carries refs and URLs only, never a `media_dial`
+token.
+
+**Wall clock (projected from current config, 2026-11-13).** One leg is the
+sum of: the BEFORE wait (an earlier spec's meeting outliving MC's 30 s
+disconnect grace, then two reads one scrape apart); `mh.sh up` plus its scrape
+(about 1 min; PLANNED does it twice); the placement search (expected 1.5
+attempts at m = 3, s = 2, derived maximum 13); the joins and pre-event hearing;
+the kill and in-place restart, or the drain (MH grace 35 s); resumption within
+the ceilings; then the AFTER steps (MC's grace again, the owner drain, and the
+GC removal settle, whose budget is B 30 s + 2 × 5 s + 30 s). That comes to
+about 5–7 min per leg, about 20 min for the three, and about 30 min for the
+whole suite with the measured ~556 s. That is why `BROWSER_E2E_TIMEOUT`
+(`scripts/layer7.sh`, pinned by `scripts/layer7.test.sh` and
+`docs/runbooks/devloop-validation.md` §6.7) is now **3000 s** (about 60 %).
+Re-measure on the first Layer-7 run that includes this spec.
+
+**If a run is killed mid-leg.** A suite-level timeout (rc 124) or a SIGTERM to
+Playwright runs no fixture teardown, so run-owned MHs stay up. The next leg in
+the same run fails BEFORE with `mh-run-leak`, and the next run fails with
+`foreign-mh-activity` (it has a new owner). Either failure prints the reclaim
+command. By hand, reclaim with
+`DT_CLUSTER_NAME=<cluster> "$DT_MH_SH" drain --all --owner <E2E_ORG_SUBDOMAIN>`,
+then check `"$DT_MH_SH" list` (`baseline` slots only, B of them serving).
+
 ## Prerequisites (host-side)
 
 1. **Kind cluster with AC+GC+MC+MH _and_ the observability stack**:
@@ -317,13 +428,15 @@ ports.json, so a pipeline run needs none of the manual env knobs below —
 
 ### Environment knobs (defaults = static Kind config)
 
-| Variable             | Default                                      | Purpose                                                      |
-| -------------------- | -------------------------------------------- | ------------------------------------------------------------ |
-| `E2E_ORG_SUBDOMAIN`  | **required — no default**                    | The per-run organization. `env.ts` throws if unset or blank. |
-| `E2E_BASE_URL`       | `http://${E2E_ORG_SUBDOMAIN}.localhost:5173` | **Derived.** Vite-served app; the Host carries the org.      |
-| `E2E_AC_URL`         | `http://127.0.0.1:8443`                      | AC NodePort (health probe)                                   |
-| `E2E_GC_URL`         | `http://127.0.0.1:8444`                      | GC NodePort (health probe + `bootstrapMeeting`)              |
-| `E2E_PROMETHEUS_URL` | `http://127.0.0.1:9090`                      | Assertion (d) counter reads                                  |
+| Variable             | Default                                       | Purpose                                                            |
+| -------------------- | --------------------------------------------- | ------------------------------------------------------------------ |
+| `E2E_ORG_SUBDOMAIN`  | **required — no default**                     | The per-run organization. `env.ts` throws if unset or blank.       |
+| `E2E_BASE_URL`       | `http://${E2E_ORG_SUBDOMAIN}.localhost:5173`  | **Derived.** Vite-served app; the Host carries the org.            |
+| `E2E_AC_URL`         | `http://127.0.0.1:8443`                       | AC NodePort (health probe)                                         |
+| `E2E_GC_URL`         | `http://127.0.0.1:8444`                       | GC NodePort (health probe + `bootstrapMeeting`)                    |
+| `E2E_PROMETHEUS_URL` | `http://127.0.0.1:9090`                       | Assertion (d) counter reads                                        |
+| `DT_MH_SH`           | **required by `mh-replacement` — no default** | Absolute path of `infra/kind/scripts/mh.sh` (Layer 7 exports it)   |
+| `DT_CLUSTER_NAME`    | **required by `mh-replacement` — no default** | The Kind cluster mh.sh targets (`kind-<name>`; Layer 7 exports it) |
 
 **`E2E_ORG_SUBDOMAIN` is required on purpose.** Layer 7 provisions a fresh
 organization per run (`scripts/layer7.sh` Phase 1h) because no production code
@@ -463,7 +576,7 @@ Building blocks for the N+1 specs; each module header carries the detail.
   ≈ 15 s (`multi-party-see`, `publish-mixes` mixes), ≈ 55 s each
   (`client-mute-video`, `server-mute-video`), **≈ 110 s `kek-rotation-video`**
   (grace + W, like S6), ≈ 7–20 s the rest. That left the former 600 s default
-  no headroom, so `BROWSER_E2E_TIMEOUT` (`scripts/layer7.sh`) is now **1500 s**
+  no headroom, so `BROWSER_E2E_TIMEOUT` (`scripts/layer7.sh`) became **1500 s**
   (the measured suite under 40 %), restated in `devloop-validation.md` §6.7 and
   pinned by `scripts/layer7.test.sh`. Re-measure before changing it.
 - **Wall-clock budget (story 2)** — measured on the Layer-7 Kind cluster (story 2 task 15,

@@ -166,3 +166,19 @@ export function formatInstanceMap(map: InstanceCounters): string {
     .map(([instance, value]) => `${instance}=${value}`);
   return `{${entries.join(', ')}}`;
 }
+
+/**
+ * PURE: the value of the ONE instance whose host part is `podIp` (twin of Rust
+ * `metrics::instance_for_pod_ip`: matches `<ip>:` exactly, so `10.0.0.1` never
+ * pins `10.0.0.10`; two matches are an ambiguous pin and THROW).
+ */
+export function instanceForPodIp(map: InstanceCounters, podIp: string): number | undefined {
+  const hits = [...map.entries()].filter(([instance]) => instance.startsWith(`${podIp}:`));
+  if (hits.length > 1) {
+    throw new Error(
+      `more than one instance matches pod IP ${podIp}: ${hits.map(([i]) => i).join(', ')} — ` +
+        'the pin does not identify one pod',
+    );
+  }
+  return hits[0]?.[1];
+}

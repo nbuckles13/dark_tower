@@ -378,6 +378,18 @@ export async function handlerSets(page: Page): Promise<readonly BusHandlerSet[]>
 }
 
 /**
+ * The handler URLs this page's own bus reports connected, deduped and sorted (a
+ * redial of the same handler is not a second connection). The ONE home of the
+ * "connected only where intended" premise check (S10a, story 4 C3).
+ */
+export async function connectedUrls(page: Page): Promise<string[]> {
+  const urls = (await busEvents(page))
+    .filter((e) => e['type'] === 'mediaConnected')
+    .map((e) => e['url'] as string);
+  return [...new Set(urls)].sort();
+}
+
+/**
  * The bus projection of the MC JoinResponse (see src/lib/e2eBus.ts `joined`),
  * plus the JOIN-TIME handler set (the first entry of the bus `handlerSets`
  * history).
@@ -479,11 +491,21 @@ async function busFailureContext(page: Page): Promise<string> {
 }
 
 /**
+ * The join flow's per-step LIVENESS bound (MC JoinResponse; every handler
+ * connected). Named so a caller budgeting whole joins (`mhLeg.ts`'s placement
+ * search) composes it rather than restating it. Never a latency gate.
+ */
+export const JOIN_LIVENESS_MS = 30_000;
+
+/**
  * Wait for the `joined` bus event (MC JoinResponse received) and return its
  * projection. On timeout, the error names what WAS observed — including the
  * squatting-server failure mode when the bus itself is missing.
  */
-export async function waitForJoined(page: Page, timeoutMs = 30_000): Promise<JoinedBusEvent> {
+export async function waitForJoined(
+  page: Page,
+  timeoutMs = JOIN_LIVENESS_MS,
+): Promise<JoinedBusEvent> {
   try {
     await page.waitForFunction(
       () => window.__darktower_test__?.events.some((e) => e['type'] === 'joined') ?? false,
@@ -520,7 +542,10 @@ export async function waitForJoined(page: Page, timeoutMs = 30_000): Promise<Joi
  * must be non-empty: an empty one would pass vacuously. Failure names the
  * missing handlers, m-of-n.
  */
-export async function waitForAllMediaConnected(page: Page, timeoutMs = 30_000): Promise<void> {
+export async function waitForAllMediaConnected(
+  page: Page,
+  timeoutMs = JOIN_LIVENESS_MS,
+): Promise<void> {
   const latest = (await handlerSets(page)).at(-1);
   if (latest === undefined || latest.handlers.length === 0) {
     throw new Error(
@@ -1237,12 +1262,30 @@ export async function pollBus<T>(
   done: (value: T) => boolean,
   boundMs: number,
 ): Promise<{ readonly converged: boolean; readonly last: T }> {
+  return pollConverge(read, done, boundMs, () =>
+    page.waitForTimeout(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS),
+  );
+}
+
+/**
+ * THE poll loop (page-free): `read` until `done`, or until `boundMs` (a
+ * liveness / failure-only bound) has passed, calling `wait` between reads.
+ * Returns whether it converged and the LAST read; the caller words its own
+ * failure. An error thrown by `read` fails AT ONCE (never retried). `pollBus`
+ * is it on the bus cadence; `mhLeg.ts`'s Prometheus waits use it on theirs.
+ */
+export async function pollConverge<T>(
+  read: () => Promise<T>,
+  done: (value: T) => boolean,
+  boundMs: number,
+  wait: () => Promise<void>,
+): Promise<{ readonly converged: boolean; readonly last: T }> {
   const deadline = Date.now() + boundMs;
   for (;;) {
     const last = await read();
     if (done(last)) return { converged: true, last };
     if (Date.now() > deadline) return { converged: false, last };
-    await page.waitForTimeout(E2E_FRAME_COUNT_SAMPLE_INTERVAL_MS);
+    await wait();
   }
 }
 
@@ -1682,8 +1725,11 @@ export async function latestReceiveView(page: Page): Promise<{
   };
 }
 
-/** Liveness bound for a lane to fill an FFT window and settle. Not a latency gate. */
-const HEAR_SENDER_TIMEOUT_MS = 30_000;
+/**
+ * Liveness bound for a lane to fill an FFT window and settle. Not a latency gate.
+ * Exported as THE hearing term of the story-4 resilience ceilings (`mhLeg.ts`).
+ */
+export const HEAR_SENDER_TIMEOUT_MS = 30_000;
 
 /** Verdicts meaning "the sender is not reaching this receiver at all". */
 const MISSING_SENDER_VERDICTS: ReadonlySet<ToneVerdict['kind']> = new Set([
