@@ -2949,7 +2949,7 @@ tasks:
   slug: 2026-11-13-obs-alerts-mh-replacement
   tag: story-2026-10-31-survive-handler-loss-task-OBS-ALERTS
 - id: 30
-  status: pending
+  status: completed
   specialist: client
   deps:
   - 18
@@ -3006,6 +3006,7 @@ tasks:
     SAME COMMIT: the spec, any harness helper it needs in e2e/ (reusing receiveEvidence.ts, toneDetector.ts, windowSampling.ts and failureDiagnostics.ts), and its entry in packages/web-app/e2e/README.md (the env and catalog).
 
     Cross-task obligations: (a) no new config keys; (b) no retirements; (c) no new series, and any metric read uses ADR-0032 semantics; (d) this implements test-gates.md "Browser", paired with test; (e) no identity in anything exported.
+  slug: 2026-11-13-browser-mh-replacement-spec
   tag: story-2026-10-31-survive-handler-loss-task-C3
   tier: light
   tier_reason: 'Browser e2e spec only: no production code, wire contract, auth or GSA change'
